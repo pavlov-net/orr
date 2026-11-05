@@ -27,11 +27,12 @@
 //! ratified glTF source and come from `MaterialPatch`.
 
 use gltf::material::AlphaMode;
-use gltf::texture::WrappingMode;
-use orr_pack::material::Material;
+use gltf::texture::{MagFilter, MinFilter, WrappingMode};
+use orr_pack::material::{Material, filter};
 use serde_json::Value;
 
 use crate::texture::Wrap;
+use crate::texture::color::ImageColor;
 use crate::texture::material::{ImageRules, MaterialTextures, TexRef};
 
 fn num(v: &Value, k: &str, d: f32) -> f32 {
@@ -204,14 +205,32 @@ pub(super) fn textures(
             WrappingMode::MirroredRepeat => Wrap::Mirror,
         };
         let s = t.sampler();
+        // An unset filter is the renderer's to choose: linear.
+        let mag = match s.mag_filter() {
+            Some(MagFilter::Nearest) => filter::MAG_NEAREST,
+            _ => 0,
+        };
+        let min = match s.min_filter() {
+            Some(MinFilter::Nearest) => filter::MIN_NEAREST | filter::MIP_NEAREST | filter::ONE_MIP,
+            Some(MinFilter::Linear) => filter::MIP_NEAREST | filter::ONE_MIP,
+            Some(MinFilter::NearestMipmapNearest) => filter::MIN_NEAREST | filter::MIP_NEAREST,
+            Some(MinFilter::LinearMipmapNearest) => filter::MIP_NEAREST,
+            Some(MinFilter::NearestMipmapLinear) => filter::MIN_NEAREST,
+            Some(MinFilter::LinearMipmapLinear) | None => 0,
+        };
         Ok(TexRef {
             image: t.source().index(),
             rules: ImageRules::Gltf,
             channel,
             uv_set: coord as u8,
             wrap: [wrap(s.wrap_s()), wrap(s.wrap_t())],
-            srgb: None,
+            color: ImageColor::Data,
+            file_wrap: [false; 2],
+            filter: mag | min,
+            outside: [0.0; 4],
+            missing: [0.0; 4],
             rg_channel: None,
+            input: None,
             uv,
             remap: None,
         })
@@ -232,9 +251,13 @@ pub(super) fn textures(
     };
     let pbr = m.pbr_metallic_roughness();
     let pbr_json = &own["pbrMetallicRoughness"];
+    let color = |r: TexRef| TexRef {
+        color: ImageColor::Gltf,
+        ..r
+    };
     let base_color = pbr
         .base_color_texture()
-        .map(|i| tex(i.texture(), &pbr_json["baseColorTexture"], 0))
+        .map(|i| tex(i.texture(), &pbr_json["baseColorTexture"], 0).map(color))
         .transpose()?;
     // An image of red and green alone has no blue: it holds roughness and metalness in
     // red and green.
@@ -251,7 +274,11 @@ pub(super) fn textures(
     };
     Ok(MaterialTextures {
         base_color,
-        opacity: base_color.map(|r| TexRef { channel: 3, ..r }),
+        opacity: base_color.map(|r| TexRef {
+            channel: 3,
+            color: ImageColor::Data,
+            ..r
+        }),
         roughness: metal_rough(1)?,
         metalness: metal_rough(2)?,
         normal: m
@@ -261,16 +288,9 @@ pub(super) fn textures(
                 Ok::<_, String>((r, [i.scale(); 2]))
             })
             .transpose()?,
-        occlusion: m
-            .occlusion_texture()
-            .map(|i| {
-                let r = tex(i.texture(), &own["occlusionTexture"], 0)?;
-                Ok::<_, String>((r, i.strength()))
-            })
-            .transpose()?,
         emissive: m
             .emissive_texture()
-            .map(|i| tex(i.texture(), &own["emissiveTexture"], 0))
+            .map(|i| tex(i.texture(), &own["emissiveTexture"], 0).map(color))
             .transpose()?,
         specular: info("KHR_materials_specular", "specularTexture", 3)?,
         coat: info("KHR_materials_clearcoat", "clearcoatTexture", 0)?,
@@ -279,7 +299,8 @@ pub(super) fn textures(
             "KHR_materials_diffuse_transmission",
             "diffuseTransmissionColorTexture",
             0,
-        )?,
+        )?
+        .map(color),
         displacement: info(
             "KHR_materials_displacement",
             "displacementGeometryTexture",

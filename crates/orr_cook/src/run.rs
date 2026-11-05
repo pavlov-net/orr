@@ -38,7 +38,7 @@ use crate::instances::{self, Catalog, ModelFacts};
 use crate::key::{self, Key};
 use crate::mesh::maps::{Displacement, Opacity, OpacityMap, Passes, Raster};
 use crate::mesh::{
-    self, DisplacementSpec, DisplacementTexture, MapSpec, MeshData, MeshInput, MeshSource,
+    self, DisplacementSpec, DisplacementTexture, MapRead, MapSpec, MeshData, MeshInput, MeshSource,
     NormalSpec, OpacitySpec, PartData, Pivots, SectionData, SectionMaps,
 };
 use crate::raster::{self, RasterReport};
@@ -48,8 +48,8 @@ use crate::report::{
 use crate::state::{self, Input, Memo, Record};
 use crate::subd::{self, CageData, CageInput, SubdSettings};
 use crate::texture::material::{
-    ImageData, ImageFacts, ImageFile, ImageRules, MaterialTextures, Packer, TexRef, TextureJob,
-    TextureRules, image_facts,
+    ImageData, ImageFile, ImageReads, ImageRules, Packer, TextureJob, TextureRules, image_facts,
+    settle_tiles, stand_in,
 };
 use crate::texture::neural::{self, NeuralJob};
 use crate::texture::{self, Img, Wrap};
@@ -148,7 +148,7 @@ enum Work<'m> {
     /// The mesh, its settings and the archives holding the cooked texture units its
     /// sections read, by unit name, filled when it starts.
     Mesh(MeshSource, MeshSettings, HashMap<String, Arc<Archive>>),
-    Texture(TextureJob, Arc<Vec<ImageFile>>),
+    Texture(Box<TextureJob>, Arc<Vec<ImageFile>>),
     Neural(NeuralJob, Arc<Vec<ImageFile>>),
     TextureFile(PathBuf, Hash32, TextureSettings),
     /// The cage, its section materials and its settings.
@@ -1683,24 +1683,73 @@ fn plan_scene(
         .collect();
     used.sort_unstable();
     used.dedup();
-    let heights: HashSet<usize> = src
+    // A set reads through its tiles.
+    let images = &src.images;
+    let read_as = |i: usize| -> Vec<usize> {
+        match images.get(i).and_then(ImageFile::tiles) {
+            Some(tiles) => tiles.iter().map(|t| t.image).collect(),
+            None => vec![i],
+        }
+    };
+    let sets = used.clone();
+    let used: Vec<usize> = used.into_iter().flat_map(read_as).collect();
+    let colors: HashSet<usize> = src
         .materials
         .iter()
-        .filter_map(|m| m.textures.displacement.map(|r| r.image))
+        .flat_map(|m| m.textures.colors().flat_map(|r| read_as(r.image)))
+        .collect();
+    // A height's range is what it stores, and a remap can take a color's below 0.
+    let whole: HashSet<usize> = src
+        .materials
+        .iter()
+        .flat_map(|m| {
+            let remapped = m.textures.colors().filter(|r| r.remap.is_some());
+            m.textures.displacement.iter().chain(remapped)
+        })
+        .flat_map(|r| read_as(r.image))
         .collect();
     let normals: HashSet<usize> = src
         .materials
         .iter()
         .filter_map(|m| m.textures.normal.as_ref())
         .filter(|n| n.0.rules == ImageRules::Gltf)
-        .map(|n| n.0.image)
+        .flat_map(|n| read_as(n.0.image))
         .collect();
-    let facts: HashMap<usize, ImageFacts> =
-        image_facts(name, &mut src.images, &used, &heights, &normals, memo)?;
+    // glTF states no value for an image it can't read.
+    let optional: HashSet<usize> = src
+        .materials
+        .iter()
+        .flat_map(|m| m.textures.refs())
+        .filter(|r| r.rules != ImageRules::Gltf)
+        .flat_map(|r| read_as(r.image))
+        .collect();
+    let reads = ImageReads {
+        whole,
+        normals,
+        colors,
+        optional,
+    };
+    let (mut facts, mut unread) = image_facts(name, &mut src.images, &used, &reads, memo)?;
+    settle_tiles(&sets, &mut src.images, &mut facts, &mut unread);
     let mut warnings = std::mem::take(&mut src.warnings);
     warnings.extend(
+        unread
+            .iter()
+            .map(|(&i, why)| texture::unread_warning(&src.images[i].name, why)),
+    );
+    let mut solids = HashMap::new();
+    for m in &mut src.materials {
+        stand_in(
+            &mut m.textures,
+            &unread,
+            &mut src.images,
+            &mut facts,
+            &mut solids,
+        );
+    }
+    warnings.extend(
         used.iter()
-            .filter(|i| facts[*i].animated)
+            .filter(|i| facts.get(*i).is_some_and(|f| f.animated))
             .map(|&i| texture::first_frame_warning(&src.images[i].name)),
     );
     let unscaled: BTreeSet<usize> = src
@@ -1714,14 +1763,10 @@ fn plan_scene(
             .map(|i| texture::unscaled_normal_warning(&src.images[i].name)),
     );
     for i in &used {
-        if let ImageData::File {
-            path,
-            read: Some((hash, _)),
-        } = &src.images[*i].data
-        {
+        if let ImageData::File { path, read, .. } = &src.images[*i].data {
             src.files.push(Input {
                 path: path.clone(),
-                hash: *hash,
+                hash: read.map_or_else(|| memo.hash(path).unwrap_or(Input::ABSENT), |r| r.0),
             });
         }
     }
@@ -1735,8 +1780,24 @@ fn plan_scene(
         materials.push((AssetId::from_name(&unit.name), unit.key, cooked));
         units.push(unit);
     }
+    let clipped = packer.clipped(src.materials.iter().map(|m| &m.textures))?;
+    if let Some(&first) = clipped.first() {
+        let name = &src.images[first].name;
+        warnings.push(texture::gamut_warning(&match clipped.len() - 1 {
+            0 => name.clone(),
+            more => format!("{name} and {more} more images"),
+        }));
+    }
     let jobs = std::mem::take(&mut packer.jobs);
     let sets = std::mem::take(&mut packer.neural);
+    for set in std::mem::take(&mut packer.tile_sets) {
+        let work = Work::Blobs {
+            schema: orr_pack::tiles::SCHEMA,
+            blobs: vec![(set.bytes, true)],
+        };
+        let class = Class::TextureTiles as u16;
+        units.push(NewUnit::leaf(&set.name, class, set.key, 0, work));
+    }
     drop(packer);
     let textures: HashMap<AssetId, (String, Hash32)> = jobs
         .iter()
@@ -1756,8 +1817,7 @@ fn plan_scene(
         let mut deps = Vec::new();
         let mut model_materials = Vec::with_capacity(model.materials.len());
         for (sec, &mi) in mesh.sections_mut().iter_mut().zip(&model.materials) {
-            let t = &src.materials[mi].textures;
-            sec.maps = map_spec(&materials[mi].2, t, &textures);
+            sec.maps = map_spec(&materials[mi].2, &textures);
             deps.extend(sec.maps.units().map(str::to_string));
             model_materials.push(if bakes_displacement(&model.settings, &sec.maps) {
                 *baked.entry(mi).or_insert_with(|| {
@@ -1770,6 +1830,16 @@ fn plan_scene(
             } else {
                 (materials[mi].0, materials[mi].1)
             });
+        }
+        let unbaked = mesh.sections().iter().any(|s| {
+            let d = s.maps.displacement.as_ref();
+            d.is_some_and(|d| d.texture.is_none())
+        });
+        if model.settings.displace_static.is_some() && unbaked {
+            warnings.push(format!(
+                "{model_name}: heights of a tile set don't bake into the mesh; they displace at \
+                 runtime"
+            ));
         }
         mesh.drop_unread_uv1();
         deps.sort_unstable();
@@ -1804,7 +1874,7 @@ fn plan_scene(
     let images = Arc::new(src.images);
     for job in jobs {
         let (name, key, working_set) = (job.name.clone(), job.key, job.working_set(&images));
-        let work = Work::Texture(job, Arc::clone(&images));
+        let work = Work::Texture(Box::new(job), Arc::clone(&images));
         let class = Class::Texture as u16;
         units.push(NewUnit::leaf(&name, class, key, working_set, work));
     }
@@ -1880,24 +1950,23 @@ fn material_unit(name: String, m: &Material) -> NewUnit<'static> {
 }
 
 /// The cooked textures a section with material `m` reads at mesh cook time.
-fn map_spec(
-    m: &Material,
-    t: &MaterialTextures,
-    textures: &HashMap<AssetId, (String, Hash32)>,
-) -> MapSpec {
+fn map_spec(m: &Material, textures: &HashMap<AssetId, (String, Hash32)>) -> MapSpec {
     let bound = |s: usize| {
         let b = m.textures[s];
         (b.texture != AssetId::NONE).then(|| (textures.get(&b.texture), usize::from(b.uv_set)))
     };
-    let wrap = |r: Option<&TexRef>| r.map_or([Wrap::Repeat; 2], |r| r.wrap);
+    let read = |s: usize| MapRead {
+        wrap: m.textures[s].wrap.map(Wrap::of_binding),
+        uv: m.uv_transforms[s],
+        outside: m.textures[s].outside,
+    };
     let opacity = match (m.alpha_mode, bound(slot::OPACITY)) {
         (Material::MASK, None) => OpacitySpec::Constant(m.geometry_opacity >= m.alpha_cutoff),
         (Material::MASK, Some((Some((unit, key)), uv_set))) => OpacitySpec::Texture {
             unit: unit.clone(),
             key: *key,
             cutoff: m.alpha_cutoff,
-            wrap: wrap(t.opacity.as_ref()),
-            uv: m.uv_transforms[slot::OPACITY],
+            read: read(slot::OPACITY),
             uv_set,
         },
         (Material::MASK, Some(_)) => OpacitySpec::Unknown,
@@ -1911,8 +1980,7 @@ fn map_spec(
         texture: b.0.map(|(unit, key)| DisplacementTexture {
             unit: unit.clone(),
             key: *key,
-            wrap: wrap(t.displacement.as_ref()),
-            uv: m.uv_transforms[slot::DISPLACEMENT],
+            read: read(slot::DISPLACEMENT),
             uv_set: b.1,
         }),
     });
@@ -1922,8 +1990,7 @@ fn map_spec(
         Some((Some((unit, key)), uv_set)) => NormalSpec::Texture {
             unit: unit.clone(),
             key: *key,
-            wrap: wrap(t.normal.as_ref().map(|n| &n.0)),
-            uv: m.uv_transforms[slot::NORMAL],
+            read: read(slot::NORMAL),
             uv_set,
         },
         Some(_) => NormalSpec::Tangent,
@@ -1962,7 +2029,7 @@ fn mesh_units(
     let mut materials_out = Vec::new();
     let mut deps = Vec::new();
     for (i, (m, span)) in materials.iter().zip(&input.sections).enumerate() {
-        let maps = map_spec(m, &MaterialTextures::default(), textures);
+        let maps = map_spec(m, textures);
         deps.extend(maps.units().map(str::to_string));
         let mut unit = material_unit(format!("{name}/material/{i}"), m);
         if bakes_displacement(settings, &maps) {
@@ -2223,13 +2290,12 @@ fn section_maps(
     opacity_maps: &Decoded<OpacityMap>,
 ) -> Result<Vec<SectionMaps>> {
     let _z = crate::profile::zone!("mesh.maps");
-    let read = |unit: &str, all: bool, wrap, uv, channels| {
+    let read = |unit: &str, all: bool, read, channels| {
         texture_mips(
             &archives[unit],
             AssetId::from_name(unit),
             all,
-            wrap,
-            uv,
+            read,
             channels,
         )
     };
@@ -2243,12 +2309,11 @@ fn section_maps(
                 unit,
                 key,
                 cutoff,
-                wrap,
-                uv,
+                read: at,
                 uv_set,
             } => {
                 let map = opacity_maps.get((*key, cutoff.to_bits()), || {
-                    let mip0 = read(unit, false, *wrap, *uv, 1)?.remove(0);
+                    let mip0 = read(unit, false, *at, 1)?.remove(0);
                     if mip0.w > u32::from(u16::MAX) {
                         return Err(Error::Texture {
                             asset: unit.clone(),
@@ -2267,8 +2332,9 @@ fn section_maps(
                         w: map.w,
                         h: map.h,
                         texels: Arc::clone(&map.texels),
-                        wrap: *wrap,
-                        uv: *uv,
+                        wrap: at.wrap,
+                        uv: at.uv,
+                        outside: at.outside[0],
                     },
                     passes: Arc::clone(&map.passes),
                     cutoff: *cutoff,
@@ -2284,15 +2350,15 @@ fn section_maps(
                 min: d.min,
                 max: d.max,
                 mips: match &d.texture {
-                    Some(t) => read(&t.unit, true, t.wrap, t.uv, 1)?,
+                    Some(t) => read(&t.unit, true, t.read, 1)?,
                     None => Vec::new(),
                 },
                 uv_set: d.texture.as_ref().map_or(0, |t| t.uv_set),
             }),
         };
         let normal = match &s.maps.normal {
-            NormalSpec::Texture { unit, wrap, uv, .. } if normals => {
-                read(unit, false, *wrap, *uv, 2)?.try_into().ok()
+            NormalSpec::Texture { unit, read: at, .. } if normals => {
+                read(unit, false, *at, 2)?.try_into().ok()
             }
             _ => None,
         };
@@ -2311,8 +2377,7 @@ fn texture_mips(
     arc: &Archive,
     id: AssetId,
     all: bool,
-    wrap: [Wrap; 2],
-    uv: [f32; 6],
+    read: MapRead,
     channels: usize,
 ) -> Result<Vec<Raster>> {
     use orr_pack::texture::vk;
@@ -2363,13 +2428,14 @@ fn texture_mips(
                     .collect()
             }
         };
-        for texels in planes {
+        for (c, texels) in planes.into_iter().enumerate() {
             out.push(Raster {
                 w,
                 h: hh,
                 texels: Arc::new(texels),
-                wrap,
-                uv,
+                wrap: read.wrap,
+                uv: read.uv,
+                outside: read.outside[c],
             });
         }
     }
@@ -2452,6 +2518,9 @@ fn cook_unit(
         Work::TextureFile(path, hash, settings) => {
             let bytes = state::read_checked(&path, hash)?;
             let built = texture::cook_file(name, &bytes, &settings, shared.quality)?;
+            if built.clips {
+                detail.warnings.push(texture::gamut_warning(name));
+            }
             texture::add(&mut w, name, key, &built)?;
         }
         Work::Subd(data, materials, settings) => {

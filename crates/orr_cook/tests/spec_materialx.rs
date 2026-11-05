@@ -1,14 +1,21 @@
 //! MaterialX documents against the MaterialX specification (`Spec`) and standard nodes
 //! (`Nodes`), and OpenPBR. Each row names its clause.
 
+#[allow(dead_code)]
+#[path = "common/tagged.rs"]
+mod tagged;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use orr_cook::{ArchiveSpec, AssetSpec, CookReport, Manifest, Source, TextureRules};
-use orr_pack::material::{Material, slot};
-use orr_pack::{Archive, AssetId, Target};
+use orr_cook::{
+    ArchiveSpec, AssetSpec, CookReport, InputChannels, Manifest, Source, TextureOverride,
+    TextureRules,
+};
+use orr_pack::material::{Material, filter, slot, wrap};
+use orr_pack::{Archive, AssetId, Class, Target};
 
 fn png(f: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
     let img = image::RgbaImage::from_fn(8, 8, |x, y| image::Rgba(f(x, y)));
@@ -27,8 +34,18 @@ fn fixture() -> PathBuf {
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("spec_materialx_{n}"));
     let _ = std::fs::remove_dir_all(&d);
-    let files: [(&str, Vec<u8>); 7] = [
+    let files: [(&str, Vec<u8>); 18] = [
         ("v.png", png(varying)),
+        // Their names are substitutions, not files to read as they stand.
+        ("v.{frame}.png", png(varying)),
+        ("[nope].png", png(varying)),
+        ("tiles/g.1001.png", png(varying)),
+        ("tiles/g.1012.png", png(varying)),
+        ("tiles/m.u1_v1.png", png(varying)),
+        ("tiles/m.u12_v3.png", png(varying)),
+        ("tiles/1001/d.png", png(varying)),
+        ("txt/wood/wood.1001.png", png(varying)),
+        ("broken.png", b"not an image".to_vec()),
         (
             "flipped.png",
             png(|x, y| {
@@ -42,6 +59,12 @@ fn fixture() -> PathBuf {
         ("textures/color/r.png", png(varying)),
         ("textures/color2/c.png", png(varying)),
         ("lib/sub/l.png", png(varying)),
+        ("gray128.png", png(|_, _| [128, 128, 128, 255])),
+        // States Display P3 in linear light, and a gamma of 1.
+        (
+            "tagged.png",
+            tagged::varying_rgb(&[(b"gAMA", &tagged::gama(1.0)), (b"cICP", &[12, 8, 0, 1])]),
+        ),
     ];
     for (name, bytes) in files {
         let path = d.join(name);
@@ -52,6 +75,14 @@ fn fixture() -> PathBuf {
 }
 
 fn cook(path: &Path, material: &str) -> orr_cook::Result<(Archive, CookReport)> {
+    cook_with(path, material, TextureRules::default())
+}
+
+fn cook_with(
+    path: &Path,
+    material: &str,
+    textures: TextureRules,
+) -> orr_cook::Result<(Archive, CookReport)> {
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
@@ -60,7 +91,7 @@ fn cook(path: &Path, material: &str) -> orr_cook::Result<(Archive, CookReport)> 
                 source: Source::MaterialX {
                     path: path.into(),
                     material: material.into(),
-                    textures: TextureRules::default(),
+                    textures,
                 },
             }],
         )],
@@ -261,6 +292,264 @@ fn documents_map_as_the_clauses_say() {
                 <dot name="d" type="color3"><input name="in" type="color3" nodename="i"/></dot>"#,
             inputs: r#"<input name="base_color" type="color3" nodename="d"/>"#,
             check: |m| bound(m, slot::BASE_COLOR),
+        },
+        Row {
+            clause: "Nodes image: uaddressmode and vaddressmode periodic, clamp and mirror",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="uaddressmode" type="string" value="clamp"/>
+                  <input name="vaddressmode" type="string" value="mirror"/></image>"#,
+            inputs: BASE_I,
+            check: |m| m.textures[slot::BASE_COLOR].wrap == [wrap::CLAMP, wrap::MIRROR],
+        },
+        Row {
+            clause: "Nodes image: address modes default to periodic",
+            body: COLOR,
+            inputs: BASE_I,
+            check: |m| m.textures[slot::BASE_COLOR].wrap == [wrap::REPEAT; 2],
+        },
+        Row {
+            clause: "Nodes image, constant: outside 0-1 reads the node's default",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="default" type="color3" value="0.25, 0.5, 0.75"/>
+                  <input name="uaddressmode" type="string" value="constant"/></image>"#,
+            inputs: BASE_I,
+            check: |m| {
+                let b = m.textures[slot::BASE_COLOR];
+                b.wrap == [wrap::CONSTANT, wrap::REPEAT] && b.outside == [0.25, 0.5, 0.75, 0.0]
+            },
+        },
+        Row {
+            clause: "Nodes image, constant: default is 0 in all channels when not defined",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="vaddressmode" type="string" value="constant"/></image>"#,
+            inputs: BASE_I,
+            check: |m| {
+                let b = m.textures[slot::BASE_COLOR];
+                b.wrap == [wrap::REPEAT, wrap::CONSTANT] && b.outside == [0.0; 4]
+            },
+        },
+        Row {
+            clause: "Nodes image, constant: a float default reads through its own input",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="default" type="float" value="0.75"/>
+                  <input name="uaddressmode" type="string" value="constant"/>
+                  <input name="vaddressmode" type="string" value="constant"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| {
+                let b = m.textures[slot::ROUGHNESS];
+                b.wrap == [wrap::CONSTANT; 2] && close(b.outside[0], 0.75)
+            },
+        },
+        Row {
+            clause: "Nodes image, constant: a default reads past what the image's texels reach",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="default" type="float" value="1.5"/>
+                  <input name="uaddressmode" type="string" value="constant"/></image>"#,
+            inputs: r#"<input name="specular_weight" type="float" nodename="i"/>"#,
+            check: |m| close(m.textures[slot::SPECULAR_WEIGHT].outside[0], 1.5),
+        },
+        Row {
+            clause: "Nodes image, constant: an image of one value isn't one past its edges",
+            body: r#"<image name="i" type="vector3">
+                  <input name="file" type="filename" value="flat.png"/>
+                  <input name="default" type="vector3" value="1, 1, 1"/>
+                  <input name="uaddressmode" type="string" value="constant"/></image>"#,
+            inputs: r#"<input name="base_color" type="color3" nodename="i"/>"#,
+            check: |m| bound(m, slot::BASE_COLOR),
+        },
+        Row {
+            clause: "Nodes image: default is the value to use if the file reference can not be \
+                     resolved",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="nope.png"/>
+                  <input name="default" type="color3" value="0.25, 0.5, 0.75"/></image>"#,
+            inputs: BASE_I,
+            check: |m| {
+                !bound(m, slot::BASE_COLOR)
+                    && [0.25, 0.5, 0.75]
+                        .iter()
+                        .zip(m.base_color)
+                        .all(|(a, b)| close(*a, b))
+            },
+        },
+        Row {
+            clause: "Nodes image: or if the resolved file URI cannot be read",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="broken.png"/>
+                  <input name="default" type="float" value="0.75"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Nodes image: If default is not defined, the default color value will be 0.0 \
+                     in all channels",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="nope.png"/></image>"#,
+            inputs: BASE_I,
+            check: |m| !bound(m, slot::BASE_COLOR) && m.base_color == [0.0; 3],
+        },
+        Row {
+            clause: "Nodes image: an image with no file reads as one that can't be resolved",
+            body: r#"<image name="i" type="float">
+                  <input name="default" type="float" value="0.75"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Nodes image: default reads under any address mode, not only constant",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="nope.png"/>
+                  <input name="default" type="float" value="0.75"/>
+                  <input name="uaddressmode" type="string" value="clamp"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Nodes image: under constant a missing file reads default inside 0-1 too",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="nope.png"/>
+                  <input name="default" type="float" value="0.75"/>
+                  <input name="uaddressmode" type="string" value="constant"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Nodes image: default reaches past 1 where the input does",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="nope.png"/>
+                  <input name="default" type="float" value="1.5"/></image>"#,
+            inputs: r#"<input name="specular_weight" type="float" nodename="i"/>"#,
+            check: |m| !bound(m, slot::SPECULAR_WEIGHT) && close(m.specular_weight, 1.5),
+        },
+        Row {
+            clause: "Nodes tiledimage: A default value to use if the file reference can not be \
+                     resolved",
+            body: r#"<tiledimage name="i" type="float">
+                  <input name="file" type="filename" value="nope.png"/>
+                  <input name="default" type="float" value="0.75"/></tiledimage>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Nodes image: a normalmap decodes the default as it would a texel",
+            body: r#"<image name="i" type="vector3">
+                  <input name="file" type="filename" value="nope.png"/>
+                  <input name="default" type="vector3" value="0.5, 0.5, 1"/></image>
+                <normalmap name="n" type="vector3">
+                  <input name="in" type="vector3" nodename="i"/></normalmap>"#,
+            inputs: r#"<input name="geometry_normal" type="vector3" nodename="n"/>"#,
+            check: |m| !bound(m, slot::NORMAL),
+        },
+        Row {
+            clause: "Spec Filename Substitutions: <UDIM> is 1001 + U + V*10 at the current point",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="tiles/g.&lt;UDIM&gt;.png"/>
+                  <input name="default" type="float" value="0.75"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| {
+                let b = m.textures[slot::ROUGHNESS];
+                bound(m, slot::ROUGHNESS) && close(b.outside[0], 0.75) && b.wrap == [wrap::CLAMP; 2]
+            },
+        },
+        Row {
+            clause: "Spec: <UDIM> stands raw in the attribute, as the specification's example has it",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="tiles/g.<UDIM>.png"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| bound(m, slot::ROUGHNESS),
+        },
+        Row {
+            clause: "Spec: <UVTILE> is uU_vV with U and V 1+ the integer portions",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="tiles/m.&lt;UVTILE&gt;.png"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| bound(m, slot::ROUGHNESS),
+        },
+        Row {
+            clause: "Spec: <UDIM> stands anywhere in a filename",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="tiles/&lt;UDIM&gt;/d.png"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| bound(m, slot::ROUGHNESS),
+        },
+        Row {
+            clause: "Nodes image: default reads if a hostattr has no substitution value",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="v.{frame}.png"/>
+                  <input name="default" type="float" value="0.75"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Nodes image: a constant that holds no name is an image with no file",
+            body: r#"<constant name="c" type="filename">
+                    <input name="value" type="filename" value=""/></constant>
+                  <image name="i" type="float">
+                  <input name="file" type="filename" nodename="c"/>
+                  <input name="default" type="float" value="0.75"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Nodes image: default reads if an interface token has no substitution value",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="[nope].png"/>
+                  <input name="default" type="float" value="0.75"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Spec: [interface token] is the value of a token of the compound nodegraph",
+            body: r#"<nodegraph name="g">
+                  <token name="effect" type="string" value="wood"/>
+                  <image name="i" type="float">
+                    <input name="file" type="filename"
+                           value="txt/[effect]/[effect].&lt;UDIM&gt;.png"/></image>
+                  <output name="out" type="float" nodename="i"/></nodegraph>"#,
+            inputs: r#"<input name="specular_roughness" type="float" nodegraph="g"/>"#,
+            check: |m| bound(m, slot::ROUGHNESS),
+        },
+        Row {
+            clause: "Spec: a token's value comes from the nodedef the nodegraph implements",
+            body: r#"<nodedef name="ND_x" node="x">
+                  <token name="effect" type="string" value="wood"/>
+                  <output name="out" type="float"/></nodedef>
+                <nodegraph name="g" nodedef="ND_x">
+                  <image name="i" type="float">
+                    <input name="file" type="filename"
+                           value="txt/[effect]/[effect].&lt;UDIM&gt;.png"/></image>
+                  <output name="out" type="float" nodename="i"/></nodegraph>"#,
+            inputs: r#"<input name="specular_roughness" type="float" nodegraph="g"/>"#,
+            check: |m| bound(m, slot::ROUGHNESS),
+        },
+        Row {
+            clause: "Spec: a node's own nodedef leaves the tokens of the graph around it",
+            body: r#"<nodedef name="ND_image_float" node="image">
+                  <output name="out" type="float"/></nodedef>
+                <nodegraph name="g">
+                  <token name="effect" type="string" value="wood"/>
+                  <image name="i" type="float" nodedef="ND_image_float">
+                    <input name="file" type="filename"
+                           value="txt/[effect]/[effect].&lt;UDIM&gt;.png"/></image>
+                  <output name="out" type="float" nodename="i"/></nodegraph>"#,
+            inputs: r#"<input name="specular_roughness" type="float" nodegraph="g"/>"#,
+            check: |m| bound(m, slot::ROUGHNESS),
+        },
+        Row {
+            clause: "Nodes image: filtertype closest is one texel",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="filtertype" type="string" value="closest"/></image>"#,
+            inputs: BASE_I,
+            check: |m| {
+                m.textures[slot::BASE_COLOR].filter
+                    == filter::MAG_NEAREST | filter::MIN_NEAREST | filter::MIP_NEAREST
+            },
         },
         Row {
             clause: "Spec Geometric Properties: UV0 is uv set 0",
@@ -601,9 +890,9 @@ fn invalid_documents_fail() {
     assert!(cooked.is_empty(), "{cooked:#?}");
 }
 
-/// The cook of a material whose `displacementshader` is node `D` of `body`.
-fn cook_displaced(body: &str) -> orr_cook::Result<(Archive, CookReport)> {
-    let path = fixture().join("m.mtlx");
+/// A document in `d` of a material whose `displacementshader` is node `D` of `body`.
+fn displaced_doc(d: &Path, body: &str) -> PathBuf {
+    let path = d.join("m.mtlx");
     let doc = format!(
         r#"<?xml version="1.0"?>
 <materialx version="1.39">
@@ -617,7 +906,11 @@ fn cook_displaced(body: &str) -> orr_cook::Result<(Archive, CookReport)> {
 "#
     );
     std::fs::write(&path, doc).unwrap();
-    cook(&path, "M")
+    path
+}
+
+fn cook_displaced(body: &str) -> orr_cook::Result<(Archive, CookReport)> {
+    cook(&displaced_doc(&fixture(), body), "M")
 }
 
 fn displaced(body: &str) -> Material {
@@ -900,6 +1193,344 @@ fn xinclude_fallbacks_stand_where_the_include_failed() {
     );
 }
 
+/// Nodes `image`: `layer` is "the name of the layer to extract from a multi-layer input file", and
+/// `default` reads "if the specified layer does not exist in the file".
+#[test]
+fn an_image_reads_its_layer_or_else_its_default() {
+    use exr::prelude::{AnyChannel, AnyChannels, FlatSamples, Image, WritableImage};
+    let d = fixture();
+    let plane = |name: &str, v: f32| AnyChannel::new(name, FlatSamples::F32(vec![v; 64]));
+    let channels = AnyChannels::sort(
+        vec![
+            plane("rough.R", 0.25),
+            plane("rough.G", 0.25),
+            plane("rough.B", 0.25),
+            plane("height.Z", 0.375),
+            plane("R", 0.625),
+            plane("G", 0.625),
+            plane("B", 0.625),
+        ]
+        .into(),
+    );
+    Image::from_channels((8, 8), channels)
+        .write()
+        .to_file(d.join("layers.exr"))
+        .unwrap();
+    let cooked = |file: &str, layer: Option<&str>| {
+        let layer = layer.map_or(String::new(), |l| {
+            format!(r#"<input name="layer" type="string" value="{l}"/>"#)
+        });
+        let body = format!(
+            r#"<image name="i" type="float">
+              <input name="file" type="filename" value="{file}"/>
+              <input name="default" type="float" value="0.75"/>{layer}</image>"#
+        );
+        let doc = write_doc(&d, "m.mtlx", "", &body, ROUGH_I);
+        let (a, _) = cook(&doc, "M").unwrap();
+        let m = material(&a);
+        assert!(!bound(&m, slot::ROUGHNESS), "every layer here is one value");
+        m.specular_roughness
+    };
+    // A control: with no layer the plain channels read, with or without `layer` support.
+    assert!(close(cooked("layers.exr", None), 0.625));
+    assert!(close(cooked("layers.exr", Some("rough")), 0.25));
+    assert!(close(cooked("layers.exr", Some("height")), 0.375));
+    assert!(close(cooked("layers.exr", Some("nope")), 0.75));
+    assert!(close(cooked("gray30.png", Some("rough")), 0.75));
+    assert!(close(cooked("layers.exr", Some("rgba")), 0.625));
+
+    // Nodes `image`: "If no value for layer is provided and the input file has multiple layers,
+    // then the "default" layer will be used".
+    let channels = AnyChannels::sort(
+        vec![
+            plane("default.R", 0.125),
+            plane("default.G", 0.125),
+            plane("default.B", 0.125),
+            plane("R", 0.625),
+            plane("G", 0.625),
+            plane("B", 0.625),
+        ]
+        .into(),
+    );
+    Image::from_channels((8, 8), channels)
+        .write()
+        .to_file(d.join("default.exr"))
+        .unwrap();
+    assert!(close(cooked("default.exr", None), 0.125));
+
+    // The file and the layer both reach the image from outside it.
+    let body = r#"<constant name="k" type="filename">
+        <input name="value" type="filename" value="layers.exr"/></constant>
+      <nodegraph name="g">
+        <input name="f" type="filename" nodename="k"/>
+        <input name="l" type="string" value="rough"/>
+        <image name="i" type="float">
+          <input name="file" type="filename" interfacename="f"/>
+          <input name="layer" type="string" interfacename="l"/></image>
+        <output name="o" type="float" nodename="i"/></nodegraph>"#;
+    let inputs = r#"<input name="specular_roughness" type="float" nodegraph="g"/>"#;
+    let (a, _) = cook(&write_doc(&d, "m.mtlx", "", body, inputs), "M").unwrap();
+    assert!(close(material(&a).specular_roughness, 0.25));
+}
+
+/// Nodes `image`: `default` reads "if the file reference can not be resolved", which stops once
+/// the file is there.
+#[test]
+fn a_default_stands_only_until_the_file_appears() {
+    let d = fixture();
+    let doc = write_doc(
+        &d,
+        "m.mtlx",
+        "",
+        r#"<image name="i" type="float">
+          <input name="file" type="filename" value="late.png"/>
+          <input name="default" type="float" value="0.75"/></image>"#,
+        ROUGH_I,
+    );
+    let out = d.join("out.orr");
+    let cook_file = || {
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::File(out.clone()),
+                vec![AssetSpec {
+                    name: "u".into(),
+                    source: Source::MaterialX {
+                        path: doc.clone(),
+                        material: "M".into(),
+                        textures: TextureRules::default(),
+                    },
+                }],
+            )],
+        };
+        let cooked = orr_cook::cook(&manifest, &Default::default()).unwrap();
+        (material(&Archive::open(&out).unwrap()), cooked.report)
+    };
+    let (m, report) = cook_file();
+    assert!(close(m.specular_roughness, 0.75));
+    let warnings = &report.assets[0].warnings;
+    assert!(
+        warnings.iter().any(|w| w.contains("late.png")),
+        "{warnings:?}"
+    );
+    std::fs::write(d.join("late.png"), png(varying)).unwrap();
+    assert!(bound(&cook_file().0, slot::ROUGHNESS));
+}
+
+/// Spec Filename Substitutions: `<UDIM>` and `<UVTILE>` name tile U, V by their formulas, and a
+/// tile set holds what the directory has; a new one is a file that now resolves.
+#[test]
+fn tile_tokens_name_cells_by_their_formulas() {
+    let cells = |a: &Archive, m: &Material| -> Vec<[u16; 2]> {
+        let e = a.find(m.textures[slot::ROUGHNESS].texture).unwrap();
+        assert_eq!(e.class, Class::TextureTiles as u16);
+        let b = &a.blobs(e)[0];
+        let mut v = vec![0; b.raw_len as usize];
+        a.read(b, &mut v).unwrap();
+        let set = orr_pack::tiles::TextureTiles::parse(&v).unwrap();
+        set.tiles.iter().map(|t| [t.column, t.row]).collect()
+    };
+    let image = |file: &str| {
+        format!(
+            r#"<image name="i" type="float">
+              <input name="file" type="filename" value="{file}"/></image>"#
+        )
+    };
+    let (a, _) = cook_body(&image("tiles/g.&lt;UDIM&gt;.png"), ROUGH_I).unwrap();
+    assert_eq!(cells(&a, &material(&a)), [[0, 0], [1, 1]]);
+    let (a, _) = cook_body(&image("tiles/m.&lt;UVTILE&gt;.png"), ROUGH_I).unwrap();
+    assert_eq!(cells(&a, &material(&a)), [[0, 0], [11, 2]]);
+    // Tiles stop where a key does: u65536 is the last column, and a file past it warns.
+    let d = fixture();
+    std::fs::write(d.join("tiles/w.u65536_v1.png"), png(varying)).unwrap();
+    std::fs::write(d.join("tiles/w.u65537_v1.png"), png(varying)).unwrap();
+    let body = image("tiles/w.&lt;UVTILE&gt;.png");
+    let (a, report) = cook(&write_doc(&d, "m.mtlx", "", &body, ROUGH_I), "M").unwrap();
+    assert_eq!(cells(&a, &material(&a)), [[65535, 0]]);
+    let warnings = &report.assets[0].warnings;
+    assert!(
+        warnings.iter().any(|w| w.contains("w.u65537_v1.png")),
+        "{warnings:?}"
+    );
+    // A name of no files, and a geometry token with no geometry to give it, can't be resolved.
+    for file in ["tiles/none.&lt;UDIM&gt;.png", "v.&lt;asset&gt;.png"] {
+        let (a, _) = cook_body(&image(file), ROUGH_I).unwrap();
+        assert!(!bound(&material(&a), slot::ROUGHNESS), "{file}");
+    }
+
+    let d = fixture();
+    let by_name = write_doc(
+        &d,
+        "m.mtlx",
+        "",
+        &image("tiles/m.&lt;UVTILE&gt;.png"),
+        ROUGH_I,
+    );
+    let by_directory = write_doc(
+        &d,
+        "d.mtlx",
+        "",
+        &image("tiles/&lt;UDIM&gt;/d.png"),
+        ROUGH_I,
+    );
+    let out = d.join("out.orr");
+    let tiles = |doc: &PathBuf| {
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::File(out.clone()),
+                vec![AssetSpec {
+                    name: "u".into(),
+                    source: Source::MaterialX {
+                        path: doc.clone(),
+                        material: "M".into(),
+                        textures: TextureRules::default(),
+                    },
+                }],
+            )],
+        };
+        orr_cook::cook(&manifest, &Default::default()).unwrap();
+        let a = Archive::open(&out).unwrap();
+        cells(&a, &material(&a)).len()
+    };
+    assert_eq!(tiles(&by_name), 2);
+    std::fs::write(d.join("tiles/m.u2_v1.png"), png(varying)).unwrap();
+    assert_eq!(tiles(&by_name), 3);
+    // A tile can appear in a directory that was there already.
+    std::fs::create_dir(d.join("tiles/1002")).unwrap();
+    assert_eq!(tiles(&by_directory), 1);
+    std::fs::write(d.join("tiles/1002/d.png"), png(varying)).unwrap();
+    assert_eq!(tiles(&by_directory), 2);
+}
+
+/// Spec `<UVTILE>` sets no last tile, so two tiles far apart are a set of two: what a table takes
+/// follows the tiles a set has, not how far apart their names lie.
+#[test]
+fn a_far_uvtile_takes_no_more_table_than_a_near_one() {
+    let d = fixture();
+    std::fs::write(d.join("tiles/f.u1_v1.png"), png(varying)).unwrap();
+    std::fs::write(d.join("tiles/f.u40000_v40000.png"), png(varying)).unwrap();
+    let body = r#"<image name="i" type="float">
+      <input name="file" type="filename" value="tiles/f.&lt;UVTILE&gt;.png"/></image>"#;
+    let (a, _) = cook(&write_doc(&d, "m.mtlx", "", body, ROUGH_I), "M").unwrap();
+    let e = a
+        .find(material(&a).textures[slot::ROUGHNESS].texture)
+        .unwrap();
+    let b = &a.blobs(e)[0];
+    let mut v = vec![0; b.raw_len as usize];
+    a.read(b, &mut v).unwrap();
+    let set = orr_pack::tiles::TextureTiles::parse(&v).unwrap();
+    let cells: Vec<_> = set.tiles.iter().map(|t| [t.column, t.row]).collect();
+    assert_eq!(cells, [[0, 0], [39_999, 39_999]]);
+    assert_eq!(4 * set.words(), 128);
+}
+
+/// `TextureRules::overrides` apply to every texture made from an image whose name contains the
+/// pattern. A tile is such an image by its own name and by its set's, the authored one.
+#[test]
+fn overrides_reach_tiles_by_their_own_name_or_their_sets() {
+    let d = fixture();
+    // Red 0.2 and green 0.8 in every tile.
+    for tile in ["c.1001", "c.1002"] {
+        let path = d.join(format!("tiles/{tile}.png"));
+        std::fs::write(path, png(|_, _| [51, 204, 0, 255])).unwrap();
+    }
+    let doc = write_doc(
+        &d,
+        "m.mtlx",
+        "",
+        r#"<image name="i" type="float">
+          <input name="file" type="filename" value="tiles/c.&lt;UDIM&gt;.png"/></image>"#,
+        ROUGH_I,
+    );
+    // Per tile, its size and the red of its first texel.
+    let tiles = |overrides: Vec<(String, TextureOverride)>| -> Vec<(u32, f32)> {
+        let textures = TextureRules {
+            overrides,
+            ..TextureRules::default()
+        };
+        let (a, _) = cook_with(&doc, "M", textures).unwrap();
+        let read = |e, b: usize| {
+            let blob = &a.blobs(e)[b];
+            let mut v = vec![0; blob.raw_len as usize];
+            a.read(blob, &mut v).unwrap();
+            v
+        };
+        let set = a
+            .find(material(&a).textures[slot::ROUGHNESS].texture)
+            .unwrap();
+        let set = orr_pack::tiles::TextureTiles::parse(&read(set, 0)).unwrap();
+        set.tiles
+            .iter()
+            .map(|t| {
+                let e = a.find(t.texture).unwrap();
+                let info = orr_pack::texture::TextureInfo::parse(&read(e, 0)).unwrap();
+                let h = info.header;
+                let texels = info.mip_texels(&read(e, h.mip_blob(0)), 0, 0).unwrap();
+                let mut px = [0u8; 16];
+                bcdec_rs::bc4(&texels[..8], &mut px, 4, false);
+                (h.width, f32::from(px[0]) / 255.0)
+            })
+            .collect()
+    };
+    let size = |n| TextureOverride {
+        max_size: Some(n),
+        ..TextureOverride::default()
+    };
+    let green = TextureOverride {
+        channels: InputChannels {
+            roughness: Some(1),
+            ..InputChannels::default()
+        },
+        ..TextureOverride::default()
+    };
+    let sizes = |pattern: &str| -> Vec<u32> {
+        let t = tiles(vec![(pattern.to_string(), size(4))]);
+        t.iter().map(|t| t.0).collect()
+    };
+    assert_eq!(sizes("nothing"), [8, 8]);
+    assert_eq!(sizes("c.<UDIM>"), [4, 4], "the set's name");
+    assert_eq!(sizes("c.1"), [4, 4], "both tiles' names");
+    assert_eq!(sizes("c.1002"), [8, 4], "one tile's name");
+    let greens = |pattern: &str| -> Vec<bool> {
+        let t = tiles(vec![(pattern.to_string(), green.clone())]);
+        t.iter().map(|t| (t.1 - 0.8).abs() < 0.02).collect()
+    };
+    assert_eq!(greens("nothing"), [false, false]);
+    assert_eq!(greens("c.<UDIM>"), [true, true], "the set's name");
+    assert_eq!(greens("c.1002"), [false, true], "one tile's name");
+}
+
+/// Heights span what every tile reads, so a tile an override sends to another channel measures
+/// there: red 0.2 in one tile and green 0.8 in the other, above the 0 where no tile lies.
+#[test]
+fn a_tile_measures_heights_in_the_channel_an_override_gives_it() {
+    let d = fixture();
+    for tile in ["c.1001", "c.1002"] {
+        let path = d.join(format!("tiles/{tile}.png"));
+        std::fs::write(path, png(|_, _| [51, 204, 0, 255])).unwrap();
+    }
+    let doc = displaced_doc(
+        &d,
+        r#"<image name="i" type="float">
+          <input name="file" type="filename" value="tiles/c.&lt;UDIM&gt;.png"/></image>
+        <displacement name="D" type="displacementshader">
+          <input name="displacement" type="float" nodename="i"/></displacement>"#,
+    );
+    let green = TextureOverride {
+        channels: InputChannels {
+            displacement: Some(1),
+            ..InputChannels::default()
+        },
+        ..TextureOverride::default()
+    };
+    let textures = TextureRules {
+        overrides: vec![("c.1002".to_string(), green)],
+        ..TextureRules::default()
+    };
+    let m = material(&cook_with(&doc, "M", textures).unwrap().0);
+    assert!(close(m.displacement_offset, 0.0), "{m:?}");
+    assert!(close(m.displacement_scale, 0.8), "{m:?}");
+}
+
 #[test]
 fn a_fallback_stands_only_until_the_include_appears() {
     let d = fixture();
@@ -1081,4 +1712,172 @@ fn long_connection_chains_cook() {
     );
     let (a, _) = cook_body(&body, BASE_I).unwrap();
     assert_eq!(material(&a).uv_transforms[slot::BASE_COLOR], [0.0; 6]);
+}
+
+/// An `image` `i` of `ty` reading `file`, the file's input carrying `attrs`.
+fn image_node(ty: &str, file: &str, attrs: &str) -> String {
+    format!(
+        r#"<image name="i" type="{ty}"><input name="file" type="filename" value="{file}" {attrs}/></image>"#
+    )
+}
+
+fn near(a: f32, b: f32) -> bool {
+    (a - b).abs() < 2e-3
+}
+
+/// A document's `UsdPreviewSurface` holds to PS `occlusion`, "pathtracers will likely choose to
+/// ignore it", so the image it reads isn't opened, here a file that doesn't exist.
+#[test]
+fn a_preview_surface_ignores_occlusion() {
+    let path = fixture().join("m.mtlx");
+    let image = image_node("float", "missing.png", "");
+    let doc = format!(
+        r#"<?xml version="1.0"?>
+<materialx version="1.39">
+  {image}
+  <UsdPreviewSurface name="S" type="surfaceshader">
+    <input name="occlusion" type="float" nodename="i"/>
+  </UsdPreviewSurface>
+  <surfacematerial name="M" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="S"/>
+  </surfacematerial>
+</materialx>
+"#
+    );
+    std::fs::write(&path, doc).unwrap();
+    let (a, _) = cook(&path, "M").unwrap();
+    let m = material(&a);
+    assert!((0..slot::COUNT).all(|s| !bound(&m, s)));
+}
+
+/// Spec Color Spaces: the table of spaces, with "`none` remains an acceptable alias for `data`",
+/// and L200 "values of type color3 and color4 are always associated with a particular color
+/// space", which leaves a `float` image in a color scope as it is. PNG 128 through current and
+/// deprecated names.
+#[test]
+fn image_color_spaces_decode_as_named() {
+    let color = r#"<input name="base_color" type="color3" nodename="i"/>"#;
+    let stored: f32 = 128.0 / 255.0;
+    let srgb = orr_color::srgb_decode(f64::from(stored)) as f32;
+    for (space, want) in [
+        ("srgb_rec709_scene", srgb),
+        ("srgb_texture", srgb),
+        ("g22_rec709_scene", stored.powf(2.2)),
+        ("g24_rec709_scene", stored.powf(2.4)),
+        ("g18_rec709", stored.powf(1.8)),
+        ("lin_rec709_scene", stored),
+        ("data", stored),
+        ("none", stored),
+    ] {
+        let image = image_node("color3", "gray128.png", &format!(r#"colorspace="{space}""#));
+        let (a, _) = cook_body(&image, color).unwrap();
+        let got = material(&a).base_color;
+        assert!(
+            got.iter().all(|c| near(*c, want)),
+            "{space}: {got:?}, not {want}"
+        );
+    }
+
+    let image = image_node("float", "gray128.png", r#"colorspace="srgb_rec709_scene""#);
+    let input = r#"<input name="specular_roughness" type="float" nodename="i"/>"#;
+    let (a, _) = cook_body(&image, input).unwrap();
+    assert!(near(material(&a).specular_roughness, stored));
+
+    // L364 leaves other spaces to color management systems, which the cook isn't: it says so.
+    let image = image_node("color3", "gray128.png", r#"colorspace="studio_log""#);
+    let (a, report) = cook_body(&image, color).unwrap();
+    assert!(near(material(&a).base_color[0], stored));
+    assert!(
+        report.assets[0]
+            .warnings
+            .iter()
+            .any(|w| w.contains("studio_log"))
+    );
+}
+
+/// Spec L381: "data" means "no color space conversion should be applied". What a file states
+/// doesn't apply under any space a document names either: L364 has the application transform from
+/// the space named. `acescg`, which has no id, converts to Rec.2020; `lin_p3d65_scene` keeps its.
+/// The input reading a file names how it decodes, wherever the name comes from.
+#[test]
+fn a_colorspace_stands_on_a_file_read_through_a_constant() {
+    let body = r#"<constant name="c" type="filename">
+          <input name="value" type="filename" value="gray128.png"/></constant>
+        <image name="i" type="color3">
+          <input name="file" type="filename" nodename="c" colorspace="g22_rec709_scene"/></image>"#;
+    let inputs = r#"<input name="base_color" type="color3" nodename="i"/>"#;
+    let (a, _) = cook_body(body, inputs).unwrap();
+    let want = (128.0f32 / 255.0).powf(2.2);
+    assert!(material(&a).base_color.iter().all(|c| near(*c, want)));
+}
+
+#[test]
+fn named_spaces_stand_over_what_the_file_states() {
+    let color = r#"<input name="base_color" type="color3" nodename="i"/>"#;
+    let primaries = |a: &Archive| {
+        let e = a
+            .find(material(a).textures[slot::BASE_COLOR].texture)
+            .unwrap();
+        let b = &a.blobs(e)[0];
+        let mut v = vec![0; b.raw_len as usize];
+        a.read(b, &mut v).unwrap();
+        orr_pack::texture::TextureInfo::parse(&v)
+            .unwrap()
+            .header
+            .primaries
+    };
+    for (attrs, want) in [
+        (r#"colorspace="data""#, 0),
+        ("", 0),
+        (r#"colorspace="srgb_rec709_scene""#, 0),
+        (r#"colorspace="lin_p3d65_scene""#, 1),
+        (r#"colorspace="acescg""#, 2),
+    ] {
+        let image = image_node("color3", "tagged.png", attrs);
+        let (a, report) = cook_body(&image, color).unwrap();
+        assert_eq!(primaries(&a), want, "{attrs}");
+        let warnings = &report.assets[0].warnings;
+        let clipped = warnings.iter().filter(|w| w.contains("Rec.2020")).count();
+        assert_eq!(clipped, usize::from(want == 2), "{attrs}: {warnings:?}");
+    }
+}
+
+/// Spec L184: "implementations are expected to translate those color values", and L331's working
+/// space is "the default color space for all image inputs and color values". The audit's rows:
+/// 0.5 under an sRGB name reads 0.214, a document in ACEScg converts what it doesn't mark, and
+/// "data" (L381) converts nothing.
+#[test]
+fn color_values_read_in_their_space() {
+    let (a, _) = cook_body(
+        "",
+        r#"<input name="base_color" type="color3" value="0.5,0.5,0.5" colorspace="srgb_rec709_scene"/>
+           <input name="base_weight" type="float" value="0.5" colorspace="srgb_rec709_scene"/>"#,
+    )
+    .unwrap();
+    let m = material(&a);
+    assert!(
+        m.base_color.iter().all(|c| near(*c, 0.214)),
+        "{:?}",
+        m.base_color
+    );
+    assert!(close(m.base_weight, 0.5));
+
+    let doc = write_doc(
+        &fixture(),
+        "m.mtlx",
+        r#"colorspace="acescg""#,
+        "",
+        r#"<input name="base_color" type="color3" value="0.5,0.25,0.125"/>
+           <input name="specular_color" type="color3" value="0.5,0.25,0.125" colorspace="data"/>"#,
+    );
+    let (a, _) = cook(&doc, "M").unwrap();
+    let m = material(&a);
+    // By the published ACEScg to linear Rec.709 matrix.
+    let want = [0.6867, 0.2188, 0.0999];
+    assert!(
+        m.base_color.iter().zip(want).all(|(c, w)| near(*c, w)),
+        "{:?}",
+        m.base_color
+    );
+    assert_eq!(m.specular_color, [0.5, 0.25, 0.125]);
 }

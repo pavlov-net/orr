@@ -1,16 +1,20 @@
 //! Texture cook: import, mip chains, encoding, and the tiled archive layout.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+pub(crate) mod color;
 mod encode;
 mod env;
 mod load;
 pub(crate) mod material;
 mod mips;
 pub(crate) mod neural;
+pub(crate) mod tiles;
 
 pub use orr_color::Primaries;
 use orr_math::Vec3;
+use orr_pack::material::wrap;
 use orr_pack::texture::{
     ExtractedLight, FormatInfo, TILE_BYTES, TextureHeader, TextureInfo, full_mip_count, mip_size,
     normal, tail_first_mip, tile,
@@ -18,6 +22,7 @@ use orr_pack::texture::{
 use orr_pack::{ArchiveWriter, AssetId, BcLayout, BlobIn, Class, Filter, Hash32, Span};
 use serde::Deserialize;
 
+use color::{BELOW_ZERO, Decode, ImageColor, Read};
 use ctt::Quality;
 pub(crate) use encode::{Encoding, encode as encode_chains};
 use load::{Blocks, Source};
@@ -43,11 +48,12 @@ pub struct TextureSettings {
     /// whole number of texels and at least 4x4 filter each cell alone and match alpha
     /// coverage per cell; smaller mips filter the whole texture.
     pub atlas_grid: Option<[u16; 2]>,
-    /// Source primaries of color texels; overrides the file's tag. Untagged files are
-    /// Rec. 709.
+    /// Source primaries of color texels; overrides what the file states. Files that state none
+    /// are Rec. 709, and primaries with no id convert to Rec. 2020, as does a file that reads below
+    /// 0 unless these are set.
     pub primaries: Option<Primaries>,
     pub filter: MipFilter,
-    /// Edge handling of the mip filter per axis (u, v).
+    /// What the mip filter reads past each edge, per axis (u, v).
     pub wrap: [Wrap; 2],
     /// Store BCn blocks split into endpoint and index streams, which zstd compresses
     /// better. `None` takes the format's default.
@@ -153,7 +159,7 @@ pub enum MipFilter {
     Kaiser,
 }
 
-/// Filter edge handling.
+/// What a texture reads past 0..1.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Wrap {
@@ -161,6 +167,40 @@ pub enum Wrap {
     Repeat,
     Clamp,
     Mirror,
+    /// Transparent black, which filtering blends with the edge texels.
+    Border,
+    /// A value of the texture's binding, and [`Self::Clamp`] within 0..1. Nothing blends across
+    /// the edge, so mips filter as under [`Self::Clamp`].
+    Constant,
+}
+
+impl Wrap {
+    /// Whether reads past 0..1 leave the texture for a value of their own.
+    pub(crate) fn bounded(self) -> bool {
+        matches!(self, Self::Border | Self::Constant)
+    }
+
+    /// The `TextureBinding::wrap` value.
+    pub(crate) fn binding(self) -> u8 {
+        match self {
+            Self::Repeat => wrap::REPEAT,
+            Self::Clamp => wrap::CLAMP,
+            Self::Mirror => wrap::MIRROR,
+            Self::Border => wrap::BORDER,
+            Self::Constant => wrap::CONSTANT,
+        }
+    }
+
+    /// The mode of a `TextureBinding::wrap` value.
+    pub(crate) fn of_binding(v: u8) -> Self {
+        match v {
+            wrap::CLAMP => Self::Clamp,
+            wrap::MIRROR => Self::Mirror,
+            wrap::BORDER => Self::Border,
+            wrap::CONSTANT => Self::Constant,
+            _ => Self::Repeat,
+        }
+    }
 }
 
 /// Linear float RGBA texels, row-major.
@@ -266,11 +306,29 @@ pub(crate) struct Built {
     info: TextureInfo,
     blobs: Vec<Vec<u8>>,
     filter: Filter,
+    /// Its source holds colors a texture can't.
+    pub(crate) clips: bool,
 }
 
 /// The report's warning for a source that reads the animated image `image`.
 pub(crate) fn first_frame_warning(image: &str) -> String {
     format!("image {image} is animated; only its first frame is cooked")
+}
+
+/// The report's warning for `image`, which can't be read for `why`, so its inputs read their
+/// fallback.
+pub(crate) fn unread_warning(image: &str, why: &str) -> String {
+    format!("image {image} reads as its input's fallback: {why}")
+}
+
+/// The report's warning for file `image`, which names a tile no set holds.
+pub(crate) fn past_tile_warning(image: &str) -> String {
+    format!("image {image} is not read: tiles stop at column and row 65535")
+}
+
+/// The report's warning for `images`, with colors a texture can't hold.
+pub(crate) fn gamut_warning(images: &str) -> String {
+    format!("colors of {images} below 0 or outside Rec.2020 clip")
 }
 
 /// The report's warning for a USD normal map `image` with no scale or bias, which an unsigned
@@ -289,6 +347,13 @@ impl Built {
             _ => Filter::None,
         };
         self
+    }
+
+    fn with_clips(self, clips: &AtomicBool) -> Self {
+        Self {
+            clips: clips.load(Ordering::Relaxed),
+            ..self
+        }
     }
 }
 
@@ -364,6 +429,8 @@ struct NormalSource {
     y: usize,
     /// The texel channel holding z, where it holds one.
     z: usize,
+    /// How its channels read as numbers.
+    decode: Decode,
 }
 
 impl NormalSource {
@@ -395,6 +462,7 @@ fn stores_normals(layers: &[Img], rg: bool) -> bool {
         signed,
         y: 1,
         z: 2,
+        decode: Decode::STORED,
     });
     if rg {
         let outside = |s: NormalSource| {
@@ -489,6 +557,7 @@ fn layout(
         info: TextureInfo { header, lights },
         blobs,
         filter: Filter::None,
+        clips: false,
     }
 }
 
@@ -549,8 +618,38 @@ pub(crate) fn encoders(quality: Quality) -> String {
     format!("bc7e for BC7, amd for BC4 BC5, intel for BC6H, preset {quality:?}")
 }
 
+/// Whether `usage` holds color, not numbers.
+fn reads_color(usage: Usage) -> bool {
+    matches!(
+        usage,
+        Usage::Color
+            | Usage::ColorAlpha
+            | Usage::Hdr
+            | Usage::Data(DataFormat::Rgba8Srgb)
+            | Usage::Environment { .. }
+    )
+}
+
 fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result<Built, String> {
-    let primaries = s.primaries.or(src.primaries).unwrap_or(Primaries::Rec709);
+    let color = reads_color(s.usage);
+    let negatives = color && (src.negatives || src.color.can_read_below());
+    let lowest = if negatives {
+        load::stored_range(&src)?.map(|r| r.0)
+    } else {
+        [0.0; 4]
+    };
+    let (read, primaries, gamut) = ImageColor::File.color(&src.color, s.primaries, |read| {
+        lowest[..3].iter().any(|&v| read.alone(v) < BELOW_ZERO)
+    });
+    let gamut = gamut.as_ref();
+    let measures = negatives || (color && read.reaches_past(gamut));
+    let clipped = AtomicBool::new(false);
+    // The conversion says whether a color clips, and the first that does settles it.
+    let measure = |read: &Read, p: [f32; 4]| {
+        if measures && !clipped.load(Ordering::Relaxed) && read.clips(p, gamut) {
+            clipped.store(true, Ordering::Relaxed);
+        }
+    };
     if let Usage::Environment {
         light_threshold,
         max_lights,
@@ -560,7 +659,17 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
             return Err("environment maps have mips".into());
         }
         load::decode_layers(&mut src)?;
-        return env::cook(src, s, primaries, light_threshold, max_lights, quality);
+        // Nothing lies behind an environment, so its stored color is the light it gives.
+        let read = Read {
+            straight: false,
+            ..read
+        };
+        for p in src.layers.iter_mut().flat_map(|l| &mut l.px) {
+            measure(&read, *p);
+            *p = read.color(*p, gamut);
+        }
+        return env::cook(src, s, primaries, light_threshold, max_lights, quality)
+            .map(|b| b.with_clips(&clipped));
     }
     let full_chain = s.mips.unwrap_or(s.usage.has_mips());
     let kept_levels = |b: &Blocks| kept_mip_count(b.w, b.h, s.max_size, full_chain) as usize;
@@ -588,12 +697,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         (Some(c), Usage::Linear1) => Some((0, c)),
         (Some(_), u) => return Err(format!("alpha_cutoff does not apply to {u:?}")),
     };
-    let color = matches!(
-        s.usage,
-        Usage::Color | Usage::ColorAlpha | Usage::Hdr | Usage::Data(DataFormat::Rgba8Srgb)
-    );
     let normal = s.usage == Usage::Normal;
-    let srgb = src.srgb;
     let vectors = normal && src.float && src.negatives;
     if vectors {
         load::decode_layers(&mut src)?;
@@ -603,12 +707,12 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         signed: src.signed || (vectors && stores_normals(&src.layers, src.rg)),
         y: 1,
         z: 2,
+        decode: Decode::STORED,
     };
     let linear = |p: &mut [f32; 4]| {
-        if color && srgb {
-            for c in &mut p[..3] {
-                *c = srgb_to_linear(*c);
-            }
+        if color {
+            measure(&read, *p);
+            *p = read.color(*p, gamut);
         }
         if normal {
             let [x, y, z] = source.read(*p);
@@ -640,7 +744,15 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         .as_ref()
         .filter(|b| b.levels[0].len() == kept_levels(b) && s.atlas_grid.is_none())
     {
-        if b.vk_format == encoding.vk_format() && (coverage.is_none() || !remakes) {
+        let stored = if encoding == Encoding::Bc7Srgb {
+            Decode::SRGB
+        } else {
+            Decode::STORED
+        };
+        if b.vk_format == encoding.vk_format()
+            && (coverage.is_none() || !remakes)
+            && (!color || gamut.is_none() && read.is(stored))
+        {
             let (w, h) = (b.w, b.h);
             let skip = skipped_mips(w, h, s.max_size);
             let levels: Vec<Vec<Vec<u8>>> = src
@@ -672,7 +784,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
                     mips::keep_heights(chain, mips::settle_heights(l));
                 }
             }
-            return finish(chains, &plan);
+            return finish(chains, &plan).map(|b| b.with_clips(&clipped));
         }
     }
     load::decode_layers(&mut src)?;
@@ -684,7 +796,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
             l
         })
         .collect();
-    build(layers, &plan)
+    build(layers, &plan).map(|b| b.with_clips(&clipped))
 }
 
 /// Every layer's mips of `b` as stored, without those over `max_size`, decoded and passed

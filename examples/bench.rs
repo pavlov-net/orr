@@ -7,17 +7,17 @@
 //! `--counter-frame N` says) and adds them to the report.
 //!
 //! `bench [--synthetic] [--script NAME] [--script-frames N] [--headless] [scene switches...]`
-//! (see `examples::vegetation`). It runs all four scripts for 600 frames each unless told
+//! (see `orr_examples::vegetation`). It runs all four scripts for 600 frames each unless told
 //! otherwise, in a window unless `--headless`, at 1920 x 1080 unless `--extent` says.
 #![allow(clippy::print_stdout)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use examples::vegetation::{Run, Sample, Script, Settings, run, settled};
-use examples::{Options, assert_clean, device, git_rev, report_dir, request_perf_counters};
 use orr::orr_gpu::{COUNTER_METRICS, CounterReport, MemoryKind};
 use orr::{FrameStats, LightingStats};
+use orr_examples::vegetation::{Run, Sample, Script, Settings, run, settled};
+use orr_examples::{Options, assert_clean, device, git_rev, report_dir, request_perf_counters};
 use serde_json::{Map, Value, json};
 
 const SCRIPT_FRAMES: u64 = 600;

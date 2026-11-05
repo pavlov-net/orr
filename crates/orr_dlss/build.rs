@@ -8,14 +8,15 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(ngx)");
     println!("cargo::rustc-check-cfg=cfg(vulkan)");
+    println!("cargo::rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-changed=wrapper.h");
+    println!("cargo::rerun-if-env-changed=DLSS_SDK");
+    println!("cargo::rerun-if-env-changed=VULKAN_SDK");
     if std::env::var_os("DEP_ORR_GPU_VULKAN").is_none() {
         return;
     }
     println!("cargo::rustc-cfg=vulkan");
     println!("cargo::metadata=built=1");
-    println!("cargo::rerun-if-env-changed=DLSS_SDK");
-    println!("cargo::rerun-if-env-changed=VULKAN_SDK");
-    println!("cargo::rerun-if-changed=wrapper.h");
     if std::env::var_os("CARGO_FEATURE_MOCK").is_some() {
         return;
     }

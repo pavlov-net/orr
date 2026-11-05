@@ -3,7 +3,7 @@
 // as the grid topology.
 #include "orr_root.h"
 import orr_shaders.random;
-import examples.field;
+import orr_examples.field;
 import orr_scene.producer;
 import orr_scene.tables;
 

@@ -74,7 +74,8 @@ use crate::patch::{self, MaterialPatch, MeshPatch};
 use crate::shading;
 use crate::skin::ClipSettings;
 use crate::subd::SubdSettings;
-use crate::texture::material::{ImageData, ImageFile, TextureRules};
+use crate::texture::material::{ImageData, ImageFile, ImageTile, TextureRules};
+use crate::texture::tiles::{UDIM, udim_cell};
 use crate::{Error, Result};
 
 use mesh::{CageBuilder, MeshPrim, Placing, Welder};
@@ -1314,23 +1315,45 @@ impl<'s> Importer<'s> {
         let images = &mut self.images;
         let image_of = &mut self.image_of;
         let reads = Rc::clone(&self.reads);
-        let mut load = |a: &sdf::AssetPath| -> Result<usize, String> {
-            let resolved = a
-                .resolved_path()
-                .ok_or_else(|| format!("asset {} does not resolve", a.asset_path()))?
-                .to_string();
-            if let Some(&i) = image_of.get(&resolved) {
-                return Ok(i);
+        let mut load = |a: &sdf::AssetPath| -> usize {
+            let name = a.asset_path().to_string();
+            let key = a.resolved_path().unwrap_or(&name).to_string();
+            if let Some(&i) = image_of.get(&key) {
+                return i;
             }
-            let bytes = Recorder::new(Rc::clone(&reads))
-                .read(&resolved)
-                .map_err(|e| format!("{resolved}: {e}"))?;
-            images.push(ImageFile {
-                name: a.asset_path().to_string(),
-                data: ImageData::Bytes(bytes),
-            });
-            image_of.insert(resolved, images.len() - 1);
-            Ok(images.len() - 1)
+            let read = |name: String, resolved: &str| match Recorder::new(Rc::clone(&reads))
+                .read(resolved)
+            {
+                Ok(bytes) => ImageFile {
+                    name,
+                    data: ImageData::Bytes(bytes),
+                },
+                Err(e) => ImageFile::unread(name, e.to_string()),
+            };
+            let tiles = a
+                .resolved_path()
+                .and_then(|r| Some(reads.borrow().tiles(r)?.to_vec()));
+            let image = match (tiles, a.resolved_path()) {
+                (Some(found), _) => {
+                    let mut tiles = Vec::with_capacity(found.len());
+                    for (n, path) in found {
+                        images.push(read(name.replace(UDIM, &n.to_string()), &path));
+                        tiles.push(ImageTile {
+                            cell: udim_cell(n),
+                            image: images.len() - 1,
+                        });
+                    }
+                    ImageFile {
+                        name,
+                        data: ImageData::Tiles(tiles),
+                    }
+                }
+                (None, Some(resolved)) => read(name, resolved),
+                (None, None) => ImageFile::unread(name, "it does not resolve".into()),
+            };
+            images.push(image);
+            image_of.insert(key, images.len() - 1);
+            images.len() - 1
         };
         let (net, surface, displacement) = shade::network(&self.stage, self.time, p, &mut load)?;
         let reads = net.primvar_reads();
@@ -1388,8 +1411,7 @@ impl<'s> Importer<'s> {
                 let primvars: Vec<&str> = self.settings.uv_sets().collect();
                 let images = &mut self.images;
                 let image_of = &mut self.image_of;
-                let mut solid = |rgb: [f32; 3]| {
-                    let image = shading::solid_image(rgb);
+                let mut add = |image: ImageFile| {
                     *image_of.entry(image.name.clone()).or_insert_with(|| {
                         images.push(image);
                         images.len() - 1
@@ -1399,7 +1421,7 @@ impl<'s> Importer<'s> {
                     meters_per_unit,
                     primvars: &primvars,
                     reads: &reads,
-                    solid: &mut solid,
+                    add: &mut add,
                 };
                 let mapped = shading::map(&s.net, s.surface, s.displacement, &mut host)
                     .map_err(|e| format!("material {p}: {e}"))?;

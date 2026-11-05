@@ -3,17 +3,22 @@
 //! `overview.dox` in usdGeom, `bindingAPI.h` and `schemas.dox` in usdSkel, and
 //! `spec_usdpreviewsurface.rst` (PS), all as OpenUSD's `release` branch has them.
 
+#[allow(dead_code)]
+#[path = "common/tagged.rs"]
+mod tagged;
+
 use std::path::PathBuf;
 
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, NodeSelect, Source, Subdivision, UsdSettings};
 use orr_math::{Mat4, Quat, Vec3};
 use orr_pack::clip::Clip;
 use orr_pack::instance::{InstancePageInfo, decode};
-use orr_pack::material::{Material, slot};
+use orr_pack::material::{Material, slot, wrap};
 use orr_pack::mesh::{MeshInfo, PageView};
 use orr_pack::model::ModelInfo;
 use orr_pack::skeleton::{SkeletonInfo, Trs};
 use orr_pack::texture::TextureInfo;
+use orr_pack::tiles::TextureTiles;
 use orr_pack::{Archive, AssetId, Blob, Class, Target};
 
 const HEAD: &str = r#"#usda 1.0
@@ -1056,6 +1061,8 @@ fn texture(name: &str, inputs: &str) -> String {
     )
 }
 
+const RAW: &str = r#"token inputs:sourceColorSpace = "raw""#;
+
 const READER: &str = r#"def Shader "R"
     {
         uniform token info:id = "UsdPrimvarReader_float2"
@@ -1104,6 +1111,134 @@ fn red(a: &Archive, m: &Material, s: usize) -> Vec<f32> {
 
 fn gradient() -> Vec<u8> {
     png(8, 8, |x, _| [(x * 32) as u8, (x * 32) as u8, 0, 255])
+}
+
+/// The binding of `diffuseColor` reading texture `T`, with `inputs` on the texture.
+fn diffuse_binding(name: &str, inputs: &str, image: &[u8]) -> orr_pack::material::TextureBinding {
+    let body = previewed(
+        "color3f inputs:diffuseColor.connect = </M/T.outputs:rgb>",
+        &format!("{}\n{READER}", texture("T", inputs)),
+        ST,
+    );
+    material(&shaded(name, &body, image)).textures[slot::BASE_COLOR]
+}
+
+/// PS `wrapS`, `wrapT`: `black`, `clamp`, `repeat`, `mirror` and the default `useMetadata`: "If
+/// the texture contains no such metadata, then fall back to *black*".
+#[test]
+fn wrap_modes_reach_the_binding_and_metadata_falls_back_to_black() {
+    use orr_pack::material::wrap;
+    let cases = [
+        ("", [wrap::BORDER; 2]),
+        (r#"token inputs:wrapS = "useMetadata""#, [wrap::BORDER; 2]),
+        (r#"token inputs:wrapT = "black""#, [wrap::BORDER; 2]),
+        (
+            r#"token inputs:wrapS = "repeat"
+            token inputs:wrapT = "clamp""#,
+            [wrap::REPEAT, wrap::CLAMP],
+        ),
+        (
+            r#"token inputs:wrapS = "mirror"
+            token inputs:wrapT = "repeat""#,
+            [wrap::MIRROR, wrap::REPEAT],
+        ),
+    ];
+    for (i, (inputs, want)) in cases.into_iter().enumerate() {
+        let b = diffuse_binding(&format!("wrap-{i}"), inputs, &gradient());
+        assert_eq!(b.wrap, want, "{inputs:?}");
+    }
+}
+
+/// PS `wrapS`: `useMetadata` reads what the texture's metadata states, here the `wrapmodes`
+/// attribute the OpenEXR standard defines; a stated mode stands.
+#[test]
+fn use_metadata_reads_an_openexr_wrapmodes_attribute() {
+    use exr::prelude::*;
+    use orr_pack::material::wrap;
+    let attributes = LayerAttributes {
+        wrap_mode_name: Some(Text::from("periodic, mirror")),
+        ..LayerAttributes::default()
+    };
+    let layer = Layer::new(
+        (8, 8),
+        attributes,
+        Encoding::FAST_LOSSLESS,
+        SpecificChannels::rgba(|Vec2(x, _): Vec2<usize>| (x as f32 / 8.0, 0.5, 0.25, 1.0)),
+    );
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    Image::from_layer(layer)
+        .write()
+        .to_buffered(&mut bytes)
+        .unwrap();
+    let bytes = bytes.into_inner();
+
+    let b = diffuse_binding("wrap-exr", "", &bytes);
+    assert_eq!(b.wrap, [wrap::REPEAT, wrap::MIRROR]);
+    let b = diffuse_binding("wrap-exr-s", r#"token inputs:wrapS = "clamp""#, &bytes);
+    assert_eq!(b.wrap, [wrap::CLAMP, wrap::MIRROR]);
+}
+
+/// PS `black`: "transparent black (0.0, 0.0, 0.0, 0.0) outside unit square". Scale and bias
+/// follow the read, so a bias is what reads there; an image of one value is that value only
+/// inside the square, so it stays a texture; and an alpha the material doesn't read as opacity
+/// doesn't cut the surface away there.
+#[test]
+fn black_reads_transparent_black_through_the_reader() {
+    use orr_pack::material::wrap;
+    let flat = png(8, 8, |_, _| [64, 64, 64, 255]);
+    let b = diffuse_binding("black-flat", "", &flat);
+    assert_ne!(b.texture, AssetId::NONE, "the image alone is not the input");
+    assert_eq!((b.wrap, b.outside), ([wrap::BORDER; 2], [0.0; 4]));
+
+    let bias = previewed(
+        "color3f inputs:diffuseColor.connect = </M/T.outputs:rgb>",
+        &format!(
+            "{}\n{READER}",
+            texture("T", "float4 inputs:bias = (0.25, 0.5, 0.75, 0)")
+        ),
+        ST,
+    );
+    let m = material(&shaded("black-bias", &bias, &gradient()));
+    let b = m.textures[slot::BASE_COLOR];
+    assert_eq!(
+        b.wrap,
+        [wrap::CONSTANT; 2],
+        "no hardware border reads a bias"
+    );
+    // The field holds what the reader reaches past 1.
+    for (c, want) in [0.25, 0.5, 0.75].into_iter().enumerate() {
+        let got = m.base_color[c] * b.outside[c];
+        assert!((got - want).abs() < 1e-5, "channel {c}: {got}");
+    }
+
+    let rough = previewed(
+        "float inputs:roughness.connect = </M/T.outputs:r>",
+        &format!(
+            "{}\n{READER}",
+            texture(
+                "T",
+                r#"float4 inputs:scale = (-1, -1, -1, 1)
+                float4 inputs:bias = (1, 1, 1, 0)"#
+            )
+        ),
+        ST,
+    );
+    let m = material(&shaded("black-gloss", &rough, &gradient()));
+    let b = m.textures[slot::ROUGHNESS];
+    assert_eq!(b.wrap, [wrap::CONSTANT; 2]);
+    assert_eq!(b.outside[0], 1.0, "1 - t of a black texel");
+
+    let cut = previewed(
+        r#"color3f inputs:diffuseColor.connect = </M/T.outputs:rgb>
+        float inputs:opacity = 0.75
+        float inputs:opacityThreshold = 0.5"#,
+        &format!("{}\n{READER}", texture("T", "")),
+        ST,
+    );
+    let m = material(&shaded("black-opaque", &cut, &gradient()));
+    let b = m.textures[slot::BASE_COLOR];
+    assert_eq!(b.wrap, [wrap::CONSTANT; 2]);
+    assert_eq!(b.outside, [0.0, 0.0, 0.0, 1.0]);
 }
 
 /// PS defaults and parameters: `ior` "including the clearcoat if clearcoat > 0";
@@ -1197,7 +1332,7 @@ fn opacity_mode_picks_transmission_or_coverage() {
     // A texture's opacity inverts into the transmission slot.
     let body = previewed(
         "float inputs:opacity.connect = </M/T.outputs:r>",
-        &format!("{}\n{READER}", texture("T", "")),
+        &format!("{}\n{READER}", texture("T", RAW)),
         ST,
     );
     let a = shaded("opacity-textured", &body, &gradient());
@@ -1209,10 +1344,31 @@ fn opacity_mode_picks_transmission_or_coverage() {
     assert!((t[3] - (1.0 - 96.0 / 255.0)).abs() < 0.02, "{}", t[3]);
 }
 
+/// PS `occlusion`: "pathtracers will likely choose to ignore it". Its reader's image isn't
+/// opened, so one that doesn't decode cooks, and its `scale` means nothing either.
+#[test]
+fn the_occlusion_input_is_ignored() {
+    let body = previewed(
+        "float inputs:occlusion.connect = </M/T.outputs:r>",
+        &format!(
+            "{}\n{READER}",
+            texture("T", "float4 inputs:scale = (0.5, 0.5, 0.5, 1)")
+        ),
+        ST,
+    );
+    let a = shaded("occlusion", &body, b"not an image");
+    let bound = material(&a).textures.map(|t| t.texture);
+    assert_eq!(bound, [AssetId::NONE; slot::COUNT]);
+}
+
 /// PS `scale` and `bias`: "output = textureValue * scale + bias", on any input.
 #[test]
 fn a_texture_bias_applies_to_scalar_and_color_inputs() {
-    let gloss = "float4 inputs:scale = (-1, -1, -1, 1)\n float4 inputs:bias = (1, 1, 1, 0)";
+    let gloss = r#"token inputs:sourceColorSpace = "raw"
+        float4 inputs:scale = (-1, -1, -1, 1)
+        float4 inputs:bias = (1, 1, 1, 0)
+        token inputs:wrapS = "repeat"
+        token inputs:wrapT = "repeat""#;
     let body = previewed(
         "float inputs:roughness.connect = </M/T.outputs:r>",
         &format!("{}\n{READER}", texture("T", gloss)),
@@ -1237,7 +1393,7 @@ fn a_texture_bias_applies_to_scalar_and_color_inputs() {
             "{}\n{READER}",
             texture(
                 "T",
-                "token inputs:sourceColorSpace = \"raw\"\n float4 inputs:scale = (0.5, 0.5, 0.5, 1)\n float4 inputs:bias = (0.25, 0, 0.5, 0)"
+                "token inputs:sourceColorSpace = \"raw\"\n float4 inputs:scale = (0.5, 0.5, 0.5, 1)\n float4 inputs:bias = (0.25, 0, 0.5, 0)\n token inputs:wrapS = \"repeat\"\n token inputs:wrapT = \"repeat\""
             )
         ),
         ST,
@@ -1477,6 +1633,270 @@ fn displacement_reads_in_the_stage_metric() {
     assert!(near(m.displacement_offset, 0.1), "{m:?}");
 }
 
+/// PS `fallback`: "Fallback value used when texture can not be read", default (0, 0, 0, 1), with
+/// `output = textureValue * scale + bias`; Storm's accessor applies scale and bias to it as well.
+#[test]
+fn a_texture_that_can_not_be_read_reads_its_fallback() {
+    let unread = |inputs: &str, wired: &str, image: Option<&[u8]>| {
+        let d = dir("fallback");
+        if let Some(bytes) = image {
+            std::fs::write(d.join("tex.png"), bytes).unwrap();
+        }
+        let prims = format!("{}\n{READER}", texture("T", inputs));
+        let body = previewed(wired, &prims, ST);
+        material(&cook_at(&d, &body, UsdSettings::default()).unwrap())
+    };
+    const FALLBACK: &str = "float4 inputs:fallback = (0.25, 0.5, 0.75, 0.125)";
+    const DIFFUSE: &str = "color3f inputs:diffuseColor.connect = </M/T.outputs:rgb>";
+    const ROUGH: &str = "float inputs:roughness.connect = </M/T.outputs:g>";
+
+    let m = unread(FALLBACK, DIFFUSE, None);
+    assert_eq!(m.textures[slot::BASE_COLOR].texture, AssetId::NONE);
+    assert!(
+        near(m.base_color[0], 0.25) && near(m.base_color[2], 0.75),
+        "{m:?}"
+    );
+
+    // A file that resolves and doesn't decode can't be read either.
+    let m = unread(FALLBACK, ROUGH, Some(b"not an image"));
+    assert_eq!(m.textures[slot::ROUGHNESS].texture, AssetId::NONE);
+    assert!(near(m.specular_roughness, 0.5), "{m:?}");
+
+    let scaled = format!(
+        "{FALLBACK}\nfloat4 inputs:scale = (1, 0.5, 1, 1)\nfloat4 inputs:bias = (0, 0.25, 0, 0)"
+    );
+    let m = unread(&scaled, ROUGH, None);
+    assert!(near(m.specular_roughness, 0.5), "{m:?}");
+
+    // A stated value past 0..1 is no texel, and reaches the scale whole.
+    let past = "float4 inputs:fallback = (2, 2, 2, 1)\nfloat4 inputs:scale = (0.25, 0.25, 0.25, 1)";
+    let m = unread(past, ROUGH, None);
+    assert!(near(m.specular_roughness, 0.5), "{m:?}");
+    assert!(near(unread(past, DIFFUSE, None).base_color[0], 0.5));
+
+    // Stated colors aren't encoded, so a source color space leaves them be.
+    let srgb = format!(
+        r#"{FALLBACK}{}token inputs:sourceColorSpace = "sRGB""#,
+        "\n"
+    );
+    let m = unread(&srgb, DIFFUSE, None);
+    assert!(near(m.base_color[0], 0.25), "{m:?}");
+
+    let m = unread("", DIFFUSE, None);
+    assert_eq!(m.base_color, [0.0; 3], "the fallback's default");
+    let m = unread("", "float inputs:metallic.connect = </M/T.outputs:a>", None);
+    assert!(near(m.metalness, 1.0), "the default's alpha is 1: {m:?}");
+
+    // `file`'s own default is the empty string.
+    let prims = format!(
+        r#"def Shader "T"
+    {{
+        uniform token info:id = "UsdUVTexture"
+        {FALLBACK}
+        float outputs:g
+    }}"#
+    );
+    let m = material(&cook("fallback-no-file", &previewed(ROUGH, &prims, ST)));
+    assert!(near(m.specular_roughness, 0.5), "{m:?}");
+}
+
+/// PS `fallback` reads only while the texture can't: the file appearing later cooks it.
+#[test]
+fn a_fallback_stands_only_until_the_file_appears() {
+    let d = dir("fallback-late");
+    let prims = format!(
+        "{}\n{READER}",
+        texture("T", "float4 inputs:fallback = (0, 0.5, 0, 1)")
+    );
+    let body = previewed(
+        "float inputs:roughness.connect = </M/T.outputs:g>",
+        &prims,
+        ST,
+    );
+    let path = d.join("stage.usda");
+    std::fs::write(&path, format!("{HEAD}\n{body}")).unwrap();
+    let out = d.join("out.orr");
+    let cook_file = || {
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::File(out.clone()),
+                vec![AssetSpec {
+                    name: "u".into(),
+                    source: Source::Usd {
+                        path: path.clone(),
+                        settings: UsdSettings::default(),
+                    },
+                }],
+            )],
+        };
+        orr_cook::cook(&manifest, &Default::default()).unwrap();
+        material(&Archive::open(&out).unwrap())
+    };
+    assert!(near(cook_file().specular_roughness, 0.5));
+    let varying = png(8, 8, |x, y| [(x * 32) as u8, (y * 32) as u8, 0, 255]);
+    std::fs::write(d.join("tex.png"), varying).unwrap();
+    assert_ne!(cook_file().textures[slot::ROUGHNESS].texture, AssetId::NONE);
+}
+
+/// A preview surface reading `tex.<UDIM>.png` in `d`, its `inputs` on the texture and `wired` on
+/// the surface.
+fn udim_stage(inputs: &str, wired: &str) -> String {
+    let texture = texture("T", inputs).replace("@tex.png@", "@tex.<UDIM>.png@");
+    previewed(wired, &format!("{texture}\n{READER}"), ST)
+}
+
+/// The tiles of the set slot `s` binds, as cell and mip 0 size.
+fn tiles_of(a: &Archive, m: &Material, s: usize) -> Vec<([u16; 2], [u32; 2])> {
+    let e = a.find(m.textures[s].texture).expect("bound");
+    assert_eq!(e.class, Class::TextureTiles as u16);
+    let set = TextureTiles::parse(&read(a, &a.blobs(e)[0])).unwrap();
+    set.tiles
+        .iter()
+        .map(|t| {
+            let e = a.find(t.texture).expect("a tile cooks");
+            let h = TextureInfo::parse(&read(a, &a.blobs(e)[0])).unwrap().header;
+            ([t.column, t.row], [h.width, h.height])
+        })
+        .collect()
+}
+
+/// PS `file`: "Mari UDIM substitution in *file* values uses the "<UDIM>" token"; the UDIM Tiling
+/// Constraints: "a maximum of ten tiles in the U direction", "within the range [1001, 1100]".
+/// Tile 1012 is u 1..2, v 1..2, and tiles keep their own sizes. A point on no tile names a file
+/// that isn't there, so it reads `fallback`, through `scale` and `bias`.
+#[test]
+fn a_udim_file_reads_as_tiles_across_st() {
+    let d = dir("udim");
+    let varying = |w: u32| png(w, w, move |x, y| [(x * 8) as u8, (y * 8) as u8, 0, 255]);
+    for (name, size) in [
+        ("1001", 8),
+        ("1002", 16),
+        ("1012", 4),
+        ("1101", 8),
+        ("1000", 8),
+    ] {
+        std::fs::write(d.join(format!("tex.{name}.png")), varying(size)).unwrap();
+    }
+    let inputs = format!(
+        "{RAW}\nfloat4 inputs:fallback = (0.25, 0.5, 0.75, 1)\n\
+         float4 inputs:scale = (0.5, 0.5, 0.5, 1)\nfloat4 inputs:bias = (0.25, 0, 0, 0)"
+    );
+    let wired = "float inputs:roughness.connect = </M/T.outputs:r>";
+    let body = udim_stage(&inputs, wired);
+    let a = cook_at(&d, &body, UsdSettings::default()).unwrap();
+    let m = material(&a);
+    let got = tiles_of(&a, &m, slot::ROUGHNESS);
+    let want = [([0, 0], [8; 2]), ([1, 0], [16; 2]), ([1, 1], [4; 2])];
+    assert_eq!(got, want);
+    let b = m.textures[slot::ROUGHNESS];
+    assert_eq!(b.wrap, [wrap::CLAMP; 2], "no point lies past a tile's edge");
+    assert!(near(b.outside[0], 0.375), "{b:?}");
+
+    // A channel of one value on every tile still reads otherwise past them.
+    std::fs::remove_file(d.join("tex.1002.png")).unwrap();
+    std::fs::remove_file(d.join("tex.1012.png")).unwrap();
+    let flat = png(8, 8, |_, _| [128, 128, 128, 255]);
+    std::fs::write(d.join("tex.1001.png"), flat).unwrap();
+    let a = cook_at(&d, &body, UsdSettings::default()).unwrap();
+    assert_eq!(tiles_of(&a, &material(&a), slot::ROUGHNESS).len(), 1);
+}
+
+/// PS `fallback`, per tile: a tile that can't be read is a point's file that can't be, and with
+/// none left the texture itself can't be.
+#[test]
+fn a_udim_set_reads_its_fallback_where_tiles_can_not_be_read() {
+    let d = dir("udim-unread");
+    let good = png(8, 8, |x, y| [(x * 32) as u8, (y * 32) as u8, 0, 255]);
+    std::fs::write(d.join("tex.1001.png"), good).unwrap();
+    std::fs::write(d.join("tex.1002.png"), b"not an image").unwrap();
+    let inputs = format!("{RAW}\nfloat4 inputs:fallback = (0.25, 0.5, 0.75, 1)");
+    let wired = "float inputs:roughness.connect = </M/T.outputs:g>";
+    let body = udim_stage(&inputs, wired);
+    let a = cook_at(&d, &body, UsdSettings::default()).unwrap();
+    let m = material(&a);
+    assert_eq!(tiles_of(&a, &m, slot::ROUGHNESS), [([0, 0], [8; 2])]);
+    assert!(near(m.textures[slot::ROUGHNESS].outside[0], 0.5));
+
+    std::fs::remove_file(d.join("tex.1001.png")).unwrap();
+    let m = material(&cook_at(&d, &body, UsdSettings::default()).unwrap());
+    assert_eq!(m.textures[slot::ROUGHNESS].texture, AssetId::NONE);
+    assert!(near(m.specular_roughness, 0.5), "{m:?}");
+
+    std::fs::remove_file(d.join("tex.1002.png")).unwrap();
+    let m = material(&cook_at(&d, &body, UsdSettings::default()).unwrap());
+    assert!(near(m.specular_roughness, 0.5), "no tile resolves: {m:?}");
+}
+
+/// A tile that appears later is a point's file that now resolves.
+#[test]
+fn a_udim_tile_appearing_cooks_the_set_again() {
+    let d = dir("udim-late");
+    let tile = png(8, 8, |x, y| [(x * 32) as u8, (y * 32) as u8, 0, 255]);
+    std::fs::write(d.join("tex.1001.png"), &tile).unwrap();
+    let body = udim_stage(RAW, "float inputs:roughness.connect = </M/T.outputs:r>");
+    let path = d.join("stage.usda");
+    std::fs::write(&path, format!("{HEAD}\n{body}")).unwrap();
+    let out = d.join("out.orr");
+    let tiles = || {
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::File(out.clone()),
+                vec![AssetSpec {
+                    name: "u".into(),
+                    source: Source::Usd {
+                        path: path.clone(),
+                        settings: UsdSettings::default(),
+                    },
+                }],
+            )],
+        };
+        orr_cook::cook(&manifest, &Default::default()).unwrap();
+        let a = Archive::open(&out).unwrap();
+        tiles_of(&a, &material(&a), slot::ROUGHNESS).len()
+    };
+    assert_eq!(tiles(), 1);
+    std::fs::write(d.join("tex.1002.png"), &tile).unwrap();
+    assert_eq!(tiles(), 2);
+}
+
+/// Inputs packed into one texture share it tile by tile when they read the same cells, and a set
+/// beside an image, or a set of other cells, keeps a texture of its own.
+#[test]
+fn inputs_share_tiles_only_at_the_same_cells() {
+    let d = dir("udim-pack");
+    let tile = png(8, 8, |x, y| [(x * 32) as u8, (y * 32) as u8, 0, 255]);
+    for name in ["tex.1001", "tex.1002", "other.1001", "plain"] {
+        std::fs::write(d.join(format!("{name}.png")), &tile).unwrap();
+    }
+    let reader =
+        |name: &str, file: &str| texture(name, RAW).replace("@tex.png@", &format!("@{file}@"));
+    let stage = |rough: &str, metal: &str| {
+        let prims = format!("{}\n{}\n{READER}", reader("T", rough), reader("U", metal));
+        previewed(
+            "float inputs:roughness.connect = </M/T.outputs:r>\n\
+             float inputs:metallic.connect = </M/U.outputs:g>",
+            &prims,
+            ST,
+        )
+    };
+    let cooked = |rough: &str, metal: &str| {
+        let body = stage(rough, metal);
+        let a = cook_at(&d, &body, UsdSettings::default()).unwrap();
+        let m = material(&a);
+        let same = m.textures[slot::ROUGHNESS].texture == m.textures[slot::METALNESS].texture;
+        (a, m, same)
+    };
+    let (a, m, same) = cooked("tex.<UDIM>.png", "tex.<UDIM>.png");
+    assert!(same, "one set of two channels");
+    assert_eq!(tiles_of(&a, &m, slot::ROUGHNESS).len(), 2);
+    assert_eq!(m.textures[slot::METALNESS].channels, 1);
+    let (a, m, same) = cooked("tex.<UDIM>.png", "other.<UDIM>.png");
+    assert!(!same, "other cells");
+    assert_eq!(tiles_of(&a, &m, slot::METALNESS).len(), 1);
+    let (.., same) = cooked("tex.<UDIM>.png", "plain.png");
+    assert!(!same, "a set and an image");
+}
+
 /// Where a slot's uv transform sends mesh uv `p`.
 fn sampled(m: &Material, s: usize, p: [f32; 2]) -> [f32; 2] {
     let [a, b, c, d, e, f] = m.uv_transforms[s];
@@ -1712,4 +2132,128 @@ fn a_clip_animates_the_joints_it_names() {
     assert_eq!(pose[1].translation, skeleton.rest[1].translation);
     let q = Quat::from_array(pose[0].rotation);
     assert!(q.angle_between(Quat::IDENTITY) < 1e-3);
+}
+
+/// A `UsdPreviewSurface` whose `input` of `kind` reads `output` of `tex.png` as `color_space`,
+/// repeating so that a flat image folds into its factor.
+fn read_through(input: &str, kind: &str, output: &str, color_space: &str) -> String {
+    previewed(
+        &format!("{kind} inputs:{input}.connect = </M/T.outputs:{output}>"),
+        &format!(
+            "{}\n{READER}",
+            texture(
+                "T",
+                &format!(
+                    "token inputs:sourceColorSpace = \"{color_space}\"
+ token inputs:wrapS = \"repeat\"
+ token inputs:wrapT = \"repeat\""
+                )
+            )
+        ),
+        ST,
+    )
+}
+
+/// PS `sourceColorSpace` `auto`: "Check for gamma/color space metadata in the texture file
+/// itself; if metadata is indicative of sRGB, mark texture as sRGB. If no relevant metadata is
+/// found, mark texture as sRGB if it is either 8-bit and has 3 channels or if it is 8-bit and has
+/// 4 channels. Otherwise, do not mark texture as sRGB". The row of 8-bit RGB at gamma 1 is Hio's
+/// reading (`stbImage.cpp`), which the text doesn't settle.
+#[test]
+fn auto_reads_file_metadata_then_channels_and_depth() {
+    use png::BitDepth::{Eight, Sixteen};
+    use png::ColorType::{Grayscale, Rgb};
+    let (linear, srgb) = (128.0 / 255.0, orr_color::srgb_decode(128.0 / 255.0) as f32);
+    let wide = [0x80u8, 0x80].repeat(3 * 64);
+    let gray = [128u8; 64];
+    let hint = tagged::gama(0.45455);
+    let hint: &[(&[u8; 4], &[u8])] = &[(b"gAMA", &hint)];
+    let one = tagged::gama(1.0);
+    let rows: [(&str, Vec<u8>, f32); 6] = [
+        ("rgb8", tagged::flat_rgb([128; 3], &[]), srgb),
+        (
+            "gray8",
+            tagged::png((Grayscale, Eight), [8, 8], &gray, None, &[]),
+            linear,
+        ),
+        (
+            "rgb16",
+            tagged::png((Rgb, Sixteen), [8, 8], &wide, None, &[]),
+            linear,
+        ),
+        (
+            "gray8_gamma",
+            tagged::png((Grayscale, Eight), [8, 8], &gray, None, hint),
+            srgb,
+        ),
+        (
+            "rgb16_gamma",
+            tagged::png((Rgb, Sixteen), [8, 8], &wide, None, hint),
+            srgb,
+        ),
+        (
+            "rgb8_gamma_1",
+            tagged::flat_rgb([128; 3], &[(b"gAMA", &one)]),
+            linear,
+        ),
+    ];
+    let body = read_through("diffuseColor", "color3f", "rgb", "auto");
+    for (name, image, want) in rows {
+        let got = material(&shaded(&format!("auto_{name}"), &body, &image)).base_color[0];
+        assert!((got - want).abs() < 2e-3, "{name}: {got}, not {want}");
+    }
+}
+
+/// PS `sourceColorSpace` marks the file, whatever reads it, which is why its `normal` input asks
+/// for `raw`: 188 into `roughness` is 0.503 under `auto` and `sRGB`, 0.737 under `raw`.
+#[test]
+fn the_color_space_holds_for_every_input_of_the_file() {
+    let image = tagged::flat_rgb([188; 3], &[]);
+    for (space, want) in [("auto", 0.503), ("sRGB", 0.503), ("raw", 188.0 / 255.0)] {
+        let body = read_through("roughness", "float", "r", space);
+        let name = format!("scalar_{}", space.to_lowercase());
+        let got = material(&shaded(&name, &body, &image)).specular_roughness;
+        assert!((got - want).abs() < 2e-3, "{space}: {got}, not {want}");
+    }
+}
+
+/// `colorSpace` metadata on the file names its space where `sourceColorSpace` leaves it to `auto`,
+/// and a `sourceColorSpace` authored over `auto` stands. This project's rule: PS doesn't mention
+/// the metadata, and `UsdAttribute::GetColorSpace` states what it means.
+#[test]
+fn file_metadata_stands_in_for_auto() {
+    let image = tagged::flat_rgb([128; 3], &[]);
+    let srgb = orr_color::srgb_decode(128.0 / 255.0) as f32;
+    for (space, want) in [("auto", 128.0 / 255.0), ("sRGB", srgb)] {
+        let body = read_through("diffuseColor", "color3f", "rgb", space).replace(
+            "@tex.png@",
+            "@tex.png@ (
+ colorSpace = \"lin_rec709_scene\"
+)",
+        );
+        let name = format!("metadata_{}", space.to_lowercase());
+        let got = material(&shaded(&name, &body, &image)).base_color[0];
+        assert!((got - want).abs() < 2e-3, "{space}: {got}, not {want}");
+    }
+}
+
+/// PS `raw`: "Use texture data as it was read from the texture and do not mark it as using a
+/// specific color space." Display P3 stated in a file stands under `auto` alone, `sRGB` naming the
+/// space itself.
+#[test]
+fn raw_takes_nothing_from_the_file() {
+    let image = tagged::varying_rgb(&[(b"cICP", &[12, 13, 0, 1])]);
+    for (space, want) in [("raw", 0), ("sRGB", 0), ("auto", 1)] {
+        let body = read_through("diffuseColor", "color3f", "rgb", space);
+        let a = shaded(
+            &format!("primaries_{}", space.to_lowercase()),
+            &body,
+            &image,
+        );
+        let e = a
+            .find(material(&a).textures[slot::BASE_COLOR].texture)
+            .unwrap();
+        let info = TextureInfo::parse(&read(&a, &a.blobs(e)[0])).unwrap();
+        assert_eq!(info.header.primaries, want, "{space}");
+    }
 }

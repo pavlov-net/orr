@@ -3,8 +3,11 @@
 //!
 //! Inputs connect by `nodename` (and `output`), by `nodegraph` (and `output`, which a graph of
 //! one output ignores), or inside a node graph by `interfacename`. File values take the
-//! `fileprefix` of their nearest scope and resolve against the directory of their document;
-//! their `colorspace` (inherited likewise) is `srgb_texture` for sRGB, anything else linear.
+//! `fileprefix` of their nearest scope and resolve against the directory of their document.
+//! Images and values of color types read in their `colorspace`, inherited likewise, so that the
+//! document's working space is the last scope, and "data" where no scope names one: values
+//! convert here to the linear Rec.709 of [`Material`](orr_pack::material::Material), images when
+//! they cook. A name that isn't a known space warns and reads as "data".
 //! A standalone material has no mesh, so each texture keeps its uv set (0 or 1) and transform
 //! in its slot; geometric properties name `st`, `UV0` or a `geompropdef` of a texcoord.
 //!
@@ -18,6 +21,15 @@
 //! `unittype` states nothing. `unitdef`s add to the standard units, and a type other than
 //! `distance` and `angle` has no scene unit, so it converts nothing. The root of a document
 //! states no unit.
+//!
+//! An image's `layer` reads that layer of its file, and a file without one reads as a file that
+//! can't be read. An image with none reads layer `default`, then `rgba`, then the whole file. A
+//! filename's `<UDIM>` and `<UVTILE>` make it a set of tiles ([`crate::texture::tiles`]), and
+//! `[token]` reads the value of a `token` of the nearest scope, then of the nodedef the graph
+//! implements. A token with no value, a `{hostattr}` or `{frame}` (no host states one) and any
+//! other `<geometry token>` (a standalone material has no geometry) leave the file unresolved, so
+//! the image reads its `default`. A raw `<` in an attribute reads as the specification's own
+//! filenames have it, though XML would have it escaped.
 //!
 //! An `xi:include` adds the children of the root of the document it names, read before the
 //! including document, so that the first of two like-named elements wins, as in the MaterialX
@@ -36,9 +48,11 @@ use std::path::{Path, PathBuf};
 use roxmltree::{Document, Node as XmlNode, NodeId};
 
 use crate::import::{Scene, SceneMaterial};
-use crate::shading::{self, Input, Network, Node, Unit, through};
+use crate::shading::{self, Input, Network, Node, Unit, is_color, through};
 use crate::state::{Input as FileInput, Memo};
-use crate::texture::material::{ImageData, ImageFile};
+use crate::texture::color::ImageColor;
+use crate::texture::material::{ImageData, ImageFile, ImageTile, Layer};
+use crate::texture::{self, tiles};
 use crate::{Error, Result};
 
 /// Elements that are not nodes.
@@ -111,44 +125,93 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
     let docs = reader
         .texts
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             Ok(Doc {
                 doc: Document::parse(&t.text).map_err(|e| fail(e.to_string()))?,
                 dir: t.path.parent().unwrap_or(Path::new("")),
                 parent: t.parent,
                 fallbacks: &t.fallbacks,
+                read_at: reader.order.iter().position(|&d| d == i),
             })
         })
         .collect::<Result<Vec<_>>>()?;
     let mut images = Vec::new();
-    let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
-    let mut load = |dir: &Path, file: &str| -> usize {
-        let p = dir.join(file);
-        *by_path.entry(p.clone()).or_insert_with(|| {
-            images.push(ImageFile {
-                name: file.to_string(),
+    let mut by_path: HashMap<(PathBuf, Layer), usize> = HashMap::new();
+    let mut listed = Vec::new();
+    let mut past = Vec::new();
+    let mut load = |dir: &Path, file: FileName, layer: Layer| -> usize {
+        let (file, unresolved) = match file {
+            Ok(file) => (file, None),
+            Err((file, why)) => (file, Some(why)),
+        };
+        let p = dir.join(&file);
+        let key = (p.clone(), layer);
+        if let Some(&i) = by_path.get(&key) {
+            return i;
+        }
+        let image = if let Some(why) = unresolved {
+            ImageFile::unread(file, why)
+        } else if tiles::tiled(&file) {
+            let scan = tiles::scan(&p);
+            past.extend(scan.past.iter().map(|f| texture::past_tile_warning(f)));
+            listed.extend(scan.holders.into_iter().map(|path| {
+                let hash = memo.hash(&path).unwrap_or(FileInput::ABSENT);
+                FileInput { path, hash }
+            }));
+            let tiles = scan
+                .files
+                .into_iter()
+                .map(|(cell, path)| {
+                    images.push(ImageFile {
+                        name: tiles::named(&file, cell).to_string_lossy().into_owned(),
+                        data: ImageData::File {
+                            path,
+                            read: None,
+                            layer: key.1.clone(),
+                        },
+                    });
+                    let image = images.len() - 1;
+                    ImageTile { cell, image }
+                })
+                .collect();
+            ImageFile {
+                name: file,
+                data: ImageData::Tiles(tiles),
+            }
+        } else {
+            ImageFile {
+                name: file,
                 data: ImageData::File {
                     path: p,
                     read: None,
+                    layer: key.1.clone(),
                 },
-            });
-            images.len() - 1
-        })
+            }
+        };
+        images.push(image);
+        by_path.insert(key, images.len() - 1);
+        images.len() - 1
     };
     let graph = network(&docs, &reader.order, material, &mut load).map_err(fail)?;
-    let mut solid = |rgb| {
-        images.push(shading::solid_image(rgb));
-        images.len() - 1
+    reader.files.append(&mut listed);
+    let mut added: HashMap<String, usize> = HashMap::new();
+    let mut add = |image: ImageFile| {
+        *added.entry(image.name.clone()).or_insert_with(|| {
+            images.push(image);
+            images.len() - 1
+        })
     };
     let mut host = shading::Host {
         meters_per_unit: 1.0,
         primvars: &["st"],
         reads: &[],
-        solid: &mut solid,
+        add: &mut add,
     };
     let mapped = shading::map(&graph.net, graph.surface, graph.displacement, &mut host)
         .map_err(|m| fail(format!("material {material}: {m}")))?;
     let mut warnings = graph.warnings;
+    warnings.extend(past);
     warnings.extend(mapped.warnings);
     Ok(Scene {
         models: Vec::new(),
@@ -203,6 +266,8 @@ struct Doc<'t> {
     dir: &'t Path,
     parent: Option<usize>,
     fallbacks: &'t [NodeId],
+    /// Its place in the order documents are read.
+    read_at: Option<usize>,
 }
 
 /// Reads a document and all it includes.
@@ -243,6 +308,7 @@ impl Reader<'_> {
         });
         let in_file = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
         let mut text = String::from_utf8(bytes).map_err(|e| in_file(&e))?;
+        text = escape_attributes(&text);
         let undeclared = matches!(
             Document::parse(&text),
             Err(roxmltree::Error::UnknownNamespace(prefix, _)) if prefix == "xi"
@@ -310,6 +376,47 @@ impl Reader<'_> {
         self.order.push(id);
         result
     }
+}
+
+/// `text` with each `<` in an attribute value escaped.
+fn escape_attributes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        let (before, tag) = rest.split_at(open);
+        out.push_str(before);
+        let skipped = [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")]
+            .into_iter()
+            .find(|(start, _)| tag.starts_with(start))
+            .map(|(_, end)| tag.find(end).map_or(tag.len(), |at| at + end.len()));
+        if let Some(len) = skipped {
+            out.push_str(&tag[..len]);
+            rest = &tag[len..];
+            continue;
+        }
+        let mut quote = None;
+        let mut end = tag.len();
+        for (at, c) in tag.char_indices() {
+            match (quote, c) {
+                (None, '>') => {
+                    out.push('>');
+                    end = at + 1;
+                    break;
+                }
+                (None, '"' | '\'') => quote = Some(c),
+                (Some(q), _) if q == c => quote = None,
+                _ => {}
+            }
+            if c == '<' && quote.is_some() {
+                out.push_str("&lt;");
+            } else {
+                out.push(c);
+            }
+        }
+        rest = &tag[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `text` with the `xi` prefix declared on its root, which the specification's own snippets
@@ -440,13 +547,20 @@ struct Graph {
     warnings: Vec<String>,
 }
 
+/// A filename with its substitutions made, or as it stands, with why it can't be resolved.
+type FileName = std::result::Result<String, (String, String)>;
+
+/// Adds the image of a filename, relative to a directory, read at a layer of its file, and returns
+/// its index.
+type Load<'a> = dyn FnMut(&Path, FileName, Layer) -> usize + 'a;
+
 /// The network of `material` in `docs`, the first of them the document cooked, walked in
-/// `order`. `load` reads an image file, relative to a directory, and returns its index.
+/// `order`.
 fn network(
     docs: &[Doc<'_>],
     order: &[usize],
     material: &str,
-    load: &mut dyn FnMut(&Path, &str) -> usize,
+    load: &mut Load<'_>,
 ) -> std::result::Result<Graph, String> {
     let mut net = Network::default();
     // Nodes by (graph, name); the top level is graph "".
@@ -583,7 +697,9 @@ fn network(
     // definitions this document never sees, such as the nodedef behind a functional graph.
     let mut resolved = vec![false; elements.len()];
     let mut pending = vec![m];
-    // Filename inputs fed by a connection, which may end in a string, and their units.
+    let mut warnings = Vec::new();
+    // Filename inputs and their units, read once every node is: a connection may end in a string,
+    // and what an image reads of its file is another of its inputs.
     let mut filenames = Vec::new();
     while let Some(n) = pending.pop() {
         if std::mem::replace(&mut resolved[n], true) {
@@ -624,19 +740,53 @@ fn network(
                 }
                 None => match source.0.attribute("value") {
                     None => continue,
-                    Some(v) => value(docs, *d, &source.0, v, unit()?, load),
+                    Some("") if source.0.attribute("type") == Some("filename") => continue,
+                    Some(v) if source.0.attribute("type") == Some("filename") => {
+                        filenames.push((n, input_name.clone(), source.0, unit()?));
+                        Input::Text(v.to_string())
+                    }
+                    Some(v) => value(docs, *d, &source.0, v, unit()?, &mut warnings),
                 },
             };
             inputs.insert(input_name, value);
         }
         net.nodes[n].inputs = inputs;
     }
-    for (n, input, e, unit) in filenames {
-        let d = elements[n].2;
-        if let Input::Text(file) = through(&net, &net.nodes[n].inputs[&input]) {
-            let image = file_input(docs, d, &e, file, unit, load);
-            net.nodes[n].inputs.insert(input, image);
+    let mut files = Vec::new();
+    for f in &filenames {
+        let read = through(&net, &net.nodes[f.0].inputs[&f.1]);
+        let file = match read {
+            Input::Text(file) if !file.is_empty() => file,
+            Input::Connect { .. } => continue,
+            // A constant or dot that holds no name leaves the input naming no file.
+            _ => {
+                files.push((f.0, &f.1, None));
+                continue;
+            }
+        };
+        // A value keeps the scope of the input that states it, wherever it is read.
+        let (n, _, e, unit) = filenames
+            .iter()
+            .find(|s| std::ptr::eq(&net.nodes[s.0].inputs[&s.1], read))
+            .unwrap_or(f);
+        let layer = match net.nodes[f.0].inputs.get("layer").map(|l| through(&net, l)) {
+            Some(Input::Text(l)) if !l.is_empty() => Layer::Named(l.clone()),
+            _ => Layer::Implied,
+        };
+        let mut image = file_input(docs, elements[*n].2, e, file, *unit, layer, load);
+        // A colorspace is how the input reading the file decodes it, wherever the name comes from.
+        if let (Input::Image { color_space, .. }, Some(own)) =
+            (&mut image, f.2.attribute("colorspace"))
+        {
+            *color_space = Some(own.to_string());
         }
+        files.push((f.0, &f.1, Some(image)));
+    }
+    for (n, input, image) in files {
+        match image {
+            Some(image) => net.nodes[n].inputs.insert(input.clone(), image),
+            None => net.nodes[n].inputs.remove(input),
+        };
     }
     let shader = |input: &str| match net.nodes[m].inputs.get(input).map(|i| through(&net, i)) {
         Some(Input::Connect { node, .. }) => Some(*node),
@@ -645,7 +795,6 @@ fn network(
     let surface =
         shader("surfaceshader").ok_or_else(|| format!("{material} has no surfaceshader"))?;
     let displacement = shader("displacementshader");
-    let mut warnings = Vec::new();
     if shader("backsurfaceshader").is_some_and(|b| b != surface) {
         warnings.push(format!(
             "material {material}: backsurfaceshader is not honored yet; both sides read \
@@ -660,6 +809,96 @@ fn network(
     })
 }
 
+/// The nodedef `name` names, the first of those read. A name may state the namespace of its
+/// document.
+fn nodedef<'a, 't>(docs: &'a [Doc<'t>], name: &str) -> Option<XmlNode<'a, 't>> {
+    let is_it = |d: usize, c: &XmlNode<'a, 't>| {
+        c.tag_name().name() == "nodedef"
+            && c.attribute("name").is_some_and(|n| {
+                n == name || qualified(inherited(docs, d, c, "namespace"), n) == name
+            })
+    };
+    let in_doc = |d: usize| {
+        let fallbacks = docs[d]
+            .fallbacks
+            .iter()
+            .filter_map(|&f| docs[d].doc.get_node(f))
+            .flat_map(|f| f.children());
+        let root = docs[d].doc.root_element();
+        let def = fallbacks.chain(root.children()).find(|c| is_it(d, c))?;
+        Some((docs[d].read_at, def))
+    };
+    (0..docs.len())
+        .filter_map(in_doc)
+        .min_by_key(|found| found.0)
+        .map(|found| found.1)
+}
+
+/// The value of `token` for element `e`: a `token` holding it on the nearest scope, which may name
+/// one further out through `interfacename`, else the default of the nodedef a graph implements.
+fn interface_token(docs: &[Doc<'_>], e: &XmlNode<'_, '_>, token: &str) -> Option<String> {
+    let named = |scope: &XmlNode<'_, '_>, name: &str| {
+        let is_it = |c: &XmlNode<'_, '_>| {
+            c.tag_name().name() == "token" && c.attribute("name") == Some(name)
+        };
+        scope.children().find(is_it).map(|t| {
+            (
+                t.attribute("value").map(str::to_string),
+                t.attribute("interfacename").map(str::to_string),
+            )
+        })
+    };
+    let mut name = token.to_string();
+    for scope in e.ancestors() {
+        if let Some((value, interface)) = named(&scope, &name) {
+            if value.is_some() {
+                return value;
+            }
+            name = interface.unwrap_or(name);
+        }
+        if let Some(def) = scope.attribute("nodedef").and_then(|n| nodedef(docs, n))
+            && let Some((Some(value), _)) = named(&def, &name)
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// `file` with its substitutions made, all but the tile tokens each point picks from, or the
+/// reason one has no value.
+fn substituted(
+    docs: &[Doc<'_>],
+    e: &XmlNode<'_, '_>,
+    file: &str,
+) -> std::result::Result<String, String> {
+    let mut out = String::new();
+    let mut rest = file;
+    while let Some(at) = rest.find(['[', '{', '<']) {
+        let close = match rest[at..].chars().next() {
+            Some('[') => ']',
+            Some('{') => '}',
+            _ => '>',
+        };
+        let Some(len) = rest[at..].find(close) else {
+            break;
+        };
+        let whole = &rest[at..=at + len];
+        out.push_str(&rest[..at]);
+        match close {
+            ']' => {
+                let value = interface_token(docs, e, &whole[1..whole.len() - 1]);
+                out.push_str(&value.ok_or_else(|| format!("{whole} has no value"))?);
+            }
+            '>' if tiles::tiled(whole) => out.push_str(whole),
+            _ => return Err(format!("{whole} has no value")),
+        }
+        rest = &rest[at + len + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 /// A filename value of element `e` in document `d`.
 fn file_input(
     docs: &[Doc<'_>],
@@ -667,33 +906,57 @@ fn file_input(
     e: &XmlNode<'_, '_>,
     file: &str,
     unit: Unit,
-    load: &mut dyn FnMut(&Path, &str) -> usize,
+    layer: Layer,
+    load: &mut Load<'_>,
 ) -> Input {
     let prefix = inherited(docs, d, e, "fileprefix").unwrap_or_default();
+    let file = format!("{prefix}{file}");
+    let resolved = substituted(docs, e, &file).map_err(|why| (file, why));
     Input::Image {
-        image: load(docs[d].dir, &format!("{prefix}{file}")),
+        image: load(docs[d].dir, resolved, layer),
         color_space: inherited(docs, d, e, "colorspace").map(str::to_string),
         unit,
     }
 }
 
-/// An input's authored value: an image for filenames, numbers, or text.
+/// An input's authored value, other than a filename: numbers or text.
 fn value(
     docs: &[Doc<'_>],
     d: usize,
     e: &XmlNode<'_, '_>,
     v: &str,
     unit: Unit,
-    load: &mut dyn FnMut(&Path, &str) -> usize,
+    warnings: &mut Vec<String>,
 ) -> Input {
-    match e.attribute("type").unwrap_or_default() {
-        "filename" => file_input(docs, d, e, v, unit, load),
+    let ty = e.attribute("type").unwrap_or_default();
+    match ty {
         "string" => Input::Text(v.to_string()),
         "boolean" => Input::Value(vec![if v == "true" { 1.0 } else { 0.0 }], unit),
-        _ => v
-            .split(',')
-            .map(|x| x.trim().parse::<f32>())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_or_else(|_| Input::Text(v.to_string()), |n| Input::Value(n, unit)),
+        _ => {
+            let numbers = v
+                .split(',')
+                .map(|x| x.trim().parse::<f32>())
+                .collect::<std::result::Result<Vec<_>, _>>();
+            let Ok(mut numbers) = numbers else {
+                return Input::Text(v.to_string());
+            };
+            if let (true, Some(space), &[r, g, b, ..]) = (
+                is_color(ty),
+                inherited(docs, d, e, "colorspace"),
+                &numbers[..],
+            ) {
+                match ImageColor::named(space) {
+                    Some(ImageColor::Named(s)) => {
+                        numbers[..3].copy_from_slice(&s.to_rec709([r, g, b]));
+                    }
+                    Some(_) => {}
+                    None => warnings.push(format!(
+                        "{}: colorspace {space} reads as data",
+                        e.attribute("name").unwrap_or_default()
+                    )),
+                }
+            }
+            Input::Value(numbers, unit)
+        }
     }
 }

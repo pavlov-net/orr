@@ -5,6 +5,9 @@
 #[allow(dead_code)]
 #[path = "common/glb.rs"]
 mod glb;
+#[allow(dead_code)]
+#[path = "common/tagged.rs"]
+mod tagged;
 
 use std::path::{Path, PathBuf};
 
@@ -18,7 +21,7 @@ use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{self, MeshHeader, MeshInfo, PageView};
 use orr_pack::skeleton::{SkeletonInfo, Trs};
 use orr_pack::texture::TextureInfo;
-use orr_pack::{Archive, AssetId, Target};
+use orr_pack::{Archive, AssetId, Class, Target};
 
 fn dir(name: &str) -> PathBuf {
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -67,6 +70,10 @@ fn read(a: &Archive, b: &orr_pack::Blob) -> Vec<u8> {
 fn material(a: &Archive, name: &str) -> Material {
     let e = a.find(AssetId::from_name(name)).unwrap();
     Material::from_bytes(&read(a, &a.blobs(e)[0])).unwrap()
+}
+
+fn material_of(a: &Archive) -> Material {
+    material(a, "g/material/0")
 }
 
 fn is_bound(m: &Material, s: usize) -> bool {
@@ -189,6 +196,72 @@ fn textured_quad(path: &Path, tex: &[u8], material: &str, top: &str) {
     let image = format!(r#"{{"bufferView":{img},"mimeType":"image/png"}}"#);
     let rest = textured_quad_json(&mut g, material, &image, top);
     g.write(path, &rest);
+}
+
+/// L2516 "Client implementations **MUST** follow specified wrapping modes." and L2514 filters
+/// **SHOULD**: a sampler's modes reach the binding of the slot reading its texture, and an
+/// unset filter leaves the renderer's own.
+#[test]
+fn samplers_reach_the_bindings_that_read_them() {
+    use orr_pack::material::{filter, wrap};
+    let nearest_min = filter::MIN_NEAREST | filter::MIP_NEAREST | filter::ONE_MIP;
+    let cases = [
+        ("{}", [wrap::REPEAT; 2], 0),
+        (
+            r#"{"wrapS":33071,"wrapT":33648}"#,
+            [wrap::CLAMP, wrap::MIRROR],
+            0,
+        ),
+        (
+            r#"{"wrapS":33648,"wrapT":10497}"#,
+            [wrap::MIRROR, wrap::REPEAT],
+            0,
+        ),
+        (
+            r#"{"magFilter":9728}"#,
+            [wrap::REPEAT; 2],
+            filter::MAG_NEAREST,
+        ),
+        (r#"{"magFilter":9729}"#, [wrap::REPEAT; 2], 0),
+        (r#"{"minFilter":9728}"#, [wrap::REPEAT; 2], nearest_min),
+        (
+            r#"{"minFilter":9729}"#,
+            [wrap::REPEAT; 2],
+            filter::MIP_NEAREST | filter::ONE_MIP,
+        ),
+        (
+            r#"{"minFilter":9984}"#,
+            [wrap::REPEAT; 2],
+            filter::MIN_NEAREST | filter::MIP_NEAREST,
+        ),
+        (
+            r#"{"minFilter":9985}"#,
+            [wrap::REPEAT; 2],
+            filter::MIP_NEAREST,
+        ),
+        (
+            r#"{"minFilter":9986}"#,
+            [wrap::REPEAT; 2],
+            filter::MIN_NEAREST,
+        ),
+        (r#"{"minFilter":9987}"#, [wrap::REPEAT; 2], 0),
+    ];
+    let d = dir("samplers");
+    for (i, (sampler, modes, bits)) in cases.into_iter().enumerate() {
+        let path = d.join(format!("{i}.glb"));
+        let mut g = Glb::default();
+        let img = g.image(&gradient());
+        let image = format!(r#"{{"bufferView":{img},"mimeType":"image/png"}}"#);
+        let material = r#"{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}}}"#;
+        let rest = textured_quad_json(&mut g, material, &image, "").replace(
+            r#""textures":[{"source":0}]"#,
+            &format!(r#""samplers":[{sampler}],"textures":[{{"source":0,"sampler":0}}]"#),
+        );
+        g.write(&path, &rest);
+        let (a, _) = cooked(&path);
+        let b = material_of(&a).textures[slot::BASE_COLOR];
+        assert_eq!((b.wrap, b.filter), (modes, bits), "{sampler}");
+    }
 }
 
 /// `KHR_texture_transform`: "Rotate the UVs by this many radians counter-clockwise around the
@@ -475,21 +548,21 @@ fn the_alpha_test_holds_per_texel() {
     }
 }
 
-/// `occlusionTexture.strength`: the stored value is `1 + strength * (texel - 1)`.
+/// L2846 "Client implementations that are capable of computing indirect lighting themselves,
+/// e.g., via path tracing, **SHOULD** ignore the occlusion texture.": its image isn't opened, so
+/// one that doesn't decode cooks, and nothing of it reaches the archive.
 #[test]
-fn occlusion_strength_scales_toward_one() {
+fn the_occlusion_texture_is_ignored() {
     let path = dir("occlusion").join("occlusion.glb");
-    let tex = png(8, |x, _| [if x < 4 { 51 } else { 255 }, 0, 0, 255]);
     textured_quad(
         &path,
-        &tex,
+        b"not an image",
         r#"{"occlusionTexture":{"index":0,"strength":0.5}}"#,
         "",
     );
     let (a, _) = cooked(&path);
-    let (_, mip) = bc4_mip0(&a, "g/texture/0/occlusion");
-    assert!((mip[0] - 0.6).abs() < 0.01, "{}", mip[0]);
-    assert!((mip[7] - 1.0).abs() < 0.01, "{}", mip[7]);
+    let texture = a.entries().iter().any(|e| e.class == Class::Texture as u16);
+    assert!(!texture);
 }
 
 /// The accessors of a triangle skinned to its skin's joint 0: positions, joints, weights.
@@ -891,4 +964,37 @@ fn a_joint_rotation_without_length_is_none() {
     );
     let (a, _) = cooked(&path);
     assert_eq!(skeleton(&a).rest[0].rotation, [0.0, 0.0, 0.0, 1.0]);
+}
+
+/// L2418 "Any colorspace information (such as ICC profiles, intents, gamma values, etc.) found in
+/// images **MUST** be ignored. ... The effective color gamut for all images that are used as color
+/// textures is ITU-R BT.709." L2441 lists the chunks. A varying and a constant image stating
+/// Display P3, linear light, narrow range and a gamma cook as the untagged one does.
+#[test]
+fn image_color_metadata_is_ignored() {
+    let material_json = r#"{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}}}"#;
+    let gamma = tagged::gama(1.0);
+    let hints: &[(&[u8; 4], &[u8])] = &[(b"gAMA", &gamma), (b"cICP", &[12, 8, 0, 0])];
+    let texture = |a: &Archive| {
+        let m = material(a, "g/material/0");
+        let e = a.find(m.textures[slot::BASE_COLOR].texture).unwrap();
+        let blobs = a.blobs(e);
+        (read(a, &blobs[0]), read(a, &blobs[1]))
+    };
+    let d = dir("image_color_metadata");
+    let path = d.join("m.glb");
+    let cook_image = |image: &[u8]| {
+        textured_quad(&path, image, material_json, "");
+        cooked(&path).0
+    };
+    let tagged = cook_image(&tagged::varying_rgb(hints));
+    let plain = cook_image(&tagged::varying_rgb(&[]));
+    assert_eq!(texture(&tagged), texture(&plain));
+
+    let tagged = cook_image(&tagged::flat_rgb([128, 64, 32], hints));
+    let plain = cook_image(&tagged::flat_rgb([128, 64, 32], &[]));
+    assert_eq!(
+        material(&tagged, "g/material/0").base_color,
+        material(&plain, "g/material/0").base_color
+    );
 }

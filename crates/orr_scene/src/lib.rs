@@ -84,7 +84,7 @@ pub use edit::{EditDesc, EditId, EditRef};
 pub use emissive::{EmissiveSpan, ModelEmission};
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
 pub use loading::{JobResult, Loading};
-pub use material::{BoundTexture, MaterialId, MaterialWriter, material_flags};
+pub use material::{BoundTexture, MaterialId, MaterialWriter, binding_sampler, material_flags};
 pub use medium_proxy::{MediumProxy, MediumProxyId, ProxyDensity, VolumeRef};
 pub use mount::{ClipRef, InstancePage, LoadState, MountId, PackSource, PageId, SkeletonRef};
 pub use neural::NeuralTextures;
@@ -111,7 +111,7 @@ pub use shaders::types::{
     ClusterRef, ClusterWork, CutGpu, EditGroupGpu, EmissiveGpu, GBufferGpu, GeneratedClusterGpu,
     InstanceGpu, LightGpu, MaterialGpu, MeshGpu, ModelGpu, ProducerBatch, ProducerClusterGpu,
     ProducerStateGpu, RasterGpu, RtCutGpu, SceneRoot, SkinStateGpu, SkinnedGpu, SkyStats,
-    SlotCutGpu, SlotStateGpu, TextureStreamGpu, VisibleCluster,
+    SlotCutGpu, SlotStateGpu, TextureSamplerGpu, TextureStreamGpu, VisibleCluster,
 };
 pub use skin::{SkinStats, SkinnedDesc};
 pub use stream::{BlobId, BlobTarget};

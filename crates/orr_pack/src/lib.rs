@@ -19,6 +19,7 @@ pub mod raster;
 pub mod skeleton;
 pub mod subd;
 pub mod texture;
+pub mod tiles;
 pub mod volume;
 mod writer;
 
@@ -160,6 +161,7 @@ pub enum Class {
     NeuralTextureSet = 9,
     Subd = 10,
     Volume = 11,
+    TextureTiles = 12,
 }
 
 /// Current schema of each built-in class whose format this crate defines.
@@ -175,11 +177,12 @@ const SCHEMAS: &[(Class, u16)] = &[
     (Class::NeuralTextureSet, neural::SCHEMA),
     (Class::Subd, subd::SCHEMA),
     (Class::Volume, volume::SCHEMA),
+    (Class::TextureTiles, tiles::SCHEMA),
 ];
 
 impl Class {
     pub const USER_FIRST: u16 = 0x8000;
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Mesh,
         Self::Texture,
         Self::Material,
@@ -191,6 +194,7 @@ impl Class {
         Self::NeuralTextureSet,
         Self::Subd,
         Self::Volume,
+        Self::TextureTiles,
     ];
 
     pub fn from_u16(v: u16) -> Option<Self> {
@@ -210,6 +214,7 @@ impl Class {
             Self::NeuralTextureSet => "neural-texture-set",
             Self::Subd => "subd",
             Self::Volume => "volume",
+            Self::TextureTiles => "texture-tiles",
         }
     }
 

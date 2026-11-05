@@ -53,7 +53,6 @@ public struct BsdfParams
     public float thin_film_thickness;   // nm
     public float thin_film_ior;
     public float3 emission;             // any units; `Bsdf.emission` attenuates it by the coat and fuzz
-    public float3 scale;                // multiplies every lobe: the directional occlusion, and the layers `bsdf_collapse` removes
     public uint flags;                  // BSDF_*: the lobes that are on and thin-walled geometry
 }
 
@@ -265,8 +264,7 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
     float3 sc = srgb_encode(saturate(p.specular_color));
     uint3 s7 = uint3(round(sc * 127.0));
     w.b.x = s7.x | (s7.y << 7) | (s7.z << 14) | (raster_error_code(s.raster_error) << 21) | (exponent << 26);
-    float occlusion = max_component(p.scale);
-    w.b.y = (oct_encode_snorm8(s.geometric_normal) & 0xffff) | (pack_unorm8(p.diffuse_roughness) << 16) | (pack_unorm8(occlusion) << 24);
+    w.b.y = (oct_encode_snorm8(s.geometric_normal) & 0xffff) | (pack_unorm8(p.diffuse_roughness) << 16);
     w.x = uint4(0);
     if ((flags & GBUFFER_EXTENDED) != 0)
     {
@@ -309,7 +307,6 @@ public GSurface decode_gsurface(GBufferWords w, MaterialGpu* m)
     s.raster_error = raster_error_from_code((w.b.x >> 21) & 31);
     s.geometric_normal = oct_decode_snorm8(w.b.y & 0xffff);
     p.diffuse_roughness = unpack_unorm8(w.b.y >> 16);
-    p.scale = float3(unpack_unorm8(w.b.y >> 24));
     p.transmission_weight = 0.0;
     p.transmission_color = float3(1.0);
     bool thin = (flags & GBUFFER_THIN_TWO_SIDED) != 0;

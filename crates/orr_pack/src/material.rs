@@ -8,15 +8,45 @@ pub const SCHEMA: u16 = 2;
 
 /// A texture bound to a material slot.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct TextureBinding {
-    /// [`AssetId::NONE`] when the slot is unbound.
+    /// A texture, or a [`TextureTiles`](crate::tiles::TextureTiles) set of them; the rest of the
+    /// binding then holds for each tile, read at the point's place in its unit square. Where no
+    /// tile lies the slot reads [`Self::outside`]. [`AssetId::NONE`] when the slot is unbound.
     pub texture: AssetId,
     /// Texture channel the slot reads, 0..15.
     pub channels: u8,
     /// 0 or 1.
     pub uv_set: u8,
-    pub _pad: [u8; 2],
+    /// What u and v read past 0..1, as [`wrap`] values.
+    pub wrap: [u8; 2],
+    /// [`filter`] bits.
+    pub filter: u8,
+    pub _pad: [u8; 3],
+    /// What the slot reads, from its first channel on, past 0..1 on an axis of
+    /// [`wrap::CONSTANT`] and where a tile set has no tile, in the units its texels sample as.
+    pub outside: [f32; 4],
+}
+
+/// `TextureBinding::wrap` values.
+pub mod wrap {
+    pub const REPEAT: u8 = 0;
+    pub const CLAMP: u8 = 1;
+    pub const MIRROR: u8 = 2;
+    /// Transparent black past 0..1, filtered in with the edge texels.
+    pub const BORDER: u8 = 3;
+    /// [`TextureBinding::outside`](super::TextureBinding::outside) past 0..1, and [`CLAMP`]
+    /// within it.
+    pub const CONSTANT: u8 = 4;
+}
+
+/// `TextureBinding::filter` bits. Without any, a slot filters trilinearly and anisotropically.
+pub mod filter {
+    pub const MAG_NEAREST: u8 = 1 << 0;
+    pub const MIN_NEAREST: u8 = 1 << 1;
+    pub const MIP_NEAREST: u8 = 1 << 2;
+    /// Reads mip 0 alone, whatever the footprint; [`MIP_NEAREST`] is set with it.
+    pub const ONE_MIP: u8 = 1 << 3;
 }
 
 /// OpenPBR 1.1.1 parameters of one material, as authored: colors linear Rec.709, lengths
@@ -77,11 +107,11 @@ pub struct Material {
     /// Linked surface id; 0 is the standard surface.
     pub surface: u8,
     /// Indexed by the `slot` constants.
-    pub textures: [TextureBinding; 12],
+    pub textures: [TextureBinding; slot::COUNT],
     /// Per slot, the affine map from mesh uv to the uv its texture is sampled at, stored
     /// as its difference from the identity so that zero is the identity: `[a - 1, b, c, d,
     /// e - 1, f]` for `u' = a u + b v + c`, `v' = d u + e v + f`.
-    pub uv_transforms: [[f32; 6]; 12],
+    pub uv_transforms: [[f32; 6]; slot::COUNT],
 }
 
 /// Texture slots. All but `NORMAL`, `EMISSION`, `SPECULAR_WEIGHT` and `DISPLACEMENT` read values
@@ -93,13 +123,13 @@ pub mod slot {
     pub const NORMAL: usize = 2;
     pub const METALNESS: usize = 3;
     pub const ROUGHNESS: usize = 4;
-    pub const OCCLUSION: usize = 5;
-    pub const EMISSION: usize = 6;
-    pub const SPECULAR_WEIGHT: usize = 7;
-    pub const SUBSURFACE_COLOR: usize = 8;
-    pub const DISPLACEMENT: usize = 9;
-    pub const COAT: usize = 10;
-    pub const TRANSMISSION: usize = 11;
+    pub const EMISSION: usize = 5;
+    pub const SPECULAR_WEIGHT: usize = 6;
+    pub const SUBSURFACE_COLOR: usize = 7;
+    pub const DISPLACEMENT: usize = 8;
+    pub const COAT: usize = 9;
+    pub const TRANSMISSION: usize = 10;
+    pub const COUNT: usize = 11;
 }
 
 impl Material {
@@ -167,8 +197,8 @@ impl Default for Material {
             double_sided: 0,
             thin_walled: 0,
             surface: 0,
-            textures: [TextureBinding::zeroed(); 12],
-            uv_transforms: [[0.0; 6]; 12],
+            textures: [TextureBinding::zeroed(); slot::COUNT],
+            uv_transforms: [[0.0; 6]; slot::COUNT],
         }
     }
 }

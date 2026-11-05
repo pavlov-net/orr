@@ -29,14 +29,6 @@
 
 use std::time::{Duration, Instant};
 
-use examples::linked::KERNELS;
-use examples::overlay::Overlay;
-use examples::scene::{FOV_Y, SUN, Showcase, TARGET, orbit_eye};
-use examples::shaders::{capture, sun_shadow};
-use examples::window::{KeyCode, Window};
-use examples::{
-    Capture, LensSwitches, Options, PROJECT_ID, Workers, assert_clean, device, fixed_time,
-};
 use orr::orr_gpu::{
     Format, Hazards, MemoryKind, OutputFormat, QueueKind, SpecData, Stages, TimelinePoint,
 };
@@ -47,6 +39,14 @@ use orr::{
     CompilingKernels, Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime,
     Lens, LitView, Projection, Reconstruction, Renderer, RendererDesc, TextureFilter,
     UpscaleQuality, ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+};
+use orr_examples::linked::KERNELS;
+use orr_examples::overlay::Overlay;
+use orr_examples::scene::{FOV_Y, SUN, Showcase, TARGET, orbit_eye};
+use orr_examples::shaders::{capture, sun_shadow};
+use orr_examples::window::{KeyCode, Window};
+use orr_examples::{
+    Capture, LensSwitches, Options, PROJECT_ID, Workers, assert_clean, device, fixed_time,
 };
 use orr_math::camera::rh::view;
 use orr_math::{UVec2, Vec2, Vec3};

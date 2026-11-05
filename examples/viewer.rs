@@ -12,18 +12,18 @@
 
 use std::time::{Duration, Instant};
 
-use examples::average::Average;
-use examples::linked::KERNELS;
-use examples::overlay::Overlay;
-use examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
-use examples::window::Window;
-use examples::{Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time};
 use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
 use orr::{
     CompilingKernels, Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameTime, HookPass,
     Lens, LitView, Projection, Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest,
     TextureFilter, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
+use orr_examples::average::Average;
+use orr_examples::linked::KERNELS;
+use orr_examples::overlay::Overlay;
+use orr_examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
+use orr_examples::window::Window;
+use orr_examples::{Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time};
 use orr_math::Vec3;
 use orr_math::camera::rh::view;
 

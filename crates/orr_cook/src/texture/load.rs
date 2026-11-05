@@ -4,6 +4,11 @@
 //! once straight into its blocks. Formats are recognized by their bytes. An animated WebP
 //! decodes to its first frame. The spec leaves `KTXswizzle` to applications; the cook applies
 //! it, because the file states it, and a file it changes loses its blocks.
+//!
+//! A [`Source`] holds a file's values as stored, beside what the file states of them
+//! ([`FileColor`]); the importers' rules decide which of that applies. Radiance's `EXPOSURE` and
+//! `COLORCORR` are the exception: they state how the values were scaled, which no rule reads past,
+//! so they are undone here.
 
 use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek};
@@ -12,11 +17,14 @@ use std::path::Path;
 use ctt::input::{InputOverrides, decode_container};
 use ctt::{ColorSpace, FormatExt, TextureKind};
 use image::ImageDecoder;
+use image::codecs::hdr::HdrDecoder;
 use image::codecs::webp::WebPDecoder;
 use orr_pack::texture::{FormatInfo, full_mip_count, mip_size, vk};
 use rayon::prelude::*;
 
-use super::{Img, Primaries};
+use super::color::{self, FileColor, Gamut, ImageColor, Transfer};
+use super::material::Layer;
+use super::{Img, Wrap};
 
 /// What a file of one channel, or of gray and alpha, holds.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -37,10 +45,7 @@ pub(super) struct Source {
     pub(super) layers: Vec<Img>,
     /// Six layers in the Vulkan face order.
     pub(super) cube: bool,
-    /// RGB values are sRGB-encoded.
-    pub(super) srgb: bool,
-    /// Primaries the file is tagged with.
-    pub(super) primaries: Option<Primaries>,
+    pub(super) color: FileColor,
     /// The block-compressed texels of a compressed file, kept so an encoding that matches
     /// can pass them through.
     pub(super) blocks: Option<Blocks>,
@@ -70,6 +75,176 @@ impl Blocks {
     }
 }
 
+/// What the `wrapmodes` attribute of an OpenEXR file says it reads past 0..1, per axis: one
+/// keyword for both, or two separated by a comma.
+pub(super) fn exr_wrap(bytes: &[u8]) -> Option<[Wrap; 2]> {
+    if !bytes.starts_with(&exr::meta::magic_number::BYTES) {
+        return None;
+    }
+    let meta = exr::meta::MetaData::read_from_buffered(Cursor::new(bytes), false).ok()?;
+    let modes = meta
+        .headers
+        .first()?
+        .own_attributes
+        .wrap_mode_name
+        .as_ref()?;
+    let mode = |m: &str| match m.trim() {
+        "black" => Some(Wrap::Border),
+        "clamp" => Some(Wrap::Clamp),
+        "periodic" => Some(Wrap::Repeat),
+        "mirror" => Some(Wrap::Mirror),
+        _ => None,
+    };
+    let modes = modes.to_string();
+    let (u, v) = modes.split_once(',').unwrap_or((&modes, &modes));
+    Some([mode(u)?, mode(v)?])
+}
+
+/// The short name of `channel` of OpenEXR part `part`, if it lies directly in layer `name`: a
+/// channel states its layers in its own name, and a part's name may lead them.
+fn in_layer(
+    name: &str,
+    part: Option<&exr::meta::attribute::Text>,
+    channel: &str,
+) -> Option<String> {
+    let under = |full: &str| {
+        let short = full.strip_prefix(name)?.strip_prefix('.')?;
+        (!short.contains('.')).then(|| short.to_string())
+    };
+    under(channel).or_else(|| under(&format!("{}.{channel}", part?)))
+}
+
+/// The layer of an OpenEXR file that [`Layer::Implied`] reads, if the file has one.
+fn implied_layer(bytes: &[u8]) -> Option<&'static str> {
+    if !bytes.starts_with(&exr::meta::magic_number::BYTES) {
+        return None;
+    }
+    let meta = exr::meta::MetaData::read_from_buffered(Cursor::new(bytes), false).ok()?;
+    ["default", "rgba"].into_iter().find(|name| {
+        meta.headers.iter().any(|h| {
+            let part = h.own_attributes.layer_name.as_ref();
+            let held = |c: &exr::meta::attribute::ChannelDescription| {
+                in_layer(name, part, &c.name.to_string()).is_some()
+            };
+            h.channels.list.iter().any(held)
+        })
+    })
+}
+
+/// What `layer` reads of an image file, as a file of its own, or none where that is the file as
+/// it stands. Only OpenEXR files hold layers. The new file keeps the display window, data window
+/// and attributes of the part that holds the layer. Its red, green, blue and alpha are the
+/// channels of those names, or where the layer has no color, its other channels in file order
+/// from red. `rgba` names a file's own channels where no layer has that name.
+pub(super) fn layer_of(bytes: &[u8], layer: &Layer) -> Result<Option<Vec<u8>>, String> {
+    use exr::image::{AnyChannel, Encoding, FlatSamples};
+    use exr::prelude::{Image, ReadChannels, ReadLayers, SpecificChannels, WritableImage, read};
+    let name = match layer {
+        Layer::Whole => return Ok(None),
+        Layer::Named(name) => name.as_str(),
+        Layer::Implied => match implied_layer(bytes) {
+            Some(name) => name,
+            None => return Ok(None),
+        },
+    };
+    let absent = || match name {
+        "rgba" => Ok(None),
+        _ => Err(format!("it has no layer {name}")),
+    };
+    if !bytes.starts_with(&exr::meta::magic_number::BYTES) {
+        return absent();
+    }
+    let file = read()
+        .no_deep_data()
+        .largest_resolution_level()
+        .all_channels()
+        .all_layers()
+        .all_attributes()
+        .non_parallel()
+        .from_buffered(Cursor::new(bytes))
+        .map_err(|e| e.to_string())?;
+    let held = file.layer_data.iter().find_map(|part| {
+        let held: Vec<_> = part
+            .channel_data
+            .list
+            .iter()
+            .filter_map(|c| {
+                let short = in_layer(
+                    name,
+                    part.attributes.layer_name.as_ref(),
+                    &c.name.to_string(),
+                );
+                Some((short?, c))
+            })
+            .collect();
+        (!held.is_empty()).then_some((part, held))
+    });
+    let Some((part, held)) = held else {
+        return absent();
+    };
+    let mut rgba: [Option<&AnyChannel<FlatSamples>>; 4] = [None; 4];
+    let mut others = Vec::new();
+    for (short, channel) in held {
+        match short.to_ascii_lowercase().as_str() {
+            "r" | "red" => rgba[0] = Some(channel),
+            "g" | "green" => rgba[1] = Some(channel),
+            "b" | "blue" => rgba[2] = Some(channel),
+            "a" | "alpha" => rgba[3] = Some(channel),
+            _ => others.push(channel),
+        }
+    }
+    if rgba[..3].iter().all(Option::is_none) {
+        if others.is_empty() {
+            others.extend(rgba[3].take());
+        }
+        for (slot, channel) in rgba.iter_mut().zip(others).take(3) {
+            *slot = Some(channel);
+        }
+    }
+    let [red, green, blue, alpha] = rgba;
+    let width = part.size.width();
+    let sample = |c: Option<&AnyChannel<FlatSamples>>, pos: exr::prelude::Vec2<usize>, or: f32| {
+        c.map_or(or, |c| {
+            let i = pos.y() * width + pos.x();
+            c.sample_data.value_by_flat_index(i).to_f32()
+        })
+    };
+    let rgb = |pos| {
+        (
+            sample(red, pos, 0.0),
+            sample(green, pos, 0.0),
+            sample(blue, pos, 0.0),
+        )
+    };
+    let attributes = || file.attributes.clone();
+    let own = || part.attributes.clone();
+    let mut out = Cursor::new(Vec::new());
+    // Without alpha the window around the data stays opaque, as it does reading the whole file.
+    match alpha {
+        Some(_) => {
+            let channels = SpecificChannels::rgba(|pos| {
+                let (r, g, b) = rgb(pos);
+                (r, g, b, sample(alpha, pos, 1.0))
+            });
+            let layer = exr::image::Layer::new(part.size, own(), Encoding::UNCOMPRESSED, channels);
+            Image::new(attributes(), layer)
+                .write()
+                .non_parallel()
+                .to_buffered(&mut out)
+        }
+        None => {
+            let channels = SpecificChannels::rgb(rgb);
+            let layer = exr::image::Layer::new(part.size, own(), Encoding::UNCOMPRESSED, channels);
+            Image::new(attributes(), layer)
+                .write()
+                .non_parallel()
+                .to_buffered(&mut out)
+        }
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(Some(out.into_inner()))
+}
+
 /// Decodes an image file, recognized by its first bytes.
 pub(super) fn decode(bytes: &[u8]) -> Result<Source, String> {
     let mut src = open(bytes)?;
@@ -91,6 +266,36 @@ pub(super) fn decode_layers(src: &mut Source) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `test` holds of an image `src` stores: mip 0 of each layer, and of blocks every mip,
+/// which a cook can keep. Each is decoded for the test, so it stops at the first that holds.
+pub(super) fn any_stored(src: &Source, mut test: impl FnMut(&Img) -> bool) -> Result<bool, String> {
+    let Some(b) = &src.blocks else {
+        return Ok(src.layers.iter().any(test));
+    };
+    for layer in &b.levels {
+        for (m, bytes) in layer.iter().enumerate() {
+            let [w, h] = mip_size(b.w, b.h, m as u32);
+            if test(&decode_blocks(b.vk_format, w, h, bytes)?) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Per channel, the lowest and highest finite value of every image `src` stores.
+pub(super) fn stored_range(src: &Source) -> Result<[(f32, f32); 4], String> {
+    let mut range = [(f32::MAX, f32::MIN); 4];
+    any_stored(src, |l| {
+        for (c, r) in range.iter_mut().enumerate() {
+            let (lo, hi) = l.finite_range(c);
+            *r = (r.0.min(lo), r.1.max(hi));
+        }
+        false
+    })?;
+    Ok(range)
+}
+
 /// Opens an image file like [`decode`], but leaves `layers` empty when the file holds
 /// block-compressed texels.
 pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
@@ -101,8 +306,9 @@ pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
     let mut src = match Ktx2Blocks::of(bytes) {
         Some(k) => k.open()?,
         None => {
-            match decode_container(bytes, InputOverrides::default()).map_err(|e| e.to_string())? {
-                Some(image) => container(image)?,
+            let dds = dds_with_known_blocks(bytes);
+            match decode_container(&dds, InputOverrides::default()).map_err(|e| e.to_string())? {
+                Some(image) => container(image, bytes)?,
                 None => file(bytes)?,
             }
         }
@@ -122,6 +328,77 @@ pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
         }
     }
     Ok(src)
+}
+
+const DDS_MAGIC: &[u8] = b"DDS ";
+const DDS_FOUR_CC: usize = 84;
+const DDS_ALPHA_MODE: usize = 144;
+const DDS_ALPHA_MODE_PREMULTIPLIED: u32 = 2;
+
+/// A DDS file's bytes with DXT2 and DXT4 as DXT3 and DXT5, whose blocks they share: they differ
+/// in premultiplied alpha, which [`dds_premultiplied`] reads, and the DDS reader knows only those.
+fn dds_with_known_blocks(bytes: &[u8]) -> Cow<'_, [u8]> {
+    let same = match bytes.get(DDS_FOUR_CC..DDS_FOUR_CC + 4) {
+        _ if !bytes.starts_with(DDS_MAGIC) => return Cow::Borrowed(bytes),
+        Some(b"DXT2") => b"DXT3",
+        Some(b"DXT4") => b"DXT5",
+        _ => return Cow::Borrowed(bytes),
+    };
+    let mut patched = bytes.to_vec();
+    patched[DDS_FOUR_CC..DDS_FOUR_CC + 4].copy_from_slice(same);
+    Cow::Owned(patched)
+}
+
+/// Whether a DDS file states premultiplied alpha: by its legacy block format, or by the alpha
+/// mode in `miscFlags2` of its `DDS_HEADER_DXT10`.
+fn dds_premultiplied(bytes: &[u8]) -> bool {
+    match bytes.get(DDS_FOUR_CC..DDS_FOUR_CC + 4) {
+        Some(b"DXT2" | b"DXT4") => true,
+        Some(b"DX10") => bytes
+            .get(DDS_ALPHA_MODE..DDS_ALPHA_MODE + 4)
+            .is_some_and(|b| {
+                let flags = u32::from_le_bytes(b.try_into().expect("4 bytes"));
+                flags & 7 == DDS_ALPHA_MODE_PREMULTIPLIED
+            }),
+        _ => false,
+    }
+}
+
+/// What a KTX2 file's DFD states of `format`. A file's `_SRGB` format decodes on any sampler, so
+/// it stands over a transfer function that disagrees.
+fn ktx2_color(reader: &ktx2::Reader<&[u8]>, format: ctt::Format, numeric: bool) -> FileColor {
+    let stated = reader
+        .transfer_function()
+        .and_then(color::ktx2_transfer)
+        .unwrap_or(Transfer::Linear);
+    FileColor {
+        transfer: Some(if format.normalize().1 == ColorSpace::Srgb {
+            Transfer::Srgb
+        } else {
+            stated
+        }),
+        gamut: reader.color_primaries().and_then(color::ktx2_gamut),
+        premultiplied: reader.is_alpha_premultiplied() == Some(true),
+        numeric,
+        ..Default::default()
+    }
+}
+
+/// What the KTX2 or DDS file `bytes` states of `format`.
+fn container_color(bytes: &[u8], format: ctt::Format, srgb: bool, numeric: bool) -> FileColor {
+    match ktx2::Reader::new(bytes) {
+        Ok(reader) => ktx2_color(&reader, format, numeric),
+        Err(_) => FileColor {
+            transfer: Some(if srgb {
+                Transfer::Srgb
+            } else {
+                Transfer::Linear
+            }),
+            premultiplied: dds_premultiplied(bytes),
+            numeric,
+            ..Default::default()
+        },
+    }
 }
 
 /// What one channel of a `KTXswizzle` mapping reads.
@@ -176,7 +453,7 @@ pub(crate) struct Scan {
     pub(super) vk_format: u32,
     /// Every mip down to 1x1 is present.
     pub(super) complete: bool,
-    pub(super) srgb: bool,
+    pub(super) color: FileColor,
     pub(super) rg: bool,
     pub(super) signed: bool,
     pub(super) float: bool,
@@ -251,8 +528,10 @@ impl<'a> Ktx2Blocks<'a> {
         self.info.mip_bytes(w, h)
     }
 
-    fn srgb(&self) -> bool {
-        self.format.normalize().1 == ColorSpace::Srgb
+    fn color(&self) -> FileColor {
+        let vk_format = self.vk_format();
+        let numeric = float_blocks(vk_format) || signed_blocks(vk_format);
+        ktx2_color(&self.reader, self.format, numeric)
     }
 
     fn open(self) -> Result<Source, String> {
@@ -287,8 +566,7 @@ impl<'a> Ktx2Blocks<'a> {
         Ok(Source {
             layers: Vec::new(),
             cube,
-            srgb: self.srgb(),
-            primaries: None,
+            color: self.color(),
             rg: two_channels(self.vk_format()),
             signed: signed_blocks(self.vk_format()),
             float: float_blocks(self.vk_format()),
@@ -330,7 +608,7 @@ impl<'a> Ktx2Blocks<'a> {
             h: hh,
             vk_format,
             complete: h.level_count.max(1) == full_mip_count(w, hh),
-            srgb: self.srgb(),
+            color: self.color(),
             rg: two_channels(vk_format),
             signed: signed_blocks(vk_format),
             float: float_blocks(vk_format),
@@ -429,7 +707,7 @@ fn bc7_opaque(block: &[u8]) -> bool {
     block[0] & 0x0f != 0 || (block[0] & 0x7f == 0x40 && bits >> 49 == 0x7fff && block[8] & 1 == 1)
 }
 
-fn container(image: ctt::Image) -> Result<Source, String> {
+fn container(image: ctt::Image, bytes: &[u8]) -> Result<Source, String> {
     let cube = match image.kind {
         TextureKind::Texture2D => false,
         TextureKind::Cubemap if image.surfaces.len() == 6 => true,
@@ -467,8 +745,12 @@ fn container(image: ctt::Image) -> Result<Source, String> {
         return Ok(Source {
             layers: Vec::new(),
             cube,
-            srgb,
-            primaries: None,
+            color: container_color(
+                bytes,
+                format,
+                srgb,
+                float_blocks(vk_format) || signed_blocks(vk_format),
+            ),
             blocks: Some(Blocks {
                 vk_format,
                 w,
@@ -526,8 +808,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
     Ok(Source {
         layers,
         cube,
-        srgb,
-        primaries: None,
+        color: container_color(bytes, format, srgb, is_float(format) || is_snorm(format)),
         blocks: None,
         rg: format.channel_count() == Some(2),
         signed: is_snorm(format),
@@ -588,48 +869,53 @@ fn is_ufloat(format: ctt::Format) -> bool {
 }
 
 fn file(bytes: &[u8]) -> Result<Source, String> {
+    use image::{ColorType as C, DynamicImage, ImageFormat};
     let reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
-    let is_png = reader.format() == Some(image::ImageFormat::Png);
-    let radiance = reader.format() == Some(image::ImageFormat::Hdr);
-    let img = reader.decode().map_err(|e| e.to_string())?;
+    let format = reader.format();
+    let radiance = format == Some(ImageFormat::Hdr);
+    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let icc = decoder.icc_profile().ok().flatten();
+    let img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
     let hdr = matches!(
         img,
-        image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_)
+        DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_)
     );
-    let (mut srgb, mut primaries) = (!hdr, None);
-    if is_png && let Some(cicp) = png_cicp(bytes)? {
-        primaries = Some(match cicp.color_primaries {
-            1 => Primaries::Rec709,
-            9 => Primaries::Rec2020,
-            12 => Primaries::DisplayP3,
-            p => return Err(format!("PNG cICP color primaries {p} are not supported")),
-        });
-        srgb = match cicp.transfer_function {
-            13 => true,
-            8 => false,
-            t => return Err(format!("PNG cICP transfer function {t} is not supported")),
-        };
-    }
-    use image::ColorType as C;
     let gray = match img.color() {
         C::L8 | C::L16 => Gray::Alone,
         C::La8 | C::La16 => Gray::WithAlpha,
         _ => Gray::No,
     };
+    let mut color = FileColor {
+        numeric: hdr,
+        rgb8: matches!(img.color(), C::Rgb8 | C::Rgba8),
+        // OpenEXR: "By convention, all color channels are premultiplied by alpha".
+        premultiplied: format == Some(ImageFormat::OpenExr) && img.color().has_alpha(),
+        ..Default::default()
+    };
+    let mut scale = [1.0; 3];
+    match format {
+        Some(ImageFormat::Png) => png_color(&mut color, bytes, icc.as_deref(), gray != Gray::No)?,
+        Some(ImageFormat::OpenExr) => exr_color(&mut color, bytes),
+        Some(ImageFormat::Hdr) => scale = radiance_header(&mut color, bytes)?,
+        _ => {
+            if let Some(icc) = &icc {
+                color::read_icc(&mut color, icc, gray != Gray::No);
+            }
+        }
+    }
     let rgba = img.to_rgba32f();
     let (w, h) = rgba.dimensions();
     let px = rgba
         .into_raw()
         .chunks_exact(4)
-        .map(|p| [p[0], p[1], p[2], p[3]])
+        .map(|p| [p[0] * scale[0], p[1] * scale[1], p[2] * scale[2], p[3]])
         .collect();
     Ok(Source {
         layers: vec![Img { w, h, px }],
         cube: false,
-        srgb,
-        primaries,
+        color,
         blocks: None,
         rg: false,
         signed: false,
@@ -637,6 +923,126 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
         negatives: hdr && !radiance,
         gray,
     })
+}
+
+/// States what a PNG's chunks say on `color`, the chunk of lowest priority number in PNG §4.3
+/// taking precedence: `cICP`, then `iCCP` (`icc`), `sRGB`, and `cHRM` and `gAMA` last.
+fn png_color(
+    color: &mut FileColor,
+    bytes: &[u8],
+    icc: Option<&[u8]>,
+    gray: bool,
+) -> Result<(), String> {
+    let reader = png::Decoder::new(Cursor::new(bytes))
+        .read_info()
+        .map_err(|e| e.to_string())?;
+    let info = reader.info();
+    if let Some(c) = info.coding_independent_code_points {
+        color.transfer = color::cicp_transfer(c.transfer_function);
+        color.gamut = color::cicp_gamut(c.color_primaries);
+        if !c.is_video_full_range_image {
+            // H.273: `D = 2^(n - 8) (219 E + 16)`, on the n-bit code that 0..1 stores.
+            color.narrow = Some(if info.bit_depth == png::BitDepth::Sixteen {
+                [-4096.0 / 56064.0, 65535.0 / 56064.0]
+            } else {
+                [-16.0 / 219.0, 255.0 / 219.0]
+            });
+        }
+        if color.transfer.is_some() || color.gamut.is_some() {
+            return Ok(());
+        }
+    }
+    if icc.is_some_and(|icc| color::read_icc(color, icc, gray)) {
+        return Ok(());
+    }
+    if info.srgb.is_some() {
+        color.transfer = Some(Transfer::Srgb);
+        color.gamut = Some(Gamut::REC709);
+        return Ok(());
+    }
+    if let Some(gamma) = info
+        .gama_chunk
+        .map(png::ScaledFloat::into_value)
+        .filter(|g| *g > 0.0)
+    {
+        color.transfer = Some(Transfer::Gamma(1.0 / gamma));
+    }
+    if let Some(c) = info.chrm_chunk {
+        let xy =
+            |p: (png::ScaledFloat, png::ScaledFloat)| [p.0, p.1].map(|v| f64::from(v.into_value()));
+        color.gamut = color::stated_gamut([xy(c.red), xy(c.green), xy(c.blue), xy(c.white)]);
+    }
+    Ok(())
+}
+
+/// States what an OpenEXR header says on `color`: `colorInteropID`, which supersedes
+/// `chromaticities`, or `chromaticities`.
+fn exr_color(color: &mut FileColor, bytes: &[u8]) {
+    use exr::meta::attribute::{AttributeValue, Text};
+    let Ok(meta) = exr::meta::MetaData::read_from_buffered(bytes, false) else {
+        return;
+    };
+    // The part `image` decodes.
+    let rgb = |h: &&exr::meta::header::Header| {
+        let holds = |c: &str| h.channels.find_index_of_channel(&Text::from(c)).is_some();
+        !h.deep && ["R", "G", "B"].into_iter().all(holds)
+    };
+    let Some(header) = meta.headers.iter().find(rgb) else {
+        return;
+    };
+    let name = Text::from("colorInteropID");
+    let interop = [
+        &header.own_attributes.other,
+        &header.shared_attributes.other,
+    ]
+    .into_iter()
+    .find_map(|attributes| match attributes.get(&name) {
+        Some(AttributeValue::Text(id)) => ImageColor::named(&id.to_string()),
+        _ => None,
+    });
+    match interop {
+        Some(ImageColor::Named(s)) => {
+            color.transfer = Some(s.transfer);
+            color.gamut = Some(s.gamut);
+        }
+        Some(_) => color.transfer = Some(Transfer::Linear),
+        None => {
+            if let Some(c) = &header.shared_attributes.chromaticities {
+                let xy = |v: exr::math::Vec2<f32>| [f64::from(v.0), f64::from(v.1)];
+                color.gamut =
+                    color::stated_gamut([xy(c.red), xy(c.green), xy(c.blue), xy(c.white)]);
+            }
+        }
+    }
+}
+
+/// States a Radiance header's `PRIMARIES` on `color`, and gives what its texels multiply by to
+/// undo every `EXPOSURE` and `COLORCORR`, which accumulate. No `PRIMARIES` stays Rec.709 rather
+/// than Radiance's default system, whose white is near E: untagged images are authored against
+/// neutrals, and would tint.
+fn radiance_header(color: &mut FileColor, bytes: &[u8]) -> Result<[f32; 3], String> {
+    let decoder = HdrDecoder::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let mut scale = [1.0f32; 3];
+    let numbers = |v: &str| -> Vec<f32> {
+        v.split_whitespace()
+            .map_while(|n| n.parse().ok())
+            .filter(|n: &f32| n.is_finite())
+            .collect()
+    };
+    for (key, value) in &decoder.metadata().custom_attributes {
+        match (key.as_str(), &numbers(value)[..]) {
+            ("EXPOSURE", &[e]) if e > 0.0 => scale = scale.map(|s| s / e),
+            ("COLORCORR", &[r, g, b]) if r > 0.0 && g > 0.0 && b > 0.0 => {
+                scale = [scale[0] / r, scale[1] / g, scale[2] / b];
+            }
+            ("PRIMARIES", &[rx, ry, gx, gy, bx, by, wx, wy]) => {
+                let xy = |x: f32, y: f32| [f64::from(x), f64::from(y)];
+                color.gamut = color::stated_gamut([xy(rx, ry), xy(gx, gy), xy(bx, by), xy(wx, wy)]);
+            }
+            _ => {}
+        }
+    }
+    Ok(scale)
 }
 
 /// An image's size and whether it is an animated WebP, from its headers; `None` when `image`
@@ -666,13 +1072,6 @@ pub(super) fn is_animated(bytes: &[u8]) -> bool {
         .ok()
         .and_then(header)
         .is_some_and(|h| h.1)
-}
-
-fn png_cicp(bytes: &[u8]) -> Result<Option<png::CodingIndependentCodePoints>, String> {
-    let reader = png::Decoder::new(Cursor::new(bytes))
-        .read_info()
-        .map_err(|e| e.to_string())?;
-    Ok(reader.info().coding_independent_code_points)
 }
 
 /// Decodes one layer's BCn mip to float texels (unorm values in 0..1, snorm values in -1..1,
@@ -817,6 +1216,58 @@ fn decode_block(vk_format: u32, block: &[u8]) -> Result<[[f32; 4]; 16], String> 
 mod tests {
     use super::*;
 
+    /// A layer in a window of its frame, in a named part of a file with stated primaries, reads
+    /// as that part of the whole file does.
+    #[test]
+    fn a_layer_keeps_the_frame_and_color_of_its_file() {
+        use exr::image::{AnyChannel, AnyChannels, Encoding, FlatSamples, Layer as ExrLayer};
+        use exr::meta::attribute::{Chromaticities, IntegerBounds};
+        use exr::meta::header::{ImageAttributes, LayerAttributes};
+        use exr::prelude::{Image, Vec2, WritableImage};
+        let plane = |name: &str, v: f32| AnyChannel::new(name, FlatSamples::F32(vec![v; 16]));
+        let mut image = ImageAttributes::new(IntegerBounds::from_dimensions((8, 8)));
+        image.chromaticities = Some(Chromaticities {
+            red: Vec2(0.708, 0.292),
+            green: Vec2(0.170, 0.797),
+            blue: Vec2(0.131, 0.046),
+            white: Vec2(0.3127, 0.3290),
+        });
+        let mut part = LayerAttributes::named("beauty");
+        part.layer_position = Vec2(2, 2);
+        let channels = AnyChannels::sort(
+            vec![
+                plane("P.X", 0.25),
+                plane("P.Y", 0.5),
+                plane("P.Z", 0.75),
+                plane("mask.A", 0.5),
+                plane("mask.Y", 0.125),
+            ]
+            .into(),
+        );
+        let layer = ExrLayer::new((4, 4), part, Encoding::UNCOMPRESSED, channels);
+        let mut file = Cursor::new(Vec::new());
+        Image::new(image, layer)
+            .write()
+            .to_buffered(&mut file)
+            .unwrap();
+        let file = file.into_inner();
+
+        let read = |name: &str| {
+            let layer = Layer::Named(name.into());
+            decode(&layer_of(&file, &layer).unwrap().unwrap()).unwrap()
+        };
+        let p = read("P");
+        let img = &p.layers[0];
+        assert_eq!((img.w, img.h), (8, 8));
+        assert_eq!(img.px[2 * 8 + 2], [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(img.px[0], [0.0, 0.0, 0.0, 1.0]);
+        assert!(p.color.gamut.is_some());
+        assert_eq!(
+            read("beauty.mask").layers[0].px[2 * 8 + 2],
+            [0.125, 0.0, 0.0, 0.5]
+        );
+    }
+
     /// 32x32, each quadrant a flat color and alpha, from libwebp at quality 90 with lossless
     /// alpha: a VP8X file with ALPH and VP8 chunks.
     const LOSSY_WEBP: &str = concat!(
@@ -833,7 +1284,7 @@ mod tests {
             .map(|i| u8::from_str_radix(&LOSSY_WEBP[2 * i..2 * i + 2], 16).unwrap())
             .collect();
         let src = decode(&bytes).unwrap();
-        assert!(src.srgb && !src.rg && src.blocks.is_none() && !is_animated(&bytes));
+        assert!(src.color.rgb8 && !src.rg && src.blocks.is_none() && !is_animated(&bytes));
         let img = &src.layers[0];
         assert_eq!((img.w, img.h), (32, 32));
         let quadrants: [[u8; 4]; 4] = [

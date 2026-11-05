@@ -326,3 +326,37 @@ pub mod consts {
 pub fn geometry_index_and_flags(index: u32, flags: u32) -> u32 {
     (index & 0xff_ffff) | flags << 29
 }
+
+#[cfg(test)]
+mod tests {
+    use super::partition_translation;
+
+    /// `(cell - origin_cell) << cell_log2` is exact in f32 for every cell and origin of a 32 km
+    /// world, at every cell size from 1 m to 4 km.
+    #[test]
+    fn partition_translation_is_exact_over_32_km() {
+        const HALF_RANGE_M: i64 = 16_384;
+        for log2 in 0..=12u32 {
+            let limit = (HALF_RANGE_M >> log2) as i32;
+            let origins = [-limit, -limit / 3, 0, 1, limit / 2, limit];
+            for cell in -limit..=limit {
+                for &origin in &origins {
+                    let got = partition_translation([cell, origin, -cell], [origin, cell, 0], log2);
+                    let want = |d: i64| (d * (1i64 << log2)) as f64;
+                    let diffs = [
+                        i64::from(cell) - i64::from(origin),
+                        i64::from(origin) - i64::from(cell),
+                        -i64::from(cell),
+                    ];
+                    for k in 0..3 {
+                        assert_eq!(
+                            f64::from(got[k]),
+                            want(diffs[k]),
+                            "cell {cell} origin {origin} log2 {log2}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

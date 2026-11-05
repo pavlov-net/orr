@@ -18,6 +18,7 @@ bytemuck.workspace = true
 # Exact pin: 0.6.1 removed a public re-export in a patch release. Default features pull
 # encoders the cook does not use.
 ctt = { version = "=0.6.1", default-features = false, features = ["encoder-amd", "encoder-bc7enc", "encoder-intel", "ispc-prebuilt", "rayon"] }
+exr = { version = "1.74", default-features = false }
 libloading = { workspace = true, optional = true }
 gltf = { version = "=1.4.1", default-features = false, features = ["utils", "names", "extras", "KHR_materials_emissive_strength", "KHR_materials_ior"] }
 half.workspace = true
@@ -28,6 +29,7 @@ meshopt.workspace = true
 # The binary's global allocator: it keeps freed pages, where the Windows heap returns large
 # buffers and faults them in again on the next job. Exact pin: it builds its C sources.
 mimalloc = { version = "=0.1.52", default-features = false }
+moxcms = "0.9"
 # Exact pin: no stable API before 1.0, and its composition shapes cooked meshes.
 openusd = "=0.8.0"
 orr_math.workspace = true

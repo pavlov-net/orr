@@ -1,5 +1,5 @@
 [package]
-name = "examples"
+name = "orr_examples"
 description = "orr's examples, and the test that runs them headless against blessed frames."
 version.workspace = true
 edition.workspace = true

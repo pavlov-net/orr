@@ -17,12 +17,13 @@ use orr_gpu::{
 use orr_io::{AlignedBuf, Read, SECTOR};
 use orr_math::{DVec3, IVec3, Vec3};
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
-use orr_pack::material::Material;
+use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{Cluster, Group, MeshHeader, MeshInfo, NodePage, PageHeader, PageView, Part};
 use orr_pack::model::ModelInfo;
 use orr_pack::neural::{Constants, Fp8Network, NeuralInfo, NeuralTexture};
 use orr_pack::subd::{Page as SubdPage, SubdInfo};
 use orr_pack::texture::{TextureHeader, TextureInfo};
+use orr_pack::tiles::TextureTiles;
 use orr_pack::volume::VolumeInfo;
 use orr_pack::{Aabb, Archive, AssetId, Class, Codec};
 use rustc_hash::FxHashMap;
@@ -36,7 +37,7 @@ use crate::edit::{
 };
 use crate::emissive::{EmissiveSpan, ModelEmission, indexed_spans};
 use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored};
-use crate::material::{BoundTexture, MaterialId, MaterialTable, candidate_class};
+use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler, candidate_class};
 use crate::medium_proxy::VolumeRef;
 use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::neural::{self, NeuralLink, Precision};
@@ -257,6 +258,14 @@ struct Placed {
     cages: Vec<PlacedCage>,
     volumes: Vec<(AssetId, VolumeRef)>,
     neural: Vec<PlacedNeural>,
+    tiles: Vec<PlacedTiles>,
+}
+
+/// A texture tile set, and the table `resolve` fills in a block of the mount.
+struct PlacedTiles {
+    id: AssetId,
+    set: TextureTiles,
+    table: GpuPtr<u32>,
 }
 
 /// A neural texture set: its weights in a block of the mount, and its record, written by
@@ -276,6 +285,7 @@ pub(crate) struct MountTask {
     /// Writes go through staging and copies (no resizable BAR).
     staged: bool,
     host_copy: bool,
+    /// The sampler of neural sets' latents.
     sampler: SamplerIndex,
     /// The precision neural sets decode at; none when textures sample their BC entries.
     neural: Option<Precision>,
@@ -581,7 +591,7 @@ fn mount_blob0(archive: &Archive, e: &orr_pack::Entry) -> Result<Option<Vec<u8>>
     Ok(Some(bytes))
 }
 
-/// The textures the pack's materials bind.
+/// The textures the pack's materials bind, the tiles of their tile sets among them.
 fn material_textures(archive: &Archive) -> Result<HashSet<AssetId>> {
     let mut bound = HashSet::new();
     for e in archive
@@ -592,6 +602,18 @@ fn material_textures(archive: &Archive) -> Result<HashSet<AssetId>> {
         if let Some(bytes) = mount_blob0(archive, e)? {
             let m = Material::from_bytes(&bytes)?;
             bound.extend(m.textures.iter().map(|t| t.texture));
+        }
+    }
+    for e in archive
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::TextureTiles as u16)
+    {
+        if bound.contains(&e.id)
+            && let Some(bytes) = mount_blob0(archive, e)?
+        {
+            let set = TextureTiles::parse(&bytes)?;
+            bound.extend(set.tiles.iter().map(|t| t.texture));
         }
     }
     Ok(bound)
@@ -668,6 +690,7 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
                 | Class::Clip
                 | Class::Subd
                 | Class::Volume
+                | Class::TextureTiles
         ) {
             continue;
         }
@@ -700,6 +723,7 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
             Class::Clip => fetch(t, i, 0, move |t, b| place_clip(t, i, id, b)),
             Class::Subd => fetch(t, i, 0, move |t, b| place_subd(t, i, id, b)),
             Class::Volume => fetch(t, i, 0, move |t, b| place_volume(t, i, id, b)),
+            Class::TextureTiles => fetch(t, i, 0, move |t, b| place_tiles(t, id, b)),
             _ => fetch(t, i, 0, move |t, b| place_page(t, i, id, b)),
         }
     }
@@ -1229,6 +1253,17 @@ fn place_texture(
     Ok(())
 }
 
+/// A tile set's table, filled once its tiles have heap indices.
+fn place_tiles(t: &Arc<MountTask>, id: AssetId, blob: &[u8]) -> Result<()> {
+    let set = TextureTiles::parse(blob)?;
+    let block = t.block(4 * set.words() as u64, "texture tiles")?;
+    // SAFETY: the block holds the table.
+    let table = unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu())) };
+    let tiles = PlacedTiles { id, set, table };
+    t.placed.lock().unwrap().tiles.push(tiles);
+    Ok(())
+}
+
 /// A neural link of its own for a texture that set `set` stands in for, its record (and the
 /// texture's own stream record, should it not stream) in a block of their own.
 fn neural_link(t: &Arc<MountTask>, (set, tex): (AssetId, NeuralTexture)) -> Result<NeuralLink> {
@@ -1456,35 +1491,65 @@ struct Resolved {
     cages: Vec<PlacedCage>,
     volumes: Vec<(AssetId, VolumeRef)>,
     neural: Vec<PlacedNeural>,
+    /// Tile tables and what they hold.
+    tiles: Vec<(GpuPtr<u32>, Vec<u32>)>,
     accel: MountAccel,
     /// Resident cluster id ranges taken for the mount's meshes.
     cluster_ranges: Vec<(u32, u32)>,
 }
 
-fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resolved> {
+fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
     let missing = |id| Error::Pack(orr_pack::Error::Missing(id));
-    let textures: HashMap<AssetId, BoundTexture> = p
+    let mut textures: HashMap<AssetId, BoundTexture> = p
         .textures
         .iter()
         .map(|t| {
             let b = BoundTexture {
                 index: t.index,
                 primaries: t.primaries,
+                ..BoundTexture::NONE
             };
             (t.id, b)
         })
         .collect();
+    let mut tiles = Vec::with_capacity(p.tiles.len());
+    let mut sets = Vec::with_capacity(p.tiles.len());
+    for s in &p.tiles {
+        let mut shared: Option<BoundTexture> = None;
+        let mut mixed = false;
+        let words = s
+            .set
+            .table(|id| {
+                let b = textures.get(&id)?;
+                mixed |= b.primaries != shared.get_or_insert(*b).primaries;
+                Some(b.index.0)
+            })
+            .map_err(missing)?;
+        if mixed {
+            return Err(orr_pack::Error::Malformed("texture tiles of mixed primaries").into());
+        }
+        let bound = BoundTexture {
+            tiles: s.table,
+            ..shared.expect("a tile set has tiles")
+        };
+        sets.push((s.id, bound));
+        tiles.push((s.table, words));
+    }
+    textures.extend(sets);
     let materials = p
         .materials
         .iter()
         .map(|(id, m)| {
-            let mut bound = [BoundTexture::NONE; 12];
+            let mut bound = [BoundTexture::NONE; slot::COUNT];
             for (b, t) in bound.iter_mut().zip(&m.textures) {
                 if t.texture != AssetId::NONE {
-                    *b = *textures.get(&t.texture).ok_or_else(|| missing(t.texture))?;
+                    *b = BoundTexture {
+                        sampler: device.sampler(&binding_sampler(t))?,
+                        ..*textures.get(&t.texture).ok_or_else(|| missing(t.texture))?
+                    };
                 }
             }
-            Ok((*id, MaterialGpu::new(m, &bound, sampler)))
+            Ok((*id, MaterialGpu::new(m, &bound)))
         })
         .collect::<Result<Vec<_>>>()?;
     let material_index: HashMap<AssetId, usize> = materials
@@ -1643,6 +1708,7 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
         cages: p.cages,
         volumes: p.volumes,
         neural: p.neural,
+        tiles,
         accel: MountAccel::default(),
         cluster_ranges: Vec::new(),
     })
@@ -1854,7 +1920,7 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<MountTask>) 
     };
     let mut ranges = Vec::new();
     let result = state
-        .and_then(|()| resolve(task.source(), placed, task.sampler))
+        .and_then(|()| resolve(task.source(), placed, device))
         .and_then(|mut r| {
             link_neural(&mut r)?;
             let tails = bind_tails(device, &r.textures)?;
@@ -3228,6 +3294,12 @@ impl Mounts {
         let resolved = (r.materials, r.meshes, r.models, r.pages, r.cages);
         for n in &r.neural {
             if let Err(e) = w.put(n.record, &[n.gpu]) {
+                self.release(res, w.device, w.materials);
+                return Err(e);
+            }
+        }
+        for (table, words) in &r.tiles {
+            if let Err(e) = w.put(*table, words) {
                 self.release(res, w.device, w.materials);
                 return Err(e);
             }

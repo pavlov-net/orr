@@ -12,11 +12,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use examples::mesh::MeshBuilder;
-use examples::shaders::wind;
-use examples::sun_shade::SunShade;
-use examples::window::Window;
-use examples::{Capture, Options, Workers, assert_clean, device, fixed_time};
 use orr::orr_gpu::{MemoryKind, QueueKind, SpecData, TimelinePoint};
 use orr::orr_pack::Target;
 use orr::orr_pack::material::Material;
@@ -26,6 +21,11 @@ use orr::{
     SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Source};
+use orr_examples::mesh::MeshBuilder;
+use orr_examples::shaders::wind;
+use orr_examples::sun_shade::SunShade;
+use orr_examples::window::Window;
+use orr_examples::{Capture, Options, Workers, assert_clean, device, fixed_time};
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, Mat3, UVec2, Vec2, Vec3};
 

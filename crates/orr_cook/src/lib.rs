@@ -20,7 +20,7 @@
 //!   named by its glTF animation index,
 //! - `N/material/<i>`: glTF material `i`, or `N/material/default` for primitives without one,
 //! - `N/texture/<material>/<role>`: the material's textures (roles `base_color`, `opacity`,
-//!   `normal`, `roughness`, `metalness`, `roughness_metalness`, `occlusion`, `emission`,
+//!   `normal`, `roughness`, `metalness`, `roughness_metalness`, `emission`,
 //!   `subsurface_color`, `specular_weight`, `coat`, `transmission`, `displacement`);
 //!   materials that would cook the same texture share the first one's entry.
 //!

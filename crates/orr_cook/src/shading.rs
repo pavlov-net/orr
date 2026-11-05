@@ -12,13 +12,14 @@
 //!   OpenPBR defines.
 //! - `UsdPreviewSurface`, mapped like glTF metallic-roughness: `diffuseColor` is
 //!   `base_color`, `metallic`, `roughness`, `ior` and `emissiveColor` (read as nits) their
-//!   fields, `clearcoat` and `clearcoatRoughness` the coat at `ior`, `occlusion` the occlusion
-//!   texture, and `normal` and `displacement` their textures, a constant reading a solid image
-//!   ([`solid_image`]). `opacityThreshold` above 0 alpha-tests `opacity` at it; otherwise
-//!   `opacityMode` `presence` blends an opacity below 1 or textured, and `transparent` makes
-//!   the rest of it thin-walled transmission, which leaves specular and emission at full
-//!   weight. The specular workflow's `specularColor` is F0: `specular_ior` gives its largest
-//!   channel and `specular_color` the others, so a colored F0 tints the edge as well.
+//!   fields, `clearcoat` and `clearcoatRoughness` the coat at `ior`, and `normal` and
+//!   `displacement` their textures, a constant reading a solid image ([`solid_image`]).
+//!   `occlusion` isn't read: a path tracer computes it. `opacityThreshold` above 0 alpha-tests
+//!   `opacity` at it; otherwise `opacityMode` `presence` blends an opacity below 1 or textured,
+//!   and `transparent` makes the rest of it thin-walled transmission, which leaves specular and
+//!   emission at full weight. The specular workflow's `specularColor` is F0: `specular_ior`
+//!   gives its largest channel and `specular_color` the others, so a colored F0 tints the edge
+//!   as well.
 //!
 //! An input is a constant, or reads a texture through these nodes: MaterialX `image` and
 //! `tiledimage` (with `texcoord`, `geompropvalue` and `place2d` on their coordinates,
@@ -30,8 +31,8 @@
 //! other than a uv set fails, as meshes hold no values for it. Any other node fails the import,
 //! naming it, as does a connection cycle. A `geompropvalue` whose property no uv set holds reads
 //! its `default` at every point, as an unconnected `place2d` reads 0, 0. Textures go to the
-//! material's slots (base color, opacity, roughness, metalness, normal, occlusion, emission,
-//! specular weight, subsurface color, coat, transmission, displacement); a textured input
+//! material's slots (base color, opacity, roughness, metalness, normal, emission, specular
+//! weight, subsurface color, coat, transmission, displacement); a textured input
 //! without a slot fails. A texture value multiplies the field, which takes the reader's scale
 //! (`UsdUVTexture` `scale`; 1 otherwise); a bias folds scale and bias into the texels
 //! ([`TexRef::remap`]) and leaves the field 1, or for a color what it reaches past 1. Normals
@@ -47,14 +48,33 @@
 //! lengths, so no object scale enters them; a displacement moves mesh space points, so a
 //! placement's scale does scale it. `thin_film_thickness` without a unit is in micrometers, as
 //! OpenPBR states it, whatever the scene's unit.
+//!
+//! A texture whose file can't be read, or which names none, reads what its node states for that
+//! everywhere: `UsdUVTexture` `fallback`, default (0, 0, 0, 1), taking the texture's place in
+//! `scale * t + bias`, or `image` and `tiledimage` `default`, default 0. Those values are linear
+//! and take no decoding. One that is no constant reads as that default there, and a `default`
+//! past the edges under `constant` fails.
+//!
+//! A file name holding a tile token is a set of images, one to each unit square of st
+//! ([`crate::texture::tiles`]). Those values are what a square with no tile reads, as a point there
+//! names a file that isn't. A token, not an address mode, picks the tile, so `wrapS`, `wrapT`,
+//! `uaddressmode` and `vaddressmode` have nothing to state of a set: tiles clamp at their edges,
+//! as USD's Storm has them.
+//!
+//! A `UsdUVTexture` reads as its `sourceColorSpace` says, or under `auto` as the file's
+//! `colorSpace` metadata names, and a MaterialX image of a color type as its `colorspace` names;
+//! [`crate::texture::color`] has what each rule does. An unknown `colorspace` warns and reads as
+//! "data". A channel picked from a color image takes the space's curve and none of its primaries:
+//! a renderer working in the document's space would read the channel as it stands.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 
 use orr_math::{Affine2, Vec2};
-use orr_pack::material::Material;
+use orr_pack::material::{Material, filter};
 
 use crate::texture::Wrap;
+use crate::texture::color::{ImageColor, Space};
 use crate::texture::material::{ImageData, ImageFile, ImageRules, MaterialTextures, TexRef};
 
 /// A shading network: nodes and the connections between their inputs and outputs.
@@ -173,8 +193,8 @@ pub(crate) struct Host<'a> {
     pub(crate) primvars: &'a [&'a str],
     /// What the mesh holds for each primvar of [`Network::primvar_reads`].
     pub(crate) reads: &'a [(String, Primvar)],
-    /// Adds a [`solid_image`] of a color to the scene; returns its index.
-    pub(crate) solid: &'a mut dyn FnMut([f32; 3]) -> usize,
+    /// Adds an image to the scene, unless it holds one of that name; returns its index.
+    pub(crate) add: &'a mut dyn FnMut(ImageFile) -> usize,
 }
 
 /// An image of one linear color, for inputs the material reads only through a texture.
@@ -189,6 +209,11 @@ pub(crate) fn solid_image(rgb: [f32; 3]) -> ImageFile {
         name: format!("solid/{texel:04x?}"),
         data: ImageData::Bytes(bytes.into_inner()),
     }
+}
+
+/// Whether a MaterialX type is one that color management covers.
+pub(crate) fn is_color(ty: &str) -> bool {
+    matches!(ty, "color3" | "color4")
 }
 
 /// The MaterialX category of a node definition id: `ND_image_color3` is `image`.
@@ -241,7 +266,11 @@ struct Tex {
     channels: Channels,
     uv_set: u8,
     wrap: [Wrap; 2],
-    srgb: Option<bool>,
+    color: ImageColor,
+    file_wrap: [bool; 2],
+    filter: u8,
+    outside: [f32; 4],
+    missing: [f32; 4],
     uv: Affine2,
     scale: [f32; 4],
     bias: [f32; 4],
@@ -257,13 +286,18 @@ impl Tex {
     fn tex_ref(&self) -> TexRef {
         TexRef {
             rg_channel: None,
+            input: None,
             uv: slot_transform(self.uv),
             image: self.image,
             rules: self.rules,
             channel: self.channel() as u8,
             uv_set: self.uv_set,
             wrap: self.wrap,
-            srgb: self.srgb,
+            color: self.color,
+            file_wrap: self.file_wrap,
+            filter: self.filter,
+            outside: self.outside,
+            missing: self.missing,
             remap: None,
         }
     }
@@ -540,7 +574,7 @@ impl Mapper<'_, '_> {
 
     /// The value output `output` of node `n` gives.
     fn connected(&mut self, n: usize, output: &str) -> Result<Value, String> {
-        let node = self.node(n);
+        let node = &self.net.nodes[n];
         let channel = |out: &str| match out {
             "outr" | "outx" | "r" => Some(0),
             "outg" | "outy" | "g" => Some(1),
@@ -555,6 +589,16 @@ impl Mapper<'_, '_> {
                     "float" => Channels::One(0),
                     _ => Channels::Rgb,
                 };
+                if let Some(Input::Image {
+                    color_space: Some(space),
+                    ..
+                }) = self.source(n, "file")
+                    && is_color(&node.ty)
+                    && ImageColor::named(space).is_none()
+                {
+                    let warning = format!("{}: colorspace {space} reads as data", node.name);
+                    self.warnings.push(warning);
+                }
                 Ok(Value::Texture(t))
             }
             "UsdUVTexture" => {
@@ -643,19 +687,21 @@ impl Mapper<'_, '_> {
     }
 
     /// A MaterialX `image` or `tiledimage` node, its channels left for the caller.
-    fn image(&self, n: usize) -> Result<Tex, String> {
-        let node = self.node(n);
-        let Some(Input::Image {
-            image,
-            color_space,
-            unit,
-        }) = self.source(n, "file")
-        else {
-            return Err(format!("{}: no file", node.name));
+    fn image(&mut self, n: usize) -> Result<Tex, String> {
+        let (image, color_space, unit) = match self.source(n, "file") {
+            Some(Input::Image {
+                image,
+                color_space,
+                unit,
+            }) => (*image, color_space.clone(), *unit),
+            None => (self.no_file(n), None, Unit::Unstated),
+            Some(_) => return Err(format!("{}: file is not a filename", self.node(n).name)),
         };
+        let node = self.node(n);
         let wrap = |mode: Option<&str>| match mode {
             None | Some("periodic") => Ok(Wrap::Repeat),
-            Some("clamp" | "constant") => Ok(Wrap::Clamp),
+            Some("clamp") => Ok(Wrap::Clamp),
+            Some("constant") => Ok(Wrap::Constant),
             Some("mirror") => Ok(Wrap::Mirror),
             Some(m) => Err(format!("{}: address mode {m}", node.name)),
         };
@@ -663,7 +709,32 @@ impl Mapper<'_, '_> {
             wrap(self.text(n, "uaddressmode"))?,
             wrap(self.text(n, "vaddressmode"))?,
         ];
-        let srgb = Some(color_space.as_deref() == Some("srgb_texture"));
+        // Color management covers color types, and a document without a space has none.
+        let color = color_space
+            .as_deref()
+            .filter(|_| is_color(&node.ty))
+            .and_then(ImageColor::named)
+            .unwrap_or(ImageColor::Data);
+        // Past the edges under `constant` the default must read; where only a missing file would
+        // need it, one that isn't a constant gives the zero of no default.
+        let default = match self.number(n, "default") {
+            Err(e) if wrap.contains(&Wrap::Constant) => return Err(e),
+            d => d.unwrap_or_default().unwrap_or_default(),
+        };
+        // A float default holds whichever channel of the file a slot reads.
+        let missing = match default[..] {
+            [v] => [v; 4],
+            ref v => std::array::from_fn(|i| v.get(i).copied().unwrap_or(0.0)),
+        };
+        let outside = if wrap.contains(&Wrap::Constant) {
+            missing
+        } else {
+            [0.0; 4]
+        };
+        let filter = match self.text(n, "filtertype") {
+            Some("closest") => filter::MAG_NEAREST | filter::MIN_NEAREST | filter::MIP_NEAREST,
+            _ => 0,
+        };
         let (uv_set, mut uv) = self.texcoord(n, "texcoord", (0, Affine2::IDENTITY))?;
         if node.kind == "tiledimage" {
             let tiling = self.vec2(n, "uvtiling", Vec2::ONE)?;
@@ -676,52 +747,76 @@ impl Mapper<'_, '_> {
                 * uv;
         }
         Ok(Tex {
-            image: *image,
+            image,
             rules: ImageRules::MaterialX,
             channels: Channels::Rgb,
             uv_set,
             wrap,
-            srgb,
+            color,
+            file_wrap: [false; 2],
+            filter,
+            outside,
+            missing,
             uv,
             scale: [1.0; 4],
             bias: [0.0; 4],
-            unit: *unit,
+            unit,
         })
     }
 
     /// A `UsdUVTexture` node, its channels left for the caller.
-    fn uv_texture(&self, n: usize) -> Result<Tex, String> {
-        let node = self.node(n);
-        let Some(Input::Image { image, .. }) = node.inputs.get("file") else {
-            return Err(format!("{}: no file", node.name));
+    fn uv_texture(&mut self, n: usize) -> Result<Tex, String> {
+        let (image, color_space) = match self.node(n).inputs.get("file") {
+            Some(Input::Image {
+                image, color_space, ..
+            }) => (*image, color_space.clone()),
+            None => (self.no_file(n), None),
+            Some(_) => return Err(format!("{}: file is not an asset", self.node(n).name)),
         };
+        let node = self.node(n);
         let wrap = |mode: Option<&str>| match mode {
-            None | Some("repeat" | "useMetadata") => Ok(Wrap::Repeat),
-            Some("clamp" | "black") => Ok(Wrap::Clamp),
+            None | Some("black" | "useMetadata") => Ok(Wrap::Border),
+            Some("repeat") => Ok(Wrap::Repeat),
+            Some("clamp") => Ok(Wrap::Clamp),
             Some("mirror") => Ok(Wrap::Mirror),
             Some(m) => Err(format!("{}: wrap mode {m}", node.name)),
         };
-        let wrap = [wrap(self.text(n, "wrapS"))?, wrap(self.text(n, "wrapT"))?];
-        let srgb = match self.text(n, "sourceColorSpace") {
-            Some("sRGB") => Some(true),
-            Some("raw") => Some(false),
-            _ => None,
+        let modes = [self.text(n, "wrapS"), self.text(n, "wrapT")];
+        let wrap = [wrap(modes[0])?, wrap(modes[1])?];
+        let file_wrap = modes.map(|m| matches!(m, None | Some("useMetadata")));
+        let stated = match self.text(n, "sourceColorSpace") {
+            Some(s @ ("sRGB" | "raw")) => Some(s),
+            _ => color_space.as_deref(),
         };
-        let four = |v: Option<Vec<f32>>, d: f32| {
-            v.map_or([d; 4], |v| {
-                std::array::from_fn(|i| v.get(i).copied().unwrap_or(d))
+        let color = match stated {
+            Some("sRGB") => ImageColor::Named(Space::SRGB),
+            s => s.and_then(ImageColor::named).unwrap_or(ImageColor::UsdAuto),
+        };
+        let four = |v: Option<Vec<f32>>, d: [f32; 4]| {
+            v.map_or(d, |v| {
+                std::array::from_fn(|i| v.get(i).copied().unwrap_or(d[i]))
             })
         };
-        let scale = four(self.number(n, "scale")?, 1.0);
-        let bias = four(self.number(n, "bias")?, 0.0);
+        let scale = four(self.number(n, "scale")?, [1.0; 4]);
+        let bias = four(self.number(n, "bias")?, [0.0; 4]);
+        // Only a file that can't be read needs the fallback, so one that isn't a constant gives
+        // its default.
+        let missing = four(
+            self.number(n, "fallback").unwrap_or_default(),
+            [0.0, 0.0, 0.0, 1.0],
+        );
         let (uv_set, uv) = self.texcoord(n, "st", (0, fixed(Vec2::ZERO)))?;
         Ok(Tex {
-            image: *image,
+            image,
             rules: ImageRules::Usd,
             channels: Channels::Rgb,
             uv_set,
             wrap,
-            srgb,
+            color,
+            file_wrap,
+            filter: 0,
+            outside: [0.0; 4],
+            missing,
             uv,
             scale,
             bias,
@@ -729,15 +824,25 @@ impl Mapper<'_, '_> {
         })
     }
 
+    /// The image of texture node `n`, which names no file.
+    fn no_file(&mut self, n: usize) -> usize {
+        let name = self.node(n).name.clone();
+        (self.host.add)(ImageFile::unread(name, "it names no file".into()))
+    }
+
     /// A texture of `rgb`, for a constant input read through a slot.
     fn solid(&mut self, rgb: [f32; 3]) -> Tex {
         Tex {
-            image: (self.host.solid)(rgb),
+            image: (self.host.add)(solid_image(rgb)),
             rules: ImageRules::Usd,
             channels: Channels::Rgb,
             uv_set: 0,
             wrap: [Wrap::Repeat; 2],
-            srgb: Some(false),
+            color: ImageColor::Data,
+            file_wrap: [false; 2],
+            filter: 0,
+            outside: [0.0; 4],
+            missing: [0.0; 4],
             uv: Affine2::IDENTITY,
             scale: [1.0; 4],
             bias: [0.0; 4],
@@ -1195,12 +1300,6 @@ impl Mapper<'_, '_> {
             self.material.coat_color = [1.0; 3];
         }
         self.preview_opacity(n)?;
-        match self.value(n, "occlusion")? {
-            None | Some(Value::Constant(..)) => {}
-            Some(Value::Texture(t)) => {
-                self.textures.occlusion = Some((t.scalar().0, 1.0));
-            }
-        }
         match self.value(n, "normal")? {
             None => {}
             Some(Value::Constant(v, _)) => {

@@ -5,8 +5,8 @@
 //!   factor becomes a BC4 opacity texture, with alpha-coverage mips at the cutoff under
 //!   `MASK` unless it keeps its source's mips.
 //! - Normal: BC5, with the glTF normal scale applied.
-//! - Roughness and metalness share a BC5 (BC4 when only one varies); occlusion gets a BC4.
-//!   Factors are folded into these texels and the material's factors set to 1.
+//! - Roughness and metalness share a BC5 (BC4 when only one varies). Factors are folded into
+//!   these texels and the material's factors set to 1.
 //! - Roughness takes the normal map's variance per mip (Toksvig), so a material with a normal
 //!   map gets a roughness texture even when its roughness is constant. At the quality levels
 //!   that keep source mips, roughness that keeps them, and roughness beside a normal map
@@ -22,34 +22,54 @@
 //!   range `lo..hi` the image measures, as `(h - lo) / (hi - lo)`, with the scale and offset
 //!   compensated; a range past 0..1 widens the declared one.
 //! - An image whose texels all lie within 1/255 of one value collapses into the material's
-//!   factor, clamped to the input's range as a texture stores it; a constant normal or
-//!   occlusion image, which has no factor, cooks at 4x4. Under `MASK` an opacity image collapses
-//!   only when its texels fall on one side of the cutoff.
+//!   factor, clamped to the input's range as a texture stores it; a constant normal image, which
+//!   has no factor, cooks at 4x4. Under `MASK` an opacity image collapses only when its texels
+//!   fall on one side of the cutoff. An image read past 0..1 as something else ([`Wrap::Border`],
+//!   [`Wrap::Constant`]) never collapses.
+//! - A slot's wrap and filter go to its binding, as does what it reads past 0..1: the image's
+//!   transparent black or stated value through the same factors and remaps as its texels.
+//!   Under [`Wrap::Border`] a texture that reads anything but black there takes
+//!   [`Wrap::Constant`], which the shader checks: a hardware border holds only black.
 //!
-//! A bound texture's value multiplies the matching factor; normal, occlusion and opacity
-//! textures have no factor.
+//! - A set of tiles ([`ImageData::Tiles`]) cooks each tile into a texture of its own, at its own
+//!   size and with its own mips, packed as an image would be, under what the whole set decides:
+//!   the format, the primaries, the scale and offset of heights. A
+//!   [`TextureTiles`](orr_pack::tiles::TextureTiles) asset holds them, and the slot binds that.
+//!   Two inputs share a texture, or pair for Toksvig roughness, only with tiles at the same cells.
+//!   A token picks the tile, so no point lies past a tile's edge: tiles clamp whatever wrap the
+//!   input states, and mips filter each tile alone. What the input reads where there is no tile
+//!   goes to the binding, and a set never collapses into a factor.
+//!
+//! A bound texture's value multiplies the matching factor; normal and opacity textures have no
+//! factor.
+//!
+//! No importer reads occlusion: a path tracer computes it, and glTF and USD say to ignore the
+//! texture there.
 
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use ctt::Quality;
 use orr_color::RgbPrimaries;
-use orr_math::DVec3;
+use orr_math::{DMat3, DVec3};
 use orr_pack::material::{Material, TextureBinding, slot};
-use orr_pack::texture::{full_mip_count, mip_size};
+use orr_pack::texture::{full_mip_count, mip_size, normal};
+use orr_pack::tiles::{TextureTiles, Tile};
 use orr_pack::{AssetId, Class, Hash32};
 use rayon::prelude::*;
 use serde::Deserialize;
 
+use super::color::{BELOW_ZERO, Decode, FileColor, ImageColor, Read, clipped, multiply};
 use super::load::{self, Blocks, Gray, Source};
-use super::mips::{MipSpec, Toksvig, normalized};
+use super::mips::{MipSpec, Toksvig, normalized, settled};
 use super::neural::{self, NeuralJob, NeuralSettings};
+use super::tiles::Cell;
 use super::{
     Built, DataFormat, Encoding, Img, MipFilter, NormalSource, Plan, Primaries, Wrap,
-    srgb_to_linear, stores_normals,
+    stores_normals,
 };
 use crate::decoded::Decoded;
 use crate::key::Key;
@@ -66,7 +86,7 @@ pub struct TextureRules {
     /// See [`super::TextureSettings::bc_split`].
     pub bc_split: Option<bool>,
     /// Applied in order to every texture made from an image whose name or URI contains the
-    /// pattern.
+    /// pattern. A tile of a set matches by its own name or the set's.
     pub overrides: Vec<(String, TextureOverride)>,
     /// With it, each material also cooks a neural texture set of its textures.
     pub neural: Option<NeuralSettings>,
@@ -92,7 +112,6 @@ pub struct InputChannels {
     pub opacity: Option<u8>,
     pub roughness: Option<u8>,
     pub metalness: Option<u8>,
-    pub occlusion: Option<u8>,
     pub specular: Option<u8>,
     pub coat: Option<u8>,
     pub transmission: Option<u8>,
@@ -116,12 +135,25 @@ pub(crate) struct TexRef {
     pub(crate) channel: u8,
     /// The channel read instead from an image that holds only red and green.
     pub(crate) rg_channel: Option<u8>,
+    /// The input whose channel overrides set [`Self::channel`], which each tile of a set takes up
+    /// by its own name.
+    pub(crate) input: Option<fn(&InputChannels) -> Option<u8>>,
     pub(crate) uv_set: u8,
     pub(crate) wrap: [Wrap; 2],
+    /// The axes whose [`Self::wrap`] gives way to what the file's metadata states.
+    pub(crate) file_wrap: [bool; 2],
+    /// `TextureBinding::filter` bits.
+    pub(crate) filter: u8,
+    /// What each channel of the image reads past 0..1 under [`Wrap::Border`] and
+    /// [`Wrap::Constant`], as its texels decode: colors linear Rec.709.
+    pub(crate) outside: [f32; 4],
+    /// What each channel reads where the image can't be read, as a linear value: the `fallback`
+    /// or `default` of the input.
+    pub(crate) missing: [f32; 4],
     /// The uv transform the texture is sampled with (`Material::uv_transforms` form).
     pub(crate) uv: [f32; 6],
-    /// Whether color texels are sRGB-encoded; `None` takes the file's own encoding.
-    pub(crate) srgb: Option<bool>,
+    /// What the importer's rules say the image's texels are.
+    pub(crate) color: ImageColor,
     /// Per axis (a scalar input's being the first), `[a, b]` of the `a + b * texel` the input
     /// reads, below any factor; a normal map reads it in place of its encoding.
     pub(crate) remap: Option<[[f32; 2]; 3]>,
@@ -134,33 +166,46 @@ impl TexRef {
             .map_or(texel, |m| m[axis][0] + m[axis][1] * texel)
     }
 
-    /// The source channel `channel` as axis `axis` of this input, under `a + b * value`.
-    fn source(&self, axis: usize, channel: usize, srgb: bool, a: f32, b: f32) -> Channel {
+    /// `[a, b]` of `a + b * read`, with `read` this input's value on `axis`, of a source value.
+    fn through(&self, axis: usize, a: f32, b: f32) -> [f32; 2] {
         let [ra, rb] = self.remap.map_or([0.0, 1.0], |m| m[axis]);
-        Channel::Image {
+        [a + b * ra, b * rb]
+    }
+
+    /// The source channel `channel` as axis `axis` of this input, under `a + b * value`.
+    fn source(&self, axis: usize, channel: usize, read: Read, a: f32, b: f32) -> Texels {
+        let [a, b] = self.through(axis, a, b);
+        Texels::Image {
             image: self.image,
             channel,
-            srgb,
-            a: a + b * ra,
-            b: b * rb,
+            read,
+            a,
+            b,
         }
     }
 
     /// The normal in texel `t`, with [`Packer::normal_source`]'s remap, of an image laid out as
     /// `source` says.
     fn normal(&self, source: NormalSource, t: [f32; 4]) -> [f32; 3] {
-        let [x, y] = [self.read(0, t[0]), self.read(1, t[source.y])];
+        let value = |c: usize| source.decode.value(t[c]);
+        let [x, y] = [self.read(0, value(0)), self.read(1, value(source.y))];
         let z = if source.rg {
-            orr_pack::texture::normal::z(x, y)
+            normal::z(x, y)
         } else {
-            self.read(2, t[source.z])
+            self.read(2, value(source.z))
         };
         [x, y, z]
     }
 
-    /// Whether both read their textures at the same uvs.
+    /// Whether both read their textures at the same uvs, past the edges too.
     fn samples_like(&self, o: &TexRef) -> bool {
-        self.uv_set == o.uv_set && self.uv == o.uv
+        self.uv_set == o.uv_set && self.uv == o.uv && self.wrap == o.wrap
+    }
+
+    /// Whether reads past 0..1 leave the image, so that an image of one value isn't one value
+    /// everywhere.
+    fn bounded(&self) -> bool {
+        self.wrap.iter().any(|w| w.bounded())
     }
 }
 
@@ -174,8 +219,6 @@ pub(crate) struct MaterialTextures {
     pub(crate) metalness: Option<TexRef>,
     /// With its scale per tangent axis; a negative scale flips the axis.
     pub(crate) normal: Option<(TexRef, [f32; 2])>,
-    /// With its strength.
-    pub(crate) occlusion: Option<(TexRef, f32)>,
     pub(crate) emissive: Option<TexRef>,
     pub(crate) specular: Option<TexRef>,
     pub(crate) coat: Option<TexRef>,
@@ -193,7 +236,6 @@ impl MaterialTextures {
             self.roughness.as_ref(),
             self.metalness.as_ref(),
             self.normal.as_ref().map(|n| &n.0),
-            self.occlusion.as_ref().map(|o| &o.0),
             self.emissive.as_ref(),
             self.specular.as_ref(),
             self.coat.as_ref(),
@@ -203,6 +245,31 @@ impl MaterialTextures {
         ]
         .into_iter()
         .flatten()
+    }
+
+    fn refs_mut(&mut self) -> impl Iterator<Item = &mut TexRef> {
+        [
+            self.base_color.as_mut(),
+            self.opacity.as_mut(),
+            self.roughness.as_mut(),
+            self.metalness.as_mut(),
+            self.normal.as_mut().map(|n| &mut n.0),
+            self.emissive.as_mut(),
+            self.specular.as_mut(),
+            self.coat.as_mut(),
+            self.transmission.as_mut(),
+            self.subsurface_color.as_mut(),
+            self.displacement.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// The references of color inputs.
+    pub(crate) fn colors(&self) -> impl Iterator<Item = &TexRef> {
+        [&self.base_color, &self.emissive, &self.subsurface_color]
+            .into_iter()
+            .flatten()
     }
 
     /// The image of a normal map that [`ImageFacts::cant_read`].
@@ -218,6 +285,17 @@ pub(crate) struct ImageFile {
     pub(crate) data: ImageData,
 }
 
+/// What an image reads of its file.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Layer {
+    /// All of it.
+    Whole,
+    /// The layer of this name, and a file without one reads as a file that can't be read.
+    Named(String),
+    /// Layer `default`, else layer `rgba`, else all of it.
+    Implied,
+}
+
 pub(crate) enum ImageData {
     Bytes(Vec<u8>),
     /// A file, read when needed. [`image_facts`] reads it first and records its hash and
@@ -225,10 +303,40 @@ pub(crate) enum ImageData {
     File {
         path: PathBuf,
         read: Option<(Hash32, u64)>,
+        layer: Layer,
     },
+    /// No file to read, and why.
+    Unread(String),
+    /// One texel of these values.
+    Solid([f32; 4]),
+    /// The images of a file name that names one per unit square of uv space, in cell order.
+    Tiles(Vec<ImageTile>),
+}
+
+/// One tile of a set: an image of the scene and its cell.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ImageTile {
+    pub(crate) cell: Cell,
+    pub(crate) image: usize,
 }
 
 impl ImageFile {
+    /// An image that reads as the input's fallback, for why it has no file.
+    pub(crate) fn unread(name: String, why: String) -> Self {
+        Self {
+            name,
+            data: ImageData::Unread(why),
+        }
+    }
+
+    /// The tiles of a set.
+    pub(crate) fn tiles(&self) -> Option<&[ImageTile]> {
+        match &self.data {
+            ImageData::Tiles(t) => Some(t),
+            _ => None,
+        }
+    }
+
     /// The file's bytes; a file must not have changed since its facts were read.
     fn bytes(&self) -> Result<Cow<'_, [u8]>> {
         match &self.data {
@@ -236,9 +344,20 @@ impl ImageFile {
             ImageData::File {
                 path,
                 read: Some((hash, _)),
-            } => Ok(Cow::Owned(state::read_checked(path, *hash)?)),
-            ImageData::File { read: None, .. } => {
-                unreachable!("an image's facts are read before its jobs")
+                layer,
+            } => {
+                let bytes = state::read_checked(path, *hash)?;
+                let layer = load::layer_of(&bytes, layer).map_err(|message| Error::Texture {
+                    asset: self.name.clone(),
+                    message,
+                })?;
+                Ok(Cow::Owned(layer.unwrap_or(bytes)))
+            }
+            ImageData::File { read: None, .. }
+            | ImageData::Unread(_)
+            | ImageData::Solid(_)
+            | ImageData::Tiles(_) => {
+                unreachable!("only an image with facts from bytes reads them")
             }
         }
     }
@@ -247,6 +366,19 @@ impl ImageFile {
         match &self.data {
             ImageData::Bytes(b) => b.len() as u64,
             ImageData::File { read, .. } => read.map_or(0, |r| r.1),
+            ImageData::Unread(_) | ImageData::Solid(_) | ImageData::Tiles(_) => 0,
+        }
+    }
+
+    /// The image's only layer.
+    fn decoded(&self) -> Result<Img, String> {
+        match self.data {
+            ImageData::Solid(texel) => Ok(Img {
+                w: 1,
+                h: 1,
+                px: vec![texel],
+            }),
+            _ => decode(&self.bytes().map_err(|e| e.to_string())?),
         }
     }
 }
@@ -256,13 +388,16 @@ impl ImageFile {
 pub(crate) struct ImageFacts {
     w: u32,
     h: u32,
-    srgb: bool,
-    primaries: Option<Primaries>,
+    color: FileColor,
     /// Per channel, the value every texel lies within 1/255 of, if there is one.
     constant: [Option<f32>; 4],
-    /// Per channel, the lowest and highest value of mip 0. Only a float image or one read as a
-    /// height is sure to have all of it: reading blocks stops once every channel varies.
+    /// Per channel, the lowest and highest value of mip 0, or of every mip the file stores of a
+    /// color that can read below 0. Only a float image or one read with all of its range is sure
+    /// to have all of it: reading blocks stops once every channel varies.
     range: [(f32, f32); 4],
+    /// A color channel holds negative infinity, which [`Self::range`] leaves out: it has no color
+    /// to convert, and clips.
+    minus_infinity: bool,
     hash: Hash32,
     /// The block format of a block-compressed file, and whether it has every mip.
     blocks: Option<(u32, bool)>,
@@ -280,9 +415,58 @@ pub(crate) struct ImageFacts {
     gray: Gray,
     /// The file is animated; only its first frame is read.
     pub(crate) animated: bool,
+    /// What the file's metadata says it reads past 0..1, per axis.
+    wrap: Option<[Wrap; 2]>,
 }
 
 impl ImageFacts {
+    /// The facts of a texel of float values.
+    fn solid(texel: [f32; 4]) -> Self {
+        Self {
+            w: 1,
+            h: 1,
+            color: FileColor::default(),
+            constant: texel.map(Some),
+            range: texel.map(|v| (v, v)),
+            minus_infinity: false,
+            hash: Hash32::of(bytemuck::cast_slice(&texel)),
+            blocks: None,
+            rg: false,
+            signed: false,
+            float: true,
+            negatives: true,
+            stored_normals: false,
+            gray: Gray::No,
+            animated: false,
+            wrap: None,
+        }
+    }
+
+    /// What a set of tiles holds in all, for what the whole set decides. Nothing collapses, so
+    /// it has no constant, and its color and values are its tiles' to read.
+    fn of_tiles<'a>(tiles: impl Iterator<Item = &'a Self> + Clone) -> Self {
+        let all = |f: fn(&Self) -> bool| tiles.clone().all(f);
+        let any = |f: fn(&Self) -> bool| tiles.clone().any(f);
+        Self {
+            w: tiles.clone().map(|t| t.w).max().unwrap_or(1),
+            h: tiles.clone().map(|t| t.h).max().unwrap_or(1),
+            color: FileColor::default(),
+            constant: [None; 4],
+            range: [(0.0, 0.0); 4],
+            minus_infinity: any(|t| t.minus_infinity),
+            hash: Hash32::of(&tiles.clone().flat_map(|t| t.hash.0).collect::<Vec<u8>>()),
+            blocks: None,
+            rg: all(|t| t.rg),
+            signed: all(|t| t.signed),
+            float: any(|t| t.float),
+            negatives: all(|t| t.negatives),
+            stored_normals: all(|t| t.stored_normals),
+            gray: Gray::No,
+            animated: false,
+            wrap: None,
+        }
+    }
+
     /// Whether normal map `r` is to read as it stands where this image can't hold the signed
     /// vectors that would mean.
     fn cant_read(&self, r: &TexRef) -> bool {
@@ -301,17 +485,32 @@ fn decode(bytes: &[u8]) -> Result<Img, String> {
     Ok(layers.remove(0))
 }
 
-/// Facts of the images `used`, of which `heights` are read as heights and `normals` as normal
-/// maps that say nothing of their encoding, read in parallel. File images are read through the
-/// memo, and each one's hash and length are recorded in its [`ImageData::File`].
+/// How a scene reads its images, by index.
+pub(crate) struct ImageReads {
+    /// Read with all of their range.
+    pub(crate) whole: HashSet<usize>,
+    /// Normal maps that say nothing of their encoding.
+    pub(crate) normals: HashSet<usize>,
+    /// Read as color.
+    pub(crate) colors: HashSet<usize>,
+    /// Their inputs state what to read where they can't be read.
+    pub(crate) optional: HashSet<usize>,
+}
+
+/// Facts of the images `used`, read as `reads` says, in parallel, and why each optional image that
+/// can't be read can't; any other fails. File images are read through the memo, and each one's
+/// hash and length are recorded in its [`ImageData::File`].
 pub(crate) fn image_facts(
     asset: &str,
     images: &mut [ImageFile],
     used: &[usize],
-    heights: &HashSet<usize>,
-    normals: &HashSet<usize>,
+    reads: &ImageReads,
     memo: &Memo,
-) -> Result<HashMap<usize, ImageFacts>> {
+) -> Result<(HashMap<usize, ImageFacts>, BTreeMap<usize, String>)> {
+    type Outcome = (
+        std::result::Result<ImageFacts, String>,
+        Option<(Hash32, u64)>,
+    );
     let fail = |message: String| Error::Texture {
         asset: asset.into(),
         message,
@@ -319,45 +518,135 @@ pub(crate) fn image_facts(
     if let Some(&i) = used.iter().find(|&&i| i >= images.len()) {
         return Err(fail(format!("image {i} does not exist")));
     }
-    let facts: HashMap<usize, (ImageFacts, Option<u64>)> = used
+    let read: HashMap<usize, Outcome> = used
         .par_iter()
         .map(|&i| {
             let file = &images[i];
             let (bytes, hash, read) = match &file.data {
                 ImageData::Bytes(b) => (Cow::Borrowed(b.as_slice()), Hash32::of(b), None),
-                ImageData::File { path, .. } => {
-                    let (bytes, hash) = memo.read(path)?;
-                    let len = bytes.len() as u64;
-                    (Cow::Owned(bytes), hash, Some(len))
-                }
+                ImageData::File { path, layer, .. } => match memo.read(path) {
+                    Ok((bytes, hash)) => {
+                        let read = Some((hash, bytes.len() as u64));
+                        match load::layer_of(&bytes, layer) {
+                            Ok(None) => (Cow::Owned(bytes), hash, read),
+                            Ok(Some(layer)) => {
+                                let hash = Hash32::of(&layer);
+                                (Cow::Owned(layer), hash, read)
+                            }
+                            Err(why) => return Ok((i, (Err(why), read))),
+                        }
+                    }
+                    Err(e) if reads.optional.contains(&i) => {
+                        return Ok((i, (Err(e.to_string()), None)));
+                    }
+                    Err(e) => return Err(e),
+                },
+                ImageData::Unread(why) => return Ok((i, (Err(why.clone()), None))),
+                &ImageData::Solid(texel) => return Ok((i, (Ok(ImageFacts::solid(texel)), None))),
+                ImageData::Tiles(_) => unreachable!("a set's tiles are read in its place"),
             };
-            let facts = facts_of(&bytes, hash, heights.contains(&i), normals.contains(&i))
-                .map_err(|e| fail(format!("image {}: {e}", file.name)))?;
+            let uses = [&reads.whole, &reads.normals, &reads.colors].map(|s| s.contains(&i));
+            let facts = facts_of(&bytes, hash, uses);
             Ok((i, (facts, read)))
         })
         .collect::<Result<_>>()?;
-    let mut out = HashMap::with_capacity(facts.len());
-    for (i, (f, len)) in facts {
-        if let (ImageData::File { read, .. }, Some(len)) = (&mut images[i].data, len) {
-            *read = Some((f.hash, len));
+    let mut out = HashMap::with_capacity(read.len());
+    let mut unread = BTreeMap::new();
+    for (i, (facts, file)) in read {
+        if let (ImageData::File { read, .. }, Some(file)) = (&mut images[i].data, file) {
+            *read = Some(file);
         }
-        out.insert(i, f);
+        match facts {
+            Ok(f) => {
+                out.insert(i, f);
+            }
+            Err(why) if reads.optional.contains(&i) => {
+                unread.insert(i, why);
+            }
+            Err(e) => return Err(fail(format!("image {}: {e}", images[i].name))),
+        }
     }
-    Ok(out)
+    Ok((out, unread))
 }
 
-/// The facts of one image file's bytes, with all of its range if it is a `height`, and how it
-/// stores normals if it is a `normal` map.
-fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<ImageFacts, String> {
+/// Drops the tiles of `unread` from the sets among `sets` and gives each set its facts; a set left
+/// with no tile joins `unread`.
+pub(crate) fn settle_tiles(
+    sets: &[usize],
+    images: &mut [ImageFile],
+    facts: &mut HashMap<usize, ImageFacts>,
+    unread: &mut BTreeMap<usize, String>,
+) {
+    for &set in sets {
+        let ImageData::Tiles(tiles) = &mut images[set].data else {
+            continue;
+        };
+        tiles.retain(|t| !unread.contains_key(&t.image));
+        if tiles.is_empty() {
+            unread.insert(set, "it has no tile that can be read".into());
+        } else {
+            let merged = ImageFacts::of_tiles(tiles.iter().map(|t| &facts[&t.image]));
+            facts.insert(set, merged);
+        }
+    }
+}
+
+/// Points every reference of `textures` to an image of `unread` at a solid image of what it
+/// reads in its place: the input's fallback, everywhere and as it stands. `solids` shares them
+/// by value.
+pub(crate) fn stand_in(
+    textures: &mut MaterialTextures,
+    unread: &BTreeMap<usize, String>,
+    images: &mut Vec<ImageFile>,
+    facts: &mut HashMap<usize, ImageFacts>,
+    solids: &mut HashMap<[u32; 4], usize>,
+) {
+    for r in textures
+        .refs_mut()
+        .filter(|r| unread.contains_key(&r.image))
+    {
+        let image = *solids
+            .entry(r.missing.map(f32::to_bits))
+            .or_insert_with(|| {
+                images.push(ImageFile {
+                    name: format!("fallback/{:?}", r.missing),
+                    data: ImageData::Solid(r.missing),
+                });
+                facts.insert(images.len() - 1, ImageFacts::solid(r.missing));
+                images.len() - 1
+            });
+        *r = TexRef {
+            image,
+            rg_channel: None,
+            wrap: [Wrap::Repeat; 2],
+            file_wrap: [false; 2],
+            outside: [0.0; 4],
+            color: ImageColor::Data,
+            ..*r
+        };
+    }
+}
+
+/// The facts of one image file's bytes, with all of its range if it is read `whole`, how it
+/// stores normals if it is a `normal` map, and what a `color` reads below 0 in any mip it stores.
+fn facts_of(
+    bytes: &[u8],
+    hash: Hash32,
+    [whole, normal, color]: [bool; 3],
+) -> Result<ImageFacts, String> {
     let _z = crate::profile::zone!("texture.facts");
     // A channel is constant when it spans at most one UNORM8 step.
     const SPREAD: f32 = 1.0 / 255.0 + 1e-6;
-    let spread = if height { f32::INFINITY } else { SPREAD };
+    let spread = if whole { f32::INFINITY } else { SPREAD };
     let constant = |range: [(f32, f32); 4]| {
         range.map(|(lo, hi)| (hi - lo <= SPREAD).then_some(0.5 * (lo + hi)))
     };
+    let every_mip = |negatives, f: &FileColor| color && (whole || negatives || f.can_read_below());
     if let Some(scan) = load::scan_ktx2(bytes, spread) {
-        let s = scan?;
+        let mut s = scan?;
+        if every_mip(s.negatives, &s.color) {
+            s.range = load::stored_range(&load::open(bytes)?)?;
+        }
         let stored_normals = s.signed
             || (normal
                 && s.float
@@ -366,10 +655,10 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
         return Ok(ImageFacts {
             w: s.w,
             h: s.h,
-            srgb: s.srgb,
-            primaries: None,
+            color: s.color,
             constant: constant(s.range),
             range: s.range,
+            minus_infinity: false,
             hash,
             blocks: Some((s.vk_format, s.complete)),
             rg: s.rg,
@@ -379,6 +668,7 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
             stored_normals,
             gray: s.gray,
             animated: false,
+            wrap: None,
         });
     }
     let mut src = load::open(bytes)?;
@@ -391,6 +681,7 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
         load::decode_layers(&mut src)?;
     }
     let (w, h, range) = match &src.blocks {
+        Some(b) if every_mip(src.negatives, &src.color) => (b.w, b.h, load::stored_range(&src)?),
         Some(b) => {
             let range = load::block_range(b.vk_format, b.w, b.h, &mut &b.levels[0][0][..], spread)?;
             (b.w, b.h, range)
@@ -401,13 +692,15 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
             (img.w, img.h, std::array::from_fn(|c| img.finite_range(c)))
         }
     };
+    let mut texels = src.layers.iter().flat_map(|l| &l.px);
+    let minus_infinity = src.float && texels.any(|p| p[..3].contains(&f32::NEG_INFINITY));
     Ok(ImageFacts {
         w,
         h,
-        srgb: src.srgb,
-        primaries: src.primaries,
+        color: src.color,
         constant: constant(range),
         range,
+        minus_infinity,
         hash,
         blocks: src.blocks.as_ref().map(|b| (b.vk_format, b.complete())),
         rg: src.rg,
@@ -417,6 +710,7 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
         stored_normals: src.signed || (vectors && stores_normals(&src.layers, src.rg)),
         gray: src.gray,
         animated: load::is_animated(bytes),
+        wrap: load::exr_wrap(bytes),
     })
 }
 
@@ -435,6 +729,19 @@ pub(crate) struct Packer<'a> {
     /// Member textures of each planned neural set.
     sets: HashSet<Vec<AssetId>>,
     pub(crate) neural: Vec<NeuralJob>,
+    pub(crate) tile_sets: Vec<TileSetJob>,
+    /// Tiles of each planned tile set, and which set holds those tiles.
+    tiles_of: HashMap<AssetId, Vec<Tile>>,
+    made_sets: HashMap<Hash32, AssetId>,
+    /// The set of each tile image, whose name overrides match as well as the tile's.
+    set_of: HashMap<usize, usize>,
+}
+
+/// A planned [`TextureTiles`] asset.
+pub(crate) struct TileSetJob {
+    pub(crate) name: String,
+    pub(crate) key: Hash32,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// A texture to make from one or more source channels.
@@ -450,16 +757,70 @@ struct Pack {
     toksvig: Option<(usize, TexRef, [f32; 2], NormalSource)>,
     normal: bool,
     shrink: bool,
+    /// The cell of a tile, and the primaries its set shares, for a color tile.
+    tile: Option<(Cell, Option<Primaries>)>,
 }
 
-/// Where one output channel comes from.
+/// One output channel.
+#[derive(Clone, Debug)]
+struct Channel {
+    texels: Texels,
+    /// What it reads past 0..1 under [`Wrap::Border`] and [`Wrap::Constant`].
+    outside: Outside,
+}
+
+/// A channel's reading past 0..1: source value `value`, read as a texel is, `a + b * value`.
 #[derive(Copy, Clone, Debug)]
-enum Channel {
-    /// Source channel of an image, `a + b * value` (after sRGB decode when `srgb`).
+struct Outside {
+    value: f32,
+    a: f32,
+    b: f32,
+}
+
+impl Outside {
+    /// The value `v` itself.
+    const fn of(v: f32) -> Self {
+        Self {
+            value: 0.0,
+            a: v,
+            b: 0.0,
+        }
+    }
+}
+
+impl Channel {
+    const UNUSED: Self = Self {
+        texels: Texels::Unused,
+        outside: Outside::of(0.0),
+    };
+
+    /// The value `v`, past 0..1 too.
+    fn constant(v: f32) -> Self {
+        Self {
+            texels: Texels::Constant(v),
+            outside: Outside::of(v),
+        }
+    }
+}
+
+/// Source value `v` of a channel of `a + b * value`, under [`Pack::limit`] `limit`.
+fn stored(v: f32, a: f32, b: f32, limit: Option<f32>) -> f32 {
+    let read = a + b * limit.map_or(v, |l| v.clamp(0.0, l));
+    if limit == Some(f32::INFINITY) {
+        read.max(0.0)
+    } else {
+        read
+    }
+}
+
+/// Where one output channel's texels come from.
+#[derive(Clone, Debug)]
+enum Texels {
+    /// Source channel of an image, `a + b * value`, the value as `read` has it.
     Image {
         image: usize,
         channel: usize,
-        srgb: bool,
+        read: Read,
         a: f32,
         b: f32,
     },
@@ -487,6 +848,8 @@ pub(crate) struct TextureJob {
     max_size: Option<u32>,
     grid: Option<[u16; 2]>,
     primaries: Primaries,
+    /// Takes linear colors into `primaries`, where the source's have no id.
+    gamut: Option<DMat3>,
     filter: MipFilter,
     bc_split: Option<bool>,
     /// Keeps the source's blocks.
@@ -495,20 +858,80 @@ pub(crate) struct TextureJob {
     source_mips: bool,
 }
 
-/// A planned texture and, per packed channel, the channel of the texture that holds it.
+impl Pack {
+    /// Where a source value stops. Apart from normals, BC4 and BC5 hold weights, and a float
+    /// weight has no upper limit: a source texel clamps before its factor, as a constant does. A
+    /// float weight's remap can reach below 0 where no format of 0..1 would store it, and a
+    /// negative weight has no IOR.
+    fn limit(&self) -> Option<f32> {
+        match self.encoding {
+            Encoding::Bc4 | Encoding::Bc5 if !self.normal => Some(1.0),
+            Encoding::Raw(DataFormat::R16f) => Some(f32::INFINITY),
+            _ => None,
+        }
+    }
+
+    /// What the texture reads past 0..1 per packed channel, as its texels sample: filtered
+    /// values stay in the format's range, and a normal is stored x and y.
+    fn outside(&self) -> [f32; 4] {
+        let limit = self.limit();
+        let mut v = [0.0; 4];
+        for (o, c) in v.iter_mut().zip(&self.channels) {
+            let Outside { value, a, b } = c.outside;
+            *o = stored(value, a, b, limit);
+        }
+        if self.normal {
+            let [x, y, ..] = normalized(v);
+            return [normal::encode(x), normal::encode(y), 0.0, 0.0];
+        }
+        let (lo, hi) = self.encoding.range();
+        v.map(|c| settled(c, lo, hi))
+    }
+}
+
+/// A planned texture, per packed channel the channel of the texture that holds it, what it
+/// reads past 0..1 and how it gets there.
 #[derive(Copy, Clone, Debug)]
 struct Made {
     id: AssetId,
     channels: [u8; 4],
+    wrap: [Wrap; 2],
+    outside: [f32; 4],
+    /// It is a set of tiles, which read `outside` where they lie on no tile.
+    tiled: bool,
+    /// Keeps source mips in place of remaking them.
+    source_mips: bool,
+}
+
+/// The name of the texture, or tile set, of `role` in a material.
+fn texture_name(asset: &str, suffix: &str, role: &str) -> String {
+    match suffix {
+        "" => format!("{asset}/texture/{role}"),
+        _ => format!("{asset}/texture/{suffix}/{role}"),
+    }
+}
+
+/// The span from the lowest to the highest of `ranges`.
+fn widest(ranges: impl Iterator<Item = (f32, f32)>) -> (f32, f32) {
+    ranges.fold((f32::INFINITY, f32::NEG_INFINITY), |a, b| {
+        (a.0.min(b.0), a.1.max(b.1))
+    })
 }
 
 /// Binds slot `s` to packed channel `channel` of `t`, sampled as `r` is.
 fn bind(m: &mut Material, s: usize, t: Made, channel: usize, r: &TexRef) {
+    let mut outside = [0.0; 4];
+    if t.tiled || t.wrap.contains(&Wrap::Constant) {
+        outside[..4 - channel].copy_from_slice(&t.outside[channel..]);
+    }
     m.textures[s] = TextureBinding {
         texture: t.id,
         channels: t.channels[channel],
         uv_set: r.uv_set,
-        _pad: [0; 2],
+        wrap: t.wrap.map(Wrap::binding),
+        filter: r.filter,
+        _pad: [0; 3],
+        outside,
     };
     m.uv_transforms[s] = r.uv;
 }
@@ -542,11 +965,54 @@ impl<'a> Packer<'a> {
             by_id: HashMap::new(),
             sets: HashSet::new(),
             neural: Vec::new(),
+            tile_sets: Vec::new(),
+            tiles_of: HashMap::new(),
+            made_sets: HashMap::new(),
+            set_of: images
+                .iter()
+                .enumerate()
+                .flat_map(|(s, f)| f.tiles().into_iter().flatten().map(move |t| (t.image, s)))
+                .collect(),
         }
     }
 
     fn image(&self, i: usize) -> &ImageFacts {
         &self.facts[&i]
+    }
+
+    /// The cell of each tile `r` reads, in order, or `None` for an image.
+    fn cells(&self, r: &TexRef) -> Option<Vec<Cell>> {
+        let tiles = self.images[r.image].tiles()?;
+        Some(tiles.iter().map(|t| t.cell).collect())
+    }
+
+    /// Whether `r` reads a set of tiles.
+    fn tiled(&self, r: &TexRef) -> bool {
+        self.images[r.image].tiles().is_some()
+    }
+
+    /// `r` as it reads the tile at `cell`, or `r` where it reads no set.
+    fn at(&self, r: &TexRef, cell: Option<Cell>) -> TexRef {
+        let (Some(cell), Some(tiles)) = (cell, self.images[r.image].tiles()) else {
+            return *r;
+        };
+        let tile = tiles.binary_search_by_key(&[cell[1], cell[0]], |t| [t.cell[1], t.cell[0]]);
+        let tile = tile.expect("those sharing a texture hold the same cells");
+        self.tile(r, &tiles[tile])
+    }
+
+    /// `r`, of a set, as it reads `tile`.
+    fn tile(&self, r: &TexRef, tile: &ImageTile) -> TexRef {
+        let image = tile.image;
+        self.channel_override(TexRef { image, ..*r })
+    }
+
+    /// `r`, or each tile of the set it reads.
+    fn each(&self, r: &TexRef) -> Vec<TexRef> {
+        match self.images[r.image].tiles() {
+            Some(tiles) => tiles.iter().map(|t| self.tile(r, t)).collect(),
+            None => vec![*r],
+        }
     }
 
     /// Channel `c` of `r` as its rules read the file: a channel of the decoded image, or the
@@ -567,42 +1033,119 @@ impl<'a> Packer<'a> {
         }
     }
 
-    /// [`TexRef::source`] of channel `c`, as [`Self::read`] has it.
-    fn source(&self, r: &TexRef, axis: usize, c: usize, srgb: bool, a: f32, b: f32) -> Channel {
-        match self.read(r, c) {
-            Ok(c) => r.source(axis, c, srgb, a, b),
-            Err(v) => Channel::Constant(a + b * r.read(axis, v)),
-        }
+    /// How `r` reads a number from its image: an input that isn't a color takes no primaries.
+    fn decode(&self, r: &TexRef) -> Decode {
+        r.color.decode(&self.image(r.image).color)
+    }
+
+    /// Stored value `v` of channel `c` of `r`, as [`Self::read`] numbers it, as an input that
+    /// isn't a color reads it. Alpha is no color, whichever channel of the file holds it.
+    fn number(&self, r: &TexRef, c: usize, v: f32) -> f32 {
+        if c == 3 { v } else { self.decode(r).value(v) }
+    }
+
+    /// [`TexRef::source`] of channel `c`, as [`Self::read`] has it, through `read`.
+    fn read_source(
+        &self,
+        r: &TexRef,
+        axis: usize,
+        c: usize,
+        read: Read,
+        a: f32,
+        b: f32,
+    ) -> Channel {
+        let texels = match self.read(r, c) {
+            Ok(held) if c == 3 => r.source(axis, held, Read::of(Decode::STORED), a, b),
+            Ok(held) => r.source(axis, held, read, a, b),
+            Err(v) => Texels::Constant(a + b * r.read(axis, v)),
+        };
+        let [a, b] = r.through(axis, a, b);
+        let value = r.outside[c];
+        let outside = Outside { value, a, b };
+        Channel { texels, outside }
+    }
+
+    /// [`Self::read_source`] of an input that isn't a color.
+    fn source(&self, r: &TexRef, axis: usize, c: usize, a: f32, b: f32) -> Channel {
+        self.read_source(r, axis, c, Read::of(self.decode(r)), a, b)
     }
 
     /// The lowest and highest value of channel `c` of `r`.
     fn range(&self, r: &TexRef, c: usize) -> (f32, f32) {
+        if self.tiled(r) {
+            return widest(self.each(r).into_iter().map(|t| self.range(&t, c)));
+        }
         match self.read(r, c) {
-            Ok(c) => self.image(r.image).range[c],
+            Ok(held) => {
+                let (lo, hi) = self.image(r.image).range[held];
+                (self.number(r, c, lo), self.number(r, c, hi))
+            }
             Err(v) => (v, v),
         }
     }
 
-    /// The value of channel `c` of `r` if every texel lies within 1/255 of one value.
-    fn constant(&self, r: &TexRef, c: usize) -> Option<f32> {
+    /// The lowest and highest value scalar input `r` reads, each tile of a set through its own
+    /// channel.
+    fn input_range(&self, r: &TexRef) -> (f32, f32) {
+        let each = self.each(r).into_iter();
+        widest(each.map(|t| self.range(&t, usize::from(t.channel))))
+    }
+
+    /// Whether some reads of `r` leave its texels: past the edges, or past a set's tiles.
+    fn bounded(&self, r: &TexRef) -> bool {
+        r.bounded() || self.tiled(r)
+    }
+
+    /// The stored value of channel `c` of `r` if every texel lies within 1/255 of one value, and
+    /// nothing else reads past them.
+    fn stored_constant(&self, r: &TexRef, c: usize) -> Option<f32> {
+        if self.bounded(r) {
+            return None;
+        }
         match self.read(r, c) {
             Ok(c) => self.image(r.image).constant[c],
             Err(v) => Some(v),
         }
     }
 
+    /// [`Self::stored_constant`] as an input that isn't a color reads it.
+    fn constant(&self, r: &TexRef, c: usize) -> Option<f32> {
+        let v = self.stored_constant(r, c)?;
+        Some(match self.read(r, c) {
+            Ok(_) => self.number(r, c, v),
+            Err(_) => v,
+        })
+    }
+
+    /// Value `v` of `r` as a texture up to `top` stores it. A stated value is stored nowhere, and
+    /// stands whole, as a constant input does.
+    fn held(&self, r: &TexRef, v: f32, top: f32) -> f32 {
+        match self.images[r.image].data {
+            ImageData::Solid(_) => v,
+            _ => v.clamp(0.0, top),
+        }
+    }
+
     /// [`Self::constant`] of an input with a 0..1 meaning, clamped as its texture stores it.
     fn constant_weight(&self, r: &TexRef, c: usize) -> Option<f32> {
-        self.constant(r, c).map(|v| v.clamp(0.0, 1.0))
+        self.constant(r, c).map(|v| self.held(r, v, 1.0))
     }
 
     /// Whether emission or specular weight `r` can read past 1: USD and MaterialX range them over
-    /// 0 and up, where glTF's stop at 1, and a float image or a remap past it reaches there. A
-    /// color's remap stops at 1, short of rounding, with its field holding the rest.
+    /// 0 and up, where glTF's stop at 1, and a float image, a remap past it or a value stated past
+    /// the edges reaches there. A color's remap stops at 1, short of rounding, with its field
+    /// holding the rest.
     fn past_one(&self, r: &TexRef) -> bool {
         let reaches = |[a, b]: [f32; 2]| a.max(a + b) > 1.0 + 1e-6;
+        let outside = (self.tiled(r) || r.wrap.contains(&Wrap::Constant))
+            && (0..3).any(|c| r.read(c, r.outside[c]) > 1.0 + 1e-6);
         r.rules != ImageRules::Gltf
-            && (self.image(r.image).float || r.remap.is_some_and(|m| m.into_iter().any(reaches)))
+            && (outside
+                || r.remap.is_some_and(|m| m.into_iter().any(reaches))
+                || self
+                    .each(r)
+                    .iter()
+                    .any(|t| self.image(t.image).float || self.decode(t).value(1.0) > 1.0 + 1e-6))
     }
 
     /// [`Self::constant`] of an input [`Self::past_one`], from 0 up, with a float image's texels
@@ -617,14 +1160,14 @@ impl<'a> Packer<'a> {
     /// [`Self::constant_weight`] of the channel of scalar input `r`, as the input reads it.
     fn constant_input(&self, r: &TexRef) -> Option<f32> {
         self.constant_weight(r, usize::from(r.channel))
-            .map(|v| r.read(0, v).clamp(0.0, 1.0))
+            .map(|v| self.held(r, r.read(0, v), 1.0))
     }
 
     /// [`Self::constant_input`] of opacity `r` of material `m`. A folded opacity tests the same
     /// for the whole surface, so under `MASK` texels either side of the cutoff stay a texture.
     fn constant_opacity(&self, m: &Material, r: &TexRef) -> Option<f32> {
-        let (lo, hi) = self.range(r, usize::from(r.channel));
-        let read = |t: f32| r.read(0, t.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        let (lo, hi) = self.input_range(r);
+        let read = |t: f32| self.held(r, r.read(0, self.held(r, t, 1.0)), 1.0);
         let passes = |t: f32| m.geometry_opacity * read(t) >= m.alpha_cutoff;
         let one_side = m.alpha_mode != Material::MASK || passes(lo) == passes(hi);
         self.constant_input(r).filter(|_| one_side)
@@ -661,6 +1204,7 @@ impl<'a> Packer<'a> {
             signed: f.stored_normals,
             y: self.read(&r, 1).unwrap_or(1),
             z: self.read(&r, 2).unwrap_or(2),
+            decode: self.decode(&r),
         };
         (TexRef { remap, ..r }, source)
     }
@@ -675,42 +1219,129 @@ impl<'a> Packer<'a> {
         TexRef { rules, ..r }
     }
 
-    /// The primaries of a color texture made from image `i`: the last override that sets
-    /// them, else the file's tag, else Rec.709.
-    fn color_primaries(&self, i: usize) -> Primaries {
-        self.rules
-            .overrides
-            .iter()
-            .filter(|(pattern, _)| self.images[i].name.contains(pattern.as_str()))
-            .fold(None, |p, (_, o)| o.primaries.or(p))
-            .or(self.image(i).primaries)
-            .unwrap_or(Primaries::Rec709)
+    /// How color input `r` reads, and the id and matrix of what it reads as: what its rules say
+    /// of its image, under the last override that sets its primaries.
+    fn color_read(&self, r: &TexRef) -> (Read, Primaries, Option<DMat3>) {
+        let over = self.overridden(&[r.image], |o| o.primaries);
+        let color = &self.image(r.image).color;
+        r.color.color(color, over, |read| self.reads_below(r, read))
+    }
+
+    /// The primaries a texture of color input `r` holds: a slot has one id, so tiles that read as
+    /// different ones all take Rec. 2020, which covers them.
+    fn slot_primaries(&self, r: &TexRef) -> Primaries {
+        let mut each = self.each(r).into_iter().map(|t| self.color_read(&t).1);
+        let first = each.next().expect("a set has a tile");
+        if each.all(|p| p == first) {
+            first
+        } else {
+            Primaries::Rec2020
+        }
+    }
+
+    /// Whether color input `r`, through `read`, holds a value below 0, in the primaries of its file
+    /// and through its remap.
+    fn reads_below(&self, r: &TexRef, read: &Read) -> bool {
+        let f = self.image(r.image);
+        (0..3).any(|c| match self.read(r, c) {
+            Ok(held) => {
+                let (lo, hi) = f.range[held];
+                let below = |&v: &f32| r.read(c, read.alone(v)) < BELOW_ZERO;
+                lo <= hi && [lo, hi].iter().any(below)
+            }
+            Err(v) => r.read(c, v) < BELOW_ZERO,
+        })
+    }
+
+    /// Whether any texel of `img` still clips once color input `r` has read and converted it.
+    fn texels_clip(&self, r: &TexRef, img: &Img) -> bool {
+        let (read, _, gamut) = self.color_read(r);
+        let channels = [0, 1, 2].map(|c| self.read(r, c));
+        img.px.par_iter().any(|t| {
+            let reach = read.reach(*t);
+            let rgb = std::array::from_fn(|c| {
+                r.read(c, channels[c].map_or_else(|v| v, |held| reach[held]))
+            });
+            clipped(gamut.as_ref().map_or(rgb, |m| multiply(m, rgb)))
+        })
+    }
+
+    /// The images of `materials`' color inputs with colors a texture can't hold, measured through
+    /// what they convert to. An image is decoded here only if a value below 0 or primaries past
+    /// Rec.2020 can clip.
+    pub(crate) fn clipped<'m>(
+        &self,
+        materials: impl Iterator<Item = &'m MaterialTextures>,
+    ) -> Result<BTreeSet<usize>> {
+        // Per file, the image the report names, a tile's being its set, and how it reads.
+        let mut reads: BTreeMap<usize, (usize, Vec<TexRef>)> = BTreeMap::new();
+        // A stated value has no texels, and stands whole.
+        let filed = |r: &&TexRef| !matches!(self.images[r.image].data, ImageData::Solid(_));
+        for r in materials.flat_map(MaterialTextures::colors).filter(filed) {
+            for t in self.each(r) {
+                let (read, _, gamut) = self.color_read(&t);
+                let below = self.image(t.image).minus_infinity || self.reads_below(&t, &read);
+                if below || read.reaches_past(gamut.as_ref()) {
+                    let (_, refs) = reads.entry(t.image).or_insert((r.image, Vec::new()));
+                    let same =
+                        |o: &TexRef| (o.color, o.rules, o.remap) == (t.color, t.rules, t.remap);
+                    if !refs.iter().any(same) {
+                        refs.push(t);
+                    }
+                }
+            }
+        }
+        let reads: Vec<_> = reads.into_iter().collect();
+        let found: Vec<Option<usize>> = reads
+            .par_iter()
+            .map(|(i, (named, refs))| {
+                let file = &self.images[*i];
+                let fail = |message| Error::Texture {
+                    asset: self.asset.into(),
+                    message: format!("image {}: {message}", file.name),
+                };
+                let src = load::open(&file.bytes()?).map_err(fail)?;
+                let clips = load::any_stored(&src, |l| refs.iter().any(|r| self.texels_clip(r, l)));
+                Ok(clips.map_err(fail)?.then_some(*named))
+            })
+            .collect::<Result<_>>()?;
+        Ok(found.into_iter().flatten().collect())
+    }
+
+    /// `r` reading the channel the last override for its image sets for its input, if one does.
+    fn channel_override(&self, r: TexRef) -> TexRef {
+        let set = |input: fn(&InputChannels) -> Option<u8>| {
+            self.overridden(&[r.image], |o| input(&o.channels))
+        };
+        match r.input.and_then(set) {
+            Some(channel) => TexRef {
+                channel,
+                ..self.file_channels(r)
+            },
+            None => r,
+        }
     }
 
     /// The channel `r` reads for an input: the last override for its image that sets the
     /// input's channel, else its two-channel reading on a red-green image, else its own.
     fn channel_of(&self, r: TexRef, input: fn(&InputChannels) -> Option<u8>) -> Result<TexRef> {
-        let name = &self.images[r.image].name;
-        let set = self
-            .rules
-            .overrides
-            .iter()
-            .filter(|(pattern, _)| name.contains(pattern.as_str()))
-            .fold(None, |c, (_, o)| input(&o.channels).or(c));
         let rg = r.rg_channel.filter(|_| self.image(r.image).rg);
-        let channel = set.or(rg).unwrap_or(r.channel);
-        if channel > 3 {
-            return Err(Error::Texture {
+        let r = self.channel_override(TexRef {
+            channel: rg.unwrap_or(r.channel),
+            input: Some(input),
+            ..r
+        });
+        // The set's own channel reads where it has no tile.
+        match self.each(&r).iter().chain(Some(&r)).find(|t| t.channel > 3) {
+            Some(t) => Err(Error::Texture {
                 asset: self.asset.into(),
-                message: format!("image {name}: no channel {channel}"),
-            });
+                message: format!(
+                    "image {}: no channel {}",
+                    self.images[t.image].name, t.channel
+                ),
+            }),
+            None => Ok(r),
         }
-        let r = if set.is_some() {
-            self.file_channels(r)
-        } else {
-            r
-        };
-        Ok(TexRef { channel, ..r })
     }
 
     /// Cooks the material's textures, binds them and folds constants into its factors.
@@ -720,15 +1351,22 @@ impl<'a> Packer<'a> {
         m: &mut Material,
         t: &MaterialTextures,
     ) -> Result<()> {
+        let mut read = t.clone();
+        for r in read.refs_mut() {
+            if let Some(wrap) = self.image(r.image).wrap {
+                r.wrap = std::array::from_fn(|a| if r.file_wrap[a] { wrap[a] } else { r.wrap[a] });
+            }
+            if self.tiled(r) {
+                r.wrap = [Wrap::Clamp; 2];
+                r.outside = r.missing;
+            }
+        }
+        let t = &read;
         let remap = |r: Option<TexRef>, input| r.map(|r| self.channel_of(r, input)).transpose();
         let t = &MaterialTextures {
             opacity: remap(t.opacity, |c| c.opacity)?,
             roughness: remap(t.roughness, |c| c.roughness)?,
             metalness: remap(t.metalness, |c| c.metalness)?,
-            occlusion: t
-                .occlusion
-                .map(|(r, s)| Ok::<_, Error>((self.channel_of(r, |c| c.occlusion)?, s)))
-                .transpose()?,
             specular: remap(t.specular, |c| c.specular)?,
             coat: remap(t.coat, |c| c.coat)?,
             transmission: remap(t.transmission, |c| c.transmission)?,
@@ -746,31 +1384,26 @@ impl<'a> Packer<'a> {
         if m.alpha_mode != Material::OPAQUE
             && let Some(r) = &t.opacity
         {
-            let channel = usize::from(r.channel);
             match self.constant_opacity(m, r) {
                 Some(a) => m.geometry_opacity *= a,
                 None => {
                     let coverage = (m.alpha_mode == Material::MASK).then_some((0, m.alpha_cutoff));
-                    let id = self.make(
-                        suffix,
+                    let opacity = m.geometry_opacity;
+                    let id = self.make_each(suffix, r, |s, cell| {
+                        let r = s.at(r, cell);
+                        let channel = usize::from(r.channel);
                         Pack {
                             role: "opacity",
                             encoding: Encoding::Bc4,
-                            channels: vec![self.source(
-                                r,
-                                0,
-                                channel,
-                                false,
-                                0.0,
-                                m.geometry_opacity,
-                            )],
-                            refs: vec![*r],
+                            channels: vec![s.source(&r, 0, channel, 0.0, opacity)],
+                            refs: vec![r],
                             coverage,
                             toksvig: None,
                             normal: false,
                             shrink: false,
-                        },
-                    )?;
+                            tile: None,
+                        }
+                    })?;
                     m.geometry_opacity = 1.0;
                     bind(m, slot::OPACITY, id, 0, r);
                 }
@@ -778,8 +1411,8 @@ impl<'a> Packer<'a> {
         }
 
         let mut normal_packed = None;
-        if let Some((r, scale)) = t.normal {
-            let (r, source) = self.normal_source(&r);
+        if let Some((raw, scale)) = t.normal {
+            let (r, source) = self.normal_source(&raw);
             let r = &r;
             let map = r.remap.expect("a normal map reads through a remap");
             let flat = [0, 1, 2].map(|c| ([0.0, 0.0, 1.0][c] - map[c][0]) / map[c][1]);
@@ -793,9 +1426,10 @@ impl<'a> Packer<'a> {
                 .zip(flat)
                 .all(|(c, f)| c.is_some_and(|v| (v - f).abs() <= 1.0 / 255.0));
             if !is_flat {
-                let channel = |c: usize, s: f32| self.source(r, c, c, false, 0.0, s);
-                let id = self.make(
-                    suffix,
+                let shrink = consts.iter().all(Option::is_some);
+                let id = self.make_each(suffix, r, |s, cell| {
+                    let (r, source) = s.normal_source(&s.at(&raw, cell));
+                    let channel = |c: usize, scale: f32| s.source(&r, c, c, 0.0, scale);
                     Pack {
                         role: "normal",
                         encoding: Encoding::Bc5,
@@ -803,33 +1437,39 @@ impl<'a> Packer<'a> {
                             channel(0, scale[0]),
                             channel(1, scale[1]),
                             if source.rg {
-                                Channel::NormalZ {
-                                    image: r.image,
-                                    source,
+                                Channel {
+                                    texels: Texels::NormalZ {
+                                        image: r.image,
+                                        source,
+                                    },
+                                    outside: Outside::of(normal::z(
+                                        r.read(0, r.outside[0]),
+                                        r.read(1, r.outside[1]),
+                                    )),
                                 }
                             } else {
                                 channel(2, 1.0)
                             },
-                            Channel::Constant(1.0),
+                            Channel::constant(1.0),
                         ],
-                        refs: vec![*r],
+                        refs: vec![r],
                         coverage: None,
                         toksvig: None,
                         normal: true,
-                        shrink: consts.iter().all(Option::is_some),
-                    },
-                )?;
+                        shrink,
+                        tile: None,
+                    }
+                })?;
                 bind(m, slot::NORMAL, id, 0, r);
                 // A normal map whose source mips the cook keeps instead of remaking them adds
                 // no Toksvig roughness.
-                let toksvig = !self.jobs[self.by_id[&id.id]].source_mips;
-                if toksvig && consts.iter().any(Option::is_none) {
-                    normal_packed = Some((*r, scale, source));
+                if !id.source_mips && consts.iter().any(Option::is_none) {
+                    normal_packed = Some((raw, scale));
                 }
             }
         }
 
-        // Roughness, metalness, occlusion.
+        // Roughness and metalness.
         let (rough, metal) = (t.roughness, t.metalness);
         let constant = |r: &Option<TexRef>| match r {
             Some(r) => self.constant_input(r),
@@ -838,41 +1478,33 @@ impl<'a> Packer<'a> {
         let (rough_const, metal_const) = (constant(&rough), constant(&metal));
         let rough_varies = rough_const.is_none() || normal_packed.is_some();
         let metal_varies = metal_const.is_none();
-        let occ = t.occlusion.map(|(r, s)| (r, s, self.constant_input(&r)));
-        let occ_varies = occ.as_ref().is_some_and(|o| o.2.is_none());
-        let rough_channel = |m: &Material| match (&rough, rough_const) {
-            (Some(r), None) => self.source(
-                r,
-                0,
-                usize::from(r.channel),
-                false,
-                0.0,
-                m.specular_roughness,
-            ),
-            (_, c) => Channel::Constant(m.specular_roughness * c.unwrap_or(1.0)),
-        };
         if !rough_varies {
             m.specular_roughness *= rough_const.unwrap_or(1.0);
         }
         if !metal_varies {
             m.metalness *= metal_const.unwrap_or(1.0);
         }
-        let metal_channel = |m: &Material, r: &TexRef| {
-            self.source(r, 0, usize::from(r.channel), false, 0.0, m.metalness)
-        };
-        let normal_ref = normal_packed.as_ref().map(|n| n.0);
-        // Per texture: its (slot, source) channels and the references it samples like.
-        // Roughness and metalness share one texture when they sample alike.
-        type Slots = Vec<(usize, Channel)>;
+        let normal_ref = normal_packed.map(|n| n.0);
+        // Per texture: per channel its slot, reference and value, and the references it samples
+        // like. Roughness and metalness share one texture when they sample alike.
+        type Slots = Vec<(usize, Option<TexRef>, f32)>;
         let mut packs: Vec<(Slots, Vec<TexRef>)> = Vec::new();
         if rough_varies {
             let refs = rough.or(normal_ref).into_iter().collect();
-            packs.push((vec![(slot::ROUGHNESS, rough_channel(m))], refs));
+            let entry = match (rough, rough_const) {
+                (Some(r), None) => (slot::ROUGHNESS, Some(r), m.specular_roughness),
+                (_, c) => (
+                    slot::ROUGHNESS,
+                    None,
+                    m.specular_roughness * c.unwrap_or(1.0),
+                ),
+            };
+            packs.push((vec![entry], refs));
         }
         if metal_varies {
             let r = metal.expect("varying metalness has an image");
-            let entry = (slot::METALNESS, metal_channel(m, &r));
-            let alike = |a: &TexRef| a.samples_like(&r) && a.wrap == r.wrap;
+            let entry = (slot::METALNESS, Some(r), m.metalness);
+            let alike = |a: &TexRef| self.alike(a, &r) && a.filter == r.filter;
             match packs.first_mut() {
                 Some((channels, refs)) if alike(&refs[0]) => channels.push(entry),
                 _ => packs.push((vec![entry], vec![r])),
@@ -880,31 +1512,42 @@ impl<'a> Packer<'a> {
         }
         for (rm, refs) in packs {
             let (encoding, role) = match rm.as_slice() {
-                [(slot::ROUGHNESS, _)] => (Encoding::Bc4, "roughness"),
+                [(slot::ROUGHNESS, ..)] => (Encoding::Bc4, "roughness"),
                 [_] => (Encoding::Bc4, "metalness"),
                 _ => (Encoding::Bc5, "roughness_metalness"),
             };
-            let mut channels: Vec<Channel> = rm.iter().map(|c| c.1).collect();
-            channels.resize(4, Channel::Constant(0.0));
             // Toksvig pairs roughness and normal texels, so both must sample alike.
-            let toksvig = match (&normal_packed, rm[0].0 == slot::ROUGHNESS) {
-                (Some((r, s, n)), true) if refs[0].samples_like(r) => Some((0, *r, *s, *n)),
+            let paired = match (&normal_packed, rm[0].0 == slot::ROUGHNESS) {
+                (Some((r, s)), true) if self.alike(&refs[0], r) => Some((*r, *s)),
                 _ => None,
             };
-            let id = self.make(
-                suffix,
+            let id = self.make_each(suffix, &refs[0], |s, cell| {
+                let channel = |(_, r, v): &(usize, Option<TexRef>, f32)| match r {
+                    Some(r) => {
+                        let r = s.at(r, cell);
+                        s.source(&r, 0, usize::from(r.channel), 0.0, *v)
+                    }
+                    None => Channel::constant(*v),
+                };
+                let mut channels: Vec<Channel> = rm.iter().map(channel).collect();
+                channels.resize(4, Channel::constant(0.0));
+                let toksvig = paired.map(|(r, scale)| {
+                    let (r, source) = s.normal_source(&s.at(&r, cell));
+                    (0, r, scale, source)
+                });
                 Pack {
                     role,
                     encoding,
                     channels,
-                    refs: refs.clone(),
+                    refs: refs.iter().map(|r| s.at(r, cell)).collect(),
                     coverage: None,
                     toksvig,
                     normal: false,
                     shrink: false,
-                },
-            )?;
-            for (i, (s, _)) in rm.iter().enumerate() {
+                    tile: None,
+                }
+            })?;
+            for (i, (s, ..)) in rm.iter().enumerate() {
                 bind(m, *s, id, i, &refs[0]);
                 if *s == slot::ROUGHNESS {
                     m.specular_roughness = 1.0;
@@ -912,31 +1555,6 @@ impl<'a> Packer<'a> {
                     m.metalness = 1.0;
                 }
             }
-        }
-        if let Some(o) = &occ
-            && (occ_varies || o.2.is_some_and(|c| 1.0 - o.1 + o.1 * c < 1.0 - 1.0 / 255.0))
-        {
-            let id = self.make(
-                suffix,
-                Pack {
-                    role: "occlusion",
-                    encoding: Encoding::Bc4,
-                    channels: vec![self.source(
-                        &o.0,
-                        0,
-                        usize::from(o.0.channel),
-                        false,
-                        1.0 - o.1,
-                        o.1,
-                    )],
-                    refs: vec![o.0],
-                    coverage: None,
-                    toksvig: None,
-                    normal: false,
-                    shrink: !occ_varies,
-                },
-            )?;
-            bind(m, slot::OCCLUSION, id, 0, &o.0);
         }
 
         if let Some(r) = &t.emissive {
@@ -988,9 +1606,14 @@ impl<'a> Packer<'a> {
         if let Some(r) = &t.displacement {
             let channel = usize::from(r.channel);
             // An image with no finite texels leaves no span to measure.
-            let (lo, hi) = match self.range(r, channel) {
+            let (lo, hi) = match self.input_range(r) {
                 (lo, hi) if (hi - lo).is_finite() => (lo, hi),
                 _ => (0.0, 1.0),
+            };
+            let (lo, hi) = if self.bounded(r) {
+                (lo.min(r.outside[channel]), hi.max(r.outside[channel]))
+            } else {
+                (lo, hi)
             };
             let span = hi - lo;
             // A constant image stores 0, and the offset holds its height.
@@ -999,19 +1622,22 @@ impl<'a> Packer<'a> {
             } else {
                 0.0
             };
-            let id = self.make(
-                suffix,
+            let shrink = self.constant(r, channel).is_some();
+            let id = self.make_each(suffix, r, |s, cell| {
+                let r = s.at(r, cell);
+                let channel = usize::from(r.channel);
                 Pack {
                     role: "displacement",
                     encoding: Encoding::Raw(DataFormat::R16),
-                    channels: vec![self.source(r, 0, channel, false, -lo * b, b)],
-                    refs: vec![*r],
+                    channels: vec![s.source(&r, 0, channel, -lo * b, b)],
+                    refs: vec![r],
                     coverage: None,
                     toksvig: None,
                     normal: false,
-                    shrink: self.constant(r, channel).is_some(),
-                },
-            )?;
+                    shrink,
+                    tile: None,
+                }
+            })?;
             bind(m, slot::DISPLACEMENT, id, 0, r);
             m.displacement_offset += m.displacement_scale * lo;
             m.displacement_scale *= span;
@@ -1035,20 +1661,46 @@ impl<'a> Packer<'a> {
     /// Plans the neural set of the material's textures, unless one with the same textures
     /// is planned.
     fn neural_set(&mut self, suffix: &str, m: &Material, settings: &NeuralSettings) -> Result<()> {
-        let mut ids: Vec<AssetId> = Vec::new();
-        for (s, b) in m.textures.iter().enumerate() {
-            if s != slot::OPACITY && b.texture != AssetId::NONE && !ids.contains(&b.texture) {
-                ids.push(b.texture);
+        for (cell, ids) in self.neural_members(m) {
+            let suffix = match cell {
+                Some([u, v]) => format!("{suffix}/tile/{u}_{v}"),
+                None => suffix.to_string(),
+            };
+            let jobs: Vec<&TextureJob> = ids.iter().map(|id| &self.jobs[self.by_id[id]]).collect();
+            let Some(set) = neural::plan(self.asset, &suffix, &jobs, settings)? else {
+                continue;
+            };
+            if self.sets.insert(set.members()) {
+                self.neural.push(set);
             }
         }
-        let jobs: Vec<&TextureJob> = ids.iter().map(|id| &self.jobs[self.by_id[id]]).collect();
-        let Some(set) = neural::plan(self.asset, suffix, &jobs, settings)? else {
-            return Ok(());
-        };
-        if self.sets.insert(set.members()) {
-            self.neural.push(set);
-        }
         Ok(())
+    }
+
+    /// The textures of `m` that a neural set may hold, in slot order. The textures of a set have
+    /// one size, so each cell of tiles makes a set of its own, apart from `m`'s plain textures.
+    fn neural_members(&self, m: &Material) -> BTreeMap<Option<Cell>, Vec<AssetId>> {
+        let mut ids: BTreeMap<Option<Cell>, Vec<AssetId>> = BTreeMap::new();
+        let mut add = |cell, id| {
+            let member = ids.entry(cell).or_default();
+            if !member.contains(&id) {
+                member.push(id);
+            }
+        };
+        for (s, b) in m.textures.iter().enumerate() {
+            if s == slot::OPACITY || b.texture == AssetId::NONE {
+                continue;
+            }
+            match self.tiles_of.get(&b.texture) {
+                Some(tiles) => {
+                    for t in tiles {
+                        add(Some([t.column, t.row]), t.texture);
+                    }
+                }
+                None => add(None, b.texture),
+            }
+        }
+        ids
     }
 
     /// A color texture whose value multiplies the material color of slot `s` (base color,
@@ -1062,36 +1714,40 @@ impl<'a> Packer<'a> {
         s: usize,
         alpha_free: bool,
     ) -> Result<()> {
-        let alpha = if alpha_free {
-            Channel::Unused
+        let fourth = if alpha_free {
+            Channel::UNUSED
         } else {
-            Channel::Constant(1.0)
+            Channel::constant(1.0)
         };
         let (role, color): (_, fn(&mut Material) -> &mut [f32; 3]) = match s {
             slot::BASE_COLOR => ("base_color", |m| &mut m.base_color),
             slot::EMISSION => ("emission", |m| &mut m.emission_color),
             _ => ("subsurface_color", |m| &mut m.subsurface_color),
         };
-        let srgb = r.srgb.unwrap_or(self.image(r.image).srgb);
+        let (read, _, gamut) = self.color_read(r);
+        let primaries = self.slot_primaries(r);
         let hdr = s == slot::EMISSION && self.past_one(r);
-        let rgb: Vec<Option<f32>> = (0..3)
-            .map(|c| {
-                if hdr {
-                    self.constant_ranged(r, c)
-                } else {
-                    self.constant_weight(r, c)
-                }
-            })
-            .collect();
-        if rgb.iter().all(Option::is_some) {
-            let texel: [f32; 3] = std::array::from_fn(|c| {
-                let v = rgb[c].expect("constant");
-                let read = r.read(c, if srgb { srgb_to_linear(v) } else { v });
-                read.clamp(0.0, if hdr { f32::INFINITY } else { 1.0 })
-            });
+        let top = if hdr { f32::INFINITY } else { 1.0 };
+        let held = (0..3).all(|c| {
+            if hdr {
+                self.constant_ranged(r, c).is_some()
+            } else {
+                self.stored_constant(r, c).is_some()
+            }
+        });
+        // A premultiplied file's color varies with its alpha.
+        let alpha = self.image(r.image).constant[3];
+        if held && (alpha.is_some() || !read.straight) {
+            let [x, y, z] = [0, 1, 2].map(|c| self.stored_constant(r, c).expect("constant"));
+            let t = [x, y, z, alpha.unwrap_or(1.0)];
+            let mut texel: [f32; 3] = std::array::from_fn(|c| r.read(c, read.value(t, c)));
+            if let Some(m) = &gamut {
+                texel = multiply(m, texel);
+            }
+            let texel = texel.map(|v| self.held(r, v, top));
             let target = color(m);
             // Rec.709 multiplies directly, so its factors stay exact.
-            *target = match self.color_primaries(r.image) {
+            *target = match primaries {
                 Primaries::Rec709 => std::array::from_fn(|c| target[c] * texel[c]),
                 p => {
                     let (rec709, p) = (RgbPrimaries::REC709, p.rgb());
@@ -1102,9 +1758,22 @@ impl<'a> Packer<'a> {
             };
             return Ok(());
         }
-        let image = |c| self.source(r, c, c, srgb, 0.0, 1.0);
-        let id = self.make(
-            suffix,
+        // Texels read in their texture's primaries, and a slot's value past 0..1 with them.
+        let outside = match primaries {
+            Primaries::Rec709 => r.outside,
+            p => {
+                let [x, y, z, w] = r.outside;
+                let rgb =
+                    RgbPrimaries::REC709.matrix_to(p.rgb()) * DVec3::from([x, y, z].map(f64::from));
+                let [x, y, z] = rgb.as_vec3().to_array();
+                [x, y, z, w]
+            }
+        };
+        let id = self.make_each(suffix, r, |this, cell| {
+            let r = this.at(r, cell);
+            let (read, ..) = this.color_read(&r);
+            let texture = TexRef { outside, ..r };
+            let image = |c| this.read_source(&texture, c, c, read.clone(), 0.0, 1.0);
             Pack {
                 role,
                 encoding: if hdr {
@@ -1112,14 +1781,15 @@ impl<'a> Packer<'a> {
                 } else {
                     Encoding::Bc7Srgb
                 },
-                channels: vec![image(0), image(1), image(2), alpha],
-                refs: vec![*r],
+                channels: vec![image(0), image(1), image(2), fourth.clone()],
+                refs: vec![r],
                 coverage: None,
                 toksvig: None,
                 normal: false,
                 shrink: false,
-            },
-        )?;
+                tile: cell.map(|c| (c, Some(primaries))),
+            }
+        })?;
         bind(m, s, id, 0, r);
         Ok(())
     }
@@ -1133,19 +1803,88 @@ impl<'a> Packer<'a> {
         role: &'static str,
         encoding: Encoding,
     ) -> Result<Made> {
-        self.make(
-            suffix,
+        self.make_each(suffix, r, |s, cell| {
+            let r = s.at(r, cell);
             Pack {
                 role,
                 encoding,
-                channels: vec![self.source(r, 0, usize::from(r.channel), false, 0.0, scale)],
-                refs: vec![*r],
+                channels: vec![s.source(&r, 0, usize::from(r.channel), 0.0, scale)],
+                refs: vec![r],
                 coverage: None,
                 toksvig: None,
                 normal: false,
                 shrink: false,
-            },
-        )
+                tile: None,
+            }
+        })
+    }
+
+    /// Whether both read at the same uvs, and any tiles at the same cells.
+    fn alike(&self, a: &TexRef, b: &TexRef) -> bool {
+        a.samples_like(b) && self.cells(a) == self.cells(b)
+    }
+
+    /// The pack `build` gives for `r`: planned as it stands for an image, and for a set of tiles
+    /// once per tile, by its cell, into a [`TextureTiles`] asset. Where no tile lies the set reads
+    /// what the pack of the set as a whole says, which no one tile's file or overrides change.
+    fn make_each(
+        &mut self,
+        suffix: &str,
+        r: &TexRef,
+        build: impl Fn(&Self, Option<Cell>) -> Pack,
+    ) -> Result<Made> {
+        let Some(cells) = self.cells(r) else {
+            return self.make(suffix, build(self, None));
+        };
+        let mut tiles = Vec::with_capacity(cells.len());
+        let mut keys = Vec::new();
+        let mut set = None;
+        let mut source_mips = false;
+        for cell in cells {
+            let mut p = build(self, Some(cell));
+            let primaries = p.tile.and_then(|t| t.1);
+            p.tile = Some((cell, primaries));
+            let role = p.role;
+            let made = self.make(suffix, p)?;
+            keys.extend_from_slice(&self.jobs[self.by_id[&made.id]].key.0);
+            tiles.push((cell[0], cell[1], made.id));
+            source_mips |= made.source_mips;
+            set = Some((made, role));
+        }
+        let (made, role) = set.expect("a set has a tile");
+        let id = self.tile_set(suffix, role, &tiles, &keys);
+        Ok(Made {
+            id,
+            channels: [0, 1, 2, 3],
+            outside: build(self, None).outside(),
+            tiled: true,
+            source_mips,
+            ..made
+        })
+    }
+
+    /// Plans the tile set of `tiles`, whose textures' keys are `keys`, or returns the one planned
+    /// with the same tiles.
+    fn tile_set(
+        &mut self,
+        suffix: &str,
+        role: &str,
+        tiles: &[(u16, u16, AssetId)],
+        keys: &[u8],
+    ) -> AssetId {
+        let set = TextureTiles::new(tiles);
+        let bytes = set.to_bytes();
+        *self.made_sets.entry(Hash32::of(&bytes)).or_insert_with(|| {
+            let name = texture_name(self.asset, suffix, role);
+            let key = Key::new(Class::TextureTiles, &name)
+                .bytes(&bytes)
+                .bytes(keys)
+                .finish();
+            let id = AssetId::from_name(&name);
+            self.tiles_of.insert(id, set.tiles);
+            self.tile_sets.push(TileSetJob { name, key, bytes });
+            id
+        })
     }
 
     /// How pack `p` keeps the blocks of its one source image, and per packed channel the
@@ -1176,36 +1915,40 @@ impl<'a> Packer<'a> {
         let mut image = None;
         let mut channels = [0u8, 1, 2, 3];
         for (c, ch) in p.channels.iter().take(count).enumerate() {
-            match *ch {
-                Channel::Image {
+            match &ch.texels {
+                Texels::Image {
                     image: i,
                     channel,
-                    srgb,
+                    read,
                     a,
                     b,
                 } => {
                     let identity = if p.normal {
-                        (a, b) == (-1.0, 2.0)
+                        (*a, *b) == (-1.0, 2.0)
                     } else {
-                        (a, b) == (0.0, 1.0)
+                        (*a, *b) == (0.0, 1.0)
                     };
                     // Color channels keep their sRGB encoding; alpha and data are linear.
-                    let color = p.encoding == Encoding::Bc7Srgb && c < 3;
-                    if !identity || *image.get_or_insert(i) != i || srgb != color {
+                    let stored = if p.encoding == Encoding::Bc7Srgb && c < 3 {
+                        Decode::SRGB
+                    } else {
+                        Decode::STORED
+                    };
+                    if !identity || *image.get_or_insert(*i) != *i || !read.is(stored) {
                         return None;
                     }
-                    channels[c] = channel as u8;
+                    channels[c] = *channel as u8;
                 }
-                Channel::Unused => {}
+                Texels::Unused => {}
                 // A color texture's alpha of 1 holds where the source's is 1.
-                Channel::Constant(v) if p.encoding == Encoding::Bc7Srgb && c == 3 => {
+                Texels::Constant(v) if p.encoding == Encoding::Bc7Srgb && c == 3 => {
                     let opaque = self.image(image?).constant[3]
                         .is_some_and(|a| (a - 1.0).abs() <= 1.0 / 255.0);
-                    if v != 1.0 || !opaque {
+                    if *v != 1.0 || !opaque {
                         return None;
                     }
                 }
-                Channel::Constant(_) | Channel::NormalZ { .. } => return None,
+                Texels::Constant(_) | Texels::NormalZ { .. } => return None,
             }
         }
         let i = image?;
@@ -1262,9 +2005,9 @@ impl<'a> Packer<'a> {
         let mut images: Vec<usize> = p
             .channels
             .iter()
-            .filter_map(|c| match c {
-                Channel::Image { image, .. } | Channel::NormalZ { image, .. } => Some(*image),
-                Channel::Constant(_) | Channel::Unused => None,
+            .filter_map(|c| match c.texels {
+                Texels::Image { image, .. } | Texels::NormalZ { image, .. } => Some(image),
+                Texels::Constant(_) | Texels::Unused => None,
             })
             .collect();
         images.sort_unstable();
@@ -1306,24 +2049,47 @@ impl<'a> Packer<'a> {
         if p.shrink {
             size = [4, 4];
         }
-        let primaries = if matches!(p.encoding, Encoding::Bc7Srgb | Encoding::Bc6h) {
-            self.color_primaries(images[0])
+        let (primaries, gamut) = if matches!(p.encoding, Encoding::Bc7Srgb | Encoding::Bc6h) {
+            let (_, primaries, gamut) = self.color_read(&p.refs[0]);
+            match p.tile.and_then(|t| t.1).filter(|set| *set != primaries) {
+                Some(set) => {
+                    let to = primaries.rgb().matrix_to(set.rgb());
+                    (set, Some(gamut.map_or(to, |g| to * g)))
+                }
+                None => (primaries, gamut),
+            }
         } else {
-            primaries.unwrap_or(Primaries::Rec709)
+            // A set holds one id, which an override of some of its tiles can't split.
+            let primaries = primaries.filter(|_| p.tile.is_none());
+            (primaries.unwrap_or(Primaries::Rec709), None)
         };
         let skipped = super::skipped_mips(size[0], size[1], max_size) > 0;
-        let pass = self.passes(&p, size, grid, skipped, source_mips);
+        // A slot reads one set of channels, whichever tile it lands on.
+        let pass = self
+            .passes(&p, size, grid, skipped, source_mips)
+            .filter(|_| gamut.is_none())
+            .filter(|(_, channels)| p.tile.is_none() || *channels == [0, 1, 2, 3]);
+        // A hardware border reads transparent black, whatever else a slot of this texture reads
+        // past 0..1 takes the shader's check.
+        let outside = p.outside();
+        if outside != [0.0; 4] {
+            let wrap = &mut p.refs[0].wrap;
+            *wrap = wrap.map(|w| if w == Wrap::Border { Wrap::Constant } else { w });
+        }
+        let wrap = p.refs[0].wrap;
+        // Constant's texels and mips are Clamp's, and what it reads past them is the binding's.
+        let mip_wrap = wrap.map(|w| if w == Wrap::Constant { Wrap::Clamp } else { w });
 
         // A rebuilt z reads the remap alone, which a normal's channels hold times the scale.
         let mut recipe = format!(
-            "{} {:?} {:?} {:?} {:?} {:?} {:?} {max_size:?} {grid:?} {primaries:?} {bc_split:?} {:?} {:?} {:?} {source_mips}",
+            "{} {:?} {:?} {:?} {:?} {:?} {:?} {max_size:?} {grid:?} {primaries:?} {gamut:?} {bc_split:?} {:?} {:?} {:?} {source_mips}",
             p.role,
             p.encoding,
-            p.channels,
+            p.channels.iter().map(|c| &c.texels).collect::<Vec<_>>(),
             p.coverage,
             p.toksvig.as_ref().map(|t| (t.0, t.1.image, t.1.remap, t.2, t.3)),
             p.normal.then_some(p.refs[0].remap),
-            p.refs[0].wrap,
+            mip_wrap,
             self.rules.filter,
             size,
             pass,
@@ -1334,13 +2100,21 @@ impl<'a> Packer<'a> {
         }
         let same = Hash32::of(&recipe);
         let channels = pass.map_or([0, 1, 2, 3], |p| p.1);
-        if let Some(id) = self.made.get(&same) {
-            return Ok(Made { id: *id, channels });
-        }
-        let name = match suffix {
-            "" => format!("{}/texture/{}", self.asset, p.role),
-            _ => format!("{}/texture/{suffix}/{}", self.asset, p.role),
+        let made = |id| Made {
+            id,
+            channels,
+            wrap,
+            outside,
+            tiled: false,
+            source_mips,
         };
+        if let Some(id) = self.made.get(&same) {
+            return Ok(made(*id));
+        }
+        let mut name = texture_name(self.asset, suffix, p.role);
+        if let Some(([u, v], _)) = p.tile {
+            name = format!("{name}/tile/{u}_{v}");
+        }
         let key = Key::new(Class::Texture, &name)
             .str(&super::encoders(self.quality))
             .bytes(&recipe)
@@ -1360,30 +2134,32 @@ impl<'a> Packer<'a> {
             max_size,
             grid,
             primaries,
+            gamut,
             filter: self.rules.filter,
             bc_split,
             pass: pass.map(|p| p.0),
             source_mips,
         });
-        Ok(Made { id, channels })
+        Ok(made(id))
     }
 }
 
 impl Packer<'_> {
-    /// The last value `field` sets among the overrides that match any of `images`.
+    /// The last value `field` sets among the overrides that match any of `images`, a tile by its
+    /// own name or its set's.
     fn overridden<T>(
         &self,
         images: &[usize],
         field: impl Fn(&TextureOverride) -> Option<T>,
     ) -> Option<T> {
+        let named = |i: usize, pattern: &str| self.images[i].name.contains(pattern);
+        let matches = |i: usize, pattern: &str| {
+            named(i, pattern) || self.set_of.get(&i).is_some_and(|&s| named(s, pattern))
+        };
         self.rules
             .overrides
             .iter()
-            .filter(|(pattern, _)| {
-                images
-                    .iter()
-                    .any(|&i| self.images[i].name.contains(pattern.as_str()))
-            })
+            .filter(|(pattern, _)| images.iter().any(|&i| matches(i, pattern)))
             .fold(None, |v, (_, o)| field(o).or(v))
     }
 }
@@ -1520,7 +2296,7 @@ impl TextureJob {
                     load::decode_layers(&mut src).map_err(&fail)?;
                     Ok(src.layers.remove(0))
                 }
-                None => decode(&images[i].bytes()?).map_err(&fail),
+                None => images[i].decoded().map_err(&fail),
             })?;
             sources.insert(i, img.resized(self.size[0], self.size[1]));
         }
@@ -1591,51 +2367,49 @@ impl TextureJob {
 
     /// The packed texture of `decoded` source images, each `w` x `h`.
     fn pack(&self, decoded: &HashMap<usize, Arc<Img>>, [w, h]: [u32; 2]) -> Img {
-        // Apart from normals, BC4 and BC5 hold weights, and a float weight has no upper limit: a
-        // source texel clamps before its factor, as a constant does. A float weight's remap can
-        // reach below 0 where no format of 0..1 would store it, and a negative weight has no IOR.
-        let limit = match self.pack.encoding {
-            Encoding::Bc4 | Encoding::Bc5 if !self.pack.normal => Some(1.0),
-            Encoding::Raw(DataFormat::R16f) => Some(f32::INFINITY),
-            _ => None,
-        };
+        let limit = self.pack.limit();
         let mut img = Img::new(w, h);
+        // One ICC transform gives all three channels of a texel.
+        let mut profiled: HashMap<usize, Vec<[f32; 4]>> = HashMap::new();
+        let as_stored = Read::of(Decode::STORED);
         for (c, ch) in self.pack.channels.iter().enumerate() {
-            match *ch {
-                Channel::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
-                Channel::Unused => img.px.par_iter_mut().for_each(|t| t[c] = 1.0),
-                Channel::NormalZ { image, source } => {
+            match &ch.texels {
+                &Texels::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
+                Texels::Unused => img.px.par_iter_mut().for_each(|t| t[c] = 1.0),
+                &Texels::NormalZ { image, source } => {
                     let r = self.pack.refs[0];
                     img.px
                         .par_iter_mut()
                         .zip(&decoded[&image].px)
                         .for_each(|(t, s)| t[c] = r.normal(source, *s)[2]);
                 }
-                Channel::Image {
+                Texels::Image {
                     image,
                     channel,
-                    srgb,
+                    read,
                     a,
                     b,
                 } => {
-                    img.px
-                        .par_iter_mut()
-                        .zip(&decoded[&image].px)
-                        .for_each(|(t, s)| {
-                            let v = if srgb {
-                                srgb_to_linear(s[channel])
-                            } else {
-                                s[channel]
-                            };
-                            let read = a + b * limit.map_or(v, |l| v.clamp(0.0, l));
-                            t[c] = if limit == Some(f32::INFINITY) {
-                                read.max(0.0)
-                            } else {
-                                read
-                            };
+                    let source = &decoded[image].px;
+                    let (texels, read) = if read.icc.is_some() {
+                        let texels = profiled.entry(*image).or_insert_with(|| {
+                            source.par_iter().map(|s| read.color(*s, None)).collect()
                         });
+                        (&*texels, &as_stored)
+                    } else {
+                        (source, read)
+                    };
+                    img.px.par_iter_mut().zip(texels).for_each(|(t, s)| {
+                        t[c] = stored(read.value(*s, *channel), *a, *b, limit);
+                    });
                 }
             }
+        }
+        if let Some(m) = &self.gamut {
+            img.px.par_iter_mut().for_each(|t| {
+                let [r, g, b] = multiply(m, [t[0], t[1], t[2]]);
+                *t = [r, g, b, t[3]];
+            });
         }
         img
     }
@@ -1661,5 +2435,115 @@ impl TextureJob {
             toksvig,
             lights: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gradient(shift: u32) -> ImageData {
+        let img = image::RgbaImage::from_fn(8, 8, |x, y| {
+            image::Rgba([(x * 32 + shift) as u8, (y * 32) as u8, 0, 255])
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        ImageData::Bytes(bytes.into_inner())
+    }
+
+    /// Tiles of one cell go to one neural set whichever slots they fill, so that a tap of any
+    /// tile finds what stands in for it at that tile's size, and a slot of plain textures stays
+    /// out of them. Opacity never joins a set, on tiles or off.
+    #[test]
+    fn each_cell_of_tiles_plans_a_neural_set_of_its_own() {
+        let image = |name: &str, data| ImageFile {
+            name: name.into(),
+            data,
+        };
+        let tiles = |images: [usize; 2]| {
+            ImageData::Tiles(vec![
+                ImageTile {
+                    cell: [0, 0],
+                    image: images[0],
+                },
+                ImageTile {
+                    cell: [1, 0],
+                    image: images[1],
+                },
+            ])
+        };
+        let mut images = vec![
+            image("c.1001", gradient(0)),
+            image("c.1002", gradient(1)),
+            image("r.1001", gradient(2)),
+            image("r.1002", gradient(3)),
+            image("o.1001", gradient(4)),
+            image("o.1002", gradient(5)),
+            image("plain", gradient(6)),
+        ];
+        images.push(image("c.<UDIM>", tiles([0, 1])));
+        images.push(image("r.<UDIM>", tiles([2, 3])));
+        images.push(image("o.<UDIM>", tiles([4, 5])));
+        let (color, rough, opacity, plain) = (7, 8, 9, 6);
+        let reads = ImageReads {
+            whole: HashSet::new(),
+            normals: HashSet::new(),
+            colors: HashSet::new(),
+            optional: HashSet::new(),
+        };
+        let used: Vec<usize> = (0..7).collect();
+        let (mut facts, mut unread) =
+            image_facts("a", &mut images, &used, &reads, &Memo::default()).unwrap();
+        settle_tiles(
+            &[color, rough, opacity],
+            &mut images,
+            &mut facts,
+            &mut unread,
+        );
+        let at = |image, channel| TexRef {
+            image,
+            rules: ImageRules::MaterialX,
+            channel,
+            rg_channel: None,
+            input: None,
+            uv_set: 0,
+            wrap: [Wrap::Repeat; 2],
+            file_wrap: [false; 2],
+            filter: 0,
+            outside: [0.0; 4],
+            missing: [0.0; 4],
+            uv: [0.0; 6],
+            color: ImageColor::Data,
+            remap: None,
+        };
+        let textures = MaterialTextures {
+            base_color: Some(at(color, 0)),
+            roughness: Some(at(rough, 0)),
+            opacity: Some(at(opacity, 0)),
+            specular: Some(at(plain, 0)),
+            ..MaterialTextures::default()
+        };
+        let mut m = Material {
+            alpha_mode: Material::BLEND,
+            ..Material::default()
+        };
+        let rules = TextureRules::default();
+        let mut packer = Packer::new("a", &images, &facts, &rules, Quality::UltraFast);
+        packer.material("m", &mut m, &textures).unwrap();
+
+        let id = |role: &str| AssetId::from_name(&format!("a/texture/m/{role}"));
+        let want: BTreeMap<Option<Cell>, Vec<AssetId>> = [
+            (None, vec![id("specular_weight")]),
+            (
+                Some([0, 0]),
+                vec![id("base_color/tile/0_0"), id("roughness/tile/0_0")],
+            ),
+            (
+                Some([1, 0]),
+                vec![id("base_color/tile/1_0"), id("roughness/tile/1_0")],
+            ),
+        ]
+        .into();
+        assert_eq!(packer.neural_members(&m), want);
     }
 }

@@ -11,11 +11,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use examples::average::Average;
-use examples::linked::KERNELS;
-use examples::mesh::MeshBuilder;
-use examples::window::Window;
-use examples::{Capture, Options, Workers, assert_clean, device, fixed_time, mount_at};
 use orr::orr_gpu::{
     Device, Format, Hazards, MemoryKind, QueueKind, Stages, Texture, TextureDesc, TextureIndex,
     TextureMemory, TextureRegion, TextureUsage, TimelinePoint, ViewDesc as TextureView,
@@ -31,6 +26,11 @@ use orr::{
 use orr_atmosphere::presets::{LUNAR_ANGULAR_RADIUS, lunar_albedo, lunar_disc, solar_disc};
 use orr_atmosphere::{Atmosphere, AtmosphereState, HeightFog};
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshSettings, Source};
+use orr_examples::average::Average;
+use orr_examples::linked::KERNELS;
+use orr_examples::mesh::MeshBuilder;
+use orr_examples::window::Window;
+use orr_examples::{Capture, Options, Workers, assert_clean, device, fixed_time, mount_at};
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, Vec3};
 

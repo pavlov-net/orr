@@ -480,6 +480,7 @@ mod tests {
             texels: std::sync::Arc::new(texels),
             wrap: [Wrap::Repeat; 2],
             uv: [0.0; 6],
+            outside: 0.0,
         };
         for wrap in [Wrap::Repeat, Wrap::Clamp, Wrap::Mirror] {
             raster.wrap = [wrap, Wrap::Repeat];

@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use orr::orr_gpu::{
     Allocation, Blend, ColorAttachment, ColorLoad, ColorMask, ColorTarget, CompareOp,
     CounterReport, DepthAttachment, DepthLoad, DepthTarget, Device, Format, Hazards, MemoryKind,
-    MeshPipeline, MeshPipelineDesc, QueueKind, RasterState, Rendering, SamplerIndex, ShaderStage,
-    SpecData, Stages, Texture, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
+    MeshPipeline, MeshPipelineDesc, QueueKind, RasterState, Rendering, ShaderStage, SpecData,
+    Stages, Texture, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
 use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::mesh::MeshInfo;
@@ -1088,8 +1088,7 @@ impl DenseVegetation {
                 display: None,
             })
             .expect("begin frame");
-        let material =
-            |m: Material| MaterialGpu::new(&m, &[BoundTexture::NONE; 12], SamplerIndex(0));
+        let material = |m: Material| MaterialGpu::new(&m, &[BoundTexture::NONE; slot::COUNT]);
         let (soil, blades, pond, glowing) = {
             let mut mats = f.materials();
             let mut create = |m: Material| mats.create(&material(m)).expect("material");

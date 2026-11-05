@@ -544,7 +544,7 @@ fn textured_emissive_producers_light_with_their_texels() {
     let image = texture(1, 1, &[[5.0, 5.0, 5.0, 1.0]], "emission");
     let mut textured = emitting([1.0, 0.6, 0.3], 400.0, 0);
     textured.textures[orr_pack::material::slot::EMISSION] = image.index;
-    textured.sampler = linear_clamp();
+    textured.samplers[orr_pack::material::slot::EMISSION].sampler = linear_clamp();
     let p = pipeline(&emit::MODULE, "main");
     scene.frame(
         |w, m| {

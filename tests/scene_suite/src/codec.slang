@@ -17,7 +17,6 @@ struct Case
     float3 geometric_normal;
     float diffuse_roughness;
     float3 subsurface_color;
-    float occlusion;
     float3 subsurface_radius;
     float raster_error;
     float3 coat_color;
@@ -33,9 +32,6 @@ struct Case
     float subsurface_anisotropy;
     uint flags;        // GBUFFER_UNLIT and the origin policy in, every GSurface flag out
     uint bsdf_flags;   // BSDF_THIN_WALLED in, the decoded BSDF flags out
-    uint pad0;
-    uint pad1;
-    uint pad2;
 }
 
 struct Words
@@ -72,7 +68,6 @@ GSurface surface(Case c)
     p.specular_ior = c.ior;
     p.diffuse_roughness = c.diffuse_roughness;
     p.subsurface_color = c.subsurface_color;
-    p.scale = float3(c.occlusion);
     p.subsurface_radius = c.subsurface_radius;
     p.coat_color = c.coat_color;
     p.coat_weight = c.coat_weight;
@@ -107,7 +102,6 @@ Case flatten(GSurface s)
     c.ior = p.specular_ior;
     c.diffuse_roughness = p.diffuse_roughness;
     c.subsurface_color = p.subsurface_color;
-    c.occlusion = p.scale.x;
     c.subsurface_radius = p.subsurface_radius;
     c.coat_color = p.coat_color;
     c.coat_weight = p.coat_weight;

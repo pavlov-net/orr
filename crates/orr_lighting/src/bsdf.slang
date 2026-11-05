@@ -117,7 +117,6 @@ public struct BsdfLayers
     bool collapsed;
     float e_ss;                         // the specular lobe's single-scattering albedo
     float coat_roughness;
-    float3 scale;
     float3 e[LOBES];
     LobeAlbedo estimate;                // specular left out
     float3 specular_single;             // the specular lobe's reflection coefficient under the layers
@@ -135,7 +134,6 @@ public struct Bsdf : IDifferentiable
     no_diff float3 b;
     no_diff float3 n;                   // toward the view
     no_diff float3 v;                   // the view in (t, b, n)
-    no_diff float3 scale;
     no_diff bool inside;
     no_diff float3 layer;               // what the coat and fuzz pass of the view to the base
 
@@ -217,8 +215,8 @@ public struct Bsdf : IDifferentiable
             e[COAT] = float3(0.0);
             e[FUZZ] = float3(0.0);
         }
-        a.specular = (e[COAT] + e[FUZZ] + fold_diffuse + (layers.specular_single + fold) * layers.e_ss
-            + layers.specular_multiple) * layers.scale;
+        a.specular = e[COAT] + e[FUZZ] + fold_diffuse + (layers.specular_single + fold) * layers.e_ss
+            + layers.specular_multiple;
         // Table interpolation can leave a complement a rounding error below zero.
         estimate.diffuse = max(a.diffuse, 0.0);
         estimate.specular = max(a.specular, 0.0);
@@ -409,7 +407,7 @@ public struct Bsdf : IDifferentiable
         if (delta)
         {
             r.pdf = probability[k] * within;
-            r.weight = w * scale / r.pdf;
+            r.weight = w / r.pdf;
             lobe = (lobe & ~LOBE_GLOSSY) | LOBE_SPECULAR;
         }
         else
@@ -482,7 +480,7 @@ public struct Bsdf : IDifferentiable
         if (dot(normalize(own), l) < 1.0 - 1e-6)
             return float3(0.0);
         chance = probability[component] * within;
-        return w * scale;
+        return w;
     }
 
     // One direction into the subsurface medium from the walk lobe alone: `weight` is its
@@ -509,7 +507,7 @@ public struct Bsdf : IDifferentiable
                 coefficients(v.z, rc, tc);
                 r.wi = normalize(from_local(l, t, b, n));
                 r.pdf = 1.0 - walk_ms_share;
-                r.weight = walk * tc * layer * scale / r.pdf;
+                r.weight = walk * tc * layer / r.pdf;
                 r.lobe = LOBE_TRANSMISSION | LOBE_SPECULAR | LOBE_VOLUME;
                 return r;
             }
@@ -520,7 +518,7 @@ public struct Bsdf : IDifferentiable
             return r;
         r.wi = normalize(from_local(l, t, b, n));
         r.pdf = pdf;
-        r.weight = f * scale / pdf;
+        r.weight = f / pdf;
         r.lobe = LOBE_TRANSMISSION | LOBE_GLOSSY | LOBE_VOLUME;
         return r;
     }
@@ -621,9 +619,9 @@ public struct Bsdf : IDifferentiable
             base += (l.z > 0.0 ? dms_reflect : dms_transmit) * dielectric_ms(l.z) * abs(l.z) * INV_PI;
             pdf += probability[DIELECTRIC_MS] * INV_TWO_PI * (l.z > 0.0 ? dms_ratio : 1.0 - dms_ratio);
         }
-        float3 below = layer * leaving(l.z) * scale;
+        float3 below = layer * leaving(l.z);
         diffuse_share = diffuse_base * below;
-        return top * scale + (base + diffuse_base) * below;
+        return top + (base + diffuse_base) * below;
     }
 
     // GGX reflection with a white coefficient, D G / (4 cos_v), and its bounded sampling density.
@@ -931,7 +929,6 @@ public SubsurfaceVolume bsdf_subsurface_volume(BsdfParams p)
 // without a walk lobe.
 public float3 bsdf_walk_exit(BsdfParams p, float3 n, float3 wi, float3 u)
 {
-    p.scale = float3(1.0);
     Bsdf s = bsdf_prepare(p, n, wi);
     float sss = max_component(s.walk);
     if (!(sss > 0.0))
@@ -1011,7 +1008,6 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     }
     s.v = v;
     float mu = v.z;
-    s.scale = p.scale;
 
     // IORs: the specular weight moves the base IOR toward the medium above it.
     bool enter_coat = coat_weight > 0.0 && !s.inside;
@@ -1167,7 +1163,6 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     layers.collapsed = collapsed;
     layers.e_ss = e_ss;
     layers.coat_roughness = coat_roughness;
-    layers.scale = p.scale;
     layers.e[COAT] = float3(coat_reflected * fuzz_in);
     layers.e[FUZZ] = fuzz_presence * s.fuzz_ltc.z * p.fuzz_color;
     layers.e[SPECULAR] = (rc + s.transmit * tc) * e_ss * below;
@@ -1177,13 +1172,13 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     layers.e[DIFFUSE] = s.diffuse * s.diffuse_comp * below;
     layers.e[THIN_SPECULAR] = s.thin_specular * e_ss * below;
     layers.e[THIN_DIFFUSE] = s.thin_diffuse * s.diffuse_comp * below;
-    layers.estimate.diffuse = (layers.e[DIFFUSE] + layers.e[THIN_DIFFUSE]) * p.scale;
+    layers.estimate.diffuse = layers.e[DIFFUSE] + layers.e[THIN_DIFFUSE];
     layers.estimate.specular = float3(0.0);
     layers.specular_single = rc * below;
     layers.specular_multiple = (s.dms_reflect * s.dms_ratio * s.dms_ec + s.mms * s.mms_ec) * below;
-    layers.estimate.transmission = ((s.transmit * tc * e_ss + s.dms_transmit * (1.0 - s.dms_ratio) * s.dms_ec) * below
-        + layers.e[THIN_SPECULAR]) * p.scale;
-    layers.estimate.subsurface = layers.e[WALK] * p.scale;
+    layers.estimate.transmission = (s.transmit * tc * e_ss + s.dms_transmit * (1.0 - s.dms_ratio) * s.dms_ec) * below
+        + layers.e[THIN_SPECULAR];
+    layers.estimate.subsurface = layers.e[WALK];
     layers.glossy_bias = lerp(SPECULAR_BIAS, 1.0, roughness);
     layers.coat_bias = lerp(SPECULAR_BIAS, 1.0, coat_roughness);
     layers.dms_floor = s.dms_ec > 0.0 && (any(s.dms_reflect > 0.0) || any(s.dms_transmit > 0.0));

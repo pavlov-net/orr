@@ -192,27 +192,31 @@ fn downsample(
 /// Normalized taps per destination texel: (source index, weight).
 fn weights(sl: u32, dl: u32, filter: MipFilter, wrap: Wrap) -> Vec<Vec<(u32, f32)>> {
     let s = sl as f32 / dl as f32;
-    let fold = |j: i64| -> u32 {
+    // `None` past a border: a tap that adds nothing but keeps its share of the weights.
+    let fold = |j: i64| -> Option<u32> {
         let n = i64::from(sl);
-        (match wrap {
+        let at = match wrap {
             Wrap::Repeat => j.rem_euclid(n),
-            Wrap::Clamp => j.clamp(0, n - 1),
+            Wrap::Clamp | Wrap::Constant => j.clamp(0, n - 1),
             Wrap::Mirror => {
                 let m = j.rem_euclid(2 * n);
                 if m >= n { 2 * n - 1 - m } else { m }
             }
-        }) as u32
+            Wrap::Border if !(0..n).contains(&j) => return None,
+            Wrap::Border => j,
+        };
+        Some(at as u32)
     };
     (0..dl)
         .map(|i| {
             let c = (i as f32 + 0.5) * s;
-            let mut taps: Vec<(u32, f32)> = match filter {
+            let taps: Vec<(i64, f32)> = match filter {
                 MipFilter::Box => {
                     let (lo, hi) = (c - 0.5 * s, c + 0.5 * s);
                     (lo.floor() as i64..hi.ceil() as i64)
                         .filter_map(|j| {
                             let k = hi.min(j as f32 + 1.0) - lo.max(j as f32);
-                            (k > 0.0).then(|| (fold(j), k))
+                            (k > 0.0).then_some((j, k))
                         })
                         .collect()
                 }
@@ -221,16 +225,15 @@ fn weights(sl: u32, dl: u32, filter: MipFilter, wrap: Wrap) -> Vec<Vec<(u32, f32
                     ((c - r).floor() as i64..=(c + r).ceil() as i64)
                         .filter_map(|j| {
                             let k = kaiser((j as f32 + 0.5 - c) / s);
-                            (k != 0.0).then(|| (fold(j), k))
+                            (k != 0.0).then_some((j, k))
                         })
                         .collect()
                 }
             };
             let sum: f32 = taps.iter().map(|t| t.1).sum();
-            for t in &mut taps {
-                t.1 /= sum;
-            }
-            taps
+            taps.into_iter()
+                .filter_map(|(j, k)| fold(j).map(|j| (j, k / sum)))
+                .collect()
         })
         .collect()
 }
@@ -650,9 +653,11 @@ impl Toksvig {
         if (self.normals.w, self.normals.h) != (w, h) {
             return Err("Toksvig normals differ in size from the roughness texture".into());
         }
+        // A border's black is no normal, and would read as spread.
+        let inside = |w: Wrap| if w.bounded() { Wrap::Clamp } else { w };
         let normal_spec = MipSpec {
             filter: MipFilter::Box,
-            wrap: spec.wrap,
+            wrap: spec.wrap.map(inside),
             grid: spec.grid,
             normal: false,
             coverage: None,
@@ -704,6 +709,28 @@ mod tests {
             coverage: None,
             height: false,
         }
+    }
+
+    /// Past a border a filter reads black, so white fades toward the edges of a mip; a
+    /// constant keeps what a clamp makes of the texels inside.
+    #[test]
+    fn a_border_filters_in_black_and_a_constant_filters_as_a_clamp() {
+        let white = || Img {
+            w: 16,
+            h: 16,
+            px: vec![[1.0; 4]; 256],
+        };
+        let mip = |wrap: Wrap| {
+            let spec = MipSpec {
+                wrap: [wrap, Wrap::Repeat],
+                ..spec(MipFilter::Kaiser)
+            };
+            chain(white(), &spec, 2).remove(1)
+        };
+        let border = mip(Wrap::Border);
+        assert!(border.px[0][0] < 0.96, "{}", border.px[0][0]);
+        assert!((border.px[3][0] - 1.0).abs() < 0.02, "{}", border.px[3][0]);
+        assert_eq!(mip(Wrap::Constant), mip(Wrap::Clamp));
     }
 
     struct Rng(u64);

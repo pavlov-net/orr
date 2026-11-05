@@ -296,7 +296,6 @@ public struct StandardSurface : ISurface
         p.thin_film_thickness = m.thin_film_thickness;
         p.thin_film_ior = m.thin_film_ior;
         p.emission = material_color(m, TEXTURE_EMISSION, i.uv, material_emission(m));
-        p.scale = float3(material_texture(m, TEXTURE_OCCLUSION, i.uv, one).x);
 
         GSurface s = (GSurface)0;
         s.normal = material_normal(i, m);
