@@ -10,6 +10,7 @@ use rayon::prelude::*;
 use serde::Deserialize;
 
 use super::maps::{self, FAIL, Map, Opacity, OpacityRead, PASS, Ranges, Raster};
+use crate::texture::Wrap;
 
 const STATES: OpacityStates = OpacityStates::Four;
 
@@ -200,6 +201,12 @@ impl<'a> OmmRead<'a> {
         Some(Self { read, alpha })
     }
 
+    /// Whether mapped uvs `p` read the texture as the rasterizer's sampler does, which repeats.
+    fn repeats_over(&self, p: &[[f64; 2]; 3]) -> bool {
+        let within = |a: usize| p.iter().all(|c| (0.0..=1.0).contains(&c[a]));
+        (0..2).all(|a| self.read.mip0.wrap[a] == Wrap::Repeat || within(a))
+    }
+
     /// Which sides of the cutoff a bilinear sample on uv triangle `tri` can read.
     fn sides(&self, tri: [[f32; 2]; 3]) -> u8 {
         let mip0 = &self.read.mip0;
@@ -271,7 +278,8 @@ impl Map<OmmRead<'_>> {
 
 /// Triangles of a cluster rasterized alike, measured together.
 struct Batch<'a> {
-    /// The texture each lies whole in; `None` for triangles that reach past one.
+    /// The texture each lies whole in, which the rasterizer can read; `None` for triangles that
+    /// reach past one or past an edge it reads otherwise.
     read: Option<&'a OmmRead<'a>>,
     /// Texels a side of the largest texture they read, which their levels aim at.
     size: [u32; 2],
@@ -294,8 +302,10 @@ fn batches<'a>(alpha: &'a Map<OmmRead<'a>>, uvs: &[[f32; 2]], tris: &[[u8; 3]]) 
             last = Some((p.read, p.uv));
             true
         });
-        let (read, corners) = match last.filter(|_| parts == 1) {
-            Some((r, p)) => (Some(r), p.map(|c| narrow(r.read.mip0.mapped(c)))),
+        let whole = last.filter(|_| parts == 1);
+        let whole = whole.map(|(r, p)| (r, p.map(|c| r.read.mip0.mapped(c))));
+        let (read, corners) = match whole.filter(|(r, p)| r.repeats_over(p)) {
+            Some((r, p)) => (Some(r), p.map(narrow)),
             None => (None, uv.map(|c| narrow(alpha.mapped(c)))),
         };
         let alike = |b: &Batch<'a>| {
@@ -609,8 +619,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ClusterOmm, FAIL, Map, OMM_STATE_OPAQUE, OMM_STATE_TRANSPARENT, OmmAlpha, OmmRead,
-        OmmSettings, Opacity, OpacityRead, PASS, cluster_omm, remap,
+        ClusterOmm, FAIL, Map, OMM_OPAQUE, OMM_STATE_OPAQUE, OMM_STATE_TRANSPARENT, OmmAlpha,
+        OmmRead, OmmSettings, Opacity, OpacityRead, PASS, cluster_omm, remap,
     };
     use crate::mesh::maps::{Raster, Tiles};
     use crate::texture::Wrap;
@@ -787,6 +797,25 @@ mod tests {
         let mut seen = [0; 3];
         walk(&m, 0, level, uvs, &mut seen);
         assert!(seen.iter().all(|&n| n > 20), "{seen:?}");
+    }
+
+    /// Past an edge, a triangle reads what the wrap says and not what repeating would: over the
+    /// opaque half of a tile and on past it, clamping and mirroring stay opaque all the way.
+    #[test]
+    fn a_triangle_past_an_edge_reads_through_the_images_wrap() {
+        let uvs = [[0.75, 0.25], [1.45, 0.25], [0.75, 0.75]];
+        let wrapped = |wrap: Wrap| {
+            let mut read = opacity(32, false);
+            read.mip0.wrap = [wrap; 2];
+            cluster(Map::Image(read), &uvs, &[[0, 1, 2]], &settings(4))
+        };
+        for wrap in [Wrap::Clamp, Wrap::Mirror] {
+            assert_eq!(wrapped(wrap).indices, [i32::from(OMM_OPAQUE)], "{wrap:?}");
+        }
+        assert!(
+            wrapped(Wrap::Repeat).indices[0] >= 0,
+            "the left half repeats in"
+        );
     }
 
     #[test]
