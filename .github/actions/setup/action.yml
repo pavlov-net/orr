@@ -1,14 +1,6 @@
 name: setup
 description: Installs the pinned Rust toolchain and tools, and restores the build caches.
 
-inputs:
-  cache-key:
-    description: Names the Rust cache. Jobs that compile the same way share one.
-    required: true
-  dlss:
-    description: Fetch the DLSS SDK and what bindgen needs, so orr_dlss compiles against NGX.
-    default: "false"
-
 runs:
   using: composite
   steps:
@@ -17,7 +9,6 @@ runs:
       run: rustup toolchain install
     - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
-        shared-key: ${{ inputs.cache-key }}
         save-if: ${{ github.ref == 'refs/heads/main' }}
     - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
@@ -26,7 +17,7 @@ runs:
     - name: Fetch pinned tools
       shell: bash
       env:
-        ORR_FETCH_DLSS: ${{ inputs.dlss == 'true' && '1' || '0' }}
+        ORR_FETCH_DLSS: ${{ runner.os == 'Windows' && '1' || '0' }}
       run: bash tools/fetch-slang.sh
     # Apple targets compile every kernel into Metal libraries, and Xcode ships the Metal
     # compiler as a separate component.
@@ -35,7 +26,7 @@ runs:
       shell: bash
       run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
     - name: Point the build at the DLSS SDK
-      if: inputs.dlss == 'true'
+      if: runner.os == 'Windows'
       shell: pwsh
       run: |
         "DLSS_SDK=${{ github.workspace }}\.tools\DLSS" >> $env:GITHUB_ENV
