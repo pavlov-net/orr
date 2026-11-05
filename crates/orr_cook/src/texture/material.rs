@@ -11,12 +11,12 @@
 //!   map gets a roughness texture even when its roughness is constant. At the quality levels
 //!   that keep source mips, roughness that keeps them, and roughness beside a normal map
 //!   that keeps them, takes none.
-//! - Emission and subsurface color: BC7 sRGB. A float image's emission is BC6H under USD and
-//!   MaterialX, which range it past 1; glTF's emissive values stop at 1.
+//! - Emission and subsurface color: BC7 sRGB. Emission that can read past 1 is BC6H, as
+//!   [`Packer::past_one`] says.
 //! - Specular weight (the specular texture's alpha), coat and transmission weights (red):
 //!   BC4 each. Coat and transmission factors are folded into their texels and set to 1;
-//!   the specular weight texture multiplies `specular_weight`. A float image's specular weight
-//!   is R16_SFLOAT under USD and MaterialX, which range it past 1.
+//!   the specular weight texture multiplies `specular_weight`. A specular weight that can read
+//!   past 1 is R16_SFLOAT.
 //! - Displacement: R16 unorm from red, never collapsed; displacement is
 //!   `displacement_scale x texel + displacement_offset`. A height `h` stores across the
 //!   range `lo..hi` the image measures, as `(h - lo) / (hi - lo)`, with the scale and offset
@@ -589,13 +589,19 @@ impl<'a> Packer<'a> {
         self.constant(r, c).map(|v| v.clamp(0.0, 1.0))
     }
 
-    /// [`Self::constant_weight`], or with `hdr` of an input ranging over 0 and up, with a float
-    /// image's texels also within 1/255 of their own size: no 8-bit step limits them, and a dim
-    /// image can be multiplied by any luminance.
-    fn constant_ranged(&self, r: &TexRef, c: usize, hdr: bool) -> Option<f32> {
-        if !hdr {
-            return self.constant_weight(r, c);
-        }
+    /// Whether emission or specular weight `r` can read past 1: USD and MaterialX range them over
+    /// 0 and up, where glTF's stop at 1, and a float image or a remap past it reaches there. A
+    /// color's remap stops at 1, short of rounding, with its field holding the rest.
+    fn past_one(&self, r: &TexRef) -> bool {
+        let reaches = |[a, b]: [f32; 2]| a.max(a + b) > 1.0 + 1e-6;
+        r.rules != ImageRules::Gltf
+            && (self.image(r.image).float || r.remap.is_some_and(|m| m.into_iter().any(reaches)))
+    }
+
+    /// [`Self::constant`] of an input [`Self::past_one`], from 0 up, with a float image's texels
+    /// also within 1/255 of their own size: no 8-bit step limits them, and a dim image can be
+    /// multiplied by any luminance.
+    fn constant_ranged(&self, r: &TexRef, c: usize) -> Option<f32> {
         let (lo, hi) = self.range(r, c);
         let held = !self.image(r.image).float || hi - lo <= hi.abs() / 255.0;
         self.constant(r, c).filter(|_| held).map(|v| v.max(0.0))
@@ -925,9 +931,9 @@ impl<'a> Packer<'a> {
             self.color(suffix, m, r, slot::SUBSURFACE_COLOR, true)?;
         }
         if let Some(r) = &t.specular {
-            let hdr = r.rules != ImageRules::Gltf;
+            let hdr = self.past_one(r);
             let constant = if hdr {
-                self.constant_ranged(r, usize::from(r.channel), true)
+                self.constant_ranged(r, usize::from(r.channel))
                     .map(|v| r.read(0, v).max(0.0))
             } else {
                 self.constant_input(r)
@@ -935,7 +941,7 @@ impl<'a> Packer<'a> {
             match constant {
                 Some(v) => m.specular_weight *= v,
                 None => {
-                    let encoding = if hdr && self.image(r.image).float {
+                    let encoding = if hdr {
                         Encoding::Raw(DataFormat::R16f)
                     } else {
                         Encoding::Bc4
@@ -1052,8 +1058,16 @@ impl<'a> Packer<'a> {
             _ => ("subsurface_color", |m| &mut m.subsurface_color),
         };
         let srgb = r.srgb.unwrap_or(self.image(r.image).srgb);
-        let hdr = s == slot::EMISSION && r.rules != ImageRules::Gltf;
-        let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant_ranged(r, c, hdr)).collect();
+        let hdr = s == slot::EMISSION && self.past_one(r);
+        let rgb: Vec<Option<f32>> = (0..3)
+            .map(|c| {
+                if hdr {
+                    self.constant_ranged(r, c)
+                } else {
+                    self.constant_weight(r, c)
+                }
+            })
+            .collect();
         if rgb.iter().all(Option::is_some) {
             let texel: [f32; 3] = std::array::from_fn(|c| {
                 let v = rgb[c].expect("constant");
@@ -1078,7 +1092,7 @@ impl<'a> Packer<'a> {
             suffix,
             Pack {
                 role,
-                encoding: if hdr && self.image(r.image).float {
+                encoding: if hdr {
                     Encoding::Bc6h
                 } else {
                     Encoding::Bc7Srgb
@@ -1561,7 +1575,8 @@ impl TextureJob {
     /// The packed texture of `decoded` source images, each `w` x `h`.
     fn pack(&self, decoded: &HashMap<usize, Arc<Img>>, [w, h]: [u32; 2]) -> Img {
         // Apart from normals, BC4 and BC5 hold weights, and a float weight has no upper limit: a
-        // source texel clamps before its factor, as a constant does.
+        // source texel clamps before its factor, as a constant does. A float weight's remap can
+        // reach below 0 where no format of 0..1 would store it, and a negative weight has no IOR.
         let limit = match self.pack.encoding {
             Encoding::Bc4 | Encoding::Bc5 if !self.pack.normal => Some(1.0),
             Encoding::Raw(DataFormat::R16f) => Some(f32::INFINITY),
@@ -1602,7 +1617,12 @@ impl TextureJob {
                             } else {
                                 s[channel]
                             };
-                            t[c] = a + b * limit.map_or(v, |l| v.clamp(0.0, l));
+                            let read = a + b * limit.map_or(v, |l| v.clamp(0.0, l));
+                            t[c] = if limit == Some(f32::INFINITY) {
+                                read.max(0.0)
+                            } else {
+                                read
+                            };
                         });
                 }
             }
