@@ -83,8 +83,8 @@ fn perf_bindings() {
         .allowlist_type("NV(PW|PA)_.*")
         .allowlist_var("NV(PW|PA)_.*")
         .layout_tests(false);
-    if let Some(vulkan) = env::var_os("VULKAN_SDK").map(PathBuf::from) {
-        builder = builder.clang_arg(format!("-I{}", vulkan.join("Include").display()));
+    if let Some(include) = vulkan_include() {
+        builder = builder.clang_arg(format!("-I{}", include.display()));
     }
     builder
         .generate()
@@ -107,4 +107,13 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
             (e.file_name() == name).then_some(path)
         }
     })
+}
+
+/// The Windows SDK names it `Include`; the Linux SDK and Vulkan-Headers name it `include`.
+fn vulkan_include() -> Option<PathBuf> {
+    let sdk = PathBuf::from(env::var_os("VULKAN_SDK").filter(|s| !s.is_empty())?);
+    ["Include", "include"]
+        .into_iter()
+        .map(|d| sdk.join(d))
+        .find(|d| d.is_dir())
 }

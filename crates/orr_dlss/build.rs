@@ -69,12 +69,21 @@ fn main() {
         .allowlist_type("NVSDK_NGX_.*")
         .allowlist_var("NVSDK_NGX_.*")
         .layout_tests(false);
-    if let Some(vulkan) = std::env::var_os("VULKAN_SDK").map(PathBuf::from) {
-        builder = builder.clang_arg(format!("-I{}", vulkan.join("Include").display()));
+    if let Some(include) = vulkan_include() {
+        builder = builder.clang_arg(format!("-I{}", include.display()));
     }
     builder
         .generate()
         .expect("NGX bindings (needs clang and the Vulkan SDK headers at VULKAN_SDK)")
         .write_to_file(out.join("ngx.rs"))
         .expect("write NGX bindings");
+}
+
+/// The Windows SDK names it `Include`; the Linux SDK and Vulkan-Headers name it `include`.
+fn vulkan_include() -> Option<PathBuf> {
+    let sdk = PathBuf::from(std::env::var_os("VULKAN_SDK").filter(|s| !s.is_empty())?);
+    ["Include", "include"]
+        .into_iter()
+        .map(|d| sdk.join(d))
+        .find(|d| d.is_dir())
 }
