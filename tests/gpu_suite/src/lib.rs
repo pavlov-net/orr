@@ -15,7 +15,7 @@ use orr_gpu::{
 use orr_shaders::bytemuck::Pod;
 
 pub mod clusters;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub mod window;
 
 pub mod shaders {

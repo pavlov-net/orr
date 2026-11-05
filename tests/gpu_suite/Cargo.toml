@@ -23,6 +23,11 @@ windows = { version = "0.62.2", features = [
   "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+
 [dev-dependencies]
 orr_color.workspace = true
 ash.workspace = true
@@ -31,6 +36,10 @@ half = { workspace = true, features = ["bytemuck"] }
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }
+
+[[test]]
+name = "present"
+harness = false
 
 [lints]
 workspace = true
