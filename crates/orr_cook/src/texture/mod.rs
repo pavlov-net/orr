@@ -465,7 +465,7 @@ pub(crate) fn cook_file(
 /// The encoders and their preset, for cook keys; their crate versions enter through
 /// [`crate::key`].
 pub(crate) fn encoders(quality: Quality) -> String {
-    format!("bc7e for BC7, intel for BC4 BC5 BC6H, preset {quality:?}")
+    format!("bc7e for BC7, amd for BC4 BC5, intel for BC6H, preset {quality:?}")
 }
 
 fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result<Built, String> {

@@ -132,13 +132,16 @@ fn raw(d: DataFormat, m: &Img) -> Vec<u8> {
     out
 }
 
-/// ctt encoder, preset and input layout for each BCn encoding: bc7e for BC7, Intel ISPC
-/// for BC4, BC5 and BC6H. Encoders are always named, never picked automatically.
+/// ctt encoder, preset and input layout for each BCn encoding: bc7e for BC7, Compressonator
+/// for BC4 and BC5, Intel ISPC for BC6H. Encoders are always named, never picked automatically.
 fn bc(e: Encoding, quality: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<u8>>>, String> {
-    let (target, encoder) = match e {
+    let amd = || Encoder::Amd(Default::default());
+    let (target, encoder, input, bpp) = match e {
         Encoding::Bc7Srgb => (
             Format::BC7_SRGB_BLOCK,
             Encoder::Bc7enc(Bc7encSettings::default()),
+            Format::R8G8B8A8_SRGB,
+            4,
         ),
         Encoding::Bc7 => (
             Format::BC7_UNORM_BLOCK,
@@ -146,40 +149,44 @@ fn bc(e: Encoding, quality: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<
                 perceptual: false,
                 ..Bc7encSettings::default()
             }),
+            Format::R8G8B8A8_UNORM,
+            4,
         ),
-        Encoding::Bc5 => (Format::BC5_UNORM_BLOCK, Encoder::Intel(Default::default())),
-        Encoding::Bc4 => (Format::BC4_UNORM_BLOCK, Encoder::Intel(Default::default())),
+        Encoding::Bc5 => (Format::BC5_UNORM_BLOCK, amd(), Format::R8G8_UNORM, 2),
+        Encoding::Bc4 => (Format::BC4_UNORM_BLOCK, amd(), Format::R8_UNORM, 1),
         Encoding::Bc6h => (
             Format::BC6H_UFLOAT_BLOCK,
             Encoder::Intel(Default::default()),
+            Format::R32G32B32A32_SFLOAT,
+            16,
         ),
         Encoding::Raw(_) => unreachable!("raw formats skip ctt"),
     };
-    let float = e == Encoding::Bc6h;
     let srgb = e == Encoding::Bc7Srgb;
+    let texel = |p: &[f32; 4], out: &mut Vec<u8>| match e {
+        Encoding::Bc6h => out.extend(
+            [p[0].max(0.0), p[1].max(0.0), p[2].max(0.0), 1.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes()),
+        ),
+        Encoding::Bc4 | Encoding::Bc5 => out.extend(p[..bpp].iter().map(|&v| unorm8(v))),
+        _ => {
+            let rgb = |v: f32| unorm8(if srgb { linear_to_srgb(v) } else { v });
+            out.extend([rgb(p[0]), rgb(p[1]), rgb(p[2]), unorm8(p[3])]);
+        }
+    };
     let inputs: Vec<Vec<Vec<u8>>> = chains
         .iter()
         .map(|c| {
             c.iter()
                 .map(|m| {
-                    if float {
-                        m.px.iter()
-                            .flat_map(|p| [p[0].max(0.0), p[1].max(0.0), p[2].max(0.0), 1.0])
-                            .flat_map(f32::to_le_bytes)
-                            .collect()
-                    } else {
-                        m.px.iter()
-                            .flat_map(|p| {
-                                let rgb = |v: f32| unorm8(if srgb { linear_to_srgb(v) } else { v });
-                                [rgb(p[0]), rgb(p[1]), rgb(p[2]), unorm8(p[3])]
-                            })
-                            .collect()
-                    }
+                    let mut out = Vec::with_capacity(m.px.len() * bpp);
+                    m.px.iter().for_each(|p| texel(p, &mut out));
+                    out
                 })
                 .collect()
         })
         .collect();
-    let bpp = if float { 16 } else { 4 };
     let image = ImageRef {
         surfaces: chains
             .iter()
@@ -192,7 +199,7 @@ fn bc(e: Encoding, quality: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<
                         width: m.w,
                         height: m.h,
                         depth: 1,
-                        stride: m.w * bpp,
+                        stride: m.w * bpp as u32,
                         slice_stride: 0,
                     })
                     .collect()
@@ -200,20 +207,16 @@ fn bc(e: Encoding, quality: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<
             .collect(),
         kind: TextureKind::Texture2D,
         desc: FormatDesc {
-            format: match (float, srgb) {
-                (true, _) => Format::R32G32B32A32_SFLOAT,
-                (false, true) => Format::R8G8B8A8_SRGB,
-                (false, false) => Format::R8G8B8A8_UNORM,
-            },
+            format: input,
             color_space: if srgb {
                 ColorSpace::Srgb
             } else {
                 ColorSpace::Linear
             },
-            alpha: if float {
-                AlphaMode::Opaque
-            } else {
+            alpha: if matches!(e, Encoding::Bc7 | Encoding::Bc7Srgb) {
                 AlphaMode::Straight
+            } else {
+                AlphaMode::Opaque
             },
         },
     };

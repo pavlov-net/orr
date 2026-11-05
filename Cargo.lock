@@ -486,6 +486,7 @@ dependencies = [
  "bytemuck",
  "ctt-astcenc",
  "ctt-bc7enc-rdo",
+ "ctt-compressonator",
  "ctt-intel-texture-compressor",
  "ddsfile",
  "fast_image_resize",
@@ -530,6 +531,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1df3c46c7563fa1d6d4bb339ab5249cc8f4c1c3438421ad1c1fd72ecf0e58d22"
 dependencies = [
  "ispc-build-utils",
+]
+
+[[package]]
+name = "ctt-compressonator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c7b8b3a78a65a55f97570932ebfdca2164979509bf373cf84cb1424a5453185"
+dependencies = [
+ "cc",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
