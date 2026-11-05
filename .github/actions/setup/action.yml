@@ -1,0 +1,54 @@
+name: setup
+description: Installs the pinned Rust toolchain and tools, and restores the build caches.
+
+inputs:
+  dlss:
+    description: Fetch the DLSS SDK and what bindgen needs, so orr_dlss compiles against NGX.
+    default: "false"
+  llvm:
+    description: The LLVM release bindgen loads libclang from when dlss is on.
+    default: "19.1.7"
+
+runs:
+  using: composite
+  steps:
+    - name: Install the Rust toolchain
+      shell: bash
+      run: rustup toolchain install
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .tools/dl
+        key: tools-dl-${{ runner.os }}-${{ hashFiles('tools/fetch-slang.sh') }}
+    - name: Fetch pinned tools
+      shell: bash
+      env:
+        ORR_FETCH_DLSS: ${{ inputs.dlss == 'true' && '1' || '0' }}
+      run: bash tools/fetch-slang.sh
+    # Apple targets compile every kernel into Metal libraries, and Xcode ships the Metal
+    # compiler as a separate component.
+    - name: Install the Metal toolchain
+      if: runner.os == 'macOS'
+      shell: bash
+      run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+    # Blacksmith's Windows image has no libclang, which bindgen loads.
+    - name: Cache LLVM
+      if: inputs.dlss == 'true'
+      id: llvm
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: C:\Program Files\LLVM
+        key: llvm-windows-${{ inputs.llvm }}
+    - name: Install LLVM
+      if: inputs.dlss == 'true' && steps.llvm.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: choco install llvm --version=${{ inputs.llvm }} -y --no-progress
+    - name: Point the build at the DLSS SDK
+      if: inputs.dlss == 'true'
+      shell: pwsh
+      run: |
+        "DLSS_SDK=${{ github.workspace }}\.tools\DLSS" >> $env:GITHUB_ENV
+        "VULKAN_SDK=${{ github.workspace }}\.tools\vulkan-headers" >> $env:GITHUB_ENV
+        "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV

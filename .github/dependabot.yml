@@ -21,7 +21,9 @@ updates:
           - major
 
   - package-ecosystem: github-actions
-    directory: /
+    directories:
+      - /
+      - /.github/actions/*
     schedule:
       interval: daily
       time: "06:00"

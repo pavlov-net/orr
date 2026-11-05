@@ -2,56 +2,43 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  check:
+  # Without the DLSS SDK, so this builds the path lint does not.
+  test:
     strategy:
       fail-fast: false
       matrix:
-        # macOS is the only platform that builds the Metal backend, so it is what catches a
-        # Vulkan-side change that breaks it.
-        os: [ubuntu-latest, windows-latest, macos-26]
+        os: [blacksmith-8vcpu-windows-2025, blacksmith-6vcpu-macos-26]
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: ./.github/actions/setup
+      # groups_match_spectral_color takes minutes on 32 threads, and runners have 6 or 8.
+      - name: Run the tests that need no GPU
+        run: cargo run --locked -p xtask -- test --no-gpu -- --skip groups_match_spectral_color
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
         with:
-          path: .tools/dl
-          key: tools-dl-${{ runner.os }}-${{ hashFiles('tools/fetch-slang.sh') }}
-      - name: Fetch pinned tools
-        run: bash tools/fetch-slang.sh
-      # Apple targets compile every kernel into Metal libraries, and Xcode ships the Metal
-      # compiler as a separate component.
-      - name: Install the Metal toolchain
-        if: runner.os == 'macOS'
-        run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
-      # Every crate, test and example builds on both platforms; this is what catches a
-      # commit that does not build on its own.
-      - name: Check the workspace
-        run: cargo check --workspace --all-targets
-      # What Apple targets build: orr without DLSS.
+          name: test-logs-${{ matrix.os }}
+          path: target/test-logs
+
+  # What Apple targets build: orr without DLSS. Lint covers the default features.
+  no-dlss:
+    runs-on: blacksmith-8vcpu-windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
       - name: Check the workspace without DLSS
-        if: runner.os != 'macOS'
-        run: cargo check --workspace --all-targets --no-default-features
-      - name: Test file IO
-        run: cargo test -p orr_io
-
-  fmt:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-  typos:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: crate-ci/typos@4c8b7f51ca60df14e3c5ca82770dfbbe6c3dae85 # v1.52.0
+        run: cargo check --workspace --all-targets --locked --no-default-features
