@@ -46,6 +46,10 @@ pub mod material_flags {
 
 /// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
 const TILED: u32 = 1 << 10;
+/// `TEXTURE_UV_SET`, `TEXTURE_CHANNEL_SHIFT` and `TEXTURE_PRIMARIES_SHIFT`.
+const UV_SET: u32 = 1 << 11;
+const CHANNEL_SHIFT: u32 = 12;
+const PRIMARIES_SHIFT: u32 = 16;
 
 /// A texture bound to a cooked material: its heap index, its
 /// [`TextureHeader::primaries`](orr_pack::texture::TextureHeader::primaries) and the sampler of
@@ -99,7 +103,14 @@ pub fn binding_sampler(b: &TextureBinding) -> SamplerDesc {
 /// past theirs, where they could claim a tile table `t` doesn't have.
 fn binding_modes(b: &TextureBinding, t: &BoundTexture) -> u32 {
     let tiled = if t.tiles == GpuPtr::NULL { 0 } else { TILED };
-    u32::from(b.wrap[0] & 7) | u32::from(b.wrap[1] & 7) << 3 | u32::from(b.filter & 15) << 6 | tiled
+    let uv_set = if b.uv_set & 1 != 0 { UV_SET } else { 0 };
+    u32::from(b.wrap[0] & 7)
+        | u32::from(b.wrap[1] & 7) << 3
+        | u32::from(b.filter & 15) << 6
+        | tiled
+        | uv_set
+        | u32::from(b.channels & 15) << CHANNEL_SHIFT
+        | u32::from(t.primaries & 3) << PRIMARIES_SHIFT
 }
 
 /// The `orr_shaders.trace` candidate class of a model whose sections have material flags `flags`:
@@ -167,12 +178,6 @@ impl MaterialGpu {
             u32::from(lobes)
         };
         flags |= cost << f::COST_SHIFT;
-        let (mut uv_sets, mut channels, mut primaries) = (0u32, 0u64, 0u32);
-        for (i, b) in m.textures.iter().enumerate() {
-            uv_sets |= u32::from(b.uv_set & 1) << i;
-            channels |= u64::from(b.channels & 15) << (4 * i);
-            primaries |= u32::from(textures[i].primaries & 3) << (2 * i);
-        }
         Self {
             base_color: rec2020(m.base_color),
             base_weight: m.base_weight,
@@ -217,10 +222,6 @@ impl MaterialGpu {
                 sampler: textures[i].sampler,
                 modes: binding_modes(&m.textures[i], &textures[i]),
             }),
-            uv_sets,
-            channels_lo: channels as u32,
-            channels_hi: (channels >> 32) as u32,
-            primaries,
             surface: u32::from(m.surface),
             tangent_set: u32::from(m.tangent_set()),
             transmission_dispersion_scale: m.transmission_dispersion_scale,
@@ -420,12 +421,14 @@ mod tests {
         };
         let g = MaterialGpu::new(&m, &textures);
         assert_ne!(g.flags & material_flags::DISPLACED, 0);
-        assert_eq!(g.channels_hi, 3, "slot 8 reads from channel 3");
-        assert_eq!(g.uv_sets, 1 << slot::NORMAL);
+        let modes = g.samplers[slot::DISPLACEMENT].modes;
+        assert_eq!(modes >> CHANNEL_SHIFT & 15, 3);
         assert_eq!(
-            g.primaries,
-            u32::from(Primaries::Rec2020.id()) << (2 * slot::DISPLACEMENT)
+            modes >> PRIMARIES_SHIFT & 3,
+            u32::from(Primaries::Rec2020.id())
         );
+        assert_ne!(g.samplers[slot::NORMAL].modes & UV_SET, 0);
+        assert_eq!(modes & UV_SET, 0);
         assert_eq!(g.textures[slot::DISPLACEMENT], TextureIndex(4));
         m.textures[slot::NORMAL].wrap = [0xff; 2];
         m.textures[slot::NORMAL].filter = 0xff;

@@ -55,6 +55,13 @@ public static const uint TEXTURE_MIP_NEAREST = 1 << 8;
 public static const uint TEXTURE_ONE_MIP = 1 << 9;
 // The slot reads a tile set through `MaterialGpu.tiles`.
 public static const uint TEXTURE_TILED = 1 << 10;
+// The uv set it reads, its first channel and its texture's primaries (0 Rec.709, 1 Display P3,
+// 2 Rec.2020).
+public static const uint TEXTURE_UV_SET = 1 << 11;
+public static const uint TEXTURE_CHANNEL_SHIFT = 12;
+public static const uint TEXTURE_CHANNEL_MASK = 15;
+public static const uint TEXTURE_PRIMARIES_SHIFT = 16;
+public static const uint TEXTURE_PRIMARIES_MASK = 3;
 // orr_pack::tiles::HEADER_WORDS.
 public static const uint TEXTURE_TILES_HEADER = 16;
 
@@ -148,10 +155,6 @@ public struct MaterialGpu
     public float displacement_max;
     public TextureIndex textures[TEXTURE_SLOTS];
     public TextureSamplerGpu samplers[TEXTURE_SLOTS];
-    public uint uv_sets;                    // 1 bit per slot
-    public uint channels_lo;                // 4 bits per slot: first channel read
-    public uint channels_hi;
-    public uint primaries;                  // 2 bits per slot: 0 Rec.709, 1 Display P3, 2 Rec.2020
     public uint surface;                    // linked surface id; 0 = StandardSurface
     public uint tangent_set;                // the uv set its tangent frame follows; TANGENT_SET_OTHER: neither
     public float transmission_dispersion_scale;
@@ -572,13 +575,6 @@ public bool material_bound(MaterialGpu* m, uint slot)
     return m.textures[slot].index != IMAGE_NONE;
 }
 
-// The first channel `slot` reads.
-uint material_channel(MaterialGpu* m, uint slot)
-{
-    uint bits = slot < 8 ? m.channels_lo >> (4 * slot) : m.channels_hi >> (4 * (slot - 8));
-    return bits & 15;
-}
-
 // Footprint `f` mapped by `slot`'s uv transform.
 public UvFootprint material_footprint(MaterialGpu* m, uint slot, UvFootprint f)
 {
@@ -616,7 +612,7 @@ public static const uint TANGENT_SET_OTHER = 2;
 // The uv set `slot` reads, 0 or 1.
 public uint material_uv_set(MaterialGpu* m, uint slot)
 {
-    return (m.uv_sets >> slot) & 1;
+    return (m.samplers[slot].modes & TEXTURE_UV_SET) != 0 ? 1 : 0;
 }
 
 // Whether `slot`, a bound one, reads a texture at `f.uv`, that texture being `t`. A tile set moves
@@ -647,7 +643,7 @@ public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint uv[2], flo
         return float4(m.outside[k], m.outside[k + 1], m.outside[k + 2], m.outside[k + 3]);
     }
     float4 v = texture_footprint(t, s, f, m.texture_streams);
-    uint c = material_channel(m, slot);
+    uint c = (s.modes >> TEXTURE_CHANNEL_SHIFT) & TEXTURE_CHANNEL_MASK;
     return c == 0 ? v : c == 1 ? float4(v.yzw, 1.0) : c == 2 ? float4(v.zw, 0.0, 1.0) : float4(v.w, 0.0, 0.0, 1.0);
 }
 
@@ -678,7 +674,7 @@ public float3 material_color(MaterialGpu* m, uint slot, UvFootprint uv[2], float
     if (!material_bound(m, slot))
         return factor;
     float3 texel = material_texture(m, slot, uv, float4(1.0)).rgb;
-    uint primaries = (m.primaries >> (2 * slot)) & 3;
+    uint primaries = (m.samplers[slot].modes >> TEXTURE_PRIMARIES_SHIFT) & TEXTURE_PRIMARIES_MASK;
     if (primaries == PRIMARIES_REC709)
         return mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, factor) * texel);
     if (primaries == PRIMARIES_DISPLAY_P3)
