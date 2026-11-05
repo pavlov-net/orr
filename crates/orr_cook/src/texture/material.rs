@@ -1096,12 +1096,14 @@ impl<'a> Packer<'a> {
                 self.stored_constant(r, c).is_some()
             }
         });
-        if held {
+        // A premultiplied file's color varies with its alpha.
+        let alpha = self.image(r.image).constant[3];
+        if held && (alpha.is_some() || !read.straight) {
             let [x, y, z] = [0, 1, 2].map(|c| {
                 let v = self.stored_constant(r, c).expect("constant");
                 v.clamp(0.0, top)
             });
-            let t = [x, y, z, 1.0];
+            let t = [x, y, z, alpha.unwrap_or(1.0)];
             let mut texel: [f32; 3] =
                 std::array::from_fn(|c| r.read(c, read.value(t, c)).clamp(0.0, top));
             if let Some(m) = &gamut {

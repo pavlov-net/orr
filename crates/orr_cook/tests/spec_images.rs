@@ -1042,6 +1042,110 @@ fn ktx2_blocks_state_primaries_to_importers_that_read_them() {
     assert_eq!(mips(&a, a.name(e)).0.header.primaries, 0);
 }
 
+/// A DDS of `w` x `h` `data`: legacy FourCC `four_cc`, or with `dx10` the DXGI format and alpha
+/// mode of a `DDS_HEADER_DXT10`.
+fn dds(four_cc: &[u8; 4], dx10: Option<(u32, u32)>, [w, h]: [u32; 2], data: &[u8]) -> Vec<u8> {
+    let mut f = vec![0u8; 128];
+    let mut put = |at: usize, v: u32| f[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    put(4, 124);
+    put(8, 0x1007);
+    put(12, h);
+    put(16, w);
+    put(76, 32);
+    put(80, 4);
+    put(108, 0x1000);
+    f[..4].copy_from_slice(b"DDS ");
+    f[84..88].copy_from_slice(four_cc);
+    if let Some((format, alpha)) = dx10 {
+        for v in [format, 3, 0, 1, alpha] {
+            f.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    f.extend_from_slice(data);
+    f
+}
+
+/// A file says its color is premultiplied by KTX 2.0 `KHR_DF_FLAG_ALPHA_PREMULTIPLIED` ("the
+/// images' RGB components have been multiplied by their alpha components"),
+/// `DDS_ALPHA_MODE_PREMULTIPLIED`, and the legacy DXT2 and DXT4 ("The only legacy file formats
+/// that indicate this information are 'DX2' and 'DX4'"). The material model's colors are straight,
+/// and the division is in linear light. Alpha 0 keeps what is stored.
+#[test]
+fn premultiplied_files_read_straight() {
+    let d = dir("premultiplied");
+    let texels = |x: u32, y: u32, rgba: [u8; 4], zero: [u8; 4]| {
+        let _ = y;
+        (if x < 4 { rgba } else { zero }).map(|c| f32::from(c) / 255.0)
+    };
+    let (rgba, zero) = ([128, 64, 32, 128], [128, 0, 0, 0]);
+    let file = float_ktx2(
+        8,
+        8,
+        ctt::TargetFormat::Uncompressed(ctt::Format::R8G8B8A8_UNORM),
+        false,
+        |x, y| texels(x, y, rgba, zero),
+    );
+    let mut srgb = with_dfd(&file, 1, 2, 1);
+    srgb[12..16].copy_from_slice(&43u32.to_le_bytes());
+    let a = 128.0 / 255.0;
+    let (_, [t, none]) = read_back(&d, &srgb);
+    assert_rgb(
+        t,
+        [linear(128.0) / a, linear(64.0) / a, linear(32.0) / a],
+        "KTX2",
+    );
+    assert_rgb(none, [linear(128.0), 0.0, 0.0], "KTX2 at alpha 0");
+    let (_, [t, _]) = read_back(&d, &with_dfd(&file, 1, 1, 0));
+    assert_rgb(t, [a, 64.0 / 255.0, 32.0 / 255.0], "straight KTX2");
+
+    let data: Vec<u8> = (0..64u32)
+        .flat_map(|i| if i % 8 < 4 { rgba } else { zero })
+        .collect();
+    let straight = [128.0 / 128.0, 64.0 / 128.0, 32.0 / 128.0];
+    let (_, [t, none]) = read_back(&d, &dds(b"DX10", Some((28, 2)), [8, 8], &data));
+    assert_rgb(t, straight, "DDS alpha mode");
+    assert_rgb(none, [a, 0.0, 0.0], "DDS at alpha 0");
+    let (_, [t, _]) = read_back(&d, &dds(b"DX10", Some((28, 1)), [8, 8], &data));
+    assert_rgb(
+        t,
+        [a, 64.0 / 255.0, 32.0 / 255.0],
+        "DDS straight alpha mode",
+    );
+
+    // One block, alpha 8/15 in DXT2 and 136/255 in DXT4 alike, over c0 = c1 = (16, 32, 8).
+    let color = [0x08u8, 0x84, 0x08, 0x84, 0, 0, 0, 0];
+    let mut dxt2 = vec![0x88u8; 8];
+    dxt2.extend_from_slice(&color);
+    let mut dxt4 = vec![136u8, 136, 0, 0, 0, 0, 0, 0];
+    dxt4.extend_from_slice(&color);
+    let want = [16.0 / 31.0, 32.0 / 63.0, 8.0 / 31.0]
+        .map(|c: f64| orr_color::srgb_decode(c) as f32 / (136.0 / 255.0));
+    for (name, block) in [(b"DXT2", dxt2), (b"DXT4", dxt4)] {
+        let (_, [t, _]) = read_back(&d, &dds(name, None, [4, 4], &block));
+        assert_rgb(t, want, "legacy block format");
+    }
+}
+
+/// A premultiplied file's blocks hold what no material reads as stored, so they don't pass, and
+/// a constant color folds only with its alpha: here alpha varies under flat RGB, which is no
+/// constant color.
+#[test]
+fn premultiplied_blocks_do_not_pass_or_fold() {
+    let d = dir("premultiplied_blocks");
+    let file = bc7_srgb(|x, _| [0.25, 0.25, 0.25, if x < 4 { 0.5 } else { 1.0 }]);
+    let file = with_dfd(&file, 1, 2, 1);
+    std::fs::write(d.join("t.ktx2"), &file).unwrap();
+    let (a, m, _) = usd(&d, "t.ktx2", "color3f inputs:diffuseColor", "rgb", "");
+    assert_ne!(m.textures[slot::BASE_COLOR].texture, AssetId::NONE);
+    let (_, texels) = stored(&a, &m, slot::BASE_COLOR, 8);
+    assert!(
+        texels[0][0] > texels[4][0] + 0.05,
+        "{:?} {:?}",
+        texels[0],
+        texels[4]
+    );
+}
+
 /// PNG §4.3, under this project's rule that plain files and USD's `auto` honor what they state:
 /// "the chunk with the lowest Priority number should take precedence", of `cICP`, `iCCP`, `sRGB`,
 /// then `cHRM` and `gAMA`. The same files through glTF are `image_color_metadata_is_ignored`.

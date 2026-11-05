@@ -19,7 +19,7 @@ use orr_pack::texture::{
 use orr_pack::{ArchiveWriter, AssetId, BcLayout, BlobIn, Class, Filter, Hash32, Span};
 use serde::Deserialize;
 
-use color::{Decode, ImageColor};
+use color::{Decode, ImageColor, Read};
 use ctt::Quality;
 pub(crate) use encode::{Encoding, encode as encode_chains};
 use load::{Blocks, Source};
@@ -565,6 +565,11 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
             return Err("environment maps have mips".into());
         }
         load::decode_layers(&mut src)?;
+        // Nothing lies behind an environment, so its stored color is the light it gives.
+        let read = Read {
+            straight: false,
+            ..read
+        };
         for p in src.layers.iter_mut().flat_map(|l| &mut l.px) {
             *p = read.color(*p, gamut.as_ref());
         }

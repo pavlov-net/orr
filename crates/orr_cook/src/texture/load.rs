@@ -102,7 +102,8 @@ pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
     let mut src = match Ktx2Blocks::of(bytes) {
         Some(k) => k.open()?,
         None => {
-            match decode_container(bytes, InputOverrides::default()).map_err(|e| e.to_string())? {
+            let dds = dds_with_known_blocks(bytes);
+            match decode_container(&dds, InputOverrides::default()).map_err(|e| e.to_string())? {
                 Some(image) => container(image, bytes)?,
                 None => file(bytes)?,
             }
@@ -125,6 +126,40 @@ pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
     Ok(src)
 }
 
+const DDS_MAGIC: &[u8] = b"DDS ";
+const DDS_FOUR_CC: usize = 84;
+const DDS_ALPHA_MODE: usize = 144;
+const DDS_ALPHA_MODE_PREMULTIPLIED: u32 = 2;
+
+/// A DDS file's bytes with DXT2 and DXT4 as DXT3 and DXT5, whose blocks they share: they differ
+/// in premultiplied alpha, which [`dds_premultiplied`] reads, and the DDS reader knows only those.
+fn dds_with_known_blocks(bytes: &[u8]) -> Cow<'_, [u8]> {
+    let same = match bytes.get(DDS_FOUR_CC..DDS_FOUR_CC + 4) {
+        _ if !bytes.starts_with(DDS_MAGIC) => return Cow::Borrowed(bytes),
+        Some(b"DXT2") => b"DXT3",
+        Some(b"DXT4") => b"DXT5",
+        _ => return Cow::Borrowed(bytes),
+    };
+    let mut patched = bytes.to_vec();
+    patched[DDS_FOUR_CC..DDS_FOUR_CC + 4].copy_from_slice(same);
+    Cow::Owned(patched)
+}
+
+/// Whether a DDS file states premultiplied alpha: by its legacy block format, or by the alpha
+/// mode in `miscFlags2` of its `DDS_HEADER_DXT10`.
+fn dds_premultiplied(bytes: &[u8]) -> bool {
+    match bytes.get(DDS_FOUR_CC..DDS_FOUR_CC + 4) {
+        Some(b"DXT2" | b"DXT4") => true,
+        Some(b"DX10") => bytes
+            .get(DDS_ALPHA_MODE..DDS_ALPHA_MODE + 4)
+            .is_some_and(|b| {
+                let flags = u32::from_le_bytes(b.try_into().expect("4 bytes"));
+                flags & 7 == DDS_ALPHA_MODE_PREMULTIPLIED
+            }),
+        _ => false,
+    }
+}
+
 /// What a KTX2 file's DFD states of `format`. A file's `_SRGB` format decodes on any sampler, so
 /// it stands over a transfer function that disagrees.
 fn ktx2_color(reader: &ktx2::Reader<&[u8]>, format: ctt::Format, numeric: bool) -> FileColor {
@@ -139,6 +174,7 @@ fn ktx2_color(reader: &ktx2::Reader<&[u8]>, format: ctt::Format, numeric: bool) 
             stated
         }),
         gamut: reader.color_primaries().and_then(color::ktx2_gamut),
+        premultiplied: reader.is_alpha_premultiplied() == Some(true),
         numeric,
         ..Default::default()
     }
@@ -154,6 +190,7 @@ fn container_color(bytes: &[u8], format: ctt::Format, srgb: bool, numeric: bool)
             } else {
                 Transfer::Linear
             }),
+            premultiplied: dds_premultiplied(bytes),
             numeric,
             ..Default::default()
         },

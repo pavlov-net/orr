@@ -269,6 +269,7 @@ impl ImageColor {
         let read = Read {
             decode: self.decode(f),
             icc,
+            straight: f.premultiplied,
         };
         (read, primaries, matrix)
     }
@@ -308,16 +309,22 @@ pub(crate) struct Read {
     pub(crate) decode: Decode,
     /// Stands in for `decode`'s transfer on red, green and blue.
     pub(crate) icc: Option<Icc>,
+    /// Color comes out straight from a file that stores it premultiplied.
+    pub(crate) straight: bool,
 }
 
 impl Read {
     pub(crate) fn of(decode: Decode) -> Self {
-        Self { decode, icc: None }
+        Self {
+            decode,
+            icc: None,
+            straight: false,
+        }
     }
 
     /// Whether this is `decode` alone, so that blocks stored under `decode` hold what it reads.
     pub(crate) fn is(&self, decode: Decode) -> bool {
-        self.decode == decode && self.icc.is_none()
+        self.decode == decode && self.icc.is_none() && !self.straight
     }
 
     /// The color of stored texel `t`, through `gamut`, with its alpha.
@@ -326,6 +333,7 @@ impl Read {
             Some(icc) => icc.linear([0, 1, 2].map(|c| self.decode.signal(t[c]))),
             None => [0, 1, 2].map(|c| self.decode.value(t[c])),
         };
+        let rgb = rgb.map(|v| self.unmultiplied(v, t[3]));
         let [r, g, b] = gamut.map_or(rgb, |m| multiply(m, rgb));
         [r, g, b, t[3]]
     }
@@ -335,7 +343,19 @@ impl Read {
         if self.icc.is_some() && c < 3 {
             return self.color(t, None)[c];
         }
-        self.decode.value(t[c])
+        self.unmultiplied(self.decode.value(t[c]), t[3])
+    }
+
+    /// Linear `v` straight from a file that stores it premultiplied by `alpha`. Division by alpha
+    /// recovers no color where alpha is 0, and OpenEXR allows color there, as light that covers
+    /// nothing: it stays as stored.
+    fn unmultiplied(&self, v: f32, alpha: f32) -> f32 {
+        let straight = v / alpha;
+        if self.straight && alpha > 0.0 && straight.is_finite() {
+            straight
+        } else {
+            v
+        }
     }
 }
 
@@ -347,6 +367,8 @@ pub(crate) struct FileColor {
     /// See [`Decode::narrow`].
     pub(crate) narrow: Option<[f32; 2]>,
     pub(crate) icc: Option<Icc>,
+    /// RGB values have been multiplied by alpha, in linear light.
+    pub(crate) premultiplied: bool,
     /// It stores floats or signed values, which the sRGB curve doesn't encode.
     pub(crate) numeric: bool,
     /// It stores 8 bits in each of 3 or 4 channels.
