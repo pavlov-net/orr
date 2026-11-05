@@ -23,6 +23,7 @@ usage: cargo run -p xtask -- test [OPTIONS] [FILTER...] [-- TEST_ARGS...]
                  orr_cook. or doc
   --skip FILTER  leave out targets whose name contains it; repeatable
   --fast         leave out the slow targets
+  --no-gpu       leave out the targets that need a GPU or a display
   --jobs N       targets to run at once (default 3)
   --list         print the selected targets and stop
   TEST_ARGS      passed to every test executable
@@ -55,6 +56,37 @@ const SLOW: &[&str] = &[
     "orr_atmosphere.reference",
     "scene_suite.renderer",
 ];
+
+/// Packages whose integration tests all need a GPU. Their libraries' tests don't.
+const GPU_PACKAGES: &[&str] = &[
+    "atmosphere_suite",
+    "gpu_suite",
+    "lighting_suite",
+    "output_suite",
+    "pack_suite",
+    "scene_suite",
+];
+
+/// The other targets that need a GPU, or for `orr_output.display_watch`, a real display.
+const GPU_TARGETS: &[&str] = &[
+    "orr_examples.screenshots",
+    "lighting_math.gpu",
+    "openpbr_ref.gpu",
+    "orr_dlss.fg",
+    "orr_dlss.mock",
+    "orr_dlss.rr",
+    "orr_output.display_watch",
+    "shader_abi.crash",
+    "shader_abi.kernels",
+    "shader_link.gpu",
+];
+
+fn needs_gpu(name: &str) -> bool {
+    GPU_TARGETS.contains(&name)
+        || name
+            .split_once('.')
+            .is_some_and(|(package, target)| target != "lib" && GPU_PACKAGES.contains(&package))
+}
 
 /// What the workspace pass and the doc tests build.
 const WORKSPACE: &[&str] = &[
@@ -98,6 +130,7 @@ struct Options {
     filters: Vec<String>,
     skips: Vec<String>,
     fast: bool,
+    no_gpu: bool,
     jobs: usize,
     list: bool,
     test_args: Vec<String>,
@@ -109,6 +142,7 @@ impl Options {
             filters: Vec::new(),
             skips: Vec::new(),
             fast: false,
+            no_gpu: false,
             jobs: DEFAULT_JOBS,
             list: false,
             test_args: Vec::new(),
@@ -118,6 +152,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => return Ok(None),
                 "--fast" => options.fast = true,
+                "--no-gpu" => options.no_gpu = true,
                 "--list" => options.list = true,
                 "--skip" => options
                     .skips
@@ -141,10 +176,11 @@ impl Options {
         (self.filters.is_empty() || self.filters.iter().any(|f| name.contains(f.as_str())))
             && !self.skips.iter().any(|f| name.contains(f.as_str()))
             && !(self.fast && SLOW.contains(&name))
+            && !(self.no_gpu && needs_gpu(name))
     }
 
     fn narrowed(&self) -> bool {
-        self.fast || !self.filters.is_empty() || !self.skips.is_empty()
+        self.fast || self.no_gpu || !self.filters.is_empty() || !self.skips.is_empty()
     }
 }
 
