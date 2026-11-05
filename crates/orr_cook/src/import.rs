@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use orr_math::{DMat3, DVec3, Mat3, Mat4};
+use orr_math::{DMat3, DMat4, DVec3, Mat3};
 use orr_pack::clip::Clip;
 use orr_pack::material::Material;
 use orr_pack::skeleton::SkeletonInfo;
@@ -99,7 +99,7 @@ pub(crate) struct SceneMaterial {
 
 /// Copies whose linear transform collapses: the transform, for the importer to bake into a
 /// model of its own, and the copies of that model, placed by translation alone.
-pub(crate) type Baked = (Mat4, Vec<Placed>);
+pub(crate) type Baked = (DMat4, Vec<Placed>);
 
 pub(crate) fn largest(m: DMat3) -> f64 {
     m.to_cols_array()
@@ -148,16 +148,17 @@ pub(crate) fn normal_matrix(l: DMat3) -> DMat3 {
 
 /// The copies `transforms` place: those an instance can hold, then the rest by linear
 /// transform.
-pub(crate) fn placements(transforms: &[Mat4]) -> Result<(Vec<Placed>, Vec<Baked>), String> {
+pub(crate) fn placements(transforms: &[DMat4]) -> Result<(Vec<Placed>, Vec<Baked>), String> {
     let mut placed = Vec::new();
     let mut baked: Vec<Baked> = Vec::new();
-    let mut baked_of: HashMap<[u32; 16], usize> = HashMap::new();
+    let mut baked_of: HashMap<[u32; 9], usize> = HashMap::new();
     for (i, m) in transforms.iter().enumerate() {
-        if !m.is_finite() {
+        if !m.as_mat4().is_finite() {
             return Err(format!("the transform of copy {i} is not finite"));
         }
-        let position = m.w_axis.truncate().as_dvec3();
-        let l = Mat3::from_mat4(*m);
+        let position = m.w_axis.truncate();
+        let exact = DMat3::from_mat4(*m);
+        let l = exact.as_mat3();
         if !collapses(l.as_dmat3()) {
             placed.push(Placed {
                 position,
@@ -165,12 +166,11 @@ pub(crate) fn placements(transforms: &[Mat4]) -> Result<(Vec<Placed>, Vec<Baked>
             });
             continue;
         }
-        let linear = Mat4::from_mat3(l);
         // Adding zero turns -0.0 into 0.0: copies scaled to zero differ only in such signs.
         let k = *baked_of
-            .entry(linear.to_cols_array().map(|x| (x + 0.0).to_bits()))
+            .entry(l.to_cols_array().map(|x| (x + 0.0).to_bits()))
             .or_insert_with(|| {
-                baked.push((linear, Vec::new()));
+                baked.push((DMat4::from_mat3(exact), Vec::new()));
                 baked.len() - 1
             });
         baked[k].1.push(Placed {

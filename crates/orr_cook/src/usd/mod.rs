@@ -429,6 +429,7 @@ impl<'s> Importer<'s> {
             .collect();
         for (m, transforms) in instances {
             let name = models[m].name.clone().unwrap_or_default();
+            let transforms: Vec<DMat4> = transforms.iter().map(Mat4::as_dmat4).collect();
             let (direct, baked) = placements(&transforms).map_err(|e| format!("{name}: {e}"))?;
             if direct.is_empty() {
                 holders[m].clear();
@@ -436,7 +437,7 @@ impl<'s> Importer<'s> {
             placed.insert(m, direct);
             for (k, (linear, copies)) in baked.into_iter().enumerate() {
                 placed.insert(models.len(), copies);
-                holders[m].push((models.len(), linear.as_dmat4()));
+                holders[m].push((models.len(), linear));
                 models.push(Building::new(Some(format!("{name}/baked/{k}")), None, None));
             }
         }

@@ -55,7 +55,7 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     (
         Class::Skeleton as u16,
         1,
-        "f25f68b7725693f72ee4f443041e59d65d338a617199c4f541910bfef08bf33a",
+        "0b6bfef8f4e4a920f5dff13d241bb708c3b88f133c49c61af81c530c45623c29",
     ),
     (
         Class::Clip as u16,

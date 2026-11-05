@@ -60,7 +60,7 @@ use std::sync::Arc;
 
 use gltf::image::Source as ImageSource;
 use gltf::mesh::{Mode, Semantic};
-use orr_math::{Mat3, Mat4, Vec3};
+use orr_math::{DMat3, DMat4, Quat, Vec3};
 use orr_pack::Hash32;
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -275,17 +275,22 @@ fn morph_accessors<'a>(prim: &gltf::Primitive<'a>) -> impl Iterator<Item = gltf:
 fn append_primitive(
     src: &Data<'_>,
     prim: &gltf::Primitive<'_>,
-    world: Mat4,
+    world: DMat4,
     weights: &[f32],
     binding: Option<&Binding<'_>>,
     cx: &Context<'_>,
     b: &mut Building,
 ) -> Result<(), String> {
-    let linear = Mat3::from_mat4(world);
-    // In f64 as `normal_matrix` takes it: where `world` flattens, the sign is rounding, and
-    // the winding and the normals have to agree on it.
-    let flip = linear.as_dmat3().determinant() < 0.0;
-    let normal_m = normal_matrix(linear.as_dmat3()).as_mat3();
+    let linear = DMat3::from_mat4(world);
+    // As `normal_matrix` takes it: where `world` flattens, the sign is rounding, and the
+    // winding and the normals have to agree on it.
+    let flip = linear.determinant() < 0.0;
+    let normal_m = normal_matrix(linear).as_mat3();
+    let linear = linear.as_mat3();
+    let place = |p: [f32; 3]| {
+        let p = world.transform_point3(Vec3::from(p).as_dvec3());
+        p.as_vec3().to_array()
+    };
     let position = prim.get(&Semantic::Positions).ok_or("no positions")?;
     let n = position.count();
     let counted = |a: &gltf::Accessor<'_>, k| {
@@ -332,7 +337,7 @@ fn append_primitive(
         .as_chunks::<3>()
         .0
         .iter()
-        .map(|&p| world.transform_point3(Vec3::from(p)).to_array())
+        .map(|&p| place(p))
         .collect();
     let vertices: Vec<u32> = match prim.indices() {
         Some(a) => src.indices(&a)?,
@@ -440,13 +445,7 @@ fn append_primitive(
             let pivots = match (&pa.pivot, cx.skeleton) {
                 (Some(name), None) => custom(name, 3)?.map_or_else(
                     || vec![[0.0; 3]; n],
-                    |p| {
-                        p.as_chunks::<3>()
-                            .0
-                            .iter()
-                            .map(|&q| world.transform_point3(Vec3::from(q)).to_array())
-                            .collect()
-                    },
+                    |p| p.as_chunks::<3>().0.iter().map(|&q| place(q)).collect(),
                 ),
                 _ => Vec::new(),
             };
@@ -763,12 +762,12 @@ impl Imported<'_> {
         name: &str,
         mesh: usize,
         weights: &[f32],
-        transforms: &[Mat4],
+        transforms: &[DMat4],
     ) -> Result<()> {
         let (direct, baked) =
             placements(transforms).map_err(|m| self.fail(format!("model {name}: {m}")))?;
         if !direct.is_empty() {
-            self.lazy_model(name, mesh, weights, Mat4::IDENTITY)?;
+            self.lazy_model(name, mesh, weights, DMat4::IDENTITY)?;
             self.instances.push((name.to_string(), direct));
         }
         for (k, (linear, placed)) in baked.into_iter().enumerate() {
@@ -781,7 +780,13 @@ impl Imported<'_> {
 
     /// Model `name`: glTF mesh `mesh` at morph `weights` with `linear` applied, read when
     /// it cooks.
-    fn lazy_model(&mut self, name: &str, mesh: usize, weights: &[f32], linear: Mat4) -> Result<()> {
+    fn lazy_model(
+        &mut self,
+        name: &str,
+        mesh: usize,
+        weights: &[f32],
+        linear: DMat4,
+    ) -> Result<()> {
         self.name(name)?;
         let src = Arc::clone(self.src);
         let m = src.doc.meshes().nth(mesh).expect("mesh index");
@@ -935,7 +940,7 @@ fn instancing_views(src: &Document, graph: &Graph) -> Vec<usize> {
 
 /// The world transforms of `n`'s copies: its world transform times each
 /// `EXT_mesh_gpu_instancing` instance, or its world transform alone.
-fn node_transforms(src: &Data<'_>, graph: &Graph, n: usize) -> Result<Vec<Mat4>, String> {
+fn node_transforms(src: &Data<'_>, graph: &Graph, n: usize) -> Result<Vec<DMat4>, String> {
     let world = graph.world[n];
     let Some(ext) = instancing(src.doc, n) else {
         return Ok(vec![world]);
@@ -969,13 +974,18 @@ fn node_transforms(src: &Data<'_>, graph: &Graph, n: usize) -> Result<Vec<Mat4>,
             let t = t
                 .as_ref()
                 .map_or(Vec3::ZERO, |v| Vec3::from_slice(&v[3 * i..]));
-            let r = r.as_ref().map_or(orr_math::Quat::IDENTITY, |v| {
-                orr_math::Quat::from_slice(&v[4 * i..]).normalize()
-            });
+            let r = r
+                .as_ref()
+                .map_or(Quat::IDENTITY, |v| Quat::from_slice(&v[4 * i..]));
             let s = sc
                 .as_ref()
                 .map_or(Vec3::ONE, |v| Vec3::from_slice(&v[3 * i..]));
-            world * Mat4::from_scale_rotation_translation(s, r, t)
+            world
+                * DMat4::from_scale_rotation_translation(
+                    s.as_dvec3(),
+                    r.as_dquat().normalize(),
+                    t.as_dvec3(),
+                )
         })
         .collect())
 }
@@ -1018,7 +1028,7 @@ fn meshes_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     b.record(&mut views)?;
     let data = instancing_data(b, &src, graph)?;
     // Per mesh, its placements per set of morph weights, the mesh's own first.
-    type Placings = Vec<(Vec<f32>, Vec<Mat4>)>;
+    type Placings = Vec<(Vec<f32>, Vec<DMat4>)>;
     let mut by_mesh: BTreeMap<usize, Placings> = BTreeMap::new();
     for &n in &shown {
         let node = doc.nodes().nth(n).expect("node index");
@@ -1173,7 +1183,7 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
                 None,
             ),
             (Some(sk), Some(s)) => (
-                Mat4::IDENTITY,
+                DMat4::IDENTITY,
                 Some(Binding::Skin(sk.skin_joints(s.index()))),
             ),
             (Some(sk), None) => {
@@ -1406,7 +1416,9 @@ fn join(
         let (node, m) = &mut models[i];
         let name = m.node.clone().unwrap_or_default();
         let world = graph.world[node.expect("selected models have nodes")];
-        let cols = world.to_cols_array_2d();
+        // In f32, the precision of glTF's numbers: a chain of decimal translations that meets
+        // the grid sums just off it in f64.
+        let cols = world.as_mat4().to_cols_array_2d();
         // Each column one unit axis: entries 0 or +-1, one non-zero per column and row.
         let axis = cols[..3].iter().all(|c| {
             c[..3]
@@ -1414,7 +1426,7 @@ fn join(
                 .all(|&x| (x - x.round()).abs() <= 1e-6 && x.round().abs() <= 1.0)
                 && c[..3].iter().filter(|x| x.abs() > 0.5).count() == 1
         });
-        let det = Mat3::from_mat4(world).determinant();
+        let det = DMat3::from_mat4(world).determinant();
         if !axis || (det - 1.0).abs() > 1e-5 {
             return Err(format!(
                 "joined model {name}: rotation is not a multiple of 90 degrees at unit scale"
