@@ -1687,11 +1687,12 @@ fn plan_scene(
         .collect();
     let facts: HashMap<usize, ImageFacts> =
         image_facts(name, &mut src.images, &used, &heights, memo)?;
-    let warnings = used
-        .iter()
-        .filter(|i| facts[*i].animated)
-        .map(|&i| texture::first_frame_warning(&src.images[i].name))
-        .collect();
+    let mut warnings = std::mem::take(&mut src.warnings);
+    warnings.extend(
+        used.iter()
+            .filter(|i| facts[*i].animated)
+            .map(|&i| texture::first_frame_warning(&src.images[i].name)),
+    );
     for i in &used {
         if let ImageData::File {
             path,

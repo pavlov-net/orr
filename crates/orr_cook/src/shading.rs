@@ -18,20 +18,25 @@
 //!   below 1 or textured blends. The specular workflow's `specularColor` becomes
 //!   `specular_color` at metalness 0.
 //!
-//! An input is a constant, or reads a texture through these nodes: MaterialX `image` (with
-//! `texcoord`, `geompropvalue` and `place2d` on its coordinates, `extract`, `separate3` or
-//! `separate4` picking a channel, `normalmap` under `geometry_normal`, `constant`), and
-//! `UsdUVTexture` (with `UsdPrimvarReader_float2` and `UsdTransform2d`). Any other node
-//! fails the import, naming it. Textures go to the material's slots (base color, opacity,
+//! An input is a constant, or reads a texture through these nodes: MaterialX `image` and
+//! `tiledimage` (with `texcoord`, `geompropvalue` and `place2d` on their coordinates,
+//! `extract`, `separate2`, `separate3` or `separate4` picking a channel, `normalmap` under
+//! `geometry_normal`), and `UsdUVTexture` (with `UsdPrimvarReader_float2` and
+//! `UsdTransform2d`). `constant` and `dot` nodes pass on what they read to MaterialX nodes. Any
+//! other node fails the import, naming it, as does a connection cycle. A `geompropvalue`
+//! whose property no uv set holds reads its `default` at every point, as an unconnected
+//! `place2d` reads 0, 0. Textures go to the material's slots (base color, opacity,
 //! roughness, metalness, normal, occlusion, emission, specular weight, subsurface color,
 //! coat, transmission, displacement); a textured input without a slot fails. A texture
 //! value multiplies the field, which takes the reader's scale (`UsdUVTexture` `scale`; 1
 //! otherwise); bias is refused except under normals (`UsdUVTexture` scale 2 and bias -1,
 //! the tangent-space encoding, with x or y flipped by scale -2 and bias 1) and
-//! displacement. The uv transform of `place2d` or `UsdTransform2d` has no material field:
-//! the importer applies it to the mesh uvs, so every texture of one material must share it.
+//! displacement. The uv transform of `tiledimage`, `place2d` or `UsdTransform2d` goes to the
+//! slot's `Material::uv_transforms` under [`map_per_slot`]. Under [`map`] the importer applies
+//! it to the mesh uvs, so every texture of one material must share it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::LazyLock;
 
 use orr_math::{Affine2, Vec2};
 use orr_pack::material::Material;
@@ -43,6 +48,8 @@ use crate::texture::material::{MaterialTextures, TexRef};
 #[derive(Default)]
 pub(crate) struct Network {
     pub(crate) nodes: Vec<Node>,
+    /// Geometric properties a document defines as a uv set, by name.
+    pub(crate) uv_sets: HashMap<String, u8>,
 }
 
 pub(crate) struct Node {
@@ -69,6 +76,27 @@ pub(crate) enum Input {
     },
 }
 
+/// What a `constant` or `dot` without a value reads.
+static ZERO: LazyLock<Input> = LazyLock::new(|| Input::Value(vec![0.0]));
+
+/// What `input` reads past `constant` and `dot` nodes, which pass a value on unchanged. A ring
+/// of them leaves a connection.
+pub(crate) fn through<'n>(net: &'n Network, mut input: &'n Input) -> &'n Input {
+    for _ in 0..net.nodes.len() {
+        let Input::Connect { node, .. } = input else {
+            break;
+        };
+        let node = &net.nodes[*node];
+        let name = match node.kind.as_str() {
+            "constant" => "value",
+            "dot" => "in",
+            _ => break,
+        };
+        input = node.inputs.get(name).unwrap_or(&ZERO);
+    }
+    input
+}
+
 /// The MaterialX category of a node definition id: `ND_image_color3` is `image`.
 pub(crate) fn category(id: &str) -> &str {
     const KNOWN: &[&str] = &[
@@ -76,7 +104,9 @@ pub(crate) fn category(id: &str) -> &str {
         "surfacematerial",
         "geompropvalue",
         "displacement",
+        "tiledimage",
         "normalmap",
+        "separate2",
         "separate3",
         "separate4",
         "texcoord",
@@ -84,6 +114,7 @@ pub(crate) fn category(id: &str) -> &str {
         "extract",
         "place2d",
         "image",
+        "dot",
     ];
     let Some(rest) = id.strip_prefix("ND_") else {
         return id;
@@ -100,6 +131,8 @@ pub(crate) struct Mapped {
     pub(crate) textures: MaterialTextures,
     /// The uv transform every texture shares, when it is not the identity.
     pub(crate) uv: Option<Affine2>,
+    /// What the material asks for that it does not get.
+    pub(crate) warnings: Vec<String>,
 }
 
 /// Which channels of a texture an input reads.
@@ -117,6 +150,8 @@ struct Tex {
     wrap: [Wrap; 2],
     srgb: Option<bool>,
     uv: Affine2,
+    /// The transform its slot samples with (`Material::uv_transforms` form).
+    slot_uv: [f32; 6],
     scale: [f32; 4],
     bias: [f32; 4],
 }
@@ -125,7 +160,7 @@ impl Tex {
     fn tex_ref(&self) -> TexRef {
         TexRef {
             rg_channel: None,
-            uv: [0.0; 6],
+            uv: self.slot_uv,
             image: self.image,
             channel: self.channel() as u8,
             uv_set: self.uv_set,
@@ -147,21 +182,105 @@ enum Value {
     Texture(Tex),
 }
 
+/// The coordinate `at`, wherever on the mesh it is read.
+fn fixed(at: Vec2) -> Affine2 {
+    Affine2::from_cols(Vec2::ZERO, Vec2::ZERO, at)
+}
+
+/// `t`, between MaterialX coordinates, in `Material::uv_transforms` form, between uvs with the
+/// cook's top-left origin.
+fn slot_transform(t: Affine2) -> [f32; 6] {
+    let flip = Affine2::from_cols(Vec2::X, -Vec2::Y, Vec2::Y);
+    let t = flip * t * flip;
+    let [a, d, b, e] = t.matrix2.to_cols_array();
+    [a - 1.0, b, t.translation.x, d, e - 1.0, t.translation.y]
+}
+
+/// Fails on a connection cycle among the nodes `roots` reach. Every later walk of the
+/// connections relies on it, and none of them recurses along a chain, so a long one is safe.
+fn acyclic(net: &Network, roots: impl IntoIterator<Item = usize>) -> Result<(), String> {
+    #[derive(Copy, Clone, PartialEq)]
+    enum Visit {
+        New,
+        Open,
+        Done,
+    }
+    let upstream = |n: usize| {
+        net.nodes[n].inputs.values().filter_map(|i| match i {
+            Input::Connect { node, .. } => Some(*node),
+            _ => None,
+        })
+    };
+    let mut visits = vec![Visit::New; net.nodes.len()];
+    for root in roots {
+        if visits[root] != Visit::New {
+            continue;
+        }
+        visits[root] = Visit::Open;
+        let mut stack = vec![(root, upstream(root))];
+        while let Some((n, next)) = stack.last_mut() {
+            let n = *n;
+            let Some(u) = next.next() else {
+                visits[n] = Visit::Done;
+                stack.pop();
+                continue;
+            };
+            match visits[u] {
+                Visit::Open => {
+                    return Err(format!(
+                        "node {} is in a connection cycle",
+                        net.nodes[u].name
+                    ));
+                }
+                Visit::New => {
+                    visits[u] = Visit::Open;
+                    stack.push((u, upstream(u)));
+                }
+                Visit::Done => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Maps the surface node (and an optional MaterialX `displacement` node) of `net`.
 /// `primvars` names the mesh primvar of each uv set, which primvar readers and geometric
-/// properties name.
+/// properties name. The uv transform comes back in [`Mapped::uv`].
 pub(crate) fn map(
     net: &Network,
     surface: usize,
     displacement: Option<usize>,
     primvars: &[&str],
 ) -> Result<Mapped, String> {
+    mapped(net, surface, displacement, primvars, false)
+}
+
+/// [`map`] for a material without a mesh: each texture's uv transform stays in its slot.
+pub(crate) fn map_per_slot(
+    net: &Network,
+    surface: usize,
+    displacement: Option<usize>,
+    primvars: &[&str],
+) -> Result<Mapped, String> {
+    mapped(net, surface, displacement, primvars, true)
+}
+
+fn mapped(
+    net: &Network,
+    surface: usize,
+    displacement: Option<usize>,
+    primvars: &[&str],
+    per_slot: bool,
+) -> Result<Mapped, String> {
+    acyclic(net, std::iter::once(surface).chain(displacement))?;
     let mut m = Mapper {
         net,
         primvars,
+        per_slot,
         material: Material::default(),
         textures: MaterialTextures::default(),
         uv: Vec::new(),
+        warnings: Vec::new(),
     };
     let node = &net.nodes[surface];
     match node.kind.as_str() {
@@ -190,16 +309,20 @@ pub(crate) fn map(
         material: m.material,
         textures: m.textures,
         uv: first.filter(|t| !t.abs_diff_eq(Affine2::IDENTITY, 1e-6)),
+        warnings: m.warnings,
     })
 }
 
 struct Mapper<'a> {
     net: &'a Network,
     primvars: &'a [&'a str],
+    /// Whether uv transforms stay in the slots, leaving [`Mapped::uv`] empty.
+    per_slot: bool,
     material: Material,
     textures: MaterialTextures,
     /// The uv transform of every texture read.
     uv: Vec<Affine2>,
+    warnings: Vec<String>,
 }
 
 type Slot = fn(&mut MaterialTextures) -> &mut Option<TexRef>;
@@ -213,14 +336,16 @@ impl Mapper<'_> {
         self.node(n).inputs.get(name)
     }
 
+    /// What input `name` of node `n` reads past `constant` and `dot` nodes.
+    fn source<'n>(&'n self, n: usize, name: &str) -> Option<&'n Input> {
+        self.input(n, name).map(|i| through(self.net, i))
+    }
+
     /// A constant input's value, or `None` when unauthored.
     fn number(&self, n: usize, name: &str) -> Result<Option<Vec<f32>>, String> {
-        match self.input(n, name) {
+        match self.source(n, name) {
             None => Ok(None),
             Some(Input::Value(v)) => Ok(Some(v.clone())),
-            Some(Input::Connect { node, .. }) if self.node(*node).kind == "constant" => {
-                self.number(*node, "value")
-            }
             Some(_) => Err(format!(
                 "{}: input {name} must be a constant",
                 self.node(n).name
@@ -229,16 +354,45 @@ impl Mapper<'_> {
     }
 
     fn text<'n>(&'n self, n: usize, name: &str) -> Option<&'n str> {
-        match self.input(n, name) {
+        match self.source(n, name) {
             Some(Input::Text(t)) => Some(t),
             _ => None,
+        }
+    }
+
+    fn float(&self, n: usize, name: &str, default: f32) -> Result<f32, String> {
+        Ok(self.number(n, name)?.map_or(default, |v| v[0]))
+    }
+
+    fn vec2(&self, n: usize, name: &str, default: Vec2) -> Result<Vec2, String> {
+        Ok(self.number(n, name)?.map_or(default, |v| {
+            Vec2::new(v[0], v.get(1).copied().unwrap_or(v[0]))
+        }))
+    }
+
+    /// The channels of the stream on input `in` of an `extract` node.
+    fn components(&self, n: usize) -> Result<usize, String> {
+        match self.input(n, "in") {
+            None => Ok(4),
+            Some(Input::Value(v)) if v.len() <= 4 => Ok(v.len()),
+            Some(Input::Connect { node, output }) => Ok(match self.node(*node).ty.as_str() {
+                "float" => 1,
+                "vector2" => 2,
+                "color3" | "vector3" => 3,
+                "" if output == "rgb" => 3,
+                _ => 4,
+            }),
+            Some(_) => Err(format!(
+                "{}: extract reads a color or vector",
+                self.node(n).name
+            )),
         }
     }
 
     /// What input `name` of node `n` resolves to; `None` when unauthored.
     fn value(&mut self, n: usize, name: &str) -> Result<Option<Value>, String> {
         let what = format!("{} input {name}", self.node(n).name);
-        let v = match self.input(n, name) {
+        let v = match self.source(n, name) {
             None => return Ok(None),
             Some(Input::Value(v)) => Value::Constant(v.clone()),
             Some(Input::Text(_) | Input::Image { .. }) => {
@@ -260,17 +414,14 @@ impl Mapper<'_> {
     fn connected(&mut self, n: usize, output: &str) -> Result<Value, String> {
         let node = self.node(n);
         let channel = |out: &str| match out {
-            "outr" | "r" => Some(0),
-            "outg" | "g" => Some(1),
-            "outb" | "b" => Some(2),
-            "outa" | "a" => Some(3),
+            "outr" | "outx" | "r" => Some(0),
+            "outg" | "outy" | "g" => Some(1),
+            "outb" | "outz" | "b" => Some(2),
+            "outa" | "outw" | "a" => Some(3),
             _ => None,
         };
         match node.kind.as_str() {
-            "constant" => Ok(Value::Constant(
-                self.number(n, "value")?.unwrap_or_else(|| vec![0.0]),
-            )),
-            "image" => {
+            "image" | "tiledimage" => {
                 let mut t = self.image(n)?;
                 t.channels = match node.ty.as_str() {
                     "float" => Channels::One(0),
@@ -288,23 +439,50 @@ impl Mapper<'_> {
                 };
                 Ok(Value::Texture(t))
             }
-            "extract" | "separate3" | "separate4" => {
+            "extract" | "separate2" | "separate3" | "separate4" => {
                 let c = match node.kind.as_str() {
-                    "extract" => self
-                        .number(n, "index")?
-                        .map_or(0, |v| v.first().copied().unwrap_or(0.0) as u8),
-                    _ => channel(output)
-                        .ok_or_else(|| format!("{}: no output {output}", node.name))?,
+                    "extract" => {
+                        let width = self.components(n)?;
+                        let index = self.float(n, "index", 0.0)?;
+                        if index.fract() != 0.0 || !(0.0..width as f32).contains(&index) {
+                            return Err(format!(
+                                "{}: index {index} of a stream of {width} channels",
+                                node.name
+                            ));
+                        }
+                        index as u8
+                    }
+                    kind => {
+                        let width = match kind {
+                            "separate2" => 2,
+                            "separate3" => 3,
+                            _ => 4,
+                        };
+                        channel(output)
+                            .filter(|c| *c < width)
+                            .ok_or_else(|| format!("{}: no output {output}", node.name))?
+                    }
                 };
                 let name = node.name.clone();
+                // A picked channel holds none to pick, and refusing it here keeps a chain of
+                // picks from recursing.
+                if let Some(Input::Connect { node, .. }) = self.source(n, "in")
+                    && matches!(
+                        self.node(*node).kind.as_str(),
+                        "extract" | "separate2" | "separate3" | "separate4"
+                    )
+                {
+                    return Err(format!("{name}: picks channel {c} of a single channel"));
+                }
                 match self.value(n, "in")? {
-                    Some(Value::Texture(mut t)) if t.channels == Channels::Rgb && c < 4 => {
+                    Some(Value::Texture(mut t)) if t.channels == Channels::Rgb => {
                         t.channels = Channels::One(c);
                         Ok(Value::Texture(t))
                     }
                     Some(Value::Constant(v)) => Ok(Value::Constant(vec![
                         v.get(usize::from(c)).copied().unwrap_or(0.0),
                     ])),
+                    None => Ok(Value::Constant(vec![0.0])),
                     _ => Err(format!(
                         "{name}: picks channel {c} of nothing a texture holds"
                     )),
@@ -317,10 +495,19 @@ impl Mapper<'_> {
         }
     }
 
-    /// A MaterialX `image` node, its channels left for the caller.
+    /// `uv`, a texture's transform, as [`Tex::uv`] and [`Tex::slot_uv`].
+    fn placed(&self, uv: Affine2) -> (Affine2, [f32; 6]) {
+        if self.per_slot {
+            (Affine2::IDENTITY, slot_transform(uv))
+        } else {
+            (uv, [0.0; 6])
+        }
+    }
+
+    /// A MaterialX `image` or `tiledimage` node, its channels left for the caller.
     fn image(&self, n: usize) -> Result<Tex, String> {
         let node = self.node(n);
-        let Some(Input::Image { image, color_space }) = node.inputs.get("file") else {
+        let Some(Input::Image { image, color_space }) = self.source(n, "file") else {
             return Err(format!("{}: no file", node.name));
         };
         let wrap = |mode: Option<&str>| match mode {
@@ -334,11 +521,18 @@ impl Mapper<'_> {
             wrap(self.text(n, "vaddressmode"))?,
         ];
         let srgb = Some(color_space.as_deref() == Some("srgb_texture"));
-        let (uv_set, uv) = match self.input(n, "texcoord") {
-            None => (0, Affine2::IDENTITY),
-            Some(Input::Connect { node, .. }) => self.coordinates(*node)?,
-            Some(_) => return Err(format!("{}: texcoord must be connected", node.name)),
-        };
+        let (uv_set, mut uv) = self.texcoord(n, "texcoord", (0, Affine2::IDENTITY))?;
+        if node.kind == "tiledimage" {
+            let tiling = self.vec2(n, "uvtiling", Vec2::ONE)?;
+            let offset = self.vec2(n, "uvoffset", Vec2::ZERO)?;
+            let image = self.vec2(n, "realworldimagesize", Vec2::ONE)?;
+            let tile = self.vec2(n, "realworldtilesize", Vec2::ONE)?;
+            uv = Affine2::from_scale(tile / image)
+                * Affine2::from_translation(-offset)
+                * Affine2::from_scale(tiling)
+                * uv;
+        }
+        let (uv, slot_uv) = self.placed(uv);
         Ok(Tex {
             image: *image,
             channels: Channels::Rgb,
@@ -346,6 +540,7 @@ impl Mapper<'_> {
             wrap,
             srgb,
             uv,
+            slot_uv,
             scale: [1.0; 4],
             bias: [0.0; 4],
         })
@@ -381,6 +576,7 @@ impl Mapper<'_> {
             Some(Input::Connect { node, .. }) => self.coordinates(*node)?,
             Some(_) => return Err(format!("{}: st must be connected", node.name)),
         };
+        let (uv, slot_uv) = self.placed(uv);
         Ok(Tex {
             image: *image,
             channels: Channels::Rgb,
@@ -388,77 +584,107 @@ impl Mapper<'_> {
             wrap,
             srgb,
             uv,
+            slot_uv,
             scale,
             bias,
         })
     }
 
-    /// The uv set and transform a texture-coordinate node gives.
-    fn coordinates(&self, n: usize) -> Result<(u8, Affine2), String> {
-        let node = self.node(n);
-        let named = |name: Option<&str>| {
-            let name = name.unwrap_or("st");
-            let set = self.primvars.iter().position(|p| *p == name);
-            set.map(|s| s as u8).ok_or_else(|| {
-                let sets = self.primvars.join(", ");
-                format!("{}: reads {name}; the mesh uv sets are {sets}", node.name)
-            })
-        };
-        let inner = |input: &str| match self.input(n, input) {
-            None => Ok((0, Affine2::IDENTITY)),
+    /// The uv set and transform coordinate input `name` of `n` gives; `unset` when unauthored.
+    fn texcoord(
+        &self,
+        n: usize,
+        name: &str,
+        unset: (u8, Affine2),
+    ) -> Result<(u8, Affine2), String> {
+        match self.source(n, name) {
+            None => Ok(unset),
             Some(Input::Connect { node, .. }) => self.coordinates(*node),
-            Some(_) => Err(format!("{}: {input} must be connected", node.name)),
-        };
-        let vec2 = |input: &str, d: Vec2| -> Result<Vec2, String> {
-            Ok(self
-                .number(n, input)?
-                .map_or(d, |v| Vec2::new(v[0], v.get(1).copied().unwrap_or(v[0]))))
-        };
-        let float = |input: &str, d: f32| -> Result<f32, String> {
-            Ok(self.number(n, input)?.map_or(d, |v| v[0]))
-        };
-        match node.kind.as_str() {
-            "texcoord" => match float("index", 0.0)? {
-                0.0 => Ok((0, Affine2::IDENTITY)),
-                1.0 => Ok((1, Affine2::IDENTITY)),
-                i => Err(format!(
-                    "{}: texcoord index {i}; uv sets are 0 and 1",
-                    node.name
-                )),
-            },
-            "geompropvalue" => Ok((named(self.text(n, "geomprop"))?, Affine2::IDENTITY)),
-            "UsdPrimvarReader_float2" => Ok((named(self.text(n, "varname"))?, Affine2::IDENTITY)),
-            "place2d" => {
-                let (set, inner) = inner("texcoord")?;
-                let pivot = vec2("pivot", Vec2::ZERO)?;
-                let scale = vec2("scale", Vec2::ONE)?;
-                let offset = vec2("offset", Vec2::ZERO)?;
-                // MaterialX rotate2d turns clockwise by its angle in degrees.
-                let rotate = Affine2::from_angle(-float("rotate", 0.0)?.to_radians());
-                let srt = float("operationorder", 0.0)? == 0.0;
-                let to = Affine2::from_translation(-pivot);
-                let back = Affine2::from_translation(pivot);
-                let s = Affine2::from_scale(scale.recip());
-                let t = Affine2::from_translation(-offset);
-                let place = if srt {
-                    back * t * rotate * s * to
-                } else {
-                    back * s * rotate * t * to
-                };
-                Ok((set, place * inner))
+            Some(_) => Ok((0, fixed(self.vec2(n, name, Vec2::ZERO)?))),
+        }
+    }
+
+    /// The uv set and transform a texture-coordinate node gives.
+    fn coordinates(&self, mut n: usize) -> Result<(u8, Affine2), String> {
+        // The transforms walked so far, of the coordinates the next node gives.
+        let mut outer = Affine2::IDENTITY;
+        loop {
+            let node = self.node(n);
+            let (transform, input, unset) = match node.kind.as_str() {
+                "texcoord" => {
+                    return match self.float(n, "index", 0.0)? {
+                        0.0 => Ok((0, outer)),
+                        1.0 => Ok((1, outer)),
+                        i => Err(format!(
+                            "{}: texcoord index {i}; uv sets are 0 and 1",
+                            node.name
+                        )),
+                    };
+                }
+                "geompropvalue" => {
+                    let name = self.text(n, "geomprop").unwrap_or_default();
+                    let set = self
+                        .primvars
+                        .iter()
+                        .position(|p| *p == name)
+                        .map(|s| s as u8)
+                        .or((name == "UV0").then_some(0))
+                        .or(self.net.uv_sets.get(name).copied())
+                        .filter(|s| *s < 2);
+                    match set {
+                        Some(s) => return Ok((s, outer)),
+                        None => (Affine2::IDENTITY, "default", (0, fixed(Vec2::ZERO))),
+                    }
+                }
+                "UsdPrimvarReader_float2" => {
+                    let name = self.text(n, "varname").unwrap_or("st");
+                    let set = self.primvars.iter().position(|p| *p == name);
+                    let set = set.ok_or_else(|| {
+                        let sets = self.primvars.join(", ");
+                        format!("{}: reads {name}; the mesh uv sets are {sets}", node.name)
+                    })?;
+                    return Ok((set as u8, outer));
+                }
+                "place2d" => {
+                    let pivot = self.vec2(n, "pivot", Vec2::ZERO)?;
+                    let scale = self.vec2(n, "scale", Vec2::ONE)?;
+                    let offset = self.vec2(n, "offset", Vec2::ZERO)?;
+                    // MaterialX rotate2d turns clockwise by its angle in degrees.
+                    let rotate = Affine2::from_angle(-self.float(n, "rotate", 0.0)?.to_radians());
+                    let srt = self.float(n, "operationorder", 0.0)? == 0.0;
+                    let to = Affine2::from_translation(-pivot);
+                    let back = Affine2::from_translation(pivot);
+                    let s = Affine2::from_scale(scale.recip());
+                    let t = Affine2::from_translation(-offset);
+                    let place = if srt {
+                        back * t * rotate * s * to
+                    } else {
+                        back * s * rotate * t * to
+                    };
+                    (place, "texcoord", (0, fixed(Vec2::ZERO)))
+                }
+                "UsdTransform2d" => {
+                    let scale = self.vec2(n, "scale", Vec2::ONE)?;
+                    let rotation = self.float(n, "rotation", 0.0)?.to_radians();
+                    let translation = self.vec2(n, "translation", Vec2::ZERO)?;
+                    let t = Affine2::from_scale_angle_translation(scale, rotation, translation);
+                    (t, "in", (0, Affine2::IDENTITY))
+                }
+                k => {
+                    return Err(format!(
+                        "node {} ({k}) is not a texture coordinate reader or transform",
+                        node.name
+                    ));
+                }
+            };
+            outer *= transform;
+            match self.source(n, input) {
+                Some(Input::Connect { node, .. }) => n = *node,
+                _ => {
+                    let (set, uv) = self.texcoord(n, input, unset)?;
+                    return Ok((set, outer * uv));
+                }
             }
-            "UsdTransform2d" => {
-                let (set, inner) = inner("in")?;
-                let scale = vec2("scale", Vec2::ONE)?;
-                let rotation = float("rotation", 0.0)?.to_radians();
-                let translation = vec2("translation", Vec2::ZERO)?;
-                let t = Affine2::from_scale_angle_translation(scale, rotation, translation);
-                Ok((set, t * inner))
-            }
-            k => Err(format!(
-                "node {} ({k}) is not a texture coordinate reader or transform",
-                node.name
-            )),
         }
     }
 
@@ -679,11 +905,18 @@ impl Mapper<'_> {
         } else if self.material.geometry_opacity < 1.0 {
             self.material.alpha_mode = Material::BLEND;
         }
-        match self.input(n, "geometry_normal") {
+        match self.source(n, "geometry_normal") {
             None => {}
             Some(Input::Connect { node, .. }) if self.node(*node).kind == "normalmap" => {
                 let map = *node;
-                let scale = self.number(map, "scale")?.map_or(1.0, |v| v[0]);
+                if self.text(map, "space") == Some("object") {
+                    self.warnings.push(format!(
+                        "{}: a normalmap space of object is not honored yet; it reads as \
+                         tangent space",
+                        self.node(map).name
+                    ));
+                }
+                let scale = self.float(map, "scale", 1.0)?;
                 match self.value(map, "in")? {
                     Some(Value::Texture(t)) if t.channels == Channels::Rgb => {
                         self.textures.normal = Some((t.tex_ref(), [scale; 2]));

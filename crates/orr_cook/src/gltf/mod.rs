@@ -579,6 +579,7 @@ pub(crate) fn import(
         skeletons: skeleton.into_iter().collect(),
         instances,
         files,
+        warnings: Vec::new(),
     })
 }
 

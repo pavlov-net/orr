@@ -49,6 +49,7 @@ pub(crate) struct Scene {
     pub(crate) instances: Vec<(String, Vec<Placed>)>,
     /// Every file read.
     pub(crate) files: Vec<Input>,
+    pub(crate) warnings: Vec<String>,
 }
 
 /// One placement: position and a linear transform that [`collapses`] passes.

@@ -207,6 +207,7 @@ struct Importer<'s> {
     materials: Vec<SceneMaterial>,
     /// Scene material and uv transform by (material prim path, double-sided).
     material_of: HashMap<(Option<String>, bool), (usize, Option<Affine2>)>,
+    warnings: Vec<String>,
 }
 
 impl<'s> Importer<'s> {
@@ -257,6 +258,7 @@ impl<'s> Importer<'s> {
             image_of: HashMap::new(),
             materials: Vec::new(),
             material_of: HashMap::new(),
+            warnings: Vec::new(),
         })
     }
 
@@ -562,6 +564,7 @@ impl<'s> Importer<'s> {
             skeletons,
             instances: instance_out,
             files: self.reads.borrow().inputs(),
+            warnings: std::mem::take(&mut self.warnings),
         })
     }
 
@@ -943,6 +946,7 @@ impl<'s> Importer<'s> {
                     material: Default::default(),
                     textures: Default::default(),
                     uv: None,
+                    warnings: Vec::new(),
                 },
                 "default".to_string(),
             ),
@@ -996,6 +1000,7 @@ impl<'s> Importer<'s> {
         } else {
             name
         };
+        self.warnings.extend(mapped.warnings);
         self.materials.push(SceneMaterial {
             suffix,
             material: mapped.material,
