@@ -11,10 +11,12 @@
 //! - A plain file is what it states, else sRGB unless the curve can't encode what it stores.
 //!
 //! Primaries with a cooked id stay as stored, tagged with the id. Any others convert to Rec.2020,
-//! the working space, whose gamut is the widest of the ids.
+//! the working space, whose gamut is the widest of the ids. So does an image that reads below 0 in
+//! narrower primaries: no texture stores that, and Rec.2020 can hold what it states. What still
+//! reads below 0 there clips, and only what the texels measure to clip warns.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use moxcms::{ColorProfile, DataColorSpace, Layout, ToneReprCurve, TransformOptions};
 use orr_color::{
@@ -252,24 +254,35 @@ impl ImageColor {
 
     /// How a color in file `f` reads, and the id and matrix of what it reads as. Primaries that
     /// `over` sets stand in for what the rules say, and take the file's texels as they are.
+    /// `below` says whether the image, as a [`Read`] has it, holds values below 0.
     pub(crate) fn color(
         self,
         f: &FileColor,
         over: Option<Primaries>,
+        below: impl FnOnce(&Read) -> bool,
     ) -> (Read, Primaries, Option<DMat3>) {
         let icc = f
             .icc
             .clone()
             .filter(|_| self.honors_file() && over.is_none());
-        let (primaries, matrix) = match (over, &icc) {
-            (Some(p), _) => (p, None),
-            (None, Some(_)) => (Primaries::Rec2020, None),
-            (None, None) => self.gamut(f).cooked(),
-        };
         let read = Read {
             decode: self.decode(f),
             icc,
             straight: f.premultiplied,
+        };
+        let (primaries, matrix) = match (over, &read.icc) {
+            (Some(p), _) => (p, None),
+            (None, Some(_)) => (Primaries::Rec2020, None),
+            (None, None) => {
+                let gamut = self.gamut(f);
+                match gamut.cooked() {
+                    (p, None) if p != Primaries::Rec2020 && below(&read) => (
+                        Primaries::Rec2020,
+                        Some(gamut.matrix_to(RgbPrimaries::REC2020)),
+                    ),
+                    cooked => cooked,
+                }
+            }
         };
         (read, primaries, matrix)
     }
@@ -346,14 +359,48 @@ impl Read {
         self.unmultiplied(self.decode.value(t[c]), t[3])
     }
 
-    /// Whether colors this reads through `gamut` can reach past Rec.2020, where they clip: a
-    /// texture holds none of its colors below 0.
-    pub(crate) fn clips(&self, gamut: Option<&DMat3>) -> bool {
+    /// Stored value `v` as one channel reads it, as far as its sign goes: an ICC transform reads
+    /// three together, and takes nothing below 0.
+    pub(crate) fn alone(&self, v: f32) -> f32 {
+        if self.icc.is_some() {
+            self.decode.signal(v)
+        } else {
+            self.decode.value(v)
+        }
+    }
+
+    /// Whether primaries alone can take what this reads through `gamut` past Rec.2020. If not,
+    /// only values below 0 can clip, and no texel needs measuring without them.
+    pub(crate) fn reaches_past(&self, gamut: Option<&DMat3>) -> bool {
         match (&self.icc, gamut) {
-            (Some(icc), _) => icc.clips,
+            (Some(icc), _) => icc.wide.is_some(),
             (None, Some(m)) => past_rec2020(m),
             (None, None) => false,
         }
+    }
+
+    /// The channels of stored texel `t` as [`Self::value`] reads them, but where the color is, not
+    /// where a transform's clamp leaves it: a texel below 0 no transform takes reads as its lowest
+    /// signal.
+    pub(crate) fn reach(&self, t: [f32; 4]) -> [f32; 4] {
+        let Some(icc) = &self.icc else {
+            return [0, 1, 2, 3].map(|c| self.value(t, c));
+        };
+        let signal = [0, 1, 2].map(|c| self.decode.signal(t[c]));
+        let lowest = signal.into_iter().fold(0.0, f32::min);
+        let rgb = if lowest < BELOW_ZERO {
+            [lowest; 3]
+        } else {
+            icc.reach(signal)
+        };
+        let [r, g, b] = rgb.map(|v| self.unmultiplied(v, t[3]));
+        [r, g, b, self.value(t, 3)]
+    }
+
+    /// Whether stored texel `t`, through `gamut`, reads as a color no texture holds.
+    pub(crate) fn clips(&self, t: [f32; 4], gamut: Option<&DMat3>) -> bool {
+        let [r, g, b, _] = self.reach(t);
+        clipped(gamut.map_or([r, g, b], |m| multiply(m, [r, g, b])))
     }
 
     /// Linear `v` straight from a file that stores it premultiplied by `alpha`. Division by alpha
@@ -385,8 +432,27 @@ pub(crate) struct FileColor {
     pub(crate) rgb8: bool,
 }
 
-/// What a channel reads below to clip: the margin keeps what rounds there.
-pub(crate) const CLIPS_BELOW: f64 = -1e-3;
+impl FileColor {
+    /// Whether a stored value of 0 or more can read below 0: a narrow range's codes under black,
+    /// or a curve that puts black above a signal of 0.
+    pub(crate) fn can_read_below(&self) -> bool {
+        self.narrow.is_some() || self.transfer.is_some_and(|t| t.decode(0.0) < BELOW_ZERO)
+    }
+}
+
+/// What a channel reads below to clip: the margin keeps what rounds there, and the noise around
+/// black a conversion leaves.
+const CLIPS_BELOW: f64 = -1e-3;
+
+/// What a value reads below to be below 0, and not there by rounding: a narrow-range file's black
+/// lands within this of 0, and keeps the primaries it states. Converting loses nothing, so the
+/// margin is no wider.
+pub(crate) const BELOW_ZERO: f32 = -1e-6;
+
+/// Whether a color, in the primaries it cooks in, clips.
+pub(crate) fn clipped(rgb: [f32; 3]) -> bool {
+    rgb.iter().any(|&v| f64::from(v) < CLIPS_BELOW)
+}
 
 /// Whether matrix `m`, to Rec.2020, takes a primary outside it: its column is that primary.
 fn past_rec2020(m: &DMat3) -> bool {
@@ -398,8 +464,8 @@ fn past_rec2020(m: &DMat3) -> bool {
 pub(crate) struct Icc {
     transform: Arc<moxcms::TransformF32Executor>,
     gray: bool,
-    /// The profile's colors reach past Rec.2020.
-    clips: bool,
+    /// The transform to AP0 of a profile whose colors reach past Rec.2020.
+    wide: Option<Arc<moxcms::TransformF32Executor>>,
 }
 
 impl fmt::Debug for Icc {
@@ -418,6 +484,17 @@ impl Icc {
             .transform(&rgb[..n], &mut out)
             .expect("one pixel of each layout");
         out
+    }
+
+    /// [`Self::linear`] short of the clamp of a transform to Rec.2020.
+    fn reach(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let Some(wide) = &self.wide else {
+            return self.linear(rgb);
+        };
+        let mut ap0 = [0.0; 3];
+        wide.transform(&rgb, &mut ap0)
+            .expect("one pixel of each layout");
+        multiply(ap0_to_rec2020(), ap0)
     }
 }
 
@@ -444,7 +521,7 @@ pub(crate) fn read_icc(f: &mut FileColor, bytes: &[u8], gray: bool) -> bool {
     let y = weights.dot(DVec3::from(icc.linear([0.5; 3]).map(f64::from)));
     let gamma = y.ln() / 0.5f64.ln();
     f.transfer = (gamma.is_finite() && gamma > 0.0).then_some(Transfer::Gamma(gamma as f32));
-    icc.clips = !gray && icc_clips(&profile);
+    icc.wide = if gray { None } else { icc_wide(&profile) };
     f.icc = Some(icc);
     true
 }
@@ -481,27 +558,33 @@ fn icc_transform(bytes: &[u8], gray: bool) -> Option<(Icc, ColorProfile)> {
     let icc = Icc {
         transform,
         gray,
-        clips: false,
+        wide: None,
     };
     Some((icc, profile))
 }
 
-/// Whether an RGB `profile`'s colors reach past Rec.2020. A transform clamps to its target, so
-/// they show only through AP0, which holds every color. The whole cube is read, because the
-/// primaries of a profile of tables don't bound its gamut. A profile with no such transform
-/// still reads through the one it has.
-fn icc_clips(profile: &ColorProfile) -> bool {
+fn ap0_to_rec2020() -> &'static DMat3 {
+    static MATRIX: LazyLock<DMat3> =
+        LazyLock::new(|| RgbPrimaries::ACES_AP0.matrix_to(RgbPrimaries::REC2020));
+    &MATRIX
+}
+
+/// The transform to AP0 of an RGB `profile` whose colors reach past Rec.2020. A transform clamps
+/// to its target, so they show only through AP0, which holds every color. The whole cube is read,
+/// because the primaries of a profile of tables don't bound its gamut. A profile with no such
+/// transform still reads through the one it has.
+fn icc_wide(profile: &ColorProfile) -> Option<Arc<moxcms::TransformF32Executor>> {
     let wide = ColorProfile::new_aces_aces_2065_1_linear();
     let options = TransformOptions::default();
-    let Ok(probe) = profile.create_transform_f32(Layout::Rgb, &wide, Layout::Rgb, options) else {
-        return false;
-    };
-    let to_rec2020 = RgbPrimaries::ACES_AP0.matrix_to(RgbPrimaries::REC2020);
-    rgb_grid().any(|rgb| {
+    let probe = profile
+        .create_transform_f32(Layout::Rgb, &wide, Layout::Rgb, options)
+        .ok()?;
+    let past = rgb_grid().any(|rgb| {
         let mut ap0 = [0.0f32; 3];
         let read = probe.transform(&rgb, &mut ap0).is_ok();
-        read && (to_rec2020 * DVec3::from(ap0.map(f64::from))).min_element() < CLIPS_BELOW
-    })
+        read && clipped(multiply(ap0_to_rec2020(), ap0))
+    });
+    past.then_some(probe)
 }
 
 /// RGB primaries at `[x, y]` of red, green, blue and white.
@@ -669,19 +752,19 @@ mod tests {
     }
 
     #[test]
-    fn only_primaries_past_rec2020_clip() {
+    fn only_primaries_past_rec2020_reach_there() {
         let read = Read::of(Decode::STORED);
-        let clips = |p| read.clips(Gamut::Rgb(p).cooked().1.as_ref());
+        let clips = |p| read.reaches_past(Gamut::Rgb(p).cooked().1.as_ref());
         assert!(clips(RgbPrimaries::ACES_AP0));
         assert!(clips(RgbPrimaries::ACES_CG));
         assert!(!clips(RgbPrimaries::ADOBE_RGB));
         assert!(!clips(RgbPrimaries::REC2020));
-        assert!(read.clips(Gamut::Xyz.cooked().1.as_ref()));
+        assert!(read.reaches_past(Gamut::Xyz.cooked().1.as_ref()));
 
         let icc = |p: ColorProfile| {
             let mut f = FileColor::default();
             assert!(read_icc(&mut f, &p.encode().unwrap(), false));
-            f.icc.unwrap().clips
+            f.icc.unwrap().wide.is_some()
         };
         assert!(icc(ColorProfile::new_aces_aces_2065_1_linear()));
         assert!(!icc(ColorProfile::new_display_p3()));

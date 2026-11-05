@@ -996,9 +996,10 @@ fn primaries_past_rec2020_warn_where_read_as_color() {
     }
 }
 
-/// A float file's values below 0 clip in any primaries.
+/// What converting to Rec.2020 leaves below 0 clips, and only that warns: `[-0.5, 1, 0]` in Rec.709
+/// is inside Rec.2020, and `[-1, 1, 0]` is not.
 #[test]
-fn color_below_zero_warns() {
+fn color_below_zero_warns_past_rec2020() {
     let d = dir("below-zero");
     let path = d.join("image.exr");
     let warnings = |texel: [f32; 3], usage| {
@@ -1017,9 +1018,306 @@ fn color_below_zero_warns() {
         let entries = report.assets.iter().flat_map(|a| &a.entries);
         entries.flat_map(|e| &e.warnings).count()
     };
-    assert_eq!(warnings([-0.5, 1.0, 0.0], Usage::Hdr), 1);
-    assert_eq!(warnings([-0.5, 1.0, 0.0], Usage::Linear4), 0);
+    assert_eq!(warnings([-0.5, 1.0, 0.0], Usage::Hdr), 0);
+    assert_eq!(warnings([-1.0, 1.0, 0.0], Usage::Hdr), 1);
+    assert_eq!(warnings([-1.0, 1.0, 0.0], Usage::Linear4), 0);
     assert_eq!(warnings([0.5, 1.0, 0.0], Usage::Hdr), 0);
+}
+
+/// Linear `rgb` in primaries `from` as primaries `to`.
+fn converted(
+    from: orr_color::RgbPrimaries,
+    to: orr_color::RgbPrimaries,
+    rgb: [f32; 3],
+) -> [f32; 3] {
+    let rgb = orr_math::DVec3::from(rgb.map(f64::from));
+    (from.matrix_to(to) * rgb).as_vec3().to_array()
+}
+
+/// `rgb` in `primaries` as linear Rec.2020.
+fn in_rec2020(primaries: orr_color::RgbPrimaries, rgb: [f32; 3]) -> [f32; 3] {
+    converted(primaries, orr_color::RgbPrimaries::REC2020, rgb)
+}
+
+/// How many warnings say that colors clip.
+fn clip_warnings(report: &CookReport) -> usize {
+    let entries = report.assets.iter().flat_map(|a| &a.entries);
+    let warnings = entries.flat_map(|e| &e.warnings);
+    let all = warnings.chain(report.assets.iter().flat_map(|a| &a.warnings));
+    all.filter(|w| w.contains("Rec.2020")).count()
+}
+
+/// Rec.709's `[-0.3, 1, 0]`, inside Rec.2020.
+const BELOW: [f32; 3] = [-0.3, 1.0, 0.0];
+
+fn flat_exr(
+    [r, g, b]: [f32; 3],
+    edit: impl FnOnce(&mut exr::meta::header::LayerAttributes, &mut exr::meta::header::ImageAttributes),
+) -> Vec<u8> {
+    exr_image(|_| (r, g, b, 1.0), edit)
+}
+
+fn display_p3() -> exr::meta::attribute::Chromaticities {
+    use exr::prelude::Vec2;
+    exr::meta::attribute::Chromaticities {
+        red: Vec2(0.68, 0.32),
+        green: Vec2(0.265, 0.69),
+        blue: Vec2(0.15, 0.06),
+        white: Vec2(0.3127, 0.329),
+    }
+}
+
+/// This project's rule: a file is what it states unless the image can't be. No texture holds a
+/// value below 0, so a float image in narrower primaries converts to Rec.2020, the widest id.
+#[test]
+fn a_texture_file_below_zero_converts_to_rec2020() {
+    use exr::meta::attribute::{AttributeValue, Text};
+    use orr_color::RgbPrimaries as P;
+    let d = dir("below-zero-file");
+    let (id, [t, _]) = read_back(&d, &flat_exr(BELOW, |_, _| {}));
+    assert_eq!(id, 2);
+    assert_rgb(t, in_rec2020(P::REC709, BELOW), "Rec.709");
+
+    let p3 = |_: &mut _, image: &mut exr::meta::header::ImageAttributes| {
+        image.chromaticities = Some(display_p3());
+    };
+    let below_p3 = [-0.2, 1.0, 0.0];
+    let (id, [t, _]) = read_back(&d, &flat_exr(below_p3, p3));
+    assert_eq!(id, 2);
+    assert_rgb(t, in_rec2020(P::DISPLAY_P3, below_p3), "Display P3");
+    assert_eq!(read_back(&d, &flat_exr([0.3, 1.0, 0.0], p3)).0, 1);
+
+    // A narrow-range file's code 16 is black, and its codes below that are not.
+    let linear_709: &[u8] = &[1, 8, 0, 0];
+    let narrow = |r: u8| tagged::flat_rgb([r, 235, 16], &[(b"cICP", linear_709)]);
+    assert_eq!(read_back(&d, &narrow(16)).0, 0);
+    let (id, [t, _]) = read_back(&d, &narrow(10));
+    assert_eq!(id, 2);
+    assert_rgb(t, in_rec2020(P::REC709, [-6.0 / 219.0, 1.0, 0.0]), "narrow");
+
+    // Rec.2020 has nowhere wider to go.
+    let rec2020 = flat_exr(BELOW, |layer, _| {
+        layer.other.insert(
+            Text::from("colorInteropID"),
+            AttributeValue::Text(Text::from("lin_rec2020_scene")),
+        );
+    });
+    let (id, [t, _]) = read_back(&d, &rec2020);
+    assert_eq!(id, 2);
+    assert_rgb(t, [0.0, 1.0, 0.0], "Rec.2020");
+
+    // An override takes the texels as they are, so what they can't hold clips.
+    let path = d.join("image");
+    std::fs::write(&path, flat_exr(BELOW, |_, _| {})).unwrap();
+    let settings = TextureSettings {
+        usage: Usage::Hdr,
+        mips: Some(false),
+        primaries: Some(orr_color::Primaries::Rec709),
+        ..Default::default()
+    };
+    let (a, report) = cook(Source::Texture { path, settings });
+    let (info, levels) = mips(&a, "u");
+    assert_eq!(info.header.primaries, 0);
+    let texels = decode(info.header.vk_format, 8, 8, &levels[0][0]);
+    assert_rgb(texels[0], [0.0, 1.0, 0.0], "override");
+    assert_eq!(clip_warnings(&report), 1);
+}
+
+/// The rule above of an environment map, which reads through its own path: its texels and the
+/// primaries the lights take from it.
+#[test]
+fn an_environment_below_zero_converts_to_rec2020() {
+    let d = dir("below-zero-environment");
+    let path = d.join("sky.exr");
+    let usage = Usage::Environment {
+        light_threshold: None,
+        max_lights: 0,
+    };
+    let cooked = |texel: [f32; 3]| {
+        let img = image::Rgb32FImage::from_fn(16, 8, |_, _| image::Rgb(texel));
+        image::DynamicImage::ImageRgb32F(img)
+            .save_with_format(&path, image::ImageFormat::OpenExr)
+            .unwrap();
+        let settings = TextureSettings {
+            usage,
+            max_size: Some(8),
+            ..Default::default()
+        };
+        let (a, report) = cook(Source::Texture {
+            path: path.clone(),
+            settings,
+        });
+        let (info, levels) = mips(&a, "u");
+        let [w, h] = [info.header.width, info.header.height];
+        let texels = decode(info.header.vk_format, w, h, &levels[0][0]);
+        (info.header.primaries, texels[0], clip_warnings(&report))
+    };
+    let (id, t, warnings) = cooked(BELOW);
+    assert_eq!((id, warnings), (2, 0));
+    assert_rgb(t, in_rec2020(orr_color::RgbPrimaries::REC709, BELOW), "sky");
+    let (id, _, warnings) = cooked([-1.0, 1.0, 0.0]);
+    assert_eq!((id, warnings), (2, 1));
+    assert_eq!(cooked([0.3, 1.0, 0.0]).0, 0);
+}
+
+/// The rule above of a material's color inputs: texels and constants convert alike, a constant's
+/// factor is still Rec.709, and a remap that reaches below 0 counts as what the input reads.
+#[test]
+fn material_colors_below_zero_convert_to_rec2020() {
+    use orr_color::RgbPrimaries as P;
+    let d = dir("below-zero-material");
+    let surface = "color3f inputs:diffuseColor";
+    let write = |name: &str, bytes: Vec<u8>| std::fs::write(d.join(name), bytes).unwrap();
+    let close = |got: [f32; 3], want: [f32; 3]| {
+        assert!(
+            (0..3).all(|c| (got[c] - want[c]).abs() < 2e-3),
+            "{got:?}, not {want:?}"
+        );
+    };
+
+    write("flat.exr", flat_exr(BELOW, |_, _| {}));
+    let (_, m, report) = usd(&d, "flat.exr", surface, "rgb", "");
+    assert_eq!(m.textures[slot::BASE_COLOR].texture, AssetId::NONE);
+    close(m.base_color, BELOW);
+    assert_eq!(clip_warnings(&report), 0);
+
+    // A stored constant reads through its remap before anything clamps it.
+    let remapped = r#"token inputs:sourceColorSpace = "raw"
+                float4 inputs:bias = (-0.5, 0, 0, 0)"#;
+    write("remapped.png", tagged::flat_rgb([51, 255, 0], &[]));
+    let (_, m, report) = usd(&d, "remapped.png", surface, "rgb", remapped);
+    close(m.base_color, BELOW);
+    assert_eq!(clip_warnings(&report), 0);
+
+    write("past.exr", flat_exr([-1.0, 1.0, 0.0], |_, _| {}));
+    let (_, m, report) = usd(&d, "past.exr", surface, "rgb", "");
+    let held = in_rec2020(P::REC709, [-1.0, 1.0, 0.0]).map(|v| v.clamp(0.0, 1.0));
+    close(m.base_color, converted(P::REC2020, P::REC709, held));
+    assert_eq!(clip_warnings(&report), 1);
+
+    // Negative infinity has no color to convert, and clips in the primaries the file states.
+    let infinite = |x: usize| (if x == 0 { f32::NEG_INFINITY } else { 0.5 }, 0.5, 0.5, 1.0);
+    write("infinite.exr", exr_image(infinite, |_, _| {}));
+    let (_, _, report) = usd(&d, "infinite.exr", surface, "rgb", "");
+    assert_eq!(clip_warnings(&report), 1);
+
+    let varying = |x: usize| {
+        let [r, g, b] = if x < 4 { BELOW } else { [0.5, 0.25, 0.125] };
+        (r, g, b, 1.0)
+    };
+    write("varying.exr", exr_image(varying, |_, _| {}));
+    let emissive = "color3f inputs:emissiveColor";
+    let (a, m, report) = usd(&d, "varying.exr", emissive, "rgb", "");
+    let e = a.find(m.textures[slot::EMISSION].texture).unwrap();
+    assert_eq!(mips(&a, a.name(e)).0.header.primaries, 2);
+    let (_, texels) = stored(&a, &m, slot::EMISSION, 8);
+    assert_rgb(texels[0], in_rec2020(P::REC709, BELOW), "below 0");
+    let inside = in_rec2020(P::REC709, [0.5, 0.25, 0.125]);
+    assert_rgb(texels[7], inside, "inside Rec.709");
+    assert_eq!(clip_warnings(&report), 0);
+}
+
+/// A warning follows what an image holds, not what its primaries could reach: gray in AP0 reads
+/// inside Rec.2020, and a saturated red doesn't, through either path.
+#[test]
+fn primaries_past_rec2020_warn_of_the_texels_that_clip() {
+    use exr::prelude::Vec2;
+    let d = dir("past-rec2020-texels");
+    let ap0 = exr::meta::attribute::Chromaticities {
+        red: Vec2(0.7347, 0.2653),
+        green: Vec2(0.0, 1.0),
+        blue: Vec2(0.0001, -0.077),
+        white: Vec2(0.32168, 0.33767),
+    };
+    let path = d.join("ap0.exr");
+    for (rgb, want) in [([0.5; 3], 0), ([1.0, 0.0, 0.0], 1)] {
+        let file = flat_exr(rgb, |_, image| image.chromaticities = Some(ap0));
+        std::fs::write(&path, file).unwrap();
+        let settings = TextureSettings {
+            usage: Usage::Hdr,
+            ..Default::default()
+        };
+        let (_, report) = cook(Source::Texture {
+            path: path.clone(),
+            settings,
+        });
+        assert_eq!(clip_warnings(&report), want, "{rgb:?} as a file");
+        let (_, _, report) = usd(&d, "ap0.exr", "color3f inputs:diffuseColor", "rgb", "");
+        assert_eq!(clip_warnings(&report), want, "{rgb:?} as a material");
+    }
+}
+
+/// A signed BC6H block of one color: mode 10, whose endpoints hold 10 bits, all indices 0.
+fn bc6h_block(rgb: [i32; 3]) -> [u8; 16] {
+    let [r, g, b] = rgb.map(|v| (v as u128) & 0x3ff);
+    (0b00011 | r << 5 | g << 15 | b << 25).to_le_bytes()
+}
+
+/// The rule above holds of every mip a file stores, which a cook can keep: here only the mips past
+/// the first read below 0.
+#[test]
+fn stored_mips_below_zero_convert_to_rec2020() {
+    let d = dir("below-zero-mips");
+    let positive = bc6h_block([40, 40, 40]);
+    let negative = bc6h_block([-40, 40, 0]);
+    let data = [positive, negative, negative].concat();
+    const DXGI_BC6H_SF16: u32 = 96;
+    let mut file = dds(b"DX10", Some((DXGI_BC6H_SF16, 0)), [4, 4], &data);
+    file[8..12].copy_from_slice(&(0x1007u32 | 0x20000).to_le_bytes());
+    file[28..32].copy_from_slice(&3u32.to_le_bytes());
+    assert_eq!(read_back(&d, &file).0, 2, "as a file");
+
+    std::fs::write(d.join("mips.dds"), &file).unwrap();
+    let (a, m, _) = usd(&d, "mips.dds", "color3f inputs:emissiveColor", "rgb", "");
+    let e = a.find(m.textures[slot::EMISSION].texture).unwrap();
+    assert_eq!(mips(&a, a.name(e)).0.header.primaries, 2, "as a material");
+
+    // A BC1 block of one color, in a file whose remap takes its mips below 0.
+    let bc1_block =
+        |color: u16| [color.to_le_bytes(), color.to_le_bytes(), [0; 2], [0; 2]].concat();
+    let data = [bc1_block(0xffff), bc1_block(0), bc1_block(0)].concat();
+    const DXGI_BC1_UNORM: u32 = 71;
+    let mut file = dds(b"DX10", Some((DXGI_BC1_UNORM, 0)), [4, 4], &data);
+    file[8..12].copy_from_slice(&(0x1007u32 | 0x20000).to_le_bytes());
+    file[28..32].copy_from_slice(&3u32.to_le_bytes());
+    std::fs::write(d.join("remapped.dds"), &file).unwrap();
+    let remap = r#"token inputs:sourceColorSpace = "raw"
+                float4 inputs:bias = (-0.5, 0, 0, 0)"#;
+    let (a, m, _) = usd(
+        &d,
+        "remapped.dds",
+        "color3f inputs:emissiveColor",
+        "rgb",
+        remap,
+    );
+    let e = a.find(m.textures[slot::EMISSION].texture).unwrap();
+    assert_eq!(mips(&a, a.name(e)).0.header.primaries, 2, "through a remap");
+}
+
+/// A curve can read an unsigned file's black below 0, and what the file stores says if it does.
+#[test]
+fn a_curve_below_zero_at_black_converts_what_reads_there() {
+    const KHR_DF_TRANSFER_SLOG: u8 = 5;
+    let d = dir("below-zero-curve");
+    let slog = |[r, g, b]: [f32; 3]| {
+        let format = ctt::TargetFormat::Uncompressed(ctt::Format::R8G8B8A8_UNORM);
+        let mut file = float_ktx2(8, 8, format, false, |_, _| [r, g, b, 1.0]);
+        let dfd = u32::from_le_bytes(file[48..52].try_into().unwrap()) as usize;
+        file[dfd + 14] = KHR_DF_TRANSFER_SLOG;
+        file
+    };
+    assert_eq!(read_back(&d, &slog([0.5; 3])).0, 0);
+    assert_eq!(read_back(&d, &slog([0.0, 0.5, 0.5])).0, 2);
+
+    let path = d.join("black");
+    std::fs::write(&path, slog([0.0; 3])).unwrap();
+    let settings = TextureSettings {
+        usage: Usage::Hdr,
+        mips: Some(false),
+        ..Default::default()
+    };
+    let (_, report) = cook(Source::Texture { path, settings });
+    assert_eq!(clip_warnings(&report), 1);
 }
 
 fn assert_rgb(got: [f32; 4], want: [f32; 3], what: &str) {

@@ -1,6 +1,7 @@
 //! Texture cook: import, mip chains, encoding, and the tiled archive layout.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) mod color;
 mod encode;
@@ -20,10 +21,10 @@ use orr_pack::texture::{
 use orr_pack::{ArchiveWriter, AssetId, BcLayout, BlobIn, Class, Filter, Hash32, Span};
 use serde::Deserialize;
 
-use color::{CLIPS_BELOW, Decode, ImageColor, Read};
+use color::{BELOW_ZERO, Decode, ImageColor, Read};
 use ctt::Quality;
 pub(crate) use encode::{Encoding, encode as encode_chains};
-use load::{Blocks, Gray, Source};
+use load::{Blocks, Source};
 pub(crate) use load::{decode_blocks, decode_channel, file_header};
 use mips::{MipSpec, Toksvig};
 
@@ -47,7 +48,8 @@ pub struct TextureSettings {
     /// coverage per cell; smaller mips filter the whole texture.
     pub atlas_grid: Option<[u16; 2]>,
     /// Source primaries of color texels; overrides what the file states. Files that state none
-    /// are Rec. 709, and primaries with no id convert to Rec. 2020.
+    /// are Rec. 709, and primaries with no id convert to Rec. 2020, as does a file that reads below
+    /// 0 unless these are set.
     pub primaries: Option<Primaries>,
     pub filter: MipFilter,
     /// What the mip filter reads past each edge, per axis (u, v).
@@ -334,6 +336,13 @@ impl Built {
         };
         self
     }
+
+    fn with_clips(self, clips: &AtomicBool) -> Self {
+        Self {
+            clips: clips.load(Ordering::Relaxed),
+            ..self
+        }
+    }
 }
 
 /// Whether a format's blocks are split when the settings leave it open.
@@ -583,13 +592,7 @@ pub(crate) fn cook_file(
     quality: Quality,
 ) -> Result<Built> {
     load::open(bytes)
-        .and_then(|mut src| {
-            let clips = clips(&mut src, s)?;
-            Ok(Built {
-                clips,
-                ..cook_source(src, s, quality)?
-            })
-        })
+        .and_then(|src| cook_source(src, s, quality))
         .map(|b| b.with_split(s.bc_split))
         .map_err(|message| Error::Texture {
             asset: asset.into(),
@@ -615,29 +618,26 @@ fn reads_color(usage: Usage) -> bool {
     )
 }
 
-/// Whether `src`, read as `s` says, holds colors a texture can't: past Rec.2020, or below 0 in
-/// the primaries they stay in. Gray that decoding spreads over RGB stays neutral through any
-/// primaries.
-fn clips(src: &mut Source, s: &TextureSettings) -> Result<bool, String> {
-    if !reads_color(s.usage) {
-        return Ok(false);
-    }
-    let (read, _, gamut) = ImageColor::File.color(&src.color, s.primaries);
-    let neutral = matches!(src.gray, Gray::Alone | Gray::WithAlpha);
-    if !neutral && read.clips(gamut.as_ref()) {
-        return Ok(true);
-    }
-    if !src.negatives {
-        return Ok(false);
-    }
-    load::decode_layers(src)?;
-    let below = |v: &f32| f64::from(*v) < CLIPS_BELOW;
-    let mut texels = src.layers.iter().flat_map(|l| &l.px);
-    Ok(texels.any(|p| p[..3].iter().any(below)))
-}
-
 fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result<Built, String> {
-    let (read, primaries, gamut) = ImageColor::File.color(&src.color, s.primaries);
+    let color = reads_color(s.usage);
+    let negatives = color && (src.negatives || src.color.can_read_below());
+    let lowest = if negatives {
+        load::stored_range(&src)?.map(|r| r.0)
+    } else {
+        [0.0; 4]
+    };
+    let (read, primaries, gamut) = ImageColor::File.color(&src.color, s.primaries, |read| {
+        lowest[..3].iter().any(|&v| read.alone(v) < BELOW_ZERO)
+    });
+    let gamut = gamut.as_ref();
+    let measures = negatives || (color && read.reaches_past(gamut));
+    let clipped = AtomicBool::new(false);
+    // The conversion says whether a color clips, and the first that does settles it.
+    let measure = |read: &Read, p: [f32; 4]| {
+        if measures && !clipped.load(Ordering::Relaxed) && read.clips(p, gamut) {
+            clipped.store(true, Ordering::Relaxed);
+        }
+    };
     if let Usage::Environment {
         light_threshold,
         max_lights,
@@ -653,9 +653,11 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
             ..read
         };
         for p in src.layers.iter_mut().flat_map(|l| &mut l.px) {
-            *p = read.color(*p, gamut.as_ref());
+            measure(&read, *p);
+            *p = read.color(*p, gamut);
         }
-        return env::cook(src, s, primaries, light_threshold, max_lights, quality);
+        return env::cook(src, s, primaries, light_threshold, max_lights, quality)
+            .map(|b| b.with_clips(&clipped));
     }
     let full_chain = s.mips.unwrap_or(s.usage.has_mips());
     let kept_levels = |b: &Blocks| kept_mip_count(b.w, b.h, s.max_size, full_chain) as usize;
@@ -683,7 +685,6 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         (Some(c), Usage::Linear1) => Some((0, c)),
         (Some(_), u) => return Err(format!("alpha_cutoff does not apply to {u:?}")),
     };
-    let color = reads_color(s.usage);
     let normal = s.usage == Usage::Normal;
     let vectors = normal && src.float && src.negatives;
     if vectors {
@@ -698,7 +699,8 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
     };
     let linear = |p: &mut [f32; 4]| {
         if color {
-            *p = read.color(*p, gamut.as_ref());
+            measure(&read, *p);
+            *p = read.color(*p, gamut);
         }
         if normal {
             let [x, y, z] = source.read(*p);
@@ -770,7 +772,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
                     mips::keep_heights(chain, mips::settle_heights(l));
                 }
             }
-            return finish(chains, &plan);
+            return finish(chains, &plan).map(|b| b.with_clips(&clipped));
         }
     }
     load::decode_layers(&mut src)?;
@@ -782,7 +784,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
             l
         })
         .collect();
-    build(layers, &plan)
+    build(layers, &plan).map(|b| b.with_clips(&clipped))
 }
 
 /// Every layer's mips of `b` as stored, without those over `max_size`, decoded and passed

@@ -120,6 +120,36 @@ pub(super) fn decode_layers(src: &mut Source) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `test` holds of an image `src` stores: mip 0 of each layer, and of blocks every mip,
+/// which a cook can keep. Each is decoded for the test, so it stops at the first that holds.
+pub(super) fn any_stored(src: &Source, mut test: impl FnMut(&Img) -> bool) -> Result<bool, String> {
+    let Some(b) = &src.blocks else {
+        return Ok(src.layers.iter().any(test));
+    };
+    for layer in &b.levels {
+        for (m, bytes) in layer.iter().enumerate() {
+            let [w, h] = mip_size(b.w, b.h, m as u32);
+            if test(&decode_blocks(b.vk_format, w, h, bytes)?) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Per channel, the lowest and highest finite value of every image `src` stores.
+pub(super) fn stored_range(src: &Source) -> Result<[(f32, f32); 4], String> {
+    let mut range = [(f32::MAX, f32::MIN); 4];
+    any_stored(src, |l| {
+        for (c, r) in range.iter_mut().enumerate() {
+            let (lo, hi) = l.finite_range(c);
+            *r = (r.0.min(lo), r.1.max(hi));
+        }
+        false
+    })?;
+    Ok(range)
+}
+
 /// Opens an image file like [`decode`], but leaves `layers` empty when the file holds
 /// block-compressed texels.
 pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {

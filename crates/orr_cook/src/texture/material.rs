@@ -39,7 +39,7 @@
 
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -52,7 +52,7 @@ use orr_pack::{AssetId, Class, Hash32};
 use rayon::prelude::*;
 use serde::Deserialize;
 
-use super::color::{CLIPS_BELOW, Decode, FileColor, ImageColor, Read, multiply};
+use super::color::{BELOW_ZERO, Decode, FileColor, ImageColor, Read, clipped, multiply};
 use super::load::{self, Blocks, Gray, Source};
 use super::mips::{MipSpec, Toksvig, normalized, settled};
 use super::neural::{self, NeuralJob, NeuralSettings};
@@ -248,6 +248,13 @@ impl MaterialTextures {
         .flatten()
     }
 
+    /// The references of color inputs.
+    pub(crate) fn colors(&self) -> impl Iterator<Item = &TexRef> {
+        [&self.base_color, &self.emissive, &self.subsurface_color]
+            .into_iter()
+            .flatten()
+    }
+
     /// The image of a normal map that [`ImageFacts::cant_read`].
     pub(crate) fn unscaled_normal(&self, facts: &HashMap<usize, ImageFacts>) -> Option<usize> {
         let r = &self.normal.as_ref()?.0;
@@ -302,9 +309,13 @@ pub(crate) struct ImageFacts {
     color: FileColor,
     /// Per channel, the value every texel lies within 1/255 of, if there is one.
     constant: [Option<f32>; 4],
-    /// Per channel, the lowest and highest value of mip 0. Only a float image or one read as a
-    /// height is sure to have all of it: reading blocks stops once every channel varies.
+    /// Per channel, the lowest and highest value of mip 0, or of every mip the file stores of a
+    /// color that can read below 0. Only a float image or one read with all of its range is sure
+    /// to have all of it: reading blocks stops once every channel varies.
     range: [(f32, f32); 4],
+    /// A color channel holds negative infinity, which [`Self::range`] leaves out: it has no color
+    /// to convert, and clips.
+    minus_infinity: bool,
     hash: Hash32,
     /// The block format of a block-compressed file, and whether it has every mip.
     blocks: Option<(u32, bool)>,
@@ -345,15 +356,17 @@ fn decode(bytes: &[u8]) -> Result<Img, String> {
     Ok(layers.remove(0))
 }
 
-/// Facts of the images `used`, of which `heights` are read as heights and `normals` as normal
-/// maps that say nothing of their encoding, read in parallel. File images are read through the
-/// memo, and each one's hash and length are recorded in its [`ImageData::File`].
+/// Facts of the images `used`, of which `whole` are read with all of their range, `normals` as
+/// normal maps that say nothing of their encoding and `colors` as color, read in parallel. File
+/// images are read through the memo, and each one's hash and length are recorded in its
+/// [`ImageData::File`].
 pub(crate) fn image_facts(
     asset: &str,
     images: &mut [ImageFile],
     used: &[usize],
-    heights: &HashSet<usize>,
+    whole: &HashSet<usize>,
     normals: &HashSet<usize>,
+    colors: &HashSet<usize>,
     memo: &Memo,
 ) -> Result<HashMap<usize, ImageFacts>> {
     let fail = |message: String| Error::Texture {
@@ -375,7 +388,8 @@ pub(crate) fn image_facts(
                     (Cow::Owned(bytes), hash, Some(len))
                 }
             };
-            let facts = facts_of(&bytes, hash, heights.contains(&i), normals.contains(&i))
+            let reads = [whole, normals, colors].map(|s| s.contains(&i));
+            let facts = facts_of(&bytes, hash, reads)
                 .map_err(|e| fail(format!("image {}: {e}", file.name)))?;
             Ok((i, (facts, read)))
         })
@@ -390,18 +404,26 @@ pub(crate) fn image_facts(
     Ok(out)
 }
 
-/// The facts of one image file's bytes, with all of its range if it is a `height`, and how it
-/// stores normals if it is a `normal` map.
-fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<ImageFacts, String> {
+/// The facts of one image file's bytes, with all of its range if it is read `whole`, how it
+/// stores normals if it is a `normal` map, and what a `color` reads below 0 in any mip it stores.
+fn facts_of(
+    bytes: &[u8],
+    hash: Hash32,
+    [whole, normal, color]: [bool; 3],
+) -> Result<ImageFacts, String> {
     let _z = crate::profile::zone!("texture.facts");
     // A channel is constant when it spans at most one UNORM8 step.
     const SPREAD: f32 = 1.0 / 255.0 + 1e-6;
-    let spread = if height { f32::INFINITY } else { SPREAD };
+    let spread = if whole { f32::INFINITY } else { SPREAD };
     let constant = |range: [(f32, f32); 4]| {
         range.map(|(lo, hi)| (hi - lo <= SPREAD).then_some(0.5 * (lo + hi)))
     };
+    let every_mip = |negatives, f: &FileColor| color && (whole || negatives || f.can_read_below());
     if let Some(scan) = load::scan_ktx2(bytes, spread) {
-        let s = scan?;
+        let mut s = scan?;
+        if every_mip(s.negatives, &s.color) {
+            s.range = load::stored_range(&load::open(bytes)?)?;
+        }
         let stored_normals = s.signed
             || (normal
                 && s.float
@@ -413,6 +435,7 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
             color: s.color,
             constant: constant(s.range),
             range: s.range,
+            minus_infinity: false,
             hash,
             blocks: Some((s.vk_format, s.complete)),
             rg: s.rg,
@@ -435,6 +458,7 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
         load::decode_layers(&mut src)?;
     }
     let (w, h, range) = match &src.blocks {
+        Some(b) if every_mip(src.negatives, &src.color) => (b.w, b.h, load::stored_range(&src)?),
         Some(b) => {
             let range = load::block_range(b.vk_format, b.w, b.h, &mut &b.levels[0][0][..], spread)?;
             (b.w, b.h, range)
@@ -445,12 +469,15 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
             (img.w, img.h, std::array::from_fn(|c| img.finite_range(c)))
         }
     };
+    let mut texels = src.layers.iter().flat_map(|l| &l.px);
+    let minus_infinity = src.float && texels.any(|p| p[..3].contains(&f32::NEG_INFINITY));
     Ok(ImageFacts {
         w,
         h,
         color: src.color,
         constant: constant(range),
         range,
+        minus_infinity,
         hash,
         blocks: src.blocks.as_ref().map(|b| (b.vk_format, b.complete())),
         rg: src.rg,
@@ -870,28 +897,71 @@ impl<'a> Packer<'a> {
     /// of its image, under the last override that sets its primaries.
     fn color_read(&self, r: &TexRef) -> (Read, Primaries, Option<DMat3>) {
         let over = self.overridden(&[r.image], |o| o.primaries);
-        r.color.color(&self.image(r.image).color, over)
+        let color = &self.image(r.image).color;
+        r.color.color(color, over, |read| self.reads_below(r, read))
     }
 
-    /// The images of `t`'s color inputs with colors a texture can't hold: past Rec.2020, or below
-    /// 0 in the primaries they stay in. Gray that repeats over RGB stays neutral through any
-    /// primaries.
-    pub(crate) fn clipped(&self, t: &MaterialTextures) -> Vec<usize> {
-        [&t.base_color, &t.emissive, &t.subsurface_color]
-            .into_iter()
-            .flatten()
-            .filter(|r| {
-                let (read, _, gamut) = self.color_read(r);
-                let f = self.image(r.image);
-                let neutral = r.rules != ImageRules::MaterialX && f.gray != Gray::No;
-                let below = |c| {
-                    self.read(r, c)
-                        .is_ok_and(|s| f64::from(r.read(c, f.range[s].0)) < CLIPS_BELOW)
+    /// Whether color input `r`, through `read`, holds a value below 0, in the primaries of its file
+    /// and through its remap.
+    fn reads_below(&self, r: &TexRef, read: &Read) -> bool {
+        let f = self.image(r.image);
+        (0..3).any(|c| match self.read(r, c) {
+            Ok(held) => {
+                let (lo, hi) = f.range[held];
+                let below = |&v: &f32| r.read(c, read.alone(v)) < BELOW_ZERO;
+                lo <= hi && [lo, hi].iter().any(below)
+            }
+            Err(v) => r.read(c, v) < BELOW_ZERO,
+        })
+    }
+
+    /// Whether any texel of `img` still clips once color input `r` has read and converted it.
+    fn texels_clip(&self, r: &TexRef, img: &Img) -> bool {
+        let (read, _, gamut) = self.color_read(r);
+        let channels = [0, 1, 2].map(|c| self.read(r, c));
+        img.px.par_iter().any(|t| {
+            let reach = read.reach(*t);
+            let rgb = std::array::from_fn(|c| {
+                r.read(c, channels[c].map_or_else(|v| v, |held| reach[held]))
+            });
+            clipped(gamut.as_ref().map_or(rgb, |m| multiply(m, rgb)))
+        })
+    }
+
+    /// The images of `materials`' color inputs with colors a texture can't hold, measured through
+    /// what they convert to. An image is decoded here only if a value below 0 or primaries past
+    /// Rec.2020 can clip.
+    pub(crate) fn clipped<'m>(
+        &self,
+        materials: impl Iterator<Item = &'m MaterialTextures>,
+    ) -> Result<BTreeSet<usize>> {
+        let mut reads: BTreeMap<usize, Vec<&TexRef>> = BTreeMap::new();
+        for r in materials.flat_map(MaterialTextures::colors) {
+            let (read, _, gamut) = self.color_read(r);
+            let below = self.image(r.image).minus_infinity || self.reads_below(r, &read);
+            if below || read.reaches_past(gamut.as_ref()) {
+                let refs = reads.entry(r.image).or_default();
+                let same = |o: &&TexRef| (o.color, o.rules, o.remap) == (r.color, r.rules, r.remap);
+                if !refs.iter().any(same) {
+                    refs.push(r);
+                }
+            }
+        }
+        let reads: Vec<_> = reads.into_iter().collect();
+        let found: Vec<Option<usize>> = reads
+            .par_iter()
+            .map(|(i, refs)| {
+                let file = &self.images[*i];
+                let fail = |message| Error::Texture {
+                    asset: self.asset.into(),
+                    message: format!("image {}: {message}", file.name),
                 };
-                (!neutral && read.clips(gamut.as_ref())) || (0..3).any(below)
+                let src = load::open(&file.bytes()?).map_err(fail)?;
+                let clips = load::any_stored(&src, |l| refs.iter().any(|r| self.texels_clip(r, l)));
+                Ok(clips.map_err(fail)?.then_some(*i))
             })
-            .map(|r| r.image)
-            .collect()
+            .collect::<Result<_>>()?;
+        Ok(found.into_iter().flatten().collect())
     }
 
     /// The channel `r` reads for an input: the last override for its image that sets the
@@ -1264,16 +1334,13 @@ impl<'a> Packer<'a> {
         // A premultiplied file's color varies with its alpha.
         let alpha = self.image(r.image).constant[3];
         if held && (alpha.is_some() || !read.straight) {
-            let [x, y, z] = [0, 1, 2].map(|c| {
-                let v = self.stored_constant(r, c).expect("constant");
-                v.clamp(0.0, top)
-            });
+            let [x, y, z] = [0, 1, 2].map(|c| self.stored_constant(r, c).expect("constant"));
             let t = [x, y, z, alpha.unwrap_or(1.0)];
-            let mut texel: [f32; 3] =
-                std::array::from_fn(|c| r.read(c, read.value(t, c)).clamp(0.0, top));
+            let mut texel: [f32; 3] = std::array::from_fn(|c| r.read(c, read.value(t, c)));
             if let Some(m) = &gamut {
-                texel = multiply(m, texel).map(|v| v.clamp(0.0, top));
+                texel = multiply(m, texel);
             }
+            let texel = texel.map(|v| v.clamp(0.0, top));
             let target = color(m);
             // Rec.709 multiplies directly, so its factors stay exact.
             *target = match primaries {

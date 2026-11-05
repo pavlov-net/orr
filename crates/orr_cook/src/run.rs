@@ -1682,10 +1682,20 @@ fn plan_scene(
         .collect();
     used.sort_unstable();
     used.dedup();
-    let heights: HashSet<usize> = src
+    let colors: HashSet<usize> = src
         .materials
         .iter()
-        .filter_map(|m| m.textures.displacement.map(|r| r.image))
+        .flat_map(|m| m.textures.colors().map(|r| r.image))
+        .collect();
+    // A height's range is what it stores, and a remap can take a color's below 0.
+    let whole: HashSet<usize> = src
+        .materials
+        .iter()
+        .flat_map(|m| {
+            let remapped = m.textures.colors().filter(|r| r.remap.is_some());
+            m.textures.displacement.iter().chain(remapped)
+        })
+        .map(|r| r.image)
         .collect();
     let normals: HashSet<usize> = src
         .materials
@@ -1694,8 +1704,15 @@ fn plan_scene(
         .filter(|n| n.0.rules == ImageRules::Gltf)
         .map(|n| n.0.image)
         .collect();
-    let facts: HashMap<usize, ImageFacts> =
-        image_facts(name, &mut src.images, &used, &heights, &normals, memo)?;
+    let facts: HashMap<usize, ImageFacts> = image_facts(
+        name,
+        &mut src.images,
+        &used,
+        &whole,
+        &normals,
+        &colors,
+        memo,
+    )?;
     let mut warnings = std::mem::take(&mut src.warnings);
     warnings.extend(
         used.iter()
@@ -1734,11 +1751,7 @@ fn plan_scene(
         materials.push((AssetId::from_name(&unit.name), unit.key, cooked));
         units.push(unit);
     }
-    let clipped: BTreeSet<usize> = src
-        .materials
-        .iter()
-        .flat_map(|m| packer.clipped(&m.textures))
-        .collect();
+    let clipped = packer.clipped(src.materials.iter().map(|m| &m.textures))?;
     if let Some(&first) = clipped.first() {
         let name = &src.images[first].name;
         warnings.push(texture::gamut_warning(&match clipped.len() - 1 {
