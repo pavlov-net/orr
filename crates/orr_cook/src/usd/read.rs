@@ -577,6 +577,23 @@ impl PrimReader<'_> {
         }))
     }
 
+    /// Primvar `name` of tangent frame vectors, as wide as its type declares: three components, or
+    /// four where the last is a bitangent sign.
+    pub(super) fn frame_primvar(&self, name: &str) -> Result<Option<Primvar>, String> {
+        let full = format!("primvars:{name}");
+        let Some(value) = self.value(&full)? else {
+            return Ok(None);
+        };
+        match element_width(&value).map(|w| w * self.element_size(&full)) {
+            Some(width @ (3 | 4)) => self.primvar(name, width, None),
+            Some(width) => Err(format!(
+                "{} {full}: {width} components, not a vector of three or four",
+                self.path()
+            )),
+            None => self.primvar(name, 3, None),
+        }
+    }
+
     /// Whether primvar `name` holds values.
     pub(super) fn holds_primvar(&self, name: &str) -> Result<bool, String> {
         let held = self.numbers(&format!("primvars:{name}"))?;

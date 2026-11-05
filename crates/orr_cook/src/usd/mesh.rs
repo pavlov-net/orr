@@ -360,7 +360,11 @@ pub(super) fn corner_tangents<'a>(
                         1.0
                     }
                 }
-                None => out[3 * k + c][3],
+                None => match v.get(3) {
+                    Some(&w) if w < 0.0 => -1.0,
+                    Some(_) => 1.0,
+                    None => out[3 * k + c][3],
+                },
             };
             let [x, y, z] = tangent.as_vec3().to_array();
             out[3 * k + c] = [x, y, z, sign];

@@ -1705,6 +1705,27 @@ fn tangents_on_a_cage_warn_that_they_are_not_read() {
     assert_eq!(warnings.iter().filter(says).count(), 2, "{warnings:?}");
 }
 
+/// A tangent's declared type says how wide it is: four components hold a bitangent sign last,
+/// also where their count divides by three.
+#[test]
+fn four_component_tangents_state_their_sign() {
+    for w in [1.0f32, -1.0] {
+        let want = |_: Vec3| Some([0.0, 1.0, 0.0, w]);
+        let each = vec![format!("(0, 1, 0, {w})"); 12].join(", ");
+        for tangents in [
+            format!(
+                "float4[] primvars:tangents = [(0, 1, 0, {w})] (\n interpolation = \"constant\"\n)"
+            ),
+            format!("float4[] primvars:tangents = [{each}] (\n interpolation = \"vertex\"\n)"),
+            format!(
+                "float[] primvars:tangents = [0, 1, 0, {w}] (\n elementSize = 4\n interpolation = \"constant\"\n)"
+            ),
+        ] {
+            assert_tangents(&framed("frame-four", &tangents, "", false), want);
+        }
+    }
+}
+
 #[test]
 fn frame_primvars_state_tangents_and_their_handedness() {
     let primvars = |tangents: &str, binormals: &str, y: f32| {

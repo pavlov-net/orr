@@ -690,11 +690,15 @@ impl<'s> Importer<'s> {
             let mut primvars: HashMap<String, Option<Primvar>> = HashMap::new();
             for &m in &used {
                 let frame = &self.frames[m];
-                let names = [&frame.tangents, &frame.binormals].map(|n| (n, 3));
-                for (name, width) in names.into_iter().chain(frame.st.iter().map(|n| (n, 2))) {
+                for name in [&frame.tangents, &frame.binormals] {
                     if !primvars.contains_key(name) {
-                        primvars.insert(name.clone(), r.primvar(name, width, None)?);
+                        primvars.insert(name.clone(), r.frame_primvar(name)?);
                     }
+                }
+                if let Some(name) = &frame.st
+                    && !primvars.contains_key(name)
+                {
+                    primvars.insert(name.clone(), r.primvar(name, 2, None)?);
                 }
                 let reads = self.materials[m].tangent_set().is_some();
                 if let Some(st) = &frame.st
