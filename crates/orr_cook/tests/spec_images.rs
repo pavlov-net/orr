@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use float_ktx2::float_ktx2;
 use orr_cook::{
-    ArchiveSpec, AssetSpec, CookReport, DataFormat, GltfSettings, Manifest, MipFilter, Source,
-    TextureRules, TextureSettings, Usage, UsdSettings,
+    ArchiveSpec, AssetSpec, CookReport, DataFormat, GltfSettings, InputChannels, Manifest,
+    MipFilter, Source, TextureOverride, TextureRules, TextureSettings, Usage, UsdSettings,
 };
 use orr_pack::material::{Material, slot};
 use orr_pack::texture::{mip_size, vk};
@@ -43,16 +43,15 @@ fn material(a: &Archive, name: &str) -> Material {
     Material::from_bytes(&read_blob(a, e, 0)).unwrap()
 }
 
-/// Cooks a MaterialX document with one `image` node `i` of `kind` reading `file`, under an
-/// `open_pbr_surface` with `inputs`.
-fn materialx(d: &Path, file: &str, kind: &str, inputs: &str) -> (Archive, Material) {
+/// Cooks a MaterialX document of `nodes`, under an `open_pbr_surface` with `inputs`.
+fn mtlx(d: &Path, nodes: &str, inputs: &str, textures: TextureRules) -> (Archive, Material) {
     let doc = d.join("m.mtlx");
     std::fs::write(
         &doc,
         format!(
             r#"<?xml version="1.0"?>
 <materialx version="1.39">
-  <image name="i" type="{kind}"><input name="file" type="filename" value="{file}"/></image>
+  {nodes}
   <open_pbr_surface name="S" type="surfaceshader">{inputs}</open_pbr_surface>
   <surfacematerial name="M" type="material">
     <input name="surfaceshader" type="surfaceshader" nodename="S"/>
@@ -65,10 +64,44 @@ fn materialx(d: &Path, file: &str, kind: &str, inputs: &str) -> (Archive, Materi
     let (a, _) = cook(Source::MaterialX {
         path: doc,
         material: "M".into(),
-        textures: TextureRules::default(),
+        textures,
     });
     let m = material(&a, "u");
     (a, m)
+}
+
+/// Cooks a MaterialX document with one `image` node `i` of `kind` reading `file`, under an
+/// `open_pbr_surface` with `inputs`.
+fn materialx(d: &Path, file: &str, kind: &str, inputs: &str) -> (Archive, Material) {
+    let image = format!(
+        r#"<image name="i" type="{kind}"><input name="file" type="filename" value="{file}"/></image>"#
+    );
+    mtlx(d, &image, inputs, TextureRules::default())
+}
+
+/// A `UsdUVTexture` `i` of `kind` reading `file` with its `scale` and `bias`.
+fn reader(file: &str, kind: &str, [scale, bias]: [&str; 2]) -> String {
+    format!(
+        r#"<UsdUVTexture name="i" type="{kind}">
+    <input name="file" type="filename" value="{file}"/>
+    <input name="scale" type="vector4" value="{scale}"/>
+    <input name="bias" type="vector4" value="{bias}"/>
+  </UsdUVTexture>"#
+    )
+}
+
+/// Cooks a MaterialX document whose `open_pbr_surface` has `inputs`, over a [`reader`] and any
+/// further `nodes`.
+fn usd_reader(
+    d: &Path,
+    file: &str,
+    kind: &str,
+    pair: [&str; 2],
+    nodes: &str,
+    inputs: &str,
+) -> (Archive, Material) {
+    let nodes = format!("{}\n  {nodes}", reader(file, kind, pair));
+    mtlx(d, &nodes, inputs, TextureRules::default())
 }
 
 /// Cooks a USD quad whose `UsdPreviewSurface` input `surface` connects to output `output` of a
@@ -125,6 +158,8 @@ def Xform "World"
                 float2 inputs:st.connect = </World/Looks/M/St.outputs:result>
                 {reader}
                 float3 outputs:rgb
+                float outputs:r
+                float outputs:a
             }}
             def Shader "St"
             {{
@@ -219,6 +254,15 @@ fn hdr_emission_keeps_values_above_1() {
     assert_eq!(format, vk::BC6H_UFLOAT);
     assert!((texels[0][0] - 5.0).abs() < 0.1, "{:?}", texels[0]);
 
+    // A bias past 1 on 8-bit texels goes to the field, so they keep to BC7.
+    let ramp = image::RgbImage::from_fn(8, 8, |x, _| image::Rgb([if x < 4 { 0 } else { 255 }; 3]));
+    ramp.save(d.join("ramp.png")).unwrap();
+    let pair = ["2, 2, 2, 1", "0.25, 0.25, 0.25, 0"];
+    let input = r#"<input name="emission_color" type="color3" nodename="i" output="rgb"/>"#;
+    let (a, m) = usd_reader(&d, "ramp.png", "color3", pair, "", input);
+    assert_eq!(m.emission_color, [2.25; 3]);
+    assert_eq!(stored(&a, &m, slot::EMISSION, 8).0, vk::BC7_SRGB);
+
     // BC6H blocks that hold every mip are what the texture stores.
     let intel = ctt::encoders::Encoder::Intel(Default::default());
     let format = ctt::TargetFormat::Compressed {
@@ -282,6 +326,36 @@ fn open_pbr_specular_weight_keeps_values_above_1() {
     assert_eq!(m.specular_weight, 1.0);
     assert_eq!(texel(0), 1.5);
     assert_eq!(texel(7), 0.0, "the range starts at 0");
+
+    let weight = |a: &Archive, m: &Material, i: usize| {
+        let e = a.find(m.textures[slot::SPECULAR_WEIGHT].texture).unwrap();
+        let (info, levels) = mips(a, a.name(e));
+        assert_eq!(info.header.vk_format, vk::R16_SFLOAT);
+        let b = &levels[0][0][2 * i..2 * i + 2];
+        half::f16::from_le_bytes([b[0], b[1]]).to_f32()
+    };
+    let input = r#"<input name="specular_weight" type="float" nodename="i" output="r"/>"#;
+
+    // A bias reaches below the texel's floor: 0.1 - 0.25 reads 0 at the range's start, as a
+    // constant image folds, and a negative weight has no IOR.
+    std::fs::write(
+        d.join("low.ktx2"),
+        float_ktx2(8, 8, f32_rgba(), false, |x, _| {
+            [if x < 4 { 0.1 } else { 1.5 }; 4]
+        }),
+    )
+    .unwrap();
+    let pair = ["1, 1, 1, 1", "-0.25, -0.25, -0.25, -0.25"];
+    let (a, m) = usd_reader(&d, "low.ktx2", "float", pair, "", input);
+    assert_eq!(weight(&a, &m, 0), 0.0);
+    assert_eq!(weight(&a, &m, 7), 1.25);
+
+    // A scale and bias take an 8-bit image past 1 as they do a float one.
+    let ramp = image::GrayImage::from_fn(8, 8, |x, _| image::Luma([if x < 4 { 0 } else { 255 }]));
+    ramp.save(d.join("ramp.png")).unwrap();
+    let pair = ["2, 2, 2, 1", "0.25, 0.25, 0.25, 0"];
+    let (a, m) = usd_reader(&d, "ramp.png", "float", pair, "", input);
+    assert_eq!(weight(&a, &m, 7), 2.25);
 }
 
 /// BC6H: "encoders ... should convert that data to the maximum allowable non-INF representation
@@ -432,6 +506,87 @@ fn one_channel_files_fill_as_their_importer_says() {
     let json = r#"{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}}}"#;
     let (_, m) = gltf(&d, json, gray_png(8, 8, |_, _| 128));
     assert_eq!(m.base_color, [srgb(gray); 3]);
+}
+
+/// USD Preview Surface `UsdUVTexture`: "If a single-channel texture is fed into a UsdUVTexture,
+/// the r, g, and b components of the rgb output will repeat the channel's value, while the single
+/// a output will be set to 1.0. If a two-channel texture is fed into a UsdUVTexture, the r, g, and
+/// b components of the rgb output will repeat the first channel's value, while the single a output
+/// will be set to the second channel's value." This holds of every container, where a block or
+/// KTX2 format decodes as (r, 0, 0, 1) or (r, g, 0, 1); MaterialX keeps those zeros.
+#[test]
+fn few_channel_containers_read_as_their_importer_says() {
+    let d = dir("spec-container-channels");
+    let raw = |f| ctt::TargetFormat::Uncompressed(f);
+    let texel = |_: u32, _: u32| [0.5, 0.25, 0.0, 1.0];
+    let bc4 = ctt::TargetFormat::Compressed {
+        format: ctt::Format::BC4_UNORM_BLOCK,
+        encoder: ctt::encoders::Encoder::Amd(Default::default()),
+    };
+    let files = [("r8.ktx2", raw(ctt::Format::R8_UNORM)), ("bc4.ktx2", bc4)];
+    let color = "color3f inputs:diffuseColor";
+    let base = r#"<input name="base_color" type="color3" nodename="i"/>"#;
+    let raw_space = r#"token inputs:sourceColorSpace = "raw""#;
+    for (file, format) in files {
+        std::fs::write(d.join(file), float_ktx2(8, 8, format, false, texel)).unwrap();
+        let (_, m, _) = usd(&d, file, color, "rgb", raw_space);
+        let [r, g, b] = m.base_color;
+        assert!(
+            (r - 0.5).abs() < 0.01 && r == g && r == b,
+            "{file}: {r} {g} {b}"
+        );
+        let (_, m) = materialx(&d, file, "color3", base);
+        assert_eq!(m.base_color[1..], [0.0, 0.0], "{file}");
+    }
+
+    std::fs::write(
+        d.join("rg8.ktx2"),
+        float_ktx2(8, 8, raw(ctt::Format::R8G8_UNORM), false, texel),
+    )
+    .unwrap();
+    let (_, m, _) = usd(&d, "rg8.ktx2", color, "rgb", raw_space);
+    let [r, g, b] = m.base_color;
+    assert!((r - 0.5).abs() < 0.01 && r == g && r == b, "{r} {g} {b}");
+    let (_, m, _) = usd(&d, "rg8.ktx2", "float inputs:opacity", "a", raw_space);
+    // Opacity under the default `transparent` mode is 1 - transmission.
+    assert!((m.transmission_weight - 0.75).abs() < 0.01, "{m:?}");
+
+    // An override names a channel of the file, past what the outputs make of it.
+    let channels = InputChannels {
+        roughness: Some(1),
+        ..Default::default()
+    };
+    let overrides = vec![(
+        "rg8".to_string(),
+        TextureOverride {
+            channels,
+            ..Default::default()
+        },
+    )];
+    let textures = TextureRules {
+        overrides,
+        ..Default::default()
+    };
+    let (_, m) = mtlx(
+        &d,
+        &reader("rg8.ktx2", "float", ["1, 1, 1, 1", "0, 0, 0, 0"]),
+        r#"<input name="specular_roughness" type="float" nodename="i" output="r"/>"#,
+        textures,
+    );
+    assert!((m.specular_roughness - 0.25).abs() < 0.01, "{m:?}");
+
+    // A two-channel normal map holds x and y, which repeating x over rgb would lose.
+    let tilted = |px: u32, _: u32| [if px < 4 { 0.8 } else { 0.2 }, 0.5, 0.0, 1.0];
+    std::fs::write(
+        d.join("n.ktx2"),
+        float_ktx2(8, 8, raw(ctt::Format::R8G8_UNORM), false, tilted),
+    )
+    .unwrap();
+    let pair = r#"float4 inputs:scale = (2, 2, 2, 1)
+                float4 inputs:bias = (-1, -1, -1, 0)"#;
+    let (a, m, _) = usd(&d, "n.ktx2", "normal3f inputs:normal", "rgb", pair);
+    let (_, texels) = stored(&a, &m, slot::NORMAL, 8);
+    assert!((texels[0][1] - 0.5).abs() < 0.02, "{:?}", texels[0]);
 }
 
 /// A KTX2 whose key/value data starts with `KTXswizzle` set to `swizzle`, with a padding entry
@@ -713,4 +868,55 @@ fn normal_encodings_yield_to_what_the_image_can_hold() {
         mapped("UsdUVTexture", r#" output="rgb""#),
         mapped("image", "")
     );
+
+    // A `normalmap` over a reader means `2 (s t + b) - 1`: scale 0.5 and bias 0.25 on x is
+    // `t - 0.5`, as USD states it with scale 1 and bias -0.5. A stated (2, -1) is the encoding
+    // itself, not `4 t - 3`.
+    let surface_input = r#"<input name="geometry_normal" type="vector3" nodename="n"/>"#;
+    let map = r#"<normalmap name="n" type="vector3"><input name="in" type="vector3" nodename="i" output="rgb"/></normalmap>"#;
+    let read = |pair: [&str; 2]| {
+        let (a, m) = usd_reader(&d, "f.ktx2", "vector3", pair, map, surface_input);
+        normal_hash(&a, &m)
+    };
+    let half_pair = read(["0.5, 1, 1, 1", "0.25, 0, 0, 0"]);
+    let (a, m, _) = usd(
+        &d,
+        "f.ktx2",
+        surface,
+        "rgb",
+        r#"float4 inputs:scale = (1, 2, 2, 1)
+                float4 inputs:bias = (-0.5, -1, -1, 0)"#,
+    );
+    assert_eq!(half_pair, normal_hash(&a, &m));
+    assert_ne!(half_pair, mapped("image", ""));
+    assert_eq!(
+        read(["2, 2, 2, 1", "-1, -1, -1, 0"]),
+        mapped("image", ""),
+        "the encoding, stated"
+    );
+}
+
+/// BC6H_UFLOAT, B10G11R11 and E5B9G9R9 store floats no lower than 0, so like an unsigned integer
+/// image they can't hold a signed vector: with no scale or bias they read as `2 v - 1`.
+#[test]
+fn unsigned_floats_cant_hold_normals_as_they_are() {
+    let d = dir("spec-ufloat-normals");
+    let encoded = |px: u32, _: u32| [if px < 8 { 0.8 } else { 0.2 }, 0.5, 0.9, 1.0];
+    let format = ctt::TargetFormat::Compressed {
+        format: ctt::Format::BC6H_UFLOAT_BLOCK,
+        encoder: ctt::encoders::Encoder::Intel(Default::default()),
+    };
+    std::fs::write(d.join("n.ktx2"), float_ktx2(16, 16, format, false, encoded)).unwrap();
+    let surface = "normal3f inputs:normal";
+    let (a, m, report) = usd(&d, "n.ktx2", surface, "rgb", "");
+    assert_eq!(
+        report.assets.iter().flat_map(|e| &e.warnings).count(),
+        1,
+        "{report:?}"
+    );
+    let unscaled = normal_hash(&a, &m);
+    let pair = r#"float4 inputs:scale = (2, 2, 2, 1)
+                float4 inputs:bias = (-1, -1, -1, 0)"#;
+    let (a, m, _) = usd(&d, "n.ktx2", surface, "rgb", pair);
+    assert_eq!(unscaled, normal_hash(&a, &m));
 }
