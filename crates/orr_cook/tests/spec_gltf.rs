@@ -8,6 +8,8 @@ mod glb;
 #[allow(dead_code)]
 #[path = "common/tagged.rs"]
 mod tagged;
+#[path = "common/tangent_quads.rs"]
+mod tangent_quads;
 
 use std::path::{Path, PathBuf};
 
@@ -492,6 +494,49 @@ fn tangents_without_normals_are_ignored() {
         normals.iter().all(|&n| near(n.into(), Vec3::Z)),
         "{normals:?}"
     );
+}
+
+/// A normal texture whose texels differ in x and y, for tangents to turn.
+fn textured_normals() -> Vec<u8> {
+    png(16, |x, y| {
+        [96 + (x * 4) as u8, 160 - (y * 4) as u8, 255, 255]
+    })
+}
+
+/// L1825, L2832: the bitangent is `cross(normal, tangent) * w`, and the texture's y turns along
+/// it. `NormalTangentMirrorTest`'s quads, plain and mirrored, shade the same from their stored
+/// tangents as from the triangle's uvs: the cook drops the stored ones.
+#[test]
+fn uv_tangents_share_the_handedness_of_published_ones() {
+    let path = dir("handed").join("quads.glb");
+    let (p, n, uv, t, idx) = tangent_quads::arrays();
+    let mut g = Glb::default();
+    let (pa, na, ta, ua) = (
+        g.floats(&p, "VEC3"),
+        g.floats(&n, "VEC3"),
+        g.floats(&t, "VEC4"),
+        g.floats(&uv, "VEC2"),
+    );
+    let ia = g.indices(&idx);
+    let img = g.image(&textured_normals());
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"NORMAL":{na},"TANGENT":{ta},"TEXCOORD_0":{ua}}},"indices":{ia},"material":0}}]}}],
+"materials":[{{"normalTexture":{{"index":0}}}}],
+"textures":[{{"source":0}}],"images":[{{"bufferView":{img},"mimeType":"image/png"}}]"#
+        ),
+    );
+    let (_, report) = cooked(&path);
+    let mesh = report
+        .assets
+        .iter()
+        .flat_map(|a| &a.entries)
+        .find_map(|e| e.mesh.clone())
+        .unwrap();
+    let t = mesh.tangents.unwrap();
+    assert!(t.derived && t.angle_p99.unwrap() < 0.1, "{t:?}");
 }
 
 /// L2899: "If the alpha value is greater than or equal to the alpha cutoff value, the material

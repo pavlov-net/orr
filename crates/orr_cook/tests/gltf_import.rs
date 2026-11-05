@@ -2061,9 +2061,9 @@ fn normal_mapped(path: &Path, seam: bool) {
         .iter()
         .map(|p| {
             if seam && (p[0] - 0.5).abs() < 1e-4 {
-                [0.0, 0.0, 1.0, -1.0]
+                [0.0, 0.0, 1.0, 1.0]
             } else {
-                [1.0, 0.0, 0.0, -1.0]
+                [1.0, 0.0, 0.0, 1.0]
             }
         })
         .collect();

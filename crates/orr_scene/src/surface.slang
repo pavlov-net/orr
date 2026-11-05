@@ -191,11 +191,13 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
         decal_over(layer.emission, layer.emission_cover, material_color(m, TEXTURE_EMISSION, fs, material_emission(m)), share);
     if ((c & DECAL_NORMAL) != 0)
     {
-        // The decal's tangent frame on the surface: its x axis, and its uv's v (down its y
-        // axis) as the bitangent, as on a mesh whose uv runs like the decal's.
+        // The decal's tangent frame on the surface: its x axis, and up its y axis, against
+        // its uv's v, as on a mesh whose uv runs like the decal's. A surface past 90 degrees
+        // from +z sees the projection mirrored.
         float3 n = i.normal;
         float3 t = safe_normalize(axis_x - n * dot(n, axis_x), cross(n, axis_y));
-        float3 b = -cross(n, t);
+        float3 b = cross(n, t);
+        b = dot(b, axis_y) < 0.0 ? -b : b;
         float3 v = float3(0.0, 0.0, 1.0);
         if (material_bound(m, TEXTURE_NORMAL))
             v = material_normal_frame(m, TEXTURE_NORMAL, normal_decode(material_texture(m, TEXTURE_NORMAL, fs, float4(0.5, 0.5, 1.0, 1.0)).xy));

@@ -128,7 +128,8 @@ impl Triangle {
         let (tangent, bitangent) = if r != 0.0 {
             (
                 (e1 * uv2[1] - e2 * uv1[1]) / r,
-                (e2 * uv1[0] - e1 * uv2[0]) / r,
+                // Uv v runs down the image and a normal map's y up it.
+                (e1 * uv2[0] - e2 * uv1[0]) / r,
             )
         } else {
             (Vec3::ZERO, Vec3::ZERO)

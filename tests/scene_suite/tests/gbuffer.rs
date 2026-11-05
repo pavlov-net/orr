@@ -28,7 +28,7 @@ use orr_gpu::{
     ComputePipeline, GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, ShaderModule, Stages,
     Texture, TextureRegion,
 };
-use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_pack::clip::Clip;
 use orr_pack::instance::{InstanceRecord, LinearRows};
 use orr_pack::material::{Material, slot};
@@ -811,6 +811,8 @@ const HALF_GREEN: [u8; 3] = [20, 230, 20];
 /// and of the matte decal under it.
 const STICKER_TEXEL: [u8; 4] = [40, 90, 230, 255];
 const STICKER_ROUGHNESS: f32 = 0.15;
+/// The tangent-space normal of the tilted models' texture.
+const TILT: [f32; 3] = [0.3, 0.5, 0.812];
 const MATTE_ROUGHNESS: f32 = 0.6;
 
 fn cook() -> Arc<[u8]> {
@@ -832,6 +834,10 @@ fn cook() -> Arc<[u8]> {
             (n.y * 255.0) as u8,
             (n.z * 255.0) as u8,
         ]
+    });
+    let tilt = png("tilt.png", 16, 16, png::ColorType::Rgb, |_, _| {
+        TILT.map(|c| ((c * 0.5 + 0.5) * 255.0).round() as u8)
+            .to_vec()
     });
     let holes = png("holes.png", 128, 128, png::ColorType::Grayscale, |x, y| {
         let (u, v) = (x as f32 / 128.0 - 0.5, y as f32 / 128.0 - 0.5);
@@ -855,6 +861,8 @@ fn cook() -> Arc<[u8]> {
     };
     ground.textures[slot::BASE_COLOR].texture = id("tex/albedo");
     ground.textures[slot::NORMAL].texture = id("tex/normal");
+    let mut tilted = Material::default();
+    tilted.textures[slot::NORMAL].texture = id("tex/tilt");
     let coat = Material {
         base_color: [0.1, 0.25, 0.8],
         specular_roughness: 0.4,
@@ -1039,6 +1047,22 @@ fn cook() -> Arc<[u8]> {
                 texture("tex/normal", bumps, Usage::Normal),
                 texture("tex/holes", holes, Usage::Linear1),
                 texture("tex/sticker", sticker, Usage::Color),
+                texture("tex/tilt", tilt, Usage::Normal),
+                model("tilted", quad(unit), vec![tilted], one()),
+                AssetSpec {
+                    name: "tilted stored".into(),
+                    source: Source::Mesh {
+                        mesh: MeshInput {
+                            tangents: Some(vec![Vec4::new(1.0, 0.0, 0.0, 1.0); 4]),
+                            ..quad(unit)
+                        },
+                        materials: vec![tilted],
+                        settings: MeshSettings {
+                            tangent_error_max: None,
+                            ..MeshSettings::default()
+                        },
+                    },
+                },
                 model("sticker", quad(unit), vec![sticker_material], one()),
                 model("matte", quad(unit), vec![matte], one()),
                 model(
@@ -2877,6 +2901,101 @@ fn set_decals(s: &mut SceneWriter<'_>, matte: MaterialId, sticker: MaterialId, w
     );
     s.set_decal(DecalId(0), Some(&under)).unwrap();
     s.set_decal(DecalId(1), Some(&over)).unwrap();
+}
+
+/// Asserts that every drawn pixel of `g` whose normal `pick` keeps is `want`, and counts them.
+fn tilted_pixels(g: &Frame, want: Vec3, pick: impl Fn(Vec3) -> bool) -> usize {
+    let mut seen = 0;
+    for i in 0..g.ids.len() {
+        let n = decode_core(g.a[i], g.b[i]).normal;
+        if g.ids[i] != 0 && pick(n) {
+            assert!(
+                n.dot(want.normalize()) > 0.9995,
+                "pixel {i}: {n} want {want}"
+            );
+            seen += 1;
+        }
+    }
+    seen
+}
+
+/// A quad seen from its front, u along +x and uv's v down -y: x of the normal map turns along
+/// its u axis and y up the image, with tangents from the triangle or from the mesh, under a
+/// mirror or a turn, and on a decal.
+#[test]
+fn normal_maps_turn_toward_the_image_up_on_meshes_and_decals() {
+    let _serial = serial();
+    let mut w = World::new(&linked::KERNELS);
+    let [x, y, z] = TILT;
+    let eye = DVec3::new(0.0, 0.0, 2.0);
+    for model in ["tilted", "tilted stored"] {
+        let cases = [
+            (Mat3::IDENTITY, Vec3::new(x, y, z)),
+            (
+                Mat3::from_diagonal(Vec3::new(-1.0, 1.0, 1.0)),
+                Vec3::new(-x, y, z),
+            ),
+            (
+                Mat3::from_diagonal(Vec3::new(1.0, -1.0, 1.0)),
+                Vec3::new(x, -y, z),
+            ),
+            (
+                Mat3::from_rotation_z(std::f32::consts::FRAC_PI_2),
+                Vec3::new(-y, x, z),
+            ),
+        ];
+        for (linear, want) in cases {
+            let item = Item {
+                model,
+                linear,
+                at: Vec3::ZERO,
+            };
+            let placed = place(&mut w, &[item]);
+            let mut shot = Shot::at(eye, DVec3::ZERO, 1);
+            shot.jitter = Vec2::ZERO;
+            let g = shoot(&mut w, &placed, &shot);
+            let seen = tilted_pixels(&g, want, |_| true);
+            assert!(seen > 1000, "{model} {linear}: {seen} pixels");
+        }
+    }
+
+    let tilted = w
+        .scenes
+        .material(w.mount, AssetId::from_name("tilted/material/0"))
+        .unwrap();
+    let wall = Item {
+        model: "plain",
+        linear: Mat3::from_diagonal(Vec3::splat(8.0)),
+        at: Vec3::ZERO,
+    };
+    let cases = [
+        (Quat::IDENTITY, Vec3::new(x, y, z)),
+        (
+            Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            Vec3::new(-y, x, z),
+        ),
+        // Past 90 degrees from the decal's +z: its y axis runs down the wall.
+        (Quat::from_rotation_x(2.0), Vec3::new(x, -y, z)),
+    ];
+    for (rotation, want) in cases {
+        let placed = place(&mut w, &[wall]);
+        let mut shot = Shot::at(eye, DVec3::ZERO, 1);
+        shot.jitter = Vec2::ZERO;
+        let g = shoot_with(&mut w, &placed, &shot, |s| {
+            let decal = Decal {
+                center: DVec3::ZERO,
+                rotation,
+                half_extent: Vec3::new(0.5, 0.5, 0.25),
+                material: tilted,
+                channels: DecalChannels::NORMAL,
+                opacity: 1.0,
+                fade_angles: [2.5, 3.0],
+                depth_fade: 0.0,
+            };
+            s.set_decal(DecalId(0), Some(&decal)).unwrap();
+        });
+        assert!(tilted_pixels(&g, want, |n| n.z < 0.95) > 1000, "decal");
+    }
 }
 
 #[test]

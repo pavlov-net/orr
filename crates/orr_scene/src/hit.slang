@@ -321,7 +321,8 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
         float2 uv2 = (set1 ? a2.uv[1] : a2.uv[0]) - (set1 ? a0.uv[1] : a0.uv[0]);
         float r = uv1.x * uv2.y - uv2.x * uv1.y;
         float3 tt = r != 0.0 ? (e1 * uv2.y - e2 * uv1.y) / r : float3(0.0);
-        float3 bt = r != 0.0 ? (e2 * uv1.x - e1 * uv2.x) / r : float3(0.0);
+        // Uv v runs down the image and a normal map's y up it.
+        float3 bt = r != 0.0 ? (e1 * uv2.x - e2 * uv1.x) / r : float3(0.0);
         if (dot(tt, tt) == 0.0)
         {
             float3 tb;
