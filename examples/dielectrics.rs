@@ -23,8 +23,8 @@ use examples::shaders::slab;
 use examples::window::Window;
 use examples::{Capture, Options, Workers, assert_clean, device, fixed_time, mount_at};
 use orr::orr_gpu::{
-    AddressMode, Allocation, Device, Filter, Format, MemoryKind, QueueKind, SamplerDesc,
-    SamplerIndex, SpecData, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
+    AddressMode, Allocation, Device, Filter, Format, MemoryKind, QueueKind, SamplerDesc, SpecData,
+    TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
 use orr::orr_lighting::EnvironmentMapGpu;
 use orr::orr_pack::material::Material;
@@ -176,11 +176,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     };
     let water = f
         .materials()
-        .create(&MaterialGpu::new(
-            &water,
-            &[BoundTexture::NONE; 12],
-            SamplerIndex(0),
-        ))
+        .create(&MaterialGpu::new(&water, &[BoundTexture::NONE; 12]))
         .expect("water");
     let mut w = f.scene(scene).expect("scene writer");
     let group = w

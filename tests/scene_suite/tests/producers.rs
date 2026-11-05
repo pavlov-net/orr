@@ -1427,7 +1427,8 @@ fn texture_displacement_moves_patches_along_the_normal_by_the_materials_texture(
     m.textures = [TextureIndex::NONE; 12];
     m.textures[orr_pack::material::slot::DISPLACEMENT] =
         d.write_sampled(slot, &texture, &orr_gpu::ViewDesc::default());
-    m.sampler = d.sampler(&SamplerDesc::default()).unwrap();
+    m.samplers[orr_pack::material::slot::DISPLACEMENT].sampler =
+        d.sampler(&SamplerDesc::default()).unwrap();
     m.displacement_scale = 0.2;
     m.displacement_offset = -0.1;
     let material = plane.material(&m);

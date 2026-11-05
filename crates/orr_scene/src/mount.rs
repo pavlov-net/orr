@@ -36,7 +36,7 @@ use crate::edit::{
 };
 use crate::emissive::{EmissiveSpan, ModelEmission, indexed_spans};
 use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored};
-use crate::material::{BoundTexture, MaterialId, MaterialTable, candidate_class};
+use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler, candidate_class};
 use crate::medium_proxy::VolumeRef;
 use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::neural::{self, NeuralLink, Precision};
@@ -276,6 +276,7 @@ pub(crate) struct MountTask {
     /// Writes go through staging and copies (no resizable BAR).
     staged: bool,
     host_copy: bool,
+    /// The sampler of neural sets' latents.
     sampler: SamplerIndex,
     /// The precision neural sets decode at; none when textures sample their BC entries.
     neural: Option<Precision>,
@@ -1461,7 +1462,7 @@ struct Resolved {
     cluster_ranges: Vec<(u32, u32)>,
 }
 
-fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resolved> {
+fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
     let missing = |id| Error::Pack(orr_pack::Error::Missing(id));
     let textures: HashMap<AssetId, BoundTexture> = p
         .textures
@@ -1470,6 +1471,7 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
             let b = BoundTexture {
                 index: t.index,
                 primaries: t.primaries,
+                ..BoundTexture::NONE
             };
             (t.id, b)
         })
@@ -1481,10 +1483,13 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
             let mut bound = [BoundTexture::NONE; 12];
             for (b, t) in bound.iter_mut().zip(&m.textures) {
                 if t.texture != AssetId::NONE {
-                    *b = *textures.get(&t.texture).ok_or_else(|| missing(t.texture))?;
+                    *b = BoundTexture {
+                        sampler: device.sampler(&binding_sampler(t))?,
+                        ..*textures.get(&t.texture).ok_or_else(|| missing(t.texture))?
+                    };
                 }
             }
-            Ok((*id, MaterialGpu::new(m, &bound, sampler)))
+            Ok((*id, MaterialGpu::new(m, &bound)))
         })
         .collect::<Result<Vec<_>>>()?;
     let material_index: HashMap<AssetId, usize> = materials
@@ -1854,7 +1859,7 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<MountTask>) 
     };
     let mut ranges = Vec::new();
     let result = state
-        .and_then(|()| resolve(task.source(), placed, task.sampler))
+        .and_then(|()| resolve(task.source(), placed, device))
         .and_then(|mut r| {
             link_neural(&mut r)?;
             let tails = bind_tails(device, &r.textures)?;

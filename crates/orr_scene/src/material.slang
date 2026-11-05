@@ -40,6 +40,20 @@ public static const uint TEXTURE_DISPLACEMENT = 9;
 public static const uint TEXTURE_COAT = 10;
 public static const uint TEXTURE_TRANSMISSION = 11;
 
+// `TextureSamplerGpu.modes`: what u and v read past 0..1, 3 bits each
+// (orr_pack::material::wrap), then the filter's bits (orr_pack::material::filter).
+public static const uint TEXTURE_REPEAT = 0;
+public static const uint TEXTURE_CLAMP = 1;
+public static const uint TEXTURE_MIRROR = 2;
+public static const uint TEXTURE_BORDER = 3;
+public static const uint TEXTURE_CONSTANT = 4;
+public static const uint TEXTURE_WRAP_MASK = 7;
+public static const uint TEXTURE_V_SHIFT = 3;
+public static const uint TEXTURE_MAG_NEAREST = 1 << 6;
+public static const uint TEXTURE_MIN_NEAREST = 1 << 7;
+public static const uint TEXTURE_MIP_NEAREST = 1 << 8;
+public static const uint TEXTURE_ONE_MIP = 1 << 9;
+
 // A material id that names no material.
 public static const uint MATERIAL_NONE = 0xffffffff;
 
@@ -78,6 +92,14 @@ public struct NeuralTextureGpu
     public NeuralSetGpu* set;
     public uint first;
     public uint count;
+}
+
+// How a texture reads: its hardware sampler and what kernels do beside it. `sampler` holds the
+// address modes and filters `modes` says, and clamps for TEXTURE_CONSTANT.
+public struct TextureSamplerGpu
+{
+    public SamplerIndex sampler;
+    public uint modes;
 }
 
 public struct MaterialGpu
@@ -121,7 +143,7 @@ public struct MaterialGpu
     public float displacement_min;
     public float displacement_max;
     public TextureIndex textures[12];       // TEXTURE_* slots
-    public SamplerIndex sampler;
+    public TextureSamplerGpu samplers[12];
     public uint uv_sets;                    // 1 bit per slot
     public uint channels_lo;                // 4 bits per slot: first channel read
     public uint channels_hi;
@@ -129,9 +151,11 @@ public struct MaterialGpu
     public uint surface;                    // linked surface id; 0 = StandardSurface
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
+    public uint _pad;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
     public float uv_transforms[72];         // per slot a-1 b c d e-1 f: u' = a u + b v + c, v' = d u + e v + f; 0 = identity
+    public float outside[48];               // per slot, what it reads past TEXTURE_CONSTANT
 }
 
 // Whether taps report the level they want to the texture feedback. A kernel whose taps drive
@@ -164,32 +188,77 @@ public TextureStreamGpu* texture_stream(TextureStreamGpu** streams, TextureIndex
     return s;
 }
 
-// The finest mip resident at `uv` of `layer` of streamed texture `s`, after reporting `lod`
-// (the level a tap there wants) to the frame's feedback with `TEXTURE_FEEDBACK`.
-public float texture_stream_clamp(TextureStreamGpu* s, float2 uv, uint layer, float lod)
+// `x` under address mode `mode`, in 0..1; past a TEXTURE_BORDER or TEXTURE_CONSTANT edge, that
+// edge.
+float texture_wrapped(float x, uint mode)
 {
-    uint2 cell = min(uint2(frac(uv) * float2(s.cells)), s.cells - 1);
-    uint at = layer * s.cells.x * s.cells.y + cell.y * s.cells.x + cell.x;
+    if (mode == TEXTURE_REPEAT)
+        return frac(x);
+    if (mode == TEXTURE_MIRROR)
+        return 1.0 - abs(1.0 - (x - 2.0 * floor(0.5 * x)));
+    return saturate(x);
+}
+
+// Where in 0..1 `uv` reads under `modes`.
+public float2 texture_place(float2 uv, uint modes)
+{
+    return float2(texture_wrapped(uv.x, modes & TEXTURE_WRAP_MASK),
+                  texture_wrapped(uv.y, (modes >> TEXTURE_V_SHIFT) & TEXTURE_WRAP_MASK));
+}
+
+// Whether `uv` lies past 0..1 on an axis of TEXTURE_CONSTANT under `modes`.
+public bool texture_outside(float2 uv, uint modes)
+{
+    bool u = (modes & TEXTURE_WRAP_MASK) == TEXTURE_CONSTANT && (uv.x < 0.0 || uv.x > 1.0);
+    bool v = ((modes >> TEXTURE_V_SHIFT) & TEXTURE_WRAP_MASK) == TEXTURE_CONSTANT && (uv.y < 0.0 || uv.y > 1.0);
+    return u || v;
+}
+
+// `cell` of an axis of `n` cells, or the cell across the seam from it under TEXTURE_REPEAT.
+uint texture_stream_across(uint cell, uint n, uint mode)
+{
+    if (mode != TEXTURE_REPEAT)
+        return cell;
+    return cell == 0 ? n - 1 : cell == n - 1 ? 0 : cell;
+}
+
+// The finest mip resident at `place` in 0..1 (`texture_place`) of `layer` of streamed texture
+// `s` read under `modes`, after reporting `lod` (the level a tap there wants) to the frame's
+// feedback with `TEXTURE_FEEDBACK`. Filtering at a repeating edge reads the cells across the
+// seam, which `map` does not hold, so they count, and load, with the cell at `place`.
+public float texture_stream_clamp(TextureStreamGpu* s, float2 place, uint modes, uint layer, float lod)
+{
+    uint2 cell = min(uint2(place * float2(s.cells)), s.cells - 1);
+    uint2 across = uint2(texture_stream_across(cell.x, s.cells.x, modes & TEXTURE_WRAP_MASK),
+                         texture_stream_across(cell.y, s.cells.y, (modes >> TEXTURE_V_SHIFT) & TEXTURE_WRAP_MASK));
     uint wanted = uint(clamp(floor(lod), 0.0, float(s.tail_mip)));
-    if (TEXTURE_FEEDBACK && wanted < s.tail_mip)
+    uint resident = 0;
+    uint reads = all(across == cell) ? 1 : 4;
+    for (uint k = 0; k < reads; k++)
     {
-        TextureFeedbackGpu* fb = s.feedback;
-        uint v = fb.frame << 8 | (255 - wanted);
-        uint cell_at = s.first_cell + at;
-        if (fb.cells[cell_at] < v)
+        uint2 c = uint2((k & 1) != 0 ? across.x : cell.x, (k & 2) != 0 ? across.y : cell.y);
+        uint at = layer * s.cells.x * s.cells.y + c.y * s.cells.x + c.x;
+        if (TEXTURE_FEEDBACK && wanted < s.tail_mip)
         {
-            uint old;
-            InterlockedMax(fb.cells[cell_at], v, old);
-            if (old < v)
+            TextureFeedbackGpu* fb = s.feedback;
+            uint v = fb.frame << 8 | (255 - wanted);
+            uint cell_at = s.first_cell + at;
+            if (fb.cells[cell_at] < v)
             {
-                uint n;
-                InterlockedAdd(fb.counts[fb.slot], 1, n);
-                if (n < fb.capacity)
-                    fb.records[fb.slot * fb.capacity + n] = uint2(cell_at, v);
+                uint old;
+                InterlockedMax(fb.cells[cell_at], v, old);
+                if (old < v)
+                {
+                    uint n;
+                    InterlockedAdd(fb.counts[fb.slot], 1, n);
+                    if (n < fb.capacity)
+                        fb.records[fb.slot * fb.capacity + n] = uint2(cell_at, v);
+                }
             }
         }
+        resident = max(resident, s.map[at]);
     }
-    return float(s.map[at]);
+    return float(resident);
 }
 
 // The level of detail anisotropic filtering of up to 16 taps reads for footprint `f` on a
@@ -287,19 +356,38 @@ uint neural_finest_mip(NeuralSetGpu* n, uint latent)
     return n.mips - 1;
 }
 
-// The texture neural set `t.set` stands in for, over footprint `f`. Each texel read runs
-// the decoder: with a tap, one texel, the one `stochastic_texel` picks under magnification,
-// else one picked by the trilinear weights of the footprint's longer axis; without, the
-// bilinear weights of four texels of the nearest mip. Mips read no finer than the latents'
-// resident tiles (their record in `streams`).
-float4 neural_footprint(NeuralTextureGpu* t, UvFootprint f, TextureStreamGpu** streams)
+// Texel `i` of an axis of `n` texels under address mode `mode`; -1 past a TEXTURE_BORDER edge.
+int texel_wrapped(int i, int n, uint mode)
+{
+    if (mode == TEXTURE_REPEAT)
+        return ((i % n) + n) % n;
+    if (mode == TEXTURE_MIRROR)
+    {
+        int m = ((i % (2 * n)) + 2 * n) % (2 * n);
+        return m < n ? m : 2 * n - 1 - m;
+    }
+    if (mode == TEXTURE_BORDER && (i < 0 || i >= n))
+        return -1;
+    return clamp(i, 0, n - 1);
+}
+
+// The texture neural set `t.set` stands in for, over footprint `f`, read as `modes` says. Each
+// texel read runs the decoder: with a tap, one texel, the one `stochastic_texel` picks under
+// magnification, else one picked by the trilinear weights of the footprint's longer axis;
+// without, the bilinear weights of four texels of the nearest mip; under a nearest filter, the
+// texel at `f.uv`. Mips read no finer than the latents' resident tiles (their record in
+// `streams`).
+float4 neural_footprint(NeuralTextureGpu* t, uint modes, UvFootprint f, TextureStreamGpu** streams)
 {
     NeuralSetGpu* n = t.set;
     float2 size = float2(n.size);
     float2 dx = f.dx * size;
     float2 dy = f.dy * size;
-    float top = float(n.mips - 1);
-    float lod = clamp(0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-16)), 0.0, top);
+    float top = (modes & TEXTURE_ONE_MIP) != 0 ? 0.0 : float(n.mips - 1);
+    float wanted = 0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-16));
+    float lod = clamp(wanted, 0.0, top);
+    if ((modes & TEXTURE_MIP_NEAREST) != 0)
+        lod = floor(lod + 0.5);
     uint finest = 0;
     TextureStreamGpu* latents = texture_stream(streams, n.latents);
     if (latents != nullptr)
@@ -307,7 +395,7 @@ float4 neural_footprint(NeuralTextureGpu* t, UvFootprint f, TextureStreamGpu** s
         float want = float(n.color_mips[uint(lod)].latent_mip);
         float resident = 0.0;
         for (uint layer = 0; layer < n.latent_layers; layer++)
-            resident = max(resident, texture_stream_clamp(latents, f.uv, layer, want));
+            resident = max(resident, texture_stream_clamp(latents, texture_place(f.uv, modes), 0, layer, want));
         finest = neural_finest_mip(n, uint(resident));
     }
     // Up to four texels and their weights, decoded in one loop.
@@ -316,7 +404,12 @@ float4 neural_footprint(NeuralTextureGpu* t, UvFootprint f, TextureStreamGpu** s
     float2 w = float2(0.0);
     uint taps = 1;
     float2 texel_uv;
-    if (f.tap.x < 0.0)
+    if ((modes & (wanted > 0.0 ? TEXTURE_MIN_NEAREST : TEXTURE_MAG_NEAREST)) != 0)
+    {
+        mip = max(uint(lod + 0.5), finest);
+        texel = int2(floor(f.uv * float2(max(n.size >> mip, uint2(1)))));
+    }
+    else if (f.tap.x < 0.0)
     {
         mip = max(uint(lod + 0.5), finest);
         float2 x = f.uv * float2(max(n.size >> mip, uint2(1))) - 0.5;
@@ -354,12 +447,16 @@ float4 neural_footprint(NeuralTextureGpu* t, UvFootprint f, TextureStreamGpu** s
         texel = int2(below) + int2(u.x < x.x - below.x ? 1 : 0, u.y < x.y - below.y ? 1 : 0);
     }
     float4 v = float4(0.0);
+    int2 mip_size = int2(max(n.size >> mip, uint2(1)));
     for (uint k = 0; k < taps; k++)
     {
         int2 o = int2(k & 1, k >> 1);
         float2 b = select(o == 1, w, 1.0 - w);
         float weight = taps == 1 ? 1.0 : b.x * b.y;
-        v += weight * neural_texel(n, texel + o, mip, t.first, t.count);
+        int2 at = int2(texel_wrapped(texel.x + o.x, mip_size.x, modes & TEXTURE_WRAP_MASK),
+                       texel_wrapped(texel.y + o.y, mip_size.y, (modes >> TEXTURE_V_SHIFT) & TEXTURE_WRAP_MASK));
+        if (at.x >= 0 && at.y >= 0)
+            v += weight * neural_texel(n, at, mip, t.first, t.count);
     }
     return v;
 }
@@ -377,10 +474,10 @@ public void texture_unprepare()
     prepared_count = 0;
 }
 
-// With `NEURAL_TEXTURES`, in builds with neural decoding: decodes `t` over `f` when a neural
-// set stands in for it (`neural_footprint`), for this invocation's later `texture_footprint`
-// taps of `t` at `f.uv`, up to PREPARED_MAX textures.
-public void texture_prepare(TextureIndex t, UvFootprint f, TextureStreamGpu** streams)
+// With `NEURAL_TEXTURES`, in builds with neural decoding: decodes `t` over `f` as `modes` says
+// when a neural set stands in for it (`neural_footprint`), for this invocation's later
+// `texture_footprint` taps of `t` at `f.uv`, up to PREPARED_MAX textures.
+public void texture_prepare(TextureIndex t, uint modes, UvFootprint f, TextureStreamGpu** streams)
 {
 #if defined(ORR_NEURAL_BUILD)
     TextureStreamGpu* record = texture_record(streams, t);
@@ -388,17 +485,17 @@ public void texture_prepare(TextureIndex t, UvFootprint f, TextureStreamGpu** st
         return;
     prepared_index[prepared_count] = t.index;
     prepared_uv[prepared_count] = f.uv;
-    prepared_value[prepared_count] = neural_footprint(record.neural, f, streams);
+    prepared_value[prepared_count] = neural_footprint(record.neural, modes, f, streams);
     prepared_count++;
 #endif
 }
 
-// `t` read through sampler `s` over footprint `f`: one stochastic texel under
-// magnification, else the sampler's filtering. Streamed textures (`streams`, from
-// `MaterialGpu.texture_streams`; null for none) read no finer than their resident tiles and,
-// with `TEXTURE_FEEDBACK`, report the level they want. A texture this invocation prepared at
-// `f.uv` (`texture_prepare`) reads its decoded value.
-public float4 texture_footprint(TextureIndex t, SamplerIndex s, UvFootprint f, TextureStreamGpu** streams)
+// `t` read through sampler `s` over footprint `f`: one stochastic texel under magnification,
+// unless the sampler magnifies nearest, else the sampler's filtering. Streamed textures
+// (`streams`, from `MaterialGpu.texture_streams`; null for none) read no finer than their
+// resident tiles and, with `TEXTURE_FEEDBACK`, report the level they want. A texture this
+// invocation prepared at `f.uv` (`texture_prepare`) reads its decoded value.
+public float4 texture_footprint(TextureIndex t, TextureSamplerGpu s, UvFootprint f, TextureStreamGpu** streams)
 {
     if (NEURAL_TEXTURES)
     {
@@ -410,8 +507,9 @@ public float4 texture_footprint(TextureIndex t, SamplerIndex s, UvFootprint f, T
     }
     TextureStreamGpu* stream = texture_stream(streams, t);
     Texture2D<float4> texture = t.get<Texture2D<float4>>();
+    bool one_mip = (s.modes & TEXTURE_ONE_MIP) != 0;
     float min_lod = 0.0;
-    if (f.tap.x >= 0.0 || stream != nullptr)
+    if (f.tap.x >= 0.0 || stream != nullptr || one_mip)
     {
         uint width;
         uint height;
@@ -419,14 +517,24 @@ public float4 texture_footprint(TextureIndex t, SamplerIndex s, UvFootprint f, T
         float2 size = float2(width, height);
         if (stream != nullptr)
         {
-            float lod = TEXTURE_FEEDBACK ? footprint_lod(f, size) : 0.0;
-            min_lod = texture_stream_clamp(stream, f.uv, 0, lod);
+            float lod = TEXTURE_FEEDBACK && !one_mip ? footprint_lod(f, size) : 0.0;
+            min_lod = texture_stream_clamp(stream, texture_place(f.uv, s.modes), s.modes, 0, lod);
         }
         float2 texel_uv;
-        if (min_lod == 0.0 && stochastic_texel(f, size, texel_uv))
-            return texture.SampleLevel(s.get(), texel_uv, 0.0);
+        if (min_lod == 0.0 && (s.modes & TEXTURE_MAG_NEAREST) == 0 && stochastic_texel(f, size, texel_uv))
+            return texture.SampleLevel(s.sampler.get(), texel_uv, 0.0);
+        if (one_mip)
+        {
+            // A level above 0 takes the min filter, and the sampler's nearest mip filter rounds
+            // this one to 0. A sampler LOD clamp can't do this: it would undercut `min_lod`,
+            // which keeps the read on resident tiles.
+            float2 dx = f.dx * size;
+            float2 dy = f.dy * size;
+            float minified = max(dot(dx, dx), dot(dy, dy)) > 1.0 ? 0.25 : 0.0;
+            return texture.SampleLevel(s.sampler.get(), f.uv, max(minified, min_lod));
+        }
     }
-    return texture.SampleGrad(s.get(), f.uv, f.dx, f.dy, int2(0), min_lod);
+    return texture.SampleGrad(s.sampler.get(), f.uv, f.dx, f.dy, int2(0), min_lod);
 }
 
 public bool material_bound(MaterialGpu* m, uint slot)
@@ -480,15 +588,22 @@ public uint material_uv_set(MaterialGpu* m, uint slot)
 
 // The texture footprint function: `slot`'s texture filtered over the footprint of the uv set
 // it reads, mapped by the slot's uv transform (`texture_footprint`), its channels from the
-// slot's first one on in xyzw. Color slots come back in their texture's primaries;
-// `material_color` multiplies them by a factor. An unbound slot reads `fallback`.
+// slot's first one on in xyzw, or `MaterialGpu.outside` past an axis of TEXTURE_CONSTANT. Color
+// slots come back in their texture's primaries; `material_color` multiplies them by a factor.
+// An unbound slot reads `fallback`.
 public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint uv[2], float4 fallback)
 {
     TextureIndex t = m.textures[slot];
     if (t.index == IMAGE_NONE)
         return fallback;
-    UvFootprint f = material_uv_set(m, slot) == 1 ? uv[1] : uv[0];
-    float4 v = texture_footprint(t, m.sampler, material_footprint(m, slot, f), m.texture_streams);
+    UvFootprint f = material_footprint(m, slot, material_uv_set(m, slot) == 1 ? uv[1] : uv[0]);
+    TextureSamplerGpu s = m.samplers[slot];
+    if (texture_outside(f.uv, s.modes))
+    {
+        uint k = 4 * slot;
+        return float4(m.outside[k], m.outside[k + 1], m.outside[k + 2], m.outside[k + 3]);
+    }
+    float4 v = texture_footprint(t, s, f, m.texture_streams);
     uint c = material_channel(m, slot);
     return c == 0 ? v : c == 1 ? float4(v.yzw, 1.0) : c == 2 ? float4(v.zw, 0.0, 1.0) : float4(v.w, 0.0, 0.0, 1.0);
 }
@@ -505,8 +620,10 @@ public void material_prepare(MaterialGpu* m, UvFootprint uv[2])
         TextureIndex t = m.textures[slot];
         if (t.index == IMAGE_NONE)
             continue;
-        UvFootprint f = material_uv_set(m, slot) == 1 ? uv[1] : uv[0];
-        texture_prepare(t, material_footprint(m, slot, f), m.texture_streams);
+        UvFootprint f = material_footprint(m, slot, material_uv_set(m, slot) == 1 ? uv[1] : uv[0]);
+        uint modes = m.samplers[slot].modes;
+        if (!texture_outside(f.uv, modes))
+            texture_prepare(t, modes, f, m.texture_streams);
     }
 }
 

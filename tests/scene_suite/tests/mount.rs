@@ -8,13 +8,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use bytemuck::Pod;
+use bytemuck::{Pod, Zeroable};
 use orr_cook::{
     ArchiveSpec, AssetSpec, Instances, Linear, LodMode, Manifest, MaterialPatch, MeshInput,
     MeshSettings, Placement, PrototypeSpec, Source, TextureSettings,
 };
 use orr_math::{Affine3, DVec3, Quat, Vec2, Vec3};
-use orr_pack::material::{Material, slot};
+use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
 use orr_pack::mesh::{MeshHeader, MeshInfo, Node, NodePage, decode_page};
 use orr_pack::model::ModelInfo;
 use orr_pack::texture::TextureInfo;
@@ -339,7 +339,8 @@ fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<
         let mid = scenes.material(m, id).unwrap();
         let mut got = gpu.value(materials.offset(u64::from(mid.0)));
         let cooked = Material::from_bytes(&blob(a, entry(a, id), 0)).unwrap();
-        let bound = cooked.textures.map(|b| {
+        let bound = std::array::from_fn(|s| {
+            let b = cooked.textures[s];
             if b.texture == AssetId::NONE {
                 return BoundTexture::NONE;
             }
@@ -349,11 +350,12 @@ fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<
             BoundTexture {
                 index: scenes.texture(m, b.texture).unwrap(),
                 primaries: header.primaries,
+                sampler: got.samplers[s].sampler,
             }
         });
         let want = MaterialGpu {
             texture_streams: scenes.texture_streams(),
-            ..MaterialGpu::new(&cooked, &bound, got.sampler)
+            ..MaterialGpu::new(&cooked, &bound)
         };
         assert_eq!(
             bytemuck::bytes_of(&got),
@@ -1551,7 +1553,7 @@ fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_wan
             dx: [1.0 / w as f32, 0.0],
             dy: [0.0, 1.0 / h as f32],
             hardware: 1,
-            pad: 0,
+            material: 0,
         })
         .collect();
     let mut input = dev
@@ -1581,7 +1583,10 @@ fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_wan
         count: footprints.len() as u32,
         taps: 1,
         streams: scenes.texture_streams(),
+        modes: 0,
         pad: 0,
+        materials: GpuPtr::NULL,
+        pad2: 0,
     };
     let p = pipeline(&texture_filter::MODULE, "mean");
     // The texels nearest sampling of `mip` reads at each tap.
@@ -1636,6 +1641,113 @@ fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_wan
         tails + others + tiles,
         "the taps loaded every tile of mips 0 and 1 of the flat texture, and nothing else"
     );
+    assert_clean();
+}
+
+/// Taps past the unit square of a streamed texture read, and load, the tiles the wrap takes
+/// them to. Reading a tile takes its neighbors, so each case taps those too; frac(u) would name
+/// other tiles, and the checked texels would never read.
+#[test]
+fn taps_past_the_edges_of_a_streamed_texture_load_the_tiles_they_read() {
+    use scene_suite::shaders::texture_filter::Footprint;
+    let _serial = serial();
+    let dev = device();
+    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let m = scenes.mount(PackSource::Memory(Arc::clone(tiled_pack())));
+    ready(&mut scenes, m);
+    let (_, w, h, _, _) = TILED[0];
+    let texture = scenes.texture(m, AssetId::from_name(TILED[0].0)).unwrap();
+    let texels = tiled_texels(0, 0, 0);
+    let at = |x: u32, y: u32| -> [f32; 4] {
+        let i = 4 * (y * w + x) as usize;
+        std::array::from_fn(|c| f32::from(texels[i + c]) / 255.0)
+    };
+    let tap = |u: f32, y: u32| Footprint {
+        uv: [u, (y as f32 + 0.5) / h as f32],
+        dx: [1.0 / w as f32, 0.0],
+        dy: [0.0, 1.0 / h as f32],
+        hardware: 1,
+        material: 0,
+    };
+    let center = |x: u32| (x as f32 + 0.5) / w as f32;
+    // Per wrap, taps at u that read texel column x, and the first of them not to check.
+    let mirrored: Vec<(f32, u32)> = (0..384).step_by(8).map(|x| (2.0 - center(x), x)).collect();
+    let cases = [
+        // Past the right edge, the first columns of tiles.
+        (wrap::MIRROR, mirrored, 256 / 8),
+        // Past the left edge, the first texel column.
+        (wrap::CLAMP, vec![(-0.4, 0)], 1),
+        // Past the right edge, the last, with the tiles beside it.
+        (wrap::CLAMP, vec![(1.4, w - 1), (center(400), 400)], 2),
+    ];
+    for (mode, columns, checked) in cases {
+        let binding = TextureBinding {
+            wrap: [mode, wrap::CLAMP],
+            filter: filter::MAG_NEAREST | filter::MIN_NEAREST | filter::MIP_NEAREST,
+            ..TextureBinding::zeroed()
+        };
+        let rows = || (0..h).step_by(8);
+        let footprints: Vec<Footprint> = columns
+            .iter()
+            .flat_map(|&(u, _)| rows().map(move |y| tap(u, y)))
+            .collect();
+        let want: Vec<[f32; 4]> = columns[..checked]
+            .iter()
+            .flat_map(|&(_, x)| rows().map(move |y| at(x, y)))
+            .collect();
+        let start = Instant::now();
+        while bound_taps(&mut scenes, texture, &footprints, 1, &binding)[..want.len()] != want {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "the tiles of {columns:?} never arrived under wrap {mode}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_clean();
+}
+
+/// A repeating read filters across the seam, into tiles nothing else wants: taps on the first
+/// tiles alone must load the last ones, and read no finer until they have.
+#[test]
+fn taps_at_a_repeating_edge_load_the_tiles_across_the_seam() {
+    use scene_suite::shaders::texture_filter::Footprint;
+    let _serial = serial();
+    let dev = device();
+    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let m = scenes.mount(PackSource::Memory(Arc::clone(tiled_pack())));
+    ready(&mut scenes, m);
+    let (_, w, h, _, _) = TILED[0];
+    let texture = scenes.texture(m, AssetId::from_name(TILED[0].0)).unwrap();
+    let texels = tiled_texels(0, 0, 0);
+    let at = |x: u32, y: u32, c: usize| f32::from(texels[4 * (y * w + x) as usize + c]) / 255.0;
+    let footprints: Vec<Footprint> = (0..h)
+        .map(|y| Footprint {
+            uv: [0.0, (y as f32 + 0.5) / h as f32],
+            dx: [1.0 / w as f32, 0.0],
+            dy: [0.0, 1.0 / h as f32],
+            hardware: 1,
+            material: 0,
+        })
+        .collect();
+    let want: Vec<[f32; 4]> = (0..h)
+        .map(|y| std::array::from_fn(|c| 0.5 * (at(0, y, c) + at(w - 1, y, c))))
+        .collect();
+    let binding = TextureBinding::zeroed();
+    let start = Instant::now();
+    loop {
+        let got = bound_taps(&mut scenes, texture, &footprints, 1, &binding);
+        if differences(&got, &want).0 < 0.01 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the tiles across the seam never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_clean();
 }
 
@@ -2481,7 +2593,7 @@ fn latent_mips() -> u32 {
 fn neural_constants() -> orr_pack::neural::Constants {
     use orr_pack::neural::{ColorMip, Constants};
     let mips = orr_pack::texture::full_mip_count(NEURAL_SIZE[0], NEURAL_SIZE[1]);
-    let mut c: Constants = bytemuck::Zeroable::zeroed();
+    let mut c: Constants = Zeroable::zeroed();
     for m in 0..mips {
         c.color_mips[m as usize] = ColorMip {
             latent_mip: m.saturating_sub(1).min(latent_mips() - 2) as i32,
@@ -2882,7 +2994,50 @@ fn neural_taps(
     footprints: &[scene_suite::shaders::texture_filter::Footprint],
     taps: u32,
 ) -> Vec<[f32; 4]> {
-    use orr_scene::orr_gpu::{AddressMode, Filter, MemoryKind, SamplerDesc};
+    // Modes of 0 leave the set's own filtering, and the sampler reads a texture's exact texels.
+    let exact = TextureBinding {
+        wrap: [wrap::CLAMP; 2],
+        filter: filter::MAG_NEAREST | filter::MIN_NEAREST | filter::MIP_NEAREST,
+        ..TextureBinding::zeroed()
+    };
+    filter_taps(scenes, texture, footprints, taps, &exact, 0)
+}
+
+/// `TextureSamplerGpu::modes` of `b`.
+fn modes_of(b: &TextureBinding) -> u32 {
+    u32::from(b.wrap[0]) | u32::from(b.wrap[1]) << 3 | u32::from(b.filter) << 6
+}
+
+/// The texture filter kernel, once over `footprints` of `texture` with `taps` taps each, read
+/// as `binding` says.
+fn bound_taps(
+    scenes: &mut Scenes,
+    texture: TextureIndex,
+    footprints: &[scene_suite::shaders::texture_filter::Footprint],
+    taps: u32,
+    binding: &TextureBinding,
+) -> Vec<[f32; 4]> {
+    filter_taps(
+        scenes,
+        texture,
+        footprints,
+        taps,
+        binding,
+        modes_of(binding),
+    )
+}
+
+/// The texture filter kernel, once over `footprints` of `texture` with `taps` taps each, through
+/// `binding`'s sampler under `modes`.
+fn filter_taps(
+    scenes: &mut Scenes,
+    texture: TextureIndex,
+    footprints: &[scene_suite::shaders::texture_filter::Footprint],
+    taps: u32,
+    binding: &TextureBinding,
+    modes: u32,
+) -> Vec<[f32; 4]> {
+    use orr_scene::orr_gpu::MemoryKind;
     use scene_suite::pipeline;
     use scene_suite::shaders::texture_filter::{self, Footprint, Root};
     let dev = device();
@@ -2900,19 +3055,14 @@ fn neural_taps(
         footprints: input.gpu(),
         out: out.gpu(),
         texture,
-        sampler: dev
-            .sampler(&SamplerDesc {
-                mag: Filter::Nearest,
-                min: Filter::Nearest,
-                mip: Filter::Nearest,
-                address: [AddressMode::ClampToEdge; 3],
-                ..SamplerDesc::default()
-            })
-            .unwrap(),
+        sampler: dev.sampler(&orr_scene::binding_sampler(binding)).unwrap(),
         count: footprints.len() as u32,
         taps,
         streams: scenes.texture_streams(),
+        modes,
         pad: 0,
+        materials: GpuPtr::NULL,
+        pad2: 0,
     };
     let p = pipeline(&texture_filter::MODULE, "mean");
     let mut f = scenes
@@ -2945,7 +3095,7 @@ fn texel_centers() -> Vec<scene_suite::shaders::texture_filter::Footprint> {
                 dx: [1.0 / w as f32, 0.0],
                 dy: [0.0, 1.0 / h as f32],
                 hardware: 1,
-                pad: 0,
+                material: 0,
             }
         })
         .collect()
@@ -3242,7 +3392,7 @@ fn stochastic_taps_of_a_neural_texture_average_to_its_filters() {
         dx: [texels / w, 0.0],
         dy: [0.0, texels / h],
         hardware: 0,
-        pad: 0,
+        material: 0,
     };
     // A quarter texel: the bicubic B-spline of mip 0. Two texels: bilinear mip 1. Three:
     // trilinear between mips 1 and 2 by log2(3).
@@ -3266,6 +3416,69 @@ fn stochastic_taps_of_a_neural_texture_average_to_its_filters() {
             "a footprint {texels} texels wide averages {max} from its filter at most, {mean} on average"
         );
     }
+    assert_clean();
+}
+
+/// A neural set reads as the sampler of the binding it stands in for: taps past the edges fold
+/// back to the texels the wrap names, or read black past a border, and a nearest filter reads
+/// the one texel under the tap.
+#[test]
+fn neural_taps_follow_the_wrap_and_filter_of_their_binding() {
+    let _serial = serial();
+    let (mut scenes, _workers, m) = mount_neural(NeuralTextures::Fp16);
+    let base = scenes.texture(m, AssetId::from_name(NEURAL_BASE)).unwrap();
+    stream_latents(&mut scenes, m, &[base]);
+    let bound = |wrap: u8, filter: u8| TextureBinding {
+        wrap: [wrap; 2],
+        filter,
+        ..TextureBinding::zeroed()
+    };
+    let centers = texel_centers();
+    let moved = |to: &dyn Fn(f32) -> f32| -> Vec<_> {
+        let mut f = centers.clone();
+        for p in &mut f {
+            p.uv = p.uv.map(to);
+        }
+        f
+    };
+    let plain = neural_taps(&mut scenes, base, &centers, 1);
+    let cases: [(u8, &dyn Fn(f32) -> f32); 2] =
+        [(wrap::REPEAT, &|u| u + 3.0), (wrap::MIRROR, &|u| 2.0 - u)];
+    for (mode, to) in cases {
+        let got = bound_taps(&mut scenes, base, &moved(to), 1, &bound(mode, 0));
+        let (max, mean) = differences(&got, &plain);
+        assert!(
+            max < 0.01 && mean < 1e-3,
+            "wrap {mode} moves taps by {max} at most, {mean} on average"
+        );
+    }
+    let past = bound_taps(
+        &mut scenes,
+        base,
+        &moved(&|u| u + 3.0),
+        1,
+        &bound(wrap::BORDER, 0),
+    );
+    assert!(past.iter().flatten().all(|&c| c == 0.0), "past a border");
+    let edge = moved(&|u| u.min(0.0) - 1.0);
+    let clamped = bound_taps(&mut scenes, base, &edge, 1, &bound(wrap::CLAMP, 0));
+    assert!(
+        clamped.iter().all(|c| c == &clamped[0]),
+        "every tap past a corner reads the corner texel"
+    );
+    let off_center = moved(&|u| u + 0.3 / NEURAL_SIZE[0] as f32);
+    let nearest = bound_taps(
+        &mut scenes,
+        base,
+        &off_center,
+        1,
+        &bound(wrap::REPEAT, filter::MAG_NEAREST | filter::MIN_NEAREST),
+    );
+    let (max, mean) = differences(&nearest, &plain);
+    assert!(
+        max < 0.01 && mean < 1e-3,
+        "a nearest filter leaves {max} at most, {mean} on average, of its neighbors"
+    );
     assert_clean();
 }
 

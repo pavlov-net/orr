@@ -15,9 +15,7 @@ use examples::field::{Grass, Heights, Slab, Terrain, blade_triangles, patch_tria
 use examples::shaders::{capture, grass, grass_tint, pond, slab, sun_shadow, terrain};
 use examples::window::Window;
 use examples::{Options, assert_clean, device, fixed_time};
-use orr::orr_gpu::{
-    Format, Hazards, MemoryKind, QueueKind, SamplerIndex, SpecData, Stages, TimelinePoint,
-};
+use orr::orr_gpu::{Format, Hazards, MemoryKind, QueueKind, SpecData, Stages, TimelinePoint};
 use orr::orr_output::Image;
 use orr::orr_pack::material::Material;
 use orr::{
@@ -161,7 +159,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             display: None,
         })
         .expect("begin frame");
-    let material = |m: Material| MaterialGpu::new(&m, &[BoundTexture::NONE; 12], SamplerIndex(0));
+    let material = |m: Material| MaterialGpu::new(&m, &[BoundTexture::NONE; 12]);
     let (soil, blades, water_material) = {
         let mut mats = f.materials();
         let soil = Material {
