@@ -700,7 +700,8 @@ pub(crate) fn import(
         hash,
     }];
     let dir = path.parent().unwrap_or_else(|| Path::new("")).to_owned();
-    let src = data::open(&bytes, &dir).map_err(|m| fail(format!("{}: {m}", path.display())))?;
+    let src = data::open(&bytes, &dir, settings.ignore_version)
+        .map_err(|m| fail(format!("{}: {m}", path.display())))?;
     drop(bytes);
     let src = Arc::new(src);
     let images = images(asset, &src, &dir)?;

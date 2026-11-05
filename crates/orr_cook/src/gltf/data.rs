@@ -11,9 +11,9 @@
 //! `KHR_mesh_quantization` allows and sparse accessors. A texture's `EXT_texture_webp` image
 //! replaces its core `source`, so a texture may carry only the extension's source. An asset
 //! whose `minVersion` is not glTF 2.0 or 2.1, or without one whose `version` has a major other
-//! than 2, is refused, as is a document whose `weights` arrays do not match its morph targets.
-//! A morph target reads from the JSON, as it may name any attribute and the `gltf` crate models
-//! three.
+//! than 2, is refused unless the settings ignore the version, as is a document whose `weights`
+//! arrays do not match its morph targets. A morph target reads from the JSON, as it may name any
+//! attribute and the `gltf` crate models three.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -209,7 +209,7 @@ fn validate(root: &gltf::json::Root) -> Result<(), String> {
 }
 
 /// Opens a `.gltf` or `.glb` file's bytes; buffer URIs resolve against `dir`.
-pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
+pub(super) fn open(bytes: &[u8], dir: &Path, ignore_version: bool) -> Result<Document, String> {
     let (json_bytes, mut bin) = if bytes.starts_with(b"glTF") {
         let glb = gltf::Glb::from_slice(bytes).map_err(|e| e.to_string())?;
         (glb.json.into_owned(), glb.bin.map(Cow::into_owned))
@@ -217,7 +217,9 @@ pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
         (bytes.to_vec(), None)
     };
     let mut json: Value = serde_json::from_slice(&json_bytes).map_err(|e| e.to_string())?;
-    check_version(&json["asset"])?;
+    if !ignore_version {
+        check_version(&json["asset"])?;
+    }
     if let Some(Value::Array(required)) = json.get_mut("extensionsRequired") {
         required.retain(|e| !e.as_str().is_some_and(|n| COOK_EXTENSIONS.contains(&n)));
     }
@@ -681,7 +683,7 @@ mod tests {
 "bufferViews":[{"buffer":0,"byteLength":4},{"buffer":0,"byteOffset":4,"byteLength":4}],
 "accessors":[{"componentType":5125,"count":2,"type":"SCALAR","sparse":{"count":1,
 "indices":{"bufferView":0,"componentType":5125},"values":{"bufferView":1}}}]}"#;
-        let doc = super::open(json.as_bytes(), std::path::Path::new("")).unwrap();
+        let doc = super::open(json.as_bytes(), std::path::Path::new(""), false).unwrap();
         let data = super::Data::load(&doc, [0, 1], "g").unwrap();
         let accessor = doc.doc.accessors().next().unwrap();
         assert_eq!(data.indices(&accessor).unwrap(), [0, (1 << 24) + 1]);
@@ -691,7 +693,7 @@ mod tests {
     fn min_version_other_than_2_0_or_2_1_is_refused() {
         let opens = |min: &str| {
             let json = format!(r#"{{"asset":{{"version":"2.1","minVersion":"{min}"}}}}"#);
-            super::open(json.as_bytes(), std::path::Path::new("")).is_ok()
+            super::open(json.as_bytes(), std::path::Path::new(""), false).is_ok()
         };
         assert!(opens("2.0") && opens("2.1"));
         assert!(!opens("2.2") && !opens("2.10") && !opens("3.0") && !opens("2") && !opens("1.0"));
@@ -701,7 +703,7 @@ mod tests {
     fn version_major_other_than_2_is_refused_without_min_version() {
         let opens = |asset: &str| {
             let json = format!(r#"{{"asset":{asset}}}"#);
-            super::open(json.as_bytes(), std::path::Path::new("")).is_ok()
+            super::open(json.as_bytes(), std::path::Path::new(""), false).is_ok()
         };
         assert!(opens(r#"{"version":"2.0"}"#) && opens(r#"{"version":"2.9"}"#));
         assert!(!opens(r#"{"version":"1.0"}"#) && !opens(r#"{"version":"3.0"}"#));

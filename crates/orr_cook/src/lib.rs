@@ -286,6 +286,9 @@ pub enum Source {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GltfSettings {
+    /// Reads the file as glTF 2 whatever its `asset` says, for a file that puts its own
+    /// version there.
+    pub ignore_version: bool,
     pub layout: GltfLayout,
     /// Nodes that become models; empty makes the whole scene one model.
     pub models: Vec<NodeSelect>,
