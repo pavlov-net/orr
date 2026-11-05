@@ -67,7 +67,7 @@ const GPU_PACKAGES: &[&str] = &[
     "scene_suite",
 ];
 
-/// The other targets that need a GPU, or for `orr_output.display_watch`, a real display.
+/// The other targets that need a GPU, or for the `orr_window` watches, a real display.
 const GPU_TARGETS: &[&str] = &[
     "orr_examples.screenshots",
     "lighting_math.gpu",
@@ -75,7 +75,8 @@ const GPU_TARGETS: &[&str] = &[
     "orr_dlss.fg",
     "orr_dlss.mock",
     "orr_dlss.rr",
-    "orr_output.display_watch",
+    "orr_window.appkit_watch",
+    "orr_window.display_watch",
     "shader_abi.crash",
     "shader_abi.kernels",
     "shader_link.gpu",
