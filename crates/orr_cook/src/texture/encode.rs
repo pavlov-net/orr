@@ -213,11 +213,8 @@ fn bc(e: Encoding, quality: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<
             } else {
                 ColorSpace::Linear
             },
-            alpha: if matches!(e, Encoding::Bc7 | Encoding::Bc7Srgb) {
-                AlphaMode::Straight
-            } else {
-                AlphaMode::Opaque
-            },
+            // Straight would premultiply and divide back, losing color where alpha is 0.
+            alpha: AlphaMode::Opaque,
         },
     };
     let out = ctt::convert(
@@ -229,7 +226,6 @@ fn bc(e: Encoding, quality: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<
             }),
             container: Container::Raw,
             quality,
-            allow_discarding_alpha: true,
             mipmap: false,
             ..Default::default()
         },

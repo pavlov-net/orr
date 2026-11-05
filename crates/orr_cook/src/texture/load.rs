@@ -365,11 +365,15 @@ fn container(image: ctt::Image) -> Result<Source, String> {
             signed: signed_blocks(vk_format),
         });
     }
-    // Uncompressed: ctt converts to f32 RGBA in the file's color space.
+    // Uncompressed: ctt converts to f32 RGBA in the file's color space. Read as straight alpha
+    // it would premultiply and divide back, which loses color where alpha is 0 or negative.
     let mip0 = ctt::Image {
         surfaces: image.surfaces.iter().map(|l| vec![l[0].clone()]).collect(),
         kind: TextureKind::Texture2D,
-        desc: image.desc,
+        desc: ctt::FormatDesc {
+            alpha: ctt::AlphaMode::Opaque,
+            ..image.desc
+        },
     };
     let out = ctt::convert(
         mip0.to_ref(),
@@ -378,7 +382,6 @@ fn container(image: ctt::Image) -> Result<Source, String> {
                 ctt::Format::R32G32B32A32_SFLOAT,
             )),
             container: ctt::Container::Raw,
-            allow_discarding_alpha: true,
             ..Default::default()
         },
     )
