@@ -211,6 +211,14 @@ impl Drop for Target {
     }
 }
 
+/// The G-buffer's textures, the extended targets only while a material needs them.
+type GBufferTextures = (
+    Arc<Texture>,
+    Arc<Texture>,
+    Option<Arc<Texture>>,
+    Option<Arc<Texture>>,
+);
+
 /// Sizes of a view's raster buffers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TargetSizes {
@@ -241,6 +249,7 @@ const DEPTH_VALUES: &str = "resolved depth";
 const GBUF_A: &str = "gbuf_a";
 const GBUF_B: &str = "gbuf_b";
 const GBUF_X: &str = "gbuf_x";
+const GBUF_Y: &str = "gbuf_y";
 const OVERLAY: &str = "transparency overlay";
 
 /// Raster's working lists and the depth it resolves, which only the raster half reads.
@@ -270,6 +279,7 @@ struct Transient {
     a: ArenaTexture,
     b: ArenaTexture,
     x: Option<ArenaTexture>,
+    y: Option<ArenaTexture>,
     overlay: ArenaTexture,
 }
 
@@ -296,6 +306,7 @@ impl Transient {
             a: texture(GBUF_A).expect("raster target"),
             b: texture(GBUF_B).expect("raster target"),
             x: texture(GBUF_X),
+            y: texture(GBUF_Y),
             overlay: texture(OVERLAY).expect("raster target"),
         }
     }
@@ -385,11 +396,9 @@ impl ViewTargets {
             ),
         ];
         if s.extended {
-            r.push(ArenaRequest::texture(
-                GBUF_X,
-                d2(Format::Rgba32Uint),
-                GBUFFER,
-            ));
+            for name in [GBUF_X, GBUF_Y] {
+                r.push(ArenaRequest::texture(name, d2(Format::Rgba32Uint), GBUFFER));
+            }
         }
         r
     }
@@ -461,22 +470,26 @@ impl ViewTargets {
             x: t.x
                 .as_ref()
                 .map_or(TextureIndex::NONE, ArenaTexture::sampled),
+            y: t.y
+                .as_ref()
+                .map_or(TextureIndex::NONE, ArenaTexture::sampled),
             motion: self.motion.sampled,
             hzb: self.hzb.sampled,
             extent: self.sizes.extent,
             hzb_mips: self.hzb.storage.len() as u32,
-            _pad: 0,
             layer_tiles: t.layer_tiles.gpu(),
         }
     }
 
-    /// The G-buffer's textures: a, b and x.
-    pub(crate) fn gbuffer_textures(&self) -> (Arc<Texture>, Arc<Texture>, Option<Arc<Texture>>) {
+    /// The G-buffer's textures: a, b, x and y.
+    pub(crate) fn gbuffer_textures(&self) -> GBufferTextures {
         let t = &self.transient;
+        let extended = |x: &Option<ArenaTexture>| x.as_ref().map(|x| Arc::clone(x.texture()));
         (
             Arc::clone(t.a.texture()),
             Arc::clone(t.b.texture()),
-            t.x.as_ref().map(|x| Arc::clone(x.texture())),
+            extended(&t.x),
+            extended(&t.y),
         )
     }
 
@@ -513,6 +526,9 @@ impl ViewTargets {
             x: t.x
                 .as_ref()
                 .map_or(StorageImageIndex::NONE, |x| x.storage(0)),
+            y: t.y
+                .as_ref()
+                .map_or(StorageImageIndex::NONE, |y| y.storage(0)),
             motion: self.motion.storage[0],
             hzb,
             tiles_x: tx,
@@ -524,7 +540,6 @@ impl ViewTargets {
             flags: if occlusion { RASTER_OCCLUSION } else { 0 },
             slots,
             hzb_mips: self.hzb.storage.len() as u32,
-            _pad: 0,
         }
     }
 

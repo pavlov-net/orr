@@ -7,21 +7,17 @@ import orr_shaders.abi;
 import orr_shaders.random;
 import orr_scene.gbuffer;
 import orr_scene.material;
-import orr_scene.tables;
 import orr_scene.view;
 
 struct Root
 {
-    SceneRoot* scene;
     ViewConstants* view;
     GBufferGpu* gbuffer;
-    StorageImageIndex radiance;
-    uint _pad2;
     float4 sky;
+    StorageImageIndex radiance;
     uint frame;            // the frame's index in the accumulation
     uint seed;
     uint _pad0;
-    uint _pad1;
 }
 ORR_ROOT(Root);
 
@@ -32,7 +28,7 @@ void main(uint3 id: SV_DispatchThreadID)
     GBufferGpu* g = root.gbuffer;
     if (any(id.xy >= g.extent))
         return;
-    GSurface s = load_gsurface(root.scene, root.view, g, id.xy);
+    GSurface s = load_gsurface(root.view, g, id.xy);
     bool drawn = s.material != MATERIAL_NONE;
     float3 color = drawn ? s.bsdf.base_color : root.sky.rgb;
     Sampler rng = Sampler(id.xy, root.frame, root.seed);

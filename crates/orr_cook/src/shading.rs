@@ -5,11 +5,10 @@
 //! - MaterialX `open_pbr_surface`, input for field: `base_metalness` is `metalness`,
 //!   `base_diffuse_roughness` `diffuse_roughness`, `specular_roughness_anisotropy`
 //!   `specular_anisotropy`, `geometry_thin_walled` `thin_walled`, `thin_film_thickness`
-//!   (micrometers) the field in nanometers when `thin_film_weight` is above 0 (0 otherwise),
-//!   and every other input the field of its name. `coat_darkening`,
-//!   `coat_roughness_anisotropy` and the coat normal and tangents have no field and are not
-//!   read. A `geometry_opacity` below 1 or textured blends, as the linear presence weight
-//!   OpenPBR defines.
+//!   (micrometers) the field in nanometers, and every other input the field of its name.
+//!   `coat_darkening`, `coat_roughness_anisotropy` and the coat normal and tangents have no
+//!   field and are not read. A `geometry_opacity` below 1 or textured blends, as the linear
+//!   presence weight OpenPBR defines.
 //! - `UsdPreviewSurface`, mapped like glTF metallic-roughness: `diffuseColor` is
 //!   `base_color`, `metallic`, `roughness`, `ior` and `emissiveColor` (read as nits) their
 //!   fields, `clearcoat` and `clearcoatRoughness` the coat at `ior`, and `normal` and
@@ -1153,6 +1152,7 @@ impl Mapper<'_, '_> {
             ("coat_weight", |m| &mut m.coat_weight, Some(|t| &mut t.coat)),
             ("coat_roughness", |m| &mut m.coat_roughness, None),
             ("coat_ior", |m| &mut m.coat_ior, None),
+            ("thin_film_weight", |m| &mut m.thin_film_weight, None),
             ("thin_film_ior", |m| &mut m.thin_film_ior, None),
             ("emission_luminance", |m| &mut m.emission_luminance, None),
             (
@@ -1208,7 +1208,6 @@ impl Mapper<'_, '_> {
                     name.as_str(),
                     "transmission_depth"
                         | "subsurface_radius"
-                        | "thin_film_weight"
                         | "thin_film_thickness"
                         | "geometry_thin_walled"
                         | "geometry_normal"
@@ -1228,7 +1227,6 @@ impl Mapper<'_, '_> {
         }
         self.length(n, "transmission_depth", |m| &mut m.transmission_depth)?;
         self.length(n, "subsurface_radius", |m| &mut m.subsurface_radius)?;
-        let film = self.number(n, "thin_film_weight")?.map_or(0.0, |v| v[0]);
         let (thickness, unit) = self
             .measure(n, "thin_film_thickness")?
             .map_or((0.5, Unit::Unstated), |(v, unit)| (v[0], unit));
@@ -1236,11 +1234,7 @@ impl Mapper<'_, '_> {
             Unit::Unstated => 1e3,
             unit => self.meters(n, "thin_film_thickness", unit)? * 1e9,
         };
-        self.material.thin_film_thickness = if film > 0.0 {
-            scaled(thickness, nanometers)
-        } else {
-            0.0
-        };
+        self.material.thin_film_thickness = scaled(thickness, nanometers);
         if let Some(v) = self.number(n, "geometry_thin_walled")? {
             self.material.thin_walled = u8::from(v[0] != 0.0);
         }

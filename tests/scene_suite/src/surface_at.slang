@@ -2,7 +2,6 @@
 #include "orr_root.h"
 import orr_scene.gbuffer;
 import orr_scene.material;
-import orr_scene.tables;
 import orr_scene.view;
 
 struct At
@@ -17,10 +16,11 @@ struct At
 
 struct Root
 {
-    SceneRoot* scene;
     ViewConstants* view;
     GBufferGpu* gbuffer;
     At* out;
+    uint pad0;
+    uint pad1;
 }
 ORR_ROOT(Root);
 
@@ -32,7 +32,7 @@ void main(uint3 id: SV_DispatchThreadID)
     if (id.x >= g.extent.x * g.extent.y)
         return;
     uint2 pixel = uint2(id.x % g.extent.x, id.x / g.extent.x);
-    GSurface s = load_gsurface(root.scene, root.view, g, pixel);
+    GSurface s = load_gsurface(root.view, g, pixel);
     At a;
     a.position = s.position;
     a.nv = dot(s.normal, normalize(root.view.eye_render.xyz - s.position));

@@ -156,7 +156,7 @@ impl MaterialGpu {
         let subsurface = m.subsurface_weight > 0.0 && !thin && !dielectric;
         let lobes = m.coat_weight > 0.0
             || m.fuzz_weight > 0.0
-            || m.thin_film_thickness > 0.0
+            || m.thin_film_weight > 0.0
             || m.specular_anisotropy > 0.0;
         set(m.alpha_mode == Material::MASK, f::ALPHA_TESTED);
         set(m.double_sided != 0, f::DOUBLE_SIDED);
@@ -168,7 +168,7 @@ impl MaterialGpu {
         set(bound(slot::DISPLACEMENT), f::DISPLACED);
         set(m.coat_weight > 0.0, f::COAT);
         set(m.fuzz_weight > 0.0, f::FUZZ);
-        set(m.thin_film_thickness > 0.0, f::THIN_FILM);
+        set(m.thin_film_weight > 0.0, f::THIN_FILM);
         set(m.specular_anisotropy > 0.0, f::ANISOTROPY);
         let cost: u32 = if subsurface {
             3
@@ -208,6 +208,7 @@ impl MaterialGpu {
             coat_roughness: m.coat_roughness,
             coat_ior: m.coat_ior,
             fuzz_roughness: m.fuzz_roughness,
+            thin_film_weight: m.thin_film_weight,
             thin_film_thickness: m.thin_film_thickness,
             thin_film_ior: m.thin_film_ior,
             geometry_opacity: m.geometry_opacity,
@@ -226,7 +227,6 @@ impl MaterialGpu {
             tangent_set: u32::from(m.tangent_set()),
             transmission_dispersion_scale: m.transmission_dispersion_scale,
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
-            _pad: 0,
             data: 0,
             texture_streams: GpuPtr::NULL,
             tiles: textures.map(|t| t.tiles),
@@ -243,18 +243,19 @@ pub(crate) struct MaterialTable {
     /// record written points `MaterialGpu::texture_streams` at it.
     pub(crate) streams: Allocation<GpuPtr<TextureStreamGpu>>,
     ids: Mutex<RangeAllocator>,
-    /// Materials whose pixels may use the extended G-buffer target.
+    /// Materials whose pixels may use the extended G-buffer targets.
     extended: Mutex<HashSet<u32>>,
     /// Materials whose paths may take a random walk.
     walking: Mutex<HashSet<u32>>,
 }
 
-/// Whether pixels of `m` may use the extended G-buffer target. A linked surface may set any
+/// Whether pixels of `m` may use the extended G-buffer targets. A linked surface may set any
 /// lobe.
 fn needs_extended(m: &MaterialGpu) -> bool {
     use material_flags as f;
     let thin_sss = m.flags & f::THIN_WALLED != 0 && m.subsurface_weight > 0.0;
-    thin_sss || m.flags & (f::SUBSURFACE | f::COAT | f::FUZZ | f::ANISOTROPY) != 0 || m.surface != 0
+    let lobes = f::SUBSURFACE | f::COAT | f::FUZZ | f::THIN_FILM | f::ANISOTROPY;
+    thin_sss || m.flags & lobes != 0 || m.surface != 0
 }
 
 /// Whether paths through `m` may take a random walk: through its subsurface medium or its dense
@@ -305,7 +306,7 @@ impl MaterialTable {
         mark(&self.walking, may_walk(m));
     }
 
-    /// Whether any material may write the extended G-buffer target.
+    /// Whether any material may write the extended G-buffer targets.
     pub(crate) fn any_extended(&self) -> bool {
         !self.extended.lock().unwrap().is_empty()
     }

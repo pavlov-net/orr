@@ -13,7 +13,7 @@
 //! | `KHR_materials_clearcoat` `clearcoatFactor`, `clearcoatRoughnessFactor`, `clearcoatTexture` (R) | `coat_weight`, `coat_roughness`, `coat_ior` 1.5, the coat texture |
 //! | `KHR_materials_sheen` `sheenColorFactor`, `sheenRoughnessFactor` | `fuzz_weight` 1 when the color is not black, `fuzz_color`, `fuzz_roughness` (approximate) |
 //! | `KHR_materials_anisotropy` `anisotropyStrength`, `anisotropyRotation` | `specular_anisotropy`, `specular_rotation` (radians, as glTF) |
-//! | `KHR_materials_iridescence` `iridescenceFactor` > 0, `iridescenceIor`, `iridescenceThicknessMaximum` | `thin_film_thickness` (nm), `thin_film_ior`; the factor and thickness texture have no equivalent |
+//! | `KHR_materials_iridescence` `iridescenceFactor`, `iridescenceIor`, `iridescenceThicknessMaximum` | `thin_film_weight`, `thin_film_ior`, `thin_film_thickness` (nm) |
 //! | `KHR_materials_transmission` `transmissionFactor`, `transmissionTexture` (R) | `transmission_weight`, the transmission texture |
 //! | `KHR_materials_volume` `attenuationColor`, `attenuationDistance` | `transmission_color`, `transmission_depth`; an infinite distance is white at depth 0 |
 //! | transmission without `KHR_materials_volume`, or with `thicknessFactor` 0 | `thin_walled` |
@@ -111,9 +111,8 @@ pub(super) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
         out.specular_anisotropy = num(e, "anisotropyStrength", 0.0);
         out.specular_rotation = num(e, "anisotropyRotation", 0.0);
     }
-    if let Some(e) = ext("KHR_materials_iridescence")
-        && num(e, "iridescenceFactor", 0.0) > 0.0
-    {
+    if let Some(e) = ext("KHR_materials_iridescence") {
+        out.thin_film_weight = num(e, "iridescenceFactor", 0.0);
         out.thin_film_thickness = num(e, "iridescenceThicknessMaximum", 400.0);
         out.thin_film_ior = num(e, "iridescenceIor", 1.3);
     }

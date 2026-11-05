@@ -143,12 +143,14 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     float4 clip = mul(v.clip_from_view_jittered, float4(view_pos, 1.0));
     float2 motion = visible_motion(s, v, vc, hit, visibility_triangle(w), relative);
 
-    bool extended = r.x.index != IMAGE_NONE;
-    GBufferWords words = encode_gsurface(g, extended);
+    GBufferWords words = encode_gsurface(g, r.x.index != IMAGE_NONE);
+    uint flags = words.a.w >> 24;
     r.a.get<RWTexture2D<uint4>>()[pixel] = words.a;
     r.b.get<RWTexture2D<uint2>>()[pixel] = words.b;
-    if (extended && ((words.a.w >> 24) & GBUFFER_EXTENDED) != 0)
+    if ((flags & GBUFFER_EXTENDED) != 0)
         r.x.get<RWTexture2D<uint4>>()[pixel] = words.x;
+    if ((flags & GBUFFER_LAYERS) != 0)
+        r.y.get<RWTexture2D<uint4>>()[pixel] = words.y;
     r.motion.get<RWTexture2D<float2>>()[pixel] = motion;
     r.depth[index] = clip.z / clip.w;
 }

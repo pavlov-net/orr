@@ -144,6 +144,7 @@ public struct MaterialGpu
     public float coat_roughness;
     public float coat_ior;
     public float fuzz_roughness;
+    public float thin_film_weight;
     public float thin_film_thickness;       // nm
     public float thin_film_ior;
     public float geometry_opacity;
@@ -159,7 +160,6 @@ public struct MaterialGpu
     public uint tangent_set;                // the uv set its tangent frame follows; TANGENT_SET_OTHER: neither
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
-    public uint _pad;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
     public uint* tiles[TEXTURE_SLOTS];                  // per slot of TEXTURE_TILED, its table: `texture_tile`

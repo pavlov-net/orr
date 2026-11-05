@@ -1085,7 +1085,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
 public bool gbuffer_vertex(SceneRoot* s, ViewConstants* v, GBufferGpu* gbuffer, uint2 pixel, out PathVertex x)
 {
     x = (PathVertex)0;
-    GSurface g = load_gsurface(s, v, gbuffer, pixel);
+    GSurface g = load_gsurface(v, gbuffer, pixel);
     if (g.material == MATERIAL_NONE)
         return false;
     x.surface = g;

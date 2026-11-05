@@ -36,7 +36,7 @@ void main(uint3 id: SV_DispatchThreadID)
     ViewConstants* v = root.view;
     float2 uv = (float2(id.xy) + 0.5) / float2(g.extent);
     float3 d = render_direction(v, view_direction(v, uv));
-    GSurface opaque = load_gsurface(s, v, g, id.xy);
+    GSurface opaque = load_gsurface(v, g, id.xy);
     RayDesc ray;
     ray.Origin = v.eye_render.xyz;
     ray.Direction = d;

@@ -1944,7 +1944,7 @@ impl<'a> Frame<'a> {
             occlusion,
             preprocess,
         )?;
-        let (gbuf_a, gbuf_b, gbuf_x) = targets.gbuffer_textures();
+        let (gbuf_a, gbuf_b, gbuf_x, gbuf_y) = targets.gbuffer_textures();
         let out = RasterView {
             view: constants,
             scene: root,
@@ -1955,6 +1955,7 @@ impl<'a> Frame<'a> {
             gbuf_a,
             gbuf_b,
             gbuf_x,
+            gbuf_y,
             hzb: Arc::clone(&targets.hzb.texture),
             counts: targets.counts(),
             raster,

@@ -3,7 +3,8 @@
 //
 // Core targets: `a` RGBA32_UINT, `b` RG32_UINT, depth D32 (reverse Z, 0 = no geometry) and
 // motion RG16F (previous uv minus current uv, unjittered). The extended target `x`
-// (RGBA32_UINT) holds subsurface and lobe scalars where `GBUFFER_EXTENDED` is set.
+// (RGBA32_UINT) holds subsurface and lobe scalars where `GBUFFER_EXTENDED` is set, and `y`
+// (RGBA32_UINT) the coat, fuzz and thin film beside them where `GBUFFER_LAYERS` is.
 module gbuffer;
 
 import orr_shaders.abi;
@@ -11,7 +12,6 @@ import orr_color.transfer;
 import orr_shaders.math;
 import orr_shaders.packing;
 import orr_scene.material;
-import orr_scene.tables;
 import orr_scene.view;
 
 // `BsdfParams.flags`.
@@ -61,7 +61,7 @@ public static const uint GBUFFER_THIN_TWO_SIDED = 1 << 0;
 public static const uint GBUFFER_UNLIT = 1 << 1;
 public static const uint GBUFFER_EXTENDED = 1 << 2;
 public static const uint GBUFFER_SUBSURFACE = 1 << 3;
-public static const uint GBUFFER_LOBE_COLORS = 1 << 4;
+public static const uint GBUFFER_LAYERS = 1 << 4;
 public static const uint GBUFFER_ORIGIN_SHIFT = 5;
 public static const uint GBUFFER_ORIGIN_MASK = 3 << 5;
 
@@ -134,11 +134,11 @@ public struct GBufferGpu
     public TextureIndex a;
     public TextureIndex b;
     public TextureIndex x;          // IMAGE_NONE while no resident material needs it
+    public TextureIndex y;          // with `x`
     public TextureIndex motion;
     public TextureIndex hzb;        // R32F: farthest reverse-Z depth per texel, mip 0 at extent
     public uint2 extent;
     public uint hzb_mips;
-    public uint _pad;
     // Per LAYER_TILE pixel tile in rows of extent.x / LAYER_TILE rounded up: nonzero where a
     // dielectric or presence cluster rastered in front of the opaque depth. Then one word,
     // nonzero when such a cluster may lie between the eye and the near plane. Null without
@@ -170,6 +170,7 @@ public struct GBufferWords
     public uint4 a;
     public uint2 b;
     public uint4 x;
+    public uint4 y;
 }
 
 uint rgb8(float3 c)
@@ -230,15 +231,22 @@ float angle_from_code(uint c)
     return float(c & 255) / 256.0 * PI;
 }
 
-// Whether `s` needs the extended target.
+// Whether `s` holds a coat, fuzz or thin film.
+bool gsurface_layered(GSurface s)
+{
+    BsdfParams p = s.bsdf;
+    return p.coat_weight > 0.0 || p.fuzz_weight > 0.0 || p.thin_film_weight > 0.0;
+}
+
+// Whether `s` needs the extended targets.
 public bool gsurface_extended(GSurface s)
 {
     BsdfParams p = s.bsdf;
-    return p.subsurface_weight > 0.0 || p.coat_weight > 0.0 || p.fuzz_weight > 0.0 || p.specular_anisotropy > 0.0;
+    return p.subsurface_weight > 0.0 || gsurface_layered(s) || p.specular_anisotropy > 0.0;
 }
 
 // Packs `s`. Emission is stored as given (the resolve pre-exposes it). `extended` false
-// drops what only the extended target holds.
+// drops what only the extended targets hold.
 public GBufferWords encode_gsurface(GSurface s, bool extended)
 {
     BsdfParams p = s.bsdf;
@@ -252,8 +260,8 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
         flags |= GBUFFER_EXTENDED;
         if (sss && !thin)
             flags |= GBUFFER_SUBSURFACE;
-        if (!sss && (p.coat_weight > 0.0 || p.fuzz_weight > 0.0))
-            flags |= GBUFFER_LOBE_COLORS;
+        if (gsurface_layered(s))
+            flags |= GBUFFER_LAYERS;
     }
     GBufferWords w;
     w.a.x = rgb8(p.base_color) | (pack_unorm8(p.specular_roughness) << 24);
@@ -266,31 +274,29 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
     w.b.x = s7.x | (s7.y << 7) | (s7.z << 14) | (raster_error_code(s.raster_error) << 21) | (exponent << 26);
     w.b.y = (oct_encode_snorm8(s.geometric_normal) & 0xffff) | (pack_unorm8(p.diffuse_roughness) << 16);
     w.x = uint4(0);
+    w.y = uint4(0);
     if ((flags & GBUFFER_EXTENDED) != 0)
     {
-        if ((flags & GBUFFER_LOBE_COLORS) != 0)
-        {
-            w.x.x = rgb8(p.coat_color);
-            w.x.y = rgb8(p.fuzz_color);
-        }
-        else
-        {
-            float3 tint = p.subsurface_weight * p.subsurface_color;
-            if (thin)
-                tint *= (p.subsurface_anisotropy + 1.0) * 0.5;
-            w.x.x = rgb8(tint) | (pack_snorm8(p.subsurface_anisotropy) << 24);
-            w.x.y = pack_rgb9e5(max(p.subsurface_radius, 0.0));
-        }
+        float3 tint = p.subsurface_weight * p.subsurface_color;
+        if (thin)
+            tint *= (p.subsurface_anisotropy + 1.0) * 0.5;
+        w.x.x = rgb8(tint) | (pack_snorm8(p.subsurface_anisotropy) << 24);
+        w.x.y = pack_rgb9e5(max(p.subsurface_radius, 0.0));
         w.x.z = pack_unorm8(p.coat_weight) | (pack_unorm8(p.coat_roughness) << 8) | (ior_code(p.coat_ior) << 16) | (pack_unorm8(p.fuzz_weight) << 24);
         w.x.w = pack_unorm8(p.fuzz_roughness) | (pack_unorm8(p.specular_anisotropy) << 8) | (angle_code(p.tangent_angle) << 16) | (pack_unorm8(p.subsurface_weight) << 24);
+    }
+    if ((flags & GBUFFER_LAYERS) != 0)
+    {
+        w.y.x = rgb8(p.coat_color);
+        w.y.y = rgb8(p.fuzz_color);
+        w.y.z = asuint(p.thin_film_thickness);
+        w.y.w = pack_unorm8(p.thin_film_weight) | (ior_code(p.thin_film_ior) << 8) | (pack_unorm8(p.coat_darkening) << 16);
     }
     return w;
 }
 
-// Unpacks what the words hold. Thin film, coat darkening and, without
-// GBUFFER_LOBE_COLORS, the coat and fuzz colors come from `m`, the pixel's material.
-// Position and the visible triangle are left 0.
-public GSurface decode_gsurface(GBufferWords w, MaterialGpu* m)
+// Unpacks what the words hold. Position, the visible triangle and the material are left 0.
+public GSurface decode_gsurface(GBufferWords w)
 {
     GSurface s;
     BsdfParams p;
@@ -322,15 +328,12 @@ public GSurface decode_gsurface(GBufferWords w, MaterialGpu* m)
     p.fuzz_roughness = 0.5;
     p.specular_anisotropy = 0.0;
     p.tangent_angle = 0.0;
-    p.coat_color = m.coat_color;
-    p.fuzz_color = m.fuzz_color;
+    p.coat_color = float3(1.0);
+    p.fuzz_color = float3(1.0);
     p.coat_darkening = 1.0;
-    bool film = (m.flags & MATERIAL_THIN_FILM) != 0;
-    p.thin_film_weight = film ? 1.0 : 0.0;
-    p.thin_film_thickness = m.thin_film_thickness;
-    p.thin_film_ior = m.thin_film_ior;
-    if (film)
-        p.flags |= BSDF_THIN_FILM;
+    p.thin_film_weight = 0.0;
+    p.thin_film_thickness = 0.0;
+    p.thin_film_ior = 1.4;
     if ((flags & GBUFFER_EXTENDED) != 0)
     {
         p.coat_weight = unpack_unorm8(w.x.z);
@@ -341,26 +344,29 @@ public GSurface decode_gsurface(GBufferWords w, MaterialGpu* m)
         p.specular_anisotropy = unpack_unorm8(w.x.w >> 8);
         p.tangent_angle = angle_from_code(w.x.w >> 16);
         p.subsurface_weight = unpack_unorm8(w.x.w >> 24);
-        if ((flags & GBUFFER_LOBE_COLORS) != 0)
-        {
-            p.coat_color = from_rgb8(w.x.x);
-            p.fuzz_color = from_rgb8(w.x.y);
-        }
-        else
-        {
-            p.subsurface_anisotropy = unpack_snorm8(w.x.x >> 24);
-            float share = p.subsurface_weight;
-            if (thin)
-                share *= (p.subsurface_anisotropy + 1.0) * 0.5;
-            p.subsurface_color = share > 0.0 ? saturate(from_rgb8(w.x.x) / share) : float3(0.0);
-            p.subsurface_radius = unpack_rgb9e5(w.x.y);
-        }
+        p.subsurface_anisotropy = unpack_snorm8(w.x.x >> 24);
+        float share = p.subsurface_weight;
+        if (thin)
+            share *= (p.subsurface_anisotropy + 1.0) * 0.5;
+        p.subsurface_color = share > 0.0 ? saturate(from_rgb8(w.x.x) / share) : float3(0.0);
+        p.subsurface_radius = unpack_rgb9e5(w.x.y);
         if (p.coat_weight > 0.0)
             p.flags |= BSDF_COAT;
         if (p.fuzz_weight > 0.0)
             p.flags |= BSDF_FUZZ;
         if (p.specular_anisotropy > 0.0)
             p.flags |= BSDF_ANISOTROPY;
+    }
+    if ((flags & GBUFFER_LAYERS) != 0)
+    {
+        p.coat_color = from_rgb8(w.y.x);
+        p.fuzz_color = from_rgb8(w.y.y);
+        p.coat_darkening = unpack_unorm8(w.y.w >> 16);
+        p.thin_film_weight = unpack_unorm8(w.y.w);
+        p.thin_film_ior = ior_from_code(w.y.w >> 8);
+        p.thin_film_thickness = asfloat(w.y.z);
+        if (p.thin_film_weight > 0.0)
+            p.flags |= BSDF_THIN_FILM;
     }
     s.bsdf = p;
     s.position = float3(0.0);
@@ -391,7 +397,7 @@ public float3 lean_normal(float3 n, float3 v)
 // The pixel's surface: render-space position from the depth target, the shading normal
 // leaned so that dot(N, V) >= 0.01, the visible triangle and its material. A pixel with no
 // geometry (depth 0) returns a surface whose material is MATERIAL_NONE.
-public GSurface load_gsurface(SceneRoot* scene, ViewConstants* view, GBufferGpu* g, uint2 pixel)
+public GSurface load_gsurface(ViewConstants* view, GBufferGpu* g, uint2 pixel)
 {
     uint64_t vis = g.visibility[pixel.y * g.extent.x + pixel.x];
     if (vis == 0)
@@ -405,10 +411,13 @@ public GSurface load_gsurface(SceneRoot* scene, ViewConstants* view, GBufferGpu*
     w.a = g.a.get<Texture2D<uint4>>().Load(int3(pixel, 0));
     w.b = g.b.get<Texture2D<uint2>>().Load(int3(pixel, 0));
     w.x = uint4(0);
+    w.y = uint4(0);
     uint flags = w.a.w >> 24;
     if ((flags & GBUFFER_EXTENDED) != 0 && g.x.index != IMAGE_NONE)
         w.x = g.x.get<Texture2D<uint4>>().Load(int3(pixel, 0));
-    GSurface s = decode_gsurface(w, scene.materials + c.material);
+    if ((flags & GBUFFER_LAYERS) != 0 && g.y.index != IMAGE_NONE)
+        w.y = g.y.get<Texture2D<uint4>>().Load(int3(pixel, 0));
+    GSurface s = decode_gsurface(w);
     float depth = g.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
     float2 uv = (float2(pixel) + 0.5) / float2(g.extent);
     s.position = render_from_view(view, view_position(view, uv, depth));

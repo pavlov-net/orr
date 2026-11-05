@@ -85,7 +85,7 @@ void main(uint3 id: SV_DispatchThreadID)
         return;
     SceneRoot* s = root.scene;
     ViewConstants* v = root.view;
-    GSurface surface = load_gsurface(s, v, g, id.xy);
+    GSurface surface = load_gsurface(v, g, id.xy);
     float3 l = root.sun.xyz;
     float3 radiance;
     if (surface.material == MATERIAL_NONE)

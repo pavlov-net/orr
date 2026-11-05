@@ -227,6 +227,8 @@ pub struct RasterView {
     pub gbuf_b: Arc<Texture>,
     /// Present while a resident material may need it.
     pub gbuf_x: Option<Arc<Texture>>,
+    /// With `gbuf_x`.
+    pub gbuf_y: Option<Arc<Texture>>,
     /// R32F: the farthest reverse-Z depth per texel, mip 0 at the render extent.
     pub hzb: Arc<Texture>,
     /// Visible clusters written, then visible clusters and cluster work dropped for want

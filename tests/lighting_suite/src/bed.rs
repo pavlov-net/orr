@@ -2002,16 +2002,13 @@ impl FlatColor {
 
     pub fn record(&self, list: &mut CommandList<'_>, f: &mut BedFrame<'_>) {
         let root = f.put(&flat_color::Root {
-            scene: f.view.scene,
             view: f.view.view,
             gbuffer: f.view.gbuffer,
             radiance: f.target.radiance_storage(),
-            _pad2: 0,
             sky: [self.sky[0], self.sky[1], self.sky[2], 0.0],
             frame: f.index,
             seed: f.seed,
             _pad0: 0,
-            _pad1: 0,
         });
         list.dispatch(
             &self.pipeline,

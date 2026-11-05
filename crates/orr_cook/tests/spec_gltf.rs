@@ -1013,6 +1013,23 @@ fn the_alpha_test_holds_per_texel() {
     }
 }
 
+/// KHR_materials_iridescence: "`iridescenceFactor` is multiplied with the red channel of
+/// `iridescenceTexture` to control the overall strength".
+#[test]
+fn iridescence_keeps_its_strength() {
+    let path = dir("iridescence").join("film.glb");
+    textured_quad(
+        &path,
+        &gradient(),
+        r#"{"extensions":{"KHR_materials_iridescence":{"iridescenceFactor":0.5}}}"#,
+        "",
+    );
+    let m = material_of(&cooked(&path).0);
+    assert_eq!(m.thin_film_weight, 0.5);
+    assert_eq!(m.thin_film_thickness, 400.0);
+    assert_eq!(m.thin_film_ior, 1.3);
+}
+
 /// L2846 "Client implementations that are capable of computing indirect lighting themselves,
 /// e.g., via path tracing, **SHOULD** ignore the occlusion texture.": its image isn't opened, so
 /// one that doesn't decode cooks, and nothing of it reaches the archive.

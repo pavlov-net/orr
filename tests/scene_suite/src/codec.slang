@@ -2,7 +2,6 @@
 // the words kept, then `decode_gsurface` back into a case.
 #include "orr_root.h"
 import orr_scene.gbuffer;
-import orr_scene.material;
 
 struct Case
 {
@@ -30,6 +29,10 @@ struct Case
     float tangent_angle;
     float subsurface_weight;
     float subsurface_anisotropy;
+    float coat_darkening;
+    float thin_film_weight;
+    float thin_film_thickness;
+    float thin_film_ior;
     uint flags;        // GBUFFER_UNLIT and the origin policy in, every GSurface flag out
     uint bsdf_flags;   // BSDF_THIN_WALLED in, the decoded BSDF flags out
 }
@@ -38,6 +41,7 @@ struct Words
 {
     uint4 a;
     uint4 x;
+    uint4 y;
     uint2 b;
     uint2 pad;
 }
@@ -47,11 +51,8 @@ struct Root
     Case* cases;
     Words* words;
     Case* decoded;
-    MaterialGpu* material;
     uint count;
     uint pad0;
-    uint pad1;
-    uint pad2;
 }
 ORR_ROOT(Root);
 
@@ -74,6 +75,10 @@ GSurface surface(Case c)
     p.fuzz_color = c.fuzz_color;
     p.coat_roughness = c.coat_roughness;
     p.coat_ior = c.coat_ior;
+    p.coat_darkening = c.coat_darkening;
+    p.thin_film_weight = c.thin_film_weight;
+    p.thin_film_thickness = c.thin_film_thickness;
+    p.thin_film_ior = c.thin_film_ior;
     p.fuzz_weight = c.fuzz_weight;
     p.fuzz_roughness = c.fuzz_roughness;
     p.specular_anisotropy = c.anisotropy;
@@ -108,6 +113,10 @@ Case flatten(GSurface s)
     c.fuzz_color = p.fuzz_color;
     c.coat_roughness = p.coat_roughness;
     c.coat_ior = p.coat_ior;
+    c.coat_darkening = p.coat_darkening;
+    c.thin_film_weight = p.thin_film_weight;
+    c.thin_film_thickness = p.thin_film_thickness;
+    c.thin_film_ior = p.thin_film_ior;
     c.fuzz_weight = p.fuzz_weight;
     c.fuzz_roughness = p.fuzz_roughness;
     c.anisotropy = p.specular_anisotropy;
@@ -132,8 +141,9 @@ void round_trip(uint3 id: SV_DispatchThreadID)
     Words o;
     o.a = w.a;
     o.x = w.x;
+    o.y = w.y;
     o.b = w.b;
     o.pad = uint2(0);
     root.words[id.x] = o;
-    root.decoded[id.x] = flatten(decode_gsurface(w, root.material));
+    root.decoded[id.x] = flatten(decode_gsurface(w));
 }

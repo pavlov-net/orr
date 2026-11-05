@@ -61,6 +61,7 @@ patch! {
         coat_roughness: f32,
         coat_ior: f32,
         fuzz_roughness: f32,
+        thin_film_weight: f32,
         thin_film_thickness: f32,
         thin_film_ior: f32,
         geometry_opacity: f32,

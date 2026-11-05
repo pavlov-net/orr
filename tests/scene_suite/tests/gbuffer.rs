@@ -46,7 +46,6 @@ use orr_scene::{
     PackSource, Pose, Projection, RasterGpu, RasterView, RendererDesc, SceneCompute, SceneDesc,
     SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, SkinnedGpu, SlotCutGpu,
     TextureFilter, TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId, VisibleCluster,
-    material_flags,
 };
 use orr_scene::{Budgets, InstancePageRef, PageId};
 use scene_suite::shaders::{codec, fracture, pose, skin_pose, surface_at, trace};
@@ -184,7 +183,7 @@ fn decode_core(a: [u32; 4], b: [u32; 2]) -> Core {
 const THIN_TWO_SIDED: u32 = 1;
 const EXTENDED: u32 = 4;
 const SUBSURFACE: u32 = 8;
-const LOBE_COLORS: u32 = 16;
+const LAYERS: u32 = 16;
 const BSDF_THIN_WALLED: u32 = 1;
 
 // --- Packing ------------------------------------------------------------------------------
@@ -270,6 +269,12 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 c.fuzz_weight = rng.next();
                 c.fuzz_color = arr(rng.rgb());
             }
+            if kind == 3 || i % 16 == 1 {
+                c.thin_film_weight = 0.05 + 0.95 * rng.next();
+                c.thin_film_thickness = 1500.0 * rng.next();
+                c.thin_film_ior = 1.0 + 2.0 * rng.next();
+                c.coat_darkening = rng.next();
+            }
             if kind != 0 {
                 c.coat_roughness = rng.next();
                 c.coat_ior = 0.5 + 6.0 * rng.next();
@@ -280,14 +285,6 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             c
         })
         .collect();
-    let material = MaterialGpu {
-        coat_color: [0.25, 0.5, 0.75],
-        fuzz_color: [0.75, 0.5, 0.25],
-        thin_film_thickness: 400.0,
-        thin_film_ior: 1.4,
-        flags: material_flags::THIN_FILM,
-        ..bytemuck::Zeroable::zeroed()
-    };
     let upload = |bytes: &[u8]| {
         let mut a = d
             .gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, "codec input")
@@ -296,7 +293,6 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
         a
     };
     let input = upload(bytemuck::cast_slice(&cases));
-    let mat = upload(bytemuck::bytes_of(&material));
     let words = d
         .gpu_malloc::<codec::Words>(MemoryKind::Readback, N as u64, "words")
         .unwrap();
@@ -307,11 +303,8 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
         cases: input.gpu().cast(),
         words: words.gpu(),
         decoded: decoded.gpu(),
-        material: mat.gpu().cast(),
         count: N as u32,
         pad0: 0,
-        pad1: 0,
-        pad2: 0,
     }));
     let p = pipeline(&codec::MODULE, "round_trip");
     let render = d.queue(QueueKind::Render).unwrap();
@@ -456,7 +449,7 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             "case {i} thin BSDF"
         );
         let sss = c.subsurface_weight > 0.0;
-        let lobes = c.coat_weight > 0.0 || c.fuzz_weight > 0.0;
+        let lobes = c.coat_weight > 0.0 || c.fuzz_weight > 0.0 || c.thin_film_weight > 0.0;
         assert_eq!(
             g.flags & EXTENDED != 0,
             sss || lobes || c.anisotropy > 0.0,
@@ -467,11 +460,7 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             sss && !thin,
             "case {i} subsurface"
         );
-        assert_eq!(
-            g.flags & LOBE_COLORS != 0,
-            !sss && lobes,
-            "case {i} lobe colors"
-        );
+        assert_eq!(g.flags & LAYERS != 0, lobes, "case {i} layers");
         if g.flags & EXTENDED == 0 {
             continue;
         }
@@ -511,7 +500,7 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             "subsurface weight",
             i,
         );
-        if lobes && !sss {
+        if lobes {
             close3(
                 srgb3(g.coat_color),
                 srgb3(c.coat_color),
@@ -526,11 +515,33 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 "fuzz color",
                 i,
             );
-        } else {
-            assert_eq!(
-                g.coat_color, material.coat_color,
-                "case {i} coat color from the material"
+            close(
+                g.thin_film_weight,
+                c.thin_film_weight,
+                step8,
+                "film weight",
+                i,
             );
+            assert_eq!(
+                g.thin_film_thickness, c.thin_film_thickness,
+                "case {i} film thickness"
+            );
+            close(
+                g.coat_darkening,
+                c.coat_darkening,
+                step8,
+                "coat darkening",
+                i,
+            );
+            assert_eq!(
+                g.bsdf_flags & 8 != 0,
+                c.thin_film_weight > 0.0,
+                "case {i} film flag"
+            );
+            let step = ior_step(r(c.thin_film_ior));
+            close(r(g.thin_film_ior), r(c.thin_film_ior), step, "film IOR", i);
+        }
+        if sss {
             close(
                 g.subsurface_anisotropy,
                 c.subsurface_anisotropy,
@@ -560,10 +571,6 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 assert!(e < 8.0 / 255.0, "case {i} subsurface color {got} vs {tint}");
             }
         }
-        assert!(
-            g.bsdf_flags & 8 != 0,
-            "case {i} thin film from the material"
-        );
     }
     assert_clean();
 }
@@ -1377,6 +1384,7 @@ struct Frame {
     a: Vec<[u32; 4]>,
     b: Vec<[u32; 2]>,
     x: Option<Vec<[u32; 4]>>,
+    y: Option<Vec<[u32; 4]>>,
     depth: Vec<f32>,
     motion: Vec<[f32; 2]>,
     /// Instance slot + 1 per pixel, 0 where nothing was drawn.
@@ -1427,6 +1435,7 @@ fn read_back(view: &RasterView) -> Frame {
         a: texels(&view.gbuf_a),
         b: texels(&view.gbuf_b),
         x: view.gbuf_x.as_ref().map(|x| texels(x)),
+        y: view.gbuf_y.as_ref().map(|y| texels(y)),
         depth: texels(&view.depth),
         motion,
         ids,
@@ -1682,7 +1691,14 @@ fn the_generated_resolve_writes_the_recorded_resolves_gbuffer_and_runs_only_bins
     let bits = |f: &Frame| {
         let depth: Vec<u32> = f.depth.iter().map(|d| d.to_bits()).collect();
         let motion: Vec<[u32; 2]> = f.motion.iter().map(|m| m.map(f32::to_bits)).collect();
-        (f.a.clone(), f.b.clone(), f.x.clone(), depth, motion)
+        (
+            f.a.clone(),
+            f.b.clone(),
+            f.x.clone(),
+            f.y.clone(),
+            depth,
+            motion,
+        )
     };
     assert!(bits(&generated) == bits(&recorded), "the G-buffers differ");
     assert_clean();
@@ -2168,10 +2184,11 @@ fn load_gsurface_reads_the_visible_surface() {
         .unwrap();
     // The view's records stay in the frame's upload window until a later frame reuses it.
     root.as_mut_slice().unwrap()[0] = surface_at::Root {
-        scene: g.view.scene,
         view: g.view.view,
         gbuffer: g.view.gbuffer,
         out: out.gpu(),
+        pad0: 0,
+        pad1: 0,
     };
     let p = pipeline(&surface_at::MODULE, "main");
     let render = d.queue(QueueKind::Render).unwrap();

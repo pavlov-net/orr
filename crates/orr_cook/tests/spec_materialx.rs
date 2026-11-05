@@ -674,6 +674,12 @@ fn documents_map_as_the_clauses_say() {
             check: |m| close(m.transmission_depth, 0.05),
         },
         Row {
+            clause: "OpenPBR thin_film_weight: the coverage weight of the film, any share of it",
+            body: "",
+            inputs: r#"<input name="thin_film_weight" type="float" value="0.01"/>"#,
+            check: |m| m.thin_film_weight == 0.01 && m.thin_film_thickness == 500.0,
+        },
+        Row {
             clause: "OpenPBR thin_film_thickness: a stated unit, not its micrometers",
             body: "",
             inputs: r#"<input name="thin_film_weight" type="float" value="1"/>

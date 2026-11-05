@@ -63,7 +63,8 @@ public struct RasterGpu
     public float* depth;             // per pixel: resolved reverse-Z depth
     public StorageImageIndex a;
     public StorageImageIndex b;
-    public StorageImageIndex x;      // index IMAGE_NONE without the extended target
+    public StorageImageIndex x;      // index IMAGE_NONE without the extended targets
+    public StorageImageIndex y;      // with `x`
     public StorageImageIndex motion;
     public StorageImageIndex hzb[16]; // per mip
     public uint tiles_x;             // 8 x 8 tiles per row
@@ -75,7 +76,6 @@ public struct RasterGpu
     public uint flags;               // RASTER_*
     public uint slots;               // instance slots to walk
     public uint hzb_mips;            // HZB mips the occlusion tests read
-    public uint _pad;
 }
 
 // `RasterGpu.args` offsets.

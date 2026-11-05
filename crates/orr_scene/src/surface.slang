@@ -296,8 +296,7 @@ public struct StandardSurface : ISurface
         p.fuzz_weight = m.fuzz_weight;
         p.fuzz_color = m.fuzz_color;
         p.fuzz_roughness = m.fuzz_roughness;
-        bool film = (m.flags & MATERIAL_THIN_FILM) != 0;
-        p.thin_film_weight = film ? 1.0 : 0.0;
+        p.thin_film_weight = m.thin_film_weight;
         p.thin_film_thickness = m.thin_film_thickness;
         p.thin_film_ior = m.thin_film_ior;
         p.emission = material_color(m, TEXTURE_EMISSION, i.uv, material_emission(m));
@@ -326,7 +325,7 @@ public struct StandardSurface : ISurface
             p.flags |= BSDF_COAT;
         if (p.fuzz_weight > 0.0)
             p.flags |= BSDF_FUZZ;
-        if (film)
+        if (p.thin_film_weight > 0.0)
             p.flags |= BSDF_THIN_FILM;
         s.bsdf = p;
         s.flags = (m.flags & MATERIAL_UNLIT) != 0 ? GBUFFER_UNLIT : 0;
