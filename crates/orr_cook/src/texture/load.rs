@@ -46,6 +46,8 @@ pub(super) struct Source {
     pub(super) signed: bool,
     /// The file stores floats, whose range no format of fixed span holds.
     pub(super) float: bool,
+    /// The file's format can hold values below 0.
+    pub(super) negatives: bool,
     pub(super) gray: Gray,
 }
 
@@ -173,6 +175,7 @@ pub(crate) struct Scan {
     pub(super) rg: bool,
     pub(super) signed: bool,
     pub(super) float: bool,
+    pub(super) negatives: bool,
     pub(super) range: [(f32, f32); 4],
 }
 
@@ -283,6 +286,7 @@ impl<'a> Ktx2Blocks<'a> {
             rg: two_channels(self.vk_format()),
             signed: signed_blocks(self.vk_format()),
             float: float_blocks(self.vk_format()),
+            negatives: negative_blocks(self.vk_format()),
             gray: Gray::No,
             blocks: Some(Blocks {
                 vk_format: self.vk_format(),
@@ -324,6 +328,7 @@ impl<'a> Ktx2Blocks<'a> {
             rg: two_channels(vk_format),
             signed: signed_blocks(vk_format),
             float: float_blocks(vk_format),
+            negatives: negative_blocks(vk_format),
             range,
         })
     }
@@ -340,6 +345,10 @@ fn signed_blocks(vk_format: u32) -> bool {
 
 fn float_blocks(vk_format: u32) -> bool {
     matches!(vk_format, vk::BC6H_UFLOAT | vk::BC6H_SFLOAT)
+}
+
+fn negative_blocks(vk_format: u32) -> bool {
+    signed_blocks(vk_format) || vk_format == vk::BC6H_SFLOAT
 }
 
 /// Per channel, the lowest and highest value of a `w` x `h` mip of `vk_format` blocks read
@@ -454,6 +463,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
             rg: two_channels(vk_format),
             signed: signed_blocks(vk_format),
             float: float_blocks(vk_format),
+            negatives: negative_blocks(vk_format),
             gray: Gray::No,
         });
     }
@@ -507,6 +517,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
         rg: format.channel_count() == Some(2),
         signed: is_snorm(format),
         float: is_float(format),
+        negatives: is_snorm(format) || (is_float(format) && !is_ufloat(format)),
         gray: Gray::No,
     })
 }
@@ -548,11 +559,21 @@ fn is_float(format: ctt::Format) -> bool {
     )
 }
 
+/// Whether uncompressed `format` stores floats no lower than 0.
+fn is_ufloat(format: ctt::Format) -> bool {
+    use ctt::Format as F;
+    matches!(
+        format,
+        F::B10G11R11_UFLOAT_PACK32 | F::E5B9G9R9_UFLOAT_PACK32
+    )
+}
+
 fn file(bytes: &[u8]) -> Result<Source, String> {
     let reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
     let is_png = reader.format() == Some(image::ImageFormat::Png);
+    let radiance = reader.format() == Some(image::ImageFormat::Hdr);
     let img = reader.decode().map_err(|e| e.to_string())?;
     let hdr = matches!(
         img,
@@ -594,6 +615,7 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
         rg: false,
         signed: false,
         float: hdr,
+        negatives: hdr && !radiance,
         gray,
     })
 }

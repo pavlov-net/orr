@@ -87,7 +87,8 @@ pub enum Usage {
     ColorAlpha,
     /// Tangent-space normal (RGB, or x and y alone from a two-channel source) to BC5 holding x
     /// and y; z is reconstructed. Unsigned sources store components at `0.5 v + 0.5` and signed
-    /// ones as they are. No format says which a float source does, so its vectors decide.
+    /// ones as they are. No format says which a float source that can hold negatives does, so
+    /// its vectors decide.
     Normal,
     /// One linear channel (R) to BC4, or BC4 snorm from a signed source without `alpha_cutoff`.
     Linear1,
@@ -590,12 +591,13 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
     );
     let normal = s.usage == Usage::Normal;
     let srgb = src.srgb;
-    if normal && src.float {
+    let vectors = normal && src.float && src.negatives;
+    if vectors {
         load::decode_layers(&mut src)?;
     }
     let source = NormalSource {
         rg: src.rg,
-        signed: src.signed || (normal && src.float && stores_normals(&src.layers, src.rg)),
+        signed: src.signed || (vectors && stores_normals(&src.layers, src.rg)),
         y: 1,
     };
     let linear = |p: &mut [f32; 4]| {

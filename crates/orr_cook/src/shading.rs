@@ -36,8 +36,9 @@
 //! (`UsdUVTexture` `scale`; 1 otherwise); a bias folds scale and bias into the texels
 //! ([`TexRef::remap`]) and leaves the field 1, or for a color what it reaches past 1. Normals
 //! read `scale * t + bias` per axis; a pair of the form `s (2 t - 1)` is the tangent-space
-//! encoding at strength `s`, and `normalmap` reads that encoding, as far as the image's format
-//! can hold what they state. Coordinate nodes set each slot's `Material::uv_transforms`,
+//! encoding at strength `s`. A `normalmap` decodes the reader's `v` as `2 v - 1`, where such a
+//! pair is the encoding stated, not a second decode. Both hold as far as the image's format can
+//! hold what they state. Coordinate nodes set each slot's `Material::uv_transforms`,
 //! conjugated by the flip of t between st and the cook's top-left uvs.
 
 use std::collections::{BTreeMap, HashMap};
@@ -236,6 +237,18 @@ impl Tex {
     fn remapped(&self, axes: [usize; 3]) -> TexRef {
         TexRef {
             remap: Some(axes.map(|c| [self.bias[c], self.scale[c]])),
+            ..self.tex_ref()
+        }
+    }
+
+    /// [`Self::tex_ref`] under a `normalmap`.
+    fn normalmap_ref(&self) -> TexRef {
+        let axis = |c: usize| match (self.bias[c], self.scale[c]) {
+            (b, s) if b == -0.5 * s => [b, s],
+            (b, s) => [2.0 * b - 1.0, 2.0 * s],
+        };
+        TexRef {
+            remap: Some(std::array::from_fn(axis)),
             ..self.tex_ref()
         }
     }
@@ -984,7 +997,7 @@ impl Mapper<'_, '_> {
                 let scale = self.vec2(map, "scale", Vec2::ONE)?;
                 match self.value(map, "in")? {
                     Some(Value::Texture(t)) if t.channels == Channels::Rgb => {
-                        self.textures.normal = Some((t.tex_ref(), scale.to_array(), true));
+                        self.textures.normal = Some((t.normalmap_ref(), scale.to_array()));
                     }
                     _ => {
                         return Err(format!("{}: in must read an image", self.node(map).name));
@@ -1083,7 +1096,7 @@ impl Mapper<'_, '_> {
                 let normal = [at(0, 0.0), at(1, 0.0), at(2, 1.0)];
                 if normal != [0.0, 0.0, 1.0] {
                     let t = self.solid(normal.map(|c| 0.5 * c + 0.5));
-                    self.textures.normal = Some((t.tex_ref(), [1.0; 2], true));
+                    self.textures.normal = Some((t.tex_ref(), [1.0; 2]));
                 }
             }
             Some(Value::Texture(t)) => {
@@ -1095,8 +1108,8 @@ impl Mapper<'_, '_> {
                 let strength =
                     |c: usize| (t.bias[c] == -0.5 * t.scale[c]).then(|| 0.5 * t.scale[c]);
                 self.textures.normal = Some(match (strength(0), strength(1), strength(2)) {
-                    (Some(x), Some(y), Some(1.0)) => (t.tex_ref(), [x, y], true),
-                    _ => (t.remapped([0, 1, 2]), [1.0; 2], true),
+                    (Some(x), Some(y), Some(1.0)) => (t.tex_ref(), [x, y]),
+                    _ => (t.remapped([0, 1, 2]), [1.0; 2]),
                 });
             }
         }

@@ -48,8 +48,8 @@ use crate::report::{
 use crate::state::{self, Input, Memo, Record};
 use crate::subd::{self, CageData, CageInput, SubdSettings};
 use crate::texture::material::{
-    ImageData, ImageFacts, ImageFile, MaterialTextures, Packer, TexRef, TextureJob, TextureRules,
-    image_facts,
+    ImageData, ImageFacts, ImageFile, ImageRules, MaterialTextures, Packer, TexRef, TextureJob,
+    TextureRules, image_facts,
 };
 use crate::texture::neural::{self, NeuralJob};
 use crate::texture::{self, Img, Wrap};
@@ -1692,7 +1692,7 @@ fn plan_scene(
         .materials
         .iter()
         .filter_map(|m| m.textures.normal.as_ref())
-        .filter(|n| !n.2)
+        .filter(|n| n.0.rules == ImageRules::Gltf)
         .map(|n| n.0.image)
         .collect();
     let facts: HashMap<usize, ImageFacts> =

@@ -146,11 +146,9 @@ impl TexRef {
         }
     }
 
-    /// The normal in texel `t` of an image that stores normals as `source` says.
+    /// The normal in texel `t`, with [`Packer::normal_source`]'s remap, of an image laid out as
+    /// `source` says.
     fn normal(&self, source: NormalSource, t: [f32; 4]) -> [f32; 3] {
-        if self.remap.is_none() {
-            return source.read(t);
-        }
         let [x, y] = [self.read(0, t[0]), self.read(1, t[source.y])];
         let z = if source.rg {
             orr_pack::texture::normal::z(x, y)
@@ -174,10 +172,8 @@ pub(crate) struct MaterialTextures {
     pub(crate) opacity: Option<TexRef>,
     pub(crate) roughness: Option<TexRef>,
     pub(crate) metalness: Option<TexRef>,
-    /// With its scale per tangent axis (a negative scale flips the axis) and whether the material
-    /// states its encoding: 0..1 where it has no [`TexRef::remap`]. Otherwise the image's format
-    /// says, and a float image's vectors.
-    pub(crate) normal: Option<(TexRef, [f32; 2], bool)>,
+    /// With its scale per tangent axis; a negative scale flips the axis.
+    pub(crate) normal: Option<(TexRef, [f32; 2])>,
     /// With its strength.
     pub(crate) occlusion: Option<(TexRef, f32)>,
     pub(crate) emissive: Option<TexRef>,
@@ -209,18 +205,11 @@ impl MaterialTextures {
         .flatten()
     }
 
-    /// The image of a USD normal map whose reader states no encoding, where the file can't hold
-    /// the signed vectors that would mean.
+    /// The image of a normal map that [`ImageFacts::cant_read`].
     pub(crate) fn unscaled_normal(&self, facts: &HashMap<usize, ImageFacts>) -> Option<usize> {
         let r = &self.normal.as_ref()?.0;
-        let f = &facts[&r.image];
-        (r.remap.is_some_and(unscaled) && !f.signed && !f.float).then_some(r.image)
+        facts[&r.image].cant_read(r).then_some(r.image)
     }
-}
-
-/// Whether `remap` leaves every texel as it is.
-fn unscaled(remap: [[f32; 2]; 3]) -> bool {
-    remap == [[0.0, 1.0]; 3]
 }
 
 pub(crate) struct ImageFile {
@@ -283,12 +272,22 @@ pub(crate) struct ImageFacts {
     signed: bool,
     /// The file stores floats.
     float: bool,
-    /// Read as a normal map that states no encoding, the file holds normals as they are, not at
-    /// `0.5 v + 0.5`.
+    /// The file's format can hold values below 0.
+    negatives: bool,
+    /// Read as a normal map, the file holds normals as they are, not at `0.5 v + 0.5`, with what
+    /// its format says or, under glTF, a float image's vectors.
     stored_normals: bool,
     gray: Gray,
     /// The file is animated; only its first frame is read.
     pub(crate) animated: bool,
+}
+
+impl ImageFacts {
+    /// Whether normal map `r` is to read as it stands where this image can't hold the signed
+    /// vectors that would mean.
+    fn cant_read(&self, r: &TexRef) -> bool {
+        !self.negatives && r.remap == Some([[0.0, 1.0]; 3])
+    }
 }
 
 /// Decodes a 2D image: its only layer.
@@ -359,8 +358,11 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
     };
     if let Some(scan) = load::scan_ktx2(bytes, spread) {
         let s = scan?;
-        let stored_normals =
-            s.signed || (normal && s.float && stores_normals(&load::decode(bytes)?.layers, s.rg));
+        let stored_normals = s.signed
+            || (normal
+                && s.float
+                && s.negatives
+                && stores_normals(&load::decode(bytes)?.layers, s.rg));
         return Ok(ImageFacts {
             w: s.w,
             h: s.h,
@@ -373,6 +375,7 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
             rg: s.rg,
             signed: s.signed,
             float: s.float,
+            negatives: s.negatives,
             stored_normals,
             gray: Gray::No,
             animated: false,
@@ -383,7 +386,8 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
     {
         return Err("not a 2D image".into());
     }
-    if normal && src.float {
+    let vectors = normal && src.float && src.negatives;
+    if vectors {
         load::decode_layers(&mut src)?;
     }
     let (w, h, range) = match &src.blocks {
@@ -409,7 +413,8 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
         rg: src.rg,
         signed: src.signed,
         float: src.float,
-        stored_normals: src.signed || (normal && src.float && stores_normals(&src.layers, src.rg)),
+        negatives: src.negatives,
+        stored_normals: src.signed || (vectors && stores_normals(&src.layers, src.rg)),
         gray: src.gray,
         animated: load::is_animated(bytes),
     })
@@ -462,7 +467,6 @@ enum Channel {
     NormalZ {
         image: usize,
         source: NormalSource,
-        remap: Option<[[f32; 2]; 3]>,
     },
     Constant(f32),
     /// Never read: stored as 1, or as the source has it where the blocks pass through.
@@ -623,33 +627,34 @@ impl<'a> Packer<'a> {
         self.constant_input(r).filter(|_| one_side)
     }
 
-    /// How normal map `r` reads, by what its material `stated` where the image can hold that: a
-    /// signed image holds the vectors themselves, so a pair that centers 0..1 at 0 doesn't apply
-    /// to it, and an unsigned one can't, so reading it as it stands doesn't either.
-    fn normal_source(&self, r: &TexRef, stated: bool) -> (TexRef, NormalSource) {
+    /// Normal map `r` with the remap it reads through, and its layout: what its material states
+    /// where the image can hold that. A signed image holds the vectors themselves, so a pair that
+    /// centers 0..1 at 0 doesn't apply to it, and one with no negatives can't, so reading it as it
+    /// stands doesn't either.
+    fn normal_source(&self, r: &TexRef) -> (TexRef, NormalSource) {
+        const ENCODED: [[f32; 2]; 3] = [[-1.0, 2.0]; 3];
         let f = self.image(r.image);
-        let remap = r.remap.filter(|&m| f.signed || f.float || !unscaled(m));
-        let remap = remap.map(|m| match f.signed {
-            true => m.map(|[a, b]| {
+        let m = match r.remap {
+            None if f.stored_normals => [[0.0, 1.0]; 3],
+            None => ENCODED,
+            Some(_) if f.cant_read(r) => ENCODED,
+            Some(m) if f.signed => m.map(|[a, b]| {
                 if a + 0.5 * b == 0.0 {
                     [0.0, 0.5 * b]
                 } else {
                     [a, b]
                 }
             }),
-            false => m,
-        });
+            Some(m) => m,
+        };
         // A channel the file doesn't hold reads as the same decode of its fill value.
-        let holds = (0..3).all(|c| self.read(r, c).is_ok());
-        let remap = remap.or((!holds).then_some([[-1.0, 2.0]; 3])).map(|m| {
-            std::array::from_fn(|c| match self.read(r, c) {
-                Ok(_) => m[c],
-                Err(v) => [m[c][0] + m[c][1] * v, 0.0],
-            })
-        });
+        let remap = Some(std::array::from_fn(|c| match self.read(r, c) {
+            Ok(_) => m[c],
+            Err(v) => [m[c][0] + m[c][1] * v, 0.0],
+        }));
         let source = NormalSource {
             rg: f.rg,
-            signed: if stated { f.signed } else { f.stored_normals },
+            signed: f.stored_normals,
             y: self.read(r, 1).unwrap_or(1),
         };
         (TexRef { remap, ..*r }, source)
@@ -753,14 +758,11 @@ impl<'a> Packer<'a> {
         }
 
         let mut normal_packed = None;
-        if let Some((r, scale, stated)) = &t.normal {
-            let (r, source) = &self.normal_source(r, *stated);
-            let source = *source;
-            let flat = match r.remap {
-                Some(m) => [0, 1, 2].map(|c| ([0.0, 0.0, 1.0][c] - m[c][0]) / m[c][1]),
-                None if source.signed => [0.0, 0.0, 1.0],
-                None => [0.5, 0.5, 1.0],
-            };
+        if let Some((r, scale)) = t.normal {
+            let (r, source) = self.normal_source(&r);
+            let r = &r;
+            let map = r.remap.expect("a normal map reads through a remap");
+            let flat = [0, 1, 2].map(|c| ([0.0, 0.0, 1.0][c] - map[c][0]) / map[c][1]);
             let mut consts: Vec<Option<f32>> = (0..3).map(|c| self.constant(r, c)).collect();
             // A two-channel image's blue is no z, so x and y alone say whether it is flat.
             if source.rg {
@@ -771,13 +773,7 @@ impl<'a> Packer<'a> {
                 .zip(flat)
                 .all(|(c, f)| c.is_some_and(|v| (v - f).abs() <= 1.0 / 255.0));
             if !is_flat {
-                let channel = |c: usize, s: f32| {
-                    if r.remap.is_some() || source.signed {
-                        self.source(r, c, c, false, 0.0, s)
-                    } else {
-                        self.source(r, c, c, false, -s, 2.0 * s)
-                    }
-                };
+                let channel = |c: usize, s: f32| self.source(r, c, c, false, 0.0, s);
                 let id = self.make(
                     suffix,
                     Pack {
@@ -790,7 +786,6 @@ impl<'a> Packer<'a> {
                                 Channel::NormalZ {
                                     image: r.image,
                                     source,
-                                    remap: r.remap,
                                 }
                             } else {
                                 channel(2, 1.0)
@@ -809,7 +804,7 @@ impl<'a> Packer<'a> {
                 // no Toksvig roughness.
                 let toksvig = !self.jobs[self.by_id[&id.id]].source_mips;
                 if toksvig && consts.iter().any(Option::is_none) {
-                    normal_packed = Some((*r, *scale, source));
+                    normal_packed = Some((*r, scale, source));
                 }
             }
         }
@@ -1299,13 +1294,15 @@ impl<'a> Packer<'a> {
         let skipped = super::skipped_mips(size[0], size[1], max_size) > 0;
         let pass = self.passes(&p, size, grid, skipped, source_mips);
 
+        // A rebuilt z reads the remap alone, which a normal's channels hold times the scale.
         let mut recipe = format!(
-            "{} {:?} {:?} {:?} {:?} {:?} {max_size:?} {grid:?} {primaries:?} {bc_split:?} {:?} {:?} {:?} {source_mips}",
+            "{} {:?} {:?} {:?} {:?} {:?} {:?} {max_size:?} {grid:?} {primaries:?} {bc_split:?} {:?} {:?} {:?} {source_mips}",
             p.role,
             p.encoding,
             p.channels,
             p.coverage,
             p.toksvig.as_ref().map(|t| (t.0, t.1.image, t.1.remap, t.2, t.3)),
+            p.normal.then_some(p.refs[0].remap),
             p.refs[0].wrap,
             self.rules.filter,
             size,
@@ -1587,15 +1584,8 @@ impl TextureJob {
             match *ch {
                 Channel::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
                 Channel::Unused => img.px.par_iter_mut().for_each(|t| t[c] = 1.0),
-                Channel::NormalZ {
-                    image,
-                    source,
-                    remap,
-                } => {
-                    let r = TexRef {
-                        remap,
-                        ..self.pack.refs[0]
-                    };
+                Channel::NormalZ { image, source } => {
+                    let r = self.pack.refs[0];
                     img.px
                         .par_iter_mut()
                         .zip(&decoded[&image].px)
