@@ -230,6 +230,7 @@ pub(super) fn textures(
             outside: [0.0; 4],
             missing: [0.0; 4],
             rg_channel: None,
+            input: None,
             uv,
             remap: None,
         })

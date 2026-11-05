@@ -1768,6 +1768,183 @@ fn a_tile_set_mounts_as_a_table_of_streamed_textures() {
     assert_clean();
 }
 
+/// Cooks a MaterialX material on `file`, a name of tiles among `tiles` (each a file and its color)
+/// with a `default` of `DEFAULT`, mounts it, and checks what it reads at each st of `cases`.
+fn cooked_tiles_read(
+    dir: &str,
+    file: &str,
+    tiles: &[(&str, [u8; 3])],
+    cases: &[([f32; 2], [f32; 3])],
+) {
+    use orr_scene::orr_gpu::MemoryKind;
+    use scene_suite::pipeline;
+    use scene_suite::shaders::texture_filter::{self, Footprint, Root};
+    let _serial = serial();
+    let dev = device();
+    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(dir);
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    for (name, rgb) in tiles {
+        let file = std::fs::File::create(d.join(name)).unwrap();
+        let mut enc = png::Encoder::new(file, 8, 8);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        let texels: Vec<u8> = rgb.iter().copied().cycle().take(3 * 64).collect();
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&texels)
+            .unwrap();
+    }
+    let path = d.join("m.mtlx");
+    std::fs::write(
+        &path,
+        format!(
+            r#"<?xml version="1.0"?>
+<materialx version="1.39">
+  <image name="i" type="color3">
+    <input name="file" type="filename" value="{file}"/>
+    <input name="default" type="color3" value="0.25, 0.5, 0.75"/>
+  </image>
+  <open_pbr_surface name="S" type="surfaceshader">
+    <input name="base_color" type="color3" nodename="i"/>
+  </open_pbr_surface>
+  <surfacematerial name="M" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="S"/>
+  </surfacematerial>
+</materialx>
+"#
+        ),
+    )
+    .unwrap();
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            vec![AssetSpec {
+                name: "u".into(),
+                source: Source::MaterialX {
+                    path,
+                    material: "M".into(),
+                    textures: Default::default(),
+                },
+            }],
+        )],
+    };
+    let pack = orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory
+        .remove(0);
+
+    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let m = scenes.mount(PackSource::Memory(pack));
+    ready(&mut scenes, m);
+    let id = scenes.material(m, AssetId::from_name("u")).unwrap();
+    let (_, _, materials) = global_tables(&scenes);
+    let footprints: Vec<Footprint> = cases
+        .iter()
+        .map(|([s, t], _)| Footprint {
+            uv: [*s, 1.0 - t],
+            dx: [1.0 / 8.0, 0.0],
+            dy: [0.0, 1.0 / 8.0],
+            hardware: 1,
+            material: id.0,
+        })
+        .collect();
+    let mut input = dev
+        .gpu_malloc::<Footprint>(MemoryKind::Upload, footprints.len() as u64, "footprints")
+        .unwrap();
+    input.as_mut_slice().unwrap().copy_from_slice(&footprints);
+    let out = dev
+        .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, footprints.len() as u64, "taps")
+        .unwrap();
+    let mut root = dev
+        .gpu_malloc::<Root>(MemoryKind::Upload, 1, "texture filter root")
+        .unwrap();
+    root.as_mut_slice().unwrap()[0] = Root {
+        footprints: input.gpu(),
+        out: out.gpu(),
+        texture: TextureIndex(0),
+        sampler: orr_gpu::SamplerIndex(0),
+        count: footprints.len() as u32,
+        taps: 1,
+        streams: GpuPtr::NULL,
+        modes: 0,
+        pad: 0,
+        materials,
+        pad2: 0,
+    };
+    let p = pipeline(&texture_filter::MODULE, "slot_mean");
+    let render = dev.queue(QueueKind::Render).unwrap();
+    let mut f = scenes
+        .begin_frame(&FrameDesc {
+            time: FrameTime::default(),
+            scenes: &[],
+            low_latency: None,
+        })
+        .unwrap();
+    let list = f.list().unwrap();
+    list.dispatch(&p, root.gpu(), [1, 1, 1]);
+    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+    let point = f.end(&[]).unwrap();
+    render.wait(point, Duration::from_secs(10)).unwrap();
+    for ((st, want), got) in cases.iter().zip(out.as_slice().unwrap()) {
+        for c in 0..3 {
+            assert!(
+                (got[c] - want[c]).abs() < 0.02,
+                "at st {st:?}: {got:?} against {want:?}"
+            );
+        }
+    }
+    assert_clean();
+}
+
+/// What the `default` of `cooked_tiles_read` reads.
+const DEFAULT: [f32; 3] = [0.25, 0.5, 0.75];
+
+fn color(rgb: [u8; 3]) -> [f32; 3] {
+    rgb.map(|c| f32::from(c) / 255.0)
+}
+
+/// Tile 1001 + U + 10 V fills st square U, V, which is uv u U..U + 1, v -V..1 - V under the cook's
+/// top-left origin. A square without a file reads `default`.
+#[test]
+fn a_cooked_udim_material_reads_each_square_of_st_from_its_tile() {
+    let (a, b, c) = ([200, 40, 40], [40, 200, 40], [40, 40, 200]);
+    cooked_tiles_read(
+        "cooked_udim",
+        "t.&lt;UDIM&gt;.png",
+        &[("t.1001.png", a), ("t.1002.png", b), ("t.1011.png", c)],
+        &[
+            ([0.5, 0.5], color(a)),
+            ([1.5, 0.5], color(b)),
+            ([0.5, 1.5], color(c)),
+            ([1.5, 1.5], DEFAULT),
+            ([2.5, 0.5], DEFAULT),
+            ([-0.5, 0.5], DEFAULT),
+            ([0.5, -0.5], DEFAULT),
+        ],
+    );
+}
+
+/// A `<UVTILE>` far from the rest reads where its name says. Its table is two tiles' worth:
+/// `a_far_uvtile_takes_no_more_table_than_a_near_one` holds that.
+#[test]
+fn a_cooked_far_uvtile_reads_at_its_square_of_st() {
+    let (a, b) = ([200, 40, 40], [40, 200, 40]);
+    cooked_tiles_read(
+        "cooked_far_uvtile",
+        "t.&lt;UVTILE&gt;.png",
+        &[("t.u1_v1.png", a), ("t.u40000_v40000.png", b)],
+        &[
+            ([0.5, 0.5], color(a)),
+            ([39_999.5, 39_999.5], color(b)),
+            ([39_998.5, 39_999.5], DEFAULT),
+            ([39_999.5, 39_998.5], DEFAULT),
+            ([1.5, 0.5], DEFAULT),
+        ],
+    );
+}
+
 /// Taps past the unit square of a streamed texture read, and load, the tiles the wrap takes
 /// them to. Reading a tile takes its neighbors, so each case taps those too; frac(u) would name
 /// other tiles, and the checked texels would never read.

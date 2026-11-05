@@ -1217,6 +1217,56 @@ fn material_colors_below_zero_convert_to_rec2020() {
     assert_eq!(clip_warnings(&report), 0);
 }
 
+/// A slot holds one primaries id, so whether a set converts is one answer for all of its tiles: a
+/// tile with nothing below 0 converts beside one that has, or the two would read in different
+/// primaries. And a set is one image to the report, however many tiles clip.
+#[test]
+fn a_tile_set_converts_and_warns_as_one_image() {
+    use orr_color::RgbPrimaries as P;
+    use orr_pack::tiles::TextureTiles;
+    let d = dir("below-zero-tiles");
+    let write = |name: &str, bytes: Vec<u8>| std::fs::write(d.join(name), bytes).unwrap();
+    let inside = [0.5, 0.25, 0.125];
+    let surface = "color3f inputs:emissiveColor";
+
+    let varying = |x: usize| {
+        let [r, g, b] = if x < 4 { BELOW } else { inside };
+        (r, g, b, 1.0)
+    };
+    write("mixed.1001.exr", exr_image(varying, |_, _| {}));
+    write("mixed.1002.exr", flat_exr(inside, |_, _| {}));
+    let (a, m, report) = usd(&d, "mixed.<UDIM>.exr", surface, "rgb", "");
+    let set = a.find(m.textures[slot::EMISSION].texture).unwrap();
+    let b = &a.blobs(set)[0];
+    let mut bytes = vec![0; b.raw_len as usize];
+    a.read(b, &mut bytes).unwrap();
+    let tiles = TextureTiles::parse(&bytes).unwrap().tiles;
+    let read = |t: usize| {
+        let e = a.find(tiles[t].texture).unwrap();
+        let (info, levels) = mips(&a, a.name(e));
+        let h = info.header;
+        (h.primaries, decode(h.vk_format, 8, 8, &levels[0][0]))
+    };
+    let (primaries, texels) = read(0);
+    assert_eq!(primaries, 2);
+    assert_rgb(texels[0], in_rec2020(P::REC709, BELOW), "below 0");
+    let (primaries, texels) = read(1);
+    assert_eq!(primaries, 2, "the tile with nothing below 0 converts too");
+    assert_rgb(texels[0], in_rec2020(P::REC709, inside), "inside Rec.709");
+    assert_eq!(clip_warnings(&report), 0);
+
+    write("past.1001.exr", flat_exr([-1.0, 1.0, 0.0], |_, _| {}));
+    write("past.1002.exr", flat_exr([-1.0, 1.0, 0.0], |_, _| {}));
+    let (_, _, report) = usd(&d, "past.<UDIM>.exr", surface, "rgb", "");
+    assert_eq!(clip_warnings(&report), 1);
+    let mut warnings = report.assets.iter().flat_map(|a| &a.warnings);
+    let warning = warnings.find(|w| w.contains("Rec.2020")).unwrap();
+    assert!(
+        warning.contains("past.<UDIM>.exr") && !warning.contains("more"),
+        "{warning}"
+    );
+}
+
 /// A warning follows what an image holds, not what its primaries could reach: gray in AP0 reads
 /// inside Rec.2020, and a saturated red doesn't, through either path.
 #[test]

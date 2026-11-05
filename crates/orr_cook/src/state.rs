@@ -61,9 +61,13 @@ impl Memo {
             .insert(path, (stat, hash));
     }
 
-    /// The file's content hash; reads and hashes it only when its size or time changed.
+    /// The file's content hash; reads and hashes it only when its size or time changed. A
+    /// directory's is that of its entries' names, so an input can watch for a file appearing.
     pub(crate) fn hash(&self, path: &Path) -> Result<Hash32> {
         let meta = fs::metadata(path).map_err(|source| read_error(path, source))?;
+        if meta.is_dir() {
+            return hash_names(path);
+        }
         let stat = Stat::of(&meta);
         if let Some(stat) = stat
             && let Some((s, h)) = self.files.lock().expect("memo lock").get(path)
@@ -104,6 +108,31 @@ impl Memo {
         }
         Ok(())
     }
+}
+
+/// What [`Memo::hash`] gives `path`, with no memo to draw on.
+pub(crate) fn hash_path(path: &Path) -> Result<Hash32> {
+    if path.is_dir() {
+        hash_names(path)
+    } else {
+        hash_file(path)
+    }
+}
+
+/// Hashes the names of a directory's entries.
+fn hash_names(path: &Path) -> Result<Hash32> {
+    let entries = fs::read_dir(path).map_err(|source| read_error(path, source))?;
+    let mut names = entries
+        .map(|e| Ok(e?.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|source| read_error(path, source))?;
+    names.sort_unstable();
+    let mut h = blake3::Hasher::new();
+    for name in &names {
+        h.update(name.as_encoded_bytes());
+        h.update(&[0]);
+    }
+    Ok(Hash32(*h.finalize().as_bytes()))
 }
 
 /// Hashes a file without holding it whole.

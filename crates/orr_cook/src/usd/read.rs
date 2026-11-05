@@ -14,7 +14,8 @@ use orr_pack::Hash32;
 
 use super::VariantSelection;
 use crate::shading;
-use crate::state::{Input, hash_file};
+use crate::state::{Input, hash_path};
+use crate::texture::tiles::{UDIM, UDIM_TILES};
 
 /// Identifier of the session layer that carries the manifest's variant selections.
 pub(super) const SESSION: &str = "orr_cook_session.usda";
@@ -25,6 +26,8 @@ pub(super) struct Reads {
     files: BTreeMap<PathBuf, Hash32>,
     /// Where assets that did not resolve or read would appear.
     absent: BTreeSet<PathBuf>,
+    /// The tiles of each `<UDIM>` identifier, by number, with their resolved paths.
+    tiles: BTreeMap<String, Vec<(u16, String)>>,
     pub(super) session: String,
 }
 
@@ -40,6 +43,42 @@ impl Recorder {
             inner: ar::DefaultResolver::new(),
             reads,
         }
+    }
+
+    /// `asset_path` as a path of a file: a bare one stays bare until a file appears beside the
+    /// layer, so that is where it would appear.
+    fn beside(&self, asset_path: &str, anchor: Option<&ar::ResolvedPath>) -> String {
+        let id = self.inner.create_identifier(asset_path, anchor);
+        if Path::new(&id).is_absolute() {
+            return id;
+        }
+        self.inner
+            .create_identifier(&format!("./{asset_path}"), anchor)
+    }
+
+    /// The identifier of an asset path holding `<UDIM>`, after finding each of its tiles the way
+    /// a path of its own would resolve.
+    fn tiled_identifier(&self, asset_path: &str, anchor: Option<&ar::ResolvedPath>) -> String {
+        let id = self.beside(asset_path, anchor);
+        if self.reads.borrow().tiles.contains_key(&id) {
+            return id;
+        }
+        let mut found = Vec::new();
+        for n in UDIM_TILES {
+            let tile = asset_path.replace(UDIM, &n.to_string());
+            match self
+                .inner
+                .resolve(&self.inner.create_identifier(&tile, anchor))
+            {
+                Some(r) => found.push((n, r.to_string_lossy().into_owned())),
+                None => {
+                    let file = outer(Path::new(&self.beside(&tile, anchor)));
+                    self.reads.borrow_mut().absent.insert(file);
+                }
+            }
+        }
+        self.reads.borrow_mut().tiles.insert(id.clone(), found);
+        id
     }
 
     /// Reads an asset (an image) by its resolved path, recording its file, which is watched for
@@ -70,15 +109,12 @@ impl Resolver for Recorder {
         if asset_path == SESSION {
             return SESSION.into();
         }
+        if asset_path.contains(UDIM) {
+            return self.tiled_identifier(asset_path, anchor);
+        }
         let id = self.inner.create_identifier(asset_path, anchor);
         if !asset_path.is_empty() && self.inner.resolve(&id).is_none() {
-            // A bare path stays bare until a file appears beside the layer.
-            let file = if Path::new(&id).is_absolute() {
-                outer(Path::new(&id))
-            } else {
-                let beside = format!("./{asset_path}");
-                outer(Path::new(&self.inner.create_identifier(&beside, anchor)))
-            };
+            let file = outer(Path::new(&self.beside(asset_path, anchor)));
             self.reads.borrow_mut().absent.insert(file);
         }
         id
@@ -87,6 +123,9 @@ impl Resolver for Recorder {
     fn resolve(&self, asset_path: &str) -> Option<ar::ResolvedPath> {
         if asset_path == SESSION {
             return Some(ar::ResolvedPath::new(SESSION));
+        }
+        if let Some(tiles) = self.reads.borrow().tiles.get(asset_path) {
+            return (!tiles.is_empty()).then(|| ar::ResolvedPath::new(asset_path));
         }
         self.inner.resolve(asset_path)
     }
@@ -134,6 +173,11 @@ impl Resolver for Recorder {
 }
 
 impl Reads {
+    /// The tiles of a resolved `<UDIM>` path.
+    pub(super) fn tiles(&self, resolved: &str) -> Option<&[(u16, String)]> {
+        self.tiles.get(resolved).map(Vec::as_slice)
+    }
+
     pub(super) fn inputs(&self) -> Vec<Input> {
         let read = self.files.iter().map(|(path, &hash)| Input {
             path: path.clone(),
@@ -146,7 +190,7 @@ impl Reads {
             .map(|path| Input {
                 path: path.clone(),
                 // A package can stand here without the entry that was asked of it.
-                hash: hash_file(path).unwrap_or(Input::ABSENT),
+                hash: hash_path(path).unwrap_or(Input::ABSENT),
             });
         read.chain(absent).collect()
     }

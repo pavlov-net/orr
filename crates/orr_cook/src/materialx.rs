@@ -22,6 +22,13 @@
 //! `distance` and `angle` has no scene unit, so it converts nothing. The root of a document
 //! states no unit.
 //!
+//! A filename's `<UDIM>` and `<UVTILE>` make it a set of tiles ([`crate::texture::tiles`]), and
+//! `[token]` reads the value of a `token` of the nearest scope, then of the nodedef the graph
+//! implements. A token with no value, a `{hostattr}` or `{frame}` (no host states one) and any
+//! other `<geometry token>` (a standalone material has no geometry) leave the file unresolved, so
+//! the image reads its `default`. A raw `<` in an attribute reads as the specification's own
+//! filenames have it, though XML would have it escaped.
+//!
 //! An `xi:include` adds the children of the root of the document it names, read before the
 //! including document, so that the first of two like-named elements wins, as in the MaterialX
 //! library. Root attributes an included document leaves out come from the document including
@@ -42,7 +49,8 @@ use crate::import::{Scene, SceneMaterial};
 use crate::shading::{self, Input, Network, Node, Unit, is_color, through};
 use crate::state::{Input as FileInput, Memo};
 use crate::texture::color::ImageColor;
-use crate::texture::material::{ImageData, ImageFile};
+use crate::texture::material::{ImageData, ImageFile, ImageTile};
+use crate::texture::{self, tiles};
 use crate::{Error, Result};
 
 /// Elements that are not nodes.
@@ -115,31 +123,70 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
     let docs = reader
         .texts
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             Ok(Doc {
                 doc: Document::parse(&t.text).map_err(|e| fail(e.to_string()))?,
                 dir: t.path.parent().unwrap_or(Path::new("")),
                 parent: t.parent,
                 fallbacks: &t.fallbacks,
+                read_at: reader.order.iter().position(|&d| d == i),
             })
         })
         .collect::<Result<Vec<_>>>()?;
     let mut images = Vec::new();
     let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
-    let mut load = |dir: &Path, file: &str| -> usize {
-        let p = dir.join(file);
-        *by_path.entry(p.clone()).or_insert_with(|| {
-            images.push(ImageFile {
-                name: file.to_string(),
+    let mut listed = Vec::new();
+    let mut past = Vec::new();
+    let mut load = |dir: &Path, file: FileName| -> usize {
+        let (file, unresolved) = match file {
+            Ok(file) => (file, None),
+            Err((file, why)) => (file, Some(why)),
+        };
+        let p = dir.join(&file);
+        if let Some(&i) = by_path.get(&p) {
+            return i;
+        }
+        let image = if let Some(why) = unresolved {
+            ImageFile::unread(file, why)
+        } else if tiles::tiled(&file) {
+            let scan = tiles::scan(&p);
+            past.extend(scan.past.iter().map(|f| texture::past_tile_warning(f)));
+            listed.extend(scan.holders.into_iter().map(|path| {
+                let hash = memo.hash(&path).unwrap_or(FileInput::ABSENT);
+                FileInput { path, hash }
+            }));
+            let tiles = scan
+                .files
+                .into_iter()
+                .map(|(cell, path)| {
+                    images.push(ImageFile {
+                        name: tiles::named(&file, cell).to_string_lossy().into_owned(),
+                        data: ImageData::File { path, read: None },
+                    });
+                    let image = images.len() - 1;
+                    ImageTile { cell, image }
+                })
+                .collect();
+            ImageFile {
+                name: file,
+                data: ImageData::Tiles(tiles),
+            }
+        } else {
+            ImageFile {
+                name: file,
                 data: ImageData::File {
-                    path: p,
+                    path: p.clone(),
                     read: None,
                 },
-            });
-            images.len() - 1
-        })
+            }
+        };
+        images.push(image);
+        by_path.insert(p, images.len() - 1);
+        images.len() - 1
     };
     let graph = network(&docs, &reader.order, material, &mut load).map_err(fail)?;
+    reader.files.append(&mut listed);
     let mut added: HashMap<String, usize> = HashMap::new();
     let mut add = |image: ImageFile| {
         *added.entry(image.name.clone()).or_insert_with(|| {
@@ -156,6 +203,7 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
     let mapped = shading::map(&graph.net, graph.surface, graph.displacement, &mut host)
         .map_err(|m| fail(format!("material {material}: {m}")))?;
     let mut warnings = graph.warnings;
+    warnings.extend(past);
     warnings.extend(mapped.warnings);
     Ok(Scene {
         models: Vec::new(),
@@ -210,6 +258,8 @@ struct Doc<'t> {
     dir: &'t Path,
     parent: Option<usize>,
     fallbacks: &'t [NodeId],
+    /// Its place in the order documents are read.
+    read_at: Option<usize>,
 }
 
 /// Reads a document and all it includes.
@@ -250,6 +300,7 @@ impl Reader<'_> {
         });
         let in_file = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
         let mut text = String::from_utf8(bytes).map_err(|e| in_file(&e))?;
+        text = escape_attributes(&text);
         let undeclared = matches!(
             Document::parse(&text),
             Err(roxmltree::Error::UnknownNamespace(prefix, _)) if prefix == "xi"
@@ -317,6 +368,47 @@ impl Reader<'_> {
         self.order.push(id);
         result
     }
+}
+
+/// `text` with each `<` in an attribute value escaped.
+fn escape_attributes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        let (before, tag) = rest.split_at(open);
+        out.push_str(before);
+        let skipped = [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")]
+            .into_iter()
+            .find(|(start, _)| tag.starts_with(start))
+            .map(|(_, end)| tag.find(end).map_or(tag.len(), |at| at + end.len()));
+        if let Some(len) = skipped {
+            out.push_str(&tag[..len]);
+            rest = &tag[len..];
+            continue;
+        }
+        let mut quote = None;
+        let mut end = tag.len();
+        for (at, c) in tag.char_indices() {
+            match (quote, c) {
+                (None, '>') => {
+                    out.push('>');
+                    end = at + 1;
+                    break;
+                }
+                (None, '"' | '\'') => quote = Some(c),
+                (Some(q), _) if q == c => quote = None,
+                _ => {}
+            }
+            if c == '<' && quote.is_some() {
+                out.push_str("&lt;");
+            } else {
+                out.push(c);
+            }
+        }
+        rest = &tag[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `text` with the `xi` prefix declared on its root, which the specification's own snippets
@@ -447,13 +539,19 @@ struct Graph {
     warnings: Vec<String>,
 }
 
+/// A filename with its substitutions made, or as it stands, with why it can't be resolved.
+type FileName = std::result::Result<String, (String, String)>;
+
+/// Adds the image of a filename, relative to a directory, and returns its index.
+type Load<'a> = dyn FnMut(&Path, FileName) -> usize + 'a;
+
 /// The network of `material` in `docs`, the first of them the document cooked, walked in
-/// `order`. `load` reads an image file, relative to a directory, and returns its index.
+/// `order`.
 fn network(
     docs: &[Doc<'_>],
     order: &[usize],
     material: &str,
-    load: &mut dyn FnMut(&Path, &str) -> usize,
+    load: &mut Load<'_>,
 ) -> std::result::Result<Graph, String> {
     let mut net = Network::default();
     // Nodes by (graph, name); the top level is graph "".
@@ -668,6 +766,96 @@ fn network(
     })
 }
 
+/// The nodedef `name` names, the first of those read. A name may state the namespace of its
+/// document.
+fn nodedef<'a, 't>(docs: &'a [Doc<'t>], name: &str) -> Option<XmlNode<'a, 't>> {
+    let is_it = |d: usize, c: &XmlNode<'a, 't>| {
+        c.tag_name().name() == "nodedef"
+            && c.attribute("name").is_some_and(|n| {
+                n == name || qualified(inherited(docs, d, c, "namespace"), n) == name
+            })
+    };
+    let in_doc = |d: usize| {
+        let fallbacks = docs[d]
+            .fallbacks
+            .iter()
+            .filter_map(|&f| docs[d].doc.get_node(f))
+            .flat_map(|f| f.children());
+        let root = docs[d].doc.root_element();
+        let def = fallbacks.chain(root.children()).find(|c| is_it(d, c))?;
+        Some((docs[d].read_at, def))
+    };
+    (0..docs.len())
+        .filter_map(in_doc)
+        .min_by_key(|found| found.0)
+        .map(|found| found.1)
+}
+
+/// The value of `token` for element `e`: a `token` holding it on the nearest scope, which may name
+/// one further out through `interfacename`, else the default of the nodedef a graph implements.
+fn interface_token(docs: &[Doc<'_>], e: &XmlNode<'_, '_>, token: &str) -> Option<String> {
+    let named = |scope: &XmlNode<'_, '_>, name: &str| {
+        let is_it = |c: &XmlNode<'_, '_>| {
+            c.tag_name().name() == "token" && c.attribute("name") == Some(name)
+        };
+        scope.children().find(is_it).map(|t| {
+            (
+                t.attribute("value").map(str::to_string),
+                t.attribute("interfacename").map(str::to_string),
+            )
+        })
+    };
+    let mut name = token.to_string();
+    for scope in e.ancestors() {
+        if let Some((value, interface)) = named(&scope, &name) {
+            if value.is_some() {
+                return value;
+            }
+            name = interface.unwrap_or(name);
+        }
+        if let Some(def) = scope.attribute("nodedef").and_then(|n| nodedef(docs, n))
+            && let Some((Some(value), _)) = named(&def, &name)
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// `file` with its substitutions made, all but the tile tokens each point picks from, or the
+/// reason one has no value.
+fn substituted(
+    docs: &[Doc<'_>],
+    e: &XmlNode<'_, '_>,
+    file: &str,
+) -> std::result::Result<String, String> {
+    let mut out = String::new();
+    let mut rest = file;
+    while let Some(at) = rest.find(['[', '{', '<']) {
+        let close = match rest[at..].chars().next() {
+            Some('[') => ']',
+            Some('{') => '}',
+            _ => '>',
+        };
+        let Some(len) = rest[at..].find(close) else {
+            break;
+        };
+        let whole = &rest[at..=at + len];
+        out.push_str(&rest[..at]);
+        match close {
+            ']' => {
+                let value = interface_token(docs, e, &whole[1..whole.len() - 1]);
+                out.push_str(&value.ok_or_else(|| format!("{whole} has no value"))?);
+            }
+            '>' if tiles::tiled(whole) => out.push_str(whole),
+            _ => return Err(format!("{whole} has no value")),
+        }
+        rest = &rest[at + len + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 /// A filename value of element `e` in document `d`.
 fn file_input(
     docs: &[Doc<'_>],
@@ -675,11 +863,13 @@ fn file_input(
     e: &XmlNode<'_, '_>,
     file: &str,
     unit: Unit,
-    load: &mut dyn FnMut(&Path, &str) -> usize,
+    load: &mut Load<'_>,
 ) -> Input {
     let prefix = inherited(docs, d, e, "fileprefix").unwrap_or_default();
+    let file = format!("{prefix}{file}");
+    let resolved = substituted(docs, e, &file).map_err(|why| (file, why));
     Input::Image {
-        image: load(docs[d].dir, &format!("{prefix}{file}")),
+        image: load(docs[d].dir, resolved),
         color_space: inherited(docs, d, e, "colorspace").map(str::to_string),
         unit,
     }
@@ -692,7 +882,7 @@ fn value(
     e: &XmlNode<'_, '_>,
     v: &str,
     unit: Unit,
-    load: &mut dyn FnMut(&Path, &str) -> usize,
+    load: &mut Load<'_>,
     warnings: &mut Vec<String>,
 ) -> Input {
     let ty = e.attribute("type").unwrap_or_default();

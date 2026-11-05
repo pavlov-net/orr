@@ -74,7 +74,8 @@ use crate::patch::{self, MaterialPatch, MeshPatch};
 use crate::shading;
 use crate::skin::ClipSettings;
 use crate::subd::SubdSettings;
-use crate::texture::material::{ImageData, ImageFile, TextureRules};
+use crate::texture::material::{ImageData, ImageFile, ImageTile, TextureRules};
+use crate::texture::tiles::{UDIM, udim_cell};
 use crate::{Error, Result};
 
 use mesh::{CageBuilder, MeshPrim, Placing, Welder};
@@ -1320,15 +1321,35 @@ impl<'s> Importer<'s> {
             if let Some(&i) = image_of.get(&key) {
                 return i;
             }
-            let image = match a.resolved_path() {
-                None => ImageFile::unread(name, "it does not resolve".into()),
-                Some(resolved) => match Recorder::new(Rc::clone(&reads)).read(resolved) {
-                    Ok(bytes) => ImageFile {
-                        name,
-                        data: ImageData::Bytes(bytes),
-                    },
-                    Err(e) => ImageFile::unread(name, e.to_string()),
+            let read = |name: String, resolved: &str| match Recorder::new(Rc::clone(&reads))
+                .read(resolved)
+            {
+                Ok(bytes) => ImageFile {
+                    name,
+                    data: ImageData::Bytes(bytes),
                 },
+                Err(e) => ImageFile::unread(name, e.to_string()),
+            };
+            let tiles = a
+                .resolved_path()
+                .and_then(|r| Some(reads.borrow().tiles(r)?.to_vec()));
+            let image = match (tiles, a.resolved_path()) {
+                (Some(found), _) => {
+                    let mut tiles = Vec::with_capacity(found.len());
+                    for (n, path) in found {
+                        images.push(read(name.replace(UDIM, &n.to_string()), &path));
+                        tiles.push(ImageTile {
+                            cell: udim_cell(n),
+                            image: images.len() - 1,
+                        });
+                    }
+                    ImageFile {
+                        name,
+                        data: ImageData::Tiles(tiles),
+                    }
+                }
+                (None, Some(resolved)) => read(name, resolved),
+                (None, None) => ImageFile::unread(name, "it does not resolve".into()),
             };
             images.push(image);
             image_of.insert(key, images.len() - 1);

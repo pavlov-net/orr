@@ -10,6 +10,7 @@ mod load;
 pub(crate) mod material;
 mod mips;
 pub(crate) mod neural;
+pub(crate) mod tiles;
 
 pub use orr_color::Primaries;
 use orr_math::Vec3;
@@ -318,6 +319,11 @@ pub(crate) fn first_frame_warning(image: &str) -> String {
 /// fallback.
 pub(crate) fn unread_warning(image: &str, why: &str) -> String {
     format!("image {image} reads as its input's fallback: {why}")
+}
+
+/// The report's warning for file `image`, which names a tile no set holds.
+pub(crate) fn past_tile_warning(image: &str) -> String {
+    format!("image {image} is not read: tiles stop at column and row 65535")
 }
 
 /// The report's warning for `images`, with colors a texture can't hold.

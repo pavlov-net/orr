@@ -55,6 +55,12 @@
 //! and take no decoding. One that is no constant reads as that default there, and a `default`
 //! past the edges under `constant` fails.
 //!
+//! A file name holding a tile token is a set of images, one to each unit square of st
+//! ([`crate::texture::tiles`]). Those values are what a square with no tile reads, as a point there
+//! names a file that isn't. A token, not an address mode, picks the tile, so `wrapS`, `wrapT`,
+//! `uaddressmode` and `vaddressmode` have nothing to state of a set: tiles clamp at their edges,
+//! as USD's Storm has them.
+//!
 //! A `UsdUVTexture` reads as its `sourceColorSpace` says, or under `auto` as the file's
 //! `colorSpace` metadata names, and a MaterialX image of a color type as its `colorspace` names;
 //! [`crate::texture::color`] has what each rule does. An unknown `colorspace` warns and reads as
@@ -280,6 +286,7 @@ impl Tex {
     fn tex_ref(&self) -> TexRef {
         TexRef {
             rg_channel: None,
+            input: None,
             uv: slot_transform(self.uv),
             image: self.image,
             rules: self.rules,

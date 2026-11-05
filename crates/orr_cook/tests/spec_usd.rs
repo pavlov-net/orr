@@ -13,11 +13,12 @@ use orr_cook::{ArchiveSpec, AssetSpec, Manifest, NodeSelect, Source, Subdivision
 use orr_math::{Mat4, Quat, Vec3};
 use orr_pack::clip::Clip;
 use orr_pack::instance::{InstancePageInfo, decode};
-use orr_pack::material::{Material, slot};
+use orr_pack::material::{Material, slot, wrap};
 use orr_pack::mesh::{MeshInfo, PageView};
 use orr_pack::model::ModelInfo;
 use orr_pack::skeleton::{SkeletonInfo, Trs};
 use orr_pack::texture::TextureInfo;
+use orr_pack::tiles::TextureTiles;
 use orr_pack::{Archive, AssetId, Blob, Class, Target};
 
 const HEAD: &str = r#"#usda 1.0
@@ -1735,6 +1736,165 @@ fn a_fallback_stands_only_until_the_file_appears() {
     let varying = png(8, 8, |x, y| [(x * 32) as u8, (y * 32) as u8, 0, 255]);
     std::fs::write(d.join("tex.png"), varying).unwrap();
     assert_ne!(cook_file().textures[slot::ROUGHNESS].texture, AssetId::NONE);
+}
+
+/// A preview surface reading `tex.<UDIM>.png` in `d`, its `inputs` on the texture and `wired` on
+/// the surface.
+fn udim_stage(inputs: &str, wired: &str) -> String {
+    let texture = texture("T", inputs).replace("@tex.png@", "@tex.<UDIM>.png@");
+    previewed(wired, &format!("{texture}\n{READER}"), ST)
+}
+
+/// The tiles of the set slot `s` binds, as cell and mip 0 size.
+fn tiles_of(a: &Archive, m: &Material, s: usize) -> Vec<([u16; 2], [u32; 2])> {
+    let e = a.find(m.textures[s].texture).expect("bound");
+    assert_eq!(e.class, Class::TextureTiles as u16);
+    let set = TextureTiles::parse(&read(a, &a.blobs(e)[0])).unwrap();
+    set.tiles
+        .iter()
+        .map(|t| {
+            let e = a.find(t.texture).expect("a tile cooks");
+            let h = TextureInfo::parse(&read(a, &a.blobs(e)[0])).unwrap().header;
+            ([t.column, t.row], [h.width, h.height])
+        })
+        .collect()
+}
+
+/// PS `file`: "Mari UDIM substitution in *file* values uses the "<UDIM>" token"; the UDIM Tiling
+/// Constraints: "a maximum of ten tiles in the U direction", "within the range [1001, 1100]".
+/// Tile 1012 is u 1..2, v 1..2, and tiles keep their own sizes. A point on no tile names a file
+/// that isn't there, so it reads `fallback`, through `scale` and `bias`.
+#[test]
+fn a_udim_file_reads_as_tiles_across_st() {
+    let d = dir("udim");
+    let varying = |w: u32| png(w, w, move |x, y| [(x * 8) as u8, (y * 8) as u8, 0, 255]);
+    for (name, size) in [
+        ("1001", 8),
+        ("1002", 16),
+        ("1012", 4),
+        ("1101", 8),
+        ("1000", 8),
+    ] {
+        std::fs::write(d.join(format!("tex.{name}.png")), varying(size)).unwrap();
+    }
+    let inputs = format!(
+        "{RAW}\nfloat4 inputs:fallback = (0.25, 0.5, 0.75, 1)\n\
+         float4 inputs:scale = (0.5, 0.5, 0.5, 1)\nfloat4 inputs:bias = (0.25, 0, 0, 0)"
+    );
+    let wired = "float inputs:roughness.connect = </M/T.outputs:r>";
+    let body = udim_stage(&inputs, wired);
+    let a = cook_at(&d, &body, UsdSettings::default()).unwrap();
+    let m = material(&a);
+    let got = tiles_of(&a, &m, slot::ROUGHNESS);
+    let want = [([0, 0], [8; 2]), ([1, 0], [16; 2]), ([1, 1], [4; 2])];
+    assert_eq!(got, want);
+    let b = m.textures[slot::ROUGHNESS];
+    assert_eq!(b.wrap, [wrap::CLAMP; 2], "no point lies past a tile's edge");
+    assert!(near(b.outside[0], 0.375), "{b:?}");
+
+    // A channel of one value on every tile still reads otherwise past them.
+    std::fs::remove_file(d.join("tex.1002.png")).unwrap();
+    std::fs::remove_file(d.join("tex.1012.png")).unwrap();
+    let flat = png(8, 8, |_, _| [128, 128, 128, 255]);
+    std::fs::write(d.join("tex.1001.png"), flat).unwrap();
+    let a = cook_at(&d, &body, UsdSettings::default()).unwrap();
+    assert_eq!(tiles_of(&a, &material(&a), slot::ROUGHNESS).len(), 1);
+}
+
+/// PS `fallback`, per tile: a tile that can't be read is a point's file that can't be, and with
+/// none left the texture itself can't be.
+#[test]
+fn a_udim_set_reads_its_fallback_where_tiles_can_not_be_read() {
+    let d = dir("udim-unread");
+    let good = png(8, 8, |x, y| [(x * 32) as u8, (y * 32) as u8, 0, 255]);
+    std::fs::write(d.join("tex.1001.png"), good).unwrap();
+    std::fs::write(d.join("tex.1002.png"), b"not an image").unwrap();
+    let inputs = format!("{RAW}\nfloat4 inputs:fallback = (0.25, 0.5, 0.75, 1)");
+    let wired = "float inputs:roughness.connect = </M/T.outputs:g>";
+    let body = udim_stage(&inputs, wired);
+    let a = cook_at(&d, &body, UsdSettings::default()).unwrap();
+    let m = material(&a);
+    assert_eq!(tiles_of(&a, &m, slot::ROUGHNESS), [([0, 0], [8; 2])]);
+    assert!(near(m.textures[slot::ROUGHNESS].outside[0], 0.5));
+
+    std::fs::remove_file(d.join("tex.1001.png")).unwrap();
+    let m = material(&cook_at(&d, &body, UsdSettings::default()).unwrap());
+    assert_eq!(m.textures[slot::ROUGHNESS].texture, AssetId::NONE);
+    assert!(near(m.specular_roughness, 0.5), "{m:?}");
+
+    std::fs::remove_file(d.join("tex.1002.png")).unwrap();
+    let m = material(&cook_at(&d, &body, UsdSettings::default()).unwrap());
+    assert!(near(m.specular_roughness, 0.5), "no tile resolves: {m:?}");
+}
+
+/// A tile that appears later is a point's file that now resolves.
+#[test]
+fn a_udim_tile_appearing_cooks_the_set_again() {
+    let d = dir("udim-late");
+    let tile = png(8, 8, |x, y| [(x * 32) as u8, (y * 32) as u8, 0, 255]);
+    std::fs::write(d.join("tex.1001.png"), &tile).unwrap();
+    let body = udim_stage(RAW, "float inputs:roughness.connect = </M/T.outputs:r>");
+    let path = d.join("stage.usda");
+    std::fs::write(&path, format!("{HEAD}\n{body}")).unwrap();
+    let out = d.join("out.orr");
+    let tiles = || {
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::File(out.clone()),
+                vec![AssetSpec {
+                    name: "u".into(),
+                    source: Source::Usd {
+                        path: path.clone(),
+                        settings: UsdSettings::default(),
+                    },
+                }],
+            )],
+        };
+        orr_cook::cook(&manifest, &Default::default()).unwrap();
+        let a = Archive::open(&out).unwrap();
+        tiles_of(&a, &material(&a), slot::ROUGHNESS).len()
+    };
+    assert_eq!(tiles(), 1);
+    std::fs::write(d.join("tex.1002.png"), &tile).unwrap();
+    assert_eq!(tiles(), 2);
+}
+
+/// Inputs packed into one texture share it tile by tile when they read the same cells, and a set
+/// beside an image, or a set of other cells, keeps a texture of its own.
+#[test]
+fn inputs_share_tiles_only_at_the_same_cells() {
+    let d = dir("udim-pack");
+    let tile = png(8, 8, |x, y| [(x * 32) as u8, (y * 32) as u8, 0, 255]);
+    for name in ["tex.1001", "tex.1002", "other.1001", "plain"] {
+        std::fs::write(d.join(format!("{name}.png")), &tile).unwrap();
+    }
+    let reader =
+        |name: &str, file: &str| texture(name, RAW).replace("@tex.png@", &format!("@{file}@"));
+    let stage = |rough: &str, metal: &str| {
+        let prims = format!("{}\n{}\n{READER}", reader("T", rough), reader("U", metal));
+        previewed(
+            "float inputs:roughness.connect = </M/T.outputs:r>\n\
+             float inputs:metallic.connect = </M/U.outputs:g>",
+            &prims,
+            ST,
+        )
+    };
+    let cooked = |rough: &str, metal: &str| {
+        let body = stage(rough, metal);
+        let a = cook_at(&d, &body, UsdSettings::default()).unwrap();
+        let m = material(&a);
+        let same = m.textures[slot::ROUGHNESS].texture == m.textures[slot::METALNESS].texture;
+        (a, m, same)
+    };
+    let (a, m, same) = cooked("tex.<UDIM>.png", "tex.<UDIM>.png");
+    assert!(same, "one set of two channels");
+    assert_eq!(tiles_of(&a, &m, slot::ROUGHNESS).len(), 2);
+    assert_eq!(m.textures[slot::METALNESS].channels, 1);
+    let (a, m, same) = cooked("tex.<UDIM>.png", "other.<UDIM>.png");
+    assert!(!same, "other cells");
+    assert_eq!(tiles_of(&a, &m, slot::METALNESS).len(), 1);
+    let (.., same) = cooked("tex.<UDIM>.png", "plain.png");
+    assert!(!same, "a set and an image");
 }
 
 /// Where a slot's uv transform sends mesh uv `p`.

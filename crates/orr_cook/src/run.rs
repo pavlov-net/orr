@@ -49,7 +49,7 @@ use crate::state::{self, Input, Memo, Record};
 use crate::subd::{self, CageData, CageInput, SubdSettings};
 use crate::texture::material::{
     ImageData, ImageFile, ImageReads, ImageRules, Packer, TextureJob, TextureRules, image_facts,
-    stand_in,
+    settle_tiles, stand_in,
 };
 use crate::texture::neural::{self, NeuralJob};
 use crate::texture::{self, Img, Wrap};
@@ -1683,10 +1683,20 @@ fn plan_scene(
         .collect();
     used.sort_unstable();
     used.dedup();
+    // A set reads through its tiles.
+    let images = &src.images;
+    let read_as = |i: usize| -> Vec<usize> {
+        match images.get(i).and_then(ImageFile::tiles) {
+            Some(tiles) => tiles.iter().map(|t| t.image).collect(),
+            None => vec![i],
+        }
+    };
+    let sets = used.clone();
+    let used: Vec<usize> = used.into_iter().flat_map(read_as).collect();
     let colors: HashSet<usize> = src
         .materials
         .iter()
-        .flat_map(|m| m.textures.colors().map(|r| r.image))
+        .flat_map(|m| m.textures.colors().flat_map(|r| read_as(r.image)))
         .collect();
     // A height's range is what it stores, and a remap can take a color's below 0.
     let whole: HashSet<usize> = src
@@ -1696,14 +1706,14 @@ fn plan_scene(
             let remapped = m.textures.colors().filter(|r| r.remap.is_some());
             m.textures.displacement.iter().chain(remapped)
         })
-        .map(|r| r.image)
+        .flat_map(|r| read_as(r.image))
         .collect();
     let normals: HashSet<usize> = src
         .materials
         .iter()
         .filter_map(|m| m.textures.normal.as_ref())
         .filter(|n| n.0.rules == ImageRules::Gltf)
-        .map(|n| n.0.image)
+        .flat_map(|n| read_as(n.0.image))
         .collect();
     // glTF states no value for an image it can't read.
     let optional: HashSet<usize> = src
@@ -1711,7 +1721,7 @@ fn plan_scene(
         .iter()
         .flat_map(|m| m.textures.refs())
         .filter(|r| r.rules != ImageRules::Gltf)
-        .map(|r| r.image)
+        .flat_map(|r| read_as(r.image))
         .collect();
     let reads = ImageReads {
         whole,
@@ -1719,7 +1729,8 @@ fn plan_scene(
         colors,
         optional,
     };
-    let (mut facts, unread) = image_facts(name, &mut src.images, &used, &reads, memo)?;
+    let (mut facts, mut unread) = image_facts(name, &mut src.images, &used, &reads, memo)?;
+    settle_tiles(&sets, &mut src.images, &mut facts, &mut unread);
     let mut warnings = std::mem::take(&mut src.warnings);
     warnings.extend(
         unread
@@ -1779,6 +1790,14 @@ fn plan_scene(
     }
     let jobs = std::mem::take(&mut packer.jobs);
     let sets = std::mem::take(&mut packer.neural);
+    for set in std::mem::take(&mut packer.tile_sets) {
+        let work = Work::Blobs {
+            schema: orr_pack::tiles::SCHEMA,
+            blobs: vec![(set.bytes, true)],
+        };
+        let class = Class::TextureTiles as u16;
+        units.push(NewUnit::leaf(&set.name, class, set.key, 0, work));
+    }
     drop(packer);
     let textures: HashMap<AssetId, (String, Hash32)> = jobs
         .iter()
@@ -1811,6 +1830,16 @@ fn plan_scene(
             } else {
                 (materials[mi].0, materials[mi].1)
             });
+        }
+        let unbaked = mesh.sections().iter().any(|s| {
+            let d = s.maps.displacement.as_ref();
+            d.is_some_and(|d| d.texture.is_none())
+        });
+        if model.settings.displace_static.is_some() && unbaked {
+            warnings.push(format!(
+                "{model_name}: heights of a tile set don't bake into the mesh; they displace at \
+                 runtime"
+            ));
         }
         mesh.drop_unread_uv1();
         deps.sort_unstable();
