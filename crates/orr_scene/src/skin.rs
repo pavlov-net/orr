@@ -75,12 +75,12 @@ pub(crate) fn mesh_table(
     let cuts = accel::cuts(m);
     let mut clusters = Vec::new();
     let mut cut_first = Vec::with_capacity(cuts.len() + 1);
-    for (_, c) in &cuts {
+    for c in &cuts {
         cut_first.push(clusters.len() as u32);
-        clusters.extend_from_slice(c);
+        clusters.extend_from_slice(&c.clusters);
     }
     cut_first.push(clusters.len() as u32);
-    let errors: Vec<f32> = cuts.iter().map(|&(e, _)| e).collect();
+    let errors: Vec<f32> = cuts.iter().map(|c| c.error).collect();
     let mut templates = templates.to_vec();
     templates.resize(m.clusters.len(), 0);
 

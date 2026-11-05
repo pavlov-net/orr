@@ -35,7 +35,7 @@ use orr_pack::mesh::{MeshHeader, StoredPage};
 use orr_pack::{Blob, Codec};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::accel::{self, AccelShared, Animated, ClusterInfo, FineCut, PageMicromap};
+use crate::accel::{self, AccelShared, Animated, ClusterInfo, CutRow, FineCut, PageMicromap};
 use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch};
 use crate::edit::Mirror;
 use crate::loading::{BlobSource, Loading, Msg, decoded, landed, read_stored};
@@ -126,10 +126,10 @@ pub(crate) struct StreamedPage {
 pub(crate) struct FineInit {
     pub(crate) mesh: u32,
     pub(crate) stream: Arc<MeshStream>,
-    /// The table entries of its finer cuts, finest first, and their thresholds.
+    /// The table entries of its finer cuts, finest first, and those cuts.
     pub(crate) table: GpuPtr<RtCutGpu>,
-    pub(crate) thresholds: Vec<f32>,
-    /// For each threshold, the streamed pages holding a group whose error is over it.
+    pub(crate) cuts: Vec<CutRow>,
+    /// For each cut, the streamed pages holding a group whose error is over its threshold.
     pub(crate) pages: Vec<Vec<u32>>,
     pub(crate) merge: f32,
     pub(crate) animated: Animated,
@@ -164,6 +164,7 @@ pub(crate) struct CutTask {
     slot: u32,
     accel: Arc<AccelShared>,
     clusters: Vec<u32>,
+    row: u32,
     infos: Vec<ClusterInfo>,
     animated: Animated,
     clas: Vec<u64>,
@@ -190,6 +191,7 @@ pub(crate) fn build_cut(loading: &Loading, device: &Device, t: CutTask) {
         device,
         &t.accel.kernels,
         t.clusters,
+        t.row,
         &t.infos,
         t.animated,
         &t.clas,
@@ -582,11 +584,7 @@ impl Streaming {
             w.put(self.streams.offset(u64::from(s.index.0)), &[s.record])?;
         }
         for init in units.fine {
-            let slots = init
-                .thresholds
-                .iter()
-                .map(|_| FineState::Empty(0))
-                .collect();
+            let slots = init.cuts.iter().map(|_| FineState::Empty(0)).collect();
             self.fine
                 .insert((mount, init.mesh), MeshFine { init, slots });
         }
@@ -894,7 +892,7 @@ impl Streaming {
                 unit: m.mesh_pages[mesh as usize][p as usize],
             };
             for k in 0..f.slots.len() {
-                let t = f.init.thresholds[k];
+                let CutRow { threshold: t, row } = f.init.cuts[k];
                 match &f.slots[k] {
                     FineState::Built { touched, .. }
                         if touched + HOLD_FRAMES < frame && *touched < settled =>
@@ -906,6 +904,7 @@ impl Streaming {
                         };
                         let empty = RtCutGpu {
                             error: t,
+                            row,
                             ..bytemuck::Zeroable::zeroed()
                         };
                         w.put(f.init.table.offset(k as u64), &[empty])?;
@@ -959,6 +958,7 @@ impl Streaming {
                             slot: k as u32,
                             accel: Arc::clone(&self.accel),
                             clusters,
+                            row,
                             infos: f.init.clusters.clone(),
                             animated: f.init.animated,
                             clas: f.init.clas.clone(),

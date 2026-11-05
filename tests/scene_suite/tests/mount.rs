@@ -15,7 +15,7 @@ use orr_cook::{
 };
 use orr_math::{Affine3, DVec3, Quat, Vec2, Vec3};
 use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
-use orr_pack::mesh::{MeshHeader, MeshInfo, Node, NodePage, decode_page};
+use orr_pack::mesh::{MeshHeader, MeshInfo, Node, NodePage, decode_page, in_cut};
 use orr_pack::model::ModelInfo;
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, ArchiveWriter, AssetId, BlobIn, Class, Entry, Span, Target};
@@ -2664,6 +2664,34 @@ fn finer_cached_cuts_build_once_wanted_lock_their_pages_and_leave_after_their_ho
         let cuts: Vec<orr_scene::RtCutGpu> = gpu.values(mesh.rt_cuts, mesh.fine_cuts);
         cuts.into_iter().filter(|c| c.blas != 0).collect()
     };
+    let a = Archive::from_memory(Arc::clone(sheet_pack())).unwrap();
+    let me = entry(&a, AssetId::from_name(&format!("{SHEET}/mesh")));
+    let info = MeshInfo::parse(&blob(&a, me, 0)).unwrap();
+    let mut records = Vec::new();
+    for p in &info.pages {
+        let mut page = vec![0; p.resident_len as usize];
+        decode_page(&blob(&a, me, p.blob as usize), &mut page).unwrap();
+        let view = orr_pack::mesh::PageView::new(&page, &info.header).unwrap();
+        records.extend((0..view.cluster_count()).map(|i| view.cluster(i)));
+    }
+    // A cut's row of the cooked sets is the one holding its clusters.
+    let check_rows = |cuts: &[orr_scene::RtCutGpu]| {
+        for c in cuts {
+            let t = info.cut_rows[c.row as usize];
+            let held = records
+                .iter()
+                .filter(|r| {
+                    let merge = info.header.merge_error;
+                    in_cut(r.self_error, r.parent_error, r.flags, t, merge)
+                })
+                .count();
+            assert_eq!(c.clusters as usize, held, "row {}", c.row);
+        }
+    };
+    let cached: Vec<orr_scene::RtCutGpu> = gpu.values(mesh.rt_cuts, mesh.rt_cut_count);
+    let first_cached = cached[mesh.fine_cuts as usize];
+    assert_eq!(first_cached.row, 0);
+    check_rows(&cached[mesh.fine_cuts as usize..]);
     let start = Instant::now();
     while built(&scenes).is_empty() {
         assert!(
@@ -2675,6 +2703,7 @@ fn finer_cached_cuts_build_once_wanted_lock_their_pages_and_leave_after_their_ho
     for c in built(&scenes) {
         assert!(c.clusters > 0, "a built cut holds clusters");
     }
+    check_rows(&built(&scenes));
     // The copy leaves: once its hold passes the cut goes, and its pages may evict.
     streamed_frame(&mut scenes, scene, |s| move_copy(s, group, 0, 800.0));
     let start = Instant::now();

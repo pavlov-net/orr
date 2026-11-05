@@ -205,6 +205,8 @@ public struct RtCutGpu
     public uint64_t body;          // `blas` when the cut has no animated part clusters; 0 when its body is empty
     public uint64_t* parts;        // per animated part, 0 where it has no clusters; null without animated part clusters
     public uint2 hash;             // cut_hash over its clusters
+    public uint row;               // its row of the mesh's cooked sets
+    public uint _pad;
 }
 
 // An animated part: its rest bounds in mesh space and the sections its clusters use.

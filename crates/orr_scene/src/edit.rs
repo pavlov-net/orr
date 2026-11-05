@@ -683,6 +683,8 @@ pub(crate) struct EditTablesDesc<'a> {
     pub(crate) page_count: u32,
     pub(crate) clusters: u32,
     pub(crate) stamps: bool,
+    /// The cooked sets' row of level 0: past the pinned cut's row on a DAG mesh.
+    pub(crate) row: u32,
     /// Its animated parts, which share the box its edited triangles stay inside.
     pub(crate) parts: &'a [PartGpu],
     pub(crate) skin: Option<EditSkin<'a>>,
@@ -749,7 +751,10 @@ impl EditTables {
             whole: u32::from(d.spheres.is_none()),
             _pad: 0,
         };
-        let empty_cut: crate::RtCutGpu = bytemuck::Zeroable::zeroed();
+        let empty_cut = crate::RtCutGpu {
+            row: d.row,
+            ..bytemuck::Zeroable::zeroed()
+        };
         let wrote = block.write_mapped(edit_at, bytemuck::bytes_of(&record))
             && block.write_mapped(spheres_at, bytemuck::cast_slice(spheres))
             && block.write_mapped(groups_at, bytemuck::cast_slice(d.groups))

@@ -19,7 +19,7 @@ use orr_gpu::{
     RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, ShaderStage, SpecData, Stages,
     TimelinePoint,
 };
-use orr_pack::mesh::{Cluster, MeshHeader, Part};
+use orr_pack::mesh::{Cluster, MeshHeader, Part, in_cut};
 
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::shaders::accel::{self, AccelRoot, AddressJob, ClasJob};
@@ -158,11 +158,45 @@ pub(crate) struct MeshInput<'a> {
     pub(crate) cluster_base: u32,
     /// The mesh's part table.
     pub(crate) parts: &'a [Part],
-    /// The smallest error of a cut whose clusters are all resident: 0 unless the mesh's
-    /// pages stream.
-    pub(crate) min_cut: f32,
-    /// Thresholds of the finer cuts built once their streamed pages are resident, finest first.
-    pub(crate) fine: &'a [f32],
+    /// DAG mode: the cuts whose clusters are all resident, finest first.
+    pub(crate) cached: &'a [CutRow],
+    /// DAG mode: the finer cuts built once their streamed pages are resident, finest first.
+    pub(crate) fine: &'a [CutRow],
+}
+
+/// A cut of a DAG mesh: its threshold, and its row of the cooked sets and cut table.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CutRow {
+    pub(crate) threshold: f32,
+    pub(crate) row: u32,
+}
+
+/// The finer and the cached cuts of a DAG mesh with cut table `table`
+/// ([`MeshHeader::cut_rows`]). A mesh whose pages stream caches only cuts at or above its
+/// pinned cut, whose clusters sit in its pinned pages, and builds the finer ones when `fine`
+/// allows it. Each family holds at most [`DAG_CUTS`].
+pub(crate) fn cut_rows(table: &[f32], streams: bool, fine: bool) -> (Vec<CutRow>, Vec<CutRow>) {
+    let (&pinned_cut, thresholds) = table.split_first().expect("a DAG mesh has a pinned cut");
+    let all = thresholds
+        .iter()
+        .zip(1..)
+        .map(|(&threshold, row)| CutRow { threshold, row });
+    if !streams {
+        return (Vec::new(), all.take(DAG_CUTS).collect());
+    }
+    let finer = all
+        .clone()
+        .filter(|c| fine && c.threshold < pinned_cut)
+        .take(DAG_CUTS);
+    let pinned = CutRow {
+        threshold: pinned_cut,
+        row: 0,
+    };
+    let coarser = all.filter(|c| c.threshold > pinned_cut).take(DAG_CUTS - 1);
+    (
+        finer.collect(),
+        std::iter::once(pinned).chain(coarser).collect(),
+    )
 }
 
 /// A mesh's animated parts: those of its clusters with `ANIMATED_PART`, from the lowest
@@ -315,86 +349,56 @@ pub(super) fn cut_hash(clusters: &[u32]) -> [u32; 2] {
     })
 }
 
-/// The thresholds of the finer cuts of a mesh whose streamed groups reach down to `min_cut`:
-/// level 0, then its smallest group error and powers of 4 above it, finest first.
-pub(crate) fn fine_thresholds(errors: impl Iterator<Item = f32>, min_cut: f32) -> Vec<f32> {
-    let smallest = errors
-        .filter(|e| e.is_finite() && *e > 0.0)
-        .fold(f32::INFINITY, f32::min);
-    let mut out = vec![0.0];
-    let mut t = smallest;
-    while smallest.is_finite() && t < min_cut && out.len() < DAG_CUTS {
-        out.push(t);
-        t *= 4.0;
-    }
-    out
-}
-
-/// The mesh clusters of the cut at threshold `t`: the clusters whose own error is at or under
-/// it and whose parent's is over it, from the merged stage once `t` reaches the merge error.
+/// The mesh clusters of the cut at threshold `t`.
 pub(crate) fn cut_clusters(clusters: &[ClusterInfo], t: f32, merge: f32) -> Vec<u32> {
-    let merged = t >= merge;
     (0..clusters.len() as u32)
         .filter(|&i| {
             let c = &clusters[i as usize];
-            ((c.flags & Cluster::MERGED) != 0) == merged && c.self_error <= t && c.parent_error > t
+            in_cut(c.self_error, c.parent_error, c.flags, t, merge)
         })
         .collect()
 }
 
-/// The clusters of each cut a mesh caches, finest first, with the largest error in it.
-/// Discrete meshes cache their levels. DAG meshes cache cuts at fixed thresholds: a cut
-/// takes every cluster whose own error is at or under the threshold and whose parent's is
-/// over it, from the merged stage once the threshold reaches the merge error. Copies whose
-/// traversed cut equals one trace it, as do distant copies and posed ones. A mesh whose
-/// pages stream caches only cuts at or above `min_cut`, whose clusters sit in its pinned
-/// pages.
-pub(crate) fn cuts(m: &MeshInput<'_>) -> Vec<(f32, Vec<u32>)> {
+/// A cut a mesh caches: its clusters, the largest error among them and its row of the
+/// cooked sets.
+pub(crate) struct Cut {
+    pub(crate) error: f32,
+    pub(crate) clusters: Vec<u32>,
+    pub(crate) row: u32,
+}
+
+/// The clusters of each cut a mesh caches, finest first. Discrete meshes cache their levels,
+/// DAG meshes [`MeshInput::cached`]. Copies whose traversed cut equals one trace it, as do
+/// distant copies and posed ones.
+pub(crate) fn cuts(m: &MeshInput<'_>) -> Vec<Cut> {
     if !m.levels.is_empty() {
         return m
             .levels
             .iter()
-            .map(|&(error, first, count)| (error, (first..first + count).collect()))
+            .zip(0..)
+            .map(|(&(error, first, count), row)| Cut {
+                error,
+                clusters: (first..first + count).collect(),
+                row,
+            })
             .collect();
     }
     let merge = m.header.merge_error;
-    let finite = |e: f32| e.is_finite() && e > 0.0;
-    let smallest = m
-        .clusters
-        .iter()
-        .map(|c| c.self_error)
-        .filter(|&e| finite(e))
-        .fold(f32::INFINITY, f32::min);
-    let largest = m
-        .clusters
-        .iter()
-        .map(|c| c.self_error)
-        .filter(|&e| finite(e))
-        .fold(0.0, f32::max);
-    let mut thresholds = vec![m.min_cut];
-    if smallest.is_finite() {
-        let mut t = smallest;
-        while thresholds.len() < DAG_CUTS {
-            if t > m.min_cut {
-                thresholds.push(t);
-            }
-            if t >= largest {
-                break;
-            }
-            t *= 4.0;
-        }
-    }
-    let mut out: Vec<(f32, Vec<u32>)> = Vec::new();
-    for t in thresholds {
-        let selected = cut_clusters(m.clusters, t, merge);
+    let mut out: Vec<Cut> = Vec::new();
+    for c in m.cached {
+        let selected = cut_clusters(m.clusters, c.threshold, merge);
         let error = selected
             .iter()
             .map(|&i| m.clusters[i as usize].self_error)
             .fold(0.0, f32::max);
-        if selected.is_empty() || out.last().is_some_and(|(_, s)| *s == selected) {
+        if selected.is_empty() || out.last().is_some_and(|l| l.clusters == selected) {
             continue;
         }
-        out.push((error, selected));
+        out.push(Cut {
+            error,
+            clusters: selected,
+            row: c.row,
+        });
     }
     out
 }
@@ -823,8 +827,8 @@ pub(crate) fn build(
         let animated = Animated::of(m.clusters, m.header.parts.count);
         let cs = cuts(m);
         per_mesh.push((cs.len() as u32, animated));
-        for (error, clusters) in cs {
-            plans.push(jobs.plan_cut(error, clusters, m.clusters, animated, &clas[mi]));
+        for cut in cs {
+            plans.push(jobs.plan_cut(cut, m.clusters, animated, &clas[mi]));
         }
     }
     let blas = jobs.build(&mut step, k, &mut accel.blocks)?;
@@ -841,8 +845,9 @@ pub(crate) fn build(
     let mut records: Vec<RtCutGpu> = Vec::with_capacity(plans.len());
     let mut remaining = plans.iter();
     for (m, &(count, _)) in meshes.iter().zip(&per_mesh) {
-        records.extend(m.fine.iter().map(|&t| RtCutGpu {
-            error: t,
+        records.extend(m.fine.iter().map(|&c| RtCutGpu {
+            error: c.threshold,
+            row: c.row,
             ..bytemuck::Zeroable::zeroed()
         }));
         for p in remaining.by_ref().take(count as usize) {
@@ -865,6 +870,8 @@ pub(crate) fn build(
                 body: at(p.body),
                 parts,
                 hash: cut_hash(&p.clusters),
+                row: p.row,
+                _pad: 0,
             });
         }
     }
@@ -958,12 +965,16 @@ impl BlasJobs {
     /// (when not empty) and one per animated part with clusters in it.
     fn plan_cut(
         &mut self,
-        error: f32,
-        clusters: Vec<u32>,
+        cut: Cut,
         infos: &[ClusterInfo],
         animated: Animated,
         clas: &[u64],
     ) -> CutPlan {
+        let Cut {
+            error,
+            clusters,
+            row,
+        } = cut;
         let rest = self.add(&clusters, clas);
         let mut parts = vec![Vec::new(); animated.count as usize];
         let mut body = Vec::new();
@@ -987,6 +998,7 @@ impl BlasJobs {
         CutPlan {
             error,
             clusters,
+            row,
             rest,
             body,
             parts,
@@ -1062,6 +1074,7 @@ pub(crate) fn build_fine_cut(
     device: &Device,
     k: &AccelKernels,
     clusters: Vec<u32>,
+    row: u32,
     infos: &[ClusterInfo],
     animated: Animated,
     clas: &[u64],
@@ -1072,7 +1085,12 @@ pub(crate) fn build_fine_cut(
         .map(|&i| infos[i as usize].self_error)
         .fold(0.0, f32::max);
     let mut jobs = BlasJobs::default();
-    let p = jobs.plan_cut(error, clusters, infos, animated, clas);
+    let cut = Cut {
+        error,
+        clusters,
+        row,
+    };
+    let p = jobs.plan_cut(cut, infos, animated, clas);
     let mut blocks = Vec::new();
     let blas = jobs.build(&mut step, k, &mut blocks)?;
     let point = step.submit()?;
@@ -1099,6 +1117,8 @@ pub(crate) fn build_fine_cut(
         body: at(p.body),
         parts,
         hash: cut_hash(&p.clusters),
+        row,
+        _pad: 0,
     };
     Ok((
         FineCut {
@@ -1114,6 +1134,7 @@ pub(crate) fn build_fine_cut(
 struct CutPlan {
     error: f32,
     clusters: Vec<u32>,
+    row: u32,
     rest: usize,
     /// None: an empty body.
     body: Option<usize>,
@@ -1510,4 +1531,22 @@ fn build_clas(
         clas[mi][ci] = a;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_cut_keeps_the_row_of_its_threshold() {
+        for table in [[0.5, 0.0, 0.25, 1.0, 4.0], [0.0, 0.0, 0.25, 1.0, 4.0]] {
+            for streams in [false, true] {
+                let (fine, cached) = cut_rows(&table, streams, true);
+                for c in fine.iter().chain(&cached) {
+                    assert_eq!(table[c.row as usize], c.threshold);
+                }
+                assert_eq!(cached[0].row, u32::from(!streams));
+            }
+        }
+    }
 }

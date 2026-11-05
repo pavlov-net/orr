@@ -29,7 +29,7 @@ use orr_pack::{Aabb, Archive, AssetId, Class, Codec};
 use rustc_hash::FxHashMap;
 
 use crate::accel::{
-    self, AccelShared, ClusterInfo, MaskBlas, MeshInput, MeshRt, MountAccel, PageMicromap,
+    self, AccelShared, ClusterInfo, CutRow, MaskBlas, MeshInput, MeshRt, MountAccel, PageMicromap,
 };
 use crate::edit::{
     self, ClasInputs, EDIT_SPHERES, EditBatch, EditClas, EditDesc, EditDone, EditId, EditLoaded,
@@ -137,14 +137,13 @@ struct PlacedMesh {
     /// Pages past the pinned ones stream: per page its blob, bytes and clusters, and the
     /// frame the traversal last reported each, in the mesh's block.
     streamed: Option<(Vec<StreamedPage>, u64)>,
-    /// The smallest error of a cut whose clusters all sit in pinned pages.
-    min_cut: f32,
+    /// DAG mode: the cuts whose clusters are all resident from mount.
+    cached: Vec<CutRow>,
     /// What edits of the mesh read: its groups, and every page's blob, bytes and clusters.
     groups: Vec<Group>,
     all_pages: Vec<StreamedPage>,
-    /// Thresholds of its finer cached cuts where its pages stream, and their stamps in the
-    /// mesh's block.
-    fine: Vec<f32>,
+    /// Its finer cached cuts where its pages stream, and their stamps in the mesh's block.
+    fine: Vec<CutRow>,
     cut_stamps: u64,
 }
 
@@ -924,16 +923,10 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     let page_clusters_at = place(4 * (info.pages.len() as u64 + 1));
     let stamps_at = place(4 * info.node_pages.len() as u64);
     let page_stamps_at = streams.then(|| place(4 * info.pages.len() as u64));
-    let min_cut = info
-        .groups
-        .iter()
-        .filter(|g| g.page as usize >= pinned && g.error.is_finite())
-        .map(|g| g.error)
-        .fold(0.0, f32::max);
-    let fine = if streams && t.traced {
-        accel::fine_thresholds(info.groups.iter().map(|g| g.error), min_cut)
+    let (fine, cached) = if info.levels.is_empty() {
+        accel::cut_rows(&info.cut_rows, streams, t.traced)
     } else {
-        Vec::new()
+        Default::default()
     };
     let cut_stamps_at = place(8 * fine.len() as u64);
     let page_at: Vec<u64> = info.pages[..pinned]
@@ -1045,7 +1038,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             node_stamps: block.gpu() + stamps_at,
             depth,
             streamed: page_stamps_at.map(|at| (all_pages.clone(), block.gpu() + at)),
-            min_cut,
+            cached,
             groups: info.groups.clone(),
             all_pages,
             fine,
@@ -1471,11 +1464,11 @@ struct ResolvedMesh {
     rt: MeshRt,
     depth: Option<u32>,
     streamed: Option<Vec<StreamedPage>>,
-    min_cut: f32,
+    cached: Vec<CutRow>,
     non_opaque: Vec<bool>,
     groups: Vec<Group>,
     all_pages: Vec<StreamedPage>,
-    fine: Vec<f32>,
+    fine: Vec<CutRow>,
     animated: accel::Animated,
 }
 
@@ -1663,7 +1656,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 rt: MeshRt::default(),
                 depth: m.depth,
                 streamed: m.streamed.map(|(pages, _)| pages),
-                min_cut: m.min_cut,
+                cached: m.cached,
                 non_opaque: Vec::new(),
                 groups: m.groups,
                 all_pages: m.all_pages,
@@ -1833,7 +1826,7 @@ fn build_accel(
             non_opaque,
             cluster_base: m.gpu.cluster_base,
             parts: &m.parts,
-            min_cut: m.min_cut,
+            cached: &m.cached,
             fine: &m.fine,
         })
         .collect();
@@ -2268,11 +2261,11 @@ fn units(
             let pages = m
                 .fine
                 .iter()
-                .map(|&t| {
+                .map(|c| {
                     let mut pages: Vec<u32> = m
                         .groups
                         .iter()
-                        .filter(|g| g.error > t && g.page >= m.header.pinned_pages)
+                        .filter(|g| g.error > c.threshold && g.page >= m.header.pinned_pages)
                         .map(|g| g.page)
                         .collect();
                     pages.sort_unstable();
@@ -2286,7 +2279,7 @@ fn units(
                 mesh,
                 stream: Arc::clone(s),
                 table: m.gpu.rt_cuts,
-                thresholds: m.fine.clone(),
+                cuts: m.fine.clone(),
                 pages,
                 merge: m.header.merge_error,
                 animated: m.animated,
@@ -2668,6 +2661,7 @@ impl Mounts {
                 page_count,
                 clusters: n,
                 stamps: src_gpu.page_stamps.address().0 != 0,
+                row: u32::from(stream.finest_level.is_none()),
                 parts: &parts,
                 skin: src_skin.map(|source| EditSkin {
                     source,
