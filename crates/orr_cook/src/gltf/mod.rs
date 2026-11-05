@@ -1,5 +1,7 @@
 //! glTF 2.0 import: the default scene's triangle primitives as one mesh per model, the
-//! materials they use, and with skins a skeleton and its clips ([`crate::skin`]).
+//! materials they use, and with skins a skeleton and its clips ([`crate::skin`]). Strips and
+//! fans become triangle lists. Points, lines and primitives without positions have no surface
+//! to cook: they are skipped, and each one placed is a warning in the report.
 //!
 //! With [`GltfLayout::Scene`] and without `GltfSettings::models` the whole scene is one model.
 //! With models, each node whose name contains a pattern (and has no selected ancestor) is a
@@ -51,7 +53,7 @@
 pub(crate) mod data;
 mod material;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -190,6 +192,58 @@ fn material_index(prim: &gltf::Primitive<'_>) -> usize {
     prim.material().index().unwrap_or(usize::MAX)
 }
 
+/// Whether `prim` has a surface to cook.
+fn has_surface(prim: &gltf::Primitive<'_>) -> bool {
+    let triangles = matches!(
+        prim.mode(),
+        Mode::Triangles | Mode::TriangleStrip | Mode::TriangleFan
+    );
+    triangles && prim.get(&Semantic::Positions).is_some()
+}
+
+/// The primitives of `mesh` with a surface to cook.
+fn surfaces<'a>(mesh: &gltf::Mesh<'a>) -> impl Iterator<Item = gltf::Primitive<'a>> {
+    mesh.primitives().filter(has_surface)
+}
+
+/// The mesh of `node`, if it has a surface to cook.
+fn surface_mesh<'a>(node: &gltf::Node<'a>) -> Option<gltf::Mesh<'a>> {
+    node.mesh().filter(|m| surfaces(m).next().is_some())
+}
+
+/// The corners of the triangles of vertices `v` connected as `mode`, in glTF's order.
+fn corners(mode: Mode, v: Vec<u32>) -> Vec<u32> {
+    let triangles = 0..v.len().saturating_sub(2);
+    match mode {
+        Mode::TriangleStrip => triangles
+            .flat_map(|i| [v[i], v[i + 1 + i % 2], v[i + 2 - i % 2]])
+            .collect(),
+        Mode::TriangleFan => triangles.flat_map(|i| [v[i + 1], v[i + 2], v[0]]).collect(),
+        _ => v,
+    }
+}
+
+/// A warning for each primitive without a surface of the meshes nodes `placed` hold.
+fn skipped_primitives(doc: &gltf::Document, placed: impl Iterator<Item = usize>) -> Vec<String> {
+    let meshes = placed.filter_map(|n| doc.nodes().nth(n)?.mesh().map(|m| m.index()));
+    let mut warnings = Vec::new();
+    for mesh in meshes.collect::<BTreeSet<_>>() {
+        let mesh = doc.meshes().nth(mesh).expect("mesh index");
+        for p in mesh.primitives().filter(|p| !has_surface(p)) {
+            let why = match p.get(&Semantic::Positions) {
+                Some(_) => format!("mode {:?}", p.mode()),
+                None => "no POSITION".to_string(),
+            };
+            warnings.push(format!(
+                "mesh {} primitive {}: {why} has no surface, skipped",
+                mesh.index(),
+                p.index()
+            ));
+        }
+    }
+    warnings
+}
+
 /// Adds the buffer views a primitive's attributes and indices read.
 fn primitive_views(prim: &gltf::Primitive<'_>, out: &mut Vec<usize>) {
     for (_, a) in prim.attributes() {
@@ -227,9 +281,6 @@ fn append_primitive(
     cx: &Context<'_>,
     b: &mut Building,
 ) -> Result<(), String> {
-    if prim.mode() != Mode::Triangles {
-        return Err(format!("mode {:?} is not triangles", prim.mode()));
-    }
     let linear = Mat3::from_mat4(world);
     // In f64 as `normal_matrix` takes it: where `world` flattens, the sign is rounding, and
     // the winding and the normals have to agree on it.
@@ -283,10 +334,11 @@ fn append_primitive(
         .iter()
         .map(|&p| world.transform_point3(Vec3::from(p)).to_array())
         .collect();
-    let mut indices: Vec<u32> = match prim.indices() {
+    let vertices: Vec<u32> = match prim.indices() {
         Some(a) => src.indices(&a)?,
         None => (0..n as u32).collect(),
     };
+    let mut indices = corners(prim.mode(), vertices);
     if !indices.len().is_multiple_of(3) || indices.iter().any(|&i| i as usize >= n) {
         return Err("bad index list".into());
     }
@@ -549,6 +601,7 @@ pub(crate) fn import(
         hashes: BTreeMap::new(),
         instances: Vec::new(),
         files: &mut files,
+        warnings: Vec::new(),
     };
     let skeleton = match settings.layout {
         GltfLayout::Scene => scene_layout(&mut b, &graph)?,
@@ -561,6 +614,7 @@ pub(crate) fn import(
         materials,
         mut models,
         instances,
+        warnings,
         ..
     } = b;
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -579,7 +633,7 @@ pub(crate) fn import(
         skeletons: skeleton.into_iter().collect(),
         instances,
         files,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -600,6 +654,7 @@ struct Imported<'a> {
     hashes: BTreeMap<PathBuf, Hash32>,
     instances: Vec<(String, Vec<Placed>)>,
     files: &'a mut Vec<Input>,
+    warnings: Vec<String>,
 }
 
 impl Imported<'_> {
@@ -726,24 +781,23 @@ impl Imported<'_> {
         let m = src.doc.meshes().nth(mesh).expect("mesh index");
         let mut views = Vec::new();
         let mut groups: BTreeMap<usize, u64> = BTreeMap::new();
-        for prim in m.primitives() {
+        for prim in surfaces(&m) {
             self.material(mesh, &prim)?;
             primitive_views(&prim, &mut views);
             for a in morph_accessors(&prim) {
                 Document::accessor_views(&a, &mut views);
             }
-            let what = format!("mesh {mesh} primitive {}", prim.index());
-            if prim.mode() != Mode::Triangles {
-                return Err(self.fail(format!("{what}: mode {:?} is not triangles", prim.mode())));
-            }
-            let positions = prim
-                .get(&Semantic::Positions)
-                .ok_or_else(|| self.fail(format!("{what}: no positions")))?;
-            let corners = prim.indices().map_or(positions.count(), |a| a.count());
-            if !corners.is_multiple_of(3) {
+            let positions = prim.get(&Semantic::Positions).expect("a surface");
+            let vertices = prim.indices().map_or(positions.count(), |a| a.count());
+            let count = match prim.mode() {
+                Mode::Triangles => vertices,
+                _ => 3 * vertices.saturating_sub(2),
+            };
+            if !count.is_multiple_of(3) {
+                let what = format!("mesh {mesh} primitive {}", prim.index());
                 return Err(self.fail(format!("{what}: bad index list")));
             }
-            *groups.entry(material_index(&prim)).or_default() += corners as u64;
+            *groups.entry(material_index(&prim)).or_default() += count as u64;
         }
         let checked = self.record(&mut views)?;
         let mut sections = Vec::new();
@@ -774,7 +828,7 @@ impl Imported<'_> {
             h.update(s.as_bytes());
         };
         json(&src.json["meshes"][mesh]);
-        for prim in m.primitives() {
+        for prim in surfaces(&m) {
             let attributes = prim.attributes().map(|a| a.1);
             for a in attributes
                 .chain(prim.indices())
@@ -812,7 +866,7 @@ impl Imported<'_> {
             let count = parts.as_ref().map_or(0, |p| usize::from(p.parts));
             let mut b = Building::new(None, count);
             let gm = src.doc.meshes().nth(mesh).expect("mesh index");
-            for prim in gm.primitives() {
+            for prim in surfaces(&gm) {
                 append_primitive(&data, &prim, linear, &weights, None, &cx, &mut b).map_err(
                     |m| Error::Import {
                         asset: asset.clone(),
@@ -849,9 +903,9 @@ impl Imported<'_> {
     }
 }
 
-/// Node `n`'s `EXT_mesh_gpu_instancing` object, if it has one and a mesh.
+/// Node `n`'s `EXT_mesh_gpu_instancing` object, if it has one and a mesh with a surface.
 fn instancing(src: &Document, n: usize) -> Option<&serde_json::Value> {
-    src.doc.nodes().nth(n)?.mesh()?;
+    surface_mesh(&src.doc.nodes().nth(n)?)?;
     src.json["nodes"][n]
         .get("extensions")
         .and_then(|e| e.get("EXT_mesh_gpu_instancing"))
@@ -936,7 +990,7 @@ fn meshes_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     let skinned = graph.order.iter().any(|&n| {
         doc.nodes()
             .nth(n)
-            .is_some_and(|d| d.mesh().is_some() && d.skin().is_some())
+            .is_some_and(|d| surface_mesh(&d).is_some() && d.skin().is_some())
     });
     let needs_scene = [
         (!s.models.is_empty(), "model selection"),
@@ -948,11 +1002,11 @@ fn meshes_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     }
     // Every placed mesh's buffer files, hashed together.
     let shown = b.shown.clone();
+    b.warnings = skipped_primitives(doc, shown.iter().copied());
     let mut views = Vec::new();
     for &n in &shown {
         if let Some(mesh) = doc.nodes().nth(n).and_then(|d| d.mesh()) {
-            mesh.primitives()
-                .for_each(|p| primitive_views(&p, &mut views));
+            surfaces(&mesh).for_each(|p| primitive_views(&p, &mut views));
         }
     }
     b.record(&mut views)?;
@@ -962,7 +1016,9 @@ fn meshes_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     let mut by_mesh: BTreeMap<usize, Placings> = BTreeMap::new();
     for &n in &shown {
         let node = doc.nodes().nth(n).expect("node index");
-        let Some(mesh) = node.mesh() else { continue };
+        let Some(mesh) = surface_mesh(&node) else {
+            continue;
+        };
         let own = mesh.weights().unwrap_or_default();
         let weights = node.weights().unwrap_or(own);
         let transforms = node_transforms(&data, graph, n).map_err(|m| b.fail(m))?;
@@ -1026,7 +1082,7 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
             continue;
         }
         if let Some(mesh) = doc.nodes().nth(n).and_then(|d| d.mesh()) {
-            for p in mesh.primitives() {
+            for p in surfaces(&mesh) {
                 primitive_views(&p, &mut views);
                 for a in morph_accessors(&p) {
                     Document::accessor_views(&a, &mut views);
@@ -1053,7 +1109,7 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
         .iter()
         .filter_map(|&n| {
             let node = doc.nodes().nth(n)?;
-            node.mesh()?;
+            surface_mesh(&node)?;
             Some(node.skin()?.index())
         })
         .collect();
@@ -1076,6 +1132,11 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
     }
     let rigid = skeleton.as_ref().filter(|_| settings.parts_from_skin);
     let (mut models, mut owner) = select_models(doc, graph, &shown, settings).map_err(fail)?;
+    let placed = shown.iter().copied();
+    b.warnings = skipped_primitives(
+        doc,
+        placed.filter(|&n| owner[n].is_some() || is_instanced[n]),
+    );
     for &n in &instanced {
         owner[n] = None;
     }
@@ -1087,7 +1148,7 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
     };
     for &n in &shown {
         let node = doc.nodes().nth(n).expect("node index");
-        let (Some(mesh), Some(m)) = (node.mesh(), owner[n]) else {
+        let (Some(mesh), Some(m)) = (surface_mesh(&node), owner[n]) else {
             continue;
         };
         let (world, binding) = match (&skeleton, node.skin()) {
@@ -1107,7 +1168,7 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
             }
         };
         let weights = node.weights().or(mesh.weights()).unwrap_or_default();
-        for prim in mesh.primitives() {
+        for prim in surfaces(&mesh) {
             b.material(mesh.index(), &prim)?;
             append_primitive(
                 &data,
@@ -1131,8 +1192,9 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
     let mut out = Vec::new();
     for building in models {
         let node = building.node;
-        // The whole scene may hold nothing but instanced nodes.
-        if node.is_none() && building.groups.values().all(Vec::is_empty) && !instanced.is_empty() {
+        // The whole scene may hold nothing but instanced nodes and primitives without a surface.
+        let elsewhere = !instanced.is_empty() || !b.warnings.is_empty();
+        if node.is_none() && building.groups.values().all(Vec::is_empty) && elsewhere {
             continue;
         }
         let name = node.map(|n| node_name(doc, n).to_string());
