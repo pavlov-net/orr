@@ -360,8 +360,8 @@ struct Pack {
     channels: Vec<Channel>,
     refs: Vec<TexRef>,
     coverage: Option<(usize, f32)>,
-    /// Output channel, normal map, its scale and how it stores normals.
-    toksvig: Option<(usize, TexRef, f32, NormalSource)>,
+    /// Output channel, normal map, its scale per tangent axis and how it stores normals.
+    toksvig: Option<(usize, TexRef, [f32; 2], NormalSource)>,
     normal: bool,
     shrink: bool,
 }
@@ -628,7 +628,7 @@ impl<'a> Packer<'a> {
                 // no Toksvig roughness.
                 let toksvig = !self.jobs[self.by_id[&id.id]].source_mips;
                 if toksvig && consts.iter().any(Option::is_none) {
-                    normal_packed = Some((*r, scale[0], source));
+                    normal_packed = Some((*r, *scale, source));
                 }
             }
         }
@@ -1324,7 +1324,7 @@ impl TextureJob {
                 let n = &sources[&r.image];
                 let px = n.px.iter().map(|t| {
                     let [x, y, z] = source.read(*t);
-                    [x * scale, y * scale, z, 1.0]
+                    [x * scale[0], y * scale[1], z, 1.0]
                 });
                 Toksvig {
                     channel: *channel,

@@ -914,10 +914,10 @@ impl Mapper<'_> {
                         self.node(map).name
                     ));
                 }
-                let scale = self.float(map, "scale", 1.0)?;
+                let scale = self.vec2(map, "scale", Vec2::ONE)?;
                 match self.value(map, "in")? {
                     Some(Value::Texture(t)) if t.channels == Channels::Rgb => {
-                        self.textures.normal = Some((t.tex_ref(), [scale; 2]));
+                        self.textures.normal = Some((t.tex_ref(), scale.to_array()));
                     }
                     _ => {
                         return Err(format!("{}: in must read an image", self.node(map).name));

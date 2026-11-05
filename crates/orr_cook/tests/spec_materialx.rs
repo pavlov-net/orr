@@ -470,6 +470,56 @@ fn address_mode_through_a_constant_is_the_mode_it_holds() {
     assert_eq!(clamp, base_texture(&through, BASE_I));
 }
 
+#[test]
+fn normalmap_vector2_scale_flips_only_y() {
+    // Nodes normalmap: scale is float or vector2.
+    let normal = |file: &str, scale: &str| {
+        let body = format!(
+            r#"<image name="i" type="vector3">
+              <input name="file" type="filename" value="{file}"/></image>
+            <normalmap name="n" type="vector3">
+              <input name="in" type="vector3" nodename="i"/>
+              <input name="scale" {scale}/></normalmap>"#
+        );
+        let inputs = r#"<input name="geometry_normal" type="vector3" nodename="n"/>"#;
+        let (a, _) = cook_body(&body, inputs).unwrap();
+        let m = material(&a);
+        a.find(m.textures[slot::NORMAL].texture)
+            .unwrap()
+            .content_hash
+    };
+    assert_eq!(
+        normal("v.png", r#"type="vector2" value="1, -1""#),
+        normal("flipped.png", r#"type="float" value="1""#)
+    );
+}
+
+#[test]
+fn toksvig_roughness_follows_the_normal_scale_of_each_axis() {
+    let roughness = |scale: &str| {
+        let body = format!(
+            r#"<image name="i" type="vector3">
+              <input name="file" type="filename" value="ripple.png"/></image>
+            <normalmap name="n" type="vector3">
+              <input name="in" type="vector3" nodename="i"/>
+              <input name="scale" type="vector2" value="{scale}"/></normalmap>"#
+        );
+        let inputs = r#"<input name="geometry_normal" type="vector3" nodename="n"/>"#;
+        let d = fixture();
+        std::fs::write(
+            d.join("ripple.png"),
+            png(|_, y| [128, if y % 2 == 0 { 40 } else { 216 }, 200, 255]),
+        )
+        .unwrap();
+        let (a, _) = cook(&write_doc(&d, "m.mtlx", "", &body, inputs), "M").unwrap();
+        let m = material(&a);
+        a.find(m.textures[slot::ROUGHNESS].texture)
+            .unwrap()
+            .content_hash
+    };
+    assert_ne!(roughness("0, 1"), roughness("0, 0.1"));
+}
+
 /// Runs a cook that a cycle could keep from ending.
 fn bounded(body: &'static str, inputs: &'static str) -> String {
     let (send, receive) = mpsc::channel();
