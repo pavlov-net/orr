@@ -1158,6 +1158,8 @@ fn tree_pair(d: &Path) -> (PathBuf, PathBuf) {
                 uniform token info:id = "UsdUVTexture"
                 asset inputs:file = @{file}@
                 float2 inputs:st.connect = </Tree/Looks/{material}/St.outputs:result>
+                token inputs:wrapS = "repeat"
+                token inputs:wrapT = "repeat"
 {extra}                float3 outputs:rgb
                 float outputs:a
             }}

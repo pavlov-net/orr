@@ -12,6 +12,7 @@ pub(crate) mod neural;
 
 pub use orr_color::Primaries;
 use orr_math::Vec3;
+use orr_pack::material::wrap;
 use orr_pack::texture::{
     ExtractedLight, FormatInfo, TILE_BYTES, TextureHeader, TextureInfo, full_mip_count, mip_size,
     normal, tail_first_mip, tile,
@@ -49,7 +50,7 @@ pub struct TextureSettings {
     /// are Rec. 709, and primaries with no id convert to Rec. 2020.
     pub primaries: Option<Primaries>,
     pub filter: MipFilter,
-    /// Edge handling of the mip filter per axis (u, v).
+    /// What the mip filter reads past each edge, per axis (u, v).
     pub wrap: [Wrap; 2],
     /// Store BCn blocks split into endpoint and index streams, which zstd compresses
     /// better. `None` takes the format's default.
@@ -155,7 +156,7 @@ pub enum MipFilter {
     Kaiser,
 }
 
-/// Filter edge handling.
+/// What a texture reads past 0..1.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Wrap {
@@ -163,6 +164,40 @@ pub enum Wrap {
     Repeat,
     Clamp,
     Mirror,
+    /// Transparent black, which filtering blends with the edge texels.
+    Border,
+    /// A value of the texture's binding, and [`Self::Clamp`] within 0..1. Nothing blends across
+    /// the edge, so mips filter as under [`Self::Clamp`].
+    Constant,
+}
+
+impl Wrap {
+    /// Whether reads past 0..1 leave the texture for a value of their own.
+    pub(crate) fn bounded(self) -> bool {
+        matches!(self, Self::Border | Self::Constant)
+    }
+
+    /// The `TextureBinding::wrap` value.
+    pub(crate) fn binding(self) -> u8 {
+        match self {
+            Self::Repeat => wrap::REPEAT,
+            Self::Clamp => wrap::CLAMP,
+            Self::Mirror => wrap::MIRROR,
+            Self::Border => wrap::BORDER,
+            Self::Constant => wrap::CONSTANT,
+        }
+    }
+
+    /// The mode of a `TextureBinding::wrap` value.
+    pub(crate) fn of_binding(v: u8) -> Self {
+        match v {
+            wrap::CLAMP => Self::Clamp,
+            wrap::MIRROR => Self::Mirror,
+            wrap::BORDER => Self::Border,
+            wrap::CONSTANT => Self::Constant,
+            _ => Self::Repeat,
+        }
+    }
 }
 
 /// Linear float RGBA texels, row-major.

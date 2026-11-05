@@ -89,6 +89,8 @@ fn reader(file: &str, kind: &str, [scale, bias]: [&str; 2]) -> String {
     <input name="file" type="filename" value="{file}"/>
     <input name="scale" type="vector4" value="{scale}"/>
     <input name="bias" type="vector4" value="{bias}"/>
+    <input name="wrapS" type="string" value="repeat"/>
+    <input name="wrapT" type="string" value="repeat"/>
   </UsdUVTexture>"#
     )
 }
@@ -159,6 +161,8 @@ def Xform "World"
                 uniform token info:id = "UsdUVTexture"
                 asset inputs:file = @{file}@
                 float2 inputs:st.connect = </World/Looks/M/St.outputs:result>
+                token inputs:wrapS = "repeat"
+                token inputs:wrapT = "repeat"
                 {reader}
                 float3 outputs:rgb
                 float outputs:r
@@ -352,6 +356,8 @@ fn open_pbr_specular_weight_keeps_values_above_1() {
     let (a, m) = usd_reader(&d, "low.ktx2", "float", pair, "", input);
     assert_eq!(weight(&a, &m, 0), 0.0);
     assert_eq!(weight(&a, &m, 7), 1.25);
+    let b = m.textures[slot::SPECULAR_WEIGHT];
+    assert_eq!(b.outside, [0.0; 4], "the floor holds past the edges too");
 
     // A scale and bias take an 8-bit image past 1 as they do a float one.
     let ramp = image::GrayImage::from_fn(8, 8, |x, _| image::Luma([if x < 4 { 0 } else { 255 }]));
@@ -866,7 +872,7 @@ fn normal_encodings_yield_to_what_the_image_can_hold() {
             format!(
                 r#"<?xml version="1.0"?>
 <materialx version="1.39">
-  <{reader} name="i" type="vector3"><input name="file" type="filename" value="f.ktx2"/></{reader}>
+  <{reader} name="i" type="vector3"><input name="file" type="filename" value="f.ktx2"/><input name="wrapS" type="string" value="repeat"/><input name="wrapT" type="string" value="repeat"/></{reader}>
   <normalmap name="n" type="vector3"><input name="in" type="vector3" nodename="i"{output}/></normalmap>
   <open_pbr_surface name="S" type="surfaceshader">
     <input name="geometry_normal" type="vector3" nodename="n"/>

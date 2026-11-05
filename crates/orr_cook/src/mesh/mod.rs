@@ -357,6 +357,15 @@ pub(crate) struct MapSpec {
     pub(crate) uv1: bool,
 }
 
+/// How a material slot reads a cooked texture: [`maps::Raster`]'s edge modes and uv transform,
+/// and per channel what it reads past 0..1.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct MapRead {
+    pub(crate) wrap: [Wrap; 2],
+    pub(crate) uv: [f32; 6],
+    pub(crate) outside: [f32; 4],
+}
+
 /// What a section's material reads the vertex tangent for.
 #[derive(Clone, Debug, Default)]
 pub(crate) enum NormalSpec {
@@ -367,8 +376,7 @@ pub(crate) enum NormalSpec {
     Texture {
         unit: String,
         key: Hash32,
-        wrap: [Wrap; 2],
-        uv: [f32; 6],
+        read: MapRead,
         uv_set: usize,
     },
     /// More than a normal map the cook can read: anisotropy, a linked surface, or a normal
@@ -387,8 +395,7 @@ pub(crate) enum OpacitySpec {
         unit: String,
         key: Hash32,
         cutoff: f32,
-        wrap: [Wrap; 2],
-        uv: [f32; 6],
+        read: MapRead,
         uv_set: usize,
     },
     Unknown,
@@ -403,14 +410,12 @@ pub(crate) struct DisplacementSpec {
     pub(crate) texture: Option<DisplacementTexture>,
 }
 
-/// The cooked displacement texture: its unit, key and edge modes, and the uv transform and
-/// uv set it reads.
+/// The cooked displacement texture: its unit and key, and how and on which uv set it reads.
 #[derive(Clone, Debug)]
 pub(crate) struct DisplacementTexture {
     pub(crate) unit: String,
     pub(crate) key: Hash32,
-    pub(crate) wrap: [Wrap; 2],
-    pub(crate) uv: [f32; 6],
+    pub(crate) read: MapRead,
     pub(crate) uv_set: usize,
 }
 
@@ -438,27 +443,22 @@ impl MapSpec {
             OpacitySpec::Texture {
                 key,
                 cutoff,
-                wrap,
-                uv,
+                read,
                 uv_set,
                 ..
-            } => format!("texture {key:?} {cutoff:?} {wrap:?} {uv:?} {uv_set}"),
+            } => format!("texture {key:?} {cutoff:?} {read:?} {uv_set}"),
             o => format!("{o:?}"),
         };
         let displacement = self.displacement.as_ref().map(|d| {
             (
                 [d.scale, d.offset, d.min, d.max],
-                d.texture.as_ref().map(|t| (t.key, t.wrap, t.uv, t.uv_set)),
+                d.texture.as_ref().map(|t| (t.key, t.read, t.uv_set)),
             )
         });
         let normal = match &self.normal {
             NormalSpec::Texture {
-                key,
-                wrap,
-                uv,
-                uv_set,
-                ..
-            } => format!("texture {key:?} {wrap:?} {uv:?} {uv_set}"),
+                key, read, uv_set, ..
+            } => format!("texture {key:?} {read:?} {uv_set}"),
             n => format!("{n:?}"),
         };
         format!("{opacity} {displacement:?} {normal} {}", self.uv1)

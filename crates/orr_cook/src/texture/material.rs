@@ -24,7 +24,12 @@
 //! - An image whose texels all lie within 1/255 of one value collapses into the material's
 //!   factor, clamped to the input's range as a texture stores it; a constant normal or
 //!   occlusion image, which has no factor, cooks at 4x4. Under `MASK` an opacity image collapses
-//!   only when its texels fall on one side of the cutoff.
+//!   only when its texels fall on one side of the cutoff. An image read past 0..1 as something
+//!   else ([`Wrap::Border`], [`Wrap::Constant`]) never collapses.
+//! - A slot's wrap and filter go to its binding, as does what it reads past 0..1: the image's
+//!   transparent black or stated value through the same factors and remaps as its texels.
+//!   Under [`Wrap::Border`] a texture that reads anything but black there takes
+//!   [`Wrap::Constant`], which the shader checks: a hardware border holds only black.
 //!
 //! A bound texture's value multiplies the matching factor; normal, occlusion and opacity
 //! textures have no factor.
@@ -39,14 +44,14 @@ use ctt::Quality;
 use orr_color::RgbPrimaries;
 use orr_math::{DMat3, DVec3};
 use orr_pack::material::{Material, TextureBinding, slot};
-use orr_pack::texture::{full_mip_count, mip_size};
+use orr_pack::texture::{full_mip_count, mip_size, normal};
 use orr_pack::{AssetId, Class, Hash32};
 use rayon::prelude::*;
 use serde::Deserialize;
 
 use super::color::{Decode, FileColor, ImageColor, Read, multiply};
 use super::load::{self, Blocks, Gray, Source};
-use super::mips::{MipSpec, Toksvig, normalized};
+use super::mips::{MipSpec, Toksvig, normalized, settled};
 use super::neural::{self, NeuralJob, NeuralSettings};
 use super::{
     Built, DataFormat, Encoding, Img, MipFilter, NormalSource, Plan, Primaries, Wrap,
@@ -119,6 +124,13 @@ pub(crate) struct TexRef {
     pub(crate) rg_channel: Option<u8>,
     pub(crate) uv_set: u8,
     pub(crate) wrap: [Wrap; 2],
+    /// The axes whose [`Self::wrap`] gives way to what the file's metadata states.
+    pub(crate) file_wrap: [bool; 2],
+    /// `TextureBinding::filter` bits.
+    pub(crate) filter: u8,
+    /// What each channel of the image reads past 0..1 under [`Wrap::Border`] and
+    /// [`Wrap::Constant`], as its texels decode: colors linear Rec.709.
+    pub(crate) outside: [f32; 4],
     /// The uv transform the texture is sampled with (`Material::uv_transforms` form).
     pub(crate) uv: [f32; 6],
     /// What the importer's rules say the image's texels are.
@@ -135,15 +147,21 @@ impl TexRef {
             .map_or(texel, |m| m[axis][0] + m[axis][1] * texel)
     }
 
-    /// The source channel `channel` as axis `axis` of this input, under `a + b * value`.
-    fn source(&self, axis: usize, channel: usize, read: Read, a: f32, b: f32) -> Channel {
+    /// `[a, b]` of `a + b * read`, with `read` this input's value on `axis`, of a source value.
+    fn through(&self, axis: usize, a: f32, b: f32) -> [f32; 2] {
         let [ra, rb] = self.remap.map_or([0.0, 1.0], |m| m[axis]);
-        Channel::Image {
+        [a + b * ra, b * rb]
+    }
+
+    /// The source channel `channel` as axis `axis` of this input, under `a + b * value`.
+    fn source(&self, axis: usize, channel: usize, read: Read, a: f32, b: f32) -> Texels {
+        let [a, b] = self.through(axis, a, b);
+        Texels::Image {
             image: self.image,
             channel,
             read,
-            a: a + b * ra,
-            b: b * rb,
+            a,
+            b,
         }
     }
 
@@ -153,16 +171,22 @@ impl TexRef {
         let value = |c: usize| source.decode.value(t[c]);
         let [x, y] = [self.read(0, value(0)), self.read(1, value(source.y))];
         let z = if source.rg {
-            orr_pack::texture::normal::z(x, y)
+            normal::z(x, y)
         } else {
             self.read(2, value(source.z))
         };
         [x, y, z]
     }
 
-    /// Whether both read their textures at the same uvs.
+    /// Whether both read their textures at the same uvs, past the edges too.
     fn samples_like(&self, o: &TexRef) -> bool {
-        self.uv_set == o.uv_set && self.uv == o.uv
+        self.uv_set == o.uv_set && self.uv == o.uv && self.wrap == o.wrap
+    }
+
+    /// Whether reads past 0..1 leave the image, so that an image of one value isn't one value
+    /// everywhere.
+    fn bounded(&self) -> bool {
+        self.wrap.iter().any(|w| w.bounded())
     }
 }
 
@@ -202,6 +226,25 @@ impl MaterialTextures {
             self.transmission.as_ref(),
             self.subsurface_color.as_ref(),
             self.displacement.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    fn refs_mut(&mut self) -> impl Iterator<Item = &mut TexRef> {
+        [
+            self.base_color.as_mut(),
+            self.opacity.as_mut(),
+            self.roughness.as_mut(),
+            self.metalness.as_mut(),
+            self.normal.as_mut().map(|n| &mut n.0),
+            self.occlusion.as_mut().map(|o| &mut o.0),
+            self.emissive.as_mut(),
+            self.specular.as_mut(),
+            self.coat.as_mut(),
+            self.transmission.as_mut(),
+            self.subsurface_color.as_mut(),
+            self.displacement.as_mut(),
         ]
         .into_iter()
         .flatten()
@@ -281,6 +324,8 @@ pub(crate) struct ImageFacts {
     gray: Gray,
     /// The file is animated; only its first frame is read.
     pub(crate) animated: bool,
+    /// What the file's metadata says it reads past 0..1, per axis.
+    wrap: Option<[Wrap; 2]>,
 }
 
 impl ImageFacts {
@@ -379,6 +424,7 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
             stored_normals,
             gray: s.gray,
             animated: false,
+            wrap: None,
         });
     }
     let mut src = load::open(bytes)?;
@@ -416,6 +462,7 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
         stored_normals: src.signed || (vectors && stores_normals(&src.layers, src.rg)),
         gray: src.gray,
         animated: load::is_animated(bytes),
+        wrap: load::exr_wrap(bytes),
     })
 }
 
@@ -451,9 +498,61 @@ struct Pack {
     shrink: bool,
 }
 
-/// Where one output channel comes from.
+/// One output channel.
 #[derive(Clone, Debug)]
-enum Channel {
+struct Channel {
+    texels: Texels,
+    /// What it reads past 0..1 under [`Wrap::Border`] and [`Wrap::Constant`].
+    outside: Outside,
+}
+
+/// A channel's reading past 0..1: source value `value`, read as a texel is, `a + b * value`.
+#[derive(Copy, Clone, Debug)]
+struct Outside {
+    value: f32,
+    a: f32,
+    b: f32,
+}
+
+impl Outside {
+    /// The value `v` itself.
+    const fn of(v: f32) -> Self {
+        Self {
+            value: 0.0,
+            a: v,
+            b: 0.0,
+        }
+    }
+}
+
+impl Channel {
+    const UNUSED: Self = Self {
+        texels: Texels::Unused,
+        outside: Outside::of(0.0),
+    };
+
+    /// The value `v`, past 0..1 too.
+    fn constant(v: f32) -> Self {
+        Self {
+            texels: Texels::Constant(v),
+            outside: Outside::of(v),
+        }
+    }
+}
+
+/// Source value `v` of a channel of `a + b * value`, under [`Pack::limit`] `limit`.
+fn stored(v: f32, a: f32, b: f32, limit: Option<f32>) -> f32 {
+    let read = a + b * limit.map_or(v, |l| v.clamp(0.0, l));
+    if limit == Some(f32::INFINITY) {
+        read.max(0.0)
+    } else {
+        read
+    }
+}
+
+/// Where one output channel's texels come from.
+#[derive(Clone, Debug)]
+enum Texels {
     /// Source channel of an image, `a + b * value`, the value as `read` has it.
     Image {
         image: usize,
@@ -496,20 +595,61 @@ pub(crate) struct TextureJob {
     source_mips: bool,
 }
 
-/// A planned texture and, per packed channel, the channel of the texture that holds it.
+impl Pack {
+    /// Where a source value stops. Apart from normals, BC4 and BC5 hold weights, and a float
+    /// weight has no upper limit: a source texel clamps before its factor, as a constant does. A
+    /// float weight's remap can reach below 0 where no format of 0..1 would store it, and a
+    /// negative weight has no IOR.
+    fn limit(&self) -> Option<f32> {
+        match self.encoding {
+            Encoding::Bc4 | Encoding::Bc5 if !self.normal => Some(1.0),
+            Encoding::Raw(DataFormat::R16f) => Some(f32::INFINITY),
+            _ => None,
+        }
+    }
+
+    /// What the texture reads past 0..1 per packed channel, as its texels sample: filtered
+    /// values stay in the format's range, and a normal is stored x and y.
+    fn outside(&self) -> [f32; 4] {
+        let limit = self.limit();
+        let mut v = [0.0; 4];
+        for (o, c) in v.iter_mut().zip(&self.channels) {
+            let Outside { value, a, b } = c.outside;
+            *o = stored(value, a, b, limit);
+        }
+        if self.normal {
+            let [x, y, ..] = normalized(v);
+            return [normal::encode(x), normal::encode(y), 0.0, 0.0];
+        }
+        let (lo, hi) = self.encoding.range();
+        v.map(|c| settled(c, lo, hi))
+    }
+}
+
+/// A planned texture, per packed channel the channel of the texture that holds it, what it
+/// reads past 0..1 and how it gets there.
 #[derive(Copy, Clone, Debug)]
 struct Made {
     id: AssetId,
     channels: [u8; 4],
+    wrap: [Wrap; 2],
+    outside: [f32; 4],
 }
 
 /// Binds slot `s` to packed channel `channel` of `t`, sampled as `r` is.
 fn bind(m: &mut Material, s: usize, t: Made, channel: usize, r: &TexRef) {
+    let mut outside = [0.0; 4];
+    if t.wrap.contains(&Wrap::Constant) {
+        outside[..4 - channel].copy_from_slice(&t.outside[channel..]);
+    }
     m.textures[s] = TextureBinding {
         texture: t.id,
         channels: t.channels[channel],
         uv_set: r.uv_set,
-        _pad: [0; 2],
+        wrap: t.wrap.map(Wrap::binding),
+        filter: r.filter,
+        _pad: [0; 3],
+        outside,
     };
     m.uv_transforms[s] = r.uv;
 }
@@ -589,11 +729,15 @@ impl<'a> Packer<'a> {
         a: f32,
         b: f32,
     ) -> Channel {
-        match self.read(r, c) {
+        let texels = match self.read(r, c) {
             Ok(held) if c == 3 => r.source(axis, held, Read::of(Decode::STORED), a, b),
             Ok(held) => r.source(axis, held, read, a, b),
-            Err(v) => Channel::Constant(a + b * r.read(axis, v)),
-        }
+            Err(v) => Texels::Constant(a + b * r.read(axis, v)),
+        };
+        let [a, b] = r.through(axis, a, b);
+        let value = r.outside[c];
+        let outside = Outside { value, a, b };
+        Channel { texels, outside }
     }
 
     /// [`Self::read_source`] of an input that isn't a color.
@@ -612,8 +756,12 @@ impl<'a> Packer<'a> {
         }
     }
 
-    /// The stored value of channel `c` of `r` if every texel lies within 1/255 of one value.
+    /// The stored value of channel `c` of `r` if every texel lies within 1/255 of one value, and
+    /// nothing else reads past them.
     fn stored_constant(&self, r: &TexRef, c: usize) -> Option<f32> {
+        if r.bounded() {
+            return None;
+        }
         match self.read(r, c) {
             Ok(c) => self.image(r.image).constant[c],
             Err(v) => Some(v),
@@ -635,12 +783,16 @@ impl<'a> Packer<'a> {
     }
 
     /// Whether emission or specular weight `r` can read past 1: USD and MaterialX range them over
-    /// 0 and up, where glTF's stop at 1, and a float image or a remap past it reaches there. A
-    /// color's remap stops at 1, short of rounding, with its field holding the rest.
+    /// 0 and up, where glTF's stop at 1, and a float image, a remap past it or a value stated past
+    /// the edges reaches there. A color's remap stops at 1, short of rounding, with its field
+    /// holding the rest.
     fn past_one(&self, r: &TexRef) -> bool {
         let reaches = |[a, b]: [f32; 2]| a.max(a + b) > 1.0 + 1e-6;
+        let outside = r.wrap.contains(&Wrap::Constant)
+            && (0..3).any(|c| r.read(c, r.outside[c]) > 1.0 + 1e-6);
         r.rules != ImageRules::Gltf
             && (self.image(r.image).float
+                || outside
                 || r.remap.is_some_and(|m| m.into_iter().any(reaches))
                 || self.decode(r).value(1.0) > 1.0 + 1e-6)
     }
@@ -756,6 +908,13 @@ impl<'a> Packer<'a> {
         m: &mut Material,
         t: &MaterialTextures,
     ) -> Result<()> {
+        let mut read = t.clone();
+        for r in read.refs_mut() {
+            if let Some(wrap) = self.image(r.image).wrap {
+                r.wrap = std::array::from_fn(|a| if r.file_wrap[a] { wrap[a] } else { r.wrap[a] });
+            }
+        }
+        let t = &read;
         let remap = |r: Option<TexRef>, input| r.map(|r| self.channel_of(r, input)).transpose();
         let t = &MaterialTextures {
             opacity: remap(t.opacity, |c| c.opacity)?,
@@ -832,14 +991,20 @@ impl<'a> Packer<'a> {
                             channel(0, scale[0]),
                             channel(1, scale[1]),
                             if source.rg {
-                                Channel::NormalZ {
-                                    image: r.image,
-                                    source,
+                                Channel {
+                                    texels: Texels::NormalZ {
+                                        image: r.image,
+                                        source,
+                                    },
+                                    outside: Outside::of(normal::z(
+                                        r.read(0, r.outside[0]),
+                                        r.read(1, r.outside[1]),
+                                    )),
                                 }
                             } else {
                                 channel(2, 1.0)
                             },
-                            Channel::Constant(1.0),
+                            Channel::constant(1.0),
                         ],
                         refs: vec![*r],
                         coverage: None,
@@ -871,7 +1036,7 @@ impl<'a> Packer<'a> {
         let occ_varies = occ.as_ref().is_some_and(|o| o.2.is_none());
         let rough_channel = |m: &Material| match (&rough, rough_const) {
             (Some(r), None) => self.source(r, 0, usize::from(r.channel), 0.0, m.specular_roughness),
-            (_, c) => Channel::Constant(m.specular_roughness * c.unwrap_or(1.0)),
+            (_, c) => Channel::constant(m.specular_roughness * c.unwrap_or(1.0)),
         };
         if !rough_varies {
             m.specular_roughness *= rough_const.unwrap_or(1.0);
@@ -893,7 +1058,7 @@ impl<'a> Packer<'a> {
         if metal_varies {
             let r = metal.expect("varying metalness has an image");
             let entry = (slot::METALNESS, metal_channel(m, &r));
-            let alike = |a: &TexRef| a.samples_like(&r) && a.wrap == r.wrap;
+            let alike = |a: &TexRef| a.samples_like(&r) && a.filter == r.filter;
             match packs.first_mut() {
                 Some((channels, refs)) if alike(&refs[0]) => channels.push(entry),
                 _ => packs.push((vec![entry], vec![r])),
@@ -906,7 +1071,7 @@ impl<'a> Packer<'a> {
                 _ => (Encoding::Bc5, "roughness_metalness"),
             };
             let mut channels: Vec<Channel> = rm.iter().map(|c| c.1.clone()).collect();
-            channels.resize(4, Channel::Constant(0.0));
+            channels.resize(4, Channel::constant(0.0));
             // Toksvig pairs roughness and normal texels, so both must sample alike.
             let toksvig = match (&normal_packed, rm[0].0 == slot::ROUGHNESS) {
                 (Some((r, s, n)), true) if refs[0].samples_like(r) => Some((0, *r, *s, *n)),
@@ -1006,6 +1171,11 @@ impl<'a> Packer<'a> {
                 (lo, hi) if (hi - lo).is_finite() => (lo, hi),
                 _ => (0.0, 1.0),
             };
+            let (lo, hi) = if r.bounded() {
+                (lo.min(r.outside[channel]), hi.max(r.outside[channel]))
+            } else {
+                (lo, hi)
+            };
             let span = hi - lo;
             // A constant image stores 0, and the offset holds its height.
             let b = if span.recip().is_finite() {
@@ -1077,9 +1247,9 @@ impl<'a> Packer<'a> {
         alpha_free: bool,
     ) -> Result<()> {
         let fourth = if alpha_free {
-            Channel::Unused
+            Channel::UNUSED
         } else {
-            Channel::Constant(1.0)
+            Channel::constant(1.0)
         };
         let (role, color): (_, fn(&mut Material) -> &mut [f32; 3]) = match s {
             slot::BASE_COLOR => ("base_color", |m| &mut m.base_color),
@@ -1122,7 +1292,19 @@ impl<'a> Packer<'a> {
             };
             return Ok(());
         }
-        let image = |c| self.read_source(r, c, c, read.clone(), 0.0, 1.0);
+        // Texels read in their texture's primaries, and a slot's value past 0..1 with them.
+        let outside = match primaries {
+            Primaries::Rec709 => r.outside,
+            p => {
+                let [x, y, z, w] = r.outside;
+                let rgb =
+                    RgbPrimaries::REC709.matrix_to(p.rgb()) * DVec3::from([x, y, z].map(f64::from));
+                let [x, y, z] = rgb.as_vec3().to_array();
+                [x, y, z, w]
+            }
+        };
+        let texture = TexRef { outside, ..*r };
+        let image = |c| self.read_source(&texture, c, c, read.clone(), 0.0, 1.0);
         let id = self.make(
             suffix,
             Pack {
@@ -1196,8 +1378,8 @@ impl<'a> Packer<'a> {
         let mut image = None;
         let mut channels = [0u8, 1, 2, 3];
         for (c, ch) in p.channels.iter().take(count).enumerate() {
-            match ch {
-                Channel::Image {
+            match &ch.texels {
+                Texels::Image {
                     image: i,
                     channel,
                     read,
@@ -1220,16 +1402,16 @@ impl<'a> Packer<'a> {
                     }
                     channels[c] = *channel as u8;
                 }
-                Channel::Unused => {}
+                Texels::Unused => {}
                 // A color texture's alpha of 1 holds where the source's is 1.
-                Channel::Constant(v) if p.encoding == Encoding::Bc7Srgb && c == 3 => {
+                Texels::Constant(v) if p.encoding == Encoding::Bc7Srgb && c == 3 => {
                     let opaque = self.image(image?).constant[3]
                         .is_some_and(|a| (a - 1.0).abs() <= 1.0 / 255.0);
                     if *v != 1.0 || !opaque {
                         return None;
                     }
                 }
-                Channel::Constant(_) | Channel::NormalZ { .. } => return None,
+                Texels::Constant(_) | Texels::NormalZ { .. } => return None,
             }
         }
         let i = image?;
@@ -1286,9 +1468,9 @@ impl<'a> Packer<'a> {
         let mut images: Vec<usize> = p
             .channels
             .iter()
-            .filter_map(|c| match c {
-                Channel::Image { image, .. } | Channel::NormalZ { image, .. } => Some(*image),
-                Channel::Constant(_) | Channel::Unused => None,
+            .filter_map(|c| match c.texels {
+                Texels::Image { image, .. } | Texels::NormalZ { image, .. } => Some(image),
+                Texels::Constant(_) | Texels::Unused => None,
             })
             .collect();
         images.sort_unstable();
@@ -1340,17 +1522,27 @@ impl<'a> Packer<'a> {
         let pass = self
             .passes(&p, size, grid, skipped, source_mips)
             .filter(|_| gamut.is_none());
+        // A hardware border reads transparent black, whatever else a slot of this texture reads
+        // past 0..1 takes the shader's check.
+        let outside = p.outside();
+        if outside != [0.0; 4] {
+            let wrap = &mut p.refs[0].wrap;
+            *wrap = wrap.map(|w| if w == Wrap::Border { Wrap::Constant } else { w });
+        }
+        let wrap = p.refs[0].wrap;
+        // Constant's texels and mips are Clamp's, and what it reads past them is the binding's.
+        let mip_wrap = wrap.map(|w| if w == Wrap::Constant { Wrap::Clamp } else { w });
 
         // A rebuilt z reads the remap alone, which a normal's channels hold times the scale.
         let mut recipe = format!(
             "{} {:?} {:?} {:?} {:?} {:?} {:?} {max_size:?} {grid:?} {primaries:?} {gamut:?} {bc_split:?} {:?} {:?} {:?} {source_mips}",
             p.role,
             p.encoding,
-            p.channels,
+            p.channels.iter().map(|c| &c.texels).collect::<Vec<_>>(),
             p.coverage,
             p.toksvig.as_ref().map(|t| (t.0, t.1.image, t.1.remap, t.2, t.3)),
             p.normal.then_some(p.refs[0].remap),
-            p.refs[0].wrap,
+            mip_wrap,
             self.rules.filter,
             size,
             pass,
@@ -1361,8 +1553,14 @@ impl<'a> Packer<'a> {
         }
         let same = Hash32::of(&recipe);
         let channels = pass.map_or([0, 1, 2, 3], |p| p.1);
+        let made = |id| Made {
+            id,
+            channels,
+            wrap,
+            outside,
+        };
         if let Some(id) = self.made.get(&same) {
-            return Ok(Made { id: *id, channels });
+            return Ok(made(*id));
         }
         let name = match suffix {
             "" => format!("{}/texture/{}", self.asset, p.role),
@@ -1393,7 +1591,7 @@ impl<'a> Packer<'a> {
             pass: pass.map(|p| p.0),
             source_mips,
         });
-        Ok(Made { id, channels })
+        Ok(made(id))
     }
 }
 
@@ -1619,30 +1817,23 @@ impl TextureJob {
 
     /// The packed texture of `decoded` source images, each `w` x `h`.
     fn pack(&self, decoded: &HashMap<usize, Arc<Img>>, [w, h]: [u32; 2]) -> Img {
-        // Apart from normals, BC4 and BC5 hold weights, and a float weight has no upper limit: a
-        // source texel clamps before its factor, as a constant does. A float weight's remap can
-        // reach below 0 where no format of 0..1 would store it, and a negative weight has no IOR.
-        let limit = match self.pack.encoding {
-            Encoding::Bc4 | Encoding::Bc5 if !self.pack.normal => Some(1.0),
-            Encoding::Raw(DataFormat::R16f) => Some(f32::INFINITY),
-            _ => None,
-        };
+        let limit = self.pack.limit();
         let mut img = Img::new(w, h);
         // One ICC transform gives all three channels of a texel.
         let mut profiled: HashMap<usize, Vec<[f32; 4]>> = HashMap::new();
-        let stored = Read::of(Decode::STORED);
+        let as_stored = Read::of(Decode::STORED);
         for (c, ch) in self.pack.channels.iter().enumerate() {
-            match ch {
-                &Channel::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
-                Channel::Unused => img.px.par_iter_mut().for_each(|t| t[c] = 1.0),
-                &Channel::NormalZ { image, source } => {
+            match &ch.texels {
+                &Texels::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
+                Texels::Unused => img.px.par_iter_mut().for_each(|t| t[c] = 1.0),
+                &Texels::NormalZ { image, source } => {
                     let r = self.pack.refs[0];
                     img.px
                         .par_iter_mut()
                         .zip(&decoded[&image].px)
                         .for_each(|(t, s)| t[c] = r.normal(source, *s)[2]);
                 }
-                Channel::Image {
+                Texels::Image {
                     image,
                     channel,
                     read,
@@ -1654,18 +1845,12 @@ impl TextureJob {
                         let texels = profiled.entry(*image).or_insert_with(|| {
                             source.par_iter().map(|s| read.color(*s, None)).collect()
                         });
-                        (&*texels, &stored)
+                        (&*texels, &as_stored)
                     } else {
                         (source, read)
                     };
                     img.px.par_iter_mut().zip(texels).for_each(|(t, s)| {
-                        let v = read.value(*s, *channel);
-                        let read = a + b * limit.map_or(v, |l| v.clamp(0.0, l));
-                        t[c] = if limit == Some(f32::INFINITY) {
-                            read.max(0.0)
-                        } else {
-                            read
-                        };
+                        t[c] = stored(read.value(*s, *channel), *a, *b, limit);
                     });
                 }
             }

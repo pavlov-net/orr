@@ -7,14 +7,15 @@ use std::sync::Arc;
 use crate::texture::Wrap;
 use rayon::prelude::*;
 
-/// One mip of one channel, row-major, with the sampler's edge modes and the material
-/// slot's uv transform (`Material::uv_transforms` form).
+/// One mip of one channel, row-major, with the sampler's edge modes, the material slot's uv
+/// transform (`Material::uv_transforms` form) and what it reads past 0..1 on a bounded axis.
 pub(crate) struct Raster {
     pub(crate) w: u32,
     pub(crate) h: u32,
     pub(crate) texels: Arc<Vec<f32>>,
     pub(crate) wrap: [Wrap; 2],
     pub(crate) uv: [f32; 6],
+    pub(crate) outside: f32,
 }
 
 /// The side of the opacity cutoff a texel is on: at or over it.
@@ -26,6 +27,7 @@ pub(super) const FAIL: u8 = 2;
 /// `x` up to the row's width.
 pub(crate) struct Passes {
     prefix: Vec<u16>,
+    cutoff: f32,
 }
 
 impl Passes {
@@ -46,7 +48,7 @@ impl Passes {
                     *o = n;
                 }
             });
-        Self { prefix }
+        Self { prefix, cutoff }
     }
 
     /// Which sides of the cutoff the texels `mip.footprint(uv)` visits are on, as `PASS`
@@ -54,13 +56,21 @@ impl Passes {
     pub(super) fn footprint(&self, mip: &Raster, uv: [[f32; 2]; 3], stop: u8) -> u8 {
         let mut sides = 0;
         let stride = mip.w as usize + 1;
-        mip.footprint_runs(uv, |y, first, last| {
-            let row = &self.prefix[wrapped(y, mip.h, mip.wrap[1]) * stride..];
-            wrapped_runs(first, last, mip.w, mip.wrap[0], |a, b| {
-                let pass = usize::from(row[b + 1] - row[a]);
-                sides |= if pass > 0 { PASS } else { 0 } | if pass <= b - a { FAIL } else { 0 };
-                sides & stop != stop
-            })
+        let outside = if mip.outside >= self.cutoff {
+            PASS
+        } else {
+            FAIL
+        };
+        mip.wrapped_footprint(uv, &mut |run| {
+            sides |= match run {
+                Some((y, a, b)) => {
+                    let row = &self.prefix[y * stride..];
+                    let pass = usize::from(row[b + 1] - row[a]);
+                    (if pass > 0 { PASS } else { 0 }) | (if pass <= b - a { FAIL } else { 0 })
+                }
+                None => outside,
+            };
+            sides & stop != stop
         });
         sides
     }
@@ -111,12 +121,12 @@ fn narrow((a, b): (i64, i64), guess: f64, keep: impl Fn(i64) -> bool) -> Option<
     }
 }
 
-/// Index `v` of an axis of `n` texels under `wrap`.
+/// Index `v` of an axis of `n` texels under `wrap`; the nearest texel past a bounded edge.
 fn wrapped(v: i64, n: u32, wrap: Wrap) -> usize {
     let n = i64::from(n);
     (match wrap {
         Wrap::Repeat => v.rem_euclid(n),
-        Wrap::Clamp => v.clamp(0, n - 1),
+        Wrap::Clamp | Wrap::Border | Wrap::Constant => v.clamp(0, n - 1),
         Wrap::Mirror => {
             let m = v.rem_euclid(2 * n);
             if m < n { m } else { 2 * n - 1 - m }
@@ -187,21 +197,54 @@ impl Raster {
     }
 
     fn texel(&self, x: i64, y: i64) -> f32 {
+        let past =
+            |v: i64, n: u32, wrap: Wrap| wrap == Wrap::Border && !(0..i64::from(n)).contains(&v);
+        if past(x, self.w, self.wrap[0]) || past(y, self.h, self.wrap[1]) {
+            return self.outside;
+        }
         let x = wrapped(x, self.w, self.wrap[0]);
         let y = wrapped(y, self.h, self.wrap[1]);
         self.texels[y * self.w as usize + x]
     }
 
     /// Calls `f` with every texel a bilinear sample anywhere on the triangle can read: the
-    /// texels whose squares, grown by one texel on each side, overlap the triangle. Stops when
-    /// `f` returns false. A triangle spanning more than two texture periods visits every
-    /// texel.
+    /// texels whose squares, grown by one texel on each side, overlap the triangle, and
+    /// [`Self::outside`] where one lies past a bounded edge. Stops when `f` returns false. A
+    /// triangle spanning more than two texture periods visits every texel.
     pub(super) fn footprint(&self, uv: [[f32; 2]; 3], mut f: impl FnMut(f32) -> bool) {
         let w = self.w as usize;
+        self.wrapped_footprint(uv, &mut |run| match run {
+            Some((y, a, b)) => self.texels[y * w..][a..=b].iter().all(|&t| f(t)),
+            None => f(self.outside),
+        });
+    }
+
+    /// Calls `f` with the runs of texels [`Self::footprint`] visits, each as its row and first
+    /// and last texel, and with `None` for each row that lies, in part, past a bounded edge.
+    /// Stops when `f` returns false.
+    fn wrapped_footprint(
+        &self,
+        uv: [[f32; 2]; 3],
+        f: &mut impl FnMut(Option<(usize, usize, usize)>) -> bool,
+    ) {
+        let (w, h) = (i64::from(self.w), i64::from(self.h));
         self.footprint_runs(uv, |y, first, last| {
-            let row = &self.texels[wrapped(y, self.h, self.wrap[1]) * w..][..w];
+            let bounded_x = self.wrap[0].bounded();
+            let past_y = self.wrap[1].bounded() && !(0..h).contains(&y);
+            if (past_y || bounded_x && (first < 0 || last >= w)) && !f(None) {
+                return false;
+            }
+            let (first, last) = if bounded_x {
+                (first.max(0), last.min(w - 1))
+            } else {
+                (first, last)
+            };
+            if past_y || first > last {
+                return true;
+            }
+            let row = wrapped(y, self.h, self.wrap[1]);
             wrapped_runs(first, last, self.w, self.wrap[0], |a, b| {
-                row[a..=b].iter().all(|&t| f(t))
+                f(Some((row, a, b)))
             })
         });
     }
@@ -214,7 +257,8 @@ impl Raster {
         let p = uv.map(|t| self.texel_pos(t));
         let (lo, hi) = bounds(&p);
         if (0..2).any(|a| hi[a] - lo[a] > 2.0 * size[a]) {
-            (0..i64::from(self.h)).all(|y| f(y, 0, i64::from(self.w) - 1));
+            let [gx, gy] = self.wrap.map(|w| i64::from(w.bounded()));
+            (-gy..i64::from(self.h) + gy).all(|y| f(y, -gx, i64::from(self.w) - 1 + gx));
             return;
         }
         // Each edge's outward normal, as n.x x + n.y y + d > 0 outside; degenerate edges
@@ -279,27 +323,33 @@ impl Raster {
     }
 
     /// Per axis, the texel indices that hold every texel [`Self::footprint`] visits for `uv`,
-    /// as one or two inclusive ranges; `None` for coordinates that are not finite.
+    /// as one or two inclusive ranges; `None` for coordinates that are not finite, and for a
+    /// footprint that may reach past a bounded edge, which no texels hold.
     pub(super) fn footprint_ranges(&self, uv: [[f32; 2]; 3]) -> Option<[Ranges; 2]> {
         let (lo, hi) = bounds(&uv.map(|t| self.texel_pos(t)));
         if !(lo.iter().chain(&hi).all(|c| c.is_finite())) {
             return None;
         }
         let size = [self.w, self.h];
+        let bounded = self.wrap.map(Wrap::bounded);
         if (0..2).any(|a| hi[a] - lo[a] > 2.0 * f64::from(size[a])) {
-            return Some(size.map(Ranges::all));
+            return (bounded == [false; 2]).then(|| size.map(Ranges::all));
         }
-        Some([0, 1].map(|a| {
-            let (first, last) = (lo[a].floor() as i64 - 2, hi[a].floor() as i64 + 2);
-            self.wrapped_range(first, last, size[a], self.wrap[a])
-        }))
+        let span = [0, 1].map(|a| (lo[a].floor() as i64 - 2, hi[a].floor() as i64 + 2));
+        let past = |a: usize| span[a].0 < 0 || span[a].1 >= i64::from(size[a]);
+        if (0..2).any(|a| bounded[a] && past(a)) {
+            return None;
+        }
+        Some([0, 1].map(|a| self.wrapped_range(span[a].0, span[a].1, size[a], self.wrap[a])))
     }
 
     /// The indices `first..=last` wrap to.
     fn wrapped_range(&self, first: i64, last: i64, n: u32, wrap: Wrap) -> Ranges {
         let len = i64::from(n);
         match wrap {
-            Wrap::Clamp => Ranges([[wrapped(first, n, wrap), wrapped(last, n, wrap)], [1, 0]]),
+            Wrap::Clamp | Wrap::Border | Wrap::Constant => {
+                Ranges([[wrapped(first, n, wrap), wrapped(last, n, wrap)], [1, 0]])
+            }
             _ if last - first + 1 >= len => Ranges::all(n),
             Wrap::Repeat => {
                 let a = first.rem_euclid(len);
@@ -318,8 +368,13 @@ impl Raster {
         }
     }
 
-    /// Bilinear sample at `uv`, texel centers at half-integers.
+    /// Bilinear sample at `uv`, texel centers at half-integers, as `material_texture` reads it.
     pub(super) fn sample(&self, uv: [f32; 2]) -> f32 {
+        let at = self.mapped(uv);
+        let past = |a: usize| self.wrap[a] == Wrap::Constant && !(0.0..=1.0).contains(&at[a]);
+        if past(0) || past(1) {
+            return self.outside;
+        }
         let [x, y] = self.texel_pos(uv).map(|c| c - 0.5);
         let (x0, y0) = (x.floor(), y.floor());
         let (fx, fy) = ((x - x0) as f32, (y - y0) as f32);
@@ -420,7 +475,8 @@ impl Displacement {
         let magnitude = self.scale.abs() + self.offset.abs() + self.min.abs() + self.max.abs();
         let slack = 4.0 * f32::EPSILON * magnitude;
         for (i, m) in self.mips.iter().enumerate() {
-            for &t in m.texels.iter() {
+            let past = m.wrap.iter().any(|w| w.bounded()).then_some(&m.outside);
+            for &t in m.texels.iter().chain(past) {
                 let d = self.scale * t + self.offset;
                 if d < self.min - slack || d > self.max + slack {
                     return Err(format!(
@@ -456,12 +512,62 @@ mod tests {
                         texels,
                         wrap: [Wrap::Repeat; 2],
                         uv: [0.0; 6],
+                        outside: 0.0,
                     }],
                     uv_set: 0,
                 };
                 d.check_range().unwrap();
             }
         }
+    }
+
+    /// Texels at or over 0.5 everywhere, past edges that read 0.
+    fn passing(wrap: Wrap) -> Raster {
+        Raster {
+            w: 8,
+            h: 8,
+            texels: Arc::new(vec![1.0; 64]),
+            wrap: [wrap, Wrap::Repeat],
+            uv: [0.0; 6],
+            outside: 0.0,
+        }
+    }
+
+    /// `material_opacity` reads the outside value past the edge, so a triangle reaching there
+    /// is not opaque, one inside is, and a triangle spanning periods reaches it too.
+    #[test]
+    fn footprints_past_a_bounded_edge_see_what_reads_there() {
+        let inside = [[0.4, 0.4], [0.6, 0.4], [0.4, 0.6]];
+        let crossing = [[0.9, 0.4], [1.2, 0.4], [0.9, 0.6]];
+        let beyond = [[1.5, 0.4], [1.7, 0.4], [1.5, 0.6]];
+        let wide = [[-3.0, 0.1], [3.0, 0.1], [0.0, 0.3]];
+        for wrap in [Wrap::Border, Wrap::Constant] {
+            let r = passing(wrap);
+            let passes = Passes::new(&r, 0.5);
+            let sides = |uv| passes.footprint(&r, uv, PASS | FAIL);
+            assert_eq!(sides(inside), PASS, "{wrap:?}");
+            assert_eq!(sides(crossing), PASS | FAIL, "{wrap:?}");
+            assert_eq!(sides(beyond), FAIL, "{wrap:?}");
+            assert_eq!(sides(wide), PASS | FAIL, "{wrap:?}");
+            assert!(r.footprint_ranges(inside).is_some(), "{wrap:?}");
+            assert!(r.footprint_ranges(crossing).is_none(), "{wrap:?}");
+            assert!(r.footprint_ranges(wide).is_none(), "{wrap:?}");
+        }
+        let r = passing(Wrap::Clamp);
+        let passes = Passes::new(&r, 0.5);
+        assert_eq!(passes.footprint(&r, crossing, PASS | FAIL), PASS);
+    }
+
+    /// A border filters in with the edge texels; a constant holds the edge texel up to the edge.
+    #[test]
+    fn samples_past_an_edge_read_as_the_runtime_does() {
+        let edge = [1.0, 0.5];
+        let border = passing(Wrap::Border);
+        assert_eq!(border.sample([1.5, 0.5]), 0.0);
+        assert_eq!(border.sample(edge), 0.5);
+        let constant = passing(Wrap::Constant);
+        assert_eq!(constant.sample(edge), 1.0);
+        assert_eq!(constant.sample([1.001, 0.5]), 0.0);
     }
 
     #[test]
@@ -523,6 +629,7 @@ mod tests {
                 texels: Arc::new(texels.clone()),
                 wrap,
                 uv: [0.0; 6],
+                outside: 0.0,
             };
             let passes = Passes::new(&raster, 0.5);
             // Coincident corners, axis-aligned edges, corners on texel corners, a span of

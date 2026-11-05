@@ -22,8 +22,8 @@ use image::codecs::webp::WebPDecoder;
 use orr_pack::texture::{FormatInfo, full_mip_count, mip_size, vk};
 use rayon::prelude::*;
 
-use super::Img;
 use super::color::{self, FileColor, Gamut, ImageColor, Transfer};
+use super::{Img, Wrap};
 
 /// What a file of one channel, or of gray and alpha, holds.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -72,6 +72,31 @@ impl Blocks {
     pub(super) fn complete(&self) -> bool {
         self.levels[0].len() as u32 == full_mip_count(self.w, self.h)
     }
+}
+
+/// What the `wrapmodes` attribute of an OpenEXR file says it reads past 0..1, per axis: one
+/// keyword for both, or two separated by a comma.
+pub(super) fn exr_wrap(bytes: &[u8]) -> Option<[Wrap; 2]> {
+    if !bytes.starts_with(&exr::meta::magic_number::BYTES) {
+        return None;
+    }
+    let meta = exr::meta::MetaData::read_from_buffered(Cursor::new(bytes), false).ok()?;
+    let modes = meta
+        .headers
+        .first()?
+        .own_attributes
+        .wrap_mode_name
+        .as_ref()?;
+    let mode = |m: &str| match m.trim() {
+        "black" => Some(Wrap::Border),
+        "clamp" => Some(Wrap::Clamp),
+        "periodic" => Some(Wrap::Repeat),
+        "mirror" => Some(Wrap::Mirror),
+        _ => None,
+    };
+    let modes = modes.to_string();
+    let (u, v) = modes.split_once(',').unwrap_or((&modes, &modes));
+    Some([mode(u)?, mode(v)?])
 }
 
 /// Decodes an image file, recognized by its first bytes.

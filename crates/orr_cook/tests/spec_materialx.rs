@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use orr_cook::{ArchiveSpec, AssetSpec, CookReport, Manifest, Source, TextureRules};
-use orr_pack::material::{Material, slot};
+use orr_pack::material::{Material, filter, slot, wrap};
 use orr_pack::{Archive, AssetId, Target};
 
 fn png(f: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
@@ -271,6 +271,86 @@ fn documents_map_as_the_clauses_say() {
                 <dot name="d" type="color3"><input name="in" type="color3" nodename="i"/></dot>"#,
             inputs: r#"<input name="base_color" type="color3" nodename="d"/>"#,
             check: |m| bound(m, slot::BASE_COLOR),
+        },
+        Row {
+            clause: "Nodes image: uaddressmode and vaddressmode periodic, clamp and mirror",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="uaddressmode" type="string" value="clamp"/>
+                  <input name="vaddressmode" type="string" value="mirror"/></image>"#,
+            inputs: BASE_I,
+            check: |m| m.textures[slot::BASE_COLOR].wrap == [wrap::CLAMP, wrap::MIRROR],
+        },
+        Row {
+            clause: "Nodes image: address modes default to periodic",
+            body: COLOR,
+            inputs: BASE_I,
+            check: |m| m.textures[slot::BASE_COLOR].wrap == [wrap::REPEAT; 2],
+        },
+        Row {
+            clause: "Nodes image, constant: outside 0-1 reads the node's default",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="default" type="color3" value="0.25, 0.5, 0.75"/>
+                  <input name="uaddressmode" type="string" value="constant"/></image>"#,
+            inputs: BASE_I,
+            check: |m| {
+                let b = m.textures[slot::BASE_COLOR];
+                b.wrap == [wrap::CONSTANT, wrap::REPEAT] && b.outside == [0.25, 0.5, 0.75, 0.0]
+            },
+        },
+        Row {
+            clause: "Nodes image, constant: default is 0 in all channels when not defined",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="vaddressmode" type="string" value="constant"/></image>"#,
+            inputs: BASE_I,
+            check: |m| {
+                let b = m.textures[slot::BASE_COLOR];
+                b.wrap == [wrap::REPEAT, wrap::CONSTANT] && b.outside == [0.0; 4]
+            },
+        },
+        Row {
+            clause: "Nodes image, constant: a float default reads through its own input",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="default" type="float" value="0.75"/>
+                  <input name="uaddressmode" type="string" value="constant"/>
+                  <input name="vaddressmode" type="string" value="constant"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| {
+                let b = m.textures[slot::ROUGHNESS];
+                b.wrap == [wrap::CONSTANT; 2] && close(b.outside[0], 0.75)
+            },
+        },
+        Row {
+            clause: "Nodes image, constant: a default reads past what the image's texels reach",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="default" type="float" value="1.5"/>
+                  <input name="uaddressmode" type="string" value="constant"/></image>"#,
+            inputs: r#"<input name="specular_weight" type="float" nodename="i"/>"#,
+            check: |m| close(m.textures[slot::SPECULAR_WEIGHT].outside[0], 1.5),
+        },
+        Row {
+            clause: "Nodes image, constant: an image of one value isn't one past its edges",
+            body: r#"<image name="i" type="vector3">
+                  <input name="file" type="filename" value="flat.png"/>
+                  <input name="default" type="vector3" value="1, 1, 1"/>
+                  <input name="uaddressmode" type="string" value="constant"/></image>"#,
+            inputs: r#"<input name="base_color" type="color3" nodename="i"/>"#,
+            check: |m| bound(m, slot::BASE_COLOR),
+        },
+        Row {
+            clause: "Nodes image: filtertype closest is one texel",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="filtertype" type="string" value="closest"/></image>"#,
+            inputs: BASE_I,
+            check: |m| {
+                m.textures[slot::BASE_COLOR].filter
+                    == filter::MAG_NEAREST | filter::MIN_NEAREST | filter::MIP_NEAREST
+            },
         },
         Row {
             clause: "Spec Geometric Properties: UV0 is uv set 0",

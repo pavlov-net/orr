@@ -27,8 +27,8 @@
 //! ratified glTF source and come from `MaterialPatch`.
 
 use gltf::material::AlphaMode;
-use gltf::texture::WrappingMode;
-use orr_pack::material::Material;
+use gltf::texture::{MagFilter, MinFilter, WrappingMode};
+use orr_pack::material::{Material, filter};
 use serde_json::Value;
 
 use crate::texture::Wrap;
@@ -205,6 +205,19 @@ pub(super) fn textures(
             WrappingMode::MirroredRepeat => Wrap::Mirror,
         };
         let s = t.sampler();
+        // An unset filter is the renderer's to choose: linear.
+        let mag = match s.mag_filter() {
+            Some(MagFilter::Nearest) => filter::MAG_NEAREST,
+            _ => 0,
+        };
+        let min = match s.min_filter() {
+            Some(MinFilter::Nearest) => filter::MIN_NEAREST | filter::MIP_NEAREST | filter::ONE_MIP,
+            Some(MinFilter::Linear) => filter::MIP_NEAREST | filter::ONE_MIP,
+            Some(MinFilter::NearestMipmapNearest) => filter::MIN_NEAREST | filter::MIP_NEAREST,
+            Some(MinFilter::LinearMipmapNearest) => filter::MIP_NEAREST,
+            Some(MinFilter::NearestMipmapLinear) => filter::MIN_NEAREST,
+            Some(MinFilter::LinearMipmapLinear) | None => 0,
+        };
         Ok(TexRef {
             image: t.source().index(),
             rules: ImageRules::Gltf,
@@ -212,6 +225,9 @@ pub(super) fn textures(
             uv_set: coord as u8,
             wrap: [wrap(s.wrap_s()), wrap(s.wrap_t())],
             color: ImageColor::Data,
+            file_wrap: [false; 2],
+            filter: mag | min,
+            outside: [0.0; 4],
             rg_channel: None,
             uv,
             remap: None,

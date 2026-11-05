@@ -58,7 +58,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 
 use orr_math::{Affine2, Vec2};
-use orr_pack::material::Material;
+use orr_pack::material::{Material, filter};
 
 use crate::texture::Wrap;
 use crate::texture::color::{ImageColor, Space};
@@ -254,6 +254,9 @@ struct Tex {
     uv_set: u8,
     wrap: [Wrap; 2],
     color: ImageColor,
+    file_wrap: [bool; 2],
+    filter: u8,
+    outside: [f32; 4],
     uv: Affine2,
     scale: [f32; 4],
     bias: [f32; 4],
@@ -276,6 +279,9 @@ impl Tex {
             uv_set: self.uv_set,
             wrap: self.wrap,
             color: self.color,
+            file_wrap: self.file_wrap,
+            filter: self.filter,
+            outside: self.outside,
             remap: None,
         }
     }
@@ -677,7 +683,8 @@ impl Mapper<'_, '_> {
         };
         let wrap = |mode: Option<&str>| match mode {
             None | Some("periodic") => Ok(Wrap::Repeat),
-            Some("clamp" | "constant") => Ok(Wrap::Clamp),
+            Some("clamp") => Ok(Wrap::Clamp),
+            Some("constant") => Ok(Wrap::Constant),
             Some("mirror") => Ok(Wrap::Mirror),
             Some(m) => Err(format!("{}: address mode {m}", node.name)),
         };
@@ -691,6 +698,19 @@ impl Mapper<'_, '_> {
             .filter(|_| is_color(&node.ty))
             .and_then(ImageColor::named)
             .unwrap_or(ImageColor::Data);
+        let outside = if wrap.contains(&Wrap::Constant) {
+            // A float default holds whichever channel of the file a slot reads.
+            match self.number(n, "default")?.unwrap_or_default()[..] {
+                [v] => [v; 4],
+                ref v => std::array::from_fn(|i| v.get(i).copied().unwrap_or(0.0)),
+            }
+        } else {
+            [0.0; 4]
+        };
+        let filter = match self.text(n, "filtertype") {
+            Some("closest") => filter::MAG_NEAREST | filter::MIN_NEAREST | filter::MIP_NEAREST,
+            _ => 0,
+        };
         let (uv_set, mut uv) = self.texcoord(n, "texcoord", (0, Affine2::IDENTITY))?;
         if node.kind == "tiledimage" {
             let tiling = self.vec2(n, "uvtiling", Vec2::ONE)?;
@@ -709,6 +729,9 @@ impl Mapper<'_, '_> {
             uv_set,
             wrap,
             color,
+            file_wrap: [false; 2],
+            filter,
+            outside,
             uv,
             scale: [1.0; 4],
             bias: [0.0; 4],
@@ -726,12 +749,15 @@ impl Mapper<'_, '_> {
             return Err(format!("{}: no file", node.name));
         };
         let wrap = |mode: Option<&str>| match mode {
-            None | Some("repeat" | "useMetadata") => Ok(Wrap::Repeat),
-            Some("clamp" | "black") => Ok(Wrap::Clamp),
+            None | Some("black" | "useMetadata") => Ok(Wrap::Border),
+            Some("repeat") => Ok(Wrap::Repeat),
+            Some("clamp") => Ok(Wrap::Clamp),
             Some("mirror") => Ok(Wrap::Mirror),
             Some(m) => Err(format!("{}: wrap mode {m}", node.name)),
         };
-        let wrap = [wrap(self.text(n, "wrapS"))?, wrap(self.text(n, "wrapT"))?];
+        let modes = [self.text(n, "wrapS"), self.text(n, "wrapT")];
+        let wrap = [wrap(modes[0])?, wrap(modes[1])?];
+        let file_wrap = modes.map(|m| matches!(m, None | Some("useMetadata")));
         let stated = match self.text(n, "sourceColorSpace") {
             Some(s @ ("sRGB" | "raw")) => Some(s),
             _ => color_space.as_deref(),
@@ -755,6 +781,9 @@ impl Mapper<'_, '_> {
             uv_set,
             wrap,
             color,
+            file_wrap,
+            filter: 0,
+            outside: [0.0; 4],
             uv,
             scale,
             bias,
@@ -771,6 +800,9 @@ impl Mapper<'_, '_> {
             uv_set: 0,
             wrap: [Wrap::Repeat; 2],
             color: ImageColor::Data,
+            file_wrap: [false; 2],
+            filter: 0,
+            outside: [0.0; 4],
             uv: Affine2::IDENTITY,
             scale: [1.0; 4],
             bias: [0.0; 4],

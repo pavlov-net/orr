@@ -8,7 +8,7 @@ pub const SCHEMA: u16 = 2;
 
 /// A texture bound to a material slot.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct TextureBinding {
     /// [`AssetId::NONE`] when the slot is unbound.
     pub texture: AssetId,
@@ -16,7 +16,35 @@ pub struct TextureBinding {
     pub channels: u8,
     /// 0 or 1.
     pub uv_set: u8,
-    pub _pad: [u8; 2],
+    /// What u and v read past 0..1, as [`wrap`] values.
+    pub wrap: [u8; 2],
+    /// [`filter`] bits.
+    pub filter: u8,
+    pub _pad: [u8; 3],
+    /// What the slot reads, from its first channel on, past 0..1 on an axis of
+    /// [`wrap::CONSTANT`], in the units its texels sample as.
+    pub outside: [f32; 4],
+}
+
+/// `TextureBinding::wrap` values.
+pub mod wrap {
+    pub const REPEAT: u8 = 0;
+    pub const CLAMP: u8 = 1;
+    pub const MIRROR: u8 = 2;
+    /// Transparent black past 0..1, filtered in with the edge texels.
+    pub const BORDER: u8 = 3;
+    /// [`TextureBinding::outside`](super::TextureBinding::outside) past 0..1, and [`CLAMP`]
+    /// within it.
+    pub const CONSTANT: u8 = 4;
+}
+
+/// `TextureBinding::filter` bits. Without any, a slot filters trilinearly and anisotropically.
+pub mod filter {
+    pub const MAG_NEAREST: u8 = 1 << 0;
+    pub const MIN_NEAREST: u8 = 1 << 1;
+    pub const MIP_NEAREST: u8 = 1 << 2;
+    /// Reads mip 0 alone, whatever the footprint; [`MIP_NEAREST`] is set with it.
+    pub const ONE_MIP: u8 = 1 << 3;
 }
 
 /// OpenPBR 1.1.1 parameters of one material, as authored: colors linear Rec.709, lengths

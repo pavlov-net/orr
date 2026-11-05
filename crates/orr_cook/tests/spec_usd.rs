@@ -1112,6 +1112,134 @@ fn gradient() -> Vec<u8> {
     png(8, 8, |x, _| [(x * 32) as u8, (x * 32) as u8, 0, 255])
 }
 
+/// The binding of `diffuseColor` reading texture `T`, with `inputs` on the texture.
+fn diffuse_binding(name: &str, inputs: &str, image: &[u8]) -> orr_pack::material::TextureBinding {
+    let body = previewed(
+        "color3f inputs:diffuseColor.connect = </M/T.outputs:rgb>",
+        &format!("{}\n{READER}", texture("T", inputs)),
+        ST,
+    );
+    material(&shaded(name, &body, image)).textures[slot::BASE_COLOR]
+}
+
+/// PS `wrapS`, `wrapT`: `black`, `clamp`, `repeat`, `mirror` and the default `useMetadata`: "If
+/// the texture contains no such metadata, then fall back to *black*".
+#[test]
+fn wrap_modes_reach_the_binding_and_metadata_falls_back_to_black() {
+    use orr_pack::material::wrap;
+    let cases = [
+        ("", [wrap::BORDER; 2]),
+        (r#"token inputs:wrapS = "useMetadata""#, [wrap::BORDER; 2]),
+        (r#"token inputs:wrapT = "black""#, [wrap::BORDER; 2]),
+        (
+            r#"token inputs:wrapS = "repeat"
+            token inputs:wrapT = "clamp""#,
+            [wrap::REPEAT, wrap::CLAMP],
+        ),
+        (
+            r#"token inputs:wrapS = "mirror"
+            token inputs:wrapT = "repeat""#,
+            [wrap::MIRROR, wrap::REPEAT],
+        ),
+    ];
+    for (i, (inputs, want)) in cases.into_iter().enumerate() {
+        let b = diffuse_binding(&format!("wrap-{i}"), inputs, &gradient());
+        assert_eq!(b.wrap, want, "{inputs:?}");
+    }
+}
+
+/// PS `wrapS`: `useMetadata` reads what the texture's metadata states, here the `wrapmodes`
+/// attribute the OpenEXR standard defines; a stated mode stands.
+#[test]
+fn use_metadata_reads_an_openexr_wrapmodes_attribute() {
+    use exr::prelude::*;
+    use orr_pack::material::wrap;
+    let attributes = LayerAttributes {
+        wrap_mode_name: Some(Text::from("periodic, mirror")),
+        ..LayerAttributes::default()
+    };
+    let layer = Layer::new(
+        (8, 8),
+        attributes,
+        Encoding::FAST_LOSSLESS,
+        SpecificChannels::rgba(|Vec2(x, _): Vec2<usize>| (x as f32 / 8.0, 0.5, 0.25, 1.0)),
+    );
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    Image::from_layer(layer)
+        .write()
+        .to_buffered(&mut bytes)
+        .unwrap();
+    let bytes = bytes.into_inner();
+
+    let b = diffuse_binding("wrap-exr", "", &bytes);
+    assert_eq!(b.wrap, [wrap::REPEAT, wrap::MIRROR]);
+    let b = diffuse_binding("wrap-exr-s", r#"token inputs:wrapS = "clamp""#, &bytes);
+    assert_eq!(b.wrap, [wrap::CLAMP, wrap::MIRROR]);
+}
+
+/// PS `black`: "transparent black (0.0, 0.0, 0.0, 0.0) outside unit square". Scale and bias
+/// follow the read, so a bias is what reads there; an image of one value is that value only
+/// inside the square, so it stays a texture; and an alpha the material doesn't read as opacity
+/// doesn't cut the surface away there.
+#[test]
+fn black_reads_transparent_black_through_the_reader() {
+    use orr_pack::material::wrap;
+    let flat = png(8, 8, |_, _| [64, 64, 64, 255]);
+    let b = diffuse_binding("black-flat", "", &flat);
+    assert_ne!(b.texture, AssetId::NONE, "the image alone is not the input");
+    assert_eq!((b.wrap, b.outside), ([wrap::BORDER; 2], [0.0; 4]));
+
+    let bias = previewed(
+        "color3f inputs:diffuseColor.connect = </M/T.outputs:rgb>",
+        &format!(
+            "{}\n{READER}",
+            texture("T", "float4 inputs:bias = (0.25, 0.5, 0.75, 0)")
+        ),
+        ST,
+    );
+    let m = material(&shaded("black-bias", &bias, &gradient()));
+    let b = m.textures[slot::BASE_COLOR];
+    assert_eq!(
+        b.wrap,
+        [wrap::CONSTANT; 2],
+        "no hardware border reads a bias"
+    );
+    // The field holds what the reader reaches past 1.
+    for (c, want) in [0.25, 0.5, 0.75].into_iter().enumerate() {
+        let got = m.base_color[c] * b.outside[c];
+        assert!((got - want).abs() < 1e-5, "channel {c}: {got}");
+    }
+
+    let rough = previewed(
+        "float inputs:roughness.connect = </M/T.outputs:r>",
+        &format!(
+            "{}\n{READER}",
+            texture(
+                "T",
+                r#"float4 inputs:scale = (-1, -1, -1, 1)
+                float4 inputs:bias = (1, 1, 1, 0)"#
+            )
+        ),
+        ST,
+    );
+    let m = material(&shaded("black-gloss", &rough, &gradient()));
+    let b = m.textures[slot::ROUGHNESS];
+    assert_eq!(b.wrap, [wrap::CONSTANT; 2]);
+    assert_eq!(b.outside[0], 1.0, "1 - t of a black texel");
+
+    let cut = previewed(
+        r#"color3f inputs:diffuseColor.connect = </M/T.outputs:rgb>
+        float inputs:opacity = 0.75
+        float inputs:opacityThreshold = 0.5"#,
+        &format!("{}\n{READER}", texture("T", "")),
+        ST,
+    );
+    let m = material(&shaded("black-opaque", &cut, &gradient()));
+    let b = m.textures[slot::BASE_COLOR];
+    assert_eq!(b.wrap, [wrap::CONSTANT; 2]);
+    assert_eq!(b.outside, [0.0, 0.0, 0.0, 1.0]);
+}
+
 /// PS defaults and parameters: `ior` "including the clearcoat if clearcoat > 0";
 /// `clearcoatRoughness` 0.01; `specularColor` (0, 0, 0): "This is the color at 0 incidence. Edge
 /// color is assumed white."
@@ -1218,9 +1346,11 @@ fn opacity_mode_picks_transmission_or_coverage() {
 /// PS `scale` and `bias`: "output = textureValue * scale + bias", on any input.
 #[test]
 fn a_texture_bias_applies_to_scalar_and_color_inputs() {
-    let gloss = "token inputs:sourceColorSpace = \"raw\"
- float4 inputs:scale = (-1, -1, -1, 1)
- float4 inputs:bias = (1, 1, 1, 0)";
+    let gloss = r#"token inputs:sourceColorSpace = "raw"
+        float4 inputs:scale = (-1, -1, -1, 1)
+        float4 inputs:bias = (1, 1, 1, 0)
+        token inputs:wrapS = "repeat"
+        token inputs:wrapT = "repeat""#;
     let body = previewed(
         "float inputs:roughness.connect = </M/T.outputs:r>",
         &format!("{}\n{READER}", texture("T", gloss)),
@@ -1245,7 +1375,7 @@ fn a_texture_bias_applies_to_scalar_and_color_inputs() {
             "{}\n{READER}",
             texture(
                 "T",
-                "token inputs:sourceColorSpace = \"raw\"\n float4 inputs:scale = (0.5, 0.5, 0.5, 1)\n float4 inputs:bias = (0.25, 0, 0.5, 0)"
+                "token inputs:sourceColorSpace = \"raw\"\n float4 inputs:scale = (0.5, 0.5, 0.5, 1)\n float4 inputs:bias = (0.25, 0, 0.5, 0)\n token inputs:wrapS = \"repeat\"\n token inputs:wrapT = \"repeat\""
             )
         ),
         ST,
@@ -1722,7 +1852,8 @@ fn a_clip_animates_the_joints_it_names() {
     assert!(q.angle_between(Quat::IDENTITY) < 1e-3);
 }
 
-/// A `UsdPreviewSurface` whose `input` of `kind` reads `output` of `tex.png` as `color_space`.
+/// A `UsdPreviewSurface` whose `input` of `kind` reads `output` of `tex.png` as `color_space`,
+/// repeating so that a flat image folds into its factor.
 fn read_through(input: &str, kind: &str, output: &str, color_space: &str) -> String {
     previewed(
         &format!("{kind} inputs:{input}.connect = </M/T.outputs:{output}>"),
@@ -1730,7 +1861,11 @@ fn read_through(input: &str, kind: &str, output: &str, color_space: &str) -> Str
             "{}\n{READER}",
             texture(
                 "T",
-                &format!("token inputs:sourceColorSpace = \"{color_space}\"")
+                &format!(
+                    "token inputs:sourceColorSpace = \"{color_space}\"
+ token inputs:wrapS = \"repeat\"
+ token inputs:wrapT = \"repeat\""
+                )
             )
         ),
         ST,
