@@ -111,9 +111,44 @@ pub(crate) struct TexRef {
     pub(crate) uv: [f32; 6],
     /// Whether color texels are sRGB-encoded; `None` takes the file's own encoding.
     pub(crate) srgb: Option<bool>,
+    /// Per axis (a scalar input's being the first), `[a, b]` of the `a + b * texel` the input
+    /// reads, below any factor; a normal map reads it in place of its encoding.
+    pub(crate) remap: Option<[[f32; 2]; 3]>,
 }
 
 impl TexRef {
+    /// What the input reads of `texel` on `axis`.
+    fn read(&self, axis: usize, texel: f32) -> f32 {
+        self.remap
+            .map_or(texel, |m| m[axis][0] + m[axis][1] * texel)
+    }
+
+    /// The source channel `channel` as axis `axis` of this input, under `a + b * value`.
+    fn source(&self, axis: usize, channel: usize, srgb: bool, a: f32, b: f32) -> Channel {
+        let [ra, rb] = self.remap.map_or([0.0, 1.0], |m| m[axis]);
+        Channel::Image {
+            image: self.image,
+            channel,
+            srgb,
+            a: a + b * ra,
+            b: b * rb,
+        }
+    }
+
+    /// The normal in texel `t` of an image that stores normals as `source` says.
+    fn normal(&self, source: NormalSource, t: [f32; 4]) -> [f32; 3] {
+        if self.remap.is_none() {
+            return source.read(t);
+        }
+        let [x, y] = [self.read(0, t[0]), self.read(1, t[1])];
+        let z = if source.rg {
+            orr_pack::texture::normal::z(x, y)
+        } else {
+            self.read(2, t[2])
+        };
+        [x, y, z]
+    }
+
     /// Whether both read their textures at the same uvs.
     fn samples_like(&self, o: &TexRef) -> bool {
         self.uv_set == o.uv_set && self.uv == o.uv
@@ -382,6 +417,7 @@ enum Channel {
     NormalZ {
         image: usize,
         source: NormalSource,
+        remap: Option<[[f32; 2]; 3]>,
     },
     Constant(f32),
     /// Never read: stored as 1, or as the source has it where the blocks pass through.
@@ -474,14 +510,20 @@ impl<'a> Packer<'a> {
         self.constant(i, channel).map(|v| v.clamp(0.0, 1.0))
     }
 
-    /// [`Self::constant_weight`] of opacity `r` of material `m`. A folded opacity tests the same
+    /// [`Self::constant_weight`] of the channel of scalar input `r`, as the input reads it.
+    fn constant_input(&self, r: &TexRef) -> Option<f32> {
+        self.constant_weight(r.image, usize::from(r.channel))
+            .map(|v| r.read(0, v).clamp(0.0, 1.0))
+    }
+
+    /// [`Self::constant_input`] of opacity `r` of material `m`. A folded opacity tests the same
     /// for the whole surface, so under `MASK` texels either side of the cutoff stay a texture.
     fn constant_opacity(&self, m: &Material, r: &TexRef) -> Option<f32> {
-        let channel = usize::from(r.channel);
-        let (lo, hi) = self.image(r.image).range[channel];
-        let passes = |t: f32| m.geometry_opacity * t.clamp(0.0, 1.0) >= m.alpha_cutoff;
+        let (lo, hi) = self.image(r.image).range[usize::from(r.channel)];
+        let read = |t: f32| r.read(0, t.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        let passes = |t: f32| m.geometry_opacity * read(t) >= m.alpha_cutoff;
         let one_side = m.alpha_mode != Material::MASK || passes(lo) == passes(hi);
-        self.constant_weight(r.image, channel).filter(|_| one_side)
+        self.constant_input(r).filter(|_| one_side)
     }
 
     /// The primaries of a color texture made from image `i`: the last override that sets
@@ -560,13 +602,7 @@ impl<'a> Packer<'a> {
                         Pack {
                             role: "opacity",
                             encoding: Encoding::Bc4,
-                            channels: vec![Channel::Image {
-                                image: r.image,
-                                channel,
-                                srgb: false,
-                                a: 0.0,
-                                b: m.geometry_opacity,
-                            }],
+                            channels: vec![r.source(0, channel, false, 0.0, m.geometry_opacity)],
                             refs: vec![*r],
                             coverage,
                             toksvig: None,
@@ -587,10 +623,10 @@ impl<'a> Packer<'a> {
                 rg: facts.rg,
                 signed: facts.signed,
             };
-            let flat = if source.signed {
-                [0.0, 0.0, 1.0]
-            } else {
-                [0.5, 0.5, 1.0]
+            let flat = match r.remap {
+                Some(m) => [0, 1, 2].map(|c| ([0.0, 0.0, 1.0][c] - m[c][0]) / m[c][1]),
+                None if source.signed => [0.0, 0.0, 1.0],
+                None => [0.5, 0.5, 1.0],
             };
             let mut consts: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
             // A two-channel image's blue is no z, so x and y alone say whether it is flat.
@@ -602,12 +638,12 @@ impl<'a> Packer<'a> {
                 .zip(flat)
                 .all(|(c, f)| c.is_some_and(|v| (v - f).abs() <= 1.0 / 255.0));
             if !is_flat {
-                let channel = |c: usize, s: f32| Channel::Image {
-                    image: r.image,
-                    channel: c,
-                    srgb: false,
-                    a: if source.signed { 0.0 } else { -s },
-                    b: if source.signed { s } else { 2.0 * s },
+                let channel = |c: usize, s: f32| {
+                    if r.remap.is_some() || source.signed {
+                        r.source(c, c, false, 0.0, s)
+                    } else {
+                        r.source(c, c, false, -s, 2.0 * s)
+                    }
                 };
                 let id = self.make(
                     suffix,
@@ -621,6 +657,7 @@ impl<'a> Packer<'a> {
                                 Channel::NormalZ {
                                     image: r.image,
                                     source,
+                                    remap: r.remap,
                                 }
                             } else {
                                 channel(2, 1.0)
@@ -647,24 +684,18 @@ impl<'a> Packer<'a> {
         // Roughness, metalness, occlusion.
         let (rough, metal) = (t.roughness, t.metalness);
         let constant = |r: &Option<TexRef>| match r {
-            Some(r) => self.constant_weight(r.image, usize::from(r.channel)),
+            Some(r) => self.constant_input(r),
             None => Some(1.0),
         };
         let (rough_const, metal_const) = (constant(&rough), constant(&metal));
         let rough_varies = rough_const.is_none() || normal_packed.is_some();
         let metal_varies = metal_const.is_none();
-        let occ = t
-            .occlusion
-            .map(|(r, s)| (r, s, self.constant_weight(r.image, usize::from(r.channel))));
+        let occ = t.occlusion.map(|(r, s)| (r, s, self.constant_input(&r)));
         let occ_varies = occ.as_ref().is_some_and(|o| o.2.is_none());
         let rough_channel = |m: &Material| match (&rough, rough_const) {
-            (Some(r), None) => Channel::Image {
-                image: r.image,
-                channel: usize::from(r.channel),
-                srgb: false,
-                a: 0.0,
-                b: m.specular_roughness,
-            },
+            (Some(r), None) => {
+                r.source(0, usize::from(r.channel), false, 0.0, m.specular_roughness)
+            }
             (_, c) => Channel::Constant(m.specular_roughness * c.unwrap_or(1.0)),
         };
         if !rough_varies {
@@ -673,20 +704,11 @@ impl<'a> Packer<'a> {
         if !metal_varies {
             m.metalness *= metal_const.unwrap_or(1.0);
         }
-        let occ_channel = |o: &(TexRef, f32, Option<f32>)| Channel::Image {
-            image: o.0.image,
-            channel: usize::from(o.0.channel),
-            srgb: false,
-            a: 1.0 - o.1,
-            b: o.1,
+        let occ_channel = |o: &(TexRef, f32, Option<f32>)| {
+            o.0.source(0, usize::from(o.0.channel), false, 1.0 - o.1, o.1)
         };
-        let metal_channel = |m: &Material, r: &TexRef| Channel::Image {
-            image: r.image,
-            channel: usize::from(r.channel),
-            srgb: false,
-            a: 0.0,
-            b: m.metalness,
-        };
+        let metal_channel =
+            |m: &Material, r: &TexRef| r.source(0, usize::from(r.channel), false, 0.0, m.metalness);
         let normal_ref = normal_packed.as_ref().map(|n| n.0);
         // Per texture: its (slot, source) channels and the references it samples like.
         // Roughness and metalness share one texture when they sample alike.
@@ -766,7 +788,7 @@ impl<'a> Packer<'a> {
             self.color(suffix, m, r, slot::SUBSURFACE_COLOR, true)?;
         }
         if let Some(r) = &t.specular {
-            match self.constant_weight(r.image, usize::from(r.channel)) {
+            match self.constant_input(r) {
                 Some(v) => m.specular_weight *= v,
                 None => {
                     let id = self.single(suffix, r, 1.0, "specular_weight")?;
@@ -784,7 +806,7 @@ impl<'a> Packer<'a> {
         for (r, role, s, weight) in weights {
             let Some(r) = r else { continue };
             let factor = *weight(m);
-            *weight(m) = match self.constant_weight(r.image, usize::from(r.channel)) {
+            *weight(m) = match self.constant_input(r) {
                 Some(v) => factor * v,
                 None => {
                     let id = self.single(suffix, r, factor, role)?;
@@ -891,7 +913,8 @@ impl<'a> Packer<'a> {
         if rgb.iter().all(Option::is_some) {
             let texel: [f32; 3] = std::array::from_fn(|c| {
                 let v = rgb[c].expect("constant");
-                if srgb { srgb_to_linear(v) } else { v }
+                r.read(c, if srgb { srgb_to_linear(v) } else { v })
+                    .clamp(0.0, 1.0)
             });
             let target = color(m);
             // Rec.709 multiplies directly, so its factors stay exact.
@@ -906,13 +929,7 @@ impl<'a> Packer<'a> {
             };
             return Ok(());
         }
-        let image = |channel| Channel::Image {
-            image: r.image,
-            channel,
-            srgb,
-            a: 0.0,
-            b: 1.0,
-        };
+        let image = |channel| r.source(channel, channel, srgb, 0.0, 1.0);
         let id = self.make(
             suffix,
             Pack {
@@ -937,13 +954,7 @@ impl<'a> Packer<'a> {
             Pack {
                 role,
                 encoding: Encoding::Bc4,
-                channels: vec![Channel::Image {
-                    image: r.image,
-                    channel: usize::from(r.channel),
-                    srgb: false,
-                    a: 0.0,
-                    b: scale,
-                }],
+                channels: vec![r.source(0, usize::from(r.channel), false, 0.0, scale)],
                 refs: vec![*r],
                 coverage: None,
                 toksvig: None,
@@ -1124,7 +1135,7 @@ impl<'a> Packer<'a> {
             p.encoding,
             p.channels,
             p.coverage,
-            p.toksvig.as_ref().map(|t| (t.0, t.1.image, t.2, t.3)),
+            p.toksvig.as_ref().map(|t| (t.0, t.1.image, t.1.remap, t.2, t.3)),
             p.refs[0].wrap,
             self.rules.filter,
             size,
@@ -1334,7 +1345,7 @@ impl TextureJob {
             .map(|(channel, r, scale, source)| {
                 let n = &sources[&r.image];
                 let px = n.px.iter().map(|t| {
-                    let [x, y, z] = source.read(*t);
+                    let [x, y, z] = r.normal(*source, *t);
                     [x * scale[0], y * scale[1], z, 1.0]
                 });
                 Toksvig {
@@ -1402,11 +1413,19 @@ impl TextureJob {
             match *ch {
                 Channel::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
                 Channel::Unused => img.px.par_iter_mut().for_each(|t| t[c] = 1.0),
-                Channel::NormalZ { image, source } => {
+                Channel::NormalZ {
+                    image,
+                    source,
+                    remap,
+                } => {
+                    let r = TexRef {
+                        remap,
+                        ..self.pack.refs[0]
+                    };
                     img.px
                         .par_iter_mut()
                         .zip(&decoded[&image].px)
-                        .for_each(|(t, s)| t[c] = source.read(*s)[2]);
+                        .for_each(|(t, s)| t[c] = r.normal(source, *s)[2]);
                 }
                 Channel::Image {
                     image,

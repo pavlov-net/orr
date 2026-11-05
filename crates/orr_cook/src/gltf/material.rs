@@ -212,6 +212,7 @@ pub(super) fn textures(
             srgb: None,
             rg_channel: None,
             uv,
+            remap: None,
         })
     };
     // A textureInfo object of an extension.

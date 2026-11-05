@@ -13,6 +13,7 @@ use orr_math::{DMat4, DQuat, DVec3};
 use orr_pack::Hash32;
 
 use super::VariantSelection;
+use crate::shading;
 use crate::state::Input;
 
 /// Identifier of the session layer that carries the manifest's variant selections.
@@ -244,6 +245,33 @@ pub(super) fn numbers(v: &sdf::Value) -> Option<Vec<f64>> {
         V::QuathVec(x) => Some(half(x)),
         V::Matrix4d(m) => Some(m.0.to_vec()),
         V::Matrix4dVec(m) => Some(m.iter().flat_map(|m| m.0).collect()),
+        _ => None,
+    }
+}
+
+/// The numbers in one element of an array value; `None` for a value that is no array.
+fn element_width(v: &sdf::Value) -> Option<usize> {
+    use sdf::Value as V;
+    match v {
+        V::BoolVec(_)
+        | V::UcharVec(_)
+        | V::IntVec(_)
+        | V::UintVec(_)
+        | V::Int64Vec(_)
+        | V::Uint64Vec(_)
+        | V::HalfVec(_)
+        | V::FloatVec(_)
+        | V::DoubleVec(_) => Some(1),
+        V::Vec2fVec(_) | V::Vec2dVec(_) | V::Vec2iVec(_) | V::Vec2hVec(_) => Some(2),
+        V::Vec3fVec(_) | V::Vec3dVec(_) | V::Vec3iVec(_) | V::Vec3hVec(_) => Some(3),
+        V::Vec4fVec(_)
+        | V::Vec4dVec(_)
+        | V::Vec4iVec(_)
+        | V::Vec4hVec(_)
+        | V::QuatfVec(_)
+        | V::QuatdVec(_)
+        | V::QuathVec(_) => Some(4),
+        V::Matrix4dVec(_) => Some(16),
         _ => None,
     }
 }
@@ -488,5 +516,34 @@ impl PrimReader<'_> {
             .and_then(|v| numbers(&v))
             .map_or(1, |v| v[0] as usize)
             .max(1)
+    }
+
+    /// Primvar `name` as a value for the whole prim, whatever the width of its elements. One
+    /// that holds no numbers, or whose index misses its values, gives a reader nothing.
+    pub(super) fn whole_primvar(&self, name: &str) -> Result<shading::Primvar, String> {
+        let full = format!("primvars:{name}");
+        let Some(value) = self.value(&full)? else {
+            return Ok(shading::Primvar::Missing);
+        };
+        let Some(values) = numbers(&value).filter(|v| !v.is_empty()) else {
+            return Ok(shading::Primvar::Missing);
+        };
+        if self
+            .metadata_token(&full, "interpolation")
+            .is_some_and(|i| i != "constant")
+        {
+            return Ok(shading::Primvar::Varying);
+        }
+        let width = element_width(&value).unwrap_or(values.len()) * self.element_size(&full);
+        let primvar = Primvar {
+            values,
+            width,
+            interp: Interp::Constant,
+            indices: self.ints(&format!("{full}:indices"))?,
+        };
+        Ok(match primvar.at(0, 0, 0) {
+            Some(v) => shading::Primvar::Constant(v.iter().map(|&x| x as f32).collect()),
+            None => shading::Primvar::Missing,
+        })
     }
 }

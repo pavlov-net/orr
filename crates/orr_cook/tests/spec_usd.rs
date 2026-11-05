@@ -9,8 +9,11 @@ use orr_cook::{ArchiveSpec, AssetSpec, Manifest, NodeSelect, Source, Subdivision
 use orr_math::{Mat4, Quat, Vec3};
 use orr_pack::clip::Clip;
 use orr_pack::instance::{InstancePageInfo, decode};
+use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{MeshInfo, PageView};
+use orr_pack::model::ModelInfo;
 use orr_pack::skeleton::{SkeletonInfo, Trs};
+use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, AssetId, Blob, Class, Target};
 
 const HEAD: &str = r#"#usda 1.0
@@ -996,6 +999,565 @@ fn a_skinned_mesh_outside_a_skel_root_is_static() {
             .iter()
             .any(|c| c.0.abs_diff_eq(Vec3::new(0.0, 4.0, 0.0), 1e-3))
     );
+}
+
+/// A triangle bound to `Material` `M`, whose `UsdPreviewSurface` holds `inputs`, beside `prims`.
+fn previewed(inputs: &str, prims: &str, mesh: &str) -> String {
+    format!(
+        r#"def Mesh "Tri"
+{{
+    {TRIANGLE}
+    rel material:binding = </M>
+    {mesh}
+}}
+
+def Material "M"
+{{
+    token outputs:surface.connect = </M/S.outputs:surface>
+
+    def Shader "S"
+    {{
+        uniform token info:id = "UsdPreviewSurface"
+        {inputs}
+        token outputs:surface
+    }}
+    {prims}
+}}"#
+    )
+}
+
+const ST: &str = r#"texCoord2f[] primvars:st = [(0, 0), (1, 0), (0, 1)] (
+        interpolation = "vertex"
+    )"#;
+
+/// A `UsdUVTexture` `T` reading `tex.png` through a primvar reader `R` of `st`, with `inputs`.
+fn texture(name: &str, inputs: &str) -> String {
+    format!(
+        r#"def Shader "{name}"
+    {{
+        uniform token info:id = "UsdUVTexture"
+        asset inputs:file = @tex.png@
+        float2 inputs:st.connect = </M/R.outputs:result>
+        {inputs}
+        float4 outputs:rgba
+        float outputs:r
+        float outputs:g
+        float3 outputs:rgb
+    }}"#
+    )
+}
+
+const READER: &str = r#"def Shader "R"
+    {
+        uniform token info:id = "UsdPrimvarReader_float2"
+        string inputs:varname = "st"
+        float2 outputs:result
+    }"#;
+
+fn png(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+    let img = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(f(x, y)));
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+fn shaded_with(name: &str, body: &str, image: &[u8]) -> orr_cook::Result<Archive> {
+    let d = dir(name);
+    std::fs::write(d.join("tex.png"), image).unwrap();
+    cook_at(&d, body, UsdSettings::default())
+}
+
+fn shaded(name: &str, body: &str, image: &[u8]) -> Archive {
+    shaded_with(name, body, image).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+fn material(a: &Archive) -> Material {
+    Material::from_bytes(&blob(a, "u/material/M", 0)).unwrap()
+}
+
+/// Red texels of mip 0 of a bound BC4 texture.
+fn red(a: &Archive, m: &Material, s: usize) -> Vec<f32> {
+    let e = a.find(m.textures[s].texture).expect("bound");
+    let blobs = a.blobs(e);
+    let info = TextureInfo::parse(&read(a, &blobs[0])).unwrap();
+    let h = info.header;
+    let bytes = info
+        .mip_texels(&read(a, &blobs[h.mip_blob(0)]), 0, 0)
+        .unwrap();
+    let mut out = Vec::new();
+    for block in bytes.chunks_exact(8) {
+        let mut px = [0u8; 16];
+        bcdec_rs::bc4(block, &mut px, 4, false);
+        out.extend(px.iter().map(|&v| f32::from(v) / 255.0));
+    }
+    out
+}
+
+fn gradient() -> Vec<u8> {
+    png(8, 8, |x, _| [(x * 32) as u8, (x * 32) as u8, 0, 255])
+}
+
+/// PS defaults and parameters: `ior` "including the clearcoat if clearcoat > 0";
+/// `clearcoatRoughness` 0.01; `specularColor` (0, 0, 0): "This is the color at 0 incidence. Edge
+/// color is assumed white."
+#[test]
+fn preview_parameters_carry_their_spec_values() {
+    let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+
+    let m = material(&cook("preview-empty", &previewed("", "", "")));
+    assert_eq!(m.base_color, [0.18; 3]);
+    assert_eq!(m.emission_luminance, 0.0);
+    assert_eq!((m.metalness, m.specular_roughness), (0.0, 0.5));
+    assert_eq!((m.specular_ior, m.geometry_opacity), (1.5, 1.0));
+    assert_eq!((m.alpha_mode, m.coat_weight), (Material::OPAQUE, 0.0));
+
+    let a = cook(
+        "preview-coat",
+        &previewed(
+            "float inputs:clearcoat = 0.5\n float inputs:ior = 1.33",
+            "",
+            "",
+        ),
+    );
+    let m = material(&a);
+    assert!(close(m.coat_ior, 1.33), "{}", m.coat_ior);
+    assert!(close(m.coat_roughness, 0.01), "{}", m.coat_roughness);
+
+    let f0 = |m: &Material, c: usize| {
+        let r = (m.specular_ior - 1.0) / (m.specular_ior + 1.0);
+        m.specular_color[c] * r * r
+    };
+    let specular = "int inputs:useSpecularWorkflow = 1";
+    let a = cook("preview-specular-default", &previewed(specular, "", ""));
+    assert!(close(f0(&material(&a), 0), 0.0));
+
+    let a = cook(
+        "preview-specular-gray",
+        &previewed(
+            &format!("{specular}\n color3f inputs:specularColor = (0.5, 0.5, 0.5)"),
+            "",
+            "",
+        ),
+    );
+    let m = material(&a);
+    assert!(close(f0(&m, 1), 0.5), "{}", f0(&m, 1));
+    assert_eq!(m.specular_color, [1.0; 3], "a gray F0 needs no tint");
+
+    let a = cook(
+        "preview-specular-color",
+        &previewed(
+            &format!("{specular}\n color3f inputs:specularColor = (0.4, 0.2, 0.1)"),
+            "",
+            "",
+        ),
+    );
+    let m = material(&a);
+    for (c, want) in [0.4, 0.2, 0.1].into_iter().enumerate() {
+        assert!(close(f0(&m, c), want), "{c}: {}", f0(&m, c));
+    }
+}
+
+/// PS `opacityMode`: under the default *transparent* "opacity reduces the contribution of the
+/// diffuse lighting component in favor of transparency, while the specular response and emissive
+/// component remain at full weight"; *presence* "scales the entire lighting response".
+#[test]
+fn opacity_mode_picks_transmission_or_coverage() {
+    let a = cook(
+        "opacity-transparent",
+        &previewed("float inputs:opacity = 0.25", "", ""),
+    );
+    let m = material(&a);
+    assert_eq!(m.transmission_weight, 0.75);
+    assert_eq!(m.geometry_opacity, 1.0);
+    assert_eq!(m.alpha_mode, Material::OPAQUE);
+    assert_eq!(m.thin_walled, 1);
+
+    let a = cook(
+        "opacity-presence",
+        &previewed(
+            "float inputs:opacity = 0.25\n token inputs:opacityMode = \"presence\"",
+            "",
+            "",
+        ),
+    );
+    let m = material(&a);
+    assert_eq!(m.transmission_weight, 0.0);
+    assert_eq!(m.geometry_opacity, 0.25);
+    assert_eq!(m.alpha_mode, Material::BLEND);
+
+    // A texture's opacity inverts into the transmission slot.
+    let body = previewed(
+        "float inputs:opacity.connect = </M/T.outputs:r>",
+        &format!("{}\n{READER}", texture("T", "")),
+        ST,
+    );
+    let a = shaded("opacity-textured", &body, &gradient());
+    let m = material(&a);
+    assert_eq!(m.alpha_mode, Material::OPAQUE);
+    assert_ne!(m.textures[slot::TRANSMISSION].texture, AssetId::NONE);
+    let t = red(&a, &m, slot::TRANSMISSION);
+    assert!((t[0] - 1.0).abs() < 0.02, "texel 0 is opacity 0: {}", t[0]);
+    assert!((t[3] - (1.0 - 96.0 / 255.0)).abs() < 0.02, "{}", t[3]);
+}
+
+/// PS `scale` and `bias`: "output = textureValue * scale + bias", on any input.
+#[test]
+fn a_texture_bias_applies_to_scalar_and_color_inputs() {
+    let gloss = "float4 inputs:scale = (-1, -1, -1, 1)\n float4 inputs:bias = (1, 1, 1, 0)";
+    let body = previewed(
+        "float inputs:roughness.connect = </M/T.outputs:r>",
+        &format!("{}\n{READER}", texture("T", gloss)),
+        ST,
+    );
+
+    let a = shaded("bias-varying", &body, &gradient());
+    let m = material(&a);
+    assert_eq!(m.specular_roughness, 1.0);
+    let t = red(&a, &m, slot::ROUGHNESS);
+    assert!((t[0] - 1.0).abs() < 0.02, "{}", t[0]);
+    assert!((t[3] - (1.0 - 96.0 / 255.0)).abs() < 0.02, "{}", t[3]);
+
+    let a = shaded("bias-constant", &body, &png(8, 8, |_, _| [64, 64, 64, 255]));
+    let m = material(&a);
+    assert!((m.specular_roughness - (1.0 - 64.0 / 255.0)).abs() < 1e-3);
+    assert_eq!(m.textures[slot::ROUGHNESS].texture, AssetId::NONE);
+
+    let body = previewed(
+        "color3f inputs:diffuseColor.connect = </M/T.outputs:rgb>",
+        &format!(
+            "{}\n{READER}",
+            texture(
+                "T",
+                "token inputs:sourceColorSpace = \"raw\"\n float4 inputs:scale = (0.5, 0.5, 0.5, 1)\n float4 inputs:bias = (0.25, 0, 0.5, 0)"
+            )
+        ),
+        ST,
+    );
+    let a = shaded("bias-color", &body, &png(8, 8, |_, _| [255, 255, 255, 255]));
+    let m = material(&a);
+    for (got, want) in m.base_color.iter().zip([0.75, 0.5, 1.0]) {
+        assert!((got - want).abs() < 1e-3, "{:?}", m.base_color);
+    }
+
+    // Emission reaches past what a texel stores.
+    let body = previewed(
+        "color3f inputs:emissiveColor.connect = </M/T.outputs:rgb>",
+        &format!(
+            "{}\n{READER}",
+            texture(
+                "T",
+                "token inputs:sourceColorSpace = \"raw\"\n float4 inputs:scale = (4, 4, 4, 1)\n float4 inputs:bias = (1, 1, 1, 0)"
+            )
+        ),
+        ST,
+    );
+    let a = shaded("bias-past-one", &body, &png(8, 8, |_, _| [255; 4]));
+    assert_eq!(material(&a).emission_color, [5.0; 3]);
+}
+
+/// PS `normal`: "properly scaled and ready to be consumed as a tangent space normal"; the (2, -1)
+/// pair is a must only for 8-bit textures, so half strength and other pairs are authored meaning.
+#[test]
+fn a_normal_texture_reads_through_any_scale_and_bias() {
+    // A red and green of 0.75 and blue of 1.
+    let tilted = png(8, 8, |x, _| [191 + (x % 2) as u8, 191, 255, 255]);
+    for (name, inputs, want) in [
+        (
+            "encoded",
+            "float4 inputs:scale = (2, 2, 2, 1)\n float4 inputs:bias = (-1, -1, -1, 0)",
+            0.5,
+        ),
+        (
+            "half-strength",
+            "float4 inputs:scale = (1, 1, 2, 1)\n float4 inputs:bias = (-0.5, -0.5, -1, 0)",
+            0.25,
+        ),
+        (
+            "as-stored",
+            "float4 inputs:scale = (1, 1, 1, 1)\n float4 inputs:bias = (-0.5, -0.5, 0, 0)",
+            0.25,
+        ),
+    ] {
+        let body = previewed(
+            "normal3f inputs:normal.connect = </M/T.outputs:rgb>",
+            &format!(
+                "{}\n{READER}",
+                texture(
+                    "T",
+                    &format!("token inputs:sourceColorSpace = \"raw\"\n {inputs}")
+                )
+            ),
+            ST,
+        );
+        let a = shaded(&format!("normal-{name}"), &body, &tilted);
+        let m = material(&a);
+        let x = normal_x(&a, &m);
+        // The cook stores unit normals, so the tilt reads against the vector's length.
+        let n = Vec3::new(want, want, 1.0).normalize();
+        assert!((x - n.x).abs() < 0.03, "{name}: {x} {}", n.x);
+    }
+}
+
+/// The mean x of the first texels of a bound normal map.
+fn normal_x(a: &Archive, m: &Material) -> f32 {
+    let e = a.find(m.textures[slot::NORMAL].texture).expect("bound");
+    let blobs = a.blobs(e);
+    let info = TextureInfo::parse(&read(a, &blobs[0])).unwrap();
+    let h = info.header;
+    let bytes = info
+        .mip_texels(&read(a, &blobs[h.mip_blob(0)]), 0, 0)
+        .unwrap();
+    let mut px = [0u8; 32];
+    bcdec_rs::bc5(&bytes[..16], &mut px, 8, false);
+    let xy = px.as_chunks::<2>().0;
+    let sum: f32 = xy
+        .iter()
+        .map(|t| orr_pack::texture::normal::decode(t.map(|v| f32::from(v) / 255.0))[0])
+        .sum();
+    sum / xy.len() as f32
+}
+
+/// PS `normal` and `displacement` are ordinary inputs: a constant one holds across the surface.
+#[test]
+fn constant_normal_and_displacement_apply() {
+    let a = cook(
+        "constant-normal",
+        &previewed("normal3f inputs:normal = (0.6, 0, 0.8)", "", ""),
+    );
+    let m = material(&a);
+    assert!((normal_x(&a, &m) - 0.6).abs() < 0.02);
+
+    let a = cook(
+        "default-normal",
+        &previewed("normal3f inputs:normal = (0, 0, 1)", "", ""),
+    );
+    assert_eq!(material(&a).textures[slot::NORMAL].texture, AssetId::NONE);
+
+    let a = cook(
+        "constant-displacement",
+        &previewed("float inputs:displacement = 0.25", "", ""),
+    );
+    let m = material(&a);
+    assert_ne!(m.textures[slot::DISPLACEMENT].texture, AssetId::NONE);
+    assert_eq!(m.displacement_offset, 0.25);
+    assert_eq!(m.displacement_scale, 0.0);
+    assert_eq!((m.displacement_min, m.displacement_max), (0.25, 0.25));
+}
+
+/// Where a slot's uv transform sends mesh uv `p`.
+fn sampled(m: &Material, s: usize, p: [f32; 2]) -> [f32; 2] {
+    let [a, b, c, d, e, f] = m.uv_transforms[s];
+    [
+        (1.0 + a) * p[0] + b * p[1] + c,
+        d * p[0] + (1.0 + e) * p[1] + f,
+    ]
+}
+
+/// PS `st`: an input with the default (0, 0), usually connected; `UsdPrimvarReader_float2`
+/// `fallback`: "fallback value to be returned if geometry fetch failed"; per-reader transforms.
+/// Mesh uvs and sampled uvs both count v from the top, st's t from the bottom.
+#[test]
+fn texture_coordinates_are_per_reader() {
+    let base = "color3f inputs:diffuseColor.connect = </M/T.outputs:rgb>";
+    let image = gradient();
+    let near = |got: [f32; 2], want: [f32; 2]| {
+        assert!(
+            (got[0] - want[0]).abs() < 1e-5 && (got[1] - want[1]).abs() < 1e-5,
+            "{got:?} {want:?}"
+        );
+    };
+    let any = [0.3, 0.7];
+
+    // Unconnected: st (0, 0), the image's bottom left.
+    let body = previewed(
+        base,
+        r#"def Shader "T"
+    {
+        uniform token info:id = "UsdUVTexture"
+        asset inputs:file = @tex.png@
+        float3 outputs:rgb
+    }"#,
+        ST,
+    );
+    let m = material(&shaded("st-unconnected", &body, &image));
+    near(sampled(&m, slot::BASE_COLOR, any), [0.0, 1.0]);
+
+    // An authored value.
+    let body = previewed(
+        base,
+        r#"def Shader "T"
+    {
+        uniform token info:id = "UsdUVTexture"
+        asset inputs:file = @tex.png@
+        float2 inputs:st = (0.25, 0.75)
+        float3 outputs:rgb
+    }"#,
+        ST,
+    );
+    let m = material(&shaded("st-value", &body, &image));
+    near(sampled(&m, slot::BASE_COLOR, any), [0.25, 0.25]);
+
+    // A mesh without the primvar reads the reader's fallback, and one with it reads it.
+    let reader = r#"def Shader "R"
+    {
+        uniform token info:id = "UsdPrimvarReader_float2"
+        string inputs:varname = "st"
+        float2 inputs:fallback = (0.5, 0.25)
+        float2 outputs:result
+    }"#;
+    let prims = format!("{}\n{reader}", texture("T", ""));
+    let body = previewed(base, &prims, "");
+    let m = material(&shaded("st-fallback", &body, &image));
+    near(sampled(&m, slot::BASE_COLOR, any), [0.5, 0.75]);
+    let body = previewed(base, &prims, ST);
+    let m = material(&shaded("st-primvar", &body, &image));
+    near(sampled(&m, slot::BASE_COLOR, any), any);
+
+    // An unset `varname` fetches nothing.
+    let unnamed = reader.replace("string inputs:varname = \"st\"\n", "");
+    let body = previewed(base, &format!("{}\n{unnamed}", texture("T", "")), ST);
+    let m = material(&shaded("st-unnamed", &body, &image));
+    near(sampled(&m, slot::BASE_COLOR, any), [0.5, 0.75]);
+
+    // A point's normal map cooks, with no uv frame to turn its normal into.
+    let body = previewed(
+        "normal3f inputs:normal.connect = </M/T.outputs:rgb>",
+        r#"def Shader "T"
+    {
+        uniform token info:id = "UsdUVTexture"
+        asset inputs:file = @tex.png@
+        float4 inputs:scale = (2, 2, 2, 1)
+        float4 inputs:bias = (-1, -1, -1, 0)
+        float3 outputs:rgb
+    }"#,
+        ST,
+    );
+    let m = material(&shaded("st-point-normal", &body, &image));
+    near(sampled(&m, slot::NORMAL, any), [0.0, 1.0]);
+
+    // Two readers transform independently; t's flip conjugates each one.
+    let transform = r#"def Shader "X"
+    {
+        uniform token info:id = "UsdTransform2d"
+        float2 inputs:in.connect = </M/R.outputs:result>
+        float2 inputs:scale = (2, 2)
+        float inputs:rotation = 90
+        float2 inputs:translation = (0.25, 0.5)
+        float2 outputs:result
+    }"#;
+    let second = texture("U", "").replace("</M/R.outputs:result>", "</M/X.outputs:result>");
+    let body = previewed(
+        &format!("{base}\n float inputs:roughness.connect = </M/U.outputs:r>"),
+        &format!("{}\n{second}\n{READER}\n{transform}", texture("T", "")),
+        ST,
+    );
+    let a = shaded("st-two-transforms", &body, &image);
+    let m = material(&a);
+    near(sampled(&m, slot::BASE_COLOR, any), any);
+    // st (0.3, 0.3) scales to (0.6, 0.6), turns to (-0.6, 0.6) and moves to (-0.35, 1.1).
+    near(sampled(&m, slot::ROUGHNESS, any), [-0.35, -0.1]);
+    for c in corners(&a, "u/mesh") {
+        assert!(
+            [[0.0, 1.0], [1.0, 1.0], [0.0, 0.0]].contains(&c.2),
+            "the mesh keeps its own uvs: {:?}",
+            c.2
+        );
+    }
+}
+
+/// PS lists float, float3, float4 and others among reader instantiations. A primvar that holds
+/// one value for the mesh gives that value; a missing one the reader's `fallback`.
+#[test]
+fn constant_primvar_readers_feed_inputs() {
+    let reader = |fallback: &str| {
+        format!(
+            r#"def Shader "C"
+    {{
+        uniform token info:id = "UsdPrimvarReader_float3"
+        string inputs:varname = "displayColor"
+        {fallback}
+        float3 outputs:result
+    }}"#
+        )
+    };
+    let base = "color3f inputs:diffuseColor.connect = </M/C.outputs:result>";
+    let a = cook(
+        "reader-constant",
+        &previewed(
+            base,
+            &reader(""),
+            "color3f[] primvars:displayColor = [(0.25, 0.5, 0.75)]",
+        ),
+    );
+    assert_eq!(material(&a).base_color, [0.25, 0.5, 0.75]);
+
+    let a = cook(
+        "reader-fallback",
+        &previewed(
+            base,
+            &reader("float3 inputs:fallback = (0.5, 0.5, 0.25)"),
+            "",
+        ),
+    );
+    assert_eq!(material(&a).base_color, [0.5, 0.5, 0.25]);
+
+    // An index picks its element whichever values it leaves out; one that misses them, or a
+    // primvar of no numbers, is the fallback.
+    let colors = "color3f[] primvars:displayColor = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]";
+    for (name, primvar, want) in [
+        (
+            "indexed",
+            format!("{colors}\n int[] primvars:displayColor:indices = [1]"),
+            [0.0, 1.0, 0.0],
+        ),
+        (
+            "index-past",
+            format!("{colors}\n int[] primvars:displayColor:indices = [7]"),
+            [0.5, 0.5, 0.25],
+        ),
+        (
+            "string",
+            "string primvars:displayColor = \"red\"".to_string(),
+            [0.5, 0.5, 0.25],
+        ),
+    ] {
+        let fallback = reader("float3 inputs:fallback = (0.5, 0.5, 0.25)");
+        let a = cook(
+            &format!("reader-{name}"),
+            &previewed(base, &fallback, &primvar),
+        );
+        assert_eq!(material(&a).base_color, want, "{name}");
+    }
+
+    // Two meshes of one material with different values take a material each.
+    let body = format!(
+        r#"{}
+
+def Mesh "Other"
+{{
+    {TRIANGLE}
+    rel material:binding = </M>
+    color3f[] primvars:displayColor = [(1, 0, 0)]
+}}"#,
+        previewed(
+            base,
+            &reader(""),
+            "color3f[] primvars:displayColor = [(0, 1, 0)]"
+        ),
+    );
+    let a = cook("reader-two-meshes", &body);
+    let model = ModelInfo::parse(&blob(&a, "u", 0)).unwrap();
+    let colors: Vec<[f32; 3]> = model
+        .materials
+        .iter()
+        .map(|&id| {
+            let e = a.find(id).unwrap();
+            Material::from_bytes(&read(&a, &a.blobs(e)[0]))
+                .unwrap()
+                .base_color
+        })
+        .collect();
+    assert!(colors.contains(&[1.0, 0.0, 0.0]) && colors.contains(&[0.0, 1.0, 0.0]));
 }
 
 /// A joint an animation does not list holds its rest transform.

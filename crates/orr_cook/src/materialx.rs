@@ -100,7 +100,16 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         })
     };
     let graph = network(&docs, &reader.order, material, &mut load).map_err(fail)?;
-    let mapped = shading::map_per_slot(&graph.net, graph.surface, graph.displacement, &["st"])
+    let mut solid = |rgb| {
+        images.push(shading::solid_image(rgb));
+        images.len() - 1
+    };
+    let mut host = shading::Host {
+        primvars: &["st"],
+        reads: &[],
+        solid: &mut solid,
+    };
+    let mapped = shading::map(&graph.net, graph.surface, graph.displacement, &mut host)
         .map_err(|m| fail(format!("material {material}: {m}")))?;
     let mut warnings = graph.warnings;
     warnings.extend(mapped.warnings);

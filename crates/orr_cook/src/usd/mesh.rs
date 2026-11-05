@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use orr_math::{Affine2, DMat3, DMat4, DVec3, Vec2};
+use orr_math::{DMat3, DMat4, DVec3, Vec2};
 use orr_pack::subd::Influence as SkinInfluence;
 
 use super::read::{Interp, PrimReader, Primvar};
@@ -189,8 +189,8 @@ pub(super) struct Welder {
 pub(super) struct Placing<'a> {
     /// Model space from the mesh's points.
     pub(super) transform: DMat4,
-    /// Scene material and uv transform per face.
-    pub(super) face_material: &'a dyn Fn(usize) -> (usize, Option<Affine2>),
+    /// Scene material per face.
+    pub(super) face_material: &'a dyn Fn(usize) -> usize,
     /// Influences per point when skinned.
     pub(super) skin: Option<&'a [Influence]>,
 }
@@ -242,7 +242,7 @@ impl Welder {
             if count < 3 || holes.contains(&face) {
                 continue;
             }
-            let (material, uv_t) = (at.face_material)(face);
+            let material = (at.face_material)(face);
             let ring: Vec<usize> = corners.clone().collect();
             let pts: Vec<DVec3> = ring.iter().map(|&c| mesh.points[mesh.indices[c]]).collect();
             for tri in triangulate(&pts) {
@@ -262,7 +262,6 @@ impl Welder {
                         None => made[point],
                     };
                     let n = (normal_m * n).normalize_or_zero();
-                    // The material's one uv transform applies to both sets.
                     let st = |uvs: &Option<Primvar>, set: usize| -> Result<[f32; 2], String> {
                         let st = match uvs {
                             Some(uv) => {
@@ -273,7 +272,6 @@ impl Welder {
                             }
                             None => Vec2::ZERO,
                         };
-                        let st = uv_t.map_or(st, |t| t.transform_point2(st));
                         Ok([st.x, 1.0 - st.y])
                     };
                     let uv = [st(&mesh.uvs, 0)?, st(&mesh.uvs1, 1)?];
@@ -300,7 +298,7 @@ pub(super) struct CageBuilder {
     pub(super) skin: Vec<SkinInfluence>,
     /// Scene material per face.
     pub(super) materials: Vec<usize>,
-    uvs: HashMap<[u32; 2], u32>,
+    uvs: HashMap<u32, u32>,
     /// The first mesh's path, naming the rules every other must share.
     first: Option<String>,
 }
@@ -365,8 +363,7 @@ impl CageBuilder {
             .transpose()?;
         let mut corner = 0;
         for (face, &count) in mesh.counts.iter().enumerate() {
-            let (material, uv_t) = (at.face_material)(face);
-            self.materials.push(material);
+            self.materials.push((at.face_material)(face));
             c.face_counts.push(count as u32);
             let ring: Vec<usize> = if flip {
                 std::iter::once(corner)
@@ -379,24 +376,12 @@ impl CageBuilder {
             for k in ring {
                 c.face_indices.push(base + mesh.indices[k] as u32);
                 let Some(fv) = c.uvs.as_mut() else { continue };
-                let value = match &welds {
-                    Some((values, index)) => {
-                        let v = values[index[k] as usize];
-                        let v = uv_t.map_or(v, |t| t.transform_point2(v));
-                        Vec2::new(v.x, 1.0 - v.y)
-                    }
-                    None => Vec2::ZERO,
-                };
                 let id = match &welds {
-                    // A value stays shared among the corners of one source value and one
-                    // uv transform.
-                    Some((_, index)) => {
-                        let source = [index[k], uv_t.map_or(u32::MAX, |_| material as u32)];
-                        *self.uvs.entry(source).or_insert_with(|| {
-                            fv.values.push(value);
-                            fv.values.len() as u32 - 1
-                        })
-                    }
+                    Some((values, index)) => *self.uvs.entry(index[k]).or_insert_with(|| {
+                        let v = values[index[k] as usize];
+                        fv.values.push(Vec2::new(v.x, 1.0 - v.y));
+                        fv.values.len() as u32 - 1
+                    }),
                     None => 0,
                 };
                 fv.indices.push(id);

@@ -47,7 +47,8 @@
 //! mesh: the direct binding `material:binding:full`, else `material:binding`, of the prim or
 //! its nearest ancestor (collection bindings are not read). Materials map as [`crate::shading`] lists and are named `<asset>/material/<path>`
 //! by their prim path (without the leading `/`), `default` for unbound faces; faces of a
-//! `doubleSided` mesh take a double-sided copy, `<path>/double_sided`.
+//! `doubleSided` mesh take a double-sided copy, `<path>/double_sided`. Meshes that differ in
+//! what they hold for a material's primvar readers take a copy each, `<path>/primvars/<k>`.
 
 mod mesh;
 mod read;
@@ -60,7 +61,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use openusd::{sdf, usd};
-use orr_math::{Affine2, DMat3, DMat4, DQuat, DVec3, DVec4};
+use orr_math::{DMat3, DMat4, DQuat, DVec3, DVec4};
 use serde::Deserialize;
 
 use crate::import::SceneSubd;
@@ -120,6 +121,13 @@ impl Default for UsdSettings {
             uv1: None,
             clips: ClipSettings::default(),
         }
+    }
+}
+
+impl UsdSettings {
+    /// The primvars of the uv sets, by set.
+    fn uv_sets(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.uv.as_str()).chain(self.uv1.as_deref())
     }
 }
 
@@ -286,6 +294,15 @@ struct Instancing {
     meshes: Vec<(usize, usize)>,
 }
 
+/// The shading of a material prim.
+struct Shading {
+    net: shading::Network,
+    surface: usize,
+    displacement: Option<usize>,
+    /// [`shading::Network::primvar_reads`].
+    reads: Vec<String>,
+}
+
 pub(crate) fn import(asset: &str, path: &Path, settings: &UsdSettings) -> Result<Scene> {
     let fail = |message: String| Error::Import {
         asset: asset.into(),
@@ -308,8 +325,13 @@ struct Importer<'s> {
     images: Vec<ImageFile>,
     image_of: HashMap<String, usize>,
     materials: Vec<SceneMaterial>,
-    /// Scene material and uv transform by (material prim path, double-sided).
-    material_of: HashMap<(Option<String>, bool), (usize, Option<Affine2>)>,
+    /// Scene material by material prim path, double-sided, and what the mesh holds for the
+    /// material's primvar readers.
+    material_of: HashMap<(Option<String>, bool, String), usize>,
+    /// Shading networks by material prim path.
+    networks: HashMap<String, Rc<Shading>>,
+    /// Scene materials so far by material prim path and double-sided.
+    copies_of: HashMap<(String, bool), usize>,
     warnings: Vec<String>,
 }
 
@@ -362,6 +384,8 @@ impl<'s> Importer<'s> {
             materials: Vec::new(),
             material_of: HashMap::new(),
             warnings: Vec::new(),
+            networks: HashMap::new(),
+            copies_of: HashMap::new(),
         })
     }
 
@@ -1238,14 +1262,10 @@ impl<'s> Importer<'s> {
         Ok(None)
     }
 
-    /// Scene material and uv transform per face of mesh prim `i`.
-    fn face_materials(
-        &mut self,
-        i: usize,
-        mesh: &MeshPrim,
-    ) -> Result<Vec<(usize, Option<Affine2>)>, String> {
+    /// Scene material per face of mesh prim `i`.
+    fn face_materials(&mut self, i: usize, mesh: &MeshPrim) -> Result<Vec<usize>, String> {
         let base = self.bound_material(Some(i))?;
-        let base = self.material(base, mesh.double_sided)?;
+        let base = self.material(base, mesh.double_sided, i)?;
         let mut faces = vec![base; mesh.counts.len()];
         let subsets: Vec<usize> = self
             .subtree(i)
@@ -1265,7 +1285,7 @@ impl<'s> Importer<'s> {
             };
             let path = r.path().to_string();
             let indices = r.ints("indices")?.unwrap_or_default();
-            let m = self.material(Some(m), mesh.double_sided)?;
+            let m = self.material(Some(m), mesh.double_sided, i)?;
             for f in indices {
                 let slot = usize::try_from(f)
                     .ok()
@@ -1277,57 +1297,121 @@ impl<'s> Importer<'s> {
         Ok(faces)
     }
 
-    /// The scene material of a material prim (`None`: the default material).
+    /// The shading of a material prim, read the first time it is asked for.
+    fn network(&mut self, p: &sdf::Path) -> Result<Rc<Shading>, String> {
+        if let Some(s) = self.networks.get(p.as_str()) {
+            return Ok(Rc::clone(s));
+        }
+        let images = &mut self.images;
+        let image_of = &mut self.image_of;
+        let reads = Rc::clone(&self.reads);
+        let mut load = |a: &sdf::AssetPath| -> Result<usize, String> {
+            let resolved = a
+                .resolved_path()
+                .ok_or_else(|| format!("asset {} does not resolve", a.asset_path()))?
+                .to_string();
+            if let Some(&i) = image_of.get(&resolved) {
+                return Ok(i);
+            }
+            let bytes = Recorder::new(Rc::clone(&reads))
+                .read(&resolved)
+                .map_err(|e| format!("{resolved}: {e}"))?;
+            images.push(ImageFile {
+                name: a.asset_path().to_string(),
+                data: ImageData::Bytes(bytes),
+            });
+            image_of.insert(resolved, images.len() - 1);
+            Ok(images.len() - 1)
+        };
+        let (net, surface, displacement) = shade::network(&self.stage, self.time, p, &mut load)?;
+        let reads = net.primvar_reads();
+        let s = Rc::new(Shading {
+            net,
+            surface,
+            displacement,
+            reads,
+        });
+        self.networks.insert(p.as_str().to_string(), Rc::clone(&s));
+        Ok(s)
+    }
+
+    /// What mesh prim `mesh` holds for primvar `name`. A constant primvar inherits down
+    /// namespace.
+    fn primvar(&self, mesh: usize, name: &str) -> Result<shading::Primvar, String> {
+        let set = self.settings.uv_sets().position(|s| s == name);
+        let mut at = Some(mesh);
+        while let Some(i) = at {
+            match (self.reader(&self.nodes[i].prim).whole_primvar(name)?, set) {
+                (shading::Primvar::Missing, _) => {}
+                (_, Some(set)) if i == mesh => return Ok(shading::Primvar::Uv(set as u8)),
+                (shading::Primvar::Varying, _) if i != mesh => {}
+                (held, _) => return Ok(held),
+            }
+            at = self.nodes[i].parent;
+        }
+        Ok(shading::Primvar::Missing)
+    }
+
+    /// The scene material of a material prim (`None`: the default material) on mesh prim
+    /// `mesh`.
     fn material(
         &mut self,
         prim: Option<sdf::Path>,
         double_sided: bool,
-    ) -> Result<(usize, Option<Affine2>), String> {
-        let key = (prim.as_ref().map(|p| p.as_str().to_string()), double_sided);
+        mesh: usize,
+    ) -> Result<usize, String> {
+        let shaded = prim.as_ref().map(|p| self.network(p)).transpose()?;
+        let mut reads = Vec::new();
+        for name in shaded.iter().flat_map(|s| &s.reads) {
+            reads.push((name.clone(), self.primvar(mesh, name)?));
+        }
+        let key = (
+            prim.as_ref().map(|p| p.as_str().to_string()),
+            double_sided,
+            format!("{reads:?}"),
+        );
         if let Some(&m) = self.material_of.get(&key) {
             return Ok(m);
         }
-        let (mut mapped, name) = match &prim {
-            None => (
+        let (mut mapped, name) = match (&prim, &shaded) {
+            (Some(p), Some(s)) => {
+                let primvars: Vec<&str> = self.settings.uv_sets().collect();
+                let images = &mut self.images;
+                let image_of = &mut self.image_of;
+                let mut solid = |rgb: [f32; 3]| {
+                    let image = shading::solid_image(rgb);
+                    *image_of.entry(image.name.clone()).or_insert_with(|| {
+                        images.push(image);
+                        images.len() - 1
+                    })
+                };
+                let mut host = shading::Host {
+                    primvars: &primvars,
+                    reads: &reads,
+                    solid: &mut solid,
+                };
+                let mapped = shading::map(&s.net, s.surface, s.displacement, &mut host)
+                    .map_err(|e| format!("material {p}: {e}"))?;
+                let path = p.as_str().trim_start_matches('/');
+                let copy = self
+                    .copies_of
+                    .entry((path.to_string(), double_sided))
+                    .or_default();
+                *copy += 1;
+                let name = match *copy {
+                    1 => path.to_string(),
+                    k => format!("{path}/primvars/{}", k - 1),
+                };
+                (mapped, name)
+            }
+            _ => (
                 shading::Mapped {
                     material: Default::default(),
                     textures: Default::default(),
-                    uv: None,
                     warnings: Vec::new(),
                 },
                 "default".to_string(),
             ),
-            Some(p) => {
-                let images = &mut self.images;
-                let image_of = &mut self.image_of;
-                let reads = Rc::clone(&self.reads);
-                let mut load = |a: &sdf::AssetPath| -> Result<usize, String> {
-                    let resolved = a
-                        .resolved_path()
-                        .ok_or_else(|| format!("asset {} does not resolve", a.asset_path()))?
-                        .to_string();
-                    if let Some(&i) = image_of.get(&resolved) {
-                        return Ok(i);
-                    }
-                    let bytes = Recorder::new(Rc::clone(&reads))
-                        .read(&resolved)
-                        .map_err(|e| format!("{resolved}: {e}"))?;
-                    images.push(ImageFile {
-                        name: a.asset_path().to_string(),
-                        data: ImageData::Bytes(bytes),
-                    });
-                    image_of.insert(resolved, images.len() - 1);
-                    Ok(images.len() - 1)
-                };
-                let (net, surface, displacement) =
-                    shade::network(&self.stage, self.time, p, &mut load)?;
-                let primvars: Vec<&str> = std::iter::once(self.settings.uv.as_str())
-                    .chain(self.settings.uv1.as_deref())
-                    .collect();
-                let mapped = shading::map(&net, surface, displacement, &primvars)
-                    .map_err(|e| format!("material {p}: {e}"))?;
-                (mapped, p.as_str().trim_start_matches('/').to_string())
-            }
         };
         let prim_name = prim
             .as_ref()
@@ -1353,7 +1437,7 @@ impl<'s> Importer<'s> {
             material: mapped.material,
             textures: mapped.textures,
         });
-        let m = (self.materials.len() - 1, mapped.uv);
+        let m = self.materials.len() - 1;
         self.material_of.insert(key, m);
         Ok(m)
     }

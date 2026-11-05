@@ -376,8 +376,8 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
         );
     }
 
-    // The cage cooks as its hull, at the selected variant's size, in meters and Y up, with
-    // the place2d scale applied to its uvs (and v flipped to a top-left origin).
+    // The cage cooks as its hull, at the selected variant's size, in meters and Y up, with v
+    // flipped to a top-left origin.
     let (info, tris) = triangles(&a, "u/mesh");
     assert_eq!(tris.len(), 2);
     assert_eq!(info.header.bounds.min, [0.0, 0.0, -2.0]);
@@ -389,8 +389,13 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
         .collect();
     uvs.sort_unstable();
     uvs.dedup();
-    assert_eq!(uvs, [[0, 500], [0, 1000], [500, 500], [500, 1000]]);
+    assert_eq!(uvs, [[0, 0], [0, 1000], [1000, 0], [1000, 1000]]);
     let bark = material(&a, "u/material/World/Looks/Bark");
+    // The place2d scale halves st about the bottom-left origin, which is v = 1 here.
+    assert_eq!(
+        bark.uv_transforms[slot::BASE_COLOR],
+        [-0.5, 0.0, 0.0, 0.0, -0.5, 0.5]
+    );
     assert_eq!(bark.specular_roughness, 0.7);
     assert_eq!(bark.base_color, [1.0; 3]);
     assert!((bark.thin_film_thickness - 400.0).abs() < 1e-3);

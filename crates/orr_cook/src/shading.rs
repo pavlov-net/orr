@@ -12,28 +12,32 @@
 //!   OpenPBR defines.
 //! - `UsdPreviewSurface`, mapped like glTF metallic-roughness: `diffuseColor` is
 //!   `base_color`, `metallic`, `roughness`, `ior` and `emissiveColor` (read as nits) their
-//!   fields, `clearcoat` and `clearcoatRoughness` the coat at IOR 1.5, `occlusion` the
-//!   occlusion texture, and `displacement` the displacement texture with its reader's scale
-//!   and bias. `opacityThreshold` above 0 alpha-tests `opacity` at it; otherwise an opacity
-//!   below 1 or textured blends. The specular workflow's `specularColor` becomes
-//!   `specular_color` at metalness 0.
+//!   fields, `clearcoat` and `clearcoatRoughness` the coat at `ior`, `occlusion` the occlusion
+//!   texture, and `normal` and `displacement` their textures, a constant reading a solid image
+//!   ([`solid_image`]). `opacityThreshold` above 0 alpha-tests `opacity` at it; otherwise
+//!   `opacityMode` `presence` blends an opacity below 1 or textured, and `transparent` makes
+//!   the rest of it thin-walled transmission, which leaves specular and emission at full
+//!   weight. The specular workflow's `specularColor` is F0: `specular_ior` gives its largest
+//!   channel and `specular_color` the others, so a colored F0 tints the edge as well.
 //!
 //! An input is a constant, or reads a texture through these nodes: MaterialX `image` and
 //! `tiledimage` (with `texcoord`, `geompropvalue` and `place2d` on their coordinates,
 //! `extract`, `separate2`, `separate3` or `separate4` picking a channel, `normalmap` under
 //! `geometry_normal`), and `UsdUVTexture` (with `UsdPrimvarReader_float2` and
-//! `UsdTransform2d`). `constant` and `dot` nodes pass on what they read to MaterialX nodes. Any
-//! other node fails the import, naming it, as does a connection cycle. A `geompropvalue`
-//! whose property no uv set holds reads its `default` at every point, as an unconnected
-//! `place2d` reads 0, 0. Textures go to the material's slots (base color, opacity,
-//! roughness, metalness, normal, occlusion, emission, specular weight, subsurface color,
-//! coat, transmission, displacement); a textured input without a slot fails. A texture
-//! value multiplies the field, which takes the reader's scale (`UsdUVTexture` `scale`; 1
-//! otherwise); bias is refused except under normals (`UsdUVTexture` scale 2 and bias -1,
-//! the tangent-space encoding, with x or y flipped by scale -2 and bias 1) and
-//! displacement. The uv transform of `tiledimage`, `place2d` or `UsdTransform2d` goes to the
-//! slot's `Material::uv_transforms` under [`map_per_slot`]. Under [`map`] the importer applies
-//! it to the mesh uvs, so every texture of one material must share it.
+//! `UsdTransform2d` on `st`, whose default is the constant (0, 0)). `constant` and `dot` nodes
+//! pass on what they read to MaterialX nodes. A primvar reader gives the value of a primvar
+//! constant over the mesh, and its `fallback` where the mesh has no such primvar; a varying one
+//! other than a uv set fails, as meshes hold no values for it. Any other node fails the import,
+//! naming it, as does a connection cycle. A `geompropvalue` whose property no uv set holds reads
+//! its `default` at every point, as an unconnected `place2d` reads 0, 0. Textures go to the
+//! material's slots (base color, opacity, roughness, metalness, normal, occlusion, emission,
+//! specular weight, subsurface color, coat, transmission, displacement); a textured input
+//! without a slot fails. A texture value multiplies the field, which takes the reader's scale
+//! (`UsdUVTexture` `scale`; 1 otherwise); a bias folds scale and bias into the texels
+//! ([`TexRef::remap`]) and leaves the field 1, or for a color what it reaches past 1. Normals
+//! read `scale * t + bias` per axis; a pair of the form `s (2 t - 1)` is the tangent-space
+//! encoding at strength `s`. Coordinate nodes set each slot's `Material::uv_transforms`,
+//! conjugated by the flip of t between st and the cook's top-left uvs.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
@@ -42,7 +46,7 @@ use orr_math::{Affine2, Vec2};
 use orr_pack::material::Material;
 
 use crate::texture::Wrap;
-use crate::texture::material::{MaterialTextures, TexRef};
+use crate::texture::material::{ImageData, ImageFile, MaterialTextures, TexRef};
 
 /// A shading network: nodes and the connections between their inputs and outputs.
 #[derive(Default)]
@@ -97,6 +101,60 @@ pub(crate) fn through<'n>(net: &'n Network, mut input: &'n Input) -> &'n Input {
     input
 }
 
+impl Network {
+    /// The primvars the network's readers name.
+    pub(crate) fn primvar_reads(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|n| n.kind.starts_with("UsdPrimvarReader_"))
+            .filter_map(|n| match n.inputs.get("varname") {
+                Some(Input::Text(t)) if !t.is_empty() => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+}
+
+/// What a mesh holds for a primvar a reader names.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Primvar {
+    /// One of its uv sets.
+    Uv(u8),
+    /// One value for the whole mesh.
+    Constant(Vec<f32>),
+    /// Values that vary over the mesh.
+    Varying,
+    Missing,
+}
+
+/// What mapping asks of the scene a material lands in.
+pub(crate) struct Host<'a> {
+    /// The mesh primvar of each uv set, which geometric properties name.
+    pub(crate) primvars: &'a [&'a str],
+    /// What the mesh holds for each primvar of [`Network::primvar_reads`].
+    pub(crate) reads: &'a [(String, Primvar)],
+    /// Adds a [`solid_image`] of a color to the scene; returns its index.
+    pub(crate) solid: &'a mut dyn FnMut([f32; 3]) -> usize,
+}
+
+/// An image of one linear color, for inputs the material reads only through a texture.
+pub(crate) fn solid_image(rgb: [f32; 3]) -> ImageFile {
+    let texel = rgb.map(|c| (c.clamp(0.0, 1.0) * 65535.0).round() as u16);
+    let image = image::ImageBuffer::from_pixel(1, 1, image::Rgb(texel));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("a PNG writes to memory");
+    ImageFile {
+        name: format!("solid/{texel:04x?}"),
+        data: ImageData::Bytes(bytes.into_inner()),
+    }
+}
+
 /// The MaterialX category of a node definition id: `ND_image_color3` is `image`.
 pub(crate) fn category(id: &str) -> &str {
     const KNOWN: &[&str] = &[
@@ -129,8 +187,6 @@ pub(crate) fn category(id: &str) -> &str {
 pub(crate) struct Mapped {
     pub(crate) material: Material,
     pub(crate) textures: MaterialTextures,
-    /// The uv transform every texture shares, when it is not the identity.
-    pub(crate) uv: Option<Affine2>,
     /// What the material asks for that it does not get.
     pub(crate) warnings: Vec<String>,
 }
@@ -150,22 +206,44 @@ struct Tex {
     wrap: [Wrap; 2],
     srgb: Option<bool>,
     uv: Affine2,
-    /// The transform its slot samples with (`Material::uv_transforms` form).
-    slot_uv: [f32; 6],
     scale: [f32; 4],
     bias: [f32; 4],
+}
+
+fn point2(v: &[f32]) -> Vec2 {
+    let at = |i: usize| v.get(i).copied().unwrap_or(0.0);
+    Vec2::new(at(0), at(1))
 }
 
 impl Tex {
     fn tex_ref(&self) -> TexRef {
         TexRef {
             rg_channel: None,
-            uv: self.slot_uv,
+            uv: slot_transform(self.uv),
             image: self.image,
             channel: self.channel() as u8,
             uv_set: self.uv_set,
             wrap: self.wrap,
             srgb: self.srgb,
+            remap: None,
+        }
+    }
+
+    /// [`Self::tex_ref`] reading `scale * t + bias` on `axes`.
+    fn remapped(&self, axes: [usize; 3]) -> TexRef {
+        TexRef {
+            remap: Some(axes.map(|c| [self.bias[c], self.scale[c]])),
+            ..self.tex_ref()
+        }
+    }
+
+    /// The reference of a scalar input, with the field's value: the reader's scale, unless a
+    /// bias folds it into the texels.
+    fn scalar(&self) -> (TexRef, f32) {
+        let c = self.channel();
+        match self.bias[c] {
+            0.0 => (self.tex_ref(), self.scale[c]),
+            _ => (self.remapped([c; 3]), 1.0),
         }
     }
 
@@ -193,7 +271,8 @@ fn slot_transform(t: Affine2) -> [f32; 6] {
     let flip = Affine2::from_cols(Vec2::X, -Vec2::Y, Vec2::Y);
     let t = flip * t * flip;
     let [a, d, b, e] = t.matrix2.to_cols_array();
-    [a - 1.0, b, t.translation.x, d, e - 1.0, t.translation.y]
+    // Adding 0 turns -0 into 0, so equal transforms store equal bytes.
+    [a - 1.0, b, t.translation.x, d, e - 1.0, t.translation.y].map(|x| x + 0.0)
 }
 
 /// Fails on a connection cycle among the nodes `roots` reach. Every later walk of the
@@ -244,42 +323,18 @@ fn acyclic(net: &Network, roots: impl IntoIterator<Item = usize>) -> Result<(), 
 }
 
 /// Maps the surface node (and an optional MaterialX `displacement` node) of `net`.
-/// `primvars` names the mesh primvar of each uv set, which primvar readers and geometric
-/// properties name. The uv transform comes back in [`Mapped::uv`].
 pub(crate) fn map(
     net: &Network,
     surface: usize,
     displacement: Option<usize>,
-    primvars: &[&str],
-) -> Result<Mapped, String> {
-    mapped(net, surface, displacement, primvars, false)
-}
-
-/// [`map`] for a material without a mesh: each texture's uv transform stays in its slot.
-pub(crate) fn map_per_slot(
-    net: &Network,
-    surface: usize,
-    displacement: Option<usize>,
-    primvars: &[&str],
-) -> Result<Mapped, String> {
-    mapped(net, surface, displacement, primvars, true)
-}
-
-fn mapped(
-    net: &Network,
-    surface: usize,
-    displacement: Option<usize>,
-    primvars: &[&str],
-    per_slot: bool,
+    host: &mut Host<'_>,
 ) -> Result<Mapped, String> {
     acyclic(net, std::iter::once(surface).chain(displacement))?;
     let mut m = Mapper {
         net,
-        primvars,
-        per_slot,
+        host,
         material: Material::default(),
         textures: MaterialTextures::default(),
-        uv: Vec::new(),
         warnings: Vec::new(),
     };
     let node = &net.nodes[surface];
@@ -296,38 +351,24 @@ fn mapped(
     if let Some(d) = displacement {
         m.displacement(d)?;
     }
-    let first = m.uv.first().copied();
-    if let Some(t) = first
-        && m.uv.iter().any(|u| !u.abs_diff_eq(t, 1e-6))
-    {
-        return Err(format!(
-            "{}: its textures use different uv transforms; one material holds one",
-            node.name
-        ));
-    }
     Ok(Mapped {
         material: m.material,
         textures: m.textures,
-        uv: first.filter(|t| !t.abs_diff_eq(Affine2::IDENTITY, 1e-6)),
         warnings: m.warnings,
     })
 }
 
-struct Mapper<'a> {
+struct Mapper<'a, 'h> {
     net: &'a Network,
-    primvars: &'a [&'a str],
-    /// Whether uv transforms stay in the slots, leaving [`Mapped::uv`] empty.
-    per_slot: bool,
+    host: &'a mut Host<'h>,
     material: Material,
     textures: MaterialTextures,
-    /// The uv transform of every texture read.
-    uv: Vec<Affine2>,
     warnings: Vec<String>,
 }
 
 type Slot = fn(&mut MaterialTextures) -> &mut Option<TexRef>;
 
-impl Mapper<'_> {
+impl Mapper<'_, '_> {
     fn node(&self, n: usize) -> &Node {
         &self.net.nodes[n]
     }
@@ -404,9 +445,6 @@ impl Mapper<'_> {
                     .map_err(|e| format!("{what}: {e}"))?
             }
         };
-        if let Value::Texture(t) = &v {
-            self.uv.push(t.uv);
-        }
         Ok(Some(v))
     }
 
@@ -488,6 +526,16 @@ impl Mapper<'_> {
                     )),
                 }
             }
+            k if k.starts_with("UsdPrimvarReader_") => match self.fetch(n) {
+                Primvar::Constant(v) => Ok(Value::Constant(v)),
+                Primvar::Missing => Ok(Value::Constant(
+                    self.number(n, "fallback")?.unwrap_or_else(|| vec![0.0; 4]),
+                )),
+                Primvar::Uv(_) | Primvar::Varying => Err(format!(
+                    "{}: its primvar varies over the mesh, which holds no values for it",
+                    node.name
+                )),
+            },
             k => Err(format!(
                 "node {} ({k}) is not a constant, image or texture channel pick",
                 node.name
@@ -495,13 +543,11 @@ impl Mapper<'_> {
         }
     }
 
-    /// `uv`, a texture's transform, as [`Tex::uv`] and [`Tex::slot_uv`].
-    fn placed(&self, uv: Affine2) -> (Affine2, [f32; 6]) {
-        if self.per_slot {
-            (Affine2::IDENTITY, slot_transform(uv))
-        } else {
-            (uv, [0.0; 6])
-        }
+    /// What the mesh holds for the primvar of reader `n`.
+    fn fetch(&self, n: usize) -> Primvar {
+        let name = self.text(n, "varname").unwrap_or_default();
+        let read = self.host.reads.iter().find(|r| r.0 == name);
+        read.map_or(Primvar::Missing, |r| r.1.clone())
     }
 
     /// A MaterialX `image` or `tiledimage` node, its channels left for the caller.
@@ -532,7 +578,6 @@ impl Mapper<'_> {
                 * Affine2::from_scale(tiling)
                 * uv;
         }
-        let (uv, slot_uv) = self.placed(uv);
         Ok(Tex {
             image: *image,
             channels: Channels::Rgb,
@@ -540,7 +585,6 @@ impl Mapper<'_> {
             wrap,
             srgb,
             uv,
-            slot_uv,
             scale: [1.0; 4],
             bias: [0.0; 4],
         })
@@ -571,12 +615,7 @@ impl Mapper<'_> {
         };
         let scale = four(self.number(n, "scale")?, 1.0);
         let bias = four(self.number(n, "bias")?, 0.0);
-        let (uv_set, uv) = match self.input(n, "st") {
-            None => (0, Affine2::IDENTITY),
-            Some(Input::Connect { node, .. }) => self.coordinates(*node)?,
-            Some(_) => return Err(format!("{}: st must be connected", node.name)),
-        };
-        let (uv, slot_uv) = self.placed(uv);
+        let (uv_set, uv) = self.texcoord(n, "st", (0, fixed(Vec2::ZERO)))?;
         Ok(Tex {
             image: *image,
             channels: Channels::Rgb,
@@ -584,10 +623,23 @@ impl Mapper<'_> {
             wrap,
             srgb,
             uv,
-            slot_uv,
             scale,
             bias,
         })
+    }
+
+    /// A texture of `rgb`, for a constant input read through a slot.
+    fn solid(&mut self, rgb: [f32; 3]) -> Tex {
+        Tex {
+            image: (self.host.solid)(rgb),
+            channels: Channels::Rgb,
+            uv_set: 0,
+            wrap: [Wrap::Repeat; 2],
+            srgb: Some(false),
+            uv: Affine2::IDENTITY,
+            scale: [1.0; 4],
+            bias: [0.0; 4],
+        }
     }
 
     /// The uv set and transform coordinate input `name` of `n` gives; `unset` when unauthored.
@@ -624,6 +676,7 @@ impl Mapper<'_> {
                 "geompropvalue" => {
                     let name = self.text(n, "geomprop").unwrap_or_default();
                     let set = self
+                        .host
                         .primvars
                         .iter()
                         .position(|p| *p == name)
@@ -637,13 +690,20 @@ impl Mapper<'_> {
                     }
                 }
                 "UsdPrimvarReader_float2" => {
-                    let name = self.text(n, "varname").unwrap_or("st");
-                    let set = self.primvars.iter().position(|p| *p == name);
-                    let set = set.ok_or_else(|| {
-                        let sets = self.primvars.join(", ");
-                        format!("{}: reads {name}; the mesh uv sets are {sets}", node.name)
-                    })?;
-                    return Ok((set as u8, outer));
+                    return match self.fetch(n) {
+                        Primvar::Uv(set) => Ok((set, outer)),
+                        Primvar::Constant(v) => Ok((0, outer * fixed(point2(&v)))),
+                        Primvar::Missing => {
+                            let fallback = self.vec2(n, "fallback", Vec2::ZERO)?;
+                            Ok((0, outer * fixed(fallback)))
+                        }
+                        Primvar::Varying => Err(format!(
+                            "{}: reads {}; the mesh uv sets are {}",
+                            node.name,
+                            self.text(n, "varname").unwrap_or_default(),
+                            self.host.primvars.join(", "),
+                        )),
+                    };
                 }
                 "place2d" => {
                     let pivot = self.vec2(n, "pivot", Vec2::ZERO)?;
@@ -668,7 +728,7 @@ impl Mapper<'_> {
                     let rotation = self.float(n, "rotation", 0.0)?.to_radians();
                     let translation = self.vec2(n, "translation", Vec2::ZERO)?;
                     let t = Affine2::from_scale_angle_translation(scale, rotation, translation);
-                    (t, "in", (0, Affine2::IDENTITY))
+                    (t, "in", (0, fixed(Vec2::ZERO)))
                 }
                 k => {
                     return Err(format!(
@@ -708,9 +768,9 @@ impl Mapper<'_> {
                         self.node(n).name
                     ));
                 }
-                self.no_bias(n, input, &t)?;
-                *field(&mut self.material) = t.scale[t.channel()];
-                *slot(&mut self.textures) = Some(t.tex_ref());
+                let (r, value) = t.scalar();
+                *field(&mut self.material) = value;
+                *slot(&mut self.textures) = Some(r);
             }
         }
         Ok(())
@@ -738,9 +798,20 @@ impl Mapper<'_> {
                         self.node(n).name
                     ));
                 }
-                self.no_bias(n, input, &t)?;
-                *field(&mut self.material) = [t.scale[0], t.scale[1], t.scale[2]];
-                *slot(&mut self.textures) = Some(t.tex_ref());
+                let (r, value) = if t.bias[..3].iter().any(|&b| b != 0.0) {
+                    // Texels store 0..1, so the field holds what the input reaches past that.
+                    let peak = [0, 1, 2].map(|c| t.bias[c].max(t.bias[c] + t.scale[c]).max(1.0));
+                    let remap = [0, 1, 2].map(|c| [t.bias[c] / peak[c], t.scale[c] / peak[c]]);
+                    let r = TexRef {
+                        remap: Some(remap),
+                        ..t.tex_ref()
+                    };
+                    (r, peak)
+                } else {
+                    (t.tex_ref(), [t.scale[0], t.scale[1], t.scale[2]])
+                };
+                *field(&mut self.material) = value;
+                *slot(&mut self.textures) = Some(r);
             }
         }
         Ok(())
@@ -751,16 +822,6 @@ impl Mapper<'_> {
             "{} input {input} is textured; the material has no texture slot for it",
             self.node(n).name
         )
-    }
-
-    fn no_bias(&self, n: usize, input: &str, t: &Tex) -> Result<(), String> {
-        if t.bias.iter().any(|&b| b != 0.0) {
-            return Err(format!(
-                "{} input {input}: a texture bias has no material field",
-                self.node(n).name
-            ));
-        }
-        Ok(())
     }
 
     fn open_pbr(&mut self, n: usize) -> Result<(), String> {
@@ -958,8 +1019,24 @@ impl Mapper<'_> {
         let specular = self
             .number(n, "useSpecularWorkflow")?
             .is_some_and(|v| v[0] != 0.0);
+        self.scalar(n, "ior", |m| &mut m.specular_ior, None)?;
+        let ior = self.material.specular_ior;
         if specular {
             self.color(n, "specularColor", |m| &mut m.specular_color, None)?;
+            let authored = self.input(n, "specularColor").is_some();
+            let f0 = if authored {
+                self.material.specular_color
+            } else {
+                [0.0; 3]
+            };
+            // Past this the IOR leaves what a float holds.
+            let peak = f0.into_iter().fold(0.0, f32::max).clamp(0.0, 0.9999);
+            let r = peak.sqrt();
+            self.material.specular_ior = (1.0 + r) / (1.0 - r);
+            self.material.specular_color = match peak {
+                0.0 => [1.0; 3],
+                _ => f0.map(|c| c.max(0.0) / peak),
+            };
         } else {
             self.scalar(
                 n,
@@ -974,73 +1051,103 @@ impl Mapper<'_> {
             |m| &mut m.specular_roughness,
             Some(|t| &mut t.roughness),
         )?;
-        self.scalar(n, "ior", |m| &mut m.specular_ior, None)?;
         self.scalar(
             n,
             "clearcoat",
             |m| &mut m.coat_weight,
             Some(|t| &mut t.coat),
         )?;
-        self.scalar(n, "clearcoatRoughness", |m| &mut m.coat_roughness, None)?;
         if self.material.coat_weight > 0.0 || self.textures.coat.is_some() {
-            self.material.coat_ior = 1.5;
+            self.material.coat_roughness = 0.01;
+            self.scalar(n, "clearcoatRoughness", |m| &mut m.coat_roughness, None)?;
+            self.material.coat_ior = ior;
             self.material.coat_color = [1.0; 3];
         }
-        self.scalar(
-            n,
-            "opacity",
-            |m| &mut m.geometry_opacity,
-            Some(|t| &mut t.opacity),
-        )?;
-        let threshold = self.number(n, "opacityThreshold")?.map_or(0.0, |v| v[0]);
-        if threshold > 0.0 {
-            self.material.alpha_mode = Material::MASK;
-            self.material.alpha_cutoff = threshold;
-        } else if self.textures.opacity.is_some() || self.material.geometry_opacity < 1.0 {
-            self.material.alpha_mode = Material::BLEND;
-        }
+        self.preview_opacity(n)?;
         match self.value(n, "occlusion")? {
             None | Some(Value::Constant(_)) => {}
             Some(Value::Texture(t)) => {
-                self.no_bias(n, "occlusion", &t)?;
-                self.textures.occlusion = Some((t.tex_ref(), 1.0));
+                self.textures.occlusion = Some((t.scalar().0, 1.0));
             }
         }
         match self.value(n, "normal")? {
-            None | Some(Value::Constant(_)) => {}
-            Some(Value::Texture(t)) => {
-                // Each axis 2t - 1, or 1 - 2t to flip x or y.
-                let sign = |c: usize| match (t.scale[c], t.bias[c]) {
-                    (2.0, -1.0) => Some(1.0),
-                    (-2.0, 1.0) if c < 2 => Some(-1.0),
-                    _ => None,
-                };
-                match (t.channels, sign(0), sign(1), sign(2)) {
-                    (Channels::Rgb, Some(x), Some(y), Some(_)) => {
-                        self.textures.normal = Some((t.tex_ref(), [x, y]));
-                    }
-                    _ => {
-                        return Err(format!(
-                            "{}: a normal texture reads rgb at scale 2 and bias -1 (x and y \
-                             may flip: scale -2, bias 1)",
-                            self.node(n).name
-                        ));
-                    }
+            None => {}
+            Some(Value::Constant(v)) => {
+                let at = |i: usize, d: f32| v.get(i).copied().unwrap_or(d);
+                let normal = [at(0, 0.0), at(1, 0.0), at(2, 1.0)];
+                if normal != [0.0, 0.0, 1.0] {
+                    let t = self.solid(normal.map(|c| 0.5 * c + 0.5));
+                    self.textures.normal = Some((t.tex_ref(), [1.0; 2]));
                 }
+            }
+            Some(Value::Texture(t)) => {
+                if t.channels != Channels::Rgb {
+                    return Err(format!("{}: a normal texture reads rgb", self.node(n).name));
+                }
+                // An axis of `s (2 t - 1)` is the tangent-space encoding at strength `s`, which
+                // stands for a signed image's values too.
+                let strength =
+                    |c: usize| (t.bias[c] == -0.5 * t.scale[c]).then(|| 0.5 * t.scale[c]);
+                self.textures.normal = Some(match (strength(0), strength(1), strength(2)) {
+                    (Some(x), Some(y), Some(1.0)) => (t.tex_ref(), [x, y]),
+                    _ => (t.remapped([0, 1, 2]), [1.0; 2]),
+                });
             }
         }
         match self.value(n, "displacement")? {
             None => {}
             Some(Value::Constant(v)) if v[0] == 0.0 => {}
-            Some(Value::Constant(_)) => {
+            Some(Value::Constant(v)) => {
+                let t = self.solid([0.0; 3]);
+                self.displaced(t, 0.0, v[0]);
+            }
+            Some(Value::Texture(t)) => {
+                let c = t.channel();
+                self.displaced(t, t.scale[c], t.bias[c]);
+            }
+        }
+        Ok(())
+    }
+
+    /// `opacity`, as `opacityThreshold` and `opacityMode` have it.
+    fn preview_opacity(&mut self, n: usize) -> Result<(), String> {
+        let threshold = self.number(n, "opacityThreshold")?.map_or(0.0, |v| v[0]);
+        if threshold > 0.0 || self.text(n, "opacityMode") == Some("presence") {
+            self.scalar(
+                n,
+                "opacity",
+                |m| &mut m.geometry_opacity,
+                Some(|t| &mut t.opacity),
+            )?;
+            if threshold > 0.0 {
+                self.material.alpha_mode = Material::MASK;
+                self.material.alpha_cutoff = threshold;
+            } else if self.textures.opacity.is_some() || self.material.geometry_opacity < 1.0 {
+                self.material.alpha_mode = Material::BLEND;
+            }
+            return Ok(());
+        }
+        match self.value(n, "opacity")? {
+            None => {}
+            Some(Value::Constant(v)) if v[0] >= 1.0 => {}
+            Some(Value::Constant(v)) => {
+                self.material.transmission_weight = 1.0 - v[0].max(0.0);
+                self.material.thin_walled = 1;
+            }
+            Some(Value::Texture(t)) if t.channels == Channels::Rgb => {
                 return Err(format!(
-                    "{}: a constant displacement has no texture to displace with",
+                    "{} input opacity: a scalar reads one channel",
                     self.node(n).name
                 ));
             }
             Some(Value::Texture(t)) => {
                 let c = t.channel();
-                self.displaced(t, t.scale[c], t.bias[c]);
+                self.textures.transmission = Some(TexRef {
+                    remap: Some([[1.0 - t.bias[c], -t.scale[c]]; 3]),
+                    ..t.tex_ref()
+                });
+                self.material.transmission_weight = 1.0;
+                self.material.thin_walled = 1;
             }
         }
         Ok(())
