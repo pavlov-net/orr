@@ -36,6 +36,10 @@ pub(crate) enum Transfer {
     Dci,
     Pq,
     Hlg,
+    SLog,
+    SLog2,
+    AcesCc,
+    AcesCct,
 }
 
 impl Transfer {
@@ -44,6 +48,8 @@ impl Transfer {
         const PQ_WHITE_NITS: f64 = 203.0;
         const HLG_WHITE_SIGNAL: f64 = 0.75;
         let v = f64::from(signal);
+        let log2 = |v: f64| (v * 17.52 - 9.72).exp2();
+        let slog = |v: f64| 10f64.powf((v - 0.646596) / 0.432699) - 0.037584;
         let linear = match self {
             Self::Linear => return signal,
             Self::Srgb => srgb_decode(v),
@@ -58,6 +64,17 @@ impl Transfer {
             Self::Dci => v.max(0.0).powf(2.6) * 52.37 / 48.0,
             Self::Pq => pq_decode(v) / PQ_WHITE_NITS,
             Self::Hlg => hlg_decode(v) / hlg_decode(HLG_WHITE_SIGNAL),
+            Self::SLog => slog(v),
+            Self::SLog2 if v < 0.030_001_222_851_889_303 => {
+                (v - 0.030_001_222_851_889_303) / 3.538_812_785_388_13
+            }
+            Self::SLog2 => slog(v) * 219.0 / 155.0,
+            Self::AcesCc if v <= (9.72 - 15.0) / 17.52 => (log2(v) - 2f64.powi(-16)) * 2.0,
+            Self::AcesCc => log2(v).min(65504.0),
+            Self::AcesCct if v <= 0.155_251_141_552_511 => {
+                (v - 0.072_905_534_195_835_5) / 10.540_237_741_654_5
+            }
+            Self::AcesCct => log2(v),
         };
         linear as f32
     }
@@ -349,6 +366,51 @@ fn smpte(white: [f64; 2]) -> Gamut {
     chromaticities([[0.63, 0.34], [0.31, 0.595], [0.155, 0.07], white])
 }
 
+/// The gamut of a KTX2 DFD `colorPrimaries`.
+pub(crate) fn ktx2_gamut(p: ktx2::ColorPrimaries) -> Option<Gamut> {
+    use ktx2::ColorPrimaries as P;
+    Some(match p {
+        P::BT709 => Gamut::REC709,
+        P::BT601EBU => ebu(),
+        P::BT601SMPTE => smpte(D65),
+        P::BT2020 => Gamut::Rgb(RgbPrimaries::REC2020),
+        P::CIEXYZ => Gamut::Xyz,
+        P::ACES => Gamut::Rgb(RgbPrimaries::ACES_AP0),
+        P::ACESCC => Gamut::Rgb(RgbPrimaries::ACES_CG),
+        P::NTSC1953 => ntsc_1953(),
+        P::PAL525 => smpte([0.3101, 0.3162]),
+        P::DISPLAYP3 => Gamut::Rgb(RgbPrimaries::DISPLAY_P3),
+        P::AdobeRGB => Gamut::Rgb(RgbPrimaries::ADOBE_RGB),
+        _ => return None,
+    })
+}
+
+/// The transfer of a KTX2 DFD `transferFunction`, as the Khronos Data Format Specification
+/// defines each. A signal reads to scene light through an OETF's inverse and display light
+/// through an EOTF; both PQ and both HLG values read as one curve, which keeps white at 1.
+pub(crate) fn ktx2_transfer(t: ktx2::TransferFunction) -> Option<Transfer> {
+    use ktx2::TransferFunction as T;
+    Some(match t {
+        T::Linear => Transfer::Linear,
+        T::SRGB => Transfer::Srgb,
+        T::ITU => Transfer::Itu,
+        T::NTSC => Transfer::Gamma(2.2),
+        T::SLOG => Transfer::SLog,
+        T::SLOG2 => Transfer::SLog2,
+        T::BT1886 => Transfer::Gamma(2.4),
+        T::HLGOETF | T::HLGEOTF => Transfer::Hlg,
+        T::PQEOTF | T::PQOETF => Transfer::Pq,
+        T::DCIP3 => Transfer::Dci,
+        T::PALOETF => Transfer::Gamma(2.5),
+        T::PAL625EOTF => Transfer::Gamma(2.8),
+        T::ST240 => Transfer::St240,
+        T::ACESCC => Transfer::AcesCc,
+        T::ACESCCT => Transfer::AcesCct,
+        T::AdobeRGB => Transfer::Gamma(563.0 / 256.0),
+        _ => return None,
+    })
+}
+
 /// The gamut of an H.273 primaries code; values it leaves unspecified or reserved say nothing.
 pub(crate) fn cicp_gamut(p: u8) -> Option<Gamut> {
     Some(match p {
@@ -402,7 +464,13 @@ mod tests {
     #[test]
     fn piecewise_transfers_meet_at_their_joins() {
         let at = |t: Transfer, v: f32| (t.decode(v - 1e-6), t.decode(v + 1e-6));
-        for (t, join) in [(Transfer::Itu, 0.081), (Transfer::St240, 0.0913)] {
+        for (t, join) in [
+            (Transfer::Itu, 0.081),
+            (Transfer::St240, 0.0913),
+            (Transfer::SLog2, 0.030_001_22),
+            (Transfer::AcesCc, (9.72 - 15.0) / 17.52),
+            (Transfer::AcesCct, 0.155_251_14),
+        ] {
             let (below, above) = at(t, join);
             assert!((below - above).abs() < 1e-4, "{t:?}: {below} {above}");
         }

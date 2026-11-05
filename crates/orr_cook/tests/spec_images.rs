@@ -968,6 +968,80 @@ fn linear(code: f64) -> f32 {
     orr_color::srgb_decode(code / 255.0) as f32
 }
 
+/// `file`, a KTX2, with its DFD's `colorPrimaries`, `transferFunction` and `flags`.
+fn with_dfd(file: &[u8], primaries: u8, transfer: u8, flags: u8) -> Vec<u8> {
+    let mut out = file.to_vec();
+    let dfd = u32::from_le_bytes(file[48..52].try_into().unwrap()) as usize;
+    out[dfd + 13..dfd + 16].copy_from_slice(&[primaries, transfer, flags]);
+    out
+}
+
+/// KTX 2.0 §3.10: the DFD's `colorPrimaries` and `transferFunction`. The spec's notes say which
+/// files are valid and lay no duty on loaders; honoring them is this project's rule for files
+/// that state them. Display P3 keeps its id, ACES AP0 has none and converts to Rec.2020, and
+/// A2B10G10R10, which has no sRGB format, "may be used with `KHR_DF_TRANSFER_SRGB`".
+#[test]
+fn ktx2_dfd_states_primaries_and_transfer() {
+    const P3: u8 = 10;
+    const ACES: u8 = 6;
+    const SRGB: u8 = 2;
+    let d = dir("ktx2_dfd");
+    let flat = |format| {
+        float_ktx2(
+            8,
+            8,
+            ctt::TargetFormat::Uncompressed(format),
+            false,
+            |_, _| [0.5, 0.25, 0.125, 1.0],
+        )
+    };
+    let rgba = flat(ctt::Format::R16G16B16A16_UNORM);
+    let (id, [t, _]) = read_back(&d, &with_dfd(&rgba, P3, 1, 0));
+    assert_eq!(id, 1);
+    assert_rgb(t, [0.5, 0.25, 0.125], "P3 stays as stored");
+
+    let (id, [t, _]) = read_back(&d, &with_dfd(&rgba, ACES, 1, 0));
+    assert_eq!(id, 2);
+    let want = orr_color::RgbPrimaries::ACES_AP0.matrix_to(orr_color::RgbPrimaries::REC2020)
+        * orr_math::DVec3::new(0.5, 0.25, 0.125);
+    assert_rgb(t, want.as_vec3().to_array(), "AP0 converts");
+
+    let packed = flat(ctt::Format::A2B10G10R10_UNORM_PACK32);
+    let (_, [t, _]) = read_back(&d, &with_dfd(&packed, 1, SRGB, 0));
+    let decoded = [0.5, 0.25, 0.125].map(|v| orr_color::srgb_decode(v) as f32);
+    assert_rgb(t, decoded, "sRGB transfer on a format without an sRGB form");
+}
+
+/// A KTX2 of 8 x 8 BC7 sRGB blocks, every mip, of stored texels `f(x, y)`.
+fn bc7_srgb(f: impl Fn(u32, u32) -> [f32; 4]) -> Vec<u8> {
+    let bc7 = ctt::TargetFormat::Compressed {
+        format: ctt::Format::BC7_UNORM_BLOCK,
+        encoder: ctt::encoders::Encoder::Bc7enc(Default::default()),
+    };
+    let mut file = float_ktx2(8, 8, bc7, true, f);
+    file[12..16].copy_from_slice(&vk::BC7_SRGB.to_le_bytes());
+    file
+}
+
+/// What a block file states reaches materials through the scan of its blocks too, and a file's
+/// Display P3 is the file's alone: USD's `auto` takes it and glTF ignores it (L2418), keeping the
+/// blocks either way.
+#[test]
+fn ktx2_blocks_state_primaries_to_importers_that_read_them() {
+    let d = dir("ktx2_blocks_primaries");
+    let file = bc7_srgb(|x, y| [x as f32 / 8.0, y as f32 / 8.0, 0.5, 1.0]);
+    let file = with_dfd(&file, 10, 2, 0);
+    std::fs::write(d.join("p3.ktx2"), &file).unwrap();
+    let (a, m, _) = usd(&d, "p3.ktx2", "color3f inputs:diffuseColor", "rgb", "");
+    let e = a.find(m.textures[slot::BASE_COLOR].texture).unwrap();
+    assert_eq!(mips(&a, a.name(e)).0.header.primaries, 1);
+
+    let material = r#"{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}}}"#;
+    let (a, m) = gltf(&d, material, file);
+    let e = a.find(m.textures[slot::BASE_COLOR].texture).unwrap();
+    assert_eq!(mips(&a, a.name(e)).0.header.primaries, 0);
+}
+
 /// PNG §4.3, under this project's rule that plain files and USD's `auto` honor what they state:
 /// "the chunk with the lowest Priority number should take precedence", of `cICP`, `sRGB`, then
 /// `cHRM` and `gAMA`. The same files through glTF are `image_color_metadata_is_ignored`.

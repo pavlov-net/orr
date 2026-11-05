@@ -103,7 +103,7 @@ pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
         Some(k) => k.open()?,
         None => {
             match decode_container(bytes, InputOverrides::default()).map_err(|e| e.to_string())? {
-                Some(image) => container(image)?,
+                Some(image) => container(image, bytes)?,
                 None => file(bytes)?,
             }
         }
@@ -125,16 +125,38 @@ pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
     Ok(src)
 }
 
-/// What a container's format states.
-fn container_color(srgb: bool, numeric: bool) -> FileColor {
+/// What a KTX2 file's DFD states of `format`. A file's `_SRGB` format decodes on any sampler, so
+/// it stands over a transfer function that disagrees.
+fn ktx2_color(reader: &ktx2::Reader<&[u8]>, format: ctt::Format, numeric: bool) -> FileColor {
+    let stated = reader
+        .transfer_function()
+        .and_then(color::ktx2_transfer)
+        .unwrap_or(Transfer::Linear);
     FileColor {
-        transfer: Some(if srgb {
+        transfer: Some(if format.normalize().1 == ColorSpace::Srgb {
             Transfer::Srgb
         } else {
-            Transfer::Linear
+            stated
         }),
+        gamut: reader.color_primaries().and_then(color::ktx2_gamut),
         numeric,
         ..Default::default()
+    }
+}
+
+/// What the KTX2 or DDS file `bytes` states of `format`.
+fn container_color(bytes: &[u8], format: ctt::Format, srgb: bool, numeric: bool) -> FileColor {
+    match ktx2::Reader::new(bytes) {
+        Ok(reader) => ktx2_color(&reader, format, numeric),
+        Err(_) => FileColor {
+            transfer: Some(if srgb {
+                Transfer::Srgb
+            } else {
+                Transfer::Linear
+            }),
+            numeric,
+            ..Default::default()
+        },
     }
 }
 
@@ -268,7 +290,7 @@ impl<'a> Ktx2Blocks<'a> {
     fn color(&self) -> FileColor {
         let vk_format = self.vk_format();
         let numeric = float_blocks(vk_format) || signed_blocks(vk_format);
-        container_color(self.format.normalize().1 == ColorSpace::Srgb, numeric)
+        ktx2_color(&self.reader, self.format, numeric)
     }
 
     fn open(self) -> Result<Source, String> {
@@ -444,7 +466,7 @@ fn bc7_opaque(block: &[u8]) -> bool {
     block[0] & 0x0f != 0 || (block[0] & 0x7f == 0x40 && bits >> 49 == 0x7fff && block[8] & 1 == 1)
 }
 
-fn container(image: ctt::Image) -> Result<Source, String> {
+fn container(image: ctt::Image, bytes: &[u8]) -> Result<Source, String> {
     let cube = match image.kind {
         TextureKind::Texture2D => false,
         TextureKind::Cubemap if image.surfaces.len() == 6 => true,
@@ -482,7 +504,12 @@ fn container(image: ctt::Image) -> Result<Source, String> {
         return Ok(Source {
             layers: Vec::new(),
             cube,
-            color: container_color(srgb, float_blocks(vk_format) || signed_blocks(vk_format)),
+            color: container_color(
+                bytes,
+                format,
+                srgb,
+                float_blocks(vk_format) || signed_blocks(vk_format),
+            ),
             blocks: Some(Blocks {
                 vk_format,
                 w,
@@ -540,7 +567,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
     Ok(Source {
         layers,
         cube,
-        color: container_color(srgb, is_float(format) || is_snorm(format)),
+        color: container_color(bytes, format, srgb, is_float(format) || is_snorm(format)),
         blocks: None,
         rg: format.channel_count() == Some(2),
         signed: is_snorm(format),
