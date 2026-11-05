@@ -318,12 +318,14 @@ pub(crate) fn binds_uv1(m: &Material) -> bool {
 /// tangent frame it reads.
 pub(crate) fn reads_uv1(m: &Material) -> bool {
     let frame = reads_tangent(m) || m.textures[slot::NORMAL].texture != AssetId::NONE;
+    let frame = frame || m.textures[slot::COAT_NORMAL].texture != AssetId::NONE;
     binds_uv1(m) || (frame && m.tangent_set() == 1)
 }
 
 /// Whether material `m` reads the tangent with or without a normal map.
 pub(crate) fn reads_tangent(m: &Material) -> bool {
-    m.specular_anisotropy > 0.0 || m.coat_anisotropy > 0.0 || m.surface != 0
+    let coat_map = m.textures[slot::COAT_NORMAL].texture != AssetId::NONE;
+    m.specular_anisotropy > 0.0 || m.coat_anisotropy > 0.0 || coat_map || m.surface != 0
 }
 
 /// [`Section`] flags of a section drawn with material `m`.

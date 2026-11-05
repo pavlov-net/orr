@@ -1290,6 +1290,37 @@ fn preview_parameters_carry_their_spec_values() {
     assert_eq!(material(&a).specular_color, [0.5; 3]);
 }
 
+/// PS inputs are connectable: `specularColor`, `ior` (for the clearcoat too) and
+/// `clearcoatRoughness` read textures.
+#[test]
+fn preview_inputs_read_textures_with_slots_of_their_own() {
+    let inputs = "int inputs:useSpecularWorkflow = 1
+        color3f inputs:specularColor.connect = </M/T.outputs:rgb>
+        float inputs:ior.connect = </M/I.outputs:r>
+        float inputs:clearcoat = 1
+        float inputs:clearcoatRoughness.connect = </M/T.outputs:g>";
+    let prims = format!(
+        "{}\n{}\n{READER}",
+        texture("T", RAW),
+        texture(
+            "I",
+            &format!(
+                "{RAW}\n float4 inputs:scale = (2, 2, 2, 1)\n float4 inputs:bias = (1, 1, 1, 0)"
+            )
+        )
+    );
+    let m = material(&shaded(
+        "preview-textured",
+        &previewed(inputs, &prims, ST),
+        &gradient(),
+    ));
+    let bound = |s: usize| m.textures[s].texture != AssetId::NONE;
+    assert!(bound(slot::SPECULAR_COLOR));
+    assert!(bound(slot::COAT_ROUGHNESS));
+    assert!(bound(slot::SPECULAR_IOR) && bound(slot::COAT_IOR));
+    assert_eq!(m.model, Material::MODEL_PREVIEW_SPECULAR);
+}
+
 /// PS `opacityMode`: under the default *transparent* "opacity reduces the contribution of the
 /// diffuse lighting component in favor of transparency, while the specular response and emissive
 /// component remain at full weight"; *presence* "scales the entire lighting response".

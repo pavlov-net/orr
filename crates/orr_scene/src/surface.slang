@@ -5,6 +5,7 @@
 module surface;
 
 import orr_shaders.abi;
+import orr_color.primaries;
 import orr_shaders.math;
 import orr_pack.normal_map;
 __exported import orr_scene.gbuffer;
@@ -106,14 +107,14 @@ public float material_coverage(SurfaceInput i)
     return material_opacity(i) >= i.scene.materials[i.material].alpha_cutoff ? 1.0 : 0.0;
 }
 
-// The shading frame: the vertex normal, turned by the material's normal map. MikkTSpace's
-// bakers invert this transform: the interpolated normal and tangent as they stand, neither
-// unit nor perpendicular.
-public float3 material_normal(SurfaceInput i, MaterialGpu* m)
+// The shading frame: the vertex normal, turned by the material's normal map in `slot`.
+// MikkTSpace's bakers invert this transform: the interpolated normal and tangent as they stand,
+// neither unit nor perpendicular.
+public float3 material_normal(SurfaceInput i, MaterialGpu* m, uint slot = TEXTURE_NORMAL)
 {
-    if (!material_bound(m, TEXTURE_NORMAL))
+    if (!material_bound(m, slot))
         return i.normal;
-    float3 v = material_normal_frame(m, TEXTURE_NORMAL, normal_decode(material_texture(m, TEXTURE_NORMAL, i.uv, float4(0.5, 0.5, 1.0, 1.0)).xy));
+    float3 v = material_normal_frame(m, slot, normal_decode(material_texture(m, slot, i.uv, float4(0.5, 0.5, 1.0, 1.0)).xy));
     float3 n = i.frame_normal;
     float3 t = i.tangent.xyz;
     float3 b = cross(n, t) * i.tangent.w;
@@ -191,7 +192,7 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
     if ((c & DECAL_METALNESS) != 0)
         decal_over(layer.metalness, layer.metalness_cover, m.metalness * material_texture(m, TEXTURE_METALNESS, fs, one).x, share);
     if ((c & DECAL_EMISSION) != 0)
-        decal_over(layer.emission, layer.emission_cover, material_color(m, TEXTURE_EMISSION, fs, material_emission(m)), share);
+        decal_over(layer.emission, layer.emission_cover, material_emission_at(m, fs), share);
     if ((c & DECAL_NORMAL) != 0)
     {
         // The decal's tangent frame on the surface: its x axis, and up its y axis, against
@@ -264,6 +265,17 @@ public void apply_decals(DecalLayer layer, inout BsdfParams p, inout float3 norm
         normal = safe_normalize(normal * (1.0 - layer.normal_cover) + layer.normal, normal);
 }
 
+// `BsdfParams.specular_color` of `m` from its specular color `color` and IOR `ior`: past OpenPBR,
+// F0, a reflectance that holds to 0..1 in the space it was stated in, Rec.709.
+float3 surface_specular_color(MaterialGpu* m, float3 color, float ior)
+{
+    if ((m.flags & MATERIAL_FRESNEL_MIX) == 0)
+        return color;
+    float r = (ior - 1.0) / (ior + 1.0);
+    float scale = (m.flags & MATERIAL_F0_STATED) != 0 ? 1.0 : r * r;
+    return mul(REC709_TO_REC2020, saturate(scale * mul(REC2020_TO_REC709, color)));
+}
+
 // The direction `rotation` turns from the mesh tangent about `normal`, measured from
 // orthonormal_basis(normal).
 float surface_tangent_angle(SurfaceInput i, float3 normal, float rotation)
@@ -286,32 +298,37 @@ public struct StandardSurface : ISurface
         MaterialGpu* m = i.scene.materials + i.material;
         float4 one = float4(1.0);
         BsdfParams p;
-        p.base_color = m.base_weight * material_color(m, TEXTURE_BASE_COLOR, i.uv, m.base_color);
+        p.base_color = m.base_weight * material_scale(m, TEXTURE_BASE_WEIGHT, i.uv) * material_color(m, TEXTURE_BASE_COLOR, i.uv, m.base_color);
         p.metalness = m.metalness * material_texture(m, TEXTURE_METALNESS, i.uv, one).x;
-        p.specular_color = m.specular_color;
+        p.specular_ior = m.specular_ior * material_scale(m, TEXTURE_SPECULAR_IOR, i.uv);
+        p.specular_color = surface_specular_color(m, material_more_color(m, TEXTURE_SPECULAR_COLOR, i.uv, m.specular_color), p.specular_ior);
         p.specular_weight = m.specular_weight * material_texture(m, TEXTURE_SPECULAR_WEIGHT, i.uv, one).x;
         p.specular_roughness = m.specular_roughness * material_texture(m, TEXTURE_ROUGHNESS, i.uv, one).x;
-        p.specular_ior = m.specular_ior;
-        p.diffuse_roughness = m.diffuse_roughness;
+        p.diffuse_roughness = m.diffuse_roughness * material_scale(m, TEXTURE_DIFFUSE_ROUGHNESS, i.uv);
         p.transmission_weight = m.transmission_weight * material_texture(m, TEXTURE_TRANSMISSION, i.uv, one).x;
         bool thin = (m.flags & MATERIAL_THIN_WALLED) != 0;
-        p.transmission_color = thin || m.transmission_depth == 0.0 ? m.transmission_color : float3(1.0);
-        p.subsurface_weight = m.subsurface_weight;
+        p.transmission_color = thin || m.transmission_depth == 0.0 ? material_more_color(m, TEXTURE_TRANSMISSION_COLOR, i.uv, m.transmission_color) : float3(1.0);
+        p.subsurface_weight = m.subsurface_weight * material_scale(m, TEXTURE_SUBSURFACE_WEIGHT, i.uv);
         p.subsurface_color = material_color(m, TEXTURE_SUBSURFACE_COLOR, i.uv, m.subsurface_color);
         p.subsurface_anisotropy = m.subsurface_scatter_anisotropy;
-        p.subsurface_radius = m.subsurface_radius * m.subsurface_radius_scale;
+        p.subsurface_radius = m.subsurface_radius * material_scale(m, TEXTURE_SUBSURFACE_RADIUS, i.uv) * m.subsurface_radius_scale;
+        if ((m.flags & MATERIAL_MORE_TEXTURES) != 0)
+        {
+            p.subsurface_radius *= material_texture(m, TEXTURE_SUBSURFACE_RADIUS_SCALE, i.uv, one).rgb;
+            p.subsurface_anisotropy = 2.0 * material_texture(m, TEXTURE_SUBSURFACE_ANISOTROPY, i.uv, float4(0.5 * p.subsurface_anisotropy + 0.5)).x - 1.0;
+        }
         p.coat_weight = m.coat_weight * material_texture(m, TEXTURE_COAT, i.uv, one).x;
-        p.coat_color = m.coat_color;
-        p.coat_roughness = m.coat_roughness;
-        p.coat_ior = m.coat_ior;
-        p.coat_darkening = m.coat_darkening;
-        p.fuzz_weight = m.fuzz_weight;
-        p.fuzz_color = m.fuzz_color;
-        p.fuzz_roughness = m.fuzz_roughness;
-        p.thin_film_weight = m.thin_film_weight;
-        p.thin_film_thickness = m.thin_film_thickness;
-        p.thin_film_ior = m.thin_film_ior;
-        p.emission = material_color(m, TEXTURE_EMISSION, i.uv, material_emission(m));
+        p.coat_color = material_more_color(m, TEXTURE_COAT_COLOR, i.uv, m.coat_color);
+        p.coat_roughness = m.coat_roughness * material_scale(m, TEXTURE_COAT_ROUGHNESS, i.uv);
+        p.coat_ior = m.coat_ior * material_scale(m, TEXTURE_COAT_IOR, i.uv);
+        p.coat_darkening = m.coat_darkening * material_scale(m, TEXTURE_COAT_DARKENING, i.uv);
+        p.fuzz_weight = m.fuzz_weight * material_scale(m, TEXTURE_FUZZ_WEIGHT, i.uv);
+        p.fuzz_color = material_more_color(m, TEXTURE_FUZZ_COLOR, i.uv, m.fuzz_color);
+        p.fuzz_roughness = m.fuzz_roughness * material_scale(m, TEXTURE_FUZZ_ROUGHNESS, i.uv);
+        p.thin_film_weight = m.thin_film_weight * material_scale(m, TEXTURE_THIN_FILM_WEIGHT, i.uv);
+        p.thin_film_thickness = m.thin_film_thickness * material_scale(m, TEXTURE_THIN_FILM_THICKNESS, i.uv);
+        p.thin_film_ior = m.thin_film_ior * material_scale(m, TEXTURE_THIN_FILM_IOR, i.uv);
+        p.emission = material_emission_at(m, i.uv);
 
         GSurface s = (GSurface)0;
         s.normal = material_normal(i, m);
@@ -326,18 +343,21 @@ public struct StandardSurface : ISurface
             p.flags |= BSDF_METAL_FLAT;
         if ((m.flags & MATERIAL_ANISOTROPY) != 0)
         {
-            p.specular_anisotropy = m.specular_anisotropy;
-            p.tangent_angle = surface_tangent_angle(i, s.normal, m.specular_rotation);
+            p.specular_anisotropy = m.specular_anisotropy * material_scale(m, TEXTURE_ANISOTROPY, i.uv);
+            float rotation = m.specular_rotation + material_direction(m, TEXTURE_TANGENT, i.uv);
+            p.tangent_angle = surface_tangent_angle(i, s.normal, rotation);
             p.flags |= BSDF_ANISOTROPY;
         }
         p.coat_normal = (m.flags & MATERIAL_COAT_ON_BASE) != 0 ? s.normal : i.normal;
-        p.coat_anisotropy = m.coat_anisotropy;
+        if ((m.flags & MATERIAL_MORE_TEXTURES) != 0)
+            p.coat_normal = material_bound(m, TEXTURE_COAT_NORMAL) ? material_normal(i, m, TEXTURE_COAT_NORMAL) : p.coat_normal;
+        p.coat_anisotropy = m.coat_anisotropy * material_scale(m, TEXTURE_COAT_ANISOTROPY, i.uv);
         p.coat_tangent_angle = 0.0;
         if (p.coat_weight > 0.0)
         {
             p.flags |= BSDF_COAT;
             if (p.coat_anisotropy > 0.0)
-                p.coat_tangent_angle = surface_tangent_angle(i, p.coat_normal, m.coat_rotation);
+                p.coat_tangent_angle = surface_tangent_angle(i, p.coat_normal, m.coat_rotation + material_direction(m, TEXTURE_COAT_TANGENT, i.uv));
             if (p.coat_anisotropy > 0.0 || any(p.coat_normal != s.normal))
                 p.flags |= BSDF_COAT_FRAME;
         }

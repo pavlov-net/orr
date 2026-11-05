@@ -674,6 +674,58 @@ fn documents_map_as_the_clauses_say() {
             check: |m| close(m.transmission_depth, 0.05),
         },
         Row {
+            clause: "OpenPBR every input is connectable: a float image binds its input's slot",
+            body: FLOAT,
+            inputs: r#"<input name="base_weight" type="float" nodename="i"/>
+                <input name="specular_ior" type="float" nodename="i"/>
+                <input name="coat_roughness" type="float" nodename="i"/>
+                <input name="thin_film_weight" type="float" nodename="i"/>
+                <input name="thin_film_thickness" type="float" nodename="i"/>
+                <input name="emission_luminance" type="float" nodename="i"/>
+                <input name="subsurface_radius" type="float" nodename="i"/>"#,
+            check: |m| {
+                [
+                    slot::BASE_WEIGHT,
+                    slot::SPECULAR_IOR,
+                    slot::COAT_ROUGHNESS,
+                    slot::THIN_FILM_WEIGHT,
+                    slot::THIN_FILM_THICKNESS,
+                    slot::EMISSION_LUMINANCE,
+                    slot::SUBSURFACE_RADIUS,
+                ]
+                .iter()
+                .all(|&s| bound(m, s))
+                    && m.thin_film_thickness == 1000.0
+            },
+        },
+        Row {
+            clause: "OpenPBR every input is connectable: a color image binds its input's slot",
+            body: COLOR,
+            inputs: r#"<input name="specular_color" type="color3" nodename="i"/>
+                <input name="transmission_color" type="color3" nodename="i"/>
+                <input name="coat_color" type="color3" nodename="i"/>
+                <input name="fuzz_color" type="color3" nodename="i"/>"#,
+            check: |m| {
+                [
+                    slot::SPECULAR_COLOR,
+                    slot::TRANSMISSION_COLOR,
+                    slot::COAT_COLOR,
+                    slot::FUZZ_COLOR,
+                ]
+                .iter()
+                .all(|&s| bound(m, s))
+            },
+        },
+        Row {
+            clause: "OpenPBR geometry_coat_normal: a normal of the coat's own",
+            body: r#"<image name="i" type="vector3">
+                  <input name="file" type="filename" value="v.png"/></image>
+                <normalmap name="n" type="vector3"><input name="in" type="vector3" nodename="i"/>
+                  </normalmap>"#,
+            inputs: r#"<input name="geometry_coat_normal" type="vector3" nodename="n"/>"#,
+            check: |m| bound(m, slot::COAT_NORMAL) && !bound(m, slot::NORMAL),
+        },
+        Row {
             clause: "OpenPBR coat_darkening and coat_roughness_anisotropy are read as stated",
             body: "",
             inputs: r#"<input name="coat_darkening" type="float" value="0.25"/>

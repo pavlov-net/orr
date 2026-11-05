@@ -40,6 +40,11 @@
 //!   input states, and mips filter each tile alone. What the input reads where there is no tile
 //!   goes to the binding, and a set never collapses into a factor.
 //!
+//! - The slots from [`slot::MORE`] on take their inputs from [`MaterialTextures::more`]: a weight
+//!   as a coat weight is, a value that can read past 1 as a specular weight is, a color as
+//!   subsurface color is, the coat normal as the normal is but for Toksvig roughness, and a
+//!   direction as BC5 of its first two channels.
+//!
 //! A bound texture's value multiplies the matching factor; normal and opacity textures have no
 //! factor.
 //!
@@ -225,6 +230,10 @@ pub(crate) struct MaterialTextures {
     pub(crate) transmission: Option<TexRef>,
     pub(crate) subsurface_color: Option<TexRef>,
     pub(crate) displacement: Option<TexRef>,
+    /// With its scale per tangent axis, as `normal`.
+    pub(crate) coat_normal: Option<(TexRef, [f32; 2])>,
+    /// The inputs of the slots from [`slot::MORE`] on, by slot, but for the coat normal.
+    pub(crate) more: BTreeMap<usize, Option<TexRef>>,
 }
 
 impl MaterialTextures {
@@ -242,9 +251,11 @@ impl MaterialTextures {
             self.transmission.as_ref(),
             self.subsurface_color.as_ref(),
             self.displacement.as_ref(),
+            self.coat_normal.as_ref().map(|n| &n.0),
         ]
         .into_iter()
         .flatten()
+        .chain(self.more.values().flatten())
     }
 
     fn refs_mut(&mut self) -> impl Iterator<Item = &mut TexRef> {
@@ -260,22 +271,103 @@ impl MaterialTextures {
             self.transmission.as_mut(),
             self.subsurface_color.as_mut(),
             self.displacement.as_mut(),
+            self.coat_normal.as_mut().map(|n| &mut n.0),
         ]
         .into_iter()
         .flatten()
+        .chain(self.more.values_mut().flatten())
     }
 
     /// The references of color inputs.
     pub(crate) fn colors(&self) -> impl Iterator<Item = &TexRef> {
+        let more = self
+            .more
+            .iter()
+            .filter(|(s, _)| More::of(**s) == More::Color);
         [&self.base_color, &self.emissive, &self.subsurface_color]
             .into_iter()
             .flatten()
+            .chain(more.flat_map(|(_, r)| r))
     }
 
-    /// The image of a normal map that [`ImageFacts::cant_read`].
-    pub(crate) fn unscaled_normal(&self, facts: &HashMap<usize, ImageFacts>) -> Option<usize> {
-        let r = &self.normal.as_ref()?.0;
-        facts[&r.image].cant_read(r).then_some(r.image)
+    /// The images of normal maps that [`ImageFacts::cant_read`].
+    pub(crate) fn unscaled_normals<'a>(
+        &'a self,
+        facts: &'a HashMap<usize, ImageFacts>,
+    ) -> impl Iterator<Item = usize> + 'a {
+        let maps = [&self.normal, &self.coat_normal].into_iter().flatten();
+        maps.filter(|(r, _)| facts[&r.image].cant_read(r))
+            .map(|(r, _)| r.image)
+    }
+}
+
+/// How the input of a slot from [`slot::MORE`] on packs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum More {
+    /// A value of 0..1, with its role, whose factor folds into the texels.
+    Weight(&'static str),
+    /// A value from 0 up, with its role, which multiplies the field.
+    Ranged(&'static str),
+    /// A value of -1..1, with its role, stored at `0.5 v + 0.5` in the field's place.
+    Signed(&'static str),
+    Color,
+    /// The first two channels of a direction, with its role.
+    Direction(&'static str),
+}
+
+impl More {
+    fn of(s: usize) -> Self {
+        match s {
+            slot::SPECULAR_COLOR
+            | slot::TRANSMISSION_COLOR
+            | slot::SUBSURFACE_RADIUS_SCALE
+            | slot::FUZZ_COLOR
+            | slot::COAT_COLOR => Self::Color,
+            slot::SPECULAR_IOR => Self::Ranged("specular_ior"),
+            slot::COAT_IOR => Self::Ranged("coat_ior"),
+            slot::THIN_FILM_IOR => Self::Ranged("thin_film_ior"),
+            slot::THIN_FILM_THICKNESS => Self::Ranged("thin_film_thickness"),
+            slot::SUBSURFACE_RADIUS => Self::Ranged("subsurface_radius"),
+            slot::EMISSION_LUMINANCE => Self::Ranged("emission_luminance"),
+            slot::SUBSURFACE_ANISOTROPY => Self::Signed("subsurface_anisotropy"),
+            slot::TANGENT => Self::Direction("tangent"),
+            slot::COAT_TANGENT => Self::Direction("coat_tangent"),
+            slot::BASE_WEIGHT => Self::Weight("base_weight"),
+            slot::DIFFUSE_ROUGHNESS => Self::Weight("diffuse_roughness"),
+            slot::ANISOTROPY => Self::Weight("anisotropy"),
+            slot::SUBSURFACE_WEIGHT => Self::Weight("subsurface_weight"),
+            slot::FUZZ_WEIGHT => Self::Weight("fuzz_weight"),
+            slot::FUZZ_ROUGHNESS => Self::Weight("fuzz_roughness"),
+            slot::COAT_ROUGHNESS => Self::Weight("coat_roughness"),
+            slot::COAT_DARKENING => Self::Weight("coat_darkening"),
+            slot::COAT_ANISOTROPY => Self::Weight("coat_anisotropy"),
+            slot::THIN_FILM_WEIGHT => Self::Weight("thin_film_weight"),
+            _ => unreachable!("slot {s} is no input of `more`"),
+        }
+    }
+}
+
+/// The field a scalar slot from [`slot::MORE`] on multiplies.
+fn scalar_field(m: &mut Material, s: usize) -> &mut f32 {
+    match s {
+        slot::SPECULAR_IOR => &mut m.specular_ior,
+        slot::COAT_IOR => &mut m.coat_ior,
+        slot::THIN_FILM_IOR => &mut m.thin_film_ior,
+        slot::THIN_FILM_THICKNESS => &mut m.thin_film_thickness,
+        slot::SUBSURFACE_RADIUS => &mut m.subsurface_radius,
+        slot::EMISSION_LUMINANCE => &mut m.emission_luminance,
+        slot::SUBSURFACE_ANISOTROPY => &mut m.subsurface_scatter_anisotropy,
+        slot::BASE_WEIGHT => &mut m.base_weight,
+        slot::DIFFUSE_ROUGHNESS => &mut m.diffuse_roughness,
+        slot::ANISOTROPY => &mut m.specular_anisotropy,
+        slot::SUBSURFACE_WEIGHT => &mut m.subsurface_weight,
+        slot::FUZZ_WEIGHT => &mut m.fuzz_weight,
+        slot::FUZZ_ROUGHNESS => &mut m.fuzz_roughness,
+        slot::COAT_ROUGHNESS => &mut m.coat_roughness,
+        slot::COAT_DARKENING => &mut m.coat_darkening,
+        slot::COAT_ANISOTROPY => &mut m.coat_anisotropy,
+        slot::THIN_FILM_WEIGHT => &mut m.thin_film_weight,
+        _ => unreachable!("slot {s} is no scalar"),
     }
 }
 
@@ -1412,61 +1504,14 @@ impl<'a> Packer<'a> {
 
         let mut normal_packed = None;
         if let Some((raw, scale)) = t.normal {
-            let (r, source) = self.normal_source(&raw);
-            let r = &r;
-            let map = r.remap.expect("a normal map reads through a remap");
-            let flat = [0, 1, 2].map(|c| ([0.0, 0.0, 1.0][c] - map[c][0]) / map[c][1]);
-            let mut consts: Vec<Option<f32>> = (0..3).map(|c| self.constant(r, c)).collect();
-            // A two-channel image's blue is no z, so x and y alone say whether it is flat.
-            if source.rg {
-                consts[2] = Some(flat[2]);
+            // A normal map whose source mips the cook keeps instead of remaking them adds no
+            // Toksvig roughness.
+            if self.normal_map(suffix, m, &raw, scale, slot::NORMAL, "normal")? {
+                normal_packed = Some((raw, scale));
             }
-            let is_flat = consts
-                .iter()
-                .zip(flat)
-                .all(|(c, f)| c.is_some_and(|v| (v - f).abs() <= 1.0 / 255.0));
-            if !is_flat {
-                let shrink = consts.iter().all(Option::is_some);
-                let id = self.make_each(suffix, r, |s, cell| {
-                    let (r, source) = s.normal_source(&s.at(&raw, cell));
-                    let channel = |c: usize, scale: f32| s.source(&r, c, c, 0.0, scale);
-                    Pack {
-                        role: "normal",
-                        encoding: Encoding::Bc5,
-                        channels: vec![
-                            channel(0, scale[0]),
-                            channel(1, scale[1]),
-                            if source.rg {
-                                Channel {
-                                    texels: Texels::NormalZ {
-                                        image: r.image,
-                                        source,
-                                    },
-                                    outside: Outside::of(normal::z(
-                                        r.read(0, r.outside[0]),
-                                        r.read(1, r.outside[1]),
-                                    )),
-                                }
-                            } else {
-                                channel(2, 1.0)
-                            },
-                            Channel::constant(1.0),
-                        ],
-                        refs: vec![r],
-                        coverage: None,
-                        toksvig: None,
-                        normal: true,
-                        shrink,
-                        tile: None,
-                    }
-                })?;
-                bind(m, slot::NORMAL, id, 0, r);
-                // A normal map whose source mips the cook keeps instead of remaking them adds
-                // no Toksvig roughness.
-                if !id.source_mips && consts.iter().any(Option::is_none) {
-                    normal_packed = Some((raw, scale));
-                }
-            }
+        }
+        if let Some((raw, scale)) = t.coat_normal {
+            self.normal_map(suffix, m, &raw, scale, slot::COAT_NORMAL, "coat_normal")?;
         }
 
         // Roughness and metalness.
@@ -1652,10 +1697,171 @@ impl<'a> Packer<'a> {
                 m.displacement_max = m.displacement_max.max(a.max(b));
             }
         }
+        for (&s, r) in &t.more {
+            if let Some(r) = r {
+                self.more(suffix, m, s, r)?;
+            }
+        }
         if let Some(settings) = &self.rules.neural {
             self.neural_set(suffix, m, settings)?;
         }
         Ok(())
+    }
+
+    /// Cooks normal map `raw` at `scale` into slot `s` unless it is flat, and returns whether it
+    /// varies through mips the cook made.
+    fn normal_map(
+        &mut self,
+        suffix: &str,
+        m: &mut Material,
+        raw: &TexRef,
+        scale: [f32; 2],
+        s: usize,
+        role: &'static str,
+    ) -> Result<bool> {
+        let (r, source) = self.normal_source(raw);
+        let r = &r;
+        let map = r.remap.expect("a normal map reads through a remap");
+        let flat = [0, 1, 2].map(|c| ([0.0, 0.0, 1.0][c] - map[c][0]) / map[c][1]);
+        let mut consts: Vec<Option<f32>> = (0..3).map(|c| self.constant(r, c)).collect();
+        // A two-channel image's blue is no z, so x and y alone say whether it is flat.
+        if source.rg {
+            consts[2] = Some(flat[2]);
+        }
+        let is_flat = consts
+            .iter()
+            .zip(flat)
+            .all(|(c, f)| c.is_some_and(|v| (v - f).abs() <= 1.0 / 255.0));
+        if is_flat {
+            return Ok(false);
+        }
+        let shrink = consts.iter().all(Option::is_some);
+        let id = self.make_each(suffix, r, |this, cell| {
+            let (r, source) = this.normal_source(&this.at(raw, cell));
+            let channel = |c: usize, scale: f32| this.source(&r, c, c, 0.0, scale);
+            Pack {
+                role,
+                encoding: Encoding::Bc5,
+                channels: vec![
+                    channel(0, scale[0]),
+                    channel(1, scale[1]),
+                    if source.rg {
+                        Channel {
+                            texels: Texels::NormalZ {
+                                image: r.image,
+                                source,
+                            },
+                            outside: Outside::of(normal::z(
+                                r.read(0, r.outside[0]),
+                                r.read(1, r.outside[1]),
+                            )),
+                        }
+                    } else {
+                        channel(2, 1.0)
+                    },
+                    Channel::constant(1.0),
+                ],
+                refs: vec![r],
+                coverage: None,
+                toksvig: None,
+                normal: true,
+                shrink,
+                tile: None,
+            }
+        })?;
+        bind(m, s, id, 0, r);
+        Ok(!id.source_mips && consts.iter().any(Option::is_none))
+    }
+
+    /// Cooks input `r` of slot `s`, from [`slot::MORE`] on.
+    fn more(&mut self, suffix: &str, m: &mut Material, s: usize, r: &TexRef) -> Result<()> {
+        match More::of(s) {
+            More::Color => self.color(suffix, m, r, s, true),
+            More::Weight(role) => {
+                let factor = *scalar_field(m, s);
+                *scalar_field(m, s) = match self.constant_input(r) {
+                    Some(v) => factor * v,
+                    None => {
+                        let id = self.single(suffix, r, factor, role, Encoding::Bc4)?;
+                        bind(m, s, id, 0, r);
+                        1.0
+                    }
+                };
+                Ok(())
+            }
+            More::Ranged(role) => {
+                let hdr = self.past_one(r);
+                let constant = if hdr {
+                    self.constant_ranged(r, usize::from(r.channel))
+                        .map(|v| r.read(0, v).max(0.0))
+                } else {
+                    self.constant_input(r)
+                };
+                match constant {
+                    Some(v) => *scalar_field(m, s) *= v,
+                    None => {
+                        let encoding = if hdr {
+                            Encoding::Raw(DataFormat::R16f)
+                        } else {
+                            Encoding::Bc4
+                        };
+                        let id = self.single(suffix, r, 1.0, role, encoding)?;
+                        bind(m, s, id, 0, r);
+                    }
+                }
+                Ok(())
+            }
+            More::Signed(role) => {
+                let factor = *scalar_field(m, s);
+                let channel = usize::from(r.channel);
+                match self.constant(r, channel).filter(|_| !self.bounded(r)) {
+                    Some(v) => *scalar_field(m, s) = factor * r.read(0, v),
+                    None => {
+                        let id = self.make_each(suffix, r, |this, cell| {
+                            let r = this.at(r, cell);
+                            let channel = usize::from(r.channel);
+                            Pack {
+                                role,
+                                encoding: Encoding::Bc4,
+                                channels: vec![this.source(&r, 0, channel, 0.5, 0.5 * factor)],
+                                refs: vec![r],
+                                coverage: None,
+                                toksvig: None,
+                                normal: false,
+                                shrink: false,
+                                tile: None,
+                            }
+                        })?;
+                        bind(m, s, id, 0, r);
+                    }
+                }
+                Ok(())
+            }
+            More::Direction(role) => {
+                let id = self.make_each(suffix, r, |this, cell| {
+                    let r = this.at(r, cell);
+                    let channels = vec![
+                        this.source(&r, 0, 0, 0.0, 1.0),
+                        this.source(&r, 1, 1, 0.0, 1.0),
+                        Channel::constant(0.0),
+                        Channel::constant(0.0),
+                    ];
+                    Pack {
+                        role,
+                        encoding: Encoding::Bc5,
+                        channels,
+                        refs: vec![r],
+                        coverage: None,
+                        toksvig: None,
+                        normal: false,
+                        shrink: false,
+                        tile: None,
+                    }
+                })?;
+                bind(m, s, id, 0, r);
+                Ok(())
+            }
+        }
     }
 
     /// Plans the neural set of the material's textures, unless one with the same textures
@@ -1722,6 +1928,13 @@ impl<'a> Packer<'a> {
         let (role, color): (_, fn(&mut Material) -> &mut [f32; 3]) = match s {
             slot::BASE_COLOR => ("base_color", |m| &mut m.base_color),
             slot::EMISSION => ("emission", |m| &mut m.emission_color),
+            slot::SPECULAR_COLOR => ("specular_color", |m| &mut m.specular_color),
+            slot::TRANSMISSION_COLOR => ("transmission_color", |m| &mut m.transmission_color),
+            slot::SUBSURFACE_RADIUS_SCALE => ("subsurface_radius_scale", |m| {
+                &mut m.subsurface_radius_scale
+            }),
+            slot::FUZZ_COLOR => ("fuzz_color", |m| &mut m.fuzz_color),
+            slot::COAT_COLOR => ("coat_color", |m| &mut m.coat_color),
             _ => ("subsurface_color", |m| &mut m.subsurface_color),
         };
         let (read, _, gamut) = self.color_read(r);

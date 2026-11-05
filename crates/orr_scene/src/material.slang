@@ -31,6 +31,10 @@ public static const uint MATERIAL_COAT_ON_BASE = 1 << 18;
 public static const uint MATERIAL_FRESNEL_MIX = 1 << 19;
 // A metal reflects its base color at every angle.
 public static const uint MATERIAL_METAL_FLAT = 1 << 20;
+// `specular_color` is F0 itself, not a factor on the IOR's.
+public static const uint MATERIAL_F0_STATED = 1 << 21;
+// It binds a slot past TEXTURE_TRANSMISSION, which hits on other materials don't look at.
+public static const uint MATERIAL_MORE_TEXTURES = 1 << 22;
 
 // `MaterialGpu.textures` slots.
 public static const uint TEXTURE_BASE_COLOR = 0;
@@ -44,7 +48,32 @@ public static const uint TEXTURE_SUBSURFACE_COLOR = 7;
 public static const uint TEXTURE_DISPLACEMENT = 8;
 public static const uint TEXTURE_COAT = 9;
 public static const uint TEXTURE_TRANSMISSION = 10;
-public static const uint TEXTURE_SLOTS = 11;
+public static const uint TEXTURE_SPECULAR_COLOR = 11;
+public static const uint TEXTURE_SPECULAR_IOR = 12;
+public static const uint TEXTURE_BASE_WEIGHT = 13;
+public static const uint TEXTURE_DIFFUSE_ROUGHNESS = 14;
+public static const uint TEXTURE_ANISOTROPY = 15;
+public static const uint TEXTURE_TANGENT = 16;
+public static const uint TEXTURE_TRANSMISSION_COLOR = 17;
+public static const uint TEXTURE_SUBSURFACE_WEIGHT = 18;
+public static const uint TEXTURE_SUBSURFACE_RADIUS = 19;
+public static const uint TEXTURE_SUBSURFACE_RADIUS_SCALE = 20;
+public static const uint TEXTURE_SUBSURFACE_ANISOTROPY = 21;
+public static const uint TEXTURE_FUZZ_WEIGHT = 22;
+public static const uint TEXTURE_FUZZ_COLOR = 23;
+public static const uint TEXTURE_FUZZ_ROUGHNESS = 24;
+public static const uint TEXTURE_COAT_COLOR = 25;
+public static const uint TEXTURE_COAT_ROUGHNESS = 26;
+public static const uint TEXTURE_COAT_IOR = 27;
+public static const uint TEXTURE_COAT_DARKENING = 28;
+public static const uint TEXTURE_COAT_ANISOTROPY = 29;
+public static const uint TEXTURE_COAT_NORMAL = 30;
+public static const uint TEXTURE_COAT_TANGENT = 31;
+public static const uint TEXTURE_THIN_FILM_WEIGHT = 32;
+public static const uint TEXTURE_THIN_FILM_THICKNESS = 33;
+public static const uint TEXTURE_THIN_FILM_IOR = 34;
+public static const uint TEXTURE_EMISSION_LUMINANCE = 35;
+public static const uint TEXTURE_SLOTS = 36;
 
 // `TextureSamplerGpu.modes`: what u and v read past 0..1, 3 bits each
 // (orr_pack::material::wrap), then the filter's bits (orr_pack::material::filter).
@@ -169,7 +198,6 @@ public struct MaterialGpu
     public uint tangent_set;                // the uv set its tangent frame follows; TANGENT_SET_OTHER: neither
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
-    public uint _pad;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
     public uint* tiles[TEXTURE_SLOTS];                  // per slot of TEXTURE_TILED, its table: `texture_tile`
@@ -657,6 +685,29 @@ public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint uv[2], flo
     return c == 0 ? v : c == 1 ? float4(v.yzw, 1.0) : c == 2 ? float4(v.zw, 0.0, 1.0) : float4(v.w, 0.0, 0.0, 1.0);
 }
 
+// What scalar slot `slot`, one past TEXTURE_TRANSMISSION, reads: 1 unbound.
+public float material_scale(MaterialGpu* m, uint slot, UvFootprint uv[2])
+{
+    return (m.flags & MATERIAL_MORE_TEXTURES) != 0 ? material_texture(m, slot, uv, float4(1.0)).x : 1.0;
+}
+
+// `material_color` of `slot`, one past TEXTURE_TRANSMISSION.
+public float3 material_more_color(MaterialGpu* m, uint slot, UvFootprint uv[2], float3 factor)
+{
+    return (m.flags & MATERIAL_MORE_TEXTURES) != 0 ? material_color(m, slot, uv, factor) : factor;
+}
+
+// The direction in the tangent plane of `slot`, one past TEXTURE_TRANSMISSION, as an angle from
+// the mesh uv's u axis: 0 unbound.
+public float material_direction(MaterialGpu* m, uint slot, UvFootprint uv[2])
+{
+    if ((m.flags & MATERIAL_MORE_TEXTURES) == 0 || !material_bound(m, slot))
+        return 0.0;
+    float2 v = material_texture(m, slot, uv, float4(1.0, 0.5, 0.0, 1.0)).xy * 2.0 - 1.0;
+    float3 d = material_normal_frame(m, slot, float3(v, 0.0));
+    return dot(d.xy, d.xy) > 0.0 ? atan2(d.y, d.x) : 0.0;
+}
+
 // Prepares (`texture_prepare`) every slot of `m` that a neural set stands in for over the
 // footprint of the uv set it reads, for the taps of one surface evaluation.
 public void material_prepare(MaterialGpu* m, UvFootprint uv[2])
@@ -674,6 +725,13 @@ public void material_prepare(MaterialGpu* m, UvFootprint uv[2])
         if (material_reads(m, slot, modes, t, f))
             texture_prepare(t, modes, f, m.texture_streams);
     }
+}
+
+// Emitted radiance of `m` in nits over footprints `uv`: `material_emission` through the emission
+// and luminance textures.
+public float3 material_emission_at(MaterialGpu* m, UvFootprint uv[2])
+{
+    return material_scale(m, TEXTURE_EMISSION_LUMINANCE, uv) * material_color(m, TEXTURE_EMISSION, uv, material_emission(m));
 }
 
 // Linear Rec.2020 `factor` times color slot `slot`'s texel over footprints `uv`, in linear

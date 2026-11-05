@@ -9,26 +9,26 @@
 //! | `emissiveFactor`, `emissiveStrength` (1 when absent; `KHR_materials_emissive_strength` overrides it) | `emission_color`, `emission_luminance` read as nits |
 //! | `alphaMode` `MASK` with `alphaCutoff`, `BLEND`; base alpha | `alpha_mode`, `alpha_cutoff`; `geometry_opacity` under `MASK` and `BLEND` |
 //! | `doubleSided` | `double_sided` |
-//! | `KHR_materials_specular` `specularFactor`, `specularColorFactor`, `specularTexture` (A) | `specular_weight`, `specular_color`, the specular weight texture |
-//! | `KHR_materials_clearcoat` `clearcoatFactor`, `clearcoatRoughnessFactor`, `clearcoatTexture` (R) | `coat_weight`, `coat_roughness`, `coat_ior` 1.5, the coat texture |
-//! | `KHR_materials_sheen` `sheenColorFactor`, `sheenRoughnessFactor` | `fuzz_weight` 1 when the color is not black, `fuzz_color`, `fuzz_roughness` (approximate) |
-//! | `KHR_materials_anisotropy` `anisotropyStrength`, `anisotropyRotation` | `specular_anisotropy`, `specular_rotation` (radians, as glTF) |
-//! | `KHR_materials_iridescence` `iridescenceFactor`, `iridescenceIor`, `iridescenceThicknessMaximum` | `thin_film_weight`, `thin_film_ior`, `thin_film_thickness` (nm) |
+//! | `KHR_materials_specular` `specularFactor`, `specularColorFactor`, `specularTexture` (A), `specularColorTexture` | `specular_weight`, `specular_color`, their textures |
+//! | `KHR_materials_clearcoat` `clearcoatFactor`, `clearcoatRoughnessFactor`, `clearcoatTexture` (R), `clearcoatRoughnessTexture` (G), `clearcoatNormalTexture` | `coat_weight`, `coat_roughness`, `coat_ior` 1.5, their textures and the coat normal |
+//! | `KHR_materials_sheen` `sheenColorFactor`, `sheenRoughnessFactor`, `sheenColorTexture`, `sheenRoughnessTexture` (A) | `fuzz_weight` 1 when the factor is not black, `fuzz_color`, `fuzz_roughness` (approximate), their textures |
+//! | `KHR_materials_anisotropy` `anisotropyStrength`, `anisotropyRotation`, `anisotropyTexture` (RG direction, B strength) | `specular_anisotropy`, `specular_rotation` (radians, as glTF), the anisotropy and tangent textures |
+//! | `KHR_materials_iridescence` `iridescenceFactor`, `iridescenceIor`, `iridescenceThicknessMinimum` and `Maximum`, `iridescenceTexture` (R), `iridescenceThicknessTexture` (G) | `thin_film_weight`, `thin_film_ior`, `thin_film_thickness` (nm) and their textures: the thickness texture reads `mix(minimum, maximum, g)` over the larger of the two |
 //! | `KHR_materials_transmission` `transmissionFactor`, `transmissionTexture` (R) | `transmission_weight`, the transmission texture |
 //! | `KHR_materials_volume` `attenuationColor`, `attenuationDistance` | `transmission_color`, `transmission_depth`; an infinite distance is white at depth 0 |
 //! | transmission without `KHR_materials_volume`, or with `thicknessFactor` 0 | `thin_walled` |
-//! | `KHR_materials_diffuse_transmission` `diffuseTransmissionFactor`, `diffuseTransmissionColorFactor`, `diffuseTransmissionColorTexture` | `subsurface_weight`, `subsurface_color`, the subsurface color texture; thin-walled (approximate: glTF's split of diffuse transmission and volume has no OpenPBR equivalent) |
+//! | `KHR_materials_diffuse_transmission` `diffuseTransmissionFactor`, `diffuseTransmissionColorFactor`, `diffuseTransmissionTexture` (A), `diffuseTransmissionColorTexture` | `subsurface_weight`, `subsurface_color`, their textures; thin-walled (approximate: glTF's split of diffuse transmission and volume has no OpenPBR equivalent) |
 //! | `KHR_materials_dispersion` `dispersion` > 0 | `transmission_dispersion_scale` 1, `transmission_dispersion_abbe_number` 20 / dispersion |
 //! | `KHR_materials_displacement` (unofficial) `displacementGeometryFactor`, `displacementGeometryOffset`, `displacementGeometryTexture` (R) | `displacement_scale`, `displacement_offset`, the displacement texture; declared range from offset to offset + factor |
 //!
-//! Textures without a slot (clearcoat roughness and normal, sheen, anisotropy, iridescence,
-//! specular color and the diffuse transmission weight textures) are not cooked. Transmission
-//! scatter, scatter anisotropy, the subsurface radius fields and the surface id have no
-//! ratified glTF source and come from `MaterialPatch`.
+//! `KHR_materials_volume` `thicknessTexture` stays unread: "Ray-tracers should ignore the
+//! thickness texture and use the actual, ray-traced distance instead." Transmission scatter,
+//! scatter anisotropy, the subsurface radius fields and the surface id have no ratified glTF
+//! source and come from `MaterialPatch`.
 
 use gltf::material::AlphaMode;
 use gltf::texture::{MagFilter, MinFilter, WrappingMode};
-use orr_pack::material::{Material, filter};
+use orr_pack::material::{Material, filter, slot};
 use serde_json::Value;
 
 use crate::texture::Wrap;
@@ -115,7 +115,12 @@ pub(super) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
     }
     if let Some(e) = ext("KHR_materials_iridescence") {
         out.thin_film_weight = num(e, "iridescenceFactor", 0.0);
-        out.thin_film_thickness = num(e, "iridescenceThicknessMaximum", 400.0);
+        // A thickness texture reads between the two, and texels store the share of the larger.
+        let (low, high) = film_thickness(e);
+        out.thin_film_thickness = match e.get("iridescenceThicknessTexture") {
+            Some(_) => low.max(high),
+            None => high,
+        };
         out.thin_film_ior = num(e, "iridescenceIor", 1.3);
     }
     if let Some(e) = ext("KHR_materials_transmission") {
@@ -160,6 +165,14 @@ pub(super) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
         out.displacement_max = offset.max(offset + factor);
     }
     out
+}
+
+/// `iridescenceThicknessMinimum` and `iridescenceThicknessMaximum`, in nanometers.
+fn film_thickness(e: &Value) -> (f32, f32) {
+    (
+        num(e, "iridescenceThicknessMinimum", 100.0),
+        num(e, "iridescenceThicknessMaximum", 400.0),
+    )
 }
 
 /// The `KHR_texture_transform` of a textureInfo object in `Material::uv_transforms` form, and
@@ -273,6 +286,65 @@ pub(super) fn textures(
             })
             .transpose()
     };
+    let mut more = std::collections::BTreeMap::new();
+    let mut read = |s: usize, r: Result<Option<TexRef>, String>| {
+        more.insert(s, r?);
+        Ok::<_, String>(())
+    };
+    let specular = "KHR_materials_specular";
+    read(
+        slot::SPECULAR_COLOR,
+        info(specular, "specularColorTexture", 0).map(|r| r.map(color)),
+    )?;
+    let coat = "KHR_materials_clearcoat";
+    read(
+        slot::COAT_ROUGHNESS,
+        info(coat, "clearcoatRoughnessTexture", 1),
+    )?;
+    let sheen = "KHR_materials_sheen";
+    read(
+        slot::FUZZ_COLOR,
+        info(sheen, "sheenColorTexture", 0).map(|r| r.map(color)),
+    )?;
+    read(
+        slot::FUZZ_ROUGHNESS,
+        info(sheen, "sheenRoughnessTexture", 3),
+    )?;
+    let anisotropy = "KHR_materials_anisotropy";
+    read(slot::ANISOTROPY, info(anisotropy, "anisotropyTexture", 2))?;
+    read(slot::TANGENT, info(anisotropy, "anisotropyTexture", 0))?;
+    let film = "KHR_materials_iridescence";
+    read(slot::THIN_FILM_WEIGHT, info(film, "iridescenceTexture", 0))?;
+    let thickness = info(film, "iridescenceThicknessTexture", 1)?.map(|r| {
+        let (low, high) = extension(json, m, film).map_or((0.0, 0.0), film_thickness);
+        let peak = low.max(high);
+        let span = if peak > 0.0 {
+            [low / peak, (high - low) / peak]
+        } else {
+            [0.0, 0.0]
+        };
+        TexRef {
+            remap: Some([span; 3]),
+            ..r
+        }
+    });
+    read(slot::THIN_FILM_THICKNESS, Ok(thickness))?;
+    read(
+        slot::SUBSURFACE_WEIGHT,
+        info(
+            "KHR_materials_diffuse_transmission",
+            "diffuseTransmissionTexture",
+            3,
+        ),
+    )?;
+    let coat_normal = extension(json, m, coat)
+        .and_then(|e| e.get("clearcoatNormalTexture"))
+        .map(|i| {
+            let r = info(coat, "clearcoatNormalTexture", 0)?;
+            let r = r.expect("the object is there");
+            Ok::<_, String>((r, [num(i, "scale", 1.0); 2]))
+        })
+        .transpose()?;
     Ok(MaterialTextures {
         base_color,
         opacity: base_color.map(|r| TexRef {
@@ -307,5 +379,7 @@ pub(super) fn textures(
             "displacementGeometryTexture",
             0,
         )?,
+        coat_normal,
+        more,
     })
 }

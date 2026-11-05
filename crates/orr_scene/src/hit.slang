@@ -817,7 +817,7 @@ public bool resolve_particle(SceneRoot* s, uint instance_index, uint cluster_id,
     if (!hit_producer(s, instance_index, entry) || !particle_candidate(s, entry, cluster_id, primitive, bary, material, normal, i))
         return false;
     MaterialGpu* m = s.materials + material;
-    emission = material_color(m, TEXTURE_EMISSION, i.uv, material_emission(m));
+    emission = material_emission_at(m, i.uv);
     opacity = material_opacity(i);
     return true;
 }
@@ -866,7 +866,7 @@ public void smoke_look(SurfaceInput i, out float3 albedo, out float3 emission, o
 {
     MaterialGpu* m = i.scene.materials + i.material;
     albedo = m.base_weight * material_color(m, TEXTURE_BASE_COLOR, i.uv, m.base_color);
-    emission = material_color(m, TEXTURE_EMISSION, i.uv, material_emission(m));
+    emission = material_emission_at(m, i.uv);
     opacity = saturate(material_opacity(i));
 }
 

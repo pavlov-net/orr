@@ -125,7 +125,7 @@ pub struct Material {
 }
 
 impl Material {
-    /// The tangent frame follows the uv set the normal map reads.
+    /// The tangent frame follows the uv set the normal map reads, else the coat's.
     pub const FRAME_NORMAL_MAP: u8 = 0;
     pub const FRAME_UV0: u8 = 1;
     pub const FRAME_UV1: u8 = 2;
@@ -152,16 +152,27 @@ impl Material {
 
     /// The uv set the tangent frame follows, 0 or 1, or [`Self::TANGENT_SET_OTHER`].
     pub fn tangent_set(&self) -> u8 {
+        let normal = self.textures[slot::NORMAL];
+        let coat = self.textures[slot::COAT_NORMAL];
+        let map = if normal.texture == AssetId::NONE && coat.texture != AssetId::NONE {
+            coat
+        } else {
+            normal
+        };
         match self.frame_uv {
-            Self::FRAME_NORMAL_MAP => self.textures[slot::NORMAL].uv_set & 1,
+            Self::FRAME_NORMAL_MAP => map.uv_set & 1,
             f => f - 1,
         }
     }
 }
 
-/// Texture slots. All but `NORMAL`, `EMISSION`, `SPECULAR_WEIGHT` and `DISPLACEMENT` read values
-/// of 0..1. Nothing clamps what they sample: a signed texture bound to one is the caller's
-/// responsibility.
+/// Texture slots. All but `NORMAL`, `COAT_NORMAL`, `EMISSION`, `EMISSION_LUMINANCE`,
+/// `SPECULAR_WEIGHT`, `SPECULAR_IOR`, `COAT_IOR`, `THIN_FILM_IOR`, `THIN_FILM_THICKNESS`,
+/// `SUBSURFACE_RADIUS` and `DISPLACEMENT` read values of 0..1. Nothing clamps what they sample: a
+/// signed texture bound to one is the caller's responsibility. A value multiplies its field,
+/// with three exceptions: `TANGENT` and `COAT_TANGENT` hold a direction in the tangent plane in
+/// their first two channels at `0.5 v + 0.5`, on top of the field's rotation, and
+/// `SUBSURFACE_ANISOTROPY` holds the anisotropy at `0.5 g + 0.5`, in place of the field.
 pub mod slot {
     pub const BASE_COLOR: usize = 0;
     pub const OPACITY: usize = 1;
@@ -174,7 +185,34 @@ pub mod slot {
     pub const DISPLACEMENT: usize = 8;
     pub const COAT: usize = 9;
     pub const TRANSMISSION: usize = 10;
-    pub const COUNT: usize = 11;
+    pub const SPECULAR_COLOR: usize = 11;
+    pub const SPECULAR_IOR: usize = 12;
+    pub const BASE_WEIGHT: usize = 13;
+    pub const DIFFUSE_ROUGHNESS: usize = 14;
+    pub const ANISOTROPY: usize = 15;
+    pub const TANGENT: usize = 16;
+    pub const TRANSMISSION_COLOR: usize = 17;
+    pub const SUBSURFACE_WEIGHT: usize = 18;
+    pub const SUBSURFACE_RADIUS: usize = 19;
+    pub const SUBSURFACE_RADIUS_SCALE: usize = 20;
+    pub const SUBSURFACE_ANISOTROPY: usize = 21;
+    pub const FUZZ_WEIGHT: usize = 22;
+    pub const FUZZ_COLOR: usize = 23;
+    pub const FUZZ_ROUGHNESS: usize = 24;
+    pub const COAT_COLOR: usize = 25;
+    pub const COAT_ROUGHNESS: usize = 26;
+    pub const COAT_IOR: usize = 27;
+    pub const COAT_DARKENING: usize = 28;
+    pub const COAT_ANISOTROPY: usize = 29;
+    pub const COAT_NORMAL: usize = 30;
+    pub const COAT_TANGENT: usize = 31;
+    pub const THIN_FILM_WEIGHT: usize = 32;
+    pub const THIN_FILM_THICKNESS: usize = 33;
+    pub const THIN_FILM_IOR: usize = 34;
+    pub const EMISSION_LUMINANCE: usize = 35;
+    pub const COUNT: usize = 36;
+    /// Slots from here on read only for a material that binds one of them.
+    pub const MORE: usize = SPECULAR_COLOR;
 }
 
 impl Material {

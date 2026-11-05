@@ -102,7 +102,8 @@ impl SceneMaterial {
     /// none. Without a normal map the shaders read set 0.
     pub(crate) fn tangent_set(&self) -> Option<usize> {
         let m = &self.material;
-        match &self.textures.normal {
+        let textures = &self.textures;
+        match textures.normal.as_ref().or(textures.coat_normal.as_ref()) {
             Some((r, _)) => Some(usize::from(r.uv_set)),
             None => mesh::reads_tangent(m).then_some(0),
         }

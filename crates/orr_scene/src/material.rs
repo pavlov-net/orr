@@ -45,6 +45,8 @@ pub mod material_flags {
     pub const COAT_ON_BASE: u32 = 1 << 18;
     pub const FRESNEL_MIX: u32 = 1 << 19;
     pub const METAL_FLAT: u32 = 1 << 20;
+    pub const F0_STATED: u32 = 1 << 21;
+    pub const MORE_TEXTURES: u32 = 1 << 22;
 }
 
 /// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
@@ -139,20 +141,6 @@ pub(crate) fn rec2020(c: impl Into<orr_math::Vec3>) -> [f32; 3] {
     rec709_to_rec2020(c.into()).as_vec3().to_array()
 }
 
-/// What the shaders take as `specular_color`: OpenPBR's edge tint, and past that model `F0`, a
-/// reflectance that holds to 0..1 however far the color runs.
-fn specular_color(m: &Material) -> [f32; 3] {
-    let f0 = |scale: f32| m.specular_color.map(|c| (scale * c).clamp(0.0, 1.0));
-    match m.model {
-        Material::MODEL_OPENPBR => m.specular_color,
-        Material::MODEL_PREVIEW_SPECULAR => f0(1.0),
-        _ => {
-            let r = (m.specular_ior - 1.0) / (m.specular_ior + 1.0);
-            f0(r * r)
-        }
-    }
-}
-
 impl MaterialGpu {
     /// The record of a cooked material whose slots read `textures`. Colors convert from Rec.709
     /// to Rec.2020, and a color slot's factor multiplies its texels in the texture's primaries;
@@ -193,6 +181,8 @@ impl MaterialGpu {
         );
         set(preview, f::COAT_ON_BASE | f::METAL_FLAT);
         set(m.model != Material::MODEL_OPENPBR, f::FRESNEL_MIX);
+        set(m.model == Material::MODEL_PREVIEW_SPECULAR, f::F0_STATED);
+        set((slot::MORE..slot::COUNT).any(bound), f::MORE_TEXTURES);
         let cost: u32 = if subsurface {
             3
         } else if dielectric || presence {
@@ -204,7 +194,7 @@ impl MaterialGpu {
         Self {
             base_color: rec2020(m.base_color),
             base_weight: m.base_weight,
-            specular_color: rec2020(specular_color(m)),
+            specular_color: rec2020(m.specular_color),
             specular_weight: m.specular_weight,
             emission_color: rec2020(m.emission_color),
             emission_luminance: m.emission_luminance,
@@ -253,7 +243,6 @@ impl MaterialGpu {
             tangent_set: u32::from(m.tangent_set()),
             transmission_dispersion_scale: m.transmission_dispersion_scale,
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
-            _pad: 0,
             data: 0,
             texture_streams: GpuPtr::NULL,
             tiles: textures.map(|t| t.tiles),
@@ -411,30 +400,6 @@ mod tests {
         assert_eq!(candidate_class([PRESENCE]), Some(2));
         assert_eq!(candidate_class([DIELECTRIC, 0]), None);
         assert_eq!(candidate_class([PRESENCE, DIELECTRIC]), None);
-    }
-
-    /// glTF's `min(((ior - 1) / (ior + 1))^2 * color, 1)` and PS "the color at 0 incidence".
-    #[test]
-    fn f0_models_hold_specular_color_to_a_reflectance() {
-        let f0 = |model, color: f32| {
-            let m = Material {
-                model,
-                specular_color: [color; 3],
-                ..Material::default()
-            };
-            MaterialGpu::new(&m, &[BoundTexture::NONE; slot::COUNT]).specular_color[1]
-        };
-        for (model, color, want) in [
-            (Material::MODEL_OPENPBR, 2.0, 2.0),
-            (Material::MODEL_GLTF, 4.0, 0.16),
-            (Material::MODEL_PREVIEW, 100.0, 1.0),
-            (Material::MODEL_PREVIEW_SPECULAR, 0.5, 0.5),
-            (Material::MODEL_PREVIEW_SPECULAR, 2.0, 1.0),
-            (Material::MODEL_PREVIEW_SPECULAR, -1.0, 0.0),
-        ] {
-            let got = f0(model, color);
-            assert!((got - want).abs() < 1e-5, "{model} {color}: {got}");
-        }
     }
 
     #[test]

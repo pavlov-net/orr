@@ -1716,7 +1716,8 @@ fn plan_scene(
     let normals: HashSet<usize> = src
         .materials
         .iter()
-        .filter_map(|m| m.textures.normal.as_ref())
+        .flat_map(|m| [&m.textures.normal, &m.textures.coat_normal])
+        .flatten()
         .filter(|n| n.0.rules == ImageRules::Gltf)
         .flat_map(|n| read_as(n.0.image))
         .collect();
@@ -1760,7 +1761,7 @@ fn plan_scene(
     let unscaled: BTreeSet<usize> = src
         .materials
         .iter()
-        .filter_map(|m| m.textures.unscaled_normal(&facts))
+        .flat_map(|m| m.textures.unscaled_normals(&facts))
         .collect();
     warnings.extend(
         unscaled

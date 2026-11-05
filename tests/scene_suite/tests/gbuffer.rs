@@ -48,7 +48,7 @@ use orr_scene::{
     TextureFilter, TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId, VisibleCluster,
 };
 use orr_scene::{Budgets, InstancePageRef, PageId};
-use scene_suite::shaders::{codec, fracture, pose, skin_pose, surface_at, trace};
+use scene_suite::shaders::{codec, fracture, pose, skin_pose, surface_at, surface_params, trace};
 use scene_suite::{Workers, linked, pipeline};
 
 const EXTENT: [u32; 2] = [160, 96];
@@ -7529,5 +7529,315 @@ fn a_streaming_mesh_traces_its_finer_cached_cuts_where_the_raster_draws() {
         "{matched} of {total} pixels agree"
     );
     assert_eq!(w.scenes.residency().failed, 0);
+    assert_clean();
+}
+
+/// Every record of `materials` through `StandardSurface` at a flat, facing point.
+fn surface_params(
+    d: &orr_gpu::Device,
+    records: &[MaterialGpu],
+    list_extra: impl FnOnce(&mut orr_gpu::CommandList<'_>),
+    vertex_color: [f32; 4],
+) -> Vec<surface_params::Params> {
+    let upload = |bytes: &[u8], name| {
+        let mut a = d
+            .gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, name)
+            .unwrap();
+        a.as_mut_slice().unwrap().copy_from_slice(bytes);
+        a
+    };
+    let materials = upload(bytemuck::cast_slice(records), "materials");
+    let scene = upload(
+        bytemuck::bytes_of(&SceneRoot {
+            materials: materials.gpu().cast(),
+            ..bytemuck::Zeroable::zeroed()
+        }),
+        "scene",
+    );
+    let out = d
+        .gpu_malloc::<surface_params::Params>(MemoryKind::Readback, records.len() as u64, "params")
+        .unwrap();
+    let root = upload(
+        bytemuck::bytes_of(&surface_params::Root {
+            scene: scene.gpu().cast(),
+            out: out.gpu(),
+            vertex_color,
+            count: records.len() as u32,
+            pad0: 0,
+            pad1: 0,
+            pad2: 0,
+        }),
+        "root",
+    );
+    let p = pipeline(&surface_params::MODULE, "main");
+    let render = d.queue(QueueKind::Render).unwrap();
+    let mut list = render.command_list().unwrap();
+    list_extra(&mut list);
+    list.dispatch(
+        &p,
+        root.gpu().cast::<surface_params::Root>(),
+        [records.len().div_ceil(64) as u32, 1, 1],
+    );
+    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+    wait(render.submit(vec![list], &[]).unwrap());
+    out.as_slice().unwrap().to_vec()
+}
+
+/// Each slot past the first ones reaches the one parameter it states, and no other: a value of a
+/// texture times its factor, or what its encoding says.
+#[test]
+fn every_slot_reaches_its_parameter() {
+    use orr_gpu::{Format, TextureDesc, TextureMemory, TextureUsage};
+    use orr_pack::material::{Material, TextureBinding, slot};
+    type P = surface_params::Params;
+
+    let _guard = serial();
+    let d = device();
+    const TEXEL: [u8; 4] = [128, 64, 192, 255];
+    let v = TEXEL.map(|c| f32::from(c) / 255.0);
+    let desc = TextureDesc::d2(Format::Rgba8Unorm, 4, 4, TextureUsage::SAMPLED);
+    let texture = d
+        .create_texture(&desc, TextureMemory::Dedicated, "one texel")
+        .unwrap();
+    let slot_index = d.alloc_image_slot().unwrap();
+    let index = d.write_sampled(slot_index, &texture, &orr_gpu::ViewDesc::default());
+    let binding = TextureBinding {
+        ..bytemuck::Zeroable::zeroed()
+    };
+    let bound_texture = BoundTexture {
+        index,
+        primaries: Primaries::Rec2020.id(),
+        sampler: d.sampler(&orr_scene::binding_sampler(&binding)).unwrap(),
+        ..BoundTexture::NONE
+    };
+    let base = Material {
+        coat_weight: 0.5,
+        coat_anisotropy: 0.5,
+        fuzz_weight: 0.5,
+        thin_film_weight: 0.5,
+        specular_anisotropy: 0.5,
+        subsurface_weight: 0.5,
+        emission_luminance: 2.0,
+        ..Material::default()
+    };
+    let with = |s: usize| {
+        let mut bound = [BoundTexture::NONE; slot::COUNT];
+        bound[s] = bound_texture;
+        MaterialGpu::new(&base, &bound)
+    };
+    // Per slot, the parameter, its factor and what it reads with the texture.
+    let scalar = |f: f32| f * v[0];
+    let turned = {
+        let [x, y] = [2.0 * v[0] - 1.0, 2.0 * v[1] - 1.0];
+        y.atan2(x)
+    };
+    type Read = fn(&P) -> f32;
+    let rows: Vec<(usize, Read, f32)> = vec![
+        (
+            slot::SPECULAR_IOR,
+            |p| p.specular_ior,
+            scalar(base.specular_ior),
+        ),
+        (slot::DIFFUSE_ROUGHNESS, |p| p.diffuse_roughness, 0.0),
+        (slot::ANISOTROPY, |p| p.specular_anisotropy, scalar(0.5)),
+        (
+            slot::SUBSURFACE_WEIGHT,
+            |p| p.subsurface_weight,
+            scalar(0.5),
+        ),
+        (
+            slot::SUBSURFACE_ANISOTROPY,
+            |p| p.subsurface_anisotropy,
+            2.0 * v[0] - 1.0,
+        ),
+        (slot::FUZZ_WEIGHT, |p| p.fuzz_weight, scalar(0.5)),
+        (
+            slot::FUZZ_ROUGHNESS,
+            |p| p.fuzz_roughness,
+            scalar(base.fuzz_roughness),
+        ),
+        (slot::COAT_IOR, |p| p.coat_ior, scalar(base.coat_ior)),
+        (slot::COAT_DARKENING, |p| p.coat_darkening, scalar(1.0)),
+        (slot::COAT_ANISOTROPY, |p| p.coat_anisotropy, scalar(0.5)),
+        (slot::THIN_FILM_WEIGHT, |p| p.thin_film_weight, scalar(0.5)),
+        (
+            slot::THIN_FILM_THICKNESS,
+            |p| p.thin_film_thickness,
+            scalar(base.thin_film_thickness),
+        ),
+        (
+            slot::THIN_FILM_IOR,
+            |p| p.thin_film_ior,
+            scalar(base.thin_film_ior),
+        ),
+    ];
+    type Color = fn(&P) -> [f32; 3];
+    let colors: Vec<(usize, Color, [f32; 3])> = vec![
+        (
+            slot::SPECULAR_COLOR,
+            |p| p.specular_color,
+            [v[0], v[1], v[2]],
+        ),
+        (
+            slot::TRANSMISSION_COLOR,
+            |p| p.transmission_color,
+            [v[0], v[1], v[2]],
+        ),
+        (slot::FUZZ_COLOR, |p| p.fuzz_color, [v[0], v[1], v[2]]),
+        (slot::COAT_COLOR, |p| p.coat_color, [v[0], v[1], v[2]]),
+    ];
+    let words = |p: &P| -> Vec<u32> { bytemuck::cast_slice(bytemuck::bytes_of(p)).to_vec() };
+    let mut records = vec![MaterialGpu::new(&base, &[BoundTexture::NONE; slot::COUNT])];
+    let slots: Vec<usize> = rows
+        .iter()
+        .map(|r| r.0)
+        .chain(colors.iter().map(|c| c.0))
+        .chain([
+            slot::BASE_WEIGHT,
+            slot::SUBSURFACE_RADIUS,
+            slot::SUBSURFACE_RADIUS_SCALE,
+            slot::TANGENT,
+            slot::COAT_TANGENT,
+            slot::COAT_ROUGHNESS,
+            slot::COAT_NORMAL,
+            slot::EMISSION_LUMINANCE,
+        ])
+        .collect();
+    records.extend(slots.iter().map(|&s| with(s)));
+
+    let texels = {
+        let mut a = d
+            .gpu_malloc::<u8>(MemoryKind::Upload, 64, "texels")
+            .unwrap();
+        a.as_mut_slice().unwrap().copy_from_slice(&TEXEL.repeat(16));
+        a
+    };
+    let out = surface_params(
+        d,
+        &records,
+        |list| {
+            list.discard(&texture);
+            list.copy_to_texture(&texture, &TextureRegion::whole_mip(&desc, 0), texels.gpu());
+            list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+        },
+        [1.0; 4],
+    );
+    let plain = &out[0];
+    let at = |s: usize| &out[1 + slots.iter().position(|&x| x == s).unwrap()];
+    let close = |a: f32, b: f32, s: usize| assert!((a - b).abs() < 1e-4, "slot {s}: {a} vs {b}");
+    // The parameters a slot moves, in words of `Params`.
+    let moved = |s: usize| {
+        let (a, b) = (words(plain), words(at(s)));
+        (0..a.len() - 2).filter(|&i| a[i] != b[i]).count()
+    };
+    for &(s, read, want) in &rows {
+        // A factor of 0 has nothing to scale.
+        if s != slot::DIFFUSE_ROUGHNESS {
+            close(read(at(s)), want, s);
+            assert_eq!(moved(s), 1, "slot {s}");
+        }
+    }
+    for &(s, read, want) in &colors {
+        let was = read(plain);
+        for c in 0..3 {
+            close(read(at(s))[c], was[c] * want[c], s);
+        }
+    }
+    close(
+        at(slot::BASE_WEIGHT).base_color[0],
+        plain.base_color[0] * v[0],
+        slot::BASE_WEIGHT,
+    );
+    close(
+        at(slot::COAT_ROUGHNESS).coat_roughness,
+        0.0,
+        slot::COAT_ROUGHNESS,
+    );
+    for c in 0..3 {
+        close(
+            at(slot::SUBSURFACE_RADIUS).subsurface_radius[c],
+            plain.subsurface_radius[c] * v[0],
+            slot::SUBSURFACE_RADIUS,
+        );
+        close(
+            at(slot::SUBSURFACE_RADIUS_SCALE).subsurface_radius[c],
+            plain.subsurface_radius[c] * v[c],
+            slot::SUBSURFACE_RADIUS_SCALE,
+        );
+        close(
+            at(slot::EMISSION_LUMINANCE).emission[c],
+            plain.emission[c] * v[0],
+            slot::EMISSION_LUMINANCE,
+        );
+    }
+    close(at(slot::TANGENT).tangent_angle, turned, slot::TANGENT);
+    close(
+        at(slot::COAT_TANGENT).coat_tangent_angle,
+        turned,
+        slot::COAT_TANGENT,
+    );
+    let n = at(slot::COAT_NORMAL).coat_normal;
+    assert!(
+        n[2] < 0.99 && (Vec3::from(n).length() - 1.0).abs() < 1e-4,
+        "coat normal {n:?}"
+    );
+    assert_eq!(plain.coat_normal, [0.0, 0.0, 1.0]);
+    d.free_image_slot_after_submitted(slot_index);
+    assert_clean();
+}
+
+/// What each model makes of the same fields, at one point.
+#[test]
+fn models_state_their_specular_and_tint() {
+    use orr_pack::material::{Material, slot};
+    let _guard = serial();
+    let d = device();
+    let specular = Material {
+        specular_color: [2.0, 1.0, 0.5],
+        specular_ior: 1.5,
+        specular_weight: 0.5,
+        base_color: [0.5, 0.25, 0.125],
+        transmission_weight: 1.0,
+        thin_walled: 1,
+        ..Material::default()
+    };
+    let record = |m: &Material| MaterialGpu::new(m, &[BoundTexture::NONE; slot::COUNT]);
+    let models = [
+        Material::MODEL_OPENPBR,
+        Material::MODEL_GLTF,
+        Material::MODEL_PREVIEW_SPECULAR,
+    ];
+    let records: Vec<MaterialGpu> = models
+        .iter()
+        .map(|&model| record(&Material { model, ..specular }))
+        .collect();
+    let out = surface_params(d, &records, |_| {}, [1.0; 4]);
+    let rec2020 = |c: [f32; 3]| {
+        orr_color::rec709_to_rec2020(Vec3::from(c))
+            .as_vec3()
+            .to_array()
+    };
+    let near = |a: [f32; 3], b: [f32; 3], what: &str| {
+        for k in 0..3 {
+            assert!((a[k] - b[k]).abs() < 1e-5, "{what}: {a:?} vs {b:?}");
+        }
+    };
+    near(
+        out[0].specular_color,
+        rec2020(specular.specular_color),
+        "OpenPBR keeps the tint",
+    );
+    near(
+        out[1].specular_color,
+        rec2020(specular.specular_color.map(|c| 0.04 * c)),
+        "glTF scales the IOR's F0",
+    );
+    near(
+        out[2].specular_color,
+        rec2020(specular.specular_color.map(|c| c.min(1.0))),
+        "the specular workflow states F0, a reflectance",
+    );
+    assert_eq!(out[0].flags & BSDF_FRESNEL_MIX, 0);
+    assert_ne!(out[1].flags & BSDF_FRESNEL_MIX, 0);
     assert_clean();
 }

@@ -714,7 +714,7 @@ LightSample emissive_sample(LightSetGpu* set, uint entry, float4 u, float probab
     float2 uv = b0 * t.attributes[0].uv[0] + b1 * t.attributes[1].uv[0] + (1.0 - b0 - b1) * t.attributes[2].uv[0];
     SurfaceInput at = particle_input(s, MATERIAL_NONE, uv);
     LightSample r = light_sample(LIGHT_SAMPLE_EMISSIVE, s.light_capacity + entry, render_point(anchor, m, p),
-                                 normalize(n), material_color(mat, TEXTURE_EMISSION, at.uv, l),
+                                 normalize(n), material_scale(mat, TEXTURE_EMISSION_LUMINANCE, at.uv) * material_color(mat, TEXTURE_EMISSION, at.uv, l),
                                  probability * luminance_rec2020(l) / e.total);
     if ((mat.flags & MATERIAL_DOUBLE_SIDED) != 0)
         r.bits |= LIGHT_SAMPLE_TWO_SIDED;

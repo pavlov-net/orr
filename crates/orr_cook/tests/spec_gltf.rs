@@ -1032,6 +1032,62 @@ fn specular_and_coat_keep_the_gltf_model() {
     assert_eq!((m.coat_ior, m.coat_darkening), (1.5, 0.0));
 }
 
+/// Each extension texture reaches a slot of its own, on the channel its extension states.
+/// `thicknessTexture` stays unread: "Ray-tracers should ignore the thickness texture".
+#[test]
+fn extension_textures_reach_their_slots() {
+    let path = dir("extension-textures").join("all.glb");
+    let image = png(8, |x, y| {
+        [
+            (x * 30) as u8,
+            (y * 30) as u8,
+            ((x + y) * 15) as u8,
+            255 - (x * 20) as u8,
+        ]
+    });
+    textured_quad(
+        &path,
+        &image,
+        r#"{"extensions":{
+            "KHR_materials_specular":{"specularColorTexture":{"index":0}},
+            "KHR_materials_clearcoat":{"clearcoatFactor":1.0,"clearcoatRoughnessFactor":0.5,
+              "clearcoatRoughnessTexture":{"index":0},"clearcoatNormalTexture":{"index":0,"scale":0.5}},
+            "KHR_materials_sheen":{"sheenColorFactor":[1,1,1],"sheenRoughnessFactor":1.0,
+              "sheenColorTexture":{"index":0},"sheenRoughnessTexture":{"index":0}},
+            "KHR_materials_anisotropy":{"anisotropyStrength":1.0,"anisotropyTexture":{"index":0}},
+            "KHR_materials_iridescence":{"iridescenceFactor":1.0,"iridescenceTexture":{"index":0},
+              "iridescenceThicknessMinimum":200.0,"iridescenceThicknessMaximum":100.0,
+              "iridescenceThicknessTexture":{"index":0}},
+            "KHR_materials_diffuse_transmission":{"diffuseTransmissionFactor":1.0,
+              "diffuseTransmissionTexture":{"index":0}}}}"#,
+        "",
+    );
+    let (a, _) = cooked(&path);
+    let m = material_of(&a);
+    for s in [
+        slot::SPECULAR_COLOR,
+        slot::COAT_ROUGHNESS,
+        slot::COAT_NORMAL,
+        slot::FUZZ_COLOR,
+        slot::FUZZ_ROUGHNESS,
+        slot::ANISOTROPY,
+        slot::TANGENT,
+        slot::THIN_FILM_WEIGHT,
+        slot::THIN_FILM_THICKNESS,
+        slot::SUBSURFACE_WEIGHT,
+    ] {
+        assert!(is_bound(&m, s), "slot {s}");
+    }
+    // `mix(minimum, maximum, g)` as a share of the larger: green runs 0 to 210 down the image.
+    assert_eq!(m.thin_film_thickness, 200.0);
+    let name = "g/texture/0/thin_film_thickness";
+    let (w, thickness) = bc4_mip0(&a, name);
+    let share = |g: f32| 1.0 - 0.5 * g;
+    assert!((thickness[0] - share(0.0)).abs() < 0.02, "{}", thickness[0]);
+    let last = thickness[(7 * w) as usize];
+    assert!((last - share(210.0 / 255.0)).abs() < 0.02, "{last}");
+}
+
 /// KHR_materials_iridescence: "`iridescenceFactor` is multiplied with the red channel of
 /// `iridescenceTexture` to control the overall strength".
 #[test]

@@ -6,8 +6,10 @@
 //!   `base_diffuse_roughness` `diffuse_roughness`, `specular_roughness_anisotropy`
 //!   `specular_anisotropy`, `geometry_thin_walled` `thin_walled`, `thin_film_thickness`
 //!   (micrometers) the field in nanometers, `coat_roughness_anisotropy` `coat_anisotropy`, and
-//!   every other input the field of its name. The coat normal and tangents have no field and are
-//!   not read. A `geometry_opacity` below 1 or textured blends, as the linear presence weight
+//!   every other input the field of its name. `geometry_coat_normal` reads as `geometry_normal`
+//!   does. `geometry_tangent` and `geometry_coat_tangent` take a `tangent` node, the mesh's, or a
+//!   texture of a direction in the tangent plane; any other warns and reads the mesh's. A
+//!   `geometry_opacity` below 1 or textured blends, as the linear presence weight
 //!   OpenPBR defines.
 //! - `UsdPreviewSurface`, mapped like glTF metallic-roughness: `diffuseColor` is
 //!   `base_color`, `metallic`, `roughness`, `ior` and `emissiveColor` (read as nits) their
@@ -29,9 +31,10 @@
 //! other than a uv set fails, as meshes hold no values for it. Any other node fails the import,
 //! naming it, as does a connection cycle. A `geompropvalue` whose property no uv set holds reads
 //! its `default` at every point, as an unconnected `place2d` reads 0, 0. Textures go to the
-//! material's slots (base color, opacity, roughness, metalness, normal, emission, specular
-//! weight, subsurface color, coat, transmission, displacement); a textured input
-//! without a slot fails. A texture value multiplies the field, which takes the reader's scale
+//! material's slots. An interior medium is one for the whole material, so a textured
+//! `transmission_depth`, `transmission_scatter`, `transmission_scatter_anisotropy` or dispersion
+//! input fails, and a `transmission_color` texture under a `transmission_depth` above 0 warns and
+//! reads the field, unless the material is thin-walled. A texture value multiplies the field, which takes the reader's scale
 //! (`UsdUVTexture` `scale`; 1 otherwise); a bias folds scale and bias into the texels
 //! ([`TexRef::remap`]) and leaves the field 1, or for a color what it reaches past 1. Normals
 //! read `scale * t + bias` per axis; a pair of the form `s (2 t - 1)` is the tangent-space
@@ -69,7 +72,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 
 use orr_math::{Affine2, Vec2};
-use orr_pack::material::{Material, filter};
+use orr_pack::material::{Material, filter, slot};
 
 use crate::texture::Wrap;
 use crate::texture::color::{ImageColor, Space};
@@ -456,6 +459,11 @@ struct Mapper<'a, 'h> {
 }
 
 type Slot = fn(&mut MaterialTextures) -> &mut Option<TexRef>;
+
+/// Slot `S` of [`MaterialTextures::more`].
+fn more<const S: usize>(t: &mut MaterialTextures) -> &mut Option<TexRef> {
+    t.more.entry(S).or_default()
+}
 
 impl Mapper<'_, '_> {
     fn node(&self, n: usize) -> &Node {
@@ -1097,8 +1105,16 @@ impl Mapper<'_, '_> {
         type F = fn(&mut Material) -> &mut f32;
         type C = fn(&mut Material) -> &mut [f32; 3];
         let scalars: &[(&str, F, Option<Slot>)] = &[
-            ("base_weight", |m| &mut m.base_weight, None),
-            ("base_diffuse_roughness", |m| &mut m.diffuse_roughness, None),
+            (
+                "base_weight",
+                |m| &mut m.base_weight,
+                Some(more::<{ slot::BASE_WEIGHT }>),
+            ),
+            (
+                "base_diffuse_roughness",
+                |m| &mut m.diffuse_roughness,
+                Some(more::<{ slot::DIFFUSE_ROUGHNESS }>),
+            ),
             (
                 "base_metalness",
                 |m| &mut m.metalness,
@@ -1114,11 +1130,15 @@ impl Mapper<'_, '_> {
                 |m| &mut m.specular_roughness,
                 Some(|t| &mut t.roughness),
             ),
-            ("specular_ior", |m| &mut m.specular_ior, None),
+            (
+                "specular_ior",
+                |m| &mut m.specular_ior,
+                Some(more::<{ slot::SPECULAR_IOR }>),
+            ),
             (
                 "specular_roughness_anisotropy",
                 |m| &mut m.specular_anisotropy,
-                None,
+                Some(more::<{ slot::ANISOTROPY }>),
             ),
             (
                 "transmission_weight",
@@ -1140,26 +1160,62 @@ impl Mapper<'_, '_> {
                 |m| &mut m.transmission_dispersion_abbe_number,
                 None,
             ),
-            ("subsurface_weight", |m| &mut m.subsurface_weight, None),
+            (
+                "subsurface_weight",
+                |m| &mut m.subsurface_weight,
+                Some(more::<{ slot::SUBSURFACE_WEIGHT }>),
+            ),
             (
                 "subsurface_scatter_anisotropy",
                 |m| &mut m.subsurface_scatter_anisotropy,
-                None,
+                Some(more::<{ slot::SUBSURFACE_ANISOTROPY }>),
             ),
-            ("fuzz_weight", |m| &mut m.fuzz_weight, None),
-            ("fuzz_roughness", |m| &mut m.fuzz_roughness, None),
+            (
+                "fuzz_weight",
+                |m| &mut m.fuzz_weight,
+                Some(more::<{ slot::FUZZ_WEIGHT }>),
+            ),
+            (
+                "fuzz_roughness",
+                |m| &mut m.fuzz_roughness,
+                Some(more::<{ slot::FUZZ_ROUGHNESS }>),
+            ),
             ("coat_weight", |m| &mut m.coat_weight, Some(|t| &mut t.coat)),
-            ("coat_roughness", |m| &mut m.coat_roughness, None),
-            ("coat_ior", |m| &mut m.coat_ior, None),
-            ("coat_darkening", |m| &mut m.coat_darkening, None),
+            (
+                "coat_roughness",
+                |m| &mut m.coat_roughness,
+                Some(more::<{ slot::COAT_ROUGHNESS }>),
+            ),
+            (
+                "coat_ior",
+                |m| &mut m.coat_ior,
+                Some(more::<{ slot::COAT_IOR }>),
+            ),
+            (
+                "coat_darkening",
+                |m| &mut m.coat_darkening,
+                Some(more::<{ slot::COAT_DARKENING }>),
+            ),
             (
                 "coat_roughness_anisotropy",
                 |m| &mut m.coat_anisotropy,
-                None,
+                Some(more::<{ slot::COAT_ANISOTROPY }>),
             ),
-            ("thin_film_weight", |m| &mut m.thin_film_weight, None),
-            ("thin_film_ior", |m| &mut m.thin_film_ior, None),
-            ("emission_luminance", |m| &mut m.emission_luminance, None),
+            (
+                "thin_film_weight",
+                |m| &mut m.thin_film_weight,
+                Some(more::<{ slot::THIN_FILM_WEIGHT }>),
+            ),
+            (
+                "thin_film_ior",
+                |m| &mut m.thin_film_ior,
+                Some(more::<{ slot::THIN_FILM_IOR }>),
+            ),
+            (
+                "emission_luminance",
+                |m| &mut m.emission_luminance,
+                Some(more::<{ slot::EMISSION_LUMINANCE }>),
+            ),
             (
                 "geometry_opacity",
                 |m| &mut m.geometry_opacity,
@@ -1172,8 +1228,16 @@ impl Mapper<'_, '_> {
                 |m| &mut m.base_color,
                 Some(|t| &mut t.base_color),
             ),
-            ("specular_color", |m| &mut m.specular_color, None),
-            ("transmission_color", |m| &mut m.transmission_color, None),
+            (
+                "specular_color",
+                |m| &mut m.specular_color,
+                Some(more::<{ slot::SPECULAR_COLOR }>),
+            ),
+            (
+                "transmission_color",
+                |m| &mut m.transmission_color,
+                Some(more::<{ slot::TRANSMISSION_COLOR }>),
+            ),
             (
                 "transmission_scatter",
                 |m| &mut m.transmission_scatter,
@@ -1187,26 +1251,28 @@ impl Mapper<'_, '_> {
             (
                 "subsurface_radius_scale",
                 |m| &mut m.subsurface_radius_scale,
-                None,
+                Some(more::<{ slot::SUBSURFACE_RADIUS_SCALE }>),
             ),
-            ("fuzz_color", |m| &mut m.fuzz_color, None),
-            ("coat_color", |m| &mut m.coat_color, None),
+            (
+                "fuzz_color",
+                |m| &mut m.fuzz_color,
+                Some(more::<{ slot::FUZZ_COLOR }>),
+            ),
+            (
+                "coat_color",
+                |m| &mut m.coat_color,
+                Some(more::<{ slot::COAT_COLOR }>),
+            ),
             (
                 "emission_color",
                 |m| &mut m.emission_color,
                 Some(|t| &mut t.emissive),
             ),
         ];
-        const UNREAD: &[&str] = &[
-            "geometry_coat_normal",
-            "geometry_tangent",
-            "geometry_coat_tangent",
-        ];
         let names: Vec<String> = self.node(n).inputs.keys().cloned().collect();
         for name in &names {
             let known = scalars.iter().any(|s| s.0 == name)
                 || colors.iter().any(|c| c.0 == name)
-                || UNREAD.contains(&name.as_str())
                 || matches!(
                     name.as_str(),
                     "transmission_depth"
@@ -1214,6 +1280,9 @@ impl Mapper<'_, '_> {
                         | "thin_film_thickness"
                         | "geometry_thin_walled"
                         | "geometry_normal"
+                        | "geometry_coat_normal"
+                        | "geometry_tangent"
+                        | "geometry_coat_tangent"
                 );
             if !known {
                 return Err(format!(
@@ -1229,23 +1298,40 @@ impl Mapper<'_, '_> {
             self.color(n, name, field, slot)?;
         }
         self.length(n, "transmission_depth", |m| &mut m.transmission_depth)?;
-        self.length(n, "subsurface_radius", |m| &mut m.subsurface_radius)?;
-        let (thickness, unit) = self
-            .measure(n, "thin_film_thickness")?
-            .map_or((0.5, Unit::Unstated), |(v, unit)| (v[0], unit));
-        let nanometers = match unit {
-            Unit::Unstated => 1e3,
-            unit => self.meters(n, "thin_film_thickness", unit)? * 1e9,
-        };
-        self.material.thin_film_thickness = scaled(thickness, nanometers);
+        self.textured_length(n, "subsurface_radius", slot::SUBSURFACE_RADIUS, |m| {
+            &mut m.subsurface_radius
+        })?;
+        self.film_thickness(n)?;
         if let Some(v) = self.number(n, "geometry_thin_walled")? {
             self.material.thin_walled = u8::from(v[0] != 0.0);
+        }
+        if self
+            .textures
+            .more
+            .get(&slot::TRANSMISSION_COLOR)
+            .is_some_and(Option::is_some)
+            && self.material.transmission_depth > 0.0
+            && self.material.thin_walled == 0
+        {
+            self.warnings.push(format!(
+                "{}: an interior medium is one for the whole material, so a transmission_color \
+                 texture reads its factor under a transmission_depth above 0",
+                self.node(n).name
+            ));
         }
         if self.textures.opacity.is_some() || self.material.geometry_opacity < 1.0 {
             self.material.alpha_mode = Material::BLEND;
         }
-        match self.source(n, "geometry_normal") {
-            None => {}
+        self.textures.normal = self.normal_input(n, "geometry_normal")?;
+        self.textures.coat_normal = self.normal_input(n, "geometry_coat_normal")?;
+        self.tangent_input(n, "geometry_tangent", slot::TANGENT)?;
+        self.tangent_input(n, "geometry_coat_tangent", slot::COAT_TANGENT)
+    }
+
+    /// The normal map of input `name` of `n`, from a `normalmap` node.
+    fn normal_input(&mut self, n: usize, name: &str) -> Result<Option<(TexRef, [f32; 2])>, String> {
+        match self.source(n, name) {
+            None => Ok(None),
             Some(Input::Connect { node, .. }) if self.node(*node).kind == "normalmap" => {
                 let map = *node;
                 if self.text(map, "space") == Some("object") {
@@ -1259,18 +1345,96 @@ impl Mapper<'_, '_> {
                 let scale = self.vec2(map, "scale", Vec2::ONE)?;
                 match self.value(map, "in")? {
                     Some(Value::Texture(t)) if t.channels == Channels::Rgb => {
-                        self.textures.normal = Some((t.normalmap_ref(), scale.to_array()));
+                        Ok(Some((t.normalmap_ref(), scale.to_array())))
                     }
-                    _ => {
-                        return Err(format!("{}: in must read an image", self.node(map).name));
-                    }
+                    _ => Err(format!("{}: in must read an image", self.node(map).name)),
                 }
             }
-            Some(_) => {
-                return Err(format!(
-                    "{}: geometry_normal must come from a normalmap node",
+            Some(_) => Err(format!(
+                "{}: {name} must come from a normalmap node",
+                self.node(n).name
+            )),
+        }
+    }
+
+    /// Tangent input `name` of `n`: a `tangent` node is the mesh's own, and a texture a direction
+    /// in the tangent plane. Anything else stands for no frame a mesh holds.
+    fn tangent_input(&mut self, n: usize, name: &str, s: usize) -> Result<(), String> {
+        let source = match self.source(n, name) {
+            None => return Ok(()),
+            Some(Input::Connect { node, .. }) => Some(*node),
+            Some(_) => None,
+        };
+        if source.is_some_and(|node| self.node(node).kind == "tangent") {
+            return Ok(());
+        }
+        let texture = source
+            .is_some_and(|node| matches!(self.node(node).kind.as_str(), "image" | "tiledimage"));
+        match texture.then(|| self.value(n, name)).transpose()?.flatten() {
+            Some(Value::Texture(t)) if t.channels == Channels::Rgb => {
+                self.textures.more.insert(s, Some(t.tex_ref()));
+            }
+            _ => {
+                let warning = format!(
+                    "{}: {name} is neither a tangent node nor a texture; the mesh's tangent \
+                     stands in for it",
                     self.node(n).name
-                ));
+                );
+                self.warnings.push(warning);
+            }
+        }
+        Ok(())
+    }
+
+    /// A length input with a slot: [`Self::length`], or a texture that multiplies the field.
+    fn textured_length(
+        &mut self,
+        n: usize,
+        input: &str,
+        s: usize,
+        field: fn(&mut Material) -> &mut f32,
+    ) -> Result<(), String> {
+        match self.value(n, input)? {
+            Some(Value::Texture(t)) => {
+                if t.channels == Channels::Rgb {
+                    return Err(format!(
+                        "{} input {input}: a scalar reads one channel",
+                        self.node(n).name
+                    ));
+                }
+                let (r, value) = t.scalar();
+                *field(&mut self.material) = scaled(value, self.meters(n, input, t.unit)?);
+                self.textures.more.insert(s, Some(r));
+                Ok(())
+            }
+            _ => self.length(n, input, field),
+        }
+    }
+
+    /// `thin_film_thickness`, in nanometers, whose values without a unit are in micrometers.
+    fn film_thickness(&mut self, n: usize) -> Result<(), String> {
+        let input = "thin_film_thickness";
+        let nanometers = |this: &Self, unit| match unit {
+            Unit::Unstated => Ok(1e3),
+            unit => Ok::<_, String>(this.meters(n, input, unit)? * 1e9),
+        };
+        match self.value(n, input)? {
+            None => self.material.thin_film_thickness = 500.0,
+            Some(Value::Constant(v, unit)) => {
+                self.material.thin_film_thickness = scaled(v[0], nanometers(self, unit)?);
+            }
+            Some(Value::Texture(t)) => {
+                if t.channels == Channels::Rgb {
+                    return Err(format!(
+                        "{} input {input}: a scalar reads one channel",
+                        self.node(n).name
+                    ));
+                }
+                let (r, value) = t.scalar();
+                self.material.thin_film_thickness = scaled(value, nanometers(self, t.unit)?);
+                self.textures
+                    .more
+                    .insert(slot::THIN_FILM_THICKNESS, Some(r));
             }
         }
         Ok(())
@@ -1302,12 +1466,22 @@ impl Mapper<'_, '_> {
         let specular = self
             .number(n, "useSpecularWorkflow")?
             .is_some_and(|v| v[0] != 0.0);
-        self.scalar(n, "ior", |m| &mut m.specular_ior, None)?;
+        self.scalar(
+            n,
+            "ior",
+            |m| &mut m.specular_ior,
+            Some(more::<{ slot::SPECULAR_IOR }>),
+        )?;
         let ior = self.material.specular_ior;
         if specular {
             self.material.model = Material::MODEL_PREVIEW_SPECULAR;
             self.material.specular_color = [0.0; 3];
-            self.color(n, "specularColor", |m| &mut m.specular_color, None)?;
+            self.color(
+                n,
+                "specularColor",
+                |m| &mut m.specular_color,
+                Some(more::<{ slot::SPECULAR_COLOR }>),
+            )?;
         } else {
             self.scalar(
                 n,
@@ -1330,8 +1504,21 @@ impl Mapper<'_, '_> {
         )?;
         if self.material.coat_weight > 0.0 || self.textures.coat.is_some() {
             self.material.coat_roughness = 0.01;
-            self.scalar(n, "clearcoatRoughness", |m| &mut m.coat_roughness, None)?;
+            self.scalar(
+                n,
+                "clearcoatRoughness",
+                |m| &mut m.coat_roughness,
+                Some(more::<{ slot::COAT_ROUGHNESS }>),
+            )?;
+            // "including the clearcoat if clearcoat > 0": a texture of `ior` holds for both.
             self.material.coat_ior = ior;
+            let shared = self
+                .textures
+                .more
+                .get(&slot::SPECULAR_IOR)
+                .copied()
+                .flatten();
+            self.textures.more.insert(slot::COAT_IOR, shared);
             self.material.coat_color = [1.0; 3];
         }
         self.preview_opacity(n)?;
