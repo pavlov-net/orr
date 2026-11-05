@@ -1574,6 +1574,137 @@ fn a_mirroring_transform_negates_the_tangent_sign() {
 
 /// PS `frame:tangentsPrimvarName`, default "tangents", and `frame:binormalsPrimvarName`, default
 /// "binormals": the file's frame stands over MikkTSpace, and the binormal gives its handedness.
+/// A stage of a two-triangle mesh on `Plain`, whose subset binds faces `faces` to normal-mapped
+/// `M`, and a plain triangle `Other` beside it; `M` says `frame` and the mesh holds `mesh`.
+fn subset_stage(faces: &str, frame: &str, mesh: &str) -> String {
+    let normal_map = texture("T", RAW);
+    format!(
+        r#"def Mesh "Two"
+{{
+    uniform token subdivisionScheme = "{mesh}"
+    int[] faceVertexCounts = [3, 3]
+    int[] faceVertexIndices = [0, 1, 2, 2, 1, 3]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0)]
+    texCoord2f[] primvars:st = [(0, 0), (1, 0), (0, 1), (1, 1)] (
+        interpolation = "vertex"
+    )
+    rel material:binding = </Plain>
+
+    def GeomSubset "Mapped"
+    {{
+        uniform token elementType = "face"
+        uniform token familyName = "materialBind"
+        int[] indices = [{faces}]
+        rel material:binding = </M>
+    }}
+}}
+
+def Mesh "Other"
+{{
+    {TRIANGLE}
+    rel material:binding = </Plain>
+}}
+
+def Material "Plain"
+{{
+    token outputs:surface.connect = </Plain/S.outputs:surface>
+
+    def Shader "S"
+    {{
+        uniform token info:id = "UsdPreviewSurface"
+        token outputs:surface
+    }}
+}}
+
+def Material "M"
+{{
+    token outputs:surface.connect = </M/S.outputs:surface>
+    {frame}
+
+    def Shader "S"
+    {{
+        uniform token info:id = "UsdPreviewSurface"
+        normal3f inputs:normal.connect = </M/T.outputs:rgb>
+        token outputs:surface
+    }}
+    {normal_map}
+    {READER}
+}}"#
+    )
+}
+
+/// The cook of `stage`, keeping its tangents, and its warnings.
+fn cook_with_warnings(
+    d: &std::path::Path,
+    stage: &str,
+    subdivision: Subdivision,
+) -> (Archive, Vec<String>) {
+    let path = d.join("stage.usda");
+    std::fs::write(&path, format!("{HEAD}\n{stage}")).unwrap();
+    std::fs::write(d.join("tex.png"), png(4, 4, |_, _| [96, 160, 255, 255])).unwrap();
+    let mut settings = UsdSettings::default();
+    settings.mesh.tangent_error_max = None;
+    settings.subdivision = subdivision;
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            vec![AssetSpec {
+                name: "u".into(),
+                source: Source::Usd { path, settings },
+            }],
+        )],
+    };
+    let mut cooked = orr_cook::cook(&manifest, &Default::default()).unwrap();
+    let warnings = cooked
+        .report
+        .assets
+        .iter()
+        .flat_map(|a| &a.warnings)
+        .cloned();
+    let warnings = warnings.collect();
+    (
+        Archive::from_memory(cooked.memory.remove(0)).unwrap(),
+        warnings,
+    )
+}
+
+/// A material only a subset binds reads tangents, which every mesh of its model then carries.
+#[test]
+fn a_subsets_material_gives_its_model_tangents() {
+    let d = dir("subset-tangents");
+    let (a, _) = cook_with_warnings(&d, &subset_stage("1", "", "none"), Subdivision::Hull);
+    assert!(!corner_tangents(&a, "u/mesh").is_empty());
+}
+
+/// A frame on uvs a mesh doesn't author warns for a material a face draws with, and only then.
+#[test]
+fn a_frame_on_unauthored_uvs_warns_for_a_material_a_face_uses() {
+    let d = dir("subset-frame-warning");
+    let frame = r#"token inputs:frame:stPrimvarName = "elsewhere""#;
+    let warned = |faces: &str| {
+        let stage = subset_stage(faces, frame, "none");
+        let (_, warnings) = cook_with_warnings(&d, &stage, Subdivision::Hull);
+        let says = |w: &&String| w.contains("tangents follow elsewhere");
+        warnings.iter().filter(says).count()
+    };
+    assert_eq!(warned("1"), 1);
+    assert_eq!(warned(""), 0, "no face draws with it");
+}
+
+/// Stated tangents on a cage warn, whatever else the model holds.
+#[test]
+fn tangents_on_a_cage_warn_that_they_are_not_read() {
+    let d = dir("cage-tangents-warning");
+    let stage = subset_stage("1", "", "catmullClark").replace(
+        "rel material:binding = </Plain>\n\n    def GeomSubset",
+        "vector3f[] primvars:tangents = [(0, 1, 0)] (\n        interpolation = \"constant\"\n    \
+         )\n    rel material:binding = </Plain>\n\n    def GeomSubset",
+    );
+    let (_, warnings) = cook_with_warnings(&d, &stage, Subdivision::Cage);
+    let says = |w: &&String| w.contains("on a subdivision cage is not read");
+    assert_eq!(warnings.iter().filter(says).count(), 2, "{warnings:?}");
+}
+
 #[test]
 fn frame_primvars_state_tangents_and_their_handedness() {
     let primvars = |tangents: &str, binormals: &str, y: f32| {

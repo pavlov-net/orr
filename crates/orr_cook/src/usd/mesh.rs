@@ -28,12 +28,40 @@ pub(super) struct MeshPrim {
     left_handed: bool,
     holes: Vec<usize>,
     scheme: String,
-    pub(super) double_sided: bool,
     creases: Vec<Crease>,
     corners: Vec<Corner>,
     boundary: Boundary,
     uv_linear: UvLinear,
     smooth_triangles: bool,
+}
+
+/// What a mesh prim says of itself without any of its arrays.
+pub(super) struct MeshFacts {
+    /// Its surface is its faces, which no scheme smooths.
+    pub(super) polygonal: bool,
+    pub(super) double_sided: bool,
+}
+
+impl MeshFacts {
+    pub(super) fn read(r: &PrimReader<'_>) -> Result<Self, String> {
+        Ok(Self {
+            polygonal: polygonal(&scheme(r)?),
+            double_sided: double_sided(r)?,
+        })
+    }
+}
+
+fn scheme(r: &PrimReader<'_>) -> Result<String, String> {
+    Ok(r.token("subdivisionScheme")?
+        .unwrap_or_else(|| "catmullClark".into()))
+}
+
+fn polygonal(scheme: &str) -> bool {
+    matches!(scheme, "none" | "bilinear")
+}
+
+fn double_sided(r: &PrimReader<'_>) -> Result<bool, String> {
+    Ok(r.numbers("doubleSided")?.is_some_and(|v| v[0] != 0.0))
 }
 
 impl MeshPrim {
@@ -157,16 +185,13 @@ impl MeshPrim {
             },
             left_handed: r.token("orientation")?.as_deref() == Some("leftHanded"),
             holes: usize_list("holeIndices")?,
-            scheme: r
-                .token("subdivisionScheme")?
-                .unwrap_or_else(|| "catmullClark".into()),
-            double_sided: r.numbers("doubleSided")?.is_some_and(|v| v[0] != 0.0),
+            scheme: scheme(r)?,
         })
     }
 
     /// Whether its surface is its faces, which no scheme smooths.
     pub(super) fn polygonal(&self) -> bool {
-        matches!(self.scheme.as_str(), "none" | "bilinear")
+        polygonal(&self.scheme)
     }
 }
 

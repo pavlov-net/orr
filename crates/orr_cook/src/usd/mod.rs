@@ -79,7 +79,7 @@ use crate::texture::material::{ImageData, ImageFile, ImageTile, TextureRules};
 use crate::texture::tiles::{UDIM, udim_cell};
 use crate::{Error, Result};
 
-use mesh::{CageBuilder, FaceFrame, Faces, FrameUvs, MeshPrim, Placing, Welder};
+use mesh::{CageBuilder, FaceFrame, Faces, FrameUvs, MeshFacts, MeshPrim, Placing, Welder};
 use read::{PrimReader, Primvar, Reads, Recorder};
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -254,6 +254,20 @@ impl Building {
             welder: Welder::default(),
             cage: CageBuilder::default(),
         }
+    }
+}
+
+/// The scene materials a mesh prim binds.
+struct Bindings {
+    /// Its own, or its nearest ancestor's.
+    base: usize,
+    /// Each `GeomSubset` that binds faces: its node and material.
+    subsets: Vec<(usize, usize)>,
+}
+
+impl Bindings {
+    fn materials(&self) -> impl Iterator<Item = usize> {
+        std::iter::once(self.base).chain(self.subsets.iter().map(|s| s.1))
     }
 }
 
@@ -634,22 +648,46 @@ impl<'s> Importer<'s> {
             skels[k].3.extend(sites);
             b.skeleton = Some(k);
         }
-        // Every mesh is read before any lands in its model, which must know whether one of them
-        // carries tangents.
-        let mut prepared = Vec::with_capacity(meshes.len());
+        // A model's meshes carry tangents if one of them does, which each must know as it lands
+        // in the model. That takes which materials a mesh binds, and none of its arrays.
+        let mut bindings = Vec::with_capacity(meshes.len());
         for &(i, o) in &meshes {
+            let prim = self.nodes[i].prim.clone();
+            let r = self.reader(&prim);
+            let facts = MeshFacts::read(&r)?;
+            let as_cage = !facts.polygonal && self.settings.subdivision == Subdivision::Cage;
+            let bound_here = self.bindings(i, facts.double_sided)?;
+            let settled = holders[o]
+                .iter()
+                .all(|h| models[h.0].welder.carries_tangents);
+            if !as_cage && !settled {
+                let r = self.reader(&prim);
+                let mut carries = false;
+                for m in bound_here.materials() {
+                    carries = carries
+                        || self.materials[m].tangent_set().is_some()
+                        || r.holds_primvar(&self.frames[m].tangents)?;
+                }
+                if carries {
+                    for &(m, _) in &holders[o] {
+                        models[m].welder.carries_tangents = true;
+                    }
+                }
+            }
+            bindings.push(bound_here);
+        }
+        for (&(i, o), bound_here) in meshes.iter().zip(&bindings) {
             let prim = self.nodes[i].prim.clone();
             let r = self.reader(&prim);
             let path = r.path().to_string();
             let mesh = MeshPrim::read(&r, &self.settings.uv, self.settings.uv1.as_deref())?;
             let as_cage = !mesh.polygonal() && self.settings.subdivision == Subdivision::Cage;
-            let faces = self.face_materials(i, &mesh)?;
+            let faces = self.face_materials(bound_here, &mesh)?;
             let mut used = faces.clone();
             used.sort_unstable();
             used.dedup();
             let r = self.reader(&prim);
             let mut primvars: HashMap<String, Option<Primvar>> = HashMap::new();
-            let mut carries = false;
             for &m in &used {
                 let frame = &self.frames[m];
                 let names = [&frame.tangents, &frame.binormals].map(|n| (n, 3));
@@ -659,7 +697,6 @@ impl<'s> Importer<'s> {
                     }
                 }
                 let reads = self.materials[m].tangent_set().is_some();
-                carries |= reads || primvars[&frame.tangents].is_some();
                 if let Some(st) = &frame.st
                     && reads
                     && !as_cage
@@ -682,25 +719,17 @@ impl<'s> Importer<'s> {
                     ));
                 }
             }
-            if carries && !as_cage {
-                for &(m, _) in &holders[o] {
-                    models[m].welder.carries_tangents = true;
-                }
-            }
-            prepared.push((i, o, path, mesh, as_cage, faces, primvars));
-        }
-        for (i, o, path, mesh, as_cage, faces, primvars) in &prepared {
-            let (i, o, as_cage) = (*i, *o, *as_cage);
             let skeleton = models[o].skeleton.map(|k| &skels[k].1);
             let (skin, transform) = match (bound.get(&i), skeleton) {
                 (Some(b), Some(sk)) => {
-                    let (s, to_bind) = sk.binding(path, &self.skin_source(b), mesh.points.len())?;
+                    let (s, to_bind) =
+                        sk.binding(&path, &self.skin_source(b), mesh.points.len())?;
                     (Some(s), to_bind)
                 }
                 _ => (None, self.to_model(&models[o], i)?),
             };
             let face_material = |f: usize| faces[f];
-            let surface = (!as_cage).then(|| Faces::new(mesh));
+            let surface = (!as_cage).then(|| Faces::new(&mesh));
             let carries = holders[o]
                 .iter()
                 .any(|h| models[h.0].welder.carries_tangents);
@@ -721,7 +750,7 @@ impl<'s> Importer<'s> {
                             binormals: held(&f.binormals),
                         }
                     };
-                    Some(mesh::corner_tangents(mesh, s, &frame, path)?)
+                    Some(mesh::corner_tangents(&mesh, s, &frame, &path)?)
                 }
                 _ => None,
             };
@@ -732,10 +761,10 @@ impl<'s> Importer<'s> {
                     skin: skin.as_deref(),
                 };
                 match &surface {
-                    None => models[m].cage.add(mesh, &placing, path)?,
+                    None => models[m].cage.add(&mesh, &placing, &path)?,
                     Some(s) => {
                         let welder = &mut models[m].welder;
-                        welder.add(mesh, s, corners.as_deref(), &placing, path)?;
+                        welder.add(&mesh, s, corners.as_deref(), &placing, &path)?;
                     }
                 }
             }
@@ -1367,15 +1396,15 @@ impl<'s> Importer<'s> {
         Ok(None)
     }
 
-    /// Scene material per face of mesh prim `i`.
-    fn face_materials(&mut self, i: usize, mesh: &MeshPrim) -> Result<Vec<usize>, String> {
+    /// The scene materials mesh prim `i` binds.
+    fn bindings(&mut self, i: usize, double_sided: bool) -> Result<Bindings, String> {
         let base = self.bound_material(Some(i))?;
-        let base = self.material(base, mesh.double_sided, i)?;
-        let mut faces = vec![base; mesh.counts.len()];
+        let base = self.material(base, double_sided, i)?;
         let subsets: Vec<usize> = self
             .subtree(i)
             .filter(|&k| self.nodes[k].parent == Some(i) && self.nodes[k].ty == "GeomSubset")
             .collect();
+        let mut bound = Vec::new();
         for k in subsets {
             let r = self.reader(&self.nodes[k].prim);
             if r.token("familyName")?.as_deref() != Some("materialBind")
@@ -1388,9 +1417,21 @@ impl<'s> Importer<'s> {
             let Some(m) = self.direct_binding(&self.nodes[k].prim)? else {
                 continue;
             };
+            bound.push((k, self.material(Some(m), double_sided, i)?));
+        }
+        Ok(Bindings {
+            base,
+            subsets: bound,
+        })
+    }
+
+    /// Scene material per face of `mesh`, which binds `bindings`.
+    fn face_materials(&self, bindings: &Bindings, mesh: &MeshPrim) -> Result<Vec<usize>, String> {
+        let mut faces = vec![bindings.base; mesh.counts.len()];
+        for &(k, m) in &bindings.subsets {
+            let r = self.reader(&self.nodes[k].prim);
             let path = r.path().to_string();
             let indices = r.ints("indices")?.unwrap_or_default();
-            let m = self.material(Some(m), mesh.double_sided, i)?;
             for f in indices {
                 let slot = usize::try_from(f)
                     .ok()

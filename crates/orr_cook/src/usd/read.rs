@@ -577,6 +577,12 @@ impl PrimReader<'_> {
         }))
     }
 
+    /// Whether primvar `name` holds values.
+    pub(super) fn holds_primvar(&self, name: &str) -> Result<bool, String> {
+        let held = self.numbers(&format!("primvars:{name}"))?;
+        Ok(held.is_some_and(|v| !v.is_empty()))
+    }
+
     /// Attribute `name`'s `elementSize`: how many array elements make one of its values.
     pub(super) fn element_size(&self, name: &str) -> usize {
         self.prim
