@@ -133,6 +133,9 @@ pub(crate) struct TexRef {
     /// What each channel of the image reads past 0..1 under [`Wrap::Border`] and
     /// [`Wrap::Constant`], as its texels decode: colors linear Rec.709.
     pub(crate) outside: [f32; 4],
+    /// What each channel reads where the image can't be read, as a linear value: the `fallback`
+    /// or `default` of the input.
+    pub(crate) missing: [f32; 4],
     /// The uv transform the texture is sampled with (`Material::uv_transforms` form).
     pub(crate) uv: [f32; 6],
     /// What the importer's rules say the image's texels are.
@@ -276,9 +279,21 @@ pub(crate) enum ImageData {
         path: PathBuf,
         read: Option<(Hash32, u64)>,
     },
+    /// No file to read, and why.
+    Unread(String),
+    /// One texel of these values.
+    Solid([f32; 4]),
 }
 
 impl ImageFile {
+    /// An image that reads as the input's fallback, for why it has no file.
+    pub(crate) fn unread(name: String, why: String) -> Self {
+        Self {
+            name,
+            data: ImageData::Unread(why),
+        }
+    }
+
     /// The file's bytes; a file must not have changed since its facts were read.
     fn bytes(&self) -> Result<Cow<'_, [u8]>> {
         match &self.data {
@@ -287,8 +302,8 @@ impl ImageFile {
                 path,
                 read: Some((hash, _)),
             } => Ok(Cow::Owned(state::read_checked(path, *hash)?)),
-            ImageData::File { read: None, .. } => {
-                unreachable!("an image's facts are read before its jobs")
+            ImageData::File { read: None, .. } | ImageData::Unread(_) | ImageData::Solid(_) => {
+                unreachable!("only an image with facts from bytes reads them")
             }
         }
     }
@@ -297,6 +312,19 @@ impl ImageFile {
         match &self.data {
             ImageData::Bytes(b) => b.len() as u64,
             ImageData::File { read, .. } => read.map_or(0, |r| r.1),
+            ImageData::Unread(_) | ImageData::Solid(_) => 0,
+        }
+    }
+
+    /// The image's only layer.
+    fn decoded(&self) -> Result<Img, String> {
+        match self.data {
+            ImageData::Solid(texel) => Ok(Img {
+                w: 1,
+                h: 1,
+                px: vec![texel],
+            }),
+            _ => decode(&self.bytes().map_err(|e| e.to_string())?),
         }
     }
 }
@@ -338,6 +366,28 @@ pub(crate) struct ImageFacts {
 }
 
 impl ImageFacts {
+    /// The facts of a texel of float values.
+    fn solid(texel: [f32; 4]) -> Self {
+        Self {
+            w: 1,
+            h: 1,
+            color: FileColor::default(),
+            constant: texel.map(Some),
+            range: texel.map(|v| (v, v)),
+            minus_infinity: false,
+            hash: Hash32::of(bytemuck::cast_slice(&texel)),
+            blocks: None,
+            rg: false,
+            signed: false,
+            float: true,
+            negatives: true,
+            stored_normals: false,
+            gray: Gray::No,
+            animated: false,
+            wrap: None,
+        }
+    }
+
     /// Whether normal map `r` is to read as it stands where this image can't hold the signed
     /// vectors that would mean.
     fn cant_read(&self, r: &TexRef) -> bool {
@@ -356,19 +406,32 @@ fn decode(bytes: &[u8]) -> Result<Img, String> {
     Ok(layers.remove(0))
 }
 
-/// Facts of the images `used`, of which `whole` are read with all of their range, `normals` as
-/// normal maps that say nothing of their encoding and `colors` as color, read in parallel. File
-/// images are read through the memo, and each one's hash and length are recorded in its
-/// [`ImageData::File`].
+/// How a scene reads its images, by index.
+pub(crate) struct ImageReads {
+    /// Read with all of their range.
+    pub(crate) whole: HashSet<usize>,
+    /// Normal maps that say nothing of their encoding.
+    pub(crate) normals: HashSet<usize>,
+    /// Read as color.
+    pub(crate) colors: HashSet<usize>,
+    /// Their inputs state what to read where they can't be read.
+    pub(crate) optional: HashSet<usize>,
+}
+
+/// Facts of the images `used`, read as `reads` says, in parallel, and why each optional image that
+/// can't be read can't; any other fails. File images are read through the memo, and each one's
+/// hash and length are recorded in its [`ImageData::File`].
 pub(crate) fn image_facts(
     asset: &str,
     images: &mut [ImageFile],
     used: &[usize],
-    whole: &HashSet<usize>,
-    normals: &HashSet<usize>,
-    colors: &HashSet<usize>,
+    reads: &ImageReads,
     memo: &Memo,
-) -> Result<HashMap<usize, ImageFacts>> {
+) -> Result<(HashMap<usize, ImageFacts>, BTreeMap<usize, String>)> {
+    type Outcome = (
+        std::result::Result<ImageFacts, String>,
+        Option<(Hash32, u64)>,
+    );
     let fail = |message: String| Error::Texture {
         asset: asset.into(),
         message,
@@ -376,32 +439,83 @@ pub(crate) fn image_facts(
     if let Some(&i) = used.iter().find(|&&i| i >= images.len()) {
         return Err(fail(format!("image {i} does not exist")));
     }
-    let facts: HashMap<usize, (ImageFacts, Option<u64>)> = used
+    let read: HashMap<usize, Outcome> = used
         .par_iter()
         .map(|&i| {
             let file = &images[i];
             let (bytes, hash, read) = match &file.data {
                 ImageData::Bytes(b) => (Cow::Borrowed(b.as_slice()), Hash32::of(b), None),
-                ImageData::File { path, .. } => {
-                    let (bytes, hash) = memo.read(path)?;
-                    let len = bytes.len() as u64;
-                    (Cow::Owned(bytes), hash, Some(len))
-                }
+                ImageData::File { path, .. } => match memo.read(path) {
+                    Ok((bytes, hash)) => {
+                        let read = Some((hash, bytes.len() as u64));
+                        (Cow::Owned(bytes), hash, read)
+                    }
+                    Err(e) if reads.optional.contains(&i) => {
+                        return Ok((i, (Err(e.to_string()), None)));
+                    }
+                    Err(e) => return Err(e),
+                },
+                ImageData::Unread(why) => return Ok((i, (Err(why.clone()), None))),
+                &ImageData::Solid(texel) => return Ok((i, (Ok(ImageFacts::solid(texel)), None))),
             };
-            let reads = [whole, normals, colors].map(|s| s.contains(&i));
-            let facts = facts_of(&bytes, hash, reads)
-                .map_err(|e| fail(format!("image {}: {e}", file.name)))?;
+            let uses = [&reads.whole, &reads.normals, &reads.colors].map(|s| s.contains(&i));
+            let facts = facts_of(&bytes, hash, uses);
             Ok((i, (facts, read)))
         })
         .collect::<Result<_>>()?;
-    let mut out = HashMap::with_capacity(facts.len());
-    for (i, (f, len)) in facts {
-        if let (ImageData::File { read, .. }, Some(len)) = (&mut images[i].data, len) {
-            *read = Some((f.hash, len));
+    let mut out = HashMap::with_capacity(read.len());
+    let mut unread = BTreeMap::new();
+    for (i, (facts, file)) in read {
+        if let (ImageData::File { read, .. }, Some(file)) = (&mut images[i].data, file) {
+            *read = Some(file);
         }
-        out.insert(i, f);
+        match facts {
+            Ok(f) => {
+                out.insert(i, f);
+            }
+            Err(why) if reads.optional.contains(&i) => {
+                unread.insert(i, why);
+            }
+            Err(e) => return Err(fail(format!("image {}: {e}", images[i].name))),
+        }
     }
-    Ok(out)
+    Ok((out, unread))
+}
+
+/// Points every reference of `textures` to an image of `unread` at a solid image of what it
+/// reads in its place: the input's fallback, everywhere and as it stands. `solids` shares them
+/// by value.
+pub(crate) fn stand_in(
+    textures: &mut MaterialTextures,
+    unread: &BTreeMap<usize, String>,
+    images: &mut Vec<ImageFile>,
+    facts: &mut HashMap<usize, ImageFacts>,
+    solids: &mut HashMap<[u32; 4], usize>,
+) {
+    for r in textures
+        .refs_mut()
+        .filter(|r| unread.contains_key(&r.image))
+    {
+        let image = *solids
+            .entry(r.missing.map(f32::to_bits))
+            .or_insert_with(|| {
+                images.push(ImageFile {
+                    name: format!("fallback/{:?}", r.missing),
+                    data: ImageData::Solid(r.missing),
+                });
+                facts.insert(images.len() - 1, ImageFacts::solid(r.missing));
+                images.len() - 1
+            });
+        *r = TexRef {
+            image,
+            rg_channel: None,
+            wrap: [Wrap::Repeat; 2],
+            file_wrap: [false; 2],
+            outside: [0.0; 4],
+            color: ImageColor::Data,
+            ..*r
+        };
+    }
 }
 
 /// The facts of one image file's bytes, with all of its range if it is read `whole`, how it
@@ -802,9 +916,18 @@ impl<'a> Packer<'a> {
         })
     }
 
+    /// Value `v` of `r` as a texture up to `top` stores it. A stated value is stored nowhere, and
+    /// stands whole, as a constant input does.
+    fn held(&self, r: &TexRef, v: f32, top: f32) -> f32 {
+        match self.images[r.image].data {
+            ImageData::Solid(_) => v,
+            _ => v.clamp(0.0, top),
+        }
+    }
+
     /// [`Self::constant`] of an input with a 0..1 meaning, clamped as its texture stores it.
     fn constant_weight(&self, r: &TexRef, c: usize) -> Option<f32> {
-        self.constant(r, c).map(|v| v.clamp(0.0, 1.0))
+        self.constant(r, c).map(|v| self.held(r, v, 1.0))
     }
 
     /// Whether emission or specular weight `r` can read past 1: USD and MaterialX range them over
@@ -834,14 +957,14 @@ impl<'a> Packer<'a> {
     /// [`Self::constant_weight`] of the channel of scalar input `r`, as the input reads it.
     fn constant_input(&self, r: &TexRef) -> Option<f32> {
         self.constant_weight(r, usize::from(r.channel))
-            .map(|v| r.read(0, v).clamp(0.0, 1.0))
+            .map(|v| self.held(r, r.read(0, v), 1.0))
     }
 
     /// [`Self::constant_input`] of opacity `r` of material `m`. A folded opacity tests the same
     /// for the whole surface, so under `MASK` texels either side of the cutoff stay a texture.
     fn constant_opacity(&self, m: &Material, r: &TexRef) -> Option<f32> {
         let (lo, hi) = self.range(r, usize::from(r.channel));
-        let read = |t: f32| r.read(0, t.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        let read = |t: f32| self.held(r, r.read(0, self.held(r, t, 1.0)), 1.0);
         let passes = |t: f32| m.geometry_opacity * read(t) >= m.alpha_cutoff;
         let one_side = m.alpha_mode != Material::MASK || passes(lo) == passes(hi);
         self.constant_input(r).filter(|_| one_side)
@@ -936,7 +1059,9 @@ impl<'a> Packer<'a> {
         materials: impl Iterator<Item = &'m MaterialTextures>,
     ) -> Result<BTreeSet<usize>> {
         let mut reads: BTreeMap<usize, Vec<&TexRef>> = BTreeMap::new();
-        for r in materials.flat_map(MaterialTextures::colors) {
+        // A stated value has no texels, and stands whole.
+        let filed = |r: &&TexRef| !matches!(self.images[r.image].data, ImageData::Solid(_));
+        for r in materials.flat_map(MaterialTextures::colors).filter(filed) {
             let (read, _, gamut) = self.color_read(r);
             let below = self.image(r.image).minus_infinity || self.reads_below(r, &read);
             if below || read.reaches_past(gamut.as_ref()) {
@@ -1340,7 +1465,7 @@ impl<'a> Packer<'a> {
             if let Some(m) = &gamut {
                 texel = multiply(m, texel);
             }
-            let texel = texel.map(|v| v.clamp(0.0, top));
+            let texel = texel.map(|v| self.held(r, v, top));
             let target = color(m);
             // Rec.709 multiplies directly, so its factors stay exact.
             *target = match primaries {
@@ -1808,7 +1933,7 @@ impl TextureJob {
                     load::decode_layers(&mut src).map_err(&fail)?;
                     Ok(src.layers.remove(0))
                 }
-                None => decode(&images[i].bytes()?).map_err(&fail),
+                None => images[i].decoded().map_err(&fail),
             })?;
             sources.insert(i, img.resized(self.size[0], self.size[1]));
         }

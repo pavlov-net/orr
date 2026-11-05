@@ -2,7 +2,7 @@
 //! conversions, transforms and primvars.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -14,7 +14,7 @@ use orr_pack::Hash32;
 
 use super::VariantSelection;
 use crate::shading;
-use crate::state::Input;
+use crate::state::{Input, hash_file};
 
 /// Identifier of the session layer that carries the manifest's variant selections.
 pub(super) const SESSION: &str = "orr_cook_session.usda";
@@ -23,6 +23,8 @@ pub(super) const SESSION: &str = "orr_cook_session.usda";
 #[derive(Default)]
 pub(super) struct Reads {
     files: BTreeMap<PathBuf, Hash32>,
+    /// Where assets that did not resolve or read would appear.
+    absent: BTreeSet<PathBuf>,
     pub(super) session: String,
 }
 
@@ -40,10 +42,17 @@ impl Recorder {
         }
     }
 
-    /// Reads an asset (an image) by its resolved path, recording its file.
+    /// Reads an asset (an image) by its resolved path, recording its file, which is watched for
+    /// a change when it can't be read.
     pub(super) fn read(&self, resolved: &str) -> io::Result<Vec<u8>> {
-        let mut asset = self.open_asset(&ar::ResolvedPath::new(resolved))?;
-        asset.read_all()
+        let read = self
+            .open_asset(&ar::ResolvedPath::new(resolved))
+            .and_then(|mut asset| asset.read_all());
+        if read.is_err() {
+            let file = outer(Path::new(resolved));
+            self.reads.borrow_mut().absent.insert(file);
+        }
+        read
     }
 }
 
@@ -61,7 +70,18 @@ impl Resolver for Recorder {
         if asset_path == SESSION {
             return SESSION.into();
         }
-        self.inner.create_identifier(asset_path, anchor)
+        let id = self.inner.create_identifier(asset_path, anchor);
+        if !asset_path.is_empty() && self.inner.resolve(&id).is_none() {
+            // A bare path stays bare until a file appears beside the layer.
+            let file = if Path::new(&id).is_absolute() {
+                outer(Path::new(&id))
+            } else {
+                let beside = format!("./{asset_path}");
+                outer(Path::new(&self.inner.create_identifier(&beside, anchor)))
+            };
+            self.reads.borrow_mut().absent.insert(file);
+        }
+        id
     }
 
     fn resolve(&self, asset_path: &str) -> Option<ar::ResolvedPath> {
@@ -115,13 +135,20 @@ impl Resolver for Recorder {
 
 impl Reads {
     pub(super) fn inputs(&self) -> Vec<Input> {
-        self.files
+        let read = self.files.iter().map(|(path, &hash)| Input {
+            path: path.clone(),
+            hash,
+        });
+        let absent = self
+            .absent
             .iter()
-            .map(|(path, &hash)| Input {
+            .filter(|p| !self.files.contains_key(*p))
+            .map(|path| Input {
                 path: path.clone(),
-                hash,
-            })
-            .collect()
+                // A package can stand here without the entry that was asked of it.
+                hash: hash_file(path).unwrap_or(Input::ABSENT),
+            });
+        read.chain(absent).collect()
     }
 }
 

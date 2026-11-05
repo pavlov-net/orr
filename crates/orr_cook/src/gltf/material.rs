@@ -228,6 +228,7 @@ pub(super) fn textures(
             file_wrap: [false; 2],
             filter: mag | min,
             outside: [0.0; 4],
+            missing: [0.0; 4],
             rg_channel: None,
             uv,
             remap: None,

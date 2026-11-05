@@ -48,7 +48,8 @@ use crate::report::{
 use crate::state::{self, Input, Memo, Record};
 use crate::subd::{self, CageData, CageInput, SubdSettings};
 use crate::texture::material::{
-    ImageData, ImageFacts, ImageFile, ImageRules, Packer, TextureJob, TextureRules, image_facts,
+    ImageData, ImageFile, ImageReads, ImageRules, Packer, TextureJob, TextureRules, image_facts,
+    stand_in,
 };
 use crate::texture::neural::{self, NeuralJob};
 use crate::texture::{self, Img, Wrap};
@@ -1704,19 +1705,40 @@ fn plan_scene(
         .filter(|n| n.0.rules == ImageRules::Gltf)
         .map(|n| n.0.image)
         .collect();
-    let facts: HashMap<usize, ImageFacts> = image_facts(
-        name,
-        &mut src.images,
-        &used,
-        &whole,
-        &normals,
-        &colors,
-        memo,
-    )?;
+    // glTF states no value for an image it can't read.
+    let optional: HashSet<usize> = src
+        .materials
+        .iter()
+        .flat_map(|m| m.textures.refs())
+        .filter(|r| r.rules != ImageRules::Gltf)
+        .map(|r| r.image)
+        .collect();
+    let reads = ImageReads {
+        whole,
+        normals,
+        colors,
+        optional,
+    };
+    let (mut facts, unread) = image_facts(name, &mut src.images, &used, &reads, memo)?;
     let mut warnings = std::mem::take(&mut src.warnings);
     warnings.extend(
+        unread
+            .iter()
+            .map(|(&i, why)| texture::unread_warning(&src.images[i].name, why)),
+    );
+    let mut solids = HashMap::new();
+    for m in &mut src.materials {
+        stand_in(
+            &mut m.textures,
+            &unread,
+            &mut src.images,
+            &mut facts,
+            &mut solids,
+        );
+    }
+    warnings.extend(
         used.iter()
-            .filter(|i| facts[*i].animated)
+            .filter(|i| facts.get(*i).is_some_and(|f| f.animated))
             .map(|&i| texture::first_frame_warning(&src.images[i].name)),
     );
     let unscaled: BTreeSet<usize> = src
@@ -1730,14 +1752,10 @@ fn plan_scene(
             .map(|i| texture::unscaled_normal_warning(&src.images[i].name)),
     );
     for i in &used {
-        if let ImageData::File {
-            path,
-            read: Some((hash, _)),
-        } = &src.images[*i].data
-        {
+        if let ImageData::File { path, read } = &src.images[*i].data {
             src.files.push(Input {
                 path: path.clone(),
-                hash: *hash,
+                hash: read.map_or(Input::ABSENT, |r| r.0),
             });
         }
     }

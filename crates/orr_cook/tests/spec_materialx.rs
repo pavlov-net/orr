@@ -31,8 +31,9 @@ fn fixture() -> PathBuf {
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("spec_materialx_{n}"));
     let _ = std::fs::remove_dir_all(&d);
-    let files: [(&str, Vec<u8>); 9] = [
+    let files: [(&str, Vec<u8>); 10] = [
         ("v.png", png(varying)),
+        ("broken.png", b"not an image".to_vec()),
         (
             "flipped.png",
             png(|x, y| {
@@ -340,6 +341,89 @@ fn documents_map_as_the_clauses_say() {
                   <input name="uaddressmode" type="string" value="constant"/></image>"#,
             inputs: r#"<input name="base_color" type="color3" nodename="i"/>"#,
             check: |m| bound(m, slot::BASE_COLOR),
+        },
+        Row {
+            clause: "Nodes image: default is the value to use if the file reference can not be \
+                     resolved",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="nope.png"/>
+                  <input name="default" type="color3" value="0.25, 0.5, 0.75"/></image>"#,
+            inputs: BASE_I,
+            check: |m| {
+                !bound(m, slot::BASE_COLOR)
+                    && [0.25, 0.5, 0.75]
+                        .iter()
+                        .zip(m.base_color)
+                        .all(|(a, b)| close(*a, b))
+            },
+        },
+        Row {
+            clause: "Nodes image: or if the resolved file URI cannot be read",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="broken.png"/>
+                  <input name="default" type="float" value="0.75"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Nodes image: If default is not defined, the default color value will be 0.0 \
+                     in all channels",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="nope.png"/></image>"#,
+            inputs: BASE_I,
+            check: |m| !bound(m, slot::BASE_COLOR) && m.base_color == [0.0; 3],
+        },
+        Row {
+            clause: "Nodes image: an image with no file reads as one that can't be resolved",
+            body: r#"<image name="i" type="float">
+                  <input name="default" type="float" value="0.75"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Nodes image: default reads under any address mode, not only constant",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="nope.png"/>
+                  <input name="default" type="float" value="0.75"/>
+                  <input name="uaddressmode" type="string" value="clamp"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Nodes image: under constant a missing file reads default inside 0-1 too",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="nope.png"/>
+                  <input name="default" type="float" value="0.75"/>
+                  <input name="uaddressmode" type="string" value="constant"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Nodes image: default reaches past 1 where the input does",
+            body: r#"<image name="i" type="float">
+                  <input name="file" type="filename" value="nope.png"/>
+                  <input name="default" type="float" value="1.5"/></image>"#,
+            inputs: r#"<input name="specular_weight" type="float" nodename="i"/>"#,
+            check: |m| !bound(m, slot::SPECULAR_WEIGHT) && close(m.specular_weight, 1.5),
+        },
+        Row {
+            clause: "Nodes tiledimage: A default value to use if the file reference can not be \
+                     resolved",
+            body: r#"<tiledimage name="i" type="float">
+                  <input name="file" type="filename" value="nope.png"/>
+                  <input name="default" type="float" value="0.75"/></tiledimage>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
+            clause: "Nodes image: a normalmap decodes the default as it would a texel",
+            body: r#"<image name="i" type="vector3">
+                  <input name="file" type="filename" value="nope.png"/>
+                  <input name="default" type="vector3" value="0.5, 0.5, 1"/></image>
+                <normalmap name="n" type="vector3">
+                  <input name="in" type="vector3" nodename="i"/></normalmap>"#,
+            inputs: r#"<input name="geometry_normal" type="vector3" nodename="n"/>"#,
+            check: |m| !bound(m, slot::NORMAL),
         },
         Row {
             clause: "Nodes image: filtertype closest is one texel",
@@ -988,6 +1072,49 @@ fn xinclude_fallbacks_stand_where_the_include_failed() {
         cook(&nested, "M").is_ok(),
         "an include in a used fallback is read"
     );
+}
+
+/// Nodes `image`: `default` reads "if the file reference can not be resolved", which stops once
+/// the file is there.
+#[test]
+fn a_default_stands_only_until_the_file_appears() {
+    let d = fixture();
+    let doc = write_doc(
+        &d,
+        "m.mtlx",
+        "",
+        r#"<image name="i" type="float">
+          <input name="file" type="filename" value="late.png"/>
+          <input name="default" type="float" value="0.75"/></image>"#,
+        ROUGH_I,
+    );
+    let out = d.join("out.orr");
+    let cook_file = || {
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::File(out.clone()),
+                vec![AssetSpec {
+                    name: "u".into(),
+                    source: Source::MaterialX {
+                        path: doc.clone(),
+                        material: "M".into(),
+                        textures: TextureRules::default(),
+                    },
+                }],
+            )],
+        };
+        let cooked = orr_cook::cook(&manifest, &Default::default()).unwrap();
+        (material(&Archive::open(&out).unwrap()), cooked.report)
+    };
+    let (m, report) = cook_file();
+    assert!(close(m.specular_roughness, 0.75));
+    let warnings = &report.assets[0].warnings;
+    assert!(
+        warnings.iter().any(|w| w.contains("late.png")),
+        "{warnings:?}"
+    );
+    std::fs::write(d.join("late.png"), png(varying)).unwrap();
+    assert!(bound(&cook_file().0, slot::ROUGHNESS));
 }
 
 #[test]

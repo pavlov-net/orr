@@ -1632,6 +1632,111 @@ fn displacement_reads_in_the_stage_metric() {
     assert!(near(m.displacement_offset, 0.1), "{m:?}");
 }
 
+/// PS `fallback`: "Fallback value used when texture can not be read", default (0, 0, 0, 1), with
+/// `output = textureValue * scale + bias`; Storm's accessor applies scale and bias to it as well.
+#[test]
+fn a_texture_that_can_not_be_read_reads_its_fallback() {
+    let unread = |inputs: &str, wired: &str, image: Option<&[u8]>| {
+        let d = dir("fallback");
+        if let Some(bytes) = image {
+            std::fs::write(d.join("tex.png"), bytes).unwrap();
+        }
+        let prims = format!("{}\n{READER}", texture("T", inputs));
+        let body = previewed(wired, &prims, ST);
+        material(&cook_at(&d, &body, UsdSettings::default()).unwrap())
+    };
+    const FALLBACK: &str = "float4 inputs:fallback = (0.25, 0.5, 0.75, 0.125)";
+    const DIFFUSE: &str = "color3f inputs:diffuseColor.connect = </M/T.outputs:rgb>";
+    const ROUGH: &str = "float inputs:roughness.connect = </M/T.outputs:g>";
+
+    let m = unread(FALLBACK, DIFFUSE, None);
+    assert_eq!(m.textures[slot::BASE_COLOR].texture, AssetId::NONE);
+    assert!(
+        near(m.base_color[0], 0.25) && near(m.base_color[2], 0.75),
+        "{m:?}"
+    );
+
+    // A file that resolves and doesn't decode can't be read either.
+    let m = unread(FALLBACK, ROUGH, Some(b"not an image"));
+    assert_eq!(m.textures[slot::ROUGHNESS].texture, AssetId::NONE);
+    assert!(near(m.specular_roughness, 0.5), "{m:?}");
+
+    let scaled = format!(
+        "{FALLBACK}\nfloat4 inputs:scale = (1, 0.5, 1, 1)\nfloat4 inputs:bias = (0, 0.25, 0, 0)"
+    );
+    let m = unread(&scaled, ROUGH, None);
+    assert!(near(m.specular_roughness, 0.5), "{m:?}");
+
+    // A stated value past 0..1 is no texel, and reaches the scale whole.
+    let past = "float4 inputs:fallback = (2, 2, 2, 1)\nfloat4 inputs:scale = (0.25, 0.25, 0.25, 1)";
+    let m = unread(past, ROUGH, None);
+    assert!(near(m.specular_roughness, 0.5), "{m:?}");
+    assert!(near(unread(past, DIFFUSE, None).base_color[0], 0.5));
+
+    // Stated colors aren't encoded, so a source color space leaves them be.
+    let srgb = format!(
+        r#"{FALLBACK}{}token inputs:sourceColorSpace = "sRGB""#,
+        "\n"
+    );
+    let m = unread(&srgb, DIFFUSE, None);
+    assert!(near(m.base_color[0], 0.25), "{m:?}");
+
+    let m = unread("", DIFFUSE, None);
+    assert_eq!(m.base_color, [0.0; 3], "the fallback's default");
+    let m = unread("", "float inputs:metallic.connect = </M/T.outputs:a>", None);
+    assert!(near(m.metalness, 1.0), "the default's alpha is 1: {m:?}");
+
+    // `file`'s own default is the empty string.
+    let prims = format!(
+        r#"def Shader "T"
+    {{
+        uniform token info:id = "UsdUVTexture"
+        {FALLBACK}
+        float outputs:g
+    }}"#
+    );
+    let m = material(&cook("fallback-no-file", &previewed(ROUGH, &prims, ST)));
+    assert!(near(m.specular_roughness, 0.5), "{m:?}");
+}
+
+/// PS `fallback` reads only while the texture can't: the file appearing later cooks it.
+#[test]
+fn a_fallback_stands_only_until_the_file_appears() {
+    let d = dir("fallback-late");
+    let prims = format!(
+        "{}\n{READER}",
+        texture("T", "float4 inputs:fallback = (0, 0.5, 0, 1)")
+    );
+    let body = previewed(
+        "float inputs:roughness.connect = </M/T.outputs:g>",
+        &prims,
+        ST,
+    );
+    let path = d.join("stage.usda");
+    std::fs::write(&path, format!("{HEAD}\n{body}")).unwrap();
+    let out = d.join("out.orr");
+    let cook_file = || {
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::File(out.clone()),
+                vec![AssetSpec {
+                    name: "u".into(),
+                    source: Source::Usd {
+                        path: path.clone(),
+                        settings: UsdSettings::default(),
+                    },
+                }],
+            )],
+        };
+        orr_cook::cook(&manifest, &Default::default()).unwrap();
+        material(&Archive::open(&out).unwrap())
+    };
+    assert!(near(cook_file().specular_roughness, 0.5));
+    let varying = png(8, 8, |x, y| [(x * 32) as u8, (y * 32) as u8, 0, 255]);
+    std::fs::write(d.join("tex.png"), varying).unwrap();
+    assert_ne!(cook_file().textures[slot::ROUGHNESS].texture, AssetId::NONE);
+}
+
 /// Where a slot's uv transform sends mesh uv `p`.
 fn sampled(m: &Material, s: usize, p: [f32; 2]) -> [f32; 2] {
     let [a, b, c, d, e, f] = m.uv_transforms[s];

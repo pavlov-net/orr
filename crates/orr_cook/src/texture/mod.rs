@@ -314,6 +314,12 @@ pub(crate) fn first_frame_warning(image: &str) -> String {
     format!("image {image} is animated; only its first frame is cooked")
 }
 
+/// The report's warning for `image`, which can't be read for `why`, so its inputs read their
+/// fallback.
+pub(crate) fn unread_warning(image: &str, why: &str) -> String {
+    format!("image {image} reads as its input's fallback: {why}")
+}
+
 /// The report's warning for `images`, with colors a texture can't hold.
 pub(crate) fn gamut_warning(images: &str) -> String {
     format!("colors of {images} below 0 or outside Rec.2020 clip")

@@ -140,15 +140,18 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         })
     };
     let graph = network(&docs, &reader.order, material, &mut load).map_err(fail)?;
-    let mut solid = |rgb| {
-        images.push(shading::solid_image(rgb));
-        images.len() - 1
+    let mut added: HashMap<String, usize> = HashMap::new();
+    let mut add = |image: ImageFile| {
+        *added.entry(image.name.clone()).or_insert_with(|| {
+            images.push(image);
+            images.len() - 1
+        })
     };
     let mut host = shading::Host {
         meters_per_unit: 1.0,
         primvars: &["st"],
         reads: &[],
-        solid: &mut solid,
+        add: &mut add,
     };
     let mapped = shading::map(&graph.net, graph.surface, graph.displacement, &mut host)
         .map_err(|m| fail(format!("material {material}: {m}")))?;
@@ -629,6 +632,7 @@ fn network(
                 }
                 None => match source.0.attribute("value") {
                     None => continue,
+                    Some("") if source.0.attribute("type") == Some("filename") => continue,
                     Some(v) => value(docs, *d, &source.0, v, unit()?, load, &mut warnings),
                 },
             };
