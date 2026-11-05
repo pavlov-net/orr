@@ -91,6 +91,13 @@ impl Window {
         self.window.isVisible()
     }
 
+    /// Moves the window's top-left corner to `top_left`, in AppKit's global screen
+    /// coordinates (points, from the bottom-left of the menu-bar screen, y up).
+    pub fn move_to(&mut self, top_left: NSPoint) {
+        self.window.setFrameTopLeftPoint(top_left);
+        self.pump();
+    }
+
     /// Resizes the content area to `width` x `height` points.
     pub fn resize(&mut self, width: i32, height: i32) {
         self.window

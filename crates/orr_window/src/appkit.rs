@@ -21,7 +21,9 @@ use crate::{DisplayFeed, DisplayInfo, Error, Result, steady};
 
 /// macOS reports a screen's range as EDR values relative to its SDR white, which moves with
 /// the brightness setting. This is the absolute luminance macOS gives EDR 1.0 when it maps PQ
-/// content, so that the feed's nits mean what PQ encodes; macOS doesn't document it.
+/// content, so that the feed's nits mean what PQ encodes. macOS doesn't document it; gpu_suite's
+/// `edr_reference` example measures it, and on an M5 MacBook's built-in screen (macOS 27.0.1,
+/// no HDR10 metadata) SDR white fell between its 90 and 100 nit PQ bars.
 const EDR_REFERENCE_NITS: f32 = 100.0;
 
 /// The headroom changes with brightness and when content asks for EDR, and neither raises an

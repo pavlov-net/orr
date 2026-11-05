@@ -32,7 +32,8 @@ use crate::{
 const MAX_DRAWABLES: u32 = 3;
 
 /// The absolute luminance macOS gives EDR 1.0 when it maps PQ content, which HDR10 metadata
-/// states as its optical output scale; orr_window's display watch uses the same value.
+/// states as its optical output scale; orr_window's display watch uses the same value and
+/// says where it comes from.
 const EDR_REFERENCE_NITS: f32 = 100.0;
 
 /// The encodings a layer takes. scRGB is left out: its 1.0 is 80 nits, but on an EDR layer
