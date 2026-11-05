@@ -414,10 +414,15 @@ impl Displacement {
 
     /// Fails when a texel of any mip lies outside the declared range.
     pub(super) fn check_range(&self) -> Result<(), String> {
+        // A scale and offset fitted to the texels' range can round past the range declared for
+        // the pair before it. That pair's rounding sets the error, and the fitted one can be
+        // far smaller when it cancels, so the declared range sizes the slack too.
+        let magnitude = self.scale.abs() + self.offset.abs() + self.min.abs() + self.max.abs();
+        let slack = 4.0 * f32::EPSILON * magnitude;
         for (i, m) in self.mips.iter().enumerate() {
             for &t in m.texels.iter() {
                 let d = self.scale * t + self.offset;
-                if d < self.min || d > self.max {
+                if d < self.min - slack || d > self.max + slack {
                     return Err(format!(
                         "displacement {d} m at mip {i} is outside the declared range {}..{} m",
                         self.min, self.max
@@ -432,6 +437,32 @@ impl Displacement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A height at the top of a range ending at 0 rounds just past it in the fitted pair, whose
+    /// offset and scale nearly cancel there.
+    #[test]
+    fn fitted_heights_stay_in_the_range_declared_before_the_fit() {
+        for factor in [0.05f32, 0.1] {
+            for lo in [249, 252, 254].map(|v| v as f32 / 255.0) {
+                let texels = Arc::new(vec![0.0, 1.0]);
+                let d = Displacement {
+                    scale: factor * (1.0 - lo),
+                    offset: factor * lo - factor,
+                    min: -factor,
+                    max: 0.0,
+                    mips: vec![Raster {
+                        w: 2,
+                        h: 1,
+                        texels,
+                        wrap: [Wrap::Repeat; 2],
+                        uv: [0.0; 6],
+                    }],
+                    uv_set: 0,
+                };
+                d.check_range().unwrap();
+            }
+        }
+    }
 
     #[test]
     fn footprint_runs_visit_the_texels_whose_grown_squares_meet_the_triangle() {

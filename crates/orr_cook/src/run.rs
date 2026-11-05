@@ -13,7 +13,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -1680,7 +1680,13 @@ fn plan_scene(
         .collect();
     used.sort_unstable();
     used.dedup();
-    let facts: HashMap<usize, ImageFacts> = image_facts(name, &mut src.images, &used, memo)?;
+    let heights: HashSet<usize> = src
+        .materials
+        .iter()
+        .filter_map(|m| m.textures.displacement.map(|r| r.image))
+        .collect();
+    let facts: HashMap<usize, ImageFacts> =
+        image_facts(name, &mut src.images, &used, &heights, memo)?;
     let warnings = used
         .iter()
         .filter(|i| facts[*i].animated)

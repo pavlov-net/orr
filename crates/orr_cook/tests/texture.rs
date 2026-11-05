@@ -10,7 +10,8 @@ use float_ktx2::float_ktx2;
 use orr_color::RgbPrimaries;
 use orr_cook::{
     ArchiveSpec, AssetSpec, CookOptions, DataFormat, GltfSettings, InputChannels, Manifest,
-    Primaries, Quality, Source, TextureOverride, TextureRules, TextureSettings, Usage,
+    MaterialPatch, Primaries, Quality, Source, TextureOverride, TextureRules, TextureSettings,
+    Usage,
 };
 use orr_math::Vec3;
 use orr_pack::material::{Material, slot};
@@ -1097,6 +1098,122 @@ fn signed_blocks(format: ctt::Format) -> ctt::TargetFormat {
     }
 }
 
+fn height_material(factor: f32, offset: f32) -> String {
+    format!(
+        r#"{{"extensions":{{"KHR_materials_displacement":{{"displacementGeometryTexture":{{"index":0}},
+            "displacementGeometryFactor":{factor},"displacementGeometryOffset":{offset}}}}}}}"#
+    )
+}
+
+/// R16 unorm texels of a material's displacement texture, read as 0..1.
+fn stored_heights(a: &Archive, m: &Material) -> Vec<f32> {
+    let texture = a.find(m.textures[slot::DISPLACEMENT].texture).unwrap();
+    let (info, levels) = mips(a, a.name(texture));
+    assert_eq!(info.header.vk_format, vk::R16_UNORM);
+    levels[0][0]
+        .chunks_exact(2)
+        .map(|t| f32::from(u16::from_le_bytes([t[0], t[1]])) / 65535.0)
+        .collect()
+}
+
+/// A material's height stores across the range the image measures, with the difference in its
+/// factors: it reads back as the source height, inside the material's range, and the mesh cook
+/// takes it. Blocks hold their extremes in the last blocks read, and the image of part of 0..1
+/// gets a pair that rounds a step past the range the importer declared.
+#[test]
+fn material_heights_read_back_through_compensated_factors() {
+    let path = dir("height-range").join("heights.glb");
+    let n = 64u32;
+    let ramp = |lo: f32, hi: f32| -> Vec<f32> {
+        (0..n)
+            .map(|x| lo + (hi - lo) * x as f32 / (n - 1) as f32)
+            .collect()
+    };
+    let file =
+        |format, h: &[f32]| float_ktx2(n, n, format, false, |x, _| [h[x as usize], 0.0, 0.0, 1.0]);
+    let raw = ctt::TargetFormat::Uncompressed;
+    let bytes: Vec<u8> = (0..n).map(|x| (16 + 239 * x / (n - 1)) as u8).collect();
+    let partial: Vec<f32> = bytes.iter().map(|&v| f32::from(v) / 255.0).collect();
+    let signed = ramp(-1.0, 1.0);
+    let float = ramp(-2.0, 3.0);
+    for (image, heights, factor, offset) in [
+        (
+            png(n, n, |x, _| [bytes[x as usize], 0, 0, 255]),
+            &partial,
+            0.2,
+            0.0,
+        ),
+        (
+            file(raw(ctt::Format::R32G32B32A32_SFLOAT), &float),
+            &float,
+            0.2,
+            0.05,
+        ),
+        (
+            file(signed_blocks(ctt::Format::BC4_SNORM_BLOCK), &signed),
+            &signed,
+            0.2,
+            0.05,
+        ),
+        (
+            file(raw(ctt::Format::R16_SNORM), &signed),
+            &signed,
+            0.2,
+            0.05,
+        ),
+    ] {
+        write_glb(&path, &[height_material(factor, offset)], &[image]);
+        let (a, m) = cook_glb(&path, GltfSettings::default());
+        let stored = stored_heights(&a, &m);
+        assert_eq!(stored.iter().copied().fold(f32::MAX, f32::min), 0.0);
+        assert_eq!(stored.iter().copied().fold(f32::MIN, f32::max), 1.0);
+        for (i, u) in stored.iter().enumerate() {
+            let got = m.displacement_scale * u + m.displacement_offset;
+            let want = factor * heights[i % n as usize] + offset;
+            assert!((got - want).abs() < 0.005, "texel {i}: {got}, not {want}");
+            assert!(m.displacement_min - 1e-6 <= got && got <= m.displacement_max + 1e-6);
+        }
+    }
+
+    // A range a patch declares past the texture's stays.
+    let (_, m) = cook_glb(
+        &path,
+        GltfSettings {
+            material_overrides: vec![(
+                String::new(),
+                MaterialPatch {
+                    displacement_max: Some(1.0),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        },
+    );
+    assert_eq!(m.displacement_max, 1.0);
+    assert!((m.displacement_min + 0.15).abs() < 1e-6);
+}
+
+/// A constant height has no span to store across: the offset holds it.
+#[test]
+fn constant_material_heights_fold_into_the_offset() {
+    let path = dir("height-constant").join("constant.glb");
+    let (factor, offset) = (0.2, 0.05);
+    for (format, height) in [
+        (ctt::Format::R16_SNORM, -0.5),
+        (ctt::Format::R32G32B32A32_SFLOAT, 3.0),
+    ] {
+        let format = ctt::TargetFormat::Uncompressed(format);
+        let image = float_ktx2(8, 8, format, false, |_, _| [height, 0.0, 0.0, 1.0]);
+        write_glb(&path, &[height_material(factor, offset)], &[image]);
+        let (a, m) = cook_glb(&path, GltfSettings::default());
+        assert!(stored_heights(&a, &m).iter().all(|&u| u == 0.0));
+        assert_eq!(m.displacement_scale, 0.0);
+        let want = factor * height + offset;
+        assert!((m.displacement_offset - want).abs() < 1e-4, "{m:?}");
+        assert!(m.displacement_min <= want + 1e-4 && want - 1e-4 <= m.displacement_max);
+    }
+}
+
 /// A float source's heights store as they are and displace geometry at every mip: non-finite
 /// texels take finite values, and the filter's overshoot at a step stays in the source's range.
 #[test]
@@ -1127,6 +1244,32 @@ fn float_standalone_heights_stay_finite_and_in_range_at_every_mip() {
             assert!((-2.5..=3.0).contains(&h), "mip {m}: {h}");
         }
     }
+}
+
+/// A material's non-finite heights settle before filtering, which would spread them through
+/// the mips: the smallest mip is the mean of the finite image, not a hole.
+#[test]
+fn non_finite_material_heights_stay_out_of_the_mips() {
+    let path = dir("height-non-finite").join("heights.glb");
+    let n = 32u32;
+    let format = ctt::TargetFormat::Uncompressed(ctt::Format::R32G32B32A32_SFLOAT);
+    let image = float_ktx2(n, n, format, false, |x, y| {
+        let height = match (x, y) {
+            (5, 5) => f32::NAN,
+            (9, 9) => f32::INFINITY,
+            (25, 25) => f32::NEG_INFINITY,
+            _ if x < n / 2 => 1.0,
+            _ => 3.0,
+        };
+        [height, 0.0, 0.0, 1.0]
+    });
+    write_glb(&path, &[height_material(0.2, 0.0)], &[image]);
+    let (a, m) = cook_glb(&path, GltfSettings::default());
+    let texture = a.find(m.textures[slot::DISPLACEMENT].texture).unwrap();
+    let (_, levels) = mips(&a, a.name(texture));
+    let last = levels[0].last().unwrap();
+    let mean = f32::from(u16::from_le_bytes([last[0], last[1]])) / 65535.0;
+    assert!((mean - 0.5).abs() < 0.05, "{mean}");
 }
 
 /// With no factor to compensate in, the stored format carries the sign. Every mip of these

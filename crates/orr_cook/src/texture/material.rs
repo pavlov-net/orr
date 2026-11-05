@@ -16,7 +16,9 @@
 //!   BC4 each. Coat and transmission factors are folded into their texels and set to 1;
 //!   the specular weight texture multiplies `specular_weight`.
 //! - Displacement: R16 unorm from red, never collapsed; displacement is
-//!   `displacement_scale x texel + displacement_offset`.
+//!   `displacement_scale x texel + displacement_offset`. A height `h` stores across the
+//!   range `lo..hi` the image measures, as `(h - lo) / (hi - lo)`, with the scale and offset
+//!   compensated; a range past 0..1 widens the declared one.
 //! - An image whose texels all lie within 1/255 of one value collapses into the material's
 //!   factor, clamped to 0..1 as a texture stores it; a constant normal or occlusion image,
 //!   which has no factor, cooks at 4x4.
@@ -207,6 +209,9 @@ pub(crate) struct ImageFacts {
     primaries: Option<Primaries>,
     /// Per channel, the value every texel lies within 1/255 of, if there is one.
     constant: [Option<f32>; 4],
+    /// Per channel, the lowest and highest value of mip 0. Only an image read as a height is
+    /// sure to have all of it: reading blocks stops once every channel varies.
+    range: [(f32, f32); 4],
     hash: Hash32,
     /// The block format of a block-compressed file, and whether it has every mip.
     blocks: Option<(u32, bool)>,
@@ -229,12 +234,14 @@ fn decode(bytes: &[u8]) -> Result<Img, String> {
     Ok(layers.remove(0))
 }
 
-/// Facts of the images `used`, read in parallel. File images are read through the memo, and
-/// each one's hash and length are recorded in its [`ImageData::File`].
+/// Facts of the images `used`, of which `heights` are read as heights, read in parallel. File
+/// images are read through the memo, and each one's hash and length are recorded in its
+/// [`ImageData::File`].
 pub(crate) fn image_facts(
     asset: &str,
     images: &mut [ImageFile],
     used: &[usize],
+    heights: &HashSet<usize>,
     memo: &Memo,
 ) -> Result<HashMap<usize, ImageFacts>> {
     let fail = |message: String| Error::Texture {
@@ -256,8 +263,8 @@ pub(crate) fn image_facts(
                     (Cow::Owned(bytes), hash, Some(len))
                 }
             };
-            let facts =
-                facts_of(&bytes, hash).map_err(|e| fail(format!("image {}: {e}", file.name)))?;
+            let facts = facts_of(&bytes, hash, heights.contains(&i))
+                .map_err(|e| fail(format!("image {}: {e}", file.name)))?;
             Ok((i, (facts, read)))
         })
         .collect::<Result<_>>()?;
@@ -271,15 +278,16 @@ pub(crate) fn image_facts(
     Ok(out)
 }
 
-/// The facts of one image file's bytes.
-fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
+/// The facts of one image file's bytes, with all of its range if it is a `height`.
+fn facts_of(bytes: &[u8], hash: Hash32, height: bool) -> Result<ImageFacts, String> {
     let _z = crate::profile::zone!("texture.facts");
     // A channel is constant when it spans at most one UNORM8 step.
     const SPREAD: f32 = 1.0 / 255.0 + 1e-6;
+    let spread = if height { f32::INFINITY } else { SPREAD };
     let constant = |range: [(f32, f32); 4]| {
         range.map(|(lo, hi)| (hi - lo <= SPREAD).then_some(0.5 * (lo + hi)))
     };
-    if let Some(scan) = load::scan_ktx2(bytes, SPREAD) {
+    if let Some(scan) = load::scan_ktx2(bytes, spread) {
         let s = scan?;
         return Ok(ImageFacts {
             w: s.w,
@@ -287,6 +295,7 @@ fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
             srgb: s.srgb,
             primaries: None,
             constant: constant(s.range),
+            range: s.range,
             hash,
             blocks: Some((s.vk_format, s.complete)),
             rg: s.rg,
@@ -301,17 +310,13 @@ fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
     }
     let (w, h, range) = match &src.blocks {
         Some(b) => {
-            let range = load::block_range(b.vk_format, b.w, b.h, &mut &b.levels[0][0][..], SPREAD)?;
+            let range = load::block_range(b.vk_format, b.w, b.h, &mut &b.levels[0][0][..], spread)?;
             (b.w, b.h, range)
         }
         None => {
             let img = &src.layers[0];
-            let range = std::array::from_fn(|c| {
-                img.px.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
-                    (lo.min(p[c]), hi.max(p[c]))
-                })
-            });
-            (img.w, img.h, range)
+            // An infinite texel stores at an end of the range, and must not make it infinite.
+            (img.w, img.h, std::array::from_fn(|c| img.finite_range(c)))
         }
     };
     Ok(ImageFacts {
@@ -320,6 +325,7 @@ fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
         srgb: src.srgb,
         primaries: src.primaries,
         constant: constant(range),
+        range,
         hash,
         blocks: src.blocks.as_ref().map(|b| (b.vk_format, b.complete())),
         rg: src.rg,
@@ -777,6 +783,19 @@ impl<'a> Packer<'a> {
             };
         }
         if let Some(r) = &t.displacement {
+            let channel = usize::from(r.channel);
+            // An image with no finite texels leaves no span to measure.
+            let (lo, hi) = match self.image(r.image).range[channel] {
+                (lo, hi) if (hi - lo).is_finite() => (lo, hi),
+                _ => (0.0, 1.0),
+            };
+            let span = hi - lo;
+            // A constant image stores 0, and the offset holds its height.
+            let b = if span.recip().is_finite() {
+                span.recip()
+            } else {
+                0.0
+            };
             let id = self.make(
                 suffix,
                 Pack {
@@ -784,19 +803,31 @@ impl<'a> Packer<'a> {
                     encoding: Encoding::Raw(DataFormat::R16),
                     channels: vec![Channel::Image {
                         image: r.image,
-                        channel: usize::from(r.channel),
+                        channel,
                         srgb: false,
-                        a: 0.0,
-                        b: 1.0,
+                        a: -lo * b,
+                        b,
                     }],
                     refs: vec![*r],
                     coverage: None,
                     toksvig: None,
                     normal: false,
-                    shrink: self.constant(r.image, usize::from(r.channel)).is_some(),
+                    shrink: self.constant(r.image, channel).is_some(),
                 },
             )?;
             bind(m, slot::DISPLACEMENT, id, 0, r);
+            m.displacement_offset += m.displacement_scale * lo;
+            m.displacement_scale *= span;
+            // Importers declare the span of a 0..1 texel. A height past it widens that, and any
+            // range a patch declared, which otherwise stands for the mesh cook to check.
+            if lo < 0.0 || hi > 1.0 {
+                let (a, b) = (
+                    m.displacement_offset,
+                    m.displacement_offset + m.displacement_scale,
+                );
+                m.displacement_min = m.displacement_min.min(a.min(b));
+                m.displacement_max = m.displacement_max.max(a.max(b));
+            }
         }
         if let Some(settings) = &self.rules.neural {
             self.neural_set(suffix, m, settings)?;

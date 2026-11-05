@@ -1056,6 +1056,8 @@ fn displacement_bounds_hold_every_mip() {
         .map(|m| texture_mip(&a, "g/texture/0/displacement", m))
         .collect();
     assert!(mips.len() > 3);
+    let e = a.find(AssetId::from_name("g/material/0")).unwrap();
+    let material = Material::from_bytes(&read(&a, &a.blobs(e)[0])).unwrap();
     let m = mesh_of(&a, "g/mesh", 0);
     let half = |b: u16| half::f16::from_bits(b).to_f32();
     let mut checked = 0;
@@ -1067,7 +1069,8 @@ fn displacement_bounds_hold_every_mip() {
         for (uv, p) in uvs.iter().zip(pos) {
             for (uv, p) in uv.iter().zip(p) {
                 for mip in &mips {
-                    let disp = 0.4 * mip.bilinear(*uv) - 0.1;
+                    let disp = material.displacement_scale * mip.bilinear(*uv)
+                        + material.displacement_offset;
                     assert!(lo <= disp && disp <= hi, "{disp} outside {lo}..{hi}");
                     // Displaced along +y, the vertex stays in the rest AABB grown by the bound.
                     let y = p[1] + disp;
