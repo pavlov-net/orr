@@ -333,6 +333,65 @@ fn collapse_keeps_the_directional_albedo() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// OpenPBR's metal table ranges `specular_weight` over [0, 1], where the dielectric's goes past
+/// it: a metal at 1.5 is the metal at 1.
+#[test]
+fn a_metals_specular_weight_stops_at_1() {
+    let mut bsdf = RealTime::new();
+    let metal = Inputs {
+        base_metalness: 1.0,
+        base_color: [0.9, 0.7, 0.5],
+        specular_roughness: 0.3,
+        ..Inputs::default()
+    };
+    let past = Inputs {
+        specular_weight: 1.5,
+        ..metal
+    };
+    for mu in VIEW_COSINES {
+        let a = harness::albedo(&mut bsdf, &metal, view(mu), 20_000, 1);
+        let b = harness::albedo(&mut bsdf, &past, view(mu), 20_000, 1);
+        assert_eq!(a.total.mean, b.total.mean, "mu {mu}");
+    }
+}
+
+/// KHR_materials_ior: at `ior` 0 "the Fresnel term **MUST** evaluate to `1.0` independently of the
+/// view or light direction".
+#[test]
+fn an_ior_of_0_reflects_everything_from_every_view() {
+    let mut bsdf = RealTime::new();
+    let inputs = Inputs {
+        base_color: [0.0; 3],
+        specular_ior: 0.0,
+        specular_roughness: 0.0,
+        ..Inputs::default()
+    };
+    for mu in VIEW_COSINES {
+        let a = harness::albedo(&mut bsdf, &inputs, view(mu), 2_000, 1);
+        for c in a.total.mean {
+            assert!((c - 1.0).abs() < 1e-3, "mu {mu}: {:?}", a.total.mean);
+        }
+    }
+}
+
+/// A coat at IOR 0, which the G-buffer's IOR code keeps, is a layer the base divides by.
+#[test]
+fn a_coat_of_ior_0_stays_finite() {
+    let mut bsdf = RealTime::new();
+    let inputs = Inputs {
+        coat_weight: 1.0,
+        coat_ior: 0.0,
+        specular_roughness: 0.3,
+        ..Inputs::default()
+    };
+    for mu in VIEW_COSINES {
+        bsdf.prepare(&inputs, view(mu));
+        let e = bsdf.eval(view(0.7));
+        assert!(finite_non_negative(e.total()), "mu {mu}: {e:?}");
+        assert!(bsdf.pdf(view(0.7)).is_finite(), "mu {mu}");
+    }
+}
+
 /// Either side of `MIRROR_ROUGHNESS` the albedo is the same; below it the lobes are delta.
 #[test]
 fn mirror_threshold_is_continuous() {

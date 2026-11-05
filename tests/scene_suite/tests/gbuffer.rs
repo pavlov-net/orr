@@ -119,8 +119,22 @@ fn rgb9e5(w: u32) -> Vec3 {
 }
 
 fn ior(code: u32) -> f32 {
-    let r = (code & 255) as f32 / 255.0 * 0.5;
-    (1.0 + r) / (1.0 - r)
+    let c = (code & 255) as f32;
+    let t = match c {
+        ..16.0 => c / 16.0 - 1.0,
+        ..241.0 => (c - 16.0) / 450.0,
+        _ => 0.5 + (c - 241.0) / 28.0,
+    };
+    (1.0 + t) / (1.0 - t).max(1e-4)
+}
+
+/// The largest error of `ior`'s code around `t = (n - 1) / (n + 1)`.
+fn ior_step(t: f32) -> f32 {
+    0.5 * match t {
+        ..0.0 => 1.0 / 16.0,
+        ..0.5 => 1.0 / 450.0,
+        _ => 1.0 / 28.0,
+    } + 1e-6
 }
 
 /// The core words as the G-buffer layout defines them: what `decode_gsurface` must return.
@@ -149,7 +163,7 @@ fn decode_core(a: [u32; 4], b: [u32; 2]) -> Core {
         normal: oct16(a[1]),
         emission: rgb9e5(a[2]),
         metalness: byte(a[3], 0),
-        specular_weight: byte(a[3], 8),
+        specular_weight: byte(a[3], 8) * (1u32 << ((b[0] >> 26) & 31)) as f32,
         ior: ior(a[3] >> 16),
         flags: a[3] >> 24,
         specular_color: Vec3::new(
@@ -226,9 +240,15 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             c.normal = arr(rng.unit());
             c.metalness = rng.next();
             c.emission = arr(rng.rgb() * 4000.0 * rng.next());
-            c.specular_weight = rng.next();
+            // Weights past 1, up to 1 / F0, and IORs over all of 0 to infinity.
+            c.specular_weight = rng.next() * if i % 3 == 0 { 2000.0 } else { 1.0 };
             c.specular_color = arr(rng.rgb());
-            c.ior = 1.0 + 2.0 * rng.next();
+            c.ior = match i % 5 {
+                0 => rng.next(),
+                1 => 3.0 + 100.0 * rng.next(),
+                2 => 1.5,
+                _ => 1.0 + 2.0 * rng.next(),
+            };
             c.geometric_normal = arr(rng.unit());
             c.diffuse_roughness = rng.next();
             c.occlusion = rng.next();
@@ -255,7 +275,7 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             }
             if kind != 0 {
                 c.coat_roughness = rng.next();
-                c.coat_ior = 1.0 + 2.0 * rng.next();
+                c.coat_ior = 0.5 + 6.0 * rng.next();
                 c.fuzz_roughness = rng.next();
                 c.anisotropy = rng.next();
                 c.tangent_angle = rng.next() * std::f32::consts::PI;
@@ -345,11 +365,11 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
         close(
             cpu.specular_weight,
             g.specular_weight,
-            1e-6,
+            1e-6 * cpu.specular_weight.max(1.0),
             "specular weight layout",
             i,
         );
-        close(cpu.ior, g.ior, 1e-5, "IOR layout", i);
+        close(cpu.ior, g.ior, 1e-5 * cpu.ior.max(1.0), "IOR layout", i);
         assert_eq!(cpu.flags, g.flags, "case {i} flags layout");
         close3(
             arr(cpu.specular_color),
@@ -401,12 +421,17 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
         close(
             g.specular_weight,
             c.specular_weight,
-            step8,
+            step8 * (2.0 * c.specular_weight).max(1.0),
             "specular weight",
             i,
         );
         let r = |n: f32| (n - 1.0) / (n + 1.0);
-        close(r(g.ior), r(c.ior), 0.5 / 510.0 + 1e-6, "IOR", i);
+        let step = if c.ior == 1.5 {
+            1e-6
+        } else {
+            ior_step(r(c.ior))
+        };
+        close(r(g.ior), r(c.ior), step, "IOR", i);
         close3(
             srgb3(g.specular_color),
             srgb3(c.specular_color),
@@ -465,7 +490,7 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
         close(
             r(g.coat_ior),
             r(c.coat_ior),
-            0.5 / 510.0 + 1e-6,
+            ior_step(r(c.coat_ior)),
             "coat IOR",
             i,
         );

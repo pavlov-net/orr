@@ -106,6 +106,8 @@ static const float MIN_ALPHA = 1e-6;
 static const float MIN_MS_ALPHA = 0.04 * 0.04;
 // The smallest view cosine; flatter views lean up to it.
 static const float MIN_COS = 1e-4;
+// The IOR the specular weight's limit on F0 leaves of an IOR of 0, which layers above divide by.
+static const float MIN_IOR = 2.5e-5;
 static const float LARGEST_BELOW_ONE = 0.99999994;
 
 // What `bsdf_prepare_layers` leaves for `Bsdf.finish`: directional albedo estimates per lobe
@@ -967,7 +969,7 @@ public float3 bsdf_straight_transmission(BsdfParams p, float3 n, float3 wi, floa
     float3 t = (1.0 - p.metalness) * p.transmission_weight * (1.0 - openpbr_fresnel(eta, mu))
         * view_tint(p.transmission_color, thin, mu, eta);
     if ((p.flags & BSDF_COAT) != 0 && p.coat_weight > 0.0)
-        t *= lerp(float3(1.0), p.coat_color * (1.0 - openpbr_fresnel(p.coat_ior / exterior_ior, mu)), p.coat_weight);
+        t *= lerp(float3(1.0), p.coat_color * (1.0 - openpbr_fresnel(max(p.coat_ior, MIN_IOR) / exterior_ior, mu)), p.coat_weight);
     return max(t, 0.0);
 }
 
@@ -1013,7 +1015,8 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
 
     // IORs: the specular weight moves the base IOR toward the medium above it.
     bool enter_coat = coat_weight > 0.0 && !s.inside;
-    float coat_ior = enter_coat ? lerp(exterior_ior, p.coat_ior, coat_weight) : exterior_ior;
+    float coat_layer_ior = max(p.coat_ior, MIN_IOR);
+    float coat_ior = enter_coat ? lerp(exterior_ior, coat_layer_ior, coat_weight) : exterior_ior;
     float specular_ior = coat_ior * openpbr_apply_specular_weight_to_ior(p.specular_ior / coat_ior, p.specular_weight);
     float eta_r;
     float eta_t;
@@ -1033,7 +1036,7 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
         {
             // No total internal reflection at the base under a coat that does not bend light.
             eta_t = coat_ior > specular_ior && specular_ior >= exterior_ior ? coat_ior / specular_ior : specular_ior / coat_ior;
-            coat_eta = p.coat_ior / exterior_ior;
+            coat_eta = coat_layer_ior / exterior_ior;
         }
         eta_o = eta_t;
     }
@@ -1061,7 +1064,8 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     float opaque = (1.0 - p.transmission_weight) * (1.0 - p.subsurface_weight) * dielectric;
     float trans = dielectric * p.transmission_weight;
     float sss = (1.0 - p.transmission_weight) * dielectric * p.subsurface_weight;
-    float darkened_metal = p.metalness * p.specular_weight;
+    // OpenPBR takes the metal's weight in 0..1; only the dielectric's goes past it.
+    float darkened_metal = p.metalness * saturate(p.specular_weight);
     float3 metal_average = openpbr_metal_average_fresnel_with_f82_tint(p.base_color, p.specular_color);
 
     // Coat darkening from internal reflections (OpenPBR 1.1.1).
