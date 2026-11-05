@@ -11,8 +11,7 @@ use orr_pack::{Class, Hash32};
 /// GDeflate level of the payload blobs of GDeflate archives.
 pub(crate) const GDEFLATE_LEVEL: i32 = 12;
 
-/// Cook version per class. Bump a class's version whenever the cook writes different bytes
-/// for the same inputs; the golden test fails until it is bumped.
+/// Cook version per class, part of every key: raising one recooks that class.
 const VERSIONS: &[(Class, u32)] = &[
     (Class::Mesh, 10),
     (Class::Texture, 7),
