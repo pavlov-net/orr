@@ -1386,6 +1386,7 @@ impl<'s> Importer<'s> {
                     })
                 };
                 let mut host = shading::Host {
+                    meters_per_unit: 1.0,
                     primvars: &primvars,
                     reads: &reads,
                     solid: &mut solid,

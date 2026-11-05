@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use openusd::{sdf, usd};
 
 use super::read::{PrimReader, numbers};
-use crate::shading::{self, Input, Network, Node};
+use crate::shading::{self, Input, Network, Node, Unit};
 
 struct Builder<'a> {
     stage: &'a usd::Stage,
@@ -164,6 +164,7 @@ impl Builder<'_> {
             sdf::Value::AssetPath(a) => Input::Image {
                 image: (self.load)(&a).map_err(|e| format!("{} {name}: {e}", reader.path()))?,
                 color_space: reader.metadata_token(name, "colorSpace"),
+                unit: Unit::Unstated,
             },
             sdf::Value::Token(t) => Input::Text(t.as_str().to_string()),
             sdf::Value::String(s) => Input::Text(s),
@@ -173,6 +174,7 @@ impl Builder<'_> {
                     .into_iter()
                     .map(|x| x as f32)
                     .collect(),
+                Unit::Unstated,
             ),
         })
     }

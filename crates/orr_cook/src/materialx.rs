@@ -8,6 +8,17 @@
 //! A standalone material has no mesh, so each texture keeps its uv set (0 or 1) and transform
 //! in its slot; geometric properties name `st`, `UV0` or a `geompropdef` of a texcoord.
 //!
+//! The scene's units are the meter and the degree. A value's unit is its input's `unit`, else
+//! the one its nodedef's input declares, and it stays with the value along connections; as in
+//! the MaterialX library, a `unit` on an input that is connected states nothing, whatever it
+//! names. A filename input reading a string is the exception: a string holds no unit, so the
+//! input states the unit of the file. A unit must be a unit of its nodedef's `unittype`, else of
+//! the input's. With neither, which the specification does not permit but which still states a
+//! unit, any type holding the name serves, `distance` and `angle` first. An empty `unit` or
+//! `unittype` states nothing. `unitdef`s add to the standard units, and a type other than
+//! `distance` and `angle` has no scene unit, so it converts nothing. The root of a document
+//! states no unit.
+//!
 //! An `xi:include` adds the children of the root of the document it names, read before the
 //! including document, so that the first of two like-named elements wins, as in the MaterialX
 //! library. Root attributes an included document leaves out come from the document including
@@ -25,7 +36,7 @@ use std::path::{Path, PathBuf};
 use roxmltree::{Document, Node as XmlNode, NodeId};
 
 use crate::import::{Scene, SceneMaterial};
-use crate::shading::{self, Input, Network, Node, through};
+use crate::shading::{self, Input, Network, Node, Unit, through};
 use crate::state::{Input as FileInput, Memo};
 use crate::texture::material::{ImageData, ImageFile};
 use crate::{Error, Result};
@@ -47,6 +58,31 @@ const NOT_NODES: &[&str] = &[
     "variantset",
     "implementation",
     "unittypedef",
+];
+
+/// The units every document has, from MaterialX's `stdlib_defs.mtlx` (Apache-2.0): unit type,
+/// unit and scale.
+const UNITS: &[(&str, &str, f64)] = &[
+    ("distance", "nanometer", 0.000000001),
+    ("distance", "micron", 0.000001),
+    ("distance", "millimeter", 0.001),
+    ("distance", "centimeter", 0.01),
+    ("distance", "inch", 0.0254),
+    ("distance", "foot", 0.3048),
+    ("distance", "yard", 0.9144),
+    ("distance", "meter", 1.0),
+    ("distance", "kilometer", 1000.0),
+    ("distance", "mile", 1609.344),
+    ("angle", "degree", 1.0),
+    ("angle", "radian", 57.295779513),
+];
+
+/// What the standard nodedefs of the nodes read here declare: node, input and unit type. Each
+/// expects the scene's unit of that type.
+const DECLARED: &[(&str, &str, &str)] = &[
+    ("place2d", "rotate", "angle"),
+    ("tiledimage", "realworldimagesize", "distance"),
+    ("tiledimage", "realworldtilesize", "distance"),
 ];
 
 const XINCLUDE: &str = "http://www.w3.org/2001/XInclude";
@@ -105,6 +141,7 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         images.len() - 1
     };
     let mut host = shading::Host {
+        meters_per_unit: 1.0,
         primvars: &["st"],
         reads: &[],
         solid: &mut solid,
@@ -320,6 +357,81 @@ fn qualified(namespace: Option<&str>, name: &str) -> String {
     }
 }
 
+/// Attribute `name` of `e`, which states nothing when empty.
+fn stated<'a>(e: &XmlNode<'a, '_>, name: &str) -> Option<&'a str> {
+    e.attribute(name).filter(|v| !v.is_empty())
+}
+
+/// The `unittype` and `unit` of a nodedef's input.
+type Declared<'a> = (Option<&'a str>, Option<&'a str>);
+
+/// The units of a document.
+#[derive(Default)]
+struct Units<'a> {
+    /// Scales by unit type and unit.
+    scales: BTreeMap<(&'a str, &'a str), f64>,
+    /// What nodedefs declare, by node and input.
+    declared: HashMap<(&'a str, &'a str), Declared<'a>>,
+}
+
+impl<'a> Units<'a> {
+    /// Adds the units of a `unitdef`; the first definition of a unit stands. A scale that is not
+    /// a number defines nothing, so it fails only a material that reads the unit.
+    fn define(&mut self, e: &XmlNode<'a, '_>) {
+        let unit_type = e.attribute("unittype").unwrap_or_default();
+        for u in e.children().filter(|c| c.tag_name().name() == "unit") {
+            let name = u.attribute("name").unwrap_or_default();
+            if let Ok(scale) = u.attribute("scale").map_or(Ok(1.0), str::parse::<f64>) {
+                self.scales.entry((unit_type, name)).or_insert(scale);
+            }
+        }
+    }
+
+    /// Adds what a `nodedef` declares; the first declaration of an input stands.
+    fn declare(&mut self, e: &XmlNode<'a, '_>) {
+        let node = e.attribute("node").unwrap_or_default();
+        for i in e.children().filter(|c| c.tag_name().name() == "input") {
+            let name = i.attribute("name").unwrap_or_default();
+            let units = (stated(&i, "unittype"), stated(&i, "unit"));
+            if units != (None, None) {
+                self.declared.entry((node, name)).or_insert(units);
+            }
+        }
+    }
+
+    /// The unit of element `e`, input `input` of a `kind` node.
+    fn of(
+        &self,
+        e: &XmlNode<'_, '_>,
+        kind: &'a str,
+        input: &'a str,
+    ) -> std::result::Result<Unit, String> {
+        let (declared_type, declared_unit) = self
+            .declared
+            .get(&(kind, input))
+            .copied()
+            .unwrap_or_default();
+        let Some(unit) = stated(e, "unit").or(declared_unit) else {
+            return Ok(Unit::Unstated);
+        };
+        let unit_type = declared_type.or(stated(e, "unittype"));
+        let found = self
+            .scales
+            .iter()
+            .filter(|((t, u), _)| *u == unit && unit_type.is_none_or(|ty| ty == *t))
+            .min_by_key(|((t, _), _)| !matches!(*t, "distance" | "angle"));
+        match found {
+            Some((("distance", _), &s)) => Ok(Unit::Distance(s)),
+            Some((("angle", _), &s)) => Ok(Unit::Angle(s)),
+            Some(_) => Ok(Unit::Unstated),
+            None => Err(format!(
+                "{input}: no unit {unit} of type {}",
+                unit_type.unwrap_or("any")
+            )),
+        }
+    }
+}
+
 /// A material's nodes and what the material reads of them.
 struct Graph {
     net: Network,
@@ -341,6 +453,10 @@ fn network(
     let mut index: HashMap<(String, String), usize> = HashMap::new();
     let mut elements = Vec::new();
     let mut graphs = HashMap::new();
+    let mut units = Units::default();
+    for &(unit_type, unit, scale) in UNITS {
+        units.scales.insert((unit_type, unit), scale);
+    }
     let is_node = |e: &XmlNode<'_, '_>| {
         e.is_element() && e.has_attribute("type") && !NOT_NODES.contains(&e.tag_name().name())
     };
@@ -376,6 +492,8 @@ fn network(
                         }
                     }
                 }
+                "unitdef" => units.define(&e),
+                "nodedef" => units.declare(&e),
                 "geompropdef" if e.attribute("geomprop") == Some("texcoord") => {
                     let set = e.attribute("index").map_or(Some(0), |i| i.parse().ok());
                     if let Some(set) = set {
@@ -386,6 +504,10 @@ fn network(
                 _ => {}
             }
         }
+    }
+    for &(node, input, unit_type) in DECLARED {
+        let declared = units.declared.entry((node, input));
+        declared.or_insert((Some(unit_type), None));
     }
     let find = |graph: &str, namespace: Option<&str>, name: &str| {
         index
@@ -461,7 +583,7 @@ fn network(
     // definitions this document never sees, such as the nodedef behind a functional graph.
     let mut resolved = vec![false; elements.len()];
     let mut pending = vec![m];
-    // Filename inputs fed by a connection, which may end in a string.
+    // Filename inputs fed by a connection, which may end in a string, and their units.
     let mut filenames = Vec::new();
     while let Some(n) = pending.pop() {
         if std::mem::replace(&mut resolved[n], true) {
@@ -485,10 +607,15 @@ fn network(
                 }
                 _ => (i, graph.as_str()),
             };
+            let unit = || {
+                units
+                    .of(&source.0, e.tag_name().name(), &input_name)
+                    .map_err(|m| format!("{}: {m}", net.nodes[n].name))
+            };
             let value = match connect(source.1, &source.0, *d)? {
                 Some(c) => {
                     if source.0.attribute("type") == Some("filename") {
-                        filenames.push((n, input_name.clone(), source.0));
+                        filenames.push((n, input_name.clone(), source.0, unit()?));
                     }
                     if let Input::Connect { node, .. } = c {
                         pending.push(node);
@@ -497,17 +624,17 @@ fn network(
                 }
                 None => match source.0.attribute("value") {
                     None => continue,
-                    Some(v) => value(docs, *d, &source.0, v, load),
+                    Some(v) => value(docs, *d, &source.0, v, unit()?, load),
                 },
             };
             inputs.insert(input_name, value);
         }
         net.nodes[n].inputs = inputs;
     }
-    for (n, input, e) in filenames {
+    for (n, input, e, unit) in filenames {
         let d = elements[n].2;
         if let Input::Text(file) = through(&net, &net.nodes[n].inputs[&input]) {
-            let image = file_input(docs, d, &e, file, load);
+            let image = file_input(docs, d, &e, file, unit, load);
             net.nodes[n].inputs.insert(input, image);
         }
     }
@@ -539,12 +666,14 @@ fn file_input(
     d: usize,
     e: &XmlNode<'_, '_>,
     file: &str,
+    unit: Unit,
     load: &mut dyn FnMut(&Path, &str) -> usize,
 ) -> Input {
     let prefix = inherited(docs, d, e, "fileprefix").unwrap_or_default();
     Input::Image {
         image: load(docs[d].dir, &format!("{prefix}{file}")),
         color_space: inherited(docs, d, e, "colorspace").map(str::to_string),
+        unit,
     }
 }
 
@@ -554,16 +683,17 @@ fn value(
     d: usize,
     e: &XmlNode<'_, '_>,
     v: &str,
+    unit: Unit,
     load: &mut dyn FnMut(&Path, &str) -> usize,
 ) -> Input {
     match e.attribute("type").unwrap_or_default() {
-        "filename" => file_input(docs, d, e, v, load),
+        "filename" => file_input(docs, d, e, v, unit, load),
         "string" => Input::Text(v.to_string()),
-        "boolean" => Input::Value(vec![if v == "true" { 1.0 } else { 0.0 }]),
+        "boolean" => Input::Value(vec![if v == "true" { 1.0 } else { 0.0 }], unit),
         _ => v
             .split(',')
             .map(|x| x.trim().parse::<f32>())
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_or_else(|_| Input::Text(v.to_string()), Input::Value),
+            .map_or_else(|_| Input::Text(v.to_string()), |n| Input::Value(n, unit)),
     }
 }

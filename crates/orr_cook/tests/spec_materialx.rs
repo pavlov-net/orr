@@ -369,6 +369,124 @@ fn documents_map_as_the_clauses_say() {
                     && close(m.uv_transforms[slot::ROUGHNESS][0], 3.0)
             },
         },
+        Row {
+            clause: "Spec Inputs: a unit states the value's unit, converted into the scene's meters",
+            body: "",
+            inputs: r#"<input name="transmission_depth" type="float" value="5" unittype="distance"
+                  unit="centimeter"/>
+                <input name="subsurface_radius" type="float" value="2" unittype="distance"
+                  unit="foot"/>"#,
+            check: |m| close(m.transmission_depth, 0.05) && close(m.subsurface_radius, 0.6096),
+        },
+        Row {
+            clause: "Spec Units: a unit names its own type, which open_pbr_surface does not declare",
+            body: "",
+            inputs: r#"<input name="transmission_depth" type="float" value="5" unit="centimeter"/>"#,
+            check: |m| close(m.transmission_depth, 0.05),
+        },
+        Row {
+            clause: "OpenPBR thin_film_thickness: a stated unit, not its micrometers",
+            body: "",
+            inputs: r#"<input name="thin_film_weight" type="float" value="1"/>
+                <input name="thin_film_thickness" type="float" value="500" unit="nanometer"/>"#,
+            check: |m| m.thin_film_thickness == 500.0,
+        },
+        Row {
+            clause: "Spec Units: an unstated type takes the name from a type the scene has",
+            body: r#"<unitdef name="UD_a" unittype="altitude"><unit name="foot" scale="2"/></unitdef>"#,
+            inputs: r#"<input name="transmission_depth" type="float" value="2" unit="foot"/>"#,
+            check: |m| close(m.transmission_depth, 0.6096),
+        },
+        Row {
+            clause: "Spec Units: a unit no input reads needs no scale that parses",
+            body: r#"<unitdef name="UD_b" unittype="distance"><unit name="x" scale="1/3"/></unitdef>"#,
+            inputs: r#"<input name="transmission_depth" type="float" value="2" unit="foot"/>"#,
+            check: |m| close(m.transmission_depth, 0.6096),
+        },
+        Row {
+            clause: "MaterialX library: a unit on a connected input states nothing",
+            body: r#"<constant name="c" type="float">
+                  <input name="value" type="float" value="4"/></constant>"#,
+            inputs: r#"<input name="transmission_depth" type="float" nodename="c" unit="cubit"/>"#,
+            check: |m| close(m.transmission_depth, 4.0),
+        },
+        Row {
+            clause: "Spec NodeDef: an empty unit declares none",
+            body: r#"<nodedef name="ND_e" node="open_pbr_surface">
+                  <input name="transmission_depth" type="float" unittype="" unit=""/>
+                  <output name="out" type="surfaceshader"/></nodedef>"#,
+            inputs: r#"<input name="transmission_depth" type="float" value="2"/>"#,
+            check: |m| close(m.transmission_depth, 2.0),
+        },
+        Row {
+            clause: "Spec Inputs: the constant example's unit reaches what reads the constant",
+            body: r#"<constant name="boxwidth" type="float">
+                  <input name="value" type="float" value="2.39" unittype="distance" unit="foot"/>
+                </constant>
+                <dot name="d" type="float"><input name="in" type="float" nodename="boxwidth"/></dot>"#,
+            inputs: r#"<input name="transmission_depth" type="float" nodename="d"/>"#,
+            check: |m| close(m.transmission_depth, 0.728472),
+        },
+        Row {
+            clause: "Spec Units: another unitdef adds units to a type",
+            body: r#"<unitdef name="UD_marine" unittype="distance">
+                  <unit name="fathom" scale="1.8288"/></unitdef>"#,
+            inputs: r#"<input name="transmission_depth" type="float" value="2" unittype="distance"
+                  unit="fathom"/>"#,
+            check: |m| close(m.transmission_depth, 3.6576),
+        },
+        Row {
+            clause: "Spec Inputs: a nodegraph interface input holds the unit of the value it gives",
+            body: r#"<nodegraph name="g">
+                  <input name="w" type="float" value="3" unittype="distance" unit="millimeter"/>
+                  <constant name="c" type="float">
+                    <input name="value" type="float" interfacename="w"/></constant>
+                  <output name="o" type="float" nodename="c"/>
+                </nodegraph>"#,
+            inputs: r#"<input name="transmission_depth" type="float" nodegraph="g"/>"#,
+            check: |m| close(m.transmission_depth, 0.003),
+        },
+        Row {
+            clause: "Spec NodeDef: a unit on a nodedef input is the one its values are in",
+            body: r#"<nodedef name="ND_mm" node="open_pbr_surface">
+                  <input name="transmission_depth" type="float" unittype="distance"
+                    unit="millimeter"/>
+                  <output name="out" type="surfaceshader"/></nodedef>"#,
+            inputs: r#"<input name="transmission_depth" type="float" value="7"/>
+                <input name="subsurface_radius" type="float" value="2"/>"#,
+            check: |m| close(m.transmission_depth, 0.007) && m.subsurface_radius == 2.0,
+        },
+        Row {
+            clause: "ND_place2d_vector2: rotate declares degrees, so radians convert to them",
+            body: r#"<texcoord name="t" type="vector2"/>
+                <place2d name="p" type="vector2">
+                  <input name="texcoord" type="vector2" nodename="t"/>
+                  <input name="rotate" type="float" value="1.57079632679" unittype="angle"
+                    unit="radian"/></place2d>
+                <image name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="texcoord" type="vector2" nodename="p"/></image>"#,
+            inputs: BASE_I,
+            check: |m| {
+                let [a, b, _, d, e, _] = m.uv_transforms[slot::BASE_COLOR];
+                close(a + 1.0, 0.0) && close(e + 1.0, 0.0) && close(b.abs(), 1.0) && close(d, -b)
+            },
+        },
+        Row {
+            clause: "Nodes tiledimage: real-world sizes of different units convert before they divide",
+            body: r#"<tiledimage name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="realworldimagesize" type="vector2" value="100, 100"
+                    unittype="distance" unit="centimeter"/>
+                  <input name="realworldtilesize" type="vector2" value="0.5, 0.25"
+                    unittype="distance" unit="meter"/>
+                </tiledimage>"#,
+            inputs: BASE_I,
+            check: |m| {
+                let t = m.uv_transforms[slot::BASE_COLOR];
+                close(t[0], -0.5) && close(t[4], -0.75)
+            },
+        },
     ];
     let failed: Vec<String> = rows
         .iter()
@@ -426,6 +544,54 @@ fn invalid_documents_fail() {
                 .to_string(),
             BASE_I,
         ),
+        (
+            "Spec Units: a unit no unitdef defines",
+            String::new(),
+            r#"<input name="transmission_depth" type="float" value="5" unit="cubit"/>"#,
+        ),
+        (
+            "Spec Inputs: a unit outside the input's unittype",
+            String::new(),
+            r#"<input name="transmission_depth" type="float" value="5" unittype="angle"
+                  unit="meter"/>"#,
+        ),
+        (
+            "ND_place2d_vector2: rotate declares angle, so a distance is outside it",
+            r#"<place2d name="p" type="vector2">
+                  <input name="rotate" type="float" value="5" unit="meter"/></place2d>
+                <image name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="texcoord" type="vector2" nodename="p"/></image>"#
+                .to_string(),
+            BASE_I,
+        ),
+        (
+            "ND_place2d_vector2: a connection does not carry a distance past rotate's angle",
+            r#"<constant name="c" type="float">
+                  <input name="value" type="float" value="5" unit="meter"/></constant>
+                <place2d name="p" type="vector2">
+                  <input name="rotate" type="float" nodename="c"/></place2d>
+                <image name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="texcoord" type="vector2" nodename="p"/></image>"#
+                .to_string(),
+            BASE_I,
+        ),
+        (
+            "Nodes tiledimage: a connection does not carry an angle past a real-world size",
+            r#"<constant name="c" type="vector2">
+                  <input name="value" type="vector2" value="1, 1" unit="radian"/></constant>
+                <tiledimage name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/>
+                  <input name="realworldimagesize" type="vector2" nodename="c"/></tiledimage>"#
+                .to_string(),
+            BASE_I,
+        ),
+        (
+            "OpenPBR transmission_depth: a distance, not an angle",
+            String::new(),
+            r#"<input name="transmission_depth" type="float" value="5" unit="degree"/>"#,
+        ),
     ];
     let cooked: Vec<&str> = rows
         .iter()
@@ -433,6 +599,72 @@ fn invalid_documents_fail() {
         .map(|r| r.0)
         .collect();
     assert!(cooked.is_empty(), "{cooked:#?}");
+}
+
+/// The cook of a material whose `displacementshader` is node `D` of `body`.
+fn cook_displaced(body: &str) -> orr_cook::Result<(Archive, CookReport)> {
+    let path = fixture().join("m.mtlx");
+    let doc = format!(
+        r#"<?xml version="1.0"?>
+<materialx version="1.39">
+  {body}
+  <open_pbr_surface name="S" type="surfaceshader"/>
+  <surfacematerial name="M" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="S"/>
+    <input name="displacementshader" type="displacementshader" nodename="D"/>
+  </surfacematerial>
+</materialx>
+"#
+    );
+    std::fs::write(&path, doc).unwrap();
+    cook(&path, "M")
+}
+
+fn displaced(body: &str) -> Material {
+    material(&cook_displaced(body).unwrap().0)
+}
+
+/// Spec Units: "images and the quantities they represent such as displacement amount" convert
+/// from an absolute size, and a unit on a filename applies to the values read from the file.
+/// `flat.png` holds a height of 0.2 of its full scale, which the cook's measured range moves
+/// into the offset.
+#[test]
+fn displacement_units_reach_the_material() {
+    let image = |unit: &str| {
+        format!(
+            r#"<image name="i" type="float">
+              <input name="file" type="filename" value="flat.png" {unit}/></image>"#
+        )
+    };
+    let node = |inputs: &str| {
+        format!(r#"<displacement name="D" type="displacementshader">{inputs}</displacement>"#)
+    };
+    let from_image = r#"<input name="displacement" type="float" nodename="i"/>"#;
+
+    let m = displaced(&format!("{}{}", image(""), node(from_image)));
+    assert!(close(m.displacement_offset, 0.2), "{m:?}");
+
+    let unit = r#"unittype="distance" unit="centimeter""#;
+    let m = displaced(&format!("{}{}", image(unit), node(from_image)));
+    assert!(close(m.displacement_offset, 0.002), "{m:?}");
+    assert!(close(m.displacement_max, 0.01), "{m:?}");
+
+    let scale = r#"<input name="scale" type="float" value="10" unit="millimeter"/>"#;
+    let inputs = format!("{from_image}{scale}");
+    let m = displaced(&format!("{}{}", image(""), node(&inputs)));
+    assert!(close(m.displacement_offset, 0.002), "{m:?}");
+
+    let m = displaced(&node(
+        r#"<input name="displacement" type="float" value="3" unit="centimeter"/>
+           <input name="scale" type="float" value="2"/>"#,
+    ));
+    assert!(bound(&m, slot::DISPLACEMENT));
+    assert!(close(m.displacement_offset, 0.06), "{m:?}");
+    assert!(close(m.displacement_max, 0.06), "{m:?}");
+
+    // ND_displacement_vector3 has no reading along the normal.
+    let vector = r#"<input name="displacement" type="vector3" value="0.1, 0.2, 0.3"/>"#;
+    assert!(cook_displaced(&node(vector)).is_err());
 }
 
 /// The content of the base color texture of `body`.

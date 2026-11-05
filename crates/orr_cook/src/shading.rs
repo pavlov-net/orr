@@ -40,6 +40,13 @@
 //! pair is the encoding stated, not a second decode. Both hold as far as the image's format can
 //! hold what they state. Coordinate nodes set each slot's `Material::uv_transforms`,
 //! conjugated by the flip of t between st and the cook's top-left uvs.
+//!
+//! A value that states a [`Unit`] converts to meters or degrees. `transmission_depth`,
+//! `subsurface_radius` (its default too) and both kinds of `displacement` are lengths: without a
+//! unit they are in the scene's length unit ([`Host::meters_per_unit`]). They are world space
+//! lengths, so no object scale enters them; a displacement moves mesh space points, so a
+//! placement's scale does scale it. `thin_film_thickness` without a unit is in micrometers, as
+//! OpenPBR states it, whatever the scene's unit.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
@@ -69,12 +76,13 @@ pub(crate) struct Node {
 }
 
 pub(crate) enum Input {
-    Value(Vec<f32>),
+    Value(Vec<f32>, Unit),
     Text(String),
-    /// A file input: an image of the scene and its authored color space.
+    /// A file input: an image of the scene, its authored color space and the unit of its values.
     Image {
         image: usize,
         color_space: Option<String>,
+        unit: Unit,
     },
     Connect {
         node: usize,
@@ -82,8 +90,32 @@ pub(crate) enum Input {
     },
 }
 
+/// The unit a value states.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) enum Unit {
+    Unstated,
+    /// Meters per unit.
+    Distance(f64),
+    /// Degrees per unit.
+    Angle(f64),
+}
+
+impl Unit {
+    /// `v` in the scene's unit of this type.
+    fn scene(self, v: f32) -> f32 {
+        match self {
+            Self::Unstated => v,
+            Self::Distance(s) | Self::Angle(s) => scaled(v, s),
+        }
+    }
+}
+
+fn scaled(v: f32, by: f64) -> f32 {
+    (f64::from(v) * by) as f32
+}
+
 /// What a `constant` or `dot` without a value reads.
-static ZERO: LazyLock<Input> = LazyLock::new(|| Input::Value(vec![0.0]));
+static ZERO: LazyLock<Input> = LazyLock::new(|| Input::Value(vec![0.0], Unit::Unstated));
 
 /// What `input` reads past `constant` and `dot` nodes, which pass a value on unchanged. A ring
 /// of them leaves a connection.
@@ -135,6 +167,8 @@ pub(crate) enum Primvar {
 
 /// What mapping asks of the scene a material lands in.
 pub(crate) struct Host<'a> {
+    /// The scene's length unit, which a length that states none is in.
+    pub(crate) meters_per_unit: f64,
     /// The mesh primvar of each uv set, which geometric properties name.
     pub(crate) primvars: &'a [&'a str],
     /// What the mesh holds for each primvar of [`Network::primvar_reads`].
@@ -211,6 +245,7 @@ struct Tex {
     uv: Affine2,
     scale: [f32; 4],
     bias: [f32; 4],
+    unit: Unit,
 }
 
 fn point2(v: &[f32]) -> Vec2 {
@@ -272,7 +307,7 @@ impl Tex {
 }
 
 enum Value {
-    Constant(Vec<f32>),
+    Constant(Vec<f32>, Unit),
     Texture(Tex),
 }
 
@@ -398,16 +433,55 @@ impl Mapper<'_, '_> {
         self.input(n, name).map(|i| through(self.net, i))
     }
 
-    /// A constant input's value, or `None` when unauthored.
-    fn number(&self, n: usize, name: &str) -> Result<Option<Vec<f32>>, String> {
+    /// A constant input's value as authored and its unit, or `None` when unauthored.
+    fn measure(&self, n: usize, name: &str) -> Result<Option<(&[f32], Unit)>, String> {
         match self.source(n, name) {
             None => Ok(None),
-            Some(Input::Value(v)) => Ok(Some(v.clone())),
+            Some(Input::Value(v, unit)) => Ok(Some((v, *unit))),
             Some(_) => Err(format!(
                 "{}: input {name} must be a constant",
                 self.node(n).name
             )),
         }
+    }
+
+    /// A constant input's value in the scene's units, or `None` when unauthored.
+    fn number(&self, n: usize, name: &str) -> Result<Option<Vec<f32>>, String> {
+        let converted = |(v, unit): (&[f32], Unit)| v.iter().map(|&x| unit.scene(x)).collect();
+        Ok(self.measure(n, name)?.map(converted))
+    }
+
+    /// Meters per `unit` of length input `name` of node `n`.
+    fn meters(&self, n: usize, name: &str, unit: Unit) -> Result<f64, String> {
+        match unit {
+            Unit::Unstated => Ok(self.host.meters_per_unit),
+            Unit::Distance(s) => Ok(s),
+            Unit::Angle(_) => Err(format!(
+                "{} input {name}: a length in a unit of angle",
+                self.node(n).name
+            )),
+        }
+    }
+
+    /// A constant angle input in degrees, 0 when unauthored. A connection brings a value here
+    /// unchecked against the unit type the input declares.
+    fn degrees(&self, n: usize, name: &str) -> Result<f32, String> {
+        match self.measure(n, name)? {
+            None => Ok(0.0),
+            Some((_, Unit::Distance(_))) => Err(format!(
+                "{} input {name}: an angle in a unit of length",
+                self.node(n).name
+            )),
+            Some((v, unit)) => Ok(unit.scene(v[0])),
+        }
+    }
+
+    /// A constant size input, 1 when unauthored, checked as [`Self::degrees`] is.
+    fn size(&self, n: usize, name: &str) -> Result<Vec2, String> {
+        if let Some((_, unit)) = self.measure(n, name)? {
+            self.meters(n, name, unit)?;
+        }
+        self.vec2(n, name, Vec2::ONE)
     }
 
     fn text<'n>(&'n self, n: usize, name: &str) -> Option<&'n str> {
@@ -431,7 +505,7 @@ impl Mapper<'_, '_> {
     fn components(&self, n: usize) -> Result<usize, String> {
         match self.input(n, "in") {
             None => Ok(4),
-            Some(Input::Value(v)) if v.len() <= 4 => Ok(v.len()),
+            Some(Input::Value(v, _)) if v.len() <= 4 => Ok(v.len()),
             Some(Input::Connect { node, output }) => Ok(match self.node(*node).ty.as_str() {
                 "float" => 1,
                 "vector2" => 2,
@@ -451,7 +525,7 @@ impl Mapper<'_, '_> {
         let what = format!("{} input {name}", self.node(n).name);
         let v = match self.source(n, name) {
             None => return Ok(None),
-            Some(Input::Value(v)) => Value::Constant(v.clone()),
+            Some(Input::Value(v, unit)) => Value::Constant(v.clone(), *unit),
             Some(Input::Text(_) | Input::Image { .. }) => {
                 return Err(format!("{what}: not a number"));
             }
@@ -533,19 +607,21 @@ impl Mapper<'_, '_> {
                         t.channels = Channels::One(c);
                         Ok(Value::Texture(t))
                     }
-                    Some(Value::Constant(v)) => Ok(Value::Constant(vec![
-                        v.get(usize::from(c)).copied().unwrap_or(0.0),
-                    ])),
-                    None => Ok(Value::Constant(vec![0.0])),
+                    Some(Value::Constant(v, unit)) => Ok(Value::Constant(
+                        vec![v.get(usize::from(c)).copied().unwrap_or(0.0)],
+                        unit,
+                    )),
+                    None => Ok(Value::Constant(vec![0.0], Unit::Unstated)),
                     _ => Err(format!(
                         "{name}: picks channel {c} of nothing a texture holds"
                     )),
                 }
             }
             k if k.starts_with("UsdPrimvarReader_") => match self.fetch(n) {
-                Primvar::Constant(v) => Ok(Value::Constant(v)),
+                Primvar::Constant(v) => Ok(Value::Constant(v, Unit::Unstated)),
                 Primvar::Missing => Ok(Value::Constant(
                     self.number(n, "fallback")?.unwrap_or_else(|| vec![0.0; 4]),
+                    Unit::Unstated,
                 )),
                 Primvar::Uv(_) | Primvar::Varying => Err(format!(
                     "{}: its primvar varies over the mesh, which holds no values for it",
@@ -569,7 +645,12 @@ impl Mapper<'_, '_> {
     /// A MaterialX `image` or `tiledimage` node, its channels left for the caller.
     fn image(&self, n: usize) -> Result<Tex, String> {
         let node = self.node(n);
-        let Some(Input::Image { image, color_space }) = self.source(n, "file") else {
+        let Some(Input::Image {
+            image,
+            color_space,
+            unit,
+        }) = self.source(n, "file")
+        else {
             return Err(format!("{}: no file", node.name));
         };
         let wrap = |mode: Option<&str>| match mode {
@@ -587,8 +668,8 @@ impl Mapper<'_, '_> {
         if node.kind == "tiledimage" {
             let tiling = self.vec2(n, "uvtiling", Vec2::ONE)?;
             let offset = self.vec2(n, "uvoffset", Vec2::ZERO)?;
-            let image = self.vec2(n, "realworldimagesize", Vec2::ONE)?;
-            let tile = self.vec2(n, "realworldtilesize", Vec2::ONE)?;
+            let image = self.size(n, "realworldimagesize")?;
+            let tile = self.size(n, "realworldtilesize")?;
             uv = Affine2::from_scale(tile / image)
                 * Affine2::from_translation(-offset)
                 * Affine2::from_scale(tiling)
@@ -604,6 +685,7 @@ impl Mapper<'_, '_> {
             uv,
             scale: [1.0; 4],
             bias: [0.0; 4],
+            unit: *unit,
         })
     }
 
@@ -643,6 +725,7 @@ impl Mapper<'_, '_> {
             uv,
             scale,
             bias,
+            unit: Unit::Unstated,
         })
     }
 
@@ -658,6 +741,7 @@ impl Mapper<'_, '_> {
             uv: Affine2::IDENTITY,
             scale: [1.0; 4],
             bias: [0.0; 4],
+            unit: Unit::Unstated,
         }
     }
 
@@ -729,7 +813,7 @@ impl Mapper<'_, '_> {
                     let scale = self.vec2(n, "scale", Vec2::ONE)?;
                     let offset = self.vec2(n, "offset", Vec2::ZERO)?;
                     // MaterialX rotate2d turns clockwise by its angle in degrees.
-                    let rotate = Affine2::from_angle(-self.float(n, "rotate", 0.0)?.to_radians());
+                    let rotate = Affine2::from_angle(-self.degrees(n, "rotate")?.to_radians());
                     let srt = self.float(n, "operationorder", 0.0)? == 0.0;
                     let to = Affine2::from_translation(-pivot);
                     let back = Affine2::from_translation(pivot);
@@ -744,7 +828,7 @@ impl Mapper<'_, '_> {
                 }
                 "UsdTransform2d" => {
                     let scale = self.vec2(n, "scale", Vec2::ONE)?;
-                    let rotation = self.float(n, "rotation", 0.0)?.to_radians();
+                    let rotation = self.degrees(n, "rotation")?.to_radians();
                     let translation = self.vec2(n, "translation", Vec2::ZERO)?;
                     let t = Affine2::from_scale_angle_translation(scale, rotation, translation);
                     (t, "in", (0, fixed(Vec2::ZERO)))
@@ -778,7 +862,7 @@ impl Mapper<'_, '_> {
     ) -> Result<(), String> {
         match self.value(n, input)? {
             None => {}
-            Some(Value::Constant(v)) => *field(&mut self.material) = v[0],
+            Some(Value::Constant(v, unit)) => *field(&mut self.material) = unit.scene(v[0]),
             Some(Value::Texture(t)) => {
                 let slot = slot.ok_or_else(|| self.no_slot(n, input))?;
                 if t.channels == Channels::Rgb {
@@ -788,10 +872,26 @@ impl Mapper<'_, '_> {
                     ));
                 }
                 let (r, value) = t.scalar();
-                *field(&mut self.material) = value;
+                *field(&mut self.material) = t.unit.scene(value);
                 *slot(&mut self.textures) = Some(r);
             }
         }
+        Ok(())
+    }
+
+    /// A length field, in meters. Its default is a length in the scene's unit as well.
+    fn length(
+        &mut self,
+        n: usize,
+        input: &str,
+        field: fn(&mut Material) -> &mut f32,
+    ) -> Result<(), String> {
+        let (v, unit) = match self.value(n, input)? {
+            None => (*field(&mut self.material), Unit::Unstated),
+            Some(Value::Constant(v, unit)) => (v[0], unit),
+            Some(Value::Texture(_)) => return Err(self.no_slot(n, input)),
+        };
+        *field(&mut self.material) = scaled(v, self.meters(n, input, unit)?);
         Ok(())
     }
 
@@ -805,7 +905,7 @@ impl Mapper<'_, '_> {
     ) -> Result<(), String> {
         match self.value(n, input)? {
             None => {}
-            Some(Value::Constant(v)) => {
+            Some(Value::Constant(v, _)) => {
                 *field(&mut self.material) =
                     std::array::from_fn(|i| v.get(i).copied().unwrap_or(v[0]));
             }
@@ -875,7 +975,6 @@ impl Mapper<'_, '_> {
                 |m| &mut m.transmission_weight,
                 Some(|t| &mut t.transmission),
             ),
-            ("transmission_depth", |m| &mut m.transmission_depth, None),
             (
                 "transmission_scatter_anisotropy",
                 |m| &mut m.transmission_scatter_anisotropy,
@@ -892,7 +991,6 @@ impl Mapper<'_, '_> {
                 None,
             ),
             ("subsurface_weight", |m| &mut m.subsurface_weight, None),
-            ("subsurface_radius", |m| &mut m.subsurface_radius, None),
             (
                 "subsurface_scatter_anisotropy",
                 |m| &mut m.subsurface_scatter_anisotropy,
@@ -956,7 +1054,9 @@ impl Mapper<'_, '_> {
                 || UNREAD.contains(&name.as_str())
                 || matches!(
                     name.as_str(),
-                    "thin_film_weight"
+                    "transmission_depth"
+                        | "subsurface_radius"
+                        | "thin_film_weight"
                         | "thin_film_thickness"
                         | "geometry_thin_walled"
                         | "geometry_normal"
@@ -974,9 +1074,21 @@ impl Mapper<'_, '_> {
         for &(name, field, slot) in colors {
             self.color(n, name, field, slot)?;
         }
+        self.length(n, "transmission_depth", |m| &mut m.transmission_depth)?;
+        self.length(n, "subsurface_radius", |m| &mut m.subsurface_radius)?;
         let film = self.number(n, "thin_film_weight")?.map_or(0.0, |v| v[0]);
-        let thickness = self.number(n, "thin_film_thickness")?.map_or(0.5, |v| v[0]);
-        self.material.thin_film_thickness = if film > 0.0 { thickness * 1000.0 } else { 0.0 };
+        let (thickness, unit) = self
+            .measure(n, "thin_film_thickness")?
+            .map_or((0.5, Unit::Unstated), |(v, unit)| (v[0], unit));
+        let nanometers = match unit {
+            Unit::Unstated => 1e3,
+            unit => self.meters(n, "thin_film_thickness", unit)? * 1e9,
+        };
+        self.material.thin_film_thickness = if film > 0.0 {
+            scaled(thickness, nanometers)
+        } else {
+            0.0
+        };
         if let Some(v) = self.number(n, "geometry_thin_walled")? {
             self.material.thin_walled = u8::from(v[0] != 0.0);
         }
@@ -1084,14 +1196,14 @@ impl Mapper<'_, '_> {
         }
         self.preview_opacity(n)?;
         match self.value(n, "occlusion")? {
-            None | Some(Value::Constant(_)) => {}
+            None | Some(Value::Constant(..)) => {}
             Some(Value::Texture(t)) => {
                 self.textures.occlusion = Some((t.scalar().0, 1.0));
             }
         }
         match self.value(n, "normal")? {
             None => {}
-            Some(Value::Constant(v)) => {
+            Some(Value::Constant(v, _)) => {
                 let at = |i: usize, d: f32| v.get(i).copied().unwrap_or(d);
                 let normal = [at(0, 0.0), at(1, 0.0), at(2, 1.0)];
                 if normal != [0.0, 0.0, 1.0] {
@@ -1114,18 +1226,9 @@ impl Mapper<'_, '_> {
             }
         }
         match self.value(n, "displacement")? {
-            None => {}
-            Some(Value::Constant(v)) if v[0] == 0.0 => {}
-            Some(Value::Constant(v)) => {
-                let t = self.solid([0.0; 3]);
-                self.displaced(t, 0.0, v[0]);
-            }
-            Some(Value::Texture(t)) => {
-                let c = t.channel();
-                self.displaced(t, t.scale[c], t.bias[c]);
-            }
+            None => Ok(()),
+            Some(height) => self.displaced(n, height, 1.0),
         }
-        Ok(())
     }
 
     /// `opacity`, as `opacityThreshold` and `opacityMode` have it.
@@ -1148,8 +1251,8 @@ impl Mapper<'_, '_> {
         }
         match self.value(n, "opacity")? {
             None => {}
-            Some(Value::Constant(v)) if v[0] >= 1.0 => {}
-            Some(Value::Constant(v)) => {
+            Some(Value::Constant(v, _)) if v[0] >= 1.0 => {}
+            Some(Value::Constant(v, _)) => {
                 self.material.transmission_weight = 1.0 - v[0].max(0.0);
                 self.material.thin_walled = 1;
             }
@@ -1181,26 +1284,41 @@ impl Mapper<'_, '_> {
                 node.name, node.kind
             ));
         }
-        let scale = self.number(n, "scale")?.map_or(1.0, |v| v[0]);
-        match self.value(n, "displacement")? {
-            None => Ok(()),
-            Some(Value::Texture(t)) if t.channels != Channels::Rgb => {
-                self.displaced(t, scale, 0.0);
-                Ok(())
-            }
-            _ => Err(format!(
-                "{}: displacement must read one channel of an image",
+        let scale = self.float(n, "scale", 1.0)?;
+        let height = self.value(n, "displacement")?;
+        let vector = match &height {
+            None => false,
+            Some(Value::Constant(v, _)) => v.len() > 1 && v.iter().any(|&c| c != 0.0),
+            Some(Value::Texture(t)) => t.channels == Channels::Rgb,
+        };
+        if vector {
+            return Err(format!(
+                "{}: displacement must read one channel, along the normal",
                 self.node(n).name
-            )),
+            ));
         }
+        height.map_or(Ok(()), |h| self.displaced(n, h, scale))
     }
 
-    fn displaced(&mut self, t: Tex, scale: f32, offset: f32) {
+    /// Sets the displacement of node `n` to `height` times `scale`, in meters. A constant height
+    /// reads a solid image at the offset.
+    fn displaced(&mut self, n: usize, height: Value, scale: f32) -> Result<(), String> {
+        let (t, unit, heights) = match height {
+            Value::Constant(v, _) if v[0] == 0.0 => return Ok(()),
+            Value::Constant(v, unit) => (self.solid([0.0; 3]), unit, (0.0, v[0])),
+            Value::Texture(t) => {
+                let c = t.channel();
+                (t, t.unit, (t.scale[c], t.bias[c]))
+            }
+        };
+        let meters = f64::from(scale) * self.meters(n, "displacement", unit)?;
+        let (scale, offset) = (scaled(heights.0, meters), scaled(heights.1, meters));
         let m = &mut self.material;
         m.displacement_scale = scale;
         m.displacement_offset = offset;
         m.displacement_min = offset.min(offset + scale);
         m.displacement_max = offset.max(offset + scale);
         self.textures.displacement = Some(t.tex_ref());
+        Ok(())
     }
 }

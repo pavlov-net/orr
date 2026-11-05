@@ -20,7 +20,8 @@ pub struct TextureBinding {
 }
 
 /// OpenPBR 1.1.1 parameters of one material, as authored: colors linear Rec.709, lengths
-/// in meters, thin-film thickness in nanometers, emission luminance in nits.
+/// in world space meters, thin-film thickness in nanometers, emission luminance in nits, angles
+/// in radians. The displacement fields are the exception: lengths in mesh space.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct Material {
@@ -63,7 +64,7 @@ pub struct Material {
     pub transmission_dispersion_abbe_number: f32,
     pub displacement_scale: f32,
     pub displacement_offset: f32,
-    /// Declared displacement range in meters, used for bounds.
+    /// Declared displacement range, used for bounds.
     pub displacement_min: f32,
     pub displacement_max: f32,
     /// [`Self::OPAQUE`], [`Self::MASK`] or [`Self::BLEND`].
