@@ -596,7 +596,9 @@ fn coverage_scale(c: &Coverage, target: f32) -> f32 {
 impl Toksvig {
     /// Adds the normal variance of each mip from mip `first` on to the roughness channel:
     /// with `r` the length of the averaged unit normals, `var = (1 - r) / r` and
-    /// `alpha'^2 = alpha^2 + 2 var`, where `alpha` is roughness squared.
+    /// `alpha'^2 = alpha^2 + 2 var`, where `alpha` is roughness squared. The normals average
+    /// with a box whatever `spec.filter` is: `r` measures spread only under positive weights,
+    /// and a sharpening filter's negative lobes push it to 1 where the normals still vary.
     pub(super) fn apply(
         &self,
         chain: &mut [Img],
@@ -609,7 +611,7 @@ impl Toksvig {
             return Err("Toksvig normals differ in size from the roughness texture".into());
         }
         let normal_spec = MipSpec {
-            filter: spec.filter,
+            filter: MipFilter::Box,
             wrap: spec.wrap,
             grid: spec.grid,
             normal: false,
@@ -949,6 +951,50 @@ mod tests {
                 let rel = (p[0] - analytic).abs() / analytic;
                 assert!(rel <= 0.02, "{}x{}: {} against {analytic}", m.w, m.h, p[0]);
             }
+        }
+    }
+
+    #[test]
+    fn toksvig_reads_ripples_the_mips_still_resolve() {
+        // Slopes a sin(2 t x) along x, t = pi / 64: a footprint of w texels keeps a fraction
+        // d = sin(w t) / (w sin t) of the wave in its mean, so their variance over it is
+        // a^2 / 2 (1 - d^2), and for small slopes the mean alpha^2 added is that variance. A
+        // sharpening mip filter keeps these waves in its mean, so its length stays nearer
+        // 1 and reads too little of it.
+        let (a, wave, size) = (0.2f32, 64.0f32, 256);
+        let mut normals = Img::new(size, size);
+        for (i, p) in normals.px.iter_mut().enumerate() {
+            let x = (i as u32 % size) as f32 + 0.5;
+            let slope = a * (std::f32::consts::TAU * x / wave).sin();
+            *p = normalized([-slope, 0.0, 1.0, 1.0]);
+        }
+        let base_rough = 0.05f32;
+        let mut img = Img::new(size, size);
+        for p in &mut img.px {
+            *p = [base_rough, 0.0, 0.0, 1.0];
+        }
+        let s = spec(MipFilter::Kaiser);
+        let mut c = full_chain(img, &s);
+        Toksvig {
+            channel: 0,
+            normals,
+        }
+        .apply(&mut c, &s, 0)
+        .unwrap();
+        for (m, mip) in c.iter().enumerate().take(4).skip(1) {
+            let (t, w) = (std::f32::consts::PI / wave, (1 << m) as f32);
+            let want = 0.5 * a * a * (1.0 - ((w * t).sin() / (w * t.sin())).powi(2));
+            let added = mip
+                .px
+                .iter()
+                .map(|p| p[0].powi(4) - base_rough.powi(4))
+                .sum::<f32>()
+                / mip.px.len() as f32;
+            let ratio = added / want;
+            assert!(
+                (0.95..=1.05).contains(&ratio),
+                "mip {m}: read {ratio} of it"
+            );
         }
     }
 }
