@@ -29,8 +29,10 @@ orr_egui = { path = "../../crates/orr_egui" }
 egui = { workspace = true, features = ["monochrome_emoji_fonts"] }
 egui_demo_lib = "0.37"
 
-[target.'cfg(windows)'.dev-dependencies]
+[target.'cfg(any(windows, target_os = "macos"))'.dev-dependencies]
 gpu_suite.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
 windows = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_System_Diagnostics_Debug",
@@ -43,6 +45,10 @@ orr_shaders = { workspace = true, features = ["build"] }
 
 [[test]]
 name = "watch_at_exit"
+harness = false
+
+[[test]]
+name = "display"
 harness = false
 
 [lints]

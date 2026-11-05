@@ -139,26 +139,26 @@ fn signals(bytes: &[u8], format: Format) -> Vec<[f64; 4]> {
 
 /// The f64 model of `decode_display` and `encode_display` (`display.slang`).
 fn decode(signal: [f64; 3], d: &ResolvedDisplay) -> [f64; 3] {
-    let pw = f64::from(d.paper_white_nits);
+    let white = f64::from(d.signal_white_nits);
     match d.encoding {
         OutputFormat::Sdr => signal.map(srgb_decode),
         OutputFormat::Hdr10Pq => {
             static M: LazyLock<DMat3> =
                 LazyLock::new(|| RgbPrimaries::REC2020.matrix_to(RgbPrimaries::REC709));
-            (*M * DVec3::from(signal.map(pq_decode)) / pw).to_array()
+            (*M * DVec3::from(signal.map(pq_decode)) / white).to_array()
         }
-        OutputFormat::ScRgb => signal.map(|v| v * SCRGB_WHITE_NITS / pw),
+        OutputFormat::ScRgb => signal.map(|v| v * SCRGB_WHITE_NITS / white),
     }
 }
 
 fn encode(linear: [f64; 3], d: &ResolvedDisplay) -> [f64; 3] {
-    let pw = f64::from(d.paper_white_nits);
+    let white = f64::from(d.signal_white_nits);
     match d.encoding {
         OutputFormat::Sdr => linear.map(|v| srgb_encode(v.clamp(0.0, 1.0))),
         OutputFormat::Hdr10Pq => rec709_to_rec2020(linear)
             .to_array()
-            .map(|v| pq_encode(v * pw)),
-        OutputFormat::ScRgb => linear.map(|v| v * pw / SCRGB_WHITE_NITS),
+            .map(|v| pq_encode(v * white)),
+        OutputFormat::ScRgb => linear.map(|v| v * white / SCRGB_WHITE_NITS),
     }
 }
 

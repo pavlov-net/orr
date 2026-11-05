@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use raw_window_handle::RawWindowHandle;
 use windows::Foundation::{Point, TypedEventHandler};
@@ -34,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, Ref, w};
 
-use crate::{DisplayFeed, DisplayInfo, Error, Result};
+use crate::{DisplayFeed, DisplayInfo, Error, Result, steady};
 
 // Windows 11 22621+. windows-rs has no binding; the three IInspectable slots come first.
 #[windows_core::interface("7449121C-382B-4705-8DA7-A795BA482013")]
@@ -48,21 +48,13 @@ unsafe trait IDisplayInformationStaticsInterop: IUnknown {
 /// Turning HDR on or off raises no event, so the watch also reads this often.
 const READ_INTERVAL_MS: u32 = 1000;
 
-/// How far the SDR white may move, as a share of its value, and still count as unchanged: each
-/// change moves the tone curve, and the reading drifts.
-const SDR_WHITE_TOLERANCE: f32 = 0.01;
-
-/// Watches the monitor a window is on and publishes what the OS reports for it to a
-/// `DisplayFeed`: once a second, when the window takes the focus, on moves to another monitor,
-/// on display mode changes and on the OS's color change event. With the `pcl-stats` feature it
-/// also receives the PC latency ping for the frames of every `Display`.
+/// Reads once a second, when the window takes the focus, on moves to another monitor, on
+/// display mode changes and on the OS's color change event.
 ///
-/// Create it on the thread that owns the window and pumps its messages; changes arrive
-/// there. It uses the thread's dispatcher queue, creating one if the thread has none. It reads
-/// through the window's message queue and adds no thread. It may be dropped on any thread, and
-/// before or after the window is destroyed; dropped on another thread, it stops when the
-/// window's thread next pumps its messages.
-pub struct DisplayWatch {
+/// It uses the thread's dispatcher queue, creating one if the thread has none. It reads
+/// through the window's message queue and adds no thread. Dropped on another thread, it stops
+/// when the window's thread next pumps its messages.
+pub(crate) struct Watch {
     hwnd: isize,
     /// The address of the `Subclass`, which the window's thread owns.
     id: usize,
@@ -72,6 +64,14 @@ pub struct DisplayWatch {
 static STOP: LazyLock<u32> =
     // SAFETY: a plain call with a constant name.
     LazyLock::new(|| unsafe { RegisterWindowMessageW(w!("orr display watch stop")) });
+
+static MESSAGE_HOOK: OnceLock<fn(u32)> = OnceLock::new();
+
+/// Calls `hook` with every message of every watched window, once per watch of the window,
+/// before the window handles it, on that window's thread. The first hook set stays.
+pub fn set_message_hook(hook: fn(u32)) {
+    let _ = MESSAGE_HOOK.set(hook);
+}
 
 /// The watch's state on the window's thread, freed there by the `stop` message or when the
 /// window is destroyed. Its address is the id of the subclass and of the timer, so two watches
@@ -107,16 +107,6 @@ impl Reader {
             }
         }
     }
-}
-
-/// `new` keeping the last SDR white while it stays within `SDR_WHITE_TOLERANCE` of `new`'s.
-fn steady(last: DisplayInfo, mut new: DisplayInfo) -> DisplayInfo {
-    if let (Some(old), Some(white)) = (last.sdr_white_nits, new.sdr_white_nits)
-        && (white - old).abs() <= SDR_WHITE_TOLERANCE * old
-    {
-        new.sdr_white_nits = last.sdr_white_nits;
-    }
-    new
 }
 
 windows_core::link!("ntdll.dll" "system" fn RtlDllShutdownInProgress() -> u8);
@@ -159,10 +149,10 @@ impl ThreadSetup {
     }
 }
 
-impl DisplayWatch {
-    pub fn new(window: RawWindowHandle) -> Result<(Self, DisplayFeed)> {
+impl Watch {
+    pub(crate) fn new(window: RawWindowHandle) -> Result<(Self, DisplayFeed)> {
         let RawWindowHandle::Win32(handle) = window else {
-            return Err(Error::NotWin32Window);
+            return Err(Error::UnsupportedWindow);
         };
         let hwnd = HWND(handle.hwnd.get() as *mut c_void);
         // SAFETY: plain queries; a stale window reads as another thread's.
@@ -229,7 +219,7 @@ impl DisplayWatch {
     }
 }
 
-impl Drop for DisplayWatch {
+impl Drop for Watch {
     fn drop(&mut self) {
         // This runs at once on the window's thread and does not wait on another: the window's
         // thread may be waiting for this one. A destroyed window has freed the subclass already.
@@ -300,14 +290,15 @@ unsafe extern "system" fn subclass_proc(
             return DefSubclassProc(hwnd, msg, wparam, lparam);
         }
     }
+    if let Some(hook) = MESSAGE_HOOK.get() {
+        hook(msg);
+    }
     match msg {
         WM_DISPLAYCHANGE | WM_SETFOCUS => subclass.reader.update(&subclass.info),
         WM_TIMER if wparam.0 == id => {
             subclass.reader.update(&subclass.info);
             return LRESULT(0);
         }
-        #[cfg(feature = "pcl-stats")]
-        m if crate::pcl_stats::is_ping(m) => crate::pcl_stats::ping(),
         WM_WINDOWPOSCHANGED => {
             // SAFETY: `hwnd` is the live subclassed window.
             let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
@@ -381,6 +372,7 @@ impl AdvancedColor {
             max_full_frame_nits: positive(self.max_full_frame_nits),
             min_nits: (self.min_nits.is_finite() && self.min_nits >= 0.0).then_some(self.min_nits),
             sdr_white_nits: positive(self.sdr_white_nits),
+            headroom: None,
             refresh_hz: refresh_hz.and_then(positive),
             primaries_xy: primaries_known.then_some(self.primaries_xy),
         }
@@ -456,22 +448,6 @@ fn until_nul(s: &[u16]) -> &[u16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sdr_white_stays_through_small_changes_only() {
-        let with = |nits: f32| DisplayInfo {
-            os_hdr_on: Some(true),
-            sdr_white_nits: Some(nits),
-            ..DisplayInfo::default()
-        };
-        assert_eq!(steady(with(200.0), with(201.0)), with(200.0));
-        assert_eq!(steady(with(200.0), with(203.0)), with(203.0));
-        assert_eq!(
-            steady(DisplayInfo::default(), with(200.0)),
-            with(200.0),
-            "a first reading stands"
-        );
-    }
 
     #[test]
     fn advanced_color_mapping_on_captured_values() {

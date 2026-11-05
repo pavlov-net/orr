@@ -84,15 +84,13 @@ fn hook(frame_id: u64, marker: LatencyMarker) {
     }
 }
 
-/// True for the PC latency ping message.
-pub(crate) fn is_ping(message: u32) -> bool {
+/// Marks a PC latency ping on the next frame when `message` is the ping; the display watches'
+/// hook for every message of their windows.
+fn on_message(message: u32) {
     // SAFETY: reads the registered message id.
-    unsafe { orr_pcl_stats_is_ping(message) }
-}
-
-/// Marks a PC latency ping on the next frame.
-pub(crate) fn ping() {
-    PING.arrived();
+    if unsafe { orr_pcl_stats_is_ping(message) } {
+        PING.arrived();
+    }
 }
 
 /// PCL Stats for one swapchain's markers. The provider and its ping thread live while any
@@ -103,6 +101,7 @@ pub(crate) struct Session {
 
 impl Session {
     pub(crate) fn start(latency: &LowLatency) -> Self {
+        orr_window::set_message_hook(on_message);
         let mut sessions = SESSIONS.lock().unwrap();
         if *sessions == 0 {
             // SAFETY: init and shutdown run under `SESSIONS`, balanced.

@@ -4,7 +4,7 @@
 use std::num::NonZeroIsize;
 use std::time::{Duration, Instant};
 
-use orr_output::{DisplayFeed, DisplayWatch};
+use orr_window::{DisplayFeed, DisplayWatch};
 use raw_window_handle::{RawWindowHandle, Win32WindowHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;

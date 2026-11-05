@@ -16,6 +16,14 @@ pub const PQ_MAX_NITS: f64 = 10000.0;
 /// divided by this.
 pub const SCRGB_WHITE_NITS: f64 = 80.0;
 
+/// The luminance macOS gives EDR 1.0, its screens' SDR white, when it maps PQ content, which
+/// HDR10 metadata states as its optical output scale. macOS reports a screen's range in EDR
+/// values, which this turns into nits. macOS doesn't document it; gpu_suite's `edr_reference`
+/// example measures it. On an M5 MacBook's built-in screen (macOS 27.0.1), SDR white fell
+/// between its 90 and 100 nit PQ bars without HDR10 metadata, and between its 100 and 110 nit
+/// bars with it; the photos' own spread is about as large.
+pub const EDR_REFERENCE_NITS: f64 = 100.0;
+
 /// The sRGB transfer function (IEC 61966-2-1), linear to non-linear. Values below 0 stay on
 /// the linear segment.
 pub fn srgb_encode(linear: f64) -> f64 {

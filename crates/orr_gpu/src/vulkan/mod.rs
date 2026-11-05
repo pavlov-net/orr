@@ -42,5 +42,5 @@ pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{HostTimeline, Queue};
 pub use ray::RayDispatchPipeline;
 pub use sparse::{SparseAllocation, SparseBinds};
-pub use swapchain::{LowLatency, Swapchain, SwapchainFrame};
+pub use swapchain::{LowLatency, Swapchain, SwapchainFrame, WindowExtent};
 pub use texture::Texture;

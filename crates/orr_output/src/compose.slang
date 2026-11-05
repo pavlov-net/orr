@@ -28,7 +28,7 @@ struct Root
     uint height;
     uint source_kind;
     uint encoding;
-    float paper_white_nits;
+    float signal_white_nits;
     // `scene_referred` converts to Rec.709.
     uint rec709;
     uint _pad0;
@@ -40,10 +40,10 @@ ORR_ROOT(Root);
 // A display capture holds what the display shows: the signal decoded, unquantized.
 void write(uint2 id, float3 linear)
 {
-    float3 signal = encode_display(linear, root.encoding, root.paper_white_nits);
+    float3 signal = encode_display(linear, root.encoding, root.signal_white_nits);
     if (root.capture != nullptr)
         root.capture[id.y * root.width + id.x] =
-            float4(decode_display(signal, root.encoding, root.paper_white_nits), 1.0);
+            float4(decode_display(signal, root.encoding, root.signal_white_nits), 1.0);
     else
         root.target.get<RWTexture2D<float4>>()[id.xy] = float4(signal, 1.0);
 }
@@ -78,7 +78,7 @@ void main(uint3 id: SV_DispatchThreadID)
             return;
         }
         linear = root.source_kind == SOURCE_ENCODED
-            ? decode_display(texel.rgb, root.encoding, root.paper_white_nits)
+            ? decode_display(texel.rgb, root.encoding, root.signal_white_nits)
             : texel.rgb;
     }
     if (any(ui != 0.0))

@@ -1,4 +1,4 @@
-//! The example on Windows, the one target with a test window ([`gpu_suite::window`]).
+//! The example on the targets with a test window ([`gpu_suite::window`]).
 
 use std::time::{Duration, Instant};
 
@@ -185,7 +185,7 @@ pub(super) fn main() {
                 ui.add_space(extent[1] as f32 / 4.0 + 8.0);
                 let text = format!(
                     "{:?}  paper white {:.0}  peak {:.0}  black {:.3} nits\n\
-                     OS: HDR {:?}, SDR white {:?}, max {:?}, min {:?}, {:?} Hz\n\
+                     OS: HDR {:?}, SDR white {:?}, max {:?}, min {:?}, headroom {:?}, {:?} Hz\n\
                      pattern {pattern:?}",
                     resolved.encoding,
                     resolved.paper_white_nits,
@@ -195,6 +195,7 @@ pub(super) fn main() {
                     info.sdr_white_nits,
                     info.max_nits,
                     info.min_nits,
+                    info.headroom.map(|h| h.current),
                     info.refresh_hz,
                 );
                 ui.label(RichText::new(text).size(18.0).color(Color32::WHITE));

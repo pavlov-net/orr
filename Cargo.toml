@@ -28,6 +28,7 @@ orr_memory = { path = "crates/orr_memory", version = "0.0.1" }
 orr_pack = { path = "crates/orr_pack" }
 orr_scene = { path = "crates/orr_scene" }
 orr_shaders = { path = "crates/orr_shaders" }
+orr_window = { path = "crates/orr_window" }
 lighting_suite = { path = "tests/lighting_suite" }
 gpu_suite = { path = "tests/gpu_suite" }
 openpbr_ref = { path = "tests/openpbr_ref" }
@@ -64,6 +65,13 @@ vulkan-memory-allocator-sys = "0.2.0"
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-metal = "0.3.2"
+objc2-app-kit = "0.3.2"
+objc2-quartz-core = "0.3.2"
+objc2-core-graphics = "0.3.2"
+objc2-core-foundation = "0.3.2"
+raw-window-metal = "1.1.0"
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
 
 cc = "1.10"
 bindgen = { version = "0.72.1", default-features = false, features = ["runtime"] }

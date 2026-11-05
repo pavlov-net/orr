@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use bytemuck::{Pod, Zeroable};
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
@@ -295,9 +295,7 @@ impl CommandList<'_> {
             self.barrier(Stages::COMPUTE, Stages::ALL, Hazards::DRAW_ARGUMENTS);
         }
         self.end_encoder();
-        let e = self
-            .buffer
-            .renderCommandEncoderWithDescriptor(&pass.desc)
+        let e = autoreleasepool(|_| self.buffer.renderCommandEncoderWithDescriptor(&pass.desc))
             .expect("renderCommandEncoderWithDescriptor");
         self.open_barrier(ProtocolObject::from_ref(&*e));
         // orr's clip space has +y pointing down the target, Metal's up: the viewport flips it.

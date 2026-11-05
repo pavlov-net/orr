@@ -2,8 +2,6 @@
 //! target, frame generation and presentation.
 
 mod display;
-#[cfg(windows)]
-mod display_watch;
 #[cfg(dlss)]
 mod dlss;
 mod dof;
@@ -31,11 +29,7 @@ mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
 }
 
-pub use display::{
-    CalibrationPattern, DisplayFeed, DisplayInfo, DisplayRequest, PatternLevels, ResolvedDisplay,
-};
-#[cfg(windows)]
-pub use display_watch::DisplayWatch;
+pub use display::{CalibrationPattern, DisplayRequest, PatternLevels, ResolvedDisplay};
 pub use dof::{DepthOfFieldPass, DofGuideImages, DofHoleMask, DofPath};
 pub use exposure::{
     AutoExposure, CompensationCurve, Exposure, ExposureTelemetry, Grade, LocalExposure, MID_GRAY,
@@ -56,6 +50,7 @@ pub use orr_color::Primaries;
 #[cfg(dlss)]
 pub use orr_dlss::{self, DlssSdk, Support as DlssSupport};
 pub use orr_scene::orr_gpu::{LowLatency, OutputFormat};
+pub use orr_window::{self, DisplayFeed, DisplayHeadroom, DisplayInfo, DisplayWatch};
 pub use overlay_front::OverlayFront;
 pub use passes::{
     CapturePass, ComposePass, ComposeRoot, ComposeSource, ExposurePass, HookInputsPass,
@@ -76,8 +71,6 @@ pub use white_balance::{AutoWhiteBalance, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV};
 pub enum Error {
     #[error(transparent)]
     Gpu(#[from] orr_scene::orr_gpu::Error),
-    #[error("the window handle is not a Win32 window")]
-    NotWin32Window,
     #[error("present thread: {0}")]
     Thread(String),
     #[cfg(dlss)]
@@ -88,12 +81,8 @@ pub enum Error {
     FrameGenerationUnavailable(&'static str),
     #[error("frame generation mode {0:?} is out of range for this device")]
     FrameGenerationMode(FrameGenerationMode),
-    #[cfg(windows)]
-    #[error("a display watch must be made on the thread that owns the window")]
-    NotWindowThread,
-    #[cfg(windows)]
-    #[error("display watch: {0}")]
-    Windows(#[from] windows_core::Error),
+    #[error(transparent)]
+    Window(#[from] orr_window::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

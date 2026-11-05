@@ -2,7 +2,7 @@ use std::any::Any;
 use std::sync::atomic::Ordering;
 
 use bytemuck::Pod;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
@@ -203,9 +203,7 @@ impl<'q> CommandList<'q> {
             return e.clone();
         }
         self.end_encoder();
-        let e = self
-            .buffer
-            .computeCommandEncoder()
+        let e = autoreleasepool(|_| self.buffer.computeCommandEncoder())
             .expect("computeCommandEncoder");
         self.open_barrier(ProtocolObject::from_ref(&*e));
         e.setArgumentTable(Some(&self.table));

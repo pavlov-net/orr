@@ -29,8 +29,8 @@ pub use chromaticity::{Chromaticity, cat16_rec2020, cie_xyz, delta_uv_1976, uv_1
 pub use luminance::{LUMINOUS_EFFICACY, luminance};
 pub use primaries::{Primaries, RgbPrimaries, rec709_to_rec2020};
 pub use transfer::{
-    PQ_MAX_NITS, SCRGB_WHITE_NITS, hlg_decode, hlg_encode, pq_decode, pq_encode, srgb_decode,
-    srgb_encode,
+    EDR_REFERENCE_NITS, PQ_MAX_NITS, SCRGB_WHITE_NITS, hlg_decode, hlg_encode, pq_decode,
+    pq_encode, srgb_decode, srgb_encode,
 };
 
 /// The import root of the crate's Slang modules (`orr_color.*`).

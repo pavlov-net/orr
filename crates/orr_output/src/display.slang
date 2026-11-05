@@ -1,5 +1,6 @@
 // Display encodings: display-linear Rec.709 (1.0 = paper white) to the signal a swapchain
-// image of each `OutputFormat` holds, and back.
+// image of each `OutputFormat` holds, and back. `signal_white_nits` is paper white's level in
+// the encoding's nits.
 module display;
 
 import orr_color.primaries;
@@ -9,20 +10,20 @@ public static const uint ENCODING_SDR = 0;
 public static const uint ENCODING_PQ = 1;
 public static const uint ENCODING_SCRGB = 2;
 
-public float3 encode_display(float3 linear, uint encoding, float paper_white_nits)
+public float3 encode_display(float3 linear, uint encoding, float signal_white_nits)
 {
     if (encoding == ENCODING_PQ)
-        return pq_encode(mul(REC709_TO_REC2020, linear) * paper_white_nits);
+        return pq_encode(mul(REC709_TO_REC2020, linear) * signal_white_nits);
     if (encoding == ENCODING_SCRGB)
-        return linear * (paper_white_nits / SCRGB_WHITE_NITS);
+        return linear * (signal_white_nits / SCRGB_WHITE_NITS);
     return srgb_encode(saturate(linear));
 }
 
-public float3 decode_display(float3 signal, uint encoding, float paper_white_nits)
+public float3 decode_display(float3 signal, uint encoding, float signal_white_nits)
 {
     if (encoding == ENCODING_PQ)
-        return mul(REC2020_TO_REC709, pq_decode(signal)) / paper_white_nits;
+        return mul(REC2020_TO_REC709, pq_decode(signal)) / signal_white_nits;
     if (encoding == ENCODING_SCRGB)
-        return signal * (SCRGB_WHITE_NITS / paper_white_nits);
+        return signal * (SCRGB_WHITE_NITS / signal_white_nits);
     return srgb_decode(signal);
 }

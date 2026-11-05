@@ -1,4 +1,4 @@
-//! The example on Windows, the one target with a test window ([`gpu_suite::window`]).
+//! The example on the targets with a test window ([`gpu_suite::window`]).
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};

@@ -26,11 +26,11 @@ export __extern_cpp void orr_gt7_display_linear(Gt7Curve* curve, float* rgb, flo
     }
 }
 
-export __extern_cpp void orr_encode_display(float* rgb, float* out, uint count, uint encoding, float paper_white_nits)
+export __extern_cpp void orr_encode_display(float* rgb, float* out, uint count, uint encoding, float signal_white_nits)
 {
     for (uint i = 0; i < count; i++)
     {
-        float3 o = encode_display(float3(rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]), encoding, paper_white_nits);
+        float3 o = encode_display(float3(rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]), encoding, signal_white_nits);
         out[3 * i] = o.x;
         out[3 * i + 1] = o.y;
         out[3 * i + 2] = o.z;

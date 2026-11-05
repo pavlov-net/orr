@@ -23,6 +23,7 @@ orr_math.workspace = true
 orr_color.workspace = true
 orr_scene.workspace = true
 orr_shaders.workspace = true
+orr_window.workspace = true
 raw-window-handle.workspace = true
 bytemuck.workspace = true
 thiserror.workspace = true
@@ -39,23 +40,10 @@ orr_shaders = { workspace = true, features = ["build"] }
 orr_dlss = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-core = "0.62.2"
 windows = { version = "0.62.2", features = [
-  "Foundation",
-  "Graphics_Display",
-  "System",
-  "Win32_Devices_Display",
   "Win32_Foundation",
-  "Win32_Graphics_Gdi",
-  "Win32_System_Threading",
-  "Win32_System_WinRT",
-  "Win32_UI_Shell",
-  "Win32_UI_WindowsAndMessaging",
   "Wdk_Graphics_Direct3D",
 ] }
-
-[target.'cfg(windows)'.dev-dependencies]
-windows = { version = "0.62.2", features = ["Win32_System_LibraryLoader"] }
 
 [lints]
 workspace = true
