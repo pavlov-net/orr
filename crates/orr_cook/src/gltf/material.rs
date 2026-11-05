@@ -32,7 +32,7 @@ use orr_pack::material::Material;
 use serde_json::Value;
 
 use crate::texture::Wrap;
-use crate::texture::material::{MaterialTextures, TexRef};
+use crate::texture::material::{ImageRules, MaterialTextures, TexRef};
 
 fn num(v: &Value, k: &str, d: f32) -> f32 {
     v.get(k).and_then(Value::as_f64).map_or(d, |x| x as f32)
@@ -206,6 +206,7 @@ pub(super) fn textures(
         let s = t.sampler();
         Ok(TexRef {
             image: t.source().index(),
+            rules: ImageRules::Gltf,
             channel,
             uv_set: coord as u8,
             wrap: [wrap(s.wrap_s()), wrap(s.wrap_t())],

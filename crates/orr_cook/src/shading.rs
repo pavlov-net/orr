@@ -47,7 +47,7 @@ use orr_math::{Affine2, Vec2};
 use orr_pack::material::Material;
 
 use crate::texture::Wrap;
-use crate::texture::material::{ImageData, ImageFile, MaterialTextures, TexRef};
+use crate::texture::material::{ImageData, ImageFile, ImageRules, MaterialTextures, TexRef};
 
 /// A shading network: nodes and the connections between their inputs and outputs.
 #[derive(Default)]
@@ -202,6 +202,7 @@ enum Channels {
 #[derive(Copy, Clone)]
 struct Tex {
     image: usize,
+    rules: ImageRules,
     channels: Channels,
     uv_set: u8,
     wrap: [Wrap; 2],
@@ -222,6 +223,7 @@ impl Tex {
             rg_channel: None,
             uv: slot_transform(self.uv),
             image: self.image,
+            rules: self.rules,
             channel: self.channel() as u8,
             uv_set: self.uv_set,
             wrap: self.wrap,
@@ -581,6 +583,7 @@ impl Mapper<'_, '_> {
         }
         Ok(Tex {
             image: *image,
+            rules: ImageRules::MaterialX,
             channels: Channels::Rgb,
             uv_set,
             wrap,
@@ -619,6 +622,7 @@ impl Mapper<'_, '_> {
         let (uv_set, uv) = self.texcoord(n, "st", (0, fixed(Vec2::ZERO)))?;
         Ok(Tex {
             image: *image,
+            rules: ImageRules::Usd,
             channels: Channels::Rgb,
             uv_set,
             wrap,
@@ -633,6 +637,7 @@ impl Mapper<'_, '_> {
     fn solid(&mut self, rgb: [f32; 3]) -> Tex {
         Tex {
             image: (self.host.solid)(rgb),
+            rules: ImageRules::Usd,
             channels: Channels::Rgb,
             uv_set: 0,
             wrap: [Wrap::Repeat; 2],

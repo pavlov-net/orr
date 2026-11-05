@@ -359,13 +359,15 @@ struct NormalSource {
     rg: bool,
     /// Components are stored as they are, not at `0.5 v + 0.5`.
     signed: bool,
+    /// The texel channel holding y.
+    y: usize,
 }
 
 impl NormalSource {
     /// The normal of texel `t`. Without a stored z it is rebuilt as the shader rebuilds it.
     fn read(self, t: [f32; 4]) -> [f32; 3] {
         let component = |v: f32| if self.signed { v } else { 2.0 * v - 1.0 };
-        let [x, y] = [component(t[0]), component(t[1])];
+        let [x, y] = [component(t[0]), component(t[self.y])];
         let z = if self.rg {
             normal::z(x, y)
         } else {
@@ -385,7 +387,11 @@ fn stores_normals(layers: &[Img], rg: bool) -> bool {
         let finite = |p: &&[f32; 4]| p[..3].iter().all(|v| v.is_finite());
         layers.iter().flat_map(|l| &l.px).filter(finite)
     };
-    let [kept, moved] = [true, false].map(|signed| NormalSource { rg: false, signed });
+    let [kept, moved] = [true, false].map(|signed| NormalSource {
+        rg: false,
+        signed,
+        y: 1,
+    });
     if rg {
         let outside = |s: NormalSource| {
             let beyond = |p: &&[f32; 4]| {
@@ -590,6 +596,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
     let source = NormalSource {
         rg: src.rg,
         signed: src.signed || (normal && src.float && stores_normals(&src.layers, src.rg)),
+        y: 1,
     };
     let linear = |p: &mut [f32; 4]| {
         if color && srgb {

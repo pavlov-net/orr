@@ -18,6 +18,14 @@ use rayon::prelude::*;
 
 use super::{Img, Primaries};
 
+/// What a gray file holds, whose decoded texels spread the gray over RGB.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum Gray {
+    No,
+    Alone,
+    WithAlpha,
+}
+
 /// A decoded image file.
 pub(super) struct Source {
     /// Mip 0 of each layer, values as stored: unorm data in 0..1, snorm data in -1..1, floats
@@ -38,6 +46,7 @@ pub(super) struct Source {
     pub(super) signed: bool,
     /// The file stores floats, whose range no format of fixed span holds.
     pub(super) float: bool,
+    pub(super) gray: Gray,
 }
 
 pub(super) struct Blocks {
@@ -274,6 +283,7 @@ impl<'a> Ktx2Blocks<'a> {
             rg: two_channels(self.vk_format()),
             signed: signed_blocks(self.vk_format()),
             float: float_blocks(self.vk_format()),
+            gray: Gray::No,
             blocks: Some(Blocks {
                 vk_format: self.vk_format(),
                 w: h.pixel_width,
@@ -438,6 +448,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
             rg: two_channels(vk_format),
             signed: signed_blocks(vk_format),
             float: float_blocks(vk_format),
+            gray: Gray::No,
         });
     }
     // Uncompressed: ctt converts to f32 RGBA in the file's color space. Read as straight alpha
@@ -490,6 +501,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
         rg: format.channel_count() == Some(2),
         signed: is_snorm(format),
         float: is_float(format),
+        gray: Gray::No,
     })
 }
 
@@ -554,6 +566,12 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
             t => return Err(format!("PNG cICP transfer function {t} is not supported")),
         };
     }
+    use image::ColorType as C;
+    let gray = match img.color() {
+        C::L8 | C::L16 => Gray::Alone,
+        C::La8 | C::La16 => Gray::WithAlpha,
+        _ => Gray::No,
+    };
     let rgba = img.to_rgba32f();
     let (w, h) = rgba.dimensions();
     let px = rgba
@@ -570,6 +588,7 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
         rg: false,
         signed: false,
         float: hdr,
+        gray,
     })
 }
 
