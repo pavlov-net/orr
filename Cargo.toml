@@ -58,7 +58,7 @@ egui = { version = "0.37", default-features = false }
 io-uring = "0.7.15"
 libc = "0.2"
 # bindgen's generated dynamic loader calls this version's `Library::new`.
-libloading = "0.8"
+libloading = "0.9"
 windows = "0.62.2"
 vulkan-memory-allocator-sys = "0.2.0"
 # Metal
@@ -74,7 +74,7 @@ block2 = "0.6.2"
 dispatch2 = "0.3.1"
 
 cc = "1.10"
-bindgen = { version = "0.72.1", default-features = false, features = ["runtime"] }
+bindgen = { version = "0.73.2", default-features = false, features = ["runtime"] }
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_qualifications = "warn"
