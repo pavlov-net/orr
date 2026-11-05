@@ -1510,7 +1510,7 @@ fn a_selected_model_needs_no_inverse_of_its_node() {
 /// the skeleton's matrices take their bind-space vertices to where the nodes put them.
 #[test]
 fn rigid_meshes_follow_joints_with_a_flattened_rest_pose() {
-    use orr_math::{Mat4, Quat, Vec3};
+    use orr_math::{Affine3, Mat4, Vec3};
     let d = dir("gltf-skin-flat");
     let path = d.join("scene.glb");
     let mut g = Glb::default();
@@ -1535,32 +1535,29 @@ fn rigid_meshes_follow_joints_with_a_flattened_rest_pose() {
     let e = a.find(AssetId::from_name("g/skeleton")).unwrap();
     let sk = orr_pack::skeleton::SkeletonInfo::parse(&read(&a, &a.blobs(e)[0])).unwrap();
     assert_eq!(sk.names, ["root", "hip"]);
-    let local = |j: usize| {
-        let r = &sk.rest[j];
-        Mat4::from_scale_rotation_translation(
-            r.scale.into(),
-            Quat::from_array(r.rotation),
-            r.translation.into(),
-        )
-    };
-    let skinning = |world: Mat4, j: usize| world * Mat4::from(sk.inverse_binds[j]);
-    let root = skinning(local(0), 0);
-    let hip = skinning(local(0) * local(1), 1);
-    let t = Mat4::from_translation;
-    let scene = Mat4::from_scale(Vec3::new(2.0, 2.0, 0.0));
     let c = mesh_of(&a, "g/mesh", 0);
     let got = corners(&c);
-    for (skin, world) in [
-        (hip, scene * t(Vec3::X) * t(Vec3::Y)),
-        (root, scene * t(Vec3::Z * 5.0)),
-    ] {
-        for p in TRIANGLE.map(Vec3::from) {
-            let want = world.transform_point3(p);
-            assert!(
-                got.iter()
-                    .any(|&b| skin.transform_point3(b).abs_diff_eq(want, 1e-3)),
-                "{want} not reached from {got:?}"
-            );
+    let t = Mat4::from_translation;
+    // The flat rest pose, and a pose that unflattens the root: the depth comes back.
+    for scale in [[2.0, 2.0, 0.0], [2.0, 2.0, 2.0]] {
+        let mut pose = sk.rest.clone();
+        pose[0].scale = scale;
+        let (mut model, mut palette) = (vec![Affine3::IDENTITY; 2], vec![Affine3::IDENTITY; 2]);
+        sk.model_pose(&pose, &mut model);
+        sk.palette(&model, &mut palette);
+        let scene = Mat4::from_scale(scale.into());
+        for (skin, world) in [
+            (palette[1], scene * t(Vec3::X) * t(Vec3::Y)),
+            (palette[0], scene * t(Vec3::Z * 5.0)),
+        ] {
+            for p in TRIANGLE.map(Vec3::from) {
+                let want = world.transform_point3(p);
+                assert!(
+                    got.iter()
+                        .any(|&b| skin.transform_point3(b).abs_diff_eq(want, 1e-3)),
+                    "{scale:?}: {want} not reached from {got:?}"
+                );
+            }
         }
     }
 }

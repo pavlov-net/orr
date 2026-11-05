@@ -160,6 +160,7 @@ impl Skeleton {
             .map(|(j, &n)| (n, j as u16))
             .collect();
         let mut info = SkeletonInfo {
+            root: Affine3::IDENTITY,
             parents: Vec::with_capacity(nodes.len()),
             rest: Vec::with_capacity(nodes.len()),
             inverse_binds: Vec::with_capacity(nodes.len()),
@@ -175,8 +176,9 @@ impl Skeleton {
             info.parents
                 .push(graph.parent[n].map_or(NO_PARENT, |p| joint_of[&p]));
             info.rest.push(rest(&node)?);
-            // Without an inverse, the identity is a bind that still poses what `attach` hangs
-            // on the joint: its space is the bind space.
+            // Without an inverse, the identity is a bind that poses what `attach` hangs on the
+            // joint: its space is the bind space, which keeps the depth a flat rest pose hides
+            // for a pose that unflattens the joint.
             let ib = bind.get(&n).copied().unwrap_or_else(|| {
                 if collapses(Mat3::from_mat4(world).as_dmat3()) {
                     Mat4::IDENTITY
@@ -471,15 +473,9 @@ fn span(channels: &[Channel]) -> (f64, f64) {
 }
 
 /// Translation distance (m) and rotation angle (degrees) between two transforms; the
-/// rotations are their linear parts with normalized columns.
+/// rotations are the frames of their linear parts, which a collapsed axis still completes.
 fn pose_error(a: &Affine3, b: &Affine3) -> (f32, f32) {
-    let rot = |m: &Affine3| {
-        Mat3::from_cols(
-            m.matrix3.x_axis.normalize_or_zero(),
-            m.matrix3.y_axis.normalize_or_zero(),
-            m.matrix3.z_axis.normalize_or_zero(),
-        )
-    };
+    let rot = |m: &Affine3| Mat3::from_quat(scale_rotation(m.matrix3).1.normalize());
     let d = rot(a).transpose() * rot(b);
     let cos = ((d.x_axis.x + d.y_axis.y + d.z_axis.z - 1.0) / 2.0).clamp(-1.0, 1.0);
     (
@@ -588,7 +584,7 @@ impl Channel {
     }
 }
 
-/// The per-axis scale and rotation of `l`, if it has them. A mirror is a negative z scale, and
+/// The per-axis scale and rotation of `l`, if it has them. A mirror is a negative x scale, and
 /// a column of zeros takes the direction that completes the frame.
 fn scale_rotation(l: Mat3) -> (Vec3, Quat) {
     let cols = [l.x_axis, l.y_axis, l.z_axis];
@@ -606,12 +602,19 @@ fn scale_rotation(l: Mat3) -> (Vec3, Quat) {
             };
         }
     }
-    let [x, y, mut z] = frame;
+    let [mut x, y, z] = frame;
     if x.cross(y).dot(z) < 0.0 {
-        scale.z = -scale.z;
-        z = -z;
+        scale.x = -scale.x;
+        x = -x;
     }
     (scale, Quat::from_mat3(&Mat3::from_cols(x, y, z)))
+}
+
+/// The scale, rotation and translation of `m`, `None` if it shears.
+pub(crate) fn decompose(m: Mat4) -> Option<(Vec3, Quat, Vec3)> {
+    let (s, r) = scale_rotation(Mat3::from_mat4(m));
+    let t = m.w_axis.truncate();
+    close(&m, &Mat4::from_scale_rotation_translation(s, r, t)).then_some((s, r, t))
 }
 
 /// A node's local transform as translation, rotation and scale; a matrix must decompose
@@ -619,15 +622,12 @@ fn scale_rotation(l: Mat3) -> (Vec3, Quat) {
 fn rest(node: &gltf::Node<'_>) -> Result<Trs, String> {
     let (t, r, s) = match node.transform() {
         gltf::scene::Transform::Matrix { matrix } => {
-            let m = Mat4::from_cols_array_2d(&matrix);
-            let (s, r) = scale_rotation(Mat3::from_mat4(m));
-            let t = m.w_axis.truncate();
-            if !close(&m, &Mat4::from_scale_rotation_translation(s, r, t)) {
-                return Err(format!(
+            let (s, r, t) = decompose(Mat4::from_cols_array_2d(&matrix)).ok_or_else(|| {
+                format!(
                     "node {}: its matrix is not translation, rotation and scale, as skeleton nodes need",
                     node.index()
-                ));
-            }
+                )
+            })?;
             (t.to_array(), r.to_array(), s.to_array())
         }
         transform => transform.decomposed(),
@@ -640,7 +640,7 @@ fn rest(node: &gltf::Node<'_>) -> Result<Trs, String> {
     })
 }
 
-pub(crate) fn close(a: &Mat4, b: &Mat4) -> bool {
+fn close(a: &Mat4, b: &Mat4) -> bool {
     let tol = 1e-5 * a.to_cols_array().iter().fold(1.0f32, |m, v| m.max(v.abs()));
     a.to_cols_array()
         .iter()

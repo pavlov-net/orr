@@ -496,7 +496,11 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
         "{:?}",
         pose[1].translation
     );
-    let root = Quat::from_array(pose[0].rotation);
+    let mut model = vec![orr_math::Affine3::IDENTITY; 2];
+    skeleton.model_pose(&pose, &mut model);
+    let root = orr_math::Mat4::from(model[0])
+        .to_scale_rotation_translation()
+        .1;
     assert!(
         root.angle_between(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .to_degrees()
@@ -572,6 +576,280 @@ def Xform "World"
                 .any(|&c| placed.transform_point3(c.into()).abs_diff_eq(want, 1e-3)),
             "{want} not reached"
         );
+    }
+}
+
+const BIND_IDENTITY: &str = "((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))";
+const BIND_FLAT: &str = "((2, 0, 0, 0), (0, 2, 0, 0), (0, 0, 0, 0), (0, 0, 0, 1))";
+const BIND_ARM: &str = "((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 1, 0, 1))";
+
+/// Joints `Root` and `Root/Arm`, with `Root` animated; `rest` is the `restTransforms` line.
+fn rig(binds: [&str; 2], rest: &str) -> String {
+    let [root, arm] = binds;
+    format!(
+        r#"uniform token[] joints = ["Root", "Root/Arm"]
+        uniform matrix4d[] bindTransforms = [{root}, {arm}]
+        {rest}
+
+        def SkelAnimation "Slide"
+        {{
+            uniform token[] joints = ["Root"]
+            float3[] translations.timeSamples = {{
+                0: [(0, 0, 0)],
+                10: [(1, 0, 0)],
+            }}
+        }}"#
+    )
+}
+
+const SECOND_JOINT: &str = "[1, 1, 1]";
+
+/// Cooks a triangle whose points take joint indices `indices`, weighted 1: `xform` holds the
+/// `SkelRoot`'s transform attributes, `skeleton` the skeleton's and `mesh` more of the mesh's.
+fn bound_triangle(
+    name: &str,
+    xform: &str,
+    skeleton: &str,
+    indices: &str,
+    mesh: &str,
+) -> orr_cook::Result<(Archive, orr_cook::CookReport)> {
+    let path = dir(name).join("stage.usda");
+    std::fs::write(
+        &path,
+        format!(
+            r#"#usda 1.0
+(
+    metersPerUnit = 1
+    timeCodesPerSecond = 10
+    upAxis = "Y"
+)
+
+def SkelRoot "Hero"
+{{
+    {xform}
+
+    def Skeleton "Rig"
+    {{
+        {skeleton}
+    }}
+
+    def Mesh "Body"
+    {{
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 1)]
+        int[] primvars:skel:jointIndices = {indices} (
+            elementSize = 1
+            interpolation = "vertex"
+        )
+        float[] primvars:skel:jointWeights = [1, 1, 1] (
+            elementSize = 1
+            interpolation = "vertex"
+        )
+        rel skel:skeleton = </Hero/Rig>
+        {mesh}
+    }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    usd(&path, UsdSettings::default())
+}
+
+/// Skinned points land where UsdSkel puts them, `world * joint * inverse bind * point`, with
+/// the pseudo-inverse of a bind that has no inverse, and a skeleton world transform that no
+/// joint could hold.
+#[test]
+fn bound_vertices_land_where_the_stage_puts_them() {
+    use orr_math::{Affine3, Mat3, Mat4, Vec3};
+    let rest =
+        |root: &str, arm: &str| format!("uniform matrix4d[] restTransforms = [{root}, {arm}]");
+    let authored = rest(BIND_IDENTITY, BIND_ARM);
+    let landed = "((2, 0, 0, 0), (0, 2, 0, 0), (0, 0, 0, 0), (1, 0, 0, 1))";
+    let sheared = "((1, 0, 0, 0), (0, 1, 0, 0), (1, 1, 0, 0), (0, 0, 0, 1))";
+    let turned = "((0.70710678, 0.70710678, 0, 0), (-0.70710678, 0.70710678, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))";
+    let turned_arm = "((0.70710678, 0.70710678, 0, 0), (-0.70710678, 0.70710678, 0, 0), (0, 0, 1, 0), (-0.70710678, 0.70710678, 0, 1))";
+    let scale = |x, y, z| Mat4::from_scale(Vec3::new(x, y, z));
+    let up = Mat4::from_translation(Vec3::Y);
+    let half = scale(0.5, 0.5, 0.0);
+    let moved = r#"double3 xformOp:translate = (0, 0, 3)
+    uniform token[] xformOpOrder = ["xformOp:translate"]"#;
+    let squashed = r#"double3 xformOp:scale = (2, 2, 0)
+    uniform token[] xformOpOrder = ["xformOp:scale"]"#;
+    let stretched = r#"double3 xformOp:scale = (1, 2, 3)
+    uniform token[] xformOpOrder = ["xformOp:scale"]"#;
+    let third = Vec3::splat(1.0 / 3.0);
+    let sheared_inverse = Mat4::from_mat3(Mat3::from_cols(
+        third * Vec3::new(2.0, -1.0, 1.0),
+        third * Vec3::new(-1.0, 2.0, 1.0),
+        Vec3::ZERO,
+    ));
+    for (name, binds, rest, xform, want) in [
+        (
+            "usd-bind-landed",
+            [BIND_IDENTITY, landed],
+            rest(BIND_IDENTITY, landed),
+            "",
+            scale(1.0, 1.0, 0.0),
+        ),
+        (
+            "usd-bind-arm",
+            [BIND_IDENTITY, BIND_FLAT],
+            authored.clone(),
+            "",
+            up * half,
+        ),
+        (
+            "usd-bind-parent",
+            [BIND_FLAT, BIND_ARM],
+            String::new(),
+            "",
+            scale(1.0, 1.0, 0.0),
+        ),
+        (
+            "usd-bind-sheared",
+            [BIND_IDENTITY, sheared],
+            rest(BIND_IDENTITY, BIND_IDENTITY),
+            "",
+            sheared_inverse,
+        ),
+        (
+            "usd-bind-moved",
+            [BIND_IDENTITY, BIND_FLAT],
+            authored.clone(),
+            moved,
+            Mat4::from_translation(Vec3::Z * 3.0) * up * half,
+        ),
+        (
+            "usd-bind-squashed",
+            [BIND_IDENTITY, BIND_ARM],
+            authored.clone(),
+            squashed,
+            scale(2.0, 2.0, 0.0),
+        ),
+        (
+            "usd-bind-stretched",
+            [turned, turned_arm],
+            rest(turned, BIND_ARM),
+            stretched,
+            scale(1.0, 2.0, 3.0),
+        ),
+    ] {
+        let (a, _) = bound_triangle(name, xform, &rig(binds, &rest), SECOND_JOINT, "").unwrap();
+        // One second of linear motion needs nothing past the starting rate.
+        let slide = Clip::parse(
+            &blob(&a, "u/Hero/clip/Slide", 0),
+            &blob(&a, "u/Hero/clip/Slide", 1),
+        )
+        .unwrap();
+        assert_eq!(slide.header.frame_count, 31, "{name}");
+        let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+        let (mut model, mut palette) = (vec![Affine3::IDENTITY; 2], vec![Affine3::IDENTITY; 2]);
+        sk.model_pose(&sk.rest, &mut model);
+        sk.palette(&model, &mut palette);
+        let posed = triangles(&a, "u/Hero/mesh").1[0]
+            .0
+            .map(|p| palette[1].transform_point3(p.into()));
+        for p in [Vec3::ZERO, Vec3::X, Vec3::new(0.0, 1.0, 1.0)] {
+            let w = want.transform_point3(p);
+            assert!(
+                posed.iter().any(|g| g.abs_diff_eq(w, 1e-3)),
+                "{name}: {w} not among {posed:?}"
+            );
+        }
+    }
+}
+
+/// A joint's parent is its nearest listed ancestor, an animated scale of zero leaves the
+/// authored rotation in place, and an authored mirror stays on its axis.
+#[test]
+fn a_clip_keeps_a_zero_scale_keys_rotation_on_a_joint_past_a_gap() {
+    use orr_math::Vec3;
+    let skeleton = format!(
+        r#"uniform token[] joints = ["Root", "Root/Gap/Arm"]
+        uniform matrix4d[] bindTransforms = [{BIND_IDENTITY}, {BIND_ARM}]
+        uniform matrix4d[] restTransforms = [{BIND_IDENTITY}, ((-1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 1, 0, 1))]
+
+        def SkelAnimation "Vanish"
+        {{
+            uniform token[] joints = ["Root/Gap/Arm"]
+            quatf[] rotations.timeSamples = {{
+                0: [(0.7071068, 0.7071068, 0, 0)],
+                10: [(0.7071068, 0.7071068, 0, 0)],
+            }}
+            float3[] scales.timeSamples = {{
+                0: [(-1, 1, 1)],
+                10: [(0, 0, 0)],
+            }}
+        }}"#
+    );
+    let (a, _) = bound_triangle("usd-zero-scale", "", &skeleton, SECOND_JOINT, "").unwrap();
+    let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    assert_eq!(sk.parents[1], 0);
+    assert_eq!(sk.rest[1].scale, [-1.0, 1.0, 1.0]);
+    let clip = Clip::parse(
+        &blob(&a, "u/Hero/clip/Vanish", 0),
+        &blob(&a, "u/Hero/clip/Vanish", 1),
+    )
+    .unwrap();
+    let want = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    let mut pose = vec![Trs::IDENTITY; 2];
+    for (t, scale) in [(0.0, [-1.0, 1.0, 1.0]), (1.0, [0.0; 3])] {
+        clip.sample(t, &mut pose);
+        let q = Quat::from_array(pose[1].rotation);
+        assert!(q.angle_between(want).to_degrees() < 0.1, "{t}: {q}");
+        assert!(
+            Vec3::from(pose[1].scale).abs_diff_eq(scale.into(), 1e-5),
+            "{t}: {:?}",
+            pose[1].scale
+        );
+    }
+}
+
+/// OpenUSD fails a skin on a joint index outside the skeleton, and reads a
+/// `geomBindTransform` that is not a matrix as unset. An xform op of the wrong size and a
+/// skeleton with no finite world transform fail.
+#[test]
+fn bad_skin_attributes_read_as_openusd_reads_them() {
+    use orr_math::Vec3;
+    let skeleton = rig([BIND_IDENTITY, BIND_ARM], "");
+    let e = bound_triangle("usd-negative-joint", "", &skeleton, "[-1, 1, 1]", "")
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("joint index -1"), "{e}");
+    for attribute in [
+        "double[] primvars:skel:geomBindTransform = [1, 2, 3]",
+        "token primvars:skel:geomBindTransform = \"none\"",
+    ] {
+        let (a, _) =
+            bound_triangle("usd-typed-bind", "", &skeleton, SECOND_JOINT, attribute).unwrap();
+        let corners = triangles(&a, "u/Hero/mesh").1[0].0;
+        assert!(
+            corners
+                .iter()
+                .any(|&c| Vec3::from(c).abs_diff_eq(Vec3::X, 1e-3))
+        );
+    }
+    for (xform, want) in [
+        (
+            r#"double xformOp:translate = 1
+    uniform token[] xformOpOrder = ["xformOp:translate"]"#,
+            "xform op translate",
+        ),
+        (
+            r#"double3 xformOp:scale = (0, 1, 1)
+    uniform token[] xformOpOrder = ["!invert!xformOp:scale"]"#,
+            "not finite",
+        ),
+    ] {
+        let e = bound_triangle("usd-bad-xform", xform, &skeleton, SECOND_JOINT, "")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains(want), "{e}");
     }
 }
 

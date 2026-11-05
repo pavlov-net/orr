@@ -477,6 +477,7 @@ impl<'s> Importer<'s> {
                     let built = skel::Skel::build(
                         &self.reader(&self.nodes[node].prim),
                         self.nodes[node].world,
+                        self.root,
                     )?;
                     let root = b.root.expect("skeletal roots have prims");
                     skels.push((path.as_str().to_string(), built, root));
@@ -495,8 +496,8 @@ impl<'s> Importer<'s> {
             let skeleton = models[o].skeleton.map(|k| &skels[k].1);
             let (skin, transform) = match (models[o].skinned, self.skinned(i), skeleton) {
                 (true, true, Some(sk)) => {
-                    let (s, to_model) = sk.binding(&r, mesh.points.len())?;
-                    (Some(s), to_model)
+                    let (s, to_bind) = sk.binding(&r, mesh.points.len())?;
+                    (Some(s), to_bind)
                 }
                 (false, false, _) => (None, self.to_model(&models[o], i)?),
                 _ => return Err(format!("{path}: a skinned mesh outside a SkelRoot")),

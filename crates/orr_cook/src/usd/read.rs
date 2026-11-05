@@ -356,15 +356,15 @@ impl PrimReader<'_> {
                 _ => DMat4::from_rotation_z(deg(x)),
             };
             let op_m = match kind {
-                "translate" => DMat4::from_translation(DVec3::from_slice(&v)),
+                "translate" if v.len() == 3 => DMat4::from_translation(DVec3::from_slice(&v)),
                 "scale" if v.len() == 1 => DMat4::from_scale(DVec3::splat(v[0])),
-                "scale" => DMat4::from_scale(DVec3::from_slice(&v)),
-                "rotateX" => axis('X', v[0]),
-                "rotateY" => axis('Y', v[0]),
-                "rotateZ" => axis('Z', v[0]),
-                "orient" => DMat4::from_quat(quat(&v).normalize()),
-                "transform" => matrix(&v),
-                k if k.len() == 9 && k.starts_with("rotate") => {
+                "scale" if v.len() == 3 => DMat4::from_scale(DVec3::from_slice(&v)),
+                "rotateX" if v.len() == 1 => axis('X', v[0]),
+                "rotateY" if v.len() == 1 => axis('Y', v[0]),
+                "rotateZ" if v.len() == 1 => axis('Z', v[0]),
+                "orient" if v.len() == 4 => DMat4::from_quat(quat(&v).normalize()),
+                "transform" if v.len() == 16 => matrix(&v),
+                k if k.len() == 9 && k.starts_with("rotate") && v.len() == 3 => {
                     // rotateXYZ applies X first: the matrix is Z * Y * X.
                     let axes: Vec<char> = k[6..].chars().collect();
                     let mut r = DMat4::IDENTITY;

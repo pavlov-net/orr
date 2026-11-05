@@ -40,7 +40,7 @@ void palette(uint3 id: SV_DispatchThreadID)
     {
         float3x4 local = trs_affine(clip_sample(c, t, j));
         uint parent = skeleton_parent(k, j);
-        out[j] = parent == NO_PARENT ? local : affine_mul(out[parent], local);
+        out[j] = affine_mul(parent == NO_PARENT ? skeleton_root(k) : out[parent], local);
     }
     for (uint j = 0; j < joints; j++)
         out[j] = skeleton_palette(k, j, out[j]);

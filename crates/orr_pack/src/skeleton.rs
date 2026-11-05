@@ -1,7 +1,8 @@
 //! Skeleton class: one mount blob holding a [`SkeletonHeader`] and its tables ([`SkeletonInfo`]).
 //!
 //! Joints are ordered parents first. A joint's model-space transform is its parent's times
-//! its local transform ([`Trs`]); a root joint's parent is the model. The skinning matrix of
+//! its local transform ([`Trs`]); a root joint's parent is [`SkeletonInfo::root`], which unlike
+//! a joint may shear or collapse an axis. The skinning matrix of
 //! joint `j`, the palette entry that [`crate::mesh::skin`] and GPU skinning read, is
 //! `model[j] x inverse_binds[j]`: it moves a mesh vertex from the bind pose into the pose.
 //! Mesh joint indices index this skeleton.
@@ -37,6 +38,8 @@ pub struct SkeletonHeader {
     pub name_hashes: Span,
     /// [`Span`] per joint: byte offset and length of its UTF-8 name in the blob.
     pub names: Span,
+    /// Model space from the space of the root joints.
+    pub root: AffineRows,
 }
 
 /// A local transform: scale, then rotation, then translation. 40 B, f32 throughout.
@@ -102,6 +105,8 @@ pub fn name_hash(name: &str) -> u64 {
 /// A skeleton blob: the header and its tables.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SkeletonInfo {
+    /// Model space from the space of the root joints.
+    pub root: Affine3,
     pub parents: Vec<u16>,
     pub rest: Vec<Trs>,
     pub inverse_binds: Vec<Affine3>,
@@ -140,6 +145,7 @@ impl SkeletonInfo {
             })
             .collect::<Result<_>>()?;
         Ok(Self {
+            root: h.root.into(),
             parents,
             rest: table(blob, h.rest)?,
             inverse_binds: table::<AffineRows>(blob, h.inverse_binds)?
@@ -186,6 +192,7 @@ impl SkeletonInfo {
             inverse_binds,
             name_hashes,
             names,
+            root: self.root.into(),
         };
         out[..size_of::<SkeletonHeader>()].copy_from_slice(bytemuck::bytes_of(&h));
         out
@@ -207,7 +214,7 @@ impl SkeletonInfo {
         for (j, &p) in self.parents.iter().enumerate() {
             let local = locals[j].to_affine();
             out[j] = match p {
-                NO_PARENT => local,
+                NO_PARENT => self.root * local,
                 p => out[usize::from(p)] * local,
             };
         }

@@ -1,26 +1,31 @@
 //! UsdSkel: one `Skeleton`, the skin bindings of the meshes bound to it, and
 //! `SkelAnimation`s as its clips.
 //!
-//! Joints keep the skeleton's order, which must list parents first. Model space is the
-//! stage's (Y up, meters): root joints take the skeleton prim's world transform, inverse
-//! binds are those of the bind transforms in model space, and rest transforms come from
-//! `restTransforms` (from the bind transforms without them). Skinned points are
-//! `geomBindTransform` times the authored points in the skeleton's model space; the mesh
-//! prim's own transform is not used, as UsdSkel specifies. A mesh's `skel:joints` maps its
-//! joint indices to skeleton joints by name. An animation that names one of the joints is
-//! a clip, named after its prim (by its index among the skeleton's animations when the name
-//! is shared): at each time any of its attributes is sampled, the authored joints' local
-//! transforms, sampled linearly between those times (rotations by slerp).
+//! Joints keep the skeleton's order, which must list parents first; a joint's parent is its
+//! nearest ancestor path among them, a joint without one being a root. Model space is the
+//! stage's (Y up, meters): [`SkeletonInfo::root`] is the skeleton prim's world transform,
+//! inverse binds are those of the bind transforms in model space, and rest transforms come
+//! from `restTransforms` (from the bind transforms without them). A bind transform that
+//! collapses an axis takes its pseudo-inverse, so the points bound to it land on the surface
+//! it flattens to. Skinned points are `geomBindTransform` (unset if it is not a matrix) times
+//! the authored points in the skeleton's model space, or its own space in scene units and axes
+//! where the skeleton prim's world transform collapses an axis and has no inverse for the binds
+//! to undo; the mesh prim's own transform is not used, as UsdSkel specifies. A mesh's
+//! `skel:joints` maps its joint indices to skeleton joints by name. An animation that names one
+//! of the joints is a clip, named after its prim (by its index among the skeleton's animations
+//! when the name is shared): at each time any of its attributes is sampled, the authored
+//! joints' local transforms, sampled linearly between those times (rotations by slerp).
 
 use std::collections::HashMap;
 
 use openusd::usd;
-use orr_math::{Affine3, DMat4, DQuat, DVec3};
+use orr_math::{Affine3, DMat3, DMat4, DVec3, DVec4};
 use orr_pack::clip::Clip;
 use orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo, Trs};
 
 use super::mesh::Influence;
 use super::read::{PrimReader, matrix, quat};
+use crate::import::collapses;
 use crate::skin::{self, Channel, ClipSettings, Interpolation, Property};
 
 pub(super) struct Skel {
@@ -28,32 +33,62 @@ pub(super) struct Skel {
     /// Joint paths as the skeleton names them.
     joints: Vec<String>,
     by_name: HashMap<String, u16>,
-    /// Model space from skeleton space.
-    to_model: DMat4,
-    /// Rest local transforms, as matrices.
-    rest: Vec<DMat4>,
+    /// Bind space from skeleton space: model space if the skeleton's root has an inverse, else
+    /// the skeleton's space in scene units and axes.
+    to_bind: DMat4,
 }
 
-/// A transform as translation, rotation and scale; shear fails.
-fn trs(m: DMat4, what: &dyn Fn() -> String) -> Result<Trs, String> {
-    let (s, r, t) = m.to_scale_rotation_translation();
-    let back = DMat4::from_scale_rotation_translation(s, r, t);
-    if !skin::close(&m.as_mat4(), &back.as_mat4()) {
-        return Err(format!(
-            "{}: shear; joints need translation, rotation and scale",
-            what()
-        ));
-    }
-    Ok(Trs {
-        rotation: r.normalize().as_quat().to_array(),
-        translation: t.as_vec3().to_array(),
-        scale: s.as_vec3().to_array(),
+/// The path above joint path `joint`.
+fn above(joint: &str) -> Option<&str> {
+    joint.rsplit_once('/').map(|a| a.0)
+}
+
+/// A transform as translation, rotation and scale, `None` if it shears.
+fn trs(m: DMat4) -> Option<Trs> {
+    let (s, r, t) = skin::decompose(m.as_mat4())?;
+    Some(Trs {
+        rotation: r.normalize().to_array(),
+        translation: t.to_array(),
+        scale: s.to_array(),
     })
 }
 
+/// The Moore-Penrose inverse of rank-deficient `l`, from the characteristic polynomial of
+/// `l^T l` (Decell, 1965). The second invariant separates ranks 2 and 1 at the bound on
+/// singular values that [`collapses`] sets on volume, squared as `l^T l` squares them.
+fn pseudo_inverse(l: DMat3) -> DMat3 {
+    let trace = |m: DMat3| m.x_axis.x + m.y_axis.y + m.z_axis.z;
+    let g = l.transpose() * l;
+    let t = trace(g);
+    let invariant = (t * t - trace(g * g)) / 2.0;
+    if invariant > t * t * 1e-10 {
+        (DMat3::from_diagonal(DVec3::splat(t)) - g) * l.transpose() * invariant.recip()
+    } else if t > 0.0 {
+        l.transpose() * t.recip()
+    } else {
+        DMat3::ZERO
+    }
+}
+
+/// The inverse of a bind transform; where it collapses an axis, the transform that takes a
+/// point to the nearest one the bind reaches and back through it.
+fn bind_inverse(m: DMat4) -> DMat4 {
+    let l = DMat3::from_mat4(m);
+    if collapses(l) {
+        DMat4::from_mat3(pseudo_inverse(l)) * DMat4::from_translation(-m.w_axis.truncate())
+    } else {
+        m.inverse()
+    }
+}
+
 impl Skel {
-    pub(super) fn build(r: &PrimReader<'_>, to_model: DMat4) -> Result<Self, String> {
+    /// The skeleton of prim `r`, at world transform `to_model` on a stage that `stage` takes
+    /// to scene units and axes.
+    pub(super) fn build(r: &PrimReader<'_>, to_model: DMat4, stage: DMat4) -> Result<Self, String> {
         let path = r.path().to_string();
+        if !to_model.as_mat4().is_finite() {
+            return Err(format!("{path}: its world transform is not finite"));
+        }
         let joints = r.tokens("joints")?;
         if joints.is_empty() || joints.len() > MAX_JOINTS {
             return Err(format!(
@@ -68,7 +103,14 @@ impl Skel {
             if v.len() != 16 * joints.len() {
                 return Err(format!("{path} {name}: not one matrix per joint"));
             }
-            Ok(Some(v.chunks_exact(16).map(matrix).collect()))
+            let m: Vec<DMat4> = v.chunks_exact(16).map(matrix).collect();
+            if !m
+                .iter()
+                .all(|m| m.is_finite() && m.row(3).abs_diff_eq(DVec4::W, 1e-5))
+            {
+                return Err(format!("{path} {name}: not all affine transforms"));
+            }
+            Ok(Some(m))
         };
         let binds = mats("bindTransforms")?.ok_or_else(|| format!("{path}: no bindTransforms"))?;
         let by_name: HashMap<String, u16> = joints
@@ -78,12 +120,9 @@ impl Skel {
             .collect();
         let mut parents = Vec::with_capacity(joints.len());
         for (i, j) in joints.iter().enumerate() {
-            let parent = match j.rsplit_once('/') {
-                None => NO_PARENT,
-                Some((p, _)) => *by_name
-                    .get(p)
-                    .ok_or_else(|| format!("{path}: joint {j} has no parent joint {p}"))?,
-            };
+            let parent = std::iter::successors(above(j), |p| above(p))
+                .find_map(|a| by_name.get(a).copied())
+                .unwrap_or(NO_PARENT);
             if parent != NO_PARENT && usize::from(parent) >= i {
                 return Err(format!("{path}: joint {j} comes before its parent"));
             }
@@ -94,12 +133,19 @@ impl Skel {
             None => (0..joints.len())
                 .map(|i| match parents[i] {
                     NO_PARENT => binds[i],
-                    p => binds[usize::from(p)].inverse() * binds[i],
+                    p => bind_inverse(binds[usize::from(p)]) * binds[i],
                 })
                 .collect(),
         };
+        let to_bind = if collapses(DMat3::from_mat4(to_model)) {
+            stage
+        } else {
+            to_model
+        };
+        let from_bind = bind_inverse(to_bind);
         let mut info = SkeletonInfo {
-            parents: parents.clone(),
+            root: Affine3::from_mat4(to_model.as_mat4()),
+            parents,
             rest: Vec::with_capacity(joints.len()),
             inverse_binds: Vec::with_capacity(joints.len()),
             names: joints
@@ -108,26 +154,25 @@ impl Skel {
                 .collect(),
         };
         for i in 0..joints.len() {
-            let local = match parents[i] {
-                NO_PARENT => to_model * rest[i],
-                _ => rest[i],
-            };
-            info.rest
-                .push(trs(local, &|| format!("{path} joint {}", joints[i]))?);
+            info.rest.push(trs(rest[i]).ok_or_else(|| {
+                format!(
+                    "{path} joint {}: shear; joints need translation, rotation and scale",
+                    joints[i]
+                )
+            })?);
             info.inverse_binds.push(Affine3::from_mat4(
-                (to_model * binds[i]).inverse().as_mat4(),
+                (bind_inverse(binds[i]) * from_bind).as_mat4(),
             ));
         }
         Ok(Self {
             info,
             joints,
             by_name,
-            to_model,
-            rest,
+            to_bind,
         })
     }
 
-    /// Skin influences per point of a bound mesh, and model space from its points.
+    /// Skin influences per point of a bound mesh, and bind space from its points.
     pub(super) fn binding(
         &self,
         r: &PrimReader<'_>,
@@ -189,8 +234,12 @@ impl Skel {
                 for k in 0..4 {
                     let i = 4 * s + k;
                     if i < size {
-                        j[k] = indices[e * size + i] as u16;
+                        let index = indices[e * size + i];
                         w[k] = weights[e * size + i] as f32;
+                        if index < 0.0 && w[k] != 0.0 {
+                            return Err(format!("{path}: joint index {index}"));
+                        }
+                        j[k] = index as u16;
                     }
                 }
                 js.push(j);
@@ -207,10 +256,11 @@ impl Skel {
         } else {
             influences
         };
-        let geom_bind = r
-            .numbers("primvars:skel:geomBindTransform")?
-            .map_or(DMat4::IDENTITY, |m| matrix(&m));
-        Ok((influences, self.to_model * geom_bind))
+        let geom_bind = match r.value("primvars:skel:geomBindTransform")? {
+            Some(openusd::sdf::Value::Matrix4d(m)) => matrix(&m.0),
+            _ => DMat4::IDENTITY,
+        };
+        Ok((influences, self.to_bind * geom_bind))
     }
 
     /// The clip of one animation prim, or `None` when it names none of the joints or has no
@@ -246,7 +296,7 @@ impl Skel {
             return Ok(None);
         }
         let n = names.len();
-        let mut keys: Vec<Vec<DMat4>> = Vec::with_capacity(times.len());
+        let mut keys: Vec<Vec<Trs>> = Vec::with_capacity(times.len());
         for &t in &times {
             let r = PrimReader {
                 prim: anim,
@@ -269,17 +319,20 @@ impl Skel {
             let mut locals = Vec::with_capacity(n);
             for (i, j) in joints.iter().enumerate() {
                 let Some(j) = *j else {
-                    locals.push(DMat4::IDENTITY);
+                    locals.push(Trs::IDENTITY);
                     continue;
                 };
-                let (rs, rr, rt) = self.rest[usize::from(j)].to_scale_rotation_translation();
-                let t3 = tr.as_ref().map_or(rt, |v| DVec3::from_slice(&v[3 * i..]));
-                let q: DQuat = ro.as_ref().map_or(rr, |v| quat(&v[4 * i..]).normalize());
-                let s3 = sc.as_ref().map_or(rs, |v| DVec3::from_slice(&v[3 * i..]));
-                let local = DMat4::from_scale_rotation_translation(s3, q, t3);
-                locals.push(match self.info.parents[usize::from(j)] {
-                    NO_PARENT => self.to_model * local,
-                    _ => local,
+                let rest = &self.info.rest[usize::from(j)];
+                let three = |v: &Option<Vec<f64>>, rest: [f32; 3]| {
+                    v.as_ref()
+                        .map_or(rest, |v| std::array::from_fn(|k| v[3 * i + k] as f32))
+                };
+                locals.push(Trs {
+                    rotation: ro.as_ref().map_or(rest.rotation, |v| {
+                        quat(&v[4 * i..]).normalize().as_quat().to_array()
+                    }),
+                    translation: three(&tr, rest.translation),
+                    scale: three(&sc, rest.scale),
                 });
             }
             keys.push(locals);
@@ -288,13 +341,9 @@ impl Skel {
         let mut channels = Vec::new();
         for (i, j) in joints.iter().enumerate() {
             let Some(j) = *j else { continue };
-            let what = || format!("{path} joint {}", names[i]);
-            let decomposed: Vec<Trs> = keys
-                .iter()
-                .map(|k| trs(k[i], &what))
-                .collect::<Result<_, _>>()?;
+            let joint_keys: Vec<Trs> = keys.iter().map(|k| k[i]).collect();
             let three = |f: fn(&Trs) -> [f32; 3]| {
-                decomposed
+                joint_keys
                     .iter()
                     .map(|d| {
                         let v = f(d);
@@ -306,7 +355,7 @@ impl Skel {
                 (Property::Translation, three(|d| d.translation)),
                 (
                     Property::Rotation,
-                    decomposed.iter().map(|d| d.rotation).collect(),
+                    joint_keys.iter().map(|d| d.rotation).collect(),
                 ),
                 (Property::Scale, three(|d| d.scale)),
             ] {
@@ -317,10 +366,42 @@ impl Skel {
                     times: seconds.clone(),
                     values,
                 };
-                ch.check().map_err(|e| format!("{}: {e}", what()))?;
+                ch.check()
+                    .map_err(|e| format!("{path} joint {}: {e}", names[i]))?;
                 channels.push(ch);
             }
         }
         Ok(Some(skin::resample(&self.info, &channels, settings)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use orr_math::{Mat3, Quat, Vec3};
+
+    use super::*;
+
+    #[test]
+    fn pseudo_inverse_meets_the_penrose_conditions() {
+        let turn = |a: f32, b: f32| Quat::from_axis_angle(Vec3::new(a, b, 1.0).normalize(), a);
+        let flat = |s: Vec3| {
+            let product = Mat3::from_quat(turn(0.3, 2.0))
+                * Mat3::from_diagonal(s)
+                * Mat3::from_quat(turn(1.1, -0.4));
+            product.as_dmat3()
+        };
+        for l in [
+            flat(Vec3::new(2.0, 3.0, 0.0)),
+            flat(Vec3::new(5.0, 0.0, 0.0)),
+            DMat3::from_cols(DVec3::X, DVec3::Y, DVec3::new(1.0, 1.0, 0.0)),
+            DMat3::ZERO,
+        ] {
+            let p = pseudo_inverse(l);
+            let near = |a: DMat3, b: DMat3| a.abs_diff_eq(b, 1e-5);
+            assert!(near(l * p * l, l), "{l}");
+            assert!(near(p * l * p, p), "{l}");
+            assert!(near((l * p).transpose(), l * p), "{l}");
+            assert!(near((p * l).transpose(), p * l), "{l}");
+        }
     }
 }
