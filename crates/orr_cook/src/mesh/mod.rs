@@ -236,13 +236,6 @@ impl MeshSource {
         }
     }
 
-    /// Drops uv set 1 when no section's material reads it; a lazy mesh drops it on load.
-    pub(crate) fn drop_unread_uv1(&mut self) {
-        if let Self::Data(m) = self {
-            m.drop_unread_uv1();
-        }
-    }
-
     pub(crate) fn hash(&self) -> Hash32 {
         match self {
             Self::Data(m) => m.hash(),
@@ -257,18 +250,8 @@ impl MeshSource {
         }
     }
 
-    /// The mesh, read now if it is lazy, and without a uv set 1 its sections don't read.
-    pub(crate) fn load(self, asset: &str, memo: &Memo) -> Result<MeshData> {
-        let lazy = matches!(self, Self::Lazy(_));
-        let mut m = self.read(asset, memo)?;
-        if lazy {
-            m.drop_unread_uv1();
-        }
-        Ok(m)
-    }
-
-    /// The mesh with every uv set, for sections that don't yet know what they read. A lazy mesh
-    /// whose triangles no longer match its sections fails as changed.
+    /// The mesh, read now if it is lazy. A lazy mesh whose triangles no longer match its sections
+    /// fails as changed.
     pub(crate) fn read(self, asset: &str, memo: &Memo) -> Result<MeshData> {
         let _z = crate::profile::zone!("mesh.load");
         match self {
@@ -1473,13 +1456,6 @@ fn write_page(clusters: &[&ClusterData], stride: usize) -> Vec<u8> {
 }
 
 impl MeshData {
-    /// Drops uv set 1 when no section's material reads it.
-    pub(crate) fn drop_unread_uv1(&mut self) {
-        if !self.sections.iter().any(|s| s.maps.uv1) {
-            self.uvs.truncate(1);
-        }
-    }
-
     /// Gives what a section reads of a uv set the mesh lacks the reading the shaders give it, a
     /// uv of zero. Returns a warning per such section.
     pub(crate) fn pad_uv_sets(&mut self) -> Vec<String> {

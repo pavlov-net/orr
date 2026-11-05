@@ -1853,7 +1853,6 @@ fn plan_scene(
                 (materials[mi].0, materials[mi].1)
             });
         }
-        mesh.drop_unread_uv1();
         deps.sort_unstable();
         deps.dedup();
         let skeleton = model
@@ -2059,7 +2058,7 @@ fn mesh_units(
     deps.sort_unstable();
     deps.dedup();
     let n = input.positions.len();
-    let mut mesh = MeshData {
+    let mesh = MeshData {
         positions: input.positions.iter().map(Vec3::to_array).collect(),
         normals: input.normals.iter().map(Vec3::to_array).collect(),
         tangents: input
@@ -2091,7 +2090,6 @@ fn mesh_units(
         }),
         min_exponent: None,
     };
-    mesh.drop_unread_uv1();
     let part = MeshPart {
         name: mesh_name,
         mesh: MeshSource::Data(Box::new(mesh)),
@@ -2578,7 +2576,7 @@ fn cook_unit(
             w.add(name, class, schema, key, &blobs)?;
         }
         Work::Mesh(source, settings, archives) => {
-            let mut data = source.load(name, &shared.memo)?;
+            let mut data = source.read(name, &shared.memo)?;
             let uv_warnings = data.pad_uv_sets();
             mesh::check(&data, &settings).map_err(|message| Error::Mesh {
                 asset: name.into(),

@@ -617,6 +617,35 @@ fn overlapping_sections_compute_their_own_tangents() {
     }
 }
 
+/// A copy can bind a material the cook never sees, so a uv set no section reads stays.
+#[test]
+fn a_uv_set_no_section_reads_stays_for_copies() {
+    let input = MeshInput {
+        uvs1: Some(vec![[0.25, 0.75].into(); 4]),
+        sections: vec![Span { first: 0, count: 6 }],
+        ..turned_sets()
+    };
+    let (a, _) = library_cook("unread-uv1", input, vec![normal_mapped(0)]);
+    let e = a.find(AssetId::from_name("m/mesh")).unwrap();
+    let blobs = a.blobs(e);
+    let read = |b: &orr_pack::Blob| {
+        let mut v = vec![0; b.raw_len as usize];
+        a.read(b, &mut v).unwrap();
+        v
+    };
+    let info = MeshInfo::parse(&read(&blobs[0])).unwrap();
+    let page = &info.pages[0];
+    let mut resident = vec![0; page.resident_len as usize];
+    mesh::decode_page(&read(&blobs[page.blob as usize]), &mut resident).unwrap();
+    let view = PageView::new(&resident, &info.header).unwrap();
+    let c = view.cluster(0);
+    let uv = view.uv(&c, 0, 1);
+    assert!(
+        (uv[0] - 0.25).abs() < 1e-3 && (uv[1] - 0.75).abs() < 1e-3,
+        "{uv:?}"
+    );
+}
+
 /// The shaders read a uv of zero from a set a mesh lacks, and so does the cook, with a warning.
 #[test]
 fn a_uv_set_the_mesh_lacks_reads_zero() {
