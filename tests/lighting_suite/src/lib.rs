@@ -4,14 +4,14 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use orr_gpu::{
-    AddressMode, Allocation, Filter, Format, GpuPtr, Hazards, KernelSet, SamplerDesc, SamplerIndex,
-    ShaderModule, Stages, Texture, TextureDesc, TextureIndex, TextureMemory, TextureRegion,
-    TextureUsage, ViewDesc,
+    AddressMode, Allocation, DEFAULT_MEDIUM, Filter, Format, GpuPtr, Hazards, KernelSet,
+    SamplerDesc, SamplerIndex, ShaderModule, Stages, Texture, TextureDesc, TextureIndex,
+    TextureMemory, TextureRegion, TextureUsage, ViewDesc,
 };
 use orr_lighting::{SceneLighting, SceneLightingSettings, ScenePass};
 use orr_scene::{
-    FrameDesc, FrameTime, LightGpu, MaterialWriter, RendererDesc, SceneCompute, SceneDesc, SceneId,
-    SceneRoot, SceneWriter, Scenes,
+    EnvironmentData, FrameDesc, FrameTime, LightGpu, MaterialWriter, RendererDesc, SceneCompute,
+    SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes,
 };
 
 pub use gpu_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -29,8 +29,12 @@ pub mod linked {
 }
 
 /// A kernel set in which each `(module, kernel)` stands in for orr_lighting's module compiled
-/// from `kernel`, as a build linking another environment or medium makes it.
-pub fn kernels(replacements: &[(&'static ShaderModule, &'static str)]) -> KernelSet {
+/// from `kernel`, as a build linking the types `environment` and `medium` makes it.
+pub fn kernels(
+    environment: &'static str,
+    medium: &'static str,
+    replacements: &[(&'static ShaderModule, &'static str)],
+) -> &'static KernelSet {
     let modules: Vec<&'static ShaderModule> = replacements
         .iter()
         .map(|&(m, kernel)| {
@@ -41,10 +45,20 @@ pub fn kernels(replacements: &[(&'static ShaderModule, &'static str)]) -> Kernel
             }))
         })
         .collect();
-    KernelSet {
+    Box::leak(Box::new(KernelSet {
         modules: Box::leak(modules.into_boxed_slice()),
-        surfaces: 0,
-    }
+        environment,
+        medium,
+        ..KernelSet::NONE
+    }))
+}
+
+/// `procedural_bake.slang`'s `ProceduralSky`, which reads no record.
+struct ProceduralSkyData;
+
+impl EnvironmentData for ProceduralSkyData {
+    const TYPE: &'static str = "ProceduralSky";
+    const NULL_SAFE: bool = true;
 }
 
 /// A linear, clamping sampler slot.
@@ -123,11 +137,16 @@ pub fn copy_back<T: bytemuck::Pod>(
     out
 }
 
+type LinkedData = Box<dyn FnOnce(&mut SceneWriter<'_>)>;
+
 /// One orr_scene scene on the suite's device, driven a frame at a time.
 pub struct TestScene {
     pub scenes: Scenes,
     pub id: SceneId,
     pub desc: SceneDesc,
+    kernels: &'static KernelSet,
+    /// Sets the scene's linked data in its first frame.
+    linked: Option<LinkedData>,
     /// The scene's root, after the first frame.
     pub root: GpuPtr<SceneRoot>,
     /// The last frame run.
@@ -136,22 +155,49 @@ pub struct TestScene {
 
 impl TestScene {
     pub fn new(desc: SceneDesc) -> Self {
-        let mut scenes = Scenes::new(device(), &RendererDesc::default()).unwrap();
+        Self::linked(desc, &KernelSet::NONE, |_| {})
+    }
+
+    /// A scene on kernels that bake the procedural sky.
+    pub fn procedural(desc: SceneDesc) -> Self {
+        let linked = kernels(
+            ProceduralSkyData::TYPE,
+            DEFAULT_MEDIUM,
+            &[(&shaders::procedural_bake::MODULE, "environment/bake")],
+        );
+        Self::linked(desc, linked, |w| {
+            w.set_environment(GpuPtr::<ProceduralSkyData>::NULL);
+        })
+    }
+
+    /// A scene on `kernels`, with `data` setting its linked data in its first frame.
+    pub fn linked(
+        desc: SceneDesc,
+        kernels: &'static KernelSet,
+        data: impl FnOnce(&mut SceneWriter<'_>) + 'static,
+    ) -> Self {
+        let renderer = RendererDesc {
+            kernels,
+            ..RendererDesc::default()
+        };
+        let mut scenes = Scenes::new(device(), &renderer).unwrap();
         let id = scenes.create_scene(&desc).unwrap();
         Self {
             scenes,
             id,
             desc,
+            kernels,
+            linked: Some(Box::new(data)),
             root: GpuPtr::NULL,
             frame: 0,
         }
     }
 
-    /// Lighting for this scene with default settings and `kernels`.
-    pub fn lighting(&self, kernels: &KernelSet) -> SceneLighting {
+    /// Lighting for this scene with default settings, on the scene's kernels.
+    pub fn lighting(&self) -> SceneLighting {
         SceneLighting::new(
             device(),
-            kernels,
+            self.kernels,
             &self.desc,
             &SceneLightingSettings::default(),
         )
@@ -181,6 +227,9 @@ impl TestScene {
         {
             let mut materials = f.materials();
             let mut w = f.scene(self.id).unwrap();
+            if let Some(linked) = self.linked.take() {
+                linked(&mut w);
+            }
             write(&mut w, &mut materials);
         }
         let mut root = GpuPtr::NULL;

@@ -14,9 +14,9 @@ use orr_cook::{
     Source, TextureSettings, Usage, VolumeGrids, VolumeInput, VolumeSettings,
 };
 use orr_gpu::{
-    Allocation, CommandList, ComputePipeline, Format, GpuAddress, GpuPtr, Hazards, KernelSet,
-    MemoryKind, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
-    TextureRegion, TextureUsage,
+    Allocation, CommandList, ComputePipeline, Format, GpuPtr, Hazards, KernelSet, MemoryKind,
+    Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory, TextureRegion,
+    TextureUsage,
 };
 use orr_lighting::{
     BsdfTables, CompilingKernels, DirectionalLight, DiscProfile, DofBackgroundPass,
@@ -31,8 +31,8 @@ use orr_scene::{
     ClusterTopology, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
     LoadState, Loading, MaterialGpu, MaterialId, MediumProxy, MediumProxyId, MountId, Opacity,
     PackSource, ProducerDesc, ProducerId, ProducerUpdate, Projection, RasterView, RendererDesc,
-    SceneCompute, SceneDesc, SceneId, Scenes, TextureFilter, TransformGroupDesc, TransformGroupId,
-    ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
+    SceneCompute, SceneDesc, SceneId, SceneWriter, Scenes, TextureFilter, TransformGroupDesc,
+    TransformGroupId, ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 
@@ -46,6 +46,9 @@ pub const EXTENT: [u32; 2] = [128, 96];
 pub const NEAR: f32 = 0.05;
 
 const PIXELS: u64 = (EXTENT[0] * EXTENT[1]) as u64;
+
+/// How far away the bed's copies are ray traced from, m.
+pub const RT_RANGE: f32 = 1000.0;
 
 /// The scenes lighting is checked on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1483,8 +1486,6 @@ pub struct Bed {
     last_overlay: Option<TextureIndex>,
     light_writes: Vec<(LightId, Option<Light>)>,
     proxy_writes: Vec<(MediumProxyId, Option<MediumProxy>)>,
-    medium: Option<GpuAddress>,
-    environment: Option<GpuAddress>,
     scene_compute: Option<SceneComputeHook>,
     /// Frames add the background layer instead of the radiance.
     background_layer: bool,
@@ -1506,11 +1507,18 @@ impl Bed {
     /// The bed for `spec` on a renderer created with `renderer`; orr_lighting's modules are
     /// replaced from its kernels too.
     pub fn with_renderer(spec: Spec, renderer: &RendererDesc) -> Self {
-        Self::with_rt_range(spec, renderer, 1000.0)
+        Self::with_linked(spec, renderer, RT_RANGE, |_| {})
     }
 
-    /// As [`Self::with_renderer`], with the copies ray traced from up to `rt_range` m away.
-    pub fn with_rt_range(spec: Spec, renderer: &RendererDesc, rt_range: f32) -> Self {
+    /// As [`Self::with_renderer`], with the copies ray traced from up to `rt_range` m away and
+    /// `linked` setting the scene's data for a linked environment and medium in its first
+    /// frame.
+    pub fn with_linked(
+        spec: Spec,
+        renderer: &RendererDesc,
+        rt_range: f32,
+        linked: impl FnOnce(&mut SceneWriter<'_>),
+    ) -> Self {
         let kernels = renderer.kernels;
         let d = device();
         let mut scenes = Scenes::new(d, renderer).unwrap();
@@ -1618,8 +1626,9 @@ impl Bed {
             w.set_light(LightId(i as u32), Some(l)).unwrap();
         }
         if let Some((_, data)) = &environment {
-            w.set_environment(data.gpu().address());
+            w.set_environment(data.gpu());
         }
+        linked(&mut w);
         if let Some((at, pixels_per_radian)) = spec.focus {
             w.set_focus(at.as_dvec3());
             f.request_detail(scene, pixels_per_radian).unwrap();
@@ -1664,8 +1673,6 @@ impl Bed {
             last_overlay: None,
             light_writes: Vec::new(),
             proxy_writes: Vec::new(),
-            medium: None,
-            environment: None,
             scene_compute: None,
             background_layer: false,
             kernels,
@@ -1838,19 +1845,9 @@ impl Bed {
             .unwrap_or_else(|e| panic!("volume {name}: {e}"))
     }
 
-    /// Gives the scene's linked environment the data at `data` from the next frame on.
-    pub fn set_environment(&mut self, data: GpuAddress) {
-        self.environment = Some(data);
-    }
-
     /// Runs `hook` at the scene compute point of every frame from the next on.
     pub fn set_scene_compute(&mut self, hook: SceneComputeHook) {
         self.scene_compute = Some(hook);
-    }
-
-    /// Gives the scene's linked medium the data at `data` from the next frame on.
-    pub fn set_medium(&mut self, data: GpuAddress) {
-        self.medium = Some(data);
     }
 
     /// The bed view's lighting targets as the last frame left them.
@@ -1922,23 +1919,13 @@ impl Bed {
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
         };
-        if !self.light_writes.is_empty()
-            || !self.proxy_writes.is_empty()
-            || self.medium.is_some()
-            || self.environment.is_some()
-        {
+        if !self.light_writes.is_empty() || !self.proxy_writes.is_empty() {
             let mut w = f.scene(self.scene).unwrap();
             for (id, l) in self.light_writes.drain(..) {
                 w.set_light(id, l.as_ref()).unwrap();
             }
             for (id, p) in self.proxy_writes.drain(..) {
                 w.set_medium_proxy(id, p.as_ref()).unwrap();
-            }
-            if let Some(data) = self.medium.take() {
-                w.set_medium(data);
-            }
-            if let Some(data) = self.environment.take() {
-                w.set_environment(data);
             }
         }
         if self.scene_compute.is_some() || self.particles.is_some() {

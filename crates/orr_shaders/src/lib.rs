@@ -17,7 +17,10 @@ mod module;
 
 #[cfg(feature = "hot-reload")]
 pub use build::{Reload, Watcher};
-pub use module::{EntryPoint, KernelMismatch, KernelSet, Mismatch, PathEntry, ShaderModule, Stage};
+pub use module::{
+    DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM, EntryPoint, KernelMismatch, KernelSet, Mismatch,
+    PathEntry, ShaderModule, Stage,
+};
 
 #[doc(hidden)]
 pub use bytemuck;

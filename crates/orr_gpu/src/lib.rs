@@ -68,7 +68,9 @@ pub use generated::{Generated, Sequence, SetKind};
 pub use memory::{HeapReport, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage};
 pub use orr_memory::AllocError;
 pub use orr_shaders::abi::*;
-pub use orr_shaders::{EntryPoint, KernelSet, ShaderModule, Stage};
+pub use orr_shaders::{
+    DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM, EntryPoint, KernelSet, ShaderModule, Stage,
+};
 pub use present::{
     HdrMetadata, LatencyMarker, LatencyTimings, OutputFormat, PresentMode, Refresh, SwapchainDesc,
 };

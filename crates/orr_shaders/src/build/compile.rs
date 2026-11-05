@@ -573,7 +573,7 @@ impl Build {
                 plans: &linked_plans[name],
             })
             .collect();
-        let rust = codegen::kernel_set(&linked_out, &link::ids(&links), &manifest_path);
+        let rust = codegen::kernel_set(&linked_out, &links, &manifest_path);
         write(&out_dir.join("orr_kernels.rs"), rust.as_bytes())?;
 
         // Reloads build Metal libraries as the build did, when it did.

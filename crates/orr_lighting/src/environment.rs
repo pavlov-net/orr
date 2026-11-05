@@ -4,11 +4,11 @@
 
 use bytemuck::{Pod, Zeroable};
 use orr_scene::orr_gpu::{
-    Allocation, CommandList, ComputePipeline, Device, Format, GpuPtr, Hazards, MemoryKind,
-    SamplerIndex, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
-    TextureUsage, ViewDesc,
+    Allocation, CommandList, ComputePipeline, DEFAULT_ENVIRONMENT, Device, Format, GpuPtr, Hazards,
+    MemoryKind, SamplerIndex, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex,
+    TextureMemory, TextureUsage, ViewDesc,
 };
-use orr_scene::{AffineRows, SceneRoot};
+use orr_scene::{AffineRows, EnvironmentData, SceneRoot};
 
 use crate::shaders::environment::{bake, pyramid};
 use crate::shaders::types::EnvironmentGpu;
@@ -36,6 +36,11 @@ pub struct EnvironmentMapGpu {
     pub primaries: u32,
     /// Rotates world directions into map space, rows `[R | 0]`.
     pub from_world: AffineRows,
+}
+
+impl EnvironmentData for EnvironmentMapGpu {
+    const TYPE: &'static str = DEFAULT_ENVIRONMENT;
+    const NULL_SAFE: bool = true;
 }
 
 pub(crate) struct EnvironmentBake {

@@ -7,10 +7,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use orr_gpu::{
-    Allocation, ClearColor, ColorAttachment, ColorLoad, CommandList, ComputePipeline, Device,
-    GpuAddress, GpuPtr, Hazards, KernelSet, LatencyMarker, LowLatency, MemoryKind, PassResult,
-    QueueKind, Rendering, SamplerDesc, SamplerIndex, ShaderModule, SpecData, Stages,
-    StorageImageIndex, TextureIndex, TimelinePoint,
+    Allocation, ClearColor, ColorAttachment, ColorLoad, CommandList, ComputePipeline,
+    DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM, Device, GpuAddress, GpuPtr, Hazards, KernelSet,
+    LatencyMarker, LowLatency, MemoryKind, PassResult, QueueKind, Rendering, SamplerDesc,
+    SamplerIndex, ShaderModule, SpecData, Stages, StorageImageIndex, TextureIndex, TimelinePoint,
 };
 use orr_math::{DVec3, Vec3};
 use orr_pack::AssetId;
@@ -161,11 +161,6 @@ impl Default for Budgets {
 /// Farther models a representation chain holds: the length of `ModelGpu::chain`.
 const MAX_CHAIN: usize = 3;
 
-static NO_KERNELS: KernelSet = KernelSet {
-    modules: &[],
-    surfaces: 0,
-};
-
 #[derive(Clone, Copy, Debug)]
 pub struct RendererDesc {
     pub budgets: Budgets,
@@ -217,7 +212,7 @@ impl Default for RendererDesc {
         Self {
             budgets: Budgets::default(),
             frames_in_flight: 2,
-            kernels: &NO_KERNELS,
+            kernels: &KernelSet::NONE,
             path_entry: PathEntry::Fastest,
             try_cached_paths: true,
             cell_log2: 8,
@@ -1089,6 +1084,7 @@ impl Scenes {
         let now = Instant::now();
         Ok(Frame {
             device: &self.device,
+            kernels: self.kernels,
             pipelines: &self.pipelines,
             core: &mut self.core,
             id: frame,
@@ -1241,6 +1237,7 @@ impl Core {
 /// `update_scenes`, then views, then `end`.
 pub struct Frame<'a> {
     device: &'a Device,
+    kernels: &'static KernelSet,
     pipelines: &'a Pipelines,
     core: &'a mut Core,
     id: u64,
@@ -1340,6 +1337,7 @@ impl<'a> Frame<'a> {
         Ok(SceneWriter {
             scene,
             device: self.device,
+            kernels: self.kernels,
             window: &self.core.windows[self.window],
             seq: &self.core.seq,
             frame: self.id,
@@ -1388,7 +1386,8 @@ impl<'a> Frame<'a> {
     }
 
     /// Step 3: applies every write of this frame, then gives each listed scene, in order,
-    /// to `compute` with the frame's command list.
+    /// to `compute` with the frame's command list. Panics if a listed scene never set the data
+    /// of an environment or medium its kernels link.
     pub fn update_scenes(
         &mut self,
         compute: &mut dyn FnMut(&mut SceneCompute<'_, 'a>),
@@ -1410,6 +1409,14 @@ impl<'a> Frame<'a> {
         for &id in &self.listed {
             let scene = core.scene(id)?;
             let cpu = &mut *scene.cpu.lock().unwrap();
+            assert!(
+                cpu.environment.is_some() || self.kernels.environment == DEFAULT_ENVIRONMENT,
+                "{id:?} has no data for the environment its kernels link: call set_environment"
+            );
+            assert!(
+                cpu.medium.is_some() || self.kernels.medium == DEFAULT_MEDIUM,
+                "{id:?} has no data for the medium its kernels link: call set_medium"
+            );
             cpu.last_update = self.id;
             records.append(&mut cpu.records);
             masks.extend(std::mem::take(&mut cpu.masks));
@@ -1522,8 +1529,8 @@ impl<'a> Frame<'a> {
                 patches: t.patches.gpu(),
                 producer_state: t.producer_state.gpu(),
                 sky_stats: t.sky_stats.gpu(),
-                environment: cpu.environment,
-                medium: cpu.medium,
+                environment: cpu.environment.unwrap_or(0),
+                medium: cpu.medium.unwrap_or(0),
                 surface_data: cpu.surface_data,
                 tlas: tlas.unwrap_or_else(|| device.empty_tlas()),
                 part_slots: cpu.ptlas.part_slots.gpu(),

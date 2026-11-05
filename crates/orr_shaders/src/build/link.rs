@@ -277,6 +277,14 @@ pub(super) fn ids(links: &[Link]) -> BTreeMap<LinkPoint, Vec<(&str, u8)>> {
     out
 }
 
+/// The type linked at `point`, which holds at most one.
+pub(super) fn single_type(links: &[Link], point: LinkPoint) -> Option<&str> {
+    links
+        .iter()
+        .find(|l| l.point == point)
+        .map(|l| l.ty.as_str())
+}
+
 /// The width of the coherence key (contracts.md 3): 3 plus the bit length of the highest
 /// linked surface id.
 fn key_bits(links: &[Link]) -> u32 {

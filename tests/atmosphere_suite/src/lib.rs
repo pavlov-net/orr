@@ -192,8 +192,7 @@ impl Rig {
     }
 
     pub fn block(&self) -> GpuPtr<AtmosphereGpu> {
-        // SAFETY: `data` is the address of an `AtmosphereGpu`.
-        unsafe { GpuPtr::from_address(self.sky.data()) }
+        self.sky.data()
     }
 
     /// Lighting's statistics of the last frame.

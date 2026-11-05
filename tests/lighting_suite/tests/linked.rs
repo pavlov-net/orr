@@ -1,15 +1,18 @@
 //! Linked kernels through the path kernel, kept in one target because each target compiles
 //! its own linked path pipelines: linked coverage against the equivalent alpha texture, and a
-//! linked surface in a mirror and at each bounce.
+//! linked surface in a mirror and at each bounce. A scene's data against its linked types.
 
 use lighting_suite::bed::{
     Accumulated, BARE_LEAF, Bed, FLOOR, Item, MIRROR, PANEL, Paths, RINGS_LEAF, Spec, WHITE_SPHERE,
     assert_close, assert_within_noise, luminance, mean_where, quad_scene, reference, surface_mean,
 };
-use lighting_suite::{assert_clean, linked};
-use orr_lighting::{LightingDebugView, PathEntry, ReferenceSettings, ViewLighting};
+use lighting_suite::{TestScene, assert_clean, linked};
+use orr_gpu::{GpuPtr, KernelSet};
+use orr_lighting::{
+    EnvironmentMapGpu, LightingDebugView, PathEntry, ReferenceSettings, ViewLighting,
+};
 use orr_math::{Mat3, Vec3};
-use orr_scene::RendererDesc;
+use orr_scene::{EnvironmentData, RendererDesc, SceneDesc, SceneWriter};
 
 fn at(model: &'static str, linear: Mat3, at: Vec3) -> Item {
     Item { model, linear, at }
@@ -39,6 +42,57 @@ fn linked_bed(spec: Spec) -> Bed {
 
 fn linked_paths(settings: ViewLighting) -> Paths {
     Paths::new(&linked::KERNELS, PathEntry::Compute, settings)
+}
+
+/// `Dome`, a linked environment that reads no record.
+struct DomeData;
+
+impl EnvironmentData for DomeData {
+    const TYPE: &'static str = "Dome";
+    const NULL_SAFE: bool = true;
+}
+
+/// A record `Dome` would read, if it read one.
+struct DomeRecord;
+
+impl EnvironmentData for DomeRecord {
+    const TYPE: &'static str = "Dome";
+}
+
+static DOME: KernelSet = KernelSet {
+    environment: DomeData::TYPE,
+    ..KernelSet::NONE
+};
+
+/// One frame of a scene on [`DOME`], with `data` setting its linked data.
+fn dome_frame(data: impl FnOnce(&mut SceneWriter<'_>) + 'static) {
+    TestScene::linked(SceneDesc::default(), &DOME, data).write(|_, _| {});
+}
+
+#[test]
+fn null_data_serves_a_linked_type_that_reads_none() {
+    dome_frame(|w| w.set_environment(GpuPtr::<DomeData>::NULL));
+    assert_clean();
+}
+
+#[test]
+#[should_panic(
+    expected = "the kernels link Dome as the environment; this data is for EnvironmentMap"
+)]
+fn data_for_another_type_panics() {
+    dome_frame(|w| w.set_environment(GpuPtr::<EnvironmentMapGpu>::NULL));
+}
+
+#[test]
+#[should_panic(expected = "Dome reads its data, and this data is null")]
+fn null_data_for_a_type_that_reads_it_panics() {
+    dome_frame(|w| w.set_environment(GpuPtr::<DomeRecord>::NULL));
+}
+
+#[test]
+#[should_panic(expected = "has no data for the environment its kernels link: call set_environment")]
+fn a_linked_environment_never_set_panics() {
+    dome_frame(|_| {});
 }
 
 #[test]

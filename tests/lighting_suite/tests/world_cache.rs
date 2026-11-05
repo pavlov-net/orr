@@ -71,7 +71,7 @@ impl Cache {
             ..SceneDesc::default()
         });
         scene.write(|_, _| {});
-        let mut lighting = scene.lighting(&KernelSet::default());
+        let mut lighting = scene.lighting();
         lighting
             .set_settings(&SceneLightingSettings {
                 world_cache,

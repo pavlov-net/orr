@@ -14,10 +14,11 @@
 //! against the reference's distance samples, also past the froxels and with shafts, a waterline at
 //! the near plane from either side, a body in the water, flicker, and particles under water.
 
+use bytemuck::{Pod, Zeroable};
 use lighting_suite::bed::{
     Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Item, LEAF, MIRROR, NEAR, PLUME,
-    Particle, ParticleLook, Paths, SKY, SUN, Spec, TURBID_WATER, WATER_BOX, WHITE_SPHERE, fresnel,
-    look, pixel_of, plume_volume, water_transmission,
+    Particle, ParticleLook, Paths, RT_RANGE, SKY, SUN, Spec, TURBID_WATER, WATER_BOX, WHITE_SPHERE,
+    fresnel, look, pixel_of, plume_volume, water_transmission,
 };
 use lighting_suite::shaders::{
     fog_aerial, fog_apply, fog_directional, fog_froxel, fog_particles, froxel_lookup, froxel_probe,
@@ -25,27 +26,33 @@ use lighting_suite::shaders::{
 };
 use lighting_suite::{assert_clean, finish, kernels, pipeline, readback, render, upload};
 use orr_color::luminance;
-use orr_gpu::{Allocation, Hazards, KernelSet, Stages};
+use orr_gpu::{Allocation, DEFAULT_ENVIRONMENT, Hazards, KernelSet, Stages};
 use orr_lighting::{
     AERIAL_SIZE, DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, MediaSettings,
     PathEntry, ReferenceSettings, ViewLighting,
 };
 use orr_math::{DVec3, Mat3, Quat, Vec2, Vec3};
 use orr_pack::volume::GridSampler;
-use orr_scene::{MaterialId, MediumProxy, MediumProxyId, Opacity, ProxyDensity, RendererDesc};
+use orr_scene::{
+    MaterialId, MediumData, MediumProxy, MediumProxyId, Opacity, ProxyDensity, RendererDesc,
+};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// Kernels with the stock height fog linked as the medium (`media_types.slang`).
 fn fog_kernels() -> &'static KernelSet {
-    static SET: OnceLock<KernelSet> = OnceLock::new();
+    static SET: OnceLock<&'static KernelSet> = OnceLock::new();
     SET.get_or_init(|| {
-        kernels(&[
-            (&fog_froxel::MODULE, "media/froxel"),
-            (&fog_aerial::MODULE, "media/aerial"),
-            (&fog_apply::MODULE, "media/apply"),
-            (&fog_directional::MODULE, "light_sampling/directional"),
-            (&fog_particles::MODULE, "media/particle_draw"),
-        ])
+        kernels(
+            DEFAULT_ENVIRONMENT,
+            FogGpu::TYPE,
+            &[
+                (&fog_froxel::MODULE, "media/froxel"),
+                (&fog_aerial::MODULE, "media/aerial"),
+                (&fog_apply::MODULE, "media/apply"),
+                (&fog_directional::MODULE, "light_sampling/directional"),
+                (&fog_particles::MODULE, "media/particle_draw"),
+            ],
+        )
     })
 }
 
@@ -55,6 +62,15 @@ struct Fog {
     density: f32,
     base_height: f32,
     falloff_height: f32,
+}
+
+/// `media_types`' `FogData` as the GPU reads it.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FogGpu([f32; 4]);
+
+impl MediumData for FogGpu {
+    const TYPE: &'static str = "StockFog";
 }
 
 const HAZE: Fog = Fog {
@@ -90,7 +106,7 @@ fn foggy(
     environment: Option<[f32; 3]>,
     eye: Vec3,
     target: Vec3,
-) -> (Bed, Allocation<[f32; 4]>) {
+) -> (Bed, Allocation<FogGpu>) {
     if copies.is_empty() {
         copies.push(at(WHITE_SPHERE, eye + (eye - target).normalize() * 30.0));
     }
@@ -107,12 +123,16 @@ fn foggy(
         kernels: fog_kernels(),
         ..RendererDesc::default()
     };
-    let mut bed = Bed::with_renderer(spec, &renderer);
     let data = upload(
-        &[[fog.density, fog.base_height, fog.falloff_height, 0.0]],
+        &[FogGpu([
+            fog.density,
+            fog.base_height,
+            fog.falloff_height,
+            0.0,
+        ])],
         "fog data",
     );
-    bed.set_medium(data.gpu().address());
+    let bed = Bed::with_linked(spec, &renderer, RT_RANGE, |w| w.set_medium(data.gpu()));
     (bed, data)
 }
 
@@ -855,7 +875,7 @@ fn water_view(medium: Option<MaterialId>, reference: bool) -> ViewLighting {
 }
 
 /// Turbid water around the origin, top at 4 m, and `more`; no fog above it.
-fn turbid(eye: Vec3, target: Vec3, more: Vec<Item>) -> (Bed, Allocation<[f32; 4]>, MaterialId) {
+fn turbid(eye: Vec3, target: Vec3, more: Vec<Item>) -> (Bed, Allocation<FogGpu>, MaterialId) {
     let mut copies = vec![at(TURBID_WATER, Vec3::ZERO)];
     copies.extend(more);
     let sun = vec![directional(60.0, 30.0, 1_000.0)];
@@ -1160,7 +1180,7 @@ fn plume_proxy(bed: &Bed, extinction: f32) -> MediumProxy {
     }
 }
 
-fn plume_view(fog: &Fog) -> (Bed, Allocation<[f32; 4]>) {
+fn plume_view(fog: &Fog) -> (Bed, Allocation<FogGpu>) {
     foggy(
         fog,
         Vec::new(),

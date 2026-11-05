@@ -389,7 +389,10 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
         }
     };
     let mut window = (!options.headless).then(|| Window::new("orr dlss sr", 1920, 1080));
-    let desc = RendererDesc::default();
+    let desc = RendererDesc {
+        kernels: &KERNELS,
+        ..RendererDesc::default()
+    };
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,

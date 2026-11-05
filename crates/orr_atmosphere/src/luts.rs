@@ -1,6 +1,6 @@
 //! One atmosphere's GPU state and the LUT passes recorded at the scene compute point.
 
-use orr::abi::{GpuAddress, StorageImageIndex, TextureIndex};
+use orr::abi::{GpuPtr, StorageImageIndex, TextureIndex};
 use orr::orr_gpu::{
     AddressMode, Allocation, ComputePipeline, Device, Filter, Format, Hazards, MemoryKind,
     SamplerDesc, ShaderStage, SpecData, Stages, Texture, TextureDesc, TextureMemory, TextureUsage,
@@ -288,11 +288,10 @@ impl AtmosphereState {
         self.record.fold_reset = 1;
     }
 
-    /// The block's address, for `SceneWriter::set_environment` and `set_medium`. Kernels
-    /// linked to this crate's types read it unconditionally, so a scene using them has it set
-    /// from its first frame, with [`record`](Self::record) running every frame before them.
-    pub fn data(&self) -> GpuAddress {
-        self.block.gpu().address()
+    /// The block, for `SceneWriter::set_environment` and `set_medium`, with
+    /// [`record`](Self::record) running every frame before the kernels that read it.
+    pub fn data(&self) -> GpuPtr<AtmosphereGpu> {
+        self.block.gpu()
     }
 
     /// Records the atmosphere's passes for the scene `cx` hands over: the medium's tables

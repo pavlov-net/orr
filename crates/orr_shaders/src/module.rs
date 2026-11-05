@@ -76,16 +76,39 @@ pub enum PathEntry {
     RayDispatch,
 }
 
+/// The Slang type of the environment kernels declare, which reads null data as black.
+pub const DEFAULT_ENVIRONMENT: &str = "EnvironmentMap";
+/// The Slang type of the medium kernels declare, which reads no data.
+pub const DEFAULT_MEDIUM: &str = "NoMedium";
+
 /// Kernels compiled by a consumer's build with its own link-time types: `KERNELS` in the
 /// build's `orr_kernels.rs`. Empty when nothing links.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct KernelSet {
     pub modules: &'static [&'static ShaderModule],
     /// Linked surfaces: their ids are `1..=surfaces`.
     pub surfaces: u32,
+    /// The Slang type linked as the environment; [`DEFAULT_ENVIRONMENT`] when none is.
+    pub environment: &'static str,
+    /// The Slang type linked as the medium; [`DEFAULT_MEDIUM`] when none is.
+    pub medium: &'static str,
+}
+
+impl Default for KernelSet {
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 impl KernelSet {
+    /// Nothing linked, for `static`s and promoted literals, where `default` can't run.
+    pub const NONE: Self = Self {
+        modules: &[],
+        surfaces: 0,
+        environment: DEFAULT_ENVIRONMENT,
+        medium: DEFAULT_MEDIUM,
+    };
+
     /// The module to create pipelines from in place of `own`: the set's module compiled from
     /// the same kernel file, else `own`. Fails when that module's entry points differ from
     /// `own`'s in name, stage, workgroup or interface hash.

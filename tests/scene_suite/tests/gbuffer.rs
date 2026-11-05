@@ -1671,10 +1671,7 @@ fn image(f: impl Fn(usize) -> [f32; 3]) -> Image {
 #[test]
 fn each_gbuffer_channel_matches_its_reference() {
     let _serial = serial();
-    let mut w = World::new(&KernelSet {
-        modules: &[],
-        surfaces: 0,
-    });
+    let mut w = World::new(&KernelSet::NONE);
     let copies = showcase();
     let placed = place(&mut w, &copies);
     let eye = Vec3::new(0.3, 2.6, 5.5);
@@ -1829,10 +1826,7 @@ fn the_generated_resolve_writes_the_recorded_resolves_gbuffer_and_runs_only_bins
 fn a_stochastic_view_changes_magnified_texels_by_frame_and_averages_near_hardware_filtering() {
     const FRAMES: u32 = 32;
     let _serial = serial();
-    let mut w = World::new(&KernelSet {
-        modules: &[],
-        surfaces: 0,
-    });
+    let mut w = World::new(&KernelSet::NONE);
     let placed = place(&mut w, &showcase());
     // Close over the ground's checker corner at the origin: about a quarter of an albedo
     // texel per pixel.
@@ -1904,10 +1898,7 @@ fn uv(i: usize) -> Vec2 {
 #[test]
 fn motion_vectors_reproject_the_previous_frame() {
     let _serial = serial();
-    let mut w = World::new(&KernelSet {
-        modules: &[],
-        surfaces: 0,
-    });
+    let mut w = World::new(&KernelSet::NONE);
     // Separate objects over the sky, so the only disocclusion is sky they uncover.
     let at = |t: f32| {
         vec![
@@ -1991,10 +1982,7 @@ fn motion_vectors_reproject_the_previous_frame() {
 #[test]
 fn a_change_of_aspect_adds_no_motion() {
     let _serial = serial();
-    let mut w = World::new(&KernelSet {
-        modules: &[],
-        surfaces: 0,
-    });
+    let mut w = World::new(&KernelSet::NONE);
     let placed = place(&mut w, &showcase());
     let eye = Vec3::new(0.3, 2.6, 5.5);
     let target = Vec3::new(0.0, 0.6, 0.0);
@@ -2075,10 +2063,7 @@ fn a_change_of_aspect_adds_no_motion() {
 #[test]
 fn a_point_behind_the_previous_camera_moves_off_its_own_side() {
     let _serial = serial();
-    let mut w = World::new(&KernelSet {
-        modules: &[],
-        surfaces: 0,
-    });
+    let mut w = World::new(&KernelSet::NONE);
     let placed = place(&mut w, &showcase());
     let eye = DVec3::new(0.0, 50.0, 0.0);
     let shot = |frame, yaw: f64| Shot {
@@ -2116,10 +2101,7 @@ fn error_code(frame: &Frame, id: u32) -> u32 {
 #[test]
 fn levels_coarsen_with_distance() {
     let _serial = serial();
-    let mut w = World::new(&KernelSet {
-        modules: &[],
-        surfaces: 0,
-    });
+    let mut w = World::new(&KernelSet::NONE);
     let copies = [
         Item {
             model: "bumps",
@@ -2230,10 +2212,7 @@ fn a_linked_surface_offsets_depth_and_motion_like_the_geometry_it_stands_for() {
 #[test]
 fn hzb_mips_hold_the_farthest_depth_they_cover() {
     let _serial = serial();
-    let mut w = World::new(&KernelSet {
-        modules: &[],
-        surfaces: 0,
-    });
+    let mut w = World::new(&KernelSet::NONE);
     let placed = place(&mut w, &showcase());
     let g = render(
         &mut w,
@@ -2281,10 +2260,7 @@ fn hzb_mips_hold_the_farthest_depth_they_cover() {
 #[test]
 fn load_gsurface_reads_the_visible_surface() {
     let _serial = serial();
-    let mut w = World::new(&KernelSet {
-        modules: &[],
-        surfaces: 0,
-    });
+    let mut w = World::new(&KernelSet::NONE);
     let placed = place(&mut w, &showcase());
     let g = render(
         &mut w,
@@ -2340,10 +2316,7 @@ fn load_gsurface_reads_the_visible_surface() {
 #[test]
 fn masked_sections_draw_nothing() {
     let _serial = serial();
-    let mut w = World::new(&KernelSet {
-        modules: &[],
-        surfaces: 0,
-    });
+    let mut w = World::new(&KernelSet::NONE);
     let ball = [Item {
         model: "ball",
         linear: Mat3::IDENTITY,
@@ -2834,10 +2807,7 @@ impl CpuMesh {
 #[test]
 fn resolved_hits_interpolate_their_triangle_like_the_cpu() {
     let _serial = serial();
-    let mut w = World::new(&KernelSet {
-        modules: &[],
-        surfaces: 0,
-    });
+    let mut w = World::new(&KernelSet::NONE);
     let items = showcase();
     let placed = place(&mut w, &items);
     let eye = DVec3::new(0.3, 2.6, 5.5);
@@ -3132,10 +3102,7 @@ fn set_decals(s: &mut SceneWriter<'_>, matte: MaterialId, sticker: MaterialId, w
 #[test]
 fn normal_maps_shade_through_the_interpolated_frame_they_were_baked_in() {
     let _serial = serial();
-    let mut w = World::new(&KernelSet {
-        modules: &[],
-        surfaces: 0,
-    });
+    let mut w = World::new(&KernelSet::NONE);
     let cpu = CpuMesh::of("tilted skew");
     for linear in [
         Mat3::IDENTITY,
@@ -5653,10 +5620,7 @@ fn last_stats(w: &mut World, frame: u32) -> orr_scene::FrameStats {
 #[test]
 fn occluded_copies_wait_for_the_second_pass_and_the_image_holds() {
     let _serial = serial();
-    let mut w = World::new(&KernelSet {
-        modules: &[],
-        surfaces: 0,
-    });
+    let mut w = World::new(&KernelSet::NONE);
     let items = [
         Item {
             model: "plain",

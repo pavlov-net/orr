@@ -1,4 +1,4 @@
-use orr_shaders::{KernelSet, Mismatch};
+use orr_shaders::{DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM, KernelSet, Mismatch};
 use shader_link::renderer::MODULES as RENDERER;
 use shader_link::{AirData, edited, linked, unlinked};
 
@@ -96,6 +96,16 @@ fn nothing_linked_keeps_the_renderer_defaults() {
         assert!(core::ptr::eq(unlinked::KERNELS.module(own).unwrap(), own));
     }
     assert!(KernelSet::default().check(RENDERER).is_ok());
+}
+
+#[test]
+fn kernel_set_names_its_environment_and_medium() {
+    let names = |set: &KernelSet| (set.environment, set.medium);
+    assert_eq!(names(&linked::KERNELS), ("Dome", "Air"));
+    assert_eq!(
+        names(&unlinked::KERNELS),
+        (DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM)
+    );
 }
 
 #[test]

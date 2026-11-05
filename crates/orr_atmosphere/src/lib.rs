@@ -21,6 +21,14 @@ pub use shaders::types::{AtmosphereGpu, AtmosphereGroups, FoldGpu};
 
 use orr_math::{DVec3, Vec3};
 
+impl orr::EnvironmentData for AtmosphereGpu {
+    const TYPE: &'static str = "AtmosphereSky";
+}
+
+impl orr::MediumData for AtmosphereGpu {
+    const TYPE: &'static str = "AtmosphereMedium";
+}
+
 /// Generated kernel modules and the Rust types of the crate's Slang structs.
 mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));

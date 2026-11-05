@@ -4,12 +4,12 @@
 use std::f64::consts::PI;
 
 use bytemuck::Zeroable;
-use lighting_suite::shaders::{emit, hotspot_bake, nee_probe, procedural_bake, tile_probe};
+use lighting_suite::shaders::{emit, hotspot_bake, nee_probe, tile_probe};
 use lighting_suite::{
     TestScene, assert_clean, compute_barrier, finish, kernels, linear_clamp, pipeline, read,
     readback, render, texture, upload,
 };
-use orr_gpu::{ComputePipeline, GpuAddress, GpuPtr, Hazards, KernelSet, Stages};
+use orr_gpu::{ComputePipeline, DEFAULT_MEDIUM, GpuPtr, Hazards, KernelSet, Stages};
 use orr_lighting::{
     DirectionalLight, DiscProfile, EmissiveSelection, LIGHT_TILE_SIZE, LIGHT_TILES, Light, LightId,
     LightSample, LightSetGpu, SceneLighting, SceneLightingSettings, ScenePass,
@@ -17,14 +17,22 @@ use orr_lighting::{
 use orr_math::{Affine3, DVec3, Mat3, Vec3};
 use orr_pack::texture::octahedral;
 use orr_scene::{
-    ClusterTopology, Cone, EmissiveGpu, GroupWriter, InstanceFlags, MaterialGpu, MaterialId,
-    MaterialWriter, Opacity, ProducerDesc, ProducerId, ProducerUpdate, SceneCompute, SceneDesc,
-    SceneWriter, TransformGroupDesc, material_flags,
+    ClusterTopology, Cone, EmissiveGpu, EnvironmentData, GroupWriter, InstanceFlags, MaterialGpu,
+    MaterialId, MaterialWriter, Opacity, ProducerDesc, ProducerId, ProducerUpdate, SceneCompute,
+    SceneDesc, SceneWriter, TransformGroupDesc, material_flags,
 };
 use shader_math::stats::chi_square_p;
 
 const BAKE: &str = "environment/bake";
 const SAMPLES: u32 = LIGHT_TILES * LIGHT_TILE_SIZE;
+
+/// `hotspot_bake.slang`'s `HotSpot`, which reads no record.
+struct HotSpotData;
+
+impl EnvironmentData for HotSpotData {
+    const TYPE: &'static str = "HotSpot";
+    const NULL_SAFE: bool = true;
+}
 
 fn y2020(c: [f32; 3]) -> f64 {
     orr_color::luminance(DVec3::new(c[0].into(), c[1].into(), c[2].into()))
@@ -202,12 +210,12 @@ fn polygon_irradiance(v: &[DVec3], n: DVec3, luminance: f64) -> f64 {
 
 #[test]
 fn environment_tiles_match_the_density() {
-    let mut scene = TestScene::new(SceneDesc {
+    let mut scene = TestScene::procedural(SceneDesc {
         light_capacity: 4,
         ..SceneDesc::default()
     });
     scene.write(|_, _| {});
-    let mut lighting = scene.lighting(&kernels(&[(&procedural_bake::MODULE, BAKE)]));
+    let mut lighting = scene.lighting();
     let t = tiles(&scene, &mut lighting, &Bins::around_y(PI, 16, 32));
     t.assert_match_density("procedural sky");
     assert_clean();
@@ -215,12 +223,20 @@ fn environment_tiles_match_the_density() {
 
 #[test]
 fn a_half_degree_hot_spot_is_sampled_at_its_own_density() {
-    let mut scene = TestScene::new(SceneDesc {
+    let linked = kernels(
+        HotSpotData::TYPE,
+        DEFAULT_MEDIUM,
+        &[(&hotspot_bake::MODULE, BAKE)],
+    );
+    let desc = SceneDesc {
         light_capacity: 4,
         ..SceneDesc::default()
+    };
+    let mut scene = TestScene::linked(desc, linked, |w| {
+        w.set_environment(GpuPtr::<HotSpotData>::NULL);
     });
     scene.write(|_, _| {});
-    let mut lighting = scene.lighting(&kernels(&[(&hotspot_bake::MODULE, BAKE)]));
+    let mut lighting = scene.lighting();
     let spot = Vec3::from_array(octahedral::to_dir([100.25 / 256.0, 60.25 / 256.0]));
     let bins = Bins {
         axis: spot,
@@ -270,7 +286,7 @@ fn sphere_tiles_match_the_density_and_irradiance() {
         )
         .unwrap();
     });
-    let mut lighting = scene.lighting(&KernelSet::default());
+    let mut lighting = scene.lighting();
     // The cap of sphere a ends on a ring boundary.
     let rings = 8;
     let cap = 2.0 * (0.5 * (0.5f64 / 3.0).asin()).sin().powi(2);
@@ -322,7 +338,7 @@ fn rect_tiles_match_the_density_and_irradiance() {
         )
         .unwrap();
     });
-    let mut lighting = scene.lighting(&KernelSet::default());
+    let mut lighting = scene.lighting();
     let t = tiles(
         &scene,
         &mut lighting,
@@ -508,7 +524,7 @@ fn emissive_producer_tiles_match_the_density_and_irradiance() {
         },
         |c| quads.iter().for_each(|q| q.dispatch(c, &p)),
     );
-    let mut lighting = scene.lighting(&KernelSet::default());
+    let mut lighting = scene.lighting();
     let t = tiles(
         &scene,
         &mut lighting,
@@ -599,7 +615,7 @@ fn lit_through_a_texture(
         },
         |c| quads.dispatch(c, &p),
     );
-    let mut lighting = scene.lighting(&KernelSet::default());
+    let mut lighting = scene.lighting();
     let t = tiles(
         &scene,
         &mut lighting,
@@ -638,7 +654,7 @@ fn run_nee_probe(
 
 #[test]
 fn directional_share_matches_the_lights_weights() {
-    let mut scene = TestScene::new(SceneDesc {
+    let mut scene = TestScene::procedural(SceneDesc {
         light_capacity: 8,
         ..SceneDesc::default()
     });
@@ -683,7 +699,7 @@ fn directional_share_matches_the_lights_weights() {
         )
         .unwrap();
     });
-    let mut lighting = scene.lighting(&kernels(&[(&procedural_bake::MODULE, BAKE)]));
+    let mut lighting = scene.lighting();
     let (rings, sectors, frames, threads) = (4u32, 8u32, 16u32, 1u32 << 16);
     let per_light = rings * sectors;
     let bins = ids.len() as u32 * per_light + 2;
@@ -785,7 +801,7 @@ fn directional_share_matches_the_lights_weights() {
 
 #[test]
 fn selection_probabilities_follow_power_and_sum_to_one() {
-    let mut scene = TestScene::new(SceneDesc {
+    let mut scene = TestScene::procedural(SceneDesc {
         light_capacity: 8,
         producer_capacity: 2,
         emissive_capacity: 4,
@@ -846,7 +862,7 @@ fn selection_probabilities_follow_power_and_sum_to_one() {
         },
         |c| quads.dispatch(c, &p),
     );
-    let mut lighting = scene.lighting(&kernels(&[(&procedural_bake::MODULE, BAKE)]));
+    let mut lighting = scene.lighting();
     scene_pass(&scene, &mut lighting, scene.frame);
     let stats = lighting.stats(scene.frame).unwrap();
     assert_eq!(
@@ -966,7 +982,7 @@ fn producer_power_equals_area_times_luminance_after_it_moves() {
         },
         |c| first.dispatch(c, &p),
     );
-    let mut lighting = scene.lighting(&KernelSet::default());
+    let mut lighting = scene.lighting();
     check_power(&scene, &mut lighting, first, linear, "first frame");
 
     let moved = Quads {
@@ -1004,8 +1020,8 @@ fn a_scene_without_lights_gives_empty_candidates_and_no_nan() {
         emissive_capacity: 4,
         ..SceneDesc::default()
     });
-    scene.write(|w, _| w.set_environment(GpuAddress(0)));
-    let mut lighting = scene.lighting(&KernelSet::default());
+    scene.write(|_, _| {});
+    let mut lighting = scene.lighting();
     let threads = 1u32 << 14;
     let mut histogram = readback::<u32>(2, "histogram");
     histogram.as_mut_slice().unwrap().fill(0);
@@ -1071,7 +1087,7 @@ fn feed_back(set: &LightSetGpu, counts: &[u32]) {
 
 #[test]
 fn light_feedback_blends_into_the_selection_and_clears_on_a_reset() {
-    let mut scene = TestScene::new(SceneDesc {
+    let mut scene = TestScene::procedural(SceneDesc {
         light_capacity: 4,
         ..SceneDesc::default()
     });
@@ -1089,7 +1105,7 @@ fn light_feedback_blends_into_the_selection_and_clears_on_a_reset() {
             .unwrap();
         }
     });
-    let mut lighting = scene.lighting(&kernels(&[(&procedural_bake::MODULE, BAKE)]));
+    let mut lighting = scene.lighting();
     let share = f64::from(SceneLightingSettings::default().feedback_share);
     let mut frame = scene.frame;
     scene_pass(&scene, &mut lighting, frame);

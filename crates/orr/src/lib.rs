@@ -61,14 +61,14 @@ pub use orr_scene::{self, RasterView};
 pub use orr_scene::{
     AffineRows, ArenaReport, ArenaTarget, BlobId, BlobTarget, BoundTexture, Budgets, ClassStats,
     ClipRef, ClusterTopology, Cone, ConsumerMarker, CopyVariant, Decal, DecalChannels, DecalId,
-    DepthOfField, DirectionalLight, DiscProfile, EditDesc, EditId, EditRef, ExposureState, Focus,
-    FrameStats, FrameTime, Glare, GroupWriter, InstanceFlags, InstancePage, InstancePageRef,
-    InstanceRange, InstancesDesc, JobResult, Lens, LensDistortion, Light, LightId, LoadState,
-    Loading, MaterialGpu, MaterialId, MaterialWriter, ModelId, MountId, NeuralTextures, Opacity,
-    OriginPolicy, PackSource, PageId, PipelineId, Pose, ProducerBatch, ProducerDesc, ProducerId,
-    ProducerStats, ProducerUpdate, Projection, RasterGpu, ReloadReport, RendererDesc,
-    ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc, SceneId, SceneRoot,
-    SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats, Span, TextureFilter,
+    DepthOfField, DirectionalLight, DiscProfile, EditDesc, EditId, EditRef, EnvironmentData,
+    ExposureState, Focus, FrameStats, FrameTime, Glare, GroupWriter, InstanceFlags, InstancePage,
+    InstancePageRef, InstanceRange, InstancesDesc, JobResult, Lens, LensDistortion, Light, LightId,
+    LoadState, Loading, MaterialGpu, MaterialId, MaterialWriter, MediumData, ModelId, MountId,
+    NeuralTextures, Opacity, OriginPolicy, PackSource, PageId, PipelineId, Pose, ProducerBatch,
+    ProducerDesc, ProducerId, ProducerStats, ProducerUpdate, Projection, RasterGpu, ReloadReport,
+    RendererDesc, ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc, SceneId,
+    SceneRoot, SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats, Span, TextureFilter,
     TextureSamplerGpu, TextureStreamGpu, TransformGroupDesc, TransformGroupId, TransparencyPass,
     ViewConstants, ViewDesc, ViewHistoryId, ViewStep, WorldPos, abi, binding_sampler,
     material_flags, orr_gpu, orr_pack,
@@ -1010,7 +1010,9 @@ impl<'a> Frame<'a> {
         self.scenes.latency_marker(marker);
     }
 
-    /// Step 3: applies every write, then hands each listed scene in order to `compute`.
+    /// Step 3: applies every write, then hands each listed scene in order to `compute`. Panics
+    /// if a listed scene never set the data of an environment or medium its kernels link, as
+    /// does any step that runs this one.
     pub fn update_scenes(
         &mut self,
         compute: &mut dyn FnMut(&mut SceneCompute<'_, 'a>),

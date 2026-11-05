@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
-use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, MemoryKind};
+use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, KernelSet, MemoryKind};
 use orr_math::{DVec3, IVec3};
 use rustc_hash::FxHashSet;
 
@@ -555,8 +555,10 @@ pub(crate) struct SceneCpu {
     /// The largest request since the last update.
     pub(crate) requested_detail: Option<f32>,
     pub(crate) origin_cell: IVec3,
-    pub(crate) environment: u64,
-    pub(crate) medium: u64,
+    /// `None` until `set_environment`: a data-free type's call sets null.
+    pub(crate) environment: Option<u64>,
+    /// `None` until `set_medium`: a data-free type's call sets null.
+    pub(crate) medium: Option<u64>,
     pub(crate) surface_data: u64,
     pub(crate) near_range: f32,
     pub(crate) ptlas: Ptlas,
@@ -891,8 +893,8 @@ impl Scene {
                 pixels_per_radian: DEFAULT_PIXELS_PER_RADIAN,
                 requested_detail: None,
                 origin_cell: IVec3::ZERO,
-                environment: 0,
-                medium: 0,
+                environment: None,
+                medium: None,
                 surface_data: 0,
                 near_range: 256.0,
                 ptlas: Ptlas::new(device, desc)?,
@@ -921,6 +923,22 @@ impl Scene {
     }
 }
 
+/// A record a linked environment reads; `TYPE` is the Slang type that reads it.
+pub trait EnvironmentData: 'static {
+    const TYPE: &'static str;
+    /// `TYPE` is safe on a null pointer, as it reads no data or checks for null, so
+    /// `SceneWriter::set_environment` takes one.
+    const NULL_SAFE: bool = false;
+}
+
+/// A record a linked medium reads; `TYPE` is the Slang type that reads it.
+pub trait MediumData: 'static {
+    const TYPE: &'static str;
+    /// `TYPE` is safe on a null pointer, as it reads no data or checks for null, so
+    /// `SceneWriter::set_medium` takes one.
+    const NULL_SAFE: bool = false;
+}
+
 /// Writes one scene's changes into this frame's upload window. Returned slices are
 /// write-only (write-combined memory) and live until `update_scenes`. Send: different
 /// scenes' writers, and disjoint pieces of one returned slice, can be filled on different
@@ -928,6 +946,7 @@ impl Scene {
 pub struct SceneWriter<'f> {
     pub(crate) scene: &'f Scene,
     pub(crate) device: &'f Device,
+    pub(crate) kernels: &'static KernelSet,
     pub(crate) window: &'f UploadWindow,
     pub(crate) seq: &'f AtomicU64,
     pub(crate) frame: u64,
@@ -2136,14 +2155,42 @@ impl<'f> SceneWriter<'f> {
         )
     }
 
-    /// Consumer data for the linked environment.
-    pub fn set_environment(&mut self, data: GpuAddress) {
-        self.scene.cpu.lock().unwrap().environment = data.0;
+    /// Consumer data for the linked environment, which kernels that link one need before the
+    /// scene's first `update_scenes`. An environment that reads no data takes a null pointer to
+    /// its `T`. Panics unless the kernels link the type that reads `T`, and on a null pointer
+    /// unless `T` is [`NULL_SAFE`](EnvironmentData::NULL_SAFE).
+    pub fn set_environment<T: EnvironmentData>(&mut self, data: GpuPtr<T>) {
+        assert!(
+            self.kernels.environment == T::TYPE,
+            "the kernels link {} as the environment; this data is for {}",
+            self.kernels.environment,
+            T::TYPE
+        );
+        assert!(
+            T::NULL_SAFE || data != GpuPtr::NULL,
+            "{} reads its data, and this data is null",
+            T::TYPE
+        );
+        self.scene.cpu.lock().unwrap().environment = Some(data.address().0);
     }
 
-    /// Consumer data for the linked medium.
-    pub fn set_medium(&mut self, data: GpuAddress) {
-        self.scene.cpu.lock().unwrap().medium = data.0;
+    /// Consumer data for the linked medium, which kernels that link one need before the scene's
+    /// first `update_scenes`. A medium that reads no data takes a null pointer to its `T`.
+    /// Panics unless the kernels link the type that reads `T`, and on a null pointer unless `T`
+    /// is [`NULL_SAFE`](MediumData::NULL_SAFE).
+    pub fn set_medium<T: MediumData>(&mut self, data: GpuPtr<T>) {
+        assert!(
+            self.kernels.medium == T::TYPE,
+            "the kernels link {} as the medium; this data is for {}",
+            self.kernels.medium,
+            T::TYPE
+        );
+        assert!(
+            T::NULL_SAFE || data != GpuPtr::NULL,
+            "{} reads its data, and this data is null",
+            T::TYPE
+        );
+        self.scene.cpu.lock().unwrap().medium = Some(data.address().0);
     }
 
     /// Consumer data for linked surfaces whose material names none (`MaterialGpu::data`).

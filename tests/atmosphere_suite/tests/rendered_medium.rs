@@ -61,13 +61,14 @@ fn bed(atmosphere: &Atmosphere, copies: Vec<Item>) -> Bed {
         kernels: &KERNELS,
         ..RendererDesc::default()
     };
-    let mut bed = Bed::with_rt_range(spec, &renderer, 200_000.0);
-    bed.set_near_range(NEAR_RANGE);
     let mut sky = AtmosphereState::new(device(), atmosphere, 0).unwrap();
     sky.set_lights(&[SUN]);
     sky.set_multiple_scattering(false);
-    bed.set_medium(sky.data());
-    bed.set_environment(sky.data());
+    let mut bed = Bed::with_linked(spec, &renderer, 200_000.0, |w| {
+        w.set_medium(sky.data());
+        w.set_environment(sky.data());
+    });
+    bed.set_near_range(NEAR_RANGE);
     bed.set_scene_compute(Box::new(move |cx| {
         sky.skip_fades();
         sky.record(cx, &[]).unwrap();

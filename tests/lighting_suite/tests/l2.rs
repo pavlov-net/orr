@@ -3,25 +3,24 @@
 use std::f64::consts::PI;
 
 use lighting_suite::shaders::{
-    disc_probe, env_probe, fog_probe, glint, octahedral as mapping, procedural_bake,
-    slab_directional, textured_probe,
+    disc_probe, env_probe, fog_probe, glint, octahedral as mapping, slab_directional,
+    textured_probe,
 };
 use lighting_suite::{
     TestScene, TestTexture, assert_clean, compute_barrier, copy_back, finish, kernels,
     linear_clamp, pipeline, read, readback, render, texture, upload,
 };
 use orr_color::RgbPrimaries;
-use orr_gpu::{GpuAddress, KernelSet, TextureIndex};
+use orr_gpu::{DEFAULT_ENVIRONMENT, GpuPtr, KernelSet, TextureIndex};
 use orr_lighting::{
     DirectionalLight, DirectionalState, DiscProfile, EnvironmentMapGpu, Light, LightId,
     SceneLighting,
 };
 use orr_math::{Affine3, DVec3, Mat3, Vec3};
 use orr_pack::texture::octahedral;
-use orr_scene::{LightGpu, SceneDesc};
+use orr_scene::{LightGpu, MediumData, SceneDesc, SceneWriter};
 use shader_math::stats::{Rng, chi_square_p};
 
-const BAKE: &str = "environment/bake";
 const DIRECTIONAL: &str = "light_sampling/directional";
 
 /// The slab's extinction and height (`media_types.slang`).
@@ -30,19 +29,30 @@ const SLAB_HEIGHT: f64 = 1000.0;
 
 const SUN_RADIUS: f32 = 4.65e-3;
 
-/// A scene holding `lights` from LightId 0 and the environment `environment`, after one
-/// frame.
-fn scene_with(lights: &[DirectionalLight], environment: GpuAddress) -> TestScene {
-    let mut scene = TestScene::new(SceneDesc {
+/// `media_types.slang`'s `Slab`, which reads no record.
+struct SlabData;
+
+impl MediumData for SlabData {
+    const TYPE: &'static str = "Slab";
+    const NULL_SAFE: bool = true;
+}
+
+/// A scene on `kernels` holding `lights` from LightId 0 and what `data` sets, after one frame.
+fn scene_with(
+    kernels: &'static KernelSet,
+    lights: &[DirectionalLight],
+    data: impl FnOnce(&mut SceneWriter<'_>) + 'static,
+) -> TestScene {
+    let desc = SceneDesc {
         light_capacity: 8,
         ..SceneDesc::default()
-    });
+    };
+    let mut scene = TestScene::linked(desc, kernels, data);
     scene.write(|w, _| {
         for (i, l) in lights.iter().enumerate() {
             w.set_light(LightId(i as u32), Some(&Light::Directional(*l)))
                 .unwrap();
         }
-        w.set_environment(environment);
     });
     scene
 }
@@ -258,16 +268,21 @@ fn hdr_map_sampling_matches_its_density() {
         }],
         "hdr map data",
     );
-    let scene = scene_with(&[], data.gpu().address());
-    let mut lighting = scene.lighting(&KernelSet::default());
+    let map = data.gpu();
+    let scene = scene_with(&KernelSet::NONE, &[], move |w| w.set_environment(map));
+    let mut lighting = scene.lighting();
     sampling_matches_density(&scene, &mut lighting);
     assert_clean();
 }
 
 #[test]
 fn procedural_sky_sampling_matches_its_density() {
-    let scene = scene_with(&[], GpuAddress(0));
-    let mut lighting = scene.lighting(&kernels(&[(&procedural_bake::MODULE, BAKE)]));
+    let mut scene = TestScene::procedural(SceneDesc {
+        light_capacity: 8,
+        ..SceneDesc::default()
+    });
+    scene.write(|_, _| {});
+    let mut lighting = scene.lighting();
     sampling_matches_density(&scene, &mut lighting);
     assert_clean();
 }
@@ -299,8 +314,17 @@ fn sky_stats_match_a_uniform_environment_and_a_slab() {
             TextureIndex::NONE,
         ),
     ];
-    let scene = scene_with(&lights, data.gpu().address());
-    let mut lighting = scene.lighting(&kernels(&[(&slab_directional::MODULE, DIRECTIONAL)]));
+    let linked = kernels(
+        DEFAULT_ENVIRONMENT,
+        SlabData::TYPE,
+        &[(&slab_directional::MODULE, DIRECTIONAL)],
+    );
+    let map = data.gpu();
+    let scene = scene_with(linked, &lights, move |w| {
+        w.set_environment(map);
+        w.set_medium(GpuPtr::<SlabData>::NULL);
+    });
+    let mut lighting = scene.lighting();
     let focus = [10.0, 100.0, -5.0];
     let mut list = render().command_list().unwrap();
     lighting.record(&mut list, &scene.pass(focus));
@@ -385,7 +409,7 @@ fn discs(lights: &[DirectionalLight], focus: [f32; 3]) -> Discs {
             c.cmd.dispatch(&probe, root, [1, 1, 1]);
         },
     );
-    let mut lighting = scene.lighting(&KernelSet::default());
+    let mut lighting = scene.lighting();
     let integrals = readback::<[f32; 4]>(u64::from(count), "disc integrals");
     let root = upload(
         &[disc_probe::Root {
@@ -518,8 +542,8 @@ fn glint_converges_to_the_same_value_from_nee_and_bsdf_sampling() {
             albedo.index,
         ),
     ];
-    let scene = scene_with(&table, GpuAddress(0));
-    let mut lighting = scene.lighting(&KernelSet::default());
+    let scene = scene_with(&KernelSet::NONE, &table, |_| {});
+    let mut lighting = scene.lighting();
     let threads = 1u32 << 16;
     let per_thread = 1024;
     let sums: Vec<_> = (0..table.len())
