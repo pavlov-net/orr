@@ -1622,7 +1622,7 @@ fn winding_and_normals_agree_on_flat_products() {
 /// A primitive without the uv set its material reads fails in either layout, even when
 /// another primitive of the mesh has it.
 #[test]
-fn a_primitive_needs_the_uv_set_its_material_reads() {
+fn a_primitive_without_the_uv_set_its_material_reads_warns() {
     let d = dir("gltf-uv1-primitive");
     let mut g = Glb::default();
     let pos = [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
@@ -1651,10 +1651,12 @@ fn a_primitive_needs_the_uv_set_its_material_reads() {
             layout,
             ..GltfSettings::default()
         };
-        let Err(e) = cook(&path, settings) else {
-            panic!("{layout:?} cooked a primitive without TEXCOORD_1");
-        };
-        assert!(e.to_string().contains("TEXCOORD_1"), "{layout:?}: {e}");
+        let (_, report) = cook(&path, settings).unwrap();
+        let warnings = &report.assets[0].warnings;
+        assert!(
+            warnings.iter().any(|w| w.contains("TEXCOORD_1")),
+            "{layout:?}: {warnings:?}"
+        );
     }
 }
 

@@ -256,9 +256,19 @@ impl MeshSource {
         }
     }
 
-    /// The mesh, read now if it is lazy; a lazy mesh whose triangles no longer match its
-    /// sections fails as changed.
+    /// The mesh, read now if it is lazy, and without a uv set 1 its sections don't read.
     pub(crate) fn load(self, asset: &str, memo: &Memo) -> Result<MeshData> {
+        let lazy = matches!(self, Self::Lazy(_));
+        let mut m = self.read(asset, memo)?;
+        if lazy {
+            m.drop_unread_uv1();
+        }
+        Ok(m)
+    }
+
+    /// The mesh with every uv set, for sections that don't yet know what they read. A lazy mesh
+    /// whose triangles no longer match its sections fails as changed.
+    pub(crate) fn read(self, asset: &str, memo: &Memo) -> Result<MeshData> {
         let _z = crate::profile::zone!("mesh.load");
         match self {
             Self::Data(m) => Ok(*m),
@@ -275,7 +285,6 @@ impl MeshSource {
                     });
                 }
                 m.sections = l.sections;
-                m.drop_unread_uv1();
                 Ok(m)
             }
         }
@@ -437,18 +446,6 @@ pub(crate) struct DisplacementTexture {
 }
 
 impl MapSpec {
-    /// The uv sets the mesh cook reads for the spec.
-    fn cook_uv_sets(&self) -> impl Iterator<Item = usize> {
-        let opacity = match self.opacity {
-            OpacitySpec::Texture { uv_set, .. } => Some(uv_set),
-            _ => None,
-        };
-        let displacement = self.displacement.as_ref().and_then(|d| d.texture.as_ref());
-        let displacement = displacement.map(|t| t.uv_set);
-        let normal = self.normal.tangent_set();
-        opacity.into_iter().chain(displacement).chain(normal)
-    }
-
     /// The texture units the spec reads.
     pub(crate) fn units(&self) -> impl Iterator<Item = &str> {
         let opacity = match &self.opacity {
@@ -960,20 +957,6 @@ pub(crate) fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
     if !(1..=2).contains(&m.uvs.len()) {
         return Err(format!("{} uv sets; meshes carry one or two", m.uvs.len()));
     }
-    if m.uvs.len() < 2
-        && let Some(i) = m.sections.iter().position(|s| s.maps.uv1)
-    {
-        return Err(format!(
-            "section {i}: its material reads uv set 1, which the mesh does not have"
-        ));
-    }
-    for (i, sec) in m.sections.iter().enumerate() {
-        if let Some(set) = sec.maps.cook_uv_sets().find(|&set| set >= m.uvs.len()) {
-            return Err(format!(
-                "section {i}: its material reads uv set {set}, which the mesh does not have"
-            ));
-        }
-    }
     if let LodMode::Discrete { errors } = &s.lod {
         if errors.len() > 254 {
             return Err(format!("{} levels; at most 255", errors.len() + 1));
@@ -1453,6 +1436,25 @@ impl MeshData {
         if !self.sections.iter().any(|s| s.maps.uv1) {
             self.uvs.truncate(1);
         }
+    }
+
+    /// Gives what a section reads of a uv set the mesh lacks the reading the shaders give it, a
+    /// uv of zero. Returns a warning per such section.
+    pub(crate) fn pad_uv_sets(&mut self) -> Vec<String> {
+        if self.uvs.len() >= 2 {
+            return Vec::new();
+        }
+        let sections = self.sections.iter().enumerate();
+        let warnings: Vec<String> = sections
+            .filter(|(_, s)| s.maps.uv1)
+            .map(|(i, _)| {
+                format!("section {i} reads uv set 1, which the mesh lacks; it reads uv 0")
+            })
+            .collect();
+        if !warnings.is_empty() {
+            self.uvs.push(vec![[0.0; 2]; self.positions.len()]);
+        }
+        warnings
     }
 
     /// Gives a mesh without tangents MikkTSpace-compatible ones when a section reads them,

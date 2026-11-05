@@ -1953,7 +1953,7 @@ fn material_unit(name: String, m: &Material) -> NewUnit<'static> {
 fn map_spec(m: &Material, textures: &HashMap<AssetId, (String, Hash32)>) -> MapSpec {
     let bound = |s: usize| {
         let b = m.textures[s];
-        (b.texture != AssetId::NONE).then(|| (textures.get(&b.texture), usize::from(b.uv_set)))
+        (b.texture != AssetId::NONE).then(|| (textures.get(&b.texture), usize::from(b.uv_set & 1)))
     };
     let read = |s: usize| MapRead {
         wrap: m.textures[s].wrap.map(Wrap::of_binding),
@@ -2496,6 +2496,7 @@ fn cook_unit(
         }
         Work::Mesh(source, settings, archives) => {
             let mut data = source.load(name, &shared.memo)?;
+            let uv_warnings = data.pad_uv_sets();
             mesh::check(&data, &settings).map_err(|message| Error::Mesh {
                 asset: name.into(),
                 message,
@@ -2508,6 +2509,7 @@ fn cook_unit(
             let cooked = mesh::cook(name, &data, &settings, &maps)?;
             drop((data, maps));
             detail.warnings = cooked.warnings;
+            detail.warnings.extend(uv_warnings);
             detail.tangents = cooked.tangents;
             let info = cooked.info.to_bytes();
             let pinned = cooked.info.header.pinned_pages as usize;

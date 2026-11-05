@@ -839,6 +839,40 @@ fn tangents_split_a_vertex_where_uvs_fold() {
     }
 }
 
+/// A mesh read at plan time for assemblies keeps the uv set its normal map reads, which its
+/// sections only learn of later.
+#[test]
+fn assemblies_keep_the_uv_set_a_material_reads() {
+    let path = dir("assembly-uv1").join("quads.glb");
+    let (p, n, uv, _, idx) = tangent_quads::arrays();
+    let mut g = Glb::default();
+    let set1 = g.floats(&uv, "VEC2");
+    let zeros = vec![[0.0f32; 2]; uv.len()];
+    let prim = primitive(&mut g, (&p, Some(&n), None), &zeros, &idx, "").replace(
+        r#""TEXCOORD_0""#,
+        &format!(r#""TEXCOORD_1":{set1},"TEXCOORD_0""#),
+    );
+    write_mesh(
+        g,
+        &path,
+        &[prim],
+        "",
+        r#"{"normalTexture":{"index":0,"texCoord":1}}"#,
+    );
+    let mut settings = keeping_tangents(GltfLayout::Meshes);
+    settings.mesh.assemblies = Some(orr_cook::AssemblySettings {
+        min_triangles: 1000,
+    });
+    let (a, report) = cook(&path, settings).unwrap();
+    assert!(report.assets[0].warnings.is_empty());
+    assert_published(&corner_tangents(&a, "g/mesh/0/mesh"));
+    let got = per_triangle(&a, "g/mesh/0/mesh", |view, c, t| view.uv(c, t[0], 1));
+    assert!(
+        got.iter()
+            .all(|u| uv.iter().any(|w| (u[0] - w[0]).abs() < 1e-3))
+    );
+}
+
 /// `path` without its primitives' `TANGENT`, written to `out`.
 fn without_tangents(path: &Path, out: &Path) {
     let glb = std::fs::read(path).unwrap();

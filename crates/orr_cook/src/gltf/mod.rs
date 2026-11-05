@@ -773,11 +773,16 @@ impl Imported<'_> {
             .textures
             .refs()
             .any(|r| r.uv_set == 1);
+        // L2628 "**MUST** define" them and gives no reading; TEXCOORD_0 reads zero alike.
         if reads_uv1 && prim.get(&Semantic::TexCoords(1)).is_none() {
-            return Err(self.fail(format!(
-                "mesh {mesh} primitive {}: its material reads TEXCOORD_1, which the primitive does not have",
+            let warning = format!(
+                "mesh {mesh} primitive {}: its material reads TEXCOORD_1, which the primitive does not have; it reads uv 0",
                 prim.index()
-            )));
+            );
+            // Every node placing the mesh comes through here.
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning);
+            }
         }
         Ok(())
     }
@@ -959,7 +964,7 @@ impl Imported<'_> {
         // Assemblies split the mesh when it is planned, so such a model is read now.
         let mesh = if settings.assemblies.is_some() {
             MeshSource::Data(Box::new(
-                MeshSource::Lazy(lazy).load(self.asset, self.memo)?,
+                MeshSource::Lazy(lazy).read(self.asset, self.memo)?,
             ))
         } else {
             MeshSource::Lazy(lazy)
@@ -1080,7 +1085,8 @@ fn meshes_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     }
     // Every placed mesh's buffer files, hashed together.
     let shown = b.shown.clone();
-    b.warnings = skipped_primitives(doc, shown.iter().copied());
+    b.warnings
+        .extend(skipped_primitives(doc, shown.iter().copied()));
     let mut views = Vec::new();
     for &n in &shown {
         if let Some(mesh) = doc.nodes().nth(n).and_then(|d| d.mesh()) {
@@ -1219,10 +1225,12 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
     let rigid = skeleton.as_ref().filter(|_| settings.parts_from_skin);
     let (mut models, mut owner) = select_models(doc, graph, &shown, settings).map_err(fail)?;
     let placed = shown.iter().copied();
-    b.warnings = skipped_primitives(
+    let skipped = skipped_primitives(
         doc,
         placed.filter(|&n| owner[n].is_some() || is_instanced[n]),
     );
+    let elsewhere = !instanced.is_empty() || !skipped.is_empty();
+    b.warnings.extend(skipped);
     for &n in &instanced {
         owner[n] = None;
     }
@@ -1285,7 +1293,6 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
     for building in models {
         let node = building.node;
         // The whole scene may hold nothing but instanced nodes and primitives without a surface.
-        let elsewhere = !instanced.is_empty() || !b.warnings.is_empty();
         if node.is_none() && building.groups.values().all(Vec::is_empty) && elsewhere {
             continue;
         }
