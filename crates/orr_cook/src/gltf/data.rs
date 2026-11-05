@@ -11,6 +11,7 @@
 //! whose `minVersion` is not glTF 2.0 or 2.1, or without one whose `version` has a major other
 //! than 2, is refused, as is a document whose `weights` arrays do not match its morph targets.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,7 @@ use gltf::accessor::{DataType, Dimensions};
 use gltf::buffer::Source as BufferSource;
 use meshopt::ffi;
 use orr_pack::Hash32;
+use percent_encoding::percent_decode_str;
 use serde_json::Value;
 
 /// Extensions the cook reads itself, removed from `extensionsRequired` before validation.
@@ -119,10 +121,7 @@ fn check_morph_weights(doc: &gltf::Document) -> Result<(), String> {
 pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
     let (json_bytes, mut bin) = if bytes.starts_with(b"glTF") {
         let glb = gltf::Glb::from_slice(bytes).map_err(|e| e.to_string())?;
-        (
-            glb.json.into_owned(),
-            glb.bin.map(std::borrow::Cow::into_owned),
-        )
+        (glb.json.into_owned(), glb.bin.map(Cow::into_owned))
     } else {
         (bytes.to_vec(), None)
     };
@@ -157,7 +156,7 @@ pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
             BufferSource::Uri(uri) => match data_uri(uri) {
                 Some(data) => data.map_err(|e| format!("buffer {}: {e}", b.index()))?,
                 None => {
-                    buffers.push(Buffer::File(dir.join(uri)));
+                    buffers.push(Buffer::File(uri_path(dir, uri)));
                     continue;
                 }
             },
@@ -178,14 +177,39 @@ pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
     Ok(d)
 }
 
-/// The bytes of a base64 data URI; `None` for any other URI.
+/// `uri` without the stray whitespace and control characters glTF recommends removing.
+fn clean_uri(uri: &str) -> Cow<'_, str> {
+    let stray = ['\t', '\n', '\r'];
+    let uri = uri.trim_matches(|c| c <= ' ');
+    match uri.contains(stray) {
+        true => uri.replace(stray, "").into(),
+        false => uri.into(),
+    }
+}
+
+/// The file that relative path `uri` names under `dir`.
+pub(super) fn uri_path(dir: &Path, uri: &str) -> PathBuf {
+    let path = clean_uri(uri).replace('\\', "/");
+    dir.join(&*percent_decode_str(&path).decode_utf8_lossy())
+}
+
+/// The bytes of a data URL, base64 or percent-encoded; `None` for any other URI.
 pub(super) fn data_uri(uri: &str) -> Option<Result<Vec<u8>, String>> {
-    let data = uri.strip_prefix("data:")?;
-    Some(match data.split_once(";base64,") {
-        Some((_, b64)) => base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .map_err(|e| e.to_string()),
-        None => Err("data URI is not base64".into()),
+    let uri = clean_uri(uri);
+    let (scheme, data) = uri.split_at_checked("data:".len())?;
+    if !scheme.eq_ignore_ascii_case("data:") {
+        return None;
+    }
+    let Some((header, payload)) = data.split_once(',') else {
+        return Some(Err("data URL has no comma before its data".into()));
+    };
+    let bytes = Cow::<[u8]>::from(percent_decode_str(payload));
+    Some(if header.to_ascii_lowercase().ends_with(";base64") {
+        base64::engine::general_purpose::STANDARD
+            .decode(bytes)
+            .map_err(|e| e.to_string())
+    } else {
+        Ok(bytes.into_owned())
     })
 }
 

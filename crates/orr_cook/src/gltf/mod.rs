@@ -497,7 +497,7 @@ fn images(asset: &str, src: &Document, dir: &Path) -> Result<Vec<ImageFile>> {
                 None => (
                     uri.to_string(),
                     ImageData::File {
-                        path: dir.join(uri),
+                        path: data::uri_path(dir, uri),
                         read: None,
                     },
                 ),

@@ -31,6 +31,7 @@ mimalloc = { version = "=0.1.52", default-features = false }
 # Exact pin: no stable API before 1.0, and its composition shapes cooked meshes.
 openusd = "=0.8.0"
 orr_math.workspace = true
+percent-encoding = "2.3"
 png.workspace = true
 roxmltree = "0.21"
 rayon = "1"
