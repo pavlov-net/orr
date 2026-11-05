@@ -35,7 +35,6 @@ use crate::edit::{
     self, ClasInputs, EDIT_SPHERES, EditBatch, EditClas, EditDesc, EditDone, EditId, EditLoaded,
     EditRecorder, EditRef, EditSkin, EditSource, EditTables, EditTablesDesc, EditTask, Mirror,
 };
-use crate::emissive::{EmissiveSpan, ModelEmission, indexed_spans};
 use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored};
 use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler, candidate_class};
 use crate::medium_proxy::VolumeRef;
@@ -54,7 +53,7 @@ use crate::traverse::{PAGED_DEPTH, PageFeedback};
 use crate::upload::Record;
 use crate::{
     ClusterRef, EditGroupGpu, Error, MaskGpu, MaterialGpu, MeshGpu, ModelGpu, NeuralSetGpu,
-    NeuralTextureGpu, PartGpu, Result, SkinMeshGpu, TextureStreamGpu, material_flags,
+    NeuralTextureGpu, PartGpu, Result, SetTablesGpu, SkinMeshGpu, TextureStreamGpu, material_flags,
 };
 
 /// Where a pack's bytes come from.
@@ -121,8 +120,8 @@ struct PlacedMesh {
     cluster_count: u32,
     sections: u32,
     header: MeshHeader,
-    /// EMISSIVE clusters of the finest level, by mesh cluster index.
-    emissive: Vec<(u32, Cluster)>,
+    /// The ranks of its emissive and caster sets.
+    ranks: [u32; 2],
     /// Discrete levels, finest first: error and mesh cluster range.
     level_ranges: Vec<(f32, u32, u32)>,
     /// Every cluster by mesh cluster index, as its page decoded.
@@ -1006,7 +1005,6 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     if !fine.is_empty() {
         t.write(block, cut_stamps_at, &vec![0u8; 8 * fine.len()])?;
     }
-    let finest = info.levels.first().map(|l| l.clusters);
     let level_ranges = info
         .levels
         .iter()
@@ -1030,7 +1028,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             cluster_count: first,
             sections: info.sections.len() as u32,
             header,
-            emissive: Vec::new(),
+            ranks: [info.emissive.rank_count(), info.casters.rank_count()],
             level_ranges,
             clusters: absent,
             micromaps: vec![None; info.pages.len()],
@@ -1054,7 +1052,6 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
                 orr_pack::mesh::decode_page(stored, resident)?;
                 t.write(block, at, resident)?;
                 let view = PageView::new(resident, &header)?;
-                let emissive = finest_emissive(&view, first, finest);
                 let h: PageHeader =
                     bytemuck::pod_read_unaligned(&resident[..size_of::<PageHeader>()]);
                 let records = (0..view.cluster_count()).map(|i| view.cluster(i));
@@ -1063,7 +1060,6 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
                 let mut placed = t.placed.lock().unwrap();
                 let m = &mut placed.meshes[mesh];
                 m.pages[p] = block.gpu() + at;
-                m.emissive.extend(emissive);
                 m.clusters.extend(clusters);
                 m.micromaps[p] = micromap;
                 Ok(())
@@ -1086,18 +1082,12 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
 }
 
 /// Whether a mesh's pages past its pinned ones stream: a DAG mesh whose pages take more than
-/// `resident_max` bytes, unless it is skinned or has emissive sections, which light and
-/// skinning read cluster by cluster from mount.
+/// `resident_max` bytes, unless it is skinned, which reads cluster by cluster from mount.
 fn streams_pages(info: &MeshInfo, resident_max: u64) -> bool {
     let h = &info.header;
     let bytes: u64 = info.pages.iter().map(|p| u64::from(p.resident_len)).sum();
-    let emissive = info
-        .sections
-        .iter()
-        .any(|s| s.flags & orr_pack::mesh::Section::EMISSIVE != 0);
     info.levels.is_empty()
         && h.attributes & MeshHeader::SKIN == 0
-        && !emissive
         && (h.pinned_pages as usize) < info.pages.len()
         && bytes > resident_max
 }
@@ -1119,25 +1109,6 @@ pub(crate) fn page_infos(
             usage: h.omm_usage,
         });
     (clusters, micromap)
-}
-
-/// The EMISSIVE clusters of a page at the mesh's finest level: the first discrete level, or
-/// in DAG mode the clusters of zero error.
-fn finest_emissive(
-    view: &PageView<'_>,
-    first: u32,
-    finest: Option<orr_pack::Span>,
-) -> Vec<(u32, Cluster)> {
-    (0..view.cluster_count())
-        .map(|i| (first + i, view.cluster(i)))
-        .filter(|(index, c)| {
-            let in_finest = match finest {
-                Some(s) => (s.first..s.first + s.count).contains(index),
-                None => c.self_error == 0.0,
-            };
-            in_finest && c.flags & Cluster::EMISSIVE != 0
-        })
-        .collect()
 }
 
 fn gpu_format(vk_format: u32) -> Option<orr_gpu::Format> {
@@ -1453,7 +1424,6 @@ struct ResolvedMesh {
     /// A skinned mesh's skin table.
     skin_record: Option<SkinMeshGpu>,
     sections: u32,
-    spans: Vec<EmissiveSpan>,
     header: MeshHeader,
     levels: Vec<(f32, u32, u32)>,
     clusters: Vec<ClusterInfo>,
@@ -1581,7 +1551,6 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
         .meshes
         .into_iter()
         .map(|mut m| {
-            m.emissive.sort_by_key(|(i, _)| *i);
             m.clusters.sort_by_key(|(i, _)| *i);
             let clusters: Vec<ClusterInfo> = m.clusters.into_iter().map(|(_, c)| c).collect();
             let mut page_addresses = m.pages;
@@ -1594,6 +1563,16 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 }
                 // SAFETY: a table of blob 0, resident in the mount's block.
                 unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(m.info + u64::from(span.first))) }
+            };
+            let sets = |s: orr_pack::mesh::SetSpans, count: u32| SetTablesGpu {
+                sets: table(s.sets).cast(),
+                ranks: table(s.ranks).cast(),
+                clusters: table(s.clusters).cast(),
+                cdf: table(s.cdf).cast(),
+                index: table(s.index).cast(),
+                nodes: table(s.nodes).cast(),
+                count,
+                _pad: 0,
             };
             ResolvedMesh {
                 id: m.id,
@@ -1641,12 +1620,13 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                         cut_stamps: GpuPtr::from_address(orr_gpu::GpuAddress(m.cut_stamps)),
                         fine_cuts: 0,
                         section_count: m.sections,
+                        emissive: sets(m.header.emissive, m.ranks[0]),
+                        casters: sets(m.header.casters, m.ranks[1]),
                     }
                 },
                 page_addresses,
                 skin_record: None,
                 sections: m.sections,
-                spans: indexed_spans(m.emissive),
                 header: m.header,
                 levels: m.level_ranges,
                 clusters,
@@ -2171,7 +2151,6 @@ pub(crate) struct Apply<'a> {
     pub(crate) seq: &'a AtomicU64,
     pub(crate) records: &'a mut Vec<Record>,
     pub(crate) materials: &'a MaterialTable,
-    pub(crate) emission: &'a mut Vec<Option<ModelEmission>>,
     /// Sections and animated parts by `ModelId`.
     pub(crate) model_cpu: &'a mut Vec<ModelCpu>,
     /// Subdivision cages by `ModelId`.
@@ -2492,9 +2471,10 @@ impl Mounts {
         let (spheres, (own, groups)) = match m.source.finest_level {
             Some(level) => (None, edit::plan_level(&m.source.pages, level)),
             None => {
-                let spheres = desc
-                    .touched
-                    .filter(|t| t.len() <= EDIT_SPHERES && m.skin.is_none());
+                // Emissive sets hold level 0 of the whole mesh.
+                let spheres = desc.touched.filter(|t| {
+                    t.len() <= EDIT_SPHERES && m.skin.is_none() && m.gpu.emissive.count == 0
+                });
                 (spheres, edit::plan(&m.source.groups, spheres))
             }
         };
@@ -2772,16 +2752,12 @@ impl Mounts {
         w.put(self.models.gpu().offset(u64::from(model)), &[record])?;
         let id = ModelId(model);
         let i = id.0 as usize;
-        if w.emission.len() <= i {
-            w.emission.resize(i + 1, None);
-        }
         if w.model_cpu.len() <= i {
             w.model_cpu.resize(i + 1, ModelCpu::default());
         }
         if w.cages.len() <= i {
             w.cages.resize(i + 1, None);
         }
-        w.emission[i] = w.emission[p.model.0 as usize].clone();
         w.model_cpu[i] = ModelCpu {
             edit: true,
             ..w.model_cpu[p.model.0 as usize]
@@ -2911,22 +2887,13 @@ impl Mounts {
     }
 
     /// Ends an edit once `frame` has completed.
-    pub(crate) fn destroy_edit(
-        &mut self,
-        id: EditId,
-        frame: u64,
-        emission: &mut [Option<ModelEmission>],
-        cages: &mut [Option<ModelCage>],
-    ) {
+    pub(crate) fn destroy_edit(&mut self, id: EditId, frame: u64, cages: &mut [Option<ModelCage>]) {
         let Some(slot) = self.edits.get_mut(id.0 as usize) else {
             return;
         };
         match slot.take() {
             Some(EditEntry::Pending(p)) => p.cancel.store(true, Ordering::Relaxed),
             Some(EditEntry::Live(e)) => {
-                if let Some(x) = emission.get_mut(e.model.0 as usize) {
-                    *x = None;
-                }
                 if let Some(x) = cages.get_mut(e.model.0 as usize) {
                     *x = None;
                 }
@@ -3204,13 +3171,7 @@ impl Mounts {
     }
 
     /// Ends every edit of mount `m`'s meshes with it.
-    fn destroy_edits_of(
-        &mut self,
-        m: MountId,
-        frame: u64,
-        emission: &mut [Option<ModelEmission>],
-        cages: &mut [Option<ModelCage>],
-    ) {
+    fn destroy_edits_of(&mut self, m: MountId, frame: u64, cages: &mut [Option<ModelCage>]) {
         let of: Vec<EditId> = (0..self.edits.len())
             .filter(|&i| match &self.edits[i] {
                 Some(EditEntry::Pending(p)) => p.mount == m,
@@ -3220,7 +3181,7 @@ impl Mounts {
             .map(|i| EditId(i as u32))
             .collect();
         for id in of {
-            self.destroy_edit(id, frame, emission, cages);
+            self.destroy_edit(id, frame, cages);
         }
     }
 
@@ -3267,14 +3228,8 @@ impl Mounts {
 
     /// Unmounts `m`: a pending mount is canceled, a ready one is freed once `frame` has
     /// completed.
-    pub(crate) fn unmount(
-        &mut self,
-        m: MountId,
-        frame: u64,
-        emission: &mut [Option<ModelEmission>],
-        cages: &mut [Option<ModelCage>],
-    ) {
-        self.destroy_edits_of(m, frame, emission, cages);
+    pub(crate) fn unmount(&mut self, m: MountId, frame: u64, cages: &mut [Option<ModelCage>]) {
+        self.destroy_edits_of(m, frame, cages);
         let Some(slot) = self.entries.get_mut(m.0 as usize) else {
             return;
         };
@@ -3287,9 +3242,6 @@ impl Mounts {
                 let mut r = *r;
                 self.free_pages(&mut r);
                 for id in r.models.values() {
-                    if let Some(e) = emission.get_mut(id.0 as usize) {
-                        *e = None;
-                    }
                     if let Some(c) = cages.get_mut(id.0 as usize) {
                         *c = None;
                     }
@@ -3432,7 +3384,6 @@ impl Mounts {
             Ok(()) => Ok(res),
             Err(e) => {
                 for id in res.models.values() {
-                    w.emission[id.0 as usize] = None;
                     if let Some(c) = w.cages.get_mut(id.0 as usize) {
                         *c = None;
                     }
@@ -3550,9 +3501,6 @@ impl Mounts {
             res.model_gpus.insert(id, gpu);
             res.model_materials.insert(id, section_materials.clone());
             let i = id.0 as usize;
-            if w.emission.len() <= i {
-                w.emission.resize(i + 1, None);
-            }
             if w.model_cpu.len() <= i {
                 w.model_cpu.resize(i + 1, ModelCpu::default());
             }
@@ -3581,7 +3529,6 @@ impl Mounts {
                     cage_only: true,
                     ..ModelCpu::default()
                 };
-                w.emission[i] = None;
                 continue;
             };
             self.owners.insert(id, (mount, mesh_index as u32));
@@ -3601,15 +3548,10 @@ impl Mounts {
                         .iter()
                         .flat_map(|&k| side_flags(&materials, k)),
                 ),
+                emissive_sections: mesh.gpu.emissive.count,
                 cage_only: false,
                 edit: false,
             };
-            let spans = &mesh.spans;
-            w.emission[i] = (!spans.is_empty()).then(|| ModelEmission {
-                sections: n,
-                materials: section_materials,
-                spans: spans.clone(),
-            });
         }
         let mut page_entries = Vec::with_capacity(pages.len());
         for p in &pages {

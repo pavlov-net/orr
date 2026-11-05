@@ -50,20 +50,20 @@ public static const uint EMISSIVE_NONE = 0;
 public static const uint EMISSIVE_INSTANCE = 1;
 public static const uint EMISSIVE_PRODUCER = 2;
 
+// `EmissiveGpu.set` of an entry that emits nothing this frame.
+public static const uint NO_SET = 0xffffffff;
+
 // One entry of the scene's emissive list. Entries 0..producer_capacity are the producer
-// entries by ProducerId; the rest are EMISSIVE cluster spans of instance slots, one per
-// (slot, span). `power`, `area` and a producer's `cluster_count` are rewritten on the GPU
-// every frame the scene is updated.
+// entries by ProducerId; the rest are the emissive sections of instance slots, one per
+// (slot, section rank). All but `kind`, `source` and `rank` are rewritten on the GPU every
+// frame the scene is updated.
 public struct EmissiveGpu
 {
     public uint kind;            // EMISSIVE_*
     public uint source;          // instance slot or ProducerId
-    public uint first_cluster;   // instance: the span's first mesh cluster, finest level
-    public uint cluster_count;   // instance: the span's clusters; producer: emissive clusters emitted
-    public uint section;         // instance: the span's model section
-    public uint sections;        // instance: the model's section count, the material-set stride
-    public uint material;        // instance: the section's MaterialId for a copy with no set
-    public float model_area;     // instance: sum of the span's Cluster.area, model space, m^2
+    public uint rank;            // instance: its section's rank in its mesh's emissive sets
+    public uint set;             // instance: its entry of `MeshGpu.emissive.sets` at the traced cut, or NO_SET
+    public uint cluster_count;   // instance: the set's clusters; producer: emissive clusters emitted
     public float3 power;         // luminance x area per channel (nit m^2), 0 when hidden
-    public float area;           // emitting area in render space, m^2
+    public float area;           // emitting area in render space, m^2; an instance's weighs texels by their share of the emission factor
 }

@@ -708,8 +708,8 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
     let panel_id = AssetId::from_name("kit/panel");
     let panel = scenes.model(m, panel_id).unwrap();
 
-    // One copy of the panel lists the finest level's EMISSIVE clusters of its glowing
-    // section, summed as the archive's pages hold them.
+    // One copy of the panel takes one entry for its glowing section, the cooked set of the
+    // level it traces, whose weight the archive's pages add up to.
     let list = [s];
     let mut f = scenes
         .begin_frame(&FrameDesc {
@@ -757,7 +757,13 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
     let info = ModelInfo::parse(&blob(&a, entry(&a, panel_id), 0)).unwrap();
     let me = entry(&a, info.header.mesh);
     let mi = MeshInfo::parse(&blob(&a, me, 0)).unwrap();
-    let finest = mi.levels[0].clusters;
+    assert_eq!(live.len(), 1);
+    let (e, sets) = (live[0], &mi.emissive);
+    assert_eq!(sets.rank_count(), 1);
+    let set = sets.sets[e.set as usize];
+    assert_eq!(set.section, 1, "only the glowing section emits");
+    assert_eq!(e.cluster_count, set.count);
+    let level = mi.levels[e.set as usize].clusters;
     let (mut index, mut area) = (0u32, 0f32);
     for p in &mi.pages {
         let mut page = vec![0; p.resident_len as usize];
@@ -765,24 +771,17 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
         let view = orr_pack::mesh::PageView::new(&page, &mi.header).unwrap();
         for i in 0..view.cluster_count() {
             let c = view.cluster(i);
-            let in_finest = (finest.first..finest.first + finest.count).contains(&index);
-            if in_finest && c.flags & orr_pack::mesh::Cluster::EMISSIVE != 0 {
-                assert_eq!(c.section, 1, "only the glowing section emits");
+            if (level.first..level.first + level.count).contains(&index) && c.section == 1 {
                 area += c.area;
             }
             index += 1;
         }
     }
-    assert!(area > 0.0 && !live.is_empty());
-    let glow = scenes.material(m, info.materials[1]).unwrap();
+    assert!(area > 0.0);
     assert!(
-        live.iter()
-            .all(|e| e.section == 1 && e.material == glow.0 && e.sections == 2)
-    );
-    let listed: f32 = live.iter().map(|e| e.model_area).sum();
-    assert!(
-        (listed - area).abs() <= 1e-4 * area,
-        "{listed} m² listed, {area} m² cooked"
+        (e.area - area).abs() <= 1e-4 * area,
+        "{} m² listed, {area} m² cooked",
+        e.area
     );
 
     // The pack's pages alone are a lower bound of what the unmount frees.
@@ -819,6 +818,198 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
         panel,
         "freed ids are reused"
     );
+    assert_clean();
+}
+
+/// A model `kit/panel` in one archive and a page of it in another.
+fn split_packs() -> (Arc<[u8]>, Arc<[u8]>) {
+    let glow = Material {
+        emission_color: [1.0, 1.0, 1.0],
+        emission_luminance: 50.0,
+        ..Material::default()
+    };
+    let panel = AssetSpec {
+        name: "kit/panel".into(),
+        source: Source::Mesh {
+            mesh: grid(8),
+            materials: vec![glow, glow],
+            settings: MeshSettings::default(),
+        },
+    };
+    let scatter = AssetSpec {
+        name: "scatter".into(),
+        source: Source::Instances(Instances {
+            records: (0..3)
+                .map(|i| Placement {
+                    position: DVec3::new(f64::from(i) * 9.0, 0.0, 3.0).to_array(),
+                    linear: Linear::Scaled {
+                        rotation: Quat::IDENTITY.to_array(),
+                        scale: [1.0; 3],
+                    },
+                    prototype: 0,
+                })
+                .collect(),
+            prototypes: vec![PrototypeSpec {
+                model: "kit/panel".into(),
+                ..PrototypeSpec::default()
+            }],
+            ..Instances::default()
+        }),
+    };
+    let manifest = Manifest {
+        archives: vec![
+            ArchiveSpec::new(Target::Memory, vec![panel]),
+            ArchiveSpec::new(Target::Memory, vec![scatter]),
+        ],
+    };
+    let mut memory = orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory;
+    let page = memory.remove(1);
+    (memory.remove(0), page)
+}
+
+#[test]
+fn an_unmount_takes_copies_and_pages_of_its_models_from_a_scene_that_keeps_rendering() {
+    let _serial = serial();
+    let (models, pages) = split_packs();
+    let scatter = Archive::from_memory(Arc::clone(&pages)).unwrap();
+    let page_id = scatter
+        .entries()
+        .iter()
+        .find(|e| e.class == Class::InstancePage as u16)
+        .unwrap()
+        .id;
+    let mut scenes = Scenes::new(device(), &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let s = scenes
+        .create_scene(&SceneDesc {
+            emissive_capacity: 64,
+            ..SceneDesc::default()
+        })
+        .unwrap();
+    let m = scenes.mount(PackSource::Memory(models));
+    ready(&mut scenes, m);
+    let p = scenes.mount(PackSource::Memory(pages));
+    ready(&mut scenes, p);
+    let panel = scenes.model(m, AssetId::from_name("kit/panel")).unwrap();
+    let page = scenes.instance_page(p, page_id).unwrap();
+
+    let list = [s];
+    let desc = FrameDesc {
+        time: FrameTime::default(),
+        scenes: &list,
+        low_latency: None,
+    };
+    let frame_with = |scenes: &mut Scenes, write: &mut dyn FnMut(&mut SceneWriter<'_>)| {
+        let mut f = scenes.begin_frame(&desc).unwrap();
+        write(&mut f.scene(s).unwrap());
+        let mut root = GpuPtr::NULL;
+        f.update_scenes(&mut |c| root = c.root).unwrap();
+        let point = f.end(&[]).unwrap();
+        let render = device().queue(QueueKind::Render).unwrap();
+        render.wait(point, Duration::from_secs(10)).unwrap();
+        root
+    };
+    let (mut copies, mut placed) = (None, None);
+    let mut group = None;
+    let root = frame_with(&mut scenes, &mut |w| {
+        let g = w
+            .create_transform_group(&TransformGroupDesc {
+                count: 2,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .unwrap();
+        w.transforms(g, 0, 2)
+            .unwrap()
+            .fill(Affine3::IDENTITY.into());
+        let range = w
+            .add_instances(&InstancesDesc {
+                model: panel,
+                copies: 2,
+                transforms: g,
+                first: 0,
+                pose: None,
+                material_set: None,
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 100.0,
+                animation_range: 0.0,
+                user_tag: 0,
+            })
+            .unwrap();
+        placed = Some(
+            w.add_instance_page(&orr_scene::InstancePageRef {
+                page,
+                frame: None,
+                poses: &[],
+                material_sets: &[],
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 100.0,
+                animation_range: 0.0,
+                user_tag: 0,
+            })
+            .unwrap(),
+        );
+        copies = Some(range);
+        group = Some(g);
+    });
+    let (copies, placed, group) = (copies.unwrap(), placed.unwrap(), group.unwrap());
+    let gpu = Gpu(device());
+    let root: SceneRoot = gpu.value(root);
+    let state = |gpu: &Gpu<'_>| -> (Vec<u8>, usize) {
+        let instances: Vec<orr_scene::InstanceGpu> =
+            gpu.values(root.instances, root.instance_capacity);
+        let entries: Vec<EmissiveGpu> = gpu.values(
+            root.emissive,
+            root.producer_capacity + root.emissive_capacity,
+        );
+        let flags = instances.iter().map(|i| i.flags).collect();
+        (flags, entries.iter().filter(|e| e.kind != 0).count())
+    };
+
+    // The page's records land and write its slots and entries.
+    let start = Instant::now();
+    while state(&gpu).1 < 2 * (2 + 3) {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the page's records never landed"
+        );
+        frame_with(&mut scenes, &mut |_| {});
+    }
+    scenes.unmount(m);
+    for _ in 0..3 {
+        frame_with(&mut scenes, &mut |_| {});
+    }
+    let (flags, entries) = state(&gpu);
+    assert!(flags.iter().all(|&f| f == 0), "copies outlive their model");
+    assert_eq!(entries, 0, "emissive entries outlive their model");
+
+    // Their ranges stay the consumer's, whose slots serve new copies of a mount that came back.
+    let again = scenes.mount(PackSource::Memory(split_packs().0));
+    ready(&mut scenes, again);
+    let panel = scenes
+        .model(again, AssetId::from_name("kit/panel"))
+        .unwrap();
+    frame_with(&mut scenes, &mut |w| {
+        w.remove(copies);
+        w.remove(placed);
+        w.add_instances(&InstancesDesc {
+            model: panel,
+            copies: 1,
+            transforms: group,
+            first: 0,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 100.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    });
+    frame_with(&mut scenes, &mut |_| {});
+    assert_eq!(state(&gpu).1, 2);
     assert_clean();
 }
 

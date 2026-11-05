@@ -172,6 +172,8 @@ fn instance_and_material_tables_read_back_as_written() {
                 debug_lod: 0,
                 user_tag: 77,
                 variant,
+                first_emissive: u32::MAX,
+                emissive_count: 0,
             }
         } else {
             InstanceGpu {
@@ -191,6 +193,8 @@ fn instance_and_material_tables_read_back_as_written() {
                 debug_lod: 0,
                 user_tag: 3,
                 variant,
+                first_emissive: u32::MAX,
+                emissive_count: 0,
             }
         };
         assert_eq!(

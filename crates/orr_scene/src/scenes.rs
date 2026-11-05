@@ -20,7 +20,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::accel::{AccelKernels, AccelLimits, AccelShared};
 use crate::arena::{ArenaReport, ArenaRequest, ViewArena, ViewStep};
 use crate::decals::{self, build_bins};
-use crate::emissive::ModelEmission;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
 use crate::medium_proxy::{ProxyBlas, VolumeRef};
@@ -336,8 +335,6 @@ struct Core {
     raster: RasterPipelines,
     cuts: CutPipelines,
     materials: MaterialTable,
-    /// Emission by `ModelId`.
-    models: Vec<Option<ModelEmission>>,
     /// Sections and animated parts by `ModelId`.
     model_cpu: Vec<ModelCpu>,
     /// Subdivision cages by `ModelId`.
@@ -491,7 +488,6 @@ impl Scenes {
                 raster,
                 cuts,
                 materials,
-                models: Vec::new(),
                 model_cpu: Vec::new(),
                 cages: Vec::new(),
                 chains: HashMap::new(),
@@ -590,8 +586,7 @@ impl Scenes {
             core.land_page(page, 0);
         }
         let gone = core.mounts.models_of(m);
-        core.mounts
-            .unmount(m, frame, &mut core.models, &mut core.cages);
+        core.mounts.unmount(m, frame, &mut core.cages);
         // Chains that name a model of the mount end; their copies take their model again.
         let ended: Vec<ModelId> = core
             .chains
@@ -638,8 +633,7 @@ impl Scenes {
                 scene.empty_copies(&gone, |_| false, frame, &core.seq);
             }
         }
-        core.mounts
-            .destroy_edit(id, frame, &mut core.models, &mut core.cages);
+        core.mounts.destroy_edit(id, frame, &mut core.cages);
     }
 
     /// Gives every copy of `model` up to 3 farther models, each with the distance from the
@@ -844,17 +838,6 @@ impl Scenes {
         }
     }
 
-    /// What copies of `model` add to the emissive list from now on; copies added before
-    /// keep their entries. Mounting sets it for models of packs.
-    #[cfg(feature = "testing")]
-    pub(crate) fn set_model_emission(&mut self, model: ModelId, emission: Option<ModelEmission>) {
-        let i = model.0 as usize;
-        if self.core.models.len() <= i {
-            self.core.models.resize(i + 1, None);
-        }
-        self.core.models[i] = emission;
-    }
-
     /// The froxel depth every view of the scene uses, in m (`SceneRoot::near_range`).
     pub fn set_near_range(&mut self, id: SceneId, near_range: f32) -> Result<()> {
         self.core.scene(id)?.cpu.lock().unwrap().near_range = near_range;
@@ -1043,7 +1026,6 @@ impl Scenes {
             seq: &core.seq,
             records: core.global.get_mut().unwrap(),
             materials: &core.materials,
-            emission: &mut core.models,
             model_cpu: &mut core.model_cpu,
             cages: &mut core.cages,
         };
@@ -1342,7 +1324,6 @@ impl<'a> Frame<'a> {
             seq: &self.core.seq,
             frame: self.id,
             cell_log2: self.core.cell_log2,
-            models: &self.core.models,
             model_cpu: &self.core.model_cpu,
             cages: &self.core.cages,
             patterns: &self.core.patterns,
@@ -1646,14 +1627,12 @@ impl<'a> Frame<'a> {
                     // written at step 1 before the event that hides them.
                     records: unsafe { GpuPtr::from_address(GpuAddress(records)) },
                     prototypes: p.prototypes.gpu().cast(),
-                    spans: p.spans,
                     first_slot: p.range.first,
                     count: p.range.count,
                     prototype_count: p.prototype_count,
                     first_entry: p.first_entry,
                     entry_stride: p.entry_stride,
                     linear_rows: p.linear_rows,
-                    _pad1: 0,
                 });
             }
         }
@@ -1891,6 +1870,8 @@ impl<'a> Frame<'a> {
         }
         self.traced = traced.iter().map(|&(id, _)| id).collect();
         if !roots.is_empty() {
+            // The PTLAS kernels write the cuts this pass reads.
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
             list.begin_pass("emissive", false);
             for &(_, scene, _, _, desc) in &roots {
                 let r = emissive::Root {

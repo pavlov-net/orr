@@ -357,7 +357,6 @@ pub struct Cluster {
 impl Cluster {
     pub const ANIMATED_PART: u8 = 1;
     pub const MERGED: u8 = 2;
-    pub const EMISSIVE: u8 = 4;
     /// Where in `flags` two bits hold what the mesh's tangents here follow:
     /// [`crate::material::Material::tangent_set`] of the section's material.
     pub const TANGENT_SET_SHIFT: u8 = 3;

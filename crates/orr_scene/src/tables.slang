@@ -39,6 +39,8 @@ public bool layer_traced(uint flags)
 public static const uint NO_MATERIAL_SET = 0xffffffff;
 // `InstanceGpu.first_part` when the copy holds no part run.
 public static const uint NO_PART_RUN = 0xffffffff;
+// `InstanceGpu.first_emissive` of a copy with no emissive list entries.
+public static const uint NO_EMISSIVE = 0xffffffff;
 
 // `GroupGpu.format`.
 public static const uint GROUP_AFFINE3X4_F32 = 0;
@@ -63,6 +65,8 @@ public struct InstanceGpu
     public uint16_t debug_lod; // 0 none; DEBUG_LOD_LEVEL | level; else the f16 bits of an error threshold scale
     public uint user_tag;      // never read by orr
     public uint variant;       // pose u8, material set u8, section mask u16 (bit set = hidden)
+    public uint first_emissive; // in SceneRoot.emissive, or NO_EMISSIVE
+    public uint emissive_count; // entries from it, one per emissive section rank of its model
 }
 
 // `InstanceGpu.debug_lod` holding the copy at one DAG level, in its low byte.
@@ -261,6 +265,19 @@ public uint8_t* previous_page(MeshGpu* mesh, uint8_t* page)
     return at < e.pages_bytes ? (uint8_t*)((uint64_t)page + e.pages_bytes) : page;
 }
 
+// The cooked sets of one purpose, in blob 0 (orr_pack::mesh::ClusterSets).
+public struct SetTablesGpu
+{
+    public uint8_t* sets;          // ClusterSet per row * count + rank
+    public uint* ranks;            // per section: its rank, or NO_RANK
+    public uint* clusters;         // mesh clusters in tree leaf order
+    public uint* cdf;              // inclusive fixed point, the last of a set 0xffffffff
+    public uint2* index;           // (mesh cluster, position in the set), ascending by cluster
+    public uint8_t* nodes;         // SetNode table
+    public uint count;             // ranks
+    public uint _pad;
+}
+
 // A mesh made resident from a mounted pack, or an edit of one. Page and node page addresses
 // are 0 while their data is not resident.
 public struct MeshGpu
@@ -300,6 +317,8 @@ public struct MeshGpu
     public uint* cut_stamps;       // per finer cut: the last frame it was reported in use, then wanted
     public uint fine_cuts;         // the first `fine_cuts` cached cuts need streamed pages: built once wanted, BLAS 0 until then
     public uint section_count;     // sections of the mesh, which a model's cage sections follow
+    public SetTablesGpu emissive;  // the sections that emit
+    public SetTablesGpu casters;   // the sections light leaves as a caustic
 }
 
 // What skinned copies of a MESH_SKIN mesh read: each cluster's place in a copy's vertex
@@ -392,7 +411,7 @@ public struct SceneRoot
     public uint light_capacity;
     public uint material_set_capacity;
     public uint producer_capacity;
-    public uint emissive_capacity;   // instance span entries, after the producer entries
+    public uint emissive_capacity;   // instance entries, after the producer entries
     public float near_range;         // m
     public uint part_base;           // PTLAS index of part instance 0
     public uint part_capacity;
@@ -471,6 +490,19 @@ public uint chain_near(SlotStateGpu st)
 public uint chain_far(SlotStateGpu st)
 {
     return word_step(chain_word(st), true);
+}
+
+// The cached cut of `mesh`, the mesh of its nearer step, that slot `slot` traces now. False
+// when its PTLAS instance holds no cached cut of that mesh: nothing, a farther step or a
+// cut gathered for the frame. An edit's copies gather level 0, which its cut 0 stands for.
+public bool traced_cut(SceneRoot* s, uint slot, MeshGpu* mesh, out uint cut)
+{
+    SlotStateGpu st = s.slot_state[slot];
+    bool edit = mesh.edit != nullptr;
+    cut = edit ? 0 : uint(st.rt_lod);
+    if ((st.rt_flags & RT_WRITTEN) == 0 || ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) != chain_near(st))
+        return false;
+    return edit || (cut != RT_CUT_BUILT && cut < mesh.rt_cut_count);
 }
 
 // The step slot copy `copy` draws and traces.

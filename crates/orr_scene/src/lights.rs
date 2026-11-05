@@ -79,6 +79,10 @@ const LIGHT_RECT: u32 = 3;
 /// `EmissiveGpu::kind`.
 pub(crate) const EMISSIVE_INSTANCE: u32 = 1;
 pub(crate) const EMISSIVE_PRODUCER: u32 = 2;
+/// `EmissiveGpu::set` of an entry that emits nothing this frame.
+pub(crate) const NO_SET: u32 = !0;
+/// `InstanceGpu::first_emissive` of a copy with no emissive list entries.
+pub(crate) const NO_EMISSIVE: u32 = !0;
 
 /// The table record of `light` in the render space of the origin at `origin_cell`.
 pub(crate) fn light_gpu(light: &Light, origin_cell: IVec3, cell_log2: u32) -> LightGpu {

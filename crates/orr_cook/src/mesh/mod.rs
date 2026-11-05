@@ -1563,7 +1563,7 @@ fn build_cluster(
         vertex_count: verts.len() as u16,
         tri_count,
         alpha_first: tri_count,
-        flags: flags & (Section::CLASS_MASK | Section::EMISSIVE),
+        flags: flags & Section::CLASS_MASK,
         local_max,
         uv_offset: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.offset)),
         uv_scale: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.scale)),

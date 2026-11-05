@@ -1,17 +1,24 @@
-//! The emissive list: instance spans and producer entries, their power summed on the GPU.
+//! The emissive list: instance entries and producer entries, their power summed on the GPU.
 
+use std::sync::Arc;
+
+use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Source};
 use orr_gpu::{GpuPtr, MemoryKind};
-use orr_math::{Affine3, DMat3, DVec3, Mat3, Vec3};
-use orr_scene::testing::{assert_clean, device, read_buffer, set_model_emission, wait};
+use orr_math::{Affine3, DMat3, DVec3, Mat3, Vec2, Vec3};
+use orr_pack::material::Material;
+use orr_pack::mesh::MeshInfo;
+use orr_pack::{Archive, AssetId, Span, Target};
+use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
-    ClusterTopology, CopyVariant, EmissiveGpu, EmissiveSpan, FrameDesc, FrameTime, GroupWriter,
-    InstanceFlags, InstanceRange, InstancesDesc, MaterialGpu, MaterialId, ModelEmission, ModelId,
-    ProducerDesc, ProducerId, ProducerUpdate, RendererDesc, SceneDesc, SceneId, SceneRoot, Scenes,
-    TransformGroupDesc, TransformGroupId, material_flags,
+    ClusterTopology, CopyVariant, EditDesc, EmissiveGpu, FrameDesc, FrameTime, GroupWriter,
+    InstanceFlags, InstanceGpu, InstanceRange, InstancesDesc, LoadState, MaterialGpu, MaterialId,
+    MeshGpu, ModelGpu, PackSource, ProducerDesc, ProducerId, ProducerUpdate, RendererDesc,
+    RtCutGpu, SceneDesc, SceneId, SceneRoot, Scenes, SlotStateGpu, TransformGroupDesc,
+    TransformGroupId, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
-use scene_suite::pipeline;
 use scene_suite::shaders::emit;
+use scene_suite::{Workers, pipeline};
 
 const PRODUCERS: u32 = 4;
 
@@ -55,10 +62,104 @@ fn close3(got: [f32; 3], expected: DVec3, what: &str) {
     }
 }
 
+/// A mesh of two sections, wavy so its clusters differ.
+fn sheet(n: u32) -> MeshInput {
+    let mut m = MeshInput::default();
+    for j in 0..=n {
+        for i in 0..=n {
+            let (x, z) = (i as f32 / n as f32 * 3.0, j as f32 / n as f32 * 3.0);
+            m.positions.push(Vec3::new(x, 0.2 * (x * 2.0).sin(), z));
+            m.normals.push(Vec3::Y);
+        }
+    }
+    m.uvs = Some(vec![Vec2::ZERO; m.positions.len()]);
+    let w = n + 1;
+    for half in 0..2 {
+        let first = m.indices.len() as u32;
+        for j in n * half / 2..n * (half + 1) / 2 {
+            for i in 0..n {
+                let c = j * w + i;
+                m.indices.extend([c, c + w, c + 1, c + 1, c + w, c + w + 1]);
+            }
+        }
+        m.sections.push(Span {
+            first,
+            count: m.indices.len() as u32 - first,
+        });
+    }
+    m
+}
+
+fn cooked(color: [f32; 3], luminance: f32) -> Material {
+    Material {
+        emission_color: color,
+        emission_luminance: luminance,
+        ..Material::default()
+    }
+}
+
+fn pack_of(assets: Vec<AssetSpec>) -> Arc<[u8]> {
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(Target::Memory, assets)],
+    };
+    orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory
+        .remove(0)
+}
+
+fn sheet_asset(name: &str, n: u32, materials: Vec<Material>, lod: LodMode) -> AssetSpec {
+    AssetSpec {
+        name: name.into(),
+        source: Source::Mesh {
+            mesh: sheet(n),
+            materials,
+            settings: MeshSettings {
+                lod,
+                ..MeshSettings::default()
+            },
+        },
+    }
+}
+
+fn lamp_materials() -> Vec<Material> {
+    vec![
+        cooked([1.0, 0.0, 0.0], 100.0),
+        cooked([0.0, 0.0, 1.0], 10.0),
+    ]
+}
+
+/// A model `lamp` of two emissive sections, and `plain` of none.
+fn pack() -> Arc<[u8]> {
+    pack_of(vec![
+        sheet_asset("lamp", 24, lamp_materials(), LodMode::default()),
+        sheet_asset(
+            "plain",
+            24,
+            vec![Material::default(), Material::default()],
+            LodMode::default(),
+        ),
+    ])
+}
+
+fn read_blob(a: &Archive, b: &orr_pack::Blob) -> Vec<u8> {
+    let mut v = vec![0; b.raw_len as usize];
+    a.read(b, &mut v).unwrap();
+    v
+}
+
 #[test]
-fn instance_spans_follow_scale_material_sets_hidden_sections_and_removal() {
+fn instance_entries_follow_scale_material_sets_hidden_sections_and_removal() {
     let d = device();
+    let bytes = pack();
+    let archive = Archive::from_memory(Arc::clone(&bytes)).unwrap();
+    let entry = archive.find(AssetId::from_name("lamp/mesh")).unwrap();
+    let info = MeshInfo::parse(&read_blob(&archive, &archive.blobs(entry)[0])).unwrap();
+    let sets = &info.emissive.sets;
+    assert_eq!(sets.len(), 2);
+
     let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
     let s = scenes
         .create_scene(&SceneDesc {
             producer_capacity: PRODUCERS,
@@ -66,44 +167,31 @@ fn instance_spans_follow_scale_material_sets_hidden_sections_and_removal() {
             ..SceneDesc::default()
         })
         .unwrap();
-    let spans = [
-        EmissiveSpan {
-            section: 0,
-            first_cluster: 4,
-            cluster_count: 3,
-            area: 1.5,
-        },
-        EmissiveSpan {
-            section: 1,
-            first_cluster: 9,
-            cluster_count: 2,
-            area: 2.0,
-        },
-    ];
-    let (red, blue, green) = ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]);
+    let m = scenes.mount(PackSource::Memory(bytes));
+    while matches!(scenes.mount_state(m), LoadState::Pending) {
+        let f = scenes.begin_frame(&frame(&[])).unwrap();
+        f.end(&[]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let model = |name: &str| scenes.model(m, AssetId::from_name(name)).unwrap();
+    let (lamp_model, plain) = (model("lamp"), model("plain"));
+    let material = |name: &str| scenes.material(m, AssetId::from_name(name)).unwrap();
+    let (lamp, shade) = (material("lamp/material/0"), material("lamp/material/1"));
+
+    let green = [0.0, 1.0, 0.0];
     let list = [s];
     let f = scenes.begin_frame(&frame(&list)).unwrap();
     let mut mats = f.materials();
-    let lamp = mats.create(&emitting(red, 100.0)).unwrap();
-    let shade = mats.create(&emitting(blue, 10.0)).unwrap();
     let other = mats.create(&emitting(green, 1000.0)).unwrap();
     let dark = mats.create(&MaterialGpu::zeroed()).unwrap();
     wait(f.end(&[]).unwrap());
-    set_model_emission(
-        &mut scenes,
-        ModelId(3),
-        Some(ModelEmission {
-            sections: 2,
-            materials: vec![lamp, shade],
-            spans: spans.to_vec(),
-        }),
-    );
 
     let scales = [
         Mat3::IDENTITY,
         Mat3::from_diagonal(Vec3::splat(2.0)),
         Mat3::from_diagonal(Vec3::new(2.0, 1.0, 0.5)),
         Mat3::from_rotation_y(0.7) * Mat3::from_diagonal(Vec3::splat(3.0)),
+        Mat3::IDENTITY,
         Mat3::IDENTITY,
     ];
     let mut f = scenes.begin_frame(&frame(&list)).unwrap();
@@ -115,11 +203,11 @@ fn instance_spans_follow_scale_material_sets_hidden_sections_and_removal() {
             anchor: DVec3::new(5000.0, 0.0, 0.0),
         })
         .unwrap();
-    for (t, m) in w.transforms(g, 0, 5).unwrap().iter_mut().zip(scales) {
+    for (t, m) in w.transforms(g, 0, 6).unwrap().iter_mut().zip(scales) {
         *t = Affine3::from_mat3_translation(m, Vec3::new(1.0, 2.0, 3.0)).into();
     }
     let desc = |model, copies, material_set| InstancesDesc {
-        model: ModelId(model),
+        model,
         copies,
         transforms: g,
         first: 0,
@@ -130,10 +218,10 @@ fn instance_spans_follow_scale_material_sets_hidden_sections_and_removal() {
         animation_range: 0.0,
         user_tag: 0,
     };
-    // A model without emission adds no entries.
-    w.add_instances(&desc(9, 2, None)).unwrap();
-    let lamps = w.add_instances(&desc(3, 4, None)).unwrap();
-    let mut set = desc(3, 1, Some(10));
+    // A model without emissive sections adds no entries.
+    w.add_instances(&desc(plain, 2, None)).unwrap();
+    let lamps = w.add_instances(&desc(lamp_model, 4, None)).unwrap();
+    let mut set = desc(lamp_model, 1, Some(10));
     set.first = 4;
     let with_set = w.add_instances(&set).unwrap();
     // Set 1 of the copy's material sets holds (other, dark).
@@ -153,60 +241,70 @@ fn instance_spans_follow_scale_material_sets_hidden_sections_and_removal() {
         section_mask: 0b10,
     };
     w.copy_variants(lamps, 3, &[hidden]).unwrap();
-    // Twelve entries hold five copies of two spans; a sixth and seventh copy do not fit,
-    // and the failed call leaves its slots free.
-    let full = w.add_instances(&desc(3, 2, None));
+    // A copy outside ray tracing keeps its entries and emits nothing.
+    let mut untraced = desc(lamp_model, 1, None);
+    untraced.first = 5;
+    untraced.flags = InstanceFlags::RASTER;
+    let untraced = w.add_instances(&untraced).unwrap();
+    // Twelve entries hold six copies of two sections; a seventh does not fit, and the failed
+    // call leaves its slot free.
+    let full = w.add_instances(&desc(lamp_model, 1, None));
     assert!(full.is_err());
-    let next = w.add_instances(&desc(9, 1, None)).unwrap();
-    assert_eq!(next.first, with_set.first + 1);
+    let next = w.add_instances(&desc(plain, 1, None)).unwrap();
+    assert_eq!(next.first, untraced.first + 1);
     drop(w);
     let mut root = GpuPtr::NULL;
     f.update_scenes(&mut |c| root = c.root).unwrap();
     wait(f.end(&[]).unwrap());
     let root: SceneRoot = read_buffer(root, 1)[0];
-
-    let luminance = |m: [f32; 3], l: f64| DVec3::from(m.map(f64::from)) * l;
-    let det23 = |m: Mat3| f64::from(m.determinant().abs()).powf(2.0 / 3.0);
-    let expect = |copy: usize, span: usize, material: DVec3| {
-        let area = f64::from(spans[span].area) * det23(scales[copy]);
-        (area, material * area)
+    let emission = |id: MaterialId| -> DVec3 {
+        let m: MaterialGpu = read_buffer(root.materials.offset(u64::from(id.0)), 1)[0];
+        DVec3::from(m.emission_color.map(f64::from)) * f64::from(m.emission_luminance)
     };
-    // (slot, copy, span, luminance), None when the section is hidden.
-    let check = |all: &[EmissiveGpu], live: &[(u32, usize, usize, Option<DVec3>)]| {
-        let instances = &all[PRODUCERS as usize..];
+
+    let det23 = |m: Mat3| f64::from(m.determinant().abs()).powf(2.0 / 3.0);
+    // (slot, copy, rank, emission), None when the entry emits nothing.
+    let check = |all: &[EmissiveGpu], live: &[(u32, usize, u32, Option<DVec3>)]| {
+        let instances: Vec<InstanceGpu> =
+            read_buffer(root.instances, u64::from(root.instance_capacity));
         let mut seen = 0;
-        for e in instances.iter().filter(|e| e.kind != 0) {
-            let &(_, copy, span, material) = live
+        for (at, e) in all.iter().enumerate().skip(PRODUCERS as usize) {
+            if e.kind == 0 {
+                continue;
+            }
+            let &(_, copy, rank, material) = live
                 .iter()
-                .find(|(slot, _, span, _)| {
-                    *slot == e.source && spans[*span].first_cluster == e.first_cluster
-                })
+                .find(|l| l.0 == e.source && l.2 == e.rank)
                 .unwrap_or_else(|| panic!("unexpected entry {e:?}"));
             assert_eq!(e.kind, 1);
-            assert_eq!(e.cluster_count, spans[span].cluster_count);
-            assert_eq!((e.section, e.sections), (u32::from(spans[span].section), 2));
-            let (area, power) = material.map_or((0.0, DVec3::ZERO), |l| expect(copy, span, l));
-            close(e.area, area, "area");
-            close3(e.power, power, "power");
+            let inst = instances[e.source as usize];
+            assert_eq!(inst.emissive_count, 2);
+            assert_eq!(inst.first_emissive + rank, at as u32);
+            let set = sets[rank as usize];
+            let area = f64::from(set.total) * det23(scales[copy]);
+            match material {
+                Some(l) => {
+                    assert_eq!((e.set, e.cluster_count), (rank, set.count));
+                    close(e.area, area, "area");
+                    close3(e.power, l * area, "power");
+                }
+                None => assert_eq!((e.area, e.power), (0.0, [0.0; 3]), "{e:?}"),
+            }
             seen += 1;
         }
         assert_eq!(seen, live.len());
     };
-    let red100 = luminance(red, 100.0);
-    let blue10 = luminance(blue, 10.0);
+    let (red, blue) = (emission(lamp), emission(shade));
     let mut live = Vec::new();
     for copy in 0..4 {
-        live.push((lamps.first + copy as u32, copy, 0, Some(red100)));
-        let hidden = copy == 3;
-        live.push((
-            lamps.first + copy as u32,
-            copy,
-            1,
-            (!hidden).then_some(blue10),
-        ));
+        let slot = lamps.first + copy as u32;
+        live.push((slot, copy, 0, Some(red)));
+        live.push((slot, copy, 1, (copy != 3).then_some(blue)));
     }
-    live.push((with_set.first, 4, 0, Some(luminance(green, 1000.0))));
+    live.push((with_set.first, 4, 0, Some(emission(other))));
     live.push((with_set.first, 4, 1, Some(DVec3::ZERO)));
+    live.push((untraced.first, 5, 0, None));
+    live.push((untraced.first, 5, 1, None));
     check(&entries(&root), &live);
 
     // Removing copies 1 and 2 clears their entries; the rest keep their power.
@@ -230,15 +328,206 @@ fn instance_spans_follow_scale_material_sets_hidden_sections_and_removal() {
     let again = f
         .scene(s)
         .unwrap()
-        .add_instances(&desc(3, 2, None))
+        .add_instances(&desc(lamp_model, 2, None))
         .unwrap();
     f.update_scenes(&mut |_| {}).unwrap();
     wait(f.end(&[]).unwrap());
     for copy in 0..2 {
-        live.push((again.first + copy as u32, copy, 0, Some(red100)));
-        live.push((again.first + copy as u32, copy, 1, Some(blue10)));
+        live.push((again.first + copy as u32, copy, 0, Some(red)));
+        live.push((again.first + copy as u32, copy, 1, Some(blue)));
     }
     check(&entries(&root), &live);
+    assert_clean();
+}
+
+#[test]
+fn an_edit_of_a_dag_mesh_takes_the_sets_of_level_0() {
+    let d = device();
+    let bytes = pack_of(vec![sheet_asset(
+        "lamp",
+        64,
+        lamp_materials(),
+        LodMode::Dag,
+    )]);
+    let archive = Archive::from_memory(Arc::clone(&bytes)).unwrap();
+    let entry = archive.find(AssetId::from_name("lamp/mesh")).unwrap();
+    let info = MeshInfo::parse(&read_blob(&archive, &archive.blobs(entry)[0])).unwrap();
+    assert_eq!(info.cut_rows[1], 0.0);
+    let ranks = info.emissive.rank_count();
+    let level0 = &info.emissive.sets[ranks as usize..][..ranks as usize];
+    assert!(level0[0].count > info.emissive.sets[0].count);
+
+    let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let s = scenes
+        .create_scene(&SceneDesc {
+            emissive_capacity: ranks,
+            ..SceneDesc::default()
+        })
+        .unwrap();
+    let m = scenes.mount(PackSource::Memory(bytes));
+    while matches!(scenes.mount_state(m), LoadState::Pending) {
+        let f = scenes.begin_frame(&frame(&[])).unwrap();
+        f.end(&[]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let edit = scenes
+        .create_edit(&EditDesc {
+            model: scenes.model(m, AssetId::from_name("lamp")).unwrap(),
+            touched: None,
+            bounds: None,
+        })
+        .unwrap();
+    while !matches!(scenes.edit_state(edit), LoadState::Ready) {
+        let f = scenes.begin_frame(&frame(&[])).unwrap();
+        wait(f.end(&[]).unwrap());
+    }
+    let model = scenes.edit(edit).unwrap().model;
+
+    let list = [s];
+    let mut f = scenes.begin_frame(&frame(&list)).unwrap();
+    let mut w = f.scene(s).unwrap();
+    let g = w
+        .create_transform_group(&TransformGroupDesc {
+            count: 1,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    w.transforms(g, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+    w.add_instances(&InstancesDesc {
+        model,
+        copies: 1,
+        transforms: g,
+        first: 0,
+        pose: None,
+        material_set: None,
+        flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+        rt_range: 100.0,
+        animation_range: 0.0,
+        user_tag: 0,
+    })
+    .unwrap();
+    drop(w);
+    let mut root = GpuPtr::NULL;
+    f.update_scenes(&mut |c| root = c.root).unwrap();
+    wait(f.end(&[]).unwrap());
+    let root: SceneRoot = read_buffer(root, 1)[0];
+
+    let all = entries(&root);
+    assert_eq!(all.iter().filter(|e| e.kind != 0).count(), ranks as usize);
+    for e in all.iter().filter(|e| e.kind != 0) {
+        let set = level0[e.rank as usize];
+        assert_eq!((e.set, e.cluster_count), (ranks + e.rank, set.count));
+        close(e.area, f64::from(set.total), "area");
+    }
+    assert_clean();
+}
+
+#[test]
+fn a_copy_takes_the_sets_of_the_cached_cut_it_traces() {
+    let d = device();
+    if d.caps().cluster.max_tris == 0 || d.caps().cluster.max_partitions == 0 {
+        return;
+    }
+    let bytes = pack_of(vec![sheet_asset(
+        "lamp",
+        64,
+        lamp_materials(),
+        LodMode::Dag,
+    )]);
+    let archive = Archive::from_memory(Arc::clone(&bytes)).unwrap();
+    let entry = archive.find(AssetId::from_name("lamp/mesh")).unwrap();
+    let info = MeshInfo::parse(&read_blob(&archive, &archive.blobs(entry)[0])).unwrap();
+    let ranks = info.emissive.rank_count();
+
+    // Every copy traces a cached cut.
+    let desc = RendererDesc {
+        rt_merge_pixels: 1e9,
+        ..RendererDesc::default()
+    };
+    let mut scenes = Scenes::new(d, &desc).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let s = scenes
+        .create_scene(&SceneDesc {
+            emissive_capacity: ranks,
+            ..SceneDesc::default()
+        })
+        .unwrap();
+    let m = scenes.mount(PackSource::Memory(bytes));
+    while matches!(scenes.mount_state(m), LoadState::Pending) {
+        let f = scenes.begin_frame(&frame(&[])).unwrap();
+        f.end(&[]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let model = scenes.model(m, AssetId::from_name("lamp")).unwrap();
+
+    let list = [s];
+    let mut f = scenes.begin_frame(&frame(&list)).unwrap();
+    let mut w = f.scene(s).unwrap();
+    w.set_focus(DVec3::new(0.0, 3.0, 0.0));
+    let g = w
+        .create_transform_group(&TransformGroupDesc {
+            count: 1,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    w.transforms(g, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+    let copy = w
+        .add_instances(&InstancesDesc {
+            model,
+            copies: 1,
+            transforms: g,
+            first: 0,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 1000.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    drop(w);
+    let mut root = GpuPtr::NULL;
+    f.update_scenes(&mut |c| root = c.root).unwrap();
+    wait(f.end(&[]).unwrap());
+    let root: SceneRoot = read_buffer(root, 1)[0];
+    let record: ModelGpu = read_buffer(root.models.offset(u64::from(model.0)), 1)[0];
+    let mesh: MeshGpu = read_buffer(root.meshes.offset(u64::from(record.mesh)), 1)[0];
+    let cuts: Vec<RtCutGpu> = read_buffer(mesh.rt_cuts, u64::from(mesh.rt_cut_count));
+
+    // Near the focus the copy traces a fine cut; far from it, a coarser one.
+    let mut rows = Vec::new();
+    for x in [0.0, 800.0] {
+        for _ in 0..8 {
+            let mut f = scenes.begin_frame(&frame(&list)).unwrap();
+            let mut w = f.scene(s).unwrap();
+            w.transforms(g, 0, 1).unwrap()[0] =
+                Affine3::from_translation(Vec3::new(x, 0.0, 0.0)).into();
+            drop(w);
+            f.update_scenes(&mut |_| {}).unwrap();
+            wait(f.end(&[]).unwrap());
+
+            let all = entries(&root);
+            let live: Vec<&EmissiveGpu> = all.iter().filter(|e| e.kind != 0).collect();
+            assert_eq!(live.len(), ranks as usize);
+            if live.iter().all(|e| e.cluster_count == 0) {
+                continue;
+            }
+            let st: SlotStateGpu = read_buffer(root.slot_state.offset(u64::from(copy.first)), 1)[0];
+            let row = cuts[usize::from(st.rt_lod)].row;
+            for e in live {
+                let at = row * ranks + e.rank;
+                let set = info.emissive.sets[at as usize];
+                assert_eq!((e.set, e.cluster_count), (at, set.count), "row {row}");
+                close(e.area, f64::from(set.total), "area");
+            }
+            rows.push(row);
+        }
+    }
+    let (first, last) = (rows[0], *rows.last().unwrap());
+    assert!(last > first, "rows {rows:?}");
     assert_clean();
 }
 

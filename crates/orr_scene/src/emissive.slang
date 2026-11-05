@@ -1,7 +1,9 @@
 // The power of every emissive list entry this frame: luminance x area, the area in
-// render space. Runs after scene compute, so it sees this frame's transforms and
-// producer clusters.
+// render space. Runs after the PTLAS kernels, so it sees this frame's transforms, producer
+// clusters and traced cuts.
 #include "orr_root.h"
+import orr_pack.mesh;
+import orr_scene.hit;
 import orr_shaders.math;
 import orr_scene.lights;
 import orr_scene.material;
@@ -28,8 +30,10 @@ float3x3 linear_part(SceneRoot* s, uint group, uint index)
     return float3x3(m[0].xyz, m[1].xyz, m[2].xyz);
 }
 
-// One thread per instance span entry. Area scales by |det|^(2/3), exact under uniform
-// scale, taken at unit size since a small transform's determinant underflows first.
+// One thread per instance entry: the cooked set of the cut the copy traces, at the copy's
+// nearer chain step, so a copy outside ray tracing emits nothing. Area scales by
+// |det|^(2/3), exact under uniform scale, taken at unit size since a small transform's
+// determinant underflows first.
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
 void instances(uint3 id: SV_DispatchThreadID)
@@ -40,24 +44,33 @@ void instances(uint3 id: SV_DispatchThreadID)
     EmissiveGpu* e = s.emissive + s.producer_capacity + id.x;
     if (e.kind != EMISSIVE_INSTANCE)
         return;
-    InstanceGpu inst = s.instances[e.source];
-    uint variant_set = (inst.variant >> 8) & 0xff;
-    uint section_mask = inst.variant >> 16;
-    bool hidden = inst.flags == 0 || (e.section < 16 && ((section_mask >> e.section) & 1) != 0);
+    InstanceGpu inst = copy_record(s, e.source);
+    ModelGpu* model = s.models + inst.model;
+    MeshGpu* mesh = s.meshes + model.mesh;
+    uint set = NO_SET;
+    uint clusters = 0;
     float area = 0.0;
     float3 power = 0.0;
-    if (!hidden)
+    uint cut;
+    if (inst.flags != 0 && e.rank < mesh.emissive.count && traced_cut(s, e.source, mesh, cut))
     {
-        uint material = inst.material_base == NO_MATERIAL_SET
-            ? e.material
-            : s.material_sets[inst.material_base + variant_set * e.sections + e.section];
-        float3x3 m = linear_part(s, inst.group, inst.group_index);
-        float k = unit_factor(m);
-        area = e.model_area * pow(abs(determinant(m * k)), 2.0 / 3.0) / k / k;
-        // Chain steps past the first add no light; a fading copy shows its model in part.
-        area *= step_presence(s.slot_state[e.source], 0);
-        power = material_light_emission(s.materials + material) * area;
+        uint at = mesh.rt_cuts[cut].row * mesh.emissive.count + e.rank;
+        ClusterSet k = ((ClusterSet*)mesh.emissive.sets)[at];
+        if (!section_hidden(inst, k.section))
+        {
+            SlotStateGpu st = s.slot_state[e.source];
+            float3x3 m = linear_part(s, inst.group, inst.group_index);
+            set = at;
+            clusters = k.count;
+            float size = unit_factor(m);
+            // A fading copy shows its nearer step in part.
+            area = k.total * pow(abs(determinant(m * size)), 2.0 / 3.0) / size / size * step_presence(st, chain_near(st));
+            uint material = section_material(s, inst, model, k.section);
+            power = material_light_emission(s.materials + material) * area;
+        }
     }
+    e.set = set;
+    e.cluster_count = clusters;
     e.power = power;
     e.area = area;
 }

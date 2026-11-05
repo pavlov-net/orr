@@ -44,7 +44,6 @@ mod arena;
 mod clas_pool;
 mod decals;
 mod edit;
-mod emissive;
 mod lights;
 mod loading;
 mod material;
@@ -85,7 +84,6 @@ pub use orr_shaders::{PathEntry, abi};
 pub use arena::{ArenaReport, ArenaRequest, ArenaTarget, ArenaTexture, Span, ViewArena, ViewStep};
 pub use decals::{Decal, DecalChannels, DecalId};
 pub use edit::{EditDesc, EditId, EditRef};
-pub use emissive::{EmissiveSpan, ModelEmission};
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
 pub use loading::{JobResult, Loading};
 pub use material::{BoundTexture, MaterialId, MaterialWriter, binding_sampler, material_flags};
@@ -109,7 +107,7 @@ pub use scenes::{
 pub(crate) use shaders::types::{
     BlasJob, CutKey, DecalBinGpu, EditGpu, FeedbackGpu, GroupGpu, MaskGpu, MediumProxyGpu,
     NeuralMipGpu, NeuralSetGpu, NeuralTextureGpu, NodeItem, PartGpu, PartListGpu, ProducerGpu,
-    RasterRoot, SkinMeshGpu, TessStateGpu, TextureFeedbackGpu, TopologyGpu,
+    RasterRoot, SetTablesGpu, SkinMeshGpu, TessStateGpu, TextureFeedbackGpu, TopologyGpu,
 };
 pub use shaders::types::{
     ClusterRef, ClusterWork, CutGpu, DecalGpu, EditGroupGpu, EmissiveGpu, GBufferGpu,

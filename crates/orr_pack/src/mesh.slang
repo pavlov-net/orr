@@ -18,7 +18,6 @@ public static const uint MESH_COLOR = 8;
 // `Cluster.flags`.
 public static const uint CLUSTER_ANIMATED_PART = 1;
 public static const uint CLUSTER_MERGED = 2;
-public static const uint CLUSTER_EMISSIVE = 4;
 public static const uint CLUSTER_TANGENT_SET_SHIFT = 3; // 2 bits: what the mesh's tangents here follow
 public static const uint CLUSTER_CLASS_SHIFT = 5; // 2 bits: orr_shaders.trace CLASS_OPAQUE, _DIELECTRIC or _PRESENCE
 

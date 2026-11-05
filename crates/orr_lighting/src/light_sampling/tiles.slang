@@ -89,7 +89,7 @@ float scan_float(uint lane, uint lanes, float v, out float total)
 }
 
 // Selection weight of candidate `i`, its emitted power in luminance (nit m² sr), and the
-// clusters its CDF needs. Instance-span entries wait for the scene's resident cluster data.
+// clusters its CDF needs. Instance entries take none: BSDF rays alone find them.
 void candidate(SceneRoot* s, uint i, out float w, out uint count)
 {
     w = 0.0;
