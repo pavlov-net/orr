@@ -257,7 +257,7 @@ pub(super) fn textures(
             .normal_texture()
             .map(|i| {
                 let r = tex(i.texture(), &own["normalTexture"], 0)?;
-                Ok::<_, String>((r, [i.scale(); 2]))
+                Ok::<_, String>((r, [i.scale(); 2], false))
             })
             .transpose()?,
         occlusion: m

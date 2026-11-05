@@ -102,6 +102,7 @@ pub(crate) struct Scan {
     pub(super) srgb: bool,
     pub(super) rg: bool,
     pub(super) signed: bool,
+    pub(super) float: bool,
     pub(super) range: [(f32, f32); 4],
 }
 
@@ -247,6 +248,7 @@ impl<'a> Ktx2Blocks<'a> {
             srgb: self.srgb(),
             rg: two_channels(vk_format),
             signed: signed_blocks(vk_format),
+            float: float_blocks(vk_format),
             range,
         })
     }

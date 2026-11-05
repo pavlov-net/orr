@@ -47,7 +47,7 @@ use super::mips::{MipSpec, Toksvig, normalized};
 use super::neural::{self, NeuralJob, NeuralSettings};
 use super::{
     Built, DataFormat, Encoding, Img, MipFilter, NormalSource, Plan, Primaries, Wrap,
-    srgb_to_linear,
+    srgb_to_linear, stores_normals,
 };
 use crate::decoded::Decoded;
 use crate::key::Key;
@@ -163,8 +163,10 @@ pub(crate) struct MaterialTextures {
     pub(crate) opacity: Option<TexRef>,
     pub(crate) roughness: Option<TexRef>,
     pub(crate) metalness: Option<TexRef>,
-    /// With its scale per tangent axis; a negative scale flips the axis.
-    pub(crate) normal: Option<(TexRef, [f32; 2])>,
+    /// With its scale per tangent axis (a negative scale flips the axis) and whether the material
+    /// states its encoding: 0..1 where it has no [`TexRef::remap`]. Otherwise the image's format
+    /// says, and a float image's vectors.
+    pub(crate) normal: Option<(TexRef, [f32; 2], bool)>,
     /// With its strength.
     pub(crate) occlusion: Option<(TexRef, f32)>,
     pub(crate) emissive: Option<TexRef>,
@@ -195,6 +197,19 @@ impl MaterialTextures {
         .into_iter()
         .flatten()
     }
+
+    /// The image of a USD normal map whose reader states no encoding, where the file can't hold
+    /// the signed vectors that would mean.
+    pub(crate) fn unscaled_normal(&self, facts: &HashMap<usize, ImageFacts>) -> Option<usize> {
+        let r = &self.normal.as_ref()?.0;
+        let f = &facts[&r.image];
+        (r.remap.is_some_and(unscaled) && !f.signed && !f.float).then_some(r.image)
+    }
+}
+
+/// Whether `remap` leaves every texel as it is.
+fn unscaled(remap: [[f32; 2]; 3]) -> bool {
+    remap == [[0.0, 1.0]; 3]
 }
 
 pub(crate) struct ImageFile {
@@ -255,6 +270,11 @@ pub(crate) struct ImageFacts {
     rg: bool,
     /// The file stores signed normalized values.
     signed: bool,
+    /// The file stores floats.
+    float: bool,
+    /// Read as a normal map that states no encoding, the file holds normals as they are, not at
+    /// `0.5 v + 0.5`.
+    stored_normals: bool,
     /// The file is animated; only its first frame is read.
     pub(crate) animated: bool,
 }
@@ -270,14 +290,15 @@ fn decode(bytes: &[u8]) -> Result<Img, String> {
     Ok(layers.remove(0))
 }
 
-/// Facts of the images `used`, of which `heights` are read as heights, read in parallel. File
-/// images are read through the memo, and each one's hash and length are recorded in its
-/// [`ImageData::File`].
+/// Facts of the images `used`, of which `heights` are read as heights and `normals` as normal
+/// maps that say nothing of their encoding, read in parallel. File images are read through the
+/// memo, and each one's hash and length are recorded in its [`ImageData::File`].
 pub(crate) fn image_facts(
     asset: &str,
     images: &mut [ImageFile],
     used: &[usize],
     heights: &HashSet<usize>,
+    normals: &HashSet<usize>,
     memo: &Memo,
 ) -> Result<HashMap<usize, ImageFacts>> {
     let fail = |message: String| Error::Texture {
@@ -299,7 +320,7 @@ pub(crate) fn image_facts(
                     (Cow::Owned(bytes), hash, Some(len))
                 }
             };
-            let facts = facts_of(&bytes, hash, heights.contains(&i))
+            let facts = facts_of(&bytes, hash, heights.contains(&i), normals.contains(&i))
                 .map_err(|e| fail(format!("image {}: {e}", file.name)))?;
             Ok((i, (facts, read)))
         })
@@ -314,8 +335,9 @@ pub(crate) fn image_facts(
     Ok(out)
 }
 
-/// The facts of one image file's bytes, with all of its range if it is a `height`.
-fn facts_of(bytes: &[u8], hash: Hash32, height: bool) -> Result<ImageFacts, String> {
+/// The facts of one image file's bytes, with all of its range if it is a `height`, and how it
+/// stores normals if it is a `normal` map.
+fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<ImageFacts, String> {
     let _z = crate::profile::zone!("texture.facts");
     // A channel is constant when it spans at most one UNORM8 step.
     const SPREAD: f32 = 1.0 / 255.0 + 1e-6;
@@ -325,6 +347,8 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool) -> Result<ImageFacts, Stri
     };
     if let Some(scan) = load::scan_ktx2(bytes, spread) {
         let s = scan?;
+        let stored_normals =
+            s.signed || (normal && s.float && stores_normals(&load::decode(bytes)?.layers, s.rg));
         return Ok(ImageFacts {
             w: s.w,
             h: s.h,
@@ -336,13 +360,18 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool) -> Result<ImageFacts, Stri
             blocks: Some((s.vk_format, s.complete)),
             rg: s.rg,
             signed: s.signed,
+            float: s.float,
+            stored_normals,
             animated: false,
         });
     }
-    let src = load::open(bytes)?;
+    let mut src = load::open(bytes)?;
     if src.cube || src.layers.len() > 1 || src.blocks.as_ref().is_some_and(|b| b.levels.len() != 1)
     {
         return Err("not a 2D image".into());
+    }
+    if normal && src.float {
+        load::decode_layers(&mut src)?;
     }
     let (w, h, range) = match &src.blocks {
         Some(b) => {
@@ -366,6 +395,8 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool) -> Result<ImageFacts, Stri
         blocks: src.blocks.as_ref().map(|b| (b.vk_format, b.complete())),
         rg: src.rg,
         signed: src.signed,
+        float: src.float,
+        stored_normals: src.signed || (normal && src.float && stores_normals(&src.layers, src.rg)),
         animated: load::is_animated(bytes),
     })
 }
@@ -526,6 +557,29 @@ impl<'a> Packer<'a> {
         self.constant_input(r).filter(|_| one_side)
     }
 
+    /// How normal map `r` reads, by what its material `stated` where the image can hold that: a
+    /// signed image holds the vectors themselves, so a pair that centers 0..1 at 0 doesn't apply
+    /// to it, and an unsigned one can't, so reading it as it stands doesn't either.
+    fn normal_source(&self, r: &TexRef, stated: bool) -> (TexRef, NormalSource) {
+        let f = self.image(r.image);
+        let remap = r.remap.filter(|&m| f.signed || f.float || !unscaled(m));
+        let remap = remap.map(|m| match f.signed {
+            true => m.map(|[a, b]| {
+                if a + 0.5 * b == 0.0 {
+                    [0.0, 0.5 * b]
+                } else {
+                    [a, b]
+                }
+            }),
+            false => m,
+        });
+        let source = NormalSource {
+            rg: f.rg,
+            signed: if stated { f.signed } else { f.stored_normals },
+        };
+        (TexRef { remap, ..*r }, source)
+    }
+
     /// The primaries of a color texture made from image `i`: the last override that sets
     /// them, else the file's tag, else Rec.709.
     fn color_primaries(&self, i: usize) -> Primaries {
@@ -617,12 +671,9 @@ impl<'a> Packer<'a> {
         }
 
         let mut normal_packed = None;
-        if let Some((r, scale)) = &t.normal {
-            let facts = self.image(r.image);
-            let source = NormalSource {
-                rg: facts.rg,
-                signed: facts.signed,
-            };
+        if let Some((r, scale, stated)) = &t.normal {
+            let (r, source) = &self.normal_source(r, *stated);
+            let source = *source;
             let flat = match r.remap {
                 Some(m) => [0, 1, 2].map(|c| ([0.0, 0.0, 1.0][c] - m[c][0]) / m[c][1]),
                 None if source.signed => [0.0, 0.0, 1.0],

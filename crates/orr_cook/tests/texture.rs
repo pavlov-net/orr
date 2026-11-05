@@ -1453,6 +1453,73 @@ fn weight_texels_clamp_before_their_factor() {
     assert!((texels[0][0] - 0.5).abs() < 0.01, "{:?}", texels[0]);
 }
 
+/// No format says how float texels hold normals, so their vectors decide, on both paths: unit
+/// vectors read as they are, and 0..1 values, stray texel or not, at `2v - 1`.
+#[test]
+fn float_normals_read_the_way_that_gives_unit_vectors() {
+    let d = dir("float-normals");
+    let n = 32u32;
+    let (x, z) = (0.6f32, 0.8f32);
+    let tilted = |px: u32| if px < n / 2 { x } else { -x };
+    let packed = |v: f32| 0.5 * v + 0.5;
+    let raw = ctt::TargetFormat::Uncompressed;
+    let rgb = || raw(ctt::Format::R32G32B32A32_SFLOAT);
+    let rg = || raw(ctt::Format::R16G16_SFLOAT);
+    // One firefly, and one ringing texel inside the circle only as stored.
+    let stray = |px: u32, py: u32, v: f32, s: f32| if (px, py) == (3, 3) { s } else { v };
+    let files = [
+        float_ktx2(n, n, rgb(), false, |px, _| [tilted(px), 0.0, z, 1.0]),
+        float_ktx2(n, n, rg(), false, |px, _| [tilted(px), 0.0, 0.0, 1.0]),
+        float_ktx2(n, n, rgb(), false, |px, py| {
+            [stray(px, py, packed(tilted(px)), -6e4), 0.5, packed(z), 1.0]
+        }),
+        float_ktx2(n, n, rg(), false, |px, py| {
+            [stray(px, py, packed(tilted(px)), -0.05), 0.5, 0.0, 1.0]
+        }),
+    ];
+    let check = |a: &Archive, name: &str, file: usize| {
+        let (_, levels) = mips(a, name);
+        let texels = decode(vk::BC5_UNORM, n, n, &levels[0][0]);
+        for (px, want) in [(8usize, x), (24, -x)] {
+            let got = 2.0 * texels[24 * n as usize + px][0] - 1.0;
+            assert!((got - want).abs() < 0.03, "file {file}: {got}, not {want}");
+        }
+    };
+    // Toksvig roughness reads the same vectors from either storage.
+    let mut roughness = Vec::new();
+    for (i, bytes) in files.iter().enumerate() {
+        let path = d.join(format!("{i}.ktx2"));
+        std::fs::write(&path, bytes).unwrap();
+        let settings = TextureSettings {
+            usage: Usage::Normal,
+            ..TextureSettings::default()
+        };
+        check(&cook(vec![texture(&path, "n", settings)]), "n", i);
+
+        let glb = d.join(format!("{i}.glb"));
+        let material =
+            r#"{"normalTexture":{"index":0},"pbrMetallicRoughness":{"roughnessFactor":0.25}}"#;
+        write_glb(&glb, &[material.into()], std::slice::from_ref(bytes));
+        let (a, m) = cook_glb_at(&glb, GltfSettings::default(), Quality::Slow);
+        check(
+            &a,
+            a.name(a.find(m.textures[slot::NORMAL].texture).unwrap()),
+            i,
+        );
+        let (info, levels) = mips(
+            &a,
+            a.name(a.find(m.textures[slot::ROUGHNESS].texture).unwrap()),
+        );
+        let last = u32::from(info.header.mip_count) - 1;
+        roughness.push(decode(vk::BC4_UNORM, 1, 1, &levels[0][last as usize])[0][0]);
+    }
+    assert!(roughness[0] > 0.3, "{roughness:?}");
+    assert!(
+        roughness.iter().all(|r| (r - roughness[0]).abs() < 0.02),
+        "{roughness:?}"
+    );
+}
+
 fn bcn_material_checks(a: &Archive, remade: bool, blocks: [&Vec<Vec<u8>>; 5]) {
     let [
         color_blocks,

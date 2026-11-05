@@ -4,12 +4,15 @@
 
 #![allow(clippy::print_stdout)] // the set test reports what each stage cooked
 
+#[path = "common/float_ktx2.rs"]
+mod float_ktx2;
 #[allow(dead_code)]
 #[path = "common/glb.rs"]
 mod glb;
 
 use std::path::{Path, PathBuf};
 
+use float_ktx2::float_ktx2;
 use glb::Glb;
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshSettings, Source, TextureRules,
@@ -1254,6 +1257,93 @@ fn assert_same_materials(ga: &Archive, g: &Material, ua: &Archive, u: &Material)
         ..*m
     };
     assert_eq!(strip(g), strip(u));
+}
+
+/// `UsdUVTexture` scale and bias state how a normal map is encoded, for any image: the same
+/// vectors cook to the same texture from values as stored, at `0.5 v + 0.5`, or flipped.
+#[test]
+fn usd_normals_decode_by_their_scale_and_bias() {
+    let d = dir("usd-normal-decode");
+    let x = |px: u32| if px < 8 { 0.6f32 } else { -0.6 };
+    let cases = [
+        ("(1, 1, 1, 1)", "(0, 0, 0, 0)", 1.0, 0.0),
+        ("(2, 2, 2, 1)", "(-1, -1, -1, 0)", 0.5, 0.5),
+        ("(-1, 1, 1, 1)", "(0, 0, 0, 0)", -1.0, 0.0),
+    ];
+    let cooked = cases.map(|(scale, bias, k, c)| {
+        let format = ctt::TargetFormat::Uncompressed(ctt::Format::R32G32B32A32_SFLOAT);
+        let file = float_ktx2(16, 16, format, false, |px, _| {
+            [k * x(px) + c, c, 0.8 * k.abs() + c, 1.0]
+        });
+        std::fs::write(d.join("n.ktx2"), file).unwrap();
+        let path = d.join("n.usda");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+def Xform "World"
+{{
+    def Mesh "Quad"
+    {{
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)]
+        normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+            interpolation = "vertex"
+        )
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+            interpolation = "vertex"
+        )
+        rel material:binding = </World/Looks/M>
+    }}
+
+    def Scope "Looks"
+    {{
+        def Material "M"
+        {{
+            token outputs:surface.connect = </World/Looks/M/Surface.outputs:surface>
+            def Shader "Surface"
+            {{
+                uniform token info:id = "UsdPreviewSurface"
+                normal3f inputs:normal.connect = </World/Looks/M/Normal.outputs:rgb>
+                token outputs:surface
+            }}
+            def Shader "Normal"
+            {{
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @n.ktx2@
+                float2 inputs:st.connect = </World/Looks/M/St.outputs:result>
+                float4 inputs:scale = {scale}
+                float4 inputs:bias = {bias}
+                float3 outputs:rgb
+            }}
+            def Shader "St"
+            {{
+                uniform token info:id = "UsdPrimvarReader_float2"
+                string inputs:varname = "st"
+                float2 outputs:result
+            }}
+        }}
+    }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let (a, _) = usd(&path, UsdSettings::default()).unwrap();
+        let m = material(&a, "u/material/World/Looks/M");
+        a.find(m.textures[slot::NORMAL].texture)
+            .unwrap()
+            .content_hash
+    });
+    assert_eq!(cooked[0], cooked[1]);
+    assert_eq!(cooked[0], cooked[2]);
 }
 
 fn level_zero() -> MeshSettings {

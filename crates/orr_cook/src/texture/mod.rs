@@ -10,6 +10,7 @@ mod mips;
 pub(crate) mod neural;
 
 pub use orr_color::Primaries;
+use orr_math::Vec3;
 use orr_pack::texture::{
     ExtractedLight, FormatInfo, TILE_BYTES, TextureHeader, TextureInfo, full_mip_count, mip_size,
     normal, tail_first_mip, tile,
@@ -84,8 +85,9 @@ pub enum Usage {
     Color,
     /// sRGB color with linear alpha to BC7 sRGB.
     ColorAlpha,
-    /// Tangent-space normal (RGB as stored, `2v - 1` unless the source is signed, or x and y
-    /// alone from a two-channel source) to BC5 holding x and y; z is reconstructed.
+    /// Tangent-space normal (RGB, or x and y alone from a two-channel source) to BC5 holding x
+    /// and y; z is reconstructed. Unsigned sources store components at `0.5 v + 0.5` and signed
+    /// ones as they are. No format says which a float source does, so its vectors decide.
     Normal,
     /// One linear channel (R) to BC4, or BC4 snorm from a signed source without `alpha_cutoff`.
     Linear1,
@@ -256,6 +258,12 @@ pub(crate) fn first_frame_warning(image: &str) -> String {
     format!("image {image} is animated; only its first frame is cooked")
 }
 
+/// The report's warning for a USD normal map `image` with no scale or bias, which an unsigned
+/// file can't mean literally.
+pub(crate) fn unscaled_normal_warning(image: &str) -> String {
+    format!("normal map {image} states no scale or bias; decoding it as 2v - 1")
+}
+
 impl Built {
     /// Stores the blocks split, or not, as `bc_split` asks; `None` takes the format's
     /// default.
@@ -343,6 +351,36 @@ impl NormalSource {
         };
         [x, y, z]
     }
+}
+
+/// Whether float `layers` hold normals as they are rather than at `0.5 v + 0.5`, the reading
+/// tools give them. With z, the reading closer to unit length on average, each texel counting
+/// for at most 1 so that no stray value outweighs the image. Without, both can fit inside the
+/// unit circle, as a flat map at 0.5 does, so it takes most texels falling outside it at
+/// `2v - 1`: a few ringing texels must not flip a whole image.
+fn stores_normals(layers: &[Img], rg: bool) -> bool {
+    let texels = || {
+        let finite = |p: &&[f32; 4]| p[..3].iter().all(|v| v.is_finite());
+        layers.iter().flat_map(|l| &l.px).filter(finite)
+    };
+    let [kept, moved] = [true, false].map(|signed| NormalSource { rg: false, signed });
+    if rg {
+        let outside = |s: NormalSource| {
+            let beyond = |p: &&[f32; 4]| {
+                let [x, y, _] = s.read(**p);
+                x * x + y * y > 1.0
+            };
+            texels().filter(beyond).count()
+        };
+        let (kept, moved) = (outside(kept), outside(moved));
+        return 2 * moved > texels().count() && kept < moved;
+    }
+    let error = |s: NormalSource| {
+        texels()
+            .map(|p| f64::from((Vec3::from(s.read(*p)).length() - 1.0).abs().min(1.0)))
+            .sum::<f64>()
+    };
+    error(kept) < error(moved)
 }
 
 /// Encoding and layout for the mip chains of `layers` (values linear, normals unit).
@@ -524,9 +562,12 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
     );
     let normal = s.usage == Usage::Normal;
     let srgb = src.srgb;
+    if normal && src.float {
+        load::decode_layers(&mut src)?;
+    }
     let source = NormalSource {
         rg: src.rg,
-        signed: src.signed,
+        signed: src.signed || (normal && src.float && stores_normals(&src.layers, src.rg)),
     };
     let linear = |p: &mut [f32; 4]| {
         if color && srgb {

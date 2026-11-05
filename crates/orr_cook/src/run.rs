@@ -1688,13 +1688,30 @@ fn plan_scene(
         .iter()
         .filter_map(|m| m.textures.displacement.map(|r| r.image))
         .collect();
+    let normals: HashSet<usize> = src
+        .materials
+        .iter()
+        .filter_map(|m| m.textures.normal.as_ref())
+        .filter(|n| !n.2)
+        .map(|n| n.0.image)
+        .collect();
     let facts: HashMap<usize, ImageFacts> =
-        image_facts(name, &mut src.images, &used, &heights, memo)?;
+        image_facts(name, &mut src.images, &used, &heights, &normals, memo)?;
     let mut warnings = std::mem::take(&mut src.warnings);
     warnings.extend(
         used.iter()
             .filter(|i| facts[*i].animated)
             .map(|&i| texture::first_frame_warning(&src.images[i].name)),
+    );
+    let unscaled: BTreeSet<usize> = src
+        .materials
+        .iter()
+        .filter_map(|m| m.textures.unscaled_normal(&facts))
+        .collect();
+    warnings.extend(
+        unscaled
+            .into_iter()
+            .map(|i| texture::unscaled_normal_warning(&src.images[i].name)),
     );
     for i in &used {
         if let ImageData::File {
