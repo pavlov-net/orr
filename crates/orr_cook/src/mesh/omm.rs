@@ -3,12 +3,13 @@
 
 use meshopt::{AlphaTexture, OpacityStates};
 use orr_pack::mesh::{
-    MicromapEntry, OMM_OPAQUE, OMM_STATE_OPAQUE, OMM_STATE_UNKNOWN_TRANSPARENT, OMM_TRANSPARENT,
+    MicromapEntry, OMM_OPAQUE, OMM_STATE_OPAQUE, OMM_STATE_TRANSPARENT, OMM_STATE_UNKNOWN_OPAQUE,
+    OMM_STATE_UNKNOWN_TRANSPARENT, OMM_TRANSPARENT,
 };
 use rayon::prelude::*;
 use serde::Deserialize;
 
-use super::maps::{FAIL, Opacity, PASS, Passes, Ranges, Raster};
+use super::maps::{self, FAIL, Map, Opacity, OpacityRead, PASS, Ranges, Raster};
 
 const STATES: OpacityStates = OpacityStates::Four;
 
@@ -186,6 +187,40 @@ impl OmmAlpha {
     }
 }
 
+/// One texture as micromaps read it.
+pub(super) struct OmmRead<'a> {
+    read: &'a OpacityRead,
+    alpha: OmmAlpha,
+}
+
+impl<'a> OmmRead<'a> {
+    /// `None` for a texture wider or taller than [`OmmAlpha::MAX_SIZE`].
+    pub(super) fn new(read: &'a OpacityRead, cutoff: f32) -> Option<Self> {
+        let alpha = OmmAlpha::new(&read.mip0, cutoff)?;
+        Some(Self { read, alpha })
+    }
+
+    /// Which sides of the cutoff a bilinear sample on uv triangle `tri` can read.
+    fn sides(&self, tri: [[f32; 2]; 3]) -> u8 {
+        let mip0 = &self.read.mip0;
+        // Tiles on one side settle the footprint they hold without walking its texels.
+        // The tiles rarely settle a footprint narrower than 16 of them; the runs are cheaper.
+        let ranges = mip0.footprint_ranges(tri);
+        let uniform = || ranges.and_then(|r| self.alpha.sides.uniform(&r));
+        let wide = ranges.is_some_and(|r| r.iter().any(|r| r.len() > 16 * Sides::TILE));
+        let sides = wide
+            .then(uniform)
+            .flatten()
+            .unwrap_or_else(|| self.read.passes.footprint(mip0, tri, PASS | FAIL));
+        // An empty footprint keeps the side its tiles are on.
+        if sides == 0 {
+            uniform().unwrap_or(0)
+        } else {
+            sides
+        }
+    }
+}
+
 fn remap(t: f32, cutoff: f32) -> u8 {
     if t >= cutoff {
         let y = if cutoff < 1.0 {
@@ -224,13 +259,74 @@ fn block_bytes(triangles: usize, entries: usize, data: usize) -> usize {
     (2 * triangles).next_multiple_of(4) + size_of::<MicromapEntry>() * entries + data
 }
 
+impl Map<OmmRead<'_>> {
+    /// Mesh uv `p` as the slot maps it.
+    fn mapped(&self, p: [f32; 2]) -> [f64; 2] {
+        match self {
+            Self::Image(t) => t.read.mip0.mapped(p),
+            Self::Tiles(t) => maps::mapped(t.uv, p),
+        }
+    }
+}
+
+/// Triangles of a cluster rasterized alike, measured together.
+struct Batch<'a> {
+    /// The texture each lies whole in; `None` for triangles that reach past one.
+    read: Option<&'a OmmRead<'a>>,
+    /// Texels a side of the largest texture they read, which their levels aim at.
+    size: [u32; 2],
+    /// Their places among the cluster's triangles.
+    tris: Vec<usize>,
+    /// Their corners, in `read`'s mapped uvs or the slot's.
+    uvs: Vec<[f32; 2]>,
+}
+
+/// The cluster's triangles `tris` over its `uvs` by what they read, in order of first use.
+fn batches<'a>(alpha: &'a Map<OmmRead<'a>>, uvs: &[[f32; 2]], tris: &[[u8; 3]]) -> Vec<Batch<'a>> {
+    let narrow = |p: [f64; 2]| p.map(|x| x as f32);
+    let mut out: Vec<Batch<'a>> = Vec::new();
+    for (t, tri) in tris.iter().enumerate() {
+        let uv = tri.map(|v| uvs[usize::from(v)]);
+        let (mut parts, mut size, mut last) = (0, [1, 1], None);
+        alpha.parts(uv, |p| {
+            parts += 1;
+            size = [size[0].max(p.read.alpha.w), size[1].max(p.read.alpha.h)];
+            last = Some((p.read, p.uv));
+            true
+        });
+        let (read, corners) = match last.filter(|_| parts == 1) {
+            Some((r, p)) => (Some(r), p.map(|c| narrow(r.read.mip0.mapped(c)))),
+            None => (None, uv.map(|c| narrow(alpha.mapped(c)))),
+        };
+        let alike = |b: &Batch<'a>| {
+            b.size == size
+                && match (b.read, read) {
+                    (Some(a), Some(b)) => std::ptr::eq(a, b),
+                    (a, b) => a.is_none() && b.is_none(),
+                }
+        };
+        let at = out.iter().position(alike).unwrap_or_else(|| {
+            out.push(Batch {
+                read,
+                size,
+                tris: Vec::new(),
+                uvs: Vec::new(),
+            });
+            out.len() - 1
+        });
+        out[at].tris.push(t);
+        out[at].uvs.extend(corners);
+    }
+    out
+}
+
 /// Micromaps of a cluster's alpha-tested triangles: `tris` in stored corner order over the
 /// cluster's stored vertex uvs. Known states never contradict the alpha test, a bilinear
-/// sample of `mip0` against the cutoff, anywhere on their micro-triangle. `None` when the
+/// sample of mip 0 against the cutoff, anywhere on their micro-triangle. `None` when the
 /// opacity is unknown to the cook.
 pub(super) fn cluster_omm(
     opacity: &Opacity,
-    alpha: Option<&OmmAlpha>,
+    alpha: Option<&Map<OmmRead<'_>>>,
     uvs: &[[f32; 2]],
     tris: &[[u8; 3]],
     s: &OmmSettings,
@@ -238,7 +334,7 @@ pub(super) fn cluster_omm(
     if tris.is_empty() {
         return None;
     }
-    let (mip0, passes) = match opacity {
+    let cutoff = match opacity {
         Opacity::Constant(pass) => {
             return Some(ClusterOmm {
                 indices: vec![
@@ -250,54 +346,73 @@ pub(super) fn cluster_omm(
                 max_level: s.max_level,
             });
         }
-        Opacity::Texture { mip0, passes, .. } => (mip0, passes),
+        Opacity::Texture { cutoff, .. } => *cutoff,
         Opacity::Unknown => return None,
     };
     let alpha = alpha?;
     let _z = crate::profile::zone!("omm.cluster");
-    let corners: Vec<u32> = tris.iter().flatten().map(|&v| u32::from(v)).collect();
     // The rasterizer reads the texture at the uvs the material samples it at.
-    let mapped: Vec<[f32; 2]> = uvs
-        .iter()
-        .map(|&p| mip0.mapped(p).map(|x| x as f32))
-        .collect();
+    let batches = batches(alpha, uvs, tris);
     // The highest level whose block fits the cap before compaction, which only shrinks it.
     let mut level = s.max_level;
-    let (m, mut offsets, size) = loop {
-        let m =
-            meshopt::opacity_map_measure(&corners, &mapped, alpha.w, alpha.h, level, s.target_edge);
-        let (offsets, size) = meshopt::opacity_map_layout(&m.levels, STATES);
-        let bytes = block_bytes(tris.len(), m.levels.len(), size);
+    let (measured, mut levels, mut offsets, size) = loop {
+        let measured: Vec<_> = batches
+            .iter()
+            .map(|b| {
+                let corners: Vec<u32> = (0..b.uvs.len() as u32).collect();
+                let [w, h] = b.size;
+                meshopt::opacity_map_measure(&corners, &b.uvs, w, h, level, s.target_edge)
+            })
+            .collect();
+        let levels: Vec<u8> = measured
+            .iter()
+            .flat_map(|m| m.levels.iter().copied())
+            .collect();
+        let (offsets, size) = meshopt::opacity_map_layout(&levels, STATES);
+        let bytes = block_bytes(tris.len(), levels.len(), size);
         if level == 0 || bytes <= s.cluster_bytes_max as usize {
-            break (m, offsets, size);
+            break (measured, levels, offsets, size);
         }
         level -= 1;
     };
-    let mut levels = m.levels;
     let mut data = vec![0; size];
+    let mut indices = vec![0; tris.len()];
+    let mut entries = Vec::with_capacity(levels.len());
+    for (b, m) in batches.iter().zip(&measured) {
+        let first = entries.len() as i32;
+        for (&t, &i) in b.tris.iter().zip(&m.indices) {
+            indices[t] = first + i;
+        }
+        entries.extend(m.sources.iter().map(|&t| (b, t as usize)));
+    }
     // Rasterizing and checking run as two passes so a profile shows each.
-    let entry = |i: usize| {
+    let entry = |levels: &[u8], i: usize| {
         let at = offsets[i] as usize;
         at..at + meshopt::opacity_map_entry_size(levels[i], STATES)
     };
+    let mesh_uv = |b: &Batch<'_>, t: usize| tris[b.tris[t]].map(|v| uvs[usize::from(v)]);
     {
         let _z = crate::profile::zone!("omm.rasterize");
-        for (i, &source) in m.sources.iter().enumerate() {
-            let at = tris[source as usize].map(|v| mapped[usize::from(v)]);
-            let entry = &mut data[entry(i)];
-            meshopt::opacity_map_rasterize(entry, levels[i], STATES, &at, &alpha.texture());
+        for (i, &(b, t)) in entries.iter().enumerate() {
+            let entry = &mut data[entry(&levels, i)];
+            match b.read {
+                Some(r) => {
+                    let at = [0, 1, 2].map(|k| b.uvs[3 * t + k]);
+                    let texture = r.alpha.texture();
+                    meshopt::opacity_map_rasterize(entry, levels[i], STATES, &at, &texture);
+                }
+                None => rasterize_across(entry, levels[i], mesh_uv(b, t), alpha, cutoff),
+            }
         }
     }
     {
         let _z = crate::profile::zone!("omm.check");
-        for (i, &source) in m.sources.iter().enumerate() {
-            let uv = tris[source as usize].map(|v| uvs[usize::from(v)]);
-            let entry = &mut data[entry(i)];
-            known_states_hold(entry, levels[i], uv, mip0, passes, &alpha.sides);
+        for (i, &(b, t)) in entries.iter().enumerate() {
+            let entry = &mut data[entry(&levels, i)];
+            known_states_hold(entry, levels[i], mesh_uv(b, t), alpha);
         }
     }
     let _z = crate::profile::zone!("omm.compact");
-    let mut indices = m.indices;
     meshopt::opacity_map_compact(&mut data, &mut levels, &mut offsets, &mut indices, STATES);
     Some(ClusterOmm {
         indices,
@@ -305,6 +420,59 @@ pub(super) fn cluster_omm(
         data,
         max_level: level,
     })
+}
+
+/// A point on a triangle and the alpha it reads, remapped as [`OmmAlpha`] holds it.
+type Reading = ([f32; 2], f32);
+
+/// What `opacity_map_rasterize` writes, for a triangle no one texture holds where it reads only
+/// one: four-state micro-triangles from the alpha at their corners and centers, without the edge
+/// samples it adds to micro-triangles a few texels wide. Unknown states pick their side as it does
+/// from those points, which rays forced to two states see.
+fn rasterize_across(
+    data: &mut [u8],
+    level: u8,
+    uv: [[f32; 2]; 3],
+    alpha: &Map<OmmRead<'_>>,
+    cutoff: f32,
+) {
+    fn visit(
+        data: &mut [u8],
+        index: usize,
+        level: u8,
+        tri: [Reading; 3],
+        read: &impl Fn([f32; 2]) -> Reading,
+    ) {
+        let [c0, c1, c2] = tri;
+        if level > 0 {
+            let mid =
+                |a: Reading, b: Reading| read([(a.0[0] + b.0[0]) / 2.0, (a.0[1] + b.0[1]) / 2.0]);
+            let (c01, c12, c20) = (mid(c0, c1), mid(c1, c2), mid(c2, c0));
+            let l = level - 1;
+            visit(data, index * 4, l, [c0, c01, c20], read);
+            visit(data, index * 4 + 1, l, [c20, c12, c01], read);
+            visit(data, index * 4 + 2, l, [c01, c1, c12], read);
+            visit(data, index * 4 + 3, l, [c12, c20, c2], read);
+            return;
+        }
+        let center = [0, 1].map(|a| (c0.0[a] + c1.0[a] + c2.0[a]) / 3.0);
+        let a = [c0.1, c1.1, c2.1, read(center).1];
+        let state = if a.iter().all(|&a| a < 0.5) {
+            OMM_STATE_TRANSPARENT
+        } else if a.iter().all(|&a| a > 0.5) {
+            OMM_STATE_OPAQUE
+        } else if (a[0] + a[1] + a[2]) * 0.12 + a[3] * 0.64 >= 0.5 {
+            OMM_STATE_UNKNOWN_OPAQUE
+        } else {
+            OMM_STATE_UNKNOWN_TRANSPARENT
+        };
+        data[index / 4] |= state << (2 * (index % 4));
+    }
+    let read = |p: [f32; 2]| {
+        let (r, q) = alpha.at(p);
+        (p, f32::from(remap(r.read.mip0.sample(q), cutoff)) / 255.0)
+    };
+    visit(data, 0, level, uv.map(read), &read);
 }
 
 /// Whether micro-triangles `first..first + count` of a four-state entry hold a known state.
@@ -320,14 +488,7 @@ fn any_known(data: &[u8], first: usize, count: usize) -> bool {
 
 /// Turns each known state into the unknown state of the same side unless every texel a
 /// bilinear sample on its micro-triangle reads is on that side of the cutoff.
-fn known_states_hold(
-    data: &mut [u8],
-    level: u8,
-    uv: [[f32; 2]; 3],
-    mip0: &Raster,
-    passes: &Passes,
-    tiles: &Sides,
-) {
+fn known_states_hold(data: &mut [u8], level: u8, uv: [[f32; 2]; 3], alpha: &Map<OmmRead<'_>>) {
     // Micro-triangles in the order meshoptimizer rasterizes them: children 0 and 2 keep
     // the winding, 1 and 3 flip it. A triangle whose footprint stays on one side of the
     // cutoff settles every micro-triangle under it.
@@ -336,36 +497,26 @@ fn known_states_hold(
         index: usize,
         level: u8,
         tri: [[f32; 2]; 3],
-        mip0: &Raster,
-        passes: &Passes,
-        tiles: &Sides,
+        alpha: &Map<OmmRead<'_>>,
     ) {
         // Only known states change, so a run of unknown ones needs no footprint.
         if !any_known(data, index << (2 * level), 1 << (2 * level)) {
             return;
         }
-        // Tiles on one side settle the footprint they hold without walking its texels.
-        // The tiles rarely settle a footprint narrower than 16 of them; the runs are cheaper.
-        let ranges = mip0.footprint_ranges(tri);
-        let uniform = || ranges.and_then(|r| tiles.uniform(&r));
-        let wide = ranges.is_some_and(|r| r.iter().any(|r| r.len() > 16 * Sides::TILE));
-        let mut sides = wide
-            .then(uniform)
-            .flatten()
-            .unwrap_or_else(|| passes.footprint(mip0, tri, PASS | FAIL));
-        // An empty footprint keeps the side its tiles are on.
-        if sides == 0 {
-            sides = uniform().unwrap_or(0);
-        }
+        let mut sides = 0;
+        alpha.parts(tri, |p| {
+            sides |= p.read.sides(p.uv);
+            sides != PASS | FAIL
+        });
         if sides == PASS | FAIL && level > 0 {
             let [c0, c1, c2] = tri;
             let mid = |a: [f32; 2], b: [f32; 2]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
             let (c01, c12, c20) = (mid(c0, c1), mid(c1, c2), mid(c2, c0));
             let l = level - 1;
-            visit(data, index * 4, l, [c0, c01, c20], mip0, passes, tiles);
-            visit(data, index * 4 + 1, l, [c20, c12, c01], mip0, passes, tiles);
-            visit(data, index * 4 + 2, l, [c01, c1, c12], mip0, passes, tiles);
-            visit(data, index * 4 + 3, l, [c12, c20, c2], mip0, passes, tiles);
+            visit(data, index * 4, l, [c0, c01, c20], alpha);
+            visit(data, index * 4 + 1, l, [c20, c12, c01], alpha);
+            visit(data, index * 4 + 2, l, [c01, c1, c12], alpha);
+            visit(data, index * 4 + 3, l, [c12, c20, c2], alpha);
             return;
         }
         let first = index << (2 * level);
@@ -382,7 +533,7 @@ fn known_states_hold(
             }
         }
     }
-    visit(data, 0, level, uv, mip0, passes, tiles);
+    visit(data, 0, level, uv, alpha);
 }
 
 /// A page's micromap region and where its clusters' indices start in it.
@@ -455,8 +606,13 @@ pub(crate) fn page_region(clusters: &[Option<&ClusterOmm>]) -> Region {
 
 #[cfg(test)]
 mod tests {
-    use super::{FAIL, OmmAlpha, PASS, remap};
-    use crate::mesh::maps::Raster;
+    use std::sync::Arc;
+
+    use super::{
+        ClusterOmm, FAIL, Map, OMM_STATE_OPAQUE, OMM_STATE_TRANSPARENT, OmmAlpha, OmmRead,
+        OmmSettings, Opacity, OpacityRead, PASS, cluster_omm, remap,
+    };
+    use crate::mesh::maps::{Raster, Tiles};
     use crate::texture::Wrap;
 
     #[test]
@@ -477,7 +633,7 @@ mod tests {
         let mut raster = Raster {
             w,
             h,
-            texels: std::sync::Arc::new(texels),
+            texels: Arc::new(texels),
             wrap: [Wrap::Repeat; 2],
             uv: [0.0; 6],
             outside: 0.0,
@@ -508,6 +664,129 @@ mod tests {
                 "{wrap:?}: tiles settled {settled} footprints"
             );
         }
+    }
+
+    /// `n` x `n` texels past the cutoff 0.5 on the right half of a tile, or `all` of them.
+    fn opacity(n: u32, all: bool) -> OpacityRead {
+        let mip0 = Raster {
+            w: n,
+            h: n,
+            texels: Arc::new(
+                (0..n * n)
+                    .map(|i| f32::from(u8::from(all || i % n >= n / 2)))
+                    .collect(),
+            ),
+            wrap: [Wrap::Clamp; 2],
+            uv: [0.0; 6],
+            outside: 0.0,
+        };
+        OpacityRead::new(mip0, 0.5)
+    }
+
+    fn set(tiles: Vec<((u16, u16), OpacityRead)>) -> Map<OpacityRead> {
+        Map::Tiles(Tiles {
+            uv: [0.0; 6],
+            tiles: tiles.into_iter().collect(),
+            missing: OpacityRead::solid(0.0, 0.5),
+        })
+    }
+
+    fn settings(level: u8) -> OmmSettings {
+        OmmSettings {
+            max_level: level,
+            target_edge: 0.0,
+            cluster_bytes_max: 64 << 10,
+        }
+    }
+
+    fn cluster(
+        map: Map<OpacityRead>,
+        uvs: &[[f32; 2]],
+        tris: &[[u8; 3]],
+        s: &OmmSettings,
+    ) -> ClusterOmm {
+        let opacity = Opacity::Texture {
+            map,
+            cutoff: 0.5,
+            uv_set: 0,
+        };
+        let Opacity::Texture { map, .. } = &opacity else {
+            unreachable!()
+        };
+        let alpha = map.try_map(|t| OmmRead::new(t, 0.5)).unwrap();
+        cluster_omm(&opacity, Some(&alpha), uvs, tris, s).unwrap()
+    }
+
+    /// Triangles inside a tile rasterize as the same image's do, wherever the tile lies.
+    #[test]
+    fn micromaps_of_a_tile_match_the_same_image() {
+        let uvs: Vec<[f32; 2]> = (0..64)
+            .map(|i| [(i % 8) as f32 / 8.0, (i / 8) as f32 / 8.0])
+            .collect();
+        let tris: Vec<[u8; 3]> = (0..56u8)
+            .filter(|i| i % 8 != 7)
+            .flat_map(|i| [[i, i + 1, i + 8], [i + 1, i + 9, i + 8]])
+            .collect();
+        let moved: Vec<[f32; 2]> = uvs.iter().map(|c| [c[0] + 3.0, c[1] - 2.0]).collect();
+        let s = OmmSettings::default();
+        let image = cluster(Map::Image(opacity(64, false)), &uvs, &tris, &s);
+        let tile = cluster(set(vec![((2, 3), opacity(64, false))]), &moved, &tris, &s);
+        assert!(!image.data.is_empty());
+        assert_eq!(image.indices, tile.indices);
+        assert_eq!(image.levels, tile.levels);
+        assert_eq!(image.data, tile.data);
+    }
+
+    /// Whole in one cell, a micro-triangle states what that cell holds, whichever cell it is.
+    #[test]
+    fn a_triangle_across_tiles_states_what_each_part_reads() {
+        // One triangle over an opaque tile, a tile half opaque and a cell with no tile.
+        let map = set(vec![
+            ((0, 0), opacity(16, true)),
+            ((0, 1), opacity(32, false)),
+        ]);
+        let uvs = [[0.25, 0.25], [2.75, 0.25], [0.25, 0.75]];
+        let level = 5;
+        let m = cluster(map, &uvs, &[[0, 1, 2]], &settings(level));
+        assert_eq!(m.levels, [level]);
+        fn walk(
+            m: &ClusterOmm,
+            index: usize,
+            level: u8,
+            [c0, c1, c2]: [[f32; 2]; 3],
+            seen: &mut [u32; 3],
+        ) {
+            if level > 0 {
+                let mid = |a: [f32; 2], b: [f32; 2]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+                let (c01, c12, c20) = (mid(c0, c1), mid(c1, c2), mid(c2, c0));
+                walk(m, index * 4, level - 1, [c0, c01, c20], seen);
+                walk(m, index * 4 + 1, level - 1, [c20, c12, c01], seen);
+                walk(m, index * 4 + 2, level - 1, [c01, c1, c12], seen);
+                walk(m, index * 4 + 3, level - 1, [c12, c20, c2], seen);
+                return;
+            }
+            let state = m.data[index / 4] >> (2 * (index % 4)) & 3;
+            let (lo, hi) = [c0, c1, c2]
+                .iter()
+                .fold((9.0f32, -9.0f32), |(l, h), c| (l.min(c[0]), h.max(c[0])));
+            // Texels a bilinear tap reads reach a texel past the half of the second tile.
+            if hi < 0.99 {
+                assert_eq!(state, OMM_STATE_OPAQUE, "opaque tile at {lo}..{hi}");
+                seen[0] += 1;
+            } else if lo > 1.01 && hi < 1.45 {
+                assert_eq!(state, OMM_STATE_TRANSPARENT, "left half at {lo}..{hi}");
+                seen[1] += 1;
+            } else if lo > 1.55 && hi < 1.99 {
+                assert_eq!(state, OMM_STATE_OPAQUE, "right half at {lo}..{hi}");
+                seen[2] += 1;
+            } else if lo > 2.01 {
+                assert_eq!(state, OMM_STATE_TRANSPARENT, "no tile at {lo}..{hi}");
+                seen[1] += 1;
+            }
+        }
+        let mut seen = [0; 3];
+        walk(&m, 0, level, uvs, &mut seen);
+        assert!(seen.iter().all(|&n| n > 20), "{seen:?}");
     }
 
     #[test]

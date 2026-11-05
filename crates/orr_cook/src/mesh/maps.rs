@@ -1,10 +1,16 @@
 //! Cooked textures a mesh cook reads: the opacity mip 0 that decides which triangles of an
 //! alpha-tested section are opaque, and the displacement mips that bound each cluster's
 //! displacement.
+//!
+//! A slot reads one texture or a tile set ([`Map`]). A set reads as `texture_tile` does: the cell
+//! under a point's mapped uv picks a tile or nothing, and the point reads that tile clamped to its
+//! own square. So a read over a triangle walks its parts, one or more to each texture it reaches.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::texture::Wrap;
+use orr_math::Vec3;
 use rayon::prelude::*;
 
 /// One mip of one channel, row-major, with the sampler's edge modes, the material slot's uv
@@ -16,6 +22,303 @@ pub(crate) struct Raster {
     pub(crate) wrap: [Wrap; 2],
     pub(crate) uv: [f32; 6],
     pub(crate) outside: f32,
+}
+
+/// What a material slot reads across uv space, each `T` what the cook holds of one texture.
+pub(crate) enum Map<T> {
+    Image(T),
+    Tiles(Tiles<T>),
+}
+
+/// A tile set. A tile's `T` reads its own square's 0..1, clamped and with no uv transform: the set
+/// maps uvs and finds the tile.
+pub(crate) struct Tiles<T> {
+    /// The slot's uv transform, in `Material::uv_transforms` form.
+    pub(crate) uv: [f32; 6],
+    /// By row, then column.
+    pub(crate) tiles: BTreeMap<(u16, u16), T>,
+    /// What reads where the set has no tile.
+    pub(crate) missing: T,
+}
+
+/// The part of a triangle one texture reads.
+pub(super) struct Part<'a, T> {
+    pub(super) read: &'a T,
+    /// Its corners in the uvs `read` takes.
+    pub(super) uv: [[f32; 2]; 3],
+    /// Its corners as weights of the whole triangle's corners.
+    pub(super) weights: [Vec3; 3],
+}
+
+const WHOLE: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
+
+/// A polygon corner: mapped u and v, then its weights of the whole triangle's corners.
+type Corner = [f64; 5];
+
+/// The parts of convex `poly` before `at` and from `at` on along `axis`. A point on the line lies
+/// in the cell that starts there, so a polygon with nothing before `at` has no first part.
+fn cut(poly: &[Corner], axis: usize, at: f64) -> [Vec<Corner>; 2] {
+    let (mut before, mut from) = (Vec::new(), Vec::new());
+    for (i, &a) in poly.iter().enumerate() {
+        let b = poly[(i + 1) % poly.len()];
+        let (da, db) = (a[axis] - at, b[axis] - at);
+        if da <= 0.0 {
+            before.push(a);
+        }
+        if da >= 0.0 {
+            from.push(a);
+        }
+        if (da < 0.0 && db > 0.0) || (da > 0.0 && db < 0.0) {
+            let s = da / (da - db);
+            let mut c: Corner = std::array::from_fn(|k| a[k] + (b[k] - a[k]) * s);
+            c[axis] = at;
+            before.push(c);
+            from.push(c);
+        }
+    }
+    if !before.iter().any(|c| c[axis] < at) {
+        before.clear();
+    }
+    [before, from]
+}
+
+/// Cuts `rest` along `axis` into the unit cells of `cells`, which ascend, and what lies between
+/// them, and calls `visit` with each piece and its cell, if it has one. Stops when `visit` returns
+/// false, and returns whether it ran to the end.
+fn sweep<C>(
+    mut rest: Vec<Corner>,
+    axis: usize,
+    cells: impl Iterator<Item = (f64, C)>,
+    visit: &mut impl FnMut(Option<C>, Vec<Corner>) -> bool,
+) -> bool {
+    for (at, cell) in cells {
+        if rest.is_empty() {
+            return true;
+        }
+        let [before, from] = cut(&rest, axis, at);
+        if !before.is_empty() && !visit(None, before) {
+            return false;
+        }
+        let [within, after] = cut(&from, axis, at + 1.0);
+        if !within.is_empty() && !visit(Some(cell), within) {
+            return false;
+        }
+        rest = after;
+    }
+    rest.is_empty() || visit(None, rest)
+}
+
+impl<T> Tiles<T> {
+    /// `texture_tile`: what reads in the cell at whole numbers `u`, `v`. Row 1 lies above row 0.
+    fn cell(&self, u: f64, v: f64) -> &T {
+        let (column, row) = (u, -v);
+        let held = |c: f64| (0.0..65536.0).contains(&c);
+        if !(held(column) && held(row)) {
+            return &self.missing;
+        }
+        self.tiles
+            .get(&(row as u16, column as u16))
+            .unwrap_or(&self.missing)
+    }
+
+    fn at(&self, uv: [f32; 2]) -> (&T, [f32; 2]) {
+        let p = mapped(self.uv, uv);
+        let cell = p.map(f64::floor);
+        (
+            self.cell(cell[0], cell[1]),
+            [0, 1].map(|a| (p[a] - cell[a]) as f32),
+        )
+    }
+
+    /// Calls `f` with the parts of `uv`; a part flat along a cell's edge counts with `edges`.
+    fn walk<'a>(
+        &'a self,
+        uv: [[f32; 2]; 3],
+        edges: bool,
+        f: &mut impl FnMut(Part<'a, T>) -> bool,
+    ) -> bool {
+        let p = uv.map(|c| mapped(self.uv, c));
+        let cell = p[0].map(f64::floor);
+        if p.iter().all(|c| c.map(f64::floor) == cell) {
+            return f(Part {
+                read: self.cell(cell[0], cell[1]),
+                uv: p.map(|c| [0, 1].map(|a| (c[a] - cell[a]) as f32)),
+                weights: WHOLE,
+            });
+        }
+        let (e1, e2) = (
+            [p[1][0] - p[0][0], p[1][1] - p[0][1]],
+            [p[2][0] - p[0][0], p[2][1] - p[0][1]],
+        );
+        // A triangle with no area reads along a line, and all its parts are flat.
+        let edges = edges || e1[0] * e2[1] == e1[1] * e2[0];
+        let mut emit = |read: &'a T, origin: [f64; 2], poly: Vec<Corner>| {
+            let flat = |a: usize| poly.iter().all(|c| c[a] == poly[0][a]);
+            if !edges && (flat(0) || flat(1)) {
+                return true;
+            }
+            let last = poly.len() - 1;
+            (1..last.max(2)).all(|i| {
+                let corners = [poly[0], poly[i.min(last)], poly[(i + 1).min(last)]];
+                f(Part {
+                    read,
+                    uv: corners.map(|c| [(c[0] - origin[0]) as f32, (c[1] - origin[1]) as f32]),
+                    weights: corners.map(|c| Vec3::new(c[2] as f32, c[3] as f32, c[4] as f32)),
+                })
+            })
+        };
+        let poly = vec![
+            [p[0][0], p[0][1], 1.0, 0.0, 0.0],
+            [p[1][0], p[1][1], 0.0, 1.0, 0.0],
+            [p[2][0], p[2][1], 0.0, 0.0, 1.0],
+        ];
+        let low = |a: usize| p.iter().map(|c| c[a]).fold(f64::INFINITY, f64::min).floor();
+        let index = |c: f64| c.clamp(0.0, 65535.0) as u16;
+        let (first_column, first_row) = (index(low(0)), index(-low(1)));
+        let row_of = |(k, _): (&(u16, u16), &T)| k.0;
+        // Rows run against v, so the sweep up v takes them from the last down.
+        let rows = std::iter::successors(
+            self.tiles
+                .range(..=(first_row, u16::MAX))
+                .next_back()
+                .map(row_of),
+            |&row| self.tiles.range(..(row, 0)).next_back().map(row_of),
+        );
+        sweep(
+            poly,
+            1,
+            rows.map(|row| (-f64::from(row), row)),
+            &mut |row, poly| {
+                let Some(row) = row else {
+                    let origin = [poly[0][0].floor(), poly[0][1].floor()];
+                    return emit(&self.missing, origin, poly);
+                };
+                let v = -f64::from(row);
+                let tiles = self.tiles.range((row, first_column)..=(row, u16::MAX));
+                let cells = tiles.map(|(k, t)| (f64::from(k.1), (f64::from(k.1), t)));
+                sweep(poly, 0, cells, &mut |tile, poly| match tile {
+                    Some((u, t)) => emit(t, [u, v], poly),
+                    None => emit(&self.missing, [poly[0][0].floor(), v], poly),
+                })
+            },
+        )
+    }
+}
+
+impl<T> Map<T> {
+    /// What reads at mesh uv `uv`, and where in it, as `material_texture` picks it.
+    pub(super) fn at(&self, uv: [f32; 2]) -> (&T, [f32; 2]) {
+        match self {
+            Self::Image(t) => (t, uv),
+            Self::Tiles(t) => t.at(uv),
+        }
+    }
+
+    fn walk<'a>(
+        &'a self,
+        uv: [[f32; 2]; 3],
+        edges: bool,
+        f: &mut impl FnMut(Part<'a, T>) -> bool,
+    ) -> bool {
+        match self {
+            Self::Image(read) => f(Part {
+                read,
+                uv,
+                weights: WHOLE,
+            }),
+            Self::Tiles(t) => t.walk(uv, edges, f),
+        }
+    }
+
+    /// Calls `f` with the parts of mesh uv triangle `uv` that hold area, which is where a ray can
+    /// land; stops when `f` returns false, and returns whether it ran to the end. A cell the
+    /// triangle only touches, past the edge its corners sit on, has no part.
+    pub(super) fn parts<'a>(
+        &'a self,
+        uv: [[f32; 2]; 3],
+        mut f: impl FnMut(Part<'a, T>) -> bool,
+    ) -> bool {
+        self.walk(uv, false, &mut f)
+    }
+
+    /// [`Self::parts`] with the cells a triangle only touches. Displacement reads at the corners
+    /// themselves, and a corner on a cell's edge reads the cell that starts there.
+    pub(super) fn reads<'a>(
+        &'a self,
+        uv: [[f32; 2]; 3],
+        mut f: impl FnMut(Part<'a, T>) -> bool,
+    ) -> bool {
+        self.walk(uv, true, &mut f)
+    }
+
+    /// Every texture, and what reads where a set has none.
+    pub(super) fn each(&self) -> impl Iterator<Item = &T> {
+        let (image, tiles, missing) = match self {
+            Self::Image(t) => (Some(t), None, None),
+            Self::Tiles(t) => (None, Some(t.tiles.values()), Some(&t.missing)),
+        };
+        image
+            .into_iter()
+            .chain(tiles.into_iter().flatten())
+            .chain(missing)
+    }
+
+    /// The same map of what `f` makes of each texture, or `None` if it makes nothing of one.
+    pub(super) fn try_map<'a, U>(
+        &'a self,
+        mut f: impl FnMut(&'a T) -> Option<U>,
+    ) -> Option<Map<U>> {
+        Some(match self {
+            Self::Image(t) => Map::Image(f(t)?),
+            Self::Tiles(t) => Map::Tiles(Tiles {
+                uv: t.uv,
+                tiles: t
+                    .tiles
+                    .iter()
+                    .map(|(&k, t)| Some((k, f(t)?)))
+                    .collect::<Option<_>>()?,
+                missing: f(&t.missing)?,
+            }),
+        })
+    }
+}
+
+impl Map<[Raster; 2]> {
+    /// [`normal_frame`] of the slot's uv transform.
+    pub(super) fn normal_frame(&self, v: [f32; 3]) -> [f32; 3] {
+        normal_frame(
+            match self {
+                Self::Image(t) => t[0].uv,
+                Self::Tiles(t) => t.uv,
+            },
+            v,
+        )
+    }
+}
+
+/// Mesh uv `p` under uv transform `uv`, as the texture is sampled at.
+pub(super) fn mapped(uv: [f32; 6], p: [f32; 2]) -> [f64; 2] {
+    let [a, b, c, d, e, f] = uv.map(f64::from);
+    let (u, v) = (f64::from(p[0]), f64::from(p[1]));
+    [(1.0 + a) * u + b * v + c, d * u + (1.0 + e) * v + f]
+}
+
+/// `material_normal_frame`: tangent-space normal `v` read from a normal map under uv transform
+/// `uv`, turned into the mesh uv's frame by the normalized columns of the inverse transform.
+fn normal_frame(uv: [f32; 6], v: [f32; 3]) -> [f32; 3] {
+    let [a, b, _, d, e, _] = uv;
+    let (a, e) = (1.0 + a, 1.0 + e);
+    let det = a * e - b * d;
+    if det == 0.0 {
+        return v;
+    }
+    let s = det.signum();
+    let unit = |x: f32, y: f32| {
+        let l = (x * x + y * y).sqrt();
+        [x / l * s, y / l * s]
+    };
+    let (u, w) = (unit(e, -d), unit(-b, a));
+    [u[0] * v[0] + w[0] * v[1], u[1] * v[0] + w[1] * v[1], v[2]]
 }
 
 /// The side of the opacity cutoff a texel is on: at or over it.
@@ -165,6 +468,18 @@ fn bounds(p: &[[f64; 2]; 3]) -> ([f64; 2], [f64; 2]) {
 }
 
 impl Raster {
+    /// One texel of `value`, what a tile set reads where it has no tile.
+    pub(crate) fn solid(value: f32) -> Self {
+        Self {
+            w: 1,
+            h: 1,
+            texels: Arc::new(vec![value]),
+            wrap: [Wrap::Clamp; 2],
+            uv: [0.0; 6],
+            outside: value,
+        }
+    }
+
     /// Mesh uv `p` in texels of this mip, after the uv transform.
     pub(super) fn texel_pos(&self, p: [f32; 2]) -> [f64; 2] {
         let q = self.mapped(p);
@@ -173,27 +488,7 @@ impl Raster {
 
     /// Mesh uv `p` as the texture is sampled at.
     pub(super) fn mapped(&self, p: [f32; 2]) -> [f64; 2] {
-        let [a, b, c, d, e, f] = self.uv.map(f64::from);
-        let (u, v) = (f64::from(p[0]), f64::from(p[1]));
-        [(1.0 + a) * u + b * v + c, d * u + (1.0 + e) * v + f]
-    }
-
-    /// `material_normal_frame`: tangent-space normal `v` read from this normal map, turned
-    /// into the mesh uv's frame by the normalized columns of the inverse uv transform.
-    pub(super) fn normal_frame(&self, v: [f32; 3]) -> [f32; 3] {
-        let [a, b, _, d, e, _] = self.uv;
-        let (a, e) = (1.0 + a, 1.0 + e);
-        let det = a * e - b * d;
-        if det == 0.0 {
-            return v;
-        }
-        let s = det.signum();
-        let unit = |x: f32, y: f32| {
-            let l = (x * x + y * y).sqrt();
-            [x / l * s, y / l * s]
-        };
-        let (u, w) = (unit(e, -d), unit(-b, a));
-        [u[0] * v[0] + w[0] * v[1], u[1] * v[0] + w[1] * v[1], v[2]]
+        mapped(self.uv, p)
     }
 
     fn texel(&self, x: i64, y: i64) -> f32 {
@@ -401,6 +696,24 @@ impl OpacityMap {
     }
 }
 
+/// An opacity texture's mip 0 under a section's cutoff.
+pub(crate) struct OpacityRead {
+    pub(crate) mip0: Raster,
+    pub(crate) passes: Arc<Passes>,
+}
+
+impl OpacityRead {
+    pub(super) fn new(mip0: Raster, cutoff: f32) -> Self {
+        let passes = Arc::new(Passes::new(&mip0, cutoff));
+        Self { mip0, passes }
+    }
+
+    /// What a tile set reads where it has no tile: `value`, under `cutoff`.
+    pub(crate) fn solid(value: f32, cutoff: f32) -> Self {
+        Self::new(Raster::solid(value), cutoff)
+    }
+}
+
 /// Which triangles of an alpha-tested section are opaque.
 pub(crate) enum Opacity {
     /// Every triangle passes, or none does.
@@ -408,10 +721,9 @@ pub(crate) enum Opacity {
     /// Opaque when every texel of the triangle's footprint, in uv set `uv_set`, is at or
     /// above the cutoff.
     Texture {
-        mip0: Raster,
+        map: Map<OpacityRead>,
         cutoff: f32,
         uv_set: usize,
-        passes: Arc<Passes>,
     },
     /// The opacity is not known to the cook: every triangle is alpha-tested.
     Unknown,
@@ -429,7 +741,9 @@ impl Opacity {
     pub(super) fn opaque(&self, uv: [[f32; 2]; 3]) -> bool {
         match self {
             Self::Constant(pass) => *pass,
-            Self::Texture { mip0, passes, .. } => passes.footprint(mip0, uv, FAIL) & FAIL == 0,
+            Self::Texture { map, .. } => map.parts(uv, |p| {
+                p.read.passes.footprint(&p.read.mip0, p.uv, FAIL) & FAIL == 0
+            }),
             Self::Unknown => false,
         }
     }
@@ -441,30 +755,39 @@ pub(crate) struct Displacement {
     pub(crate) offset: f32,
     pub(crate) min: f32,
     pub(crate) max: f32,
-    /// Every mip of the texture, finest first; empty when the cook cannot read it, so
+    /// Every mip of each texture, finest first; `None` when the cook cannot read them, so
     /// clusters take the declared range.
-    pub(crate) mips: Vec<Raster>,
+    pub(crate) map: Option<Map<Vec<Raster>>>,
     pub(crate) uv_set: usize,
 }
 
 impl Displacement {
     /// Displacement range over the triangles at every mip, meters.
-    pub(super) fn bounds(&self, tris: impl Iterator<Item = [[f32; 2]; 3]> + Clone) -> [f32; 2] {
-        if self.mips.is_empty() {
+    pub(super) fn bounds(&self, tris: impl Iterator<Item = [[f32; 2]; 3]>) -> [f32; 2] {
+        let Some(map) = &self.map else {
             return [self.min, self.max];
-        }
+        };
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-        for m in &self.mips {
-            for uv in tris.clone() {
-                m.footprint(uv, |t| {
-                    lo = lo.min(t);
-                    hi = hi.max(t);
-                    true
-                });
-            }
+        for uv in tris {
+            map.reads(uv, |p| {
+                for m in p.read {
+                    m.footprint(p.uv, |t| {
+                        lo = lo.min(t);
+                        hi = hi.max(t);
+                        true
+                    });
+                }
+                true
+            });
         }
         let (a, b) = (self.scale * lo + self.offset, self.scale * hi + self.offset);
         [a.min(b), a.max(b)]
+    }
+
+    /// The displacement at mesh uv `uv`, meters, from a map the cook reads.
+    pub(super) fn at(&self, uv: [f32; 2]) -> Option<f32> {
+        let (mips, p) = self.map.as_ref()?.at(uv);
+        Some(self.scale * mips[0].sample(p) + self.offset)
     }
 
     /// Fails when a texel of any mip lies outside the declared range.
@@ -474,7 +797,8 @@ impl Displacement {
         // far smaller when it cancels, so the declared range sizes the slack too.
         let magnitude = self.scale.abs() + self.offset.abs() + self.min.abs() + self.max.abs();
         let slack = 4.0 * f32::EPSILON * magnitude;
-        for (i, m) in self.mips.iter().enumerate() {
+        let textures = self.map.iter().flat_map(Map::each);
+        for (i, m) in textures.flat_map(|mips| mips.iter().enumerate()) {
             let past = m.wrap.iter().any(|w| w.bounded()).then_some(&m.outside);
             for &t in m.texels.iter().chain(past) {
                 let d = self.scale * t + self.offset;
@@ -506,14 +830,14 @@ mod tests {
                     offset: factor * lo - factor,
                     min: -factor,
                     max: 0.0,
-                    mips: vec![Raster {
+                    map: Some(Map::Image(vec![Raster {
                         w: 2,
                         h: 1,
                         texels,
                         wrap: [Wrap::Repeat; 2],
                         uv: [0.0; 6],
                         outside: 0.0,
-                    }],
+                    }])),
                     uv_set: 0,
                 };
                 d.check_range().unwrap();
@@ -675,6 +999,217 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A set of `tiles`, each a row, a column and a value, reading `missing` elsewhere.
+    fn solid_set(uv: [f32; 6], tiles: &[(u16, u16, f32)], missing: f32) -> Map<Raster> {
+        let tiles = tiles.iter().map(|&(r, c, v)| ((r, c), Raster::solid(v)));
+        Map::Tiles(Tiles {
+            uv,
+            tiles: tiles.collect(),
+            missing: Raster::solid(missing),
+        })
+    }
+
+    fn value(map: &Map<Raster>, uv: [f32; 2]) -> f32 {
+        let (r, p) = map.at(uv);
+        r.sample(p)
+    }
+
+    /// `texture_tile`: a floor picks the cell, rows climb up the image, and nothing lies past the
+    /// tiles, below 0 or above the first row.
+    #[test]
+    fn a_point_reads_the_tile_of_the_cell_under_it() {
+        let tiles = [(0, 0, 0.1), (0, 1, 0.2), (1, 0, 0.3), (0, 9, 0.4)];
+        let set = solid_set([0.0; 6], &tiles, 0.9);
+        for (uv, want) in [
+            ([0.5, 0.5], 0.1),
+            ([1.5, 0.5], 0.2),
+            ([0.5, -0.5], 0.3),
+            ([9.5, 0.5], 0.4),
+            ([10.5, 0.5], 0.9),
+            ([-0.5, 0.5], 0.9),
+            ([0.5, 1.5], 0.9),
+            ([0.5, -1.5], 0.9),
+            ([1.0, 0.5], 0.2),
+            ([0.5, 0.0], 0.1),
+            ([0.5, 1.0], 0.9),
+            ([0.5, -1.0], 0.3),
+            ([70000.5, 0.5], 0.9),
+        ] {
+            assert_eq!(value(&set, uv), want, "{uv:?}");
+        }
+        let moved = solid_set([0.0, 0.0, 1.0, 0.0, 0.0, 0.0], &tiles, 0.9);
+        assert_eq!(
+            value(&moved, [0.5, 0.5]),
+            0.2,
+            "the slot's transform maps first"
+        );
+    }
+
+    #[test]
+    fn parts_hold_a_triangle_by_what_each_point_of_it_reads() {
+        let tiles: Vec<_> = [
+            (0, 0),
+            (0, 1),
+            (0, 4),
+            (1, 1),
+            (1, 2),
+            (3, 2),
+            (3, 3),
+            (40, 7),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (r, c))| (r, c, (i + 1) as f32 / 16.0))
+        .collect();
+        let mut seed = 3u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed as f32 / u32::MAX as f32
+        };
+        for uv in [[0.0; 6], [0.5, 0.25, 0.3, -0.25, -0.5, -0.7]] {
+            let set = solid_set(uv, &tiles, 0.9);
+            let Map::Tiles(t) = &set else { unreachable!() };
+            for k in 0..4000 {
+                let size = [0.3, 2.0, 9.0][k % 3];
+                let o = [next() * 12.0 - 2.0, next() * 8.0 - 6.0];
+                let tri = [0, 1, 2].map(|_| [o[0] + next() * size, o[1] + next() * size]);
+                let p = tri.map(|c| mapped(t.uv, c));
+                let area = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+                    ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs() / 2.0
+                };
+                let mut parts = Vec::new();
+                set.parts(tri, |q| {
+                    parts.push((q.read.texels[0], q.weights));
+                    true
+                });
+                let on = |w: Vec3| {
+                    [0, 1].map(|a| {
+                        f64::from(w.x) * p[0][a]
+                            + f64::from(w.y) * p[1][a]
+                            + f64::from(w.z) * p[2][a]
+                    })
+                };
+                let total: f64 = parts
+                    .iter()
+                    .map(|(_, w)| area(on(w[0]), on(w[1]), on(w[2])))
+                    .sum();
+                let whole = area(p[0], p[1], p[2]);
+                assert!((total - whole).abs() < 1e-3 * whole.max(1e-2), "{tri:?}");
+                for _ in 0..8 {
+                    let (a, b) = (next(), next());
+                    let (a, b) = if a + b > 1.0 {
+                        (1.0 - a, 1.0 - b)
+                    } else {
+                        (a, b)
+                    };
+                    let w = Vec3::new(1.0 - a - b, a, b);
+                    let point = [0, 1].map(|i| w.x * tri[0][i] + w.y * tri[1][i] + w.z * tri[2][i]);
+                    let want = value(&set, point);
+                    // A point within rounding of a cell's edge may fall on either side of it.
+                    let m = mapped(t.uv, point);
+                    let edge = m.iter().any(|c| (c - c.round()).abs() < 1e-4);
+                    let inside = |w3: &[Vec3; 3]| {
+                        let q = [on(w3[0]), on(w3[1]), on(w3[2])];
+                        let sum = area(m, q[0], q[1]) + area(m, q[1], q[2]) + area(m, q[2], q[0]);
+                        (sum - area(q[0], q[1], q[2])).abs() < 1e-6
+                    };
+                    let held = parts.iter().filter(|(_, w)| inside(w));
+                    assert!(
+                        edge || held.clone().next().is_none() || held.clone().all(|h| h.0 == want),
+                        "{tri:?} {point:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Corners on a cell's edge read the next cell, where a ray lands on nothing.
+    #[test]
+    fn a_cell_a_triangle_only_touches_has_no_area_to_hit() {
+        let set = solid_set([0.0; 6], &[(0, 0, 0.25)], 0.75);
+        let seen = |edges: bool, tri| {
+            let mut seen = Vec::new();
+            let mut f = |p: Part<'_, Raster>| {
+                seen.push(p.read.texels[0]);
+                true
+            };
+            match edges {
+                true => set.reads(tri, &mut f),
+                false => set.parts(tri, &mut f),
+            };
+            seen.sort_by(f32::total_cmp);
+            seen.dedup();
+            seen
+        };
+        let unit = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        assert_eq!(seen(false, unit), [0.25]);
+        assert_eq!(seen(true, unit), [0.25, 0.75]);
+        let inside = [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75]];
+        assert_eq!(seen(true, inside), [0.25]);
+        let line = [[0.5, 0.5], [1.5, 0.5], [1.5, 0.5]];
+        assert_eq!(seen(false, line), [0.25, 0.75], "a line reads along itself");
+    }
+
+    /// A gradient across `n` texels, at the cutoff 0.5 halfway, with the edge modes of a tile.
+    fn gradient(n: u32) -> Raster {
+        Raster {
+            w: n,
+            h: n,
+            texels: Arc::new(
+                (0..n * n)
+                    .map(|i| (i % n + i / n) as f32 / (2 * n - 2) as f32)
+                    .collect(),
+            ),
+            wrap: [Wrap::Clamp; 2],
+            uv: [0.0; 6],
+            outside: 0.0,
+        }
+    }
+
+    fn texture(map: Map<OpacityRead>) -> Opacity {
+        Opacity::Texture {
+            map,
+            cutoff: 0.5,
+            uv_set: 0,
+        }
+    }
+
+    #[test]
+    fn a_tile_gives_the_opaque_verdict_of_the_same_image() {
+        let image = texture(Map::Image(OpacityRead::new(gradient(32), 0.5)));
+        let tiled = |missing: f32| {
+            texture(Map::Tiles(Tiles {
+                uv: [0.0; 6],
+                tiles: [((2, 3), OpacityRead::new(gradient(32), 0.5))].into(),
+                missing: OpacityRead::solid(missing, 0.5),
+            }))
+        };
+        let (fails, passes) = (tiled(0.0), tiled(1.0));
+        let mut seed = 11u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f64::from(seed >> 22) / 1024.0
+        };
+        let moved = |t: [[f32; 2]; 3]| t.map(|c| [c[0] + 3.0, c[1] - 2.0]);
+        let mut opaque = 0;
+        for _ in 0..4000 {
+            let o = [next() as f32, next() as f32];
+            let side = next() as f32 / 8.0;
+            let tri = [o, [o[0] + side, o[1]], [o[0], o[1] + side]];
+            if tri.iter().flatten().all(|c| (0.0..1.0).contains(c)) {
+                let want = image.opaque(tri);
+                opaque += u32::from(want);
+                assert_eq!(fails.opaque(moved(tri)), want, "{tri:?}");
+                assert_eq!(passes.opaque(moved(tri)), want, "{tri:?}");
+            }
+        }
+        assert!(opaque > 100, "{opaque} opaque triangles");
+        // The bright corner of the tile, reaching past it into a cell with no tile.
+        let across = [[3.9, -1.1], [4.1, -1.1], [3.9, -1.05]];
+        assert!(!fails.opaque(across));
+        assert!(passes.opaque(across));
     }
 
     #[test]

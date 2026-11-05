@@ -2160,6 +2160,134 @@ fn a_udim_tile_appearing_cooks_the_set_again() {
     assert_eq!(tiles(), 2);
 }
 
+/// A 16 x 16 grid of quads with `st` running 1/8 to 7/8 from `(s, t)`, under a preview surface
+/// with `wired`, whose `T` reads `file` clamped.
+fn grid_stage(file: &str, [s, t]: [f32; 2], wired: &str) -> String {
+    const N: usize = 16;
+    let list = |f: &dyn Fn(usize, usize) -> String| {
+        let at = (0..=N).flat_map(|y| (0..=N).map(move |x| (x, y)));
+        at.map(|(x, y)| f(x, y)).collect::<Vec<_>>().join(", ")
+    };
+    let points = list(&|x, y| format!("({}, {}, 0)", x as f32 / 16.0, y as f32 / 16.0));
+    let st = list(&|x, y| {
+        let at = |o: f32, i: usize| o + 0.125 + 0.75 * i as f32 / N as f32;
+        format!("({}, {})", at(s, x), at(t, y))
+    });
+    let quads = (0..N).flat_map(|y| (0..N).map(move |x| (x, y)));
+    let indices = quads.map(|(x, y)| {
+        let c = y * (N + 1) + x;
+        format!("{}, {}, {}, {}", c, c + 1, c + N + 2, c + N + 1)
+    });
+    let indices = indices.collect::<Vec<_>>().join(", ");
+    let counts = vec!["4"; N * N].join(", ");
+    let texture = texture(
+        "T",
+        &format!("{RAW}\ntoken inputs:wrapS = \"clamp\"\ntoken inputs:wrapT = \"clamp\""),
+    )
+    .replace("@tex.png@", &format!("@{file}@"));
+    format!(
+        r#"def Mesh "Grid"
+{{
+    uniform token subdivisionScheme = "none"
+    int[] faceVertexCounts = [{counts}]
+    int[] faceVertexIndices = [{indices}]
+    point3f[] points = [{points}]
+    texCoord2f[] primvars:st = [{st}] (
+        interpolation = "vertex"
+    )
+    rel material:binding = </M>
+}}
+
+def Material "M"
+{{
+    token outputs:surface.connect = </M/S.outputs:surface>
+
+    def Shader "S"
+    {{
+        uniform token info:id = "UsdPreviewSurface"
+        {wired}
+        token outputs:surface
+    }}
+    {texture}
+    {READER}
+}}
+"#
+    )
+}
+
+/// Every blob of the mesh `stage` cooks.
+fn mesh_blobs(d: &std::path::Path, stage: &str) -> Vec<Vec<u8>> {
+    let a = cook_at(d, stage, UsdSettings::default()).unwrap();
+    let e = a.find(AssetId::from_name("u/mesh")).expect("a mesh");
+    a.blobs(e).iter().map(|b| read(&a, b)).collect()
+}
+
+/// Rings of alpha, so a grid cell can lie on either side of a cutoff or across it.
+fn rings() -> Vec<u8> {
+    png(64, 64, |x, y| {
+        let (x, y) = (x as f32 - 31.5, y as f32 - 31.5);
+        let v = if (x * x + y * y).sqrt() % 16.0 < 8.0 {
+            255
+        } else {
+            0
+        };
+        [v, v, v, 255]
+    })
+}
+
+/// A tile reads clamped, so inside it the mesh cook reads what it reads of the same image
+/// clamped: micromaps, opaque triangles and all.
+#[test]
+fn a_mesh_on_one_tile_cooks_as_on_the_same_image() {
+    let d = dir("udim-mesh-opacity");
+    for file in ["tex.png", "tex.1001.png"] {
+        std::fs::write(d.join(file), rings()).unwrap();
+    }
+    let wired = r#"float inputs:opacity.connect = </M/T.outputs:r>
+        float inputs:opacityThreshold = 0.5"#;
+    let image = mesh_blobs(&d, &grid_stage("tex.png", [0.0, 0.0], wired));
+    let tiled = mesh_blobs(&d, &grid_stage("tex.<UDIM>.png", [0.0, 0.0], wired));
+    assert_eq!(image, tiled);
+}
+
+/// A mesh past every tile reads the fallback, which decides its triangles as one texel would.
+#[test]
+fn a_mesh_past_a_tile_reads_what_the_set_holds_there() {
+    let d = dir("udim-mesh-missing");
+    std::fs::write(d.join("tex.1001.png"), rings()).unwrap();
+    let alpha_tested = |fallback: f32, at: [f32; 2]| {
+        let wired = r#"float inputs:opacity.connect = </M/T.outputs:r>
+        float inputs:opacityThreshold = 0.5"#;
+        let stage = grid_stage("tex.<UDIM>.png", at, wired).replace(
+            r#"token inputs:sourceColorSpace = "raw""#,
+            &format!(
+                "token inputs:sourceColorSpace = \"raw\"\nfloat4 inputs:fallback = ({fallback}, 0, 0, 1)"
+            ),
+        );
+        let a = cook_at(&d, &stage, UsdSettings::default()).unwrap();
+        let info = MeshInfo::parse(&blob(&a, "u/mesh", 0)).unwrap();
+        let mut tested = 0;
+        for p in &info.pages {
+            let mut page = vec![0; p.resident_len as usize];
+            orr_pack::mesh::decode_page(&blob(&a, "u/mesh", p.blob as usize), &mut page).unwrap();
+            let view = PageView::new(&page, &info.header).unwrap();
+            for i in 0..view.cluster_count() {
+                let c = view.cluster(i);
+                tested += u32::from(c.tri_count - c.alpha_first);
+            }
+        }
+        tested
+    };
+    assert!(alpha_tested(1.0, [0.0, 0.0]) > 0, "rings cross the cutoff");
+    // Tile 1002 has no file: past it the whole mesh reads the fallback.
+    assert_eq!(
+        alpha_tested(1.0, [1.0, 0.0]),
+        0,
+        "a passing fallback is opaque"
+    );
+    assert_eq!(alpha_tested(0.0, [1.0, 0.0]), 512, "a failing one is not");
+}
+
 /// Inputs packed into one texture share it tile by tile when they read the same cells, and a set
 /// beside an image, or a set of other cells, keeps a texture of its own.
 #[test]

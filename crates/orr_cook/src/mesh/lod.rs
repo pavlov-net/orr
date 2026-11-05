@@ -410,9 +410,9 @@ pub(super) fn displacement_seams(
     s: usize,
     d: &Displacement,
 ) -> Vec<String> {
-    let Some(mip0) = d.mips.first() else {
+    if d.map.is_none() {
         return Vec::new();
-    };
+    }
     let tolerance = (d.max - d.min) / 1024.0;
     let mut uvs: FxHashMap<[i32; 3], Vec<[f32; 2]>> = FxHashMap::default();
     for t in w.section_triangles(s) {
@@ -427,10 +427,7 @@ pub(super) fn displacement_seams(
     let mut bad: Vec<[i32; 3]> = uvs
         .iter()
         .filter(|(_, uv)| {
-            let disp: Vec<f32> = uv
-                .iter()
-                .map(|&u| d.scale * mip0.sample(u) + d.offset)
-                .collect();
+            let disp: Vec<f32> = uv.iter().filter_map(|&u| d.at(u)).collect();
             let lo = disp.iter().copied().fold(f32::INFINITY, f32::min);
             let hi = disp.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             hi - lo > tolerance

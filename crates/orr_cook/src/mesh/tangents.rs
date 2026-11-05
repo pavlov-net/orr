@@ -4,7 +4,8 @@
 //!
 //! Over every texel center of each normal map that a triangle covers, the check builds the
 //! shading normal `material_normal` gives from the stored tangent and from the derived one,
-//! and takes the 99th percentile of the angle between them.
+//! and takes the 99th percentile of the angle between them. A tile set counts each tile's texels,
+//! and the cells it has no tile in at the density of its largest.
 
 use meshopt::TangentOptions;
 use orr_math::{DVec2, Vec3};
@@ -12,7 +13,7 @@ use orr_pack::texture::normal;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use super::maps::Raster;
+use super::maps::{Map, Raster};
 use super::{MeshData, NormalSpec, SectionMaps};
 
 /// Histogram bin width, degrees.
@@ -149,6 +150,14 @@ pub(super) fn check(
             ) if frame_set < m.uvs.len() => (map, uv_set, frame_set),
             _ => return TangentCheck::KEPT,
         };
+        // Tiles of a set weigh by the uv area they cover, as texels of one image do, whatever
+        // their sizes: each texel counts as the largest tile's do.
+        let texels_of = |[w, h]: [u32; 2]| f64::from(w) * f64::from(h);
+        let largest = map
+            .each()
+            .map(|t| [t[0].w, t[0].h])
+            .max_by(|a, b| texels_of(*a).total_cmp(&texels_of(*b)))
+            .expect("a map holds a texture");
         let (h, n) = m.indices[sec.indices.clone()]
             .par_chunks(3 * CHUNK)
             .map(|chunk| {
@@ -156,10 +165,21 @@ pub(super) fn check(
                 let mut n = 0u64;
                 for t in chunk.as_chunks::<3>().0 {
                     let tri = Triangle::new(m, [set, frame], tangents, t.map(|i| i as usize));
-                    texel_centers(&map[0], tri.uv, |w, weight| {
-                        let deg = tri.angle(map, w);
-                        h[((deg / BIN) as usize).min(BINS - 1)] += weight;
-                        n += 1;
+                    map.parts(tri.uv, |p| {
+                        let [x, ..] = p.read;
+                        // One texel holds one value and no grid: it reads as finely as the set.
+                        let (size, scale) = match [x.w, x.h] {
+                            [1, 1] => (largest, 1.0),
+                            s => (s, texels_of(largest) / texels_of(s)),
+                        };
+                        let uv = p.uv.map(|c| x.mapped(c));
+                        texel_centers(size, uv, |w, weight| {
+                            let [a, b, c] = p.weights;
+                            let deg = tri.angle(map, a * w.x + b * w.y + c * w.z);
+                            h[((deg / BIN) as usize).min(BINS - 1)] += weight * scale;
+                            n += 1;
+                        });
+                        true
                     });
                 }
                 (h, n)
@@ -240,11 +260,12 @@ impl Triangle {
     }
 
     /// Degrees between the two shading normals at barycentrics `w`.
-    fn angle(&self, map: &[Raster; 2], w: Vec3) -> f32 {
+    fn angle(&self, map: &Map<[Raster; 2]>, w: Vec3) -> f32 {
         let at = |c: [Vec3; 3]| w.x * c[0] + w.y * c[1] + w.z * c[2];
         let uv = [0, 1].map(|a| w.x * self.uv[0][a] + w.y * self.uv[1][a] + w.z * self.uv[2][a]);
-        let v = normal::decode([map[0].sample(uv), map[1].sample(uv)]);
-        let v = Vec3::from(map[0].normal_frame(v));
+        let (read, p) = map.at(uv);
+        let v = normal::decode([read[0].sample(p), read[1].sample(p)]);
+        let v = Vec3::from(map.normal_frame(v));
         let frame = at(self.normals);
         let n = frame.normalize_or(self.geometric);
 
@@ -275,13 +296,13 @@ fn orthonormal_basis(n: Vec3) -> (Vec3, Vec3) {
     )
 }
 
-/// Calls `f` with the barycentrics and weight of every texel center of `map` inside the uv
-/// triangle `uv`. A triangle covering more texels than the map holds samples a grid coarse
-/// enough to stay at the map's texel count, each sample weighted by its cell's texels; a
-/// triangle covering no center samples its centroid.
-fn texel_centers(map: &Raster, uv: [[f32; 2]; 3], mut f: impl FnMut(Vec3, f64)) {
-    let size = [f64::from(map.w), f64::from(map.h)];
-    let p = uv.map(|t| DVec2::from(map.texel_pos(t)));
+/// Calls `f` with the barycentrics and weight of every texel center of a map of `size` texels
+/// inside the mapped uv triangle `uv`. A triangle covering more texels than the map holds samples
+/// a grid coarse enough to stay at the map's texel count, each sample weighted by its cell's
+/// texels; a triangle covering no center samples its centroid.
+fn texel_centers(size: [u32; 2], uv: [[f64; 2]; 3], mut f: impl FnMut(Vec3, f64)) {
+    let size = size.map(f64::from);
+    let p = uv.map(|t| DVec2::new(t[0] * size[0], t[1] * size[1]));
     let cross = |a: DVec2, b: DVec2, c: DVec2| (b - a).perp_dot(c - a);
     let area2 = cross(p[0], p[1], p[2]);
     let mut any = false;

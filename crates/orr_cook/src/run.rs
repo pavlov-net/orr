@@ -26,6 +26,7 @@ use orr_math::{Vec2, Vec3, Vec4};
 use orr_pack::material::{Material, slot};
 use orr_pack::model::{ModelHeader, ModelInfo};
 use orr_pack::texture::TextureInfo;
+use orr_pack::tiles::TextureTiles;
 use orr_pack::{
     Aabb, Archive, ArchiveWriter, AssetId, BlobIn, Class, GDeflate, Hash32, Span, Target,
 };
@@ -36,10 +37,12 @@ use crate::decoded::Decoded;
 use crate::import::{Placed, Scene};
 use crate::instances::{self, Catalog, ModelFacts};
 use crate::key::{self, Key};
-use crate::mesh::maps::{Displacement, Opacity, OpacityMap, Passes, Raster};
+use crate::mesh::maps::{
+    Displacement, Map, Opacity, OpacityMap, OpacityRead, Passes, Raster, Tiles,
+};
 use crate::mesh::{
-    self, DisplacementSpec, DisplacementTexture, MapRead, MapSpec, MeshData, MeshInput, MeshSource,
-    NormalSpec, OpacitySpec, PartData, Pivots, SectionData, SectionMaps,
+    self, DisplacementSpec, DisplacementTexture, MapRead, MapSpec, MapTexture, MeshData, MeshInput,
+    MeshSource, NormalSpec, OpacitySpec, PartData, Pivots, SectionData, SectionMaps,
 };
 use crate::raster::{self, RasterReport};
 use crate::report::{
@@ -422,7 +425,8 @@ impl<'m, 's> Run<'m, 's> {
                 run.source(a, first + i, asset, &previous, &textures)?;
                 if is_texture(&i) {
                     let u = &run.units[run.by_name[&(a, asset.name.clone())]];
-                    textures.insert(AssetId::from_name(&asset.name), (u.name.clone(), u.key));
+                    let texture = MapTexture::lone(&u.name, u.key);
+                    textures.insert(AssetId::from_name(&asset.name), texture);
                 }
             }
         }
@@ -438,7 +442,7 @@ impl<'m, 's> Run<'m, 's> {
         index: usize,
         asset: &'m crate::AssetSpec,
         previous: &HashMap<Hash32, Record>,
-        textures: &HashMap<AssetId, (String, Hash32)>,
+        textures: &HashMap<AssetId, MapTexture>,
     ) -> Result<()> {
         let name = asset.name.as_str();
         match &asset.source {
@@ -1790,7 +1794,29 @@ fn plan_scene(
     }
     let jobs = std::mem::take(&mut packer.jobs);
     let sets = std::mem::take(&mut packer.neural);
-    for set in std::mem::take(&mut packer.tile_sets) {
+    let tile_sets = std::mem::take(&mut packer.tile_sets);
+    drop(packer);
+    let mut textures: HashMap<AssetId, MapTexture> = jobs
+        .iter()
+        .map(|j| {
+            (
+                AssetId::from_name(&j.name),
+                MapTexture::lone(&j.name, j.key),
+            )
+        })
+        .collect();
+    for set in tile_sets {
+        let held = TextureTiles::parse(&set.bytes).expect("a planned set parses");
+        let tiles = held.tiles.iter().map(|t| {
+            let tile = &textures[&t.texture];
+            ([t.column, t.row], tile.unit.clone(), tile.key)
+        });
+        let texture = MapTexture {
+            unit: set.name.clone(),
+            key: set.key,
+            tiles: tiles.collect(),
+        };
+        textures.insert(AssetId::from_name(&set.name), texture);
         let work = Work::Blobs {
             schema: orr_pack::tiles::SCHEMA,
             blobs: vec![(set.bytes, true)],
@@ -1798,11 +1824,6 @@ fn plan_scene(
         let class = Class::TextureTiles as u16;
         units.push(NewUnit::leaf(&set.name, class, set.key, 0, work));
     }
-    drop(packer);
-    let textures: HashMap<AssetId, (String, Hash32)> = jobs
-        .iter()
-        .map(|j| (AssetId::from_name(&j.name), (j.name.clone(), j.key)))
-        .collect();
 
     // Materials of statically displaced sections without their displacement, which the
     // geometry holds.
@@ -1950,7 +1971,7 @@ fn material_unit(name: String, m: &Material) -> NewUnit<'static> {
 }
 
 /// The cooked textures a section with material `m` reads at mesh cook time.
-fn map_spec(m: &Material, textures: &HashMap<AssetId, (String, Hash32)>) -> MapSpec {
+fn map_spec(m: &Material, textures: &HashMap<AssetId, MapTexture>) -> MapSpec {
     let bound = |s: usize| {
         let b = m.textures[s];
         (b.texture != AssetId::NONE).then(|| (textures.get(&b.texture), usize::from(b.uv_set & 1)))
@@ -1962,9 +1983,8 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, (String, Hash32)>) -> MapS
     };
     let opacity = match (m.alpha_mode, bound(slot::OPACITY)) {
         (Material::MASK, None) => OpacitySpec::Constant(m.geometry_opacity >= m.alpha_cutoff),
-        (Material::MASK, Some((Some((unit, key)), uv_set))) => OpacitySpec::Texture {
-            unit: unit.clone(),
-            key: *key,
+        (Material::MASK, Some((Some(texture), uv_set))) => OpacitySpec::Texture {
+            texture: texture.clone(),
             cutoff: m.alpha_cutoff,
             read: read(slot::OPACITY),
             uv_set,
@@ -1977,25 +1997,26 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, (String, Hash32)>) -> MapS
         offset: m.displacement_offset,
         min: m.displacement_min,
         max: m.displacement_max,
-        texture: b.0.map(|(unit, key)| DisplacementTexture {
-            unit: unit.clone(),
-            key: *key,
-            read: read(slot::DISPLACEMENT),
-            uv_set: b.1,
-        }),
+        texture: b
+            .0
+            .filter(|t| t.tiles.is_empty())
+            .map(|t| DisplacementTexture {
+                texture: t.clone(),
+                read: read(slot::DISPLACEMENT),
+                uv_set: b.1,
+            }),
     });
     let frame_set = usize::from(m.tangent_set());
     let normal = match bound(slot::NORMAL) {
         _ if mesh::reads_tangent(m) => NormalSpec::Tangent { frame_set },
         None => NormalSpec::None,
-        Some((Some((unit, key)), uv_set)) => NormalSpec::Texture {
-            unit: unit.clone(),
-            key: *key,
+        Some((Some(t), uv_set)) if t.tiles.is_empty() => NormalSpec::Texture {
+            texture: t.clone(),
             read: read(slot::NORMAL),
             uv_set,
             frame_set,
         },
-        Some((None, _)) => NormalSpec::Tangent { frame_set },
+        Some(_) => NormalSpec::Tangent { frame_set },
     };
     MapSpec {
         opacity,
@@ -2012,7 +2033,7 @@ fn mesh_units(
     input: &MeshInput,
     materials: &[Material],
     settings: &MeshSettings,
-    textures: &HashMap<AssetId, (String, Hash32)>,
+    textures: &HashMap<AssetId, MapTexture>,
 ) -> Result<(Vec<NewUnit<'static>>, Option<Assembly>)> {
     let fail = |message: String| Error::Mesh {
         asset: name.into(),
@@ -2320,37 +2341,45 @@ fn section_maps(
             OpacitySpec::Constant(pass) => Some(Opacity::Constant(*pass)),
             OpacitySpec::Unknown => Some(Opacity::Unknown),
             OpacitySpec::Texture {
-                unit,
-                key,
+                texture,
                 cutoff,
                 read: at,
                 uv_set,
             } => {
-                let map = opacity_maps.get((*key, cutoff.to_bits()), || {
-                    let mip0 = read(unit, false, *at, 1)?.remove(0);
-                    if mip0.w > u32::from(u16::MAX) {
-                        return Err(Error::Texture {
-                            asset: unit.clone(),
-                            message: format!("opacity texture {} texels wide, over 65535", mip0.w),
-                        });
-                    }
-                    Ok(OpacityMap {
-                        w: mip0.w,
-                        h: mip0.h,
-                        passes: Arc::new(Passes::new(&mip0, *cutoff)),
-                        texels: mip0.texels,
+                let texture_read = |unit: &str, key: Hash32, at: MapRead| {
+                    let map = opacity_maps.get((key, cutoff.to_bits()), || {
+                        let mip0 = read(unit, false, at, 1)?.remove(0);
+                        if mip0.w > u32::from(u16::MAX) {
+                            return Err(Error::Texture {
+                                asset: unit.to_string(),
+                                message: format!(
+                                    "opacity texture {} texels wide, over 65535",
+                                    mip0.w
+                                ),
+                            });
+                        }
+                        Ok(OpacityMap {
+                            w: mip0.w,
+                            h: mip0.h,
+                            passes: Arc::new(Passes::new(&mip0, *cutoff)),
+                            texels: mip0.texels,
+                        })
+                    })?;
+                    Ok(OpacityRead {
+                        mip0: Raster {
+                            w: map.w,
+                            h: map.h,
+                            texels: Arc::clone(&map.texels),
+                            wrap: at.wrap,
+                            uv: at.uv,
+                            outside: at.outside[0],
+                        },
+                        passes: Arc::clone(&map.passes),
                     })
-                })?;
+                };
+                let missing = |outside: [f32; 4]| OpacityRead::solid(outside[0], *cutoff);
                 Some(Opacity::Texture {
-                    mip0: Raster {
-                        w: map.w,
-                        h: map.h,
-                        texels: Arc::clone(&map.texels),
-                        wrap: at.wrap,
-                        uv: at.uv,
-                        outside: at.outside[0],
-                    },
-                    passes: Arc::clone(&map.passes),
+                    map: read_map(texture, *at, texture_read, missing)?,
                     cutoff: *cutoff,
                     uv_set: *uv_set,
                 })
@@ -2363,16 +2392,28 @@ fn section_maps(
                 offset: d.offset,
                 min: d.min,
                 max: d.max,
-                mips: match &d.texture {
-                    Some(t) => read(&t.unit, true, t.read, 1)?,
-                    None => Vec::new(),
+                map: match &d.texture {
+                    Some(t) => Some(read_map(
+                        &t.texture,
+                        t.read,
+                        |unit, _, at| read(unit, true, at, 1),
+                        |outside| vec![Raster::solid(outside[0])],
+                    )?),
+                    None => None,
                 },
                 uv_set: d.texture.as_ref().map_or(0, |t| t.uv_set),
             }),
         };
         let normal = match &s.maps.normal {
-            NormalSpec::Texture { unit, read: at, .. } if normals => {
-                read(unit, false, *at, 2)?.try_into().ok()
+            NormalSpec::Texture {
+                texture, read: at, ..
+            } if normals => {
+                let pair = |unit: &str, _, at| {
+                    let channels = read(unit, false, at, 2)?.try_into();
+                    Ok(channels.unwrap_or_else(|_| panic!("a mip of {unit} has two channels")))
+                };
+                let missing = |o: [f32; 4]| [Raster::solid(o[0]), Raster::solid(o[1])];
+                Some(read_map(texture, *at, pair, missing)?)
             }
             _ => None,
         };
@@ -2383,6 +2424,33 @@ fn section_maps(
         });
     }
     Ok(out)
+}
+
+/// `t` under `at` as a map of what `texture` makes of each of its textures. Tiles read clamped in
+/// their own squares, and `missing` makes what reads where a set has none from the slot's values.
+fn read_map<T>(
+    t: &MapTexture,
+    at: MapRead,
+    mut texture: impl FnMut(&str, Hash32, MapRead) -> Result<T>,
+    missing: impl FnOnce([f32; 4]) -> T,
+) -> Result<Map<T>> {
+    if t.tiles.is_empty() {
+        return Ok(Map::Image(texture(&t.unit, t.key, at)?));
+    }
+    let tile = MapRead {
+        wrap: [Wrap::Clamp; 2],
+        uv: [0.0; 6],
+        ..at
+    };
+    let tiles = t
+        .tiles
+        .iter()
+        .map(|([column, row], unit, key)| Ok(((*row, *column), texture(unit, *key, tile)?)));
+    Ok(Map::Tiles(Tiles {
+        uv: at.uv,
+        tiles: tiles.collect::<Result<_>>()?,
+        missing: missing(at.outside),
+    }))
 }
 
 /// Mip 0, or every mip with `all`, of a cooked texture: per mip, its first `channels`

@@ -39,10 +39,11 @@ use serde::Deserialize;
 use crate::assembly::AssemblySettings;
 use crate::state::Memo;
 use crate::texture::Wrap;
+use crate::texture::tiles::Cell;
 use crate::{Error, Result};
-use maps::{Displacement, Opacity, Raster};
+use maps::{Displacement, Map, Opacity, Raster};
 pub use omm::OmmSettings;
-use omm::{ClusterOmm, OmmAlpha};
+use omm::{ClusterOmm, OmmAlpha, OmmRead};
 pub(crate) use tangents::TangentCheck;
 
 /// How meshes are simplified, clustered and quantized.
@@ -380,6 +381,32 @@ pub(crate) struct MapSpec {
     pub(crate) uv1: bool,
 }
 
+/// A cooked texture or tile set a material slot binds.
+#[derive(Clone, Debug)]
+pub(crate) struct MapTexture {
+    pub(crate) unit: String,
+    pub(crate) key: Hash32,
+    /// A set's tiles: each one's column and row, unit and key. Empty for a lone texture.
+    pub(crate) tiles: Vec<(Cell, String, Hash32)>,
+}
+
+impl MapTexture {
+    pub(crate) fn lone(unit: &str, key: Hash32) -> Self {
+        Self {
+            unit: unit.to_string(),
+            key,
+            tiles: Vec::new(),
+        }
+    }
+
+    /// The units whose texels it reads.
+    fn units(&self) -> impl Iterator<Item = &str> {
+        let lone = self.tiles.is_empty().then_some(self.unit.as_str());
+        lone.into_iter()
+            .chain(self.tiles.iter().map(|t| t.1.as_str()))
+    }
+}
+
 /// How a material slot reads a cooked texture: [`maps::Raster`]'s edge modes and uv transform,
 /// and per channel what it reads past 0..1.
 #[derive(Copy, Clone, Debug)]
@@ -395,11 +422,10 @@ pub(crate) enum NormalSpec {
     /// Nothing.
     #[default]
     None,
-    /// Only to turn this unit's cooked normal map, read on uv set `uv_set`. Tangents follow
+    /// Only to turn this cooked normal map, read on uv set `uv_set`. Tangents follow
     /// `frame_set`, a [`Material::tangent_set`].
     Texture {
-        unit: String,
-        key: Hash32,
+        texture: MapTexture,
         read: MapRead,
         uv_set: usize,
         frame_set: usize,
@@ -425,10 +451,9 @@ pub(crate) enum OpacitySpec {
     #[default]
     None,
     Constant(bool),
-    /// The cooked opacity texture of this unit.
+    /// This cooked opacity texture.
     Texture {
-        unit: String,
-        key: Hash32,
+        texture: MapTexture,
         cutoff: f32,
         read: MapRead,
         uv_set: usize,
@@ -445,11 +470,10 @@ pub(crate) struct DisplacementSpec {
     pub(crate) texture: Option<DisplacementTexture>,
 }
 
-/// The cooked displacement texture: its unit and key, and how and on which uv set it reads.
+/// The cooked displacement texture, and how and on which uv set it reads.
 #[derive(Clone, Debug)]
 pub(crate) struct DisplacementTexture {
-    pub(crate) unit: String,
-    pub(crate) key: Hash32,
+    pub(crate) texture: MapTexture,
     pub(crate) read: MapRead,
     pub(crate) uv_set: usize,
 }
@@ -458,46 +482,47 @@ impl MapSpec {
     /// The texture units the spec reads.
     pub(crate) fn units(&self) -> impl Iterator<Item = &str> {
         let opacity = match &self.opacity {
-            OpacitySpec::Texture { unit, .. } => Some(unit.as_str()),
+            OpacitySpec::Texture { texture, .. } => Some(texture),
             _ => None,
         };
         let displacement = self
             .displacement
             .as_ref()
-            .and_then(|d| d.texture.as_ref().map(|t| t.unit.as_str()));
+            .and_then(|d| d.texture.as_ref().map(|t| &t.texture));
         let normal = match &self.normal {
-            NormalSpec::Texture { unit, .. } => Some(unit.as_str()),
+            NormalSpec::Texture { texture, .. } => Some(texture),
             _ => None,
         };
-        opacity.into_iter().chain(displacement).chain(normal)
+        let textures = opacity.into_iter().chain(displacement).chain(normal);
+        textures.flat_map(MapTexture::units)
     }
 
     /// Everything of the spec that shapes the cooked mesh: values and texture keys.
     fn fingerprint(&self) -> String {
         let opacity = match &self.opacity {
             OpacitySpec::Texture {
-                key,
+                texture,
                 cutoff,
                 read,
                 uv_set,
-                ..
-            } => format!("texture {key:?} {cutoff:?} {read:?} {uv_set}"),
+            } => format!("texture {:?} {cutoff:?} {read:?} {uv_set}", texture.key),
             o => format!("{o:?}"),
         };
         let displacement = self.displacement.as_ref().map(|d| {
             (
                 [d.scale, d.offset, d.min, d.max],
-                d.texture.as_ref().map(|t| (t.key, t.read, t.uv_set)),
+                d.texture
+                    .as_ref()
+                    .map(|t| (t.texture.key, t.read, t.uv_set)),
             )
         });
         let normal = match &self.normal {
             NormalSpec::Texture {
-                key,
+                texture,
                 read,
                 uv_set,
                 frame_set,
-                ..
-            } => format!("texture {key:?} {read:?} {uv_set} {frame_set}"),
+            } => format!("texture {:?} {read:?} {uv_set} {frame_set}", texture.key),
             n => format!("{n:?}"),
         };
         format!("{opacity} {displacement:?} {normal} {}", self.uv1)
@@ -510,15 +535,13 @@ pub(crate) struct SectionMaps {
     pub(crate) opacity: Option<Opacity>,
     pub(crate) displacement: Option<Displacement>,
     /// Mip 0 of the [`NormalSpec::Texture`] map, stored x and y.
-    pub(crate) normal: Option<[Raster; 2]>,
+    pub(crate) normal: Option<Map<[Raster; 2]>>,
 }
 
 impl SectionMaps {
     /// Static displacement bakes this section into the geometry.
     fn bakes(&self) -> bool {
-        self.displacement
-            .as_ref()
-            .is_some_and(|d| !d.mips.is_empty())
+        self.displacement.as_ref().is_some_and(|d| d.map.is_some())
     }
 }
 
@@ -589,13 +612,15 @@ pub(crate) fn cook(
     let mut omm_alpha = Vec::with_capacity(maps.len());
     for (si, sm) in maps.iter().enumerate() {
         let alpha = match (&s.omm, &sm.opacity) {
-            (Some(_), Some(Opacity::Texture { mip0, cutoff, .. })) => {
-                let a = OmmAlpha::new(mip0, *cutoff);
+            (Some(_), Some(Opacity::Texture { map, cutoff, .. })) => {
+                let a = map.try_map(|t| OmmRead::new(t, *cutoff));
                 if a.is_none() {
+                    let [w, h] = map
+                        .each()
+                        .fold([0, 0], |[w, h], t| [w.max(t.mip0.w), h.max(t.mip0.h)]);
                     warnings.push(format!(
-                        "section {si}: opacity texture {}x{} is over {} texels a side; no micromaps",
-                        mip0.w,
-                        mip0.h,
+                        "section {si}: opacity texture {w}x{h} is over {} texels a side; no \
+                         micromaps",
                         OmmAlpha::MAX_SIZE
                     ));
                 }
@@ -707,7 +732,7 @@ struct Ctx<'a> {
     parts: &'a lod::Parts,
     sections: &'a [SectionData],
     maps: &'a [SectionMaps],
-    omm_alpha: &'a [Option<OmmAlpha>],
+    omm_alpha: &'a [Option<Map<OmmRead<'a>>>],
     /// Sections whose displacement is in their geometry: no displacement bounds.
     baked: &'a [bool],
     s: &'a MeshSettings,
