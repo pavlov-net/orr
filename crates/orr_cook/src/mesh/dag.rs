@@ -23,7 +23,7 @@ use std::os::raw::c_int;
 use meshopt::ffi;
 use orr_pack::mesh::{
     Cluster, Group, MeshHeader, MeshInfo, NODE_PAGE_MAX, Node, NodePage, OMM_ALIGN, PAGE_MAX,
-    PageHeader, PageInfo, Section, cluster_resident_len,
+    PageHeader, PageInfo, Section, SurfaceClass, cluster_resident_len,
 };
 use orr_pack::{Aabb, Span, Sphere};
 use rayon::prelude::*;
@@ -123,7 +123,7 @@ fn stages(
     };
     let options = |section: u16| Options {
         limits: limits(section),
-        dilate: s.dilate_double_sided && flags[usize::from(section)] & Section::DOUBLE_SIDED != 0,
+        dilate: dilates(s, flags[usize::from(section)]),
         regularize: skinned,
     };
     // Sections that cluster alike share a stage. Border dilation moves each side of a
@@ -238,6 +238,13 @@ fn stages(
         .collect();
     stages.extend(merged);
     stages
+}
+
+/// Whether a section with `flags` dilates its open borders. Glass has no coverage to keep.
+fn dilates(s: &MeshSettings, flags: u8) -> bool {
+    s.dilate_double_sided
+        && flags & Section::DOUBLE_SIDED != 0
+        && SurfaceClass::from_flags(flags) != Some(SurfaceClass::Dielectric)
 }
 
 /// Positions the stages share, which stay locked, and uv and section seams, which stay

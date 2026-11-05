@@ -15,14 +15,12 @@ public static const uint MESH_SKIN = 2;
 public static const uint MESH_UV1 = 4;
 public static const uint MESH_COLOR = 8;
 
-// `Cluster.kind`.
-public static const uint CLUSTER_TRIANGLES = 0;
-
 // `Cluster.flags`.
 public static const uint CLUSTER_ANIMATED_PART = 1;
 public static const uint CLUSTER_MERGED = 2;
 public static const uint CLUSTER_EMISSIVE = 4;
 public static const uint CLUSTER_TANGENT_SET_SHIFT = 3; // 2 bits: what the mesh's tangents here follow
+public static const uint CLUSTER_CLASS_SHIFT = 5; // 2 bits: orr_shaders.trace CLASS_OPAQUE, _DIELECTRIC or _PRESENCE
 
 // `Cluster.omm_first` of a cluster without micromaps.
 public static const uint CLUSTER_NO_OMM = 0xffffffff;
@@ -61,7 +59,7 @@ public struct Cluster
     public uint8_t tri_count;
     public uint8_t alpha_first;
     public uint16_t section;
-    public uint8_t kind;
+    public uint8_t flat_triangles; // triangles from 0 whose vertex normals equal the face normal
     public uint8_t flags;
     public uint16_t local_max[3];
     public half deformation_bound; // m

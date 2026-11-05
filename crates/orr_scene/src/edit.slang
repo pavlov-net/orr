@@ -74,6 +74,7 @@ void bounds(uint3 id: SV_DispatchThreadID)
     at.cull_sphere = float4(0.5 * (lo + hi), 0.5 * length(hi - lo));
     at.cone = CONE_NONE;
     at.area = area;
+    at.flat_triangles = uint8_t(0);
     at.local_max[0] = uint16_t(top.x);
     at.local_max[1] = uint16_t(top.y);
     at.local_max[2] = uint16_t(top.z);

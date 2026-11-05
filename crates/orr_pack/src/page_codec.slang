@@ -364,7 +364,8 @@ public uint page_decode_cluster(StoredPage p, uint cluster, uint lane)
     uint t0 = c.tri_first;
     uint tn = c.tri_count;
     if (v0 % 2 != 0 || uint64_t(v0) + vn > k.slots || t0 % 4 != 0
-        || uint64_t(t0) + tn * 3 > k.tris_len || c.alpha_first > c.tri_count)
+        || uint64_t(t0) + tn * 3 > k.tris_len || c.alpha_first > c.tri_count
+        || c.flat_triangles > c.alpha_first || ((c.flags >> CLUSTER_CLASS_SHIFT) & 3) == 3)
         return PAGE_CODEC_BAD_CLUSTER;
     // Clusters take their slots in order, so no two workgroups write the same bytes.
     if (cluster > 0)

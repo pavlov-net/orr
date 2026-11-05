@@ -1849,7 +1849,9 @@ fn plan_scene(
         let mut deps = Vec::new();
         let mut model_materials = Vec::with_capacity(model.materials.len());
         for (sec, &mi) in mesh.sections_mut().iter_mut().zip(&model.materials) {
-            sec.maps = map_spec(&materials[mi].2, &textures);
+            let cooked = &materials[mi].2;
+            // Packing binds the textures that decide a section's class and emission.
+            *sec = SectionData::new(sec.indices.clone(), cooked, map_spec(cooked, &textures));
             deps.extend(sec.maps.units().map(str::to_string));
             model_materials.push(if bakes_displacement(&model.settings, &sec.maps) {
                 *baked.entry(mi).or_insert_with(|| {

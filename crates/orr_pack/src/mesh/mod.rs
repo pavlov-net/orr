@@ -96,6 +96,12 @@ pub struct MeshHeader {
     pub pinned_pages: u32,
     /// u32 page indices that [`PageInfo::deps`] ranges index.
     pub page_deps: Span,
+    /// Bit per section below 32: its class is opaque.
+    pub opaque_sections: u32,
+    /// Bit per section below 32: its class is dielectric or presence.
+    pub layer_sections: u32,
+    /// Bit per [`SurfaceClass`] of the sections from 32 on.
+    pub high_classes: u32,
 }
 
 impl MeshHeader {
@@ -134,6 +140,46 @@ impl Section {
     pub const ALPHA_TESTED: u8 = 1;
     pub const DOUBLE_SIDED: u8 = 2;
     pub const EMISSIVE: u8 = 4;
+    /// The [`SurfaceClass`] in bits 5-6, the same bits as [`Cluster::flags`].
+    pub const CLASS_SHIFT: u8 = 5;
+    pub const CLASS_MASK: u8 = 3 << Self::CLASS_SHIFT;
+    /// On the mesh grid, its triangles use each edge as often in one direction as in the
+    /// other.
+    pub const CLOSED: u8 = 8;
+    /// In [`MeshHeader::casters`]: a smooth dielectric or metal.
+    pub const CASTER: u8 = 16;
+
+    pub fn class(&self) -> Option<SurfaceClass> {
+        SurfaceClass::from_flags(self.flags)
+    }
+}
+
+/// What a section's rays do at its surface. It sets how the section's clusters are traced
+/// and rastered, and stays with the mesh: no material set changes it.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SurfaceClass {
+    Opaque = 0,
+    Dielectric = 1,
+    Presence = 2,
+}
+
+impl SurfaceClass {
+    /// The class bits of [`Section::flags`] or [`Cluster::flags`]; `None` for the value no
+    /// class has.
+    pub fn from_flags(flags: u8) -> Option<Self> {
+        match (flags & Section::CLASS_MASK) >> Section::CLASS_SHIFT {
+            0 => Some(Self::Opaque),
+            1 => Some(Self::Dielectric),
+            2 => Some(Self::Presence),
+            _ => None,
+        }
+    }
+
+    /// The bits of [`Section::flags`] and [`Cluster::flags`] holding the class.
+    pub fn flags(self) -> u8 {
+        (self as u8) << Section::CLASS_SHIFT
+    }
 }
 
 /// A rigid part.
@@ -272,7 +318,10 @@ pub struct Cluster {
     pub tri_count: u8,
     pub alpha_first: u8,
     pub section: u16,
-    pub kind: u8,
+    /// On clusters of [`Section::CASTER`] sections: triangles `0..flat_triangles`, all
+    /// before `alpha_first`, have every vertex normal within [`FLAT_NORMAL`] of the face
+    /// normal. 0 elsewhere.
+    pub flat_triangles: u8,
     pub flags: u8,
     /// Rest AABB is `(anchor, anchor + local_max) x 2^k`.
     pub local_max: [u16; 3],
@@ -295,7 +344,6 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    pub const TRIANGLES: u8 = 0;
     pub const ANIMATED_PART: u8 = 1;
     pub const MERGED: u8 = 2;
     pub const EMISSIVE: u8 = 4;
@@ -303,7 +351,15 @@ impl Cluster {
     /// [`crate::material::Material::tangent_set`] of the section's material.
     pub const TANGENT_SET_SHIFT: u8 = 3;
     pub const NO_OMM: u32 = !0;
+
+    pub fn class(&self) -> Option<SurfaceClass> {
+        SurfaceClass::from_flags(self.flags)
+    }
 }
+
+/// How far a flat triangle's vertex normals lie from its face normal, as the length of their
+/// difference.
+pub const FLAT_NORMAL: f32 = 1e-4;
 
 const _: () = assert!(size_of::<Cluster>() == 144);
 const _: () = assert!(size_of::<PageHeader>() == 96);
@@ -327,8 +383,12 @@ pub struct MeshInfo {
 impl MeshInfo {
     pub fn parse(blob: &[u8]) -> Result<Self> {
         let header: MeshHeader = read(blob, 0).ok_or(Error::Malformed("mesh header"))?;
+        let sections: Vec<Section> = table(blob, header.sections)?;
+        if sections.iter().any(|s| s.class().is_none()) {
+            return Err(Error::Malformed("section class"));
+        }
         Ok(Self {
-            sections: table(blob, header.sections)?,
+            sections,
             parts: table(blob, header.parts)?,
             part_levels: table(blob, header.part_levels)?,
             levels: table(blob, header.levels)?,
@@ -474,8 +534,11 @@ fn check_cluster(c: &Cluster, prev: Option<&Cluster>, slots: usize, tris_len: us
             return Err(Error::Malformed("clusters overlap"));
         }
     }
-    if c.alpha_first > c.tri_count {
-        return Err(Error::Malformed("cluster alpha_first"));
+    if c.alpha_first > c.tri_count || c.flat_triangles > c.alpha_first {
+        return Err(Error::Malformed("cluster triangle counts"));
+    }
+    if c.class().is_none() {
+        return Err(Error::Malformed("cluster class"));
     }
     Ok(())
 }

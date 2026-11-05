@@ -25,7 +25,7 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     (
         Class::Mesh as u16,
         11,
-        "f8cbf5328bf0b27637b9e14810e477144f8bef085047a4b49f583947be357446",
+        "519d5450a7516899ad6dae5c67449ce1664880d3f8a40a5361e09ea4798ef03d",
     ),
     (
         Class::Material as u16,

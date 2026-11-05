@@ -2,9 +2,13 @@
 
 use bytemuck::{Pod, Zeroable};
 
+use crate::mesh::SurfaceClass;
 use crate::{AssetId, Error, Result};
 
 pub const SCHEMA: u16 = 2;
+
+/// Roughness below which a lobe carries light on as a caustic instead of scattering it.
+pub const CHAIN_ROUGHNESS: f32 = 0.1;
 
 /// A texture bound to a material slot.
 #[repr(C)]
@@ -302,6 +306,31 @@ impl Material {
     /// Whether the material emits light.
     pub fn emits(&self) -> bool {
         self.emission_luminance > 0.0 && self.emission_color.iter().any(|&c| c > 0.0)
+    }
+
+    fn bound(&self, slot: usize) -> bool {
+        self.textures[slot].texture != AssetId::NONE
+    }
+
+    /// The class of a section drawn with the material; transmission wins over blending.
+    pub fn class(&self) -> SurfaceClass {
+        if self.transmission_weight > 0.0 {
+            SurfaceClass::Dielectric
+        } else if self.alpha_mode == Self::BLEND
+            && (self.geometry_opacity < 1.0 || self.bound(slot::OPACITY))
+        {
+            SurfaceClass::Presence
+        } else {
+            SurfaceClass::Opaque
+        }
+    }
+
+    /// Whether light can leave a surface of the material as a caustic: a dielectric or metal
+    /// whose roughness may fall below [`CHAIN_ROUGHNESS`]. Textures only scale `metalness`
+    /// and `specular_roughness` down.
+    pub fn casts(&self) -> bool {
+        let lobe = self.class() == SurfaceClass::Dielectric || self.metalness > 0.0;
+        lobe && (self.specular_roughness < CHAIN_ROUGHNESS || self.bound(slot::ROUGHNESS))
     }
 }
 

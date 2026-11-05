@@ -267,7 +267,7 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
     assert_eq!(
         flags,
         [
-            Section::EMISSIVE,
+            Section::EMISSIVE | Section::CLOSED,
             Section::ALPHA_TESTED | Section::DOUBLE_SIDED
         ]
     );

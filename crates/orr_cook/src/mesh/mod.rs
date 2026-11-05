@@ -29,8 +29,8 @@ use meshopt::VertexDataAdapter;
 use orr_math::{Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{
-    Cluster, Level, MAX_SECTIONS, MeshHeader, MeshInfo, OMM_ALIGN, PAGE_MAX, PageHeader, PageInfo,
-    Part, PartLevel, Section, oct_encode,
+    Cluster, FLAT_NORMAL, Level, MAX_SECTIONS, MeshHeader, MeshInfo, OMM_ALIGN, PAGE_MAX,
+    PageHeader, PageInfo, Part, PartLevel, Section, SurfaceClass, oct_encode,
 };
 use orr_pack::{Aabb, AssetId, Hash32, Span, Sphere};
 use rayon::prelude::*;
@@ -54,7 +54,7 @@ pub struct MeshSettings {
     pub lod: LodMode,
     /// Cluster vertex limit on solid sections.
     pub max_vertices: u16,
-    /// Cluster vertex limit on alpha-tested or double-sided sections.
+    /// Cluster vertex limit on alpha-tested or double-sided sections, dielectric ones aside.
     pub max_vertices_foliage: u16,
     /// Cluster triangle limit, a multiple of 16 up to 128; clusters aim for at least a quarter.
     pub max_triangles: u16,
@@ -71,8 +71,8 @@ pub struct MeshSettings {
     /// DAG mode: the error in meters from which the parts of each section continue as one
     /// merged stage; `None` keeps parts at every error. Ignored on meshes without parts.
     pub merge_error: Option<f32>,
-    /// DAG mode: dilate the open borders of simplified double-sided sections, so foliage
-    /// keeps its coverage.
+    /// DAG mode: dilate the open borders of simplified double-sided sections, dielectric
+    /// ones aside, so foliage keeps its coverage.
     pub dilate_double_sided: bool,
     /// DAG mode: node bytes kept in blob 0, resident from mount; a larger hierarchy is
     /// paged.
@@ -350,7 +350,10 @@ pub(crate) fn section_flags(m: &Material) -> u8 {
     if m.emits() {
         flags |= Section::EMISSIVE;
     }
-    flags
+    if m.casts() {
+        flags |= Section::CASTER;
+    }
+    flags | m.class().flags()
 }
 
 impl SectionData {
@@ -728,10 +731,25 @@ pub(crate) fn cook(
         .enumerate()
         .map(|(i, sec)| Section {
             material_slot: i as u16,
-            flags: sec.flags,
+            flags: sec.flags
+                | if lod::closed(&w, &grid, i) {
+                    Section::CLOSED
+                } else {
+                    0
+                },
             _pad: 0,
         })
         .collect();
+    let h = &mut built.info.header;
+    for (i, sec) in built.info.sections.iter().enumerate() {
+        let class = sec.class().expect("sections take one class");
+        let bit = 1u32.checked_shl(i as u32).unwrap_or(0);
+        match class {
+            _ if bit == 0 => h.high_classes |= 1 << class as u32,
+            SurfaceClass::Opaque => h.opaque_sections |= bit,
+            _ => h.layer_sections |= bit,
+        }
+    }
     built.info.parts = parts
         .table
         .iter()
@@ -776,7 +794,8 @@ struct Ctx<'a> {
 
 impl Ctx<'_> {
     fn max_vertices(&self, flags: u8) -> u16 {
-        if flags & (Section::ALPHA_TESTED | Section::DOUBLE_SIDED) != 0 {
+        let dielectric = SurfaceClass::from_flags(flags) == Some(SurfaceClass::Dielectric);
+        if flags & (Section::ALPHA_TESTED | Section::DOUBLE_SIDED) != 0 && !dielectric {
             self.s.max_vertices_foliage
         } else {
             self.s.max_vertices
@@ -810,8 +829,20 @@ impl Ctx<'_> {
         };
         let uvs = stored(section_maps.opacity.as_ref().map_or(0, Opacity::uv_set));
         let opaque = partition_opaque(&uvs, &mut tris, section_maps.opacity.as_ref());
+        let flat = if sec.flags & Section::CASTER != 0 {
+            partition_flat(
+                w,
+                self.grid,
+                &verts,
+                &cells,
+                &mut tris[..3 * usize::from(opaque)],
+            )
+        } else {
+            0
+        };
         stored_corner_order(&mut tris);
         let mut c = build_cluster(w, self.grid, &verts, &cells, &tris, sec.flags, &uv);
+        c.record.flat_triangles = flat;
         if self.s.omm.is_some() && section_maps.opacity.is_some() {
             c.uvs = uvs;
         }
@@ -1170,6 +1201,42 @@ fn partition_opaque(uvs: &[[f32; 2]], tris: &mut [u8], opacity: Option<&Opacity>
     first as u8
 }
 
+/// Stable partition of a cluster's triangles: those whose vertex normals all lie within
+/// [`FLAT_NORMAL`] of the face normal first. Returns their count. A corner at `cells` off its
+/// welded grid position, moved by border dilation, has no welded face to compare with.
+fn partition_flat(
+    w: &lod::Welded,
+    grid: &Grid,
+    verts: &[u32],
+    cells: &[[i32; 3]],
+    tris: &mut [u8],
+) -> u8 {
+    let (mut flat, mut curved) = (Vec::with_capacity(tris.len()), Vec::new());
+    for t in tris.as_chunks::<3>().0 {
+        let at = t.map(|i| verts[usize::from(i)] as usize);
+        let welded = t
+            .iter()
+            .zip(at)
+            .all(|(&i, v)| cells[usize::from(i)] == grid.cells[v]);
+        let p = at.map(|v| Vec3::from(w.positions[v]).as_dvec3());
+        let face = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+        let unit = at.map(|v| Vec3::from(w.normals[v]).as_dvec3().normalize_or_zero());
+        if welded
+            && unit
+                .iter()
+                .all(|n| n.distance(face) <= f64::from(FLAT_NORMAL))
+        {
+            flat.extend_from_slice(t);
+        } else {
+            curved.extend_from_slice(t);
+        }
+    }
+    let first = flat.len() / 3;
+    flat.extend_from_slice(&curved);
+    tris.copy_from_slice(&flat);
+    first as u8
+}
+
 /// Rotates each triangle's corners as the page codec stores them; order and winding stay.
 fn stored_corner_order(tris: &mut [u8]) {
     let n = tris.len() / 3;
@@ -1439,12 +1506,7 @@ fn build_cluster(
         vertex_count: verts.len() as u16,
         tri_count,
         alpha_first: tri_count,
-        kind: Cluster::TRIANGLES,
-        flags: if flags & Section::EMISSIVE != 0 {
-            Cluster::EMISSIVE
-        } else {
-            0
-        },
+        flags: flags & (Section::CLASS_MASK | Section::EMISSIVE),
         local_max,
         uv_offset: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.offset)),
         uv_scale: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.scale)),

@@ -464,6 +464,25 @@ pub(super) fn displacement_seams(
     )]
 }
 
+/// Whether section `s` is closed: on the mesh grid, each edge between two positions is used
+/// as often in one direction as in the other.
+pub(super) fn closed(w: &Welded, grid: &Grid, s: usize) -> bool {
+    let mut uses: FxHashMap<([i32; 3], [i32; 3]), i32> = FxHashMap::default();
+    let mut any = false;
+    for t in w.section_triangles(s) {
+        let c = t.map(|v| grid.cells[v as usize]);
+        if c[0] == c[1] || c[1] == c[2] || c[0] == c[2] {
+            continue;
+        }
+        any = true;
+        for i in 0..3 {
+            let (a, b) = (c[i], c[(i + 1) % 3]);
+            *uses.entry((a.min(b), a.max(b))).or_default() += if a < b { 1 } else { -1 };
+        }
+    }
+    any && uses.values().all(|&n| n == 0)
+}
+
 /// Edges of section `s` used by one triangle, by grid position.
 pub(super) fn border_edges(w: &Welded, grid: &Grid, s: usize) -> usize {
     let mut uses: FxHashMap<([i32; 3], [i32; 3]), u32> = FxHashMap::default();

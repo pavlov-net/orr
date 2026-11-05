@@ -2,16 +2,17 @@
 //!
 //! Each triangle of a subsurface cluster casts rays along its reversed face normal, from its
 //! centroid and from the points halfway between the centroid and each corner, against the
-//! geometry drawn with the cluster: the cluster itself and every cluster of the same stage
-//! (part or merged) whose `self_error <= e < parent_error` at the cluster's own
-//! `self_error` e. The smallest hit distance, rounded down to f16, is the cluster's
-//! `min_thickness`; f16 infinity when no ray hits.
+//! opaque geometry drawn with the cluster: the cluster itself and every opaque cluster of the
+//! same stage (part or merged) whose `self_error <= e < parent_error` at the cluster's own
+//! `self_error` e. Dielectric and presence layers stop no subsurface walk. The smallest hit
+//! distance, rounded down to f16, is the cluster's `min_thickness`; f16 infinity when no ray
+//! hits.
 
 use orr_math::DVec3;
 use rayon::prelude::*;
 
 use super::{ClusterData, Grid, SectionData, f16_down};
-use orr_pack::mesh::Cluster;
+use orr_pack::mesh::{Cluster, SurfaceClass};
 
 /// Triangles per BVH leaf.
 const LEAF: usize = 4;
@@ -48,6 +49,7 @@ struct Errors {
     self_error: f32,
     parent_error: f32,
     merged: bool,
+    layer: bool,
 }
 
 impl Errors {
@@ -56,6 +58,7 @@ impl Errors {
             self_error: r.self_error,
             parent_error: r.parent_error,
             merged: r.flags & Cluster::MERGED != 0,
+            layer: r.class() != Some(SurfaceClass::Opaque),
         }
     }
 
@@ -127,7 +130,9 @@ impl Scene {
             nodes: Vec::new(),
             t_min: step / 8.0,
         };
-        let mut order: Vec<u32> = (0..s.tris.len() as u32).collect();
+        let mut order: Vec<u32> = (0..s.tris.len() as u32)
+            .filter(|&t| !s.errors[s.cluster_of[t as usize] as usize].layer)
+            .collect();
         s.nodes.push(s.node(&order, 0));
         s.split(0, &mut order, 0);
         s.order = order;
@@ -185,9 +190,9 @@ impl Scene {
             error: span.self_error,
             merged: span.merged,
         };
-        // A cluster outside its own cut (equal errors) still sees itself.
+        // A cluster outside its own cut (equal errors) or the tree still sees itself.
         let tris = &self.tris[self.first[cluster]..self.first[cluster + 1]];
-        let own = (!span.drawn_at(cut)).then_some(tris);
+        let own = (!span.drawn_at(cut) || span.layer).then_some(tris);
         let mut best = f64::INFINITY;
         let mut stack = Vec::new();
         for t in tris {

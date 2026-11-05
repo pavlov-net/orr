@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use orr_pack::mesh::{
     Cluster, MeshHeader, MeshInfo, Node, OMM_STATE_UNKNOWN_TRANSPARENT, OMM_UNKNOWN_TRANSPARENT,
-    PageView, Section, cluster_resident_len, decode_page,
+    PageView, Section, SurfaceClass, cluster_resident_len, decode_page,
 };
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, Class, Entry};
@@ -372,7 +372,8 @@ fn mesh_report(
                 };
             }
             let foliage = Section::ALPHA_TESTED | Section::DOUBLE_SIDED;
-            if m.sections.get(usize::from(c.section))?.flags & foliage != 0 {
+            let section = m.sections.get(usize::from(c.section))?;
+            if section.flags & foliage != 0 && section.class() != Some(SurfaceClass::Dielectric) {
                 foliage_tris += u64::from(c.tri_count);
                 foliage_clusters += 1;
             }
