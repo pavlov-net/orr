@@ -21,7 +21,8 @@
 //!   compensated; a range past 0..1 widens the declared one.
 //! - An image whose texels all lie within 1/255 of one value collapses into the material's
 //!   factor, clamped to 0..1 as a texture stores it; a constant normal or occlusion image,
-//!   which has no factor, cooks at 4x4.
+//!   which has no factor, cooks at 4x4. Under `MASK` an opacity image collapses only when its
+//!   texels fall on one side of the cutoff.
 //!
 //! A bound texture's value multiplies the matching factor; normal, occlusion and opacity
 //! textures have no factor.
@@ -473,6 +474,16 @@ impl<'a> Packer<'a> {
         self.constant(i, channel).map(|v| v.clamp(0.0, 1.0))
     }
 
+    /// [`Self::constant_weight`] of opacity `r` of material `m`. A folded opacity tests the same
+    /// for the whole surface, so under `MASK` texels either side of the cutoff stay a texture.
+    fn constant_opacity(&self, m: &Material, r: &TexRef) -> Option<f32> {
+        let channel = usize::from(r.channel);
+        let (lo, hi) = self.image(r.image).range[channel];
+        let passes = |t: f32| m.geometry_opacity * t.clamp(0.0, 1.0) >= m.alpha_cutoff;
+        let one_side = m.alpha_mode != Material::MASK || passes(lo) == passes(hi);
+        self.constant_weight(r.image, channel).filter(|_| one_side)
+    }
+
     /// The primaries of a color texture made from image `i`: the last override that sets
     /// them, else the file's tag, else Rec.709.
     fn color_primaries(&self, i: usize) -> Primaries {
@@ -533,14 +544,14 @@ impl<'a> Packer<'a> {
             // where no opacity slot is bound.
             let alpha_free = m.alpha_mode == Material::OPAQUE
                 || t.opacity
-                    .is_some_and(|o| self.constant(o.image, usize::from(o.channel)).is_none());
+                    .is_some_and(|o| self.constant_opacity(m, &o).is_none());
             self.color(suffix, m, r, slot::BASE_COLOR, alpha_free)?;
         }
         if m.alpha_mode != Material::OPAQUE
             && let Some(r) = &t.opacity
         {
             let channel = usize::from(r.channel);
-            match self.constant_weight(r.image, channel) {
+            match self.constant_opacity(m, r) {
                 Some(a) => m.geometry_opacity *= a,
                 None => {
                     let coverage = (m.alpha_mode == Material::MASK).then_some((0, m.alpha_cutoff));
