@@ -124,8 +124,10 @@ fn midpoint(w: &mut Welded, a: u32, b: u32) -> u32 {
         u.push([mid(ua[0], ub[0]), mid(ua[1], ub[1])]);
     }
     if let Some(t) = &mut w.tangents {
+        // A placed mesh's tangents are not unit, and the longer one would pull the midpoint.
         let (ta, tb) = (t[a], t[b]);
-        let v = (Vec3::from_slice(&ta) + Vec3::from_slice(&tb)).normalize_or(Vec3::from_slice(&ta));
+        let [ua, ub] = [ta, tb].map(|t| Vec3::from_slice(&t).normalize_or_zero());
+        let v = (ua + ub).normalize_or(ua);
         t.push([v.x, v.y, v.z, ta[3]]);
     }
     if let Some(k) = &mut w.skin {
