@@ -1,6 +1,10 @@
 //! MaterialX documents against the MaterialX specification (`Spec`) and standard nodes
 //! (`Nodes`), and OpenPBR. Each row names its clause.
 
+#[allow(dead_code)]
+#[path = "common/tagged.rs"]
+mod tagged;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -27,7 +31,7 @@ fn fixture() -> PathBuf {
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("spec_materialx_{n}"));
     let _ = std::fs::remove_dir_all(&d);
-    let files: [(&str, Vec<u8>); 7] = [
+    let files: [(&str, Vec<u8>); 9] = [
         ("v.png", png(varying)),
         (
             "flipped.png",
@@ -42,6 +46,12 @@ fn fixture() -> PathBuf {
         ("textures/color/r.png", png(varying)),
         ("textures/color2/c.png", png(varying)),
         ("lib/sub/l.png", png(varying)),
+        ("gray128.png", png(|_, _| [128, 128, 128, 255])),
+        // States Display P3 in linear light, and a gamma of 1.
+        (
+            "tagged.png",
+            tagged::varying_rgb(&[(b"gAMA", &tagged::gama(1.0)), (b"cICP", &[12, 8, 0, 1])]),
+        ),
     ];
     for (name, bytes) in files {
         let path = d.join(name);
@@ -1081,4 +1091,91 @@ fn long_connection_chains_cook() {
     );
     let (a, _) = cook_body(&body, BASE_I).unwrap();
     assert_eq!(material(&a).uv_transforms[slot::BASE_COLOR], [0.0; 6]);
+}
+
+/// An `image` `i` of `ty` reading `file`, the file's input carrying `attrs`.
+fn image_node(ty: &str, file: &str, attrs: &str) -> String {
+    format!(
+        r#"<image name="i" type="{ty}"><input name="file" type="filename" value="{file}" {attrs}/></image>"#
+    )
+}
+
+fn near(a: f32, b: f32) -> bool {
+    (a - b).abs() < 2e-3
+}
+
+/// Spec Color Spaces: the table of spaces, with "`none` remains an acceptable alias for `data`",
+/// and L200 "values of type color3 and color4 are always associated with a particular color
+/// space", which leaves a `float` image in a color scope as it is. PNG 128 through current and
+/// deprecated names.
+#[test]
+fn image_color_spaces_decode_as_named() {
+    let color = r#"<input name="base_color" type="color3" nodename="i"/>"#;
+    let stored: f32 = 128.0 / 255.0;
+    let srgb = orr_color::srgb_decode(f64::from(stored)) as f32;
+    for (space, want) in [
+        ("srgb_rec709_scene", srgb),
+        ("srgb_texture", srgb),
+        ("g22_rec709_scene", stored.powf(2.2)),
+        ("g24_rec709_scene", stored.powf(2.4)),
+        ("g18_rec709", stored.powf(1.8)),
+        ("lin_rec709_scene", stored),
+        ("data", stored),
+        ("none", stored),
+    ] {
+        let image = image_node("color3", "gray128.png", &format!(r#"colorspace="{space}""#));
+        let (a, _) = cook_body(&image, color).unwrap();
+        let got = material(&a).base_color;
+        assert!(
+            got.iter().all(|c| near(*c, want)),
+            "{space}: {got:?}, not {want}"
+        );
+    }
+
+    let image = image_node("float", "gray128.png", r#"colorspace="srgb_rec709_scene""#);
+    let input = r#"<input name="specular_roughness" type="float" nodename="i"/>"#;
+    let (a, _) = cook_body(&image, input).unwrap();
+    assert!(near(material(&a).specular_roughness, stored));
+
+    // L364 leaves other spaces to color management systems, which the cook isn't: it says so.
+    let image = image_node("color3", "gray128.png", r#"colorspace="studio_log""#);
+    let (a, report) = cook_body(&image, color).unwrap();
+    assert!(near(material(&a).base_color[0], stored));
+    assert!(
+        report.assets[0]
+            .warnings
+            .iter()
+            .any(|w| w.contains("studio_log"))
+    );
+}
+
+/// Spec L381: "data" means "no color space conversion should be applied". What a file states
+/// doesn't apply under any space a document names either: L364 has the application transform from
+/// the space named. `acescg`, which has no id, converts to Rec.2020; `lin_p3d65_scene` keeps its.
+#[test]
+fn named_spaces_stand_over_what_the_file_states() {
+    let color = r#"<input name="base_color" type="color3" nodename="i"/>"#;
+    let primaries = |a: &Archive| {
+        let e = a
+            .find(material(a).textures[slot::BASE_COLOR].texture)
+            .unwrap();
+        let b = &a.blobs(e)[0];
+        let mut v = vec![0; b.raw_len as usize];
+        a.read(b, &mut v).unwrap();
+        orr_pack::texture::TextureInfo::parse(&v)
+            .unwrap()
+            .header
+            .primaries
+    };
+    for (attrs, want) in [
+        (r#"colorspace="data""#, 0),
+        ("", 0),
+        (r#"colorspace="srgb_rec709_scene""#, 0),
+        (r#"colorspace="lin_p3d65_scene""#, 1),
+        (r#"colorspace="acescg""#, 2),
+    ] {
+        let image = image_node("color3", "tagged.png", attrs);
+        let (a, _) = cook_body(&image, color).unwrap();
+        assert_eq!(primaries(&a), want, "{attrs}");
+    }
 }

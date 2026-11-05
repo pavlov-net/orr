@@ -148,7 +148,7 @@ enum Work<'m> {
     /// The mesh, its settings and the archives holding the cooked texture units its
     /// sections read, by unit name, filled when it starts.
     Mesh(MeshSource, MeshSettings, HashMap<String, Arc<Archive>>),
-    Texture(TextureJob, Arc<Vec<ImageFile>>),
+    Texture(Box<TextureJob>, Arc<Vec<ImageFile>>),
     Neural(NeuralJob, Arc<Vec<ImageFile>>),
     TextureFile(PathBuf, Hash32, TextureSettings),
     /// The cage, its section materials and its settings.
@@ -1804,7 +1804,7 @@ fn plan_scene(
     let images = Arc::new(src.images);
     for job in jobs {
         let (name, key, working_set) = (job.name.clone(), job.key, job.working_set(&images));
-        let work = Work::Texture(job, Arc::clone(&images));
+        let work = Work::Texture(Box::new(job), Arc::clone(&images));
         let class = Class::Texture as u16;
         units.push(NewUnit::leaf(&name, class, key, working_set, work));
     }

@@ -32,6 +32,7 @@ use orr_pack::material::Material;
 use serde_json::Value;
 
 use crate::texture::Wrap;
+use crate::texture::color::ImageColor;
 use crate::texture::material::{ImageRules, MaterialTextures, TexRef};
 
 fn num(v: &Value, k: &str, d: f32) -> f32 {
@@ -210,7 +211,7 @@ pub(super) fn textures(
             channel,
             uv_set: coord as u8,
             wrap: [wrap(s.wrap_s()), wrap(s.wrap_t())],
-            srgb: None,
+            color: ImageColor::Data,
             rg_channel: None,
             uv,
             remap: None,
@@ -232,9 +233,13 @@ pub(super) fn textures(
     };
     let pbr = m.pbr_metallic_roughness();
     let pbr_json = &own["pbrMetallicRoughness"];
+    let color = |r: TexRef| TexRef {
+        color: ImageColor::Gltf,
+        ..r
+    };
     let base_color = pbr
         .base_color_texture()
-        .map(|i| tex(i.texture(), &pbr_json["baseColorTexture"], 0))
+        .map(|i| tex(i.texture(), &pbr_json["baseColorTexture"], 0).map(color))
         .transpose()?;
     // An image of red and green alone has no blue: it holds roughness and metalness in
     // red and green.
@@ -251,7 +256,11 @@ pub(super) fn textures(
     };
     Ok(MaterialTextures {
         base_color,
-        opacity: base_color.map(|r| TexRef { channel: 3, ..r }),
+        opacity: base_color.map(|r| TexRef {
+            channel: 3,
+            color: ImageColor::Data,
+            ..r
+        }),
         roughness: metal_rough(1)?,
         metalness: metal_rough(2)?,
         normal: m
@@ -270,7 +279,7 @@ pub(super) fn textures(
             .transpose()?,
         emissive: m
             .emissive_texture()
-            .map(|i| tex(i.texture(), &own["emissiveTexture"], 0))
+            .map(|i| tex(i.texture(), &own["emissiveTexture"], 0).map(color))
             .transpose()?,
         specular: info("KHR_materials_specular", "specularTexture", 3)?,
         coat: info("KHR_materials_clearcoat", "clearcoatTexture", 0)?,
@@ -279,7 +288,8 @@ pub(super) fn textures(
             "KHR_materials_diffuse_transmission",
             "diffuseTransmissionColorTexture",
             0,
-        )?,
+        )?
+        .map(color),
         displacement: info(
             "KHR_materials_displacement",
             "displacementGeometryTexture",

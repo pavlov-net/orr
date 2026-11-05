@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+pub(crate) mod color;
 mod encode;
 mod env;
 mod load;
@@ -18,6 +19,7 @@ use orr_pack::texture::{
 use orr_pack::{ArchiveWriter, AssetId, BcLayout, BlobIn, Class, Filter, Hash32, Span};
 use serde::Deserialize;
 
+use color::{Decode, ImageColor};
 use ctt::Quality;
 pub(crate) use encode::{Encoding, encode as encode_chains};
 use load::{Blocks, Source};
@@ -43,8 +45,8 @@ pub struct TextureSettings {
     /// whole number of texels and at least 4x4 filter each cell alone and match alpha
     /// coverage per cell; smaller mips filter the whole texture.
     pub atlas_grid: Option<[u16; 2]>,
-    /// Source primaries of color texels; overrides the file's tag. Untagged files are
-    /// Rec. 709.
+    /// Source primaries of color texels; overrides what the file states. Files that state none
+    /// are Rec. 709, and primaries with no id convert to Rec. 2020.
     pub primaries: Option<Primaries>,
     pub filter: MipFilter,
     /// Edge handling of the mip filter per axis (u, v).
@@ -364,6 +366,8 @@ struct NormalSource {
     y: usize,
     /// The texel channel holding z, where it holds one.
     z: usize,
+    /// How its channels read as numbers.
+    decode: Decode,
 }
 
 impl NormalSource {
@@ -395,6 +399,7 @@ fn stores_normals(layers: &[Img], rg: bool) -> bool {
         signed,
         y: 1,
         z: 2,
+        decode: Decode::STORED,
     });
     if rg {
         let outside = |s: NormalSource| {
@@ -550,7 +555,7 @@ pub(crate) fn encoders(quality: Quality) -> String {
 }
 
 fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result<Built, String> {
-    let primaries = s.primaries.or(src.primaries).unwrap_or(Primaries::Rec709);
+    let (read, primaries, gamut) = ImageColor::File.color(&src.color, s.primaries);
     if let Usage::Environment {
         light_threshold,
         max_lights,
@@ -560,6 +565,9 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
             return Err("environment maps have mips".into());
         }
         load::decode_layers(&mut src)?;
+        for p in src.layers.iter_mut().flat_map(|l| &mut l.px) {
+            *p = read.color(*p, gamut.as_ref());
+        }
         return env::cook(src, s, primaries, light_threshold, max_lights, quality);
     }
     let full_chain = s.mips.unwrap_or(s.usage.has_mips());
@@ -593,7 +601,6 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         Usage::Color | Usage::ColorAlpha | Usage::Hdr | Usage::Data(DataFormat::Rgba8Srgb)
     );
     let normal = s.usage == Usage::Normal;
-    let srgb = src.srgb;
     let vectors = normal && src.float && src.negatives;
     if vectors {
         load::decode_layers(&mut src)?;
@@ -603,12 +610,11 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         signed: src.signed || (vectors && stores_normals(&src.layers, src.rg)),
         y: 1,
         z: 2,
+        decode: Decode::STORED,
     };
     let linear = |p: &mut [f32; 4]| {
-        if color && srgb {
-            for c in &mut p[..3] {
-                *c = srgb_to_linear(*c);
-            }
+        if color {
+            *p = read.color(*p, gamut.as_ref());
         }
         if normal {
             let [x, y, z] = source.read(*p);
@@ -640,7 +646,15 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         .as_ref()
         .filter(|b| b.levels[0].len() == kept_levels(b) && s.atlas_grid.is_none())
     {
-        if b.vk_format == encoding.vk_format() && (coverage.is_none() || !remakes) {
+        let stored = if encoding == Encoding::Bc7Srgb {
+            Decode::SRGB
+        } else {
+            Decode::STORED
+        };
+        if b.vk_format == encoding.vk_format()
+            && (coverage.is_none() || !remakes)
+            && (!color || gamut.is_none() && read.is(stored))
+        {
             let (w, h) = (b.w, b.h);
             let skip = skipped_mips(w, h, s.max_size);
             let levels: Vec<Vec<Vec<u8>>> = src

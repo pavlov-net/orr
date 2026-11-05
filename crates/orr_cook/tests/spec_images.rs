@@ -3,6 +3,9 @@
 
 #[path = "common/float_ktx2.rs"]
 mod float_ktx2;
+#[allow(dead_code)]
+#[path = "common/tagged.rs"]
+mod tagged;
 #[path = "common/texels.rs"]
 mod texels;
 
@@ -550,6 +553,25 @@ fn few_channel_containers_read_as_their_importer_says() {
     let (_, m, _) = usd(&d, "rg8.ktx2", "float inputs:opacity", "a", raw_space);
     // Opacity under the default `transparent` mode is 1 - transmission.
     assert!((m.transmission_weight - 0.75).abs() < 0.01, "{m:?}");
+    // The second channel is alpha there, which no curve touches.
+    let srgb_space = r#"token inputs:sourceColorSpace = "sRGB""#;
+    let (_, m, _) = usd(&d, "rg8.ktx2", "float inputs:opacity", "a", srgb_space);
+    assert!((m.transmission_weight - 0.75).abs() < 0.01, "{m:?}");
+    let varying = |x: u32, _: u32| [0.5, if x < 4 { 0.25 } else { 0.75 }, 0.0, 1.0];
+    std::fs::write(
+        d.join("rg8_varying.ktx2"),
+        float_ktx2(8, 8, raw(ctt::Format::R8G8_UNORM), false, varying),
+    )
+    .unwrap();
+    let (a, m, _) = usd(
+        &d,
+        "rg8_varying.ktx2",
+        "float inputs:opacity",
+        "a",
+        srgb_space,
+    );
+    let (_, texels) = stored(&a, &m, slot::TRANSMISSION, 8);
+    assert!((texels[0][0] - 0.75).abs() < 0.02, "{:?}", texels[0]);
 
     // An override names a channel of the file, past what the outputs make of it.
     let channels = InputChannels {
@@ -919,4 +941,102 @@ fn unsigned_floats_cant_hold_normals_as_they_are() {
                 float4 inputs:bias = (-1, -1, -1, 0)"#;
     let (a, m, _) = usd(&d, "n.ktx2", surface, "rgb", pair);
     assert_eq!(unscaled, normal_hash(&a, &m));
+}
+
+/// A file's flat color read back: the id of its primaries and the texel at (0, 0) and (4, 0).
+fn read_back(d: &Path, bytes: &[u8]) -> (u8, [[f32; 4]; 2]) {
+    let path = d.join("image");
+    std::fs::write(&path, bytes).unwrap();
+    let settings = TextureSettings {
+        usage: Usage::Hdr,
+        mips: Some(false),
+        ..Default::default()
+    };
+    let (a, _) = cook(Source::Texture { path, settings });
+    let (info, levels) = mips(&a, "u");
+    let (w, h) = (info.header.width, info.header.height);
+    let texels = decode(info.header.vk_format, w, h, &levels[0][0]);
+    (info.header.primaries, [texels[0], texels[4]])
+}
+
+fn assert_rgb(got: [f32; 4], want: [f32; 3], what: &str) {
+    let close = (0..3).all(|c| (got[c] - want[c]).abs() <= 0.012 * want[c].abs().max(0.25));
+    assert!(close, "{what}: {got:?}, not {want:?}");
+}
+
+fn linear(code: f64) -> f32 {
+    orr_color::srgb_decode(code / 255.0) as f32
+}
+
+/// PNG §4.3, under this project's rule that plain files and USD's `auto` honor what they state:
+/// "the chunk with the lowest Priority number should take precedence", of `cICP`, `sRGB`, then
+/// `cHRM` and `gAMA`. The same files through glTF are `image_color_metadata_is_ignored`.
+#[test]
+fn png_chunks_read_by_priority() {
+    let d = dir("png_priority");
+    let code = 128.0;
+    let stored = code as f32 / 255.0;
+    let one = tagged::gama(1.0);
+    let gamma_1: (&[u8; 4], &[u8]) = (b"gAMA", &one);
+    let read = |chunks: &[(&[u8; 4], &[u8])], icc: Option<&[u8]>| {
+        let texels = [128u8; 3].repeat(64);
+        let (id, [t, _]) = read_back(&d, &tagged::png(tagged::RGB8, [8, 8], &texels, icc, chunks));
+        (id, t)
+    };
+    let (id, t) = read(&[], None);
+    assert_rgb(t, [linear(code); 3], "no chunk");
+    assert_eq!(id, 0);
+
+    let (_, t) = read(&[gamma_1], None);
+    assert_rgb(t, [stored; 3], "gAMA of 1");
+    let (_, t) = read(&[(b"gAMA", &tagged::gama(1.0 / 1.8))], None);
+    assert_rgb(t, [stored.powf(1.8); 3], "gAMA of 1/1.8");
+    let (_, t) = read(&[gamma_1, (b"sRGB", &[0])], None);
+    assert_rgb(t, [linear(code); 3], "sRGB over gAMA");
+    let (_, t) = read(&[gamma_1, (b"cICP", &[1, 13, 0, 1])], None);
+    assert_rgb(t, [linear(code); 3], "cICP over gAMA");
+
+    // Display P3's chromaticities at 100000 per unit, white first.
+    let chrm: Vec<u8> = [31270u32, 32900, 68000, 32000, 26500, 69000, 15000, 6000]
+        .iter()
+        .flat_map(|v| v.to_be_bytes())
+        .collect();
+    let (id, _) = read(&[(b"cHRM", &chrm)], None);
+    assert_eq!(id, 1, "cHRM");
+    let (id, _) = read(&[(b"cHRM", &chrm), (b"sRGB", &[0])], None);
+    assert_eq!(id, 0, "sRGB over cHRM");
+
+    // Code points outside the three ids read, and neutrals stay.
+    let (id, t) = read(&[(b"cICP", &[7, 4, 0, 1])], None);
+    assert_eq!(id, 2);
+    assert_rgb(t, [stored.powf(2.2); 3], "H.273 7 and 4");
+}
+
+/// PNG §11.3.2.6: "If Video Full Range Flag value is 0, then the image is a narrow-range image",
+/// which H.273 scales as `D = 2^(n - 8) (219 E + 16)`. Alpha is no color signal.
+#[test]
+fn cicp_narrow_range_expands() {
+    let d = dir("cicp_narrow");
+    let linear_709: &[u8] = &[1, 8, 0, 0];
+    let eight = [126u8, 16, 235].repeat(64);
+    let image = tagged::png(tagged::RGB8, [8, 8], &eight, None, &[(b"cICP", linear_709)]);
+    let (_, [t, _]) = read_back(&d, &image);
+    assert_rgb(t, [110.0 / 219.0, 0.0, 1.0], "8 bits");
+    let wide: Vec<u8> = [0x7d80u16, 4096, 60160]
+        .repeat(64)
+        .iter()
+        .flat_map(|v| v.to_be_bytes())
+        .collect();
+    let sixteen = (png::ColorType::Rgb, png::BitDepth::Sixteen);
+    let image = tagged::png(sixteen, [8, 8], &wide, None, &[(b"cICP", linear_709)]);
+    let (_, [t, _]) = read_back(&d, &image);
+    assert_rgb(t, [(32128.0 - 4096.0) / 56064.0, 0.0, 1.0], "16 bits");
+
+    // Codes past 235 are signal past 1, which emission keeps.
+    let above = tagged::flat_rgb([255; 3], &[(b"cICP", linear_709)]);
+    std::fs::write(d.join("above.png"), above).unwrap();
+    let emissive = "color3f inputs:emissiveColor";
+    let (_, m, _) = usd(&d, "above.png", emissive, "rgb", "");
+    let want = 239.0 / 219.0;
+    assert!((m.emission_color[0] - want).abs() < 0.01, "{m:?}");
 }

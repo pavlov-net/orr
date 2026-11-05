@@ -3,8 +3,10 @@
 //!
 //! Inputs connect by `nodename` (and `output`), by `nodegraph` (and `output`, which a graph of
 //! one output ignores), or inside a node graph by `interfacename`. File values take the
-//! `fileprefix` of their nearest scope and resolve against the directory of their document;
-//! their `colorspace` (inherited likewise) is `srgb_texture` for sRGB, anything else linear.
+//! `fileprefix` of their nearest scope and resolve against the directory of their document.
+//! Images of color types read in their `colorspace`, inherited likewise, so that the document's
+//! working space is the last scope, and "data" where no scope names one. A name that isn't a
+//! known space warns and reads as "data".
 //! A standalone material has no mesh, so each texture keeps its uv set (0 or 1) and transform
 //! in its slot; geometric properties name `st`, `UV0` or a `geompropdef` of a texcoord.
 //!

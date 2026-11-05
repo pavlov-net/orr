@@ -37,19 +37,20 @@ use std::sync::Arc;
 
 use ctt::Quality;
 use orr_color::RgbPrimaries;
-use orr_math::DVec3;
+use orr_math::{DMat3, DVec3};
 use orr_pack::material::{Material, TextureBinding, slot};
 use orr_pack::texture::{full_mip_count, mip_size};
 use orr_pack::{AssetId, Class, Hash32};
 use rayon::prelude::*;
 use serde::Deserialize;
 
+use super::color::{Decode, FileColor, ImageColor, Read, multiply};
 use super::load::{self, Blocks, Gray, Source};
 use super::mips::{MipSpec, Toksvig, normalized};
 use super::neural::{self, NeuralJob, NeuralSettings};
 use super::{
     Built, DataFormat, Encoding, Img, MipFilter, NormalSource, Plan, Primaries, Wrap,
-    srgb_to_linear, stores_normals,
+    stores_normals,
 };
 use crate::decoded::Decoded;
 use crate::key::Key;
@@ -120,8 +121,8 @@ pub(crate) struct TexRef {
     pub(crate) wrap: [Wrap; 2],
     /// The uv transform the texture is sampled with (`Material::uv_transforms` form).
     pub(crate) uv: [f32; 6],
-    /// Whether color texels are sRGB-encoded; `None` takes the file's own encoding.
-    pub(crate) srgb: Option<bool>,
+    /// What the importer's rules say the image's texels are.
+    pub(crate) color: ImageColor,
     /// Per axis (a scalar input's being the first), `[a, b]` of the `a + b * texel` the input
     /// reads, below any factor; a normal map reads it in place of its encoding.
     pub(crate) remap: Option<[[f32; 2]; 3]>,
@@ -135,12 +136,12 @@ impl TexRef {
     }
 
     /// The source channel `channel` as axis `axis` of this input, under `a + b * value`.
-    fn source(&self, axis: usize, channel: usize, srgb: bool, a: f32, b: f32) -> Channel {
+    fn source(&self, axis: usize, channel: usize, read: Read, a: f32, b: f32) -> Channel {
         let [ra, rb] = self.remap.map_or([0.0, 1.0], |m| m[axis]);
         Channel::Image {
             image: self.image,
             channel,
-            srgb,
+            read,
             a: a + b * ra,
             b: b * rb,
         }
@@ -149,11 +150,12 @@ impl TexRef {
     /// The normal in texel `t`, with [`Packer::normal_source`]'s remap, of an image laid out as
     /// `source` says.
     fn normal(&self, source: NormalSource, t: [f32; 4]) -> [f32; 3] {
-        let [x, y] = [self.read(0, t[0]), self.read(1, t[source.y])];
+        let value = |c: usize| source.decode.value(t[c]);
+        let [x, y] = [self.read(0, value(0)), self.read(1, value(source.y))];
         let z = if source.rg {
             orr_pack::texture::normal::z(x, y)
         } else {
-            self.read(2, t[source.z])
+            self.read(2, value(source.z))
         };
         [x, y, z]
     }
@@ -256,8 +258,7 @@ impl ImageFile {
 pub(crate) struct ImageFacts {
     w: u32,
     h: u32,
-    srgb: bool,
-    primaries: Option<Primaries>,
+    color: FileColor,
     /// Per channel, the value every texel lies within 1/255 of, if there is one.
     constant: [Option<f32>; 4],
     /// Per channel, the lowest and highest value of mip 0. Only a float image or one read as a
@@ -366,8 +367,7 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
         return Ok(ImageFacts {
             w: s.w,
             h: s.h,
-            srgb: s.srgb,
-            primaries: None,
+            color: s.color,
             constant: constant(s.range),
             range: s.range,
             hash,
@@ -404,8 +404,7 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
     Ok(ImageFacts {
         w,
         h,
-        srgb: src.srgb,
-        primaries: src.primaries,
+        color: src.color,
         constant: constant(range),
         range,
         hash,
@@ -453,13 +452,13 @@ struct Pack {
 }
 
 /// Where one output channel comes from.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 enum Channel {
-    /// Source channel of an image, `a + b * value` (after sRGB decode when `srgb`).
+    /// Source channel of an image, `a + b * value`, the value as `read` has it.
     Image {
         image: usize,
         channel: usize,
-        srgb: bool,
+        read: Read,
         a: f32,
         b: f32,
     },
@@ -487,6 +486,8 @@ pub(crate) struct TextureJob {
     max_size: Option<u32>,
     grid: Option<[u16; 2]>,
     primaries: Primaries,
+    /// Takes linear colors into `primaries`, where the source's have no id.
+    gamut: Option<DMat3>,
     filter: MipFilter,
     bc_split: Option<bool>,
     /// Keeps the source's blocks.
@@ -567,28 +568,65 @@ impl<'a> Packer<'a> {
         }
     }
 
-    /// [`TexRef::source`] of channel `c`, as [`Self::read`] has it.
-    fn source(&self, r: &TexRef, axis: usize, c: usize, srgb: bool, a: f32, b: f32) -> Channel {
+    /// How `r` reads a number from its image: an input that isn't a color takes no primaries.
+    fn decode(&self, r: &TexRef) -> Decode {
+        r.color.decode(&self.image(r.image).color)
+    }
+
+    /// Stored value `v` of channel `c` of `r`, as [`Self::read`] numbers it, as an input that
+    /// isn't a color reads it. Alpha is no color, whichever channel of the file holds it.
+    fn number(&self, r: &TexRef, c: usize, v: f32) -> f32 {
+        if c == 3 { v } else { self.decode(r).value(v) }
+    }
+
+    /// [`TexRef::source`] of channel `c`, as [`Self::read`] has it, through `read`.
+    fn read_source(
+        &self,
+        r: &TexRef,
+        axis: usize,
+        c: usize,
+        read: Read,
+        a: f32,
+        b: f32,
+    ) -> Channel {
         match self.read(r, c) {
-            Ok(c) => r.source(axis, c, srgb, a, b),
+            Ok(held) if c == 3 => r.source(axis, held, Read::of(Decode::STORED), a, b),
+            Ok(held) => r.source(axis, held, read, a, b),
             Err(v) => Channel::Constant(a + b * r.read(axis, v)),
         }
+    }
+
+    /// [`Self::read_source`] of an input that isn't a color.
+    fn source(&self, r: &TexRef, axis: usize, c: usize, a: f32, b: f32) -> Channel {
+        self.read_source(r, axis, c, Read::of(self.decode(r)), a, b)
     }
 
     /// The lowest and highest value of channel `c` of `r`.
     fn range(&self, r: &TexRef, c: usize) -> (f32, f32) {
         match self.read(r, c) {
-            Ok(c) => self.image(r.image).range[c],
+            Ok(held) => {
+                let (lo, hi) = self.image(r.image).range[held];
+                (self.number(r, c, lo), self.number(r, c, hi))
+            }
             Err(v) => (v, v),
         }
     }
 
-    /// The value of channel `c` of `r` if every texel lies within 1/255 of one value.
-    fn constant(&self, r: &TexRef, c: usize) -> Option<f32> {
+    /// The stored value of channel `c` of `r` if every texel lies within 1/255 of one value.
+    fn stored_constant(&self, r: &TexRef, c: usize) -> Option<f32> {
         match self.read(r, c) {
             Ok(c) => self.image(r.image).constant[c],
             Err(v) => Some(v),
         }
+    }
+
+    /// [`Self::stored_constant`] as an input that isn't a color reads it.
+    fn constant(&self, r: &TexRef, c: usize) -> Option<f32> {
+        let v = self.stored_constant(r, c)?;
+        Some(match self.read(r, c) {
+            Ok(_) => self.number(r, c, v),
+            Err(_) => v,
+        })
     }
 
     /// [`Self::constant`] of an input with a 0..1 meaning, clamped as its texture stores it.
@@ -602,7 +640,9 @@ impl<'a> Packer<'a> {
     fn past_one(&self, r: &TexRef) -> bool {
         let reaches = |[a, b]: [f32; 2]| a.max(a + b) > 1.0 + 1e-6;
         r.rules != ImageRules::Gltf
-            && (self.image(r.image).float || r.remap.is_some_and(|m| m.into_iter().any(reaches)))
+            && (self.image(r.image).float
+                || r.remap.is_some_and(|m| m.into_iter().any(reaches))
+                || self.decode(r).value(1.0) > 1.0 + 1e-6)
     }
 
     /// [`Self::constant`] of an input [`Self::past_one`], from 0 up, with a float image's texels
@@ -661,6 +701,7 @@ impl<'a> Packer<'a> {
             signed: f.stored_normals,
             y: self.read(&r, 1).unwrap_or(1),
             z: self.read(&r, 2).unwrap_or(2),
+            decode: self.decode(&r),
         };
         (TexRef { remap, ..r }, source)
     }
@@ -675,16 +716,11 @@ impl<'a> Packer<'a> {
         TexRef { rules, ..r }
     }
 
-    /// The primaries of a color texture made from image `i`: the last override that sets
-    /// them, else the file's tag, else Rec.709.
-    fn color_primaries(&self, i: usize) -> Primaries {
-        self.rules
-            .overrides
-            .iter()
-            .filter(|(pattern, _)| self.images[i].name.contains(pattern.as_str()))
-            .fold(None, |p, (_, o)| o.primaries.or(p))
-            .or(self.image(i).primaries)
-            .unwrap_or(Primaries::Rec709)
+    /// How color input `r` reads, and the id and matrix of what it reads as: what its rules say
+    /// of its image, under the last override that sets its primaries.
+    fn color_read(&self, r: &TexRef) -> (Read, Primaries, Option<DMat3>) {
+        let over = self.overridden(&[r.image], |o| o.primaries);
+        r.color.color(&self.image(r.image).color, over)
     }
 
     /// The channel `r` reads for an input: the last override for its image that sets the
@@ -756,14 +792,7 @@ impl<'a> Packer<'a> {
                         Pack {
                             role: "opacity",
                             encoding: Encoding::Bc4,
-                            channels: vec![self.source(
-                                r,
-                                0,
-                                channel,
-                                false,
-                                0.0,
-                                m.geometry_opacity,
-                            )],
+                            channels: vec![self.source(r, 0, channel, 0.0, m.geometry_opacity)],
                             refs: vec![*r],
                             coverage,
                             toksvig: None,
@@ -793,7 +822,7 @@ impl<'a> Packer<'a> {
                 .zip(flat)
                 .all(|(c, f)| c.is_some_and(|v| (v - f).abs() <= 1.0 / 255.0));
             if !is_flat {
-                let channel = |c: usize, s: f32| self.source(r, c, c, false, 0.0, s);
+                let channel = |c: usize, s: f32| self.source(r, c, c, 0.0, s);
                 let id = self.make(
                     suffix,
                     Pack {
@@ -841,14 +870,7 @@ impl<'a> Packer<'a> {
         let occ = t.occlusion.map(|(r, s)| (r, s, self.constant_input(&r)));
         let occ_varies = occ.as_ref().is_some_and(|o| o.2.is_none());
         let rough_channel = |m: &Material| match (&rough, rough_const) {
-            (Some(r), None) => self.source(
-                r,
-                0,
-                usize::from(r.channel),
-                false,
-                0.0,
-                m.specular_roughness,
-            ),
+            (Some(r), None) => self.source(r, 0, usize::from(r.channel), 0.0, m.specular_roughness),
             (_, c) => Channel::Constant(m.specular_roughness * c.unwrap_or(1.0)),
         };
         if !rough_varies {
@@ -857,9 +879,8 @@ impl<'a> Packer<'a> {
         if !metal_varies {
             m.metalness *= metal_const.unwrap_or(1.0);
         }
-        let metal_channel = |m: &Material, r: &TexRef| {
-            self.source(r, 0, usize::from(r.channel), false, 0.0, m.metalness)
-        };
+        let metal_channel =
+            |m: &Material, r: &TexRef| self.source(r, 0, usize::from(r.channel), 0.0, m.metalness);
         let normal_ref = normal_packed.as_ref().map(|n| n.0);
         // Per texture: its (slot, source) channels and the references it samples like.
         // Roughness and metalness share one texture when they sample alike.
@@ -884,7 +905,7 @@ impl<'a> Packer<'a> {
                 [_] => (Encoding::Bc4, "metalness"),
                 _ => (Encoding::Bc5, "roughness_metalness"),
             };
-            let mut channels: Vec<Channel> = rm.iter().map(|c| c.1).collect();
+            let mut channels: Vec<Channel> = rm.iter().map(|c| c.1.clone()).collect();
             channels.resize(4, Channel::Constant(0.0));
             // Toksvig pairs roughness and normal texels, so both must sample alike.
             let toksvig = match (&normal_packed, rm[0].0 == slot::ROUGHNESS) {
@@ -921,14 +942,7 @@ impl<'a> Packer<'a> {
                 Pack {
                     role: "occlusion",
                     encoding: Encoding::Bc4,
-                    channels: vec![self.source(
-                        &o.0,
-                        0,
-                        usize::from(o.0.channel),
-                        false,
-                        1.0 - o.1,
-                        o.1,
-                    )],
+                    channels: vec![self.source(&o.0, 0, usize::from(o.0.channel), 1.0 - o.1, o.1)],
                     refs: vec![o.0],
                     coverage: None,
                     toksvig: None,
@@ -1004,7 +1018,7 @@ impl<'a> Packer<'a> {
                 Pack {
                     role: "displacement",
                     encoding: Encoding::Raw(DataFormat::R16),
-                    channels: vec![self.source(r, 0, channel, false, -lo * b, b)],
+                    channels: vec![self.source(r, 0, channel, -lo * b, b)],
                     refs: vec![*r],
                     coverage: None,
                     toksvig: None,
@@ -1062,7 +1076,7 @@ impl<'a> Packer<'a> {
         s: usize,
         alpha_free: bool,
     ) -> Result<()> {
-        let alpha = if alpha_free {
+        let fourth = if alpha_free {
             Channel::Unused
         } else {
             Channel::Constant(1.0)
@@ -1072,26 +1086,30 @@ impl<'a> Packer<'a> {
             slot::EMISSION => ("emission", |m| &mut m.emission_color),
             _ => ("subsurface_color", |m| &mut m.subsurface_color),
         };
-        let srgb = r.srgb.unwrap_or(self.image(r.image).srgb);
+        let (read, primaries, gamut) = self.color_read(r);
         let hdr = s == slot::EMISSION && self.past_one(r);
-        let rgb: Vec<Option<f32>> = (0..3)
-            .map(|c| {
-                if hdr {
-                    self.constant_ranged(r, c)
-                } else {
-                    self.constant_weight(r, c)
-                }
-            })
-            .collect();
-        if rgb.iter().all(Option::is_some) {
-            let texel: [f32; 3] = std::array::from_fn(|c| {
-                let v = rgb[c].expect("constant");
-                let read = r.read(c, if srgb { srgb_to_linear(v) } else { v });
-                read.clamp(0.0, if hdr { f32::INFINITY } else { 1.0 })
+        let top = if hdr { f32::INFINITY } else { 1.0 };
+        let held = (0..3).all(|c| {
+            if hdr {
+                self.constant_ranged(r, c).is_some()
+            } else {
+                self.stored_constant(r, c).is_some()
+            }
+        });
+        if held {
+            let [x, y, z] = [0, 1, 2].map(|c| {
+                let v = self.stored_constant(r, c).expect("constant");
+                v.clamp(0.0, top)
             });
+            let t = [x, y, z, 1.0];
+            let mut texel: [f32; 3] =
+                std::array::from_fn(|c| r.read(c, read.value(t, c)).clamp(0.0, top));
+            if let Some(m) = &gamut {
+                texel = multiply(m, texel).map(|v| v.clamp(0.0, top));
+            }
             let target = color(m);
             // Rec.709 multiplies directly, so its factors stay exact.
-            *target = match self.color_primaries(r.image) {
+            *target = match primaries {
                 Primaries::Rec709 => std::array::from_fn(|c| target[c] * texel[c]),
                 p => {
                     let (rec709, p) = (RgbPrimaries::REC709, p.rgb());
@@ -1102,7 +1120,7 @@ impl<'a> Packer<'a> {
             };
             return Ok(());
         }
-        let image = |c| self.source(r, c, c, srgb, 0.0, 1.0);
+        let image = |c| self.read_source(r, c, c, read.clone(), 0.0, 1.0);
         let id = self.make(
             suffix,
             Pack {
@@ -1112,7 +1130,7 @@ impl<'a> Packer<'a> {
                 } else {
                     Encoding::Bc7Srgb
                 },
-                channels: vec![image(0), image(1), image(2), alpha],
+                channels: vec![image(0), image(1), image(2), fourth],
                 refs: vec![*r],
                 coverage: None,
                 toksvig: None,
@@ -1138,7 +1156,7 @@ impl<'a> Packer<'a> {
             Pack {
                 role,
                 encoding,
-                channels: vec![self.source(r, 0, usize::from(r.channel), false, 0.0, scale)],
+                channels: vec![self.source(r, 0, usize::from(r.channel), 0.0, scale)],
                 refs: vec![*r],
                 coverage: None,
                 toksvig: None,
@@ -1176,32 +1194,36 @@ impl<'a> Packer<'a> {
         let mut image = None;
         let mut channels = [0u8, 1, 2, 3];
         for (c, ch) in p.channels.iter().take(count).enumerate() {
-            match *ch {
+            match ch {
                 Channel::Image {
                     image: i,
                     channel,
-                    srgb,
+                    read,
                     a,
                     b,
                 } => {
                     let identity = if p.normal {
-                        (a, b) == (-1.0, 2.0)
+                        (*a, *b) == (-1.0, 2.0)
                     } else {
-                        (a, b) == (0.0, 1.0)
+                        (*a, *b) == (0.0, 1.0)
                     };
                     // Color channels keep their sRGB encoding; alpha and data are linear.
-                    let color = p.encoding == Encoding::Bc7Srgb && c < 3;
-                    if !identity || *image.get_or_insert(i) != i || srgb != color {
+                    let stored = if p.encoding == Encoding::Bc7Srgb && c < 3 {
+                        Decode::SRGB
+                    } else {
+                        Decode::STORED
+                    };
+                    if !identity || *image.get_or_insert(*i) != *i || !read.is(stored) {
                         return None;
                     }
-                    channels[c] = channel as u8;
+                    channels[c] = *channel as u8;
                 }
                 Channel::Unused => {}
                 // A color texture's alpha of 1 holds where the source's is 1.
                 Channel::Constant(v) if p.encoding == Encoding::Bc7Srgb && c == 3 => {
                     let opaque = self.image(image?).constant[3]
                         .is_some_and(|a| (a - 1.0).abs() <= 1.0 / 255.0);
-                    if v != 1.0 || !opaque {
+                    if *v != 1.0 || !opaque {
                         return None;
                     }
                 }
@@ -1306,17 +1328,20 @@ impl<'a> Packer<'a> {
         if p.shrink {
             size = [4, 4];
         }
-        let primaries = if matches!(p.encoding, Encoding::Bc7Srgb | Encoding::Bc6h) {
-            self.color_primaries(images[0])
+        let (primaries, gamut) = if matches!(p.encoding, Encoding::Bc7Srgb | Encoding::Bc6h) {
+            let (_, primaries, gamut) = self.color_read(&p.refs[0]);
+            (primaries, gamut)
         } else {
-            primaries.unwrap_or(Primaries::Rec709)
+            (primaries.unwrap_or(Primaries::Rec709), None)
         };
         let skipped = super::skipped_mips(size[0], size[1], max_size) > 0;
-        let pass = self.passes(&p, size, grid, skipped, source_mips);
+        let pass = self
+            .passes(&p, size, grid, skipped, source_mips)
+            .filter(|_| gamut.is_none());
 
         // A rebuilt z reads the remap alone, which a normal's channels hold times the scale.
         let mut recipe = format!(
-            "{} {:?} {:?} {:?} {:?} {:?} {:?} {max_size:?} {grid:?} {primaries:?} {bc_split:?} {:?} {:?} {:?} {source_mips}",
+            "{} {:?} {:?} {:?} {:?} {:?} {:?} {max_size:?} {grid:?} {primaries:?} {gamut:?} {bc_split:?} {:?} {:?} {:?} {source_mips}",
             p.role,
             p.encoding,
             p.channels,
@@ -1360,6 +1385,7 @@ impl<'a> Packer<'a> {
             max_size,
             grid,
             primaries,
+            gamut,
             filter: self.rules.filter,
             bc_split,
             pass: pass.map(|p| p.0),
@@ -1601,10 +1627,10 @@ impl TextureJob {
         };
         let mut img = Img::new(w, h);
         for (c, ch) in self.pack.channels.iter().enumerate() {
-            match *ch {
-                Channel::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
+            match ch {
+                &Channel::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
                 Channel::Unused => img.px.par_iter_mut().for_each(|t| t[c] = 1.0),
-                Channel::NormalZ { image, source } => {
+                &Channel::NormalZ { image, source } => {
                     let r = self.pack.refs[0];
                     img.px
                         .par_iter_mut()
@@ -1614,19 +1640,15 @@ impl TextureJob {
                 Channel::Image {
                     image,
                     channel,
-                    srgb,
+                    read,
                     a,
                     b,
                 } => {
                     img.px
                         .par_iter_mut()
-                        .zip(&decoded[&image].px)
+                        .zip(&decoded[image].px)
                         .for_each(|(t, s)| {
-                            let v = if srgb {
-                                srgb_to_linear(s[channel])
-                            } else {
-                                s[channel]
-                            };
+                            let v = read.value(*s, *channel);
                             let read = a + b * limit.map_or(v, |l| v.clamp(0.0, l));
                             t[c] = if limit == Some(f32::INFINITY) {
                                 read.max(0.0)
@@ -1636,6 +1658,12 @@ impl TextureJob {
                         });
                 }
             }
+        }
+        if let Some(m) = &self.gamut {
+            img.px.par_iter_mut().for_each(|t| {
+                let [r, g, b] = multiply(m, [t[0], t[1], t[2]]);
+                *t = [r, g, b, t[3]];
+            });
         }
         img
     }

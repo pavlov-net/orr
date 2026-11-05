@@ -3,6 +3,10 @@
 //! `overview.dox` in usdGeom, `bindingAPI.h` and `schemas.dox` in usdSkel, and
 //! `spec_usdpreviewsurface.rst` (PS), all as OpenUSD's `release` branch has them.
 
+#[allow(dead_code)]
+#[path = "common/tagged.rs"]
+mod tagged;
+
 use std::path::PathBuf;
 
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, NodeSelect, Source, Subdivision, UsdSettings};
@@ -1056,6 +1060,8 @@ fn texture(name: &str, inputs: &str) -> String {
     )
 }
 
+const RAW: &str = r#"token inputs:sourceColorSpace = "raw""#;
+
 const READER: &str = r#"def Shader "R"
     {
         uniform token info:id = "UsdPrimvarReader_float2"
@@ -1197,7 +1203,7 @@ fn opacity_mode_picks_transmission_or_coverage() {
     // A texture's opacity inverts into the transmission slot.
     let body = previewed(
         "float inputs:opacity.connect = </M/T.outputs:r>",
-        &format!("{}\n{READER}", texture("T", "")),
+        &format!("{}\n{READER}", texture("T", RAW)),
         ST,
     );
     let a = shaded("opacity-textured", &body, &gradient());
@@ -1212,7 +1218,9 @@ fn opacity_mode_picks_transmission_or_coverage() {
 /// PS `scale` and `bias`: "output = textureValue * scale + bias", on any input.
 #[test]
 fn a_texture_bias_applies_to_scalar_and_color_inputs() {
-    let gloss = "float4 inputs:scale = (-1, -1, -1, 1)\n float4 inputs:bias = (1, 1, 1, 0)";
+    let gloss = "token inputs:sourceColorSpace = \"raw\"
+ float4 inputs:scale = (-1, -1, -1, 1)
+ float4 inputs:bias = (1, 1, 1, 0)";
     let body = previewed(
         "float inputs:roughness.connect = </M/T.outputs:r>",
         &format!("{}\n{READER}", texture("T", gloss)),
@@ -1712,4 +1720,123 @@ fn a_clip_animates_the_joints_it_names() {
     assert_eq!(pose[1].translation, skeleton.rest[1].translation);
     let q = Quat::from_array(pose[0].rotation);
     assert!(q.angle_between(Quat::IDENTITY) < 1e-3);
+}
+
+/// A `UsdPreviewSurface` whose `input` of `kind` reads `output` of `tex.png` as `color_space`.
+fn read_through(input: &str, kind: &str, output: &str, color_space: &str) -> String {
+    previewed(
+        &format!("{kind} inputs:{input}.connect = </M/T.outputs:{output}>"),
+        &format!(
+            "{}\n{READER}",
+            texture(
+                "T",
+                &format!("token inputs:sourceColorSpace = \"{color_space}\"")
+            )
+        ),
+        ST,
+    )
+}
+
+/// PS `sourceColorSpace` `auto`: "Check for gamma/color space metadata in the texture file
+/// itself; if metadata is indicative of sRGB, mark texture as sRGB. If no relevant metadata is
+/// found, mark texture as sRGB if it is either 8-bit and has 3 channels or if it is 8-bit and has
+/// 4 channels. Otherwise, do not mark texture as sRGB". The row of 8-bit RGB at gamma 1 is Hio's
+/// reading (`stbImage.cpp`), which the text doesn't settle.
+#[test]
+fn auto_reads_file_metadata_then_channels_and_depth() {
+    use png::BitDepth::{Eight, Sixteen};
+    use png::ColorType::{Grayscale, Rgb};
+    let (linear, srgb) = (128.0 / 255.0, orr_color::srgb_decode(128.0 / 255.0) as f32);
+    let wide = [0x80u8, 0x80].repeat(3 * 64);
+    let gray = [128u8; 64];
+    let hint = tagged::gama(0.45455);
+    let hint: &[(&[u8; 4], &[u8])] = &[(b"gAMA", &hint)];
+    let one = tagged::gama(1.0);
+    let rows: [(&str, Vec<u8>, f32); 6] = [
+        ("rgb8", tagged::flat_rgb([128; 3], &[]), srgb),
+        (
+            "gray8",
+            tagged::png((Grayscale, Eight), [8, 8], &gray, None, &[]),
+            linear,
+        ),
+        (
+            "rgb16",
+            tagged::png((Rgb, Sixteen), [8, 8], &wide, None, &[]),
+            linear,
+        ),
+        (
+            "gray8_gamma",
+            tagged::png((Grayscale, Eight), [8, 8], &gray, None, hint),
+            srgb,
+        ),
+        (
+            "rgb16_gamma",
+            tagged::png((Rgb, Sixteen), [8, 8], &wide, None, hint),
+            srgb,
+        ),
+        (
+            "rgb8_gamma_1",
+            tagged::flat_rgb([128; 3], &[(b"gAMA", &one)]),
+            linear,
+        ),
+    ];
+    let body = read_through("diffuseColor", "color3f", "rgb", "auto");
+    for (name, image, want) in rows {
+        let got = material(&shaded(&format!("auto_{name}"), &body, &image)).base_color[0];
+        assert!((got - want).abs() < 2e-3, "{name}: {got}, not {want}");
+    }
+}
+
+/// PS `sourceColorSpace` marks the file, whatever reads it, which is why its `normal` input asks
+/// for `raw`: 188 into `roughness` is 0.503 under `auto` and `sRGB`, 0.737 under `raw`.
+#[test]
+fn the_color_space_holds_for_every_input_of_the_file() {
+    let image = tagged::flat_rgb([188; 3], &[]);
+    for (space, want) in [("auto", 0.503), ("sRGB", 0.503), ("raw", 188.0 / 255.0)] {
+        let body = read_through("roughness", "float", "r", space);
+        let name = format!("scalar_{}", space.to_lowercase());
+        let got = material(&shaded(&name, &body, &image)).specular_roughness;
+        assert!((got - want).abs() < 2e-3, "{space}: {got}, not {want}");
+    }
+}
+
+/// `colorSpace` metadata on the file names its space where `sourceColorSpace` leaves it to `auto`,
+/// and a `sourceColorSpace` authored over `auto` stands. This project's rule: PS doesn't mention
+/// the metadata, and `UsdAttribute::GetColorSpace` states what it means.
+#[test]
+fn file_metadata_stands_in_for_auto() {
+    let image = tagged::flat_rgb([128; 3], &[]);
+    let srgb = orr_color::srgb_decode(128.0 / 255.0) as f32;
+    for (space, want) in [("auto", 128.0 / 255.0), ("sRGB", srgb)] {
+        let body = read_through("diffuseColor", "color3f", "rgb", space).replace(
+            "@tex.png@",
+            "@tex.png@ (
+ colorSpace = \"lin_rec709_scene\"
+)",
+        );
+        let name = format!("metadata_{}", space.to_lowercase());
+        let got = material(&shaded(&name, &body, &image)).base_color[0];
+        assert!((got - want).abs() < 2e-3, "{space}: {got}, not {want}");
+    }
+}
+
+/// PS `raw`: "Use texture data as it was read from the texture and do not mark it as using a
+/// specific color space." Display P3 stated in a file stands under `auto` alone, `sRGB` naming the
+/// space itself.
+#[test]
+fn raw_takes_nothing_from_the_file() {
+    let image = tagged::varying_rgb(&[(b"cICP", &[12, 13, 0, 1])]);
+    for (space, want) in [("raw", 0), ("sRGB", 0), ("auto", 1)] {
+        let body = read_through("diffuseColor", "color3f", "rgb", space);
+        let a = shaded(
+            &format!("primaries_{}", space.to_lowercase()),
+            &body,
+            &image,
+        );
+        let e = a
+            .find(material(&a).textures[slot::BASE_COLOR].texture)
+            .unwrap();
+        let info = TextureInfo::parse(&read(&a, &a.blobs(e)[0])).unwrap();
+        assert_eq!(info.header.primaries, want, "{space}");
+    }
 }

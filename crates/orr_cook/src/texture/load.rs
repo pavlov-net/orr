@@ -4,6 +4,9 @@
 //! once straight into its blocks. Formats are recognized by their bytes. An animated WebP
 //! decodes to its first frame. The spec leaves `KTXswizzle` to applications; the cook applies
 //! it, because the file states it, and a file it changes loses its blocks.
+//!
+//! A [`Source`] holds a file's values as stored, beside what the file states of them
+//! ([`FileColor`]); the importers' rules decide which of that applies.
 
 use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek};
@@ -16,7 +19,8 @@ use image::codecs::webp::WebPDecoder;
 use orr_pack::texture::{FormatInfo, full_mip_count, mip_size, vk};
 use rayon::prelude::*;
 
-use super::{Img, Primaries};
+use super::Img;
+use super::color::{self, FileColor, Gamut, Transfer};
 
 /// What a file of one channel, or of gray and alpha, holds.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -37,10 +41,7 @@ pub(super) struct Source {
     pub(super) layers: Vec<Img>,
     /// Six layers in the Vulkan face order.
     pub(super) cube: bool,
-    /// RGB values are sRGB-encoded.
-    pub(super) srgb: bool,
-    /// Primaries the file is tagged with.
-    pub(super) primaries: Option<Primaries>,
+    pub(super) color: FileColor,
     /// The block-compressed texels of a compressed file, kept so an encoding that matches
     /// can pass them through.
     pub(super) blocks: Option<Blocks>,
@@ -124,6 +125,19 @@ pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
     Ok(src)
 }
 
+/// What a container's format states.
+fn container_color(srgb: bool, numeric: bool) -> FileColor {
+    FileColor {
+        transfer: Some(if srgb {
+            Transfer::Srgb
+        } else {
+            Transfer::Linear
+        }),
+        numeric,
+        ..Default::default()
+    }
+}
+
 /// What one channel of a `KTXswizzle` mapping reads.
 #[derive(Copy, Clone, PartialEq)]
 enum Component {
@@ -176,7 +190,7 @@ pub(crate) struct Scan {
     pub(super) vk_format: u32,
     /// Every mip down to 1x1 is present.
     pub(super) complete: bool,
-    pub(super) srgb: bool,
+    pub(super) color: FileColor,
     pub(super) rg: bool,
     pub(super) signed: bool,
     pub(super) float: bool,
@@ -251,8 +265,10 @@ impl<'a> Ktx2Blocks<'a> {
         self.info.mip_bytes(w, h)
     }
 
-    fn srgb(&self) -> bool {
-        self.format.normalize().1 == ColorSpace::Srgb
+    fn color(&self) -> FileColor {
+        let vk_format = self.vk_format();
+        let numeric = float_blocks(vk_format) || signed_blocks(vk_format);
+        container_color(self.format.normalize().1 == ColorSpace::Srgb, numeric)
     }
 
     fn open(self) -> Result<Source, String> {
@@ -287,8 +303,7 @@ impl<'a> Ktx2Blocks<'a> {
         Ok(Source {
             layers: Vec::new(),
             cube,
-            srgb: self.srgb(),
-            primaries: None,
+            color: self.color(),
             rg: two_channels(self.vk_format()),
             signed: signed_blocks(self.vk_format()),
             float: float_blocks(self.vk_format()),
@@ -330,7 +345,7 @@ impl<'a> Ktx2Blocks<'a> {
             h: hh,
             vk_format,
             complete: h.level_count.max(1) == full_mip_count(w, hh),
-            srgb: self.srgb(),
+            color: self.color(),
             rg: two_channels(vk_format),
             signed: signed_blocks(vk_format),
             float: float_blocks(vk_format),
@@ -467,8 +482,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
         return Ok(Source {
             layers: Vec::new(),
             cube,
-            srgb,
-            primaries: None,
+            color: container_color(srgb, float_blocks(vk_format) || signed_blocks(vk_format)),
             blocks: Some(Blocks {
                 vk_format,
                 w,
@@ -526,8 +540,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
     Ok(Source {
         layers,
         cube,
-        srgb,
-        primaries: None,
+        color: container_color(srgb, is_float(format) || is_snorm(format)),
         blocks: None,
         rg: format.channel_count() == Some(2),
         signed: is_snorm(format),
@@ -588,36 +601,30 @@ fn is_ufloat(format: ctt::Format) -> bool {
 }
 
 fn file(bytes: &[u8]) -> Result<Source, String> {
+    use image::{ColorType as C, DynamicImage, ImageFormat};
     let reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
-    let is_png = reader.format() == Some(image::ImageFormat::Png);
-    let radiance = reader.format() == Some(image::ImageFormat::Hdr);
+    let format = reader.format();
+    let radiance = format == Some(ImageFormat::Hdr);
     let img = reader.decode().map_err(|e| e.to_string())?;
     let hdr = matches!(
         img,
-        image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_)
+        DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_)
     );
-    let (mut srgb, mut primaries) = (!hdr, None);
-    if is_png && let Some(cicp) = png_cicp(bytes)? {
-        primaries = Some(match cicp.color_primaries {
-            1 => Primaries::Rec709,
-            9 => Primaries::Rec2020,
-            12 => Primaries::DisplayP3,
-            p => return Err(format!("PNG cICP color primaries {p} are not supported")),
-        });
-        srgb = match cicp.transfer_function {
-            13 => true,
-            8 => false,
-            t => return Err(format!("PNG cICP transfer function {t} is not supported")),
-        };
-    }
-    use image::ColorType as C;
     let gray = match img.color() {
         C::L8 | C::L16 => Gray::Alone,
         C::La8 | C::La16 => Gray::WithAlpha,
         _ => Gray::No,
     };
+    let mut color = FileColor {
+        numeric: hdr,
+        rgb8: matches!(img.color(), C::Rgb8 | C::Rgba8),
+        ..Default::default()
+    };
+    if format == Some(ImageFormat::Png) {
+        png_color(&mut color, bytes)?;
+    }
     let rgba = img.to_rgba32f();
     let (w, h) = rgba.dimensions();
     let px = rgba
@@ -628,8 +635,7 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
     Ok(Source {
         layers: vec![Img { w, h, px }],
         cube: false,
-        srgb,
-        primaries,
+        color,
         blocks: None,
         rg: false,
         signed: false,
@@ -637,6 +643,48 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
         negatives: hdr && !radiance,
         gray,
     })
+}
+
+/// States what a PNG's chunks say on `color`, the chunk of lowest priority number in PNG §4.3
+/// taking precedence: `cICP`, then `sRGB`, and `cHRM` and `gAMA` last.
+fn png_color(color: &mut FileColor, bytes: &[u8]) -> Result<(), String> {
+    let reader = png::Decoder::new(Cursor::new(bytes))
+        .read_info()
+        .map_err(|e| e.to_string())?;
+    let info = reader.info();
+    if let Some(c) = info.coding_independent_code_points {
+        color.transfer = color::cicp_transfer(c.transfer_function);
+        color.gamut = color::cicp_gamut(c.color_primaries);
+        if !c.is_video_full_range_image {
+            // H.273: `D = 2^(n - 8) (219 E + 16)`, on the n-bit code that 0..1 stores.
+            color.narrow = Some(if info.bit_depth == png::BitDepth::Sixteen {
+                [-4096.0 / 56064.0, 65535.0 / 56064.0]
+            } else {
+                [-16.0 / 219.0, 255.0 / 219.0]
+            });
+        }
+        if color.transfer.is_some() || color.gamut.is_some() {
+            return Ok(());
+        }
+    }
+    if info.srgb.is_some() {
+        color.transfer = Some(Transfer::Srgb);
+        color.gamut = Some(Gamut::REC709);
+        return Ok(());
+    }
+    if let Some(gamma) = info
+        .gama_chunk
+        .map(png::ScaledFloat::into_value)
+        .filter(|g| *g > 0.0)
+    {
+        color.transfer = Some(Transfer::Gamma(1.0 / gamma));
+    }
+    if let Some(c) = info.chrm_chunk {
+        let xy =
+            |p: (png::ScaledFloat, png::ScaledFloat)| [p.0, p.1].map(|v| f64::from(v.into_value()));
+        color.gamut = color::stated_gamut([xy(c.red), xy(c.green), xy(c.blue), xy(c.white)]);
+    }
+    Ok(())
 }
 
 /// An image's size and whether it is an animated WebP, from its headers; `None` when `image`
@@ -666,13 +714,6 @@ pub(super) fn is_animated(bytes: &[u8]) -> bool {
         .ok()
         .and_then(header)
         .is_some_and(|h| h.1)
-}
-
-fn png_cicp(bytes: &[u8]) -> Result<Option<png::CodingIndependentCodePoints>, String> {
-    let reader = png::Decoder::new(Cursor::new(bytes))
-        .read_info()
-        .map_err(|e| e.to_string())?;
-    Ok(reader.info().coding_independent_code_points)
 }
 
 /// Decodes one layer's BCn mip to float texels (unorm values in 0..1, snorm values in -1..1,
@@ -833,7 +874,7 @@ mod tests {
             .map(|i| u8::from_str_radix(&LOSSY_WEBP[2 * i..2 * i + 2], 16).unwrap())
             .collect();
         let src = decode(&bytes).unwrap();
-        assert!(src.srgb && !src.rg && src.blocks.is_none() && !is_animated(&bytes));
+        assert!(src.color.rgb8 && !src.rg && src.blocks.is_none() && !is_animated(&bytes));
         let img = &src.layers[0];
         assert_eq!((img.w, img.h), (32, 32));
         let quadrants: [[u8; 4]; 4] = [

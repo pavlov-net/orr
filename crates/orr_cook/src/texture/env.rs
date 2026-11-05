@@ -15,7 +15,7 @@ use rayon::prelude::*;
 
 use super::load::Source;
 use super::mips::{MipSpec, settled};
-use super::{Encoding, Img, MipFilter, Plan, Primaries, TextureSettings, Wrap, srgb_to_linear};
+use super::{Encoding, Img, MipFilter, Plan, Primaries, TextureSettings, Wrap};
 
 const SUB: u32 = 4;
 
@@ -27,15 +27,6 @@ pub(super) fn cook(
     max_lights: u8,
     quality: Quality,
 ) -> Result<super::Built, String> {
-    if src.srgb {
-        for l in &mut src.layers {
-            for p in &mut l.px {
-                for c in &mut p[..3] {
-                    *c = srgb_to_linear(*c);
-                }
-            }
-        }
-    }
     // Finite values past the format's range stay, for the lights to take. Others would spread
     // through the resampling and the lights' energy.
     let (lo, hi) = Encoding::Bc6h.range();

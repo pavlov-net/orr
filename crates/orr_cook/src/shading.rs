@@ -47,6 +47,12 @@
 //! lengths, so no object scale enters them; a displacement moves mesh space points, so a
 //! placement's scale does scale it. `thin_film_thickness` without a unit is in micrometers, as
 //! OpenPBR states it, whatever the scene's unit.
+//!
+//! A `UsdUVTexture` reads as its `sourceColorSpace` says, or under `auto` as the file's
+//! `colorSpace` metadata names, and a MaterialX image of a color type as its `colorspace` names;
+//! [`crate::texture::color`] has what each rule does. An unknown `colorspace` warns and reads as
+//! "data". A channel picked from a color image takes the space's curve and none of its primaries:
+//! a renderer working in the document's space would read the channel as it stands.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
@@ -55,6 +61,7 @@ use orr_math::{Affine2, Vec2};
 use orr_pack::material::Material;
 
 use crate::texture::Wrap;
+use crate::texture::color::{ImageColor, Space};
 use crate::texture::material::{ImageData, ImageFile, ImageRules, MaterialTextures, TexRef};
 
 /// A shading network: nodes and the connections between their inputs and outputs.
@@ -191,6 +198,11 @@ pub(crate) fn solid_image(rgb: [f32; 3]) -> ImageFile {
     }
 }
 
+/// Whether a MaterialX type is one that color management covers.
+pub(crate) fn is_color(ty: &str) -> bool {
+    matches!(ty, "color3" | "color4")
+}
+
 /// The MaterialX category of a node definition id: `ND_image_color3` is `image`.
 pub(crate) fn category(id: &str) -> &str {
     const KNOWN: &[&str] = &[
@@ -241,7 +253,7 @@ struct Tex {
     channels: Channels,
     uv_set: u8,
     wrap: [Wrap; 2],
-    srgb: Option<bool>,
+    color: ImageColor,
     uv: Affine2,
     scale: [f32; 4],
     bias: [f32; 4],
@@ -263,7 +275,7 @@ impl Tex {
             channel: self.channel() as u8,
             uv_set: self.uv_set,
             wrap: self.wrap,
-            srgb: self.srgb,
+            color: self.color,
             remap: None,
         }
     }
@@ -555,6 +567,16 @@ impl Mapper<'_, '_> {
                     "float" => Channels::One(0),
                     _ => Channels::Rgb,
                 };
+                if let Some(Input::Image {
+                    color_space: Some(space),
+                    ..
+                }) = self.source(n, "file")
+                    && is_color(&node.ty)
+                    && ImageColor::named(space).is_none()
+                {
+                    let warning = format!("{}: colorspace {space} reads as data", node.name);
+                    self.warnings.push(warning);
+                }
                 Ok(Value::Texture(t))
             }
             "UsdUVTexture" => {
@@ -663,7 +685,12 @@ impl Mapper<'_, '_> {
             wrap(self.text(n, "uaddressmode"))?,
             wrap(self.text(n, "vaddressmode"))?,
         ];
-        let srgb = Some(color_space.as_deref() == Some("srgb_texture"));
+        // Color management covers color types, and a document without a space has none.
+        let color = color_space
+            .as_deref()
+            .filter(|_| is_color(&node.ty))
+            .and_then(ImageColor::named)
+            .unwrap_or(ImageColor::Data);
         let (uv_set, mut uv) = self.texcoord(n, "texcoord", (0, Affine2::IDENTITY))?;
         if node.kind == "tiledimage" {
             let tiling = self.vec2(n, "uvtiling", Vec2::ONE)?;
@@ -681,7 +708,7 @@ impl Mapper<'_, '_> {
             channels: Channels::Rgb,
             uv_set,
             wrap,
-            srgb,
+            color,
             uv,
             scale: [1.0; 4],
             bias: [0.0; 4],
@@ -692,7 +719,10 @@ impl Mapper<'_, '_> {
     /// A `UsdUVTexture` node, its channels left for the caller.
     fn uv_texture(&self, n: usize) -> Result<Tex, String> {
         let node = self.node(n);
-        let Some(Input::Image { image, .. }) = node.inputs.get("file") else {
+        let Some(Input::Image {
+            image, color_space, ..
+        }) = node.inputs.get("file")
+        else {
             return Err(format!("{}: no file", node.name));
         };
         let wrap = |mode: Option<&str>| match mode {
@@ -702,10 +732,13 @@ impl Mapper<'_, '_> {
             Some(m) => Err(format!("{}: wrap mode {m}", node.name)),
         };
         let wrap = [wrap(self.text(n, "wrapS"))?, wrap(self.text(n, "wrapT"))?];
-        let srgb = match self.text(n, "sourceColorSpace") {
-            Some("sRGB") => Some(true),
-            Some("raw") => Some(false),
-            _ => None,
+        let stated = match self.text(n, "sourceColorSpace") {
+            Some(s @ ("sRGB" | "raw")) => Some(s),
+            _ => color_space.as_deref(),
+        };
+        let color = match stated {
+            Some("sRGB") => ImageColor::Named(Space::SRGB),
+            s => s.and_then(ImageColor::named).unwrap_or(ImageColor::UsdAuto),
         };
         let four = |v: Option<Vec<f32>>, d: f32| {
             v.map_or([d; 4], |v| {
@@ -721,7 +754,7 @@ impl Mapper<'_, '_> {
             channels: Channels::Rgb,
             uv_set,
             wrap,
-            srgb,
+            color,
             uv,
             scale,
             bias,
@@ -737,7 +770,7 @@ impl Mapper<'_, '_> {
             channels: Channels::Rgb,
             uv_set: 0,
             wrap: [Wrap::Repeat; 2],
-            srgb: Some(false),
+            color: ImageColor::Data,
             uv: Affine2::IDENTITY,
             scale: [1.0; 4],
             bias: [0.0; 4],

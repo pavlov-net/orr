@@ -5,6 +5,9 @@
 #[allow(dead_code)]
 #[path = "common/glb.rs"]
 mod glb;
+#[allow(dead_code)]
+#[path = "common/tagged.rs"]
+mod tagged;
 
 use std::path::{Path, PathBuf};
 
@@ -891,4 +894,37 @@ fn a_joint_rotation_without_length_is_none() {
     );
     let (a, _) = cooked(&path);
     assert_eq!(skeleton(&a).rest[0].rotation, [0.0, 0.0, 0.0, 1.0]);
+}
+
+/// L2418 "Any colorspace information (such as ICC profiles, intents, gamma values, etc.) found in
+/// images **MUST** be ignored. ... The effective color gamut for all images that are used as color
+/// textures is ITU-R BT.709." L2441 lists the chunks. A varying and a constant image stating
+/// Display P3, linear light, narrow range and a gamma cook as the untagged one does.
+#[test]
+fn image_color_metadata_is_ignored() {
+    let material_json = r#"{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}}}"#;
+    let gamma = tagged::gama(1.0);
+    let hints: &[(&[u8; 4], &[u8])] = &[(b"gAMA", &gamma), (b"cICP", &[12, 8, 0, 0])];
+    let texture = |a: &Archive| {
+        let m = material(a, "g/material/0");
+        let e = a.find(m.textures[slot::BASE_COLOR].texture).unwrap();
+        let blobs = a.blobs(e);
+        (read(a, &blobs[0]), read(a, &blobs[1]))
+    };
+    let d = dir("image_color_metadata");
+    let path = d.join("m.glb");
+    let cook_image = |image: &[u8]| {
+        textured_quad(&path, image, material_json, "");
+        cooked(&path).0
+    };
+    let tagged = cook_image(&tagged::varying_rgb(hints));
+    let plain = cook_image(&tagged::varying_rgb(&[]));
+    assert_eq!(texture(&tagged), texture(&plain));
+
+    let tagged = cook_image(&tagged::flat_rgb([128, 64, 32], hints));
+    let plain = cook_image(&tagged::flat_rgb([128, 64, 32], &[]));
+    assert_eq!(
+        material(&tagged, "g/material/0").base_color,
+        material(&plain, "g/material/0").base_color
+    );
 }
