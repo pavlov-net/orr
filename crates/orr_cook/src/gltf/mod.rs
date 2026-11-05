@@ -352,7 +352,20 @@ fn append_primitive(
         v.map_or_else(|| vec![[0.0; 2]; n], |v| v.as_chunks::<2>().0.to_vec())
     };
     let (uvs, uvs1) = (zeros(uvs), zeros(uvs1));
-    let tangents = rows(Semantic::Tangents, 4)?.map(|t| {
+    let normals: Option<Vec<[f32; 3]>> = rows(Semantic::Normals, 3)?.map(|ns| {
+        ns.as_chunks::<3>()
+            .0
+            .iter()
+            .map(|&nv| (normal_m * Vec3::from(nv)).normalize_or_zero().to_array())
+            .collect()
+    });
+    // glTF ignores the tangents of a primitive without normals.
+    let stored = normals
+        .is_some()
+        .then(|| rows(Semantic::Tangents, 4))
+        .transpose()?
+        .flatten();
+    let tangents = stored.map(|t| {
         t.as_chunks::<4>()
             .0
             .iter()
@@ -364,13 +377,6 @@ fn append_primitive(
     });
     b.tangents &= tangents.is_some();
     let tangents = tangents.unwrap_or_else(|| vec![[1.0, 0.0, 0.0, 1.0]; n]);
-    let normals: Option<Vec<[f32; 3]>> = rows(Semantic::Normals, 3)?.map(|ns| {
-        ns.as_chunks::<3>()
-            .0
-            .iter()
-            .map(|&nv| (normal_m * Vec3::from(nv)).normalize_or_zero().to_array())
-            .collect()
-    });
     let skin: Vec<([u8; 4], [u8; 4])> = match binding {
         None => Vec::new(),
         Some(Binding::Rigid(j)) => vec![([*j as u8; 4], [255, 0, 0, 0]); n],
