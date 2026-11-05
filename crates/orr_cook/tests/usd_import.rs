@@ -1254,8 +1254,10 @@ fn assert_same_materials(ga: &Archive, g: &Material, ua: &Archive, u: &Material)
             "slot {s} texels"
         );
     }
+    assert_eq!(g.tangent_set(), u.tangent_set());
     let strip = |m: &Material| Material {
         textures: bytemuck::Zeroable::zeroed(),
+        frame_uv: 0,
         ..*m
     };
     assert_eq!(strip(g), strip(u));

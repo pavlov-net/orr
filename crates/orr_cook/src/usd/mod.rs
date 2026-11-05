@@ -63,6 +63,7 @@ use std::rc::Rc;
 
 use openusd::{sdf, usd};
 use orr_math::{DMat3, DMat4, DQuat, DVec3, DVec4};
+use orr_pack::material::Material;
 use serde::Deserialize;
 
 use crate::import::SceneSubd;
@@ -78,8 +79,8 @@ use crate::texture::material::{ImageData, ImageFile, ImageTile, TextureRules};
 use crate::texture::tiles::{UDIM, udim_cell};
 use crate::{Error, Result};
 
-use mesh::{CageBuilder, MeshPrim, Placing, Welder};
-use read::{PrimReader, Reads, Recorder};
+use mesh::{CageBuilder, FaceFrame, Faces, FrameUvs, MeshPrim, Placing, Welder};
+use read::{PrimReader, Primvar, Reads, Recorder};
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -256,6 +257,17 @@ impl Building {
     }
 }
 
+/// The primvars a material's tangent frame reads: PS `frame:tangentsPrimvarName`,
+/// `frame:binormalsPrimvarName` and `frame:stPrimvarName`.
+struct Frame {
+    tangents: String,
+    binormals: String,
+    /// The uv set it follows.
+    set: usize,
+    /// Or this primvar outside the uv sets, on the meshes that hold it.
+    st: Option<String>,
+}
+
 /// How a mesh under a `SkelRoot` binds a skeleton: nodes of the prims that say so.
 struct Bound {
     skeleton: sdf::Path,
@@ -327,6 +339,8 @@ struct Importer<'s> {
     images: Vec<ImageFile>,
     image_of: HashMap<String, usize>,
     materials: Vec<SceneMaterial>,
+    /// Per scene material, the primvars of its tangent frame.
+    frames: Vec<Frame>,
     /// Scene material by material prim path, double-sided, and what the mesh holds for the
     /// material's primvar readers.
     material_of: HashMap<(Option<String>, bool, String), usize>,
@@ -384,6 +398,7 @@ impl<'s> Importer<'s> {
             images: Vec::new(),
             image_of: HashMap::new(),
             materials: Vec::new(),
+            frames: Vec::new(),
             material_of: HashMap::new(),
             warnings: Vec::new(),
             networks: HashMap::new(),
@@ -619,33 +634,109 @@ impl<'s> Importer<'s> {
             skels[k].3.extend(sites);
             b.skeleton = Some(k);
         }
+        // Every mesh is read before any lands in its model, which must know whether one of them
+        // carries tangents.
+        let mut prepared = Vec::with_capacity(meshes.len());
         for &(i, o) in &meshes {
             let prim = self.nodes[i].prim.clone();
             let r = self.reader(&prim);
             let path = r.path().to_string();
             let mesh = MeshPrim::read(&r, &self.settings.uv, self.settings.uv1.as_deref())?;
             let as_cage = !mesh.polygonal() && self.settings.subdivision == Subdivision::Cage;
+            let faces = self.face_materials(i, &mesh)?;
+            let mut used = faces.clone();
+            used.sort_unstable();
+            used.dedup();
+            let r = self.reader(&prim);
+            let mut primvars: HashMap<String, Option<Primvar>> = HashMap::new();
+            let mut carries = false;
+            for &m in &used {
+                let frame = &self.frames[m];
+                let names = [&frame.tangents, &frame.binormals].map(|n| (n, 3));
+                for (name, width) in names.into_iter().chain(frame.st.iter().map(|n| (n, 2))) {
+                    if !primvars.contains_key(name) {
+                        primvars.insert(name.clone(), r.primvar(name, width, None)?);
+                    }
+                }
+                let reads = self.materials[m].tangent_set().is_some();
+                carries |= reads || primvars[&frame.tangents].is_some();
+                if let Some(st) = &frame.st
+                    && reads
+                    && !as_cage
+                    && primvars[st].is_none()
+                {
+                    self.warnings.push(format!(
+                        "{path}: a material's tangents follow {st}, which the mesh does not \
+                         author; they follow uv set {}",
+                        frame.set
+                    ));
+                }
+                if as_cage && primvars[&frame.tangents].is_some() {
+                    // `mesh.h`: "Normals should not be authored on a subdivision mesh, since
+                    // subdivision algorithms define their own normals." The frame around them is
+                    // the limit surface's too.
+                    self.warnings.push(format!(
+                        "{path}: {} on a subdivision cage is not read; tangents follow the limit \
+                         surface",
+                        frame.tangents
+                    ));
+                }
+            }
+            if carries && !as_cage {
+                for &(m, _) in &holders[o] {
+                    models[m].welder.carries_tangents = true;
+                }
+            }
+            prepared.push((i, o, path, mesh, as_cage, faces, primvars));
+        }
+        for (i, o, path, mesh, as_cage, faces, primvars) in &prepared {
+            let (i, o, as_cage) = (*i, *o, *as_cage);
             let skeleton = models[o].skeleton.map(|k| &skels[k].1);
             let (skin, transform) = match (bound.get(&i), skeleton) {
                 (Some(b), Some(sk)) => {
-                    let (s, to_bind) =
-                        sk.binding(&path, &self.skin_source(b), mesh.points.len())?;
+                    let (s, to_bind) = sk.binding(path, &self.skin_source(b), mesh.points.len())?;
                     (Some(s), to_bind)
                 }
                 _ => (None, self.to_model(&models[o], i)?),
             };
-            let faces = self.face_materials(i, &mesh)?;
             let face_material = |f: usize| faces[f];
+            let surface = (!as_cage).then(|| Faces::new(mesh));
+            let carries = holders[o]
+                .iter()
+                .any(|h| models[h.0].welder.carries_tangents);
+            let corners = match &surface {
+                Some(s) if carries => {
+                    let frame = |face: usize| {
+                        let f = &self.frames[faces[face]];
+                        let held = |name: &String| primvars[name].as_ref();
+                        // Clusters of a section reading none say set 0, for a copy's material.
+                        let reads = self.materials[faces[face]].tangent_set().is_some();
+                        let named = f.st.as_ref().filter(|_| reads);
+                        let named = named.and_then(|n| Some((n.as_str(), held(n)?)));
+                        let set = FrameUvs::Set(if reads { f.set } else { 0 });
+                        let uvs = named.map_or(set, |(n, p)| FrameUvs::Primvar(n, p));
+                        FaceFrame {
+                            uvs,
+                            tangents: held(&f.tangents),
+                            binormals: held(&f.binormals),
+                        }
+                    };
+                    Some(mesh::corner_tangents(mesh, s, &frame, path)?)
+                }
+                _ => None,
+            };
             for &(m, linear) in &holders[o] {
                 let placing = Placing {
                     transform: linear * transform,
                     face_material: &face_material,
                     skin: skin.as_deref(),
                 };
-                if as_cage {
-                    models[m].cage.add(&mesh, &placing, &path)?;
-                } else {
-                    models[m].welder.add(&mesh, &placing, &path)?;
+                match &surface {
+                    None => models[m].cage.add(mesh, &placing, path)?,
+                    Some(s) => {
+                        let welder = &mut models[m].welder;
+                        welder.add(mesh, s, corners.as_deref(), &placing, path)?;
+                    }
                 }
             }
         }
@@ -701,7 +792,7 @@ impl<'s> Importer<'s> {
     }
 
     /// A built model's mesh, one section per scene material.
-    fn model(&self, b: Building) -> Result<SceneModel, String> {
+    fn model(&mut self, b: Building) -> Result<SceneModel, String> {
         let mut settings = self.settings.mesh.clone();
         patch::apply_matching(
             &self.settings.mesh_overrides,
@@ -717,11 +808,15 @@ impl<'s> Importer<'s> {
             if tris.is_empty() {
                 continue;
             }
+            // PS `UsdPrimvarReader`: `fallback` is "returned if geometry fetch failed".
+            let material = &self.materials[m];
+            let frame = material.tangent_set().is_some() && self.frames[m].set == 1;
             if w.missing_uv1.contains(&m)
-                && self.materials[m].textures.refs().any(|r| r.uv_set == 1)
+                && (frame || material.textures.refs().any(|r| r.uv_set == 1))
             {
-                return Err(format!(
-                    "material {m} reads uv set 1, which a mesh drawn with it does not author"
+                self.warnings.push(format!(
+                    "material {m} reads uv set 1, which a mesh drawn with it does not author; \
+                     it reads uv 0"
                 ));
             }
             sections.push(SectionData::new(
@@ -764,7 +859,7 @@ impl<'s> Importer<'s> {
             mesh: MeshSource::Data(Box::new(MeshData {
                 positions: w.positions,
                 normals: w.normals,
-                tangents: None,
+                tangents: w.carries_tangents.then_some(w.tangents),
                 uvs: std::iter::once(w.uvs)
                     .chain(self.settings.uv1.is_some().then_some(w.uvs1))
                     .collect(),
@@ -1367,6 +1462,41 @@ impl<'s> Importer<'s> {
         Ok(s)
     }
 
+    /// The tangent frame of a material prim with `material`: the primvars PS's `frame:*` inputs
+    /// name, by default `tangents`, `binormals` and the uv set `material` follows.
+    fn frame(&self, prim: Option<&sdf::Path>, material: &mut Material) -> Result<Frame, String> {
+        let mut frame = Frame {
+            tangents: "tangents".into(),
+            binormals: "binormals".into(),
+            set: usize::from(material.tangent_set()),
+            st: None,
+        };
+        let Some(p) = prim else {
+            return Ok(frame);
+        };
+        let prim = self.stage.prim(p.clone()).map_err(|e| e.to_string())?;
+        let r = self.reader(&prim);
+        if let Some(n) = r.token("inputs:frame:tangentsPrimvarName")? {
+            frame.tangents = n;
+        }
+        if let Some(n) = r.token("inputs:frame:binormalsPrimvarName")? {
+            frame.binormals = n;
+        }
+        if let Some(n) = r.token("inputs:frame:stPrimvarName")? {
+            match self.settings.uv_sets().position(|s| s == n) {
+                Some(0) => material.frame_uv = Material::FRAME_UV0,
+                Some(_) => material.frame_uv = Material::FRAME_UV1,
+                None => material.frame_uv = Material::FRAME_OTHER,
+            }
+            frame.st = (material.frame_uv == Material::FRAME_OTHER).then_some(n);
+            frame.set = match frame.st {
+                Some(_) => 0,
+                None => usize::from(material.tangent_set()),
+            };
+        }
+        Ok(frame)
+    }
+
     /// What mesh prim `mesh` holds for primvar `name`. A constant primvar inherits down
     /// namespace.
     fn primvar(&self, mesh: usize, name: &str) -> Result<shading::Primvar, String> {
@@ -1459,6 +1589,7 @@ impl<'s> Importer<'s> {
         if double_sided {
             mapped.material.double_sided = 1;
         }
+        let frame = self.frame(prim.as_ref(), &mut mapped.material)?;
         let suffix = if double_sided {
             format!("{name}/double_sided")
         } else {
@@ -1470,6 +1601,7 @@ impl<'s> Importer<'s> {
             material: mapped.material,
             textures: mapped.textures,
         });
+        self.frames.push(frame);
         let m = self.materials.len() - 1;
         self.material_of.insert(key, m);
         Ok(m)

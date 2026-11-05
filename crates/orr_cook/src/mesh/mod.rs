@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use meshopt::VertexDataAdapter;
 use orr_math::{Vec2, Vec3};
-use orr_pack::material::Material;
+use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{
     Cluster, Level, MeshHeader, MeshInfo, OMM_ALIGN, PAGE_MAX, PageHeader, PageInfo, Part,
     PartLevel, Section, oct_encode,
@@ -324,10 +324,17 @@ pub(crate) struct SectionData {
 }
 
 /// Whether material `m` binds a texture on uv set 1.
-pub(crate) fn reads_uv1(m: &Material) -> bool {
+pub(crate) fn binds_uv1(m: &Material) -> bool {
     m.textures
         .iter()
-        .any(|b| b.texture != AssetId::NONE && b.uv_set == 1)
+        .any(|b| b.texture != AssetId::NONE && b.uv_set & 1 == 1)
+}
+
+/// Whether a mesh section drawn with material `m` reads uv set 1, for a texture or for the
+/// tangent frame it reads.
+pub(crate) fn reads_uv1(m: &Material) -> bool {
+    let frame = reads_tangent(m) || m.textures[slot::NORMAL].texture != AssetId::NONE;
+    binds_uv1(m) || (frame && m.tangent_set() == 1)
 }
 
 /// Whether material `m` reads the tangent with or without a normal map.
@@ -388,24 +395,26 @@ pub(crate) enum NormalSpec {
     /// Nothing.
     #[default]
     None,
-    /// Only to turn this unit's cooked normal map, on uv set `uv_set`.
+    /// Only to turn this unit's cooked normal map, read on uv set `uv_set`. Tangents follow
+    /// `frame_set`, a [`Material::tangent_set`].
     Texture {
         unit: String,
         key: Hash32,
         read: MapRead,
         uv_set: usize,
+        frame_set: usize,
     },
     /// More than a normal map the cook can read: anisotropy, a linked surface, or a normal
-    /// map not cooked here. Tangents follow `uv_set`.
-    Tangent { uv_set: usize },
+    /// map not cooked here.
+    Tangent { frame_set: usize },
 }
 
 impl NormalSpec {
-    /// The uv set tangents follow, when the material reads them.
+    /// What tangents follow, when the material reads them: a [`Material::tangent_set`].
     fn tangent_set(&self) -> Option<usize> {
         match self {
             Self::None => None,
-            Self::Texture { uv_set, .. } | Self::Tangent { uv_set } => Some(*uv_set),
+            Self::Texture { frame_set, .. } | Self::Tangent { frame_set } => Some(*frame_set),
         }
     }
 }
@@ -483,8 +492,12 @@ impl MapSpec {
         });
         let normal = match &self.normal {
             NormalSpec::Texture {
-                key, read, uv_set, ..
-            } => format!("texture {key:?} {read:?} {uv_set}"),
+                key,
+                read,
+                uv_set,
+                frame_set,
+                ..
+            } => format!("texture {key:?} {read:?} {uv_set} {frame_set}"),
             n => format!("{n:?}"),
         };
         format!("{opacity} {displacement:?} {normal} {}", self.uv1)
@@ -745,6 +758,8 @@ impl Ctx<'_> {
         }
         c.record.section = section;
         c.record.part = part;
+        let frame = sec.maps.normal.tangent_set().unwrap_or(0) as u8;
+        c.record.flags |= frame << Cluster::TANGENT_SET_SHIFT;
         c.record.alpha_first = opaque;
         if merged {
             c.record.flags |= Cluster::MERGED;
@@ -1465,9 +1480,27 @@ impl MeshData {
         if self.tangents.is_some() || !self.sections.iter().any(reads) {
             return;
         }
+        // One corner holds one tangent, so sections sharing corners get their own.
+        let mut taken: Vec<Range<usize>> = Vec::with_capacity(self.sections.len());
+        for s in &mut self.sections {
+            if taken
+                .iter()
+                .any(|r| r.start < s.indices.end && s.indices.start < r.end)
+            {
+                let start = self.indices.len();
+                self.indices.extend_from_within(s.indices.clone());
+                s.indices = start..self.indices.len();
+            }
+            taken.push(s.indices.clone());
+        }
+        let zeros = vec![[0.0; 2]; self.positions.len()];
         let mut corners = vec![tangents::UNREAD; self.indices.len()];
         for s in &self.sections {
-            let uvs = &self.uvs[s.maps.normal.tangent_set().unwrap_or(0)];
+            let set = s.maps.normal.tangent_set().unwrap_or(0);
+            // A frame on uvs outside the mesh's sets falls back to set 0, as the shaders do
+            // without a tangent stream.
+            let other = set == usize::from(Material::TANGENT_SET_OTHER);
+            let uvs = self.uvs.get(if other { 0 } else { set }).unwrap_or(&zeros);
             let section = &self.indices[s.indices.clone()];
             let at = |i: &u32| *i as usize;
             let positions: Vec<_> = section.iter().map(|i| self.positions[at(i)]).collect();

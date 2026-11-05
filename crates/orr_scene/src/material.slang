@@ -153,8 +153,10 @@ public struct MaterialGpu
     public uint channels_hi;
     public uint primaries;                  // 2 bits per slot: 0 Rec.709, 1 Display P3, 2 Rec.2020
     public uint surface;                    // linked surface id; 0 = StandardSurface
+    public uint tangent_set;                // the uv set its tangent frame follows; TANGENT_SET_OTHER: neither
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
+    public uint _pad;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
     public uint* tiles[TEXTURE_SLOTS];                  // per slot of TEXTURE_TILED, its table: `texture_tile`
@@ -607,6 +609,9 @@ public float3 material_normal_frame(MaterialGpu* m, uint slot, float3 v)
     float2 v_axis = normalize(float2(-b, a)) * s;
     return float3(u_axis * v.x + v_axis * v.y, v.z);
 }
+
+// `MaterialGpu.tangent_set` of a frame that follows uvs a mesh doesn't carry.
+public static const uint TANGENT_SET_OTHER = 2;
 
 // The uv set `slot` reads, 0 or 1.
 public uint material_uv_set(MaterialGpu* m, uint slot)

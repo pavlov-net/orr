@@ -21,6 +21,7 @@ public static const uint CLUSTER_TRIANGLES = 0;
 public static const uint CLUSTER_ANIMATED_PART = 1;
 public static const uint CLUSTER_MERGED = 2;
 public static const uint CLUSTER_EMISSIVE = 4;
+public static const uint CLUSTER_TANGENT_SET_SHIFT = 3; // 2 bits: what the mesh's tangents here follow
 
 // `Cluster.omm_first` of a cluster without micromaps.
 public static const uint CLUSTER_NO_OMM = 0xffffffff;

@@ -844,6 +844,21 @@ fn cook() -> Arc<[u8]> {
             (n.z * 255.0) as u8,
         ]
     });
+    let turned_quad = || MeshInput {
+        // Its second uvs turn a quarter turn: their u runs down -y and their up runs +x.
+        uvs1: Some(vec![
+            Vec2::new(1.0, 1.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 1.0),
+        ]),
+        ..quad([
+            Vec3::new(-0.5, -0.5, 0.0),
+            Vec3::new(0.5, -0.5, 0.0),
+            Vec3::new(0.5, 0.5, 0.0),
+            Vec3::new(-0.5, 0.5, 0.0),
+        ])
+    };
     let tilt = png("tilt.png", 16, 16, png::ColorType::Rgb, |_, _| {
         TILT.map(|c| ((c * 0.5 + 0.5) * 255.0).round() as u8)
             .to_vec()
@@ -872,6 +887,11 @@ fn cook() -> Arc<[u8]> {
     ground.textures[slot::NORMAL].texture = id("tex/normal");
     let mut tilted = Material::default();
     tilted.textures[slot::NORMAL].texture = id("tex/tilt");
+    let mut tilted_uv1 = tilted;
+    tilted_uv1.textures[slot::NORMAL].uv_set = 1;
+    let mut tilted_keeping_uv1 = tilted;
+    tilted_keeping_uv1.textures[slot::BASE_COLOR].texture = id("tex/albedo");
+    tilted_keeping_uv1.textures[slot::BASE_COLOR].uv_set = 1;
     let coat = Material {
         base_color: [0.1, 0.25, 0.8],
         specular_roughness: 0.4,
@@ -1079,6 +1099,18 @@ fn cook() -> Arc<[u8]> {
                     },
                 },
                 AssetSpec {
+                    name: "tilted sets".into(),
+                    source: Source::Mesh {
+                        mesh: turned_quad(),
+                        materials: vec![tilted_keeping_uv1],
+                        settings: MeshSettings {
+                            tangent_error_max: None,
+                            ..MeshSettings::default()
+                        },
+                    },
+                },
+                model("tilted on uv1", turned_quad(), vec![tilted_uv1], one()),
+                AssetSpec {
                     name: "tilted computed".into(),
                     source: Source::Mesh {
                         mesh: quad(unit),
@@ -1274,6 +1306,17 @@ fn place(w: &mut World, copies: &[Item]) -> Placed {
 
 /// [`place`] with the group anchored at `anchor` and the copies traced within `rt_range`.
 fn place_at(w: &mut World, copies: &[Item], anchor: DVec3, rt_range: f32) -> Placed {
+    place_with(w, copies, anchor, rt_range, None)
+}
+
+/// [`place_at`] with one-section copies drawn in `material`, in place of the section's.
+fn place_with(
+    w: &mut World,
+    copies: &[Item],
+    anchor: DVec3,
+    rt_range: f32,
+    material: Option<MaterialId>,
+) -> Placed {
     let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
     let history = w.scenes.create_view_history().unwrap();
     let models: Vec<ModelId> = copies.iter().map(|c| w.model(c.model)).collect();
@@ -1288,6 +1331,9 @@ fn place_at(w: &mut World, copies: &[Item], anchor: DVec3, rt_range: f32) -> Pla
         })
         .unwrap();
     let mut s = f.scene(scene).unwrap();
+    if let Some(m) = material {
+        s.material_sets(0, 1).unwrap()[0] = m;
+    }
     let group = s
         .create_transform_group(&TransformGroupDesc {
             count: copies.len() as u32,
@@ -1305,7 +1351,7 @@ fn place_at(w: &mut World, copies: &[Item], anchor: DVec3, rt_range: f32) -> Pla
                 transforms: group,
                 first: i as u32,
                 pose: None,
-                material_set: None,
+                material_set: material.map(|_| 0),
                 flags: InstanceFlags::RASTER | InstanceFlags::RAY,
                 rt_range,
                 animation_range: 0.0,
@@ -3006,6 +3052,35 @@ fn tilted_pixels(g: &Frame, want: Vec3, pick: impl Fn(Vec3) -> bool) -> usize {
         }
     }
     seen
+}
+
+/// A copy's material can read a normal map on the uv set the mesh's tangents don't follow, which
+/// turns the frame with that set's uvs.
+#[test]
+fn a_replaced_material_turns_its_normal_map_with_its_own_uv_set() {
+    let _serial = serial();
+    let mut w = World::new(&linked::KERNELS);
+    let material = w
+        .scenes
+        .material(w.mount, AssetId::from_name("tilted on uv1/material/0"))
+        .unwrap();
+    let [x, y, z] = TILT;
+    let item = Item {
+        model: "tilted sets",
+        linear: Mat3::IDENTITY,
+        at: Vec3::ZERO,
+    };
+    let eye = DVec3::new(0.0, 0.0, 2.0);
+    for (over, want) in [
+        (None, Vec3::new(x, y, z)),
+        (Some(material), Vec3::new(y, -x, z)),
+    ] {
+        let placed = place_with(&mut w, &[item], DVec3::ZERO, 100.0, over);
+        let mut shot = Shot::at(eye, DVec3::ZERO, 1);
+        shot.jitter = Vec2::ZERO;
+        let g = shoot(&mut w, &placed, &shot);
+        assert!(tilted_pixels(&g, want, |_| true) > 1000);
+    }
 }
 
 /// A quad seen from its front, u along +x and uv's v down -y: x of the normal map turns along

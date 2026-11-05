@@ -6,6 +6,8 @@
 #[allow(dead_code)]
 #[path = "common/tagged.rs"]
 mod tagged;
+#[path = "common/tangent_quads.rs"]
+mod tangent_quads;
 
 use std::path::PathBuf;
 
@@ -1418,6 +1420,305 @@ fn a_texture_bias_applies_to_scalar_and_color_inputs() {
     );
     let a = shaded("bias-past-one", &body, &png(8, 8, |_, _| [255; 4]));
     assert_eq!(material(&a).emission_color, [5.0; 3]);
+}
+
+/// USD's text of `v`, one tuple per element.
+fn usd_list<const N: usize>(v: impl IntoIterator<Item = [f32; N]>) -> String {
+    let tuples: Vec<String> = v
+        .into_iter()
+        .map(|t| format!("({})", t.map(|x| x.to_string()).join(", ")))
+        .collect();
+    format!("[{}]", tuples.join(", "))
+}
+
+/// `NormalTangentMirrorTest`'s quads as mesh `Q`, its uvs in `st` and `reversed` winding them
+/// left-handed, with `mesh` attributes, bound to a normal map whose `Material` holds `material`.
+fn framed(name: &str, mesh: &str, material: &str, reversed: bool) -> Vec<(Vec3, [f32; 4])> {
+    let (p, n, uv, _, idx) = tangent_quads::arrays();
+    let idx: Vec<u32> = idx
+        .chunks_exact(3)
+        .flat_map(|t| match reversed {
+            true => [t[0], t[2], t[1]],
+            false => [t[0], t[1], t[2]],
+        })
+        .collect();
+    let counts = vec!["3"; idx.len() / 3].join(", ");
+    let indices = idx
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (points, normals) = (usd_list(p), usd_list(n));
+    let st = usd_list(uv.iter().map(|&[u, v]| [u, 1.0 - v]));
+    let orientation = if reversed {
+        r#"uniform token orientation = "leftHanded""#
+    } else {
+        ""
+    };
+    let normal_map = texture(
+        "T",
+        &format!(
+            "{RAW}\n float4 inputs:scale = (2, 2, 2, 1)\n float4 inputs:bias = (-1, -1, -1, 0)"
+        ),
+    );
+    let body = format!(
+        r#"def Mesh "Q"
+{{
+    uniform token subdivisionScheme = "none"
+    {orientation}
+    int[] faceVertexCounts = [{counts}]
+    int[] faceVertexIndices = [{indices}]
+    point3f[] points = {points}
+    normal3f[] normals = {normals} (
+        interpolation = "vertex"
+    )
+    texCoord2f[] primvars:st = {st} (
+        interpolation = "vertex"
+    )
+    rel material:binding = </M>
+    {mesh}
+}}
+
+def Material "M"
+{{
+    token outputs:surface.connect = </M/S.outputs:surface>
+    {material}
+
+    def Shader "S"
+    {{
+        uniform token info:id = "UsdPreviewSurface"
+        normal3f inputs:normal.connect = </M/T.outputs:rgb>
+        token outputs:surface
+    }}
+    {normal_map}
+    {READER}
+}}"#
+    );
+    let d = dir(name);
+    let tilted = png(16, 16, |x, y| {
+        [96 + (x * 4) as u8, 160 - (y * 4) as u8, 255, 255]
+    });
+    std::fs::write(d.join("tex.png"), tilted).unwrap();
+    let mut settings = UsdSettings::default();
+    settings.mesh.tangent_error_max = None;
+    let a = cook_at(&d, &body, settings).unwrap_or_else(|e| panic!("{name}: {e}"));
+    corner_tangents(&a, "u/mesh")
+}
+
+/// Position and tangent of every corner of a mesh entry.
+fn corner_tangents(a: &Archive, name: &str) -> Vec<(Vec3, [f32; 4])> {
+    let info = MeshInfo::parse(&blob(a, name, 0)).unwrap();
+    let mut out = Vec::new();
+    for p in &info.pages {
+        let mut page = vec![0; p.resident_len as usize];
+        orr_pack::mesh::decode_page(&blob(a, name, p.blob as usize), &mut page).unwrap();
+        let view = PageView::new(&page, &info.header).unwrap();
+        for i in 0..view.cluster_count() {
+            let c = view.cluster(i);
+            for v in 0..u32::from(c.vertex_count) {
+                let at = Vec3::from(view.position(&c, v));
+                out.push((at, view.tangent(&c, v).expect("tangents")));
+            }
+        }
+    }
+    out
+}
+
+fn assert_tangents(got: &[(Vec3, [f32; 4])], want: impl Fn(Vec3) -> Option<[f32; 4]>) {
+    assert!(!got.is_empty());
+    for (at, t) in got {
+        let want = want(*at).unwrap_or_else(|| panic!("no tangent wanted at {at}"));
+        let dir = Vec3::from_slice(&want).normalize();
+        assert!(
+            Vec3::from_slice(t).dot(dir) > 0.9999 && t[3] == want[3],
+            "at {at}: {t:?} want {want:?}"
+        );
+    }
+}
+
+/// The tangent `NormalTangentMirrorTest` stores at `at`, with `place` taking its positions and
+/// tangents where the model puts them.
+fn published(at: Vec3, place: impl Fn(Vec3) -> Vec3) -> Option<[f32; 4]> {
+    let (p, _, _, t, _) = tangent_quads::arrays();
+    let k = p
+        .iter()
+        .position(|&q| place(q.into()).abs_diff_eq(at, 2e-3))?;
+    let v = place(Vec3::from_slice(&t[k]));
+    Some([v.x, v.y, v.z, t[k][3]])
+}
+
+/// PS `frame:stPrimvarName`: "Mikktspace or similar is recommended for consistency". The
+/// tangents `NormalTangentMirrorTest` publishes, from uvs USD flips, left-handed winding included.
+#[test]
+fn unstated_tangents_are_mikktspaces_on_either_winding() {
+    let want = |at| published(at, |p| p);
+    assert_tangents(&framed("frame-mikk", "", "", false), want);
+    assert_tangents(&framed("frame-left", "", "", true), want);
+}
+
+/// A mesh's own space holds its tangents, and a transform reaches them as it reaches `points`:
+/// a mirror turns them with the surface and negates their sign.
+#[test]
+fn a_mirroring_transform_negates_the_tangent_sign() {
+    let mirrored = r#"double3 xformOp:scale = (-1, 1, 1)
+    uniform token[] xformOpOrder = ["xformOp:scale"]"#;
+    let flip = |v: Vec3| v * Vec3::new(-1.0, 1.0, 1.0);
+    let got = framed("frame-mirror", mirrored, "", false);
+    assert_tangents(&got, |at| {
+        published(at, flip).map(|[x, y, z, w]| [x, y, z, -w])
+    });
+}
+
+/// PS `frame:tangentsPrimvarName`, default "tangents", and `frame:binormalsPrimvarName`, default
+/// "binormals": the file's frame stands over MikkTSpace, and the binormal gives its handedness.
+#[test]
+fn frame_primvars_state_tangents_and_their_handedness() {
+    let primvars = |tangents: &str, binormals: &str, y: f32| {
+        format!(
+            r#"vector3f[] primvars:{tangents} = [(0, 1, 0)] (
+        interpolation = "constant"
+    )
+    vector3f[] primvars:{binormals} = [({y}, 0, 0)] (
+        interpolation = "constant"
+    )"#
+        )
+    };
+    // The third quad faces -z, where cross(n, t) runs +x.
+    let z = |at: Vec3| at.z < -0.005;
+    let want = |w: f32| move |at: Vec3| Some([0.0, 1.0, 0.0, if z(at) { -w } else { w }]);
+    let got = framed(
+        "frame-stated",
+        &primvars("tangents", "binormals", -1.0),
+        "",
+        false,
+    );
+    assert_tangents(&got, want(1.0));
+    let got = framed(
+        "frame-left-stated",
+        &primvars("tangents", "binormals", 1.0),
+        "",
+        false,
+    );
+    assert_tangents(&got, want(-1.0));
+
+    let names = r#"string inputs:frame:tangentsPrimvarName = "t2"
+    string inputs:frame:binormalsPrimvarName = "b2""#;
+    assert_tangents(
+        &framed("frame-named", &primvars("t2", "b2", -1.0), names, false),
+        want(1.0),
+    );
+}
+
+/// PS `frame:stPrimvarName`: "Name of the texture coordinate to be use to calculate the tangent
+/// frame".
+#[test]
+fn the_frames_st_primvar_can_differ_from_the_textures() {
+    let (_, _, uv, _, _) = tangent_quads::arrays();
+    let st = usd_list(uv.iter().map(|&[u, v]| [1.0 - u, 1.0 - v]));
+    let mirrored = format!(
+        r#"texCoord2f[] primvars:frame_st = {st} (
+        interpolation = "vertex"
+    )"#
+    );
+    let material = r#"string inputs:frame:stPrimvarName = "frame_st""#;
+    let got = framed("frame-st", &mirrored, material, false);
+    assert_tangents(&got, |at| {
+        published(at, |p| p).map(|[x, y, z, w]| [-x, -y, -z, -w])
+    });
+    // A mesh without the named primvar falls back on the first set.
+    let got = framed("frame-st-absent", "", material, false);
+    assert_tangents(&got, |at| published(at, |p| p));
+}
+
+/// MaterialX `tangent`: "The index of the texcoord space to use to compute the tangent vector",
+/// through a `normalmap`'s `tangent` input; by default `Tworld`, index 0, whichever set the image
+/// reads.
+#[test]
+fn a_normalmaps_tangent_node_picks_the_uv_set() {
+    let (p, n, uv, _, idx) = tangent_quads::arrays();
+    let counts = vec!["3"; idx.len() / 3].join(", ");
+    let indices = idx
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (points, normals) = (usd_list(p), usd_list(n));
+    let st = usd_list(uv.iter().map(|&[u, v]| [u, 1.0 - v]));
+    let other = usd_list(uv.iter().map(|&[u, v]| [1.0 - u, 1.0 - v]));
+    let stage = |tangent: &str, input: &str| {
+        format!(
+            r#"def Mesh "Q"
+{{
+    uniform token subdivisionScheme = "none"
+    int[] faceVertexCounts = [{counts}]
+    int[] faceVertexIndices = [{indices}]
+    point3f[] points = {points}
+    normal3f[] normals = {normals} (
+        interpolation = "vertex"
+    )
+    texCoord2f[] primvars:st = {st} (
+        interpolation = "vertex"
+    )
+    texCoord2f[] primvars:st1 = {other} (
+        interpolation = "vertex"
+    )
+    rel material:binding = </M>
+}}
+
+def Material "M"
+{{
+    token outputs:mtlx:surface.connect = </M/S.outputs:out>
+
+    def Shader "S"
+    {{
+        uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+        vector3f inputs:geometry_normal.connect = </M/N.outputs:out>
+        token outputs:out
+    }}
+    def Shader "N"
+    {{
+        uniform token info:id = "ND_normalmap"
+        vector3f inputs:in.connect = </M/I.outputs:out>
+        {input}
+        vector3f outputs:out
+    }}
+    def Shader "I"
+    {{
+        uniform token info:id = "ND_image_vector3"
+        asset inputs:file = @tex.png@
+        vector3f outputs:out
+    }}
+    {tangent}
+}}"#
+        )
+    };
+    let tilted = png(16, 16, |x, y| {
+        [96 + (x * 4) as u8, 160 - (y * 4) as u8, 255, 255]
+    });
+    let run = |name: &str, body: &str| {
+        let d = dir(name);
+        std::fs::write(d.join("tex.png"), &tilted).unwrap();
+        let mut settings = UsdSettings {
+            uv1: Some("st1".into()),
+            ..UsdSettings::default()
+        };
+        settings.mesh.tangent_error_max = None;
+        let a = cook_at(&d, body, settings).unwrap_or_else(|e| panic!("{name}: {e}"));
+        corner_tangents(&a, "u/mesh")
+    };
+    assert_tangents(&run("mtlx-tworld", &stage("", "")), |at| {
+        published(at, |p| p)
+    });
+    let node = r#"def Shader "T"
+    {
+        uniform token info:id = "ND_tangent_vector3"
+        int inputs:index = 1
+        vector3f outputs:out
+    }"#;
+    let input = "vector3f inputs:tangent.connect = </M/T.outputs:out>";
+    assert_tangents(&run("mtlx-tangent", &stage(node, input)), |at| {
+        published(at, |p| p).map(|[x, y, z, w]| [-x, -y, -z, -w])
+    });
 }
 
 /// PS `normal`: "properly scaled and ready to be consumed as a tangent space normal"; the (2, -1)

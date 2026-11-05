@@ -225,6 +225,8 @@ pub(crate) fn category(id: &str) -> &str {
         "displacement",
         "tiledimage",
         "normalmap",
+        "bitangent",
+        "tangent",
         "separate2",
         "separate3",
         "separate4",
@@ -418,7 +420,11 @@ pub(crate) fn map(
     let mut m = Mapper {
         net,
         host,
-        material: Material::default(),
+        // PS `frame:stPrimvarName` and MaterialX `Tworld` both default to the first set.
+        material: Material {
+            frame_uv: Material::FRAME_UV0,
+            ..Material::default()
+        },
         textures: MaterialTextures::default(),
         warnings: Vec::new(),
     };
@@ -456,6 +462,47 @@ type Slot = fn(&mut MaterialTextures) -> &mut Option<TexRef>;
 impl Mapper<'_, '_> {
     fn node(&self, n: usize) -> &Node {
         &self.net.nodes[n]
+    }
+
+    /// The uv set of the `tangent` and `bitangent` nodes feeding `normalmap` node `map`. A
+    /// frame from anything else has no field: meshes hold one tangent per vertex.
+    fn normal_frame(&mut self, map: usize) -> Result<(), String> {
+        let mut index = None;
+        for (input, kind) in [("tangent", "tangent"), ("bitangent", "bitangent")] {
+            let Some(source) = self.source(map, input) else {
+                continue;
+            };
+            match source {
+                Input::Connect { node, .. } if self.node(*node).kind == kind => {
+                    let node = *node;
+                    let i = self.float(node, "index", 0.0)?;
+                    if index.is_some_and(|set| set != i) {
+                        let name = &self.node(map).name;
+                        self.warnings.push(format!(
+                            "{name}: its bitangent reads another uv set than its tangent, which \
+                             stands"
+                        ));
+                    }
+                    index.get_or_insert(i);
+                }
+                _ => {
+                    let name = &self.node(map).name;
+                    self.warnings.push(format!(
+                        "{name}: {input} is not a {kind} node; the mesh's own stands in for it"
+                    ));
+                }
+            }
+        }
+        match index {
+            Some(0.0) | None => {}
+            Some(1.0) => self.material.frame_uv = Material::FRAME_UV1,
+            Some(i) => {
+                let name = &self.node(map).name;
+                self.warnings
+                    .push(format!("{name}: uv set {i} is past the two a mesh holds"));
+            }
+        }
+        Ok(())
     }
 
     fn input<'n>(&'n self, n: usize, name: &str) -> Option<&'n Input> {
@@ -1211,6 +1258,7 @@ impl Mapper<'_, '_> {
                         self.node(map).name
                     ));
                 }
+                self.normal_frame(map)?;
                 let scale = self.vec2(map, "scale", Vec2::ONE)?;
                 match self.value(map, "in")? {
                     Some(Value::Texture(t)) if t.channels == Channels::Rgb => {

@@ -106,12 +106,34 @@ pub struct Material {
     pub thin_walled: u8,
     /// Linked surface id; 0 is the standard surface.
     pub surface: u8,
+    /// What the tangent frame follows: [`Self::FRAME_NORMAL_MAP`] by default.
+    pub frame_uv: u8,
+    pub _pad: [u8; 3],
     /// Indexed by the `slot` constants.
     pub textures: [TextureBinding; slot::COUNT],
     /// Per slot, the affine map from mesh uv to the uv its texture is sampled at, stored
     /// as its difference from the identity so that zero is the identity: `[a - 1, b, c, d,
     /// e - 1, f]` for `u' = a u + b v + c`, `v' = d u + e v + f`.
     pub uv_transforms: [[f32; 6]; slot::COUNT],
+}
+
+impl Material {
+    /// The tangent frame follows the uv set the normal map reads.
+    pub const FRAME_NORMAL_MAP: u8 = 0;
+    pub const FRAME_UV0: u8 = 1;
+    pub const FRAME_UV1: u8 = 2;
+    /// It follows uvs a mesh doesn't carry: only a tangent stream holds it.
+    pub const FRAME_OTHER: u8 = 3;
+    /// [`Self::tangent_set`] of [`Self::FRAME_OTHER`].
+    pub const TANGENT_SET_OTHER: u8 = 2;
+
+    /// The uv set the tangent frame follows, 0 or 1, or [`Self::TANGENT_SET_OTHER`].
+    pub fn tangent_set(&self) -> u8 {
+        match self.frame_uv {
+            Self::FRAME_NORMAL_MAP => self.textures[slot::NORMAL].uv_set & 1,
+            f => f - 1,
+        }
+    }
 }
 
 /// Texture slots. All but `NORMAL`, `EMISSION`, `SPECULAR_WEIGHT` and `DISPLACEMENT` read values
@@ -197,6 +219,8 @@ impl Default for Material {
             double_sided: 0,
             thin_walled: 0,
             surface: 0,
+            frame_uv: Self::FRAME_NORMAL_MAP,
+            _pad: [0; 3],
             textures: [TextureBinding::zeroed(); slot::COUNT],
             uv_transforms: [[0.0; 6]; slot::COUNT],
         }

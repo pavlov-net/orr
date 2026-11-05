@@ -1984,18 +1984,18 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, (String, Hash32)>) -> MapS
             uv_set: b.1,
         }),
     });
+    let frame_set = usize::from(m.tangent_set());
     let normal = match bound(slot::NORMAL) {
-        b if mesh::reads_tangent(m) => NormalSpec::Tangent {
-            uv_set: b.map_or(0, |b| b.1),
-        },
+        _ if mesh::reads_tangent(m) => NormalSpec::Tangent { frame_set },
         None => NormalSpec::None,
         Some((Some((unit, key)), uv_set)) => NormalSpec::Texture {
             unit: unit.clone(),
             key: *key,
             read: read(slot::NORMAL),
             uv_set,
+            frame_set,
         },
-        Some((None, uv_set)) => NormalSpec::Tangent { uv_set },
+        Some((None, _)) => NormalSpec::Tangent { frame_set },
     };
     MapSpec {
         opacity,
