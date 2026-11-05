@@ -2,7 +2,8 @@
 //! KTX2 and DDS through ctt's readers, block-compressed texels decoded with bcdec. KTX2 files
 //! of BCn blocks, plain or zstd-compressed, are read here instead, each level decompressed
 //! once straight into its blocks. Formats are recognized by their bytes. An animated WebP
-//! decodes to its first frame.
+//! decodes to its first frame. The spec leaves `KTXswizzle` to applications; the cook applies
+//! it, because the file states it, and a file it changes loses its blocks.
 
 use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek};
@@ -82,13 +83,73 @@ pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
     if bytes.starts_with(KTX1) {
         return Err("KTX1 images are not supported; convert them to KTX2".into());
     }
-    if let Some(k) = Ktx2Blocks::of(bytes) {
-        return k.open();
+    let mut src = match Ktx2Blocks::of(bytes) {
+        Some(k) => k.open()?,
+        None => {
+            match decode_container(bytes, InputOverrides::default()).map_err(|e| e.to_string())? {
+                Some(image) => container(image)?,
+                None => file(bytes)?,
+            }
+        }
+    };
+    if let Some(s) = ktx2_swizzle(bytes) {
+        decode_layers(&mut src)?;
+        src.blocks = None;
+        // Past the file's two channels, only what decoding fills in leaves it two.
+        src.rg &= s[2].keeps(2, 2) && s[3].keeps(3, 2);
+        for p in src.layers.iter_mut().flat_map(|l| &mut l.px) {
+            let t = *p;
+            *p = s.map(|c| match c {
+                Component::Channel(i) => t[i],
+                Component::Value(v) => v,
+            });
+        }
     }
-    match decode_container(bytes, InputOverrides::default()).map_err(|e| e.to_string())? {
-        Some(image) => container(image),
-        None => file(bytes),
+    Ok(src)
+}
+
+/// What one channel of a `KTXswizzle` mapping reads.
+#[derive(Copy, Clone, PartialEq)]
+enum Component {
+    Channel(usize),
+    Value(f32),
+}
+
+impl Component {
+    /// Whether this leaves channel `c` of a file of `held` channels as it decodes: absent channels
+    /// decode to 0, with alpha 1.
+    fn keeps(self, c: usize, held: usize) -> bool {
+        let absent = if c == 3 { 1.0 } else { 0.0 };
+        self == Self::Channel(c) || (c >= held && self == Self::Value(absent))
     }
+}
+
+/// The `KTXswizzle` of a KTX2 file, unless it leaves every channel as it decodes.
+fn ktx2_swizzle(bytes: &[u8]) -> Option<[Component; 4]> {
+    let reader = ktx2::Reader::new(bytes).ok()?;
+    let (_, value) = reader
+        .key_value_data()
+        .find(|(key, _)| *key == "KTXswizzle")?;
+    let text = value.strip_suffix(b"\0").unwrap_or(value);
+    let read = |c: u8| match c {
+        b'r' => Some(Component::Channel(0)),
+        b'g' => Some(Component::Channel(1)),
+        b'b' => Some(Component::Channel(2)),
+        b'a' => Some(Component::Channel(3)),
+        b'0' => Some(Component::Value(0.0)),
+        b'1' => Some(Component::Value(1.0)),
+        _ => None,
+    };
+    let s = match *text {
+        [r, g, b, a] => [read(r)?, read(g)?, read(b)?, read(a)?],
+        _ => return None,
+    };
+    let held = reader
+        .header()
+        .format
+        .and_then(|f| f.channel_count())
+        .unwrap_or(4);
+    (!(0..4).all(|c| s[c].keeps(c, held))).then_some(s)
 }
 
 /// What [`open`] tells of a KTX2 file of BCn blocks holding one 2D image, with the range of
@@ -106,8 +167,12 @@ pub(crate) struct Scan {
     pub(super) range: [(f32, f32); 4],
 }
 
-/// The [`Scan`] of a KTX2 file of BCn blocks; `None` for every other file.
+/// The [`Scan`] of a KTX2 file of BCn blocks that it holds as they are; `None` for every other
+/// file.
 pub(crate) fn scan_ktx2(bytes: &[u8], spread: f32) -> Option<Result<Scan, String>> {
+    if ktx2_swizzle(bytes).is_some() {
+        return None;
+    }
     Ktx2Blocks::of(bytes).map(|k| k.scan(spread))
 }
 
