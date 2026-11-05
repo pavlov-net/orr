@@ -6,10 +6,11 @@
 //! selections of [`UsdSettings::variants`] in a session layer; any composition error fails
 //! the import. Values are read at [`UsdSettings::time`]. The stage's `upAxis` and
 //! `metersPerUnit` (0.01 when unauthored, as USD's) turn stage space into scene space (Y
-//! up, meters). Inactive prims (and their subtrees) are not read, and prims under a `class` or
-//! `over` are read only as prototypes. An Imageable prim that is `invisible`, or has an
-//! effective purpose of `guide` or `proxy`, is not drawn: invisibility holds for the subtree,
-//! and a prim takes the purpose of the nearest Imageable prim at or above it that authors one.
+//! up, meters), and `metersPerUnit` is the length unit of materials. Inactive prims (and their
+//! subtrees) are not read, and prims under a `class` or `over` are read only as prototypes. An
+//! Imageable prim that is `invisible`, or has an effective purpose of `guide` or `proxy`, is not
+//! drawn: invisibility holds for the subtree, and a prim takes the purpose of the nearest
+//! Imageable prim at or above it that authors one.
 //! Instanceable prims are expanded.
 //!
 //! Models, every one in scene units and axes:
@@ -398,22 +399,30 @@ impl<'s> Importer<'s> {
 
     /// Scene space from stage space: Y up, meters.
     fn stage_to_scene(&self) -> Result<DMat4, String> {
-        let meta = |k: &str| self.stage.stage_metadata(k).map_err(|e| e.to_string());
-        let up = match meta("upAxis")? {
+        let up = self.stage.stage_metadata("upAxis");
+        let up = match up.map_err(|e| e.to_string())? {
             Some(sdf::Value::Token(t)) => t.as_str().to_string(),
             Some(sdf::Value::String(s)) => s,
             _ => "Y".into(),
         };
-        let meters = meta("metersPerUnit")?
-            .and_then(|v| read::numbers(&v))
-            .map_or(0.01, |v| v[0]);
         let axis = match up.as_str() {
             "Y" => DMat4::IDENTITY,
             // Z up: +Z becomes +Y, +Y becomes -Z.
             "Z" => DMat4::from_cols(DVec4::X, DVec4::NEG_Z, DVec4::Y, DVec4::W),
             a => return Err(format!("upAxis {a}")),
         };
-        Ok(DMat4::from_scale(DVec3::splat(meters)) * axis)
+        Ok(DMat4::from_scale(DVec3::splat(self.meters_per_unit()?)) * axis)
+    }
+
+    /// The stage's `metersPerUnit`.
+    fn meters_per_unit(&self) -> Result<f64, String> {
+        let meters = self
+            .stage
+            .stage_metadata("metersPerUnit")
+            .map_err(|e| e.to_string())?;
+        Ok(meters
+            .and_then(|v| read::numbers(&v))
+            .map_or(0.01, |v| v[0]))
     }
 
     /// Every prim worth reading, parents first, with its scene transform.
@@ -1375,6 +1384,7 @@ impl<'s> Importer<'s> {
         }
         let (mut mapped, name) = match (&prim, &shaded) {
             (Some(p), Some(s)) => {
+                let meters_per_unit = self.meters_per_unit()?;
                 let primvars: Vec<&str> = self.settings.uv_sets().collect();
                 let images = &mut self.images;
                 let image_of = &mut self.image_of;
@@ -1386,7 +1396,7 @@ impl<'s> Importer<'s> {
                     })
                 };
                 let mut host = shading::Host {
-                    meters_per_unit: 1.0,
+                    meters_per_unit,
                     primvars: &primvars,
                     reads: &reads,
                     solid: &mut solid,

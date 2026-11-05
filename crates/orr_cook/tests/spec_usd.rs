@@ -40,8 +40,17 @@ fn dir(name: &str) -> PathBuf {
 }
 
 fn cook_at(d: &std::path::Path, body: &str, settings: UsdSettings) -> orr_cook::Result<Archive> {
+    cook_stage(d, HEAD, body, settings)
+}
+
+fn cook_stage(
+    d: &std::path::Path,
+    head: &str,
+    body: &str,
+    settings: UsdSettings,
+) -> orr_cook::Result<Archive> {
     let path = d.join("stage.usda");
-    std::fs::write(&path, format!("{HEAD}\n{body}")).unwrap();
+    std::fs::write(&path, format!("{head}\n{body}")).unwrap();
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
@@ -1342,6 +1351,130 @@ fn constant_normal_and_displacement_apply() {
     assert_eq!(m.displacement_offset, 0.25);
     assert_eq!(m.displacement_scale, 0.0);
     assert_eq!((m.displacement_min, m.displacement_max), (0.25, 0.25));
+}
+
+/// `body` on a stage in centimeters, with `image` as `tex.png`.
+fn cook_centimeters(name: &str, body: &str, image: &[u8]) -> Archive {
+    let d = dir(name);
+    std::fs::write(d.join("tex.png"), image).unwrap();
+    let head = "#usda 1.0\n(\n    metersPerUnit = 0.01\n    upAxis = \"Y\"\n)\n";
+    cook_stage(&d, head, body, UsdSettings::default()).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// A triangle bound to a Material `M` of `outputs` and `prims`.
+fn mtlx_material(outputs: &str, prims: &str) -> String {
+    format!(
+        r#"def Mesh "Tri"
+{{
+    {TRIANGLE}
+    {ST}
+    rel material:binding = </M>
+}}
+
+def Material "M"
+{{
+    {outputs}
+    {prims}
+}}"#
+    )
+}
+
+fn open_pbr(inputs: &str) -> String {
+    format!(
+        r#"def Shader "S"
+    {{
+        uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+        {inputs}
+        token outputs:out
+    }}"#
+    )
+}
+
+fn near(a: f32, b: f32) -> bool {
+    (a - b).abs() <= 1e-6 * b.abs().max(1.0)
+}
+
+/// OpenPBR Metadata asks for "the floating-point conversion factor from the parameters given in
+/// world space length units to meters", which `metersPerUnit` is on a stage. OpenPBR states
+/// `thin_film_thickness` in micrometers, which no stage changes.
+#[test]
+fn open_pbr_lengths_read_in_the_stage_metric() {
+    let surface = "token outputs:mtlx:surface.connect = </M/S.outputs:out>";
+    let inputs = "float inputs:transmission_depth = 2
+        float inputs:thin_film_weight = 1
+        float inputs:thin_film_thickness = 0.5";
+    let body = mtlx_material(surface, &open_pbr(inputs));
+    let m = material(&cook_centimeters("stage-lengths", &body, &[]));
+    assert!(near(m.transmission_depth, 0.02), "{}", m.transmission_depth);
+    assert_eq!(m.thin_film_thickness, 500.0);
+    // The nodedef's default radius of 1 is a length like any other.
+    assert!(near(m.subsurface_radius, 0.01), "{}", m.subsurface_radius);
+
+    let body = mtlx_material(surface, &open_pbr("float inputs:subsurface_radius = 3"));
+    let m = material(&cook_centimeters("stage-radius", &body, &[]));
+    assert!(near(m.subsurface_radius, 0.03), "{}", m.subsurface_radius);
+}
+
+/// PS `displacement` under the `metrics.h` metric: Storm's `displacementShader` adds
+/// `Neye * displacement` to the eye space point, so the input is a world space length in stage
+/// units. The range the cook measures and declares follows the converted scale and offset.
+#[test]
+fn displacement_reads_in_the_stage_metric() {
+    let a = cook_centimeters(
+        "stage-constant-displacement",
+        &previewed("float inputs:displacement = 25", "", ""),
+        &[],
+    );
+    let m = material(&a);
+    assert!(near(m.displacement_offset, 0.25), "{m:?}");
+    assert!(near(m.displacement_min, 0.25) && near(m.displacement_max, 0.25));
+
+    let gradient = png(4, 1, |x, _| {
+        let v = [0, 85, 170, 255][x as usize];
+        [v, v, v, 255]
+    });
+    let remap = "float4 inputs:scale = (40, 40, 40, 1)
+        float4 inputs:bias = (-10, -10, -10, 0)";
+    let body = previewed(
+        "float inputs:displacement.connect = </M/T.outputs:r>",
+        &format!("{}\n{READER}", texture("T", remap)),
+        ST,
+    );
+    let m = material(&cook_centimeters("stage-displacement", &body, &gradient));
+    assert!(near(m.displacement_scale, 0.4), "{m:?}");
+    assert!(near(m.displacement_offset, -0.1), "{m:?}");
+    assert!(
+        near(m.displacement_min, -0.1) && near(m.displacement_max, 0.3),
+        "{m:?}"
+    );
+
+    let remap = "float4 inputs:scale = (2, 2, 2, 1)
+        float4 inputs:bias = (1, 1, 1, 0)";
+    let body = mtlx_material(
+        "token outputs:mtlx:surface.connect = </M/S.outputs:out>
+    token outputs:mtlx:displacement.connect = </M/D.outputs:out>",
+        &format!(
+            r#"{}
+    def Shader "D"
+    {{
+        uniform token info:id = "ND_displacement_float"
+        float inputs:displacement.connect = </M/T.outputs:r>
+        float inputs:scale = 10
+        token outputs:out
+    }}
+    {}
+    {READER}"#,
+            open_pbr(""),
+            texture("T", remap),
+        ),
+    );
+    let m = material(&cook_centimeters(
+        "stage-mtlx-displacement",
+        &body,
+        &gradient,
+    ));
+    assert!(near(m.displacement_scale, 0.2), "{m:?}");
+    assert!(near(m.displacement_offset, 0.1), "{m:?}");
 }
 
 /// Where a slot's uv transform sends mesh uv `p`.
