@@ -273,7 +273,8 @@ fn float_part_attributes_round_to_parts() {
 }
 
 /// A grid skinned to two joints by x band, `base` and its child `limb`; vertex `blend`
-/// splits its weight between them.
+/// splits its weight between them. A third joint, which no vertex follows, has an inverse
+/// bind without an inverse.
 fn rigid_skin(path: &Path, blend: Option<usize>) -> (Vec<u32>, Vec<usize>) {
     let (pos, _, idx) = grid(8, |_, _| 0.0);
     let joint: Vec<usize> = pos.iter().map(|p| usize::from(p[0] > 0.5)).collect();
@@ -286,7 +287,8 @@ fn rigid_skin(path: &Path, blend: Option<usize>) -> (Vec<u32>, Vec<usize>) {
         .collect();
     let ib =
         |t: [f32; 3]| orr_math::Mat4::from_translation(-orr_math::Vec3::from(t)).to_cols_array();
-    let binds = [ib([0.0, 0.0, 0.25]), ib([0.5, 0.0, 0.0])];
+    let flat = orr_math::Mat4::from_scale(orr_math::Vec3::ZERO).to_cols_array();
+    let binds = [ib([0.0, 0.0, 0.25]), ib([0.5, 0.0, 0.0]), flat];
     let mut g = Glb::default();
     let pa = g.floats(&pos, "VEC3");
     let jv = g.view(bytemuck::cast_slice(&joints), None);
@@ -297,10 +299,10 @@ fn rigid_skin(path: &Path, blend: Option<usize>) -> (Vec<u32>, Vec<usize>) {
     g.write(
         path,
         &format!(
-            r#""scene":0,"scenes":[{{"nodes":[0,2]}}],
+            r#""scene":0,"scenes":[{{"nodes":[0,2,3]}}],
 "nodes":[{{"name":"base","translation":[0,0,0.25],"children":[1]}},
-{{"name":"limb","translation":[0.5,0,-0.25]}},{{"mesh":0,"skin":0}}],
-"skins":[{{"joints":[0,1],"inverseBindMatrices":{ba}}}],
+{{"name":"limb","translation":[0.5,0,-0.25]}},{{"mesh":0,"skin":0}},{{"name":"spare"}}],
+"skins":[{{"joints":[0,1,3],"inverseBindMatrices":{ba}}}],
 "meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}},"indices":{ia}}}]}}]"#
         ),
     );
@@ -320,7 +322,10 @@ fn single_joint_skins_cook_as_rigid_parts() {
     let m = mesh_of(&a, "g/mesh", 0);
     assert_eq!(m.info.header.attributes & mesh::MeshHeader::SKIN, 0);
     let pivots: Vec<_> = m.info.parts.iter().map(|p| (p.pivot, p.joint)).collect();
-    assert_eq!(pivots, [([0.0, 0.0, 0.25], 0), ([0.5, 0.0, 0.0], 1)]);
+    assert_eq!(
+        pivots,
+        [([0.0, 0.0, 0.25], 0), ([0.5, 0.0, 0.0], 1), ([0.0; 3], 2)]
+    );
     let mut cooked = [0u32; 2];
     for (c, ..) in &m.clusters {
         cooked[usize::from(c.part)] += u32::from(c.tri_count);
@@ -1364,30 +1369,252 @@ fn a_texture_on_texcoord_1_binds_uv_set_1_and_the_mesh_stores_it() {
     }
 }
 
-/// A flattened node keeps its surface, and a node scaled to nothing leaves the others to cook.
-#[test]
-fn a_flattened_node_keeps_its_surface() {
-    let d = dir("gltf-zero-scale");
+/// A GLB whose mesh 0 is one triangle facing -z, with these nodes and scene roots.
+fn triangle_nodes(path: &Path, roots: &str, nodes: &str) {
+    triangle_facing(path, [0.0, 0.0, -1.0], roots, nodes);
+}
+
+fn triangle_facing(path: &Path, normal: [f32; 3], roots: &str, nodes: &str) {
     let mut g = Glb::default();
-    let pa = g.floats(
-        &[[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-        "VEC3",
-    );
-    let na = g.floats(&[[0.0f32, 0.0, 1.0]; 3], "VEC3");
-    let path = d.join("scaled.glb");
+    let pa = g.floats(&TRIANGLE, "VEC3");
+    let na = g.floats(&[normal; 3], "VEC3");
     g.write(
-        &path,
+        path,
         &format!(
-            r#""scene":0,"scenes":[{{"nodes":[0,1]}}],
-"nodes":[{{"mesh":0,"scale":[0,0,0]}},{{"mesh":0,"scale":[2,2,0]}}],
+            r#""scene":0,"scenes":[{{"nodes":{roots}}}],"nodes":{nodes},
 "meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"NORMAL":{na}}}}}]}}]"#
         ),
     );
+}
+
+const TRIANGLE: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 1.0]];
+
+fn corners(c: &Cooked) -> Vec<orr_math::Vec3> {
+    let tris = c.clusters.iter().flat_map(|c| c.2.iter());
+    tris.flatten().map(|&p| p.into()).collect()
+}
+
+/// Asserts `c` holds a triangle's worth of corners at `want`.
+fn assert_corners(c: &Cooked, want: impl IntoIterator<Item = orr_math::Vec3>) {
+    let got = corners(c);
+    for w in want {
+        assert!(
+            got.iter().any(|g| g.abs_diff_eq(w, 1e-3)),
+            "{w} not among {got:?}"
+        );
+    }
+}
+
+fn assert_normal(c: &Cooked, want: orr_math::Vec3) {
+    let mut got = c.clusters.iter().flat_map(|c| c.3.iter());
+    assert!(
+        got.any(|&n| orr_math::Vec3::from(n).abs_diff_eq(want, 0.01)),
+        "{want} not among the normals"
+    );
+}
+
+/// A flattened node keeps its surface, and a node scaled to nothing leaves the others to cook.
+#[test]
+fn a_flattened_node_keeps_its_surface() {
+    use orr_math::{Mat3, Vec3};
+    let d = dir("gltf-zero-scale");
+    let path = d.join("scaled.glb");
+    let m = [
+        -1.0f32, 0.5, 0.0, 0.0, 0.0, 1.0, 0.25, 0.0, 0.75, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    triangle_nodes(
+        &path,
+        "[0,1,2]",
+        &format!(
+            r#"[{{"mesh":0,"scale":[0,0,0]}},{{"mesh":0,"scale":[2,2,0]}},{{"mesh":0,"matrix":{m:?}}}]"#
+        ),
+    );
     let (a, _) = cook(&path, GltfSettings::default()).unwrap();
-    let triangles = triangle_set(&mesh_of(&a, "g/mesh", 0));
-    let two = 2.0f32.to_bits();
-    let flat = [[0, 0, 0], [two, 0, 0], [0, two, 0]];
-    assert!(triangles.contains(&flat), "{triangles:?}");
+    let c = mesh_of(&a, "g/mesh", 0);
+    assert_corners(&c, [Vec3::ZERO, Vec3::X * 2.0, Vec3::Y * 2.0]);
+    assert_normal(&c, Vec3::NEG_Z);
+    let linear = Mat3::from_mat4(orr_math::Mat4::from_cols_array(&m));
+    assert_normal(&c, (linear.inverse().transpose() * Vec3::NEG_Z).normalize());
+}
+
+/// A collapsed transform cannot be a placement, whose inverse the renderer needs, so each one
+/// bakes its surface.
+#[test]
+fn meshes_layout_bakes_collapsed_nodes() {
+    use orr_math::Vec3;
+    let d = dir("gltf-meshes-collapsed");
+    let path = d.join("scene.glb");
+    triangle_nodes(
+        &path,
+        "[0,1,2]",
+        r#"[{"mesh":0,"scale":[2,2,0],"translation":[1,0,0]},
+{"mesh":0,"matrix":[1,0,0,0, 0,1,0,0, 1,1,0,0, 0,0,3,1]},
+{"mesh":0,"scale":[0,0,0]}]"#,
+    );
+    let settings = GltfSettings {
+        layout: GltfLayout::Meshes,
+        ..GltfSettings::default()
+    };
+    let (a, _) = cook(&path, settings).unwrap();
+    assert!(a.find(AssetId::from_name("g/mesh/0/mesh")).is_none());
+    let flat = mesh_of(&a, "g/mesh/0/baked/0/mesh", 0);
+    assert_corners(&flat, [Vec3::ZERO, Vec3::X * 2.0, Vec3::Y * 2.0]);
+    assert_normal(&flat, Vec3::NEG_Z);
+    let at = |model, t: Vec3| {
+        let got = placements(&a, model);
+        assert_eq!(got.len(), 1);
+        let want = orr_math::Mat4::from_translation(t);
+        assert!(got[0].abs_diff_eq(want, 0.01), "{model}: {:?}", got[0]);
+    };
+    at("g/mesh/0/baked/0", Vec3::X);
+    let sheared = mesh_of(&a, "g/mesh/0/baked/1/mesh", 0);
+    assert_corners(&sheared, [Vec3::ZERO, Vec3::X, Vec3::new(1.0, 2.0, 0.0)]);
+    assert_normal(&sheared, Vec3::NEG_Z);
+    at("g/mesh/0/baked/1", Vec3::Z * 3.0);
+    at("g/mesh/0/baked/2", Vec3::ZERO);
+}
+
+/// A selected model is in its node's space, which its node's own transform and those above it
+/// do not enter, however they flatten.
+#[test]
+fn a_selected_model_needs_no_inverse_of_its_node() {
+    use orr_math::Vec3;
+    let d = dir("gltf-selected-flat");
+    let path = d.join("scene.glb");
+    triangle_nodes(
+        &path,
+        "[0,2]",
+        r#"[{"scale":[2,2,0],"children":[1]},{"name":"under","mesh":0},
+{"name":"on","scale":[0,0,0],"mesh":0,"children":[3]},{"mesh":0,"scale":[3,3,3]}]"#,
+    );
+    let select = |node: &str| NodeSelect { node: node.into() };
+    let settings = GltfSettings {
+        models: vec![select("under"), select("on")],
+        ..GltfSettings::default()
+    };
+    let (a, _) = cook(&path, settings).unwrap();
+    let source = TRIANGLE.map(Vec3::from);
+    assert_corners(&mesh_of(&a, "g/under/mesh", 0), source);
+    let on = mesh_of(&a, "g/on/mesh", 0);
+    assert_corners(&on, source);
+    assert_corners(&on, source.map(|p| p * 3.0));
+}
+
+/// Rigid meshes on a named joint and on an ancestor no skin names, both flattened at rest:
+/// the skeleton's matrices take their bind-space vertices to where the nodes put them.
+#[test]
+fn rigid_meshes_follow_joints_with_a_flattened_rest_pose() {
+    use orr_math::{Mat4, Quat, Vec3};
+    let d = dir("gltf-skin-flat");
+    let path = d.join("scene.glb");
+    let mut g = Glb::default();
+    let pa = g.floats(&TRIANGLE, "VEC3");
+    let jv = g.view(bytemuck::cast_slice(&[[0u8; 4]; 3]), None);
+    let ja = g.accessor(jv, 5121, 3, "VEC4", "");
+    let wa = g.floats(&[[1.0f32, 0.0, 0.0, 0.0]; 3], "VEC4");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,4]}}],
+"nodes":[{{"name":"root","matrix":[2,0,0,0, 0,2,0,0, 0,0,0,0, 0,0,0,1],"children":[1,3]}},
+{{"name":"hip","translation":[1,0,0],"children":[2]}},
+{{"mesh":0,"translation":[0,1,0]}},{{"mesh":0,"translation":[0,0,5]}},
+{{"mesh":1,"skin":0}}],
+"skins":[{{"joints":[1]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}}}}]}},
+{{"primitives":[{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}}}}]}}]"#
+        ),
+    );
+    let (a, _) = cook(&path, GltfSettings::default()).unwrap();
+    let e = a.find(AssetId::from_name("g/skeleton")).unwrap();
+    let sk = orr_pack::skeleton::SkeletonInfo::parse(&read(&a, &a.blobs(e)[0])).unwrap();
+    assert_eq!(sk.names, ["root", "hip"]);
+    let local = |j: usize| {
+        let r = &sk.rest[j];
+        Mat4::from_scale_rotation_translation(
+            r.scale.into(),
+            Quat::from_array(r.rotation),
+            r.translation.into(),
+        )
+    };
+    let skinning = |world: Mat4, j: usize| world * Mat4::from(sk.inverse_binds[j]);
+    let root = skinning(local(0), 0);
+    let hip = skinning(local(0) * local(1), 1);
+    let t = Mat4::from_translation;
+    let scene = Mat4::from_scale(Vec3::new(2.0, 2.0, 0.0));
+    let c = mesh_of(&a, "g/mesh", 0);
+    let got = corners(&c);
+    for (skin, world) in [
+        (hip, scene * t(Vec3::X) * t(Vec3::Y)),
+        (root, scene * t(Vec3::Z * 5.0)),
+    ] {
+        for p in TRIANGLE.map(Vec3::from) {
+            let want = world.transform_point3(p);
+            assert!(
+                got.iter()
+                    .any(|&b| skin.transform_point3(b).abs_diff_eq(want, 1e-3)),
+                "{want} not reached from {got:?}"
+            );
+        }
+    }
+}
+
+/// `1e39` is past f32: the transform is what is wrong, not a rotation.
+#[test]
+fn a_transform_past_f32_says_so() {
+    let d = dir("gltf-non-finite");
+    let path = d.join("scene.glb");
+    triangle_nodes(&path, "[0]", r#"[{"mesh":0,"scale":[1e39,1,1]}]"#);
+    let settings = GltfSettings {
+        layout: GltfLayout::Meshes,
+        ..GltfSettings::default()
+    };
+    let e = cook(&path, settings).err().unwrap().to_string();
+    assert!(e.contains("transform") && e.contains("not finite"), "{e}");
+}
+
+/// Rotations either side of a flattening scale leave a determinant of pure rounding, whose
+/// sign f32 and f64 can disagree on. The winding and the normals have to take the same one.
+#[test]
+fn winding_and_normals_agree_on_flat_products() {
+    use orr_math::{Quat, Vec3};
+    let d = dir("gltf-flat-products");
+    let path = d.join("scene.glb");
+    let count = 16;
+    let (outer, inner) = (
+        Vec3::new(1.0, 2.0, 3.0).normalize(),
+        Vec3::new(3.0, -1.0, 2.0).normalize(),
+    );
+    let nodes: Vec<String> = (0..count)
+        .map(|i| {
+            let angle = i as f32 * 0.4 + 0.1;
+            let a = Quat::from_axis_angle(outer, angle).to_array();
+            let b = Quat::from_axis_angle(inner, angle * 0.1).to_array();
+            let child = 2 * i + 1;
+            format!(
+                r#"{{"rotation":{a:?},"scale":[2,2,0],"children":[{child}]}},{{"mesh":0,"rotation":{b:?}}}"#
+            )
+        })
+        .collect();
+    let roots: Vec<usize> = (0..count).map(|i| 2 * i).collect();
+    let [p, q, r] = TRIANGLE.map(Vec3::from);
+    triangle_facing(
+        &path,
+        (q - p).cross(r - p).normalize().to_array(),
+        &format!("{roots:?}"),
+        &format!("[{}]", nodes.join(",")),
+    );
+    let settings = GltfSettings {
+        layout: GltfLayout::Meshes,
+        ..GltfSettings::default()
+    };
+    let (a, _) = cook(&path, settings).unwrap();
+    for k in 0..count {
+        let c = mesh_of(&a, &format!("g/mesh/0/baked/{k}/mesh"), 0);
+        let [p, q, r] = c.clusters[0].2[0].map(Vec3::from);
+        let normal = Vec3::from(c.clusters[0].3[0]);
+        assert!((q - p).cross(r - p).dot(normal) > 0.0, "product {k}");
+    }
 }
 
 /// A primitive without the uv set its material reads fails in either layout, even when

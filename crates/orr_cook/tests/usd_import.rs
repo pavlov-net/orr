@@ -504,6 +504,151 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
     );
 }
 
+/// A prototype at the stage root has no parent to frame it, and scene space is that frame:
+/// the stage's units and axes must enter once. Z up in centimeters shows them.
+#[test]
+fn a_prototype_at_the_stage_root_lands_where_the_stage_says() {
+    use orr_math::{IVec3, Mat4, Vec3};
+    let d = dir("usd-root-prototype");
+    let path = d.join("stage.usda");
+    std::fs::write(
+        &path,
+        r#"#usda 1.0
+(
+    metersPerUnit = 0.01
+    upAxis = "Z"
+)
+
+def Mesh "Proto"
+{
+    double3 xformOp:translate = (100, 0, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+    int[] faceVertexCounts = [3]
+    int[] faceVertexIndices = [0, 1, 2]
+    point3f[] points = [(0, 0, 0), (100, 0, 0), (0, 100, 0)]
+    uniform token subdivisionScheme = "none"
+}
+
+def Xform "World"
+{
+    double3 xformOp:translate = (0, 200, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+
+    def PointInstancer "Copies"
+    {
+        rel prototypes = [</Proto>]
+        int[] protoIndices = [0]
+        point3f[] positions = [(0, 0, 300)]
+    }
+}
+"#,
+    )
+    .unwrap();
+    let (a, _) = usd(&path, UsdSettings::default()).unwrap();
+    let page = a
+        .entries()
+        .iter()
+        .find(|e| e.class == Class::InstancePage as u16)
+        .unwrap();
+    let bytes = |i: usize| {
+        let b = &a.blobs(page)[i];
+        let mut v = vec![0; b.raw_len as usize];
+        a.read(b, &mut v).unwrap();
+        v
+    };
+    let (head, body) = (bytes(0), bytes(1));
+    let (cell, mut records) = orr_pack::instance::decode(&head, &body).unwrap();
+    let mut placed = records.next().unwrap().1;
+    placed.translation += IVec3::from(cell).as_vec3() * 256.0;
+    let placed = Mat4::from(placed);
+    let corners = triangles(&a, "u/Proto/mesh").1[0].0;
+    for p in [Vec3::ZERO, Vec3::X * 100.0, Vec3::Y * 100.0] {
+        // Stage offsets of the mesh, the instancer's parent and the copy; then meters, Y up.
+        let s = (p + Vec3::new(100.0, 200.0, 300.0)) / 100.0;
+        let want = Vec3::new(s.x, s.z, -s.y);
+        assert!(
+            corners
+                .iter()
+                .any(|&c| placed.transform_point3(c.into()).abs_diff_eq(want, 1e-3)),
+            "{want} not reached"
+        );
+    }
+}
+
+/// Copies an instance transform cannot hold bake their surface, whether the instancer's
+/// scales or the instancer itself flatten them, and keep the surface's normal.
+#[test]
+fn an_instancer_bakes_collapsed_copies() {
+    let d = dir("usd-collapsed");
+    let path = d.join("stage.usda");
+    let tile = |name: &str| {
+        format!(
+            r#"def Scope "Protos"
+        {{
+            def Mesh "{name}"
+            {{
+                int[] faceVertexCounts = [3]
+                int[] faceVertexIndices = [0, 1, 2]
+                point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 1)]
+                normal3f[] normals = [(0, 0, -1), (0, 0, -1), (0, 0, -1)] (interpolation = "vertex")
+                uniform token subdivisionScheme = "none"
+            }}
+        }}"#
+        )
+    };
+    let (a, b) = (tile("Kept"), tile("Flat"));
+    std::fs::write(
+        &path,
+        format!(
+            r#"#usda 1.0
+(
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{{
+    def PointInstancer "Scaled"
+    {{
+        rel prototypes = [</World/Scaled/Protos/Kept>]
+        int[] protoIndices = [0, 0, 0]
+        point3f[] positions = [(0, 0, 0), (1, 0, 0), (2, 0, 0)]
+        float3[] scales = [(1, 1, 1), (2, 2, 0), (0, 0, 0)]
+        {a}
+    }}
+
+    def PointInstancer "Squashed"
+    {{
+        double3 xformOp:scale = (2, 2, 0)
+        uniform token[] xformOpOrder = ["xformOp:scale"]
+        rel prototypes = [</World/Squashed/Protos/Flat>]
+        int[] protoIndices = [0]
+        point3f[] positions = [(0, 0, 0)]
+        {b}
+    }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let (a, _) = usd(&path, UsdSettings::default()).unwrap();
+    assert!(a.find(AssetId::from_name("u/Kept/mesh")).is_some());
+    assert!(a.find(AssetId::from_name("u/Kept/baked/1/mesh")).is_some());
+    assert!(a.find(AssetId::from_name("u/Flat/mesh")).is_none());
+    let two = 2.0f32.to_bits();
+    let flat = [[0, 0, 0], [two, 0, 0], [0, two, 0]];
+    for mesh in ["u/Kept/baked/0/mesh", "u/Flat/baked/0/mesh"] {
+        assert_eq!(triangle_set(&a, mesh), [flat], "{mesh}");
+        let info = MeshInfo::parse(&blob(&a, mesh, 0)).unwrap();
+        let p = &info.pages[0];
+        let mut page = vec![0; p.resident_len as usize];
+        orr_pack::mesh::decode_page(&blob(&a, mesh, p.blob as usize), &mut page).unwrap();
+        let view = PageView::new(&page, &info.header).unwrap();
+        let n = view.normal(&view.cluster(0), 0);
+        assert!(n[2] < -0.99, "{mesh}: {n:?}");
+    }
+}
+
 /// One tree written as glTF and as USD: a square trunk of four quads and two crossed leaf
 /// cards, a bark material with a normal map and an alpha-tested leaf material.
 fn tree_pair(d: &Path) -> (PathBuf, PathBuf) {

@@ -12,8 +12,8 @@
 //! - with [`GltfLayout::Meshes`], instead of all three, `N/mesh/<i>` and `N/mesh/<i>/mesh`
 //!   per glTF mesh the scene places, in the mesh's space, placed by instance pages
 //!   `N/instances/...`,
-//! - `N/<model>/baked/<k>` and its mesh for the copies of a model whose transform shears
-//!   ([`SHEAR_MAX`]), with the transform applied,
+//! - `N/<model>/baked/<k>` and its mesh for the copies of a model whose transform collapses
+//!   an axis or shears ([`SHEAR_MAX`]), with the transform applied,
 //! - `N/skeleton`, with skins: their joints and the joints' ancestors,
 //! - `N/clip/<animation>`: each animation that moves the skeleton, resampled at
 //!   [`ClipSettings`]; an animation without a unique name that is not all digits is

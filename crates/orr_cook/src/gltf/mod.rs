@@ -27,9 +27,10 @@
 //! mix with skins.
 //!
 //! A placement keeps rotation, per-axis scale and translation; a mirroring transform is a
-//! negative scale, and a transform that collapses an axis places nothing. A transform that shears further than [`crate::SHEAR_MAX`] is not a placement:
-//! the mesh is cooked once per such linear transform with it applied, as model
-//! `<model>/baked/<k>`, placed by translation alone.
+//! negative scale. A transform that collapses an axis or shears further than
+//! [`crate::SHEAR_MAX`] is not a placement: the mesh is cooked once per such linear transform
+//! with it applied, as model `<model>/baked/<k>`, placed by translation alone. A node scaled
+//! to zero on every axis cooks like any other, as a surface of no area.
 //!
 //! Rigid parts come from the custom vertex attribute `PartAttribute::name` (integer, or
 //! float rounded to the nearest integer; 0 where a primitive lacks it). With skins the
@@ -51,7 +52,7 @@
 pub(crate) mod data;
 mod material;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -64,7 +65,7 @@ use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::import::{
-    Decomposed, Placed, Scene, SceneMaterial, SceneModel, SceneSkeleton, placement,
+    Placed, Scene, SceneMaterial, SceneModel, SceneSkeleton, normal_matrix, placements,
 };
 use crate::mesh::{
     self, LazyMesh, MeshData, MeshSettings, MeshSource, PartData, Pivots, SectionData, Skin,
@@ -113,8 +114,6 @@ enum Binding<'a> {
 /// One model being assembled: its vertices and triangles per glTF material.
 struct Building {
     node: Option<usize>,
-    /// Model space from scene space.
-    from_scene: Mat4,
     v: Vertices,
     tangents: bool,
     /// A primitive has TEXCOORD_1.
@@ -125,10 +124,9 @@ struct Building {
 }
 
 impl Building {
-    fn new(node: Option<usize>, from_scene: Mat4, parts: usize) -> Self {
+    fn new(node: Option<usize>, parts: usize) -> Self {
         Self {
             node,
-            from_scene,
             v: Vertices::default(),
             tangents: true,
             uv1: false,
@@ -234,11 +232,10 @@ fn append_primitive(
         return Err(format!("mode {:?} is not triangles", prim.mode()));
     }
     let linear = Mat3::from_mat4(world);
-    let flip = linear.determinant() < 0.0;
-    // The inverse transpose up to scale, which still exists where `world` flattens an axis.
-    let [x, y, z] = [linear.x_axis, linear.y_axis, linear.z_axis];
-    let normal_m =
-        Mat3::from_cols(y.cross(z), z.cross(x), x.cross(y)) * if flip { -1.0 } else { 1.0 };
+    // In f64 as `normal_matrix` takes it: where `world` flattens, the sign is rounding, and
+    // the winding and the normals have to agree on it.
+    let flip = linear.as_dmat3().determinant() < 0.0;
+    let normal_m = normal_matrix(linear.as_dmat3()).as_mat3();
     let position = prim.get(&Semantic::Positions).ok_or("no positions")?;
     let n = position.count();
     let counted = |a: &gltf::Accessor<'_>, k| {
@@ -707,29 +704,8 @@ impl Imported<'_> {
         weights: &[f32],
         transforms: &[Mat4],
     ) -> Result<()> {
-        let mut direct = Vec::new();
-        let mut baked: Vec<(Mat4, Vec<Placed>)> = Vec::new();
-        let mut baked_of: HashMap<[u32; 16], usize> = HashMap::new();
-        for m in transforms {
-            match placement(*m) {
-                Decomposed::Placed(p) => direct.push(p),
-                Decomposed::Nothing => {}
-                Decomposed::Sheared => {
-                    let linear = Mat4::from_mat3(Mat3::from_mat4(*m));
-                    let k = *baked_of
-                        .entry(linear.to_cols_array().map(f32::to_bits))
-                        .or_insert_with(|| {
-                            baked.push((linear, Vec::new()));
-                            baked.len() - 1
-                        });
-                    baked[k].1.push(Placed {
-                        position: m.w_axis.truncate().as_dvec3(),
-                        rotation: orr_math::Quat::IDENTITY,
-                        scale: Vec3::ONE,
-                    });
-                }
-            }
-        }
+        let (direct, baked) =
+            placements(transforms).map_err(|m| self.fail(format!("model {name}: {m}")))?;
         if !direct.is_empty() {
             self.lazy_model(name, mesh, weights, Mat4::IDENTITY)?;
             self.instances.push((name.to_string(), direct));
@@ -834,7 +810,7 @@ impl Imported<'_> {
                 rigid: false,
             };
             let count = parts.as_ref().map_or(0, |p| usize::from(p.parts));
-            let mut b = Building::new(None, Mat4::IDENTITY, count);
+            let mut b = Building::new(None, count);
             let gm = src.doc.meshes().nth(mesh).expect("mesh index");
             for prim in gm.primitives() {
                 append_primitive(&data, &prim, linear, &weights, None, &cx, &mut b).map_err(
@@ -1115,7 +1091,12 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
             continue;
         };
         let (world, binding) = match (&skeleton, node.skin()) {
-            (None, _) => (models[m].from_scene * graph.world[n], None),
+            (None, _) => (
+                models[m]
+                    .node
+                    .map_or(graph.world[n], |model| graph.relative(model, n)),
+                None,
+            ),
             (Some(sk), Some(s)) => (
                 Mat4::IDENTITY,
                 Some(Binding::Skin(sk.skin_joints(s.index()))),
@@ -1247,13 +1228,13 @@ fn select_models(
         .parts_from_attribute
         .as_ref()
         .map_or(0, |p| usize::from(p.parts));
-    let building = |node, from_scene| Building::new(node, from_scene, parts);
+    let building = |node| Building::new(node, parts);
     let mut owner: Vec<Option<usize>> = vec![None; graph.parent.len()];
     if settings.models.is_empty() {
         for &i in shown {
             owner[i] = Some(0);
         }
-        return Ok((vec![building(None, Mat4::IDENTITY)], owner));
+        return Ok((vec![building(None)], owner));
     }
     let mut models = Vec::new();
     let mut names: Vec<&str> = Vec::new();
@@ -1279,7 +1260,7 @@ fn select_models(
         }
         names.push(name);
         owner[i] = Some(models.len());
-        models.push(building(Some(i), graph.world[i].inverse()));
+        models.push(building(Some(i)));
     }
     if let Some(s) = matched.iter().position(|m| !m) {
         let pattern = settings.models[s].node.as_str();

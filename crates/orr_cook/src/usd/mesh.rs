@@ -10,6 +10,7 @@ use orr_math::{Affine2, DMat3, DMat4, DVec3, Vec2};
 use orr_pack::subd::Influence as SkinInfluence;
 
 use super::read::{Interp, PrimReader, Primvar};
+use crate::import::normal_matrix;
 use crate::subd::{Boundary, CageInput, Corner, Crease, FaceVarying, UvLinear};
 
 /// The authored topology and attributes of one mesh prim.
@@ -220,7 +221,7 @@ impl Welder {
     ) -> Result<(), String> {
         let linear = DMat3::from_mat4(at.transform);
         let flip = (linear.determinant() < 0.0) != mesh.left_handed;
-        let normal_m = linear.inverse().transpose();
+        let normal_m = normal_matrix(linear);
         let smooth = match &mesh.normals {
             Some(_) => Vec::new(),
             None => smooth_normals(mesh),

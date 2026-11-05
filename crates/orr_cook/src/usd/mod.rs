@@ -20,7 +20,10 @@
 //!   the root prim's parent, so the root's own transform is part of the model. The
 //!   instancer's `positions`, `orientations`, `scales` and `protoIndices` place it (records
 //!   whose `ids` are in `invisibleIds` are dropped) as [`crate::import::Scene::instances`].
-//!   Prims under an instancer are cooked only as its prototypes.
+//!   Prims under an instancer are cooked only as its prototypes. A transform that collapses
+//!   an axis or shears further than [`crate::SHEAR_MAX`] is not a placement: the prototype
+//!   is cooked once per such linear transform with it applied, as model `<model>/baked/<k>`,
+//!   placed by translation alone.
 //! - Without [`UsdSettings::models`], the rest of the stage is one model, in scene space.
 //!   With it, each prim whose name contains a pattern (and has no selected ancestor) is a
 //!   model holding its subtree, framed by the prim; meshes outside every model are not
@@ -43,17 +46,17 @@ mod shade;
 mod skel;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 
 use openusd::{sdf, usd};
-use orr_math::{Affine2, DMat4, DQuat, DVec3, DVec4, Mat4};
+use orr_math::{Affine2, DMat3, DMat4, DQuat, DVec3, DVec4, Mat4};
 use serde::Deserialize;
 
 use crate::import::SceneSubd;
 use crate::import::{
-    Decomposed, NodeSelect, Scene, SceneMaterial, SceneModel, SceneSkeleton, placement,
+    NodeSelect, Placed, Scene, SceneMaterial, SceneModel, SceneSkeleton, collapses, placements,
 };
 use crate::mesh::{MeshData, MeshSettings, MeshSource, SectionData, Skin};
 use crate::patch::{self, MaterialPatch, MeshPatch};
@@ -140,6 +143,10 @@ struct Node {
     end: usize,
     /// Scene space (Y up, meters) from the prim's space.
     world: DMat4,
+    /// The prim's own transform.
+    local: DMat4,
+    /// `local` starts from the stage, not the parent.
+    reset: bool,
     ty: String,
     name: String,
     /// Under a `PointInstancer`, which cooks it only as a prototype.
@@ -152,8 +159,8 @@ struct Node {
 /// One model being assembled.
 struct Building {
     name: Option<String>,
-    /// Model space from scene space.
-    from_scene: DMat4,
+    /// The node that frames the model, in scene units and axes; scene space without one.
+    frame: Option<usize>,
     /// Holds skinned meshes, in bind space.
     skinned: bool,
     /// The node of the prim a skeletal root model holds.
@@ -161,6 +168,20 @@ struct Building {
     skeleton: Option<usize>,
     welder: Welder,
     cage: CageBuilder,
+}
+
+impl Building {
+    fn new(name: Option<String>, frame: Option<usize>, root: Option<usize>) -> Self {
+        Self {
+            name,
+            frame,
+            skinned: root.is_some(),
+            root,
+            skeleton: None,
+            welder: Welder::default(),
+            cage: CageBuilder::default(),
+        }
+    }
 }
 
 pub(crate) fn import(asset: &str, path: &Path, settings: &UsdSettings) -> Result<Scene> {
@@ -310,6 +331,8 @@ impl<'s> Importer<'s> {
                 parent,
                 end: i + 1,
                 world,
+                local,
+                reset,
                 ty,
                 name,
                 instanced,
@@ -334,19 +357,10 @@ impl<'s> Importer<'s> {
         let n = self.nodes.len();
         let mut models: Vec<Building> = Vec::new();
         let mut owner: Vec<Option<usize>> = vec![None; n];
-        let new_model =
-            |models: &mut Vec<Building>, node: &Node, from_scene, root: Option<usize>| {
-                models.push(Building {
-                    name: Some(node.name.clone()),
-                    from_scene,
-                    skinned: root.is_some(),
-                    root,
-                    skeleton: None,
-                    welder: Welder::default(),
-                    cage: CageBuilder::default(),
-                });
-                models.len() - 1
-            };
+        let new_model = |models: &mut Vec<Building>, node: &Node, frame, root: Option<usize>| {
+            models.push(Building::new(Some(node.name.clone()), frame, root));
+            models.len() - 1
+        };
 
         // Skeletal roots hold their skinned meshes, in bind space.
         for i in 0..n {
@@ -354,7 +368,7 @@ impl<'s> Importer<'s> {
             if node.ty != "SkelRoot" || owner[i].is_some() || node.instanced {
                 continue;
             }
-            let m = new_model(&mut models, node, DMat4::IDENTITY, Some(i));
+            let m = new_model(&mut models, node, None, Some(i));
             for k in self.subtree(i) {
                 if owner[k].is_none() && self.nodes[k].ty == "Mesh" && self.skinned(k) {
                     owner[k] = Some(m);
@@ -369,7 +383,7 @@ impl<'s> Importer<'s> {
                 node.ty == "PointInstancer" && !node.instanced && !node.hidden
             })
             .collect();
-        let mut instances: HashMap<usize, Vec<Mat4>> = HashMap::new();
+        let mut instances: BTreeMap<usize, Vec<Mat4>> = BTreeMap::new();
         let mut proto_model: HashMap<String, usize> = HashMap::new();
         for &ins in &instancers {
             let r = self.reader(&self.nodes[ins].prim);
@@ -385,11 +399,8 @@ impl<'s> Importer<'s> {
                             .by_path
                             .get(&key)
                             .ok_or_else(|| format!("{path}: prototype {key} is not cooked"))?;
-                        let parent_world = self.nodes[root]
-                            .parent
-                            .map_or(DMat4::IDENTITY, |q| self.nodes[q].world);
-                        let from_scene = self.root * parent_world.inverse();
-                        let m = new_model(&mut models, &self.nodes[root], from_scene, None);
+                        let frame = self.nodes[root].parent;
+                        let m = new_model(&mut models, &self.nodes[root], frame, None);
                         for o in &mut owner[self.subtree(root)] {
                             o.get_or_insert(m);
                         }
@@ -407,6 +418,27 @@ impl<'s> Importer<'s> {
             }
         }
         self.select_models(&mut models, &mut owner)?;
+
+        // Per instanced model its placements, and per model the models its meshes go to, with
+        // what they apply: the model itself unless it places nothing, and those that bake its
+        // other copies.
+        let mut placed: HashMap<usize, Vec<Placed>> = HashMap::new();
+        let mut holders: Vec<Vec<(usize, DMat4)>> = (0..models.len())
+            .map(|m| vec![(m, DMat4::IDENTITY)])
+            .collect();
+        for (m, transforms) in instances {
+            let name = models[m].name.clone().unwrap_or_default();
+            let (direct, baked) = placements(&transforms).map_err(|e| format!("{name}: {e}"))?;
+            if direct.is_empty() {
+                holders[m].clear();
+            }
+            placed.insert(m, direct);
+            for (k, (linear, copies)) in baked.into_iter().enumerate() {
+                placed.insert(models.len(), copies);
+                holders[m].push((models.len(), linear.as_dmat4()));
+                models.push(Building::new(Some(format!("{name}/baked/{k}")), None, None));
+            }
+        }
 
         let meshes: Vec<usize> = (0..n)
             .filter(|&i| self.nodes[i].ty == "Mesh" && owner[i].is_some() && !self.nodes[i].hidden)
@@ -466,20 +498,22 @@ impl<'s> Importer<'s> {
                     let (s, to_model) = sk.binding(&r, mesh.points.len())?;
                     (Some(s), to_model)
                 }
-                (false, false, _) => (None, models[o].from_scene * self.nodes[i].world),
+                (false, false, _) => (None, self.to_model(&models[o], i)?),
                 _ => return Err(format!("{path}: a skinned mesh outside a SkelRoot")),
             };
             let faces = self.face_materials(i, &mesh)?;
             let face_material = |f: usize| faces[f];
-            let placing = Placing {
-                transform,
-                face_material: &face_material,
-                skin: skin.as_deref(),
-            };
-            if as_cage {
-                models[o].cage.add(&mesh, &placing, &path)?;
-            } else {
-                models[o].welder.add(&mesh, &placing, &path)?;
+            for &(m, linear) in &holders[o] {
+                let placing = Placing {
+                    transform: linear * transform,
+                    face_material: &face_material,
+                    skin: skin.as_deref(),
+                };
+                if as_cage {
+                    models[m].cage.add(&mesh, &placing, &path)?;
+                } else {
+                    models[m].welder.add(&mesh, &placing, &path)?;
+                }
             }
         }
 
@@ -487,6 +521,11 @@ impl<'s> Importer<'s> {
         let mut names = std::collections::HashSet::new();
         let mut instance_out = Vec::new();
         for (mi, b) in models.into_iter().enumerate() {
+            let copies = placed.remove(&mi);
+            // Models that bake them hold all of a prototype's copies.
+            if copies.as_ref().is_some_and(Vec::is_empty) {
+                continue;
+            }
             // The rest of the stage, or a skeletal root with no skinned mesh, may be empty.
             if (b.name.is_none() || b.skinned)
                 && b.welder.groups.values().all(Vec::is_empty)
@@ -499,20 +538,8 @@ impl<'s> Importer<'s> {
             {
                 return Err(format!("two models are named {n:?}"));
             }
-            if let (Some(n), Some(t)) = (&b.name, instances.get(&mi)) {
-                let mut placed = Vec::with_capacity(t.len());
-                for (i, &m) in t.iter().enumerate() {
-                    match placement(m) {
-                        Decomposed::Placed(p) => placed.push(p),
-                        Decomposed::Nothing => {}
-                        Decomposed::Sheared => {
-                            return Err(format!(
-                                "{n}: instance {i} has a shear, which a placement cannot hold"
-                            ));
-                        }
-                    }
-                }
-                instance_out.push((n.clone(), placed));
+            if let (Some(n), Some(copies)) = (&b.name, copies) {
+                instance_out.push((n.clone(), copies));
             }
             out.push(self.model(b)?);
         }
@@ -621,6 +648,35 @@ impl<'s> Importer<'s> {
         })
     }
 
+    /// Model `b`'s space from node `n`'s. The local transforms up to the frame give it where
+    /// the frame's world transform has no inverse; only that inverse reaches a prim that
+    /// resets the transform stack.
+    fn to_model(&self, b: &Building, n: usize) -> Result<DMat4, String> {
+        let Some(frame) = b.frame else {
+            return Ok(self.nodes[n].world);
+        };
+        let (mut m, mut at) = (DMat4::IDENTITY, n);
+        while at != frame {
+            let node = &self.nodes[at];
+            m = node.local * m;
+            match node.parent.filter(|_| !node.reset) {
+                Some(p) => at = p,
+                None => {
+                    let world = self.nodes[frame].world;
+                    if collapses(DMat3::from_mat4(world)) {
+                        return Err(format!(
+                            "{}: resets the transform stack under {}, which collapses an axis",
+                            self.nodes[n].prim.path().as_str(),
+                            self.nodes[frame].prim.path().as_str(),
+                        ));
+                    }
+                    return Ok(self.root * world.inverse() * self.nodes[n].world);
+                }
+            }
+        }
+        Ok(self.root * m)
+    }
+
     /// Adds the selected models (or the whole-stage model) for prims no model holds yet.
     fn select_models(
         &self,
@@ -630,15 +686,7 @@ impl<'s> Importer<'s> {
         let n = self.nodes.len();
         if self.settings.models.is_empty() {
             let whole = models.len();
-            models.push(Building {
-                name: None,
-                from_scene: DMat4::IDENTITY,
-                skinned: false,
-                root: None,
-                skeleton: None,
-                welder: Welder::default(),
-                cage: CageBuilder::default(),
-            });
+            models.push(Building::new(None, None, None));
             for (i, o) in owner.iter_mut().enumerate() {
                 if o.is_none() && !self.nodes[i].instanced {
                     *o = Some(whole);
@@ -674,15 +722,7 @@ impl<'s> Importer<'s> {
                 return Err(format!("two selected prims are named {:?}", node.name));
             }
             owner[i] = Some(models.len());
-            models.push(Building {
-                name: Some(node.name.clone()),
-                from_scene: self.root * node.world.inverse(),
-                skinned: false,
-                root: None,
-                skeleton: None,
-                welder: Welder::default(),
-                cage: CageBuilder::default(),
-            });
+            models.push(Building::new(Some(node.name.clone()), Some(i), None));
         }
         if let Some(s) = matched.iter().position(|m| !m) {
             return Err(format!(

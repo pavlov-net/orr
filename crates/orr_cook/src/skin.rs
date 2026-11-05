@@ -5,8 +5,8 @@
 //! up to the scene roots, so model space is the scene's space and an animated ancestor
 //! animates the whole skeleton. Joints are ordered parents first (scene order, depth
 //! first); mesh joint indices are remapped to that order. Ancestors that no skin names get
-//! the inverse of their rest transform as inverse bind. Skins that name the same node must
-//! agree on its inverse bind.
+//! the inverse of their rest transform as inverse bind, or identity when it collapses an
+//! axis. Skins that name the same node must agree on its inverse bind.
 //!
 //! Clips: every animation with a translation, rotation or scale channel on a skeleton
 //! joint. A clip runs from its first key to its last over every channel; it is resampled
@@ -20,17 +20,19 @@
 
 use std::collections::HashMap;
 
-use orr_math::{Affine3, Mat3, Mat4, Quat};
+use orr_math::{Affine3, Mat3, Mat4, Quat, Vec3};
 use orr_pack::AssetId;
 use orr_pack::clip::{Clip, ClipHeader};
 use orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo, Trs, slerp};
 use serde::Deserialize;
 
 use crate::gltf::data::Data;
+use crate::import::collapses;
 
 /// The default scene's node tree: parent and world transform of each glTF node in it.
 pub(crate) struct Graph {
     pub(crate) parent: Vec<Option<usize>>,
+    local: Vec<Mat4>,
     pub(crate) world: Vec<Mat4>,
     in_scene: Vec<bool>,
     /// Scene nodes depth first, parents before children, in document order.
@@ -42,6 +44,7 @@ impl Graph {
         let n = doc.nodes().len();
         let mut g = Self {
             parent: vec![None; n],
+            local: vec![Mat4::IDENTITY; n],
             world: vec![Mat4::IDENTITY; n],
             in_scene: vec![false; n],
             order: Vec::new(),
@@ -53,16 +56,27 @@ impl Graph {
             if g.in_scene[i] {
                 continue;
             }
-            let local = Mat4::from_cols_array_2d(&node.transform().matrix());
+            g.local[i] = Mat4::from_cols_array_2d(&node.transform().matrix());
             g.in_scene[i] = true;
             g.parent[i] = parent;
-            g.world[i] = parent.map_or(Mat4::IDENTITY, |p| g.world[p]) * local;
+            g.world[i] = parent.map_or(Mat4::IDENTITY, |p| g.world[p]) * g.local[i];
             g.order.push(i);
             let at = stack.len();
             stack.extend(node.children().map(|c| (c, Some(i))));
             stack[at..].reverse();
         }
         g
+    }
+
+    /// Node `ancestor`'s space from the space of `node`, in its subtree. The local transforms
+    /// between them give it even where a world transform on the way has no inverse.
+    pub(crate) fn relative(&self, ancestor: usize, node: usize) -> Mat4 {
+        let (mut m, mut at) = (Mat4::IDENTITY, node);
+        while at != ancestor {
+            m = self.local[at] * m;
+            at = self.parent[at].expect("an ancestor of the node");
+        }
+        m
     }
 }
 
@@ -154,13 +168,22 @@ impl Skeleton {
         let mut inverse_binds = Vec::with_capacity(nodes.len());
         for &n in &nodes {
             let node = doc.nodes().nth(n).expect("node index");
+            let world = graph.world[n];
+            if !world.is_finite() {
+                return Err(format!("node {n}: its transform is not finite"));
+            }
             info.parents
                 .push(graph.parent[n].map_or(NO_PARENT, |p| joint_of[&p]));
             info.rest.push(rest(&node)?);
-            let ib = bind
-                .get(&n)
-                .copied()
-                .unwrap_or_else(|| graph.world[n].inverse());
+            // Without an inverse, the identity is a bind that still poses what `attach` hangs
+            // on the joint: its space is the bind space.
+            let ib = bind.get(&n).copied().unwrap_or_else(|| {
+                if collapses(Mat3::from_mat4(world).as_dmat3()) {
+                    Mat4::IDENTITY
+                } else {
+                    world.inverse()
+                }
+            });
             inverse_binds.push(ib);
             info.inverse_binds.push(Affine3::from_mat4(ib));
             info.names.push(node.name().unwrap_or_default().to_string());
@@ -181,13 +204,24 @@ impl Skeleton {
         }))
     }
 
-    /// Bind-space position of skeleton joint `j`.
+    /// Bind space from skeleton joint `j`'s space. A skin may give a joint an inverse bind
+    /// that has no inverse: its vertices still skin, but nothing can sit on the joint.
+    fn bind(&self, j: u16) -> Result<Mat4, String> {
+        let j = usize::from(j);
+        let ib = self.inverse_binds[j];
+        if collapses(Mat3::from_mat4(ib).as_dmat3()) {
+            return Err(format!(
+                "the inverse bind of node {} has no inverse",
+                self.nodes[j]
+            ));
+        }
+        Ok(ib.inverse())
+    }
+
+    /// Bind-space position of skeleton joint `j`, the origin if its inverse bind has no inverse.
     pub(crate) fn bind_origin(&self, j: u16) -> [f32; 3] {
-        self.inverse_binds[usize::from(j)]
-            .inverse()
-            .w_axis
-            .truncate()
-            .to_array()
+        self.bind(j)
+            .map_or([0.0; 3], |b| b.w_axis.truncate().to_array())
     }
 
     /// Skeleton joint of each joint of glTF skin `s`.
@@ -202,9 +236,7 @@ impl Skeleton {
         let mut a = Some(node);
         while let Some(n) = a {
             if let Some(&j) = self.joint_of.get(&n) {
-                let rest = graph.world[self.nodes[usize::from(j)]];
-                let to_bind = self.inverse_binds[usize::from(j)].inverse() * rest.inverse();
-                return Ok((j, to_bind * graph.world[node]));
+                return Ok((j, self.bind(j)? * graph.relative(n, node)));
             }
             a = graph.parent[n];
         }
@@ -556,20 +588,50 @@ impl Channel {
     }
 }
 
+/// The per-axis scale and rotation of `l`, if it has them. A mirror is a negative z scale, and
+/// a column of zeros takes the direction that completes the frame.
+fn scale_rotation(l: Mat3) -> (Vec3, Quat) {
+    let cols = [l.x_axis, l.y_axis, l.z_axis];
+    let mut scale = Vec3::from(cols.map(Vec3::length));
+    let mut frame = cols.map(Vec3::normalize_or_zero);
+    for k in 0..3 {
+        if frame[k] == Vec3::ZERO {
+            let (a, b) = (frame[(k + 1) % 3], frame[(k + 2) % 3]);
+            frame[k] = match [a, b].into_iter().find(|v| *v != Vec3::ZERO) {
+                Some(seed) => a
+                    .cross(b)
+                    .try_normalize()
+                    .unwrap_or(seed.any_orthonormal_vector()),
+                None => Vec3::X,
+            };
+        }
+    }
+    let [x, y, mut z] = frame;
+    if x.cross(y).dot(z) < 0.0 {
+        scale.z = -scale.z;
+        z = -z;
+    }
+    (scale, Quat::from_mat3(&Mat3::from_cols(x, y, z)))
+}
+
 /// A node's local transform as translation, rotation and scale; a matrix must decompose
 /// into them.
 fn rest(node: &gltf::Node<'_>) -> Result<Trs, String> {
-    let (t, r, s) = node.transform().decomposed();
-    if let gltf::scene::Transform::Matrix { matrix } = node.transform() {
-        let m = Mat4::from_cols_array_2d(&matrix);
-        let back = Mat4::from_scale_rotation_translation(s.into(), Quat::from_array(r), t.into());
-        if !close(&m, &back) {
-            return Err(format!(
-                "node {}: its matrix has shear; skeleton nodes need translation, rotation and scale",
-                node.index()
-            ));
+    let (t, r, s) = match node.transform() {
+        gltf::scene::Transform::Matrix { matrix } => {
+            let m = Mat4::from_cols_array_2d(&matrix);
+            let (s, r) = scale_rotation(Mat3::from_mat4(m));
+            let t = m.w_axis.truncate();
+            if !close(&m, &Mat4::from_scale_rotation_translation(s, r, t)) {
+                return Err(format!(
+                    "node {}: its matrix is not translation, rotation and scale, as skeleton nodes need",
+                    node.index()
+                ));
+            }
+            (t.to_array(), r.to_array(), s.to_array())
         }
-    }
+        transform => transform.decomposed(),
+    };
     let q = Quat::from_array(r).normalize();
     Ok(Trs {
         rotation: q.to_array(),

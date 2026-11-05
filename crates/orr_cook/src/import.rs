@@ -2,6 +2,8 @@
 //! materials and images they use, skeletons with their clips, instanced models and their
 //! placements, and the files it read.
 
+use std::collections::HashMap;
+
 use orr_math::{DMat3, DQuat, DVec3, Mat3, Mat4, Quat, Vec3};
 use orr_pack::clip::Clip;
 use orr_pack::material::Material;
@@ -100,14 +102,9 @@ pub(crate) struct SceneMaterial {
 /// largest entry of `linear`. It is below the instance record's own rotation error.
 pub const SHEAR_MAX: f64 = 1e-3;
 
-/// What a scene-space transform places.
-pub(crate) enum Decomposed {
-    Placed(Placed),
-    /// The transform collapses an axis: nothing shows.
-    Nothing,
-    /// The transform shears further than [`SHEAR_MAX`].
-    Sheared,
-}
+/// Copies whose linear transform no placement holds: the transform, for the importer to bake
+/// into a model of its own, and the copies of that model, placed by translation alone.
+pub(crate) type Baked = (Mat4, Vec<Placed>);
 
 fn largest(m: DMat3) -> f64 {
     m.to_cols_array()
@@ -115,14 +112,36 @@ fn largest(m: DMat3) -> f64 {
         .fold(0.0, |a, x| a.max(x.abs()))
 }
 
-/// The placement of a scene-space transform.
-pub(crate) fn placement(m: Mat4) -> Decomposed {
+fn column_lengths(l: DMat3) -> DVec3 {
+    DVec3::new(l.x_axis.length(), l.y_axis.length(), l.z_axis.length())
+}
+
+/// Whether finite `l` flattens space: a column vanishes beside the largest, or the columns
+/// at unit length enclose no volume. The volume's bound sits above the f32 rounding of a
+/// product of transforms, which leaves a flat matrix a tiny determinant.
+pub(crate) fn collapses(l: DMat3) -> bool {
+    let s = column_lengths(l);
+    s.min_element() <= largest(l) * 1e-9
+        || (l * DMat3::from_diagonal(s.recip())).determinant().abs() <= 1e-5
+}
+
+/// The inverse transpose of `l` up to a positive scale, which exists where `l` collapses. Its
+/// largest entry is 1, so it fits an f32 whatever the size of `l`.
+pub(crate) fn normal_matrix(l: DMat3) -> DMat3 {
+    let [x, y, z] = [l.x_axis, l.y_axis, l.z_axis];
+    let m = DMat3::from_cols(y.cross(z), z.cross(x), x.cross(y));
+    let sign = if l.determinant() < 0.0 { -1.0 } else { 1.0 };
+    m * (sign / largest(m).max(f64::MIN_POSITIVE))
+}
+
+/// The placement of a finite scene-space transform, `None` when it collapses an axis, which
+/// an instance transform has to invert, or shears further than [`SHEAR_MAX`].
+fn placement(m: Mat4) -> Option<Placed> {
     let l = Mat3::from_mat4(m).as_dmat3();
-    let mut s = DVec3::new(l.x_axis.length(), l.y_axis.length(), l.z_axis.length());
-    let largest_entry = largest(l);
-    if s.min_element() <= largest_entry * 1e-9 {
-        return Decomposed::Nothing;
+    if collapses(l) {
+        return None;
     }
+    let mut s = column_lengths(l);
     if l.determinant() < 0.0 {
         s.x = -s.x;
     }
@@ -131,12 +150,39 @@ pub(crate) fn placement(m: Mat4) -> Decomposed {
     for _ in 0..16 {
         r = (r + r.inverse().transpose()) * 0.5;
     }
-    if largest(l - r * DMat3::from_diagonal(s)) > SHEAR_MAX * largest_entry {
-        return Decomposed::Sheared;
-    }
-    Decomposed::Placed(Placed {
+    (largest(l - r * DMat3::from_diagonal(s)) <= SHEAR_MAX * largest(l)).then(|| Placed {
         position: m.w_axis.truncate().as_dvec3(),
         rotation: DQuat::from_mat3(&r).normalize().as_quat(),
         scale: s.as_vec3(),
     })
+}
+
+/// The copies `transforms` place: those a placement holds, then the rest by linear transform.
+pub(crate) fn placements(transforms: &[Mat4]) -> Result<(Vec<Placed>, Vec<Baked>), String> {
+    let mut placed = Vec::new();
+    let mut baked: Vec<Baked> = Vec::new();
+    let mut baked_of: HashMap<[u32; 16], usize> = HashMap::new();
+    for (i, m) in transforms.iter().enumerate() {
+        if !m.is_finite() {
+            return Err(format!("the transform of copy {i} is not finite"));
+        }
+        if let Some(p) = placement(*m) {
+            placed.push(p);
+            continue;
+        }
+        let linear = Mat4::from_mat3(Mat3::from_mat4(*m));
+        // Adding zero turns -0.0 into 0.0: copies scaled to zero differ only in such signs.
+        let k = *baked_of
+            .entry(linear.to_cols_array().map(|x| (x + 0.0).to_bits()))
+            .or_insert_with(|| {
+                baked.push((linear, Vec::new()));
+                baked.len() - 1
+            });
+        baked[k].1.push(Placed {
+            position: m.w_axis.truncate().as_dvec3(),
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+        });
+    }
+    Ok((placed, baked))
 }
