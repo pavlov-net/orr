@@ -38,7 +38,7 @@ BsdfParams bsdf_params(Inputs m)
     p.emission = m.emission_luminance * m.emission_color;
     p.flags = (thin ? BSDF_THIN_WALLED : 0) | (m.coat_weight > 0.0 ? BSDF_COAT : 0) | (m.fuzz_weight > 0.0 ? BSDF_FUZZ : 0)
         | (m.thin_film_weight > 0.0 ? BSDF_THIN_FILM : 0) | (m.specular_roughness_anisotropy > 0.0 ? BSDF_ANISOTROPY : 0)
-        | (m.coat_roughness_anisotropy > 0.0 || m.coat_normal.z < 1.0 ? BSDF_COAT_FRAME : 0);
+        | (m.coat_roughness_anisotropy > 0.0 || m.coat_normal.z < 1.0 ? BSDF_COAT_FRAME : 0) | m.bsdf_flags;
     return p;
 }
 

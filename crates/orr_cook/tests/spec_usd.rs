@@ -1272,13 +1272,12 @@ fn preview_parameters_carry_their_spec_values() {
     assert!(close(m.coat_ior, 1.33), "{}", m.coat_ior);
     assert!(close(m.coat_roughness, 0.01), "{}", m.coat_roughness);
 
-    let f0 = |m: &Material, c: usize| {
-        let r = (m.specular_ior - 1.0) / (m.specular_ior + 1.0);
-        m.specular_color[c] * r * r
-    };
     let specular = "int inputs:useSpecularWorkflow = 1";
     let a = cook("preview-specular-default", &previewed(specular, "", ""));
-    assert!(close(f0(&material(&a), 0), 0.0));
+    let m = material(&a);
+    assert_eq!(m.model, Material::MODEL_PREVIEW_SPECULAR);
+    assert_eq!(m.specular_color, [0.0; 3]);
+    assert_eq!(m.specular_ior, 1.5, "ior stays for refraction");
 
     let a = cook(
         "preview-specular-gray",
@@ -1288,22 +1287,7 @@ fn preview_parameters_carry_their_spec_values() {
             "",
         ),
     );
-    let m = material(&a);
-    assert!(close(f0(&m, 1), 0.5), "{}", f0(&m, 1));
-    assert_eq!(m.specular_color, [1.0; 3], "a gray F0 needs no tint");
-
-    let a = cook(
-        "preview-specular-color",
-        &previewed(
-            &format!("{specular}\n color3f inputs:specularColor = (0.4, 0.2, 0.1)"),
-            "",
-            "",
-        ),
-    );
-    let m = material(&a);
-    for (c, want) in [0.4, 0.2, 0.1].into_iter().enumerate() {
-        assert!(close(f0(&m, c), want), "{c}: {}", f0(&m, c));
-    }
+    assert_eq!(material(&a).specular_color, [0.5; 3]);
 }
 
 /// PS `opacityMode`: under the default *transparent* "opacity reduces the contribution of the

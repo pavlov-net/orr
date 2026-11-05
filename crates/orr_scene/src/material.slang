@@ -27,6 +27,10 @@ public static const uint MATERIAL_COST_SHIFT = 16;
 public static const uint MATERIAL_COST_MASK = 3 << 16;
 // The coat shades on the base's normal, normal map included, not the mesh's.
 public static const uint MATERIAL_COAT_ON_BASE = 1 << 18;
+// orr_pack::material::Material::MODEL_GLTF's dielectric and coat: `specular_color` is F0.
+public static const uint MATERIAL_FRESNEL_MIX = 1 << 19;
+// A metal reflects its base color at every angle.
+public static const uint MATERIAL_METAL_FLAT = 1 << 20;
 
 // `MaterialGpu.textures` slots.
 public static const uint TEXTURE_BASE_COLOR = 0;

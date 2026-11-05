@@ -24,6 +24,13 @@ public static const uint BSDF_ANISOTROPY = 1 << 4;
 public static const uint BSDF_COLLAPSED = 1 << 5;
 // The coat has a frame of its own: `coat_normal` and `coat_tangent_angle`.
 public static const uint BSDF_COAT_FRAME = 1 << 6;
+// `specular_color` is F0 at normal incidence, `specular_weight` the reflection at grazing
+// incidence and what scales F0 with it, Schlick's curve lies between them, and the layer below
+// keeps what the largest channel leaves. `specular_ior` is only the angle of refraction and what
+// reflects from inside. Neither reaches a metal, and the coat leaves the base as it is.
+public static const uint BSDF_FRESNEL_MIX = 1 << 7;
+// A metal reflects its base color at every angle.
+public static const uint BSDF_METAL_FLAT = 1 << 8;
 
 // OpenPBR inputs at a shading point, linear Rec.2020 and absolute units.
 public struct BsdfParams
@@ -69,6 +76,7 @@ public static const uint GBUFFER_SUBSURFACE = 1 << 3;
 public static const uint GBUFFER_LAYERS = 1 << 4;
 public static const uint GBUFFER_ORIGIN_SHIFT = 5;
 public static const uint GBUFFER_ORIGIN_MASK = 3 << 5;
+public static const uint GBUFFER_FRESNEL_MIX = 1 << 7;
 
 // Ray origin policies, in `GSurface.flags` at GBUFFER_ORIGIN_SHIFT.
 public static const uint ORIGIN_DEFAULT = 0;
@@ -271,6 +279,9 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
     bool thin = (p.flags & BSDF_THIN_WALLED) != 0;
     if (thin)
         flags |= GBUFFER_THIN_TWO_SIDED;
+    bool mix = (p.flags & BSDF_FRESNEL_MIX) != 0;
+    if (mix)
+        flags |= GBUFFER_FRESNEL_MIX;
     bool sss = p.subsurface_weight > 0.0;
     if (extended && gsurface_extended(s))
     {
@@ -286,10 +297,16 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
     w.a.z = pack_rgb9e5(max(p.emission, 0.0));
     uint exponent = weight_exponent(p.specular_weight);
     w.a.w = pack_unorm8(p.metalness) | (pack_unorm8(p.specular_weight * exp2(-float(exponent))) << 8) | (ior_code(p.specular_ior) << 16) | (flags << 24);
-    float3 sc = srgb_encode(saturate(p.specular_color));
+    // F0 keeps its size in its own byte, so seven bits hold its hue where they have steps.
+    float peak = mix ? max_component(p.specular_color) : 1.0;
+    float3 hue = peak > 0.0 ? p.specular_color / peak : float3(1.0);
+    float3 sc = srgb_encode(saturate(hue));
     uint3 s7 = uint3(round(sc * 127.0));
-    w.b.x = s7.x | (s7.y << 7) | (s7.z << 14) | (raster_error_code(s.raster_error) << 21) | (exponent << 26);
+    uint flat = (p.flags & BSDF_METAL_FLAT) != 0 ? 1u << 31 : 0;
+    w.b.x = s7.x | (s7.y << 7) | (s7.z << 14) | (raster_error_code(s.raster_error) << 21) | (exponent << 26) | flat;
     w.b.y = (oct_encode_snorm8(s.geometric_normal) & 0xffff) | (pack_unorm8(p.diffuse_roughness) << 16);
+    if (mix)
+        w.b.y |= pack_unorm8(sqrt(peak)) << 24;
     w.x = uint4(0);
     w.y = uint4(0);
     if ((flags & GBUFFER_EXTENDED) != 0)
@@ -333,10 +350,19 @@ public GSurface decode_gsurface(GBufferWords w)
     s.raster_error = raster_error_from_code((w.b.x >> 21) & 31);
     s.geometric_normal = oct_decode_snorm8(w.b.y & 0xffff);
     p.diffuse_roughness = unpack_unorm8(w.b.y >> 16);
+    if ((flags & GBUFFER_FRESNEL_MIX) != 0)
+    {
+        float root = unpack_unorm8(w.b.y >> 24);
+        p.specular_color *= root * root;
+    }
     p.transmission_weight = 0.0;
     p.transmission_color = float3(1.0);
     bool thin = (flags & GBUFFER_THIN_TWO_SIDED) != 0;
     p.flags = thin ? BSDF_THIN_WALLED : 0;
+    if ((flags & GBUFFER_FRESNEL_MIX) != 0)
+        p.flags |= BSDF_FRESNEL_MIX;
+    if ((w.b.x >> 31) != 0)
+        p.flags |= BSDF_METAL_FLAT;
     p.subsurface_weight = 0.0;
     p.subsurface_color = float3(0.0);
     p.subsurface_anisotropy = 0.0;

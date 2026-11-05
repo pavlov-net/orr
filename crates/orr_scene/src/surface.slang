@@ -320,6 +320,10 @@ public struct StandardSurface : ISurface
         p.specular_anisotropy = 0.0;
         p.tangent_angle = 0.0;
         p.flags = thin ? BSDF_THIN_WALLED : 0;
+        if ((m.flags & MATERIAL_FRESNEL_MIX) != 0)
+            p.flags |= BSDF_FRESNEL_MIX;
+        if ((m.flags & MATERIAL_METAL_FLAT) != 0)
+            p.flags |= BSDF_METAL_FLAT;
         if ((m.flags & MATERIAL_ANISOTROPY) != 0)
         {
             p.specular_anisotropy = m.specular_anisotropy;

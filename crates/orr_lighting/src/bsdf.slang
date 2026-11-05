@@ -108,6 +108,8 @@ static const float MIN_COS = 1e-4;
 // The IOR the specular weight's limit on F0 leaves of an IOR of 0, which layers above divide by.
 static const float MIN_IOR = 2.5e-5;
 static const float LARGEST_BELOW_ONE = 0.99999994;
+// The reference's largest F0, past which an IOR leaves what a float holds.
+static const float MAX_F0 = 0.9999;
 
 // What `bsdf_prepare_layers` leaves for `Bsdf.finish`: directional albedo estimates per lobe
 // without the coat and fuzz folded, and the lobe-selection inputs.
@@ -146,6 +148,10 @@ public struct Bsdf : IDifferentiable
     no_diff float3 reflect_transparent;
     no_diff float3 reflect_opaque;
     no_diff float3 reflect_const;
+    no_diff bool fresnel_mix;           // BSDF_FRESNEL_MIX, seen from outside
+    no_diff float3 mix_f0;
+    no_diff float mix_weight;           // 1 without `fresnel_mix`
+    no_diff bool metal_flat;
     no_diff float metal;
     no_diff float3 f0;
     no_diff float3 f82;
@@ -153,7 +159,7 @@ public struct Bsdf : IDifferentiable
     no_diff float film_thickness;
     no_diff float film_exterior;
     no_diff float film_ior;
-    no_diff float film_interior;
+    no_diff float3 film_interior;
     no_diff float3 transmit;
     no_diff float3 walk;
     no_diff float walk_ms_share;
@@ -785,7 +791,7 @@ public struct Bsdf : IDifferentiable
     float3 eon(float3 rho, float3 l)
     {
         return openpbr_f_EON(rho, diffuse_roughness, v, l, false) * diffuse_comp
-            * openpbr_look_up_opaque_dielectric_energy_complement(eta_opaque, alpha_iso, l.z);
+            * weighted_complement(openpbr_look_up_opaque_dielectric_energy_complement(eta_opaque, alpha_iso, l.z), mix_weight);
     }
 
     [TreatAsDifferentiable]
@@ -814,24 +820,37 @@ public struct Bsdf : IDifferentiable
     // microfacet cosine `c`, with the thin film.
     void coefficients(float c, out float3 reflection, out float3 transmission)
     {
-        float ft = openpbr_fresnel(eta_transparent, c);
-        // The two differ only from inside.
-        float fo = ft;
-        if (eta_opaque != eta_transparent)
-            fo = openpbr_fresnel(eta_opaque, c);
-        reflection = reflect_transparent * ft + reflect_opaque * fo;
+        float ft;
+        if (fresnel_mix)
+        {
+            float3 r = mix_reflection(mix_f0, mix_weight, c);
+            reflection = (reflect_transparent + reflect_opaque) * r;
+            ft = max_component(r);
+        }
+        else
+        {
+            ft = openpbr_fresnel(eta_transparent, c);
+            // The two differ only from inside.
+            float fo = ft;
+            if (eta_opaque != eta_transparent)
+                fo = openpbr_fresnel(eta_opaque, c);
+            reflection = reflect_transparent * ft + reflect_opaque * fo;
+        }
         if (metal > 0.0)
-            reflection += metal * openpbr_metal_schlick_with_f82_tint(f0, f82, c);
+            reflection += metal * (metal_flat ? f0 : openpbr_metal_schlick_with_f82_tint(f0, f82, c));
         transmission = float3(1.0 - ft);
         if (film > 0.0)
         {
             bool dielectric = any(reflect_transparent > 0.0) || any(reflect_opaque > 0.0);
             OpenPBR_ThinFilmResults r = openpbr_thin_film_and_base_reflectance(
-                c, film_exterior, film_ior, float3(film_interior), false, f0, f82, dielectric,
+                c, film_exterior, film_ior, film_interior, false, f0, f82, dielectric,
                 metal > 0.0, film_thickness, OpenPBR_BaseRgbWavelengths_nm);
-            float3 film_reflection = (reflect_transparent + reflect_opaque) * r.reflectance_dielectric + metal * r.reflectance_metal;
+            float3 dielectric_film = mix_weight * r.reflectance_dielectric;
+            float3 film_reflection = (reflect_transparent + reflect_opaque) * dielectric_film + metal * r.reflectance_metal;
             reflection = lerp(reflection, film_reflection, film);
-            transmission = lerp(transmission, saturate(1.0 - r.reflectance_dielectric), film);
+            // No inverse colors: the layer below keeps what the largest channel leaves.
+            float3 film_passed = fresnel_mix ? float3(1.0 - max_component(dielectric_film)) : 1.0 - dielectric_film;
+            transmission = lerp(transmission, saturate(film_passed), film);
         }
         reflection += reflect_const;
     }
@@ -922,6 +941,21 @@ float fourth_root(float x)
     return sqrt(sqrt(x));
 }
 
+// What the layer below a specular lobe keeps of `complement`, the share a full weight leaves it,
+// at BSDF_FRESNEL_MIX's `weight`.
+float weighted_complement(float complement, float weight)
+{
+    return (1.0 - weight) + weight * complement;
+}
+
+// BSDF_FRESNEL_MIX's reflection at cosine `c`, from `f0` and `weight`.
+float3 mix_reflection(float3 f0, float weight, float c)
+{
+    float x = 1.0 - c;
+    float x2 = x * x;
+    return weight * (f0 + (1.0 - f0) * (x2 * x2 * x));
+}
+
 // A thin wall's tint along the refracted path, from its tint at normal incidence.
 float3 view_tint(float3 tint, bool thin, float c, float eta)
 {
@@ -1003,10 +1037,13 @@ public float3 bsdf_straight_transmission(BsdfParams p, float3 n, float3 wi, floa
     float c = dot(wi, n);
     bool inside = window && c > 0.0 && !thin;
     float mu = max(abs(c), MIN_COS);
-    float ior = exterior_ior * openpbr_apply_specular_weight_to_ior(p.specular_ior / exterior_ior, p.specular_weight);
+    bool mix = (p.flags & BSDF_FRESNEL_MIX) != 0;
+    float weight = mix ? 1.0 : p.specular_weight;
+    float ior = exterior_ior * openpbr_apply_specular_weight_to_ior(p.specular_ior / exterior_ior, weight);
     float eta = inside ? exterior_ior / ior : ior / exterior_ior;
-    float3 t = (1.0 - p.metalness) * p.transmission_weight * (1.0 - openpbr_fresnel(eta, mu))
-        * view_tint(p.transmission_color, thin, mu, eta);
+    float reflected = mix && !inside ? max_component(mix_reflection(p.specular_color, p.specular_weight, mu)) : openpbr_fresnel(eta, mu);
+    float3 t = (1.0 - p.metalness) * p.transmission_weight * (1.0 - reflected)
+        * view_tint(p.transmission_color, thin && !mix, mu, eta);
     if ((p.flags & BSDF_COAT) != 0 && p.coat_weight > 0.0)
         t *= lerp(float3(1.0), p.coat_color * (1.0 - openpbr_fresnel(max(p.coat_ior, MIN_IOR) / exterior_ior, mu)), p.coat_weight);
     return max(t, 0.0);
@@ -1068,11 +1105,13 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
         s.fuzz_v = leaned(mul(s.fuzz_basis, v));
     }
 
-    // IORs: the specular weight moves the base IOR toward the medium above it.
+    // IORs: the specular weight moves the base IOR toward the medium above it. A Fresnel mix's
+    // base sees neither.
+    bool mix = (p.flags & BSDF_FRESNEL_MIX) != 0;
     bool enter_coat = coat_weight > 0.0 && !s.inside;
     float coat_layer_ior = max(p.coat_ior, MIN_IOR);
-    float coat_ior = enter_coat ? lerp(exterior_ior, coat_layer_ior, coat_weight) : exterior_ior;
-    float specular_ior = coat_ior * openpbr_apply_specular_weight_to_ior(p.specular_ior / coat_ior, p.specular_weight);
+    float coat_ior = enter_coat && !mix ? lerp(exterior_ior, coat_layer_ior, coat_weight) : exterior_ior;
+    float specular_ior = coat_ior * openpbr_apply_specular_weight_to_ior(p.specular_ior / coat_ior, mix ? 1.0 : p.specular_weight);
     float eta_r;
     float eta_t;
     float eta_o;
@@ -1094,7 +1133,12 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
             coat_eta = coat_layer_ior / exterior_ior;
         }
         eta_o = eta_t;
+        if (mix)
+            eta_o = openpbr_ior_from_f0(min(max_component(p.specular_color), MAX_F0));
     }
+    s.fresnel_mix = mix && !s.inside;
+    s.mix_f0 = p.specular_color;
+    s.mix_weight = s.fresnel_mix ? p.specular_weight : 1.0;
     eta_r = eta_r >= 1.0 ? max(eta_r, 1.0001) : min(eta_r, 1.0 / 1.0001);
     s.eta_refraction = eta_r;
     s.eta_transparent = eta_t;
@@ -1106,7 +1150,7 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
         fourth_root(min(1.0, sq(sq(p.coat_roughness)) + fuzz_adjust * sq(sq(p.fuzz_roughness)))), fuzz_weight);
     float coat_adjust = 1.0 - (coat_eta >= 1.0 ? 1.0 / coat_eta : coat_eta);
     float roughness = lerp(p.specular_roughness,
-        fourth_root(min(1.0, sq(sq(p.specular_roughness)) + coat_adjust * sq(sq(coat_roughness)))), coat_weight);
+        fourth_root(min(1.0, sq(sq(p.specular_roughness)) + coat_adjust * sq(sq(coat_roughness)))), mix ? 0.0 : coat_weight);
     s.alpha_iso = sq(roughness);
     s.alpha = openpbr_compute_anisotropic_alpha(s.alpha_iso, anisotropy, false, MIN_ALPHA);
     s.mirror = max(s.alpha.x, s.alpha.y) < MIRROR_ALPHA;
@@ -1121,8 +1165,10 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     float trans = dielectric * p.transmission_weight;
     float sss = (1.0 - p.transmission_weight) * dielectric * p.subsurface_weight;
     // OpenPBR takes the metal's weight in 0..1; only the dielectric's goes past it.
-    float darkened_metal = p.metalness * saturate(p.specular_weight);
-    float3 metal_average = openpbr_metal_average_fresnel_with_f82_tint(p.base_color, p.specular_color);
+    float darkened_metal = p.metalness * (mix ? 1.0 : saturate(p.specular_weight));
+    float3 edge = mix ? float3(1.0) : p.specular_color;
+    s.metal_flat = (p.flags & BSDF_METAL_FLAT) != 0;
+    float3 metal_average = s.metal_flat ? p.base_color : openpbr_metal_average_fresnel_with_f82_tint(p.base_color, edge);
 
     // Coat darkening from internal reflections (OpenPBR 1.1.1).
     float k_smooth = openpbr_average_fresnel(coat_eta);
@@ -1147,20 +1193,26 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.emitted = s.inside ? float3(0.0) : p.emission * coat_in * fuzz_in;
 
     // Specular reflection and transmission.
-    s.reflect_transparent = s.inside ? float3(trans + sss) : p.specular_color * (thin ? sss : trans + sss);
-    s.reflect_opaque = p.specular_color * opaque;
-    float3 tinted = trans * view_tint(p.transmission_color, thin, mu, eta_r);
+    float3 specular_tint = mix ? float3(1.0) : p.specular_color;
+    s.reflect_transparent = s.inside ? float3(trans + sss) : specular_tint * (thin && !mix ? sss : trans + sss);
+    s.reflect_opaque = specular_tint * opaque;
+    float3 tinted = trans * view_tint(p.transmission_color, thin && !mix, mu, eta_r);
     bool walk_on = !s.inside && !thin && sss > 0.0;
     s.transmit = thin ? float3(0.0) : tinted + (walk_on ? 0.0 : sss);
     s.walk = float3(walk_on ? sss : 0.0);
     s.bounded = all(s.transmit == 0.0);
     s.metal = darkened_metal;
     s.f0 = p.base_color;
-    s.f82 = p.specular_color;
+    s.f82 = edge;
     s.film = film_weight > 0.0 && !collapsed ? film_weight * openpbr_thin_film_presence_multiplier(p.thin_film_thickness) : 0.0;
     s.film_thickness = p.thin_film_thickness;
     s.film_exterior = s.inside ? specular_ior : coat_ior;
-    s.film_interior = s.inside ? coat_ior : specular_ior;
+    s.film_interior = float3(s.inside ? coat_ior : specular_ior);
+    if (s.fresnel_mix && s.film > 0.0)
+    {
+        float3 root = sqrt(min(p.specular_color, MAX_F0));
+        s.film_interior = (1.0 + root) / (1.0 - root);
+    }
     s.film_ior = p.thin_film_ior;
 
     // Thin walls: a window's reflection and transmission, and subsurface as diffuse.
@@ -1170,8 +1222,15 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     float3 thin_reflect_diffuse = float3(0.0);
     if (thin)
     {
-        s.reflect_const = p.specular_color * trans * openpbr_thin_wall_fresnel(eta_t, mu);
-        s.thin_specular = tinted * (1.0 - openpbr_thin_wall_fresnel(eta_r, mu));
+        if (mix)
+        {
+            s.thin_specular = tinted * (1.0 - max_component(mix_reflection(p.specular_color, p.specular_weight, mu)));
+        }
+        else
+        {
+            s.reflect_const = p.specular_color * trans * openpbr_thin_wall_fresnel(eta_t, mu);
+            s.thin_specular = tinted * (1.0 - openpbr_thin_wall_fresnel(eta_r, mu));
+        }
         float forward = (p.subsurface_anisotropy + 1.0) * 0.5;
         float3 albedo = sss * p.subsurface_color;
         s.thin_diffuse = albedo * forward;
@@ -1186,7 +1245,7 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.dms_average_above = 1.0;
     s.dms_average_below = 1.0;
     s.g1v = openpbr_eval_aniso_smith_g1(s.v, s.alpha);
-    s.dms_reflect = s.inside ? float3(trans + sss) : p.specular_color * (trans + sss);
+    s.dms_reflect = s.inside ? float3(trans + sss) : specular_tint * s.mix_weight * (trans + sss);
     s.dms_transmit = tinted + (walk_on ? 0.0 : sss);
     if (s.alpha_iso >= MIN_MS_ALPHA)
     {
@@ -1203,8 +1262,8 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
 
     // Diffuse under the specular layer.
     s.diffuse_roughness = p.diffuse_roughness;
-    s.diffuse_comp = openpbr_look_up_opaque_dielectric_energy_complement(eta_o, s.alpha_iso, mu)
-        / openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_opaque_dielectric_average_energy_complement(eta_o, s.alpha_iso));
+    s.diffuse_comp = weighted_complement(openpbr_look_up_opaque_dielectric_energy_complement(eta_o, s.alpha_iso, mu), s.mix_weight)
+        / weighted_complement(openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_opaque_dielectric_average_energy_complement(eta_o, s.alpha_iso)), s.mix_weight);
     s.diffuse = p.base_color * opaque + thin_reflect_diffuse;
 
     // Directional albedo estimates without the coat and fuzz: `finish` adds them, folded or

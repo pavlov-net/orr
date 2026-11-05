@@ -84,6 +84,8 @@ pub(super) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
         alpha_mode,
         alpha_cutoff: m.alpha_cutoff().unwrap_or(0.5),
         double_sided: m.double_sided().into(),
+        model: Material::MODEL_GLTF,
+        coat_darkening: 0.0,
         ..Material::default()
     };
     if let Some(e) = ext("KHR_materials_ior") {

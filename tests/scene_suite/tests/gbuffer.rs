@@ -186,6 +186,8 @@ const SUBSURFACE: u32 = 8;
 const LAYERS: u32 = 16;
 const BSDF_THIN_WALLED: u32 = 1;
 const BSDF_COAT_FRAME: u32 = 64;
+const BSDF_FRESNEL_MIX: u32 = 128;
+const BSDF_METAL_FLAT: u32 = 256;
 
 // --- Packing ------------------------------------------------------------------------------
 
@@ -255,6 +257,14 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 1e-5 * 1e7f32.powf(rng.next())
             };
             c.flags = ((i as u32 % 3) << 5) | ((i as u32 % 2) * 2);
+            if i % 6 == 5 {
+                c.specular_color = arr(rng.rgb() * rng.next());
+                c.specular_weight = rng.next();
+                c.bsdf_flags |= BSDF_FRESNEL_MIX;
+            }
+            if i % 4 == 3 {
+                c.bsdf_flags |= BSDF_METAL_FLAT;
+            }
             if kind == 1 || kind == 2 {
                 c.subsurface_weight = 0.05 + 0.95 * rng.next();
                 c.subsurface_color = arr(rng.rgb());
@@ -262,7 +272,7 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 c.subsurface_anisotropy = rng.next() * 1.8 - 0.9;
             }
             if kind == 2 {
-                c.bsdf_flags = BSDF_THIN_WALLED;
+                c.bsdf_flags |= BSDF_THIN_WALLED;
             }
             if kind == 3 {
                 c.coat_weight = rng.next();
@@ -365,9 +375,15 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             i,
         );
         close(cpu.ior, g.ior, 1e-5 * cpu.ior.max(1.0), "IOR layout", i);
+        let mix = c.bsdf_flags & BSDF_FRESNEL_MIX != 0;
+        assert_eq!(g.bsdf_flags & BSDF_FRESNEL_MIX != 0, mix, "case {i} mix");
+        let flat = c.bsdf_flags & BSDF_METAL_FLAT;
+        assert_eq!(g.bsdf_flags & BSDF_METAL_FLAT, flat, "case {i} flat metal");
         assert_eq!(cpu.flags, g.flags, "case {i} flags layout");
+        let root = byte(w.b[1], 24);
+        let scale = if mix { root * root } else { 1.0 };
         close3(
-            arr(cpu.specular_color),
+            arr(cpu.specular_color * scale),
             g.specular_color,
             1e-6,
             "specular color layout",
@@ -427,13 +443,28 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             ior_step(r(c.ior))
         };
         close(r(g.ior), r(c.ior), step, "IOR", i);
-        close3(
-            srgb3(g.specular_color),
-            srgb3(c.specular_color),
-            0.5 / 127.0 + 1e-6,
-            "specular color",
-            i,
-        );
+        if mix {
+            // The size of F0 to a byte of its root, its hue to seven sRGB bits.
+            let peak = Vec3::from(c.specular_color).max_element();
+            let got = Vec3::from(g.specular_color).max_element();
+            close(got.sqrt(), peak.sqrt(), step8, "F0 size", i);
+            let tint = |v: [f32; 3], p: f32| v.map(|x| x / p.max(1e-9));
+            close3(
+                srgb3(tint(g.specular_color, got)),
+                srgb3(tint(c.specular_color, peak)),
+                0.5 / 127.0 + 1e-6,
+                "F0 hue",
+                i,
+            );
+        } else {
+            close3(
+                srgb3(g.specular_color),
+                srgb3(c.specular_color),
+                0.5 / 127.0 + 1e-6,
+                "specular color",
+                i,
+            );
+        }
         if c.raster_error == 0.0 {
             assert_eq!(g.raster_error, 0.0);
         } else {

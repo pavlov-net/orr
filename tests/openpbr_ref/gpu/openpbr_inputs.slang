@@ -46,6 +46,7 @@ struct Inputs
     float geometry_opacity;
     uint geometry_thin_walled;
     float exterior_ior;
+    uint bsdf_flags;    // BSDF_* past what OpenPBR states; the reference reads none
 }
 
 OpenPBR_ResolvedInputs resolve(Inputs m)

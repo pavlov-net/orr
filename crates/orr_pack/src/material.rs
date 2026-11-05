@@ -136,9 +136,19 @@ impl Material {
 
     /// The fields mean what OpenPBR states.
     pub const MODEL_OPENPBR: u8 = 0;
-    /// As [`Self::MODEL_OPENPBR`], where UsdPreviewSurface says otherwise: the coat shades on the
-    /// base's normal, normal map included.
-    pub const MODEL_PREVIEW: u8 = 1;
+    /// As glTF's metallic-roughness: the dielectric Fresnel runs from `F0` at normal incidence to
+    /// [`Self::specular_weight`] at grazing, with `F0` the IOR's times [`Self::specular_color`]
+    /// (at most 1) times the weight, and what it leaves goes to the layer below. Neither field
+    /// reaches a metal, whose edge is white, or the angle of refraction. The coat mixes over all of
+    /// that by its Fresnel term, and takes nothing from the base's IOR or roughness.
+    pub const MODEL_GLTF: u8 = 1;
+    /// As [`Self::MODEL_GLTF`] under UsdPreviewSurface's metalness workflow, except that a metal
+    /// reflects its base color at every angle and the coat shades on the base's normal, normal
+    /// map included.
+    pub const MODEL_PREVIEW: u8 = 2;
+    /// As [`Self::MODEL_PREVIEW`] under its specular workflow: [`Self::specular_color`] is `F0`
+    /// itself.
+    pub const MODEL_PREVIEW_SPECULAR: u8 = 3;
 
     /// The uv set the tangent frame follows, 0 or 1, or [`Self::TANGENT_SET_OTHER`].
     pub fn tangent_set(&self) -> u8 {

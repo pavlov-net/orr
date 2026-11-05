@@ -16,9 +16,8 @@
 //!   `occlusion` isn't read: a path tracer computes it. `opacityThreshold` above 0 alpha-tests
 //!   `opacity` at it; otherwise `opacityMode` `presence` blends an opacity below 1 or textured,
 //!   and `transparent` makes the rest of it thin-walled transmission, which leaves specular and
-//!   emission at full weight. The specular workflow's `specularColor` is F0: `specular_ior`
-//!   gives its largest channel and `specular_color` the others, so a colored F0 tints the edge
-//!   as well.
+//!   emission at full weight. The specular workflow's `specularColor` is F0, with `ior` left to
+//!   refraction and the coat.
 //!
 //! An input is a constant, or reads a texture through these nodes: MaterialX `image` and
 //! `tiledimage` (with `texcoord`, `geompropvalue` and `place2d` on their coordinates,
@@ -1280,6 +1279,7 @@ impl Mapper<'_, '_> {
     fn preview(&mut self, n: usize) -> Result<(), String> {
         let m = &mut self.material;
         m.model = Material::MODEL_PREVIEW;
+        m.coat_darkening = 0.0;
         m.base_color = [0.18; 3];
         m.metalness = 0.0;
         m.specular_roughness = 0.5;
@@ -1305,21 +1305,9 @@ impl Mapper<'_, '_> {
         self.scalar(n, "ior", |m| &mut m.specular_ior, None)?;
         let ior = self.material.specular_ior;
         if specular {
+            self.material.model = Material::MODEL_PREVIEW_SPECULAR;
+            self.material.specular_color = [0.0; 3];
             self.color(n, "specularColor", |m| &mut m.specular_color, None)?;
-            let authored = self.input(n, "specularColor").is_some();
-            let f0 = if authored {
-                self.material.specular_color
-            } else {
-                [0.0; 3]
-            };
-            // Past this the IOR leaves what a float holds.
-            let peak = f0.into_iter().fold(0.0, f32::max).clamp(0.0, 0.9999);
-            let r = peak.sqrt();
-            self.material.specular_ior = (1.0 + r) / (1.0 - r);
-            self.material.specular_color = match peak {
-                0.0 => [1.0; 3],
-                _ => f0.map(|c| c.max(0.0) / peak),
-            };
         } else {
             self.scalar(
                 n,

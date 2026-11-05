@@ -20,6 +20,10 @@ use shader_math::stats::{Rng, SphereGrid};
 /// Directional albedo accuracy the plan asks of the approximation, absolute.
 const ALBEDO: f64 = 0.02;
 
+/// `BSDF_FRESNEL_MIX` and `BSDF_METAL_FLAT`.
+const FRESNEL_MIX: u32 = 1 << 7;
+const METAL_FLAT: u32 = 1 << 8;
+
 /// `a` and `b` agree within `tolerance` plus 3 combined standard errors in every channel.
 fn agree(a: &Estimate, b: &Estimate, tolerance: f64) -> bool {
     (0..3).all(|c| {
@@ -384,6 +388,82 @@ fn a_coat_keeps_its_own_frame() {
                 let near = (a[k] - b[k]).abs() <= 0.03 * b[k] + 2e-3;
                 assert!(near, "{i} {light}: {a:?} vs {b:?}");
             }
+        }
+    }
+}
+
+/// glTF's `mix(dielectric_f0, dielectric_f90, fresnel_w)` and PS "Edge color is assumed white":
+/// a colored F0 falls to a white edge, scaled by the weight, and the IOR plays no part.
+#[test]
+fn a_fresnel_mix_runs_from_f0_to_a_white_edge() {
+    let f0 = [0.5, 0.25, 0.1];
+    let inputs = Inputs {
+        specular_color: f0,
+        specular_weight: 0.5,
+        specular_roughness: 0.0,
+        specular_ior: 1.1,
+        base_color: [0.0; 3],
+        bsdf_flags: FRESNEL_MIX,
+        ..Inputs::default()
+    };
+    let delta = |bsdf: &mut RealTime, c: f32| {
+        let view = [(1.0 - c * c).sqrt(), 0.0, c];
+        bsdf.prepare(&inputs, view);
+        let wi = [-view[0], 0.0, c];
+        let (value, chance) = bsdf.delta_value(2, wi);
+        assert!(chance > 0.0);
+        value
+    };
+    let mut bsdf = RealTime::new();
+    for c in [1.0, 0.7, 0.3, 0.05] {
+        let got = delta(&mut bsdf, c);
+        let x = (1.0f32 - c).powi(5);
+        for k in 0..3 {
+            let want = 0.5 * (f0[k] + (1.0 - f0[k]) * x);
+            assert!((got[k] - want).abs() < 1e-4, "{c}: {got:?}");
+        }
+    }
+}
+
+/// glTF: "The metal BRDF is not affected by the parameter", against OpenPBR's weight and tint.
+#[test]
+fn a_fresnel_mix_leaves_metal_alone() {
+    let view = [0.6, 0.0, 0.8];
+    let metal = Inputs {
+        base_metalness: 1.0,
+        base_color: [0.9, 0.6, 0.3],
+        specular_roughness: 0.4,
+        ..Inputs::default()
+    };
+    let tinted = Inputs {
+        specular_color: [0.1, 0.2, 0.3],
+        specular_weight: 0.25,
+        bsdf_flags: FRESNEL_MIX,
+        ..metal
+    };
+    let [_, want] = albedo_by_kind(&mut RealTime::new(), &metal, view, 1 << 16, 3);
+    let [_, got] = albedo_by_kind(&mut RealTime::new(), &tinted, view, 1 << 16, 3);
+    assert!(agree(&got, &want, 1e-3), "{got:?} vs {want:?}");
+}
+
+/// PS: a metal's "F0 ... and edge F90 reflectivity will simply be the Albedo".
+#[test]
+fn a_flat_metal_reflects_its_color_at_every_angle() {
+    let color = [0.9, 0.6, 0.3];
+    let inputs = Inputs {
+        base_metalness: 1.0,
+        base_color: color,
+        specular_roughness: 0.0,
+        bsdf_flags: FRESNEL_MIX | METAL_FLAT,
+        ..Inputs::default()
+    };
+    let mut bsdf = RealTime::new();
+    for c in [1.0f32, 0.5, 0.05] {
+        let view = [(1.0 - c * c).sqrt(), 0.0, c];
+        bsdf.prepare(&inputs, view);
+        let (value, _) = bsdf.delta_value(2, [-view[0], 0.0, c]);
+        for k in 0..3 {
+            assert!((value[k] - color[k]).abs() < 1e-4, "{c}: {value:?}");
         }
     }
 }

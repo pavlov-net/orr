@@ -82,6 +82,7 @@ impl Default for Inputs {
             geometry_opacity: 1.0,
             geometry_thin_walled: 0,
             exterior_ior: 1.0,
+            bsdf_flags: 0,
         }
     }
 }

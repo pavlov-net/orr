@@ -1013,6 +1013,25 @@ fn the_alpha_test_holds_per_texel() {
     }
 }
 
+/// KHR_materials_specular: "The specular color factor is allowed to be set to values greater than
+/// [1, 1, 1]", and clearcoat's `fresnel_coat` is a mix: the model says so, darkening nothing.
+#[test]
+fn specular_and_coat_keep_the_gltf_model() {
+    let path = dir("specular-model").join("specular.glb");
+    textured_quad(
+        &path,
+        &gradient(),
+        r#"{"extensions":{"KHR_materials_specular":{"specularFactor":0.5,"specularColorFactor":[4.0,2.0,0.5]},
+            "KHR_materials_clearcoat":{"clearcoatFactor":1.0}}}"#,
+        "",
+    );
+    let m = material_of(&cooked(&path).0);
+    assert_eq!(m.model, Material::MODEL_GLTF);
+    assert_eq!(m.specular_weight, 0.5);
+    assert_eq!(m.specular_color, [4.0, 2.0, 0.5]);
+    assert_eq!((m.coat_ior, m.coat_darkening), (1.5, 0.0));
+}
+
 /// KHR_materials_iridescence: "`iridescenceFactor` is multiplied with the red channel of
 /// `iridescenceTexture` to control the overall strength".
 #[test]

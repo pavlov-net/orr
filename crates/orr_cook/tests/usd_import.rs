@@ -1258,6 +1258,7 @@ fn assert_same_materials(ga: &Archive, g: &Material, ua: &Archive, u: &Material)
     let strip = |m: &Material| Material {
         textures: bytemuck::Zeroable::zeroed(),
         frame_uv: 0,
+        model: 0,
         ..*m
     };
     assert_eq!(strip(g), strip(u));

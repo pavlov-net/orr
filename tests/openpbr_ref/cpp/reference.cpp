@@ -50,6 +50,7 @@ struct Inputs {
     float geometry_opacity;
     uint32_t geometry_thin_walled;
     float exterior_ior;
+    uint32_t bsdf_flags;
 };
 
 static vec3 load3(const float* p) { return vec3(p[0], p[1], p[2]); }
