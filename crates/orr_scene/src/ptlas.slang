@@ -823,7 +823,6 @@ void emit(uint3 id: SV_DispatchThreadID)
         return;
     }
     st.rt_age = 0;
-    st.rt_lod = uint8_t(op.cut);
     InstanceGpu base = s.instances[slot];
     uint near = chain_near(*st);
     bool fading = st.fade != 0;
@@ -843,7 +842,8 @@ void emit(uint3 id: SV_DispatchThreadID)
     {
         uint index;
         bool rebuilt = op.cut == RT_CUT_BUILT;
-        if (written && (blas != st.rt_blas || rebuilt) && reserve(COUNTER_UPDATES, t.update_capacity, 1, index))
+        bool changed = blas != st.rt_blas || rebuilt;
+        if (written && changed && reserve(COUNTER_UPDATES, t.update_capacity, 1, index))
         {
             PtlasUpdate u;
             u.blas = blas;
@@ -851,6 +851,11 @@ void emit(uint3 id: SV_DispatchThreadID)
             u.pad = 0;
             store((uint64_t)t.updates, index, u);
             st.rt_blas = blas;
+            st.rt_lod = uint8_t(op.cut);
+        }
+        else if (!changed)
+        {
+            st.rt_lod = uint8_t(op.cut);
         }
     }
     else
@@ -876,6 +881,7 @@ void emit(uint3 id: SV_DispatchThreadID)
         if (was_global && !global)
             InterlockedAdd(t.counters[COUNTER_GLOBAL], uint(-1));
         st.rt_blas = disable ? 0 : blas;
+        st.rt_lod = uint8_t(op.cut);
         st.rt_partition = op.partition;
         st.rt_key = op.key;
         uint chain = disable ? 0 : (near << RT_STEP_SHIFT) | (fading ? RT_FADING : 0);
