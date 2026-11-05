@@ -680,14 +680,13 @@ fn opaque_triangles_never_cover_cut_out_texels() {
     assert_eq!(cut_out("gltf-alpha", None), [0.0; 6]);
 }
 
-/// A texture transform (glTF's `T R S`, uvs turned counter-clockwise) reaches the material
-/// and the cook's opacity reads.
+/// A texture transform reaches the material and the cook's opacity reads.
 #[test]
 fn texture_transforms_map_the_uvs_the_cook_reads() {
     let t = r#"{"offset":[0.2,-0.1],"rotation":0.4,"scale":[0.8,1.2]}"#;
     let got = cut_out("gltf-alpha-transform", Some(t));
     let (s, c) = 0.4f32.sin_cos();
-    let want = [c * 0.8 - 1.0, -s * 1.2, 0.2, s * 0.8, c * 1.2 - 1.0, -0.1];
+    let want = [c * 0.8 - 1.0, s * 1.2, 0.2, -s * 0.8, c * 1.2 - 1.0, -0.1];
     for (g, w) in got.iter().zip(want) {
         assert!((g - w).abs() < 1e-6, "{got:?} against {want:?}");
     }

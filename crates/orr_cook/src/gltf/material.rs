@@ -160,9 +160,10 @@ pub(super) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
     out
 }
 
-/// The `KHR_texture_transform` of a textureInfo object in `Material::uv_transforms` form
-/// (`T R S`, the rotation turning the uvs counter-clockwise), and the uv set it reads: the
-/// extension's `texCoord`, else the object's.
+/// The `KHR_texture_transform` of a textureInfo object in `Material::uv_transforms` form, and
+/// the uv set it reads: the extension's `texCoord`, else the object's. `T R S`, with the uvs
+/// turning counter-clockwise about their upper left origin, so a positive rotation takes +u
+/// toward -v and turns the image clockwise.
 fn uv_transform(info: &Value) -> ([f32; 6], u32) {
     let coord = |v: &Value| v["texCoord"].as_u64().map(|c| c as u32);
     let Some(t) = info["extensions"].get("KHR_texture_transform") else {
@@ -179,7 +180,7 @@ fn uv_transform(info: &Value) -> ([f32; 6], u32) {
     let [ox, oy] = pair("offset", [0.0, 0.0]);
     let [sx, sy] = pair("scale", [1.0, 1.0]);
     let (sin, cos) = num(t, "rotation", 0.0).sin_cos();
-    let uv = [cos * sx - 1.0, -sin * sy, ox, sin * sx, cos * sy - 1.0, oy];
+    let uv = [cos * sx - 1.0, sin * sy, ox, -sin * sx, cos * sy - 1.0, oy];
     (uv, coord(t).or(coord(info)).unwrap_or(0))
 }
 
