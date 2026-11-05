@@ -10,8 +10,8 @@
 //! default weights (the node's `weights`, else the mesh's). With skins, the mesh is in
 //! bind space: a skinned primitive's vertices stay as stored (glTF ignores its node's
 //! transform), take their joints and weights from `JOINTS_n`/`WEIGHTS_n`, and a primitive
-//! without a skin follows its nearest skeleton joint rigidly; skins and model selection do
-//! not mix.
+//! without a skin follows its nearest skeleton joint rigidly, or with none stays where its
+//! node puts it; skins and model selection do not mix.
 //!
 //! With [`GltfLayout::Meshes`] every glTF mesh the scene places is a model `mesh/<i>` in the
 //! mesh's own space (`mesh/<i>/morph/<k>` for each other set of node morph weights), and every
@@ -1121,7 +1121,15 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
         .collect();
     skins.sort_unstable();
     skins.dedup();
-    let skeleton = Skeleton::build(&data, graph, &skins).map_err(fail)?;
+    let unskinned: Vec<usize> = shown
+        .iter()
+        .copied()
+        .filter(|&n| {
+            let node = doc.nodes().nth(n).expect("node index");
+            node.skin().is_none() && surface_mesh(&node).is_some()
+        })
+        .collect();
+    let skeleton = Skeleton::build(&data, graph, &skins, &unskinned).map_err(fail)?;
     if skeleton.is_some() && !settings.models.is_empty() {
         return Err(fail(
             "model selection needs a scene without skins: skinned vertices stay in bind space"
