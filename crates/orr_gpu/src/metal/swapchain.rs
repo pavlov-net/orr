@@ -9,18 +9,19 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
+use dispatch2::DispatchQueue;
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceITUR_2100_PQ, kCGColorSpaceSRGB};
 use objc2_foundation::NSData;
-use objc2_metal::{MTL4CommandQueue, MTLDrawable, MTLPixelFormat, MTLTexture};
+use objc2_metal::{MTL4CommandQueue, MTLDrawable, MTLTexture};
 use objc2_quartz_core::{CAEDRMetadata, CAMetalDrawable, CAMetalLayer, CATransaction};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use super::device::Device;
-use super::texture::Texture;
+use super::texture::{Texture, pixel_format};
 use super::{Obj, lock};
 use crate::{
     Error, Format, HdrMetadata, LatencyMarker, LatencyTimings, OutputFormat, PresentMode,
@@ -148,6 +149,7 @@ struct Applied {
     format: OutputFormat,
     hdr: Option<HdrMetadata>,
     mode: PresentMode,
+    drawables: u32,
     extent: [u32; 2],
 }
 
@@ -161,6 +163,7 @@ pub struct Swapchain {
     format: OutputFormat,
     hdr: Option<HdrMetadata>,
     mode: PresentMode,
+    drawables: u32,
     applied: Option<Applied>,
     next_present_id: u64,
     presented: Arc<Presented>,
@@ -206,7 +209,6 @@ impl Swapchain {
                 .expect("raw-window-metal returns a layer");
         layer.setDevice(Some(&device.shared.device));
         layer.setFramebufferOnly(false);
-        layer.setMaximumDrawableCount(desc.min_images.clamp(2, MAX_DRAWABLES) as usize);
         queue.raw.addResidencySet(&layer.residencySet());
         let s = Swapchain {
             device: device.clone(),
@@ -219,6 +221,7 @@ impl Swapchain {
             },
             hdr: desc.hdr,
             mode: desc.present_mode,
+            drawables: desc.min_images.clamp(2, MAX_DRAWABLES),
             applied: None,
             next_present_id: 1,
             presented: Arc::default(),
@@ -243,10 +246,9 @@ impl Swapchain {
         Ok(())
     }
 
-    /// Asks for at least `n` drawables; a layer holds two or three.
+    /// Asks for at least `n` drawables at the next acquire; a layer holds two or three.
     pub fn set_min_images(&mut self, n: u32) {
-        self.layer
-            .setMaximumDrawableCount(n.clamp(2, MAX_DRAWABLES) as usize);
+        self.drawables = n.clamp(2, MAX_DRAWABLES);
     }
 
     /// Switches between FIFO and IMMEDIATE at the next acquire.
@@ -305,6 +307,7 @@ impl Swapchain {
             format: self.format,
             hdr: self.hdr,
             mode: self.mode,
+            drawables: self.drawables,
             extent,
         };
         if self.applied != Some(wanted) {
@@ -345,21 +348,20 @@ impl Swapchain {
         CATransaction::setDisableActions(true);
         let layer = &self.layer;
         layer.setDrawableSize(CGSize::new(f64::from(a.extent[0]), f64::from(a.extent[1])));
+        layer.setMaximumDrawableCount(a.drawables as usize);
         #[cfg(target_os = "macos")]
         layer.setDisplaySyncEnabled(a.mode == PresentMode::Fifo);
         // SAFETY: CoreGraphics' color space names are constants.
-        let (pixel_format, space, edr) = unsafe {
+        let (space, edr) = unsafe {
             match a.format {
-                OutputFormat::Sdr => (MTLPixelFormat::BGRA8Unorm, kCGColorSpaceSRGB, false),
-                OutputFormat::Hdr10Pq => (
-                    MTLPixelFormat::RGB10A2Unorm,
-                    kCGColorSpaceITUR_2100_PQ,
-                    true,
-                ),
+                OutputFormat::Sdr => (kCGColorSpaceSRGB, false),
+                OutputFormat::Hdr10Pq => (kCGColorSpaceITUR_2100_PQ, true),
                 OutputFormat::ScRgb => unreachable!("layers don't take scRGB"),
             }
         };
-        layer.setPixelFormat(pixel_format);
+        layer.setPixelFormat(
+            pixel_format(texture_format(a.format)).expect("layer formats have pixel formats"),
+        );
         let space = CGColorSpace::with_name(Some(space));
         layer.setColorspace(space.as_deref());
         layer.setWantsExtendedDynamicRangeContent(edr);
@@ -423,13 +425,22 @@ impl Drop for Swapchain {
         let layer = self.layer.clone();
         let queue = self.queue().raw.clone();
         let added = self.added;
-        // The layer's drawables stay resident until the GPU is done with them.
+        // The layer's drawables stay resident until the GPU is done with them. The release
+        // runs on whichever thread collects garbage, and the view's layers change on the main
+        // thread only.
         self.device.shared.defer(Box::new(move || {
             queue.removeResidencySet(&layer.residencySet());
             if added {
-                CATransaction::begin();
-                layer.removeFromSuperlayer();
-                CATransaction::commit();
+                let remove = move || {
+                    CATransaction::begin();
+                    layer.removeFromSuperlayer();
+                    CATransaction::commit();
+                };
+                if MainThreadMarker::new().is_some() {
+                    remove();
+                } else {
+                    DispatchQueue::main().exec_async(remove);
+                }
             }
         }));
     }

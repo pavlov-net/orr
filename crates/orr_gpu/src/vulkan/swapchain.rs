@@ -130,6 +130,9 @@ impl Locked {
 struct Lock {
     shared: Arc<Shared>,
     surface: vk::SurfaceKHR,
+    /// Held by swapchain creation, which needs the surface to itself, and by
+    /// [`WindowExtent`]'s queries, which then need not wait for acquires and presents.
+    creating: Mutex<()>,
     locked: Mutex<Locked>,
     /// Timeline semaphore `vkLatencySleepNV` signals; null without low latency.
     sleep: vk::Semaphore,
@@ -190,9 +193,9 @@ impl WindowExtent {
     /// no area, or once the window is gone.
     pub fn get(&self) -> Option<[u32; 2]> {
         let caps = {
-            let _locked = self.lock.lock();
-            // SAFETY: the surface and physical device are live, and the lock keeps a swapchain
-            // creation, which needs the surface to itself, from running beside this.
+            let _creating = self.lock.creating.lock().unwrap();
+            // SAFETY: the surface and physical device are live, and `creating` keeps a swapchain
+            // creation from running beside this.
             unsafe {
                 self.lock
                     .fns()
@@ -474,6 +477,7 @@ impl Swapchain {
         let lock = Arc::new(Lock {
             shared: Arc::clone(shared),
             surface,
+            creating: Mutex::new(()),
             locked: Mutex::new(Locked {
                 raw: vk::SwapchainKHR::null(),
                 latency: false,
@@ -937,9 +941,12 @@ impl Swapchain {
         }
         let raw = {
             let mut locked = self.lock.lock();
-            // SAFETY: valid create info; the old swapchain is ours and the lock is held.
+            let creating = self.lock.creating.lock().unwrap();
+            // SAFETY: valid create info; the old swapchain is ours, and the lock and `creating`
+            // are held.
             let raw = unsafe { fns.swapchain.create_swapchain(&info, None) }
                 .map_err(Error::vk("vkCreateSwapchainKHR"))?;
+            drop(creating);
             locked.raw = raw;
             locked.latency = low_latency;
             if let (true, Some(m)) = (low_latency, locked.mode) {
