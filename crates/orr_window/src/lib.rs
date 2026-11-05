@@ -10,6 +10,8 @@ use raw_window_handle::RawWindowHandle;
 mod win32;
 #[cfg(windows)]
 use win32 as imp;
+#[cfg(windows)]
+pub use win32::set_message_hook;
 
 #[cfg(target_os = "macos")]
 mod appkit;
@@ -21,9 +23,23 @@ mod none;
 #[cfg(not(any(windows, target_os = "macos")))]
 use none as imp;
 
+/// A screen's extended dynamic range, as multiples of the OS's SDR white. That white moves with
+/// the brightness setting and has no known luminance, so these don't convert to nits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DisplayHeadroom {
+    /// What the screen can show now. It moves with brightness, and rises over some seconds
+    /// once extended range content is showing.
+    pub current: f32,
+    /// The most the screen can reach.
+    pub potential: f32,
+    /// The most it shows without tone mapping of its own, on screens that report one.
+    pub reference: Option<f32>,
+}
+
 /// What the OS reports for the window's monitor. With HDR on, the luminance fields are the
 /// display's default HDR color profile (the Windows HDR Calibration app writes one), else
-/// EDID; a consumer's request overrides them.
+/// EDID; a consumer's request overrides them. An OS that only reports relative range fills
+/// `headroom` instead of the luminance fields.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DisplayInfo {
     pub os_hdr_on: Option<bool>,
@@ -31,6 +47,7 @@ pub struct DisplayInfo {
     pub max_full_frame_nits: Option<f32>,
     pub min_nits: Option<f32>,
     pub sdr_white_nits: Option<f32>,
+    pub headroom: Option<DisplayHeadroom>,
     pub refresh_hz: Option<f32>,
     /// Red, green, blue and white, CIE 1931 xy.
     pub primaries_xy: Option<[[f32; 2]; 4]>,
@@ -98,43 +115,36 @@ impl DisplayWatch {
     /// Watches `window` and returns the feed it keeps current, already holding a first
     /// reading.
     pub fn new(window: RawWindowHandle) -> Result<(Self, DisplayFeed)> {
-        let (imp, feed) = imp::Watch::new(window, None)?;
-        Ok((Self { _imp: imp }, feed))
-    }
-
-    /// As [`Self::new`], and also calls `hook` on the window's thread with every message
-    /// the window receives, before the window handles it.
-    #[cfg(windows)]
-    pub fn with_message_hook(
-        window: RawWindowHandle,
-        hook: fn(u32),
-    ) -> Result<(Self, DisplayFeed)> {
-        let (imp, feed) = imp::Watch::new(window, Some(hook))?;
+        let (imp, feed) = imp::Watch::new(window)?;
         Ok((Self { _imp: imp }, feed))
     }
 }
 
-/// How far the SDR white and the peak may move, as a share of their value, and still count as
-/// unchanged: each change moves the tone curve, and the readings drift (on macOS the peak
-/// follows the brightness setting).
+/// How far the SDR white, the peak and the headroom may move, as a share of their value, and
+/// still count as unchanged: each change moves the tone curve, and the readings drift (macOS's
+/// headroom follows the brightness setting).
 const STEADY_TOLERANCE: f32 = 0.01;
 
-/// `new` keeping the last SDR white and peak while each stays within `STEADY_TOLERANCE` of
-/// `new`'s.
+/// `new` keeping the last SDR white, peak and current headroom while each stays within
+/// `STEADY_TOLERANCE` of `new`'s.
 #[cfg_attr(
     not(any(windows, target_os = "macos", test)),
     expect(dead_code, reason = "used by the platform watches")
 )]
 fn steady(last: DisplayInfo, mut new: DisplayInfo) -> DisplayInfo {
-    let hold = |old: Option<f32>, new: &mut Option<f32>| {
-        if let (Some(old), Some(value)) = (old, *new)
-            && (value - old).abs() <= STEADY_TOLERANCE * old
+    let hold = |old: Option<f32>, new: Option<&mut f32>| {
+        if let (Some(old), Some(value)) = (old, new)
+            && (*value - old).abs() <= STEADY_TOLERANCE * old
         {
-            *new = Some(old);
+            *value = old;
         }
     };
-    hold(last.sdr_white_nits, &mut new.sdr_white_nits);
-    hold(last.max_nits, &mut new.max_nits);
+    hold(last.sdr_white_nits, new.sdr_white_nits.as_mut());
+    hold(last.max_nits, new.max_nits.as_mut());
+    hold(
+        last.headroom.map(|h| h.current),
+        new.headroom.as_mut().map(|h| &mut h.current),
+    );
     new
 }
 
@@ -157,5 +167,19 @@ mod tests {
             with(200.0),
             "a first reading stands"
         );
+    }
+
+    #[test]
+    fn current_headroom_stays_through_small_changes_only() {
+        let with = |current: f32| DisplayInfo {
+            headroom: Some(DisplayHeadroom {
+                current,
+                potential: 8.0,
+                reference: None,
+            }),
+            ..DisplayInfo::default()
+        };
+        assert_eq!(steady(with(2.0), with(2.01)), with(2.0));
+        assert_eq!(steady(with(2.0), with(2.03)), with(2.03));
     }
 }

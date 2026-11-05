@@ -1028,6 +1028,7 @@ mod glare {
         ResolvedDisplay {
             encoding: OutputFormat::ScRgb,
             paper_white_nits: 250.0,
+            signal_white_nits: 250.0,
             peak_nits,
             black_nits: 0.0,
         }
@@ -1037,6 +1038,7 @@ mod glare {
         ResolvedDisplay {
             encoding: OutputFormat::Sdr,
             paper_white_nits: 250.0,
+            signal_white_nits: 250.0,
             peak_nits: 250.0,
             black_nits: 0.0,
         }
@@ -1545,6 +1547,7 @@ mod glare {
         let hdr = ResolvedDisplay {
             encoding: OutputFormat::Hdr10Pq,
             paper_white_nits: 250.0,
+            signal_white_nits: 250.0,
             peak_nits: 1000.0,
             black_nits: 0.0,
         };
@@ -2008,6 +2011,7 @@ mod lens_distortion {
                 display: ResolvedDisplay {
                     encoding: OutputFormat::ScRgb,
                     paper_white_nits: 250.0,
+                    signal_white_nits: 250.0,
                     peak_nits: 1000.0,
                     black_nits: 0.0,
                 },

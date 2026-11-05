@@ -76,7 +76,7 @@ fn captures_carry_their_frames() {
     let last = &shots[3];
     assert!(!last.scene_referred && !last.hdr);
     assert_eq!(last.primaries, Primaries::Rec709);
-    assert_eq!(last.paper_white_nits, display.paper_white_nits);
+    assert_eq!(last.paper_white_nits, display.signal_white_nits);
     for (i, (got, linear)) in last
         .rgba
         .chunks_exact(4)

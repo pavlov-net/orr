@@ -171,7 +171,7 @@ mod run {
                     let text = format!(
                         "request: {label}{}\n\
                          {:?}  paper white {:.0}  peak {:.0}  black {:.3} nits\n\
-                         OS: HDR {:?}, SDR white {:?}, max {:?}, min {:?}, {:?} Hz\n\
+                         OS: HDR {:?}, SDR white {:?}, max {:?}, min {:?}, headroom {:?}, {:?} Hz\n\
                          {pattern:?}",
                         if ignore_os { " (OS state ignored)" } else { "" },
                         resolved.encoding,
@@ -182,6 +182,7 @@ mod run {
                         info.sdr_white_nits,
                         info.max_nits,
                         info.min_nits,
+                        info.headroom.map(|h| h.current),
                         info.refresh_hz,
                     );
                     egui::Frame::new()

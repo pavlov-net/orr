@@ -92,11 +92,7 @@ impl Reader {
 }
 
 impl Watch {
-    pub(crate) fn new(
-        window: RawWindowHandle,
-        hook: Option<fn(u32)>,
-    ) -> Result<(Self, DisplayFeed)> {
-        let _ = hook;
+    pub(crate) fn new(window: RawWindowHandle) -> Result<(Self, DisplayFeed)> {
         let RawWindowHandle::AppKit(handle) = window else {
             return Err(Error::UnsupportedWindow);
         };

@@ -46,13 +46,13 @@ pub use orr_output::DisplayWatch;
 pub use orr_output::{self, Error as OutputError};
 pub use orr_output::{
     AutoExposure, AutoWhiteBalance, CalibrationPattern, CompensationCurve, Display, DisplayFeed,
-    DisplayInfo, DisplayRequest, Exposure, ExposureTelemetry, FrameGenerationBackend,
-    FrameGenerationCamera, FrameGenerationFeature, FrameGenerationInputs, FrameGenerationMode,
-    GlareMethod, Grade, Gt7Params, HookPass, InterpolationCheck, LocalExposure, MeterWeights,
-    OutputDebug, Physiological, PostQuality, Presented, Primaries, Reconstruction,
-    ReconstructionBackend, ReconstructionFeature, ReconstructionInputs, ReconstructionSupport,
-    ResolvedDisplay, Screenshot, ScreenshotRequest, SkyTelemetry, UiPass, UpscaleMode,
-    UpscaleQuality, ViewOutput,
+    DisplayHeadroom, DisplayInfo, DisplayRequest, Exposure, ExposureTelemetry,
+    FrameGenerationBackend, FrameGenerationCamera, FrameGenerationFeature, FrameGenerationInputs,
+    FrameGenerationMode, GlareMethod, Grade, Gt7Params, HookPass, InterpolationCheck,
+    LocalExposure, MeterWeights, OutputDebug, Physiological, PostQuality, Presented, Primaries,
+    Reconstruction, ReconstructionBackend, ReconstructionFeature, ReconstructionInputs,
+    ReconstructionSupport, ResolvedDisplay, Screenshot, ScreenshotRequest, SkyTelemetry, UiPass,
+    UpscaleMode, UpscaleQuality, ViewOutput,
 };
 #[cfg(dlss)]
 pub use orr_output::{DlssSdk, DlssSupport};

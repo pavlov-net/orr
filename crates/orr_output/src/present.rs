@@ -414,11 +414,7 @@ impl Display {
         };
         #[cfg(all(windows, feature = "pcl-stats"))]
         let pcl_stats = latency.as_ref().map(crate::pcl_stats::Session::start);
-        #[cfg(all(windows, feature = "pcl-stats"))]
-        let watched = crate::DisplayWatch::with_message_hook(window, crate::pcl_stats::on_message);
-        #[cfg(not(all(windows, feature = "pcl-stats")))]
-        let watched = crate::DisplayWatch::new(window);
-        let (watch, feed) = match watched {
+        let (watch, feed) = match crate::DisplayWatch::new(window) {
             Ok((watch, feed)) => (Some(watch), Some(feed)),
             Err(e) => {
                 log::warn!("not watching the OS's display state, so presenting SDR: {e}");

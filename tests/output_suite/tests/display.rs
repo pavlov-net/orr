@@ -209,7 +209,10 @@ mod windowed {
         // It watches the OS on its own, and follows what the OS says.
         let os = display.feed().expect("watches the OS").latest().1;
         assert!(os.os_hdr_on.is_some());
-        assert!(os.sdr_white_nits.is_some(), "a report from the OS: {os:?}");
+        assert!(
+            os.sdr_white_nits.is_some() || os.headroom.is_some(),
+            "a report from the OS: {os:?}"
+        );
         let d = frames(&mut display, &mut window, 1);
         if os.os_hdr_on == Some(false) {
             assert_eq!(d.encoding, OutputFormat::Sdr);

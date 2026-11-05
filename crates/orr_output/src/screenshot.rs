@@ -28,7 +28,7 @@ pub struct Screenshot {
     pub rgba: Vec<f32>,
     pub scene_referred: bool,
     pub primaries: Primaries,
-    /// The display's paper white when captured.
+    /// Paper white's level in the signal when captured, in nits.
     pub paper_white_nits: f32,
     /// The display was HDR (PQ or scRGB).
     pub hdr: bool,

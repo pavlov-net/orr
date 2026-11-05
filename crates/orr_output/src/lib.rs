@@ -50,7 +50,7 @@ pub use orr_color::Primaries;
 #[cfg(dlss)]
 pub use orr_dlss::{self, DlssSdk, Support as DlssSupport};
 pub use orr_scene::orr_gpu::{LowLatency, OutputFormat};
-pub use orr_window::{self, DisplayFeed, DisplayInfo, DisplayWatch};
+pub use orr_window::{self, DisplayFeed, DisplayHeadroom, DisplayInfo, DisplayWatch};
 pub use overlay_front::OverlayFront;
 pub use passes::{
     CapturePass, ComposePass, ComposeRoot, ComposeSource, ExposurePass, HookInputsPass,

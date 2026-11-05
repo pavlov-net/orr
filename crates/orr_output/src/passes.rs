@@ -263,7 +263,7 @@ impl OutputView {
             rgba: Vec::new(),
             scene_referred: primaries.is_some(),
             primaries: primaries.unwrap_or(Primaries::Rec709),
-            paper_white_nits: display.paper_white_nits,
+            paper_white_nits: display.signal_white_nits,
             hdr: display.encoding != OutputFormat::Sdr,
         };
         let [w, h] = size;
@@ -1104,7 +1104,7 @@ fn compose_root(
         height: extent[1],
         source_kind,
         encoding,
-        paper_white_nits: display.paper_white_nits,
+        signal_white_nits: display.signal_white_nits,
         rec709: 0,
         _pad0: 0,
         _pad1: 0,

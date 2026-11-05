@@ -1,4 +1,4 @@
-use orr_color::{PQ_MAX_NITS, RgbPrimaries};
+use orr_color::{EDR_REFERENCE_NITS, PQ_MAX_NITS, RgbPrimaries, SCRGB_WHITE_NITS};
 use orr_scene::orr_gpu::{HdrMetadata, OutputFormat, PresentMode};
 use orr_window::DisplayInfo;
 
@@ -8,7 +8,8 @@ const DEFAULT_PEAK_NITS: f32 = 1000.0;
 const MAX_NITS: f32 = PQ_MAX_NITS as f32;
 
 /// What the consumer asks of a display. Luminance requests (from the consumer's calibration)
-/// override what the OS reports.
+/// override what the OS reports. On a display that reports headroom, nits are the tone curve's,
+/// with the OS's SDR white at 250, and the headroom limits the peak.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisplayRequest {
     /// Use an HDR encoding when the surface offers one and the OS has HDR on. Without a
@@ -42,7 +43,12 @@ impl Default for DisplayRequest {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResolvedDisplay {
     pub encoding: OutputFormat,
+    /// Paper white in the tone curve's nits.
     pub paper_white_nits: f32,
+    /// Paper white's level in the signal, in the encoding's nits. It equals `paper_white_nits`
+    /// on displays that report nits; on one that reports headroom, the curve's 250 lands on
+    /// the OS's SDR white.
+    pub signal_white_nits: f32,
     pub peak_nits: f32,
     pub black_nits: f32,
 }
@@ -51,14 +57,17 @@ impl DisplayRequest {
     /// Picks the encoding and luminance for a surface supporting `supported`, given what the
     /// OS reports. Pure.
     ///
-    /// - Encoding: `encoding` if supported, else with `hdr` PQ then scRGB, else SDR. With
-    ///   `info.os_hdr_on == Some(false)` every choice resolves to SDR, since Windows
-    ///   advertises PQ either way. With frame generation on, scRGB becomes PQ.
+    /// - Encoding: `encoding` if supported, else with `hdr` PQ then scRGB, or scRGB then PQ on
+    ///   a display that reports headroom, else SDR. With `info.os_hdr_on == Some(false)` every
+    ///   choice resolves to SDR, since Windows advertises PQ either way. With frame generation
+    ///   on, scRGB becomes PQ.
     /// - SDR: paper white = peak = 250 nits, black 0; requests and OS values are ignored.
     /// - PQ and scRGB: paper white from the request, else the OS SDR white, else 250; peak
     ///   from the request, else the display maximum, else 1000, at least 250; black from the
     ///   request, else the display minimum, else 0. Then black <= paper white <= peak <=
     ///   10000.
+    /// - With headroom: as above, with the OS's SDR white at 250 and the peak 250 x the current
+    ///   headroom, or the request if that's lower.
     pub fn resolve(
         &self,
         supported: &[OutputFormat],
@@ -66,15 +75,23 @@ impl DisplayRequest {
         frame_generation: bool,
     ) -> ResolvedDisplay {
         let info = info.copied().unwrap_or_default();
+        let headroom = info.headroom.map(|h| h.current.max(1.0));
         let available = |f: OutputFormat| {
             supported.contains(&f) && (f == OutputFormat::Sdr || info.os_hdr_on != Some(false))
         };
         let mut encoding = match self.encoding {
             Some(e) if available(e) => e,
-            _ if self.hdr => [OutputFormat::Hdr10Pq, OutputFormat::ScRgb]
-                .into_iter()
-                .find(|&f| available(f))
-                .unwrap_or(OutputFormat::Sdr),
+            _ if self.hdr => {
+                let order = if headroom.is_some() {
+                    [OutputFormat::ScRgb, OutputFormat::Hdr10Pq]
+                } else {
+                    [OutputFormat::Hdr10Pq, OutputFormat::ScRgb]
+                };
+                order
+                    .into_iter()
+                    .find(|&f| available(f))
+                    .unwrap_or(OutputFormat::Sdr)
+            }
             _ => OutputFormat::Sdr,
         };
         if frame_generation && encoding == OutputFormat::ScRgb {
@@ -88,16 +105,24 @@ impl DisplayRequest {
             return ResolvedDisplay {
                 encoding,
                 paper_white_nits: SDR_WHITE_NITS,
+                signal_white_nits: SDR_WHITE_NITS,
                 peak_nits: SDR_WHITE_NITS,
                 black_nits: 0.0,
             };
         }
 
         let positive = |v: Option<f32>| v.filter(|v| v.is_finite() && *v > 0.0);
-        let peak = positive(self.peak_nits)
-            .or(positive(info.max_nits))
-            .unwrap_or(DEFAULT_PEAK_NITS)
-            .clamp(SDR_WHITE_NITS, MAX_NITS);
+        let requested_peak = positive(self.peak_nits);
+        let peak = match headroom {
+            Some(h) => {
+                let room = SDR_WHITE_NITS * h;
+                requested_peak.map_or(room, |r| r.min(room))
+            }
+            None => requested_peak
+                .or(positive(info.max_nits))
+                .unwrap_or(DEFAULT_PEAK_NITS),
+        }
+        .clamp(SDR_WHITE_NITS, MAX_NITS);
         let paper_white = positive(self.paper_white_nits)
             .or(positive(info.sdr_white_nits))
             .unwrap_or(SDR_WHITE_NITS)
@@ -107,9 +132,20 @@ impl DisplayRequest {
             .or(non_negative(info.min_nits))
             .unwrap_or(0.0)
             .min(paper_white);
+        let signal_white = match headroom {
+            Some(_) => {
+                let os_white = match encoding {
+                    OutputFormat::ScRgb => SCRGB_WHITE_NITS,
+                    _ => EDR_REFERENCE_NITS,
+                };
+                paper_white / SDR_WHITE_NITS * os_white as f32
+            }
+            None => paper_white,
+        };
         ResolvedDisplay {
             encoding,
             paper_white_nits: paper_white,
+            signal_white_nits: signal_white,
             peak_nits: peak,
             black_nits: black,
         }
@@ -126,15 +162,16 @@ impl DisplayRequest {
 
 impl ResolvedDisplay {
     /// Mastering metadata for HDR encodings: Rec.2020 primaries, D65, the resolved peak and
-    /// black, MaxCLL at the resolved peak, MaxFALL unknown. `None` for SDR.
+    /// black at their signal levels, MaxCLL at the peak, MaxFALL unknown. `None` for SDR.
     pub(crate) fn hdr_metadata(&self) -> Option<HdrMetadata> {
         let p = RgbPrimaries::REC2020;
+        let signal = self.signal_white_nits / self.paper_white_nits;
         (self.encoding != OutputFormat::Sdr).then_some(HdrMetadata {
             primaries: [p.red, p.green, p.blue].map(Into::into),
             white: p.white.into(),
-            max_luminance: self.peak_nits,
-            min_luminance: self.black_nits,
-            max_cll: self.peak_nits,
+            max_luminance: self.peak_nits * signal,
+            min_luminance: self.black_nits * signal,
+            max_cll: self.peak_nits * signal,
             max_fall: 0.0,
         })
     }
@@ -180,6 +217,8 @@ impl CalibrationPattern {
 
 #[cfg(test)]
 mod tests {
+    use orr_window::DisplayHeadroom;
+
     use super::*;
 
     const ALL: [OutputFormat; 3] = [
@@ -216,6 +255,75 @@ mod tests {
         }
         let on = DisplayRequest::default().resolve(&ALL, Some(&hdr_info()), false);
         assert_eq!(on.encoding, OutputFormat::Hdr10Pq);
+    }
+
+    fn headroom(current: f32) -> DisplayInfo {
+        DisplayInfo {
+            os_hdr_on: Some(true),
+            headroom: Some(DisplayHeadroom {
+                current,
+                potential: 8.0,
+                reference: None,
+            }),
+            ..DisplayInfo::default()
+        }
+    }
+
+    #[test]
+    fn headroom_puts_os_white_at_the_curves_sdr_white() {
+        let hdr = DisplayRequest::default();
+        // No headroom yet: the SDR curve, with OS white at scRGB's 1.0.
+        let r = hdr.resolve(&ALL, Some(&headroom(1.0)), false);
+        assert_eq!(r.encoding, OutputFormat::ScRgb);
+        assert_eq!((r.paper_white_nits, r.peak_nits), (250.0, 250.0));
+        assert_eq!(r.signal_white_nits, SCRGB_WHITE_NITS as f32);
+
+        let r = hdr.resolve(&ALL, Some(&headroom(1.5)), false);
+        assert_eq!((r.paper_white_nits, r.peak_nits), (250.0, 375.0));
+        // Anything below 1 is no headroom, on a screen that still reports it.
+        for current in [0.5, 0.0, f32::NAN] {
+            let r = hdr.resolve(&ALL, Some(&headroom(current)), false);
+            assert_eq!(r.peak_nits, 250.0);
+            assert_eq!(r.signal_white_nits, SCRGB_WHITE_NITS as f32);
+        }
+
+        // PQ puts OS white at the level macOS maps to it, and its metadata follows.
+        let pq = DisplayRequest {
+            encoding: Some(OutputFormat::Hdr10Pq),
+            ..hdr
+        };
+        let r = pq.resolve(&ALL, Some(&headroom(4.0)), false);
+        assert_eq!(r.signal_white_nits, EDR_REFERENCE_NITS as f32);
+        let metadata = r.hdr_metadata().unwrap();
+        assert_eq!(metadata.max_luminance, 4.0 * EDR_REFERENCE_NITS as f32);
+
+        // A paper white above OS white raises the signal with it; headroom limits a peak.
+        let calibrated = DisplayRequest {
+            paper_white_nits: Some(500.0),
+            peak_nits: Some(2000.0),
+            ..hdr
+        };
+        let r = calibrated.resolve(&ALL, Some(&headroom(4.0)), false);
+        assert_eq!((r.paper_white_nits, r.peak_nits), (500.0, 1000.0));
+        assert_eq!(r.signal_white_nits, 2.0 * SCRGB_WHITE_NITS as f32);
+        let low = DisplayRequest {
+            peak_nits: Some(600.0),
+            ..hdr
+        };
+        let r = low.resolve(&ALL, Some(&headroom(4.0)), false);
+        assert_eq!(r.peak_nits, 600.0);
+
+        // Frame generation still leaves scRGB, and the signal follows the encoding.
+        let r = hdr.resolve(&ALL, Some(&headroom(4.0)), true);
+        assert_eq!(r.encoding, OutputFormat::Hdr10Pq);
+        assert_eq!(r.signal_white_nits, EDR_REFERENCE_NITS as f32);
+    }
+
+    #[test]
+    fn nits_keep_the_signal_at_paper_white() {
+        let r = DisplayRequest::default().resolve(&ALL, Some(&hdr_info()), false);
+        assert_eq!(r.signal_white_nits, r.paper_white_nits);
+        assert_eq!(r.hdr_metadata().unwrap().max_luminance, r.peak_nits);
     }
 
     #[test]
@@ -260,6 +368,7 @@ mod tests {
             ResolvedDisplay {
                 encoding: OutputFormat::Sdr,
                 paper_white_nits: 250.0,
+                signal_white_nits: 250.0,
                 peak_nits: 250.0,
                 black_nits: 0.0
             }

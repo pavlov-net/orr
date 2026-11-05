@@ -30,7 +30,7 @@ mod ffi {
             out: *mut f32,
             count: u32,
             encoding: u32,
-            paper_white_nits: f32,
+            signal_white_nits: f32,
         );
         pub(crate) fn orr_ev100_from_luminance(l: f32) -> f32;
         pub(crate) fn orr_luminance_from_ev100(e: f32) -> f32;
@@ -82,7 +82,7 @@ pub fn gt7_display_linear(curve: &Gt7Curve, rgb: &[[f32; 3]], sdr: bool) -> Vec<
 pub fn encode_display(
     rgb: &[[f32; 3]],
     format: OutputFormat,
-    paper_white_nits: f32,
+    signal_white_nits: f32,
 ) -> Vec<[f32; 3]> {
     // ENCODING_* in display.slang.
     let encoding = match format {
@@ -98,7 +98,7 @@ pub fn encode_display(
             out.as_mut_ptr().cast(),
             count(rgb),
             encoding,
-            paper_white_nits,
+            signal_white_nits,
         );
     }
     out

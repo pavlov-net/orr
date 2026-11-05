@@ -4,9 +4,9 @@
 use half::f16;
 use orr_color::{pq_decode, pq_encode, srgb_decode};
 use orr_output::{
-    ComposePass, ComposeRoot, ComposeSource, DisplayInfo, DisplayRequest, Gt7Curve, Gt7Params,
-    OutputFormat, OutputKernels, OutputRoots, ResolvedDisplay, TonemapPass, ViewOutput,
-    exposure_from_ev100,
+    ComposePass, ComposeRoot, ComposeSource, DisplayHeadroom, DisplayInfo, DisplayRequest,
+    Gt7Curve, Gt7Params, OutputFormat, OutputKernels, OutputRoots, ResolvedDisplay, TonemapPass,
+    ViewOutput, exposure_from_ev100,
 };
 use orr_scene::orr_gpu::{
     Format, Hazards, MemoryKind, QueueKind, Stages, TextureDesc, TextureMemory, TextureRegion,
@@ -167,7 +167,7 @@ fn reference(display: &ResolvedDisplay) -> Vec<[f32; 3]> {
         .into_iter()
         .map(|c| c.map(|v| f16::from_f32(v).to_f32()))
         .collect();
-    encode_display(&linear, display.encoding, display.paper_white_nits)
+    encode_display(&linear, display.encoding, display.signal_white_nits)
 }
 
 /// How far a channel may differ in nits, as a fraction of the texel's brightest channel,
@@ -206,7 +206,26 @@ const HDR_MONITOR: DisplayInfo = DisplayInfo {
     max_full_frame_nits: Some(600.0),
     min_nits: Some(0.05),
     sdr_white_nits: Some(240.0),
+    headroom: None,
     refresh_hz: Some(144.0),
+    primaries_xy: None,
+};
+
+const EDR_HEADROOM: f32 = 4.0;
+
+/// A screen that reports headroom and no nits.
+const EDR_SCREEN: DisplayInfo = DisplayInfo {
+    os_hdr_on: Some(true),
+    max_nits: None,
+    max_full_frame_nits: None,
+    min_nits: None,
+    sdr_white_nits: None,
+    headroom: Some(DisplayHeadroom {
+        current: EDR_HEADROOM,
+        potential: 8.0,
+        reference: None,
+    }),
+    refresh_hz: Some(120.0),
     primaries_xy: None,
 };
 
@@ -255,10 +274,13 @@ fn sdr_pq_and_scrgb_match_cpu_target() {
         ..DisplayRequest::default()
     }
     .resolve(&supported, Some(&HDR_MONITOR), false);
-    let got: Vec<[f32; 3]> = run(&scrgb, Format::Rgba16Float)
-        .chunks_exact(8)
-        .map(|t| [0, 2, 4].map(|o| f16::from_le_bytes([t[o], t[o + 1]]).to_f32()))
-        .collect();
+    let run_scrgb = |display| -> Vec<[f32; 3]> {
+        run(display, Format::Rgba16Float)
+            .chunks_exact(8)
+            .map(|t| [0, 2, 4].map(|o| f16::from_le_bytes([t[o], t[o + 1]]).to_f32()))
+            .collect()
+    };
+    let got = run_scrgb(&scrgb);
     let scrgb_nits = |v: f32| f64::from(v) * orr_color::SCRGB_WHITE_NITS;
     // One RGBA16F step in the display-linear image and one in the backbuffer.
     let two_steps = |r: f32| r.abs() / 512.0 + 1e-6;
@@ -269,6 +291,18 @@ fn sdr_pq_and_scrgb_match_cpu_target() {
         1.0,
         two_steps,
         scrgb_nits,
+    );
+
+    let edr = DisplayRequest::default().resolve(&supported, Some(&EDR_SCREEN), false);
+    assert_eq!(edr.encoding, OutputFormat::ScRgb);
+    let got = run_scrgb(&edr);
+    check("EDR", &got, &reference(&edr), 1.0, two_steps, scrgb_nits);
+    // The brightest gray sits at the screen's headroom.
+    let top = got[WIDTH as usize - 1];
+    assert!(
+        top.iter()
+            .all(|&c| (c - EDR_HEADROOM).abs() < two_steps(EDR_HEADROOM)),
+        "EDR gray at 1e3 x paper white: {top:?}"
     );
 
     assert_clean();

@@ -61,7 +61,13 @@ pub fn run_on_main_thread(tests: &[(&str, fn())]) {
             _ => filters.push(arg),
         }
     }
-    let matches = |name: &str, f: &String| if exact { name == f } else { name.contains(f.as_str()) };
+    let matches = |name: &str, f: &String| {
+        if exact {
+            name == f
+        } else {
+            name.contains(f.as_str())
+        }
+    };
     for &(name, test) in tests {
         let chosen = (filters.is_empty() || filters.iter().any(|f| matches(name, f)))
             && !skips.iter().any(|s| matches(name, s));

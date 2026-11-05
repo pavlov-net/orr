@@ -9,11 +9,8 @@ use crate::{DisplayFeed, Error, Result};
 pub(crate) struct Watch(Infallible);
 
 impl Watch {
-    pub(crate) fn new(
-        window: RawWindowHandle,
-        hook: Option<fn(u32)>,
-    ) -> Result<(Self, DisplayFeed)> {
-        let _ = (window, hook);
+    pub(crate) fn new(window: RawWindowHandle) -> Result<(Self, DisplayFeed)> {
+        let _ = window;
         Err(Error::UnsupportedWindow)
     }
 }

@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use raw_window_handle::RawWindowHandle;
 use windows::Foundation::{Point, TypedEventHandler};
@@ -65,12 +65,19 @@ static STOP: LazyLock<u32> =
     // SAFETY: a plain call with a constant name.
     LazyLock::new(|| unsafe { RegisterWindowMessageW(w!("orr display watch stop")) });
 
+static MESSAGE_HOOK: OnceLock<fn(u32)> = OnceLock::new();
+
+/// Calls `hook` with every message of every watched window, once per watch of the window,
+/// before the window handles it, on that window's thread. The first hook set stays.
+pub fn set_message_hook(hook: fn(u32)) {
+    let _ = MESSAGE_HOOK.set(hook);
+}
+
 /// The watch's state on the window's thread, freed there by the `stop` message or when the
 /// window is destroyed. Its address is the id of the subclass and of the timer, so two watches
 /// of a window stay apart.
 struct Subclass {
     token: i64,
-    hook: Option<fn(u32)>,
     reader: Reader,
     monitor: Cell<HMONITOR>,
     info: DisplayInformation,
@@ -143,10 +150,7 @@ impl ThreadSetup {
 }
 
 impl Watch {
-    pub(crate) fn new(
-        window: RawWindowHandle,
-        hook: Option<fn(u32)>,
-    ) -> Result<(Self, DisplayFeed)> {
+    pub(crate) fn new(window: RawWindowHandle) -> Result<(Self, DisplayFeed)> {
         let RawWindowHandle::Win32(handle) = window else {
             return Err(Error::UnsupportedWindow);
         };
@@ -183,7 +187,6 @@ impl Watch {
 
         let subclass = Box::into_raw(Box::new(Subclass {
             token,
-            hook,
             reader,
             // SAFETY: `hwnd` is a live window.
             monitor: Cell::new(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }),
@@ -287,7 +290,7 @@ unsafe extern "system" fn subclass_proc(
             return DefSubclassProc(hwnd, msg, wparam, lparam);
         }
     }
-    if let Some(hook) = subclass.hook {
+    if let Some(hook) = MESSAGE_HOOK.get() {
         hook(msg);
     }
     match msg {
@@ -369,6 +372,7 @@ impl AdvancedColor {
             max_full_frame_nits: positive(self.max_full_frame_nits),
             min_nits: (self.min_nits.is_finite() && self.min_nits >= 0.0).then_some(self.min_nits),
             sdr_white_nits: positive(self.sdr_white_nits),
+            headroom: None,
             refresh_hz: refresh_hz.and_then(positive),
             primaries_xy: primaries_known.then_some(self.primaries_xy),
         }
