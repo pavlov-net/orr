@@ -375,19 +375,30 @@ impl<'d> Data<'d> {
                 read(&base[i * stride..], row);
             }
         }
-        if let Some(s) = a.sparse() {
-            let indices = self.sparse_indices(&s, a.count())?;
-            let values = s.values();
-            let (data, stride) = self.view_elements(&values.view(), a.size())?;
-            let base = data
-                .get(values.offset()..)
-                .filter(|b| b.len() >= stride * s.count().saturating_sub(1) + a.size())
-                .ok_or_else(|| format!("accessor {}: sparse values outside", a.index()))?;
-            for (k, &i) in indices.iter().enumerate() {
-                read(&base[k * stride..], &mut out[i * n..(i + 1) * n]);
-            }
-        }
+        self.sparse_elements(a, |i, b| read(b, &mut out[i * n..(i + 1) * n]))?;
         Ok(out)
+    }
+
+    /// Calls `replace` with the index and bytes of each sparse element of `a`.
+    fn sparse_elements(
+        &self,
+        a: &gltf::Accessor<'_>,
+        mut replace: impl FnMut(usize, &[u8]),
+    ) -> Result<(), String> {
+        let Some(s) = a.sparse() else {
+            return Ok(());
+        };
+        let indices = self.sparse_indices(&s, a.count())?;
+        let values = s.values();
+        let (data, stride) = self.view_elements(&values.view(), a.size())?;
+        let base = data
+            .get(values.offset()..)
+            .filter(|b| b.len() >= stride * s.count().saturating_sub(1) + a.size())
+            .ok_or_else(|| format!("accessor {}: sparse values outside", a.index()))?;
+        for (k, &i) in indices.iter().enumerate() {
+            replace(i, &base[k * stride..]);
+        }
+        Ok(())
     }
 
     /// An index or other unsigned integer scalar accessor.
@@ -400,24 +411,21 @@ impl<'d> Data<'d> {
                 a.index()
             ));
         }
-        if a.sparse().is_some() {
-            return Ok(self.floats(a, 1)?.into_iter().map(|v| v as u32).collect());
-        }
-        let Some(v) = a.view() else {
-            return Ok(vec![0; a.count()]);
+        let read = |b: &[u8]| match a.data_type() {
+            DataType::U8 => u32::from(b[0]),
+            DataType::U16 => u32::from(u16::from_le_bytes([b[0], b[1]])),
+            _ => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
         };
-        let (data, stride) = self.view_elements(&v, a.size())?;
-        let base = &data[a.offset()..];
-        Ok((0..a.count())
-            .map(|i| {
-                let b = &base[i * stride..];
-                match a.data_type() {
-                    DataType::U8 => u32::from(b[0]),
-                    DataType::U16 => u32::from(u16::from_le_bytes([b[0], b[1]])),
-                    _ => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-                }
-            })
-            .collect())
+        let mut out = match a.view() {
+            Some(v) => {
+                let (data, stride) = self.view_elements(&v, a.size())?;
+                let base = &data[a.offset()..];
+                (0..a.count()).map(|i| read(&base[i * stride..])).collect()
+            }
+            None => vec![0; a.count()],
+        };
+        self.sparse_elements(a, |i, b| out[i] = read(b))?;
+        Ok(out)
     }
 
     fn view_elements(
@@ -541,6 +549,20 @@ fn decode_view(e: &Value, src: &[u8], length: usize) -> Result<Vec<u8>, String> 
 
 #[cfg(test)]
 mod tests {
+    /// L1738 allows uint32 indices, and 2^24 + 1 has no f32.
+    #[test]
+    fn sparse_u32_indices_stay_exact() {
+        let json = r#"{"asset":{"version":"2.0"},
+"buffers":[{"byteLength":8,"uri":"data:,%01%00%00%00%01%00%00%01"}],
+"bufferViews":[{"buffer":0,"byteLength":4},{"buffer":0,"byteOffset":4,"byteLength":4}],
+"accessors":[{"componentType":5125,"count":2,"type":"SCALAR","sparse":{"count":1,
+"indices":{"bufferView":0,"componentType":5125},"values":{"bufferView":1}}}]}"#;
+        let doc = super::open(json.as_bytes(), std::path::Path::new("")).unwrap();
+        let data = super::Data::load(&doc, [0, 1], "g").unwrap();
+        let accessor = doc.doc.accessors().next().unwrap();
+        assert_eq!(data.indices(&accessor).unwrap(), [0, (1 << 24) + 1]);
+    }
+
     #[test]
     fn min_version_other_than_2_0_or_2_1_is_refused() {
         let opens = |min: &str| {
