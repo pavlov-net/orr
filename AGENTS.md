@@ -10,10 +10,12 @@ setup. It has no users yet.
 - Build the correct fix, not the smallest one. API, file format and version changes cost nothing
   yet: when the right design needs a format change, a cross-crate refactor or removing an old path,
   do it. Don't refuse input, drop a feature or work around a limitation to avoid a larger change.
-- Don't skip, defer or downplay a problem by calling a case rare, unlikely or degenerate unless
-  you measured it. Decide on whether it's correct, not on how often you guess it happens.
-- Don't defer known work. A bug or gap you find in what you're building gets fixed now: "later",
-  "out of scope" and "needs its own design" aren't reasons. If it's truly separate, say why and ask.
+- Be ambitious: build the whole correct thing, not the smallest version that passes. A bug or gap
+  you find in what you're building is part of the task, because deferred gaps here have been silent
+  wrong output. "Later", "out of scope" and "needs its own design" aren't reasons. If it's truly
+  separate, say why and ask.
+- Decide by whether something is correct, not by a guess at how often it matters. "Rare", "unlikely"
+  and "degenerate" aren't reasons unless you measured it.
 - Don't vendor third-party code: no copied sources, submodules or committed derived data. Use crate
   dependencies, bindgen against an SDK found by environment variable, or a pinned fetch into the
   ignored `.tools/`. The exceptions are small numeric tables, with their source and license at the
