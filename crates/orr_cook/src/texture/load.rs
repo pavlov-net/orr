@@ -20,7 +20,7 @@ use orr_pack::texture::{FormatInfo, full_mip_count, mip_size, vk};
 use rayon::prelude::*;
 
 use super::Img;
-use super::color::{self, FileColor, Gamut, Transfer};
+use super::color::{self, FileColor, Gamut, ImageColor, Transfer};
 
 /// What a file of one channel, or of gray and alpha, holds.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -686,10 +686,13 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
     let mut color = FileColor {
         numeric: hdr,
         rgb8: matches!(img.color(), C::Rgb8 | C::Rgba8),
+        // OpenEXR: "By convention, all color channels are premultiplied by alpha".
+        premultiplied: format == Some(ImageFormat::OpenExr) && img.color().has_alpha(),
         ..Default::default()
     };
     match format {
         Some(ImageFormat::Png) => png_color(&mut color, bytes, icc.as_deref(), gray != Gray::No)?,
+        Some(ImageFormat::OpenExr) => exr_color(&mut color, bytes),
         _ => {
             if let Some(icc) = &icc {
                 color::read_icc(&mut color, icc, gray != Gray::No);
@@ -764,6 +767,47 @@ fn png_color(
         color.gamut = color::stated_gamut([xy(c.red), xy(c.green), xy(c.blue), xy(c.white)]);
     }
     Ok(())
+}
+
+/// States what an OpenEXR header says on `color`: `colorInteropID`, which supersedes
+/// `chromaticities`, or `chromaticities`.
+fn exr_color(color: &mut FileColor, bytes: &[u8]) {
+    use exr::meta::attribute::{AttributeValue, Text};
+    let Ok(meta) = exr::meta::MetaData::read_from_buffered(bytes, false) else {
+        return;
+    };
+    // The part `image` decodes.
+    let rgb = |h: &&exr::meta::header::Header| {
+        let holds = |c: &str| h.channels.find_index_of_channel(&Text::from(c)).is_some();
+        !h.deep && ["R", "G", "B"].into_iter().all(holds)
+    };
+    let Some(header) = meta.headers.iter().find(rgb) else {
+        return;
+    };
+    let name = Text::from("colorInteropID");
+    let interop = [
+        &header.own_attributes.other,
+        &header.shared_attributes.other,
+    ]
+    .into_iter()
+    .find_map(|attributes| match attributes.get(&name) {
+        Some(AttributeValue::Text(id)) => ImageColor::named(&id.to_string()),
+        _ => None,
+    });
+    match interop {
+        Some(ImageColor::Named(s)) => {
+            color.transfer = Some(s.transfer);
+            color.gamut = Some(s.gamut);
+        }
+        Some(_) => color.transfer = Some(Transfer::Linear),
+        None => {
+            if let Some(c) = &header.shared_attributes.chromaticities {
+                let xy = |v: exr::math::Vec2<f32>| [f64::from(v.0), f64::from(v.1)];
+                color.gamut =
+                    color::stated_gamut([xy(c.red), xy(c.green), xy(c.blue), xy(c.white)]);
+            }
+        }
+    }
 }
 
 /// An image's size and whether it is an animated WebP, from its headers; `None` when `image`

@@ -1065,11 +1065,28 @@ fn dds(four_cc: &[u8; 4], dx10: Option<(u32, u32)>, [w, h]: [u32; 2], data: &[u8
     f
 }
 
-/// A file says its color is premultiplied by KTX 2.0 `KHR_DF_FLAG_ALPHA_PREMULTIPLIED` ("the
-/// images' RGB components have been multiplied by their alpha components"),
-/// `DDS_ALPHA_MODE_PREMULTIPLIED`, and the legacy DXT2 and DXT4 ("The only legacy file formats
-/// that indicate this information are 'DX2' and 'DX4'"). The material model's colors are straight,
-/// and the division is in linear light. Alpha 0 keeps what is stored.
+/// An EXR of 8 x 8 texels `f(x)`.
+fn exr_image(
+    f: impl Fn(usize) -> (f32, f32, f32, f32) + Sync,
+    edit: impl FnOnce(&mut exr::meta::header::LayerAttributes, &mut exr::meta::header::ImageAttributes),
+) -> Vec<u8> {
+    use exr::image::write::WritableImage;
+    use exr::prelude::{Image, SpecificChannels, Vec2};
+    let channels = SpecificChannels::rgba(|Vec2(x, _): Vec2<usize>| f(x));
+    let mut image = Image::from_channels((8, 8), channels);
+    edit(&mut image.layer_data.attributes, &mut image.attributes);
+    let mut out = std::io::Cursor::new(Vec::new());
+    image.write().non_parallel().to_buffered(&mut out).unwrap();
+    out.into_inner()
+}
+
+/// The four places a file says its color is premultiplied: KTX 2.0 `KHR_DF_FLAG_ALPHA_PREMULTIPLIED`
+/// ("the images' RGB components have been multiplied by their alpha components"),
+/// `DDS_ALPHA_MODE_PREMULTIPLIED`, the legacy DXT2 and DXT4 ("The only legacy file formats that
+/// indicate this information are 'DX2' and 'DX4'"), and OpenEXR ("By convention, all color channels
+/// are premultiplied by alpha"). The material model's colors are straight, and the division is in
+/// linear light. OpenEXR: "Premultiplied does not mean that pixels with zero alpha and non-zero
+/// color channels are illegal", so alpha 0 keeps what is stored.
 #[test]
 fn premultiplied_files_read_straight() {
     let d = dir("premultiplied");
@@ -1124,6 +1141,20 @@ fn premultiplied_files_read_straight() {
         let (_, [t, _]) = read_back(&d, &dds(name, None, [4, 4], &block));
         assert_rgb(t, want, "legacy block format");
     }
+
+    let exr = exr_image(
+        |x| {
+            if x < 4 {
+                (0.25, 0.125, 0.0625, 0.5)
+            } else {
+                (0.75, 0.0, 0.0, 0.0)
+            }
+        },
+        |_, _| {},
+    );
+    let (_, [t, none]) = read_back(&d, &exr);
+    assert_rgb(t, [0.5, 0.25, 0.125], "EXR");
+    assert_rgb(none, [0.75, 0.0, 0.0], "EXR at alpha 0");
 }
 
 /// A premultiplied file's blocks hold what no material reads as stored, so they don't pass, and
@@ -1252,4 +1283,46 @@ fn cicp_narrow_range_expands() {
     let (_, m, _) = usd(&d, "above.png", emissive, "rgb", "");
     let want = 239.0 / 219.0;
     assert!((m.emission_color[0] - want).abs() < 0.01, "{m:?}");
+}
+
+/// OpenEXR standard attributes: `chromaticities` "specifies the CIE (x,y) chromaticities of the
+/// primaries and the white point", "superseded by the colorInteropID". ACES AP0 has no id and
+/// converts; the interop id stands over chromaticities; a file with neither is Rec.709, the
+/// library's default.
+#[test]
+fn exr_states_chromaticities_and_interop_id() {
+    use exr::meta::attribute::{AttributeValue, Chromaticities, Text};
+    use exr::prelude::Vec2;
+    let d = dir("exr_color");
+    let flat = |_: usize| (0.5, 0.25, 0.125, 1.0);
+    let ap0 = Chromaticities {
+        red: Vec2(0.7347, 0.2653),
+        green: Vec2(0.0, 1.0),
+        blue: Vec2(0.0001, -0.077),
+        white: Vec2(0.32168, 0.33767),
+    };
+    let (id, [t, _]) = read_back(&d, &exr_image(flat, |_, _| {}));
+    assert_eq!(id, 0);
+    assert_rgb(t, [0.5, 0.25, 0.125], "untagged");
+    let (id, [t, _]) = read_back(
+        &d,
+        &exr_image(flat, |_, image| image.chromaticities = Some(ap0)),
+    );
+    assert_eq!(id, 2);
+    let want = orr_color::RgbPrimaries::ACES_AP0.matrix_to(orr_color::RgbPrimaries::REC2020)
+        * orr_math::DVec3::new(0.5, 0.25, 0.125);
+    assert_rgb(t, want.as_vec3().to_array(), "AP0");
+
+    let (id, [t, _]) = read_back(
+        &d,
+        &exr_image(flat, |layer, image| {
+            image.chromaticities = Some(ap0);
+            layer.other.insert(
+                Text::from("colorInteropID"),
+                AttributeValue::Text(Text::from("lin_rec2020_scene")),
+            );
+        }),
+    );
+    assert_eq!(id, 2);
+    assert_rgb(t, [0.5, 0.25, 0.125], "colorInteropID");
 }

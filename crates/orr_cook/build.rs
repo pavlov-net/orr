@@ -22,7 +22,7 @@ use std::path::Path;
 
 const ZSTD: &[&str] = &["zstd", "zstd-safe", "zstd-sys"];
 const MESH: &[&str] = &["meshopt", "gltf", "gltf-json", "openusd", "roxmltree"];
-const TEXTURE: &[&str] = &["bcdec_rs", "image", "moxcms", "png", "half", "ktx2"];
+const TEXTURE: &[&str] = &["bcdec_rs", "exr", "image", "moxcms", "png", "half", "ktx2"];
 const VOLUME: &[&str] = &["vdb-rs", "blosc-src", "half"];
 
 fn main() {
