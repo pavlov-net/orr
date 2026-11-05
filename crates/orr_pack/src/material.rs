@@ -83,6 +83,10 @@ pub struct Material {
     pub subsurface_scatter_anisotropy: f32,
     pub coat_roughness: f32,
     pub coat_ior: f32,
+    pub coat_darkening: f32,
+    pub coat_anisotropy: f32,
+    /// Radians from the mesh tangent toward the bitangent, as [`Self::specular_rotation`].
+    pub coat_rotation: f32,
     pub fuzz_roughness: f32,
     pub thin_film_weight: f32,
     pub thin_film_thickness: f32,
@@ -109,7 +113,9 @@ pub struct Material {
     pub surface: u8,
     /// What the tangent frame follows: [`Self::FRAME_NORMAL_MAP`] by default.
     pub frame_uv: u8,
-    pub _pad: [u8; 3],
+    /// Whose model the parameters state: [`Self::MODEL_OPENPBR`] by default.
+    pub model: u8,
+    pub _pad: [u8; 2],
     /// Indexed by the `slot` constants.
     pub textures: [TextureBinding; slot::COUNT],
     /// Per slot, the affine map from mesh uv to the uv its texture is sampled at, stored
@@ -127,6 +133,12 @@ impl Material {
     pub const FRAME_OTHER: u8 = 3;
     /// [`Self::tangent_set`] of [`Self::FRAME_OTHER`].
     pub const TANGENT_SET_OTHER: u8 = 2;
+
+    /// The fields mean what OpenPBR states.
+    pub const MODEL_OPENPBR: u8 = 0;
+    /// As [`Self::MODEL_OPENPBR`], where UsdPreviewSurface says otherwise: the coat shades on the
+    /// base's normal, normal map included.
+    pub const MODEL_PREVIEW: u8 = 1;
 
     /// The uv set the tangent frame follows, 0 or 1, or [`Self::TANGENT_SET_OTHER`].
     pub fn tangent_set(&self) -> u8 {
@@ -205,6 +217,9 @@ impl Default for Material {
             subsurface_scatter_anisotropy: 0.0,
             coat_roughness: 0.0,
             coat_ior: 1.6,
+            coat_darkening: 1.0,
+            coat_anisotropy: 0.0,
+            coat_rotation: 0.0,
             fuzz_roughness: 0.5,
             thin_film_weight: 0.0,
             thin_film_thickness: 500.0,
@@ -222,7 +237,8 @@ impl Default for Material {
             thin_walled: 0,
             surface: 0,
             frame_uv: Self::FRAME_NORMAL_MAP,
-            _pad: [0; 3],
+            model: Self::MODEL_OPENPBR,
+            _pad: [0; 2],
             textures: [TextureBinding::zeroed(); slot::COUNT],
             uv_transforms: [[0.0; 6]; slot::COUNT],
         }

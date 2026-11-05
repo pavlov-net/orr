@@ -25,6 +25,8 @@ public static const uint MATERIAL_ORIGIN_SHIFT = 13;
 public static const uint MATERIAL_ORIGIN_MASK = 3 << 13;
 public static const uint MATERIAL_COST_SHIFT = 16;
 public static const uint MATERIAL_COST_MASK = 3 << 16;
+// The coat shades on the base's normal, normal map included, not the mesh's.
+public static const uint MATERIAL_COAT_ON_BASE = 1 << 18;
 
 // `MaterialGpu.textures` slots.
 public static const uint TEXTURE_BASE_COLOR = 0;
@@ -143,6 +145,9 @@ public struct MaterialGpu
     public float subsurface_scatter_anisotropy;
     public float coat_roughness;
     public float coat_ior;
+    public float coat_darkening;
+    public float coat_anisotropy;
+    public float coat_rotation;
     public float fuzz_roughness;
     public float thin_film_weight;
     public float thin_film_thickness;       // nm
@@ -160,6 +165,7 @@ public struct MaterialGpu
     public uint tangent_set;                // the uv set its tangent frame follows; TANGENT_SET_OTHER: neither
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
+    public uint _pad;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
     public uint* tiles[TEXTURE_SLOTS];                  // per slot of TEXTURE_TILED, its table: `texture_tile`

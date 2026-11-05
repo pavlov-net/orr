@@ -22,6 +22,8 @@ public static const uint BSDF_THIN_FILM = 1 << 3;
 public static const uint BSDF_ANISOTROPY = 1 << 4;
 // Set by `bsdf_collapse`.
 public static const uint BSDF_COLLAPSED = 1 << 5;
+// The coat has a frame of its own: `coat_normal` and `coat_tangent_angle`.
+public static const uint BSDF_COAT_FRAME = 1 << 6;
 
 // OpenPBR inputs at a shading point, linear Rec.2020 and absolute units.
 public struct BsdfParams
@@ -46,6 +48,9 @@ public struct BsdfParams
     public float coat_roughness;
     public float coat_ior;
     public float coat_darkening;
+    public float coat_anisotropy;
+    public float coat_tangent_angle;    // rad: as `tangent_angle`, from orthonormal_basis(coat_normal)'s tangent
+    public float3 coat_normal;          // unit, with BSDF_COAT_FRAME
     public float fuzz_weight;
     public float3 fuzz_color;
     public float fuzz_roughness;
@@ -231,6 +236,18 @@ float angle_from_code(uint c)
     return float(c & 255) / 256.0 * PI;
 }
 
+// 12 bits per axis of `n` in octahedral form. 0 stays free to say there is no such normal.
+uint oct_code(float3 n)
+{
+    uint2 q = uint2(round((oct_wrap(n) * 0.5 + 0.5) * 4095.0));
+    return max(q.x | (q.y << 12), 1);
+}
+
+float3 oct_from_code(uint c)
+{
+    return oct_unwrap(float2(c & 4095, (c >> 12) & 4095) / 4095.0 * 2.0 - 1.0);
+}
+
 // Whether `s` holds a coat, fuzz or thin film.
 bool gsurface_layered(GSurface s)
 {
@@ -287,10 +304,13 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
     }
     if ((flags & GBUFFER_LAYERS) != 0)
     {
-        w.y.x = rgb8(p.coat_color);
-        w.y.y = rgb8(p.fuzz_color);
-        w.y.z = asuint(p.thin_film_thickness);
-        w.y.w = pack_unorm8(p.thin_film_weight) | (ior_code(p.thin_film_ior) << 8) | (pack_unorm8(p.coat_darkening) << 16);
+        w.y.x = rgb8(p.coat_color) | (pack_unorm8(p.coat_darkening) << 24);
+        w.y.y = rgb8(p.fuzz_color) | (pack_unorm8(p.coat_anisotropy) << 24);
+        if ((p.flags & BSDF_COAT_FRAME) != 0)
+            w.y.z = oct_code(p.coat_normal) | (angle_code(p.coat_tangent_angle) << 24);
+        // The top half of a float, which holds any thickness a film can state.
+        uint thickness = (asuint(p.thin_film_thickness) + 0x8000) >> 16;
+        w.y.w = pack_unorm8(p.thin_film_weight) | (ior_code(p.thin_film_ior) << 8) | (thickness << 16);
     }
     return w;
 }
@@ -331,6 +351,9 @@ public GSurface decode_gsurface(GBufferWords w)
     p.coat_color = float3(1.0);
     p.fuzz_color = float3(1.0);
     p.coat_darkening = 1.0;
+    p.coat_anisotropy = 0.0;
+    p.coat_tangent_angle = 0.0;
+    p.coat_normal = s.normal;
     p.thin_film_weight = 0.0;
     p.thin_film_thickness = 0.0;
     p.thin_film_ior = 1.4;
@@ -360,11 +383,18 @@ public GSurface decode_gsurface(GBufferWords w)
     if ((flags & GBUFFER_LAYERS) != 0)
     {
         p.coat_color = from_rgb8(w.y.x);
+        p.coat_darkening = unpack_unorm8(w.y.x >> 24);
         p.fuzz_color = from_rgb8(w.y.y);
-        p.coat_darkening = unpack_unorm8(w.y.w >> 16);
+        p.coat_anisotropy = unpack_unorm8(w.y.y >> 24);
+        if ((w.y.z & 0xffffff) != 0)
+        {
+            p.coat_normal = oct_from_code(w.y.z);
+            p.coat_tangent_angle = angle_from_code(w.y.z >> 24);
+            p.flags |= BSDF_COAT_FRAME;
+        }
         p.thin_film_weight = unpack_unorm8(w.y.w);
         p.thin_film_ior = ior_from_code(w.y.w >> 8);
-        p.thin_film_thickness = asfloat(w.y.z);
+        p.thin_film_thickness = asfloat((w.y.w >> 16) << 16);
         if (p.thin_film_weight > 0.0)
             p.flags |= BSDF_THIN_FILM;
     }

@@ -26,6 +26,9 @@ BsdfParams bsdf_params(Inputs m)
     p.coat_roughness = m.coat_roughness;
     p.coat_ior = m.coat_ior;
     p.coat_darkening = m.coat_darkening;
+    p.coat_anisotropy = m.coat_roughness_anisotropy;
+    p.coat_tangent_angle = any(m.coat_rotation != 0.0) ? atan2(m.coat_rotation.y, m.coat_rotation.x) : 0.0;
+    p.coat_normal = m.coat_normal;
     p.fuzz_weight = m.fuzz_weight;
     p.fuzz_color = m.fuzz_color;
     p.fuzz_roughness = m.fuzz_roughness;
@@ -34,7 +37,8 @@ BsdfParams bsdf_params(Inputs m)
     p.thin_film_ior = m.thin_film_ior;
     p.emission = m.emission_luminance * m.emission_color;
     p.flags = (thin ? BSDF_THIN_WALLED : 0) | (m.coat_weight > 0.0 ? BSDF_COAT : 0) | (m.fuzz_weight > 0.0 ? BSDF_FUZZ : 0)
-        | (m.thin_film_weight > 0.0 ? BSDF_THIN_FILM : 0) | (m.specular_roughness_anisotropy > 0.0 ? BSDF_ANISOTROPY : 0);
+        | (m.thin_film_weight > 0.0 ? BSDF_THIN_FILM : 0) | (m.specular_roughness_anisotropy > 0.0 ? BSDF_ANISOTROPY : 0)
+        | (m.coat_roughness_anisotropy > 0.0 || m.coat_normal.z < 1.0 ? BSDF_COAT_FRAME : 0);
     return p;
 }
 

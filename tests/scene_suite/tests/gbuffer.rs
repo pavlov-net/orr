@@ -185,6 +185,7 @@ const EXTENDED: u32 = 4;
 const SUBSURFACE: u32 = 8;
 const LAYERS: u32 = 16;
 const BSDF_THIN_WALLED: u32 = 1;
+const BSDF_COAT_FRAME: u32 = 64;
 
 // --- Packing ------------------------------------------------------------------------------
 
@@ -268,6 +269,10 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 c.coat_color = arr(rng.rgb());
                 c.fuzz_weight = rng.next();
                 c.fuzz_color = arr(rng.rgb());
+                c.coat_anisotropy = rng.next();
+                c.coat_tangent_angle = rng.next() * std::f32::consts::PI;
+                c.coat_normal = arr(rng.unit());
+                c.bsdf_flags |= BSDF_COAT_FRAME;
             }
             if kind == 3 || i % 16 == 1 {
                 c.thin_film_weight = 0.05 + 0.95 * rng.next();
@@ -522,10 +527,22 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 "film weight",
                 i,
             );
-            assert_eq!(
-                g.thin_film_thickness, c.thin_film_thickness,
-                "case {i} film thickness"
-            );
+            let (t, want) = (g.thin_film_thickness, c.thin_film_thickness);
+            close(t, want, want / 256.0 + 1e-6, "film thickness", i);
+            if c.bsdf_flags & BSDF_COAT_FRAME != 0 {
+                close(
+                    g.coat_anisotropy,
+                    c.coat_anisotropy,
+                    step8,
+                    "coat anisotropy",
+                    i,
+                );
+                assert!(
+                    angle(g.coat_normal, c.coat_normal) < 2e-3,
+                    "case {i} coat normal"
+                );
+                assert_ne!(g.bsdf_flags & BSDF_COAT_FRAME, 0, "case {i} coat frame");
+            }
             close(
                 g.coat_darkening,
                 c.coat_darkening,

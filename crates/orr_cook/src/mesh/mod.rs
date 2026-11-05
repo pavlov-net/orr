@@ -323,7 +323,7 @@ pub(crate) fn reads_uv1(m: &Material) -> bool {
 
 /// Whether material `m` reads the tangent with or without a normal map.
 pub(crate) fn reads_tangent(m: &Material) -> bool {
-    m.specular_anisotropy > 0.0 || m.surface != 0
+    m.specular_anisotropy > 0.0 || m.coat_anisotropy > 0.0 || m.surface != 0
 }
 
 /// [`Section`] flags of a section drawn with material `m`.

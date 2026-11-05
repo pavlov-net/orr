@@ -63,6 +63,7 @@ impl Default for Inputs {
             coat_ior: 1.6,
             coat_darkening: 1.0,
             coat_rotation: [1.0, 0.0],
+            coat_normal: [0.0, 0.0, 1.0],
             fuzz_weight: 0.0,
             fuzz_color: [1.0; 3],
             fuzz_roughness: 0.5,

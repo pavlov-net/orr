@@ -335,6 +335,59 @@ fn collapse_keeps_the_directional_albedo() {
 
 /// OpenPBR's metal table ranges `specular_weight` over [0, 1], where the dielectric's goes past
 /// it: a metal at 1.5 is the metal at 1.
+/// A coat on a normal and anisotropy of its own, around its highlight, against the reference's
+/// second basis. One frame for every layer misses a tilted coat's peak by a factor of 5.
+#[test]
+fn a_coat_keeps_its_own_frame() {
+    let normal = Vec3::new(0.35, 0.2, 1.0).normalize();
+    let view = Vec3::new(0.5, -0.3, 0.8).normalize();
+    let coat = Inputs {
+        coat_weight: 1.0,
+        coat_roughness: 0.3,
+        specular_roughness: 0.6,
+        ..Inputs::default()
+    };
+    let cases = [
+        Inputs {
+            coat_normal: normal.to_array(),
+            ..coat
+        },
+        Inputs {
+            coat_roughness_anisotropy: 0.8,
+            coat_rotation: [0.6, 0.8],
+            ..coat
+        },
+        Inputs {
+            coat_normal: normal.to_array(),
+            fuzz_weight: 1.0,
+            fuzz_roughness: 0.4,
+            ..coat
+        },
+    ];
+    let mirror = 2.0 * normal.dot(view) * normal - view;
+    let lights = [
+        mirror,
+        (mirror + Vec3::new(0.2, 0.0, 0.0)).normalize(),
+        (mirror + Vec3::new(0.0, 0.25, 0.0)).normalize(),
+        (mirror + Vec3::new(-0.3, -0.1, 0.0)).normalize(),
+    ];
+    let (mut ours, mut reference) = (RealTime::new(), Reference::new());
+    for (i, inputs) in cases.iter().enumerate() {
+        ours.prepare(inputs, view.to_array());
+        reference.prepare(inputs, view.to_array());
+        for light in lights {
+            let (a, b) = (
+                ours.eval(light.to_array()).total(),
+                reference.eval(light.to_array()).total(),
+            );
+            for k in 0..3 {
+                let near = (a[k] - b[k]).abs() <= 0.03 * b[k] + 2e-3;
+                assert!(near, "{i} {light}: {a:?} vs {b:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn a_metals_specular_weight_stops_at_1() {
     let mut bsdf = RealTime::new();

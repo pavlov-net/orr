@@ -31,6 +31,7 @@ struct Inputs {
     float coat_ior;
     float coat_darkening;
     float coat_rotation[2];
+    float coat_normal[3];
     float fuzz_weight;
     float fuzz_color[3];
     float fuzz_roughness;
@@ -78,6 +79,7 @@ static OpenPBR_ResolvedInputs resolve(const Inputs& m) {
     r.coat_ior = m.coat_ior;
     r.coat_darkening = m.coat_darkening;
     r.coat_anisotropy_rotation_cos_sin = vec2(m.coat_rotation[0], m.coat_rotation[1]);
+    if (m.coat_normal[2] < 1.0f) r.geometry_coat_basis = openpbr_make_basis(load3(m.coat_normal));
     r.fuzz_weight = m.fuzz_weight;
     r.fuzz_color = load3(m.fuzz_color);
     r.fuzz_roughness = m.fuzz_roughness;

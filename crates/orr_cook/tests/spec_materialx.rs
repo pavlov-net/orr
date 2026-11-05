@@ -674,6 +674,13 @@ fn documents_map_as_the_clauses_say() {
             check: |m| close(m.transmission_depth, 0.05),
         },
         Row {
+            clause: "OpenPBR coat_darkening and coat_roughness_anisotropy are read as stated",
+            body: "",
+            inputs: r#"<input name="coat_darkening" type="float" value="0.25"/>
+                <input name="coat_roughness_anisotropy" type="float" value="0.5"/>"#,
+            check: |m| m.coat_darkening == 0.25 && m.coat_anisotropy == 0.5,
+        },
+        Row {
             clause: "OpenPBR thin_film_weight: the coverage weight of the film, any share of it",
             body: "",
             inputs: r#"<input name="thin_film_weight" type="float" value="0.01"/>"#,

@@ -1,5 +1,5 @@
 // The material parameters of the harness (`openpbr_ref::Inputs`): every OpenPBR input but
-// the shading bases, which are the identity, plus the exterior IOR. cpp/reference.cpp
+// the base's shading basis, which is the identity, plus the exterior IOR. cpp/reference.cpp
 // mirrors the struct.
 import orr_lighting.openpbr;
 
@@ -27,6 +27,7 @@ struct Inputs
     float coat_ior;
     float coat_darkening;
     float2 coat_rotation;
+    float3 coat_normal;
     float fuzz_weight;
     float3 fuzz_color;
     float fuzz_roughness;
@@ -72,6 +73,8 @@ OpenPBR_ResolvedInputs resolve(Inputs m)
     r.coat_ior = m.coat_ior;
     r.coat_darkening = m.coat_darkening;
     r.coat_anisotropy_rotation_cos_sin = m.coat_rotation;
+    if (m.coat_normal.z < 1.0)
+        r.geometry_coat_basis = openpbr_make_basis(m.coat_normal);
     r.fuzz_weight = m.fuzz_weight;
     r.fuzz_color = m.fuzz_color;
     r.fuzz_roughness = m.fuzz_roughness;

@@ -30,6 +30,9 @@ struct Case
     float subsurface_weight;
     float subsurface_anisotropy;
     float coat_darkening;
+    float coat_anisotropy;
+    float coat_tangent_angle;
+    float3 coat_normal;
     float thin_film_weight;
     float thin_film_thickness;
     float thin_film_ior;
@@ -76,6 +79,9 @@ GSurface surface(Case c)
     p.coat_roughness = c.coat_roughness;
     p.coat_ior = c.coat_ior;
     p.coat_darkening = c.coat_darkening;
+    p.coat_anisotropy = c.coat_anisotropy;
+    p.coat_tangent_angle = c.coat_tangent_angle;
+    p.coat_normal = c.coat_normal;
     p.thin_film_weight = c.thin_film_weight;
     p.thin_film_thickness = c.thin_film_thickness;
     p.thin_film_ior = c.thin_film_ior;
@@ -114,6 +120,9 @@ Case flatten(GSurface s)
     c.coat_roughness = p.coat_roughness;
     c.coat_ior = p.coat_ior;
     c.coat_darkening = p.coat_darkening;
+    c.coat_anisotropy = p.coat_anisotropy;
+    c.coat_tangent_angle = p.coat_tangent_angle;
+    c.coat_normal = p.coat_normal;
     c.thin_film_weight = p.thin_film_weight;
     c.thin_film_thickness = p.thin_film_thickness;
     c.thin_film_ior = p.thin_film_ior;

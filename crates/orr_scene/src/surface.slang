@@ -264,6 +264,18 @@ public void apply_decals(DecalLayer layer, inout BsdfParams p, inout float3 norm
         normal = safe_normalize(normal * (1.0 - layer.normal_cover) + layer.normal, normal);
 }
 
+// The direction `rotation` turns from the mesh tangent about `normal`, measured from
+// orthonormal_basis(normal).
+float surface_tangent_angle(SurfaceInput i, float3 normal, float rotation)
+{
+    float3 t = safe_normalize(i.tangent.xyz - normal * dot(normal, i.tangent.xyz), float3(1, 0, 0));
+    float3 b = cross(normal, t) * i.tangent.w;
+    float3 d = cos(rotation) * t + sin(rotation) * b;
+    float3 t0, b0;
+    orthonormal_basis(normal, t0, b0);
+    return atan2(dot(d, b0), dot(d, t0));
+}
+
 // OpenPBR from the hit's `MaterialGpu` and its textures, with the decals over the hit
 // written over the material's parameters.
 public struct StandardSurface : ISurface
@@ -292,7 +304,7 @@ public struct StandardSurface : ISurface
         p.coat_color = m.coat_color;
         p.coat_roughness = m.coat_roughness;
         p.coat_ior = m.coat_ior;
-        p.coat_darkening = 1.0;
+        p.coat_darkening = m.coat_darkening;
         p.fuzz_weight = m.fuzz_weight;
         p.fuzz_color = m.fuzz_color;
         p.fuzz_roughness = m.fuzz_roughness;
@@ -310,19 +322,21 @@ public struct StandardSurface : ISurface
         p.flags = thin ? BSDF_THIN_WALLED : 0;
         if ((m.flags & MATERIAL_ANISOTROPY) != 0)
         {
-            // The anisotropy direction, turned from the mesh tangent, then measured from
-            // orthonormal_basis(n).
             p.specular_anisotropy = m.specular_anisotropy;
-            float3 t = safe_normalize(i.tangent.xyz - s.normal * dot(s.normal, i.tangent.xyz), float3(1, 0, 0));
-            float3 b = cross(s.normal, t) * i.tangent.w;
-            float3 d = cos(m.specular_rotation) * t + sin(m.specular_rotation) * b;
-            float3 t0, b0;
-            orthonormal_basis(s.normal, t0, b0);
-            p.tangent_angle = atan2(dot(d, b0), dot(d, t0));
+            p.tangent_angle = surface_tangent_angle(i, s.normal, m.specular_rotation);
             p.flags |= BSDF_ANISOTROPY;
         }
+        p.coat_normal = (m.flags & MATERIAL_COAT_ON_BASE) != 0 ? s.normal : i.normal;
+        p.coat_anisotropy = m.coat_anisotropy;
+        p.coat_tangent_angle = 0.0;
         if (p.coat_weight > 0.0)
+        {
             p.flags |= BSDF_COAT;
+            if (p.coat_anisotropy > 0.0)
+                p.coat_tangent_angle = surface_tangent_angle(i, p.coat_normal, m.coat_rotation);
+            if (p.coat_anisotropy > 0.0 || any(p.coat_normal != s.normal))
+                p.flags |= BSDF_COAT_FRAME;
+        }
         if (p.fuzz_weight > 0.0)
             p.flags |= BSDF_FUZZ;
         if (p.thin_film_weight > 0.0)

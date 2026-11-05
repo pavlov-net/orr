@@ -14,8 +14,7 @@
 // read the tables from the heap slots `orr_lighting.openpbr` names (specialization constant 104);
 // defining `ORR_OPENPBR_ARRAY_LUTS` compiles them in instead (CPU builds).
 //
-// Differences from the reference: one shading normal for every layer and an isotropic coat;
-// reflection-only GGX lobes sample bounded visible normals (Eto and Tokuyoshi 2023); a
+// Differences from the reference: reflection-only GGX lobes sample bounded visible normals (Eto and Tokuyoshi 2023); a
 // roughness below 0.01 is an ideal mirror and refraction; subsurface transmission is its own
 // lobe (`LOBE_VOLUME`), which `Bsdf.subsurface_entry` samples alone for a random walk; lobes
 // are chosen by their estimated albedo, glossy ones favored by up to `SPECULAR_BIAS`; and no
@@ -184,8 +183,13 @@ public struct Bsdf : IDifferentiable
     no_diff float3 coat_tint;
     no_diff float coat_tint_presence;
     no_diff float coat_eta;
-    no_diff float coat_alpha;
+    no_diff float2 coat_alpha;
     no_diff bool coat_mirror;
+    no_diff bool own_frames;            // the coat and fuzz do not shade in (t, b, n)
+    no_diff float3x3 coat_basis;        // rows: its axes in (t, b, n)
+    no_diff float3 coat_v;              // the view in the coat's frame
+    no_diff float3x3 fuzz_basis;
+    no_diff float3 fuzz_v;
 
     no_diff float fuzz_presence;
     no_diff float3 fuzz_tint;
@@ -303,6 +307,8 @@ public struct Bsdf : IDifferentiable
         float2 uv = float2(x, u.y);
         float3 l = float3(0.0);
         uint lobe = LOBE_GLOSSY;
+        // How far `l` lies on the lobe's side of its own frame, where that isn't (t, b, n).
+        float facing = 0.0;
         // A delta direction: its coefficient and its probability within the lobe.
         bool delta = false;
         float3 w = float3(0.0);
@@ -311,15 +317,23 @@ public struct Bsdf : IDifferentiable
         switch (k)
         {
         case COAT:
+        {
             delta = coat_mirror;
-            l = delta ? float3(-v.xy, v.z) : sample_ggx_vndf_bounded(v, float2(coat_alpha), uv);
-            w = float3(coat_presence * openpbr_fresnel(coat_eta, v.z));
+            float3 c = delta ? float3(-coat_v.xy, coat_v.z) : sample_ggx_vndf_bounded(coat_v, coat_alpha, uv);
+            facing = c.z;
+            l = own_frames ? mul(c, coat_basis) : c;
+            w = float3(coat_presence * openpbr_fresnel(coat_eta, coat_v.z));
             lobe |= LOBE_REFLECTION;
             break;
+        }
         case FUZZ:
-            l = sample_fuzz(uv);
+        {
+            float3 f = sample_fuzz(uv);
+            facing = f.z;
+            l = own_frames ? mul(f, fuzz_basis) : f;
             lobe |= LOBE_REFLECTION;
             break;
+        }
         case SPECULAR:
         {
             delta = mirror;
@@ -339,14 +353,14 @@ public struct Bsdf : IDifferentiable
             {
                 l = reflect(-v, h);
                 lobe |= LOBE_REFLECTION;
-                w = rc * layer * leaving(l.z) + fold;
+                w = rc * layer * leaving(l) + fold;
                 within = pr;
             }
             else
             {
                 ok = openpbr_refract(v, h, c, eta_refraction, l);
                 lobe |= LOBE_TRANSMISSION;
-                w = tc * layer * leaving(l.z);
+                w = tc * layer * leaving(l);
                 within = 1.0 - pr;
             }
             break;
@@ -402,7 +416,8 @@ public struct Bsdf : IDifferentiable
             break;
         }
         bool up = (lobe & LOBE_REFLECTION) != 0;
-        if (!ok || (up ? l.z <= 0.0 : l.z >= 0.0))
+        bool layered = k == COAT || k == FUZZ;
+        if (!ok || (layered ? facing <= 0.0 : up ? l.z <= 0.0 : l.z >= 0.0))
             return r;
         if (delta)
         {
@@ -442,8 +457,10 @@ public struct Bsdf : IDifferentiable
         case COAT:
             if (!coat_mirror)
                 return float3(0.0);
-            own = float3(-v.xy, v.z);
-            w = float3(coat_presence * openpbr_fresnel(coat_eta, v.z));
+            own = float3(-coat_v.xy, coat_v.z);
+            if (own_frames)
+                own = mul(own, coat_basis);
+            w = float3(coat_presence * openpbr_fresnel(coat_eta, coat_v.z));
             break;
         case SPECULAR:
         {
@@ -456,14 +473,14 @@ public struct Bsdf : IDifferentiable
             if (l.z > 0.0)
             {
                 own = float3(-v.xy, v.z);
-                w = rc * layer * leaving(own.z) + fold;
+                w = rc * layer * leaving(own) + fold;
                 within = pr;
             }
             else
             {
                 if (!openpbr_refract(v, float3(0.0, 0.0, 1.0), v.z, eta_refraction, own))
                     return float3(0.0);
-                w = tc * layer * leaving(own.z);
+                w = tc * layer * leaving(own);
                 within = 1.0 - pr;
             }
             break;
@@ -513,7 +530,7 @@ public struct Bsdf : IDifferentiable
             }
         }
         float pdf;
-        float3 f = walk_lobe(l, pdf) * layer * leaving(l.z);
+        float3 f = walk_lobe(l, pdf) * layer * leaving(l);
         if (!(pdf > 0.0))
             return r;
         r.wi = normalize(from_local(l, t, b, n));
@@ -564,18 +581,26 @@ public struct Bsdf : IDifferentiable
         float3 base = float3(0.0);
         float3 top = float3(0.0);
         float lobe_pdf;
-        if (l.z > 0.0)
+        if (probability[COAT] > 0.0 && !coat_mirror)
         {
-            if (probability[COAT] > 0.0 && !coat_mirror)
+            float3 c = in_frame(l, coat_basis);
+            if (c.z > 0.0)
             {
-                top += coat_lobe(l, lobe_pdf);
+                top += coat_lobe(c, lobe_pdf);
                 pdf += probability[COAT] * lobe_pdf;
             }
-            if (probability[FUZZ] > 0.0)
+        }
+        if (probability[FUZZ] > 0.0)
+        {
+            float3 f = in_frame(l, fuzz_basis);
+            if (f.z > 0.0)
             {
-                top += fuzz_lobe(l, lobe_pdf);
+                top += fuzz_lobe(f, lobe_pdf);
                 pdf += probability[FUZZ] * lobe_pdf;
             }
+        }
+        if (l.z > 0.0)
+        {
             if (probability[DIFFUSE] > 0.0)
             {
                 diffuse_base += eon(diffuse, l) * l.z;
@@ -619,7 +644,7 @@ public struct Bsdf : IDifferentiable
             base += (l.z > 0.0 ? dms_reflect : dms_transmit) * dielectric_ms(l.z) * abs(l.z) * INV_PI;
             pdf += probability[DIELECTRIC_MS] * INV_TWO_PI * (l.z > 0.0 ? dms_ratio : 1.0 - dms_ratio);
         }
-        float3 below = layer * leaving(l.z);
+        float3 below = layer * leaving(l);
         diffuse_share = diffuse_base * below;
         return top + (base + diffuse_base) * below;
     }
@@ -711,21 +736,29 @@ public struct Bsdf : IDifferentiable
         return abs(c);
     }
 
+    // `l` in a layer's frame.
+    [TreatAsDifferentiable]
+    float3 in_frame(float3 l, float3x3 basis)
+    {
+        return own_frames ? mul(basis, l) : l;
+    }
+
+    // `l` in the coat's frame.
     [TreatAsDifferentiable]
     float3 coat_lobe(float3 l, out float pdf)
     {
-        float3 h = normalize(v + l);
-        float2 a = float2(coat_alpha);
-        float d = openpbr_eval_aniso_ggx(h, a);
-        float g = openpbr_eval_aniso_smith_g1(v, a) * openpbr_eval_aniso_smith_g1(l, a);
-        pdf = ggx_vndf_bounded_pdf(v, l, a);
-        return float3(coat_presence * d * g * openpbr_fresnel(coat_eta, abs(dot(v, h))) / (4.0 * v.z));
+        float3 h = normalize(coat_v + l);
+        float d = openpbr_eval_aniso_ggx(h, coat_alpha);
+        float g = openpbr_eval_aniso_smith_g1(coat_v, coat_alpha) * openpbr_eval_aniso_smith_g1(l, coat_alpha);
+        pdf = ggx_vndf_bounded_pdf(coat_v, l, coat_alpha);
+        return float3(coat_presence * d * g * openpbr_fresnel(coat_eta, abs(dot(coat_v, h))) / (4.0 * coat_v.z));
     }
 
+    // `l` in the fuzz's frame.
     [TreatAsDifferentiable]
     float3 fuzz_lobe(float3 l, out float pdf)
     {
-        pdf = ltc_eval(view_aligned(l, float2(v.x, -v.y)));
+        pdf = ltc_eval(view_aligned(l, float2(fuzz_v.x, -fuzz_v.y)));
         return fuzz_presence * fuzz_ltc.z * fuzz_tint * pdf;
     }
 
@@ -745,7 +778,7 @@ public struct Bsdf : IDifferentiable
         float3 o = sample_cosine_hemisphere(uv);
         float a = 1.0 / fuzz_ltc.x;
         float3 l = normalize(float3(o.x * a - o.z * fuzz_ltc.y * a, o.y * a, o.z));
-        return view_aligned(l, v.xy);
+        return view_aligned(l, fuzz_v.xy);
     }
 
     [TreatAsDifferentiable]
@@ -803,13 +836,13 @@ public struct Bsdf : IDifferentiable
         reflection += reflect_const;
     }
 
-    // The coat's color on light leaving the base toward local cosine `c`.
+    // The coat's color on light leaving the base toward local `l`.
     [TreatAsDifferentiable]
-    float3 leaving(float c)
+    float3 leaving(float3 l)
     {
-        if (inside ? c >= 0.0 : c <= 0.0)
+        if (inside ? l.z >= 0.0 : l.z <= 0.0)
             return float3(1.0);
-        return passage(abs(c));
+        return passage(abs(in_frame(l, coat_basis).z));
     }
 
     // The coat's color along a direction at cosine `c` > 0 outside the base.
@@ -859,6 +892,15 @@ float3 view_aligned(float3 l, float2 xy)
     float c = xy.x * k;
     float s = xy.y * k;
     return float3(c * l.x - s * l.y, c * l.y + s * l.x, l.z);
+}
+
+// `v` leaned up to the smallest view cosine.
+float3 leaned(float3 v)
+{
+    if (v.z >= MIN_COS)
+        return v;
+    float r2 = dot(v.xy, v.xy);
+    return r2 > 0.0 ? float3(v.xy * sqrt((1.0 - MIN_COS * MIN_COS) / r2), MIN_COS) : float3(0.0, 0.0, 1.0);
 }
 
 // The sheen LTC (a_inv, b_inv, albedo) at roughness `alpha` and view cosine `mu`, filtered as
@@ -1001,13 +1043,30 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.t = cos(p.tangent_angle) * t0 + sin(p.tangent_angle) * b0;
     s.b = cross(s.n, s.t);
     float3 v = to_local(wo, s.t, s.b, s.n);
-    if (v.z < MIN_COS)
-    {
-        float r2 = dot(v.xy, v.xy);
-        v = r2 > 0.0 ? float3(v.xy * sqrt((1.0 - MIN_COS * MIN_COS) / r2), MIN_COS) : float3(0.0, 0.0, 1.0);
-    }
+    v = leaned(v);
     s.v = v;
     float mu = v.z;
+    s.coat_v = v;
+    s.fuzz_v = v;
+    s.coat_basis = float3x3(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    s.fuzz_basis = s.coat_basis;
+    s.own_frames = coat_weight > 0.0 && (p.flags & BSDF_COAT_FRAME) != 0;
+    if (s.own_frames)
+    {
+        float3 cn = dot(wo, p.coat_normal) < 0.0 ? -p.coat_normal : p.coat_normal;
+        float3 ct0, cb0;
+        orthonormal_basis(p.coat_normal, ct0, cb0);
+        float3 ct = cos(p.coat_tangent_angle) * ct0 + sin(p.coat_tangent_angle) * cb0;
+        float3 cb = cross(cn, ct);
+        s.coat_basis = float3x3(to_local(ct, s.t, s.b, s.n), to_local(cb, s.t, s.b, s.n), to_local(cn, s.t, s.b, s.n));
+        s.coat_v = leaned(mul(s.coat_basis, v));
+        // The reference's fuzz lies between the base and the coat.
+        float3 fn = safe_normalize(lerp(float3(0.0, 0.0, 1.0), s.coat_basis[2], coat_weight), float3(0.0, 0.0, 1.0));
+        float3 ft, fb;
+        orthonormal_basis(fn, ft, fb);
+        s.fuzz_basis = float3x3(ft, fb, fn);
+        s.fuzz_v = leaned(mul(s.fuzz_basis, v));
+    }
 
     // IORs: the specular weight moves the base IOR toward the medium above it.
     bool enter_coat = coat_weight > 0.0 && !s.inside;
@@ -1051,8 +1110,9 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.alpha_iso = sq(roughness);
     s.alpha = openpbr_compute_anisotropic_alpha(s.alpha_iso, anisotropy, false, MIN_ALPHA);
     s.mirror = max(s.alpha.x, s.alpha.y) < MIRROR_ALPHA;
-    s.coat_alpha = max(sq(coat_roughness), MIN_ALPHA);
-    s.coat_mirror = s.coat_alpha < MIRROR_ALPHA;
+    float coat_alpha = max(sq(coat_roughness), MIN_ALPHA);
+    s.coat_alpha = openpbr_compute_anisotropic_alpha(coat_alpha, p.coat_anisotropy, false, MIN_ALPHA);
+    s.coat_mirror = max(s.coat_alpha.x, s.coat_alpha.y) < MIRROR_ALPHA;
     s.coat_eta = coat_eta;
 
     // The base: metal over transmission over subsurface over opaque dielectric.
@@ -1077,11 +1137,11 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.coat_tint = p.coat_color;
     s.coat_tint_presence = coat_weight;
     float coat_presence = s.inside ? 0.0 : coat_weight;
-    float coat_reflected = coat_presence > 0.0 ? coat_presence * dielectric_energy(coat_eta, s.coat_alpha, mu) : 0.0;
-    float3 coat_in = s.passage(mu) * (1.0 - coat_reflected) * darkening;
+    float coat_reflected = coat_presence > 0.0 ? coat_presence * dielectric_energy(coat_eta, coat_alpha, s.coat_v.z) : 0.0;
+    float3 coat_in = s.passage(s.coat_v.z) * (1.0 - coat_reflected) * darkening;
     float fuzz_presence = s.inside ? 0.0 : fuzz_weight;
     s.fuzz_tint = p.fuzz_color;
-    s.fuzz_ltc = ltc_coeffs(p.fuzz_roughness, mu);
+    s.fuzz_ltc = ltc_coeffs(p.fuzz_roughness, s.fuzz_v.z);
     float fuzz_in = 1.0 - fuzz_presence * s.fuzz_ltc.z;
     s.layer = s.inside ? float3(1.0) : coat_in * fuzz_in;
     s.emitted = s.inside ? float3(0.0) : p.emission * coat_in * fuzz_in;
@@ -1150,7 +1210,7 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     // Directional albedo estimates without the coat and fuzz: `finish` adds them, folded or
     // not, and turns the estimates into lobe probabilities.
     float e_ss = 1.0 - openpbr_look_up_ideal_metal_energy_complement(s.alpha_iso, mu);
-    float3 below = s.layer * s.leaving(mu);
+    float3 below = s.layer * s.leaving(v);
     float3 rc;
     float3 tc;
     s.coefficients(mu, rc, tc);

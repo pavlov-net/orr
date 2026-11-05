@@ -42,6 +42,7 @@ pub mod material_flags {
     /// The cost class, 0-3, in bits 16-17.
     pub const COST_SHIFT: u32 = 16;
     pub const COST_MASK: u32 = 3 << COST_SHIFT;
+    pub const COAT_ON_BASE: u32 = 1 << 18;
 }
 
 /// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
@@ -170,6 +171,7 @@ impl MaterialGpu {
         set(m.fuzz_weight > 0.0, f::FUZZ);
         set(m.thin_film_weight > 0.0, f::THIN_FILM);
         set(m.specular_anisotropy > 0.0, f::ANISOTROPY);
+        set(m.model == Material::MODEL_PREVIEW, f::COAT_ON_BASE);
         let cost: u32 = if subsurface {
             3
         } else if dielectric || presence {
@@ -207,6 +209,9 @@ impl MaterialGpu {
             subsurface_scatter_anisotropy: m.subsurface_scatter_anisotropy,
             coat_roughness: m.coat_roughness,
             coat_ior: m.coat_ior,
+            coat_darkening: m.coat_darkening,
+            coat_anisotropy: m.coat_anisotropy,
+            coat_rotation: m.coat_rotation,
             fuzz_roughness: m.fuzz_roughness,
             thin_film_weight: m.thin_film_weight,
             thin_film_thickness: m.thin_film_thickness,
@@ -227,6 +232,7 @@ impl MaterialGpu {
             tangent_set: u32::from(m.tangent_set()),
             transmission_dispersion_scale: m.transmission_dispersion_scale,
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
+            _pad: 0,
             data: 0,
             texture_streams: GpuPtr::NULL,
             tiles: textures.map(|t| t.tiles),
