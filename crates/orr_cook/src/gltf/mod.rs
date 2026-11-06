@@ -910,6 +910,7 @@ impl Imported<'_> {
                 placed: direct,
                 frame,
                 alone: frame.is_some(),
+                motion: None,
             });
         }
         for (k, (linear, placed)) in baked.into_iter().enumerate() {
@@ -920,6 +921,7 @@ impl Imported<'_> {
                 placed,
                 frame,
                 alone: frame.is_some(),
+                motion: None,
             });
         }
         Ok(())
@@ -1572,6 +1574,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
                 placed: copies,
                 frame: None,
                 alone: true,
+                motion: None,
             });
         }
         out.push((

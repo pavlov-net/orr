@@ -350,6 +350,7 @@ struct UserBlob {
 }
 
 pub(crate) struct Streaming {
+    instance_page_pool: u64,
     residency: Residency,
     accel: Arc<AccelShared>,
     /// Streamed pages' CLAS; none without cluster acceleration structures.
@@ -408,6 +409,7 @@ impl Streaming {
         budgets[ResidencyClass::HierarchyPages as usize] = b.hierarchy_page_pool;
         budgets[ResidencyClass::Textures as usize] = b.texture_pool;
         budgets[ResidencyClass::InstancePages as usize] = b.instance_page_pool;
+        let instance_page_pool = b.instance_page_pool;
         budgets[ResidencyClass::UserBlobs as usize] = b.user_blob_pool;
         let kind = if device.caps().rebar {
             MemoryKind::Upload
@@ -422,6 +424,7 @@ impl Streaming {
             None
         };
         Ok(Self {
+            instance_page_pool,
             accel: Arc::clone(accel),
             clas,
             retired_clas: Vec::new(),
@@ -717,6 +720,11 @@ impl Streaming {
             cell_distance,
         };
         self.residency.request(Key { mount, unit }, p);
+    }
+
+    /// The most instance pages may hold, whatever the budget has shrunk to.
+    pub(crate) fn instance_page_pool(&self) -> u64 {
+        self.instance_page_pool
     }
 
     /// The budget instance pages plan under.

@@ -4,8 +4,8 @@
 //!   [`SectionOverride`] table the prototypes point into, and the partition table (u16 first
 //!   record per partition). Spans are byte offsets in blob 0 and record counts.
 //! - Blob 1: [`InstancePageHeader::record_count`] [`InstanceRecord`]s in Morton order of
-//!   [`InstanceRecord::pos`], at most [`MAX_RECORDS`], then the page's [`LinearRows`] table, so
-//!   both stream and stay resident together.
+//!   [`InstanceRecord::pos`], at most [`MAX_RECORDS`], then the page's [`LinearRows`] table, then
+//!   on an animated page its [`MotionRow`]s, so all stream and stay resident together.
 //! - Blob 2, when `user_stride` is not 0: `user_stride` bytes of consumer data per record,
 //!   in record order.
 //!
@@ -17,12 +17,20 @@
 //! records, is a row of the table instead, stored exactly and shared by every record with the same
 //! linear part.
 //! [`decode`] is the reference both for the GPU decode and for consumers' CPU queries.
+//!
+//! An animated page moves its records over time: [`InstancePageHeader::motion_times`] starts one
+//! interval each, and every interval holds a [`MotionRow`] per record, interval-major, which
+//! carries the record from the interval's start until the next. [`motion_interval`] finds the
+//! interval of a time, and [`motion_transform`] is the reference for the kernel that evaluates a
+//! row. The first interval runs back from the second without end, and the last on.
+//! An instance needs a transform that inverts, so a scale of 0 on an axis stands at
+//! [`MOTION_FLAT`], which draws the same, and one of 0 on all three hides the instance.
 
 use bytemuck::{Pod, Zeroable};
 use orr_math::{Affine3, DMat3, DQuat, DVec4, Mat3, Quat, Vec3};
 
 use crate::blob::{put_table, read, table};
-use crate::{AssetId, Error, Result, Span};
+use crate::{AffineRows, AssetId, Error, Result, Span};
 
 pub const SCHEMA: u16 = 1;
 
@@ -38,7 +46,10 @@ pub const MAX_POSE: u16 = 256;
 /// Sections a prototype can hide: sections `0..MAX_HIDDEN_SECTION`.
 pub const MAX_HIDDEN_SECTION: usize = 16;
 
-/// Blob 0 header, 84 B.
+/// The least size of a scale on an axis of a [`MotionRow`].
+pub const MOTION_FLAT: f32 = 1.0 / (1u64 << 60) as f32;
+
+/// Blob 0 header, 192 B.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct InstancePageHeader {
@@ -62,13 +73,26 @@ pub struct InstancePageHeader {
     /// the bind space of joint `frame_joint`, and its skinning matrix (a palette entry) poses them.
     pub frame_skeleton: AssetId,
     pub frame_joint: u32,
+    /// f32 seconds each interval of an animated page starts at; empty on a page that holds still.
+    pub motion_times: Span,
+    /// A row's transform stands between these, relative to the page's cell:
+    /// `motion_left * row * motion_right`.
+    pub motion_left: AffineRows,
+    pub motion_right: AffineRows,
+    /// s of the clock of [`Self::motion_times`] that a page stands at until something sets it.
+    pub motion_start: f32,
 }
 
 impl InstancePageHeader {
+    /// Bytes of [`MotionRow`]s at the end of blob 1.
+    pub fn motion_bytes(&self) -> usize {
+        self.motion_times.count as usize * usize::from(self.record_count) * size_of::<MotionRow>()
+    }
+
     /// Rows of the linear table in a blob 1 of `len` bytes.
     pub fn linear_rows(&self, len: usize) -> Result<usize> {
         let records = usize::from(self.record_count) * size_of::<InstanceRecord>();
-        len.checked_sub(records)
+        len.checked_sub(records + self.motion_bytes())
             .filter(|table| {
                 usize::from(self.record_count) <= MAX_RECORDS
                     && table.is_multiple_of(size_of::<LinearRows>())
@@ -76,6 +100,62 @@ impl InstancePageHeader {
             .map(|table| table / size_of::<LinearRows>())
             .ok_or(Error::Malformed("instance records"))
     }
+}
+
+/// A record of an animated page over one interval, `dt` seconds after the interval starts, 88 B:
+/// position `p + dt (v + a dt / 2)`, the rotation by `spin` degrees a second about its direction,
+/// and scale `s + g dt`. Linear interpolation is a velocity, and spherical a spin, so every way an
+/// instance can move is this one formula. An instance not there has a rotation of all zeros.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct MotionRow {
+    pub position: [f32; 3],
+    pub velocity: [f32; 3],
+    pub acceleration: [f32; 3],
+    /// Unit quaternion, xyzw.
+    pub rotation: [f32; 4],
+    pub spin: [f32; 3],
+    pub scale: [f32; 3],
+    pub growth: [f32; 3],
+}
+
+impl MotionRow {
+    /// Scale, rotation and translation `dt` seconds on, `None` where the instance is not there or
+    /// has no size.
+    pub fn at(&self, dt: f32) -> Option<(Vec3, Quat, Vec3)> {
+        if self.rotation == [0.0; 4] {
+            return None;
+        }
+        let (p, v) = (Vec3::from(self.position), Vec3::from(self.velocity));
+        let a = Vec3::from(self.acceleration);
+        let spin = Vec3::from(self.spin);
+        let q = Quat::from_array(self.rotation);
+        let turn = (spin.length() * dt).to_radians();
+        let turned = match spin.try_normalize() {
+            Some(axis) => Quat::from_axis_angle(axis, turn) * q,
+            None => q,
+        };
+        let s = Vec3::from(self.scale) + Vec3::from(self.growth) * dt;
+        if s.abs().max_element() < MOTION_FLAT {
+            return None;
+        }
+        let s = s.abs().max(Vec3::splat(MOTION_FLAT)).copysign(s);
+        Some((s, turned, p + dt * (v + 0.5 * dt * a)))
+    }
+}
+
+/// The interval of `times` that `t` falls in, and the seconds since it started.
+pub fn motion_interval(times: &[f32], t: f32) -> (usize, f32) {
+    let k = times[1..].partition_point(|&x| x <= t);
+    (k, t - times[k])
+}
+
+/// The cell-relative transform of `row` `dt` seconds into its interval, `None` where the instance
+/// is not there.
+pub fn motion_transform(h: &InstancePageHeader, row: &MotionRow, dt: f32) -> Option<Affine3> {
+    let (s, q, p) = row.at(dt)?;
+    let trs = Affine3::from_scale_rotation_translation(s, q, p);
+    Some(Affine3::from(h.motion_left) * trs * Affine3::from(h.motion_right))
 }
 
 /// A model as placed by the page's records, 32 B.
@@ -175,6 +255,8 @@ pub struct InstancePageInfo {
     /// Every prototype's overrides; [`Prototype::sections`] indexes into this table.
     pub sections: Vec<SectionOverride>,
     pub partitions: Vec<u16>,
+    /// [`InstancePageHeader::motion_times`].
+    pub motion_times: Vec<f32>,
 }
 
 impl InstancePageInfo {
@@ -200,6 +282,7 @@ impl InstancePageInfo {
             return Err(Error::Malformed("instance page partitions"));
         }
         Ok(Self {
+            motion_times: table(blob, header.motion_times)?,
             header,
             prototypes: prototypes_out,
             sections,
@@ -221,6 +304,7 @@ impl InstancePageInfo {
             .collect();
         h.prototypes = put_table(&mut out, &prototypes);
         h.partitions = put_table(&mut out, &self.partitions);
+        h.motion_times = put_table(&mut out, &self.motion_times);
         out[..size_of::<InstancePageHeader>()].copy_from_slice(bytemuck::bytes_of(&h));
         out
     }
@@ -237,6 +321,7 @@ pub fn records(
     blob: &[u8],
 ) -> Result<(Vec<InstanceRecord>, Vec<LinearRows>)> {
     h.linear_rows(blob.len())?;
+    let blob = &blob[..blob.len() - h.motion_bytes()];
     let (records, table) = blob.split_at(usize::from(h.record_count) * size_of::<InstanceRecord>());
     let records: Vec<InstanceRecord> = bytemuck::pod_collect_to_vec(records);
     let table: Vec<LinearRows> = bytemuck::pod_collect_to_vec(table);
@@ -263,6 +348,15 @@ pub fn decode(
             .into_iter()
             .map(move |r| (r.prototype, decode_record(&h, &table, &r))),
     ))
+}
+
+/// The motion rows of a blob 1, per interval a row per record.
+pub fn motion_rows(h: &InstancePageHeader, blob: &[u8]) -> Result<Vec<MotionRow>> {
+    let start = blob
+        .len()
+        .checked_sub(h.motion_bytes())
+        .ok_or(Error::Malformed("instance records"))?;
+    Ok(bytemuck::pod_collect_to_vec(&blob[start..]))
 }
 
 /// Cell-relative transform of one record of a page with linear table `table`: its table row,

@@ -15,9 +15,11 @@ use orr_cook::{
     ArchiveSpec, AssetSpec, Manifest, MeshPatch, NodeSelect, Source, StaticDisplacement,
     Subdivision, UsdSettings,
 };
-use orr_math::{Mat4, Quat, Vec3};
+use orr_math::{Affine3, Mat4, Quat, Vec3};
 use orr_pack::clip::Clip;
-use orr_pack::instance::{InstancePageInfo, decode};
+use orr_pack::instance::{
+    InstancePageInfo, decode, motion_interval, motion_rows, motion_transform,
+};
 use orr_pack::material::{Material, slot, wrap};
 use orr_pack::mesh::{MeshInfo, PageView};
 use orr_pack::model::ModelInfo;
@@ -3569,17 +3571,14 @@ fn part_corners(a: &Archive, name: &str) -> Vec<(u16, Vec3)> {
 }
 
 /// Clip `clip` of skeleton `model`, and the skeleton's skinning matrices `t` seconds into it.
-fn posed(a: &Archive, model: &str, clip: &str, t: f32) -> (Clip, Vec<orr_math::Affine3>) {
+fn posed(a: &Archive, model: &str, clip: &str, t: f32) -> (Clip, Vec<Affine3>) {
     let sk = SkeletonInfo::parse(&blob(a, &format!("{model}/skeleton"), 0)).unwrap();
     let name = format!("{model}/clip/{clip}");
     let clip = Clip::parse(&blob(a, &name, 0), &blob(a, &name, 1)).unwrap();
     let mut pose = sk.rest.clone();
     clip.sample(t, &mut pose);
     let n = sk.joint_count();
-    let (mut model, mut palette) = (
-        vec![orr_math::Affine3::IDENTITY; n],
-        vec![orr_math::Affine3::IDENTITY; n],
-    );
+    let (mut model, mut palette) = (vec![Affine3::IDENTITY; n], vec![Affine3::IDENTITY; n]);
     sk.model_pose(&pose, &mut model);
     sk.palette(&model, &mut palette);
     (clip, palette)
@@ -3812,10 +3811,7 @@ fn a_thin_turned_bind_keeps_the_points_off_its_plane() {
             ),
         );
         let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
-        let (mut model, mut palette) = (
-            vec![orr_math::Affine3::IDENTITY; 1],
-            vec![orr_math::Affine3::IDENTITY; 1],
-        );
+        let (mut model, mut palette) = (vec![Affine3::IDENTITY; 1], vec![Affine3::IDENTITY; 1]);
         sk.model_pose(&sk.rest, &mut model);
         sk.palette(&model, &mut palette);
         let worst = corners(&a, "u/Hero/mesh")
@@ -3868,10 +3864,7 @@ fn a_skinned_prototype_is_a_model_placed_per_copy() {
     assert_eq!(copies(&a, "u/Hero").len(), 2);
     let model = ModelInfo::parse(&blob(&a, "u/Hero", 0)).unwrap();
     assert_eq!(model.header.skeleton, AssetId::from_name("u/Hero/skeleton"));
-    let (mut pose, mut palette) = (
-        vec![orr_math::Affine3::IDENTITY; 3],
-        vec![orr_math::Affine3::IDENTITY; 3],
-    );
+    let (mut pose, mut palette) = (vec![Affine3::IDENTITY; 3], vec![Affine3::IDENTITY; 3]);
     sk.model_pose(&sk.rest, &mut pose);
     sk.palette(&pose, &mut palette);
     let mesh = corners(&a, "u/Hero/mesh");
@@ -4041,10 +4034,7 @@ fn what_moves_in_a_skinned_prototype_moves() {
     );
     let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
     let n = sk.joint_count();
-    let (mut pose, mut palette) = (
-        vec![orr_math::Affine3::IDENTITY; n],
-        vec![orr_math::Affine3::IDENTITY; n],
-    );
+    let (mut pose, mut palette) = (vec![Affine3::IDENTITY; n], vec![Affine3::IDENTITY; n]);
     sk.model_pose(&sk.rest, &mut pose);
     sk.palette(&pose, &mut palette);
     let prop = Vec3::new(5.0, 3.0, 0.0);
@@ -4227,10 +4217,7 @@ fn a_skeleton_outside_a_prototype_is_seen_from_its_first_copy() {
         ),
     );
     let sk = SkeletonInfo::parse(&blob(&a, "u/Proto/skeleton", 0)).unwrap();
-    let (mut pose, mut palette) = (
-        vec![orr_math::Affine3::IDENTITY; 2],
-        vec![orr_math::Affine3::IDENTITY; 2],
-    );
+    let (mut pose, mut palette) = (vec![Affine3::IDENTITY; 2], vec![Affine3::IDENTITY; 2]);
     sk.model_pose(&sk.rest, &mut pose);
     sk.palette(&pose, &mut palette);
     let joint = usize::from(joints_of(&a, "u/Proto/mesh")[0]);
@@ -4604,8 +4591,396 @@ fn samples_of_different_lengths_hold_the_lower() {
         at,
     )
     .unwrap();
-    let placed = copies(&a, "u/P");
+    let placed = transforms_at(&a, "u/P", 0.5);
     assert_eq!(placed.len(), 1);
     let x = placed[0].transform_point3(Vec3::ZERO).x;
     assert!((x - 1.0).abs() < 1e-3, "{x}");
+}
+
+fn instancing(attributes: &str) -> String {
+    format!(
+        r#"def PointInstancer "Crowd"
+{{
+    rel prototypes = [</Crowd/Proto>, </Crowd/Other>]
+    {attributes}
+    def Xform "Proto"
+    {{
+        def Mesh "M"
+        {{
+            {TRIANGLE}
+        }}
+    }}
+    def Xform "Other"
+    {{
+        def Mesh "M"
+        {{
+            {TRIANGLE}
+        }}
+    }}
+}}"#
+    )
+}
+
+/// The cells of the animated pages of `model` and how they place its copies `t` seconds in.
+fn placed_at(a: &Archive, model: &str, t: f32) -> Vec<([i32; 3], Affine3)> {
+    let want = AssetId::from_name(model);
+    let mut out = Vec::new();
+    for e in a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::InstancePage as u16)
+    {
+        let blobs = a.blobs(e);
+        let (head, body) = (read(a, &blobs[0]), read(a, &blobs[1]));
+        let info = InstancePageInfo::parse(&head).unwrap();
+        if info.prototypes.iter().all(|p| p.model != want) {
+            continue;
+        }
+        assert!(!info.motion_times.is_empty(), "{model} holds still");
+        let h = info.header;
+        let rows = motion_rows(&h, &body).unwrap();
+        let (k, dt) = motion_interval(&info.motion_times, t);
+        let n = usize::from(h.record_count);
+        for row in &rows[k * n..(k + 1) * n] {
+            out.extend(motion_transform(&h, row, dt).map(|m| (h.cell, m)));
+        }
+    }
+    out
+}
+
+/// How the animated pages of `model` place its copies `t` seconds in, in scene space, sorted.
+fn transforms_at(a: &Archive, model: &str, t: f32) -> Vec<Mat4> {
+    let in_scene = |(cell, mut m): ([i32; 3], Affine3)| {
+        m.translation += Vec3::from(cell.map(|c| c as f32)) * 256.0;
+        Mat4::from(m)
+    };
+    let mut out: Vec<Mat4> = placed_at(a, model, t).into_iter().map(in_scene).collect();
+    let at = |m: &Mat4| m.w_axis.to_array();
+    out.sort_by(|a, b| at(a).partial_cmp(&at(b)).unwrap());
+    out
+}
+
+/// The lowest corner of each copy of the triangle in `model`, `t` seconds in.
+fn copies_at(a: &Archive, model: &str, t: f32) -> Vec<Vec3> {
+    let lowest = |m: &Mat4| {
+        [Vec3::ZERO, Vec3::X, Vec3::Y]
+            .map(|c| m.transform_point3(c))
+            .into_iter()
+            .reduce(Vec3::min)
+            .unwrap()
+    };
+    let mut out: Vec<Vec3> = transforms_at(a, model, t).iter().map(lowest).collect();
+    out.sort_by(|a, b| a.to_array().partial_cmp(&b.to_array()).unwrap());
+    out
+}
+
+#[track_caller]
+fn assert_copies(a: &Archive, t: f32, want: &[[f32; 3]]) {
+    let got = copies_at(a, "u/Proto", t);
+    assert_eq!(got.len(), want.len(), "at {t} s: {got:?}");
+    for (g, w) in got.iter().zip(want) {
+        assert!(g.abs_diff_eq(Vec3::from(*w), 2e-3), "at {t} s: {got:?}");
+    }
+}
+
+/// `overview.dox`: without velocities, "if the timeSamples bracketing a requested sample have the
+/// same number of elements, apply linear interpolation". Copies move on a page of one model.
+#[test]
+fn sampled_positions_orientations_and_scales_move_their_copies() {
+    let a = cook(
+        "instances-sampled",
+        &instancing(
+            r#"int[] protoIndices = [0, 0]
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0), (4, 0, 0)], 10: [(0, 2, 0), (4, 0, 2)] }
+    quath[] orientations.timeSamples = { 0: [(1, 0, 0, 0), (1, 0, 0, 0)], 10: [(0.70710678, 0, 0, 0.70710678), (1, 0, 0, 0)] }
+    float3[] scales.timeSamples = { 0: [(1, 1, 1), (1, 1, 1)], 10: [(1, 1, 1), (2, 2, 2)] }"#,
+        ),
+    );
+    assert_copies(&a, 0.0, &[[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]]);
+    let turned = -std::f32::consts::FRAC_1_SQRT_2;
+    assert_copies(&a, 0.5, &[[turned, 1.0, 0.0], [4.0, 0.0, 1.0]]);
+    let end = transforms_at(&a, "u/Proto", 1.0);
+    let scaled = end[1].determinant();
+    assert!((scaled - 8.0).abs() < 1e-3, "{scaled}");
+    assert!(!has(&a, "u/skeleton"));
+}
+
+/// Far from the instancer's origin, what a copy moves by stays as fine as near it: an f32 of the
+/// position there steps by 0.25.
+#[test]
+fn moving_copies_keep_their_precision_far_from_the_instancer() {
+    let a = cook(
+        "instances-far",
+        &instancing(
+            r#"int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 0: [(3000000, 0, 0)], 10: [(3000000.5, 0, 0)] }"#,
+        ),
+    );
+    let (cell, m) = placed_at(&a, "u/Proto", 0.25)[0];
+    let x = f64::from(cell[0]) * 256.0 + f64::from(m.translation.x);
+    assert!((x - 3000000.125).abs() < 1e-3, "{x}");
+}
+
+/// `pointInstancer.h` leaves scales free, and a scale of 0 flattens a copy or takes it away. An
+/// instance needs a transform that inverts, so a flat one stays where it can, at no visible size.
+#[test]
+fn scales_through_zero_flatten_and_hide_their_copies() {
+    let a = cook(
+        "instances-flat",
+        &instancing(
+            r#"int[] protoIndices = [0, 0]
+    point3f[] positions = [(0, 0, 0), (5, 0, 0)]
+    float3[] scales.timeSamples = { 0: [(1, 1, 1), (1, 1, 1)], 10: [(1, 0, 1), (0, 0, 0)] }"#,
+        ),
+    );
+    assert_eq!(transforms_at(&a, "u/Proto", 0.5).len(), 2);
+    let at = transforms_at(&a, "u/Proto", 1.0);
+    assert_eq!(at.len(), 1);
+    assert!(at[0].determinant() != 0.0);
+    assert!(at[0].inverse().is_finite());
+}
+
+/// A sample that holds the same value throughout moves nothing, so the copies stay as they were.
+#[test]
+fn samples_that_hold_still_stay_on_pages() {
+    let a = cook(
+        "instances-held",
+        &instancing(
+            r#"int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 0: [(1, 0, 0)], 10: [(1, 0, 0)] }"#,
+        ),
+    );
+    assert_eq!(origins(&a, "u/Proto"), [[1000, 0, 0]]);
+    let page = a
+        .entries()
+        .iter()
+        .find(|e| e.class == Class::InstancePage as u16);
+    let head = read(&a, &a.blobs(page.unwrap())[0]);
+    assert!(
+        InstancePageInfo::parse(&head)
+            .unwrap()
+            .motion_times
+            .is_empty()
+    );
+}
+
+/// `overview.dox`: with velocities whose samples line up with those of positions, "use the lower
+/// velocities timeSample and the lower points timeSample", and `pointInstancer.h`: "we will not
+/// attempt to interpolate samples of positions". Their sampling apart, "fall back to standard
+/// position computation logic".
+#[test]
+fn velocities_carry_positions_from_the_lower_sample() {
+    let carried = cook(
+        "instances-velocities",
+        &instancing(
+            r#"int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0)], 10: [(9, 0, 0)] }
+    vector3f[] velocities.timeSamples = { 0: [(1, 0, 0)], 10: [(1, 0, 0)] }"#,
+        ),
+    );
+    assert_copies(&carried, 0.5, &[[0.5, 0.0, 0.0]]);
+    assert_copies(&carried, 1.0, &[[9.0, 0.0, 0.0]]);
+    let apart = cook(
+        "instances-velocities-apart",
+        &instancing(
+            r#"int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0)], 10: [(9, 0, 0)] }
+    vector3f[] velocities.timeSamples = { 0: [(1, 0, 0)], 5: [(1, 0, 0)] }"#,
+        ),
+    );
+    assert_copies(&apart, 0.5, &[[4.5, 0.0, 0.0]]);
+    let spun = cook(
+        "instances-spin",
+        &instancing(
+            r#"int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0)], 10: [(0, 0, 0)] }
+    quath[] orientations.timeSamples = { 0: [(1, 0, 0, 0)], 10: [(1, 0, 0, 0)] }
+    vector3f[] angularVelocities.timeSamples = { 0: [(0, 0, 270)], 10: [(0, 0, 270)] }"#,
+        ),
+    );
+    let x = transforms_at(&spun, "u/Proto", 0.5)[0].transform_vector3(Vec3::X);
+    let want = Vec3::new(135f32.to_radians().cos(), 135f32.to_radians().sin(), 0.0);
+    assert!(x.abs_diff_eq(want, 1e-2), "{x}");
+}
+
+/// A sample of something else splits a rate's interval, and the quadratic and the spin go on
+/// through it. `pointInstancer.h`: with a rate, values come from the lower sample, so scales step
+/// though they would interpolate alone, and so do orientations whose own rate was dropped.
+#[test]
+fn a_rate_runs_through_samples_and_holds_the_rest() {
+    let a = cook(
+        "instances-rekeyed",
+        &instancing(
+            r#"int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0)], 10: [(9, 0, 0)] }
+    vector3f[] velocities.timeSamples = { 0: [(1, 0, 0)], 10: [(0, 0, 0)] }
+    vector3f[] accelerations.timeSamples = { 0: [(2, 0, 0)], 10: [(0, 0, 0)] }
+    quath[] orientations.timeSamples = { 0: [(1, 0, 0, 0)], 10: [(0, 0, 0, 1)] }
+    vector3f[] angularVelocities.timeSamples = { 0: [(0, 0, 90)], 5: [(0, 0, 90)] }
+    float3[] scales.timeSamples = { 0: [(1, 1, 1)], 4: [(2, 2, 2)], 10: [(3, 3, 3)] }"#,
+        ),
+    );
+    let at = |t: f32| transforms_at(&a, "u/Proto", t)[0];
+    for t in [0.2f32, 0.39, 0.4, 0.75] {
+        let x = at(t).transform_point3(Vec3::ZERO).x;
+        let want = t + t * t;
+        assert!((x - want).abs() < 1e-4, "at {t} s: {x}, not {want}");
+    }
+    assert!(
+        at(0.39)
+            .transform_vector3(Vec3::X)
+            .abs_diff_eq(Vec3::X, 1e-5)
+    );
+    assert!(
+        at(0.4)
+            .transform_vector3(Vec3::X)
+            .abs_diff_eq(Vec3::X * 2.0, 1e-5)
+    );
+    assert!(
+        at(0.75)
+            .transform_vector3(Vec3::X)
+            .abs_diff_eq(Vec3::X * 2.0, 1e-5)
+    );
+}
+
+/// `pointInstancer.h`: positions before and after their samples come from the first and last, and
+/// a rate there "extrapolates". Without one they stand still at the end.
+#[test]
+fn past_their_samples_rates_extrapolate_and_values_clamp() {
+    let a = cook(
+        "instances-open-ends",
+        &instancing(
+            r#"int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 10: [(0, 0, 0)] }
+    vector3f[] velocities.timeSamples = { 10: [(1, 0, 0)] }"#,
+        ),
+    );
+    assert_copies(&a, -2.0, &[[-2.0, 0.0, 0.0]]);
+    assert_copies(&a, 3.0, &[[3.0, 0.0, 0.0]]);
+    let b = cook(
+        "instances-clamped",
+        &instancing(
+            r#"int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 10: [(0, 0, 0)], 20: [(4, 0, 0)] }"#,
+        ),
+    );
+    assert_copies(&b, -2.0, &[[0.0, 0.0, 0.0]]);
+    assert_copies(&b, 0.5, &[[2.0, 0.0, 0.0]]);
+    assert_copies(&b, 7.0, &[[4.0, 0.0, 0.0]]);
+}
+
+/// `pointInstancer.h`: `ids` give "the 64 bit integer ID of the particle at each index, at each
+/// point in time", and an index "will be taken over by a new particle": it is the index that
+/// interpolates. `overview.dox`: samples of different lengths hold the lower one.
+#[test]
+fn ids_follow_instances_that_are_born_and_die() {
+    let a = cook(
+        "instances-ids",
+        &instancing(
+            r#"int[] protoIndices.timeSamples = { 0: [0, 0], 10: [0], 20: [0, 0] }
+    int64[] ids.timeSamples = { 0: [1, 2], 10: [2], 20: [2, 3] }
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0), (5, 0, 0)], 10: [(5, 2, 0)], 20: [(5, 4, 0), (9, 0, 0)] }"#,
+        ),
+    );
+    assert_copies(&a, 0.0, &[[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]]);
+    assert_copies(&a, 0.95, &[[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]]);
+    assert_copies(&a, 1.0, &[[5.0, 2.0, 0.0]]);
+    assert_copies(&a, 1.95, &[[5.0, 2.0, 0.0]]);
+    assert_copies(&a, 2.0, &[[5.0, 4.0, 0.0], [9.0, 0.0, 0.0]]);
+}
+
+/// `pointInstancer.h`: "The second masking feature encodes a list of IDs in a time-varying
+/// Int64Array-valued UsdAttribute", so an instance hides by the sample as well. `protoIndices`
+/// steps too, and a sample that does not match in length holds no instances.
+#[test]
+fn what_steps_changes_a_copy_at_its_sample() {
+    let a = cook(
+        "instances-invisible",
+        &instancing(
+            r#"int[] protoIndices = [0, 0]
+    point3f[] positions = [(0, 0, 0), (5, 0, 0)]
+    int64[] invisibleIds.timeSamples = { 0: [], 10: [1] }"#,
+        ),
+    );
+    assert_copies(&a, 0.0, &[[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]]);
+    assert_copies(&a, 1.0, &[[0.0, 0.0, 0.0]]);
+    let b = cook(
+        "instances-prototypes",
+        &instancing(
+            r#"int[] protoIndices.timeSamples = { 0: [0, 0], 10: [1, 0], 20: [1, 0, 0] }
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0), (5, 0, 0)], 10: [(0, 2, 0), (5, 2, 0)], 20: [(0, 2, 0), (5, 2, 0)], 30: [(0, 2, 0), (5, 2, 0), (7, 0, 0)] }"#,
+        ),
+    );
+    assert_copies(&b, 0.5, &[[0.0, 1.0, 0.0], [5.0, 1.0, 0.0]]);
+    assert_copies(&b, 1.0, &[[5.0, 2.0, 0.0]]);
+    assert_eq!(copies_at(&b, "u/Other", 0.5), []);
+    assert_eq!(copies_at(&b, "u/Other", 1.5), [Vec3::new(0.0, 2.0, 0.0)]);
+    assert_copies(&b, 2.5, &[]);
+    assert_eq!(copies_at(&b, "u/Other", 2.5), []);
+    assert_copies(&b, 3.0, &[[5.0, 2.0, 0.0], [7.0, 0.0, 0.0]]);
+}
+
+/// `pointInstancer.h`: "instances are placed in the instancer's space": a prim moving above and
+/// the instances' own samples compose, the one as the page's joint and the other as its rows. An
+/// instancer in a prototype of moving instances stands in the copies the time read found.
+#[test]
+fn moving_instances_hang_from_what_moves_them() {
+    let body = format!(
+        r#"point3f[] positions.timeSamples = {{ 0: [(1, 0, 0), (5, 0, 0)], 10: [(1, 2, 0), (5, 2, 0)] }}
+        def Xform "Proto"
+        {{
+            def Mesh "M"
+            {{
+                {TRIANGLE}
+            }}
+        }}"#
+    );
+    let stage = moving_crowd("/Mover/Crowd/Proto", &body)
+        .replace("point3f[] positions = [(1, 0, 0), (5, 0, 0)]\n", "\n");
+    let a = cook("instances-moving-hung", &stage);
+    let (skeleton, joint, _) = hung(&a, "u/Proto");
+    assert_eq!(skeleton, AssetId::from_name("u/skeleton"));
+    assert_eq!(joint, 1);
+    // The rows stand in the joint's bind space: the joint adds what the prim above moved.
+    let (_, end) = posed(&a, "u", "xform", 1.0);
+    let at = transforms_at(&a, "u/Proto", 1.0);
+    let got = end[joint].transform_point3(at[0].transform_point3(Vec3::ZERO));
+    assert!(got.abs_diff_eq(Vec3::new(1.0, 5.0, 0.0), 1e-3), "{got}");
+}
+
+/// 20 000 instances are that many records of one shared model, however a page splits them, and
+/// each record keeps its own rows.
+#[test]
+fn many_moving_copies_stay_records_of_one_model() {
+    let n = 20_000;
+    let spot = |i: usize, y: usize| format!("({}, {y}, {})", i % 200 * 3, i / 200 * 3);
+    let list = |y: usize| (0..n).map(|i| spot(i, y)).collect::<Vec<_>>().join(", ");
+    let a = cook(
+        "instances-many",
+        &instancing(&format!(
+            r#"int[] protoIndices = [{}]
+    point3f[] positions.timeSamples = {{ 0: [{}], 10: [{}] }}"#,
+            vec!["0"; n].join(", "),
+            list(0),
+            list(4),
+        )),
+    );
+    assert!(!has(&a, "u/skeleton"));
+    let models = a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::Model as u16);
+    assert_eq!(models.count(), 2, "one per prototype");
+    let at = transforms_at(&a, "u/Proto", 0.5);
+    assert_eq!(at.len(), n);
+    let mut got: Vec<[i32; 3]> = at
+        .iter()
+        .map(|m| m.w_axis.truncate().to_array().map(|x| x.round() as i32))
+        .collect();
+    let mut want: Vec<[i32; 3]> = (0..n as i32)
+        .map(|i| [i % 200 * 3, 2, i / 200 * 3])
+        .collect();
+    got.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(got, want);
 }

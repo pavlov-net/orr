@@ -1,8 +1,8 @@
 use orr_math::{DVec4, Mat3, Quat, Vec3, Vec4};
 use orr_pack::instance::{
     self, AXIS_ROTATIONS, InstancePageHeader, InstancePageInfo, InstanceRecord, LinearRows,
-    Prototype, SectionOverride, axis_rotation, decode_rotation, encode_rotation, exact_axis_index,
-    instance_rotation,
+    MotionRow, Prototype, SectionOverride, axis_rotation, decode_rotation, encode_rotation,
+    exact_axis_index, instance_rotation,
 };
 
 struct Rng(u64);
@@ -29,7 +29,8 @@ fn angle_deg(q: [f64; 4], d: [f32; 4]) -> f64 {
 
 #[test]
 fn layouts_match_the_gpu_structs() {
-    assert_eq!(size_of::<InstancePageHeader>(), 64);
+    assert_eq!(size_of::<InstancePageHeader>(), 192);
+    assert_eq!(size_of::<MotionRow>(), 88);
     assert_eq!(size_of::<Prototype>(), 32);
     assert_eq!(size_of::<SectionOverride>(), 20);
     assert_eq!(size_of::<InstanceRecord>(), 16);
@@ -68,6 +69,7 @@ fn sheared_page() -> (InstancePageInfo, Vec<u8>) {
         prototypes: vec![bytemuck::Zeroable::zeroed()],
         sections: Vec::new(),
         partitions: vec![0],
+        motion_times: Vec::new(),
     };
     let blob = [
         bytemuck::cast_slice::<_, u8>(&records),

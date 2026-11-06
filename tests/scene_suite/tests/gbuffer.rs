@@ -20,17 +20,17 @@ use std::time::{Duration, Instant};
 
 use orr_color::RgbPrimaries;
 use orr_cook::{
-    ArchiveSpec, AssetSpec, GltfSettings, Instances, Linear, LodMode, Manifest, MeshInput,
-    MeshParts, MeshSettings, Placement, Primaries, PrototypeSpec, SectionSpec, Source,
+    ArchiveSpec, AssetSpec, GltfSettings, InstanceMotion, Instances, Linear, LodMode, Manifest,
+    MeshInput, MeshParts, MeshSettings, Placement, Primaries, PrototypeSpec, SectionSpec, Source,
     TextureSettings, Usage, UsdSettings,
 };
 use orr_gpu::{
     ComputePipeline, GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, ShaderModule, Stages,
     Texture, TextureRegion,
 };
-use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3, Vec4};
+use orr_math::{Affine3, DMat4, DVec3, Mat3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_pack::clip::Clip;
-use orr_pack::instance::{InstanceRecord, LinearRows};
+use orr_pack::instance::{InstanceRecord, LinearRows, MotionRow};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{Cluster, Group, MeshInfo, PageView, decode_page};
 use orr_pack::model::ModelInfo;
@@ -1261,6 +1261,20 @@ fn cook() -> Arc<[u8]> {
                     },
                 },
                 AssetSpec {
+                    name: "paced".into(),
+                    source: Source::Usd {
+                        path: paced_stage("paced.usda", MOVER),
+                        settings: UsdSettings::default(),
+                    },
+                },
+                AssetSpec {
+                    name: "paced alone".into(),
+                    source: Source::Usd {
+                        path: paced_stage("paced-alone.usda", ""),
+                        settings: UsdSettings::default(),
+                    },
+                },
+                AssetSpec {
                     name: "swaying door".into(),
                     source: Source::Usd {
                         path: swaying_door_stage(),
@@ -1286,6 +1300,10 @@ fn cook() -> Arc<[u8]> {
                             ..GltfSettings::default()
                         },
                     },
+                },
+                AssetSpec {
+                    name: "paced crowd".into(),
+                    source: Source::Instances(paced_crowd()),
                 },
                 AssetSpec {
                     name: "unbounded worm".into(),
@@ -4352,6 +4370,44 @@ def Xform "Mover"
     path
 }
 
+/// What [`paced_stage`]'s instancer hangs from.
+const MOVER: &str = r#"double3 xformOp:translate.timeSamples = { 0: (0, 0, 0), 24: (1, 0, 0) }
+    uniform token[] xformOpOrder = ["xformOp:translate"]"#;
+
+/// A stage of an instancer under a prim of `mover`, whose one instance goes from (0.5, 0, 0) to
+/// (0.9, 0, 0) in the first second and is gone after the second.
+fn paced_stage(name: &str, mover: &str) -> PathBuf {
+    let path = temp(name);
+    let stage = format!(
+        r#"#usda 1.0
+(
+    metersPerUnit = 1
+    timeCodesPerSecond = 10
+    upAxis = "Y"
+)
+def Xform "Mover"
+{{
+    {mover}
+    def PointInstancer "Crowd"
+    {{
+        rel prototypes = [</Mover/Crowd/Leaf>]
+        int[] protoIndices.timeSamples = {{ 0: [0], 20: [] }}
+        point3f[] positions.timeSamples = {{ 0: [(0.5, 0, 0)], 10: [(0.9, 0, 0)], 20: [] }}
+        def Mesh "Leaf"
+        {{
+            uniform token subdivisionScheme = "none"
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.2, -0.2, 0), (0.2, -0.2, 0), (0.2, 0.2, 0), (-0.2, 0.2, 0)]
+        }}
+    }}
+}}
+"#
+    );
+    std::fs::write(&path, stage).unwrap();
+    path
+}
+
 /// [`door_stage`] with a door whose shear grows over its clip, as glTF cannot animate one.
 fn swaying_door_stage() -> PathBuf {
     let path = temp("swaying-door.usda");
@@ -4478,19 +4534,28 @@ fn place_door(w: &mut World, x: f32) -> Placed {
 
 /// `hung`'s page, hung from a palette whose joint moves it `x` m along x.
 fn place_hung(w: &mut World, x: f32) -> Placed {
+    place_page(w, "hung", x)
+}
+
+/// The page of `asset`, hung from a palette whose joint moves it `x` m along x if it names one.
+fn place_page(w: &mut World, asset: &str, x: f32) -> Placed {
     let a = Archive::from_memory(Arc::clone(pack())).unwrap();
-    let is_hung = |e: &&Entry| {
-        e.class == orr_pack::Class::InstancePage as u16 && a.name(e).starts_with("hung/")
+    let prefix = format!("{asset}/");
+    let is_page = |e: &&Entry| {
+        e.class == orr_pack::Class::InstancePage as u16 && a.name(e).starts_with(&prefix)
     };
-    let entry = a.entries().iter().find(is_hung).expect("the hung page");
+    let entry = a.entries().iter().find(is_page).expect("the page");
     let header = orr_pack::instance::InstancePageInfo::parse(&blob(&a, entry, 0))
         .unwrap()
         .header;
-    assert_eq!(
-        header.frame_skeleton,
-        AssetId::from_name("hung/skeleton"),
-        "the page names its skeleton"
-    );
+    let hung = header.frame_skeleton != AssetId::NONE;
+    if hung {
+        assert_eq!(
+            header.frame_skeleton,
+            AssetId::from_name(&format!("{asset}/skeleton")),
+            "the page names its skeleton"
+        );
+    }
     let page = w.scenes.instance_page(w.mount, entry.id).unwrap();
     let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
     let history = w.scenes.create_view_history().unwrap();
@@ -4518,7 +4583,7 @@ fn place_hung(w: &mut World, x: f32) -> Placed {
     let range = s
         .add_instance_page(&InstancePageRef {
             page,
-            frame: Some((palette, header.frame_joint)),
+            frame: hung.then_some((palette, header.frame_joint)),
             poses: &[],
             material_sets: &[],
             flags: InstanceFlags::RASTER | InstanceFlags::RAY,
@@ -4584,6 +4649,88 @@ fn a_page_hung_from_a_joint_follows_its_palette_entry() {
         "{matched} of {} pixels agree",
         r.traced.len()
     );
+    assert_clean();
+}
+
+/// An animated page draws and traces where its rows stand at the page's clock, frame after frame
+/// of one placement: the rows move a copy on, a joint above carries it further, and past its last
+/// sample it is gone, to come back when the clock does.
+#[test]
+fn an_animated_page_follows_its_clock_and_its_joint() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let (eye, target) = (DVec3::new(0.7, 0.0, 2.5), DVec3::new(0.7, 0.0, 0.0));
+    let middle = |g: &Frame| {
+        let columns = g.ids.iter().enumerate().filter(|(_, id)| **id != 0);
+        let (n, sum) = columns.fold((0u32, 0.0f64), |(n, sum), (i, _)| {
+            (n + 1, sum + f64::from(i as u32 % EXTENT[0]))
+        });
+        assert!(n > 100, "{n} pixels of the copy");
+        sum / f64::from(n)
+    };
+    let f = 1.0 / (0.45f64).tan();
+    let aspect = f64::from(EXTENT[0]) / f64::from(EXTENT[1]);
+    let px = |m: f64| 0.5 * m / 2.5 * f / aspect * f64::from(EXTENT[0]);
+    for (asset, base) in [("paced", 0), ("paced alone", 100)] {
+        let placed = place_page(&mut w, asset, 0.0);
+        let range = placed.ranges[0];
+        let mut frame = base;
+        let mut from = |w: &mut World, before: f32, t: f32, joint: Option<f32>| {
+            frame += 4;
+            let mut g = None;
+            for n in 0..4 {
+                let mut shot = Shot::at(eye, target, frame + n);
+                shot.reset = false;
+                if let Some(x) = joint {
+                    shot.moved = vec![(1, Affine3::from_translation(Vec3::X * x))];
+                }
+                let t = if n < 3 { before } else { t };
+                g = Some(shoot_with(w, &placed, &shot, |s| s.set_page_time(range, t)));
+            }
+            g.unwrap()
+        };
+        let start = Instant::now();
+        let at_rest = loop {
+            let g = from(&mut w, 0.0, 0.0, None);
+            if g.ids.iter().any(|&id| id != 0) {
+                break g;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the page never landed"
+            );
+        };
+        let rest = middle(&at_rest);
+        let g = from(&mut w, 0.25, 0.5, None);
+        let got = middle(&g) - rest;
+        assert!((got - px(0.2)).abs() < 0.05 * px(0.2), "{asset}: {got} px");
+        // A frame's motion is what its clock moved the copy since the last.
+        for (i, _) in g.ids.iter().enumerate().filter(|(_, id)| **id != 0) {
+            let m = f64::from(g.motion[i][0]) * f64::from(EXTENT[0]);
+            assert!((m + px(0.1)).abs() < 0.05, "{asset}: {m} px of motion");
+        }
+        let g = from(&mut w, 1.5, 1.5, None);
+        let got = middle(&g) - rest;
+        assert!((got - px(0.4)).abs() < 0.05 * px(0.4), "{asset}: {got} px");
+        let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+        let (matched, _) = parity(&g, &r, 1e-4);
+        assert!(
+            matched as f64 >= 0.999 * r.traced.len() as f64,
+            "{asset}: {matched} of {} pixels agree",
+            r.traced.len()
+        );
+        if asset == "paced" {
+            let g = from(&mut w, 1.5, 1.5, Some(-0.3));
+            let got = middle(&g) - rest;
+            let want = px(0.1);
+            assert!((got - want).abs() < 0.05 * want, "{got} px, not {want}");
+        }
+        let g = from(&mut w, 2.5, 2.5, None);
+        assert!(g.ids.iter().all(|&id| id == 0), "{asset}: the copy is gone");
+        let g = from(&mut w, 0.0, 0.0, Some(0.0));
+        let got = middle(&g) - rest;
+        assert!(got.abs() < 1.0, "{asset}: {got} px after it came back");
+    }
     assert_clean();
 }
 
@@ -5692,11 +5839,55 @@ struct Worms {
 /// Where `crowd`'s instances place its worms, in one world cell and in record order.
 const CROWD: [[f32; 3]; 2] = [[0.2, 0.0, 0.1], [1.0, 0.0, 0.1]];
 
+/// m/s of [`paced_crowd`].
+const PACE: Vec3 = Vec3::new(0.3, 0.0, 0.0);
+
+/// Worms of [`CROWD`] walking at [`PACE`], on a page of the model all of `worm`'s copies share.
+fn paced_crowd() -> Instances {
+    let row = |p: [f32; 3]| MotionRow {
+        position: p,
+        velocity: PACE.to_array(),
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        scale: [1.0; 3],
+        ..MotionRow::default()
+    };
+    let spot = |p: [f32; 3]| Placement {
+        position: p.map(f64::from),
+        linear: Linear::Scaled {
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+        },
+        prototype: 0,
+    };
+    Instances {
+        records: CROWD.map(spot).to_vec(),
+        prototypes: vec![PrototypeSpec {
+            model: "worm".into(),
+            ..PrototypeSpec::default()
+        }],
+        motion: Some(Arc::new(InstanceMotion {
+            times: vec![0.0],
+            rows: CROWD.map(row).to_vec(),
+            anchors: vec![[0.0; 3]; CROWD.len()],
+            left: DMat4::IDENTITY,
+            right: DMat4::IDENTITY,
+            start: 0.0,
+        })),
+        ..Instances::default()
+    }
+}
+
 /// The copies of `crowd`'s page, with a palette group written on the CPU.
 fn place_crowd(w: &mut World) -> Worms {
+    place_crowd_of(w, "crowd")
+}
+
+/// The copies of `asset`'s page, with a palette group written on the CPU.
+fn place_crowd_of(w: &mut World, asset: &str) -> Worms {
     let a = Archive::from_memory(Arc::clone(pack())).unwrap();
+    let prefix = format!("{asset}/");
     let is_crowd = |e: &&Entry| {
-        e.class == orr_pack::Class::InstancePage as u16 && a.name(e).starts_with("crowd/")
+        e.class == orr_pack::Class::InstancePage as u16 && a.name(e).starts_with(&prefix)
     };
     let entry = a.entries().iter().find(is_crowd).expect("the crowd's page");
     let page = w.scenes.instance_page(w.mount, entry.id).unwrap();
@@ -5951,6 +6142,56 @@ fn skinned_vertices_match_the_cpu_skin_by_this_and_the_last_palette() {
     assert!(
         before < 1e-5,
         "previous positions {before} m from the CPU skin"
+    );
+    assert_clean();
+}
+
+/// A skinned copy of an animated page stands where its rows say, like one placed there by hand:
+/// the rows give the transform and the palette the pose.
+#[test]
+fn skinned_copies_on_an_animated_page_follow_its_clock() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let by_hand = CROWD.map(|p| (Mat3::IDENTITY, Vec3::from(p) + PACE));
+    let hand = place_worms(&mut w, "worm", &by_hand, false);
+    let want = shoot_worms(&mut w, &hand, &worm_shot(1), 0.7, 0.45);
+    let crowd = place_crowd_of(&mut w, "paced crowd");
+    let range = crowd.placed.ranges[0];
+    let shoot_at = |w: &mut World, frame: u32| {
+        shoot_with(w, &crowd.placed, &worm_shot(frame), |s| {
+            write_palette(s, &crowd, 0.7, 0.45);
+            s.set_page_time(range, 1.0);
+        })
+    };
+    let start = Instant::now();
+    let mut frame = 2;
+    let g = loop {
+        frame += 1;
+        let g = shoot_at(&mut w, frame);
+        if frame > 4 && g.ids.iter().any(|&id| id != 0) {
+            break shoot_at(&mut w, frame + 1);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the page never landed"
+        );
+    };
+    let n = g.depth.len();
+    let same = (0..n)
+        .filter(|&i| (want.depth[i] - g.depth[i]).abs() <= 2e-3 * want.depth[i].max(1e-3))
+        .count();
+    let drawn = g.ids.iter().filter(|&&id| id != 0).count();
+    assert!(drawn > n / 50, "{drawn} of {n} pixels drawn");
+    assert!(
+        same as f64 >= 0.995 * n as f64,
+        "{same} of {n} depths agree"
+    );
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let (matched, _) = parity(&g, &r, 1e-4);
+    assert!(
+        matched as f64 >= 0.999 * r.traced.len() as f64,
+        "{matched} of {} pixels agree",
+        r.traced.len()
     );
     assert_clean();
 }
@@ -7863,7 +8104,7 @@ fn row_pages(
     let a = Archive::from_memory(Arc::clone(pack())).unwrap();
     let mut out = Vec::new();
     for e in a.entries() {
-        if e.class != orr_pack::Class::InstancePage as u16 {
+        if e.class != orr_pack::Class::InstancePage as u16 || !a.name(e).starts_with("rows/") {
             continue;
         }
         let id = w.scenes.instance_page(w.mount, e.id).unwrap();

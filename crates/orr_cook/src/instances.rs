@@ -2,14 +2,15 @@
 //! into PTLAS partitions.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use bytemuck::Zeroable;
-use orr_math::{DMat3, DQuat, DVec3, Mat3, Quat, Vec3};
+use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, Mat3, Quat, Vec3};
 use orr_pack::instance::{
     self, InstancePageHeader, InstancePageInfo, InstanceRecord, LinearRows, MAX_HIDDEN_SECTION,
-    MAX_POSE, MAX_RECORDS, PARTITION_INSTANCES, Prototype, SectionOverride,
+    MAX_POSE, MAX_RECORDS, MotionRow, PARTITION_INSTANCES, Prototype, SectionOverride,
 };
-use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
+use orr_pack::{AffineRows, ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
 use serde::Deserialize;
 
 use crate::import::{collapses, column_lengths, largest};
@@ -28,10 +29,30 @@ pub struct Instances {
     pub user_stride: u16,
     /// The joint the records hang from, in whose bind space they stand.
     pub frame: Option<PageFrame>,
+    /// How the records move over time, which an importer works out.
+    #[serde(skip)]
+    pub motion: Option<Arc<InstanceMotion>>,
     /// Pieces that join without cracks: every placement sits on the coarsest grid step of the
     /// page's meshes, has scale 1 and a rotation that is a multiple of 90 degrees about the
     /// axes, and decodes exactly.
     pub joined: bool,
+}
+
+/// Records over time ([`orr_pack::instance`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstanceMotion {
+    /// Seconds each interval starts at.
+    pub times: Vec<f32>,
+    /// Per interval a row per record, interval-major, each position from its record's anchor.
+    pub rows: Vec<MotionRow>,
+    /// Per record a point between `left` and `right`, in f64: rows stay small, and a page brings
+    /// them to its cell, where an f32 keeps what they move by.
+    pub anchors: Vec<[f64; 3]>,
+    /// What stands either side of a row: scene space, or `frame`'s bind space, from it.
+    pub left: DMat4,
+    pub right: DMat4,
+    /// Seconds of `times` the stage was read at, where the copies stand until set.
+    pub start: f32,
 }
 
 /// A joint of a skeleton entry.
@@ -205,11 +226,12 @@ pub(crate) fn cook(
     for (cell, records) in &cells {
         let pages = split_cell(&rel, records, edge).ok_or_else(|| crowded(name, *cell))?;
         for (page, members) in pages.into_iter().enumerate() {
-            let built = build_page(name, src, &prototypes, *cell, &rel, &members)?;
+            let built = build_page(name, src, &prototypes, *cell, &rel, &members, edge)?;
             let info = built.info.to_bytes();
             let records = [
                 bytemuck::cast_slice(&built.records),
                 bytemuck::cast_slice(&built.linear),
+                bytemuck::cast_slice(&built.motion),
             ]
             .concat();
             let mut blobs = vec![mount(&info), BlobIn::new(&records)];
@@ -318,6 +340,32 @@ fn resolve_prototypes(name: &str, src: &Instances, catalog: &Catalog) -> Result<
 }
 
 fn check_records(name: &str, src: &Instances) -> Result<()> {
+    if let Some(m) = &src.motion
+        && m.anchors.len() != src.records.len()
+    {
+        return Err(fail(
+            name,
+            format!(
+                "motion holds {} anchors for {} records",
+                m.anchors.len(),
+                src.records.len()
+            ),
+        ));
+    }
+    if let Some(m) = &src.motion
+        && (m.times.is_empty() || m.rows.len() != m.times.len() * src.records.len())
+    {
+        return Err(fail(
+            name,
+            format!(
+                "motion holds {} rows, {} intervals of {} records need {}",
+                m.rows.len(),
+                m.times.len(),
+                src.records.len(),
+                m.times.len() * src.records.len()
+            ),
+        ));
+    }
     if src.user.len() != src.records.len() * usize::from(src.user_stride) {
         return Err(fail(
             name,
@@ -357,6 +405,14 @@ pub(crate) fn input_hash(src: &Instances, cell_log2: u8) -> Hash32 {
     let mut h = blake3::Hasher::new();
     h.update(&[cell_log2, u8::from(src.joined)]);
     h.update(format!("{:?} {:?}", src.prototypes, src.frame).as_bytes());
+    if let Some(m) = &src.motion {
+        h.update(bytemuck::cast_slice(&m.times));
+        h.update(bytemuck::cast_slice(&m.rows));
+        h.update(bytemuck::cast_slice(&m.anchors));
+        h.update(bytemuck::cast_slice(&m.left.to_cols_array()));
+        h.update(bytemuck::cast_slice(&m.right.to_cols_array()));
+        h.update(&m.start.to_le_bytes());
+    }
     for p in &src.records {
         h.update(bytemuck::cast_slice(&p.position));
         h.update(bytemuck::cast_slice(&p.linear().to_cols_array()));
@@ -425,6 +481,7 @@ struct BuiltPage {
     info: InstancePageInfo,
     records: Vec<InstanceRecord>,
     linear: Vec<LinearRows>,
+    motion: Vec<MotionRow>,
     user: Vec<u8>,
 }
 
@@ -435,6 +492,7 @@ fn build_page(
     cell: [i32; 3],
     rel: &[DVec3],
     members: &[usize],
+    edge: f64,
 ) -> Result<BuiltPage> {
     let mut used: Vec<u16> = members.iter().map(|&i| src.records[i].prototype).collect();
     used.sort_unstable();
@@ -476,6 +534,10 @@ fn build_page(
             .as_ref()
             .map_or(AssetId::NONE, |f| AssetId::from_name(&f.skeleton)),
         frame_joint: src.frame.as_ref().map_or(0, |f| f.joint),
+        motion_times: Span::default(),
+        motion_left: AffineRows::from(Affine3::IDENTITY),
+        motion_right: AffineRows::from(Affine3::IDENTITY),
+        motion_start: 0.0,
     };
     let mut forms: Vec<Form> = members
         .iter()
@@ -587,15 +649,40 @@ fn build_page(
     if src.joined {
         check_joined(name, &header, &records, rel, &order, members)?;
     }
+    // Rows follow their records, by interval, from a point of the page.
+    let mut motion = Vec::new();
+    let mut motion_times = Vec::new();
+    if let Some(m) = &src.motion {
+        let all = src.records.len();
+        let origin = DVec3::from_array(m.anchors[members[0]]);
+        for k in 0..m.times.len() {
+            motion.extend(order.iter().map(|&n| {
+                let i = members[n];
+                let mut row = m.rows[k * all + i];
+                let from = DVec3::from_array(row.position.map(f64::from));
+                let at = from + DVec3::from_array(m.anchors[i]) - origin;
+                row.position = at.as_vec3().to_array();
+                row
+            }));
+        }
+        motion_times.clone_from(&m.times);
+        let corner = DVec3::from_array(cell.map(f64::from)) * edge;
+        let left = DMat4::from_translation(-corner) * m.left * DMat4::from_translation(origin);
+        header.motion_left = AffineRows::from(Affine3::from_mat4(left.as_mat4()));
+        header.motion_right = AffineRows::from(Affine3::from_mat4(m.right.as_mat4()));
+        header.motion_start = m.start;
+    }
     Ok(BuiltPage {
         info: InstancePageInfo {
             header,
             prototypes: page_prototypes,
             sections,
             partitions,
+            motion_times,
         },
         records,
         linear,
+        motion,
         user,
     })
 }

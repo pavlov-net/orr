@@ -166,6 +166,7 @@ fn fixture_page_decodes_within_its_error_bounds() {
     ];
     let a = cook_instances(Instances {
         frame: None,
+        motion: None,
         records: records.clone(),
         prototypes,
         user,

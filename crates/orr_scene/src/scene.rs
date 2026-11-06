@@ -322,6 +322,22 @@ pub(crate) struct GroupFrame {
     origin: [f32; 3],
 }
 
+/// An animated page placed in a scene.
+pub(crate) struct PageMotion {
+    pub(crate) range: InstanceRange,
+    /// The page's records.
+    pub(crate) records: TransformGroupId,
+    /// The transforms its copies read.
+    pub(crate) group: TransformGroupId,
+    pub(crate) times: Vec<f32>,
+    pub(crate) left: [[f32; 4]; 3],
+    pub(crate) right: [[f32; 4]; 3],
+    pub(crate) count: u32,
+    pub(crate) linear_rows: u32,
+    /// s of the page's clock, from [`SceneWriter::set_page_time`].
+    pub(crate) time: f32,
+}
+
 /// What a cooked page's transform group holds.
 #[derive(Clone, Copy)]
 pub(crate) struct PageGroup {
@@ -536,6 +552,10 @@ pub(crate) struct SceneCpu {
     /// Pages removed in a frame, freed once that frame has completed.
     pub(crate) pages_removed: Vec<(u64, PagePlacement)>,
     pub(crate) skinned_pages: Vec<SkinnedPage>,
+    /// Animated pages, which a kernel poses every frame.
+    pub(crate) page_motions: Vec<PageMotion>,
+    /// Groups removed in a frame, whose memory that frame's records may still write.
+    pub(crate) groups_removed: Vec<(u64, Group)>,
     /// Entries of skinned pages' material sets by the frames that removed them, freed once
     /// those have completed.
     pub(crate) skinned_sets_removed: Vec<(u64, (u32, u32))>,
@@ -565,6 +585,22 @@ fn words(bytes: usize) -> u32 {
 }
 
 impl SceneCpu {
+    /// The lowest id no group holds; 0 means none.
+    fn free_group(&self) -> usize {
+        (1..self.groups.len())
+            .find(|&i| self.groups[i].is_none())
+            .unwrap_or(self.groups.len())
+    }
+
+    /// Puts `group` at an id of [`Self::free_group`].
+    fn put_group(&mut self, id: usize, group: Group) {
+        if id == self.groups.len() {
+            self.groups.push(Some(group));
+        } else {
+            self.groups[id] = Some(group);
+        }
+    }
+
     /// The focus and the pixels per radian of the scene's per-frame work.
     pub(crate) fn focus_detail(&self) -> Option<(DVec3, f32)> {
         self.focus.map(|f| (f, self.pixels_per_radian))
@@ -677,6 +713,8 @@ impl Scene {
                 pages: Vec::new(),
                 pages_removed: Vec::new(),
                 skinned_pages: Vec::new(),
+                page_motions: Vec::new(),
+                groups_removed: Vec::new(),
                 skinned_sets_removed: Vec::new(),
                 page_sets: RangeAllocator::new(desc.page_material_sets),
             }),
@@ -738,6 +776,14 @@ impl<'f> SceneWriter<'f> {
         &mut self,
         desc: &TransformGroupDesc,
     ) -> Result<TransformGroupId> {
+        self.create_group(desc, None)
+    }
+
+    fn create_group(
+        &mut self,
+        desc: &TransformGroupDesc,
+        frame: Option<GroupFrame>,
+    ) -> Result<TransformGroupId> {
         let bytes = u64::from(desc.count.max(1)) * size_of::<AffineRows>() as u64;
         let buffers = [0, 1].map(|_| {
             self.device
@@ -754,7 +800,7 @@ impl<'f> SceneWriter<'f> {
             created_frame: self.frame,
             written: false,
             page: None,
-            frame: None,
+            frame,
         };
         let record = group.record();
         let zero = Record::fill(
@@ -765,16 +811,16 @@ impl<'f> SceneWriter<'f> {
         );
         let id = {
             let mut cpu = self.scene.cpu.lock().unwrap();
-            let id = cpu.groups.len() as u32;
-            if id >= self.scene.desc.group_capacity {
+            let id = cpu.free_group();
+            if id as u32 >= self.scene.desc.group_capacity {
                 return Err(Error::Capacity {
                     what: "transform groups",
                     capacity: self.scene.desc.group_capacity,
                 });
             }
-            cpu.groups.push(Some(group));
+            cpu.put_group(id, group);
             cpu.records.push(zero);
-            id
+            id as u32
         };
         self.write(self.scene.tables.groups.gpu().offset(u64::from(id)), record)?;
         Ok(TransformGroupId(id))
@@ -978,6 +1024,16 @@ impl<'f> SceneWriter<'f> {
     /// page's prototypes the first time the records land, so their variants, flags and other
     /// per-copy settings come from the page.
     pub fn add_instance_page(&mut self, r: &InstancePageRef<'_>) -> Result<InstanceRange> {
+        let motion = self.motion_group(r.page, r.frame)?;
+        let placed = self.place_instance_page(r, motion);
+        self.settle_motion(r.page, motion, placed)
+    }
+
+    fn place_instance_page(
+        &mut self,
+        r: &InstancePageRef<'_>,
+        motion: Option<TransformGroupId>,
+    ) -> Result<(InstanceRange, TransformGroupId)> {
         let page = self
             .mounts
             .pages
@@ -1033,9 +1089,7 @@ impl<'f> SceneWriter<'f> {
             .frame
             .map(|f| self.group_frame(cpu, f, cell))
             .transpose()?;
-        let group_id = (1..cpu.groups.len())
-            .find(|&i| cpu.groups[i].is_none())
-            .unwrap_or(cpu.groups.len()) as u32;
+        let group_id = cpu.free_group() as u32;
         if group_id >= self.scene.desc.group_capacity {
             return Err(Error::Capacity {
                 what: "transform groups",
@@ -1128,7 +1182,7 @@ impl<'f> SceneWriter<'f> {
             }
             copies.push(PagePrototypeGpu {
                 instance: InstanceGpu {
-                    group: group_id,
+                    group: motion.map_or(group_id, |m| m.0),
                     group_index: 0,
                     model: p.model.0,
                     material_base: base,
@@ -1169,12 +1223,7 @@ impl<'f> SceneWriter<'f> {
         let mut group = Group::of_page(r.page, page, self.frame);
         group.frame = frame;
         let record = group.record();
-        let at = group_id as usize;
-        if at == cpu.groups.len() {
-            cpu.groups.push(Some(group));
-        } else {
-            cpu.groups[at] = Some(group);
-        }
+        cpu.put_group(group_id as usize, group);
         let range = InstanceRange { first, count };
         let seq = self.next_seq();
         let n = count * words(size_of::<InstanceGpu>());
@@ -1211,7 +1260,7 @@ impl<'f> SceneWriter<'f> {
             1,
         ));
         Self::reset_slot_state_with(&self.scene.tables, self.next_seq(), range, &mut cpu.records);
-        Ok(range)
+        Ok((range, TransformGroupId(group_id)))
     }
 
     /// What hangs a group anchored at `cell` from entry `frame.1` of palette group `frame.0`. A
@@ -1238,6 +1287,87 @@ impl<'f> SceneWriter<'f> {
         })
     }
 
+    /// The group an animated page's copies read, hung as the page is; `None` for a page that
+    /// holds still. A kernel writes it every frame, from [`Self::set_page_time`].
+    fn motion_group(
+        &mut self,
+        page: PageId,
+        frame: Option<(TransformGroupId, u32)>,
+    ) -> Result<Option<TransformGroupId>> {
+        let held = self
+            .mounts
+            .pages
+            .get(page.0 as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Error::UnknownPage(page))?;
+        if held.info.motion_times.is_empty() {
+            return Ok(None);
+        }
+        let header = held.info.header;
+        let pool = self.mounts.streaming.instance_page_pool();
+        let bytes = self.mounts.page_bytes(page.0);
+        if bytes > pool {
+            return Err(Error::PageOverPool { page, bytes, pool });
+        }
+        let cell = IVec3::from_array(header.cell);
+        let edge = 2f64.powi(self.cell_log2 as i32);
+        let hung = {
+            let cpu = self.scene.cpu.lock().unwrap();
+            frame.map(|f| self.group_frame(&cpu, f, cell)).transpose()?
+        };
+        let desc = TransformGroupDesc {
+            count: u32::from(header.record_count),
+            writer: GroupWriter::Gpu,
+            anchor: cell.as_dvec3() * edge,
+        };
+        self.create_group(&desc, hung).map(Some)
+    }
+
+    /// Lists the animated page just placed, or frees its group if that failed. `placed` is the
+    /// page's range and the group of its records.
+    fn settle_motion(
+        &self,
+        page: PageId,
+        motion: Option<TransformGroupId>,
+        placed: Result<(InstanceRange, TransformGroupId)>,
+    ) -> Result<InstanceRange> {
+        let Some(group) = motion else {
+            return placed.map(|p| p.0);
+        };
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        let (range, records) = match placed {
+            Ok(p) => p,
+            Err(e) => {
+                self.clear_group(cpu, group, self.next_seq());
+                return Err(e);
+            }
+        };
+        let held = self.mounts.pages[page.0 as usize].as_ref();
+        let p = held.ok_or(Error::UnknownPage(page))?;
+        let h = p.info.header;
+        cpu.page_motions.push(PageMotion {
+            range,
+            records,
+            group,
+            times: p.info.motion_times.clone(),
+            left: h.motion_left.rows,
+            right: h.motion_right.rows,
+            count: u32::from(h.record_count),
+            linear_rows: h.linear_rows(p.bytes as usize)? as u32,
+            time: h.motion_start,
+        });
+        Ok(range)
+    }
+
+    /// Sets the clock of the animated page placed at `range`, in seconds, on the timeline of its
+    /// skeleton clips. Copies of a page that holds still ignore it.
+    pub fn set_page_time(&mut self, range: InstanceRange, seconds: f32) {
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        if let Some(m) = cpu.page_motions.iter_mut().find(|m| m.range == range) {
+            m.time = seconds;
+        }
+    }
+
     /// Whether `model` has a skinned mesh.
     fn is_skinned(&self, model: ModelId) -> bool {
         let cpu = self.model_cpu.get(model.0 as usize);
@@ -1250,6 +1380,16 @@ impl<'f> SceneWriter<'f> {
     /// do, unless `r` names a material set. A page of anything else fails with
     /// [`Error::NotSkinnedPage`].
     pub fn add_skinned_page(&mut self, r: &SkinnedPageRef) -> Result<InstanceRange> {
+        let motion = self.motion_group(r.page, r.frame)?;
+        let placed = self.place_skinned_page(r, motion);
+        self.settle_motion(r.page, motion, placed)
+    }
+
+    fn place_skinned_page(
+        &mut self,
+        r: &SkinnedPageRef,
+        motion: Option<TransformGroupId>,
+    ) -> Result<(InstanceRange, TransformGroupId)> {
         let page = self
             .mounts
             .pages
@@ -1282,9 +1422,7 @@ impl<'f> SceneWriter<'f> {
         let set_entries = cooked.map_or(0, |s| s.len() as u32);
         let (id, sets) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
-            let id = (1..cpu.groups.len())
-                .find(|&i| cpu.groups[i].is_none())
-                .unwrap_or(cpu.groups.len());
+            let id = cpu.free_group();
             if id as u32 >= self.scene.desc.group_capacity {
                 return Err(Error::Capacity {
                     what: "transform groups",
@@ -1310,11 +1448,7 @@ impl<'f> SceneWriter<'f> {
                     set_entries,
                 ));
             }
-            if id == cpu.groups.len() {
-                cpu.groups.push(Some(group));
-            } else {
-                cpu.groups[id] = Some(group);
-            }
+            cpu.put_group(id, group);
             let (src, out) = self.window.slice::<GroupGpu>(self.device, 1)?;
             out[0] = record;
             cpu.records.push(Record::values(
@@ -1333,7 +1467,7 @@ impl<'f> SceneWriter<'f> {
         let placed = self.add_skinned(&SkinnedDesc {
             model: proto.model,
             copies,
-            transforms: id,
+            transforms: motion.unwrap_or(id),
             first: 0,
             palette: r.palette,
             palette_first: r.palette_first,
@@ -1366,12 +1500,13 @@ impl<'f> SceneWriter<'f> {
             };
             self.copy_variants(range, 0, &vec![variant; copies as usize])?;
         }
-        Ok(range)
+        Ok((range, id))
     }
 
     /// Empties group `id` and its record.
     fn clear_group(&self, cpu: &mut SceneCpu, id: TransformGroupId, seq: u64) {
-        cpu.groups[id.0 as usize] = None;
+        let group = cpu.groups[id.0 as usize].take();
+        cpu.groups_removed.extend(group.map(|g| (self.frame, g)));
         let at = self.scene.tables.groups.gpu().offset(u64::from(id.0));
         let n = words(size_of::<GroupGpu>());
         cpu.records.push(Record::fill(seq, at.address().0, n, 0));
@@ -1635,6 +1770,10 @@ impl<'f> SceneWriter<'f> {
             let p = cpu.pages.swap_remove(i);
             self.clear_group(cpu, p.group, seq);
             cpu.pages_removed.push((self.frame, p));
+        }
+        if let Some(i) = cpu.page_motions.iter().position(|m| m.range == range) {
+            let m = cpu.page_motions.swap_remove(i);
+            self.clear_group(cpu, m.group, seq);
         }
         if let Some(i) = cpu.skinned_pages.iter().position(|p| p.range == range) {
             let p = cpu.skinned_pages.swap_remove(i);

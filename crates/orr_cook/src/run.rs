@@ -1897,6 +1897,7 @@ fn plan_scene(
                 skeleton: skeleton_names[skeleton].clone(),
                 joint: u32::from(joint),
             });
+            src.motion.clone_from(&m.motion);
         }
         instances.extend(pages);
     }

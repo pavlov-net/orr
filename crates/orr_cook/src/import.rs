@@ -3,6 +3,7 @@
 //! placements, and the files it read.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use orr_math::{DMat3, DMat4, DVec3, Mat3};
 use orr_pack::clip::Clip;
@@ -10,6 +11,7 @@ use orr_pack::material::{Material, slot};
 use orr_pack::skeleton::SkeletonInfo;
 use serde::Deserialize;
 
+use crate::instances::InstanceMotion;
 use crate::mesh::{self, MeshSettings, MeshSource};
 use crate::state::Input;
 use crate::subd::{CageData, SubdSettings};
@@ -59,8 +61,10 @@ pub(crate) struct PlacedModel {
     /// Index into [`Scene::skeletons`] and the joint the placements hang from.
     pub(crate) frame: Option<(usize, u16)>,
     /// On pages of its own, whose records are its copies alone: for the palettes of a model with
-    /// a skeleton, and for a frame, which is a page's.
+    /// a skeleton, and for a frame or motion, which are a page's.
     pub(crate) alone: bool,
+    /// How the placements move over time, in their order.
+    pub(crate) motion: Option<Arc<InstanceMotion>>,
 }
 
 /// One placement: position and a linear transform that [`collapses`] passes.

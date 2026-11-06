@@ -39,7 +39,7 @@ use crate::reload::Reloader;
 use crate::residency::ResidencyStats;
 use crate::scene::{GroupWriter, ModelCpu, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
 use crate::shaders::transparency::CompositeRoot;
-use crate::shaders::{animation, emissive, instance_page, world as world_kernel};
+use crate::shaders::{animation, emissive, instance_page, page_motion, world as world_kernel};
 use crate::skin::{SkinFrame, SkinKernels, SkinStats};
 use crate::subd::ModelCage;
 use crate::tessellate::{self, Patterns, SeenBy, TessKernels, TessellationStats};
@@ -983,6 +983,7 @@ impl Scenes {
                 !done
             });
             cpu.retired.retain(|(frame, _)| *frame > completed);
+            cpu.groups_removed.retain(|(frame, _)| *frame > completed);
             let sets = &mut cpu.page_sets;
             cpu.pages_removed.retain(|(frame, p)| {
                 let done = *frame <= completed;
@@ -1130,9 +1131,13 @@ impl Core {
                     continue;
                 };
                 // The sphere is the rest pose: only the GPU knows where a joint has a page now.
-                let hung = cpu.groups[group.0 as usize]
+                let moves = self.mounts.pages[page.0 as usize]
                     .as_ref()
-                    .is_some_and(|g| g.frame.is_some());
+                    .is_some_and(|p| !p.info.motion_times.is_empty());
+                let hung = moves
+                    || cpu.groups[group.0 as usize]
+                        .as_ref()
+                        .is_some_and(|g| g.frame.is_some());
                 let distance = cpu
                     .focus
                     .filter(|_| !hung)
@@ -1593,11 +1598,54 @@ impl<'a> Frame<'a> {
                 });
             }
         }
-        if !expansions.is_empty() {
+        let mut motions = Vec::new();
+        for &id in &self.listed {
+            let scene = core.scene(id)?;
+            let cpu = scene.cpu.lock().unwrap();
+            for m in &cpu.page_motions {
+                let records = cpu.groups[m.records.0 as usize]
+                    .as_ref()
+                    .and_then(|g| g.page.as_ref())
+                    .map_or(0, |g| g.records);
+                let (interval, dt) = orr_pack::instance::motion_interval(&m.times, m.time);
+                let n = u64::from(m.count);
+                let row_size = size_of::<orr_pack::instance::MotionRow>() as u64;
+                let table = n * size_of::<orr_pack::instance::InstanceRecord>() as u64
+                    + u64::from(m.linear_rows) * size_of::<orr_pack::instance::LinearRows>() as u64;
+                let rows = match records {
+                    0 => GpuPtr::NULL,
+                    // SAFETY: the records stay resident through this frame, as they do for the
+                    // expansions above.
+                    r => unsafe {
+                        GpuPtr::from_address(GpuAddress(r + table + interval as u64 * n * row_size))
+                    },
+                };
+                motions.push(page_motion::PageMotionRoot {
+                    scene: scene.tables.root.gpu(),
+                    rows,
+                    left0: m.left[0],
+                    left1: m.left[1],
+                    left2: m.left[2],
+                    right0: m.right[0],
+                    right1: m.right[1],
+                    right2: m.right[2],
+                    group: m.group.0,
+                    count: m.count,
+                    dt,
+                    _pad: 0,
+                });
+            }
+        }
+        if !expansions.is_empty() || !motions.is_empty() {
             list.begin_pass("instance pages", false);
             for r in &expansions {
                 let ptr = window.put_root(device, r)?;
                 let p = self.pipelines.get(own.expand_page);
+                list.dispatch(p, ptr, [r.count.div_ceil(64), 1, 1]);
+            }
+            for r in &motions {
+                let ptr = window.put_root(device, r)?;
+                let p = self.pipelines.get(own.page_motion);
                 list.dispatch(p, ptr, [r.count.div_ceil(64), 1, 1]);
             }
             list.end_pass();

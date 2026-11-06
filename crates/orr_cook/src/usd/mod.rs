@@ -38,6 +38,18 @@
 //!   so that such clips keep time. A `Skeleton` under
 //!   such a prim keeps its model, with the prims above it as joints, and each of its clips
 //!   holds them too, beside an `xform` clip without a `SkelAnimation`.
+//! - An instancer whose own attributes move its instances cooks to animated pages: per interval
+//!   between the samples of `positions`, orientations, `scales`, `protoIndices`, `ids` and
+//!   `invisibleIds`, a row per instance that carries it to the next ([`InstanceState`]). A copy
+//!   is a slot of one prototype and index, as USD interpolates by index, and has no row where a
+//!   sample has no such instance, so `ids` and counts step at the lower sample, unlike what
+//!   interpolates between them. A rate that survives alignment holds all three at their lower
+//!   samples; without one, values interpolate unless samples differ in length. Before the first
+//!   sample and after the last, rates extrapolate and all else clamps. `motion:velocityScale`
+//!   is deprecated and not read. Every copy shares its prototype's model, and a kernel poses
+//!   them each frame by [`orr_pack::instance::motion_transform`]; the page's clock runs on the
+//!   timeline of the stage's clips. An instancer under one that moves this way stays where the
+//!   time read puts it, with a warning.
 //! - What a sampled xform moves above an instancer takes its copies along: the rig of those prims
 //!   holds the instancer, and its records stand in the bind space of the rig's nearest joint, on
 //!   pages of their own that name the joint (`InstancePageHeader::frame_skeleton`), so one
@@ -88,9 +100,11 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use openusd::{sdf, usd};
 use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4};
+use orr_pack::instance::MotionRow;
 use orr_pack::material::Material;
 use orr_pack::skeleton::{NO_PARENT, SkeletonInfo, Trs};
 use serde::Deserialize;
@@ -100,6 +114,7 @@ use crate::import::{
     NodeSelect, Placed, PlacedModel, Scene, SceneMaterial, SceneModel, SceneSkeleton, collapses,
     placements,
 };
+use crate::instances::InstanceMotion;
 use crate::mesh::{MeshData, MeshSettings, MeshSource, PartData, Pivots, SectionData, Skin};
 use crate::patch::{self, MaterialPatch, MeshPatch};
 use crate::shading;
@@ -367,6 +382,82 @@ struct Around {
     upper: f64,
 }
 
+/// An instance from a time until the next sample: [`MotionRow`] in double precision, in the
+/// instancer's space, with rates in seconds.
+#[derive(Copy, Clone, PartialEq)]
+struct InstanceState {
+    /// Its index in the instancer's arrays.
+    index: usize,
+    /// Index into the instancer's prototypes.
+    proto: usize,
+    position: DVec3,
+    velocity: DVec3,
+    acceleration: DVec3,
+    rotation: DQuat,
+    /// Degrees a second, its direction the axis.
+    spin: DVec3,
+    scale: DVec3,
+    growth: DVec3,
+}
+
+impl InstanceState {
+    /// Where it stands at the time it was read.
+    fn transform(&self) -> DMat4 {
+        DMat4::from_scale_rotation_translation(self.scale, self.rotation, self.position)
+    }
+
+    fn is_finite(&self) -> bool {
+        let vectors = [
+            self.position,
+            self.velocity,
+            self.acceleration,
+            self.spin,
+            self.scale,
+            self.growth,
+        ];
+        self.rotation.as_quat().is_finite() && vectors.iter().all(|v| v.as_vec3().is_finite())
+    }
+
+    fn holds_still(&self) -> bool {
+        [self.velocity, self.acceleration, self.spin, self.growth]
+            .iter()
+            .all(|&v| v == DVec3::ZERO)
+    }
+
+    /// Its row, the position from `anchor`.
+    fn row(&self, anchor: DVec3) -> MotionRow {
+        let three = |v: DVec3| v.as_vec3().to_array();
+        MotionRow {
+            position: three(self.position - anchor),
+            velocity: three(self.velocity),
+            acceleration: three(self.acceleration),
+            rotation: self.rotation.normalize().as_quat().to_array(),
+            spin: three(self.spin),
+            scale: three(self.scale),
+            growth: three(self.growth),
+        }
+    }
+}
+
+/// An attribute's values from a time on: the lower sample, and to interpolate, the upper one with
+/// how far the time stands between them and the seconds they span.
+struct Sampled {
+    lower: Vec<f64>,
+    upper: Option<(Vec<f64>, f64, f64)>,
+}
+
+/// The instances of an instancer that move by its own attributes.
+struct Motion {
+    /// Time codes each interval starts at.
+    times: Vec<f64>,
+    /// Prototype and index of each instance, whatever its id: a copy of one prototype.
+    slots: Vec<(usize, usize)>,
+    /// Per interval a row per slot, its position from the slot's `rest`.
+    rows: Vec<MotionRow>,
+    /// Per slot, how it stands at the time the stage is read, else at its first interval.
+    rest: Vec<InstanceState>,
+}
+
 /// Where [`Importer::place`] puts an instancer's copies.
 struct Placer<'a> {
     models: &'a mut Vec<Building>,
@@ -381,7 +472,7 @@ struct Placer<'a> {
 type RigJoint = (usize, u16);
 
 /// Placements of a model, and the joint they hang from.
-type FramedCopies = (Option<RigJoint>, Vec<Placed>);
+type FramedCopies = (Option<RigJoint>, Vec<Placed>, Option<Arc<InstanceMotion>>);
 
 /// One prototype of the stage.
 #[derive(Clone)]
@@ -412,6 +503,8 @@ struct Instancing {
     copies: BTreeMap<(usize, Option<RigJoint>), Vec<DMat4>>,
     /// What placing them warned of.
     warnings: Vec<String>,
+    /// Animated copies per model.
+    animated: Vec<(usize, FramedCopies)>,
     /// Meshes the prototypes draw, with their models.
     meshes: Vec<(usize, usize)>,
     /// How the skinned ones among them bind a skeleton.
@@ -446,6 +539,8 @@ struct Importer<'s> {
     root: DMat4,
     nodes: Vec<Node>,
     by_path: HashMap<String, usize>,
+    /// By instancer node, those whose instances move.
+    motions: HashMap<usize, Motion>,
     images: Vec<ImageFile>,
     image_of: HashMap<String, usize>,
     materials: Vec<SceneMaterial>,
@@ -505,6 +600,7 @@ impl<'s> Importer<'s> {
             root: DMat4::IDENTITY,
             nodes: Vec::new(),
             by_path: HashMap::new(),
+            motions: HashMap::new(),
             images: Vec::new(),
             image_of: HashMap::new(),
             materials: Vec::new(),
@@ -635,6 +731,7 @@ impl<'s> Importer<'s> {
 
     fn run(&mut self) -> Result<Scene, String> {
         self.traverse()?;
+        self.find_motions()?;
         let n = self.nodes.len();
         let mut models: Vec<Building> = Vec::new();
         let mut owner: Vec<Option<usize>> = vec![None; n];
@@ -789,10 +886,10 @@ impl<'s> Importer<'s> {
             let name = models[m].name.clone().unwrap_or_default();
             let (direct, baked) =
                 placements(&transforms, baking.contains(&m)).map_err(|e| format!("{name}: {e}"))?;
-            placed.entry(m).or_default().push((frame, direct));
+            placed.entry(m).or_default().push((frame, direct, None));
             for (linear, copies) in baked {
                 let k = baked_of.entry(m).or_default();
-                placed.insert(models.len(), vec![(frame, copies)]);
+                placed.insert(models.len(), vec![(frame, copies, None)]);
                 holders[m].push((models.len(), linear));
                 let (prototype, skel_root) = (models[m].prototype, models[m].root);
                 let first_copy = models[m].first_copy;
@@ -803,6 +900,9 @@ impl<'s> Importer<'s> {
                 baked.first_copy = first_copy;
                 *k += 1;
             }
+        }
+        for (m, list) in instancing.animated {
+            placed.entry(m).or_default().push(list);
         }
         // Models that bake them hold all of a prototype's copies.
         for (&m, lists) in &placed {
@@ -1116,14 +1216,15 @@ impl<'s> Importer<'s> {
                 return Err(format!("two models are named {n:?}"));
             }
             if let (Some(n), Some(copies)) = (&b.name, copies) {
-                for (frame, placed) in copies.into_iter().filter(|l| !l.1.is_empty()) {
+                for (frame, placed, motion) in copies.into_iter().filter(|l| !l.1.is_empty()) {
                     instance_out.push(PlacedModel {
                         model: n.clone(),
                         placed,
+                        alone: frame.is_some() || b.skeleton.is_some() || motion.is_some(),
+                        motion,
                         frame: frame.map(|(m, joint)| {
                             (rig_skeleton[m].expect("a rig has a skeleton"), joint)
                         }),
-                        alone: frame.is_some() || b.skeleton.is_some(),
                     });
                 }
             }
@@ -1487,9 +1588,15 @@ impl<'s> Importer<'s> {
         let per_second = self.stage.time_codes_per_second();
         let seconds = |t: f64| f64::from((t / per_second) as f32);
         let held = self.nodes.iter().filter(|d| !d.times.is_empty());
-        let (first, last) = held.fold((f64::MAX, f64::MIN), |(a, b), d| {
-            (a.min(d.times[0]), b.max(d.times[d.times.len() - 1]))
-        });
+        let ends = held.map(|d| (d.times[0], d.times[d.times.len() - 1]));
+        // An instancer's first interval runs back from its first sample.
+        let moved = self
+            .motions
+            .values()
+            .map(|m| (m.times[1], m.times[m.times.len() - 1]));
+        let (first, last) = ends
+            .chain(moved)
+            .fold((f64::MAX, f64::MIN), |(a, b), e| (a.min(e.0), b.max(e.1)));
         (seconds(first), seconds(last) - seconds(first))
     }
 
@@ -1815,18 +1922,35 @@ impl<'s> Importer<'s> {
                         None => None,
                     });
                 }
-                let placed = self.placements(ins, protos.len(), &mut instancing.warnings)?;
+                // Those that move warned at every sample.
+                let mut unheard = Vec::new();
+                let warnings = match self.motions.contains_key(&ins) {
+                    true => &mut unheard,
+                    false => &mut instancing.warnings,
+                };
+                let placed = self.placements(ins, protos.len(), warnings)?;
                 let i = Rc::new(Instancer { protos, placed });
                 instancing.instancers.insert(ins, Rc::clone(&i));
                 i
             }
         };
+        let motion = self.motions.get(&ins);
+        if let Some(motion) = motion {
+            let at = Placer {
+                models: &mut *models,
+                instancing: &mut *instancing,
+                above: &mut *above,
+                frame,
+            };
+            self.place_moving(ins, motion, &instancer, to_scene, at)?;
+        }
         for &(proto, local) in &instancer.placed {
             let Some((root, p)) = &instancer.protos[proto] else {
                 continue;
             };
             let transform = to_scene * local;
-            for &m in std::iter::once(&p.model).chain(&p.also) {
+            let copied = std::iter::once(&p.model).chain(&p.also);
+            for &m in copied.filter(|_| motion.is_none()) {
                 let key = (m, frame);
                 instancing.copies.entry(key).or_default().push(transform);
                 models[m].first_copy.get_or_insert((ins, transform));
@@ -1846,6 +1970,84 @@ impl<'s> Importer<'s> {
         Ok(())
     }
 
+    /// Records the moving copies of instancer `ins`, a set per prototype. What an instancer in
+    /// a prototype places stays out of them: a page poses a copy, not the pages it would carry.
+    fn place_moving(
+        &self,
+        ins: usize,
+        motion: &Motion,
+        instancer: &Instancer,
+        to_scene: DMat4,
+        at: Placer<'_>,
+    ) -> Result<(), String> {
+        let Placer {
+            models,
+            instancing,
+            frame,
+            ..
+        } = at;
+        let right = self.root.inverse();
+        let start = self.xform_span().0;
+        let per_second = self.stage.time_codes_per_second();
+        let seconds = |t: &f64| (t / per_second - start) as f32;
+        let times: Vec<f32> = motion.times.iter().map(seconds).collect();
+        for (proto, entry) in instancer.protos.iter().enumerate() {
+            let Some((_, p)) = entry else { continue };
+            let held = |&k: &usize| motion.slots[k].0 == proto;
+            let slots: Vec<usize> = (0..motion.slots.len()).filter(held).collect();
+            if slots.is_empty() {
+                continue;
+            }
+            if !p.nested.is_empty() {
+                let r = self.reader(&self.nodes[ins].prim);
+                let path = r.path();
+                instancing.warnings.push(format!(
+                    "{path}: an instancer in a prototype of this one stays where the time read \
+                     puts it, as its instances move"
+                ));
+            }
+            let rest: Vec<DMat4> = slots
+                .iter()
+                .map(|&k| to_scene * motion.rest[k].transform() * right)
+                .collect();
+            let mut rows = Vec::with_capacity(times.len() * slots.len());
+            for k in 0..times.len() {
+                let at = k * motion.slots.len();
+                rows.extend(slots.iter().map(|&s| motion.rows[at + s]));
+            }
+            let table = Arc::new(InstanceMotion {
+                times: times.clone(),
+                rows,
+                anchors: slots
+                    .iter()
+                    .map(|&k| motion.rest[k].position.to_array())
+                    .collect(),
+                left: to_scene,
+                right,
+                start: seconds(&f64::from(self.time)),
+            });
+            // The kernel replaces a record, which need only stand somewhere it can invert.
+            let record = |m: &DMat4| {
+                let l = DMat3::from_mat4(*m);
+                Placed {
+                    position: m.w_axis.truncate(),
+                    linear: if collapses(l) {
+                        orr_math::Mat3::IDENTITY
+                    } else {
+                        l.as_mat3()
+                    },
+                }
+            };
+            let placed: Vec<Placed> = rest.iter().map(record).collect();
+            for &m in std::iter::once(&p.model).chain(&p.also) {
+                models[m].first_copy.get_or_insert((ins, rest[0]));
+                let copies = (frame, placed.clone(), Some(Arc::clone(&table)));
+                instancing.animated.push((m, copies));
+            }
+        }
+        Ok(())
+    }
+
     /// Per instance of a `PointInstancer`: its prototype index and the instancer's space from
     /// the prototype's model.
     fn placements(
@@ -1854,12 +2056,28 @@ impl<'s> Importer<'s> {
         protos: usize,
         warnings: &mut Vec<String>,
     ) -> Result<Vec<(usize, DMat4)>, String> {
+        let to_model = self.root.inverse();
+        let states = self.instance_states(ins, protos, f64::from(self.time), warnings)?;
+        let placed = states.iter().map(|s| (s.proto, s.transform() * to_model));
+        Ok(placed.collect())
+    }
+
+    /// The instances of `ins` that `time` holds, from there until the next sample of what they
+    /// read. `pointInstancer.h` and `UsdGeom_VelocityInterpolation` in `overview.dox` decide it:
+    /// `placements` reads them as they stand, and an animated page keeps them per interval.
+    fn instance_states(
+        &self,
+        ins: usize,
+        protos: usize,
+        time: f64,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<InstanceState>, String> {
         let node = &self.nodes[ins];
         let r = self.reader(&node.prim);
+        let r = r.at(time);
         let path = r.path();
         let index = r.ints("protoIndices")?.unwrap_or_default();
         let count = index.len();
-        let time = f64::from(self.time);
         let around = |name: &str| self.samples_around(&node.prim, name, time);
         // `name` at the sample of `base`, if it stands around the time as `base` does and has one
         // value per instance.
@@ -1892,17 +2110,30 @@ impl<'s> Importer<'s> {
         // Without a rate to extrapolate by, values interpolate, but for samples of different
         // lengths, which hold the lower; with one, all hold.
         let rated = velocities.is_some() || spins.is_some();
-        let values = |name: &str, base: Option<Around>, width: usize| {
-            let held = base.filter(|_| rated).map_or(time, |b| b.sample);
-            match (r.at(held).numbers(name)?, base) {
-                (Some(v), Some(b)) if v.len() != width * count => r.at(b.sample).numbers(name),
-                (v, _) => Ok(v),
-            }
-        };
-        let positions = values("positions", moved, 3)?.unwrap_or_default();
-        let orientations = values(orientation, turned, 4)?.filter(|v| !v.is_empty());
-        let scales = values("scales", around("scales")?, 3)?.filter(|v| !v.is_empty());
         let per_second = self.stage.time_codes_per_second();
+        let read = |name: &str, base: Option<Around>, width: usize| {
+            let Some(b) = base else {
+                let lower = r.numbers(name)?;
+                return Ok::<_, String>(lower.map(|lower| Sampled { lower, upper: None }));
+            };
+            let Some(lower) = r.at(b.sample).numbers(name)? else {
+                return Ok(None);
+            };
+            let between = !rated && b.lower <= time && time < b.upper;
+            let upper = match between && lower.len() == width * count {
+                true => r
+                    .at(b.upper)
+                    .numbers(name)?
+                    .filter(|u| u.len() == lower.len()),
+                false => None,
+            };
+            let span = b.upper - b.lower;
+            let upper = upper.map(|u| (u, (time - b.lower) / span, span / per_second));
+            Ok(Some(Sampled { lower, upper }))
+        };
+        let positions = read("positions", moved, 3)?;
+        let orientations = read(orientation, turned, 4)?.filter(|v| !v.lower.is_empty());
+        let scales = read("scales", around("scales")?, 3)?.filter(|v| !v.lower.is_empty());
         let since = |b: Option<Around>| b.map_or(0.0, |b| (time - b.sample) / per_second);
         let (moved_for, turned_for) = (since(moved), since(turned));
         let ids = r.ints("ids")?.filter(|v| !v.is_empty());
@@ -1925,9 +2156,15 @@ impl<'s> Importer<'s> {
         }
         // An attribute of another length than `protoIndices` leaves nothing to place at this time.
         let lengths = [
-            ("positions", Some(positions.len() / 3)),
-            (orientation, orientations.as_ref().map(|v| v.len() / 4)),
-            ("scales", scales.as_ref().map(|v| v.len() / 3)),
+            (
+                "positions",
+                Some(positions.as_ref().map_or(0, |v| v.lower.len() / 3)),
+            ),
+            (
+                orientation,
+                orientations.as_ref().map(|v| v.lower.len() / 4),
+            ),
+            ("scales", scales.as_ref().map(|v| v.lower.len() / 3)),
             ("ids", ids.as_ref().map(Vec::len)),
         ];
         if let Some((name, n)) = lengths
@@ -1939,7 +2176,6 @@ impl<'s> Importer<'s> {
             ));
             return Ok(Vec::new());
         }
-        let to_model = self.root.inverse();
         let mut out = Vec::with_capacity(count);
         for (i, &p) in index.iter().enumerate() {
             let id = ids.as_ref().map_or(i as i64, |ids| ids[i]);
@@ -1954,23 +2190,178 @@ impl<'s> Importer<'s> {
                 v.as_ref()
                     .map_or(DVec3::ZERO, |v| DVec3::from_slice(&v[3 * i..]))
             };
-            let velocity = vector(&velocities) + moved_for * vector(&accelerations) * 0.5;
-            let t = DVec3::from_slice(&positions[3 * i..]) + moved_for * velocity;
-            let q = orientations.as_ref().map_or(DQuat::IDENTITY, |o| {
-                let spin = vector(&spins);
-                let turn = (turned_for * spin.length()).to_radians();
-                let by = DQuat::from_axis_angle(spin.normalize_or(DVec3::X), turn);
-                by * read::quat(&o[4 * i..]).normalize()
-            });
-            let s = scales
-                .as_ref()
-                .map_or(DVec3::ONE, |s| DVec3::from_slice(&s[3 * i..]));
-            out.push((
+            // Between samples a line is a velocity, and a slerp a spin.
+            let three = |v: &[f64]| DVec3::from_slice(&v[3 * i..]);
+            let (mut position, mut velocity, mut acceleration) = match &positions {
+                Some(Sampled {
+                    lower,
+                    upper: Some((upper, u, span)),
+                }) => {
+                    let (a, b) = (three(lower), three(upper));
+                    (a + (b - a) * *u, (b - a) / *span, DVec3::ZERO)
+                }
+                Some(s) => (three(&s.lower), DVec3::ZERO, DVec3::ZERO),
+                None => (DVec3::ZERO, DVec3::ZERO, DVec3::ZERO),
+            };
+            if velocities.is_some() {
+                let (v, a) = (vector(&velocities), vector(&accelerations));
+                position += moved_for * (v + a * (moved_for * 0.5));
+                velocity = v + a * moved_for;
+                acceleration = a;
+            }
+            let (rotation, spin) = match &orientations {
+                Some(Sampled {
+                    lower,
+                    upper: Some((upper, u, span)),
+                }) => {
+                    let a = read::quat(&lower[4 * i..]).normalize();
+                    let mut b = read::quat(&upper[4 * i..]).normalize();
+                    if a.dot(b) < 0.0 {
+                        b = -b;
+                    }
+                    let (axis, angle) = (b * a.inverse()).to_axis_angle();
+                    let at = DQuat::from_axis_angle(axis, angle * *u) * a;
+                    (at, axis * angle.to_degrees() / *span)
+                }
+                Some(s) => {
+                    let spin = vector(&spins);
+                    let turn = (turned_for * spin.length()).to_radians();
+                    let by = DQuat::from_axis_angle(spin.normalize_or(DVec3::X), turn);
+                    (by * read::quat(&s.lower[4 * i..]).normalize(), spin)
+                }
+                None => (DQuat::IDENTITY, DVec3::ZERO),
+            };
+            let (scale, growth) = match &scales {
+                Some(Sampled {
+                    lower,
+                    upper: Some((upper, u, span)),
+                }) => {
+                    let (a, b) = (three(lower), three(upper));
+                    (a + (b - a) * *u, (b - a) / *span)
+                }
+                Some(s) => (three(&s.lower), DVec3::ZERO),
+                None => (DVec3::ONE, DVec3::ZERO),
+            };
+            out.push(InstanceState {
+                index: i,
                 proto,
-                DMat4::from_scale_rotation_translation(s, q, t) * to_model,
-            ));
+                position,
+                velocity,
+                acceleration,
+                rotation,
+                spin,
+                scale,
+                growth,
+            });
         }
         Ok(out)
+    }
+
+    /// Finds the instancers whose instances move by their own attributes.
+    fn find_motions(&mut self) -> Result<(), String> {
+        let mut motions = HashMap::new();
+        for i in 0..self.nodes.len() {
+            if self.nodes[i].ty != "PointInstancer" {
+                continue;
+            }
+            // What holds still warns as it is placed.
+            let mut warnings = Vec::new();
+            if let Some(m) = self.instance_motion(i, &mut warnings)? {
+                motions.insert(i, m);
+                warnings.dedup();
+                self.warnings.append(&mut warnings);
+            }
+        }
+        self.motions = motions;
+        Ok(())
+    }
+
+    /// The motion of instancer `ins`, `None` where nothing moves. Every interval runs from a
+    /// sample of what steps or interpolates to the next, all else is constant in it: rates apply
+    /// only between samples of their own at both its ends, or none at all.
+    fn instance_motion(
+        &self,
+        ins: usize,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<Motion>, String> {
+        let node = &self.nodes[ins];
+        let r = self.reader(&node.prim);
+        let path = r.path();
+        let mut samples = Vec::new();
+        for name in [
+            "positions",
+            self.orientation_attribute(&r)?,
+            "scales",
+            "protoIndices",
+            "ids",
+            "invisibleIds",
+        ] {
+            let held = node.prim.attribute(name).time_sample_times();
+            samples.extend(held.map_err(|e| format!("{path} {name}: {e}"))?);
+        }
+        samples.sort_by(f64::total_cmp);
+        samples.dedup();
+        let Some(&first) = samples.first() else {
+            return Ok(None);
+        };
+        let protos = r.targets("prototypes")?.len();
+        // The first interval runs back from the first sample, which only a rate can move.
+        let times: Vec<f64> = std::iter::once(first - 1.0).chain(samples).collect();
+        let mut keys = Vec::with_capacity(times.len());
+        for &t in &times {
+            let states = self.instance_states(ins, protos, t, warnings)?;
+            if let Some(s) = states.iter().find(|s| !s.is_finite()) {
+                return Err(format!("{path}: instance {} at {t} is not finite", s.index));
+            }
+            keys.push(states);
+        }
+        let same = |a: &InstanceState, b: &InstanceState| {
+            a.index == b.index
+                && a.proto == b.proto
+                && a.transform() == b.transform()
+                && a.holds_still()
+                && b.holds_still()
+        };
+        let still = keys
+            .iter()
+            .all(|k| k.len() == keys[0].len() && k.iter().zip(&keys[0]).all(|(a, b)| same(a, b)));
+        if still {
+            return Ok(None);
+        }
+        let mut slots: Vec<(usize, usize)> =
+            keys.iter().flatten().map(|s| (s.proto, s.index)).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let slot_of = |s: &InstanceState| {
+            slots
+                .binary_search(&(s.proto, s.index))
+                .expect("every state has a slot")
+        };
+        let mut rest: Vec<Option<InstanceState>> = vec![None; slots.len()];
+        for s in keys.iter().flatten() {
+            rest[slot_of(s)].get_or_insert(*s);
+        }
+        let now = self.instance_states(ins, protos, f64::from(self.time), &mut Vec::new())?;
+        for s in &now {
+            rest[slot_of(s)] = Some(*s);
+        }
+        let rest: Vec<InstanceState> = rest
+            .into_iter()
+            .map(|s| s.expect("every slot has a key"))
+            .collect();
+        let mut rows = vec![MotionRow::default(); times.len() * slots.len()];
+        for (k, states) in keys.iter().enumerate() {
+            for s in states {
+                let slot = slot_of(s);
+                rows[k * slots.len() + slot] = s.row(rest[slot].position);
+            }
+        }
+        Ok(Some(Motion {
+            times,
+            slots,
+            rows,
+            rest,
+        }))
     }
 
     /// Where attribute `name` of `prim` stands around `time`, `None` without samples: as
