@@ -4527,3 +4527,85 @@ fn alignment_on_a_sample_looks_at_the_interval_ahead() {
     let got = copies(&a, "u/P")[0].transform_vector3(Vec3::X);
     assert!(got.abs_diff_eq(Vec3::Y, 2e-2), "{got}");
 }
+
+/// `pointInstancer.cpp` warns and places nothing where an attribute's length is not the number of
+/// instances, and `samplingUtils.cpp` drops a rate of the wrong length with a warning: neither
+/// refuses the stage.
+#[test]
+fn lengths_that_disagree_place_nothing_and_warn() {
+    let body = |attributes: &str| instancer(&format!("int[] protoIndices = [0, 0]\n{attributes}"));
+    for (name, attributes) in [
+        ("positions", "point3f[] positions = [(0, 0, 0)]"),
+        (
+            "orientations",
+            "point3f[] positions = [(0, 0, 0), (1, 0, 0)]
+    quath[] orientations = [(1, 0, 0, 0)]",
+        ),
+        (
+            "scales",
+            "point3f[] positions = [(0, 0, 0), (1, 0, 0)]
+    float3[] scales = [(1, 1, 1)]",
+        ),
+        (
+            "ids",
+            "point3f[] positions = [(0, 0, 0), (1, 0, 0)]
+    int64[] ids = [7]",
+        ),
+    ] {
+        let d = dir(&format!("length-{name}"));
+        let stage = format!(
+            "{}\ndef Mesh \"Ground\"\n{{\n    {TRIANGLE}\n}}",
+            body(attributes)
+        );
+        let (a, warnings) = cook_with_warnings(&d, &stage, Subdivision::Hull);
+        assert!(copies(&a, "u/P").is_empty(), "{name}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(name) && w.contains("1 for 2")),
+            "{name}: {warnings:?}"
+        );
+    }
+
+    // A rate of the wrong length goes, and what it would move stays.
+    let d = dir("length-velocities");
+    let (a, warnings) = cook_with_warnings(
+        &d,
+        &body(
+            "point3f[] positions.timeSamples = { 0: [(0, 0, 0), (1, 0, 0)], 10: [(0, 0, 0), (1, 0, 0)] }
+    vector3f[] velocities.timeSamples = { 0: [(1, 0, 0)], 10: [(1, 0, 0)] }",
+        ),
+        Subdivision::Hull,
+    );
+    assert_eq!(copies(&a, "u/P").len(), 2);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("velocities") && w.contains("dropped")),
+        "{warnings:?}"
+    );
+}
+
+/// `overview.dox`: without velocities, "if the timeSamples bracketing a requested sample have the
+/// same number of elements, apply linear interpolation between the two samples; otherwise, use the
+/// value of the sample with the lower/earlier ordinate".
+#[test]
+fn samples_of_different_lengths_hold_the_lower() {
+    let at = UsdSettings {
+        time: Some(5.0),
+        ..UsdSettings::default()
+    };
+    let a = cook_at(
+        &dir("length-held"),
+        &instancer(
+            "int[] protoIndices.timeSamples = { 0: [0], 10: [0, 0] }
+    point3f[] positions.timeSamples = { 0: [(1, 0, 0)], 10: [(3, 0, 0), (9, 0, 0)] }",
+        ),
+        at,
+    )
+    .unwrap();
+    let placed = copies(&a, "u/P");
+    assert_eq!(placed.len(), 1);
+    let x = placed[0].transform_point3(Vec3::ZERO).x;
+    assert!((x - 1.0).abs() < 1e-3, "{x}");
+}

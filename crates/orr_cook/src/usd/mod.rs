@@ -410,8 +410,8 @@ struct Instancing {
     instancers: HashMap<usize, Rc<Instancer>>,
     /// Placements per model and the joint they hang from.
     copies: BTreeMap<(usize, Option<RigJoint>), Vec<DMat4>>,
-    /// Instancers under what moves inside a prototype, which stay where they are read.
-    frozen: Vec<String>,
+    /// What placing them warned of.
+    warnings: Vec<String>,
     /// Meshes the prototypes draw, with their models.
     meshes: Vec<(usize, usize)>,
     /// How the skinned ones among them bind a skeleton.
@@ -757,7 +757,7 @@ impl<'s> Importer<'s> {
             };
             self.place(i, to_scene, place)?;
         }
-        self.warnings.append(&mut instancing.frozen);
+        self.warnings.append(&mut instancing.warnings);
         for m in holders.len()..models.len() {
             holders.push(vec![(m, DMat4::IDENTITY)]);
         }
@@ -1717,7 +1717,7 @@ impl<'s> Importer<'s> {
                     };
                     let mut above = std::iter::successors(Some(k), up);
                     if above.any(|n| !self.nodes[n].times.is_empty()) {
-                        instancing.frozen.push(format!(
+                        instancing.warnings.push(format!(
                             "{}: a prim of its prototype moves this instancer, whose copies stay \
                              where the time read puts them",
                             at.prim.path().as_str()
@@ -1815,7 +1815,7 @@ impl<'s> Importer<'s> {
                         None => None,
                     });
                 }
-                let placed = self.placements(ins, protos.len())?;
+                let placed = self.placements(ins, protos.len(), &mut instancing.warnings)?;
                 let i = Rc::new(Instancer { protos, placed });
                 instancing.instancers.insert(ins, Rc::clone(&i));
                 i
@@ -1848,7 +1848,12 @@ impl<'s> Importer<'s> {
 
     /// Per instance of a `PointInstancer`: its prototype index and the instancer's space from
     /// the prototype's model.
-    fn placements(&self, ins: usize, protos: usize) -> Result<Vec<(usize, DMat4)>, String> {
+    fn placements(
+        &self,
+        ins: usize,
+        protos: usize,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<(usize, DMat4)>, String> {
         let node = &self.nodes[ins];
         let r = self.reader(&node.prim);
         let path = r.path();
@@ -1858,12 +1863,20 @@ impl<'s> Importer<'s> {
         let around = |name: &str| self.samples_around(&node.prim, name, time);
         // `name` at the sample of `base`, if it stands around the time as `base` does and has one
         // value per instance.
-        let lined_up = |name: &str, base: Option<Around>, width: usize| match base {
-            Some(b) if around(name)? == base => Ok::<_, String>(
-                r.at(b.sample)
-                    .numbers(name)?
-                    .filter(|v| v.len() == width * count),
-            ),
+        let mut dropped = Vec::new();
+        let mut lined_up = |name: &str, base: Option<Around>, width: usize| match base {
+            Some(b) if around(name)? == base => {
+                let held = r.at(b.sample).numbers(name)?;
+                let (fits, wrong): (Option<Vec<f64>>, _) = match held {
+                    Some(v) if v.len() == width * count => (Some(v), None),
+                    Some(v) => (None, Some(v.len() / width)),
+                    None => (None, None),
+                };
+                dropped.extend(wrong.map(|n| {
+                    format!("{path} {name} at {time}: {n} for {count} protoIndices; dropped")
+                }));
+                Ok::<_, String>(fits)
+            }
             _ => Ok(None),
         };
         let orientation = self.orientation_attribute(&r)?;
@@ -1875,25 +1888,24 @@ impl<'s> Importer<'s> {
             None => None,
         };
         let spins = lined_up("angularVelocities", turned, 3)?;
-        // Without a rate to extrapolate by, values interpolate; with one, both hold.
-        let held = |b: Option<Around>| match b {
-            Some(b) if velocities.is_some() || spins.is_some() => b.sample,
-            _ => time,
+        warnings.append(&mut dropped);
+        // Without a rate to extrapolate by, values interpolate, but for samples of different
+        // lengths, which hold the lower; with one, all hold.
+        let rated = velocities.is_some() || spins.is_some();
+        let values = |name: &str, base: Option<Around>, width: usize| {
+            let held = base.filter(|_| rated).map_or(time, |b| b.sample);
+            match (r.at(held).numbers(name)?, base) {
+                (Some(v), Some(b)) if v.len() != width * count => r.at(b.sample).numbers(name),
+                (v, _) => Ok(v),
+            }
         };
-        let positions = r.at(held(moved)).numbers("positions")?.unwrap_or_default();
-        let orientations = r
-            .at(held(turned))
-            .numbers(orientation)?
-            .filter(|v| !v.is_empty());
-        let scaled = around("scales")?;
-        let scales = r
-            .at(held(scaled))
-            .numbers("scales")?
-            .filter(|v| !v.is_empty());
+        let positions = values("positions", moved, 3)?.unwrap_or_default();
+        let orientations = values(orientation, turned, 4)?.filter(|v| !v.is_empty());
+        let scales = values("scales", around("scales")?, 3)?.filter(|v| !v.is_empty());
         let per_second = self.stage.time_codes_per_second();
         let since = |b: Option<Around>| b.map_or(0.0, |b| (time - b.sample) / per_second);
         let (moved_for, turned_for) = (since(moved), since(turned));
-        let ids = r.ints("ids")?;
+        let ids = r.ints("ids")?.filter(|v| !v.is_empty());
         let mut masked: std::collections::HashSet<i64> = r
             .ints("invisibleIds")?
             .unwrap_or_default()
@@ -1911,28 +1923,26 @@ impl<'s> Importer<'s> {
             ),
             None => {}
         }
-        if positions.len() != 3 * count {
-            return Err(format!(
-                "{path}: {} positions for {count} protoIndices",
-                positions.len() / 3
+        // An attribute of another length than `protoIndices` leaves nothing to place at this time.
+        let lengths = [
+            ("positions", Some(positions.len() / 3)),
+            (orientation, orientations.as_ref().map(|v| v.len() / 4)),
+            ("scales", scales.as_ref().map(|v| v.len() / 3)),
+            ("ids", ids.as_ref().map(Vec::len)),
+        ];
+        if let Some((name, n)) = lengths
+            .iter()
+            .find_map(|&(name, n)| Some((name, n?)).filter(|l| l.1 != count))
+        {
+            warnings.push(format!(
+                "{path} {name} at {time}: {n} for {count} protoIndices; no instances there"
             ));
+            return Ok(Vec::new());
         }
-        let check = |v: &Option<Vec<f64>>, k: usize, what: &str| match v {
-            Some(v) if v.len() != k * count => Err(format!(
-                "{path}: {} {what} for {count} instances",
-                v.len() / k
-            )),
-            _ => Ok(()),
-        };
-        check(&orientations, 4, "orientations")?;
-        check(&scales, 3, "scales")?;
         let to_model = self.root.inverse();
         let mut out = Vec::with_capacity(count);
         for (i, &p) in index.iter().enumerate() {
-            let id = ids
-                .as_ref()
-                .and_then(|ids| ids.get(i).copied())
-                .unwrap_or(i as i64);
+            let id = ids.as_ref().map_or(i as i64, |ids| ids[i]);
             if masked.contains(&id) {
                 continue;
             }
