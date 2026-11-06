@@ -308,6 +308,8 @@ public struct StandardSurface : ISurface
         p.transmission_weight = m.transmission_weight * material_texture(m, TEXTURE_TRANSMISSION, i.uv, one).x;
         bool thin = (m.flags & MATERIAL_THIN_WALLED) != 0;
         p.transmission_color = thin || m.transmission_depth == 0.0 ? material_more_color(m, TEXTURE_TRANSMISSION_COLOR, i.uv, m.transmission_color) : float3(1.0);
+        if ((m.flags & MATERIAL_BASE_TINT) != 0)
+            p.transmission_color *= p.base_color;
         p.subsurface_weight = m.subsurface_weight * material_scale(m, TEXTURE_SUBSURFACE_WEIGHT, i.uv);
         p.subsurface_color = material_color(m, TEXTURE_SUBSURFACE_COLOR, i.uv, m.subsurface_color);
         p.subsurface_anisotropy = m.subsurface_scatter_anisotropy;

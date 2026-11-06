@@ -33,6 +33,8 @@ public static const uint MATERIAL_FRESNEL_MIX = 1 << 19;
 public static const uint MATERIAL_METAL_FLAT = 1 << 20;
 // `specular_color` is F0 itself, not a factor on the IOR's.
 public static const uint MATERIAL_F0_STATED = 1 << 21;
+// The base color tints what passes through the surface.
+public static const uint MATERIAL_BASE_TINT = 1 << 23;
 // It binds a slot past TEXTURE_TRANSMISSION, which hits on other materials don't look at.
 public static const uint MATERIAL_MORE_TEXTURES = 1 << 22;
 

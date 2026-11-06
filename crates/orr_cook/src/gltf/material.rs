@@ -14,8 +14,8 @@
 //! | `KHR_materials_sheen` `sheenColorFactor`, `sheenRoughnessFactor`, `sheenColorTexture`, `sheenRoughnessTexture` (A) | `fuzz_weight` 1 when the factor is not black, `fuzz_color`, `fuzz_roughness` (approximate), their textures |
 //! | `KHR_materials_anisotropy` `anisotropyStrength`, `anisotropyRotation`, `anisotropyTexture` (RG direction, B strength) | `specular_anisotropy`, `specular_rotation` (radians, as glTF), the anisotropy and tangent textures |
 //! | `KHR_materials_iridescence` `iridescenceFactor`, `iridescenceIor`, `iridescenceThicknessMinimum` and `Maximum`, `iridescenceTexture` (R), `iridescenceThicknessTexture` (G) | `thin_film_weight`, `thin_film_ior`, `thin_film_thickness` (nm) and their textures: the thickness texture reads `mix(minimum, maximum, g)` over the larger of the two |
-//! | `KHR_materials_transmission` `transmissionFactor`, `transmissionTexture` (R) | `transmission_weight`, the transmission texture |
-//! | `KHR_materials_volume` `attenuationColor`, `attenuationDistance` | `transmission_color`, `transmission_depth`; an infinite distance is white at depth 0 |
+//! | `KHR_materials_transmission` `transmissionFactor`, `transmissionTexture` (R) | `transmission_weight`, the transmission texture; `Material::MODEL_GLTF` tints it with the base color |
+//! | `KHR_materials_volume` `attenuationColor`, `attenuationDistance` | `transmission_color`, `transmission_depth` above `thicknessFactor` 0; an infinite distance is white at depth 0 |
 //! | transmission without `KHR_materials_volume`, or with `thicknessFactor` 0 | `thin_walled` |
 //! | `KHR_materials_diffuse_transmission` `diffuseTransmissionFactor`, `diffuseTransmissionColorFactor`, `diffuseTransmissionTexture` (A), `diffuseTransmissionColorTexture` | `subsurface_weight`, `subsurface_color`, their textures; thin-walled (approximate: glTF's split of diffuse transmission and volume has no OpenPBR equivalent) |
 //! | `KHR_materials_dispersion` `dispersion` > 0 | `transmission_dispersion_scale` 1, `transmission_dispersion_abbe_number` 20 / dispersion |
@@ -127,14 +127,15 @@ pub(super) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
         out.transmission_weight = num(e, "transmissionFactor", 0.0);
     }
     let volume = ext("KHR_materials_volume");
-    if let Some(e) = volume {
+    let thin_volume = volume.is_none_or(|e| num(e, "thicknessFactor", 0.0) == 0.0);
+    // "If the value is 0 the material is thin-walled": nothing lies inside to attenuate.
+    if let Some(e) = volume.filter(|_| !thin_volume) {
         let distance = num(e, "attenuationDistance", f32::INFINITY);
         if distance.is_finite() && distance > 0.0 {
             out.transmission_color = rgb(e, "attenuationColor", [1.0; 3]);
             out.transmission_depth = distance;
         }
     }
-    let thin_volume = volume.is_none_or(|e| num(e, "thicknessFactor", 0.0) == 0.0);
     if out.transmission_weight > 0.0 && thin_volume {
         out.thin_walled = 1;
     }

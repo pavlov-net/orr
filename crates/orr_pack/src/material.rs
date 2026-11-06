@@ -140,11 +140,13 @@ impl Material {
     /// [`Self::specular_weight`] at grazing, with `F0` the IOR's times [`Self::specular_color`]
     /// (at most 1) times the weight, and what it leaves goes to the layer below. Neither field
     /// reaches a metal, whose edge is white, or the angle of refraction. The coat mixes over all of
-    /// that by its Fresnel term, and takes nothing from the base's IOR or roughness.
+    /// that by its Fresnel term, and takes nothing from the base's IOR or roughness. The base
+    /// color tints light through the surface, on top of any surface tint
+    /// [`Self::transmission_color`] states.
     pub const MODEL_GLTF: u8 = 1;
     /// As [`Self::MODEL_GLTF`] under UsdPreviewSurface's metalness workflow, except that a metal
-    /// reflects its base color at every angle and the coat shades on the base's normal, normal
-    /// map included.
+    /// reflects its base color at every angle, the coat shades on the base's normal, normal map
+    /// included, and the base color tints no transmission.
     pub const MODEL_PREVIEW: u8 = 2;
     /// As [`Self::MODEL_PREVIEW`] under its specular workflow: [`Self::specular_color`] is `F0`
     /// itself.

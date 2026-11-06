@@ -7839,5 +7839,12 @@ fn models_state_their_specular_and_tint() {
     );
     assert_eq!(out[0].flags & BSDF_FRESNEL_MIX, 0);
     assert_ne!(out[1].flags & BSDF_FRESNEL_MIX, 0);
+    near(out[0].transmission_color, rec2020([1.0; 3]), "no tint");
+    near(
+        out[1].transmission_color,
+        rec2020(specular.base_color),
+        "glTF's base color tints",
+    );
+    near(out[2].transmission_color, rec2020([1.0; 3]), "no tint");
     assert_clean();
 }

@@ -1088,6 +1088,26 @@ fn extension_textures_reach_their_slots() {
     assert!((last - share(210.0 / 255.0)).abs() < 0.02, "{last}");
 }
 
+/// KHR_materials_volume: thickness 0 "the material is thin-walled", so attenuation has no volume
+/// to act in; KHR_materials_transmission: `baseColor` tints.
+#[test]
+fn a_thin_volume_attenuates_nothing() {
+    let path = dir("thin-volume").join("thin.glb");
+    textured_quad(
+        &path,
+        &gradient(),
+        r#"{"extensions":{"KHR_materials_transmission":{"transmissionFactor":1.0},
+            "KHR_materials_volume":{"attenuationColor":[0.5,0.5,0.5],"attenuationDistance":1.0}}}"#,
+        "",
+    );
+    let m = material_of(&cooked(&path).0);
+    assert_eq!(m.thin_walled, 1);
+    assert_eq!(
+        (m.transmission_color, m.transmission_depth),
+        ([1.0; 3], 0.0)
+    );
+}
+
 /// KHR_materials_iridescence: "`iridescenceFactor` is multiplied with the red channel of
 /// `iridescenceTexture` to control the overall strength".
 #[test]
