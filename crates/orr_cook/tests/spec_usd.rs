@@ -404,6 +404,39 @@ fn a_prototype_gives_way_to_a_selected_model_of_its_name() {
     assert!(has(&a, "u/P/mesh") && has(&a, "u/I/Protos/P/mesh"));
 }
 
+/// `xformable.h`: `!resetXformStack!` makes a prim "not inherit the parent transformation", so a
+/// child of a selected model stands in the world whatever frames the model.
+#[test]
+fn a_reset_prim_stands_in_the_world_under_a_framed_model() {
+    let body = format!(
+        r#"def Xform "Frame"
+{{
+    double3 xformOp:translate = (10, 0, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+
+    def Mesh "Child"
+    {{
+        double3 xformOp:translate = (1, 0, 0)
+        uniform token[] xformOpOrder = ["!resetXformStack!", "xformOp:translate"]
+        {TRIANGLE}
+    }}
+}}"#
+    );
+    let settings = UsdSettings {
+        models: vec![NodeSelect {
+            node: "Frame".into(),
+        }],
+        ..Default::default()
+    };
+    let a = cook_at(&dir("reset-under-frame"), &body, settings).unwrap();
+    // In the frame's space, which stands at 10.
+    let lowest = corners(&a, "u/Frame/mesh")
+        .iter()
+        .map(|c| c.0.x)
+        .fold(f32::MAX, f32::min);
+    assert!((lowest + 9.0).abs() < 1e-3, "{lowest}");
+}
+
 /// PI, below: where a copy at the origin turns +x, by each row's orientation attributes.
 #[test]
 fn orientationsf_wins_unless_its_first_value_is_empty() {
