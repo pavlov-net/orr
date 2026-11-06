@@ -206,7 +206,8 @@ pub(crate) enum Primvar {
     Uv(u8),
     /// One value for the whole mesh.
     Constant(Vec<f32>),
-    /// Values that vary over the mesh, of this many channels.
+    /// Values that vary over the mesh, of this many channels, at most the stream's four. A
+    /// reader takes a wider primvar's first ones.
     Varying(u8),
     Missing,
 }

@@ -521,6 +521,11 @@ impl Primvar {
         self.values.get(i * self.width..(i + 1) * self.width)
     }
 
+    /// The numbers of each element.
+    pub(super) fn width(&self) -> usize {
+        self.width
+    }
+
     /// How many of the `domain` elements hold no value.
     pub(super) fn missing(&self, domain: usize) -> usize {
         (0..domain).filter(|&i| self.get(i).is_none()).count()
@@ -546,6 +551,23 @@ impl PrimReader<'_> {
         width: usize,
         fallback: Option<&str>,
     ) -> Result<Option<Primvar>, String> {
+        let Some((primvar, attr)) = self.elements(name, width, fallback)? else {
+            return Ok(None);
+        };
+        if !primvar.values.len().is_multiple_of(width) {
+            return Err(format!("{} {attr}: not {width}-wide", self.path()));
+        }
+        Ok(Some(primvar))
+    }
+
+    /// [`Self::primvar`] and the attribute that holds it, whatever its last element falls short
+    /// of.
+    fn elements(
+        &self,
+        name: &str,
+        width: usize,
+        fallback: Option<&str>,
+    ) -> Result<Option<(Primvar, String)>, String> {
         let full = format!("primvars:{name}");
         let held = |attr: &str| Ok::<_, String>(self.numbers(attr)?.filter(|v| !v.is_empty()));
         let (values, attr) = match (held(&full)?, fallback) {
@@ -571,15 +593,13 @@ impl PrimReader<'_> {
         } else {
             None
         };
-        if !values.len().is_multiple_of(width) {
-            return Err(format!("{} {attr}: not {width}-wide", self.path()));
-        }
-        Ok(Some(Primvar {
+        let primvar = Primvar {
             values,
             width,
             interp,
             indices,
-        }))
+        };
+        Ok(Some((primvar, attr.to_string())))
     }
 
     /// Primvar `name` of tangent frame vectors, as wide as its type declares: three components, or
@@ -597,6 +617,25 @@ impl PrimReader<'_> {
             )),
             None => self.primvar(name, 3, None),
         }
+    }
+
+    /// Primvar `name` as its elements stand, each as wide as its type and `elementSize` make it.
+    /// A last element the array falls short of holds no value.
+    pub(super) fn wide_primvar(&self, name: &str) -> Result<Option<Primvar>, String> {
+        let full = format!("primvars:{name}");
+        let Some(value) = self.value(&full)? else {
+            return Ok(None);
+        };
+        let Some(width) = self.stride(&full, &value) else {
+            return Ok(None);
+        };
+        Ok(self.elements(name, width, None)?.map(|(p, _)| p))
+    }
+
+    /// The numbers of one element of attribute `name` holding `value`, if it holds numbers.
+    fn stride(&self, name: &str, value: &sdf::Value) -> Option<usize> {
+        let width = element_width(value).or_else(|| numbers(value).map(|v| v.len()))?;
+        Some(width * self.element_size(name))
     }
 
     /// Whether primvar `name` holds values.
@@ -627,7 +666,7 @@ impl PrimReader<'_> {
         let Some(values) = numbers(&value).filter(|v| !v.is_empty()) else {
             return Ok(shading::Primvar::Missing);
         };
-        let width = element_width(&value).unwrap_or(values.len()) * self.element_size(&full);
+        let width = self.stride(&full, &value).unwrap_or(values.len());
         if self
             .metadata_token(&full, "interpolation")
             .is_some_and(|i| i != "constant")

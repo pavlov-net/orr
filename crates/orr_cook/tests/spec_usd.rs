@@ -1426,6 +1426,93 @@ fn a_short_primvar_reads_the_readers_fallback() {
     assert!(says("primvar tint") && says("primvar see"), "{warnings:?}");
 }
 
+/// `primvar.h` `elementSize`: "how many consecutive elements in the value array should be taken
+/// as an atomic element", so a vertex's value starts a whole element on, however wide, and a
+/// reader takes the first of it.
+#[test]
+fn wide_primvars_read_at_their_own_stride() {
+    let prims = r#"def Shader "C"
+    {
+        uniform token info:id = "UsdPrimvarReader_float4"
+        string inputs:varname = "wide"
+        float4 outputs:result
+    }"#;
+    let inputs = "color3f inputs:diffuseColor.connect = </M/C.outputs:result>";
+    let colors =
+        |name: &str, primvar: &str| vertex_colors(&cook(name, &previewed(inputs, prims, primvar)));
+    let held = |c: &[[f32; 4]], first: f32| {
+        assert!(
+            c.contains(&[first, first + 1.0, first + 2.0, first + 3.0]),
+            "{c:?}"
+        );
+    };
+    let eight = colors(
+        "primvar-eight",
+        r#"float[] primvars:wide = [
+        0, 1, 2, 3, 4, 5, 6, 7,
+        10, 11, 12, 13, 14, 15, 16, 17,
+        20, 21, 22, 23, 24, 25, 26, 27
+    ] (
+        elementSize = 8
+        interpolation = "vertex"
+    )"#,
+    );
+    held(&eight, 10.0);
+    held(&eight, 20.0);
+    // 18 numbers are no whole number of four-wide values.
+    let six = colors(
+        "primvar-six",
+        r#"float[] primvars:wide = [
+        0, 1, 2, 3, 4, 5,
+        10, 11, 12, 13, 14, 15,
+        20, 21, 22, 23, 24, 25
+    ] (
+        elementSize = 6
+        interpolation = "vertex"
+    )"#,
+    );
+    held(&six, 10.0);
+    held(&six, 20.0);
+    let matrices = colors(
+        "primvar-matrix",
+        r#"matrix4d[] primvars:wide = [
+        ((0, 1, 2, 3), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)),
+        ((10, 11, 12, 13), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)),
+        ((20, 21, 22, 23), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0))
+    ] (
+        interpolation = "vertex"
+    )"#,
+    );
+    held(&matrices, 10.0);
+    held(&matrices, 20.0);
+}
+
+/// `_ComputeFlattenedHelper`: an index is invalid where `(indices[i] + 1) * elementSize` passes
+/// the array, so an array that stops within an element holds the elements before it.
+#[test]
+fn a_partial_last_element_reads_the_fallback() {
+    let d = dir("primvar-ragged");
+    let prims = r#"def Shader "C"
+    {
+        uniform token info:id = "UsdPrimvarReader_float2"
+        string inputs:varname = "pair"
+        float2 inputs:fallback = (0.5, 0.25)
+        float2 outputs:result
+    }"#;
+    let inputs = "float inputs:roughness.connect = </M/C.outputs:result>";
+    let mesh = r#"float[] primvars:pair = [1, 2, 3] (
+        elementSize = 2
+        interpolation = "vertex"
+    )"#;
+    let stage = previewed(inputs, prims, mesh);
+    let (a, warnings) = cook_with_warnings(&d, &stage, Subdivision::Hull);
+    let colors = vertex_colors(&a);
+    assert!(colors.contains(&[1.0, 2.0, 1.0, 1.0]), "{colors:?}");
+    assert!(colors.contains(&[0.5, 0.25, 1.0, 1.0]), "{colors:?}");
+    let says = |w: &&String| w.contains("primvar pair") && w.contains("2 elements");
+    assert!(warnings.iter().any(|w| says(&w)), "{warnings:?}");
+}
+
 /// Two readers of one primvar each keep their own `fallback`.
 #[test]
 fn readers_of_a_primvar_keep_their_fallbacks() {

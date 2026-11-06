@@ -721,7 +721,14 @@ impl<'s> Importer<'s> {
                 }
                 for read in &frame.vertex {
                     if !read_primvars.contains_key(&read.name) {
-                        let held = r.primvar(&read.name, usize::from(read.width), None)?;
+                        let held = r.wide_primvar(&read.name)?;
+                        if let Some(p) = held.as_ref().filter(|p| p.width() > 4 && !as_cage) {
+                            self.warnings.push(format!(
+                                "{path}: primvar {} is {} wide; a reader takes the first 4",
+                                read.name,
+                                p.width()
+                            ));
+                        }
                         let missing = held
                             .as_ref()
                             .map_or(0, |p| p.missing(mesh.domain(p.interp)));
