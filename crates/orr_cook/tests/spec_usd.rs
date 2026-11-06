@@ -4174,3 +4174,118 @@ fn a_projective_xform_is_no_joint_local() {
     };
     assert!(e.to_string().contains("affine"), "{e}");
 }
+
+/// `xformResolver.cpp` `GetPrimLocalToCommonSpace` takes "the first" of an instancer's instance
+/// transforms: a skinned mesh in a prototype is posed in the space of its first copy, which stands
+/// exactly at the skeleton's world pose. What stands above the prototype's root plays no part.
+#[test]
+fn a_skeleton_outside_a_prototype_is_seen_from_its_first_copy() {
+    let a = cook(
+        "skel-outside-prototype",
+        &format!(
+            r#"def SkelRoot "Root"
+{{
+    {RIG}
+    def Xform "Group"
+    {{
+        double3 xformOp:translate = (0, 0, 7)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Xform "Proto"
+        {{
+            double3 xformOp:translate = (0, 9, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+            def Mesh "Body"
+            {{
+                {TRIANGLE}
+                rel skel:skeleton = </Root/Rig>
+                {INFLUENCES}
+            }}
+        }}
+    }}
+    def PointInstancer "Crowd"
+    {{
+        rel prototypes = [</Root/Group/Proto>]
+        int[] protoIndices = [0]
+        point3f[] positions = [(1, 0, 0)]
+    }}
+}}"#
+        ),
+    );
+    let sk = SkeletonInfo::parse(&blob(&a, "u/Proto/skeleton", 0)).unwrap();
+    let (mut pose, mut palette) = (
+        vec![orr_math::Affine3::IDENTITY; 2],
+        vec![orr_math::Affine3::IDENTITY; 2],
+    );
+    sk.model_pose(&sk.rest, &mut pose);
+    sk.palette(&pose, &mut palette);
+    let joint = usize::from(joints_of(&a, "u/Proto/mesh")[0]);
+    // The copy stands at x = 1, so the model holds the skeleton's pose 1 m the other way.
+    let source = [Vec3::ZERO, Vec3::X, Vec3::Y].map(|p| p - Vec3::X);
+    for (p, ..) in corners(&a, "u/Proto/mesh") {
+        let got = palette[joint].transform_point3(p);
+        let hit = source.iter().any(|w| got.abs_diff_eq(*w, 1e-4));
+        assert!(hit, "{p} reaches {got}");
+    }
+    assert_eq!(copies(&a, "u/Proto").len(), 1);
+}
+
+/// Per skeleton of `a`, where the first corner of its mesh stands at the start and end of its
+/// `xform` clip.
+fn skinned_travel(a: &Archive) -> Vec<(Vec3, Vec3)> {
+    let skeletons = a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::Skeleton as u16);
+    let models = skeletons.map(|e| a.name(e).trim_end_matches("/skeleton").to_string());
+    models
+        .map(|model| {
+            let joint = usize::from(joints_of(a, &format!("{model}/mesh"))[0]);
+            let (_, start) = posed(a, &model, "xform", 0.0);
+            let (_, end) = posed(a, &model, "xform", 1.0);
+            let bound = corners(a, &format!("{model}/mesh"))[0].0;
+            (
+                start[joint].transform_point3(bound),
+                end[joint].transform_point3(bound),
+            )
+        })
+        .collect()
+}
+
+/// A skeleton hung from a prototype's moving root stays in the prototype's model, which holds
+/// nothing of what stands above the root.
+#[test]
+fn a_moving_prototype_root_hangs_its_skeleton_in_the_model() {
+    let a = cook(
+        "prototype-root-moves",
+        &format!(
+            r#"def Xform "Group"
+{{
+    double3 xformOp:translate = (0, 0, 7)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+    def PointInstancer "Crowd"
+    {{
+        rel prototypes = [</Group/Crowd/Hero>]
+        int[] protoIndices = [0]
+        point3f[] positions = [(0, 0, 0)]
+        def SkelRoot "Hero"
+        {{
+            double3 xformOp:translate.timeSamples = {{ 0: (0, 0, 0), 10: (0, 3, 0) }}
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+            {RIG}
+            def Mesh "Body"
+            {{
+                {TRIANGLE}
+                rel skel:skeleton = </Group/Crowd/Hero/Rig>
+                {INFLUENCES}
+            }}
+        }}
+    }}
+}}"#
+        ),
+    );
+    let [(from, to)] = skinned_travel(&a)[..] else {
+        panic!("one skeleton");
+    };
+    assert!(from.z.abs() < 1e-4, "{from}");
+    assert!(to.abs_diff_eq(from + Vec3::Y * 3.0, 1e-4), "{from} {to}");
+}

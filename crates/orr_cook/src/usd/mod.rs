@@ -24,7 +24,10 @@
 //!   its other meshes on a still joint, a binding past the first a model
 //!   `<prototype>/<binding prim's path under it>` placed with it, and what a sampled xform moves
 //!   among its other meshes a model `<prototype>/moved` placed with it. One skeleton serves every
-//!   copy, and its pages hold only that model's copies, which a palette per copy poses.
+//!   copy, and its pages hold only that model's copies, which a palette per copy poses. A
+//!   skeleton outside the prototype is seen from the first copy, following the common space
+//!   UsdSkel's scene index defines: that copy stands at the skeleton's world pose, and the others
+//!   stand off from it as they do from the first.
 //! - What moves by an xform sampled over time, where a sample differs from the first: every mesh
 //!   drawn under such a prim. In the rest of the stage each rig of them is a model of its own in
 //!   scene space, named after its first joint (after its path, or `node<i>` for its node, if
@@ -269,6 +272,8 @@ struct Building {
     root: Option<usize>,
     /// The root node of the prototype the model holds.
     prototype: Option<usize>,
+    /// The instancer of its first copy, and scene space from the model at that copy.
+    first_copy: Option<(usize, DMat4)>,
     skeleton: Option<usize>,
     /// Its skeleton among those of rigs.
     rig_skeleton: Option<usize>,
@@ -286,6 +291,7 @@ impl Building {
             skinned: root.is_some(),
             root,
             prototype: None,
+            first_copy: None,
             skeleton: None,
             rig_skeleton: None,
             pivots: None,
@@ -696,10 +702,12 @@ impl<'s> Importer<'s> {
                 placed.insert(models.len(), copies);
                 holders[m].push((models.len(), linear));
                 let (prototype, skel_root) = (models[m].prototype, models[m].root);
+                let first_copy = models[m].first_copy;
                 models.push(Building::new(Some(format!("{name}/baked/{k}")), None, None));
                 let baked = models.last_mut().expect("pushed");
                 baked.prototype = prototype;
                 baked.root = skel_root;
+                baked.first_copy = first_copy;
             }
         }
 
@@ -1403,18 +1411,32 @@ impl<'s> Importer<'s> {
         parents: &[Option<usize>],
     ) -> Result<(), String> {
         let mut chain: Vec<usize> = skin::chain(parents, node, None).collect();
-        if let Some(end) = b
-            .prototype
-            .and_then(|root| chain.iter().position(|&n| n == root))
-        {
-            chain.truncate(end + 1);
+        let mut moving = chain.len();
+        if let Some(root) = b.prototype {
+            match chain.iter().position(|&n| n == root) {
+                Some(end) => {
+                    chain.truncate(end + 1);
+                    moving = chain.len();
+                }
+                // Past where it meets the instancer, a prim moves copies and skeleton alike.
+                None => {
+                    let holds = |&n: &usize| {
+                        let ins = b.first_copy.map_or(root, |c| c.0);
+                        self.subtree(n).contains(&ins)
+                    };
+                    moving = chain.iter().position(holds).unwrap_or(moving);
+                }
+            }
         }
-        let Some(far) = chain.iter().rposition(|&n| animated[n]) else {
+        let Some(far) = chain[..moving].iter().rposition(|&n| animated[n]) else {
             return Ok(());
         };
         let root = match chain.get(far + 1) {
             Some(&above) => self.to_model(b, above)?,
-            None => self.root,
+            // The space above a prototype's highest prim is its model's, without what stands
+            // above the prototype.
+            None if b.prototype.is_some_and(|r| self.under(chain[far], r)) => self.root,
+            None => self.stage_to_model(b),
         };
         let mut prims = Vec::with_capacity(far + 1);
         for &n in chain[..=far].iter().rev() {
@@ -1424,6 +1446,20 @@ impl<'s> Importer<'s> {
             prims.push((n, d.name.clone(), local, ib));
         }
         sk.hang(prims, root)
+    }
+
+    /// Model `b`'s space from stage space. For what stands outside a prototype that space is its
+    /// first copy's, the common space of `UsdSkelImagingDataSourceXformResolver`.
+    fn stage_to_model(&self, b: &Building) -> DMat4 {
+        match b.first_copy {
+            Some((_, copy)) => inverse_bind(copy) * self.root,
+            None => self.root,
+        }
+    }
+
+    /// Whether node `n` stands at or under node `top`.
+    fn under(&self, n: usize, top: usize) -> bool {
+        std::iter::successors(Some(n), |&k| self.nodes[k].parent).any(|k| k == top)
     }
 
     /// Prototype `root`'s model space from node `n`'s under it: the local transforms from
@@ -1445,7 +1481,10 @@ impl<'s> Importer<'s> {
     /// resets the transform stack.
     fn to_model(&self, b: &Building, n: usize) -> Result<DMat4, String> {
         if let Some(root) = b.prototype {
-            return Ok(self.to_prototype(root, n));
+            if self.under(n, root) {
+                return Ok(self.to_prototype(root, n));
+            }
+            return Ok(self.stage_to_model(b) * self.root.inverse() * self.nodes[n].world);
         }
         let Some(frame) = b.frame else {
             return Ok(self.nodes[n].world);
@@ -1672,6 +1711,7 @@ impl<'s> Importer<'s> {
             let transform = to_scene * local;
             for &m in std::iter::once(&p.model).chain(&p.also) {
                 instancing.copies.entry(m).or_default().push(transform);
+                models[m].first_copy.get_or_insert((ins, transform));
             }
             for &nested in &p.nested {
                 let to_scene = transform * self.to_prototype(*root, nested);
