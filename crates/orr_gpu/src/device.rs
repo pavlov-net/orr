@@ -19,6 +19,14 @@ pub struct DeviceDesc<'a> {
     /// [`Device::save_pipeline_cache`](crate::Device::save_pipeline_cache). `None`: no cache
     /// beyond the driver's own.
     pub pipeline_cache: Option<&'a Path>,
+    /// A directory holding each pipeline's compiled code in a file of its own, which takes the
+    /// place of `pipeline_cache`. The device loads all of it at creation, so its size is a cost
+    /// to every process. A pipeline's file is written when the pipeline compiles, so nothing
+    /// needs saving and a killed process keeps what it finished. Processes share it: one compiles
+    /// a pipeline while the others wait for it, for as long as what they wait for hits. Files
+    /// stay until the caller removes them; a file's modification time says when a pipeline last
+    /// came from it. Vulkan only.
+    pub pipeline_store: Option<&'a Path>,
     /// Optional extensions to leave off even when the device offers them; their `Caps`
     /// stay false. Vulkan only.
     pub skip_extensions: &'a [&'a CStr],
@@ -43,6 +51,7 @@ impl Default for DeviceDesc<'_> {
             queues: QueueRequest::default(),
             diagnostics: Diagnostics::Off,
             pipeline_cache: None,
+            pipeline_store: None,
             skip_extensions: &[],
             force_staging: false,
             perf_counters: false,

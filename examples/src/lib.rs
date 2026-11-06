@@ -64,8 +64,11 @@ pub fn device() -> &'static Device {
             .try_init();
         #[cfg(dlss)]
         let hooks = DlssSdk::device_hooks(PROJECT_ID);
+        // The test runner sets it, so the screenshot tests share compiled pipelines.
+        let store = std::env::var_os("ORR_TEST_PIPELINE_STORE").map(PathBuf::from);
         let desc = DeviceDesc {
             name: "orr-examples",
+            pipeline_store: store.as_deref(),
             #[cfg(dlss)]
             hooks: Some(&hooks),
             queues: QueueRequest {

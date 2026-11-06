@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 
@@ -30,6 +30,9 @@ usage: cargo run -p xtask -- test [OPTIONS] [FILTER...] [-- TEST_ARGS...]
 
 ORR_TEST_WRAPPER is a command, split on spaces, that every test executable runs under.
 It is the place for a time limit: the runner sets none. Doc tests run without it.
+
+ORR_TEST_PIPELINE_STORE is the directory where test devices keep compiled pipelines, shared
+by targets, worktrees and commits. It defaults to target/test-pipelines in the main checkout.
 
 Each target's output goes to target/test-logs/<target>.log. Exits 0 when every selected
 target passes, 1 when one fails and 2 when the tests can't be built or run.
@@ -422,9 +425,70 @@ struct Job {
     command: Command,
 }
 
+/// Names the directory of the pipeline store to test devices.
+const STORE_VAR: &str = "ORR_TEST_PIPELINE_STORE";
+
+/// The most the pipeline store keeps. Every test device loads the whole store, at about 0.6 ms
+/// per MB, and a full set of path kernels takes about 350 MB of it.
+const STORE_BYTES: u64 = 4 << 30;
+
+/// The pipeline store test devices share: `STORE_VAR` if set, else one directory for every
+/// worktree of the clone, or in the workspace outside a clone. NVIDIA's driver keeps its shader
+/// cache per executable file name, and a process can't read the cache of another that is running,
+/// so targets that build the same kernels would each compile them, for many minutes.
+fn pipeline_store(ws: &Workspace) -> Result<PathBuf, String> {
+    if let Some(dir) = env::var_os(STORE_VAR) {
+        // Each test runs in its package's directory, which a relative path would follow.
+        return std::path::absolute(dir).map_err(|e| format!("{STORE_VAR}: {e}"));
+    }
+    let git = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(&ws.root)
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()));
+    // A tree that isn't a clone has no other worktree to share with.
+    let clone = git.as_deref().and_then(Path::parent).unwrap_or(&ws.root);
+    Ok(clone.join("target").join("test-pipelines"))
+}
+
+/// Removes the pipelines used longest ago until the store fits [`STORE_BYTES`]. A pipeline
+/// removed while another run reads it is only a miss.
+fn trim_store(store: &Path) {
+    let Ok(entries) = fs::read_dir(store) else {
+        return;
+    };
+    let mut files: Vec<(SystemTime, u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            Some((meta.modified().ok()?, meta.len(), entry.path()))
+        })
+        .collect();
+    files.sort();
+    let mut total: u64 = files.iter().map(|(_, len, _)| len).sum();
+    for (_, len, path) in files {
+        if total <= STORE_BYTES {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            total -= len;
+        }
+    }
+}
+
 /// Each executable runs as under `cargo test`: in its package's directory, with
-/// `CARGO_MANIFEST_DIR` and `CARGO_PKG_NAME` set and the dependency directory on `PATH`.
-fn test_job(target: &Target, exe: &Path, wrapper: &[String], test_args: &[String]) -> Job {
+/// `CARGO_MANIFEST_DIR` and `CARGO_PKG_NAME` set and the dependency directory on `PATH`, and
+/// with the pipeline store in `STORE_VAR`.
+fn test_job(
+    target: &Target,
+    exe: &Path,
+    store: &Path,
+    wrapper: &[String],
+    test_args: &[String],
+) -> Job {
     let mut command = match wrapper {
         [program, args @ ..] => {
             let mut command = Command::new(program);
@@ -444,6 +508,7 @@ fn test_job(target: &Target, exe: &Path, wrapper: &[String], test_args: &[String
         .current_dir(&target.dir)
         .env("CARGO_MANIFEST_DIR", &target.dir)
         .env("CARGO_PKG_NAME", &target.package)
+        .env(STORE_VAR, store)
         .env(
             "PATH",
             env::join_paths(paths).unwrap_or_else(|_| OsString::from(&path)),
@@ -719,11 +784,13 @@ fn try_run(args: Vec<String>) -> Result<ExitCode, String> {
 
     let wrapper = env::var("ORR_TEST_WRAPPER").unwrap_or_default();
     let wrapper: Vec<String> = wrapper.split_whitespace().map(str::to_owned).collect();
+    let store = pipeline_store(&ws)?;
+    trim_store(&store);
     let mut jobs: Vec<Job> = ws
         .selected(&options)
         .filter_map(|t| {
             let exe = t.exe.as_ref()?;
-            Some(test_job(t, exe, &wrapper, &options.test_args))
+            Some(test_job(t, exe, &store, &wrapper, &options.test_args))
         })
         .collect();
     if doc {

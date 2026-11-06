@@ -9,7 +9,7 @@ use crate::Error;
 /// What the pipeline cache loaded and how creation has used it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineCacheReport {
-    /// The file existed and its data was loaded.
+    /// The file, or at least one file of the pipeline store, existed and its data was loaded.
     pub loaded: bool,
     /// Pipelines the cache already held: a driver cache hit on Vulkan, a pipeline this session
     /// or the archive held on Metal.

@@ -119,9 +119,11 @@ fn frame_generation_presents_generated_images_before_each_frame() {
     let _serial = serial();
     gpu_suite::log_to_stderr();
     let hooks = DlssSdk::device_hooks(PROJECT_ID);
+    let store = std::env::var_os("ORR_TEST_PIPELINE_STORE").map(std::path::PathBuf::from);
     let gpu = Device::new(&DeviceDesc {
         name: "output_suite frame generation",
         hooks: Some(&hooks),
+        pipeline_store: store.as_deref(),
         queues: QueueRequest {
             render_compute: true,
             async_compute: true,

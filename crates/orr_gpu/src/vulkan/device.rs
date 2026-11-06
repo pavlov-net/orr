@@ -595,7 +595,8 @@ impl Device {
             }
         };
 
-        let pipeline_cache = PipelineCache::open(&device, &props, desc.pipeline_cache);
+        let pipeline_cache =
+            PipelineCache::open(&device, &props, desc.pipeline_cache, desc.pipeline_store);
         let mut queue_handles = [None; MAX_TIMELINES];
         let mut families_by_kind = [0; MAX_TIMELINES];
         for plan in &plans {
@@ -793,9 +794,10 @@ impl Device {
 
     /// A handle to this device whose [`Device::create_compute_pipeline`],
     /// [`Device::create_ray_dispatch_pipeline`] and [`Device::create_mesh_pipeline`] compile
-    /// nothing: a pipeline in the driver's disk cache or the [`DeviceDesc::pipeline_cache`] file
-    /// comes back at once, and any other returns [`crate::Error::CompileRequired`] without doing
-    /// the work. So a thread that must not stall can find out whether a start is warm.
+    /// nothing: a pipeline in the driver's disk cache, the [`DeviceDesc::pipeline_cache`] file or
+    /// the [`DeviceDesc::pipeline_store`] comes back at once, and any other returns
+    /// [`crate::Error::CompileRequired`] without doing the work. So a thread that must not stall
+    /// can find out whether a start is warm.
     pub fn cached_pipelines_only(&self) -> Device {
         Device {
             creation_flags: vk::PipelineCreateFlags2::FAIL_ON_PIPELINE_COMPILE_REQUIRED,

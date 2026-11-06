@@ -396,6 +396,115 @@ fn a_file_the_driver_ignores_is_replaced() {
     assert!(d.pipeline_cache_report().loaded);
 }
 
+#[cfg(not(target_vendor = "apple"))]
+fn open_store(dir: &Path) -> Device {
+    log_to_stderr();
+    Device::new(&DeviceDesc {
+        name: "gpu_suite pipeline store",
+        pipeline_store: Some(dir),
+        ..DeviceDesc::default()
+    })
+    .unwrap()
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn store_dir(test: &str) -> PathBuf {
+    let path = cache_path(test);
+    let _ = std::fs::remove_dir_all(&path);
+    path
+}
+
+/// A pipeline reaches the store when it compiles, with no save, and a cached-only handle finds
+/// it there. A device loads the store at creation, before any pipeline: on NVIDIA's driver many
+/// path kernels miss from files loaded only when they are asked for, which small pipelines like
+/// these don't show. A file whose data the driver refuses costs one compile, which rewrites it;
+/// only NVIDIA's driver is known to refuse such data.
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn a_store_keeps_each_pipeline_as_it_compiles() {
+    let dir = store_dir("store");
+    let d = open_store(&dir);
+    let nvidia = d.caps().device_name.contains("NVIDIA");
+    let set = Set::new(&d, 21);
+    let n = set.kinds();
+    assert_eq!(d.pipeline_cache_report().misses, n);
+    set.check(&d);
+    assert_clean(&d);
+    drop((set, d));
+
+    let warm = |what: &str| {
+        let d = open_store(&dir);
+        assert!(d.pipeline_cache_report().loaded, "{what}");
+        let set = Set::new(&d, 21);
+        let report = d.pipeline_cache_report();
+        assert_eq!((report.hits, report.misses), (n, 0), "{what}: {report:?}");
+        set.check(&d);
+        assert_clean(&d);
+    };
+    warm("from the store");
+
+    let d = open_store(&dir);
+    let spec = cached::Spec { value: 21 }.bytes();
+    let data = SpecData {
+        entries: cached::Spec::ENTRIES,
+        bytes: &spec,
+    };
+    let stage = ShaderStage::new(&cached::MODULE, "compute_main", data).unwrap();
+    d.cached_pipelines_only()
+        .create_compute_pipeline(&stage, "cached compute")
+        .unwrap();
+    assert_eq!(d.pipeline_cache_report().hits, 1);
+    drop(d);
+
+    if !require(
+        nvidia,
+        "only NVIDIA's driver is known to refuse bad cache data",
+    ) {
+        return;
+    }
+    for file in std::fs::read_dir(&dir).unwrap() {
+        let path = file.unwrap().path();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let body = bytes.len() - CHECKSUM;
+        let driver = u32::from_le_bytes(bytes[HEADER..HEADER + 4].try_into().unwrap()) as usize;
+        for (i, byte) in bytes[HEADER + driver..body].iter_mut().enumerate() {
+            *byte = (i * 31) as u8;
+        }
+        write_checksummed(&path, bytes);
+    }
+    let d = open_store(&dir);
+    let set = Set::new(&d, 21);
+    assert_eq!(d.pipeline_cache_report().misses, n);
+    set.check(&d);
+    assert_clean(&d);
+    drop((set, d));
+    warm("after a refused file");
+}
+
+/// Devices sharing a store that held something at open compile a pipeline once: the second waits
+/// for the first and hits.
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn devices_sharing_a_store_compile_a_pipeline_once() {
+    let dir = store_dir("store_shared");
+    let d = open_store(&dir);
+    drop((Set::new(&d, 23), d));
+    let devices = [open_store(&dir), open_store(&dir)];
+    let n = std::thread::scope(|s| {
+        let made = devices
+            .iter()
+            .map(|d| s.spawn(move || Set::new(d, 22).kinds()))
+            .collect::<Vec<_>>();
+        made.into_iter().map(|t| t.join().unwrap()).sum::<u32>() / 2
+    });
+    let reports = devices.each_ref().map(Device::pipeline_cache_report);
+    let (hits, misses) = (
+        reports[0].hits + reports[1].hits,
+        reports[0].misses + reports[1].misses,
+    );
+    assert_eq!((hits, misses), (n, n), "{reports:?}");
+}
+
 /// Threads asking for one pipeline at once compile it once.
 #[test]
 fn one_pipeline_requested_at_once_compiles_once() {
