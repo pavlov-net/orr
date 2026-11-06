@@ -670,6 +670,51 @@ fn ktx2(
     (bytes, blocks)
 }
 
+/// A map of mesh space directions stores what a linear BC7 file holds: `0.5 v + 0.5` as it stands.
+#[test]
+fn object_normal_maps_keep_bc7_blocks() {
+    let d = dir("object-normal-pass");
+    let n = 64;
+    let (file, blocks) = ktx2(n, n, ctt::Format::BC7_UNORM_BLOCK, |_, x, y| {
+        [(4 * x) as u8, (4 * y) as u8, (2 * (x + y)) as u8, 255]
+    });
+    std::fs::write(d.join("o.ktx2"), file).unwrap();
+    let doc = d.join("m.mtlx");
+    let body = r#"<?xml version="1.0"?>
+<materialx version="1.38">
+  <image name="i" type="vector3"><input name="file" type="filename" value="o.ktx2"/></image>
+  <normalmap name="n" type="vector3">
+    <input name="in" type="vector3" nodename="i"/>
+    <input name="space" type="string" value="object"/>
+  </normalmap>
+  <open_pbr_surface name="S" type="surfaceshader">
+    <input name="geometry_normal" type="vector3" nodename="n"/>
+  </open_pbr_surface>
+  <surfacematerial name="M" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="S"/>
+  </surfacematerial>
+</materialx>
+"#;
+    std::fs::write(&doc, body).unwrap();
+    let a = cook_at(
+        vec![AssetSpec {
+            name: "u".into(),
+            source: Source::MaterialX {
+                path: doc,
+                material: "M".into(),
+                textures: TextureRules::default(),
+            },
+        }],
+        Quality::Fast,
+    );
+    let e = a.find(AssetId::from_name("u")).unwrap();
+    let m = Material::from_bytes(&read_blob(&a, e, 0)).unwrap();
+    let t = m.textures[slot::NORMAL].texture;
+    let (info, levels) = mips(&a, a.name(a.find(t).unwrap()));
+    assert_eq!(info.header.vk_format, vk::BC7_UNORM);
+    assert_eq!(levels[0], blocks);
+}
+
 /// BCn images that already hold what the material wants keep their blocks: every mip, or
 /// at qualities that remake mips, mip 0 where the cook makes the other mips (Toksvig
 /// roughness). Below those, a texture made from other channels of BCn images encodes the

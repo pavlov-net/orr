@@ -7,10 +7,12 @@
 //!   `specular_anisotropy`, `geometry_thin_walled` `thin_walled`, `thin_film_thickness`
 //!   (micrometers) the field in nanometers, `coat_roughness_anisotropy` `coat_anisotropy`, and
 //!   every other input the field of its name. `geometry_coat_normal` reads as `geometry_normal`
-//!   does. `geometry_tangent` and `geometry_coat_tangent` take a `tangent` node, the mesh's, or a
-//!   texture of a direction in the tangent plane; any other warns and reads the mesh's. A
-//!   `geometry_opacity` below 1 or textured blends, as the linear presence weight
-//!   OpenPBR defines.
+//!   does, and a `normalmap` `space` of `object` in either states directions in the mesh's space,
+//!   which turn with what places it; a transform an importer bakes into the mesh isn't among that.
+//!   `geometry_tangent` and `geometry_coat_tangent` take a
+//!   `tangent` node, the mesh's, or a texture of a direction in the tangent plane; any other warns
+//!   and reads the mesh's. A `geometry_opacity` below 1 or textured blends, as the linear presence
+//!   weight OpenPBR defines.
 //! - `UsdPreviewSurface`, mapped like glTF metallic-roughness: `diffuseColor` is
 //!   `base_color`, `metallic`, `roughness`, `ior` and `emissiveColor` (read as nits) their
 //!   fields, `clearcoat` and `clearcoatRoughness` the coat at `ior`, and `normal` and
@@ -1491,27 +1493,33 @@ impl Mapper<'_, '_> {
         {
             self.material.alpha_mode = Material::BLEND;
         }
-        self.textures.normal = self.normal_input(n, "geometry_normal")?;
-        self.textures.coat_normal = self.normal_input(n, "geometry_coat_normal")?;
+        self.textures.normal = self.normal_input(n, "geometry_normal", Material::OBJECT_NORMAL)?;
+        self.textures.coat_normal =
+            self.normal_input(n, "geometry_coat_normal", Material::OBJECT_COAT_NORMAL)?;
         self.tangent_input(n, "geometry_tangent", slot::TANGENT)?;
         self.tangent_input(n, "geometry_coat_tangent", slot::COAT_TANGENT)
     }
 
-    /// The normal map of input `name` of `n`, from a `normalmap` node.
-    fn normal_input(&mut self, n: usize, name: &str) -> Result<Option<(TexRef, [f32; 2])>, String> {
+    /// The normal map of input `name` of `n`, from a `normalmap` node. A 1.38 `space` of `object`
+    /// sets `object` in [`Material::object_normals`]: as in the library's upgrade of it, the node
+    /// reads `2 in - 1` and no tangent frame or `scale` has a part.
+    fn normal_input(
+        &mut self,
+        n: usize,
+        name: &str,
+        object: u8,
+    ) -> Result<Option<(TexRef, [f32; 2])>, String> {
         match self.source(n, name) {
             None => Ok(None),
             Some(Input::Connect { node, .. }) if self.node(*node).kind == "normalmap" => {
                 let map = *node;
-                if self.text(map, "space") == Some("object") {
-                    self.warnings.push(format!(
-                        "{}: a normalmap space of object is not honored yet; it reads as \
-                         tangent space",
-                        self.node(map).name
-                    ));
-                }
-                self.normal_frame(map)?;
-                let scale = self.vec2(map, "scale", Vec2::ONE)?;
+                let scale = if self.text(map, "space") == Some("object") {
+                    self.material.object_normals |= object;
+                    Vec2::ONE
+                } else {
+                    self.normal_frame(map)?;
+                    self.vec2(map, "scale", Vec2::ONE)?
+                };
                 match self.value(map, "in")? {
                     Some(Value::Texture(t)) if t.channels == Channels::Rgb => {
                         Ok(Some((t.normalmap_ref(), scale.to_array())))

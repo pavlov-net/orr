@@ -1997,7 +1997,7 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, MapTexture>) -> MapSpec {
         }),
     });
     let frame_set = usize::from(m.tangent_set());
-    let normal = match bound(slot::NORMAL) {
+    let normal = match bound(slot::NORMAL).filter(|_| !m.object_normal(slot::NORMAL)) {
         _ if mesh::reads_tangent(m) => NormalSpec::Tangent { frame_set },
         None => NormalSpec::None,
         Some((Some(t), uv_set)) => NormalSpec::Texture {

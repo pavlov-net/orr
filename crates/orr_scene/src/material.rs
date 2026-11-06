@@ -49,6 +49,8 @@ pub mod material_flags {
     pub const MORE_TEXTURES: u32 = 1 << 22;
     pub const BASE_TINT: u32 = 1 << 23;
     pub const VERTEX: u32 = 1 << 24;
+    pub const OBJECT_NORMAL: u32 = 1 << 25;
+    pub const OBJECT_COAT_NORMAL: u32 = 1 << 26;
 }
 
 /// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
@@ -188,6 +190,14 @@ impl MaterialGpu {
         set(m.model != Material::MODEL_OPENPBR, f::FRESNEL_MIX);
         set(m.model == Material::MODEL_GLTF, f::BASE_TINT);
         set(m.textures.iter().any(|b| b.vertex != 0), f::VERTEX);
+        set(
+            m.object_normals & Material::OBJECT_NORMAL != 0,
+            f::OBJECT_NORMAL,
+        );
+        set(
+            m.object_normals & Material::OBJECT_COAT_NORMAL != 0,
+            f::OBJECT_COAT_NORMAL,
+        );
         set(m.model == Material::MODEL_PREVIEW_SPECULAR, f::F0_STATED);
         set((slot::MORE..slot::COUNT).any(bound), f::MORE_TEXTURES);
         let cost: u32 = if subsurface {

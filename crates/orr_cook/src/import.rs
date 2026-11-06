@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use orr_math::{DMat3, DMat4, DVec3, Mat3};
 use orr_pack::clip::Clip;
-use orr_pack::material::Material;
+use orr_pack::material::{Material, slot};
 use orr_pack::skeleton::SkeletonInfo;
 use serde::Deserialize;
 
@@ -102,8 +102,11 @@ impl SceneMaterial {
     /// none. Without a normal map the shaders read set 0.
     pub(crate) fn tangent_set(&self) -> Option<usize> {
         let m = &self.material;
-        let textures = &self.textures;
-        match textures.normal.as_ref().or(textures.coat_normal.as_ref()) {
+        let normal = self.textures.normal.as_ref();
+        let normal = normal.filter(|_| !m.object_normal(slot::NORMAL));
+        let coat = self.textures.coat_normal.as_ref();
+        let coat = coat.filter(|_| !m.object_normal(slot::COAT_NORMAL));
+        match normal.or(coat) {
             Some((r, _)) => Some(usize::from(r.uv_set)),
             None => mesh::reads_tangent(m).then_some(0),
         }

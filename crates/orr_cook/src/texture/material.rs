@@ -927,7 +927,9 @@ enum Texels {
         b: f32,
     },
     /// The z of a two-channel normal image, which holds none, rebuilt from its x and y.
+    /// With `encoded`, at `0.5 z + 0.5`.
     NormalZ {
+        encoded: bool,
         image: usize,
         source: NormalSource,
     },
@@ -1730,6 +1732,9 @@ impl<'a> Packer<'a> {
         s: usize,
         role: &'static str,
     ) -> Result<bool> {
+        if m.object_normal(s) {
+            return self.object_normal_map(suffix, m, raw, s, role);
+        }
         let (r, source) = self.normal_source(raw);
         let r = &r;
         let map = r.remap.expect("a normal map reads through a remap");
@@ -1759,6 +1764,7 @@ impl<'a> Packer<'a> {
                     if source.rg {
                         Channel {
                             texels: Texels::NormalZ {
+                                encoded: false,
                                 image: r.image,
                                 source,
                             },
@@ -1782,6 +1788,57 @@ impl<'a> Packer<'a> {
         })?;
         bind(m, s, id, 0, r);
         Ok(!id.source_mips && consts.iter().any(Option::is_none))
+    }
+
+    /// A normal map of mesh space directions. Unlike the tangent plane's they reach every side, so
+    /// each holds three channels at `0.5 v + 0.5`, and none is flat. Roughness takes no variance
+    /// from it.
+    fn object_normal_map(
+        &mut self,
+        suffix: &str,
+        m: &mut Material,
+        raw: &TexRef,
+        s: usize,
+        role: &'static str,
+    ) -> Result<bool> {
+        let (r, source) = self.normal_source(raw);
+        // A two-channel image's z follows from its x and y.
+        let held = if source.rg { 2 } else { 3 };
+        let shrink = (0..held).all(|c| self.constant(&r, c).is_some());
+        let id = self.make_each(suffix, &r, |this, cell| {
+            let (r, source) = this.normal_source(&this.at(raw, cell));
+            let channel = |c: usize| this.source(&r, c, c, 0.5, 0.5);
+            Pack {
+                role,
+                encoding: Encoding::Bc7,
+                channels: vec![
+                    channel(0),
+                    channel(1),
+                    if source.rg {
+                        let z = normal::z(r.read(0, r.outside[0]), r.read(1, r.outside[1]));
+                        Channel {
+                            texels: Texels::NormalZ {
+                                encoded: true,
+                                image: r.image,
+                                source,
+                            },
+                            outside: Outside::of(0.5 * z + 0.5),
+                        }
+                    } else {
+                        channel(2)
+                    },
+                    Channel::constant(1.0),
+                ],
+                refs: vec![r],
+                coverage: None,
+                toksvig: None,
+                normal: false,
+                shrink,
+                tile: None,
+            }
+        })?;
+        bind(m, s, id, 0, &r);
+        Ok(false)
     }
 
     /// Cooks input `r` of slot `s`, from [`slot::MORE`] on.
@@ -2127,7 +2184,7 @@ impl<'a> Packer<'a> {
     ) -> Option<(Pass, [u8; 4])> {
         use orr_pack::texture::vk;
         let count = match p.encoding {
-            Encoding::Bc7Srgb => 4,
+            Encoding::Bc7Srgb | Encoding::Bc7 => 4,
             Encoding::Bc6h => 3,
             Encoding::Bc5 => 2,
             Encoding::Bc4 => 1,
@@ -2165,7 +2222,7 @@ impl<'a> Packer<'a> {
                 }
                 Texels::Unused => {}
                 // A color texture's alpha of 1 holds where the source's is 1.
-                Texels::Constant(v) if p.encoding == Encoding::Bc7Srgb && c == 3 => {
+                Texels::Constant(v) if count == 4 && c == 3 => {
                     let opaque = self.image(image?).constant[3]
                         .is_some_and(|a| (a - 1.0).abs() <= 1.0 / 255.0);
                     if *v != 1.0 || !opaque {
@@ -2188,7 +2245,7 @@ impl<'a> Packer<'a> {
         };
         // Slots read color and normal channels together from their first one on.
         let in_order = match p.encoding {
-            Encoding::Bc7Srgb | Encoding::Bc6h => channels[..3] == [0, 1, 2],
+            Encoding::Bc7Srgb | Encoding::Bc7 | Encoding::Bc6h => channels[..3] == [0, 1, 2],
             Encoding::Bc5 if p.normal => channels[..2] == [0, 1],
             _ => true,
         };
@@ -2600,12 +2657,17 @@ impl TextureJob {
             match &ch.texels {
                 &Texels::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
                 Texels::Unused => img.px.par_iter_mut().for_each(|t| t[c] = 1.0),
-                &Texels::NormalZ { image, source } => {
+                &Texels::NormalZ {
+                    encoded,
+                    image,
+                    source,
+                } => {
                     let r = self.pack.refs[0];
+                    let (a, b) = if encoded { (0.5, 0.5) } else { (0.0, 1.0) };
                     img.px
                         .par_iter_mut()
                         .zip(&decoded[&image].px)
-                        .for_each(|(t, s)| t[c] = r.normal(source, *s)[2]);
+                        .for_each(|(t, s)| t[c] = a + b * r.normal(source, *s)[2]);
                 }
                 Texels::Image {
                     image,

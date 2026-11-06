@@ -35,6 +35,9 @@ public static const uint MATERIAL_METAL_FLAT = 1 << 20;
 public static const uint MATERIAL_F0_STATED = 1 << 21;
 // A slot reads the vertex color stream.
 public static const uint MATERIAL_VERTEX = 1 << 24;
+// The normal map, or the coat's, holds mesh space directions at `0.5 v + 0.5`.
+public static const uint MATERIAL_OBJECT_NORMAL = 1 << 25;
+public static const uint MATERIAL_OBJECT_COAT_NORMAL = 1 << 26;
 // The base color tints what passes through the surface.
 public static const uint MATERIAL_BASE_TINT = 1 << 23;
 // It binds a slot past TEXTURE_TRANSMISSION, which hits on other materials don't look at.

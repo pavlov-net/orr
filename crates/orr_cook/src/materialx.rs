@@ -40,9 +40,8 @@
 //! its scope: references within it and to the global namespace need no qualifier, others name
 //! `namespace:element`, and so may the material.
 //!
-//! Not honored yet, and reported as warnings: a `backsurfaceshader` other than the
-//! `surfaceshader`, and a `normalmap` `space` of `object` from 1.38 documents, which reads as
-//! tangent space.
+//! Not honored yet, and reported as a warning: a `backsurfaceshader` other than the
+//! `surfaceshader`.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};

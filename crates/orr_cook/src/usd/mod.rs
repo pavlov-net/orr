@@ -794,7 +794,17 @@ impl<'s> Importer<'s> {
                 }
                 c
             };
+            let object_space = used
+                .iter()
+                .any(|&m| self.materials[m].material.object_normals != 0);
             for &(m, linear) in &holders[o] {
+                let baked = DMat3::from_mat4(linear * transform);
+                if object_space && !baked.abs_diff_eq(DMat3::IDENTITY, 1e-6) {
+                    self.warnings.push(format!(
+                        "{path}: its object space normal maps don't turn with the transform \
+                         baked into its model"
+                    ));
+                }
                 let placing = Placing {
                     transform: linear * transform,
                     face_material: &face_material,

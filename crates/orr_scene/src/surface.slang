@@ -151,12 +151,20 @@ public float material_coverage(SurfaceInput i)
 
 // The shading frame: the vertex normal, turned by the material's normal map in `slot`.
 // MikkTSpace's bakers invert this transform: the interpolated normal and tangent as they stand,
-// neither unit nor perpendicular.
+// neither unit nor perpendicular. A map of mesh space directions takes the placement's normal
+// transform, and the side `i.normal` faces where a double-sided back face turned it.
 public float3 material_normal(SurfaceInput i, MaterialGpu* m, uint slot = TEXTURE_NORMAL)
 {
     if (!material_bound(m, slot))
         return i.normal;
-    float3 v = material_normal_frame(m, slot, normal_decode(material_texture(m, slot, i.uv, float4(0.5, 0.5, 1.0, 1.0)).xy));
+    float4 texel = material_texture(m, slot, i.uv, float4(0.5, 0.5, 1.0, 1.0));
+    if ((m.flags & (slot == TEXTURE_NORMAL ? MATERIAL_OBJECT_NORMAL : MATERIAL_OBJECT_COAT_NORMAL)) != 0)
+    {
+        float3x3 c = normal_matrix(i.object_to_render);
+        float side = dot(mul(c, i.object_normal), i.normal) < 0.0 ? -1.0 : 1.0;
+        return safe_normalize(mul(c, 2.0 * texel.xyz - 1.0) * side, i.normal);
+    }
+    float3 v = material_normal_frame(m, slot, normal_decode(texel.xy));
     float3 n = i.frame_normal;
     float3 t = i.tangent.xyz;
     float3 b = cross(n, t) * i.tangent.w;
@@ -245,10 +253,23 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
         float3 t = safe_normalize(axis_x - n * dot(n, axis_x), cross(n, axis_y));
         float3 b = cross(n, t);
         b = dot(b, axis_y) < 0.0 ? -b : b;
-        float3 v = float3(0.0, 0.0, 1.0);
+        float3 normal = n;
         if (material_bound(m, TEXTURE_NORMAL))
-            v = material_normal_frame(m, TEXTURE_NORMAL, normal_decode(material_texture(m, TEXTURE_NORMAL, fs, float4(0.5, 0.5, 1.0, 1.0)).xy));
-        decal_over(layer.normal, layer.normal_cover, safe_normalize(t * v.x + b * v.y + n * v.z, n), share);
+        {
+            float4 texel = material_texture(m, TEXTURE_NORMAL, fs, float4(0.5, 0.5, 1.0, 1.0));
+            if ((m.flags & MATERIAL_OBJECT_NORMAL) != 0)
+            {
+                // A decal has no mesh: its box stands for the space the map states.
+                float3 v = 2.0 * texel.xyz - 1.0;
+                normal = axis_x * v.x + axis_y * v.y + d.axis_z * v.z;
+            }
+            else
+            {
+                float3 v = material_normal_frame(m, TEXTURE_NORMAL, normal_decode(texel.xy));
+                normal = t * v.x + b * v.y + n * v.z;
+            }
+        }
+        decal_over(layer.normal, layer.normal_cover, safe_normalize(normal, n), share);
     }
 }
 

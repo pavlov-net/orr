@@ -944,6 +944,11 @@ fn cook() -> Arc<[u8]> {
     ground.textures[slot::NORMAL].texture = id("tex/normal");
     let mut tilted = Material::default();
     tilted.textures[slot::NORMAL].texture = id("tex/tilt");
+    let mut tilted_object = Material {
+        object_normals: Material::OBJECT_NORMAL,
+        ..Material::default()
+    };
+    tilted_object.textures[slot::NORMAL].texture = id("tex/tilt object");
     let mut tilted_uv1 = tilted;
     tilted_uv1.textures[slot::NORMAL].uv_set = 1;
     let mut tilted_keeping_uv1 = tilted;
@@ -1133,8 +1138,10 @@ fn cook() -> Arc<[u8]> {
                 texture("tex/normal", bumps, Usage::Normal),
                 texture("tex/holes", holes, Usage::Linear1),
                 texture("tex/sticker", sticker, Usage::Color),
+                texture("tex/tilt object", tilt.clone(), Usage::Linear4),
                 texture("tex/tilt", tilt, Usage::Normal),
                 model("tilted", quad(unit), vec![tilted], one()),
+                model("tilted object", quad(unit), vec![tilted_object], one()),
                 AssetSpec {
                     name: "tilted skew".into(),
                     source: Source::Mesh {
@@ -3159,7 +3166,12 @@ fn normal_maps_turn_toward_the_image_up_on_meshes_and_decals() {
     let mut w = World::new(&linked::KERNELS);
     let [x, y, z] = TILT;
     let eye = DVec3::new(0.0, 0.0, 2.0);
-    for model in ["tilted", "tilted computed", "tilted stored"] {
+    for model in [
+        "tilted",
+        "tilted computed",
+        "tilted stored",
+        "tilted object",
+    ] {
         let cases = [
             (Mat3::IDENTITY, Vec3::new(x, y, z)),
             (
@@ -3194,21 +3206,29 @@ fn normal_maps_turn_toward_the_image_up_on_meshes_and_decals() {
         .scenes
         .material(w.mount, AssetId::from_name("tilted/material/0"))
         .unwrap();
+    let object = w
+        .scenes
+        .material(w.mount, AssetId::from_name("tilted object/material/0"))
+        .unwrap();
     let wall = Item {
         model: "plain",
         linear: Mat3::from_diagonal(Vec3::splat(8.0)),
         at: Vec3::ZERO,
     };
+    let past = Quat::from_rotation_x(2.0);
     let cases = [
-        (Quat::IDENTITY, Vec3::new(x, y, z)),
+        (tilted, Quat::IDENTITY, Vec3::new(x, y, z)),
         (
+            tilted,
             Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
             Vec3::new(-y, x, z),
         ),
         // Past 90 degrees from the decal's +z: its y axis runs down the wall.
-        (Quat::from_rotation_x(2.0), Vec3::new(x, -y, z)),
+        (tilted, past, Vec3::new(x, -y, z)),
+        // Mesh space directions are the box's, which no surface under it mirrors.
+        (object, past, past * Vec3::new(x, y, z)),
     ];
-    for (rotation, want) in cases {
+    for (material, rotation, want) in cases {
         let placed = place(&mut w, &[wall]);
         let mut shot = Shot::at(eye, DVec3::ZERO, 1);
         shot.jitter = Vec2::ZERO;
@@ -3217,7 +3237,7 @@ fn normal_maps_turn_toward_the_image_up_on_meshes_and_decals() {
                 center: DVec3::ZERO,
                 rotation,
                 half_extent: Vec3::new(0.5, 0.5, 0.25),
-                material: tilted,
+                material,
                 channels: DecalChannels::NORMAL,
                 opacity: 1.0,
                 fade_angles: [2.5, 3.0],
@@ -7731,6 +7751,9 @@ fn every_slot_reaches_its_parameter() {
         ])
         .collect();
     records.extend(slots.iter().map(|&s| with(s)));
+    let mut object = with(slot::COAT_NORMAL);
+    object.flags |= orr_scene::material_flags::OBJECT_COAT_NORMAL;
+    records.push(object);
 
     let texels = {
         let mut a = d
@@ -7809,6 +7832,14 @@ fn every_slot_reaches_its_parameter() {
         "coat normal {n:?}"
     );
     assert_eq!(plain.coat_normal, [0.0, 0.0, 1.0]);
+    // A mesh space direction turns with the placement, a quarter turn about z.
+    let [x, y, z] = [v[0], v[1], v[2]].map(|c| 2.0 * c - 1.0);
+    let want = Vec3::new(-y, x, z).normalize();
+    let n = Vec3::from(out[out.len() - 1].coat_normal);
+    assert!(
+        n.abs_diff_eq(want, 1e-4),
+        "object normal {n} against {want}"
+    );
     d.free_image_slot_after_submitted(slot_index);
     assert_clean();
 }

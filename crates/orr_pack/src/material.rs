@@ -119,7 +119,11 @@ pub struct Material {
     pub frame_uv: u8,
     /// Whose model the parameters state: [`Self::MODEL_OPENPBR`] by default.
     pub model: u8,
-    pub _pad: [u8; 2],
+    /// Which normal maps hold mesh space directions: [`Self::OBJECT_NORMAL`] and
+    /// [`Self::OBJECT_COAT_NORMAL`]. Such a map stores a direction at `0.5 v + 0.5` in its first
+    /// three channels, and the mesh's tangents have no part in it.
+    pub object_normals: u8,
+    pub _pad: u8,
     /// Indexed by the `slot` constants.
     pub textures: [TextureBinding; slot::COUNT],
     /// Per slot, the affine map from mesh uv to the uv its texture is sampled at, stored
@@ -137,6 +141,9 @@ impl Material {
     pub const FRAME_OTHER: u8 = 3;
     /// [`Self::tangent_set`] of [`Self::FRAME_OTHER`].
     pub const TANGENT_SET_OTHER: u8 = 2;
+
+    pub const OBJECT_NORMAL: u8 = 1 << 0;
+    pub const OBJECT_COAT_NORMAL: u8 = 1 << 1;
 
     /// The fields mean what OpenPBR states.
     pub const MODEL_OPENPBR: u8 = 0;
@@ -156,17 +163,28 @@ impl Material {
     /// itself.
     pub const MODEL_PREVIEW_SPECULAR: u8 = 3;
 
+    /// Whether [`slot::NORMAL`] or [`slot::COAT_NORMAL`] `s` holds mesh space directions.
+    pub fn object_normal(&self, s: usize) -> bool {
+        let flag = if s == slot::NORMAL {
+            Self::OBJECT_NORMAL
+        } else {
+            Self::OBJECT_COAT_NORMAL
+        };
+        self.object_normals & flag != 0
+    }
+
+    /// Whether [`slot::NORMAL`] or [`slot::COAT_NORMAL`] `s` binds a map the tangent frame turns.
+    pub fn tangent_map(&self, s: usize) -> bool {
+        self.textures[s].texture != AssetId::NONE && !self.object_normal(s)
+    }
+
     /// The uv set the tangent frame follows, 0 or 1, or [`Self::TANGENT_SET_OTHER`].
     pub fn tangent_set(&self) -> u8 {
-        let normal = self.textures[slot::NORMAL];
-        let coat = self.textures[slot::COAT_NORMAL];
-        let map = if normal.texture == AssetId::NONE && coat.texture != AssetId::NONE {
-            coat
-        } else {
-            normal
-        };
+        let map = [slot::NORMAL, slot::COAT_NORMAL]
+            .into_iter()
+            .find(|&s| self.tangent_map(s));
         match self.frame_uv {
-            Self::FRAME_NORMAL_MAP => map.uv_set & 1,
+            Self::FRAME_NORMAL_MAP => map.map_or(0, |s| self.textures[s].uv_set & 1),
             f => f - 1,
         }
     }
@@ -292,7 +310,8 @@ impl Default for Material {
             surface: 0,
             frame_uv: Self::FRAME_NORMAL_MAP,
             model: Self::MODEL_OPENPBR,
-            _pad: [0; 2],
+            object_normals: 0,
+            _pad: 0,
             textures: [TextureBinding::zeroed(); slot::COUNT],
             uv_transforms: [[0.0; 6]; slot::COUNT],
         }

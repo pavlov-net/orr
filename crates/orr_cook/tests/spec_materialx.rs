@@ -1856,24 +1856,66 @@ fn connection_cycles_fail() {
     }
 }
 
+/// `Version.cpp`, upgrading 1.38 `normalmap`: `space` `object` is `normalize(in * 2 - 1)`, with no
+/// `scale` and no tangent frame, so all three channels stand, flat or not.
 #[test]
-fn inputs_not_yet_honored_warn() {
-    let object = format!(
+fn an_object_space_normalmap_keeps_its_three_channels() {
+    let object = |scale: &str, input: &str| {
+        let body = format!(
+            r#"{COLOR}<normalmap name="n" type="vector3">
+              <input name="in" type="vector3" nodename="i"/>
+              <input name="scale" type="float" value="{scale}"/>
+              <input name="space" type="string" value="object"/></normalmap>"#
+        );
+        let inputs = format!(r#"<input name="{input}" type="vector3" nodename="n"/>"#);
+        cook_body(&body, &inputs).unwrap()
+    };
+    let (a, report) = object("0.25", "geometry_normal");
+    let m = material(&a);
+    assert_eq!(m.object_normals, Material::OBJECT_NORMAL);
+    assert!(bound(&m, slot::NORMAL));
+    assert!(report.assets[0].warnings.is_empty());
+    let hash = |a: &Archive, s: usize| {
+        let t = material(a).textures[s].texture;
+        a.find(t).unwrap().content_hash
+    };
+    let (b, _) = object("1", "geometry_normal");
+    assert_eq!(
+        hash(&a, slot::NORMAL),
+        hash(&b, slot::NORMAL),
+        "scale has no part"
+    );
+
+    let (c, _) = object("1", "geometry_coat_normal");
+    assert_eq!(material(&c).object_normals, Material::OBJECT_COAT_NORMAL);
+    assert!(bound(&material(&c), slot::COAT_NORMAL));
+
+    let tangent = format!(
         r#"{COLOR}<normalmap name="n" type="vector3">
+          <input name="in" type="vector3" nodename="i"/></normalmap>"#
+    );
+    let inputs = r#"<input name="geometry_normal" type="vector3" nodename="n"/>"#;
+    let (t, _) = cook_body(&tangent, inputs).unwrap();
+    assert_eq!(material(&t).object_normals, 0);
+    assert_ne!(hash(&t, slot::NORMAL), hash(&a, slot::NORMAL));
+
+    // One direction everywhere stays bound, in no more blocks than it needs.
+    let flat = format!(
+        r#"{FLAT3}<normalmap name="n" type="vector3">
           <input name="in" type="vector3" nodename="i"/>
           <input name="space" type="string" value="object"/></normalmap>"#
     );
-    let inputs = r#"<input name="geometry_normal" type="vector3" nodename="n"/>"#;
-    let (_, report) = cook_body(&object, inputs).unwrap();
-    assert!(
-        report.assets[0]
-            .warnings
-            .iter()
-            .any(|w| w.contains("space")),
-        "{:?}",
-        report.assets[0].warnings
-    );
+    let (f, _) = cook_body(&flat, inputs).unwrap();
+    let e = f.find(material(&f).textures[slot::NORMAL].texture).unwrap();
+    let head = &f.blobs(e)[0];
+    let mut bytes = vec![0; head.raw_len as usize];
+    f.read(head, &mut bytes).unwrap();
+    let info = orr_pack::texture::TextureInfo::parse(&bytes).unwrap();
+    assert_eq!(info.header.mip_size(0), [4, 4]);
+}
 
+#[test]
+fn inputs_not_yet_honored_warn() {
     let d = fixture();
     let doc = d.join("back.mtlx");
     std::fs::write(

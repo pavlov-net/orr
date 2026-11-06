@@ -545,6 +545,32 @@ fn library_meshes_without_tangents_compute_the_published_ones() {
     }
 }
 
+/// Maps of mesh space directions read no tangent frame, and neither map's uv set takes one.
+#[test]
+fn object_space_normal_maps_read_no_tangents() {
+    let (p, n, uv, _, idx) = tangent_quads::arrays();
+    let input = MeshInput {
+        positions: p.iter().map(|&p| p.into()).collect(),
+        normals: n.iter().map(|&n| n.into()).collect(),
+        uvs: Some(uv.iter().map(|&u| u.into()).collect()),
+        sections: vec![Span {
+            first: 0,
+            count: idx.len() as u32,
+        }],
+        indices: idx,
+        ..MeshInput::default()
+    };
+    let mut m = normal_mapped(0);
+    m.textures[slot::COAT_NORMAL].texture = AssetId::from_name("tex");
+    m.object_normals = Material::OBJECT_NORMAL | Material::OBJECT_COAT_NORMAL;
+    let (a, _) = library_cook("library-object-normals", input, vec![m]);
+    let blob = a.blobs(a.find(AssetId::from_name("m/mesh")).unwrap())[0];
+    let mut head = vec![0; blob.raw_len as usize];
+    a.read(&blob, &mut head).unwrap();
+    let info = MeshInfo::parse(&head).unwrap();
+    assert_eq!(info.header.attributes & mesh::MeshHeader::TANGENT, 0);
+}
+
 /// A plane with u along +x and v down y, and its second uv set turned to run along y.
 fn turned_sets() -> MeshInput {
     let z = Vec3::Z;
