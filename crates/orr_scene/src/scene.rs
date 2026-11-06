@@ -1500,7 +1500,8 @@ impl<'f> SceneWriter<'f> {
     }
 
     /// Sets the clock of the animated page placed at `range`, in seconds, on the timeline of its
-    /// skeleton clips. Copies of a page that holds still ignore it.
+    /// skeleton clips. Copies of a page that holds still ignore it. A clock that wraps reads as a
+    /// seek: the page can't know it loops, so its copies hold until the rows of the new time land.
     pub fn set_page_time(&mut self, range: InstanceRange, seconds: f32) {
         let cpu = &mut *self.scene.cpu.lock().unwrap();
         if let Some(m) = cpu.page_motions.iter_mut().find(|m| m.range == range) {
