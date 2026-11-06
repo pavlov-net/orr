@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::device::Shared;
 use super::diagnostics::unmarker;
+use super::load_reason;
 
 const WATCH_VULKAN: u32 = 0x2;
 const DEFER_DEBUG_INFO: u32 = 0x1;
@@ -170,14 +171,14 @@ fn load() -> Result<Library, String> {
     let path = root.join("lib").join("x64").join(file);
     // SAFETY: loading the Aftermath library, whose initializers have no preconditions.
     let lib = unsafe { libloading::Library::new(&path) }
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+        .map_err(|e| format!("{}: {}", path.display(), load_reason(&e)))?;
     /// SAFETY: `T` must be the symbol's signature in the Aftermath headers.
     unsafe fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Result<T, String> {
         let c = format!("{name}\0");
         // SAFETY: the caller's type is the symbol's.
         unsafe { lib.get::<T>(c.as_bytes()) }
             .map(|s| *s)
-            .map_err(|e| format!("{name}: {e}"))
+            .map_err(|e| format!("{name}: {}", load_reason(&e)))
     }
     // SAFETY: every field's type is its symbol's signature.
     unsafe {

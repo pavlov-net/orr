@@ -134,6 +134,7 @@ mod imp {
 
     use ash::vk::{self, Handle as _};
 
+    use super::super::load_reason;
     use crate::{COUNTER_METRICS, CounterRange, CounterReport, Error, QueueKind};
 
     #[allow(
@@ -202,12 +203,12 @@ mod imp {
                     libloading::os::windows::LOAD_WITH_ALTERED_SEARCH_PATH,
                 )
             }
-            .map_err(|e| format!("{path}: {e}"))?;
+            .map_err(|e| format!("{path}: {}", load_reason(&e)))?;
             let lib = libloading::Library::from(lib);
             // SAFETY: the export has this signature in every SDK release.
             let get = unsafe { lib.get::<GetProcAddress>(b"NVPA_GetProcAddress\0") }
                 .map(|s| *s)
-                .map_err(|e| format!("NVPA_GetProcAddress: {e}"))?;
+                .map_err(|e| format!("NVPA_GetProcAddress: {}", load_reason(&e)))?;
             let l = Library { _lib: lib, get };
             l.call(
                 c"NVPW_InitializeHost",

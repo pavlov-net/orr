@@ -31,6 +31,13 @@ use toolchain::SLANGC_OPTIONS;
 use std::path::{Path, PathBuf};
 use std::{env, io};
 
+/// libloading's own message names only the call that failed; the OS's reason is its source.
+fn load_reason(e: &libloading::Error) -> String {
+    use std::error::Error;
+    e.source()
+        .map_or_else(|| e.to_string(), |reason| format!("{e}: {reason}"))
+}
+
 /// A build failure.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -59,8 +66,9 @@ pub enum Error {
     /// The release's Slang library could not be loaded, or lacks a function of the release orr
     /// needs.
     #[error(
-        "cannot load the Slang library at {}: {source}; orr needs exactly {SLANG_VERSION} (run tools/fetch-slang.sh or point ORR_SLANGC at a {SLANG_VERSION} release)",
-        path.display()
+        "cannot load the Slang library at {}: {}; orr needs exactly {SLANG_VERSION} (run tools/fetch-slang.sh or point ORR_SLANGC at a {SLANG_VERSION} release)",
+        path.display(),
+        load_reason(source)
     )]
     LibraryLoad {
         path: PathBuf,

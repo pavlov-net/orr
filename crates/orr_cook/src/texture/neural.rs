@@ -601,7 +601,12 @@ mod libntc {
 
         fn load() -> Result<Lib, String> {
             let path = path();
-            let fail = |e: libloading::Error| format!("{}: {e} (set ORR_NTC_LIB)", path.display());
+            let fail = |e: libloading::Error| {
+                // libloading's own message names only the call that failed.
+                let reason = std::error::Error::source(&e)
+                    .map_or_else(|| e.to_string(), |reason| format!("{e}: {reason}"));
+                format!("{}: {reason} (set ORR_NTC_LIB)", path.display())
+            };
             // SAFETY: LibNTC's initializers have no preconditions.
             let lib = unsafe { libloading::Library::new(&path) }.map_err(fail)?;
             let get = |name: &str| -> Result<*const c_void, String> {

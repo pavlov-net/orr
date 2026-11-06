@@ -26,6 +26,13 @@ mod spirv;
 mod swapchain;
 mod texture;
 
+/// libloading's own message names only the call that failed; the OS's reason is its source.
+fn load_reason(e: &libloading::Error) -> String {
+    use std::error::Error;
+    e.source()
+        .map_or_else(|| e.to_string(), |reason| format!("{e}: {reason}"))
+}
+
 pub use accel::{ClassicAs, Micromap};
 pub use ash;
 pub use command::CommandList;
