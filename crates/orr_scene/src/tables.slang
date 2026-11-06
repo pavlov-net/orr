@@ -211,7 +211,7 @@ public struct RtCutGpu
 public struct PartGpu
 {
     public float3 bounds_min;
-    public uint sections;          // bit per section below 32
+    public uint sections;          // bit per section a mask can hide, below 16; bit 16 for those it can't
     public float3 bounds_max;
     public uint _pad;
 }
@@ -284,7 +284,7 @@ public struct MeshGpu
     public uint first_animated;    // the first animated part; animated parts follow it
     public uint animated_parts;    // 0: no part is animated
     public uint mask_count;
-    public uint animated_sections; // the sections of every animated part, bit per section below 32
+    public uint animated_sections; // the sections of every animated part, as `PartGpu.sections`
     public uint8_t* nodes;         // DAG mode: the Node table of a resident hierarchy, else null
     public uint8_t* node_table;    // DAG mode: the NodePage table of a paged hierarchy, else null
     public uint8_t* groups;        // DAG mode: the Group table
@@ -297,7 +297,7 @@ public struct MeshGpu
     public EditGpu* edit;          // an edit's mesh: what stays at level 0; its copies always gather their cut
     public uint* cut_stamps;       // per finer cut: the last frame it was reported in use, then wanted
     public uint fine_cuts;         // the first `fine_cuts` cached cuts need streamed pages: built once wanted, BLAS 0 until then
-    public uint _pad_cuts;
+    public uint section_count;     // sections of the mesh, which a model's cage sections follow
 }
 
 // What skinned copies of a MESH_SKIN mesh read: each cluster's place in a copy's vertex

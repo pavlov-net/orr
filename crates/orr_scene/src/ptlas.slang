@@ -73,7 +73,7 @@ public static const uint PTLAS_FIRST = 2;         // the first build: the persis
 public static const uint PART_BUMP = 0;           // part instances handed out from the pool
 public static const uint PART_RELEASED = 1;       // runs in `part_released`
 public static const uint PART_TOPS = 2;           // one free-list size per run class
-public static const uint PART_CLASSES = 9;        // runs of 1 to 256 part instances
+public static const uint PART_CLASSES = 17;       // runs of 1 to 65,536 part instances, a mesh's most
 public static const uint PART_STATE = PART_TOPS + PART_CLASSES;
 
 // `partition_state` bits.

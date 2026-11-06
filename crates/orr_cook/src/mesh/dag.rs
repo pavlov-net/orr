@@ -34,17 +34,17 @@ use super::{Built, ClusterData, Ctx, Grid, MeshSettings, store_page, write_page}
 
 /// Sections that share a stage: the cluster vertex limit, and the section itself when its
 /// borders dilate.
-type Class = (u16, Option<u8>);
+type Class = (u16, Option<u16>);
 
 /// A triangle corner: its welded vertex, grid position and section.
-type Corner = (u32, [i32; 3], u8);
+type Corner = (u32, [i32; 3], u16);
 
 /// One input to `clodBuild`: vertices referring to welded vertices, at grid positions, in
 /// sections.
 struct Input {
     welded: Vec<u32>,
     cells: Vec<[i32; 3]>,
-    sections: Vec<u8>,
+    sections: Vec<u16>,
     lock: Vec<u8>,
     indices: Vec<u32>,
 }
@@ -58,7 +58,7 @@ struct DagCluster {
     tris: Vec<u8>,
     /// The stage group whose simplification made the cluster; -1 for the stage's source.
     refined: i32,
-    section: u8,
+    section: u16,
 }
 
 struct DagGroup {
@@ -72,7 +72,7 @@ struct DagGroup {
 struct Stage {
     part: u16,
     /// The sections of the stage's class that have triangles, ascending.
-    sections: Vec<u8>,
+    sections: Vec<u16>,
     merged: bool,
     /// Error of the stage's source geometry: 0, or the merge error on a merged stage.
     base: f32,
@@ -112,7 +112,7 @@ fn stages(
     parts: &Parts,
     s: &MeshSettings,
     flags: &[u8],
-    limits: impl Fn(u8) -> Limits + Sync,
+    limits: impl Fn(u16) -> Limits + Sync,
     skinned: bool,
 ) -> Vec<Stage> {
     let _z = crate::profile::zone!("dag.stages");
@@ -121,18 +121,18 @@ fn stages(
         min: [0, 1, 2].map(|a| grid.cells.iter().map(|c| c[a]).min().unwrap_or(0)),
         max: [0, 1, 2].map(|a| grid.cells.iter().map(|c| c[a]).max().unwrap_or(0)),
     };
-    let options = |section: u8| Options {
+    let options = |section: u16| Options {
         limits: limits(section),
         dilate: s.dilate_double_sided && flags[usize::from(section)] & Section::DOUBLE_SIDED != 0,
         regularize: skinned,
     };
     // Sections that cluster alike share a stage. Border dilation moves each side of a
     // seam on its own, so a dilated section keeps a stage of its own.
-    let class = |section: u8| -> Class {
+    let class = |section: u16| -> Class {
         let o = options(section);
         (o.limits.max_vertices, o.dilate.then_some(section))
     };
-    let mut by_stage: BTreeMap<(u16, Class), (Vec<u8>, Vec<Corner>)> = BTreeMap::new();
+    let mut by_stage: BTreeMap<(u16, Class), (Vec<u16>, Vec<Corner>)> = BTreeMap::new();
     for p in lod::pieces(w, parts) {
         let (sections, corners) = by_stage.entry((p.part, class(p.section))).or_default();
         sections.push(p.section);
@@ -142,7 +142,7 @@ fn stages(
                 .map(|&v| (v, grid.cells[v as usize], p.section)),
         );
     }
-    let pieces: Vec<(u16, Vec<u8>, Vec<Corner>)> = by_stage
+    let pieces: Vec<(u16, Vec<u16>, Vec<Corner>)> = by_stage
         .into_iter()
         .map(|((part, _), (sections, corners))| (part, sections, corners))
         .collect();
@@ -169,7 +169,7 @@ fn stages(
         truncate(&mut st.groups, m);
     }
     // Each class's merged source: its parts' terminal clusters at their emitted positions.
-    let mut sources: BTreeMap<Class, (Vec<u8>, Vec<Corner>)> = BTreeMap::new();
+    let mut sources: BTreeMap<Class, (Vec<u16>, Vec<Corner>)> = BTreeMap::new();
     for st in &stages {
         let (sections, corners) = sources.entry(class(st.sections[0])).or_default();
         sections.extend(&st.sections);
@@ -182,7 +182,7 @@ fn stages(
             }
         }
     }
-    let sources: Vec<(Vec<u8>, Vec<Corner>)> = sources
+    let sources: Vec<(Vec<u16>, Vec<Corner>)> = sources
         .into_values()
         .filter(|s| !s.1.is_empty())
         .map(|(mut sections, corners)| {
@@ -249,7 +249,7 @@ fn borders<'a>(
     let shared = lod::shared_cells(stages.clone().map(|c| c.iter().map(|&(_, cell, _)| cell)));
     let mut seams = lod::seam_cells(w, stages.clone().flatten().map(|&(v, cell, _)| (v, cell)));
     for corners in stages {
-        let mut section_of: FxHashMap<[i32; 3], u8> = FxHashMap::default();
+        let mut section_of: FxHashMap<[i32; 3], u16> = FxHashMap::default();
         for &(_, cell, section) in corners {
             if *section_of.entry(cell).or_insert(section) != section {
                 seams.insert(cell);
@@ -263,7 +263,7 @@ fn borders<'a>(
 /// different keys never share a vertex.
 fn input<K: std::hash::Hash + Eq>(
     corners: &[Corner],
-    key: impl Fn(u32, [i32; 3], u8) -> K,
+    key: impl Fn(u32, [i32; 3], u16) -> K,
     shared: &FxHashSet<[i32; 3]>,
     seams: &FxHashSet<[i32; 3]>,
 ) -> Input {
@@ -376,7 +376,7 @@ fn partition_size(group_max: usize) -> usize {
 fn group_of(
     e: &super::clod::Emitted<'_>,
     welded: &[u32],
-    sections: &[u8],
+    sections: &[u16],
     snap: &Snap,
     max_indices: usize,
 ) -> DagGroup {
@@ -400,14 +400,14 @@ fn group_of(
         let tris = &local_triangles[..indices.len()];
         let section_of = |t: &[u8]| sections[local[usize::from(t[0])] as usize];
         // One cluster per section: a triangle's corners all lie in one section.
-        let mut pieces: Vec<(u8, Vec<u32>, Vec<u8>)> = Vec::new();
+        let mut pieces: Vec<(u16, Vec<u32>, Vec<u8>)> = Vec::new();
         if tris
             .chunks_exact(3)
             .all(|t| section_of(t) == section_of(tris))
         {
             pieces.push((section_of(tris), local.to_vec(), tris.to_vec()));
         } else {
-            let mut by_section: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
+            let mut by_section: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
             for t in tris.chunks_exact(3) {
                 by_section
                     .entry(section_of(t))
@@ -540,7 +540,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
     let s = cx.s;
     let flags: Vec<u8> = cx.sections.iter().map(|sec| sec.flags).collect();
     let header = size_of::<PageHeader>();
-    let limits = |section: u8| {
+    let limits = |section: u16| {
         let maxv = cx.max_vertices(flags[usize::from(section)]);
         let cluster_max =
             cluster_resident_len(usize::from(maxv), usize::from(s.max_triangles), cx.stride);

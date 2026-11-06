@@ -1880,7 +1880,7 @@ fn meshes_layout_places_each_mesh_and_keeps_shears() {
     // Sections in material order, with the second primitive's material first.
     let plain = mesh_of(&a, "g/mesh/1/mesh", 0);
     assert_eq!(plain.info.sections.len(), 2);
-    let tris = |s: u8| {
+    let tris = |s: u16| {
         plain
             .clusters
             .iter()

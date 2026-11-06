@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use orr_cook::{
     ArchiveSpec, AssetSpec, CageColor, CageInput, ColorValues, Corner, Crease, FaceVarying,
-    Manifest, Source, SubdSettings, Subdivision, UsdSettings,
+    Manifest, MeshInput, MeshSettings, Source, SubdSettings, Subdivision, UsdSettings,
 };
 use orr_gpu::{
     Blend, ClearColor, ColorAttachment, ColorLoad, ColorMask, ColorTarget, ComputePipeline, Device,
@@ -36,11 +36,12 @@ use orr_scene::testing::{
 };
 use orr_scene::{
     AffineRows, ClusterTopology, Frame, FrameDesc, FrameTime, GeneratedClusterGpu, GroupWriter,
-    Lens, LoadState, MaterialGpu, MaterialId, ModelId, MountId, Opacity, PackSource, ProducerBatch,
-    ProducerClusterGpu, ProducerDesc, ProducerId, ProducerStateGpu, ProducerStats, ProducerUpdate,
-    Projection, RasterView, RendererDesc, SceneDesc, SceneId, SceneWriter, Scenes, SubdDesc,
-    TessellationStats, TextureFilter, TransformGroupDesc, TransformGroupId, TransparencyPass,
-    ViewDesc, ViewHistoryId, VisibleCluster, material_flags, tessellation,
+    InstanceFlags, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, ModelId, MountId,
+    Opacity, PackSource, ProducerBatch, ProducerClusterGpu, ProducerDesc, ProducerId,
+    ProducerStateGpu, ProducerStats, ProducerUpdate, Projection, RasterView, RendererDesc,
+    SceneDesc, SceneId, SceneWriter, Scenes, SubdDesc, TessellationStats, TextureFilter,
+    TransformGroupDesc, TransformGroupId, TransparencyPass, ViewDesc, ViewHistoryId,
+    VisibleCluster, material_flags, tessellation,
 };
 use orr_shaders::bytemuck::Zeroable;
 use scene_suite::shaders::{
@@ -1899,7 +1900,73 @@ fn painted_cage() -> CageInput {
     c
 }
 
-/// The cages: `cages` (cage only), `painted` and the skinned `arm/Arm` from USD.
+/// Quads a side of the quilts: 15 x 20 in all, each its own section.
+const QUILT_COLUMNS: u32 = 15;
+const QUILT_ROWS: u32 = 20;
+const QUILT_SECTIONS: u32 = QUILT_COLUMNS * QUILT_ROWS;
+
+/// The corners of quilt quad `i`, 0.9 m wide in a 1 m cell, its columns running from x = 1 away
+/// from the origin along the sign `side`.
+fn quilt_quad(i: u32, side: f32) -> [Vec3; 4] {
+    let x = 1.05 + (i % QUILT_COLUMNS) as f32;
+    let y = 0.05 + (i / QUILT_COLUMNS) as f32 - QUILT_ROWS as f32 / 2.0;
+    [(0.0, 0.0), (0.9, 0.0), (0.9, 0.9), (0.0, 0.9)]
+        .map(|(a, b)| Vec3::new(side * (x + a), y + b, 0.0))
+}
+
+/// The quilt quad at `p`.
+fn quilt_at(p: Vec3) -> u32 {
+    let column = (p.x.abs() - 1.0).floor() as u32;
+    let row = (p.y + QUILT_ROWS as f32 / 2.0).floor() as u32;
+    row * QUILT_COLUMNS + column
+}
+
+/// The base color of quilt section `i`: a gray of its own, which working primaries keep.
+fn quilt_color(i: u32) -> [f32; 3] {
+    [(i + 1) as f32 / QUILT_SECTIONS as f32; 3]
+}
+
+fn quilt_materials() -> Vec<orr_pack::material::Material> {
+    (0..QUILT_SECTIONS)
+        .map(|i| orr_pack::material::Material {
+            base_color: quilt_color(i),
+            double_sided: 1,
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Quilt quads at negative x, one section each.
+fn quilt_mesh() -> MeshInput {
+    let mut m = MeshInput::default();
+    for i in 0..QUILT_SECTIONS {
+        let first = m.positions.len() as u32;
+        m.positions.extend(quilt_quad(i, -1.0));
+        m.normals.extend([Vec3::Z; 4]);
+        m.sections.push(orr_pack::Span {
+            first: m.indices.len() as u32,
+            count: 6,
+        });
+        m.indices.extend([0, 2, 1, 0, 3, 2].map(|k| first + k));
+    }
+    m
+}
+
+/// Quilt quads at positive x as a cage of lone faces, one section each.
+fn quilt_cage() -> CageInput {
+    let mut c = CageInput::default();
+    for i in 0..QUILT_SECTIONS {
+        let first = c.positions.len() as u32;
+        c.positions.extend(quilt_quad(i, 1.0));
+        c.face_counts.push(4);
+        c.face_indices.extend(first..first + 4);
+        c.face_sections.push(i as u16);
+    }
+    c
+}
+
+/// The cages: `cages` (cage only), `painted`, the skinned `arm/Arm` from USD, and a mesh and a
+/// cage past 256 sections, `quilt mesh` and `quilt cage`.
 fn cage_pack() -> &'static Arc<[u8]> {
     static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
     PACK.get_or_init(|| {
@@ -1927,6 +1994,22 @@ fn cage_pack() -> &'static Arc<[u8]> {
                         source: Source::Subd {
                             cage: painted_cage(),
                             materials: vec![material],
+                            settings: SubdSettings::default(),
+                        },
+                    },
+                    AssetSpec {
+                        name: "quilt mesh".into(),
+                        source: Source::Mesh {
+                            mesh: quilt_mesh(),
+                            materials: quilt_materials(),
+                            settings: MeshSettings::default(),
+                        },
+                    },
+                    AssetSpec {
+                        name: "quilt cage".into(),
+                        source: Source::Subd {
+                            cage: quilt_cage(),
+                            materials: quilt_materials(),
                             settings: SubdSettings::default(),
                         },
                     },
@@ -2710,6 +2793,77 @@ fn a_cage_carries_its_colors_across_a_crease_and_a_seam_to_what_the_raster_shows
         worst_shown < 1e-5,
         "{worst_shown} from the triangle's corners"
     );
+    assert_clean();
+}
+
+#[test]
+fn every_section_of_a_model_past_256_gives_its_hits_its_material() {
+    let mut s = CageScene::with(&RendererDesc {
+        dice_pixels: 2.0,
+        ..RendererDesc::default()
+    });
+    let (mesh, cage) = (s.model("quilt mesh"), s.model("quilt cage"));
+    let (eye, target) = (Vec3::new(0.0, 0.0, 23.0), Vec3::ZERO);
+    s.frame(
+        |w| {
+            let group = w
+                .create_transform_group(&TransformGroupDesc {
+                    count: 1,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::ZERO,
+                })
+                .unwrap();
+            w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+            w.add_instances(&InstancesDesc {
+                model: mesh,
+                copies: 1,
+                transforms: group,
+                first: 0,
+                pose: None,
+                material_set: None,
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 100.0,
+                animation_range: 0.0,
+                user_tag: 0,
+            })
+            .unwrap();
+            let desc = SubdDesc {
+                model: cage,
+                transform: (group, 0),
+                max_clusters: 16_384,
+                max_vertices: 16_384 * 78,
+                ..SubdDesc::default()
+            };
+            w.set_subd(SMOOTH, Some(&desc)).unwrap();
+        },
+        eye,
+        target,
+        target,
+    );
+    for _ in 0..2 {
+        s.frame(|_| {}, eye, target, target);
+    }
+    let view = s.frame(|_| {}, eye, target, target);
+    let seen = seen_colors(&view);
+    let sections = QUILT_SECTIONS as usize;
+    let mut shown = [vec![false; sections], vec![false; sections]];
+    for s in seen.iter().filter(|s| s.shown != 0) {
+        let p = Vec3::from(s.object);
+        let i = quilt_at(p);
+        let want = quilt_color(i);
+        let error = (0..3)
+            .map(|k| (s.base_color[k] - want[k]).abs())
+            .fold(0.0, f32::max);
+        assert!(error < 1e-3, "section {i} at {p} reads {:?}", s.base_color);
+        shown[s.shown as usize - 1][i as usize] = true;
+    }
+    for (kind, shown) in ["cage", "mesh"].iter().zip(&shown) {
+        let missed: Vec<usize> = (0..sections).filter(|&i| !shown[i]).collect();
+        assert!(
+            missed.is_empty(),
+            "{kind} sections {missed:?} show no pixel"
+        );
+    }
     assert_clean();
 }
 

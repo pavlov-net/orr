@@ -197,11 +197,11 @@ fn read_blob(a: &Archive, b: &orr_pack::Blob) -> Vec<u8> {
     v
 }
 
-type TriKey = (u8, [[u32; 3]; 3]);
+type TriKey = (u16, [[u32; 3]; 3]);
 
 /// A triangle keyed by its corner positions' bits, rotated so the smallest corner comes
 /// first (winding kept), and the rotation applied.
-fn key(section: u8, p: [[f32; 3]; 3]) -> (TriKey, usize) {
+fn key(section: u16, p: [[f32; 3]; 3]) -> (TriKey, usize) {
     let bits = p.map(|v| v.map(f32::to_bits));
     let r = (0..3).min_by_key(|&i| bits[i]).unwrap();
     (
@@ -312,7 +312,7 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
     for (s, p) in prims.iter().enumerate() {
         for t in p.idx.as_chunks::<3>().0 {
             let q = t.map(|i| snap(src[s][i as usize]));
-            let (k, r) = key(s as u8, q);
+            let (k, r) = key(s as u16, q);
             let rotated = [t[r], t[(r + 1) % 3], t[(r + 2) % 3]];
             assert!(expected.insert(k, (s, rotated)).is_none());
             let q = q.map(|v| Vec3::from(v).as_dvec3());
@@ -484,7 +484,7 @@ fn library_cook(name: &str, input: MeshInput, materials: Vec<Material>) -> (Arch
 }
 
 /// Section, position and tangent of every vertex of the library model.
-fn library_tangents(a: &Archive) -> Vec<(u8, Vec3, [f32; 4])> {
+fn library_tangents(a: &Archive) -> Vec<(u16, Vec3, [f32; 4])> {
     let e = a.find(AssetId::from_name("m/mesh")).unwrap();
     let blobs = a.blobs(e);
     let read = |b: &orr_pack::Blob| {

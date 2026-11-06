@@ -17,6 +17,7 @@ mod osd;
 
 use orr_math::{Vec2, Vec3, Vec4};
 use orr_pack::material::Material;
+use orr_pack::mesh::MAX_SECTIONS;
 use orr_pack::subd::{Influence, SubdInfo};
 use serde::Deserialize;
 
@@ -169,6 +170,11 @@ pub(crate) struct Cooked {
 
 /// Checks the cage against its section count.
 pub(crate) fn check(cage: &CageInput, sections: usize) -> Result<(), String> {
+    if sections > MAX_SECTIONS {
+        return Err(format!(
+            "{sections} sections, expected at most {MAX_SECTIONS}: a face names its section in a u16"
+        ));
+    }
     let n = cage.positions.len();
     if cage.face_counts.is_empty() {
         return Err("the cage has no faces".into());

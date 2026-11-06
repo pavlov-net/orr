@@ -106,7 +106,7 @@ void fill(uint3 id: SV_DispatchThreadID)
         out.user = 0;
         out.vertex_count = uint16_t(k.y);
         out.tri_count = uint8_t(k.w & 0xff);
-        out.material = uint8_t(k.w >> 8);
+        out.material = uint16_t(k.w >> 8);
         out.topology = uint16_t(DIRECT_CLUSTER);
         out._pad = 0;
         b.clusters[i] = out;

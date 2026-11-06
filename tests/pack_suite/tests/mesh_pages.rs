@@ -214,7 +214,7 @@ fn synthetic(rng: &mut Rng, clusters: usize, attr_stride: usize, entries: u32) -
             uv_offset: [0; 2].map(|_| [rng.float(-4.0, 4.0), rng.float(-4.0, 4.0)]),
             uv_scale: [0; 2].map(|_| [rng.float(0.01, 8.0), rng.float(0.01, 8.0)]),
             omm_first,
-            section: i as u8,
+            section: i as u16,
             area: rng.float(0.0, 10.0),
             ..bytemuck::Zeroable::zeroed()
         };

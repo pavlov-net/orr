@@ -60,8 +60,7 @@ public struct Cluster
     public uint16_t vertex_count;
     public uint8_t tri_count;
     public uint8_t alpha_first;
-    public uint8_t section;
-    public uint8_t _pad;
+    public uint16_t section;
     public uint8_t kind;
     public uint8_t flags;
     public uint16_t local_max[3];

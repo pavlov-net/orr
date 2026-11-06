@@ -251,7 +251,7 @@ fn cuts_cover_the_surface_once() {
     assert_eq!(d.info.roots[1], MeshHeader::NO_ROOT);
     let seam = |cut: Cut| {
         let flat = d.select(cut, |_| true);
-        let side = |s: u8| -> HashSet<[u32; 3]> {
+        let side = |s: u16| -> HashSet<[u32; 3]> {
             flat.iter()
                 .filter(|&&c| d.clusters[c].record.section == s)
                 .flat_map(|&c| d.clusters[c].tris.iter().flatten())

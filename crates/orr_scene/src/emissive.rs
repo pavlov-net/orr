@@ -10,7 +10,7 @@ use crate::material::MaterialId;
 /// Consecutive EMISSIVE clusters of one section at a model's finest level.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EmissiveSpan {
-    pub section: u8,
+    pub section: u16,
     /// Mesh cluster indices `first_cluster..first_cluster + cluster_count`.
     pub first_cluster: u32,
     pub cluster_count: u32,
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn spans_join_consecutive_emissive_clusters_of_one_section() {
-        let cluster = |section: u8, emissive: bool, area: f32| {
+        let cluster = |section: u16, emissive: bool, area: f32| {
             let mut c = Cluster::zeroed();
             c.section = section;
             c.flags = if emissive { Cluster::EMISSIVE } else { 0 };

@@ -1647,7 +1647,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                         edit: GpuPtr::NULL,
                         cut_stamps: GpuPtr::from_address(orr_gpu::GpuAddress(m.cut_stamps)),
                         fine_cuts: 0,
-                        _pad_cuts: 0,
+                        section_count: m.sections,
                     }
                 },
                 page_addresses,
@@ -2745,15 +2745,14 @@ impl Mounts {
             },
         )?;
 
-        // The source's model record says how many sections its roots hold; the merged stage
-        // would bypass what the edit pins. Part BLAS are gathered with the cut.
+        // The merged stage would bypass what the edit pins. Part BLAS are gathered with the cut.
         let gpu = MeshGpu {
             pages: table,
             cluster_base: base,
             merge_error: f32::INFINITY,
             root_count: src_gpu
                 .root_count
-                .min(src_gpu.part_count * src_model.section_count),
+                .min(src_gpu.part_count * src_gpu.section_count),
             level_count: src_gpu.level_count.min(1),
             rt_cuts: tables.rt_cut,
             rt_cut_count: 1,

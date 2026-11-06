@@ -40,6 +40,10 @@ pub const NODE_PAGE_MAX: usize = 64 << 10;
 /// Largest resident page.
 pub const PAGE_MAX: usize = 128 << 10;
 
+/// The most sections a mesh or a subdivision cage holds: [`Cluster::section`] and
+/// [`crate::subd::Face::section`] name one in a u16.
+pub const MAX_SECTIONS: usize = 1 << 16;
+
 /// Blob 0 header.
 ///
 /// Spans name tables in blob 0: `first` is the table's byte offset in the blob and `count`
@@ -267,8 +271,7 @@ pub struct Cluster {
     pub vertex_count: u16,
     pub tri_count: u8,
     pub alpha_first: u8,
-    pub section: u8,
-    pub _pad: u8,
+    pub section: u16,
     pub kind: u8,
     pub flags: u8,
     /// Rest AABB is `(anchor, anchor + local_max) x 2^k`.

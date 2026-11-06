@@ -398,14 +398,14 @@ void init(uint3 id: SV_DispatchThreadID)
             want_cut(s, cut, far_mesh, far_model.mesh, p.scale * l.scale[1], far_distance, l.threshold[1], 0);
         }
         if (raster)
-            raster_roots(s, cut, slot | COPY_FAR, far, far_model, far_mesh, p, far_sphere, l, 0);
+            raster_roots(s, cut, slot | COPY_FAR, far_mesh, p, far_sphere, l, 0);
     }
 
     if (mesh.level_count > 0)
     {
         if (raster)
         {
-            raster_roots(s, cut, slot, inst, model, mesh, p, sphere, l, 0);
+            raster_roots(s, cut, slot, mesh, p, sphere, l, 0);
             c.flags |= CUT_RASTER;
         }
         if (ray && l.level >= 0)
@@ -450,16 +450,16 @@ void init(uint3 id: SV_DispatchThreadID)
     cut.slots[slot] = c;
     uint mask = (raster ? 1 : 0) | (gather ? 2 : 0);
     if (mask != 0)
-        push_roots(s, cut, slot, inst, model, mesh, p, sphere, l, mask, 0);
+        push_roots(s, cut, slot, mesh, p, sphere, l, mask, 0);
 }
 
 // The raster candidates of slot copy `copy` (record `inst`): a discrete mesh's coarsest
 // level whose error stays under the threshold at the nearest point, or a DAG's roots.
-void raster_roots(SceneRoot* s, CutGpu* cut, uint copy, InstanceGpu inst, ModelGpu* model, MeshGpu* mesh, Placement p, float4 sphere, Lod l, uint flags)
+void raster_roots(SceneRoot* s, CutGpu* cut, uint copy, MeshGpu* mesh, Placement p, float4 sphere, Lod l, uint flags)
 {
     if (mesh.level_count == 0)
     {
-        push_roots(s, cut, copy, inst, model, mesh, p, sphere, l, 1, flags);
+        push_roots(s, cut, copy, mesh, p, sphere, l, 1, flags);
         return;
     }
     uint level = 0;
@@ -484,9 +484,9 @@ void raster_roots(SceneRoot* s, CutGpu* cut, uint copy, InstanceGpu inst, ModelG
 // Pushes the roots of the stage each cut in `mask` takes, for pass `root.pass`: the merged
 // stage when its error stays under the cut's threshold at the copy's nearest point, else the
 // part stage.
-void push_roots(SceneRoot* s, CutGpu* cut, uint slot, InstanceGpu inst, ModelGpu* model, MeshGpu* mesh, Placement p, float4 sphere, Lod l, uint mask, uint flags)
+void push_roots(SceneRoot* s, CutGpu* cut, uint slot, MeshGpu* mesh, Placement p, float4 sphere, Lod l, uint mask, uint flags)
 {
-    uint sections = model.section_count;
+    uint sections = mesh.section_count;
     uint part_roots = mesh.part_count * sections;
     bool has_merged = mesh.root_count > part_roots;
     uint merged = 0;
@@ -508,8 +508,8 @@ void push_roots(SceneRoot* s, CutGpu* cut, uint slot, InstanceGpu inst, ModelGpu
         NodeItem item;
         item.slot = slot;
         item.node = node;
-        item.flags = m | (part << 8) | (stage_merged ? 0x10000 : 0) | flags;
-        item._pad = 0;
+        item.flags = m | (stage_merged ? 0x10000 : 0) | flags;
+        item.part = part;
         push(cut, root.pass % 2, item);
     }
 }
@@ -675,7 +675,7 @@ void traverse(uint3 id: SV_DispatchThreadID)
     uint slot = copy_slot(copy);
     bool retry = (item.flags & WORK_RETRY) != 0;
     uint mask = item.flags & 3;
-    uint part = (item.flags >> 8) & 0xff;
+    uint part = item.part;
     bool merged = (item.flags & 0x10000) != 0;
     InstanceGpu inst = copy_record(s, copy);
     ModelGpu* model = s.models + inst.model;
@@ -813,14 +813,14 @@ void retry(uint3 id: SV_DispatchThreadID)
     MeshGpu* mesh = s.meshes + model.mesh;
     Lod l = slot_lod(s, inst, slot, c, true);
     if (mesh.level_count == 0)
-        push_roots(s, cut, slot, inst, model, mesh, p, model_sphere(model), l, mask, WORK_RETRY);
+        push_roots(s, cut, slot, mesh, p, model_sphere(model), l, mask, WORK_RETRY);
     else if ((mask & 1) != 0)
-        raster_roots(s, cut, slot, inst, model, mesh, p, model_sphere(model), l, WORK_RETRY);
+        raster_roots(s, cut, slot, mesh, p, model_sphere(model), l, WORK_RETRY);
     if ((mask & 1) != 0 && copy_fading(s, slot))
     {
         InstanceGpu far = copy_record(s, slot | COPY_FAR);
         ModelGpu* far_model = s.models + far.model;
-        raster_roots(s, cut, slot | COPY_FAR, far, far_model, s.meshes + far_model.mesh, p, model_sphere(far_model), l, WORK_RETRY);
+        raster_roots(s, cut, slot | COPY_FAR, s.meshes + far_model.mesh, p, model_sphere(far_model), l, WORK_RETRY);
     }
 }
 

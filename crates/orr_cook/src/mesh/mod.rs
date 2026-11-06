@@ -29,8 +29,8 @@ use meshopt::VertexDataAdapter;
 use orr_math::{Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{
-    Cluster, Level, MeshHeader, MeshInfo, OMM_ALIGN, PAGE_MAX, PageHeader, PageInfo, Part,
-    PartLevel, Section, oct_encode,
+    Cluster, Level, MAX_SECTIONS, MeshHeader, MeshInfo, OMM_ALIGN, PAGE_MAX, PageHeader, PageInfo,
+    Part, PartLevel, Section, oct_encode,
 };
 use orr_pack::{Aabb, AssetId, Hash32, Span, Sphere};
 use rayon::prelude::*;
@@ -788,7 +788,7 @@ impl Ctx<'_> {
     /// caller's to set.
     fn cluster(
         &self,
-        section: u8,
+        section: u16,
         part: u16,
         merged: bool,
         verts: &[u32],
@@ -883,7 +883,7 @@ impl Ctx<'_> {
 
 /// Discrete levels: pages of whole clusters of one level, coarsest level first.
 fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
-    let levels = lod::levels(cx.w, cx.grid, cx.parts, cx.s, errors, cx.sections.len());
+    let levels = lod::levels(cx.w, cx.grid, cx.parts, cx.s, errors);
     let level_count = levels.len();
     let part_count = cx.parts.table.len();
     let adapter = VertexDataAdapter::new(bytemuck::cast_slice(&cx.grid.floats), 12, 0)
@@ -1111,8 +1111,11 @@ pub(crate) fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
             s.deformation_bound
         ));
     }
-    if m.sections.is_empty() || m.sections.len() > 256 {
-        return Err(format!("{} sections, expected 1 to 256", m.sections.len()));
+    if m.sections.is_empty() || m.sections.len() > MAX_SECTIONS {
+        return Err(format!(
+            "{} sections, expected 1 to {MAX_SECTIONS}: a cluster names its section in a u16",
+            m.sections.len()
+        ));
     }
     for sec in &m.sections {
         let r = &sec.indices;

@@ -76,8 +76,8 @@ public struct NodeItem
 {
     public uint slot;
     public uint node;
-    public uint flags;             // cuts it is entered for (1 raster, 2 ray tracing), WORK_RETRY, part << 8
-    public uint _pad;
+    public uint flags;             // cuts it is entered for (1 raster, 2 ray tracing), 0x10000 for a merged stage, WORK_RETRY
+    public uint part;              // the stage's part; 0 in a merged stage
 }
 
 // One cluster BLAS built this frame: `count` CLAS addresses at `first` in `CutGpu.clas`.

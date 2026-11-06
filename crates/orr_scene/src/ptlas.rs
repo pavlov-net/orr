@@ -34,8 +34,8 @@ const DISTANCE_BUCKETS: u32 = 64;
 const COUNTERS: usize = 17;
 const PTLAS_REBASE: u32 = 1;
 const PTLAS_FIRST: u32 = 2;
-const PART_STATE: u32 = 11;
-const PART_CLASSES: u32 = 9;
+const PART_STATE: u32 = 19;
+const PART_CLASSES: u32 = 17;
 
 /// `PtlasGpu.counters` read back for [`RtStats`].
 const COUNTER_WRITES: usize = 0;

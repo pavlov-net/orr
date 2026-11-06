@@ -1,5 +1,5 @@
-// Per pixel, the vertex color stream of what the raster shows of producer entries, and the
-// batch vertices and barycentrics of the triangle it hit.
+// Per pixel, the base color of what the raster shows and where on it; of producer entries also
+// the vertex color stream and the batch vertices and barycentrics of the triangle it hit.
 #include "orr_root.h"
 import orr_scene.hit;
 import orr_scene.producer;
@@ -9,8 +9,10 @@ struct Seen
 {
     float4 color;
     uint3 corners;
-    uint shown;     // 1 where the raster shows a producer cluster
+    uint shown;     // 1 where the raster shows a producer cluster, 2 a mesh's
     float2 barycentrics;
+    float3 base_color;
+    float3 object;
 }
 
 struct Root
@@ -37,10 +39,13 @@ void main(uint3 id: SV_DispatchThreadID)
     if (w != 0)
     {
         VisibleCluster vc = root.gbuffer.clusters[visibility_cluster(w)];
+        float2 pixel = float2(id.x % extent.x, id.x / extent.x) + 0.5;
+        PrimaryHit p = primary_hit(s, v, vc, visibility_triangle(w), pixel);
+        o.base_color = s.materials[p.input.material].base_color;
+        o.object = p.object;
+        o.shown = 2;
         if (visible_producer(s, vc, entry))
         {
-            float2 pixel = float2(id.x % extent.x, id.x / extent.x) + 0.5;
-            PrimaryHit p = primary_hit(s, v, vc, visibility_triangle(w), pixel);
             ProducerClusterGpu k = s.batches[entry].clusters[vc.cluster];
             o.color = p.input.vertex_color;
             o.corners = cluster_corners(k, visibility_triangle(w)) + k.first_vertex;

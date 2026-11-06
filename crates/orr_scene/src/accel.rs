@@ -89,7 +89,7 @@ pub(crate) struct ClusterInfo {
     local: u32,
     pub(crate) vertex_count: u32,
     pub(crate) tri_count: u32,
-    pub(crate) section: u8,
+    pub(crate) section: u16,
     part: u16,
     pub(crate) flags: u8,
     pub(crate) micromap: bool,
@@ -204,7 +204,7 @@ impl Animated {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MeshRt {
     pub(crate) clas: Vec<u64>,
-    sections: Vec<u8>,
+    sections: Vec<u16>,
     animated: Vec<bool>,
     pub(crate) cuts: Vec<Vec<u32>>,
     /// Per cut: it has animated part clusters, so its body BLAS differs from its rest one.
@@ -1138,10 +1138,8 @@ fn part_records(m: &MeshInput<'_>, animated: Animated) -> Vec<PartGpu> {
         })
         .collect();
     for c in m.clusters {
-        if let Some(j) = animated.index(c)
-            && c.section < 32
-        {
-            out[j].sections |= 1 << c.section;
+        if let Some(j) = animated.index(c) {
+            out[j].sections |= 1 << c.section.min(16);
         }
     }
     out

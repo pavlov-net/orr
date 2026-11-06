@@ -37,9 +37,9 @@ public struct ProducerClusterGpu
     public uint user;            // the producer's word for this cluster
     public uint16_t vertex_count;
     public uint8_t tri_count;
-    public uint8_t material;     // index in the entry's materials
+    public uint8_t _pad;
+    public uint16_t material;    // index in the entry's materials
     public uint16_t topology;    // or DIRECT_CLUSTER
-    public uint16_t _pad;
 }
 
 // A producer entry's batch. Counts reset to 0 before scene compute each frame for
@@ -180,7 +180,7 @@ public uint emit_template_cluster(ProducerBatch b, uint topology, uint first_ver
     c.user = user;
     c.tri_count = uint8_t(t.tri_count);
     c.vertex_count = uint16_t(t.vertex_count);
-    c.material = uint8_t(material);
+    c.material = uint16_t(material);
     c.topology = uint16_t(topology);
     c._pad = 0;
     return emit(b, c);
@@ -197,7 +197,7 @@ public uint emit_direct_cluster(ProducerBatch b, uint tri_count, uint vertex_cou
     c.user = user;
     c.tri_count = uint8_t(tri_count);
     c.vertex_count = uint16_t(vertex_count);
-    c.material = uint8_t(material);
+    c.material = uint16_t(material);
     c.topology = uint16_t(DIRECT_CLUSTER);
     c._pad = 0;
     return emit(b, c);

@@ -30,6 +30,7 @@ use crate::subd::{CageShape, SubdBuild};
 use crate::tessellate::{EntryTess, Layout, PATTERNS, Patterns, TessellationStats};
 use crate::{ProducerBatch, ProducerClusterGpu, ProducerGpu, Result, SceneRoot, TopologyGpu};
 use bytemuck::Zeroable;
+use orr_pack::mesh::MAX_SECTIONS;
 
 /// `producer_build.slang` `BUILD_*`.
 const BUILD_TEMPLATES: u64 = 0;
@@ -167,7 +168,7 @@ pub struct ProducerDesc<'a> {
     /// counts here over the placement's smallest scale.
     pub displacement_reach: f32,
     pub opacity: Opacity,
-    /// Indexed by each cluster's material; at most 256.
+    /// Indexed by each cluster's material, a u16; at most [`MAX_SECTIONS`].
     pub materials: &'a [MaterialId],
     /// Group and index of the transform the batch's positions are relative to.
     pub transform: (TransformGroupId, u32),
@@ -459,8 +460,8 @@ pub(crate) fn build(
         desc.topologies.len()
     );
     assert!(
-        desc.materials.len() <= 256,
-        "{} materials; at most 256",
+        desc.materials.len() <= MAX_SECTIONS,
+        "{} materials; at most {MAX_SECTIONS}",
         desc.materials.len()
     );
     let strands = desc.max_segments > 0;

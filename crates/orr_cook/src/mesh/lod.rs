@@ -1,5 +1,7 @@
 //! Welding, part assignment and the discrete levels of a mesh.
 
+use std::collections::BTreeMap;
+
 use meshopt::{SimplifyOptions, SimplifyVertex, VertexDataAdapter, VertexStream};
 use orr_pack::Aabb;
 use orr_pack::mesh::Part;
@@ -201,7 +203,7 @@ impl Parts {
 #[derive(Clone)]
 pub(crate) struct Piece {
     pub(super) part: u16,
-    pub(super) section: u8,
+    pub(super) section: u16,
     pub(super) merged: bool,
     pub(super) indices: Vec<u32>,
 }
@@ -219,7 +221,6 @@ pub(crate) fn levels(
     parts: &Parts,
     s: &MeshSettings,
     errors: &[f32],
-    sections: usize,
 ) -> Vec<LevelGeometry> {
     let adapter = VertexDataAdapter::new(bytemuck::cast_slice(&grid.floats), 12, 0)
         .expect("positions are 12-byte vertices");
@@ -238,20 +239,17 @@ pub(crate) fn levels(
         let prev = out.last().expect("level 0");
         let merged = mergeable && s.merge_level.is_some_and(|l| level >= usize::from(l));
         let input: Vec<Piece> = if merged && !prev.pieces.iter().any(|p| p.merged) {
-            (0..sections as u8)
-                .filter_map(|section| {
-                    let indices: Vec<u32> = prev
-                        .pieces
-                        .iter()
-                        .filter(|p| p.section == section)
-                        .flat_map(|p| p.indices.iter().copied())
-                        .collect();
-                    (!indices.is_empty()).then_some(Piece {
-                        part: 0,
-                        section,
-                        merged: true,
-                        indices,
-                    })
+            let mut by_section: BTreeMap<u16, Vec<u32>> = BTreeMap::new();
+            for p in prev.pieces.iter().filter(|p| !p.indices.is_empty()) {
+                by_section.entry(p.section).or_default().extend(&p.indices);
+            }
+            by_section
+                .into_iter()
+                .map(|(section, indices)| Piece {
+                    part: 0,
+                    section,
+                    merged: true,
+                    indices,
                 })
                 .collect()
         } else {
@@ -279,11 +277,11 @@ pub(crate) fn levels(
 
 /// The triangles of each (part, section), sorted by part, then section.
 pub(crate) fn pieces(w: &Welded, parts: &Parts) -> Vec<Piece> {
-    let mut by_key: std::collections::BTreeMap<(u16, u8), Vec<u32>> = Default::default();
+    let mut by_key: BTreeMap<(u16, u16), Vec<u32>> = Default::default();
     for (sec, r) in w.sections.iter().enumerate() {
         for t in r.start / 3..r.end / 3 {
             by_key
-                .entry((parts.of_triangle[t], sec as u8))
+                .entry((parts.of_triangle[t], sec as u16))
                 .or_default()
                 .extend_from_slice(&w.indices[3 * t..3 * t + 3]);
         }
