@@ -31,11 +31,14 @@
 //! the image reads its `default`. A raw `<` in an attribute reads as the specification's own
 //! filenames have it, though XML would have it escaped.
 //!
-//! An `xi:include` adds the children of the root of the document it names, read before the
-//! including document, so that the first of two like-named elements wins, as in the MaterialX
-//! library. Root attributes an included document leaves out come from the document including
-//! it. A `namespace` qualifies the names of its scope: references within it and to the global
-//! namespace need no qualifier, others name `namespace:element`, and so may the material.
+//! A scope holds one list of names: the first of two elements of one name wins, whatever their
+//! categories, as in the MaterialX library. An `xi:include` among the root's children adds the
+//! children of the root of the document it names, read before the including document. Its
+//! `xi:fallback` stands where it stood, reading what it includes first; an include anywhere else
+//! reads nothing and warns, as the library reads nothing there. Root attributes an included
+//! document leaves out come from the document including it. A `namespace` qualifies the names of
+//! its scope: references within it and to the global namespace need no qualifier, others name
+//! `namespace:element`, and so may the material.
 //!
 //! Not honored yet, and reported as warnings: a `backsurfaceshader` other than the
 //! `surfaceshader`, and a `normalmap` `space` of `object` from 1.38 documents, which reads as
@@ -105,6 +108,36 @@ fn is_xinclude(e: &XmlNode<'_, '_>, name: &str) -> bool {
     e.tag_name().namespace() == Some(XINCLUDE) && e.tag_name().name() == name
 }
 
+/// The `xi:fallback` an include reads when its document can't be read.
+fn fallback_of<'a, 't>(include: &XmlNode<'a, 't>) -> Option<XmlNode<'a, 't>> {
+    include.children().find(|c| is_xinclude(c, "fallback"))
+}
+
+/// The include whose fallback holds `e`.
+fn outer_include<'a, 't>(e: &XmlNode<'a, 't>) -> Option<XmlNode<'a, 't>> {
+    let fallback = e.parent_element().filter(|p| is_xinclude(p, "fallback"))?;
+    let include = fallback.parent_element()?;
+    (is_xinclude(&include, "include") && fallback_of(&include) == Some(fallback)).then_some(include)
+}
+
+/// Whether include `e` stands among the children of `root`, or in the fallback of one that does.
+fn in_place<'a, 't>(e: &XmlNode<'a, 't>, root: &XmlNode<'a, 't>) -> bool {
+    e.parent_element().as_ref() == Some(root)
+        || outer_include(e).is_some_and(|outer| in_place(&outer, root))
+}
+
+/// The elements under `parent`, the first of each name.
+fn first_named<'a, 't>(parent: XmlNode<'a, 't>) -> impl Iterator<Item = XmlNode<'a, 't>> {
+    let mut names = HashSet::new();
+    parent
+        .children()
+        .filter(XmlNode::is_element)
+        .filter(move |e| {
+            let name = e.attribute("name").unwrap_or_default();
+            name.is_empty() || names.insert(name)
+        })
+}
+
 pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> Result<Scene> {
     let fail = |message: String| Error::Import {
         asset: asset.into(),
@@ -117,6 +150,7 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         open: Vec::new(),
         seen: HashSet::new(),
         files: Vec::new(),
+        warnings: Vec::new(),
     };
     reader.read(path, None).map_err(|e| match e {
         Failure::Read(e) => e,
@@ -125,14 +159,11 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
     let docs = reader
         .texts
         .iter()
-        .enumerate()
-        .map(|(i, t)| {
+        .map(|t| {
             Ok(Doc {
                 doc: Document::parse(&t.text).map_err(|e| fail(e.to_string()))?,
                 dir: t.path.parent().unwrap_or(Path::new("")),
                 parent: t.parent,
-                fallbacks: &t.fallbacks,
-                read_at: reader.order.iter().position(|&d| d == i),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -211,7 +242,8 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
     };
     let mapped = shading::map(&graph.net, graph.surface, graph.displacement, &mut host)
         .map_err(|m| fail(format!("material {material}: {m}")))?;
-    let mut warnings = graph.warnings;
+    let mut warnings = reader.warnings;
+    warnings.extend(graph.warnings);
     warnings.extend(past);
     warnings.extend(mapped.warnings);
     Ok(Scene {
@@ -248,8 +280,14 @@ struct Text {
     text: String,
     /// The document that first included it.
     parent: Option<usize>,
-    /// `xi:fallback` elements taking the place of includes that could not be read.
-    fallbacks: Vec<NodeId>,
+}
+
+/// What is read at one place in the order: the children of a document's root, or of an
+/// `xi:fallback` of it taking the place of an include that could not be read.
+#[derive(Clone, Copy)]
+struct Part {
+    doc: usize,
+    fallback: Option<NodeId>,
 }
 
 /// An `xi:include` of a document.
@@ -266,21 +304,28 @@ struct Doc<'t> {
     doc: Document<'t>,
     dir: &'t Path,
     parent: Option<usize>,
-    fallbacks: &'t [NodeId],
-    /// Its place in the order documents are read.
-    read_at: Option<usize>,
+}
+
+impl<'t> Doc<'t> {
+    /// The elements under the root, or under `fallback`.
+    fn children(&self, fallback: Option<NodeId>) -> impl Iterator<Item = XmlNode<'_, 't>> {
+        let root = self.doc.root_element();
+        let parent = fallback.and_then(|f| self.doc.get_node(f)).unwrap_or(root);
+        parent.children().filter(XmlNode::is_element)
+    }
 }
 
 /// Reads a document and all it includes.
 struct Reader<'a> {
     memo: &'a Memo,
     texts: Vec<Text>,
-    /// Indices of `texts`, each after those it includes.
-    order: Vec<usize>,
+    /// What each of `texts` reads, each after what it includes.
+    order: Vec<Part>,
     /// The chain of includes being read.
     open: Vec<PathBuf>,
     seen: HashSet<PathBuf>,
     files: Vec<FileInput>,
+    warnings: Vec<String>,
 }
 
 impl Reader<'_> {
@@ -319,18 +364,22 @@ impl Reader<'_> {
         }
         let doc = Document::parse(&text).map_err(|e| in_file(&e))?;
         let mut includes: Vec<Include> = Vec::new();
+        let root = doc.root_element();
         for e in doc.descendants().filter(|e| is_xinclude(e, "include")) {
+            if !in_place(&e, &root) {
+                self.warnings.push(in_file(
+                    &"an xi:include below the root's children reads nothing",
+                ));
+                continue;
+            }
             let href = e
                 .attribute("href")
                 .ok_or_else(|| in_file(&"xi:include without an href"))?;
-            let outer = e.ancestors().skip(1).find(|a| is_xinclude(a, "include"));
+            let outer = outer_include(&e);
             includes.push(Include {
                 id: e.id(),
                 href: href.to_string(),
-                fallback: e
-                    .children()
-                    .find(|c| is_xinclude(c, "fallback"))
-                    .map(|f| f.id()),
+                fallback: fallback_of(&e).map(|f| f.id()),
                 within: outer.and_then(|o| includes.iter().position(|i| i.id == o.id())),
             });
         }
@@ -341,17 +390,33 @@ impl Reader<'_> {
             key: key.clone(),
             text,
             parent,
-            fallbacks: Vec::new(),
         });
         self.open.push(key);
         let dir = path.parent().unwrap_or(Path::new(""));
-        let mut fell_back = vec![false; includes.len()];
-        let mut result = Ok(());
+        let result = self.includes(id, dir, &includes, None);
+        self.open.pop();
+        self.order.push(Part {
+            doc: id,
+            fallback: None,
+        });
+        result
+    }
+
+    /// Reads the includes of document `id` that stand in the fallback of include `within`, or
+    /// at its root.
+    fn includes(
+        &mut self,
+        id: usize,
+        dir: &Path,
+        includes: &[Include],
+        within: Option<usize>,
+    ) -> std::result::Result<(), Failure> {
         for (i, include) in includes.iter().enumerate() {
-            if include.within.is_some_and(|w| !fell_back[w]) {
+            if include.within != within {
                 continue;
             }
-            let (texts, order) = (self.texts.len(), self.order.len());
+            let (texts, order, warnings) =
+                (self.texts.len(), self.order.len(), self.warnings.len());
             match (
                 self.read(&dir.join(&include.href), Some(id)),
                 include.fallback,
@@ -360,22 +425,20 @@ impl Reader<'_> {
                     // What the failed include read is not part of the document, though
                     // another include may yet bring it in.
                     self.order.truncate(order);
+                    self.warnings.truncate(warnings);
                     for t in self.texts.drain(texts..) {
                         self.seen.remove(&t.key);
                     }
-                    self.texts[id].fallbacks.push(f);
-                    fell_back[i] = true;
+                    self.includes(id, dir, includes, Some(i))?;
+                    self.order.push(Part {
+                        doc: id,
+                        fallback: Some(f),
+                    });
                 }
-                (Err(e), _) => {
-                    result = Err(e);
-                    break;
-                }
-                (Ok(()), _) => {}
+                (result, _) => result?,
             }
         }
-        self.open.pop();
-        self.order.push(id);
-        result
+        Ok(())
     }
 }
 
@@ -487,7 +550,7 @@ impl<'a> Units<'a> {
     /// a number defines nothing, so it fails only a material that reads the unit.
     fn define(&mut self, e: &XmlNode<'a, '_>) {
         let unit_type = e.attribute("unittype").unwrap_or_default();
-        for u in e.children().filter(|c| c.tag_name().name() == "unit") {
+        for u in first_named(*e).filter(|c| c.tag_name().name() == "unit") {
             let name = u.attribute("name").unwrap_or_default();
             if let Ok(scale) = u.attribute("scale").map_or(Ok(1.0), str::parse::<f64>) {
                 self.scales.entry((unit_type, name)).or_insert(scale);
@@ -498,7 +561,7 @@ impl<'a> Units<'a> {
     /// Adds what a `nodedef` declares; the first declaration of an input stands.
     fn declare(&mut self, e: &XmlNode<'a, '_>) {
         let node = e.attribute("node").unwrap_or_default();
-        for i in e.children().filter(|c| c.tag_name().name() == "input") {
+        for i in first_named(*e).filter(|c| c.tag_name().name() == "input") {
             let name = i.attribute("name").unwrap_or_default();
             let units = (stated(&i, "unittype"), stated(&i, "unit"));
             if units != (None, None) {
@@ -548,6 +611,9 @@ struct Graph {
     warnings: Vec<String>,
 }
 
+/// The nodedefs read, each by its name and by its qualified name; the first read of a name stands.
+type Nodedefs<'a, 't> = HashMap<String, XmlNode<'a, 't>>;
+
 /// A filename with its substitutions made, or as it stands, with why it can't be resolved.
 type FileName = std::result::Result<String, (String, String)>;
 
@@ -559,7 +625,7 @@ type Load<'a> = dyn FnMut(&Path, FileName, Layer) -> usize + 'a;
 /// `order`.
 fn network(
     docs: &[Doc<'_>],
-    order: &[usize],
+    order: &[Part],
     material: &str,
     load: &mut Load<'_>,
 ) -> std::result::Result<Graph, String> {
@@ -568,6 +634,7 @@ fn network(
     let mut index: HashMap<(String, String), usize> = HashMap::new();
     let mut elements = Vec::new();
     let mut graphs = HashMap::new();
+    let mut nodedefs = Nodedefs::new();
     let mut units = Units::default();
     for &(unit_type, unit, scale) in UNITS {
         units.scales.insert((unit_type, unit), scale);
@@ -581,7 +648,9 @@ fn network(
             elements.push((graph.to_string(), n, d));
         }
     };
-    for &d in order {
+    // The top level holds one list of names, whatever the elements' categories.
+    let mut names = HashSet::new();
+    for &Part { doc: d, fallback } in order {
         let root = docs[d].doc.root_element();
         if root.tag_name().name() != "materialx" {
             return Err(format!(
@@ -589,26 +658,27 @@ fn network(
                 root.tag_name().name()
             ));
         }
-        let fallbacks = docs[d]
-            .fallbacks
-            .iter()
-            .filter_map(|&f| docs[d].doc.get_node(f))
-            .flat_map(|f| f.children());
-        for e in fallbacks.chain(root.children()).filter(XmlNode::is_element) {
+        for e in docs[d].children(fallback) {
             let name = e.attribute("name").unwrap_or_default();
             let full_name = qualified(inherited(docs, d, &e, "namespace"), name);
+            if !name.is_empty() && !names.insert(full_name.clone()) {
+                continue;
+            }
             match e.tag_name().name() {
-                "nodegraph" => {
-                    if let Entry::Vacant(v) = graphs.entry(full_name.clone()) {
-                        v.insert((e, d));
-                        for n in e.children().filter(is_node) {
-                            let name = n.attribute("name").unwrap_or_default().to_string();
-                            add(&full_name, name, n, d);
-                        }
+                // Graph "" is the top level, so a graph with no name holds nothing to read.
+                "nodegraph" if !name.is_empty() => {
+                    graphs.insert(full_name.clone(), (e, d));
+                    for n in first_named(e).filter(is_node) {
+                        let name = n.attribute("name").unwrap_or_default().to_string();
+                        add(&full_name, name, n, d);
                     }
                 }
                 "unitdef" => units.define(&e),
-                "nodedef" => units.declare(&e),
+                "nodedef" => {
+                    units.declare(&e);
+                    nodedefs.entry(name.to_string()).or_insert(e);
+                    nodedefs.entry(full_name).or_insert(e);
+                }
                 "geompropdef" if e.attribute("geomprop") == Some("texcoord") => {
                     let set = e.attribute("index").map_or(Some(0), |i| i.parse().ok());
                     if let Some(set) = set {
@@ -649,8 +719,7 @@ fn network(
                 .get_key_value(&key)
                 .or_else(|| graphs.get_key_value(g))
                 .ok_or_else(|| format!("no nodegraph {g}"))?;
-            let outputs: Vec<_> = ge
-                .children()
+            let outputs: Vec<_> = first_named(*ge)
                 .filter(|o| o.tag_name().name() == "output")
                 .collect();
             let out = match outputs[..] {
@@ -708,14 +777,13 @@ fn network(
         }
         let (graph, e, d) = &elements[n];
         let mut inputs = BTreeMap::new();
-        for i in e.children().filter(|c| c.tag_name().name() == "input") {
+        for i in first_named(*e).filter(|c| c.tag_name().name() == "input") {
             let input_name = i.attribute("name").unwrap_or_default().to_string();
             // Inside a graph, an interface name reads the graph's own input.
             let source = match (i.attribute("interfacename"), graph.as_str()) {
                 (Some(iface), g) if !g.is_empty() => {
                     let (ge, _) = graphs.get(g).ok_or_else(|| format!("no nodegraph {g}"))?;
-                    let gi = ge
-                        .children()
+                    let gi = first_named(*ge)
                         .find(|c| {
                             c.tag_name().name() == "input" && c.attribute("name") == Some(iface)
                         })
@@ -774,7 +842,9 @@ fn network(
             Some(Input::Text(l)) if !l.is_empty() => Layer::Named(l.clone()),
             _ => Layer::Implied,
         };
-        let mut image = file_input(docs, elements[*n].2, e, file, *unit, layer, load);
+        let d = elements[*n].2;
+        let name = file_name(docs, &nodedefs, d, e, file);
+        let mut image = file_input(docs, d, e, name, *unit, layer, load);
         // A colorspace is how the input reading the file decodes it, wherever the name comes from.
         if let (Input::Image { color_space, .. }, Some(own)) =
             (&mut image, f.2.attribute("colorspace"))
@@ -810,39 +880,18 @@ fn network(
     })
 }
 
-/// The nodedef `name` names, the first of those read. A name may state the namespace of its
-/// document.
-fn nodedef<'a, 't>(docs: &'a [Doc<'t>], name: &str) -> Option<XmlNode<'a, 't>> {
-    let is_it = |d: usize, c: &XmlNode<'a, 't>| {
-        c.tag_name().name() == "nodedef"
-            && c.attribute("name").is_some_and(|n| {
-                n == name || qualified(inherited(docs, d, c, "namespace"), n) == name
-            })
-    };
-    let in_doc = |d: usize| {
-        let fallbacks = docs[d]
-            .fallbacks
-            .iter()
-            .filter_map(|&f| docs[d].doc.get_node(f))
-            .flat_map(|f| f.children());
-        let root = docs[d].doc.root_element();
-        let def = fallbacks.chain(root.children()).find(|c| is_it(d, c))?;
-        Some((docs[d].read_at, def))
-    };
-    (0..docs.len())
-        .filter_map(in_doc)
-        .min_by_key(|found| found.0)
-        .map(|found| found.1)
-}
-
 /// The value of `token` for element `e`: a `token` holding it on the nearest scope, which may name
 /// one further out through `interfacename`, else the default of the nodedef a graph implements.
-fn interface_token(docs: &[Doc<'_>], e: &XmlNode<'_, '_>, token: &str) -> Option<String> {
+fn interface_token(
+    nodedefs: &Nodedefs<'_, '_>,
+    e: &XmlNode<'_, '_>,
+    token: &str,
+) -> Option<String> {
     let named = |scope: &XmlNode<'_, '_>, name: &str| {
         let is_it = |c: &XmlNode<'_, '_>| {
             c.tag_name().name() == "token" && c.attribute("name") == Some(name)
         };
-        scope.children().find(is_it).map(|t| {
+        first_named(*scope).find(is_it).map(|t| {
             (
                 t.attribute("value").map(str::to_string),
                 t.attribute("interfacename").map(str::to_string),
@@ -857,8 +906,8 @@ fn interface_token(docs: &[Doc<'_>], e: &XmlNode<'_, '_>, token: &str) -> Option
             }
             name = interface.unwrap_or(name);
         }
-        if let Some(def) = scope.attribute("nodedef").and_then(|n| nodedef(docs, n))
-            && let Some((Some(value), _)) = named(&def, &name)
+        if let Some(def) = scope.attribute("nodedef").and_then(|n| nodedefs.get(n))
+            && let Some((Some(value), _)) = named(def, &name)
         {
             return Some(value);
         }
@@ -869,7 +918,7 @@ fn interface_token(docs: &[Doc<'_>], e: &XmlNode<'_, '_>, token: &str) -> Option
 /// `file` with its substitutions made, all but the tile tokens each point picks from, or the
 /// reason one has no value.
 fn substituted(
-    docs: &[Doc<'_>],
+    nodedefs: &Nodedefs<'_, '_>,
     e: &XmlNode<'_, '_>,
     file: &str,
 ) -> std::result::Result<String, String> {
@@ -888,7 +937,7 @@ fn substituted(
         out.push_str(&rest[..at]);
         match close {
             ']' => {
-                let value = interface_token(docs, e, &whole[1..whole.len() - 1]);
+                let value = interface_token(nodedefs, e, &whole[1..whole.len() - 1]);
                 out.push_str(&value.ok_or_else(|| format!("{whole} has no value"))?);
             }
             '>' if tiles::tiled(whole) => out.push_str(whole),
@@ -900,21 +949,31 @@ fn substituted(
     Ok(out)
 }
 
-/// A filename value of element `e` in document `d`.
+/// The file a filename value of element `e` in document `d` names.
+fn file_name(
+    docs: &[Doc<'_>],
+    nodedefs: &Nodedefs<'_, '_>,
+    d: usize,
+    e: &XmlNode<'_, '_>,
+    file: &str,
+) -> FileName {
+    let prefix = inherited(docs, d, e, "fileprefix").unwrap_or_default();
+    let file = format!("{prefix}{file}");
+    substituted(nodedefs, e, &file).map_err(|why| (file, why))
+}
+
+/// The image of file `name`, read by element `e` in document `d`.
 fn file_input(
     docs: &[Doc<'_>],
     d: usize,
     e: &XmlNode<'_, '_>,
-    file: &str,
+    name: FileName,
     unit: Unit,
     layer: Layer,
     load: &mut Load<'_>,
 ) -> Input {
-    let prefix = inherited(docs, d, e, "fileprefix").unwrap_or_default();
-    let file = format!("{prefix}{file}");
-    let resolved = substituted(docs, e, &file).map_err(|why| (file, why));
     Input::Image {
-        image: load(docs[d].dir, resolved, layer),
+        image: load(docs[d].dir, name, layer),
         color_space: inherited(docs, d, e, "colorspace").map(str::to_string),
         unit,
     }

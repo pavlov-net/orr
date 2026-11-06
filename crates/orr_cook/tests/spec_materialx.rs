@@ -1264,6 +1264,158 @@ fn xinclude_fallbacks_stand_where_the_include_failed() {
     );
 }
 
+/// `XmlIo.cpp` `documentFromXml`: includes among the root's children read in order before the
+/// document, `importLibrary` and `elementFromXml` keep the first child of a name whatever its
+/// category, and an include anywhere else is skipped.
+#[test]
+fn xinclude_reads_as_the_library_does() {
+    let d = fixture();
+    let image = |file: &str| {
+        format!(
+            r#"<image name="shared" type="color3">
+            <input name="file" type="filename" value="{file}"/></image>"#
+        )
+    };
+    let lib = |file: &str, extra: &str| {
+        format!(
+            r#"<?xml version="1.0"?><materialx version="1.39">{extra}{}</materialx>"#,
+            image(file)
+        )
+    };
+    std::fs::write(d.join("v.mtlx"), lib("v.png", "")).unwrap();
+    std::fs::write(d.join("flipped.mtlx"), lib("flipped.png", "")).unwrap();
+    std::fs::write(
+        d.join("nested.mtlx"),
+        lib("flipped.png", r#"<xi:include href="v.mtlx"/>"#),
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("graph.mtlx"),
+        r#"<?xml version="1.0"?><materialx version="1.39">
+          <nodegraph name="shared"/></materialx>"#,
+    )
+    .unwrap();
+    let base = r#"<input name="base_color" type="color3" nodename="shared"/>"#;
+    let reads = |name: &str, body: &str| {
+        let (a, _) = cook(&write_doc(&d, name, "", body, base), "M").unwrap();
+        let t = material(&a).textures[slot::BASE_COLOR].texture;
+        a.find(t).unwrap().content_hash
+    };
+    let v = reads("one.mtlx", &image("v.png"));
+    let flipped = reads("two.mtlx", &image("flipped.png"));
+    assert_ne!(v, flipped);
+
+    let included_first = format!(r#"{}<xi:include href="v.mtlx"/>"#, image("flipped.png"));
+    assert_eq!(
+        reads("a.mtlx", &included_first),
+        v,
+        "an include wherever it stands"
+    );
+    let includes = r#"<xi:include href="flipped.mtlx"/><xi:include href="v.mtlx"/>"#;
+    assert_eq!(reads("b.mtlx", includes), flipped, "the first include");
+    let nested = r#"<xi:include href="nested.mtlx"/>"#;
+    assert_eq!(reads("c.mtlx", nested), v, "an include of an include");
+    let fallback = format!(
+        r#"<xi:include href="nope.mtlx"><xi:fallback>{}</xi:fallback></xi:include>
+        <xi:include href="v.mtlx"/>"#,
+        image("flipped.png")
+    );
+    assert_eq!(
+        reads("d.mtlx", &fallback),
+        flipped,
+        "a fallback stands where its include stood"
+    );
+    let within = format!(
+        r#"<xi:include href="nope.mtlx"><xi:fallback>{}<xi:include href="v.mtlx"/>
+        </xi:fallback></xi:include>"#,
+        image("flipped.png")
+    );
+    assert_eq!(
+        reads("e.mtlx", &within),
+        v,
+        "what a fallback includes reads before it"
+    );
+
+    let no_node = |name: &str, body: &str| {
+        let doc = write_doc(&d, name, "", body, base);
+        let e = cook(&doc, "M").err().expect("no such node");
+        assert!(e.to_string().contains("no node shared"), "{e}");
+    };
+    let graph = format!(r#"<xi:include href="graph.mtlx"/>{}"#, image("v.png"));
+    no_node("f.mtlx", &graph);
+    let below = r#"<nodegraph name="g"><xi:include href="v.mtlx"/></nodegraph>"#;
+    no_node("g.mtlx", below);
+    let stray = r#"<xi:fallback><xi:include href="v.mtlx"/></xi:fallback>"#;
+    no_node("h.mtlx", stray);
+    let beside = r#"<xi:include href="nope.mtlx"><xi:fallback/><xi:include href="v.mtlx"/>
+        </xi:include>"#;
+    no_node("i.mtlx", beside);
+    let second = r#"<xi:include href="nope.mtlx"><xi:fallback/>
+        <xi:fallback><xi:include href="v.mtlx"/></xi:fallback></xi:include>"#;
+    no_node("j.mtlx", second);
+    let in_graph = format!(
+        r#"<nodegraph name="g"><input name="shared" type="color3"/>{}
+        <output name="out" type="color3" nodename="shared"/></nodegraph>"#,
+        image("v.png")
+    );
+    let reads_graph = r#"<input name="base_color" type="color3" nodegraph="g"/>"#;
+    let e = cook(&write_doc(&d, "k.mtlx", "", &in_graph, reads_graph), "M");
+    let e = e.err().expect("a graph's input takes the name of its node");
+    assert!(e.to_string().contains("no node shared"), "{e}");
+
+    let nameless = format!(
+        r#"<nodegraph>{}</nodegraph>{}"#,
+        image("v.png"),
+        image("flipped.png")
+    );
+    assert_eq!(
+        reads("l.mtlx", &nameless),
+        flipped,
+        "a graph with no name adds nothing to the top level"
+    );
+    let inputs = r#"<image name="shared" type="color3">
+        <input name="file" type="filename" value="flipped.png"/>
+        <input name="file" type="filename" value="v.png"/></image>"#;
+    assert_eq!(reads("m.mtlx", inputs), flipped, "the first of two inputs");
+
+    let warnings = |name: &str, body: &str| {
+        let (_, report) = cook(&write_doc(&d, name, "", body, base), "M").unwrap();
+        report.assets[0].warnings.clone()
+    };
+    let unread = format!("{below}{}", image("v.png"));
+    let warned = warnings("n.mtlx", &unread);
+    assert!(
+        warned.iter().any(|w| w.contains("reads nothing")),
+        "{warned:?}"
+    );
+    std::fs::write(
+        d.join("failing.mtlx"),
+        format!(
+            r#"<?xml version="1.0"?><materialx version="1.39">{below}
+            <xi:include href="nope.mtlx"/></materialx>"#
+        ),
+    )
+    .unwrap();
+    let failed = format!(
+        r#"<xi:include href="failing.mtlx"><xi:fallback/></xi:include>{}"#,
+        image("v.png")
+    );
+    let warned = warnings("o.mtlx", &failed);
+    assert!(
+        !warned.iter().any(|w| w.contains("reads nothing")),
+        "a document a fallback replaced warns of nothing: {warned:?}"
+    );
+    let hidden = r#"<nodegraph name="ND_x"/>
+        <nodedef name="ND_x" node="x"><token name="at" type="string" value="v"/></nodedef>
+        <image name="shared" type="color3" nodedef="ND_x">
+        <input name="file" type="filename" value="[at].png"/></image>"#;
+    let warned = warnings("p.mtlx", hidden);
+    assert!(
+        warned.iter().any(|w| w.contains("[at]")),
+        "a nodedef a name hides states no token: {warned:?}"
+    );
+}
+
 /// Nodes `image`: `layer` is "the name of the layer to extract from a multi-layer input file", and
 /// `default` reads "if the specified layer does not exist in the file".
 #[test]
