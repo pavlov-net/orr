@@ -54,13 +54,13 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     ),
     (
         Class::Skeleton as u16,
-        1,
-        "0b6bfef8f4e4a920f5dff13d241bb708c3b88f133c49c61af81c530c45623c29",
+        2,
+        "fc0354c88262c2490c85a666dfce169baa14192124373bdad1c32f493363428f",
     ),
     (
         Class::Clip as u16,
-        1,
-        "517b3a610d36451309d0b6313cbda0b2339f05b2b247c3bcbfa0fd7880a15c44",
+        2,
+        "6ad26f11b39caeead765da2d904ec647c92edb6fac170a1e80dcdfdc8ea601f8",
     ),
     (
         Class::Volume as u16,

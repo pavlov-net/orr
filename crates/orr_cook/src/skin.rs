@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4, Mat3, Mat4, Quat, Vec3, Vec4};
+use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4, Mat3, Mat4, Quat, Vec4};
 use orr_pack::AssetId;
 use orr_pack::clip::{Clip, ClipHeader};
 use orr_pack::skeleton::{MAX_JOINTS, MAX_SKINNED_JOINTS, NO_PARENT, SkeletonInfo, Trs, slerp};
@@ -729,6 +729,7 @@ fn pose(info: &SkeletonInfo, channels: &[Channel], t: f64) -> Vec<Trs> {
             Property::Translation => p.translation = [v[0], v[1], v[2]],
             Property::Rotation => p.rotation = v,
             Property::Scale => p.scale = [v[0], v[1], v[2]],
+            Property::Shear => p.shear = [v[0], v[1], v[2]],
         }
     }
     pose
@@ -861,15 +862,28 @@ pub(crate) fn span(channels: &[Channel]) -> (f64, f64) {
     (f64::from(start), f64::from(end) - f64::from(start))
 }
 
-/// Translation distance (m) and rotation angle (degrees) between two transforms; the
-/// rotations are the frames of their linear parts, which a collapsed axis still completes.
+/// Translation distance (m) and rotation angle (degrees) between two transforms: the larger of
+/// the angle between the frames of their linear parts, which a collapsed axis still completes,
+/// and the angle between any axis and its counterpart, which shows a shear the frames don't.
 fn pose_error(a: &Affine3, b: &Affine3) -> (f32, f32) {
-    let rot = |m: &Affine3| Mat3::from_quat(scale_rotation(m.matrix3).1.normalize());
+    let rot = |m: &Affine3| {
+        let l = DMat3::from_cols_array(&m.matrix3.to_cols_array().map(f64::from));
+        Mat3::from_quat(stretch_rotation(l).1.normalize().as_quat())
+    };
     let d = rot(a).transpose() * rot(b);
     let cos = ((d.x_axis.x + d.y_axis.y + d.z_axis.z - 1.0) / 2.0).clamp(-1.0, 1.0);
+    let (p, q) = (&a.matrix3, &b.matrix3);
+    let lean = [
+        (p.x_axis, q.x_axis),
+        (p.y_axis, q.y_axis),
+        (p.z_axis, q.z_axis),
+    ]
+    .map(|(u, v)| u.cross(v).length().atan2(u.dot(v)))
+    .into_iter()
+    .fold(0.0, f32::max);
     (
         a.translation.distance(b.translation),
-        cos.acos().to_degrees(),
+        cos.acos().max(lean).to_degrees(),
     )
 }
 
@@ -878,6 +892,7 @@ pub(crate) enum Property {
     Translation,
     Rotation,
     Scale,
+    Shear,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -974,62 +989,96 @@ impl Channel {
     }
 }
 
-/// The per-axis scale and rotation of `l`, if it has them. A mirror is a negative x scale, and
-/// a column of zeros takes the direction that completes the frame.
-fn scale_rotation(l: Mat3) -> (Vec3, Quat) {
+/// `l` as a rotation times an upper triangular stretch (Gram-Schmidt in column order): the
+/// rotation, the stretch's diagonal and what lies above it, [`Trs::shear`]. Every `l` has one. A
+/// mirror is a negative x scale, and a column with nothing past those before it takes the
+/// direction that completes the frame.
+fn stretch_rotation(l: DMat3) -> (DVec3, DQuat, DVec3) {
     let cols = [l.x_axis, l.y_axis, l.z_axis];
-    let mut scale = Vec3::from(cols.map(Vec3::length));
-    let mut frame = cols.map(Vec3::normalize_or_zero);
+    let mut frame: [Option<DVec3>; 3] = [None; 3];
+    let mut scale = DVec3::ZERO;
+    let mut above = [0.0; 3];
     for k in 0..3 {
-        if frame[k] == Vec3::ZERO {
-            let (a, b) = (frame[(k + 1) % 3], frame[(k + 2) % 3]);
-            frame[k] = match [a, b].into_iter().find(|v| *v != Vec3::ZERO) {
-                Some(seed) => a
-                    .cross(b)
-                    .try_normalize()
-                    .unwrap_or(seed.any_orthonormal_vector()),
-                None => Vec3::X,
-            };
+        let mut rest = cols[k];
+        // Twice: what one pass leaves of a nearly dependent column is rounding as much as
+        // direction, and the rotation needs the frame orthonormal.
+        for _ in 0..2 {
+            for i in 0..k {
+                if let Some(q) = frame[i] {
+                    let d = q.dot(rest);
+                    rest -= q * d;
+                    above[i + k - 1] += d;
+                }
+            }
+        }
+        scale[k] = rest.length();
+        if scale[k] > 1e-14 * cols[k].length() {
+            frame[k] = Some(rest / scale[k]);
+        } else {
+            scale[k] = 0.0;
         }
     }
-    let [mut x, y, z] = frame;
-    if x.cross(y).dot(z) < 0.0 {
-        scale.x = -scale.x;
-        x = -x;
+    // In cyclic order, so that a filled axis leaves the frame right-handed: only a mirror may
+    // turn x over, or a key that flattens y would spin half a turn from its neighbors.
+    while let Some(k) = frame.iter().position(Option::is_none) {
+        frame[k] = Some(match (frame[(k + 1) % 3], frame[(k + 2) % 3]) {
+            (Some(a), Some(b)) => a.cross(b).normalize(),
+            (Some(a), None) | (None, Some(a)) => a.any_orthonormal_vector(),
+            (None, None) => DVec3::X,
+        });
     }
-    (scale, Quat::from_mat3(&Mat3::from_cols(x, y, z)))
+    let [mut x, y, z] = frame.map(|q| q.expect("every axis is filled"));
+    if x.cross(y).dot(z) < 0.0 {
+        x = -x;
+        scale.x = -scale.x;
+        above[0] = -above[0];
+        above[1] = -above[1];
+    }
+    (
+        scale,
+        DQuat::from_mat3(&DMat3::from_cols(x, y, z)),
+        DVec3::from(above),
+    )
 }
 
-/// The scale, rotation and translation of `m`, `None` if it shears.
-pub(crate) fn decompose(m: Mat4) -> Option<(Vec3, Quat, Vec3)> {
-    let (s, r) = scale_rotation(Mat3::from_mat4(m));
-    let t = m.w_axis.truncate();
-    close(&m, &Mat4::from_scale_rotation_translation(s, r, t)).then_some((s, r, t))
+/// `m` as a joint's local transform, `None` unless it is affine and finite in f32.
+pub(crate) fn decompose(m: DMat4) -> Option<Trs> {
+    let (s, r, h) = stretch_rotation(DMat3::from_mat4(m));
+    let (s, h, t) = (s.as_vec3(), h.as_vec3(), m.w_axis.truncate().as_vec3());
+    let held = m.is_finite() && s.is_finite() && h.is_finite() && t.is_finite();
+    (held && m.row(3).abs_diff_eq(DVec4::W, 1e-5)).then(|| Trs {
+        rotation: r.normalize().as_quat().to_array(),
+        translation: t.to_array(),
+        scale: s.to_array(),
+        shear: h.to_array(),
+    })
 }
 
-/// A node's local transform as translation, rotation and scale; a matrix must decompose
-/// into them.
+/// A node's local transform as a joint's.
 fn rest(node: &gltf::Node<'_>) -> Result<Trs, String> {
-    let (t, r, s) = match node.transform() {
+    match node.transform() {
         gltf::scene::Transform::Matrix { matrix } => {
-            let (s, r, t) = decompose(Mat4::from_cols_array_2d(&matrix)).ok_or_else(|| {
+            decompose(Mat4::from_cols_array_2d(&matrix).as_dmat4()).ok_or_else(|| {
                 format!(
-                    "node {}: its matrix is not translation, rotation and scale, as skeleton nodes need",
+                    "node {}: its matrix is not a finite affine transform",
                     node.index()
                 )
-            })?;
-            (t.to_array(), r.to_array(), s.to_array())
+            })
         }
-        transform => transform.decomposed(),
-    };
-    let q = Vec4::from(r)
-        .try_normalize()
-        .map_or(Quat::IDENTITY, Quat::from_vec4);
-    Ok(Trs {
-        rotation: q.to_array(),
-        translation: t,
-        scale: s,
-    })
+        gltf::scene::Transform::Decomposed {
+            translation,
+            rotation,
+            scale,
+        } => {
+            let q = Vec4::from(rotation).try_normalize();
+            Ok(Trs {
+                rotation: q.map_or(Quat::IDENTITY, Quat::from_vec4).to_array(),
+                translation,
+                scale,
+                shear: [0.0; 3],
+            })
+        }
+    }
 }
 
 fn close(a: &Mat4, b: &Mat4) -> bool {

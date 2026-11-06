@@ -97,7 +97,7 @@ pub(super) fn trs_channels(
             })
             .collect()
     };
-    let mut channels = Vec::with_capacity(3);
+    let mut channels = Vec::with_capacity(4);
     for (property, values) in [
         (Property::Translation, three(|d| d.translation)),
         (
@@ -105,6 +105,7 @@ pub(super) fn trs_channels(
             keys.iter().map(|d| d.rotation).collect(),
         ),
         (Property::Scale, three(|d| d.scale)),
+        (Property::Shear, three(|d| d.shear)),
     ] {
         let ch = Channel {
             joint,
@@ -121,17 +122,7 @@ pub(super) fn trs_channels(
 
 /// `what`'s local transform as a joint's.
 pub(super) fn prim_trs(what: &str, m: DMat4) -> Result<Trs, String> {
-    trs(m).ok_or_else(|| format!("{what}: shear; joints need translation, rotation and scale"))
-}
-
-/// A transform as translation, rotation and scale, `None` if it shears.
-fn trs(m: DMat4) -> Option<Trs> {
-    let (s, r, t) = skin::decompose(m.as_mat4())?;
-    Some(Trs {
-        rotation: r.normalize().to_array(),
-        translation: t.to_array(),
-        scale: s.to_array(),
-    })
+    skin::decompose(m).ok_or_else(|| format!("{what}: not a finite affine transform"))
 }
 
 /// The Moore-Penrose inverse of rank-deficient `l`, from the characteristic polynomial of
@@ -235,12 +226,8 @@ impl Skel {
                 .collect(),
         };
         for i in 0..joints.len() {
-            info.rest.push(trs(rest[i]).ok_or_else(|| {
-                format!(
-                    "{path} joint {}: shear; joints need translation, rotation and scale",
-                    joints[i]
-                )
-            })?);
+            info.rest
+                .push(prim_trs(&format!("{path} joint {}", joints[i]), rest[i])?);
             info.inverse_binds.push(Affine3::from_mat4(
                 (bind_inverse(binds[i]) * from_bind).as_mat4(),
             ));
@@ -475,6 +462,7 @@ impl Skel {
                         rotation: quat(&ro[4 * i..]).normalize().as_quat().to_array(),
                         translation: three(tr),
                         scale: three(sc),
+                        shear: [0.0; 3],
                     },
                     _ => self.info.rest[usize::from(j)],
                 });

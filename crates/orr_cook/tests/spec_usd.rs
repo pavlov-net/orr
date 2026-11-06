@@ -3760,17 +3760,20 @@ fn a_selected_model_keeps_what_moves_in_it() {
 /// at rest instead of dropping to the plane.
 #[test]
 fn a_thin_turned_bind_keeps_the_points_off_its_plane() {
-    // 1e-6 along (1, -1, 0).
+    // 1e-6 along (1, -1, 0), turned on one side or on both, where it shears.
     let (c, thin) = (std::f64::consts::FRAC_1_SQRT_2, 1e-6);
-    let bind = format!(
+    let (p, q) = ((1.0 + thin) / 2.0, (1.0 - thin) / 2.0);
+    let one = format!(
         "(({c}, {c}, 0, 0), ({}, {}, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))",
         -c * thin,
         c * thin
     );
-    let a = cook(
-        "skel-thin-bind",
-        &format!(
-            r#"def SkelRoot "Hero"
+    let both = format!("(({p}, {q}, 0, 0), ({q}, {p}, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))");
+    for (name, bind) in [("one", one), ("both", both)] {
+        let a = cook(
+            &format!("skel-thin-bind-{name}"),
+            &format!(
+                r#"def SkelRoot "Hero"
 {{
     def Skeleton "Rig"
     {{
@@ -3791,23 +3794,24 @@ fn a_thin_turned_bind_keeps_the_points_off_its_plane() {
         )
     }}
 }}"#
-        ),
-    );
-    let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
-    let (mut model, mut palette) = (
-        vec![orr_math::Affine3::IDENTITY; 1],
-        vec![orr_math::Affine3::IDENTITY; 1],
-    );
-    sk.model_pose(&sk.rest, &mut model);
-    sk.palette(&model, &mut palette);
-    let worst = corners(&a, "u/Hero/mesh")
-        .iter()
-        .map(|c| palette[0].transform_point3(c.0).distance(c.0))
-        .fold(0.0, f32::max);
-    assert!(
-        worst < 0.2,
-        "a point lands {worst} m from where it is bound"
-    );
+            ),
+        );
+        let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+        let (mut model, mut palette) = (
+            vec![orr_math::Affine3::IDENTITY; 1],
+            vec![orr_math::Affine3::IDENTITY; 1],
+        );
+        sk.model_pose(&sk.rest, &mut model);
+        sk.palette(&model, &mut palette);
+        let worst = corners(&a, "u/Hero/mesh")
+            .iter()
+            .map(|c| palette[0].transform_point3(c.0).distance(c.0))
+            .fold(0.0, f32::max);
+        assert!(
+            worst < 0.2,
+            "{name}: a point lands {worst} m from where it is bound"
+        );
+    }
 }
 
 /// `instancing.dox`: copies of a model "will typically have a different root transform, and
@@ -4082,4 +4086,91 @@ def PointInstancer "Crowd"
         assert!(has(&a, &format!("{model}/skeleton")), "{model}");
     }
     assert_eq!(copies(&a, "u/Hero/prototype").len(), 1);
+}
+
+/// `xformOp.h` takes any matrix for `xformOp:transform`, so a shear moves like the rest: a joint
+/// holds the matrix at rest and at every key, and its stretch interpolates.
+#[test]
+fn a_shearing_xform_is_a_joint_local() {
+    let a = cook(
+        "xform-shear",
+        &format!(
+            r#"def Xform "Lean"
+{{
+    matrix4d xformOp:transform.timeSamples = {{
+        0: ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)),
+        10: ((1, 0, 0, 0), (2, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)),
+    }}
+    uniform token[] xformOpOrder = ["xformOp:transform"]
+    def Mesh "M"
+    {{
+        {TRIANGLE}
+    }}
+}}"#
+        ),
+    );
+    let (_, end) = posed(&a, "u", "xform", 1.0);
+    let (_, middle) = posed(&a, "u", "xform", 0.5);
+    let top = Vec3::Y;
+    assert!(
+        end[1]
+            .transform_point3(top)
+            .abs_diff_eq(Vec3::new(2.0, 1.0, 0.0), 1e-3)
+    );
+    assert!(
+        middle[1]
+            .transform_point3(top)
+            .abs_diff_eq(Vec3::new(1.0, 1.0, 0.0), 1e-3)
+    );
+}
+
+/// A clip's rate answers to a shear as to a turn: a lean that lands between two frames is an
+/// error the rate doubles for, though no joint moves and no frame of a joint turns.
+#[test]
+fn a_sudden_shear_raises_the_clip_rate() {
+    let a = cook(
+        "xform-sudden-shear",
+        &format!(
+            r#"def Xform "Lean"
+{{
+    matrix4d xformOp:transform.timeSamples = {{
+        0: ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)),
+        5: ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)),
+        5.2: ((1, 0, 0, 0), (2, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)),
+        10: ((1, 0, 0, 0), (2, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)),
+    }}
+    uniform token[] xformOpOrder = ["xformOp:transform"]
+    def Mesh "M"
+    {{
+        {TRIANGLE}
+    }}
+}}"#
+        ),
+    );
+    let (clip, _) = posed(&a, "u", "xform", 0.0);
+    let rate = clip.header.sample_rate;
+    assert!(rate > 200.0, "{rate} frames a second");
+}
+
+/// `xformOp.h` takes any matrix, but a joint has no place for a projective column.
+#[test]
+fn a_projective_xform_is_no_joint_local() {
+    let body = format!(
+        r#"def Xform "Lean"
+{{
+    matrix4d xformOp:transform.timeSamples = {{
+        0: ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)),
+        10: ((1, 0, 0, 0.5), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)),
+    }}
+    uniform token[] xformOpOrder = ["xformOp:transform"]
+    def Mesh "M"
+    {{
+        {TRIANGLE}
+    }}
+}}"#
+    );
+    let Err(e) = cook_at(&dir("xform-projective"), &body, UsdSettings::default()) else {
+        panic!("a projective key cooked");
+    };
+    assert!(e.to_string().contains("affine"), "{e}");
 }

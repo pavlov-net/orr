@@ -2,8 +2,8 @@
 //!
 //! - Blob 0 (mount): a [`ClipHeader`].
 //! - Blob 1: `frame_count x joint_count` [`Trs`] records, frame-major: joint `j` at frame `f`
-//!   is record `f x joint_count + j`, ten f32 (rotation xyzw, translation, scale) that a
-//!   consumer kernel reads in place. Joints follow the skeleton's order; joints the source
+//!   is record `f x joint_count + j`, thirteen f32 (rotation xyzw, translation, scale, shear)
+//!   that a consumer kernel reads in place. Joints follow the skeleton's order; joints the source
 //!   does not animate hold their rest transform.
 //!
 //! Frame `f` is the pose `f / sample_rate` seconds after the clip starts, and the last frame

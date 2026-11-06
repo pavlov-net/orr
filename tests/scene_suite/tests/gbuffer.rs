@@ -1254,9 +1254,16 @@ fn cook() -> Arc<[u8]> {
                     },
                 },
                 AssetSpec {
+                    name: "leaning worm".into(),
+                    source: Source::Gltf {
+                        path: worm_glb_of("lean.glb", &[], true),
+                        settings: GltfSettings::default(),
+                    },
+                },
+                AssetSpec {
                     name: "crowd".into(),
                     source: Source::Gltf {
-                        path: worm_glb_of("crowd.glb", &CROWD),
+                        path: worm_glb_of("crowd.glb", &CROWD, false),
                         settings: GltfSettings {
                             mesh: MeshSettings {
                                 deformation_bound: 1.0,
@@ -5282,11 +5289,12 @@ const WORM_HEIGHT: f32 = 1.6;
 /// blending from joint to joint with height, and a `bend` clip that sways the upper two
 /// joints about z over 2 s.
 fn worm_glb() -> PathBuf {
-    worm_glb_of("worm.glb", &[])
+    worm_glb_of("worm.glb", &[], false)
 }
 
-/// [`worm_glb`] at `name`, with `EXT_mesh_gpu_instancing` placing it at `copies`.
-fn worm_glb_of(name: &str, copies: &[[f32; 3]]) -> PathBuf {
+/// [`worm_glb`] at `name`, with `EXT_mesh_gpu_instancing` placing it at `copies`, and with `lean`
+/// a shear in the rest pose of its middle joint.
+fn worm_glb_of(name: &str, copies: &[[f32; 3]], lean: bool) -> PathBuf {
     let (rings, sides, radius) = (24u32, 16u32, 0.2f32);
     let mut positions: Vec<f32> = Vec::new();
     let mut normals: Vec<f32> = Vec::new();
@@ -5380,10 +5388,16 @@ fn worm_glb_of(name: &str, copies: &[[f32; 3]]) -> PathBuf {
             ),
         )
     };
+    let m = WORM_JOINTS[1];
+    let middle = if lean {
+        format!(r#""matrix":[1,0,0,0, 0.3,1,0,0, 0,0,1,0, 0,{m},0,1]"#)
+    } else {
+        format!(r#""translation":[0,{m},0]"#)
+    };
     let json = format!(
         r#"{{"asset":{{"version":"2.0"}},{used}"scene":0,"scenes":[{{"nodes":[0,3]}}],
 "nodes":[{{"name":"root","children":[1]}},
-{{"name":"mid","translation":[0,{m},0],"children":[2]}},
+{{"name":"mid",{middle},"children":[2]}},
 {{"name":"top","translation":[0,{t},0]}},
 {{"name":"body","mesh":0,"skin":0{body}}}],
 "skins":[{{"joints":[0,1,2],"inverseBindMatrices":5}}],
@@ -5401,7 +5415,6 @@ fn worm_glb_of(name: &str, copies: &[[f32; 3]]) -> PathBuf {
 {{"bufferView":{v_rot},"componentType":5126,"count":5,"type":"VEC4"}}{placed}],
 "bufferViews":[{views}],
 "buffers":[{{"byteLength":{len}}}]}}"#,
-        m = WORM_JOINTS[1],
         t = WORM_JOINTS[2] - WORM_JOINTS[1],
         lo = -radius,
         hi = radius,
@@ -5429,9 +5442,18 @@ fn worm_glb_of(name: &str, copies: &[[f32; 3]]) -> PathBuf {
 
 /// The worm's skeleton and clip, decoded from the pack.
 fn worm_rig() -> (SkeletonInfo, Clip) {
+    worm_rig_of("worm")
+}
+
+/// The skeleton and clip of worm `name`.
+fn worm_rig_of(name: &str) -> (SkeletonInfo, Clip) {
     let a = Archive::from_memory(Arc::clone(pack())).unwrap();
-    let skeleton = a.find(AssetId::from_name("worm/skeleton")).unwrap();
-    let clip = a.find(AssetId::from_name("worm/clip/bend")).unwrap();
+    let skeleton = a
+        .find(AssetId::from_name(&format!("{name}/skeleton")))
+        .unwrap();
+    let clip = a
+        .find(AssetId::from_name(&format!("{name}/clip/bend")))
+        .unwrap();
     (
         SkeletonInfo::parse(&blob(&a, skeleton, 0)).unwrap(),
         Clip::parse(&blob(&a, clip, 0), &blob(&a, clip, 1)).unwrap(),
@@ -5441,7 +5463,12 @@ fn worm_rig() -> (SkeletonInfo, Clip) {
 /// The worm's skinning matrices `t` seconds into its clip, as orr_pack's CPU reference
 /// samples and chains them.
 fn worm_palette(t: f32) -> Vec<Affine3> {
-    let (skeleton, clip) = worm_rig();
+    worm_palette_of("worm", t)
+}
+
+/// [`worm_palette`] of worm `name`.
+fn worm_palette_of(name: &str, t: f32) -> Vec<Affine3> {
+    let (skeleton, clip) = worm_rig_of(name);
     let n = skeleton.joint_count();
     let mut locals = vec![Trs::IDENTITY; n];
     clip.sample(t, &mut locals);
@@ -5457,6 +5484,8 @@ struct Worms {
     placed: Placed,
     palette: TransformGroupId,
     joints: u32,
+    /// The asset whose skeleton and clip pose them.
+    rig: String,
 }
 
 /// Where `crowd`'s instances place its worms, in one world cell and in record order.
@@ -5528,6 +5557,7 @@ fn place_crowd(w: &mut World) -> Worms {
         },
         palette,
         joints,
+        rig: "worm".to_string(),
     }
 }
 
@@ -5535,7 +5565,10 @@ fn place_crowd(w: &mut World) -> Worms {
 /// `gpu`, by a scene compute kernel.
 fn place_worms(w: &mut World, name: &str, copies: &[(Mat3, Vec3)], gpu: bool) -> Worms {
     let model = w.model(name);
-    place_worms_of(w, model, copies, gpu)
+    Worms {
+        rig: name.to_string(),
+        ..place_worms_of(w, model, copies, gpu)
+    }
 }
 
 fn place_worms_of(w: &mut World, model: ModelId, copies: &[(Mat3, Vec3)], gpu: bool) -> Worms {
@@ -5601,6 +5634,7 @@ fn place_worms_of(w: &mut World, model: ModelId, copies: &[(Mat3, Vec3)], gpu: b
         },
         palette,
         joints,
+        rig: "worm".to_string(),
     }
 }
 
@@ -5791,11 +5825,17 @@ fn shoot_gpu_worms(
 ) -> Frame {
     let skeleton = w
         .scenes
-        .skeleton(w.mount, AssetId::from_name("worm/skeleton"))
+        .skeleton(
+            w.mount,
+            AssetId::from_name(&format!("{}/skeleton", worms.rig)),
+        )
         .unwrap();
     let clip = w
         .scenes
-        .clip(w.mount, AssetId::from_name("worm/clip/bend"))
+        .clip(
+            w.mount,
+            AssetId::from_name(&format!("{}/clip/bend", worms.rig)),
+        )
         .unwrap();
     assert_eq!(skeleton.joint_count, worms.joints);
     assert_eq!(clip.joint_count, worms.joints);
@@ -5827,36 +5867,43 @@ fn a_pose_kernel_samples_clips_on_the_gpu_like_the_cpu() {
     let _serial = serial();
     let mut w = finest_world();
     let copies = [(Mat3::IDENTITY, Vec3::ZERO), (Mat3::IDENTITY, Vec3::X)];
-    let worms = place_worms(&mut w, "worm", &copies, true);
+    assert_ne!(worm_rig_of("leaning worm").0.rest[1].shear, [0.0; 3]);
     let kernel = pipeline(&skin_pose::MODULE, "palette");
-    let (t, phase) = (0.37, 0.81);
-    let frame = shoot_gpu_worms(&mut w, &worms, &kernel, &worm_shot(1), t, phase);
-    let view = &frame.view;
-    let root = read_buffer(view.scene, 1)[0];
-    let group = read_buffer(root.groups.offset(u64::from(worms.palette.0)), 1)[0];
-    let got: Vec<[[f32; 4]; 3]> = read_buffer(
-        group.current.cast::<[[f32; 4]; 3]>(),
-        u64::from(2 * worms.joints),
-    );
-    let mut worst = 0.0f32;
-    for copy in 0..2 {
-        let want = worm_palette(t + copy as f32 * phase);
-        for (j, p) in want.iter().enumerate() {
-            let g = got[copy * worms.joints as usize + j];
-            for (a, b) in g
-                .iter()
-                .flatten()
-                .zip(AffineRows::from(*p).rows.iter().flatten())
-            {
-                worst = worst.max((a - b).abs());
+    for (frame, name) in (1..).zip(["worm", "leaning worm"]) {
+        let worms = place_worms(&mut w, name, &copies, true);
+        let (t, phase) = (0.37, 0.81);
+        let shot = worm_shot(frame);
+        let frame = shoot_gpu_worms(&mut w, &worms, &kernel, &shot, t, phase);
+        let view = &frame.view;
+        let root = read_buffer(view.scene, 1)[0];
+        let group = read_buffer(root.groups.offset(u64::from(worms.palette.0)), 1)[0];
+        let got: Vec<[[f32; 4]; 3]> = read_buffer(
+            group.current.cast::<[[f32; 4]; 3]>(),
+            u64::from(2 * worms.joints),
+        );
+        let mut worst = 0.0f32;
+        for copy in 0..2 {
+            let want = worm_palette_of(name, t + copy as f32 * phase);
+            for (j, p) in want.iter().enumerate() {
+                let g = got[copy * worms.joints as usize + j];
+                for (a, b) in g
+                    .iter()
+                    .flatten()
+                    .zip(AffineRows::from(*p).rows.iter().flatten())
+                {
+                    worst = worst.max((a - b).abs());
+                }
             }
         }
+        assert!(
+            worst < 1e-5,
+            "{name}: palette entries {worst} from the CPU's"
+        );
+        assert!(
+            frame.ids.iter().any(|&id| id != 0),
+            "{name}: the GPU-posed copies draw"
+        );
     }
-    assert!(worst < 1e-5, "palette entries {worst} from the CPU's");
-    assert!(
-        frame.ids.iter().any(|&id| id != 0),
-        "the GPU-posed copies draw"
-    );
     assert_clean();
 }
 

@@ -1852,6 +1852,64 @@ fn instanced_nodes_move_with_rigs_and_skins() {
     assert_eq!(pages.count(), 2, "each posed model on pages of its own");
 }
 
+/// L895 asks a `matrix` to decompose, but a file that shears still states where its mesh stands:
+/// a joint holds what a node's matrix says, mirror and shear alike.
+#[test]
+fn a_joint_holds_any_matrix() {
+    let path = dir("joint-matrix").join("skin.glb");
+    let mut g = Glb::default();
+    let (pa, ja, wa) = skinned_triangle(&mut g);
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1]}}],
+"nodes":[{{"name":"hip","matrix":[-1,0,0,0, 2,1,0,0, 0.5,0,3,0, 1,2,3,1]}},
+{{"mesh":0,"skin":0}}],
+"skins":[{{"joints":[0]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}}}}]}}]"#
+        ),
+    );
+    let (a, _) = cooked(&path);
+    let sk = skeleton(&a);
+    let want = Mat4::from_cols_array(&[
+        -1.0, 0.0, 0.0, 0.0, 2.0, 1.0, 0.0, 0.0, 0.5, 0.0, 3.0, 0.0, 1.0, 2.0, 3.0, 1.0,
+    ]);
+    let got = Mat4::from(sk.rest[0].to_affine());
+    assert!(got.abs_diff_eq(want, 1e-5), "{got}");
+}
+
+/// A matrix that flattens one axis is no mirror: the other two hold their frame, whichever it is,
+/// so a key that flattens a joint lies a short turn from its neighbors.
+#[test]
+fn a_flat_joint_keeps_its_frame() {
+    for (axis, matrix) in [
+        ("x", "0,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1"),
+        ("y", "1,0,0,0, 0,0,0,0, 0,0,1,0, 0,0,0,1"),
+        ("z", "1,0,0,0, 0,1,0,0, 0,0,0,0, 0,0,0,1"),
+    ] {
+        let path = dir(&format!("joint-flat-{axis}")).join("skin.glb");
+        let mut g = Glb::default();
+        let (pa, ja, wa) = skinned_triangle(&mut g);
+        g.write(
+            &path,
+            &format!(
+                r#""scene":0,"scenes":[{{"nodes":[0,1]}}],
+"nodes":[{{"name":"hip","matrix":[{matrix}]}},
+{{"mesh":0,"skin":0}}],
+"skins":[{{"joints":[0]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}}}}]}}]"#
+            ),
+        );
+        let (a, _) = cooked(&path);
+        let rest = skeleton(&a).rest[0];
+        assert!(
+            orr_math::Quat::from_array(rest.rotation).abs_diff_eq(orr_math::Quat::IDENTITY, 1e-6),
+            "{axis}: {rest:?}"
+        );
+        assert!(rest.scale.iter().all(|&s| s >= 0.0), "{axis}: {rest:?}");
+    }
+}
+
 /// L2124 asks nothing of an inverse bind but four rows, so one may not invert, or only just: a
 /// rigid mesh on such a joint holds its place all the same, on a joint of its own for the node.
 #[test]

@@ -8,7 +8,7 @@
 //! Mesh joint indices index this skeleton.
 
 use bytemuck::{Pod, Zeroable};
-use orr_math::{Affine3, Quat, Vec3};
+use orr_math::{Affine3, Mat3, Quat, Vec3};
 
 use crate::blob::{put_table, read, table};
 use crate::{AffineRows, Error, Result, Span};
@@ -45,7 +45,8 @@ pub struct SkeletonHeader {
     pub root: AffineRows,
 }
 
-/// A local transform: scale, then rotation, then translation. 40 B, f32 throughout.
+/// A local transform: scale and shear, then rotation, then translation, so any 3x4 matrix has
+/// one, and interpolating its fields stays a transform. 52 B, f32 throughout.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct Trs {
@@ -53,6 +54,9 @@ pub struct Trs {
     pub rotation: [f32; 4],
     pub translation: [f32; 3],
     pub scale: [f32; 3],
+    /// The upper triangle of the stretch whose diagonal is `scale`: how far unit y moves along x,
+    /// unit z along x and unit z along y.
+    pub shear: [f32; 3],
 }
 
 impl Trs {
@@ -60,23 +64,28 @@ impl Trs {
         rotation: [0.0, 0.0, 0.0, 1.0],
         translation: [0.0; 3],
         scale: [1.0; 3],
+        shear: [0.0; 3],
     };
 
     pub fn to_affine(&self) -> Affine3 {
-        Affine3::from_scale_rotation_translation(
-            Vec3::from(self.scale),
-            Quat::from_array(self.rotation),
-            Vec3::from(self.translation),
-        )
+        let ([sx, sy, sz], [xy, xz, yz]) = (self.scale, self.shear);
+        let stretch = Mat3::from_cols(
+            Vec3::new(sx, 0.0, 0.0),
+            Vec3::new(xy, sy, 0.0),
+            Vec3::new(xz, yz, sz),
+        );
+        let rotation = Mat3::from_quat(Quat::from_array(self.rotation));
+        Affine3::from_mat3_translation(rotation * stretch, Vec3::from(self.translation))
     }
 
-    /// Translation and scale lerped, rotation slerped on the shorter arc.
+    /// Translation, scale and shear lerped, rotation slerped on the shorter arc.
     pub fn interpolate(&self, b: &Self, u: f32) -> Self {
         let lerp = |a: f32, b: f32| a + (b - a) * u;
         Self {
             rotation: slerp(self.rotation, b.rotation, u),
             translation: std::array::from_fn(|i| lerp(self.translation[i], b.translation[i])),
             scale: std::array::from_fn(|i| lerp(self.scale[i], b.scale[i])),
+            shear: std::array::from_fn(|i| lerp(self.shear[i], b.shear[i])),
         }
     }
 }

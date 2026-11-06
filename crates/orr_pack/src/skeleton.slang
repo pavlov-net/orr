@@ -9,22 +9,24 @@ import orr_shaders.math;
 // `SkeletonHeader.parents` entry of a root joint.
 public static const uint NO_PARENT = 0xffff;
 
-// Scale, then rotation, then translation, relative to the parent joint.
+// Scale and shear, then rotation, then translation, relative to the parent joint.
 public struct Trs
 {
     public float4 rotation;        // unit quaternion, xyzw
     public float3 translation;
     public float3 scale;
+    public float3 shear;           // unit y along x, unit z along x, unit z along y
 }
 
-// Trs record `i` of a table of 40-byte records at `p`.
+// Trs record `i` of a table of 52-byte records at `p`.
 public Trs load_trs(uint8_t* p, uint i)
 {
-    float* f = (float*)(p + 40 * i);
+    float* f = (float*)(p + 52 * i);
     Trs t;
     t.rotation = float4(f[0], f[1], f[2], f[3]);
     t.translation = float3(f[4], f[5], f[6]);
     t.scale = float3(f[7], f[8], f[9]);
+    t.shear = float3(f[10], f[11], f[12]);
     return t;
 }
 
@@ -36,10 +38,17 @@ public float3x4 trs_affine(Trs t)
     float z = t.rotation.z;
     float w = t.rotation.w;
     float3 s = t.scale;
+    float3 h = t.shear;
+    float3 ax = float3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y));
+    float3 ay = float3(2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x));
+    float3 az = float3(2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y));
+    float3 c0 = ax * s.x;
+    float3 c1 = ax * h.x + ay * s.y;
+    float3 c2 = ax * h.y + ay * h.z + az * s.z;
     return float3x4(
-        float4((1.0 - 2.0 * (y * y + z * z)) * s.x, 2.0 * (x * y - w * z) * s.y, 2.0 * (x * z + w * y) * s.z, t.translation.x),
-        float4(2.0 * (x * y + w * z) * s.x, (1.0 - 2.0 * (x * x + z * z)) * s.y, 2.0 * (y * z - w * x) * s.z, t.translation.y),
-        float4(2.0 * (x * z - w * y) * s.x, 2.0 * (y * z + w * x) * s.y, (1.0 - 2.0 * (x * x + y * y)) * s.z, t.translation.z));
+        float4(c0.x, c1.x, c2.x, t.translation.x),
+        float4(c0.y, c1.y, c2.y, t.translation.y),
+        float4(c0.z, c1.z, c2.z, t.translation.z));
 }
 
 // Spherical interpolation on the shorter arc, normalized lerp above a dot of 0.9995, as
@@ -68,6 +77,7 @@ public Trs trs_interpolate(Trs a, Trs b, float u)
     o.rotation = slerp(a.rotation, b.rotation, u);
     o.translation = a.translation + (b.translation - a.translation) * u;
     o.scale = a.scale + (b.scale - a.scale) * u;
+    o.shear = a.shear + (b.shear - a.shear) * u;
     return o;
 }
 
