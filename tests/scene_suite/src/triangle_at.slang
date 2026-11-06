@@ -6,7 +6,7 @@ import orr_scene.hit;
 struct Root
 {
     SceneRoot* scene;
-    float4* out;              // the vertex color, the geometric and vertex normals, the side's material
+    float4* out;              // the vertex color, the geometric and vertex normals, the side's material, the tangents of the base and the coat
     float4 view;              // the ray's direction, then the section's material
     float4 color0;
     float4 color1;
@@ -27,6 +27,11 @@ void main()
     t.attributes[2].color = root.color2;
     for (uint c = 0; c < 3; c++)
         t.attributes[c].normal = float3(0.0, 0.0, 1.0);
+    // Uv set 1 is set 0 with its axes swapped.
+    t.attributes[1].uv[0] = float2(1.0, 0.0);
+    t.attributes[2].uv[0] = float2(0.0, 1.0);
+    t.attributes[1].uv[1] = float2(0.0, 1.0);
+    t.attributes[2].uv[1] = float2(1.0, 0.0);
     Placement pl = (Placement)0;
     float size = root.point.z;
     pl.linear = float3x3(-size, 0.0, 0.0, 0.0, size, 0.0, 0.0, 0.0, size);
@@ -37,4 +42,6 @@ void main()
     root.out[1] = float4(i.geometric_normal, 0.0);
     root.out[2] = float4(i.normal, 0.0);
     root.out[3] = float4(float(side_material(root.scene, material, i)), 0.0, 0.0, 0.0);
+    root.out[4] = i.tangent;
+    root.out[5] = i.coat_tangent;
 }

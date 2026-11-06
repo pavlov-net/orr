@@ -166,6 +166,8 @@ public bool strand_geometry(inout SurfaceInput i, ProducerBatch b, uint segment,
     i.normal = n;
     i.frame_normal = n;
     i.tangent = float4(t, 1.0);
+    i.coat_frame_normal = n;
+    i.coat_tangent = i.tangent;
     i.object_position = object;
     i.object_normal = n_obj;
     i.object_to_render = pl.linear;
@@ -286,6 +288,39 @@ public Corners load_corners(uint8_t* page, Cluster c, uint triangle, MeshGpu* me
     return t;
 }
 
+// The tangent that follows `set` on triangle `t`, at weights `w`: the mesh's where its tangents
+// do, else that of the triangle's uv in the set, whose `frame` normal is then `n`. `e1` and `e2`
+// are its edges, and `unit` and `mirror` what the placement gives directions.
+float4 triangle_tangent(Corners t, uint attributes, uint set, float3 w, float3x3 unit, float mirror, float3 e1, float3 e2, float3 n, inout float3 frame)
+{
+    VertexAttributes a0 = t.attributes[0];
+    VertexAttributes a1 = t.attributes[1];
+    VertexAttributes a2 = t.attributes[2];
+    if ((attributes & MESH_TANGENT) != 0 && (set == t.tangent_set || set == TANGENT_SET_OTHER))
+    {
+        float3 tt = float3(0.0);
+        for (uint c = 0; c < 3; c++)
+            tt += w[c] * unit_direction(mul(unit, t.attributes[c].tangent.xyz), float3(1, 0, 0));
+        return float4(tt, a0.tangent.w * mirror);
+    }
+    bool set1 = set == 1;
+    float2 uv1 = (set1 ? a1.uv[1] : a1.uv[0]) - (set1 ? a0.uv[1] : a0.uv[0]);
+    float2 uv2 = (set1 ? a2.uv[1] : a2.uv[0]) - (set1 ? a0.uv[1] : a0.uv[0]);
+    float r = uv1.x * uv2.y - uv2.x * uv1.y;
+    float3 tt = r != 0.0 ? (e1 * uv2.y - e2 * uv1.y) / r : float3(0.0);
+    // Uv v runs down the image and a normal map's y up it.
+    float3 bt = r != 0.0 ? (e1 * uv2.x - e2 * uv1.x) / r : float3(0.0);
+    if (dot(tt, tt) == 0.0)
+    {
+        float3 tb;
+        orthonormal_basis(n, tt, tb);
+        bt = tb;
+    }
+    tt = safe_normalize(tt - n * dot(n, tt), float3(1, 0, 0));
+    frame = n;
+    return float4(tt, dot(cross(n, tt), bt) < 0.0 ? -1.0 : 1.0);
+}
+
 // The geometry of `i` at barycentrics `b` of triangle `t` placed by `pl`, with `attributes`
 // the mesh's MESH_* flags: both uv sets and their footprints from the barycentric steps `bx` and `by` of one footprint width, normals and
 // tangent frame in render space (back faces of double-sided materials turned toward the
@@ -293,7 +328,7 @@ public Corners load_corners(uint8_t* page, Cluster c, uint triangle, MeshGpu* me
 // and the object-space position and normal. `material` is the section's, and the frame follows
 // the material of the side `d` meets. Without mesh tangents on the uvs that frame follows, as
 // where a copy's material replaces the section's, the tangent follows the triangle's uv in
-// that set.
+// that set, as a coat's frame of its own does when the mesh's tangents follow the base's.
 public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, SceneRoot* scene, uint material, Placement pl, float2 b, float2 bx, float2 by, float3 d, float bias)
 {
     VertexAttributes a0 = t.attributes[0];
@@ -330,45 +365,28 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
     float3 n = safe_normalize(frame, ng);
     i.back_face = dot(ng, d) > 0.0 && (scene.materials[material].flags & MATERIAL_DOUBLE_SIDED) != 0;
     MaterialGpu* side = scene.materials + side_material(scene, material, i);
-    float4 tangent;
-    uint frame_set = side.tangent_set;
-    if ((attributes & MESH_TANGENT) != 0 && (frame_set == t.tangent_set || frame_set == TANGENT_SET_OTHER))
-    {
-        float3 tt = float3(0.0);
-        for (uint c = 0; c < 3; c++)
-            tt += w[c] * unit_direction(mul(unit, t.attributes[c].tangent.xyz), float3(1, 0, 0));
-        tangent = float4(tt, a0.tangent.w * mirror);
-    }
+    float3 coat_frame = frame;
+    float4 tangent = triangle_tangent(t, attributes, side.tangent_set, w, unit, mirror, e1, e2, n, frame);
+    float4 coat_tangent = tangent;
+    if (side.coat_tangent_set != side.tangent_set)
+        coat_tangent = triangle_tangent(t, attributes, side.coat_tangent_set, w, unit, mirror, e1, e2, n, coat_frame);
     else
-    {
-        bool set1 = frame_set == 1;
-        float2 uv1 = (set1 ? a1.uv[1] : a1.uv[0]) - (set1 ? a0.uv[1] : a0.uv[0]);
-        float2 uv2 = (set1 ? a2.uv[1] : a2.uv[0]) - (set1 ? a0.uv[1] : a0.uv[0]);
-        float r = uv1.x * uv2.y - uv2.x * uv1.y;
-        float3 tt = r != 0.0 ? (e1 * uv2.y - e2 * uv1.y) / r : float3(0.0);
-        // Uv v runs down the image and a normal map's y up it.
-        float3 bt = r != 0.0 ? (e1 * uv2.x - e2 * uv1.x) / r : float3(0.0);
-        if (dot(tt, tt) == 0.0)
-        {
-            float3 tb;
-            orthonormal_basis(n, tt, tb);
-            bt = tb;
-        }
-        tt = safe_normalize(tt - n * dot(n, tt), float3(1, 0, 0));
-        tangent = float4(tt, dot(cross(n, tt), bt) < 0.0 ? -1.0 : 1.0);
-        frame = n;
-    }
+        coat_frame = frame;
     if (i.back_face && (side.flags & MATERIAL_DIELECTRIC) == 0)
     {
         ng = -ng;
         n = -n;
         frame = -frame;
+        coat_frame = -coat_frame;
         tangent.w = -tangent.w;
+        coat_tangent.w = -coat_tangent.w;
     }
     i.geometric_normal = ng;
     i.normal = n;
     i.frame_normal = frame;
     i.tangent = tangent;
+    i.coat_frame_normal = coat_frame;
+    i.coat_tangent = coat_tangent;
     i.object_position = w.x * t.position[0] + w.y * t.position[1] + w.z * t.position[2];
     i.object_normal = n_obj;
     i.object_to_render = pl.linear;

@@ -11,8 +11,10 @@
 //!   which turn with what places it; a transform an importer bakes into the mesh isn't among that.
 //!   `geometry_tangent` and `geometry_coat_tangent` take a
 //!   `tangent` node, the mesh's, or a texture of a direction in the tangent plane; any other warns
-//!   and reads the mesh's. A `geometry_opacity` below 1 or textured blends, as the linear presence
-//!   weight OpenPBR defines.
+//!   and reads the mesh's. The base and the coat each follow the uv set the `index` of their
+//!   `tangent` nodes names. Mesh tangents hold one of the two, and a coat on another set takes its
+//!   tangent from the triangle's uvs. A `geometry_opacity` below 1 or textured blends, as the
+//!   linear presence weight OpenPBR defines.
 //! - `UsdPreviewSurface`, mapped like glTF metallic-roughness: `diffuseColor` is
 //!   `base_color`, `metallic`, `roughness`, `ior` and `emissiveColor` (read as nits) their
 //!   fields, `clearcoat` and `clearcoatRoughness` the coat at `ior`, and `normal` and
@@ -567,6 +569,7 @@ pub(crate) fn map(
         },
         textures: MaterialTextures::default(),
         vertex: Vec::new(),
+        frames: [None; 2],
         warnings: Vec::new(),
     };
     let node = &net.nodes[surface];
@@ -597,8 +600,14 @@ struct Mapper<'a, 'h> {
     material: Material,
     textures: MaterialTextures,
     vertex: Vec<VertexRead>,
+    /// The uv set the [`BASE`] and [`COAT`] frames follow, where a node names one.
+    frames: [Option<f32>; 2],
     warnings: Vec<String>,
 }
+
+/// Indices of [`Mapper::frames`].
+const BASE: usize = 0;
+const COAT: usize = 1;
 
 type Slot = fn(&mut MaterialTextures) -> &mut Option<TexRef>;
 
@@ -612,9 +621,27 @@ impl Mapper<'_, '_> {
         &self.net.nodes[n]
     }
 
-    /// The uv set of the `tangent` and `bitangent` nodes feeding `normalmap` node `map`. A
-    /// frame from anything else has no field: meshes hold one tangent per vertex.
-    fn normal_frame(&mut self, map: usize) -> Result<(), String> {
+    /// Has `frame` follow uv set `index`, as node `n` says. One frame serves a layer's normal map
+    /// and its tangent.
+    fn follow(&mut self, n: usize, frame: usize, index: f32) {
+        let name = &self.node(n).name;
+        if index != 0.0 && index != 1.0 {
+            let warning = format!("{name}: uv set {index} is past the two a mesh holds");
+            self.warnings.push(warning);
+            self.frames[frame].get_or_insert(0.0);
+        } else if self.frames[frame].is_some_and(|set| set != index) {
+            let warning =
+                format!("{name}: reads another uv set than its layer's frame, which stands");
+            self.warnings.push(warning);
+        } else {
+            self.frames[frame] = Some(index);
+        }
+    }
+
+    /// The uv set of the `tangent` and `bitangent` nodes feeding `normalmap` node `map` for layer
+    /// `frame`; by default `Tworld`, index 0. A frame from anything else has no field: meshes
+    /// hold one tangent per vertex.
+    fn normal_frame(&mut self, map: usize, frame: usize) -> Result<(), String> {
         let mut index = None;
         for (input, kind) in [("tangent", "tangent"), ("bitangent", "bitangent")] {
             let Some(source) = self.source(map, input) else {
@@ -641,16 +668,34 @@ impl Mapper<'_, '_> {
                 }
             }
         }
-        match index {
-            Some(0.0) | None => {}
-            Some(1.0) => self.material.frame_uv = Material::FRAME_UV1,
-            Some(i) => {
-                let name = &self.node(map).name;
-                self.warnings
-                    .push(format!("{name}: uv set {i} is past the two a mesh holds"));
-            }
-        }
+        self.follow(map, frame, index.unwrap_or(0.0));
         Ok(())
+    }
+
+    /// Settles the material's frames. The mesh's tangents go to the base's frame, or to the
+    /// coat's where nothing reads the base's, and the coat holds its own only where the two part.
+    fn settle_frames(&mut self) {
+        let m = &self.material;
+        let bound = |s: usize| self.textures.more.get(&s).is_some_and(Option::is_some);
+        let reads_base =
+            self.frames[BASE].is_some() || m.specular_anisotropy > 0.0 || bound(slot::TANGENT);
+        let reads_coat =
+            self.frames[COAT].is_some() || m.coat_anisotropy > 0.0 || bound(slot::COAT_TANGENT);
+        let uv = |set: Option<f32>| {
+            if set == Some(1.0) {
+                Material::FRAME_UV1
+            } else {
+                Material::FRAME_UV0
+            }
+        };
+        let (base, coat) = (uv(self.frames[BASE]), uv(self.frames[COAT]));
+        let (frame, coat_frame) = match (reads_base, reads_coat) {
+            (false, true) => (coat, Material::FRAME_NORMAL_MAP),
+            (true, true) if coat != base => (base, coat),
+            _ => (base, Material::FRAME_NORMAL_MAP),
+        };
+        self.material.frame_uv = frame;
+        self.material.coat_frame_uv = coat_frame;
     }
 
     fn input<'n>(&'n self, n: usize, name: &str) -> Option<&'n Input> {
@@ -1601,11 +1646,18 @@ impl Mapper<'_, '_> {
         {
             self.material.alpha_mode = Material::BLEND;
         }
-        self.textures.normal = self.normal_input(n, "geometry_normal", Material::OBJECT_NORMAL)?;
-        self.textures.coat_normal =
-            self.normal_input(n, "geometry_coat_normal", Material::OBJECT_COAT_NORMAL)?;
-        self.tangent_input(n, "geometry_tangent", slot::TANGENT)?;
-        self.tangent_input(n, "geometry_coat_tangent", slot::COAT_TANGENT)
+        self.textures.normal =
+            self.normal_input(n, "geometry_normal", Material::OBJECT_NORMAL, BASE)?;
+        self.textures.coat_normal = self.normal_input(
+            n,
+            "geometry_coat_normal",
+            Material::OBJECT_COAT_NORMAL,
+            COAT,
+        )?;
+        self.tangent_input(n, "geometry_tangent", slot::TANGENT, BASE)?;
+        self.tangent_input(n, "geometry_coat_tangent", slot::COAT_TANGENT, COAT)?;
+        self.settle_frames();
+        Ok(())
     }
 
     /// The normal map of input `name` of `n`, from a `normalmap` node. A 1.38 `space` of `object`
@@ -1616,6 +1668,7 @@ impl Mapper<'_, '_> {
         n: usize,
         name: &str,
         object: u8,
+        frame: usize,
     ) -> Result<Option<(TexRef, [f32; 2])>, String> {
         match self.source(n, name) {
             None => Ok(None),
@@ -1625,7 +1678,7 @@ impl Mapper<'_, '_> {
                     self.material.object_normals |= object;
                     Vec2::ONE
                 } else {
-                    self.normal_frame(map)?;
+                    self.normal_frame(map, frame)?;
                     self.vec2(map, "scale", Vec2::ONE)?
                 };
                 match self.value(map, "in")? {
@@ -1642,15 +1695,24 @@ impl Mapper<'_, '_> {
         }
     }
 
-    /// Tangent input `name` of `n`: a `tangent` node is the mesh's own, and a texture a direction
-    /// in the tangent plane. Anything else stands for no frame a mesh holds.
-    fn tangent_input(&mut self, n: usize, name: &str, s: usize) -> Result<(), String> {
+    /// Tangent input `name` of `n`: a `tangent` node is the mesh's own in its `index`'s uv set
+    /// for layer `frame`, and a texture a direction in the tangent plane. Anything else stands
+    /// for no frame a mesh holds.
+    fn tangent_input(
+        &mut self,
+        n: usize,
+        name: &str,
+        s: usize,
+        frame: usize,
+    ) -> Result<(), String> {
         let source = match self.source(n, name) {
             None => return Ok(()),
             Some(Input::Connect { node, .. }) => Some(*node),
             Some(_) => None,
         };
-        if source.is_some_and(|node| self.node(node).kind == "tangent") {
+        if let Some(node) = source.filter(|&node| self.node(node).kind == "tangent") {
+            let index = self.float(node, "index", 0.0)?;
+            self.follow(node, frame, index);
             return Ok(());
         }
         let texture = source

@@ -327,7 +327,8 @@ pub(crate) fn binds_uv1(m: &Material) -> bool {
 /// tangent frame it reads.
 pub(crate) fn reads_uv1(m: &Material) -> bool {
     let frame = reads_tangent(m) || m.tangent_map(slot::NORMAL);
-    binds_uv1(m) || (frame && m.tangent_set() == 1)
+    let coat = m.tangent_map(slot::COAT_NORMAL) || m.coat_anisotropy > 0.0;
+    binds_uv1(m) || (frame && m.tangent_set() == 1) || (coat && m.coat_tangent_set() == 1)
 }
 
 /// Whether material `m` reads the tangent with or without a normal map.

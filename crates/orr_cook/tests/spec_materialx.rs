@@ -732,6 +732,53 @@ fn documents_map_as_the_clauses_say() {
             check: |m| m.textures[slot::BASE_COLOR].vertex == 1 && m.base_color == [1.0; 3],
         },
         Row {
+            clause: "Nodes tangent: `index` picks the texcoord space of each normalmap's frame",
+            body: r#"<image name="i" type="vector3">
+                  <input name="file" type="filename" value="v.png"/></image>
+                <tangent name="t1" type="vector3">
+                  <input name="index" type="integer" value="1"/></tangent>
+                <normalmap name="n" type="vector3"><input name="in" type="vector3" nodename="i"/>
+                  </normalmap>
+                <normalmap name="c" type="vector3"><input name="in" type="vector3" nodename="i"/>
+                  <input name="tangent" type="vector3" nodename="t1"/></normalmap>"#,
+            inputs: r#"<input name="geometry_normal" type="vector3" nodename="n"/>
+                <input name="geometry_coat_normal" type="vector3" nodename="c"/>"#,
+            check: |m| m.tangent_set() == 0 && m.coat_tangent_set() == 1,
+        },
+        Row {
+            clause: "Nodes tangent: a coat map's frame leaves the base's where the base's says 1",
+            body: r#"<image name="i" type="vector3">
+                  <input name="file" type="filename" value="v.png"/></image>
+                <tangent name="t1" type="vector3">
+                  <input name="index" type="integer" value="1"/></tangent>
+                <normalmap name="n" type="vector3"><input name="in" type="vector3" nodename="i"/>
+                  <input name="tangent" type="vector3" nodename="t1"/></normalmap>
+                <normalmap name="c" type="vector3"><input name="in" type="vector3" nodename="i"/>
+                  </normalmap>"#,
+            inputs: r#"<input name="geometry_normal" type="vector3" nodename="n"/>
+                <input name="geometry_coat_normal" type="vector3" nodename="c"/>"#,
+            check: |m| m.tangent_set() == 1 && m.coat_tangent_set() == 0,
+        },
+        Row {
+            clause: "Nodes tangent: a coat alone gives the mesh's tangents its set",
+            body: r#"<image name="i" type="vector3">
+                  <input name="file" type="filename" value="v.png"/></image>
+                <tangent name="t1" type="vector3">
+                  <input name="index" type="integer" value="1"/></tangent>
+                <normalmap name="c" type="vector3"><input name="in" type="vector3" nodename="i"/>
+                  <input name="tangent" type="vector3" nodename="t1"/></normalmap>"#,
+            inputs: r#"<input name="geometry_coat_normal" type="vector3" nodename="c"/>"#,
+            check: |m| m.tangent_set() == 1 && m.coat_frame_uv == Material::FRAME_NORMAL_MAP,
+        },
+        Row {
+            clause: "OpenPBR geometry_tangent: a tangent node's index picks the base frame's set",
+            body: r#"<tangent name="t1" type="vector3">
+                  <input name="index" type="integer" value="1"/></tangent>"#,
+            inputs: r#"<input name="specular_roughness_anisotropy" type="float" value="0.5"/>
+                <input name="geometry_tangent" type="vector3" nodename="t1"/>"#,
+            check: |m| m.tangent_set() == 1,
+        },
+        Row {
             clause: "Nodes geomcolor: `index`, a color of its own; `out` defaults to zero",
             body: r#"<geomcolor name="c" type="color3">
                   <input name="index" type="integer" value="1"/></geomcolor>"#,

@@ -132,6 +132,10 @@ pub struct Material {
     /// Nonzero: the displacement fields are world lengths along the world normal, whatever scale
     /// places the mesh, not mesh space lengths that scale with it.
     pub displacement_world: u8,
+    /// What the coat's normal map and tangent follow where they part from the tangent frame:
+    /// [`Self::FRAME_UV0`] or [`Self::FRAME_UV1`]. [`Self::FRAME_NORMAL_MAP`] shares the frame.
+    pub coat_frame_uv: u8,
+    pub _pad: [u8; 3],
     /// The material of the surface's back, double-sided as this one is; [`AssetId::NONE`] where
     /// both sides read this one.
     pub back: AssetId,
@@ -187,6 +191,14 @@ impl Material {
     /// Whether [`slot::NORMAL`] or [`slot::COAT_NORMAL`] `s` binds a map the tangent frame turns.
     pub fn tangent_map(&self, s: usize) -> bool {
         self.textures[s].texture != AssetId::NONE && !self.object_normal(s)
+    }
+
+    /// What the coat's frame follows, as [`Self::tangent_set`].
+    pub fn coat_tangent_set(&self) -> u8 {
+        match self.coat_frame_uv {
+            Self::FRAME_NORMAL_MAP => self.tangent_set(),
+            f => f - 1,
+        }
     }
 
     /// The uv set the tangent frame follows, 0 or 1, or [`Self::TANGENT_SET_OTHER`].
@@ -320,6 +332,8 @@ impl Default for Material {
             thin_walled: 0,
             surface: 0,
             frame_uv: Self::FRAME_NORMAL_MAP,
+            coat_frame_uv: Self::FRAME_NORMAL_MAP,
+            _pad: [0; 3],
             model: Self::MODEL_OPENPBR,
             object_normals: 0,
             displacement_world: 0,

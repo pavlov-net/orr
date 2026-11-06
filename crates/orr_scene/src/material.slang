@@ -218,7 +218,7 @@ public struct MaterialGpu
     public uint back;                       // with MATERIAL_HAS_BACK or MATERIAL_BACK_SIDE, the material of the other side
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
-    public uint _pad0;
+    public uint coat_tangent_set;           // what the coat's normal map and tangent follow, as `tangent_set`
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
     public uint* tiles[TEXTURE_SLOTS];                  // per slot of TEXTURE_TILED, its table: `texture_tile`

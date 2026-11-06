@@ -7984,7 +7984,7 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         (1.0, 1.0, -1.0, 2),
     ] {
         let out = d
-            .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, 4, "out")
+            .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, 6, "out")
             .unwrap();
         let root = upload(
             bytemuck::bytes_of(&triangle_at::Root {
@@ -8002,8 +8002,8 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         list.dispatch(&p, root.gpu().cast::<triangle_at::Root>(), [1, 1, 1]);
         list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
         wait(render.submit(vec![list], &[]).unwrap());
-        let [color, geometric, normal, material] = out.as_slice().unwrap()[..] else {
-            panic!("four rows");
+        let [color, geometric, normal, material, ..] = out.as_slice().unwrap()[..] else {
+            panic!("six rows");
         };
         assert_eq!(color, [0.25, 0.25, 0.5, 0.6875], "{size}");
         let turned = if first == 0 { side } else { 1.0 };
@@ -8012,6 +8012,76 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         assert!(up(normal), "{size}: {normal:?}");
         let shown = first + u32::from(side < 0.0);
         assert_eq!(material[0], shown as f32, "{size}");
+    }
+    assert_clean();
+}
+
+/// OpenPBR `geometry_tangent` and `geometry_coat_tangent` are a tangent of the base and of the
+/// coat, and MaterialX `tangent`'s `index` picks the coordinates of each: a frame of the coat's
+/// own follows its uv set where the base's follows another.
+#[test]
+fn a_coat_frame_follows_a_uv_set_of_its_own() {
+    use orr_pack::material::slot;
+    let _guard = serial();
+    let d = device();
+    let upload = |bytes: &[u8], name| {
+        let mut a = d
+            .gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, name)
+            .unwrap();
+        a.as_mut_slice().unwrap().copy_from_slice(bytes);
+        a
+    };
+    let p = pipeline(&triangle_at::MODULE, "main");
+    let render = d.queue(QueueKind::Render).unwrap();
+    for (frame, coat_frame, base, coat) in [
+        (Material::FRAME_UV0, Material::FRAME_UV1, Vec3::X, Vec3::Y),
+        (Material::FRAME_UV1, Material::FRAME_UV0, Vec3::Y, Vec3::X),
+        (
+            Material::FRAME_UV1,
+            Material::FRAME_NORMAL_MAP,
+            Vec3::Y,
+            Vec3::Y,
+        ),
+    ] {
+        let m = Material {
+            frame_uv: frame,
+            coat_frame_uv: coat_frame,
+            ..Material::default()
+        };
+        let record = MaterialGpu::new(&m, &[BoundTexture::NONE; slot::COUNT]);
+        let materials = upload(bytemuck::bytes_of(&record), "materials");
+        let scene = upload(
+            bytemuck::bytes_of(&SceneRoot {
+                materials: materials.gpu().cast(),
+                ..bytemuck::Zeroable::zeroed()
+            }),
+            "scene",
+        );
+        let out = d
+            .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, 6, "out")
+            .unwrap();
+        let root = upload(
+            bytemuck::bytes_of(&triangle_at::Root {
+                scene: scene.gpu().cast(),
+                view: [0.0, 0.0, -1.0, 0.0],
+                out: out.gpu().cast(),
+                color0: [1.0; 4],
+                color1: [1.0; 4],
+                color2: [1.0; 4],
+                point: [0.25, 0.5, 1.0, 1.0],
+            }),
+            "root",
+        );
+        let mut list = render.command_list().unwrap();
+        list.dispatch(&p, root.gpu().cast::<triangle_at::Root>(), [1, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+        wait(render.submit(vec![list], &[]).unwrap());
+        let rows = out.as_slice().unwrap();
+        // The placement mirrors x, and a tangent's sign doesn't tell a frame's set.
+        let along =
+            |row: [f32; 4], axis: Vec3| Vec3::from_slice(&row).abs().abs_diff_eq(axis, 1e-5);
+        assert!(along(rows[4], base), "{:?}", rows[4]);
+        assert!(along(rows[5], coat), "{:?}", rows[5]);
     }
     assert_clean();
 }

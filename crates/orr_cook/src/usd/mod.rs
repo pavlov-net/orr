@@ -927,7 +927,9 @@ impl<'s> Importer<'s> {
             }
             // PS `UsdPrimvarReader`: `fallback` is "returned if geometry fetch failed".
             let material = &self.materials[m];
-            let frame = material.tangent_set().is_some() && self.frames[m].set == 1;
+            let frame = material.tangent_set().is_some()
+                && (self.frames[m].set == 1
+                    || material.material.coat_frame_uv == Material::FRAME_UV1);
             if w.missing_uv1.contains(&m)
                 && (frame || material.textures.refs().any(|r| r.uv_set == 1))
             {

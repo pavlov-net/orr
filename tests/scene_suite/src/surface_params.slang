@@ -60,6 +60,8 @@ void main(uint3 id: SV_DispatchThreadID)
     i.frame_normal = i.normal;
     i.geometric_normal = i.normal;
     i.tangent = float4(1.0, 0.0, 0.0, 1.0);
+    i.coat_frame_normal = i.frame_normal;
+    i.coat_tangent = i.tangent;
     i.object_normal = i.normal;
     i.object_to_render = float3x3(0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0);
     i.vertex_color = root.vertex_color;

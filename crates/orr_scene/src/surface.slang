@@ -54,6 +54,8 @@ public struct SurfaceInput
     public float3 normal;           // interpolated vertex normal, unit
     public float3 frame_normal;     // `normal` before normalizing, not always unit
     public float4 tangent;          // xyz as interpolated, not always unit; w bitangent sign
+    public float3 coat_frame_normal; // `frame_normal` of the frame the coat follows
+    public float4 coat_tangent;     // `tangent` of the frame the coat follows
     public float3 object_position;
     public float3 object_normal;
     public float3x3 object_to_render; // the instance's linear transform
@@ -169,9 +171,11 @@ public float3 material_normal(SurfaceInput i, MaterialGpu* m, uint slot = TEXTUR
         return safe_normalize(mul(c, 2.0 * texel.xyz - 1.0) * side, i.normal);
     }
     float3 v = material_normal_frame(m, slot, normal_decode(texel.xy));
-    float3 n = i.frame_normal;
-    float3 t = i.tangent.xyz;
-    float3 b = cross(n, t) * i.tangent.w;
+    bool coat = slot == TEXTURE_COAT_NORMAL;
+    float3 n = coat ? i.coat_frame_normal : i.frame_normal;
+    float4 tangent = coat ? i.coat_tangent : i.tangent;
+    float3 t = tangent.xyz;
+    float3 b = cross(n, t) * tangent.w;
     return safe_normalize(t * v.x + b * v.y + n * v.z, i.normal);
 }
 
@@ -344,12 +348,12 @@ float3 surface_specular_color(MaterialGpu* m, float3 color, float ior)
     return mul(REC709_TO_REC2020, saturate(scale * mul(REC2020_TO_REC709, color)));
 }
 
-// The direction `rotation` turns from the mesh tangent about `normal`, measured from
+// The direction `rotation` turns from `tangent` about `normal`, measured from
 // orthonormal_basis(normal).
-float surface_tangent_angle(SurfaceInput i, float3 normal, float rotation)
+float surface_tangent_angle(float4 tangent, float3 normal, float rotation)
 {
-    float3 t = safe_normalize(i.tangent.xyz - normal * dot(normal, i.tangent.xyz), float3(1, 0, 0));
-    float3 b = cross(normal, t) * i.tangent.w;
+    float3 t = safe_normalize(tangent.xyz - normal * dot(normal, tangent.xyz), float3(1, 0, 0));
+    float3 b = cross(normal, t) * tangent.w;
     float3 d = cos(rotation) * t + sin(rotation) * b;
     float3 t0, b0;
     orthonormal_basis(normal, t0, b0);
@@ -415,7 +419,7 @@ public struct StandardSurface : ISurface
         {
             p.specular_anisotropy = m.specular_anisotropy * surface_scale(i, m, TEXTURE_ANISOTROPY);
             float rotation = m.specular_rotation + material_direction(m, TEXTURE_TANGENT, i.uv);
-            p.tangent_angle = surface_tangent_angle(i, s.normal, rotation);
+            p.tangent_angle = surface_tangent_angle(i.tangent, s.normal, rotation);
             p.flags |= BSDF_ANISOTROPY;
         }
         p.coat_normal = (m.flags & MATERIAL_COAT_ON_BASE) != 0 ? s.normal : i.normal;
@@ -427,7 +431,7 @@ public struct StandardSurface : ISurface
         {
             p.flags |= BSDF_COAT;
             if (p.coat_anisotropy > 0.0)
-                p.coat_tangent_angle = surface_tangent_angle(i, p.coat_normal, m.coat_rotation + material_direction(m, TEXTURE_COAT_TANGENT, i.uv));
+                p.coat_tangent_angle = surface_tangent_angle(i.coat_tangent, p.coat_normal, m.coat_rotation + material_direction(m, TEXTURE_COAT_TANGENT, i.uv));
             if (p.coat_anisotropy > 0.0 || any(p.coat_normal != s.normal))
                 p.flags |= BSDF_COAT_FRAME;
         }
