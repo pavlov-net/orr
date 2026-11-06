@@ -237,11 +237,10 @@ pub(crate) enum Primvar {
     /// One value for the whole mesh.
     Constant(Vec<f32>),
     /// Values that vary over the mesh, of `width` channels, at most the stream's four: a reader
-    /// takes a wider primvar's first ones. The stream holds them over `scale`
-    /// ([`stream_scale`]), `None` on a mesh that holds no stream and so reads 1.
+    /// takes a wider primvar's first ones. The stream holds them over `scale` ([`stream_scale`]).
     Varying {
         width: u8,
-        scale: Option<f32>,
+        scale: f32,
     },
     Missing,
 }
@@ -259,8 +258,24 @@ pub(crate) struct VertexRead {
     pub(crate) scale: f32,
 }
 
+impl VertexRead {
+    /// Puts into the stream's channels `c` what they hold of element `v` of the primvar: where the
+    /// mesh holds none, the fallback.
+    pub(crate) fn put(&self, v: Option<&[f64]>, c: &mut [f32; 4]) {
+        for k in 0..usize::from(self.width) {
+            let x = v.map_or(f64::from(self.fallback[k]), |v| v[k]);
+            c[usize::from(self.first) + k] = (x / f64::from(self.scale)) as f32;
+        }
+    }
+}
+
 /// The half floats' largest value.
 const HALF_MAX: f64 = 65504.0;
+
+/// Whether the vertex color stream's half floats hold `x`.
+pub(crate) fn stream_holds(x: f32) -> bool {
+    half::f16::from_f32(x).is_finite()
+}
 
 /// What the vertex color stream divides values of magnitude up to `peak` by: 1 where its half
 /// floats hold them, else the least power of two that brings `peak` within them, which leaves
@@ -1060,7 +1075,7 @@ impl Mapper<'_, '_> {
         n: usize,
         name: &str,
         width: u8,
-        scale: Option<f32>,
+        scale: f32,
         fallback: [f32; 4],
     ) -> Result<u8, String> {
         let same = |r: &&VertexRead| r.name == name && r.width == width;
@@ -1089,11 +1104,9 @@ impl Mapper<'_, '_> {
             first,
             width,
             fallback,
-            scale: scale.map_or(1.0, |s| {
-                s.max(stream_scale(
-                    fallback.iter().fold(0.0, |p, &x| p.max(f64::from(x.abs()))),
-                ))
-            }),
+            scale: scale.max(stream_scale(
+                fallback.iter().fold(0.0, |p, &x| p.max(f64::from(x.abs()))),
+            )),
         });
         Ok(first)
     }

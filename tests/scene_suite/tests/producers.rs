@@ -18,8 +18,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use orr_cook::{
-    ArchiveSpec, AssetSpec, CageInput, Corner, Crease, FaceVarying, Manifest, Source, SubdSettings,
-    Subdivision, UsdSettings,
+    ArchiveSpec, AssetSpec, CageColor, CageInput, ColorValues, Corner, Crease, FaceVarying,
+    Manifest, Source, SubdSettings, Subdivision, UsdSettings,
 };
 use orr_gpu::{
     Blend, ClearColor, ColorAttachment, ColorLoad, ColorMask, ColorTarget, ComputePipeline, Device,
@@ -27,7 +27,7 @@ use orr_gpu::{
     RasterState, Rendering, SamplerDesc, ShaderStage, SpecData, Stages, StorageImageIndex, Texture,
     TextureDesc, TextureIndex, TextureMemory, TextureRegion, TextureUsage,
 };
-use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_pack::AssetId;
 use orr_pack::subd::{Page as SubdPage, SubdInfo};
 use orr_scene::testing::{
@@ -44,7 +44,7 @@ use orr_scene::{
 };
 use orr_shaders::bytemuck::Zeroable;
 use scene_suite::shaders::{
-    blades, particle_draw, patches, producer_rays, strand_rays, strands, tess_rays,
+    blades, cage_colors, particle_draw, patches, producer_rays, strand_rays, strands, tess_rays,
 };
 use scene_suite::{Workers, linked, pipeline};
 
@@ -1045,6 +1045,8 @@ struct Generated {
     /// Empty where the entry keeps no previous positions.
     previous: Vec<Vec3>,
     attrs: Vec<[u32; 2]>,
+    /// The vertex color stream; empty where the entry keeps none.
+    colors: Vec<[f32; 4]>,
     patch_clusters: Vec<ProducerClusterGpu>,
     patch_positions: Vec<Vec3>,
     patch_previous: Vec<Vec3>,
@@ -1073,7 +1075,14 @@ fn generated(view: &RasterView, entry: ProducerId) -> Generated {
             v3(read_buffer(b.previous.cast(), n))
         }
     };
+    let colors = if b.colors.address().0 == 0 {
+        Vec::new()
+    } else {
+        let words: Vec<[half::f16; 4]> = read_buffer(b.colors.cast(), vertices);
+        words.iter().map(|c| c.map(half::f16::to_f32)).collect()
+    };
     Generated {
+        colors,
         clusters: read_buffer(b.clusters, clusters),
         records: read_buffer(b.generated, clusters),
         positions: v3(read_buffer(b.positions.cast(), vertices)),
@@ -1803,7 +1812,94 @@ def Xform "World"
 }
 "#;
 
-/// The cages: `cages` (cage only) and the skinned `arm/Arm` from USD.
+/// Quads of the painted cage along x and along z, and the row and column its features lie on.
+const PAINTED_QUADS: u32 = 6;
+const PAINTED_MIDDLE: u32 = 3;
+/// m between the painted cage's points.
+const PAINTED_STEP: f32 = 0.4;
+/// The painted cage's face that reads none of its colors.
+const PAINTED_BARE: u32 = 7;
+/// What the face-varying color adds to its green past the seam.
+const PAINTED_JUMP: f32 = 0.3;
+
+/// A grid folded along an infinitely sharp crease at column [`PAINTED_MIDDLE`]. Red is the
+/// height, on the surface's basis, so the limit surface states what it reads. Green and blue are
+/// face-varying with a seam along row [`PAINTED_MIDDLE`], across the crease. Alpha is a checker
+/// of the points, linear over each face.
+fn painted_cage() -> CageInput {
+    let n = PAINTED_QUADS;
+    let point = |i: u32, j: u32| j * (n + 1) + i;
+    let mut c = CageInput::default();
+    let (mut seamed, mut checker, mut heights) = (Vec::new(), Vec::new(), Vec::new());
+    for j in 0..=n {
+        for i in 0..=n {
+            let height = 0.2 * i.abs_diff(PAINTED_MIDDLE) as f32 + 0.05 * (j % 3) as f32;
+            let centered = |k: u32| (k as f32 - PAINTED_MIDDLE as f32) * PAINTED_STEP;
+            c.positions
+                .push(Vec3::new(centered(i), height, centered(j)));
+            heights.push(Vec4::new(height, 0.0, 0.0, 0.0));
+            seamed.push(Vec4::new(0.0, 0.1 * i as f32, 0.15 * j as f32, 0.0));
+            checker.push(Vec4::new(
+                0.0,
+                0.0,
+                0.0,
+                if (i + j) % 2 == 0 { 0.25 } else { 0.75 },
+            ));
+        }
+    }
+    let mut seam_indices = Vec::new();
+    let first_copy = seamed.len() as u32;
+    for i in 0..=n {
+        let at = seamed[point(i, PAINTED_MIDDLE) as usize];
+        seamed.push(at + Vec4::new(0.0, PAINTED_JUMP, 0.0, 0.0));
+    }
+    for j in 0..n {
+        for i in 0..n {
+            let corners = [(i, j), (i, j + 1), (i + 1, j + 1), (i + 1, j)];
+            c.face_counts.push(4);
+            c.face_indices.extend(corners.map(|(i, j)| point(i, j)));
+            seam_indices.extend(corners.map(|(a, b)| {
+                if b == PAINTED_MIDDLE && j == PAINTED_MIDDLE {
+                    first_copy + a
+                } else {
+                    point(a, b)
+                }
+            }));
+        }
+    }
+    for j in 0..n {
+        c.creases.push(Crease {
+            edge: [point(PAINTED_MIDDLE, j), point(PAINTED_MIDDLE, j + 1)],
+            sharpness: 10.0,
+        });
+    }
+    let faces: Vec<u32> = (0..n * n).filter(|&f| f != PAINTED_BARE).collect();
+    let color = |values, channels| CageColor {
+        values,
+        channels,
+        faces: faces.clone(),
+    };
+    c.colors = vec![
+        color(ColorValues::Vertex(heights), 0b0001),
+        color(
+            ColorValues::FaceVarying(FaceVarying {
+                values: seamed,
+                indices: seam_indices,
+            }),
+            0b0110,
+        ),
+        color(
+            ColorValues::Linear(FaceVarying {
+                values: checker,
+                indices: c.face_indices.clone(),
+            }),
+            0b1000,
+        ),
+    ];
+    c
+}
+
+/// The cages: `cages` (cage only), `painted` and the skinned `arm/Arm` from USD.
 fn cage_pack() -> &'static Arc<[u8]> {
     static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
     PACK.get_or_init(|| {
@@ -1822,6 +1918,14 @@ fn cage_pack() -> &'static Arc<[u8]> {
                         name: "cages".into(),
                         source: Source::Subd {
                             cage: closed_cages(),
+                            materials: vec![material],
+                            settings: SubdSettings::default(),
+                        },
+                    },
+                    AssetSpec {
+                        name: "painted".into(),
+                        source: Source::Subd {
+                            cage: painted_cage(),
                             materials: vec![material],
                             settings: SubdSettings::default(),
                         },
@@ -1874,11 +1978,12 @@ struct LimitSurface {
     cell: f32,
 }
 
-/// A page with its points and uv points.
+/// A page with its points, uv points and color points.
 struct PosedPage {
     page: SubdPage,
     points: Vec<[f32; 3]>,
     uv_points: Vec<[f32; 2]>,
+    color_points: Vec<[f32; 4]>,
 }
 
 /// Face coordinates on face `face` of page `page`.
@@ -1898,6 +2003,8 @@ struct Nearest {
     /// rational blend.
     normal: Vec3,
     uv: Vec2,
+    color: [f32; 4],
+    spot: Spot,
     distance: f32,
     /// Radians between the normals of the faces that meet at the point.
     spread: f32,
@@ -1913,6 +2020,7 @@ impl LimitSurface {
                     page: p.clone(),
                     points: p.points(points),
                     uv_points: p.uv_points(&info.uvs),
+                    color_points: p.color_points(&info.colors),
                 })
                 .collect(),
             cells: HashMap::new(),
@@ -2032,10 +2140,16 @@ impl LimitSurface {
             .page
             .limit_uv(s.face, s.u as f32, s.v as f32, &page.uv_points)
             .unwrap_or_default();
+        let color = page
+            .page
+            .limit_color(s.face, s.u as f32, s.v as f32, &page.color_points)
+            .unwrap();
         Nearest {
             position,
             normal: normal.normalize().as_vec3(),
             uv: Vec2::from(uv),
+            color,
+            spot: s,
             distance: position.distance(x),
             spread: 0.0,
         }
@@ -2127,15 +2241,15 @@ struct CageScene {
 
 impl CageScene {
     fn new(dice_pixels: f32) -> Self {
-        let mut scenes = Scenes::new(
-            device(),
-            &RendererDesc {
-                kernels: &linked::KERNELS,
-                dice_pixels,
-                ..RendererDesc::default()
-            },
-        )
-        .unwrap();
+        Self::with(&RendererDesc {
+            kernels: &linked::KERNELS,
+            dice_pixels,
+            ..RendererDesc::default()
+        })
+    }
+
+    fn with(desc: &RendererDesc) -> Self {
+        let mut scenes = Scenes::new(device(), desc).unwrap();
         let workers = Workers::start(&scenes, 2);
         let mount = scenes.mount(PackSource::Memory(Arc::clone(cage_pack())));
         let start = Instant::now();
@@ -2437,6 +2551,165 @@ fn subdivision_cages_dice_closed_at_mixed_rates_on_their_limit_surface_in_raster
             "{far_apart} of {covered} disagree on depth"
         );
     }
+    assert_clean();
+}
+
+/// What `view` shows of producer entries, per pixel.
+fn seen_colors(view: &RasterView) -> Vec<cage_colors::Seen> {
+    let d = device();
+    let n = u64::from(EXTENT[0] * EXTENT[1]);
+    let out = d
+        .gpu_malloc::<cage_colors::Seen>(MemoryKind::Readback, n, "seen")
+        .unwrap();
+    let mut root = d
+        .gpu_malloc::<cage_colors::Root>(MemoryKind::Upload, 1, "root")
+        .unwrap();
+    root.as_mut_slice().unwrap()[0] = cage_colors::Root {
+        scene: view.scene,
+        view: view.view,
+        gbuffer: view.gbuffer,
+        out: out.gpu(),
+    };
+    let p = pipeline(&cage_colors::MODULE, "main");
+    let render = d.queue(QueueKind::Render).unwrap();
+    let mut list = render.command_list().unwrap();
+    list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+    list.dispatch(&p, root.gpu(), [n.div_ceil(64) as u32, 1, 1]);
+    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+    wait(render.submit(vec![list], &[]).unwrap());
+    out.as_slice().unwrap().to_vec()
+}
+
+/// Half floats near the painted colors round by up to this, with room for the f32 evaluation.
+const COLOR_TOLERANCE: f32 = 1e-3;
+
+/// The largest difference between two colors' channels.
+fn color_error(a: [f32; 4], b: [f32; 4]) -> f32 {
+    (0..4).map(|k| (a[k] - b[k]).abs()).fold(0.0, f32::max)
+}
+
+#[test]
+fn a_cage_carries_its_colors_across_a_crease_and_a_seam_to_what_the_raster_shows() {
+    let mut s = CageScene::with(&RendererDesc {
+        dice_pixels: 2.0,
+        ..RendererDesc::default()
+    });
+    let model = s.model("painted");
+    let (info, pages) = cage_entry("painted/subd");
+    let limit = LimitSurface::new(&info, &pages, &info.points);
+    let (eye, target) = (Vec3::new(0.0, 2.6, 1.8), Vec3::new(0.0, 0.2, 0.0));
+    let mut group = TransformGroupId(0);
+    s.frame(
+        |w| {
+            group = w
+                .create_transform_group(&TransformGroupDesc {
+                    count: 1,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::ZERO,
+                })
+                .unwrap();
+            w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+            let desc = SubdDesc {
+                model,
+                transform: (group, 0),
+                max_clusters: 16_384,
+                max_vertices: 16_384 * 78,
+                ..SubdDesc::default()
+            };
+            w.set_subd(SMOOTH, Some(&desc)).unwrap();
+        },
+        eye,
+        target,
+        target,
+    );
+    for _ in 0..2 {
+        s.frame(|_| {}, eye, target, target);
+    }
+    let view = s.frame(|_| {}, eye, target, target);
+    let g = generated(&view, SMOOTH);
+    let seen = seen_colors(&view);
+    let stats = s.stats();
+    assert_eq!(stats.dice_dropped + stats.split_dropped, 0, "{stats:?}");
+    assert_eq!(g.colors.len(), g.positions.len());
+
+    let cage = painted_cage();
+    let ColorValues::Linear(checker) = &cage.colors[2].values else {
+        panic!("the checker is linear");
+    };
+    let bare = |spot: Spot| limit.pages[spot.page].page.faces[spot.face].base == PAINTED_BARE;
+    // Of the faces at a point, the one that explains its color: a seam or a face's border has
+    // more than one.
+    let closest = |p: Vec3, color: [f32; 4]| {
+        limit
+            .candidates(p)
+            .into_iter()
+            .filter(|c| c.distance < LIMIT_TOLERANCE)
+            .min_by(|a, b| color_error(a.color, color).total_cmp(&color_error(b.color, color)))
+            .unwrap_or_else(|| panic!("no surface at {p}"))
+    };
+
+    // Every generated vertex holds the CPU limit's color, and away from the bare face what the
+    // spec of each interpolation says without the color tables: red rides the surface, and
+    // alpha is bilinear in its face's corners.
+    let (mut worst, mut worst_red, mut worst_alpha) = (0.0f32, 0.0f32, 0.0f32);
+    let mut bare_vertices = 0;
+    let mut greens: HashMap<[u32; 3], (f32, f32)> = HashMap::new();
+    for (&p, &color) in g.positions.iter().zip(&g.colors) {
+        let n = closest(p, color);
+        worst = worst.max(color_error(n.color, color));
+        if bare(n.spot) {
+            bare_vertices += 1;
+            assert_eq!(color, [1.0; 4], "the bare face at {p}");
+            continue;
+        }
+        worst_red = worst_red.max((color[0] - p.y).abs());
+        let face = limit.pages[n.spot.page].page.faces[n.spot.face].base as usize;
+        let corners = &checker.indices[4 * face..4 * face + 4];
+        let a = |c: usize| checker.values[corners[c] as usize].w;
+        let (u, v) = (n.spot.u as f32, n.spot.v as f32);
+        let alpha = (1.0 - v) * ((1.0 - u) * a(0) + u * a(1)) + v * ((1.0 - u) * a(3) + u * a(2));
+        worst_alpha = worst_alpha.max((color[3] - alpha).abs());
+        let green = greens
+            .entry(p.to_array().map(f32::to_bits))
+            .or_insert((color[1], color[1]));
+        *green = (green.0.min(color[1]), green.1.max(color[1]));
+    }
+    assert!(worst < COLOR_TOLERANCE, "{worst} from the CPU limit");
+    assert!(
+        worst_red < COLOR_TOLERANCE,
+        "red {worst_red} from the height"
+    );
+    assert!(
+        worst_alpha < COLOR_TOLERANCE,
+        "alpha {worst_alpha} from bilinear"
+    );
+    assert!(bare_vertices > 0);
+
+    // Both sides of the seam meet at one point of the surface with their own colors, the jump
+    // apart.
+    let jumps = greens
+        .values()
+        .filter(|&&(lo, hi)| (hi - lo - PAINTED_JUMP).abs() < 0.01)
+        .count();
+    assert!(
+        jumps > 2 * PAINTED_QUADS as usize,
+        "{jumps} points on the seam"
+    );
+
+    // Hits read the stream between those vertices.
+    let (mut shown, mut worst_shown) = (0, 0.0f32);
+    for s in seen.iter().filter(|s| s.shown != 0) {
+        shown += 1;
+        let [a, b, c] = s.corners.map(|v| Vec4::from(g.colors[v as usize]));
+        let [u, v] = s.barycentrics;
+        let color = a * (1.0 - u - v) + b * u + c * v;
+        worst_shown = worst_shown.max(color_error(color.to_array(), s.color));
+    }
+    assert!(shown > EXTENT[0] * EXTENT[1] / 8, "{shown} pixels shown");
+    assert!(
+        worst_shown < 1e-5,
+        "{worst_shown} from the triangle's corners"
+    );
     assert_clean();
 }
 

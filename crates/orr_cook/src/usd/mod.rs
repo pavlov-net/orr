@@ -93,6 +93,8 @@
 //! control faces as they are, [`Subdivision::Cage`] cooks the model's cages as one
 //! subdivision cage entry (Catmull-Clark only; every cage of a model shares its
 //! `interpolateBoundary`, `faceVaryingLinearInterpolation` and `triangleSubdivisionRule`).
+//! The primvars a cage's materials read through the vertex color stream come out of the
+//! tessellator by their interpolation ([`mesh::CageBuilder`]).
 //! Faces take the material of their `GeomSubset` of family `materialBind`, else of the
 //! mesh: the direct binding `material:binding:full`, else `material:binding`, of the prim or
 //! its nearest ancestor (collection bindings are not read). Materials map as [`crate::shading`] lists and are named `<asset>/material/<path>`
@@ -379,6 +381,11 @@ struct Assembly<'a> {
     holders: &'a mut Vec<Vec<(usize, DMat4)>>,
     meshes: &'a mut Vec<(usize, usize)>,
 }
+
+/// How far past its largest value the stream keeps room for a cage's primvar: a patch near an
+/// extraordinary point approximates the limit surface, which stays in the hull of the cage, and
+/// can pass it. A power of two more leaves every mantissa as it is.
+const CAGE_COLOR_REACH: f64 = 2.0;
 
 /// `UsdTimeCode::SafeStep`: past rounding at any time code a stage holds.
 const SAFE_STEP: f64 = f64::EPSILON * 1e7;
@@ -1088,7 +1095,7 @@ impl<'s> Importer<'s> {
                 for read in &frame.vertex {
                     if !read_primvars.contains_key(&read.name) {
                         let held = r.wide_primvar(&read.name)?;
-                        if let Some(p) = held.as_ref().filter(|p| p.width() > 4 && !as_cage) {
+                        if let Some(p) = held.as_ref().filter(|p| p.width() > 4) {
                             self.warnings.push(format!(
                                 "{path}: primvar {} is {} wide; a reader takes the first 4",
                                 read.name,
@@ -1098,7 +1105,7 @@ impl<'s> Importer<'s> {
                         let missing = held
                             .as_ref()
                             .map_or(0, |p| p.missing(mesh.domain(p.interp)));
-                        if missing > 0 && !as_cage {
+                        if missing > 0 {
                             self.warnings.push(format!(
                                 "{path}: primvar {} holds no value for {missing} elements of the \
                                  mesh; its reader's fallback stands in for them",
@@ -1132,16 +1139,9 @@ impl<'s> Importer<'s> {
                 }
             }
             let colored = used.iter().any(|&m| !self.frames[m].vertex.is_empty());
-            if colored {
-                if as_cage {
-                    self.warnings.push(format!(
-                        "{path}: a subdivision cage holds no vertex colors; what a material reads \
-                         of them reads 1"
-                    ));
-                } else {
-                    for &(m, _) in &holders[o] {
-                        models[m].welder.carries_colors = true;
-                    }
+            if colored && !as_cage {
+                for &(m, _) in &holders[o] {
+                    models[m].welder.carries_colors = true;
                 }
             }
             let skeleton = models[o].skeleton.and_then(|k| skels.get(k)).map(|s| &s.1);
@@ -1230,14 +1230,25 @@ impl<'s> Importer<'s> {
                 let mut c = [1.0; 4];
                 for read in &self.frames[faces[face]].vertex {
                     let held = read_primvars[&read.name].as_ref();
-                    let v = held.and_then(|p| p.at(point, face, corner));
-                    for k in 0..usize::from(read.width) {
-                        let x = v.map_or(f64::from(read.fallback[k]), |v| v[k]);
-                        c[usize::from(read.first) + k] = (x / f64::from(read.scale)) as f32;
-                    }
+                    read.put(held.and_then(|p| p.at(point, face, corner)), &mut c);
                 }
                 c
             };
+            let mut color_reads: Vec<mesh::ColorRead<'_>> = Vec::new();
+            if as_cage {
+                for (face, &m) in faces.iter().enumerate() {
+                    for read in &self.frames[m].vertex {
+                        match color_reads.iter_mut().find(|c| c.read == read) {
+                            Some(c) => c.faces.push(face),
+                            None => color_reads.push(mesh::ColorRead {
+                                read,
+                                held: read_primvars[&read.name].as_ref(),
+                                faces: vec![face],
+                            }),
+                        }
+                    }
+                }
+            }
             for (&(m, linear), turned) in holders[o].iter().zip(&turned) {
                 let turned_material = |f: usize| {
                     let m = face_material(f);
@@ -1249,6 +1260,7 @@ impl<'s> Importer<'s> {
                     skin: skin.as_deref(),
                     part,
                     color: &color,
+                    color_reads: &color_reads,
                 };
                 match &surface {
                     None => models[m].cage.add(&mesh, &placing, &path)?,
@@ -2834,20 +2846,22 @@ impl<'s> Importer<'s> {
     }
 
     /// What mesh prim `mesh` holds for primvar `name`. A constant primvar inherits down
-    /// namespace. A cage holds no stream, so nothing is scaled to fit one.
+    /// namespace.
     fn primvar(&self, mesh: usize, name: &str) -> Result<shading::Primvar, String> {
         let set = self.settings.uv_sets().position(|s| s == name);
         let facts = MeshFacts::read(&self.reader(&self.nodes[mesh].prim))?;
         let cage = !facts.polygonal && self.settings.subdivision == Subdivision::Cage;
+        let reach = if cage { CAGE_COLOR_REACH } else { 1.0 };
         let mut at = Some(mesh);
         while let Some(i) = at {
-            match (self.reader(&self.nodes[i].prim).whole_primvar(name)?, set) {
+            match (
+                self.reader(&self.nodes[i].prim)
+                    .whole_primvar(name, reach)?,
+                set,
+            ) {
                 (shading::Primvar::Missing, _) => {}
                 (_, Some(set)) if i == mesh => return Ok(shading::Primvar::Uv(set as u8)),
                 (shading::Primvar::Varying { .. }, _) if i != mesh => {}
-                (shading::Primvar::Varying { width, .. }, _) if cage => {
-                    return Ok(shading::Primvar::Varying { width, scale: None });
-                }
                 (held, _) => return Ok(held),
             }
             at = self.nodes[i].parent;

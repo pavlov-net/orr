@@ -411,6 +411,7 @@ struct BatchAt {
     positions: u64,
     previous: Option<u64>,
     attrs: u64,
+    colors: Option<u64>,
     vertex_user: Option<u64>,
 }
 
@@ -421,6 +422,7 @@ impl BatchAt {
         clusters: u32,
         vertices: u32,
         extra: u32,
+        colored: bool,
         take: &mut dyn FnMut(u64) -> u64,
     ) -> Self {
         let vertices = u64::from(vertices);
@@ -429,6 +431,7 @@ impl BatchAt {
             positions: take(12 * (vertices + u64::from(extra))),
             previous: desc.previous_positions.then(|| take(12 * vertices)),
             attrs: take(8 * vertices),
+            colors: colored.then(|| take(8 * vertices)),
             vertex_user: desc.vertex_user.then(|| take(4 * vertices)),
         }
     }
@@ -557,6 +560,7 @@ pub(crate) fn build(
         built_clusters,
         desc.max_vertices,
         sentinels,
+        subd.is_some_and(|s| s.shape.colored),
         &mut take,
     );
     let generated_at = take(only(
@@ -569,6 +573,7 @@ pub(crate) fn build(
             desc.max_patch_clusters,
             desc.max_patch_vertices,
             0,
+            false,
             &mut take,
         );
         (at, take(16))
@@ -797,6 +802,7 @@ pub(crate) fn build(
         positions: at(b.positions).cast(),
         previous: b.previous.map_or(GpuPtr::NULL, |o| at(o).cast()),
         attrs: at(b.attrs).cast(),
+        colors: b.colors.map_or(GpuPtr::NULL, |o| at(o).cast()),
         vertex_user: b.vertex_user.map_or(GpuPtr::NULL, |o| at(o).cast()),
         cluster_count: counts,
         vertex_count: counts.offset(1),

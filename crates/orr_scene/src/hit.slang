@@ -223,7 +223,7 @@ public ProducerTriangle producer_triangle(ProducerBatch b, ProducerClusterGpu k,
         a.uv[0] = producer_uv(b.attrs[v]);
         a.uv[1] = a.uv[0];
         a.tangent = float4(1.0, 0.0, 0.0, 1.0);
-        a.color = float4(1.0);
+        a.color = b.colors != nullptr ? producer_color(b.colors[v]) : float4(1.0);
         t.corners.attributes[j] = a;
         t.vertex_user[j] = b.vertex_user != nullptr ? b.vertex_user[v] : 0;
     }

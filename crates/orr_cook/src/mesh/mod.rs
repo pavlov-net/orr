@@ -37,6 +37,7 @@ use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::assembly::AssemblySettings;
+use crate::shading::stream_holds;
 use crate::state::Memo;
 use crate::texture::Wrap;
 use crate::texture::tiles::Cell;
@@ -1132,8 +1133,13 @@ pub(crate) fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
     {
         return Err("non-finite vertex attribute".into());
     }
-    let half = |x: &f32| half::f16::from_f32(*x).is_finite();
-    if !m.colors.iter().flatten().flatten().all(half) {
+    if !m
+        .colors
+        .iter()
+        .flatten()
+        .flatten()
+        .all(|&x| stream_holds(x))
+    {
         return Err("a vertex color past what the stream's half floats hold".into());
     }
     Ok(())

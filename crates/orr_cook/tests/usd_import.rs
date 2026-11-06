@@ -1735,20 +1735,107 @@ def Xform "World"
 }
 "#;
 
-/// The limit positions and uvs of every face of a subdivision cage entry on a 3x3 grid.
+/// A left-handed 2 by 2 grid whose faces read primvars of each interpolation through the vertex
+/// color stream: `M` a vertex color and a face-varying fade, `N` a varying color.
 #[cfg(feature = "subd")]
-fn limit_samples(a: &Archive, name: &str) -> Vec<(u32, [f32; 3], [f32; 2])> {
+const PAINTED_CAGE: &str = r#"#usda 1.0
+(
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+def Mesh "Grid"
+{
+    uniform token orientation = "leftHanded"
+    int[] faceVertexCounts = [4, 4, 4, 4]
+    int[] faceVertexIndices = [0, 1, 4, 3, 1, 2, 5, 4, 3, 4, 7, 6, 4, 5, 8, 7]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 0, 1), (1, 0.5, 1), (2, 0, 1), (0, 0, 2), (1, 0, 2), (2, 0, 2)]
+    color3f[] primvars:paint = [(0, 0, 1), (0, 1, 0), (1, 0, 0), (0, 1, 1), (1, 1, 0), (1, 0, 1), (0.5, 0, 0), (0, 0.5, 0), (0, 0, 0.5)] (
+        interpolation = "vertex"
+    )
+    float[] primvars:fade = [0.25, 0.5, 0.75, 1] (
+        interpolation = "faceVarying"
+    )
+    int[] primvars:fade:indices = [0, 1, 1, 0, 1, 2, 2, 1, 3, 3, 2, 2, 3, 2, 2, 3]
+    color3f[] primvars:tint = [(1, 0, 0), (0, 0, 0), (0, 1, 0), (0, 0, 0), (0, 0, 1), (0, 0, 0), (1, 1, 0), (0, 0, 0), (0, 1, 1)] (
+        interpolation = "varying"
+    )
+    rel material:binding = </Looks/M>
+
+    def GeomSubset "Right"
+    {
+        uniform token elementType = "face"
+        uniform token familyName = "materialBind"
+        int[] indices = [1, 3]
+        rel material:binding = </Looks/N>
+    }
+}
+
+def Scope "Looks"
+{
+    def Material "M"
+    {
+        token outputs:surface.connect = </Looks/M/S.outputs:surface>
+        def Shader "S"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor.connect = </Looks/M/Paint.outputs:result>
+            float inputs:opacity.connect = </Looks/M/Fade.outputs:result>
+            token outputs:surface
+        }
+        def Shader "Paint"
+        {
+            uniform token info:id = "UsdPrimvarReader_float3"
+            string inputs:varname = "paint"
+            float3 outputs:result
+        }
+        def Shader "Fade"
+        {
+            uniform token info:id = "UsdPrimvarReader_float"
+            string inputs:varname = "fade"
+            float outputs:result
+        }
+    }
+    def Material "N"
+    {
+        token outputs:surface.connect = </Looks/N/S.outputs:surface>
+        def Shader "S"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor.connect = </Looks/N/Tint.outputs:result>
+            token outputs:surface
+        }
+        def Shader "Tint"
+        {
+            uniform token info:id = "UsdPrimvarReader_float3"
+            string inputs:varname = "tint"
+            float3 outputs:result
+        }
+    }
+}
+"#;
+
+/// A ptex face and its limit position, uv and color at one point.
+#[cfg(feature = "subd")]
+type LimitSample = (u32, [f32; 3], Option<[f32; 2]>, [f32; 4]);
+
+/// The limit positions, uvs and colors of every face of a subdivision cage entry on a 3x3 grid.
+#[cfg(feature = "subd")]
+fn limit_samples(a: &Archive, name: &str) -> Vec<LimitSample> {
     use orr_pack::subd::{Page, SubdInfo};
     let info = SubdInfo::parse(&blob(a, name, 0)).unwrap();
     let mut out = Vec::new();
     for p in &info.pages {
         let page = Page::parse(&blob(a, name, p.blob as usize)).unwrap();
         let (points, uvs) = (page.points(&info.points), page.uv_points(&info.uvs));
+        let colors = page.color_points(&info.colors);
         for (f, face) in page.faces.iter().enumerate() {
             for u in [0.0, 0.5, 1.0] {
                 for v in [0.0, 0.5, 1.0] {
                     let l = page.limit(f, u, v, &points).unwrap();
-                    out.push((face.ptex, l.position, page.limit_uv(f, u, v, &uvs).unwrap()));
+                    let uv = page.limit_uv(f, u, v, &uvs);
+                    let color = page.limit_color(f, u, v, &colors).unwrap();
+                    out.push((face.ptex, l.position, uv, color));
                 }
             }
         }
@@ -1818,6 +1905,7 @@ fn usd_cages_cook_the_surface_of_the_same_cage_built_in_memory() {
             values: st.iter().map(|&[u, v]| Vec2::new(u, 1.0 - v)).collect(),
             indices: uv_indices,
         }),
+        colors: Vec::new(),
         left_handed: false,
         boundary: Boundary::Edges,
         uv_linear: UvLinear::Boundaries,
@@ -1840,9 +1928,108 @@ fn usd_cages_cook_the_surface_of_the_same_cage_built_in_memory() {
             (0..3).all(|k| (x.1[k] - y.1[k]).abs() < 1e-6),
             "{x:?} {y:?}"
         );
+        let (p, q) = (x.2.unwrap(), y.2.unwrap());
+        assert!((0..2).all(|k| (p[k] - q[k]).abs() < 1e-6), "{x:?} {y:?}");
+    }
+}
+
+/// Each primvar lands in the channels its reader took, under the rule its interpolation asks
+/// for, on the faces that read it, in the order the flipped faces hold their corners.
+#[cfg(feature = "subd")]
+#[test]
+fn usd_cages_carry_primvars_by_their_interpolation_as_the_same_cage_built_in_memory() {
+    use orr_cook::{CageColor, CageInput, ColorValues, FaceVarying, Subdivision};
+    use orr_math::{Vec3, Vec4};
+    let d = dir("usd-cage-colors");
+    std::fs::write(d.join("cage.usda"), PAINTED_CAGE).unwrap();
+    let settings = UsdSettings {
+        subdivision: Subdivision::Cage,
+        ..UsdSettings::default()
+    };
+    let (a, report) = usd(&d.join("cage.usda"), settings).unwrap();
+    assert!(report.assets[0].warnings.is_empty(), "{report:?}");
+
+    let rgb = |c: [f32; 3]| Vec4::new(c[0], c[1], c[2], 0.0);
+    let paint = [
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 1.0],
+        [1.0, 1.0, 0.0],
+        [1.0, 0.0, 1.0],
+        [0.5, 0.0, 0.0],
+        [0.0, 0.5, 0.0],
+        [0.0, 0.0, 0.5],
+    ];
+    let black = [0.0; 3];
+    let tint = [
+        [1.0, 0.0, 0.0],
+        black,
+        [0.0, 1.0, 0.0],
+        black,
+        [0.0, 0.0, 1.0],
+        black,
+        [1.0, 1.0, 0.0],
+        black,
+        [0.0, 1.0, 1.0],
+    ];
+    let corners = vec![0, 1, 4, 3, 1, 2, 5, 4, 3, 4, 7, 6, 4, 5, 8, 7];
+    let fade = [0.25, 0.5, 0.75, 1.0].map(|f| Vec4::new(0.0, 0.0, 0.0, f));
+    let cage = CageInput {
+        positions: (0..9)
+            .map(|i| {
+                let y = if i == 4 { 0.5 } else { 0.0 };
+                Vec3::new((i % 3) as f32, y, (i / 3) as f32)
+            })
+            .collect(),
+        face_counts: vec![4; 4],
+        face_indices: corners.clone(),
+        face_sections: vec![0, 1, 0, 1],
+        colors: vec![
+            CageColor {
+                values: ColorValues::Vertex(paint.map(rgb).to_vec()),
+                channels: 0b0111,
+                faces: vec![0, 2],
+            },
+            CageColor {
+                values: ColorValues::FaceVarying(FaceVarying {
+                    values: fade.to_vec(),
+                    indices: vec![0, 1, 1, 0, 1, 2, 2, 1, 3, 3, 2, 2, 3, 2, 2, 3],
+                }),
+                channels: 0b1000,
+                faces: vec![0, 2],
+            },
+            CageColor {
+                values: ColorValues::Linear(FaceVarying {
+                    values: tint.map(rgb).to_vec(),
+                    indices: corners,
+                }),
+                channels: 0b0111,
+                faces: vec![1, 3],
+            },
+        ],
+        left_handed: true,
+        ..CageInput::default()
+    };
+    let (b, _) = cook_one(Source::Subd {
+        cage,
+        materials: vec![
+            material(&a, "u/material/Looks/M"),
+            material(&a, "u/material/Looks/N"),
+        ],
+        settings: Default::default(),
+    })
+    .unwrap();
+    let (usd, built) = (limit_samples(&a, "u/subd"), limit_samples(&b, "u/subd"));
+    assert_eq!(usd.len(), 4 * 9);
+    for (x, y) in usd.iter().zip(&built) {
+        assert_eq!(x.0, y.0);
         assert!(
-            (0..2).all(|k| (x.2[k] - y.2[k]).abs() < 1e-6),
+            (0..4).all(|k| (x.3[k] - y.3[k]).abs() < 1e-6),
             "{x:?} {y:?}"
         );
     }
+    // The faces of `M` read all four channels and those of `N` read 1 in the fourth.
+    assert!(usd.iter().any(|s| s.3[3] == 1.0));
+    assert!(usd.iter().any(|s| s.3[3] < 0.9));
 }

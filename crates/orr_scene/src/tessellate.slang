@@ -7,7 +7,8 @@
 // whose edges need more than MAX_DICE segments by the pattern of their split factors;
 // `dice` writes one generated cluster per subpatch, its vertices on the patch triangle or a
 // subdivision copy's limit surface, displaced through the linked `IDisplacement` with
-// normals from finite differences of the displaced field;
+// normals from finite differences of the displaced field, and a colored copy's vertex color
+// stream at each;
 // `weld_clear`, `weld` and `weld_apply` give vertices on patch triangle edges that share an
 // undisplaced point one displaced position, which closes uv seams; `finish` keeps the
 // figures. An edge's factor depends only on its endpoints, so patches on both sides of it
@@ -328,6 +329,13 @@ struct Surface
     float2 uv;
 }
 
+// Where patch weights `w` of a subdivision copy's patch triangle lie on its patch.
+float2 patch_st(Patch pt, float3 w)
+{
+    float2 corners[3] = { triangle_corner(pt.base, 0), triangle_corner(pt.base, 1), triangle_corner(pt.base, 2) };
+    return interpolate(corners, w);
+}
+
 // The undisplaced surface at patch weights `w`, last frame's with `previous`: the patch
 // triangle interpolated, or a subdivision copy's limit surface.
 Surface undisplaced(Patch pt, float3 w, bool previous)
@@ -345,8 +353,7 @@ Surface undisplaced(Patch pt, float3 w, bool previous)
         o.uv = interpolate(uvs, w);
         return o;
     }
-    float2 corners[3] = { triangle_corner(pt.base, 0), triangle_corner(pt.base, 1), triangle_corner(pt.base, 2) };
-    float2 st = interpolate(corners, w);
+    float2 st = patch_st(pt, w);
     float3 du, dv;
     o.position = subd_limit(c.cage, previous ? c.previous : c.points, pt.base.patch, st, du, dv);
     o.normal = subd_normal(du, dv, o.normal);
@@ -404,8 +411,7 @@ bool on_patch(Patch pt, float3 w)
 {
     if (root.tess.subd == nullptr)
         return true;
-    float2 corners[3] = { triangle_corner(pt.base, 0), triangle_corner(pt.base, 1), triangle_corner(pt.base, 2) };
-    float2 st = interpolate(corners, w);
+    float2 st = patch_st(pt, w);
     return all(st >= -1e-6) && all(st <= 1.0 + 1e-6);
 }
 
@@ -500,6 +506,8 @@ void dice(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     uint v = g_first + thread;
     d.positions[v] = x;
     d.attrs[v] = producer_attributes(nd, base.uv);
+    if (d.colors != nullptr)
+        d.colors[v] = producer_color_word(subd_limit_color(root.tess.subd.cage, pt.base.patch, patch_st(pt, w)));
     if (d.previous != nullptr)
     {
         Surface before;

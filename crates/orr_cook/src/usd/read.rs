@@ -554,7 +554,10 @@ impl PrimReader<'_> {
 pub(super) enum Interp {
     Constant,
     Uniform,
+    /// A value per point on the surface's basis.
     Vertex,
+    /// A value per point, linear over each face.
+    Varying,
     FaceVarying,
 }
 
@@ -591,7 +594,7 @@ impl Primvar {
         self.get(match self.interp {
             Interp::Constant => 0,
             Interp::Uniform => face,
-            Interp::Vertex => point,
+            Interp::Vertex | Interp::Varying => point,
             Interp::FaceVarying => corner,
         })
     }
@@ -637,7 +640,8 @@ impl PrimReader<'_> {
             Some("constant") => Interp::Constant,
             Some("uniform") => Interp::Uniform,
             Some("faceVarying") => Interp::FaceVarying,
-            Some("vertex" | "varying") => Interp::Vertex,
+            Some("vertex") => Interp::Vertex,
+            Some("varying") => Interp::Varying,
             // A primvar unauthored is constant; the plain attribute has vertex as its fallback.
             None if attr == full => Interp::Constant,
             None => Interp::Vertex,
@@ -712,8 +716,9 @@ impl PrimReader<'_> {
     }
 
     /// Primvar `name` as a value for the whole prim, whatever the width of its elements. One
-    /// that holds no numbers, or whose index misses its values, gives a reader nothing.
-    pub(super) fn whole_primvar(&self, name: &str) -> Result<shading::Primvar, String> {
+    /// that holds no numbers, or whose index misses its values, gives a reader nothing. The stream
+    /// makes room for `reach` times its largest value.
+    pub(super) fn whole_primvar(&self, name: &str, reach: f64) -> Result<shading::Primvar, String> {
         let full = format!("primvars:{name}");
         let Some(value) = self.value(&full)? else {
             return Ok(shading::Primvar::Missing);
@@ -733,7 +738,7 @@ impl PrimReader<'_> {
                 .fold(0.0, |p: f64, x| p.max(x.abs()));
             return Ok(shading::Primvar::Varying {
                 width: channels as u8,
-                scale: Some(shading::stream_scale(peak)),
+                scale: shading::stream_scale(reach * peak),
             });
         }
         let primvar = Primvar {

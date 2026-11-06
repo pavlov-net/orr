@@ -8,16 +8,19 @@
 //! triangle that meets there reads the same bits: the tessellator's edge factors and weld
 //! then agree across patches and faces. A copy's fill writes the base triangles into its
 //! entry's patch batch every frame, from the rest page points or, for a skinned copy, from
-//! cage points posed by its palette and the cage's stencils.
+//! cage points posed by its palette and the cage's stencils. A cage's colors don't move with
+//! its pose: the tessellator reads their rest points where it dices.
 
 use std::collections::HashMap;
 
-use orr_pack::subd::{CagePoint, Face, Page, SubdInfo};
+use orr_pack::subd::{CagePoint, Face, Page, PatchParam, SubdInfo};
 
 use crate::material::MaterialId;
 use crate::producer::{Opacity, OriginPolicy};
 use crate::scene::{InstanceFlags, ModelId, TransformGroupId};
-use crate::shaders::types::{SubdCageGpu, SubdPatchGpu, SubdTriangleGpu, SubdVertexGpu};
+use crate::shaders::types::{
+    SubdCageGpu, SubdColorPartGpu, SubdPatchGpu, SubdTriangleGpu, SubdVertexGpu,
+};
 use crate::{Error, Result};
 use orr_gpu::GpuPtr;
 
@@ -77,6 +80,8 @@ pub(crate) struct CageShape {
     pub(crate) cage_points: u32,
     pub(crate) sections: u32,
     pub(crate) skinned: bool,
+    /// It holds a vertex color stream, which its copies' generated vertices carry.
+    pub(crate) colored: bool,
     /// The farthest the limit surface lies from its base triangles at rest, m.
     pub(crate) deviation: f32,
 }
@@ -224,7 +229,21 @@ pub(crate) struct CageTables {
     stencil_weights: Vec<f32>,
     cage_points: Vec<[f32; 3]>,
     skin: Vec<[u32; 2]>,
+    color_parts: Vec<SubdColorPartGpu>,
+    color_cvs: Vec<u32>,
+    color_points: Vec<[f32; 4]>,
     pub(crate) shape: CageShape,
+}
+
+/// How coordinates on the patch `param` become coordinates on `other`, a patch of another table
+/// over the same face: their scale and what comes off them after.
+fn coordinates(param: &PatchParam, other: &PatchParam) -> (f32, [f32; 2]) {
+    let scale = 2f32.powi(i32::from(other.levels()) - i32::from(param.levels()));
+    let offset = [
+        f32::from(other.u) - f32::from(param.u) * scale,
+        f32::from(other.v) - f32::from(param.v) * scale,
+    ];
+    (scale, offset)
 }
 
 /// Base triangles per patch cluster, at most; triangles of a patch stay in one cluster.
@@ -259,10 +278,14 @@ impl CageTables {
                 .iter()
                 .map(|s| [u32::from_le_bytes(s.joints), u32::from_le_bytes(s.weights)])
                 .collect(),
+            color_parts: Vec::new(),
+            color_cvs: Vec::new(),
+            color_points: Vec::new(),
             shape: CageShape {
                 cage_points: info.points.len() as u32,
                 sections: info.sections.len() as u32,
                 skinned,
+                colored: !info.colors.is_empty(),
                 ..CageShape::default()
             },
         };
@@ -272,9 +295,11 @@ impl CageTables {
         for (k, page) in pages.iter().enumerate() {
             let point_base = t.points.len() as u32;
             let uv_base = t.uv_points.len() as u32;
+            let color_base = t.color_points.len() as u32;
             let patch_base = t.patches.len();
             t.points.extend(page.points(&info.points));
             t.uv_points.extend(page.uv_points(&info.uvs));
+            t.color_points.extend(page.color_points(&info.colors));
             if skinned {
                 let term_base = t.stencil_points.len() as u32;
                 let offsets = &page.stencils[..page.stencils.len().saturating_sub(1)];
@@ -283,8 +308,7 @@ impl CageTables {
                 t.stencil_weights.extend(&page.stencil_weights);
             }
             for p in &page.patches {
-                let (lp, luv) = (p.param.levels(), p.uv_param.levels());
-                let scale = 2f32.powi(i32::from(luv) - i32::from(lp));
+                let (uv_scale, uv_offset) = coordinates(&p.param, &p.uv_param);
                 let n = p.param.cv_count();
                 let n_uv = p.uv_param.cv_count();
                 t.patches.push(SubdPatchGpu {
@@ -294,18 +318,33 @@ impl CageTables {
                         | u32::from(p.uv_param.boundary) << 24,
                     cvs: t.cvs.len() as u32,
                     uv_cvs: t.uv_cvs.len() as u32,
-                    uv_scale: scale,
-                    uv_offset: [
-                        f32::from(p.uv_param.u) - f32::from(p.param.u) * scale,
-                        f32::from(p.uv_param.v) - f32::from(p.param.v) * scale,
-                    ],
-                    _pad: [0; 2],
+                    uv_scale,
+                    uv_offset,
+                    color_first: t.color_parts.len() as u32,
+                    color_count: p.colors.count,
                 });
                 let cvs = &page.cvs[p.cvs as usize..p.cvs as usize + n];
                 t.cvs.extend(cvs.iter().map(|&c| u32::from(c) + point_base));
                 let uv_cvs = &page.uv_cvs[p.uv_cvs as usize..p.uv_cvs as usize + n_uv];
                 t.uv_cvs
                     .extend(uv_cvs.iter().map(|&c| u32::from(c) + uv_base));
+                let first = p.colors.first as usize;
+                for part in &page.color_parts[first..first + p.colors.count as usize] {
+                    let (scale, offset) = coordinates(&p.param, &part.param);
+                    t.color_parts.push(SubdColorPartGpu {
+                        bits: u32::from(part.param.kind)
+                            | u32::from(part.param.boundary) << 8
+                            | part.channels << 16,
+                        cvs: t.color_cvs.len() as u32,
+                        offset,
+                        scale,
+                        _pad: 0,
+                    });
+                    let at = part.cvs as usize;
+                    let cvs = &page.color_cvs[at..at + part.param.cv_count()];
+                    t.color_cvs
+                        .extend(cvs.iter().map(|&c| u32::from(c) + color_base));
+                }
             }
             faces.extend(
                 page.faces
@@ -417,7 +456,7 @@ impl CageTables {
         Ok(t)
     }
 
-    fn arrays(&self) -> [&[u8]; 14] {
+    fn arrays(&self) -> [&[u8]; 17] {
         use bytemuck::cast_slice as b;
         [
             b(&self.patches),
@@ -434,6 +473,9 @@ impl CageTables {
             b(&self.stencil_weights),
             b(&self.cage_points),
             b(&self.skin),
+            b(&self.color_parts),
+            b(&self.color_cvs),
+            b(&self.color_points),
         ]
     }
 
@@ -482,6 +524,9 @@ impl CageTables {
             stencil_weights: at(11).cast(),
             cage_points: at(12).cast(),
             skin: at(13).cast(),
+            color_parts: at(14).cast(),
+            color_cvs: at(15).cast(),
+            color_points: at(16).cast(),
             point_count: self.shape.points,
             cage_point_count: self.shape.cage_points,
             vertex_count: self.shape.vertices,

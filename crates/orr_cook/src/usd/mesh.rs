@@ -3,19 +3,24 @@
 //! polygons of schemes `none` and `bilinear` and smooth point normals on other hulls), uvs
 //! flipped from USD's bottom-left origin to the cook's top-left. Or as a subdivision cage
 //! ([`CageBuilder`]): faces as authored with their creases, corners, holes and boundary
-//! rules, `st` as face-varying values (unindexed values weld where a point's corners agree).
+//! rules, `st` as face-varying values (unindexed values weld where a point's corners agree),
+//! and each primvar a material reads through the vertex color stream as its interpolation
+//! asks: `vertex` on the surface's basis, `faceVarying` as `st`, `varying` and `uniform` linear.
 //! Tangents are the frame primvars a material names, or MikkTSpace-compatible ones from its
 //! frame's uvs, in the mesh's own space; a cage's come from its limit surface on the GPU.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use orr_math::{DMat3, DMat4, DVec3, Vec2};
+use orr_math::{DMat3, DMat4, DVec3, Vec2, Vec4};
 use orr_pack::subd::Influence as SkinInfluence;
 
 use super::read::{Interp, PrimReader, Primvar};
 use crate::import::normal_matrix;
 use crate::mesh::tangents;
-use crate::subd::{Boundary, CageInput, Corner, Crease, FaceVarying, UvLinear};
+use crate::shading::VertexRead;
+use crate::subd::{
+    Boundary, CageColor, CageInput, ColorValues, Corner, Crease, FaceVarying, UvLinear,
+};
 
 /// The authored topology and attributes of one mesh prim.
 pub(super) struct MeshPrim {
@@ -199,7 +204,7 @@ impl MeshPrim {
         match interp {
             Interp::Constant => 1,
             Interp::Uniform => self.counts.len(),
-            Interp::Vertex => self.points.len(),
+            Interp::Vertex | Interp::Varying => self.points.len(),
             Interp::FaceVarying => self.indices.len(),
         }
     }
@@ -422,6 +427,65 @@ pub(super) struct Placing<'a> {
     pub(super) part: u16,
     /// The vertex color stream at a triangle's corner: its face, face corner and point.
     pub(super) color: &'a dyn Fn(usize, usize, usize) -> [f32; 4],
+    /// What a cage's faces read of the stream.
+    pub(super) color_reads: &'a [ColorRead<'a>],
+}
+
+/// A primvar faces of a cage read through the vertex color stream.
+pub(super) struct ColorRead<'a> {
+    pub(super) read: &'a VertexRead,
+    /// What the mesh holds of it.
+    pub(super) held: Option<&'a Primvar>,
+    /// The faces that read it.
+    pub(super) faces: Vec<usize>,
+}
+
+/// Which [`CageColor`] of a model a read lands in: meshes share one where they read a primvar
+/// alike, so a model's face-varying channels don't grow with its meshes.
+#[derive(PartialEq, Eq, Hash)]
+struct ColorKey {
+    name: String,
+    first: u8,
+    width: u8,
+    fallback: [u32; 4],
+    scale: u32,
+    /// 0 on the surface's basis, 1 face-varying, 2 linear.
+    interpolation: u8,
+}
+
+impl ColorKey {
+    fn new(r: &ColorRead<'_>) -> Self {
+        Self {
+            name: r.read.name.clone(),
+            first: r.read.first,
+            width: r.read.width,
+            fallback: r.read.fallback.map(f32::to_bits),
+            scale: r.read.scale.to_bits(),
+            interpolation: match r.held.map(|p| p.interp) {
+                Some(Interp::Vertex) => 0,
+                Some(Interp::FaceVarying) => 1,
+                _ => 2,
+            },
+        }
+    }
+
+    /// The color it names, with no mesh in it yet. Corners of a mesh that doesn't read it take
+    /// value 0.
+    fn color(&self) -> CageColor {
+        let corners = || FaceVarying {
+            values: vec![Vec4::ZERO],
+            indices: Vec::new(),
+        };
+        CageColor {
+            values: match self.interpolation {
+                0 => ColorValues::Vertex(Vec::new()),
+                1 => ColorValues::FaceVarying(corners()),
+                _ => ColorValues::Linear(corners()),
+            },
+            channels: ((1 << self.width) - 1) << self.first,
+            faces: Vec::new(),
+        }
+    }
 }
 
 impl Welder {
@@ -519,6 +583,8 @@ pub(super) struct CageBuilder {
     /// Scene material per face.
     pub(super) materials: Vec<usize>,
     uvs: HashMap<u32, u32>,
+    /// Each read's place in the cage's colors.
+    colors: HashMap<ColorKey, usize>,
     /// The first mesh's path, naming the rules every other must share.
     first: Option<String>,
 }
@@ -559,6 +625,7 @@ impl CageBuilder {
         let flip = (DMat3::from_mat4(at.transform).determinant() < 0.0) != mesh.left_handed;
         let base = c.positions.len() as u32;
         let first_face = c.face_counts.len() as u32;
+        let first_corner = c.face_indices.len();
         for &p in &mesh.points {
             c.positions.push(at.transform.transform_point3(p).as_vec3());
         }
@@ -579,9 +646,16 @@ impl CageBuilder {
         let welds = mesh
             .uvs
             .as_ref()
-            .map(|uv| uv_values(mesh, uv, path))
+            .map(|uv| {
+                corner_values(mesh, uv, |v, face| {
+                    let v = v.ok_or_else(|| format!("{path}: st does not cover face {face}"))?;
+                    Ok(Vec2::new(v[0] as f32, v[1] as f32))
+                })
+            })
             .transpose()?;
         let mut corner = 0;
+        // Face corners as the cage holds them.
+        let mut read_order = Vec::with_capacity(mesh.indices.len());
         for (face, &count) in mesh.counts.iter().enumerate() {
             self.materials.push((at.face_material)(face));
             c.face_counts.push(count as u32);
@@ -593,6 +667,7 @@ impl CageBuilder {
                 (corner..corner + count).collect()
             };
             corner += count;
+            read_order.extend(&ring);
             for k in ring {
                 c.face_indices.push(base + mesh.indices[k] as u32);
                 let Some(fv) = c.uvs.as_mut() else { continue };
@@ -628,35 +703,115 @@ impl CageBuilder {
         }
         // Per-mesh uv welding must not join another mesh's values.
         self.uvs.clear();
+        self.add_colors(
+            mesh,
+            at,
+            &read_order,
+            base as usize,
+            first_corner,
+            first_face,
+        )
+    }
+
+    /// Adds what the mesh's faces read of the vertex color stream: the mesh's points start at
+    /// `first_point`, its corners, in `read_order`, at `first_corner` and its faces at
+    /// `first_face`. A color spans the cage, so the values of faces that don't read it stay
+    /// beside those of faces that do, and the surface between them shapes both.
+    fn add_colors(
+        &mut self,
+        mesh: &MeshPrim,
+        at: &Placing<'_>,
+        read_order: &[usize],
+        first_point: usize,
+        first_corner: usize,
+        first_face: u32,
+    ) -> Result<(), String> {
+        let c = &mut self.cage;
+        for r in at.color_reads {
+            let element = |v: Option<&[f64]>| {
+                let mut color = [0.0; 4];
+                r.read.put(v, &mut color);
+                Vec4::from_array(color)
+            };
+            let l = *self
+                .colors
+                .entry(ColorKey::new(r))
+                .or_insert_with_key(|key| {
+                    c.colors.push(key.color());
+                    c.colors.len() - 1
+                });
+            let color = &mut c.colors[l];
+            color
+                .faces
+                .extend(r.faces.iter().map(|&f| first_face + f as u32));
+            match (&mut color.values, r.held) {
+                (ColorValues::Vertex(values), Some(held)) => {
+                    values.resize(first_point, Vec4::ZERO);
+                    values.extend((0..mesh.points.len()).map(|p| element(held.at(p, 0, 0))));
+                }
+                (ColorValues::Vertex(_), None) => {
+                    unreachable!("a primvar the mesh doesn't hold has no point values")
+                }
+                (ColorValues::FaceVarying(corners) | ColorValues::Linear(corners), held) => {
+                    let (values, index) = match held {
+                        Some(p) => corner_values(mesh, p, |v, _| Ok(element(v)))?,
+                        None => (vec![element(None)], vec![0; mesh.indices.len()]),
+                    };
+                    let first = corners.values.len() as u32;
+                    corners.values.extend(values);
+                    corners.indices.resize(first_corner, 0);
+                    corners
+                        .indices
+                        .extend(read_order.iter().map(|&k| first + index[k]));
+                }
+            }
+        }
+        for color in &mut c.colors {
+            match &mut color.values {
+                ColorValues::Vertex(values) => values.resize(c.positions.len(), Vec4::ZERO),
+                ColorValues::FaceVarying(corners) | ColorValues::Linear(corners) => {
+                    corners.indices.resize(c.face_indices.len(), 0);
+                }
+            }
+        }
         Ok(())
     }
 }
 
-/// The mesh's uv values and one value index per face corner: indexed and vertex primvars
-/// keep their sharing, unindexed face-varying values weld where a point's corners agree.
-fn uv_values(mesh: &MeshPrim, uv: &Primvar, path: &str) -> Result<(Vec<Vec2>, Vec<u32>), String> {
+/// A primvar's values by `value`, which takes an element and its face, and one value index per
+/// face corner: indexed and point primvars keep their sharing, unindexed face-varying values
+/// weld where a point's corners agree in the four numbers a reader can take of them.
+fn corner_values<T>(
+    mesh: &MeshPrim,
+    p: &Primvar,
+    value: impl Fn(Option<&[f64]>, usize) -> Result<T, String>,
+) -> Result<(Vec<T>, Vec<u32>), String> {
     let mut values = Vec::new();
     let mut index = Vec::with_capacity(mesh.indices.len());
-    let mut seen: HashMap<(usize, [u64; 2]), u32> = HashMap::new();
+    let mut seen: HashMap<(usize, Option<[u64; 4]>), u32> = HashMap::new();
     let mut corner = 0;
     for (face, &count) in mesh.counts.iter().enumerate() {
         for k in corner..corner + count {
             let point = mesh.indices[k];
-            let v = uv
-                .at(point, face, k)
-                .ok_or_else(|| format!("{path}: st does not cover face {face}"))?;
-            let element = match (uv.interp, &uv.indices) {
-                (Interp::FaceVarying, Some(ix)) => ix[k] as usize,
+            let v = p.at(point, face, k);
+            let element = match (p.interp, &p.indices) {
+                (Interp::FaceVarying, Some(ix)) => ix.get(k).map_or(usize::MAX, |&i| i as usize),
                 (Interp::FaceVarying, None) => point,
-                (Interp::Vertex, _) => point,
+                (Interp::Vertex | Interp::Varying, _) => point,
                 (Interp::Uniform, _) => usize::MAX - face,
                 (Interp::Constant, _) => usize::MAX,
             };
-            let key = (element, [v[0].to_bits(), v[1].to_bits()]);
-            let id = *seen.entry(key).or_insert_with(|| {
-                values.push(Vec2::new(v[0] as f32, v[1] as f32));
-                values.len() as u32 - 1
-            });
+            let bits = v.map(|v| std::array::from_fn(|i| v.get(i).map_or(0, |x| x.to_bits())));
+            let key = (element, bits);
+            let id = match seen.get(&key) {
+                Some(&id) => id,
+                None => {
+                    values.push(value(v, face)?);
+                    let id = values.len() as u32 - 1;
+                    seen.insert(key, id);
+                    id
+                }
+            };
             index.push(id);
         }
         corner += count;

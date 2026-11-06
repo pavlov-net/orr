@@ -15,7 +15,19 @@ public struct SubdPatchGpu
     public uint uv_cvs;          // its first uv point in `uv_cvs`
     public float uv_scale;       // uv patch coordinates are st * uv_scale - uv_offset
     public float2 uv_offset;
-    public uint2 _pad;
+    public uint color_first;     // its first part in the cage's `color_parts`
+    public uint color_count;
+}
+
+// Some channels of the vertex color stream over a patch: a patch of its own, which lies in the
+// patch's coordinates as its uv patch does.
+public struct SubdColorPartGpu
+{
+    public uint bits;            // kind | boundary << 8 | channels << 16
+    public uint cvs;             // its first point in the cage's `color_cvs`
+    public float2 offset;        // its coordinates are st * scale - offset
+    public float scale;
+    public uint _pad;
 }
 
 // A vertex of a cage's base patches: the patch and coordinates its uv and normal come from,
@@ -54,6 +66,9 @@ public struct SubdCageGpu
     public float* stencil_weights;
     public float3* cage_points;     // rest
     public uint2* skin;             // per cage point: joints u8x4, weights unorm8x4
+    public SubdColorPartGpu* color_parts;
+    public uint* color_cvs;         // color point per part point
+    public float4* color_points;
     public uint point_count;        // page points
     public uint cage_point_count;
     public uint vertex_count;
@@ -111,6 +126,25 @@ public float2 subd_limit_uv(SubdCageGpu* c, uint patch, float2 st)
     for (uint i = 0; i < n; i++)
         uv += w[i] * c.uv_points[c.uv_cvs[p.uv_cvs + i]];
     return uv;
+}
+
+// The vertex color stream of patch `patch` at `st`; 1 in the channels none of its parts gives.
+public float4 subd_limit_color(SubdCageGpu* c, uint patch, float2 st)
+{
+    SubdPatchGpu p = c.patches[patch];
+    float w[20], wu[20], wv[20];
+    float4 color = 1.0;
+    for (uint k = 0; k < p.color_count; k++)
+    {
+        SubdColorPartGpu part = c.color_parts[p.color_first + k];
+        uint n = subd_basis(part.bits & 0xff, (part.bits >> 8) & 0xff, st * part.scale - part.offset, w, wu, wv);
+        float4 value = 0.0;
+        for (uint i = 0; i < n; i++)
+            value += w[i] * c.color_points[c.color_cvs[part.cvs + i]];
+        uint channels = part.bits >> 16;
+        color = select((uint4(channels) & uint4(1, 2, 4, 8)) != 0, value, color);
+    }
+    return color;
 }
 
 // The unit normal of the limit surface from its derivatives, oriented by the face winding;

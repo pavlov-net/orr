@@ -7,17 +7,20 @@
 //! basis patches where isolation stops. Faces are ordered by section, then by cage face, and
 //! packed whole into pages; a page holds the stencils of the points its patches read. A
 //! face's bounds are the box of its patches' Bezier control points (the limit surface lies
-//! in their hull), grown by its section's declared displacement range.
+//! in their hull), grown by its section's declared displacement range. A cage's colors
+//! ([`CageColor`]) go through as positions and uvs do, by the interpolation each states.
 
 #[cfg(feature = "subd")]
 mod build;
 #[cfg(feature = "subd")]
 mod osd;
 
-use orr_math::{Vec2, Vec3};
+use orr_math::{Vec2, Vec3, Vec4};
 use orr_pack::material::Material;
 use orr_pack::subd::{Influence, SubdInfo};
 use serde::Deserialize;
+
+use crate::shading::stream_holds;
 
 /// A Catmull-Clark cage in model space, built by a library caller.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -34,6 +37,9 @@ pub struct CageInput {
     /// Faces left out of the surface.
     pub holes: Vec<u32>,
     pub uvs: Option<FaceVarying>,
+    /// What the vertex color stream reads, as [`crate::MeshInput::colors`] holds it. A later entry
+    /// takes a channel of a face from an earlier one; a channel none gives reads 1.
+    pub colors: Vec<CageColor>,
     /// Faces wind clockwise.
     pub left_handed: bool,
     pub boundary: Boundary,
@@ -56,11 +62,37 @@ pub struct Corner {
     pub sharpness: f32,
 }
 
-/// Face-varying uvs, top-left origin: values and one value per face corner.
+/// Face-varying values: uvs by default, top-left origin. Values and one value per face corner.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct FaceVarying {
-    pub values: Vec<Vec2>,
+pub struct FaceVarying<T = Vec2> {
+    pub values: Vec<T>,
     pub indices: Vec<u32>,
+}
+
+/// Some channels of a cage's vertex color stream over some of its faces.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CageColor {
+    pub values: ColorValues,
+    /// The stream's channels it gives: bit `i` for channel `i`, at least one of the four.
+    pub channels: u8,
+    /// The faces that read it; empty for every face. The surface around them still shapes it:
+    /// its values span the whole cage.
+    pub faces: Vec<u32>,
+}
+
+/// How a [`CageColor`] interpolates.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ColorValues {
+    /// One value per cage point, on the surface's own basis, so it refines as positions do:
+    /// creases, corners and the boundary rule shape it, and a cage point's value is a control
+    /// point, not what the limit surface reads there.
+    Vertex(Vec<Vec4>),
+    /// Refined on its own topology by [`CageInput::uv_linear`]: corners that share a value join
+    /// and the surface between other values is a seam.
+    FaceVarying(FaceVarying<Vec4>),
+    /// Bilinear over each face from its corners' values, smoothing nothing: a face's center and
+    /// edge middles read averages, as subdividing them linearly gives.
+    Linear(FaceVarying<Vec4>),
 }
 
 /// How boundary edges and corners interpolate.
@@ -76,13 +108,13 @@ pub enum Boundary {
     EdgesAndCorners,
 }
 
-/// Where face-varying uvs interpolate linearly rather than smoothly.
+/// Where face-varying channels interpolate linearly rather than smoothly.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UvLinear {
     /// Smooth everywhere.
     None = 0,
-    /// Linear at corners of uv islands.
+    /// Linear at corners of islands.
     CornersOnly = 1,
     /// Linear at corners, at junctions of three or more islands and at darts.
     #[default]
@@ -200,6 +232,57 @@ pub(crate) fn check(cage: &CageInput, sections: usize) -> Result<(), String> {
         if let Some(i) = uv.indices.iter().find(|&&i| i as usize >= uv.values.len()) {
             return Err(format!("a uv index names value {i} of {}", uv.values.len()));
         }
+    }
+    for c in &cage.colors {
+        check_color(cage, c)?;
+    }
+    Ok(())
+}
+
+fn check_color(cage: &CageInput, c: &CageColor) -> Result<(), String> {
+    if !(1..16).contains(&c.channels) {
+        return Err(format!(
+            "a cage color gives channels {:#b} of the stream's four",
+            c.channels
+        ));
+    }
+    if let Some(f) = c
+        .faces
+        .iter()
+        .find(|&&f| f as usize >= cage.face_counts.len())
+    {
+        return Err(format!("a cage color names face {f}, past the faces"));
+    }
+    let values = match &c.values {
+        ColorValues::Vertex(v) => {
+            if v.len() != cage.positions.len() {
+                return Err(format!(
+                    "{} vertex colors for {} points",
+                    v.len(),
+                    cage.positions.len()
+                ));
+            }
+            v
+        }
+        ColorValues::FaceVarying(f) | ColorValues::Linear(f) => {
+            if f.indices.len() != cage.face_indices.len() {
+                return Err(format!(
+                    "{} color indices for {} face corners",
+                    f.indices.len(),
+                    cage.face_indices.len()
+                ));
+            }
+            if let Some(i) = f.indices.iter().find(|&&i| i as usize >= f.values.len()) {
+                return Err(format!(
+                    "a color index names value {i} of {}",
+                    f.values.len()
+                ));
+            }
+            &f.values
+        }
+    };
+    if !values.iter().flat_map(Vec4::to_array).all(stream_holds) {
+        return Err("a cage color past what the stream's half floats hold".into());
     }
     Ok(())
 }
