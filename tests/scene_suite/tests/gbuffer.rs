@@ -22,7 +22,7 @@ use orr_color::RgbPrimaries;
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, Instances, Linear, LodMode, Manifest, MeshInput,
     MeshParts, MeshSettings, Placement, Primaries, PrototypeSpec, SectionSpec, Source,
-    TextureSettings, Usage,
+    TextureSettings, Usage, UsdSettings,
 };
 use orr_gpu::{
     ComputePipeline, GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, ShaderModule, Stages,
@@ -1244,6 +1244,13 @@ fn cook() -> Arc<[u8]> {
                             },
                             ..GltfSettings::default()
                         },
+                    },
+                },
+                AssetSpec {
+                    name: "door".into(),
+                    source: Source::Usd {
+                        path: door_stage(),
+                        settings: UsdSettings::default(),
                     },
                 },
                 AssetSpec {
@@ -4287,6 +4294,137 @@ fn posed_rigid_parts_trace_where_the_raster_draws_them() {
         );
         w.scenes.destroy_scene(rigs.placed.scene);
     }
+    assert_clean();
+}
+
+/// A stage of one prim that moves, holding a 0.4 m square facing +z: all of it on one rigid part,
+/// and part 0, which takes no pose, empty.
+fn door_stage() -> PathBuf {
+    let path = temp("door.usda");
+    std::fs::write(
+        &path,
+        r#"#usda 1.0
+(
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+def Xform "Door"
+{
+    double3 xformOp:translate.timeSamples = { 0: (0, 0, 0), 24: (1, 0, 0) }
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+    def Mesh "Leaf"
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-0.2, -0.2, 0), (0.2, -0.2, 0), (0.2, 0.2, 0), (-0.2, 0.2, 0)]
+    }
+}
+"#,
+    )
+    .unwrap();
+    path
+}
+
+/// The door moved `x` m along x by the pose of its part.
+fn place_door(w: &mut World, x: f32) -> Placed {
+    let model = w.model("door");
+    let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
+    let history = w.scenes.create_view_history().unwrap();
+    let list = [scene];
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(0),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    let mut s = f.scene(scene).unwrap();
+    s.set_focus(DVec3::ZERO);
+    let group = s
+        .create_transform_group(&TransformGroupDesc {
+            count: 1,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    let pose = s
+        .create_transform_group(&TransformGroupDesc {
+            count: 2,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    s.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+    let parts = s.transforms(pose, 0, 2).unwrap();
+    parts[0] = Affine3::IDENTITY.into();
+    parts[1] = Affine3::from_translation(Vec3::X * x).into();
+    let range = s
+        .add_instances(&InstancesDesc {
+            model,
+            copies: 1,
+            transforms: group,
+            first: 0,
+            pose: Some(Pose {
+                group: pose,
+                index: 0,
+                variants: 1,
+                stride: 0,
+            }),
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 10_000.0,
+            animation_range: 100.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    drop(s);
+    wait(f.end(&[]).unwrap());
+    Placed {
+        scene,
+        ranges: vec![range],
+        group,
+        history,
+        count: 1,
+    }
+}
+
+/// A prim that moves cooks to a model with nothing on part 0, which the renderer does not pose:
+/// the pose of its part moves all of it, drawn and traced alike.
+#[test]
+fn a_rigid_model_with_an_empty_part_0_draws_and_traces_where_its_pose_says() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let (eye, target) = (DVec3::new(0.0, 0.0, 2.5), DVec3::ZERO);
+    let middle = |g: &Frame| {
+        let columns = g.ids.iter().enumerate().filter(|(_, id)| **id != 0);
+        let (n, sum) = columns.fold((0u32, 0.0f64), |(n, sum), (i, _)| {
+            (n + 1, sum + f64::from(i as u32 % EXTENT[0]))
+        });
+        assert!(n > 100, "{n} pixels of the door");
+        sum / f64::from(n)
+    };
+    let still = place_door(&mut w, 0.0);
+    let at_rest = shoot(&mut w, &still, &Shot::at(eye, target, 1));
+    let moved = place_door(&mut w, 0.4);
+    // The part's BLAS follows its cut, a frame or two after the copy first takes a pose.
+    for frame in 2..6 {
+        shoot(&mut w, &moved, &Shot::at(eye, target, frame));
+    }
+    let g = shoot(&mut w, &moved, &Shot::at(eye, target, 6));
+    let f = 1.0 / (0.45f64).tan();
+    let aspect = f64::from(EXTENT[0]) / f64::from(EXTENT[1]);
+    let want = 0.5 * 0.4 / 2.5 * f / aspect * f64::from(EXTENT[0]);
+    let got = middle(&g) - middle(&at_rest);
+    assert!((got - want).abs() < 0.05 * want, "{got} px, not {want}");
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let (matched, _) = parity(&g, &r, 1e-4);
+    assert!(
+        matched as f64 >= 0.999 * r.traced.len() as f64,
+        "{matched} of {} pixels agree",
+        r.traced.len()
+    );
     assert_clean();
 }
 

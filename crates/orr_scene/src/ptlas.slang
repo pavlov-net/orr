@@ -435,14 +435,15 @@ void want(uint3 id: SV_DispatchThreadID)
     st.rt_flags = (st.rt_flags & ~RT_IN_RANGE) | RT_SEEN | (in_range ? RT_IN_RANGE : 0);
 
     // A traced copy inside its animation range holds a run while its cut has animated
-    // part clusters and a body, and its section mask leaves some part shown.
+    // part clusters and its section mask leaves some part shown. A body may be empty: all of
+    // the copy is then on its parts, and the slot's own instance holds nothing.
     uint held = st.part_count;
     uint hidden = (inst.variant >> 16) & 0xffff;
     // What a BLAS built last frame holds is gone after this frame's builds.
     bool held_built = written && st.rt_lod == RT_CUT_BUILT;
     bool built = op.cut == RT_CUT_BUILT;
     bool posed = active && in_range && (st.rt_flags & RT_ANIMATED) != 0
-        && (parted_built || (!built && mesh.rt_cuts[op.cut].parts != nullptr && body != 0))
+        && (parted_built || (!built && mesh.rt_cuts[op.cut].parts != nullptr))
         && (mesh.animated_sections & ~hidden) != 0;
     bool release = held != 0 && (!posed || held != mesh.animated_parts);
     bool take = posed && (held == 0 || release);
@@ -482,7 +483,8 @@ void want(uint3 id: SV_DispatchThreadID)
     // Global instances are in render space, so a rebase rewrites every one of them now.
     bool rebased = (root.flags & PTLAS_REBASE) != 0;
     // An update cannot take an instance to or from an empty body.
-    bool body_held = !parted_built || (op.blas != 0 && st.rt_blas != 0);
+    bool body_held = parted_built ? op.blas != 0 && st.rt_blas != 0
+                                  : (op.blas != 0) == (st.rt_blas != 0);
     bool placed = written && !restep && st.rt_partition == target && all(st.rt_key == op.key) && body_held;
     bool update = false;
     if (!placed || (target == global_partition() && rebased))
