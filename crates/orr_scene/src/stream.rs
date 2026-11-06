@@ -62,6 +62,8 @@ pub(crate) enum PoolTarget {
     Table(GpuPtr<u64>),
     /// The transform groups placing an instance page.
     InstancePage(u32),
+    /// A window of an animated page's rows.
+    PageWindow { page: u32, window: u32 },
 }
 
 /// How a streamed unit loads.
@@ -224,7 +226,7 @@ pub struct BlobId(pub u32);
 
 /// A mount's units as the stream step sees them.
 pub(crate) struct MountUnits {
-    /// The unit of each instance page.
+    /// The unit of each instance page, which its windows of rows follow.
     pub(crate) page_units: Vec<u32>,
     /// Every unit, and how to load the ones that start absent.
     pub(crate) units: Vec<(UnitDesc, Option<StreamUnit>)>,
@@ -350,7 +352,6 @@ struct UserBlob {
 }
 
 pub(crate) struct Streaming {
-    instance_page_pool: u64,
     residency: Residency,
     accel: Arc<AccelShared>,
     /// Streamed pages' CLAS; none without cluster acceleration structures.
@@ -391,6 +392,7 @@ pub(crate) struct Streaming {
     nulls: Vec<u32>,
     /// Instance pages that landed (their records' address) or left (0) since the last take.
     page_events: Vec<(u32, u64)>,
+    window_events: Vec<(u32, u32, u64)>,
     blobs: Vec<Option<UserBlob>>,
     queued: VecDeque<u32>,
     fif: u32,
@@ -409,7 +411,6 @@ impl Streaming {
         budgets[ResidencyClass::HierarchyPages as usize] = b.hierarchy_page_pool;
         budgets[ResidencyClass::Textures as usize] = b.texture_pool;
         budgets[ResidencyClass::InstancePages as usize] = b.instance_page_pool;
-        let instance_page_pool = b.instance_page_pool;
         budgets[ResidencyClass::UserBlobs as usize] = b.user_blob_pool;
         let kind = if device.caps().rebar {
             MemoryKind::Upload
@@ -424,7 +425,6 @@ impl Streaming {
             None
         };
         Ok(Self {
-            instance_page_pool,
             accel: Arc::clone(accel),
             clas,
             retired_clas: Vec::new(),
@@ -472,6 +472,7 @@ impl Streaming {
             fragmented: HashMap::new(),
             nulls: Vec::new(),
             page_events: Vec::new(),
+            window_events: Vec::new(),
             blobs: Vec::new(),
             queued: VecDeque::new(),
             fif: fif.max(1),
@@ -713,6 +714,15 @@ impl Streaming {
         std::mem::take(&mut self.page_events)
     }
 
+    pub(crate) fn note_pages_over_budget(&mut self, count: u32) {
+        self.residency.note_pages_over_budget(count);
+    }
+
+    /// The windows of rows, by page, that landed or left since the last call.
+    pub(crate) fn take_window_events(&mut self) -> Vec<(u32, u32, u64)> {
+        std::mem::take(&mut self.window_events)
+    }
+
     /// Requests unit `unit` of `mount` with hint priority for the next step.
     pub(crate) fn request_unit(&mut self, mount: MountId, unit: u32, cell_distance: u32) {
         let p = Priority {
@@ -720,11 +730,6 @@ impl Streaming {
             cell_distance,
         };
         self.residency.request(Key { mount, unit }, p);
-    }
-
-    /// The most instance pages may hold, whatever the budget has shrunk to.
-    pub(crate) fn instance_page_pool(&self) -> u64 {
-        self.instance_page_pool
     }
 
     /// The budget instance pages plan under.
@@ -1240,6 +1245,9 @@ impl Streaming {
         match target {
             PoolTarget::Table(table) => w.put(table, &[at])?,
             PoolTarget::InstancePage(page) => self.page_events.push((page, at)),
+            PoolTarget::PageWindow { page, window } => {
+                self.window_events.push((page, window, at));
+            }
         }
         Ok(())
     }

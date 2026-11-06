@@ -4,10 +4,12 @@
 //!   [`SectionOverride`] table the prototypes point into, and the partition table (u16 first
 //!   record per partition). Spans are byte offsets in blob 0 and record counts.
 //! - Blob 1: [`InstancePageHeader::record_count`] [`InstanceRecord`]s in Morton order of
-//!   [`InstanceRecord::pos`], at most [`MAX_RECORDS`], then the page's [`LinearRows`] table, then
-//!   on an animated page its [`MotionRow`]s, so all stream and stay resident together.
+//!   [`InstanceRecord::pos`], at most [`MAX_RECORDS`], then the page's [`LinearRows`] table, so
+//!   both stream and stay resident together.
 //! - Blob 2, when `user_stride` is not 0: `user_stride` bytes of consumer data per record,
 //!   in record order.
+//! - Then on an animated page a blob per window of its [`MotionRow`]s
+//!   ([`InstancePageHeader::motion_blob`]), which stream by the page's clock.
 //!
 //! A record decodes to a transform relative to the page cell (edge `2^cell_log2` m):
 //! translation `origin + pos * (extent / 65535)`, and a linear part. A compact record holds a
@@ -20,9 +22,12 @@
 //!
 //! An animated page moves its records over time: [`InstancePageHeader::motion_times`] starts one
 //! interval each, and every interval holds a [`MotionRow`] per record, interval-major, which
-//! carries the record from the interval's start until the next. [`motion_interval`] finds the
-//! interval of a time, and [`motion_transform`] is the reference for the kernel that evaluates a
-//! row. The first interval runs back from the second without end, and the last on.
+//! carries the record from the interval's start until the next. A window is
+//! [`InstancePageHeader::motion_window`] intervals in a row, about [`MOTION_WINDOW_BYTES`], so what
+//! must be resident at one time does not grow with the length of the animation.
+//! [`motion_interval`] finds the interval of a time, and [`motion_transform`] is the reference for
+//! the kernel that evaluates a row. The first interval runs back from the second without end, and
+//! the last on.
 //! An instance needs a transform that inverts, so a scale of 0 on an axis stands at
 //! [`MOTION_FLAT`], which draws the same, and one of 0 on all three hides the instance.
 
@@ -49,7 +54,11 @@ pub const MAX_HIDDEN_SECTION: usize = 16;
 /// The least size of a scale on an axis of a [`MotionRow`].
 pub const MOTION_FLAT: f32 = 1.0 / (1u64 << 60) as f32;
 
-/// Blob 0 header, 192 B.
+/// What a blob of [`MotionRow`]s aims at; one interval of a full page is under it.
+pub const MOTION_WINDOW_BYTES: usize = 2 << 20;
+const _: () = assert!(MAX_RECORDS * size_of::<MotionRow>() <= MOTION_WINDOW_BYTES);
+
+/// Blob 0 header, 196 B.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct InstancePageHeader {
@@ -81,18 +90,35 @@ pub struct InstancePageHeader {
     pub motion_right: AffineRows,
     /// s of the clock of [`Self::motion_times`] that a page stands at until something sets it.
     pub motion_start: f32,
+    /// Intervals in a window of rows, the last window up to the end.
+    pub motion_window: u32,
 }
 
 impl InstancePageHeader {
-    /// Bytes of [`MotionRow`]s at the end of blob 1.
-    pub fn motion_bytes(&self) -> usize {
-        self.motion_times.count as usize * usize::from(self.record_count) * size_of::<MotionRow>()
+    /// Blobs of [`MotionRow`]s.
+    pub fn motion_windows(&self) -> u32 {
+        match self.motion_times.count {
+            0 => 0,
+            n => n.div_ceil(self.motion_window),
+        }
+    }
+
+    /// The blob of window `w`.
+    pub fn motion_blob(&self, w: u32) -> u32 {
+        2 + u32::from(self.user_stride != 0) + w
+    }
+
+    /// The bytes of window `w`.
+    pub fn motion_window_bytes(&self, w: u32) -> u32 {
+        let left = self.motion_times.count - w * self.motion_window;
+        let intervals = left.min(self.motion_window);
+        intervals * u32::from(self.record_count) * size_of::<MotionRow>() as u32
     }
 
     /// Rows of the linear table in a blob 1 of `len` bytes.
     pub fn linear_rows(&self, len: usize) -> Result<usize> {
         let records = usize::from(self.record_count) * size_of::<InstanceRecord>();
-        len.checked_sub(records + self.motion_bytes())
+        len.checked_sub(records)
             .filter(|table| {
                 usize::from(self.record_count) <= MAX_RECORDS
                     && table.is_multiple_of(size_of::<LinearRows>())
@@ -281,6 +307,13 @@ impl InstancePageInfo {
         if partitions.first().is_some_and(|&p| p != 0) || !partitions.is_sorted() {
             return Err(Error::Malformed("instance page partitions"));
         }
+        let times = header.motion_times.count;
+        let window = u64::from(header.motion_window.min(times))
+            * u64::from(header.record_count)
+            * size_of::<MotionRow>() as u64;
+        if times != 0 && !(1..=u64::from(u32::MAX)).contains(&window) {
+            return Err(Error::Malformed("instance page motion window"));
+        }
         Ok(Self {
             motion_times: table(blob, header.motion_times)?,
             header,
@@ -321,7 +354,6 @@ pub fn records(
     blob: &[u8],
 ) -> Result<(Vec<InstanceRecord>, Vec<LinearRows>)> {
     h.linear_rows(blob.len())?;
-    let blob = &blob[..blob.len() - h.motion_bytes()];
     let (records, table) = blob.split_at(usize::from(h.record_count) * size_of::<InstanceRecord>());
     let records: Vec<InstanceRecord> = bytemuck::pod_collect_to_vec(records);
     let table: Vec<LinearRows> = bytemuck::pod_collect_to_vec(table);
@@ -350,13 +382,9 @@ pub fn decode(
     ))
 }
 
-/// The motion rows of a blob 1, per interval a row per record.
-pub fn motion_rows(h: &InstancePageHeader, blob: &[u8]) -> Result<Vec<MotionRow>> {
-    let start = blob
-        .len()
-        .checked_sub(h.motion_bytes())
-        .ok_or(Error::Malformed("instance records"))?;
-    Ok(bytemuck::pod_collect_to_vec(&blob[start..]))
+/// The rows of a window's blob, per interval a row per record.
+pub fn motion_rows(blob: &[u8]) -> Vec<MotionRow> {
+    bytemuck::pod_collect_to_vec(blob)
 }
 
 /// Cell-relative transform of one record of a page with linear table `table`: its table row,

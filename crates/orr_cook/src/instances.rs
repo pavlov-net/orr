@@ -231,12 +231,15 @@ pub(crate) fn cook(
             let records = [
                 bytemuck::cast_slice(&built.records),
                 bytemuck::cast_slice(&built.linear),
-                bytemuck::cast_slice(&built.motion),
             ]
             .concat();
             let mut blobs = vec![mount(&info), BlobIn::new(&records)];
             if stride > 0 {
                 blobs.push(BlobIn::new(&built.user));
+            }
+            let window = built.info.header.motion_window as usize * members.len();
+            for rows in built.motion.chunks(window) {
+                blobs.push(BlobIn::new(bytemuck::cast_slice(rows)));
             }
             w.add(
                 &format!("{name}/{}_{}_{}/{page}", cell[0], cell[1], cell[2]),
@@ -538,6 +541,7 @@ fn build_page(
         motion_left: AffineRows::from(Affine3::IDENTITY),
         motion_right: AffineRows::from(Affine3::IDENTITY),
         motion_start: 0.0,
+        motion_window: 1,
     };
     let mut forms: Vec<Form> = members
         .iter()
@@ -671,6 +675,8 @@ fn build_page(
         header.motion_left = AffineRows::from(Affine3::from_mat4(left.as_mat4()));
         header.motion_right = AffineRows::from(Affine3::from_mat4(m.right.as_mat4()));
         header.motion_start = m.start;
+        let interval = members.len() * size_of::<MotionRow>();
+        header.motion_window = (instance::MOTION_WINDOW_BYTES / interval) as u32;
     }
     Ok(BuiltPage {
         info: InstancePageInfo {

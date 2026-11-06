@@ -29,7 +29,7 @@ fn angle_deg(q: [f64; 4], d: [f32; 4]) -> f64 {
 
 #[test]
 fn layouts_match_the_gpu_structs() {
-    assert_eq!(size_of::<InstancePageHeader>(), 192);
+    assert_eq!(size_of::<InstancePageHeader>(), 196);
     assert_eq!(size_of::<MotionRow>(), 88);
     assert_eq!(size_of::<Prototype>(), 32);
     assert_eq!(size_of::<SectionOverride>(), 20);

@@ -583,6 +583,13 @@ impl Scenes {
         let core = &mut self.core;
         for page in core.mounts.pages_of(m) {
             core.land_page(page.0, 0);
+            for scene in core.scenes.iter().flatten() {
+                let cpu = &mut *scene.cpu.lock().unwrap();
+                let motions = cpu.page_motions.iter_mut();
+                motions
+                    .filter(|p| p.page == Some(page))
+                    .for_each(|p| p.page = None);
+            }
         }
         let gone = core.mounts.models_of(m);
         core.mounts
@@ -738,10 +745,10 @@ impl Scenes {
             .prefetch_texture(m, texture.0, finest);
     }
 
-    /// Wants the records of instance page `id` resident from the next frame on. Requests last
-    /// one frame.
+    /// Wants the records of instance page `id`, and on an animated page the rows of its start,
+    /// resident from the next frame on. Requests last one frame.
     pub fn prefetch_page(&mut self, id: PageId, cell_distance: u32) {
-        self.core.mounts.request_page(id.0, cell_distance);
+        self.core.mounts.prefetch_page(id.0, cell_distance);
     }
 
     /// Wants the records of every mounted instance page meeting the sphere, and the streamed
@@ -1055,6 +1062,11 @@ impl Scenes {
         for (page, records) in events {
             core.land_page(page, records);
         }
+        for (page, window, at) in core.mounts.streaming.take_window_events() {
+            if let Some(Some(p)) = core.mounts.pages.get_mut(page as usize) {
+                p.windows[window as usize] = at;
+            }
+        }
         #[cfg(feature = "hot-reload")]
         let reloads = self
             .reloader
@@ -1118,11 +1130,13 @@ impl Core {
         }
     }
 
-    /// Wants the records of every placed page for this step, nearest a focus first, as far as
-    /// the instance page budget holds them; the others are left to leave after their hold.
+    /// Wants the records of every placed page and the windows of rows its clock needs for this
+    /// step, nearest a focus first, as far as the instance page budget holds them; the others
+    /// are left to leave after their hold.
     fn request_pages(&mut self) {
         let mut wanted: FxHashMap<u32, f64> = FxHashMap::default();
         let edge = f64::from(1u32 << self.cell_log2);
+        let mut windows: FxHashMap<(u32, u32), f64> = FxHashMap::default();
         for scene in self.scenes.iter().flatten() {
             let cpu = scene.cpu.lock().unwrap();
             let skinned = cpu.skinned_pages.iter().map(|p| (p.page, p.group));
@@ -1143,20 +1157,45 @@ impl Core {
                     .filter(|_| !hung)
                     .map_or(0.0, |f| (f.distance(center) - radius).max(0.0));
                 let e = wanted.entry(page.0).or_insert(f64::INFINITY);
-                *e = e.min(distance);
+                *e = e.min(distance / edge);
+            }
+            for m in &cpu.page_motions {
+                let Some(page) = m.page else { continue };
+                let Some(Some(p)) = self.mounts.pages.get(page.0 as usize) else {
+                    continue;
+                };
+                for (window, rank) in m.windows(p.info.header.motion_window) {
+                    let e = windows.entry((page.0, window)).or_insert(f64::INFINITY);
+                    *e = e.min(rank);
+                }
             }
         }
-        let mut pages: Vec<(u32, f64)> = wanted.into_iter().collect();
-        pages.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        // Records and windows in one order: what stands now comes before what lies ahead.
+        let records = wanted.into_iter().map(|(page, at)| (at, page, None));
+        let rows = windows
+            .into_iter()
+            .map(|((page, window), rank)| (rank, page, Some(window)));
+        let mut units: Vec<(f64, u32, Option<u32>)> = records.chain(rows).collect();
+        units.sort_by(|a, b| a.0.total_cmp(&b.0).then((a.1, a.2).cmp(&(b.1, b.2))));
         let budget = self.mounts.streaming.instance_page_budget();
         let mut bytes = 0;
-        for (page, distance) in pages {
-            bytes += self.mounts.page_bytes(page);
-            if bytes > budget {
-                break;
+        let mut over = 0;
+        for (at, page, window) in units {
+            let size = match window {
+                Some(w) => self.mounts.window_bytes(page, w),
+                None => self.mounts.page_bytes(page),
+            };
+            if bytes + size > budget {
+                over += u32::from(window.is_none() || at == 0.0);
+                continue;
             }
-            self.mounts.request_page(page, (distance / edge) as u32);
+            bytes += size;
+            match window {
+                Some(w) => self.mounts.request_window(page, w, at as u32),
+                None => self.mounts.request_page(page, at as u32),
+            }
         }
+        self.mounts.streaming.note_pages_over_budget(over);
     }
 
     /// Points the page groups of `page` in every scene at its records, or hides their copies.
@@ -1601,24 +1640,34 @@ impl<'a> Frame<'a> {
         let mut motions = Vec::new();
         for &id in &self.listed {
             let scene = core.scene(id)?;
-            let cpu = scene.cpu.lock().unwrap();
-            for m in &cpu.page_motions {
+            let cpu = &mut *scene.cpu.lock().unwrap();
+            for m in &mut cpu.page_motions {
                 let records = cpu.groups[m.records.0 as usize]
                     .as_ref()
                     .and_then(|g| g.page.as_ref())
                     .map_or(0, |g| g.records);
-                let (interval, dt) = orr_pack::instance::motion_interval(&m.times, m.time);
-                let n = u64::from(m.count);
+                let page = m
+                    .page
+                    .and_then(|p| core.mounts.pages[p.0 as usize].as_ref());
                 let row_size = size_of::<orr_pack::instance::MotionRow>() as u64;
-                let table = n * size_of::<orr_pack::instance::InstanceRecord>() as u64
-                    + u64::from(m.linear_rows) * size_of::<orr_pack::instance::LinearRows>() as u64;
-                let rows = match records {
-                    0 => GpuPtr::NULL,
-                    // SAFETY: the records stay resident through this frame, as they do for the
-                    // expansions above.
-                    r => unsafe {
-                        GpuPtr::from_address(GpuAddress(r + table + interval as u64 * n * row_size))
-                    },
+                // The address of interval `k`'s rows, 0 while its window is not resident.
+                let row_at = |k: u32| {
+                    let p = page.filter(|_| records != 0)?;
+                    let per_window = p.info.header.motion_window;
+                    let at = *p.windows.get((k / per_window) as usize)?;
+                    let k = u64::from(k % per_window);
+                    (at != 0).then(|| at + k * u64::from(m.count) * row_size)
+                };
+                let (k, dt) = orr_pack::instance::motion_interval(&m.times, m.time);
+                let now = (k as u32, dt);
+                if row_at(now.0).is_some() {
+                    m.held = Some(now);
+                }
+                let (rows, dt) = match m.held.and_then(|h| Some((row_at(h.0)?, h.1))) {
+                    // SAFETY: an evicted window stays alive through this frame, as records do for
+                    // the expansions above.
+                    Some((at, dt)) => (unsafe { GpuPtr::from_address(GpuAddress(at)) }, dt),
+                    None => (GpuPtr::NULL, 0.0),
                 };
                 motions.push(page_motion::PageMotionRoot {
                     scene: scene.tables.root.gpu(),

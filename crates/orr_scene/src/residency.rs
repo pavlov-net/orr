@@ -91,6 +91,9 @@ pub struct ResidencyStats {
     pub dropped: u32,
     /// Units whose read or decode failed since the mount; they are not requested again.
     pub failed: u32,
+    /// Instance page records and windows of rows that the frame wanted past the pool's budget.
+    /// Copies stay hidden, or at their last pose, for as long as this holds them out.
+    pub pages_over_budget: u32,
     /// Bytes bound in the CLAS pool that streamed mesh pages build into.
     pub clas_pool_bytes: u64,
     /// Texture tiles moved beside their texture's other tiles since the start.
@@ -234,6 +237,10 @@ impl Residency {
 
     pub(crate) fn stats(&self) -> &ResidencyStats {
         &self.stats
+    }
+
+    pub(crate) fn note_pages_over_budget(&mut self, count: u32) {
+        self.stats.pages_over_budget = count;
     }
 
     pub(crate) fn note_clas_pool(&mut self, bytes: u64) {

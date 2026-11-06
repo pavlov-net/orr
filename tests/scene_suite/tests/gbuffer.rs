@@ -30,7 +30,7 @@ use orr_gpu::{
 };
 use orr_math::{Affine3, DMat4, DVec3, Mat3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_pack::clip::Clip;
-use orr_pack::instance::{InstanceRecord, LinearRows, MotionRow};
+use orr_pack::instance::{InstanceRecord, LinearRows, MOTION_WINDOW_BYTES, MotionRow};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{Cluster, Group, MeshInfo, PageView, decode_page};
 use orr_pack::model::ModelInfo;
@@ -1300,6 +1300,10 @@ fn cook() -> Arc<[u8]> {
                             ..GltfSettings::default()
                         },
                     },
+                },
+                AssetSpec {
+                    name: "long walk".into(),
+                    source: Source::Instances(long_walk()),
                 },
                 AssetSpec {
                     name: "paced crowd".into(),
@@ -4734,6 +4738,71 @@ fn an_animated_page_follows_its_clock_and_its_joint() {
     assert_clean();
 }
 
+/// Rows far past the instance page pool stream by the page's clock: its copy reaches every time
+/// along the animation and back to its start, never hidden on the way, while the pool stays in
+/// its budget.
+#[test]
+fn an_animated_page_past_its_pool_streams_by_its_clock() {
+    let _serial = serial();
+    let pool = 6u64 << 20;
+    let rows = WALK_RECORDS * WALK_INTERVALS * size_of::<MotionRow>();
+    assert!(rows as u64 > 2 * pool, "{rows} B of rows");
+    let mut w = walk_world(pool);
+    let placed = place_page(&mut w, "long walk", 0.0);
+    let mut frame = 0;
+    let rest = walk_rest(&mut w, &placed, &mut frame);
+    let times = (1..40).map(|i| i as f32 * 0.5).chain([0.0]);
+    for t in times {
+        let want = walk_px(t);
+        let start = Instant::now();
+        loop {
+            let g = walk_shot(&mut w, &placed, &mut frame, t);
+            let x = walk_middle(&g).unwrap_or_else(|| panic!("hidden on the way to {t} s"));
+            let stats = *w.scenes.residency();
+            let used = stats
+                .class(orr_scene::ResidencyClass::InstancePages)
+                .resident_bytes;
+            assert!(used <= pool, "{used} B resident at {t} s");
+            assert_eq!(stats.pages_over_budget, 0, "at {t} s");
+            if (x - rest - want).abs() < 1.0 {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "stuck {} px short of {t} s",
+                x - rest - want
+            );
+        }
+    }
+    assert_clean();
+}
+
+/// A pool with room for one window of rows gives it to the clock, not to the window copies hold
+/// in: the copy may hide on the way but gets there.
+#[test]
+fn an_animated_page_with_room_for_one_window_follows_its_clock() {
+    let _serial = serial();
+    let window = MOTION_WINDOW_BYTES as u64;
+    let mut w = walk_world(window + (window >> 1));
+    let placed = place_page(&mut w, "long walk", 0.0);
+    let mut frame = 0;
+    let rest = walk_rest(&mut w, &placed, &mut frame);
+    let t = 5.0;
+    let want = walk_px(t);
+    let start = Instant::now();
+    loop {
+        let g = walk_shot(&mut w, &placed, &mut frame, t);
+        if walk_middle(&g).is_some_and(|x| (x - rest - want).abs() < 1.0) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "never reached {t} s"
+        );
+    }
+    assert_clean();
+}
+
 /// A prim that moves cooks to a model with nothing on part 0, which the renderer does not pose:
 /// the pose of its part moves all of it, drawn and traced alike.
 #[test]
@@ -5841,6 +5910,110 @@ const CROWD: [[f32; 3]; 2] = [[0.2, 0.0, 0.1], [1.0, 0.0, 0.1]];
 
 /// m/s of [`paced_crowd`].
 const PACE: Vec3 = Vec3::new(0.3, 0.0, 0.0);
+
+/// Records of [`long_walk`].
+const WALK_RECORDS: usize = 1024;
+/// Its intervals, a tenth of a second each.
+const WALK_INTERVALS: usize = 200;
+/// How far along x it steps at each.
+const WALK_STEP: f32 = 0.004;
+
+/// A page of copies far longer in rows than in records: the first starts at (0.5, 0, 0) in view,
+/// the rest stand behind the eye, and all step along x at every interval.
+fn long_walk() -> Instances {
+    let rest = |i: usize| match i {
+        0 => [0.5, 0.0, 0.0],
+        _ => [i as f32 * 0.01, 0.0, 20.0],
+    };
+    let row = |k: usize, i: usize| {
+        let [x, y, z] = rest(i);
+        MotionRow {
+            position: [x + WALK_STEP * k as f32, y, z],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+            ..MotionRow::default()
+        }
+    };
+    let spot = |i: usize| Placement {
+        position: rest(i).map(f64::from),
+        linear: Linear::Scaled {
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+        },
+        prototype: 0,
+    };
+    let rows = (0..WALK_INTERVALS).flat_map(|k| (0..WALK_RECORDS).map(move |i| row(k, i)));
+    Instances {
+        records: (0..WALK_RECORDS).map(spot).collect(),
+        prototypes: vec![PrototypeSpec {
+            model: "plain".into(),
+            ..PrototypeSpec::default()
+        }],
+        motion: Some(Arc::new(InstanceMotion {
+            times: (0..WALK_INTERVALS).map(|k| k as f32 * 0.1).collect(),
+            rows: rows.collect(),
+            anchors: vec![[0.0; 3]; WALK_RECORDS],
+            left: DMat4::IDENTITY,
+            right: DMat4::IDENTITY,
+            start: 0.0,
+        })),
+        ..Instances::default()
+    }
+}
+
+/// A world of `pool` bytes of instance pages, to watch [`long_walk`] in.
+fn walk_world(pool: u64) -> World {
+    World::with(&RendererDesc {
+        raster_error_pixels: 1e-3,
+        rt_error_pixels: 1e-3,
+        budgets: Budgets {
+            instance_page_pool: pool,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    })
+}
+
+/// A shot of [`long_walk`] at `t` s of its clock.
+fn walk_shot(w: &mut World, placed: &Placed, frame: &mut u32, t: f32) -> Frame {
+    *frame += 1;
+    let (eye, target) = (DVec3::new(0.9, 0.0, 2.5), DVec3::new(0.9, 0.0, 0.0));
+    let mut shot = Shot::at(eye, target, *frame);
+    shot.reset = *frame == 1;
+    let range = placed.ranges[0];
+    shoot_with(w, placed, &shot, |s| s.set_page_time(range, t))
+}
+
+/// The middle column of what a shot of [`long_walk`] sees.
+fn walk_middle(g: &Frame) -> Option<f64> {
+    let columns = g.ids.iter().enumerate().filter(|(_, id)| **id != 0);
+    let (n, sum) = columns.fold((0u32, 0.0f64), |(n, sum), (i, _)| {
+        (n + 1, sum + f64::from(i as u32 % EXTENT[0]))
+    });
+    (n > 0).then(|| sum / f64::from(n))
+}
+
+/// Pixels the copy of [`long_walk`] in view has moved by `t` s.
+fn walk_px(t: f32) -> f64 {
+    let interval = f64::from((t / 0.1 + 1e-3).floor());
+    let f = 1.0 / (0.45f64).tan();
+    let aspect = f64::from(EXTENT[0]) / f64::from(EXTENT[1]);
+    0.5 * f64::from(WALK_STEP) * interval / 2.5 * f / aspect * f64::from(EXTENT[0])
+}
+
+/// Where [`long_walk`]'s copy stands at its start, once the page lands.
+fn walk_rest(w: &mut World, placed: &Placed, frame: &mut u32) -> f64 {
+    let start = Instant::now();
+    loop {
+        if let Some(x) = walk_middle(&walk_shot(w, placed, frame, 0.0)) {
+            return x;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the page never landed"
+        );
+    }
+}
 
 /// Worms of [`CROWD`] walking at [`PACE`], on a page of the model all of `worm`'s copies share.
 fn paced_crowd() -> Instances {
@@ -8292,6 +8465,7 @@ fn instance_pages_come_nearest_first_under_their_budget_and_their_ranges_stay_va
         a.entries()
             .iter()
             .filter(|e| e.class == orr_pack::Class::InstancePage as u16)
+            .filter(|e| a.name(e).starts_with("rows/"))
             .map(|e| u64::from(a.blobs(e)[1].raw_len).next_multiple_of(256))
             .collect()
     };

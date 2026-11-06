@@ -199,6 +199,8 @@ pub struct InstancePage {
     pub info: InstancePageInfo,
     /// Null while the records are not resident. The page's linear table follows them.
     pub records: GpuPtr<InstanceRecord>,
+    /// Per window of an animated page's rows, its address, 0 while it is not resident.
+    pub windows: Vec<u64>,
     /// Bytes of the records and the table.
     pub bytes: u32,
     /// The mount holding it, whose models its prototypes name first.
@@ -1413,7 +1415,14 @@ fn place_page(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     let a = t.archive();
     let blobs = a.blobs(&a.entries()[entry]);
     let bytes = blobs.get(1).map_or(0, |b| b.raw_len);
-    info.header.linear_rows(bytes as usize)?;
+    let h = &info.header;
+    h.linear_rows(bytes as usize)?;
+    for w in 0..h.motion_windows() {
+        let held = blobs.get(h.motion_blob(w) as usize).map(|b| b.raw_len);
+        if held != Some(h.motion_window_bytes(w)) {
+            return Err(orr_pack::Error::Malformed("motion rows").into());
+        }
+    }
     t.placed.lock().unwrap().pages.push(PlacedPage {
         id,
         info,
@@ -2124,7 +2133,7 @@ pub(crate) struct Mounts {
     page_ranges: RangeAllocator,
     sizes: TableSizes,
     pub(crate) pages: Vec<Option<InstancePage>>,
-    /// By page: the mount and unit of its records.
+    /// By page: the mount and unit of its records, which its windows of rows follow.
     page_keys: Vec<Option<(MountId, u32)>>,
     retired: Vec<(u64, Resident)>,
     pub(crate) streaming: Streaming,
@@ -2381,6 +2390,23 @@ fn units(
             target: PoolTarget::InstancePage(id),
         };
         units.push((unit, Some(load)));
+        let h = &p.info.header;
+        for window in 0..h.motion_windows() {
+            let bytes = h.motion_window_bytes(window);
+            let unit = UnitDesc {
+                class: ResidencyClass::InstancePages,
+                bytes: u64::from(bytes).next_multiple_of(256),
+                deps: Vec::new(),
+                start: Start::Absent,
+            };
+            let load = StreamUnit::Pool {
+                entry: p.entry,
+                blob: h.motion_blob(window),
+                bytes,
+                target: PoolTarget::PageWindow { page: id, window },
+            };
+            units.push((unit, Some(load)));
+        }
     }
     Ok(MountUnits {
         fine,
@@ -3011,6 +3037,38 @@ impl Mounts {
         }
     }
 
+    /// The bytes window `window` of page `id`'s rows takes in the instance page pool.
+    pub(crate) fn window_bytes(&self, id: u32, window: u32) -> u64 {
+        self.pages
+            .get(id as usize)
+            .and_then(Option::as_ref)
+            .map_or(0, |p| {
+                u64::from(p.info.header.motion_window_bytes(window)).next_multiple_of(256)
+            })
+    }
+
+    /// Requests window `window` of page `id`'s rows for the next step.
+    pub(crate) fn request_window(&mut self, id: u32, window: u32, cell_distance: u32) {
+        if let Some(Some((mount, unit))) = self.page_keys.get(id as usize).copied() {
+            self.streaming
+                .request_unit(mount, unit + 1 + window, cell_distance);
+        }
+    }
+
+    /// Requests what page `id` needs to stand where it starts: its records, and on an animated
+    /// page the window of its start.
+    pub(crate) fn prefetch_page(&mut self, id: u32, cell_distance: u32) {
+        self.request_page(id, cell_distance);
+        let Some(Some(p)) = self.pages.get(id as usize) else {
+            return;
+        };
+        if !p.info.motion_times.is_empty() {
+            let h = p.info.header;
+            let (k, _) = orr_pack::instance::motion_interval(&p.info.motion_times, h.motion_start);
+            self.request_window(id, k as u32 / h.motion_window, cell_distance);
+        }
+    }
+
     /// Requests the records of the pages meeting the sphere and every streamed unit of the
     /// models they place, nearer pages first, for the next step.
     pub(crate) fn prefetch_region(&mut self, center: DVec3, radius: f64, cell_log2: u32) {
@@ -3024,7 +3082,7 @@ impl Mounts {
                 continue;
             }
             let cells = (c.distance(center) / edge) as u32;
-            self.request_page(id, cells);
+            self.prefetch_page(id, cells);
             let Ok(protos) = self.page_prototypes(PageId(id)) else {
                 continue;
             };
@@ -3530,6 +3588,7 @@ impl Mounts {
             self.pages[i] = Some(InstancePage {
                 info: p.info.clone(),
                 records: GpuPtr::NULL,
+                windows: vec![0; p.info.header.motion_windows() as usize],
                 bytes: p.bytes,
                 mount,
             });

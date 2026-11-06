@@ -4631,14 +4631,15 @@ fn placed_at(a: &Archive, model: &str, t: f32) -> Vec<([i32; 3], Affine3)> {
         .filter(|e| e.class == Class::InstancePage as u16)
     {
         let blobs = a.blobs(e);
-        let (head, body) = (read(a, &blobs[0]), read(a, &blobs[1]));
+        let head = read(a, &blobs[0]);
         let info = InstancePageInfo::parse(&head).unwrap();
         if info.prototypes.iter().all(|p| p.model != want) {
             continue;
         }
         assert!(!info.motion_times.is_empty(), "{model} holds still");
         let h = info.header;
-        let rows = motion_rows(&h, &body).unwrap();
+        let windows = (0..h.motion_windows()).map(|w| &blobs[h.motion_blob(w) as usize]);
+        let rows: Vec<_> = windows.flat_map(|b| motion_rows(&read(a, b))).collect();
         let (k, dt) = motion_interval(&info.motion_times, t);
         let n = usize::from(h.record_count);
         for row in &rows[k * n..(k + 1) * n] {

@@ -31,6 +31,9 @@ use crate::{
     SkyStats, SlotStateGpu, TessStateGpu, ViewConstants,
 };
 
+/// Seconds of an animated page's rows wanted ahead of its clock.
+const MOTION_AHEAD: f32 = 1.0;
+
 /// `tables.slang` `GROUP_QUANTIZED_PAGE`.
 const GROUP_QUANTIZED_PAGE: u32 = 1;
 
@@ -325,6 +328,9 @@ pub(crate) struct GroupFrame {
 /// An animated page placed in a scene.
 pub(crate) struct PageMotion {
     pub(crate) range: InstanceRange,
+    /// `None` once its pack unmounts, when its copies hide for good: the id can name another
+    /// page by then.
+    pub(crate) page: Option<PageId>,
     /// The page's records.
     pub(crate) records: TransformGroupId,
     /// The transforms its copies read.
@@ -333,9 +339,36 @@ pub(crate) struct PageMotion {
     pub(crate) left: [[f32; 4]; 3],
     pub(crate) right: [[f32; 4]; 3],
     pub(crate) count: u32,
-    pub(crate) linear_rows: u32,
     /// s of the page's clock, from [`SceneWriter::set_page_time`].
     pub(crate) time: f32,
+    /// Whether the clock last ran forward, the way its windows stream ahead.
+    pub(crate) forward: bool,
+    /// The interval and seconds into it last posed, where copies hold while the window of the
+    /// clock is on its way.
+    pub(crate) held: Option<(u32, f32)>,
+}
+
+impl PageMotion {
+    /// The windows of rows wanted now, with their rank: the clock's, then the one copies hold in
+    /// while that is on its way, then those [`MOTION_AHEAD`] seconds on along the clock. A pool
+    /// with room for one window gives it to the clock's, or copies would hold for good.
+    pub(crate) fn windows(&self, per_window: u32) -> Vec<(u32, f64)> {
+        let window =
+            |t: f32| orr_pack::instance::motion_interval(&self.times, t).0 as u32 / per_window;
+        let now = window(self.time);
+        let last = (self.times.len() as u32 - 1) / per_window;
+        let (first, end) = if self.forward {
+            let far = window(self.time + MOTION_AHEAD);
+            (now, far.max(now + 1).min(last))
+        } else {
+            let far = window(self.time - MOTION_AHEAD);
+            (far.min(now.saturating_sub(1)), now)
+        };
+        let rank = |w: u32| f64::from(w.abs_diff(now));
+        let mut out: Vec<(u32, f64)> = (first..=end).map(|w| (w, rank(w))).collect();
+        out.extend(self.held.map(|h| (h.0 / per_window, 0.5)));
+        out
+    }
 }
 
 /// What a cooked page's transform group holds.
@@ -1304,11 +1337,6 @@ impl<'f> SceneWriter<'f> {
             return Ok(None);
         }
         let header = held.info.header;
-        let pool = self.mounts.streaming.instance_page_pool();
-        let bytes = self.mounts.page_bytes(page.0);
-        if bytes > pool {
-            return Err(Error::PageOverPool { page, bytes, pool });
-        }
         let cell = IVec3::from_array(header.cell);
         let edge = 2f64.powi(self.cell_log2 as i32);
         let hung = {
@@ -1347,14 +1375,16 @@ impl<'f> SceneWriter<'f> {
         let h = p.info.header;
         cpu.page_motions.push(PageMotion {
             range,
+            page: Some(page),
             records,
             group,
             times: p.info.motion_times.clone(),
             left: h.motion_left.rows,
             right: h.motion_right.rows,
             count: u32::from(h.record_count),
-            linear_rows: h.linear_rows(p.bytes as usize)? as u32,
             time: h.motion_start,
+            forward: true,
+            held: None,
         });
         Ok(range)
     }
@@ -1364,6 +1394,9 @@ impl<'f> SceneWriter<'f> {
     pub fn set_page_time(&mut self, range: InstanceRange, seconds: f32) {
         let cpu = &mut *self.scene.cpu.lock().unwrap();
         if let Some(m) = cpu.page_motions.iter_mut().find(|m| m.range == range) {
+            if seconds != m.time {
+                m.forward = seconds > m.time;
+            }
             m.time = seconds;
         }
     }

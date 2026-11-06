@@ -26,7 +26,9 @@
 //! stream as well, nearest a scene's focus first, and its copies are hidden while they are not
 //! resident. [`Scenes::prefetch_region`] asks ahead for what a region holds. An animated page's
 //! copies stand where a kernel puts them from its rows at the clock of
-//! [`SceneWriter::set_page_time`]; all its intervals are resident at once, nearest or not.
+//! [`SceneWriter::set_page_time`]. Those rows stream by that clock, a window of intervals at a
+//! time and ahead of it, however long the animation; a copy holds its last pose while the window
+//! it has reached is on its way.
 //!
 //! An edit ([`Scenes::create_edit`]) is a model of its own over pages of its own, which
 //! consumer kernels change at the scene compute point: its triangles and positions, split by
@@ -206,9 +208,6 @@ pub enum Error {
     /// A page hangs from an entry of a transform group that is not a page's.
     #[error("{0:?} holds no palette entry {1}")]
     NoFrameJoint(TransformGroupId, u32),
-    /// An animated page holds its rows for every interval, and those could never land.
-    #[error("{page:?} holds {bytes} B, past the instance page pool's {pool} B")]
-    PageOverPool { page: PageId, bytes: u64, pool: u64 },
     /// [`SceneWriter::add_instance_page`] draws no pose, and a skinned copy needs one:
     /// [`SceneWriter::add_skinned_page`] places such a page.
     #[error("{0:?} is skinned: its page takes add_skinned_page")]
