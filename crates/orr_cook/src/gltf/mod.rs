@@ -1265,10 +1265,16 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     instanced.iter().for_each(|&n| is_instanced[n] = true);
     let skinned_copies = |n: usize| is_instanced[n] && node(n).skin().is_some();
     let animated = skin::animated(doc, graph);
+    let skin_of = |n: usize| {
+        let skin = node(n).skin()?;
+        Some((skin.index(), skin.joints().map(|j| j.index()).collect()))
+    };
     let rigging = Rigging {
-        doc,
-        graph,
+        parent: &graph.parent,
+        order: &graph.order,
+        in_scene: &graph.in_scene,
         animated: &animated,
+        skin_of: &skin_of,
         parts_from_skin: settings.parts_from_skin,
         parts_from_attribute: settings.parts_from_attribute.is_some(),
     };

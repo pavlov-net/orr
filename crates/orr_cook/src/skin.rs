@@ -62,7 +62,7 @@ pub(crate) struct Graph {
     pub(crate) parent: Vec<Option<usize>>,
     local: Vec<DMat4>,
     pub(crate) world: Vec<DMat4>,
-    in_scene: Vec<bool>,
+    pub(crate) in_scene: Vec<bool>,
     /// Scene nodes depth first, parents before children, in document order.
     pub(crate) order: Vec<usize>,
 }
@@ -98,8 +98,7 @@ impl Graph {
 
     /// `node` and the nodes above it, short of `stop`.
     fn chain(&self, node: usize, stop: Option<usize>) -> impl Iterator<Item = usize> {
-        let above = |&n: &usize| self.parent[n];
-        std::iter::successors(Some(node), above).take_while(move |&n| Some(n) != stop)
+        chain(&self.parent, node, stop)
     }
 
     /// Model space from the space of node `n`, in a model framed by `frame`, or in the scene
@@ -137,6 +136,16 @@ impl Graph {
     }
 }
 
+/// `node` and the nodes above it by `parent`, short of `stop`.
+pub(crate) fn chain(
+    parent: &[Option<usize>],
+    node: usize,
+    stop: Option<usize>,
+) -> impl Iterator<Item = usize> {
+    let above = |&n: &usize| parent[n];
+    std::iter::successors(Some(node), above).take_while(move |&n| Some(n) != stop)
+}
+
 /// The nodes an animation's translation, rotation or scale channel targets in the scene.
 pub(crate) fn animated(doc: &gltf::Document, graph: &Graph) -> Vec<bool> {
     use gltf::animation::Property as P;
@@ -154,7 +163,7 @@ pub(crate) fn animated(doc: &gltf::Document, graph: &Graph) -> Vec<bool> {
 /// What one skeleton holds.
 pub(crate) struct Rig {
     /// Per node, whether it is a joint.
-    joints: Vec<bool>,
+    pub(crate) joints: Vec<bool>,
     /// glTF skins of its meshes.
     skins: Vec<usize>,
     /// The mesh nodes that hang on it.
@@ -162,22 +171,27 @@ pub(crate) struct Rig {
     /// The first joint in scene order, which names a model of its own.
     pub(crate) top: usize,
     /// The node that frames its model; without one, model space is the scene's.
-    frame: Option<usize>,
+    pub(crate) frame: Option<usize>,
     /// The nearest node above every root joint. Without one they hang from the frame, or from
     /// the scene where one of them lies outside the frame.
-    above: Option<usize>,
-    outside: bool,
+    pub(crate) above: Option<usize>,
+    pub(crate) outside: bool,
     /// Its meshes cook as rigid parts instead of skinned vertices.
     pub(crate) rigid: bool,
     /// Holds a still joint.
-    still: bool,
+    pub(crate) still: bool,
 }
 
 /// How [`Rig::find`] reads the scene.
 pub(crate) struct Rigging<'a> {
-    pub(crate) doc: &'a gltf::Document,
-    pub(crate) graph: &'a Graph,
+    /// Per node, the node whose space it stands in.
+    pub(crate) parent: &'a [Option<usize>],
+    /// Nodes in scene order, parents first.
+    pub(crate) order: &'a [usize],
+    pub(crate) in_scene: &'a [bool],
     pub(crate) animated: &'a [bool],
+    /// The skin of a mesh node, and the nodes it binds.
+    pub(crate) skin_of: &'a dyn Fn(usize) -> Option<(usize, Vec<usize>)>,
     /// Skins cook as rigid parts.
     pub(crate) parts_from_skin: bool,
     /// Parts come from a vertex attribute, which leaves joints to skinning.
@@ -194,9 +208,8 @@ impl Rig {
         frame: Option<usize>,
         one: bool,
     ) -> Vec<Self> {
-        let (doc, graph) = (r.doc, r.graph);
-        let count = graph.parent.len();
-        let skin_of = |n: usize| doc.nodes().nth(n).and_then(|d| d.skin());
+        let count = r.parent.len();
+        let skin_of = r.skin_of;
         let mut sets: Vec<usize> = (0..count).collect();
         fn find(sets: &mut [usize], mut n: usize) -> usize {
             while sets[n] != n {
@@ -206,8 +219,8 @@ impl Rig {
             n
         }
         let mut pinned = vec![false; count];
-        for skin in meshes.iter().filter_map(|&m| skin_of(m)) {
-            let mut skin_joints = skin.joints().map(|j| j.index());
+        for (_, skin_joints) in meshes.iter().filter_map(|&m| skin_of(m)) {
+            let mut skin_joints = skin_joints.into_iter();
             let Some(first) = skin_joints.next() else {
                 continue;
             };
@@ -222,7 +235,7 @@ impl Rig {
         // The movers at or above `from`, short of `stop`, with what is between them; the nearest
         // of them.
         let mut mark = |from: usize, stop: Option<usize>, sets: &mut [usize]| {
-            let chain: Vec<usize> = graph.chain(from, stop).collect();
+            let chain: Vec<usize> = chain(r.parent, from, stop).collect();
             let moves = |n: &usize| r.animated[*n] || pinned[*n];
             let near = chain.iter().position(moves)?;
             let far = chain.iter().rposition(moves)?;
@@ -241,13 +254,13 @@ impl Rig {
         let mut anchors: Vec<(usize, Option<usize>)> = Vec::with_capacity(meshes.len());
         for &m in meshes {
             anchors.push(match skin_of(m) {
-                Some(s) => (m, s.joints().next().map(|j| j.index())),
+                Some((_, joints)) => (m, joints.first().copied()),
                 None => (m, mark(m, frame, &mut sets)),
             });
         }
         // Scene order. A joint out of the scene still makes a rig, for `Skeleton::build` to report.
-        let out_of_scene = (0..count).filter(|&n| joints[n] && !graph.in_scene[n]);
-        let in_scene = graph.order.iter().copied().filter(|&n| joints[n]);
+        let out_of_scene = (0..count).filter(|&n| joints[n] && !r.in_scene[n]);
+        let in_scene = r.order.iter().copied().filter(|&n| joints[n]);
         let members: Vec<usize> = in_scene.chain(out_of_scene).collect();
         if one && let Some(&first) = members.first() {
             for &n in &members {
@@ -278,10 +291,7 @@ impl Rig {
         }
         let mut rigs = Vec::with_capacity(groups.len());
         for (own, held) in groups.into_iter().zip(held) {
-            let mut skins: Vec<usize> = held
-                .iter()
-                .filter_map(|&m| Some(skin_of(m)?.index()))
-                .collect();
+            let mut skins: Vec<usize> = held.iter().filter_map(|&m| Some(skin_of(m)?.0)).collect();
             skins.sort_unstable();
             skins.dedup();
             let rigid = r.parts_from_skin || (skins.is_empty() && !r.parts_from_attribute);
@@ -297,7 +307,7 @@ impl Rig {
                 still: still || rigid,
             };
             own.iter().for_each(|&n| rig.joints[n] = true);
-            rig.fold(graph, &own, still && !rigid);
+            rig.fold(r.parent, &own, still && !rigid);
             rigs.push(rig);
         }
         rigs
@@ -306,13 +316,13 @@ impl Rig {
     /// Settles the space root joints hang from among `own`: the nearest node above them all.
     /// The nodes short of it become joints, and with `unfolded`, every node up to the frame or
     /// the scene does, for a still joint a root that does not invert could not undo.
-    fn fold(&mut self, graph: &Graph, own: &[usize], unfolded: bool) {
+    fn fold(&mut self, parent: &[Option<usize>], own: &[usize], unfolded: bool) {
         let roots: Vec<usize> = own
             .iter()
             .copied()
-            .filter(|&n| graph.parent[n].is_none_or(|p| !self.joints[p]))
+            .filter(|&n| parent[n].is_none_or(|p| !self.joints[p]))
             .collect();
-        let below = |r: usize, f: usize| graph.chain(r, None).skip(1).any(|a| a == f);
+        let below = |r: usize, f: usize| chain(parent, r, None).skip(1).any(|a| a == f);
         self.outside = self
             .frame
             .is_some_and(|f| !roots.iter().all(|&r| below(r, f)));
@@ -320,7 +330,7 @@ impl Rig {
         let paths: Vec<Vec<usize>> = roots
             .iter()
             .map(|&r| {
-                let mut path: Vec<usize> = graph.chain(r, stop).skip(1).collect();
+                let mut path: Vec<usize> = chain(parent, r, stop).skip(1).collect();
                 path.reverse();
                 path
             })
@@ -738,6 +748,8 @@ fn error(info: &SkeletonInfo, channels: &[Channel], span: (f64, f64), clip: &Cli
         .flat_map(|c| c.times.iter().map(|&t| f64::from(t) - start))
         .collect();
     times.extend((0..h.frame_count - 1).map(|f| (f64::from(f) + 0.5) / f64::from(h.sample_rate)));
+    times.sort_by(f64::total_cmp);
+    times.dedup();
     let n = info.joint_count();
     let (mut sampled, mut model, mut want) = (
         vec![Trs::IDENTITY; n],

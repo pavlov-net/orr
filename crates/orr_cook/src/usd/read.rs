@@ -439,6 +439,34 @@ impl PrimReader<'_> {
             .map_err(|e| format!("{} {name}: {e}", self.path()))
     }
 
+    /// The times the prim's `xformOpOrder` ops are sampled at, in order; none where each op holds
+    /// one value. Values tell that and matrices can't: a full turn ends where it began.
+    pub(super) fn xform_times(&self) -> Result<Vec<f64>, String> {
+        let mut times = Vec::new();
+        let mut moves = false;
+        for op in self.tokens("xformOpOrder")? {
+            let name = op.strip_prefix("!invert!").unwrap_or(&op);
+            if name == "!resetXformStack!" {
+                continue;
+            }
+            let held = self.prim.attribute(name).time_sample_times();
+            let held = held.map_err(|e| format!("{} {name}: {e}", self.path()))?;
+            if let Some((&first, rest)) = held.split_first() {
+                let value = self.at(first).numbers(name)?;
+                for &t in rest {
+                    moves = moves || self.at(t).numbers(name)? != value;
+                }
+            }
+            times.extend(held);
+        }
+        if !moves {
+            return Ok(Vec::new());
+        }
+        times.sort_by(f64::total_cmp);
+        times.dedup();
+        Ok(times)
+    }
+
     /// The prim's local transform from its `xformOpOrder`, and whether it resets the
     /// parent's.
     pub(super) fn local_transform(&self) -> Result<(DMat4, bool), String> {

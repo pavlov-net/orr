@@ -20,6 +20,16 @@
 //!   `<asset>/<root>/clip/<animation>`. Its other meshes are static and cook with the rest
 //!   of the stage, as do meshes outside a `SkelRoot`, whose bindings mean nothing. A skinned
 //!   mesh under a `SkelRoot` in a prototype fails: a copy has no pose of its own.
+//! - What moves by an xform sampled over time, where a sample differs from the first: every mesh
+//!   drawn under such a prim. In the rest of the stage each rig of them is a model of its own in
+//!   scene space, named after its first joint (after its path, or `node<i>` for its node, if
+//!   another model has the name or it would be `mesh`), unless it is all the stage holds; a selected model or a prototype keeps its own, with one
+//!   skeleton. Prims become joints as glTF nodes do ([`crate::skin`]), and a rig cooks as rigid
+//!   parts, one per joint, part 0 on a still joint, unless a subdivision cage in it takes its
+//!   joints by skinning. Its one clip is `xform`, over the samples of every prim on the stage
+//!   so that such clips keep time. A `Skeleton` under
+//!   such a prim keeps its model, with the prims above it as joints, and each of its clips
+//!   holds them too, beside an `xform` clip without a `SkelAnimation`.
 //! - Each prototype of a `PointInstancer` is a model named after its root prim (after its path
 //!   if another model has the name). The root's own transform is part of the model, as is
 //!   what each prim under it adds, up to any prim that resets the transform stack. Only the
@@ -64,18 +74,19 @@ use std::path::Path;
 use std::rc::Rc;
 
 use openusd::{sdf, usd};
-use orr_math::{DMat3, DMat4, DQuat, DVec3, DVec4};
+use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4};
 use orr_pack::material::Material;
+use orr_pack::skeleton::{NO_PARENT, SkeletonInfo, Trs};
 use serde::Deserialize;
 
 use crate::import::SceneSubd;
 use crate::import::{
     NodeSelect, Placed, Scene, SceneMaterial, SceneModel, SceneSkeleton, collapses, placements,
 };
-use crate::mesh::{MeshData, MeshSettings, MeshSource, SectionData, Skin};
+use crate::mesh::{MeshData, MeshSettings, MeshSource, PartData, Pivots, SectionData, Skin};
 use crate::patch::{self, MaterialPatch, MeshPatch};
 use crate::shading;
-use crate::skin::ClipSettings;
+use crate::skin::{self, Channel, ClipSettings, Rig, Rigging};
 use crate::subd::SubdSettings;
 use crate::texture::material::{ImageData, ImageFile, ImageTile, TextureRules};
 use crate::texture::tiles::{UDIM, udim_cell};
@@ -157,6 +168,18 @@ pub enum Subdivision {
     Cage,
 }
 
+/// The clip of a stage's xforms, which have no animation prim to name them.
+const XFORM_CLIP: &str = "xform";
+
+/// A joint's inverse bind from its bind pose: the identity where that collapses an axis, which
+/// leaves the joint's own space as bind space.
+fn inverse_bind(m: DMat4) -> DMat4 {
+    match collapses(DMat3::from_mat4(m)) {
+        true => DMat4::IDENTITY,
+        false => m.inverse(),
+    }
+}
+
 /// Schemas derived from `UsdGeomImageable`; other prims have no visibility or purpose.
 const IMAGEABLE: &[&str] = &[
     "BasisCurves",
@@ -221,6 +244,8 @@ struct Node {
     name: String,
     /// Under a `PointInstancer`, or a `class` or `over` (or one): cooked only as a prototype.
     instanced: bool,
+    /// The times its xform is sampled at, where they differ; empty for a prim that holds still.
+    times: Vec<f64>,
     /// Imageable and `invisible`: not drawn with its subtree, but read as a skeleton or
     /// animation.
     invisible: bool,
@@ -240,6 +265,10 @@ struct Building {
     /// The root node of the prototype the model holds.
     prototype: Option<usize>,
     skeleton: Option<usize>,
+    /// Its skeleton among those of rigs.
+    rig_skeleton: Option<usize>,
+    /// Bind position per joint of a model of rigid parts.
+    pivots: Option<Vec<[f32; 3]>>,
     welder: Welder,
     cage: CageBuilder,
 }
@@ -253,6 +282,8 @@ impl Building {
             root,
             prototype: None,
             skeleton: None,
+            rig_skeleton: None,
+            pivots: None,
             welder: Welder::default(),
             cage: CageBuilder::default(),
         }
@@ -295,6 +326,13 @@ struct Bound {
     indices: usize,
     weights: usize,
     geom_bind: Option<usize>,
+}
+
+/// The models being assembled, the models their meshes go to and the meshes drawn.
+struct Assembly<'a> {
+    models: &'a mut Vec<Building>,
+    holders: &'a mut Vec<Vec<(usize, DMat4)>>,
+    meshes: &'a mut Vec<(usize, usize)>,
 }
 
 /// One prototype of the stage.
@@ -478,6 +516,7 @@ impl<'s> Importer<'s> {
                 || prim.is_abstract().map_err(|e| e.to_string())?
                 || up.is_some_and(|p| p.instanced || p.ty == "PointInstancer");
             let (local, reset) = r.local_transform()?;
+            let times = r.xform_times()?;
             let world = match (parent, reset) {
                 (Some(p), false) => self.nodes[p].world * local,
                 _ => root * local,
@@ -504,6 +543,7 @@ impl<'s> Importer<'s> {
                 local,
                 reset,
                 ty,
+                times,
                 name,
                 instanced,
                 invisible,
@@ -628,11 +668,41 @@ impl<'s> Importer<'s> {
             }
         }
 
+        let order: Vec<usize> = (0..n).collect();
+        let animated: Vec<bool> = self.nodes.iter().map(|d| !d.times.is_empty()).collect();
+        let parents: Vec<Option<usize>> = self
+            .nodes
+            .iter()
+            .map(|d| d.parent.filter(|_| !d.reset))
+            .collect();
+        let mut rigs: HashMap<usize, skel::PrimRig> = HashMap::new();
+        let mut rig_skeletons = Vec::new();
+        if animated.contains(&true) {
+            let mut held: Vec<Vec<usize>> = vec![Vec::new(); models.len()];
+            meshes.iter().for_each(|&(i, o)| held[o].push(i));
+            let moved = |&i: &usize| skin::chain(&parents, i, None).any(|n| animated[n]);
+            for (o, held) in held.iter().enumerate() {
+                if models[o].skinned || !held.iter().any(moved) {
+                    continue;
+                }
+                self.rig_model(
+                    o,
+                    held,
+                    (&order, &animated, &parents),
+                    Assembly {
+                        models: &mut models,
+                        holders: &mut holders,
+                        meshes: &mut meshes,
+                    },
+                    (&mut rigs, &mut rig_skeletons),
+                )?;
+            }
+        }
         // One skeleton per skeletal root, from what its skinned meshes bind: its prim path,
         // the skeleton, the root's node and the prims that bind it.
         let mut skels: Vec<(String, skel::Skel, usize, Vec<usize>)> = Vec::new();
         for (m, b) in models.iter_mut().enumerate() {
-            if !b.skinned {
+            if !b.skinned || b.rig_skeleton.is_some() {
                 continue;
             }
             let mut skeleton: Option<&sdf::Path> = None;
@@ -659,11 +729,12 @@ impl<'s> Importer<'s> {
                         .by_path
                         .get(path.as_str())
                         .ok_or_else(|| format!("skeleton {path} is not cooked"))?;
-                    let built = skel::Skel::build(
+                    let mut built = skel::Skel::build(
                         &self.reader(&self.nodes[node].prim),
                         self.nodes[node].world,
                         self.root,
                     )?;
+                    self.hang(&mut built, node, &animated, &parents)?;
                     let root = b.root.expect("skeletal roots have prims");
                     skels.push((path.as_str().to_string(), built, root, Vec::new()));
                     skels.len() - 1
@@ -671,6 +742,11 @@ impl<'s> Importer<'s> {
             };
             skels[k].3.extend(sites);
             b.skeleton = Some(k);
+        }
+        for b in &mut models {
+            if let Some(k) = b.rig_skeleton {
+                b.skeleton = Some(skels.len() + k);
+            }
         }
         // A model's meshes carry tangents if one of them does, which each must know as it lands
         // in the model. That takes which materials a mesh binds, and none of its arrays.
@@ -778,14 +854,23 @@ impl<'s> Importer<'s> {
                     }
                 }
             }
-            let skeleton = models[o].skeleton.map(|k| &skels[k].1);
-            let (skin, transform) = match (bound.get(&i), skeleton) {
-                (Some(b), Some(sk)) => {
+            let skeleton = models[o].skeleton.and_then(|k| skels.get(k)).map(|s| &s.1);
+            let rig = rigs.get(&o);
+            let (skin, transform, part) = match (bound.get(&i), skeleton, rig) {
+                (Some(b), Some(sk), _) => {
                     let (s, to_bind) =
                         sk.binding(&path, &self.skin_source(b), mesh.points.len())?;
-                    (Some(s), to_bind)
+                    (Some(s), to_bind, 0)
                 }
-                _ => (None, self.to_model(&models[o], i)?),
+                (_, _, Some(r)) => {
+                    let (j, to_bind) = self.attach(r, &models[o], i)?;
+                    let skin = (!r.rigid).then(|| {
+                        let one = ([j as u8; 4], [255, 0, 0, 0]);
+                        vec![one; mesh.points.len()]
+                    });
+                    (skin, to_bind, j)
+                }
+                _ => (None, self.to_model(&models[o], i)?, 0),
             };
             let face_material = |f: usize| faces[f];
             let surface = (!as_cage).then(|| Faces::new(&mesh));
@@ -837,9 +922,16 @@ impl<'s> Importer<'s> {
                     ));
                 }
                 let placing = Placing {
-                    transform: linear * transform,
+                    // A skeleton takes what a mesh in its bind pose cannot, but it poses no
+                    // part 0.
+                    transform: if rig.is_some_and(|r| !r.rigid || part != 0) {
+                        transform
+                    } else {
+                        linear * transform
+                    },
                     face_material: &face_material,
                     skin: skin.as_deref(),
+                    part,
                     color: &color,
                 };
                 match &surface {
@@ -891,6 +983,7 @@ impl<'s> Importer<'s> {
                 clips,
             });
         }
+        skeletons.extend(rig_skeletons);
         Ok(Scene {
             models: out,
             materials: std::mem::take(&mut self.materials),
@@ -990,13 +1083,290 @@ impl<'s> Importer<'s> {
                     joints: w.joints,
                     weights: w.weights,
                 }),
-                parts: None,
+                parts: b.pivots.map(|pivots| PartData {
+                    values: w.parts,
+                    count: pivots.len() as u16,
+                    by_section: false,
+                    pivots: Pivots::PerValue(pivots),
+                    joints: None,
+                }),
                 min_exponent: None,
             })),
             skeleton: b.skeleton,
             settings,
             materials: slots,
         })
+    }
+
+    /// Finds what moves among model `o`'s meshes `held`, and gives it skeletons: on the model
+    /// where it is the whole model, a selection or a prototype, else in models of its own.
+    fn rig_model(
+        &self,
+        o: usize,
+        held: &[usize],
+        (order, animated, parents): (&[usize], &[bool], &[Option<usize>]),
+        Assembly {
+            models,
+            holders,
+            meshes,
+        }: Assembly<'_>,
+        (rigs, skeletons): (&mut HashMap<usize, skel::PrimRig>, &mut Vec<SceneSkeleton>),
+    ) -> Result<(), String> {
+        let in_scene = vec![true; parents.len()];
+        // A prototype's model ends at its root.
+        let mut cut = parents.to_vec();
+        if let Some(root) = models[o].prototype {
+            cut[root] = None;
+        }
+        let no_skin = |_: usize| None;
+        let mut cages = std::collections::HashSet::new();
+        for &i in held {
+            let facts = MeshFacts::read(&self.reader(&self.nodes[i].prim))?;
+            if !facts.polygonal && self.settings.subdivision == Subdivision::Cage {
+                cages.insert(i);
+            }
+        }
+        let one = models[o].frame.is_some() || models[o].prototype.is_some();
+        let rigging = Rigging {
+            parent: &cut,
+            order,
+            in_scene: &in_scene,
+            animated,
+            skin_of: &no_skin,
+            parts_from_skin: false,
+            // A cage skins the one rig of such a model, which settles where its root hangs.
+            parts_from_attribute: one && !cages.is_empty(),
+        };
+        let found = Rig::find(&rigging, held, models[o].frame, one);
+        let whole = found.len() == 1 && found[0].meshes.len() == held.len();
+        let mut moved: HashMap<usize, usize> = HashMap::new();
+        for mut rig in found {
+            let m = if one || whole {
+                o
+            } else {
+                let top = &self.nodes[rig.top];
+                let path = top.prim.path().as_str().trim_start_matches('/');
+                // `mesh` is the entry of the whole stage's mesh.
+                let free = |s: &&str| {
+                    *s != "mesh" && !models.iter().any(|m| m.name.as_deref() == Some(*s))
+                };
+                let name = [top.name.as_str(), path]
+                    .into_iter()
+                    .find(free)
+                    .map_or_else(|| format!("node{}", rig.top), str::to_string);
+                models.push(Building::new(Some(name), None, None));
+                holders.push(vec![(models.len() - 1, DMat4::IDENTITY)]);
+                let m = models.len() - 1;
+                moved.extend(rig.meshes.iter().map(|&i| (i, m)));
+                m
+            };
+            rig.rigid = !rig.meshes.iter().any(|i| cages.contains(i));
+            let mut channels = Vec::new();
+            for (k, &(h, linear)) in holders[m].clone().iter().enumerate() {
+                let built = self.prim_rig(&rig, &models[h], linear)?;
+                models[h].skinned = !rig.rigid;
+                let joints = 0..built.info.joint_count();
+                models[h].pivots = rig.rigid.then(|| {
+                    let at = |j: usize| built.binds[j].w_axis.truncate().as_vec3().to_array();
+                    joints.map(at).collect()
+                });
+                models[h].rig_skeleton = Some(skeletons.len());
+                if k == 0 {
+                    channels = self.xform_channels(&built.prims)?;
+                }
+                let clip = self.xform_clip(&built.info, &channels)?;
+                skeletons.push(SceneSkeleton {
+                    prefix: models[h].name.clone().unwrap_or_default(),
+                    info: built.info.clone(),
+                    clips: clip
+                        .map(|c| (XFORM_CLIP.to_string(), c))
+                        .into_iter()
+                        .collect(),
+                });
+                if k == 0 {
+                    rigs.insert(m, built);
+                }
+            }
+        }
+        for h in meshes.iter_mut().filter(|h| h.1 == o) {
+            h.1 = moved.get(&h.0).copied().unwrap_or(o);
+        }
+        Ok(())
+    }
+
+    /// The skeleton of `rig` in the space of model `b`, with `after` applied to that space.
+    fn prim_rig(&self, rig: &Rig, b: &Building, after: DMat4) -> Result<skel::PrimRig, String> {
+        let nodes: Vec<usize> = (0..self.nodes.len()).filter(|&n| rig.joints[n]).collect();
+        let first = u16::from(rig.still);
+        let count = nodes.len() + usize::from(first);
+        let most = if rig.rigid {
+            orr_pack::skeleton::MAX_JOINTS
+        } else {
+            orr_pack::skeleton::MAX_SKINNED_JOINTS
+        };
+        if count > most {
+            return Err(format!(
+                "{} moves {count} joints with the prims between them; at most {most}",
+                self.nodes[rig.top].prim.path().as_str()
+            ));
+        }
+        let root = match (rig.above, rig.frame) {
+            (Some(n), _) => self.to_model(b, n)?,
+            (None, Some(f)) if rig.outside => {
+                let world = self.nodes[f].world;
+                if collapses(DMat3::from_mat4(world)) {
+                    return Err(format!(
+                        "{}: frames a model with prims that reset the transform stack, and \
+                         collapses an axis",
+                        self.nodes[f].prim.path().as_str()
+                    ));
+                }
+                self.root * world.inverse() * self.root
+            }
+            (None, _) => self.root,
+        };
+        let joint_of: HashMap<usize, u16> = nodes
+            .iter()
+            .enumerate()
+            .map(|(k, &n)| (n, k as u16 + first))
+            .collect();
+        let mut info = SkeletonInfo {
+            root: Affine3::from_mat4((after * root).as_mat4()),
+            parents: Vec::with_capacity(count),
+            rest: Vec::with_capacity(count),
+            inverse_binds: Vec::with_capacity(count),
+            names: Vec::with_capacity(count),
+        };
+        let mut binds = Vec::with_capacity(count);
+        if rig.still {
+            let ib = inverse_bind(root);
+            info.parents.push(NO_PARENT);
+            info.rest.push(Trs::IDENTITY);
+            info.inverse_binds.push(Affine3::from_mat4(ib.as_mat4()));
+            info.names.push(String::new());
+            binds.push(inverse_bind(ib));
+        }
+        for &n in &nodes {
+            let node = &self.nodes[n];
+            let path = node.prim.path().as_str();
+            let rest = self.to_model(b, n)?;
+            let parent = node.parent.filter(|_| !node.reset);
+            let parent = parent.and_then(|p| joint_of.get(&p).copied());
+            info.parents.push(parent.unwrap_or(NO_PARENT));
+            info.rest.push(skel::prim_trs(path, node.local)?);
+            let ib = inverse_bind(rest);
+            info.inverse_binds.push(Affine3::from_mat4(ib.as_mat4()));
+            info.names.push(node.name.clone());
+            binds.push(inverse_bind(ib));
+        }
+        Ok(skel::PrimRig {
+            info,
+            prims: nodes.iter().map(|&n| (n, joint_of[&n])).collect(),
+            joint_of,
+            binds,
+            still: rig.still.then_some(0),
+            rigid: rig.rigid,
+        })
+    }
+
+    /// The joint mesh `i` of model `b` follows, its nearest prim that has one, else the still
+    /// joint, and bind space from its points.
+    fn attach(&self, r: &skel::PrimRig, b: &Building, i: usize) -> Result<(u16, DMat4), String> {
+        let (mut m, mut at) = (DMat4::IDENTITY, Some(i));
+        while let Some(n) = at.filter(|&n| Some(n) != b.frame) {
+            if let Some(&j) = r.joint_of.get(&n) {
+                return Ok((j, r.binds[usize::from(j)] * m));
+            }
+            let node = &self.nodes[n];
+            m = node.local * m;
+            at = node
+                .parent
+                .filter(|_| !node.reset && Some(n) != b.prototype);
+        }
+        let still = r.still.ok_or("a mesh with no joint above it")?;
+        Ok((still, self.to_model(b, i)?))
+    }
+
+    /// The channels of `prims`' xforms: keys at their samples and between them, every
+    /// [`ClipSettings::max_rate`].
+    fn xform_channels(&self, prims: &[(usize, u16)]) -> Result<Vec<Channel>, String> {
+        let per_second = self.stage.time_codes_per_second();
+        let rate = f64::from(self.settings.clips.max_rate);
+        let mut channels = Vec::new();
+        for &(n, joint) in prims {
+            let node = &self.nodes[n];
+            let Some(&last) = node.times.last() else {
+                continue;
+            };
+            let mut times = Vec::new();
+            for w in node.times.windows(2) {
+                let steps = ((w[1] - w[0]) / per_second * rate).ceil().max(1.0) as u32;
+                let at = |k: u32| w[0] + (w[1] - w[0]) * f64::from(k) / f64::from(steps);
+                times.extend((0..steps).map(at));
+            }
+            times.push(last);
+            let path = node.prim.path().as_str();
+            let r = self.reader(&node.prim);
+            let mut keys = Vec::with_capacity(times.len());
+            for &t in &times {
+                let local = r.at(t).local_transform()?.0;
+                keys.push(skel::prim_trs(&format!("{path} at {t}"), local)?);
+            }
+            let seconds: Vec<f32> = times.iter().map(|t| (t / per_second) as f32).collect();
+            let keyed = skel::trs_channels(usize::from(joint), &seconds, &keys);
+            channels.extend(keyed.map_err(|e| format!("{path}: {e}"))?);
+        }
+        Ok(channels)
+    }
+
+    /// The start and length in seconds of every xform on the stage, as [`skin::span`] gives them.
+    fn xform_span(&self) -> (f64, f64) {
+        let per_second = self.stage.time_codes_per_second();
+        let seconds = |t: f64| f64::from((t / per_second) as f32);
+        let held = self.nodes.iter().filter(|d| !d.times.is_empty());
+        let (first, last) = held.fold((f64::MAX, f64::MIN), |(a, b), d| {
+            (a.min(d.times[0]), b.max(d.times[d.times.len() - 1]))
+        });
+        (seconds(first), seconds(last) - seconds(first))
+    }
+
+    /// The clip of `channels`, what xforms make up alone, or `None` without any. It runs over
+    /// every xform, so the clips of separate skeletons keep time.
+    fn xform_clip(
+        &self,
+        info: &SkeletonInfo,
+        channels: &[Channel],
+    ) -> Result<Option<orr_pack::clip::Clip>, String> {
+        self.settings.clips.check()?;
+        let span = self.xform_span();
+        let clips = &self.settings.clips;
+        Ok((!channels.is_empty()).then(|| skin::resample(info, channels, span, clips)))
+    }
+
+    /// Hangs skeleton `sk` of prim `node` from the prims that move it, if any do: every prim
+    /// from the highest of them to its own.
+    fn hang(
+        &self,
+        sk: &mut skel::Skel,
+        node: usize,
+        animated: &[bool],
+        parents: &[Option<usize>],
+    ) -> Result<(), String> {
+        let chain: Vec<usize> = skin::chain(parents, node, None).collect();
+        let Some(far) = chain.iter().rposition(|&n| animated[n]) else {
+            return Ok(());
+        };
+        let root = match chain.get(far + 1) {
+            Some(&above) => self.nodes[above].world,
+            None => self.root,
+        };
+        let mut prims = Vec::with_capacity(far + 1);
+        for &n in chain[..=far].iter().rev() {
+            let d = &self.nodes[n];
+            let local = skel::prim_trs(d.prim.path().as_str(), d.local)?;
+            prims.push((n, d.name.clone(), local, inverse_bind(d.world)));
+        }
+        sk.hang(prims, root)
     }
 
     /// Prototype `root`'s model space from node `n`'s under it: the local transforms from
@@ -1449,21 +1819,27 @@ impl<'s> Importer<'s> {
         }));
         sources.sort_unstable();
         sources.dedup();
+        let xforms = self.xform_channels(&sk.prims)?;
         let mut clips = Vec::new();
         for i in sources {
             let node = &self.nodes[i];
-            if let Some(c) = sk.clip(&node.prim, per_second, &self.settings.clips)? {
-                clips.push((i, node.name.clone(), c));
+            if let Some(c) = sk.clip(&node.prim, per_second, &xforms, &self.settings.clips)? {
+                clips.push((node.name.clone(), c));
             }
         }
+        if clips.is_empty()
+            && let Some(c) = self.xform_clip(&sk.info, &xforms)?
+        {
+            clips.push((XFORM_CLIP.to_string(), c));
+        }
         let mut count: HashMap<String, usize> = HashMap::new();
-        for (_, n, _) in &clips {
+        for (n, _) in &clips {
             *count.entry(n.clone()).or_default() += 1;
         }
         Ok(clips
             .into_iter()
             .enumerate()
-            .map(|(k, (_, n, c))| (if count[&n] == 1 { n } else { k.to_string() }, c))
+            .map(|(k, (n, c))| (if count[&n] == 1 { n } else { k.to_string() }, c))
             .collect())
     }
 

@@ -18,6 +18,13 @@
 //! joints' local transforms, sampled linearly between those times (rotations by slerp). At a
 //! time it does not hold translations, rotations and scales for all its joints it is not valid,
 //! and those joints hold their rest transforms; invalid at every time, it is no clip.
+//!
+//! Prims whose xforms are sampled over time move what stands under them by the same means, as
+//! [`PrimRig`]s: what moves is a [`Rig`](crate::skin::Rig) of prims, and a `Skeleton` under such a
+//! prim takes it and every prim between them as joints above its own ([`Skel::hang`]). An xform
+//! joint's clip keys come from the prim's transform at its samples and between them, every
+//! [`ClipSettings::max_rate`], so an op that turns past half a circle between two samples keeps
+//! its turn.
 
 use std::collections::HashMap;
 
@@ -36,6 +43,10 @@ pub(super) struct Skel {
     /// Joint paths as the skeleton names them.
     joints: Vec<String>,
     by_name: HashMap<String, u16>,
+    /// The first of its own joints, after any prims above it.
+    first: u16,
+    /// The prims above it that are joints, with their joints.
+    pub(super) prims: Vec<(usize, u16)>,
     /// Bind space from skeleton space: model space if the skeleton's root has an inverse, else
     /// the skeleton's space in scene units and axes.
     to_bind: DMat4,
@@ -53,6 +64,60 @@ pub(super) struct SkinSource<'a> {
 /// The path above joint path `joint`.
 fn above(joint: &str) -> Option<&str> {
     joint.rsplit_once('/').map(|a| a.0)
+}
+
+/// A skeleton of prims.
+pub(super) struct PrimRig {
+    pub(super) info: SkeletonInfo,
+    /// The prim of each joint that has one, with its joint.
+    pub(super) prims: Vec<(usize, u16)>,
+    pub(super) joint_of: HashMap<usize, u16>,
+    /// Per joint, bind space from its space.
+    pub(super) binds: Vec<DMat4>,
+    pub(super) still: Option<u16>,
+    /// One rigid part per joint, where the model's cages take no parts.
+    pub(super) rigid: bool,
+}
+
+/// A local transform per key time in `seconds` of `joint`, as linear channels.
+pub(super) fn trs_channels(
+    joint: usize,
+    seconds: &[f32],
+    keys: &[Trs],
+) -> Result<Vec<Channel>, String> {
+    let three = |f: fn(&Trs) -> [f32; 3]| {
+        keys.iter()
+            .map(|d| {
+                let v = f(d);
+                [v[0], v[1], v[2], 0.0]
+            })
+            .collect()
+    };
+    let mut channels = Vec::with_capacity(3);
+    for (property, values) in [
+        (Property::Translation, three(|d| d.translation)),
+        (
+            Property::Rotation,
+            keys.iter().map(|d| d.rotation).collect(),
+        ),
+        (Property::Scale, three(|d| d.scale)),
+    ] {
+        let ch = Channel {
+            joint,
+            property,
+            interpolation: Interpolation::Linear,
+            times: seconds.to_vec(),
+            values,
+        };
+        ch.check()?;
+        channels.push(ch);
+    }
+    Ok(channels)
+}
+
+/// `what`'s local transform as a joint's.
+pub(super) fn prim_trs(what: &str, m: DMat4) -> Result<Trs, String> {
+    trs(m).ok_or_else(|| format!("{what}: shear; joints need translation, rotation and scale"))
 }
 
 /// A transform as translation, rotation and scale, `None` if it shears.
@@ -180,8 +245,51 @@ impl Skel {
             info,
             joints,
             by_name,
+            first: 0,
+            prims: Vec::new(),
             to_bind,
         })
+    }
+
+    /// Puts `prims`, top first, above the skeleton's joints, the last of them holding its root
+    /// joints: each prim's node, name, rest transform and inverse bind. `root` is model space
+    /// from the space of the first.
+    pub(super) fn hang(
+        &mut self,
+        prims: Vec<(usize, String, Trs, DMat4)>,
+        root: DMat4,
+    ) -> Result<(), String> {
+        let added = prims.len();
+        if self.info.joint_count() + added > MAX_SKINNED_JOINTS {
+            return Err(format!(
+                "{} joints with the prims moving them; at most {MAX_SKINNED_JOINTS}",
+                self.info.joint_count() + added
+            ));
+        }
+        let by = added as u16;
+        let shift = |p: u16| match p {
+            NO_PARENT => by - 1,
+            p => p + by,
+        };
+        let parents = (0..by).map(|k| k.checked_sub(1).unwrap_or(NO_PARENT));
+        let own = self.info.parents.iter().map(|&p| shift(p));
+        self.info.parents = parents.chain(own).collect();
+        self.by_name.values_mut().for_each(|j| *j += by);
+        self.first = by;
+        self.info.root = Affine3::from_mat4(root.as_mat4());
+        let mut rest = Vec::with_capacity(added);
+        let mut binds = Vec::with_capacity(added);
+        let mut names = Vec::with_capacity(added);
+        for (k, (node, name, local, ib)) in prims.into_iter().enumerate() {
+            self.prims.push((node, k as u16));
+            rest.push(local);
+            binds.push(Affine3::from_mat4(ib.as_mat4()));
+            names.push(name);
+        }
+        self.info.rest.splice(0..0, rest);
+        self.info.inverse_binds.splice(0..0, binds);
+        self.info.names.splice(0..0, names);
+        Ok(())
     }
 
     /// Skin influences per point of a bound mesh `path`, and bind space from its points.
@@ -196,7 +304,7 @@ impl Skel {
             None => Vec::new(),
         };
         let map: Vec<u16> = match joints.as_slice() {
-            [] => (0..self.joints.len() as u16).collect(),
+            [] => (self.first..self.first + self.joints.len() as u16).collect(),
             names => names
                 .iter()
                 .map(|n| {
@@ -281,12 +389,13 @@ impl Skel {
         Ok((influences, self.to_bind * geom_bind))
     }
 
-    /// The clip of one animation prim, or `None` when it names none of the joints, has no time
-    /// samples or is not valid at any of them.
+    /// The clip of one animation prim beside the channels `xforms` of the prims above, or `None`
+    /// when it names none of the joints, has no time samples or is not valid at any of them.
     pub(super) fn clip(
         &self,
         anim: &usd::Prim,
         per_second: f64,
+        xforms: &[Channel],
         settings: &ClipSettings,
     ) -> Result<Option<Clip>, String> {
         let path = anim.path().as_str().to_string();
@@ -352,38 +461,14 @@ impl Skel {
             return Ok(None);
         }
         let seconds: Vec<f32> = times.iter().map(|t| (t / per_second) as f32).collect();
-        let mut channels = Vec::new();
+        let mut channels = xforms.to_vec();
         for (i, j) in joints.iter().enumerate() {
             let Some(j) = *j else { continue };
             let joint_keys: Vec<Trs> = keys.iter().map(|k| k[i]).collect();
-            let three = |f: fn(&Trs) -> [f32; 3]| {
-                joint_keys
-                    .iter()
-                    .map(|d| {
-                        let v = f(d);
-                        [v[0], v[1], v[2], 0.0]
-                    })
-                    .collect()
-            };
-            for (property, values) in [
-                (Property::Translation, three(|d| d.translation)),
-                (
-                    Property::Rotation,
-                    joint_keys.iter().map(|d| d.rotation).collect(),
-                ),
-                (Property::Scale, three(|d| d.scale)),
-            ] {
-                let ch = Channel {
-                    joint: usize::from(j),
-                    property,
-                    interpolation: Interpolation::Linear,
-                    times: seconds.clone(),
-                    values,
-                };
-                ch.check()
-                    .map_err(|e| format!("{path} joint {}: {e}", names[i]))?;
-                channels.push(ch);
-            }
+            channels.extend(
+                trs_channels(usize::from(j), &seconds, &joint_keys)
+                    .map_err(|e| format!("{path} joint {}: {e}", names[i]))?,
+            );
         }
         let span = skin::span(&channels);
         Ok(Some(skin::resample(&self.info, &channels, span, settings)))

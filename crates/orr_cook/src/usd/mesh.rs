@@ -401,6 +401,8 @@ pub(super) struct Welder {
     /// A material of the model reads the vertex color stream.
     pub(super) carries_colors: bool,
     pub(super) joints: Vec<[u8; 4]>,
+    /// Per vertex, its rigid part.
+    pub(super) parts: Vec<u16>,
     pub(crate) weights: Vec<[u8; 4]>,
     pub(super) groups: BTreeMap<usize, Vec<u32>>,
     /// Scene materials drawn on a mesh without the uv set 1 primvar.
@@ -416,6 +418,8 @@ pub(super) struct Placing<'a> {
     pub(super) face_material: &'a dyn Fn(usize) -> usize,
     /// Influences per point when skinned.
     pub(super) skin: Option<&'a [Influence]>,
+    /// The rigid part the mesh makes up.
+    pub(super) part: u16,
     /// The vertex color stream at a triangle's corner: its face, face corner and point.
     pub(super) color: &'a dyn Fn(usize, usize, usize) -> [f32; 4],
 }
@@ -428,14 +432,14 @@ impl Welder {
         t: [f32; 4],
         uv: [[f32; 2]; 2],
         color: [f32; 4],
-        skin: Influence,
+        (skin, part): (Influence, u16),
     ) -> u32 {
         let mut key = [0u32; 20];
         let values = p.iter().chain(&n).chain(&t).chain(uv.as_flattened());
         for (k, v) in key.iter_mut().zip(values) {
             *k = v.to_bits();
         }
-        key[14] = u32::from_le_bytes(skin.0);
+        key[14] = u32::from_le_bytes(skin.0) ^ u32::from(part) << 16;
         key[15] = u32::from_le_bytes(skin.1);
         key[16..].copy_from_slice(&color.map(f32::to_bits));
         if let Some(&i) = self.seen.get(&key) {
@@ -450,6 +454,7 @@ impl Welder {
         self.colors.push(color);
         self.joints.push(skin.0);
         self.weights.push(skin.1);
+        self.parts.push(part);
         self.seen.insert(key, i);
         i
     }
@@ -491,7 +496,7 @@ impl Welder {
                     tangent,
                     uv,
                     (at.color)(t.face, t.corners[c].0, point),
-                    skin,
+                    (skin, at.part),
                 );
             }
             if flip {

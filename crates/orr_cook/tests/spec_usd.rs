@@ -3532,3 +3532,225 @@ fn raw_takes_nothing_from_the_file() {
         assert_eq!(info.header.primaries, want, "{space}");
     }
 }
+
+/// Each corner of mesh entry `name` with its cluster's part.
+fn part_corners(a: &Archive, name: &str) -> Vec<(u16, Vec3)> {
+    let info = MeshInfo::parse(&blob(a, name, 0)).unwrap();
+    let mut out = Vec::new();
+    for p in &info.pages {
+        let mut page = vec![0; p.resident_len as usize];
+        orr_pack::mesh::decode_page(&blob(a, name, p.blob as usize), &mut page).unwrap();
+        let view = PageView::new(&page, &info.header).unwrap();
+        for i in 0..view.cluster_count() {
+            let c = view.cluster(i);
+            for t in 0..u32::from(c.tri_count) {
+                for v in view.triangle(&c, t).map(u32::from) {
+                    out.push((c.part, Vec3::from(view.position(&c, v))));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Clip `clip` of skeleton `model`, and the skeleton's skinning matrices `t` seconds into it.
+fn posed(a: &Archive, model: &str, clip: &str, t: f32) -> (Clip, Vec<orr_math::Affine3>) {
+    let sk = SkeletonInfo::parse(&blob(a, &format!("{model}/skeleton"), 0)).unwrap();
+    let name = format!("{model}/clip/{clip}");
+    let clip = Clip::parse(&blob(a, &name, 0), &blob(a, &name, 1)).unwrap();
+    let mut pose = sk.rest.clone();
+    clip.sample(t, &mut pose);
+    let n = sk.joint_count();
+    let (mut model, mut palette) = (
+        vec![orr_math::Affine3::IDENTITY; n],
+        vec![orr_math::Affine3::IDENTITY; n],
+    );
+    sk.model_pose(&pose, &mut model);
+    sk.palette(&model, &mut palette);
+    (clip, palette)
+}
+
+/// `xformOp.h`: time samples of an op interpolate as the op's own value, so a full turn between
+/// two samples turns all the way, though the matrices at those samples are equal. What moves
+/// leaves the stage's model for one of its own, and a prim sampled at one value holds still.
+#[test]
+fn a_time_sampled_xform_moves_the_meshes_under_it() {
+    let a = cook(
+        "xform-samples",
+        &format!(
+            r#"def Xform "Spin"
+{{
+    double xformOp:rotateY.timeSamples = {{ 0: 0, 10: 360 }}
+    uniform token[] xformOpOrder = ["xformOp:rotateY"]
+    def Mesh "M"
+    {{
+        double3 xformOp:translate = (1, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        {TRIANGLE}
+    }}
+}}
+def Xform "Held"
+{{
+    double3 xformOp:translate.timeSamples = {{ 0: (0, 5, 0), 10: (0, 5, 0) }}
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+    def Mesh "M"
+    {{
+        {TRIANGLE}
+    }}
+}}"#
+        ),
+    );
+    assert!(!has(&a, "u/skeleton") && !has(&a, "u/Held/skeleton"));
+    let still = corners(&a, "u/mesh");
+    assert!(still.len() == 3 && still.iter().all(|c| c.0.y >= 5.0));
+    let sk = SkeletonInfo::parse(&blob(&a, "u/Spin/skeleton", 0)).unwrap();
+    assert_eq!(sk.names, ["", "Spin"]);
+    let moved = part_corners(&a, "u/Spin/mesh");
+    assert!(
+        moved.iter().all(|c| c.0 == 1),
+        "the renderer poses no part 0"
+    );
+    let far = moved.iter().find(|c| c.1.x > 1.5).unwrap().1;
+    let at = |t: f32| posed(&a, "u/Spin", "xform", t).1[1].transform_point3(far);
+    let (clip, _) = posed(&a, "u/Spin", "xform", 0.0);
+    assert!((clip.header.duration - 1.0).abs() < 1e-5);
+    assert!(
+        at(0.25).abs_diff_eq(Vec3::new(0.0, 0.0, -2.0), 1e-2),
+        "{}",
+        at(0.25)
+    );
+    assert!(
+        at(0.5).abs_diff_eq(Vec3::new(-2.0, 0.0, 0.0), 1e-2),
+        "{}",
+        at(0.5)
+    );
+}
+
+/// The stage holds one timeline, so a rig whose samples start late keeps its place on it, and
+/// two rigs of one name part: a top-level prim's path is that name too.
+#[test]
+fn xform_clips_keep_time_and_rigs_of_one_name_part() {
+    let a = cook(
+        "xform-timeline",
+        &format!(
+            r#"def Xform "Group"
+{{
+    def Xform "Door"
+    {{
+        double3 xformOp:translate.timeSamples = {{ 0: (0, 0, 0), 10: (3, 0, 0) }}
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Mesh "M"
+        {{
+            {TRIANGLE}
+        }}
+    }}
+}}
+def Xform "Door"
+{{
+    double3 xformOp:translate.timeSamples = {{ 5: (0, 0, 0), 10: (3, 0, 0) }}
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+    def Mesh "M"
+    {{
+        {TRIANGLE}
+    }}
+}}"#
+        ),
+    );
+    let (clip, half) = posed(&a, "u/node3", "xform", 0.5);
+    assert!((clip.header.duration - 1.0).abs() < 1e-5);
+    let rest = posed(&a, "u/node3", "xform", 0.0).1[1].translation;
+    assert!(half[1].translation.abs_diff_eq(rest, 1e-4), "still at half");
+    assert!(has(&a, "u/Door/skeleton"));
+}
+
+/// `schemas.dox` poses a skeleton in its prim's space, so a prim above it moves the skin: it
+/// takes that prim as a joint, and every prim down to the skeleton.
+#[test]
+fn an_xform_above_a_skeleton_moves_its_skin() {
+    let a = cook(
+        "xform-above-skel",
+        &format!(
+            r#"def Xform "Mover"
+{{
+    double3 xformOp:translate.timeSamples = {{ 0: (0, 0, 0), 10: (3, 0, 0) }}
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+    def SkelRoot "Hero"
+    {{
+        {RIG}
+        def Mesh "Body"
+        {{
+            {TRIANGLE}
+            rel skel:skeleton = </Mover/Hero/Rig>
+            {INFLUENCES}
+        }}
+    }}
+}}"#
+        ),
+    );
+    let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    assert_eq!(sk.names, ["Mover", "Hero", "Rig", "Root", "Arm"]);
+    assert_eq!(
+        sk.parents[3], 2,
+        "a root joint hangs on its skeleton's prim"
+    );
+    let joint = usize::from(joints_of(&a, "u/Hero/mesh")[0]);
+    assert_eq!(joint, 4, "joint indices follow the prims above");
+    let (_, start) = posed(&a, "u/Hero", "xform", 0.0);
+    let (_, end) = posed(&a, "u/Hero", "xform", 1.0);
+    for (p, ..) in corners(&a, "u/Hero/mesh") {
+        let (from, to) = (
+            start[joint].transform_point3(p),
+            end[joint].transform_point3(p),
+        );
+        assert!(to.abs_diff_eq(from + Vec3::X * 3.0, 1e-4), "{from} {to}");
+    }
+}
+
+/// A selection frames a model, and a prim under it that moves leaves it one model with a
+/// skeleton: what holds still sits on the still joint, in part 0, which takes no pose.
+#[test]
+fn a_selected_model_keeps_what_moves_in_it() {
+    let settings = UsdSettings {
+        models: vec![NodeSelect {
+            node: "Frame".into(),
+        }],
+        ..UsdSettings::default()
+    };
+    let d = dir("xform-selected");
+    let body = format!(
+        r#"def Xform "Frame"
+{{
+    double3 xformOp:translate = (0, 0, 9)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+    def Mesh "Still"
+    {{
+        {TRIANGLE}
+    }}
+    def Xform "Door"
+    {{
+        double3 xformOp:translate.timeSamples = {{ 0: (2, 0, 0), 10: (4, 0, 0) }}
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Mesh "M"
+        {{
+            {TRIANGLE}
+        }}
+    }}
+}}"#
+    );
+    let a = cook_at(&d, &body, settings).unwrap();
+    let sk = SkeletonInfo::parse(&blob(&a, "u/Frame/skeleton", 0)).unwrap();
+    assert_eq!(sk.names, ["", "Door"]);
+    let parts = part_corners(&a, "u/Frame/mesh");
+    assert!(parts.iter().any(|c| c.0 == 0) && parts.iter().any(|c| c.0 == 1));
+    assert!(
+        parts.iter().all(|c| (c.0 == 1) == (c.1.x >= 2.0)),
+        "{parts:?}"
+    );
+    let (_, end) = posed(&a, "u/Frame", "xform", 1.0);
+    let door = parts.iter().find(|c| c.0 == 1).unwrap().1;
+    assert!(
+        end[1]
+            .transform_point3(door)
+            .abs_diff_eq(door + Vec3::X * 2.0, 1e-4)
+    );
+}
