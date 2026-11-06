@@ -116,18 +116,18 @@ public struct RasterRoot
     public uint _pad;
 }
 
-// The transform of `index` in `group` relative to the eye, from `transforms` (the group's
-// current or previous buffer). False when the group hides the instance.
-public bool placement(GroupGpu* g, uint8_t* transforms, uint index, ViewConstants* v, out Placement p)
+// The current or `previous` transform of `index` in `group` relative to the eye. False when the
+// group hides the instance.
+public bool placement(GroupGpu* g, bool previous, uint index, ViewConstants* v, out Placement p)
 {
-    return placement(g, transforms, index, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), p);
+    return placement(g, previous, index, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), p);
 }
 
 // The instance's current placement.
 public bool instance_placement(SceneRoot* s, InstanceGpu inst, ViewConstants* v, out Placement p)
 {
     GroupGpu* g = s.groups + inst.group;
-    return placement(g, g.current, inst.group_index, v, p);
+    return placement(g, false, inst.group_index, v, p);
 }
 
 // A view-space point from an eye-relative render-space one.
@@ -340,7 +340,7 @@ public bool visible_placement(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     GroupGpu* g = s.groups + inst.group;
     Placement copy;
     p = (Placement)0;
-    if (!placement(g, previous ? g.previous : g.current, inst.group_index, v, copy))
+    if (!placement(g, previous, inst.group_index, v, copy))
         return false;
     return cluster_placement(s, vc.instance, inst, load_cluster(vc.page, vc.local), copy, previous, p);
 }

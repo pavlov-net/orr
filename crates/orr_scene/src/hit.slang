@@ -21,14 +21,14 @@ public struct Placement
     public float scale;              // bounds the stretch of a mesh-space length
 }
 
-// The transform of `index` in `group` from `transforms` (the group's current or previous
-// buffer), relative to the point at `cell` + `offset`. False when the group hides it.
-public bool placement(GroupGpu* g, uint8_t* transforms, uint index, int3 cell, float3 offset, uint cell_log2, out Placement p)
+// The current or `previous` transform of `index` in `group`, relative to the point at `cell` +
+// `offset`. False when the group hides it.
+public bool placement(GroupGpu* g, bool previous, uint index, int3 cell, float3 offset, uint cell_log2, out Placement p)
 {
     p = (Placement)0;
-    if (transforms == nullptr || index >= g.count)
+    if ((previous ? g.previous : g.current) == nullptr || index >= g.count)
         return false;
-    float3x4 m = group_entry(g, transforms, index);
+    float3x4 m = group_entry(g, previous, index);
     if (all(m[0] == 0.0) && all(m[1] == 0.0) && all(m[2] == 0.0))
         return false;
     p.linear = affine_linear(m);
@@ -110,7 +110,7 @@ public bool hit_producer(SceneRoot* s, uint index, out uint entry)
 public bool producer_placement(SceneRoot* s, ProducerGpu p, bool previous, int3 cell, float3 offset, uint cell_log2, out Placement pl)
 {
     GroupGpu* g = s.groups + p.group;
-    return placement(g, previous ? g.previous : g.current, p.group_index, cell, offset, cell_log2, pl);
+    return placement(g, previous, p.group_index, cell, offset, cell_log2, pl);
 }
 
 // The material of an emitted cluster, MATERIAL_NONE outside the entry's materials.
@@ -696,7 +696,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
         material = section_material(s, inst, model, c.section);
         attributes = mesh.attributes;
         GroupGpu* g = s.groups + inst.group;
-        if (!placement(g, previous ? g.previous : g.current, inst.group_index, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
+        if (!placement(g, previous, inst.group_index, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
             return false;
         // A part instance traces its part posed.
         if (instance_index >= s.part_base && (copy & COPY_FAR) == 0)

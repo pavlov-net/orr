@@ -2,6 +2,7 @@
 module tables;
 
 import orr_shaders.abi;
+import orr_shaders.math;
 import orr_shaders.trace;
 import orr_pack.instance;
 __exported import orr_scene.cut;
@@ -120,7 +121,8 @@ public struct SlotStateGpu
 public struct GroupGpu
 {
     public uint8_t* current;
-    public uint8_t* previous;  // last frame's transforms; equals `current` when unchanged
+    public uint8_t* previous;  // last frame's transforms; equals `current` when unchanged,
+                               // though `frame` can still move them
     public uint count;
     public uint format;        // GROUP_*
     public int3 anchor_cell;
@@ -129,6 +131,11 @@ public struct GroupGpu
     public float3 extent;
     public float log2_scale_min;
     public float log2_scale_max;
+    // A group hung from a joint: the palette group holding the joint and its entry there, which
+    // takes every entry from its bind space to its pose. Null for none.
+    public GroupGpu* frame;
+    public uint frame_index;
+    public float3 frame_origin;    // the group's anchor in the palette's space
 }
 
 bool palette_unset(float3x4 m)
@@ -543,9 +550,9 @@ public uint cluster_page(MeshGpu* mesh, uint cluster)
     return lo;
 }
 
-// Entry `index` of `transforms` (`group`'s current or previous buffer) as a row-major [L | t]
-// relative to the group's anchor. A page's linear table follows its records.
-public float3x4 group_entry(GroupGpu* group, uint8_t* transforms, uint index)
+// Entry `index` of the transforms in `transforms` as a row-major [L | t] relative to the group's
+// anchor. A page's linear table follows its records.
+float3x4 stored_entry(GroupGpu* group, uint8_t* transforms, uint index)
 {
     if (group.format == GROUP_QUANTIZED_PAGE)
     {
@@ -556,14 +563,35 @@ public float3x4 group_entry(GroupGpu* group, uint8_t* transforms, uint index)
     return ((float3x4*)transforms)[index];
 }
 
+// Entry `index` of the group's current or previous transforms, as `stored_entry`, posed by the
+// joint it hangs from. A joint without a pose hides it, as an all-zero entry does.
+public float3x4 group_entry(GroupGpu* group, bool previous, uint index)
+{
+    float3x4 m = stored_entry(group, previous ? group.previous : group.current, index);
+    GroupGpu* palette = group.frame;
+    if (palette == nullptr || palette_unset(m))
+        return m;
+    uint8_t* joints = previous ? palette.previous : palette.current;
+    float3x4 zero = float3x4(float4(0.0), float4(0.0), float4(0.0));
+    if (joints == nullptr || group.frame_index >= palette.count)
+        return zero;
+    float3x4 joint = ((float3x4*)joints)[group.frame_index];
+    if (palette_unset(joint))
+        return zero;
+    // The joint poses the palette's space, of which the group's anchor is a point.
+    float3 o = group.frame_origin;
+    float3 moved = mul(affine_linear(joint), o) + affine_translation(joint) - o;
+    return affine_mul(affine(affine_linear(joint), moved), m);
+}
+
 public float3x4 group_transform(GroupGpu* group, uint index)
 {
-    return group_entry(group, group.current, index);
+    return group_entry(group, false, index);
 }
 
 public float3x4 previous_group_transform(GroupGpu* group, uint index)
 {
-    return group_entry(group, group.previous, index);
+    return group_entry(group, true, index);
 }
 
 // An order-free hash of a set of mesh clusters: the sum of two hashes of each.

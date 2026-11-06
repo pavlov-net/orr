@@ -109,7 +109,7 @@ void instances(uint3 id: SV_DispatchThreadID)
     {
         GroupGpu* g = s.groups + inst.group;
         Placement before;
-        if (placement(g, g.previous, inst.group_index, v, before) && box_occluded(v, r, before, lo, hi, true))
+        if (placement(g, true, inst.group_index, v, before) && box_occluded(v, r, before, lo, hi, true))
         {
             state = SLOT_OCCLUDED;
             InterlockedAdd(r.counts[COUNT_OCCLUDED_INSTANCES], 1);
@@ -326,7 +326,7 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
                 GroupGpu* g = s.groups + inst.group;
                 Placement before_copy;
                 Placement before;
-                if (placement(g, g.previous, inst.group_index, v, before_copy)
+                if (placement(g, true, inst.group_index, v, before_copy)
                     && cluster_placement(s, copy, inst, c, before_copy, true, before)
                     && box_occluded(v, r, before, lo, hi, true))
                 {

@@ -113,6 +113,7 @@ fn scatter_set_cooks_within_its_error_bounds() {
         assets.push(AssetSpec {
             name: file.file_stem().unwrap().to_string_lossy().into_owned(),
             source: Source::Instances(Instances {
+                frame: None,
                 records: recs
                     .iter()
                     .map(|r| Placement {

@@ -201,6 +201,9 @@ pub enum Error {
     UnknownEdit(EditId),
     #[error("{0:?} does not exist")]
     UnknownPage(PageId),
+    /// A page hangs from an entry of a transform group that is not a page's.
+    #[error("{0:?} holds no palette entry {1}")]
+    NoFrameJoint(TransformGroupId, u32),
     /// [`SceneWriter::add_instance_page`] draws no pose, and a skinned copy needs one:
     /// [`SceneWriter::add_skinned_page`] places such a page.
     #[error("{0:?} is skinned: its page takes add_skinned_page")]

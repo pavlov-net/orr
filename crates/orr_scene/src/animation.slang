@@ -104,7 +104,7 @@ void animate(uint3 id: SV_DispatchThreadID)
     bool focus = root.focus_cell.w != 0;
     Placement pl;
     bool placed = inst.flags != 0 && (inst.flags & INSTANCE_SKINNED) == 0
-        && placement(g, g.current, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), pl);
+        && placement(g, false, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), pl);
     float distance = 0.0;
     if (placed && focus)
     {

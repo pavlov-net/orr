@@ -1254,6 +1254,13 @@ fn cook() -> Arc<[u8]> {
                     },
                 },
                 AssetSpec {
+                    name: "hung".into(),
+                    source: Source::Usd {
+                        path: hung_stage(),
+                        settings: UsdSettings::default(),
+                    },
+                },
+                AssetSpec {
                     name: "swaying door".into(),
                     source: Source::Usd {
                         path: swaying_door_stage(),
@@ -4311,6 +4318,40 @@ fn posed_rigid_parts_trace_where_the_raster_draws_them() {
     assert_clean();
 }
 
+/// A stage of a prim that moves, with an instancer under it placing a 0.4 m square at (0.5, 0, 0).
+fn hung_stage() -> PathBuf {
+    let path = temp("hung.usda");
+    std::fs::write(
+        &path,
+        r#"#usda 1.0
+(
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+def Xform "Mover"
+{
+    double3 xformOp:translate.timeSamples = { 0: (0, 0, 0), 24: (1, 0, 0) }
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+    def PointInstancer "Crowd"
+    {
+        rel prototypes = [</Mover/Crowd/Leaf>]
+        int[] protoIndices = [0]
+        point3f[] positions = [(0.5, 0, 0)]
+        def Mesh "Leaf"
+        {
+            uniform token subdivisionScheme = "none"
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.2, -0.2, 0), (0.2, -0.2, 0), (0.2, 0.2, 0), (-0.2, 0.2, 0)]
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    path
+}
+
 /// [`door_stage`] with a door whose shear grows over its clip, as glTF cannot animate one.
 fn swaying_door_stage() -> PathBuf {
     let path = temp("swaying-door.usda");
@@ -4433,6 +4474,117 @@ fn place_door(w: &mut World, x: f32) -> Placed {
         history,
         count: 1,
     }
+}
+
+/// `hung`'s page, hung from a palette whose joint moves it `x` m along x.
+fn place_hung(w: &mut World, x: f32) -> Placed {
+    let a = Archive::from_memory(Arc::clone(pack())).unwrap();
+    let is_hung = |e: &&Entry| {
+        e.class == orr_pack::Class::InstancePage as u16 && a.name(e).starts_with("hung/")
+    };
+    let entry = a.entries().iter().find(is_hung).expect("the hung page");
+    let header = orr_pack::instance::InstancePageInfo::parse(&blob(&a, entry, 0))
+        .unwrap()
+        .header;
+    assert_eq!(
+        header.frame_skeleton,
+        AssetId::from_name("hung/skeleton"),
+        "the page names its skeleton"
+    );
+    let page = w.scenes.instance_page(w.mount, entry.id).unwrap();
+    let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
+    let history = w.scenes.create_view_history().unwrap();
+    let list = [scene];
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(0),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    let mut s = f.scene(scene).unwrap();
+    s.set_focus(DVec3::ZERO);
+    let palette = s
+        .create_transform_group(&TransformGroupDesc {
+            count: 2,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    let joints = s.transforms(palette, 0, 2).unwrap();
+    joints[0] = Affine3::IDENTITY.into();
+    joints[1] = Affine3::from_translation(Vec3::X * x).into();
+    let range = s
+        .add_instance_page(&InstancePageRef {
+            page,
+            frame: Some((palette, header.frame_joint)),
+            poses: &[],
+            material_sets: &[],
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 1000.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    drop(s);
+    wait(f.end(&[]).unwrap());
+    Placed {
+        scene,
+        ranges: vec![range],
+        group: palette,
+        history,
+        count: 1,
+    }
+}
+
+/// A page hung from a joint draws and traces where the joint's palette entry poses its records,
+/// without a rebuilt page: the joint moves it, the record says where it stands in bind space.
+#[test]
+fn a_page_hung_from_a_joint_follows_its_palette_entry() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let (eye, target) = (DVec3::new(0.5, 0.0, 2.5), DVec3::new(0.5, 0.0, 0.0));
+    let middle = |g: &Frame| {
+        let columns = g.ids.iter().enumerate().filter(|(_, id)| **id != 0);
+        let (n, sum) = columns.fold((0u32, 0.0f64), |(n, sum), (i, _)| {
+            (n + 1, sum + f64::from(i as u32 % EXTENT[0]))
+        });
+        assert!(n > 100, "{n} pixels of the copy");
+        sum / f64::from(n)
+    };
+    let landed = |w: &mut World, placed: &Placed, from: u32| {
+        let start = Instant::now();
+        let mut frame = from;
+        loop {
+            frame += 1;
+            let g = shoot(w, placed, &Shot::at(eye, target, frame));
+            if frame > from + 3 && g.ids.iter().any(|&id| id != 0) {
+                return g;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the page never landed"
+            );
+        }
+    };
+    let still = place_hung(&mut w, 0.0);
+    let at_rest = landed(&mut w, &still, 0);
+    let moved = place_hung(&mut w, 0.4);
+    let g = landed(&mut w, &moved, 100);
+    let f = 1.0 / (0.45f64).tan();
+    let aspect = f64::from(EXTENT[0]) / f64::from(EXTENT[1]);
+    let want = 0.5 * 0.4 / 2.5 * f / aspect * f64::from(EXTENT[0]);
+    let got = middle(&g) - middle(&at_rest);
+    assert!((got - want).abs() < 0.05 * want, "{got} px, not {want}");
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let (matched, _) = parity(&g, &r, 1e-4);
+    assert!(
+        matched as f64 >= 0.999 * r.traced.len() as f64,
+        "{matched} of {} pixels agree",
+        r.traced.len()
+    );
+    assert_clean();
 }
 
 /// A prim that moves cooks to a model with nothing on part 0, which the renderer does not pose:
@@ -5570,6 +5722,7 @@ fn place_crowd(w: &mut World) -> Worms {
         })
         .unwrap();
     let refused = s.add_instance_page(&InstancePageRef {
+        frame: None,
         page,
         poses: &[],
         material_sets: &[],
@@ -5584,6 +5737,7 @@ fn place_crowd(w: &mut World) -> Worms {
     );
     let range = s
         .add_skinned_page(&SkinnedPageRef {
+            frame: None,
             page,
             palette,
             palette_first: 0,
@@ -7723,6 +7877,7 @@ fn row_pages(
 
 fn add_page(s: &mut SceneWriter<'_>, page: PageId) -> InstanceRange {
     s.add_instance_page(&InstancePageRef {
+        frame: None,
         page,
         poses: &[],
         material_sets: &[],

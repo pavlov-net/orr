@@ -11,7 +11,7 @@ public static const uint AXIS_ROTATIONS = 24;
 // The x scale is negated: the copy is mirrored.
 public static const uint MIRROR = 1u << 31;
 
-// Blob 0 header, 64 B. Spans are (byte offset in blob 0, count).
+// Blob 0 header, 84 B. Spans are (byte offset in blob 0, count).
 public struct InstancePageHeader
 {
     public int3 cell;
@@ -23,6 +23,8 @@ public struct InstancePageHeader
     public uint16_t user_stride;
     public uint16_t record_count;
     public uint2 partitions;
+    public uint4 frame_skeleton;
+    public uint frame_joint;
 }
 
 // 16 B.

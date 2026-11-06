@@ -106,7 +106,7 @@ void select(uint3 id: SV_DispatchThreadID)
     Placement p = (Placement)0;
     bool shown = (inst.flags & (INSTANCE_RASTER | INSTANCE_RAY)) != 0 && sm != nullptr && sm.cut_count > 0
         && palette.current != nullptr && k.palette_first + k.joint_count <= palette.count
-        && placement(g, g.current, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), p);
+        && placement(g, false, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), p);
     if (!shown || !palette_set(palette, k.palette_first, k.joint_count))
         return;
 

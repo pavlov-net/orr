@@ -1124,13 +1124,18 @@ impl Core {
         let edge = f64::from(1u32 << self.cell_log2);
         for scene in self.scenes.iter().flatten() {
             let cpu = scene.cpu.lock().unwrap();
-            let skinned = cpu.skinned_pages.iter().map(|p| p.page);
-            for page in cpu.pages.iter().map(|p| p.page).chain(skinned) {
+            let skinned = cpu.skinned_pages.iter().map(|p| (p.page, p.group));
+            for (page, group) in cpu.pages.iter().map(|p| (p.page, p.group)).chain(skinned) {
                 let Some((center, radius)) = self.mounts.page_sphere(page.0, self.cell_log2) else {
                     continue;
                 };
+                // The sphere is the rest pose: only the GPU knows where a joint has a page now.
+                let hung = cpu.groups[group.0 as usize]
+                    .as_ref()
+                    .is_some_and(|g| g.frame.is_some());
                 let distance = cpu
                     .focus
+                    .filter(|_| !hung)
                     .map_or(0.0, |f| (f.distance(center) - radius).max(0.0));
                 let e = wanted.entry(page.0).or_insert(f64::INFINITY);
                 *e = e.min(distance);

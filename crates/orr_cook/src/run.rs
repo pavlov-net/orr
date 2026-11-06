@@ -35,8 +35,8 @@ use orr_pack::{
 use crate::assembly::{self, Assembly};
 use crate::cache::Cache;
 use crate::decoded::Decoded;
-use crate::import::{Placed, Scene};
-use crate::instances::{self, Catalog, ModelFacts};
+use crate::import::{PlacedModel, Scene};
+use crate::instances::{self, Catalog, ModelFacts, PageFrame};
 use crate::key::{self, Key};
 use crate::mesh::maps::{
     Displacement, Map, Opacity, OpacityMap, OpacityRead, Passes, Raster, Reach, Tiles,
@@ -1644,6 +1644,7 @@ fn plan_scene(
 ) -> Result<Imported> {
     let mut units = Vec::new();
     let mut skeletons = Vec::with_capacity(src.skeletons.len());
+    let mut skeleton_names = Vec::with_capacity(src.skeletons.len());
     for sk in std::mem::take(&mut src.skeletons) {
         let prefix = match sk.prefix.as_str() {
             "" => name.to_string(),
@@ -1656,6 +1657,7 @@ fn plan_scene(
             .finish();
         let skeleton = (AssetId::from_name(&skeleton_name), Some(key));
         skeletons.push(skeleton);
+        skeleton_names.push(skeleton_name.clone());
         let working_set = bytes.len() as u64;
         let work = Work::Blobs {
             schema: orr_pack::skeleton::SCHEMA,
@@ -1886,9 +1888,18 @@ fn plan_scene(
         units.extend(model);
         assemblies.extend(assembly);
     }
-    let mut instances = scene_instances(name, &src.instances);
-    let posed = src.posed.iter().map(std::slice::from_ref);
-    instances.extend(posed.flat_map(|model| scene_instances(name, model)));
+    let (alone, shared): (Vec<_>, Vec<_>) = src.instances.iter().partition(|m| m.alone);
+    let mut instances = scene_instances(name, &shared);
+    for m in alone {
+        let mut pages = scene_instances(name, &[m]);
+        for src in &mut pages {
+            src.frame = m.frame.map(|(skeleton, joint)| PageFrame {
+                skeleton: skeleton_names[skeleton].clone(),
+                joint: u32::from(joint),
+            });
+        }
+        instances.extend(pages);
+    }
     let images = Arc::new(src.images);
     for job in jobs {
         let (name, key, working_set) = (job.name.clone(), job.key, job.working_set(&images));
@@ -1913,17 +1924,17 @@ fn plan_scene(
 
 /// The instance sources of a scene's instanced models: one prototype per model, a placement
 /// per instance, and a source per 65536 models, the most a source's prototype index names.
-fn scene_instances(name: &str, models: &[(String, Vec<Placed>)]) -> Vec<Instances> {
+fn scene_instances(name: &str, models: &[&PlacedModel]) -> Vec<Instances> {
     models
         .chunks(1 << 16)
         .map(|chunk| {
             let mut src = Instances::default();
-            for (p, (model, placed)) in chunk.iter().enumerate() {
+            for (p, m) in chunk.iter().enumerate() {
                 src.prototypes.push(PrototypeSpec {
-                    model: format!("{name}/{model}"),
+                    model: format!("{name}/{}", m.model),
                     ..PrototypeSpec::default()
                 });
-                src.records.extend(placed.iter().map(|q| Placement {
+                src.records.extend(m.placed.iter().map(|q| Placement {
                     position: q.position.to_array(),
                     linear: Linear::Matrix(q.linear.to_cols_array_2d()),
                     prototype: p as u16,

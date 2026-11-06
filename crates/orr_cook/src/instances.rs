@@ -26,10 +26,21 @@ pub struct Instances {
     /// `user_stride` bytes per record, kept with its record through the reordering.
     pub user: Vec<u8>,
     pub user_stride: u16,
+    /// The joint the records hang from, in whose bind space they stand.
+    pub frame: Option<PageFrame>,
     /// Pieces that join without cracks: every placement sits on the coarsest grid step of the
     /// page's meshes, has scale 1 and a rotation that is a multiple of 90 degrees about the
     /// axes, and decodes exactly.
     pub joined: bool,
+}
+
+/// A joint of a skeleton entry.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageFrame {
+    /// The skeleton's entry name.
+    pub skeleton: String,
+    pub joint: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -345,7 +356,7 @@ fn check_records(name: &str, src: &Instances) -> Result<()> {
 pub(crate) fn input_hash(src: &Instances, cell_log2: u8) -> Hash32 {
     let mut h = blake3::Hasher::new();
     h.update(&[cell_log2, u8::from(src.joined)]);
-    h.update(format!("{:?}", src.prototypes).as_bytes());
+    h.update(format!("{:?} {:?}", src.prototypes, src.frame).as_bytes());
     for p in &src.records {
         h.update(bytemuck::cast_slice(&p.position));
         h.update(bytemuck::cast_slice(&p.linear().to_cols_array()));
@@ -460,6 +471,11 @@ fn build_page(
         user_stride: src.user_stride,
         record_count: members.len() as u16,
         partitions: Span::default(),
+        frame_skeleton: src
+            .frame
+            .as_ref()
+            .map_or(AssetId::NONE, |f| AssetId::from_name(&f.skeleton)),
+        frame_joint: src.frame.as_ref().map_or(0, |f| f.joint),
     };
     let mut forms: Vec<Form> = members
         .iter()

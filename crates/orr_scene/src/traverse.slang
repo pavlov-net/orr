@@ -160,7 +160,7 @@ float4 model_sphere(ModelGpu* model)
 bool focus_placement(SceneRoot* s, InstanceGpu inst, out Placement p)
 {
     GroupGpu* g = s.groups + inst.group;
-    return placement(g, g.current, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), p);
+    return placement(g, false, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), p);
 }
 
 // Whether a copy gathers one BLAS per animated part: an edit's copy taking its pose, which no

@@ -31,11 +31,11 @@
 //! Nodes hidden by `KHR_node_visibility` or the core `visible` property of glTF 2.1 are not
 //! cooked, nor are their subtrees; hidden joints still pose their skins.
 //!
-//! In either layout a node with `EXT_mesh_gpu_instancing` that does not move is placed as a model
-//! of its own, in the scene layout named after the node and in its mesh's space, whatever the
-//! selection; its instances, scene space from the node's transform times each instance's,
-//! become placements. One that moves is baked: each instance is a copy of its mesh in the rig's
-//! model. A skinned one is a model of its own with its skin's skeleton, each instance a copy
+//! In either layout a node with `EXT_mesh_gpu_instancing` is placed as a model of its own, in the
+//! scene layout named after the node and in its mesh's space, whatever the selection; its
+//! instances, scene space from the node's transform times each instance's, become placements.
+//! Those of a node that moves hang from its rig's joint, in the joint's bind space, on pages of
+//! their own. A skinned one is a model of its own with its skin's skeleton, each instance a copy
 //! posed on its own. glTF ignores a skinned mesh's node transform, and the extension says nothing
 //! of skins, so a copy's placement is the instance's transform alone.
 //!
@@ -84,7 +84,7 @@ use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::import::{
-    Placed, Scene, SceneMaterial, SceneModel, SceneSkeleton, normal_matrix, placements,
+    Placed, PlacedModel, Scene, SceneMaterial, SceneModel, SceneSkeleton, normal_matrix, placements,
 };
 use crate::mesh::{
     self, LazyMesh, MeshData, MeshSettings, MeshSource, PartData, Pivots, SectionData, Skin,
@@ -709,7 +709,6 @@ pub(crate) fn import(
         hashes: BTreeMap::new(),
         skeletons: Vec::new(),
         instances: Vec::new(),
-        posed: Vec::new(),
         files: &mut files,
         warnings: Vec::new(),
     };
@@ -719,7 +718,6 @@ pub(crate) fn import(
         mut models,
         skeletons,
         instances,
-        posed,
         warnings,
         ..
     } = b;
@@ -738,7 +736,6 @@ pub(crate) fn import(
         images,
         skeletons,
         instances,
-        posed,
         files,
         warnings,
     })
@@ -760,8 +757,7 @@ struct Imported<'a> {
     /// Hashes of the buffer files read so far.
     hashes: BTreeMap<PathBuf, Hash32>,
     skeletons: Vec<SceneSkeleton>,
-    instances: Vec<(String, Vec<Placed>)>,
-    posed: Vec<(String, Vec<Placed>)>,
+    instances: Vec<PlacedModel>,
     files: &'a mut Vec<Input>,
     warnings: Vec<String>,
 }
@@ -896,24 +892,35 @@ impl Imported<'_> {
 
     /// The models of glTF mesh `mesh` placed by `transforms` under name `name`: the mesh in
     /// its own space for the transforms a placement holds, and a baked model per other
-    /// linear transform.
+    /// linear transform. They hang from `frame`, in its joint's bind space.
     fn placed(
         &mut self,
         name: &str,
         mesh: usize,
         weights: &[f32],
         transforms: &[DMat4],
+        frame: Option<(usize, u16)>,
     ) -> Result<()> {
         let (direct, baked) =
             placements(transforms, false).map_err(|m| self.fail(format!("model {name}: {m}")))?;
         if !direct.is_empty() {
             self.lazy_model(name, mesh, weights, DMat4::IDENTITY)?;
-            self.instances.push((name.to_string(), direct));
+            self.instances.push(PlacedModel {
+                model: name.to_string(),
+                placed: direct,
+                frame,
+                alone: frame.is_some(),
+            });
         }
         for (k, (linear, placed)) in baked.into_iter().enumerate() {
             let name = format!("{name}/baked/{k}");
             self.lazy_model(&name, mesh, weights, linear)?;
-            self.instances.push((name, placed));
+            self.instances.push(PlacedModel {
+                model: name,
+                placed,
+                frame,
+                alone: frame.is_some(),
+            });
         }
         Ok(())
     }
@@ -1199,7 +1206,7 @@ fn meshes_layout(b: &mut Imported<'_>, graph: &Graph, placed: &[usize]) -> Resul
                 k => format!("mesh/{mesh}/morph/{k}"),
             };
             if !transforms.is_empty() {
-                b.placed(&name, mesh, weights, transforms)?;
+                b.placed(&name, mesh, weights, transforms, None)?;
             }
         }
     }
@@ -1337,7 +1344,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
             let at = node(n);
             let mesh = at.mesh().expect("instanced nodes have meshes");
             let weights = at.weights().or(mesh.weights()).unwrap_or_default();
-            b.placed(&name, mesh.index(), weights, &transforms)?;
+            b.placed(&name, mesh.index(), weights, &transforms, None)?;
         }
     }
     let part_values = settings
@@ -1345,6 +1352,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
         .as_ref()
         .map_or(0, |p| usize::from(p.parts));
     let whole = !selecting && !by_mesh && rigs.len() == 1 && still.iter().all(|&n| is_instanced[n]);
+    let mut hung: Vec<(usize, usize)> = Vec::new();
     for rig in rigs {
         let m = if whole {
             0
@@ -1363,7 +1371,14 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
             slots.push(Slot::new(Some(name), None));
             models.len() - 1
         };
-        rig.meshes.iter().for_each(|&n| owner[n] = Some(m));
+        for &n in &rig.meshes {
+            // An instanced node's copies stay placements: they hang from the rig.
+            if is_instanced[n] {
+                hung.push((n, m));
+            } else {
+                owner[n] = Some(m);
+            }
+        }
         slots[m].rig = Some(rig);
     }
     // A skinned instanced node: per transform an instance holds or bakes, a model of its copies.
@@ -1475,47 +1490,53 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
                 (mat, Some(Binding::Rigid(j)))
             }
         };
-        // A rig bakes the instances of a node that moves; a skin's are copies of the model.
-        let copies = match at.skin() {
-            None => instance_locals(&inst, n).map_err(fail)?,
-            Some(_) => vec![DMat4::IDENTITY],
-        };
         let weights = at.weights().or(mesh.weights()).unwrap_or_default();
-        for copy in copies {
-            for prim in surfaces(&mesh) {
-                let placing = Placing {
-                    mesh: mesh.index(),
-                    world: world * copy,
-                    weights,
-                    binding: binding.as_ref(),
-                    tangent_set: b.tangent_set(&prim),
-                    displaced: b.displaces(&prim),
-                };
-                append_primitive(&data, &prim, &placing, &cx, &mut models[m]).map_err(|e| {
-                    fail(format!(
-                        "mesh {} primitive {}: {e}",
-                        mesh.index(),
-                        prim.index()
-                    ))
-                })?;
-            }
+        for prim in surfaces(&mesh) {
+            let placing = Placing {
+                mesh: mesh.index(),
+                world,
+                weights,
+                binding: binding.as_ref(),
+                tangent_set: b.tangent_set(&prim),
+                displaced: b.displaces(&prim),
+            };
+            append_primitive(&data, &prim, &placing, &cx, &mut models[m]).map_err(|e| {
+                fail(format!(
+                    "mesh {} primitive {}: {e}",
+                    mesh.index(),
+                    prim.index()
+                ))
+            })?;
         }
     }
 
     let mut out = Vec::new();
+    let mut skeleton_of: Vec<Option<usize>> = vec![None; slots.len()];
     for (m, (building, slot)) in models.into_iter().zip(slots.iter_mut()).enumerate() {
         let frame = building.frame;
         let empty = building.groups.values().all(Vec::is_empty);
+        let sk = skeletons[m].as_ref();
+        let skeleton = match sk {
+            Some(sk) => {
+                b.skeletons.push(SceneSkeleton {
+                    prefix: slot.name.clone().unwrap_or_default(),
+                    info: sk.info.clone(),
+                    clips: sk.clips(&data, &spans, &settings.clips).map_err(fail)?,
+                });
+                Some(b.skeletons.len() - 1)
+            }
+            None => None,
+        };
+        skeleton_of[m] = skeleton;
         // The whole scene may hold nothing but what moves, instanced nodes and primitives
-        // without a surface.
-        if slot.name.is_none() && empty && (elsewhere || skeletons.len() > 1) {
+        // without a surface, and a rig nothing but the copies that hang from it.
+        if empty && (sk.is_some() || (slot.name.is_none() && (elsewhere || skeletons.len() > 1))) {
             continue;
         }
         let name = slot.name.take();
         if let Some(name) = &name {
             b.name(name)?;
         }
-        let sk = skeletons[m].as_ref();
         let parts_of = sk.filter(|_| rigid[m]);
         let joint_values = parts_of.map(|_| building.v.values.clone());
         let (mut mesh, groups) = building.finish(parts, sk.is_some() && parts_of.is_none());
@@ -1545,19 +1566,13 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
                 )
             })
             .collect();
-        let skeleton = match sk {
-            Some(sk) => {
-                b.skeletons.push(SceneSkeleton {
-                    prefix: name.clone().unwrap_or_default(),
-                    info: sk.info.clone(),
-                    clips: sk.clips(&data, &spans, &settings.clips).map_err(fail)?,
-                });
-                Some(b.skeletons.len() - 1)
-            }
-            None => None,
-        };
         if let (Some(name), Some(copies)) = (&name, slot.copies.take()) {
-            b.posed.push((name.clone(), copies));
+            b.instances.push(PlacedModel {
+                model: name.clone(),
+                placed: copies,
+                frame: None,
+                alone: true,
+            });
         }
         out.push((
             frame,
@@ -1573,6 +1588,23 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     }
     join(&mut out, graph, &settings.joined).map_err(fail)?;
     b.models.extend(out.into_iter().map(|m| m.1));
+    // Hung copies stand in the bind space of the joint that moves them, so that its skinning
+    // matrix takes them from the rest pose to the pose.
+    for (n, m) in hung {
+        let sk = skeletons[m].as_ref().expect("a rig has a skeleton");
+        let (joint, to_bind) = sk.attach(n, graph).map_err(fail)?;
+        let locals = instance_locals(&inst, n).map_err(fail)?;
+        let transforms: Vec<DMat4> = locals.into_iter().map(|l| to_bind * l).collect();
+        let at = node(n);
+        let mesh = at.mesh().expect("instanced nodes have meshes");
+        let weights = at.weights().or(mesh.weights()).unwrap_or_default();
+        let frame = skeleton_of[m].map(|s| (s, joint));
+        // Node names repeat, and a rig may have taken this one.
+        let name = instanced_name(doc, n);
+        let unusable = name.is_empty() || name == "mesh" || b.names.contains(&name);
+        let name = if unusable { format!("node{n}") } else { name };
+        b.placed(&name, mesh.index(), weights, &transforms, frame)?;
+    }
     if by_mesh {
         meshes_layout(b, graph, &still)?;
     }

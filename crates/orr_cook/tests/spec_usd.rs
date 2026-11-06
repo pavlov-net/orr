@@ -4289,3 +4289,174 @@ fn a_moving_prototype_root_hangs_its_skeleton_in_the_model() {
     assert!(from.z.abs() < 1e-4, "{from}");
     assert!(to.abs_diff_eq(from + Vec3::Y * 3.0, 1e-4), "{from} {to}");
 }
+
+/// A prim that moves, with an instancer under it placing `body` at x = 1 and 5 from `prototype`.
+fn moving_crowd(prototype: &str, body: &str) -> String {
+    format!(
+        r#"def Xform "Mover"
+{{
+    double3 xformOp:translate.timeSamples = {{ 0: (0, 0, 0), 10: (0, 3, 0) }}
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+    def PointInstancer "Crowd"
+    {{
+        rel prototypes = [<{prototype}>]
+        int[] protoIndices = [0, 0]
+        point3f[] positions = [(1, 0, 0), (5, 0, 0)]
+        {body}
+    }}
+}}"#
+    )
+}
+
+/// The skeleton and joint model `model`'s page hangs from, and where its records stand.
+fn hung(a: &Archive, model: &str) -> (AssetId, usize, Vec<Vec3>) {
+    let want = AssetId::from_name(model);
+    let mut found = None;
+    let mut at = Vec::new();
+    for e in a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::InstancePage as u16)
+    {
+        let blobs = a.blobs(e);
+        let (head, body) = (read(a, &blobs[0]), read(a, &blobs[1]));
+        let info = InstancePageInfo::parse(&head).unwrap();
+        if info.prototypes.iter().all(|p| p.model != want) {
+            continue;
+        }
+        found = Some((info.header.frame_skeleton, info.header.frame_joint as usize));
+        let (cell, records) = decode(&head, &body).unwrap();
+        for (_, m) in records {
+            at.push(m.translation + Vec3::from(cell.map(|c| c as f32)) * 256.0);
+        }
+    }
+    let (skeleton, joint) = found.unwrap_or_else(|| panic!("no page of {model}"));
+    at.sort_by(|a, b| a.x.total_cmp(&b.x));
+    (skeleton, joint, at)
+}
+
+/// `pointInstancer.h`: instances are placed in the instancer's space, so whatever moves it moves
+/// them. They stay copies of one model, on a page that hangs from the joint of the prim above: a
+/// palette entry poses them all, and what moves inside the prototype stays the prototype's.
+#[test]
+fn an_instancer_under_a_moving_prim_hangs_from_its_joint() {
+    let body = format!(
+        r#"def Xform "Proto"
+        {{
+            def Mesh "Still"
+            {{
+                {TRIANGLE}
+            }}
+            def Xform "Arm"
+            {{
+                double3 xformOp:translate.timeSamples = {{ 0: (0, 0, 0), 10: (0, 0, 2) }}
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+                def Mesh "M"
+                {{
+                    {TRIANGLE}
+                }}
+            }}
+        }}"#
+    );
+    let stage = format!(
+        r#"{}
+def Mesh "Ground"
+{{
+    double3 xformOp:translate = (0, -9, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+    {TRIANGLE}
+}}"#,
+        moving_crowd("/Mover/Crowd/Proto", &body)
+    );
+    let a = cook("instancer-moved", &stage);
+    assert_eq!(
+        corners(&a, "u/mesh").len(),
+        3,
+        "the ground stays where it is"
+    );
+    let sk = SkeletonInfo::parse(&blob(&a, "u/Mover/skeleton", 0)).unwrap();
+    assert_eq!(sk.names, ["", "Mover"]);
+    let (skeleton, joint, at) = hung(&a, "u/Proto");
+    assert_eq!(skeleton, AssetId::from_name("u/Mover/skeleton"));
+    assert_eq!(joint, 1);
+    assert_eq!(at.len(), 2);
+    let (_, end) = posed(&a, "u/Mover", "xform", 1.0);
+    for (x, p) in [1.0, 5.0].into_iter().zip(at) {
+        let got = end[joint].transform_point3(p);
+        assert!(got.abs_diff_eq(Vec3::new(x, 3.0, 0.0), 1e-3), "{got}");
+    }
+    // One mesh for both copies, with its own rig.
+    assert!(has(&a, "u/Proto/skeleton"));
+    assert_eq!(part_corners(&a, "u/Proto/mesh").len(), 6);
+}
+
+/// `instancing.dox`: copies share the bind state and take "different set of joint transforms". A
+/// moving instancer changes only where they stand: one skinned model and skeleton for all, on a
+/// page hung from the prim above, with a palette per copy.
+#[test]
+fn skinned_copies_under_a_moving_prim_share_their_skeleton() {
+    let body = format!(
+        r#"def SkelRoot "Hero"
+        {{
+            {RIG}
+            def Mesh "Body"
+            {{
+                {TRIANGLE}
+                rel skel:skeleton = </Mover/Crowd/Hero/Rig>
+                {INFLUENCES}
+            }}
+        }}"#
+    );
+    let a = cook(
+        "instancer-moved-skin",
+        &moving_crowd("/Mover/Crowd/Hero", &body),
+    );
+    let skeletons: Vec<&str> = a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::Skeleton as u16)
+        .map(|e| a.name(e))
+        .collect();
+    assert_eq!(skeletons.len(), 2, "{skeletons:?}");
+    let hero = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    assert_eq!(hero.names, ["Root", "Arm"]);
+    let (skeleton, joint, at) = hung(&a, "u/Hero");
+    assert_eq!(skeleton, AssetId::from_name("u/skeleton"));
+    assert_eq!(at.len(), 2);
+    let (_, end) = posed(&a, "u", "xform", 1.0);
+    let got = end[joint].transform_point3(at[0]);
+    assert!(got.abs_diff_eq(at[0] + Vec3::Y * 3.0, 1e-3), "{got}");
+}
+
+/// A selection holds no stage, so what moves an instancer outside it has a rig of its own, as the
+/// instancer's prototypes have a model whether selected or not.
+#[test]
+fn a_selection_leaves_a_moving_instancer_its_rig() {
+    let body = format!(
+        r#"def Xform "Proto"
+        {{
+            def Mesh "M"
+            {{
+                {TRIANGLE}
+            }}
+        }}"#
+    );
+    let stage = format!(
+        r#"{}
+def Mesh "Picked"
+{{
+    {TRIANGLE}
+}}"#,
+        moving_crowd("/Mover/Crowd/Proto", &body)
+    );
+    let settings = UsdSettings {
+        models: vec![NodeSelect {
+            node: "Picked".into(),
+        }],
+        ..UsdSettings::default()
+    };
+    let a = cook_at(&dir("instancer-selected"), &stage, settings).unwrap();
+    let (skeleton, joint, _) = hung(&a, "u/Proto");
+    assert_eq!(skeleton, AssetId::from_name("u/Mover/Crowd/skeleton"));
+    assert_eq!(joint, 1);
+}

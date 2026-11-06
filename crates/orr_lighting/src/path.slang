@@ -294,7 +294,7 @@ public float traced_error(SceneRoot* s, uint copy)
     float error = mesh.rt_cuts[min(cut, mesh.rt_cut_count - 1)].error;
     Placement pl;
     GroupGpu* g = s.groups + inst.group;
-    if (!placement(g, g.current, inst.group_index, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))
+    if (!placement(g, false, inst.group_index, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))
         return 0.0;
     return error * pl.scale;
 }

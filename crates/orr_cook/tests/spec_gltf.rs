@@ -1796,8 +1796,8 @@ fn the_meshes_layout_keeps_what_moves_in_rigs() {
 }
 
 /// `EXT_mesh_gpu_instancing`: an object space transform on the node's world transform, "with
-/// instance transformation applied first". Under an animated node the copies move with it,
-/// baked into its rig. A skinned instanced node is a model placed per instance, posed by one
+/// instance transformation applied first". Under an animated node the copies move with it, on a
+/// page hung from its joint. A skinned instanced node is a model placed per instance, posed by one
 /// skeleton, beside a skin of the scene; a scale of zero is no placement, and goes to a skeleton
 /// of its own while the mesh keeps its bind pose.
 #[test]
@@ -1829,14 +1829,37 @@ fn instanced_nodes_move_with_rigs_and_skins() {
     let (a, _) = cooked(&path);
     let sk = skeleton_of(&a, "g");
     assert_eq!(sk.names, ["", "mover"]);
-    let (_, corners) = part_corners(&a, "g/mesh");
-    assert_eq!(corners.len(), 6, "a copy of the mesh per instance");
+    assert!(
+        a.find(AssetId::from_name("g/mesh")).is_none(),
+        "nothing is baked"
+    );
     let end = posed_at(&sk, &clip_of(&a, "g", "go"), 1.0);
-    let top = corners
+    let page = a
+        .entries()
         .iter()
-        .map(|(j, p)| end[usize::from(*j)].transform_point3(*p))
-        .fold(Vec3::ZERO, Vec3::max);
-    assert!(top.x >= 1.99 && top.y >= 4.0, "{top}");
+        .find(|e| {
+            e.class == Class::InstancePage as u16 && {
+                let head = read(&a, &a.blobs(e)[0]);
+                let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
+                info.prototypes[0].model == AssetId::from_name("g/copies")
+            }
+        })
+        .expect("the copies' page");
+    let (head, body) = (read(&a, &a.blobs(page)[0]), read(&a, &a.blobs(page)[1]));
+    let header = orr_pack::instance::InstancePageInfo::parse(&head)
+        .unwrap()
+        .header;
+    assert_eq!(header.frame_skeleton, AssetId::from_name("g/skeleton"));
+    assert_eq!(header.frame_joint, 1);
+    let (_, records) = orr_pack::instance::decode(&head, &body).unwrap();
+    let mut top: Vec<Vec3> = records
+        .map(|(_, m)| end[1].transform_point3(m.translation))
+        .collect();
+    top.sort_by(|a, b| a.y.total_cmp(&b.y));
+    assert!(
+        near(top[0], Vec3::new(1.0, 2.0, 0.0)) && near(top[1], Vec3::new(1.0, 4.0, 0.0)),
+        "{top:?}"
+    );
 
     let crowd = skeleton_of(&a, "g/crowd");
     assert_eq!(crowd.names, ["hip"]);
@@ -1849,7 +1872,39 @@ fn instanced_nodes_move_with_rigs_and_skins() {
         .entries()
         .iter()
         .filter(|e| a.name(e).contains("/instances"));
-    assert_eq!(pages.count(), 2, "each posed model on pages of its own");
+    assert_eq!(
+        pages.count(),
+        3,
+        "each posed or hung model on pages of its own"
+    );
+}
+
+/// glTF node names need not be unique, so a rig named after its top node leaves that node's copies
+/// a name of their own.
+#[test]
+fn a_moving_instanced_node_shares_no_name_with_its_rig() {
+    let path = dir("instanced-names").join("scene.glb");
+    let mut g = Glb::default();
+    let (pa, _, _) = skinned_triangle(&mut g);
+    let ta = g.floats(&[[0.0f32], [1.0]], "SCALAR");
+    let va = g.floats(&[[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0]], "VEC3");
+    let at = g.floats(&[[0.0f32, 2.0, 0.0], [0.0, 4.0, 0.0]], "VEC3");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,2]}}],
+"extensionsUsed":["EXT_mesh_gpu_instancing"],
+"nodes":[{{"name":"mover","mesh":0,"children":[1],"extensions":{{"EXT_mesh_gpu_instancing":{{"attributes":{{"TRANSLATION":{at}}}}}}}}},
+{{"name":"child","mesh":0}},
+{{"name":"ground","mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}}}}]}}],
+"animations":[{{"name":"go","samplers":[{{"input":{ta},"output":{va}}}],
+"channels":[{{"sampler":0,"target":{{"node":0,"path":"translation"}}}}]}}]"#
+        ),
+    );
+    let (a, _) = cooked(&path);
+    assert!(a.find(AssetId::from_name("g/mover/mesh")).is_some());
+    assert!(a.find(AssetId::from_name("g/node0/mesh")).is_some());
 }
 
 /// L895 asks a `matrix` to decompose, but a file that shears still states where its mesh stands:

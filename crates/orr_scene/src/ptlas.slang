@@ -227,7 +227,7 @@ uint2 instance_key(GroupGpu* g, InstanceGpu inst)
 
 bool moved(GroupGpu* g, uint index)
 {
-    if (g.previous == g.current)
+    if (g.frame == nullptr && g.previous == g.current)
         return false;
     float3x4 a = group_transform(g, index);
     float3x4 b = previous_group_transform(g, index);
@@ -392,7 +392,7 @@ void want(uint3 id: SV_DispatchThreadID)
     // its skinning decided the range.
     bool skinned = (inst.flags & INSTANCE_SKINNED) != 0;
     uint64_t skinned_blas = skinned && inst.pose_index < s.skinned_capacity ? s.skin_state[inst.pose_index].blas : 0;
-    active = active && placement(g, g.current, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, cell_log2, pl);
+    active = active && placement(g, false, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, cell_log2, pl);
     active = active && (skinned || mesh.rt_cut_count > 0);
     uint cell = !active ? PARTITION_NONE : skinned ? global_partition() : t.slot_partition[slot];
     active = active && cell != PARTITION_NONE;
@@ -733,7 +733,7 @@ PtlasWrite copy_write(SceneRoot* s, PtlasGpu* t, uint index, uint partition, Ins
     GroupGpu* g = s.groups + inst.group;
     int3 cell = partition == global_partition() ? s.origin_cell.xyz : t.partitions[partition].cell;
     Placement pl;
-    placement(g, g.current, inst.group_index, cell, float3(0.0), uint(s.origin_cell.w), pl);
+    placement(g, false, inst.group_index, cell, float3(0.0), uint(s.origin_cell.w), pl);
     float3 lo, hi;
     if ((inst.flags & INSTANCE_SKINNED) == 0 || !skinned_reach(s, inst, lo, hi))
         copy_bounds(s, inst, lo, hi);
@@ -769,7 +769,7 @@ void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot, Instanc
     uint hidden = (inst.variant >> 16) & 0xffff;
     GroupGpu* g = s.groups + inst.group;
     Placement copy;
-    bool shown = placement(g, g.current, inst.group_index, t.partitions[partition].cell, float3(0.0), uint(s.origin_cell.w), copy);
+    bool shown = placement(g, false, inst.group_index, t.partitions[partition].cell, float3(0.0), uint(s.origin_cell.w), copy);
     for (uint j = 0; j < n; j++)
     {
         PartGpu part = mesh.parts[j];

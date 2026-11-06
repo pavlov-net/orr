@@ -202,6 +202,10 @@ pub struct Pose {
 #[derive(Clone, Copy, Debug)]
 pub struct InstancePageRef<'a> {
     pub page: PageId,
+    /// The palette group and entry of the joint the page hangs from, for a page that names one
+    /// (`InstancePageHeader::frame_skeleton`): the entry takes its records from the joint's bind
+    /// space to its pose. None places them as stored.
+    pub frame: Option<(TransformGroupId, u32)>,
     /// Where copies of each model take their part poses; the copy's index in its pose block
     /// is its record index. Models not listed take none.
     pub poses: &'a [(ModelId, Pose)],
@@ -223,6 +227,8 @@ pub struct InstancePageRef<'a> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SkinnedPageRef {
     pub page: PageId,
+    /// As [`InstancePageRef::frame`].
+    pub frame: Option<(TransformGroupId, u32)>,
     pub palette: TransformGroupId,
     pub palette_first: u32,
     /// Base in the scene's material-set table; None: the model's own materials.
@@ -304,6 +310,16 @@ pub(crate) struct Group {
     pub(crate) written: bool,
     /// A page group's record; its buffers are empty.
     pub(crate) page: Option<PageGroup>,
+    /// The joint it hangs from.
+    pub(crate) frame: Option<GroupFrame>,
+}
+
+/// [`GroupGpu::frame`], `frame_index` and `frame_origin`.
+#[derive(Clone, Copy)]
+pub(crate) struct GroupFrame {
+    palette: GpuPtr<GroupGpu>,
+    index: u32,
+    origin: [f32; 3],
 }
 
 /// What a cooked page's transform group holds.
@@ -336,6 +352,7 @@ impl Group {
             previous_is_current: true,
             created_frame: frame,
             written: false,
+            frame: None,
             page: Some(PageGroup {
                 page: id,
                 records: page.records.address().0,
@@ -349,11 +366,19 @@ impl Group {
     }
 
     pub(crate) fn record(&self) -> GroupGpu {
+        let frame = self.frame.unwrap_or(GroupFrame {
+            palette: GpuPtr::NULL,
+            index: 0,
+            origin: [0.0; 3],
+        });
         if let Some(p) = &self.page {
             // SAFETY: the records stay resident while this record names them: their eviction
             // and their pack's unmount write it null first.
             let records = unsafe { GpuPtr::from_address(GpuAddress(p.records)) };
             return GroupGpu {
+                frame: frame.palette,
+                frame_index: frame.index,
+                frame_origin: frame.origin,
                 current: records,
                 previous: records,
                 count: self.count,
@@ -379,6 +404,9 @@ impl Group {
             format: 0,
             anchor_cell: self.anchor.cell.to_array(),
             anchor_offset: self.anchor.offset.to_array(),
+            frame: frame.palette,
+            frame_index: frame.index,
+            frame_origin: frame.origin,
             ..Zeroable::zeroed()
         }
     }
@@ -726,6 +754,7 @@ impl<'f> SceneWriter<'f> {
             created_frame: self.frame,
             written: false,
             page: None,
+            frame: None,
         };
         let record = group.record();
         let zero = Record::fill(
@@ -999,6 +1028,11 @@ impl<'f> SceneWriter<'f> {
         )?;
 
         let cpu = &mut *self.scene.cpu.lock().unwrap();
+        let cell = IVec3::from_array(header.cell);
+        let frame = r
+            .frame
+            .map(|f| self.group_frame(cpu, f, cell))
+            .transpose()?;
         let group_id = (1..cpu.groups.len())
             .find(|&i| cpu.groups[i].is_none())
             .unwrap_or(cpu.groups.len()) as u32;
@@ -1131,9 +1165,9 @@ impl<'f> SceneWriter<'f> {
         if runs.is_empty() && count > 0 {
             runs.push(count);
         }
-        let cell = IVec3::from_array(header.cell);
         let partitions = cpu.ptlas.place_runs(first, &runs, cell);
-        let group = Group::of_page(r.page, page, self.frame);
+        let mut group = Group::of_page(r.page, page, self.frame);
+        group.frame = frame;
         let record = group.record();
         let at = group_id as usize;
         if at == cpu.groups.len() {
@@ -1180,6 +1214,30 @@ impl<'f> SceneWriter<'f> {
         Ok(range)
     }
 
+    /// What hangs a group anchored at `cell` from entry `frame.1` of palette group `frame.0`. A
+    /// page's group holds records, not the matrices a palette entry is read as.
+    fn group_frame(
+        &self,
+        cpu: &SceneCpu,
+        (palette, index): (TransformGroupId, u32),
+        cell: IVec3,
+    ) -> Result<GroupFrame> {
+        let anchor = cpu
+            .groups
+            .get(palette.0 as usize)
+            .and_then(Option::as_ref)
+            .filter(|g| g.page.is_none() && index < g.count)
+            .ok_or(Error::NoFrameJoint(palette, index))?
+            .anchor;
+        let edge = 2f64.powi(self.cell_log2 as i32);
+        let cells = (cell - anchor.cell).as_dvec3() * edge - anchor.offset.as_dvec3();
+        Ok(GroupFrame {
+            palette: self.scene.tables.groups.gpu().offset(u64::from(palette.0)),
+            index,
+            origin: cells.as_vec3().to_array(),
+        })
+    }
+
     /// Whether `model` has a skinned mesh.
     fn is_skinned(&self, model: ModelId) -> bool {
         let cpu = self.model_cpu.get(model.0 as usize);
@@ -1210,7 +1268,14 @@ impl<'f> SceneWriter<'f> {
         {
             return Err(Error::NotSkinnedPage(r.page));
         }
-        let group = Group::of_page(r.page, page, self.frame);
+        let mut group = Group::of_page(r.page, page, self.frame);
+        let cell = IVec3::from_array(page.info.header.cell);
+        group.frame = {
+            let cpu = self.scene.cpu.lock().unwrap();
+            r.frame
+                .map(|f| self.group_frame(&cpu, f, cell))
+                .transpose()?
+        };
         let copies = group.count;
         let record = group.record();
         let cooked = proto.sets.as_ref().filter(|_| r.material_set.is_none());

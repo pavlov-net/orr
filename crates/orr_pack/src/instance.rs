@@ -38,7 +38,7 @@ pub const MAX_POSE: u16 = 256;
 /// Sections a prototype can hide: sections `0..MAX_HIDDEN_SECTION`.
 pub const MAX_HIDDEN_SECTION: usize = 16;
 
-/// Blob 0 header, 64 B.
+/// Blob 0 header, 84 B.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct InstancePageHeader {
@@ -58,6 +58,10 @@ pub struct InstancePageHeader {
     /// u16 first record of each PTLAS partition, ascending, the first 0. Partition `p`
     /// covers records `[first[p], first[p + 1])`, the last up to the record count.
     pub partitions: Span,
+    /// The skeleton of the joint the records hang from, [`AssetId::NONE`] for none: they stand in
+    /// the bind space of joint `frame_joint`, and its skinning matrix (a palette entry) poses them.
+    pub frame_skeleton: AssetId,
+    pub frame_joint: u32,
 }
 
 impl InstancePageHeader {

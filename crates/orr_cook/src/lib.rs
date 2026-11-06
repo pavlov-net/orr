@@ -137,7 +137,7 @@ pub use assembly::AssemblySettings;
 pub use ctt::Quality;
 pub use gltf::GltfLayout;
 pub use import::{NodeSelect, PartAttribute};
-pub use instances::{Instances, Linear, Placement, PrototypeSpec, SectionSpec};
+pub use instances::{Instances, Linear, PageFrame, Placement, PrototypeSpec, SectionSpec};
 pub use mesh::{LodMode, MeshInput, MeshParts, MeshSettings, OmmSettings, StaticDisplacement};
 pub use patch::{MaterialPatch, MeshPatch};
 pub use quality::zstd_level;

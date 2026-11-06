@@ -45,14 +45,22 @@ pub(crate) struct Scene {
     pub(crate) materials: Vec<SceneMaterial>,
     pub(crate) images: Vec<ImageFile>,
     pub(crate) skeletons: Vec<SceneSkeleton>,
-    /// Per instanced model: its name and its instances' scene-space placements.
-    pub(crate) instances: Vec<(String, Vec<Placed>)>,
-    /// The same of instanced models with skeletons. Each cooks to pages of its own, whose
-    /// records are its copies, for the palettes that pose them.
-    pub(crate) posed: Vec<(String, Vec<Placed>)>,
+    pub(crate) instances: Vec<PlacedModel>,
     /// Every file read.
     pub(crate) files: Vec<Input>,
     pub(crate) warnings: Vec<String>,
+}
+
+/// The placements of one model that share pages.
+pub(crate) struct PlacedModel {
+    pub(crate) model: String,
+    /// In scene space, or the bind space of `frame`'s joint.
+    pub(crate) placed: Vec<Placed>,
+    /// Index into [`Scene::skeletons`] and the joint the placements hang from.
+    pub(crate) frame: Option<(usize, u16)>,
+    /// On pages of its own, whose records are its copies alone: for the palettes of a model with
+    /// a skeleton, and for a frame, which is a page's.
+    pub(crate) alone: bool,
 }
 
 /// One placement: position and a linear transform that [`collapses`] passes.
