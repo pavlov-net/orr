@@ -350,6 +350,16 @@ impl Ptlas {
         }
     }
 
+    /// Marks the partitions of the slots changed, as for slots emptied in place.
+    pub(crate) fn touch(&mut self, first: u32, count: u32) {
+        for slot in first..first + count {
+            let p = self.slot_partition[slot as usize];
+            if p != PARTITION_NONE && p != PARTITION_SKINNED {
+                self.changed.insert(p);
+            }
+        }
+    }
+
     /// Marks medium proxy `id` set or cleared; its instance is written at the next build.
     pub(crate) fn set_proxy(&mut self, id: u32, live: bool) {
         let was = std::mem::replace(&mut self.proxy_live[id as usize], live);

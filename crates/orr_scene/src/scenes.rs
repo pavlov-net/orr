@@ -15,7 +15,7 @@ use orr_gpu::{
 use orr_math::{DVec3, Vec3};
 use orr_pack::AssetId;
 use orr_shaders::PathEntry;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::accel::{AccelKernels, AccelLimits, AccelShared};
 use crate::arena::{ArenaReport, ArenaRequest, ViewArena, ViewStep};
@@ -577,10 +577,20 @@ impl Scenes {
     }
 
     /// Unmounts a pack. A pending mount stops loading; a ready one's memory is freed once
-    /// every frame submitted so far has completed.
+    /// every frame submitted so far has completed. Copies of its models in every scene are
+    /// gone from the next frame, placed by hand or on pages, and their [`InstanceRange`]s stay
+    /// the consumer's to remove.
     pub fn unmount(&mut self, m: MountId) {
         let frame = self.core.next_frame - 1;
         let core = &mut self.core;
+        let gone: FxHashSet<u32> = core.mounts.models_of(m).iter().map(|id| id.0).collect();
+        let holds = |page: PageId| {
+            let protos = core.mounts.page_prototypes(page);
+            protos.is_ok_and(|p| p.iter().any(|q| gone.contains(&q.model.0)))
+        };
+        for scene in core.scenes.iter().flatten() {
+            scene.empty_copies(&gone, holds, frame, &core.seq);
+        }
         for page in core.mounts.pages_of(m) {
             core.land_page(page, 0);
         }

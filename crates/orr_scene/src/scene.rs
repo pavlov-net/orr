@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use bytemuck::{Pod, Zeroable};
 use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, MemoryKind};
 use orr_math::{DVec3, IVec3};
+use rustc_hash::FxHashSet;
 
 use crate::decals::{Decal, DecalId, Listing, decal_gpu, listing, table_sizes};
 use crate::emissive::{ModelEmission, Run, Runs};
@@ -30,6 +31,9 @@ use crate::{
     ProducerBatch, ProducerGpu, ProducerStateGpu, Result, SceneRoot, SkinStateGpu, SkinnedGpu,
     SkyStats, SlotStateGpu, TessStateGpu, ViewConstants,
 };
+
+/// `SceneCpu::slot_models` of a slot no model placed by hand holds.
+const NO_MODEL: u32 = u32::MAX;
 
 /// Seconds of an animated page's rows wanted ahead of its clock.
 const MOTION_AHEAD: f32 = 1.0;
@@ -640,6 +644,122 @@ impl SceneCpu {
 }
 
 impl Scene {
+    /// Instance entry `entry` of the emissive list.
+    fn emissive_entry(&self, entry: u32) -> GpuPtr<EmissiveGpu> {
+        self.tables
+            .emissive
+            .gpu()
+            .offset(u64::from(self.desc.producer_capacity + entry))
+    }
+
+    /// Empties group `id` and its record.
+    fn clear_group(&self, cpu: &mut SceneCpu, frame: u64, id: TransformGroupId, seq: u64) {
+        let group = cpu.groups[id.0 as usize].take();
+        cpu.groups_removed.extend(group.map(|g| (frame, g)));
+        let at = self.tables.groups.gpu().offset(u64::from(id.0));
+        let n = words(size_of::<GroupGpu>());
+        cpu.records.push(Record::fill(seq, at.address().0, n, 0));
+    }
+
+    /// Ends what the slots of `range` hold, and leaves them with their owner, who still removes
+    /// them.
+    fn empty_slots(&self, cpu: &mut SceneCpu, range: InstanceRange, frame: u64, seq: u64) {
+        let n = range.count * words(size_of::<InstanceGpu>());
+        let first = self.tables.instances.gpu().offset(u64::from(range.first));
+        cpu.records.push(Record::fill(seq, first.address().0, n, 0));
+        let slots = range.first as usize..(range.first + range.count) as usize;
+        cpu.slot_models[slots].fill(NO_MODEL);
+        if let Some(i) = cpu.pages.iter().position(|p| p.range == range) {
+            let p = cpu.pages.swap_remove(i);
+            self.clear_group(cpu, frame, p.group, seq);
+            cpu.pages_removed.push((frame, p));
+        }
+        if let Some(i) = cpu.page_motions.iter().position(|m| m.range == range) {
+            let m = cpu.page_motions.swap_remove(i);
+            self.clear_group(cpu, frame, m.group, seq);
+        }
+        if let Some(i) = cpu.skinned_pages.iter().position(|p| p.range == range) {
+            let p = cpu.skinned_pages.swap_remove(i);
+            self.clear_group(cpu, frame, p.group, seq);
+            cpu.skinned_sets_removed.push((frame, p.sets));
+        }
+        let end = range.first + range.count;
+        let mut i = 0;
+        while i < cpu.skins.len() {
+            let r = &mut cpu.skins[i];
+            let (a, b) = (
+                range.first.max(r.slots.first),
+                end.min(r.slots.first + r.slots.count),
+            );
+            if a >= b {
+                i += 1;
+                continue;
+            }
+            let entry = r.entry + (a - r.slots.first);
+            let n = b - a;
+            r.live -= n;
+            let at = self.tables.skinned.gpu().offset(u64::from(entry));
+            let w = n * words(size_of::<SkinnedGpu>());
+            cpu.records.push(Record::fill(seq, at.address().0, w, 0));
+            let arrays = if r.live == 0 {
+                Some(cpu.skins.swap_remove(i).arrays)
+            } else {
+                i += 1;
+                None
+            };
+            cpu.skins_removed.push((frame, entry, n, arrays));
+        }
+        for (entry, count) in cpu.emissive_runs.remove(range.first, range.count) {
+            let at = self.emissive_entry(entry).address().0;
+            let n = count * words(size_of::<EmissiveGpu>());
+            cpu.records.push(Record::fill(seq, at, n, 0));
+            cpu.emissive_removed.push((frame, entry, count));
+        }
+    }
+
+    /// Empties every copy of `gone`, whose memory is about to go: placed by hand, or on a page
+    /// `holds` says names one of them. Their ranges stay with their owners.
+    pub(crate) fn empty_copies(
+        &self,
+        gone: &FxHashSet<u32>,
+        holds: impl Fn(PageId) -> bool,
+        frame: u64,
+        seq: &AtomicU64,
+    ) {
+        let cpu = &mut *self.cpu.lock().unwrap();
+        let pages = cpu.pages.iter().map(|p| (p.page, p.range));
+        let skinned = cpu.skinned_pages.iter().map(|p| (p.page, p.range));
+        let mut ranges: Vec<InstanceRange> = pages
+            .chain(skinned)
+            .filter(|p| holds(p.0))
+            .map(|p| p.1)
+            .collect();
+        for &r in &ranges {
+            let slots = r.first as usize..(r.first + r.count) as usize;
+            cpu.slot_models[slots].fill(NO_MODEL);
+        }
+        let held = |&(_, m): &(usize, &u32)| gone.contains(m);
+        let mut run: Option<InstanceRange> = None;
+        for (slot, _) in cpu.slot_models.iter().enumerate().filter(held) {
+            let slot = slot as u32;
+            match &mut run {
+                Some(r) if r.first + r.count == slot => r.count += 1,
+                _ => {
+                    ranges.extend(run.take());
+                    run = Some(InstanceRange {
+                        first: slot,
+                        count: 1,
+                    });
+                }
+            }
+        }
+        ranges.extend(run);
+        for r in ranges {
+            self.empty_slots(cpu, r, frame, seq.fetch_add(1, Ordering::Relaxed));
+            cpu.ptlas.touch(r.first, r.count);
+        }
+    }
+
     pub(crate) fn new(device: &Device, desc: &SceneDesc) -> Result<Self> {
         let n = |c: u32| u64::from(c.max(1));
         let dl = MemoryKind::DeviceLocal;
@@ -710,7 +830,7 @@ impl Scene {
             tables,
             cpu: Mutex::new(SceneCpu {
                 slots: RangeAllocator::new(desc.instance_capacity),
-                slot_models: vec![0; desc.instance_capacity as usize],
+                slot_models: vec![NO_MODEL; desc.instance_capacity as usize],
                 masks: HashSet::new(),
                 removed: Vec::new(),
                 emissive: RangeAllocator::new(desc.emissive_capacity),
@@ -1356,7 +1476,8 @@ impl<'f> SceneWriter<'f> {
         let (range, records) = match placed {
             Ok(p) => p,
             Err(e) => {
-                self.clear_group(cpu, group, self.next_seq());
+                self.scene
+                    .clear_group(cpu, self.frame, group, self.next_seq());
                 return Err(e);
             }
         };
@@ -1498,7 +1619,7 @@ impl<'f> SceneWriter<'f> {
             Err(e) => {
                 let seq = self.next_seq();
                 let cpu = &mut *self.scene.cpu.lock().unwrap();
-                self.clear_group(cpu, id, seq);
+                self.scene.clear_group(cpu, self.frame, id, seq);
                 cpu.skinned_sets_removed.push((self.frame, sets));
                 return Err(e);
             }
@@ -1518,15 +1639,6 @@ impl<'f> SceneWriter<'f> {
             self.copy_variants(range, 0, &vec![variant; copies as usize])?;
         }
         Ok((range, id))
-    }
-
-    /// Empties group `id` and its record.
-    fn clear_group(&self, cpu: &mut SceneCpu, id: TransformGroupId, seq: u64) {
-        let group = cpu.groups[id.0 as usize].take();
-        cpu.groups_removed.extend(group.map(|g| (self.frame, g)));
-        let at = self.scene.tables.groups.gpu().offset(u64::from(id.0));
-        let n = words(size_of::<GroupGpu>());
-        cpu.records.push(Record::fill(seq, at.address().0, n, 0));
     }
 
     /// Zeroes the slot state of new slots. The fields from `part_run` on describe runs the
@@ -1766,69 +1878,17 @@ impl<'f> SceneWriter<'f> {
 
     /// Instance entry `entry` of the emissive list.
     fn emissive_entry(&self, entry: u32) -> GpuPtr<EmissiveGpu> {
-        self.scene
-            .tables
-            .emissive
-            .gpu()
-            .offset(u64::from(self.scene.desc.producer_capacity + entry))
+        self.scene.emissive_entry(entry)
     }
 
     /// Empties the slots of `range` and their emissive list entries; they are reused once
     /// this frame has completed.
     pub fn remove(&mut self, range: InstanceRange) {
-        let n = range.count * words(size_of::<InstanceGpu>());
         let seq = self.next_seq();
         let cpu = &mut *self.scene.cpu.lock().unwrap();
-        cpu.records
-            .push(Record::fill(seq, self.instance_word(range.first, 0), n, 0));
+        self.scene.empty_slots(cpu, range, self.frame, seq);
         cpu.removed.push((self.frame, range));
         cpu.ptlas.remove(range.first, range.count, self.frame);
-        if let Some(i) = cpu.pages.iter().position(|p| p.range == range) {
-            let p = cpu.pages.swap_remove(i);
-            self.clear_group(cpu, p.group, seq);
-            cpu.pages_removed.push((self.frame, p));
-        }
-        if let Some(i) = cpu.page_motions.iter().position(|m| m.range == range) {
-            let m = cpu.page_motions.swap_remove(i);
-            self.clear_group(cpu, m.group, seq);
-        }
-        if let Some(i) = cpu.skinned_pages.iter().position(|p| p.range == range) {
-            let p = cpu.skinned_pages.swap_remove(i);
-            self.clear_group(cpu, p.group, seq);
-            cpu.skinned_sets_removed.push((self.frame, p.sets));
-        }
-        let end = range.first + range.count;
-        let mut i = 0;
-        while i < cpu.skins.len() {
-            let r = &mut cpu.skins[i];
-            let (a, b) = (
-                range.first.max(r.slots.first),
-                end.min(r.slots.first + r.slots.count),
-            );
-            if a >= b {
-                i += 1;
-                continue;
-            }
-            let entry = r.entry + (a - r.slots.first);
-            let n = b - a;
-            r.live -= n;
-            let at = self.scene.tables.skinned.gpu().offset(u64::from(entry));
-            let w = n * words(size_of::<SkinnedGpu>());
-            cpu.records.push(Record::fill(seq, at.address().0, w, 0));
-            let arrays = if r.live == 0 {
-                Some(cpu.skins.swap_remove(i).arrays)
-            } else {
-                i += 1;
-                None
-            };
-            cpu.skins_removed.push((self.frame, entry, n, arrays));
-        }
-        for (entry, count) in cpu.emissive_runs.remove(range.first, range.count) {
-            let at = self.emissive_entry(entry).address().0;
-            let n = count * words(size_of::<EmissiveGpu>());
-            cpu.records.push(Record::fill(seq, at, n, 0));
-            cpu.emissive_removed.push((self.frame, entry, count));
-        }
     }
 
     /// Sets or clears producer entry `id`. Setting allocates the entry's batch and build

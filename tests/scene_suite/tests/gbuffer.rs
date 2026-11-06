@@ -4656,6 +4656,78 @@ fn a_page_hung_from_a_joint_follows_its_palette_entry() {
     assert_clean();
 }
 
+/// A copy placed by hand goes with its pack too: the next pack to take its model's id holds
+/// another model, which draws nothing of the old placement.
+#[test]
+fn a_copy_of_an_unmounted_model_stays_hidden_when_its_id_is_reused() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let (eye, target) = (DVec3::new(0.0, 0.0, 2.5), DVec3::ZERO);
+    let old = w.model("plain");
+    let placed = place(
+        &mut w,
+        &[Item {
+            model: "plain",
+            linear: Mat3::IDENTITY,
+            at: Vec3::ZERO,
+        }],
+    );
+    let mut frame = 1;
+    let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+    assert!(g.ids.iter().any(|&id| id != 0), "the copy never drew");
+    w.scenes.unmount(w.mount);
+    for _ in 0..6 {
+        frame += 1;
+        let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+        assert!(g.ids.iter().all(|&id| id == 0), "drawn with its pack gone");
+    }
+    let again = w.scenes.mount(PackSource::Memory(Arc::clone(pack())));
+    let start = Instant::now();
+    while matches!(w.scenes.mount_state(again), LoadState::Pending) {
+        frame += 1;
+        shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the mount never landed"
+        );
+    }
+    assert!(matches!(w.scenes.mount_state(again), LoadState::Ready));
+    let new = w
+        .scenes
+        .model(again, AssetId::from_name("plain"))
+        .expect("the same pack again");
+    assert_eq!(old, new, "the id goes to the next mount");
+    for _ in 0..12 {
+        frame += 1;
+        let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+        assert!(
+            g.ids.iter().all(|&id| id == 0),
+            "another mount's model drew the old copy"
+        );
+        let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+        assert!(
+            r.traced.iter().all(|t| t.instance == 0),
+            "another mount's model traced the old copy"
+        );
+    }
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(frame + 1),
+            scenes: &[placed.scene],
+            low_latency: None,
+        })
+        .unwrap();
+    {
+        let mut s = f.scene(placed.scene).unwrap();
+        for &r in &placed.ranges {
+            s.remove(r);
+        }
+    }
+    wait(f.end(&[]).unwrap());
+    assert_clean();
+}
+
 /// A copy goes with its pack. The next pack to take its page's slot holds another page, whose
 /// records are no copy's of the old placement, however alike the slot.
 #[test]
