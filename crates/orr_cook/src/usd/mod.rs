@@ -33,7 +33,9 @@
 //!   prototype is placed by each copy of it. Prims under an instancer are cooked only as
 //!   prototypes; one elsewhere that is defined also draws where it stands. A transform that
 //!   collapses an axis is not a placement: the prototype is cooked once per such linear
-//!   transform with it applied, as model `<model>/baked/<k>`, placed by translation alone.
+//!   transform with it applied, as model `<model>/baked/<k>`, placed by translation alone. A
+//!   displacement is a world length, so one that bakes into a mesh makes any transform that
+//!   changes lengths no placement of it either.
 //! - Without [`UsdSettings::models`], the rest of the stage is one model, in scene space.
 //!   With it, each prim whose name contains a pattern (and has no selected ancestor) is a
 //!   model holding its subtree, framed by the prim; meshes outside every model are not
@@ -577,6 +579,31 @@ impl<'s> Importer<'s> {
             }
         }
 
+        // Every mesh drawn, with the model it goes to.
+        let mut meshes: Vec<(usize, usize)> = (0..n)
+            .filter(|&i| self.nodes[i].ty == "Mesh" && !self.hidden(i, None))
+            .filter_map(|i| Some((i, owner[i]?)))
+            .collect();
+        meshes.append(&mut instancing.meshes);
+        // What each mesh binds and whether it is a cage, and the models that bake a height into a
+        // mesh of theirs.
+        let mut bindings = Vec::with_capacity(meshes.len());
+        let mut baking = std::collections::HashSet::new();
+        for &(i, o) in &meshes {
+            let prim = self.nodes[i].prim.clone();
+            let facts = MeshFacts::read(&self.reader(&prim))?;
+            let as_cage = !facts.polygonal && self.settings.subdivision == Subdivision::Cage;
+            let bound_here = self.bindings(i, facts.double_sided)?;
+            let displaced = bound_here
+                .materials()
+                .any(|m| self.materials[m].textures.displacement.is_some());
+            let settings = || self.mesh_settings(models[o].name.as_deref());
+            if !as_cage && displaced && settings().displace_static.is_some() {
+                baking.insert(o);
+            }
+            bindings.push((bound_here, as_cage));
+        }
+
         // Per instanced model its placements, and per model the models its meshes go to, with
         // what they apply: the model itself unless it places nothing, and those that bake its
         // other copies.
@@ -586,7 +613,8 @@ impl<'s> Importer<'s> {
             .collect();
         for (m, transforms) in instancing.copies {
             let name = models[m].name.clone().unwrap_or_default();
-            let (direct, baked) = placements(&transforms).map_err(|e| format!("{name}: {e}"))?;
+            let (direct, baked) =
+                placements(&transforms, baking.contains(&m)).map_err(|e| format!("{name}: {e}"))?;
             if direct.is_empty() {
                 holders[m].clear();
             }
@@ -600,12 +628,6 @@ impl<'s> Importer<'s> {
             }
         }
 
-        // Every mesh drawn, with the model it goes to.
-        let mut meshes: Vec<(usize, usize)> = (0..n)
-            .filter(|&i| self.nodes[i].ty == "Mesh" && !self.hidden(i, None))
-            .filter_map(|i| Some((i, owner[i]?)))
-            .collect();
-        meshes.extend(instancing.meshes);
         // One skeleton per skeletal root, from what its skinned meshes bind: its prim path,
         // the skeleton, the root's node and the prims that bind it.
         let mut skels: Vec<(String, skel::Skel, usize, Vec<usize>)> = Vec::new();
@@ -652,17 +674,12 @@ impl<'s> Importer<'s> {
         }
         // A model's meshes carry tangents if one of them does, which each must know as it lands
         // in the model. That takes which materials a mesh binds, and none of its arrays.
-        let mut bindings = Vec::with_capacity(meshes.len());
-        for &(i, o) in &meshes {
-            let prim = self.nodes[i].prim.clone();
-            let r = self.reader(&prim);
-            let facts = MeshFacts::read(&r)?;
-            let as_cage = !facts.polygonal && self.settings.subdivision == Subdivision::Cage;
-            let bound_here = self.bindings(i, facts.double_sided)?;
+        for (&(i, o), (bound_here, as_cage)) in meshes.iter().zip(&bindings) {
             let settled = holders[o]
                 .iter()
                 .all(|h| models[h.0].welder.carries_tangents);
             if !as_cage && !settled {
+                let prim = self.nodes[i].prim.clone();
                 let r = self.reader(&prim);
                 let mut carries = false;
                 for m in bound_here.materials() {
@@ -676,9 +693,8 @@ impl<'s> Importer<'s> {
                     }
                 }
             }
-            bindings.push(bound_here);
         }
-        for (&(i, o), bound_here) in meshes.iter().zip(&bindings) {
+        for (&(i, o), (bound_here, _)) in meshes.iter().zip(&bindings) {
             let prim = self.nodes[i].prim.clone();
             let r = self.reader(&prim);
             let path = r.path().to_string();
@@ -871,15 +887,21 @@ impl<'s> Importer<'s> {
         })
     }
 
-    /// A built model's mesh, one section per scene material.
-    fn model(&mut self, b: Building) -> Result<SceneModel, String> {
-        let mut settings = self.settings.mesh.clone();
+    /// Mesh settings of the model named `name`.
+    fn mesh_settings(&self, name: Option<&str>) -> MeshSettings {
+        let mut s = self.settings.mesh.clone();
         patch::apply_matching(
             &self.settings.mesh_overrides,
-            b.name.as_deref().unwrap_or_default(),
-            &mut settings,
+            name.unwrap_or_default(),
+            &mut s,
             MeshPatch::apply,
         );
+        s
+    }
+
+    /// A built model's mesh, one section per scene material.
+    fn model(&mut self, b: Building) -> Result<SceneModel, String> {
+        let settings = self.mesh_settings(b.name.as_deref());
         let w = b.welder;
         let mut indices = Vec::new();
         let mut sections = Vec::new();
@@ -944,6 +966,7 @@ impl<'s> Importer<'s> {
                     .chain(self.settings.uv1.is_some().then_some(w.uvs1))
                     .collect(),
                 colors: w.carries_colors.then_some(w.colors),
+                moves: None,
                 indices,
                 sections,
                 skin: b.skinned.then_some(Skin {

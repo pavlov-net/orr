@@ -39,7 +39,8 @@ pub struct SubdDesc<'a> {
     /// The linked `IDisplacement` id the limit surface displaces through; 0 is the
     /// material's displacement texture.
     pub displacement: u8,
-    /// The most the displacement moves a point, in m of the copy's space.
+    /// The most the displacement moves a point, in m of the copy's space. A material's world
+    /// length counts here over the placement's smallest scale.
     pub displacement_reach: f32,
     pub origin: OriginPolicy,
     pub flags: InstanceFlags,

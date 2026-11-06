@@ -38,6 +38,8 @@ public static const uint MATERIAL_VERTEX = 1 << 24;
 // The normal map, or the coat's, holds mesh space directions at `0.5 v + 0.5`.
 public static const uint MATERIAL_OBJECT_NORMAL = 1 << 25;
 public static const uint MATERIAL_OBJECT_COAT_NORMAL = 1 << 26;
+// Displacement fields are world lengths along the world normal, not mesh space lengths.
+public static const uint MATERIAL_DISPLACEMENT_WORLD = 1 << 27;
 // The base color tints what passes through the surface.
 public static const uint MATERIAL_BASE_TINT = 1 << 23;
 // It binds a slot past TEXTURE_TRANSMISSION, which hits on other materials don't look at.

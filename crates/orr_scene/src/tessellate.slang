@@ -354,8 +354,21 @@ Surface undisplaced(Patch pt, float3 w, bool previous)
     return o;
 }
 
-// The displaced point at patch weights `w`, last frame's with `previous`.
-float3 displaced(Patch pt, PatchItem item, uint material, float3 w, bool previous, out Surface base)
+// What places the entry: last frame's with `previous`, this frame's where its group hid it then.
+float3x3 entry_linear(bool previous)
+{
+    SceneRoot* s = root.scene;
+    ProducerGpu p = entry();
+    Placement placed;
+    if (previous && producer_placement(s, p, true, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), placed))
+        return placed.linear;
+    if (producer_placement(s, p, false, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), placed))
+        return placed.linear;
+    return float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
+}
+
+// The displaced point at patch weights `w`, last frame's with `previous`, under `placing`.
+float3 displaced(Patch pt, PatchItem item, uint material, float3 w, bool previous, float3x3 placing, out Surface base)
 {
     ProducerTriangle tri = previous ? pt.previous : pt.current;
     float2 uvs[3] = { tri.corners.attributes[0].uv[0], tri.corners.attributes[1].uv[0], tri.corners.attributes[2].uv[0] };
@@ -365,6 +378,7 @@ float3 displaced(Patch pt, PatchItem item, uint material, float3 w, bool previou
     i.displacement = entry().displacement;
     i.normal = base.normal;
     i.material = material;
+    i.linear = placing;
     float2 inward = (uvs[0] + uvs[1] + uvs[2]) / 3.0 - base.uv;
     UvFootprint f = { base.uv, (uvs[1] - uvs[0]) / item.rate, (uvs[2] - uvs[0]) / item.rate, float2(-1.0), inward };
     i.uv[0] = f;
@@ -392,16 +406,16 @@ bool on_patch(Patch pt, float3 w)
 // Twice a step `e` times the displaced field's derivative along it at `w`, where it is `x`:
 // central differences, or second-order one-sided ones toward the patch where a step would
 // leave it.
-float3 difference(Patch pt, PatchItem item, uint material, float3 w, float3 e, float3 x)
+float3 difference(Patch pt, PatchItem item, uint material, float3 w, float3 e, float3 x, float3x3 placing)
 {
     Surface unused;
     bool plus = on_patch(pt, w + e);
     bool minus = on_patch(pt, w - e);
     if (plus == minus)
-        return displaced(pt, item, material, w + e, false, unused) - displaced(pt, item, material, w - e, false, unused);
+        return displaced(pt, item, material, w + e, false, placing, unused) - displaced(pt, item, material, w - e, false, placing, unused);
     float s = plus ? 1.0 : -1.0;
-    float3 a = displaced(pt, item, material, w + s * e, false, unused);
-    float3 b = displaced(pt, item, material, w + 2.0 * s * e, false, unused);
+    float3 a = displaced(pt, item, material, w + s * e, false, placing, unused);
+    float3 b = displaced(pt, item, material, w + 2.0 * s * e, false, placing, unused);
     return s * (4.0 * a - b - 3.0 * x);
 }
 
@@ -453,7 +467,8 @@ void dice(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     uint3 wi = place(pattern_weights(key, q), item.corners, vertex_zeros(key, item.zeros));
     float3 w = bary_weights(wi);
     Surface base;
-    float3 x = displaced(pt, item, material, w, false, base);
+    float3x3 placing = entry_linear(false);
+    float3 x = displaced(pt, item, material, w, false, placing, base);
     // Differences along two directions, over a quarter of a generated step and at most a
     // quarter of the finest step one pattern dices: the patch triangle's edges, or a
     // subdivision patch's s and t, which always have a side on the patch.
@@ -470,8 +485,8 @@ void dice(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         e1 = float3(-s.x - s.y, s.x, s.y);
         e2 = float3(-t.x - t.y, t.x, t.y);
     }
-    float3 du = difference(pt, item, material, w, e1, x);
-    float3 dv = difference(pt, item, material, w, e2, x);
+    float3 du = difference(pt, item, material, w, e1, x, placing);
+    float3 dv = difference(pt, item, material, w, e2, x, placing);
     float3 n = base.normal;
     float3 nd = safe_normalize(cross(du, dv), n);
     if (dot(nd, n) < 0.0)
@@ -482,7 +497,7 @@ void dice(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     if (d.previous != nullptr)
     {
         Surface before;
-        d.previous[v] = pt.has_previous ? displaced(pt, item, material, w, true, before) : x;
+        d.previous[v] = pt.has_previous ? displaced(pt, item, material, w, true, entry_linear(true), before) : x;
     }
     if (d.vertex_user != nullptr)
     {

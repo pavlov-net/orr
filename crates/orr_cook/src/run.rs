@@ -1946,6 +1946,7 @@ fn static_material_unit(name: &str, m: &Material) -> NewUnit<'static> {
     m.displacement_offset = 0.0;
     m.displacement_min = 0.0;
     m.displacement_max = 0.0;
+    m.displacement_world = 0;
     material_unit(format!("{name}/static"), &m)
 }
 
@@ -2062,6 +2063,7 @@ fn mesh_units(
     deps.dedup();
     let n = input.positions.len();
     let mesh = MeshData {
+        moves: None,
         colors: input
             .colors
             .as_ref()

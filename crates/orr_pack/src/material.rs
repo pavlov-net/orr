@@ -55,7 +55,8 @@ pub mod filter {
 
 /// OpenPBR 1.1.1 parameters of one material, as authored: colors linear Rec.709, lengths
 /// in world space meters, thin-film thickness in nanometers, emission luminance in nits, angles
-/// in radians. The displacement fields are the exception: lengths in mesh space.
+/// in radians. The displacement fields are the exception: lengths in mesh space, unless
+/// [`Self::displacement_world`] says otherwise.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct Material {
@@ -123,7 +124,9 @@ pub struct Material {
     /// [`Self::OBJECT_COAT_NORMAL`]. Such a map stores a direction at `0.5 v + 0.5` in its first
     /// three channels, and the mesh's tangents have no part in it.
     pub object_normals: u8,
-    pub _pad: u8,
+    /// Nonzero: the displacement fields are world lengths along the world normal, whatever scale
+    /// places the mesh, not mesh space lengths that scale with it.
+    pub displacement_world: u8,
     /// Indexed by the `slot` constants.
     pub textures: [TextureBinding; slot::COUNT],
     /// Per slot, the affine map from mesh uv to the uv its texture is sampled at, stored
@@ -311,7 +314,7 @@ impl Default for Material {
             frame_uv: Self::FRAME_NORMAL_MAP,
             model: Self::MODEL_OPENPBR,
             object_normals: 0,
-            _pad: 0,
+            displacement_world: 0,
             textures: [TextureBinding::zeroed(); slot::COUNT],
             uv_transforms: [[0.0; 6]; slot::COUNT],
         }

@@ -28,6 +28,10 @@
 //! from the node's transform times each instance's, become placements. Such models do not
 //! mix with skins.
 //!
+//! A displacement is a mesh space length along the mesh's normal, as `KHR_materials_volume` has
+//! thickness, so a transform moves it with the mesh, placed or applied. Only a static bake holds
+//! that of a transform applied to the vertices: at run time such a height keeps its stated length.
+//!
 //! A placement keeps the whole transform, mirrored or sheared. A transform that collapses an
 //! axis is not a placement: the mesh is cooked once per such linear transform with it
 //! applied, as model `<model>/baked/<k>`, placed by translation alone. A node scaled to zero
@@ -101,6 +105,8 @@ struct Vertices {
     uvs: Vec<[f32; 2]>,
     uvs1: Vec<[f32; 2]>,
     colors: Vec<[f32; 4]>,
+    /// See [`MeshData::moves`].
+    moves: Vec<[[f32; 3]; 2]>,
     joints: Vec<[u8; 4]>,
     weights: Vec<[u8; 4]>,
     values: Vec<u16>,
@@ -175,6 +181,10 @@ impl Building {
             },
             joints: skinned.then(|| jp.iter().map(|p| p.map_or(0, |p| p.1)).collect()),
         });
+        let mut moves = v.moves;
+        if !moves.is_empty() {
+            moves.resize(v.positions.len(), [[0.0; 3]; 2]);
+        }
         let mesh = MeshData {
             positions: v.positions,
             normals: v.normals,
@@ -183,6 +193,7 @@ impl Building {
                 .chain(self.uv1.then_some(v.uvs1))
                 .collect(),
             colors: self.colors.then_some(v.colors),
+            moves: (!moves.is_empty()).then_some(moves),
             indices,
             sections: Vec::new(),
             skin: skinned.then_some(Skin {
@@ -283,6 +294,8 @@ struct Placing<'a> {
     /// [`SceneMaterial::tangent_set`] of its material; set 0 where that reads none and the
     /// model carries tangents.
     tangent_set: Option<usize>,
+    /// Its material displaces it in a space `world` has already moved it to.
+    displaced: bool,
 }
 
 /// Appends a triangle primitive to `b` with its morph targets at the weights, its positions
@@ -523,6 +536,13 @@ fn append_primitive(
     let base = b.v.positions.len() as u32;
     let tris = b.groups.entry(material_index(prim)).or_default();
     let v = &mut b.v;
+    if at.displaced {
+        v.moves.resize(base as usize, [[0.0; 3]; 2]);
+    }
+    let moved = |n: Vec3| {
+        let unit = n.normalize_or_zero();
+        [unit.to_array(), (linear * unit).to_array()]
+    };
     match normals {
         Some(normals) => {
             let (tangents, copies) = match (&computed, stated) {
@@ -532,6 +552,10 @@ fn append_primitive(
             };
             v.positions
                 .extend(tangents::with_copies(positions, &copies));
+            if let Some(ns) = local_normals.filter(|_| at.displaced) {
+                let moves = ns.iter().map(|&n| moved(Vec3::from(n))).collect();
+                v.moves.extend(tangents::with_copies(moves, &copies));
+            }
             v.normals.extend(tangents::with_copies(normals, &copies));
             v.tangents.extend(tangents);
             v.uvs.extend(tangents::with_copies(uvs, &copies));
@@ -548,11 +572,17 @@ fn append_primitive(
         None => {
             for (k, t) in indices.as_chunks::<3>().0.iter().enumerate() {
                 let face = tangents::face_normal(t.map(|i| Vec3::from(positions[i as usize])));
+                // `t` winds as the placed triangle does, against the mesh's under a mirror.
+                let moves = at.displaced.then(|| {
+                    let n = tangents::face_normal(t.map(|i| Vec3::from(local[i as usize])));
+                    moved(if flip { -n } else { n })
+                });
                 for (c, &i) in t.iter().enumerate() {
                     let i = i as usize;
                     tris.push(v.positions.len() as u32);
                     v.positions.push(positions[i]);
                     v.normals.push(face.to_array());
+                    v.moves.extend(moves);
                     v.tangents
                         .push(computed.as_ref().map_or(tangents::UNREAD, |t| t[3 * k + c]));
                     v.uvs.push(uvs[i]);
@@ -821,6 +851,14 @@ impl Imported<'_> {
         self.materials[&material_index(prim)].tangent_set()
     }
 
+    /// Whether `prim`'s registered material displaces it.
+    fn displaces(&self, prim: &gltf::Primitive<'_>) -> bool {
+        self.materials[&material_index(prim)]
+            .textures
+            .displacement
+            .is_some()
+    }
+
     /// Whether `prim` makes its model carry tangents. glTF ignores those of a primitive without
     /// normals.
     fn carries_tangents(&self, prim: &gltf::Primitive<'_>) -> bool {
@@ -851,7 +889,7 @@ impl Imported<'_> {
         transforms: &[DMat4],
     ) -> Result<()> {
         let (direct, baked) =
-            placements(transforms).map_err(|m| self.fail(format!("model {name}: {m}")))?;
+            placements(transforms, false).map_err(|m| self.fail(format!("model {name}: {m}")))?;
         if !direct.is_empty() {
             self.lazy_model(name, mesh, weights, DMat4::IDENTITY)?;
             self.instances.push((name.to_string(), direct));
@@ -879,9 +917,11 @@ impl Imported<'_> {
         let mut views = Vec::new();
         let mut groups: BTreeMap<usize, u64> = BTreeMap::new();
         let mut tangent_sets = Vec::new();
+        let mut displaced = Vec::new();
         for prim in surfaces(&m) {
             self.material(mesh, &prim)?;
             tangent_sets.push(self.tangent_set(&prim));
+            displaced.push(linear != DMat4::IDENTITY && self.displaces(&prim));
             primitive_views(&prim, &mut views);
             for a in src.morph_accessors(mesh, prim.index()) {
                 Document::accessor_views(&a, &mut views);
@@ -919,8 +959,8 @@ impl Imported<'_> {
             return Err(self.fail(format!("model {name} has no triangles")));
         }
         // Everything the loaded mesh is made of: the mesh's JSON, its accessors and views,
-        // the bytes of the buffers they read, the transform, the part attribute, and whether
-        // the model carries tangents and the uv sets they follow.
+        // the bytes of the buffers they read, the transform, the part attribute, whether the
+        // model carries tangents and the uv sets they follow, and what the transform displaces.
         let mut h = blake3::Hasher::new();
         let mut json = |v: &serde_json::Value| {
             let s = serde_json::to_string(v).expect("JSON serializes");
@@ -951,7 +991,7 @@ impl Imported<'_> {
         h.update(bytemuck::cast_slice(weights));
         h.update(format!("{:?}", self.settings.parts_from_attribute).as_bytes());
         let tangents = surfaces(&m).any(|p| self.carries_tangents(&p));
-        h.update(format!("{tangents} {tangent_sets:?}").as_bytes());
+        h.update(format!("{tangents} {tangent_sets:?} {displaced:?}").as_bytes());
         let parts = self.settings.parts_from_attribute.clone();
         let asset = self.asset.to_string();
         let weights = weights.to_vec();
@@ -969,13 +1009,15 @@ impl Imported<'_> {
             let mut b = Building::new(None, count);
             b.tangents = tangents;
             let gm = src.doc.meshes().nth(mesh).expect("mesh index");
-            for (prim, &tangent_set) in surfaces(&gm).zip(&tangent_sets) {
+            let placings = tangent_sets.iter().zip(&displaced);
+            for (prim, (&tangent_set, &displaced)) in surfaces(&gm).zip(placings) {
                 let at = Placing {
                     mesh,
                     world: linear,
                     weights: &weights,
                     binding: None,
                     tangent_set,
+                    displaced,
                 };
                 append_primitive(&data, &prim, &at, &cx, &mut b).map_err(|m| Error::Import {
                     asset: asset.clone(),
@@ -1309,6 +1351,7 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
                 weights,
                 binding: binding.as_ref(),
                 tangent_set: b.tangent_set(&prim),
+                displaced: b.displaces(&prim),
             };
             append_primitive(&data, &prim, &at, &cx, &mut models[m]).map_err(|e| {
                 fail(format!(

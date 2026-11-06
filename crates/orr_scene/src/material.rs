@@ -51,6 +51,7 @@ pub mod material_flags {
     pub const VERTEX: u32 = 1 << 24;
     pub const OBJECT_NORMAL: u32 = 1 << 25;
     pub const OBJECT_COAT_NORMAL: u32 = 1 << 26;
+    pub const DISPLACEMENT_WORLD: u32 = 1 << 27;
 }
 
 /// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
@@ -190,6 +191,7 @@ impl MaterialGpu {
         set(m.model != Material::MODEL_OPENPBR, f::FRESNEL_MIX);
         set(m.model == Material::MODEL_GLTF, f::BASE_TINT);
         set(m.textures.iter().any(|b| b.vertex != 0), f::VERTEX);
+        set(m.displacement_world != 0, f::DISPLACEMENT_WORLD);
         set(
             m.object_normals & Material::OBJECT_NORMAL != 0,
             f::OBJECT_NORMAL,

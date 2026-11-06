@@ -1211,6 +1211,80 @@ fn morph_targets_leave_joints_and_weights() {
     cooked(&path);
 }
 
+/// A quad displaced 0.5 under a node of `scale`, with vertex `normals` if any.
+fn displaced_quad(name: &str, scale: [f32; 3], normals: Option<&[[f32; 3]]>) -> PathBuf {
+    let path = dir(name).join("displaced.glb");
+    let mut g = Glb::default();
+    let pa = g.floats(&QUAD, "VEC3");
+    let ua = g.floats(&QUAD_UV, "VEC2");
+    let ia = g.indices(&QUAD_INDICES);
+    let img = g.image(&png(4, |_, _| [255, 255, 255, 255]));
+    let normal = normals.map_or(String::new(), |n| {
+        format!(r#","NORMAL":{}"#, g.floats(n, "VEC3"))
+    });
+    g.write(
+        &path,
+        &format!(
+            r#""extensionsUsed":["KHR_materials_displacement"],"scene":0,"scenes":[{{"nodes":[0]}}],
+"nodes":[{{"mesh":0,"scale":{scale:?}}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"TEXCOORD_0":{ua}{normal}}},"indices":{ia},"material":0}}]}}],
+"materials":[{{"extensions":{{"KHR_materials_displacement":{{"displacementGeometryTexture":{{"index":0}},"displacementGeometryFactor":0.5}}}}}}],
+"textures":[{{"source":0}}],"images":[{{"bufferView":{img},"mimeType":"image/png"}}]"#
+        ),
+    );
+    path
+}
+
+fn baking(layout: GltfLayout, max_edge: f32) -> GltfSettings {
+    let mut s = GltfSettings {
+        layout,
+        ..GltfSettings::default()
+    };
+    s.mesh.displace_static = Some(orr_cook::StaticDisplacement {
+        max_edge,
+        target_error: 0.001,
+    });
+    s
+}
+
+fn heights(a: &Archive, name: &str) -> Vec<f32> {
+    let corners = per_triangle(a, name, |view, c, t| t.map(|v| view.position(c, v)[2]));
+    corners.into_iter().flatten().collect()
+}
+
+/// KHR_materials_volume's rule for a material's length: "given in the coordinate space of the
+/// mesh", so "any transformations applied to the mesh's node will also be applied". A displacement
+/// of 0.5 under a z scale of 3 moves the mesh 1.5, whichever layout places it, and under a z scale
+/// of 0 stays in the plane the node flattens the mesh to.
+#[test]
+fn a_node_scales_a_baked_displacement_in_either_layout() {
+    let path = displaced_quad("displaced-node", [2.0, 1.0, 3.0], None);
+    let (a, _) = cook(&path, baking(GltfLayout::Scene, 2.0)).unwrap();
+    let scene = heights(&a, "g/mesh");
+    assert!(scene.iter().all(|z| (z - 1.5).abs() < 1e-3), "{scene:?}");
+    let (a, _) = cook(&path, baking(GltfLayout::Meshes, 2.0)).unwrap();
+    let own = heights(&a, "g/mesh/0/mesh");
+    assert!(own.iter().all(|z| (z - 0.5).abs() < 1e-3), "{own:?}");
+
+    let path = displaced_quad("displaced-flat", [2.0, 1.0, 0.0], None);
+    let (a, _) = cook(&path, baking(GltfLayout::Meshes, 2.0)).unwrap();
+    let flat = heights(&a, "g/mesh/0/baked/0/mesh");
+    assert!(flat.iter().all(|z| z.abs() < 1e-3), "{flat:?}");
+}
+
+/// Normals turning 90 degrees across the quad are straight up halfway, where a split puts points:
+/// a height of 0.5 has its whole length there, 1.5 under a z scale of 3, against 1.06 at the
+/// corners.
+#[test]
+fn a_split_point_takes_the_whole_length_of_its_normal() {
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    let normals = [[-s, 0.0, s], [s, 0.0, s], [s, 0.0, s], [-s, 0.0, s]];
+    let path = displaced_quad("displaced-curve", [1.0, 1.0, 3.0], Some(&normals));
+    let (a, _) = cook(&path, baking(GltfLayout::Scene, 0.2)).unwrap();
+    let top = heights(&a, "g/mesh").into_iter().fold(f32::MIN, f32::max);
+    assert!((top - 1.5).abs() < 5e-3, "{top}");
+}
+
 /// KHR_materials_iridescence: "`iridescenceFactor` is multiplied with the red channel of
 /// `iridescenceTexture` to control the overall strength".
 #[test]

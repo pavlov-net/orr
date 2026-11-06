@@ -184,6 +184,10 @@ pub(crate) struct MeshData {
     pub(crate) uvs: Vec<Vec<[f32; 2]>>,
     /// The vertex color stream.
     pub(crate) colors: Option<Vec<[f32; 4]>>,
+    /// Per vertex where a displacement is a length of a space the vertices have left: the unit
+    /// normal there, then what a displacement of 1 moves the vertex by, which is that normal taken
+    /// to the vertices' space as a position is.
+    pub(crate) moves: Option<Vec<[[f32; 3]; 2]>>,
     pub(crate) indices: Vec<u32>,
     pub(crate) sections: Vec<SectionData>,
     pub(crate) skin: Option<Skin>,
@@ -564,7 +568,7 @@ pub(crate) fn cook(
         (Some(t), Some(max)) if !bakes => tangents::check(m, t, maps, max),
         _ => TangentCheck::KEPT,
     };
-    let mut w = lod::Welded::new(m, !tangent_check.derive);
+    let mut w = lod::Welded::new(m, !tangent_check.derive, bakes);
     let source_grid =
         Grid::new(&w.positions, s.position_step_log2, m.min_exponent).map_err(fail)?;
     let mut parts = lod::Parts::new(&w, m, &source_grid).map_err(fail)?;
@@ -1038,6 +1042,7 @@ pub(crate) fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
         || m.uvs.iter().any(|u| u.len() != n)
         || m.tangents.as_ref().is_some_and(|t| t.len() != n)
         || m.colors.as_ref().is_some_and(|c| c.len() != n)
+        || m.moves.as_ref().is_some_and(|c| c.len() != n)
         || m.skin
             .as_ref()
             .is_some_and(|k| k.joints.len() != n || k.weights.len() != n)
@@ -1074,6 +1079,7 @@ pub(crate) fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
         || !m.uvs.iter().flatten().all(|p| finite(p))
         || !m.tangents.iter().flatten().all(|p| finite(p))
         || !m.colors.iter().flatten().all(|p| finite(p))
+        || !m.moves.iter().flatten().flatten().all(|p| finite(p))
     {
         return Err("non-finite vertex attribute".into());
     }
@@ -1549,6 +1555,9 @@ impl MeshData {
         if let Some(c) = &mut self.colors {
             copy(c, &copies);
         }
+        if let Some(c) = &mut self.moves {
+            copy(c, &copies);
+        }
         if let Some(k) = &mut self.skin {
             copy(&mut k.joints, &copies);
             copy(&mut k.weights, &copies);
@@ -1573,6 +1582,7 @@ impl MeshData {
         part(bytemuck::cast_slice(&self.normals));
         part(self.tangents.as_deref().map_or(&[], bytemuck::cast_slice));
         part(self.colors.as_deref().map_or(&[], bytemuck::cast_slice));
+        part(self.moves.as_deref().map_or(&[], bytemuck::cast_slice));
         for u in &self.uvs {
             part(bytemuck::cast_slice(u));
         }

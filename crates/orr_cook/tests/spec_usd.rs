@@ -12,8 +12,8 @@ mod tangent_quads;
 use std::path::PathBuf;
 
 use orr_cook::{
-    ArchiveSpec, AssetSpec, Manifest, NodeSelect, Source, StaticDisplacement, Subdivision,
-    UsdSettings,
+    ArchiveSpec, AssetSpec, Manifest, MeshPatch, NodeSelect, Source, StaticDisplacement,
+    Subdivision, UsdSettings,
 };
 use orr_math::{Mat4, Quat, Vec3};
 use orr_pack::clip::Clip;
@@ -2564,6 +2564,56 @@ fn baking() -> UsdSettings {
         target_error: 0.0001,
     });
     s
+}
+
+/// PS `displacement` is a world length, so a copy that scales keeps the height it states: it cooks
+/// with its scale applied, and a copy that doesn't stays a placement of the model.
+#[test]
+fn a_baked_height_holds_under_a_placement_scale() {
+    let d = dir("displaced-copies");
+    let surface = previewed("float inputs:displacement = 0.25", "", "");
+    let material = &surface[surface.find("def Material").unwrap()..];
+    let stage = format!(
+        r#"def PointInstancer "I"
+{{
+    rel prototypes = [</I/Protos/P>]
+    int[] protoIndices = [0, 0]
+    point3f[] positions = [(0, 0, 0), (5, 0, 0)]
+    float3[] scales = [(1, 1, 1), (2, 2, 2)]
+    def Scope "Protos"
+    {{
+        def Mesh "P"
+        {{
+            {TRIANGLE}
+            rel material:binding = </M>
+        }}
+    }}
+}}
+
+{material}"#
+    );
+    // Baking for every model, or for this one alone.
+    let overridden = UsdSettings {
+        mesh_overrides: vec![(
+            "P".into(),
+            MeshPatch {
+                displace_static: Some(baking().mesh.displace_static),
+                ..Default::default()
+            },
+        )],
+        ..Default::default()
+    };
+    for settings in [baking(), overridden] {
+        let a = cook_at(&d, &stage, settings).unwrap();
+        let height = |name: &str| {
+            corners(&a, name)
+                .iter()
+                .map(|c| c.0.z)
+                .fold(f32::MIN, f32::max)
+        };
+        assert!((height("u/P/mesh") - 0.25).abs() < 1e-3);
+        assert!((height("u/P/baked/0/mesh") - 0.25).abs() < 1e-3);
+    }
 }
 
 /// Cluster bounds and baked heights read a tile as they read the same image clamped.

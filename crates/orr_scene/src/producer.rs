@@ -163,7 +163,8 @@ pub struct ProducerDesc<'a> {
     /// material's displacement texture.
     pub displacement: u8,
     /// The most the entry's displacement moves a point, in m of entry space: edges whose
-    /// sphere grown by it was out of view last frame take a coarse rate.
+    /// sphere grown by it was out of view last frame take a coarse rate. A material's world length
+    /// counts here over the placement's smallest scale.
     pub displacement_reach: f32,
     pub opacity: Opacity,
     /// Indexed by each cluster's material; at most 256.

@@ -439,7 +439,8 @@ fn refine(a: &Piece, b: &Piece, grid: &PointGrid<'_>, r: &mut DQuat) -> bool {
 }
 
 /// Whether every triangle of `a` under `r` lands on its own triangle of `b`: corners within
-/// `tol`, the same section, uvs within 1e-4, normals and tangents within 0.9995.
+/// `tol`, the same section, uvs within 1e-4, normals, tangents and moves within 0.9995, moves
+/// of one length.
 fn matches(m: &MeshData, a: &Piece, b: &Piece, r: DQuat, tol: f64) -> bool {
     let cell = 2.0 * tol;
     let pos = |v: u32| point(m, v);
@@ -470,7 +471,11 @@ fn matches(m: &MeshData, a: &Piece, b: &Piece, r: DQuat, tol: f64) -> bool {
                     Vec3::new(tb[0], tb[1], tb[2]),
                 )
         });
-        uv && normal && tangent
+        let moves = m.moves.as_ref().is_none_or(|c| {
+            let (ma, mb) = (Vec3::from(c[va][1]), Vec3::from(c[vb][1]));
+            dir_ok(rf * ma, mb) && (ma.length() - mb.length()).abs() <= 1e-3 * mb.length()
+        });
+        uv && normal && tangent && moves
     };
     let mut used = vec![false; b.tris.len()];
     a.tris.iter().all(|ta| {
@@ -509,6 +514,7 @@ fn unit_mesh(m: &MeshData, p: &Piece) -> (MeshData, Vec<u16>) {
         tangents: m.tangents.as_ref().map(|_| Vec::new()),
         uvs: vec![Vec::new(); m.uvs.len()],
         colors: m.colors.as_ref().map(|_| Vec::new()),
+        moves: m.moves.as_ref().map(|_| Vec::new()),
         indices: Vec::with_capacity(3 * p.tris.len()),
         sections: Vec::new(),
         skin: None,
@@ -535,6 +541,9 @@ fn unit_mesh(m: &MeshData, p: &Piece) -> (MeshData, Vec<u16>) {
                     dst.push(src[i]);
                 }
                 if let (Some(dst), Some(src)) = (&mut out.tangents, &m.tangents) {
+                    dst.push(src[i]);
+                }
+                if let (Some(dst), Some(src)) = (&mut out.moves, &m.moves) {
                     dst.push(src[i]);
                 }
                 if let (Some(dst), Some(src)) = (&mut out.colors, &m.colors) {
@@ -593,6 +602,10 @@ fn remainder(m: &MeshData, mut removed: Vec<Vec<[u32; 3]>>) -> MeshData {
             .collect(),
         colors: m
             .colors
+            .as_ref()
+            .map(|c| order.iter().map(|&v| c[v]).collect()),
+        moves: m
+            .moves
             .as_ref()
             .map(|c| order.iter().map(|&v| c[v]).collect()),
         indices,
@@ -744,6 +757,7 @@ mod tests {
                 tangents: None,
                 uvs: vec![self.uvs.clone()],
                 colors: None,
+                moves: None,
                 indices,
                 sections: out,
                 skin: None,

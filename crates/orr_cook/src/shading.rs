@@ -51,9 +51,9 @@
 //! A value that states a [`Unit`] converts to meters or degrees. `transmission_depth`,
 //! `subsurface_radius` (its default too) and both kinds of `displacement` are lengths: without a
 //! unit they are in the scene's length unit ([`Host::meters_per_unit`]). They are world space
-//! lengths, so no object scale enters them; a displacement moves mesh space points, so a
-//! placement's scale does scale it. `thin_film_thickness` without a unit is in micrometers, as
-//! OpenPBR states it, whatever the scene's unit.
+//! lengths, so no object scale enters them, and a displacement keeps its length under a
+//! placement's scale ([`Material::displacement_world`]). `thin_film_thickness` without a unit is
+//! in micrometers, as OpenPBR states it, whatever the scene's unit.
 //!
 //! A texture whose file can't be read, or which names none, reads what its node states for that
 //! everywhere: `UsdUVTexture` `fallback`, default (0, 0, 0, 1), taking the texture's place in
@@ -1844,6 +1844,7 @@ impl Mapper<'_, '_> {
         let meters = f64::from(scale) * self.meters(n, "displacement", unit)?;
         let (scale, offset) = (scaled(heights.0, meters), scaled(heights.1, meters));
         let m = &mut self.material;
+        m.displacement_world = 1;
         m.displacement_scale = scale;
         m.displacement_offset = offset;
         m.displacement_min = offset.min(offset + scale);

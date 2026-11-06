@@ -162,9 +162,18 @@ pub(crate) fn normal_matrix(l: DMat3) -> DMat3 {
     m * (sign / largest(m).max(f64::MIN_POSITIVE))
 }
 
+/// Whether `l` keeps lengths.
+fn rigid(l: DMat3) -> bool {
+    largest(l.transpose() * l - DMat3::IDENTITY) <= 1e-5
+}
+
 /// The copies `transforms` place: those an instance can hold, then the rest by linear
-/// transform.
-pub(crate) fn placements(transforms: &[DMat4]) -> Result<(Vec<Placed>, Vec<Baked>), String> {
+/// transform. With `lengths` a model states world lengths its mesh holds, so an instance can hold
+/// only what keeps them.
+pub(crate) fn placements(
+    transforms: &[DMat4],
+    lengths: bool,
+) -> Result<(Vec<Placed>, Vec<Baked>), String> {
     let mut placed = Vec::new();
     let mut baked: Vec<Baked> = Vec::new();
     let mut baked_of: HashMap<[u32; 9], usize> = HashMap::new();
@@ -175,7 +184,7 @@ pub(crate) fn placements(transforms: &[DMat4]) -> Result<(Vec<Placed>, Vec<Baked
         let position = m.w_axis.truncate();
         let exact = DMat3::from_mat4(*m);
         let l = exact.as_mat3();
-        if !collapses(l.as_dmat3()) {
+        if !collapses(l.as_dmat3()) && (!lengths || rigid(exact)) {
             placed.push(Placed {
                 position,
                 linear: l,

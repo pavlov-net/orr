@@ -75,6 +75,7 @@ patch! {
         displacement_offset: f32,
         displacement_min: f32,
         displacement_max: f32,
+        displacement_world: u8,
         alpha_mode: u8,
         double_sided: u8,
         thin_walled: u8,

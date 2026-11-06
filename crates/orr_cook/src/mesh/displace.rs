@@ -4,7 +4,8 @@
 //! shared by every triangle on its edge, and the two sides of a uv seam compute it from the
 //! same positions, so the split mesh stays watertight. Every vertex at a position moves
 //! along the mean normal of the baked vertices there, by their mean displacement, so seams
-//! and borders with other sections move alike. Normals become the area-weighted face
+//! and borders with other sections move alike. [`MeshData::moves`](super::MeshData::moves) takes
+//! that normal to the vertices' space where it is held. Normals become the area-weighted face
 //! normals at each position. The baked sections are then simplified to `target_error`.
 
 use orr_math::{DVec3, Vec3};
@@ -28,8 +29,9 @@ pub(super) fn bake(
     }
     split(w, parts, &baked, d.max_edge);
 
-    // Mean displacement and normal per position over the baked vertices.
-    let mut at: FxHashMap<[u32; 3], (f64, DVec3, u32)> = FxHashMap::default();
+    // Mean displacement, and summed normals and moves of a height of 1, per position over the
+    // baked vertices.
+    let mut at: FxHashMap<[u32; 3], (f64, DVec3, DVec3, u32)> = FxHashMap::default();
     for (s, r) in w.sections.iter().enumerate() {
         let Some(disp) = maps[s].displacement.as_ref().filter(|_| baked[s]) else {
             continue;
@@ -38,17 +40,30 @@ pub(super) fn bake(
         for &v in &w.indices[r.clone()] {
             let height = heights[&v];
             let v = v as usize;
-            let e = at
-                .entry(w.positions[v].map(f32::to_bits))
-                .or_insert((0.0, DVec3::ZERO, 0));
+            let e = at.entry(w.positions[v].map(f32::to_bits)).or_insert((
+                0.0,
+                DVec3::ZERO,
+                DVec3::ZERO,
+                0,
+            ));
             e.0 += f64::from(height);
-            e.1 += Vec3::from(w.normals[v]).normalize_or_zero().as_dvec3();
-            e.2 += 1;
+            let unit = Vec3::from(w.normals[v]).normalize_or_zero().to_array();
+            let [normal, moved] = w.moves.as_ref().map_or([unit; 2], |m| m[v]);
+            e.1 += Vec3::from(normal).as_dvec3();
+            e.2 += Vec3::from(moved).as_dvec3();
+            e.3 += 1;
         }
     }
     for p in &mut w.positions {
-        if let Some(&(sum, n, count)) = at.get(&p.map(f32::to_bits)) {
-            let offset = n.normalize_or_zero() * (sum / f64::from(count));
+        if let Some(&(sum, n, moved, count)) = at.get(&p.map(f32::to_bits)) {
+            // A move is linear in its normal, so the unit mean normal's is the sum's over its size.
+            let unit = n.length_recip();
+            let along = if unit.is_finite() {
+                moved * unit
+            } else {
+                DVec3::ZERO
+            };
+            let offset = along * (sum / f64::from(count));
             *p = (Vec3::from(*p).as_dvec3() + offset).as_vec3().to_array();
         }
     }
@@ -127,6 +142,16 @@ fn midpoint(w: &mut Welded, a: u32, b: u32) -> u32 {
     if let Some(c) = &mut w.colors {
         let (ca, cb) = (c[a], c[b]);
         c.push(std::array::from_fn(|i| mid(ca[i], cb[i])));
+    }
+    if let Some(c) = &mut w.moves {
+        // A move is linear in its normal, and the midpoint's normal is the ends' unit sum.
+        let [na, ma] = c[a].map(Vec3::from);
+        let [nb, mb] = c[b].map(Vec3::from);
+        let unit = (na + nb).length_recip();
+        c.push(match unit.is_finite() {
+            true => [(na + nb) * unit, (ma + mb) * unit].map(<[f32; 3]>::from),
+            false => c[a],
+        });
     }
     if let Some(t) = &mut w.tangents {
         // A placed mesh's tangents are not unit, and the longer one would pull the midpoint.

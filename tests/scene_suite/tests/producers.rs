@@ -813,6 +813,8 @@ struct Plane {
     scene: SceneId,
     history: ViewHistoryId,
     group: TransformGroupId,
+    /// The linear part of the entry's transform.
+    linear: Mat3,
     material: MaterialId,
     mesh: PatchMesh,
     /// Positions, attributes, triangles and cluster records of `mesh`, for `patches.slang`.
@@ -900,6 +902,7 @@ impl Plane {
             scene,
             history,
             group,
+            linear: Mat3::IDENTITY,
             material,
             mesh,
             gpu,
@@ -951,6 +954,8 @@ impl Plane {
         {
             let mut w = f.scene(self.scene).unwrap();
             if let Some(desc) = desc {
+                w.transforms(self.group, 0, 1).unwrap()[0] =
+                    Affine3::from_mat3_translation(self.linear, Vec3::ZERO).into();
                 w.set_producer(PLANE, Some(desc)).unwrap();
             }
             w.set_focus(focus.as_dvec3());
@@ -1397,8 +1402,28 @@ fn tessellation_steps_its_rate_down_near_capacity_and_back_up_with_room() {
 
 #[test]
 fn texture_displacement_moves_patches_along_the_normal_by_the_materials_texture() {
+    let double = Mat3::from_diagonal(Vec3::splat(2.0));
+    textured_heights(Mat3::IDENTITY, 0, 1.0);
+    // A mesh space length scales with the entry, in whose space a generated point stands.
+    textured_heights(double, 0, 1.0);
+    // A world length holds whatever scales the entry.
+    let world = material_flags::DISPLACEMENT_WORLD;
+    textured_heights(double, world, 0.5);
+    // Shear leans the world normal off the mesh's, to (-0.75, 1, 0) / 1.25, which the inverse
+    // takes to 1.25 along y.
+    let shear = Mat3::from_cols(Vec3::new(1.0, 0.75, 0.0), Vec3::Y, Vec3::Z);
+    textured_heights(shear, world, 1.25);
+    // Nothing inverts a collapsed axis, and the height stays finite along the mesh's normal.
+    let flat = Mat3::from_diagonal(Vec3::new(1.0, 0.0, 1.0));
+    textured_heights(flat, world, 1.0);
+}
+
+/// A plane placed by `linear`, of a material with `flags`, displaces by the texture's height times
+/// `share` along y in the entry's space.
+fn textured_heights(linear: Mat3, flags: u32, share: f32) {
     let d = device();
     let mut plane = Plane::new(4.0);
+    plane.linear = linear;
     // Every texel of a 4 x 4 R16 displacement texture at 0.75.
     let texel = (0.75f32 * 65535.0).round() as u16;
     let desc = TextureDesc::d2(Format::R16Unorm, 4, 4, TextureUsage::SAMPLED);
@@ -1423,7 +1448,7 @@ fn texture_displacement_moves_patches_along_the_normal_by_the_materials_texture(
     let mut m = MaterialGpu::zeroed();
     m.base_color = [0.5; 3];
     m.base_weight = 1.0;
-    m.flags = material_flags::DOUBLE_SIDED | material_flags::DISPLACED;
+    m.flags = material_flags::DOUBLE_SIDED | material_flags::DISPLACED | flags;
     m.textures = [TextureIndex::NONE; orr_pack::material::slot::COUNT];
     m.textures[orr_pack::material::slot::DISPLACEMENT] =
         d.write_sampled(slot, &texture, &orr_gpu::ViewDesc::default());
@@ -1441,7 +1466,7 @@ fn texture_displacement_moves_patches_along_the_normal_by_the_materials_texture(
     let stats = plane.stats();
     // The same texel on both sides of the seam: nothing for the weld to move.
     assert_eq!(stats.welded, 0, "{stats:?}");
-    let want = 0.2 * f32::from(texel) / 65535.0 - 0.1;
+    let want = share * (0.2 * f32::from(texel) / 65535.0 - 0.1);
     assert!(!g.positions.is_empty());
     for (p, a) in g.positions.iter().zip(&g.attrs) {
         assert!((p.y - want).abs() < 1e-4, "{p} against height {want}");

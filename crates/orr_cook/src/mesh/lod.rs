@@ -16,6 +16,7 @@ pub(super) struct Welded {
     /// Per uv set, a uv per vertex.
     pub(super) uvs: Vec<Vec<[f32; 2]>>,
     pub(super) colors: Option<Vec<[f32; 4]>>,
+    pub(super) moves: Option<Vec<[[f32; 3]; 2]>>,
     pub(super) skin: Option<Skin>,
     pub(super) values: Option<Vec<u16>>,
     pub(super) pivots: Option<Vec<[f32; 3]>>,
@@ -25,11 +26,12 @@ pub(super) struct Welded {
 }
 
 impl Welded {
-    /// Welds `m`, without its tangents unless `tangents`.
-    pub(super) fn new(m: &MeshData, tangents: bool) -> Self {
+    /// Welds `m`, without its tangents unless `tangents` and its moves unless `moves`.
+    pub(super) fn new(m: &MeshData, tangents: bool, moves: bool) -> Self {
         let _z = crate::profile::zone!("mesh.weld");
         let n = m.positions.len();
         let stored = m.tangents.as_ref().filter(|_| tangents);
+        let moves = m.moves.as_ref().filter(|_| moves);
         let mut streams = vec![
             VertexStream::new(m.positions.as_ptr()),
             VertexStream::new(m.normals.as_ptr()),
@@ -39,6 +41,9 @@ impl Welded {
             streams.push(VertexStream::new(t.as_ptr()));
         }
         if let Some(c) = &m.colors {
+            streams.push(VertexStream::new(c.as_ptr()));
+        }
+        if let Some(c) = moves {
             streams.push(VertexStream::new(c.as_ptr()));
         }
         if let Some(k) = &m.skin {
@@ -70,6 +75,7 @@ impl Welded {
                 .colors
                 .as_ref()
                 .map(|c| meshopt::remap_vertex_buffer(c, count, &remap)),
+            moves: moves.map(|c| meshopt::remap_vertex_buffer(c, count, &remap)),
             skin: m.skin.as_ref().map(|k| Skin {
                 joints: meshopt::remap_vertex_buffer(&k.joints, count, &remap),
                 weights: meshopt::remap_vertex_buffer(&k.weights, count, &remap),
