@@ -5,8 +5,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use orr_math::{DMat3, DMat4, DVec3, Mat3};
+use orr_math::{DMat3, DMat4, DQuat, DVec3, Mat3};
 use orr_pack::clip::Clip;
+use orr_pack::instance::MotionRow;
 use orr_pack::material::{Material, slot};
 use orr_pack::skeleton::SkeletonInfo;
 use serde::Deserialize;
@@ -200,6 +201,164 @@ pub(crate) fn normal_matrix(l: DMat3) -> DMat3 {
 /// Whether `l` keeps lengths.
 fn rigid(l: DMat3) -> bool {
     largest(l.transpose() * l - DMat3::IDENTITY) <= 1e-5
+}
+
+/// A transform that goes into a mesh, with the records and intervals it stands in.
+type BakedSet = (DMat4, Vec<(usize, Vec<usize>)>);
+
+/// Moving copies of a model that states world lengths, split as [`kept_lengths`] says.
+pub(crate) struct KeptLengths {
+    /// What stays on the model, its rows as they were.
+    pub(crate) direct: Option<(Vec<Placed>, Arc<InstanceMotion>)>,
+    /// What cooks a model of its own with the transform applied, and moves rigidly.
+    pub(crate) baked: Vec<(DMat4, Vec<Placed>, Arc<InstanceMotion>)>,
+    /// Whether some of `direct` stretches over time, which no single transform can hold.
+    pub(crate) stretched: bool,
+}
+
+/// A copy's transform is `left * T(t) * R(t) * S(t) * right`. A height baked into a mesh keeps
+/// its world length through a rigid transform only, so what stretches has to go into the mesh, and
+/// that takes a stretch that stands still: `Q(t) * B` with `Q` rigid and `B` constant. Under a
+/// uniform `left` that is `B = c S right`, for any `R(t)`. Otherwise `R` has to hold as well, and
+/// `B` is the whole linear part. `S` and `R` that step make one `B` per step, each with the
+/// intervals it stands in, so only a `growth`, or a `spin` under a `left` that isn't uniform, has
+/// no `B`: its copy stays on the model, stretching.
+pub(crate) fn kept_lengths(placed: &[Placed], m: &InstanceMotion) -> KeptLengths {
+    let n = placed.len();
+    let intervals = m.times.len();
+    let row = |k: usize, i: usize| &m.rows[k * n + i];
+    let lin = DMat3::from_mat4(m.left);
+    let gram = lin.transpose() * lin;
+    let unit = (gram.x_axis.x + gram.y_axis.y + gram.z_axis.z) / 3.0;
+    let uniform = largest(gram * (1.0 / unit) - DMat3::IDENTITY) <= 1e-5;
+    let c = unit.sqrt();
+    let vector = |v: [f32; 3]| DVec3::from_array(v.map(f64::from));
+    let quat = |q: [f32; 4]| DQuat::from_array(q.map(f64::from));
+    let bake = |r: &MotionRow| match uniform {
+        true => DMat4::from_scale(vector(r.scale) * c) * m.right,
+        false => {
+            let stretch = DMat3::from_diagonal(vector(r.scale));
+            DMat4::from_mat3(lin * DMat3::from_quat(quat(r.rotation)) * stretch) * m.right
+        }
+    };
+    let there = |k: &usize, i: usize| row(*k, i).rotation != [0.0; 4];
+
+    let mut stretched = false;
+    // Per record the intervals that stay, and per transform the records and intervals it takes.
+    let mut staying: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut sets: Vec<BakedSet> = Vec::new();
+    let mut set_of: HashMap<[u64; 16], usize> = HashMap::new();
+    for (i, stays) in staying.iter_mut().enumerate() {
+        let alive: Vec<usize> = (0..intervals).filter(|k| there(k, i)).collect();
+        let grows = |k: &usize| {
+            let r = row(*k, i);
+            r.growth != [0.0; 3] || (!uniform && r.spin != [0.0; 3])
+        };
+        if alive.iter().any(grows) {
+            stretched = true;
+            *stays = alive;
+            continue;
+        }
+        for k in alive {
+            let b = bake(row(k, i));
+            if rigid(DMat3::from_mat4(b)) {
+                stays.push(k);
+                continue;
+            }
+            let key = b.to_cols_array().map(|x| (x + 0.0).to_bits());
+            let s = *set_of.entry(key).or_insert_with(|| {
+                sets.push((b, Vec::new()));
+                sets.len() - 1
+            });
+            let records = &mut sets[s].1;
+            match records.iter_mut().find(|r| r.0 == i) {
+                Some(r) => r.1.push(k),
+                None => records.push((i, vec![k])),
+            }
+        }
+    }
+
+    let kept: Vec<usize> = (0..n).filter(|&i| !staying[i].is_empty()).collect();
+    let direct = (!kept.is_empty()).then(|| {
+        let mut rows = vec![MotionRow::default(); intervals * kept.len()];
+        for (slot, &i) in kept.iter().enumerate() {
+            for &k in &staying[i] {
+                rows[k * kept.len() + slot] = *row(k, i);
+            }
+        }
+        let table = InstanceMotion {
+            rows,
+            anchors: kept.iter().map(|&i| m.anchors[i]).collect(),
+            times: m.times.clone(),
+            left: m.left,
+            right: m.right,
+            start: m.start,
+        };
+        let records = kept.iter().map(|&i| placed[i]).collect();
+        (records, Arc::new(table))
+    });
+
+    // What the rows keep once `B` holds the stretch: the rest of `left` goes to them.
+    let left = match uniform {
+        true => DMat4::from_cols(
+            m.left.x_axis / c,
+            m.left.y_axis / c,
+            m.left.z_axis / c,
+            m.left.w_axis,
+        ),
+        false => DMat4::from_translation(m.left.w_axis.truncate()),
+    };
+    let through = |v: DVec3| if uniform { v * c } else { lin * v };
+    let moved = |v: [f32; 3]| through(vector(v)).as_vec3().to_array();
+    let rigid_row = |r: &MotionRow| MotionRow {
+        position: moved(r.position),
+        velocity: moved(r.velocity),
+        acceleration: moved(r.acceleration),
+        rotation: if uniform {
+            r.rotation
+        } else {
+            [0.0, 0.0, 0.0, 1.0]
+        },
+        spin: r.spin,
+        scale: [1.0; 3],
+        growth: [0.0; 3],
+    };
+    let baked = sets.into_iter().map(|(b, records)| {
+        let mut rows = vec![MotionRow::default(); intervals * records.len()];
+        let mut anchors = Vec::with_capacity(records.len());
+        let mut at = Vec::with_capacity(records.len());
+        for (slot, (i, held)) in records.iter().enumerate() {
+            for &k in held {
+                rows[k * records.len() + slot] = rigid_row(row(k, *i));
+            }
+            let anchor = through(DVec3::from_array(m.anchors[*i]));
+            anchors.push(anchor.to_array());
+            let first = rows[held[0] * records.len() + slot];
+            let stands = left
+                * DMat4::from_rotation_translation(
+                    quat(first.rotation),
+                    anchor + vector(first.position),
+                );
+            at.push(Placed {
+                position: stands.w_axis.truncate(),
+                linear: DMat3::from_mat4(stands).as_mat3(),
+            });
+        }
+        let table = InstanceMotion {
+            rows,
+            anchors,
+            times: m.times.clone(),
+            left,
+            right: DMat4::IDENTITY,
+            start: m.start,
+        };
+        (b, at, Arc::new(table))
+    });
+    KeptLengths {
+        baked: baked.collect(),
+        direct,
+        stretched,
+    }
 }
 
 /// The copies `transforms` place: those an instance can hold, then the rest by linear

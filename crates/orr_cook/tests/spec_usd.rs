@@ -5148,3 +5148,142 @@ fn a_bad_sample_loses_its_instances_there_and_nothing_else() {
     assert_eq!(origins(&held, "u/Proto"), [[1000, 0, 0]]);
     assert!(warnings.iter().any(|w| w.contains("not finite")));
 }
+
+/// As `a_baked_height_holds_under_a_placement_scale`, for copies that move: a scale that stands
+/// still between samples cooks into a mesh and the rows move it rigidly, so the height keeps its
+/// world length. A scale that grows has no mesh to go into, and says so.
+#[test]
+fn a_baked_height_holds_under_a_moving_copy() {
+    let d = dir("displaced-moving-copies");
+    let surface = previewed("float inputs:displacement = 0.25", "", "");
+    let material = &surface[surface.find("def Material").unwrap()..];
+    let stage = |attributes: &str| {
+        format!(
+            r#"def PointInstancer "I"
+{{
+    rel prototypes = [</I/Protos/P>]
+    {attributes}
+    def Scope "Protos"
+    {{
+        def Mesh "P"
+        {{
+            {TRIANGLE}
+            rel material:binding = </M>
+        }}
+    }}
+}}
+
+{material}"#
+        )
+    };
+    let height = |a: &Archive, name: &str| {
+        corners(a, name)
+            .iter()
+            .map(|c| c.0.z)
+            .fold(f32::MIN, f32::max)
+    };
+    let a = cook_at(
+        &d,
+        &stage(
+            r#"int[] protoIndices = [0, 0]
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0), (5, 0, 0)], 10: [(0, 2, 0), (5, 2, 0)] }
+    quath[] orientations.timeSamples = { 0: [(1, 0, 0, 0), (1, 0, 0, 0)], 10: [(0.70710678, 0, 0, 0.70710678), (1, 0, 0, 0)] }
+    float3[] scales = [(1, 1, 1), (2, 2, 2)]"#,
+        ),
+        baking(),
+    )
+    .unwrap();
+    assert!((height(&a, "u/P/mesh") - 0.25).abs() < 1e-3);
+    assert!((height(&a, "u/P/baked/0/mesh") - 0.25).abs() < 1e-3);
+    let plain = transforms_at(&a, "u/P", 0.5);
+    let scaled = transforms_at(&a, "u/P/baked/0", 0.5);
+    assert_eq!((plain.len(), scaled.len()), (1, 1));
+    let at = scaled[0].transform_point3(Vec3::ZERO);
+    assert!(at.abs_diff_eq(Vec3::new(5.0, 1.0, 0.0), 1e-3), "{at}");
+    let det = scaled[0].determinant();
+    assert!((det - 1.0).abs() < 1e-3, "the rows stretch by {det}");
+    // The stretch is in the mesh: a corner stands twice as far out.
+    let far = corners(&a, "u/P/baked/0/mesh")
+        .iter()
+        .map(|c| c.0.x)
+        .fold(f32::MIN, f32::max);
+    assert!((far - 2.0).abs() < 1e-3, "{far}");
+
+    // A scale that steps at a sample stands in one mesh, then another.
+    let stepped = cook_at(
+        &d,
+        &stage(
+            r#"int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0)], 10: [(0, 2, 0)], 20: [(0, 4, 0)] }
+    vector3f[] velocities.timeSamples = { 0: [(0, 2, 0)], 10: [(0, 2, 0)], 20: [(0, 2, 0)] }
+    float3[] scales.timeSamples = { 0: [(2, 2, 2)], 10: [(3, 3, 3)] }"#,
+        ),
+        baking(),
+    )
+    .unwrap();
+    assert_eq!(transforms_at(&stepped, "u/P/baked/0", 0.5).len(), 1);
+    assert_eq!(transforms_at(&stepped, "u/P/baked/1", 0.5).len(), 0);
+    assert_eq!(transforms_at(&stepped, "u/P/baked/0", 1.5).len(), 0);
+    assert_eq!(transforms_at(&stepped, "u/P/baked/1", 1.5).len(), 1);
+    assert!((height(&stepped, "u/P/baked/1/mesh") - 0.25).abs() < 1e-3);
+
+    // A stretch above the instancer doesn't commute with a turn, so what holds it holds the turn
+    // too, and the rows only carry the copy.
+    let instancer = stage(
+        r#"int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 0: [(1, 0, 0)], 10: [(1, 2, 0)] }"#,
+    )
+    .replace("</I/Protos/P>", "</W/I/Protos/P>");
+    let (instancer, material) = instancer.split_at(instancer.find("def Material").unwrap());
+    let under = format!(
+        r#"def Xform "W"
+{{
+    double3 xformOp:scale = (2, 1, 1)
+    uniform token[] xformOpOrder = ["xformOp:scale"]
+    {instancer}
+}}
+
+{material}"#
+    );
+    let stretched = cook_at(&d, &under, baking()).unwrap();
+    assert!((height(&stretched, "u/P/baked/0/mesh") - 0.25).abs() < 1e-3);
+    let at = transforms_at(&stretched, "u/P/baked/0", 0.5);
+    let origin = at[0].transform_point3(Vec3::ZERO);
+    assert!(
+        origin.abs_diff_eq(Vec3::new(2.0, 1.0, 0.0), 1e-3),
+        "{origin}"
+    );
+    assert!((at[0].determinant() - 1.0).abs() < 1e-3);
+
+    let path = d.join("stage.usda");
+    let grows = stage(
+        r#"int[] protoIndices = [0]
+    point3f[] positions = [(0, 0, 0)]
+    float3[] scales.timeSamples = { 0: [(1, 1, 1)], 10: [(2, 2, 2)] }"#,
+    );
+    std::fs::write(&path, format!("{HEAD}\n{grows}")).unwrap();
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            vec![AssetSpec {
+                name: "u".into(),
+                source: Source::Usd {
+                    path,
+                    settings: baking(),
+                },
+            }],
+        )],
+    };
+    let mut cooked = orr_cook::cook(&manifest, &Default::default()).unwrap();
+    let warnings: Vec<&String> = cooked
+        .report
+        .assets
+        .iter()
+        .flat_map(|a| &a.warnings)
+        .collect();
+    let told = |w: &&String| w.contains("/I") && w.contains("stretches");
+    assert!(warnings.iter().any(told), "{warnings:?}");
+    let a = Archive::from_memory(cooked.memory.remove(0)).unwrap();
+    assert_eq!(transforms_at(&a, "u/P", 0.5).len(), 1);
+    assert!(!has(&a, "u/P/baked/0/mesh"));
+}

@@ -78,7 +78,11 @@
 //!   collapses an axis is not a placement: the prototype is cooked once per such linear
 //!   transform with it applied, as model `<model>/baked/<k>`, placed by translation alone. A
 //!   displacement is a world length, so one that bakes into a mesh makes any transform that
-//!   changes lengths no placement of it either.
+//!   changes lengths no placement of it either. Moving copies of such a mesh follow the same
+//!   rule while what stretches them stands still between samples ([`crate::import::kept_lengths`]):
+//!   each stretch cooks its own `<model>/baked/<k>`, and the rows move that rigidly. One that
+//!   changes between samples has no mesh to go into, as only run-time displacement keeps a length
+//!   through it: those copies stay on the model, with a warning, and the height stretches.
 //! - Without [`UsdSettings::models`], the rest of the stage is one model, in scene space.
 //!   With it, each prim whose name contains a pattern (and has no selected ancestor) is a
 //!   model holding its subtree, framed by the prim; meshes outside every model are not
@@ -117,7 +121,7 @@ use serde::Deserialize;
 use crate::import::SceneSubd;
 use crate::import::{
     NodeSelect, Placed, PlacedModel, Scene, SceneMaterial, SceneModel, SceneSkeleton, collapses,
-    placements,
+    kept_lengths, placements,
 };
 use crate::instances::InstanceMotion;
 use crate::mesh::{MeshData, MeshSettings, MeshSource, PartData, Pivots, SectionData, Skin};
@@ -477,6 +481,25 @@ struct Placer<'a> {
 /// The joint of a rig: the model that holds the rig, and the joint.
 type RigJoint = (usize, u16);
 
+/// Gives model `m` its `k`th baked model, which holds its meshes with `linear` applied.
+fn bake_model(
+    models: &mut Vec<Building>,
+    holders: &mut [Vec<(usize, DMat4)>],
+    m: usize,
+    k: usize,
+    linear: DMat4,
+) {
+    holders[m].push((models.len(), linear));
+    let name = models[m].name.clone().unwrap_or_default();
+    let (prototype, skel_root) = (models[m].prototype, models[m].root);
+    let first_copy = models[m].first_copy;
+    models.push(Building::new(Some(format!("{name}/baked/{k}")), None, None));
+    let baked = models.last_mut().expect("pushed");
+    baked.prototype = prototype;
+    baked.root = skel_root;
+    baked.first_copy = first_copy;
+}
+
 /// Placements of a model, and the joint they hang from.
 type FramedCopies = (Option<RigJoint>, Vec<Placed>, Option<Arc<InstanceMotion>>);
 
@@ -510,7 +533,7 @@ struct Instancing {
     /// What placing them warned of.
     warnings: Vec<String>,
     /// Animated copies per model.
-    animated: Vec<(usize, FramedCopies)>,
+    animated: Vec<(usize, usize, FramedCopies)>,
     /// Meshes the prototypes draw, with their models.
     meshes: Vec<(usize, usize)>,
     /// How the skinned ones among them bind a skeleton.
@@ -903,19 +926,40 @@ impl<'s> Importer<'s> {
             for (linear, copies) in baked {
                 let k = baked_of.entry(m).or_default();
                 placed.insert(models.len(), vec![(frame, copies, None)]);
-                holders[m].push((models.len(), linear));
-                let (prototype, skel_root) = (models[m].prototype, models[m].root);
-                let first_copy = models[m].first_copy;
-                models.push(Building::new(Some(format!("{name}/baked/{k}")), None, None));
-                let baked = models.last_mut().expect("pushed");
-                baked.prototype = prototype;
-                baked.root = skel_root;
-                baked.first_copy = first_copy;
+                bake_model(&mut models, &mut holders, m, *k, linear);
                 *k += 1;
             }
         }
-        for (m, list) in instancing.animated {
+        for (m, ins, list) in instancing.animated {
+            let (frame, copies, Some(motion)) = list else {
+                continue;
+            };
+            if !baking.contains(&m) {
+                let list = (frame, copies, Some(motion));
+                placed.entry(m).or_default().push(list);
+                continue;
+            }
+            let kept = kept_lengths(&copies, &motion);
+            if kept.stretched {
+                let name = models[m].name.clone().unwrap_or_default();
+                let r = self.reader(&self.nodes[ins].prim);
+                self.warnings.push(format!(
+                    "{}: a copy's scale changes over time, so the height baked into {name} \
+                     stretches with it, not a world length",
+                    r.path()
+                ));
+            }
+            let list = match kept.direct {
+                Some((copies, motion)) => (frame, copies, Some(motion)),
+                None => (frame, Vec::new(), None),
+            };
             placed.entry(m).or_default().push(list);
+            for (linear, copies, motion) in kept.baked {
+                let k = baked_of.entry(m).or_default();
+                placed.insert(models.len(), vec![(frame, copies, Some(motion))]);
+                bake_model(&mut models, &mut holders, m, *k, linear);
+                *k += 1;
+            }
         }
         // Models that bake them hold all of a prototype's copies.
         for (&m, lists) in &placed {
@@ -2073,7 +2117,7 @@ impl<'s> Importer<'s> {
             for &m in std::iter::once(&p.model).chain(&p.also) {
                 models[m].first_copy.get_or_insert((ins, rest[0]));
                 let copies = (frame, placed.clone(), Some(Arc::clone(&table)));
-                instancing.animated.push((m, copies));
+                instancing.animated.push((m, ins, copies));
             }
         }
         Ok(())
