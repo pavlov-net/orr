@@ -271,15 +271,10 @@ struct Context<'a> {
     rigid: bool,
 }
 
-/// The accessors of `prim`'s morph targets.
-fn morph_accessors<'a>(prim: &gltf::Primitive<'a>) -> impl Iterator<Item = gltf::Accessor<'a>> {
-    prim.morph_targets()
-        .flat_map(|t| [t.positions(), t.normals(), t.tangents()])
-        .flatten()
-}
-
 /// How one primitive lands in a model.
 struct Placing<'a> {
+    /// Its glTF mesh.
+    mesh: usize,
     /// Model space from the primitive's.
     world: DMat4,
     /// Of its morph targets.
@@ -320,28 +315,26 @@ fn append_primitive(
         }
         src.floats(a, k)
     };
-    // An attribute as rows of `k` floats, `None` when the primitive lacks it; positions,
-    // normals and tangents with the weighted morph target deltas added.
+    // An attribute as rows of `k` floats with the weighted morph target deltas added, `None` when
+    // the primitive lacks it. L1991: a tangent's deltas leave its w. L1926 gives joints and their
+    // weights no deltas.
     let rows = |s: Semantic, k: usize| -> Result<Option<Vec<f32>>, String> {
         let Some(a) = prim.get(&s) else {
             return Ok(None);
         };
         let mut out = counted(&a, k)?;
-        for (t, &w) in prim
-            .morph_targets()
-            .zip(weights)
-            .filter(|&(_, &w)| w != 0.0)
-        {
-            let delta = match s {
-                Semantic::Positions => t.positions(),
-                Semantic::Normals => t.normals(),
-                Semantic::Tangents => t.tangents(),
-                _ => None,
+        if matches!(s, Semantic::Joints(_) | Semantic::Weights(_)) {
+            return Ok(Some(out));
+        }
+        let width = if s == Semantic::Tangents { 3 } else { k };
+        let name = s.to_string();
+        for (t, &w) in weights.iter().enumerate().filter(|&(_, &w)| w != 0.0) {
+            let Some(d) = src.doc.morph_deltas(at.mesh, prim.index(), t, &name) else {
+                continue;
             };
-            let Some(d) = delta else { continue };
-            let d = counted(&d, 3)?;
-            let xyz = out.chunks_exact_mut(k).flat_map(|r| &mut r[..3]);
-            for (x, d) in xyz.zip(&d) {
+            let d = counted(&d, width)?;
+            let components = out.chunks_exact_mut(k).flat_map(|r| &mut r[..width]);
+            for (x, d) in components.zip(&d) {
                 *x += w * d;
             }
         }
@@ -371,15 +364,21 @@ fn append_primitive(
         v.map_or_else(|| vec![[0.0; 2]; n], |v| v.as_chunks::<2>().0.to_vec())
     };
     let (uvs, uvs1) = (zeros(uvs), zeros(uvs1));
-    // L1707 keeps them in 0..1, and a primitive without any multiplies by nothing.
-    let colors: Vec<[f32; 4]> = match prim.get(&Semantic::Colors(0)) {
-        Some(a) => {
-            let mut rows = counted(&a, 4)?;
-            if a.dimensions() == gltf::accessor::Dimensions::Vec3 {
-                rows.chunks_exact_mut(4).for_each(|r| r[3] = 1.0);
+    // L1707 keeps them in 0..1, L2008 keeps them there once morphed, and a primitive without any
+    // multiplies by nothing.
+    let colors: Vec<[f32; 4]> = match rows(Semantic::Colors(0), 4)? {
+        Some(mut colors) => {
+            let opaque = prim
+                .get(&Semantic::Colors(0))
+                .is_some_and(|a| a.dimensions() == gltf::accessor::Dimensions::Vec3);
+            if opaque {
+                colors.chunks_exact_mut(4).for_each(|r| r[3] += 1.0);
+            }
+            if weights.iter().any(|&w| w != 0.0) {
+                colors.iter_mut().for_each(|c| *c = c.clamp(0.0, 1.0));
             }
             b.colors = true;
-            rows.as_chunks::<4>().0.to_vec()
+            colors.as_chunks::<4>().0.to_vec()
         }
         None => vec![[1.0; 4]; n],
     };
@@ -884,7 +883,7 @@ impl Imported<'_> {
             self.material(mesh, &prim)?;
             tangent_sets.push(self.tangent_set(&prim));
             primitive_views(&prim, &mut views);
-            for a in morph_accessors(&prim) {
+            for a in src.morph_accessors(mesh, prim.index()) {
                 Document::accessor_views(&a, &mut views);
             }
             let positions = prim.get(&Semantic::Positions).expect("a surface");
@@ -933,7 +932,7 @@ impl Imported<'_> {
             let attributes = prim.attributes().map(|a| a.1);
             for a in attributes
                 .chain(prim.indices())
-                .chain(morph_accessors(&prim))
+                .chain(src.morph_accessors(mesh, prim.index()))
             {
                 json(&src.json["accessors"][a.index()]);
             }
@@ -972,6 +971,7 @@ impl Imported<'_> {
             let gm = src.doc.meshes().nth(mesh).expect("mesh index");
             for (prim, &tangent_set) in surfaces(&gm).zip(&tangent_sets) {
                 let at = Placing {
+                    mesh,
                     world: linear,
                     weights: &weights,
                     binding: None,
@@ -1198,7 +1198,7 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
         if let Some(mesh) = doc.nodes().nth(n).and_then(|d| d.mesh()) {
             for p in surfaces(&mesh) {
                 primitive_views(&p, &mut views);
-                for a in morph_accessors(&p) {
+                for a in src.morph_accessors(mesh.index(), p.index()) {
                     Document::accessor_views(&a, &mut views);
                 }
             }
@@ -1304,6 +1304,7 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
         let weights = node.weights().or(mesh.weights()).unwrap_or_default();
         for prim in surfaces(&mesh) {
             let at = Placing {
+                mesh: mesh.index(),
                 world,
                 weights,
                 binding: binding.as_ref(),

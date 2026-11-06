@@ -12,6 +12,8 @@
 //! replaces its core `source`, so a texture may carry only the extension's source. An asset
 //! whose `minVersion` is not glTF 2.0 or 2.1, or without one whose `version` has a major other
 //! than 2, is refused, as is a document whose `weights` arrays do not match its morph targets.
+//! A morph target reads from the JSON, as it may name any attribute and the `gltf` crate models
+//! three.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -83,6 +85,19 @@ fn check_version(asset: &Value) -> Result<(), String> {
             "asset version {} is not a glTF 2 version",
             asset["version"]
         ));
+    }
+    Ok(())
+}
+
+/// Each morph target of the document holds accessors of it.
+fn check_morph_targets(json: &Value, accessors: usize) -> Result<(), String> {
+    let primitives = json["meshes"].as_array().into_iter().flatten();
+    let primitives = primitives.flat_map(|m| m["primitives"].as_array().into_iter().flatten());
+    let targets = primitives.flat_map(|p| p["targets"].as_array().into_iter().flatten());
+    for (name, accessor) in targets.flat_map(|t| t.as_object().into_iter().flatten()) {
+        if accessor.as_u64().is_none_or(|a| a >= accessors as u64) {
+            return Err(format!("morph target {name}: no accessor {accessor}"));
+        }
     }
     Ok(())
 }
@@ -182,6 +197,7 @@ pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
     validate(&root)?;
     let doc = gltf::Document::from_json_without_validation(root);
     check_morph_weights(&doc)?;
+    check_morph_targets(&json, doc.accessors().len())?;
     let mut buffers = Vec::new();
     for b in doc.buffers() {
         let j = &json["buffers"][b.index()];
@@ -260,6 +276,35 @@ fn field(v: &Value, k: &str) -> usize {
 }
 
 impl Document {
+    /// The morph targets of primitive `prim` of mesh `mesh`.
+    fn morph_targets(&self, mesh: usize, prim: usize) -> &[Value] {
+        let targets = self.json["meshes"][mesh]["primitives"][prim]["targets"].as_array();
+        targets.map_or(&[], Vec::as_slice)
+    }
+
+    fn accessor(&self, json: &Value) -> Option<gltf::Accessor<'_>> {
+        self.doc.accessors().nth(json.as_u64()? as usize)
+    }
+
+    /// The deltas morph target `target` of primitive `prim` of mesh `mesh` holds for attribute
+    /// `semantic`.
+    pub(super) fn morph_deltas(
+        &self,
+        mesh: usize,
+        prim: usize,
+        target: usize,
+        semantic: &str,
+    ) -> Option<gltf::Accessor<'_>> {
+        self.accessor(self.morph_targets(mesh, prim).get(target)?.get(semantic)?)
+    }
+
+    /// The accessors of the morph targets of primitive `prim` of mesh `mesh`.
+    pub(super) fn morph_accessors(&self, mesh: usize, prim: usize) -> Vec<gltf::Accessor<'_>> {
+        let targets = self.morph_targets(mesh, prim).iter();
+        let attributes = targets.flat_map(|t| t.as_object().into_iter().flatten());
+        attributes.filter_map(|(_, a)| self.accessor(a)).collect()
+    }
+
     /// Every buffer view lies inside its buffer, and every accessor's stride holds its
     /// element and its last element ends inside its view.
     fn check_views(&self) -> Result<(), String> {

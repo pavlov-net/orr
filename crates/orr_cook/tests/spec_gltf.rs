@@ -1154,6 +1154,63 @@ fn color_0_multiplies_the_base_color() {
     assert!(corners.iter().any(|c| c.1 == [1.0; 4]), "no white corner");
 }
 
+/// L1844 a target maps any attribute to its deltas, L1951 `TEXCOORD_n` and `COLOR_n` among them,
+/// and L2008 "clamp all `COLOR_0` attribute components to the [0, 1] range after applying morph
+/// deltas". A `VEC3` color's deltas leave its implied alpha.
+#[test]
+fn morph_targets_move_colors_and_texture_coordinates() {
+    let path = dir("morph-color").join("morph.glb");
+    let mut g = Glb::default();
+    let pa = g.floats(&QUAD, "VEC3");
+    let colors = [[0.5, 0.25, 0.0]; 4];
+    let ca = g.floats(&colors, "VEC3");
+    let deltas = [[0.25, -0.5, 0.5]; 4];
+    let da = g.floats(&deltas, "VEC3");
+    let uvs = [[0.0, 0.0]; 4];
+    let ua = g.floats(&uvs, "VEC2");
+    let moves = [[0.5, 0.25]; 4];
+    let ma = g.floats(&moves, "VEC2");
+    let ia = g.indices(&QUAD_INDICES);
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"weights":[1.0,0.5],"primitives":[{{"attributes":{{"POSITION":{pa},"COLOR_0":{ca},"TEXCOORD_0":{ua}}},
+"indices":{ia},"material":0,"targets":[{{"COLOR_0":{da}}},{{"TEXCOORD_0":{ma}}}]}}]}}],
+"materials":[{{}}]"#
+        ),
+    );
+    let a = cooked(&path).0;
+    let corners = per_triangle(&a, "g/mesh", |view, c, t| {
+        t.map(|v| (view.color(c, v), view.uv(c, v, 0)))
+    });
+    for (color, uv) in corners.into_iter().flatten() {
+        assert_eq!(color, [0.75, 0.0, 0.5, 1.0], "the sum, clamped");
+        assert_eq!(uv, [0.25, 0.125]);
+    }
+}
+
+/// L1926 lists what morph targets move and joints are not among it: moved, this skin's vertices
+/// would follow a joint past it, with weights summing to 2.
+#[test]
+fn morph_targets_leave_joints_and_weights() {
+    let path = dir("morph-skin").join("skin.glb");
+    let mut g = Glb::default();
+    let (pa, ja, wa) = skinned_triangle(&mut g);
+    let deltas = g.floats(&[[5.0f32, 0.0, 0.0, 0.0]; 3], "VEC4");
+    let more = g.floats(&[[1.0f32, 0.0, 0.0, 0.0]; 3], "VEC4");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1]}}],
+"nodes":[{{"name":"hip"}},{{"mesh":0,"skin":0}}],"skins":[{{"joints":[0]}}],
+"meshes":[{{"weights":[1.0],"primitives":[{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}},
+"targets":[{{"JOINTS_0":{deltas},"WEIGHTS_0":{more}}}]}}]}}]"#
+        ),
+    );
+    cooked(&path);
+}
+
 /// KHR_materials_iridescence: "`iridescenceFactor` is multiplied with the red channel of
 /// `iridescenceTexture` to control the overall strength".
 #[test]
