@@ -468,6 +468,59 @@ fn sheared_placements_take_table_rows_and_the_rest_stay_compact() {
     }
 }
 
+/// A scale far from the rest takes a table row, so that it costs the rest no precision: a range
+/// of 80 octaves would leave every compact scale 2.7% out.
+#[test]
+fn an_outlying_scale_leaves_the_range_to_the_rest() {
+    let turned = Quat::from_rotation_y(0.7);
+    let scaled = |x: usize, scale: [f32; 3]| Placement {
+        position: [1.0 + x as f64, 1.0, 2.0],
+        linear: Linear::Scaled {
+            rotation: turned.to_array(),
+            scale,
+        },
+        prototype: 0,
+    };
+    let scales = [
+        [1.0, 1.1, 1.3],
+        [1e-12, 1e-12, 1e-12],
+        [0.7, 0.7, 0.9],
+        [1.0, 1000.0, 1.0],
+        [1.7, 1.2, 1.0],
+        [1e12, 1e12, 1e12],
+    ];
+    let records: Vec<Placement> = scales
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| scaled(i, s))
+        .collect();
+    let a = cook_instances(Instances {
+        records,
+        prototypes: vec![proto(0)],
+        ..Default::default()
+    })
+    .unwrap();
+    let e = pages(&a)[0];
+    let (head, blob) = (read(&a, e, 0), read(&a, e, 1));
+    let h = InstancePageInfo::parse(&head).unwrap().header;
+    assert!(h.log2_scale_max - h.log2_scale_min <= 6.0, "{h:?}");
+    let (records, table) = instance::records(&h, &blob).unwrap();
+    assert_eq!(table.len(), 3);
+    let (_, decoded) = instance::decode(&head, &blob).unwrap();
+    for (r, m) in records.iter().zip(decoded.map(|d| d.1)) {
+        let i = m.translation.x.round() as usize - 1;
+        for (axis, want) in scales[i].into_iter().enumerate() {
+            let error = m.matrix3.col(axis).length() / want - 1.0;
+            let bound = if r.linear_row().is_some() {
+                1e-6
+            } else {
+                0.002
+            };
+            assert!(error.abs() <= bound, "copy {i} axis {axis}: {error}");
+        }
+    }
+}
+
 /// One rule decides what may be an instance, whatever form the transform arrives in: it inverts
 /// in f32. Scale on either side does not stop that; a determinant lost to rounding does.
 #[test]

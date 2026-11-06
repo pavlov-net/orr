@@ -13,8 +13,9 @@
 //! translation `origin + pos * (extent / 65535)`, and a linear part. A compact record holds a
 //! rotation in `rot` and per-axis scale `2^(lerp(log2_scale_min, log2_scale_max, code / 1023))`
 //! applied before it, its x negated on a mirrored record ([`InstanceRecord::MIRROR`]). A
-//! transform no rotation and scale hold, a sheared one, is a row of the table instead, stored
-//! exactly and shared by every record with the same linear part.
+//! transform no rotation and scale hold, a sheared one or one scaled far from the page's other
+//! records, is a row of the table instead, stored exactly and shared by every record with the same
+//! linear part.
 //! [`decode`] is the reference both for the GPU decode and for consumers' CPU queries.
 
 use bytemuck::{Pod, Zeroable};

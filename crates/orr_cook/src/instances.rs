@@ -78,6 +78,11 @@ impl Placement {
 /// direction to within this, which is below the record's own rotation error.
 const SHEAR_MAX: f64 = 1e-3;
 
+/// The widest log2 scale range of a page's compact records, a factor of 64: half a 10-bit code
+/// of it is 0.2% of a scale. One scale past it would coarsen every other record on the page, so
+/// it takes a table row.
+const SCALE_RANGE: f32 = 6.0;
+
 /// How a record holds the linear transform of a placement.
 enum Form {
     /// `R diag(s)`: a rotation and per-axis scale, the x scale negative on a mirrored copy.
@@ -456,7 +461,7 @@ fn build_page(
         record_count: members.len() as u16,
         partitions: Span::default(),
     };
-    let forms: Vec<Form> = members
+    let mut forms: Vec<Form> = members
         .iter()
         .map(|&i| Form::of(src.records[i].linear()))
         .collect();
@@ -468,6 +473,7 @@ fn build_page(
             .unwrap_or(0);
         joined_positions(name, &mut header, f64::from(k).exp2(), rel, members)?
     } else {
+        keep_scale_range(&mut forms, |n| src.records[members[n]].linear());
         set_scale_range(
             &mut header,
             forms.iter().filter_map(|f| match f {
@@ -635,6 +641,42 @@ fn nearest_code(guess: f64, max: u32, err: impl Fn(u32) -> f64) -> u32 {
     (g.saturating_sub(1)..=(g + 1).min(max))
         .min_by(|&a, &b| err(a).total_cmp(&err(b)))
         .unwrap_or(g)
+}
+
+/// Gives a table row to every compact form outside the [`SCALE_RANGE`] that holds the most of
+/// them, the first such range from the smallest scales up. `linear` is form `n`'s transform.
+fn keep_scale_range(forms: &mut [Form], linear: impl Fn(usize) -> DMat3) {
+    // Where a range may start and still hold each form's three scales.
+    let starts: Vec<Option<(f32, f32)>> = forms
+        .iter()
+        .map(|f| match f {
+            Form::Compact(_, s) => {
+                let l = s.abs().to_array().map(f32::log2);
+                let (lo, hi) = (l[0].min(l[1]).min(l[2]), l[0].max(l[1]).max(l[2]));
+                Some((hi - SCALE_RANGE, lo)).filter(|(first, last)| first <= last)
+            }
+            Form::Table(_) => None,
+        })
+        .collect();
+    let mut edges: Vec<(f32, i32)> = starts
+        .iter()
+        .flatten()
+        .flat_map(|&(first, last)| [(first, 0), (last, 1)])
+        .collect();
+    edges.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let (mut open, mut most, mut start) = (0, 0, f32::NAN);
+    for (at, closes) in edges {
+        open += 1 - 2 * closes;
+        if open > most {
+            (most, start) = (open, at);
+        }
+    }
+    for (n, f) in forms.iter_mut().enumerate() {
+        let held = starts[n].is_some_and(|(first, last)| first <= start && start <= last);
+        if matches!(f, Form::Compact(..)) && !held {
+            *f = Form::Table(linear(n).as_mat3().into());
+        }
+    }
 }
 
 fn set_scale_range(h: &mut InstancePageHeader, scales: impl Iterator<Item = Vec3>) {
