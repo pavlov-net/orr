@@ -1413,6 +1413,26 @@ fn preview_inputs_read_textures_with_slots_of_their_own() {
     assert!(bound(slot::COAT_ROUGHNESS));
     assert!(bound(slot::SPECULAR_IOR) && bound(slot::COAT_IOR));
     assert_eq!(m.model, Material::MODEL_PREVIEW_SPECULAR);
+
+    // PS `ior`: "including the clearcoat if clearcoat > 0", as it varies over the mesh too.
+    let reader = r#"def Shader "I"
+    {
+        uniform token info:id = "UsdPrimvarReader_float"
+        string inputs:varname = "eta"
+        float outputs:result
+    }"#;
+    let inputs = "float inputs:ior.connect = </M/I.outputs:result>
+        float inputs:clearcoat = 1";
+    let mesh = r#"float[] primvars:eta = [1.25, 1.5, 2] (
+        interpolation = "vertex"
+    )"#;
+    let m = material(&cook(
+        "preview-varying-ior",
+        &previewed(inputs, reader, mesh),
+    ));
+    assert_eq!((m.specular_ior, m.coat_ior), (1.0, 1.0));
+    assert_eq!(m.textures[slot::SPECULAR_IOR].vertex, 1);
+    assert_eq!(m.textures[slot::COAT_IOR].vertex, 1);
 }
 
 /// PS `opacityMode`: under the default *transparent* "opacity reduces the contribution of the

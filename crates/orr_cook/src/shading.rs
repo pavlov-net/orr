@@ -1691,7 +1691,7 @@ impl Mapper<'_, '_> {
                 |m| &mut m.coat_roughness,
                 Some(more::<{ slot::COAT_ROUGHNESS }>),
             )?;
-            // "including the clearcoat if clearcoat > 0": a texture of `ior` holds for both.
+            // "including the clearcoat if clearcoat > 0": what `ior` reads holds for both.
             self.material.coat_ior = ior;
             let shared = self
                 .textures
@@ -1700,6 +1700,8 @@ impl Mapper<'_, '_> {
                 .copied()
                 .flatten();
             self.textures.more.insert(slot::COAT_IOR, shared);
+            self.material.textures[slot::COAT_IOR].vertex =
+                self.material.textures[slot::SPECULAR_IOR].vertex;
             self.material.coat_color = [1.0; 3];
         }
         self.preview_opacity(n)?;
