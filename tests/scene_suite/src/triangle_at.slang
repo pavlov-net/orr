@@ -6,7 +6,7 @@ import orr_scene.hit;
 struct Root
 {
     SceneRoot* scene;
-    float4* out;              // the vertex color, the geometric and vertex normals, the side's material, the tangents of the base and the coat
+    float4* out;              // the vertex color, the geometric and vertex normals, the side's material and whether it bounds an interior, the tangents of the base and the coat
     float4 view;              // the ray's direction, then the section's material
     float4 color0;
     float4 color1;
@@ -41,7 +41,8 @@ void main()
     root.out[0] = i.vertex_color;
     root.out[1] = float4(i.geometric_normal, 0.0);
     root.out[2] = float4(i.normal, 0.0);
-    root.out[3] = float4(float(side_material(root.scene, material, i)), 0.0, 0.0, 0.0);
+    uint side = side_material(root.scene, material, i);
+    root.out[3] = float4(float(side), crosses_interior(root.scene, side) ? 1.0 : 0.0, 0.0, 0.0);
     root.out[4] = i.tangent;
     root.out[5] = i.coat_tangent;
 }

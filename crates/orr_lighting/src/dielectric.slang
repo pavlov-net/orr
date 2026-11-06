@@ -491,7 +491,7 @@ public LayerShadow<S, M> vertex_shadow<S : ISurface, M : IMedium>(PathRoot r, La
         uint out = interior.outside(m, m);
         shadow.normal = l.x.surface.geometric_normal;
         shadow.above = out;
-        shadow.below = thin_walled(l.x.surface) ? out : m;
+        shadow.below = crosses_interior(r.scene, l.x.surface.material) ? m : out;
     }
     else
     {
@@ -747,8 +747,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                 spread = delta ? 0.0 : diffuse ? 1.0 : 2.0 * roughness * roughness;
                 // The walk takes the place of an opaque vertex's ray.
                 walking = alive && (bs.lobe & LOBE_VOLUME) != 0;
-                crossed = l.kind == VERTEX_LAYER && (bs.lobe & LOBE_TRANSMISSION) != 0 && !thin_walled(l.x.surface)
-                    && (s.materials[l.x.surface.material].flags & MATERIAL_DIELECTRIC) != 0;
+                crossed = l.kind == VERTEX_LAYER && (bs.lobe & LOBE_TRANSMISSION) != 0 && crosses_interior(s, l.x.surface.material);
             }
             if (alive && !walking && l.kind != VERTEX_LAYER && opaque > r.roulette_depth)
             {
@@ -1132,7 +1131,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
     d = bent;
     if (!open)
         through = float3(0.0);
-    else if (!thin_walled(x.x.surface))
+    else if (crosses_interior(s, x.x.surface.material))
         list.cross(interior_material(s, x.x.surface.material), x.front);
     float length_so_far = 0.0;
     // What the chain's interiors scatter, which shows in their single-scattering color.
@@ -1179,7 +1178,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
             break;
         }
         blur += rough_widening(x, length_so_far);
-        if (!thin_walled(x.x.surface))
+        if (crosses_interior(s, x.x.surface.material))
             list.cross(interior_material(s, x.x.surface.material), x.front);
     }
     float wr = luminance_rec2020(a.specular + a.diffuse + scattered);

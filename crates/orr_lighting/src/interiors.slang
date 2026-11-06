@@ -135,7 +135,7 @@ public bool next_surface<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 or
         return false;
     t = h.t;
     front = dot(n, dir) < 0.0;
-    if ((s.materials[m].flags & (MATERIAL_DIELECTRIC | MATERIAL_THIN_WALLED)) == MATERIAL_DIELECTRIC)
+    if (crosses_interior(s, m))
         material = m;
     return true;
 }

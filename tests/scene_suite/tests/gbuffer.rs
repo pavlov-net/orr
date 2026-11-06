@@ -8972,12 +8972,25 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
     let mut back = front;
     back.flags ^= orr_scene::material_flags::HAS_BACK | orr_scene::material_flags::BACK_SIDE;
     back.back = 0;
-    let glass = |mut m: MaterialGpu| {
+    let glass = |mut m: MaterialGpu, first: u32| {
         m.flags |= orr_scene::material_flags::DIELECTRIC;
-        m.back += 2;
+        m.back += first;
         m
     };
-    let records = [front, back, glass(front), glass(back)];
+    let thin = |mut m: MaterialGpu| {
+        m.flags |= orr_scene::material_flags::THIN_WALLED;
+        m
+    };
+    // The front's walls decide the interior: a thin back on a solid front leaves it, and a solid
+    // back on a thin front has none.
+    let records = [
+        front,
+        back,
+        glass(front, 2),
+        thin(glass(back, 2)),
+        thin(glass(front, 4)),
+        glass(back, 4),
+    ];
     let materials = upload(bytemuck::cast_slice(&records), "materials");
     let scene = upload(
         bytemuck::bytes_of(&SceneRoot {
@@ -9001,7 +9014,10 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         (1e12, 1e-12, 1.0, 0),
         (1.0, 1.0, -1.0, 0),
         (1e-16, 1.0, -1.0, 0),
+        (1.0, 1.0, 1.0, 2),
         (1.0, 1.0, -1.0, 2),
+        (1.0, 1.0, 1.0, 4),
+        (1.0, 1.0, -1.0, 4),
     ] {
         let out = d
             .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, 6, "out")
@@ -9032,6 +9048,7 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         assert!(up(normal), "{size}: {normal:?}");
         let shown = first + u32::from(side < 0.0);
         assert_eq!(material[0], shown as f32, "{size}");
+        assert_eq!(material[1], f32::from(u8::from(first == 2)), "{size}");
     }
     assert_clean();
 }

@@ -408,6 +408,14 @@ public uint interior_material(SceneRoot* s, uint material)
     return material != MATERIAL_NONE && (m.flags & MATERIAL_BACK_SIDE) != 0 ? m.back : material;
 }
 
+// Whether a surface of `material` bounds an interior, which only a solid dielectric has. The
+// material that owns the interior decides, so a thin back on a solid front still leaves it.
+public bool crosses_interior(SceneRoot* s, uint material)
+{
+    uint flags = s.materials[interior_material(s, material)].flags;
+    return (flags & (MATERIAL_DIELECTRIC | MATERIAL_THIN_WALLED)) == MATERIAL_DIELECTRIC;
+}
+
 // The skinned copy `inst` names; false for copies not from `add_skinned`.
 public bool copy_skin(SceneRoot* s, InstanceGpu inst, out SkinnedGpu k)
 {
