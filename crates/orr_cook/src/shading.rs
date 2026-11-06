@@ -33,7 +33,8 @@
 //! `default` where the mesh has no such primvar. One that varies over the mesh takes channels of
 //! the mesh's vertex color stream, four between all that one material reads, and multiplies its
 //! input's texture or stands in for it ([`VertexRead`]); `geomcolor` reads `displayColor`, or
-//! with no mesh to ask the stream as it stands. Any other node fails the import, naming it, as
+//! with no mesh to ask the stream as it stands, and at any `index` but 0 a color no mesh holds,
+//! which is 0. Any other node fails the import, naming it, as
 //! does a connection cycle. A `geompropvalue` on a coordinate whose property no uv set holds reads
 //! its `default` at every point, as an unconnected `place2d` reads 0, 0. Textures go to the
 //! material's slots. An interior medium is one for the whole material, so a textured
@@ -168,7 +169,7 @@ impl Network {
             .nodes
             .iter()
             .filter_map(|n| match n.kind.as_str() {
-                "geomcolor" => Some(DISPLAY_COLOR.to_string()),
+                "geomcolor" => (color_index(n) == 0.0).then(|| DISPLAY_COLOR.to_string()),
                 "geompropvalue" => text_of(n, "geomprop"),
                 k if k.starts_with("UsdPrimvarReader_") => text_of(n, "varname"),
                 _ => None,
@@ -180,8 +181,16 @@ impl Network {
     }
 }
 
-/// The primvar `geomcolor` reads.
+/// The primvar `geomcolor` reads at index 0.
 const DISPLAY_COLOR: &str = "displayColor";
+
+/// The `index` of `geomcolor` node `n`, a uniform input.
+fn color_index(n: &Node) -> f32 {
+    match n.inputs.get("index") {
+        Some(Input::Value(v, _)) => v[0],
+        _ => 0.0,
+    }
+}
 
 fn text_of(n: &Node, input: &str) -> Option<String> {
     match n.inputs.get(input) {
@@ -803,9 +812,25 @@ impl Mapper<'_, '_> {
                 self.primvar_value(n, &name, "default")
             }
             "geomcolor" => {
+                let width = match node.ty.as_str() {
+                    "float" => 1,
+                    "color4" => 4,
+                    _ => 3,
+                };
+                let index = color_index(node);
+                if index != 0.0 {
+                    let message = format!(
+                        "{}: color {index} is past the one a mesh holds; it reads 0",
+                        node.name
+                    );
+                    self.warnings.push(message);
+                    return Ok(Value::Constant(vec![0.0; width], Unit::Unstated));
+                }
                 if self.host.any_mesh {
-                    let width = if node.ty == "color4" { 4 } else { 3 };
-                    return Ok(Value::Vertex { first: 0, width });
+                    return Ok(Value::Vertex {
+                        first: 0,
+                        width: width as u8,
+                    });
                 }
                 self.primvar_value(n, DISPLAY_COLOR, "default")
             }

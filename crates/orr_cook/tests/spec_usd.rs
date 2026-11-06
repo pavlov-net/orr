@@ -1384,6 +1384,33 @@ fn varying_primvars_read_through_the_vertex_stream() {
     assert!(colors.contains(&[0.0, 0.0, 1.0, 0.75]), "{colors:?}");
 }
 
+/// MaterialX `geomcolor`: `index` is the "index of the geometric color", `HwGeomColorNode` reads
+/// each from a stream of its own, and `out` defaults to zero. A mesh holds the one.
+#[test]
+fn geomcolor_past_the_first_reads_zero() {
+    let m = |name: &str, index: u8| {
+        let prims = format!(
+            r#"def Shader "C"
+    {{
+        uniform token info:id = "ND_geomcolor_color3"
+        int inputs:index = {index}
+        color3f outputs:out
+    }}"#
+        );
+        let inputs = "color3f inputs:diffuseColor.connect = </M/C.outputs:out>";
+        let mesh = r#"color3f[] primvars:displayColor = [(1, 0, 0), (0, 1, 0), (0, 0, 1)] (
+        interpolation = "vertex"
+    )"#;
+        material(&cook(name, &previewed(inputs, &prims, mesh)))
+    };
+    let first = m("geomcolor-0", 0);
+    assert_eq!(first.textures[slot::BASE_COLOR].vertex, 1);
+    assert_eq!(first.base_color, [1.0; 3]);
+    let other = m("geomcolor-7", 7);
+    assert_eq!(other.textures[slot::BASE_COLOR].vertex, 0);
+    assert_eq!(other.base_color, [0.0; 3]);
+}
+
 /// PS inputs are connectable: `specularColor`, `ior` (for the clearcoat too) and
 /// `clearcoatRoughness` read textures.
 #[test]

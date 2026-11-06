@@ -732,6 +732,13 @@ fn documents_map_as_the_clauses_say() {
             check: |m| m.textures[slot::BASE_COLOR].vertex == 1 && m.base_color == [1.0; 3],
         },
         Row {
+            clause: "Nodes geomcolor: `index`, a color of its own; `out` defaults to zero",
+            body: r#"<geomcolor name="c" type="color3">
+                  <input name="index" type="integer" value="1"/></geomcolor>"#,
+            inputs: r#"<input name="base_color" type="color3" nodename="c"/>"#,
+            check: |m| m.textures[slot::BASE_COLOR].vertex == 0 && m.base_color == [0.0; 3],
+        },
+        Row {
             clause: "OpenPBR coat_darkening and coat_roughness_anisotropy are read as stated",
             body: "",
             inputs: r#"<input name="coat_darkening" type="float" value="0.25"/>
