@@ -74,6 +74,30 @@ impl Drop for AlignedBuf {
     }
 }
 
+/// Physical memory in bytes; 16 GiB when the system does not say.
+pub fn physical_memory() -> u64 {
+    const FALLBACK: u64 = 16 << 30;
+    #[cfg(windows)]
+    return windows::physical_memory().unwrap_or(FALLBACK);
+    #[cfg(unix)]
+    {
+        // SAFETY: sysconf has no preconditions.
+        let (pages, size) = unsafe {
+            (
+                libc::sysconf(libc::_SC_PHYS_PAGES),
+                libc::sysconf(libc::_SC_PAGESIZE),
+            )
+        };
+        if pages > 0 && size > 0 {
+            pages as u64 * size as u64
+        } else {
+            FALLBACK
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    FALLBACK
+}
+
 /// Opens `path` for reading so that it can be deleted, or replaced by a rename, while open.
 /// The handle keeps reading the file as it was when opened.
 pub fn open_shared(path: &Path) -> io::Result<File> {

@@ -59,7 +59,10 @@ io-uring = "0.7.15"
 libc = "0.2"
 # bindgen's generated dynamic loader calls this version's `Library::new`.
 libloading = "0.8"
-windows = "0.62.2"
+windows-core = { version = "0.100.0", default-features = false, features = ["std"] }
+windows-future = "0.100.0"
+windows-link = "0.100.0"
+windows-result = "0.100.0"
 vulkan-memory-allocator-sys = "0.2.0"
 # Metal
 objc2 = "0.6"

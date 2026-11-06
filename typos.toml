@@ -40,4 +40,4 @@ rasteriser = "rasterizer"
 rasterises = "rasterizes"
 
 [files]
-extend-exclude = ["Cargo.lock", "crates/orr_shaders/src/build/slang_sys.rs"]
+extend-exclude = ["Cargo.lock", "bindings.rs", "crates/orr_io/src/windows/ioring.rs", "crates/orr_shaders/src/build/slang_sys.rs"]

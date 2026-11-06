@@ -1,27 +1,22 @@
 //! A plain Win32 window for swapchain tests. The thread that creates it pumps its messages.
 
+use std::io::Error;
 use std::num::NonZeroIsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
 };
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, HWND_BOTTOM, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
-    RegisterClassW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetWindowPos, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
-};
-use windows::core::w;
+
+mod bindings;
+use bindings::*;
 
 static CLOSED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if msg == WM_CLOSE {
+    if msg == WM_CLOSE as u32 {
         CLOSED.store(true, Ordering::Relaxed);
-        return LRESULT(0);
+        return 0;
     }
     // SAFETY: forwarding the message the system passed in.
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
@@ -37,48 +32,58 @@ pub struct Window {
 impl Window {
     /// Opens a window whose client area is about `width` x `height`.
     pub fn new(title: &str, width: i32, height: i32) -> Window {
-        // SAFETY: plain Win32 calls with valid arguments; the class name is static.
+        let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let class = wide("orr_gpu_suite");
+        let title = wide(title);
+        // SAFETY: plain Win32 calls with valid arguments.
         unsafe {
-            let hinstance = GetModuleHandleW(None).expect("GetModuleHandleW");
-            let class = w!("orr_gpu_suite");
+            let hinstance = GetModuleHandleW(std::ptr::null());
+            assert!(
+                !hinstance.is_null(),
+                "GetModuleHandleW: {}",
+                Error::last_os_error()
+            );
             let wc = WNDCLASSW {
-                style: CS_HREDRAW | CS_VREDRAW,
+                style: (CS_HREDRAW | CS_VREDRAW) as u32,
                 lpfnWndProc: Some(window_proc),
-                hInstance: hinstance.into(),
-                lpszClassName: class,
-                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                hInstance: hinstance,
+                lpszClassName: class.as_ptr(),
+                hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
                 ..Default::default()
             };
             // A second registration fails harmlessly.
             RegisterClassW(&wc);
-            let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
             let hwnd = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                class,
-                windows::core::PCWSTR(title.as_ptr()),
-                WS_OVERLAPPEDWINDOW,
+                0,
+                class.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPEDWINDOW as u32,
                 100,
                 100,
                 width,
                 height,
-                None,
-                None,
-                Some(hinstance.into()),
-                None,
-            )
-            .expect("CreateWindowExW");
-            let _ = SetWindowPos(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                hinstance,
+                std::ptr::null(),
+            );
+            assert!(
+                !hwnd.is_null(),
+                "CreateWindowExW: {}",
+                Error::last_os_error()
+            );
+            SetWindowPos(
                 hwnd,
-                Some(HWND_BOTTOM),
+                HWND_BOTTOM,
                 0,
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                (SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW) as u32,
             );
             let mut w = Window {
                 hwnd,
-                hinstance: hinstance.0 as isize,
+                hinstance: hinstance as isize,
             };
             w.pump();
             w
@@ -86,7 +91,7 @@ impl Window {
     }
 
     pub fn window_handle(&self) -> RawWindowHandle {
-        let mut h = Win32WindowHandle::new(NonZeroIsize::new(self.hwnd.0 as isize).unwrap());
+        let mut h = Win32WindowHandle::new(NonZeroIsize::new(self.hwnd as isize).unwrap());
         h.hinstance = NonZeroIsize::new(self.hinstance);
         RawWindowHandle::Win32(h)
     }
@@ -100,8 +105,8 @@ impl Window {
         // SAFETY: the message loop of the thread that owns the window.
         unsafe {
             let mut msg = MSG::default();
-            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                let _ = TranslateMessage(&msg);
+            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE as u32) != 0 {
+                TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
@@ -112,14 +117,14 @@ impl Window {
     pub fn resize(&mut self, width: i32, height: i32) {
         // SAFETY: the window is live and owned by this thread.
         unsafe {
-            let _ = SetWindowPos(
+            SetWindowPos(
                 self.hwnd,
-                None,
+                std::ptr::null_mut(),
                 0,
                 0,
                 width,
                 height,
-                SWP_NOMOVE | SWP_NOZORDER,
+                (SWP_NOMOVE | SWP_NOZORDER) as u32,
             );
         }
         self.pump();
@@ -129,7 +134,7 @@ impl Window {
     pub fn client_size(&self) -> [u32; 2] {
         let mut rc = RECT::default();
         // SAFETY: the window is live.
-        let _ = unsafe { GetClientRect(self.hwnd, &mut rc) };
+        unsafe { GetClientRect(self.hwnd, &mut rc) };
         [(rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32]
     }
 }
@@ -137,7 +142,7 @@ impl Window {
 impl Drop for Window {
     fn drop(&mut self) {
         // SAFETY: the window is live and owned by this thread.
-        let _ = unsafe { DestroyWindow(self.hwnd) };
+        unsafe { DestroyWindow(self.hwnd) };
         self.pump();
         CLOSED.store(false, Ordering::Relaxed);
     }

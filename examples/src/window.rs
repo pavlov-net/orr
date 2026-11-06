@@ -67,32 +67,9 @@ fn behind() -> bool {
 }
 
 /// Shows a hidden window at the bottom of the window order.
-#[cfg(windows)]
 fn show_behind(window: &winit::window::Window) {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
-    };
-    let handle = window.window_handle().expect("window handle").as_raw();
-    let RawWindowHandle::Win32(handle) = handle else {
-        return;
-    };
-    // SAFETY: the window is live and owned by this thread.
-    let _ = unsafe {
-        SetWindowPos(
-            HWND(handle.hwnd.get() as *mut _),
-            Some(HWND_BOTTOM),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        )
-    };
-}
-
-#[cfg(not(windows))]
-fn show_behind(window: &winit::window::Window) {
+    #[cfg(windows)]
+    window.set_window_level(winit::window::WindowLevel::AlwaysOnBottom);
     window.set_visible(true);
 }
 

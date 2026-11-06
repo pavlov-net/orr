@@ -12,7 +12,7 @@ mod win32;
 #[cfg(windows)]
 use win32 as imp;
 #[cfg(windows)]
-pub use win32::set_message_hook;
+pub use win32::{hardware_scheduling, set_message_hook};
 
 #[cfg(target_os = "macos")]
 mod appkit;
@@ -129,8 +129,14 @@ pub enum Error {
     NotWindowThread,
     #[cfg(windows)]
     #[error("display watch: {0}")]
-    Windows(#[from] windows_core::Error),
+    Windows(OsError),
 }
+
+/// An error the OS reported.
+#[cfg(windows)]
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct OsError(windows_core::Error);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

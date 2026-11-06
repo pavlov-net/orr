@@ -1,22 +1,18 @@
 //! Needs an interactive desktop session.
 #![cfg(windows)]
 
+use std::io::Error;
 use std::num::NonZeroIsize;
 use std::time::{Duration, Instant};
 
 use orr_window::{DisplayFeed, DisplayWatch};
 use raw_window_handle::{RawWindowHandle, Win32WindowHandle};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW,
-    RegisterClassW, SendMessageW, WM_DISPLAYCHANGE, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP,
-};
-use windows::core::w;
+
+mod bindings;
+use bindings::*;
 
 extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    assert_ne!(msg, WM_TIMER, "the watch's timer reached the window");
+    assert_ne!(msg, WM_TIMER as u32, "the watch's timer reached the window");
     // SAFETY: default handling of this window's messages.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
@@ -29,8 +25,8 @@ fn pump_for(time: Duration) -> u32 {
         let mut msg = MSG::default();
         // SAFETY: plain message pumping on this thread with a live `msg`.
         unsafe {
-            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                timers += u32::from(msg.message == WM_TIMER);
+            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE as u32) != 0 {
+                timers += u32::from(msg.message == WM_TIMER as u32);
                 DispatchMessageW(&msg);
             }
         }
@@ -39,37 +35,44 @@ fn pump_for(time: Duration) -> u32 {
     timers
 }
 
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain([0]).collect()
+}
+
 fn window() -> HWND {
+    let class = wide("orr_display_watch_test");
+    let title = wide("display watch");
     // SAFETY: plain window creation on this thread.
-    unsafe {
-        let instance = GetModuleHandleW(None).unwrap();
-        let class = w!("orr_display_watch_test");
+    let hwnd = unsafe {
+        let instance = GetModuleHandleW(std::ptr::null());
+        assert!(!instance.is_null(), "{}", Error::last_os_error());
         RegisterClassW(&WNDCLASSW {
             lpfnWndProc: Some(window_proc),
-            hInstance: instance.into(),
-            lpszClassName: class,
+            hInstance: instance,
+            lpszClassName: class.as_ptr(),
             ..Default::default()
         });
         CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            class,
-            w!("display watch"),
+            (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) as u32,
+            class.as_ptr(),
+            title.as_ptr(),
             WS_POPUP,
             0,
             0,
             32,
             32,
-            None,
-            None,
-            Some(instance.into()),
-            None,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            instance,
+            std::ptr::null(),
         )
-        .unwrap()
-    }
+    };
+    assert!(!hwnd.is_null(), "{}", Error::last_os_error());
+    hwnd
 }
 
 fn watch(hwnd: HWND) -> (DisplayWatch, DisplayFeed) {
-    let handle = Win32WindowHandle::new(NonZeroIsize::new(hwnd.0 as isize).unwrap());
+    let handle = Win32WindowHandle::new(NonZeroIsize::new(hwnd as isize).unwrap());
     DisplayWatch::new(RawWindowHandle::Win32(handle)).unwrap()
 }
 
@@ -90,7 +93,7 @@ fn reads_the_window_monitor() {
 
     // A display mode change re-reads through the subclass; an unchanged display keeps the count.
     // SAFETY: the window belongs to this thread.
-    unsafe { SendMessageW(hwnd, WM_DISPLAYCHANGE, Some(WPARAM(0)), Some(LPARAM(0))) };
+    unsafe { SendMessageW(hwnd, WM_DISPLAYCHANGE as u32, 0, 0) };
     assert_eq!(feed.latest(), (count, info));
 
     // The once-a-second read runs through the window's messages and ends with the watch.
@@ -107,6 +110,7 @@ fn reads_the_window_monitor() {
     // The window may go first.
     let (watching, _feed) = watch(hwnd);
     // SAFETY: the window is ours.
-    unsafe { DestroyWindow(hwnd).unwrap() };
+    let destroyed = unsafe { DestroyWindow(hwnd) };
+    assert_ne!(destroyed, 0, "{}", Error::last_os_error());
     drop(watching);
 }

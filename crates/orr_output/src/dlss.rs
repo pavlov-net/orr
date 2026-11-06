@@ -165,12 +165,6 @@ impl FrameGenerationFeature for FrameGeneration {
 fn hardware_scheduling(gpu: &Device) -> Option<bool> {
     use orr_scene::orr_gpu::interop::{self, ash::vk};
     use vk::TaggedStructure as _;
-    use windows::Wdk::Graphics::Direct3D::{
-        D3DKMT_CLOSEADAPTER, D3DKMT_OPENADAPTERFROMLUID, D3DKMT_QUERYADAPTERINFO,
-        D3DKMT_WDDM_2_7_CAPS, D3DKMTCloseAdapter, D3DKMTOpenAdapterFromLuid,
-        D3DKMTQueryAdapterInfo, KMTQAITYPE_WDDM_2_7_CAPS,
-    };
-    use windows::Win32::Foundation::LUID;
 
     let raw = interop::raw_device(gpu);
     let mut id = vk::PhysicalDeviceIDProperties::default();
@@ -183,36 +177,7 @@ fn hardware_scheduling(gpu: &Device) -> Option<bool> {
     if id.device_luid_valid == vk::FALSE {
         return None;
     }
-    let l = id.device_luid;
-    let mut open = D3DKMT_OPENADAPTERFROMLUID {
-        AdapterLuid: LUID {
-            LowPart: u32::from_le_bytes([l[0], l[1], l[2], l[3]]),
-            HighPart: i32::from_le_bytes([l[4], l[5], l[6], l[7]]),
-        },
-        hAdapter: 0,
-    };
-    // SAFETY: a plain struct the call fills.
-    if unsafe { D3DKMTOpenAdapterFromLuid(&mut open) }.is_err() {
-        return None;
-    }
-    let mut caps = D3DKMT_WDDM_2_7_CAPS::default();
-    let mut query = D3DKMT_QUERYADAPTERINFO {
-        hAdapter: open.hAdapter,
-        Type: KMTQAITYPE_WDDM_2_7_CAPS,
-        pPrivateDriverData: (&raw mut caps).cast(),
-        PrivateDriverDataSize: size_of::<D3DKMT_WDDM_2_7_CAPS>() as u32,
-    };
-    // SAFETY: `query` points at a caps struct of the size it states.
-    let read = unsafe { D3DKMTQueryAdapterInfo(&mut query) }.is_ok();
-    // SAFETY: the adapter was opened above.
-    let _ = unsafe {
-        D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER {
-            hAdapter: open.hAdapter,
-        })
-    };
-    // SAFETY: every bit pattern is a valid u32. HwSchEnabled is bit 1.
-    let value = unsafe { caps.Anonymous.Value };
-    read.then_some(value & 0b10 != 0)
+    orr_window::hardware_scheduling(id.device_luid)
 }
 
 #[cfg(not(windows))]

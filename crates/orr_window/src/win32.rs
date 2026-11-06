@@ -1,52 +1,20 @@
-#![allow(non_snake_case)]
-
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use raw_window_handle::RawWindowHandle;
-use windows::Foundation::{Point, TypedEventHandler};
-use windows::Graphics::Display::{AdvancedColorKind, DisplayInformation};
-use windows::System::{DispatcherQueue, DispatcherQueueController};
-use windows::Win32::Devices::Display::{
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
-    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
-    QueryDisplayConfig,
-};
-use windows::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, HWND, LPARAM, LRESULT, RPC_E_CHANGED_MODE, WPARAM,
-};
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW,
-    MonitorFromWindow,
-};
-use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::System::WinRT::{
-    CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions,
-    RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize,
-};
-use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowThreadProcessId, KillTimer, RegisterWindowMessageW, SendNotifyMessageW, SetTimer,
-    WM_DISPLAYCHANGE, WM_NCDESTROY, WM_SETFOCUS, WM_TIMER, WM_WINDOWPOSCHANGED,
-};
-use windows_core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, Ref, w};
+use windows_core::{EventRevoker, Interface, Ref, w};
 
-use crate::{DisplayFeed, DisplayInfo, Error, Result, steady};
+use crate::{DisplayFeed, DisplayInfo, Error, OsError, Result, steady};
 
-// Windows 11 22621+. windows-rs has no binding; the three IInspectable slots come first.
-#[windows_core::interface("7449121C-382B-4705-8DA7-A795BA482013")]
-unsafe trait IDisplayInformationStaticsInterop: IUnknown {
-    fn GetIids(&self, count: *mut u32, iids: *mut *mut GUID) -> HRESULT;
-    fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
-    fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
-    fn GetForWindow(&self, window: HWND, riid: *const GUID, info: *mut *mut c_void) -> HRESULT;
-}
+mod bindings;
+use bindings::*;
 
 /// Turning HDR on or off raises no event, so the watch also reads this often.
 const READ_INTERVAL_MS: u32 = 1000;
+
+const NEAREST: u32 = MONITOR_DEFAULTTONEAREST as u32;
 
 /// Reads once a second, when the window takes the focus, on moves to another monitor, on
 /// display mode changes and on the OS's color change event.
@@ -58,12 +26,9 @@ pub(crate) struct Watch {
     hwnd: isize,
     /// The address of the `Subclass`, which the window's thread owns.
     id: usize,
+    /// The message that frees the `Subclass`, named by its id in `wparam`.
+    stop: u32,
 }
-
-/// The message that frees a `Subclass`, named by its id in `wparam`; 0 if none could be made.
-static STOP: LazyLock<u32> =
-    // SAFETY: a plain call with a constant name.
-    LazyLock::new(|| unsafe { RegisterWindowMessageW(w!("orr display watch stop")) });
 
 static MESSAGE_HOOK: OnceLock<fn(u32)> = OnceLock::new();
 
@@ -77,10 +42,11 @@ pub fn set_message_hook(hook: fn(u32)) {
 /// window is destroyed. Its address is the id of the subclass and of the timer, so two watches
 /// of a window stay apart.
 struct Subclass {
-    token: i64,
+    _event: EventRevoker,
     reader: Reader,
     monitor: Cell<HMONITOR>,
     info: DisplayInformation,
+    stop: u32,
 }
 
 /// Publishes what the OS reports for a window. A failed read keeps the last values, since the
@@ -127,7 +93,7 @@ impl ThreadSetup {
     fn new() -> windows_core::Result<Self> {
         // SAFETY: `drop` balances it on this thread. An apartment of another kind already on the
         // thread serves WinRT as well.
-        let apartment = match unsafe { RoInitialize(RO_INIT_SINGLETHREADED) } {
+        let apartment = match unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }.ok() {
             Ok(()) => true,
             Err(e) if e.code() == RPC_E_CHANGED_MODE => false,
             Err(e) => return Err(e),
@@ -143,7 +109,7 @@ impl ThreadSetup {
                 apartmentType: DQTAT_COM_NONE,
             };
             // SAFETY: plain call with a filled options struct.
-            setup.queue = Some(unsafe { CreateDispatcherQueueController(options) }?);
+            setup.queue = Some(unsafe { CreateDispatcherQueueController(options) }?.cast()?);
         }
         Ok(setup)
     }
@@ -158,6 +124,11 @@ impl Watch {
         // SAFETY: plain queries; a stale window reads as another thread's.
         if unsafe { GetWindowThreadProcessId(hwnd, None) != GetCurrentThreadId() } {
             return Err(Error::NotWindowThread);
+        }
+        // SAFETY: a plain call with a constant name.
+        let stop = unsafe { RegisterWindowMessageW(w!("orr display watch stop")) };
+        if stop == 0 {
+            return Err(windows_core::Error::from_thread().into());
         }
 
         THREAD_SETUP.with_borrow_mut(|setup| {
@@ -176,31 +147,29 @@ impl Watch {
         reader.update(&info);
 
         let handler = reader.clone();
-        let token = info.AdvancedColorInfoChanged(&TypedEventHandler::new(
-            move |sender: Ref<DisplayInformation>, _| {
-                if let Some(info) = sender.as_ref() {
-                    handler.update(info);
-                }
-                Ok(())
-            },
-        ))?;
+        let event = info.AdvancedColorInfoChanged(move |sender: Ref<DisplayInformation>, _| {
+            if let Some(info) = sender.as_ref() {
+                handler.update(info);
+            }
+        })?;
 
         let subclass = Box::into_raw(Box::new(Subclass {
-            token,
+            _event: event,
             reader,
             // SAFETY: `hwnd` is a live window.
-            monitor: Cell::new(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }),
+            monitor: Cell::new(unsafe { MonitorFromWindow(hwnd, NEAREST) }),
             info,
+            stop,
         }));
         let id = subclass as usize;
         // SAFETY: on the window's thread; `Subclass`'s drop removes the subclass before the box
         // goes away.
         let installed = unsafe { SetWindowSubclass(hwnd, Some(subclass_proc), id, id) };
-        if *STOP == 0 || !installed.as_bool() {
-            let e = windows_core::Error::from_thread();
+        if !installed.as_bool() {
             // SAFETY: the box made above, which nothing else holds now.
             drop(unsafe { Box::from_raw(subclass) });
-            return Err(e.into());
+            // It sets no last error.
+            return Err(windows_core::Error::new(E_FAIL, "SetWindowSubclass failed").into());
         }
         // SAFETY: `hwnd` is a live window of this thread; `Subclass`'s drop kills the timer.
         if unsafe { SetTimer(Some(hwnd), id, READ_INTERVAL_MS, None) } == 0 {
@@ -213,6 +182,7 @@ impl Watch {
             Self {
                 hwnd: hwnd.0 as isize,
                 id,
+                stop,
             },
             feed,
         ))
@@ -227,7 +197,7 @@ impl Drop for Watch {
         let _ = unsafe {
             SendNotifyMessageW(
                 HWND(self.hwnd as *mut c_void),
-                *STOP,
+                self.stop,
                 WPARAM(self.id),
                 LPARAM(0),
             )
@@ -245,7 +215,6 @@ impl Drop for Subclass {
             let _ = KillTimer(Some(hwnd), id);
             let _ = RemoveWindowSubclass(hwnd, Some(subclass_proc), id);
         }
-        let _ = self.info.RemoveAdvancedColorInfoChanged(self.token);
     }
 }
 
@@ -278,12 +247,12 @@ unsafe extern "system" fn subclass_proc(
 ) -> LRESULT {
     // SAFETY: `data` is the `Subclass` box, alive until the subclass is removed.
     let subclass = unsafe { &*(data as *const Subclass) };
-    if msg == *STOP && wparam.0 == id {
+    if msg == subclass.stop && wparam.0 == id {
         // SAFETY: the box is not used after this, and its drop removes the subclass.
         drop(unsafe { Box::from_raw(data as *mut Subclass) });
         return LRESULT(0);
     }
-    if msg == WM_NCDESTROY {
+    if msg == WM_NCDESTROY as u32 {
         // SAFETY: as above, and the rest of the window's handlers still run.
         unsafe {
             drop(Box::from_raw(data as *mut Subclass));
@@ -293,7 +262,7 @@ unsafe extern "system" fn subclass_proc(
     if let Some(hook) = MESSAGE_HOOK.get() {
         hook(msg);
     }
-    match msg {
+    match msg as i32 {
         WM_DISPLAYCHANGE | WM_SETFOCUS => subclass.reader.update(&subclass.info),
         WM_TIMER if wparam.0 == id => {
             subclass.reader.update(&subclass.info);
@@ -301,7 +270,7 @@ unsafe extern "system" fn subclass_proc(
         }
         WM_WINDOWPOSCHANGED => {
             // SAFETY: `hwnd` is the live subclassed window.
-            let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+            let monitor = unsafe { MonitorFromWindow(hwnd, NEAREST) };
             if subclass.monitor.replace(monitor) != monitor {
                 subclass.reader.update(&subclass.info);
             }
@@ -312,16 +281,52 @@ unsafe extern "system" fn subclass_proc(
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
+/// `GetForWindow` needs Windows 11 22621 or later.
 fn display_information(hwnd: HWND) -> windows_core::Result<DisplayInformation> {
     let interop = windows_core::factory::<DisplayInformation, IDisplayInformationStaticsInterop>()?;
-    let mut raw = std::ptr::null_mut();
-    // SAFETY: `hwnd` is a live window; on success `raw` holds an owned DisplayInformation.
-    unsafe {
-        interop
-            .GetForWindow(hwnd, &DisplayInformation::IID, &mut raw)
-            .ok()?;
-        Ok(DisplayInformation::from_raw(raw))
+    // SAFETY: `hwnd` is a live window.
+    unsafe { interop.GetForWindow(hwnd) }
+}
+
+impl From<windows_core::Error> for Error {
+    fn from(e: windows_core::Error) -> Self {
+        Self::Windows(OsError(e))
     }
+}
+
+/// Whether Windows schedules the GPU of the adapter with this LUID in hardware, which frame
+/// generation needs. `None` when it cannot tell.
+pub fn hardware_scheduling(adapter_luid: [u8; 8]) -> Option<bool> {
+    let l = adapter_luid;
+    let mut open = D3DKMT_OPENADAPTERFROMLUID {
+        AdapterLuid: LUID {
+            LowPart: u32::from_le_bytes([l[0], l[1], l[2], l[3]]),
+            HighPart: i32::from_le_bytes([l[4], l[5], l[6], l[7]]),
+        },
+        hAdapter: D3DKMT_HANDLE::default(),
+    };
+    // SAFETY: a plain struct the call fills.
+    if unsafe { D3DKMTOpenAdapterFromLuid(&mut open) }.is_err() {
+        return None;
+    }
+    let mut caps = D3DKMT_WDDM_2_7_CAPS::default();
+    let mut query = D3DKMT_QUERYADAPTERINFO {
+        hAdapter: open.hAdapter,
+        Type: KMTQAITYPE_WDDM_2_7_CAPS,
+        pPrivateDriverData: (&raw mut caps).cast(),
+        PrivateDriverDataSize: size_of::<D3DKMT_WDDM_2_7_CAPS>() as u32,
+    };
+    // SAFETY: `query` points at a caps struct of the size it states.
+    let read = unsafe { D3DKMTQueryAdapterInfo(&mut query) }.is_ok();
+    // SAFETY: the adapter was opened above.
+    let _ = unsafe {
+        D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER {
+            hAdapter: open.hAdapter,
+        })
+    };
+    // SAFETY: every bit pattern is a valid u32.
+    let flags = unsafe { caps.Anonymous.Anonymous };
+    read.then(|| flags.HwSchEnabled())
 }
 
 /// Reads the window's monitor.
@@ -382,10 +387,10 @@ impl AdvancedColor {
 /// The refresh rate of the display path whose source is the window's monitor.
 fn refresh_hz(hwnd: HWND) -> Option<f32> {
     let mut monitor_info = MONITORINFOEXW::default();
-    monitor_info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    monitor_info.Base.cbSize = size_of::<MONITORINFOEXW>() as u32;
     // SAFETY: `hwnd` is a live window; `monitor_info` is a MONITORINFOEXW with its size set.
     let found = unsafe {
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let monitor = MonitorFromWindow(hwnd, NEAREST);
         GetMonitorInfoW(monitor, (&raw mut monitor_info).cast::<MONITORINFO>())
     };
     if !found.as_bool() {
@@ -398,23 +403,26 @@ fn refresh_hz(hwnd: HWND) -> Option<f32> {
         let (mut path_count, mut mode_count) = (0, 0);
         // SAFETY: plain out-parameter calls with buffers of the reported sizes.
         let paths = unsafe {
-            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
-                .ok()
-                .ok()?;
+            let flags = QDC_ONLY_ACTIVE_PATHS as u32;
+            if GetDisplayConfigBufferSizes(flags, &mut path_count, &mut mode_count) != 0 {
+                return None;
+            }
             let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
             let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
             let status = QueryDisplayConfig(
-                QDC_ONLY_ACTIVE_PATHS,
+                flags,
                 &mut path_count,
                 paths.as_mut_ptr(),
                 &mut mode_count,
                 modes.as_mut_ptr(),
-                None,
+                std::ptr::null_mut(),
             );
             if status == ERROR_INSUFFICIENT_BUFFER {
                 continue;
             }
-            status.ok().ok()?;
+            if status != 0 {
+                return None;
+            }
             paths.truncate(path_count as usize);
             paths
         };

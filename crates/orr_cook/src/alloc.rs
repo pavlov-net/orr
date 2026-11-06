@@ -1,39 +1,4 @@
-//! Memory: the machine's RAM, and per-thread arenas for meshoptimizer's temporaries.
-
-/// Physical memory in bytes; 16 GiB when the system does not say.
-pub(crate) fn physical_memory() -> u64 {
-    const FALLBACK: u64 = 16 << 30;
-    #[cfg(windows)]
-    {
-        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-        let mut s = MEMORYSTATUSEX {
-            dwLength: size_of::<MEMORYSTATUSEX>() as u32,
-            ..Default::default()
-        };
-        // SAFETY: `s` is a valid MEMORYSTATUSEX with its length set.
-        match unsafe { GlobalMemoryStatusEx(&mut s) } {
-            Ok(()) => s.ullTotalPhys,
-            Err(_) => FALLBACK,
-        }
-    }
-    #[cfg(unix)]
-    {
-        // SAFETY: sysconf has no preconditions.
-        let (pages, size) = unsafe {
-            (
-                libc::sysconf(libc::_SC_PHYS_PAGES),
-                libc::sysconf(libc::_SC_PAGESIZE),
-            )
-        };
-        if pages > 0 && size > 0 {
-            pages as u64 * size as u64
-        } else {
-            FALLBACK
-        }
-    }
-    #[cfg(not(any(windows, unix)))]
-    FALLBACK
-}
+//! Memory: per-thread arenas for meshoptimizer's temporaries.
 
 /// Routes meshoptimizer's temporary allocations to a stack arena per thread, so cook
 /// threads do not contend on the Windows heap. meshoptimizer frees in reverse order of

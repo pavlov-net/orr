@@ -1,0 +1,12 @@
+[package]
+name = "windows-bindings"
+description = "Generates orr's private Windows bindings. tools/gen-windows-bindings.sh runs it."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+windows-bindgen = "=0.100.0"
+windows-bindgen-ioring = { package = "windows-bindgen", version = "=0.66.0" }
+
+[workspace]

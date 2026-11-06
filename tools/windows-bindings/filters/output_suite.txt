@@ -1,0 +1,5 @@
+AddVectoredExceptionHandler
+EXCEPTION_ACCESS_VIOLATION
+EXCEPTION_POINTERS
+GetCurrentProcess
+TerminateProcess

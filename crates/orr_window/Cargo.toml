@@ -13,19 +13,8 @@ log.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-core = "0.62.2"
-windows = { workspace = true, features = [
-  "Foundation",
-  "Graphics_Display",
-  "System",
-  "Win32_Devices_Display",
-  "Win32_Foundation",
-  "Win32_Graphics_Gdi",
-  "Win32_System_Threading",
-  "Win32_System_WinRT",
-  "Win32_UI_Shell",
-  "Win32_UI_WindowsAndMessaging",
-] }
+windows-core.workspace = true
+windows-future.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
@@ -36,7 +25,7 @@ dispatch2.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
 orr_color.workspace = true
-windows = { workspace = true, features = ["Win32_System_LibraryLoader"] }
+windows-link.workspace = true
 
 [[test]]
 name = "appkit_watch"

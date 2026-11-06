@@ -40,6 +40,21 @@ jobs:
       - name: Every other hook
         run: prek run --all-files --skip typos --skip cargo-fmt --skip cargo-clippy
 
+  # Nothing else builds the generator, and this ties the committed bindings to their filters.
+  bindings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain
+        run: rustup toolchain install
+      - name: Regenerate the Windows bindings
+        run: bash tools/gen-windows-bindings.sh
+      - name: Compare them with what's committed
+        run: git diff --exit-code
+
   test:
     name: test (${{ matrix.os }})
     needs: lint

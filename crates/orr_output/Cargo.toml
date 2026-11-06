@@ -39,11 +39,5 @@ orr_shaders = { workspace = true, features = ["build"] }
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
 orr_dlss = { workspace = true, optional = true }
 
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
-  "Win32_Foundation",
-  "Wdk_Graphics_Direct3D",
-] }
-
 [lints]
 workspace = true

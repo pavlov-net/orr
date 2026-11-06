@@ -335,7 +335,7 @@ impl Default for CookOptions {
             report: None,
             cache: None,
             cache_cap: None,
-            working_set: alloc::physical_memory() / 2,
+            working_set: orr_io::physical_memory() / 2,
             reorder_window: 1 << 30,
             quality: Quality::Fast,
             zstd_level: None,

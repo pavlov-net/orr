@@ -4,21 +4,21 @@
 //! thread is not the main thread. Needs an interactive desktop session.
 
 #[cfg(windows)]
-fn main() {
-    use windows::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
-    use windows::Win32::System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+mod bindings;
 
+#[cfg(windows)]
+fn main() {
+    use bindings::*;
+
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
     const FAULTED: u32 = 0xfa17;
 
     unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes a valid record.
-        let code: NTSTATUS = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
-        if code == EXCEPTION_ACCESS_VIOLATION {
+        let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+        if code == EXCEPTION_ACCESS_VIOLATION.cast_unsigned() {
             // SAFETY: ends this process.
-            let _ = unsafe { TerminateProcess(GetCurrentProcess(), FAULTED) };
+            unsafe { TerminateProcess(GetCurrentProcess(), FAULTED) };
         }
         EXCEPTION_CONTINUE_SEARCH
     }

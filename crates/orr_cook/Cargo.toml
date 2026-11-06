@@ -65,11 +65,5 @@ gdeflate = ["dep:cc", "dep:orr_shaders"]
 cc = { workspace = true, optional = true }
 orr_shaders = { workspace = true, features = ["build"], optional = true }
 
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Win32_System_SystemInformation"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 [lints]
 workspace = true

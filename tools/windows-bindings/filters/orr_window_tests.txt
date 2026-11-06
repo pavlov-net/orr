@@ -1,0 +1,16 @@
+CreateWindowExW
+DefWindowProcW
+DestroyWindow
+DispatchMessageW
+GetModuleHandleW
+MSG
+PM_REMOVE
+PeekMessageW
+RegisterClassW
+SendMessageW
+WM_DISPLAYCHANGE
+WM_TIMER
+WNDCLASSW
+WS_EX_NOACTIVATE
+WS_EX_TOOLWINDOW
+WS_POPUP
