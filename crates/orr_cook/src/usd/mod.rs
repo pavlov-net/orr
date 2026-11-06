@@ -1878,7 +1878,11 @@ impl<'s> Importer<'s> {
             .at(held(turned))
             .numbers(orientation)?
             .filter(|v| !v.is_empty());
-        let scales = r.numbers("scales")?.filter(|v| !v.is_empty());
+        let scaled = bracket("scales")?;
+        let scales = r
+            .at(held(scaled))
+            .numbers("scales")?
+            .filter(|v| !v.is_empty());
         let per_second = self.stage.time_codes_per_second();
         let since = |b: Option<(f64, f64)>| b.map_or(0.0, |b| (time - b.0) / per_second);
         let (moved_for, turned_for) = (since(moved), since(turned));

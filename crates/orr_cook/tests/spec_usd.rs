@@ -561,6 +561,21 @@ fn velocities_extrapolate_from_the_lower_sample_where_they_line_up() {
         assert_eq!(origins(&a, "u/P"), [want], "{name}");
     }
 
+    // `samplingUtils.cpp` `UsdGeom_GetScales`: "we lock the scale to the last authored value
+    // without performing any interpolation", and with a rate nothing interpolates.
+    let a = cook_at(
+        &dir("velocity-scales"),
+        &instancer(&format!(
+            "{samples}
+    vector3f[] velocities.timeSamples = {{ 0: [(2, 0, 0)], 10: [(2, 0, 0)] }}
+    float3[] scales.timeSamples = {{ 0: [(1, 1, 1)], 10: [(2, 2, 2)] }}"
+        )),
+        at(5.0),
+    )
+    .unwrap();
+    let scale = copies(&a, "u/P")[0].transform_vector3(Vec3::X).length();
+    assert!((scale - 1.0).abs() < 1e-3, "{scale}");
+
     // Angular velocities turn the lower sample's orientation, in degrees per second, after it.
     let a = cook_at(
         &dir("velocity-angular"),
