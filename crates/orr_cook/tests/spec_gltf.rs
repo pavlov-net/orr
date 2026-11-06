@@ -83,8 +83,43 @@ fn is_bound(m: &Material, s: usize) -> bool {
 }
 
 fn skeleton(a: &Archive) -> SkeletonInfo {
-    let e = a.find(AssetId::from_name("g/skeleton")).unwrap();
+    skeleton_of(a, "g")
+}
+
+/// The skeleton of model `model`.
+fn skeleton_of(a: &Archive, model: &str) -> SkeletonInfo {
+    let name = format!("{model}/skeleton");
+    let e = a
+        .find(AssetId::from_name(&name))
+        .unwrap_or_else(|| panic!("no {name}"));
     SkeletonInfo::parse(&read(a, &a.blobs(e)[0])).unwrap()
+}
+
+/// Clip `name` of model `model`.
+fn clip_of(a: &Archive, model: &str, name: &str) -> Clip {
+    let name = format!("{model}/clip/{name}");
+    let e = a
+        .find(AssetId::from_name(&name))
+        .unwrap_or_else(|| panic!("no {name}"));
+    let blobs = a.blobs(e);
+    Clip::parse(&read(a, &blobs[0]), &read(a, &blobs[1])).unwrap()
+}
+
+/// The pose of `clip` `t` seconds in, as skinning matrices of `sk`.
+fn posed_at(sk: &SkeletonInfo, clip: &Clip, t: f32) -> Vec<Affine3> {
+    let mut pose = sk.rest.clone();
+    clip.sample(t, &mut pose);
+    palette(sk, &pose)
+}
+
+/// The mesh of `name` as its header and each triangle's corners with their cluster's part.
+fn part_corners(a: &Archive, name: &str) -> (MeshInfo, Vec<(u16, Vec3)>) {
+    let e = a.find(AssetId::from_name(name)).unwrap();
+    let info = MeshInfo::parse(&read(a, &a.blobs(e)[0])).unwrap();
+    let tris = per_triangle(a, name, |view, c, t| {
+        t.map(|v| (c.part, Vec3::from(view.position(c, v))))
+    });
+    (info, tris.into_iter().flatten().collect())
 }
 
 /// What `f` makes of every triangle of mesh entry `name`.
@@ -1339,7 +1374,12 @@ fn palette(sk: &SkeletonInfo, pose: &[Trs]) -> Vec<Affine3> {
 
 /// Each triangle corner of `g/mesh` and its one joint.
 fn skinned_corners(a: &Archive) -> Vec<(Vec3, usize)> {
-    let tris = per_triangle(a, "g/mesh", |view, c, t| {
+    skinned_corners_of(a, "g/mesh")
+}
+
+/// Each triangle corner of mesh `name` and its one joint.
+fn skinned_corners_of(a: &Archive, name: &str) -> Vec<(Vec3, usize)> {
+    let tris = per_triangle(a, name, |view, c, t| {
         t.map(|v| {
             let joint = view.joints(c, v).unwrap()[0];
             (Vec3::from(view.position(c, v)), usize::from(joint))
@@ -1375,7 +1415,8 @@ fn inverse_binds_past_the_joints_are_unused() {
 }
 
 /// L1580, L1584: "Any node **MAY** contain one mesh", and "The mesh **MAY** be skinned", so a
-/// static mesh sits beside a skin at its node's transform, and stays there as the joints move.
+/// static mesh sits beside a skin at its node's transform, and stays there as the joints move:
+/// in the whole-scene model, with the skin in a model of its own.
 #[test]
 fn a_static_mesh_beside_a_skin_keeps_its_place() {
     let path = dir("static").join("skin.glb");
@@ -1392,16 +1433,423 @@ fn a_static_mesh_beside_a_skin_keeps_its_place() {
         ),
     );
     let (a, _) = cooked(&path);
-    assert_has(&triangles(&a, "g/mesh"), Vec3::new(5.0, 2.0, 0.0));
-    let sk = skeleton(&a);
+    let still = triangles(&a, "g/mesh");
+    assert_has(&still, Vec3::new(5.0, 2.0, 0.0));
+    assert_eq!(still.len(), 1);
+    assert!(a.find(AssetId::from_name("g/skeleton")).is_none());
+    let sk = skeleton_of(&a, "g/hip");
     let mut pose = sk.rest.clone();
     pose[0].translation = [1.0, 0.0, 0.0];
     let posed = palette(&sk, &pose);
-    for (p, j) in skinned_corners(&a) {
-        let want = if p.x >= 4.0 { p } else { p + Vec3::X };
+    for (p, j) in skinned_corners_of(&a, "g/hip/mesh") {
         let got = posed[j].transform_point3(p);
+        assert!(near(got, p + Vec3::X), "{p} on joint {j} reaches {got}");
+    }
+}
+
+/// A scene of a static mesh, and `spin` holding a mesh with `arm`, translated, holding another,
+/// each animated; a static wrapper stands above `spin`. L3237: an animation channel targets a
+/// node's TRS property. `spin` moves 2 m along x over its second, and `arm` turns.
+fn animated_scene(path: &Path) {
+    let mut g = Glb::default();
+    let pa = g.floats(&TRIANGLE, "VEC3");
+    let ta = g.floats(&[[1.0f32], [2.0]], "SCALAR");
+    let moved = g.floats(&[[0.0f32, 0.0, 0.0], [2.0, 0.0, 0.0]], "VEC3");
+    let half_turn = [0.0f32, 0.0, 0.707_106_77, 0.707_106_77];
+    let turn = g.floats(&[[0.0f32, 0.0, 0.0, 1.0], half_turn], "VEC4");
+    let early = g.floats(&[[0.0f32], [3.0]], "SCALAR");
+    g.write(
+        path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1,5]}}],
+"nodes":[{{"name":"ground","mesh":0,"translation":[0,-1,0]}},
+{{"name":"wrapper","translation":[0,0,10],"scale":[2,2,2],"children":[2]}},
+{{"name":"spin","mesh":0,"children":[3]}},
+{{"name":"arm","mesh":0,"translation":[0,1,0],"children":[4]}},
+{{"name":"child","mesh":0,"translation":[1,0,0]}},
+{{"name":"far","mesh":0,"translation":[100,0,0]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}}}}]}}],
+"animations":[{{"name":"go","samplers":[
+{{"input":{ta},"output":{moved}}},{{"input":{ta},"output":{turn}}},{{"input":{early},"output":{moved}}}],
+"channels":[{{"sampler":0,"target":{{"node":2,"path":"translation"}}}},
+{{"sampler":1,"target":{{"node":3,"path":"rotation"}}}},
+{{"sampler":2,"target":{{"node":5,"path":"translation"}}}}]}}]"#
+        ),
+    );
+}
+
+/// L3237: an animated node moves its subtree, skin or no skin. Each rig is a model with a
+/// skeleton of rigid parts, the static scene stays out of it, and a static node above folds into
+/// the skeleton's root without spending a joint. Part 0 takes no pose, so no triangle is on it.
+#[test]
+fn an_animated_node_moves_its_subtree_as_rigid_parts() {
+    let path = dir("animated").join("scene.glb");
+    animated_scene(&path);
+    let (a, _) = cooked(&path);
+    assert!(a.find(AssetId::from_name("g/skeleton")).is_none());
+    assert_eq!(triangles(&a, "g/mesh").len(), 1);
+
+    let sk = skeleton_of(&a, "g/spin");
+    assert_eq!(sk.names, ["", "spin", "arm"]);
+    let (info, corners) = part_corners(&a, "g/spin/mesh");
+    assert_eq!(info.header.attributes & MeshHeader::SKIN, 0);
+    assert_eq!(
+        info.parts.iter().map(|p| p.joint).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert!(corners.iter().all(|c| c.0 != 0), "a triangle on part 0");
+
+    let clip = clip_of(&a, "g/spin", "go");
+    // A joint with no clip channel holds still, and its rest pose places it.
+    let rest = palette(&sk, &sk.rest);
+    for (part, p) in &corners {
+        let at = rest[usize::from(*part)].transform_point3(*p);
+        assert!(near(at, *p), "rest pose moved {p} to {at}");
+    }
+    // At the end `spin` has moved 4 m of scene (2 m under the wrapper's scale of 2), and `arm`
+    // has turned 90 degrees about z above `child`, 1 m along x of it, so that lands on y.
+    let end = posed_at(&sk, &clip, clip.header.duration);
+    let want = |local: Vec3| Vec3::new(4.0, 2.0, 10.0) + local * 2.0;
+    let child = TRIANGLE.map(|t| {
+        let t = Vec3::from(t);
+        want(Vec3::new(-t.y, t.x + 1.0, t.z))
+    });
+    let reached: Vec<Vec3> = corners
+        .iter()
+        .map(|(part, p)| end[usize::from(*part)].transform_point3(*p))
+        .collect();
+    for w in child {
+        assert!(
+            reached.iter().any(|&r| near(r, w)),
+            "{w} not in {reached:?}"
+        );
+    }
+}
+
+/// L3081 leaves timelines to the client, which plays an animation as one: the clips it leaves on
+/// separate skeletons share its span, whichever channels each one holds.
+#[test]
+fn one_animation_keeps_time_across_skeletons() {
+    let path = dir("animated-time").join("scene.glb");
+    animated_scene(&path);
+    let (a, _) = cooked(&path);
+    let (spin, far) = (clip_of(&a, "g/spin", "go"), clip_of(&a, "g/far", "go"));
+    assert!(
+        (spin.header.duration - 3.0).abs() < 1e-5,
+        "{:?}",
+        spin.header
+    );
+    assert!((far.header.duration - 3.0).abs() < 1e-5, "{:?}", far.header);
+    // `spin` keys from 1 s to 2 s of the animation's 0 to 3: still at 1 s, and home by 2 s.
+    let sk = skeleton_of(&a, "g/spin");
+    let x = |t: f32| posed_at(&sk, &spin, t)[1].translation.x;
+    assert!(
+        x(0.9).abs() < 1e-4 && (x(2.1) - 4.0).abs() < 1e-3,
+        "{} {}",
+        x(0.9),
+        x(2.1)
+    );
+}
+
+/// A chain of `count` nodes with one mesh each, every one moved by an animation, 1 m along x by
+/// its end on top of what the nodes above it add. `skinned` puts each vertex on one joint of a
+/// skin instead.
+fn long_chain(path: &Path, count: usize, skinned: bool) {
+    let mut g = Glb::default();
+    let positions: Vec<[f32; 3]> = (0..count)
+        .flat_map(|i| TRIANGLE.map(|p| [p[0], p[1] + i as f32, p[2]]))
+        .collect();
+    let joints: Vec<[u16; 4]> = (0..3 * count as u16).map(|v| [v / 3, 0, 0, 0]).collect();
+    let pa = g.floats(&positions, "VEC3");
+    let tri = g.floats(&TRIANGLE, "VEC3");
+    let jv = g.view(bytemuck::cast_slice(&joints), None);
+    let ja = g.accessor(jv, 5123, joints.len(), "VEC4", "");
+    let wa = g.floats(&vec![[1.0f32, 0.0, 0.0, 0.0]; joints.len()], "VEC4");
+    let ta = g.floats(&[[0.0f32], [1.0]], "SCALAR");
+    let va = g.floats(&[[0.0f32, 1.0, 0.0], [1.0, 1.0, 0.0]], "VEC3");
+    let channels: Vec<String> = (0..count)
+        .map(|i| format!(r#"{{"sampler":0,"target":{{"node":{i},"path":"translation"}}}}"#))
+        .collect();
+    let chain: Vec<String> = (0..count)
+        .map(|i| {
+            let mesh = if skinned { "" } else { r#""mesh":0,"# };
+            let next = if i + 1 < count {
+                format!(r#","children":[{}]"#, i + 1)
+            } else {
+                String::new()
+            };
+            format!(r#"{{"name":"n{i}",{mesh}"translation":[0,1,0]{next}}}"#)
+        })
+        .collect();
+    let list: Vec<String> = (0..count).map(|i| i.to_string()).collect();
+    let (extra, roots, attributes) = if skinned {
+        (
+            r#",{"mesh":0,"skin":0}"#.to_string(),
+            format!("0,{count}"),
+            format!(r#""POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}"#),
+        )
+    } else {
+        (
+            String::new(),
+            "0".to_string(),
+            format!(r#""POSITION":{tri}"#),
+        )
+    };
+    g.write(
+        path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[{roots}]}}],
+"nodes":[{}{extra}],
+"skins":[{{"joints":[{}]}}],
+"meshes":[{{"primitives":[{{"attributes":{{{attributes}}}}}]}}],
+"animations":[{{"name":"go","samplers":[{{"input":{ta},"output":{va}}}],
+"channels":[{}]}}]"#,
+            chain.join(","),
+            list.join(","),
+            channels.join(",")
+        ),
+    );
+}
+
+/// Vertices name joints in a u8, parts do not, so a rigid skeleton has no skin's bound: neither
+/// 256 joints with the still joint, nor a chain of 300 animated nodes, past what a skin holds.
+#[test]
+fn rigid_skeletons_pass_the_joints_a_skin_can_name() {
+    let d = dir("long-chain");
+    let settings = GltfSettings {
+        parts_from_skin: true,
+        ..GltfSettings::default()
+    };
+    let path = d.join("skin.glb");
+    long_chain(&path, 256, true);
+    let (a, _) = cook(&path, settings).unwrap();
+    assert_eq!(skeleton(&a).joint_count(), 257);
+    let (info, corners) = part_corners(&a, "g/mesh");
+    assert_eq!(info.parts.len(), 257);
+    assert!(corners.iter().any(|c| c.0 == 256));
+    assert!(corners.iter().all(|c| c.0 != 0));
+
+    let path = d.join("nodes.glb");
+    long_chain(&path, 300, false);
+    let (a, _) = cooked(&path);
+    let sk = skeleton(&a);
+    assert_eq!(sk.joint_count(), 301);
+    let (_, corners) = part_corners(&a, "g/mesh");
+    assert!(corners.iter().any(|c| c.0 == 300));
+    let end = posed_at(&sk, &clip_of(&a, "g", "go"), 1.0);
+    let (part, p) = corners.iter().find(|c| c.0 == 300).unwrap();
+    let got = end[usize::from(*part)].transform_point3(*p);
+    assert!(near(got, *p + Vec3::X * 300.0), "{p} reaches {got}");
+}
+
+/// The selection frames a model, whatever moves in it: one skeleton in the node's space holds
+/// its skin, whose joints may stand outside the node, and a mesh there with no joint above it
+/// keeps its place. L2153: a skinned mesh's node transform is ignored.
+#[test]
+fn a_selected_model_holds_a_skeleton_of_its_own() {
+    let path = dir("selected").join("skin.glb");
+    let mut g = Glb::default();
+    let (pa, ja, wa) = skinned_triangle(&mut g);
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1,4]}}],
+"nodes":[{{"name":"hip","translation":[1,0,0]}},
+{{"name":"body","translation":[0,0,5],"children":[2,3]}},
+{{"mesh":0,"skin":0}},{{"mesh":1,"translation":[0,3,0]}},
+{{"name":"other","mesh":1}}],
+"skins":[{{"joints":[0]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}}}}]}},
+{{"primitives":[{{"attributes":{{"POSITION":{pa}}}}}]}}]"#
+        ),
+    );
+    let settings = GltfSettings {
+        models: vec![
+            NodeSelect {
+                node: "body".into(),
+            },
+            NodeSelect {
+                node: "other".into(),
+            },
+        ],
+        ..GltfSettings::default()
+    };
+    let (a, _) = cook(&path, settings).unwrap();
+    assert!(a.find(AssetId::from_name("g/other/skeleton")).is_none());
+    let sk = skeleton_of(&a, "g/body");
+    assert_eq!(sk.names, ["", "hip"]);
+    let rest = palette(&sk, &sk.rest);
+    let corners = skinned_corners_of(&a, "g/body/mesh");
+    let still = |p: Vec3| p.y >= 3.0 - 1e-4;
+    for (p, j) in corners {
+        let got = rest[j].transform_point3(p);
+        // The hip stands at (1, 0, -5) in the body's space, and bind space is the file's.
+        let want = if still(p) {
+            p
+        } else {
+            p + Vec3::new(1.0, 0.0, -5.0)
+        };
         assert!(near(got, want), "{p} on joint {j} reaches {got}");
     }
+}
+
+/// A selected node may be a joint of the skin it holds. The model is in that node's space, so the
+/// joint rests at the model's origin, and the root takes the node's place back out.
+#[test]
+fn a_selected_node_can_be_a_joint_of_its_skin() {
+    let path = dir("selected-joint").join("skin.glb");
+    let mut g = Glb::default();
+    let (pa, ja, wa) = skinned_triangle(&mut g);
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],
+"nodes":[{{"name":"body","translation":[0,0,5],"children":[1,2]}},
+{{"name":"hip","translation":[1,0,0]}},{{"mesh":0,"skin":0}}],
+"skins":[{{"joints":[0,1]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}}}}]}}]"#
+        ),
+    );
+    let settings = GltfSettings {
+        models: vec![NodeSelect {
+            node: "body".into(),
+        }],
+        ..GltfSettings::default()
+    };
+    let (a, _) = cook(&path, settings).unwrap();
+    let sk = skeleton_of(&a, "g/body");
+    assert_eq!(sk.names, ["body", "hip"]);
+    let rest = palette(&sk, &sk.rest);
+    for (p, j) in skinned_corners_of(&a, "g/body/mesh") {
+        let got = rest[j].transform_point3(p);
+        assert!(near(got, p), "{p} on joint {j} reaches {got}");
+    }
+}
+
+/// A skin with no joint in the scene has nothing to pose it: an error, not a mesh left at its node.
+#[test]
+fn a_skin_of_joints_out_of_the_scene_does_not_cook() {
+    let path = dir("joints-elsewhere").join("skin.glb");
+    let mut g = Glb::default();
+    let (pa, ja, wa) = skinned_triangle(&mut g);
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[1]}}],
+"nodes":[{{"name":"hip"}},{{"mesh":0,"skin":0}}],
+"skins":[{{"joints":[0]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}}}}]}}]"#
+        ),
+    );
+    let e = cook(&path, GltfSettings::default()).err().unwrap();
+    assert!(e.to_string().contains("not in the scene"), "{e}");
+}
+
+/// A rig takes its first joint's name, unless that is the whole scene's mesh entry.
+#[test]
+fn a_rig_named_mesh_leaves_the_scene_its_mesh() {
+    let path = dir("rig-name").join("scene.glb");
+    let mut g = Glb::default();
+    let pa = g.floats(&TRIANGLE, "VEC3");
+    let ta = g.floats(&[[0.0f32], [1.0]], "SCALAR");
+    let va = g.floats(&[[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0]], "VEC3");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1]}}],
+"nodes":[{{"name":"ground","mesh":0}},{{"name":"mesh","mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}}}}]}}],
+"animations":[{{"name":"go","samplers":[{{"input":{ta},"output":{va}}}],
+"channels":[{{"sampler":0,"target":{{"node":1,"path":"translation"}}}}]}}]"#
+        ),
+    );
+    let (a, _) = cooked(&path);
+    assert_eq!(triangles(&a, "g/mesh").len(), 1);
+    assert_eq!(skeleton_of(&a, "g/node1").names, ["", "mesh"]);
+}
+
+/// `layout` on a skinned scene: the model-per-mesh layout places what stands still, and a skin
+/// goes to a model of its own there too.
+#[test]
+fn the_meshes_layout_keeps_what_moves_in_rigs() {
+    let path = dir("meshes-skin").join("skin.glb");
+    let mut g = Glb::default();
+    let (pa, ja, wa) = skinned_triangle(&mut g);
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1,2]}}],
+"nodes":[{{"name":"hip"}},{{"mesh":0,"skin":0}},{{"mesh":1,"translation":[5,0,0]}}],
+"skins":[{{"joints":[0]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}}}}]}},
+{{"primitives":[{{"attributes":{{"POSITION":{pa}}}}}]}}]"#
+        ),
+    );
+    let settings = GltfSettings {
+        layout: GltfLayout::Meshes,
+        ..GltfSettings::default()
+    };
+    let (a, _) = cook(&path, settings).unwrap();
+    assert!(a.find(AssetId::from_name("g/mesh/1")).is_some());
+    assert!(a.find(AssetId::from_name("g/mesh/0")).is_none());
+    assert_eq!(skeleton_of(&a, "g/hip").names, ["hip"]);
+}
+
+/// `EXT_mesh_gpu_instancing`: an object space transform on the node's world transform, "with
+/// instance transformation applied first". Under an animated node the copies move with it,
+/// baked into its rig. A skinned instanced node is a model placed per instance, posed by one
+/// skeleton, beside a skin of the scene; a scale of zero is no placement, and goes to a skeleton
+/// of its own while the mesh keeps its bind pose.
+#[test]
+fn instanced_nodes_move_with_rigs_and_skins() {
+    let path = dir("instanced").join("scene.glb");
+    let mut g = Glb::default();
+    let (pa, ja, wa) = skinned_triangle(&mut g);
+    let ta = g.floats(&[[0.0f32], [1.0]], "SCALAR");
+    let va = g.floats(&[[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0]], "VEC3");
+    let at = g.floats(&[[0.0f32, 2.0, 0.0], [0.0, 4.0, 0.0]], "VEC3");
+    let bt = g.floats(&[[7.0f32, 0.0, 0.0], [9.0, 0.0, 0.0]], "VEC3");
+    let bs = g.floats(&[[1.0f32, 1.0, 1.0], [1.0, 0.0, 1.0]], "VEC3");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,2,3]}}],
+"extensionsUsed":["EXT_mesh_gpu_instancing"],
+"nodes":[{{"name":"mover","children":[1]}},
+{{"name":"copies","mesh":1,"extensions":{{"EXT_mesh_gpu_instancing":{{"attributes":{{"TRANSLATION":{at}}}}}}}}},
+{{"name":"hip"}},
+{{"name":"crowd","mesh":0,"skin":0,"extensions":{{"EXT_mesh_gpu_instancing":{{"attributes":{{"TRANSLATION":{bt},"SCALE":{bs}}}}}}}}}],
+"skins":[{{"joints":[2]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}}}}]}},
+{{"primitives":[{{"attributes":{{"POSITION":{pa}}}}}]}}],
+"animations":[{{"name":"go","samplers":[{{"input":{ta},"output":{va}}}],
+"channels":[{{"sampler":0,"target":{{"node":0,"path":"translation"}}}}]}}]"#
+        ),
+    );
+    let (a, _) = cooked(&path);
+    let sk = skeleton_of(&a, "g");
+    assert_eq!(sk.names, ["", "mover"]);
+    let (_, corners) = part_corners(&a, "g/mesh");
+    assert_eq!(corners.len(), 6, "a copy of the mesh per instance");
+    let end = posed_at(&sk, &clip_of(&a, "g", "go"), 1.0);
+    let top = corners
+        .iter()
+        .map(|(j, p)| end[usize::from(*j)].transform_point3(*p))
+        .fold(Vec3::ZERO, Vec3::max);
+    assert!(top.x >= 1.99 && top.y >= 4.0, "{top}");
+
+    let crowd = skeleton_of(&a, "g/crowd");
+    assert_eq!(crowd.names, ["hip"]);
+    assert!(a.find(AssetId::from_name("g/crowd/clip/go")).is_none());
+    let flat = skeleton_of(&a, "g/crowd/baked/0");
+    assert_eq!(flat.root.matrix3.y_axis.y, 0.0);
+    let bind = skinned_corners_of(&a, "g/crowd/baked/0/mesh");
+    assert!(bind.iter().any(|c| c.0.y > 0.5), "{bind:?}");
+    let pages = a
+        .entries()
+        .iter()
+        .filter(|e| a.name(e).contains("/instances"));
+    assert_eq!(pages.count(), 1);
 }
 
 /// L2098, L2100: inverse binds are per skin, and L2167 lets the nodes of one mesh "specify

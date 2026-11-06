@@ -14,10 +14,15 @@
 //!   `N/instances/...`,
 //! - `N/<model>/baked/<k>` and its mesh for the copies of a model whose transform collapses
 //!   an axis, with the transform applied,
-//! - `N/skeleton`, with skins: their joints and the joints' ancestors,
-//! - `N/clip/<animation>`: each animation that moves the skeleton, resampled at
-//!   [`ClipSettings`]; an animation without a unique name that is not all digits is
-//!   named by its glTF animation index,
+//! - `N/<rig>` and `N/<rig>/mesh` for each set of meshes that moves together, in scene space,
+//!   named after its first joint and out of the models above: a skin's meshes, and the meshes
+//!   under a node an animation targets, the latter as rigid parts, one per joint with part 0 on
+//!   a still joint; a scene that is all one such set keeps the names `N` and `N/mesh`,
+//! - `N/<model>/skeleton` for a model that moves: the joints of its skins, the nodes animated
+//!   above its meshes and the nodes between them,
+//! - `N/<model>/clip/<animation>`: each animation that moves the skeleton, resampled at
+//!   [`ClipSettings`], running over the whole animation so its clips keep time; an animation
+//!   without a unique name that is not all digits is named by its glTF animation index,
 //! - `N/material/<i>`: glTF material `i`, or `N/material/default` for primitives without one,
 //! - `N/texture/<material>/<role>`: the material's textures (roles `base_color`, `opacity`,
 //!   `normal`, `roughness`, `metalness`, `roughness_metalness`, `emission`,
@@ -291,8 +296,9 @@ pub struct GltfSettings {
     /// Skinned meshes cook as rigid parts instead: every vertex follows one joint (one
     /// non-zero weight), its part is that skeleton joint, pivoted at the joint's bind
     /// position, and the mesh keeps no skin attributes. The skeleton still cooks, so its
-    /// parents and rest transforms give the parts' hierarchy; skeleton joint 0 is the body.
-    /// Without skins it does nothing. Does not mix with `parts_from_attribute`.
+    /// parents and rest transforms give the parts' hierarchy; skeleton joint 0 is a still joint
+    /// of its own, since the renderer does not pose part 0. Without skins it does nothing. Does
+    /// not mix with `parts_from_attribute`.
     pub parts_from_skin: bool,
     /// Patterns of selected models that join crack-free: they share one grid step and
     /// their nodes must keep them on it.

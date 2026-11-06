@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use openusd::usd;
 use orr_math::{Affine3, DMat3, DMat4, DVec3, DVec4};
 use orr_pack::clip::Clip;
-use orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo, Trs};
+use orr_pack::skeleton::{MAX_SKINNED_JOINTS, NO_PARENT, SkeletonInfo, Trs};
 
 use super::mesh::Influence;
 use super::read::{PrimReader, matrix, quat};
@@ -102,9 +102,9 @@ impl Skel {
             return Err(format!("{path}: its world transform is not finite"));
         }
         let joints = r.tokens("joints")?;
-        if joints.is_empty() || joints.len() > MAX_JOINTS {
+        if joints.is_empty() || joints.len() > MAX_SKINNED_JOINTS {
             return Err(format!(
-                "{path}: {} joints; 1 to {MAX_JOINTS}",
+                "{path}: {} joints; 1 to {MAX_SKINNED_JOINTS}",
                 joints.len()
             ));
         }
@@ -259,7 +259,10 @@ impl Skel {
             influence_sets.push((js, ws));
         }
         let influences: Vec<Influence> = (0..elements)
-            .map(|e| skin::influences(&influence_sets, &map, e))
+            .map(|e| {
+                let (joints, weights) = skin::influences(&influence_sets, &map, e)?;
+                Ok::<_, String>((joints.map(|j| j as u8), weights))
+            })
             .collect::<Result<_, _>>()
             .map_err(|e| format!("{path}: {e}"))?;
         let influences = if constant {
@@ -382,7 +385,8 @@ impl Skel {
                 channels.push(ch);
             }
         }
-        Ok(Some(skin::resample(&self.info, &channels, settings)))
+        let span = skin::span(&channels);
+        Ok(Some(skin::resample(&self.info, &channels, span, settings)))
     }
 }
 

@@ -1,32 +1,43 @@
 //! glTF 2.0 import: the default scene's triangle primitives as one mesh per model, the
-//! materials they use, and with skins a skeleton and its clips ([`crate::skin`]). Strips and
-//! fans become triangle lists. Points, lines and primitives without positions have no surface
-//! to cook: they are skipped, and each one placed is a warning in the report.
+//! materials they use, and what moves as models with skeletons and clips ([`crate::skin`]).
+//! Strips and fans become triangle lists. Points, lines and primitives without positions have no
+//! surface to cook: they are skipped, and each one placed is a warning in the report.
 //!
 //! With [`GltfLayout::Scene`] and without `GltfSettings::models` the whole scene is one model.
 //! With models, each node whose name contains a pattern (and has no selected ancestor) is a
 //! model holding its subtree, in the node's own space; meshes outside every selected subtree
 //! are not cooked. Node transforms are applied to the vertices, and morph targets at their
-//! default weights (the node's `weights`, else the mesh's). With skins, the mesh is in
-//! bind space: a skinned primitive's vertices stay as stored (glTF ignores its node's
-//! transform), take their joints and weights from `JOINTS_n`/`WEIGHTS_n`, and a primitive
-//! without a skin follows its nearest skeleton joint rigidly, or with none stays where its
-//! node puts it; skins and model selection do not mix.
+//! default weights (the node's `weights`, else the mesh's).
 //!
 //! With [`GltfLayout::Meshes`] every glTF mesh the scene places is a model `mesh/<i>` in the
 //! mesh's own space (`mesh/<i>/morph/<k>` for each other set of node morph weights), and every
 //! node holding it, and every `EXT_mesh_gpu_instancing` instance, is a placement of it
 //! ([`Scene::instances`]). Meshes are read when their cook starts, so
-//! the import holds no geometry. Skins, model selection, joined models and assemblies need
-//! the scene layout.
+//! the import holds no geometry. Model selection and joined models need the scene layout.
+//!
+//! What moves does not stay in those models. A mesh moves if it has a skin, or a joint of a skin
+//! or a node an animation targets stands at or above it. Each [`Rig`] of them is a model of its
+//! own in scene space, named after its first joint (`node<i>` where that is empty or taken),
+//! with its skeleton and clips under that name; a scene that is all one rig stays the
+//! whole-scene model. A selected model keeps what moves in it, with one skeleton: it holds what
+//! its meshes need of the scene below its node, and a node above or at it that moves it is the
+//! placement's to follow. Such a model's mesh is in bind space: a skinned primitive's vertices
+//! stay as stored (glTF ignores its node's transform), take their joints and weights from
+//! `JOINTS_n`/`WEIGHTS_n`, and a primitive without a skin follows its nearest joint rigidly, or
+//! with none stays where its node puts it, on the skeleton's still joint. A rig without a skin
+//! cooks as rigid parts, one per joint, unless parts come from an attribute, which leaves its
+//! vertices skinned to their joints.
 //!
 //! Nodes hidden by `KHR_node_visibility` or the core `visible` property of glTF 2.1 are not
 //! cooked, nor are their subtrees; hidden joints still pose their skins.
 //!
-//! In the scene layout a node with `EXT_mesh_gpu_instancing` is a model of its own, named
-//! after the node and in its mesh's space, whatever the selection; its instances, scene space
-//! from the node's transform times each instance's, become placements. Such models do not
-//! mix with skins.
+//! In either layout a node with `EXT_mesh_gpu_instancing` that does not move is placed as a model
+//! of its own, in the scene layout named after the node and in its mesh's space, whatever the
+//! selection; its instances, scene space from the node's transform times each instance's,
+//! become placements. One that moves is baked: each instance is a copy of its mesh in the rig's
+//! model. A skinned one is a model of its own with its skin's skeleton, each instance a copy
+//! posed on its own. glTF ignores a skinned mesh's node transform, and the extension says nothing
+//! of skins, so a copy's placement is the instance's transform alone.
 //!
 //! A displacement is a mesh space length along the mesh's normal, as `KHR_materials_volume` has
 //! thickness, so a transform moves it with the mesh, placed or applied. Only a static bake holds
@@ -34,7 +45,8 @@
 //!
 //! A placement keeps the whole transform, mirrored or sheared. A transform that collapses an
 //! axis is not a placement: the mesh is cooked once per such linear transform with it
-//! applied, as model `<model>/baked/<k>`, placed by translation alone. A node scaled to zero
+//! applied, as model `<model>/baked/<k>`, placed by translation alone; a skinned mesh keeps its
+//! bind pose, and the transform goes to a skeleton of that model's own. A node scaled to zero
 //! on every axis cooks like any other, as a surface of no area.
 //!
 //! Rigid parts come from the custom vertex attribute `PartAttribute::name` (integer, or
@@ -42,8 +54,9 @@
 //! values are joints of the primitive's skin, pivots their bind positions and `Part::joint`
 //! the skeleton joint; without, pivots come from the `PartAttribute::pivot` attribute, else
 //! the model origin. With `GltfSettings::parts_from_skin`, a skin whose vertices each follow
-//! one joint cooks as rigid parts instead of a skinned mesh: part `j` is skeleton joint `j`,
-//! pivoted at its bind position.
+//! one joint cooks as rigid parts instead of a skinned mesh, as a rig without a skin does:
+//! part `j` is skeleton joint `j`, pivoted at its bind position, and part 0, which the renderer
+//! does not pose, is the still joint.
 //!
 //! Joined models (`GltfSettings::joined`) share the coarsest grid step among them, and each
 //! one's node must sit on that grid: translation a multiple of the step, rotation a multiple
@@ -78,7 +91,7 @@ use crate::mesh::{
     tangents,
 };
 use crate::patch::{self, MaterialPatch, MeshPatch};
-use crate::skin::{Graph, Skeleton, influences};
+use crate::skin::{self, Graph, Rig, Rigging, Skeleton, influences};
 use crate::state::{Input, Memo};
 use crate::texture::material::{ImageData, ImageFile, Layer};
 use crate::{Error, GltfSettings, PartAttribute, Result};
@@ -123,7 +136,8 @@ enum Binding<'a> {
 
 /// One model being assembled: its vertices and triangles per glTF material.
 struct Building {
-    node: Option<usize>,
+    /// The node that frames it; without one, its space is the scene's.
+    frame: Option<usize>,
     v: Vertices,
     /// The model carries tangents, on every primitive: one states them or its material reads
     /// them, and a prototype's material can read them on the others.
@@ -138,9 +152,9 @@ struct Building {
 }
 
 impl Building {
-    fn new(node: Option<usize>, parts: usize) -> Self {
+    fn new(frame: Option<usize>, parts: usize) -> Self {
         Self {
-            node,
+            frame,
             v: Vertices::default(),
             tangents: false,
             uv1: false,
@@ -444,9 +458,9 @@ fn append_primitive(
                 .for_each(|t| t.swap(1, 2));
         }
     }
-    let skin: Vec<([u8; 4], [u8; 4])> = match binding {
+    let skin: Vec<([u16; 4], [u8; 4])> = match binding {
         None => Vec::new(),
-        Some(Binding::Rigid(j)) => vec![([*j as u8; 4], [255, 0, 0, 0]); n],
+        Some(Binding::Rigid(j)) => vec![([*j; 4], [255, 0, 0, 0]); n],
         Some(Binding::Skin(map)) => {
             let mut sets = Vec::new();
             for set in 0.. {
@@ -480,7 +494,7 @@ fn append_primitive(
                 .iter()
                 .enumerate()
                 .map(|(i, (j, w))| match w[1..] {
-                    [0, 0, 0] => Ok(u16::from(j[0])),
+                    [0, 0, 0] => Ok(j[0]),
                     _ => Err(format!(
                         "vertex {i} follows {} joints; parts from a skin take one",
                         w.iter().filter(|&&x| x > 0).count()
@@ -562,7 +576,7 @@ fn append_primitive(
             v.uvs1.extend(tangents::with_copies(uvs1, &copies));
             v.colors.extend(tangents::with_copies(colors, &copies));
             let skin = tangents::with_copies(skin, &copies);
-            v.joints.extend(skin.iter().map(|s| s.0));
+            v.joints.extend(skin.iter().map(|s| s.0.map(|j| j as u8)));
             v.weights.extend(skin.iter().map(|s| s.1));
             v.values.extend(tangents::with_copies(values, &copies));
             v.pivots.extend(tangents::with_copies(pivots, &copies));
@@ -589,7 +603,7 @@ fn append_primitive(
                     v.uvs1.push(uvs1[i]);
                     v.colors.push(colors[i]);
                     if let Some(&(j, w)) = skin.get(i) {
-                        v.joints.push(j);
+                        v.joints.push(j.map(|j| j as u8));
                         v.weights.push(w);
                     }
                     if let Some(&x) = values.get(i) {
@@ -693,20 +707,16 @@ pub(crate) fn import(
         names: HashSet::new(),
         shown: shown_nodes(&src.json, &graph),
         hashes: BTreeMap::new(),
+        skeletons: Vec::new(),
         instances: Vec::new(),
         files: &mut files,
         warnings: Vec::new(),
     };
-    let skeleton = match settings.layout {
-        GltfLayout::Scene => scene_layout(&mut b, &graph)?,
-        GltfLayout::Meshes => {
-            meshes_layout(&mut b, &graph)?;
-            None
-        }
-    };
+    node_models(&mut b, &graph)?;
     let Imported {
         materials,
         mut models,
+        skeletons,
         instances,
         warnings,
         ..
@@ -724,7 +734,7 @@ pub(crate) fn import(
         models,
         materials: materials.into_values().collect(),
         images,
-        skeletons: skeleton.into_iter().collect(),
+        skeletons,
         instances,
         files,
         warnings,
@@ -746,6 +756,7 @@ struct Imported<'a> {
     shown: Vec<usize>,
     /// Hashes of the buffer files read so far.
     hashes: BTreeMap<PathBuf, Hash32>,
+    skeletons: Vec<SceneSkeleton>,
     instances: Vec<(String, Vec<Placed>)>,
     files: &'a mut Vec<Input>,
     warnings: Vec<String>,
@@ -1078,12 +1089,17 @@ fn instancing_views(src: &Document, graph: &Graph) -> Vec<usize> {
     views
 }
 
-/// The world transforms of `n`'s copies: its world transform times each
-/// `EXT_mesh_gpu_instancing` instance, or its world transform alone.
+/// The world transforms of `n`'s copies: its world transform times each of [`instance_locals`].
 fn node_transforms(src: &Data<'_>, graph: &Graph, n: usize) -> Result<Vec<DMat4>, String> {
-    let world = graph.world[n];
+    let locals = instance_locals(src, n)?;
+    Ok(locals.into_iter().map(|l| graph.world[n] * l).collect())
+}
+
+/// Each `EXT_mesh_gpu_instancing` instance's transform of node `n`, the identity alone without
+/// the extension.
+fn instance_locals(src: &Data<'_>, n: usize) -> Result<Vec<DMat4>, String> {
     let Some(ext) = instancing(src.doc, n) else {
-        return Ok(vec![world]);
+        return Ok(vec![DMat4::IDENTITY]);
     };
     let what = format!("node {n} EXT_mesh_gpu_instancing");
     let read = |attribute: &str, k: usize| -> Result<Option<Vec<f32>>, String> {
@@ -1120,12 +1136,11 @@ fn node_transforms(src: &Data<'_>, graph: &Graph, n: usize) -> Result<Vec<DMat4>
             let s = sc
                 .as_ref()
                 .map_or(Vec3::ONE, |v| Vec3::from_slice(&v[3 * i..]));
-            world
-                * DMat4::from_scale_rotation_translation(
-                    s.as_dvec3(),
-                    r.as_dquat().normalize(),
-                    t.as_dvec3(),
-                )
+            DMat4::from_scale_rotation_translation(
+                s.as_dvec3(),
+                r.as_dquat().normalize(),
+                t.as_dvec3(),
+            )
         })
         .collect())
 }
@@ -1137,31 +1152,17 @@ fn instancing_data<'d>(b: &mut Imported<'_>, src: &'d Document, graph: &Graph) -
     Data::load(src, views, b.asset)
 }
 
-/// Every glTF mesh the scene places is a model, every node and instance holding it a
+/// Every glTF mesh that nodes `placed` hold is a model, every node and instance holding it a
 /// placement.
-fn meshes_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
-    let s = b.settings;
+fn meshes_layout(b: &mut Imported<'_>, graph: &Graph, placed: &[usize]) -> Result<()> {
     let src = Arc::clone(b.src);
     let doc = &src.doc;
-    let skinned = graph.order.iter().any(|&n| {
-        doc.nodes()
-            .nth(n)
-            .is_some_and(|d| surface_mesh(&d).is_some() && d.skin().is_some())
-    });
-    let needs_scene = [
-        (!s.models.is_empty(), "model selection"),
-        (!s.joined.is_empty(), "joined models"),
-        (skinned, "skins"),
-    ];
-    if let Some((_, what)) = needs_scene.iter().find(|n| n.0) {
-        return Err(b.fail(format!("{what} need the scene layout")));
-    }
     // Every placed mesh's buffer files, hashed together.
     let shown = b.shown.clone();
     b.warnings
         .extend(skipped_primitives(doc, shown.iter().copied()));
     let mut views = Vec::new();
-    for &n in &shown {
+    for &n in placed {
         if let Some(mesh) = doc.nodes().nth(n).and_then(|d| d.mesh()) {
             surfaces(&mesh).for_each(|p| primitive_views(&p, &mut views));
         }
@@ -1171,7 +1172,7 @@ fn meshes_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     // Per mesh, its placements per set of morph weights, the mesh's own first.
     type Placings = Vec<(Vec<f32>, Vec<DMat4>)>;
     let mut by_mesh: BTreeMap<usize, Placings> = BTreeMap::new();
-    for &n in &shown {
+    for &n in placed {
         let node = doc.nodes().nth(n).expect("node index");
         let Some(mesh) = surface_mesh(&node) else {
             continue;
@@ -1201,9 +1202,30 @@ fn meshes_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     Ok(())
 }
 
-/// The whole scene, or the selected nodes' subtrees, as models with node transforms
-/// applied, and instanced nodes as placed models. Returns the skeleton.
-fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkeleton>> {
+/// A model built from nodes, beside its [`Building`].
+struct Slot {
+    /// `None` for the whole scene.
+    name: Option<String>,
+    rig: Option<Rig>,
+    /// What its skeleton applies after model space ([`Skeleton::build`]).
+    after: DMat4,
+    /// Its instances' placements, if it is placed by them.
+    copies: Option<Vec<Placed>>,
+}
+
+impl Slot {
+    fn new(name: Option<String>, rig: Option<Rig>) -> Self {
+        Self {
+            name,
+            rig,
+            after: DMat4::IDENTITY,
+            copies: None,
+        }
+    }
+}
+
+/// The models of both layouts: what moves in rigs, and what stands still as the layout says.
+fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     let (asset, settings) = (b.asset, b.settings);
     let src = Arc::clone(b.src);
     let doc = &src.doc;
@@ -1211,34 +1233,162 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
         asset: asset.into(),
         message,
     };
+    let selecting = !settings.models.is_empty();
+    let by_mesh = settings.layout == GltfLayout::Meshes;
+    if by_mesh {
+        let needs_scene = [
+            (selecting, "model selection"),
+            (!settings.joined.is_empty(), "joined models"),
+        ];
+        if let Some((_, what)) = needs_scene.iter().find(|n| n.0) {
+            return Err(b.fail(format!("{what} need the scene layout")));
+        }
+    }
+    if settings.parts_from_skin && settings.parts_from_attribute.is_some() {
+        return Err(fail(
+            "parts_from_skin and parts_from_attribute do not mix".into(),
+        ));
+    }
+    let node = |n: usize| doc.nodes().nth(n).expect("node index");
     let shown = b.shown.clone();
-    let instanced: Vec<usize> = shown
+    let surfaced: Vec<usize> = shown
+        .iter()
+        .copied()
+        .filter(|&n| surface_mesh(&node(n)).is_some())
+        .collect();
+    let instanced: Vec<usize> = surfaced
         .iter()
         .copied()
         .filter(|&n| instancing(&src, n).is_some())
         .collect();
     let mut is_instanced = vec![false; graph.parent.len()];
     instanced.iter().for_each(|&n| is_instanced[n] = true);
-    let inst = instancing_data(b, &src, graph)?;
+    let skinned_copies = |n: usize| is_instanced[n] && node(n).skin().is_some();
+    let animated = skin::animated(doc, graph);
+    let rigging = Rigging {
+        doc,
+        graph,
+        animated: &animated,
+        parts_from_skin: settings.parts_from_skin,
+        parts_from_attribute: settings.parts_from_attribute.is_some(),
+    };
+    let (mut models, mut owner) = if by_mesh {
+        (Vec::new(), vec![None; graph.parent.len()])
+    } else {
+        select_models(doc, graph, &shown, settings).map_err(fail)?
+    };
+    let placed = shown.iter().copied();
+    let skipped = skipped_primitives(
+        doc,
+        placed.filter(|&n| owner[n].is_some() || instancing(&src, n).is_some()),
+    );
+    let elsewhere = !instanced.is_empty() || !skipped.is_empty();
+    if !by_mesh {
+        b.warnings.extend(skipped);
+    }
     for &n in &instanced {
-        let node = doc.nodes().nth(n).expect("node index");
-        let name = node
-            .name()
-            .map_or_else(|| format!("node{n}"), str::to_string);
-        let transforms = node_transforms(&inst, graph, n).map_err(fail)?;
-        let mesh = node.mesh().expect("instanced nodes have meshes");
-        let weights = node.weights().or(mesh.weights()).unwrap_or_default();
-        b.placed(&name, mesh.index(), weights, &transforms)?;
+        owner[n] = None;
+    }
+    let mut slots: Vec<Slot> = models
+        .iter()
+        .map(|m| {
+            let name = m.frame.map(|n| node_name(doc, n).to_string());
+            Slot::new(name, None)
+        })
+        .collect();
+    if selecting {
+        for (m, slot) in slots.iter_mut().enumerate() {
+            let held: Vec<usize> = surfaced
+                .iter()
+                .copied()
+                .filter(|&n| owner[n] == Some(m))
+                .collect();
+            slot.rig = Rig::find(&rigging, &held, models[m].frame, true).pop();
+        }
+    }
+    // What no selected model holds: with selection, only instanced nodes are cooked of that.
+    let free: Vec<usize> = surfaced
+        .iter()
+        .copied()
+        .filter(|&n| !skinned_copies(n) && (!selecting || is_instanced[n]))
+        .collect();
+    let rigs = Rig::find(&rigging, &free, None, false);
+    let mut rigged = vec![false; graph.parent.len()];
+    rigs.iter()
+        .flat_map(|r| &r.meshes)
+        .for_each(|&n| rigged[n] = true);
+    let still: Vec<usize> = free.iter().copied().filter(|&n| !rigged[n]).collect();
+
+    let inst = instancing_data(b, &src, graph)?;
+    if !by_mesh {
+        for &n in still.iter().filter(|&&n| is_instanced[n]) {
+            let name = instanced_name(doc, n);
+            let transforms = node_transforms(&inst, graph, n).map_err(fail)?;
+            let at = node(n);
+            let mesh = at.mesh().expect("instanced nodes have meshes");
+            let weights = at.weights().or(mesh.weights()).unwrap_or_default();
+            b.placed(&name, mesh.index(), weights, &transforms)?;
+        }
+    }
+    let part_values = settings
+        .parts_from_attribute
+        .as_ref()
+        .map_or(0, |p| usize::from(p.parts));
+    let whole = !selecting && !by_mesh && rigs.len() == 1 && still.iter().all(|&n| is_instanced[n]);
+    for rig in rigs {
+        let m = if whole {
+            0
+        } else {
+            let top = node_name(doc, rig.top);
+            let taken = |s: &Slot| s.name.as_deref() == Some(top);
+            let copied = |&n: &usize| skinned_copies(n) && instanced_name(doc, n) == top;
+            // `mesh` is the entry of the whole scene's mesh.
+            let unusable = top.is_empty() || top == "mesh" || b.names.contains(top);
+            let name = if unusable || slots.iter().any(taken) || instanced.iter().any(copied) {
+                format!("node{}", rig.top)
+            } else {
+                top.to_string()
+            };
+            models.push(Building::new(None, part_values));
+            slots.push(Slot::new(Some(name), None));
+            models.len() - 1
+        };
+        rig.meshes.iter().for_each(|&n| owner[n] = Some(m));
+        slots[m].rig = Some(rig);
+    }
+    // A skinned instanced node: per transform an instance holds or bakes, a model of its copies.
+    let mut placing: Vec<(usize, usize)> = surfaced
+        .iter()
+        .filter_map(|&n| Some((n, owner[n]?)))
+        .collect();
+    for &n in instanced.iter().filter(|&&n| skinned_copies(n)) {
+        let name = instanced_name(doc, n);
+        let locals = instance_locals(&inst, n).map_err(fail)?;
+        let (direct, baked) =
+            placements(&locals, false).map_err(|m| fail(format!("model {name}: {m}")))?;
+        let baked = baked
+            .into_iter()
+            .enumerate()
+            .map(|(k, (linear, copies))| (format!("{name}/baked/{k}"), linear, copies));
+        let direct = (!direct.is_empty()).then(|| (name.clone(), DMat4::IDENTITY, direct));
+        for (name, after, copies) in direct.into_iter().chain(baked) {
+            let rig = Rig::find(&rigging, &[n], None, true).pop();
+            let rig = rig.ok_or_else(|| fail(format!("node {n}: a skin without joints")))?;
+            placing.push((n, models.len()));
+            models.push(Building::new(None, part_values));
+            slots.push(Slot {
+                after,
+                copies: Some(copies),
+                ..Slot::new(Some(name), Some(rig))
+            });
+        }
     }
 
-    // The views of the other nodes' meshes, the skins and the animations; instanced nodes'
-    // meshes are read when they cook.
+    // The views of what cooks here, the skins and the animations; other meshes are read when
+    // they cook.
     let mut views = Vec::new();
-    for &n in &shown {
-        if is_instanced[n] {
-            continue;
-        }
-        if let Some(mesh) = doc.nodes().nth(n).and_then(|d| d.mesh()) {
+    for &(n, _) in &placing {
+        if let Some(mesh) = node(n).mesh() {
             for p in surfaces(&mesh) {
                 primitive_views(&p, &mut views);
                 for a in src.morph_accessors(mesh.index(), p.index()) {
@@ -1247,91 +1397,62 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
             }
         }
     }
-    for skin in doc.skins() {
-        if let Some(a) = skin.inverse_bind_matrices() {
-            Document::accessor_views(&a, &mut views);
+    let moves = slots.iter().any(|s| s.rig.is_some());
+    if moves {
+        for skin in doc.skins() {
+            if let Some(a) = skin.inverse_bind_matrices() {
+                Document::accessor_views(&a, &mut views);
+            }
         }
-    }
-    for s in doc
-        .animations()
-        .flat_map(|a| a.samplers().collect::<Vec<_>>())
-    {
-        Document::accessor_views(&s.input(), &mut views);
-        Document::accessor_views(&s.output(), &mut views);
+        for s in doc
+            .animations()
+            .flat_map(|a| a.samplers().collect::<Vec<_>>())
+        {
+            Document::accessor_views(&s.input(), &mut views);
+            Document::accessor_views(&s.output(), &mut views);
+        }
     }
     b.record(&mut views)?;
     let data = Data::load(&src, views, asset)?;
-
-    let mut skins: Vec<usize> = shown
-        .iter()
-        .filter_map(|&n| {
-            let node = doc.nodes().nth(n)?;
-            surface_mesh(&node)?;
-            Some(node.skin()?.index())
-        })
-        .collect();
-    skins.sort_unstable();
-    skins.dedup();
-    let unskinned: Vec<usize> = shown
-        .iter()
-        .copied()
-        .filter(|&n| {
-            let node = doc.nodes().nth(n).expect("node index");
-            node.skin().is_none() && surface_mesh(&node).is_some()
-        })
-        .collect();
-    let skeleton = Skeleton::build(&data, graph, &skins, &unskinned).map_err(fail)?;
-    if skeleton.is_some() && !settings.models.is_empty() {
-        return Err(fail(
-            "model selection needs a scene without skins: skinned vertices stay in bind space"
-                .into(),
-        ));
-    }
-    if !instanced.is_empty() && skeleton.is_some() {
-        return Err(fail("instanced nodes need a scene without skins".into()));
-    }
-    if settings.parts_from_skin && settings.parts_from_attribute.is_some() {
-        return Err(fail(
-            "parts_from_skin and parts_from_attribute do not mix".into(),
-        ));
-    }
-    let rigid = skeleton.as_ref().filter(|_| settings.parts_from_skin);
-    let (mut models, mut owner) = select_models(doc, graph, &shown, settings).map_err(fail)?;
-    let placed = shown.iter().copied();
-    let skipped = skipped_primitives(
-        doc,
-        placed.filter(|&n| owner[n].is_some() || is_instanced[n]),
-    );
-    let elsewhere = !instanced.is_empty() || !skipped.is_empty();
-    b.warnings.extend(skipped);
-    for &n in &instanced {
-        owner[n] = None;
-    }
-    let parts = settings.parts_from_attribute.as_ref();
-    let cx = Context {
-        skeleton: skeleton.as_ref(),
-        parts,
-        rigid: rigid.is_some(),
+    let spans = match moves {
+        true => skin::animation_spans(&data).map_err(fail)?,
+        false => Vec::new(),
     };
-    for &n in &shown {
-        let node = doc.nodes().nth(n).expect("node index");
-        let (Some(mesh), Some(m)) = (surface_mesh(&node), owner[n]) else {
-            continue;
-        };
+    let build = |s: &Slot| {
+        let rig = s.rig.as_ref();
+        rig.map(|r| Skeleton::build(&data, graph, r, s.after))
+            .transpose()
+    };
+    let skeletons: Vec<Option<Skeleton>> = slots
+        .iter()
+        .map(build)
+        .collect::<Result<_, _>>()
+        .map_err(fail)?;
+    let rigid: Vec<bool> = slots
+        .iter()
+        .map(|s| s.rig.as_ref().is_some_and(|r| r.rigid))
+        .collect();
+
+    let parts = settings.parts_from_attribute.as_ref();
+    for &(n, m) in &placing {
+        let mesh = surface_mesh(&node(n)).expect("a mesh with a surface");
         for prim in surfaces(&mesh) {
             b.material(mesh.index(), &prim)?;
             models[m].tangents |= b.carries_tangents(&prim);
         }
     }
-    for &n in &shown {
-        let node = doc.nodes().nth(n).expect("node index");
-        let (Some(mesh), Some(m)) = (surface_mesh(&node), owner[n]) else {
-            continue;
+    for &(n, m) in &placing {
+        let at = node(n);
+        let mesh = surface_mesh(&at).expect("a mesh with a surface");
+        let cx = Context {
+            skeleton: skeletons[m].as_ref(),
+            parts,
+            rigid: rigid[m],
         };
-        let (world, binding) = match (&skeleton, node.skin()) {
+        let (world, binding) = match (&skeletons[m], at.skin()) {
             (None, _) => (
                 models[m]
-                    .node
+                    .frame
                     .map_or(graph.world[n], |model| graph.relative(model, n)),
                 None,
             ),
@@ -1344,40 +1465,51 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
                 (mat, Some(Binding::Rigid(j)))
             }
         };
-        let weights = node.weights().or(mesh.weights()).unwrap_or_default();
-        for prim in surfaces(&mesh) {
-            let at = Placing {
-                mesh: mesh.index(),
-                world,
-                weights,
-                binding: binding.as_ref(),
-                tangent_set: b.tangent_set(&prim),
-                displaced: b.displaces(&prim),
-            };
-            append_primitive(&data, &prim, &at, &cx, &mut models[m]).map_err(|e| {
-                fail(format!(
-                    "mesh {} primitive {}: {e}",
-                    mesh.index(),
-                    prim.index()
-                ))
-            })?;
+        // A rig bakes the instances of a node that moves; a skin's are copies of the model.
+        let copies = match at.skin() {
+            None => instance_locals(&inst, n).map_err(fail)?,
+            Some(_) => vec![DMat4::IDENTITY],
+        };
+        let weights = at.weights().or(mesh.weights()).unwrap_or_default();
+        for copy in copies {
+            for prim in surfaces(&mesh) {
+                let placing = Placing {
+                    mesh: mesh.index(),
+                    world: world * copy,
+                    weights,
+                    binding: binding.as_ref(),
+                    tangent_set: b.tangent_set(&prim),
+                    displaced: b.displaces(&prim),
+                };
+                append_primitive(&data, &prim, &placing, &cx, &mut models[m]).map_err(|e| {
+                    fail(format!(
+                        "mesh {} primitive {}: {e}",
+                        mesh.index(),
+                        prim.index()
+                    ))
+                })?;
+            }
         }
     }
 
     let mut out = Vec::new();
-    for building in models {
-        let node = building.node;
-        // The whole scene may hold nothing but instanced nodes and primitives without a surface.
-        if node.is_none() && building.groups.values().all(Vec::is_empty) && elsewhere {
+    for (m, (building, slot)) in models.into_iter().zip(slots.iter_mut()).enumerate() {
+        let frame = building.frame;
+        let empty = building.groups.values().all(Vec::is_empty);
+        // The whole scene may hold nothing but what moves, instanced nodes and primitives
+        // without a surface.
+        if slot.name.is_none() && empty && (elsewhere || skeletons.len() > 1) {
             continue;
         }
-        let name = node.map(|n| node_name(doc, n).to_string());
+        let name = slot.name.take();
         if let Some(name) = &name {
             b.name(name)?;
         }
-        let joint_values = rigid.map(|_| building.v.values.clone());
-        let (mut mesh, groups) = building.finish(parts, skeleton.is_some() && rigid.is_none());
-        if let (Some(sk), Some(values)) = (rigid, joint_values) {
+        let sk = skeletons[m].as_ref();
+        let parts_of = sk.filter(|_| rigid[m]);
+        let joint_values = parts_of.map(|_| building.v.values.clone());
+        let (mut mesh, groups) = building.finish(parts, sk.is_some() && parts_of.is_none());
+        if let (Some(sk), Some(values)) = (parts_of, joint_values) {
             let joints = 0..sk.info.joint_count() as u16;
             mesh.parts = Some(PartData {
                 values,
@@ -1403,29 +1535,45 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
                 )
             })
             .collect();
+        let skeleton = match sk {
+            Some(sk) => {
+                b.skeletons.push(SceneSkeleton {
+                    prefix: name.clone().unwrap_or_default(),
+                    info: sk.info.clone(),
+                    clips: sk.clips(&data, &spans, &settings.clips).map_err(fail)?,
+                });
+                Some(b.skeletons.len() - 1)
+            }
+            None => None,
+        };
+        if let (Some(name), Some(copies)) = (&name, slot.copies.take()) {
+            b.instances.push((name.clone(), copies));
+        }
         out.push((
-            node,
+            frame,
             SceneModel {
                 settings: b.mesh_settings(name.as_deref().unwrap_or_default()),
                 node: name,
                 subd: None,
                 mesh: MeshSource::Data(Box::new(mesh)),
-                skeleton: skeleton.as_ref().map(|_| 0),
+                skeleton,
                 materials: groups.into_iter().map(|g| g.0).collect(),
             },
         ));
     }
     join(&mut out, graph, &settings.joined).map_err(fail)?;
-    let clips = match &skeleton {
-        Some(sk) => sk.clips(&data, &settings.clips).map_err(fail)?,
-        None => Vec::new(),
-    };
     b.models.extend(out.into_iter().map(|m| m.1));
-    Ok(skeleton.map(|s| SceneSkeleton {
-        prefix: String::new(),
-        info: s.info,
-        clips,
-    }))
+    if by_mesh {
+        meshes_layout(b, graph, &still)?;
+    }
+    Ok(())
+}
+
+/// The model name of instanced node `n`.
+fn instanced_name(doc: &gltf::Document, n: usize) -> String {
+    let node = doc.nodes().nth(n).expect("node index");
+    node.name()
+        .map_or_else(|| format!("node{n}"), str::to_string)
 }
 
 /// The scene's nodes in [`Graph::order`] without those hidden, with their subtrees, by
@@ -1539,6 +1687,7 @@ fn join(
     }
     let matches = |m: &SceneModel, p: &str| m.node.as_deref().is_some_and(|n| n.contains(p));
     let joined: Vec<usize> = (0..models.len())
+        .filter(|&i| models[i].0.is_some())
         .filter(|&i| patterns.iter().any(|p| matches(&models[i].1, p)))
         .collect();
     if let Some(p) = patterns

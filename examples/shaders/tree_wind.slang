@@ -6,7 +6,7 @@
 import orr_shaders.math;
 import orr_scene.tables;
 
-static const uint MAX_JOINTS = 256;
+static const uint MAX_JOINTS = 512;
 static const uint NO_PARENT = 0xFFFFFFFFu;
 
 // A joint's pivot in mesh space, its parent (NO_PARENT for a root; parents come first), the

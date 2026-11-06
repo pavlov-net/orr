@@ -35,7 +35,7 @@ use orr::orr_gpu::{
 use orr::orr_pack::material::Material;
 use orr::orr_pack::mesh::MeshInfo;
 use orr::orr_pack::model::ModelInfo;
-use orr::orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo};
+use orr::orr_pack::skeleton::{NO_PARENT, SkeletonInfo};
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
     CompilingKernels, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
@@ -71,6 +71,8 @@ const HEADLESS_FRAMES: u64 = 120;
 const FIRST_FRAME: u64 = 500;
 /// Unit xz direction the wind blows toward.
 const WIND: Vec2 = Vec2::new(0.8, 0.6);
+/// Joints the pose kernel holds: `tree_wind.slang` `MAX_JOINTS`.
+const POSE_JOINTS: usize = 512;
 /// Rad the most flexible chain of joints leans at its tip in a full gust, summed over it.
 const TIP_BEND: f32 = 0.22;
 /// Rad of flutter on the joints that flutter most.
@@ -146,7 +148,7 @@ fn cook_tree(args: &Args) -> PathBuf {
             .collect(),
         parts_from_attribute: args.part_attribute.as_ref().map(|name| PartAttribute {
             name: name.clone(),
-            parts: MAX_JOINTS as u16,
+            parts: POSE_JOINTS as u16,
             ..PartAttribute::default()
         }),
         parts_from_skin: args.part_attribute.is_none(),
@@ -204,10 +206,19 @@ fn model_name(archive: &Archive, wanted: Option<&str>) -> String {
             );
             w.to_string()
         }
-        None => names
-            .first()
-            .expect("the archive holds no model")
-            .to_string(),
+        // What stands still beside a rig is a model of its own, with no parts to pose.
+        None => {
+            let rigged = |n: &&&str| {
+                let info = ModelInfo::parse(&head(archive, AssetId::from_name(n))).expect("model");
+                info.header.skeleton != AssetId::NONE
+            };
+            names
+                .iter()
+                .find(rigged)
+                .or(names.first())
+                .expect("the archive holds no model")
+                .to_string()
+        }
     }
 }
 
@@ -294,8 +305,8 @@ fn rig(
     };
     let n = pivots.len();
     assert!(
-        n <= MAX_JOINTS,
-        "{n} joints; the pose kernel takes {MAX_JOINTS}"
+        n <= POSE_JOINTS,
+        "{n} joints; the pose kernel takes {POSE_JOINTS}"
     );
     let mut depth = vec![0u32; n];
     let mut leaf = vec![true; n];

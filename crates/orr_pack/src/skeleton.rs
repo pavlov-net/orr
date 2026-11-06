@@ -18,8 +18,11 @@ pub const SCHEMA: u16 = 1;
 /// Parent of a root joint.
 pub const NO_PARENT: u16 = u16::MAX;
 
-/// Joints per skeleton: mesh vertices name joints in a u8.
-pub const MAX_JOINTS: usize = 256;
+/// Joints per skeleton: parents name joints in a u16, short of [`NO_PARENT`].
+pub const MAX_JOINTS: usize = NO_PARENT as usize;
+
+/// Joints of a skeleton that skins a mesh: its vertices name joints in a u8.
+pub const MAX_SKINNED_JOINTS: usize = 256;
 
 /// Blob header. Spans name tables in the blob: `first` is a byte offset, `count` a record
 /// count, one record per joint.

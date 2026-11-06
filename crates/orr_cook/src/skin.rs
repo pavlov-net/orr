@@ -1,19 +1,24 @@
-//! glTF skins and animations: one skeleton per import and its clips; clip resampling from
-//! keyed channels, which USD animations share ([`resample`]).
+//! glTF skins and animations: skeletons and their clips, one skeleton per model; clip resampling
+//! from keyed channels, which USD animations share ([`resample`]).
 //!
-//! The skeleton holds every joint of the skins the scene's meshes use, plus their ancestors
-//! up to the scene roots, so model space is the scene's space and an animated ancestor
-//! animates the whole skeleton. Joints are ordered parents first (scene order, depth
-//! first); mesh joint indices are remapped to that order. Ancestors that no skin names get
-//! the inverse of their rest transform as inverse bind, or identity when it collapses an
-//! axis. A node that skins bind differently has one joint per inverse bind, neighbors with
-//! the same parent and pose. A mesh without a skin and with no joint above it sits still on
-//! one more joint, last, unnamed and at identity.
+//! A [`Rig`] is what one skeleton holds: the joints of the skins its meshes use, the nodes that
+//! animate what it moves, and every node between those. A node that animates nothing cooked is no
+//! joint. Static nodes above them fold into [`SkeletonInfo::root`], which keeps model space the
+//! scene's (or the frame's, in a framed model) and spends no joints; rigs that share no joint and
+//! no skin are separate rigs. Joints are ordered parents first (scene order, depth first); mesh
+//! joint indices are remapped to that order. A joint no skin names gets the inverse of its rest
+//! transform as inverse bind, or identity when that collapses an axis. A node that skins bind
+//! differently has one joint per inverse bind, neighbors with the same parent and pose.
+//!
+//! A rig of no skin cooks as rigid parts, one per joint ([`Rig::rigid`]). The renderer poses every
+//! part but part 0, so such a skeleton starts with a still joint: unnamed, at identity, holding
+//! what a clip must not move. A skinned model's mesh with no joint above it takes the same joint.
 //!
 //! Clips: every animation with a translation, rotation or scale channel on a skeleton
-//! joint. A clip runs from its first key to its last over every channel; it is resampled
-//! at the frame rate nearest the setting that fits a whole number of frame intervals, so
-//! both ends are frames, and the rate doubles until the clip's sampler holds every joint
+//! joint. A clip runs from the animation's first key to its last, over every channel it holds,
+//! whatever they target, so the clips one animation leaves on several skeletons keep time. It is
+//! resampled at the frame rate nearest the setting that fits a whole number of frame intervals,
+//! so both ends are frames, and the rate doubles until the clip's sampler holds every joint
 //! within [`ClipSettings`]' bounds of the source. Channels follow glTF sampling (`STEP`,
 //! `LINEAR` with slerp on the shorter arc, `CUBICSPLINE`; values clamp outside their keys);
 //! morph weight channels and channels on other nodes are ignored. A clip is named after its
@@ -26,7 +31,7 @@ use std::ops::Range;
 use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec4, Mat3, Mat4, Quat, Vec3, Vec4};
 use orr_pack::AssetId;
 use orr_pack::clip::{Clip, ClipHeader};
-use orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo, Trs, slerp};
+use orr_pack::skeleton::{MAX_JOINTS, MAX_SKINNED_JOINTS, NO_PARENT, SkeletonInfo, Trs, slerp};
 use serde::Deserialize;
 
 use crate::gltf::data::Data;
@@ -91,6 +96,35 @@ impl Graph {
         g
     }
 
+    /// `node` and the nodes above it, short of `stop`.
+    fn chain(&self, node: usize, stop: Option<usize>) -> impl Iterator<Item = usize> {
+        let above = |&n: &usize| self.parent[n];
+        std::iter::successors(Some(node), above).take_while(move |&n| Some(n) != stop)
+    }
+
+    /// Model space from the space of node `n`, in a model framed by `frame`, or in the scene
+    /// without one. The local transforms give it inside the frame, wherever a world transform
+    /// on the way has no inverse.
+    fn in_model(&self, frame: Option<usize>, n: usize) -> Result<DMat4, String> {
+        let Some(f) = frame else {
+            return Ok(self.world[n]);
+        };
+        if self.chain(n, None).any(|a| a == f) {
+            return Ok(self.relative(f, n));
+        }
+        Ok(self.outside(f)? * self.world[n])
+    }
+
+    /// Model space from the scene, in a model framed by `f`.
+    fn outside(&self, f: usize) -> Result<DMat4, String> {
+        if collapses(DMat3::from_mat4(self.world[f])) {
+            return Err(format!(
+                "node {f} frames a model with joints outside it, and collapses an axis"
+            ));
+        }
+        Ok(self.world[f].inverse())
+    }
+
     /// Node `ancestor`'s space from the space of `node`, in its subtree. The local transforms
     /// between them give it even where a world transform on the way has no inverse.
     pub(crate) fn relative(&self, ancestor: usize, node: usize) -> DMat4 {
@@ -103,37 +137,246 @@ impl Graph {
     }
 }
 
+/// The nodes an animation's translation, rotation or scale channel targets in the scene.
+pub(crate) fn animated(doc: &gltf::Document, graph: &Graph) -> Vec<bool> {
+    use gltf::animation::Property as P;
+    let mut animated = vec![false; graph.parent.len()];
+    for ch in doc
+        .animations()
+        .flat_map(|a| a.channels().collect::<Vec<_>>())
+    {
+        let n = ch.target().node().index();
+        animated[n] |= graph.in_scene[n] && ch.target().property() != P::MorphTargetWeights;
+    }
+    animated
+}
+
+/// What one skeleton holds.
+pub(crate) struct Rig {
+    /// Per node, whether it is a joint.
+    joints: Vec<bool>,
+    /// glTF skins of its meshes.
+    skins: Vec<usize>,
+    /// The mesh nodes that hang on it.
+    pub(crate) meshes: Vec<usize>,
+    /// The first joint in scene order, which names a model of its own.
+    pub(crate) top: usize,
+    /// The node that frames its model; without one, model space is the scene's.
+    frame: Option<usize>,
+    /// The nearest node above every root joint. Without one they hang from the frame, or from
+    /// the scene where one of them lies outside the frame.
+    above: Option<usize>,
+    outside: bool,
+    /// Its meshes cook as rigid parts instead of skinned vertices.
+    pub(crate) rigid: bool,
+    /// Holds a still joint.
+    still: bool,
+}
+
+/// How [`Rig::find`] reads the scene.
+pub(crate) struct Rigging<'a> {
+    pub(crate) doc: &'a gltf::Document,
+    pub(crate) graph: &'a Graph,
+    pub(crate) animated: &'a [bool],
+    /// Skins cook as rigid parts.
+    pub(crate) parts_from_skin: bool,
+    /// Parts come from a vertex attribute, which leaves joints to skinning.
+    pub(crate) parts_from_attribute: bool,
+}
+
+impl Rig {
+    /// The rigs of mesh nodes `meshes`, which share a model's frame `frame`: each moving mesh in
+    /// the one its motion belongs to, and the meshes with no motion in none. With `one`, the
+    /// meshes make up a model, and if any moves, a single rig holds them all.
+    pub(crate) fn find(
+        r: &Rigging<'_>,
+        meshes: &[usize],
+        frame: Option<usize>,
+        one: bool,
+    ) -> Vec<Self> {
+        let (doc, graph) = (r.doc, r.graph);
+        let count = graph.parent.len();
+        let skin_of = |n: usize| doc.nodes().nth(n).and_then(|d| d.skin());
+        let mut sets: Vec<usize> = (0..count).collect();
+        fn find(sets: &mut [usize], mut n: usize) -> usize {
+            while sets[n] != n {
+                sets[n] = sets[sets[n]];
+                n = sets[n];
+            }
+            n
+        }
+        let mut pinned = vec![false; count];
+        for skin in meshes.iter().filter_map(|&m| skin_of(m)) {
+            let mut skin_joints = skin.joints().map(|j| j.index());
+            let Some(first) = skin_joints.next() else {
+                continue;
+            };
+            pinned[first] = true;
+            for j in skin_joints {
+                pinned[j] = true;
+                let (a, b) = (find(&mut sets, j), find(&mut sets, first));
+                sets[a] = b;
+            }
+        }
+        let mut joints = vec![false; count];
+        // The movers at or above `from`, short of `stop`, with what is between them; the nearest
+        // of them.
+        let mut mark = |from: usize, stop: Option<usize>, sets: &mut [usize]| {
+            let chain: Vec<usize> = graph.chain(from, stop).collect();
+            let moves = |n: &usize| r.animated[*n] || pinned[*n];
+            let near = chain.iter().position(moves)?;
+            let far = chain.iter().rposition(moves)?;
+            for &n in &chain[near..=far] {
+                joints[n] = true;
+                let (a, b) = (find(sets, n), find(sets, chain[near]));
+                sets[a] = b;
+            }
+            Some(chain[near])
+        };
+        // A skin may name the frame itself, which poses it like any joint.
+        for j in (0..count).filter(|&j| pinned[j]).collect::<Vec<_>>() {
+            mark(j, frame.filter(|&f| f != j), &mut sets);
+        }
+        // Per mesh, a joint of the rig that moves it.
+        let mut anchors: Vec<(usize, Option<usize>)> = Vec::with_capacity(meshes.len());
+        for &m in meshes {
+            anchors.push(match skin_of(m) {
+                Some(s) => (m, s.joints().next().map(|j| j.index())),
+                None => (m, mark(m, frame, &mut sets)),
+            });
+        }
+        // Scene order. A joint out of the scene still makes a rig, for `Skeleton::build` to report.
+        let out_of_scene = (0..count).filter(|&n| joints[n] && !graph.in_scene[n]);
+        let in_scene = graph.order.iter().copied().filter(|&n| joints[n]);
+        let members: Vec<usize> = in_scene.chain(out_of_scene).collect();
+        if one && let Some(&first) = members.first() {
+            for &n in &members {
+                let (a, b) = (find(&mut sets, n), find(&mut sets, first));
+                sets[a] = b;
+            }
+        }
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut group_of: HashMap<usize, usize> = HashMap::new();
+        for &n in &members {
+            let g = *group_of.entry(find(&mut sets, n)).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[g].push(n);
+        }
+        let mut held: Vec<Vec<usize>> = vec![Vec::new(); groups.len()];
+        let mut still = false;
+        for &(m, anchor) in &anchors {
+            match anchor {
+                Some(a) => held[group_of[&find(&mut sets, a)]].push(m),
+                None if one && !held.is_empty() => {
+                    held[0].push(m);
+                    still = true;
+                }
+                None => {}
+            }
+        }
+        let mut rigs = Vec::with_capacity(groups.len());
+        for (own, held) in groups.into_iter().zip(held) {
+            let mut skins: Vec<usize> = held
+                .iter()
+                .filter_map(|&m| Some(skin_of(m)?.index()))
+                .collect();
+            skins.sort_unstable();
+            skins.dedup();
+            let rigid = r.parts_from_skin || (skins.is_empty() && !r.parts_from_attribute);
+            let mut rig = Self {
+                joints: vec![false; count],
+                skins,
+                meshes: held,
+                top: own[0],
+                frame,
+                above: None,
+                outside: false,
+                rigid,
+                still: still || rigid,
+            };
+            own.iter().for_each(|&n| rig.joints[n] = true);
+            rig.fold(graph, &own, still && !rigid);
+            rigs.push(rig);
+        }
+        rigs
+    }
+
+    /// Settles the space root joints hang from among `own`: the nearest node above them all.
+    /// The nodes short of it become joints, and with `unfolded`, every node up to the frame or
+    /// the scene does, for a still joint a root that does not invert could not undo.
+    fn fold(&mut self, graph: &Graph, own: &[usize], unfolded: bool) {
+        let roots: Vec<usize> = own
+            .iter()
+            .copied()
+            .filter(|&n| graph.parent[n].is_none_or(|p| !self.joints[p]))
+            .collect();
+        let below = |r: usize, f: usize| graph.chain(r, None).skip(1).any(|a| a == f);
+        self.outside = self
+            .frame
+            .is_some_and(|f| !roots.iter().all(|&r| below(r, f)));
+        let stop = self.frame.filter(|_| !self.outside);
+        let paths: Vec<Vec<usize>> = roots
+            .iter()
+            .map(|&r| {
+                let mut path: Vec<usize> = graph.chain(r, stop).skip(1).collect();
+                path.reverse();
+                path
+            })
+            .collect();
+        let common = match paths.split_first() {
+            _ if unfolded => 0,
+            Some((first, rest)) => (0..first.len())
+                .take_while(|&i| rest.iter().all(|p| p.get(i) == first.get(i)))
+                .count(),
+            None => 0,
+        };
+        self.above = common.checked_sub(1).map(|i| paths[0][i]);
+        for &n in paths.iter().flat_map(|p| &p[common..]) {
+            self.joints[n] = true;
+        }
+    }
+
+    /// Model space from the space of the root joints.
+    fn root(&self, graph: &Graph) -> Result<DMat4, String> {
+        match (self.above, self.frame) {
+            (Some(n), frame) => graph.in_model(frame, n),
+            (None, Some(f)) if self.outside => graph.outside(f),
+            (None, _) => Ok(DMat4::IDENTITY),
+        }
+    }
+}
+
 pub(crate) struct Skeleton {
     pub(crate) info: SkeletonInfo,
-    /// glTF node per joint, but for `still`, which has none.
-    nodes: Vec<usize>,
+    /// glTF node per joint; a still joint has none.
+    nodes: Vec<Option<usize>>,
     /// The first joint of each node.
     joint_of: HashMap<usize, u16>,
     /// Per glTF skin: the skeleton joint of each of its joints.
     skins: HashMap<usize, Vec<u16>>,
     inverse_binds: Vec<DMat4>,
-    /// The joint of meshes with no skin and no joint above them.
+    /// The frame of its model.
+    frame: Option<usize>,
+    /// The joint of meshes with no joint above them.
     still: Option<u16>,
 }
 
 impl Skeleton {
-    /// The skeleton of `skins` (glTF skin indices), or `None` without skins. `unskinned` are the
-    /// nodes that hold a mesh and no skin.
+    /// The skeleton of `rig`, with `after` applied to its model space: the mesh keeps its bind
+    /// pose, so a linear transform no placement holds goes here.
     pub(crate) fn build(
         data: &Data<'_>,
         graph: &Graph,
-        skins: &[usize],
-        unskinned: &[usize],
-    ) -> Result<Option<Self>, String> {
-        if skins.is_empty() {
-            return Ok(None);
-        }
+        rig: &Rig,
+        after: DMat4,
+    ) -> Result<Self, String> {
         let doc = &data.doc.doc;
-        let mut wanted = vec![false; graph.parent.len()];
         // Per node its distinct inverse binds, and per skin each joint's node and bind among them.
         let mut binds: HashMap<usize, Vec<Mat4>> = HashMap::new();
-        let mut bound: Vec<(usize, Vec<(usize, usize)>)> = Vec::with_capacity(skins.len());
-        for &s in skins {
+        let mut bound: Vec<(usize, Vec<(usize, usize)>)> = Vec::with_capacity(rig.skins.len());
+        for &s in &rig.skins {
             let skin = doc.skins().nth(s).expect("skin index");
             let mats: Vec<Mat4> = match skin.inverse_bind_matrices() {
                 Some(a) => data
@@ -170,37 +413,41 @@ impl Skeleton {
                     own.len() - 1
                 });
                 joints.push((i, k));
-                let mut a = Some(i);
-                while let Some(n) = a.filter(|&n| !wanted[n]) {
-                    wanted[n] = true;
-                    a = graph.parent[n];
-                }
             }
             bound.push((s, joints));
         }
-        let nodes: Vec<usize> = graph
-            .order
+        let still = rig.still.then_some(0u16);
+        let nodes: Vec<Option<usize>> = still
             .iter()
-            .filter(|&&n| wanted[n])
-            .flat_map(|&n| std::iter::repeat_n(n, binds.get(&n).map_or(1, Vec::len)))
+            .map(|_| None)
+            .chain(
+                graph
+                    .order
+                    .iter()
+                    .filter(|&&n| rig.joints[n])
+                    .flat_map(|&n| std::iter::repeat_n(Some(n), binds.get(&n).map_or(1, Vec::len))),
+            )
             .collect();
-        let held = |&n: &usize| {
-            let mut above = std::iter::successors(Some(n), |&a| graph.parent[a]);
-            above.any(|a| wanted[a])
+        let most = if rig.rigid {
+            MAX_JOINTS
+        } else {
+            MAX_SKINNED_JOINTS
         };
-        let still = (!unskinned.iter().all(held)).then_some(nodes.len() as u16);
-        let joints = nodes.len() + usize::from(still.is_some());
-        if joints > MAX_JOINTS {
+        if nodes.len() > most {
             return Err(format!(
-                "skeleton of {joints} joints with ancestors; at most {MAX_JOINTS}"
+                "skeleton of {} joints with the nodes between them; at most {most}",
+                nodes.len()
             ));
         }
         let mut joint_of: HashMap<usize, u16> = HashMap::new();
-        for (j, &n) in nodes.iter().enumerate() {
-            joint_of.entry(n).or_insert(j as u16);
+        for (j, n) in nodes.iter().enumerate() {
+            if let Some(n) = n {
+                joint_of.entry(*n).or_insert(j as u16);
+            }
         }
+        let root = rig.root(graph)?;
         let mut info = SkeletonInfo {
-            root: Affine3::IDENTITY,
+            root: Affine3::from_mat4((after * root).as_mat4()),
             parents: Vec::with_capacity(nodes.len()),
             rest: Vec::with_capacity(nodes.len()),
             inverse_binds: Vec::with_capacity(nodes.len()),
@@ -208,32 +455,39 @@ impl Skeleton {
         };
         let mut inverse_binds = Vec::with_capacity(nodes.len());
         for (j, &n) in nodes.iter().enumerate() {
+            let Some(n) = n else {
+                // Undoes the root, where it can: a rigid body's part takes no pose.
+                let ib = match collapses(DMat3::from_mat4(root)) {
+                    true => DMat4::IDENTITY,
+                    false => root.inverse(),
+                };
+                info.parents.push(NO_PARENT);
+                info.rest.push(Trs::IDENTITY);
+                inverse_binds.push(ib);
+                info.inverse_binds.push(Affine3::from_mat4(ib.as_mat4()));
+                info.names.push(String::new());
+                continue;
+            };
             let node = doc.nodes().nth(n).expect("node index");
-            let world = graph.world[n];
-            if !world.as_mat4().is_finite() {
+            let rest_pose = graph.in_model(rig.frame, n)?;
+            if !rest_pose.as_mat4().is_finite() {
                 return Err(format!("node {n}: its transform is not finite"));
             }
+            let parent = graph.parent[n].filter(|&p| rig.joints[p]);
             info.parents
-                .push(graph.parent[n].map_or(NO_PARENT, |p| joint_of[&p]));
+                .push(parent.map_or(NO_PARENT, |p| joint_of[&p]));
             info.rest.push(rest(&node)?);
             // Without an inverse, the identity is a bind that poses what `attach` hangs on the
             // joint: its space is the bind space, which keeps the depth a flat rest pose hides
             // for a pose that unflattens the joint.
             let ib = match binds.get(&n) {
                 Some(own) => own[j - usize::from(joint_of[&n])].as_dmat4(),
-                None if collapses(DMat3::from_mat4(world)) => DMat4::IDENTITY,
-                None => world.inverse(),
+                None if collapses(DMat3::from_mat4(rest_pose)) => DMat4::IDENTITY,
+                None => rest_pose.inverse(),
             };
             inverse_binds.push(ib);
             info.inverse_binds.push(Affine3::from_mat4(ib.as_mat4()));
             info.names.push(node.name().unwrap_or_default().to_string());
-        }
-        if still.is_some() {
-            info.parents.push(NO_PARENT);
-            info.rest.push(Trs::IDENTITY);
-            inverse_binds.push(DMat4::IDENTITY);
-            info.inverse_binds.push(Affine3::IDENTITY);
-            info.names.push(String::new());
         }
         let skins = bound
             .into_iter()
@@ -242,14 +496,15 @@ impl Skeleton {
                 (s, joints.into_iter().map(joint).collect())
             })
             .collect();
-        Ok(Some(Self {
+        Ok(Self {
             info,
             nodes,
             joint_of,
             skins,
             inverse_binds,
+            frame: rig.frame,
             still,
-        }))
+        })
     }
 
     /// The joints of the node whose first joint is `first`.
@@ -265,10 +520,8 @@ impl Skeleton {
         let j = usize::from(j);
         let ib = self.inverse_binds[j];
         if collapses(DMat3::from_mat4(ib)) {
-            return Err(format!(
-                "the inverse bind of node {} has no inverse",
-                self.nodes[j]
-            ));
+            let node = self.nodes[j].expect("a still joint's bind inverts");
+            return Err(format!("the inverse bind of node {node} has no inverse"));
         }
         Ok(ib.inverse())
     }
@@ -285,27 +538,29 @@ impl Skeleton {
     }
 
     /// For a mesh node without a skin: the joint it follows rigidly (itself or its nearest
-    /// skeleton ancestor, else the still joint) and the transform from its local space to bind
-    /// space, so the joint's skinning matrix moves it with the joint. The joints of one node pose
-    /// alike, so any whose bind has an inverse will do.
+    /// skeleton ancestor in the model, else the still joint) and the transform from its local
+    /// space to bind space, so the joint's skinning matrix moves it with the joint. The joints of
+    /// one node pose alike, so any whose bind has an inverse will do.
     pub(crate) fn attach(&self, node: usize, graph: &Graph) -> Result<(u16, DMat4), String> {
-        let mut a = Some(node);
-        while let Some(n) = a {
+        for n in graph.chain(node, self.frame) {
             if let Some(&first) = self.joint_of.get(&n) {
                 let mut joints = self.joints_from(usize::from(first)).map(|j| j as u16);
                 let j = joints.find(|&j| self.bind(j).is_ok()).unwrap_or(first);
                 return Ok((j, self.bind(j)? * graph.relative(n, node)));
             }
-            a = graph.parent[n];
         }
-        let still = self.still.expect("`build` saw every node without a skin");
-        Ok((still, graph.world[node]))
+        let still = self
+            .still
+            .expect("`Rig::find` saw every mesh without a joint");
+        Ok((still, graph.in_model(self.frame, node)?))
     }
 
-    /// Clips of every animation that moves the skeleton, with their names.
+    /// Clips of every animation that moves the skeleton, with their names. `spans` is
+    /// [`animation_spans`].
     pub(crate) fn clips(
         &self,
         data: &Data<'_>,
+        spans: &[(f64, f64)],
         settings: &ClipSettings,
     ) -> Result<Vec<(String, Clip)>, String> {
         settings.check()?;
@@ -358,7 +613,7 @@ impl Skeleton {
             if channels.is_empty() {
                 continue;
             }
-            let clip = resample(&self.info, &channels, settings);
+            let clip = resample(&self.info, &channels, spans[anim.index()], settings);
             clips.push((anim.index(), anim.name().unwrap_or_default(), clip));
         }
         let mut count: HashMap<&str, usize> = HashMap::new();
@@ -376,14 +631,38 @@ impl Skeleton {
     }
 }
 
-/// The clip of `channels` (checked), resampled at the rate nearest `settings.rate` that fits
-/// a whole number of frame intervals, doubling until the clip's sampler holds every joint
-/// within the settings' bounds or the rate reaches `max_rate`.
-pub(crate) fn resample(info: &SkeletonInfo, channels: &[Channel], settings: &ClipSettings) -> Clip {
+/// Per glTF animation the start and length in seconds of its keys, over every channel it holds.
+pub(crate) fn animation_spans(data: &Data<'_>) -> Result<Vec<(f64, f64)>, String> {
+    let mut spans = Vec::with_capacity(data.doc.doc.animations().len());
+    for anim in data.doc.doc.animations() {
+        let (mut first, mut last) = (f32::MAX, f32::MIN);
+        for ch in anim.channels() {
+            let times = data.floats(&ch.sampler().input(), 1);
+            let times = times.map_err(|m| format!("animation {}: {m}", anim.index()))?;
+            if let (Some(&a), Some(&b)) = (times.first(), times.last()) {
+                first = first.min(a);
+                last = last.max(b);
+            }
+        }
+        spans.push((f64::from(first), f64::from(last) - f64::from(first)));
+    }
+    Ok(spans)
+}
+
+/// The clip of `channels` (checked) over `span` (the start and length, in seconds), resampled at
+/// the rate nearest `settings.rate` that fits a whole number of frame intervals, doubling until
+/// the clip's sampler holds every joint within the settings' bounds or the rate reaches
+/// `max_rate`.
+pub(crate) fn resample(
+    info: &SkeletonInfo,
+    channels: &[Channel],
+    span: (f64, f64),
+    settings: &ClipSettings,
+) -> Clip {
     let mut rate = settings.rate;
     loop {
-        let clip = sample(info, channels, rate);
-        let (position, rotation) = error(info, channels, &clip);
+        let clip = sample(info, channels, span, rate);
+        let (position, rotation) = error(info, channels, span, &clip);
         if (position <= settings.position_error && rotation <= settings.rotation_error)
             || rate * 2.0 > settings.max_rate
         {
@@ -408,10 +687,10 @@ fn pose(info: &SkeletonInfo, channels: &[Channel], t: f64) -> Vec<Trs> {
     pose
 }
 
-/// The channels sampled from their first key to their last at the rate nearest `rate`
-/// that fits a whole number of frame intervals.
-fn sample(info: &SkeletonInfo, channels: &[Channel], rate: f32) -> Clip {
-    let (start, duration) = span(channels);
+/// The channels sampled over `span` at the rate nearest `rate` that fits a whole number of frame
+/// intervals.
+fn sample(info: &SkeletonInfo, channels: &[Channel], span: (f64, f64), rate: f32) -> Clip {
+    let (start, duration) = span;
     let intervals = if duration > 0.0 {
         (duration * f64::from(rate)).round().max(1.0) as u32
     } else {
@@ -451,8 +730,8 @@ fn sample(info: &SkeletonInfo, channels: &[Channel], rate: f32) -> Clip {
 
 /// Largest model-space joint error of `clip` against the channels, in meters and
 /// degrees, over every key time and the middle of every frame interval.
-fn error(info: &SkeletonInfo, channels: &[Channel], clip: &Clip) -> (f32, f32) {
-    let (start, duration) = span(channels);
+fn error(info: &SkeletonInfo, channels: &[Channel], span: (f64, f64), clip: &Clip) -> (f32, f32) {
+    let (start, duration) = span;
     let h = &clip.header;
     let mut times: Vec<f64> = channels
         .iter()
@@ -524,7 +803,7 @@ impl ClipSettings {
 }
 
 /// First key time and the time to the last, over every channel.
-fn span(channels: &[Channel]) -> (f64, f64) {
+pub(crate) fn span(channels: &[Channel]) -> (f64, f64) {
     let start = channels.iter().map(|c| c.times[0]).fold(f32::MAX, f32::min);
     let end = channels
         .iter()
@@ -722,7 +1001,7 @@ pub(crate) fn influences(
     sets: &[InfluenceSet],
     map: &[u16],
     v: usize,
-) -> Result<([u8; 4], [u8; 4]), String> {
+) -> Result<([u16; 4], [u8; 4]), String> {
     let mut list: Vec<(u16, f32)> = Vec::with_capacity(4 * sets.len());
     for (joints, weights) in sets {
         for (&j, &w) in joints[v].iter().zip(&weights[v]) {
@@ -758,12 +1037,12 @@ pub(crate) fn influences(
     for &i in by_frac.iter().take(short as usize) {
         q[i] += 1;
     }
-    let first = list[0].0 as u8;
+    let first = list[0].0;
     let mut joints = [first; 4];
     let mut weights = [0; 4];
     for (s, ((j, _), w)) in list.iter().zip(q).enumerate() {
         if w > 0 {
-            joints[s] = *j as u8;
+            joints[s] = *j;
             weights[s] = w;
         }
     }

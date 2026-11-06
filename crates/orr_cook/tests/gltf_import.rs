@@ -327,18 +327,23 @@ fn single_joint_skins_cook_as_rigid_parts() {
     let pivots: Vec<_> = m.info.parts.iter().map(|p| (p.pivot, p.joint)).collect();
     assert_eq!(
         pivots,
-        [([0.0, 0.0, 0.25], 0), ([0.5, 0.0, 0.0], 1), ([0.0; 3], 2)]
+        [
+            ([0.0; 3], 0),
+            ([0.0, 0.0, 0.25], 1),
+            ([0.5, 0.0, 0.0], 2),
+            ([0.0; 3], 3)
+        ]
     );
-    let mut cooked = [0u32; 2];
+    // Part 0 is the still joint, which no vertex follows: both joints here take a pose.
+    let mut cooked = [0u32; 3];
     for (c, ..) in &m.clusters {
         cooked[usize::from(c.part)] += u32::from(c.tri_count);
-        let animated = c.flags & Cluster::ANIMATED_PART != 0;
-        assert_eq!(animated, c.part == 1);
+        assert_ne!(c.flags & Cluster::ANIMATED_PART, 0);
     }
-    let mut expected = [0u32; 2];
+    let mut expected = [0u32; 3];
     for t in idx.chunks(3) {
         let v = [0, 1, 2].map(|k| joint[t[k] as usize]);
-        expected[if v[0] == v[1] || v[0] == v[2] {
+        expected[1 + if v[0] == v[1] || v[0] == v[2] {
             v[0]
         } else {
             v[1]
@@ -1517,11 +1522,15 @@ fn rigid_meshes_follow_joints_with_a_flattened_rest_pose() {
     let jv = g.view(bytemuck::cast_slice(&[[0u8; 4]; 3]), None);
     let ja = g.accessor(jv, 5121, 3, "VEC4", "");
     let wa = g.floats(&[[1.0f32, 0.0, 0.0, 0.0]; 3], "VEC4");
+    let ta = g.floats(&[[0.0f32], [1.0]], "SCALAR");
+    let sa = g.floats(&[[2.0f32, 2.0, 0.0], [2.0, 2.0, 2.0]], "VEC3");
     g.write(
         &path,
         &format!(
             r#""scene":0,"scenes":[{{"nodes":[0,4]}}],
-"nodes":[{{"name":"root","matrix":[2,0,0,0, 0,2,0,0, 0,0,0,0, 0,0,0,1],"children":[1,3]}},
+"animations":[{{"samplers":[{{"input":{ta},"output":{sa}}}],
+"channels":[{{"sampler":0,"target":{{"node":0,"path":"scale"}}}}]}}],
+"nodes":[{{"name":"root","scale":[2,2,0],"children":[1,3]}},
 {{"name":"hip","translation":[1,0,0],"children":[2]}},
 {{"mesh":0,"translation":[0,1,0]}},{{"mesh":0,"translation":[0,0,5]}},
 {{"mesh":1,"skin":0}}],
