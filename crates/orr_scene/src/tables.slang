@@ -133,7 +133,7 @@ public struct GroupGpu
     public float log2_scale_max;
     // A group hung from a joint: the palette group holding the joint and its entry there, which
     // takes every entry from its bind space to its pose. Null for none.
-    public GroupGpu* frame;
+    public uint8_t* frame;  // a GroupGpu*, which Metal cannot emit inside GroupGpu itself
     public uint frame_index;
     public float3 frame_origin;    // the group's anchor in the palette's space
 }
@@ -568,7 +568,7 @@ float3x4 stored_entry(GroupGpu* group, uint8_t* transforms, uint index)
 public float3x4 group_entry(GroupGpu* group, bool previous, uint index)
 {
     float3x4 m = stored_entry(group, previous ? group.previous : group.current, index);
-    GroupGpu* palette = group.frame;
+    GroupGpu* palette = (GroupGpu*)group.frame;
     if (palette == nullptr || palette_unset(m))
         return m;
     uint8_t* joints = previous ? palette.previous : palette.current;

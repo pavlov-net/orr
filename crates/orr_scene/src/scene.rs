@@ -428,7 +428,7 @@ impl Group {
             // and their pack's unmount write it null first.
             let records = unsafe { GpuPtr::from_address(GpuAddress(p.records)) };
             return GroupGpu {
-                frame: frame.palette,
+                frame: frame.palette.cast(),
                 frame_index: frame.index,
                 frame_origin: frame.origin,
                 current: records,
@@ -456,7 +456,7 @@ impl Group {
             format: 0,
             anchor_cell: self.anchor.cell.to_array(),
             anchor_offset: self.anchor.offset.to_array(),
-            frame: frame.palette,
+            frame: frame.palette.cast(),
             frame_index: frame.index,
             frame_origin: frame.origin,
             ..Zeroable::zeroed()
