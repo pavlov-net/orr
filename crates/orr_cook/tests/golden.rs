@@ -29,8 +29,8 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     ),
     (
         Class::Material as u16,
-        7,
-        "00387b7a5e709c50574990cf1fbbd8dc2ec221d554ee6dc29ac6afb706a1850f",
+        8,
+        "e9804847bb2747a77298fb9fd06d61899389f185f09d757744af3331efbb3d19",
     ),
     (
         Class::Model as u16,

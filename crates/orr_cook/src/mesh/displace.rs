@@ -5,7 +5,8 @@
 //! same positions, so the split mesh stays watertight. Every vertex at a position moves
 //! along the mean normal of the baked vertices there, by their mean displacement, so seams
 //! and borders with other sections move alike. [`MeshData::moves`](super::MeshData::moves) takes
-//! that normal to the vertices' space where it is held. Normals become the area-weighted face
+//! that normal to the vertices' space where it is held. A height across the surface moves it
+//! along the direction its uvs give there. Normals become the area-weighted face
 //! normals at each position. The baked sections are then simplified to `target_error`.
 
 use orr_math::{DVec3, Vec3};
@@ -31,21 +32,33 @@ pub(super) fn bake(
 
     // Mean displacement, and summed normals and moves of a height of 1, per position over the
     // baked vertices.
-    let mut at: FxHashMap<[u32; 3], (f64, DVec3, DVec3, u32)> = FxHashMap::default();
+    let mut at: FxHashMap<[u32; 3], (f64, DVec3, DVec3, u32, DVec3)> = FxHashMap::default();
     for (s, r) in w.sections.iter().enumerate() {
         let Some(disp) = maps[s].displacement.as_ref().filter(|_| baked[s]) else {
             continue;
         };
         let heights = disp.vertex_heights(&w.uvs[disp.uv_set], w.section_triangles(s));
+        let [along_u, along_v] = maps[s].tangent_displacement.each_ref().map(|d| {
+            d.as_ref()
+                .map(|d| d.vertex_heights(&w.uvs[d.uv_set], w.section_triangles(s)))
+        });
+        let frames = (along_u.is_some() || along_v.is_some())
+            .then(|| uv_frames(w, &w.indices[r.clone()], disp.uv_set));
         for &v in &w.indices[r.clone()] {
             let height = heights[&v];
+            let frame = frames.as_ref().and_then(|f| f.get(&v)).copied();
+            let [u, t] = [&along_u, &along_v].map(|h| h.as_ref().map_or(0.0, |h| h[&v]));
             let v = v as usize;
             let e = at.entry(w.positions[v].map(f32::to_bits)).or_insert((
                 0.0,
                 DVec3::ZERO,
                 DVec3::ZERO,
                 0,
+                DVec3::ZERO,
             ));
+            if let Some([tangent, bitangent]) = frame {
+                e.4 += tangent * f64::from(u) + bitangent * f64::from(t);
+            }
             e.0 += f64::from(height);
             let unit = Vec3::from(w.normals[v]).normalize_or_zero().to_array();
             let [normal, moved] = w.moves.as_ref().map_or([unit; 2], |m| m[v]);
@@ -55,7 +68,7 @@ pub(super) fn bake(
         }
     }
     for p in &mut w.positions {
-        if let Some(&(sum, n, moved, count)) = at.get(&p.map(f32::to_bits)) {
+        if let Some(&(sum, n, moved, count, across)) = at.get(&p.map(f32::to_bits)) {
             // A move is linear in its normal, so the unit mean normal's is the sum's over its size.
             let unit = n.length_recip();
             let along = if unit.is_finite() {
@@ -63,12 +76,44 @@ pub(super) fn bake(
             } else {
                 DVec3::ZERO
             };
-            let offset = along * (sum / f64::from(count));
+            let offset = (along * sum + across) / f64::from(count);
             *p = (Vec3::from(*p).as_dvec3() + offset).as_vec3().to_array();
         }
     }
     smooth_normals(w, &baked);
     baked
+}
+
+/// Per vertex of triangle list `indices`, unit directions in the surface where u grows and where
+/// st's t grows, which is against the cook's v.
+fn uv_frames(w: &Welded, indices: &[u32], set: usize) -> FxHashMap<u32, [DVec3; 2]> {
+    let mut sums: FxHashMap<u32, [DVec3; 2]> = FxHashMap::default();
+    for t in indices.chunks_exact(3) {
+        let [a, b, c] = [t[0], t[1], t[2]].map(|v| v as usize);
+        let point = |i: usize| Vec3::from(w.positions[i]).as_dvec3();
+        let uv = |i: usize| w.uvs[set][i].map(f64::from);
+        let (e1, e2) = (point(b) - point(a), point(c) - point(a));
+        let ([ua, va], [ub, vb], [uc, vc]) = (uv(a), uv(b), uv(c));
+        let (u1, v1, u2, v2) = (ub - ua, vb - va, uc - ua, vc - va);
+        let r = u1 * v2 - u2 * v1;
+        if r == 0.0 {
+            continue;
+        }
+        let along = ((e1 * v2 - e2 * v1) / r).normalize_or_zero();
+        let across = ((e1 * u2 - e2 * u1) / r).normalize_or_zero();
+        for &v in t {
+            let sum = sums.entry(v).or_default();
+            sum[0] += along;
+            sum[1] += across;
+        }
+    }
+    for (&v, frame) in &mut sums {
+        let n = Vec3::from(w.normals[v as usize])
+            .normalize_or_zero()
+            .as_dvec3();
+        *frame = frame.map(|d| (d - n * n.dot(d)).normalize_or_zero());
+    }
+    sums
 }
 
 /// Longest-edge bisection of the baked sections' triangles until no edge is over

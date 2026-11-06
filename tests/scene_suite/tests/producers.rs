@@ -1416,14 +1416,31 @@ fn texture_displacement_moves_patches_along_the_normal_by_the_materials_texture(
     // Nothing inverts a collapsed axis, and the height stays finite along the mesh's normal.
     let flat = Mat3::from_diagonal(Vec3::new(1.0, 0.0, 1.0));
     textured_heights(flat, world, 1.0);
+    // Heights across the surface follow its uvs: u up x, and t, against the cook's v, down z.
+    moved_patches(Mat3::IDENTITY, 0, 1.0, [0.3, -0.2], true);
+    moved_patches(double, world, 0.5, [0.3, -0.2], true);
+    // Uvs that span no surface give those heights no direction.
+    moved_patches(double, world, 0.5, [0.3, -0.2], false);
 }
 
 /// A plane placed by `linear`, of a material with `flags`, displaces by the texture's height times
 /// `share` along y in the entry's space.
 fn textured_heights(linear: Mat3, flags: u32, share: f32) {
+    moved_patches(linear, flags, share, [0.0; 2], true);
+}
+
+/// [`textured_heights`] with heights of `across` along u and t, which `share` scales too, on a
+/// plane of one uv everywhere unless `uvs`.
+fn moved_patches(linear: Mat3, flags: u32, share: f32, across: [f32; 2], uvs: bool) {
     let d = device();
     let mut plane = Plane::new(4.0);
     plane.linear = linear;
+    if !uvs {
+        let attrs = plane.gpu[1].as_mut_slice().unwrap();
+        bytemuck::cast_slice_mut::<u8, [u32; 2]>(attrs)
+            .iter_mut()
+            .for_each(|a| a[1] = 0);
+    }
     // Every texel of a 4 x 4 R16 displacement texture at 0.75.
     let texel = (0.75f32 * 65535.0).round() as u16;
     let desc = TextureDesc::d2(Format::R16Unorm, 4, 4, TextureUsage::SAMPLED);
@@ -1456,6 +1473,10 @@ fn textured_heights(linear: Mat3, flags: u32, share: f32) {
         d.sampler(&SamplerDesc::default()).unwrap();
     m.displacement_scale = 0.2;
     m.displacement_offset = -0.1;
+    if across != [0.0; 2] {
+        m.flags |= material_flags::DISPLACED_TANGENT;
+        m.displacement_tangent = [0.0, across[0], 0.0, across[1]];
+    }
     let material = plane.material(&m);
     let materials = [material];
     let desc = plane.desc(&materials, 0, 4096);
@@ -1468,6 +1489,13 @@ fn textured_heights(linear: Mat3, flags: u32, share: f32) {
     assert_eq!(stats.welded, 0, "{stats:?}");
     let want = share * (0.2 * f32::from(texel) / 65535.0 - 0.1);
     assert!(!g.positions.is_empty());
+    if across != [0.0; 2] {
+        let moved = across.map(|a| if uvs { share * a } else { 0.0 });
+        let lowest_x = g.positions.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+        let highest_z = g.positions.iter().map(|p| p.z).fold(f32::MIN, f32::max);
+        assert!((lowest_x + 2.0 - moved[0]).abs() < 1e-4, "{lowest_x}");
+        assert!((highest_z + moved[1]).abs() < 1e-4, "{highest_z}");
+    }
     for (p, a) in g.positions.iter().zip(&g.attrs) {
         assert!((p.y - want).abs() < 1e-4, "{p} against height {want}");
         let n = Vec3::from(orr_pack::mesh::oct_decode(a[0]));

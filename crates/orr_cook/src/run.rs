@@ -1711,7 +1711,10 @@ fn plan_scene(
         .iter()
         .flat_map(|m| {
             let remapped = m.textures.colors().filter(|r| r.remap.is_some());
-            m.textures.displacement.iter().chain(remapped)
+            let across = [slot::DISPLACEMENT_U, slot::DISPLACEMENT_V]
+                .into_iter()
+                .filter_map(|s| m.textures.more.get(&s).and_then(Option::as_ref));
+            m.textures.displacement.iter().chain(remapped).chain(across)
         })
         .flat_map(|r| read_as(r.image))
         .collect();
@@ -1960,6 +1963,9 @@ fn bakes_displacement(settings: &MeshSettings, maps: &MapSpec) -> bool {
 fn static_material_unit(name: &str, m: &Material) -> NewUnit<'static> {
     let mut m = *m;
     m.textures[slot::DISPLACEMENT] = bytemuck::Zeroable::zeroed();
+    m.textures[slot::DISPLACEMENT_U] = bytemuck::Zeroable::zeroed();
+    m.textures[slot::DISPLACEMENT_V] = bytemuck::Zeroable::zeroed();
+    m.displacement_tangent = [[0.0; 4]; 2];
     m.displacement_scale = 0.0;
     m.displacement_offset = 0.0;
     m.displacement_min = 0.0;
@@ -2004,17 +2010,32 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, MapTexture>) -> MapSpec {
         (Material::MASK, Some(_)) => OpacitySpec::Unknown,
         _ => OpacitySpec::None,
     };
-    let displacement = bound(slot::DISPLACEMENT).map(|b| DisplacementSpec {
-        scale: m.displacement_scale,
-        offset: m.displacement_offset,
-        min: m.displacement_min,
-        max: m.displacement_max,
-        texture: b.0.map(|t| DisplacementTexture {
-            texture: t.clone(),
-            read: read(slot::DISPLACEMENT),
-            uv_set: b.1,
-        }),
-    });
+    let height = |s: usize, [scale, offset, min, max]: [f32; 4]| {
+        bound(s).map(|b| DisplacementSpec {
+            scale,
+            offset,
+            min,
+            max,
+            texture: b.0.map(|t| DisplacementTexture {
+                texture: t.clone(),
+                read: read(s),
+                uv_set: b.1,
+            }),
+        })
+    };
+    let displacement = height(
+        slot::DISPLACEMENT,
+        [
+            m.displacement_scale,
+            m.displacement_offset,
+            m.displacement_min,
+            m.displacement_max,
+        ],
+    );
+    let tangent_displacement = [
+        height(slot::DISPLACEMENT_U, m.displacement_tangent[0]),
+        height(slot::DISPLACEMENT_V, m.displacement_tangent[1]),
+    ];
     let frame_set = usize::from(m.tangent_set());
     let normal = match bound(slot::NORMAL).filter(|_| !m.object_normal(slot::NORMAL)) {
         _ if mesh::reads_tangent(m) => NormalSpec::Tangent { frame_set },
@@ -2028,6 +2049,7 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, MapTexture>) -> MapSpec {
         Some((None, _)) => NormalSpec::Tangent { frame_set },
     };
     MapSpec {
+        tangent_displacement,
         opacity,
         displacement,
         normal,
@@ -2404,9 +2426,8 @@ fn section_maps(
                 })
             }
         };
-        let displacement = match &s.maps.displacement {
-            None => None,
-            Some(d) => Some(Displacement {
+        let mut height = |d: &DisplacementSpec| -> Result<Displacement> {
+            Ok(Displacement {
                 scale: d.scale,
                 offset: d.offset,
                 min: d.min,
@@ -2435,8 +2456,14 @@ fn section_maps(
                     None => None,
                 },
                 uv_set: d.texture.as_ref().map_or(0, |t| t.uv_set),
-            }),
+            })
         };
+        let displacement = s.maps.displacement.as_ref().map(&mut height).transpose()?;
+        let [u, v] = &s.maps.tangent_displacement;
+        let tangent_displacement = [
+            u.as_ref().map(&mut height).transpose()?,
+            v.as_ref().map(&mut height).transpose()?,
+        ];
         let normal = match &s.maps.normal {
             NormalSpec::Texture {
                 texture,
@@ -2456,6 +2483,7 @@ fn section_maps(
         out.push(SectionMaps {
             opacity,
             displacement,
+            tangent_displacement,
             normal,
         });
     }

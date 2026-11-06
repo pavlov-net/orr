@@ -288,6 +288,15 @@ public Corners load_corners(uint8_t* page, Cluster c, uint triangle, MeshGpu* me
     return t;
 }
 
+// Where u grows and where v shrinks, up the image, on a triangle of edges `e1` and `e2` along which
+// the uv changes by `uv1` and `uv2`, at no set size: 0 where its uvs span no surface.
+public void uv_directions(float3 e1, float3 e2, float2 uv1, float2 uv2, out float3 along, out float3 across)
+{
+    float r = uv1.x * uv2.y - uv2.x * uv1.y;
+    along = r != 0.0 ? (e1 * uv2.y - e2 * uv1.y) / r : float3(0.0);
+    across = r != 0.0 ? (e1 * uv2.x - e2 * uv1.x) / r : float3(0.0);
+}
+
 // The tangent that follows `set` on triangle `t`, at weights `w`: the mesh's where its tangents
 // do, else that of the triangle's uv in the set, whose `frame` normal is then `n`. `e1` and `e2`
 // are its edges, and `unit` and `mirror` what the placement gives directions.
@@ -306,10 +315,9 @@ float4 triangle_tangent(Corners t, uint attributes, uint set, float3 w, float3x3
     bool set1 = set == 1;
     float2 uv1 = (set1 ? a1.uv[1] : a1.uv[0]) - (set1 ? a0.uv[1] : a0.uv[0]);
     float2 uv2 = (set1 ? a2.uv[1] : a2.uv[0]) - (set1 ? a0.uv[1] : a0.uv[0]);
-    float r = uv1.x * uv2.y - uv2.x * uv1.y;
-    float3 tt = r != 0.0 ? (e1 * uv2.y - e2 * uv1.y) / r : float3(0.0);
     // Uv v runs down the image and a normal map's y up it.
-    float3 bt = r != 0.0 ? (e1 * uv2.x - e2 * uv1.x) / r : float3(0.0);
+    float3 tt, bt;
+    uv_directions(e1, e2, uv1, uv2, tt, bt);
     if (dot(tt, tt) == 0.0)
     {
         float3 tb;

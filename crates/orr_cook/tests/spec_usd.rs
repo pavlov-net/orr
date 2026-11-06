@@ -2971,6 +2971,35 @@ fn a_baked_height_holds_under_a_placement_scale() {
     }
 }
 
+/// Nodes `displacement`: "the vector signature allows displacement in tangent/normal space using
+/// (dPdu, dPdv, N) coordinates": x along u, y along t, and z along the normal.
+#[test]
+fn a_vector_displacement_bakes_along_the_uvs_and_the_normal() {
+    let d = dir("vector-displacement");
+    let outputs = "token outputs:mtlx:surface.connect = </M/S.outputs:out>
+    token outputs:mtlx:displacement.connect = </M/D.outputs:out>";
+    let prims = format!(
+        r#"{}
+    def Shader "D"
+    {{
+        uniform token info:id = "ND_displacement_vector3"
+        vector3f inputs:displacement = (0.25, 0.5, 0.125)
+        token outputs:out
+    }}"#,
+        open_pbr("")
+    );
+    let a = cook_at(&d, &mtlx_material(outputs, &prims), baking()).unwrap();
+    let lowest = |axis: usize| {
+        let points = corners(&a, "u/mesh");
+        points.iter().map(|c| c.0[axis]).fold(f32::MAX, f32::min)
+    };
+    let moved = [lowest(0), lowest(1), lowest(2)];
+    assert!(
+        Vec3::from(moved).abs_diff_eq(Vec3::new(0.25, 0.5, 0.125), 1e-3),
+        "{moved:?}"
+    );
+}
+
 /// Cluster bounds and baked heights read a tile as they read the same image clamped.
 #[test]
 fn heights_on_one_tile_cook_as_on_the_same_image() {

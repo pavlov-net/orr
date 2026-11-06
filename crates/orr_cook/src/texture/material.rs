@@ -20,7 +20,8 @@
 //! - Displacement: R16 unorm from red, never collapsed; displacement is
 //!   `displacement_scale x texel + displacement_offset`. A height `h` stores across the
 //!   range `lo..hi` the image measures, as `(h - lo) / (hi - lo)`, with the scale and offset
-//!   compensated; a range past 0..1 widens the declared one.
+//!   compensated; a range past 0..1 widens the declared one. Heights along u and v cook alike,
+//!   each from its own channel, into [`Material::displacement_tangent`].
 //! - An image whose texels all lie within 1/255 of one value collapses into the material's
 //!   factor, clamped to the input's range as a texture stores it; a constant normal image, which
 //!   has no factor, cooks at 4x4. Under `MASK` an opacity image collapses only when its texels
@@ -313,6 +314,8 @@ enum More {
     Color,
     /// The first two channels of a direction, with its role.
     Direction(&'static str),
+    /// A height along tangent axis 0 or 1, with its role.
+    Height(usize, &'static str),
 }
 
 impl More {
@@ -332,6 +335,8 @@ impl More {
             slot::SUBSURFACE_ANISOTROPY => Self::Signed("subsurface_anisotropy"),
             slot::TANGENT => Self::Direction("tangent"),
             slot::COAT_TANGENT => Self::Direction("coat_tangent"),
+            slot::DISPLACEMENT_U => Self::Height(0, "displacement_u"),
+            slot::DISPLACEMENT_V => Self::Height(1, "displacement_v"),
             slot::BASE_WEIGHT => Self::Weight("base_weight"),
             slot::DIFFUSE_ROUGHNESS => Self::Weight("diffuse_roughness"),
             slot::ANISOTROPY => Self::Weight("anisotropy"),
@@ -1476,7 +1481,11 @@ impl<'a> Packer<'a> {
             specular: remap(t.specular, |c| c.specular)?,
             coat: remap(t.coat, |c| c.coat)?,
             transmission: remap(t.transmission, |c| c.transmission)?,
-            displacement: remap(t.displacement, |c| c.displacement)?,
+            // The channels of a vector are its axes, which no scalar input's channel stands for.
+            displacement: match t.displacement {
+                Some(r) if t.more.contains_key(&slot::DISPLACEMENT_U) => Some(r),
+                r => remap(r, |c| c.displacement)?,
+            },
             ..t.clone()
         };
         if let Some(r) = &t.base_color {
@@ -1663,53 +1672,19 @@ impl<'a> Packer<'a> {
             };
         }
         if let Some(r) = &t.displacement {
-            let channel = usize::from(r.channel);
-            // An image with no finite texels leaves no span to measure.
-            let (lo, hi) = match self.input_range(r) {
-                (lo, hi) if (hi - lo).is_finite() => (lo, hi),
-                _ => (0.0, 1.0),
-            };
-            let (lo, hi) = if self.bounded(r) {
-                (lo.min(r.outside[channel]), hi.max(r.outside[channel]))
-            } else {
-                (lo, hi)
-            };
-            let span = hi - lo;
-            // A constant image stores 0, and the offset holds its height.
-            let b = if span.recip().is_finite() {
-                span.recip()
-            } else {
-                0.0
-            };
-            let shrink = self.constant(r, channel).is_some();
-            let id = self.make_each(suffix, r, |s, cell| {
-                let r = s.at(r, cell);
-                let channel = usize::from(r.channel);
-                Pack {
-                    role: "displacement",
-                    encoding: Encoding::Raw(DataFormat::R16),
-                    channels: vec![s.source(&r, 0, channel, -lo * b, b)],
-                    refs: vec![r],
-                    coverage: None,
-                    toksvig: None,
-                    normal: false,
-                    shrink,
-                    tile: None,
-                }
-            })?;
-            bind(m, slot::DISPLACEMENT, id, 0, r);
-            m.displacement_offset += m.displacement_scale * lo;
-            m.displacement_scale *= span;
-            // Importers declare the span of a 0..1 texel. A height past it widens that, and any
-            // range a patch declared, which otherwise stands for the mesh cook to check.
-            if lo < 0.0 || hi > 1.0 {
-                let (a, b) = (
-                    m.displacement_offset,
-                    m.displacement_offset + m.displacement_scale,
-                );
-                m.displacement_min = m.displacement_min.min(a.min(b));
-                m.displacement_max = m.displacement_max.max(a.max(b));
-            }
+            let mut h = [
+                m.displacement_scale,
+                m.displacement_offset,
+                m.displacement_min,
+                m.displacement_max,
+            ];
+            self.height(suffix, m, r, slot::DISPLACEMENT, "displacement", &mut h)?;
+            [
+                m.displacement_scale,
+                m.displacement_offset,
+                m.displacement_min,
+                m.displacement_max,
+            ] = h;
         }
         for (&s, r) in &t.more {
             if let Some(r) = r {
@@ -1842,10 +1817,73 @@ impl<'a> Packer<'a> {
         Ok(false)
     }
 
+    /// Packs height texture `r` into slot `s`, whose `h` is scale, offset and declared range.
+    fn height(
+        &mut self,
+        suffix: &str,
+        m: &mut Material,
+        r: &TexRef,
+        s: usize,
+        role: &'static str,
+        h: &mut [f32; 4],
+    ) -> Result<()> {
+        let channel = usize::from(r.channel);
+        // An image with no finite texels leaves no span to measure.
+        let (lo, hi) = match self.input_range(r) {
+            (lo, hi) if (hi - lo).is_finite() => (lo, hi),
+            _ => (0.0, 1.0),
+        };
+        let (lo, hi) = if self.bounded(r) {
+            (lo.min(r.outside[channel]), hi.max(r.outside[channel]))
+        } else {
+            (lo, hi)
+        };
+        let span = hi - lo;
+        // A constant image stores 0, and the offset holds its height.
+        let b = if span.recip().is_finite() {
+            span.recip()
+        } else {
+            0.0
+        };
+        let shrink = self.constant(r, channel).is_some();
+        let id = self.make_each(suffix, r, |s, cell| {
+            let r = s.at(r, cell);
+            let channel = usize::from(r.channel);
+            Pack {
+                role,
+                encoding: Encoding::Raw(DataFormat::R16),
+                channels: vec![s.source(&r, 0, channel, -lo * b, b)],
+                refs: vec![r],
+                coverage: None,
+                toksvig: None,
+                normal: false,
+                shrink,
+                tile: None,
+            }
+        })?;
+        bind(m, s, id, 0, r);
+        h[1] += h[0] * lo;
+        h[0] *= span;
+        // Importers declare the span of a 0..1 texel. A height past it widens that, and any
+        // range a patch declared, which otherwise stands for the mesh cook to check.
+        if lo < 0.0 || hi > 1.0 {
+            let (a, b) = (h[1], h[1] + h[0]);
+            h[2] = h[2].min(a.min(b));
+            h[3] = h[3].max(a.max(b));
+        }
+        Ok(())
+    }
+
     /// Cooks input `r` of slot `s`, from [`slot::MORE`] on.
     fn more(&mut self, suffix: &str, m: &mut Material, s: usize, r: &TexRef) -> Result<()> {
         match More::of(s) {
             More::Color => self.color(suffix, m, r, s, true),
+            More::Height(axis, role) => {
+                let mut h = m.displacement_tangent[axis];
+                self.height(suffix, m, r, s, role, &mut h)?;
+                m.displacement_tangent[axis] = h;
+                Ok(())
+            }
             More::Weight(role) => {
                 let factor = *scalar_field(m, s);
                 *scalar_field(m, s) = match self.constant_input(r) {
@@ -2714,7 +2752,7 @@ impl TextureJob {
                 grid: self.grid.map(|g| g.map(u32::from)),
                 normal: p.normal,
                 coverage: p.coverage,
-                height: p.role == "displacement",
+                height: p.role.starts_with("displacement"),
             },
             full_chain: true,
             quality: self.quality,

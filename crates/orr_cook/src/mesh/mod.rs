@@ -371,6 +371,8 @@ impl SectionData {
 pub(crate) struct MapSpec {
     pub(crate) opacity: OpacitySpec,
     pub(crate) displacement: Option<DisplacementSpec>,
+    /// Along the surface's u and v, beside `displacement`.
+    pub(crate) tangent_displacement: [Option<DisplacementSpec>; 2],
     pub(crate) normal: NormalSpec,
     pub(crate) uv1: bool,
 }
@@ -487,7 +489,13 @@ impl MapSpec {
             NormalSpec::Texture { texture, .. } => Some(texture),
             _ => None,
         };
-        let textures = opacity.into_iter().chain(displacement).chain(normal);
+        let tangents = self.tangent_displacement.iter().flatten();
+        let tangents = tangents.filter_map(|d| d.texture.as_ref().map(|t| &t.texture));
+        let textures = opacity
+            .into_iter()
+            .chain(displacement)
+            .chain(tangents)
+            .chain(normal);
         textures.flat_map(MapTexture::units)
     }
 
@@ -502,14 +510,19 @@ impl MapSpec {
             } => format!("texture {:?} {cutoff:?} {read:?} {uv_set}", texture.key),
             o => format!("{o:?}"),
         };
-        let displacement = self.displacement.as_ref().map(|d| {
+        let height = |d: &DisplacementSpec| {
             (
                 [d.scale, d.offset, d.min, d.max],
                 d.texture
                     .as_ref()
                     .map(|t| (t.texture.key, t.read, t.uv_set)),
             )
-        });
+        };
+        let displacement = self.displacement.as_ref().map(height);
+        let tangents = self
+            .tangent_displacement
+            .each_ref()
+            .map(|d| d.as_ref().map(height));
         let normal = match &self.normal {
             NormalSpec::Texture {
                 texture,
@@ -519,7 +532,10 @@ impl MapSpec {
             } => format!("texture {:?} {read:?} {uv_set} {frame_set}", texture.key),
             n => format!("{n:?}"),
         };
-        format!("{opacity} {displacement:?} {normal} {}", self.uv1)
+        format!(
+            "{opacity} {displacement:?} {tangents:?} {normal} {}",
+            self.uv1
+        )
     }
 }
 
@@ -528,6 +544,8 @@ impl MapSpec {
 pub(crate) struct SectionMaps {
     pub(crate) opacity: Option<Opacity>,
     pub(crate) displacement: Option<Displacement>,
+    /// Along the surface's u and v.
+    pub(crate) tangent_displacement: [Option<Displacement>; 2],
     /// Mip 0 of the [`NormalSpec::Texture`] map, stored x and y.
     pub(crate) normal: Option<Map<[Raster; 2]>>,
 }
@@ -574,7 +592,8 @@ pub(crate) fn cook(
         Grid::new(&w.positions, s.position_step_log2, m.min_exponent).map_err(fail)?;
     let mut parts = lod::Parts::new(&w, m, &source_grid).map_err(fail)?;
     for (si, sec) in m.sections.iter().enumerate() {
-        if let Some(d) = &maps[si].displacement {
+        let tangents = maps[si].tangent_displacement.iter().flatten();
+        for d in maps[si].displacement.iter().chain(tangents) {
             d.check_range()
                 .map_err(|e| fail(format!("section {si}: {e}")))?;
             warnings.extend(lod::displacement_seams(&w, &source_grid, si, d));
@@ -797,11 +816,24 @@ impl Ctx<'_> {
             && !self.baked[usize::from(section)]
         {
             // Stored uvs, which the runtime reads: their rounding can cross a tile's edge.
-            let stored = stored(d.uv_set);
-            let at = |i: u8| stored[usize::from(i)];
-            let [lo, hi] = d.bounds(tris.as_chunks::<3>().0.iter().map(|t| t.map(at)));
-            c.record.displacement_min = f16_down(lo);
-            c.record.displacement_max = f16_up(hi);
+            let bounds = |d: &Displacement| {
+                let stored = stored(d.uv_set);
+                let at = |i: u8| stored[usize::from(i)];
+                d.bounds(tris.as_chunks::<3>().0.iter().map(|t| t.map(at)))
+            };
+            let [lo, hi] = bounds(d);
+            // A move across the surface is no longer than these, in any direction.
+            let across: f32 = section_maps
+                .tangent_displacement
+                .iter()
+                .flatten()
+                .map(|d| {
+                    let [lo, hi] = bounds(d);
+                    lo.abs().max(hi.abs())
+                })
+                .sum();
+            c.record.displacement_min = f16_down(lo - across);
+            c.record.displacement_max = f16_up(hi + across);
         }
         c
     }

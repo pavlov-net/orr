@@ -71,10 +71,7 @@ pub(super) fn build(
     let mut order: Vec<u32> = (0..cage.face_counts.len() as u32).collect();
     order.sort_by_key(|&f| (section_of(f), f));
 
-    let reach: Vec<f32> = materials
-        .iter()
-        .map(|m| m.displacement_min.abs().max(m.displacement_max.abs()))
-        .collect();
+    let reach: Vec<f32> = materials.iter().map(Material::displacement_reach).collect();
     let mut pages = Vec::new();
     let mut infos: Vec<PageInfo> = Vec::new();
     let mut page = PageBuilder::default();
@@ -508,6 +505,7 @@ mod tests {
         let mut materials = [Material::default(); 2];
         materials[1].displacement_min = -0.05;
         materials[1].displacement_max = 0.1;
+        materials[1].displacement_tangent = [[0.0, 0.0, 0.0, 0.2], [0.0, 0.0, -0.05, 0.0]];
         let data = CageData {
             cage: cage.clone(),
             skin: None,
@@ -538,7 +536,7 @@ mod tests {
                     let e = (0..3).map(|i| (p[i] - q[i]).abs()).fold(0.0, f32::max);
                     assert!(e <= 1e-5 * size, "{:?} of face {}", corners[k], face.ptex);
                 }
-                let reach = if face.section == 1 { 0.1 } else { 0.0 };
+                let reach = if face.section == 1 { 0.35 } else { 0.0 };
                 for &u in &steps {
                     for &v in &steps {
                         let l = page.limit(f, u, v, &points).unwrap();

@@ -379,6 +379,12 @@ float3 displaced(Patch pt, PatchItem item, uint material, float3 w, bool previou
     i.normal = base.normal;
     i.material = material;
     i.linear = placing;
+    float3 e1 = tri.corners.position[1] - tri.corners.position[0];
+    float3 e2 = tri.corners.position[2] - tri.corners.position[0];
+    float3 along, across;
+    uv_directions(e1, e2, uvs[1] - uvs[0], uvs[2] - uvs[0], along, across);
+    i.tangent = unit_direction(along - base.normal * dot(base.normal, along), float3(0.0));
+    i.bitangent = unit_direction(across - base.normal * dot(base.normal, across), float3(0.0));
     float2 inward = (uvs[0] + uvs[1] + uvs[2]) / 3.0 - base.uv;
     UvFootprint f = { base.uv, (uvs[1] - uvs[0]) / item.rate, (uvs[2] - uvs[0]) / item.rate, float2(-1.0), inward };
     i.uv[0] = f;

@@ -112,6 +112,9 @@ pub struct Material {
     /// Declared displacement range, used for bounds.
     pub displacement_min: f32,
     pub displacement_max: f32,
+    /// Of the displacement along the surface's u and v directions, [`slot::DISPLACEMENT_U`] and
+    /// [`slot::DISPLACEMENT_V`]: scale, offset, declared lowest and highest.
+    pub displacement_tangent: [[f32; 4]; 2],
     /// [`Self::OPAQUE`], [`Self::MASK`] or [`Self::BLEND`].
     pub alpha_mode: u8,
     /// By default (0), back faces are not drawn and do not emit light, but rays still hit them
@@ -201,6 +204,13 @@ impl Material {
         }
     }
 
+    /// How far the declared displacement ranges can move a point of the surface, in any direction.
+    pub fn displacement_reach(&self) -> f32 {
+        let reach = |lo: f32, hi: f32| lo.abs().max(hi.abs());
+        let across = self.displacement_tangent.map(|[.., lo, hi]| reach(lo, hi));
+        reach(self.displacement_min, self.displacement_max) + across[0] + across[1]
+    }
+
     /// The uv set the tangent frame follows, 0 or 1, or [`Self::TANGENT_SET_OTHER`].
     pub fn tangent_set(&self) -> u8 {
         let map = [slot::NORMAL, slot::COAT_NORMAL]
@@ -215,10 +225,10 @@ impl Material {
 
 /// Texture slots. All but `NORMAL`, `COAT_NORMAL`, `EMISSION`, `EMISSION_LUMINANCE`,
 /// `SPECULAR_WEIGHT`, `SPECULAR_IOR`, `COAT_IOR`, `THIN_FILM_IOR`, `THIN_FILM_THICKNESS`,
-/// `SUBSURFACE_RADIUS` and `DISPLACEMENT` read values of 0..1. Nothing clamps what they sample: a
-/// signed texture bound to one is the caller's responsibility. A value multiplies its field,
-/// with three exceptions: `TANGENT` and `COAT_TANGENT` hold a direction in the tangent plane in
-/// their first two channels at `0.5 v + 0.5`, on top of the field's rotation, and
+/// `SUBSURFACE_RADIUS` and the three of displacement read values of 0..1. Nothing clamps what they
+/// sample: a signed texture bound to one is the caller's responsibility. A value multiplies its
+/// field, with three exceptions: `TANGENT` and `COAT_TANGENT` hold a direction in the tangent plane
+/// in their first two channels at `0.5 v + 0.5`, on top of the field's rotation, and
 /// `SUBSURFACE_ANISOTROPY` holds the anisotropy at `0.5 g + 0.5`, in place of the field.
 pub mod slot {
     pub const BASE_COLOR: usize = 0;
@@ -257,7 +267,9 @@ pub mod slot {
     pub const THIN_FILM_THICKNESS: usize = 33;
     pub const THIN_FILM_IOR: usize = 34;
     pub const EMISSION_LUMINANCE: usize = 35;
-    pub const COUNT: usize = 36;
+    pub const DISPLACEMENT_U: usize = 36;
+    pub const DISPLACEMENT_V: usize = 37;
+    pub const COUNT: usize = 38;
     /// Slots from here on read only for a material that binds one of them.
     pub const MORE: usize = SPECULAR_COLOR;
 }
@@ -327,6 +339,7 @@ impl Default for Material {
             displacement_offset: 0.0,
             displacement_min: 0.0,
             displacement_max: 0.0,
+            displacement_tangent: [[0.0; 4]; 2],
             alpha_mode: Self::OPAQUE,
             double_sided: 0,
             thin_walled: 0,

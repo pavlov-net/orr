@@ -2034,26 +2034,72 @@ impl Mapper<'_, '_> {
         }
         let scale = self.float(n, "scale", 1.0)?;
         let height = self.value(n, "displacement")?;
-        let vector = match &height {
-            None => false,
-            Some(Value::Constant(v, _)) => v.len() > 1 && v.iter().any(|&c| c != 0.0),
-            Some(Value::Texture(t)) => t.channels == Channels::Rgb,
-            Some(Value::Vertex { width, .. }) => *width > 1,
-        };
-        if vector {
-            return Err(format!(
-                "{}: displacement must read one channel, along the normal",
-                self.node(n).name
-            ));
+        match height {
+            None => Ok(()),
+            // Nodes: "in tangent/normal space using (dPdu, dPdv, N) coordinates".
+            Some(Value::Constant(v, unit)) if v.len() > 1 && v.iter().any(|&c| c != 0.0) => {
+                let along =
+                    |c: usize| Value::Constant(vec![v.get(c).copied().unwrap_or(0.0)], unit);
+                self.tangent_height(n, 0, along(0), scale)?;
+                self.tangent_height(n, 1, along(1), scale)?;
+                self.normal_height(n, along(2), scale)
+            }
+            Some(Value::Texture(t)) if t.channels == Channels::Rgb => {
+                let channel = |c: u8| {
+                    Value::Texture(Tex {
+                        channels: Channels::One(c),
+                        ..t
+                    })
+                };
+                self.tangent_height(n, 0, channel(0), scale)?;
+                self.tangent_height(n, 1, channel(1), scale)?;
+                self.normal_height(n, channel(2), scale)
+            }
+            Some(h) => self.displaced(n, h, scale),
         }
-        height.map_or(Ok(()), |h| self.displaced(n, h, scale))
+    }
+
+    /// `height` times `scale` along tangent `axis`, 0 for u and 1 for v.
+    fn tangent_height(
+        &mut self,
+        n: usize,
+        axis: usize,
+        height: Value,
+        scale: f32,
+    ) -> Result<(), String> {
+        let s = [slot::DISPLACEMENT_U, slot::DISPLACEMENT_V][axis];
+        let (t, heights) = self.height(n, height, scale)?;
+        self.material.displacement_tangent[axis] = heights;
+        self.textures.more.insert(s, Some(t.tex_ref()));
+        Ok(())
+    }
+
+    /// [`Self::displaced`] where a zero stands too: the tangents read beside it.
+    fn normal_height(&mut self, n: usize, height: Value, scale: f32) -> Result<(), String> {
+        let (t, [scale, offset, lo, hi]) = self.height(n, height, scale)?;
+        let m = &mut self.material;
+        m.displacement_world = 1;
+        m.displacement_scale = scale;
+        m.displacement_offset = offset;
+        m.displacement_min = lo;
+        m.displacement_max = hi;
+        self.textures.displacement = Some(t.tex_ref());
+        Ok(())
     }
 
     /// Sets the displacement of node `n` to `height` times `scale`, in meters. A constant height
     /// reads a solid image at the offset.
     fn displaced(&mut self, n: usize, height: Value, scale: f32) -> Result<(), String> {
+        match height {
+            Value::Constant(v, _) if v[0] == 0.0 => Ok(()),
+            height => self.normal_height(n, height, scale),
+        }
+    }
+
+    /// What reads `height` times `scale`, in meters: its texture, and the texture's scale and
+    /// offset, then the lowest and highest it reaches.
+    fn height(&mut self, n: usize, height: Value, scale: f32) -> Result<(Tex, [f32; 4]), String> {
         let (t, unit, heights) = match height {
-            Value::Constant(v, _) if v[0] == 0.0 => return Ok(()),
             Value::Constant(v, unit) => (self.solid([0.0; 3]), unit, (0.0, v[0])),
             Value::Texture(t) => {
                 let c = t.channel();
@@ -2063,13 +2109,7 @@ impl Mapper<'_, '_> {
         };
         let meters = f64::from(scale) * self.meters(n, "displacement", unit)?;
         let (scale, offset) = (scaled(heights.0, meters), scaled(heights.1, meters));
-        let m = &mut self.material;
-        m.displacement_world = 1;
-        m.displacement_scale = scale;
-        m.displacement_offset = offset;
-        m.displacement_min = offset.min(offset + scale);
-        m.displacement_max = offset.max(offset + scale);
-        self.textures.displacement = Some(t.tex_ref());
-        Ok(())
+        let (lo, hi) = (offset.min(offset + scale), offset.max(offset + scale));
+        Ok((t, [scale, offset, lo, hi]))
     }
 }

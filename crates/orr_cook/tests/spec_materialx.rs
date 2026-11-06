@@ -1144,10 +1144,6 @@ fn displacement_units_reach_the_material() {
     assert!(bound(&m, slot::DISPLACEMENT));
     assert!(close(m.displacement_offset, 0.06), "{m:?}");
     assert!(close(m.displacement_max, 0.06), "{m:?}");
-
-    // ND_displacement_vector3 has no reading along the normal.
-    let vector = r#"<input name="displacement" type="vector3" value="0.1, 0.2, 0.3"/>"#;
-    assert!(cook_displaced(&node(vector)).is_err());
 }
 
 /// The content of the base color texture of `body`.
@@ -2031,6 +2027,68 @@ fn an_object_space_normalmap_keeps_its_three_channels() {
     f.read(head, &mut bytes).unwrap();
     let info = orr_pack::texture::TextureInfo::parse(&bytes).unwrap();
     assert_eq!(info.header.mip_size(0), [4, 4]);
+}
+
+/// Nodes `displacement`: "the vector signature allows displacement in tangent/normal space using
+/// (dPdu, dPdv, N) coordinates". Each channel is a height of its own, along u, v and the normal.
+#[test]
+fn vector_displacement_reads_a_height_per_axis() {
+    let body = r#"<image name="i" type="vector3"><input name="file" type="filename" value="v.png"/></image>
+      <displacement name="D" type="displacementshader">
+        <input name="displacement" type="vector3" nodename="i"/>
+        <input name="scale" type="float" value="0.5"/>
+      </displacement>
+      <open_pbr_surface name="S2" type="surfaceshader"/>
+      <surfacematerial name="V" type="material">
+        <input name="surfaceshader" type="surfaceshader" nodename="S2"/>
+        <input name="displacementshader" type="displacementshader" nodename="D"/>
+      </surfacematerial>"#;
+    let doc = write_doc(&fixture(), "vector.mtlx", "", body, "");
+    let (a, _) = cook(&doc, "V").unwrap();
+    let m = material(&a);
+    for s in [
+        slot::DISPLACEMENT,
+        slot::DISPLACEMENT_U,
+        slot::DISPLACEMENT_V,
+    ] {
+        assert!(bound(&m, s), "slot {s}");
+    }
+    assert_ne!(
+        m.textures[slot::DISPLACEMENT_U].texture,
+        m.textures[slot::DISPLACEMENT_V].texture
+    );
+    // `varying` reads x * 32 / 255 in red, up to 224 / 255.
+    assert!(close(m.displacement_tangent[0][0], 0.5 * 224.0 / 255.0));
+    assert!(close(m.displacement_tangent[0][1], 0.0));
+    // Blue stands at 200 / 255, and a scalar input's channel doesn't send it to red.
+    assert!(close(m.displacement_offset, 0.5 * 200.0 / 255.0));
+    let red = TextureOverride {
+        channels: InputChannels {
+            displacement: Some(0),
+            ..InputChannels::default()
+        },
+        ..TextureOverride::default()
+    };
+    let textures = TextureRules {
+        overrides: vec![("v.png".to_string(), red)],
+        ..TextureRules::default()
+    };
+    let overridden = material(&cook_with(&doc, "V", textures).unwrap().0);
+    assert!(close(overridden.displacement_offset, m.displacement_offset));
+
+    let body = r#"<displacement name="D" type="displacementshader">
+        <input name="displacement" type="vector3" value="0.25, 0, 0"/>
+      </displacement>
+      <open_pbr_surface name="S2" type="surfaceshader"/>
+      <surfacematerial name="V" type="material">
+        <input name="surfaceshader" type="surfaceshader" nodename="S2"/>
+        <input name="displacementshader" type="displacementshader" nodename="D"/>
+      </surfacematerial>"#;
+    let doc = write_doc(&fixture(), "constant.mtlx", "", body, "");
+    let (a, _) = cook(&doc, "V").unwrap();
+    let m = material(&a);
+    assert!(bound(&m, slot::DISPLACEMENT));
+    assert_eq!(m.displacement_tangent[0][1], 0.25);
 }
 
 /// Spec: "the name of the surfaceshader node to be used for the back surface of an object, if the

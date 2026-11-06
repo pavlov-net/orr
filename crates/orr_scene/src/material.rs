@@ -56,6 +56,8 @@ pub mod material_flags {
     pub const HAS_BACK: u32 = 1 << 28;
     /// It is the back of the material `MaterialGpu::back`.
     pub const BACK_SIDE: u32 = 1 << 29;
+    /// Displacement reads `TEXTURE_DISPLACEMENT_U` and `TEXTURE_DISPLACEMENT_V` too.
+    pub const DISPLACED_TANGENT: u32 = 1 << 30;
 }
 
 /// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
@@ -185,6 +187,10 @@ impl MaterialGpu {
         set(m.emission_luminance > 0.0, f::EMISSIVE);
         set(subsurface, f::SUBSURFACE);
         set(bound(slot::DISPLACEMENT), f::DISPLACED);
+        set(
+            bound(slot::DISPLACEMENT_U) || bound(slot::DISPLACEMENT_V),
+            f::DISPLACED_TANGENT,
+        );
         set(m.coat_weight > 0.0, f::COAT);
         set(m.fuzz_weight > 0.0, f::FUZZ);
         set(m.thin_film_weight > 0.0, f::THIN_FILM);
@@ -207,7 +213,10 @@ impl MaterialGpu {
             f::OBJECT_COAT_NORMAL,
         );
         set(m.model == Material::MODEL_PREVIEW_SPECULAR, f::F0_STATED);
-        set((slot::MORE..slot::COUNT).any(bound), f::MORE_TEXTURES);
+        set(
+            (slot::MORE..slot::DISPLACEMENT_U).any(bound),
+            f::MORE_TEXTURES,
+        );
         let cost: u32 = if subsurface {
             3
         } else if dielectric || presence {
@@ -259,6 +268,12 @@ impl MaterialGpu {
             displacement_offset: m.displacement_offset,
             displacement_min: m.displacement_min,
             displacement_max: m.displacement_max,
+            displacement_tangent: [
+                m.displacement_tangent[0][0],
+                m.displacement_tangent[0][1],
+                m.displacement_tangent[1][0],
+                m.displacement_tangent[1][1],
+            ],
             textures: textures.map(|t| t.index),
             samplers: std::array::from_fn(|i| TextureSamplerGpu {
                 sampler: textures[i].sampler,

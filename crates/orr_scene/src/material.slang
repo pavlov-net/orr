@@ -44,6 +44,8 @@ public static const uint MATERIAL_DISPLACEMENT_WORLD = 1 << 27;
 public static const uint MATERIAL_HAS_BACK = 1 << 28;
 // It is the back of the material `MaterialGpu.back`.
 public static const uint MATERIAL_BACK_SIDE = 1 << 29;
+// Displacement reads TEXTURE_DISPLACEMENT_U and TEXTURE_DISPLACEMENT_V too.
+public static const uint MATERIAL_DISPLACED_TANGENT = 1 << 30;
 // The base color tints what passes through the surface.
 public static const uint MATERIAL_BASE_TINT = 1 << 23;
 // It binds a slot past TEXTURE_TRANSMISSION, which hits on other materials don't look at.
@@ -86,7 +88,9 @@ public static const uint TEXTURE_THIN_FILM_WEIGHT = 32;
 public static const uint TEXTURE_THIN_FILM_THICKNESS = 33;
 public static const uint TEXTURE_THIN_FILM_IOR = 34;
 public static const uint TEXTURE_EMISSION_LUMINANCE = 35;
-public static const uint TEXTURE_SLOTS = 36;
+public static const uint TEXTURE_DISPLACEMENT_U = 36;
+public static const uint TEXTURE_DISPLACEMENT_V = 37;
+public static const uint TEXTURE_SLOTS = 38;
 
 // `TextureSamplerGpu.modes`: what u and v read past 0..1, 3 bits each
 // (orr_pack::material::wrap), then the filter's bits (orr_pack::material::filter).
@@ -211,6 +215,7 @@ public struct MaterialGpu
     public float displacement_offset;
     public float displacement_min;
     public float displacement_max;
+    public float displacement_tangent[4];   // scale and offset along u, then along v, as above
     public TextureIndex textures[TEXTURE_SLOTS];
     public TextureSamplerGpu samplers[TEXTURE_SLOTS];
     public uint surface;                    // linked surface id; 0 = StandardSurface
