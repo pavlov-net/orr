@@ -373,8 +373,6 @@ public struct StandardSurface : ISurface
         p.transmission_weight = m.transmission_weight * material_texture(m, TEXTURE_TRANSMISSION, i.uv, one).x * surface_vertex(i, m, TEXTURE_TRANSMISSION).x;
         bool thin = (m.flags & MATERIAL_THIN_WALLED) != 0;
         p.transmission_color = thin || m.transmission_depth == 0.0 ? surface_more_color(i, m, TEXTURE_TRANSMISSION_COLOR, m.transmission_color) : float3(1.0);
-        if ((m.flags & MATERIAL_BASE_TINT) != 0)
-            p.transmission_color *= p.base_color;
         p.subsurface_weight = m.subsurface_weight * surface_scale(i, m, TEXTURE_SUBSURFACE_WEIGHT);
         p.subsurface_color = surface_color(i, m, TEXTURE_SUBSURFACE_COLOR, m.subsurface_color);
         p.subsurface_anisotropy = m.subsurface_scatter_anisotropy;
@@ -400,6 +398,8 @@ public struct StandardSurface : ISurface
         GSurface s = (GSurface)0;
         s.normal = material_normal(i, m);
         apply_decals(surface_decals(i), p, s.normal);
+        if ((m.flags & MATERIAL_BASE_TINT) != 0)
+            p.transmission_color *= p.base_color;
         s.geometric_normal = i.geometric_normal;
         p.specular_anisotropy = 0.0;
         p.tangent_angle = 0.0;

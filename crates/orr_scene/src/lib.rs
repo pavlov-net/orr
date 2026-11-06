@@ -103,15 +103,15 @@ pub use scenes::{
     Budgets, ConsumerMarker, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes,
 };
 pub(crate) use shaders::types::{
-    BlasJob, CutKey, DecalBinGpu, DecalGpu, EditGpu, FeedbackGpu, GroupGpu, MaskGpu,
-    MediumProxyGpu, NeuralMipGpu, NeuralSetGpu, NeuralTextureGpu, NodeItem, PartGpu, PartListGpu,
-    ProducerGpu, RasterRoot, SkinMeshGpu, TessStateGpu, TextureFeedbackGpu, TopologyGpu,
+    BlasJob, CutKey, DecalBinGpu, EditGpu, FeedbackGpu, GroupGpu, MaskGpu, MediumProxyGpu,
+    NeuralMipGpu, NeuralSetGpu, NeuralTextureGpu, NodeItem, PartGpu, PartListGpu, ProducerGpu,
+    RasterRoot, SkinMeshGpu, TessStateGpu, TextureFeedbackGpu, TopologyGpu,
 };
 pub use shaders::types::{
-    ClusterRef, ClusterWork, CutGpu, EditGroupGpu, EmissiveGpu, GBufferGpu, GeneratedClusterGpu,
-    InstanceGpu, LightGpu, MaterialGpu, MeshGpu, ModelGpu, ProducerBatch, ProducerClusterGpu,
-    ProducerStateGpu, RasterGpu, RtCutGpu, SceneRoot, SkinStateGpu, SkinnedGpu, SkyStats,
-    SlotCutGpu, SlotStateGpu, TextureSamplerGpu, TextureStreamGpu, VisibleCluster,
+    ClusterRef, ClusterWork, CutGpu, DecalGpu, EditGroupGpu, EmissiveGpu, GBufferGpu,
+    GeneratedClusterGpu, InstanceGpu, LightGpu, MaterialGpu, MeshGpu, ModelGpu, ProducerBatch,
+    ProducerClusterGpu, ProducerStateGpu, RasterGpu, RtCutGpu, SceneRoot, SkinStateGpu, SkinnedGpu,
+    SkyStats, SlotCutGpu, SlotStateGpu, TextureSamplerGpu, TextureStreamGpu, VisibleCluster,
 };
 pub use skin::{SkinStats, SkinnedDesc};
 pub use stream::{BlobId, BlobTarget};

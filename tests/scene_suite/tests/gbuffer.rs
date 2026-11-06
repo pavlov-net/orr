@@ -41,7 +41,7 @@ use orr_scene::testing::{
 };
 use orr_scene::{
     AffineRows, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, Decal, DecalChannels,
-    DecalId, EditDesc, EditId, EditRef, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
+    DecalGpu, DecalId, EditDesc, EditId, EditRef, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
     InstanceRange, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, ModelId, MountId,
     PackSource, Pose, Projection, RasterGpu, RasterView, RendererDesc, SceneCompute, SceneDesc,
     SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, SkinnedGpu, SlotCutGpu,
@@ -7586,6 +7586,17 @@ fn surface_params(
     list_extra: impl FnOnce(&mut orr_gpu::CommandList<'_>),
     vertex_color: [f32; 4],
 ) -> Vec<surface_params::Params> {
+    surface_params_under(d, records, None, list_extra, vertex_color)
+}
+
+/// [`surface_params`] with `decal`, if any, over every point.
+fn surface_params_under(
+    d: &orr_gpu::Device,
+    records: &[MaterialGpu],
+    decal: Option<DecalGpu>,
+    list_extra: impl FnOnce(&mut orr_gpu::CommandList<'_>),
+    vertex_color: [f32; 4],
+) -> Vec<surface_params::Params> {
     let upload = |bytes: &[u8], name| {
         let mut a = d
             .gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, name)
@@ -7594,9 +7605,17 @@ fn surface_params(
         a
     };
     let materials = upload(bytemuck::cast_slice(records), "materials");
+    let decals = upload(
+        bytemuck::cast_slice(&[decal.unwrap_or(bytemuck::Zeroable::zeroed())]),
+        "decals",
+    );
+    let refs = upload(bytemuck::bytes_of(&0u32), "decal refs");
     let scene = upload(
         bytemuck::bytes_of(&SceneRoot {
             materials: materials.gpu().cast(),
+            decals: decals.gpu().cast(),
+            decal_refs: refs.gpu().cast(),
+            decal_globals: u32::from(decal.is_some()),
             ..bytemuck::Zeroable::zeroed()
         }),
         "scene",
@@ -7994,6 +8013,58 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         let shown = first + u32::from(side < 0.0);
         assert_eq!(material[0], shown as f32, "{size}");
     }
+    assert_clean();
+}
+
+/// `Material::MODEL_GLTF`: "The base color tints light through the surface", and a decal's base
+/// color is the surface's base color where it lies.
+#[test]
+fn a_decals_base_color_tints_gltf_transmission() {
+    use orr_pack::material::Material;
+    let _guard = serial();
+    let d = device();
+    let glass = Material {
+        base_color: [0.5; 3],
+        transmission_weight: 1.0,
+        model: Material::MODEL_GLTF,
+        ..Material::default()
+    };
+    let paint = Material {
+        base_color: [1.0, 0.0, 0.0],
+        ..Material::default()
+    };
+    let surface = Material {
+        model: Material::MODEL_OPENPBR,
+        ..glass
+    };
+    let record = |m: &Material| MaterialGpu::new(m, &[BoundTexture::NONE; slot::COUNT]);
+    let decal = DecalGpu {
+        material: 1,
+        channels: DecalChannels::BASE_COLOR.0,
+        axis_x: [1.0, 0.0, 0.0],
+        inv_half_x: 1e-3,
+        axis_y: [0.0, 1.0, 0.0],
+        inv_half_y: 1e-3,
+        axis_z: [0.0, 0.0, 1.0],
+        inv_half_z: 1e-3,
+        opacity: 1.0,
+        cos_full: 0.5,
+        ..bytemuck::Zeroable::zeroed()
+    };
+    let records = [record(&glass), record(&paint), record(&surface)];
+    let out = surface_params_under(d, &records, Some(decal), |_| {}, [1.0; 4]);
+    let want = orr_color::rec709_to_rec2020(Vec3::X).as_vec3();
+    let near = |got: [f32; 3], want: Vec3| (Vec3::from(got) - want).abs().max_element() < 1e-5;
+    assert!(near(out[0].base_color, want), "{:?}", out[0].base_color);
+    assert!(
+        near(out[0].transmission_color, want),
+        "{:?}",
+        out[0].transmission_color
+    );
+    assert_eq!(
+        out[2].transmission_color, [1.0; 3],
+        "OpenPBR's tint is its own"
+    );
     assert_clean();
 }
 
