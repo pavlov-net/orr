@@ -154,7 +154,7 @@ pub use report::{
 };
 pub use skin::ClipSettings;
 pub use subd::{
-    Boundary, CageColor, CageInput, ColorValues, Corner, Crease, FaceVarying, SubdSettings,
+    Boundary, CageColor, CageInput, CageUv, CageValues, Corner, Crease, FaceVarying, SubdSettings,
     UvLinear,
 };
 pub use texture::material::{InputChannels, TextureOverride, TextureRules};

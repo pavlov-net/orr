@@ -1,21 +1,20 @@
 //! Subdivision cage class: a Catmull-Clark cage and the patches of its limit surface.
 //!
 //! Blob 0 holds a [`SubdHeader`] and its tables ([`SubdInfo`]): the cage's control points and
-//! faces, its face-varying uv values, its color values, per-point skin influences, the sections
-//! and the pages. The blobs after it are pages of whole faces ([`Page`]), each read alone.
+//! faces, the values its uvs and colors read, per-point skin influences, the sections and the
+//! pages. The blobs after it are pages of whole faces ([`Page`]), each read alone.
 //!
 //! Faces are ptex faces: a quad of the cage is one face, an n-sided face is n faces, one per
 //! corner. Each face is covered by patches: one bicubic B-spline patch for a regular face,
 //! or the feature-adaptive patches of its isolated sub-faces, B-spline where regular and
 //! Gregory basis patches at the isolation level. A patch's points are page points; each page
-//! point is a stencil, a weighted sum of cage points (uv points: of cage uv values), so an
-//! animated cage deforms by moving its points and re-applying the page stencils.
-//! [`Page::limit`] is the reference evaluator.
+//! point is a stencil, a weighted sum of cage points, so an animated cage deforms by moving its
+//! points and re-applying the page stencils. [`Page::limit`] is the reference evaluator.
 //!
-//! A patch's colors are [`ColorPart`]s, each a patch of its own over color points, which are
-//! stencils of the cage's color values: on the position patch for a color the surface's basis
-//! carries, on a face-varying patch, or bilinear over the patch's corners. Each gives some of the
-//! vertex color stream's four channels, so colors of different interpolations share a face.
+//! A patch's uvs and colors are [`Part`]s, each a patch of its own over value points, which are
+//! stencils of the cage's values: on the position patch for values the surface's basis carries,
+//! on a face-varying patch, or bilinear over the patch's corners. Each gives a uv set or some of
+//! the vertex color stream's four channels, so values of different interpolations share a face.
 
 use bytemuck::{Pod, Zeroable};
 use orr_math::{Affine3, Vec3};
@@ -24,7 +23,7 @@ use crate::blob::{put_table, read, table};
 use crate::mesh::Section;
 use crate::{Aabb, Error, Result, Span};
 
-pub const SCHEMA: u16 = 3;
+pub const SCHEMA: u16 = 4;
 
 /// Largest page.
 pub const PAGE_MAX: usize = 128 << 10;
@@ -46,18 +45,16 @@ pub struct SubdHeader {
     pub boundary: u8,
     /// Face-varying linear interpolation, [`Self::UV_LINEAR_NONE`] to [`Self::UV_LINEAR_ALL`].
     pub uv_linear: u8,
-    /// [`Self::UV`], [`Self::SKIN`] and [`Self::COLOR`].
+    /// [`Self::UV`], [`Self::SKIN`], [`Self::COLOR`] and [`Self::UV1`].
     pub attributes: u8,
     pub _pad: [u8; 3],
     /// [`Section`] per material slot.
     pub sections: Span,
     /// `[f32; 3]` rest position per cage point, model space.
     pub points: Span,
-    /// `[f32; 2]` per cage uv value, top-left origin; empty without [`Self::UV`].
-    pub uvs: Span,
-    /// `[f32; 4]` per cage color value, as the vertex color stream holds it; empty without
-    /// [`Self::COLOR`].
-    pub colors: Span,
+    /// `[f32; 4]` per cage value [`Part`]s read: a color as the vertex color stream holds it, a
+    /// uv in its first two, top-left origin.
+    pub values: Span,
     /// [`Influence`] per cage point; empty without [`Self::SKIN`].
     pub skin: Span,
     /// [`PageInfo`] per page.
@@ -74,6 +71,8 @@ impl SubdHeader {
     pub const UV: u8 = 1;
     pub const SKIN: u8 = 2;
     pub const COLOR: u8 = 4;
+    /// Its copies carry uv set 1; without it that set reads uv set 0, as other producers' do.
+    pub const UV1: u8 = 8;
 
     /// Boundary edges and corners are smooth.
     pub const BOUNDARY_NONE: u8 = 0;
@@ -117,8 +116,7 @@ pub struct SubdInfo {
     pub header: SubdHeader,
     pub sections: Vec<Section>,
     pub points: Vec<[f32; 3]>,
-    pub uvs: Vec<[f32; 2]>,
-    pub colors: Vec<[f32; 4]>,
+    pub values: Vec<[f32; 4]>,
     pub skin: Vec<Influence>,
     pub pages: Vec<PageInfo>,
     pub cage_faces: Vec<u32>,
@@ -142,8 +140,7 @@ impl SubdInfo {
         let info = Self {
             sections: table(blob, header.sections)?,
             points: table(blob, header.points)?,
-            uvs: table(blob, header.uvs)?,
-            colors: table(blob, header.colors)?,
+            values: table(blob, header.values)?,
             skin: table(blob, header.skin)?,
             pages: table(blob, header.pages)?,
             cage_faces: table(blob, header.cage_faces)?,
@@ -216,8 +213,7 @@ impl SubdInfo {
         let mut out = vec![0; size_of::<SubdHeader>()];
         h.sections = put_table(&mut out, &self.sections);
         h.points = put_table(&mut out, &self.points);
-        h.uvs = put_table(&mut out, &self.uvs);
-        h.colors = put_table(&mut out, &self.colors);
+        h.values = put_table(&mut out, &self.values);
         h.skin = put_table(&mut out, &self.skin);
         h.pages = put_table(&mut out, &self.pages);
         h.cage_faces = put_table(&mut out, &self.cage_faces);
@@ -245,18 +241,13 @@ pub struct PageHeader {
     pub stencil_points: Span,
     /// f32 weight per stencil term.
     pub stencil_weights: Span,
-    /// The same four tables for uvs, over the cage's uv values; empty without uvs.
-    pub uv_cvs: Span,
-    pub uv_stencils: Span,
-    pub uv_stencil_points: Span,
-    pub uv_stencil_weights: Span,
-    /// [`ColorPart`] per part; a patch's parts are contiguous.
-    pub color_parts: Span,
-    /// The same four tables for colors, over the cage's color values; empty without colors.
-    pub color_cvs: Span,
-    pub color_stencils: Span,
-    pub color_stencil_points: Span,
-    pub color_stencil_weights: Span,
+    /// [`Part`] per part; a patch's parts are contiguous.
+    pub parts: Span,
+    /// The same four tables for parts, over the cage's values; empty without any.
+    pub part_cvs: Span,
+    pub value_stencils: Span,
+    pub value_stencil_points: Span,
+    pub value_stencil_weights: Span,
 }
 
 /// One ptex face of the cage.
@@ -291,7 +282,7 @@ pub struct PatchParam {
     pub boundary: u8,
     /// Edges whose neighbor is one level finer, for crack-free tessellation.
     pub transition: u8,
-    /// [`Self::REGULAR`], [`Self::GREGORY`], [`Self::LINEAR`] or [`Self::NONE`].
+    /// [`Self::REGULAR`], [`Self::GREGORY`] or [`Self::LINEAR`].
     pub kind: u8,
     /// [`Self::NON_QUAD`].
     pub flags: u8,
@@ -305,8 +296,6 @@ impl PatchParam {
     pub const GREGORY: u8 = 1;
     /// Bilinear, 4 points.
     pub const LINEAR: u8 = 2;
-    /// No patch (the uv patch of a cage without uvs).
-    pub const NONE: u8 = 0xFF;
     /// The patch belongs to a sub-face of an n-sided cage face.
     pub const NON_QUAD: u8 = 1;
 
@@ -373,30 +362,34 @@ impl PatchParam {
     }
 }
 
-/// One patch: its parameters for positions and for uvs, and its first points.
+/// One patch: its parameters and first point for positions, and its parts.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct Patch {
     pub param: PatchParam,
-    pub uv_param: PatchParam,
-    /// First entry of the page's `cvs` and `uv_cvs` tables.
+    /// First entry of the page's `cvs` table.
     pub cvs: u32,
-    pub uv_cvs: u32,
-    /// Range of the page's `color_parts`; the stream's channels none of them gives read 1.
-    pub colors: Span,
+    /// Range of the page's `parts`. Color channels none of them gives read 1, and a uv set none
+    /// of them gives reads 0.
+    pub parts: Span,
 }
 
-/// Some channels of the vertex color stream over one patch.
+/// A uv set or some channels of the vertex color stream over one patch.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
-pub struct ColorPart {
-    /// Where the part's patch sits in the face, as [`Patch::uv_param`] does.
+pub struct Part {
+    /// Where the part's own patch sits in the face.
     pub param: PatchParam,
-    /// First entry of the page's `color_cvs` table.
+    /// First entry of the page's `part_cvs` table.
     pub cvs: u32,
-    /// The channels it gives: bit `i` for channel `i`. A later part of a patch takes a channel
-    /// from an earlier one.
+    /// What it gives: bit `i` below [`Self::UV`] for color channel `i`, [`Self::UV`] for uv set 0
+    /// and the next bit for set 1. A later part of a patch takes either from an earlier one.
     pub channels: u32,
+}
+
+impl Part {
+    /// [`Self::channels`] of uv set 0.
+    pub const UV: u32 = 16;
 }
 
 /// A limit surface sample: position and derivatives in face coordinates.
@@ -426,15 +419,11 @@ pub struct Page {
     pub stencils: Vec<u32>,
     pub stencil_points: Vec<u32>,
     pub stencil_weights: Vec<f32>,
-    pub uv_cvs: Vec<u16>,
-    pub uv_stencils: Vec<u32>,
-    pub uv_stencil_points: Vec<u32>,
-    pub uv_stencil_weights: Vec<f32>,
-    pub color_parts: Vec<ColorPart>,
-    pub color_cvs: Vec<u16>,
-    pub color_stencils: Vec<u32>,
-    pub color_stencil_points: Vec<u32>,
-    pub color_stencil_weights: Vec<f32>,
+    pub parts: Vec<Part>,
+    pub part_cvs: Vec<u16>,
+    pub value_stencils: Vec<u32>,
+    pub value_stencil_points: Vec<u32>,
+    pub value_stencil_weights: Vec<f32>,
 }
 
 impl Page {
@@ -447,15 +436,11 @@ impl Page {
             stencils: table(blob, h.stencils)?,
             stencil_points: table(blob, h.stencil_points)?,
             stencil_weights: table(blob, h.stencil_weights)?,
-            uv_cvs: table(blob, h.uv_cvs)?,
-            uv_stencils: table(blob, h.uv_stencils)?,
-            uv_stencil_points: table(blob, h.uv_stencil_points)?,
-            uv_stencil_weights: table(blob, h.uv_stencil_weights)?,
-            color_parts: table(blob, h.color_parts)?,
-            color_cvs: table(blob, h.color_cvs)?,
-            color_stencils: table(blob, h.color_stencils)?,
-            color_stencil_points: table(blob, h.color_stencil_points)?,
-            color_stencil_weights: table(blob, h.color_stencil_weights)?,
+            parts: table(blob, h.parts)?,
+            part_cvs: table(blob, h.part_cvs)?,
+            value_stencils: table(blob, h.value_stencils)?,
+            value_stencil_points: table(blob, h.value_stencil_points)?,
+            value_stencil_weights: table(blob, h.value_stencil_weights)?,
         };
         page.check()?;
         Ok(page)
@@ -467,17 +452,14 @@ impl Page {
             s.windows(2).all(|w| w[0] <= w[1]) && s.last().is_none_or(|&l| l as usize == terms)
         };
         if !stencils_ok(&self.stencils, self.stencil_points.len())
-            || !stencils_ok(&self.uv_stencils, self.uv_stencil_points.len())
-            || !stencils_ok(&self.color_stencils, self.color_stencil_points.len())
+            || !stencils_ok(&self.value_stencils, self.value_stencil_points.len())
             || self.stencil_points.len() != self.stencil_weights.len()
-            || self.uv_stencil_points.len() != self.uv_stencil_weights.len()
-            || self.color_stencil_points.len() != self.color_stencil_weights.len()
+            || self.value_stencil_points.len() != self.value_stencil_weights.len()
         {
             return Err(bad);
         }
         let points = self.stencils.len().saturating_sub(1);
-        let uv_points = self.uv_stencils.len().saturating_sub(1);
-        let color_points = self.color_stencils.len().saturating_sub(1);
+        let value_points = self.value_stencils.len().saturating_sub(1);
         let cvs = |at: u32, n: usize, table: &[u16], limit: usize| {
             table
                 .get(at as usize..at as usize + n)
@@ -485,14 +467,13 @@ impl Page {
         };
         for p in &self.patches {
             if !cvs(p.cvs, p.param.cv_count(), &self.cvs, points)
-                || !cvs(p.uv_cvs, p.uv_param.cv_count(), &self.uv_cvs, uv_points)
-                || p.colors.first as usize + p.colors.count as usize > self.color_parts.len()
+                || p.parts.first as usize + p.parts.count as usize > self.parts.len()
             {
                 return Err(bad);
             }
         }
-        for c in &self.color_parts {
-            if !cvs(c.cvs, c.param.cv_count(), &self.color_cvs, color_points) {
+        for c in &self.parts {
+            if !cvs(c.cvs, c.param.cv_count(), &self.part_cvs, value_points) {
                 return Err(bad);
             }
         }
@@ -516,15 +497,11 @@ impl Page {
             stencils: put_table(&mut out, &self.stencils),
             stencil_points: put_table(&mut out, &self.stencil_points),
             stencil_weights: put_table(&mut out, &self.stencil_weights),
-            uv_cvs: put_table(&mut out, &self.uv_cvs),
-            uv_stencils: put_table(&mut out, &self.uv_stencils),
-            uv_stencil_points: put_table(&mut out, &self.uv_stencil_points),
-            uv_stencil_weights: put_table(&mut out, &self.uv_stencil_weights),
-            color_parts: put_table(&mut out, &self.color_parts),
-            color_cvs: put_table(&mut out, &self.color_cvs),
-            color_stencils: put_table(&mut out, &self.color_stencils),
-            color_stencil_points: put_table(&mut out, &self.color_stencil_points),
-            color_stencil_weights: put_table(&mut out, &self.color_stencil_weights),
+            parts: put_table(&mut out, &self.parts),
+            part_cvs: put_table(&mut out, &self.part_cvs),
+            value_stencils: put_table(&mut out, &self.value_stencils),
+            value_stencil_points: put_table(&mut out, &self.value_stencil_points),
+            value_stencil_weights: put_table(&mut out, &self.value_stencil_weights),
         };
         out[..size_of::<PageHeader>()].copy_from_slice(bytemuck::bytes_of(&h));
         out
@@ -540,23 +517,13 @@ impl Page {
         )
     }
 
-    /// The page uv points from the cage uv values.
-    pub fn uv_points(&self, uvs: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    /// The page value points from the cage's values.
+    pub fn value_points(&self, values: &[[f32; 4]]) -> Vec<[f32; 4]> {
         apply_stencils(
-            &self.uv_stencils,
-            &self.uv_stencil_points,
-            &self.uv_stencil_weights,
-            uvs,
-        )
-    }
-
-    /// The page color points from the cage's color values.
-    pub fn color_points(&self, colors: &[[f32; 4]]) -> Vec<[f32; 4]> {
-        apply_stencils(
-            &self.color_stencils,
-            &self.color_stencil_points,
-            &self.color_stencil_weights,
-            colors,
+            &self.value_stencils,
+            &self.value_stencil_points,
+            &self.value_stencil_weights,
+            values,
         )
     }
 
@@ -597,69 +564,65 @@ impl Page {
         }
     }
 
-    /// The limit uv of face `face` at face coordinates `(u, v)`, from [`Self::uv_points`].
+    /// The parts of the patch of face `face` that holds face coordinates `(u, v)`.
+    fn parts_at(&self, face: usize, u: f32, v: f32) -> Option<&[Part]> {
+        let s = self.patches[self.patch_at(face, u, v)?].parts;
+        Some(&self.parts[s.first as usize..(s.first + s.count) as usize])
+    }
+
+    /// Part `part` at face coordinates `(u, v)`, from [`Self::value_points`].
+    fn part_value(&self, part: &Part, u: f32, v: f32, points: &[[f32; 4]]) -> [f32; 4] {
+        let (mut w, mut du, mut dv) = ([0.0; 20], [0.0; 20], [0.0; 20]);
+        let n = part.param.basis(u, v, &mut w, &mut du, &mut dv);
+        let mut acc = [0.0f64; 4];
+        let cvs = &self.part_cvs[part.cvs as usize..part.cvs as usize + n];
+        for (i, &c) in cvs.iter().enumerate() {
+            let q = points[usize::from(c)];
+            for k in 0..4 {
+                acc[k] += f64::from(w[i]) * f64::from(q[k]);
+            }
+        }
+        acc.map(|a| a as f32)
+    }
+
+    /// The limit uv of set `set` of face `face` at face coordinates `(u, v)`, from
+    /// [`Self::value_points`].
     pub fn limit_uv(
         &self,
         face: usize,
         u: f32,
         v: f32,
-        uv_points: &[[f32; 2]],
+        set: u32,
+        points: &[[f32; 4]],
     ) -> Option<[f32; 2]> {
-        let p = &self.patches[self.patch_at(face, u, v)?];
-        evaluate(
-            &p.uv_param,
-            &self.uv_cvs[p.uv_cvs as usize..],
-            u,
-            v,
-            uv_points,
-        )
+        let mut uv = [0.0; 2];
+        for part in self.parts_at(face, u, v)? {
+            if part.channels & (Part::UV << set) != 0 {
+                let [x, y, ..] = self.part_value(part, u, v, points);
+                uv = [x, y];
+            }
+        }
+        Some(uv)
     }
 
     /// The vertex color stream of face `face` at face coordinates `(u, v)`, from
-    /// [`Self::color_points`].
+    /// [`Self::value_points`].
     pub fn limit_color(
         &self,
         face: usize,
         u: f32,
         v: f32,
-        color_points: &[[f32; 4]],
+        points: &[[f32; 4]],
     ) -> Option<[f32; 4]> {
-        let p = &self.patches[self.patch_at(face, u, v)?];
         let mut color = [1.0; 4];
-        let parts = p.colors.first as usize..(p.colors.first + p.colors.count) as usize;
-        for part in &self.color_parts[parts] {
-            let cvs = &self.color_cvs[part.cvs as usize..];
-            let value = evaluate(&part.param, cvs, u, v, color_points)?;
+        for part in self.parts_at(face, u, v)? {
+            let value = self.part_value(part, u, v, points);
             for k in (0..4).filter(|k| part.channels & (1 << k) != 0) {
                 color[k] = value[k];
             }
         }
         Some(color)
     }
-}
-
-/// The patch `param` over `points` at face coordinates `(u, v)`, its points first in `cvs`;
-/// `None` for no patch.
-fn evaluate<const N: usize>(
-    param: &PatchParam,
-    cvs: &[u16],
-    u: f32,
-    v: f32,
-    points: &[[f32; N]],
-) -> Option<[f32; N]> {
-    let (mut w, mut du, mut dv) = ([0.0; 20], [0.0; 20], [0.0; 20]);
-    let n = param.basis(u, v, &mut w, &mut du, &mut dv);
-    if n == 0 {
-        return None;
-    }
-    let mut acc = [0.0f64; N];
-    for (i, &c) in cvs[..n].iter().enumerate() {
-        let q = points[usize::from(c)];
-        for k in 0..N {
-            acc[k] += f64::from(w[i]) * f64::from(q[k]);
-        }
-    }
-    Some(acc.map(|a| a as f32))
 }
 
 /// Points from stencils over `source`: point `i` is the sum of `weights[t] x source[points[t]]`

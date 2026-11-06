@@ -247,8 +247,8 @@ fn cooked_bytes_match_their_cook_versions() {
 /// (cook version, hash) of the subdivision cage class, as the rows above.
 #[cfg(feature = "subd")]
 const SUBD_GOLDEN: (u32, &str) = (
-    3,
-    "ddc7a4617090654c69c7793a4322980164676da07ebdd9ac7f72feff67f21355",
+    4,
+    "e52d04e32fe4cc7eee855e185c21728678cb01321a4013155088c7abe3087988",
 );
 
 #[cfg(feature = "subd")]

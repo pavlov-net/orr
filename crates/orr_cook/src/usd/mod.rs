@@ -93,8 +93,8 @@
 //! control faces as they are, [`Subdivision::Cage`] cooks the model's cages as one
 //! subdivision cage entry (Catmull-Clark only; every cage of a model shares its
 //! `interpolateBoundary`, `faceVaryingLinearInterpolation` and `triangleSubdivisionRule`).
-//! The primvars a cage's materials read through the vertex color stream come out of the
-//! tessellator by their interpolation ([`mesh::CageBuilder`]).
+//! Its uv sets and the primvars its materials read through the vertex color stream come out of
+//! the tessellator by their interpolation ([`mesh::CageBuilder`]).
 //! Faces take the material of their `GeomSubset` of family `materialBind`, else of the
 //! mesh: the direct binding `material:binding:full`, else `material:binding`, of the prim or
 //! its nearest ancestor (collection bindings are not read). Materials map as [`crate::shading`] lists and are named `<asset>/material/<path>`
@@ -1125,6 +1125,15 @@ impl<'s> Importer<'s> {
                         "{path}: a material's tangents follow {st}, which the mesh does not \
                          author; they follow uv set {}",
                         frame.set
+                    ));
+                }
+                if let Some(st) = &frame.st
+                    && reads
+                    && as_cage
+                {
+                    self.warnings.push(format!(
+                        "{path}: a material's tangents follow {st}, which a subdivision cage does \
+                         not carry; they follow uv set 0"
                     ));
                 }
                 if as_cage && primvars[&frame.tangents].is_some() {

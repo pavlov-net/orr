@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use orr_cook::{
-    ArchiveSpec, AssetSpec, CageColor, CageInput, ColorValues, Corner, Crease, FaceVarying,
+    ArchiveSpec, AssetSpec, CageColor, CageInput, CageUv, CageValues, Corner, Crease, FaceVarying,
     Manifest, MeshInput, MeshSettings, Source, SubdSettings, Subdivision, UsdSettings,
 };
 use orr_gpu::{
@@ -1046,6 +1046,8 @@ struct Generated {
     /// Empty where the entry keeps no previous positions.
     previous: Vec<Vec3>,
     attrs: Vec<[u32; 2]>,
+    /// Uv set 1; empty where the entry keeps none.
+    uv1: Vec<[f32; 2]>,
     /// The vertex color stream; empty where the entry keeps none.
     colors: Vec<[f32; 4]>,
     patch_clusters: Vec<ProducerClusterGpu>,
@@ -1082,7 +1084,14 @@ fn generated(view: &RasterView, entry: ProducerId) -> Generated {
         let words: Vec<[half::f16; 4]> = read_buffer(b.colors.cast(), vertices);
         words.iter().map(|c| c.map(half::f16::to_f32)).collect()
     };
+    let uv1 = if b.uv1.address().0 == 0 {
+        Vec::new()
+    } else {
+        let words: Vec<[half::f16; 2]> = read_buffer(b.uv1.cast(), vertices);
+        words.iter().map(|c| c.map(half::f16::to_f32)).collect()
+    };
     Generated {
+        uv1,
         colors,
         clusters: read_buffer(b.clusters, clusters),
         records: read_buffer(b.generated, clusters),
@@ -1752,9 +1761,13 @@ fn closed_cages() -> CageInput {
         .iter()
         .map(|p| Vec2::new(p.x + 0.4 * p.y, p.z + 0.3 * p.y) * 0.5)
         .collect();
-    c.uvs = Some(FaceVarying {
-        values,
-        indices: c.face_indices.clone(),
+    c.uvs.push(CageUv {
+        values: CageValues::FaceVarying(FaceVarying {
+            values,
+            indices: c.face_indices.clone(),
+        }),
+        set: 0,
+        faces: Vec::new(),
     });
     c
 }
@@ -1826,12 +1839,14 @@ const PAINTED_JUMP: f32 = 0.3;
 /// A grid folded along an infinitely sharp crease at column [`PAINTED_MIDDLE`]. Red is the
 /// height, on the surface's basis, so the limit surface states what it reads. Green and blue are
 /// face-varying with a seam along row [`PAINTED_MIDDLE`], across the crease. Alpha is a checker
-/// of the points, linear over each face.
+/// of the points, linear over each face. Uv set 0 rides the surface as red does, and uv set 1 is
+/// the checker.
 fn painted_cage() -> CageInput {
     let n = PAINTED_QUADS;
     let point = |i: u32, j: u32| j * (n + 1) + i;
     let mut c = CageInput::default();
     let (mut seamed, mut checker, mut heights) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut plane, mut uv_checker) = (Vec::new(), Vec::new());
     for j in 0..=n {
         for i in 0..=n {
             let height = 0.2 * i.abs_diff(PAINTED_MIDDLE) as f32 + 0.05 * (j % 3) as f32;
@@ -1839,6 +1854,8 @@ fn painted_cage() -> CageInput {
             c.positions
                 .push(Vec3::new(centered(i), height, centered(j)));
             heights.push(Vec4::new(height, 0.0, 0.0, 0.0));
+            plane.push(Vec2::new(height, 0.1 * j as f32));
+            uv_checker.push(Vec2::splat(if (i + j) % 2 == 0 { 0.25 } else { 0.75 }));
             seamed.push(Vec4::new(0.0, 0.1 * i as f32, 0.15 * j as f32, 0.0));
             checker.push(Vec4::new(
                 0.0,
@@ -1874,6 +1891,21 @@ fn painted_cage() -> CageInput {
             sharpness: 10.0,
         });
     }
+    c.uvs = vec![
+        CageUv {
+            values: CageValues::Vertex(plane),
+            set: 0,
+            faces: Vec::new(),
+        },
+        CageUv {
+            values: CageValues::Linear(FaceVarying {
+                values: uv_checker,
+                indices: c.face_indices.clone(),
+            }),
+            set: 1,
+            faces: Vec::new(),
+        },
+    ];
     let faces: Vec<u32> = (0..n * n).filter(|&f| f != PAINTED_BARE).collect();
     let color = |values, channels| CageColor {
         values,
@@ -1881,16 +1913,16 @@ fn painted_cage() -> CageInput {
         faces: faces.clone(),
     };
     c.colors = vec![
-        color(ColorValues::Vertex(heights), 0b0001),
+        color(CageValues::Vertex(heights), 0b0001),
         color(
-            ColorValues::FaceVarying(FaceVarying {
+            CageValues::FaceVarying(FaceVarying {
                 values: seamed,
                 indices: seam_indices,
             }),
             0b0110,
         ),
         color(
-            ColorValues::Linear(FaceVarying {
+            CageValues::Linear(FaceVarying {
                 values: checker,
                 indices: c.face_indices.clone(),
             }),
@@ -2061,12 +2093,11 @@ struct LimitSurface {
     cell: f32,
 }
 
-/// A page with its points, uv points and color points.
+/// A page with its points and value points.
 struct PosedPage {
     page: SubdPage,
     points: Vec<[f32; 3]>,
-    uv_points: Vec<[f32; 2]>,
-    color_points: Vec<[f32; 4]>,
+    value_points: Vec<[f32; 4]>,
 }
 
 /// Face coordinates on face `face` of page `page`.
@@ -2086,6 +2117,7 @@ struct Nearest {
     /// rational blend.
     normal: Vec3,
     uv: Vec2,
+    uv1: Vec2,
     color: [f32; 4],
     spot: Spot,
     distance: f32,
@@ -2102,8 +2134,7 @@ impl LimitSurface {
                 .map(|p| PosedPage {
                     page: p.clone(),
                     points: p.points(points),
-                    uv_points: p.uv_points(&info.uvs),
-                    color_points: p.color_points(&info.colors),
+                    value_points: p.value_points(&info.values),
                 })
                 .collect(),
             cells: HashMap::new(),
@@ -2219,18 +2250,17 @@ impl LimitSurface {
         let (u0, u1) = ((s.u - h).max(0.0), (s.u + h).min(1.0));
         let (v0, v1) = ((s.v - h).max(0.0), (s.v + h).min(1.0));
         let normal = (p(u1, s.v) - p(u0, s.v)).cross(p(s.u, v1) - p(s.u, v0));
-        let uv = page
-            .page
-            .limit_uv(s.face, s.u as f32, s.v as f32, &page.uv_points)
-            .unwrap_or_default();
+        let (u, v) = (s.u as f32, s.v as f32);
+        let uv = |set| page.page.limit_uv(s.face, u, v, set, &page.value_points);
         let color = page
             .page
-            .limit_color(s.face, s.u as f32, s.v as f32, &page.color_points)
+            .limit_color(s.face, u, v, &page.value_points)
             .unwrap();
         Nearest {
             position,
             normal: normal.normalize().as_vec3(),
-            uv: Vec2::from(uv),
+            uv: Vec2::from(uv(0).unwrap()),
+            uv1: Vec2::from(uv(1).unwrap()),
             color,
             spot: s,
             distance: position.distance(x),
@@ -2663,6 +2693,12 @@ fn seen_colors(view: &RasterView) -> Vec<cage_colors::Seen> {
     out.as_slice().unwrap().to_vec()
 }
 
+/// Uv set 0 of an attribute word.
+fn attr_uv(a: [u32; 2]) -> Vec2 {
+    let half = |bits: u32| half::f16::from_bits(bits as u16).to_f32();
+    Vec2::new(half(a[1] & 0xffff), half(a[1] >> 16))
+}
+
 /// Half floats near the painted colors round by up to this, with room for the f32 evaluation.
 const COLOR_TOLERANCE: f32 = 1e-3;
 
@@ -2716,7 +2752,7 @@ fn a_cage_carries_its_colors_across_a_crease_and_a_seam_to_what_the_raster_shows
     assert_eq!(g.colors.len(), g.positions.len());
 
     let cage = painted_cage();
-    let ColorValues::Linear(checker) = &cage.colors[2].values else {
+    let CageValues::Linear(checker) = &cage.colors[2].values else {
         panic!("the checker is linear");
     };
     let bare = |spot: Spot| limit.pages[spot.page].page.faces[spot.face].base == PAINTED_BARE;
@@ -2735,11 +2771,17 @@ fn a_cage_carries_its_colors_across_a_crease_and_a_seam_to_what_the_raster_shows
     // spec of each interpolation says without the color tables: red rides the surface, and
     // alpha is bilinear in its face's corners.
     let (mut worst, mut worst_red, mut worst_alpha) = (0.0f32, 0.0f32, 0.0f32);
+    let mut worst_uv = 0.0f32;
     let mut bare_vertices = 0;
     let mut greens: HashMap<[u32; 3], (f32, f32)> = HashMap::new();
-    for (&p, &color) in g.positions.iter().zip(&g.colors) {
+    assert_eq!(g.uv1.len(), g.positions.len());
+    for (v, (&p, &color)) in g.positions.iter().zip(&g.colors).enumerate() {
         let n = closest(p, color);
         worst = worst.max(color_error(n.color, color));
+        let uv1 = Vec2::from(g.uv1[v]);
+        let uv = attr_uv(g.attrs[v]);
+        worst_uv = worst_uv.max((uv - n.uv).abs().max_element());
+        worst_uv = worst_uv.max((uv1 - n.uv1).abs().max_element());
         if bare(n.spot) {
             bare_vertices += 1;
             assert_eq!(color, [1.0; 4], "the bare face at {p}");
@@ -2758,6 +2800,7 @@ fn a_cage_carries_its_colors_across_a_crease_and_a_seam_to_what_the_raster_shows
         *green = (green.0.min(color[1]), green.1.max(color[1]));
     }
     assert!(worst < COLOR_TOLERANCE, "{worst} from the CPU limit");
+    assert!(worst_uv < COLOR_TOLERANCE, "uvs {worst_uv} from the CPU");
     assert!(
         worst_red < COLOR_TOLERANCE,
         "red {worst_red} from the height"
@@ -2787,6 +2830,9 @@ fn a_cage_carries_its_colors_across_a_crease_and_a_seam_to_what_the_raster_shows
         let [u, v] = s.barycentrics;
         let color = a * (1.0 - u - v) + b * u + c * v;
         worst_shown = worst_shown.max(color_error(color.to_array(), s.color));
+        let [a, b, c] = s.corners.map(|v| Vec2::from(g.uv1[v as usize]));
+        let uv1 = a * (1.0 - u - v) + b * u + c * v;
+        worst_shown = worst_shown.max((uv1 - Vec2::from(s.uv[1])).abs().max_element());
     }
     assert!(shown > EXTENT[0] * EXTENT[1] / 8, "{shown} pixels shown");
     assert!(

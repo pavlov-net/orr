@@ -22,7 +22,7 @@ const VERSIONS: &[(Class, u32)] = &[
     (Class::Skeleton, 2),
     (Class::Clip, 2),
     (Class::NeuralTextureSet, 3),
-    (Class::Subd, 3),
+    (Class::Subd, 4),
     (Class::Volume, 1),
     (Class::TextureTiles, 1),
 ];

@@ -18,9 +18,9 @@ public struct DisplacementInput
     public float3 normal;        // unit: interpolated from the patch's corners, or a subdivision copy's limit normal
     public uint material;        // MaterialId
     public float3x3 linear;      // what places the entry, last frame with `previous`
-    public float3 tangent;       // unit: where u grows, in the surface
-    public float3 bitangent;     // unit: where st's t grows, in the surface
-    public UvFootprint uv[2];    // per uv set, both the patch's one uv: uv and its change over one generated vertex step; hardware filtering
+    public float3 tangent;       // unit: where u of the set the displacement texture reads grows, in the surface
+    public float3 bitangent;     // unit: where that set's t grows, in the surface
+    public UvFootprint uv[2];    // per uv set: uv and its change over one generated vertex step; hardware filtering
     public uint user;            // the patch's cluster word
     public uint user_tag;        // the entry's
     public uint previous;        // 1: last frame's surface, for motion

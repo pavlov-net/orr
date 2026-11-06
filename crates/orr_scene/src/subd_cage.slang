@@ -6,31 +6,30 @@ module subd_cage;
 
 __exported import orr_pack.subd;
 
-// One patch: its kind and boundary edges for positions and for uvs, and where its uv patch
-// lies in its coordinates.
+// `SubdPartGpu.bits >> 16` of uv set 0; set 1's is the next bit. Those below are color channels.
+public static const uint SUBD_PART_UV = 16;
+
+// One patch: its kind and boundary edges for positions, and its parts.
 public struct SubdPatchGpu
 {
-    public uint bits;            // kind | boundary << 8 | uv kind << 16 | uv boundary << 24
+    public uint bits;            // kind | boundary << 8
     public uint cvs;             // its first point in the cage's `cvs`
-    public uint uv_cvs;          // its first uv point in `uv_cvs`
-    public float uv_scale;       // uv patch coordinates are st * uv_scale - uv_offset
-    public float2 uv_offset;
-    public uint color_first;     // its first part in the cage's `color_parts`
-    public uint color_count;
+    public uint part_first;      // its first part in the cage's `parts`
+    public uint part_count;
 }
 
-// Some channels of the vertex color stream over a patch: a patch of its own, which lies in the
-// patch's coordinates as its uv patch does.
-public struct SubdColorPartGpu
+// A uv set or some channels of the vertex color stream over a patch: a patch of its own, which
+// lies in the patch's coordinates.
+public struct SubdPartGpu
 {
     public uint bits;            // kind | boundary << 8 | channels << 16
-    public uint cvs;             // its first point in the cage's `color_cvs`
+    public uint cvs;             // its first point in the cage's `part_cvs`
     public float2 offset;        // its coordinates are st * scale - offset
     public float scale;
     public uint _pad;
 }
 
-// A vertex of a cage's base patches: the patch and coordinates its uv and normal come from,
+// A vertex of a cage's base patches: the patch and coordinates its uvs and normal come from,
 // and those its position comes from, which every vertex at the same cage point shares.
 public struct SubdVertexGpu
 {
@@ -54,9 +53,7 @@ public struct SubdCageGpu
 {
     public SubdPatchGpu* patches;
     public uint* cvs;               // page point per patch point
-    public uint* uv_cvs;            // uv point per uv patch point
     public float3* points;          // rest page points
-    public float2* uv_points;
     public SubdVertexGpu* vertices; // per base vertex
     public SubdTriangleGpu* triangles;
     public uint4* clusters;         // first vertex, vertex count, first triangle, triangle count | material << 8
@@ -66,9 +63,9 @@ public struct SubdCageGpu
     public float* stencil_weights;
     public float3* cage_points;     // rest
     public uint2* skin;             // per cage point: joints u8x4, weights unorm8x4
-    public SubdColorPartGpu* color_parts;
-    public uint* color_cvs;         // color point per part point
-    public float4* color_points;
+    public SubdPartGpu* parts;
+    public uint* part_cvs;          // value point per part point
+    public float4* value_points;    // a color, or a uv in its first two
     public uint point_count;        // page points
     public uint cage_point_count;
     public uint vertex_count;
@@ -115,16 +112,28 @@ public float3 subd_limit(SubdCageGpu* c, float3* points, uint patch, float2 st, 
     return x;
 }
 
-// The limit uv of patch `patch` at `st`; 0 for a cage without uvs.
-public float2 subd_limit_uv(SubdCageGpu* c, uint patch, float2 st)
+// Part `part` of a patch at the patch's `st`.
+float4 subd_part_value(SubdCageGpu* c, SubdPartGpu part, float2 st)
+{
+    float w[20], wu[20], wv[20];
+    uint n = subd_basis(part.bits & 0xff, (part.bits >> 8) & 0xff, st * part.scale - part.offset, w, wu, wv);
+    float4 value = 0.0;
+    for (uint i = 0; i < n; i++)
+        value += w[i] * c.value_points[c.part_cvs[part.cvs + i]];
+    return value;
+}
+
+// Uv set `set` of patch `patch` at `st`; 0 where none of its parts gives the set.
+public float2 subd_limit_uv(SubdCageGpu* c, uint patch, float2 st, uint set)
 {
     SubdPatchGpu p = c.patches[patch];
-    float w[20], wu[20], wv[20];
-    float2 at = st * p.uv_scale - p.uv_offset;
-    uint n = subd_basis((p.bits >> 16) & 0xff, p.bits >> 24, at, w, wu, wv);
     float2 uv = 0.0;
-    for (uint i = 0; i < n; i++)
-        uv += w[i] * c.uv_points[c.uv_cvs[p.uv_cvs + i]];
+    for (uint k = 0; k < p.part_count; k++)
+    {
+        SubdPartGpu part = c.parts[p.part_first + k];
+        if (((part.bits >> 16) & (SUBD_PART_UV << set)) != 0)
+            uv = subd_part_value(c, part, st).xy;
+    }
     return uv;
 }
 
@@ -132,17 +141,13 @@ public float2 subd_limit_uv(SubdCageGpu* c, uint patch, float2 st)
 public float4 subd_limit_color(SubdCageGpu* c, uint patch, float2 st)
 {
     SubdPatchGpu p = c.patches[patch];
-    float w[20], wu[20], wv[20];
     float4 color = 1.0;
-    for (uint k = 0; k < p.color_count; k++)
+    for (uint k = 0; k < p.part_count; k++)
     {
-        SubdColorPartGpu part = c.color_parts[p.color_first + k];
-        uint n = subd_basis(part.bits & 0xff, (part.bits >> 8) & 0xff, st * part.scale - part.offset, w, wu, wv);
-        float4 value = 0.0;
-        for (uint i = 0; i < n; i++)
-            value += w[i] * c.color_points[c.color_cvs[part.cvs + i]];
-        uint channels = part.bits >> 16;
-        color = select((uint4(channels) & uint4(1, 2, 4, 8)) != 0, value, color);
+        SubdPartGpu part = c.parts[p.part_first + k];
+        uint channels = (part.bits >> 16) & (SUBD_PART_UV - 1);
+        if (channels != 0)
+            color = select((uint4(channels) & uint4(1, 2, 4, 8)) != 0, subd_part_value(c, part, st), color);
     }
     return color;
 }

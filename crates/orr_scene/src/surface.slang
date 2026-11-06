@@ -48,7 +48,7 @@ public struct SurfaceInput
     public uint3 vertex_user;       // producer vertex words per corner; 0 on cooked clusters
     public uint material;
     public uint surface;            // linked surface id; 0 = StandardSurface
-    public UvFootprint uv[2];       // per uv set; producer and patch geometry give both its one uv
+    public UvFootprint uv[2];       // per uv set; producer and patch geometry give both its one uv, but for a subdivision copy holding uv set 1
     public float3 geometric_normal; // the triangle's front face
     public bool back_face;          // the ray met the back of a double-sided material
     public float3 normal;           // interpolated vertex normal, unit

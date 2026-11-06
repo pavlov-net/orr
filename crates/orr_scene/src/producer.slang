@@ -50,7 +50,8 @@ public struct ProducerBatch
     public ProducerClusterGpu* clusters;
     public float3* positions;    // relative to the entry's transform
     public float3* previous;     // each vertex's position last frame; null unless ProducerDesc::previous_positions
-    public uint2* attrs;         // normal oct 2x16 unorm, uv 2x f16 (both uv sets read it)
+    public uint2* attrs;         // normal oct 2x16 unorm, uv 2x f16 (uv set 1 too where `uv1` is null)
+    public uint* uv1;            // uv set 1, 2x f16; null but on a subdivision copy that carries it
     public uint2* colors;        // the vertex color stream, 4x f16; null where it reads 1: only a colored subdivision copy's generated vertices hold it
     public uint* vertex_user;    // null unless ProducerDesc::vertex_user
     public uint* cluster_count;
@@ -144,6 +145,18 @@ public float3 producer_normal(uint2 attrs)
 public float2 producer_uv(uint2 attrs)
 {
     return unpack_half2x16(attrs.y);
+}
+
+// The word of a vertex with uv set 1 `uv`, for `ProducerBatch.uv1`.
+public uint producer_uv_word(float2 uv)
+{
+    return pack_half2x16(uv);
+}
+
+// Uv set 1 of vertex `v`, whose uv set 0 is `uv`.
+public float2 producer_uv1(ProducerBatch b, uint v, float2 uv)
+{
+    return b.uv1 != nullptr ? unpack_half2x16(b.uv1[v]) : uv;
 }
 
 // The word of a vertex with vertex color stream `color`, for `ProducerBatch.colors`.

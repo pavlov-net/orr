@@ -221,7 +221,7 @@ public ProducerTriangle producer_triangle(ProducerBatch b, ProducerClusterGpu k,
         VertexAttributes a = (VertexAttributes)0;
         a.normal = producer_normal(b.attrs[v]);
         a.uv[0] = producer_uv(b.attrs[v]);
-        a.uv[1] = a.uv[0];
+        a.uv[1] = producer_uv1(b, v, a.uv[0]);
         a.tangent = float4(1.0, 0.0, 0.0, 1.0);
         a.color = b.colors != nullptr ? producer_color(b.colors[v]) : float4(1.0);
         t.corners.attributes[j] = a;

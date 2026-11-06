@@ -1815,9 +1815,173 @@ def Scope "Looks"
 }
 "#;
 
+/// Three meshes of a model, two quads each, whose uv sets each state their own interpolation.
+#[cfg(feature = "subd")]
+const SET_CAGE: &str = r#"#usda 1.0
+(
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+def Mesh "Curved"
+{
+    int[] faceVertexCounts = [4, 4]
+    int[] faceVertexIndices = [0, 1, 4, 3, 1, 2, 5, 4]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 0, 1), (1, 0, 1), (2, 0, 1)]
+    texCoord2f[] primvars:st = [(0, 0), (0.5, 0.25), (1, 0), (0, 1), (0.5, 0.75), (1, 1)] (
+        interpolation = "vertex"
+    )
+    texCoord2f[] primvars:st1 = [(0.25, 0.25), (0.75, 0.75)] (
+        interpolation = "uniform"
+    )
+}
+
+def Mesh "Flat"
+{
+    int[] faceVertexCounts = [4, 4]
+    int[] faceVertexIndices = [0, 1, 4, 3, 1, 2, 5, 4]
+    point3f[] points = [(0, 0, 3), (1, 0, 3), (2, 0, 3), (0, 0, 4), (1, 0, 4), (2, 0, 4)]
+    texCoord2f[] primvars:st = [(0, 0), (0.5, 0.25), (1, 0), (0, 1), (0.5, 0.75), (1, 1)] (
+        interpolation = "varying"
+    )
+    texCoord2f[] primvars:st1 = [(0.5, 0.25)] (
+        interpolation = "constant"
+    )
+}
+
+def Mesh "Bare"
+{
+    int[] faceVertexCounts = [4, 4]
+    int[] faceVertexIndices = [0, 1, 4, 3, 1, 2, 5, 4]
+    point3f[] points = [(0, 0, 6), (1, 0, 6), (2, 0, 6), (0, 0, 7), (1, 0, 7), (2, 0, 7)]
+}
+"#;
+
 /// A ptex face and its limit position, uv and color at one point.
 #[cfg(feature = "subd")]
 type LimitSample = (u32, [f32; 3], Option<[f32; 2]>, [f32; 4]);
+
+/// Both uv sets of every face of a subdivision cage entry on a 3x3 grid.
+#[cfg(feature = "subd")]
+fn uv_samples(a: &Archive, name: &str) -> Vec<(u32, [[f32; 2]; 2])> {
+    use orr_pack::subd::{Page, SubdInfo};
+    let info = SubdInfo::parse(&blob(a, name, 0)).unwrap();
+    let mut out = Vec::new();
+    for p in &info.pages {
+        let page = Page::parse(&blob(a, name, p.blob as usize)).unwrap();
+        let values = page.value_points(&info.values);
+        for (f, face) in page.faces.iter().enumerate() {
+            for u in [0.0, 0.5, 1.0] {
+                for v in [0.0, 0.5, 1.0] {
+                    let uv = |set| page.limit_uv(f, u, v, set, &values).unwrap();
+                    out.push((face.ptex, [uv(0), uv(1)]));
+                }
+            }
+        }
+    }
+    out.sort_by_key(|s| s.0);
+    out
+}
+
+#[cfg(feature = "subd")]
+#[test]
+fn a_cages_uv_sets_cook_by_each_meshs_interpolation() {
+    use orr_cook::{CageInput, CageUv, CageValues, FaceVarying, Subdivision};
+    use orr_math::{Vec2, Vec3};
+    let d = dir("usd-cage-uvs");
+    std::fs::write(d.join("cage.usda"), SET_CAGE).unwrap();
+    let settings = UsdSettings {
+        subdivision: Subdivision::Cage,
+        uv1: Some("st1".into()),
+        ..UsdSettings::default()
+    };
+    let (a, report) = usd(&d.join("cage.usda"), settings).unwrap();
+    assert!(report.assets[0].warnings.is_empty(), "{report:?}");
+
+    let top_left = |[u, v]: [f32; 2]| Vec2::new(u, 1.0 - v);
+    let st = [
+        [0.0, 0.0],
+        [0.5, 0.25],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.5, 0.75],
+        [1.0, 1.0],
+    ]
+    .map(top_left);
+    let mut cage = CageInput::default();
+    for z in [0.0, 3.0, 6.0] {
+        let first = cage.positions.len() as u32;
+        for (dz, x) in [
+            (0.0, 0.0),
+            (0.0, 1.0),
+            (0.0, 2.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (1.0, 2.0),
+        ] {
+            cage.positions.push(Vec3::new(x, 0.0, z + dz));
+        }
+        cage.face_counts.extend([4, 4]);
+        cage.face_indices
+            .extend([0, 1, 4, 3, 1, 2, 5, 4].map(|k| first + k));
+    }
+    let of_second = |values: Vec<Vec2>, indices: Vec<u32>| FaceVarying {
+        values: [vec![Vec2::ZERO], values].concat(),
+        indices: [vec![0; 8], indices, vec![0; 8]].concat(),
+    };
+    let mut on_points = st.to_vec();
+    on_points.resize(18, Vec2::ZERO);
+    let corners = vec![1, 2, 5, 4, 2, 3, 6, 5];
+    let uniform = [[0.25, 0.25], [0.75, 0.75]].map(top_left).to_vec();
+    cage.uvs = vec![
+        CageUv {
+            values: CageValues::Vertex(on_points),
+            set: 0,
+            faces: vec![0, 1],
+        },
+        CageUv {
+            values: CageValues::Linear(of_second(st.to_vec(), corners)),
+            set: 0,
+            faces: vec![2, 3],
+        },
+        CageUv {
+            values: CageValues::Linear(FaceVarying {
+                values: [vec![Vec2::ZERO], uniform].concat(),
+                indices: [vec![1; 4], vec![2; 4], vec![0; 16]].concat(),
+            }),
+            set: 1,
+            faces: vec![0, 1],
+        },
+        CageUv {
+            values: CageValues::Linear(of_second(vec![top_left([0.5, 0.25])], vec![1; 8])),
+            set: 1,
+            faces: vec![2, 3],
+        },
+    ];
+    let (b, _) = cook_one(Source::Subd {
+        cage,
+        materials: vec![material(&a, "u/material/default")],
+        settings: Default::default(),
+    })
+    .unwrap();
+    let (usd, built) = (uv_samples(&a, "u/subd"), uv_samples(&b, "u/subd"));
+    assert_eq!(usd.len(), 6 * 9);
+    for (x, y) in usd.iter().zip(&built) {
+        assert_eq!(x.0, y.0);
+        let e = (0..2).flat_map(|s| (0..2).map(move |k| (s, k)));
+        let e = e.fold(0.0f32, |m, (s, k)| m.max((x.1[s][k] - y.1[s][k]).abs()));
+        assert!(e < 1e-6, "{x:?} {y:?}");
+    }
+    // The curved mesh's points smooth off their control values; the flat mesh's are bilinear.
+    let middle = |face: u32| usd.iter().filter(|s| s.0 == face).nth(4).unwrap().1[0];
+    let (curved, flat) = (middle(0), middle(2));
+    assert_ne!(curved, flat);
+    assert!(
+        usd.iter()
+            .filter(|s| s.0 >= 4)
+            .all(|s| s.1 == [[0.0; 2]; 2])
+    );
+}
 
 /// The limit positions, uvs and colors of every face of a subdivision cage entry on a 3x3 grid.
 #[cfg(feature = "subd")]
@@ -1827,14 +1991,13 @@ fn limit_samples(a: &Archive, name: &str) -> Vec<LimitSample> {
     let mut out = Vec::new();
     for p in &info.pages {
         let page = Page::parse(&blob(a, name, p.blob as usize)).unwrap();
-        let (points, uvs) = (page.points(&info.points), page.uv_points(&info.uvs));
-        let colors = page.color_points(&info.colors);
+        let (points, values) = (page.points(&info.points), page.value_points(&info.values));
         for (f, face) in page.faces.iter().enumerate() {
             for u in [0.0, 0.5, 1.0] {
                 for v in [0.0, 0.5, 1.0] {
                     let l = page.limit(f, u, v, &points).unwrap();
-                    let uv = page.limit_uv(f, u, v, &uvs);
-                    let color = page.limit_color(f, u, v, &colors).unwrap();
+                    let uv = page.limit_uv(f, u, v, 0, &values);
+                    let color = page.limit_color(f, u, v, &values).unwrap();
                     out.push((face.ptex, l.position, uv, color));
                 }
             }
@@ -1847,7 +2010,9 @@ fn limit_samples(a: &Archive, name: &str) -> Vec<LimitSample> {
 #[cfg(feature = "subd")]
 #[test]
 fn usd_cages_cook_the_surface_of_the_same_cage_built_in_memory() {
-    use orr_cook::{Boundary, CageInput, Corner, Crease, FaceVarying, Subdivision, UvLinear};
+    use orr_cook::{
+        Boundary, CageInput, CageUv, CageValues, Corner, Crease, FaceVarying, Subdivision, UvLinear,
+    };
     use orr_math::{Vec2, Vec3};
     let d = dir("usd-cage");
     std::fs::write(d.join("cage.usda"), CAGE).unwrap();
@@ -1901,10 +2066,14 @@ fn usd_cages_cook_the_surface_of_the_same_cage_built_in_memory() {
             sharpness: 10.0,
         }],
         holes: vec![5],
-        uvs: Some(FaceVarying {
-            values: st.iter().map(|&[u, v]| Vec2::new(u, 1.0 - v)).collect(),
-            indices: uv_indices,
-        }),
+        uvs: vec![CageUv {
+            values: CageValues::FaceVarying(FaceVarying {
+                values: st.iter().map(|&[u, v]| Vec2::new(u, 1.0 - v)).collect(),
+                indices: uv_indices,
+            }),
+            set: 0,
+            faces: Vec::new(),
+        }],
         colors: Vec::new(),
         left_handed: false,
         boundary: Boundary::Edges,
@@ -1938,7 +2107,7 @@ fn usd_cages_cook_the_surface_of_the_same_cage_built_in_memory() {
 #[cfg(feature = "subd")]
 #[test]
 fn usd_cages_carry_primvars_by_their_interpolation_as_the_same_cage_built_in_memory() {
-    use orr_cook::{CageColor, CageInput, ColorValues, FaceVarying, Subdivision};
+    use orr_cook::{CageColor, CageInput, CageValues, FaceVarying, Subdivision};
     use orr_math::{Vec3, Vec4};
     let d = dir("usd-cage-colors");
     std::fs::write(d.join("cage.usda"), PAINTED_CAGE).unwrap();
@@ -1987,12 +2156,12 @@ fn usd_cages_carry_primvars_by_their_interpolation_as_the_same_cage_built_in_mem
         face_sections: vec![0, 1, 0, 1],
         colors: vec![
             CageColor {
-                values: ColorValues::Vertex(paint.map(rgb).to_vec()),
+                values: CageValues::Vertex(paint.map(rgb).to_vec()),
                 channels: 0b0111,
                 faces: vec![0, 2],
             },
             CageColor {
-                values: ColorValues::FaceVarying(FaceVarying {
+                values: CageValues::FaceVarying(FaceVarying {
                     values: fade.to_vec(),
                     indices: vec![0, 1, 1, 0, 1, 2, 2, 1, 3, 3, 2, 2, 3, 2, 2, 3],
                 }),
@@ -2000,7 +2169,7 @@ fn usd_cages_carry_primvars_by_their_interpolation_as_the_same_cage_built_in_mem
                 faces: vec![0, 2],
             },
             CageColor {
-                values: ColorValues::Linear(FaceVarying {
+                values: CageValues::Linear(FaceVarying {
                     values: tint.map(rgb).to_vec(),
                     indices: corners,
                 }),

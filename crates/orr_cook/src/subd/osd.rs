@@ -2,7 +2,7 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 
-use super::{Boundary, CageInput, ColorValues, SubdSettings};
+use super::{Boundary, CageInput, CageValues, SubdSettings};
 
 #[repr(C)]
 struct Cage {
@@ -92,9 +92,8 @@ pub(super) struct Patches {
 pub(super) struct Refined {
     pub(super) stencils: Stencils,
     pub(super) patches: Patches,
-    pub(super) uv: Option<(Stencils, Patches)>,
-    /// Those of each [`ColorValues::FaceVarying`] of the cage, in order.
-    pub(super) colors: Vec<(Stencils, Patches)>,
+    /// Those of each [`CageValues::FaceVarying`] of the cage, uvs then colors, in order.
+    pub(super) fvar: Vec<(Stencils, Patches)>,
 }
 
 /// The topology arrays the shim reads, kept alive while it runs.
@@ -116,13 +115,18 @@ fn int(v: u32) -> c_int {
     v as c_int
 }
 
+/// The value count and indices of a face-varying channel.
+fn channel<T>(values: &CageValues<T>) -> Option<(usize, &Vec<u32>)> {
+    match values {
+        CageValues::FaceVarying(f) => Some((f.values.len(), &f.indices)),
+        _ => None,
+    }
+}
+
 impl Arrays {
     fn new(cage: &CageInput) -> Self {
-        let uvs = cage.uvs.iter().map(|u| (u.values.len(), &u.indices));
-        let colors = cage.colors.iter().filter_map(|c| match &c.values {
-            ColorValues::FaceVarying(f) => Some((f.values.len(), &f.indices)),
-            _ => None,
-        });
+        let uvs = cage.uvs.iter().filter_map(|u| channel(&u.values));
+        let colors = cage.colors.iter().filter_map(|c| channel(&c.values));
         let (mut fvar_values, mut fvar_indices) = (Vec::new(), Vec::new());
         for (values, indices) in uvs.chain(colors) {
             fvar_values.push(values as c_int);
@@ -256,14 +260,12 @@ pub(super) fn refine(cage: &CageInput, settings: &SubdSettings) -> Result<Refine
         return Err(format!("OpenSubdiv: {}", message(&error)));
     }
     let h = Handle(osd);
-    let mut fvar = (1..=desc.fvar_count).map(|k| {
+    let fvar = (1..=desc.fvar_count).map(|k| {
         let base = TABLES * k;
         (h.stencils(base), h.patches(base + PATCH_TYPES))
     });
-    let uv = cage.uvs.as_ref().and_then(|_| fvar.next());
     Ok(Refined {
-        uv,
-        colors: fvar.collect(),
+        fvar: fvar.collect(),
         stencils: h.stencils(STENCIL_SIZES),
         patches: h.patches(PATCH_TYPES),
     })
@@ -273,7 +275,8 @@ pub(super) fn refine(cage: &CageInput, settings: &SubdSettings) -> Result<Refine
 #[cfg(test)]
 type Samples<const N: usize> = (Vec<[f32; 3]>, Vec<[f32; N]>);
 
-/// OpenSubdiv's own limit positions and uvs at ptex locations `(face, s, t)`.
+/// OpenSubdiv's own limit positions, and of the cage's first face-varying uv, at ptex locations
+/// `(face, s, t)`.
 #[cfg(test)]
 pub(super) fn limit(
     cage: &CageInput,
@@ -282,8 +285,12 @@ pub(super) fn limit(
 ) -> Result<Samples<2>, String> {
     let uvs: Vec<[f32; 2]> = cage
         .uvs
-        .as_ref()
-        .map(|u| u.values.iter().map(orr_math::Vec2::to_array).collect())
+        .iter()
+        .find_map(|u| match &u.values {
+            CageValues::FaceVarying(f) => Some(&f.values),
+            _ => None,
+        })
+        .map(|v| v.iter().map(orr_math::Vec2::to_array).collect())
         .unwrap_or_default();
     limit_of(cage, settings, at, &uvs)
 }
@@ -300,7 +307,7 @@ pub(super) fn limit_color(
         .colors
         .iter()
         .find_map(|c| match &c.values {
-            ColorValues::FaceVarying(f) => Some(&f.values),
+            CageValues::FaceVarying(f) => Some(&f.values),
             _ => None,
         })
         .ok_or("the cage has no face-varying color")?
@@ -308,7 +315,7 @@ pub(super) fn limit_color(
         .map(orr_math::Vec4::to_array)
         .collect();
     let alone = CageInput {
-        uvs: None,
+        uvs: Vec::new(),
         ..cage.clone()
     };
     Ok(limit_of(&alone, settings, at, &colors)?.1)

@@ -2686,6 +2686,7 @@ fn cook_unit(
                     asset: name.into(),
                     message,
                 })?;
+            detail.warnings = cooked.warnings;
             let info = cooked.info.to_bytes();
             let mut blobs = vec![mount(&info)];
             blobs.extend(cooked.pages.iter().map(|p| BlobIn::new(p)));

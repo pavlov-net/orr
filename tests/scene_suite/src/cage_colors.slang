@@ -1,5 +1,6 @@
 // Per pixel, the base color of what the raster shows and where on it; of producer entries also
-// the vertex color stream and the batch vertices and barycentrics of the triangle it hit.
+// the vertex color stream, the uv sets and the batch vertices and barycentrics of the triangle it
+// hit.
 #include "orr_root.h"
 import orr_scene.hit;
 import orr_scene.producer;
@@ -13,6 +14,7 @@ struct Seen
     float2 barycentrics;
     float3 base_color;
     float3 object;
+    float2 uv[2];
 }
 
 struct Root
@@ -48,6 +50,8 @@ void main(uint3 id: SV_DispatchThreadID)
         {
             ProducerClusterGpu k = s.batches[entry].clusters[vc.cluster];
             o.color = p.input.vertex_color;
+            o.uv[0] = p.input.uv[0].uv;
+            o.uv[1] = p.input.uv[1].uv;
             o.corners = cluster_corners(k, visibility_triangle(w)) + k.first_vertex;
             o.barycentrics = p.input.barycentrics;
             o.shown = 1;

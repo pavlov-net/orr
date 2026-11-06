@@ -124,7 +124,9 @@ void fill(uint3 id: SV_DispatchThreadID)
     }
     float3 n = subd_normal(du, dv, float3(0.0, 1.0, 0.0));
     b.positions[i] = x;
-    b.attrs[i] = producer_attributes(n, subd_limit_uv(cage, v.patch, v.st));
+    b.attrs[i] = producer_attributes(n, subd_limit_uv(cage, v.patch, v.st, 0));
+    if (b.uv1 != nullptr)
+        b.uv1[i] = producer_uv_word(subd_limit_uv(cage, v.patch, v.st, 1));
     if (b.previous != nullptr)
         b.previous[i] = subd_limit(cage, c.previous, v.source, v.source_st, du, dv);
 }

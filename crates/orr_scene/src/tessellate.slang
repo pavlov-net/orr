@@ -7,7 +7,7 @@
 // whose edges need more than MAX_DICE segments by the pattern of their split factors;
 // `dice` writes one generated cluster per subpatch, its vertices on the patch triangle or a
 // subdivision copy's limit surface, displaced through the linked `IDisplacement` with
-// normals from finite differences of the displaced field, and a colored copy's vertex color
+// normals from finite differences of the displaced field, and a copy's uv sets and vertex color
 // stream at each;
 // `weld_clear`, `weld` and `weld_apply` give vertices on patch triangle edges that share an
 // undisplaced point one displaced position, which closes uv seams; `finish` keeps the
@@ -326,7 +326,7 @@ struct Surface
 {
     float3 position;
     float3 normal;
-    float2 uv;
+    float2 uv[2];
 }
 
 // Where patch weights `w` of a subdivision copy's patch triangle lie on its patch.
@@ -343,21 +343,25 @@ Surface undisplaced(Patch pt, float3 w, bool previous)
     ProducerTriangle tri = previous ? pt.previous : pt.current;
     float3 positions[3] = tri.corners.position;
     float3 normals[3] = { tri.corners.attributes[0].normal, tri.corners.attributes[1].normal, tri.corners.attributes[2].normal };
-    float2 uvs[3] = { tri.corners.attributes[0].uv[0], tri.corners.attributes[1].uv[0], tri.corners.attributes[2].uv[0] };
     Surface o;
     o.normal = safe_normalize(interpolate(normals, w), float3(0.0, 1.0, 0.0));
     SubdCopyGpu* c = root.tess.subd;
     if (c == nullptr)
     {
         o.position = interpolate(positions, w);
-        o.uv = interpolate(uvs, w);
+        for (uint s = 0; s < 2; s++)
+        {
+            float2 uvs[3] = { tri.corners.attributes[0].uv[s], tri.corners.attributes[1].uv[s], tri.corners.attributes[2].uv[s] };
+            o.uv[s] = interpolate(uvs, w);
+        }
         return o;
     }
     float2 st = patch_st(pt, w);
     float3 du, dv;
     o.position = subd_limit(c.cage, previous ? c.previous : c.points, pt.base.patch, st, du, dv);
     o.normal = subd_normal(du, dv, o.normal);
-    o.uv = subd_limit_uv(c.cage, pt.base.patch, st);
+    o.uv[0] = subd_limit_uv(c.cage, pt.base.patch, st, 0);
+    o.uv[1] = drawn().uv1 != nullptr ? subd_limit_uv(c.cage, pt.base.patch, st, 1) : o.uv[0];
     return o;
 }
 
@@ -378,7 +382,7 @@ float3x3 entry_linear(bool previous)
 float3 displaced(Patch pt, PatchItem item, uint material, float3 w, bool previous, float3x3 placing, out Surface base)
 {
     ProducerTriangle tri = previous ? pt.previous : pt.current;
-    float2 uvs[3] = { tri.corners.attributes[0].uv[0], tri.corners.attributes[1].uv[0], tri.corners.attributes[2].uv[0] };
+    MaterialGpu* m = root.scene.materials + material;
     base = undisplaced(pt, w, previous);
     DisplacementInput i = (DisplacementInput)0;
     i.position = base.position;
@@ -388,19 +392,23 @@ float3 displaced(Patch pt, PatchItem item, uint material, float3 w, bool previou
     i.linear = placing;
     float3 e1 = tri.corners.position[1] - tri.corners.position[0];
     float3 e2 = tri.corners.position[2] - tri.corners.position[0];
+    uint set = material_uv_set(m, TEXTURE_DISPLACEMENT);
+    float2 first = tri.corners.attributes[0].uv[set];
     float3 along, across;
-    uv_directions(e1, e2, uvs[1] - uvs[0], uvs[2] - uvs[0], along, across);
+    uv_directions(e1, e2, tri.corners.attributes[1].uv[set] - first, tri.corners.attributes[2].uv[set] - first, along, across);
     i.tangent = unit_direction(along - base.normal * dot(base.normal, along), float3(0.0));
     i.bitangent = unit_direction(across - base.normal * dot(base.normal, across), float3(0.0));
-    float2 inward = (uvs[0] + uvs[1] + uvs[2]) / 3.0 - base.uv;
-    UvFootprint f = { base.uv, (uvs[1] - uvs[0]) / item.rate, (uvs[2] - uvs[0]) / item.rate, float2(-1.0), inward };
-    i.uv[0] = f;
-    i.uv[1] = f;
+    for (uint s = 0; s < 2; s++)
+    {
+        float2 uvs[3] = { tri.corners.attributes[0].uv[s], tri.corners.attributes[1].uv[s], tri.corners.attributes[2].uv[s] };
+        float2 inward = (uvs[0] + uvs[1] + uvs[2]) / 3.0 - base.uv[s];
+        UvFootprint f = { base.uv[s], (uvs[1] - uvs[0]) / item.rate, (uvs[2] - uvs[0]) / item.rate, float2(-1.0), inward };
+        i.uv[s] = f;
+    }
     i.user = pt.cluster.user;
     i.user_tag = entry().user_tag;
     i.previous = previous ? 1 : 0;
     i.scene = root.scene;
-    MaterialGpu* m = root.scene.materials + material;
     i.data = m.data != 0 ? m.data : root.scene.surface_data;
     return base.position + Displace.displace(i);
 }
@@ -505,7 +513,9 @@ void dice(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         nd = -nd;
     uint v = g_first + thread;
     d.positions[v] = x;
-    d.attrs[v] = producer_attributes(nd, base.uv);
+    d.attrs[v] = producer_attributes(nd, base.uv[0]);
+    if (d.uv1 != nullptr)
+        d.uv1[v] = producer_uv_word(base.uv[1]);
     if (d.colors != nullptr)
         d.colors[v] = producer_color_word(subd_limit_color(root.tess.subd.cage, pt.base.patch, patch_st(pt, w)));
     if (d.previous != nullptr)

@@ -318,7 +318,7 @@ pub(crate) struct SectionData {
 }
 
 /// Whether material `m` binds a texture on uv set 1.
-pub(crate) fn binds_uv1(m: &Material) -> bool {
+fn binds_uv1(m: &Material) -> bool {
     m.textures
         .iter()
         .any(|b| b.texture != AssetId::NONE && b.uv_set & 1 == 1)

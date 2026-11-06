@@ -3,9 +3,10 @@
 //! polygons of schemes `none` and `bilinear` and smooth point normals on other hulls), uvs
 //! flipped from USD's bottom-left origin to the cook's top-left. Or as a subdivision cage
 //! ([`CageBuilder`]): faces as authored with their creases, corners, holes and boundary
-//! rules, `st` as face-varying values (unindexed values weld where a point's corners agree),
-//! and each primvar a material reads through the vertex color stream as its interpolation
-//! asks: `vertex` on the surface's basis, `faceVarying` as `st`, `varying` and `uniform` linear.
+//! rules, and its uv sets and each primvar a material reads through the vertex color stream as
+//! their interpolation asks: `vertex` on the surface's basis, `faceVarying` on its own topology
+//! (unindexed values weld where a point's corners agree), `varying`, `uniform` and `constant`
+//! linear over each face.
 //! Tangents are the frame primvars a material names, or MikkTSpace-compatible ones from its
 //! frame's uvs, in the mesh's own space; a cage's come from its limit surface on the GPU.
 
@@ -19,7 +20,7 @@ use crate::import::normal_matrix;
 use crate::mesh::tangents;
 use crate::shading::VertexRead;
 use crate::subd::{
-    Boundary, CageColor, CageInput, ColorValues, Corner, Crease, FaceVarying, UvLinear,
+    Boundary, CageColor, CageInput, CageUv, CageValues, Corner, Crease, FaceVarying, UvLinear,
 };
 
 /// The authored topology and attributes of one mesh prim.
@@ -449,8 +450,42 @@ struct ColorKey {
     width: u8,
     fallback: [u32; 4],
     scale: u32,
-    /// 0 on the surface's basis, 1 face-varying, 2 linear.
-    interpolation: u8,
+    interpolation: CageBasis,
+}
+
+/// How a primvar interpolates over a cage, as [`CageValues`] states.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+enum CageBasis {
+    Surface,
+    Own,
+    Linear,
+}
+
+impl CageBasis {
+    /// `UsdGeomPrimvar`: `vertex` takes "the basis function of the surface", `varying` "bilinear
+    /// interpolation", and only `faceVarying` values may differ across an edge. A primvar the mesh
+    /// doesn't hold reads its fallback, which is linear.
+    fn of(held: Option<&Primvar>) -> Self {
+        match held.map(|p| p.interp) {
+            Some(Interp::Vertex) => Self::Surface,
+            Some(Interp::FaceVarying) => Self::Own,
+            _ => Self::Linear,
+        }
+    }
+
+    /// Values of this basis with no mesh in them yet. Corners of a mesh that doesn't read them
+    /// take value 0.
+    fn values<T: Default>(self) -> CageValues<T> {
+        let corners = || FaceVarying {
+            values: vec![T::default()],
+            indices: Vec::new(),
+        };
+        match self {
+            Self::Surface => CageValues::Vertex(Vec::new()),
+            Self::Own => CageValues::FaceVarying(corners()),
+            Self::Linear => CageValues::Linear(corners()),
+        }
+    }
 }
 
 impl ColorKey {
@@ -461,27 +496,14 @@ impl ColorKey {
             width: r.read.width,
             fallback: r.read.fallback.map(f32::to_bits),
             scale: r.read.scale.to_bits(),
-            interpolation: match r.held.map(|p| p.interp) {
-                Some(Interp::Vertex) => 0,
-                Some(Interp::FaceVarying) => 1,
-                _ => 2,
-            },
+            interpolation: CageBasis::of(r.held),
         }
     }
 
-    /// The color it names, with no mesh in it yet. Corners of a mesh that doesn't read it take
-    /// value 0.
+    /// The color it names, with no mesh in it yet.
     fn color(&self) -> CageColor {
-        let corners = || FaceVarying {
-            values: vec![Vec4::ZERO],
-            indices: Vec::new(),
-        };
         CageColor {
-            values: match self.interpolation {
-                0 => ColorValues::Vertex(Vec::new()),
-                1 => ColorValues::FaceVarying(corners()),
-                _ => ColorValues::Linear(corners()),
-            },
+            values: self.interpolation.values(),
             channels: ((1 << self.width) - 1) << self.first,
             faces: Vec::new(),
         }
@@ -582,7 +604,8 @@ pub(super) struct CageBuilder {
     pub(super) skin: Vec<SkinInfluence>,
     /// Scene material per face.
     pub(super) materials: Vec<usize>,
-    uvs: HashMap<u32, u32>,
+    /// Each uv set's place in the cage's uvs, per basis: meshes of a model share one.
+    uvs: HashMap<(u8, CageBasis), usize>,
     /// Each read's place in the cage's colors.
     colors: HashMap<ColorKey, usize>,
     /// The first mesh's path, naming the rules every other must share.
@@ -635,24 +658,6 @@ impl CageBuilder {
                     .map(|&(joints, weights)| SkinInfluence { joints, weights }),
             );
         }
-        let had_uvs = c.uvs.is_some();
-        if mesh.uvs.is_some() && !had_uvs {
-            // Earlier meshes without uvs read value 0.
-            c.uvs = Some(FaceVarying {
-                values: vec![Vec2::ZERO],
-                indices: vec![0; c.face_indices.len()],
-            });
-        }
-        let welds = mesh
-            .uvs
-            .as_ref()
-            .map(|uv| {
-                corner_values(mesh, uv, |v, face| {
-                    let v = v.ok_or_else(|| format!("{path}: st does not cover face {face}"))?;
-                    Ok(Vec2::new(v[0] as f32, v[1] as f32))
-                })
-            })
-            .transpose()?;
         let mut corner = 0;
         // Face corners as the cage holds them.
         let mut read_order = Vec::with_capacity(mesh.indices.len());
@@ -668,19 +673,8 @@ impl CageBuilder {
             };
             corner += count;
             read_order.extend(&ring);
-            for k in ring {
-                c.face_indices.push(base + mesh.indices[k] as u32);
-                let Some(fv) = c.uvs.as_mut() else { continue };
-                let id = match &welds {
-                    Some((values, index)) => *self.uvs.entry(index[k]).or_insert_with(|| {
-                        let v = values[index[k] as usize];
-                        fv.values.push(Vec2::new(v.x, 1.0 - v.y));
-                        fv.values.len() as u32 - 1
-                    }),
-                    None => 0,
-                };
-                fv.indices.push(id);
-            }
+            c.face_indices
+                .extend(ring.into_iter().map(|k| base + mesh.indices[k] as u32));
         }
         for cr in &mesh.creases {
             c.creases.push(Crease {
@@ -701,37 +695,72 @@ impl CageBuilder {
             }
             c.holes.push(first_face + h as u32);
         }
-        // Per-mesh uv welding must not join another mesh's values.
-        self.uvs.clear();
-        self.add_colors(
-            mesh,
-            at,
-            &read_order,
-            base as usize,
+        let spot = CageSpot {
+            read_order: &read_order,
+            first_point: base as usize,
             first_corner,
-            first_face,
-        )
+        };
+        self.add_uvs(mesh, &spot, first_face, path)?;
+        self.add_colors(mesh, at, &spot, first_face)?;
+        let c = &mut self.cage;
+        let (points, corners) = (c.positions.len(), c.face_indices.len());
+        for uv in &mut c.uvs {
+            pad(&mut uv.values, points, corners);
+        }
+        for color in &mut c.colors {
+            pad(&mut color.values, points, corners);
+        }
+        Ok(())
     }
 
-    /// Adds what the mesh's faces read of the vertex color stream: the mesh's points start at
-    /// `first_point`, its corners, in `read_order`, at `first_corner` and its faces at
+    /// Adds the mesh's uv sets. A face of a mesh without a set reads uv 0.
+    fn add_uvs(
+        &mut self,
+        mesh: &MeshPrim,
+        spot: &CageSpot<'_>,
+        first_face: u32,
+        path: &str,
+    ) -> Result<(), String> {
+        let c = &mut self.cage;
+        let first_faces = first_face..first_face + mesh.counts.len() as u32;
+        for (set, held) in [(0, &mesh.uvs), (1, &mesh.uvs1)] {
+            let Some(held) = held else { continue };
+            let basis = CageBasis::of(Some(held));
+            let l = *self.uvs.entry((set, basis)).or_insert_with(|| {
+                c.uvs.push(CageUv {
+                    values: basis.values(),
+                    set,
+                    faces: Vec::new(),
+                });
+                c.uvs.len() - 1
+            });
+            let uv = &mut c.uvs[l];
+            uv.faces.extend(first_faces.clone());
+            let element = |v: Option<&[f64]>, face: usize| {
+                let v = v.ok_or_else(|| format!("{path}: uvs do not cover face {face}"))?;
+                Ok(Vec2::new(v[0] as f32, 1.0 - v[1] as f32))
+            };
+            add_values(&mut uv.values, mesh, Some(held), element, spot)?;
+        }
+        Ok(())
+    }
+
+    /// Adds what the mesh's faces read of the vertex color stream, its faces starting at
     /// `first_face`. A color spans the cage, so the values of faces that don't read it stay
     /// beside those of faces that do, and the surface between them shapes both.
     fn add_colors(
         &mut self,
         mesh: &MeshPrim,
         at: &Placing<'_>,
-        read_order: &[usize],
-        first_point: usize,
-        first_corner: usize,
+        spot: &CageSpot<'_>,
         first_face: u32,
     ) -> Result<(), String> {
         let c = &mut self.cage;
         for r in at.color_reads {
-            let element = |v: Option<&[f64]>| {
+            let element = |v: Option<&[f64]>, _: usize| {
                 let mut color = [0.0; 4];
                 r.read.put(v, &mut color);
-                Vec4::from_array(color)
+                Ok(Vec4::from_array(color))
             };
             let l = *self
                 .colors
@@ -744,37 +773,59 @@ impl CageBuilder {
             color
                 .faces
                 .extend(r.faces.iter().map(|&f| first_face + f as u32));
-            match (&mut color.values, r.held) {
-                (ColorValues::Vertex(values), Some(held)) => {
-                    values.resize(first_point, Vec4::ZERO);
-                    values.extend((0..mesh.points.len()).map(|p| element(held.at(p, 0, 0))));
-                }
-                (ColorValues::Vertex(_), None) => {
-                    unreachable!("a primvar the mesh doesn't hold has no point values")
-                }
-                (ColorValues::FaceVarying(corners) | ColorValues::Linear(corners), held) => {
-                    let (values, index) = match held {
-                        Some(p) => corner_values(mesh, p, |v, _| Ok(element(v)))?,
-                        None => (vec![element(None)], vec![0; mesh.indices.len()]),
-                    };
-                    let first = corners.values.len() as u32;
-                    corners.values.extend(values);
-                    corners.indices.resize(first_corner, 0);
-                    corners
-                        .indices
-                        .extend(read_order.iter().map(|&k| first + index[k]));
-                }
-            }
-        }
-        for color in &mut c.colors {
-            match &mut color.values {
-                ColorValues::Vertex(values) => values.resize(c.positions.len(), Vec4::ZERO),
-                ColorValues::FaceVarying(corners) | ColorValues::Linear(corners) => {
-                    corners.indices.resize(c.face_indices.len(), 0);
-                }
-            }
+            add_values(&mut color.values, mesh, r.held, element, spot)?;
         }
         Ok(())
+    }
+}
+
+/// Where a mesh lands in a cage: its corners in the cage's order, and its first point and corner.
+struct CageSpot<'a> {
+    read_order: &'a [usize],
+    first_point: usize,
+    first_corner: usize,
+}
+
+/// Adds a mesh's `held` primvar to `values`, the elements of the mesh and face `element` takes;
+/// without a primvar it takes none, on every corner.
+fn add_values<T: Default + Clone>(
+    values: &mut CageValues<T>,
+    mesh: &MeshPrim,
+    held: Option<&Primvar>,
+    element: impl Fn(Option<&[f64]>, usize) -> Result<T, String>,
+    at: &CageSpot<'_>,
+) -> Result<(), String> {
+    match (values, held) {
+        (CageValues::Vertex(values), Some(held)) => {
+            values.resize(at.first_point, T::default());
+            for p in 0..mesh.points.len() {
+                values.push(element(held.at(p, 0, 0), 0)?);
+            }
+        }
+        (CageValues::Vertex(_), None) => {
+            unreachable!("a primvar the mesh doesn't hold has no point values")
+        }
+        (CageValues::FaceVarying(corners) | CageValues::Linear(corners), held) => {
+            let (values, index) = match held {
+                Some(p) => corner_values(mesh, p, &element)?,
+                None => (vec![element(None, 0)?], vec![0; mesh.indices.len()]),
+            };
+            let first = corners.values.len() as u32;
+            corners.values.extend(values);
+            corners.indices.resize(at.first_corner, 0);
+            corners
+                .indices
+                .extend(at.read_order.iter().map(|&k| first + index[k]));
+        }
+    }
+    Ok(())
+}
+
+/// Gives `values` an entry for every point and face corner of the cage so far.
+fn pad<T: Default + Clone>(values: &mut CageValues<T>, points: usize, corners: usize) {
+    match values {
+        CageValues::Vertex(values) => values.resize(points, T::default()),
+        CageValues::FaceVarying(c) | CageValues::Linear(c) => c.indices.resize(corners, 0),
     }
 }
 

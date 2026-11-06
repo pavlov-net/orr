@@ -3,16 +3,16 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::{Add, Div, Mul, Sub};
 
-use orr_math::{Vec3, Vec4};
+use orr_math::{Vec2, Vec3, Vec4};
 use orr_pack::material::Material;
 use orr_pack::mesh::Section;
 use orr_pack::subd::{
-    ColorPart, Face, PAGE_MAX, Page, PageHeader, PageInfo, Patch, PatchParam, SubdHeader, SubdInfo,
+    Face, PAGE_MAX, Page, PageHeader, PageInfo, Part, Patch, PatchParam, SubdHeader, SubdInfo,
 };
 use orr_pack::{Aabb, Span};
 
 use super::osd::{Patches, Refined, Stencils};
-use super::{Boundary, CageData, CageInput, ColorValues, Cooked, SubdSettings};
+use super::{Boundary, CageData, CageInput, CageValues, Cooked, SubdSettings};
 use crate::shading::stream_holds;
 
 /// Ptex faces of a cage face with `corners` corners: one for a quad, one per corner
@@ -42,10 +42,10 @@ fn param(kind: u8, p: [u32; 2]) -> (u32, PatchParam) {
     (face, param)
 }
 
-/// A page color point.
+/// A page value point.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum ColorPoint {
-    /// Point `point` of the refined points [`ColorLayer`] `layer` interpolates on.
+enum ValuePoint {
+    /// Point `point` of the refined points [`Layer`] `layer` interpolates on.
     Refined { layer: u32, point: u32 },
     /// Face coordinates `(u, v)`, as bits, of the ptex face at corner `corner` of cage face
     /// `face`, in linear layer `layer`.
@@ -58,27 +58,39 @@ enum ColorPoint {
     },
 }
 
-/// One [`ColorPart`] of a patch before it has a place in a page.
-struct PatchColor {
+/// One [`Part`] of a patch before it has a place in a page.
+struct PatchPart {
     param: PatchParam,
     channels: u32,
-    points: Vec<ColorPoint>,
+    points: Vec<ValuePoint>,
 }
 
-/// A [`super::CageColor`] in the blob's color table.
-struct ColorLayer<'a> {
+/// What a [`Layer`] interpolates on.
+#[derive(Copy, Clone)]
+enum Basis<'a> {
+    /// The surface's points and patches.
+    Surface,
+    /// Its own refined points and patches.
+    Own(&'a (Stencils, Patches)),
+    /// Each face's corners, by these value indices.
+    Linear(&'a [u32]),
+}
+
+/// A [`super::CageUv`] or [`super::CageColor`] in the blob's value table.
+struct Layer<'a> {
     /// Its first value in the table.
     first: u32,
-    /// The refined points and patches of a face-varying one.
-    refined: Option<&'a (Stencils, Patches)>,
+    basis: Basis<'a>,
+    /// [`Part::channels`].
+    channels: u32,
 }
 
-/// A cage's colors over its refinement.
-struct Colors<'a> {
+/// A cage's uvs and colors over its refinement.
+struct Layers<'a> {
     cage: &'a CageInput,
     refined: &'a Refined,
-    layers: Vec<ColorLayer<'a>>,
-    /// The blob's color table.
+    layers: Vec<Layer<'a>>,
+    /// The blob's value table.
     values: Vec<[f32; 4]>,
     /// Layers of each cage face, in order.
     of_face: Vec<Vec<u32>>,
@@ -86,28 +98,8 @@ struct Colors<'a> {
     first_corner: Vec<u32>,
 }
 
-impl<'a> Colors<'a> {
+impl<'a> Layers<'a> {
     fn new(cage: &'a CageInput, refined: &'a Refined) -> Self {
-        let mut values = Vec::new();
-        let mut face_varying = refined.colors.iter();
-        let mut of_face = vec![Vec::new(); cage.face_counts.len()];
-        let mut layers = Vec::with_capacity(cage.colors.len());
-        for (l, c) in cage.colors.iter().enumerate() {
-            let first = values.len() as u32;
-            let (own, refined) = match &c.values {
-                ColorValues::Vertex(v) => (v, None),
-                ColorValues::FaceVarying(f) => (&f.values, face_varying.next()),
-                ColorValues::Linear(f) => (&f.values, None),
-            };
-            values.extend(own.iter().map(Vec4::to_array));
-            layers.push(ColorLayer { first, refined });
-            if c.faces.is_empty() {
-                of_face.iter_mut().for_each(|f| f.push(l as u32));
-            }
-            for &f in &c.faces {
-                of_face[f as usize].push(l as u32);
-            }
-        }
         let mut corner = 0;
         let first_corner = cage
             .face_counts
@@ -117,35 +109,78 @@ impl<'a> Colors<'a> {
                 corner - c
             })
             .collect();
-        Self {
+        let mut out = Self {
             cage,
             refined,
-            layers,
-            values,
-            of_face,
+            layers: Vec::with_capacity(cage.uvs.len() + cage.colors.len()),
+            values: Vec::new(),
+            of_face: vec![Vec::new(); cage.face_counts.len()],
             first_corner,
+        };
+        let mut fvar = refined.fvar.iter();
+        for u in &cage.uvs {
+            let wide = |v: &Vec2| [v.x, v.y, 0.0, 0.0];
+            let channels = Part::UV << u.set;
+            out.add(&u.values, channels, &u.faces, wide, &mut fvar);
+        }
+        for c in &cage.colors {
+            let channels = u32::from(c.channels);
+            out.add(&c.values, channels, &c.faces, Vec4::to_array, &mut fvar);
+        }
+        out
+    }
+
+    /// Adds a layer of `values`, four wide by `wide`, that gives `channels` over `faces`.
+    fn add<T>(
+        &mut self,
+        values: &'a CageValues<T>,
+        channels: u32,
+        faces: &[u32],
+        wide: impl Fn(&T) -> [f32; 4],
+        fvar: &mut std::slice::Iter<'a, (Stencils, Patches)>,
+    ) {
+        let (own, basis) = match values {
+            CageValues::Vertex(v) => (v, Basis::Surface),
+            CageValues::FaceVarying(f) => {
+                let channel = fvar.next().expect("OpenSubdiv refined every channel");
+                (&f.values, Basis::Own(channel))
+            }
+            CageValues::Linear(f) => (&f.values, Basis::Linear(&f.indices)),
+        };
+        let l = self.layers.len() as u32;
+        self.layers.push(Layer {
+            first: self.values.len() as u32,
+            basis,
+            channels,
+        });
+        self.values.extend(own.iter().map(wide));
+        if faces.is_empty() {
+            self.of_face.iter_mut().for_each(|f| f.push(l));
+        }
+        for &f in faces {
+            self.of_face[f as usize].push(l);
         }
     }
 
     /// The parts of patch `p`, at `corner` of cage face `face`.
-    fn parts(&self, face: u32, corner: u32, p: usize) -> Vec<PatchColor> {
+    fn parts(&self, face: u32, corner: u32, p: usize) -> Vec<PatchPart> {
         let patches = &self.refined.patches;
         let (_, surface) = param(patches.types[p], patches.params[p]);
         let on = |layer: u32, table: &Patches| {
             let points = &table.cvs[table.first[p]..table.first[p + 1]];
-            let refined = |&point| ColorPoint::Refined { layer, point };
+            let refined = |&point| ValuePoint::Refined { layer, point };
             points.iter().map(refined).collect()
         };
         self.of_face[face as usize]
             .iter()
             .map(|&layer| {
-                let l = layer as usize;
-                let (param, points) = match (&self.cage.colors[l].values, self.layers[l].refined) {
-                    (ColorValues::Vertex(_), _) => (surface, on(layer, patches)),
-                    (_, Some((_, own))) => (param(own.types[p], own.params[p]).1, on(layer, own)),
-                    _ => {
+                let l = &self.layers[layer as usize];
+                let (param, points) = match l.basis {
+                    Basis::Surface => (surface, on(layer, patches)),
+                    Basis::Own((_, own)) => (param(own.types[p], own.params[p]).1, on(layer, own)),
+                    Basis::Linear(_) => {
                         let n = f32::from(1u16 << surface.levels());
-                        let at = |d: (u16, u16)| ColorPoint::Linear {
+                        let at = |d: (u16, u16)| ValuePoint::Linear {
                             layer,
                             face,
                             corner,
@@ -160,26 +195,29 @@ impl<'a> Colors<'a> {
                         (param, [(0, 0), (1, 0), (1, 1), (0, 1)].map(at).to_vec())
                     }
                 };
-                PatchColor {
+                PatchPart {
                     param,
-                    channels: u32::from(self.cage.colors[l].channels),
+                    channels: l.channels,
                     points,
                 }
             })
             .collect()
     }
 
-    /// The stencil of a color point over the blob's color table.
-    fn terms(&self, point: ColorPoint) -> Vec<(u32, f32)> {
+    /// The stencil of a value point over the blob's value table.
+    fn terms(&self, point: ValuePoint) -> Vec<(u32, f32)> {
         match point {
-            ColorPoint::Refined { layer, point } => {
+            ValuePoint::Refined { layer, point } => {
                 let l = &self.layers[layer as usize];
-                let s = l.refined.map_or(&self.refined.stencils, |r| &r.0);
+                let s = match l.basis {
+                    Basis::Own((s, _)) => s,
+                    _ => &self.refined.stencils,
+                };
                 s.terms(point as usize)
                     .map(|k| (l.first + s.indices[k], s.weights[k]))
                     .collect()
             }
-            ColorPoint::Linear {
+            ValuePoint::Linear {
                 layer,
                 face,
                 corner,
@@ -192,9 +230,9 @@ impl<'a> Colors<'a> {
     /// Linear layer `layer` at `(u, v)` of a ptex face, whose corners [`SubdInfo::ptex_corners`]
     /// states: a quad's are its own, an n-sided face's a corner, its edges' middles and its center.
     fn linear_terms(&self, layer: u32, face: u32, corner: u32, u: f32, v: f32) -> Vec<(u32, f32)> {
-        let l = layer as usize;
-        let ColorValues::Linear(values) = &self.cage.colors[l].values else {
-            unreachable!("a linear color point of a layer of another interpolation");
+        let l = &self.layers[layer as usize];
+        let Basis::Linear(indices) = l.basis else {
+            unreachable!("a linear value point of a layer of another interpolation");
         };
         let f = face as usize;
         let n = self.cage.face_counts[f] as usize;
@@ -207,7 +245,7 @@ impl<'a> Colors<'a> {
             } else {
                 i
             };
-            self.layers[l].first + values.indices[first + k]
+            l.first + indices[first + k]
         };
         let w = [(1.0 - u) * (1.0 - v), u * (1.0 - v), u * v, (1.0 - u) * v];
         let mut terms = Vec::new();
@@ -239,7 +277,7 @@ pub(super) fn build(
         .into_iter()
         .map(Vec3::from_array)
         .collect();
-    let colors = Colors::new(cage, refined);
+    let layers = Layers::new(cage, refined);
     let section_of = |f: u32| cage.face_sections.get(f as usize).copied().unwrap_or(0);
 
     // Patches by ptex face, in table order.
@@ -278,13 +316,13 @@ pub(super) fn build(
         }
         let section = section_of(f);
         let grow = reach.get(usize::from(section)).copied().unwrap_or(0.0);
-        let mut cost = page.cost(f, first, &faces, &by_face, refined, &colors);
+        let mut cost = page.cost(f, first, &faces, &by_face, refined, &layers);
         if page.bytes() + cost > PAGE_MAX && !page.faces.is_empty() {
-            let (bytes, info) = page.finish(pages.len() as u32 + 1, &colors.values)?;
+            let (bytes, info) = page.finish(pages.len() as u32 + 1, &layers.values)?;
             pages.push(bytes);
             infos.push(info);
             page = PageBuilder::default();
-            cost = page.cost(f, first, &faces, &by_face, refined, &colors);
+            cost = page.cost(f, first, &faces, &by_face, refined, &layers);
         }
         if page.bytes() + cost > PAGE_MAX {
             return Err(format!(
@@ -302,8 +340,8 @@ pub(super) fn build(
                 for c in hull(&prm, cvs, &rest) {
                     b.extend(c.to_array());
                 }
-                let parts = colors.parts(f, u32::from(corner), p);
-                page.patch(p, prm, refined, &parts, &colors);
+                let parts = layers.parts(f, u32::from(corner), p);
+                page.patch(p, prm, refined, &parts, &layers);
             }
             // Grown by the displacement reach and by rounding of the evaluated surface.
             let size = b
@@ -332,7 +370,7 @@ pub(super) fn build(
         }
     }
     if !page.faces.is_empty() {
-        let (bytes, info) = page.finish(pages.len() as u32 + 1, &colors.values)?;
+        let (bytes, info) = page.finish(pages.len() as u32 + 1, &layers.values)?;
         pages.push(bytes);
         infos.push(info);
     }
@@ -366,8 +404,12 @@ pub(super) fn build(
     }
     cage_faces.push(cage_corners.len() as u32);
     let mut attributes = 0;
-    if cage.uvs.is_some() {
+    if !cage.uvs.is_empty() {
         attributes |= SubdHeader::UV;
+    }
+    let reads_uv1 = |m| crate::mesh::reads_uv1(m);
+    if cage.uvs.iter().any(|u| u.set == 1) || materials.iter().any(reads_uv1) {
+        attributes |= SubdHeader::UV1;
     }
     if data.skin.is_some() {
         attributes |= SubdHeader::SKIN;
@@ -393,18 +435,44 @@ pub(super) fn build(
         },
         sections,
         points,
-        uvs: cage
-            .uvs
-            .as_ref()
-            .map(|u| u.values.iter().map(orr_math::Vec2::to_array).collect())
-            .unwrap_or_default(),
-        colors: colors.values,
+        values: layers.values,
         skin: data.skin.clone().unwrap_or_default(),
         pages: infos,
         cage_faces,
         cage_corners,
     };
-    Ok(Cooked { info, pages })
+    Ok(Cooked {
+        info,
+        pages,
+        warnings: uv1_warnings(cage, materials),
+    })
+}
+
+/// A warning per section that reads uv set 1 on faces no [`super::CageUv`] of the set covers,
+/// which read uv 0.
+fn uv1_warnings(cage: &CageInput, materials: &[Material]) -> Vec<String> {
+    let mut covered = vec![false; cage.face_counts.len()];
+    for u in cage.uvs.iter().filter(|u| u.set == 1) {
+        if u.faces.is_empty() {
+            covered.fill(true);
+        }
+        for &f in &u.faces {
+            covered[f as usize] = true;
+        }
+    }
+    let mut lacking = vec![false; materials.len()];
+    for f in (0..covered.len()).filter(|&f| !covered[f]) {
+        let section = cage.face_sections.get(f).copied().unwrap_or(0);
+        lacking[usize::from(section)] = true;
+    }
+    let reads = materials.iter().map(crate::mesh::reads_uv1);
+    let lacks = reads
+        .zip(lacking)
+        .enumerate()
+        .filter(|(_, (r, l))| *r && *l);
+    lacks
+        .map(|(i, _)| format!("section {i} reads uv set 1, which faces of it lack; they read uv 0"))
+        .collect()
 }
 
 /// The points whose box bounds a patch: the Bezier points of a B-spline patch (with its
@@ -459,9 +527,8 @@ struct PageBuilder {
     faces: Vec<Face>,
     patches: Vec<Patch>,
     points: HashMap<u32, u16>,
-    uv_points: HashMap<u32, u16>,
-    color_parts: Vec<ColorPart>,
-    color_points: HashMap<ColorPoint, u16>,
+    parts: Vec<Part>,
+    value_points: HashMap<ValuePoint, u16>,
 }
 
 #[derive(Default)]
@@ -470,31 +537,25 @@ struct PageTables {
     stencils: Vec<u32>,
     stencil_points: Vec<u32>,
     stencil_weights: Vec<f32>,
-    uv_cvs: Vec<u16>,
-    uv_stencils: Vec<u32>,
-    uv_stencil_points: Vec<u32>,
-    uv_stencil_weights: Vec<f32>,
-    color_cvs: Vec<u16>,
-    color_stencils: Vec<u32>,
-    color_stencil_points: Vec<u32>,
-    color_stencil_weights: Vec<f32>,
+    part_cvs: Vec<u16>,
+    value_stencils: Vec<u32>,
+    value_stencil_points: Vec<u32>,
+    value_stencil_weights: Vec<f32>,
 }
 
 impl PageBuilder {
     fn bytes(&self) -> usize {
         let t = &self.page;
-        // Header, fifteen tables each padded to 4 bytes, and the closing stencil offsets.
+        // Header, eleven tables each padded to 4 bytes, and the closing stencil offsets.
         size_of::<PageHeader>()
-            + 60
-            + 12
+            + 44
+            + 8
             + self.faces.len() * size_of::<Face>()
             + self.patches.len() * size_of::<Patch>()
-            + self.color_parts.len() * size_of::<ColorPart>()
-            + 2 * (t.cvs.len() + t.uv_cvs.len() + t.color_cvs.len())
-            + 4 * (t.stencils.len() + t.uv_stencils.len() + t.color_stencils.len())
-            + 8 * (t.stencil_points.len()
-                + t.uv_stencil_points.len()
-                + t.color_stencil_points.len())
+            + self.parts.len() * size_of::<Part>()
+            + 2 * (t.cvs.len() + t.part_cvs.len())
+            + 4 * (t.stencils.len() + t.value_stencils.len())
+            + 8 * (t.stencil_points.len() + t.value_stencil_points.len())
     }
 
     /// Bytes the ptex faces of cage face `face`, whose first is `first`, would add.
@@ -505,11 +566,10 @@ impl PageBuilder {
         faces: &[u32],
         by_face: &[Vec<usize>],
         r: &Refined,
-        colors: &Colors<'_>,
+        layers: &Layers<'_>,
     ) -> usize {
         let mut new = HashSet::new();
-        let mut new_uv = HashSet::new();
-        let mut new_color = HashSet::new();
+        let mut new_value = HashSet::new();
         let mut bytes = faces.len() * size_of::<Face>();
         for &q in faces {
             for &p in &by_face[q as usize] {
@@ -521,20 +581,11 @@ impl PageBuilder {
                         bytes += 4 + 8 * r.stencils.terms(c as usize).len();
                     }
                 }
-                if let Some((s, uv)) = &r.uv {
-                    let cvs = &uv.cvs[uv.first[p]..uv.first[p + 1]];
-                    bytes += 2 * cvs.len();
-                    for &c in cvs {
-                        if !self.uv_points.contains_key(&c) && new_uv.insert(c) {
-                            bytes += 4 + 8 * s.terms(c as usize).len();
-                        }
-                    }
-                }
-                for part in colors.parts(face, q - first, p) {
-                    bytes += size_of::<ColorPart>() + 2 * part.points.len();
+                for part in layers.parts(face, q - first, p) {
+                    bytes += size_of::<Part>() + 2 * part.points.len();
                     for c in part.points {
-                        if !self.color_points.contains_key(&c) && new_color.insert(c) {
-                            bytes += 4 + 8 * colors.terms(c).len();
+                        if !self.value_points.contains_key(&c) && new_value.insert(c) {
+                            bytes += 4 + 8 * layers.terms(c).len();
                         }
                     }
                 }
@@ -548,8 +599,8 @@ impl PageBuilder {
         p: usize,
         prm: PatchParam,
         r: &Refined,
-        parts: &[PatchColor],
-        colors: &Colors<'_>,
+        parts: &[PatchPart],
+        layers: &Layers<'_>,
     ) {
         let t = &mut self.page;
         let cvs = t.cvs.len() as u32;
@@ -565,40 +616,21 @@ impl PageBuilder {
             });
             t.cvs.push(local);
         }
-        let uv_cvs = t.uv_cvs.len() as u32;
-        let mut uv_param = PatchParam {
-            kind: PatchParam::NONE,
-            ..Default::default()
-        };
-        if let Some((s, uv)) = &r.uv {
-            uv_param = param(uv.types[p], uv.params[p]).1;
-            for &c in &uv.cvs[uv.first[p]..uv.first[p + 1]] {
-                let local = *self.uv_points.entry(c).or_insert_with(|| {
-                    t.uv_stencils.push(t.uv_stencil_points.len() as u32);
-                    for k in s.terms(c as usize) {
-                        t.uv_stencil_points.push(s.indices[k]);
-                        t.uv_stencil_weights.push(s.weights[k]);
-                    }
-                    (t.uv_stencils.len() - 1) as u16
-                });
-                t.uv_cvs.push(local);
-            }
-        }
-        let first_part = self.color_parts.len() as u32;
+        let first_part = self.parts.len() as u32;
         for part in parts {
-            let cvs = t.color_cvs.len() as u32;
+            let cvs = t.part_cvs.len() as u32;
             for &c in &part.points {
-                let local = *self.color_points.entry(c).or_insert_with(|| {
-                    t.color_stencils.push(t.color_stencil_points.len() as u32);
-                    for (value, weight) in colors.terms(c) {
-                        t.color_stencil_points.push(value);
-                        t.color_stencil_weights.push(weight);
+                let local = *self.value_points.entry(c).or_insert_with(|| {
+                    t.value_stencils.push(t.value_stencil_points.len() as u32);
+                    for (value, weight) in layers.terms(c) {
+                        t.value_stencil_points.push(value);
+                        t.value_stencil_weights.push(weight);
                     }
-                    (t.color_stencils.len() - 1) as u16
+                    (t.value_stencils.len() - 1) as u16
                 });
-                t.color_cvs.push(local);
+                t.part_cvs.push(local);
             }
-            self.color_parts.push(ColorPart {
+            self.parts.push(Part {
                 param: part.param,
                 cvs,
                 channels: part.channels,
@@ -606,24 +638,19 @@ impl PageBuilder {
         }
         self.patches.push(Patch {
             param: prm,
-            uv_param,
             cvs,
-            uv_cvs,
-            colors: Span {
+            parts: Span {
                 first: first_part,
                 count: parts.len() as u32,
             },
         });
     }
 
-    fn finish(mut self, blob: u32, colors: &[[f32; 4]]) -> Result<(Vec<u8>, PageInfo), String> {
+    fn finish(mut self, blob: u32, values: &[[f32; 4]]) -> Result<(Vec<u8>, PageInfo), String> {
         let t = &mut self.page;
         t.stencils.push(t.stencil_points.len() as u32);
-        if !t.uv_stencils.is_empty() {
-            t.uv_stencils.push(t.uv_stencil_points.len() as u32);
-        }
-        if !t.color_stencils.is_empty() {
-            t.color_stencils.push(t.color_stencil_points.len() as u32);
+        if !t.value_stencils.is_empty() {
+            t.value_stencils.push(t.value_stencil_points.len() as u32);
         }
         let mut bounds = Aabb::EMPTY;
         for f in &self.faces {
@@ -637,17 +664,13 @@ impl PageBuilder {
             stencils: std::mem::take(&mut t.stencils),
             stencil_points: std::mem::take(&mut t.stencil_points),
             stencil_weights: std::mem::take(&mut t.stencil_weights),
-            uv_cvs: std::mem::take(&mut t.uv_cvs),
-            uv_stencils: std::mem::take(&mut t.uv_stencils),
-            uv_stencil_points: std::mem::take(&mut t.uv_stencil_points),
-            uv_stencil_weights: std::mem::take(&mut t.uv_stencil_weights),
-            color_parts: self.color_parts,
-            color_cvs: std::mem::take(&mut t.color_cvs),
-            color_stencils: std::mem::take(&mut t.color_stencils),
-            color_stencil_points: std::mem::take(&mut t.color_stencil_points),
-            color_stencil_weights: std::mem::take(&mut t.color_stencil_weights),
+            parts: self.parts,
+            part_cvs: std::mem::take(&mut t.part_cvs),
+            value_stencils: std::mem::take(&mut t.value_stencils),
+            value_stencil_points: std::mem::take(&mut t.value_stencil_points),
+            value_stencil_weights: std::mem::take(&mut t.value_stencil_weights),
         };
-        check_color_reach(&page, colors)?;
+        check_color_reach(&page, values)?;
         let bytes = page.to_bytes();
         let info = PageInfo {
             blob,
@@ -663,15 +686,15 @@ impl PageBuilder {
 /// Refuses colors whose patches can pass what the stream's half floats hold: a patch's limit
 /// lies in its hull, which a Gregory patch's points or a boundary's extrapolated ones can take
 /// past the cage's values.
-fn check_color_reach(page: &Page, colors: &[[f32; 4]]) -> Result<(), String> {
+fn check_color_reach(page: &Page, values: &[[f32; 4]]) -> Result<(), String> {
     let points: Vec<Vec4> = page
-        .color_points(colors)
+        .value_points(values)
         .into_iter()
         .map(Vec4::from_array)
         .collect();
-    for part in &page.color_parts {
+    for part in &page.parts {
         let first = part.cvs as usize;
-        let cvs: Vec<u32> = page.color_cvs[first..first + part.param.cv_count()]
+        let cvs: Vec<u32> = page.part_cvs[first..first + part.param.cv_count()]
             .iter()
             .map(|&c| u32::from(c))
             .collect();
@@ -691,11 +714,10 @@ fn check_color_reach(page: &Page, colors: &[[f32; 4]]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use orr_math::Vec2;
     use orr_pack::subd::Page;
 
     use super::*;
-    use crate::subd::{CageColor, Corner, Crease, FaceVarying, UvLinear, cook, osd};
+    use crate::subd::{CageColor, CageUv, Corner, Crease, FaceVarying, UvLinear, cook, osd};
 
     /// Points of a disc of `k` quads around a center of valence `k`, lifted off the plane,
     /// at `origin`; returns the cage's first point.
@@ -796,17 +818,156 @@ mod tests {
             color_indices[k] = colors.len() as u32 - 1;
         }
         c.colors.push(CageColor {
-            values: ColorValues::FaceVarying(FaceVarying {
+            values: CageValues::FaceVarying(FaceVarying {
                 values: colors,
                 indices: color_indices,
             }),
             channels: 0b1111,
             faces: Vec::new(),
         });
-        c.uvs = Some(FaceVarying { values, indices });
+        c.uvs.push(CageUv {
+            values: CageValues::FaceVarying(FaceVarying { values, indices }),
+            set: 0,
+            faces: Vec::new(),
+        });
         c.uv_linear = UvLinear::CornersPlus1;
         c.face_sections = (0..c.face_counts.len()).map(|f| (f % 2) as u16).collect();
         c
+    }
+
+    #[test]
+    fn uvs_read_their_interpolation_and_only_face_varying_refines_the_surface() {
+        const N: u32 = 6;
+        let point = |i: u32, j: u32| j * (N + 1) + i;
+        let mut c = CageInput::default();
+        let mut values = Vec::new();
+        for j in 0..=N {
+            for i in 0..=N {
+                c.positions.push(Vec3::new(i as f32, j as f32, 0.0));
+                // Too rough for a plane, so what smooths it moves it.
+                values.push(Vec2::new(
+                    (i * i % 5) as f32 * 0.2,
+                    ((i + 2 * j) % 3) as f32 * 0.3,
+                ));
+            }
+        }
+        for j in 0..N {
+            for i in 0..N {
+                c.face_counts.push(4);
+                c.face_indices.extend([
+                    point(i, j),
+                    point(i + 1, j),
+                    point(i + 1, j + 1),
+                    point(i, j + 1),
+                ]);
+            }
+            c.creases.push(Crease {
+                edge: [point(3, j), point(3, j + 1)],
+                sharpness: 10.0,
+            });
+        }
+        // Faces above row 3 read copies of its points, so a seam runs along it.
+        let mut seamed = values.clone();
+        let mut seam_indices = c.face_indices.clone();
+        for (k, index) in seam_indices.iter_mut().enumerate() {
+            if *index / (N + 1) == 3 && (k / 4) as u32 / N >= 3 {
+                seamed.push(seamed[*index as usize] + Vec2::new(0.4, 0.0));
+                *index = seamed.len() as u32 - 1;
+            }
+        }
+        let rows = |r: std::ops::Range<u32>| (r.start * N..r.end * N).collect::<Vec<u32>>();
+        let uv = |values, set, faces| CageUv { values, set, faces };
+        let linear = FaceVarying {
+            values: values.clone(),
+            indices: c.face_indices.clone(),
+        };
+        let seam = FaceVarying {
+            values: seamed,
+            indices: seam_indices,
+        };
+        let surface = CageValues::Vertex(values.clone());
+        let bare = c.clone();
+        c.uvs = vec![
+            uv(surface.clone(), 0, rows(0..2)),
+            uv(CageValues::FaceVarying(seam.clone()), 0, rows(2..4)),
+            uv(CageValues::Linear(linear.clone()), 0, rows(4..N)),
+            uv(CageValues::Linear(linear.clone()), 1, Vec::new()),
+        ];
+        let settings = SubdSettings::default();
+        let materials = [Material::default()];
+        let cook_cage = |cage: &CageInput| {
+            let data = CageData {
+                cage: cage.clone(),
+                skin: None,
+            };
+            cook(&data, &materials, &settings).unwrap()
+        };
+        let cooked = cook_cage(&c);
+
+        let (mut at, mut ours, mut sets_one) = (Vec::new(), Vec::new(), Vec::new());
+        for bytes in &cooked.pages {
+            let page = Page::parse(bytes).unwrap();
+            let points = page.value_points(&cooked.info.values);
+            for (f, face) in page.faces.iter().enumerate() {
+                for u in [0.0, 0.13, 0.5, 0.77, 1.0] {
+                    for v in [0.0, 0.13, 0.5, 0.77, 1.0] {
+                        at.push((face.ptex, u, v));
+                        ours.push(Vec2::from(page.limit_uv(f, u, v, 0, &points).unwrap()));
+                        sets_one.push(Vec2::from(page.limit_uv(f, u, v, 1, &points).unwrap()));
+                    }
+                }
+            }
+        }
+        // OpenSubdiv's limit of the uvs as points, on the same refinement as the cooked cage's.
+        let as_points = CageInput {
+            positions: values.iter().map(|v| v.extend(0.0)).collect(),
+            ..c.clone()
+        };
+        let on_surface = osd::limit(&as_points, &settings, &at).unwrap().0;
+        let on_channel = osd::limit(&c, &settings, &at).unwrap().1;
+        let bilinear = |&(f, u, v): &(u32, f32, f32)| {
+            let k = &c.face_indices[4 * f as usize..4 * f as usize + 4];
+            let p = |i: usize| values[k[i] as usize];
+            (p(0) * (1.0 - u) + p(1) * u) * (1.0 - v) + (p(3) * (1.0 - u) + p(2) * u) * v
+        };
+        let mut clear = [0.0f32; 3];
+        for (i, place) in at.iter().enumerate() {
+            let readings = [
+                Vec3::from(on_surface[i]).truncate(),
+                Vec2::from(on_channel[i]),
+                bilinear(place),
+            ];
+            let which = match place.0 / N {
+                0..2 => 0,
+                2..4 => 1,
+                _ => 2,
+            };
+            let e = (ours[i] - readings[which]).abs().max_element();
+            assert!(e <= 1e-5, "{place:?}: {}, {:?}", ours[i], readings[which]);
+            let e = (sets_one[i] - bilinear(place)).abs().max_element();
+            assert!(e <= 1e-5, "{place:?}: set 1 reads {}", sets_one[i]);
+            for (k, other) in readings.iter().enumerate() {
+                if k != which {
+                    let d = (readings[which] - *other).abs().max_element();
+                    clear[which] = clear[which].max(d);
+                }
+            }
+        }
+        assert!(clear.iter().all(|&d| d > 0.05), "{clear:?}: alike");
+
+        let patches = |uvs: Vec<CageUv>| {
+            let cage = CageInput {
+                uvs,
+                ..bare.clone()
+            };
+            cook_cage(&cage).info.header.patch_count
+        };
+        let plain = patches(Vec::new());
+        assert_eq!(patches(vec![uv(surface, 0, Vec::new())]), plain);
+        let linear = CageValues::Linear(linear);
+        assert_eq!(patches(vec![uv(linear, 0, Vec::new())]), plain);
+        let seam = CageValues::FaceVarying(seam);
+        assert!(patches(vec![uv(seam, 0, Vec::new())]) > plain);
     }
 
     #[test]
@@ -835,8 +996,7 @@ mod tests {
             let page = Page::parse(bytes).unwrap();
             assert_eq!(page.faces.len() as u32, page_info.face_count);
             let points = page.points(&info.points);
-            let uv_points = page.uv_points(&info.uvs);
-            let color_points = page.color_points(&info.colors);
+            let value_points = page.value_points(&info.values);
             for (f, face) in page.faces.iter().enumerate() {
                 let corners = info.ptex_corners(face);
                 for (k, (u, v)) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
@@ -852,7 +1012,7 @@ mod tests {
                 for &u in &steps {
                     for &v in &steps {
                         let l = page.limit(f, u, v, &points).unwrap();
-                        let uv = page.limit_uv(f, u, v, &uv_points).unwrap();
+                        let uv = page.limit_uv(f, u, v, 0, &value_points).unwrap();
                         let n = l.normal();
                         for d in [-reach, reach] {
                             let p = std::array::from_fn::<f32, 3, _>(|k| l.position[k] + d * n[k]);
@@ -863,7 +1023,7 @@ mod tests {
                                 face.ptex
                             );
                         }
-                        let color = page.limit_color(f, u, v, &color_points).unwrap();
+                        let color = page.limit_color(f, u, v, &value_points).unwrap();
                         at.push((face.ptex, u, v));
                         ours.push((l.position, uv, color));
                     }
