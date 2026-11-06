@@ -44,8 +44,13 @@
 //!   is a slot of one prototype and index, as USD interpolates by index, and has no row where a
 //!   sample has no such instance, so `ids` and counts step at the lower sample, unlike what
 //!   interpolates between them. A rate that survives alignment holds all three at their lower
-//!   samples; without one, values interpolate unless samples differ in length. Before the first
-//!   sample and after the last, rates extrapolate and all else clamps. `motion:velocityScale`
+//!   samples; without one, values interpolate unless samples differ in length. A time whose
+//!   arrays disagree in length, or with a `protoIndices` entry past the prototypes, holds no
+//!   instances, as USD refuses that call alone, and the instancer stands again at the next good
+//!   sample. USD defines no non-finite value and no format here carries one, so that instance
+//!   alone is skipped there. Both warn, at any time and for an instancer that holds still as well.
+//!   Before the first sample and after the last, rates extrapolate and all else clamps.
+//!   `motion:velocityScale`
 //!   is deprecated and not read. Every copy shares its prototype's model, and a kernel poses
 //!   them each frame by [`orr_pack::instance::motion_transform`]; the page's clock runs on the
 //!   timeline of the stage's clips. An instancer under one that moves this way stays where the
@@ -859,6 +864,9 @@ impl<'s> Importer<'s> {
             };
             self.place(i, to_scene, place)?;
         }
+        // An instancer that holds still warned of its samples already, the placed one among them.
+        let heard: std::collections::HashSet<String> = self.warnings.iter().cloned().collect();
+        instancing.warnings.retain(|w| !heard.contains(w));
         self.warnings.append(&mut instancing.warnings);
         for m in holders.len()..models.len() {
             holders.push(vec![(m, DMat4::IDENTITY)]);
@@ -2199,16 +2207,20 @@ impl<'s> Importer<'s> {
             ));
             return Ok(Vec::new());
         }
+        let known = |&p: &i64| usize::try_from(p).is_ok_and(|p| p < protos);
+        if let Some(p) = index.iter().find(|p| !known(p)) {
+            warnings.push(format!(
+                "{path}: protoIndex {p} of {protos} prototypes; no instances at that sample"
+            ));
+            return Ok(Vec::new());
+        }
         let mut out = Vec::with_capacity(count);
         for (i, &p) in index.iter().enumerate() {
             let id = ids.as_ref().map_or(i as i64, |ids| ids[i]);
             if masked.contains(&id) {
                 continue;
             }
-            let proto = usize::try_from(p)
-                .ok()
-                .filter(|&p| p < protos)
-                .ok_or_else(|| format!("{path}: protoIndex {p} of {protos} prototypes"))?;
+            let proto = p as usize;
             let vector = |v: &Option<Vec<f64>>| {
                 v.as_ref()
                     .map_or(DVec3::ZERO, |v| DVec3::from_slice(&v[3 * i..]))
@@ -2265,7 +2277,7 @@ impl<'s> Importer<'s> {
                 Some(s) => (three(&s.lower), DVec3::ZERO),
                 None => (DVec3::ONE, DVec3::ZERO),
             };
-            out.push(InstanceState {
+            let state = InstanceState {
                 index: i,
                 proto,
                 position,
@@ -2275,7 +2287,14 @@ impl<'s> Importer<'s> {
                 spin,
                 scale,
                 growth,
-            });
+            };
+            if state.is_finite() {
+                out.push(state);
+            } else {
+                warnings.push(format!(
+                    "{path}: instance {i} is not finite; it is skipped at that sample"
+                ));
+            }
         }
         Ok(out)
     }
@@ -2287,13 +2306,13 @@ impl<'s> Importer<'s> {
             if self.nodes[i].ty != "PointInstancer" {
                 continue;
             }
-            // What holds still warns as it is placed.
             let mut warnings = Vec::new();
             if let Some(m) = self.instance_motion(i, &mut warnings)? {
                 motions.insert(i, m);
-                warnings.dedup();
-                self.warnings.append(&mut warnings);
             }
+            let mut seen = std::collections::HashSet::new();
+            warnings.retain(|w| seen.insert(w.clone()));
+            self.warnings.append(&mut warnings);
         }
         self.motions = motions;
         Ok(())
@@ -2332,11 +2351,7 @@ impl<'s> Importer<'s> {
         let times: Vec<f64> = std::iter::once(first - 1.0).chain(samples).collect();
         let mut keys = Vec::with_capacity(times.len());
         for &t in &times {
-            let states = self.instance_states(ins, protos, t, warnings)?;
-            if let Some(s) = states.iter().find(|s| !s.is_finite()) {
-                return Err(format!("{path}: instance {} at {t} is not finite", s.index));
-            }
-            keys.push(states);
+            keys.push(self.instance_states(ins, protos, t, warnings)?);
         }
         let same = |a: &InstanceState, b: &InstanceState| {
             a.index == b.index

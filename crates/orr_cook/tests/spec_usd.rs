@@ -5093,3 +5093,58 @@ fn many_moving_copies_stay_records_of_one_model() {
     want.sort_unstable();
     assert_eq!(got, want);
 }
+
+/// `pointInstancer.cpp`, `_GetPrototypePathsForInstanceTransforms`: an index outside the prototypes
+/// fails that call alone, at that time. USD defines no non-finite value, and a copy can't hold
+/// one, so it is that instance alone that is skipped. Neither stops the cook.
+#[test]
+fn a_bad_sample_loses_its_instances_there_and_nothing_else() {
+    let d = dir("instances-bad-samples");
+    let (moving, warnings) = cook_with_warnings(
+        &d,
+        &instancing(
+            r#"int[] protoIndices.timeSamples = { 0: [0, 0], 10: [0, 5], 20: [0, 0] }
+    point3f[] positions = [(0, 0, 0), (5, 0, 0)]"#,
+        ),
+        Subdivision::Hull,
+    );
+    assert_copies(&moving, 0.5, &[[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]]);
+    assert_copies(&moving, 1.5, &[]);
+    assert_copies(&moving, 2.5, &[[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]]);
+    let told = warnings.iter().filter(|w| w.contains("protoIndex 5"));
+    assert_eq!(told.count(), 1, "{warnings:?}");
+    let (still, warnings) = cook_with_warnings(
+        &d,
+        &instancing(
+            r#"int[] protoIndices = [0, 5]
+    point3f[] positions = [(0, 0, 0), (5, 0, 0)]"#,
+        ),
+        Subdivision::Hull,
+    );
+    assert_eq!(origins(&still, "u/Proto"), Vec::<[i32; 3]>::new());
+    assert!(warnings.iter().any(|w| w.contains("protoIndex 5")));
+    let (spent, warnings) = cook_with_warnings(
+        &d,
+        &instancing(
+            r#"int[] protoIndices = [0, 0]
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0), (5, 0, 0)], 10: [(0, 2, 0), (inf, 0, 0)], 20: [(0, 2, 0), (5, 0, 0)] }"#,
+        ),
+        Subdivision::Hull,
+    );
+    assert_copies(&spent, 0.5, &[[0.0, 1.0, 0.0]]);
+    assert_copies(&spent, 2.0, &[[0.0, 2.0, 0.0], [5.0, 0.0, 0.0]]);
+    let told = warnings
+        .iter()
+        .filter(|w| w.contains("instance 1 is not finite"));
+    assert_eq!(told.count(), 1, "{warnings:?}");
+    let (held, warnings) = cook_with_warnings(
+        &d,
+        &instancing(
+            r#"int[] protoIndices = [0, 0]
+    point3f[] positions = [(1, 0, 0), (inf, 0, 0)]"#,
+        ),
+        Subdivision::Hull,
+    );
+    assert_eq!(origins(&held, "u/Proto"), [[1000, 0, 0]]);
+    assert!(warnings.iter().any(|w| w.contains("not finite")));
+}
