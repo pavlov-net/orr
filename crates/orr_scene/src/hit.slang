@@ -160,6 +160,7 @@ public bool strand_geometry(inout SurfaceInput i, ProducerBatch b, uint segment,
     i.uv[0].uv = lerp(uv0, uv1, u);
     i.uv[0].dx = (uv1 - uv0) * (width / max(length(axis), 1e-30));
     i.uv[0].dy = float2(0.0);
+    i.uv[0].inward = float2(0.0);
     i.uv[1] = i.uv[0];
     i.geometric_normal = n;
     i.normal = n;
@@ -305,6 +306,7 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
         float2 along1 = a1.uv[s] - a0.uv[s];
         float2 along2 = a2.uv[s] - a0.uv[s];
         i.uv[s].uv = a0.uv[s] + b.x * along1 + b.y * along2;
+        i.uv[s].inward = a0.uv[s] + (along1 + along2) / 3.0 - i.uv[s].uv;
         i.uv[s].dx = (bx.x * along1 + bx.y * along2) * bias;
         i.uv[s].dy = (by.x * along1 + by.y * along2) * bias;
     }
@@ -849,6 +851,8 @@ bool particle_candidate(SceneRoot* s, uint entry, uint cluster_id, uint primitiv
     normal = safe_normalize(cross(e1, e2), float3(0.0, 0.0, 1.0));
     float2 uv = (1.0 - bary.x - bary.y) * t.attributes[0].uv[0] + bary.x * t.attributes[1].uv[0] + bary.y * t.attributes[2].uv[0];
     i = particle_input(s, material, uv);
+    i.uv[0].inward = (t.attributes[0].uv[0] + t.attributes[1].uv[0] + t.attributes[2].uv[0]) / 3.0 - uv;
+    i.uv[1].inward = i.uv[0].inward;
     return true;
 }
 

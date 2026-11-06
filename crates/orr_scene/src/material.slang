@@ -272,22 +272,39 @@ public bool texture_outside(float2 uv, uint modes)
 // in 0..1 of that square. `tiles` holds a multiplier and a shift, padding to TEXTURE_TILES_HEADER,
 // then buckets of eight entries of a key `row << 16 | column` and a heap index, IMAGE_NONE where
 // empty (orr_pack::tiles). Keys in a bucket differ, so at most one entry adds a heap index. Row 1
-// lies above row 0, so it covers v from -1 to 0.
-public TextureIndex texture_tile(uint* tiles, inout float2 uv)
+// lies above row 0, so it covers v from -1 to 0. A point within a few f32 steps of a cell's edge
+// lies on it, and belongs to the cell `inward` (`UvFootprint.inward`) points into, which a read by
+// its uv alone can't tell from the cell across the edge. A point on a cell's lower edge lies on
+// the cells before it too, and reads one of those where its own cell has no tile: a surface ending
+// on a tile's edge has its last points there, and rounding puts others there.
+public TextureIndex texture_tile(uint* tiles, inout float2 uv, float2 inward)
 {
-    float2 cell = floor(uv);
-    uv -= cell;
-    float2 at = float2(cell.x, -cell.y);
+    float slack = 4.0 * 1.1920929e-7 * max(1.0, max(abs(uv.x), abs(uv.y)));
+    float2 edge = round(uv);
+    float2 side = select(uv + inward < edge, edge - 1.0, edge);
+    float2 cell = select(abs(uv - edge) < slack, side, floor(uv));
+    float2 place = uv - cell;
+    uint edges = (place.x < slack ? 1 : 0) | (place.y < slack ? 2 : 0);
+    uv = place;
     TextureIndex t = { IMAGE_NONE };
-    if (!(at.x >= 0.0 && at.y >= 0.0 && at.x < 65536.0 && at.y < 65536.0))
-        return t;
-    uint key = uint(at.y) << 16 | uint(at.x);
-    uint bucket = (key * tiles[0]) >> tiles[1];
-    uint4* entries = (uint4*)(tiles + TEXTURE_TILES_HEADER) + 4 * bucket;
-    for (uint i = 0; i < 4; i++)
+    for (uint before = 0; before < 4 && t.index == IMAGE_NONE; before++)
     {
-        uint4 e = entries[i];
-        t.index |= (e.x == key ? e.y : IMAGE_NONE) | (e.z == key ? e.w : IMAGE_NONE);
+        if ((before & ~edges) != 0)
+            continue;
+        float2 back = float2(before & 1, before >> 1);
+        float2 at = float2(cell.x - back.x, back.y - cell.y);
+        if (!(at.x >= 0.0 && at.y >= 0.0 && at.x < 65536.0 && at.y < 65536.0))
+            continue;
+        uint key = uint(at.y) << 16 | uint(at.x);
+        uint bucket = (key * tiles[0]) >> tiles[1];
+        uint4* entries = (uint4*)(tiles + TEXTURE_TILES_HEADER) + 4 * bucket;
+        for (uint i = 0; i < 4; i++)
+        {
+            uint4 e = entries[i];
+            t.index |= (e.x == key ? e.y : IMAGE_NONE) | (e.z == key ? e.w : IMAGE_NONE);
+        }
+        if (t.index != IMAGE_NONE)
+            uv = place + back;
     }
     return t;
 }
@@ -376,6 +393,7 @@ public struct UvFootprint
     public float2 dx;
     public float2 dy;
     public float2 tap;
+    public float2 inward;   // from `uv` into the surface it lies on, 0 off any: `texture_tile`
 }
 
 // The offset from the texel below a sample, -1 to 2, that the cubic B-spline weights at
@@ -630,6 +648,7 @@ public UvFootprint material_footprint(MaterialGpu* m, uint slot, UvFootprint f)
     g.uv = float2(dot(x, f.uv) + m.uv_transforms[k + 2], dot(y, f.uv) + m.uv_transforms[k + 5]);
     g.dx = float2(dot(x, f.dx), dot(y, f.dx));
     g.dy = float2(dot(x, f.dy), dot(y, f.dy));
+    g.inward = float2(dot(x, f.inward), dot(y, f.inward));
     return g;
 }
 
@@ -666,7 +685,7 @@ bool material_reads(MaterialGpu* m, uint slot, uint modes, inout TextureIndex t,
 {
     if ((modes & TEXTURE_TILED) == 0)
         return !texture_outside(f.uv, modes);
-    t = texture_tile(m.tiles[slot], f.uv);
+    t = texture_tile(m.tiles[slot], f.uv, f.inward);
     return t.index != IMAGE_NONE;
 }
 

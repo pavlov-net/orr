@@ -1735,7 +1735,11 @@ fn cook_with_warnings(
         .report
         .assets
         .iter()
-        .flat_map(|a| &a.warnings)
+        .flat_map(|a| {
+            a.warnings
+                .iter()
+                .chain(a.entries.iter().flat_map(|e| &e.warnings))
+        })
         .cloned();
     let warnings = warnings.collect();
     (
@@ -2393,7 +2397,12 @@ fn a_udim_tile_appearing_cooks_the_set_again() {
 
 /// A 16 x 16 grid of quads with `st` running 1/8 to 7/8 from `(s, t)`, under a preview surface
 /// with `wired`, whose `T` reads `file` clamped.
-fn grid_stage(file: &str, [s, t]: [f32; 2], wired: &str) -> String {
+fn grid_stage(file: &str, at: [f32; 2], wired: &str) -> String {
+    grid_over(file, at, [0.125, 0.75], wired)
+}
+
+/// [`grid_stage`] with `st` running `span` from its start, for `span[1]` in all.
+fn grid_over(file: &str, [s, t]: [f32; 2], span: [f32; 2], wired: &str) -> String {
     const N: usize = 16;
     let list = |f: &dyn Fn(usize, usize) -> String| {
         let at = (0..=N).flat_map(|y| (0..=N).map(move |x| (x, y)));
@@ -2401,7 +2410,7 @@ fn grid_stage(file: &str, [s, t]: [f32; 2], wired: &str) -> String {
     };
     let points = list(&|x, y| format!("({}, {}, 0)", x as f32 / 16.0, y as f32 / 16.0));
     let st = list(&|x, y| {
-        let at = |o: f32, i: usize| o + 0.125 + 0.75 * i as f32 / N as f32;
+        let at = |o: f32, i: usize| o + span[0] + span[1] * i as f32 / N as f32;
         format!("({}, {})", at(s, x), at(t, y))
     });
     let quads = (0..N).flat_map(|y| (0..N).map(move |x| (x, y)));
@@ -2577,6 +2586,31 @@ fn heights_on_one_tile_cook_as_on_the_same_image() {
     }
 }
 
+/// A quad over all of a tile has vertices on its edges, which read the tile their triangles lie
+/// on and not the cells past them: heights bright at the edges, against a fallback of 0, bake and
+/// bound as the same image's do.
+#[test]
+fn a_quad_over_a_whole_tile_cooks_as_on_the_same_image() {
+    let d = dir("udim-mesh-whole-tile");
+    let bright = png(64, 64, |x, y| {
+        let (x, y) = (x as f32 - 31.5, y as f32 - 31.5);
+        let v = if (x * x + y * y).sqrt() < 8.0 { 0 } else { 255 };
+        [v, v, v, 255]
+    });
+    for file in ["tex.png", "tex.1001.png"] {
+        std::fs::write(d.join(file), &bright).unwrap();
+    }
+    let cooked = |file: &str, s: UsdSettings| {
+        let stage = grid_over(file, [0.0, 0.0], [0.0, 1.0], HEIGHT);
+        let a = cook_at(&d, &stage, s).unwrap();
+        let e = a.find(AssetId::from_name("u/mesh")).expect("a mesh");
+        a.blobs(e).iter().map(|b| read(&a, b)).collect::<Vec<_>>()
+    };
+    for settings in [UsdSettings::default, baking] {
+        assert!(cooked("tex.png", settings()) == cooked("tex.<UDIM>.png", settings()));
+    }
+}
+
 /// Tiles of heights 64/255 and 191/255 side by side, past which the fallback reads 0.
 fn stepped(name: &str) -> PathBuf {
     let d = dir(name);
@@ -2634,6 +2668,20 @@ fn cluster_bounds_follow_the_tiles_under_them() {
     assert!(
         past.iter().any(|b| near(b.0, 0.0) && near(b.1, HIGH)),
         "{past:?}"
+    );
+}
+
+/// One vertex on two tiles reads each tile's height from its triangles on that tile. The surface
+/// stays closed, baked at their mean and welded at runtime, but it takes a step the tiles disagree
+/// on, as across a uv seam.
+#[test]
+fn heights_differing_across_a_tile_edge_warn() {
+    let d = stepped("udim-mesh-seam");
+    let stage = grid_stage("tex.<UDIM>.png", [0.5, 0.0], HEIGHT);
+    let (_, warnings) = cook_with_warnings(&d, &stage, Subdivision::Hull);
+    assert!(
+        warnings.iter().any(|w| w.contains("tile edge")),
+        "{warnings:?}"
     );
 }
 

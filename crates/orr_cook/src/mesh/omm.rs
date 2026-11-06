@@ -432,9 +432,6 @@ pub(super) fn cluster_omm(
     })
 }
 
-/// A point on a triangle and the alpha it reads, remapped as [`OmmAlpha`] holds it.
-type Reading = ([f32; 2], f32);
-
 /// What `opacity_map_rasterize` writes, for a triangle no one texture holds where it reads only
 /// one: four-state micro-triangles from the alpha at their corners and centers, without the edge
 /// samples it adds to micro-triangles a few texels wide. Unknown states pick their side as it does
@@ -450,23 +447,28 @@ fn rasterize_across(
         data: &mut [u8],
         index: usize,
         level: u8,
-        tri: [Reading; 3],
-        read: &impl Fn([f32; 2]) -> Reading,
+        tri: [[f32; 2]; 3],
+        alpha: &Map<OmmRead<'_>>,
+        cutoff: f32,
     ) {
         let [c0, c1, c2] = tri;
         if level > 0 {
-            let mid =
-                |a: Reading, b: Reading| read([(a.0[0] + b.0[0]) / 2.0, (a.0[1] + b.0[1]) / 2.0]);
+            let mid = |a: [f32; 2], b: [f32; 2]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
             let (c01, c12, c20) = (mid(c0, c1), mid(c1, c2), mid(c2, c0));
             let l = level - 1;
-            visit(data, index * 4, l, [c0, c01, c20], read);
-            visit(data, index * 4 + 1, l, [c20, c12, c01], read);
-            visit(data, index * 4 + 2, l, [c01, c1, c12], read);
-            visit(data, index * 4 + 3, l, [c12, c20, c2], read);
+            visit(data, index * 4, l, [c0, c01, c20], alpha, cutoff);
+            visit(data, index * 4 + 1, l, [c20, c12, c01], alpha, cutoff);
+            visit(data, index * 4 + 2, l, [c01, c1, c12], alpha, cutoff);
+            visit(data, index * 4 + 3, l, [c12, c20, c2], alpha, cutoff);
             return;
         }
-        let center = [0, 1].map(|a| (c0.0[a] + c1.0[a] + c2.0[a]) / 3.0);
-        let a = [c0.1, c1.1, c2.1, read(center).1];
+        let value = |r: &OmmRead<'_>, p| f32::from(remap(r.read.mip0.sample(p), cutoff)) / 255.0;
+        let corner = |k: usize| {
+            let c = alpha.corner(tri, k);
+            value(c.read, c.uv)
+        };
+        let (r, center) = alpha.at([0, 1].map(|a| (c0[a] + c1[a] + c2[a]) / 3.0));
+        let a = [corner(0), corner(1), corner(2), value(r, center)];
         let state = if a.iter().all(|&a| a < 0.5) {
             OMM_STATE_TRANSPARENT
         } else if a.iter().all(|&a| a > 0.5) {
@@ -478,11 +480,7 @@ fn rasterize_across(
         };
         data[index / 4] |= state << (2 * (index % 4));
     }
-    let read = |p: [f32; 2]| {
-        let (r, q) = alpha.at(p);
-        (p, f32::from(remap(r.read.mip0.sample(q), cutoff)) / 255.0)
-    };
-    visit(data, 0, level, uv.map(read), &read);
+    visit(data, 0, level, uv, alpha, cutoff);
 }
 
 /// Whether micro-triangles `first..first + count` of a four-state entry hold a known state.

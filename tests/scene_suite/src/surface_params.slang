@@ -53,7 +53,7 @@ void main(uint3 id: SV_DispatchThreadID)
     if (id.x >= root.count)
         return;
     SurfaceInput i = (SurfaceInput)0;
-    UvFootprint f = { float2(0.25), float2(0.0), float2(0.0), float2(-1.0) };
+    UvFootprint f = { float2(0.25), float2(0.0), float2(0.0), float2(-1.0), float2(0.0) };
     i.uv[0] = f;
     i.uv[1] = f;
     i.normal = float3(0.0, 0.0, 1.0);

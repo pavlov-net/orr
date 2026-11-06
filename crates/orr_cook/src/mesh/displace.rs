@@ -34,13 +34,14 @@ pub(super) fn bake(
         let Some(disp) = maps[s].displacement.as_ref().filter(|_| baked[s]) else {
             continue;
         };
+        let heights = disp.vertex_heights(&w.uvs[disp.uv_set], w.section_triangles(s));
         for &v in &w.indices[r.clone()] {
+            let height = heights[&v];
             let v = v as usize;
             let e = at
                 .entry(w.positions[v].map(f32::to_bits))
                 .or_insert((0.0, DVec3::ZERO, 0));
-            let height = disp.at(w.uvs[disp.uv_set][v]);
-            e.0 += f64::from(height.expect("a baked section reads its map"));
+            e.0 += f64::from(height);
             e.1 += Vec3::from(w.normals[v]).normalize_or_zero().as_dvec3();
             e.2 += 1;
         }

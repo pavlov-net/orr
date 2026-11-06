@@ -5701,6 +5701,7 @@ fn stochastic_texture_taps_average_to_the_bicubic_filter_under_magnification() {
         dy: [0.0, texels / SIZE as f32],
         hardware: u32::from(hardware),
         material: 0,
+        inward: [0.0; 2],
     };
     let mut cases = Vec::new();
     for &uv in &uvs {
@@ -5968,6 +5969,7 @@ fn material_slots_read_their_wrap_and_filter_like_a_cpu_reference() {
                     dy: [0.0, texels / SIZE as f32],
                     hardware: u32::from(hardware),
                     material: (wi * filters.len() + fi) as u32,
+                    inward: [0.0; 2],
                 };
                 cases.push((footprint, want, modes, fi));
             }
@@ -6233,36 +6235,59 @@ fn material_tile_sets_read_each_square_like_a_cpu_reference() {
     for (fi, &(_, texels, hardware, read)) in filters.iter().enumerate() {
         for (wi, &mode) in wraps.iter().enumerate() {
             let material = (wi * filters.len() + fi) as u32;
+            let want = |t: usize, place: [f32; 2]| match read {
+                Bilinear(mip) => filtered(t, mode, mip, place, 1, &linear),
+                Bicubic => filtered(t, mode, 0, place, 2, &bspline),
+                Nearest => {
+                    let at = place.map(|c| (c * SIZES[t] as f32).floor() as i32);
+                    texel(t, mode, 0, at[0], at[1])
+                }
+            };
             for &(column, row, t) in &tiles {
                 let n = SIZES[t];
                 for &place in &places {
                     // A far tile's uv holds fewer bits of its place.
                     let uv = [f32::from(column) + place[0], place[1] - f32::from(row)];
                     let place = uv.map(|c| c - c.floor());
-                    let want = match read {
-                        Bilinear(mip) => filtered(t, mode, mip, place, 1, &linear),
-                        Bicubic => filtered(t, mode, 0, place, 2, &bspline),
-                        Nearest => {
-                            let at = place.map(|c| (c * n as f32).floor() as i32);
-                            texel(t, mode, 0, at[0], at[1])
-                        }
-                    };
-                    cases.push((uv, texels / n as f32, hardware, material, want));
+                    let size = texels / n as f32;
+                    cases.push((uv, [0.0; 2], size, hardware, material, want(t, place)));
                 }
             }
+            // Past the last tile of a row and below the first row, a point on the edge still lies
+            // on the tile before it, at its far edge.
+            for (uv, t, place) in [
+                ([2.0, 0.5], 1, [1.0, 0.5]),
+                ([0.5, 1.0], 0, [0.5, 1.0]),
+                ([2.0, 1.0], 1, [1.0, 1.0]),
+            ] {
+                let size = texels / SIZES[t] as f32;
+                cases.push((uv, [0.0; 2], size, hardware, material, want(t, place)));
+            }
+            // On the edge of two tiles, or rounded past it, a point on a surface reads the tile the
+            // surface lies on.
+            let past = 1.0 + f32::EPSILON;
+            for (uv, inward, t, place) in [
+                ([1.0, 0.5], [-0.25, 0.0], 0, [1.0, 0.5]),
+                ([1.0, 0.5], [0.25, 0.0], 1, [0.0, 0.5]),
+                ([past, 0.5], [-0.25, 0.0], 0, [past, 0.5]),
+            ] {
+                let size = texels / SIZES[t] as f32;
+                cases.push((uv, inward, size, hardware, material, want(t, place)));
+            }
             for &uv in &holes {
-                cases.push((uv, texels / 8.0, hardware, material, OUTSIDE));
+                cases.push((uv, [0.0; 2], texels / 8.0, hardware, material, OUTSIDE));
             }
         }
     }
     let footprints: Vec<Footprint> = cases
         .iter()
-        .map(|&(uv, size, hardware, material, _)| Footprint {
+        .map(|&(uv, inward, size, hardware, material, _)| Footprint {
             uv,
             dx: [size, 0.0],
             dy: [0.0, size],
             hardware: u32::from(hardware),
             material,
+            inward,
         })
         .collect();
     let levels: Vec<_> = mips
@@ -6316,7 +6341,7 @@ fn material_tile_sets_read_each_square_like_a_cpu_reference() {
     wait(render.submit(vec![list], &[]).unwrap());
 
     for (case, mean) in cases.iter().zip(out.as_slice().unwrap()) {
-        let (uv, _, _, material, want) = case;
+        let (uv, _, _, _, material, want) = case;
         for c in 0..4 {
             assert!(
                 (mean[c] - want[c]).abs() < 6e-3,

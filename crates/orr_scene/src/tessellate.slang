@@ -365,7 +365,8 @@ float3 displaced(Patch pt, PatchItem item, uint material, float3 w, bool previou
     i.displacement = entry().displacement;
     i.normal = base.normal;
     i.material = material;
-    UvFootprint f = { base.uv, (uvs[1] - uvs[0]) / item.rate, (uvs[2] - uvs[0]) / item.rate, float2(-1.0) };
+    float2 inward = (uvs[0] + uvs[1] + uvs[2]) / 3.0 - base.uv;
+    UvFootprint f = { base.uv, (uvs[1] - uvs[0]) / item.rate, (uvs[2] - uvs[0]) / item.rate, float2(-1.0), inward };
     i.uv[0] = f;
     i.uv[1] = f;
     i.user = pt.cluster.user;

@@ -17,6 +17,7 @@ struct Footprint
     float2 dy;
     uint hardware;   // 1: every lookup with a negative tap
     uint material;   // in `Root.materials`, for `slot_mean`
+    float2 inward;
 }
 
 struct Root
@@ -46,7 +47,7 @@ void mean(uint3 id: SV_DispatchThreadID)
     float4 sum = float4(0.0);
     for (uint n = 0; n < root.taps; n++)
     {
-        UvFootprint f = { p.uv, p.dx, p.dy, p.hardware != 0 ? float2(-1.0) : r2(n) };
+        UvFootprint f = { p.uv, p.dx, p.dy, p.hardware != 0 ? float2(-1.0) : r2(n), p.inward };
         texture_unprepare();
         texture_prepare(root.texture, s.modes, f, root.streams);
         sum += texture_footprint(root.texture, s, f, root.streams);
@@ -64,7 +65,7 @@ void slot_mean(uint3 id: SV_DispatchThreadID)
     float4 sum = float4(0.0);
     for (uint n = 0; n < root.taps; n++)
     {
-        UvFootprint f = { p.uv, p.dx, p.dy, p.hardware != 0 ? float2(-1.0) : r2(n) };
+        UvFootprint f = { p.uv, p.dx, p.dy, p.hardware != 0 ? float2(-1.0) : r2(n), p.inward };
         UvFootprint uv[2] = { f, f };
         sum += material_texture(root.materials + p.material, TEXTURE_BASE_COLOR, uv, float4(0.0));
     }

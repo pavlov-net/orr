@@ -89,8 +89,8 @@ public float material_opacity(SurfaceInput i)
     if ((m.flags & (MATERIAL_ALPHA_TESTED | MATERIAL_PRESENCE)) == 0)
         return 1.0;
     UvFootprint finest[2] = {
-        { i.uv[0].uv, float2(0.0), float2(0.0), float2(-1.0) },
-        { i.uv[1].uv, float2(0.0), float2(0.0), float2(-1.0) },
+        { i.uv[0].uv, float2(0.0), float2(0.0), float2(-1.0), i.uv[0].inward },
+        { i.uv[1].uv, float2(0.0), float2(0.0), float2(-1.0), i.uv[1].inward },
     };
     float opacity = m.geometry_opacity * surface_vertex(i, m, TEXTURE_OPACITY).x;
     if (material_bound(m, TEXTURE_OPACITY))
@@ -208,6 +208,7 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
     f.dx = float2(dot(px, axis_x), dot(px, axis_y)) * scale;
     f.dy = float2(dot(py, axis_x), dot(py, axis_y)) * scale;
     f.tap = i.uv[0].tap;
+    f.inward = float2(0.0);
     // A decal projects one uv, which every slot reads.
     UvFootprint fs[2] = { f, f };
     float4 one = float4(1.0);

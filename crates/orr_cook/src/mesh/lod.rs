@@ -84,7 +84,7 @@ impl Welded {
         }
     }
 
-    fn section_triangles(&self, s: usize) -> impl Iterator<Item = [u32; 3]> + '_ {
+    pub(super) fn section_triangles(&self, s: usize) -> impl Iterator<Item = [u32; 3]> + '_ {
         let r = self.sections[s].clone();
         self.indices[r].chunks_exact(3).map(|t| [t[0], t[1], t[2]])
     }
@@ -411,36 +411,32 @@ pub(super) fn simplify(
     (out.into_iter().map(|v| global[v as usize]).collect(), error)
 }
 
-/// Warnings for vertices on a uv seam of section `s` whose displacement differs between
-/// its uvs by more than 1/1024 of the declared range.
+/// Warnings for vertices on a uv seam or a tile's edge of section `s` whose triangles read
+/// displacements there more than 1/1024 of the declared range apart.
 pub(super) fn displacement_seams(
     w: &Welded,
     grid: &Grid,
     s: usize,
     d: &Displacement,
 ) -> Vec<String> {
-    if d.map.is_none() {
+    let Some(map) = &d.map else {
         return Vec::new();
-    }
+    };
     let tolerance = (d.max - d.min) / 1024.0;
-    let mut uvs: FxHashMap<[i32; 3], Vec<[f32; 2]>> = FxHashMap::default();
+    let mut heights: FxHashMap<[i32; 3], [f32; 2]> = FxHashMap::default();
     for t in w.section_triangles(s) {
-        for v in t {
-            let e = uvs.entry(grid.cells[v as usize]).or_default();
-            let uv = w.uvs[d.uv_set][v as usize];
-            if !e.contains(&uv) {
-                e.push(uv);
-            }
+        let uv = t.map(|v| w.uvs[d.uv_set][v as usize]);
+        for (k, &v) in t.iter().enumerate() {
+            let (height, _) = d.corner(map, uv, k);
+            let e = heights
+                .entry(grid.cells[v as usize])
+                .or_insert([height, height]);
+            *e = [e[0].min(height), e[1].max(height)];
         }
     }
-    let mut bad: Vec<[i32; 3]> = uvs
+    let mut bad: Vec<[i32; 3]> = heights
         .iter()
-        .filter(|(_, uv)| {
-            let disp: Vec<f32> = uv.iter().filter_map(|&u| d.at(u)).collect();
-            let lo = disp.iter().copied().fold(f32::INFINITY, f32::min);
-            let hi = disp.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            hi - lo > tolerance
-        })
+        .filter(|(_, [lo, hi])| hi - lo > tolerance)
         .map(|(c, _)| *c)
         .collect();
     if bad.is_empty() {
@@ -454,7 +450,7 @@ pub(super) fn displacement_seams(
         .map(|c| format!("{:?}", c.map(|v| (f64::from(v) * step) as f32)))
         .collect();
     vec![format!(
-        "section {s}: displacement differs across the uv seam at {} vertices, at {}{}",
+        "section {s}: displacement differs across a uv seam or tile edge at {} vertices, at {}{}",
         bad.len(),
         named.join(", "),
         if bad.len() > named.len() { ", .." } else { "" }

@@ -13,7 +13,6 @@ use orr_pack::texture::normal;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use super::maps::{Map, Raster};
 use super::{MeshData, NormalSpec, SectionMaps};
 
 /// Histogram bin width, degrees.
@@ -175,7 +174,11 @@ pub(super) fn check(
                         let uv = p.uv.map(|c| x.mapped(c));
                         texel_centers(size, uv, |w, weight| {
                             let [a, b, c] = p.weights;
-                            let deg = tri.angle(map, a * w.x + b * w.y + c * w.z);
+                            let at = [0, 1]
+                                .map(|i| w.x * p.uv[0][i] + w.y * p.uv[1][i] + w.z * p.uv[2][i]);
+                            let v = normal::decode([p.read[0].sample(at), p.read[1].sample(at)]);
+                            let v = Vec3::from(map.normal_frame(v));
+                            let deg = tri.angle(v, a * w.x + b * w.y + c * w.z);
                             h[((deg / BIN) as usize).min(BINS - 1)] += weight * scale;
                             n += 1;
                         });
@@ -259,13 +262,9 @@ impl Triangle {
         }
     }
 
-    /// Degrees between the two shading normals at barycentrics `w`.
-    fn angle(&self, map: &Map<[Raster; 2]>, w: Vec3) -> f32 {
+    /// Degrees between the two shading normals at barycentrics `w`, of tangent-space normal `v`.
+    fn angle(&self, v: Vec3, w: Vec3) -> f32 {
         let at = |c: [Vec3; 3]| w.x * c[0] + w.y * c[1] + w.z * c[2];
-        let uv = [0, 1].map(|a| w.x * self.uv[0][a] + w.y * self.uv[1][a] + w.z * self.uv[2][a]);
-        let (read, p) = map.at(uv);
-        let v = normal::decode([read[0].sample(p), read[1].sample(p)]);
-        let v = Vec3::from(map.normal_frame(v));
         let frame = at(self.normals);
         let n = frame.normalize_or(self.geometric);
 

@@ -1555,6 +1555,7 @@ fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_wan
             dy: [0.0, 1.0 / h as f32],
             hardware: 1,
             material: 0,
+            inward: [0.0; 2],
         })
         .collect();
     let mut input = dev
@@ -1718,6 +1719,7 @@ fn a_tile_set_mounts_as_a_table_of_streamed_textures() {
         dy: [0.0, 1.0 / height as f32],
         hardware: 1,
         material: id.0,
+        inward: [0.0; 2],
     };
     let mut input = dev
         .gpu_malloc::<Footprint>(MemoryKind::Upload, 1, "footprint")
@@ -1848,6 +1850,7 @@ fn cooked_tiles_read(
             dy: [0.0, 1.0 / 8.0],
             hardware: 1,
             material: id.0,
+            inward: [0.0; 2],
         })
         .collect();
     let mut input = dev
@@ -1970,6 +1973,7 @@ fn taps_past_the_edges_of_a_streamed_texture_load_the_tiles_they_read() {
         dy: [0.0, 1.0 / h as f32],
         hardware: 1,
         material: 0,
+        inward: [0.0; 2],
     };
     let center = |x: u32| (x as f32 + 0.5) / w as f32;
     // Per wrap, taps at u that read texel column x, and the first of them not to check.
@@ -2031,6 +2035,7 @@ fn taps_at_a_repeating_edge_load_the_tiles_across_the_seam() {
             dy: [0.0, 1.0 / h as f32],
             hardware: 1,
             material: 0,
+            inward: [0.0; 2],
         })
         .collect();
     let want: Vec<[f32; 4]> = (0..h)
@@ -3397,6 +3402,7 @@ fn texel_centers() -> Vec<scene_suite::shaders::texture_filter::Footprint> {
                 dy: [0.0, 1.0 / h as f32],
                 hardware: 1,
                 material: 0,
+                inward: [0.0; 2],
             }
         })
         .collect()
@@ -3694,6 +3700,7 @@ fn stochastic_taps_of_a_neural_texture_average_to_its_filters() {
         dy: [0.0, texels / h],
         hardware: 0,
         material: 0,
+        inward: [0.0; 2],
     };
     // A quarter texel: the bicubic B-spline of mip 0. Two texels: bilinear mip 1. Three:
     // trilinear between mips 1 and 2 by log2(3).

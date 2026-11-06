@@ -13,6 +13,7 @@ use crate::texture::Wrap;
 use crate::texture::tiles::Cell;
 use orr_math::Vec3;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 /// One mip of one channel, row-major, with the sampler's edge modes, the material slot's uv
 /// transform (`Material::uv_transforms` form) and what it reads past 0..1 on a bounded axis.
@@ -170,30 +171,80 @@ fn sweep<C>(
     rest.is_empty() || visit(None, rest)
 }
 
+/// How near a cell's edge mapped uvs `p` count as on it: the rounding of `texture_tile`'s f32 uvs.
+fn edge_slack<'a>(p: impl IntoIterator<Item = &'a f64>) -> f64 {
+    let largest = p.into_iter().fold(1.0f64, |a, c| a.max(c.abs()));
+    4.0 * f64::from(f32::EPSILON) * largest
+}
+
+/// How far corners `c` run along axis `a`.
+fn spread<const N: usize>(c: &[[f64; N]], a: usize) -> f64 {
+    let (lo, hi) = c
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| {
+            (lo.min(c[a]), hi.max(c[a]))
+        });
+    hi - lo
+}
+
 impl<T> Tiles<T> {
-    /// `texture_tile`: what reads in the cell at whole numbers `u`, `v`. Row 1 lies above row 0.
-    fn cell(&self, u: f64, v: f64) -> &T {
+    /// The tile in the cell at whole numbers `u`, `v`. Row 1 lies above row 0.
+    fn tile(&self, u: f64, v: f64) -> Option<&T> {
         let (column, row) = (u, -v);
         let held = |c: f64| (0.0..65536.0).contains(&c);
-        if !(held(column) && held(row)) {
-            return &self.missing;
-        }
-        self.tiles
-            .get(&(row as u16, column as u16))
-            .unwrap_or(&self.missing)
+        (held(column) && held(row))
+            .then(|| self.tiles.get(&(row as u16, column as u16)))
+            .flatten()
     }
 
+    /// What reads in the cell at whole numbers `u`, `v`.
+    fn cell(&self, u: f64, v: f64) -> &T {
+        self.tile(u, v).unwrap_or(&self.missing)
+    }
+
+    /// What mapped uv `p` reads in the cell at whole numbers `cell`, and where in it: the cell's
+    /// tile, or one before it if `p` lies on its lower edge and the cell has none.
+    fn read(&self, p: [f64; 2], cell: [f64; 2]) -> (&T, [f32; 2]) {
+        let place = [0, 1].map(|a| p[a] - cell[a]);
+        let slack = edge_slack(&p);
+        let edges = u8::from(place[0] < slack) | u8::from(place[1] < slack) << 1;
+        for i in (0..4u8).filter(|i| i & !edges == 0) {
+            let step = [f64::from(i & 1), f64::from(i >> 1)];
+            if let Some(tile) = self.tile(cell[0] - step[0], cell[1] - step[1]) {
+                return (tile, [0, 1].map(|a| (place[a] + step[a]) as f32));
+            }
+        }
+        (&self.missing, place.map(|c| c as f32))
+    }
+
+    /// `texture_tile` of a point on no surface.
     fn at(&self, uv: [f32; 2]) -> (&T, [f32; 2]) {
         let p = mapped(self.uv, uv);
-        let cell = p.map(f64::floor);
-        (
-            self.cell(cell[0], cell[1]),
-            [0, 1].map(|a| (p[a] - cell[a]) as f32),
-        )
+        self.read(p, p.map(f64::floor))
     }
 
-    /// Calls `f` with the parts of mapped uv triangle `p`; a part flat along a cell's edge counts
-    /// with `edges`.
+    /// `texture_tile` of corner `k` of uv triangle `tri`, pointing inward at the triangle's center.
+    fn corner(&self, tri: [[f32; 2]; 3], k: usize) -> CornerRead<'_, T> {
+        let p = tri.map(|c| mapped(self.uv, c));
+        let at = p[k];
+        let slack = edge_slack(&at);
+        let cell = [0, 1].map(|a| {
+            let edge = at[a].round();
+            let center = (p[0][a] + p[1][a] + p[2][a]) / 3.0;
+            match (at[a] - edge).abs() <= slack {
+                true if center < edge => edge - 1.0,
+                true => edge,
+                false => at[a].floor(),
+            }
+        });
+        let (read, uv) = self.read(at, cell);
+        let held = !std::ptr::eq(read, &self.missing);
+        CornerRead { read, uv, held }
+    }
+
+    /// Calls `f` with the parts of mapped uv triangle `p`. A part flat along a cell's edge counts
+    /// with `edges`, unless it reads no tile: there a point on the edge reads the tile beside it,
+    /// and so does a part no wider than `texture_tile`'s rounding.
     fn walk<'a>(
         &'a self,
         p: [[f64; 2]; 3],
@@ -212,11 +263,15 @@ impl<T> Tiles<T> {
             [p[1][0] - p[0][0], p[1][1] - p[0][1]],
             [p[2][0] - p[0][0], p[2][1] - p[0][1]],
         );
-        // A triangle with no area reads along a line, and all its parts are flat.
-        let edges = edges || e1[0] * e2[1] == e1[1] * e2[0];
+        let slack = edge_slack(p.iter().flatten());
+        // A triangle with no width to speak of reads along a line, and all its parts are flat.
+        let line =
+            e1[0] * e2[1] == e1[1] * e2[0] || spread(&p, 0) <= slack || spread(&p, 1) <= slack;
         let mut emit = |read: &'a T, origin: [f64; 2], poly: Vec<Corner>| {
-            let flat = |a: usize| poly.iter().all(|c| c[a] == poly[0][a]);
-            if !edges && (flat(0) || flat(1)) {
+            let missing = std::ptr::eq(read, &self.missing);
+            let thin = if missing { slack } else { 0.0 };
+            let flat = spread(&poly, 0) <= thin || spread(&poly, 1) <= thin;
+            if flat && !line && (missing || !edges) {
                 return true;
             }
             let last = poly.len() - 1;
@@ -267,12 +322,35 @@ impl<T> Tiles<T> {
     }
 }
 
+/// What a triangle's corner reads.
+pub(super) struct CornerRead<'a, T> {
+    pub(super) read: &'a T,
+    /// The corner in the uvs `read` takes.
+    pub(super) uv: [f32; 2],
+    /// A texture holds it, and not what a set reads where it has none.
+    pub(super) held: bool,
+}
+
 impl<T> Map<T> {
-    /// What reads at mesh uv `uv`, and where in it, as `material_texture` picks it.
+    /// What reads at mesh uv `uv`, and where in it, as `material_texture` picks it. Where a
+    /// triangle holds the point, [`Self::corner`] and [`Self::parts`] know better.
     pub(super) fn at(&self, uv: [f32; 2]) -> (&T, [f32; 2]) {
         match self {
             Self::Image(t) => (t, uv),
             Self::Tiles(t) => t.at(uv),
+        }
+    }
+
+    /// Corner `k` of mesh uv triangle `tri`. On a cell's edge it belongs to the triangle using it,
+    /// so it reads toward that triangle and not where a lone point's floor would.
+    pub(super) fn corner(&self, tri: [[f32; 2]; 3], k: usize) -> CornerRead<'_, T> {
+        match self {
+            Self::Image(read) => CornerRead {
+                read,
+                uv: tri[k],
+                held: true,
+            },
+            Self::Tiles(t) => t.corner(tri, k),
         }
     }
 
@@ -294,9 +372,10 @@ impl<T> Map<T> {
         }
     }
 
-    /// [`Self::parts`] with every cell a read at a corner or along an edge can land in, as
-    /// displacement's do. A corner on a cell's edge reads the cell that starts there, and the
-    /// runtime's f32 uvs round across an edge a corner lies within a few steps of.
+    /// [`Self::parts`] with every tile a read at a corner or along an edge can land in, as
+    /// displacement's do: a point on a cell's edge reads the tile that starts there, and the
+    /// runtime's f32 uvs round across an edge a corner lies within a few steps of. A cell with no
+    /// tile counts only with area, since such a point reads the tile beside it.
     pub(super) fn reads<'a>(
         &'a self,
         uv: [[f32; 2]; 3],
@@ -306,18 +385,29 @@ impl<T> Map<T> {
             return self.parts(uv, f);
         };
         let p = uv.map(|c| mapped(t.uv, c));
-        if !t.walk(p, true, &mut f) {
-            return false;
-        }
-        let largest = p.iter().flatten().fold(1.0f64, |a, c| a.max(c.abs()));
-        let slack = 4.0 * f64::from(f32::EPSILON) * largest;
-        if !p.iter().flatten().any(|c| (c - c.round()).abs() <= slack) {
-            return true;
+        let mut seen: Vec<*const T> = vec![&t.missing];
+        let whole = t.walk(p, false, &mut |part| {
+            seen.push(part.read);
+            f(part)
+        });
+        let slack = edge_slack(p.iter().flatten());
+        if !whole || !p.iter().flatten().any(|c| (c - c.round()).abs() <= slack) {
+            return whole;
         }
         let shifted = |[x, y]: [f64; 2]| p.map(|c| [c[0] + x * slack, c[1] + y * slack]);
-        [[1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0]]
-            .into_iter()
-            .all(|s| t.walk(shifted(s), true, &mut f))
+        [
+            [0.0, 0.0],
+            [1.0, 1.0],
+            [1.0, -1.0],
+            [-1.0, 1.0],
+            [-1.0, -1.0],
+        ]
+        .into_iter()
+        .all(|s| {
+            t.walk(shifted(s), true, &mut |part| {
+                seen.contains(&std::ptr::from_ref(part.read)) || f(part)
+            })
+        })
     }
 
     /// Every texture, and what reads where a set has none.
@@ -853,10 +943,46 @@ impl Displacement {
         [a.min(b), a.max(b)]
     }
 
-    /// The displacement at mesh uv `uv`, meters, from a map the cook reads.
-    pub(super) fn at(&self, uv: [f32; 2]) -> Option<f32> {
-        let (mips, p) = self.map.as_ref()?.at(uv);
-        Some(self.scale * mips[0].sample(p) + self.offset)
+    /// The displacement at corner `k` of uv triangle `tri` under `map`, meters, and whether a
+    /// texture holds it.
+    pub(super) fn corner(
+        &self,
+        map: &Map<Vec<Raster>>,
+        tri: [[f32; 2]; 3],
+        k: usize,
+    ) -> (f32, bool) {
+        let c = map.corner(tri, k);
+        (self.scale * c.read[0].sample(c.uv) + self.offset, c.held)
+    }
+
+    /// The displacement of each vertex of triangles `tris` over vertex uvs `uvs`, meters, to bake
+    /// into one position. A vertex takes the mean of the tiles its triangles' corners read, and
+    /// what a set reads where it has no tile only when none of them reads a tile.
+    pub(super) fn vertex_heights(
+        &self,
+        uvs: &[[f32; 2]],
+        tris: impl Iterator<Item = [u32; 3]>,
+    ) -> FxHashMap<u32, f32> {
+        let Some(map) = &self.map else {
+            return FxHashMap::default();
+        };
+        let mut reads: FxHashMap<u32, (f64, u32, f32)> = FxHashMap::default();
+        for t in tris {
+            let uv = t.map(|v| uvs[v as usize]);
+            for (k, &v) in t.iter().enumerate() {
+                let (height, held) = self.corner(map, uv, k);
+                let e = reads.entry(v).or_insert((0.0, 0, height));
+                if held {
+                    e.0 += f64::from(height);
+                    e.1 += 1;
+                }
+            }
+        }
+        let height = |(sum, held, missing): (f64, u32, f32)| match held {
+            0 => missing,
+            n => (sum / f64::from(n)) as f32,
+        };
+        reads.into_iter().map(|(v, r)| (v, height(r))).collect()
     }
 
     /// Fails when a texel of any mip lies outside the declared range.
@@ -1138,7 +1264,10 @@ mod tests {
             ([0.5, -1.5], 0.9),
             ([1.0, 0.5], 0.2),
             ([0.5, 0.0], 0.1),
-            ([0.5, 1.0], 0.9),
+            ([0.5, 1.0], 0.1),
+            ([2.0, 0.5], 0.2),
+            ([10.0, 0.5], 0.4),
+            ([2.0, 1.0], 0.2),
             ([0.5, -1.0], 0.3),
             ([70000.5, 0.5], 0.9),
         ] {
@@ -1233,8 +1362,9 @@ mod tests {
     /// Corners on a cell's edge read the next cell, where a ray lands on nothing.
     #[test]
     fn a_cell_a_triangle_only_touches_has_no_area_to_hit() {
-        let set = solid_set([0.0; 6], &[(0, 0, 0.25)], 0.75);
-        let seen = |edges: bool, tri| {
+        let alone = solid_set([0.0; 6], &[(0, 0, 0.25)], 0.75);
+        let beside = solid_set([0.0; 6], &[(0, 0, 0.25), (0, 1, 0.5)], 0.75);
+        let seen = |set: &Map<Raster>, edges: bool, tri| {
             let mut seen = Vec::new();
             let mut f = |p: Part<'_, Raster>| {
                 seen.push(p.read.texels[0]);
@@ -1249,16 +1379,76 @@ mod tests {
             seen
         };
         let unit = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
-        assert_eq!(seen(false, unit), [0.25]);
-        assert_eq!(seen(true, unit), [0.25, 0.75]);
+        assert_eq!(seen(&alone, false, unit), [0.25]);
+        assert_eq!(
+            seen(&alone, true, unit),
+            [0.25],
+            "no tile lies there to read"
+        );
+        assert_eq!(seen(&beside, false, unit), [0.25]);
+        assert_eq!(seen(&beside, true, unit), [0.25, 0.5]);
         let inside = [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75]];
-        assert_eq!(seen(true, inside), [0.25]);
+        assert_eq!(seen(&beside, true, inside), [0.25]);
         let line = [[0.5, 0.5], [1.5, 0.5], [1.5, 0.5]];
-        assert_eq!(seen(false, line), [0.25, 0.75], "a line reads along itself");
+        assert_eq!(
+            seen(&alone, false, line),
+            [0.25, 0.75],
+            "a line reads along itself"
+        );
         // A step below 1, which the runtime's f32 interpolation can round up to it.
         let close = [[0.5, 0.5], [1.0 - f32::EPSILON / 2.0, 0.5], [0.5, 0.75]];
-        assert_eq!(seen(false, close), [0.25]);
-        assert_eq!(seen(true, close), [0.25, 0.75]);
+        assert_eq!(seen(&beside, false, close), [0.25]);
+        assert_eq!(seen(&beside, true, close), [0.25, 0.5]);
+        // A step past 1, where a page's rounding can leave a corner of a tile's last triangle.
+        let over = [[0.5, 0.5], [1.0 + f32::EPSILON, 0.5], [0.5, 0.75]];
+        assert_eq!(seen(&alone, false, over), [0.25]);
+    }
+
+    /// A vertex on a tile's edge reads the tile its triangles lie on, whatever lies past it. Two
+    /// tiles sharing it agree on one height, and a cell with no tile never outweighs a tile.
+    #[test]
+    fn a_vertex_reads_the_tiles_its_triangles_lie_on() {
+        let tiles = [((0, 0), 0.25), ((0, 1), 0.75)];
+        let tiles = tiles.map(|(k, v)| (k, vec![Raster::solid(v)]));
+        let d = Displacement {
+            scale: 1.0,
+            offset: 0.0,
+            min: 0.0,
+            max: 1.0,
+            map: Some(Map::Tiles(Tiles {
+                uv: [0.0; 6],
+                tiles: tiles.into(),
+                missing: vec![Raster::solid(0.5)],
+            })),
+            uv_set: 0,
+        };
+        // Vertex 1 at u = 1, on the edge of both tiles, and vertex 3 at u = 2, past the last.
+        let uvs = [
+            [0.5, 0.5],
+            [1.0, 0.5],
+            [1.5, 0.5],
+            [2.0, 0.5],
+            [2.5, 0.5],
+            [2.5, 0.75],
+            [0.5, 0.75],
+            [1.5, 0.75],
+        ];
+        let height = |tris: &[[u32; 3]], v: u32| d.vertex_heights(&uvs, tris.iter().copied())[&v];
+        let on_first = [0, 1, 6];
+        let on_second = [1, 2, 7];
+        let to_the_end = [2, 3, 7];
+        let past = [3, 4, 5];
+        assert_eq!(height(&[on_first], 1), 0.25, "not the tile past it");
+        assert_eq!(height(&[on_second], 1), 0.75);
+        assert_eq!(
+            height(&[on_first, on_second], 1),
+            0.5,
+            "one height at a seam"
+        );
+        assert_eq!(height(&[to_the_end], 3), 0.75, "not the cell past it");
+        assert_eq!(height(&[past], 3), 0.75, "the tile before a cell with none");
+        assert_eq!(height(&[past], 4), 0.5, "all that lies on no tile");
+        assert_eq!(height(&[past, to_the_end], 3), 0.75, "a tile outweighs it");
     }
 
     /// A gradient across `n` texels, at the cutoff 0.5 halfway, with the edge modes of a tile.
