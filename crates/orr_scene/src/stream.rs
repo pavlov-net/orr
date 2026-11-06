@@ -40,7 +40,7 @@ use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch};
 use crate::edit::Mirror;
 use crate::loading::{BlobSource, Loading, Msg, decoded, landed, read_stored};
 use crate::memory::{Block, Pool, PoolSlot};
-use crate::mount::{Apply, page_infos};
+use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
 use crate::residency::{
     HOLD_FRAMES, Key, Limits, Plan, Priority, Residency, ResidencyClass, ResidencyStats, UnitDesc,
@@ -61,9 +61,9 @@ pub(crate) enum PoolTarget {
     /// A table entry on the GPU.
     Table(GpuPtr<u64>),
     /// The transform groups placing an instance page.
-    InstancePage(u32),
+    InstancePage(PageId),
     /// A window of an animated page's rows.
-    PageWindow { page: u32, window: u32 },
+    PageWindow { page: PageId, window: u32 },
 }
 
 /// How a streamed unit loads.
@@ -391,8 +391,8 @@ pub(crate) struct Streaming {
     /// Heap indices whose stream table entry the next step writes null.
     nulls: Vec<u32>,
     /// Instance pages that landed (their records' address) or left (0) since the last take.
-    page_events: Vec<(u32, u64)>,
-    window_events: Vec<(u32, u32, u64)>,
+    page_events: Vec<(PageId, u64)>,
+    window_events: Vec<(PageId, u32, u64)>,
     blobs: Vec<Option<UserBlob>>,
     queued: VecDeque<u32>,
     fif: u32,
@@ -710,7 +710,7 @@ impl Streaming {
     }
 
     /// The instance pages that landed or left since the last call.
-    pub(crate) fn take_page_events(&mut self) -> Vec<(u32, u64)> {
+    pub(crate) fn take_page_events(&mut self) -> Vec<(PageId, u64)> {
         std::mem::take(&mut self.page_events)
     }
 
@@ -719,7 +719,7 @@ impl Streaming {
     }
 
     /// The windows of rows, by page, that landed or left since the last call.
-    pub(crate) fn take_window_events(&mut self) -> Vec<(u32, u32, u64)> {
+    pub(crate) fn take_window_events(&mut self) -> Vec<(PageId, u32, u64)> {
         std::mem::take(&mut self.window_events)
     }
 

@@ -328,9 +328,8 @@ pub(crate) struct GroupFrame {
 /// An animated page placed in a scene.
 pub(crate) struct PageMotion {
     pub(crate) range: InstanceRange,
-    /// `None` once its pack unmounts, when its copies hide for good: the id can name another
-    /// page by then.
-    pub(crate) page: Option<PageId>,
+    /// Names no page once its pack unmounts, when its copies hide for good.
+    pub(crate) page: PageId,
     /// The page's records.
     pub(crate) records: TransformGroupId,
     /// The transforms its copies read.
@@ -1068,12 +1067,7 @@ impl<'f> SceneWriter<'f> {
         r: &InstancePageRef<'_>,
         motion: Option<TransformGroupId>,
     ) -> Result<(InstanceRange, TransformGroupId)> {
-        let page = self
-            .mounts
-            .pages
-            .get(r.page.0 as usize)
-            .and_then(Option::as_ref)
-            .ok_or(Error::UnknownPage(r.page))?;
+        let page = self.mounts.page(r.page).ok_or(Error::UnknownPage(r.page))?;
         let count = u32::from(page.info.header.record_count);
         let protos = self.mounts.page_prototypes(r.page)?;
         if let Some(p) = protos.iter().find(|p| self.is_skinned(p.model)) {
@@ -1328,12 +1322,7 @@ impl<'f> SceneWriter<'f> {
         page: PageId,
         frame: Option<(TransformGroupId, u32)>,
     ) -> Result<Option<TransformGroupId>> {
-        let held = self
-            .mounts
-            .pages
-            .get(page.0 as usize)
-            .and_then(Option::as_ref)
-            .ok_or(Error::UnknownPage(page))?;
+        let held = self.mounts.page(page).ok_or(Error::UnknownPage(page))?;
         if held.info.motion_times.is_empty() {
             return Ok(None);
         }
@@ -1371,12 +1360,11 @@ impl<'f> SceneWriter<'f> {
                 return Err(e);
             }
         };
-        let held = self.mounts.pages[page.0 as usize].as_ref();
-        let p = held.ok_or(Error::UnknownPage(page))?;
+        let p = self.mounts.page(page).ok_or(Error::UnknownPage(page))?;
         let h = p.info.header;
         cpu.page_motions.push(PageMotion {
             range,
-            page: Some(page),
+            page,
             records,
             group,
             times: p.info.motion_times.clone(),
@@ -1424,12 +1412,7 @@ impl<'f> SceneWriter<'f> {
         r: &SkinnedPageRef,
         motion: Option<TransformGroupId>,
     ) -> Result<(InstanceRange, TransformGroupId)> {
-        let page = self
-            .mounts
-            .pages
-            .get(r.page.0 as usize)
-            .and_then(Option::as_ref)
-            .ok_or(Error::UnknownPage(r.page))?;
+        let page = self.mounts.page(r.page).ok_or(Error::UnknownPage(r.page))?;
         let protos = self.mounts.page_prototypes(r.page)?;
         let [proto] = protos.as_slice() else {
             return Err(Error::NotSkinnedPage(r.page));

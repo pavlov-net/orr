@@ -81,9 +81,13 @@ pub enum LoadState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MountId(pub u32);
 
-/// A resident instance page.
+/// A mounted instance page. It names no page once its pack is gone, whatever later takes its
+/// slot in the page table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PageId(pub u32);
+pub struct PageId {
+    pub(crate) slot: u32,
+    pub(crate) generation: u32,
+}
 
 /// Heap image slots and their textures.
 pub(crate) struct PlacedTexture {
@@ -2132,9 +2136,11 @@ pub(crate) struct Mounts {
     page_table: Allocation<u64>,
     page_ranges: RangeAllocator,
     sizes: TableSizes,
-    pub(crate) pages: Vec<Option<InstancePage>>,
+    pages: Vec<Option<InstancePage>>,
     /// By page: the mount and unit of its records, which its windows of rows follow.
     page_keys: Vec<Option<(MountId, u32)>>,
+    /// Per slot of `pages`, the generation of the page it holds or holds next.
+    page_generations: Vec<u32>,
     retired: Vec<(u64, Resident)>,
     pub(crate) streaming: Streaming,
     /// The mount and mesh of each resident model.
@@ -2232,7 +2238,7 @@ fn units(
     tables: &[GpuPtr<u64>],
     clusters: GpuPtr<ClusterRef>,
     textures: &[PlacedTexture],
-    pages: &[(u32, &PlacedPage)],
+    pages: &[(PageId, &PlacedPage)],
 ) -> Result<MountUnits> {
     let malformed = |what| Error::Pack(orr_pack::Error::Malformed(what));
     let mut units = Vec::new();
@@ -2458,6 +2464,7 @@ impl Mounts {
             sizes,
             pages: Vec::new(),
             page_keys: Vec::new(),
+            page_generations: Vec::new(),
             retired: Vec::new(),
             streaming: Streaming::new(device, budgets, accel, streams, fif)?,
             owners: FxHashMap::default(),
@@ -2949,11 +2956,7 @@ impl Mounts {
     /// The prototypes of page `id`: their models looked up in the page's mount, then in the
     /// other ready mounts, and their overrides.
     pub(crate) fn page_prototypes(&self, id: PageId) -> Result<Vec<PagePrototype>> {
-        let page = self
-            .pages
-            .get(id.0 as usize)
-            .and_then(Option::as_ref)
-            .ok_or(Error::UnknownPage(id))?;
+        let page = self.page(id).ok_or(Error::UnknownPage(id))?;
         let home = self.resident(page.mount)?;
         let others = self.entries.iter().flatten().filter_map(|e| match e {
             Entry::Ready(r) => Some(&**r),
@@ -3011,9 +3014,25 @@ impl Mounts {
             .collect()
     }
 
+    /// The slot of page `id`, unless its pack has gone.
+    fn page_slot(&self, id: PageId) -> Option<usize> {
+        let slot = id.slot as usize;
+        (self.page_generations.get(slot) == Some(&id.generation)).then_some(slot)
+    }
+
+    /// Page `id`, while its pack holds it.
+    pub(crate) fn page(&self, id: PageId) -> Option<&InstancePage> {
+        self.pages[self.page_slot(id)?].as_ref()
+    }
+
+    pub(crate) fn page_mut(&mut self, id: PageId) -> Option<&mut InstancePage> {
+        let slot = self.page_slot(id)?;
+        self.pages[slot].as_mut()
+    }
+
     /// The box of page `id` in world space, as a center and radius.
-    pub(crate) fn page_sphere(&self, id: u32, cell_log2: u32) -> Option<(DVec3, f64)> {
-        let h = self.pages.get(id as usize)?.as_ref()?.info.header;
+    pub(crate) fn page_sphere(&self, id: PageId, cell_log2: u32) -> Option<(DVec3, f64)> {
+        let h = self.page(id)?.info.header;
         let cell = IVec3::from_array(h.cell).as_dvec3() * f64::from(1u32 << cell_log2);
         let half = Vec3::from_array(h.extent).as_dvec3() * 0.5;
         Some((
@@ -3023,33 +3042,33 @@ impl Mounts {
     }
 
     /// The bytes page `id`'s records and linear table take in the instance page pool.
-    pub(crate) fn page_bytes(&self, id: u32) -> u64 {
-        self.pages
-            .get(id as usize)
-            .and_then(Option::as_ref)
+    pub(crate) fn page_bytes(&self, id: PageId) -> u64 {
+        self.page(id)
             .map_or(0, |p| u64::from(p.bytes).next_multiple_of(256))
     }
 
+    /// The mount and records unit of page `id`.
+    fn page_key(&self, id: PageId) -> Option<(MountId, u32)> {
+        self.page_keys[self.page_slot(id)?]
+    }
+
     /// Requests the records of page `id` for the next step.
-    pub(crate) fn request_page(&mut self, id: u32, cell_distance: u32) {
-        if let Some(Some((mount, unit))) = self.page_keys.get(id as usize).copied() {
+    pub(crate) fn request_page(&mut self, id: PageId, cell_distance: u32) {
+        if let Some((mount, unit)) = self.page_key(id) {
             self.streaming.request_unit(mount, unit, cell_distance);
         }
     }
 
     /// The bytes window `window` of page `id`'s rows takes in the instance page pool.
-    pub(crate) fn window_bytes(&self, id: u32, window: u32) -> u64 {
-        self.pages
-            .get(id as usize)
-            .and_then(Option::as_ref)
-            .map_or(0, |p| {
-                u64::from(p.info.header.motion_window_bytes(window)).next_multiple_of(256)
-            })
+    pub(crate) fn window_bytes(&self, id: PageId, window: u32) -> u64 {
+        self.page(id).map_or(0, |p| {
+            u64::from(p.info.header.motion_window_bytes(window)).next_multiple_of(256)
+        })
     }
 
     /// Requests window `window` of page `id`'s rows for the next step.
-    pub(crate) fn request_window(&mut self, id: u32, window: u32, cell_distance: u32) {
-        if let Some(Some((mount, unit))) = self.page_keys.get(id as usize).copied() {
+    pub(crate) fn request_window(&mut self, id: PageId, window: u32, cell_distance: u32) {
+        if let Some((mount, unit)) = self.page_key(id) {
             self.streaming
                 .request_unit(mount, unit + 1 + window, cell_distance);
         }
@@ -3057,9 +3076,9 @@ impl Mounts {
 
     /// Requests what page `id` needs to stand where it starts: its records, and on an animated
     /// page the window of its start.
-    pub(crate) fn prefetch_page(&mut self, id: u32, cell_distance: u32) {
+    pub(crate) fn prefetch_page(&mut self, id: PageId, cell_distance: u32) {
         self.request_page(id, cell_distance);
-        let Some(Some(p)) = self.pages.get(id as usize) else {
+        let Some(p) = self.page(id) else {
             return;
         };
         if !p.info.motion_times.is_empty() {
@@ -3073,7 +3092,11 @@ impl Mounts {
     /// models they place, nearer pages first, for the next step.
     pub(crate) fn prefetch_region(&mut self, center: DVec3, radius: f64, cell_log2: u32) {
         let edge = f64::from(1u32 << cell_log2);
-        for id in 0..self.pages.len() as u32 {
+        for slot in 0..self.pages.len() {
+            let id = PageId {
+                slot: slot as u32,
+                generation: self.page_generations[slot],
+            };
             let Some((c, r)) = self.page_sphere(id, cell_log2) else {
                 continue;
             };
@@ -3083,7 +3106,7 @@ impl Mounts {
             }
             let cells = (c.distance(center) / edge) as u32;
             self.prefetch_page(id, cells);
-            let Ok(protos) = self.page_prototypes(PageId(id)) else {
+            let Ok(protos) = self.page_prototypes(id) else {
                 continue;
             };
             for p in protos {
@@ -3257,7 +3280,8 @@ impl Mounts {
                 *slot = Some(Entry::Unmounted);
             }
             Some(Entry::Ready(r)) => {
-                let r = *r;
+                let mut r = *r;
+                self.free_pages(&mut r);
                 for id in r.models.values() {
                     if let Some(e) = emission.get_mut(id.0 as usize) {
                         *e = None;
@@ -3294,7 +3318,18 @@ impl Mounts {
         }
     }
 
-    fn release(&mut self, r: Resident, device: &Device, materials: &MaterialTable) {
+    /// Ends the pages of `r` at once: nothing on the GPU follows a slot, and what a frame in
+    /// flight reads of them lives in the stream pool.
+    fn free_pages(&mut self, r: &mut Resident) {
+        for (_, id) in r.pages.drain() {
+            let slot = id.slot as usize;
+            self.pages[slot] = None;
+            self.page_keys[slot] = None;
+            self.page_generations[slot] += 1;
+        }
+    }
+
+    fn release(&mut self, mut r: Resident, device: &Device, materials: &MaterialTable) {
         for id in r.models.values() {
             self.owners.remove(id);
             self.model_ids.free(id.0, 1);
@@ -3313,10 +3348,7 @@ impl Mounts {
         for id in r.materials.values() {
             materials.free(*id);
         }
-        for id in r.pages.values() {
-            self.pages[id.0 as usize] = None;
-            self.page_keys[id.0 as usize] = None;
-        }
+        self.free_pages(&mut r);
         for t in &r.placed_textures {
             device.free_image_slot_after_submitted(t.index.0);
         }
@@ -3582,6 +3614,7 @@ impl Mounts {
                 None => {
                     self.pages.push(None);
                     self.page_keys.push(None);
+                    self.page_generations.push(0);
                     self.pages.len() - 1
                 }
             };
@@ -3592,8 +3625,12 @@ impl Mounts {
                 bytes: p.bytes,
                 mount,
             });
-            res.pages.insert(p.id, PageId(i as u32));
-            page_entries.push((i as u32, p));
+            let id = PageId {
+                slot: i as u32,
+                generation: self.page_generations[i],
+            };
+            res.pages.insert(p.id, id);
+            page_entries.push((id, p));
         }
         let units = units(
             &meshes,
@@ -3602,8 +3639,8 @@ impl Mounts {
             &res.placed_textures,
             &page_entries,
         )?;
-        for (&(i, _), &unit) in page_entries.iter().zip(&units.page_units) {
-            self.page_keys[i as usize] = Some((mount, unit));
+        for (&(id, _), &unit) in page_entries.iter().zip(&units.page_units) {
+            self.page_keys[id.slot as usize] = Some((mount, unit));
         }
         let neural: Vec<(u32, &NeuralLink)> = res
             .placed_textures

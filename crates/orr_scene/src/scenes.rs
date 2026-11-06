@@ -582,14 +582,7 @@ impl Scenes {
         let frame = self.core.next_frame - 1;
         let core = &mut self.core;
         for page in core.mounts.pages_of(m) {
-            core.land_page(page.0, 0);
-            for scene in core.scenes.iter().flatten() {
-                let cpu = &mut *scene.cpu.lock().unwrap();
-                let motions = cpu.page_motions.iter_mut();
-                motions
-                    .filter(|p| p.page == Some(page))
-                    .for_each(|p| p.page = None);
-            }
+            core.land_page(page, 0);
         }
         let gone = core.mounts.models_of(m);
         core.mounts
@@ -748,7 +741,7 @@ impl Scenes {
     /// Wants the records of instance page `id`, and on an animated page the rows of its start,
     /// resident from the next frame on. Requests last one frame.
     pub fn prefetch_page(&mut self, id: PageId, cell_distance: u32) {
-        self.core.mounts.prefetch_page(id.0, cell_distance);
+        self.core.mounts.prefetch_page(id, cell_distance);
     }
 
     /// Wants the records of every mounted instance page meeting the sphere, and the streamed
@@ -798,7 +791,7 @@ impl Scenes {
 
     /// A resident instance page.
     pub fn page(&self, id: PageId) -> Option<&InstancePage> {
-        self.core.mounts.pages.get(id.0 as usize)?.as_ref()
+        self.core.mounts.page(id)
     }
 
     #[cfg(feature = "testing")]
@@ -1063,7 +1056,7 @@ impl Scenes {
             core.land_page(page, records);
         }
         for (page, window, at) in core.mounts.streaming.take_window_events() {
-            if let Some(Some(p)) = core.mounts.pages.get_mut(page as usize) {
+            if let Some(p) = core.mounts.page_mut(page) {
                 p.windows[window as usize] = at;
             }
         }
@@ -1134,19 +1127,20 @@ impl Core {
     /// step, nearest a focus first, as far as the instance page budget holds them; the others
     /// are left to leave after their hold.
     fn request_pages(&mut self) {
-        let mut wanted: FxHashMap<u32, f64> = FxHashMap::default();
+        let mut wanted: FxHashMap<PageId, f64> = FxHashMap::default();
         let edge = f64::from(1u32 << self.cell_log2);
-        let mut windows: FxHashMap<(u32, u32), f64> = FxHashMap::default();
+        let mut windows: FxHashMap<(PageId, u32), f64> = FxHashMap::default();
         for scene in self.scenes.iter().flatten() {
             let cpu = scene.cpu.lock().unwrap();
             let skinned = cpu.skinned_pages.iter().map(|p| (p.page, p.group));
             for (page, group) in cpu.pages.iter().map(|p| (p.page, p.group)).chain(skinned) {
-                let Some((center, radius)) = self.mounts.page_sphere(page.0, self.cell_log2) else {
+                let Some((center, radius)) = self.mounts.page_sphere(page, self.cell_log2) else {
                     continue;
                 };
                 // The sphere is the rest pose: only the GPU knows where a joint has a page now.
-                let moves = self.mounts.pages[page.0 as usize]
-                    .as_ref()
+                let moves = self
+                    .mounts
+                    .page(page)
                     .is_some_and(|p| !p.info.motion_times.is_empty());
                 let hung = moves
                     || cpu.groups[group.0 as usize]
@@ -1156,16 +1150,15 @@ impl Core {
                     .focus
                     .filter(|_| !hung)
                     .map_or(0.0, |f| (f.distance(center) - radius).max(0.0));
-                let e = wanted.entry(page.0).or_insert(f64::INFINITY);
+                let e = wanted.entry(page).or_insert(f64::INFINITY);
                 *e = e.min(distance / edge);
             }
             for m in &cpu.page_motions {
-                let Some(page) = m.page else { continue };
-                let Some(Some(p)) = self.mounts.pages.get(page.0 as usize) else {
+                let Some(p) = self.mounts.page(m.page) else {
                     continue;
                 };
                 for (window, rank) in m.windows(p.info.header.motion_window) {
-                    let e = windows.entry((page.0, window)).or_insert(f64::INFINITY);
+                    let e = windows.entry((m.page, window)).or_insert(f64::INFINITY);
                     *e = e.min(rank);
                 }
             }
@@ -1175,7 +1168,7 @@ impl Core {
         let rows = windows
             .into_iter()
             .map(|((page, window), rank)| (rank, page, Some(window)));
-        let mut units: Vec<(f64, u32, Option<u32>)> = records.chain(rows).collect();
+        let mut units: Vec<(f64, PageId, Option<u32>)> = records.chain(rows).collect();
         units.sort_by(|a, b| a.0.total_cmp(&b.0).then((a.1, a.2).cmp(&(b.1, b.2))));
         let budget = self.mounts.streaming.instance_page_budget();
         let mut bytes = 0;
@@ -1199,16 +1192,18 @@ impl Core {
     }
 
     /// Points the page groups of `page` in every scene at its records, or hides their copies.
-    fn land_page(&mut self, page: u32, records: u64) {
-        if let Some(Some(p)) = self.mounts.pages.get_mut(page as usize) {
-            // SAFETY: the records stay resident until the event that writes this null.
-            p.records = unsafe { GpuPtr::from_address(GpuAddress(records)) };
-        }
+    /// An event that outlived the page's pack names memory already given back.
+    fn land_page(&mut self, page: PageId, records: u64) {
+        let Some(p) = self.mounts.page_mut(page) else {
+            return;
+        };
+        // SAFETY: the records stay resident until the event that writes this null.
+        p.records = unsafe { GpuPtr::from_address(GpuAddress(records)) };
         for scene in self.scenes.iter().flatten() {
             let mut cpu = scene.cpu.lock().unwrap();
             for g in cpu.groups.iter_mut().flatten() {
                 if let Some(q) = &mut g.page
-                    && q.page.0 == page
+                    && q.page == page
                 {
                     q.records = records;
                     q.changed = true;
@@ -1647,9 +1642,7 @@ impl<'a> Frame<'a> {
                     .as_ref()
                     .and_then(|g| g.page.as_ref())
                     .map_or(0, |g| g.records);
-                let page = m
-                    .page
-                    .and_then(|p| core.mounts.pages[p.0 as usize].as_ref());
+                let page = core.mounts.page(m.page);
                 let row_size = size_of::<orr_pack::instance::MotionRow>() as u64;
                 // The address of interval `k`'s rows, 0 while its window is not resident.
                 let row_at = |k: u32| {

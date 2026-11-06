@@ -4656,6 +4656,54 @@ fn a_page_hung_from_a_joint_follows_its_palette_entry() {
     assert_clean();
 }
 
+/// A copy goes with its pack. The next pack to take its page's slot holds another page, whose
+/// records are no copy's of the old placement, however alike the slot.
+#[test]
+fn a_copy_of_an_unmounted_page_stays_hidden_when_its_slot_is_reused() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let (eye, target) = (DVec3::new(0.5, 0.0, 2.5), DVec3::new(0.5, 0.0, 0.0));
+    let placed = place_hung(&mut w, 0.0);
+    let start = Instant::now();
+    let mut frame = 0;
+    loop {
+        frame += 1;
+        let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+        if frame > 3 && g.ids.iter().any(|&id| id != 0) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the page never landed"
+        );
+    }
+    w.scenes.unmount(w.mount);
+    for _ in 0..6 {
+        frame += 1;
+        let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+        assert!(g.ids.iter().all(|&id| id == 0), "drawn with its pack gone");
+    }
+    let again = w.scenes.mount(PackSource::Memory(Arc::clone(pack())));
+    while matches!(w.scenes.mount_state(again), LoadState::Pending) {
+        frame += 1;
+        shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the mount never landed"
+        );
+    }
+    assert!(matches!(w.scenes.mount_state(again), LoadState::Ready));
+    for _ in 0..12 {
+        frame += 1;
+        let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+        assert!(
+            g.ids.iter().all(|&id| id == 0),
+            "another mount's page drew the old copy"
+        );
+    }
+    assert_clean();
+}
+
 /// An animated page draws and traces where its rows stand at the page's clock, frame after frame
 /// of one placement: the rows move a copy on, a joint above carries it further, and past its last
 /// sample it is gone, to come back when the clock does.
