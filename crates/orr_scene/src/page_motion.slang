@@ -7,7 +7,7 @@ import orr_shaders.math;
 public struct PageMotionRoot
 {
     public SceneRoot* scene;
-    public float* rows;            // null writes nothing there: the page is not resident
+    public float* rows;            // null while nothing resident can pose the page: it hides
     public float4 left0;
     public float4 left1;
     public float4 left2;

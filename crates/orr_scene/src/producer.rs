@@ -23,7 +23,7 @@ use orr_gpu::{
 use crate::material::MaterialId;
 use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
-use crate::scene::{InstanceFlags, TransformGroupId};
+use crate::scene::{InstanceFlags, ModelId, TransformGroupId};
 use crate::shaders::producer_build::{self, BuildRoot, ProducerBuildGpu};
 use crate::shaders::types::{GeneratedClusterGpu, SubdCopyGpu, TessGpu, TessStateGpu};
 use crate::subd::{CageShape, SubdBuild};
@@ -321,6 +321,8 @@ pub(crate) struct Producer {
     pub(crate) tess: Option<EntryTess>,
     /// A subdivision copy's record and its cage's sizes.
     pub(crate) subd: Option<(GpuPtr<SubdCopyGpu>, CageShape)>,
+    /// The model of a subdivision copy, which it reads the cage of every frame.
+    pub(crate) model: Option<ModelId>,
     accel: Option<Accel>,
     /// Held while the entry is set.
     _memory: Allocation<u8>,
@@ -860,6 +862,7 @@ pub(crate) fn build(
                 weld_slots: l.weld_slots,
             }),
             subd: subd.map(|s| (copy_ptr, s.shape)),
+            model: None,
             accel,
             _memory: memory,
         },

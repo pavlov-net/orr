@@ -8311,6 +8311,50 @@ fn skinned_array(g: &Frame, array: GpuPtr<[f32; 3]>) -> Vec<[f32; 3]> {
         .collect()
 }
 
+/// A copy of an edit reads the edit's memory, so it goes with the edit, whether the edit ends by
+/// itself or with its pack.
+#[test]
+fn a_copy_of_an_edit_ends_with_the_edit() {
+    let _serial = serial();
+    let ends: [fn(&mut World, EditId); 2] = [
+        |w, edit| w.scenes.destroy_edit(edit),
+        |w, _| w.scenes.unmount(w.mount),
+    ];
+    for end in ends {
+        let mut w = World::with(&RendererDesc {
+            raster_error_pixels: 4.0,
+            rt_error_pixels: 4.0,
+            ..RendererDesc::default()
+        });
+        let source = w.model("dag ground");
+        let edit = w
+            .scenes
+            .create_edit(&EditDesc {
+                model: source,
+                touched: Some(&[[-2.0, 0.0, -2.0, 1.0]]),
+                bounds: None,
+            })
+            .unwrap();
+        settle_edits(&mut w, &[edit]);
+        let model = w.scenes.edit(edit).unwrap().model;
+        let placed = place_models(&mut w, &[model]);
+        let (eye, target) = (DVec3::new(0.0, 0.5, 0.0), DVec3::new(0.0, 0.0, -14.0));
+        let mut sh = Shot::at(eye, target, 1);
+        let at = Vec3::new(0.0, 0.0, -14.0);
+        let linear = Mat3::from_rotation_x(1.1);
+        sh.moved = vec![(0, Affine3::from_mat3_translation(linear, at))];
+        let g = shoot(&mut w, &placed, &sh);
+        assert!(g.ids.iter().any(|&id| id != 0), "the copy never drew");
+        end(&mut w, edit);
+        let g = shoot(&mut w, &placed, &Shot::at(eye, target, 2));
+        assert!(
+            g.ids.iter().all(|&id| id == 0),
+            "the copy outlived its edit"
+        );
+        assert_clean();
+    }
+}
+
 #[test]
 fn a_partial_edit_holds_what_it_touches_at_level_0_and_the_rest_keeps_its_detail() {
     let _serial = serial();

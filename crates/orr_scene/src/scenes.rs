@@ -577,9 +577,9 @@ impl Scenes {
     }
 
     /// Unmounts a pack. A pending mount stops loading; a ready one's memory is freed once
-    /// every frame submitted so far has completed. Copies of its models in every scene are
-    /// gone from the next frame, placed by hand or on pages, and their [`InstanceRange`]s stay
-    /// the consumer's to remove.
+    /// every frame submitted so far has completed. Copies of its models and their edits in every
+    /// scene are gone from the next frame, placed by hand, on pages or as subdivision copies, and
+    /// their [`InstanceRange`]s and producer entries stay the consumer's.
     pub fn unmount(&mut self, m: MountId) {
         let frame = self.core.next_frame - 1;
         let core = &mut self.core;
@@ -631,11 +631,18 @@ impl Scenes {
         self.core.mounts.edit(id)
     }
 
-    /// Ends an edit. Its copies must be removed first; its memory is freed once every frame
+    /// Ends an edit. Its copies in every scene are gone from the next frame, and their
+    /// [`InstanceRange`]s stay the consumer's to remove; its memory is freed once every frame
     /// submitted so far has completed.
     pub fn destroy_edit(&mut self, id: EditId) {
         let frame = self.core.next_frame - 1;
         let core = &mut self.core;
+        if let Some(model) = core.mounts.edit_model(id) {
+            let gone = FxHashSet::from_iter([model.0]);
+            for scene in core.scenes.iter().flatten() {
+                scene.empty_copies(&gone, |_| false, frame, &core.seq);
+            }
+        }
         core.mounts
             .destroy_edit(id, frame, &mut core.models, &mut core.cages);
     }

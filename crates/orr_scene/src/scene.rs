@@ -758,6 +758,52 @@ impl Scene {
             self.empty_slots(cpu, r, frame, seq.fetch_add(1, Ordering::Relaxed));
             cpu.ptlas.touch(r.first, r.count);
         }
+        for i in 0..cpu.producers.len() {
+            let held = cpu.producers[i].as_ref().and_then(|p| p.model);
+            if held.is_some_and(|m| gone.contains(&m.0)) {
+                self.end_producer(cpu, i, frame, seq.fetch_add(1, Ordering::Relaxed));
+            }
+        }
+    }
+
+    /// Clears producer entry `i` as `SceneWriter::set_producer` with nothing does, between frames.
+    fn end_producer(&self, cpu: &mut SceneCpu, i: usize, frame: u64, seq: u64) {
+        let t = &self.tables;
+        let at = i as u64;
+        let state = t.producer_state.gpu().offset(at).address().0;
+        let blas = std::mem::offset_of!(ProducerStateGpu, blas) as u64;
+        let clusters = std::mem::offset_of!(ProducerStateGpu, clusters) as u64;
+        let zeroed = [
+            (
+                t.producers.gpu().offset(at).address().0,
+                words(size_of::<ProducerGpu>()),
+            ),
+            (
+                t.batches.gpu().offset(at).address().0,
+                words(size_of::<ProducerBatch>()),
+            ),
+            (
+                t.patches.gpu().offset(at).address().0,
+                words(size_of::<ProducerBatch>()),
+            ),
+            (
+                t.tess_state.gpu().offset(at).address().0,
+                words(size_of::<TessStateGpu>()),
+            ),
+            (
+                t.emissive.gpu().offset(at).address().0,
+                words(size_of::<EmissiveGpu>()),
+            ),
+            (t.producer_counts.gpu().offset(at).address().0, 4),
+            (state + blas, 2),
+            (state + clusters, 1),
+        ];
+        for (dst, n) in zeroed {
+            cpu.records.push(Record::fill(seq, dst, n, 0));
+        }
+        if let Some(old) = cpu.producers[i].take() {
+            cpu.retired.push((frame, old));
+        }
     }
 
     pub(crate) fn new(device: &Device, desc: &SceneDesc) -> Result<Self> {
@@ -1907,8 +1953,9 @@ impl<'f> SceneWriter<'f> {
     /// extraordinary vertices and creases were refined to the cage's isolation level when
     /// it cooked; each patch dices like any other. The copy takes the opacity of the cage
     /// sections' own materials; a cage that mixes dielectric or presence materials with
-    /// others fails with [`Error::MixedClasses`]. Its cage stays valid until its pack is
-    /// unmounted. Panics with materials for another section count, or a palette for a cage
+    /// others fails with [`Error::MixedClasses`]. The copy ends with its model's pack or edit,
+    /// and `id` stays the consumer's. Panics with materials for another section count, or a
+    /// palette for a cage
     /// without skin or a model without a skeleton.
     pub fn set_subd(&mut self, id: ProducerId, desc: Option<&SubdDesc<'_>>) -> Result<()> {
         let Some(d) = desc else {
@@ -1953,7 +2000,12 @@ impl<'f> SceneWriter<'f> {
             shape: cage.shape,
             palette: d.palette.map(|(g, first)| (g.0, first, joints)),
         };
-        self.set_entry(id, Some(&producer), Some(&build))
+        self.set_entry(id, Some(&producer), Some(&build))?;
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        if let Some(p) = &mut cpu.producers[id.0 as usize] {
+            p.model = Some(d.model);
+        }
+        Ok(())
     }
 
     fn set_entry(

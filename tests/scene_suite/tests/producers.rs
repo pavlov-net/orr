@@ -2263,6 +2263,45 @@ const SHARP: f32 = 0.01;
 /// at the corner).
 const CORNER_REACH: f32 = 0.25;
 
+/// A subdivision copy reads its cage every frame, so it ends with its pack; its entry stays the
+/// consumer's to clear or set again.
+#[test]
+fn a_subdivision_copy_ends_with_its_pack() {
+    let mut s = CageScene::new(1.5);
+    let model = s.model("cages");
+    let (eye, target) = (Vec3::new(-3.6, 1.4, 1.6), Vec3::new(0.0, 0.0, -1.0));
+    s.frame(
+        |w| {
+            let group = w
+                .create_transform_group(&TransformGroupDesc {
+                    count: 1,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::ZERO,
+                })
+                .unwrap();
+            w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+            let desc = SubdDesc {
+                model,
+                transform: (group, 0),
+                max_clusters: 8192,
+                max_vertices: 8192 * 78,
+                ..SubdDesc::default()
+            };
+            w.set_subd(SMOOTH, Some(&desc)).unwrap();
+        },
+        eye,
+        target,
+        eye,
+    );
+    s.frame(|_| {}, eye, target, eye);
+    assert_eq!(s.stats().entries, 1);
+    s.scenes.unmount(s.mount);
+    s.frame(|_| {}, eye, target, eye);
+    assert_eq!(s.stats().entries, 0, "the copy outlived its cage");
+    s.frame(|w| w.set_subd(SMOOTH, None).unwrap(), eye, target, eye);
+    assert_clean();
+}
+
 #[test]
 fn subdivision_cages_dice_closed_at_mixed_rates_on_their_limit_surface_in_raster_and_rays() {
     let mut s = CageScene::new(1.5);

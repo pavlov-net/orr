@@ -3231,11 +3231,22 @@ impl Mounts {
         }
     }
 
-    /// The models of ready mount `m`; none for other mounts.
+    /// The models of ready mount `m`, and of the edits of its meshes; none for other mounts.
     pub(crate) fn models_of(&self, m: MountId) -> Vec<ModelId> {
-        self.resident(m)
-            .map(|r| r.models.values().copied().collect())
-            .unwrap_or_default()
+        let own = self.resident(m).map(|r| r.models.values().copied());
+        let edited = self.edits.iter().flatten().filter_map(|e| match e {
+            EditEntry::Live(e) if e.mount == m => Some(e.model),
+            _ => None,
+        });
+        own.into_iter().flatten().chain(edited).collect()
+    }
+
+    /// The model of live edit `id`.
+    pub(crate) fn edit_model(&self, id: EditId) -> Option<ModelId> {
+        match self.edits.get(id.0 as usize)? {
+            Some(EditEntry::Live(e)) => Some(e.model),
+            _ => None,
+        }
     }
 
     pub(crate) fn lookup<T: Clone>(
