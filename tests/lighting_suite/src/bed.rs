@@ -274,6 +274,8 @@ pub const LIGHT_FLOOR: &str = "light floor";
 /// A smooth glass slab 1.6 x [`SLAB_THICKNESS`] x 1 m around its origin (IOR 1.5) whose
 /// interior transmits half the light over its thickness.
 pub const TINTED_SLAB: &str = "tinted slab";
+/// [`TINTED_SLAB`], double-sided.
+pub const TWO_SIDED_SLAB: &str = "two-sided slab";
 pub const SLAB_THICKNESS: f32 = 0.3;
 /// [`TINTED_SLAB`] with specular roughness 0.3.
 pub const ROUGH_SLAB: &str = "rough slab";
@@ -837,6 +839,10 @@ fn cook() -> Arc<[u8]> {
         transmission_depth: SLAB_THICKNESS,
         ..glass
     };
+    let two_sided = Material {
+        double_sided: 1,
+        ..tinted
+    };
     let rough = Material {
         specular_roughness: 0.3,
         ..tinted
@@ -1031,6 +1037,11 @@ fn cook() -> Arc<[u8]> {
                     TINTED_SLAB,
                     mesh(|b| b.cuboid(0, Vec3::new(0.8, SLAB_THICKNESS * 0.5, 0.5))),
                     vec![tinted],
+                ),
+                model(
+                    TWO_SIDED_SLAB,
+                    mesh(|b| b.cuboid(0, Vec3::new(0.8, SLAB_THICKNESS * 0.5, 0.5))),
+                    vec![two_sided],
                 ),
                 model(
                     ROUGH_SLAB,

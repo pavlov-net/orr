@@ -50,6 +50,7 @@ public struct SurfaceInput
     public uint surface;            // linked surface id; 0 = StandardSurface
     public UvFootprint uv[2];       // per uv set; producer and patch geometry give both its one uv
     public float3 geometric_normal; // the triangle's front face
+    public bool back_face;          // the ray met the back of a double-sided material
     public float3 normal;           // interpolated vertex normal, unit
     public float3 frame_normal;     // `normal` before normalizing, not always unit
     public float4 tangent;          // xyz as interpolated, not always unit; w bitangent sign

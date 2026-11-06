@@ -127,6 +127,9 @@ pub struct Material {
     /// Nonzero: the displacement fields are world lengths along the world normal, whatever scale
     /// places the mesh, not mesh space lengths that scale with it.
     pub displacement_world: u8,
+    /// The material of the surface's back, double-sided as this one is; [`AssetId::NONE`] where
+    /// both sides read this one.
+    pub back: AssetId,
     /// Indexed by the `slot` constants.
     pub textures: [TextureBinding; slot::COUNT],
     /// Per slot, the affine map from mesh uv to the uv its texture is sampled at, stored
@@ -315,6 +318,7 @@ impl Default for Material {
             model: Self::MODEL_OPENPBR,
             object_normals: 0,
             displacement_world: 0,
+            back: AssetId::NONE,
             textures: [TextureBinding::zeroed(); slot::COUNT],
             uv_transforms: [[0.0; 6]; slot::COUNT],
         }

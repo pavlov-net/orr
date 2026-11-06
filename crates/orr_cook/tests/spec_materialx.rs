@@ -1914,8 +1914,10 @@ fn an_object_space_normalmap_keeps_its_three_channels() {
     assert_eq!(info.header.mip_size(0), [4, 4]);
 }
 
+/// Spec: "the name of the surfaceshader node to be used for the back surface of an object, if the
+/// geometry is two-sided".
 #[test]
-fn inputs_not_yet_honored_warn() {
+fn a_backsurfaceshader_is_a_material_of_the_back() {
     let d = fixture();
     let doc = d.join("back.mtlx");
     std::fs::write(
@@ -1923,7 +1925,9 @@ fn inputs_not_yet_honored_warn() {
         r#"<?xml version="1.0"?>
 <materialx version="1.39">
   <open_pbr_surface name="F" type="surfaceshader"/>
-  <open_pbr_surface name="B" type="surfaceshader"/>
+  <open_pbr_surface name="B" type="surfaceshader">
+    <input name="base_color" type="color3" value="0.25, 0.5, 0.75"/>
+  </open_pbr_surface>
   <surfacematerial name="M" type="material">
     <input name="surfaceshader" type="surfaceshader" nodename="F"/>
     <input name="backsurfaceshader" type="surfaceshader" nodename="B"/>
@@ -1936,17 +1940,22 @@ fn inputs_not_yet_honored_warn() {
 "#,
     )
     .unwrap();
-    let (_, report) = cook(&doc, "M").unwrap();
-    assert!(
-        report.assets[0]
-            .warnings
-            .iter()
-            .any(|w| w.contains("backsurfaceshader")),
-        "{:?}",
-        report.assets[0].warnings
-    );
-    let (_, report) = cook(&doc, "Same").unwrap();
+    let (a, report) = cook(&doc, "M").unwrap();
     assert!(report.assets[0].warnings.is_empty());
+    let front = material(&a);
+    assert_eq!(front.double_sided, 1);
+    assert_eq!(front.base_color, Material::default().base_color);
+    assert_eq!(front.back, AssetId::from_name("u/material/back"));
+    let e = a.find(front.back).expect("the back's material");
+    let mut v = vec![0; a.blobs(e)[0].raw_len as usize];
+    a.read(&a.blobs(e)[0], &mut v).unwrap();
+    let back = Material::from_bytes(&v).unwrap();
+    assert_eq!(back.base_color, [0.25, 0.5, 0.75]);
+    assert_eq!(back.double_sided, 1);
+
+    let (a, _) = cook(&doc, "Same").unwrap();
+    assert_eq!(material(&a).back, AssetId::NONE);
+    assert_eq!(material(&a).double_sided, 0);
 }
 
 #[test]

@@ -40,6 +40,10 @@ public static const uint MATERIAL_OBJECT_NORMAL = 1 << 25;
 public static const uint MATERIAL_OBJECT_COAT_NORMAL = 1 << 26;
 // Displacement fields are world lengths along the world normal, not mesh space lengths.
 public static const uint MATERIAL_DISPLACEMENT_WORLD = 1 << 27;
+// `MaterialGpu.back` is the material of the surface's back.
+public static const uint MATERIAL_HAS_BACK = 1 << 28;
+// It is the back of the material `MaterialGpu.back`.
+public static const uint MATERIAL_BACK_SIDE = 1 << 29;
 // The base color tints what passes through the surface.
 public static const uint MATERIAL_BASE_TINT = 1 << 23;
 // It binds a slot past TEXTURE_TRANSMISSION, which hits on other materials don't look at.
@@ -208,8 +212,10 @@ public struct MaterialGpu
     public TextureSamplerGpu samplers[TEXTURE_SLOTS];
     public uint surface;                    // linked surface id; 0 = StandardSurface
     public uint tangent_set;                // the uv set its tangent frame follows; TANGENT_SET_OTHER: neither
+    public uint back;                       // with MATERIAL_HAS_BACK or MATERIAL_BACK_SIDE, the material of the other side
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
+    public uint _pad0;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
     public uint* tiles[TEXTURE_SLOTS];                  // per slot of TEXTURE_TILED, its table: `texture_tile`

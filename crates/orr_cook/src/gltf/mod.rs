@@ -809,6 +809,7 @@ impl Imported<'_> {
             self.materials.insert(
                 index,
                 SceneMaterial {
+                    back: None,
                     suffix: match index {
                         usize::MAX => "default".to_string(),
                         i => i.to_string(),

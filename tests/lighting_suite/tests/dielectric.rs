@@ -12,8 +12,8 @@ use lighting_suite::bed::{
     LINE_HALF_HEIGHT, LINE_HALF_WIDTH, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, OverlayFrontLayer,
     PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR,
     Particle, ParticleLook, Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec,
-    TINTED_SLAB, WATER_BOX, assert_close, fresnel, image_mean, prism_corners, reference,
-    surface_mean, water_transmission,
+    TINTED_SLAB, TWO_SIDED_SLAB, WATER_BOX, assert_close, fresnel, image_mean, prism_corners,
+    reference, surface_mean, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -243,22 +243,25 @@ fn the_interior_list_keeps_nested_media_innermost_last() {
 }
 
 /// A tinted slab over an emitter, seen straight down: Fresnel at both faces and Beer's law
-/// over the thickness, its internal reflections included.
+/// over the thickness, its internal reflections included. A double-sided slab has the same
+/// interior, which a ray leaves at its back faces.
 #[test]
 fn a_slab_transmits_its_beer_law_share_between_two_fresnel_faces() {
-    let spec = from_above(
-        vec![
-            at(LIGHT_FLOOR, Vec3::ZERO),
-            at(TINTED_SLAB, Vec3::new(0.0, 0.5, 0.0)),
-        ],
-        Vec::new(),
-        3.0,
-    );
-    let image = render_paths(&mut Bed::with(spec), &paths(reference(2)), 32);
     let (f, t) = (fresnel(1.5, 1.0), 0.5);
     let through = (1.0 - f) * (1.0 - f) * t / (1.0 - f * f * t * t);
     let l = f64::from(EMITTER_LUMINANCE) * through;
-    assert_close("slab", center(&image, 8), [l; 3], 0.015);
+    for slab in [TINTED_SLAB, TWO_SIDED_SLAB] {
+        let spec = from_above(
+            vec![
+                at(LIGHT_FLOOR, Vec3::ZERO),
+                at(slab, Vec3::new(0.0, 0.5, 0.0)),
+            ],
+            Vec::new(),
+            3.0,
+        );
+        let image = render_paths(&mut Bed::with(spec), &paths(reference(2)), 32);
+        assert_close(slab, center(&image, 8), [l; 3], 0.015);
+    }
     assert_clean();
 }
 

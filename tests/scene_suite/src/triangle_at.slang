@@ -5,8 +5,9 @@ import orr_scene.hit;
 
 struct Root
 {
-    MaterialGpu* material;
-    float4* out;              // the vertex color, then the geometric and vertex normals
+    SceneRoot* scene;
+    float4* out;              // the vertex color, the geometric and vertex normals, the side's material
+    float4 view;              // the ray's direction, then the section's material
     float4 color0;
     float4 color1;
     float4 color2;
@@ -30,8 +31,10 @@ void main()
     float size = root.point.z;
     pl.linear = float3x3(-size, 0.0, 0.0, 0.0, size, 0.0, 0.0, 0.0, size);
     SurfaceInput i = (SurfaceInput)0;
-    triangle_geometry(i, t, 0, root.material, pl, root.point.xy, float2(0.0), float2(0.0), float3(0.0, 0.0, -1.0), 1.0);
+    uint material = uint(root.view.w);
+    triangle_geometry(i, t, 0, root.scene, material, pl, root.point.xy, float2(0.0), float2(0.0), root.view.xyz, 1.0);
     root.out[0] = i.vertex_color;
     root.out[1] = float4(i.geometric_normal, 0.0);
     root.out[2] = float4(i.normal, 0.0);
+    root.out[3] = float4(float(side_material(root.scene, material, i)), 0.0, 0.0, 0.0);
 }

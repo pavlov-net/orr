@@ -1782,6 +1782,10 @@ fn plan_scene(
     for m in &src.materials {
         let mut cooked = m.material;
         packer.material(&m.suffix, &mut cooked, &m.textures)?;
+        if let Some(back) = m.back {
+            let back = material_name(name, &src.materials[back].suffix);
+            cooked.back = AssetId::from_name(&back);
+        }
         let unit = material_unit(material_name(name, &m.suffix), &cooked);
         materials.push((AssetId::from_name(&unit.name), unit.key, cooked));
         units.push(unit);

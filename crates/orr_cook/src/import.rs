@@ -95,6 +95,8 @@ pub(crate) struct SceneMaterial {
     pub(crate) suffix: String,
     pub(crate) material: Material,
     pub(crate) textures: MaterialTextures,
+    /// The index among the scene's materials of its back.
+    pub(crate) back: Option<usize>,
 }
 
 impl SceneMaterial {

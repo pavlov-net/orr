@@ -7909,7 +7909,8 @@ fn models_state_their_specular_and_tint() {
 
 /// A hit's vertex color weighs each corner by its barycentric, and its normals stay on the side
 /// a mirrored placement puts them, at sizes whose determinant is outside a float's range and on
-/// triangles whose area is.
+/// triangles whose area is. A ray from behind a double-sided material meets the normals turned
+/// toward it, but for a dielectric's, and the material of the back.
 #[test]
 fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
     use orr_pack::material::slot;
@@ -7922,8 +7923,30 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         a.as_mut_slice().unwrap().copy_from_slice(bytes);
         a
     };
-    let record = MaterialGpu::new(&Material::default(), &[BoundTexture::NONE; slot::COUNT]);
-    let material = upload(bytemuck::bytes_of(&record), "material");
+    let two_sided = Material {
+        double_sided: 1,
+        ..Material::default()
+    };
+    let mut front = MaterialGpu::new(&two_sided, &[BoundTexture::NONE; slot::COUNT]);
+    front.flags |= orr_scene::material_flags::HAS_BACK;
+    front.back = 1;
+    let mut back = front;
+    back.flags ^= orr_scene::material_flags::HAS_BACK | orr_scene::material_flags::BACK_SIDE;
+    back.back = 0;
+    let glass = |mut m: MaterialGpu| {
+        m.flags |= orr_scene::material_flags::DIELECTRIC;
+        m.back += 2;
+        m
+    };
+    let records = [front, back, glass(front), glass(back)];
+    let materials = upload(bytemuck::cast_slice(&records), "materials");
+    let scene = upload(
+        bytemuck::bytes_of(&SceneRoot {
+            materials: materials.gpu().cast(),
+            ..bytemuck::Zeroable::zeroed()
+        }),
+        "scene",
+    );
     let corners = [
         [1.0, 0.0, 0.0, 0.25],
         [0.0, 1.0, 0.0, 0.5],
@@ -7931,19 +7954,23 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
     ];
     let p = pipeline(&triangle_at::MODULE, "main");
     let render = d.queue(QueueKind::Render).unwrap();
-    for (size, edge) in [
-        (1.0, 1.0),
-        (1e-16, 1.0),
-        (1e-25, 1.0),
-        (1e25, 1.0),
-        (1e12, 1e-12),
+    for (size, edge, side, first) in [
+        (1.0, 1.0, 1.0, 0),
+        (1e-16, 1.0, 1.0, 0),
+        (1e-25, 1.0, 1.0, 0),
+        (1e25, 1.0, 1.0, 0),
+        (1e12, 1e-12, 1.0, 0),
+        (1.0, 1.0, -1.0, 0),
+        (1e-16, 1.0, -1.0, 0),
+        (1.0, 1.0, -1.0, 2),
     ] {
         let out = d
-            .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, 3, "out")
+            .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, 4, "out")
             .unwrap();
         let root = upload(
             bytemuck::bytes_of(&triangle_at::Root {
-                material: material.gpu().cast(),
+                scene: scene.gpu().cast(),
+                view: [0.0, 0.0, -side, first as f32],
                 out: out.gpu().cast(),
                 color0: corners[0],
                 color1: corners[1],
@@ -7956,13 +7983,16 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         list.dispatch(&p, root.gpu().cast::<triangle_at::Root>(), [1, 1, 1]);
         list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
         wait(render.submit(vec![list], &[]).unwrap());
-        let [color, geometric, normal] = out.as_slice().unwrap()[..] else {
-            panic!("three rows");
+        let [color, geometric, normal, material] = out.as_slice().unwrap()[..] else {
+            panic!("four rows");
         };
         assert_eq!(color, [0.25, 0.25, 0.5, 0.6875], "{size}");
-        let up = |n: [f32; 4]| Vec4::from(n).abs_diff_eq(Vec4::Z, 1e-5);
+        let turned = if first == 0 { side } else { 1.0 };
+        let up = |n: [f32; 4]| Vec4::from(n).abs_diff_eq(Vec4::Z * turned, 1e-5);
         assert!(up(geometric), "{size}: {geometric:?}");
         assert!(up(normal), "{size}: {normal:?}");
+        let shown = first + u32::from(side < 0.0);
+        assert_eq!(material[0], shown as f32, "{size}");
     }
     assert_clean();
 }

@@ -389,7 +389,6 @@ float strand_ray(ProducerBatch b, Placement pl, float3 d, inout uint segment)
 // (`strand_ray`); the input is a strand hit's (`strand_geometry`).
 public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc, uint triangle, float2 pixel_center)
 {
-    MaterialGpu* m = s.materials + vc.material;
     PrimaryHit hit = (PrimaryHit)0;
     SurfaceInput i = (SurfaceInput)0;
     visible_placement(s, v, vc, false, hit.placement);
@@ -447,7 +446,7 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
         float3 b = ray_barycentrics(d, q0, e1, e2);
         float2 bx = ray_barycentrics(dx, q0, e1, e2).xy - b.xy;
         float2 by = ray_barycentrics(dy, q0, e1, e2).xy - b.xy;
-        triangle_geometry(i, c, attributes, m, pl, b.xy, bx, by, d, bias);
+        triangle_geometry(i, c, attributes, s, vc.material, pl, b.xy, bx, by, d, bias);
         hit.distance = b.z;
         hit.object = (1.0 - b.x - b.y) * c.position[0] + b.x * c.position[1] + b.y * c.position[2];
         i.cluster = vc.cluster;
@@ -465,7 +464,8 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     i.context.tap = texture_tap(v, uint2(pixel_center) / 2, v.frame_index, 0, 0);
     i.uv[0].tap = i.uv[1].tap = i.context.tap;
     i.instance = vc.instance;
-    i.material = vc.material;
+    i.material = side_material(s, vc.material, i);
+    MaterialGpu* m = s.materials + i.material;
     i.surface = m.surface;
     i.position = hit.relative + v.eye_render.xyz;
     world_cell(v.eye_cell.xyz, v.eye_offset.xyz, hit.relative, uint(v.eye_cell.w), i.cell, i.offset);

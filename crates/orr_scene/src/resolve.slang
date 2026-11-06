@@ -35,6 +35,12 @@ uint surface_bin(RasterGpu* r, uint surface)
     return surface < r.bins ? surface : 0;
 }
 
+// The bin of the back of `m`, which a pixel's hit may turn out to show; that of `m` without one.
+uint back_bin(SceneRoot* s, RasterGpu* r, MaterialGpu* m)
+{
+    return surface_bin(r, (m.flags & MATERIAL_HAS_BACK) != 0 ? s.materials[m.back].surface : m.surface);
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void classify(uint group: SV_GroupID, uint t: SV_GroupThreadID)
@@ -64,6 +70,8 @@ void classify(uint group: SV_GroupID, uint t: SV_GroupThreadID)
         {
             MaterialGpu* m = s.materials + r.gbuffer.clusters[visibility_cluster(w)].material;
             uint bin = surface_bin(r, m.surface);
+            InterlockedOr(bins_used[bin >> 5], 1u << (bin & 31));
+            bin = back_bin(s, r, m);
             InterlockedOr(bins_used[bin >> 5], 1u << (bin & 31));
         }
     }
@@ -118,10 +126,13 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
         return;
     VisibleCluster vc = r.gbuffer.clusters[visibility_cluster(w)];
     MaterialGpu* m = s.materials + vc.material;
-    if (surface_bin(r, m.surface) != bin)
+    if (surface_bin(r, m.surface) != bin && back_bin(s, r, m) != bin)
         return;
 
     PrimaryHit hit = primary_hit(s, v, vc, visibility_triangle(w), float2(pixel) + 0.5);
+    m = s.materials + hit.input.material;
+    if (surface_bin(r, m.surface) != bin)
+        return;
     material_prepare(m, hit.input.uv);
     float offset = 0.0;
     GSurface g = Surface.surface(hit.input, offset);
@@ -134,7 +145,7 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     g.instance = vc.instance;
     g.cluster = hit.input.cluster;
     g.primitive = hit.input.primitive;
-    g.material = vc.material;
+    g.material = hit.input.material;
     ExposureState* exposure = v.exposure + v.exposure_slot;
     g.bsdf.emission = apply_hdr_ceiling(g.bsdf.emission * exposure.pre_exposure);
 

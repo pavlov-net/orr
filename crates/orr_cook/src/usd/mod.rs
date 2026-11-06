@@ -1720,6 +1720,7 @@ impl<'s> Importer<'s> {
             suffix,
             material: mapped.material,
             textures: mapped.textures,
+            back: None,
         });
         self.frames.push(frame);
         let m = self.materials.len() - 1;

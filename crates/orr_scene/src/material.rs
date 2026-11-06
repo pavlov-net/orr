@@ -52,6 +52,10 @@ pub mod material_flags {
     pub const OBJECT_NORMAL: u32 = 1 << 25;
     pub const OBJECT_COAT_NORMAL: u32 = 1 << 26;
     pub const DISPLACEMENT_WORLD: u32 = 1 << 27;
+    /// `MaterialGpu::back` is the material of the surface's back.
+    pub const HAS_BACK: u32 = 1 << 28;
+    /// It is the back of the material `MaterialGpu::back`.
+    pub const BACK_SIDE: u32 = 1 << 29;
 }
 
 /// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
@@ -262,6 +266,8 @@ impl MaterialGpu {
             tangent_set: u32::from(m.tangent_set()),
             transmission_dispersion_scale: m.transmission_dispersion_scale,
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
+            back: 0,
+            _pad0: 0,
             data: 0,
             texture_streams: GpuPtr::NULL,
             tiles: textures.map(|t| t.tiles),

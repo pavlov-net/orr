@@ -374,7 +374,7 @@ public float dispersed_material_ior(SceneRoot* s, uint m, float ior, float nm)
 // Whether layer vertex `l`, reached with `interior`, has a dispersive side.
 public bool layer_disperses(SceneRoot* s, LayerVertex l, Interior interior)
 {
-    uint m = l.x.surface.material;
+    uint m = interior_material(s, l.x.surface.material);
     return l.kind == VERTEX_LAYER && (disperses(s, m) || disperses(s, interior.outside(m, m)));
 }
 
@@ -386,7 +386,7 @@ public bool layer_disperses(SceneRoot* s, LayerVertex l, Interior interior)
 public Bsdf prepare_vertex(SceneRoot* s, LayerVertex l, Interior interior, uint depth, bool walks = true, float nm = 0.0)
 {
     BsdfParams p = walk_params(vertex_params(l, depth), walks);
-    uint m = l.x.surface.material;
+    uint m = interior_material(s, l.x.surface.material);
     bool layer = l.kind == VERTEX_LAYER;
     uint outside = layer ? interior.outside(m, m) : interior.innermost();
     float exterior = interior_ior(s, outside);
@@ -487,7 +487,7 @@ public LayerShadow<S, M> vertex_shadow<S : ISurface, M : IMedium>(PathRoot r, La
     shadow.normal = float3(0.0);
     if (l.kind == VERTEX_LAYER)
     {
-        uint m = l.x.surface.material;
+        uint m = interior_material(r.scene, l.x.surface.material);
         uint out = interior.outside(m, m);
         shadow.normal = l.x.surface.geometric_normal;
         shadow.above = out;
@@ -780,10 +780,11 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             {
                 if (crossed)
                 {
-                    interior.cross(l.x.surface.material, l.front);
+                    uint inside = interior_material(s, l.x.surface.material);
+                    interior.cross(inside, l.front);
                     if (l.front)
                     {
-                        entered = l.x.surface.material;
+                        entered = inside;
                         entered_at = l.x.surface.position;
                         entered_normal = l.x.surface.geometric_normal;
                     }
@@ -996,7 +997,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             continue;
         }
         cone = cone_after_hit(cone, t, 0.0);
-        bool front = dot(sh.surface.geometric_normal, ray.dir) < 0.0;
+        bool front = sh.back_face || dot(sh.surface.geometric_normal, ray.dir) < 0.0;
         bool layer = is_layer(h);
         if (layer)
         {
@@ -1063,7 +1064,7 @@ public bool layer_refraction(SceneRoot* s, LayerVertex l, Interior interior, flo
     out_dir = dir;
     if (thin_walled(l.x.surface))
         return true;
-    uint m = l.x.surface.material;
+    uint m = interior_material(s, l.x.surface.material);
     float outer = interior_ior(s, interior.outside(m, m));
     float inner = interior_ior(s, m);
     float3 n = l.front ? l.x.surface.normal : -l.x.surface.normal;
@@ -1132,7 +1133,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
     if (!open)
         through = float3(0.0);
     else if (!thin_walled(x.x.surface))
-        list.cross(x.x.surface.material, x.front);
+        list.cross(interior_material(s, x.x.surface.material), x.front);
     float length_so_far = 0.0;
     // What the chain's interiors scatter, which shows in their single-scattering color.
     float3 scattered = float3(0.0);
@@ -1179,7 +1180,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
         }
         blur += rough_widening(x, length_so_far);
         if (!thin_walled(x.x.surface))
-            list.cross(x.x.surface.material, x.front);
+            list.cross(interior_material(s, x.x.surface.material), x.front);
     }
     float wr = luminance_rec2020(a.specular + a.diffuse + scattered);
     float wt = luminance_rec2020(through);
@@ -1351,7 +1352,7 @@ public void dielectric_body<C : ICoherence, S : ISurface, E : IEnvironment, M : 
         }
         path = sh.valid;
         layers = 1;
-        if (path && r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE && l.front)
+        if (path && r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE && (l.front || sh.back_face))
             radiance += throughput * emission;
     }
     else if (surface)

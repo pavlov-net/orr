@@ -1482,7 +1482,7 @@ struct Resolved {
     source: Arc<BlobSource>,
     blocks: Vec<Allocation<u8>>,
     textures: Vec<PlacedTexture>,
-    materials: Vec<(AssetId, MaterialGpu)>,
+    materials: Vec<ResolvedMaterial>,
     meshes: Vec<ResolvedMesh>,
     models: Vec<ResolvedModel>,
     pages: Vec<PlacedPage>,
@@ -1549,14 +1549,28 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                     };
                 }
             }
-            Ok((*id, MaterialGpu::new(m, &bound)))
+            Ok((*id, MaterialGpu::new(m, &bound), m.back))
         })
         .collect::<Result<Vec<_>>>()?;
     let material_index: HashMap<AssetId, usize> = materials
         .iter()
         .enumerate()
-        .map(|(i, (id, _))| (*id, i))
+        .map(|(i, (id, ..))| (*id, i))
         .collect();
+    let materials: Vec<ResolvedMaterial> = materials
+        .into_iter()
+        .map(|(id, m, back)| {
+            let back = (back != AssetId::NONE)
+                .then(|| {
+                    material_index
+                        .get(&back)
+                        .copied()
+                        .ok_or_else(|| missing(back))
+                })
+                .transpose()?;
+            Ok((id, m, back))
+        })
+        .collect::<Result<_>>()?;
     let meshes: Vec<ResolvedMesh> = p
         .meshes
         .into_iter()
@@ -1771,7 +1785,9 @@ fn build_accel(
         let sections = r.meshes[mesh].sections as usize;
         for (section, &mi) in model.materials.iter().take(sections).enumerate() {
             let m = &r.materials[mi].1;
-            let layered = m.flags & (material_flags::DIELECTRIC | material_flags::PRESENCE) != 0;
+            let layered = side_flags(&r.materials, mi)
+                .iter()
+                .any(|f| f & (material_flags::DIELECTRIC | material_flags::PRESENCE) != 0);
             if layered || (m.surface != 0 && m.flags & material_flags::ALPHA_TESTED != 0) {
                 non_opaque[mesh][section] = true;
             }
@@ -2175,8 +2191,21 @@ impl Apply<'_> {
     }
 }
 
+/// A material, its record, and the index among the pack's materials of its back.
+type ResolvedMaterial = (AssetId, MaterialGpu, Option<usize>);
+
+/// The flags of both sides of material `k`: rays take a surface by its class before they know
+/// the side they meet.
+fn side_flags(materials: &[ResolvedMaterial], k: usize) -> [u32; 2] {
+    let (_, front, back) = &materials[k];
+    [
+        front.flags,
+        back.map_or(front.flags, |b| materials[b].1.flags),
+    ]
+}
+
 type ResolvedTables = (
-    Vec<(AssetId, MaterialGpu)>,
+    Vec<ResolvedMaterial>,
     Vec<ResolvedMesh>,
     Vec<ResolvedModel>,
     Vec<PlacedPage>,
@@ -3330,10 +3359,21 @@ impl Mounts {
         w: &mut Apply<'_>,
     ) -> Result<()> {
         let mut material_ids = Vec::with_capacity(materials.len());
-        for (id, m) in &materials {
+        for (id, ..) in &materials {
             let mid = w.materials.alloc()?;
             res.materials.insert(*id, mid);
             material_ids.push(mid);
+        }
+        // A back reads its front's id, as the front reads its.
+        let mut records: Vec<MaterialGpu> = materials.iter().map(|m| m.1).collect();
+        for (i, &(.., back)) in materials.iter().enumerate() {
+            let Some(b) = back else { continue };
+            records[i].back = material_ids[b].0;
+            records[i].flags |= material_flags::HAS_BACK;
+            records[b].back = material_ids[i].0;
+            records[b].flags |= material_flags::BACK_SIDE;
+        }
+        for (m, &mid) in records.iter().zip(&material_ids) {
             w.materials.note(mid, m);
             w.put(
                 w.materials.table.gpu().offset(u64::from(mid.0)),
@@ -3430,7 +3470,7 @@ impl Mounts {
                 let c = &cages[k];
                 let flags: Vec<u32> = m.materials[mesh_sections..]
                     .iter()
-                    .map(|&k| materials[k].1.flags)
+                    .flat_map(|&k| side_flags(&materials, k))
                     .collect();
                 ModelCage {
                     cage: c.cage,
@@ -3463,7 +3503,9 @@ impl Mounts {
                     clusters: mesh.gpu.cluster_count,
                 }),
                 candidate_class: candidate_class(
-                    mesh_materials.iter().map(|&k| materials[k].1.flags),
+                    mesh_materials
+                        .iter()
+                        .flat_map(|&k| side_flags(&materials, k)),
                 ),
                 cage_only: false,
                 edit: false,

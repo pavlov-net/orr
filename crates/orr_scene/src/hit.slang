@@ -289,10 +289,12 @@ public Corners load_corners(uint8_t* page, Cluster c, uint triangle, MeshGpu* me
 // The geometry of `i` at barycentrics `b` of triangle `t` placed by `pl`, with `attributes`
 // the mesh's MESH_* flags: both uv sets and their footprints from the barycentric steps `bx` and `by` of one footprint width, normals and
 // tangent frame in render space (back faces of double-sided materials turned toward the
-// ray `d`), and the object-space position and normal. Without mesh tangents on the uvs the
-// material's frame follows, as where a copy's material replaces the section's, the tangent
-// follows the triangle's uv in that set.
-public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, MaterialGpu* m, Placement pl, float2 b, float2 bx, float2 by, float3 d, float bias)
+// ray `d`, but for a dielectric's, which stay on its front so a ray knows the way it crosses),
+// and the object-space position and normal. `material` is the section's, and the frame follows
+// the material of the side `d` meets. Without mesh tangents on the uvs that frame follows, as
+// where a copy's material replaces the section's, the tangent follows the triangle's uv in
+// that set.
+public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, SceneRoot* scene, uint material, Placement pl, float2 b, float2 bx, float2 by, float3 d, float bias)
 {
     VertexAttributes a0 = t.attributes[0];
     VertexAttributes a1 = t.attributes[1];
@@ -326,8 +328,10 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
     for (uint c = 0; c < 3; c++)
         frame += w[c] * unit_direction(mul(normals, t.attributes[c].normal), ng);
     float3 n = safe_normalize(frame, ng);
+    i.back_face = dot(ng, d) > 0.0 && (scene.materials[material].flags & MATERIAL_DOUBLE_SIDED) != 0;
+    MaterialGpu* side = scene.materials + side_material(scene, material, i);
     float4 tangent;
-    uint frame_set = m.tangent_set;
+    uint frame_set = side.tangent_set;
     if ((attributes & MESH_TANGENT) != 0 && (frame_set == t.tangent_set || frame_set == TANGENT_SET_OTHER))
     {
         float3 tt = float3(0.0);
@@ -354,7 +358,7 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
         tangent = float4(tt, dot(cross(n, tt), bt) < 0.0 ? -1.0 : 1.0);
         frame = n;
     }
-    if (dot(ng, d) > 0.0 && (m.flags & MATERIAL_DOUBLE_SIDED) != 0)
+    if (i.back_face && (side.flags & MATERIAL_DIELECTRIC) == 0)
     {
         ng = -ng;
         n = -n;
@@ -369,6 +373,21 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
     i.object_normal = n_obj;
     i.object_to_render = pl.linear;
     i.vertex_color = w.x * a0.color + w.y * a1.color + w.z * a2.color;
+}
+
+// The material shading the side of `material` that `i` shows: its back's on a back face.
+public uint side_material(SceneRoot* s, uint material, SurfaceInput i)
+{
+    MaterialGpu* m = s.materials + material;
+    return i.back_face && (m.flags & MATERIAL_HAS_BACK) != 0 ? m.back : material;
+}
+
+// The material whose interior a surface of `material` bounds: one surface has one interior, so
+// that of the material it backs.
+public uint interior_material(SceneRoot* s, uint material)
+{
+    MaterialGpu* m = s.materials + material;
+    return material != MATERIAL_NONE && (m.flags & MATERIAL_BACK_SIDE) != 0 ? m.back : material;
 }
 
 // The skinned copy `inst` names; false for copies not from `add_skinned`.
@@ -533,6 +552,7 @@ public struct SurfaceHit
     public uint3 vertex_user;     // per corner
     public float geometric_error; // m: the hit cluster's LOD error times the instance scale
     public float depth_offset;    // m, along the ray
+    public bool back_face;        // on a double-sided material's back
     public bool valid;            // false for hits on entries this module does not resolve
 }
 
@@ -584,7 +604,8 @@ struct HitInput
     uint origin;       // a producer entry's origin policy, else ORIGIN_DEFAULT
 }
 
-bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, HitContext context, out HitInput h)
+// With `sided` the input is that of the side `d` meets, else of the section's material.
+bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, out HitInput h)
 {
     h = (HitInput)0;
     uint cell_log2 = uint(s.origin_cell.w);
@@ -676,9 +697,11 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     }
     if (material == MATERIAL_NONE)
         return false;
-    MaterialGpu* m = s.materials + material;
     if (!strand)
-        hit_triangle(i, d, corners, t, fetched, deformed, previous, attributes, m, pl, primitive, bary, context, bias);
+        hit_triangle(i, d, corners, t, fetched, deformed, previous, attributes, s, material, pl, primitive, bary, context, bias);
+    if (sided)
+        material = side_material(s, material, i);
+    MaterialGpu* m = s.materials + material;
     i.uv[0].tap = i.uv[1].tap = context.tap;
     i.context = context;
     i.material = material;
@@ -696,7 +719,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
 
 // The triangle geometry of a hit at barycentrics `bary` of triangle `primitive` with
 // `corners`, the fetched positions `t` replacing theirs where they are this frame's.
-void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bool fetched, bool deformed, bool previous, uint attributes, MaterialGpu* m, Placement pl, uint primitive, float2 bary, HitContext context, float bias)
+void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bool fetched, bool deformed, bool previous, uint attributes, SceneRoot* s, uint material, Placement pl, uint primitive, float2 bary, HitContext context, float bias)
 {
     // A deformed copy's fetched positions are this frame's.
     if (fetched && !(deformed && previous))
@@ -727,7 +750,7 @@ void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bo
     float2 bx = float2(dot(cross(x * w, e2), n), dot(cross(e1, x * w), n)) / nn * size;
     float2 by = float2(dot(cross(yp * w, e2), n), dot(cross(e1, yp * w), n)) / nn * size;
 
-    triangle_geometry(i, corners, attributes, m, pl, bary, bx, by, d, bias);
+    triangle_geometry(i, corners, attributes, s, material, pl, bary, bx, by, d, bias);
     i.primitive = primitive;
     i.barycentrics = bary;
 }
@@ -744,7 +767,7 @@ public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     Corners t;
     t.position = object_positions;
     HitInput h;
-    if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, true, previous, context, h))
+    if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, true, previous, true, context, h))
         return hit;
     float offset;
     GSurface g = S.surface(h.input, offset);
@@ -765,6 +788,7 @@ public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     hit.cluster_user = h.input.cluster_user;
     hit.vertex_user = h.input.vertex_user;
     hit.depth_offset = offset;
+    hit.back_face = h.input.back_face;
     hit.valid = true;
     return hit;
 }
@@ -781,14 +805,15 @@ bool fade_present(SceneRoot* s, float3 d, uint instance_index)
 // Whether a non-opaque triangle candidate is present: on a fading copy's step, by its share
 // of the fade against a draw both steps share; then for alpha-tested materials with
 // probability the surface's coverage (the material's alpha test unless a linked surface has
-// its own), against a draw hashed from the candidate and the frame.
+// its own), against a draw hashed from the candidate and the frame. Coverage is the section
+// material's on both sides, as the raster's alpha test and the opacity micromaps are.
 public bool resolve_alpha<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context)
 {
     if (!fade_present(s, d, instance_index))
         return false;
     Corners t = (Corners)0;
     HitInput h;
-    if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, context, h))
+    if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, false, context, h))
         return false;
     // A fading copy's triangles of materials without an alpha test are candidates only for
     // the fade.
@@ -807,7 +832,7 @@ public float resolve_coverage<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
         return 0.0;
     Corners t = (Corners)0;
     HitInput h;
-    if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, context, h))
+    if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, false, context, h))
         return 0.0;
     if ((s.materials[h.input.material].flags & MATERIAL_PRESENCE) != 0)
         return material_opacity(h.input);
@@ -915,15 +940,15 @@ public bool hit_previous_position(SceneRoot* s, float3 d, uint instance_index, u
     Corners t = (Corners)0;
     HitInput h;
     HitContext context = (HitContext)0;
-    if (!hit_input(s, nullptr, d, instance_index, cluster_id, primitive, bary, t, false, true, context, h))
+    if (!hit_input(s, nullptr, d, instance_index, cluster_id, primitive, bary, t, false, true, false, context, h))
         return false;
     position = h.input.position;
     return true;
 }
 
-// The geometric normal (the triangle's front face, turned toward the ray on double-sided
-// materials) and the material of a ray hit, without shading it. False where the hit does
-// not resolve.
+// The geometric normal (the triangle's front face, turned toward the ray where
+// `triangle_geometry` turns it) and the material whose interior a ray hit bounds, without
+// shading it. False where the hit does not resolve.
 public bool hit_geometry(SceneRoot* s, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], out float3 normal, out uint material)
 {
     normal = float3(0.0);
@@ -932,9 +957,9 @@ public bool hit_geometry(SceneRoot* s, float3 d, uint instance_index, uint clust
     t.position = object_positions;
     HitInput h;
     HitContext context = (HitContext)0;
-    if (!hit_input(s, nullptr, d, instance_index, cluster_id, primitive, bary, t, true, false, context, h))
+    if (!hit_input(s, nullptr, d, instance_index, cluster_id, primitive, bary, t, true, false, true, context, h))
         return false;
     normal = h.input.geometric_normal;
-    material = h.input.material;
+    material = interior_material(s, h.input.material);
     return true;
 }

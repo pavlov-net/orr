@@ -40,8 +40,8 @@
 //! its scope: references within it and to the global namespace need no qualifier, others name
 //! `namespace:element`, and so may the material.
 //!
-//! Not honored yet, and reported as a warning: a `backsurfaceshader` other than the
-//! `surfaceshader`.
+//! A `backsurfaceshader` other than the `surfaceshader` shades the back of two-sided geometry, so
+//! it makes the material double-sided, and cooks as material `back` of the asset.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -239,19 +239,36 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         any_mesh: true,
         add: &mut add,
     };
-    let mapped = shading::map(&graph.net, graph.surface, graph.displacement, &mut host)
+    let mut mapped = shading::map(&graph.net, graph.surface, graph.displacement, &mut host)
         .map_err(|m| fail(format!("material {material}: {m}")))?;
     let mut warnings = reader.warnings;
     warnings.extend(graph.warnings);
     warnings.extend(past);
     warnings.extend(mapped.warnings);
+    let mut back = None;
+    if let Some(b) = graph.back {
+        let mut side = shading::map(&graph.net, b, None, &mut host)
+            .map_err(|m| fail(format!("material {material}: {m}")))?;
+        warnings.extend(side.warnings);
+        mapped.material.double_sided = 1;
+        side.material.double_sided = 1;
+        back = Some(SceneMaterial {
+            suffix: "back".to_string(),
+            material: side.material,
+            textures: side.textures,
+            back: None,
+        });
+    }
     Ok(Scene {
         models: Vec::new(),
-        materials: vec![SceneMaterial {
+        materials: std::iter::once(SceneMaterial {
             suffix: String::new(),
             material: mapped.material,
             textures: mapped.textures,
-        }],
+            back: back.is_some().then_some(1),
+        })
+        .chain(back)
+        .collect(),
         images,
         skeletons: Vec::new(),
         instances: Vec::new(),
@@ -606,6 +623,8 @@ impl<'a> Units<'a> {
 struct Graph {
     net: Network,
     surface: usize,
+    /// A surface for the back other than `surface`.
+    back: Option<usize>,
     displacement: Option<usize>,
     warnings: Vec<String>,
 }
@@ -865,15 +884,11 @@ fn network(
     let surface =
         shader("surfaceshader").ok_or_else(|| format!("{material} has no surfaceshader"))?;
     let displacement = shader("displacementshader");
-    if shader("backsurfaceshader").is_some_and(|b| b != surface) {
-        warnings.push(format!(
-            "material {material}: backsurfaceshader is not honored yet; both sides read \
-             surfaceshader"
-        ));
-    }
+    let back = shader("backsurfaceshader").filter(|&b| b != surface);
     Ok(Graph {
         net,
         surface,
+        back,
         displacement,
         warnings,
     })

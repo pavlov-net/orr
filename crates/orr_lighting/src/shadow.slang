@@ -129,7 +129,7 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
             return float3(1.0);
         float3 n = sh.surface.geometric_normal;
         bool front = dot(n, dir) < 0.0;
-        depth += interior_medium(scene, sh.surface.material).sigma_t * (front ? -c.t : c.t);
+        depth += interior_medium(scene, interior_material(scene, sh.surface.material)).sigma_t * (front ? -c.t : c.t);
         return bsdf_straight_transmission(sh.surface.bsdf, n, dir, AMBIENT_IOR, environment);
     }
 
