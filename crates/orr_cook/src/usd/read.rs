@@ -314,7 +314,11 @@ pub(super) fn numbers(v: &sdf::Value) -> Option<Vec<f64>> {
         V::QuatfVec(x) => Some(cast::<_, f32>(x)),
         V::QuatdVec(x) => Some(cast::<_, f64>(x)),
         V::QuathVec(x) => Some(half(x)),
+        V::Matrix2d(m) => Some(m.0.to_vec()),
+        V::Matrix3d(m) => Some(m.0.to_vec()),
         V::Matrix4d(m) => Some(m.0.to_vec()),
+        V::Matrix2dVec(m) => Some(m.iter().flat_map(|m| m.0).collect()),
+        V::Matrix3dVec(m) => Some(m.iter().flat_map(|m| m.0).collect()),
         V::Matrix4dVec(m) => Some(m.iter().flat_map(|m| m.0).collect()),
         _ => None,
     }
@@ -342,6 +346,8 @@ fn element_width(v: &sdf::Value) -> Option<usize> {
         | V::QuatfVec(_)
         | V::QuatdVec(_)
         | V::QuathVec(_) => Some(4),
+        V::Matrix2dVec(_) => Some(4),
+        V::Matrix3dVec(_) => Some(9),
         V::Matrix4dVec(_) => Some(16),
         _ => None,
     }

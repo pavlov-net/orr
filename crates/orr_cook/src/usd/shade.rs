@@ -60,6 +60,17 @@ pub(super) fn network(
     Ok((b.net, surface, displacement))
 }
 
+/// The output type of a node definition whose id ends in `suffix`. An `extract` id names the type
+/// it reads, where other ids name the type they give.
+fn output_type<'s>(kind: &str, suffix: &'s str) -> &'s str {
+    match (kind, suffix) {
+        ("extract", "matrix33") => "vector3",
+        ("extract", "matrix44") => "vector4",
+        ("extract", _) => "float",
+        _ => suffix,
+    }
+}
+
 impl Builder<'_> {
     /// What a connection to property `target` reads.
     fn source(&mut self, target: &sdf::Path) -> Result<Input, String> {
@@ -120,7 +131,7 @@ impl Builder<'_> {
             .strip_prefix("ND_")
             .and_then(|r| r.strip_prefix(kind.as_str()))
             .and_then(|r| r.strip_prefix('_'))
-            .unwrap_or_default()
+            .map_or("", |suffix| output_type(&kind, suffix))
             .to_string();
         let n = self.net.nodes.len();
         self.net.nodes.push(Node {

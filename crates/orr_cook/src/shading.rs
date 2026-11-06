@@ -27,9 +27,10 @@
 //!
 //! An input is a constant, or reads a texture through these nodes: MaterialX `image` and
 //! `tiledimage` (with `texcoord`, `geompropvalue` and `place2d` on their coordinates,
-//! `extract`, `separate2`, `separate3` or `separate4` picking a channel, `normalmap` under
-//! `geometry_normal`), and `UsdUVTexture` (with `UsdPrimvarReader_float2` and
-//! `UsdTransform2d` on `st`, whose default is the constant (0, 0)). `constant` and `dot` nodes
+//! `extract`, `separate2`, `separate3` or `separate4` picking a channel, `extract` a row of a
+//! constant matrix, `normalmap` under `geometry_normal`), and `UsdUVTexture` (with
+//! `UsdPrimvarReader_float2` and `UsdTransform2d` on `st`, whose default is the constant
+//! (0, 0)). `constant` and `dot` nodes
 //! pass on what they read to MaterialX nodes. A primvar reader, or a `geompropvalue` or `geomcolor`
 //! off a coordinate, gives the value of a primvar constant over the mesh, and its `fallback` or
 //! `default` where the mesh has no such primvar. One that varies over the mesh takes channels of
@@ -146,6 +147,28 @@ fn scaled(v: f32, by: f64) -> f32 {
 /// What a `constant` or `dot` without a value reads.
 static ZERO: LazyLock<Input> = LazyLock::new(|| Input::Value(vec![0.0], Unit::Unstated));
 
+/// What a matrix `constant` or `dot` without a value reads: its nodedef's identity.
+static IDENTITY33: LazyLock<Input> = LazyLock::new(|| identity(3));
+static IDENTITY44: LazyLock<Input> = LazyLock::new(|| identity(4));
+
+fn identity(n: usize) -> Input {
+    let cell = |i| if i % (n + 1) == 0 { 1.0 } else { 0.0 };
+    Input::Value((0..n * n).map(cell).collect(), Unit::Unstated)
+}
+
+fn is_pick(node: &Node) -> bool {
+    matches!(
+        node.kind.as_str(),
+        "extract" | "separate2" | "separate3" | "separate4"
+    )
+}
+
+/// Whether `node` is an `extract` of a matrix's row, whose output type tells it from one of a
+/// float channel.
+fn gives_row(node: &Node) -> bool {
+    node.kind == "extract" && matches!(node.ty.as_str(), "vector3" | "vector4")
+}
+
 /// What `input` reads past `constant` and `dot` nodes, which pass a value on unchanged. A ring
 /// of them leaves a connection.
 pub(crate) fn through<'n>(net: &'n Network, mut input: &'n Input) -> &'n Input {
@@ -159,7 +182,11 @@ pub(crate) fn through<'n>(net: &'n Network, mut input: &'n Input) -> &'n Input {
             "dot" => "in",
             _ => break,
         };
-        input = node.inputs.get(name).unwrap_or(&ZERO);
+        input = node.inputs.get(name).unwrap_or(match node.ty.as_str() {
+            "matrix33" => &IDENTITY33,
+            "matrix44" => &IDENTITY44,
+            _ => &ZERO,
+        });
     }
     input
 }
@@ -775,6 +802,39 @@ impl Mapper<'_, '_> {
         }))
     }
 
+    /// The row an `extract` node takes of a matrix on its input `in`; `None` for a node that
+    /// picks a channel. Nodes `extract`: "the node extracts a row vector by index", and a matrix
+    /// value lists its rows in order. An unconnected input is the nodedef's zero matrix.
+    fn matrix_row(&mut self, n: usize) -> Result<Option<Value>, String> {
+        let node = &self.net.nodes[n];
+        if !gives_row(node) {
+            return Ok(None);
+        }
+        let width = if node.ty == "vector3" { 3 } else { 4 };
+        let index = self.float(n, "index", 0.0)?;
+        if index.fract() != 0.0 || !(0.0..width as f32).contains(&index) {
+            return Err(format!(
+                "{}: row {index} of a matrix of {width} rows",
+                node.name
+            ));
+        }
+        let no_matrix = || format!("{}: a row of {width} reads no matrix", node.name);
+        // Refusing a pick here keeps a chain of them from recursing.
+        if let Some(Input::Connect { node: up, .. }) = self.source(n, "in")
+            && is_pick(self.node(*up))
+        {
+            return Err(no_matrix());
+        }
+        match self.value(n, "in")? {
+            None => Ok(Some(Value::Constant(vec![0.0; width], Unit::Unstated))),
+            Some(Value::Constant(v, unit)) if v.len() == width * width => {
+                let row = v[index as usize * width..][..width].to_vec();
+                Ok(Some(Value::Constant(row, unit)))
+            }
+            Some(_) => Err(no_matrix()),
+        }
+    }
+
     /// The channels of the stream on input `in` of an `extract` node.
     fn components(&self, n: usize) -> Result<usize, String> {
         match self.input(n, "in") {
@@ -852,6 +912,11 @@ impl Mapper<'_, '_> {
                 Ok(Value::Texture(t))
             }
             "extract" | "separate2" | "separate3" | "separate4" => {
+                if node.kind == "extract"
+                    && let Some(row) = self.matrix_row(n)?
+                {
+                    return Ok(row);
+                }
                 let c = match node.kind.as_str() {
                     "extract" => {
                         let width = self.components(n)?;
@@ -876,13 +941,11 @@ impl Mapper<'_, '_> {
                     }
                 };
                 let name = node.name.clone();
-                // A picked channel holds none to pick, and refusing it here keeps a chain of
-                // picks from recursing.
+                // A picked channel holds none to pick, though a matrix's row holds several.
+                // Refusing it here keeps a chain of picks from recursing.
                 if let Some(Input::Connect { node, .. }) = self.source(n, "in")
-                    && matches!(
-                        self.node(*node).kind.as_str(),
-                        "extract" | "separate2" | "separate3" | "separate4"
-                    )
+                    && is_pick(self.node(*node))
+                    && !gives_row(self.node(*node))
                 {
                     return Err(format!("{name}: picks channel {c} of a single channel"));
                 }

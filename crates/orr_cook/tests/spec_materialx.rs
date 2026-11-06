@@ -228,6 +228,43 @@ fn documents_map_as_the_clauses_say() {
             check: |m| close(m.specular_roughness, 0.8),
         },
         Row {
+            clause: "Nodes extract: a matrix33 gives the row vector at index",
+            body: r#"<extract name="r" type="vector3">
+                  <input name="in" type="matrix33" value="1,2,3, 0.4,0.5,0.6, 7,8,9"/>
+                  <input name="index" type="integer" value="1"/></extract>
+                <extract name="e" type="float">
+                  <input name="in" type="vector3" nodename="r"/>
+                  <input name="index" type="integer" value="2"/></extract>"#,
+            inputs: ROUGH_E,
+            check: |m| close(m.specular_roughness, 0.6),
+        },
+        Row {
+            clause: "Nodes extract: a matrix44 through a constant gives a row of four",
+            body: r#"<constant name="k" type="matrix44">
+                  <input name="value" type="matrix44"
+                         value="1,0,0,0, 0,1,0,0, 0,0,1,0, 0.1,0.2,0.3,0.7"/></constant>
+                <extract name="r" type="vector4">
+                  <input name="in" type="matrix44" nodename="k"/>
+                  <input name="index" type="integer" value="3"/></extract>
+                <extract name="e" type="float">
+                  <input name="in" type="vector4" nodename="r"/>
+                  <input name="index" type="integer" value="3"/></extract>"#,
+            inputs: ROUGH_E,
+            check: |m| close(m.specular_roughness, 0.7),
+        },
+        Row {
+            clause: "ND_constant_matrix33: value defaults to the identity",
+            body: r#"<constant name="k" type="matrix33"/>
+                <extract name="r" type="vector3">
+                  <input name="in" type="matrix33" nodename="k"/>
+                  <input name="index" type="integer" value="1"/></extract>
+                <extract name="e" type="float">
+                  <input name="in" type="vector3" nodename="r"/>
+                  <input name="index" type="integer" value="1"/></extract>"#,
+            inputs: ROUGH_E,
+            check: |m| close(m.specular_roughness, 1.0),
+        },
+        Row {
             clause: "Nodes separate3: outy of a vector3 is its second channel",
             body: r#"<image name="i" type="vector3">
                   <input name="file" type="filename" value="flat.png"/></image>
@@ -937,6 +974,34 @@ fn invalid_documents_fail() {
             r#"<extract name="e" type="float">
               <input name="in" type="color3" value="0.1, 0.2, 0.3"/>
               <input name="index" type="integer" value="3"/></extract>"#
+                .to_string(),
+            ROUGH_E,
+        ),
+        (
+            "Nodes extract: uimax 2 on the index of a matrix33",
+            r#"<extract name="r" type="vector3">
+              <input name="in" type="matrix33" value="1,0,0, 0,1,0, 0,0,1"/>
+              <input name="index" type="integer" value="3"/></extract>
+              <extract name="e" type="float">
+              <input name="in" type="vector3" nodename="r"/></extract>"#
+                .to_string(),
+            ROUGH_E,
+        ),
+        (
+            "Nodes extract: a matrix gives a vector, not a float",
+            r#"<extract name="e" type="float">
+              <input name="in" type="matrix33" value="1,0,0, 0,1,0, 0,0,1"/></extract>"#
+                .to_string(),
+            ROUGH_E,
+        ),
+        (
+            "Nodes extract: only a matrix gives a vector",
+            r#"<extract name="a" type="vector3">
+              <input name="in" type="vector3" value="1,0,0"/></extract>
+              <extract name="r" type="vector3">
+              <input name="in" type="vector3" nodename="a"/></extract>
+              <extract name="e" type="float">
+              <input name="in" type="vector3" nodename="r"/></extract>"#
                 .to_string(),
             ROUGH_E,
         ),

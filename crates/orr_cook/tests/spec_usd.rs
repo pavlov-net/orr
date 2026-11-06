@@ -2395,6 +2395,35 @@ fn near(a: f32, b: f32) -> bool {
     (a - b).abs() <= 1e-6 * b.abs().max(1.0)
 }
 
+/// `ND_extract_matrix33` reads a `matrix33` and gives a `vector3`, so its id names its input where
+/// other ids name their output, and a `matrix3d` value holds the matrix.
+#[test]
+fn a_matrix_row_extracts_through_node_definition_ids() {
+    let inputs = "float inputs:specular_roughness.connect = </M/E.outputs:out>";
+    let prims = format!(
+        r#"{}
+    def Shader "R"
+    {{
+        uniform token info:id = "ND_extract_matrix33"
+        matrix3d inputs:in = ((1, 2, 3), (0.4, 0.5, 0.6), (7, 8, 9))
+        int inputs:index = 1
+        vector3f outputs:out
+    }}
+    def Shader "E"
+    {{
+        uniform token info:id = "ND_extract_vector3"
+        vector3f inputs:in.connect = </M/R.outputs:out>
+        int inputs:index = 2
+        float outputs:out
+    }}"#,
+        open_pbr(inputs)
+    );
+    let surface = "token outputs:mtlx:surface.connect = </M/S.outputs:out>";
+    let body = mtlx_material(surface, &prims);
+    let m = material(&cook_centimeters("matrix-row", &body, &[]));
+    assert!(near(m.specular_roughness, 0.6), "{}", m.specular_roughness);
+}
+
 /// OpenPBR Metadata asks for "the floating-point conversion factor from the parameters given in
 /// world space length units to meters", which `metersPerUnit` is on a stage. OpenPBR states
 /// `thin_film_thickness` in micrometers, which no stage changes.
