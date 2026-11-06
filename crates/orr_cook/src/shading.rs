@@ -41,10 +41,10 @@
 //! which is 0. Any other node fails the import, naming it, as
 //! does a connection cycle. A `geompropvalue` on a coordinate whose property no uv set holds reads
 //! its `default` at every point, as an unconnected `place2d` reads 0, 0. Textures go to the
-//! material's slots. An interior medium is one for the whole material, so a textured
-//! `transmission_depth`, `transmission_scatter`, `transmission_scatter_anisotropy` or dispersion
-//! input fails, and a `transmission_color` texture under a `transmission_depth` above 0 warns and
-//! reads the field, unless the material is thin-walled. A texture value multiplies the field, which takes the reader's scale
+//! material's slots. OpenPBR's interior medium is homogeneous and its parameters vary by uv, so a
+//! texture of `transmission_depth`, `transmission_scatter`, `transmission_scatter_anisotropy`,
+//! dispersion or `transmission_color` under a depth above 0 reads where a path enters the medium.
+//! A texture value multiplies the field, which takes the reader's scale
 //! (`UsdUVTexture` `scale`; 1 otherwise); a bias folds scale and bias into the texels
 //! ([`TexRef::remap`]) and leaves the field 1, or for a color what it reaches past 1. Normals
 //! read `scale * t + bias` per axis; a pair of the form `s (2 t - 1)` is the tangent-space
@@ -1533,17 +1533,17 @@ impl Mapper<'_, '_> {
             (
                 "transmission_scatter_anisotropy",
                 |m| &mut m.transmission_scatter_anisotropy,
-                None,
+                Some(more::<{ slot::TRANSMISSION_SCATTER_ANISOTROPY }>),
             ),
             (
                 "transmission_dispersion_scale",
                 |m| &mut m.transmission_dispersion_scale,
-                None,
+                Some(more::<{ slot::DISPERSION_SCALE }>),
             ),
             (
                 "transmission_dispersion_abbe_number",
                 |m| &mut m.transmission_dispersion_abbe_number,
-                None,
+                Some(more::<{ slot::DISPERSION_ABBE }>),
             ),
             (
                 "subsurface_weight",
@@ -1626,7 +1626,7 @@ impl Mapper<'_, '_> {
             (
                 "transmission_scatter",
                 |m| &mut m.transmission_scatter,
-                None,
+                Some(more::<{ slot::TRANSMISSION_SCATTER }>),
             ),
             (
                 "subsurface_color",
@@ -1682,27 +1682,15 @@ impl Mapper<'_, '_> {
         for &(name, field, slot) in colors {
             self.color(n, name, field, slot)?;
         }
-        self.length(n, "transmission_depth", |m| &mut m.transmission_depth)?;
+        self.textured_length(n, "transmission_depth", slot::TRANSMISSION_DEPTH, |m| {
+            &mut m.transmission_depth
+        })?;
         self.textured_length(n, "subsurface_radius", slot::SUBSURFACE_RADIUS, |m| {
             &mut m.subsurface_radius
         })?;
         self.film_thickness(n)?;
         if let Some(v) = self.number(n, "geometry_thin_walled")? {
             self.material.thin_walled = u8::from(v[0] != 0.0);
-        }
-        if self
-            .textures
-            .more
-            .get(&slot::TRANSMISSION_COLOR)
-            .is_some_and(Option::is_some)
-            && self.material.transmission_depth > 0.0
-            && self.material.thin_walled == 0
-        {
-            self.warnings.push(format!(
-                "{}: an interior medium is one for the whole material, so a transmission_color \
-                 texture reads its factor under a transmission_depth above 0",
-                self.node(n).name
-            ));
         }
         if self.textures.opacity.is_some()
             || self.material.geometry_opacity < 1.0

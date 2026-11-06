@@ -46,6 +46,8 @@ public static const uint MATERIAL_HAS_BACK = 1 << 28;
 public static const uint MATERIAL_BACK_SIDE = 1 << 29;
 // Displacement reads TEXTURE_DISPLACEMENT_U and TEXTURE_DISPLACEMENT_V too.
 public static const uint MATERIAL_DISPLACED_TANGENT = 1 << 30;
+// `material_medium` reads textures.
+public static const uint MATERIAL_MEDIUM_TEXTURED = 1u << 31;
 // The base color tints what passes through the surface.
 public static const uint MATERIAL_BASE_TINT = 1 << 23;
 // It binds a slot past TEXTURE_TRANSMISSION, which hits on other materials don't look at.
@@ -90,7 +92,12 @@ public static const uint TEXTURE_THIN_FILM_IOR = 34;
 public static const uint TEXTURE_EMISSION_LUMINANCE = 35;
 public static const uint TEXTURE_DISPLACEMENT_U = 36;
 public static const uint TEXTURE_DISPLACEMENT_V = 37;
-public static const uint TEXTURE_SLOTS = 38;
+public static const uint TEXTURE_TRANSMISSION_DEPTH = 38;
+public static const uint TEXTURE_TRANSMISSION_SCATTER = 39;
+public static const uint TEXTURE_TRANSMISSION_SCATTER_ANISOTROPY = 40;
+public static const uint TEXTURE_DISPERSION_SCALE = 41;
+public static const uint TEXTURE_DISPERSION_ABBE = 42;
+public static const uint TEXTURE_SLOTS = 43;
 
 // `TextureSamplerGpu.modes`: what u and v read past 0..1, 3 bits each
 // (orr_pack::material::wrap), then the filter's bits (orr_pack::material::filter).
@@ -225,7 +232,6 @@ public struct MaterialGpu
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
     public uint coat_tangent_set;           // what the coat's normal map and tangent follow, as `tangent_set`
-    public uint _pad0;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
     public uint* tiles[TEXTURE_SLOTS];                  // per slot of TEXTURE_TILED, its table: `texture_tile`
@@ -772,6 +778,45 @@ public void material_prepare(MaterialGpu* m, UvFootprint uv[2])
         if (material_reads(m, slot, modes, t, f))
             texture_prepare(t, modes, f, m.texture_streams);
     }
+}
+
+// A surface point a medium's textures read at: uv sets 0 and 1 in xy and zw.
+public static const float4 NO_MEDIUM_POINT = float4(-3.0e38);
+
+// What describes `m`'s interior medium, at `point` where that names one, else its factors.
+public struct MediumParams
+{
+    public float3 color;
+    public float depth;
+    public float3 scatter;
+    public float anisotropy;
+    public float dispersion_scale;
+    public float dispersion_abbe;
+}
+
+public MediumParams material_medium(MaterialGpu* m, float4 point)
+{
+    MediumParams p;
+    p.color = m.transmission_color;
+    p.depth = m.transmission_depth;
+    p.scatter = m.transmission_scatter;
+    p.anisotropy = m.transmission_scatter_anisotropy;
+    p.dispersion_scale = m.transmission_dispersion_scale;
+    p.dispersion_abbe = m.transmission_dispersion_abbe_number;
+    if ((m.flags & MATERIAL_MEDIUM_TEXTURED) == 0 || point.x == NO_MEDIUM_POINT.x)
+        return p;
+    UvFootprint uv[2] = {
+        { point.xy, float2(0.0), float2(0.0), float2(-1.0), float2(0.0) },
+        { point.zw, float2(0.0), float2(0.0), float2(-1.0), float2(0.0) },
+    };
+    float4 one = float4(1.0);
+    p.color = material_color(m, TEXTURE_TRANSMISSION_COLOR, uv, p.color);
+    p.depth *= material_texture(m, TEXTURE_TRANSMISSION_DEPTH, uv, one).x;
+    p.scatter = material_color(m, TEXTURE_TRANSMISSION_SCATTER, uv, p.scatter);
+    p.anisotropy = 2.0 * material_texture(m, TEXTURE_TRANSMISSION_SCATTER_ANISOTROPY, uv, float4(0.5 * p.anisotropy + 0.5)).x - 1.0;
+    p.dispersion_scale *= material_texture(m, TEXTURE_DISPERSION_SCALE, uv, one).x;
+    p.dispersion_abbe *= material_texture(m, TEXTURE_DISPERSION_ABBE, uv, one).x;
+    return p;
 }
 
 // Emitted radiance of `m` in nits over footprints `uv`: `material_emission` through the emission

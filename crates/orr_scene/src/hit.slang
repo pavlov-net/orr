@@ -814,6 +814,7 @@ public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     g.cluster = h.input.cluster;
     g.primitive = h.input.primitive;
     g.material = h.input.material;
+    g.medium_point = float4(h.input.uv[0].uv, h.input.uv[1].uv);
     hit.surface = g;
     hit.uv = h.input.uv;
     hit.user_tag = h.input.user_tag;

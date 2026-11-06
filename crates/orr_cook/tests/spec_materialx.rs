@@ -2091,6 +2091,65 @@ fn vector_displacement_reads_a_height_per_axis() {
     assert_eq!(m.displacement_tangent[0][1], 0.25);
 }
 
+/// OpenPBR: textures generate "spatially varying parameters according to the local UV coordinates
+/// of the geometry", the medium's among them, and at a depth above 0 `transmission_color` sets
+/// that medium, so each reads through a slot of its own and no warning stands.
+#[test]
+fn a_medium_reads_its_textures() {
+    let float_image = r#"<image name="f" type="float"><input name="file" type="filename" value="v.png"/></image>"#;
+    let color_image = r#"<image name="c" type="color3"><input name="file" type="filename" value="flipped.png"/></image>"#;
+    let body = format!("{float_image}{color_image}");
+    let float = |name: &str| format!(r#"<input name="{name}" type="float" nodename="f"/>"#);
+    let color = |name: &str| format!(r#"<input name="{name}" type="color3" nodename="c"/>"#);
+    let inputs = [
+        float("transmission_depth"),
+        color("transmission_color"),
+        color("transmission_scatter"),
+        float("transmission_scatter_anisotropy"),
+        float("transmission_dispersion_scale"),
+        float("transmission_dispersion_abbe_number"),
+    ]
+    .concat();
+    let (a, report) = cook_body(&body, &inputs).unwrap();
+    assert!(
+        report.assets[0].warnings.is_empty(),
+        "{:?}",
+        report.assets[0].warnings
+    );
+    let m = material(&a);
+    for s in [
+        slot::TRANSMISSION_DEPTH,
+        slot::TRANSMISSION_COLOR,
+        slot::TRANSMISSION_SCATTER,
+        slot::TRANSMISSION_SCATTER_ANISOTROPY,
+        slot::DISPERSION_SCALE,
+        slot::DISPERSION_ABBE,
+    ] {
+        assert!(bound(&m, s), "slot {s}");
+    }
+}
+
+/// A texture of one value folds into the field of the input it feeds.
+#[test]
+fn a_constant_scatter_texture_folds_into_its_field() {
+    let body = r#"<image name="c" type="color3"><input name="file" type="filename" value="gray128.png"/></image>"#;
+    let inputs = r#"<input name="transmission_scatter" type="color3" nodename="c"/>"#;
+    let plain = material(&cook_body("", "").unwrap().0);
+    let m = material(&cook_body(body, inputs).unwrap().0);
+    assert!(!bound(&m, slot::TRANSMISSION_SCATTER));
+    assert!(
+        m.transmission_scatter[0] > 0.0,
+        "{:?}",
+        m.transmission_scatter
+    );
+    assert!(
+        m.transmission_scatter[0] < 1.0,
+        "{:?}",
+        m.transmission_scatter
+    );
+    assert_eq!(m.subsurface_color, plain.subsurface_color);
+}
+
 /// Spec: "the name of the surfaceshader node to be used for the back surface of an object, if the
 /// geometry is two-sided".
 #[test]

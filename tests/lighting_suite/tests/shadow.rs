@@ -5,9 +5,9 @@
 //! medium mask bit see proxies.
 
 use lighting_suite::bed::{
-    Bed, FLOOR, Item, PLUME, PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, PRODUCER_CAPACITY, Particle,
-    ParticleLook, SLAB_THICKNESS, SUN, Spec, TINTED_SLAB, WATER_BOX, fresnel, plume_volume,
-    water_transmission,
+    Bed, DEPTH_TEXTURED_SHEET, DEPTH_TEXTURED_SLAB, FLOOR, Item, PLUME, PRESENCE_VEIL,
+    PRESENCE_VEIL_OPACITY, PRODUCER_CAPACITY, Particle, ParticleLook, SHEET_DEPTH, SHEET_THICKNESS,
+    SLAB_THICKNESS, SUN, Spec, TINTED_SLAB, WATER_BOX, fresnel, plume_volume, water_transmission,
 };
 use lighting_suite::shaders::{proxy_rays, shadow_probe};
 use lighting_suite::{assert_clean, pipeline, readback, upload};
@@ -138,6 +138,42 @@ fn a_slab_shadows_receivers_below_it_by_fresnel_and_beer_law() {
     );
     assert_all("above the slab", &above.transmittance, [1.0; 3], 0.0);
     assert_eq!(below.overflows + above.overflows, 0);
+    assert_clean();
+}
+
+/// OpenPBR's `transmission_depth` sets "the extinction coefficient": a texture of it reads
+/// at the hits of a shadow ray as at a path's, so half the depth takes twice the extinction.
+#[test]
+fn a_textured_depth_shadows_as_its_texels_say() {
+    let sun = SUN.direction_to_light.normalize();
+    let mid = Vec3::new(0.0, 1.0, 0.0);
+    let copies = vec![at(DEPTH_TEXTURED_SLAB, mid)];
+    let below = trace(copies, &grid(mid, [0.4, 0.3], 0.7 / sun.y, sun), sun);
+    let mu = f64::from(sun.y);
+    let depth = f64::from(SLAB_THICKNESS) * 128.0 / 255.0;
+    let path = f64::from(SLAB_THICKNESS) / mu;
+    let through = (1.0 - fresnel(1.5, mu)).powi(2) * 0.5f64.powf(path / depth);
+    assert_all("below the slab", &below.transmittance, [through; 3], 2e-3);
+    assert_clean();
+}
+
+/// Each textured interior on a ray takes its own distance at its own extinction: a mean over the
+/// two would put the slab's length at the sheet's sigma.
+#[test]
+fn a_textured_depth_of_each_interior_stays_its_own() {
+    let sun = SUN.direction_to_light.normalize();
+    let mid = Vec3::new(0.0, 1.0, 0.0);
+    let copies = vec![
+        at(DEPTH_TEXTURED_SLAB, mid),
+        at(DEPTH_TEXTURED_SHEET, mid + sun * 0.6),
+    ];
+    let below = trace(copies, &grid(mid, [0.4, 0.3], 0.7 / sun.y, sun), sun);
+    let mu = f64::from(sun.y);
+    let texel = 128.0 / 255.0;
+    let slab = 1.0 / texel;
+    let sheet = f64::from(SHEET_THICKNESS) / (f64::from(SHEET_DEPTH) * texel);
+    let through = (1.0 - fresnel(1.5, mu)).powi(4) * 0.5f64.powf((slab + sheet) / mu);
+    assert_all("below both", &below.transmittance, [through; 3], 2e-3);
     assert_clean();
 }
 

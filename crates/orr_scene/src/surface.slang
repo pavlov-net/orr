@@ -383,7 +383,9 @@ public struct StandardSurface : ISurface
         p.diffuse_roughness = m.diffuse_roughness * surface_scale(i, m, TEXTURE_DIFFUSE_ROUGHNESS);
         p.transmission_weight = m.transmission_weight * material_texture(m, TEXTURE_TRANSMISSION, i.uv, one).x * surface_vertex(i, m, TEXTURE_TRANSMISSION).x;
         bool thin = (m.flags & MATERIAL_THIN_WALLED) != 0;
-        p.transmission_color = thin || m.transmission_depth == 0.0 ? surface_more_color(i, m, TEXTURE_TRANSMISSION_COLOR, m.transmission_color) : float3(1.0);
+        // OpenPBR: at a depth of 0 the color "acts as a constant (on-surface) transmission tint".
+        float depth = m.transmission_depth * material_texture(m, TEXTURE_TRANSMISSION_DEPTH, i.uv, one).x;
+        p.transmission_color = thin || depth == 0.0 ? surface_more_color(i, m, TEXTURE_TRANSMISSION_COLOR, m.transmission_color) : float3(1.0);
         p.subsurface_weight = m.subsurface_weight * surface_scale(i, m, TEXTURE_SUBSURFACE_WEIGHT);
         p.subsurface_color = surface_color(i, m, TEXTURE_SUBSURFACE_COLOR, m.subsurface_color);
         p.subsurface_anisotropy = m.subsurface_scatter_anisotropy;

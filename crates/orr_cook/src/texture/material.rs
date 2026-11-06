@@ -323,6 +323,7 @@ impl More {
         match s {
             slot::SPECULAR_COLOR
             | slot::TRANSMISSION_COLOR
+            | slot::TRANSMISSION_SCATTER
             | slot::SUBSURFACE_RADIUS_SCALE
             | slot::FUZZ_COLOR
             | slot::COAT_COLOR => Self::Color,
@@ -332,12 +333,16 @@ impl More {
             slot::THIN_FILM_THICKNESS => Self::Ranged("thin_film_thickness"),
             slot::SUBSURFACE_RADIUS => Self::Ranged("subsurface_radius"),
             slot::EMISSION_LUMINANCE => Self::Ranged("emission_luminance"),
+            slot::TRANSMISSION_DEPTH => Self::Ranged("transmission_depth"),
+            slot::DISPERSION_ABBE => Self::Ranged("dispersion_abbe"),
             slot::SUBSURFACE_ANISOTROPY => Self::Signed("subsurface_anisotropy"),
+            slot::TRANSMISSION_SCATTER_ANISOTROPY => Self::Signed("transmission_anisotropy"),
             slot::TANGENT => Self::Direction("tangent"),
             slot::COAT_TANGENT => Self::Direction("coat_tangent"),
             slot::DISPLACEMENT_U => Self::Height(0, "displacement_u"),
             slot::DISPLACEMENT_V => Self::Height(1, "displacement_v"),
             slot::BASE_WEIGHT => Self::Weight("base_weight"),
+            slot::DISPERSION_SCALE => Self::Weight("dispersion_scale"),
             slot::DIFFUSE_ROUGHNESS => Self::Weight("diffuse_roughness"),
             slot::ANISOTROPY => Self::Weight("anisotropy"),
             slot::SUBSURFACE_WEIGHT => Self::Weight("subsurface_weight"),
@@ -361,6 +366,10 @@ pub(crate) fn scalar_field(m: &mut Material, s: usize) -> &mut f32 {
         slot::THIN_FILM_THICKNESS => &mut m.thin_film_thickness,
         slot::SUBSURFACE_RADIUS => &mut m.subsurface_radius,
         slot::EMISSION_LUMINANCE => &mut m.emission_luminance,
+        slot::TRANSMISSION_DEPTH => &mut m.transmission_depth,
+        slot::DISPERSION_ABBE => &mut m.transmission_dispersion_abbe_number,
+        slot::DISPERSION_SCALE => &mut m.transmission_dispersion_scale,
+        slot::TRANSMISSION_SCATTER_ANISOTROPY => &mut m.transmission_scatter_anisotropy,
         slot::SUBSURFACE_ANISOTROPY => &mut m.subsurface_scatter_anisotropy,
         slot::BASE_WEIGHT => &mut m.base_weight,
         slot::DIFFUSE_ROUGHNESS => &mut m.diffuse_roughness,
@@ -2037,6 +2046,7 @@ impl<'a> Packer<'a> {
             slot::EMISSION => ("emission", |m| &mut m.emission_color),
             slot::SPECULAR_COLOR => ("specular_color", |m| &mut m.specular_color),
             slot::TRANSMISSION_COLOR => ("transmission_color", |m| &mut m.transmission_color),
+            slot::TRANSMISSION_SCATTER => ("transmission_scatter", |m| &mut m.transmission_scatter),
             slot::SUBSURFACE_RADIUS_SCALE => ("subsurface_radius_scale", |m| {
                 &mut m.subsurface_radius_scale
             }),

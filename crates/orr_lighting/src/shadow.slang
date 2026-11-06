@@ -43,8 +43,8 @@ public float interior_ior(SceneRoot* s, uint m)
 }
 
 // The homogeneous medium inside dielectric material `m`, from its `transmission_color` over
-// `transmission_depth` and `transmission_scatter` (OpenPBR's mapping): none for
-// MATERIAL_NONE, thin-walled materials and a depth of 0.
+// `transmission_depth` and `transmission_scatter` (OpenPBR's mapping) as `material_medium` reads
+// them at `point`: none for MATERIAL_NONE, thin-walled materials and a depth of 0.
 public struct InteriorMedium
 {
     public float3 sigma_t;          // 1/m
@@ -57,26 +57,48 @@ public struct InteriorMedium
     }
 }
 
-public InteriorMedium interior_medium(SceneRoot* s, uint m)
+public InteriorMedium interior_medium(SceneRoot* s, uint m, float4 point = NO_MEDIUM_POINT)
 {
     InteriorMedium r = (InteriorMedium)0;
     if (m == MATERIAL_NONE)
         return r;
     MaterialGpu* g = s.materials + m;
-    if ((g.flags & MATERIAL_THIN_WALLED) != 0 || !(g.transmission_depth > 0.0))
+    MediumParams p = material_medium(g, point);
+    if ((g.flags & MATERIAL_THIN_WALLED) != 0 || !(p.depth > 0.0))
         return r;
-    OpenPBR_HomogeneousVolume v = openpbr_create_volume_from_openpbr_params(
-        g.transmission_color, g.transmission_depth, g.transmission_scatter, g.transmission_scatter_anisotropy);
+    OpenPBR_HomogeneousVolume v = openpbr_create_volume_from_openpbr_params(p.color, p.depth, p.scatter, p.anisotropy);
     r.sigma_t = max(v.extinction_coefficient, 0.0);
     r.sigma_s = r.sigma_t * saturate(v.albedo);
     r.anisotropy = v.anisotropy;
     return r;
 }
 
+// Textured interiors a shadow ray keeps apart; the faces of any past these sum with the last.
+public static const uint SHADOW_MEDIA = 4;
+
+// What a shadow ray's faces of one textured interior sum: the signed distance inside, and the
+// sigma of the faces it enters and leaves by, in xyz, with how many in w.
+public struct VaryingMedium
+{
+    public uint material;
+    public float reach;
+    public float4 entered;
+    public float4 left;
+
+    public float3 depth()
+    {
+        float4 sigma = entered.w > 0.0 ? entered : left;
+        return sigma.xyz * (reach / sigma.w);
+    }
+}
+
 // The candidates of one shadow ray from `origin` along unit `dir` to `t_max`. Dielectric
 // interiors add their optical depth to `depth` with the sign of the face crossed: minus the
 // candidate's distance times sigma at a front face, plus it at a back face, so the sum is the
-// optical depth over the ray's distance inside in any candidate order.
+// optical depth over the ray's distance inside in any candidate order. A medium that varies by
+// its entry point has no pairing in that order: each one's faces sum its distance inside, and
+// the sigma of the faces the ray enters by, as a path along it would read, averaging at the end.
+// A ray that only leaves takes the sigma of the faces it leaves by.
 public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
 {
     public SceneRoot* scene;
@@ -87,6 +109,8 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
     public HitContext context;
     public float3 depth;
     public bool environment;
+    public uint varying_count;
+    public VaryingMedium varying[SHADOW_MEDIA];
 
     public bool positions(Candidate c)
     {
@@ -129,8 +153,38 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
             return float3(1.0);
         float3 n = sh.surface.geometric_normal;
         bool front = dot(n, dir) < 0.0;
-        depth += interior_medium(scene, interior_material(scene, sh.surface.material)).sigma_t * (front ? -c.t : c.t);
+        uint m = interior_material(scene, sh.surface.material);
+        float reach = front ? -c.t : c.t;
+        if ((scene.materials[m].flags & (MATERIAL_MEDIUM_TEXTURED | MATERIAL_THIN_WALLED)) == MATERIAL_MEDIUM_TEXTURED)
+        {
+            uint k = varying_entry(m);
+            varying[k].reach += reach;
+            float4 sigma = float4(interior_medium(scene, m, sh.surface.medium_point).sigma_t, 1.0);
+            if (front)
+                varying[k].entered += sigma;
+            else
+                varying[k].left += sigma;
+        }
+        else
+            depth += interior_medium(scene, m).sigma_t * reach;
         return bsdf_straight_transmission(sh.surface.bsdf, n, dir, AMBIENT_IOR, environment);
+    }
+
+    // Where the faces of textured interior `m` sum.
+    [mutating]
+    uint varying_entry(uint m)
+    {
+        for (uint k = 0; k < varying_count; k++)
+        {
+            if (varying[k].material == m)
+                return k;
+        }
+        if (varying_count == SHADOW_MEDIA)
+            return SHADOW_MEDIA - 1;
+        VaryingMedium none = { m, 0.0, float4(0.0), float4(0.0) };
+        varying[varying_count] = none;
+        varying_count++;
+        return varying_count - 1;
     }
 
     // A medium proxy is the cube [-1, 1]^3 in its instance's object space. The ray's span
@@ -198,7 +252,17 @@ public float3 visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants*
 // segment left out of the product and returned in `depth`.
 public float3 surface_visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, uint* overflows, out float3 depth)
 {
-    ShadowCandidates<S, M> h = { s, v, origin, dir, t_max, context, float3(0.0), environment };
+    // Field by field: an initializer list would clear `varying` on every ray.
+    ShadowCandidates<S, M> h;
+    h.scene = s;
+    h.view = v;
+    h.origin = origin;
+    h.dir = dir;
+    h.t_max = t_max;
+    h.context = context;
+    h.depth = float3(0.0);
+    h.environment = environment;
+    h.varying_count = 0;
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = dir;
@@ -209,6 +273,8 @@ public float3 surface_visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewCo
     float3 product = trace_transmittance(s.tlas, ray, SHADOW_MASK, flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, h, SHADOW_CANDIDATES, overflow);
     if (overflow && overflows != nullptr)
         InterlockedAdd(*overflows, 1u);
+    for (uint k = 0; k < h.varying_count; k++)
+        h.depth += h.varying[k].depth();
     depth = max(h.depth, 0.0);
     return product;
 }

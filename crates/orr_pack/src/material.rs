@@ -229,11 +229,15 @@ impl Material {
 
 /// Texture slots. All but `NORMAL`, `COAT_NORMAL`, `EMISSION`, `EMISSION_LUMINANCE`,
 /// `SPECULAR_WEIGHT`, `SPECULAR_IOR`, `COAT_IOR`, `THIN_FILM_IOR`, `THIN_FILM_THICKNESS`,
-/// `SUBSURFACE_RADIUS` and the three of displacement read values of 0..1. Nothing clamps what they
-/// sample: a signed texture bound to one is the caller's responsibility. A value multiplies its
-/// field, with three exceptions: `TANGENT` and `COAT_TANGENT` hold a direction in the tangent plane
-/// in their first two channels at `0.5 v + 0.5`, on top of the field's rotation, and
-/// `SUBSURFACE_ANISOTROPY` holds the anisotropy at `0.5 g + 0.5`, in place of the field.
+/// `SUBSURFACE_RADIUS`, `TRANSMISSION_DEPTH`, `DISPERSION_ABBE` and the three of displacement read
+/// values of 0..1. Nothing clamps what they sample: a signed texture bound to one is the caller's
+/// responsibility. A value multiplies its field, with three exceptions: `TANGENT` and
+/// `COAT_TANGENT` hold a direction in the tangent plane in their first two channels at
+/// `0.5 v + 0.5`, on top of the field's rotation, and
+/// `SUBSURFACE_ANISOTROPY` and `TRANSMISSION_SCATTER_ANISOTROPY` hold the anisotropy at
+/// `0.5 g + 0.5`, in place of the field. What describes an interior medium, these slots and
+/// `TRANSMISSION_COLOR` under a depth above 0, reads where a path enters the medium: it is
+/// homogeneous, and each entry point states its own.
 pub mod slot {
     pub const BASE_COLOR: usize = 0;
     pub const OPACITY: usize = 1;
@@ -273,7 +277,12 @@ pub mod slot {
     pub const EMISSION_LUMINANCE: usize = 35;
     pub const DISPLACEMENT_U: usize = 36;
     pub const DISPLACEMENT_V: usize = 37;
-    pub const COUNT: usize = 38;
+    pub const TRANSMISSION_DEPTH: usize = 38;
+    pub const TRANSMISSION_SCATTER: usize = 39;
+    pub const TRANSMISSION_SCATTER_ANISOTROPY: usize = 40;
+    pub const DISPERSION_SCALE: usize = 41;
+    pub const DISPERSION_ABBE: usize = 42;
+    pub const COUNT: usize = 43;
     /// Slots from here on read only for a material that binds one of them.
     pub const MORE: usize = SPECULAR_COLOR;
 }

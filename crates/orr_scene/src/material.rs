@@ -58,6 +58,8 @@ pub mod material_flags {
     pub const BACK_SIDE: u32 = 1 << 29;
     /// Displacement reads `TEXTURE_DISPLACEMENT_U` and `TEXTURE_DISPLACEMENT_V` too.
     pub const DISPLACED_TANGENT: u32 = 1 << 30;
+    /// `material_medium` reads textures.
+    pub const MEDIUM_TEXTURED: u32 = 1 << 31;
 }
 
 /// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
@@ -191,6 +193,14 @@ impl MaterialGpu {
             bound(slot::DISPLACEMENT_U) || bound(slot::DISPLACEMENT_V),
             f::DISPLACED_TANGENT,
         );
+        // A thin wall has no medium, but its IOR still disperses.
+        let tinted = bound(slot::TRANSMISSION_COLOR) && m.transmission_depth > 0.0;
+        let medium = (slot::TRANSMISSION_DEPTH..=slot::TRANSMISSION_SCATTER_ANISOTROPY).any(bound);
+        let dispersion = bound(slot::DISPERSION_SCALE) || bound(slot::DISPERSION_ABBE);
+        set(
+            dispersion || (!thin && (medium || tinted)),
+            f::MEDIUM_TEXTURED,
+        );
         set(m.coat_weight > 0.0, f::COAT);
         set(m.fuzz_weight > 0.0, f::FUZZ);
         set(m.thin_film_weight > 0.0, f::THIN_FILM);
@@ -286,7 +296,6 @@ impl MaterialGpu {
             transmission_dispersion_scale: m.transmission_dispersion_scale,
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
             back: 0,
-            _pad0: 0,
             data: 0,
             texture_streams: GpuPtr::NULL,
             tiles: textures.map(|t| t.tiles),

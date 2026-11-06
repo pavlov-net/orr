@@ -274,6 +274,15 @@ pub const LIGHT_FLOOR: &str = "light floor";
 /// A smooth glass slab 1.6 x [`SLAB_THICKNESS`] x 1 m around its origin (IOR 1.5) whose
 /// interior transmits half the light over its thickness.
 pub const TINTED_SLAB: &str = "tinted slab";
+/// [`TINTED_SLAB`] whose `transmission_depth` a texture of 128 / 255 multiplies.
+pub const DEPTH_TEXTURED_SLAB: &str = "depth textured slab";
+/// [`DEPTH_TEXTURED_SLAB`] [`SHEET_THICKNESS`] thick, with a `transmission_depth` of
+/// [`SHEET_DEPTH`].
+pub const DEPTH_TEXTURED_SHEET: &str = "depth textured sheet";
+/// A length the mesh's position grid holds exactly, since an optical depth this steep shows its
+/// rounding.
+pub const SHEET_THICKNESS: f32 = 0.0625;
+pub const SHEET_DEPTH: f32 = 0.06;
 /// [`TINTED_SLAB`], double-sided.
 pub const TWO_SIDED_SLAB: &str = "two-sided slab";
 pub const SLAB_THICKNESS: f32 = 0.3;
@@ -643,6 +652,21 @@ fn mesh(build: impl FnOnce(&mut MeshBuilder)) -> MeshInput {
     b.finish()
 }
 
+/// A flat gray of 128 / 255.
+fn gray_png() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("orr_lighting_bed_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gray.png");
+    let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 4, 4);
+    enc.set_color(png::ColorType::Grayscale);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()
+        .unwrap()
+        .write_image_data(&[128; 16])
+        .unwrap();
+    path
+}
+
 /// A grayscale PNG of concentric rings, opaque on the inner 60% of each ring.
 fn rings_png() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("orr_lighting_bed_{}", std::process::id()));
@@ -839,6 +863,12 @@ fn cook() -> Arc<[u8]> {
         transmission_depth: SLAB_THICKNESS,
         ..glass
     };
+    let mut depth_textured = tinted;
+    depth_textured.textures[slot::TRANSMISSION_DEPTH].texture = AssetId::from_name("gray");
+    let depth_textured_sheet = Material {
+        transmission_depth: SHEET_DEPTH,
+        ..depth_textured
+    };
     let two_sided = Material {
         double_sided: 1,
         ..tinted
@@ -942,6 +972,16 @@ fn cook() -> Arc<[u8]> {
             Target::Memory,
             vec![
                 AssetSpec {
+                    name: "gray".into(),
+                    source: Source::Texture {
+                        path: gray_png(),
+                        settings: TextureSettings {
+                            usage: Usage::Data(orr_cook::DataFormat::R8),
+                            ..TextureSettings::default()
+                        },
+                    },
+                },
+                AssetSpec {
                     name: "rings".into(),
                     source: Source::Texture {
                         path: rings_png(),
@@ -1037,6 +1077,16 @@ fn cook() -> Arc<[u8]> {
                     TINTED_SLAB,
                     mesh(|b| b.cuboid(0, Vec3::new(0.8, SLAB_THICKNESS * 0.5, 0.5))),
                     vec![tinted],
+                ),
+                model(
+                    DEPTH_TEXTURED_SLAB,
+                    mesh(|b| b.cuboid(0, Vec3::new(0.8, SLAB_THICKNESS * 0.5, 0.5))),
+                    vec![depth_textured],
+                ),
+                model(
+                    DEPTH_TEXTURED_SHEET,
+                    mesh(|b| b.cuboid(0, Vec3::new(0.8, SHEET_THICKNESS * 0.5, 0.5))),
+                    vec![depth_textured_sheet],
                 ),
                 model(
                     TWO_SIDED_SLAB,

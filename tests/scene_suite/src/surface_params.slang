@@ -20,6 +20,12 @@ struct Params
     float fuzz_roughness;
     float3 emission;
     float thin_film_weight;
+    float3 medium_color;
+    float medium_depth;
+    float3 medium_scatter;
+    float medium_anisotropy;
+    float medium_dispersion_scale;
+    float medium_dispersion_abbe;
     float thin_film_thickness;
     float thin_film_ior;
     float diffuse_roughness;
@@ -88,6 +94,13 @@ void main(uint3 id: SV_DispatchThreadID)
     o.subsurface_radius = p.subsurface_radius;
     o.fuzz_roughness = p.fuzz_roughness;
     o.emission = p.emission;
+    MediumParams medium = material_medium(i.scene.materials + id.x, float4(0.25));
+    o.medium_color = medium.color;
+    o.medium_depth = medium.depth;
+    o.medium_scatter = medium.scatter;
+    o.medium_anisotropy = medium.anisotropy;
+    o.medium_dispersion_scale = medium.dispersion_scale;
+    o.medium_dispersion_abbe = medium.dispersion_abbe;
     o.thin_film_weight = p.thin_film_weight;
     o.thin_film_thickness = p.thin_film_thickness;
     o.thin_film_ior = p.thin_film_ior;

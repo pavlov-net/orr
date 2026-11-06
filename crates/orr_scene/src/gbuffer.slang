@@ -96,6 +96,7 @@ public struct GSurface
     public uint cluster;            // mesh cluster index,
     public uint primitive;          // triangle in the cluster
     public uint material;
+    public float4 medium_point;     // uv sets 0 and 1, where a medium entered here reads: `material_medium`
 }
 
 // A cluster the raster drew this view: the visibility buffer names it by its index here.
@@ -430,6 +431,7 @@ public GSurface decode_gsurface(GBufferWords w)
     s.cluster = 0;
     s.primitive = 0;
     s.material = 0;
+    s.medium_point = NO_MEDIUM_POINT;
     return s;
 }
 

@@ -8954,6 +8954,44 @@ fn every_slot_reaches_its_parameter() {
         ])
         .collect();
     records.extend(slots.iter().map(|&s| with(s)));
+    // OpenPBR's medium, at a point of each slot that describes it.
+    let medium_base = Material {
+        transmission_color: [0.5, 0.6, 0.7],
+        transmission_depth: 2.0,
+        transmission_scatter: [0.25, 0.5, 0.75],
+        transmission_scatter_anisotropy: 0.25,
+        transmission_dispersion_scale: 0.5,
+        transmission_dispersion_abbe_number: 40.0,
+        ..base
+    };
+    let medium_slots = [
+        slot::TRANSMISSION_COLOR,
+        slot::TRANSMISSION_DEPTH,
+        slot::TRANSMISSION_SCATTER,
+        slot::TRANSMISSION_SCATTER_ANISOTROPY,
+        slot::DISPERSION_SCALE,
+        slot::DISPERSION_ABBE,
+    ];
+    let first_medium = records.len();
+    records.push(MaterialGpu::new(
+        &medium_base,
+        &[BoundTexture::NONE; slot::COUNT],
+    ));
+    records.extend(medium_slots.map(|s| {
+        let mut bound = [BoundTexture::NONE; slot::COUNT];
+        bound[s] = bound_texture;
+        MaterialGpu::new(&medium_base, &bound)
+    }));
+    let thin_dispersion = records.len();
+    let mut bound = [BoundTexture::NONE; slot::COUNT];
+    bound[slot::DISPERSION_SCALE] = bound_texture;
+    records.push(MaterialGpu::new(
+        &Material {
+            thin_walled: 1,
+            ..medium_base
+        },
+        &bound,
+    ));
     let mut object = with(slot::COAT_NORMAL);
     object.flags |= orr_scene::material_flags::OBJECT_COAT_NORMAL;
     records.push(object);
@@ -9038,6 +9076,42 @@ fn every_slot_reaches_its_parameter() {
         "coat normal {n:?}"
     );
     assert_eq!(plain.coat_normal, [0.0, 0.0, 1.0]);
+    let plain_medium = &out[first_medium];
+    let medium = |k: usize| &out[first_medium + 1 + k];
+    for (c, &texel) in v.iter().enumerate().take(3) {
+        close(
+            medium(0).medium_color[c],
+            plain_medium.medium_color[c] * texel,
+            slot::TRANSMISSION_COLOR,
+        );
+        close(
+            medium(2).medium_scatter[c],
+            plain_medium.medium_scatter[c] * texel,
+            slot::TRANSMISSION_SCATTER,
+        );
+    }
+    close(medium(1).medium_depth, 2.0 * v[0], slot::TRANSMISSION_DEPTH);
+    close(
+        medium(3).medium_anisotropy,
+        2.0 * v[0] - 1.0,
+        slot::TRANSMISSION_SCATTER_ANISOTROPY,
+    );
+    close(
+        medium(4).medium_dispersion_scale,
+        0.5 * v[0],
+        slot::DISPERSION_SCALE,
+    );
+    close(
+        medium(5).medium_dispersion_abbe,
+        40.0 * v[0],
+        slot::DISPERSION_ABBE,
+    );
+    // A thin wall has no medium, but its IOR disperses by the same texture.
+    close(
+        out[thin_dispersion].medium_dispersion_scale,
+        0.5 * v[0],
+        slot::DISPERSION_SCALE,
+    );
     // A mesh space direction turns with the placement, a quarter turn about z.
     let [x, y, z] = [v[0], v[1], v[2]].map(|c| 2.0 * c - 1.0);
     let want = Vec3::new(-y, x, z).normalize();

@@ -17,12 +17,27 @@ public struct Interior
 {
     public uint count;
     public uint entries[INTERIOR_ENTRIES];
+    public float4 points[INTERIOR_ENTRIES]; // where each was entered: `material_medium`
 
     public __init()
     {
         count = 0;
         for (uint i = 0; i < INTERIOR_ENTRIES; i++)
+        {
             entries[i] = MATERIAL_NONE;
+            points[i] = NO_MEDIUM_POINT;
+        }
+    }
+
+    // Where entry `m` was entered; NO_MEDIUM_POINT for one that isn't an entry.
+    public float4 point(uint m)
+    {
+        for (uint i = 0; i < count; i++)
+        {
+            if (entries[i] == m)
+                return points[i];
+        }
+        return NO_MEDIUM_POINT;
     }
 
     public uint innermost()
@@ -42,10 +57,10 @@ public struct Interior
         return MATERIAL_NONE;
     }
 
-    // Crosses the surface of material `m`: into it from its front, out of it from its back.
-    // A full list drops its outermost entry to take a new one.
+    // Crosses the surface of material `m`: into it from its front at `entered`, out of it from
+    // its back. A full list drops its outermost entry to take a new one.
     [mutating]
-    public void cross(uint m, bool front)
+    public void cross(uint m, bool front, float4 entered = NO_MEDIUM_POINT)
     {
         uint at = INTERIOR_ENTRIES;
         for (uint i = 0; i < count; i++)
@@ -62,6 +77,7 @@ public struct Interior
             else
             {
                 entries[count] = m;
+                points[count] = entered;
                 count++;
                 return;
             }
@@ -69,9 +85,15 @@ public struct Interior
         else if (at == INTERIOR_ENTRIES)
             return;
         for (uint i = at; i + 1 < count; i++)
+        {
             entries[i] = entries[i + 1];
+            points[i] = points[i + 1];
+        }
         if (front)
+        {
             entries[count - 1] = m;
+            points[count - 1] = entered;
+        }
         else
         {
             count--;

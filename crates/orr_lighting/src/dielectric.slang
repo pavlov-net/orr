@@ -362,13 +362,13 @@ public bool disperses(SceneRoot* s, uint m)
     return g.transmission_dispersion_scale > 0.0 && g.transmission_dispersion_abbe_number > 0.0;
 }
 
-// `ior`, the IOR of material `m` at 587.6 nm, at wavelength `nm`.
-public float dispersed_material_ior(SceneRoot* s, uint m, float ior, float nm)
+// `ior`, the IOR of material `m` at 587.6 nm, at wavelength `nm`, with what `point` reads.
+public float dispersed_material_ior(SceneRoot* s, uint m, float ior, float nm, float4 point)
 {
     if (m == MATERIAL_NONE)
         return ior;
-    MaterialGpu* g = s.materials + m;
-    return dispersed_ior(ior, g.transmission_dispersion_scale, g.transmission_dispersion_abbe_number, nm);
+    MediumParams p = material_medium(s.materials + m, point);
+    return dispersed_ior(ior, p.dispersion_scale, p.dispersion_abbe, nm);
 }
 
 // Whether layer vertex `l`, reached with `interior`, has a dispersive side.
@@ -392,8 +392,11 @@ public Bsdf prepare_vertex(SceneRoot* s, LayerVertex l, Interior interior, uint 
     float exterior = interior_ior(s, outside);
     if (layer && nm > 0.0)
     {
-        p.specular_ior = dispersed_material_ior(s, m, p.specular_ior, nm);
-        exterior = dispersed_material_ior(s, outside, exterior, nm);
+        // A path inside `m` read it where it entered; a path meeting it reads it here.
+        float4 entered = interior.point(m);
+        float4 point = entered.x != NO_MEDIUM_POINT.x ? entered : l.x.surface.medium_point;
+        p.specular_ior = dispersed_material_ior(s, m, p.specular_ior, nm, point);
+        exterior = dispersed_material_ior(s, outside, exterior, nm, interior.point(outside));
     }
     return bsdf_prepare(p, l.x.surface.normal, l.x.view, exterior);
 }
@@ -780,7 +783,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                 if (crossed)
                 {
                     uint inside = interior_material(s, l.x.surface.material);
-                    interior.cross(inside, l.front);
+                    interior.cross(inside, l.front, l.x.surface.medium_point);
                     if (l.front)
                     {
                         entered = inside;
@@ -821,6 +824,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
         bool scatters = false;
         bool interior_walk = false;
         float3 scatter_at = float3(0.0);
+        float scatter_anisotropy = 0.0;
         if (alive && !walking)
         {
             depth++;
@@ -832,7 +836,8 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             medium = interior.innermost();
             if (medium != MATERIAL_NONE)
             {
-                InteriorMedium im = interior_medium(s, medium);
+                InteriorMedium im = interior_medium(s, medium, interior.point(medium));
+                scatter_anisotropy = im.anisotropy;
                 // A walk takes a bounce; a ray leaving an opaque vertex takes transmittance only.
                 bool walks = ray.chain && (reference || !walked) && opaque < r.max_bounces
                     && max_component(im.sigma_s) * t >= 1.0;
@@ -904,7 +909,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
         {
             if (scatters && !interior_walk)
             {
-                l = scatter_vertex(v, scatter_at, ray.dir, medium, interior_medium(s, medium).anisotropy);
+                l = scatter_vertex(v, scatter_at, ray.dir, medium, scatter_anisotropy);
                 if (cache && !reference)
                 {
                     if (counted)
@@ -1132,7 +1137,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
     if (!open)
         through = float3(0.0);
     else if (crosses_interior(s, x.x.surface.material))
-        list.cross(interior_material(s, x.x.surface.material), x.front);
+        list.cross(interior_material(s, x.x.surface.material), x.front, x.x.surface.medium_point);
     float length_so_far = 0.0;
     // What the chain's interiors scatter, which shows in their single-scattering color.
     float3 scattered = float3(0.0);
@@ -1146,7 +1151,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
         LayerAccept<S> ta = { s, v, d, hit_context(HIT_SECONDARY, k + 1, cone, 0.0), 0, PRESENCE_ANY };
         float3 positions[3];
         Hit th = trace_closest(s.tlas, path_ray(vertex_origin(x.x, d), d, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, ta, positions);
-        InteriorMedium im = interior_medium(s, list.innermost());
+        InteriorMedium im = interior_medium(s, list.innermost(), list.point(list.innermost()));
         float3 tr = beer(im.sigma_t, th.hit ? th.t : positive_infinity());
         scattered += through * (1.0 - tr) * im.albedo();
         through *= tr;
@@ -1179,7 +1184,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
         }
         blur += rough_widening(x, length_so_far);
         if (crosses_interior(s, x.x.surface.material))
-            list.cross(interior_material(s, x.x.surface.material), x.front);
+            list.cross(interior_material(s, x.x.surface.material), x.front, x.x.surface.medium_point);
     }
     float wr = luminance_rec2020(a.specular + a.diffuse + scattered);
     float wt = luminance_rec2020(through);
@@ -1334,7 +1339,7 @@ public void dielectric_body<C : ICoherence, S : ISurface, E : IEnvironment, M : 
     uint layers = 0;
     float t_first = hit_layer ? h.t : t_opaque;
     uint medium = interior.innermost();
-    InteriorMedium im = interior_medium(s, medium);
+    InteriorMedium im = interior_medium(s, medium, interior.point(medium));
     float scattered;
     bool path = true;
     bool scatters = carried && interior_segment(im, t_first, true, rng, throughput, scattered);
