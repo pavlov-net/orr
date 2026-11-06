@@ -1,6 +1,6 @@
 //! Patches into pages.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::{Add, Div, Mul, Sub};
 
 use orr_math::{Vec2, Vec3, Vec4};
@@ -407,8 +407,7 @@ pub(super) fn build(
     if !cage.uvs.is_empty() {
         attributes |= SubdHeader::UV;
     }
-    let reads_uv1 = |m| crate::mesh::reads_uv1(m);
-    if cage.uvs.iter().any(|u| u.set == 1) || materials.iter().any(reads_uv1) {
+    if cage.uvs.iter().any(|u| u.set == 1) || materials.iter().any(crate::mesh::reads_uv1) {
         attributes |= SubdHeader::UV1;
     }
     if data.skin.is_some() {
@@ -448,10 +447,13 @@ pub(super) fn build(
     })
 }
 
-/// A warning per section that reads uv set 1 on faces no [`super::CageUv`] of the set covers,
-/// which read uv 0.
+/// A warning per section that reads uv set 1 on drawn faces no [`super::CageUv`] of the set
+/// covers, which read uv 0.
 fn uv1_warnings(cage: &CageInput, materials: &[Material]) -> Vec<String> {
     let mut covered = vec![false; cage.face_counts.len()];
+    for &hole in &cage.holes {
+        covered[hole as usize] = true;
+    }
     for u in cage.uvs.iter().filter(|u| u.set == 1) {
         if u.faces.is_empty() {
             covered.fill(true);
@@ -460,18 +462,19 @@ fn uv1_warnings(cage: &CageInput, materials: &[Material]) -> Vec<String> {
             covered[f as usize] = true;
         }
     }
-    let mut lacking = vec![false; materials.len()];
-    for f in (0..covered.len()).filter(|&f| !covered[f]) {
-        let section = cage.face_sections.get(f).copied().unwrap_or(0);
-        lacking[usize::from(section)] = true;
-    }
-    let reads = materials.iter().map(crate::mesh::reads_uv1);
-    let lacks = reads
-        .zip(lacking)
-        .enumerate()
-        .filter(|(_, (r, l))| *r && *l);
-    lacks
-        .map(|(i, _)| format!("section {i} reads uv set 1, which faces of it lack; they read uv 0"))
+    let lacking: BTreeSet<u16> = (0..covered.len())
+        .filter(|&f| !covered[f])
+        .map(|f| cage.face_sections.get(f).copied().unwrap_or(0))
+        .collect();
+    // A library caller's cage may name no materials: its faces are in a section 0 that isn't there.
+    lacking
+        .into_iter()
+        .filter(|&s| {
+            materials
+                .get(usize::from(s))
+                .is_some_and(crate::mesh::reads_uv1)
+        })
+        .map(|s| format!("section {s} reads uv set 1, which faces of it lack; they read uv 0"))
         .collect()
 }
 
@@ -692,7 +695,11 @@ fn check_color_reach(page: &Page, values: &[[f32; 4]]) -> Result<(), String> {
         .into_iter()
         .map(Vec4::from_array)
         .collect();
-    for part in &page.parts {
+    for part in page
+        .parts
+        .iter()
+        .filter(|p| p.channels & (Part::UV - 1) != 0)
+    {
         let first = part.cvs as usize;
         let cvs: Vec<u32> = page.part_cvs[first..first + part.param.cv_count()]
             .iter()
@@ -990,7 +997,7 @@ mod tests {
         let steps = [0.0, 0.13, 0.5, 0.77, 1.0];
         let mut at = Vec::new();
         let mut ours = Vec::new();
-        let mut corner_counts = std::collections::BTreeSet::new();
+        let mut corner_counts = BTreeSet::new();
         let mut shared: HashMap<orr_pack::subd::CagePoint, [f32; 3]> = HashMap::new();
         for (bytes, page_info) in cooked.pages.iter().zip(&info.pages) {
             let page = Page::parse(bytes).unwrap();
