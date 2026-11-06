@@ -4475,3 +4475,30 @@ def Mesh "Picked"
     assert_eq!(skeleton, AssetId::from_name("u/Mover/Crowd/skeleton"));
     assert_eq!(joint, 1);
 }
+
+/// `pointInstancer.h`: "the 64 bit integer ID of the particle". Ids a double cannot tell apart are
+/// two instances, and a mask names one of them.
+#[test]
+fn ids_past_a_double_stay_apart() {
+    for (name, mask) in [
+        ("attribute", "int64[] invisibleIds = [9007199254740993]"),
+        ("metadata", ""),
+    ] {
+        let stage = instancer(&format!(
+            "int[] protoIndices = [0, 0]
+    point3f[] positions = [(0, 0, 0), (1, 0, 0)]
+    int64[] ids = [9007199254740992, 9007199254740993]
+    {mask}"
+        ));
+        let stage = match name {
+            "metadata" => stage.replacen(
+                "def PointInstancer \"I\"",
+                "def PointInstancer \"I\" (\n    inactiveIds = [ 9007199254740993 ]\n)",
+                1,
+            ),
+            _ => stage,
+        };
+        let a = cook(&format!("ids-wide-{name}"), &stage);
+        assert_eq!(copies(&a, "u/P").len(), 1, "{name}");
+    }
+}

@@ -1899,7 +1899,9 @@ impl<'s> Importer<'s> {
         // A crate file holds a list op; text gives a plain list its own type.
         match inactive {
             Some(sdf::Value::Int64ListOp(op)) => masked.extend(op.flatten()),
-            Some(v) => masked.extend(read::numbers(&v).iter().flatten().map(|&x| x as i64)),
+            Some(v) => masked.extend(
+                read::integers(&v).ok_or_else(|| format!("{path} inactiveIds: not integers"))?,
+            ),
             None => {}
         }
         if positions.len() != 3 * count {

@@ -324,6 +324,24 @@ pub(super) fn numbers(v: &sdf::Value) -> Option<Vec<f64>> {
     }
 }
 
+/// Every integer of a value, as stored: an id past 2^53 does not survive an `f64`.
+pub(super) fn integers(v: &sdf::Value) -> Option<Vec<i64>> {
+    use sdf::Value as V;
+    Some(match v {
+        V::Uchar(x) => vec![i64::from(*x)],
+        V::UcharVec(x) => x.iter().map(|&x| i64::from(x)).collect(),
+        V::Int(x) => vec![i64::from(*x)],
+        V::IntVec(x) => x.iter().map(|&x| i64::from(x)).collect(),
+        V::Uint(x) => vec![i64::from(*x)],
+        V::UintVec(x) => x.iter().map(|&x| i64::from(x)).collect(),
+        V::Int64(x) => vec![*x],
+        V::Int64Vec(x) => x.clone(),
+        V::Uint64(x) => vec![*x as i64],
+        V::Uint64Vec(x) => x.iter().map(|&x| x as i64).collect(),
+        _ => return None,
+    })
+}
+
 /// The numbers in one element of an array value; `None` for a value that is no array.
 fn element_width(v: &sdf::Value) -> Option<usize> {
     use sdf::Value as V;
@@ -391,9 +409,12 @@ impl PrimReader<'_> {
     }
 
     pub(super) fn ints(&self, name: &str) -> Result<Option<Vec<i64>>, String> {
-        Ok(self
-            .numbers(name)?
-            .map(|v| v.into_iter().map(|x| x as i64).collect()))
+        match self.value(name)? {
+            None => Ok(None),
+            Some(v) => integers(&v)
+                .map(Some)
+                .ok_or_else(|| format!("{} {name}: not integers", self.path())),
+        }
     }
 
     pub(super) fn token(&self, name: &str) -> Result<Option<String>, String> {
