@@ -1852,6 +1852,51 @@ fn instanced_nodes_move_with_rigs_and_skins() {
     assert_eq!(pages.count(), 1);
 }
 
+/// L2124 asks nothing of an inverse bind but four rows, so one may not invert, or only just: a
+/// rigid mesh on such a joint holds its place all the same, on a joint of its own for the node.
+#[test]
+fn a_rigid_mesh_sits_on_a_joint_whatever_its_skin_binds() {
+    let turn = Mat4::from_rotation_z(0.7);
+    for (name, bind) in [
+        ("thin", turn * Mat4::from_scale(Vec3::new(1.0, 1e-6, 1.0))),
+        (
+            "thin-turned",
+            turn * Mat4::from_scale(Vec3::new(1.0, 1e-6, 1.0)) * turn.inverse(),
+        ),
+        ("flat", turn * Mat4::from_scale(Vec3::new(1.0, 0.0, 1.0))),
+    ] {
+        let path = dir(&format!("rigid-on-{name}")).join("skin.glb");
+        let mut g = Glb::default();
+        let (pa, ja, wa) = skinned_triangle(&mut g);
+        let ba = g.floats(&[bind.to_cols_array()], "MAT4");
+        g.write(
+            &path,
+            &format!(
+                r#""scene":0,"scenes":[{{"nodes":[0,2]}}],
+"nodes":[{{"name":"hip","translation":[3,0,0],"children":[1]}},
+{{"mesh":1,"translation":[0,2,0]}},{{"mesh":0,"skin":0}}],
+"skins":[{{"joints":[0],"inverseBindMatrices":{ba}}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}}}}]}},
+{{"primitives":[{{"attributes":{{"POSITION":{pa}}}}}]}}]"#
+            ),
+        );
+        let (a, _) = cooked(&path);
+        let sk = skeleton(&a);
+        let rest = palette(&sk, &sk.rest);
+        let want = TRIANGLE.map(|p| Vec3::from(p) + Vec3::new(3.0, 2.0, 0.0));
+        let got: Vec<Vec3> = skinned_corners(&a)
+            .iter()
+            .map(|&(p, j)| rest[j].transform_point3(p))
+            .collect();
+        for w in want {
+            assert!(
+                got.iter().any(|&g| near(g, w)),
+                "{name}: {w} not in {got:?}"
+            );
+        }
+    }
+}
+
 /// L2098, L2100: inverse binds are per skin, and L2167 lets the nodes of one mesh "specify
 /// different ... skins", so two skins may bind one joint differently. Each keeps its bind, and
 /// a clip on the joint moves both.

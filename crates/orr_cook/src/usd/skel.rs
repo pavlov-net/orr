@@ -5,9 +5,9 @@
 //! nearest ancestor path among them, a joint without one being a root. Model space is the
 //! stage's (Y up, meters): [`SkeletonInfo::root`] is the skeleton prim's world transform,
 //! inverse binds are those of the bind transforms in model space, and rest transforms come
-//! from `restTransforms` (from the bind transforms without them). A bind transform that
-//! collapses an axis takes its pseudo-inverse, so the points bound to it land on the surface
-//! it flattens to. Skinned points are `geomBindTransform` (unset if it is not a matrix) times
+//! from `restTransforms` (from the bind transforms without them). A bind transform with no
+//! inverse takes its pseudo-inverse, so the points bound to it land on the surface it flattens
+//! to. Skinned points are `geomBindTransform` (unset if it is not a matrix) times
 //! the authored points in the skeleton's model space, or its own space in scene units and axes
 //! where the skeleton prim's world transform collapses an axis and has no inverse for the binds
 //! to undo; the mesh prim's own transform is not used, as UsdSkel specifies. A mesh's
@@ -35,7 +35,7 @@ use orr_pack::skeleton::{MAX_SKINNED_JOINTS, NO_PARENT, SkeletonInfo, Trs};
 
 use super::mesh::Influence;
 use super::read::{PrimReader, matrix, quat};
-use crate::import::collapses;
+use crate::import::{collapses, singular};
 use crate::skin::{self, Channel, ClipSettings, Interpolation, Property};
 
 pub(super) struct Skel {
@@ -131,8 +131,8 @@ fn trs(m: DMat4) -> Option<Trs> {
 }
 
 /// The Moore-Penrose inverse of rank-deficient `l`, from the characteristic polynomial of
-/// `l^T l` (Decell, 1965). The second invariant separates ranks 2 and 1 at the ratio of singular
-/// values that [`collapses`] takes for rounding, squared as `l^T l` squares them.
+/// `l^T l` (Decell, 1965). The second invariant separates ranks 2 and 1 at a ratio of singular
+/// values of 1e-5, squared as `l^T l` squares them.
 fn pseudo_inverse(l: DMat3) -> DMat3 {
     let trace = |m: DMat3| m.x_axis.x + m.y_axis.y + m.z_axis.z;
     let g = l.transpose() * l;
@@ -147,11 +147,11 @@ fn pseudo_inverse(l: DMat3) -> DMat3 {
     }
 }
 
-/// The inverse of a bind transform; where it collapses an axis, the transform that takes a
-/// point to the nearest one the bind reaches and back through it.
+/// The inverse of a bind transform; where it has none, the transform that takes a point to the
+/// nearest one the bind reaches and back through it.
 fn bind_inverse(m: DMat4) -> DMat4 {
     let l = DMat3::from_mat4(m);
-    if collapses(l) {
+    if singular(l) {
         DMat4::from_mat3(pseudo_inverse(l)) * DMat4::from_translation(-m.w_axis.truncate())
     } else {
         m.inverse()

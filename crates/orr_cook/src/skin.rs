@@ -8,7 +8,10 @@
 //! no skin are separate rigs. Joints are ordered parents first (scene order, depth first); mesh
 //! joint indices are remapped to that order. A joint no skin names gets the inverse of its rest
 //! transform as inverse bind, or identity when that collapses an axis. A node that skins bind
-//! differently has one joint per inverse bind, neighbors with the same parent and pose.
+//! differently has one joint per inverse bind, neighbors with the same parent and pose. A rigid
+//! mesh sits on a joint in bind space, so a bind that stretches would stretch the rounding of its
+//! vertices, and one that flattens would lose them: a node with no other bind takes one more
+//! joint for it, bound at the node's rest pose.
 //!
 //! A rig of no skin cooks as rigid parts, one per joint ([`Rig::rigid`]). The renderer poses every
 //! part but part 0, so such a skeleton starts with a still joint: unnamed, at identity, holding
@@ -28,7 +31,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec4, Mat3, Mat4, Quat, Vec3, Vec4};
+use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4, Mat3, Mat4, Quat, Vec3, Vec4};
 use orr_pack::AssetId;
 use orr_pack::clip::{Clip, ClipHeader};
 use orr_pack::skeleton::{MAX_JOINTS, MAX_SKINNED_JOINTS, NO_PARENT, SkeletonInfo, Trs, slerp};
@@ -358,6 +361,24 @@ impl Rig {
     }
 }
 
+/// The inverse bind of a joint no skin binds: its rest pose's, or the identity where that
+/// collapses an axis.
+fn rest_bind(rest: DMat4) -> DMat4 {
+    if collapses(DMat3::from_mat4(rest)) {
+        DMat4::IDENTITY
+    } else {
+        rest.inverse()
+    }
+}
+
+/// Whether `m` turns and scales alike on every axis, which keeps what it takes in shape.
+fn holds_shape(m: DMat4) -> bool {
+    let l = DMat3::from_mat4(m);
+    let g = l.transpose() * l;
+    let s = (g.x_axis.x + g.y_axis.y + g.z_axis.z) / 3.0;
+    s > 0.0 && (g - DMat3::from_diagonal(DVec3::splat(s))).abs_diff_eq(DMat3::ZERO, 1e-3 * s)
+}
+
 pub(crate) struct Skeleton {
     pub(crate) info: SkeletonInfo,
     /// glTF node per joint; a still joint has none.
@@ -426,6 +447,20 @@ impl Skeleton {
             }
             bound.push((s, joints));
         }
+        for &m in &rig.meshes {
+            if doc.nodes().nth(m).is_some_and(|d| d.skin().is_some()) {
+                continue;
+            }
+            let joint = graph.chain(m, rig.frame).find(|&n| rig.joints[n]);
+            if let Some((n, own)) = joint.and_then(|n| Some((n, binds.get_mut(&n)?)))
+                && !own.iter().any(|b| holds_shape(b.as_dmat4()))
+            {
+                let m = rest_bind(graph.in_model(rig.frame, n)?).as_mat4();
+                if !own.iter().any(|b| close(b, &m)) {
+                    own.push(m);
+                }
+            }
+        }
         let still = rig.still.then_some(0u16);
         let nodes: Vec<Option<usize>> = still
             .iter()
@@ -492,8 +527,7 @@ impl Skeleton {
             // for a pose that unflattens the joint.
             let ib = match binds.get(&n) {
                 Some(own) => own[j - usize::from(joint_of[&n])].as_dmat4(),
-                None if collapses(DMat3::from_mat4(rest_pose)) => DMat4::IDENTITY,
-                None => rest_pose.inverse(),
+                None => rest_bind(rest_pose),
             };
             inverse_binds.push(ib);
             info.inverse_binds.push(Affine3::from_mat4(ib.as_mat4()));
@@ -550,12 +584,15 @@ impl Skeleton {
     /// For a mesh node without a skin: the joint it follows rigidly (itself or its nearest
     /// skeleton ancestor in the model, else the still joint) and the transform from its local
     /// space to bind space, so the joint's skinning matrix moves it with the joint. The joints of
-    /// one node pose alike, so any whose bind has an inverse will do.
+    /// one node pose alike, so it takes one whose bind has an inverse, keeping shape if one does.
     pub(crate) fn attach(&self, node: usize, graph: &Graph) -> Result<(u16, DMat4), String> {
         for n in graph.chain(node, self.frame) {
             if let Some(&first) = self.joint_of.get(&n) {
-                let mut joints = self.joints_from(usize::from(first)).map(|j| j as u16);
-                let j = joints.find(|&j| self.bind(j).is_ok()).unwrap_or(first);
+                let joints = self.joints_from(usize::from(first));
+                let mut seated = joints.filter(|&j| self.bind(j as u16).is_ok());
+                let shaped = |&j: &usize| holds_shape(self.inverse_binds[j]);
+                let j = seated.clone().find(shaped).or(seated.next_back());
+                let j = j.map_or(first, |j| j as u16);
                 return Ok((j, self.bind(j)? * graph.relative(n, node)));
             }
         }

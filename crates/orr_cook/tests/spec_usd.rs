@@ -3754,3 +3754,58 @@ fn a_selected_model_keeps_what_moves_in_it() {
             .abs_diff_eq(door + Vec3::X * 2.0, 1e-4)
     );
 }
+
+/// `bindTransforms` take any invertible transform, whatever its orientation. A bind thin in a
+/// turned direction inverts in the cook's double precision, so a point off its plane comes back
+/// at rest instead of dropping to the plane.
+#[test]
+fn a_thin_turned_bind_keeps_the_points_off_its_plane() {
+    // 1e-6 along (1, -1, 0).
+    let (c, thin) = (std::f64::consts::FRAC_1_SQRT_2, 1e-6);
+    let bind = format!(
+        "(({c}, {c}, 0, 0), ({}, {}, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))",
+        -c * thin,
+        c * thin
+    );
+    let a = cook(
+        "skel-thin-bind",
+        &format!(
+            r#"def SkelRoot "Hero"
+{{
+    def Skeleton "Rig"
+    {{
+        uniform token[] joints = ["Root"]
+        uniform matrix4d[] bindTransforms = [{bind}]
+    }}
+    def Mesh "Body"
+    {{
+        {TRIANGLE}
+        rel skel:skeleton = </Hero/Rig>
+        int[] primvars:skel:jointIndices = [0] (
+            elementSize = 1
+            interpolation = "constant"
+        )
+        float[] primvars:skel:jointWeights = [1] (
+            elementSize = 1
+            interpolation = "constant"
+        )
+    }}
+}}"#
+        ),
+    );
+    let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    let (mut model, mut palette) = (
+        vec![orr_math::Affine3::IDENTITY; 1],
+        vec![orr_math::Affine3::IDENTITY; 1],
+    );
+    sk.model_pose(&sk.rest, &mut model);
+    sk.palette(&model, &mut palette);
+    let worst = corners(&a, "u/Hero/mesh")
+        .iter()
+        .map(|c| palette[0].transform_point3(c.0).distance(c.0))
+        .fold(0.0, f32::max);
+    assert!(
+        worst < 0.2,
+        "a point lands {worst} m from where it is bound"
+    );
+}

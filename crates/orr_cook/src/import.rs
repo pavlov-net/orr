@@ -155,6 +155,23 @@ pub(crate) fn collapses(l: DMat3) -> bool {
         || largest(kept.inverse()) > f64::from(f32::MAX)
 }
 
+/// Whether finite `l` does not invert in f64, the arithmetic of the cook's own transforms, which
+/// inverts what [`collapses`] keeps from an instance: the determinant is lost only to the rounding
+/// of the six products it sums.
+pub(crate) fn singular(l: DMat3) -> bool {
+    let [x, y, z] = l.to_cols_array_2d();
+    let products = [
+        x[0] * y[1] * z[2],
+        x[1] * y[2] * z[0],
+        x[2] * y[0] * z[1],
+        -x[2] * y[1] * z[0],
+        -x[1] * y[0] * z[2],
+        -x[0] * y[2] * z[1],
+    ];
+    let rounding = products.iter().map(|p| p.abs()).sum::<f64>() * 1e-14;
+    products.iter().sum::<f64>().abs() <= rounding || !l.inverse().is_finite()
+}
+
 /// The inverse transpose of `l` up to a positive scale, which exists where `l` collapses. Its
 /// largest entry is 1, so it fits an f32 whatever the size of `l`.
 pub(crate) fn normal_matrix(l: DMat3) -> DMat3 {
