@@ -14,7 +14,7 @@ use crate::lights::{EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, Light, LightId, light_
 use crate::material::MaterialId;
 use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
 use crate::memory::{RangeAllocator, UploadWindow};
-use crate::mount::{Mounts, PageId};
+use crate::mount::{InstancePage, Mounts, PageId};
 use crate::producer::{self, Producer, ProducerDesc, ProducerId, ProducerUpdate};
 use crate::ptlas::Ptlas;
 use crate::shaders::instance_page::PagePrototypeGpu;
@@ -217,6 +217,23 @@ pub struct InstancePageRef<'a> {
     pub user_tag: u32,
 }
 
+/// A cooked instance page of a skinned model, placed in a scene with
+/// [`SceneWriter::add_skinned_page`]: its records are the copies, as [`SkinnedDesc`] places them,
+/// each taking `joints` palette entries from `palette_first` on in record order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SkinnedPageRef {
+    pub page: PageId,
+    pub palette: TransformGroupId,
+    pub palette_first: u32,
+    /// Base in the scene's material-set table; None: the model's own materials.
+    pub material_set: Option<u32>,
+    pub flags: InstanceFlags,
+    /// m from the scene focus within which the copies are traced.
+    pub rt_range: f32,
+    /// Never read by orr.
+    pub user_tag: u32,
+}
+
 /// Per-copy variety: pose variant, material set and hidden sections (bit set = hidden).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
@@ -304,6 +321,33 @@ pub(crate) struct PageGroup {
 }
 
 impl Group {
+    /// The group of `page`'s records.
+    fn of_page(id: PageId, page: &InstancePage, frame: u64) -> Self {
+        let header = page.info.header;
+        Self {
+            writer: GroupWriter::Page,
+            count: u32::from(header.record_count),
+            anchor: WorldPos {
+                cell: IVec3::from_array(header.cell),
+                offset: orr_math::Vec3::ZERO,
+            },
+            buffers: Vec::new(),
+            current: 0,
+            previous_is_current: true,
+            created_frame: frame,
+            written: false,
+            page: Some(PageGroup {
+                page: id,
+                records: page.records.address().0,
+                changed: false,
+                origin: header.origin,
+                extent: header.extent,
+                log2_scale_min: header.log2_scale_min,
+                log2_scale_max: header.log2_scale_max,
+            }),
+        }
+    }
+
     pub(crate) fn record(&self) -> GroupGpu {
         if let Some(p) = &self.page {
             // SAFETY: the records stay resident while this record names them: their eviction
@@ -372,6 +416,15 @@ pub(crate) struct PagePlacement {
     pub(crate) entry_stride: u32,
     pub(crate) expanded: bool,
     /// Its prototypes' entries of the page part of the material-set table.
+    pub(crate) sets: (u32, u32),
+}
+
+/// A cooked page of skinned copies placed in a scene.
+pub(crate) struct SkinnedPage {
+    pub(crate) range: InstanceRange,
+    pub(crate) group: TransformGroupId,
+    pub(crate) page: PageId,
+    /// Its prototype's entries of the page part of the material-set table.
     pub(crate) sets: (u32, u32),
 }
 
@@ -454,6 +507,10 @@ pub(crate) struct SceneCpu {
     pub(crate) pages: Vec<PagePlacement>,
     /// Pages removed in a frame, freed once that frame has completed.
     pub(crate) pages_removed: Vec<(u64, PagePlacement)>,
+    pub(crate) skinned_pages: Vec<SkinnedPage>,
+    /// Entries of skinned pages' material sets by the frames that removed them, freed once
+    /// those have completed.
+    pub(crate) skinned_sets_removed: Vec<(u64, (u32, u32))>,
     /// Entries of the page part of the material-set table, from `material_set_capacity`.
     pub(crate) page_sets: RangeAllocator,
 }
@@ -591,6 +648,8 @@ impl Scene {
                 last_update: 0,
                 pages: Vec::new(),
                 pages_removed: Vec::new(),
+                skinned_pages: Vec::new(),
+                skinned_sets_removed: Vec::new(),
                 page_sets: RangeAllocator::new(desc.page_material_sets),
             }),
             writing: AtomicBool::new(false),
@@ -898,6 +957,9 @@ impl<'f> SceneWriter<'f> {
             .ok_or(Error::UnknownPage(r.page))?;
         let count = u32::from(page.info.header.record_count);
         let protos = self.mounts.page_prototypes(r.page)?;
+        if let Some(p) = protos.iter().find(|p| self.is_skinned(p.model)) {
+            return Err(Error::SkinnedPage(p.model));
+        }
         let header = page.info.header;
         let linear_rows = header.linear_rows(page.bytes as usize)? as u32;
         let set_entries: u32 = protos
@@ -1071,28 +1133,7 @@ impl<'f> SceneWriter<'f> {
         }
         let cell = IVec3::from_array(header.cell);
         let partitions = cpu.ptlas.place_runs(first, &runs, cell);
-        let group = Group {
-            writer: GroupWriter::Page,
-            count,
-            anchor: WorldPos {
-                cell,
-                offset: orr_math::Vec3::ZERO,
-            },
-            buffers: Vec::new(),
-            current: 0,
-            previous_is_current: true,
-            created_frame: self.frame,
-            written: false,
-            page: Some(PageGroup {
-                page: r.page,
-                records: page.records.address().0,
-                changed: false,
-                origin: header.origin,
-                extent: header.extent,
-                log2_scale_min: header.log2_scale_min,
-                log2_scale_max: header.log2_scale_max,
-            }),
-        };
+        let group = Group::of_page(r.page, page, self.frame);
         let record = group.record();
         let at = group_id as usize;
         if at == cpu.groups.len() {
@@ -1137,6 +1178,138 @@ impl<'f> SceneWriter<'f> {
         ));
         Self::reset_slot_state_with(&self.scene.tables, self.next_seq(), range, &mut cpu.records);
         Ok(range)
+    }
+
+    /// Whether `model` has a skinned mesh.
+    fn is_skinned(&self, model: ModelId) -> bool {
+        let cpu = self.model_cpu.get(model.0 as usize);
+        cpu.is_some_and(|m| m.skin.is_some())
+    }
+
+    /// The copies of a page of one skinned model, one instance slot each, posed like
+    /// [`Self::add_skinned`]'s from the page's records, and hidden while those are not resident.
+    /// They take the page's flags, section mask and materials as [`Self::add_instance_page`]'s
+    /// do, unless `r` names a material set. A page of anything else fails with
+    /// [`Error::NotSkinnedPage`].
+    pub fn add_skinned_page(&mut self, r: &SkinnedPageRef) -> Result<InstanceRange> {
+        let page = self
+            .mounts
+            .pages
+            .get(r.page.0 as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Error::UnknownPage(r.page))?;
+        let protos = self.mounts.page_prototypes(r.page)?;
+        let [proto] = protos.as_slice() else {
+            return Err(Error::NotSkinnedPage(r.page));
+        };
+        let posable = |m: &ModelCpu| m.skin.is_some() && m.joints > 0;
+        if !self
+            .model_cpu
+            .get(proto.model.0 as usize)
+            .is_some_and(posable)
+        {
+            return Err(Error::NotSkinnedPage(r.page));
+        }
+        let group = Group::of_page(r.page, page, self.frame);
+        let copies = group.count;
+        let record = group.record();
+        let cooked = proto.sets.as_ref().filter(|_| r.material_set.is_none());
+        let set_entries = cooked.map_or(0, |s| s.len() as u32);
+        let (id, sets) = {
+            let cpu = &mut *self.scene.cpu.lock().unwrap();
+            let id = (1..cpu.groups.len())
+                .find(|&i| cpu.groups[i].is_none())
+                .unwrap_or(cpu.groups.len());
+            if id as u32 >= self.scene.desc.group_capacity {
+                return Err(Error::Capacity {
+                    what: "transform groups",
+                    capacity: self.scene.desc.group_capacity,
+                });
+            }
+            let Some(set_base) = cpu.page_sets.alloc(set_entries) else {
+                return Err(Error::Capacity {
+                    what: "page material sets",
+                    capacity: self.scene.desc.page_material_sets,
+                });
+            };
+            if let Some(set) = cooked {
+                let values: Vec<u32> = set.iter().map(|m| m.0).collect();
+                let (src, out) = self.window.slice::<u32>(self.device, set_entries)?;
+                out.copy_from_slice(&values);
+                let at = self.scene.desc.material_set_capacity + set_base;
+                let table = self.scene.tables.material_sets.gpu();
+                cpu.records.push(Record::values(
+                    self.next_seq(),
+                    table.offset(u64::from(at)).cast::<u32>(),
+                    src,
+                    set_entries,
+                ));
+            }
+            if id == cpu.groups.len() {
+                cpu.groups.push(Some(group));
+            } else {
+                cpu.groups[id] = Some(group);
+            }
+            let (src, out) = self.window.slice::<GroupGpu>(self.device, 1)?;
+            out[0] = record;
+            cpu.records.push(Record::values(
+                self.next_seq(),
+                self.scene.tables.groups.gpu().offset(id as u64),
+                src,
+                1,
+            ));
+            (TransformGroupId(id as u32), (set_base, set_entries))
+        };
+        let cooked_set = cooked.map(|_| self.scene.desc.material_set_capacity + sets.0);
+        let flags = match proto.flags {
+            0 => r.flags,
+            f => InstanceFlags(f as u8 & r.flags.0),
+        };
+        let placed = self.add_skinned(&SkinnedDesc {
+            model: proto.model,
+            copies,
+            transforms: id,
+            first: 0,
+            palette: r.palette,
+            palette_first: r.palette_first,
+            material_set: r.material_set.or(cooked_set),
+            flags,
+            rt_range: r.rt_range,
+            user_tag: r.user_tag,
+        });
+        let range = match placed {
+            Ok(range) => range,
+            Err(e) => {
+                let seq = self.next_seq();
+                let cpu = &mut *self.scene.cpu.lock().unwrap();
+                self.clear_group(cpu, id, seq);
+                cpu.skinned_sets_removed.push((self.frame, sets));
+                return Err(e);
+            }
+        };
+        let placement = SkinnedPage {
+            range,
+            group: id,
+            page: r.page,
+            sets,
+        };
+        self.scene.cpu.lock().unwrap().skinned_pages.push(placement);
+        if proto.mask != 0 {
+            let variant = CopyVariant {
+                section_mask: proto.mask,
+                ..CopyVariant::default()
+            };
+            self.copy_variants(range, 0, &vec![variant; copies as usize])?;
+        }
+        Ok(range)
+    }
+
+    /// Empties group `id` and its record.
+    fn clear_group(&self, cpu: &mut SceneCpu, id: TransformGroupId, seq: u64) {
+        cpu.groups[id.0 as usize] = None;
+        let at = self.scene.tables.groups.gpu().offset(u64::from(id.0));
+        let n = words(size_of::<GroupGpu>());
+        cpu.records.push(Record::fill(seq, at.address().0, n, 0));
     }
 
     /// Zeroes the slot state of new slots. The fields from `part_run` on describe runs the
@@ -1395,11 +1568,13 @@ impl<'f> SceneWriter<'f> {
         cpu.ptlas.remove(range.first, range.count, self.frame);
         if let Some(i) = cpu.pages.iter().position(|p| p.range == range) {
             let p = cpu.pages.swap_remove(i);
-            cpu.groups[p.group.0 as usize] = None;
-            let at = self.scene.tables.groups.gpu().offset(u64::from(p.group.0));
-            let n = words(size_of::<GroupGpu>());
-            cpu.records.push(Record::fill(seq, at.address().0, n, 0));
+            self.clear_group(cpu, p.group, seq);
             cpu.pages_removed.push((self.frame, p));
+        }
+        if let Some(i) = cpu.skinned_pages.iter().position(|p| p.range == range) {
+            let p = cpu.skinned_pages.swap_remove(i);
+            self.clear_group(cpu, p.group, seq);
+            cpu.skinned_sets_removed.push((self.frame, p.sets));
         }
         let end = range.first + range.count;
         let mut i = 0;

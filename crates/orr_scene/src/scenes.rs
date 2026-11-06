@@ -991,6 +991,13 @@ impl Scenes {
                 }
                 !done
             });
+            cpu.skinned_sets_removed.retain(|&(frame, (first, count))| {
+                let done = frame <= completed;
+                if done {
+                    sets.free(first, count);
+                }
+                !done
+            });
             cpu.skins_removed.retain(|&(frame, first, count, _)| {
                 let done = frame <= completed;
                 if done {
@@ -1117,15 +1124,15 @@ impl Core {
         let edge = f64::from(1u32 << self.cell_log2);
         for scene in self.scenes.iter().flatten() {
             let cpu = scene.cpu.lock().unwrap();
-            for p in &cpu.pages {
-                let Some((center, radius)) = self.mounts.page_sphere(p.page.0, self.cell_log2)
-                else {
+            let skinned = cpu.skinned_pages.iter().map(|p| p.page);
+            for page in cpu.pages.iter().map(|p| p.page).chain(skinned) {
+                let Some((center, radius)) = self.mounts.page_sphere(page.0, self.cell_log2) else {
                     continue;
                 };
                 let distance = cpu
                     .focus
                     .map_or(0.0, |f| (f.distance(center) - radius).max(0.0));
-                let e = wanted.entry(p.page.0).or_insert(f64::INFINITY);
+                let e = wanted.entry(page.0).or_insert(f64::INFINITY);
                 *e = e.min(distance);
             }
         }

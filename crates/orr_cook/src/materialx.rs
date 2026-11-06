@@ -271,6 +271,7 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         .collect(),
         images,
         skeletons: Vec::new(),
+        posed: Vec::new(),
         instances: Vec::new(),
         files: reader.files,
         warnings,

@@ -15,11 +15,16 @@
 //!
 //! Models, every one in scene units and axes:
 //! - Each `SkelRoot` is a model named after it, in scene space (bind space), of the skinned
-//!   meshes under it (those with joint influences and a bound skeleton), which must bind one
-//!   skeleton, cooked as `<asset>/<root>/skeleton` with clips
-//!   `<asset>/<root>/clip/<animation>`. Its other meshes are static and cook with the rest
-//!   of the stage, as do meshes outside a `SkelRoot`, whose bindings mean nothing. A skinned
-//!   mesh under a `SkelRoot` in a prototype fails: a copy has no pose of its own.
+//!   meshes under it (those with joint influences and a bound skeleton), cooked as
+//!   `<asset>/<root>/skeleton` with clips `<asset>/<root>/clip/<animation>`. `schemas.dox` makes
+//!   each `skel:skeleton` binding a skeleton instance of its own, so with several under a root
+//!   each is a model `<root>/<binding prim's path under it>`, whichever skeleton it binds. Its
+//!   other meshes are static and cook with the rest of the stage, as do meshes outside a
+//!   `SkelRoot`, whose bindings mean nothing. A prototype's skinned meshes make it such a model,
+//!   its other meshes on a still joint, a binding past the first a model
+//!   `<prototype>/<binding prim's path under it>` placed with it, and what a sampled xform moves
+//!   among its other meshes a model `<prototype>/moved` placed with it. One skeleton serves every
+//!   copy, and its pages hold only that model's copies, which a palette per copy poses.
 //! - What moves by an xform sampled over time, where a sample differs from the first: every mesh
 //!   drawn under such a prim. In the rest of the stage each rig of them is a model of its own in
 //!   scene space, named after its first joint (after its path, or `node<i>` for its node, if
@@ -339,6 +344,8 @@ struct Assembly<'a> {
 #[derive(Clone)]
 struct Prototype {
     model: usize,
+    /// Models of its skeleton instances past the first, placed with it.
+    also: Vec<usize>,
     /// Instancers in its subtree, each placed by every copy of it.
     nested: Vec<usize>,
 }
@@ -362,6 +369,8 @@ struct Instancing {
     copies: BTreeMap<usize, Vec<DMat4>>,
     /// Meshes the prototypes draw, with their models.
     meshes: Vec<(usize, usize)>,
+    /// How the skinned ones among them bind a skeleton.
+    bound: HashMap<usize, Bound>,
 }
 
 /// The shading of a material prim.
@@ -592,18 +601,31 @@ impl<'s> Importer<'s> {
             if node.ty != "SkelRoot" || owner[i].is_some() || node.instanced {
                 continue;
             }
-            let m = models.len();
-            models.push(Building::new(Some(node.name.clone()), None, Some(i)));
+            let mut held = Vec::new();
             for k in self.subtree(i) {
                 let node = &self.nodes[k];
                 if owner[k].is_some() || node.ty != "Mesh" || node.instanced {
                     continue;
                 }
                 if let Some(b) = self.binding(k, i)? {
-                    bound.insert(k, b);
-                    owner[k] = Some(m);
+                    held.push((k, b));
                 }
             }
+            let mut sites: Vec<usize> = held.iter().map(|h| h.1.site).collect();
+            sites.sort_unstable();
+            sites.dedup();
+            for &site in &sites {
+                let name = match sites.len() {
+                    1 => self.nodes[i].name.clone(),
+                    _ => format!("{}/{}", self.nodes[i].name, self.site_name(i, site)),
+                };
+                models.push(Building::new(Some(name), None, Some(i)));
+                let m = models.len() - 1;
+                held.iter()
+                    .filter(|h| h.1.site == site)
+                    .for_each(|h| owner[h.0] = Some(m));
+            }
+            bound.extend(held);
         }
 
         self.select_models(&mut models, &mut owner)?;
@@ -614,6 +636,17 @@ impl<'s> Importer<'s> {
         for i in 0..n {
             let node = &self.nodes[i];
             if node.ty == "PointInstancer" && !node.instanced && !self.hidden(i, None) {
+                let mut above = std::iter::successors(Some(i), |&k| {
+                    self.nodes[k].parent.filter(|_| !self.nodes[k].reset)
+                });
+                if above.any(|k| !self.nodes[k].times.is_empty()) {
+                    self.warnings.push(format!(
+                        "{}: a prim moves this instancer, whose copies stay where the time read \
+                         puts them",
+                        node.prim.path().as_str()
+                    ));
+                }
+                let node = &self.nodes[i];
                 let world = node.world;
                 self.place(i, world, &mut models, &mut instancing, &mut Vec::new())?;
             }
@@ -662,12 +695,15 @@ impl<'s> Importer<'s> {
             for (k, (linear, copies)) in baked.into_iter().enumerate() {
                 placed.insert(models.len(), copies);
                 holders[m].push((models.len(), linear));
-                let prototype = models[m].prototype;
+                let (prototype, skel_root) = (models[m].prototype, models[m].root);
                 models.push(Building::new(Some(format!("{name}/baked/{k}")), None, None));
-                models.last_mut().expect("pushed").prototype = prototype;
+                let baked = models.last_mut().expect("pushed");
+                baked.prototype = prototype;
+                baked.root = skel_root;
             }
         }
 
+        bound.extend(instancing.bound);
         let order: Vec<usize> = (0..n).collect();
         let animated: Vec<bool> = self.nodes.iter().map(|d| !d.times.is_empty()).collect();
         let parents: Vec<Option<usize>> = self
@@ -698,50 +734,50 @@ impl<'s> Importer<'s> {
                 )?;
             }
         }
-        // One skeleton per skeletal root, from what its skinned meshes bind: its prim path,
-        // the skeleton, the root's node and the prims that bind it.
-        let mut skels: Vec<(String, skel::Skel, usize, Vec<usize>)> = Vec::new();
-        for (m, b) in models.iter_mut().enumerate() {
-            if !b.skinned || b.rig_skeleton.is_some() {
+        // One skeleton per model that skins, from what its meshes bind: its prim path, the
+        // skeleton, the root's node, the prims that bind it and the name its entries go under.
+        let mut skels: Vec<(String, skel::Skel, usize, Vec<usize>, String)> = Vec::new();
+        for m in 0..models.len() {
+            if !models[m].skinned || models[m].rig_skeleton.is_some() {
                 continue;
             }
             let mut skeleton: Option<&sdf::Path> = None;
             let mut sites = Vec::new();
+            let mut still = false;
             for &(i, _) in meshes.iter().filter(|h| h.1 == m) {
-                let binding = &bound[&i];
-                match skeleton {
-                    Some(s) if *s != binding.skeleton => {
-                        return Err(format!(
-                            "{}: binds {}, another mesh of its SkelRoot {s}",
-                            self.nodes[i].prim.path().as_str(),
-                            binding.skeleton,
-                        ));
+                match bound.get(&i) {
+                    Some(binding) => {
+                        skeleton = Some(&binding.skeleton);
+                        sites.push(binding.site);
                     }
-                    _ => skeleton = Some(&binding.skeleton),
+                    None => still = true,
                 }
-                sites.push(binding.site);
             }
             let Some(path) = skeleton else { continue };
-            let k = match skels.iter().position(|s| s.0 == path.as_str()) {
-                Some(k) => k,
-                None => {
-                    let node = *self
-                        .by_path
-                        .get(path.as_str())
-                        .ok_or_else(|| format!("skeleton {path} is not cooked"))?;
-                    let mut built = skel::Skel::build(
-                        &self.reader(&self.nodes[node].prim),
-                        self.nodes[node].world,
-                        self.root,
-                    )?;
-                    self.hang(&mut built, node, &animated, &parents)?;
-                    let root = b.root.expect("skeletal roots have prims");
-                    skels.push((path.as_str().to_string(), built, root, Vec::new()));
-                    skels.len() - 1
+            let node = *self
+                .by_path
+                .get(path.as_str())
+                .ok_or_else(|| format!("skeleton {path} is not cooked"))?;
+            for (h, linear) in holders[m].clone() {
+                let to_model = self.to_model(&models[h], node)?;
+                let mut built =
+                    skel::Skel::build(&self.reader(&self.nodes[node].prim), to_model, self.root)?;
+                self.hang(&mut built, node, &models[h], &animated, &parents)?;
+                if still {
+                    built.add_still()?;
                 }
-            };
-            skels[k].3.extend(sites);
-            b.skeleton = Some(k);
+                // A baked copy keeps its bind pose: the skeleton takes the transform.
+                let after = Affine3::from_mat4(linear.as_mat4());
+                built.info.root = after * built.info.root;
+                let root = models[h].root.expect("skeletal roots have prims");
+                let prefix = models[h].name.clone().unwrap_or_default();
+                let path = path.as_str().to_string();
+                skels.push((path, built, root, sites.clone(), prefix));
+                models[h].skinned = true;
+                models[h].skeleton = Some(skels.len() - 1);
+            }
+            // Its meshes bind through it even where it bakes every copy and holds none.
+            models[m].skeleton = models[holders[m][0].0].skeleton;
         }
         for b in &mut models {
             if let Some(k) = b.rig_skeleton {
@@ -862,6 +898,14 @@ impl<'s> Importer<'s> {
                         sk.binding(&path, &self.skin_source(b), mesh.points.len())?;
                     (Some(s), to_bind, 0)
                 }
+                (None, Some(sk), _) => {
+                    let still = sk
+                        .still
+                        .expect("`add_still` saw every mesh without a binding");
+                    let one = ([still as u8; 4], [255, 0, 0, 0]);
+                    let to_model = self.to_model(&models[o], i)?;
+                    (Some(vec![one; mesh.points.len()]), to_model, 0)
+                }
                 (_, _, Some(r)) => {
                     let (j, to_bind) = self.attach(r, &models[o], i)?;
                     let skin = (!r.rigid).then(|| {
@@ -924,7 +968,7 @@ impl<'s> Importer<'s> {
                 let placing = Placing {
                     // A skeleton takes what a mesh in its bind pose cannot, but it poses no
                     // part 0.
-                    transform: if rig.is_some_and(|r| !r.rigid || part != 0) {
+                    transform: if skin.is_some() || rig.is_some_and(|r| part != 0 && r.rigid) {
                         transform
                     } else {
                         linear * transform
@@ -947,6 +991,7 @@ impl<'s> Importer<'s> {
         let mut out = Vec::new();
         let mut names = std::collections::HashSet::new();
         let mut instance_out = Vec::new();
+        let mut posed_out = Vec::new();
         for (mi, b) in models.into_iter().enumerate() {
             let copies = placed.remove(&mi);
             // Models that bake them hold all of a prototype's copies.
@@ -967,7 +1012,10 @@ impl<'s> Importer<'s> {
                 return Err(format!("two models are named {n:?}"));
             }
             if let (Some(n), Some(copies)) = (&b.name, copies) {
-                instance_out.push((n.clone(), copies));
+                match b.skeleton {
+                    Some(_) => posed_out.push((n.clone(), copies)),
+                    None => instance_out.push((n.clone(), copies)),
+                }
             }
             out.push(self.model(b)?);
         }
@@ -975,10 +1023,10 @@ impl<'s> Importer<'s> {
             return Err("the stage has no triangles".into());
         }
         let mut skeletons = Vec::with_capacity(skels.len());
-        for (path, sk, root, sites) in skels {
+        for (path, sk, root, sites, prefix) in skels {
             let clips = self.clips(&path, &sk, root, &sites)?;
             skeletons.push(SceneSkeleton {
-                prefix: self.nodes[root].name.clone(),
+                prefix,
                 info: sk.info,
                 clips,
             });
@@ -990,6 +1038,7 @@ impl<'s> Importer<'s> {
             images: std::mem::take(&mut self.images),
             skeletons,
             instances: instance_out,
+            posed: posed_out,
             files: self.reads.borrow().inputs(),
             warnings: std::mem::take(&mut self.warnings),
         })
@@ -1343,28 +1392,36 @@ impl<'s> Importer<'s> {
         Ok((!channels.is_empty()).then(|| skin::resample(info, channels, span, clips)))
     }
 
-    /// Hangs skeleton `sk` of prim `node` from the prims that move it, if any do: every prim
-    /// from the highest of them to its own.
+    /// Hangs skeleton `sk` of prim `node` in model `b` from the prims that move it, if any do:
+    /// every prim from the highest of them to its own.
     fn hang(
         &self,
         sk: &mut skel::Skel,
         node: usize,
+        b: &Building,
         animated: &[bool],
         parents: &[Option<usize>],
     ) -> Result<(), String> {
-        let chain: Vec<usize> = skin::chain(parents, node, None).collect();
+        let mut chain: Vec<usize> = skin::chain(parents, node, None).collect();
+        if let Some(end) = b
+            .prototype
+            .and_then(|root| chain.iter().position(|&n| n == root))
+        {
+            chain.truncate(end + 1);
+        }
         let Some(far) = chain.iter().rposition(|&n| animated[n]) else {
             return Ok(());
         };
         let root = match chain.get(far + 1) {
-            Some(&above) => self.nodes[above].world,
+            Some(&above) => self.to_model(b, above)?,
             None => self.root,
         };
         let mut prims = Vec::with_capacity(far + 1);
         for &n in chain[..=far].iter().rev() {
             let d = &self.nodes[n];
             let local = skel::prim_trs(d.prim.path().as_str(), d.local)?;
-            prims.push((n, d.name.clone(), local, inverse_bind(d.world)));
+            let ib = inverse_bind(self.to_model(b, n)?);
+            prims.push((n, d.name.clone(), local, ib));
         }
         sk.hang(prims, root)
     }
@@ -1483,18 +1540,25 @@ impl<'s> Importer<'s> {
             return Ok(p.clone());
         }
         let node = &self.nodes[root];
-        let taken = models
-            .iter()
-            .any(|m| m.name.as_deref() == Some(node.name.as_str()));
-        let name = if taken {
-            node.prim.path().as_str().trim_start_matches('/')
-        } else {
-            node.name.as_str()
+        // Models under a name would meet those of the prototype's own binding prims.
+        let taken = |name: &str| {
+            let under = format!("{name}/");
+            let named = |n: &str| n == name || n.starts_with(&under);
+            models.iter().filter_map(|m| m.name.as_deref()).any(named)
+        };
+        let path = node.prim.path().as_str().trim_start_matches('/');
+        let name = match (taken(&node.name), taken(path)) {
+            (false, _) => node.name.clone(),
+            (_, false) => path.to_string(),
+            _ => format!("{path}/prototype"),
         };
         let model = models.len();
-        models.push(Building::new(Some(name.to_string()), None, None));
+        models.push(Building::new(Some(name.clone()), None, None));
         models[model].prototype = Some(root);
         let mut nested = Vec::new();
+        let mut also = Vec::new();
+        // Each skeleton binding met so far, with its model.
+        let mut sites: Vec<(usize, usize)> = Vec::new();
         let mut k = root;
         while k < node.end {
             let at = &self.nodes[k];
@@ -1507,19 +1571,63 @@ impl<'s> Importer<'s> {
                 continue;
             }
             if at.ty == "Mesh" && drawn {
-                if let Some(skel_root) = self.skel_root(k)
-                    && self.binding(k, skel_root)?.is_some()
-                {
-                    return Err(format!(
-                        "{}: a skinned mesh in a prototype",
-                        at.prim.path().as_str()
-                    ));
-                }
-                instancing.meshes.push((k, model));
+                let skel_root = self.skel_root(k);
+                let binding = match skel_root {
+                    Some(r) => self.binding(k, r)?,
+                    None => None,
+                };
+                let held = match binding {
+                    None => model,
+                    Some(b) => {
+                        let m = match sites.iter().find(|s| s.0 == b.site) {
+                            Some(s) => s.1,
+                            None if sites.is_empty() => model,
+                            None => {
+                                let name = format!("{name}/{}", self.site_name(root, b.site));
+                                models.push(Building::new(Some(name), None, None));
+                                models.last_mut().expect("pushed").prototype = Some(root);
+                                also.push(models.len() - 1);
+                                models.len() - 1
+                            }
+                        };
+                        sites.push((b.site, m));
+                        models[m].skinned = true;
+                        models[m].root = skel_root;
+                        instancing.bound.insert(k, b);
+                        m
+                    }
+                };
+                instancing.meshes.push((k, held));
             }
             k += 1;
         }
-        let p = Prototype { model, nested };
+        // A skeleton's model takes no rig, so what moves beside its skins takes one of its own.
+        let moves = |mesh: usize| {
+            let (mut at, mut moved) = (Some(mesh), false);
+            while let Some(n) = at {
+                let d = &self.nodes[n];
+                moved |= !d.times.is_empty();
+                at = d.parent.filter(|_| n != root && !d.reset);
+            }
+            moved
+        };
+        let bound = &instancing.bound;
+        let mut rigged = None;
+        for h in instancing.meshes.iter_mut().filter(|h| h.1 == model) {
+            if !sites.is_empty() && !bound.contains_key(&h.0) && moves(h.0) {
+                h.1 = *rigged.get_or_insert_with(|| {
+                    models.push(Building::new(Some(format!("{name}/moved")), None, None));
+                    models.last_mut().expect("pushed").prototype = Some(root);
+                    also.push(models.len() - 1);
+                    models.len() - 1
+                });
+            }
+        }
+        let p = Prototype {
+            model,
+            also,
+            nested,
+        };
         instancing.prototypes.insert(root, p.clone());
         Ok(p)
     }
@@ -1562,8 +1670,9 @@ impl<'s> Importer<'s> {
                 continue;
             };
             let transform = to_scene * local;
-            let copies = instancing.copies.entry(p.model).or_default();
-            copies.push(transform);
+            for &m in std::iter::once(&p.model).chain(&p.also) {
+                instancing.copies.entry(m).or_default().push(transform);
+            }
             for &nested in &p.nested {
                 let to_scene = transform * self.to_prototype(*root, nested);
                 self.place(nested, to_scene, models, instancing, above)?;
@@ -1703,6 +1812,16 @@ impl<'s> Importer<'s> {
         Ok(if empty { "orientations" } else { name })
     }
 
+    /// What names skeleton binding `site` beside others under node `root`: its path under
+    /// `root`, or from the stage's root where it stands elsewhere.
+    fn site_name(&self, root: usize, site: usize) -> &str {
+        let path = self.nodes[site].prim.path().as_str();
+        let under = path.strip_prefix(self.nodes[root].prim.path().as_str());
+        under
+            .and_then(|p| p.strip_prefix('/'))
+            .unwrap_or_else(|| path.trim_start_matches('/'))
+    }
+
     /// The nearest `SkelRoot` at or above node `n`.
     fn skel_root(&self, n: usize) -> Option<usize> {
         std::iter::successors(Some(n), |&i| self.nodes[i].parent)
@@ -1815,7 +1934,7 @@ impl<'s> Importer<'s> {
         }
         sources.extend(self.subtree(root).filter(|&i| {
             let node = &self.nodes[i];
-            node.ty == "SkelAnimation" && !node.instanced
+            node.ty == "SkelAnimation" && node.instanced == self.nodes[root].instanced
         }));
         sources.sort_unstable();
         sources.dedup();

@@ -1849,7 +1849,7 @@ fn instanced_nodes_move_with_rigs_and_skins() {
         .entries()
         .iter()
         .filter(|e| a.name(e).contains("/instances"));
-    assert_eq!(pages.count(), 1);
+    assert_eq!(pages.count(), 2, "each posed model on pages of its own");
 }
 
 /// L2124 asks nothing of an inverse bind but four rows, so one may not invert, or only just: a

@@ -44,8 +44,9 @@ use orr_scene::{
     DecalGpu, DecalId, EditDesc, EditId, EditRef, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
     InstanceRange, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, ModelId, MountId,
     PackSource, Pose, Projection, RasterGpu, RasterView, RendererDesc, SceneCompute, SceneDesc,
-    SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, SkinnedGpu, SlotCutGpu,
-    TextureFilter, TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId, VisibleCluster,
+    SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, SkinnedGpu, SkinnedPageRef,
+    SlotCutGpu, TextureFilter, TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId,
+    VisibleCluster,
 };
 use orr_scene::{Budgets, InstancePageRef, PageId};
 use scene_suite::shaders::{
@@ -1236,6 +1237,19 @@ fn cook() -> Arc<[u8]> {
                     name: "worm".into(),
                     source: Source::Gltf {
                         path: worm_glb(),
+                        settings: GltfSettings {
+                            mesh: MeshSettings {
+                                deformation_bound: 1.0,
+                                ..MeshSettings::default()
+                            },
+                            ..GltfSettings::default()
+                        },
+                    },
+                },
+                AssetSpec {
+                    name: "crowd".into(),
+                    source: Source::Gltf {
+                        path: worm_glb_of("crowd.glb", &CROWD),
                         settings: GltfSettings {
                             mesh: MeshSettings {
                                 deformation_bound: 1.0,
@@ -5130,6 +5144,11 @@ const WORM_HEIGHT: f32 = 1.6;
 /// blending from joint to joint with height, and a `bend` clip that sways the upper two
 /// joints about z over 2 s.
 fn worm_glb() -> PathBuf {
+    worm_glb_of("worm.glb", &[])
+}
+
+/// [`worm_glb`] at `name`, with `EXT_mesh_gpu_instancing` placing it at `copies`.
+fn worm_glb_of(name: &str, copies: &[[f32; 3]]) -> PathBuf {
     let (rings, sides, radius) = (24u32, 16u32, 0.2f32);
     let mut positions: Vec<f32> = Vec::new();
     let mut normals: Vec<f32> = Vec::new();
@@ -5210,12 +5229,25 @@ fn worm_glb() -> PathBuf {
     let v_ibm = add(bytemuck::cast_slice(&inverse_binds));
     let v_time = add(bytemuck::cast_slice(&times));
     let v_rot = add(bytemuck::cast_slice(&rotations));
+    let (body, used, placed) = if copies.is_empty() {
+        (String::new(), String::new(), String::new())
+    } else {
+        let v_copies = add(bytemuck::cast_slice(copies));
+        (
+            r#","extensions":{"EXT_mesh_gpu_instancing":{"attributes":{"TRANSLATION":8}}}"#.into(),
+            r#""extensionsUsed":["EXT_mesh_gpu_instancing"],"#.into(),
+            format!(
+                r#",{{"bufferView":{v_copies},"componentType":5126,"count":{},"type":"VEC3"}}"#,
+                copies.len()
+            ),
+        )
+    };
     let json = format!(
-        r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0,3]}}],
+        r#"{{"asset":{{"version":"2.0"}},{used}"scene":0,"scenes":[{{"nodes":[0,3]}}],
 "nodes":[{{"name":"root","children":[1]}},
 {{"name":"mid","translation":[0,{m},0],"children":[2]}},
 {{"name":"top","translation":[0,{t},0]}},
-{{"name":"body","mesh":0,"skin":0}}],
+{{"name":"body","mesh":0,"skin":0{body}}}],
 "skins":[{{"joints":[0,1,2],"inverseBindMatrices":5}}],
 "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0,"NORMAL":1,"JOINTS_0":2,"WEIGHTS_0":3}},"indices":4}}]}}],
 "animations":[{{"name":"bend","samplers":[{{"input":6,"output":7,"interpolation":"LINEAR"}}],
@@ -5228,7 +5260,7 @@ fn worm_glb() -> PathBuf {
 {{"bufferView":{v_idx},"componentType":5125,"count":{n_idx},"type":"SCALAR"}},
 {{"bufferView":{v_ibm},"componentType":5126,"count":3,"type":"MAT4"}},
 {{"bufferView":{v_time},"componentType":5126,"count":5,"type":"SCALAR","min":[0],"max":[2]}},
-{{"bufferView":{v_rot},"componentType":5126,"count":5,"type":"VEC4"}}],
+{{"bufferView":{v_rot},"componentType":5126,"count":5,"type":"VEC4"}}{placed}],
 "bufferViews":[{views}],
 "buffers":[{{"byteLength":{len}}}]}}"#,
         m = WORM_JOINTS[1],
@@ -5252,7 +5284,7 @@ fn worm_glb() -> PathBuf {
     glb.extend((bin.len() as u32).to_le_bytes());
     glb.extend(b"BIN\0");
     glb.extend(&bin);
-    let path = temp("worm.glb");
+    let path = temp(name);
     std::fs::write(&path, glb).unwrap();
     path
 }
@@ -5287,6 +5319,78 @@ struct Worms {
     placed: Placed,
     palette: TransformGroupId,
     joints: u32,
+}
+
+/// Where `crowd`'s instances place its worms, in one world cell and in record order.
+const CROWD: [[f32; 3]; 2] = [[0.2, 0.0, 0.1], [1.0, 0.0, 0.1]];
+
+/// The copies of `crowd`'s page, with a palette group written on the CPU.
+fn place_crowd(w: &mut World) -> Worms {
+    let a = Archive::from_memory(Arc::clone(pack())).unwrap();
+    let is_crowd = |e: &&Entry| {
+        e.class == orr_pack::Class::InstancePage as u16 && a.name(e).starts_with("crowd/")
+    };
+    let entry = a.entries().iter().find(is_crowd).expect("the crowd's page");
+    let page = w.scenes.instance_page(w.mount, entry.id).unwrap();
+    let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
+    let history = w.scenes.create_view_history().unwrap();
+    let joints = worm_rig().0.joint_count() as u32;
+    let n = CROWD.len() as u32;
+    let list = [scene];
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(0),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    let mut s = f.scene(scene).unwrap();
+    let palette = s
+        .create_transform_group(&TransformGroupDesc {
+            count: n * joints,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    let refused = s.add_instance_page(&InstancePageRef {
+        page,
+        poses: &[],
+        material_sets: &[],
+        flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+        rt_range: 100.0,
+        animation_range: 0.0,
+        user_tag: 0,
+    });
+    assert!(
+        refused.is_err(),
+        "a page of skinned copies would draw at the bind pose"
+    );
+    let range = s
+        .add_skinned_page(&SkinnedPageRef {
+            page,
+            palette,
+            palette_first: 0,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 100.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    assert_eq!(range.count, n);
+    drop(s);
+    wait(f.end(&[]).unwrap());
+    Worms {
+        placed: Placed {
+            scene,
+            ranges: vec![range],
+            group: palette,
+            history,
+            count: n,
+        },
+        palette,
+        joints,
+    }
 }
 
 /// Worm copies placed by `copies`, with a palette group written on the CPU or, with
@@ -5469,6 +5573,71 @@ fn skinned_vertices_match_the_cpu_skin_by_this_and_the_last_palette() {
     assert!(
         before < 1e-5,
         "previous positions {before} m from the CPU skin"
+    );
+    assert_clean();
+}
+
+/// A page of skinned copies draws and traces like the same copies placed by hand, each on its
+/// own pose: the page gives the transform and the palette the pose.
+#[test]
+fn skinned_copies_on_a_page_pose_like_copies_placed_by_hand() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let by_hand = CROWD.map(|p| (Mat3::IDENTITY, Vec3::from(p)));
+    let hand = place_worms(&mut w, "worm", &by_hand, false);
+    let want = shoot_worms(&mut w, &hand, &worm_shot(1), 0.7, 0.45);
+    let crowd = place_crowd(&mut w);
+    let mesh = CpuMesh::of("crowd/body");
+    let start = Instant::now();
+    let mut frame = 2;
+    let g = loop {
+        frame += 1;
+        let g = shoot_worms(&mut w, &crowd, &worm_shot(frame), 0.7, 0.45);
+        if frame > 4 && g.ids.iter().any(|&id| id != 0) {
+            break shoot_worms(&mut w, &crowd, &worm_shot(frame + 1), 0.7, 0.45);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the page never landed"
+        );
+    };
+    let n = g.depth.len();
+    let same = (0..n)
+        .filter(|&i| (want.depth[i] - g.depth[i]).abs() <= 2e-3 * want.depth[i].max(1e-3))
+        .count();
+    let drawn = g.ids.iter().filter(|&&id| id != 0).count();
+    assert!(drawn > n / 50, "{drawn} of {n} pixels drawn");
+    assert!(
+        same as f64 >= 0.995 * n as f64,
+        "{same} of {n} depths agree"
+    );
+    let vertices: u32 = mesh
+        .pages
+        .iter()
+        .map(|p| {
+            let v = PageView::new(p, &mesh.header).unwrap();
+            (0..v.cluster_count())
+                .map(|i| u32::from(v.cluster(i).vertex_count))
+                .sum::<u32>()
+        })
+        .sum();
+    for copy in 0..CROWD.len() as u32 {
+        let (k, _, clusters) = skinned_entry(&g.view, copy);
+        assert!(!clusters.is_empty(), "copy {copy} skinned nothing");
+        let at: Vec<Vec3> = read_buffer::<[f32; 3]>(k.positions.cast(), u64::from(vertices))
+            .into_iter()
+            .map(Vec3::from)
+            .collect();
+        let pose = worm_palette(0.7 + 0.45 * copy as f32);
+        let error = skin_error(&mesh, &at, &clusters, &pose);
+        assert!(error < 1e-5, "copy {copy} is {error} m from its own pose");
+    }
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let (matched, _) = parity(&g, &r, 1e-4);
+    assert!(
+        matched as f64 >= 0.999 * r.traced.len() as f64,
+        "{matched} of {} pixels agree",
+        r.traced.len()
     );
     assert_clean();
 }

@@ -96,8 +96,8 @@ pub use ptlas::RtStats;
 pub use residency::{ClassStats, ResidencyClass, ResidencyStats};
 pub use scene::{
     AffineRows, CopyVariant, DebugLod, GroupWriter, InstanceFlags, InstancePageRef, InstanceRange,
-    InstancesDesc, ModelId, Pose, SceneDesc, SceneId, SceneWriter, TransformGroupDesc,
-    TransformGroupId,
+    InstancesDesc, ModelId, Pose, SceneDesc, SceneId, SceneWriter, SkinnedPageRef,
+    TransformGroupDesc, TransformGroupId,
 };
 pub use scenes::{
     Budgets, ConsumerMarker, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes,
@@ -201,6 +201,13 @@ pub enum Error {
     UnknownEdit(EditId),
     #[error("{0:?} does not exist")]
     UnknownPage(PageId),
+    /// [`SceneWriter::add_instance_page`] draws no pose, and a skinned copy needs one:
+    /// [`SceneWriter::add_skinned_page`] places such a page.
+    #[error("{0:?} is skinned: its page takes add_skinned_page")]
+    SkinnedPage(ModelId),
+    /// Its copies must all be of one skinned model with a skeleton.
+    #[error("{0:?} holds something other than one skinned model with a skeleton")]
+    NotSkinnedPage(PageId),
     /// An edit cannot be edited, nor a model without a mesh.
     #[error("{model:?} cannot be edited: {reason}")]
     NotEditable {

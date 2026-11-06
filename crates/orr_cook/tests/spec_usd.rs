@@ -3809,3 +3809,277 @@ fn a_thin_turned_bind_keeps_the_points_off_its_plane() {
         "a point lands {worst} m from where it is bound"
     );
 }
+
+/// `instancing.dox`: copies of a model "will typically have a different root transform, and
+/// different set of joint transforms", sharing all the rest: the "bind state". A skinned prototype
+/// is one model and skeleton however many copies place it, with its other meshes on a joint of
+/// their own, and a scale that collapses an axis goes to a skeleton while the mesh stays bound.
+#[test]
+fn a_skinned_prototype_is_a_model_placed_per_copy() {
+    let a = cook(
+        "skel-prototype",
+        &format!(
+            r#"def PointInstancer "Crowd"
+{{
+    rel prototypes = [</Crowd/Hero>]
+    int[] protoIndices = [0, 0, 0]
+    point3f[] positions = [(1, 0, 0), (2, 0, 0), (3, 0, 0)]
+    float3[] scales = [(1, 1, 1), (1, 1, 1), (1, 0, 1)]
+    def SkelRoot "Hero"
+    {{
+        {RIG}
+        def Mesh "Body"
+        {{
+            {TRIANGLE}
+            rel skel:skeleton = </Crowd/Hero/Rig>
+            {INFLUENCES}
+        }}
+        def Mesh "Prop"
+        {{
+            double3 xformOp:translate = (5, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+            {TRIANGLE}
+        }}
+    }}
+}}"#
+        ),
+    );
+    let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    assert_eq!(sk.names, ["Root", "Arm", ""]);
+    assert_eq!(copies(&a, "u/Hero").len(), 2);
+    let model = ModelInfo::parse(&blob(&a, "u/Hero", 0)).unwrap();
+    assert_eq!(model.header.skeleton, AssetId::from_name("u/Hero/skeleton"));
+    let (mut pose, mut palette) = (
+        vec![orr_math::Affine3::IDENTITY; 3],
+        vec![orr_math::Affine3::IDENTITY; 3],
+    );
+    sk.model_pose(&sk.rest, &mut pose);
+    sk.palette(&pose, &mut palette);
+    let mesh = corners(&a, "u/Hero/mesh");
+    assert_eq!(mesh.len(), 6);
+    let joints = joints_of(&a, "u/Hero/mesh");
+    assert!(joints.contains(&1) && joints.contains(&2), "{joints:?}");
+    let prop = mesh.iter().find(|c| c.0.x >= 5.0).expect("the prop").0;
+    assert!(palette[2].transform_point3(prop).abs_diff_eq(prop, 1e-5));
+
+    let flat = SkeletonInfo::parse(&blob(&a, "u/Hero/baked/0/skeleton", 0)).unwrap();
+    assert_eq!(flat.root.matrix3.y_axis.y, 0.0);
+    assert_eq!(copies(&a, "u/Hero/baked/0").len(), 1);
+    let bound = corners(&a, "u/Hero/baked/0/mesh");
+    assert!(
+        bound.iter().any(|c| c.0.y > 0.5),
+        "the mesh keeps its bind pose"
+    );
+}
+
+/// `schemas.dox`: "Each skel:skeleton binding may be thought of as identifying a Skeleton
+/// Instance, animated according to whichever inherited skel:animationSource is defined at the
+/// location at which the skel:skeleton is bound", so one root holds as many as it has bindings,
+/// of one skeleton or of several.
+#[test]
+fn each_skeleton_binding_under_a_root_is_a_model() {
+    let binding = |prim: &str, skeleton: &str, anim: &str| {
+        format!(
+            r#"def Xform "{prim}" (
+        prepend apiSchemas = ["SkelBindingAPI"]
+    )
+    {{
+        rel skel:skeleton = </Crowd/{skeleton}>
+        rel skel:animationSource = </Crowd/{anim}>
+        def Mesh "M"
+        {{
+            {TRIANGLE}
+            {INFLUENCES}
+        }}
+    }}"#
+        )
+    };
+    let anim = |name: &str, x: f32| {
+        format!(
+            r#"def SkelAnimation "{name}"
+    {{
+        uniform token[] joints = ["Root"]
+        float3[] translations.timeSamples = {{ 0: [(0, 0, 0)], 10: [({x}, 0, 0)] }}
+        {ROTATIONS}
+        half3[] scales = [(1, 1, 1)]
+    }}"#
+        )
+    };
+    let a = cook(
+        "skel-bindings",
+        &format!(
+            r#"def SkelRoot "Crowd"
+{{
+    {RIG}
+    {}
+    {}
+    {}
+    {}
+    {}
+}}"#,
+            RIG.replace("\"Rig\"", "\"Other\""),
+            anim("Walk", 1.0),
+            binding("One", "Rig", "Walk"),
+            binding("Two", "Rig", "Walk"),
+            binding("Three", "Other", "Walk"),
+        ),
+    );
+    for model in ["One", "Two", "Three"] {
+        let name = format!("u/Crowd/{model}");
+        assert!(has(&a, &format!("{name}/skeleton")), "{model}");
+        assert!(has(&a, &format!("{name}/clip/Walk")), "{model}");
+        assert_eq!(corners(&a, &format!("{name}/mesh")).len(), 3, "{model}");
+    }
+    assert!(!has(&a, "u/Crowd/skeleton"));
+}
+
+/// `instancing.dox` asks one bind state of a prototype's copies however they are placed: with
+/// every copy flat its mesh still binds its skeleton, and a clip under the root comes with no
+/// `skel:animationSource`.
+#[test]
+fn a_prototype_whose_copies_all_flatten_stays_skinned() {
+    let a = cook(
+        "skel-prototype-flat",
+        &format!(
+            r#"def PointInstancer "Crowd"
+{{
+    rel prototypes = [</Crowd/Hero>]
+    int[] protoIndices = [0]
+    point3f[] positions = [(1, 0, 0)]
+    float3[] scales = [(1, 0, 1)]
+    def SkelRoot "Hero"
+    {{
+        {RIG}
+        def SkelAnimation "Walk"
+        {{
+            uniform token[] joints = ["Root"]
+            float3[] translations.timeSamples = {{ 0: [(0, 0, 0)], 10: [(1, 0, 0)] }}
+            {ROTATIONS}
+            half3[] scales = [(1, 1, 1)]
+        }}
+        def Mesh "Body"
+        {{
+            {TRIANGLE}
+            rel skel:skeleton = </Crowd/Hero/Rig>
+            {INFLUENCES}
+        }}
+    }}
+}}"#
+        ),
+    );
+    assert!(has(&a, "u/Hero/baked/0/clip/Walk"));
+    let joints = joints_of(&a, "u/Hero/baked/0/mesh");
+    assert!(joints.contains(&1), "{joints:?}");
+}
+
+/// Sampled xforms move a prim whichever skin stands beside it. Above a prototype's
+/// skeleton the still joint undoes the root the prims take, and a mesh under a moving prim beside
+/// the skin rides a rig of its own.
+#[test]
+fn what_moves_in_a_skinned_prototype_moves() {
+    let a = cook(
+        "skel-prototype-moving",
+        &format!(
+            r#"def PointInstancer "Crowd"
+{{
+    rel prototypes = [</Crowd/Hero>]
+    int[] protoIndices = [0]
+    point3f[] positions = [(1, 0, 0)]
+    def SkelRoot "Hero"
+    {{
+        double3 xformOp:translate = (0, 3, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Xform "Lift"
+        {{
+            double3 xformOp:translate.timeSamples = {{ 0: (0, 1, 0), 24: (0, 2, 0) }}
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+            {RIG}
+        }}
+        def Mesh "Body"
+        {{
+            {TRIANGLE}
+            rel skel:skeleton = </Crowd/Hero/Lift/Rig>
+            {INFLUENCES}
+        }}
+        def Mesh "Prop"
+        {{
+            double3 xformOp:translate = (5, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+            {TRIANGLE}
+        }}
+        def Xform "Door"
+        {{
+            double3 xformOp:translate.timeSamples = {{ 0: (0, 0, 0), 24: (1, 0, 0) }}
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+            def Mesh "Leaf"
+            {{
+                {TRIANGLE}
+            }}
+        }}
+    }}
+}}"#
+        ),
+    );
+    let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    let n = sk.joint_count();
+    let (mut pose, mut palette) = (
+        vec![orr_math::Affine3::IDENTITY; n],
+        vec![orr_math::Affine3::IDENTITY; n],
+    );
+    sk.model_pose(&sk.rest, &mut pose);
+    sk.palette(&pose, &mut palette);
+    let prop = Vec3::new(5.0, 3.0, 0.0);
+    let held = palette[n - 1].transform_point3(prop);
+    assert!(held.abs_diff_eq(prop, 1e-5), "{held}");
+    assert_eq!(corners(&a, "u/Hero/mesh").len(), 6);
+    assert!(has(&a, "u/Hero/moved/skeleton"));
+    assert!(has(&a, "u/Hero/moved/clip/xform"));
+    assert_eq!(copies(&a, "u/Hero/moved").len(), 1);
+}
+
+/// Binding prims that share a name are still instances of their own, and a root drawn in place
+/// that is also a prototype keeps both.
+#[test]
+fn binding_prims_of_one_name_and_a_drawn_prototype_each_keep_a_model() {
+    let binding = |prim: &str| {
+        format!(
+            r#"def Xform "{prim}"
+    {{
+        def Xform "Geo" (
+            prepend apiSchemas = ["SkelBindingAPI"]
+        )
+        {{
+            rel skel:skeleton = </Hero/Rig>
+            def Mesh "M"
+            {{
+                {TRIANGLE}
+                {INFLUENCES}
+            }}
+        }}
+    }}"#
+        )
+    };
+    let a = cook(
+        "skel-binding-names",
+        &format!(
+            r#"def SkelRoot "Hero"
+{{
+    {RIG}
+    {}
+    {}
+}}
+def PointInstancer "Crowd"
+{{
+    rel prototypes = [</Hero>]
+    int[] protoIndices = [0]
+    point3f[] positions = [(1, 0, 0)]
+}}"#,
+            binding("A"),
+            binding("B"),
+        ),
+    );
+    for model in ["u/Hero/A/Geo", "u/Hero/B/Geo", "u/Hero/prototype"] {
+        assert!(has(&a, &format!("{model}/skeleton")), "{model}");
+    }
+    assert_eq!(copies(&a, "u/Hero/prototype").len(), 1);
+}

@@ -47,9 +47,13 @@ pub(super) struct Skel {
     first: u16,
     /// The prims above it that are joints, with their joints.
     pub(super) prims: Vec<(usize, u16)>,
+    /// The joint of meshes it does not skin, beside those it does.
+    pub(super) still: Option<u16>,
     /// Bind space from skeleton space: model space if the skeleton's root has an inverse, else
     /// the skeleton's space in scene units and axes.
     to_bind: DMat4,
+    /// Model space from the space of its root joints.
+    root: DMat4,
 }
 
 /// The prims a mesh's skinning attributes come from: its own, or the nearest ancestor's up to
@@ -247,8 +251,28 @@ impl Skel {
             by_name,
             first: 0,
             prims: Vec::new(),
+            still: None,
             to_bind,
+            root: to_model,
         })
+    }
+
+    /// Adds a joint that holds still in model space, after the others: its bind undoes the root
+    /// as it stands, after any [`Self::hang`]. A root that flattens holds still only what lies
+    /// on its plane.
+    pub(super) fn add_still(&mut self) -> Result<(), String> {
+        let joint = self.info.joint_count();
+        if joint == MAX_SKINNED_JOINTS {
+            return Err(format!("more than {MAX_SKINNED_JOINTS} joints"));
+        }
+        self.info.parents.push(NO_PARENT);
+        self.info.rest.push(Trs::IDENTITY);
+        self.info
+            .inverse_binds
+            .push(Affine3::from_mat4(bind_inverse(self.root).as_mat4()));
+        self.info.names.push(String::new());
+        self.still = Some(joint as u16);
+        Ok(())
     }
 
     /// Puts `prims`, top first, above the skeleton's joints, the last of them holding its root
@@ -277,6 +301,7 @@ impl Skel {
         self.by_name.values_mut().for_each(|j| *j += by);
         self.first = by;
         self.info.root = Affine3::from_mat4(root.as_mat4());
+        self.root = root;
         let mut rest = Vec::with_capacity(added);
         let mut binds = Vec::with_capacity(added);
         let mut names = Vec::with_capacity(added);

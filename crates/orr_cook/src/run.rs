@@ -253,8 +253,8 @@ impl<'m> NewUnit<'m> {
 struct Imported {
     files: Vec<Input>,
     units: Vec<NewUnit<'static>>,
-    /// Placements of the instanced models, cooked as instance units `<asset>/instances`,
-    /// then `<asset>/instances/<k>` for each further 65536 models.
+    /// Placements of the instanced models, cooked as instance units `<asset>/instances`, then
+    /// `<asset>/instances/<k>` for each further 65536 models and each model with a skeleton.
     instances: Vec<Instances>,
     assemblies: Vec<Assembly>,
     /// For the asset's report and its record.
@@ -1886,7 +1886,9 @@ fn plan_scene(
         units.extend(model);
         assemblies.extend(assembly);
     }
-    let instances = scene_instances(name, &src.instances);
+    let mut instances = scene_instances(name, &src.instances);
+    let posed = src.posed.iter().map(std::slice::from_ref);
+    instances.extend(posed.flat_map(|model| scene_instances(name, model)));
     let images = Arc::new(src.images);
     for job in jobs {
         let (name, key, working_set) = (job.name.clone(), job.key, job.working_set(&images));

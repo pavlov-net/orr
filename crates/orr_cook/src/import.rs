@@ -47,6 +47,9 @@ pub(crate) struct Scene {
     pub(crate) skeletons: Vec<SceneSkeleton>,
     /// Per instanced model: its name and its instances' scene-space placements.
     pub(crate) instances: Vec<(String, Vec<Placed>)>,
+    /// The same of instanced models with skeletons. Each cooks to pages of its own, whose
+    /// records are its copies, for the palettes that pose them.
+    pub(crate) posed: Vec<(String, Vec<Placed>)>,
     /// Every file read.
     pub(crate) files: Vec<Input>,
     pub(crate) warnings: Vec<String>,

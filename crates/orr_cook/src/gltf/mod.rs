@@ -709,6 +709,7 @@ pub(crate) fn import(
         hashes: BTreeMap::new(),
         skeletons: Vec::new(),
         instances: Vec::new(),
+        posed: Vec::new(),
         files: &mut files,
         warnings: Vec::new(),
     };
@@ -718,6 +719,7 @@ pub(crate) fn import(
         mut models,
         skeletons,
         instances,
+        posed,
         warnings,
         ..
     } = b;
@@ -736,6 +738,7 @@ pub(crate) fn import(
         images,
         skeletons,
         instances,
+        posed,
         files,
         warnings,
     })
@@ -758,6 +761,7 @@ struct Imported<'a> {
     hashes: BTreeMap<PathBuf, Hash32>,
     skeletons: Vec<SceneSkeleton>,
     instances: Vec<(String, Vec<Placed>)>,
+    posed: Vec<(String, Vec<Placed>)>,
     files: &'a mut Vec<Input>,
     warnings: Vec<String>,
 }
@@ -1553,7 +1557,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
             None => None,
         };
         if let (Some(name), Some(copies)) = (&name, slot.copies.take()) {
-            b.instances.push((name.clone(), copies));
+            b.posed.push((name.clone(), copies));
         }
         out.push((
             frame,
