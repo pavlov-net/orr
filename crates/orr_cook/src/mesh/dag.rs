@@ -768,15 +768,19 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
     }
     let sections = cx.sections.len();
     // A stage's root sits at its first section's slot.
+    let root_of: FxHashMap<(usize, usize, bool), u32> = stages
+        .iter()
+        .zip(stage_root)
+        .map(|(st, root)| {
+            let slot = (usize::from(st.part), usize::from(st.sections[0]), st.merged);
+            (slot, root)
+        })
+        .collect();
     let stage_of = |part: usize, section: usize, merged: bool| {
-        stages
-            .iter()
-            .position(|st| {
-                usize::from(st.part) == part
-                    && usize::from(st.sections[0]) == section
-                    && st.merged == merged
-            })
-            .map_or(MeshHeader::NO_ROOT, |si| stage_root[si])
+        root_of
+            .get(&(part, section, merged))
+            .copied()
+            .unwrap_or(MeshHeader::NO_ROOT)
     };
     let mut roots: Vec<u32> = (0..cx.parts.table.len() * sections)
         .map(|i| stage_of(i / sections, i % sections, false))
