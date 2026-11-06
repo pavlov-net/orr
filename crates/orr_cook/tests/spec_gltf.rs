@@ -1108,6 +1108,52 @@ fn a_thin_volume_attenuates_nothing() {
     );
 }
 
+/// L2666 "used as an extra multiplier for the base color value", with the example below it for
+/// alpha, and a primitive beside it without `COLOR_0` multiplying by nothing.
+#[test]
+fn color_0_multiplies_the_base_color() {
+    let path = dir("color-0").join("colors.glb");
+    let mut g = Glb::default();
+    let pa = g.floats(&QUAD, "VEC3");
+    let colors: [[f32; 4]; 4] = [
+        [1.0, 0.0, 0.0, 0.5],
+        [0.0, 1.0, 0.0, 0.5],
+        [0.0, 0.0, 1.0, 0.5],
+        [0.25, 0.5, 0.75, 0.5],
+    ];
+    let ca = g.floats(&colors, "VEC4");
+    let ia = g.indices(&QUAD_INDICES);
+    let tri = g.floats(&TRIANGLE, "VEC3");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"COLOR_0":{ca}}},"indices":{ia},"material":0}},
+{{"attributes":{{"POSITION":{tri}}},"material":0}}]}}],
+"materials":[{{"alphaMode":"MASK"}}]"#
+        ),
+    );
+    let a = cooked(&path).0;
+    let m = material_of(&a);
+    assert_eq!(m.textures[slot::BASE_COLOR].vertex, 1);
+    assert_eq!(m.textures[slot::OPACITY].vertex, 4);
+    let corners = per_triangle(&a, "g/mesh", |view, c, t| {
+        t.map(|v| (view.position(c, v), view.color(c, v)))
+    });
+    let corners: Vec<_> = corners.into_iter().flatten().collect();
+    let at = |i: usize| {
+        let want = Vec3::from(QUAD[i]);
+        corners
+            .iter()
+            .find(|c| near(Vec3::from(c.0), want) && c.1[3] == 0.5)
+            .expect("a corner of the quad")
+            .1
+    };
+    assert_eq!(at(0), colors[0]);
+    assert_eq!(at(3), colors[3]);
+    assert!(corners.iter().any(|c| c.1 == [1.0; 4]), "no white corner");
+}
+
 /// KHR_materials_iridescence: "`iridescenceFactor` is multiplied with the red channel of
 /// `iridescenceTexture` to control the overall strength".
 #[test]

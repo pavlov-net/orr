@@ -3,6 +3,7 @@
 //! | glTF | `Material` |
 //! | --- | --- |
 //! | `baseColorFactor` rgb, `metallicFactor`, `roughnessFactor` | `base_color`, `metalness`, `specular_roughness` |
+//! | `COLOR_0` on a primitive | the vertex color stream, multiplying the base color and, by its alpha, the opacity |
 //! | `metallicRoughnessTexture` G and B, or R and G of an image holding only red and green | the roughness and metalness textures |
 //! | `KHR_texture_transform` on any textureInfo (offset, rotation, scale, texCoord) | the slot's `uv_transforms` entry and uv set |
 //! | `KHR_materials_ior` `ior` | `specular_ior` |

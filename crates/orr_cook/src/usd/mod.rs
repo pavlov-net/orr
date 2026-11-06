@@ -280,6 +280,8 @@ struct Frame {
     set: usize,
     /// Or this primvar outside the uv sets, on the meshes that hold it.
     st: Option<String>,
+    /// The primvars its material reads through the vertex color stream.
+    vertex: Vec<shading::VertexRead>,
 }
 
 /// How a mesh under a `SkelRoot` binds a skeleton: nodes of the prims that say so.
@@ -700,6 +702,12 @@ impl<'s> Importer<'s> {
                 {
                     primvars.insert(name.clone(), r.primvar(name, 2, None)?);
                 }
+                for read in &frame.vertex {
+                    if !primvars.contains_key(&read.name) {
+                        let width = usize::from(read.width);
+                        primvars.insert(read.name.clone(), r.primvar(&read.name, width, None)?);
+                    }
+                }
                 let reads = self.materials[m].tangent_set().is_some();
                 if let Some(st) = &frame.st
                     && reads
@@ -721,6 +729,19 @@ impl<'s> Importer<'s> {
                          surface",
                         frame.tangents
                     ));
+                }
+            }
+            let colored = used.iter().any(|&m| !self.frames[m].vertex.is_empty());
+            if colored {
+                if as_cage {
+                    self.warnings.push(format!(
+                        "{path}: a subdivision cage holds no vertex colors; what a material reads \
+                         of them reads 1"
+                    ));
+                } else {
+                    for &(m, _) in &holders[o] {
+                        models[m].welder.carries_colors = true;
+                    }
                 }
             }
             let skeleton = models[o].skeleton.map(|k| &skels[k].1);
@@ -758,11 +779,27 @@ impl<'s> Importer<'s> {
                 }
                 _ => None,
             };
+            let color = |face: usize, corner: usize, point: usize| {
+                let mut c = [1.0; 4];
+                for read in &self.frames[faces[face]].vertex {
+                    let held = primvars[&read.name].as_ref();
+                    let Some(v) = held.and_then(|p| p.at(point, face, corner)) else {
+                        continue;
+                    };
+                    let held = v.iter().skip(usize::from(read.offset));
+                    for (k, &x) in held.take(usize::from(read.width)).enumerate() {
+                        let x = x as f32;
+                        c[usize::from(read.first) + k] = if read.inverted { 1.0 - x } else { x };
+                    }
+                }
+                c
+            };
             for &(m, linear) in &holders[o] {
                 let placing = Placing {
                     transform: linear * transform,
                     face_material: &face_material,
                     skin: skin.as_deref(),
+                    color: &color,
                 };
                 match &surface {
                     None => models[m].cage.add(&mesh, &placing, &path)?,
@@ -896,6 +933,7 @@ impl<'s> Importer<'s> {
                 uvs: std::iter::once(w.uvs)
                     .chain(self.settings.uv1.is_some().then_some(w.uvs1))
                     .collect(),
+                colors: w.carries_colors.then_some(w.colors),
                 indices,
                 sections,
                 skin: b.skinned.then_some(Skin {
@@ -1515,6 +1553,7 @@ impl<'s> Importer<'s> {
             binormals: "binormals".into(),
             set: usize::from(material.tangent_set()),
             st: None,
+            vertex: Vec::new(),
         };
         let Some(p) = prim else {
             return Ok(frame);
@@ -1551,7 +1590,7 @@ impl<'s> Importer<'s> {
             match (self.reader(&self.nodes[i].prim).whole_primvar(name)?, set) {
                 (shading::Primvar::Missing, _) => {}
                 (_, Some(set)) if i == mesh => return Ok(shading::Primvar::Uv(set as u8)),
-                (shading::Primvar::Varying, _) if i != mesh => {}
+                (shading::Primvar::Varying(_), _) if i != mesh => {}
                 (held, _) => return Ok(held),
             }
             at = self.nodes[i].parent;
@@ -1596,6 +1635,7 @@ impl<'s> Importer<'s> {
                     meters_per_unit,
                     primvars: &primvars,
                     reads: &reads,
+                    any_mesh: false,
                     add: &mut add,
                 };
                 let mapped = shading::map(&s.net, s.surface, s.displacement, &mut host)
@@ -1616,6 +1656,7 @@ impl<'s> Importer<'s> {
                 shading::Mapped {
                     material: Default::default(),
                     textures: Default::default(),
+                    vertex: Vec::new(),
                     warnings: Vec::new(),
                 },
                 "default".to_string(),
@@ -1634,7 +1675,8 @@ impl<'s> Importer<'s> {
         if double_sided {
             mapped.material.double_sided = 1;
         }
-        let frame = self.frame(prim.as_ref(), &mut mapped.material)?;
+        let mut frame = self.frame(prim.as_ref(), &mut mapped.material)?;
+        frame.vertex = std::mem::take(&mut mapped.vertex);
         let suffix = if double_sided {
             format!("{name}/double_sided")
         } else {

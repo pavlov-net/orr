@@ -42,6 +42,7 @@ public struct SurfaceInput
     public uint part;
     public uint primitive;          // triangle in the cluster
     public float2 barycentrics;     // weights of corners 1 and 2
+    public float4 vertex_color;     // the mesh's color stream here; 1 without one
     public uint user_tag;           // the copy's or entry's
     public uint cluster_user;       // producer cluster word; 0 on cooked clusters
     public uint3 vertex_user;       // producer vertex words per corner; 0 on cooked clusters
@@ -91,12 +92,46 @@ public float material_opacity(SurfaceInput i)
         { i.uv[0].uv, float2(0.0), float2(0.0), float2(-1.0) },
         { i.uv[1].uv, float2(0.0), float2(0.0), float2(-1.0) },
     };
-    float opacity = m.geometry_opacity;
+    float opacity = m.geometry_opacity * surface_vertex(i, m, TEXTURE_OPACITY).x;
     if (material_bound(m, TEXTURE_OPACITY))
         opacity *= material_texture(m, TEXTURE_OPACITY, finest, float4(1.0)).x;
     else if (material_bound(m, TEXTURE_BASE_COLOR))
         opacity *= material_texture(m, TEXTURE_BASE_COLOR, finest, float4(1.0)).w;
     return opacity;
+}
+
+// What the vertex color stream multiplies `slot` by at the hit: from its first channel on in
+// xyz, 1 for a slot that reads none.
+public float3 surface_vertex(SurfaceInput i, MaterialGpu* m, uint slot)
+{
+    if ((m.flags & MATERIAL_VERTEX) == 0)
+        return float3(1.0);
+    uint first = (m.samplers[slot].modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK;
+    float4 c = i.vertex_color;
+    return first == 0 ? float3(1.0) : first == 1 ? c.xyz : first == 2 ? c.yzw : first == 3 ? float3(c.zw, 1.0) : float3(c.w, 1.0, 1.0);
+}
+
+// Scalar slot `slot` at the hit, times the vertex color stream's value for it.
+float surface_scale(SurfaceInput i, MaterialGpu* m, uint slot)
+{
+    return material_scale(m, slot, i.uv) * surface_vertex(i, m, slot).x;
+}
+
+// `material_color` of `slot` at the hit, its factor multiplied by the vertex color stream, which
+// is linear Rec.709.
+float3 surface_color(SurfaceInput i, MaterialGpu* m, uint slot, float3 factor)
+{
+    if ((m.flags & MATERIAL_VERTEX) != 0 && ((m.samplers[slot].modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK) != 0)
+        factor = mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, factor) * surface_vertex(i, m, slot));
+    return material_color(m, slot, i.uv, factor);
+}
+
+// `material_more_color` of `slot`, with `surface_color`'s vertex color.
+float3 surface_more_color(SurfaceInput i, MaterialGpu* m, uint slot, float3 factor)
+{
+    if ((m.flags & (MATERIAL_MORE_TEXTURES | MATERIAL_VERTEX)) == 0)
+        return factor;
+    return surface_color(i, m, slot, factor);
 }
 
 // The material's alpha test at the hit: 1 where `material_opacity` is at or above the
@@ -298,39 +333,41 @@ public struct StandardSurface : ISurface
         MaterialGpu* m = i.scene.materials + i.material;
         float4 one = float4(1.0);
         BsdfParams p;
-        p.base_color = m.base_weight * material_scale(m, TEXTURE_BASE_WEIGHT, i.uv) * material_color(m, TEXTURE_BASE_COLOR, i.uv, m.base_color);
-        p.metalness = m.metalness * material_texture(m, TEXTURE_METALNESS, i.uv, one).x;
-        p.specular_ior = m.specular_ior * material_scale(m, TEXTURE_SPECULAR_IOR, i.uv);
-        p.specular_color = surface_specular_color(m, material_more_color(m, TEXTURE_SPECULAR_COLOR, i.uv, m.specular_color), p.specular_ior);
-        p.specular_weight = m.specular_weight * material_texture(m, TEXTURE_SPECULAR_WEIGHT, i.uv, one).x;
-        p.specular_roughness = m.specular_roughness * material_texture(m, TEXTURE_ROUGHNESS, i.uv, one).x;
-        p.diffuse_roughness = m.diffuse_roughness * material_scale(m, TEXTURE_DIFFUSE_ROUGHNESS, i.uv);
-        p.transmission_weight = m.transmission_weight * material_texture(m, TEXTURE_TRANSMISSION, i.uv, one).x;
+        p.base_color = m.base_weight * surface_scale(i, m, TEXTURE_BASE_WEIGHT) * surface_color(i, m, TEXTURE_BASE_COLOR, m.base_color);
+        p.metalness = m.metalness * material_texture(m, TEXTURE_METALNESS, i.uv, one).x * surface_vertex(i, m, TEXTURE_METALNESS).x;
+        p.specular_ior = m.specular_ior * surface_scale(i, m, TEXTURE_SPECULAR_IOR);
+        p.specular_color = surface_specular_color(m, surface_more_color(i, m, TEXTURE_SPECULAR_COLOR, m.specular_color), p.specular_ior);
+        p.specular_weight = m.specular_weight * material_texture(m, TEXTURE_SPECULAR_WEIGHT, i.uv, one).x * surface_vertex(i, m, TEXTURE_SPECULAR_WEIGHT).x;
+        p.specular_roughness = m.specular_roughness * material_texture(m, TEXTURE_ROUGHNESS, i.uv, one).x * surface_vertex(i, m, TEXTURE_ROUGHNESS).x;
+        p.diffuse_roughness = m.diffuse_roughness * surface_scale(i, m, TEXTURE_DIFFUSE_ROUGHNESS);
+        p.transmission_weight = m.transmission_weight * material_texture(m, TEXTURE_TRANSMISSION, i.uv, one).x * surface_vertex(i, m, TEXTURE_TRANSMISSION).x;
         bool thin = (m.flags & MATERIAL_THIN_WALLED) != 0;
-        p.transmission_color = thin || m.transmission_depth == 0.0 ? material_more_color(m, TEXTURE_TRANSMISSION_COLOR, i.uv, m.transmission_color) : float3(1.0);
+        p.transmission_color = thin || m.transmission_depth == 0.0 ? surface_more_color(i, m, TEXTURE_TRANSMISSION_COLOR, m.transmission_color) : float3(1.0);
         if ((m.flags & MATERIAL_BASE_TINT) != 0)
             p.transmission_color *= p.base_color;
-        p.subsurface_weight = m.subsurface_weight * material_scale(m, TEXTURE_SUBSURFACE_WEIGHT, i.uv);
-        p.subsurface_color = material_color(m, TEXTURE_SUBSURFACE_COLOR, i.uv, m.subsurface_color);
+        p.subsurface_weight = m.subsurface_weight * surface_scale(i, m, TEXTURE_SUBSURFACE_WEIGHT);
+        p.subsurface_color = surface_color(i, m, TEXTURE_SUBSURFACE_COLOR, m.subsurface_color);
         p.subsurface_anisotropy = m.subsurface_scatter_anisotropy;
-        p.subsurface_radius = m.subsurface_radius * material_scale(m, TEXTURE_SUBSURFACE_RADIUS, i.uv) * m.subsurface_radius_scale;
+        p.subsurface_radius = m.subsurface_radius * surface_scale(i, m, TEXTURE_SUBSURFACE_RADIUS) * m.subsurface_radius_scale;
         if ((m.flags & MATERIAL_MORE_TEXTURES) != 0)
         {
             p.subsurface_radius *= material_texture(m, TEXTURE_SUBSURFACE_RADIUS_SCALE, i.uv, one).rgb;
             p.subsurface_anisotropy = 2.0 * material_texture(m, TEXTURE_SUBSURFACE_ANISOTROPY, i.uv, float4(0.5 * p.subsurface_anisotropy + 0.5)).x - 1.0;
         }
-        p.coat_weight = m.coat_weight * material_texture(m, TEXTURE_COAT, i.uv, one).x;
-        p.coat_color = material_more_color(m, TEXTURE_COAT_COLOR, i.uv, m.coat_color);
-        p.coat_roughness = m.coat_roughness * material_scale(m, TEXTURE_COAT_ROUGHNESS, i.uv);
-        p.coat_ior = m.coat_ior * material_scale(m, TEXTURE_COAT_IOR, i.uv);
-        p.coat_darkening = m.coat_darkening * material_scale(m, TEXTURE_COAT_DARKENING, i.uv);
-        p.fuzz_weight = m.fuzz_weight * material_scale(m, TEXTURE_FUZZ_WEIGHT, i.uv);
-        p.fuzz_color = material_more_color(m, TEXTURE_FUZZ_COLOR, i.uv, m.fuzz_color);
-        p.fuzz_roughness = m.fuzz_roughness * material_scale(m, TEXTURE_FUZZ_ROUGHNESS, i.uv);
-        p.thin_film_weight = m.thin_film_weight * material_scale(m, TEXTURE_THIN_FILM_WEIGHT, i.uv);
-        p.thin_film_thickness = m.thin_film_thickness * material_scale(m, TEXTURE_THIN_FILM_THICKNESS, i.uv);
-        p.thin_film_ior = m.thin_film_ior * material_scale(m, TEXTURE_THIN_FILM_IOR, i.uv);
-        p.emission = material_emission_at(m, i.uv);
+        p.coat_weight = m.coat_weight * material_texture(m, TEXTURE_COAT, i.uv, one).x * surface_vertex(i, m, TEXTURE_COAT).x;
+        p.coat_color = surface_more_color(i, m, TEXTURE_COAT_COLOR, m.coat_color);
+        p.coat_roughness = m.coat_roughness * surface_scale(i, m, TEXTURE_COAT_ROUGHNESS);
+        p.coat_ior = m.coat_ior * surface_scale(i, m, TEXTURE_COAT_IOR);
+        p.coat_darkening = m.coat_darkening * surface_scale(i, m, TEXTURE_COAT_DARKENING);
+        p.fuzz_weight = m.fuzz_weight * surface_scale(i, m, TEXTURE_FUZZ_WEIGHT);
+        p.fuzz_color = surface_more_color(i, m, TEXTURE_FUZZ_COLOR, m.fuzz_color);
+        p.fuzz_roughness = m.fuzz_roughness * surface_scale(i, m, TEXTURE_FUZZ_ROUGHNESS);
+        p.thin_film_weight = m.thin_film_weight * surface_scale(i, m, TEXTURE_THIN_FILM_WEIGHT);
+        p.thin_film_thickness = m.thin_film_thickness * surface_scale(i, m, TEXTURE_THIN_FILM_THICKNESS);
+        p.thin_film_ior = m.thin_film_ior * surface_scale(i, m, TEXTURE_THIN_FILM_IOR);
+        p.emission = material_emission_at(m, i.uv) * surface_vertex(i, m, TEXTURE_EMISSION_LUMINANCE).x;
+        if ((m.flags & MATERIAL_VERTEX) != 0 && ((m.samplers[TEXTURE_EMISSION].modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK) != 0)
+            p.emission = mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, p.emission) * surface_vertex(i, m, TEXTURE_EMISSION));
 
         GSurface s = (GSurface)0;
         s.normal = material_normal(i, m);
@@ -345,7 +382,7 @@ public struct StandardSurface : ISurface
             p.flags |= BSDF_METAL_FLAT;
         if ((m.flags & MATERIAL_ANISOTROPY) != 0)
         {
-            p.specular_anisotropy = m.specular_anisotropy * material_scale(m, TEXTURE_ANISOTROPY, i.uv);
+            p.specular_anisotropy = m.specular_anisotropy * surface_scale(i, m, TEXTURE_ANISOTROPY);
             float rotation = m.specular_rotation + material_direction(m, TEXTURE_TANGENT, i.uv);
             p.tangent_angle = surface_tangent_angle(i, s.normal, rotation);
             p.flags |= BSDF_ANISOTROPY;
@@ -353,7 +390,7 @@ public struct StandardSurface : ISurface
         p.coat_normal = (m.flags & MATERIAL_COAT_ON_BASE) != 0 ? s.normal : i.normal;
         if ((m.flags & MATERIAL_MORE_TEXTURES) != 0)
             p.coat_normal = material_bound(m, TEXTURE_COAT_NORMAL) ? material_normal(i, m, TEXTURE_COAT_NORMAL) : p.coat_normal;
-        p.coat_anisotropy = m.coat_anisotropy * material_scale(m, TEXTURE_COAT_ANISOTROPY, i.uv);
+        p.coat_anisotropy = m.coat_anisotropy * surface_scale(i, m, TEXTURE_COAT_ANISOTROPY);
         p.coat_tangent_angle = 0.0;
         if (p.coat_weight > 0.0)
         {

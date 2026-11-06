@@ -173,6 +173,7 @@ public bool strand_geometry(inout SurfaceInput i, ProducerBatch b, uint segment,
     i.primitive = 0;
     i.cluster_user = b.segment_user[segment];
     i.vertex_user = b.vertex_user != nullptr ? uint3(b.vertex_user[g.vertex], b.vertex_user[g.vertex + 1], 0) : uint3(0);
+    i.vertex_color = float4(1.0);
     return true;
 }
 
@@ -219,6 +220,7 @@ public ProducerTriangle producer_triangle(ProducerBatch b, ProducerClusterGpu k,
         a.uv[0] = producer_uv(b.attrs[v]);
         a.uv[1] = a.uv[0];
         a.tangent = float4(1.0, 0.0, 0.0, 1.0);
+        a.color = float4(1.0);
         t.corners.attributes[j] = a;
         t.vertex_user[j] = b.vertex_user != nullptr ? b.vertex_user[v] : 0;
     }
@@ -360,6 +362,7 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
     i.object_position = w.x * t.position[0] + w.y * t.position[1] + w.z * t.position[2];
     i.object_normal = n_obj;
     i.object_to_render = pl.linear;
+    i.vertex_color = w.x * a0.color + w.y * a1.color + w.z * a2.color;
 }
 
 // The skinned copy `inst` names; false for copies not from `add_skinned`.
@@ -855,6 +858,7 @@ public SurfaceInput particle_input(SceneRoot* s, uint material, float2 uv)
     SurfaceInput i = (SurfaceInput)0;
     i.scene = s;
     i.material = material;
+    i.vertex_color = float4(1.0);
     i.uv[0].uv = uv;
     i.uv[0].tap = float2(-1.0);
     i.uv[1] = i.uv[0];

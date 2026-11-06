@@ -48,6 +48,7 @@ pub mod material_flags {
     pub const F0_STATED: u32 = 1 << 21;
     pub const MORE_TEXTURES: u32 = 1 << 22;
     pub const BASE_TINT: u32 = 1 << 23;
+    pub const VERTEX: u32 = 1 << 24;
 }
 
 /// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
@@ -56,6 +57,7 @@ const TILED: u32 = 1 << 10;
 const UV_SET: u32 = 1 << 11;
 const CHANNEL_SHIFT: u32 = 12;
 const PRIMARIES_SHIFT: u32 = 16;
+const VERTEX_SHIFT: u32 = 18;
 
 /// A texture bound to a cooked material: its heap index, its
 /// [`TextureHeader::primaries`](orr_pack::texture::TextureHeader::primaries) and the sampler of
@@ -117,6 +119,7 @@ fn binding_modes(b: &TextureBinding, t: &BoundTexture) -> u32 {
         | uv_set
         | u32::from(b.channels & 15) << CHANNEL_SHIFT
         | u32::from(t.primaries & 3) << PRIMARIES_SHIFT
+        | u32::from(b.vertex & 7) << VERTEX_SHIFT
 }
 
 /// The `orr_shaders.trace` candidate class of a model whose sections have material flags `flags`:
@@ -157,8 +160,9 @@ impl MaterialGpu {
         };
         let thin = m.thin_walled != 0;
         let dielectric = m.transmission_weight > 0.0;
-        let presence =
-            m.alpha_mode == Material::BLEND && (m.geometry_opacity < 1.0 || bound(slot::OPACITY));
+        let vertex_opacity = m.textures[slot::OPACITY].vertex != 0;
+        let presence = m.alpha_mode == Material::BLEND
+            && (m.geometry_opacity < 1.0 || bound(slot::OPACITY) || vertex_opacity);
         let subsurface = m.subsurface_weight > 0.0 && !thin && !dielectric;
         let lobes = m.coat_weight > 0.0
             || m.fuzz_weight > 0.0
@@ -183,6 +187,7 @@ impl MaterialGpu {
         set(preview, f::COAT_ON_BASE | f::METAL_FLAT);
         set(m.model != Material::MODEL_OPENPBR, f::FRESNEL_MIX);
         set(m.model == Material::MODEL_GLTF, f::BASE_TINT);
+        set(m.textures.iter().any(|b| b.vertex != 0), f::VERTEX);
         set(m.model == Material::MODEL_PREVIEW_SPECULAR, f::F0_STATED);
         set((slot::MORE..slot::COUNT).any(bound), f::MORE_TEXTURES);
         let cost: u32 = if subsurface {

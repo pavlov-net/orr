@@ -38,7 +38,7 @@ public struct StoredPage
 static const uint HEADER_BYTES = 96;
 static const uint CLUSTER_BYTES = 144;
 static const uint MAX_VERTICES = 256;
-static const uint MAX_VERTEX_BYTES = 8 + 24;
+static const uint MAX_VERTEX_BYTES = 8 + 32;
 static const uint MAX_CHANNELS = MAX_VERTEX_BYTES / 4;
 static const uint MAX_GROUPS = MAX_VERTICES / 16;
 

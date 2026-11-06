@@ -622,13 +622,13 @@ impl PrimReader<'_> {
         let Some(values) = numbers(&value).filter(|v| !v.is_empty()) else {
             return Ok(shading::Primvar::Missing);
         };
+        let width = element_width(&value).unwrap_or(values.len()) * self.element_size(&full);
         if self
             .metadata_token(&full, "interpolation")
             .is_some_and(|i| i != "constant")
         {
-            return Ok(shading::Primvar::Varying);
+            return Ok(shading::Primvar::Varying(width.min(4) as u8));
         }
-        let width = element_width(&value).unwrap_or(values.len()) * self.element_size(&full);
         let primvar = Primvar {
             values,
             width,

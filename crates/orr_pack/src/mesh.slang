@@ -13,6 +13,7 @@ public static const uint PAGE_MAX = 128 << 10;
 public static const uint MESH_TANGENT = 1;
 public static const uint MESH_SKIN = 2;
 public static const uint MESH_UV1 = 4;
+public static const uint MESH_COLOR = 8;
 
 // `Cluster.kind`.
 public static const uint CLUSTER_TRIANGLES = 0;
@@ -118,6 +119,7 @@ public struct VertexAttributes
     public float3 normal;
     public float4 tangent;         // xyz and bitangent sign; (1, 0, 0, 1) without MESH_TANGENT
     public float2 uv[2];           // per uv set; set 1 is zero without MESH_UV1
+    public float4 color;           // 1 without MESH_COLOR
     public uint4 joints;           // MESH_SKIN only
     public float4 weights;         // MESH_SKIN only; sum to 1
 }
@@ -174,6 +176,12 @@ public VertexAttributes load_attributes(uint8_t* page, PageHeader h, Cluster c, 
     v.uv[1] = float2(0.0);
     if ((attributes & MESH_UV1) != 0)
         v.uv[1] = load_uv(a[at++], c, 1);
+    v.color = float4(1.0);
+    if ((attributes & MESH_COLOR) != 0)
+    {
+        v.color = float4(unpack_half2x16(a[at]), unpack_half2x16(a[at + 1]));
+        at += 2;
+    }
     v.joints = uint4(0);
     v.weights = float4(0.0);
     if ((attributes & MESH_SKIN) != 0)

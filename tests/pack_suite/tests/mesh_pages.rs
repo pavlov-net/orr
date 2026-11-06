@@ -134,6 +134,11 @@ fn check(page: &[u8], mesh: &MeshHeader, spread: &mut Spread) {
             assert_eq!(g.joints, joints, "{at}");
             let w = view.weights(&c, v).unwrap_or_default();
             Spread::add(&mut spread.weight, &g.weights, &w, 1.0);
+            // Random words hold NaNs, whose payloads the GPU's conversion needn't keep.
+            let color = view.color(&c, v);
+            let same =
+                |k: usize| g.color[k] == color[k] || g.color[k].is_nan() && color[k].is_nan();
+            assert!((0..4).all(same), "{at}: {:?} {color:?}", g.color);
         }
         for t in 0..u32::from(c.tri_count) {
             let g = triangles[ci * SLOTS + t as usize].corners;
@@ -270,13 +275,20 @@ fn synthetic_pages_load_alike_at_every_attribute_layout() {
         MeshHeader::SKIN,
         MeshHeader::UV1,
         MeshHeader::TANGENT | MeshHeader::UV1 | MeshHeader::SKIN,
+        MeshHeader::TANGENT | MeshHeader::UV1 | MeshHeader::COLOR | MeshHeader::SKIN,
     ] {
         for exponent in [-11, 3] {
             let mut mesh: MeshHeader = bytemuck::Zeroable::zeroed();
             mesh.attributes = attributes;
             mesh.position_exponent = exponent;
             let entries = if exponent < 0 { 37 } else { 0 };
-            let p = synthetic(&mut rng, 24, mesh.attr_stride() as usize, entries);
+            // The widest vertices fill a page in fewer clusters.
+            let clusters = if attributes & MeshHeader::COLOR != 0 {
+                16
+            } else {
+                24
+            };
+            let p = synthetic(&mut rng, clusters, mesh.attr_stride() as usize, entries);
             let mut resident = vec![0; p.len()];
             mesh::decode_page(&mesh::encode_page(&p).unwrap(), &mut resident).unwrap();
             check(&resident, &mesh, &mut spread);

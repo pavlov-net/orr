@@ -62,6 +62,7 @@ use gltf::image::Source as ImageSource;
 use gltf::mesh::{Mode, Semantic};
 use orr_math::{DMat3, DMat4, Quat, Vec3};
 use orr_pack::Hash32;
+use orr_pack::material::slot;
 use rayon::prelude::*;
 use serde::Deserialize;
 
@@ -99,6 +100,7 @@ struct Vertices {
     tangents: Vec<[f32; 4]>,
     uvs: Vec<[f32; 2]>,
     uvs1: Vec<[f32; 2]>,
+    colors: Vec<[f32; 4]>,
     joints: Vec<[u8; 4]>,
     weights: Vec<[u8; 4]>,
     values: Vec<u16>,
@@ -122,6 +124,8 @@ struct Building {
     tangents: bool,
     /// A primitive has TEXCOORD_1.
     uv1: bool,
+    /// A primitive has COLOR_0.
+    colors: bool,
     groups: BTreeMap<usize, Vec<u32>>,
     /// Bind position and skeleton joint per part value, from skins.
     joint_pivots: Vec<Option<([f32; 3], u16)>>,
@@ -134,6 +138,7 @@ impl Building {
             v: Vertices::default(),
             tangents: false,
             uv1: false,
+            colors: false,
             groups: BTreeMap::new(),
             joint_pivots: vec![None; parts],
         }
@@ -177,6 +182,7 @@ impl Building {
             uvs: std::iter::once(v.uvs)
                 .chain(self.uv1.then_some(v.uvs1))
                 .collect(),
+            colors: self.colors.then_some(v.colors),
             indices,
             sections: Vec::new(),
             skin: skinned.then_some(Skin {
@@ -365,6 +371,18 @@ fn append_primitive(
         v.map_or_else(|| vec![[0.0; 2]; n], |v| v.as_chunks::<2>().0.to_vec())
     };
     let (uvs, uvs1) = (zeros(uvs), zeros(uvs1));
+    // L1707 keeps them in 0..1, and a primitive without any multiplies by nothing.
+    let colors: Vec<[f32; 4]> = match prim.get(&Semantic::Colors(0)) {
+        Some(a) => {
+            let mut rows = counted(&a, 4)?;
+            if a.dimensions() == gltf::accessor::Dimensions::Vec3 {
+                rows.chunks_exact_mut(4).for_each(|r| r[3] = 1.0);
+            }
+            b.colors = true;
+            rows.as_chunks::<4>().0.to_vec()
+        }
+        None => vec![[1.0; 4]; n],
+    };
     let local_normals = rows(Semantic::Normals, 3)?;
     let local_normals = local_normals.as_ref().map(|n| n.as_chunks::<3>().0);
     let normals: Option<Vec<[f32; 3]>> = local_normals.map(|ns| {
@@ -519,6 +537,7 @@ fn append_primitive(
             v.tangents.extend(tangents);
             v.uvs.extend(tangents::with_copies(uvs, &copies));
             v.uvs1.extend(tangents::with_copies(uvs1, &copies));
+            v.colors.extend(tangents::with_copies(colors, &copies));
             let skin = tangents::with_copies(skin, &copies);
             v.joints.extend(skin.iter().map(|s| s.0));
             v.weights.extend(skin.iter().map(|s| s.1));
@@ -539,6 +558,7 @@ fn append_primitive(
                         .push(computed.as_ref().map_or(tangents::UNREAD, |t| t[3 * k + c]));
                     v.uvs.push(uvs[i]);
                     v.uvs1.push(uvs1[i]);
+                    v.colors.push(colors[i]);
                     if let Some(&(j, w)) = skin.get(i) {
                         v.joints.push(j);
                         v.weights.push(w);
@@ -768,6 +788,16 @@ impl Imported<'_> {
                     textures: t,
                 },
             );
+        }
+        // L2666: an extra multiplier for the base color, alpha included by the example below it.
+        if prim.get(&Semantic::Colors(0)).is_some() {
+            let m = &mut self
+                .materials
+                .get_mut(&index)
+                .expect("registered above")
+                .material;
+            m.textures[slot::BASE_COLOR].vertex = 1;
+            m.textures[slot::OPACITY].vertex = 4;
         }
         let reads_uv1 = self.materials[&index]
             .textures

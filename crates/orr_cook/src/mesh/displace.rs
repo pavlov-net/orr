@@ -123,6 +123,10 @@ fn midpoint(w: &mut Welded, a: u32, b: u32) -> u32 {
         let (ua, ub) = (u[a], u[b]);
         u.push([mid(ua[0], ub[0]), mid(ua[1], ub[1])]);
     }
+    if let Some(c) = &mut w.colors {
+        let (ca, cb) = (c[a], c[b]);
+        c.push(std::array::from_fn(|i| mid(ca[i], cb[i])));
+    }
     if let Some(t) = &mut w.tangents {
         // A placed mesh's tangents are not unit, and the longer one would pull the midpoint.
         let (ta, tb) = (t[a], t[b]);

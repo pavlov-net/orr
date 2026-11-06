@@ -1290,6 +1290,67 @@ fn preview_parameters_carry_their_spec_values() {
     assert_eq!(material(&a).specular_color, [0.5; 3]);
 }
 
+/// The vertex color stream of the stage's mesh, one entry per vertex.
+fn vertex_colors(a: &Archive) -> Vec<[f32; 4]> {
+    let e = a.find(AssetId::from_name("u/mesh")).unwrap();
+    let blobs = a.blobs(e);
+    let read = |b: &Blob| {
+        let mut v = vec![0; b.raw_len as usize];
+        a.read(b, &mut v).unwrap();
+        v
+    };
+    let info = MeshInfo::parse(&read(&blobs[0])).unwrap();
+    let mut out = Vec::new();
+    for p in &info.pages {
+        let mut page = vec![0; p.resident_len as usize];
+        orr_pack::mesh::decode_page(&read(&blobs[p.blob as usize]), &mut page).unwrap();
+        let view = PageView::new(&page, &info.header).unwrap();
+        for i in 0..view.cluster_count() {
+            let c = view.cluster(i);
+            out.extend((0..u32::from(c.vertex_count)).map(|v| view.color(&c, v)));
+        }
+    }
+    out
+}
+
+/// PS primvar reader: "(potentially) surface-varying data". A varying primvar takes channels of
+/// the vertex stream, by its interpolation, and `opacity` under `transparent` reads its complement.
+#[test]
+fn varying_primvars_read_through_the_vertex_stream() {
+    let reader = |name: &str, kind: &str, primvar: &str, output: &str| {
+        format!(
+            r#"def Shader "{name}"
+    {{
+        uniform token info:id = "UsdPrimvarReader_{kind}"
+        string inputs:varname = "{primvar}"
+        {output} outputs:result
+    }}"#
+        )
+    };
+    let inputs = "color3f inputs:diffuseColor.connect = </M/C.outputs:result>
+        float inputs:opacity.connect = </M/O.outputs:result>";
+    let prims = format!(
+        "{}\n{}",
+        reader("C", "float3", "displayColor", "float3"),
+        reader("O", "float", "displayOpacity", "float")
+    );
+    let mesh = r#"color3f[] primvars:displayColor = [(1, 0, 0), (0, 1, 0), (0, 0, 1)] (
+        interpolation = "vertex"
+    )
+    float[] primvars:displayOpacity = [0.25] (
+        interpolation = "uniform"
+    )"#;
+    let a = cook("reader-varying", &previewed(inputs, &prims, mesh));
+    let m = material(&a);
+    assert_eq!(m.base_color, [1.0; 3]);
+    assert_eq!(m.textures[slot::BASE_COLOR].vertex, 1);
+    assert_eq!(m.textures[slot::TRANSMISSION].vertex, 4);
+    let colors = vertex_colors(&a);
+    assert_eq!(colors.len(), 3);
+    assert!(colors.contains(&[1.0, 0.0, 0.0, 0.75]), "{colors:?}");
+    assert!(colors.contains(&[0.0, 0.0, 1.0, 0.75]), "{colors:?}");
+}
+
 /// PS inputs are connectable: `specularColor`, `ior` (for the clearcoat too) and
 /// `clearcoatRoughness` read textures.
 #[test]

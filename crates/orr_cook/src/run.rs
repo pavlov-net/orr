@@ -1973,6 +1973,8 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, MapTexture>) -> MapSpec {
         outside: m.textures[s].outside,
     };
     let opacity = match (m.alpha_mode, bound(slot::OPACITY)) {
+        // Vertices state an opacity no triangle-wide test can stand for.
+        (Material::MASK, _) if m.textures[slot::OPACITY].vertex != 0 => OpacitySpec::Unknown,
         (Material::MASK, None) => OpacitySpec::Constant(m.geometry_opacity >= m.alpha_cutoff),
         (Material::MASK, Some((Some(texture), uv_set))) => OpacitySpec::Texture {
             texture: texture.clone(),
@@ -2060,6 +2062,10 @@ fn mesh_units(
     deps.dedup();
     let n = input.positions.len();
     let mesh = MeshData {
+        colors: input
+            .colors
+            .as_ref()
+            .map(|c| c.iter().map(Vec4::to_array).collect()),
         positions: input.positions.iter().map(Vec3::to_array).collect(),
         normals: input.normals.iter().map(Vec3::to_array).collect(),
         tangents: input

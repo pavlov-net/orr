@@ -195,7 +195,7 @@ fn stages(
     // Vertices of different parts join where they share a position, attributes and section.
     let attrs = |v: u32| {
         let v = v as usize;
-        let mut k = [0u32; 13];
+        let mut k = [0u32; 17];
         k[..3].copy_from_slice(&w.normals[v].map(f32::to_bits));
         k[3..5].copy_from_slice(&w.uvs[0][v].map(f32::to_bits));
         if let Some(t) = &w.tangents {
@@ -207,6 +207,9 @@ fn stages(
         }
         if let Some(u) = w.uvs.get(1) {
             k[11..13].copy_from_slice(&u[v].map(f32::to_bits));
+        }
+        if let Some(c) = &w.colors {
+            k[13..17].copy_from_slice(&c[v].map(f32::to_bits));
         }
         k
     };

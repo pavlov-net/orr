@@ -7848,3 +7848,41 @@ fn models_state_their_specular_and_tint() {
     near(out[2].transmission_color, rec2020([1.0; 3]), "no tint");
     assert_clean();
 }
+
+/// The vertex color stream multiplies the slots that name a channel of it, a color from that
+/// channel on, bound to a texture or not, in linear Rec.709.
+#[test]
+fn vertex_colors_multiply_the_slots_that_read_them() {
+    use orr_pack::material::{Material, slot};
+    let _guard = serial();
+    let d = device();
+    let mut m = Material {
+        base_color: [0.5, 0.5, 0.25],
+        metalness: 0.5,
+        ..Material::default()
+    };
+    m.textures[slot::BASE_COLOR].vertex = 1;
+    m.textures[slot::METALNESS].vertex = 4;
+    let plain = Material {
+        textures: Material::default().textures,
+        ..m
+    };
+    let record = |m: &Material| MaterialGpu::new(m, &[BoundTexture::NONE; slot::COUNT]);
+    let vertex = [0.5, 0.25, 1.0, 0.75];
+    let out = surface_params(d, &[record(&m), record(&plain)], |_| {}, vertex);
+    let rec2020 = |c: [f32; 3]| {
+        orr_color::rec709_to_rec2020(Vec3::from(c))
+            .as_vec3()
+            .to_array()
+    };
+    let want = rec2020([0.25, 0.125, 0.25]);
+    let near = |(a, b): (&f32, &f32)| (a - b).abs() < 1e-5;
+    assert!(
+        out[0].base_color.iter().zip(&want).all(near),
+        "{:?}",
+        out[0].base_color
+    );
+    assert!((out[0].metalness - 0.375).abs() < 1e-6);
+    assert_eq!(out[1].metalness, 0.5, "a slot that names none reads none");
+    assert_clean();
+}

@@ -387,12 +387,15 @@ pub(super) struct Welder {
     pub(super) carries_tangents: bool,
     pub(super) uvs: Vec<[f32; 2]>,
     pub(super) uvs1: Vec<[f32; 2]>,
+    pub(super) colors: Vec<[f32; 4]>,
+    /// A material of the model reads the vertex color stream.
+    pub(super) carries_colors: bool,
     pub(super) joints: Vec<[u8; 4]>,
     pub(crate) weights: Vec<[u8; 4]>,
     pub(super) groups: BTreeMap<usize, Vec<u32>>,
     /// Scene materials drawn on a mesh without the uv set 1 primvar.
     pub(super) missing_uv1: BTreeSet<usize>,
-    seen: HashMap<[u32; 16], u32>,
+    seen: HashMap<[u32; 20], u32>,
 }
 
 /// How a mesh's faces land in a model.
@@ -403,6 +406,8 @@ pub(super) struct Placing<'a> {
     pub(super) face_material: &'a dyn Fn(usize) -> usize,
     /// Influences per point when skinned.
     pub(super) skin: Option<&'a [Influence]>,
+    /// The vertex color stream at a triangle's corner: its face, face corner and point.
+    pub(super) color: &'a dyn Fn(usize, usize, usize) -> [f32; 4],
 }
 
 impl Welder {
@@ -412,15 +417,17 @@ impl Welder {
         n: [f32; 3],
         t: [f32; 4],
         uv: [[f32; 2]; 2],
+        color: [f32; 4],
         skin: Influence,
     ) -> u32 {
-        let mut key = [0u32; 16];
+        let mut key = [0u32; 20];
         let values = p.iter().chain(&n).chain(&t).chain(uv.as_flattened());
         for (k, v) in key.iter_mut().zip(values) {
             *k = v.to_bits();
         }
         key[14] = u32::from_le_bytes(skin.0);
         key[15] = u32::from_le_bytes(skin.1);
+        key[16..].copy_from_slice(&color.map(f32::to_bits));
         if let Some(&i) = self.seen.get(&key) {
             return i;
         }
@@ -430,6 +437,7 @@ impl Welder {
         self.tangents.push(t);
         self.uvs.push(uv[0]);
         self.uvs1.push(uv[1]);
+        self.colors.push(color);
         self.joints.push(skin.0);
         self.weights.push(skin.1);
         self.seen.insert(key, i);
@@ -472,6 +480,7 @@ impl Welder {
                     n.as_vec3().to_array(),
                     tangent,
                     uv,
+                    (at.color)(t.face, t.corners[c].0, point),
                     skin,
                 );
             }

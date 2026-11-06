@@ -13,6 +13,7 @@ struct VertexOut
     float4 uv;
     uint4 joints;
     float4 weights;
+    float4 color;
 }
 
 struct TriangleOut
@@ -59,6 +60,7 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID)
         v.uv = float4(a.uv[0], a.uv[1]);
         v.joints = a.joints;
         v.weights = a.weights;
+        v.color = a.color;
         root.vertices[slot] = v;
     }
     if (i < c.tri_count)

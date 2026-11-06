@@ -460,6 +460,7 @@ fn matches(m: &MeshData, a: &Piece, b: &Piece, r: DQuat, tol: f64) -> bool {
         let (va, vb) = (va as usize, vb as usize);
         let near = |a: [f32; 2], b: [f32; 2]| (0..2).all(|k| (a[k] - b[k]).abs() <= 1e-4);
         let uv = m.uvs.iter().all(|u| near(u[va], u[vb]));
+        let uv = uv && m.colors.as_ref().is_none_or(|c| c[va] == c[vb]);
         let normal = dir_ok(rf * Vec3::from(m.normals[va]), Vec3::from(m.normals[vb]));
         let tangent = m.tangents.as_ref().is_none_or(|t| {
             let (ta, tb) = (t[va], t[vb]);
@@ -507,6 +508,7 @@ fn unit_mesh(m: &MeshData, p: &Piece) -> (MeshData, Vec<u16>) {
         normals: Vec::new(),
         tangents: m.tangents.as_ref().map(|_| Vec::new()),
         uvs: vec![Vec::new(); m.uvs.len()],
+        colors: m.colors.as_ref().map(|_| Vec::new()),
         indices: Vec::with_capacity(3 * p.tris.len()),
         sections: Vec::new(),
         skin: None,
@@ -533,6 +535,9 @@ fn unit_mesh(m: &MeshData, p: &Piece) -> (MeshData, Vec<u16>) {
                     dst.push(src[i]);
                 }
                 if let (Some(dst), Some(src)) = (&mut out.tangents, &m.tangents) {
+                    dst.push(src[i]);
+                }
+                if let (Some(dst), Some(src)) = (&mut out.colors, &m.colors) {
                     dst.push(src[i]);
                 }
                 (out.positions.len() - 1) as u32
@@ -586,6 +591,10 @@ fn remainder(m: &MeshData, mut removed: Vec<Vec<[u32; 3]>>) -> MeshData {
             .iter()
             .map(|u| order.iter().map(|&v| u[v]).collect())
             .collect(),
+        colors: m
+            .colors
+            .as_ref()
+            .map(|c| order.iter().map(|&v| c[v]).collect()),
         indices,
         sections,
         skin: None,
@@ -734,6 +743,7 @@ mod tests {
                 normals: self.normals.clone(),
                 tangents: None,
                 uvs: vec![self.uvs.clone()],
+                colors: None,
                 indices,
                 sections: out,
                 skin: None,

@@ -12,7 +12,8 @@
 //!   unorm), tangent when the mesh has [`MeshHeader::TANGENT`] (octahedral 2x16 unorm,
 //!   bitangent sign in the low bit of y: set means -1), uv set 0 (2x16 unorm over the
 //!   cluster's `uv_offset[0]` and `uv_scale[0]`), uv set 1 likewise when the mesh has
-//!   [`MeshHeader::UV1`], and with [`MeshHeader::SKIN`] joints u8x4 and weights unorm8x4.
+//!   [`MeshHeader::UV1`], with [`MeshHeader::COLOR`] four half floats, and with
+//!   [`MeshHeader::SKIN`] joints u8x4 and weights unorm8x4.
 //! - Vertex `i` of a cluster sits at index `vertex_first + i` in both the position and the
 //!   attribute array. `vertex_first` is even, so every cluster's positions start 4-aligned.
 //! - Triangles at `tris_offset + tri_first`: u8x3 cluster-local corners, opaque triangles
@@ -55,7 +56,7 @@ pub struct MeshHeader {
     pub position_exponent: i8,
     /// Low mantissa bits a CLAS build may truncate without moving any position.
     pub clas_truncate_bits: u8,
-    /// [`Self::TANGENT`], [`Self::SKIN`] and [`Self::UV1`].
+    /// [`Self::TANGENT`], [`Self::SKIN`], [`Self::UV1`] and [`Self::COLOR`].
     pub attributes: u8,
     /// Cluster limits the mesh was cooked with.
     pub max_vertices: u16,
@@ -98,6 +99,9 @@ impl MeshHeader {
     pub const SKIN: u8 = 2;
     /// A second uv set.
     pub const UV1: u8 = 4;
+    /// Per vertex, four values a material reads through
+    /// [`TextureBinding::vertex`](crate::material::TextureBinding::vertex); 1 without them.
+    pub const COLOR: u8 = 8;
     pub const NO_MERGE_LEVEL: u8 = 0xFF;
     pub const NO_ROOT: u32 = !0;
 
@@ -368,7 +372,10 @@ pub fn nodes(blob: &[u8]) -> Result<Vec<Node>> {
 /// Bytes per vertex in the attribute array of a mesh with these [`MeshHeader::attributes`].
 pub fn attr_stride(attributes: u8) -> u32 {
     let has = |a: u8| u32::from(attributes & a != 0);
-    8 + 4 * has(MeshHeader::TANGENT) + 4 * has(MeshHeader::UV1) + 8 * has(MeshHeader::SKIN)
+    8 + 4 * has(MeshHeader::TANGENT)
+        + 4 * has(MeshHeader::UV1)
+        + 8 * has(MeshHeader::COLOR)
+        + 8 * has(MeshHeader::SKIN)
 }
 
 /// Bytes a cluster of `vertices` and `triangles` takes in a resident page, its record
@@ -552,6 +559,16 @@ impl<'a> PageView<'a> {
             let [x, y, z] = oct_decode(t);
             [x, y, z, if t & 1 << 16 != 0 { -1.0 } else { 1.0 }]
         })
+    }
+
+    /// The color stream of a vertex, 1 without [`MeshHeader::COLOR`].
+    pub fn color(&self, c: &Cluster, v: u32) -> [f32; 4] {
+        if !self.has(MeshHeader::COLOR) {
+            return [1.0; 4];
+        }
+        let at = attr_stride(self.attributes & !(MeshHeader::SKIN | MeshHeader::COLOR));
+        let [x, y] = [self.attr(c, v, at), self.attr(c, v, at + 4)];
+        [x & 0xFFFF, x >> 16, y & 0xFFFF, y >> 16].map(|h| half::f16::from_bits(h as u16).to_f32())
     }
 
     /// Uv `set` of a vertex. Panics on set 1 when the mesh has no [`MeshHeader::UV1`].

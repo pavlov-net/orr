@@ -15,6 +15,7 @@ pub(super) struct Welded {
     pub(super) tangents: Option<Vec<[f32; 4]>>,
     /// Per uv set, a uv per vertex.
     pub(super) uvs: Vec<Vec<[f32; 2]>>,
+    pub(super) colors: Option<Vec<[f32; 4]>>,
     pub(super) skin: Option<Skin>,
     pub(super) values: Option<Vec<u16>>,
     pub(super) pivots: Option<Vec<[f32; 3]>>,
@@ -36,6 +37,9 @@ impl Welded {
         streams.extend(m.uvs.iter().map(|u| VertexStream::new(u.as_ptr())));
         if let Some(t) = stored {
             streams.push(VertexStream::new(t.as_ptr()));
+        }
+        if let Some(c) = &m.colors {
+            streams.push(VertexStream::new(c.as_ptr()));
         }
         if let Some(k) = &m.skin {
             streams.push(VertexStream::new(k.joints.as_ptr()));
@@ -62,6 +66,10 @@ impl Welded {
                 .iter()
                 .map(|u| meshopt::remap_vertex_buffer(u, count, &remap))
                 .collect(),
+            colors: m
+                .colors
+                .as_ref()
+                .map(|c| meshopt::remap_vertex_buffer(c, count, &remap)),
             skin: m.skin.as_ref().map(|k| Skin {
                 joints: meshopt::remap_vertex_buffer(&k.joints, count, &remap),
                 weights: meshopt::remap_vertex_buffer(&k.weights, count, &remap),
@@ -293,7 +301,8 @@ pub(super) fn seam_cells(
     for (v, cell) in corners {
         let f = *first.entry(cell).or_insert(v);
         let (f, v) = (f as usize, v as usize);
-        if w.uvs.iter().any(|u| u[f] != u[v]) {
+        let colors_differ = w.colors.as_ref().is_some_and(|c| c[f] != c[v]);
+        if colors_differ || w.uvs.iter().any(|u| u[f] != u[v]) {
             seams.insert(cell);
         }
     }

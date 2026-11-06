@@ -206,6 +206,7 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         meters_per_unit: 1.0,
         primvars: &["st"],
         reads: &[],
+        any_mesh: true,
         add: &mut add,
     };
     let mapped = shading::map(&graph.net, graph.surface, graph.displacement, &mut host)

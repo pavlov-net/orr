@@ -152,6 +152,9 @@ pub struct MeshInput {
     pub uvs: Option<Vec<Vec2>>,
     /// Uv set 1, which material slots on set 1 read.
     pub uvs1: Option<Vec<Vec2>>,
+    /// Per vertex, the values [`TextureBinding::vertex`](orr_pack::material::TextureBinding::vertex)
+    /// reads, colors in linear Rec.709.
+    pub colors: Option<Vec<orr_math::Vec4>>,
     pub indices: Vec<u32>,
     /// Index ranges, one per material.
     pub sections: Vec<Span>,
@@ -179,6 +182,8 @@ pub(crate) struct MeshData {
     pub(crate) tangents: Option<Vec<[f32; 4]>>,
     /// Per uv set, one or two, a uv per vertex.
     pub(crate) uvs: Vec<Vec<[f32; 2]>>,
+    /// The vertex color stream.
+    pub(crate) colors: Option<Vec<[f32; 4]>>,
     pub(crate) indices: Vec<u32>,
     pub(crate) sections: Vec<SectionData>,
     pub(crate) skin: Option<Skin>,
@@ -624,7 +629,12 @@ pub(crate) fn cook(
         MeshHeader::SKIN
     } else {
         0
-    } | if w.uvs.len() > 1 { MeshHeader::UV1 } else { 0 };
+    } | if w.uvs.len() > 1 { MeshHeader::UV1 } else { 0 }
+        | if w.colors.is_some() {
+            MeshHeader::COLOR
+        } else {
+            0
+        };
     let cx = Ctx {
         w: &w,
         grid: &grid,
@@ -1028,6 +1038,7 @@ pub(crate) fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
     if m.normals.len() != n
         || m.uvs.iter().any(|u| u.len() != n)
         || m.tangents.as_ref().is_some_and(|t| t.len() != n)
+        || m.colors.as_ref().is_some_and(|c| c.len() != n)
         || m.skin
             .as_ref()
             .is_some_and(|k| k.joints.len() != n || k.weights.len() != n)
@@ -1063,6 +1074,7 @@ pub(crate) fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
         || !m.normals.iter().all(|p| finite(p))
         || !m.uvs.iter().flatten().all(|p| finite(p))
         || !m.tangents.iter().flatten().all(|p| finite(p))
+        || !m.colors.iter().flatten().all(|p| finite(p))
     {
         return Err("non-finite vertex attribute".into());
     }
@@ -1321,6 +1333,11 @@ fn build_cluster(
             let q = r.quantize(u[v]);
             attrs.push(q[0] | q[1] << 16);
         }
+        if let Some(c) = &w.colors {
+            let h = c[v].map(|x| u32::from(half::f16::from_f32(x).to_bits()));
+            attrs.push(h[0] | h[1] << 16);
+            attrs.push(h[2] | h[3] << 16);
+        }
         if let Some(k) = &w.skin {
             attrs.push(u32::from_le_bytes(k.joints[v]));
             attrs.push(u32::from_le_bytes(k.weights[v]));
@@ -1530,6 +1547,9 @@ impl MeshData {
         for u in &mut self.uvs {
             copy(u, &copies);
         }
+        if let Some(c) = &mut self.colors {
+            copy(c, &copies);
+        }
         if let Some(k) = &mut self.skin {
             copy(&mut k.joints, &copies);
             copy(&mut k.weights, &copies);
@@ -1553,6 +1573,7 @@ impl MeshData {
         part(bytemuck::cast_slice(&self.positions));
         part(bytemuck::cast_slice(&self.normals));
         part(self.tangents.as_deref().map_or(&[], bytemuck::cast_slice));
+        part(self.colors.as_deref().map_or(&[], bytemuck::cast_slice));
         for u in &self.uvs {
             part(bytemuck::cast_slice(u));
         }

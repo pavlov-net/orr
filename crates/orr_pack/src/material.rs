@@ -22,7 +22,11 @@ pub struct TextureBinding {
     pub wrap: [u8; 2],
     /// [`filter`] bits.
     pub filter: u8,
-    pub _pad: [u8; 3],
+    /// One more than the first channel of the vertex color stream that multiplies what the slot
+    /// reads, bound or not; 0 for none. A color reads three from it, a scalar one. A mesh without
+    /// the stream reads 1.
+    pub vertex: u8,
+    pub _pad: [u8; 2],
     /// What the slot reads, from its first channel on, past 0..1 on an axis of
     /// [`wrap::CONSTANT`] and where a tile set has no tile, in the units its texels sample as.
     pub outside: [f32; 4],

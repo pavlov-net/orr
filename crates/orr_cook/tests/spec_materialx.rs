@@ -726,6 +726,12 @@ fn documents_map_as_the_clauses_say() {
             check: |m| bound(m, slot::COAT_NORMAL) && !bound(m, slot::NORMAL),
         },
         Row {
+            clause: "Nodes geomcolor: \"generally bound via per-vertex color values\"",
+            body: r#"<geomcolor name="c" type="color3"/>"#,
+            inputs: r#"<input name="base_color" type="color3" nodename="c"/>"#,
+            check: |m| m.textures[slot::BASE_COLOR].vertex == 1 && m.base_color == [1.0; 3],
+        },
+        Row {
             clause: "OpenPBR coat_darkening and coat_roughness_anisotropy are read as stated",
             body: "",
             inputs: r#"<input name="coat_darkening" type="float" value="0.25"/>

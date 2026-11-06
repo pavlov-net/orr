@@ -26,10 +26,13 @@
 //! `extract`, `separate2`, `separate3` or `separate4` picking a channel, `normalmap` under
 //! `geometry_normal`), and `UsdUVTexture` (with `UsdPrimvarReader_float2` and
 //! `UsdTransform2d` on `st`, whose default is the constant (0, 0)). `constant` and `dot` nodes
-//! pass on what they read to MaterialX nodes. A primvar reader gives the value of a primvar
-//! constant over the mesh, and its `fallback` where the mesh has no such primvar; a varying one
-//! other than a uv set fails, as meshes hold no values for it. Any other node fails the import,
-//! naming it, as does a connection cycle. A `geompropvalue` whose property no uv set holds reads
+//! pass on what they read to MaterialX nodes. A primvar reader, or a `geompropvalue` or `geomcolor`
+//! off a coordinate, gives the value of a primvar constant over the mesh, and its `fallback` or
+//! `default` where the mesh has no such primvar. One that varies over the mesh takes channels of
+//! the mesh's vertex color stream, four between all that one material reads, and multiplies its
+//! input's texture or stands in for it ([`VertexRead`]); `geomcolor` reads `displayColor`, or
+//! with no mesh to ask the stream as it stands. Any other node fails the import, naming it, as
+//! does a connection cycle. A `geompropvalue` on a coordinate whose property no uv set holds reads
 //! its `default` at every point, as an unconnected `place2d` reads 0, 0. Textures go to the
 //! material's slots. An interior medium is one for the whole material, so a textured
 //! `transmission_depth`, `transmission_scatter`, `transmission_scatter_anisotropy` or dispersion
@@ -162,15 +165,26 @@ impl Network {
         let mut names: Vec<String> = self
             .nodes
             .iter()
-            .filter(|n| n.kind.starts_with("UsdPrimvarReader_"))
-            .filter_map(|n| match n.inputs.get("varname") {
-                Some(Input::Text(t)) if !t.is_empty() => Some(t.clone()),
+            .filter_map(|n| match n.kind.as_str() {
+                "geomcolor" => Some(DISPLAY_COLOR.to_string()),
+                "geompropvalue" => text_of(n, "geomprop"),
+                k if k.starts_with("UsdPrimvarReader_") => text_of(n, "varname"),
                 _ => None,
             })
             .collect();
         names.sort_unstable();
         names.dedup();
         names
+    }
+}
+
+/// The primvar `geomcolor` reads.
+const DISPLAY_COLOR: &str = "displayColor";
+
+fn text_of(n: &Node, input: &str) -> Option<String> {
+    match n.inputs.get(input) {
+        Some(Input::Text(t)) if !t.is_empty() => Some(t.clone()),
+        _ => None,
     }
 }
 
@@ -181,9 +195,22 @@ pub(crate) enum Primvar {
     Uv(u8),
     /// One value for the whole mesh.
     Constant(Vec<f32>),
-    /// Values that vary over the mesh.
-    Varying,
+    /// Values that vary over the mesh, of this many channels.
+    Varying(u8),
     Missing,
+}
+
+/// A primvar a material reads through the vertex color stream.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct VertexRead {
+    pub(crate) name: String,
+    /// The stream's channel of its first value.
+    pub(crate) first: u8,
+    pub(crate) width: u8,
+    /// The primvar's channel that `first` holds.
+    pub(crate) offset: u8,
+    /// The stream holds `1 - v`, for an input that reads the complement of it.
+    pub(crate) inverted: bool,
 }
 
 /// What mapping asks of the scene a material lands in.
@@ -194,6 +221,8 @@ pub(crate) struct Host<'a> {
     pub(crate) primvars: &'a [&'a str],
     /// What the mesh holds for each primvar of [`Network::primvar_reads`].
     pub(crate) reads: &'a [(String, Primvar)],
+    /// No mesh is at hand to ask: `geomcolor` reads whatever the vertex color stream holds.
+    pub(crate) any_mesh: bool,
     /// Adds an image to the scene, unless it holds one of that name; returns its index.
     pub(crate) add: &'a mut dyn FnMut(ImageFile) -> usize,
 }
@@ -223,6 +252,7 @@ pub(crate) fn category(id: &str) -> &str {
         "open_pbr_surface",
         "surfacematerial",
         "geompropvalue",
+        "geomcolor",
         "displacement",
         "tiledimage",
         "normalmap",
@@ -251,6 +281,8 @@ pub(crate) fn category(id: &str) -> &str {
 pub(crate) struct Mapped {
     pub(crate) material: Material,
     pub(crate) textures: MaterialTextures,
+    /// The primvars its vertex color stream holds.
+    pub(crate) vertex: Vec<VertexRead>,
     /// What the material asks for that it does not get.
     pub(crate) warnings: Vec<String>,
 }
@@ -346,6 +378,45 @@ impl Tex {
 enum Value {
     Constant(Vec<f32>, Unit),
     Texture(Tex),
+    /// Channels of the vertex color stream, from `first` on.
+    Vertex {
+        first: u8,
+        width: u8,
+    },
+}
+
+/// The slot an input stands on, which a vertex color stream multiplies.
+fn input_slot(input: &str) -> Option<usize> {
+    Some(match input {
+        "base_color" | "diffuseColor" => slot::BASE_COLOR,
+        "base_weight" => slot::BASE_WEIGHT,
+        "base_metalness" | "metallic" => slot::METALNESS,
+        "base_diffuse_roughness" => slot::DIFFUSE_ROUGHNESS,
+        "specular_weight" => slot::SPECULAR_WEIGHT,
+        "specular_color" | "specularColor" => slot::SPECULAR_COLOR,
+        "specular_roughness" | "roughness" => slot::ROUGHNESS,
+        "specular_ior" | "ior" => slot::SPECULAR_IOR,
+        "specular_roughness_anisotropy" => slot::ANISOTROPY,
+        "transmission_weight" => slot::TRANSMISSION,
+        "transmission_color" => slot::TRANSMISSION_COLOR,
+        "subsurface_weight" => slot::SUBSURFACE_WEIGHT,
+        "subsurface_color" => slot::SUBSURFACE_COLOR,
+        "fuzz_weight" => slot::FUZZ_WEIGHT,
+        "fuzz_color" => slot::FUZZ_COLOR,
+        "fuzz_roughness" => slot::FUZZ_ROUGHNESS,
+        "coat_weight" | "clearcoat" => slot::COAT,
+        "coat_color" => slot::COAT_COLOR,
+        "coat_roughness" | "clearcoatRoughness" => slot::COAT_ROUGHNESS,
+        "coat_ior" => slot::COAT_IOR,
+        "coat_darkening" => slot::COAT_DARKENING,
+        "coat_roughness_anisotropy" => slot::COAT_ANISOTROPY,
+        "thin_film_weight" => slot::THIN_FILM_WEIGHT,
+        "thin_film_ior" => slot::THIN_FILM_IOR,
+        "emission_color" | "emissiveColor" => slot::EMISSION,
+        "emission_luminance" => slot::EMISSION_LUMINANCE,
+        "geometry_opacity" | "opacity" => slot::OPACITY,
+        _ => return None,
+    })
 }
 
 /// The coordinate `at`, wherever on the mesh it is read.
@@ -427,6 +498,7 @@ pub(crate) fn map(
             ..Material::default()
         },
         textures: MaterialTextures::default(),
+        vertex: Vec::new(),
         warnings: Vec::new(),
     };
     let node = &net.nodes[surface];
@@ -446,6 +518,7 @@ pub(crate) fn map(
     Ok(Mapped {
         material: m.material,
         textures: m.textures,
+        vertex: m.vertex,
         warnings: m.warnings,
     })
 }
@@ -455,6 +528,7 @@ struct Mapper<'a, 'h> {
     host: &'a mut Host<'h>,
     material: Material,
     textures: MaterialTextures,
+    vertex: Vec<VertexRead>,
     warnings: Vec<String>,
 }
 
@@ -708,23 +782,31 @@ impl Mapper<'_, '_> {
                         vec![v.get(usize::from(c)).copied().unwrap_or(0.0)],
                         unit,
                     )),
+                    Some(Value::Vertex { first, width }) if c < width => Ok(Value::Vertex {
+                        first: first + c,
+                        width: 1,
+                    }),
                     None => Ok(Value::Constant(vec![0.0], Unit::Unstated)),
                     _ => Err(format!(
                         "{name}: picks channel {c} of nothing a texture holds"
                     )),
                 }
             }
-            k if k.starts_with("UsdPrimvarReader_") => match self.fetch(n) {
-                Primvar::Constant(v) => Ok(Value::Constant(v, Unit::Unstated)),
-                Primvar::Missing => Ok(Value::Constant(
-                    self.number(n, "fallback")?.unwrap_or_else(|| vec![0.0; 4]),
-                    Unit::Unstated,
-                )),
-                Primvar::Uv(_) | Primvar::Varying => Err(format!(
-                    "{}: its primvar varies over the mesh, which holds no values for it",
-                    node.name
-                )),
-            },
+            k if k.starts_with("UsdPrimvarReader_") => {
+                let name = self.text(n, "varname").unwrap_or_default().to_string();
+                self.primvar_value(n, &name, "fallback")
+            }
+            "geompropvalue" => {
+                let name = self.text(n, "geomprop").unwrap_or_default().to_string();
+                self.primvar_value(n, &name, "default")
+            }
+            "geomcolor" => {
+                if self.host.any_mesh {
+                    let width = if node.ty == "color4" { 4 } else { 3 };
+                    return Ok(Value::Vertex { first: 0, width });
+                }
+                self.primvar_value(n, DISPLAY_COLOR, "default")
+            }
             k => Err(format!(
                 "node {} ({k}) is not a constant, image or texture channel pick",
                 node.name
@@ -732,11 +814,81 @@ impl Mapper<'_, '_> {
         }
     }
 
-    /// What the mesh holds for the primvar of reader `n`.
-    fn fetch(&self, n: usize) -> Primvar {
-        let name = self.text(n, "varname").unwrap_or_default();
+    /// What the mesh holds for primvar `name`.
+    fn held(&self, name: &str) -> Primvar {
         let read = self.host.reads.iter().find(|r| r.0 == name);
         read.map_or(Primvar::Missing, |r| r.1.clone())
+    }
+
+    /// What the mesh holds for the primvar of reader `n`.
+    fn fetch(&self, n: usize) -> Primvar {
+        self.held(self.text(n, "varname").unwrap_or_default())
+    }
+
+    /// The value of primvar `name` to reader `n`, whose input `missing` stands in where the mesh
+    /// holds none.
+    fn primvar_value(&mut self, n: usize, name: &str, missing: &str) -> Result<Value, String> {
+        match self.held(name) {
+            Primvar::Constant(v) => Ok(Value::Constant(v, Unit::Unstated)),
+            Primvar::Missing => Ok(Value::Constant(
+                self.number(n, missing)?.unwrap_or_else(|| vec![0.0; 4]),
+                Unit::Unstated,
+            )),
+            Primvar::Uv(_) => Err(format!(
+                "{}: {name} is a uv set, which only texture coordinates read",
+                self.node(n).name
+            )),
+            Primvar::Varying(width) => {
+                let first = self.vertex_channels(n, name, width, 0, false)?;
+                Ok(Value::Vertex { first, width })
+            }
+        }
+    }
+
+    /// The first channel of the vertex color stream that holds primvar `name` from channel
+    /// `offset` on.
+    fn vertex_channels(
+        &mut self,
+        n: usize,
+        name: &str,
+        width: u8,
+        offset: u8,
+        inverted: bool,
+    ) -> Result<u8, String> {
+        let same = |r: &&VertexRead| {
+            r.name == name && r.offset == offset && r.width == width && r.inverted == inverted
+        };
+        if let Some(r) = self.vertex.iter().find(same) {
+            return Ok(r.first);
+        }
+        let first = self.vertex.iter().map(|r| r.width).sum::<u8>();
+        if first + width > 4 {
+            return Err(format!(
+                "{}: {name} takes {width} channels of the vertex color stream's 4, {first} of \
+                 which other primvars of the material hold",
+                self.node(n).name
+            ));
+        }
+        self.vertex.push(VertexRead {
+            name: name.to_string(),
+            first,
+            width,
+            offset,
+            inverted,
+        });
+        Ok(first)
+    }
+
+    /// Input `input` of `n` multiplied by channels of the vertex color stream from `first` on.
+    fn vertex_slot(&mut self, n: usize, input: &str, first: u8) -> Result<(), String> {
+        let s = input_slot(input).ok_or_else(|| {
+            format!(
+                "{} input {input} varies over the mesh, which no slot reads",
+                self.node(n).name
+            )
+        })?;
+        self.material.textures[s].vertex = first + 1;
+        Ok(())
     }
 
     /// A MaterialX `image` or `tiledimage` node, its channels left for the caller.
@@ -958,7 +1110,7 @@ impl Mapper<'_, '_> {
                             let fallback = self.vec2(n, "fallback", Vec2::ZERO)?;
                             Ok((0, outer * fixed(fallback)))
                         }
-                        Primvar::Varying => Err(format!(
+                        Primvar::Varying(_) => Err(format!(
                             "{}: reads {}; the mesh uv sets are {}",
                             node.name,
                             self.text(n, "varname").unwrap_or_default(),
@@ -1033,6 +1185,10 @@ impl Mapper<'_, '_> {
                 *field(&mut self.material) = t.unit.scene(value);
                 *slot(&mut self.textures) = Some(r);
             }
+            Some(Value::Vertex { first, .. }) => {
+                *field(&mut self.material) = 1.0;
+                self.vertex_slot(n, input, first)?;
+            }
         }
         Ok(())
     }
@@ -1047,7 +1203,7 @@ impl Mapper<'_, '_> {
         let (v, unit) = match self.value(n, input)? {
             None => (*field(&mut self.material), Unit::Unstated),
             Some(Value::Constant(v, unit)) => (v[0], unit),
-            Some(Value::Texture(_)) => return Err(self.no_slot(n, input)),
+            Some(Value::Texture(_) | Value::Vertex { .. }) => return Err(self.no_slot(n, input)),
         };
         *field(&mut self.material) = scaled(v, self.meters(n, input, unit)?);
         Ok(())
@@ -1089,6 +1245,16 @@ impl Mapper<'_, '_> {
                 };
                 *field(&mut self.material) = value;
                 *slot(&mut self.textures) = Some(r);
+            }
+            Some(Value::Vertex { first, width }) => {
+                if width < 3 {
+                    return Err(format!(
+                        "{} input {input}: a color reads RGB",
+                        self.node(n).name
+                    ));
+                }
+                *field(&mut self.material) = [1.0; 3];
+                self.vertex_slot(n, input, first)?;
             }
         }
         Ok(())
@@ -1319,7 +1485,10 @@ impl Mapper<'_, '_> {
                 self.node(n).name
             ));
         }
-        if self.textures.opacity.is_some() || self.material.geometry_opacity < 1.0 {
+        if self.textures.opacity.is_some()
+            || self.material.geometry_opacity < 1.0
+            || self.material.textures[slot::OPACITY].vertex != 0
+        {
             self.material.alpha_mode = Material::BLEND;
         }
         self.textures.normal = self.normal_input(n, "geometry_normal")?;
@@ -1436,6 +1605,10 @@ impl Mapper<'_, '_> {
                     .more
                     .insert(slot::THIN_FILM_THICKNESS, Some(r));
             }
+            Some(Value::Vertex { first, .. }) => {
+                self.material.thin_film_thickness = scaled(1.0, nanometers(self, Unit::Unstated)?);
+                self.material.textures[slot::THIN_FILM_THICKNESS].vertex = first + 1;
+            }
         }
         Ok(())
     }
@@ -1532,6 +1705,7 @@ impl Mapper<'_, '_> {
                     self.textures.normal = Some((t.tex_ref(), [1.0; 2]));
                 }
             }
+            Some(Value::Vertex { .. }) => return Err(self.no_slot(n, "normal")),
             Some(Value::Texture(t)) => {
                 if t.channels != Channels::Rgb {
                     return Err(format!("{}: a normal texture reads rgb", self.node(n).name));
@@ -1565,7 +1739,10 @@ impl Mapper<'_, '_> {
             if threshold > 0.0 {
                 self.material.alpha_mode = Material::MASK;
                 self.material.alpha_cutoff = threshold;
-            } else if self.textures.opacity.is_some() || self.material.geometry_opacity < 1.0 {
+            } else if self.textures.opacity.is_some()
+                || self.material.geometry_opacity < 1.0
+                || self.material.textures[slot::OPACITY].vertex != 0
+            {
                 self.material.alpha_mode = Material::BLEND;
             }
             return Ok(());
@@ -1592,6 +1769,28 @@ impl Mapper<'_, '_> {
                 self.material.transmission_weight = 1.0;
                 self.material.thin_walled = 1;
             }
+            Some(Value::Vertex { first, .. }) => {
+                // The stream multiplies, so it holds the complement this input reads, in the
+                // channels no other input takes as they stand.
+                let held = |r: &&mut VertexRead| r.first <= first && first < r.first + r.width;
+                let Some(read) = self.vertex.iter_mut().find(held) else {
+                    return Err(format!(
+                        "{} input opacity: the complement of a stream no primvar names has no                          channel to hold it",
+                        self.node(n).name
+                    ));
+                };
+                let (name, offset) = (read.name.clone(), first - read.first);
+                let taken = self.material.textures.iter().any(|b| b.vertex == first + 1);
+                let first = if read.width == 1 && !taken {
+                    read.inverted = true;
+                    first
+                } else {
+                    self.vertex_channels(n, &name, 1, offset, true)?
+                };
+                self.material.textures[slot::TRANSMISSION].vertex = first + 1;
+                self.material.transmission_weight = 1.0;
+                self.material.thin_walled = 1;
+            }
         }
         Ok(())
     }
@@ -1611,6 +1810,7 @@ impl Mapper<'_, '_> {
             None => false,
             Some(Value::Constant(v, _)) => v.len() > 1 && v.iter().any(|&c| c != 0.0),
             Some(Value::Texture(t)) => t.channels == Channels::Rgb,
+            Some(Value::Vertex { width, .. }) => *width > 1,
         };
         if vector {
             return Err(format!(
@@ -1631,6 +1831,7 @@ impl Mapper<'_, '_> {
                 let c = t.channel();
                 (t, t.unit, (t.scale[c], t.bias[c]))
             }
+            Value::Vertex { .. } => return Err(self.no_slot(n, "displacement")),
         };
         let meters = f64::from(scale) * self.meters(n, "displacement", unit)?;
         let (scale, offset) = (scaled(heights.0, meters), scaled(heights.1, meters));
