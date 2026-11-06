@@ -16,6 +16,11 @@ setup. It has no users yet.
   separate, say why and ask.
 - Decide by whether something is correct, not by a guess at how often it matters. "Rare", "unlikely"
   and "degenerate" aren't reasons unless you measured it.
+- Before adding code to handle a case, show the case is real: check what the spec and the code
+  producing and reading the value say it can be, then fix the cause where it starts. Code here
+  follows spec review and can look wrong on purpose, and a guard written from a guess hides bugs and
+  changes correct output. This covers clamps, `abs`, epsilons, fallbacks, default values, retries,
+  swallowed errors and extra branches. If the case can't happen, add nothing.
 - Don't vendor third-party code: no copied sources, submodules or committed derived data. Use crate
   dependencies, bindgen against an SDK found by environment variable, or a pinned fetch into the
   ignored `.tools/`. The exceptions are small numeric tables, with their source and license at the
