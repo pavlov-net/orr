@@ -355,6 +355,18 @@ struct Assembly<'a> {
     meshes: &'a mut Vec<(usize, usize)>,
 }
 
+/// `UsdTimeCode::SafeStep`: past rounding at any time code a stage holds.
+const SAFE_STEP: f64 = f64::EPSILON * 1e7;
+
+/// Where an attribute's samples stand around a time ([`Importer::samples_around`]).
+#[derive(Copy, Clone, PartialEq)]
+struct Around {
+    /// What it reads there, without interpolating.
+    sample: f64,
+    lower: f64,
+    upper: f64,
+}
+
 /// Where [`Importer::place`] puts an instancer's copies.
 struct Placer<'a> {
     models: &'a mut Vec<Building>,
@@ -1843,34 +1855,29 @@ impl<'s> Importer<'s> {
         let index = r.ints("protoIndices")?.unwrap_or_default();
         let count = index.len();
         let time = f64::from(self.time);
-        let bracket = |name: &str| {
-            node.prim
-                .attribute(name)
-                .bracketing_time_samples(self.time)
-                .map_err(|e| format!("{path} {name}: {e}"))
-        };
-        // `name` at the lower sample of `base`, if it brackets the time at the same samples and
-        // has one value per instance.
-        let lined_up = |name: &str, base: Option<(f64, f64)>, width: usize| match base {
-            Some((lower, _)) if bracket(name)? == base => Ok::<_, String>(
-                r.at(lower)
+        let around = |name: &str| self.samples_around(&node.prim, name, time);
+        // `name` at the sample of `base`, if it stands around the time as `base` does and has one
+        // value per instance.
+        let lined_up = |name: &str, base: Option<Around>, width: usize| match base {
+            Some(b) if around(name)? == base => Ok::<_, String>(
+                r.at(b.sample)
                     .numbers(name)?
                     .filter(|v| v.len() == width * count),
             ),
             _ => Ok(None),
         };
         let orientation = self.orientation_attribute(&r)?;
-        let moved = bracket("positions")?;
-        let turned = bracket(orientation)?;
+        let moved = around("positions")?;
+        let turned = around(orientation)?;
         let velocities = lined_up("velocities", moved, 3)?;
         let accelerations = match velocities {
-            Some(_) => lined_up("accelerations", moved, 3)?,
+            Some(_) => lined_up("accelerations", around("velocities")?, 3)?,
             None => None,
         };
         let spins = lined_up("angularVelocities", turned, 3)?;
         // Without a rate to extrapolate by, values interpolate; with one, both hold.
-        let held = |b: Option<(f64, f64)>| match b {
-            Some((lower, _)) if velocities.is_some() || spins.is_some() => lower,
+        let held = |b: Option<Around>| match b {
+            Some(b) if velocities.is_some() || spins.is_some() => b.sample,
             _ => time,
         };
         let positions = r.at(held(moved)).numbers("positions")?.unwrap_or_default();
@@ -1878,13 +1885,13 @@ impl<'s> Importer<'s> {
             .at(held(turned))
             .numbers(orientation)?
             .filter(|v| !v.is_empty());
-        let scaled = bracket("scales")?;
+        let scaled = around("scales")?;
         let scales = r
             .at(held(scaled))
             .numbers("scales")?
             .filter(|v| !v.is_empty());
         let per_second = self.stage.time_codes_per_second();
-        let since = |b: Option<(f64, f64)>| b.map_or(0.0, |b| (time - b.0) / per_second);
+        let since = |b: Option<Around>| b.map_or(0.0, |b| (time - b.sample) / per_second);
         let (moved_for, turned_for) = (since(moved), since(turned));
         let ids = r.ints("ids")?;
         let mut masked: std::collections::HashSet<i64> = r
@@ -1954,6 +1961,35 @@ impl<'s> Importer<'s> {
             ));
         }
         Ok(out)
+    }
+
+    /// Where attribute `name` of `prim` stands around `time`, `None` without samples: as
+    /// `_GetAttrForTransforms` in `samplingUtils.cpp` finds it, the samples around the time just
+    /// past it where the time is on a sample, so that alignment is judged on the interval ahead.
+    fn samples_around(
+        &self,
+        prim: &usd::Prim,
+        name: &str,
+        time: f64,
+    ) -> Result<Option<Around>, String> {
+        let bracket = |t: f64| {
+            prim.attribute(name)
+                .bracketing_time_samples(usd::TimeCode::new(t))
+                .map_err(|e| format!("{} {name}: {e}", prim.path().as_str()))
+        };
+        let Some((sample, upper)) = bracket(time)? else {
+            return Ok(None);
+        };
+        let (lower, upper) = if sample == upper {
+            bracket(time + SAFE_STEP)?.unwrap_or((sample, upper))
+        } else {
+            (sample, upper)
+        };
+        Ok(Some(Around {
+            sample,
+            lower,
+            upper,
+        }))
     }
 
     /// The attribute orientations come from: `orientationsf`, where its earliest sample (or

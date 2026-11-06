@@ -4502,3 +4502,28 @@ fn ids_past_a_double_stay_apart() {
         assert_eq!(copies(&a, "u/P").len(), 1, "{name}");
     }
 }
+
+/// `samplingUtils.cpp` `_GetAttrForTransforms`: on a sample, alignment is judged on the interval
+/// ahead. Positions at 0, 5 and 20 with velocities at 0, 5 and 10 line up behind time 5 but not
+/// ahead of it, so at 5 the velocities drop and orientations, with samples at 0 and 10, slerp.
+#[test]
+fn alignment_on_a_sample_looks_at_the_interval_ahead() {
+    let at = UsdSettings {
+        time: Some(5.0),
+        ..UsdSettings::default()
+    };
+    let a = cook_at(
+        &dir("align-ahead"),
+        &instancer(
+            "int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0)], 5: [(0, 0, 0)], 20: [(0, 0, 0)] }
+    vector3f[] velocities.timeSamples = { 0: [(1, 0, 0)], 5: [(1, 0, 0)], 10: [(1, 0, 0)] }
+    quath[] orientations.timeSamples = { 0: [(1, 0, 0, 0)], 10: [(0, 0, 0, 1)] }",
+        ),
+        at,
+    )
+    .unwrap();
+    // Half of a half turn about z: x goes to y.
+    let got = copies(&a, "u/P")[0].transform_vector3(Vec3::X);
+    assert!(got.abs_diff_eq(Vec3::Y, 2e-2), "{got}");
+}
