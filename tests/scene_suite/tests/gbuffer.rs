@@ -1254,6 +1254,13 @@ fn cook() -> Arc<[u8]> {
                     },
                 },
                 AssetSpec {
+                    name: "swaying door".into(),
+                    source: Source::Usd {
+                        path: swaying_door_stage(),
+                        settings: UsdSettings::default(),
+                    },
+                },
+                AssetSpec {
                     name: "leaning worm".into(),
                     source: Source::Gltf {
                         path: worm_glb_of("lean.glb", &[], true),
@@ -4304,6 +4311,37 @@ fn posed_rigid_parts_trace_where_the_raster_draws_them() {
     assert_clean();
 }
 
+/// [`door_stage`] with a door whose shear grows over its clip, as glTF cannot animate one.
+fn swaying_door_stage() -> PathBuf {
+    let path = temp("swaying-door.usda");
+    std::fs::write(
+        &path,
+        r#"#usda 1.0
+(
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+def Xform "Door"
+{
+    matrix4d xformOp:transform.timeSamples = {
+        0: ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)),
+        24: ((1, 0, 0, 0), (1.5, 1, 0, 0), (0.5, 0.25, 1, 0), (0, 0, 0, 1)),
+    }
+    uniform token[] xformOpOrder = ["xformOp:transform"]
+    def Mesh "Leaf"
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-0.2, -0.2, 0), (0.2, -0.2, 0), (0.2, 0.2, 0), (-0.2, 0.2, 0)]
+    }
+}
+"#,
+    )
+    .unwrap();
+    path
+}
+
 /// A stage of one prim that moves, holding a 0.4 m square facing +z: all of it on one rigid part,
 /// and part 0, which takes no pose, empty.
 fn door_stage() -> PathBuf {
@@ -5447,12 +5485,17 @@ fn worm_rig() -> (SkeletonInfo, Clip) {
 
 /// The skeleton and clip of worm `name`.
 fn worm_rig_of(name: &str) -> (SkeletonInfo, Clip) {
+    rig_of(name, "bend")
+}
+
+/// The skeleton of asset `name` and its clip `clip`.
+fn rig_of(name: &str, clip: &str) -> (SkeletonInfo, Clip) {
     let a = Archive::from_memory(Arc::clone(pack())).unwrap();
     let skeleton = a
         .find(AssetId::from_name(&format!("{name}/skeleton")))
         .unwrap();
     let clip = a
-        .find(AssetId::from_name(&format!("{name}/clip/bend")))
+        .find(AssetId::from_name(&format!("{name}/clip/{clip}")))
         .unwrap();
     (
         SkeletonInfo::parse(&blob(&a, skeleton, 0)).unwrap(),
@@ -5468,7 +5511,12 @@ fn worm_palette(t: f32) -> Vec<Affine3> {
 
 /// [`worm_palette`] of worm `name`.
 fn worm_palette_of(name: &str, t: f32) -> Vec<Affine3> {
-    let (skeleton, clip) = worm_rig_of(name);
+    palette_of(name, "bend", t)
+}
+
+/// The skinning matrices of asset `name`, `t` seconds into its clip `clip`.
+fn palette_of(name: &str, clip: &str, t: f32) -> Vec<Affine3> {
+    let (skeleton, clip) = rig_of(name, clip);
     let n = skeleton.joint_count();
     let mut locals = vec![Trs::IDENTITY; n];
     clip.sample(t, &mut locals);
@@ -5486,6 +5534,7 @@ struct Worms {
     joints: u32,
     /// The asset whose skeleton and clip pose them.
     rig: String,
+    clip: String,
 }
 
 /// Where `crowd`'s instances place its worms, in one world cell and in record order.
@@ -5558,6 +5607,7 @@ fn place_crowd(w: &mut World) -> Worms {
         palette,
         joints,
         rig: "worm".to_string(),
+        clip: "bend".to_string(),
     }
 }
 
@@ -5567,6 +5617,7 @@ fn place_worms(w: &mut World, name: &str, copies: &[(Mat3, Vec3)], gpu: bool) ->
     let model = w.model(name);
     Worms {
         rig: name.to_string(),
+        clip: "bend".to_string(),
         ..place_worms_of(w, model, copies, gpu)
     }
 }
@@ -5635,6 +5686,7 @@ fn place_worms_of(w: &mut World, model: ModelId, copies: &[(Mat3, Vec3)], gpu: b
         palette,
         joints,
         rig: "worm".to_string(),
+        clip: "bend".to_string(),
     }
 }
 
@@ -5834,7 +5886,7 @@ fn shoot_gpu_worms(
         .scenes
         .clip(
             w.mount,
-            AssetId::from_name(&format!("{}/clip/bend", worms.rig)),
+            AssetId::from_name(&format!("{}/clip/{}", worms.rig, worms.clip)),
         )
         .unwrap();
     assert_eq!(skeleton.joint_count, worms.joints);
@@ -5904,6 +5956,50 @@ fn a_pose_kernel_samples_clips_on_the_gpu_like_the_cpu() {
             "{name}: the GPU-posed copies draw"
         );
     }
+
+    // A shear that varies over the clip, read between frames, is the kernel's shear lerp. The
+    // worms stand in for what the palette poses: only its entries are read.
+    let (name, clip) = ("swaying door", "xform");
+    let (skeleton, sway) = rig_of(name, clip);
+    let n = skeleton.joint_count();
+    let frames = sway.header.frame_count as usize;
+    let at = |f: usize| sway.samples[f * n + 1].shear;
+    assert_ne!(at(0), at(frames - 1), "the shear holds still");
+    let times = [0.37f32, 0.81];
+    for t in times {
+        let x = t * sway.header.sample_rate;
+        assert!((x - x.round()).abs() > 0.1, "{t} s lies on a frame");
+    }
+    let worms = place_worms(&mut w, "worm", &copies, true);
+    let worms = Worms {
+        rig: name.to_string(),
+        clip: clip.to_string(),
+        joints: n as u32,
+        ..worms
+    };
+    let (t, phase) = (times[0], times[1] - times[0]);
+    let frame = shoot_gpu_worms(&mut w, &worms, &kernel, &worm_shot(3), t, phase);
+    let root = read_buffer(frame.view.scene, 1)[0];
+    let group = read_buffer(root.groups.offset(u64::from(worms.palette.0)), 1)[0];
+    let got: Vec<[[f32; 4]; 3]> = read_buffer(group.current.cast::<[[f32; 4]; 3]>(), 2 * n as u64);
+    let mut worst = 0.0f32;
+    for copy in 0..2 {
+        let want = palette_of(name, clip, t + copy as f32 * phase);
+        for (j, p) in want.iter().enumerate() {
+            let rows = AffineRows::from(*p).rows;
+            for (a, b) in got[copy * n + j]
+                .iter()
+                .flatten()
+                .zip(rows.iter().flatten())
+            {
+                worst = worst.max((a - b).abs());
+            }
+        }
+    }
+    assert!(
+        worst < 1e-5,
+        "{name}: palette entries {worst} from the CPU's"
+    );
     assert_clean();
 }
 
