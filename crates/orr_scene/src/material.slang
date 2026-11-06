@@ -215,6 +215,7 @@ public struct MaterialGpu
     public float displacement_offset;
     public float displacement_min;
     public float displacement_max;
+    public float object_frame[9];           // rows, from the identity: mesh space from an object space map's
     public float displacement_tangent[4];   // scale and offset along u, then along v, as above
     public TextureIndex textures[TEXTURE_SLOTS];
     public TextureSamplerGpu samplers[TEXTURE_SLOTS];
@@ -224,6 +225,7 @@ public struct MaterialGpu
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
     public uint coat_tangent_set;           // what the coat's normal map and tangent follow, as `tangent_set`
+    public uint _pad0;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
     public uint* tiles[TEXTURE_SLOTS];                  // per slot of TEXTURE_TILED, its table: `texture_tile`

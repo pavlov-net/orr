@@ -8,7 +8,8 @@
 //!   (micrometers) the field in nanometers, `coat_roughness_anisotropy` `coat_anisotropy`, and
 //!   every other input the field of its name. `geometry_coat_normal` reads as `geometry_normal`
 //!   does, and a `normalmap` `space` of `object` in either states directions in the mesh's space,
-//!   which turn with what places it; a transform an importer bakes into the mesh isn't among that.
+//!   which turn with what places it and with a transform an importer bakes into the mesh
+//!   ([`Material::object_frame`]), but not with a skin's joints, which warns.
 //!   `geometry_tangent` and `geometry_coat_tangent` take a
 //!   `tangent` node, the mesh's, or a texture of a direction in the tangent plane; any other warns
 //!   and reads the mesh's. The base and the coat each follow the uv set the `index` of their

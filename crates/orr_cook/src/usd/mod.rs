@@ -341,6 +341,7 @@ impl Bindings {
 
 /// The primvars a material's tangent frame reads: PS `frame:tangentsPrimvarName`,
 /// `frame:binormalsPrimvarName` and `frame:stPrimvarName`.
+#[derive(Clone)]
 struct Frame {
     tangents: String,
     binormals: String,
@@ -544,6 +545,9 @@ struct Importer<'s> {
     images: Vec<ImageFile>,
     image_of: HashMap<String, usize>,
     materials: Vec<SceneMaterial>,
+    /// Copies of materials whose object space maps read through a baked transform, by material
+    /// and the bits of the frame.
+    object_frames: HashMap<(usize, [[u32; 3]; 3]), usize>,
     /// Per scene material, the primvars of its tangent frame.
     frames: Vec<Frame>,
     /// Scene material by material prim path, double-sided, and what the mesh holds for the
@@ -608,6 +612,7 @@ impl<'s> Importer<'s> {
             material_of: HashMap::new(),
             warnings: Vec::new(),
             networks: HashMap::new(),
+            object_frames: HashMap::new(),
             copies_of: HashMap::new(),
         })
     }
@@ -1139,6 +1144,36 @@ impl<'s> Importer<'s> {
                 }
                 _ => None,
             };
+            // A skeleton takes what a mesh in its bind pose cannot, but it poses no part 0.
+            let applied = |linear: DMat4| {
+                if skin.is_some() || rig.is_some_and(|r| part != 0 && r.rigid) {
+                    transform
+                } else {
+                    linear * transform
+                }
+            };
+            if skin.is_some()
+                && (bound.contains_key(&i) || skeleton.is_none())
+                && used
+                    .iter()
+                    .any(|&m| self.materials[m].material.object_normals != 0)
+            {
+                self.warnings.push(format!(
+                    "{path}: its object space normal maps don't turn with its skeleton's pose"
+                ));
+            }
+            // A map states directions in the prim's space, which a model's vertices left.
+            let mut turned = Vec::with_capacity(holders[o].len());
+            for &(_, linear) in &holders[o] {
+                let baked = DMat3::from_mat4(applied(linear));
+                let mut copies = HashMap::new();
+                for &m in &used {
+                    if self.materials[m].material.object_normals != 0 {
+                        copies.insert(m, self.object_frame_material(m, baked));
+                    }
+                }
+                turned.push(copies);
+            }
             let color = |face: usize, corner: usize, point: usize| {
                 let mut c = [1.0; 4];
                 for read in &self.frames[faces[face]].vertex {
@@ -1151,26 +1186,14 @@ impl<'s> Importer<'s> {
                 }
                 c
             };
-            let object_space = used
-                .iter()
-                .any(|&m| self.materials[m].material.object_normals != 0);
-            for &(m, linear) in &holders[o] {
-                let baked = DMat3::from_mat4(linear * transform);
-                if object_space && !baked.abs_diff_eq(DMat3::IDENTITY, 1e-6) {
-                    self.warnings.push(format!(
-                        "{path}: its object space normal maps don't turn with the transform \
-                         baked into its model"
-                    ));
-                }
+            for (&(m, linear), turned) in holders[o].iter().zip(&turned) {
+                let turned_material = |f: usize| {
+                    let m = face_material(f);
+                    turned.get(&m).copied().unwrap_or(m)
+                };
                 let placing = Placing {
-                    // A skeleton takes what a mesh in its bind pose cannot, but it poses no
-                    // part 0.
-                    transform: if skin.is_some() || rig.is_some_and(|r| part != 0 && r.rigid) {
-                        transform
-                    } else {
-                        linear * transform
-                    },
-                    face_material: &face_material,
+                    transform: applied(linear),
+                    face_material: &turned_material,
                     skin: skin.as_deref(),
                     part,
                     color: &color,
@@ -2415,6 +2438,36 @@ impl<'s> Importer<'s> {
         under
             .and_then(|p| p.strip_prefix('/'))
             .unwrap_or_else(|| path.trim_start_matches('/'))
+    }
+
+    /// Material `m`, or its copy whose object space maps read through `baked`.
+    fn object_frame_material(&mut self, m: usize, baked: DMat3) -> usize {
+        let rows = crate::import::normal_matrix(baked)
+            .transpose()
+            .as_mat3()
+            .to_cols_array_2d();
+        // On a grid far finer than a map's texels, turns that only rounding parts share a copy: a
+        // cosine of 90 degrees reads 6e-17 where another prim states 0. Adding zero turns -0.0
+        // into 0.0.
+        let step = 2f32.powi(20);
+        let frame: [[f32; 3]; 3] = std::array::from_fn(|r| {
+            std::array::from_fn(|c| ((rows[r][c] - f32::from(r == c)) * step).round() / step + 0.0)
+        });
+        if frame == [[0.0; 3]; 3] {
+            return m;
+        }
+        let key = (m, frame.map(|row| row.map(f32::to_bits)));
+        if let Some(&turned) = self.object_frames.get(&key) {
+            return turned;
+        }
+        let mut copy = self.materials[m].clone();
+        copy.suffix = format!("{}/object/{}", copy.suffix, self.object_frames.len());
+        copy.material.object_frame = frame;
+        self.materials.push(copy);
+        self.frames.push(self.frames[m].clone());
+        let turned = self.materials.len() - 1;
+        self.object_frames.insert(key, turned);
+        turned
     }
 
     /// The nearest `SkelRoot` at or above node `n`.

@@ -3000,6 +3000,85 @@ fn a_vector_displacement_bakes_along_the_uvs_and_the_normal() {
     );
 }
 
+/// `Version.cpp` reads a 1.38 `space` of `object`, so directions in the prim's own space, and a
+/// default import bakes the prim's transform into one model: the map has to take the turn too, in
+/// a copy of the material that a prim standing as it was doesn't need.
+#[test]
+fn an_object_space_map_turns_with_the_transform_baked_in() {
+    let d = dir("object-space-baked");
+    std::fs::write(
+        d.join("tex.png"),
+        png(2, 2, |x, y| [(x * 200) as u8, (y * 200) as u8, 200, 255]),
+    )
+    .unwrap();
+    let surface = "token outputs:mtlx:surface.connect = </M/S.outputs:out>";
+    let shader = open_pbr("float3 inputs:geometry_normal.connect = </M/N.outputs:out>");
+    let prims = format!(
+        r#"{shader}
+    def Shader "I"
+    {{
+        uniform token info:id = "ND_image_vector3"
+        asset inputs:file = @tex.png@
+        float3 outputs:out
+    }}
+    def Shader "N"
+    {{
+        uniform token info:id = "ND_normalmap"
+        float3 inputs:in.connect = </M/I.outputs:out>
+        string inputs:space = "object"
+        float3 outputs:out
+    }}"#
+    );
+    let material = mtlx_material(surface, &prims);
+    let material = &material[material.find("def Material").unwrap()..];
+    let stage = format!(
+        r#"def Xform "Turned"
+{{
+    double3 xformOp:rotateXYZ = (0, 0, 90)
+    uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
+
+    def Mesh "A"
+    {{
+        {TRIANGLE}
+        {ST}
+        rel material:binding = </M>
+    }}
+}}
+
+def Mesh "B"
+{{
+    {TRIANGLE}
+    {ST}
+    rel material:binding = </M>
+}}
+
+{material}"#
+    );
+    let a = cook_at(&d, &stage, UsdSettings::default()).unwrap();
+    let model = ModelInfo::parse(&blob(&a, "u", 0)).unwrap();
+    let frames: Vec<[[f32; 3]; 3]> = model
+        .materials
+        .iter()
+        .map(|&m| {
+            let e = a.find(m).unwrap();
+            Material::from_bytes(&read(&a, &a.blobs(e)[0]))
+                .unwrap()
+                .object_frame
+        })
+        .collect();
+    assert_eq!(frames.len(), 2, "one material as it was, one turned");
+    assert!(frames.contains(&[[0.0; 3]; 3]));
+    let turned = frames.iter().find(|f| **f != [[0.0; 3]; 3]).unwrap();
+    // A quarter turn about z takes x to y: rows (0, -1, 0), (1, 0, 0), (0, 0, 1).
+    let near_row = |r: usize, want: [f32; 3]| {
+        (0..3).all(|c| (turned[r][c] + f32::from(r == c) - want[c]).abs() < 1e-5)
+    };
+    assert!(
+        near_row(0, [0.0, -1.0, 0.0]) && near_row(1, [1.0, 0.0, 0.0]),
+        "{turned:?}"
+    );
+}
+
 /// Cluster bounds and baked heights read a tile as they read the same image clamped.
 #[test]
 fn heights_on_one_tile_cook_as_on_the_same_image() {

@@ -128,9 +128,9 @@ pub struct Material {
     pub frame_uv: u8,
     /// Whose model the parameters state: [`Self::MODEL_OPENPBR`] by default.
     pub model: u8,
-    /// Which normal maps hold mesh space directions: [`Self::OBJECT_NORMAL`] and
-    /// [`Self::OBJECT_COAT_NORMAL`]. Such a map stores a direction at `0.5 v + 0.5` in its first
-    /// three channels, and the mesh's tangents have no part in it.
+    /// Which normal maps hold mesh space directions, through [`Self::object_frame`]:
+    /// [`Self::OBJECT_NORMAL`] and [`Self::OBJECT_COAT_NORMAL`]. Such a map stores a direction at
+    /// `0.5 v + 0.5` in its first three channels, and the mesh's tangents have no part in it.
     pub object_normals: u8,
     /// Nonzero: the displacement fields are world lengths along the world normal, whatever scale
     /// places the mesh, not mesh space lengths that scale with it.
@@ -142,6 +142,10 @@ pub struct Material {
     /// The material of the surface's back, double-sided as this one is; [`AssetId::NONE`] where
     /// both sides read this one.
     pub back: AssetId,
+    /// What takes such a map's directions to the mesh's space, where an importer baked a transform
+    /// into its vertices: rows of its normal matrix, up to a positive scale, as their difference
+    /// from the identity so that zero is the identity.
+    pub object_frame: [[f32; 3]; 3],
     /// Indexed by the `slot` constants.
     pub textures: [TextureBinding; slot::COUNT],
     /// Per slot, the affine map from mesh uv to the uv its texture is sampled at, stored
@@ -351,6 +355,7 @@ impl Default for Material {
             object_normals: 0,
             displacement_world: 0,
             back: AssetId::NONE,
+            object_frame: [[0.0; 3]; 3],
             textures: [TextureBinding::zeroed(); slot::COUNT],
             uv_transforms: [[0.0; 6]; slot::COUNT],
         }

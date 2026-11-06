@@ -104,6 +104,7 @@ pub(crate) struct SceneSubd {
     pub(crate) settings: SubdSettings,
 }
 
+#[derive(Clone)]
 pub(crate) struct SceneMaterial {
     /// Entry name suffix: `<asset>/material/<suffix>`, textures under
     /// `<asset>/texture/<suffix>/`; empty names the material `<asset>` itself.

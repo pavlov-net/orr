@@ -8793,6 +8793,9 @@ fn every_slot_reaches_its_parameter() {
     let mut object = with(slot::COAT_NORMAL);
     object.flags |= orr_scene::material_flags::OBJECT_COAT_NORMAL;
     records.push(object);
+    // A baked quarter turn about x, from the identity: not symmetric, so rows read as rows.
+    object.object_frame = [0.0, 0.0, 0.0, 0.0, -1.0, -1.0, 0.0, 1.0, -1.0];
+    records.push(object);
 
     let texels = {
         let mut a = d
@@ -8874,10 +8877,17 @@ fn every_slot_reaches_its_parameter() {
     // A mesh space direction turns with the placement, a quarter turn about z.
     let [x, y, z] = [v[0], v[1], v[2]].map(|c| 2.0 * c - 1.0);
     let want = Vec3::new(-y, x, z).normalize();
-    let n = Vec3::from(out[out.len() - 1].coat_normal);
+    let n = Vec3::from(out[out.len() - 2].coat_normal);
     assert!(
         n.abs_diff_eq(want, 1e-4),
         "object normal {n} against {want}"
+    );
+    // The baked turn comes first, to (x, -z, y), then the placement's.
+    let want = Vec3::new(z, x, y).normalize();
+    let n = Vec3::from(out[out.len() - 1].coat_normal);
+    assert!(
+        n.abs_diff_eq(want, 1e-4),
+        "baked object normal {n} against {want}"
     );
     d.free_image_slot_after_submitted(slot_index);
     assert_clean();

@@ -268,6 +268,7 @@ impl MaterialGpu {
             displacement_offset: m.displacement_offset,
             displacement_min: m.displacement_min,
             displacement_max: m.displacement_max,
+            object_frame: m.object_frame.concat().try_into().expect("nine entries"),
             displacement_tangent: [
                 m.displacement_tangent[0][0],
                 m.displacement_tangent[0][1],
@@ -285,6 +286,7 @@ impl MaterialGpu {
             transmission_dispersion_scale: m.transmission_dispersion_scale,
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
             back: 0,
+            _pad0: 0,
             data: 0,
             texture_streams: GpuPtr::NULL,
             tiles: textures.map(|t| t.tiles),

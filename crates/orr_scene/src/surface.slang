@@ -157,8 +157,9 @@ public float material_coverage(SurfaceInput i)
 
 // The shading frame: the vertex normal, turned by the material's normal map in `slot`.
 // MikkTSpace's bakers invert this transform: the interpolated normal and tangent as they stand,
-// neither unit nor perpendicular. A map of mesh space directions takes the placement's normal
-// transform, and the side `i.normal` faces where a double-sided back face turned it.
+// neither unit nor perpendicular. A map of mesh space directions takes the material's
+// `object_frame`, then the placement's normal transform, and the side `i.normal` faces where a
+// double-sided back face turned it.
 public float3 material_normal(SurfaceInput i, MaterialGpu* m, uint slot = TEXTURE_NORMAL)
 {
     if (!material_bound(m, slot))
@@ -168,7 +169,10 @@ public float3 material_normal(SurfaceInput i, MaterialGpu* m, uint slot = TEXTUR
     {
         float3x3 c = normal_matrix(i.object_to_render);
         float side = dot(mul(c, i.object_normal), i.normal) < 0.0 ? -1.0 : 1.0;
-        return safe_normalize(mul(c, 2.0 * texel.xyz - 1.0) * side, i.normal);
+        float3 v = 2.0 * texel.xyz - 1.0;
+        float3x3 frame = float3x3(m.object_frame[0], m.object_frame[1], m.object_frame[2], m.object_frame[3], m.object_frame[4], m.object_frame[5], m.object_frame[6], m.object_frame[7], m.object_frame[8]);
+        float3 baked = v + mul(frame, v);
+        return safe_normalize(mul(c, baked) * side, i.normal);
     }
     float3 v = material_normal_frame(m, slot, normal_decode(texel.xy));
     bool coat = slot == TEXTURE_COAT_NORMAL;
