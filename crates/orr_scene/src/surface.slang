@@ -111,7 +111,8 @@ public float3 surface_vertex(SurfaceInput i, MaterialGpu* m, uint slot)
     uint first = (modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK;
     float4 c = i.vertex_color;
     float3 v = first == 0 ? float3(1.0) : first == 1 ? c.xyz : first == 2 ? c.yzw : first == 3 ? float3(c.zw, 1.0) : float3(c.w, 1.0, 1.0);
-    return ((modes >> TEXTURE_VERTEX_COMPLEMENT_SHIFT) & TEXTURE_VERTEX_COMPLEMENT_MASK) != 0 ? saturate(1.0 - v) : v;
+    uint complement = (modes >> TEXTURE_VERTEX_COMPLEMENT_SHIFT) & TEXTURE_VERTEX_COMPLEMENT_MASK;
+    return complement != 0 ? saturate(1.0 - exp2(float(complement - 1)) * v) : v;
 }
 
 // Scalar slot `slot` at the hit, times the vertex color stream's value for it.

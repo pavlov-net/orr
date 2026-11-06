@@ -8131,5 +8131,10 @@ fn a_complemented_slot_reads_the_stream_as_opacity() {
         let out = surface_params(d, &[record], |_| {}, [1.0, 1.0, opacity, 1.0]);
         assert_eq!(out[0].transmission_weight, weight, "opacity {opacity}");
     }
+    // Over 2^3 in the stream, as one past half floats holds it.
+    m.textures[slot::TRANSMISSION].vertex_complement = 4;
+    let record = MaterialGpu::new(&m, &[BoundTexture::NONE; slot::COUNT]);
+    let out = surface_params(d, &[record], |_| {}, [1.0, 1.0, 0.25 / 8.0, 1.0]);
+    assert_eq!(out[0].transmission_weight, 0.75);
     assert_clean();
 }

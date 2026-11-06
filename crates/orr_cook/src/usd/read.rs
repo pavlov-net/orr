@@ -671,7 +671,15 @@ impl PrimReader<'_> {
             .metadata_token(&full, "interpolation")
             .is_some_and(|i| i != "constant")
         {
-            return Ok(shading::Primvar::Varying(width.min(4) as u8));
+            let channels = width.min(4);
+            let peak = values
+                .chunks(width)
+                .flat_map(|v| v.iter().take(channels))
+                .fold(0.0, |p: f64, x| p.max(x.abs()));
+            return Ok(shading::Primvar::Varying {
+                width: channels as u8,
+                scale: Some(shading::stream_scale(peak)),
+            });
         }
         let primvar = Primvar {
             values,

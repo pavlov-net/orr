@@ -348,7 +348,7 @@ impl More {
 }
 
 /// The field a scalar slot from [`slot::MORE`] on multiplies.
-fn scalar_field(m: &mut Material, s: usize) -> &mut f32 {
+pub(crate) fn scalar_field(m: &mut Material, s: usize) -> &mut f32 {
     match s {
         slot::SPECULAR_IOR => &mut m.specular_ior,
         slot::COAT_IOR => &mut m.coat_ior,

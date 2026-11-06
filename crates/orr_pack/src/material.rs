@@ -26,8 +26,10 @@ pub struct TextureBinding {
     /// reads, bound or not; 0 for none. A color reads three from it, a scalar one. A mesh without
     /// the stream reads 1.
     pub vertex: u8,
-    /// Nonzero: the slot reads `1 - v` of the stream's `v` in place of `v`, held to 0..1, so a
-    /// mesh without the stream reads 0.
+    /// Nonzero: the slot reads `1 - 2^(vertex_complement - 1) v` of the stream's `v` in place of
+    /// `v`, held to 0..1, so a mesh without the stream reads 0 at 1. Past 1 the power of two
+    /// stands for what the field does for a slot that multiplies: the stream's half floats hold
+    /// `v` over it.
     pub vertex_complement: u8,
     pub _pad: [u8; 1],
     /// What the slot reads, from its first channel on, past 0..1 on an axis of

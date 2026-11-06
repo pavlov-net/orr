@@ -1513,6 +1513,78 @@ fn a_partial_last_element_reads_the_fallback() {
     assert!(warnings.iter().any(|w| says(&w)), "{warnings:?}");
 }
 
+/// OpenPBR `emission_color`: "permitted to have arbitrarily large (positive) components", in a
+/// range of `[0, inf)` past what the stream's half floats hold, which then hold them over a power
+/// of two the field gives back. Opacity past it stays exact below 1, its range, by a scale of the
+/// complement's own.
+#[test]
+fn primvars_past_half_floats_fold_into_the_field() {
+    let reader = |name: &str, kind: &str, primvar: &str, ty: &str| {
+        format!(
+            r#"def Shader "{name}"
+    {{
+        uniform token info:id = "UsdPrimvarReader_{kind}"
+        string inputs:varname = "{primvar}"
+        {ty} outputs:result
+    }}"#
+        )
+    };
+    let glow = reader("C", "float3", "glow", "float3");
+    let inputs = "color3f inputs:emissiveColor.connect = </M/C.outputs:result>";
+    let mesh = |peak: &str| {
+        format!(
+            r#"color3f[] primvars:glow = [({peak}, 3, 0), (1, 0.5, 0), (0.25, 0.125, 0)] (
+        interpolation = "vertex"
+    )"#
+        )
+    };
+    let a = cook(
+        "primvar-past-half",
+        &previewed(inputs, &glow, &mesh("100032")),
+    );
+    let m = material(&a);
+    assert_eq!(m.emission_color, [2.0; 3]);
+    let colors = vertex_colors(&a);
+    assert!(colors.contains(&[50016.0, 1.5, 0.0, 1.0]), "{colors:?}");
+    assert!(colors.contains(&[0.5, 0.25, 0.0, 1.0]), "{colors:?}");
+    assert!(colors.contains(&[0.125, 0.0625, 0.0, 1.0]), "{colors:?}");
+
+    let a = cook("primvar-in-half", &previewed(inputs, &glow, &mesh("60000")));
+    assert_eq!(material(&a).emission_color, [1.0; 3]);
+
+    let see = reader("O", "float", "see", "float");
+    let inputs = "float inputs:opacity.connect = </M/O.outputs:result>";
+    let mesh = r#"float[] primvars:see = [0.5, 1, 1000000] (
+        interpolation = "vertex"
+    )"#;
+    let a = cook("primvar-opacity", &previewed(inputs, &see, mesh));
+    let m = material(&a);
+    assert_eq!(m.transmission_weight, 1.0);
+    assert_eq!(m.textures[slot::TRANSMISSION].vertex_complement, 5);
+    let colors = vertex_colors(&a);
+    assert!(colors.contains(&[0.03125, 1.0, 1.0, 1.0]), "{colors:?}");
+}
+
+/// The stream's values are half floats, so a value no power of two brings within them, past an
+/// `f32` field's reach, fails the cook rather than becoming infinity.
+#[test]
+fn a_primvar_past_f32_fails_the_cook() {
+    let d = dir("primvar-past-f32");
+    let prims = r#"def Shader "C"
+    {
+        uniform token info:id = "UsdPrimvarReader_float"
+        string inputs:varname = "huge"
+        float outputs:result
+    }"#;
+    let inputs = "float inputs:roughness.connect = </M/C.outputs:result>";
+    let mesh = r#"double[] primvars:huge = [1e300, 1, 1] (
+        interpolation = "vertex"
+    )"#;
+    let body = previewed(inputs, prims, mesh);
+    let err = cook_at(&d, &body, UsdSettings::default()).err();
+    assert!(err.is_some_and(|e| e.to_string().contains("vertex")));
+}
+
 /// Two readers of one primvar each keep their own `fallback`.
 #[test]
 fn readers_of_a_primvar_keep_their_fallbacks() {

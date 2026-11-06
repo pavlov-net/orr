@@ -206,9 +206,13 @@ pub(crate) enum Primvar {
     Uv(u8),
     /// One value for the whole mesh.
     Constant(Vec<f32>),
-    /// Values that vary over the mesh, of this many channels, at most the stream's four. A
-    /// reader takes a wider primvar's first ones.
-    Varying(u8),
+    /// Values that vary over the mesh, of `width` channels, at most the stream's four: a reader
+    /// takes a wider primvar's first ones. The stream holds them over `scale`
+    /// ([`stream_scale`]), `None` on a mesh that holds no stream and so reads 1.
+    Varying {
+        width: u8,
+        scale: Option<f32>,
+    },
     Missing,
 }
 
@@ -221,6 +225,60 @@ pub(crate) struct VertexRead {
     pub(crate) width: u8,
     /// What the reader gives per channel where the mesh holds no value.
     pub(crate) fallback: [f32; 4],
+    /// What the stream holds its values over ([`stream_scale`]).
+    pub(crate) scale: f32,
+}
+
+/// The half floats' largest value.
+const HALF_MAX: f64 = 65504.0;
+
+/// What the vertex color stream divides values of magnitude up to `peak` by: 1 where its half
+/// floats hold them, else the least power of two that brings `peak` within them, which leaves
+/// every mantissa as it is and the most room below for small values. A value no `f32` field
+/// reaches gets 1, for [`crate::mesh::check`] to refuse.
+pub(crate) fn stream_scale(peak: f64) -> f32 {
+    if peak <= HALF_MAX || peak > f64::from(f32::MAX) {
+        return 1.0;
+    }
+    (peak / HALF_MAX).log2().ceil().exp2() as f32
+}
+
+/// The field slot `s` reads the stream through, whose channels multiply it.
+fn stream_field(m: &mut Material, s: usize) -> &mut [f32] {
+    match s {
+        slot::BASE_COLOR => &mut m.base_color,
+        slot::EMISSION => &mut m.emission_color,
+        slot::SPECULAR_COLOR => &mut m.specular_color,
+        slot::TRANSMISSION_COLOR => &mut m.transmission_color,
+        slot::SUBSURFACE_COLOR => &mut m.subsurface_color,
+        slot::FUZZ_COLOR => &mut m.fuzz_color,
+        slot::COAT_COLOR => &mut m.coat_color,
+        slot::OPACITY => std::slice::from_mut(&mut m.geometry_opacity),
+        slot::METALNESS => std::slice::from_mut(&mut m.metalness),
+        slot::ROUGHNESS => std::slice::from_mut(&mut m.specular_roughness),
+        slot::SPECULAR_WEIGHT => std::slice::from_mut(&mut m.specular_weight),
+        slot::TRANSMISSION => std::slice::from_mut(&mut m.transmission_weight),
+        slot::COAT => std::slice::from_mut(&mut m.coat_weight),
+        s => std::slice::from_mut(crate::texture::material::scalar_field(m, s)),
+    }
+}
+
+/// Gives each slot of `m` that reads the stream back what `reads` hold it over: the field for a
+/// slot it multiplies, which is the scale's whole effect on `m`, or a complement's own scale.
+/// `m`'s fields are final by then, so a patch of one states what multiplies the primvar.
+pub(crate) fn fold_stream_scales(m: &mut Material, reads: &[VertexRead]) {
+    for s in 0..slot::COUNT {
+        let channel = m.textures[s].vertex.wrapping_sub(1);
+        let held = |r: &&VertexRead| (r.first..r.first + r.width).contains(&channel);
+        let Some(scale) = reads.iter().find(held).map(|r| r.scale) else {
+            continue;
+        };
+        if m.textures[s].vertex_complement != 0 {
+            m.textures[s].vertex_complement = 1 + scale.log2() as u8;
+        } else {
+            stream_field(m, s).iter_mut().for_each(|f| *f *= scale);
+        }
+    }
 }
 
 /// What mapping asks of the scene a material lands in.
@@ -864,9 +922,9 @@ impl Mapper<'_, '_> {
                 "{}: {name} is a uv set, which only texture coordinates read",
                 self.node(n).name
             )),
-            Primvar::Varying(width) => {
+            Primvar::Varying { width, scale } => {
                 let fallback = self.fallback(n, missing);
-                let first = self.vertex_channels(n, name, width, fallback)?;
+                let first = self.vertex_channels(n, name, width, scale, fallback)?;
                 Ok(Value::Vertex { first, width })
             }
         }
@@ -893,6 +951,7 @@ impl Mapper<'_, '_> {
         n: usize,
         name: &str,
         width: u8,
+        scale: Option<f32>,
         fallback: [f32; 4],
     ) -> Result<u8, String> {
         let same = |r: &&VertexRead| r.name == name && r.width == width;
@@ -921,6 +980,11 @@ impl Mapper<'_, '_> {
             first,
             width,
             fallback,
+            scale: scale.map_or(1.0, |s| {
+                s.max(stream_scale(
+                    fallback.iter().fold(0.0, |p, &x| p.max(f64::from(x.abs()))),
+                ))
+            }),
         });
         Ok(first)
     }
@@ -1156,7 +1220,7 @@ impl Mapper<'_, '_> {
                             let fallback = self.vec2(n, "fallback", Vec2::ZERO)?;
                             Ok((0, outer * fixed(fallback)))
                         }
-                        Primvar::Varying(_) => Err(format!(
+                        Primvar::Varying { .. } => Err(format!(
                             "{}: reads {}; the mesh uv sets are {}",
                             node.name,
                             self.text(n, "varname").unwrap_or_default(),

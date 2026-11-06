@@ -819,8 +819,8 @@ impl<'s> Importer<'s> {
                     let held = read_primvars[&read.name].as_ref();
                     let v = held.and_then(|p| p.at(point, face, corner));
                     for k in 0..usize::from(read.width) {
-                        let x = v.map_or(read.fallback[k], |v| v[k] as f32);
-                        c[usize::from(read.first) + k] = x;
+                        let x = v.map_or(f64::from(read.fallback[k]), |v| v[k]);
+                        c[usize::from(read.first) + k] = (x / f64::from(read.scale)) as f32;
                     }
                 }
                 c
@@ -1630,15 +1630,20 @@ impl<'s> Importer<'s> {
     }
 
     /// What mesh prim `mesh` holds for primvar `name`. A constant primvar inherits down
-    /// namespace.
+    /// namespace. A cage holds no stream, so nothing is scaled to fit one.
     fn primvar(&self, mesh: usize, name: &str) -> Result<shading::Primvar, String> {
         let set = self.settings.uv_sets().position(|s| s == name);
+        let facts = MeshFacts::read(&self.reader(&self.nodes[mesh].prim))?;
+        let cage = !facts.polygonal && self.settings.subdivision == Subdivision::Cage;
         let mut at = Some(mesh);
         while let Some(i) = at {
             match (self.reader(&self.nodes[i].prim).whole_primvar(name)?, set) {
                 (shading::Primvar::Missing, _) => {}
                 (_, Some(set)) if i == mesh => return Ok(shading::Primvar::Uv(set as u8)),
-                (shading::Primvar::Varying(_), _) if i != mesh => {}
+                (shading::Primvar::Varying { .. }, _) if i != mesh => {}
+                (shading::Primvar::Varying { width, .. }, _) if cage => {
+                    return Ok(shading::Primvar::Varying { width, scale: None });
+                }
                 (held, _) => return Ok(held),
             }
             at = self.nodes[i].parent;
@@ -1725,6 +1730,7 @@ impl<'s> Importer<'s> {
         }
         let mut frame = self.frame(prim.as_ref(), &mut mapped.material)?;
         frame.vertex = std::mem::take(&mut mapped.vertex);
+        shading::fold_stream_scales(&mut mapped.material, &frame.vertex);
         let suffix = if double_sided {
             format!("{name}/double_sided")
         } else {
