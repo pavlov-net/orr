@@ -15,6 +15,8 @@ use orr_gpu::{
     TextureRegion, TimelinePoint,
 };
 
+use crate::Loading;
+
 struct StderrLog;
 
 impl log::Log for StderrLog {
@@ -54,6 +56,11 @@ pub fn device() -> &'static Device {
         };
         Device::new(&desc).expect("test device")
     })
+}
+
+/// A loading side with no renderer, for a test that only queues jobs on it.
+pub fn loading() -> Loading {
+    Loading::new(false)
 }
 
 /// Fails the calling test if the validation layer has reported anything on [`device`].

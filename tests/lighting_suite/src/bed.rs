@@ -19,9 +19,9 @@ use orr_gpu::{
     TextureRegion, TextureUsage,
 };
 use orr_lighting::{
-    BsdfTables, DirectionalLight, DiscProfile, DofBackgroundPass, EnvironmentMapGpu, Light,
-    LightId, LightingKernels, LightingView, ParticleDraw, PathEntry, ReferenceSettings,
-    SceneLighting, SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
+    BsdfTables, CompilingKernels, DirectionalLight, DiscProfile, DofBackgroundPass,
+    EnvironmentMapGpu, Light, LightId, LightingKernels, LightingView, ParticleDraw, PathEntry,
+    ReferenceSettings, SceneLighting, SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
 };
 use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
@@ -2197,8 +2197,8 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// The kernels of a set and entry compile once per process and stay: under the validation
-    /// layer each compile takes minutes.
+    /// The kernels of a set and entry compile once per process, on threads of their own, and
+    /// stay: under the validation layer each compile takes minutes.
     pub fn new(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
         type Key = (Vec<usize>, PathEntry);
         static COMPILED: Mutex<Vec<(Key, &'static OnceLock<LightingKernels>)>> =
@@ -2223,7 +2223,16 @@ impl Paths {
         drop(compiled);
         let kernels = slot.get_or_init(|| {
             let tables = BsdfTables::new(device()).unwrap();
-            LightingKernels::new(device(), kernels, &tables, entry).unwrap()
+            let kernels: &'static KernelSet = Box::leak(Box::new(*kernels));
+            let loading = orr_scene::testing::loading();
+            let jobs = LightingKernels::spawn(device(), kernels, &tables, entry, &loading);
+            std::thread::scope(|threads| {
+                for _ in 1..CompilingKernels::JOBS {
+                    threads.spawn(|| while loading.run_one() {});
+                }
+                jobs.wait(&loading);
+            });
+            jobs.finish().unwrap()
         });
         Self {
             kernels,
