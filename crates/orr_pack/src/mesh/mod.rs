@@ -268,7 +268,7 @@ pub struct Cluster {
     pub tri_count: u8,
     pub alpha_first: u8,
     pub section: u8,
-    pub part: u8,
+    pub _pad: u8,
     pub kind: u8,
     pub flags: u8,
     /// Rest AABB is `(anchor, anchor + local_max) x 2^k`.
@@ -288,7 +288,7 @@ pub struct Cluster {
     /// inward from one of its triangles travels to the geometry drawn with it (infinity when
     /// none hits); 0 elsewhere.
     pub min_thickness: u16,
-    pub _pad: u16,
+    pub part: u16,
 }
 
 impl Cluster {

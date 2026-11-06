@@ -61,7 +61,7 @@ public struct Cluster
     public uint8_t tri_count;
     public uint8_t alpha_first;
     public uint8_t section;
-    public uint8_t part;
+    public uint8_t _pad;
     public uint8_t kind;
     public uint8_t flags;
     public uint16_t local_max[3];
@@ -73,7 +73,7 @@ public struct Cluster
     public uint omm_first;         // bytes from omm_offset
     public float area;             // m^2
     public half min_thickness;     // m
-    public uint16_t _pad;
+    public uint16_t part;
 }
 
 // 32 B. A DAG hierarchy node: a leaf names a group (`group` >= 0), an internal node has

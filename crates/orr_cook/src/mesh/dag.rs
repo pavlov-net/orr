@@ -70,7 +70,7 @@ struct DagGroup {
 }
 
 struct Stage {
-    part: u8,
+    part: u16,
     /// The sections of the stage's class that have triangles, ascending.
     sections: Vec<u8>,
     merged: bool,
@@ -132,7 +132,7 @@ fn stages(
         let o = options(section);
         (o.limits.max_vertices, o.dilate.then_some(section))
     };
-    let mut by_stage: BTreeMap<(u8, Class), (Vec<u8>, Vec<Corner>)> = BTreeMap::new();
+    let mut by_stage: BTreeMap<(u16, Class), (Vec<u8>, Vec<Corner>)> = BTreeMap::new();
     for p in lod::pieces(w, parts) {
         let (sections, corners) = by_stage.entry((p.part, class(p.section))).or_default();
         sections.push(p.section);
@@ -142,7 +142,7 @@ fn stages(
                 .map(|&v| (v, grid.cells[v as usize], p.section)),
         );
     }
-    let pieces: Vec<(u8, Vec<u8>, Vec<Corner>)> = by_stage
+    let pieces: Vec<(u16, Vec<u8>, Vec<Corner>)> = by_stage
         .into_iter()
         .map(|((part, _), (sections, corners))| (part, sections, corners))
         .collect();

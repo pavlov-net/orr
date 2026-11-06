@@ -90,7 +90,7 @@ pub(crate) struct ClusterInfo {
     pub(crate) vertex_count: u32,
     pub(crate) tri_count: u32,
     pub(crate) section: u8,
-    part: u8,
+    part: u16,
     pub(crate) flags: u8,
     pub(crate) micromap: bool,
     pub(crate) self_error: f32,

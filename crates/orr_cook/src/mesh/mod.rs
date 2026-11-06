@@ -754,7 +754,7 @@ impl Ctx<'_> {
     fn cluster(
         &self,
         section: u8,
-        part: u8,
+        part: u16,
         merged: bool,
         verts: &[u32],
         cells: &[[i32; 3]],

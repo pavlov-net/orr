@@ -236,7 +236,7 @@ fn levels_simplify_and_parts_merge() {
     assert!(info.levels[2].error >= info.levels[1].error);
 
     // Level 0 holds the source triangles, each in its majority part.
-    let mut expected: Vec<(u8, [[u32; 3]; 3])> = input
+    let mut expected: Vec<(u16, [[u32; 3]; 3])> = input
         .indices
         .chunks(3)
         .map(|t| {
@@ -249,7 +249,7 @@ fn levels_simplify_and_parts_merge() {
                 v[0].min(v[1]).min(v[2])
             };
             (
-                value as u8,
+                value,
                 rotate(
                     [0, 1, 2].map(|k| snap(input.positions[t[k] as usize], h.position_exponent)),
                 ),
@@ -257,7 +257,7 @@ fn levels_simplify_and_parts_merge() {
         })
         .collect();
     let l0 = info.levels[0].clusters;
-    let mut cooked: Vec<(u8, [[u32; 3]; 3])> = all
+    let mut cooked: Vec<(u16, [[u32; 3]; 3])> = all
         [l0.first as usize..(l0.first + l0.count) as usize]
         .iter()
         .flat_map(|(c, _, tris)| tris.iter().map(|t| (c.part, rotate(*t))))
@@ -320,9 +320,9 @@ fn triangles(values: &[[u16; 3]], sections: usize) -> MeshInput {
     m
 }
 
-fn part_triangles(a: &Archive) -> Vec<(u8, u32)> {
+fn part_triangles(a: &Archive) -> Vec<(u16, u32)> {
     let (_, pages) = clusters(a);
-    let mut out: Vec<(u8, u32)> = pages
+    let mut out: Vec<(u16, u32)> = pages
         .iter()
         .flat_map(|(_, cs)| cs.iter().map(|c| (c.part, u32::from(c.tri_count))))
         .collect();
@@ -347,7 +347,7 @@ fn parts_follow_the_majority_then_the_lowest_value() {
     let a = cook(input, MeshSettings::default()).unwrap();
     let (info, _) = clusters(&a);
     assert_eq!(info.parts.len(), 8);
-    let parts: Vec<u8> = part_triangles(&a).iter().map(|p| p.0).collect();
+    let parts: Vec<u16> = part_triangles(&a).iter().map(|p| p.0).collect();
     assert_eq!(parts, [2, 3, 4]);
     assert_eq!(info.parts[3].joint, 1);
 

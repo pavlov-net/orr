@@ -96,6 +96,9 @@ impl Welded {
     }
 }
 
+/// Parts of a mesh: [`Cluster::part`](orr_pack::mesh::Cluster::part) names them in a u16.
+const MAX_PARTS: usize = 1 << 16;
+
 /// The part table and each triangle's part.
 pub(super) struct Parts {
     /// Pivot and joint per part; bounds are filled from the clusters.
@@ -103,7 +106,7 @@ pub(super) struct Parts {
     /// Part value is not 0.
     pub(super) animated: Vec<bool>,
     /// Part of each triangle, in [`Welded::indices`] order.
-    pub(super) of_triangle: Vec<u8>,
+    pub(super) of_triangle: Vec<u16>,
 }
 
 impl Parts {
@@ -126,15 +129,15 @@ impl Parts {
         let sections = w.sections.len();
         let per_value = if p.by_section { sections } else { 1 };
         let total = usize::from(p.count) * per_value;
-        if total == 0 || total > 256 {
+        if total == 0 || total > MAX_PARTS {
             return Err(format!(
-                "{} parts ({} values{}); a mesh holds 1 to 256",
+                "{} parts ({} values{}); a mesh holds 1 to {MAX_PARTS}",
                 total,
                 p.count,
                 if p.by_section { " x sections" } else { "" }
             ));
         }
-        let mut of_triangle = vec![0u8; triangles];
+        let mut of_triangle = vec![0u16; triangles];
         for (s, r) in w.sections.iter().enumerate() {
             for t in r.start / 3..r.end / 3 {
                 let v = [0, 1, 2].map(|k| values[w.indices[3 * t + k] as usize]);
@@ -152,7 +155,7 @@ impl Parts {
                     ));
                 }
                 let index = usize::from(value) * per_value + if p.by_section { s } else { 0 };
-                of_triangle[t] = index as u8;
+                of_triangle[t] = index as u16;
             }
         }
         // Per part, the pivot its vertices carry: a vertex belongs to the part of its own
@@ -197,7 +200,7 @@ impl Parts {
 /// Triangles of one part and section at one level, or of a section's merged stage.
 #[derive(Clone)]
 pub(crate) struct Piece {
-    pub(super) part: u8,
+    pub(super) part: u16,
     pub(super) section: u8,
     pub(super) merged: bool,
     pub(super) indices: Vec<u32>,
@@ -276,7 +279,7 @@ pub(crate) fn levels(
 
 /// The triangles of each (part, section), sorted by part, then section.
 pub(crate) fn pieces(w: &Welded, parts: &Parts) -> Vec<Piece> {
-    let mut by_key: std::collections::BTreeMap<(u8, u8), Vec<u32>> = Default::default();
+    let mut by_key: std::collections::BTreeMap<(u16, u8), Vec<u32>> = Default::default();
     for (sec, r) in w.sections.iter().enumerate() {
         for t in r.start / 3..r.end / 3 {
             by_key
