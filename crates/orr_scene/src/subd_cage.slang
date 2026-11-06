@@ -127,14 +127,13 @@ float4 subd_part_value(SubdCageGpu* c, SubdPartGpu part, float2 st)
 public float2 subd_limit_uv(SubdCageGpu* c, uint patch, float2 st, uint set)
 {
     SubdPatchGpu p = c.patches[patch];
-    float2 uv = 0.0;
-    for (uint k = 0; k < p.part_count; k++)
+    for (uint k = p.part_count; k > 0; k--)
     {
-        SubdPartGpu part = c.parts[p.part_first + k];
+        SubdPartGpu part = c.parts[p.part_first + k - 1];
         if (((part.bits >> 16) & (SUBD_PART_UV << set)) != 0)
-            uv = subd_part_value(c, part, st).xy;
+            return subd_part_value(c, part, st).xy;
     }
-    return uv;
+    return 0.0;
 }
 
 // The vertex color stream of patch `patch` at `st`; 1 in the channels none of its parts gives.

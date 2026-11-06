@@ -595,14 +595,12 @@ impl Page {
         set: u32,
         points: &[[f32; 4]],
     ) -> Option<[f32; 2]> {
-        let mut uv = [0.0; 2];
-        for part in self.parts_at(face, u, v)? {
-            if part.channels & (Part::UV << set) != 0 {
-                let [x, y, ..] = self.part_value(part, u, v, points);
-                uv = [x, y];
-            }
-        }
-        Some(uv)
+        let parts = self.parts_at(face, u, v)?;
+        let last = parts.iter().rfind(|p| p.channels & (Part::UV << set) != 0);
+        Some(last.map_or([0.0; 2], |part| {
+            let [x, y, ..] = self.part_value(part, u, v, points);
+            [x, y]
+        }))
     }
 
     /// The vertex color stream of face `face` at face coordinates `(u, v)`, from
