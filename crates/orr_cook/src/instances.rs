@@ -69,7 +69,8 @@ pub struct PageFrame {
 pub struct Placement {
     /// World position, meters.
     pub position: [f64; 3],
-    /// Has to invert: a flat transform cannot be an instance.
+    /// Has to invert: a flat transform cannot be an instance. A model cooks once, before anything
+    /// places it, so a world length of displacement baked into it scales with this.
     pub linear: Linear,
     /// Index into [`Instances::prototypes`].
     pub prototype: u16,

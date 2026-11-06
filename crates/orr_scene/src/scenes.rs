@@ -1337,6 +1337,7 @@ impl<'a> Frame<'a> {
             cages: &self.core.cages,
             patterns: &self.core.patterns,
             mounts: &self.core.mounts,
+            materials: &self.core.materials,
         })
     }
 

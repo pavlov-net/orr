@@ -587,6 +587,17 @@ pub(crate) fn cook(
         (Some(t), Some(max)) if !bakes => tangents::check(m, t, maps, max),
         _ => TangentCheck::KEPT,
     };
+    let stretch: Vec<[f32; 2]> = m
+        .sections
+        .iter()
+        .map(|sec| {
+            let vertices = m.moves.iter().flat_map(|moves| {
+                let at = |&v: &u32| Vec3::from(moves[v as usize][1]).length();
+                m.indices[sec.indices.clone()].iter().map(at)
+            });
+            vertices.fold([1.0f32; 2], |[lo, hi], l| [lo.min(l), hi.max(l)])
+        })
+        .collect();
     let mut w = lod::Welded::new(m, !tangent_check.derive, bakes);
     let source_grid =
         Grid::new(&w.positions, s.position_step_log2, m.min_exponent).map_err(fail)?;
@@ -666,6 +677,7 @@ pub(crate) fn cook(
         maps,
         omm_alpha: &omm_alpha,
         baked: &baked,
+        stretch: &stretch,
         s,
         deformation_bound: if m.skin.is_some() {
             f16_up(s.deformation_bound)
@@ -753,6 +765,9 @@ struct Ctx<'a> {
     omm_alpha: &'a [Option<Map<OmmRead<'a>>>],
     /// Sections whose displacement is in their geometry: no displacement bounds.
     baked: &'a [bool],
+    /// Per section, the least and most a height of 1 moves a vertex: by `MeshData::moves`, or by 1
+    /// as a run time displacement does.
+    stretch: &'a [[f32; 2]],
     s: &'a MeshSettings,
     deformation_bound: u16,
     stride: usize,
@@ -832,8 +847,9 @@ impl Ctx<'_> {
                     lo.abs().max(hi.abs())
                 })
                 .sum();
-            c.record.displacement_min = f16_down(lo - across);
-            c.record.displacement_max = f16_up(hi + across);
+            let [least, most] = self.stretch[usize::from(section)];
+            c.record.displacement_min = f16_down((lo * least).min(lo * most) - across);
+            c.record.displacement_max = f16_up((hi * least).max(hi * most) + across);
         }
         c
     }

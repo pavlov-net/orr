@@ -307,6 +307,8 @@ pub(crate) struct MaterialTable {
     extended: Mutex<HashSet<u32>>,
     /// Materials whose paths may take a random walk.
     walking: Mutex<HashSet<u32>>,
+    /// Materials whose displacement is a world length.
+    world_lengths: Mutex<HashSet<u32>>,
 }
 
 /// Whether pixels of `m` may use the extended G-buffer targets. A linked surface may set any
@@ -341,6 +343,7 @@ impl MaterialTable {
             ids: Mutex::new(RangeAllocator::new(capacity)),
             extended: Mutex::new(HashSet::new()),
             walking: Mutex::new(HashSet::new()),
+            world_lengths: Mutex::new(HashSet::new()),
         })
     }
 
@@ -364,6 +367,10 @@ impl MaterialTable {
         };
         mark(&self.extended, needs_extended(m));
         mark(&self.walking, may_walk(m));
+        mark(
+            &self.world_lengths,
+            m.flags & material_flags::DISPLACEMENT_WORLD != 0,
+        );
     }
 
     /// Whether any material may write the extended G-buffer targets.
@@ -374,6 +381,12 @@ impl MaterialTable {
     /// Whether paths through any material may take a random walk.
     pub(crate) fn any_walking(&self) -> bool {
         !self.walking.lock().unwrap().is_empty()
+    }
+
+    /// Whether any of `ids` displaces by a world length.
+    pub(crate) fn any_world_length(&self, ids: &[MaterialId]) -> bool {
+        let set = self.world_lengths.lock().unwrap();
+        ids.iter().any(|id| set.contains(&id.0))
     }
 
     pub(crate) fn alloc(&self) -> Result<MaterialId> {
@@ -388,6 +401,7 @@ impl MaterialTable {
     pub(crate) fn free(&self, id: MaterialId) {
         self.extended.lock().unwrap().remove(&id.0);
         self.walking.lock().unwrap().remove(&id.0);
+        self.world_lengths.lock().unwrap().remove(&id.0);
         self.ids.lock().unwrap().free(id.0, 1);
     }
 }
@@ -411,7 +425,8 @@ impl MaterialWriter<'_> {
 
     /// Replaces material `id` from this frame on. Its triangles stay as opaque or
     /// micromapped in traversal as their mount cooked them: coverage that changes at run time
-    /// goes through a linked surface's `coverage`.
+    /// goes through a linked surface's `coverage`. A subdivision copy keeps last frame's positions
+    /// by whether its materials displaced by a world length when it was set.
     pub fn update(&mut self, id: MaterialId, m: &MaterialGpu) -> Result<()> {
         assert!(
             id.0 < self.table.capacity,

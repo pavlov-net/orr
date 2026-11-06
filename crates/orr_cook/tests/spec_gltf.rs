@@ -1385,6 +1385,39 @@ fn displacement_reads_the_draft_form() {
     assert!(baked("not-a-material", "5").is_err());
 }
 
+/// A height in mesh space moves a node's vertices by its scale, so a mesh left undisplaced bounds
+/// that much: clusters reach twice the highest texel's height under a z scale of 2, and their least
+/// height stays the lowest texel's, which a run time displacement keeps.
+#[test]
+fn clusters_bound_a_height_under_their_nodes_scale() {
+    let path = dir("displaced-bounds").join("displaced.glb");
+    let mut g = Glb::default();
+    let pa = g.floats(&QUAD, "VEC3");
+    let ua = g.floats(&QUAD_UV, "VEC2");
+    let ia = g.indices(&QUAD_INDICES);
+    let img = g.image(&png(4, |x, _| [(40 + x * 60) as u8, 0, 0, 255]));
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0,"scale":[1.0,1.0,2.0]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"TEXCOORD_0":{ua}}},"indices":{ia},"material":0}}]}}],
+"materials":[{{"extensions":{{"KHR_materials_displacement":{{"displacementGeometryTexture":{{"index":0}},"displacementGeometryFactor":0.25}}}}}}],
+"textures":[{{"source":0}}],"images":[{{"bufferView":{img},"mimeType":"image/png"}}]"#
+        ),
+    );
+    let a = cooked(&path).0;
+    let bounds = per_triangle(&a, "g/mesh", |_, c, _| {
+        [c.displacement_min, c.displacement_max].map(|b| half::f16::from_bits(b).to_f32())
+    });
+    let lowest = bounds.iter().map(|b| b[0]).fold(f32::MAX, f32::min);
+    let highest = bounds.iter().map(|b| b[1]).fold(f32::MIN, f32::max);
+    assert!((lowest - 0.25 * 40.0 / 255.0).abs() < 1e-3, "{lowest}");
+    assert!(
+        (highest - 2.0 * 0.25 * 220.0 / 255.0).abs() < 1e-3,
+        "{highest}"
+    );
+}
+
 /// KHR_materials_iridescence: "`iridescenceFactor` is multiplied with the red channel of
 /// `iridescenceTexture` to control the overall strength".
 #[test]

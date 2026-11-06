@@ -11,7 +11,7 @@ use orr_math::{DVec3, IVec3};
 use crate::decals::{Decal, DecalId, Listing, decal_gpu, listing, table_sizes};
 use crate::emissive::{ModelEmission, Run, Runs};
 use crate::lights::{EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, Light, LightId, light_gpu};
-use crate::material::MaterialId;
+use crate::material::{MaterialId, MaterialTable};
 use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::mount::{InstancePage, Mounts, PageId};
@@ -775,6 +775,7 @@ pub struct SceneWriter<'f> {
     pub(crate) cages: &'f [Option<ModelCage>],
     pub(crate) patterns: &'f Patterns,
     pub(crate) mounts: &'f Mounts,
+    pub(crate) materials: &'f MaterialTable,
 }
 
 impl Drop for SceneWriter<'_> {
@@ -1896,7 +1897,8 @@ impl<'f> SceneWriter<'f> {
             materials,
             transform: d.transform,
             origin: d.origin,
-            previous_positions: d.palette.is_some(),
+            // A world length is another entry space length once the placement's scale changes.
+            previous_positions: d.palette.is_some() || self.materials.any_world_length(materials),
             vertex_user: false,
             flags: d.flags,
             user_tag: d.user_tag,
