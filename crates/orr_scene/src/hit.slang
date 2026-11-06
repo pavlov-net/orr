@@ -151,14 +151,14 @@ public bool strand_geometry(inout SurfaceInput i, ProducerBatch b, uint segment,
     float3 n_obj = swept_normal(g.a, g.b, g.ra, g.rb, object, u);
     if (previous)
         object += strand_motion(b, segment, u);
-    float mirror = determinant(pl.linear) < 0.0 ? -1.0 : 1.0;
-    float3 n = safe_normalize(mul(cofactors(pl.linear), n_obj) * mirror);
-    float3 axis = mul(pl.linear, g.b - g.a);
-    float3 t = safe_normalize(axis, perpendicular(n));
+    float3 n = unit_direction(mul(normal_matrix(pl.linear), n_obj));
+    float size = unit_factor(pl.linear);
+    float3 axis = mul(pl.linear * size, g.b - g.a);
+    float3 t = unit_direction(axis, perpendicular(n));
     float2 uv0 = producer_uv(b.attrs[g.vertex]);
     float2 uv1 = producer_uv(b.attrs[g.vertex + 1]);
     i.uv[0].uv = lerp(uv0, uv1, u);
-    i.uv[0].dx = (uv1 - uv0) * (width / max(length(axis), 1e-30));
+    i.uv[0].dx = (uv1 - uv0) * (width / max(unit_length(axis), 1e-30)) * size;
     i.uv[0].dy = float2(0.0);
     i.uv[0].inward = float2(0.0);
     i.uv[1] = i.uv[0];
@@ -298,8 +298,13 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
     VertexAttributes a1 = t.attributes[1];
     VertexAttributes a2 = t.attributes[2];
     float3 w = float3(1.0 - b.x - b.y, b.x, b.y);
-    float3 e1 = mul(pl.linear, t.position[1] - t.position[0]);
-    float3 e2 = mul(pl.linear, t.position[2] - t.position[0]);
+    // Only the directions of what the placement gives are read, so its size stays out of them.
+    float3x3 unit = unit_linear(pl.linear);
+    float3 e1 = mul(unit, t.position[1] - t.position[0]);
+    float3 e2 = mul(unit, t.position[2] - t.position[0]);
+    float size = unit_factor(max(abs(e1), abs(e2)));
+    e1 *= size;
+    e2 *= size;
 
     for (uint s = 0; s < 2; s++)
     {
@@ -311,16 +316,15 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
         i.uv[s].dy = (by.x * along1 + by.y * along2) * bias;
     }
 
-    float det = determinant(pl.linear);
-    float mirror = det < 0.0 ? -1.0 : 1.0;
-    float3 ng = safe_normalize(cross(e1, e2)) * mirror;
-    float3x3 normal_matrix = cofactors(pl.linear);
+    float3x3 normals = normal_matrix(pl.linear);
+    float mirror = linear_mirror(pl.linear);
+    float3 ng = unit_direction(cross(e1, e2)) * mirror;
     float3 face = cross(t.position[1] - t.position[0], t.position[2] - t.position[0]);
     float3 n_obj = safe_normalize(w.x * a0.normal + w.y * a1.normal + w.z * a2.normal, safe_normalize(face));
     // Placed per vertex and interpolated as they stand, the frame normal maps are baked in.
     float3 frame = float3(0.0);
     for (uint c = 0; c < 3; c++)
-        frame += w[c] * safe_normalize(mul(normal_matrix, t.attributes[c].normal) * mirror, ng);
+        frame += w[c] * unit_direction(mul(normals, t.attributes[c].normal), ng);
     float3 n = safe_normalize(frame, ng);
     float4 tangent;
     uint frame_set = m.tangent_set;
@@ -328,7 +332,7 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
     {
         float3 tt = float3(0.0);
         for (uint c = 0; c < 3; c++)
-            tt += w[c] * safe_normalize(mul(pl.linear, t.attributes[c].tangent.xyz), float3(1, 0, 0));
+            tt += w[c] * unit_direction(mul(unit, t.attributes[c].tangent.xyz), float3(1, 0, 0));
         tangent = float4(tt, a0.tangent.w * mirror);
     }
     else
@@ -702,6 +706,10 @@ void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bo
     // along it onto the triangle's plane.
     float3 e1 = mul(pl.linear, corners.position[1] - corners.position[0]);
     float3 e2 = mul(pl.linear, corners.position[2] - corners.position[0]);
+    // At unit size, since the steps multiply four edge lengths.
+    float size = unit_factor(max(abs(e1), abs(e2)));
+    e1 *= size;
+    e2 *= size;
     float3 n = cross(e1, e2);
     float nn = max(dot(n, n), 1e-30);
     float3 across = cross(d, n);
@@ -716,8 +724,8 @@ void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bo
     dn = abs(dn) < 1e-6 * sqrt(nn) ? (dn < 0.0 ? -1e-6 : 1e-6) * sqrt(nn) : dn;
     float3 yp = y - d * (dot(y, n) / dn);
     float w = context.cone_width;
-    float2 bx = float2(dot(cross(x * w, e2), n), dot(cross(e1, x * w), n)) / nn;
-    float2 by = float2(dot(cross(yp * w, e2), n), dot(cross(e1, yp * w), n)) / nn;
+    float2 bx = float2(dot(cross(x * w, e2), n), dot(cross(e1, x * w), n)) / nn * size;
+    float2 by = float2(dot(cross(yp * w, e2), n), dot(cross(e1, yp * w), n)) / nn * size;
 
     triangle_geometry(i, corners, attributes, m, pl, bary, bx, by, d, bias);
     i.primitive = primitive;
@@ -846,9 +854,11 @@ bool particle_candidate(SceneRoot* s, uint entry, uint cluster_id, uint primitiv
     if (!producer_placement(s, p, false, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))
         return false;
     Corners t = producer_triangle(b, k, primitive, false).corners;
-    float3 e1 = mul(pl.linear, t.position[1] - t.position[0]);
-    float3 e2 = mul(pl.linear, t.position[2] - t.position[0]);
-    normal = safe_normalize(cross(e1, e2), float3(0.0, 0.0, 1.0));
+    float3x3 unit = unit_linear(pl.linear);
+    float3 e1 = mul(unit, t.position[1] - t.position[0]);
+    float3 e2 = mul(unit, t.position[2] - t.position[0]);
+    float size = unit_factor(max(abs(e1), abs(e2)));
+    normal = unit_direction(cross(e1 * size, e2 * size)) * linear_mirror(pl.linear);
     float2 uv = (1.0 - bary.x - bary.y) * t.attributes[0].uv[0] + bary.x * t.attributes[1].uv[0] + bary.y * t.attributes[2].uv[0];
     i = particle_input(s, material, uv);
     i.uv[0].inward = (t.attributes[0].uv[0] + t.attributes[1].uv[0] + t.attributes[2].uv[0]) / 3.0 - uv;

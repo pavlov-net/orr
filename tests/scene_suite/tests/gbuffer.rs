@@ -48,7 +48,9 @@ use orr_scene::{
     TextureFilter, TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId, VisibleCluster,
 };
 use orr_scene::{Budgets, InstancePageRef, PageId};
-use scene_suite::shaders::{codec, fracture, pose, skin_pose, surface_at, surface_params, trace};
+use scene_suite::shaders::{
+    codec, fracture, pose, skin_pose, surface_at, surface_params, trace, triangle_at,
+};
 use scene_suite::{Workers, linked, pipeline};
 
 const EXTENT: [u32; 2] = [160, 96];
@@ -7871,6 +7873,66 @@ fn models_state_their_specular_and_tint() {
         "glTF's base color tints",
     );
     near(out[2].transmission_color, rec2020([1.0; 3]), "no tint");
+    assert_clean();
+}
+
+/// A hit's vertex color weighs each corner by its barycentric, and its normals stay on the side
+/// a mirrored placement puts them, at sizes whose determinant is outside a float's range and on
+/// triangles whose area is.
+#[test]
+fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
+    use orr_pack::material::slot;
+    let _guard = serial();
+    let d = device();
+    let upload = |bytes: &[u8], name| {
+        let mut a = d
+            .gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, name)
+            .unwrap();
+        a.as_mut_slice().unwrap().copy_from_slice(bytes);
+        a
+    };
+    let record = MaterialGpu::new(&Material::default(), &[BoundTexture::NONE; slot::COUNT]);
+    let material = upload(bytemuck::bytes_of(&record), "material");
+    let corners = [
+        [1.0, 0.0, 0.0, 0.25],
+        [0.0, 1.0, 0.0, 0.5],
+        [0.0, 0.0, 1.0, 1.0],
+    ];
+    let p = pipeline(&triangle_at::MODULE, "main");
+    let render = d.queue(QueueKind::Render).unwrap();
+    for (size, edge) in [
+        (1.0, 1.0),
+        (1e-16, 1.0),
+        (1e-25, 1.0),
+        (1e25, 1.0),
+        (1e12, 1e-12),
+    ] {
+        let out = d
+            .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, 3, "out")
+            .unwrap();
+        let root = upload(
+            bytemuck::bytes_of(&triangle_at::Root {
+                material: material.gpu().cast(),
+                out: out.gpu().cast(),
+                color0: corners[0],
+                color1: corners[1],
+                color2: corners[2],
+                point: [0.25, 0.5, size, edge],
+            }),
+            "root",
+        );
+        let mut list = render.command_list().unwrap();
+        list.dispatch(&p, root.gpu().cast::<triangle_at::Root>(), [1, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+        wait(render.submit(vec![list], &[]).unwrap());
+        let [color, geometric, normal] = out.as_slice().unwrap()[..] else {
+            panic!("three rows");
+        };
+        assert_eq!(color, [0.25, 0.25, 0.5, 0.6875], "{size}");
+        let up = |n: [f32; 4]| Vec4::from(n).abs_diff_eq(Vec4::Z, 1e-5);
+        assert!(up(geometric), "{size}: {geometric:?}");
+        assert!(up(normal), "{size}: {normal:?}");
+    }
     assert_clean();
 }
 

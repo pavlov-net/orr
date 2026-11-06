@@ -102,9 +102,7 @@ public float3 transform_vector(float3x4 m, float3 v)
 // linear part; correct under non-uniform scale and mirroring.
 public float3 transform_normal(float3x4 m, float3 n)
 {
-    float3x3 c = cofactors(affine_linear(m));
-    float det = dot(m[0].xyz, c[0]);
-    return safe_normalize(mul(c, n) * (det < 0.0 ? -1.0 : 1.0));
+    return unit_direction(mul(normal_matrix(affine_linear(m)), n));
 }
 
 // a applied after b.
@@ -124,14 +122,32 @@ public float3x3 linear_inverse(float3x3 m)
     return transpose(c) * (1.0 / dot(n[0], c[0])) * k;
 }
 
-// The power of two that takes the largest entry of `m` to between 1 and 4. It is exact and stays
+// The power of two that takes the largest entry of `v` to between 1 and 4. It is exact and stays
 // normal at both ends of the float range, where the entry's reciprocal is subnormal and shaders
 // may flush it to 0.
-float unit_factor(float3x3 m)
+public float unit_factor(float3 v)
 {
-    float3 big = max(abs(m[0]), max(abs(m[1]), abs(m[2])));
-    uint exponent = asuint(max_component(big)) & 0x7f800000u;
+    uint exponent = asuint(max_component(abs(v))) & 0x7f800000u;
     return asfloat(0x7f000000u - min(exponent, 0x7e800000u));
+}
+
+public float unit_factor(float3x3 m)
+{
+    return unit_factor(max(abs(m[0]), max(abs(m[1]), abs(m[2]))));
+}
+
+// The direction of `v` at any size, where `safe_normalize` takes a small one for zero, and
+// `fallback` where `v` is 0 or not finite.
+public float3 unit_direction(float3 v, float3 fallback = float3(0, 0, 1))
+{
+    return safe_normalize(v * unit_factor(v), fallback);
+}
+
+// The length of `v`, whose square may not fit a float.
+public float unit_length(float3 v)
+{
+    float k = unit_factor(v);
+    return length(v * k) / k;
 }
 
 // A bound on the most `m` stretches a length, its largest singular value, tight when its columns
@@ -149,5 +165,26 @@ public float largest_scale(float3x3 m)
 public float3x3 cofactors(float3x3 m)
 {
     return float3x3(cross(m[1], m[2]), cross(m[2], m[0]), cross(m[0], m[1]));
+}
+
+// `m` at unit size, for directions and handedness: the products of a matrix of small entries
+// underflow, and those of large ones overflow, long before the matrix stops inverting.
+public float3x3 unit_linear(float3x3 m)
+{
+    return m * unit_factor(m);
+}
+
+// -1 where `m` mirrors, else 1.
+public float linear_mirror(float3x3 m)
+{
+    float3x3 n = unit_linear(m);
+    return dot(n[0], cross(n[1], n[2])) < 0.0 ? -1.0 : 1.0;
+}
+
+// The inverse transpose of `m` up to a positive scale, which takes a normal through it, mirrored
+// or not.
+public float3x3 normal_matrix(float3x3 m)
+{
+    return cofactors(unit_linear(m)) * linear_mirror(m);
 }
 

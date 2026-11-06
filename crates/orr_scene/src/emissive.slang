@@ -2,6 +2,7 @@
 // render space. Runs after scene compute, so it sees this frame's transforms and
 // producer clusters.
 #include "orr_root.h"
+import orr_shaders.math;
 import orr_scene.lights;
 import orr_scene.material;
 import orr_scene.producer;
@@ -28,7 +29,7 @@ float3x3 linear_part(SceneRoot* s, uint group, uint index)
 }
 
 // One thread per instance span entry. Area scales by |det|^(2/3), exact under uniform
-// scale.
+// scale, taken at unit size since a small transform's determinant underflows first.
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
 void instances(uint3 id: SV_DispatchThreadID)
@@ -51,7 +52,8 @@ void instances(uint3 id: SV_DispatchThreadID)
             ? e.material
             : s.material_sets[inst.material_base + variant_set * e.sections + e.section];
         float3x3 m = linear_part(s, inst.group, inst.group_index);
-        area = e.model_area * pow(abs(determinant(m)), 2.0 / 3.0);
+        float k = unit_factor(m);
+        area = e.model_area * pow(abs(determinant(m * k)), 2.0 / 3.0) / k / k;
         // Chain steps past the first add no light; a fading copy shows its model in part.
         area *= step_presence(s.slot_state[e.source], 0);
         power = material_light_emission(s.materials + material) * area;
@@ -94,7 +96,10 @@ void producers(uint3 entry: SV_GroupID, uint3 thread: SV_GroupThreadID)
         {
             float3 p0, p1, p2;
             cluster_triangle(b, k, i, p0, p1, p2);
-            a += 0.5 * length(cross(mul(m, p1 - p0), mul(m, p2 - p0)));
+            float3 e1 = mul(m, p1 - p0);
+            float3 e2 = mul(m, p2 - p0);
+            float size = unit_factor(max(abs(e1), abs(e2)));
+            a += 0.5 * unit_length(cross(e1 * size, e2 * size)) / size / size;
         }
         sum += float4(l * a, a);
         count++;

@@ -105,6 +105,22 @@ fn quaternions_and_affines_match_glam() {
     }
 }
 
+/// A determinant of a small transform underflows, and of a large one overflows, far inside the
+/// sizes an instance may have.
+#[test]
+fn transform_normal_keeps_a_mirror_at_any_size() {
+    for s in [1e-30, 1e-16, 1.0, 1e13, 1e30] {
+        let mut m = [0.0; 12];
+        [m[0], m[5], m[10]] = [-s, s, s];
+        let n = transform_normal(m, [1.0, 0.0, 0.0]);
+        assert!(close(&n, &[-1.0, 0.0, 0.0], 1e-5), "{s}: {n:?}");
+    }
+    let mut stretched = [0.0; 12];
+    [stretched[0], stretched[5], stretched[10]] = [1e18, 1.0, 1.0];
+    let n = transform_normal(stretched, [1.0, 0.0, 0.0]);
+    assert!(close(&n, &[1.0, 0.0, 0.0], 1e-5), "{n:?}");
+}
+
 /// The largest singular value of `m`, by power iteration on `m^T m`.
 fn largest_singular_value(m: Mat3) -> f64 {
     let m = m.as_dmat3();

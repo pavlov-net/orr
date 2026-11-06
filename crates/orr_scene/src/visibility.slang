@@ -297,12 +297,16 @@ public float3 render_direction(ViewConstants* v, float3 d)
 // corners `q`: the weights of corners 1 and 2 in xy, the distance along `d` in z.
 float3 ray_barycentrics(float3 d, float3 q0, float3 e1, float3 e2)
 {
+    // At unit size, since the determinant multiplies two edge lengths.
+    float size = unit_factor(max(abs(e1), abs(e2)));
+    e1 *= size;
+    e2 *= size;
     float3 pv = cross(d, e2);
     float det = dot(e1, pv);
     float inv = abs(det) > 1e-30 ? 1.0 / det : 0.0;
     float3 tv = -q0;
     float3 qv = cross(tv, e1);
-    return float3(dot(tv, pv), dot(d, qv), dot(e2, qv)) * inv;
+    return float3(dot(tv, pv) * size, dot(d, qv) * size, dot(e2, qv)) * inv;
 }
 
 // The pixel ray's hit on a visible triangle, and the surface input at it.

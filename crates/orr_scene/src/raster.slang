@@ -56,6 +56,7 @@ struct ClusterDraw
     uint count;
     uint split;          // first alpha-tested triangle
     bool single_sided;
+    float mirror;        // -1 where the placement mirrors, else 1
     bool by_size;        // VISIBLE_BY_SIZE
 }
 
@@ -106,6 +107,7 @@ ClusterDraw cluster_draw(uint visible, bool alpha)
     d.count = alpha ? d.tri_count - d.split : d.split;
     d.single_sided = !d.strands && (m.flags & MATERIAL_DOUBLE_SIDED) == 0;
     visible_placement(s, root.view, d.vc, false, d.p);
+    d.mirror = linear_mirror(d.p.linear);
     return d;
 }
 
@@ -181,9 +183,14 @@ bool left_to_software(uint3 k)
 // Whether a single-sided material shows the back of the triangle with corners `k`.
 bool back_facing(ClusterDraw d, uint3 k)
 {
+    if (!d.single_sided)
+        return false;
     float3 q0 = corners[k.x];
-    float3 n = cross(corners[k.y] - q0, corners[k.z] - q0) * sign(determinant(d.p.linear));
-    return d.single_sided && dot(n, q0) > 0.0;
+    float3 e1 = corners[k.y] - q0;
+    float3 e2 = corners[k.z] - q0;
+    float size = unit_factor(max(abs(e1), abs(e2)));
+    float3 n = cross(e1 * size, e2 * size) * d.mirror;
+    return dot(n * unit_factor(n), q0 * unit_factor(q0)) > 0.0;
 }
 
 // Triangle `first + t` of the draw, culled when it shows its back.
