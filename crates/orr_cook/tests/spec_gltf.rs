@@ -1320,6 +1320,71 @@ fn a_split_point_takes_the_whole_length_of_its_normal() {
     assert!((top - 1.5).abs() < 5e-3, "{top}");
 }
 
+/// KhronosGroup/glTF issue 948, the draft of `KHR_materials_displacement`: the fields under
+/// `displacementGeometry`, the texture an index. "If no texture is present, the value is take as
+/// it is. Finally, the offset is added".
+#[test]
+fn displacement_reads_the_draft_form() {
+    let baked = |name: &str, material: &str| {
+        let path = dir(&format!("displacement-{name}")).join("displaced.glb");
+        let mut g = Glb::default();
+        let pa = g.floats(&QUAD, "VEC3");
+        let ua = g.floats(&QUAD_UV, "VEC2");
+        let ia = g.indices(&QUAD_INDICES);
+        let img = g.image(&png(4, |_, _| [255, 255, 255, 255]));
+        g.write(
+            &path,
+            &format!(
+                r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"TEXCOORD_0":{ua}}},"indices":{ia},"material":0}}]}}],
+"materials":[{material}],
+"textures":[{{"source":0}}],"images":[{{"bufferView":{img},"mimeType":"image/png"}}]"#
+            ),
+        );
+        let mut s = GltfSettings::default();
+        s.mesh.displace_static = Some(orr_cook::StaticDisplacement {
+            max_edge: 2.0,
+            target_error: 0.001,
+        });
+        cook(&path, s).map(|(a, _)| {
+            let corners =
+                per_triangle(&a, "g/mesh", |view, c, t| t.map(|v| view.position(c, v)[2]));
+            corners.into_iter().flatten().collect::<Vec<_>>()
+        })
+    };
+    let nested = r#"{"displacementGeometry":{"displacementGeometryFactor":0.5,
+        "displacementGeometryTexture":0,"displacementGeometryOffset":0.25}}"#;
+    let extension = r#"{"extensions":{"KHR_materials_displacement":{"displacementGeometry":{
+        "displacementGeometryFactor":0.5,"displacementGeometryTexture":0,
+        "displacementGeometryOffset":0.25}}}}"#;
+    let flat = r#"{"extensions":{"KHR_materials_displacement":{
+        "displacementGeometryFactor":0.5,"displacementGeometryTexture":{"index":0},
+        "displacementGeometryOffset":0.25}}}"#;
+    let constant = r#"{"displacementGeometry":{"displacementGeometryFactor":0.5,
+        "displacementGeometryOffset":0.25}}"#;
+    let split = r#"{"displacementGeometry":{"displacementGeometryTexture":0},
+        "extensions":{"KHR_materials_displacement":{"displacementGeometryFactor":0.5,
+        "displacementGeometryOffset":0.25}}}"#;
+    let offset = r#"{"displacementGeometry":{"displacementGeometryOffset":0.25}}"#;
+    let empty = r#"{"extensions":{"KHR_materials_displacement":{}}}"#;
+    for (name, material, height) in [
+        ("draft", nested, 0.75),
+        ("draft-extension", extension, 0.75),
+        ("flat", flat, 0.75),
+        ("draft-constant", constant, 0.75),
+        ("split", split, 0.75),
+        ("offset", offset, 0.25),
+        ("empty", empty, 0.0),
+    ] {
+        let heights = baked(name, material).unwrap();
+        assert!(
+            heights.iter().all(|z| (z - height).abs() < 1e-3),
+            "{name}: {heights:?}"
+        );
+    }
+    assert!(baked("not-a-material", "5").is_err());
+}
+
 /// KHR_materials_iridescence: "`iridescenceFactor` is multiplied with the red channel of
 /// `iridescenceTexture` to control the overall strength".
 #[test]

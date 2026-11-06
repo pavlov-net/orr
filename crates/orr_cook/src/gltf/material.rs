@@ -20,7 +20,7 @@
 //! | transmission without `KHR_materials_volume`, or with `thicknessFactor` 0 | `thin_walled` |
 //! | `KHR_materials_diffuse_transmission` `diffuseTransmissionFactor`, `diffuseTransmissionColorFactor`, `diffuseTransmissionTexture` (A), `diffuseTransmissionColorTexture` | `subsurface_weight`, `subsurface_color`, their textures; thin-walled (approximate: glTF's split of diffuse transmission and volume has no OpenPBR equivalent) |
 //! | `KHR_materials_dispersion` `dispersion` > 0 | `transmission_dispersion_scale` 1, `transmission_dispersion_abbe_number` 20 / dispersion |
-//! | `KHR_materials_displacement` (unofficial) `displacementGeometryFactor`, `displacementGeometryOffset`, `displacementGeometryTexture` (R) | `displacement_scale`, `displacement_offset`, the displacement texture; declared range from offset to offset + factor |
+//! | `KHR_materials_displacement` (unofficial, the draft of KhronosGroup/glTF issue 948, in either of its forms) `displacementGeometryFactor`, `displacementGeometryOffset`, `displacementGeometryTexture` (R) | `displacement_scale`, `displacement_offset`, the displacement texture; declared range from offset to offset + factor. Without a texture "the value is take as it is": factor, 0 when absent, plus offset everywhere, through a solid image |
 //!
 //! `KHR_materials_volume` `thicknessTexture` stays unread: "Ray-tracers should ignore the
 //! thickness texture and use the actual, ray-traced distance instead." Transmission scatter,
@@ -154,19 +154,28 @@ pub(super) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
             out.transmission_dispersion_abbe_number = 20.0 / d;
         }
     }
-    if let Some(e) = ext("KHR_materials_displacement")
-        && e.get("displacementGeometryTexture").is_some()
-    {
-        let (factor, offset) = (
-            num(e, "displacementGeometryFactor", 1.0),
-            num(e, "displacementGeometryOffset", 0.0),
-        );
-        out.displacement_scale = factor;
+    if let Some(e) = ext("KHR_materials_displacement") {
+        let (scale, offset) = match constant_height(e) {
+            Some(height) => (0.0, height),
+            None => (
+                num(e, "displacementGeometryFactor", 1.0),
+                num(e, "displacementGeometryOffset", 0.0),
+            ),
+        };
+        out.displacement_scale = scale;
         out.displacement_offset = offset;
-        out.displacement_min = offset.min(offset + factor);
-        out.displacement_max = offset.max(offset + factor);
+        out.displacement_min = offset.min(offset + scale);
+        out.displacement_max = offset.max(offset + scale);
     }
     out
+}
+
+/// The one height `e`, a material's displacement extension, states everywhere, if it has no
+/// texture. The factor's default of 1 scales a texture: without one, no factor is no value.
+fn constant_height(e: &Value) -> Option<f32> {
+    e.get("displacementGeometryTexture").is_none().then(|| {
+        num(e, "displacementGeometryFactor", 0.0) + num(e, "displacementGeometryOffset", 0.0)
+    })
 }
 
 /// `iridescenceThicknessMinimum` and `iridescenceThicknessMaximum`, in nanometers.
@@ -376,11 +385,29 @@ pub(super) fn textures(
             0,
         )?
         .map(color),
-        displacement: info(
-            "KHR_materials_displacement",
-            "displacementGeometryTexture",
-            0,
-        )?,
+        displacement: match extension(json, m, "KHR_materials_displacement") {
+            Some(e) if constant_height(e).is_some_and(|h| h != 0.0) => Some(TexRef {
+                image: doc.images().len(),
+                rules: ImageRules::Gltf,
+                channel: 0,
+                rg_channel: None,
+                input: None,
+                uv_set: 0,
+                wrap: [Wrap::Repeat; 2],
+                file_wrap: [false; 2],
+                filter: 0,
+                outside: [0.0; 4],
+                missing: [0.0; 4],
+                uv: [0.0; 6],
+                color: ImageColor::Data,
+                remap: None,
+            }),
+            _ => info(
+                "KHR_materials_displacement",
+                "displacementGeometryTexture",
+                0,
+            )?,
+        },
         coat_normal,
         more,
     })

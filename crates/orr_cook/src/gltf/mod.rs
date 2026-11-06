@@ -668,6 +668,11 @@ fn images(asset: &str, src: &Document, dir: &Path) -> Result<Vec<ImageFile>> {
             data,
         });
     }
+    // What a constant displacement reads, past the document's images.
+    out.push(ImageFile {
+        name: "constant displacement".into(),
+        data: ImageData::Solid([0.0; 4]),
+    });
     Ok(out)
 }
 

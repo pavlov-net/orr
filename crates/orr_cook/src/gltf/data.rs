@@ -25,7 +25,7 @@ use gltf::buffer::Source as BufferSource;
 use meshopt::ffi;
 use orr_pack::Hash32;
 use percent_encoding::percent_decode_str;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Extensions the cook reads itself, removed from `extensionsRequired` before validation.
 const COOK_EXTENSIONS: &[&str] = &[
@@ -87,6 +87,42 @@ fn check_version(asset: &Value) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Moves `KHR_materials_displacement` as KhronosGroup/glTF issue 948 drafted it into the form the
+/// cook reads: the fields in a `displacementGeometry` object, on the material as the draft's
+/// example has it or in the extension, and the texture an index, not a textureInfo. A field the
+/// extension states itself stands, and what isn't a material is left for parsing to refuse.
+fn flatten_displacement(json: &mut Value) {
+    let Some(Value::Array(materials)) = json.get_mut("materials") else {
+        return;
+    };
+    let (name, path) = (
+        "KHR_materials_displacement",
+        "/extensions/KHR_materials_displacement",
+    );
+    let draft = "displacementGeometry";
+    let object = |v: Option<Value>| match v {
+        Some(Value::Object(o)) => o,
+        _ => Map::new(),
+    };
+    for m in materials.iter_mut().filter(|m| m.is_object()) {
+        let mut fields = object(m.as_object_mut().and_then(|o| o.remove(draft)));
+        if let Some(e) = m.pointer_mut(path).and_then(Value::as_object_mut) {
+            fields.extend(object(e.remove(draft)));
+            fields.extend(std::mem::take(e));
+        }
+        let holds = |e: &Value| e.is_object() || e.is_null();
+        if !fields.is_empty() && m.get("extensions").is_none_or(holds) {
+            m["extensions"][name] = fields.into();
+        }
+        let texture = m
+            .pointer_mut(path)
+            .and_then(|e| e.get_mut("displacementGeometryTexture"));
+        if let Some(t) = texture.filter(|t| t.is_u64()) {
+            *t = serde_json::json!({ "index": t.take() });
+        }
+    }
 }
 
 /// Each morph target of the document holds accessors of it.
@@ -193,6 +229,7 @@ pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
         }
     }
     check_images(&mut json)?;
+    flatten_displacement(&mut json);
     let root: gltf::json::Root = serde_json::from_value(json.clone()).map_err(|e| e.to_string())?;
     validate(&root)?;
     let doc = gltf::Document::from_json_without_validation(root);
