@@ -706,6 +706,7 @@ impl<'s> Importer<'s> {
             used.dedup();
             let r = self.reader(&prim);
             let mut primvars: HashMap<String, Option<Primvar>> = HashMap::new();
+            let mut read_primvars: HashMap<String, Option<Primvar>> = HashMap::new();
             for &m in &used {
                 let frame = &self.frames[m];
                 for name in [&frame.tangents, &frame.binormals] {
@@ -719,9 +720,19 @@ impl<'s> Importer<'s> {
                     primvars.insert(name.clone(), r.primvar(name, 2, None)?);
                 }
                 for read in &frame.vertex {
-                    if !primvars.contains_key(&read.name) {
-                        let width = usize::from(read.width);
-                        primvars.insert(read.name.clone(), r.primvar(&read.name, width, None)?);
+                    if !read_primvars.contains_key(&read.name) {
+                        let held = r.primvar(&read.name, usize::from(read.width), None)?;
+                        let missing = held
+                            .as_ref()
+                            .map_or(0, |p| p.missing(mesh.domain(p.interp)));
+                        if missing > 0 && !as_cage {
+                            self.warnings.push(format!(
+                                "{path}: primvar {} holds no value for {missing} elements of the \
+                                 mesh; its reader's fallback stands in for them",
+                                read.name
+                            ));
+                        }
+                        read_primvars.insert(read.name.clone(), held);
                     }
                 }
                 let reads = self.materials[m].tangent_set().is_some();
@@ -798,14 +809,11 @@ impl<'s> Importer<'s> {
             let color = |face: usize, corner: usize, point: usize| {
                 let mut c = [1.0; 4];
                 for read in &self.frames[faces[face]].vertex {
-                    let held = primvars[&read.name].as_ref();
-                    let Some(v) = held.and_then(|p| p.at(point, face, corner)) else {
-                        continue;
-                    };
-                    let held = v.iter().skip(usize::from(read.offset));
-                    for (k, &x) in held.take(usize::from(read.width)).enumerate() {
-                        let x = x as f32;
-                        c[usize::from(read.first) + k] = if read.inverted { 1.0 - x } else { x };
+                    let held = read_primvars[&read.name].as_ref();
+                    let v = held.and_then(|p| p.at(point, face, corner));
+                    for k in 0..usize::from(read.width) {
+                        let x = v.map_or(read.fallback[k], |v| v[k] as f32);
+                        c[usize::from(read.first) + k] = x;
                     }
                 }
                 c

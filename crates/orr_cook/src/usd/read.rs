@@ -521,6 +521,11 @@ impl Primvar {
         self.values.get(i * self.width..(i + 1) * self.width)
     }
 
+    /// How many of the `domain` elements hold no value.
+    pub(super) fn missing(&self, domain: usize) -> usize {
+        (0..domain).filter(|&i| self.get(i).is_none()).count()
+    }
+
     /// The element for a corner: `point`, `face` and `corner` index into each domain.
     pub(super) fn at(&self, point: usize, face: usize, corner: usize) -> Option<&[f64]> {
         self.get(match self.interp {

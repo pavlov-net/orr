@@ -1378,10 +1378,80 @@ fn varying_primvars_read_through_the_vertex_stream() {
     assert_eq!(m.base_color, [1.0; 3]);
     assert_eq!(m.textures[slot::BASE_COLOR].vertex, 1);
     assert_eq!(m.textures[slot::TRANSMISSION].vertex, 4);
+    assert_ne!(m.textures[slot::TRANSMISSION].vertex_complement, 0);
     let colors = vertex_colors(&a);
     assert_eq!(colors.len(), 3);
-    assert!(colors.contains(&[1.0, 0.0, 0.0, 0.75]), "{colors:?}");
-    assert!(colors.contains(&[0.0, 0.0, 1.0, 0.75]), "{colors:?}");
+    assert!(colors.contains(&[1.0, 0.0, 0.0, 0.25]), "{colors:?}");
+    assert!(colors.contains(&[0.0, 0.0, 1.0, 0.25]), "{colors:?}");
+}
+
+/// PS `UsdPrimvarReader`: "fallback value to be returned if geometry fetch failed", which holds
+/// for an element a short array doesn't reach as for a primvar the mesh doesn't have, and opacity
+/// reads it as it reads any other value.
+#[test]
+fn a_short_primvar_reads_the_readers_fallback() {
+    let d = dir("reader-short");
+    let inputs = "color3f inputs:diffuseColor.connect = </M/C.outputs:result>
+        float inputs:opacity.connect = </M/O.outputs:result>";
+    let prims = r#"def Shader "C"
+    {
+        uniform token info:id = "UsdPrimvarReader_float3"
+        string inputs:varname = "tint"
+        float3 inputs:fallback = (0.5, 0.25, 0.125)
+        float3 outputs:result
+    }
+    def Shader "O"
+    {
+        uniform token info:id = "UsdPrimvarReader_float"
+        string inputs:varname = "see"
+        float inputs:fallback = 0.75
+        float outputs:result
+    }"#;
+    let mesh = r#"color3f[] primvars:tint = [(1, 0, 0)] (
+        interpolation = "vertex"
+    )
+    float[] primvars:see = [0.25] (
+        interpolation = "vertex"
+    )"#;
+    let stage = previewed(inputs, prims, mesh);
+    let (a, warnings) = cook_with_warnings(&d, &stage, Subdivision::Hull);
+    let colors = vertex_colors(&a);
+    assert!(colors.contains(&[1.0, 0.0, 0.0, 0.25]), "{colors:?}");
+    assert!(colors.contains(&[0.5, 0.25, 0.125, 0.75]), "{colors:?}");
+    let says = |name: &str| {
+        warnings
+            .iter()
+            .any(|w| w.contains(name) && w.contains("2 elements"))
+    };
+    assert!(says("primvar tint") && says("primvar see"), "{warnings:?}");
+}
+
+/// Two readers of one primvar each keep their own `fallback`.
+#[test]
+fn readers_of_a_primvar_keep_their_fallbacks() {
+    let reader = |name: &str, fallback: f32| {
+        format!(
+            r#"def Shader "{name}"
+    {{
+        uniform token info:id = "UsdPrimvarReader_float"
+        string inputs:varname = "w"
+        float inputs:fallback = {fallback}
+        float outputs:result
+    }}"#
+        )
+    };
+    let inputs = "float inputs:roughness.connect = </M/R.outputs:result>
+        float inputs:metallic.connect = </M/N.outputs:result>";
+    let prims = format!("{}\n{}", reader("R", 0.5), reader("N", 0.25));
+    let mesh = r#"float[] primvars:w = [1] (
+        interpolation = "vertex"
+    )"#;
+    let a = cook("reader-fallbacks", &previewed(inputs, &prims, mesh));
+    let m = material(&a);
+    assert_eq!(m.textures[slot::METALNESS].vertex, 1);
+    assert_eq!(m.textures[slot::ROUGHNESS].vertex, 2);
+    let colors = vertex_colors(&a);
+    assert!(colors.contains(&[0.25, 0.5, 1.0, 1.0]), "{colors:?}");
 }
 
 /// MaterialX `geomcolor`: `index` is the "index of the geometric color", `HwGeomColorNode` reads

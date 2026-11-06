@@ -31,7 +31,7 @@ struct Params
     float tangent_angle;
     float coat_tangent_angle;
     uint flags;
-    uint pad;
+    float transmission_weight;
 }
 
 struct Root
@@ -75,6 +75,7 @@ void main(uint3 id: SV_DispatchThreadID)
     o.specular_color = p.specular_color;
     o.specular_weight = p.specular_weight;
     o.transmission_color = p.transmission_color;
+    o.transmission_weight = p.transmission_weight;
     o.specular_ior = p.specular_ior;
     o.coat_color = p.coat_color;
     o.coat_roughness = p.coat_roughness;

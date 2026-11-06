@@ -102,14 +102,16 @@ public float material_opacity(SurfaceInput i)
 }
 
 // What the vertex color stream multiplies `slot` by at the hit: from its first channel on in
-// xyz, 1 for a slot that reads none.
+// xyz, or the complement of that for a slot that reads one, and 1 for a slot that reads none.
 public float3 surface_vertex(SurfaceInput i, MaterialGpu* m, uint slot)
 {
     if ((m.flags & MATERIAL_VERTEX) == 0)
         return float3(1.0);
-    uint first = (m.samplers[slot].modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK;
+    uint modes = m.samplers[slot].modes;
+    uint first = (modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK;
     float4 c = i.vertex_color;
-    return first == 0 ? float3(1.0) : first == 1 ? c.xyz : first == 2 ? c.yzw : first == 3 ? float3(c.zw, 1.0) : float3(c.w, 1.0, 1.0);
+    float3 v = first == 0 ? float3(1.0) : first == 1 ? c.xyz : first == 2 ? c.yzw : first == 3 ? float3(c.zw, 1.0) : float3(c.w, 1.0, 1.0);
+    return ((modes >> TEXTURE_VERTEX_COMPLEMENT_SHIFT) & TEXTURE_VERTEX_COMPLEMENT_MASK) != 0 ? saturate(1.0 - v) : v;
 }
 
 // Scalar slot `slot` at the hit, times the vertex color stream's value for it.

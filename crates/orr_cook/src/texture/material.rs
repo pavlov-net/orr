@@ -1035,7 +1035,8 @@ fn bind(m: &mut Material, s: usize, t: Made, channel: usize, r: &TexRef) {
         wrap: t.wrap.map(Wrap::binding),
         filter: r.filter,
         vertex: m.textures[s].vertex,
-        _pad: [0; 2],
+        vertex_complement: m.textures[s].vertex_complement,
+        _pad: [0; 1],
         outside,
     };
     m.uv_transforms[s] = r.uv;

@@ -113,6 +113,9 @@ public static const uint TEXTURE_PRIMARIES_MASK = 3;
 // orr_pack::material::TextureBinding::vertex.
 public static const uint TEXTURE_VERTEX_SHIFT = 18;
 public static const uint TEXTURE_VERTEX_MASK = 7;
+// orr_pack::material::TextureBinding::vertex_complement.
+public static const uint TEXTURE_VERTEX_COMPLEMENT_SHIFT = 21;
+public static const uint TEXTURE_VERTEX_COMPLEMENT_MASK = 255;
 // orr_pack::tiles::HEADER_WORDS.
 public static const uint TEXTURE_TILES_HEADER = 16;
 

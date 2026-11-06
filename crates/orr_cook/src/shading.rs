@@ -218,10 +218,8 @@ pub(crate) struct VertexRead {
     /// The stream's channel of its first value.
     pub(crate) first: u8,
     pub(crate) width: u8,
-    /// The primvar's channel that `first` holds.
-    pub(crate) offset: u8,
-    /// The stream holds `1 - v`, for an input that reads the complement of it.
-    pub(crate) inverted: bool,
+    /// What the reader gives per channel where the mesh holds no value.
+    pub(crate) fallback: [f32; 4],
 }
 
 /// What mapping asks of the scene a material lands in.
@@ -866,30 +864,51 @@ impl Mapper<'_, '_> {
                 self.node(n).name
             )),
             Primvar::Varying(width) => {
-                let first = self.vertex_channels(n, name, width, 0, false)?;
+                let fallback = self.fallback(n, missing);
+                let first = self.vertex_channels(n, name, width, fallback)?;
                 Ok(Value::Vertex { first, width })
             }
         }
     }
 
-    /// The first channel of the vertex color stream that holds primvar `name` from channel
-    /// `offset` on.
+    /// What input `missing` of reader `n` gives each channel of an element a mesh doesn't hold:
+    /// a single number all of them, as a float `default` does for an image.
+    fn fallback(&mut self, n: usize, missing: &str) -> [f32; 4] {
+        match self.number(n, missing) {
+            Ok(None) => [0.0; 4],
+            Ok(Some(v)) if v.len() == 1 => [v[0]; 4],
+            Ok(Some(v)) => std::array::from_fn(|i| v.get(i).copied().unwrap_or(0.0)),
+            Err(e) => {
+                self.warnings.push(format!("{e}; 0 stands in for it"));
+                [0.0; 4]
+            }
+        }
+    }
+
+    /// The first channel of the vertex color stream that holds primvar `name`, with `fallback`
+    /// where the mesh holds none of it.
     fn vertex_channels(
         &mut self,
         n: usize,
         name: &str,
         width: u8,
-        offset: u8,
-        inverted: bool,
+        fallback: [f32; 4],
     ) -> Result<u8, String> {
-        let same = |r: &&VertexRead| {
-            r.name == name && r.offset == offset && r.width == width && r.inverted == inverted
-        };
-        if let Some(r) = self.vertex.iter().find(same) {
+        let same = |r: &&VertexRead| r.name == name && r.width == width;
+        let exact = |r: &&VertexRead| same(r) && r.fallback == fallback;
+        if let Some(r) = self.vertex.iter().find(exact) {
             return Ok(r.first);
         }
         let first = self.vertex.iter().map(|r| r.width).sum::<u8>();
         if first + width > 4 {
+            if let Some(first) = self.vertex.iter().find(same).map(|r| r.first) {
+                let reader = &self.node(n).name;
+                self.warnings.push(format!(
+                    "{reader}: no channel is left for its fallback, so {name} reads another \
+                     reader's"
+                ));
+                return Ok(first);
+            }
             return Err(format!(
                 "{}: {name} takes {width} channels of the vertex color stream's 4, {first} of \
                  which other primvars of the material hold",
@@ -900,8 +919,7 @@ impl Mapper<'_, '_> {
             name: name.to_string(),
             first,
             width,
-            offset,
-            inverted,
+            fallback,
         });
         Ok(first)
     }
@@ -1805,24 +1823,9 @@ impl Mapper<'_, '_> {
                 self.material.thin_walled = 1;
             }
             Some(Value::Vertex { first, .. }) => {
-                // The stream multiplies, so it holds the complement this input reads, in the
-                // channels no other input takes as they stand.
-                let held = |r: &&mut VertexRead| r.first <= first && first < r.first + r.width;
-                let Some(read) = self.vertex.iter_mut().find(held) else {
-                    return Err(format!(
-                        "{} input opacity: the complement of a stream no primvar names has no                          channel to hold it",
-                        self.node(n).name
-                    ));
-                };
-                let (name, offset) = (read.name.clone(), first - read.first);
-                let taken = self.material.textures.iter().any(|b| b.vertex == first + 1);
-                let first = if read.width == 1 && !taken {
-                    read.inverted = true;
-                    first
-                } else {
-                    self.vertex_channels(n, &name, 1, offset, true)?
-                };
-                self.material.textures[slot::TRANSMISSION].vertex = first + 1;
+                let binding = &mut self.material.textures[slot::TRANSMISSION];
+                binding.vertex = first + 1;
+                binding.vertex_complement = 1;
                 self.material.transmission_weight = 1.0;
                 self.material.thin_walled = 1;
             }

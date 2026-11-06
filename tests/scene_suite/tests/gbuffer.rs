@@ -8105,3 +8105,31 @@ fn vertex_colors_multiply_the_slots_that_read_them() {
     assert_eq!(out[1].metalness, 0.5, "a slot that names none reads none");
     assert_clean();
 }
+
+/// PS `opacity`: 1 is "fully opaque" and 0 "fully transparent", as a slot's complement of the
+/// stream reads it. A mesh without the stream reads 1, so it is opaque.
+#[test]
+fn a_complemented_slot_reads_the_stream_as_opacity() {
+    use orr_pack::material::{Material, slot};
+    let _guard = serial();
+    let d = device();
+    let mut m = Material {
+        transmission_weight: 1.0,
+        thin_walled: 1,
+        ..Material::default()
+    };
+    m.textures[slot::TRANSMISSION].vertex = 3;
+    m.textures[slot::TRANSMISSION].vertex_complement = 1;
+    let record = MaterialGpu::new(&m, &[BoundTexture::NONE; slot::COUNT]);
+    for (opacity, weight) in [
+        (0.25, 0.75),
+        (1.0, 0.0),
+        (0.0, 1.0),
+        (4.0, 0.0),
+        (-1.0, 1.0),
+    ] {
+        let out = surface_params(d, &[record], |_| {}, [1.0, 1.0, opacity, 1.0]);
+        assert_eq!(out[0].transmission_weight, weight, "opacity {opacity}");
+    }
+    assert_clean();
+}

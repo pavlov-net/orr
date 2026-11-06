@@ -193,6 +193,16 @@ impl MeshPrim {
     pub(super) fn polygonal(&self) -> bool {
         polygonal(&self.scheme)
     }
+
+    /// How many elements a primvar of interpolation `interp` holds over it.
+    pub(super) fn domain(&self, interp: Interp) -> usize {
+        match interp {
+            Interp::Constant => 1,
+            Interp::Uniform => self.counts.len(),
+            Interp::Vertex => self.points.len(),
+            Interp::FaceVarying => self.indices.len(),
+        }
+    }
 }
 
 /// One triangle of a face.

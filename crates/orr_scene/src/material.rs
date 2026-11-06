@@ -65,6 +65,7 @@ const UV_SET: u32 = 1 << 11;
 const CHANNEL_SHIFT: u32 = 12;
 const PRIMARIES_SHIFT: u32 = 16;
 const VERTEX_SHIFT: u32 = 18;
+const VERTEX_COMPLEMENT_SHIFT: u32 = 21;
 
 /// A texture bound to a cooked material: its heap index, its
 /// [`TextureHeader::primaries`](orr_pack::texture::TextureHeader::primaries) and the sampler of
@@ -127,6 +128,7 @@ fn binding_modes(b: &TextureBinding, t: &BoundTexture) -> u32 {
         | u32::from(b.channels & 15) << CHANNEL_SHIFT
         | u32::from(t.primaries & 3) << PRIMARIES_SHIFT
         | u32::from(b.vertex & 7) << VERTEX_SHIFT
+        | u32::from(b.vertex_complement) << VERTEX_COMPLEMENT_SHIFT
 }
 
 /// The `orr_shaders.trace` candidate class of a model whose sections have material flags `flags`:
