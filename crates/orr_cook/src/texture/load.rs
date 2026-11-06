@@ -245,9 +245,10 @@ pub(super) fn layer_of(bytes: &[u8], layer: &Layer) -> Result<Option<Vec<u8>>, S
     Ok(Some(out.into_inner()))
 }
 
-/// Decodes an image file, recognized by its first bytes.
+/// Decodes the mip 0 of each layer of an image file, recognized by its first bytes. A KTX2 file's
+/// other levels stay packed.
 pub(super) fn decode(bytes: &[u8]) -> Result<Source, String> {
-    let mut src = open(bytes)?;
+    let mut src = open_levels(bytes, 1)?;
     decode_layers(&mut src)?;
     Ok(src)
 }
@@ -296,15 +297,20 @@ pub(super) fn stored_range(src: &Source) -> Result<[(f32, f32); 4], String> {
     Ok(range)
 }
 
-/// Opens an image file like [`decode`], but leaves `layers` empty when the file holds
+/// Opens an image file with every mip it stores, leaving `layers` empty when the file holds
 /// block-compressed texels.
 pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
+    open_levels(bytes, usize::MAX)
+}
+
+/// [`open`], taking at most `levels` mips of a KTX2 file.
+fn open_levels(bytes: &[u8], levels: usize) -> Result<Source, String> {
     const KTX1: &[u8] = b"\xABKTX 11\xBB\r\n\x1A\n";
     if bytes.starts_with(KTX1) {
         return Err("KTX1 images are not supported; convert them to KTX2".into());
     }
     let mut src = match Ktx2Blocks::of(bytes) {
-        Some(k) => k.open()?,
+        Some(k) => k.open(levels)?,
         None => {
             let dds = dds_with_known_blocks(bytes);
             match decode_container(&dds, InputOverrides::default()).map_err(|e| e.to_string())? {
@@ -534,7 +540,7 @@ impl<'a> Ktx2Blocks<'a> {
         ktx2_color(&self.reader, self.format, numeric)
     }
 
-    fn open(self) -> Result<Source, String> {
+    fn open(self, levels_kept: usize) -> Result<Source, String> {
         let h = &self.header;
         let cube = h.face_count == 6;
         if cube && h.layer_count > 1 {
@@ -543,7 +549,7 @@ impl<'a> Ktx2Blocks<'a> {
         // Each level holds every layer's faces in turn.
         let images = h.layer_count.max(1) as usize * h.face_count as usize;
         let mut levels = vec![Vec::new(); images];
-        for (m, level) in self.reader.levels().enumerate() {
+        for (m, level) in self.reader.levels().take(levels_kept).enumerate() {
             let size = self.image_bytes(m as u32);
             let data = if self.zstd {
                 let data = zstd::bulk::decompress(level.data, size * images)

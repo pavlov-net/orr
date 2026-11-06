@@ -736,14 +736,24 @@ fn facts_of(
     let every_mip = |negatives, f: &FileColor| color && (whole || negatives || f.can_read_below());
     if let Some(scan) = load::scan_ktx2(bytes, spread) {
         let mut s = scan?;
+        let mut opened = None;
         if every_mip(s.negatives, &s.color) {
-            s.range = load::stored_range(&load::open(bytes)?)?;
+            let src = load::open(bytes)?;
+            s.range = load::stored_range(&src)?;
+            opened = Some(src);
         }
+        let vectors = normal && s.float && s.negatives;
         let stored_normals = s.signed
-            || (normal
-                && s.float
-                && s.negatives
-                && stores_normals(&load::decode(bytes)?.layers, s.rg));
+            || (vectors && {
+                let src = match opened {
+                    Some(mut src) => {
+                        load::decode_layers(&mut src)?;
+                        src
+                    }
+                    None => load::decode(bytes)?,
+                };
+                stores_normals(&src.layers, s.rg)
+            });
         return Ok(ImageFacts {
             w: s.w,
             h: s.h,
