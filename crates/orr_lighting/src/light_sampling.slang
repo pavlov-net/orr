@@ -667,7 +667,9 @@ public float emissive_area_pdf(LightSetGpu* set, uint entry, float luminance)
 // Sample of emissive entry `entry` from `u`, the entry chosen with `probability`: a cluster
 // by its CDF, a triangle by area and a point uniform in the triangle. A triangle's front
 // face winds counter-clockwise. Selection follows the material's factor, so the density is the
-// factor's, and the sample carries what the point emits, with its emission texture.
+// factor's, and the sample carries what a ray sees at the point: what the surface emits, in the
+// share a presence layer shows there, and none where an alpha test leaves a hole. Traversal
+// takes opaque and dielectric entries' triangles whole, so no test applies to them.
 LightSample emissive_sample(LightSetGpu* set, uint entry, float4 u, float probability)
 {
     SceneRoot* s = set.scene;
@@ -712,12 +714,17 @@ LightSample emissive_sample(LightSetGpu* set, uint entry, float4 u, float probab
     float3 l = material_light_emission(mat);
     Corners t = producer_triangle(b, k, triangle, false).corners;
     float2 uv = b0 * t.attributes[0].uv[0] + b1 * t.attributes[1].uv[0] + (1.0 - b0 - b1) * t.attributes[2].uv[0];
-    SurfaceInput at = particle_input(s, MATERIAL_NONE, uv);
+    ProducerGpu producer = s.producers[entry];
+    SurfaceInput at = particle_input(s, producer_material(producer, k), uv);
     at.uv[0].inward = (t.attributes[0].uv[0] + t.attributes[1].uv[0] + t.attributes[2].uv[0]) / 3.0 - uv;
     at.uv[1].inward = at.uv[0].inward;
+    float3 emitted = surface_emission(at, mat);
+    if ((mat.flags & MATERIAL_PRESENCE) != 0)
+        emitted *= saturate(material_opacity(at));
+    else if ((mat.flags & MATERIAL_ALPHA_TESTED) != 0 && producer.opacity != PRODUCER_OPAQUE && producer.opacity != PRODUCER_DIELECTRIC)
+        emitted *= material_coverage(at);
     LightSample r = light_sample(LIGHT_SAMPLE_EMISSIVE, s.light_capacity + entry, render_point(anchor, m, p),
-                                 normalize(n), material_scale(mat, TEXTURE_EMISSION_LUMINANCE, at.uv) * material_color(mat, TEXTURE_EMISSION, at.uv, l),
-                                 probability * luminance_rec2020(l) / e.total);
+                                 normalize(n), emitted, probability * luminance_rec2020(l) / e.total);
     if ((mat.flags & MATERIAL_DOUBLE_SIDED) != 0)
         r.bits |= LIGHT_SAMPLE_TWO_SIDED;
     return r;

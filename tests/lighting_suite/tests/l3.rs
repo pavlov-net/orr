@@ -18,8 +18,8 @@ use orr_math::{Affine3, DVec3, Mat3, Vec3};
 use orr_pack::texture::octahedral;
 use orr_scene::{
     ClusterTopology, Cone, EmissiveGpu, GroupWriter, InstanceFlags, MaterialGpu, MaterialId,
-    MaterialWriter, ProducerDesc, ProducerId, ProducerUpdate, SceneCompute, SceneDesc, SceneWriter,
-    TransformGroupDesc, material_flags,
+    MaterialWriter, Opacity, ProducerDesc, ProducerId, ProducerUpdate, SceneCompute, SceneDesc,
+    SceneWriter, TransformGroupDesc, material_flags,
 };
 use shader_math::stats::chi_square_p;
 
@@ -404,14 +404,26 @@ fn producer_materials(m: &mut MaterialWriter<'_>) -> [MaterialId; 3] {
     ]
 }
 
-/// Producer entries `0..transforms.len()`, each with its transform in one group anchored at
-/// `anchor`.
+/// Opaque producer entries `0..transforms.len()`, each with its transform in one group anchored
+/// at `anchor`.
 fn set_producers(
     w: &mut SceneWriter<'_>,
     materials: &[MaterialId; 3],
     anchor: DVec3,
     transforms: &[Affine3],
     update: ProducerUpdate,
+) {
+    set_producers_of(w, materials, anchor, transforms, update, Opacity::Opaque);
+}
+
+/// [`set_producers`], the entries of `opacity`.
+fn set_producers_of(
+    w: &mut SceneWriter<'_>,
+    materials: &[MaterialId; 3],
+    anchor: DVec3,
+    transforms: &[Affine3],
+    update: ProducerUpdate,
+    opacity: Opacity,
 ) {
     let g = w
         .create_transform_group(&TransformGroupDesc {
@@ -442,6 +454,7 @@ fn set_producers(
                 vertex_user: false,
                 flags: InstanceFlags::RASTER | InstanceFlags::RAY,
                 user_tag: 0,
+                opacity,
                 ..ProducerDesc::default()
             }),
         )
@@ -523,10 +536,34 @@ fn emissive_producer_tiles_match_the_density_and_irradiance() {
     assert_clean();
 }
 
-/// A sample carries what its point emits, past 1 included, while selection stays by the factor:
-/// a texel of 5 lights the receiver five times as much as the factor alone.
+/// A sample carries what a ray sees at its point, past 1 included, while selection stays by the
+/// factor: a texel of 5 lights the receiver five times as much as the factor alone, a presence
+/// layer's opacity texel of 0.25 a quarter as much, and one under an alpha cutoff not at all.
 #[test]
 fn textured_emissive_producers_light_with_their_texels() {
+    use orr_pack::material::slot;
+    let solid = Opacity::Opaque;
+    lit_through_a_texture(slot::EMISSION, 0, solid, 5.0, 5.0, "textured emitters");
+    let presence = material_flags::PRESENCE;
+    let what = "textured presence emitters";
+    lit_through_a_texture(slot::OPACITY, presence, solid, 0.25, 0.25, what);
+    let tested = material_flags::ALPHA_TESTED;
+    let cut = Opacity::AlphaTested;
+    lit_through_a_texture(slot::OPACITY, tested, cut, 0.25, 0.0, "cut away emitters");
+    let what = "alpha tested emitters traced whole";
+    lit_through_a_texture(slot::OPACITY, tested, solid, 0.25, 1.0, what);
+}
+
+/// Producers of `opacity` with a material of `flags`, whose slot `s` reads `texel`, light a
+/// receiver `shown` times as much as their factor.
+fn lit_through_a_texture(
+    s: usize,
+    flags: u32,
+    opacity: Opacity,
+    texel: f32,
+    shown: f32,
+    what: &str,
+) {
     let mut scene = TestScene::new(SceneDesc {
         light_capacity: 4,
         producer_capacity: 4,
@@ -541,20 +578,23 @@ fn textured_emissive_producers_light_with_their_texels() {
         origin: Vec3::new(-1.6, 0.0, -0.2),
         step: Vec3::new(0.55, 0.0, 0.05),
     };
-    let image = texture(1, 1, &[[5.0, 5.0, 5.0, 1.0]], "emission");
-    let mut textured = emitting([1.0, 0.6, 0.3], 400.0, 0);
-    textured.textures[orr_pack::material::slot::EMISSION] = image.index;
-    textured.samplers[orr_pack::material::slot::EMISSION].sampler = linear_clamp();
+    let image = texture(1, 1, &[[texel, texel, texel, 1.0]], "texel");
+    let mut textured = emitting([1.0, 0.6, 0.3], 400.0, flags);
+    textured.geometry_opacity = 1.0;
+    textured.alpha_cutoff = 0.5;
+    textured.textures[s] = image.index;
+    textured.samplers[s].sampler = linear_clamp();
     let p = pipeline(&emit::MODULE, "main");
     scene.frame(
         |w, m| {
             let id = m.create(&textured).unwrap();
-            set_producers(
+            set_producers_of(
                 w,
                 &[id; 3],
                 DVec3::ZERO,
                 &transforms,
                 ProducerUpdate::Static,
+                opacity,
             );
         },
         |c| quads.dispatch(c, &p),
@@ -565,7 +605,7 @@ fn textured_emissive_producers_light_with_their_texels() {
         &mut lighting,
         &Bins::around_y(70f64.to_radians(), 8, 16),
     );
-    let luminance = y2020([1.0, 0.6, 0.3]) * 400.0 * 5.0;
+    let luminance = y2020([1.0, 0.6, 0.3]) * 400.0 * f64::from(shown);
     let lit = Vec3::new(0.0, 2.0, 0.0);
     let e: f64 = (0..quads.count)
         .map(|c| {
@@ -573,7 +613,7 @@ fn textured_emissive_producers_light_with_their_texels() {
             polygon_irradiance(&v, DVec3::Y, luminance)
         })
         .sum();
-    t.assert_irradiance(e, "textured emitters");
+    t.assert_irradiance(e, what);
     assert_clean();
 }
 

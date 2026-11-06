@@ -134,6 +134,13 @@ float3 surface_more_color(SurfaceInput i, MaterialGpu* m, uint slot, float3 fact
     return surface_color(i, m, slot, factor);
 }
 
+// What the surface emits at the hit, in nits: `material_emission_at` with the vertex color
+// stream on both of its slots.
+public float3 surface_emission(SurfaceInput i, MaterialGpu* m)
+{
+    return surface_scale(i, m, TEXTURE_EMISSION_LUMINANCE) * surface_color(i, m, TEXTURE_EMISSION, material_emission(m));
+}
+
 // The material's alpha test at the hit: 1 where `material_opacity` is at or above the
 // cutoff, else 0: the test the cook's opaque triangles and opacity micromaps follow, so the
 // raster, ray candidates and micromaps agree.
@@ -366,9 +373,7 @@ public struct StandardSurface : ISurface
         p.thin_film_weight = m.thin_film_weight * surface_scale(i, m, TEXTURE_THIN_FILM_WEIGHT);
         p.thin_film_thickness = m.thin_film_thickness * surface_scale(i, m, TEXTURE_THIN_FILM_THICKNESS);
         p.thin_film_ior = m.thin_film_ior * surface_scale(i, m, TEXTURE_THIN_FILM_IOR);
-        p.emission = material_emission_at(m, i.uv) * surface_vertex(i, m, TEXTURE_EMISSION_LUMINANCE).x;
-        if ((m.flags & MATERIAL_VERTEX) != 0 && ((m.samplers[TEXTURE_EMISSION].modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK) != 0)
-            p.emission = mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, p.emission) * surface_vertex(i, m, TEXTURE_EMISSION));
+        p.emission = surface_emission(i, m);
 
         GSurface s = (GSurface)0;
         s.normal = material_normal(i, m);
