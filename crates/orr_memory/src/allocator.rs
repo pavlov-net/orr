@@ -20,8 +20,6 @@ pub struct AllocatorDesc<'a> {
     pub device: &'a ash::Device,
     /// The API version the instance and device were created with, Vulkan 1.4 at most.
     pub api_version: u32,
-    /// `VK_EXT_memory_budget` is enabled: budgets come from the OS instead of estimates.
-    pub memory_budget: bool,
     /// `VK_EXT_memory_priority` is enabled with `memoryPriority`: pools pass their priority.
     pub memory_priority: bool,
 }
@@ -114,10 +112,9 @@ pub struct HeapBudget {
     pub allocations: u32,
     pub block_bytes: u64,
     pub allocation_bytes: u64,
-    /// What this process uses on the heap, everything included; estimated without
-    /// `VK_EXT_memory_budget`.
+    /// What this process uses on the heap, everything included, as the OS counts it.
     pub usage: u64,
-    /// What the OS lets this process use; estimated without `VK_EXT_memory_budget`.
+    /// What the OS lets this process use.
     pub budget: u64,
 }
 
@@ -138,9 +135,9 @@ impl Allocator {
     ///
     /// # Safety
     ///
-    /// The handles in `desc` are live, the device has `bufferDeviceAddress` and the
-    /// extensions `desc` names enabled, and the device outlives the allocator and
-    /// everything allocated from it.
+    /// The handles in `desc` are live, the device has `bufferDeviceAddress`,
+    /// `VK_EXT_memory_budget` and the extensions `desc` names enabled, and the device
+    /// outlives the allocator and everything allocated from it.
     pub unsafe fn new(desc: &AllocatorDesc<'_>) -> Result<Self> {
         let allocations = Box::<AtomicU64>::default();
         let callbacks = sys::VmaDeviceMemoryCallbacks {
@@ -157,10 +154,8 @@ impl Allocator {
             ),
             ..Default::default()
         };
-        let mut flags = sys::VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
-        if desc.memory_budget {
-            flags |= sys::VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
-        }
+        let mut flags = sys::VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT
+            | sys::VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
         if desc.memory_priority {
             flags |= sys::VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
         }

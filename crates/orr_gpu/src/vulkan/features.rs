@@ -20,6 +20,7 @@ const REQUIRED_EXTENSIONS: &[&CStr] = &[
     ash::ext::mesh_shader::NAME,
     ash::nv::cluster_acceleration_structure::NAME,
     ash::nv::partitioned_acceleration_structure::NAME,
+    ash::ext::memory_budget::NAME,
 ];
 
 /// Required on devices that present (`QueueRequest::present`).
@@ -62,7 +63,6 @@ pub(super) struct Optional {
     pub(super) device_address_commands: bool,
     pub(super) indirect_copy: bool,
     pub(super) unified_image_layouts: bool,
-    pub(super) memory_budget: bool,
     pub(super) memory_priority: bool,
     /// `VK_EXT_pageable_device_local_memory`, only beside `memory_priority`.
     pub(super) pageable_memory: bool,
@@ -387,7 +387,6 @@ pub(super) fn select(
         device_address_commands: present(ash::khr::device_address_commands::NAME),
         indirect_copy: present(ash::khr::copy_memory_indirect::NAME),
         unified_image_layouts: present(ash::khr::unified_image_layouts::NAME),
-        memory_budget: present(ash::ext::memory_budget::NAME),
         memory_priority: present(ash::ext::memory_priority::NAME),
         pageable_memory: present(ash::ext::pageable_device_local_memory::NAME),
         // shader_abort requires device_fault and shader_constant_data enabled with it.
@@ -706,7 +705,6 @@ pub(super) fn select(
         opt.unified_image_layouts,
         &[ash::khr::unified_image_layouts::NAME],
     );
-    add(opt.memory_budget, &[ash::ext::memory_budget::NAME]);
     add(opt.memory_priority, &[ash::ext::memory_priority::NAME]);
     add(
         opt.pageable_memory,

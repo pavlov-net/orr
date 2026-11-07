@@ -474,7 +474,6 @@ impl Device {
                     .supported_queues
                     .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE),
             unified_image_layouts: optional.unified_image_layouts,
-            memory_budget: optional.memory_budget,
             memory_priority: optional.memory_priority,
             shader_abort: optional.shader_abort,
             device_fault: optional.device_fault || optional.device_fault_ext,
@@ -569,7 +568,6 @@ impl Device {
             physical,
             device: &device,
             api_version: vk::API_VERSION_1_4,
-            memory_budget: optional.memory_budget,
             memory_priority: optional.memory_priority,
         };
         let placement = placement_align(

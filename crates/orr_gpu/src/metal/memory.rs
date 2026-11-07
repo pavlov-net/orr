@@ -225,6 +225,7 @@ impl Device {
     pub fn memory_report(&self) -> MemoryReport {
         let s = &self.shared;
         let kinds = *lock(&s.usage);
+        // The working set Metal recommends, against what the device has allocated.
         let budget = s.device.recommendedMaxWorkingSetSize();
         MemoryReport {
             kinds,
@@ -232,8 +233,8 @@ impl Device {
                 size: budget,
                 device_local: true,
                 block_bytes: s.heaps.iter().map(|p| lock(p).heap_bytes()).sum(),
-                budget: Some(budget),
-                usage: Some(s.device.currentAllocatedSize() as u64),
+                budget,
+                usage: s.device.currentAllocatedSize() as u64,
             }],
             device_allocations: s.device_allocations.load(Ordering::Relaxed),
         }

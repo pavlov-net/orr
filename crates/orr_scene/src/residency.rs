@@ -266,11 +266,7 @@ impl Residency {
 
     /// Takes the share of its OS budget that device-local memory uses
     /// (`MemoryReport::pressure`), and shrinks or grows the budgets the next plans use.
-    /// `None`, without a budget from the OS, changes nothing.
-    pub(crate) fn react(&mut self, pressure: Option<f64>) {
-        let Some(p) = pressure else {
-            return;
-        };
+    pub(crate) fn react(&mut self, p: f64) {
         if p > SHRINK_ABOVE {
             self.scale = (self.scale * SCALE_STEP).max(MIN_SCALE);
         } else if p < GROW_BELOW {
@@ -987,11 +983,10 @@ mod tests {
         r.register(M, &units).unwrap();
         // 300 of 400 resident beside the pinned 100.
         step(&mut r, &[0, 1, 2], 1);
-        r.react(None);
-        r.react(Some(0.85));
-        assert_eq!(class(&r).budget, 400, "no budget or between the thresholds");
+        r.react(0.85);
+        assert_eq!(class(&r).budget, 400, "between the thresholds");
         for _ in 0..5 {
-            r.react(Some(0.95));
+            r.react(0.95);
         }
         assert_eq!(class(&r).budget, (400.0 * 0.95f64.powi(5)) as u64);
         assert_eq!(
@@ -1006,14 +1001,14 @@ mod tests {
         let plan = step(&mut r, &[3], late);
         assert_eq!((plan.evictions, plan.loads), (vec![key(1)], vec![key(3)]));
         for _ in 0..100 {
-            r.react(Some(2.0));
+            r.react(2.0);
         }
         assert_eq!(class(&r).budget, 50, "the floor");
         let later = late + HOLD_FRAMES + 1;
         assert_eq!(step(&mut r, &[], later).evictions, [key(2), key(3)]);
         assert_eq!(class(&r).resident_bytes, 100, "the pinned unit stays");
         for _ in 0..100 {
-            r.react(Some(0.5));
+            r.react(0.5);
         }
         assert_eq!(class(&r).budget, 400);
         assert_eq!(step(&mut r, &[0, 1, 2], later).loads.len(), 3);

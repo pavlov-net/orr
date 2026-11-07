@@ -723,13 +723,8 @@ fn priorities_allocate_and_the_report_carries_the_pressure() {
         }
     }
     d.collect_garbage();
-    let pressure = d.memory_report().pressure();
-    if d.caps().memory_budget {
-        let p = pressure.expect("a device-local heap with an OS budget");
-        assert!(p > 0.0 && p.is_finite(), "pressure {p}");
-    } else {
-        assert_eq!(pressure, None);
-    }
+    let p = d.memory_report().pressure();
+    assert!(p > 0.0 && p.is_finite(), "pressure {p}");
     assert_clean();
 }
 

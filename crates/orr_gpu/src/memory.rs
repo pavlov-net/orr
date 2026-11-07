@@ -40,8 +40,7 @@ pub enum MemoryPriority {
     High,
 }
 
-/// Memory use per [`MemoryKind`] and per heap and, with `Caps::memory_budget`, the OS
-/// budget per heap.
+/// Memory use per [`MemoryKind`] and per heap, and the OS budget per heap.
 #[derive(Clone, Debug)]
 pub struct MemoryReport {
     /// Indexed like [`MemoryKind`]: Upload, DeviceLocal, Readback.
@@ -57,13 +56,13 @@ impl MemoryReport {
     }
 
     /// The largest share of its OS budget a device-local heap uses; above 1 the OS pages
-    /// memory out. `None` without `Caps::memory_budget`.
-    pub fn pressure(&self) -> Option<f64> {
+    /// memory out.
+    pub fn pressure(&self) -> f64 {
         self.heaps
             .iter()
             .filter(|h| h.device_local)
-            .filter_map(|h| Some(h.usage? as f64 / h.budget?.max(1) as f64))
-            .reduce(f64::max)
+            .map(|h| h.usage as f64 / h.budget as f64)
+            .fold(0.0, f64::max)
     }
 }
 
@@ -81,8 +80,8 @@ pub struct HeapReport {
     pub device_local: bool,
     /// Bytes of the device memory blocks orr_gpu holds on the heap.
     pub block_bytes: u64,
-    /// What the OS lets this process use; `None` without `Caps::memory_budget`.
-    pub budget: Option<u64>,
+    /// What the OS lets this process use.
+    pub budget: u64,
     /// What this process uses, as the OS counts it.
-    pub usage: Option<u64>,
+    pub usage: u64,
 }

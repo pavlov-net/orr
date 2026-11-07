@@ -50,8 +50,6 @@ pub struct Caps {
     pub indirect_copy: bool,
     /// `GENERAL` is guaranteed optimal for every use (`VK_KHR_unified_image_layouts`).
     pub unified_image_layouts: bool,
-    /// The memory report carries the OS budget per heap.
-    pub memory_budget: bool,
     /// Allocations carry their [`crate::MemoryPriority`] (`VK_EXT_memory_priority`), and with
     /// `VK_EXT_pageable_device_local_memory` the OS pages low-priority device-local memory
     /// out first when VRAM runs short. Without it every allocation has the same priority.

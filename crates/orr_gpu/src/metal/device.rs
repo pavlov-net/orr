@@ -339,8 +339,6 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
         device_address_commands: false,
         indirect_copy: false,
         unified_image_layouts: true,
-        // The working set Metal recommends, against what the device has allocated.
-        memory_budget: true,
         memory_priority: false,
         shader_abort: false,
         device_fault: false,

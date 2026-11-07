@@ -509,7 +509,6 @@ impl Shared {
         });
         let allocator = &self.pools.allocator;
         let p = &self.memory.properties;
-        let budget = self.caps.memory_budget;
         let heaps = allocator
             .heap_budgets()
             .iter()
@@ -520,8 +519,8 @@ impl Shared {
                     .flags
                     .contains(vk::MemoryHeapFlags::DEVICE_LOCAL),
                 block_bytes: b.block_bytes,
-                budget: budget.then_some(b.budget),
-                usage: budget.then_some(b.usage),
+                budget: b.budget,
+                usage: b.usage,
             })
             .collect();
         MemoryReport {
@@ -597,8 +596,7 @@ impl Device {
             .defer(self.shared.after_point(after), Item::Buffer(raw));
     }
 
-    /// Live allocations per kind, blocks per heap and, with `Caps::memory_budget`, the OS
-    /// budget.
+    /// Live allocations per kind, and blocks and the OS budget per heap.
     pub fn memory_report(&self) -> MemoryReport {
         self.shared.report()
     }
