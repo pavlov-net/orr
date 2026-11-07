@@ -2000,7 +2000,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                 // The reference ends a path whose walk reached its cap, and counts it.
                 bool capped = walk.kind == WALK_CAP;
                 if (capped && reference)
-                    InterlockedAdd(*set.capped_walks, 1u);
+                    InterlockedAdd(set.reference_counts[0], 1u);
                 alive = walk.kind != WALK_NONE && (!capped || (!reference && (walking || entered == medium)));
                 if (walking || walk.kind == WALK_BOUNDARY)
                 {

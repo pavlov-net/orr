@@ -158,9 +158,10 @@ public struct LightSetGpu
     // Shadow rays this frame past `SHADOW_CANDIDATES` non-opaque candidates; the next scene
     // pass reads and clears it.
     public uint* shadow_overflows;
-    // Reference walks this frame that reached `PathRoot.sss_max_steps`; the next scene pass
-    // reads and clears it.
-    public uint* capped_walks;
+    // Reference walks this frame that reached `PathRoot.sss_max_steps`, then reference photon
+    // map deposits this frame that found their map full; the next scene pass reads and clears
+    // them.
+    public uint* reference_counts;
     public uint directional_count;
     public uint candidate_count;
     // The last value of `cdf`.
@@ -196,6 +197,8 @@ public struct LightSetStats
     public uint shadow_overflows;
     // Reference walks of the frame before that reached their step cap.
     public uint capped_walks;
+    // Reference photon map deposits of the frame before that found their map full.
+    public uint photon_overflows;
 }
 
 // One slot of a local sampler: a light that fed back in its tile, or for an emissive entry a

@@ -2390,6 +2390,11 @@ impl Bed {
         }
         let point = f.end(&[]).unwrap();
         render().wait(point, Duration::from_secs(10)).unwrap();
+        let stats = self.lighting.stats(id).unwrap();
+        assert_eq!(
+            stats.photon_overflows, 0,
+            "the frame before {id} filled a reference photon map"
+        );
     }
 }
 

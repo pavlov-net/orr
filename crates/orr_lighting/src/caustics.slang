@@ -67,8 +67,8 @@ public static const uint PHOTON_END = 0xffffffff;
 
 // `CausticsGpu.counters`, by index: the quantum of this frame's deposits (f32 bits); this
 // frame's deposits and their summed quanta as two words of a u64, for the next quantum;
-// photons started; deposits whose cell's probe was full or that the map had no room for;
-// cells occupied and evicted by the resolve.
+// photons started; deposits whose cell's probe was full; cells occupied and evicted by the
+// resolve.
 public static const uint CAUSTIC_QUANTUM = 0;
 public static const uint CAUSTIC_DEPOSITS = 1;
 public static const uint CAUSTIC_SUM_LOW = 2;
@@ -356,7 +356,7 @@ public void map_deposit(CausticsGpu* g, float3 p, float3 n, float3 flux, float3 
     InterlockedAdd(g.counters[CAUSTIC_DEPOSITS], 1u, i);
     if (i >= g.map_capacity)
     {
-        InterlockedAdd(g.counters[CAUSTIC_OVERFLOWS], 1u);
+        InterlockedAdd(g.source.set.reference_counts[1], 1u);
         return;
     }
     PhotonGpu* ph = g.map + i;

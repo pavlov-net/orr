@@ -126,6 +126,9 @@ pub struct LightingStats {
     /// Walks of reference views in the frame before that reached their step cap; each ended its
     /// path.
     pub capped_walks: u32,
+    /// Deposits of reference views' photon maps in the frame before that found their map full;
+    /// each dropped its photon.
+    pub photon_overflows: u32,
     pub world_cache: WorldCacheStats,
     pub caustics: CausticStats,
 }
@@ -199,7 +202,7 @@ pub struct SceneLighting {
     feedback_counts: Allocation<u32>,
     feedback_weights: Allocation<f32>,
     shadow_overflows: Allocation<u32>,
-    capped_walks: Allocation<u32>,
+    reference_counts: Allocation<u32>,
     readback: Allocation<LightSetStats>,
     bake_roots: Ring<crate::shaders::environment::bake::Root>,
     directional_roots: Ring<directional::Root>,
@@ -263,7 +266,7 @@ impl SceneLighting {
             feedback_counts: device_local(device, feedback_ids, "light feedback counts")?,
             feedback_weights: device_local(device, feedback_ids, "light feedback weights")?,
             shadow_overflows: device_local(device, 1, "shadow overflows")?,
-            capped_walks: device_local(device, 1, "capped walks")?,
+            reference_counts: device_local(device, 2, "reference counts")?,
             readback: device.gpu_malloc(
                 MemoryKind::Readback,
                 FRAME_SLOTS as u64,
@@ -361,7 +364,7 @@ impl SceneLighting {
                 feedback_counts: self.feedback_counts.gpu(),
                 feedback_weights: self.feedback_weights.gpu(),
                 shadow_overflows: self.shadow_overflows.gpu(),
-                capped_walks: self.capped_walks.gpu(),
+                reference_counts: self.reference_counts.gpu(),
                 stats: self.readback.gpu().offset(slot as u64),
                 cluster_capacity: self.settings.emissive_clusters,
                 frame: pass.frame as u32,
@@ -440,6 +443,7 @@ impl SceneLighting {
                 feedback_pixels: s.feedback_pixels,
                 shadow_overflows: s.shadow_overflows,
                 capped_walks: s.capped_walks,
+                photon_overflows: s.photon_overflows,
                 world_cache: self.cache.stats(slot),
                 caustics: self.caustics.stats(slot),
             }

@@ -501,7 +501,9 @@ pub(crate) struct PhotonMap {
 const PROGRESSIVE_ALPHA: f64 = 2.0 / 3.0;
 
 impl PhotonMap {
-    /// A map for `photons` photons a frame, each depositing about twice.
+    /// A map for `photons` photons a frame, room for two deposits each: a photon deposits where
+    /// it ends and at each chain vertex with diffuse lobes on its way. A deposit past the room
+    /// counts in [`crate::LightingStats::photon_overflows`].
     pub(crate) fn new(device: &Device, photons: u32) -> Result<Self, Error> {
         let capacity = photons.saturating_mul(2).max(1);
         let heads_log2 = capacity.next_power_of_two().trailing_zeros();
