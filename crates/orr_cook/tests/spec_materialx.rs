@@ -2194,6 +2194,93 @@ fn a_backsurfaceshader_is_a_material_of_the_back() {
     assert_eq!(material(&a).double_sided, 0);
 }
 
+/// A surface has one class and one interior, so a back that states other transmission, opacity or
+/// interior IOR inputs takes the front's and warns, and keeps the rest of its look.
+#[test]
+fn a_back_takes_the_class_of_its_front() {
+    let d = fixture();
+    let doc = d.join("back_class.mtlx");
+    std::fs::write(
+        &doc,
+        r#"<?xml version="1.0"?>
+<materialx version="1.39">
+  <image name="dispersion" type="float"><input name="file" type="filename" value="v.png"/></image>
+  <open_pbr_surface name="F" type="surfaceshader">
+    <input name="transmission_weight" type="float" value="1"/>
+    <input name="transmission_depth" type="float" value="0.5"/>
+    <input name="transmission_dispersion_scale" type="float" nodename="dispersion"/>
+    <input name="geometry_thin_walled" type="boolean" value="true"/>
+  </open_pbr_surface>
+  <open_pbr_surface name="B" type="surfaceshader">
+    <input name="base_color" type="color3" value="0.25, 0.5, 0.75"/>
+    <input name="geometry_opacity" type="float" value="0.5"/>
+  </open_pbr_surface>
+  <open_pbr_surface name="Look" type="surfaceshader">
+    <input name="base_color" type="color3" value="0.25, 0.5, 0.75"/>
+  </open_pbr_surface>
+  <open_pbr_surface name="S" type="surfaceshader">
+    <input name="transmission_weight" type="float" value="1"/>
+    <input name="specular_ior" type="float" value="1.33"/>
+  </open_pbr_surface>
+  <surfacematerial name="Solid" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="S"/>
+    <input name="backsurfaceshader" type="surfaceshader" nodename="B"/>
+  </surfacematerial>
+  <surfacematerial name="M" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="F"/>
+    <input name="backsurfaceshader" type="surfaceshader" nodename="B"/>
+  </surfacematerial>
+  <surfacematerial name="Plain" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="Look"/>
+    <input name="backsurfaceshader" type="surfaceshader" nodename="B"/>
+  </surfacematerial>
+  <surfacematerial name="Veil" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="B"/>
+    <input name="backsurfaceshader" type="surfaceshader" nodename="Look"/>
+  </surfacematerial>
+</materialx>
+"#,
+    )
+    .unwrap();
+    let back_of = |a: &Archive| {
+        let e = a.find(material(a).back).expect("the back's material");
+        let mut v = vec![0; a.blobs(e)[0].raw_len as usize];
+        a.read(&a.blobs(e)[0], &mut v).unwrap();
+        Material::from_bytes(&v).unwrap()
+    };
+    let (a, report) = cook(&doc, "M").unwrap();
+    let warned = &report.assets[0].warnings;
+    assert!(
+        warned.iter().any(|w| w.contains("material M:")),
+        "{warned:?}"
+    );
+    let (front, back) = (material(&a), back_of(&a));
+    assert_eq!(back.class(), front.class());
+    assert_eq!(back.transmission_weight, 1.0);
+    assert_eq!(back.transmission_depth, 0.5);
+    assert!(bound(&back, slot::DISPERSION_SCALE));
+    assert_eq!(back.thin_walled, 1);
+    assert_eq!(back.geometry_opacity, 1.0);
+    assert_eq!(back.alpha_mode, front.alpha_mode);
+    assert_eq!(back.base_color, [0.25, 0.5, 0.75]);
+    // A thin wall bounds no interior, so the back keeps its own IOR.
+    assert_eq!(back.specular_ior, 1.5);
+
+    // A solid's IOR is its interior's, which a ray leaving through the back refracts against.
+    let (a, _) = cook(&doc, "Solid").unwrap();
+    assert_eq!(back_of(&a).specular_ior, material(&a).specular_ior);
+    assert_eq!(back_of(&a).specular_ior, 1.33);
+
+    let (a, report) = cook(&doc, "Plain").unwrap();
+    assert!(!report.assets[0].warnings.is_empty());
+    assert_eq!(back_of(&a).geometry_opacity, 1.0);
+
+    let (a, report) = cook(&doc, "Veil").unwrap();
+    assert!(!report.assets[0].warnings.is_empty());
+    assert_eq!(back_of(&a).geometry_opacity, 0.5);
+    assert_eq!(back_of(&a).class(), material(&a).class());
+}
+
 #[test]
 fn long_connection_chains_cook() {
     // Nothing in the spec limits a graph's depth, so a chain must not exhaust the stack.

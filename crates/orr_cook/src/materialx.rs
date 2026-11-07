@@ -6,7 +6,7 @@
 //! `fileprefix` of their nearest scope and resolve against the directory of their document.
 //! Images and values of color types read in their `colorspace`, inherited likewise, so that the
 //! document's working space is the last scope, and "data" where no scope names one: values
-//! convert here to the linear Rec.709 of [`Material`](orr_pack::material::Material), images when
+//! convert here to the linear Rec.709 of [`Material`], images when
 //! they cook. A name that isn't a known space warns and reads as "data".
 //! A standalone material has no mesh, so each texture keeps its uv set (0 or 1) and transform
 //! in its slot; geometric properties name `st`, `UV0` or a `geompropdef` of a texcoord.
@@ -41,19 +41,22 @@
 //! `namespace:element`, and so may the material.
 //!
 //! A `backsurfaceshader` other than the `surfaceshader` shades the back of two-sided geometry, so
-//! it makes the material double-sided, and cooks as material `back` of the asset.
+//! it makes the material double-sided, and cooks as material `back` of the asset. A surface has
+//! one class and one interior, which the front owns: the back takes the front's transmission,
+//! opacity and thin-walled inputs and a solid dielectric's IOR, and warns where they differed.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use orr_pack::material::{Material, slot};
 use roxmltree::{Document, Node as XmlNode, NodeId};
 
 use crate::import::{Scene, SceneMaterial};
 use crate::shading::{self, Input, Network, Node, Unit, is_color, through};
 use crate::state::{Input as FileInput, Memo};
 use crate::texture::color::ImageColor;
-use crate::texture::material::{ImageData, ImageFile, ImageTile, Layer};
+use crate::texture::material::{ImageData, ImageFile, ImageTile, Layer, MaterialTextures, TexRef};
 use crate::texture::{self, tiles};
 use crate::{Error, Result};
 
@@ -250,6 +253,14 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         let mut side = shading::map(&graph.net, b, None, &mut host)
             .map_err(|m| fail(format!("material {material}: {m}")))?;
         warnings.extend(side.warnings);
+        let front = (&mapped.material, &mapped.textures);
+        if take_front_class(front, (&mut side.material, &mut side.textures)) {
+            warnings.push(format!(
+                "material {material}: its back states transmission, opacity, thin-walled or \
+                 interior IOR inputs of its own, but a surface has one class and interior, so \
+                 it takes the front's"
+            ));
+        }
         mapped.material.double_sided = 1;
         side.material.double_sided = 1;
         back = Some(SceneMaterial {
@@ -275,6 +286,58 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         files: reader.files,
         warnings,
     })
+}
+
+/// Gives `back` what decides how rays take the surface: the front's transmission, opacity and
+/// thin-walled inputs, and a solid dielectric's IOR, which is its interior's and so the one both
+/// faces refract against. All else on it stays its own. True where the two sides differed.
+fn take_front_class(
+    (f, ft): (&Material, &MaterialTextures),
+    (b, bt): (&mut Material, &mut MaterialTextures),
+) -> bool {
+    let before = *b;
+    let solid = f.transmission_weight > 0.0 && f.thin_walled == 0;
+    b.transmission_weight = f.transmission_weight;
+    b.transmission_color = f.transmission_color;
+    b.transmission_depth = f.transmission_depth;
+    b.transmission_scatter = f.transmission_scatter;
+    b.transmission_scatter_anisotropy = f.transmission_scatter_anisotropy;
+    b.transmission_dispersion_scale = f.transmission_dispersion_scale;
+    b.transmission_dispersion_abbe_number = f.transmission_dispersion_abbe_number;
+    b.alpha_mode = f.alpha_mode;
+    b.alpha_cutoff = f.alpha_cutoff;
+    b.geometry_opacity = f.geometry_opacity;
+    b.thin_walled = f.thin_walled;
+    if solid {
+        b.specular_ior = f.specular_ior;
+    }
+    let medium: Vec<usize> = [
+        slot::TRANSMISSION_COLOR,
+        slot::TRANSMISSION_DEPTH,
+        slot::TRANSMISSION_SCATTER,
+        slot::TRANSMISSION_SCATTER_ANISOTROPY,
+        slot::DISPERSION_SCALE,
+        slot::DISPERSION_ABBE,
+    ]
+    .into_iter()
+    .chain(solid.then_some(slot::SPECULAR_IOR))
+    .collect();
+    for &s in [slot::OPACITY, slot::TRANSMISSION].iter().chain(&medium) {
+        b.textures[s] = f.textures[s];
+    }
+    let reads = |t: Option<&TexRef>| t.map(|r| (r.image, r.channel, r.uv_set, r.uv));
+    let more = |t: &MaterialTextures, s| t.more.get(&s).copied().flatten();
+    let same = reads(ft.opacity.as_ref()) == reads(bt.opacity.as_ref())
+        && reads(ft.transmission.as_ref()) == reads(bt.transmission.as_ref())
+        && medium
+            .iter()
+            .all(|&s| reads(more(ft, s).as_ref()) == reads(more(bt, s).as_ref()));
+    bt.opacity = ft.opacity;
+    bt.transmission = ft.transmission;
+    for &s in &medium {
+        bt.more.insert(s, more(ft, s));
+    }
+    !same || before != *b
 }
 
 enum Failure {
