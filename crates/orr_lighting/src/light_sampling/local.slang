@@ -3,8 +3,8 @@
 // tile's surfaces, found by reprojecting each pixel through the G-buffer's motion. A pixel
 // whose reprojected surface lay at another distance from the camera was hidden then, and adds
 // nothing; the sampler's share falls with the tile's surfaces that found no feedback. `main`
-// also bounds the tile's surfaces, and `refine` splits the slots of emissive entries whose
-// cooked sets hold trees toward them.
+// also bounds the tile's surfaces when a slot's emissive entry has a cooked set holding a tree,
+// and `refine` splits those slots toward them.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
@@ -66,6 +66,9 @@ groupshared uint bounds_hi[3];
 groupshared uint bounds_radius;
 groupshared uint bounds_cos;
 groupshared float3 normal_sums[LOCAL_TILE * LOCAL_TILE];
+// The tile's sampler before its bounds, and whether a slot holds a tree, so `refine` needs them.
+groupshared LocalLights built;
+groupshared bool bounded;
 
 // The feedback id that `pixel`'s surface found in the last frame, or NO_LIGHT; false for
 // sky pixels.
@@ -150,21 +153,8 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
     uint2 pixel = uint2(max(at, int2(0)));
     uint id = NO_LIGHT;
     bool surface = all(at >= 0) && all(pixel < root.gbuffer.extent) && reprojected(pixel, id);
-    float3 position = float3(0.0);
-    float3 normal = float3(0.0);
     if (surface)
-    {
         InterlockedAdd(surfaces[0], 1);
-        GSurface g = load_gsurface(root.view, root.gbuffer, pixel);
-        position = g.position;
-        normal = g.normal;
-        for (uint c = 0; c < 3; c++)
-        {
-            InterlockedMin(bounds_lo[c], ordered(position[c]));
-            InterlockedMax(bounds_hi[c], ordered(position[c]));
-        }
-    }
-    normal_sums[lane] = normal;
     if (id != NO_LIGHT)
     {
         InterlockedAdd(surfaces[1], 1);
@@ -179,6 +169,84 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
             }
         }
     }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane == 0)
+    {
+        LocalLights out = (LocalLights)0;
+        float p[LOCAL_LIGHTS];
+        for (uint k = 0; k < LOCAL_LIGHTS; k++)
+            p[k] = 0.0;
+        uint lights = root.set.scene.light_capacity;
+        bool tree = false;
+        while (out.count < LOCAL_LIGHTS)
+        {
+            uint k = out.count;
+            uint best = GATHERED;
+            uint most = 0;
+            for (uint j = 0; j < GATHERED; j++)
+            {
+                uint c = gathered_counts[j];
+                if (c > most || (c == most && c > 0 && gathered_ids[j] < gathered_ids[best]))
+                {
+                    most = c;
+                    best = j;
+                }
+            }
+            if (best == GATHERED)
+                break;
+            gathered_counts[best] = 0;
+            uint light = gathered_ids[best];
+            bool entry = light >= lights && light != feedback_environment(root.set);
+            uint positions = entry ? root.set.emissive[light - lights].count : 1;
+            // Feedback is the last frame's: an entry this frame's selection left empty has
+            // nothing to draw.
+            if (positions == 0)
+                continue;
+            tree = tree || (entry && root.set.emissive[light - lights].node_count > 0);
+            out.count = k + 1;
+            LocalLight l = { light, 0, positions, 0, 0.0 };
+            // Ascending by light: insertion keeps the slots sorted.
+            uint at_slot = k;
+            while (at_slot > 0 && out.lights[at_slot - 1].id > light)
+            {
+                out.lights[at_slot] = out.lights[at_slot - 1];
+                p[at_slot] = p[at_slot - 1];
+                at_slot--;
+            }
+            out.lights[at_slot] = l;
+            p[at_slot] = float(most);
+        }
+        finish_slots(out, p, out.count);
+        uint found = surfaces[1];
+        out.share = out.count > 0 ? root.share * float(found) / float(max(surfaces[0], 1u)) : 0.0;
+        out.receiver = float4(0.0, 0.0, 0.0, -1.0);
+        out.normal = float4(0.0, 0.0, 1.0, -1.0);
+        built = out;
+        bounded = tree && surfaces[0] > 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // Only `refine` reads the bounds, and only for slots whose entries hold trees.
+    if (!bounded)
+    {
+        if (lane == 0)
+            root.local[group.y * root.columns + group.x] = built;
+        return;
+    }
+
+    float3 position = float3(0.0);
+    float3 normal = float3(0.0);
+    if (surface)
+    {
+        GSurface g = load_gsurface(root.view, root.gbuffer, pixel);
+        position = g.position;
+        normal = g.normal;
+        for (uint c = 0; c < 3; c++)
+        {
+            InterlockedMin(bounds_lo[c], ordered(position[c]));
+            InterlockedMax(bounds_hi[c], ordered(position[c]));
+        }
+    }
+    normal_sums[lane] = normal;
     GroupMemoryBarrierWithGroupSync();
     for (uint step = LOCAL_TILE * LOCAL_TILE / 2; step > 0; step >>= 1)
     {
@@ -199,55 +267,9 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
     GroupMemoryBarrierWithGroupSync();
     if (lane != 0)
         return;
-
-    LocalLights out = (LocalLights)0;
-    float p[LOCAL_LIGHTS];
-    for (uint k = 0; k < LOCAL_LIGHTS; k++)
-        p[k] = 0.0;
-    while (out.count < LOCAL_LIGHTS)
-    {
-        uint k = out.count;
-        uint best = GATHERED;
-        uint most = 0;
-        for (uint j = 0; j < GATHERED; j++)
-        {
-            uint c = gathered_counts[j];
-            if (c > most || (c == most && c > 0 && gathered_ids[j] < gathered_ids[best]))
-            {
-                most = c;
-                best = j;
-            }
-        }
-        if (best == GATHERED)
-            break;
-        gathered_counts[best] = 0;
-        uint light = gathered_ids[best];
-        uint lights = root.set.scene.light_capacity;
-        bool entry = light >= lights && light != feedback_environment(root.set);
-        uint positions = entry ? root.set.emissive[light - lights].count : 1;
-        // Feedback is the last frame's: an entry this frame's selection left empty has nothing
-        // to draw.
-        if (positions == 0)
-            continue;
-        out.count = k + 1;
-        LocalLight l = { light, 0, positions, 0, 0.0 };
-        // Ascending by light: insertion keeps the slots sorted.
-        uint at_slot = k;
-        while (at_slot > 0 && out.lights[at_slot - 1].id > light)
-        {
-            out.lights[at_slot] = out.lights[at_slot - 1];
-            p[at_slot] = p[at_slot - 1];
-            at_slot--;
-        }
-        out.lights[at_slot] = l;
-        p[at_slot] = float(most);
-    }
-    finish_slots(out, p, out.count);
-    uint found = surfaces[1];
-    out.share = out.count > 0 ? root.share * float(found) / float(max(surfaces[0], 1u)) : 0.0;
-    bool any_surface = surfaces[0] > 0;
-    out.receiver = float4(center, any_surface ? asfloat(bounds_radius) : -1.0);
-    out.normal = float4(axis, any_surface && dot(sum, sum) > 0.0 ? unordered(bounds_cos) : -1.0);
+    LocalLights out = built;
+    out.receiver = float4(center, asfloat(bounds_radius));
+    out.normal = float4(axis, dot(sum, sum) > 0.0 ? unordered(bounds_cos) : -1.0);
     root.local[group.y * root.columns + group.x] = out;
 }
 

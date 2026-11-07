@@ -225,9 +225,9 @@ public struct LocalLights
     public float share;
     public uint _pad0;
     public uint _pad1;
-    // The tile's surfaces this frame: a sphere around their points (render space, radius in w;
-    // radius below 0 for none) and a cone around their normals (axis, cosine of its half
-    // angle in w).
+    // The tile's surfaces this frame, where a slot's entry holds a tree: a sphere around their
+    // points (render space, radius in w; radius below 0 for none or not bounded) and a cone
+    // around their normals (axis, cosine of its half angle in w).
     public float4 receiver;
     public float4 normal;
 }
