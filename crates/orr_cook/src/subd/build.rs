@@ -383,7 +383,7 @@ pub(super) fn build(
         .enumerate()
         .map(|(i, m)| Section {
             material_slot: i as u16,
-            flags: crate::mesh::section_flags(m),
+            flags: crate::mesh::section_flags(m, None),
             _pad: 0,
         })
         .collect();

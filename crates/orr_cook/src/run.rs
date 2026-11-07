@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -277,6 +278,16 @@ struct PendingInstances<'m> {
     record: Option<(usize, usize)>,
 }
 
+/// A library mesh waiting for the materials its sections' backs name, which imports plan.
+struct PendingMesh<'m> {
+    archive: usize,
+    asset: usize,
+    name: &'m str,
+    mesh: &'m MeshInput,
+    materials: &'m [Material],
+    settings: &'m MeshSettings,
+}
+
 /// A cooked unit: where its entries are, the job's seconds and its report details.
 type UnitResult = (From, f64, Detail);
 
@@ -322,6 +333,7 @@ struct Run<'m, 's> {
     files: Vec<Vec<PathBuf>>,
     imports: Vec<Import<'m>>,
     instances: Vec<PendingInstances<'m>>,
+    meshes: Vec<PendingMesh<'m>>,
     /// Assemblies by model unit.
     assemblies: HashMap<usize, Assembly>,
     assets: Vec<AssetReport>,
@@ -361,6 +373,7 @@ impl<'m, 's> Run<'m, 's> {
             files: vec![Vec::new(); n],
             imports: Vec::new(),
             instances: Vec::new(),
+            meshes: Vec::new(),
             assemblies: HashMap::new(),
             assets: Vec::new(),
             details: HashMap::new(),
@@ -412,8 +425,6 @@ impl<'m, 's> Run<'m, 's> {
                 _ => None,
             };
             run.old.push(old);
-            // Texture assets first, so that library meshes find the textures their
-            // materials name; reports keep the manifest's order.
             let first = run.assets.len();
             run.assets
                 .extend(spec.assets.iter().map(|asset| AssetReport {
@@ -421,35 +432,21 @@ impl<'m, 's> Run<'m, 's> {
                     archive: a,
                     ..AssetReport::default()
                 }));
-            let n = spec.assets.len();
-            let is_texture = |i: &usize| matches!(spec.assets[*i].source, Source::Texture { .. });
-            let order = (0..n)
-                .filter(is_texture)
-                .chain((0..n).filter(|i| !is_texture(i)));
-            let mut textures = HashMap::new();
-            for i in order {
-                let asset = &spec.assets[i];
-                run.source(a, first + i, asset, &previous, &textures)?;
-                if is_texture(&i) {
-                    let u = &run.units[run.by_name[&(a, asset.name.clone())]];
-                    let texture = MapTexture::lone(&u.name, u.key);
-                    textures.insert(AssetId::from_name(&asset.name), texture);
-                }
+            for (i, asset) in spec.assets.iter().enumerate() {
+                run.source(a, first + i, asset, &previous)?;
             }
         }
         Ok(run)
     }
 
-    /// Turns a source into units, or into a pending import or instance set, reporting as
-    /// asset `index`. Library meshes read `textures`: the archive's texture assets by id,
-    /// with their unit names and keys.
+    /// Turns a source into units, or into a pending import, instance set or mesh, reporting
+    /// as asset `index`.
     fn source(
         &mut self,
         a: usize,
         index: usize,
         asset: &'m crate::AssetSpec,
         previous: &HashMap<Hash32, Record>,
-        textures: &HashMap<AssetId, MapTexture>,
     ) -> Result<()> {
         let name = asset.name.as_str();
         match &asset.source {
@@ -552,11 +549,14 @@ impl<'m, 's> Run<'m, 's> {
                 mesh,
                 materials,
                 settings,
-            } => {
-                let (units, assembly) = mesh_units(name, mesh, materials, settings, textures)?;
-                self.add_units(a, index, units);
-                self.add_assemblies(a, assembly);
-            }
+            } => self.meshes.push(PendingMesh {
+                archive: a,
+                asset: index,
+                name,
+                mesh,
+                materials,
+                settings,
+            }),
             Source::Subd {
                 cage,
                 materials,
@@ -793,6 +793,7 @@ impl<'m, 's> Run<'m, 's> {
     {
         let (tx, rx) = mpsc::channel::<Msg>();
         self.import_all(scope, threads, &tx, &rx)?;
+        self.mesh_sources()?;
         self.instance_units()?;
         self.link_all()?;
         self.open_writers()?;
@@ -926,6 +927,144 @@ impl<'m, 's> Run<'m, 's> {
                 record: Some((a, self.records[a].len() - 1)),
             });
         }
+    }
+
+    /// Units of library meshes, whose sections' backs name materials of any planned unit or
+    /// library mesh. A material's textures are the texture units of the archive holding it.
+    fn mesh_sources(&mut self) -> Result<()> {
+        let meshes = std::mem::take(&mut self.meshes);
+        let units: HashMap<(usize, AssetId), usize> = self
+            .by_name
+            .iter()
+            .map(|((a, n), &u)| ((*a, AssetId::from_name(n)), u))
+            .collect();
+        let first_units: HashMap<AssetId, usize> = self
+            .first_by_name
+            .iter()
+            .map(|(n, &u)| (AssetId::from_name(n), u))
+            .collect();
+        let mut library: HashMap<(usize, AssetId), Material> = HashMap::new();
+        let mut first_library: HashMap<AssetId, (usize, Material)> = HashMap::new();
+        for p in &meshes {
+            for (i, m) in p.materials.iter().enumerate() {
+                let id = AssetId::from_name(&format!("{}/material/{i}", p.name));
+                library.insert((p.archive, id), *m);
+                let first = first_library.entry(id).or_insert((p.archive, *m));
+                if p.archive < first.0 {
+                    *first = (p.archive, *m);
+                }
+            }
+        }
+        for p in meshes {
+            let a = p.archive;
+            let is_material = |u: &&usize| self.units[**u].class == Class::Material as u16;
+            let read = |u: usize| -> Result<Material> {
+                Ok(bytemuck::pod_read_unaligned(&self.unit_blob(u)?))
+            };
+            // As `named`: the archive's own material, else the first archive's that has one,
+            // with the archive holding it.
+            let material = |id: AssetId| -> Result<Option<(usize, Material)>> {
+                if let Some(m) = library.get(&(a, id)) {
+                    return Ok(Some((a, *m)));
+                }
+                if let Some(&u) = units.get(&(a, id)).filter(is_material) {
+                    return read(u).map(|m| Some((a, m)));
+                }
+                let unit = first_units.get(&id).filter(is_material);
+                match (unit, first_library.get(&id)) {
+                    (Some(&u), Some(&(la, m))) if la < self.units[u].archive => Ok(Some((la, m))),
+                    (Some(&u), _) => read(u).map(|m| Some((self.units[u].archive, m))),
+                    (None, l) => Ok(l.copied()),
+                }
+            };
+            let mut backs = Vec::with_capacity(p.materials.len());
+            for m in p.materials {
+                backs.push(match m.back {
+                    AssetId::NONE => None,
+                    id => Some(material(id)?.ok_or_else(|| Error::UnknownMaterial {
+                        asset: p.name.into(),
+                        material: id.to_string(),
+                    })?),
+                });
+            }
+            let mut textures: HashMap<usize, HashMap<AssetId, MapTexture>> =
+                HashMap::from([(a, HashMap::new())]);
+            let fronts = p.materials.iter().map(|m| (a, m));
+            for (archive, m) in fronts.chain(backs.iter().flatten().map(|(b, m)| (*b, m))) {
+                let held = textures.entry(archive).or_default();
+                for b in &m.textures {
+                    if b.texture != AssetId::NONE
+                        && !held.contains_key(&b.texture)
+                        && let Some(t) = self.map_texture(&units, archive, b.texture)?
+                    {
+                        held.insert(b.texture, t);
+                    }
+                }
+            }
+            let backs: Vec<_> = backs
+                .iter()
+                .map(|b| b.as_ref().map(|(archive, m)| (m, &textures[archive])))
+                .collect();
+            let (new, assembly) = mesh_units(
+                p.name,
+                p.mesh,
+                p.materials,
+                &backs,
+                p.settings,
+                &textures[&a],
+            )?;
+            self.add_units(a, p.asset, new);
+            self.add_assemblies(a, assembly);
+        }
+        Ok(())
+    }
+
+    /// Texture `id` of archive `a`, by `units`, as a mesh reads it: a cooked texture or a set
+    /// of tiles.
+    fn map_texture(
+        &self,
+        units: &HashMap<(usize, AssetId), usize>,
+        a: usize,
+        id: AssetId,
+    ) -> Result<Option<MapTexture>> {
+        let Some(&u) = units.get(&(a, id)) else {
+            return Ok(None);
+        };
+        let unit = &self.units[u];
+        Ok(match Class::from_u16(unit.class) {
+            Some(Class::Texture) => Some(MapTexture::lone(&unit.name, unit.key)),
+            Some(Class::TextureTiles) => {
+                let set = TextureTiles::parse(&self.unit_blob(u)?)?;
+                let mut tiles = Vec::with_capacity(set.tiles.len());
+                for t in &set.tiles {
+                    let tile = &self.units[units[&(a, t.texture)]];
+                    tiles.push(([t.column, t.row], tile.name.clone(), tile.key));
+                }
+                Some(MapTexture {
+                    unit: unit.name.clone(),
+                    key: unit.key,
+                    tiles,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// The first blob of unit `u`: its planned bytes, else its linked entry's.
+    fn unit_blob(&self, u: usize) -> Result<Vec<u8>> {
+        let unit = &self.units[u];
+        if let Some(Work::Blobs { blobs, .. }) = &unit.work {
+            return Ok(blobs[0].0.clone());
+        }
+        let State::Done(done) = &unit.state else {
+            unreachable!("a unit planned without its bytes is linked");
+        };
+        self.with_archive(unit.archive, &done.from, |arc| {
+            let blob = &arc.blobs(&arc.entries()[done.entries[0]])[0];
+            let mut bytes = vec![0; blob.raw_len as usize];
+            arc.read(blob, &mut bytes).map(|()| bytes)
+        })?
+        .map_err(Into::into)
     }
 
     /// Keys and dependencies of instance sources, from the keys of the models and
@@ -1857,8 +1996,14 @@ fn plan_scene(
         let mut model_materials = Vec::with_capacity(model.materials.len());
         for (sec, &mi) in mesh.sections_mut().iter_mut().zip(&model.materials) {
             let cooked = &materials[mi].2;
+            let back = src.materials[mi].back.map(|b| &materials[b].2);
             // Packing binds the textures that decide a section's class and emission.
-            *sec = SectionData::new(sec.indices.clone(), cooked, map_spec(cooked, &textures));
+            *sec = section_data(
+                sec.indices.clone(),
+                cooked,
+                back.map(|b| (b, &textures)),
+                &textures,
+            );
             deps.extend(sec.maps.units().map(str::to_string));
             model_materials.push(if bakes_displacement(&model.settings, &sec.maps) {
                 *baked.entry(mi).or_insert_with(|| {
@@ -1983,6 +2128,22 @@ fn static_material_unit(name: &str, m: &Material) -> NewUnit<'static> {
     material_unit(format!("{name}/static"), &m)
 }
 
+/// A section of `indices` drawn with `m`, whose back is `back` where it has one of its own,
+/// with the textures each binds. A section whose front emits nothing weighs its clusters by its back's
+/// emission.
+fn section_data(
+    indices: Range<usize>,
+    m: &Material,
+    back: Option<(&Material, &HashMap<AssetId, MapTexture>)>,
+    textures: &HashMap<AssetId, MapTexture>,
+) -> SectionData {
+    let mut maps = map_spec(m, textures);
+    if let Some((b, held)) = back.filter(|(b, _)| !m.emits() && b.emits()) {
+        maps.emission = map_spec(b, held).emission;
+    }
+    SectionData::new(indices, m, back.map(|b| b.0), maps)
+}
+
 /// A material entry holding `m`.
 fn material_unit(name: String, m: &Material) -> NewUnit<'static> {
     let bytes = bytemuck::bytes_of(m).to_vec();
@@ -2075,12 +2236,14 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, MapTexture>) -> MapSpec {
     }
 }
 
-/// A mesh, its materials and a model from a library caller's mesh, whose materials name
-/// textures among `textures`, and the model's assembly.
+/// A mesh, its materials and a model from a library caller's mesh, and the model's assembly.
+/// `backs` holds the material each one's back names with the textures it binds, and `textures`
+/// the textures the materials bind.
 fn mesh_units(
     name: &str,
     input: &MeshInput,
     materials: &[Material],
+    backs: &[Option<(&Material, &HashMap<AssetId, MapTexture>)>],
     settings: &MeshSettings,
     textures: &HashMap<AssetId, MapTexture>,
 ) -> Result<(Vec<NewUnit<'static>>, Option<Assembly>)> {
@@ -2100,22 +2263,18 @@ fn mesh_units(
     let mut sections = Vec::new();
     let mut materials_out = Vec::new();
     let mut deps = Vec::new();
-    for (i, (m, span)) in materials.iter().zip(&input.sections).enumerate() {
-        let maps = map_spec(m, textures);
-        deps.extend(maps.units().map(str::to_string));
+    for (i, ((m, back), span)) in materials.iter().zip(backs).zip(&input.sections).enumerate() {
+        let first = span.first as usize;
+        let section = section_data(first..first + span.count as usize, m, *back, textures);
+        deps.extend(section.maps.units().map(str::to_string));
         let mut unit = material_unit(format!("{name}/material/{i}"), m);
-        if bakes_displacement(settings, &maps) {
+        if bakes_displacement(settings, &section.maps) {
             let baked = static_material_unit(&unit.name, m);
             units.push(std::mem::replace(&mut unit, baked));
         }
         materials_out.push((AssetId::from_name(&unit.name), unit.key));
         units.push(unit);
-        let first = span.first as usize;
-        sections.push(SectionData::new(
-            first..first + span.count as usize,
-            m,
-            maps,
-        ));
+        sections.push(section);
     }
     deps.sort_unstable();
     deps.dedup();

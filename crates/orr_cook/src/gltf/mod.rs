@@ -980,6 +980,7 @@ impl Imported<'_> {
             sections.push(SectionData::new(
                 at..end,
                 &self.materials[&index].material,
+                None,
                 Default::default(),
             ));
             materials.push(index);
@@ -1569,6 +1570,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
                 SectionData::new(
                     range.clone(),
                     &b.materials[index].material,
+                    None,
                     Default::default(),
                 )
             })

@@ -254,10 +254,9 @@ pub enum Source {
         #[serde(default)]
         settings: VolumeSettings,
     },
-    /// A mesh built in memory, one material per section; library callers only. Alpha-tested
-    /// sections with an opacity texture keep every triangle alpha-tested without micromaps,
-    /// and displaced sections bound their clusters by the declared range, since the cook
-    /// does not read the bound textures.
+    /// A mesh built in memory, one material per section, cooked as `<name>/material/<i>`;
+    /// library callers only. Its materials bind texture units of its archive, and a material's
+    /// `back` names a material unit of any source or another such mesh's material.
     #[serde(skip)]
     Mesh {
         mesh: MeshInput,

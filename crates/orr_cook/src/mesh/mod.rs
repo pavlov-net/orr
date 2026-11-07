@@ -341,8 +341,9 @@ pub(crate) fn reads_tangent(m: &Material) -> bool {
     m.specular_anisotropy > 0.0 || m.coat_anisotropy > 0.0 || coat_map || m.surface != 0
 }
 
-/// [`Section`] flags of a section drawn with material `m`.
-pub(crate) fn section_flags(m: &Material) -> u8 {
+/// [`Section`] flags of a section drawn with material `m`, whose back is `back` where it has
+/// one of its own: the section emits where either side does.
+pub(crate) fn section_flags(m: &Material, back: Option<&Material>) -> u8 {
     let mut flags = 0;
     if m.alpha_mode == Material::MASK {
         flags |= Section::ALPHA_TESTED;
@@ -350,7 +351,7 @@ pub(crate) fn section_flags(m: &Material) -> u8 {
     if m.double_sided != 0 {
         flags |= Section::DOUBLE_SIDED;
     }
-    if m.emits() {
+    if m.emits() || back.is_some_and(Material::emits) {
         flags |= Section::EMISSIVE;
     }
     if m.casts() {
@@ -368,11 +369,17 @@ impl SectionData {
         SurfaceClass::from_flags(self.flags) == Some(SurfaceClass::Opaque)
     }
 
-    /// A section of `indices` drawn with material `m`.
-    pub(crate) fn new(indices: Range<usize>, m: &Material, maps: MapSpec) -> Self {
+    /// A section of `indices` drawn with material `m`, whose back is `back` where it has one
+    /// of its own.
+    pub(crate) fn new(
+        indices: Range<usize>,
+        m: &Material,
+        back: Option<&Material>,
+        maps: MapSpec,
+    ) -> Self {
         Self {
             indices,
-            flags: section_flags(m),
+            flags: section_flags(m, back),
             subsurface: m.subsurface_weight > 0.0
                 && m.thin_walled == 0
                 && m.transmission_weight == 0.0,

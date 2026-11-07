@@ -1389,6 +1389,7 @@ impl<'s> Importer<'s> {
             sections.push(SectionData::new(
                 indices.len()..indices.len() + tris.len(),
                 &self.materials[m].material,
+                None,
                 Default::default(),
             ));
             indices.extend_from_slice(tris);

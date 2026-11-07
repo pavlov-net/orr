@@ -6,7 +6,8 @@ mod dag_read;
 
 use dag_read::{C, Dag, load};
 use orr_cook::{
-    ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Source, TextureSettings,
+    ArchiveSpec, AssetSpec, LodMode, Manifest, MaterialPatch, MeshInput, MeshSettings, Source,
+    TextureSettings,
 };
 use orr_math::{Vec2, Vec3};
 use orr_pack::material::{Material, slot};
@@ -287,11 +288,10 @@ fn a_dag_with_streamed_pages_has_a_row_for_its_pinned_cut() {
     );
 }
 
-/// `half` lights the part of the texture below u = 0.5, `other` the rest.
-fn emitter(path: &std::path::Path, half: u8, other: u8) -> Vec<AssetSpec> {
-    let w = 64;
-    let img = image::RgbaImage::from_fn(w, w, |x, _| {
-        let v = if x < w / 2 { half } else { other };
+/// A lamp whose emission texture is 64 x 64 texels of `texel(x, y)`.
+fn emitter(path: &std::path::Path, texel: impl Fn(u32, u32) -> u8) -> Vec<AssetSpec> {
+    let img = image::RgbaImage::from_fn(64, 64, |x, y| {
+        let v = texel(x, y);
         image::Rgba([v, v, v, 255])
     });
     img.save(path).unwrap();
@@ -318,7 +318,8 @@ fn emitter(path: &std::path::Path, half: u8, other: u8) -> Vec<AssetSpec> {
 fn emission_textures_weigh_clusters_and_key_the_mesh() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let path = dir.join("cluster_sets_emission.png");
-    let a = cook(emitter(&path, 255, 0));
+    let half = |x: u32, _| if x < 32 { 255 } else { 0 };
+    let a = cook(emitter(&path, half));
     let d = load(&a, "lamp/mesh");
     let e = &d.info.emissive;
     let set = set_of(e, 0, 0);
@@ -343,13 +344,62 @@ fn emission_textures_weigh_clusters_and_key_the_mesh() {
             .unwrap()
             .content_hash
     };
-    let brighter = cook(emitter(&path, 255, 255));
+    let brighter = cook(emitter(&path, |_, _| 255));
     assert_ne!(mesh_hash(&a), mesh_hash(&brighter));
     let d = load(&brighter, "lamp/mesh");
     assert_eq!(
         set_of(&d.info.emissive, 0, 0).count as usize,
         d.clusters.len()
     );
+}
+
+#[test]
+fn a_section_whose_back_alone_emits_is_ranked_by_its_backs_emission() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let half = |x: u32, _| if x < 32 { 255 } else { 0 };
+    let mut assets = emitter(&dir.join("cluster_sets_back.png"), half);
+    let patch = |luminance| AssetSpec {
+        name: if luminance > 0.0 { "warm" } else { "dull" }.into(),
+        source: Source::Material(MaterialPatch {
+            emission_color: Some([1.0, 0.8, 0.6]),
+            emission_luminance: Some(luminance),
+            ..MaterialPatch::default()
+        }),
+    };
+    let backed = |name: &str, back: &str| {
+        let m = Material {
+            double_sided: 1,
+            back: AssetId::from_name(back),
+            ..Material::default()
+        };
+        let lod = LodMode::Discrete { errors: Vec::new() };
+        mesh(name, grid(96, 1), vec![m], lod)
+    };
+    // "panel" comes before the mesh whose material its back names.
+    assets.insert(0, backed("panel", "lamp/material/0"));
+    assets.extend([
+        patch(5.0),
+        patch(0.0),
+        backed("warm_back", "warm"),
+        backed("dull_back", "dull"),
+    ]);
+    let a = cook(assets);
+
+    let d = load(&a, "warm_back/mesh");
+    assert_ne!(d.info.sections[0].flags & Section::EMISSIVE, 0);
+    let set = set_of(&d.info.emissive, 0, 0);
+    assert_eq!(set.count as usize, d.clusters.len());
+    assert!(set.total > 0.0);
+    // A back that emits nothing ranks nothing: the rank follows the back's emission.
+    let d = load(&a, "dull_back/mesh");
+    assert_eq!(d.info.emissive.ranks, [NO_RANK]);
+    // A textured back weighs the clusters by its own emission map.
+    let d = load(&a, "panel/mesh");
+    let set = set_of(&d.info.emissive, 0, 0);
+    assert!(set.count > 0 && (set.count as usize) < d.clusters.len());
+    let total: f64 = d.clusters.iter().flat_map(|c| &c.tris).map(area).sum();
+    let share = f64::from(set.total) / total;
+    assert!((0.4..0.6).contains(&share), "lit share {share}");
 }
 
 /// A unit cube: a closed section of flat faces, or five of them with `open`.
