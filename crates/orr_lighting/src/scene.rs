@@ -283,17 +283,16 @@ impl SceneLighting {
     }
 
     /// A change of `emissive_clusters` reallocates the producer cluster pool, and a change of
-    /// `world_cache` or `caustics` reallocates and clears the cache or the caustics; old buffers
-    /// are freed once the work submitted so far has completed.
+    /// `world_cache` reallocates and clears the cache. The caustics take theirs as
+    /// [`CausticSettings`] describes. Old buffers are freed once the work submitted so far has
+    /// completed.
     pub fn set_settings(&mut self, settings: &SceneLightingSettings) -> Result<(), Error> {
         check_settings(settings)?;
         if settings.world_cache != *self.cache.settings() {
             self.cache = WorldCache::new(&self.device, &settings.world_cache)?;
         }
-        if settings.caustics != *self.caustics.settings() {
-            self.caustics
-                .resize(&self.device, &self.scene_desc, &settings.caustics)?;
-        }
+        self.caustics
+            .set_settings(&self.device, &self.scene_desc, &settings.caustics)?;
         if settings.emissive_clusters != self.settings.emissive_clusters {
             self.cluster_cdf = device_local(
                 &self.device,

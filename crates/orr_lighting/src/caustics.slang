@@ -15,9 +15,9 @@
 // cosine; the resolve turns the frame's sum into irradiance and blends it into a running mean
 // of the frames' estimates, zero included where a frame deposited none.
 // A point reads the levels `caustic_level` puts it between, first one by the blend between
-// them and then the other, at most two probes, jittered across the cell; near a boundary
-// between normal buckets it draws one of the two by how close the normal lies to it, and a
-// photon there deposits in each. A cell's irradiance holds only where every photon inside it
+// them and then the other, at most two probes, jittered across a share of the cell; near a
+// boundary between normal buckets it draws one of the two by how close the normal lies to it,
+// and a photon there deposits in each. A cell's irradiance holds only where every photon inside it
 // deposited there, and a cell spans points whose levels differ by one, so a photon deposits in
 // the four levels from one finer than its point's to two coarser. Only Lambertian receivers
 // take the grid's irradiance exactly.
@@ -147,7 +147,7 @@ public struct CausticsGpu
     public float3 offset;               // map: this frame's offset of its cells, m
     public float radius;                // map: this frame's gather radius, m
     public uint photon_count;           // photons the frame starts, over which each carries its flux
-    public uint _pad0;
+    public float jitter;                // grid: the share of a cell's edge its reads jitter across
     public uint _pad1;
     public uint _pad2;
 }
@@ -286,7 +286,7 @@ bool grid_cell(CausticsGpu* g, uint64_t key, out float3 irradiance, out float ph
 // one its blend draws with `u.x`, where its cell has history; past that the other. A finer
 // cell gives way to the coarser where it has fewer than CAUSTIC_MIN_PHOTONS or is narrower
 // than the footprint. 0 where neither holds light. `u.y` draws the bucket and `u.zw` jitter the
-// point across the cell in the tangent plane.
+// point in the tangent plane across `CausticsGpu.jitter` of the cell's edge.
 public float3 grid_irradiance(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float width, float4 u)
 {
     float blend;
@@ -306,7 +306,7 @@ public float3 grid_irradiance(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, 
         uint l = coarse ? level + 1 : level;
         int e = g.base_cell_log2 + int(l);
         float size = exp2(float(e));
-        float3 q = p + (t * (u.z - 0.5) + b * (u.w - 0.5)) * size;
+        float3 q = p + (t * (u.z - 0.5) + b * (u.w - 0.5)) * (size * g.jitter);
         float3 irradiance;
         float photons;
         if (!grid_cell(g, cache_key(s.origin_cell, plane_point(q, n, axis, size), e, l, bucket), irradiance, photons))

@@ -36,6 +36,11 @@ pub const MAX_PHOTONS: u32 = 4096 * 65535;
 /// casting materials), deposited in a hash grid of 2^`capacity_log2` cells of 48 B on voxels
 /// whose edge doubles with each level, from 2^`base_cell_log2` m within `lod_scale` m of the
 /// scene focus. Each cell keeps a running mean of the frames' irradiance.
+///
+/// Through [`crate::SceneLighting::set_settings`], `photons`, `max_temporal_samples`,
+/// `cell_lifetime` and `jitter` take effect at the next frame and keep the grid. A new
+/// `capacity_log2` or `producer_clusters` reallocates it, and those, a new `base_cell_log2` or
+/// `lod_scale`, or photons after none clear it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct CausticSettings {
     /// Photons each frame, at most [`MAX_PHOTONS`]; 0 turns caustics off, which leaves the
@@ -54,6 +59,9 @@ pub struct CausticSettings {
     pub cell_lifetime: u32,
     /// Frames of history a cell keeps; cells whose light is changing keep 8.
     pub max_temporal_samples: f32,
+    /// The share of a cell's edge each read's point jitters across, in [0, 1]: 1 blends
+    /// neighboring cells over frames, 0 reads the cell holding the point.
+    pub jitter: f32,
     /// Clusters the producer entries' caster lists hold per frame; a producer entry past it
     /// casts no photons.
     pub producer_clusters: u32,
@@ -68,6 +76,7 @@ impl Default for CausticSettings {
             lod_scale: 2.0,
             cell_lifetime: 8,
             max_temporal_samples: 16.0,
+            jitter: 1.0,
             producer_clusters: 1 << 18,
         }
     }
@@ -97,6 +106,9 @@ pub(crate) fn check_settings(s: &CausticSettings) -> Result<(), Error> {
         return Err(Error::Settings(
             "caustics photons must be at most MAX_PHOTONS",
         ));
+    }
+    if !(0.0..=1.0).contains(&s.jitter) {
+        return Err(Error::Settings("caustics jitter must lie in [0, 1]"));
     }
     if s.cell_lifetime > 255 {
         return Err(Error::Settings(
@@ -246,23 +258,32 @@ impl Caustics {
         })
     }
 
-    /// Takes `settings`, with buffers of their sizes, cleared at the next scene pass.
-    pub(crate) fn resize(
+    /// Takes `settings`. New sizes make new buffers; those and new cells, a new focus falloff
+    /// or caustics turned back on clear the grid and the casters' yields at the next scene
+    /// pass. A new photon count, history, lifetime or jitter keeps them.
+    pub(crate) fn set_settings(
         &mut self,
         device: &Device,
         scene: &SceneDesc,
         settings: &CausticSettings,
     ) -> Result<(), Error> {
         check_settings(settings)?;
-        self.b = Buffers::new(device, scene, settings)?;
+        let old = self.settings;
+        if settings.capacity_log2 != old.capacity_log2
+            || settings.producer_clusters != old.producer_clusters
+        {
+            self.b = Buffers::new(device, scene, settings)?;
+            self.recorded = [false; FRAME_SLOTS];
+            self.clear = true;
+        }
+        if settings.base_cell_log2 != old.base_cell_log2
+            || settings.lod_scale != old.lod_scale
+            || (old.photons == 0 && settings.photons > 0)
+        {
+            self.clear = true;
+        }
         self.settings = *settings;
-        self.clear = true;
-        self.recorded = [false; FRAME_SLOTS];
         Ok(())
-    }
-
-    pub(crate) fn settings(&self) -> &CausticSettings {
-        &self.settings
     }
 
     /// Empties every cell and forgets the casters' yields at the next scene pass.
@@ -307,7 +328,7 @@ impl Caustics {
                 offset: [0.0; 3],
                 radius: 0.0,
                 photon_count: s.photons,
-                _pad0: 0,
+                jitter: s.jitter,
                 _pad1: 0,
                 _pad2: 0,
             },
@@ -432,7 +453,7 @@ impl Caustics {
                 offset: offset.map(|o| o * 2.0 * radius),
                 radius,
                 photon_count: photons,
-                _pad0: 0,
+                jitter: 0.0,
                 _pad1: 0,
                 _pad2: 0,
             },
