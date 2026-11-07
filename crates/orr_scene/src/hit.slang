@@ -793,12 +793,14 @@ void triangle_input(SceneRoot* s, ViewConstants* v, float3 d, TracedTriangle tri
     finish_input(s, v, d, tri.material, tri.placement, sided, context, i, h);
 }
 
-// The surface input of `t` at `bary` on the side that `d` meets, as a ray along `d` resolves
-// it with no footprint: what light sampling reads of an emitter's point.
+// The surface input of `t` at `bary` on the side that `d` meets, as a ray past the camera along
+// `d` resolves it with no footprint and hardware filtering: what light sampling reads of an
+// emitter's point.
 public SurfaceInput emitter_input(SceneRoot* s, TracedTriangle t, uint primitive, float2 bary, float3 d)
 {
     HitInput h;
-    HitContext context = (HitContext)0;
+    RayCone none = { 0.0, 0.0 };
+    HitContext context = hit_context(HIT_SECONDARY, 0, none, 0.0);
     triangle_input(s, nullptr, d, t, primitive, bary, (Corners)0, false, false, true, context, h);
     return h.input;
 }
