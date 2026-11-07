@@ -1,5 +1,5 @@
 //! Dielectric paths on the bed: the interior list, Beer transmittance through a slab,
-//! rough refraction, the glass furnace, single scattering against a CPU integral, an albedo-1
+//! rough refraction, the glass furnace and a diffuse sphere beside glass in one, single scattering against a CPU integral, an albedo-1
 //! medium, presence layers, a camera inside water, layer guides under camera rotation,
 //! the frosted-glass term of rough glass, dispersion: a white line through a prism against a
 //! CPU model, a dispersive furnace, and paths without dispersive hits, the layer tiles
@@ -13,7 +13,8 @@ use lighting_suite::bed::{
     MILKY_SLAB, MIXED_SLAB, NEAR, OverlayFrontLayer, PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, PRISM,
     PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Particle, ParticleLook, Paths, ROUGH_SLAB,
     SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB, TWO_SIDED_SLAB, WATER_BOX,
-    assert_close, fresnel, image_mean, prism_corners, reference, surface_mean, water_transmission,
+    WHITE_SPHERE, assert_close, fresnel, image_mean, pixel_of, prism_corners, reference,
+    surface_mean, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -380,15 +381,51 @@ fn a_glass_sphere_in_a_furnace_keeps_its_energy() {
     assert_clean();
 }
 
-/// A scattering slab under a wide sun disc 10 degrees from the zenith, seen straight down,
-/// against the single-scattering integral of the same model over the disc: each direction's
+/// A white diffuse sphere beside a clear glass one in a uniform environment returns the
+/// environment on its side that faces the glass, in real time and in the reference: the light
+/// it takes through the glass, where shadow rays end, comes in full by BSDF rays.
+#[test]
+fn a_diffuse_sphere_beside_glass_in_a_furnace_returns_the_environment() {
+    let white = Vec3::new(-1.1, 0.0, 0.0);
+    let spec = Spec {
+        copies: vec![
+            at(WHITE_SPHERE, white),
+            at(GLASS_SPHERE, Vec3::new(1.1, 0.0, 0.0)),
+        ],
+        lights: Vec::new(),
+        environment: Some(FURNACE_RADIANCE),
+        eye: Vec3::new(0.0, 0.0, 6.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        focus: None,
+    };
+    let facing = pixel_of(&spec, white + Vec3::new(0.8, 0.0, 0.6));
+    let mut bed = Bed::with(spec);
+    let real_time = ViewLighting {
+        dielectric_depth: 8,
+        ..ViewLighting::default()
+    };
+    let truth = ViewLighting {
+        dielectric_depth: 8,
+        ..reference(8)
+    };
+    for (what, settings) in [("real time", real_time), ("reference", truth)] {
+        let image = render_paths(&mut bed, &paths(settings), 32);
+        let got = image.around(facing, 4);
+        assert_close(what, got, FURNACE_RADIANCE.map(f64::from), 0.01);
+    }
+    assert_clean();
+}
+
+/// A scattering slab under a wide sun disc 20 degrees from the zenith, seen straight down, so
+/// that its top mirrors none of the disc into view, against the single-scattering integral of the same model over the disc: each direction's
 /// light refracts into the medium by Fresnel, its beam narrowing to the refracted cosine,
 /// scatters isotropically once, and leaves through the camera's refraction, which scales
 /// radiance by 1 / n^2. Shadow rays end at the slab, so the light comes by the bent rays alone.
 #[test]
 fn a_scattering_slab_matches_single_scattering_within_5_percent() {
     const RADIUS: f32 = 0.25;
-    let tilt = 10f32.to_radians();
+    let tilt = 20f32.to_radians();
     let axis = Vec3::new(tilt.sin(), tilt.cos(), 0.0);
     let sun = DirectionalLight {
         direction_to_light: axis,
@@ -483,8 +520,8 @@ fn presence_layers_pass_light_by_their_opacity() {
 }
 
 /// The floor seen from inside a water box lit by the sun: against the same floor without
-/// water, the water's absorption along the camera ray and along the sun's path to the
-/// surface, and Fresnel where sunlight enters.
+/// water, the water's absorption along the camera ray and along the sun's refracted path from
+/// the surface, and Fresnel where sunlight enters.
 #[test]
 fn a_camera_inside_water_sees_its_absorption() {
     let eye = Vec3::new(0.0, 1.5, 2.0);
@@ -498,9 +535,15 @@ fn a_camera_inside_water_sees_its_absorption() {
         focus: None,
     };
     let top = 3.99;
+    // The box widened to 24 m, so the sunlight its sides pass lands on the floor only past
+    // 10 m from the middle.
     let mut wet = Bed::with(spec(vec![
         at(FLOOR, Vec3::ZERO),
-        at(WATER_BOX, Vec3::new(0.0, top - 2.0, 0.0)),
+        Item {
+            model: WATER_BOX,
+            linear: Mat3::from_diagonal(Vec3::new(4.0, 1.0, 4.0)),
+            at: Vec3::new(0.0, top - 2.0, 0.0),
+        },
     ]));
     let water = wet.material(WATER_BOX);
     let inside = ViewLighting {
@@ -511,8 +554,11 @@ fn a_camera_inside_water_sees_its_absorption() {
     let mut dry = Bed::with(spec(vec![at(FLOOR, Vec3::ZERO)]));
     let open = center(&render_paths(&mut dry, &paths(reference(0)), 64), 4);
     let sun = SUN.direction_to_light.normalize();
-    let path = f64::from(eye.length() + top / sun.y);
-    let leave = 1.0 - fresnel(1.33, f64::from(sun.y));
+    // The sunlight refracts at the surface on its way down to the floor.
+    let mu = f64::from(sun.y);
+    let mu_t = (1.0 - (1.0 - mu * mu) / (1.33 * 1.33)).sqrt();
+    let path = f64::from(eye.length()) + f64::from(top) / mu_t;
+    let leave = 1.0 - fresnel(1.33, mu);
     let transmitted = water_transmission();
     let wanted: [f64; 3] = std::array::from_fn(|c| open[c] * leave * transmitted[c].powf(path));
     assert_close("under water", under, wanted, 0.05);
@@ -719,8 +765,9 @@ fn a_dispersive_sphere_in_a_furnace_stays_white() {
 }
 
 /// Without a dispersive material, turning dispersion off changes no pixel's radiance or ray
-/// count. The scene has no light the light set samples, whose presampling differs between
-/// beds.
+/// count. The radiance compared is the BSDF rays': next-event estimation draws some of its
+/// candidates from the light tiles, which the scene pass presamples by its own frame, not the
+/// view's.
 #[test]
 fn paths_without_dispersive_hits_ignore_the_dispersion_setting() {
     let spec = from_above(
@@ -742,7 +789,7 @@ fn paths_without_dispersive_hits_ignore_the_dispersion_setting() {
         };
         render_paths(&mut bed, &paths, 2)
     };
-    for view in [LightingDebugView::None, LightingDebugView::RaysPerPixel] {
+    for view in [LightingDebugView::BsdfOnly, LightingDebugView::RaysPerPixel] {
         let (on, off, again) = (render(true, view), render(false, view), render(true, view));
         assert!(on.mean.iter().any(|p| p[3] > 0.5), "nothing drawn");
         assert!(on == again, "{view:?} differs between identical runs");
