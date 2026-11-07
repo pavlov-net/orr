@@ -868,16 +868,7 @@ pub(crate) fn build(
                     part_blas.gpu().offset((row - parts.len()) as u64)
                 }
             };
-            records.push(RtCutGpu {
-                blas: blas[p.rest],
-                error: p.error,
-                clusters: p.clusters.len() as u32,
-                body: at(p.body),
-                parts,
-                hash: cut_hash(&p.clusters),
-                row: p.row,
-                _pad: 0,
-            });
+            records.push(p.record(&blas, parts));
         }
     }
     let mut table = device.gpu_malloc::<RtCutGpu>(
@@ -1096,8 +1087,7 @@ pub(crate) fn build_fine_cut(
     let p = jobs.plan_cut(cut, infos, animated, clas);
     let mut blocks = Vec::new();
     let blas = jobs.build(&mut step, k, &mut blocks)?;
-    let point = step.submit()?;
-    let at = |j: Option<usize>| j.map_or(0, |j| blas[j]);
+    // Everything fallible comes before the submit, so a failed cut has no build in flight.
     let mut part_table = None;
     let parts = match &p.parts {
         None => GpuPtr::NULL,
@@ -1106,25 +1096,16 @@ pub(crate) fn build_fine_cut(
                 device.gpu_malloc::<u64>(MemoryKind::Upload, parts.len() as u64, "part BLAS")?;
             let out = a.as_mut_slice().expect("upload is mapped");
             for (o, &j) in out.iter_mut().zip(parts) {
-                *o = at(j);
+                *o = j.map_or(0, |j| blas[j]);
             }
             let gpu = a.gpu();
             part_table = Some(a);
             gpu
         }
     };
-    let record = RtCutGpu {
-        blas: blas[p.rest],
-        error: p.error,
-        clusters: p.clusters.len() as u32,
-        body: at(p.body),
-        parts,
-        hash: cut_hash(&p.clusters),
-        row,
-        _pad: 0,
-    };
+    let point = step.submit()?;
     Ok((
-        record,
+        p.record(&blas, parts),
         FineCut {
             _blocks: blocks,
             _parts: part_table,
@@ -1143,6 +1124,22 @@ struct CutPlan {
     body: Option<usize>,
     /// Per animated part, None where it has no clusters; None without animated part clusters.
     parts: Option<Vec<Option<usize>>>,
+}
+
+impl CutPlan {
+    /// Its table record over the built `blas`, with its parts' BLAS table at `parts`.
+    fn record(&self, blas: &[u64], parts: GpuPtr<u64>) -> RtCutGpu {
+        RtCutGpu {
+            blas: blas[self.rest],
+            error: self.error,
+            clusters: self.clusters.len() as u32,
+            body: self.body.map_or(0, |j| blas[j]),
+            parts,
+            hash: cut_hash(&self.clusters),
+            row: self.row,
+            _pad: 0,
+        }
+    }
 }
 
 /// Each animated part's rest bounds and the sections its clusters use.
