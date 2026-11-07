@@ -418,6 +418,8 @@ fn sections_carry_their_class_and_shape_and_clusters_their_class() {
         ..Material::default()
     };
     let none = || LodMode::Discrete { errors: Vec::new() };
+    let mut many_sections = vec![Material::default(); 17];
+    many_sections.push(glass());
     let a = cook(vec![
         mesh("glass_cube", cube(false), vec![glass()], none()),
         mesh("open_box", cube(true), vec![glass()], none()),
@@ -430,6 +432,7 @@ fn sections_carry_their_class_and_shape_and_clusters_their_class() {
             vec![glass(), Material::default(), presence],
             none(),
         ),
+        mesh("many", grid(18, 18), many_sections, none()),
     ]);
     let section = |name: &str| load(&a, &format!("{name}/mesh")).info.sections[0];
 
@@ -463,10 +466,10 @@ fn sections_carry_their_class_and_shape_and_clusters_their_class() {
 
     let d = load(&a, "mixed/mesh");
     let h: &MeshHeader = &d.info.header;
-    assert_eq!(
-        (h.opaque_sections, h.layer_sections, h.high_classes),
-        (0b010, 0b101, 0)
-    );
+    assert_eq!((h.opaque_sections, h.layer_sections), (0b010, 0b101));
+    // Sections an instance can't hide share a bit, whichever of them holds the class.
+    let h = load(&a, "many/mesh").info.header;
+    assert_eq!((h.opaque_sections, h.layer_sections), (0x1ffff, 1 << 16));
     let classes = [
         SurfaceClass::Dielectric,
         SurfaceClass::Opaque,

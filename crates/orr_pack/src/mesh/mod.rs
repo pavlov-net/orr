@@ -99,12 +99,11 @@ pub struct MeshHeader {
     pub pinned_pages: u32,
     /// u32 page indices that [`PageInfo::deps`] ranges index.
     pub page_deps: Span,
-    /// Bit per section below 32: its class is opaque.
+    /// The sections of opaque class: a bit per section an instance can hide, below
+    /// [`MAX_HIDDEN_SECTION`](crate::instance::MAX_HIDDEN_SECTION), then one for all the rest.
     pub opaque_sections: u32,
-    /// Bit per section below 32: its class is dielectric or presence.
+    /// The sections of dielectric or presence class, likewise.
     pub layer_sections: u32,
-    /// Bit per [`SurfaceClass`] of the sections from 32 on.
-    pub high_classes: u32,
     /// DAG mode: f32 threshold per cut row. Row 0 is the finest cut whose clusters all sit in
     /// pinned pages, at 0 when no streamed group has an error; [`cut_thresholds`] follow.
     /// Discrete mode has a row per level and no thresholds.

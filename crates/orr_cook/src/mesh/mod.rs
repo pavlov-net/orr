@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use meshopt::VertexDataAdapter;
 use orr_math::{DVec3, Vec2, Vec3};
+use orr_pack::instance::MAX_HIDDEN_SECTION;
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{
     Cluster, ClusterSets, FLAT_NORMAL, Level, MAX_SECTIONS, MeshHeader, MeshInfo, OMM_ALIGN,
@@ -359,6 +360,14 @@ pub(crate) fn section_flags(m: &Material) -> u8 {
 }
 
 impl SectionData {
+    /// Whether the section's alpha-tested clusters take micromaps. Rays force micromaps to two
+    /// states, where a micro-triangle is either skipped or a hit the traversal commits, so none
+    /// of them could send a dielectric or presence candidate to the ray's handler. Those classes
+    /// run the alpha test there.
+    fn takes_micromaps(&self) -> bool {
+        SurfaceClass::from_flags(self.flags) == Some(SurfaceClass::Opaque)
+    }
+
     /// A section of `indices` drawn with material `m`.
     pub(crate) fn new(indices: Range<usize>, m: &Material, maps: MapSpec) -> Self {
         Self {
@@ -657,9 +666,9 @@ pub(crate) fn cook(
         None => source_grid,
     };
     let mut omm_alpha = Vec::with_capacity(maps.len());
-    for (si, sm) in maps.iter().enumerate() {
+    for (si, (sm, sec)) in maps.iter().zip(&m.sections).enumerate() {
         let alpha = match (&s.omm, &sm.opacity) {
-            (Some(_), Some(Opacity::Texture { map, cutoff, .. })) => {
+            (Some(_), Some(Opacity::Texture { map, cutoff, .. })) if sec.takes_micromaps() => {
                 let a = map.try_map(|t| OmmRead::new(t, *cutoff));
                 if a.is_none() {
                     let [w, h] = map
@@ -761,10 +770,8 @@ pub(crate) fn cook(
         .collect();
     let h = &mut built.info.header;
     for (i, sec) in built.info.sections.iter().enumerate() {
-        let class = sec.class().expect("sections take one class");
-        let bit = 1u32.checked_shl(i as u32).unwrap_or(0);
-        match class {
-            _ if bit == 0 => h.high_classes |= 1 << class as u32,
+        let bit = 1u32 << i.min(MAX_HIDDEN_SECTION);
+        match sec.class().expect("sections take one class") {
             SurfaceClass::Opaque => h.opaque_sections |= bit,
             _ => h.layer_sections |= bit,
         }
@@ -882,7 +889,7 @@ impl Ctx<'_> {
             ));
         }
         c.record.flat_triangles = flat;
-        if self.s.omm.is_some() && section_maps.opacity.is_some() {
+        if self.s.omm.is_some() && section_maps.opacity.is_some() && sec.takes_micromaps() {
             c.uvs = uvs;
         }
         c.record.section = section;
@@ -931,6 +938,9 @@ impl Ctx<'_> {
     fn omm(&self, c: &ClusterData, bytes_max: u32) -> Option<ClusterOmm> {
         let o = self.s.omm.as_ref()?;
         let section = usize::from(c.record.section);
+        if !self.sections[section].takes_micromaps() {
+            return None;
+        }
         let opacity = self.maps[section].opacity.as_ref()?;
         let alpha = &c.tris.as_chunks::<3>().0[usize::from(c.record.alpha_first)..];
         let s = OmmSettings {

@@ -24,8 +24,8 @@ const USER: u16 = Class::USER_FIRST + 1;
 const GOLDEN: &[(u16, u32, &str)] = &[
     (
         Class::Mesh as u16,
-        11,
-        "2e919e880f4f908de2787d366e8cf128de15c72087fbdea0fbd2fb5fe3ac14a9",
+        12,
+        "bf62862d23b2d6549b108f2726f913d75443ab647a8e9786e0d5b5b357541ce8",
     ),
     (
         Class::Material as u16,
