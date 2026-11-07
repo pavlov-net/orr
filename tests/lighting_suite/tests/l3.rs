@@ -894,7 +894,7 @@ fn directional_share_matches_the_lights_weights() {
         .unwrap();
     });
     let mut lighting = scene.lighting();
-    let (rings, sectors, frames, threads) = (4u32, 8u32, 16u32, 1u32 << 16);
+    let (rings, sectors, frames, threads) = (4u32, 8u32, 64u32, 1u32 << 16);
     let per_light = rings * sectors;
     let bins = ids.len() as u32 * per_light + 2;
     let mut histogram = readback::<u32>(u64::from(bins), "histogram");
