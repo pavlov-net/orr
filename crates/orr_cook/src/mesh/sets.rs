@@ -8,9 +8,10 @@
 
 use orr_math::DVec3;
 use orr_pack::mesh::{
-    ClusterSet, ClusterSets, MeshInfo, NO_RANK, SET_LEAF, Section, SetNode, cut_thresholds, in_cut,
-    oct_decode, oct_encode,
+    Cluster, ClusterSet, ClusterSets, MeshInfo, NO_RANK, SET_LEAF, Section, SetNode,
+    cut_thresholds, in_cut, oct_decode, oct_encode,
 };
+use rustc_hash::FxHashMap;
 
 use super::SectionData;
 use super::maps::Emission;
@@ -92,6 +93,10 @@ pub(super) struct SetCluster {
     pub(super) parent_error: f32,
     pub(super) flags: u8,
     pub(super) section: u16,
+    /// On a DAG mesh: the group the cluster is in and the group it was simplified from, or -1
+    /// for a stage's source cluster.
+    pub(super) group: u32,
+    pub(super) refined: i32,
     /// `None` on sections without a set.
     pub(super) bounds: Option<ClusterBounds>,
 }
@@ -132,11 +137,17 @@ pub(super) fn build(info: &mut MeshInfo, sections: &[SectionData], clusters: &[S
         };
         info.levels.iter().map(level).collect()
     };
+    let bound = if !ranked || !info.levels.is_empty() {
+        Vec::new()
+    } else {
+        cut_bound(sections.len(), clusters)
+    };
     let double_sided = |s: u16| sections[usize::from(s)].flags & Section::DOUBLE_SIDED != 0;
     info.emissive = sets(
         sections,
         Section::EMISSIVE,
         &rows,
+        &bound,
         clusters,
         |b| b.emission,
         double_sided,
@@ -145,10 +156,42 @@ pub(super) fn build(info: &mut MeshInfo, sections: &[SectionData], clusters: &[S
         sections,
         Section::CASTER,
         &rows,
+        &bound,
         clusters,
         |b| b.area,
         |_| true,
     );
+}
+
+/// Per section of a DAG mesh: the most clusters it can have in any cut a traversal takes.
+///
+/// A cut of one stage kind is its source clusters with each group of a down-closed set
+/// replaced by the clusters simplified from it, so a section's count is its source clusters
+/// plus each replaced group's outputs less its inputs in the section, and summing only the
+/// groups that add clusters bounds every cut. The two stage kinds never share a cut.
+fn cut_bound(section_count: usize, clusters: &[SetCluster]) -> Vec<u32> {
+    let mut out = vec![0u32; section_count];
+    for merged in [false, true] {
+        let mut base = vec![0i64; section_count];
+        let mut grows: FxHashMap<(u32, u16), i64> = FxHashMap::default();
+        for c in clusters
+            .iter()
+            .filter(|c| (c.flags & Cluster::MERGED != 0) == merged)
+        {
+            match u32::try_from(c.refined) {
+                Ok(from) => *grows.entry((from, c.section)).or_default() += 1,
+                Err(_) => base[usize::from(c.section)] += 1,
+            }
+            *grows.entry((c.group, c.section)).or_default() -= 1;
+        }
+        for (&(_, s), &w) in &grows {
+            base[usize::from(s)] += w.max(0);
+        }
+        for (o, b) in out.iter_mut().zip(base) {
+            *o = (*o).max(b as u32);
+        }
+    }
+    out
 }
 
 /// A cluster on its way into a set.
@@ -160,11 +203,13 @@ struct Item {
 }
 
 /// The sets of the sections with `flag`. A cluster weighs `weight`; sections `two_sided` send
-/// light both ways, so their cones hold every direction.
+/// light both ways, so their cones hold every direction. `bound` is empty or bounds each
+/// section's clusters in any cut, as [`cut_bound`].
 fn sets(
     sections: &[SectionData],
     flag: u8,
     rows: &[Vec<u32>],
+    bound: &[u32],
     clusters: &[SetCluster],
     weight: impl Fn(&ClusterBounds) -> f64,
     two_sided: impl Fn(u16) -> bool,
@@ -185,17 +230,25 @@ fn sets(
     if ranked.is_empty() {
         return out;
     }
+    if !bound.is_empty() {
+        out.widest = ranked
+            .iter()
+            .map(|&s| bound[usize::from(s)])
+            .fold(0, u32::max);
+    }
     // The set each rank took at the row before, which an equal row shares.
     let mut last: Vec<(Vec<u32>, ClusterSet)> =
         vec![(Vec::new(), ClusterSet::default()); ranked.len()];
     for row in rows {
         let mut members: Vec<Vec<Item>> = vec![Vec::new(); ranked.len()];
+        let mut in_row = vec![0u32; ranked.len()];
         for &i in row {
             let c = &clusters[i as usize];
             let k = out.ranks[usize::from(c.section)];
             if k == NO_RANK {
                 continue;
             }
+            in_row[k as usize] += 1;
             let bounds = c.bounds.expect("clusters of ranked sections have bounds");
             let w = weight(&bounds);
             if w > 0.0 {
@@ -206,6 +259,7 @@ fn sets(
                 });
             }
         }
+        out.widest = in_row.into_iter().fold(out.widest, u32::max);
         for (k, mut items) in members.into_iter().enumerate() {
             let section = ranked[k];
             let ids: Vec<u32> = items.iter().map(|i| i.cluster).collect();
@@ -401,6 +455,35 @@ mod tests {
         check(&[1e-30, 1.0, 1e-30, 1e-30]);
         check(&[1.0, 1e-30, 1e-30]);
         check(&[1e-30; 5]);
+    }
+
+    #[test]
+    fn a_cut_bound_holds_cuts_that_mix_levels_and_counts_one_stage_kind() {
+        // (section, group, refined, merged), each a cluster.
+        let c = |section, group, refined, merged: bool| SetCluster {
+            self_error: 0.0,
+            parent_error: 0.0,
+            flags: if merged { Cluster::MERGED } else { 0 },
+            section,
+            group,
+            refined,
+            bounds: None,
+        };
+        let mut clusters = Vec::new();
+        // Section 0: group 0 simplifies 3 clusters into 1 and group 1 simplifies 1 into 3, both
+        // into root group 2. Either level counts 4; group 1 alone simplified counts 6.
+        clusters.extend((0..3).map(|_| c(0, 0, -1, false)));
+        clusters.push(c(0, 1, -1, false));
+        clusters.push(c(0, 2, 0, false));
+        clusters.extend((0..3).map(|_| c(0, 2, 1, false)));
+        // Section 1: 4 clusters shrink to 2, then to 1.
+        clusters.extend((0..4).map(|_| c(1, 3, -1, false)));
+        clusters.extend((0..2).map(|_| c(1, 4, 3, false)));
+        clusters.push(c(1, 5, 4, false));
+        // Its merged stage: 5 clusters into 2, a cut of its own.
+        clusters.extend((0..5).map(|_| c(1, 6, -1, true)));
+        clusters.extend((0..2).map(|_| c(1, 7, 6, true)));
+        assert_eq!(cut_bound(2, &clusters), [6, 5]);
     }
 
     fn item(cluster: u32, center: [f64; 3], normal: DVec3, cos: f64) -> Item {

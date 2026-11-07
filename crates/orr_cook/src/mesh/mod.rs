@@ -1035,7 +1035,7 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
         for p in 0..part_count {
             part_level_spans[p * level_count + li].first = next;
         }
-        set_clusters.extend(clusters.iter().map(ClusterData::set_cluster));
+        set_clusters.extend(clusters.iter().map(|c| c.set_cluster(0, -1)));
         for (i, c) in clusters.iter().enumerate() {
             let span = &mut part_level_spans[usize::from(c.record.part) * level_count + li];
             if span.count == 0 {
@@ -1467,12 +1467,16 @@ impl ClusterData {
         self.local.len().next_multiple_of(2)
     }
 
-    fn set_cluster(&self) -> sets::SetCluster {
+    /// What the sets read of the cluster, in DAG `group` and simplified from group `refined`
+    /// (-1 for none).
+    fn set_cluster(&self, group: u32, refined: i32) -> sets::SetCluster {
         sets::SetCluster {
             self_error: self.record.self_error,
             parent_error: self.record.parent_error,
             flags: self.record.flags,
             section: self.record.section,
+            group,
+            refined,
             bounds: self.bounds,
         }
     }

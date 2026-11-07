@@ -450,6 +450,8 @@ pub struct SetSpans {
     pub cdf: Span,
     pub index: Span,
     pub nodes: Span,
+    /// [`ClusterSets::widest`].
+    pub widest: u32,
 }
 
 /// The sets of one purpose: for each cut row, one per ranked section. A row is a discrete
@@ -472,6 +474,10 @@ pub struct ClusterSets {
     /// (mesh cluster, position in the set), ascending by cluster.
     pub index: Vec<[u32; 2]>,
     pub nodes: Vec<SetNode>,
+    /// The most clusters one ranked section can have in any cut a copy traces, those of zero
+    /// weight included: on a discrete mesh its largest level, on a DAG mesh a bound over every
+    /// traversal cut.
+    pub widest: u32,
 }
 
 impl ClusterSets {
@@ -488,6 +494,7 @@ impl ClusterSets {
             cdf: table(blob, s.cdf)?,
             index: table(blob, s.index)?,
             nodes: table(blob, s.nodes)?,
+            widest: s.widest,
         })
     }
 
@@ -499,6 +506,7 @@ impl ClusterSets {
             cdf: put_table(out, &self.cdf),
             index: put_table_aligned(out, &self.index, 8),
             nodes: put_table_aligned(out, &self.nodes, 16),
+            widest: self.widest,
         }
     }
 }

@@ -736,11 +736,17 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         }
     }
 
+    let table = &table_index;
     let set_clusters = page_groups
         .iter()
         .flatten()
-        .flat_map(|&g| &groups[g].clusters)
-        .map(ClusterData::set_cluster)
+        .flat_map(|&gi| {
+            let g = &groups[gi];
+            g.clusters.iter().zip(&g.refined).map(move |(c, &r)| {
+                let refined = usize::try_from(r).map_or(-1, |r| table[r] as i32);
+                c.set_cluster(table[gi], refined)
+            })
+        })
         .collect();
     let mut part_bounds = vec![Aabb::EMPTY; cx.parts.table.len()];
     for c in groups.iter().flat_map(|g| &g.clusters) {

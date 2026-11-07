@@ -323,6 +323,7 @@ fn emission_textures_weigh_clusters_and_key_the_mesh() {
     let d = load(&a, "lamp/mesh");
     let e = &d.info.emissive;
     let set = set_of(e, 0, 0);
+    assert_eq!(e.widest as usize, d.clusters.len());
     // Clusters wholly over the black half leave the set; the edge texels wrap around.
     assert!(set.count > 0 && (set.count as usize) < d.clusters.len());
     let total: f64 = d.clusters.iter().flat_map(|c| &c.tris).map(area).sum();
@@ -351,6 +352,27 @@ fn emission_textures_weigh_clusters_and_key_the_mesh() {
         set_of(&d.info.emissive, 0, 0).count as usize,
         d.clusters.len()
     );
+}
+
+/// A section's clusters of no emission stay out of its set but count toward
+/// `ClusterSets::widest`, which decides whether its copies may gather their cuts.
+#[test]
+fn dark_clusters_count_toward_the_widest_section() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let patch = |x: u32, y: u32| {
+        if (30..34).contains(&x) && (30..34).contains(&y) {
+            255
+        } else {
+            0
+        }
+    };
+    let a = cook(emitter(&dir.join("cluster_sets_patch.png"), patch));
+    let d = load(&a, "lamp/mesh");
+    let e = &d.info.emissive;
+    let set = set_of(e, 0, 0);
+    assert!(set.count > 0 && set.count <= SET_LEAF && set.node_count == 0);
+    assert!(d.clusters.len() as u32 > SET_LEAF);
+    assert_eq!(e.widest as usize, d.clusters.len());
 }
 
 #[test]
