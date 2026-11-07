@@ -530,15 +530,18 @@ public interface IShadow
 }
 
 // Next-event estimation at `x` (a zero shading normal for a point in a medium), weighed by
-// `f`, with local sampler `local` (null for none): `candidates` draws from the light set's
-// mixture resampled by unshadowed luminance, one shadow ray through `shadow` for the
-// winner, aimed at its point on a finite light, weighted against BSDF sampling unless
-// `weight_one`. `light` is the winner's feedback id, NO_LIGHT for a directional winner or
-// none. With `no_environment` the environment's candidates count for nothing. An emitter's
-// coat and fuzz pass its light into the vertex's medium, of IOR `exterior_ior`. At a `chain`
-// vertex, what a light other than the environment gives keeps `keep` of the share outside the
-// vertex's diffuse lobes, the caustic photons' to give. Draws six sampler dimensions per
-// candidate and counts the ray in `rays`.
+// `f`, with local sampler `local` (null for none). It draws the directional lights with the
+// vertex's directional share, taking one candidate; otherwise `candidates` draws from the rest
+// of the light set's mixture, resampled by unshadowed luminance. Splitting the two keeps an
+// occluded sun, whose unshadowed light outweighs every emitter, from winning nearly every
+// resampling. One shadow ray through `shadow` goes to the winner, aimed at its point on a
+// finite light, or for a directional light straight or through a plane stack; it is weighted
+// against BSDF sampling unless `weight_one`. `light` is the winner's feedback id, NO_LIGHT for a
+// directional winner or none. With `no_environment` the environment's candidates count for
+// nothing. An emitter's coat and fuzz pass its light into the vertex's medium, of IOR
+// `exterior_ior`. At a `chain` vertex, what a light other than the environment gives keeps
+// `keep` of the share outside the vertex's diffuse lobes, the caustic photons' to give. Draws
+// one sampler dimension and six per candidate, and counts the ray in `rays`.
 public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot r, PathVertex x, F f, V shadow, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, float exterior_ior, float3 keep, bool chain, inout Sampler rng, inout uint rays, out uint light, bool no_environment = false)
 {
     LightSetGpu* set = r.set;
@@ -549,9 +552,12 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
     float3 chosen_f = float3(0.0);
     float chosen_scatter_pdf = 0.0;
     float sum = 0.0;
-    for (uint i = 0; i < candidates; i++)
+    uint end = rng.dimension + 1 + 6 * candidates;
+    bool directional = rng.next() < v.share;
+    uint drawn = directional ? 1 : candidates;
+    for (uint i = 0; i < drawn; i++)
     {
-        ResolvedLightSample c = nee_candidate<S>(set, v, rng);
+        ResolvedLightSample c = directional ? nee_directional_candidate(set, v, rng) : nee_light_candidate<S>(set, v, rng);
         float u = rng.next();
         if (!(c.pdf > 0.0) || (no_environment && c.kind == LIGHT_SAMPLE_ENVIRONMENT))
             continue;
@@ -570,9 +576,10 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
             chosen_scatter_pdf = scatter_pdf;
         }
     }
+    rng.dimension = end;
     if (!(sum > 0.0))
         return float3(0.0);
-    float W = sum / (float(candidates) * chosen_target);
+    float W = sum / (float(drawn) * chosen_target);
     float3 dir = chosen.dir;
     float3 l = chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, chosen.light, dir) : chosen.radiance;
     float3 fe = chosen_f;

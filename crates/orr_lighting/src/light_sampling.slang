@@ -1235,24 +1235,45 @@ ResolvedLightSample directional_candidate(LightSetGpu* set, float3 normal, float
 }
 
 // One next-event candidate for vertex `v`: with the vertex's directional share, a directional
-// light chosen by weight x n.l and a direction in its cone; otherwise, with the local
-// sampler's share, a slot it holds and a sample of its range, or else a sample at a random
-// offset in the vertex's tile. The density is the candidate's in the vertex's whole mixture.
-// Draws five sampler dimensions.
+// light chosen by weight x n.l and a direction in its cone; otherwise a light candidate
+// (`light_candidate`). The density is the candidate's in the vertex's whole mixture. Draws five
+// sampler dimensions.
 public ResolvedLightSample nee_candidate<S : ISurface>(LightSetGpu* set, NeeVertex v, inout Sampler rng)
 {
-    float total = v.total;
-    float share = v.share;
     float choice = rng.next();
+    if (choice < v.share)
+        return nee_directional_candidate(set, v, rng);
+    return light_candidate<S>(set, v, (choice - v.share) / (1.0 - v.share), rng);
+}
+
+// `nee_candidate` given that it draws a directional light, its density still the whole
+// mixture's. Draws four sampler dimensions.
+public ResolvedLightSample nee_directional_candidate(LightSetGpu* set, NeeVertex v, inout Sampler rng)
+{
+    uint pick = rng.next_bits();
+    rng.dimension += 2;
+    float2 u = rng.next4_parts().xy();
+    return directional_candidate(set, v.normal, v.total, v.share, pick, u);
+}
+
+// `nee_candidate` given that it draws no directional light, its density still the whole
+// mixture's: with the local sampler's share, a slot it holds and a sample of its range, or
+// else a sample at a random offset in the vertex's tile. Draws five sampler dimensions.
+public ResolvedLightSample nee_light_candidate<S : ISurface>(LightSetGpu* set, NeeVertex v, inout Sampler rng)
+{
+    return light_candidate<S>(set, v, rng.next(), rng);
+}
+
+// A light candidate from local sampler or tile by `choice` in [0, 1); four sampler dimensions.
+ResolvedLightSample light_candidate<S : ISurface>(LightSetGpu* set, NeeVertex v, float choice, inout Sampler rng)
+{
     uint pick = rng.next_bits();
     uint2 bits = uint2(rng.next_bits(), rng.next_bits());
     OwenSobol4 u4 = rng.next4_parts();
     float2 u = u4.xy();
-    if (choice < share)
-        return directional_candidate(set, v.normal, total, share, pick, u);
     LocalLights* local = v.local;
     ResolvedLightSample r;
-    if (local != nullptr && (choice - share) < local.share * (1.0 - share))
+    if (local != nullptr && choice < local.share)
     {
         r = local_candidate<S>(set, local, v.position, pick, bits, float4(u, u4.zw()));
         if (r.pdf > 0.0)
@@ -1266,7 +1287,7 @@ public ResolvedLightSample nee_candidate<S : ISurface>(LightSetGpu* set, NeeVert
         if (local != nullptr && r.pdf > 0.0)
             r.pdf *= light_selection(set, local, r.light, r.position) / global_selection(set, r.light);
     }
-    r.pdf *= 1.0 - share;
+    r.pdf *= 1.0 - v.share;
     return r;
 }
 
