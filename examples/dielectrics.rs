@@ -1,7 +1,7 @@
 //! Dielectrics under a low sun: a pool of wave-displaced water (a producer entry) holding a
 //! half-submerged glass sphere and a white ball on its floor, an amber glass slab and a
-//! scattering jade block on the ground. Each frame traces the opaque paths, then one camera
-//! ray per pixel against the dielectric mask and the path through what it finds: Fresnel
+//! scattering jade block on the ground. Each frame traces one path per pixel, from the first
+//! layer its camera ray finds or its surface: Fresnel
 //! reflection or refraction, the water's and the amber's absorption, the jade's scattering,
 //! and nested media where the glass meets the water. The camera orbits the pool, or with
 //! `--dive` bobs through the water's surface, the eye's medium following it. `--turbid` makes the

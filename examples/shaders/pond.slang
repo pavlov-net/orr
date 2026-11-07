@@ -44,9 +44,9 @@ void main(uint3 id: SV_DispatchThreadID)
     ray.TMax = opaque.material == MATERIAL_NONE ? 1e30 : length(opaque.position - v.eye_render.xyz);
     AcceptAll all;
     float3 positions[3];
-    Hit h = trace_closest(s.tlas, ray, MASK_DIELECTRIC, RAY_FLAG_NONE, all, positions);
+    Hit h = trace_closest(s.tlas, ray, MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_NONE, all, positions);
     uint entry;
-    if (!h.hit || h.cluster_id < 0 || !hit_producer(s, h.instance_index, entry))
+    if (!h.hit || h.class_id != CLASS_DIELECTRIC || h.cluster_id < 0 || !hit_producer(s, h.instance_index, entry))
         return;
     HitContext context = hit_context(HIT_PRIMARY, 0, camera_cone(v), h.t);
     SurfaceHit sh = resolve_hit<StandardSurface>(s, v, d, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
