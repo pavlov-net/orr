@@ -14,7 +14,8 @@ pub enum MemoryKind {
 }
 
 impl MemoryKind {
-    pub(crate) const ALL: [MemoryKind; 3] = [
+    /// Every kind, in [`MemoryReport::kinds`] order.
+    pub const ALL: [MemoryKind; 3] = [
         MemoryKind::Upload,
         MemoryKind::DeviceLocal,
         MemoryKind::Readback,
@@ -46,6 +47,8 @@ pub struct MemoryReport {
     /// Indexed like [`MemoryKind`]: Upload, DeviceLocal, Readback.
     pub kinds: [MemoryUsage; 3],
     pub heaps: Vec<HeapReport>,
+    /// Indexed like `kinds`: the index in `heaps` of the heap each kind's memory comes from.
+    pub kind_heaps: [usize; 3],
     /// Device memory allocations (`VkDeviceMemory` or `MTLHeap`) orr_gpu has made so far.
     pub device_allocations: u64,
 }
@@ -53,6 +56,11 @@ pub struct MemoryReport {
 impl MemoryReport {
     pub fn kind(&self, kind: MemoryKind) -> MemoryUsage {
         self.kinds[kind.index()]
+    }
+
+    /// The heap `kind`'s memory comes from.
+    pub fn heap_of(&self, kind: MemoryKind) -> &HeapReport {
+        &self.heaps[self.kind_heaps[kind.index()]]
     }
 
     /// The largest share of its OS budget a device-local heap uses; above 1 the OS pages

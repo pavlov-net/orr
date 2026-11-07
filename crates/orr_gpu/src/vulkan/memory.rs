@@ -69,6 +69,11 @@ impl MemoryTypes {
         self.properties.memory_heaps[ty.heap_index as usize].size
     }
 
+    /// The index of the heap `kind`'s memory comes from.
+    fn heap(&self, kind: MemoryKind) -> usize {
+        self.properties.memory_types[self.of(kind) as usize].heap_index as usize
+    }
+
     fn host_visible(&self, kind: MemoryKind) -> bool {
         self.properties.memory_types[self.of(kind) as usize]
             .property_flags
@@ -434,7 +439,17 @@ impl Shared {
                 .allocator
                 .create_buffer(pool, &info, offset_align, flags, name)
         }
-        .map_err(memory_error)?;
+        .map_err(|e| match e {
+            orr_memory::Error::Vulkan {
+                call,
+                result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            } => Error::OutOfMemory {
+                call,
+                device: true,
+                kind: Some(kind),
+            },
+            e => memory_error(e),
+        })?;
         let mapped = allocation.mapped;
         // SAFETY: the buffer has device-address usage and bound memory.
         let address = unsafe {
@@ -526,6 +541,7 @@ impl Shared {
         MemoryReport {
             kinds,
             heaps,
+            kind_heaps: MemoryKind::ALL.map(|k| self.memory.heap(k)),
             device_allocations: allocator.device_memory_allocations(),
         }
     }

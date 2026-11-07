@@ -23,6 +23,19 @@ pub enum Error {
         call: &'static str,
         result: VkResult,
     },
+    /// The device or host had no memory for the call. Memory freed later can let it succeed.
+    /// `device` when device memory ran out, not the driver's host memory; `kind` names the
+    /// memory an allocation failed in, `None` when the call doesn't say.
+    #[error(
+        "{call}: out of {} memory{}",
+        if *.device { "device" } else { "host" },
+        .kind.map_or(String::new(), |k| format!(" ({k:?})"))
+    )]
+    OutOfMemory {
+        call: &'static str,
+        device: bool,
+        kind: Option<crate::MemoryKind>,
+    },
     /// A wait ran out of time.
     #[error("timed out")]
     Timeout,
@@ -87,6 +100,16 @@ impl Error {
             ash::vk::Result::ERROR_DEVICE_LOST => Error::DeviceLost,
             ash::vk::Result::TIMEOUT => Error::Timeout,
             ash::vk::Result::PIPELINE_COMPILE_REQUIRED => Error::CompileRequired,
+            ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => Error::OutOfMemory {
+                call,
+                device: true,
+                kind: None,
+            },
+            ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY => Error::OutOfMemory {
+                call,
+                device: false,
+                kind: None,
+            },
             r => Error::Vulkan {
                 call,
                 result: VkResult(r.as_raw()),

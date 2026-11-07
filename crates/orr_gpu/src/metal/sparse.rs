@@ -285,9 +285,10 @@ impl Device {
                     SPARSE_PAGE,
                 )
         }
-        .ok_or_else(|| Error::Metal {
+        .ok_or(Error::OutOfMemory {
             call: "newBufferWithLength:placementSparsePageSize:",
-            message: format!("{name}: {size} bytes"),
+            device: true,
+            kind: Some(crate::MemoryKind::DeviceLocal),
         })?;
         buffer.setLabel(Some(&NSString::from_str(name)));
         let address = buffer.gpuAddress();

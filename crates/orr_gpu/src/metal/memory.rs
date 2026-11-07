@@ -236,6 +236,7 @@ impl Device {
                 budget,
                 usage: s.device.currentAllocatedSize() as u64,
             }],
+            kind_heaps: [0; 3],
             device_allocations: s.device_allocations.load(Ordering::Relaxed),
         }
     }
@@ -314,9 +315,10 @@ impl Shared {
         size: u64,
         name: &str,
     ) -> Result<RawBuffer, Error> {
-        let no_memory = || Error::Metal {
+        let no_memory = || Error::OutOfMemory {
             call: "newBufferWithLength",
-            message: format!("{name}: {size} bytes of {kind:?} memory"),
+            device: true,
+            kind: Some(kind),
         };
         let options = options(kind);
         let mut size = size.next_multiple_of(MALLOC_ALIGN);
@@ -334,8 +336,11 @@ impl Shared {
             size = size.next_multiple_of(page);
             bytes = bytes.max(size).next_multiple_of(page);
         }
-        let layout =
-            Layout::from_size_align(bytes as usize, align as usize).map_err(|_| no_memory())?;
+        let layout = Layout::from_size_align(bytes as usize, align as usize).map_err(|_| {
+            Error::Invalid(format!(
+                "{name}: {bytes} bytes aligned to {align} exceed the address space"
+            ))
+        })?;
         let (memory, new_heap) = lock(&self.heaps[kind.index()])
             .allocate(layout)
             .map_err(|_| no_memory())?;
@@ -350,7 +355,11 @@ impl Shared {
         let Some(buffer) = buffer else {
             // A heap the pool releases here is the new one, never made resident.
             lock(&self.heaps[kind.index()]).free(memory);
-            return Err(no_memory());
+            // The range is already the heap's: no memory is missing, the placement is wrong.
+            return Err(Error::Metal {
+                call: "newBufferWithLength:options:offset:",
+                message: format!("{name}: {size} bytes of {kind:?} memory"),
+            });
         };
         buffer.setLabel(Some(&NSString::from_str(name)));
         if new_heap {

@@ -57,9 +57,10 @@ impl Bindings {
                 | MTLResourceOptions::HazardTrackingModeUntracked;
             let b = device
                 .newBufferWithLength_options(bytes.max(8), options)
-                .ok_or(Error::Metal {
+                .ok_or(Error::OutOfMemory {
                     call: "newBufferWithLength",
-                    message: format!("{label}: no memory"),
+                    device: true,
+                    kind: Some(crate::MemoryKind::Upload),
                 })?;
             b.setLabel(Some(&NSString::from_str(label)));
             Ok::<_, Error>(Obj(b))
