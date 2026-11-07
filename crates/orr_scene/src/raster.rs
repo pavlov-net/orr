@@ -11,13 +11,13 @@ use bytemuck::Zeroable;
 use orr_gpu::{
     Allocation, ColorTarget, CommandList, CompareOp, DepthAttachment, DepthLoad, DepthTarget,
     Device, DispatchArgs, Format, Generated, GpuPtr, Hazards, KernelSet, MemoryKind, MeshArgs,
-    MeshPipeline, MeshPipelineDesc, RasterState, Rendering, Sequence, ShaderStage, SpecData,
-    Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage,
-    ViewDesc,
+    MeshPipeline, MeshPipelineDesc, ROOT_ALIGN, RasterState, Rendering, Sequence, ShaderStage,
+    SpecData, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
+    TextureUsage, ViewDesc,
 };
 
 use crate::arena::{ArenaBuffer, ArenaRequest, ArenaTexture, Span, ViewArena, ViewStep};
-use crate::memory::{ROOT_ALIGN, UploadWindow};
+use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::shaders::{cull, hzb, raster, resolve};
 use crate::{

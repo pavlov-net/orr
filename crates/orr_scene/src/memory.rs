@@ -8,7 +8,8 @@ use std::sync::Mutex;
 
 use bytemuck::Pod;
 use orr_gpu::{
-    Allocation, Device, DeviceArenas, GpuAddress, GpuPtr, MemoryKind, MemoryPriority, TimelinePoint,
+    Allocation, Device, DeviceArenas, GpuAddress, GpuPtr, MemoryKind, MemoryPriority, ROOT_ALIGN,
+    TimelinePoint,
 };
 
 use crate::Result;
@@ -289,10 +290,6 @@ impl Pool {
         }
     }
 }
-
-/// Bytes between kernel roots in an upload window: the largest
-/// `minUniformBufferOffsetAlignment` Vulkan allows.
-pub(crate) const ROOT_ALIGN: u64 = 256;
 
 /// One frame's upload memory: mapped, write-combined blocks handed out by bumping an
 /// offset. Writers on several threads allocate from one window; it is reset once the

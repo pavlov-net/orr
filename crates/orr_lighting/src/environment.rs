@@ -10,6 +10,7 @@ use orr_scene::orr_gpu::{
 };
 use orr_scene::{AffineRows, EnvironmentData, SceneRoot};
 
+use crate::scene::Roots;
 use crate::shaders::environment::{bake, pyramid};
 use crate::shaders::types::EnvironmentGpu;
 use crate::{Error, KernelSet, pipeline};
@@ -19,6 +20,7 @@ pub const ENVIRONMENT_SIZE: u32 = 256;
 
 const LEVELS: u32 = ENVIRONMENT_SIZE.trailing_zeros();
 const GROUPS: u32 = ENVIRONMENT_SIZE / 8;
+const PYRAMID_ROOTS: usize = LEVELS as usize + 1;
 
 /// Floats in the importance pyramid: every level from `ENVIRONMENT_SIZE`^2 down to 1.
 const PYRAMID_LEN: u64 = (4 * ENVIRONMENT_SIZE as u64 * ENVIRONMENT_SIZE as u64 - 1) / 3;
@@ -55,7 +57,7 @@ pub(crate) struct EnvironmentBake {
     partials: Allocation<[f32; 4]>,
     record: Allocation<EnvironmentGpu>,
     /// Index 0 is `mean`'s root, index `l` the root building level `l`.
-    pyramid_roots: Allocation<pyramid::Root>,
+    pyramid_roots: Roots<pyramid::Root, PYRAMID_ROOTS>,
     initialized: bool,
 }
 
@@ -89,23 +91,22 @@ impl EnvironmentBake {
             map: sampled,
             size: ENVIRONMENT_SIZE,
         };
-        let mut pyramid_roots = device.gpu_malloc::<pyramid::Root>(
-            MemoryKind::Upload,
-            u64::from(LEVELS + 1),
-            "environment pyramid roots",
-        )?;
-        for (level, root) in pyramid_roots.as_mut_slice().unwrap().iter_mut().enumerate() {
-            *root = pyramid::Root {
-                partials: partials.gpu(),
-                pyramid: pyramid.gpu(),
-                environment: record.gpu(),
-                partial_count: GROUPS * GROUPS,
-                size: ENVIRONMENT_SIZE,
-                level: level as u32,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
-            };
+        let mut pyramid_roots = Roots::new(device, "environment pyramid roots")?;
+        for level in 0..PYRAMID_ROOTS {
+            pyramid_roots.write(
+                level,
+                pyramid::Root {
+                    partials: partials.gpu(),
+                    pyramid: pyramid.gpu(),
+                    environment: record.gpu(),
+                    partial_count: GROUPS * GROUPS,
+                    size: ENVIRONMENT_SIZE,
+                    level: level as u32,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                },
+            );
         }
         Ok(Self {
             device: device.clone(),
@@ -145,13 +146,13 @@ impl EnvironmentBake {
 
     /// The mean and pyramid; after the bake's writes are visible.
     pub(crate) fn record_reduce(&self, list: &mut CommandList<'_>) {
-        list.dispatch(&self.mean, self.pyramid_roots.gpu(), [1, 1, 1]);
+        list.dispatch(&self.mean, self.pyramid_roots.at(0), [1, 1, 1]);
         for level in 1..=LEVELS {
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
             let side = ENVIRONMENT_SIZE >> level;
             list.dispatch(
                 &self.build,
-                self.pyramid_roots.gpu().offset(u64::from(level)),
+                self.pyramid_roots.at(level as usize),
                 [side.div_ceil(8), side.div_ceil(8), 1],
             );
         }

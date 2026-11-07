@@ -47,6 +47,11 @@ pub mod interop {
     };
 }
 
+/// Bytes between kernel roots placed side by side in one allocation. Roots are read as uniform
+/// buffers, whose address must be a multiple of `minUniformBufferOffsetAlignment`, and 256 is
+/// the largest value Vulkan allows; allocations start at a multiple of it.
+pub const ROOT_ALIGN: u64 = 256;
+
 pub use accel::{
     ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance, ClassicKind, InstanceFlags,
     LssEndCaps, LssIndexing, MicromapDesc, MicromapTriangle, MicromapUsage, OmmFormat,

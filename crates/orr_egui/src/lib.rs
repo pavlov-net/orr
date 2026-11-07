@@ -17,9 +17,9 @@ use egui::{
 };
 use orr_gpu::{
     AddressMode, Allocation, Blend, ColorAttachment, ColorLoad, ColorTarget, CommandList, Device,
-    Error, Filter, Format, GpuPtr, Hazards, MemoryKind, MeshPipeline, MeshPipelineDesc, Rendering,
-    SamplerDesc, SamplerIndex, ShaderStage, SpecData, Stages, Texture, TextureDesc, TextureIndex,
-    TextureMemory, TextureRegion, TextureUsage, ViewDesc,
+    Error, Filter, Format, GpuPtr, Hazards, MemoryKind, MeshPipeline, MeshPipelineDesc, ROOT_ALIGN,
+    Rendering, SamplerDesc, SamplerIndex, ShaderStage, SpecData, Stages, Texture, TextureDesc,
+    TextureIndex, TextureMemory, TextureRegion, TextureUsage, ViewDesc,
 };
 
 mod shaders {
@@ -41,9 +41,6 @@ const GROUP: u32 = 32;
 const MAX_GROUPS: u32 = 65_535;
 /// Bytes of a new upload block, unless one allocation needs more.
 const BLOCK_BYTES: u64 = 1 << 20;
-/// Alignment of draw roots in the upload blocks: the largest uniform-buffer offset
-/// alignment Vulkan allows.
-const ROOT_ALIGN: u64 = 256;
 
 /// Paints egui output into a UI layer. Holds one list of upload blocks per frame in flight.
 pub struct Painter {

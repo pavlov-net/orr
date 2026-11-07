@@ -1,9 +1,11 @@
 //! Per-scene lighting state and the scene pass that runs before the scene's first view.
 
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use orr_scene::orr_gpu::{
-    Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, MemoryKind, Stages,
+    Allocation, CommandList, ComputePipeline, Device, GpuAddress, GpuPtr, Hazards, MemoryKind,
+    ROOT_ALIGN, Stages,
 };
 use orr_scene::{SceneDesc, SceneRoot, SkyStats};
 
@@ -128,25 +130,34 @@ pub struct LightingStats {
     pub caustics: CausticStats,
 }
 
-/// Per-root ring of one root per frame slot, in upload memory.
-pub(crate) struct Ring<T: 'static>(Allocation<T>);
+/// `N` kernel roots in upload memory, [`ROOT_ALIGN`] bytes apart.
+pub(crate) struct Roots<T: 'static, const N: usize>(Allocation<u8>, PhantomData<fn() -> T>);
 
-impl<T: bytemuck::Pod> Ring<T> {
+/// One root per frame slot.
+pub(crate) type Ring<T> = Roots<T, FRAME_SLOTS>;
+
+impl<T: bytemuck::Pod, const N: usize> Roots<T, N> {
     pub(crate) fn new(device: &Device, name: &str) -> Result<Self, Error> {
-        Ok(Self(device.gpu_malloc::<T>(
-            MemoryKind::Upload,
-            FRAME_SLOTS as u64,
-            name,
-        )?))
+        const { assert!(size_of::<T>() as u64 <= ROOT_ALIGN) };
+        Ok(Self(
+            device.gpu_malloc::<u8>(MemoryKind::Upload, N as u64 * ROOT_ALIGN, name)?,
+            PhantomData,
+        ))
     }
 
-    pub(crate) fn write(&mut self, slot: usize, value: T) -> GpuPtr<T> {
-        self.0.as_mut_slice().unwrap()[slot] = value;
-        self.at(slot)
+    pub(crate) fn write(&mut self, index: usize, value: T) -> GpuPtr<T> {
+        let at = index * ROOT_ALIGN as usize;
+        self.0.as_mut_slice().unwrap()[at..at + size_of::<T>()]
+            .copy_from_slice(bytemuck::bytes_of(&value));
+        self.at(index)
     }
 
-    pub(crate) fn at(&self, slot: usize) -> GpuPtr<T> {
-        self.0.gpu().offset(slot as u64)
+    pub(crate) fn at(&self, index: usize) -> GpuPtr<T> {
+        assert!(index < N);
+        let address = self.0.gpu().address().0 + index as u64 * ROOT_ALIGN;
+        // SAFETY: root `index` has room for a `T` at a multiple of ROOT_ALIGN, which `write`
+        // fills.
+        unsafe { GpuPtr::from_address(GpuAddress(address)) }
     }
 }
 
