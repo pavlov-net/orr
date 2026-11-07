@@ -69,7 +69,8 @@ float3 sides_emission(SceneRoot* s, uint material)
 }
 
 // Writes the fixed-point CDF of instance entry `entry`'s gathered list over its clusters'
-// areas, and returns their sum in m^2, mesh space. A cluster of no area takes a step of 0.
+// areas, and returns their sum in m^2, mesh space. A cluster of no area takes a step of 0, and
+// the CDF is 0xffffffff from the last cluster with area on.
 float gathered_cdf(SceneRoot* s, MeshGpu* mesh, uint entry, uint count)
 {
     uint* list = gathered_list(s.emissive_lists, entry);
@@ -85,8 +86,7 @@ float gathered_cdf(SceneRoot* s, MeshGpu* mesh, uint entry, uint count)
     for (uint i = 0; i < count; i++)
     {
         sum += areas[i];
-        bool last = i + 1 == count;
-        list[GATHERED_CLUSTERS + i] = last ? 0xffffffffu : fixed_point_share(sum / total);
+        list[GATHERED_CLUSTERS + i] = sum >= total ? 0xffffffffu : fixed_point_share(sum / total);
     }
     return total;
 }

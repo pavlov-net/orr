@@ -93,6 +93,52 @@ float scan_float(uint lane, uint lanes, float v, out float total)
     return r;
 }
 
+// Marks a position of no weight in a fixed-point CDF while the CDF still holds float sums; the
+// bits are a NaN, which no sum of weights is.
+static const uint NO_WEIGHT = 0xffffffffu;
+
+groupshared uint weighted;
+
+// Inclusive maxima over the first `lanes` lanes of the workgroup.
+uint scan_max(uint lane, uint lanes, uint v, out uint total)
+{
+    scan_c[lane] = v;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint off = 1; off < lanes; off <<= 1)
+    {
+        uint other = lane >= off ? scan_c[lane - off] : 0;
+        GroupMemoryBarrierWithGroupSync();
+        scan_c[lane] = max(scan_c[lane], other);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    uint r = scan_c[lane];
+    total = scan_c[lanes - 1];
+    GroupMemoryBarrierWithGroupSync();
+    return r;
+}
+
+// Replaces the float sums at `cdf[0..count]` over 64 lanes, `NO_WEIGHT` where a position has
+// none, by their fixed-point CDF: `total` is the last sum and `end` one past the last position
+// with weight, which takes 0xffffffff whatever rounding left. A float scan's lanes add
+// in different orders, so its sums can fall by a rounding past a weight of 0 or a tiny one; a
+// running maximum keeps the CDF rising, and a position of no weight takes the one before it.
+void write_fixed_cdf(uint lane, uint* cdf, uint count, float total, uint end)
+{
+    uint carry = 0;
+    for (uint base = 0; base < count; base += 64)
+    {
+        uint c = base + lane;
+        uint v = 0;
+        if (c < count && cdf[c] != NO_WEIGHT)
+            v = c + 1 == end ? 0xffffffffu : fixed_point_share(asfloat(cdf[c]) / total);
+        uint chunk;
+        uint top = max(carry, scan_max(lane, 64, v, chunk));
+        if (c < count)
+            cdf[c] = top;
+        carry = max(carry, chunk);
+    }
+}
+
 // Whether producer entry `entry` is traced this frame: only what rays meet can cast.
 bool producer_traced(SceneRoot* s, uint entry)
 {
@@ -161,8 +207,8 @@ float producer_caster_area(SceneRoot* s, uint entry, uint c)
 }
 
 // One workgroup per producer entry: its caster list's fixed-point CDF over its clusters' caster
-// area, and that area's sum. A cluster of no area takes a step of 0, and the last value is
-// 0xffffffff; a list of no area at all is left empty.
+// area, and that area's sum. A cluster of no area takes a step of 0, and the last with area
+// takes 0xffffffff; a list of no area at all is left empty.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void lists(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
@@ -177,6 +223,8 @@ void lists(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
             root.areas[entry] = 0.0;
         return;
     }
+    if (lane == 0)
+        weighted = 0;
     float carry = 0.0;
     for (uint base = 0; base < count; base += 64)
     {
@@ -184,18 +232,15 @@ void lists(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
         float w = c < count ? producer_caster_area(root.scene, entry, c) : 0.0;
         float chunk;
         float sum = carry + scan_float(lane, 64, w, chunk);
+        if (w > 0.0)
+            InterlockedMax(weighted, c + 1);
         if (c < count)
-            e.cdf[c] = asuint(sum);
+            e.cdf[c] = w > 0.0 ? asuint(sum) : NO_WEIGHT;
         carry += chunk;
     }
-    DeviceMemoryBarrierWithGroupSync();
+    AllMemoryBarrierWithGroupSync();
     float total = carry;
-    for (uint c = lane; c < count; c += 64)
-    {
-        float sum = asfloat(e.cdf[c]);
-        uint v = total > 0.0 ? fixed_point_share(sum / total) : 0u;
-        e.cdf[c] = c + 1 == count && total > 0.0 ? 0xffffffffu : v;
-    }
+    write_fixed_cdf(lane, e.cdf, count, total, weighted);
     if (lane == 0)
     {
         root.areas[entry] = total;

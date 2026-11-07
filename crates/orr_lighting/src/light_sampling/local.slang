@@ -96,8 +96,8 @@ bool reprojected(uint2 pixel, out uint id)
 }
 
 // Finishes slots `0..count` of `out`, sorted by light and first position, from each one's
-// probability `p`: their fixed-point CDF, the last 0xffffffff, and their gain, a slot's
-// fixed-point step over its range's.
+// probability `p`: their fixed-point CDF, 0xffffffff from the last slot with probability on,
+// and their gain, a slot's fixed-point step over its range's.
 void finish_slots(inout LocalLights out, float p[LOCAL_LIGHTS], uint count)
 {
     float total = 0.0;
@@ -109,7 +109,7 @@ void finish_slots(inout LocalLights out, float p[LOCAL_LIGHTS], uint count)
     for (uint k = 0; k < count; k++)
     {
         sum += p[k];
-        uint v = k + 1 == count ? 0xffffffffu : fixed_point_share(sum / total);
+        uint v = sum >= total ? 0xffffffffu : fixed_point_share(sum / total);
         v = max(v, previous);
         LocalLight l = out.lights[k];
         l.cdf = v;
