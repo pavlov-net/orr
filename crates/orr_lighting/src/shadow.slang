@@ -382,29 +382,44 @@ public float3 surface_visibility<S : ISurface, M : IMedium, let MODE : uint>(Sce
     bool overflow;
     // Any opaque hit makes the product 0, so the search ends at the first it finds.
     flags |= RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
-    float3 product;
-    if (MODE == SHADOW_UNBENT)
+    // SHADOW_UNBENT traces everything but dielectrics as the AS has it, then dielectrics alone
+    // forced non-opaque, so the AS's solid glass arrives as crossings and opaque geometry takes no
+    // candidate handling. Solid glass in an instance that mixes classes commits in the first
+    // trace; that ray traces everything forced non-opaque instead. One call site keeps one copy
+    // of the candidate handling in the kernel.
+    float3 product = float3(1.0);
+    overflow = false;
+    uint mask = MODE == SHADOW_UNBENT ? SHADOW_MASK & ~MASK_DIELECTRIC : SHADOW_MASK;
+    uint pass_flags = flags;
+    for (uint pass = 0; pass < 2; pass++)
     {
-        // Everything but dielectrics as the AS has it, then dielectrics alone forced
-        // non-opaque, so the AS's solid glass arrives as crossings and opaque geometry takes no
-        // candidate handling. Solid glass in an instance that mixes classes commits in the first
-        // trace; that ray traces everything forced non-opaque instead.
-        product = trace_transmittance(s.tlas, ray, SHADOW_MASK & ~MASK_DIELECTRIC, flags, h, SHADOW_CANDIDATES, overflow, committed, committed_t);
-        if (committed == CLASS_DIELECTRIC)
+        bool more;
+        uint c;
+        float c_t;
+        float3 p = trace_transmittance(s.tlas, ray, mask, pass_flags, h, SHADOW_CANDIDATES, more, c, c_t);
+        overflow = overflow || more;
+        product *= p;
+        if (pass == 0)
         {
-            product = trace_transmittance(s.tlas, ray, SHADOW_MASK, flags | RAY_FLAG_FORCE_NON_OPAQUE, h, SHADOW_CANDIDATES, overflow);
+            committed = c;
+            committed_t = c_t;
+        }
+        if (MODE != SHADOW_UNBENT || pass == 1)
+            break;
+        if (c == CLASS_DIELECTRIC)
+        {
+            mask = SHADOW_MASK;
+            product = float3(1.0);
+            overflow = false;
             committed = ~0u;
             committed_t = positive_infinity();
         }
-        else if (any(product > 0.0))
-        {
-            bool more;
-            product *= trace_transmittance(s.tlas, ray, MASK_DIELECTRIC, flags | RAY_FLAG_FORCE_NON_OPAQUE, h, SHADOW_CANDIDATES, more);
-            overflow = overflow || more;
-        }
+        else if (all(product == 0.0))
+            break;
+        else
+            mask = MASK_DIELECTRIC;
+        pass_flags = flags | RAY_FLAG_FORCE_NON_OPAQUE;
     }
-    else
-        product = trace_transmittance(s.tlas, ray, SHADOW_MASK, flags, h, SHADOW_CANDIDATES, overflow, committed, committed_t);
     if (overflow && overflows != nullptr)
         InterlockedAdd(*overflows, 1u);
     float scale;
