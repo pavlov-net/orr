@@ -1,6 +1,7 @@
 // orr_lighting's `ray_origin` over a batch of surface points.
 #include "orr_root.h"
 import orr_lighting.path;
+import orr_lighting.shadow;
 
 struct OriginCase
 {

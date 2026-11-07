@@ -54,16 +54,20 @@ public struct ParticleLighting
 
 // The light at render-space `x` that does not depend on a direction, as mean radiance over the
 // sphere: inside the froxels their incident light, with `vis` the visibility of their shadowed
-// lights, and `inside` true; else the world cache's on two opposed faces along unit `to_eye`,
-// with `vis` 1. Draws two sampler dimensions.
-public float3 particle_ambient(ParticleLighting* l, float3 x, float3 to_eye, inout Sampler rng, out bool inside, out float3 vis[MAX_FROXEL_SHADOWED_LIGHTS])
+// lights and `arrives` the directions they arrive along, and `inside` true; else the world
+// cache's on two opposed faces along unit `to_eye`, with `vis` 1 and `arrives` the lights'
+// directions. Draws two sampler dimensions.
+public float3 particle_ambient(ParticleLighting* l, float3 x, float3 to_eye, inout Sampler rng, out bool inside, out float3 vis[MAX_FROXEL_SHADOWED_LIGHTS], out float3 arrives[MAX_FROXEL_SHADOWED_LIGHTS])
 {
     SceneRoot* s = l.scene;
     float3 coord = float3(0.0);
     inside = l.incident.index != IMAGE_NONE
         && froxel_coord(uint3(l.columns, l.rows, l.slices), l.view, s.near_range, x, coord);
     for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
+    {
         vis[j] = float3(1.0);
+        arrives[j] = j < l.lights.count ? s.lights[l.lights.ids[j]].direction : float3(0.0);
+    }
     if (!inside)
         return particle_irradiance(l.cache, s, x, to_eye, rng) * (0.5 * INV_PI);
     SamplerState ss = l.sampler.get();
@@ -79,18 +83,24 @@ public float3 particle_ambient(ParticleLighting* l, float3 x, float3 to_eye, ino
         EyeColumn eye = l.eye[column.y * l.columns + column.x];
         if (uint(coord.z * float(l.slices)) < eye.slices)
         {
-            float3 sigma_t = interior_medium(s, eye.interior.innermost()).sigma_t;
+            uint m = eye.interior.innermost();
+            float3 sigma_t = interior_medium(s, m).sigma_t;
             float4 depth = l.eye_depth.get<Texture3D<float4>>().SampleLevel(ss, coord, 0.0);
             for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
+            {
                 vis[j] *= vis[j].x > 0.0 ? beer(sigma_t, depth[j] / vis[j].x) : float3(1.0);
+                if (eye.stacks[j].w > 0.0 && !stack_direction(arrives[j], eye.stacks[j].xyz, interior_ior(s, m), arrives[j]))
+                    vis[j] = float3(0.0);
+            }
         }
     }
     rng.next2();
     return incident.rgb;
 }
 
-// One shadow ray from render-space `x` toward each of the froxels' shadowed lights.
-public void particle_shadow_rays<S : ISurface, M : IMedium>(ParticleLighting* l, float3 x, out float3 vis[MAX_FROXEL_SHADOWED_LIGHTS])
+// One shadow ray from render-space `x` toward each of the froxels' shadowed lights, through a
+// plane stack where its light finds one, and in `arrives` the direction the light arrives along.
+public void particle_shadow_rays<S : ISurface, M : IMedium>(ParticleLighting* l, float3 x, out float3 vis[MAX_FROXEL_SHADOWED_LIGHTS], out float3 arrives[MAX_FROXEL_SHADOWED_LIGHTS])
 {
     SceneRoot* s = l.scene;
     float offset = T_MIN_BASE * (1.0 + length(x - l.view.eye_render.xyz) * T_MIN_SCALE);
@@ -99,19 +109,23 @@ public void particle_shadow_rays<S : ISurface, M : IMedium>(ParticleLighting* l,
     for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
     {
         vis[j] = float3(1.0);
+        arrives[j] = float3(0.0);
         if (j >= count)
             continue;
         float3 to_light = s.lights[l.lights.ids[j]].direction;
         float3 depth;
-        vis[j] = surface_visibility<S, M, SHADOW_UNBENT>(s, l.view, x + to_light * offset, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, Interior(), l.set.shadow_overflows, depth);
-        vis[j] *= exp(-depth);
+        StackLight stack;
+        vis[j] = directional_visibility<S, M>(s, l.view, x + to_light * offset, to_light, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), Interior(), l.set.shadow_overflows, depth, stack);
+        vis[j] *= exp(-depth) * stack.jacobian;
+        arrives[j] = stack.bent;
     }
 }
 
 // The directional light at render-space `x` scattering toward the eye along unit `to_eye` per
 // unit albedo, with a Henyey-Greenstein response of `anisotropy`: the shadowed lights by `vis`
-// and, outside the froxels, whose incident light holds them inside, the others unshadowed.
-public float3 particle_directional<M : IMedium>(ParticleLighting* l, float3 x, float3 to_eye, float anisotropy, bool inside, float3 vis[MAX_FROXEL_SHADOWED_LIGHTS])
+// along `arrives` and, outside the froxels, whose incident light holds them inside, the others
+// unshadowed.
+public float3 particle_directional<M : IMedium>(ParticleLighting* l, float3 x, float3 to_eye, float anisotropy, bool inside, float3 vis[MAX_FROXEL_SHADOWED_LIGHTS], float3 arrives[MAX_FROXEL_SHADOWED_LIGHTS])
 {
     SceneRoot* s = l.scene;
     LightSetGpu* set = l.set;
@@ -121,19 +135,21 @@ public float3 particle_directional<M : IMedium>(ParticleLighting* l, float3 x, f
     {
         uint id = set.directional_ids[k];
         float3 v = float3(1.0);
+        float3 to_light = s.lights[id].direction;
+        float3 along = to_light;
         bool shadowed = false;
         for (uint j = 0; j < lights.count; j++)
         {
             if (lights.ids[j] == id)
             {
                 v = vis[j];
+                along = arrives[j];
                 shadowed = true;
             }
         }
         if ((inside && !shadowed) || !any(v > 0.0))
             continue;
-        float3 to_light = s.lights[id].direction;
-        light += directional_illuminance(set, id) * v * hg_phase(anisotropy, dot(-to_light, to_eye))
+        light += directional_illuminance(set, id) * v * hg_phase(anisotropy, dot(-along, to_eye))
             * M.transmittance(s.medium, x, to_light, positive_infinity());
     }
     return light;
@@ -146,10 +162,11 @@ public float3 particle_light<S : ISurface, M : IMedium>(ParticleLighting* l, flo
 {
     bool inside;
     float3 vis[MAX_FROXEL_SHADOWED_LIGHTS];
-    float3 light = particle_ambient(l, x, to_eye, rng, inside, vis);
+    float3 arrives[MAX_FROXEL_SHADOWED_LIGHTS];
+    float3 light = particle_ambient(l, x, to_eye, rng, inside, vis, arrives);
     if (!inside)
-        particle_shadow_rays<S, M>(l, x, vis);
-    return light + particle_directional<M>(l, x, to_eye, anisotropy, inside, vis);
+        particle_shadow_rays<S, M>(l, x, vis, arrives);
+    return light + particle_directional<M>(l, x, to_eye, anisotropy, inside, vis, arrives);
 }
 
 // The in-scatter (pre-exposed) and transmittance from the eye to render-space `x` along the

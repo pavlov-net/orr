@@ -343,7 +343,9 @@ bool eye_may_be_inside(FroxelRoot r)
 // of another material inside that interior does not end it.
 public void froxel_eye_column<S : ISurface>(FroxelRoot r, uint2 column)
 {
-    EyeColumn out = { EyeInterior(), 0.0, positive_infinity(), 0 };
+    EyeColumn out = (EyeColumn)0;
+    out.interior = EyeInterior();
+    out.end = positive_infinity();
     if (eye_may_be_inside(r))
     {
         SceneRoot* s = r.scene;
@@ -567,6 +569,9 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
     EyeColumn eye_column = r.eye[column.y * r.columns + column.x];
     float3 eye_sigma = interior_medium(r.scene, eye_column.interior.innermost()).sigma_t;
     bool keep_depth = r.eye_depth.index != IMAGE_NONE;
+    float4 stacks[MAX_FROXEL_SHADOWED_LIGHTS];
+    for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
+        stacks[j] = float4(0.0);
     uint active = 0;
     uint rays = 0;
     for (uint k = 0; k < r.slices; k++)
@@ -615,7 +620,11 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
                 RayCone cone = { 0.0, 0.0 };
                 rays++;
                 float3 tau;
-                float3 t = surface_visibility<S, M, SHADOW_UNBENT>(r.scene, r.view, x, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, Interior(), r.set.shadow_overflows, tau);
+                StackLight stack;
+                float3 t = directional_visibility<S, M>(r.scene, r.view, x, to_light, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), enclosed ? Interior(eye_column.interior) : Interior(), r.set.shadow_overflows, tau, stack);
+                t *= stack.jacobian;
+                if (inside && stack.jacobian != 1.0 && stacks[j].w == 0.0)
+                    stacks[j] = float4(stack.normal, 1.0);
                 // The column's interior takes its share of the optical depth as a distance.
                 float d = 0.0;
                 if (inside && any(eye_sigma > 0.0))
@@ -640,6 +649,8 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
         if (keep_depth)
             r.eye_depth.get<RWTexture3D<float4>>()[f] = depth;
     }
+    if (keep_depth)
+        r.eye[column.y * r.columns + column.x].stacks = stacks;
     uint wave_active = WaveActiveSum(active);
     uint wave_rays = WaveActiveSum(rays);
     if (WaveIsFirstLane())
@@ -654,8 +665,9 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
 // `incident.a` and `more`, and every directional light's multiple scattering. Its smoke's
 // `smoke_scatter` takes the same light with a Henyey-Greenstein response of `anisotropy`. A froxel
 // of a dielectric's interior `im` takes `im`'s phase function, its shadowed lights through their
-// distance in it (`depth` over their visibility), and no multiple scattering of the linked medium.
-float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumPoint m, float3 smoke_scatter, float anisotropy, float4 incident, float4 more, float3 x, float3 dir, bool in_interior = false, InteriorMedium im = (InteriorMedium)0, float4 depth = float4(0.0))
+// distance in it (`depth` over their visibility) along the direction a plane stack of `stacks`
+// bends them to in its IOR `ior`, and no multiple scattering of the linked medium.
+float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumPoint m, float3 smoke_scatter, float anisotropy, float4 incident, float4 more, float3 x, float3 dir, bool in_interior = false, InteriorMedium im = (InteriorMedium)0, float4 depth = float4(0.0), float4 stacks[MAX_FROXEL_SHADOWED_LIGHTS] = {}, float ior = AMBIENT_IOR)
 {
     uint64_t data = set.scene.medium;
     float3 medium_light = float3(0.0);
@@ -667,7 +679,10 @@ float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumP
         float vis = j == 0 ? incident.a : more[j - 1];
         if (vis > 0.0)
         {
-            float cos_theta = dot(to_light, dir);
+            float3 arrives = to_light;
+            if (in_interior && stacks[j].w > 0.0 && !stack_direction(to_light, stacks[j].xyz, ior, arrives))
+                continue;
+            float cos_theta = dot(arrives, dir);
             float3 arriving = directional_illuminance(set, id) * vis * beer(im.sigma_t, depth[j] / vis) * M.transmittance(data, x, to_light, positive_infinity());
             medium_light += arriving * (in_interior ? float3(hg_phase(im.anisotropy, cos_theta)) : M.phase(data, m, cos_theta));
             smoke_light += arriving * hg_phase(anisotropy, cos_theta);
@@ -822,7 +837,7 @@ public void froxel_integrate<M : IMedium>(FroxelRoot r, uint2 column)
             float4 incident = r.incident.get<RWTexture3D<float4>>()[f];
             float4 more = lights.count > 1 ? r.visibility.get<RWTexture3D<float4>>()[f] : float4(1.0);
             float4 depth = inside && r.eye_depth.index != IMAGE_NONE ? r.eye_depth.get<RWTexture3D<float4>>()[f] : float4(0.0);
-            source = froxel_source<M>(set, lights, m, smoke_scatter, r.smoke_anisotropy, incident, more, x, dir, inside, im, depth);
+            source = froxel_source<M>(set, lights, m, smoke_scatter, r.smoke_anisotropy, incident, more, x, dir, inside, im, depth, eye_column.stacks, interior_ior(r.scene, eye_column.interior.innermost()));
         }
         march_step(m.sigma_t, source, dt, inscatter, transmittance);
         r.integrated.get<RWTexture3D<float4>>()[f] = float4(apply_hdr_ceiling(inscatter * pre_exposure), luminance_rec2020(transmittance));

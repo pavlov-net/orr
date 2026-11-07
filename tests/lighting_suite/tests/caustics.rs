@@ -39,14 +39,23 @@ fn gathered() -> ViewLighting {
     }
 }
 
+/// The first vertex's light in real time: its next-event estimation, what its BSDF ray finds and
+/// what it gathers of the grid.
+fn first_vertex() -> ViewLighting {
+    ViewLighting {
+        max_bounces: 0,
+        ..ViewLighting::default()
+    }
+}
+
 /// The white floor's irradiance where it shows radiance `radiance` by its diffuse albedo.
 fn irradiance(radiance: f64) -> f64 {
     radiance * std::f64::consts::PI / f64::from(WHITE_FLOOR_ALBEDO)
 }
 
-/// Sunlight through the tinted slab reaches the floor below it as photons alone: the shadow
-/// rays end at the slab, and the grid holds the sun's irradiance through both faces' Fresnel,
-/// Beer's law along the refracted path and the internal reflections between the faces, on a
+/// Sunlight through the tinted slab reaches the floor below it through both faces' Fresnel and
+/// Beer's law along the refracted path, by next-event estimation through the slab as a plane
+/// stack, and through the internal reflections between the faces, which the grid holds, on a
 /// level floor and on one tilted 30 degrees toward the sun, whose plane crosses the grid's
 /// voxels. The patch lies under a point of the slab past the bands where the faces facing away
 /// from the sun fold light onto the floor by total internal reflection.
@@ -84,7 +93,7 @@ fn a_slab_passes_the_sun_to_the_floor_by_fresnel_and_beer_law() {
         let under = through_at - sun * (normal.dot(through_at) / cosine);
         let patch = pixel_of(&spec, under);
         let mut bed = Bed::with(spec);
-        let image = render_paths(&mut bed, &paths(gathered()), 32, 1);
+        let image = render_paths(&mut bed, &paths(first_vertex()), 32, 1);
         let got = image.around(patch, 4);
         for (c, &radiance) in got.iter().enumerate() {
             let wanted = f64::from(SUN.illuminance[c]) * f64::from(cosine) * through;

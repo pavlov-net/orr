@@ -381,7 +381,7 @@ public void apply_decals(DecalLayer layer, inout BsdfParams p, inout float3 norm
 
 // `BsdfParams.specular_color` of `m` from its specular color `color` and IOR `ior`: past OpenPBR,
 // F0, a reflectance that holds to 0..1 in the space it was stated in, Rec.709.
-float3 surface_specular_color(MaterialGpu* m, float3 color, float ior)
+public float3 surface_specular_color(MaterialGpu* m, float3 color, float ior)
 {
     if ((m.flags & MATERIAL_FRESNEL_MIX) == 0)
         return color;

@@ -232,6 +232,7 @@ struct ProxyMarch<S : ISurface, M : IMedium> : IProxyStep
     float ray_spacing;
     uint traced;
     float3 ray_vis[MAX_PROXY_RAYS][MAX_FROXEL_SHADOWED_LIGHTS];
+    float3 ray_arrives[MAX_FROXEL_SHADOWED_LIGHTS];
     // The linked medium's in-scatter past `near_range` this march has added: a sky pixel's
     // environment holds it too.
     float3 past;
@@ -282,7 +283,8 @@ struct ProxyMarch<S : ISurface, M : IMedium> : IProxyStep
     {
         bool inside;
         float3 vis[MAX_FROXEL_SHADOWED_LIGHTS];
-        float3 ambient = particle_ambient(root.lighting, p, -dir, rng, inside, vis);
+        float3 arrives[MAX_FROXEL_SHADOWED_LIGHTS];
+        float3 ambient = particle_ambient(root.lighting, p, -dir, rng, inside, vis, arrives);
         if (root.proxy_rays > 0 || !inside)
         {
             // Between the two nearest rays, optical depth being what runs linearly along the
@@ -297,13 +299,17 @@ struct ProxyMarch<S : ISurface, M : IMedium> : IProxyStep
                     continue;
                 traced |= 1u << i;
                 float3 traced_vis[MAX_FROXEL_SHADOWED_LIGHTS];
-                particle_shadow_rays<S, M>(root.lighting, froxels.view.eye_render.xyz + dir * (ray_start + float(i) * ray_spacing), traced_vis);
+                // A plane stack bends a light alike at every point behind it.
+                particle_shadow_rays<S, M>(root.lighting, froxels.view.eye_render.xyz + dir * (ray_start + float(i) * ray_spacing), traced_vis, ray_arrives);
                 ray_vis[i] = traced_vis;
             }
             for (uint j = 0; j < froxels.lights.count; j++)
+            {
                 vis[j] = exp(lerp(log(max(ray_vis[a][j], 1e-4)), log(max(ray_vis[b][j], 1e-4)), u - float(a)));
+                arrives[j] = ray_arrives[j];
+            }
         }
-        return ambient + particle_directional<M>(root.lighting, p, -dir, anisotropy, inside, vis);
+        return ambient + particle_directional<M>(root.lighting, p, -dir, anisotropy, inside, vis, arrives);
     }
 
     [mutating]
@@ -526,7 +532,20 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
                     float3 l = c.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, c.light, c.dir) : c.radiance;
                     float t_max = isfinite(c.distance) ? c.distance * (1.0 - 1e-4) : c.distance;
                     RayCone cone = { 0.0, 0.0 };
-                    float3 vis = visibility<S, M, SHADOW_UNBENT>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind == LIGHT_SAMPLE_ENVIRONMENT, Interior(), set.shadow_overflows);
+                    HitContext context = hit_context(HIT_SECONDARY, 1, cone, 0.0);
+                    float3 vis;
+                    // Outside every interior a plane stack leaves a directional light's direction
+                    // as it is.
+                    if (c.kind == LIGHT_SAMPLE_DIRECTIONAL)
+                    {
+                        float3 depth;
+                        StackLight stack;
+                        vis = directional_visibility<S, M>(s, f.view, origin, c.dir, RAY_FLAG_NONE, context, Interior(), set.shadow_overflows, depth, stack);
+                        if (any(vis > 0.0))
+                            vis *= exp(-depth) * medium_transmittance<M>(s.medium, origin, c.dir, t_max);
+                    }
+                    else
+                        vis = visibility<S, M, SHADOW_UNBENT>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, context, c.kind == LIGHT_SAMPLE_ENVIRONMENT, Interior(), set.shadow_overflows);
                     if (c.view && any(vis > 0.0))
                         vis *= emitter_view_layer<S>(set, c, AMBIENT_IOR);
                     source += scatter * l * vis / c.pdf;
