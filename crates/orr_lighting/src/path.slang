@@ -1625,7 +1625,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
     bool cache = (r.cache_flags & CACHE_TERMINATE) != 0 && !one_technique && r.mode != PATH_DIRECT;
     bool disperse = record.spectral() && (r.dielectric_flags & DIELECTRIC_DISPERSION) != 0;
     // One technique alone carries caustics itself.
-    bool caustics = r.caustics != nullptr && !one_technique && !photon;
+    bool caustics = r.caustics != nullptr && !one_technique && !photon && caustics_hold_light(r.caustics);
     uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
 
     Interior interior = start.interior;

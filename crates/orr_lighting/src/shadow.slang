@@ -1,20 +1,20 @@
-// Shadow rays. One ray query over opaque geometry, particles, medium proxies and dielectric
-// and presence layers multiplies what each non-opaque candidate lets through, committing
-// none: a presence layer or particle passes 1 minus its opacity, a medium proxy a short march
-// of its own medium inside its box. Alpha-tested candidates pass or stop the ray by the alpha
-// test, and an opaque hit stops it. What a dielectric does depends on the ray's mode:
-// SHADOW_PATH, a path vertex's, passes a thin wall that is an ideal window by its straight
-// transmission and ends at any other, and at solid glass, which the AS commits as opaque, since
-// light through either bends and BSDF rays and caustic photons carry it; SHADOW_PHOTON, a
-// photon's way from its light, ends at every dielectric; SHADOW_UNBENT, what froxels, particle
-// lighting and media apply trace, passes every dielectric by its unbent transmission, forcing
-// the AS's solid glass non-opaque. That mode keeps its crossings sorted by distance, since
-// candidates arrive in no order, and walks them from the interior list at its origin: each
-// segment takes the Beer transmittance of the innermost interior around it, each crossing its
-// Fresnel against the medium around it, and the walk gives the radiance scale between the two
-// ends. The other modes cross no interior surface, so their whole segment lies in the innermost
-// interior at the origin. The linked medium's transmittance covers the scene's medium, which
-// proxies add to.
+// Shadow rays. A ray query over opaque geometry, particles, medium proxies and dielectric and
+// presence layers multiplies what each non-opaque candidate lets through, committing none: a
+// presence layer or particle passes 1 minus its opacity, a medium proxy a short march of its own
+// medium inside its box. Alpha-tested candidates pass or stop the ray by the alpha test, and an
+// opaque hit stops it. What a dielectric does depends on the ray's mode: SHADOW_PATH, a path
+// vertex's, passes a thin wall that is an ideal window by its straight transmission and ends at
+// any other, and at solid glass, which the AS commits as opaque, since light through either
+// bends and BSDF rays and caustic photons carry it; SHADOW_PHOTON, a photon's way from its
+// light, ends at every dielectric; SHADOW_UNBENT, what froxels, particle lighting and media
+// apply trace, passes every dielectric by its unbent transmission, tracing dielectrics apart
+// from the rest so that it forces the AS's solid glass alone non-opaque. That mode keeps its
+// crossings sorted by distance, since candidates arrive in no order, and walks them from the
+// interior list at its origin: each segment takes the Beer transmittance of the innermost
+// interior around it, each crossing its Fresnel against the medium around it, and the walk
+// gives the radiance scale between the two ends. The other modes cross no interior surface, so
+// their whole segment lies in the innermost interior at the origin. The linked medium's
+// transmittance covers the scene's medium, which proxies add to.
 module shadow;
 
 import orr_shaders.abi;
@@ -296,8 +296,8 @@ struct ProxyDepth : IProxyStep
 // interiors of `inside`, which need not name those the ray leaves through: the product of every
 // candidate along the segment, 0 at an opaque hit, times the linked medium's transmittance over
 // it unless the ray goes to the `environment`, whose map holds that medium. A ray past
-// SHADOW_CANDIDATES non-opaque candidates keeps the product so far and adds 1 to `overflows`
-// (null: not counted).
+// SHADOW_CANDIDATES non-opaque candidates in one of its traces keeps the product so far and adds
+// 1 to `overflows` (null: not counted).
 public float3 visibility<S : ISurface, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows)
 {
     float3 depth;
@@ -314,6 +314,16 @@ public float3 visibility<S : ISurface, M : IMedium, let MODE : uint>(SceneRoot* 
 // segment left out of the product and returned in `depth`.
 public float3 surface_visibility<S : ISurface, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows, out float3 depth)
 {
+    uint committed;
+    float committed_t;
+    return surface_visibility<S, M, MODE>(s, v, origin, dir, t_max, flags, context, environment, inside, overflows, depth, committed, committed_t);
+}
+
+// As above, and in `committed` and `committed_t` the CLASS_* and distance of an opaque hit the AS
+// committed, which made the product 0, or ~0 and +inf for none: the first one found, not the
+// nearest. A SHADOW_PATH ray ending at solid glass commits CLASS_DIELECTRIC.
+public float3 surface_visibility<S : ISurface, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows, out float3 depth, out uint committed, out float committed_t)
+{
     ShadowCandidates<S, M, MODE> h;
     h.scene = s;
     h.view = v;
@@ -329,11 +339,32 @@ public float3 surface_visibility<S : ISurface, M : IMedium, let MODE : uint>(Sce
     ray.Direction = dir;
     ray.TMin = 0.0;
     ray.TMax = t_max;
-    if (MODE == SHADOW_UNBENT)
-        flags |= RAY_FLAG_FORCE_NON_OPAQUE;
     bool overflow;
     // Any opaque hit makes the product 0, so the search ends at the first it finds.
-    float3 product = trace_transmittance(s.tlas, ray, SHADOW_MASK, flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, h, SHADOW_CANDIDATES, overflow);
+    flags |= RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+    float3 product;
+    if (MODE == SHADOW_UNBENT)
+    {
+        // Everything but dielectrics as the AS has it, then dielectrics alone forced
+        // non-opaque, so the AS's solid glass arrives as crossings and opaque geometry takes no
+        // candidate handling. Solid glass in an instance that mixes classes commits in the first
+        // trace; that ray traces everything forced non-opaque instead.
+        product = trace_transmittance(s.tlas, ray, SHADOW_MASK & ~MASK_DIELECTRIC, flags, h, SHADOW_CANDIDATES, overflow, committed, committed_t);
+        if (committed == CLASS_DIELECTRIC)
+        {
+            product = trace_transmittance(s.tlas, ray, SHADOW_MASK, flags | RAY_FLAG_FORCE_NON_OPAQUE, h, SHADOW_CANDIDATES, overflow);
+            committed = ~0u;
+            committed_t = positive_infinity();
+        }
+        else if (any(product > 0.0))
+        {
+            bool more;
+            product *= trace_transmittance(s.tlas, ray, MASK_DIELECTRIC, flags | RAY_FLAG_FORCE_NON_OPAQUE, h, SHADOW_CANDIDATES, more);
+            overflow = overflow || more;
+        }
+    }
+    else
+        product = trace_transmittance(s.tlas, ray, SHADOW_MASK, flags, h, SHADOW_CANDIDATES, overflow, committed, committed_t);
     if (overflow && overflows != nullptr)
         InterlockedAdd(*overflows, 1u);
     float scale;

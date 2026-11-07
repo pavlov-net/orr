@@ -176,7 +176,19 @@ public bool trace_any<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags
 [ForceInline]
 public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint mask, uint flags, inout H handler, uint max_candidates, out bool overflow)
 {
+    uint committed_class;
+    float committed_t;
+    return trace_transmittance(tlas, ray, mask, flags, handler, max_candidates, overflow, committed_class, committed_t);
+}
+
+// As above, and in `committed_class` and `committed_t` the CLASS_* and distance of the opaque hit
+// that gave 0, or ~0 and +inf for none.
+[ForceInline]
+public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint mask, uint flags, inout H handler, uint max_candidates, out bool overflow, out uint committed_class, out float committed_t)
+{
     overflow = false;
+    committed_class = ~0u;
+    committed_t = asfloat(0x7f800000u);
     float3 product = 1;
     uint count = 0;
     RayQuery<RAY_FLAG_NONE> q;
@@ -213,7 +225,12 @@ public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint m
         }
     }
     if (q.CommittedStatus() != COMMITTED_NOTHING)
+    {
         product = 0;
+        Hit h = committed(q);
+        committed_class = h.class_id;
+        committed_t = h.t;
+    }
     return product;
 }
 

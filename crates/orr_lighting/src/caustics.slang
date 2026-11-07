@@ -406,6 +406,13 @@ public float3 map_radiance<R : IPhotonReceiver>(CausticsGpu* g, float3 p, float3
     return sum / (PI * r2);
 }
 
+// Whether the caustics hold any light to gather once the frame's photons and resolve are done:
+// a grid's occupied cells, a map's deposits.
+public bool caustics_hold_light(CausticsGpu* g)
+{
+    return g.counters[g.mode == CAUSTICS_MAP ? CAUSTIC_DEPOSITS : CAUSTIC_OCCUPIED] > 0;
+}
+
 // Counts a photon started from entry `entry`.
 public void count_started(PhotonSourceGpu* source, CausticsGpu* g, uint entry)
 {
