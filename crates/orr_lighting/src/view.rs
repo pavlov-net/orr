@@ -111,6 +111,12 @@ pub struct GuideSettings {
     /// in `specular_motion`; others take their surface's motion.
     pub specular_motion_roughness: f32,
     pub camera_jump: CameraJump,
+    /// The depth-of-field guide ([`LightingView::depth_of_field_guide`]) holds, before the
+    /// frosted-glass term, the luminance of the light each pixel's guides show gathered of the
+    /// caustic grid, read without jitter: by its G-buffer surface, the surfaces a near-mirror's
+    /// chain reaches, and a layer's surface and refraction chain by the layer's weight;
+    /// otherwise 0.
+    pub caustic_guide: bool,
 }
 
 impl Default for GuideSettings {
@@ -118,6 +124,7 @@ impl Default for GuideSettings {
         Self {
             specular_motion_roughness: 0.25,
             camera_jump: CameraJump::default(),
+            caustic_guide: false,
         }
     }
 }
@@ -268,6 +275,15 @@ const CACHE_TERMINATE: u32 = 1;
 
 /// The layer vertices a reference path takes at least: a ray through a solid can take many.
 const REFERENCE_DIELECTRIC_DEPTH: u32 = 64;
+
+/// The layer vertices `lighting`'s paths and dielectric guides take.
+fn dielectric_depth(lighting: &ViewLighting) -> u32 {
+    if lighting.reference.is_some() {
+        lighting.dielectric_depth.max(REFERENCE_DIELECTRIC_DEPTH)
+    } else {
+        lighting.dielectric_depth
+    }
+}
 
 /// `path`'s `DIELECTRIC_REFERENCE`, `DIELECTRIC_DEBUG_LAYER`, `DIELECTRIC_DISPERSION` and
 /// `DIELECTRIC_FROST`.
@@ -428,6 +444,7 @@ const NORMAL_ROUGHNESS: &str = "normal roughness";
 const SPECULAR_MOTION: &str = "specular motion";
 const RR_DEPTH: &str = "rr depth";
 const RR_MOTION: &str = "rr motion";
+const DOF_GUIDE: &str = "dof guide";
 
 /// What the passes after ray reconstruction and the consumer read.
 const TO_FRAME_END: Span = Span::new(ViewStep::Lighting, ViewStep::After);
@@ -444,6 +461,8 @@ struct Targets {
     specular_motion: ArenaTexture,
     depth: ArenaTexture,
     motion: ArenaTexture,
+    /// Held only for ray reconstruction.
+    dof_guide: Option<ArenaTexture>,
 }
 
 impl Targets {
@@ -464,6 +483,7 @@ impl Targets {
             specular_motion: get(SPECULAR_MOTION)?,
             depth: get(RR_DEPTH)?,
             motion: get(RR_MOTION)?,
+            dof_guide: arena.texture(DOF_GUIDE).cloned(),
         })
     }
 }
@@ -486,6 +506,8 @@ pub struct LightingView {
     layers: Allocation<LayerGuide>,
     layers_frame: Option<u64>,
     layers_frost: bool,
+    /// The caustics the paths of a frame gathered from, and that frame.
+    caustics: Option<(u64, GpuPtr<CausticsGpu>)>,
     layer_tile_roots: Ring<LayerTilesRoot>,
     local_roots: Ring<local::Root>,
     guide_roots: Ring<GuideRoot>,
@@ -503,8 +525,8 @@ pub struct LightingView {
 
 impl LightingView {
     /// The targets a view's arena holds for its [`LightingView`] at `extent`. With
-    /// `reconstructed`, ray reconstruction's output replaces the radiance after it, and later
-    /// passes read lighting's depth and motion.
+    /// `reconstructed`, ray reconstruction's output replaces the radiance after it, later
+    /// passes read lighting's depth and motion, and the view holds a depth-of-field guide.
     pub fn requests(extent: [u32; 2], reconstructed: bool) -> Vec<ArenaRequest> {
         let (radiance, surface) = if reconstructed {
             (TO_RECONSTRUCTION, TO_FRAME_END)
@@ -514,7 +536,7 @@ impl LightingView {
         let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
         let d2 = |format| TextureDesc::d2(format, extent[0], extent[1], usage);
         let guide = |name, format| ArenaRequest::texture(name, d2(format), TO_RECONSTRUCTION);
-        vec![
+        let mut requests = vec![
             ArenaRequest::texture(RADIANCE, d2(Format::Rgba16Float), radiance),
             guide(DIFFUSE_ALBEDO, Format::Rgba8Unorm),
             guide(SPECULAR_ALBEDO, Format::Rgba8Unorm),
@@ -522,7 +544,11 @@ impl LightingView {
             guide(SPECULAR_MOTION, Format::Rg16Float),
             ArenaRequest::texture(RR_DEPTH, d2(Format::R32Float), surface),
             ArenaRequest::texture(RR_MOTION, d2(Format::Rg16Float), surface),
-        ]
+        ];
+        if reconstructed {
+            requests.push(guide(DOF_GUIDE, Format::R16Float));
+        }
+        requests
     }
 
     /// A view over the targets `arena` holds from [`Self::requests`], at their extent.
@@ -584,6 +610,7 @@ impl LightingView {
             layers,
             layers_frame: None,
             layers_frost: false,
+            caustics: None,
             layer_tile_roots: Ring::new(device, "layer tile roots")?,
             local_roots: Ring::new(device, "local light sampler roots")?,
             guide_roots: Ring::new(device, "guide roots")?,
@@ -677,6 +704,20 @@ impl LightingView {
     /// the surface's elsewhere.
     pub fn specular_motion(&self) -> &Texture {
         self.targets.specular_motion.texture()
+    }
+
+    /// R16F, ray reconstruction's depth-of-field guide, held where [`Self::requests`] was
+    /// `reconstructed`: per pixel `guide_luminance(after - before)` (`(r + 2g + b) / 4`) of
+    /// what changed the radiance from what the other guides show. The guide resolve given the
+    /// target writes its caustic term ([`GuideSettings::caustic_guide`]) or 0, and
+    /// [`LightingKernels::record_frosted_glass`] adds the frosted-glass term.
+    pub fn depth_of_field_guide(&self) -> Option<&Texture> {
+        self.targets.dof_guide.as_ref().map(|t| &**t.texture())
+    }
+
+    /// The storage view of [`Self::depth_of_field_guide`].
+    pub fn depth_of_field_guide_storage(&self) -> Option<StorageImageIndex> {
+        self.targets.dof_guide.as_ref().map(|t| t.storage(0))
     }
 
     /// R32F reverse-Z device depth, 0 on sky pixels.
@@ -835,7 +876,7 @@ pub struct ViewPass {
     /// ([`LightingView::dof_background_index`]); `None` frees it.
     pub dof_background: Option<DofBackgroundPass>,
     /// The view dispatch keeps what [`LightingKernels::record_frosted_glass`] reads: set while
-    /// output's depth-of-field guide is on.
+    /// ray reconstruction reads a depth-of-field guide.
     pub frosted_glass: bool,
     /// The view keeps a front layer for each pixel ([`LightingView::overlay_depth`]), which
     /// [`LightingKernels::record_overlay_front`] resolves: set while output's
@@ -1366,11 +1407,7 @@ impl LightingKernels {
             light_flags: if reference { 0 } else { LIGHT_FEEDBACK_COUNT },
             layers: view.layers.gpu(),
             froxels,
-            dielectric_depth: if reference {
-                lighting.dielectric_depth.max(REFERENCE_DIELECTRIC_DEPTH)
-            } else {
-                lighting.dielectric_depth
-            },
+            dielectric_depth: dielectric_depth(lighting),
             camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
             dielectric_flags: flags,
             sss_max_steps: if reference {
@@ -1395,11 +1432,21 @@ impl LightingKernels {
             caustics: GpuPtr::NULL,
             _pad1: 0,
         };
-        self.record_layers(list, view, pass, lighting, lens.is_some(), &path_root);
         let path_root = PathRoot {
             caustics: self.record_photons(list, scene, view, pass, lighting, &path_root)?,
             ..path_root
         };
+        view.caustics = Some((pass.frame, path_root.caustics));
+        // The layer guides gather the caustics only for the guide resolve's caustic term.
+        let layer_root = PathRoot {
+            caustics: if lighting.guides.caustic_guide && view.targets.dof_guide.is_some() {
+                path_root.caustics
+            } else {
+                GpuPtr::NULL
+            },
+            ..path_root
+        };
+        self.record_layers(list, view, pass, lighting, lens.is_some(), &layer_root);
         if !reference {
             let update_root = PathRoot {
                 mode: 0,
@@ -1588,9 +1635,10 @@ impl LightingKernels {
 
     /// Records the guide resolve of `pass` into `view`'s guide targets after the view's
     /// raster half, and after [`Self::record_paths`] where that runs in the frame, whose
-    /// layer guides it blends in. Under a [`LightingDebugView::Guide`] view it also overwrites the
-    /// radiance, so it must then be ordered after [`Self::record_paths`]. Orders nothing
-    /// after it.
+    /// layer guides and caustics it reads. It writes every pixel of the view's
+    /// [`LightingView::depth_of_field_guide`] where it holds one. Under a
+    /// [`LightingDebugView::Guide`] view it also overwrites the radiance, so it must then be
+    /// ordered after [`Self::record_paths`]. Orders nothing after it.
     pub fn record_guides(
         &self,
         list: &mut CommandList<'_>,
@@ -1607,6 +1655,7 @@ impl LightingKernels {
             _ => 0,
         };
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
+        let dof_guide = view.depth_of_field_guide_storage();
         let root = view.guide_roots.write(
             slot,
             GuideRoot {
@@ -1621,8 +1670,20 @@ impl LightingKernels {
                 specular_motion: view.targets.specular_motion.storage(0),
                 depth: view.targets.depth.storage(0),
                 motion: view.targets.motion.storage(0),
+                dof_guide: dof_guide.unwrap_or(StorageImageIndex::NONE),
+                caustics: match view.caustics {
+                    Some((frame, caustics))
+                        if frame == pass.frame
+                            && lighting.guides.caustic_guide
+                            && dof_guide.is_some() =>
+                    {
+                        caustics
+                    }
+                    _ => GpuPtr::NULL,
+                },
                 motion_roughness: lighting.guides.specular_motion_roughness,
                 debug,
+                dielectric_depth: dielectric_depth(lighting),
                 _pad0: 0,
                 _pad1: 0,
                 _pad2: 0,
@@ -1664,14 +1725,14 @@ impl LightingKernels {
     }
 
     /// Adds the frosted-glass term into `guide`, ray reconstruction's depth-of-field guide
-    /// (R16F at the view's extent, `luminance(after - before)`), after output wrote it and
-    /// after [`Self::record_paths`] of `pass` with [`ViewPass::frosted_glass`]. A pixel
-    /// whose dominant layer is rough transmission adds its transmission's luminance times
-    /// the change that blurring the background over its rough interfaces' disc makes. The
-    /// background is the radiance of the paths from the G-buffer's surfaces at those pixels,
-    /// unbent by refraction, and each other pixel's own radiance. Other
-    /// pixels keep what output wrote. Records nothing without such a dispatch in
-    /// `pass.frame`. Orders nothing after it.
+    /// (R16F at the view's extent, `guide_luminance(after - before)`), after the guide resolve
+    /// or output's depth-of-field guide pass wrote it and after [`Self::record_paths`] of
+    /// `pass` with [`ViewPass::frosted_glass`]. A pixel whose dominant layer is rough
+    /// transmission adds its transmission's luminance times the change that blurring the
+    /// background over its rough interfaces' disc makes. The background is the radiance of the
+    /// paths from the G-buffer's surfaces at those pixels, unbent by refraction, and each other
+    /// pixel's own radiance. Other pixels keep what that write left. Records nothing without
+    /// such a dispatch in `pass.frame`. Orders nothing after it.
     pub fn record_frosted_glass(
         &self,
         list: &mut CommandList<'_>,

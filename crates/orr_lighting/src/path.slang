@@ -240,6 +240,10 @@ public struct LayerGuide
     // floats of the blur its lobes give the background, as a radius in pixels (low), and of
     // the transmission's `guide_luminance` (high); 0 elsewhere.
     public uint frost;
+    // `guide_luminance` of the pre-exposed light the layer and its refraction chain gather of
+    // the caustic grid (`LayerChain.caustic`), ceiled as radiance, where `PathRoot.caustics` is
+    // set in the layer guides' dispatch; 0 elsewhere.
+    public float caustic;
 }
 
 // A view's layer memory at G-buffer extent `extent`, from `LayerGuide*`: a guide per pixel in
@@ -2319,17 +2323,16 @@ Interior lens_interior<S : ISurface>(PathRoot r, float3 origin)
     return interior;
 }
 
-// The camera ray of `pixel` from the near plane: toward the G-buffer's surface, where the tile
-// may hold a layer before it.
-public PathStart pinhole_start(PathRoot r, uint2 pixel, bool traced)
+// The camera ray of `pixel` of view `v` from the near plane: toward the G-buffer `gb`'s
+// surface, where the tile may hold a layer before it.
+public PathStart pinhole_start(ViewConstants* v, GBufferGpu* gb, uint2 pixel, bool traced)
 {
-    ViewConstants* v = r.view;
     float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
     PathStart start = (PathStart)0;
     start.dir = render_direction(v, view_direction(v, uv));
     start.origin = render_from_view(v, view_position(v, uv, 1.0));
     start.offset = length(start.origin - v.eye_render.xyz);
-    float depth = r.gbuffer.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
+    float depth = gb.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
     start.t_max = depth > 0.0 ? max((length(view_position(v, uv, depth)) - start.offset) * (1.0 - 1e-5), 0.0) : positive_infinity();
     start.axis = 1.0;
     start.mask = traced ? MASK_OPAQUE | MASK_DIELECTRIC : 0;
@@ -2337,6 +2340,20 @@ public PathStart pinhole_start(PathRoot r, uint2 pixel, bool traced)
     start.interior = Interior();
     start.throughput = float3(1.0);
     return start;
+}
+
+// The interiors around `pixel`'s G-buffer surface, which its `pinhole_start` ray `start`
+// reaches, from this frame's layer memory `layers` (null for none): on a tile the layer
+// guides traced, those at its near-plane point flipped at each surface the ray crosses before
+// it; elsewhere none, since no layer lies before the surface and the eye lies in no medium.
+public Interior gbuffer_interior<S : ISurface>(SceneRoot* s, ViewConstants* v, LayerGuide* layers, uint2 extent, uint2 pixel, PathStart start)
+{
+    if (layers == nullptr || traced_tiles(layers, extent)[layer_tile(extent, pixel)] == 0)
+        return Interior();
+    Interior interior = Interior(layers[pixel.y * extent.x + pixel.x].near_interior);
+    if (isfinite(start.t_max))
+        surface_crossings<S>(s, v, start.origin, start.dir, start.t_max, interior);
+    return interior;
 }
 
 // Whether `pixel`'s path runs this frame, with probability `PathRoot.pixel_fraction`.
@@ -2407,7 +2424,7 @@ public void view_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMediu
     }
     else
     {
-        start = pinhole_start(r, pixel, traced);
+        start = pinhole_start(v, r.gbuffer, pixel, traced);
         if (traced)
             start.interior = Interior(r.layers[index].near_interior);
     }
@@ -2507,13 +2524,8 @@ public void update_body<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r, u
     if (any(pixel >= extent))
         return;
     Sampler rng = Sampler(pixel, r.frame, r.seed ^ UPDATE_STREAM);
-    PathStart start = pinhole_start(r, pixel, false);
-    if (traced_tiles(r.layers, extent)[layer_tile(extent, pixel)] != 0)
-    {
-        start.interior = Interior(r.layers[pixel.y * extent.x + pixel.x].near_interior);
-        if (isfinite(start.t_max))
-            surface_crossings<S>(r.scene, r.view, start.origin, start.dir, start.t_max, start.interior);
-    }
+    PathStart start = pinhole_start(r.view, r.gbuffer, pixel, false);
+    start.interior = gbuffer_interior<S>(r.scene, r.view, r.layers, extent, pixel, start);
     uint rays = 0;
     CacheUpdate update = CacheUpdate();
     float3 exposed;
@@ -2597,13 +2609,8 @@ public float3 caustic_gather<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, bo
         return map_radiance(g, x.position, n, thin, receiver);
     }
     float3 front = exit ? exit_scatter.eval(exit_scatter.n) * PI : b.diffuse_reflection();
-    float3 e = float3(0.0);
-    if (any(front > 0.0))
-        e += front * grid_irradiance(g, r.scene, x.position, n, width, u);
     float3 back = thin ? b.diffuse_transmission() : float3(0.0);
-    if (any(back > 0.0))
-        e += back * grid_irradiance(g, r.scene, x.position, -n, width, u_back);
-    return e * INV_PI;
+    return grid_gather(g, r.scene, x.position, n, front, back, width, u, u_back);
 }
 
 // Separates a photon's samples from every other stream.

@@ -71,39 +71,21 @@ public void layer_args_body(LayerTilesRoot r)
     write_grid(args + 1, 2 * args[0]);
 }
 
-// The refracted direction of a ray along `dir` through layer `l`, without roughness: straight
-// through thin walls; false on total internal reflection.
-public bool layer_refraction(SceneRoot* s, LayerVertex l, Interior interior, float3 dir, out float3 out_dir)
-{
-    out_dir = dir;
-    if (thin_walled(l.x.surface))
-        return true;
-    uint m = l.section;
-    float outer = interior_ior(s, interior.outside(m, m));
-    float inner = interior_ior(s, m);
-    float3 n = l.front ? l.x.surface.normal : -l.x.surface.normal;
-    float eta = l.front ? outer / inner : inner / outer;
-    out_dir = refract(dir, n, eta);
-    return any(out_dir != 0.0);
-}
-
 // The guides of a pixel whose first layer `l` (prepared as `b`) was hit by the camera ray
 // along `dir` with `interior` the eye's list. Presence layers give their own guides at their
-// opacity `coverage`. A dielectric blends its reflection, the surface itself, with what its
-// transmission reaches along a roughness-free refraction chain, by throughput; the dominant
-// one gives depth and motion: the hit's own where reflection carries more, the virtual point
-// of the chain otherwise. Specular motion follows the mirror reflection's virtual point.
-// Where transmission dominates, `frost` gets the blur the chain's rough interfaces give what
-// it reaches: each widens the ray by its roughness squared per m beyond it (half the cone
-// spread a rough lobe gives a path), and the widths add in quadrature.
+// opacity `coverage`. A dielectric gives its `layer_chain`; the dominant one of its reflection
+// and its chain gives depth and motion: the hit's own where reflection carries more, the
+// virtual point of the chain otherwise. Diffuse albedo holds emission, and `caustic` what the
+// layer and its chain gather of `r.caustics`' grid. Specular motion follows
+// the mirror reflection's virtual point. Where transmission dominates, `frost` gets the blur
+// the chain's rough interfaces give what it reaches, the widths adding in quadrature.
 // `front` is the layer's overlay front word where the dominant layer lies behind it, else 0.
 public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, Hit h, float3 dir, Interior interior, float coverage, out uint64_t front)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
-    LobeAlbedo a = b.albedo();
+    float exposure = v.exposure[v.exposure_slot].pre_exposure;
     LayerGuide g = (LayerGuide)0;
-    Guides own = surface_guides(l.x.surface, a);
     float3 lean = l.front ? l.x.surface.normal : -l.x.surface.normal;
     float3 previous;
     if (!hit_previous_position(s, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, previous))
@@ -122,7 +104,8 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
 
     if (h.class_id == CLASS_PRESENCE)
     {
-        g.diffuse = own.diffuse;
+        Guides own = surface_guides(l.x.surface, b, exposure);
+        g.diffuse = own.diffuse + own.emission;
         g.specular = own.specular;
         g.normal = lean;
         g.roughness = own.roughness;
@@ -130,82 +113,23 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
         g.dominant = coverage >= 0.5 ? 1 : 0;
         g.depth = own_depth;
         g.motion = own_motion;
+        g.caustic = guide_luminance(apply_hdr_ceiling(exposure * caustic_guide(r.caustics, s, l, interior, false, cone.width)));
         front = g.dominant == 0 ? overlay_front_word(own_depth, own_motion, coverage) : 0;
         return g;
     }
 
-    // The transmission chain.
-    float3 through = a.transmission;
-    Guides behind = sky_guides();
-    float traveled = positive_infinity();
-    float3 d = dir;
-    Interior list = interior;
-    LayerVertex x = l;
-    float3 bent = d;
-    bool open = any(through > 0.0) && layer_refraction(s, x, list, d, bent);
-    d = bent;
-    if (!open)
-        through = float3(0.0);
-    else if (crosses_interior(s, x.section))
-        list.cross(x.section, x.front, x.x.surface.medium_point);
-    float length_so_far = 0.0;
-    // What the chain's interiors scatter, which shows in their single-scattering color.
-    float3 scattered = float3(0.0);
-    // Over the rough interfaces i at chain length s_i with widening w_i: sums of w^2, s w^2
-    // and s^2 w^2, which give sum (D - s_i)^2 w_i^2 at chain length D.
-    float3 blur = float3(0.0);
-    if (open)
-        blur += rough_widening(x, 0.0);
-    for (uint k = 0; open && k < r.dielectric_depth; k++)
-    {
-        LayerAccept<S> ta = { s, v, d, hit_context(HIT_SECONDARY, k + 1, cone, 0.0), 0, PRESENCE_ANY };
-        float3 positions[3];
-        Hit th = trace_closest(s.tlas, path_ray(vertex_origin(x.x, d), d, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, ta, positions);
-        InteriorMedium im = interior_medium(s, list.innermost(), list.point(list.innermost()));
-        float3 tr = beer(im.sigma_t, th.hit ? th.t : positive_infinity());
-        scattered += through * (1.0 - tr) * im.albedo();
-        through *= tr;
-        if (!th.hit || th.cluster_id < 0)
-        {
-            behind = sky_guides();
-            break;
-        }
-        SurfaceHit sh = resolve_hit<S>(s, v, d, th.instance_index, uint(th.cluster_id), th.primitive_index, th.barycentrics, positions, false, hit_context(HIT_SECONDARY, k + 1, cone, th.t));
-        if (!sh.valid)
-            break;
-        length_so_far += th.t;
-        if (!is_layer(th))
-        {
-            LayerVertex o = opaque_vertex(hit_vertex(v, sh, d));
-            behind = surface_guides(o.x.surface, prepare_vertex(s, o, list, true, true, false, 0.0).albedo());
-            traveled = length_so_far;
-            break;
-        }
-        x = layer_vertex(v, sh, d);
-        Bsdf xb = prepare_vertex(s, x, list, k > 0, true, false, 0.0);
-        through *= xb.albedo().transmission;
-        bent = d;
-        bool bends = any(through > 0.0) && layer_refraction(s, x, list, d, bent);
-        d = bent;
-        if (!bends)
-        {
-            through = float3(0.0);
-            break;
-        }
-        blur += rough_widening(x, length_so_far);
-        if (crosses_interior(s, x.section))
-            list.cross(x.section, x.front, x.x.surface.medium_point);
-    }
-    float wr = luminance_rec2020(a.specular + a.diffuse + scattered);
-    float wt = luminance_rec2020(through);
-    g.diffuse = own.diffuse + scattered + through * behind.diffuse;
-    g.specular = own.specular + through * behind.specular;
-    float3 n = wr * lean + wt * behind.normal;
-    g.normal = dot(n, n) > 0.0 ? normalize(n) : lean;
-    g.roughness = wr + wt > 0.0 ? (wr * own.roughness + wt * behind.roughness) / (wr + wt) : own.roughness;
+    LayerChain c = layer_chain<S>(s, v, l, b, false, dir, interior, r.dielectric_depth, cone, exposure, r.caustics);
+    float wr = c.reflected;
+    float wt = c.transmitted;
+    g.diffuse = c.guides.diffuse + c.guides.emission;
+    g.specular = c.guides.specular;
+    g.normal = c.guides.normal;
+    g.roughness = c.guides.roughness;
+    g.caustic = guide_luminance(apply_hdr_ceiling(exposure * c.caustic));
     g.weight = 1.0;
     g.dominant = 1;
     front = wr < wt ? overlay_front_word(own_depth, own_motion, wr / (wr + wt)) : 0;
+    float traveled = c.traveled;
     if (wr >= wt)
     {
         g.depth = own_depth;
@@ -222,6 +146,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
         g.depth = 0.0;
         g.motion = reprojected_motion(v, dir, 0.0);
     }
+    float3 blur = c.blur;
     if ((r.dielectric_flags & DIELECTRIC_FROST) != 0 && wt > wr && blur.x > 0.0)
     {
         // The blur's radius over the width of a pixel where the chain ends; the angle alone
@@ -229,19 +154,9 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
         float radius = isfinite(traveled)
             ? sqrt(max(traveled * traveled * blur.x - 2.0 * traveled * blur.y + blur.z, 0.0)) / (cone.spread * (length(camera) + traveled))
             : sqrt(blur.x) / cone.spread;
-        g.frost = f32tof16(min(radius, FROST_MAX_RADIUS)) | (f32tof16(guide_luminance(through)) << 16);
+        g.frost = f32tof16(min(radius, FROST_MAX_RADIUS)) | (f32tof16(guide_luminance(c.through)) << 16);
     }
     return g;
-}
-
-// What rough layer `x`, `s` m along a transmission chain, adds to `layer_guides`'s blur sums.
-float3 rough_widening(LayerVertex x, float s)
-{
-    float roughness = x.x.surface.bsdf.specular_roughness;
-    if (roughness < MIRROR_ROUGHNESS)
-        return float3(0.0);
-    float w2 = roughness * roughness * roughness * roughness;
-    return w2 * float3(1.0, s, s * s);
 }
 
 // The layer guide dispatch's body for `pixel`, in a traced tile: `camera_medium`, flipped at each
@@ -254,7 +169,7 @@ public void layer_guide_body<S : ISurface>(PathRoot r, uint2 pixel)
     ViewConstants* v = r.view;
     uint2 extent = r.gbuffer.extent;
     uint index = pixel.y * extent.x + pixel.x;
-    PathStart start = pinhole_start(r, pixel, true);
+    PathStart start = pinhole_start(v, r.gbuffer, pixel, true);
     Interior interior = Interior();
     if (r.camera_medium != MATERIAL_NONE)
         interior.cross(r.camera_medium, true);

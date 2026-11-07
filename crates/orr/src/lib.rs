@@ -38,9 +38,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub use orr_lighting::{
-    self, CompilingKernels, Error as LightingError, LightingDebugView, LightingStats,
-    MediaSettings, ParticleDraw, ParticleLighting, PathEntry, ReferenceSettings,
-    SceneLightingSettings, ThinLens, ViewLighting, WorldCacheSettings,
+    self, CausticSettings, CausticStats, CompilingKernels, Error as LightingError, GuideSettings,
+    LightingDebugView, LightingStats, MediaSettings, ParticleDraw, ParticleLighting, PathEntry,
+    ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting, WorldCacheSettings,
 };
 pub use orr_output::DisplayWatch;
 pub use orr_output::{self, Error as OutputError};
@@ -1115,7 +1115,9 @@ impl<'a> Frame<'a> {
     /// renders at the output extent. A new output extent or request remakes the view's feature,
     /// which waits for its setup on this thread. The jitter follows the view's renders, so a view
     /// not rendered every frame still covers its pixels. A feature the backend refuses is an
-    /// error.
+    /// error. Ray reconstruction reads lighting's guides
+    /// ([`orr_lighting::LightingView::depth_of_field_guide`] among them, with the blur rough
+    /// glass gives what lies behind it).
     ///
     /// While the path tracing kernels compile ([`Frame::paths_ready`] false) only the view's raster
     /// half runs, so streaming goes on while a loading thread is free, and everything after it
@@ -1221,7 +1223,7 @@ impl<'a> Frame<'a> {
             sample_index: state.samples,
             seed: 0,
             dof_background: None,
-            frosted_glass: false,
+            frosted_glass: reconstructed,
             overlay_front: blurs && view.lens.shutter > 0.0,
             walking_materials: raster.walking_materials,
         };
@@ -1255,6 +1257,10 @@ impl<'a> Frame<'a> {
         if reconstructed || matches!(lighting.debug_view, LightingDebugView::Guide(_)) {
             let list = self.scenes.list()?;
             kernels.record_guides(list, paths, &pass, lighting);
+            if let Some(guide) = paths.depth_of_field_guide_storage() {
+                list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+                kernels.record_frosted_glass(list, paths, &pass, guide);
+            }
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
         let overlay_front = paths
@@ -1285,7 +1291,7 @@ impl<'a> Frame<'a> {
                         specular_motion: paths.specular_motion(),
                         specular_hit_distance: None,
                         transparency: overlay.as_ref().map(|(texture, _)| &**texture),
-                        depth_of_field_guide: None,
+                        depth_of_field_guide: paths.depth_of_field_guide(),
                         denoise_strength_mask: None,
                         reactive_mask: None,
                         exposure: None,

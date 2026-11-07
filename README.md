@@ -61,8 +61,12 @@ world.
 - Path tracing with shader execution reordering
 - A real time OpenPBR BSDF, checked against the reference implementation
 - Light selection across many lights, including area lights and emissive meshes, guided by per
-  pixel feedback, plus a world radiance cache
-- Glass with nested interiors, absorption and hero wavelength dispersion
+  pixel feedback, with light and BSDF samples weighed against each other, plus a world radiance
+  cache
+- Glass with nested interiors, absorption and hero wavelength dispersion, which every path ray
+  bends at
+- Caustics through glass and mirrors from photons traced each frame into a world space grid, and
+  a progressive photon map in the accumulation reference
 - Random walk subsurface scattering
 - Froxel fog, smoke, and volumes from cooked or your own data
 - A physically based, spectral sky, sun and moon in `orr_atmosphere`

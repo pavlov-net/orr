@@ -318,6 +318,19 @@ public float3 grid_irradiance(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, 
     return found;
 }
 
+// The radiance a receiver at `p` with geometric normal `n` on the reading side gathers of the
+// grid through its Lambertian lobes: `front` albedo on that side, read with `u`, and `back`
+// albedo through it, read with `u_back`; a lobe of zero albedo reads nothing.
+public float3 grid_gather(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float3 front, float3 back, float width, float4 u, float4 u_back)
+{
+    float3 e = float3(0.0);
+    if (any(front > 0.0))
+        e += front * grid_irradiance(g, s, p, n, width, u);
+    if (any(back > 0.0))
+        e += back * grid_irradiance(g, s, p, -n, width, u_back);
+    return e * INV_PI;
+}
+
 // The map's cell of render-space `p`: two radii wide, offset by `offset`.
 int3 map_cell(CausticsGpu* g, float3 p)
 {

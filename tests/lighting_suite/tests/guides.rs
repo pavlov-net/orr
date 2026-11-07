@@ -1,10 +1,11 @@
 //! Ray reconstruction guides on the bed's scenes: albedo, normal and roughness against the
-//! materials, sky defaults, mirror chains, specular motion under camera motion, and the
-//! sources of the history reset.
+//! materials, emission and sky defaults, mirror chains and the glass they meet, specular motion
+//! under camera motion, and the sources of the history reset.
 
 use lighting_suite::assert_clean;
 use lighting_suite::bed::{
-    Analytic, Bed, EXTENT, FLOOR, GuideImages, Item, MIRROR, Paths, SKY, SUN, Spec, look,
+    Analytic, Bed, EXTENT, FLOOR, GuideImages, Item, MIRROR, Paths, SKY, SLAB_THICKNESS, SUN, Spec,
+    TINTED_SLAB, look,
 };
 use orr_gpu::KernelSet;
 use orr_lighting::{GuideKind, Light, LightingDebugView, PathEntry, ViewLighting};
@@ -93,14 +94,15 @@ fn guides_hold_the_material_albedo_and_sky_defaults() {
 }
 
 #[test]
-fn cornell_box_walls_take_their_base_colors() {
+fn cornell_box_walls_take_their_base_colors_and_the_emitter_its_emission() {
     let mut bed = Bed::new(Analytic::CornellBox);
     let g = guides(&mut bed);
     let colors = [
         rec2020([0.73; 3]),
         rec2020([0.63, 0.065, 0.05]),
         rec2020([0.14, 0.45, 0.091]),
-        Vec3::ZERO, // the emitter
+        // The emitter, whose pre-exposed emission fills the diffuse albedo guide.
+        Vec3::ONE,
     ];
     let mut counts = [0; 4];
     for (i, d) in g.diffuse_albedo.iter().enumerate() {
@@ -114,7 +116,10 @@ fn cornell_box_walls_take_their_base_colors() {
             .unwrap_or_else(|| panic!("pixel {i}: diffuse albedo {d} is no wall's"));
         counts[k] += 1;
     }
-    assert!(counts[..3].iter().all(|&n| n > 100), "{counts:?}");
+    assert!(
+        counts[..3].iter().all(|&n| n > 100) && counts[3] > 0,
+        "{counts:?}"
+    );
     assert_clean();
 }
 
@@ -329,6 +334,80 @@ fn near_mirrors_take_the_guides_of_what_they_reflect() {
         assert!(
             near(d, floor_diffuse, 0.05),
             "pixel {i}: {d} against {floor_diffuse}"
+        );
+    }
+    assert_clean();
+}
+
+/// Whether the ray from `o` along `dir` meets the box `lo`..`hi`.
+fn meets_box(o: Vec3, dir: Vec3, lo: Vec3, hi: Vec3) -> bool {
+    let a = (lo - o) / dir;
+    let b = (hi - o) / dir;
+    let near = a.min(b).max_element().max(0.0);
+    let far = a.max(b).min_element();
+    near <= far
+}
+
+/// The tinted slab on the floor between the camera and the mirror: the mirror reflects the
+/// floor through it, and the guides of those pixels show the floor through the glass.
+#[test]
+fn mirrors_take_the_guides_of_the_glass_they_reflect() {
+    let (mut spec, mirror) = mirror_scene();
+    // Turned so its 1.6 m runs along z, its bottom 1 cm above the floor.
+    let center = Vec3::new(0.0, 0.5 * SLAB_THICKNESS + 0.01, 0.0);
+    let half = Vec3::new(0.5, 0.5 * SLAB_THICKNESS, 0.8);
+    spec.copies.push(Item {
+        model: TINTED_SLAB,
+        linear: Mat3::from_rotation_y(std::f32::consts::FRAC_PI_2),
+        at: center,
+    });
+    let camera = Camera::new(&spec);
+    let mut bed = Bed::with(spec);
+    let g = guides(&mut bed);
+    let n = mirror.normal();
+    let (lo, hi) = (center - half, center + half);
+    let margin = Vec3::splat(MARGIN);
+    let inside = |p: Vec3| {
+        (p.x - center.x).abs() < half.x - MARGIN && (p.z - center.z).abs() < half.z - MARGIN
+    };
+    let (mut clear, mut clears) = (Vec3::ZERO, 0);
+    let mut through = Vec::new();
+    for i in 0..g.depth.len() {
+        let (dir, _) = camera.pixel(i);
+        if meets_box(camera.eye, dir, lo - margin, hi + margin) {
+            continue;
+        }
+        let Ray::MirrorToFloor { x1, .. } = trace(&mirror, camera.eye, dir) else {
+            continue;
+        };
+        let r = dir - 2.0 * dir.dot(n) * n;
+        let diffuse = rgb(g.diffuse_albedo[i]);
+        if !meets_box(x1, r, lo - margin, hi + margin) {
+            clear += diffuse;
+            clears += 1;
+            continue;
+        }
+        // Through the top and out of the bottom, away from the sides.
+        let at = |y: f32| x1 + r * ((y - x1.y) / r.y);
+        if inside(at(hi.y)) && inside(at(lo.y)) {
+            through.push((i, diffuse));
+        }
+    }
+    assert!(
+        clears > 100 && through.len() > 40,
+        "{clears} {}",
+        through.len()
+    );
+    let clear = clear / clears as f32;
+    // The slab's interior passes half the light over its thickness, less along a slanted
+    // path and less again by the Fresnel of its faces. The refracted path is at most 0.3 m over
+    // the cosine of the critical angle, 0.4 m, so about 0.4 of the light or more passes it, and
+    // the faces keep most of that: a chain that stops at the glass shows black.
+    for (i, d) in through {
+        let ratio = (d / clear).max_element();
+        assert!(
+            ratio > 0.2 && ratio < 0.6,
+            "pixel {i}: {d} against the clear floor's {clear}"
         );
     }
     assert_clean();

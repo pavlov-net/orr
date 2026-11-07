@@ -1,10 +1,12 @@
 // Ray reconstruction guides. Per pixel: diffuse and specular albedo from the surface's BSDF,
-// world normal and linear roughness, depth and motion from the G-buffer, and specular motion.
-// Pixels with a dielectric or presence layer blend in its guide by its weight, and take its
-// depth and motion where it dominates.
+// with its pre-exposed emission added to the diffuse albedo, world normal and linear roughness,
+// depth and motion from the G-buffer, and specular motion. Pixels with a dielectric or presence
+// layer blend in its guide by its weight, and take its depth and motion where it dominates.
 // A primary surface that is a near-mirror follows its mirror chain and takes the guides of
-// the first surface past it, seen through the chain. Pixels smoother than the specular-motion
-// roughness trace the mirror direction and reproject the reflection's virtual point.
+// the first surface past it, seen through the chain; a dielectric the chain meets gives the
+// guides of its reflection and refraction chain, as a pixel's first layer does. Pixels
+// smoother than the specular-motion roughness trace the mirror direction and reproject the
+// reflection's virtual point.
 module guides;
 
 import orr_shaders.abi;
@@ -16,6 +18,9 @@ import orr_scene.hit;
 import orr_scene.visibility;
 import orr_lighting.bsdf;
 import orr_lighting.path;
+import orr_lighting.shadow;
+import orr_lighting.interiors;
+import orr_lighting.caustics;
 
 // `GuideRoot.debug`: which guide the radiance image shows.
 public static const uint GUIDE_NONE = 0;
@@ -48,8 +53,14 @@ public struct GuideRoot
     public StorageImageIndex specular_motion;   // RG16F
     public StorageImageIndex depth;             // R32F
     public StorageImageIndex motion;            // RG16F
+    // R16F depth-of-field guide, set on every pixel to its caustic term, 0 without one; NONE
+    // writes none.
+    public StorageImageIndex dof_guide;
+    // The caustics whose light the caustic term shows; null for no caustic term.
+    public CausticsGpu* caustics;
     public float motion_roughness;              // specular motion below this roughness
     public uint debug;                          // GUIDE_*
+    public uint dielectric_depth;               // layers a dielectric's refraction chain crosses
     public uint _pad0;
     public uint _pad1;
     public uint _pad2;
@@ -116,17 +127,21 @@ public struct Guides
     public float3 specular;
     public float3 normal;
     public float roughness;
+    // Pre-exposed emission, which the diffuse albedo guide adds.
+    public float3 emission;
 }
 
-// A surface's guides from its BSDF's albedo: subsurface pixels add the subsurface share in
-// the subsurface color to the diffuse albedo.
-public Guides surface_guides(GSurface s, LobeAlbedo a)
+// A surface's guides from its BSDF `b`: subsurface pixels add the subsurface share in the
+// subsurface color to the diffuse albedo. `exposure` scales its emission to pre-exposed units.
+public Guides surface_guides(GSurface s, Bsdf b, float exposure)
 {
+    LobeAlbedo a = b.albedo();
     Guides g;
     g.diffuse = a.diffuse + a.subsurface * s.bsdf.subsurface_color;
     g.specular = a.specular;
     g.normal = s.normal;
     g.roughness = s.bsdf.specular_roughness;
+    g.emission = exposure * b.emission();
     return g;
 }
 
@@ -137,6 +152,7 @@ public Guides sky_guides()
     g.specular = float3(0.0);
     g.normal = float3(0.0);
     g.roughness = 0.0;
+    g.emission = float3(0.0);
     return g;
 }
 
@@ -175,17 +191,180 @@ public struct Reflection
     // infinity (`w` 0).
     public float3 virtual_point;
     public float w;
+    // With a chain, the caustic grid's light the surfaces past `x1` gather (`caustic_guide`,
+    // `LayerChain.caustic`), by the chain's specular albedo; otherwise 0.
+    public float3 caustic;
 }
 
-// Traces the mirror direction from `x1` (guides `g1`). With `chain`, keeps reflecting off
-// near-mirrors for up to `MIRROR_CHAIN` bounces and returns the guides of the surface past
-// the last one, scaled by the chain's specular albedo, with its normal mirrored through the
-// chain into the view; otherwise one bounce and `g1`. The virtual point lies along the camera
-// ray at the camera distance plus every bounce's length.
-public Reflection mirror_chain<S : ISurface>(SceneRoot* s, ViewConstants* v, PathVertex x1, Guides g1, bool chain)
+// What vertex `l`, reached with `interior`, its coat, fuzz and film collapsed with `collapse`
+// and its footprint `width` m wide, gathers of `g`'s caustic grid by its diffuse lobes, as
+// `caustic_gather` reads it at a vertex that does not walk, which takes its subsurface share
+// as diffuse, but without its draws: the nearer level, the dominant normal bucket and the
+// point itself, so the guide holds still. 0 for null `g` or a photon map.
+public float3 caustic_guide(CausticsGpu* g, SceneRoot* s, LayerVertex l, Interior interior, bool collapse, float width)
 {
+    if (g == nullptr || g.mode != CAUSTICS_GRID)
+        return float3(0.0);
+    Bsdf b = prepare_vertex(s, l, interior, collapse, false, false, 0.0);
+    GSurface x = l.x.surface;
+    float3 n = dot(x.geometric_normal, l.x.view) < 0.0 ? -x.geometric_normal : x.geometric_normal;
+    float3 back = thin_walled(x) ? b.diffuse_transmission() : float3(0.0);
+    return grid_gather(g, s, x.position, n, b.diffuse_reflection(), back, width, float4(0.5), float4(0.5));
+}
+
+// The refracted direction of a ray along `dir` through layer `l`, without roughness: straight
+// through thin walls; false on total internal reflection.
+public bool layer_refraction(SceneRoot* s, LayerVertex l, Interior interior, float3 dir, out float3 out_dir)
+{
+    out_dir = dir;
+    if (thin_walled(l.x.surface))
+        return true;
+    uint m = l.section;
+    float outer = interior_ior(s, interior.outside(m, m));
+    float inner = interior_ior(s, m);
+    float3 n = l.front ? l.x.surface.normal : -l.x.surface.normal;
+    float eta = l.front ? outer / inner : inner / outer;
+    out_dir = refract(dir, n, eta);
+    return any(out_dir != 0.0);
+}
+
+// What rough layer `x`, `s` m along a refraction chain, adds to `LayerChain.blur`.
+float3 rough_widening(LayerVertex x, float s)
+{
+    float roughness = x.x.surface.bsdf.specular_roughness;
+    if (roughness < MIRROR_ROUGHNESS)
+        return float3(0.0);
+    float w2 = roughness * roughness * roughness * roughness;
+    return w2 * float3(1.0, s, s * s);
+}
+
+// What a dielectric layer shows ray reconstruction: its reflection, the surface itself, and
+// what its transmission reaches along a roughness-free refraction chain, by throughput.
+public struct LayerChain
+{
+    // The reflection's and the chain's guides added by their throughputs, with normal and
+    // roughness weighed by `reflected` and `transmitted`.
+    public Guides guides;
+    // Luminance of the reflection's albedo with what the chain's interiors scatter, and of
+    // the chain's throughput.
+    public float reflected;
+    public float transmitted;
+    public float3 through;
+    // What the layer and the chain's surfaces gather of the caustic grid by their diffuse
+    // lobes (`caustic_guide`), by the throughput reaching each; 0 without a grid.
+    public float3 caustic;
+    // m along the chain to the surface it ends on; infinite where it reaches the sky or ends
+    // without one.
+    public float traveled;
+    // Over the chain's rough interfaces i at chain length s_i with widening w_i: sums of w^2,
+    // s w^2 and s^2 w^2, which give sum (D - s_i)^2 w_i^2 at chain length D.
+    public float3 blur;
+}
+
+// `LayerChain` of dielectric layer `l`, prepared as `b` with its coat, fuzz and film
+// collapsed by `collapse`, met along `dir` with `interior` the list around the ray before it
+// and `cone` the ray's cone there; the chain crosses at most `depth` layers. `exposure` scales
+// emission to pre-exposed units, and `caustics` (null for none) gives the caustic grid. Each
+// rough interface widens the chain by its roughness squared per m beyond it (half the cone
+// spread a rough lobe gives a path).
+public LayerChain layer_chain<S : ISurface>(SceneRoot* s, ViewConstants* v, LayerVertex l, Bsdf b, bool collapse, float3 dir, Interior interior, uint depth, RayCone cone, float exposure, CausticsGpu* caustics)
+{
+    LobeAlbedo a = b.albedo();
+    Guides own = surface_guides(l.x.surface, b, exposure);
+    float3 lean = l.front ? l.x.surface.normal : -l.x.surface.normal;
+    LayerChain c;
+    c.through = a.transmission;
+    c.caustic = caustic_guide(caustics, s, l, interior, collapse, cone.width);
+    c.traveled = positive_infinity();
+    c.blur = float3(0.0);
+    Guides behind = sky_guides();
+    float3 d = dir;
+    Interior list = interior;
+    LayerVertex x = l;
+    float3 bent = d;
+    bool open = any(c.through > 0.0) && layer_refraction(s, x, list, d, bent);
+    d = bent;
+    if (!open)
+        c.through = float3(0.0);
+    else if (crosses_interior(s, x.section))
+        list.cross(x.section, x.front, x.x.surface.medium_point);
+    float length_so_far = 0.0;
+    // What the chain's interiors scatter, which shows in their single-scattering color.
+    float3 scattered = float3(0.0);
+    if (open)
+        c.blur += rough_widening(x, 0.0);
+    for (uint k = 0; open && k < depth; k++)
+    {
+        LayerAccept<S> ta = { s, v, d, hit_context(HIT_SECONDARY, k + 1, cone, 0.0), 0, PRESENCE_ANY };
+        float3 positions[3];
+        Hit th = trace_closest(s.tlas, path_ray(vertex_origin(x.x, d), d, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, ta, positions);
+        InteriorMedium im = interior_medium(s, list.innermost(), list.point(list.innermost()));
+        float3 tr = beer(im.sigma_t, th.hit ? th.t : positive_infinity());
+        scattered += c.through * (1.0 - tr) * im.albedo();
+        c.through *= tr;
+        if (!th.hit || th.cluster_id < 0)
+        {
+            behind = sky_guides();
+            break;
+        }
+        SurfaceHit sh = resolve_hit<S>(s, v, d, th.instance_index, uint(th.cluster_id), th.primitive_index, th.barycentrics, positions, false, hit_context(HIT_SECONDARY, k + 1, cone, th.t));
+        if (!sh.valid)
+            break;
+        length_so_far += th.t;
+        bool layer = is_layer(th);
+        LayerVertex y = layer ? layer_vertex(v, sh, d) : opaque_vertex(hit_vertex(v, sh, d));
+        c.caustic += c.through * caustic_guide(caustics, s, y, list, !layer || k > 0, cone_width(cone, length_so_far));
+        if (!layer)
+        {
+            behind = surface_guides(y.x.surface, prepare_vertex(s, y, list, true, true, false, 0.0), exposure);
+            c.traveled = length_so_far;
+            break;
+        }
+        x = y;
+        Bsdf xb = prepare_vertex(s, x, list, k > 0, true, false, 0.0);
+        c.through *= xb.albedo().transmission;
+        bent = d;
+        bool bends = any(c.through > 0.0) && layer_refraction(s, x, list, d, bent);
+        d = bent;
+        if (!bends)
+        {
+            c.through = float3(0.0);
+            break;
+        }
+        c.blur += rough_widening(x, length_so_far);
+        if (crosses_interior(s, x.section))
+            list.cross(x.section, x.front, x.x.surface.medium_point);
+    }
+    c.reflected = luminance_rec2020(a.specular + a.diffuse + scattered);
+    c.transmitted = luminance_rec2020(c.through);
+    float wr = c.reflected;
+    float wt = c.transmitted;
+    c.guides.diffuse = own.diffuse + scattered + c.through * behind.diffuse;
+    c.guides.specular = own.specular + c.through * behind.specular;
+    c.guides.emission = own.emission + c.through * behind.emission;
+    float3 n = wr * lean + wt * behind.normal;
+    c.guides.normal = dot(n, n) > 0.0 ? normalize(n) : lean;
+    c.guides.roughness = wr + wt > 0.0 ? (wr * own.roughness + wt * behind.roughness) / (wr + wt) : own.roughness;
+    return c;
+}
+
+// Traces the mirror direction from `pixel`'s G-buffer surface `x1` (guides `g1`), meeting
+// dielectrics and passing presence layers; `interior` is the list around `x1` where `known`. With `chain`,
+// keeps reflecting off near-mirrors for up to `MIRROR_CHAIN` bounces and returns the guides of
+// the surface past the last one, or the `LayerChain` guides of the dielectric it meets, scaled
+// by the chain's specular albedo, with the normal mirrored through the chain into the view;
+// otherwise one bounce and `g1`. The virtual point lies along the camera ray at the camera
+// distance plus every bounce's length, and past a dielectric whose refraction chain carries
+// more than its reflection, plus that chain's length or at infinity, as a pixel's first layer
+// takes it.
+public Reflection mirror_chain<S : ISurface>(GuideRoot r, uint2 pixel, PathVertex x1, Guides g1, Interior interior, bool known, bool chain)
+{
+    SceneRoot* s = r.scene;
+    ViewConstants* v = r.view;
+    float exposure = v.exposure[v.exposure_slot].pre_exposure;
     Reflection out;
     out.guides = g1;
+    out.caustic = float3(0.0);
     float3 camera_dir = -x1.view;
     float traveled = x1.camera_distance;
     float3 throughput = float3(1.0);
@@ -198,9 +377,9 @@ public Reflection mirror_chain<S : ISurface>(SceneRoot* s, ViewConstants* v, Pat
     {
         float3 dir = reflect(-x.view, x.surface.normal);
         HitContext trace_context = hit_context(HIT_SECONDARY, i + 1, cone, 0.0);
-        Alpha<S> a = { s, v, dir, trace_context };
+        LayerAccept<S> a = { s, v, dir, trace_context, 0, PRESENCE_NONE };
         float3 positions[3];
-        Hit h = trace_closest(s.tlas, path_ray(vertex_origin(x, dir), dir, positive_infinity()), MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+        Hit h = trace_closest(s.tlas, path_ray(vertex_origin(x, dir), dir, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
         if (chain)
         {
             throughput *= g.specular;
@@ -220,49 +399,92 @@ public Reflection mirror_chain<S : ISurface>(SceneRoot* s, ViewConstants* v, Pat
         traveled += h.t;
         out.virtual_point = camera_dir * traveled;
         out.w = 1.0;
-        if (!chain)
+        bool layer = is_layer(h);
+        if (!chain && !layer)
             return out;
         cone = cone_after_hit(cone, h.t, 0.0);
         SurfaceHit sh = resolve_hit<S>(s, v, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, hit_context(HIT_SECONDARY, i + 1, cone, h.t));
         if (!sh.valid)
             return out;
-        x = hit_vertex(v, sh, dir);
-        Bsdf b = bsdf_prepare(bsdf_collapse(x.surface.bsdf), x.surface.normal, x.view);
-        g = surface_guides(x.surface, b.albedo());
+        if (layer)
+        {
+            // The chain's surfaces are opaque, so the interiors around the ray are x1's.
+            Interior around = known ? interior : gbuffer_interior<S>(s, v, r.layers, r.gbuffer.extent, pixel, pinhole_start(v, r.gbuffer, pixel, true));
+            LayerVertex l = layer_vertex(v, sh, dir);
+            Bsdf lb = prepare_vertex(s, l, around, true, true, false, 0.0);
+            CausticsGpu* caustics = nullptr;
+            if (chain)
+                caustics = r.caustics;
+            LayerChain c = layer_chain<S>(s, v, l, lb, true, dir, around, r.dielectric_depth, cone, exposure, caustics);
+            g = c.guides;
+            out.caustic += throughput * c.caustic;
+            if (c.transmitted > c.reflected)
+            {
+                bool ends = isfinite(c.traveled);
+                out.virtual_point = ends ? camera_dir * (traveled + c.traveled) : camera_dir;
+                out.w = ends ? 1.0 : 0.0;
+            }
+            if (!chain)
+                return out;
+        }
+        else
+        {
+            x = hit_vertex(v, sh, dir);
+            Bsdf b = bsdf_prepare(bsdf_collapse(x.surface.bsdf), x.surface.normal, x.view);
+            g = surface_guides(x.surface, b, exposure);
+            out.caustic += throughput * caustic_guide(r.caustics, s, opaque_vertex(x), interior, true, cone.width);
+        }
         out.guides = g;
         out.guides.diffuse *= throughput;
         out.guides.specular *= throughput;
+        out.guides.emission *= throughput;
         out.guides.normal = mul(mirrors, g.normal);
-        if (!near_delta(g))
+        if (layer || !near_delta(g))
             return out;
     }
     return out;
 }
 
-// The guide resolve's body for `pixel`, hits shading through linked surface `S`.
+// The guide resolve's body for `pixel`, hits shading through linked surface `S`. The caustic
+// term is the `guide_luminance` of the pre-exposed light the pixel's guides show gathered of
+// the caustic grid: by the G-buffer's surface and the surfaces its mirror chain reaches,
+// blended with what a layer's own surface and refraction chain gather by the layer's weight.
 public void guide_body<S : ISurface>(GuideRoot r, uint2 pixel)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
     GBufferGpu* gb = r.gbuffer;
+    float exposure = v.exposure[v.exposure_slot].pre_exposure;
     float depth = gb.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
     float2 motion = gb.motion.get<Texture2D<float2>>().Load(int3(pixel, 0));
     Guides g = sky_guides();
     float2 specular_motion = motion;
+    float caustic = 0.0;
     PathVertex x1;
     bool surface = gbuffer_vertex(s, v, gb, pixel, x1);
     if (surface)
     {
         Bsdf b = bsdf_prepare(x1.surface.bsdf, x1.surface.normal, x1.view);
-        g = surface_guides(x1.surface, b.albedo());
+        // The G-buffer's emission is already pre-exposed.
+        g = surface_guides(x1.surface, b, 1.0);
         bool chain = near_delta(g);
+        // The interiors around the surface, which a caustic term needs and a mirror chain only
+        // where it meets a dielectric.
+        bool known = r.caustics != nullptr;
+        Interior interior = known ? gbuffer_interior<S>(s, v, r.layers, gb.extent, pixel, pinhole_start(v, gb, pixel, true)) : Interior();
+        float3 gathered = caustic_guide(r.caustics, s, opaque_vertex(x1), interior, false, cone_width(camera_cone(v), x1.camera_distance));
         if (chain || g.roughness < r.motion_roughness)
         {
-            Reflection m = mirror_chain<S>(s, v, x1, g, chain);
+            Reflection m = mirror_chain<S>(r, pixel, x1, g, interior, known, chain);
             g = m.guides;
             specular_motion = reprojected_motion(v, m.virtual_point, m.w);
+            gathered += m.caustic;
         }
+        // Ceiled as the radiance it is part of.
+        caustic = guide_luminance(apply_hdr_ceiling(exposure * gathered));
     }
+    // Layer guides hold their emission in their diffuse albedo.
+    g.diffuse += g.emission;
     if (r.layers != nullptr)
     {
         LayerGuide l = layer_guide(r.layers, gb.extent, pixel);
@@ -270,6 +492,7 @@ public void guide_body<S : ISurface>(GuideRoot r, uint2 pixel)
         {
             float w = l.weight;
             float3 n = w * l.normal + (1.0 - w) * g.normal;
+            caustic = lerp(caustic, l.caustic, w);
             g.diffuse = lerp(g.diffuse, l.diffuse, w);
             g.specular = lerp(g.specular, l.specular, w);
             g.normal = dot(n, n) > 0.0 ? normalize(n) : l.normal;
@@ -289,6 +512,8 @@ public void guide_body<S : ISurface>(GuideRoot r, uint2 pixel)
     r.specular_motion.get<RWTexture2D<float2>>()[pixel] = specular_motion;
     r.depth.get<RWTexture2D<float>>()[pixel] = depth;
     r.motion.get<RWTexture2D<float2>>()[pixel] = motion;
+    if (r.dof_guide.index != IMAGE_NONE)
+        r.dof_guide.get<RWTexture2D<float>>()[pixel] = caustic;
 
     float3 shown;
     switch (r.debug)
