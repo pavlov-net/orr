@@ -91,6 +91,9 @@ pub struct ResidencyStats {
     pub dropped: u32,
     /// Units whose read or decode failed since the mount; they are not requested again.
     pub failed: u32,
+    /// Finer cached cuts of streaming meshes whose build failed since their mount; they are
+    /// not built again.
+    pub failed_cuts: u32,
     /// Instance page records and windows of rows that the frame wanted past the pool's budget.
     /// Copies stay hidden, or at their last pose, for as long as this holds them out.
     pub pages_over_budget: u32,
@@ -241,6 +244,15 @@ impl Residency {
 
     pub(crate) fn note_pages_over_budget(&mut self, count: u32) {
         self.stats.pages_over_budget = count;
+    }
+
+    pub(crate) fn note_failed_cut(&mut self) {
+        self.stats.failed_cuts += 1;
+    }
+
+    /// Forgets `count` failed cuts of a mount that is gone.
+    pub(crate) fn forget_failed_cuts(&mut self, count: u32) {
+        self.stats.failed_cuts -= count;
     }
 
     pub(crate) fn note_clas_pool(&mut self, bytes: u64) {

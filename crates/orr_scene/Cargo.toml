@@ -10,9 +10,9 @@ links = "orr_scene"
 
 [features]
 # `orr_scene::testing`: headless device, readback and reference-image comparison.
-testing = ["dep:image", "dep:nv-flip", "dep:log"]
+testing = ["dep:image", "dep:nv-flip"]
 # Recompiles kernels whose sources change and swaps their pipelines at step 1, for dev builds.
-hot-reload = ["orr_shaders/hot-reload", "dep:log"]
+hot-reload = ["orr_shaders/hot-reload"]
 
 [dependencies]
 orr_color.workspace = true
@@ -27,7 +27,7 @@ rustc-hash.workspace = true
 thiserror.workspace = true
 image = { workspace = true, features = ["png", "exr"], optional = true }
 nv-flip = { version = "0.1.2", optional = true }
-log = { workspace = true, optional = true }
+log.workspace = true
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }

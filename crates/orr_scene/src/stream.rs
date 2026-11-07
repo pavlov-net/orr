@@ -149,6 +149,8 @@ enum FineState {
         touched: u64,
         locks: Vec<u32>,
     },
+    /// Its build failed; not built again while mounted.
+    Failed,
 }
 
 /// A streaming mesh's finer cached cuts on the render thread.
@@ -643,11 +645,16 @@ impl Streaming {
         self.residency.unregister(mount);
         let cuts: Vec<(MountId, u32)> =
             self.fine.keys().filter(|k| k.0 == mount).copied().collect();
+        let mut failed = 0;
         for k in cuts {
             let f = self.fine.remove(&k).expect("listed");
             for state in f.slots {
                 let locks = match state {
                     FineState::Empty(_) => continue,
+                    FineState::Failed => {
+                        failed += 1;
+                        continue;
+                    }
                     FineState::Building { locks } => locks,
                     FineState::Built { cut, locks, .. } => {
                         self.retired_cuts.push((frame, cut));
@@ -657,6 +664,7 @@ impl Streaming {
                 self.fine_locked -= f.init.stream.pages_bytes(&locks);
             }
         }
+        self.residency.forget_failed_cuts(failed);
         let gone: Vec<Key> = self
             .resident
             .keys()
@@ -867,8 +875,15 @@ impl Streaming {
                         locks,
                     };
                 }
-                // The slot stays empty, so a copy that still wants it asks again.
-                Err(_) => {
+                Err(e) => {
+                    log::warn!(
+                        "finer cut {} of mesh {} of {:?} failed to build: {e}",
+                        batch.slot,
+                        batch.mesh,
+                        batch.mount
+                    );
+                    f.slots[slot] = FineState::Failed;
+                    self.residency.note_failed_cut();
                     let m = &self.mounts[&batch.mount];
                     for &p in &locks {
                         let unit = m.mesh_pages[batch.mesh as usize][p as usize];
