@@ -299,7 +299,6 @@ struct ProxyMarch<S : ISurface, M : IMedium> : IProxyStep
                     continue;
                 traced |= 1u << i;
                 float3 traced_vis[MAX_FROXEL_SHADOWED_LIGHTS];
-                // A plane stack bends a light alike at every point behind it.
                 particle_shadow_rays<S, M>(root.lighting, froxels.view.eye_render.xyz + dir * (ray_start + float(i) * ray_spacing), traced_vis, ray_arrives);
                 ray_vis[i] = traced_vis;
             }
@@ -532,20 +531,7 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
                     float3 l = c.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, c.light, c.dir) : c.radiance;
                     float t_max = isfinite(c.distance) ? c.distance * (1.0 - 1e-4) : c.distance;
                     RayCone cone = { 0.0, 0.0 };
-                    HitContext context = hit_context(HIT_SECONDARY, 1, cone, 0.0);
-                    float3 vis;
-                    // Outside every interior a plane stack leaves a directional light's direction
-                    // as it is.
-                    if (c.kind == LIGHT_SAMPLE_DIRECTIONAL)
-                    {
-                        float3 depth;
-                        StackLight stack;
-                        vis = directional_visibility<S, M>(s, f.view, origin, c.dir, RAY_FLAG_NONE, context, Interior(), set.shadow_overflows, depth, stack);
-                        if (any(vis > 0.0))
-                            vis *= exp(-depth) * medium_transmittance<M>(s.medium, origin, c.dir, t_max);
-                    }
-                    else
-                        vis = visibility<S, M, SHADOW_UNBENT>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, context, c.kind == LIGHT_SAMPLE_ENVIRONMENT, Interior(), set.shadow_overflows);
+                    float3 vis = visibility<S, M, SHADOW_UNBENT>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind == LIGHT_SAMPLE_ENVIRONMENT, Interior(), set.shadow_overflows);
                     if (c.view && any(vis > 0.0))
                         vis *= emitter_view_layer<S>(set, c, AMBIENT_IOR);
                     source += scatter * l * vis / c.pdf;
