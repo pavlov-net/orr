@@ -34,6 +34,8 @@ const DISTANCE_BUCKETS: u32 = 64;
 const COUNTERS: usize = 17;
 const PTLAS_REBASE: u32 = 1;
 const PTLAS_FIRST: u32 = 2;
+/// `ptlas.slang` `LIGHT_JOB`: a proxy job naming a light.
+const LIGHT_JOB: u32 = 0x8000_0000;
 const PART_STATE: u32 = 19;
 const PART_CLASSES: u32 = 17;
 
@@ -181,8 +183,11 @@ pub(crate) struct Ptlas {
     /// Per medium proxy, whether it is set.
     proxy_live: Vec<bool>,
     proxies_live: u32,
-    /// Medium proxies set or cleared since the last build.
+    /// Medium proxies set or cleared since the last build, and lights as `LIGHT_JOB` | LightId.
     proxy_dirty: BTreeSet<u32>,
+    /// Per light, whether it has a proxy: a sphere of non-zero radius or a rect.
+    light_live: Vec<bool>,
+    lights_live: u32,
     partitions: Vec<PartitionCpu>,
     free: Vec<u32>,
     /// The partition of each cell that takes its next copies.
@@ -215,13 +220,15 @@ impl Ptlas {
                 instances: desc.instance_capacity
                     + desc.part_capacity
                     + desc.producer_capacity
-                    + desc.medium_proxy_capacity,
+                    + desc.medium_proxy_capacity
+                    + desc.light_capacity,
                 partitions,
                 max_per_partition: desc.partition_instances,
                 global_instances: desc.global_instances
                     + desc.producer_capacity
                     + desc.skinned_capacity
-                    + desc.medium_proxy_capacity,
+                    + desc.medium_proxy_capacity
+                    + desc.light_capacity,
                 max_ops: 3,
                 translation: true,
             },
@@ -232,6 +239,8 @@ impl Ptlas {
             proxy_live: vec![false; desc.medium_proxy_capacity as usize],
             proxies_live: 0,
             proxy_dirty: BTreeSet::new(),
+            light_live: vec![false; desc.light_capacity as usize],
+            lights_live: 0,
             partitions: (0..partitions)
                 .map(|_| PartitionCpu {
                     cell: IVec3::ZERO,
@@ -367,9 +376,18 @@ impl Ptlas {
         self.proxy_dirty.insert(id);
     }
 
-    /// Whether a medium proxy is set or awaits its null write.
+    /// Marks light `id` as having a proxy or not; its instance is written at the next build.
+    pub(crate) fn set_light(&mut self, id: u32, live: bool) {
+        let was = std::mem::replace(&mut self.light_live[id as usize], live);
+        self.lights_live = self.lights_live + u32::from(live) - u32::from(was);
+        if live || was {
+            self.proxy_dirty.insert(LIGHT_JOB | id);
+        }
+    }
+
+    /// Whether a medium or light proxy is set or awaits its null write.
     pub(crate) fn has_proxy_work(&self) -> bool {
-        self.proxies_live > 0 || !self.proxy_dirty.is_empty()
+        self.proxies_live > 0 || self.lights_live > 0 || !self.proxy_dirty.is_empty()
     }
 
     /// Frees the partitions emptied in frames at or before `completed`.
@@ -396,7 +414,10 @@ impl Ptlas {
     ) -> Result<Option<Tlas>> {
         let caps = device.caps();
         if caps.cluster.max_partitions == 0
-            || (self.high_water == 0 && !producers && self.proxies_live == 0)
+            || (self.high_water == 0
+                && !producers
+                && self.proxies_live == 0
+                && self.lights_live == 0)
         {
             return Ok(None);
         }
@@ -590,6 +611,11 @@ impl Ptlas {
         if f.rebased {
             proxies
                 .extend((0..self.proxy_live.len() as u32).filter(|&i| self.proxy_live[i as usize]));
+            proxies.extend(
+                (0..self.light_live.len() as u32)
+                    .filter(|&i| self.light_live[i as usize])
+                    .map(|i| LIGHT_JOB | i),
+            );
         }
         let proxies: Vec<u32> = proxies.into_iter().collect();
         let proxy_jobs = if proxies.is_empty() {
@@ -607,7 +633,7 @@ impl Ptlas {
             slots: self.high_water,
             budget: f.budget,
             flags: if f.rebased { PTLAS_REBASE } else { 0 } | if s.built { 0 } else { PTLAS_FIRST },
-            proxies: self.proxies_live,
+            proxies: self.proxies_live + self.lights_live,
             translate_jobs,
             translate_count: jobs.len() as u32,
             proxy_job_count: proxies.len() as u32,
@@ -684,7 +710,7 @@ pub(crate) struct FrameInputs {
     pub(crate) cell_log2: u32,
     pub(crate) rebased: bool,
     pub(crate) budget: u32,
-    /// The BLAS medium proxies trace; 0 while the scene has none.
+    /// The BLAS medium and light proxies trace; 0 while the scene has none.
     pub(crate) proxy_blas: GpuAddress,
     /// The frame's readback slot.
     pub(crate) slot: usize,

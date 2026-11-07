@@ -2,6 +2,9 @@
 // environment's pyramid and the directional pass.
 #include "orr_root.h"
 import orr_shaders.math;
+import orr_shaders.sampling;
+import orr_pack.mesh;
+import orr_scene.hit;
 import orr_color.chromaticity;
 import orr_color.luminance;
 import orr_color.primaries;
@@ -11,6 +14,8 @@ import orr_scene.tables;
 import orr_scene.view;
 import orr_lighting.environment;
 import orr_lighting.light_sampling;
+
+extern struct Surface : ISurface = StandardSurface;
 
 struct Root
 {
@@ -22,7 +27,7 @@ struct Root
     float* cdf;
     float* light_probability;
     EmissiveSelection* emissive;
-    float* cluster_cdf;
+    uint* cluster_cdf;
     LightSample* tiles;
     // Per feedback id: pixels the views of the frame before counted, and their decayed sums.
     uint* feedback_counts;
@@ -31,7 +36,7 @@ struct Root
     uint* shadow_overflows;
     // This frame's slot of the statistics readback.
     LightSetStats* stats;
-    // Values `cluster_cdf` holds.
+    // Values `cluster_cdf` holds: the producer entries' lists.
     uint cluster_capacity;
     uint frame;
     // Share of the selection placed by feedback once there is any.
@@ -88,12 +93,13 @@ float scan_float(uint lane, uint lanes, float v, out float total)
     return r;
 }
 
-// Selection weight of candidate `i`, its emitted power in luminance (nit m² sr), and the
-// clusters its CDF needs. Instance entries take none: BSDF rays alone find them.
-void candidate(SceneRoot* s, uint i, out float w, out uint count)
+// Selection weight of candidate `i`, its emitted power in luminance (nit m² sr), the clusters
+// its list holds, and those of them the producer pool takes.
+void candidate(SceneRoot* s, uint i, out float w, out uint count, out uint pooled)
 {
     w = 0.0;
     count = 0;
+    pooled = 0;
     if (i < s.light_capacity)
     {
         LightGpu l = s.lights[i];
@@ -108,14 +114,41 @@ void candidate(SceneRoot* s, uint i, out float w, out uint count)
     }
     uint e = i - s.light_capacity;
     EmissiveGpu g = s.emissive[e];
-    if (g.kind != EMISSIVE_PRODUCER)
-        return;
     float y = luminance_rec2020(max(g.power, 0.0)) * PI;
     if (!(y > 0.0) || !isfinite(y))
         return;
-    ProducerBatch b = s.batches[g.source];
-    count = min(*b.cluster_count, b.max_clusters);
+    if (g.kind == EMISSIVE_PRODUCER)
+    {
+        ProducerBatch b = s.batches[g.source];
+        count = emitted_clusters(b);
+        pooled = count;
+    }
+    else if (g.kind == EMISSIVE_INSTANCE && g.set != NO_SET)
+        count = g.cluster_count;
     w = count > 0 ? y : 0.0;
+}
+
+// The list of instance entry `e` (from `s.producer_capacity`) as `select` hands it to
+// sampling: its cooked set at the row its copy traces, or the list its traversal gathered.
+void instance_list(SceneRoot* s, uint e, inout EmissiveSelection sel)
+{
+    EmissiveGpu g = s.emissive[e];
+    if (g.set == GATHERED_SET)
+    {
+        uint* list = gathered_list(s.emissive_lists, e - s.producer_capacity);
+        sel.clusters = list;
+        sel.cdf = list + GATHERED_CLUSTERS;
+        return;
+    }
+    InstanceGpu inst = copy_record(s, g.source);
+    SetTablesGpu t = s.meshes[s.models[inst.model].mesh].emissive;
+    ClusterSet k = ((ClusterSet*)t.sets)[g.set];
+    sel.cdf = t.cdf + k.first;
+    sel.clusters = t.clusters + k.first;
+    sel.index = t.index + k.first;
+    sel.node_count = k.node_count;
+    if (k.node_count > 0)
+        sel.nodes = (uint8_t*)((SetNode*)t.nodes + k.first_node);
 }
 
 // Feedback weight of feedback id `i` this frame: the weight before, decayed, plus the pixels
@@ -161,15 +194,17 @@ void select(uint lane: SV_GroupIndex)
         uint i = base + lane;
         float w = 0.0;
         uint c = 0;
+        uint pooled = 0;
         float h = 0.0;
         if (i < n)
         {
-            candidate(s, i, w, c);
+            candidate(s, i, w, c, pooled);
             h = feedback(i);
         }
         uint chunk_c;
-        uint first = carry_c + scan_uint(lane, c, chunk_c) - c;
-        bool fits = first + c <= root.cluster_capacity;
+        uint first = carry_c + scan_uint(lane, pooled, chunk_c) - pooled;
+        // Instance entries take nothing of the pool, so its overflow leaves them in.
+        bool fits = pooled == 0 || first + pooled <= root.cluster_capacity;
         if (!fits)
         {
             if (w > 0.0)
@@ -190,10 +225,13 @@ void select(uint lane: SV_GroupIndex)
             root.cdf[i] = w;
             if (i >= lights)
             {
-                EmissiveSelection* e = root.emissive + (i - lights);
-                e.first = first;
-                e.count = w > 0.0 ? c : 0;
-                e.total = 0.0;
+                EmissiveSelection sel = (EmissiveSelection)0;
+                sel.count = w > 0.0 ? c : 0;
+                if (w > 0.0 && pooled > 0)
+                    sel.cdf = root.cluster_cdf + first;
+                else if (w > 0.0)
+                    instance_list(s, i - lights, sel);
+                root.emissive[i - lights] = sel;
             }
         }
         carry_c += chunk_c;
@@ -253,6 +291,7 @@ void select(uint lane: SV_GroupIndex)
     set.candidate_total = total;
     set.environment_probability = env;
     set.frame = root.frame;
+    set.local_lights = counts[0];
 
     float3 mean = root.environment.mean.rgb;
     float3 xyz = mul(REC2020_TO_XYZ, mean);
@@ -278,13 +317,15 @@ void select(uint lane: SV_GroupIndex)
     *root.stats = st;
 }
 
-// One workgroup per producer entry: the inclusive sums of its clusters' luminance x area.
+// One workgroup per producer entry: its list's CDF over its clusters' luminance x area, in
+// fixed point. A cluster of no weight takes a step of 0, and the last value is 0xffffffff
+// whatever rounding left; a list of no weight at all stays at 0, so nothing draws from it.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void clusters(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
 {
     uint entry = group.x;
-    EmissiveSelection* e = root.emissive + entry;
+    EmissiveSelection e = root.emissive[entry];
     uint count = e.count;
     if (count == 0)
         return;
@@ -296,11 +337,17 @@ void clusters(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
         float chunk;
         float sum = carry + scan_float(lane, 64, w, chunk);
         if (c < count)
-            root.cluster_cdf[e.first + c] = sum;
+            e.cdf[c] = asuint(sum);
         carry += chunk;
     }
-    if (lane == 0)
-        e.total = carry;
+    DeviceMemoryBarrierWithGroupSync();
+    float total = carry;
+    for (uint c = lane; c < count; c += 64)
+    {
+        float sum = asfloat(e.cdf[c]);
+        uint v = total > 0.0 ? fixed_point_share(sum / total) : 0u;
+        e.cdf[c] = c + 1 == count && total > 0.0 ? 0xffffffffu : v;
+    }
 }
 
 // One thread per tile sample.
@@ -308,5 +355,5 @@ void clusters(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
 [numthreads(64, 1, 1)]
 void presample(uint3 id: SV_DispatchThreadID)
 {
-    root.tiles[id.x] = presample_light(root.set, id.x, root.frame);
+    root.tiles[id.x] = presample_light<Surface>(root.set, id.x, root.frame);
 }

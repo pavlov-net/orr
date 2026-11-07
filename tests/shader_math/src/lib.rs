@@ -61,7 +61,7 @@ mod ffi {
         pub(crate) fn orr_sample_uniform_sphere(u0: f32, u1: f32, out: *mut f32);
         pub(crate) fn orr_sample_cone(u0: f32, u1: f32, one_minus_cos: f32, out: *mut f32);
         pub(crate) fn orr_cone_pdf(one_minus_cos: f32) -> f32;
-        pub(crate) fn orr_mis_power(a: f32, b: f32) -> f32;
+        pub(crate) fn orr_mis_balance(a: f32, b: f32) -> f32;
         pub(crate) fn orr_pack_unorm8(v: f32) -> u32;
         pub(crate) fn orr_unpack_unorm8(p: u32) -> f32;
         pub(crate) fn orr_pack_snorm8(v: f32) -> u32;
@@ -300,8 +300,8 @@ pub fn sample_cone(u: [f32; 2], one_minus_cos: f32) -> V3 {
 pub fn cone_pdf(one_minus_cos: f32) -> f32 {
     call!(ffi::orr_cone_pdf(one_minus_cos))
 }
-pub fn mis_power(a: f32, b: f32) -> f32 {
-    call!(ffi::orr_mis_power(a, b))
+pub fn mis_balance(a: f32, b: f32) -> f32 {
+    call!(ffi::orr_mis_balance(a, b))
 }
 pub fn pack_unorm8(v: f32) -> u32 {
     call!(ffi::orr_pack_unorm8(v))

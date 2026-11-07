@@ -42,7 +42,7 @@ void main(uint3 id: SV_DispatchThreadID)
     float3 l = sample_ggx_vndf_bounded(n, float2(0.3, 0.5), u);
     float3 sampled = sample_cosine_hemisphere(u) * cosine_hemisphere_pdf(n.z) + sample_uniform_hemisphere(u)
         + sample_cone(u, 0.1) * cone_pdf(0.1)
-        + l * ggx_vndf_bounded_pdf(n, l, float2(0.3, 0.5)) * mis_power(u.x, u.y);
+        + l * ggx_vndf_bounded_pdf(n, l, float2(0.3, 0.5)) * mis_balance(u.x, u.y);
 
     float4 hashes = float4(pcg4d(uint4(id, 1))) + float4(r2(id.x), owen_sobol4(id.x, hash_combine(id.y, 3)).xy)
         + float4(pcg_float(id.x), float(sobol(id.x, 2)), float(nested_uniform_scramble(id.x, 9)), s.next());

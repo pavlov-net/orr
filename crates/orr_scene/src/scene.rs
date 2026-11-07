@@ -11,7 +11,8 @@ use rustc_hash::FxHashSet;
 
 use crate::decals::{Decal, DecalId, Listing, decal_gpu, listing, table_sizes};
 use crate::lights::{
-    EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, Light, LightId, NO_EMISSIVE, NO_SET, light_gpu,
+    EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, GATHERED_CLUSTERS, Light, LightId, NO_EMISSIVE, NO_SET,
+    light_gpu,
 };
 use crate::material::{MaterialId, MaterialTable};
 use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
@@ -57,7 +58,8 @@ pub struct SceneDesc {
     pub material_set_capacity: u32,
     /// Producer entries: every `ProducerId` is below it.
     pub producer_capacity: u32,
-    /// Emissive list entries for instances: one per copy per emissive section of its model.
+    /// Emissive list entries for instances: one per copy per emissive section of its model's
+    /// most emissive chain step.
     pub emissive_capacity: u32,
     /// PTLAS instances for the animated parts of copies inside their animation range, and
     /// one for each copy fading between two chain steps.
@@ -267,7 +269,9 @@ pub struct InstancesDesc {
     pub first: u32,
     /// None: no animated parts.
     pub pose: Option<Pose>,
-    /// Base in the scene's material-set table; None: the model's own materials.
+    /// Base in the scene's material-set table; None: the model's own materials. Light sampling
+    /// takes what the set's materials emit on the sections the model cooked as emissive; a
+    /// set that makes another section emit leaves it to BSDF rays, at full weight.
     pub material_set: Option<u32>,
     pub flags: InstanceFlags,
     /// m from the scene focus within which the copies are traced.
@@ -288,6 +292,8 @@ pub(crate) struct Tables {
     pub(crate) lights: Allocation<LightGpu>,
     /// Producer entries first, then instance entries.
     pub(crate) emissive: Allocation<EmissiveGpu>,
+    /// Per instance entry, the list its copy's traversal gathers (`SceneRoot.emissive_lists`).
+    pub(crate) emissive_lists: Allocation<u32>,
     pub(crate) producers: Allocation<ProducerGpu>,
     pub(crate) batches: Allocation<ProducerBatch>,
     /// Tessellated entries' patch batches, zero for others.
@@ -470,8 +476,11 @@ impl Group {
 pub(crate) struct ModelCpu {
     pub(crate) sections: u32,
     pub(crate) animated_parts: u32,
-    /// Its mesh's emissive section ranks: the emissive list entries of each copy.
+    /// Its mesh's emissive section ranks.
     pub(crate) emissive_sections: u32,
+    /// The emissive list entries of each copy: the most emissive section ranks of its mesh
+    /// and of its chain's.
+    pub(crate) emissive_stride: u32,
     /// Its skeleton's joints; 0 without a skeleton.
     pub(crate) joints: u32,
     /// Set when its mesh is skinned.
@@ -526,6 +535,16 @@ struct SkinRange {
 /// What a scene chooses geometry for before any view has asked ([`crate::Frame::request_detail`]).
 const DEFAULT_PIXELS_PER_RADIAN: f32 = 1000.0;
 
+/// Emissive list ranges taken for a chain that grows `model`'s copies to `stride` entries:
+/// one per slot, then one per page with its new stride.
+pub(crate) struct EntryGrowth {
+    model: u32,
+    stride: u32,
+    slots: Vec<u32>,
+    pages: Vec<(usize, u32)>,
+    taken: Vec<(u32, u32)>,
+}
+
 /// What a slot holds.
 #[derive(Clone, Copy)]
 struct SlotHold {
@@ -560,6 +579,9 @@ pub(crate) struct SceneCpu {
     pub(crate) emissive: RangeAllocator,
     /// Entry ranges removed in a frame, freed once that frame has completed.
     pub(crate) emissive_removed: Vec<(u64, u32, u32)>,
+    /// Slots of written records that take new emissive list entries at the next update:
+    /// (slot, first instance entry, entries, 0).
+    pub(crate) entry_jobs: Vec<[u32; 4]>,
     pub(crate) producers: Vec<Option<Producer>>,
     /// Memory of replaced or cleared producer entries, freed once that frame has completed.
     pub(crate) retired: Vec<(u64, Producer)>,
@@ -686,6 +708,8 @@ impl Scene {
     /// Ends what the slots of `range` hold, and leaves them with their owner, who still removes
     /// them.
     fn empty_slots(&self, cpu: &mut SceneCpu, range: InstanceRange, frame: u64, seq: u64) {
+        cpu.entry_jobs
+            .retain(|j| !(range.first..range.first + range.count).contains(&j[0]));
         let n = range.count * words(size_of::<InstanceGpu>());
         let first = self.tables.instances.gpu().offset(u64::from(range.first));
         cpu.records.push(Record::fill(seq, first.address().0, n, 0));
@@ -746,6 +770,136 @@ impl Scene {
             let n = count * words(size_of::<EmissiveGpu>());
             cpu.records.push(Record::fill(seq, at, n, 0));
             cpu.emissive_removed.push((frame, entry, count));
+        }
+    }
+
+    /// Takes the emissive list ranges that give every copy of `model` placed by hand, and
+    /// every page whose prototypes `page_stride` gives a larger stride, `stride` entries where
+    /// it holds fewer, as a chain that grows the model's most emissive step asks. Fails without
+    /// a change when the list has no room.
+    pub(crate) fn reserve_entries(
+        &self,
+        model: u32,
+        stride: u32,
+        page_stride: impl Fn(PageId) -> u32,
+    ) -> Result<EntryGrowth> {
+        let cpu = &mut *self.cpu.lock().unwrap();
+        let slots: Vec<u32> = (0..cpu.slot_holds.len() as u32)
+            .filter(|&i| {
+                let h = &cpu.slot_holds[i as usize];
+                h.model == model && h.entries < stride
+            })
+            .collect();
+        let pages: Vec<(usize, u32)> = cpu
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, page_stride(p.page)))
+            .filter(|&(i, wanted)| wanted > cpu.pages[i].entry_stride)
+            .collect();
+        let mut taken: Vec<(u32, u32)> = Vec::new();
+        let wanted = slots
+            .iter()
+            .map(|_| stride)
+            .chain(pages.iter().map(|&(i, w)| cpu.pages[i].range.count * w));
+        for n in wanted {
+            match cpu.emissive.alloc(n) {
+                Some(first) => taken.push((first, n)),
+                None => {
+                    for (first, n) in taken {
+                        cpu.emissive.free(first, n);
+                    }
+                    return Err(Error::Capacity {
+                        what: "emissive list entries",
+                        capacity: self.desc.emissive_capacity,
+                    });
+                }
+            }
+        }
+        Ok(EntryGrowth {
+            model,
+            stride,
+            slots,
+            pages,
+            taken,
+        })
+    }
+
+    /// Frees the ranges of a growth that is not applied.
+    pub(crate) fn release_entries(&self, growth: EntryGrowth) {
+        let cpu = &mut *self.cpu.lock().unwrap();
+        for (first, n) in growth.taken {
+            cpu.emissive.free(first, n);
+        }
+    }
+
+    /// Moves the copies of a growth from [`reserve_entries`](Self::reserve_entries) to its
+    /// ranges. New entries are written at the next update; the old ones are emptied and freed
+    /// once this frame has completed.
+    pub(crate) fn grow_entries(&self, growth: EntryGrowth, frame: u64, seq: &AtomicU64) {
+        let cpu = &mut *self.cpu.lock().unwrap();
+        let EntryGrowth {
+            model,
+            stride,
+            slots,
+            pages,
+            taken,
+        } = growth;
+        let seq = seq.fetch_add(1, Ordering::Relaxed);
+        let retire = |cpu: &mut SceneCpu, first: u32, count: u32| {
+            if count == 0 {
+                return;
+            }
+            let at = self.emissive_entry(first).address().0;
+            cpu.records.push(Record::fill(
+                seq,
+                at,
+                count * words(size_of::<EmissiveGpu>()),
+                0,
+            ));
+            cpu.emissive_removed.push((frame, first, count));
+        };
+        let mut ranges = taken.into_iter();
+        for slot in slots {
+            let (first, _) = ranges.next().expect("one range per slot");
+            let hold = cpu.slot_holds[slot as usize];
+            retire(cpu, hold.first_entry, hold.entries);
+            cpu.slot_holds[slot as usize] = SlotHold {
+                model,
+                first_entry: first,
+                entries: stride,
+            };
+            cpu.entry_jobs.push([slot, first, stride, 0]);
+        }
+        for (i, wanted) in pages {
+            let (first, _) = ranges.next().expect("one range per page");
+            let p = &cpu.pages[i];
+            let (range, old, old_stride, expanded) =
+                (p.range, p.first_entry, p.entry_stride, p.expanded);
+            retire(cpu, old, range.count * old_stride);
+            for copy in 0..range.count {
+                let slot = range.first + copy;
+                let entry = first + copy * wanted;
+                cpu.slot_holds[slot as usize].first_entry = entry;
+                cpu.slot_holds[slot as usize].entries = wanted;
+                // A page not yet written takes its stride when its records land.
+                if expanded {
+                    cpu.entry_jobs.push([slot, entry, wanted, 0]);
+                }
+            }
+            let p = &mut cpu.pages[i];
+            p.first_entry = first;
+            p.entry_stride = wanted;
+            if expanded {
+                continue;
+            }
+            // No expansion has read the prototypes yet.
+            let prototypes = p.prototypes.as_mut_slice().expect("upload is mapped");
+            for proto in bytemuck::cast_slice_mut::<u8, PagePrototypeGpu>(
+                &mut prototypes[..p.prototype_count as usize * size_of::<PagePrototypeGpu>()],
+            ) {
+                proto.emissive_count = wanted;
+            }
         }
     }
 
@@ -860,6 +1014,11 @@ impl Scene {
                 n(desc.producer_capacity + desc.emissive_capacity),
                 "emissive list",
             )?,
+            emissive_lists: device.gpu_malloc(
+                dl,
+                n(desc.emissive_capacity * 2 * GATHERED_CLUSTERS),
+                "gathered emissive lists",
+            )?,
             producers: device.gpu_malloc(dl, n(desc.producer_capacity), "producers")?,
             batches: device.gpu_malloc(dl, n(desc.producer_capacity), "producer batches")?,
             patches: device.gpu_malloc(dl, n(desc.producer_capacity), "producer patches")?,
@@ -915,6 +1074,7 @@ impl Scene {
                 removed: Vec::new(),
                 emissive: RangeAllocator::new(desc.emissive_capacity),
                 emissive_removed: Vec::new(),
+                entry_jobs: Vec::new(),
                 producers: (0..desc.producer_capacity).map(|_| None).collect(),
                 retired: Vec::new(),
                 producer_readback: None,
@@ -1154,7 +1314,7 @@ impl<'f> SceneWriter<'f> {
         let ranks = self
             .model_cpu
             .get(desc.model.0 as usize)
-            .map_or(0, |m| m.emissive_sections);
+            .map_or(0, |m| m.emissive_stride);
         let (first, entry, partitions, table) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
@@ -1196,18 +1356,7 @@ impl<'f> SceneWriter<'f> {
         };
         self.upload(table.offset(u64::from(first)), desc.copies)?
             .copy_from_slice(&partitions);
-        if ranks > 0 {
-            let entries = self.upload(self.scene.emissive_entry(entry), desc.copies * ranks)?;
-            for (e, i) in entries.iter_mut().zip(0..) {
-                *e = EmissiveGpu {
-                    kind: EMISSIVE_INSTANCE,
-                    source: first + i / ranks,
-                    rank: i % ranks,
-                    set: NO_SET,
-                    ..Zeroable::zeroed()
-                };
-            }
-        }
+        self.write_entries(first, desc.copies, entry, ranks)?;
         let first_entry = self.scene.desc.producer_capacity + entry;
         let range = InstanceRange {
             first,
@@ -1253,6 +1402,25 @@ impl<'f> SceneWriter<'f> {
         Ok(range)
     }
 
+    /// Writes the emissive list entries of `copies` slots from `first`, `stride` each from
+    /// instance entry `entry`.
+    fn write_entries(&self, first: u32, copies: u32, entry: u32, stride: u32) -> Result<()> {
+        if stride == 0 {
+            return Ok(());
+        }
+        let entries = self.upload(self.scene.emissive_entry(entry), copies * stride)?;
+        for (e, i) in entries.iter_mut().zip(0..) {
+            *e = EmissiveGpu {
+                kind: EMISSIVE_INSTANCE,
+                source: first + i / stride,
+                rank: i % stride,
+                set: NO_SET,
+                ..Zeroable::zeroed()
+            };
+        }
+        Ok(())
+    }
+
     /// One slot per record of a cooked instance page, partitioned as the cook laid them out,
     /// in a transform group of its own over the page's records. The page's records load on
     /// the loading side: the scene wants them every frame, nearest the focus first, within
@@ -1286,10 +1454,10 @@ impl<'f> SceneWriter<'f> {
         let empty = ModelCpu::default();
         let model_cpu = |model: ModelId| self.model_cpu.get(model.0 as usize).unwrap_or(&empty);
         // Every copy of the page takes room for the emissive sections of the most emissive
-        // model.
+        // model and chain.
         let stride = protos
             .iter()
-            .map(|p| model_cpu(p.model).emissive_sections)
+            .map(|p| model_cpu(p.model).emissive_stride)
             .max()
             .unwrap_or(0);
         let copy_bytes = (protos.len() * size_of::<PagePrototypeGpu>()) as u64;
@@ -1405,7 +1573,7 @@ impl<'f> SceneWriter<'f> {
                     first_emissive: NO_EMISSIVE,
                     emissive_count: 0,
                 },
-                emissive_count: model_cpu(p.model).emissive_sections,
+                emissive_count: stride,
                 _pad: [0; 3],
             });
         }
@@ -1746,7 +1914,8 @@ impl<'f> SceneWriter<'f> {
             .unwrap_or_else(|| panic!("{:?} has no skinned mesh", desc.model));
         assert!(model.joints > 0, "{:?} has no skeleton", desc.model);
         let arrays = CopyArrays::new(self.device, desc.copies, shape.vertices, shape.clusters)?;
-        let (first, entry) = {
+        let ranks = model.emissive_stride;
+        let (first, entry, emissive) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
                 what: "instances",
@@ -1759,12 +1928,33 @@ impl<'f> SceneWriter<'f> {
                     capacity: self.scene.desc.skinned_capacity,
                 });
             };
+            let emissive = if ranks > 0 {
+                cpu.emissive.alloc(desc.copies * ranks)
+            } else {
+                Some(0)
+            };
+            let Some(emissive) = emissive else {
+                cpu.slots.free(first, desc.copies);
+                cpu.skinned.free(entry, desc.copies);
+                return Err(Error::Capacity {
+                    what: "emissive list entries",
+                    capacity: self.scene.desc.emissive_capacity,
+                });
+            };
             cpu.skinned_high_water = cpu.skinned_high_water.max(entry + desc.copies);
-            cpu.slot_holds[first as usize..(first + desc.copies) as usize]
-                .fill(SlotHold::of(desc.model.0));
+            let holds = &mut cpu.slot_holds[first as usize..(first + desc.copies) as usize];
+            for (hold, copy) in holds.iter_mut().zip(0..) {
+                *hold = SlotHold {
+                    model: desc.model.0,
+                    first_entry: emissive + copy * ranks,
+                    entries: ranks,
+                };
+            }
             cpu.ptlas.place_skinned(first, desc.copies);
-            (first, entry)
+            (first, entry, emissive)
         };
+        self.write_entries(first, desc.copies, emissive, ranks)?;
+        let first_emissive = self.scene.desc.producer_capacity + emissive;
         let range = InstanceRange {
             first,
             count: desc.copies,
@@ -1775,8 +1965,12 @@ impl<'f> SceneWriter<'f> {
         )?;
         for (copy, r) in (0..).zip(records.iter_mut()) {
             *r = InstanceGpu {
-                first_emissive: NO_EMISSIVE,
-                emissive_count: 0,
+                first_emissive: if ranks > 0 {
+                    first_emissive + copy * ranks
+                } else {
+                    NO_EMISSIVE
+                },
+                emissive_count: ranks,
                 group: desc.transforms.0,
                 group_index: desc.first + copy,
                 model: desc.model.0,
@@ -2084,13 +2278,24 @@ impl<'f> SceneWriter<'f> {
         Ok(())
     }
 
-    /// Sets or clears light `id`.
+    /// Sets or clears light `id`. A sphere of non-zero radius and a rect also stand in the
+    /// scene's ray tracing as a proxy that only the BSDF rays of paths meet, weighed against
+    /// light sampling. Camera, lens, shadow and G-buffer rays do not see it, so a light casts
+    /// no shadow and has no body in the image; a lamp the camera sees is an emissive instance.
     pub fn set_light(&mut self, id: LightId, light: Option<&Light>) -> Result<()> {
         assert!(
             id.0 < self.scene.desc.light_capacity,
             "{id:?} outside the light table"
         );
-        let origin = self.scene.cpu.lock().unwrap().origin_cell;
+        let proxied = matches!(
+            light,
+            Some(Light::Sphere { radius, .. }) if *radius > 0.0
+        ) || matches!(light, Some(Light::Rect { .. }));
+        let origin = {
+            let mut cpu = self.scene.cpu.lock().unwrap();
+            cpu.ptlas.set_light(id.0, proxied);
+            cpu.origin_cell
+        };
         let record = light.map_or(LightGpu::zeroed(), |l| light_gpu(l, origin, self.cell_log2));
         self.write(
             self.scene.tables.lights.gpu().offset(u64::from(id.0)),

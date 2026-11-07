@@ -516,7 +516,8 @@ impl LightingView {
                 target: b,
             },
         ];
-        let local_tiles = extent.map(|e| e.div_ceil(LOCAL_TILE));
+        // The tile grid moves by up to a tile each frame, so it spans one tile more each way.
+        let local_tiles = extent.map(|e| e.div_ceil(LOCAL_TILE) + 1);
         let local = device_local(
             device,
             u64::from(local_tiles[0]) * u64::from(local_tiles[1]),
@@ -874,6 +875,7 @@ struct SupportKernels {
     overlay_clear: ComputePipeline,
     overlay_resolve: ComputePipeline,
     local: ComputePipeline,
+    refine: ComputePipeline,
     media: MediaKernels,
     subsurface_table: SubsurfaceTable,
 }
@@ -906,6 +908,7 @@ impl SupportKernels {
             overlay_clear: pipeline(device, kernels, &overlay_front::MODULE, "clear")?,
             overlay_resolve: pipeline(device, kernels, &overlay_front::MODULE, "resolve")?,
             local: pipeline(device, kernels, &local::MODULE, "main")?,
+            refine: pipeline(device, kernels, &local::MODULE, "refine")?,
             media: MediaKernels::new(device, kernels)?,
             subsurface_table: SubsurfaceTable::new(device)?,
         })
@@ -1208,11 +1211,16 @@ impl LightingKernels {
                     columns: view.local_tiles[0],
                     share: local_share,
                     reset: u32::from(view.history_reset),
+                    frame: pass.sample_index,
+                    _pad0: 0,
+                    _pad1: 0,
                 },
             );
             let [w, h] = view.local_tiles;
             list.begin_pass("local light samplers", false);
             list.dispatch(&self.support.local, root, [w, h, 1]);
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            list.dispatch(&self.support.refine, root, [w, h, 1]);
             list.end_pass();
             list.barrier(
                 Stages::COMPUTE,

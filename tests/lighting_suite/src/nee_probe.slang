@@ -5,6 +5,7 @@
 import orr_shaders.math;
 import orr_shaders.random;
 import orr_scene.lights;
+import orr_scene.surface;
 import orr_lighting.light_sampling;
 
 struct Root
@@ -55,7 +56,7 @@ void candidates(uint3 id: SV_DispatchThreadID)
     for (uint f = 0; f < root.frames; f++)
     {
         Sampler rng = Sampler(v.pixel, f);
-        ResolvedLightSample r = nee_candidate(set, v, rng);
+        ResolvedLightSample r = nee_candidate<StandardSurface>(set, v, rng);
         bool finite = all(isfinite(r.radiance)) && isfinite(r.pdf) && all(isfinite(r.dir));
         if (!finite || (r.pdf == 0.0 && any(r.radiance != 0.0)))
             InterlockedAdd(root.checks[1], 1);

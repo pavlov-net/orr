@@ -50,8 +50,14 @@ public static const uint EMISSIVE_NONE = 0;
 public static const uint EMISSIVE_INSTANCE = 1;
 public static const uint EMISSIVE_PRODUCER = 2;
 
-// `EmissiveGpu.set` of an entry that emits nothing this frame.
+// `EmissiveGpu.set` of an entry that emits nothing this frame, and of one that samples the
+// list its copy's traversal gathered.
 public static const uint NO_SET = 0xffffffff;
+public static const uint GATHERED_SET = 0xfffffffe;
+
+// Clusters an instance entry's gathered list holds: a mesh that can put more clusters of one
+// emissive section in a cut traces cached cuts only (`SetTablesGpu.cached`).
+public static const uint GATHERED_CLUSTERS = 16;
 
 // One entry of the scene's emissive list. Entries 0..producer_capacity are the producer
 // entries by ProducerId; the rest are the emissive sections of instance slots, one per
@@ -62,8 +68,16 @@ public struct EmissiveGpu
     public uint kind;            // EMISSIVE_*
     public uint source;          // instance slot or ProducerId
     public uint rank;            // instance: its section's rank in its mesh's emissive sets
-    public uint set;             // instance: its entry of `MeshGpu.emissive.sets` at the traced cut, or NO_SET
-    public uint cluster_count;   // instance: the set's clusters; producer: emissive clusters emitted
-    public float3 power;         // luminance x area per channel (nit m^2), 0 when hidden
+    public uint set;             // instance: its entry of `MeshGpu.emissive.sets` at the traced row, GATHERED_SET or NO_SET
+    public uint cluster_count;   // instance: the set's or list's clusters; producer: emissive clusters emitted
+    public float3 power;         // luminance x area per channel (nit m^2), both sides of a surface with a back; 0 when hidden
     public float area;           // emitting area in render space, m^2; an instance's weighs texels by their share of the emission factor
+    public uint gathered;        // instance: clusters its copy's traversal gathered this frame
+}
+
+// An instance entry's gathered list in `SceneRoot.emissive_lists`: its mesh clusters, then
+// their inclusive fixed-point CDF.
+public uint* gathered_list(uint* lists, uint instance_entry)
+{
+    return lists + instance_entry * 2 * GATHERED_CLUSTERS;
 }

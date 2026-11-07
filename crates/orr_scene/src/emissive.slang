@@ -5,6 +5,7 @@
 import orr_pack.mesh;
 import orr_scene.hit;
 import orr_shaders.math;
+import orr_shaders.sampling;
 import orr_scene.lights;
 import orr_scene.material;
 import orr_scene.producer;
@@ -13,10 +14,37 @@ import orr_scene.tables;
 struct Root
 {
     SceneRoot* scene;
+    // `entries`: (slot, first instance entry, entries, 0) per slot.
+    uint4* jobs;
+    uint job_count;
     uint _pad0;
-    uint _pad1;
+    uint64_t _pad1;
 }
 ORR_ROOT(Root);
+
+// One thread per job: a written slot's record takes its emissive list entries, which are
+// written as new, for a chain that holds more emissive sections than the copy had entries.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void entries(uint3 id: SV_DispatchThreadID)
+{
+    if (id.x >= root.job_count)
+        return;
+    SceneRoot* s = root.scene;
+    uint4 j = root.jobs[id.x];
+    uint first = s.producer_capacity + j.y;
+    s.instances[j.x].first_emissive = j.z != 0 ? first : NO_EMISSIVE;
+    s.instances[j.x].emissive_count = j.z;
+    for (uint k = 0; k < j.z; k++)
+    {
+        EmissiveGpu e = (EmissiveGpu)0;
+        e.kind = EMISSIVE_INSTANCE;
+        e.source = j.x;
+        e.rank = k;
+        e.set = NO_SET;
+        s.emissive[first + k] = e;
+    }
+}
 
 static const uint GROUP = 64;
 
@@ -30,10 +58,43 @@ float3x3 linear_part(SceneRoot* s, uint group, uint index)
     return float3x3(m[0].xyz, m[1].xyz, m[2].xyz);
 }
 
-// One thread per instance entry: the cooked set of the cut the copy traces, at the copy's
-// nearer chain step, so a copy outside ray tracing emits nothing. Area scales by
-// |det|^(2/3), exact under uniform scale, taken at unit size since a small transform's
-// determinant underflows first.
+// Emission per channel of section material `material`, with its back's where it has one.
+float3 sides_emission(SceneRoot* s, uint material)
+{
+    MaterialGpu* m = s.materials + material;
+    float3 e = material_light_emission(m);
+    if ((m.flags & MATERIAL_HAS_BACK) != 0)
+        e += material_light_emission(s.materials + m.back);
+    return e;
+}
+
+// Writes the fixed-point CDF of instance entry `entry`'s gathered list over its clusters'
+// areas, and returns their sum in m^2, mesh space. A cluster of no area takes a step of 0.
+float gathered_cdf(SceneRoot* s, MeshGpu* mesh, uint entry, uint count)
+{
+    uint* list = gathered_list(s.emissive_lists, entry);
+    float areas[GATHERED_CLUSTERS];
+    float total = 0.0;
+    for (uint i = 0; i < count; i++)
+    {
+        ClusterRef r = s.clusters[mesh.cluster_base + list[i]];
+        areas[i] = load_cluster(r.page, r.local).area;
+        total += areas[i];
+    }
+    float sum = 0.0;
+    for (uint i = 0; i < count; i++)
+    {
+        sum += areas[i];
+        bool last = i + 1 == count;
+        list[GATHERED_CLUSTERS + i] = last ? 0xffffffffu : fixed_point_share(sum / total);
+    }
+    return total;
+}
+
+// One thread per instance entry: the cooked set of the row the copy traces, or the list its
+// traversal gathered for a cut built this frame, at the copy's nearer chain step, so a copy
+// outside ray tracing emits nothing. Area scales by |det|^(2/3), exact under uniform scale,
+// taken at unit size since a small transform's determinant underflows first.
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
 void instances(uint3 id: SV_DispatchThreadID)
@@ -51,22 +112,30 @@ void instances(uint3 id: SV_DispatchThreadID)
     uint clusters = 0;
     float area = 0.0;
     float3 power = 0.0;
-    uint cut;
-    if (inst.flags != 0 && e.rank < mesh.emissive.count && traced_cut(s, e.source, mesh, cut))
+    uint row;
+    bool gathered;
+    if (inst.flags != 0 && e.rank < mesh.emissive.count && traced_row(s, e.source, inst, mesh, row, gathered))
     {
-        uint at = mesh.rt_cuts[cut].row * mesh.emissive.count + e.rank;
+        // Every row holds a set of each rank, all of one section.
+        uint at = row * mesh.emissive.count + e.rank;
         ClusterSet k = ((ClusterSet*)mesh.emissive.sets)[at];
-        if (!section_hidden(inst, k.section))
+        float total = k.total;
+        uint count = k.count;
+        if (gathered)
+        {
+            count = min(e.gathered, GATHERED_CLUSTERS);
+            total = count > 0 ? gathered_cdf(s, mesh, id.x, count) : 0.0;
+        }
+        if (!section_hidden(inst, k.section) && total > 0.0)
         {
             SlotStateGpu st = s.slot_state[e.source];
             float3x3 m = linear_part(s, inst.group, inst.group_index);
-            set = at;
-            clusters = k.count;
+            set = gathered ? GATHERED_SET : at;
+            clusters = count;
             float size = unit_factor(m);
             // A fading copy shows its nearer step in part.
-            area = k.total * pow(abs(determinant(m * size)), 2.0 / 3.0) / size / size * step_presence(st, chain_near(st));
-            uint material = section_material(s, inst, model, k.section);
-            power = material_light_emission(s.materials + material) * area;
+            area = total * pow(abs(determinant(m * size)), 2.0 / 3.0) / size / size * step_presence(st, chain_near(st));
+            power = sides_emission(s, section_material(s, inst, model, k.section)) * area;
         }
     }
     e.set = set;
@@ -78,8 +147,9 @@ void instances(uint3 id: SV_DispatchThreadID)
 groupshared float4 sums[GROUP];
 groupshared uint counts[GROUP];
 
-// One group per producer entry: sums its emitted clusters' triangle areas, transformed
-// by the entry's transform, times each cluster's emission.
+// One group per producer entry its PTLAS instance traces: sums its emitted clusters' triangle
+// areas, transformed by the entry's transform, times each cluster's emission from both sides
+// of a surface with a back.
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
 void producers(uint3 entry: SV_GroupID, uint3 thread: SV_GroupThreadID)
@@ -93,7 +163,9 @@ void producers(uint3 entry: SV_GroupID, uint3 thread: SV_GroupThreadID)
     ProducerGpu p = s.producers[id];
     ProducerBatch b = s.batches[id];
     float3x3 m = linear_part(s, p.group, p.group_index);
-    uint n = min(*b.cluster_count, b.max_clusters);
+    // An entry rays do not trace emits nothing light sampling could weigh against them.
+    bool traced = (p.flags & INSTANCE_RAY) != 0 && (s.producer_state[id].rt_flags & PRODUCER_RT_WRITTEN) != 0;
+    uint n = traced ? min(*b.cluster_count, b.max_clusters) : 0;
     float4 sum = 0.0;
     uint count = 0;
     for (uint c = t; c < n; c += GROUP)
@@ -101,7 +173,7 @@ void producers(uint3 entry: SV_GroupID, uint3 thread: SV_GroupThreadID)
         ProducerClusterGpu k = b.clusters[c];
         if (k.material >= p.material_count)
             continue;
-        float3 l = material_light_emission(s.materials + p.materials[k.material]);
+        float3 l = sides_emission(s, p.materials[k.material]);
         if (all(l == 0.0))
             continue;
         float a = 0.0;

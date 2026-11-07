@@ -640,101 +640,118 @@ struct HitInput
     uint section;      // the section's material
 }
 
-// With `sided` the input is that of the side `d` meets, else of the section's material.
-bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, out HitInput h)
+// A triangle of a producer entry's emitted cluster or of a copy's cluster as rays trace it:
+// its corners (a skinned copy's skinned positions, last frame's with `previous` where the
+// batch or edit keeps them), its placement relative to the render origin (posed for a part
+// instance) and its section's material. Hits and light sampling read triangles through it.
+public struct TracedTriangle
 {
-    h = (HitInput)0;
+    public Corners corners;
+    public Placement placement;
+    public uint material;        // the section's, or the producer cluster's
+    public uint attributes;      // orr_pack.mesh MESH_*
+    public bool deformed;        // the corners move apart from the placement
+    public uint instance;        // what `SurfaceInput.instance` names
+    public uint cluster;         // what `SurfaceInput.cluster` names
+    public uint part;
+    public uint user_tag;
+    public uint cluster_user;
+    public uint3 vertex_user;
+    public float error;          // m, mesh space: the cluster's LOD error; 0 for producer clusters
+    public uint origin;          // a producer entry's origin policy, else ORIGIN_DEFAULT
+}
+
+// Triangle `primitive` of cluster `cluster_id` on PTLAS instance `instance_index`; false for a
+// strand entry, an index outside the batch, a hidden group or pose, and a material outside
+// the entry's.
+public bool traced_triangle(SceneRoot* s, uint instance_index, uint cluster_id, uint primitive, bool previous, out TracedTriangle t)
+{
+    t = (TracedTriangle)0;
     uint cell_log2 = uint(s.origin_cell.w);
-    float bias = footprint_bias(context.kind, v);
-    SurfaceInput i = (SurfaceInput)0;
-    Corners corners = (Corners)0;
-    uint material;
-    uint attributes;
-    Placement pl;
     uint entry;
-    bool deformed = false;
-    bool producer = hit_producer(s, instance_index, entry);
-    bool strand = producer && s.producers[entry].strands != 0;
-    if (strand)
-    {
-        // Strands are opaque, so only closest hits with their hit point reach here.
-        ProducerGpu p = s.producers[entry];
-        ProducerBatch b = s.batches[entry];
-        if (!fetched || !producer_placement(s, p, previous, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
-            return false;
-        uint segment = strand_segment(cluster_id, primitive);
-        float3 object = cluster_id == SWEPT_CLUSTER ? t.position[0]
-            : (1.0 - bary.x - bary.y) * t.position[0] + bary.x * t.position[1] + bary.y * t.position[2];
-        if (!strand_geometry(i, b, segment, object, pl, previous, context.cone_width * bias))
-            return false;
-        material = strand_material(p);
-        attributes = 0;
-        i.instance = instance_index;
-        i.user_tag = p.user_tag;
-        h.origin = p.origin;
-    }
-    else if (producer)
+    if (hit_producer(s, instance_index, entry))
     {
         ProducerGpu p = s.producers[entry];
         ProducerBatch b = s.batches[entry];
-        if (cluster_id >= emitted_clusters(b))
+        if (p.strands != 0 || cluster_id >= emitted_clusters(b))
             return false;
         ProducerClusterGpu k = b.clusters[cluster_id];
-        if (!producer_placement(s, p, previous, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
+        if (!producer_placement(s, p, previous, s.origin_cell.xyz, float3(0.0), cell_log2, t.placement))
             return false;
         ProducerTriangle pt = producer_triangle(b, k, primitive, previous);
-        corners = pt.corners;
-        material = producer_material(p, k);
-        attributes = 0;
-        i.instance = instance_index;
-        i.cluster = cluster_id;
-        i.part = 0;
-        i.user_tag = p.user_tag;
-        i.cluster_user = pt.cluster_user;
-        i.vertex_user = pt.vertex_user;
-        h.origin = p.origin;
+        t.corners = pt.corners;
+        t.material = producer_material(p, k);
+        t.instance = instance_index;
+        t.cluster = cluster_id;
+        t.user_tag = p.user_tag;
+        t.cluster_user = pt.cluster_user;
+        t.vertex_user = pt.vertex_user;
+        t.origin = p.origin;
+        return t.material != MATERIAL_NONE;
     }
-    else
-    {
-        uint copy;
-        if (!hit_copy(s, instance_index, copy))
-            return false;
-        InstanceGpu inst = copy_record(s, copy);
-        ModelGpu* model = s.models + inst.model;
-        MeshGpu* mesh = s.meshes + model.mesh;
-        ClusterRef r = s.clusters[cluster_id];
-        Cluster c = load_cluster(r.page, r.local);
-        corners = load_corners(r.page, c, primitive, mesh);
-        SkinnedGpu k;
-        deformed = copy_skin(s, inst, k);
-        if (deformed)
-            skinned_corners(k, mesh, r.page, c, r.mesh_cluster, primitive, previous, corners);
-        else if (previous)
-            deformed = edited_corners(mesh, r.page, r.local, primitive, corners);
-        material = section_material(s, inst, model, c.section);
-        attributes = mesh.attributes;
-        GroupGpu* g = s.groups + inst.group;
-        if (!placement(g, previous, inst.group_index, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
-            return false;
-        // A part instance traces its part posed.
-        if (instance_index >= s.part_base && (copy & COPY_FAR) == 0)
-        {
-            float3x4 pose;
-            if (!part_pose(s, inst, mesh, c.part, previous, pose))
-                return false;
-            pl = placed_after(pl, pose);
-        }
-        i.instance = copy;
-        i.cluster = r.mesh_cluster;
-        i.part = c.part;
-        i.user_tag = inst.user_tag;
-        h.error = c.self_error;
-        h.origin = ORIGIN_DEFAULT;
-    }
-    if (material == MATERIAL_NONE)
+    uint copy;
+    if (!hit_copy(s, instance_index, copy))
         return false;
-    if (!strand)
-        hit_triangle(i, d, corners, t, fetched, deformed, previous, attributes, s, material, pl, primitive, bary, context, bias);
+    InstanceGpu inst = copy_record(s, copy);
+    ModelGpu* model = s.models + inst.model;
+    MeshGpu* mesh = s.meshes + model.mesh;
+    ClusterRef r = s.clusters[cluster_id];
+    Cluster c = load_cluster(r.page, r.local);
+    t.corners = load_corners(r.page, c, primitive, mesh);
+    SkinnedGpu k;
+    t.deformed = copy_skin(s, inst, k);
+    if (t.deformed)
+        skinned_corners(k, mesh, r.page, c, r.mesh_cluster, primitive, previous, t.corners);
+    else if (previous)
+        t.deformed = edited_corners(mesh, r.page, r.local, primitive, t.corners);
+    t.material = section_material(s, inst, model, c.section);
+    t.attributes = mesh.attributes;
+    GroupGpu* g = s.groups + inst.group;
+    if (!placement(g, previous, inst.group_index, s.origin_cell.xyz, float3(0.0), cell_log2, t.placement))
+        return false;
+    // A part instance traces its part posed.
+    if (instance_index >= s.part_base && (copy & COPY_FAR) == 0)
+    {
+        float3x4 pose;
+        if (!part_pose(s, inst, mesh, c.part, previous, pose))
+            return false;
+        t.placement = placed_after(t.placement, pose);
+    }
+    t.instance = copy;
+    t.cluster = r.mesh_cluster;
+    t.part = c.part;
+    t.user_tag = inst.user_tag;
+    t.error = c.self_error;
+    t.origin = ORIGIN_DEFAULT;
+    return t.material != MATERIAL_NONE;
+}
+
+// The render-space area of triangle `t` and its unit front-face normal (counter-clockwise
+// corners, turned by a mirroring placement, as `triangle_geometry`'s), from its edges at unit
+// size, since a small transform's cross product underflows first. Light sampling and the hits
+// it weighs both take a triangle's area from here.
+public float traced_area(TracedTriangle t, out float3 normal)
+{
+    float3 e1 = mul(t.placement.linear, t.corners.position[1] - t.corners.position[0]);
+    float3 e2 = mul(t.placement.linear, t.corners.position[2] - t.corners.position[0]);
+    float size = unit_factor(max(abs(e1), abs(e2)));
+    float3 n = cross(e1 * size, e2 * size);
+    normal = unit_direction(n) * linear_mirror(t.placement.linear);
+    return 0.5 * unit_length(n) / size / size;
+}
+
+// The render-space point of `t` at barycentrics `bary` (weights of corners 1 and 2).
+public float3 traced_point(TracedTriangle t, float2 bary)
+{
+    float3 o = (1.0 - bary.x - bary.y) * t.corners.position[0] + bary.x * t.corners.position[1] + bary.y * t.corners.position[2];
+    return place(t.placement, o);
+}
+
+// The rest of a hit's input past its geometry: the side shown, the material and the
+// render-space position.
+void finish_input(SceneRoot* s, ViewConstants* v, float3 d, uint material, Placement pl, bool sided, HitContext context, SurfaceInput i, inout HitInput h)
+{
+    uint cell_log2 = uint(s.origin_cell.w);
     h.section = material;
     if (sided)
     {
@@ -754,6 +771,72 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     i.data = m.data != 0 ? m.data : s.surface_data;
     h.input = i;
     h.placement = pl;
+}
+
+// The surface input of `tri` at `bary` seen along `d`, the fetched positions `t` replacing its
+// corners' where they are this frame's; with `sided` that of the side `d` meets, else of the
+// section's material.
+void triangle_input(SceneRoot* s, ViewConstants* v, float3 d, TracedTriangle tri, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, out HitInput h)
+{
+    h = (HitInput)0;
+    float bias = footprint_bias(context.kind, v);
+    SurfaceInput i = (SurfaceInput)0;
+    i.instance = tri.instance;
+    i.cluster = tri.cluster;
+    i.part = tri.part;
+    i.user_tag = tri.user_tag;
+    i.cluster_user = tri.cluster_user;
+    i.vertex_user = tri.vertex_user;
+    hit_triangle(i, d, tri.corners, t, fetched, tri.deformed, previous, tri.attributes, s, tri.material, tri.placement, primitive, bary, context, bias);
+    h.error = tri.error;
+    h.origin = tri.origin;
+    finish_input(s, v, d, tri.material, tri.placement, sided, context, i, h);
+}
+
+// The surface input of `t` at `bary` on the side that `d` meets, as a ray along `d` resolves
+// it with no footprint: what light sampling reads of an emitter's point.
+public SurfaceInput emitter_input(SceneRoot* s, TracedTriangle t, uint primitive, float2 bary, float3 d)
+{
+    HitInput h;
+    HitContext context = (HitContext)0;
+    triangle_input(s, nullptr, d, t, primitive, bary, (Corners)0, false, false, true, context, h);
+    return h.input;
+}
+
+// With `sided` the input is that of the side `d` meets, else of the section's material.
+bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, out HitInput h)
+{
+    h = (HitInput)0;
+    uint entry;
+    if (hit_producer(s, instance_index, entry) && s.producers[entry].strands != 0)
+    {
+        // Strands are opaque, so only closest hits with their hit point reach here.
+        uint cell_log2 = uint(s.origin_cell.w);
+        float bias = footprint_bias(context.kind, v);
+        SurfaceInput i = (SurfaceInput)0;
+        Placement pl;
+        ProducerGpu p = s.producers[entry];
+        ProducerBatch b = s.batches[entry];
+        if (!fetched || !producer_placement(s, p, previous, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
+            return false;
+        uint segment = strand_segment(cluster_id, primitive);
+        float3 object = cluster_id == SWEPT_CLUSTER ? t.position[0]
+            : (1.0 - bary.x - bary.y) * t.position[0] + bary.x * t.position[1] + bary.y * t.position[2];
+        if (!strand_geometry(i, b, segment, object, pl, previous, context.cone_width * bias))
+            return false;
+        uint material = strand_material(p);
+        if (material == MATERIAL_NONE)
+            return false;
+        i.instance = instance_index;
+        i.user_tag = p.user_tag;
+        h.origin = p.origin;
+        finish_input(s, v, d, material, pl, sided, context, i, h);
+        return true;
+    }
+    TracedTriangle tri;
+    if (!traced_triangle(s, instance_index, cluster_id, primitive, previous, tri))
+        return false;
+    triangle_input(s, v, d, tri, primitive, bary, t, fetched, previous, sided, context, h);
     return true;
 }
 
@@ -882,12 +965,13 @@ public float resolve_coverage<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     return S.coverage(h.input);
 }
 
-// What a triangle candidate of a particle producer entry shows rays that take particles by
-// their emission alone: its material, its unit render-space front-face normal, the emission
-// there in nits, unexposed (the emission texture where bound), and its opacity
-// (`material_opacity`), both at the hit's uv from the entry's batch. False for any other
-// candidate.
-public bool resolve_particle(SceneRoot* s, uint instance_index, uint cluster_id, uint primitive, float2 bary, out uint material, out float3 normal, out float3 emission, out float opacity)
+// What a triangle candidate of a particle producer entry shows rays along `d` that take
+// particles by their emission alone: its section material, its unit render-space front-face
+// normal, the emission there in nits of the side `d` meets, unexposed (the emission texture
+// where bound; a back of its own where `d` meets the back of a material with one), and its
+// opacity (`material_opacity`, the section material's on both sides), both at the hit's uv from
+// the entry's batch. False for any other candidate.
+public bool resolve_particle(SceneRoot* s, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 d, out uint material, out float3 normal, out float3 emission, out float opacity)
 {
     material = MATERIAL_NONE;
     normal = float3(0.0);
@@ -898,7 +982,8 @@ public bool resolve_particle(SceneRoot* s, uint instance_index, uint cluster_id,
     if (!hit_producer(s, instance_index, entry) || !particle_candidate(s, entry, cluster_id, primitive, bary, material, normal, i))
         return false;
     MaterialGpu* m = s.materials + material;
-    emission = material_emission_at(m, i.uv);
+    MaterialGpu* shown = (m.flags & MATERIAL_HAS_BACK) != 0 && dot(normal, d) >= 0.0 ? s.materials + m.back : m;
+    emission = material_emission_at(shown, i.uv);
     opacity = material_opacity(i);
     return true;
 }

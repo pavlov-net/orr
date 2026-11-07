@@ -2,8 +2,9 @@
 // G-buffer's surface or a thin lens, and the world cache's update paths. A vertex runs next-event
 // estimation by resampled importance sampling over the light set's mixture and traces one shadow
 // ray for the winner, then samples its BSDF, phase function or way out, and its ray goes through
-// the scene's PTLAS; BSDF rays add the environment, directional discs and emission they reach,
-// weighted against next-event estimation by the power heuristic. Hits shade through the kernel's
+// the scene's PTLAS; BSDF rays add the environment, directional discs, emission and sphere and
+// rect light proxies they reach, weighted against next-event estimation by the balance
+// heuristic with densities taken from the vertex the ray left. Hits shade through the kernel's
 // linked surface with a `HitContext`. Paths may end in the scene's world cache; the cache's update
 // paths trace the same loop and add what each vertex scattered to its cell. Radiance is written
 // pre-exposed. Each pixel also writes its light feedback, one of the lights that added to its
@@ -383,47 +384,73 @@ public struct Alpha<S : ISurface> : IAnyHit
     }
 }
 
-// Most candidates a ray that resolves particles visits.
+// Most candidates a ray that resolves particles and light proxies visits.
 public static const uint PARTICLE_CANDIDATES = 64;
 
-// Particles on a BSDF ray, as `trace_resolve_translucent` layers them: each particle
-// candidate is a layer of its emission at its opacity, unexposed, weighed by the power
-// heuristic against the light set's sampling of its entry where `pdf` (the ray's density,
-// 0 for none) is above 0. `other` decides every other candidate.
-public struct ParticleEmission<A : IAnyHit> : ITranslucent
+// What a BSDF ray meets in front of its hit, as `trace_resolve_translucent` layers it: each
+// particle is a layer of its emission at its opacity, and each sphere or rect light's proxy a
+// layer that only emits, unexposed. Emission is weighed by the balance heuristic against the
+// light set's sampling where `pdf` (the ray's density, 0 for none) is above 0; densities take
+// the distance and direction from the vertex at `from`. A particle lights its front, and its
+// back where it is double-sided or has a back of its own, as light sampling takes it.
+public struct PathEmission : ITranslucent
 {
     public SceneRoot* scene;
     public LightSetGpu* set;
     public LocalLights* local;
+    public float3 origin;           // the ray's
     public float3 dir;
+    public float3 from;             // the vertex's position
     public float3 normal;           // the vertex's shading normal, zero in a medium
     public float pdf;
     public float run;               // the vertex's next-event probability
-    public A other;
+    public float t_max;             // the ray's hit, or infinity
 
-    public float4 layer(Candidate c)
+    public float4 layer(inout Candidate c)
     {
+        if (!c.triangle)
+        {
+            float3 l;
+            float t;
+            uint id = c.instance_index - scene.light_base;
+            if (c.class_id != CLASS_LIGHT || id >= scene.light_capacity || !light_proxy_hit(set, id, origin, dir, t_max, from, t, l) || !any(l > 0.0))
+                return float4(0.0);
+            c.t = t;
+            float w = 1.0;
+            if (pdf > 0.0)
+            {
+                float3 toward = normalize(origin + dir * t - from);
+                w = mis_balance(pdf, run * nee_local_light_pdf(set, local, normal, id, from, toward));
+            }
+            return float4(l * w, 0.0);
+        }
         uint material;
         float3 n;
         float3 e;
         float a;
         if (c.class_id != CLASS_PARTICLE || c.cluster_id < 0
-            || !resolve_particle(scene, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, material, n, e, a))
+            || !resolve_particle(scene, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, dir, material, n, e, a))
             return float4(0.0);
         a = saturate(a);
+        uint flags = scene.materials[material].flags;
+        bool back = dot(n, dir) >= 0.0;
+        if (back && (flags & (MATERIAL_DOUBLE_SIDED | MATERIAL_HAS_BACK)) == 0)
+            return float4(0.0, 0.0, 0.0, a);
         float w = 1.0;
-        uint entry;
-        if (pdf > 0.0 && any(e > 0.0) && hit_producer(scene, c.instance_index, entry))
+        if (pdf > 0.0 && any(e > 0.0))
         {
-            float l = luminance_rec2020(material_light_emission(scene.materials + material));
-            w = mis_power(pdf, run * nee_emissive_pdf(set, local, normal, entry, l, c.t, dot(n, dir)));
+            EmitterHit h = emitter_hit(set, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, back && (flags & MATERIAL_HAS_BACK) != 0);
+            float3 v = h.point - from;
+            float distance = length(v);
+            float cos_light = distance > 0.0 ? dot(h.normal, v / distance) : 0.0;
+            w = mis_balance(pdf, run * nee_emissive_pdf(set, local, normal, h, distance, cos_light));
         }
         return float4(e * (a * w), a);
     }
 
     public bool accept(Candidate c)
     {
-        return c.class_id != CLASS_PARTICLE && other.accept(c);
+        return false;
     }
 }
 
@@ -437,14 +464,17 @@ public RayDesc path_ray(float3 origin, float3 dir, float t_max)
     return r;
 }
 
-// Probability that a vertex runs next-event estimation: 1 unless it is a smooth metal
-// without directional light.
+// Probability that a vertex runs next-event estimation: 1 unless it is a smooth metal or
+// transmitting dielectric without directional light, which runs it with probability roughness
+// / `NEE_METAL_ROUGHNESS` in the share of its light that such lobes carry.
 public float nee_probability(LightSetGpu* set, GSurface s)
 {
     float total;
     if (directional_share(set, s.normal, total) > 0.0)
         return 1.0;
-    return lerp(1.0, saturate(s.bsdf.specular_roughness / NEE_METAL_ROUGHNESS), s.bsdf.metalness);
+    BsdfParams p = s.bsdf;
+    float specular = p.metalness + (1.0 - p.metalness) * p.transmission_weight;
+    return lerp(1.0, saturate(p.specular_roughness / NEE_METAL_ROUGHNESS), specular);
 }
 
 // The local light sampler of `pixel`'s screen tile, or null.
@@ -452,7 +482,7 @@ public LocalLights* pixel_local_lights(PathRoot r, uint2 pixel)
 {
     if (r.local == nullptr)
         return nullptr;
-    uint2 t = pixel / LOCAL_TILE;
+    uint2 t = (pixel + local_tile_offset(r.frame)) / LOCAL_TILE;
     return r.local + t.y * r.local_columns + t.x;
 }
 
@@ -478,11 +508,12 @@ public interface IShadow
 // Next-event estimation at `x` (a zero shading normal for a point in a medium), weighed by
 // `f`, with local sampler `local` (null for none): `candidates` draws from the light set's
 // mixture resampled by unshadowed luminance, one shadow ray through `shadow` for the
-// winner, weighted against BSDF sampling unless `weight_one`. `light` is the winner's
-// feedback id, NO_LIGHT for a directional winner or none. With `no_environment` the
-// environment's candidates count for nothing. Draws four sampler dimensions per candidate and
-// counts the ray in `rays`.
-public float3 shade_vertex_nee<F : IScatter, V : IShadow>(PathRoot r, PathVertex x, F f, V shadow, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, inout Sampler rng, inout uint rays, out uint light, bool no_environment = false)
+// winner, aimed at its point on a finite light, weighted against BSDF sampling unless
+// `weight_one`. `light` is the winner's feedback id, NO_LIGHT for a directional winner or
+// none. With `no_environment` the environment's candidates count for nothing. An emitter's
+// coat and fuzz pass its light into the vertex's medium, of IOR `exterior_ior`. Draws six
+// sampler dimensions per candidate and counts the ray in `rays`.
+public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot r, PathVertex x, F f, V shadow, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, float exterior_ior, inout Sampler rng, inout uint rays, out uint light, bool no_environment = false)
 {
     LightSetGpu* set = r.set;
     light = NO_LIGHT;
@@ -494,7 +525,7 @@ public float3 shade_vertex_nee<F : IScatter, V : IShadow>(PathRoot r, PathVertex
     float sum = 0.0;
     for (uint i = 0; i < candidates; i++)
     {
-        ResolvedLightSample c = nee_candidate(set, v, rng);
+        ResolvedLightSample c = nee_candidate<S>(set, v, rng);
         float u = rng.next();
         if (!(c.pdf > 0.0) || (no_environment && c.kind == LIGHT_SAMPLE_ENVIRONMENT))
             continue;
@@ -523,19 +554,28 @@ public float3 shade_vertex_nee<F : IScatter, V : IShadow>(PathRoot r, PathVertex
         return float3(0.0);
     float3 origin = vertex_origin(x, dir);
     float t_max = chosen.distance;
+    float3 toward = dir;
+    // A finite light's ray goes from the offset origin to the point drawn on it, stopping
+    // short of it by its rounding.
     if (isfinite(t_max))
-        t_max = max(0.0, t_max - length(origin - x.surface.position)) * (1.0 - 1e-4);
+    {
+        float3 to = chosen.point - origin;
+        float length_to = length(to);
+        toward = length_to > 0.0 ? to / length_to : dir;
+        float magnitude = max(abs(chosen.point.x), max(abs(chosen.point.y), abs(chosen.point.z)));
+        t_max = max(0.0, length_to - max(1e-4 * length_to, magnitude * F32_PRECISION));
+    }
     RayCone cone = { 0.0, 0.0 };
     rays++;
     bool weigh;
-    float3 vis = shadow.transmittance(origin, dir, t_max, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0), chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, weigh);
+    float3 vis = shadow.transmittance(origin, toward, t_max, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0), chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, weigh);
+    if (chosen.view && any(vis > 0.0))
+        vis *= emitter_view_layer<S>(set, chosen, exterior_ior);
     float mis = 1.0;
-    // Sphere and rect lights are not in the PTLAS, so BSDF rays never reach them; the
-    // emissive entries the tiles sample are producer entries, which BSDF rays hit.
-    bool shared = chosen.kind == LIGHT_SAMPLE_ENVIRONMENT || chosen.kind == LIGHT_SAMPLE_DIRECTIONAL
-        || chosen.kind == LIGHT_SAMPLE_EMISSIVE;
-    if (!weight_one && weigh && shared)
-        mis = mis_power(run * chosen.pdf, chosen_scatter_pdf);
+    // Every light the tiles hold is one BSDF rays reach too: emissive entries' surfaces, and
+    // sphere and rect lights through their proxies.
+    if (!weight_one && weigh)
+        mis = mis_balance(run * chosen.pdf, chosen_scatter_pdf);
     if (chosen.kind != LIGHT_SAMPLE_DIRECTIONAL)
         light = chosen.light;
     return e * vis * (W * mis / run);
@@ -1177,6 +1217,7 @@ struct LayerRay
     float pdf;                      // 0 for an ideal-specular direction
     float run;                      // the vertex's next-event probability
     float3 normal;                  // the vertex's shading normal, zero in a medium
+    float3 from;                    // the vertex's position, from which light densities are taken
     bool diffuse;
     bool chain;                     // left a layer or a scatter
     bool scatter;                   // may scatter in an interior
@@ -1533,7 +1574,8 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             bool medium_vertex = record.crosses() && l.kind == VERTEX_SCATTER;
             bool leaving = record.crosses() && l.kind == VERTEX_LEAVE;
             bool on_layer = record.crosses() && l.kind == VERTEX_LAYER;
-            float run = medium_vertex || at_exit || leaving ? 1.0 : nee_probability(set, l.x.surface);
+            // A chain vertex on a layer's back sees lights from inside it, which BSDF rays carry.
+            float run = medium_vertex || at_exit || leaving ? 1.0 : on_layer && !l.front ? 0.0 : nee_probability(set, l.x.surface);
             float u_run = rng.next();
             uint candidates = depth == 0 ? r.primary_candidates : r.bounce_candidates;
             if (count_nee && candidates > 0 && u_run < run && !(skip_direct && on_layer) && !split)
@@ -1546,7 +1588,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                 uint light;
                 VertexScatter f = { b, medium_vertex, -l.x.view, l.anisotropy, at_exit, exit_scatter, leaving, leave_scatter };
                 // The rays of a walk's way out reach no light this estimate is weighed against.
-                float3 e = shade_vertex_nee(r, at, f, shadow, run, pixel, local, depth, candidates, one_technique || leaving, rng, rays, light, leaving && count_bsdf);
+                float3 e = shade_vertex_nee<S>(r, at, f, shadow, run, pixel, local, depth, candidates, one_technique || leaving, interior_ior(s, interior.innermost()), rng, rays, light, leaving && count_bsdf);
                 float3 added = spectral.color(throughput * e);
                 if (counted)
                     radiance += added;
@@ -1645,6 +1687,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                     ray.pdf = delta ? 0.0 : pdf;
                     ray.run = count_nee && !split && !environment_after_walk ? run : 0.0;
                     ray.normal = l.kind == VERTEX_OPAQUE ? l.x.surface.normal : float3(0.0);
+                    ray.from = l.x.surface.position;
                     ray.diffuse = diffuse;
                     ray.chain = record.crosses() && l.kind != VERTEX_OPAQUE;
                     ray.scatter = record.walks() && (reference || depth == 0);
@@ -1673,24 +1716,29 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                 LayerAccept<S> a = { s, v, ray.dir, context, camera ? seed : pcg(seed ^ (depth + 1)), PRESENCE_DRAWN };
                 rays += camera ? 0 : 1;
                 RayDesc rd = path_ray(ray.origin, ray.dir, camera ? start.t_max : positive_infinity());
-                // Rays leaving a layer or a scatter, and the first vertex's, see particles.
-                if (record.particles() && !camera && (ray.chain || depth == 0))
+                h = trace_closest(s.tlas, rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+                // Rays leaving a layer or a scatter, and the first vertex's, see particles, and
+                // every path ray that adds emission sees the proxies of sphere and rect lights,
+                // which cover nothing: a second trace finds them in front of the hit.
+                bool adds = count_bsdf && counted && !skip_direct;
+                bool particles = record.particles() && !camera && (ray.chain || depth == 0);
+                bool lights = !camera && adds && set.local_lights > 0;
+                if (particles || lights)
                 {
-                    mask |= MASK_PARTICLE;
                     LocalLights* ray_local = nullptr;
                     if (ray.local)
                         ray_local = pixel_local_lights(r, pixel);
-                    ParticleEmission<LayerAccept<S> > pe = { s, set, ray_local, ray.dir, ray.normal, one_technique ? 0.0 : ray.pdf, ray.run, a };
-                    // The particles in front of the ray's hit, premultiplied.
-                    float4 particles;
-                    h = trace_resolve_translucent(s.tlas, rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, pe, PARTICLE_CANDIDATES, particles, positions);
-                    // While the path skips direct light, particles add no emission, as producer hits do.
-                    if (count_bsdf && counted && !skip_direct)
-                        radiance += spectral.color(throughput * particles.rgb);
-                    throughput *= 1.0 - particles.a;
+                    RayDesc front = path_ray(ray.origin, ray.dir, h.hit ? h.t : positive_infinity());
+                    PathEmission pe = { s, set, ray_local, ray.origin, ray.dir, ray.from, ray.normal, one_technique ? 0.0 : ray.pdf, ray.run, front.TMax };
+                    // What lies in front of the ray's hit, premultiplied.
+                    float4 layers;
+                    trace_resolve_translucent(s.tlas, front, (particles ? MASK_PARTICLE : 0) | (lights ? MASK_LIGHT : 0), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, pe, PARTICLE_CANDIDATES, layers);
+                    // While the path skips direct light, what it meets adds no emission, as
+                    // emitters the light set samples do.
+                    if (adds)
+                        radiance += spectral.color(throughput * layers.rgb);
+                    throughput *= 1.0 - layers.a;
                 }
-                else
-                    h = trace_closest(s.tlas, rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
             }
             if (!camera)
                 depth++;
@@ -1874,7 +1922,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             else if (count_bsdf && counted && (!skip_direct || environment_after_walk))
             {
                 float3 env = environment_map(set.environment, ray.dir);
-                float w = weigh ? mis_power(ray.pdf, ray.run * nee_environment_pdf(set, ray_local, ray.normal, ray.dir)) : 1.0;
+                float w = weigh ? mis_balance(ray.pdf, ray.run * nee_environment_pdf(set, ray_local, ray.normal, ray.dir)) : 1.0;
                 float3 e = env * w;
                 record.light(feedback_environment(set), luminance_rec2020(spectral.color(throughput * e)));
                 for (uint k = 0; k < set.directional_count && !skip_direct; k++)
@@ -1882,7 +1930,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                     uint id = set.directional_ids[k];
                     float3 d = directional_disc<M>(set, id, ray.origin, ray.dir);
                     if (any(d > 0.0))
-                        e += d * (weigh ? mis_power(ray.pdf, ray.run * nee_directional_pdf(set, ray.normal, id, ray.dir)) : 1.0);
+                        e += d * (weigh ? mis_balance(ray.pdf, ray.run * nee_directional_pdf(set, ray.normal, id, ray.dir)) : 1.0);
                 }
                 radiance += spectral.color(throughput * e);
             }
@@ -1892,9 +1940,9 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
 
         bool layer = false;
         bool front = true;
-        // The hit shows what the light set samples, a producer entry's front.
-        bool sampled = false;
-        uint entry = 0;
+        // What the light set samples of the hit, and the side it shows.
+        EmitterHit emitter = (EmitterHit)0;
+        bool swapped = false;
         float cos_light = 0.0;
         if (gbuffer)
         {
@@ -1941,7 +1989,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                 l = opaque_vertex(hit_vertex(v, sh, ray.dir));
                 opaque++;
             }
-            sampled = hit_producer(s, h.instance_index, entry) && !sh.swapped;
+            swapped = sh.swapped;
         }
         if (first)
             cone.width = cone_width(cone, l.x.camera_distance);
@@ -1955,23 +2003,28 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
         b = prepare_vertex(s, l, interior, collapse, walks, record.adjoint(), spectral.hero());
         if (first)
             record.arrive(r, l.x, b, gbuffer ? length(l.x.surface.position - v.eye_render.xyz) : start.offset + t, layer);
-        // Emission seen from the front. Cooked emitters and a surface's back are reached by BSDF
-        // rays alone; the light set samples producer entries, so their emission is weighed
-        // against it.
+        // Emission seen from the side that emits, weighed against the light set's sampling of
+        // the point, which takes its density from the vertex the ray left; a point the light set
+        // never draws takes weight 1.
         if (gbuffer)
         {
             if (counted)
                 exposed += throughput * b.emission();
         }
-        else if ((count_bsdf || first) && counted && front && !(skip_direct && sampled))
+        else if ((count_bsdf || first) && counted && front && any(b.emission() > 0.0))
         {
+            if (!first && (weigh || skip_direct))
+                emitter = emitter_hit(set, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, swapped);
             float w = 1.0;
-            if (weigh && sampled)
+            if (weigh && emitter.density > 0.0)
             {
-                float lum = luminance_rec2020(material_light_emission(s.materials + l.x.surface.material));
-                w = mis_power(ray.pdf, ray.run * nee_emissive_pdf(set, ray_local, ray.normal, entry, lum, t, cos_light));
+                float3 toward = emitter.point - ray.from;
+                float distance = length(toward);
+                float cos_to = distance > 0.0 ? dot(emitter.normal, toward / distance) : 0.0;
+                w = mis_balance(ray.pdf, ray.run * nee_emissive_pdf(set, ray_local, ray.normal, emitter, distance, cos_to));
             }
-            radiance += spectral.color(throughput * b.emission() * w);
+            if (!(skip_direct && emitter.density > 0.0))
+                radiance += spectral.color(throughput * b.emission() * w);
         }
         if (layer)
         {

@@ -5,13 +5,12 @@
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub use openpbr_ref::walk::fresnel;
 use orr_cook::{
-    ArchiveSpec, AssetSpec, GridInput, GridVoxels, LodMode, Manifest, MeshInput, MeshSettings,
-    Source, TextureSettings, Usage, VolumeGrids, VolumeInput, VolumeSettings,
+    ArchiveSpec, AssetSpec, GltfSettings, GridInput, GridVoxels, LodMode, Manifest, MeshInput,
+    MeshSettings, Source, TextureSettings, Usage, VolumeGrids, VolumeInput, VolumeSettings,
 };
 use orr_gpu::{
     Allocation, CommandList, ComputePipeline, Format, GpuPtr, Hazards, KernelSet, MemoryKind,
@@ -29,15 +28,16 @@ use orr_pack::{AssetId, Span, Target};
 use orr_scene::testing::{FlipError, Image, Pixels, flip};
 use orr_scene::{
     ClusterTopology, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
-    LoadState, Loading, MaterialGpu, MaterialId, MediumProxy, MediumProxyId, MountId, Opacity,
-    PackSource, ProducerDesc, ProducerId, ProducerUpdate, Projection, RasterView, RendererDesc,
-    SceneCompute, SceneDesc, SceneId, SceneWriter, Scenes, TextureFilter, TransformGroupDesc,
-    TransformGroupId, ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
+    LoadState, MaterialGpu, MaterialId, MediumProxy, MediumProxyId, MountId, Opacity, PackSource,
+    ProducerDesc, ProducerId, ProducerUpdate, Projection, RasterView, RendererDesc, SceneCompute,
+    SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, TextureFilter,
+    TransformGroupDesc, TransformGroupId, ViewArena, ViewDesc, ViewHistoryId, VolumeRef,
+    material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 
 use crate::shaders::{accumulate, exposure, flat_color, guide_read, particle_quads};
-use crate::{TestTexture, device, linear_clamp, pipeline, render, texture, upload};
+use crate::{TestTexture, Workers, device, linear_clamp, pipeline, read, render, texture, upload};
 
 /// Render extent of every bed view.
 pub const EXTENT: [u32; 2] = [128, 96];
@@ -264,6 +264,15 @@ pub const CORNELL: &str = "cornell box";
 pub const TALL_BOX: &str = "tall box";
 pub const SHORT_BOX: &str = "short box";
 pub const EMITTER: &str = "emitter";
+/// [`EMITTER`] under a full blue-tinted coat and a full fuzz, which pass its light by angle.
+pub const COATED_EMITTER: &str = "coated emitter";
+/// [`EMITTER`] with an emission texture of four quadrants that emit 1, 0.22, 0.05 and 0 of its
+/// luminance, so no flip or swap of its uv leaves the light it gives where it is.
+pub const QUADRANT_EMITTER: &str = "quadrant emitter";
+/// A 0.8 x 0.3 m strip along x facing -y, emitting [`EMITTER_LUMINANCE`] nits, skinned to two
+/// joints at its origin: the first holds x = -0.4, and the second's weight grows to 1 at
+/// x = 0.4. Placed with [`Bed::add_skinned`].
+pub const SKINNED_EMITTER: &str = "skinned emitter";
 /// The alpha-tested 2 m quad of rings, facing +z, with opacity micromaps.
 pub const LEAF: &str = "leaf";
 /// [`LEAF`] cooked without opacity micromaps.
@@ -285,6 +294,13 @@ pub const MIRROR: &str = "mirror";
 pub const SMOOTH_FLOOR: &str = "smooth floor";
 /// The floor with a strong bump normal map.
 pub const BUMPY_FLOOR: &str = "bumpy floor";
+/// The floor as a glossy black dielectric, roughness [`GLOSSY_ROUGHNESS`]: it shows lights by a
+/// blurred reflection that next-event estimation and BSDF rays both find.
+pub const GLOSSY_FLOOR: &str = "glossy floor";
+pub const GLOSSY_ROUGHNESS: f32 = 0.25;
+/// A 6 m square of 48 x 48 emitting tiles facing -y around its origin, each a fifth of its
+/// cell's side: a sparse field with clusters enough for its cooked set to hold a tree.
+pub const EMITTER_FIELD: &str = "emitter field";
 /// An upright 1 m square facing +z whose material names linked surface 1.
 pub const PANEL: &str = "panel";
 /// A valley 3 m across and 8 m long along z, y = 0.5 x^2, finely tessellated, with
@@ -674,6 +690,110 @@ fn mesh(build: impl FnOnce(&mut MeshBuilder)) -> MeshInput {
     b.finish()
 }
 
+/// [`QUADRANT_EMITTER`]'s emission texture: a 2 x 2 sRGB PNG.
+fn quadrants_png() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("orr_lighting_bed_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("quadrants.png");
+    let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 2, 2);
+    enc.set_color(png::ColorType::Grayscale);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()
+        .unwrap()
+        .write_image_data(&[255, 128, 64, 0])
+        .unwrap();
+    path
+}
+
+/// [`SKINNED_EMITTER`] as a binary glTF.
+fn skinned_strip_glb() -> PathBuf {
+    let n = 8u32;
+    let (mut positions, mut normals, mut joints, mut weights) = (
+        Vec::<f32>::new(),
+        Vec::<f32>::new(),
+        Vec::<u8>::new(),
+        Vec::<f32>::new(),
+    );
+    for i in 0..=n {
+        let x = -0.4 + 0.8 * i as f32 / n as f32;
+        let w = (x + 0.4) / 0.8;
+        for z in [-0.15f32, 0.15] {
+            positions.extend([x, 0.0, z]);
+            normals.extend([0.0, -1.0, 0.0]);
+            joints.extend([0, 1, 0, 0]);
+            weights.extend([1.0 - w, w, 0.0, 0.0]);
+        }
+    }
+    // Vertex 2 i lies at z = -0.15 and 2 i + 1 at z = 0.15; both triangles face -y.
+    let indices: Vec<u32> = (0..n)
+        .flat_map(|i| {
+            let (a, b, c, d) = (2 * i, 2 * i + 1, 2 * i + 2, 2 * i + 3);
+            [a, c, b, c, d, b]
+        })
+        .collect();
+    let identity: Vec<f32> = [
+        1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+    ]
+    .repeat(2);
+    let mut bin: Vec<u8> = Vec::new();
+    let mut views = Vec::new();
+    let mut add = |bytes: &[u8]| {
+        views.push(format!(
+            r#"{{"buffer":0,"byteOffset":{},"byteLength":{}}}"#,
+            bin.len(),
+            bytes.len()
+        ));
+        bin.extend_from_slice(bytes);
+        bin.resize(bin.len().next_multiple_of(4), 0);
+        views.len() - 1
+    };
+    let v_pos = add(bytemuck::cast_slice(&positions));
+    let v_nrm = add(bytemuck::cast_slice(&normals));
+    let v_jnt = add(&joints);
+    let v_wgt = add(bytemuck::cast_slice(&weights));
+    let v_idx = add(bytemuck::cast_slice(&indices));
+    let v_ibm = add(bytemuck::cast_slice(&identity));
+    let vertices = positions.len() / 3;
+    let json = format!(
+        r#"{{"asset":{{"version":"2.0"}},"extensionsUsed":["KHR_materials_emissive_strength"],
+"scene":0,"scenes":[{{"nodes":[0,2]}}],
+"nodes":[{{"name":"root","children":[1]}},{{"name":"tip"}},{{"name":"strip","mesh":0,"skin":0}}],
+"skins":[{{"joints":[0,1],"inverseBindMatrices":5}}],
+"materials":[{{"pbrMetallicRoughness":{{"baseColorFactor":[0,0,0,1],"metallicFactor":0}},
+"emissiveFactor":[1,1,1],"extensions":{{"KHR_materials_emissive_strength":{{"emissiveStrength":{EMITTER_LUMINANCE}}}}}}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0,"NORMAL":1,"JOINTS_0":2,"WEIGHTS_0":3}},"indices":4,"material":0}}]}}],
+"accessors":[
+{{"bufferView":{v_pos},"componentType":5126,"count":{vertices},"type":"VEC3","min":[-0.4,0,-0.15],"max":[0.4,0,0.15]}},
+{{"bufferView":{v_nrm},"componentType":5126,"count":{vertices},"type":"VEC3"}},
+{{"bufferView":{v_jnt},"componentType":5121,"count":{vertices},"type":"VEC4"}},
+{{"bufferView":{v_wgt},"componentType":5126,"count":{vertices},"type":"VEC4"}},
+{{"bufferView":{v_idx},"componentType":5125,"count":{n_idx},"type":"SCALAR"}},
+{{"bufferView":{v_ibm},"componentType":5126,"count":2,"type":"MAT4"}}],
+"bufferViews":[{views}],
+"buffers":[{{"byteLength":{len}}}]}}"#,
+        n_idx = indices.len(),
+        views = views.join(","),
+        len = bin.len(),
+    );
+    let mut json = json.into_bytes();
+    json.resize(json.len().next_multiple_of(4), b' ');
+    let mut glb = Vec::new();
+    glb.extend(b"glTF");
+    glb.extend(2u32.to_le_bytes());
+    glb.extend(((12 + 8 + json.len() + 8 + bin.len()) as u32).to_le_bytes());
+    glb.extend((json.len() as u32).to_le_bytes());
+    glb.extend(b"JSON");
+    glb.extend(&json);
+    glb.extend((bin.len() as u32).to_le_bytes());
+    glb.extend(b"BIN\0");
+    glb.extend(&bin);
+    let dir = std::env::temp_dir().join(format!("orr_lighting_bed_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("skinned_strip.glb");
+    std::fs::write(&path, glb).unwrap();
+    path
+}
+
 /// A 16 x 16 grayscale PNG, `left` where u is below 1/2 and `right` elsewhere.
 fn halves_png(name: &str, left: u8, right: u8) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("orr_lighting_bed_{}", std::process::id()));
@@ -770,6 +890,15 @@ fn cook() -> Arc<[u8]> {
         emission_luminance: EMITTER_LUMINANCE,
         ..Material::default()
     };
+    let mut quadrant_emitter = emitter;
+    quadrant_emitter.textures[slot::EMISSION].texture = AssetId::from_name("quadrants");
+    let coated_emitter = Material {
+        coat_weight: 1.0,
+        coat_color: [0.4, 0.6, 1.0],
+        fuzz_weight: 1.0,
+        fuzz_color: [1.0; 3],
+        ..emitter
+    };
     let mut leaf = Material {
         base_color: [0.2, 0.6, 0.15],
         alpha_mode: Material::MASK,
@@ -814,6 +943,10 @@ fn cook() -> Arc<[u8]> {
         specular_roughness: 0.0,
         specular_ior: 1.5,
         ..Material::default()
+    };
+    let glossy = Material {
+        specular_roughness: GLOSSY_ROUGHNESS,
+        ..smooth
     };
     let mut bumpy = floor;
     bumpy.textures[slot::NORMAL].texture = AssetId::from_name("bumps");
@@ -1072,6 +1205,58 @@ fn cook() -> Arc<[u8]> {
                     mesh(|b| b.quad(0, square(0.3, 0.0), -y, 1)),
                     vec![emitter],
                 ),
+                model(
+                    COATED_EMITTER,
+                    mesh(|b| b.quad(0, square(0.3, 0.0), -y, 1)),
+                    vec![coated_emitter],
+                ),
+                AssetSpec {
+                    name: "quadrants".into(),
+                    source: Source::Texture {
+                        path: quadrants_png(),
+                        settings: TextureSettings {
+                            usage: Usage::Color,
+                            ..TextureSettings::default()
+                        },
+                    },
+                },
+                model(
+                    QUADRANT_EMITTER,
+                    mesh(|b| b.quad(0, square(0.3, 0.0), -y, 1)),
+                    vec![quadrant_emitter],
+                ),
+                AssetSpec {
+                    name: SKINNED_EMITTER.into(),
+                    source: Source::Gltf {
+                        path: skinned_strip_glb(),
+                        settings: GltfSettings {
+                            mesh: MeshSettings {
+                                deformation_bound: 1.0,
+                                ..MeshSettings::default()
+                            },
+                            ..GltfSettings::default()
+                        },
+                    },
+                },
+                model(
+                    EMITTER_FIELD,
+                    mesh(|b| {
+                        let (n, side) = (48, 6.0f32);
+                        let cell = side / n as f32;
+                        for j in 0..n {
+                            for i in 0..n {
+                                let c = Vec3::new(
+                                    (i as f32 + 0.5) * cell - 0.5 * side,
+                                    0.0,
+                                    (j as f32 + 0.5) * cell - 0.5 * side,
+                                );
+                                let tile = square(0.1 * cell, 0.0).map(|p| p + c);
+                                b.quad(0, tile, -y, 1);
+                            }
+                        }
+                    }),
+                    vec![emitter],
+                ),
                 model(LEAF, upright(1.0), vec![leaf]),
                 AssetSpec {
                     name: BARE_LEAF.into(),
@@ -1111,6 +1296,11 @@ fn cook() -> Arc<[u8]> {
                     SMOOTH_FLOOR,
                     mesh(|b| b.quad(0, square(5.0, 0.0), y, 8)),
                     vec![smooth],
+                ),
+                model(
+                    GLOSSY_FLOOR,
+                    mesh(|b| b.quad(0, square(5.0, 0.0), y, 8)),
+                    vec![glossy],
                 ),
                 model(
                     BUMPY_FLOOR,
@@ -1253,21 +1443,6 @@ fn cook() -> Arc<[u8]> {
 fn pack() -> &'static Arc<[u8]> {
     static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
     PACK.get_or_init(cook)
-}
-
-/// Threads lent to the loading side until dropped.
-struct Workers {
-    loading: Arc<Loading>,
-    threads: Vec<JoinHandle<()>>,
-}
-
-impl Drop for Workers {
-    fn drop(&mut self) {
-        self.loading.stop_workers();
-        for t in self.threads.drain(..) {
-            t.join().unwrap();
-        }
-    }
 }
 
 fn time(frame: u64) -> FrameTime {
@@ -1551,6 +1726,8 @@ pub struct Bed {
     pre_exposure: f32,
     frame: u64,
     last_id: u64,
+    /// The scene root of the last frame run.
+    last_root: GpuPtr<SceneRoot>,
     last_overlay: Option<TextureIndex>,
     light_writes: Vec<(LightId, Option<Light>)>,
     proxy_writes: Vec<(MediumProxyId, Option<MediumProxy>)>,
@@ -1590,14 +1767,7 @@ impl Bed {
         let kernels = renderer.kernels;
         let d = device();
         let mut scenes = Scenes::new(d, renderer).unwrap();
-        let loading = scenes.loading();
-        let threads = (0..2)
-            .map(|_| {
-                let l = Arc::clone(&loading);
-                std::thread::spawn(move || l.run_worker())
-            })
-            .collect();
-        let workers = Workers { loading, threads };
+        let workers = Workers::start(&scenes);
         let mount = scenes.mount(PackSource::Memory(Arc::clone(pack())));
         let start = Instant::now();
         let mut frame = 0;
@@ -1738,6 +1908,7 @@ impl Bed {
             pre_exposure: 1.0,
             frame,
             last_id: 0,
+            last_root: GpuPtr::NULL,
             last_overlay: None,
             light_writes: Vec::new(),
             proxy_writes: Vec::new(),
@@ -1748,6 +1919,66 @@ impl Bed {
             particles: None,
             _workers: workers,
         }
+    }
+
+    /// Adds a skinned copy of model `model` from the next frame on, placed by `place` and posed
+    /// by the skinning matrices `palette`, one per joint of its skeleton.
+    pub fn add_skinned(&mut self, model: &str, place: Affine3, palette: &[Affine3]) {
+        let model = self
+            .scenes
+            .model(self.mount, AssetId::from_name(model))
+            .unwrap_or_else(|e| panic!("model {model}: {e}"));
+        self.frame += 1;
+        let list = [self.scene];
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        {
+            let mut w = f.scene(self.scene).unwrap();
+            let group = |w: &mut SceneWriter<'_>, transforms: &[Affine3]| {
+                let g = w
+                    .create_transform_group(&TransformGroupDesc {
+                        count: transforms.len() as u32,
+                        writer: GroupWriter::Cpu,
+                        anchor: DVec3::ZERO,
+                    })
+                    .unwrap();
+                let out = w.transforms(g, 0, transforms.len() as u32).unwrap();
+                for (o, &t) in out.iter_mut().zip(transforms) {
+                    *o = t.into();
+                }
+                g
+            };
+            let transforms = group(&mut w, &[place]);
+            let palette = group(&mut w, palette);
+            w.add_skinned(&SkinnedDesc {
+                model,
+                copies: 1,
+                transforms,
+                first: 0,
+                palette,
+                palette_first: 0,
+                material_set: None,
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: RT_RANGE,
+                user_tag: 0,
+            })
+            .unwrap();
+        }
+        let point = f.end(&[]).unwrap();
+        render().wait(point, Duration::from_secs(10)).unwrap();
+    }
+
+    /// The state the last frame left skinned entry `entry` in, the bed's skinned copies taking
+    /// entries in the order [`Self::add_skinned`] added them.
+    pub fn skin_state(&self, entry: u32) -> SkinStateGpu {
+        let root = read(self.last_root, 1)[0];
+        read(root.skin_state.offset(u64::from(entry)), 1)[0]
     }
 
     /// Gives the bed's particle entry `particles` of `look` from the next frame on, traced
@@ -1880,6 +2111,22 @@ impl Bed {
         assert!(frames > 0);
         for k in 0..frames {
             self.run_frame(first + k, seed, k == 0, k == 0, k + 1 == frames, kernel);
+        }
+        self.mean(frames)
+    }
+
+    /// As [`Self::accumulate_from`], with no camera cut: the view's history, light feedback and
+    /// local light samplers carry on from the frames before.
+    pub fn accumulate_on(
+        &mut self,
+        first: u32,
+        frames: u32,
+        seed: u32,
+        kernel: &mut dyn FnMut(&mut CommandList<'_>, &mut BedFrame<'_>),
+    ) -> Accumulated {
+        assert!(frames > 0);
+        for k in 0..frames {
+            self.run_frame(first + k, seed, false, k == 0, k + 1 == frames, kernel);
         }
         self.mean(frames)
     }
@@ -2060,6 +2307,7 @@ impl Bed {
         let view = f.raster_view(&desc).unwrap();
         let id = f.id();
         self.last_id = id;
+        self.last_root = view.scene;
         let list = f.list().unwrap();
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         self.lighting.record(

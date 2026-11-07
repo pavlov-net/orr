@@ -331,13 +331,20 @@ public DecalLayer surface_decals(SurfaceInput i)
     return layer;
 }
 
+// Emission `emission` with `layer` written over it: what `apply_decals` leaves, and what light
+// sampling takes of an emitter's point.
+public float3 decal_emission(DecalLayer layer, float3 emission)
+{
+    return emission * (1.0 - layer.emission_cover) + layer.emission;
+}
+
 // `layer` written over a surface's parameters and shading normal.
 public void apply_decals(DecalLayer layer, inout BsdfParams p, inout float3 normal)
 {
     p.base_color = p.base_color * (1.0 - layer.base_color_cover) + layer.base_color;
     p.specular_roughness = p.specular_roughness * (1.0 - layer.roughness_cover) + layer.roughness;
     p.metalness = p.metalness * (1.0 - layer.metalness_cover) + layer.metalness;
-    p.emission = p.emission * (1.0 - layer.emission_cover) + layer.emission;
+    p.emission = decal_emission(layer, p.emission);
     if (layer.normal_cover > 0.0)
         normal = safe_normalize(normal * (1.0 - layer.normal_cover) + layer.normal, normal);
 }

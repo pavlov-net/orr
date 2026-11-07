@@ -10,6 +10,8 @@ import orr_scene.lights;
 import orr_scene.material;
 import orr_scene.producer;
 import orr_scene.tables;
+import orr_scene.hit;
+import orr_shaders.trace;
 import orr_lighting.environment;
 import orr_lighting.light_sampling;
 
@@ -21,7 +23,8 @@ struct Root
     // Samples whose resolved density differs from the tiles' density by more than 1e-3; the
     // lights must not overlap as seen from the receiver.
     uint* mismatches;
-    float* bin_probability;
+    // Per bin, each of its 64 lanes' share of the bin's probability.
+    float* bin_partials;
     // Per sample: luminance x cos to the axis / density.
     float* values;
     uint64_t _pad;
@@ -36,62 +39,30 @@ struct Root
 }
 ORR_ROOT(Root);
 
-// Distance along the ray to triangle p0 p1 p2, or -1 on a miss (Moller and Trumbore).
-float ray_triangle(float3 o, float3 d, float3 p0, float3 p1, float3 p2)
-{
-    float3 e1 = p1 - p0;
-    float3 e2 = p2 - p0;
-    float3 p = cross(d, e2);
-    float det = dot(e1, p);
-    if (det == 0.0)
-        return -1.0;
-    float3 s = o - p0;
-    float u = dot(s, p) / det;
-    float3 q = cross(s, e1);
-    float v = dot(d, q) / det;
-    if (u < 0.0 || v < 0.0 || u + v > 1.0)
-        return -1.0;
-    return dot(e2, q) / det;
-}
-
-// Density per sr of the tiles' samples toward `dir` from `x`, summed over every light.
+// Density per sr of the tiles' samples toward `dir` from `x`, summed over every light: an
+// emitter's by the hit side's own density at what a ray along `dir` meets first.
 float density(LightSetGpu* set, float3 x, float3 dir)
 {
     SceneRoot* s = set.scene;
     float d = set.environment_probability * environment_pdf(set.environment, dir);
     for (uint id = 0; id < s.light_capacity; id++)
-        d += local_light_pdf(set, id, x, dir);
-    for (uint e = 0; e < s.producer_capacity; e++)
-    {
-        EmissiveSelection sel = set.emissive[e];
-        float3 anchor;
-        float3x4 m;
-        if (sel.count == 0 || !producer_transform(s, e, anchor, m))
-            continue;
-        ProducerBatch b = s.batches[e];
-        ProducerGpu p = s.producers[e];
-        for (uint c = 0; c < sel.count; c++)
-        {
-            ProducerClusterGpu k = b.clusters[c];
-            MaterialGpu* mat = cluster_material(s, p, k);
-            if (mat == nullptr)
-                continue;
-            float y = luminance_rec2020(material_emission(mat));
-            for (uint i = 0; i < k.tri_count; i++)
-            {
-                float3 p0, p1, p2;
-                cluster_triangle(b, k, i, p0, p1, p2);
-                float t = ray_triangle(x, dir, render_point(anchor, m, p0),
-                                       render_point(anchor, m, p1), render_point(anchor, m, p2));
-                if (t > 0.0)
-                {
-                    float area;
-                    float c = dot(transformed_normal(m, p0, p1, p2, area), dir);
-                    d += emissive_area_pdf(set, e, y) * t * t / abs(c);
-                }
-            }
-        }
-    }
+        d += set.light_probability[id] * local_light_density(set, id, x, dir);
+    if (s.tlas.address == 0)
+        return d;
+    RayDesc ray = { x, 0.0, dir, 1e30 };
+    AcceptAll all;
+    Hit h = trace_closest(s.tlas, ray, MASK_OPAQUE | MASK_DIELECTRIC | MASK_PARTICLE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, all);
+    TracedTriangle t;
+    if (!h.hit || h.cluster_id < 0 || !traced_triangle(s, h.instance_index, uint(h.cluster_id), h.primitive_index, false, t))
+        return d;
+    float3 n;
+    traced_area(t, n);
+    bool back = dot(n, dir) > 0.0 && (s.materials[t.material].flags & MATERIAL_HAS_BACK) != 0;
+    EmitterHit e = emitter_hit(set, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, back);
+    float3 v = e.point - x;
+    float distance = length(v);
+    if (e.density > 0.0 && distance > 0.0)
+        d += global_selection(set, e.light) * e.density * distance * distance / abs(dot(e.normal, v / distance));
     return d;
 }
 
@@ -116,6 +87,7 @@ uint bin_of(float3 dir)
 [numthreads(64, 1, 1)]
 void histogram(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(histogram);
     LightSetGpu* set = root.set;
     uint4 h = pcg4d(uint4(id.x, root.frame, 0x7072u, 3u));
     ResolvedLightSample r = resolve_light_sample(set, set.tiles[id.x], root.receiver.xyz,
@@ -133,13 +105,14 @@ void histogram(uint3 id: SV_DispatchThreadID)
     root.values[id.x] = luminance_rec2020(r.radiance) * max(0.0, dot(root.axis.xyz, r.dir)) / r.pdf;
 }
 
-static groupshared float sums[64];
-
-// One workgroup per bin, integrating uniformly in theta and phi.
+// One workgroup per bin, integrating uniformly in theta and phi. The host sums the lanes:
+// with a groupshared reduction here, NVIDIA 621.14 on an RTX 5090 hangs in this kernel's
+// ray-query traversal.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void integrate(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
 {
+    ORR_OMM(integrate);
     uint bin = group.x;
     uint ring = bin / root.sectors;
     uint sector = bin % root.sectors;
@@ -158,17 +131,8 @@ void integrate(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
         sum += density(root.set, root.receiver.xyz, normalize(from_local(local, t, b, a)))
                * sin(theta);
     }
-    sums[lane] = sum;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint s = 32; s > 0; s >>= 1)
-    {
-        if (lane < s)
-            sums[lane] += sums[lane + s];
-        GroupMemoryBarrierWithGroupSync();
-    }
-    if (lane == 0)
-        root.bin_probability[bin] = sums[0] / float(n * n) * (theta_hi - theta_lo) * TWO_PI
-                                    / float(root.sectors);
+    root.bin_partials[bin * 64 + lane] = sum / float(n * n) * (theta_hi - theta_lo) * TWO_PI
+                                         / float(root.sectors);
 }
 
 // The angle from the axis at 1 - cos `omc`.

@@ -37,6 +37,7 @@ import orr_shaders.math;
 import orr_shaders.trace;
 import orr_gpu.rtas;
 import orr_scene.hit;
+import orr_scene.lights;
 import orr_scene.producer;
 
 public static const uint PARTITION_NONE = 0xffffffff;
@@ -153,12 +154,12 @@ public struct PtlasRoot
     public uint slots;            // slots to walk
     public uint budget;           // rebuilt instances beyond mandatory work
     public uint flags;            // PTLAS_*
-    public uint proxies;          // medium proxies set
+    public uint proxies;          // medium and light proxies set
     public TranslateJob* translate_jobs;
     public uint translate_count;
     public uint proxy_job_count;
-    public uint* proxy_jobs;      // medium proxies whose instance this frame writes
-    public uint64_t proxy_blas;   // the BLAS every medium proxy traces
+    public uint* proxy_jobs;      // medium proxies whose instance this frame writes, and LIGHT_JOB | LightId
+    public uint64_t proxy_blas;   // the BLAS every medium and light proxy traces
 }
 ORR_ROOT(PtlasRoot);
 
@@ -1018,9 +1019,40 @@ void producer_emit(uint3 id: SV_DispatchThreadID)
     st.rt_flags = write ? PRODUCER_RT_WRITTEN : 0;
 }
 
-// One thread per medium proxy job: its instance written over the proxy BLAS in render space,
-// or null-written once it is cleared. Runs beside `want`, so its charge is in before the
-// cutoff.
+// A proxy job naming light `job & ~LIGHT_JOB`.
+public static const uint LIGHT_JOB = 0x80000000;
+
+// The placement of light `l`'s proxy: the proxy BLAS's cube [-1, 1]^3 around a sphere of
+// its stored radius, or flat around a rect, a little larger so its box holds every point
+// light sampling and hits test.
+bool light_placement(LightGpu l, out Placement pl)
+{
+    pl = (Placement)0;
+    pl.translation = l.position;
+    if (l.kind == LIGHT_SPHERE && l.radius > 0.0)
+    {
+        float r = l.radius * 1.001;
+        pl.linear = float3x3(r, 0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, r);
+        pl.scale = r;
+        return true;
+    }
+    if (l.kind != LIGHT_RECT)
+        return false;
+    float3 x = 0.5005 * l.edge_x;
+    float3 y = 0.5005 * l.edge_y;
+    float3 n = cross(l.edge_x, l.edge_y);
+    float size = max(length(l.edge_x), length(l.edge_y));
+    if (!(size > 0.0) || !(length(n) > 0.0))
+        return false;
+    float3 z = normalize(n) * (1e-3 * size);
+    pl.linear = transpose(float3x3(x, y, z));
+    pl.scale = max(length(x), length(y));
+    return true;
+}
+
+// One thread per medium or light proxy job: its instance written over the proxy BLAS in
+// render space, or null-written once it is cleared. Runs beside `want`, so its charge is in
+// before the cutoff.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void proxy_write(uint3 id: SV_DispatchThreadID)
@@ -1035,10 +1067,20 @@ void proxy_write(uint3 id: SV_DispatchThreadID)
     uint index;
     if (!reserve(COUNTER_WRITES, t.write_capacity, 1, index))
         return;
-    MediumProxyGpu p = s.proxies[e];
     PtlasWrite w = (PtlasWrite)0;
-    w.instance_index = s.proxy_base + e;
     w.partition = PTLAS_GLOBAL_PARTITION;
+    if ((e & LIGHT_JOB) != 0)
+    {
+        uint light = e & ~LIGHT_JOB;
+        w.instance_index = s.light_base + light;
+        Placement pl;
+        if (light_placement(s.lights[light], pl))
+            w = instance_write(w.instance_index, global_partition(), pl, float3(-1.0), float3(1.0), root.proxy_blas, CLASS_LIGHT, MASK_LIGHT);
+        store((uint64_t)t.writes, index, w);
+        return;
+    }
+    MediumProxyGpu p = s.proxies[e];
+    w.instance_index = s.proxy_base + e;
     if ((p.flags & PROXY_LIVE) != 0)
     {
         Placement pl;

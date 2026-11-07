@@ -7,11 +7,18 @@
 //! light tiles, writes the scene's `SkyStats`, and resolves the scene's world cache. The
 //! selection blends emitted power with the light feedback of the scene's views in earlier
 //! frames: each pixel of a view dispatch names one of the lights that added to its path,
-//! chosen in proportion to what each added. Kernels reach the result through
-//! [`SceneLighting::light_set`], [`SceneLighting::world_cache`] and the Slang modules
-//! `orr_lighting.light_sampling`, `orr_lighting.world_cache`, `orr_lighting.environment` and
-//! `orr_lighting.media` (`DEP_ORR_LIGHTING_SHADER_DIRS`). Kernels that shade with the real-time
-//! OpenPBR BSDF import `orr_lighting.bsdf` and read [`BsdfTables`].
+//! chosen in proportion to what each added. An emissive entry is a list of clusters with a
+//! fixed-point CDF: a copy's cooked set at the cut its ray tracing holds, the clusters its
+//! traversal gathered for a cut built that frame, or a producer's emitted clusters. Light
+//! sampling draws a cluster by its step, a triangle uniform by index and a point uniform in it,
+//! from the triangle as rays trace it, and a BSDF ray that hits an emitter reads the same
+//! density from the same triangle, so the two techniques weigh each other exactly. Sphere and
+//! rect lights stand in the ray tracing as proxies that paths' BSDF rays meet. Kernels reach
+//! the result through [`SceneLighting::light_set`], [`SceneLighting::world_cache`] and the
+//! Slang modules `orr_lighting.light_sampling`, `orr_lighting.world_cache`,
+//! `orr_lighting.environment` and `orr_lighting.media` (`DEP_ORR_LIGHTING_SHADER_DIRS`).
+//! Kernels that shade with the real-time OpenPBR BSDF import `orr_lighting.bsdf` and read
+//! [`BsdfTables`].
 //!
 //! Each view, [`LightingView::begin`] settles the frame's history reset; after the view's
 //! raster half, [`LightingKernels::record_media`] fills the view's froxel volume with the

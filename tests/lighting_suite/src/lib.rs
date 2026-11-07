@@ -1,7 +1,8 @@
 //! Headless GPU tests of orr_lighting, on gpu_suite's device with validation on.
 
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use orr_gpu::{
     AddressMode, Allocation, DEFAULT_MEDIUM, Filter, Format, GpuPtr, Hazards, KernelSet,
@@ -10,8 +11,8 @@ use orr_gpu::{
 };
 use orr_lighting::{SceneLighting, SceneLightingSettings, ScenePass};
 use orr_scene::{
-    EnvironmentData, FrameDesc, FrameTime, LightGpu, MaterialWriter, RendererDesc, SceneCompute,
-    SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes,
+    EnvironmentData, FrameDesc, FrameTime, LightGpu, LoadState, Loading, MaterialWriter, MountId,
+    PackSource, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes,
 };
 
 pub use gpu_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -138,6 +139,34 @@ pub fn copy_back<T: bytemuck::Pod>(
     out
 }
 
+/// Threads lent to the loading side until dropped.
+pub(crate) struct Workers {
+    loading: Arc<Loading>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl Workers {
+    pub(crate) fn start(scenes: &Scenes) -> Self {
+        let loading = scenes.loading();
+        let threads = (0..2)
+            .map(|_| {
+                let l = Arc::clone(&loading);
+                std::thread::spawn(move || l.run_worker())
+            })
+            .collect();
+        Self { loading, threads }
+    }
+}
+
+impl Drop for Workers {
+    fn drop(&mut self) {
+        self.loading.stop_workers();
+        for t in self.threads.drain(..) {
+            t.join().unwrap();
+        }
+    }
+}
+
 type LinkedData = Box<dyn FnOnce(&mut SceneWriter<'_>)>;
 
 /// One orr_scene scene on the suite's device, driven a frame at a time.
@@ -152,6 +181,8 @@ pub struct TestScene {
     pub root: GpuPtr<SceneRoot>,
     /// The last frame run.
     pub frame: u64,
+    /// Loads mounts, from the first [`Self::mount`].
+    workers: Option<Workers>,
 }
 
 impl TestScene {
@@ -191,7 +222,26 @@ impl TestScene {
             linked: Some(Box::new(data)),
             root: GpuPtr::NULL,
             frame: 0,
+            workers: None,
         }
+    }
+
+    /// Mounts the pack `bytes`, running frames until it loads.
+    pub fn mount(&mut self, bytes: Arc<[u8]>) -> MountId {
+        if self.workers.is_none() {
+            self.workers = Some(Workers::start(&self.scenes));
+        }
+        let m = self.scenes.mount(PackSource::Memory(bytes));
+        let start = Instant::now();
+        while matches!(self.scenes.mount_state(m), LoadState::Pending) {
+            self.write(|_, _| {});
+            assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if let LoadState::Failed(e) = self.scenes.mount_state(m) {
+            panic!("mount failed: {e}");
+        }
+        m
     }
 
     /// Lighting for this scene with default settings, on the scene's kernels.

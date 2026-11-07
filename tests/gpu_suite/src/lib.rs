@@ -86,12 +86,25 @@ pub fn run_on_main_thread(tests: &[(&str, fn())]) {
 static DEVICE: OnceLock<Device> = OnceLock::new();
 
 /// The suite's device: every queue kind. `ORR_CAPTURE=1` creates it for an
-/// Nsight Graphics capture ([`Diagnostics::Capture`]).
+/// Nsight Graphics capture ([`Diagnostics::Capture`]). `ORR_DIAGNOSTICS=checkpoints` creates
+/// it with [`Diagnostics::Checkpoints`], so a device-lost report names the passes it was
+/// running, and `ORR_DIAGNOSTICS=aftermath` with [`Diagnostics::Aftermath`], writing crash
+/// dumps to the directory `ORR_AFTERMATH_DIR` names.
 pub fn device() -> &'static Device {
     let diagnostics = if std::env::var_os("ORR_CAPTURE").is_some_and(|v| v == "1") {
         Diagnostics::Capture
     } else {
-        Diagnostics::Off
+        match std::env::var("ORR_DIAGNOSTICS").as_deref() {
+            Ok("checkpoints") => Diagnostics::Checkpoints,
+            Ok("aftermath") => {
+                let dir = std::env::var_os("ORR_AFTERMATH_DIR")
+                    .expect("ORR_DIAGNOSTICS=aftermath needs ORR_AFTERMATH_DIR");
+                let dir: &'static std::path::Path = Box::leak(std::path::PathBuf::from(dir).into());
+                Diagnostics::Aftermath { dump_dir: dir }
+            }
+            Ok(other) => panic!("ORR_DIAGNOSTICS={other}: expected checkpoints or aftermath"),
+            Err(_) => Diagnostics::Off,
+        }
     };
     device_with(diagnostics)
 }

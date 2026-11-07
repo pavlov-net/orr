@@ -4,18 +4,20 @@
 //! as lights.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, BUMPY_FLOOR, Bed, EXTENT, FLOOR, FURNACE_RADIANCE, Item, MIRROR, NEAR,
-    Particle, ParticleLook, Paths, SKY, SMOOTH_FLOOR, SUN, Spec, TROUGH, assert_close, image_mean,
-    luminance, mean_where, pixel_of, reference, surface_mean,
+    Accumulated, Analytic, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD, EXTENT, FLOOR,
+    FURNACE_RADIANCE, GLASS_SPHERE, GLOSSY_FLOOR, Item, MIRROR, NEAR, Particle, ParticleLook,
+    Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec, TROUGH, assert_close,
+    image_mean, luminance, mean_where, pixel_of, reference, surface_mean,
 };
 use lighting_suite::shaders::origins;
+use lighting_suite::welch::assert_same_mean;
 use lighting_suite::{assert_clean, pipeline, readback, render, run, texture, upload};
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
     DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightingDebugView, PathEntry,
     ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting,
 };
-use orr_math::{Affine3, DVec3, Mat3, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, Vec2, Vec3};
 use orr_scene::{Opacity, RendererDesc};
 
 fn paths(settings: ViewLighting) -> Paths {
@@ -709,11 +711,12 @@ fn an_emissive_particle_lights_as_an_emitter_of_its_opacity() {
     assert_clean();
 }
 
-/// A quad with a back of its own lights the floor in front of it by both techniques, while only
-/// BSDF rays see its back, at full weight: light sampling reads the front, and so the emission of
-/// a back reaches the floor behind whatever it shows. A mirrored placement keeps the sides.
+/// A quad with a back of its own lights the floor on each side by both techniques: light
+/// sampling takes each side by its emission and reads what that side shows, and BSDF rays weigh
+/// what they meet against it, so a black back leaves the floor behind dark to both. A mirrored
+/// placement keeps the sides.
 #[test]
-fn light_sampling_reads_the_front_of_a_surface_with_a_back() {
+fn light_sampling_takes_each_side_of_a_surface_with_a_back() {
     let spec = Spec {
         copies: vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
         lights: Vec::new(),
@@ -752,11 +755,326 @@ fn light_sampling_reads_the_front_of_a_surface_with_a_back() {
         assert!(by_full[0][0] > 1.0, "the floor in front: {by_full:?}");
         assert_close("next-event in front", by_nee[0], by_full[0], 0.05);
         assert_close("BSDF in front", by_bsdf[0], by_full[0], 0.05);
-        assert_eq!(by_nee[1], [0.0; 3], "next-event behind");
+        assert_eq!(by_nee[1][0] > 1.0, back > 0.0, "next-event behind");
         assert_eq!(by_bsdf[1][0] > 1.0, back > 0.0, "BSDF behind");
         if back > 0.0 {
-            assert_close("behind", by_full[1], by_bsdf[1], 0.1);
+            assert_close("next-event behind", by_nee[1], by_full[1], 0.1);
+            assert_close("BSDF behind", by_bsdf[1], by_full[1], 0.1);
         }
     }
+    assert_clean();
+}
+
+/// Per-render means of green over the `2 half` square pixels around `at`, each of `frames`
+/// frames from its own seed.
+fn patch_means(
+    bed: &mut Bed,
+    paths: &Paths,
+    at: Vec2,
+    renders: u32,
+    frames: u32,
+    seed: u32,
+) -> Vec<f64> {
+    (0..renders)
+        .map(|k| render_paths(bed, paths, frames, seed * 1000 + k).around(at, 6)[1])
+        .collect()
+}
+
+/// The floor below `copy` seen from the side, lit by it alone.
+fn over_floor(floor: &'static str, copy: Item, lights: Vec<Light>) -> Spec {
+    Spec {
+        copies: vec![at(floor, Mat3::IDENTITY, Vec3::ZERO), copy],
+        lights,
+        environment: None,
+        eye: Vec3::new(0.0, 1.5, 4.0),
+        target: Vec3::new(0.0, 0.3, 0.0),
+        fov_y: 0.8,
+        focus: None,
+    }
+}
+
+/// A cooked emitter tilted and stretched unevenly over the floor lights it alike by next-event
+/// estimation and by BSDF rays, by Welch's test over renders: light sampling draws the copy's
+/// traced triangles at the density that hits on them read, and the light set names its entry.
+/// Under a coat and fuzz, next-event estimation passes the winner's light through them along
+/// its shadow ray, as BSDF rays see it; with an emission texture, it reads the texel at the uv
+/// of the point it draws, as the hit there does.
+#[test]
+fn a_cooked_emitter_lights_the_floor_alike_by_next_event_and_bsdf_rays() {
+    let linear = Mat3::from_rotation_x(-0.6) * Mat3::from_diagonal(Vec3::new(1.6, 1.0, 0.7));
+    for emitter in [EMITTER, COATED_EMITTER, QUADRANT_EMITTER] {
+        let spec = over_floor(
+            FLOOR,
+            at(emitter, linear, Vec3::new(0.0, 1.0, 0.0)),
+            Vec::new(),
+        );
+        let patch = pixel_of(&spec, Vec3::new(0.0, 0.0, 0.6));
+        let mut bed = Bed::with(spec);
+        let nee = patch_means(
+            &mut bed,
+            &paths(debug(LightingDebugView::NeeOnly, 1)),
+            patch,
+            16,
+            8,
+            1,
+        );
+        let stats = bed.lighting.stats(bed.last_frame()).unwrap();
+        assert_eq!(stats.emissive_entries, 1, "{emitter}: emissive entries");
+        let bsdf = patch_means(
+            &mut bed,
+            &paths(debug(LightingDebugView::BsdfOnly, 1)),
+            patch,
+            16,
+            32,
+            2,
+        );
+        let full = patch_means(&mut bed, &paths(reference(1)), patch, 16, 8, 3);
+        assert!(
+            nee.iter().sum::<f64>() > 0.0,
+            "{emitter}: next-event lit nothing"
+        );
+        assert_same_mean(&format!("{emitter}: next-event against BSDF"), &nee, &bsdf);
+        assert_same_mean(&format!("{emitter}: full against BSDF"), &full, &bsdf);
+    }
+    assert_clean();
+}
+
+/// Green of each of the `2 half` square pixels around `at`, row by row.
+fn patch_pixels(a: &Accumulated, at: Vec2, half: u32) -> Vec<f64> {
+    let w = EXTENT[0];
+    let (cx, cy) = (at.x.round() as u32, at.y.round() as u32);
+    (cy - half..cy + half)
+        .flat_map(|y| (cx - half..cx + half).map(move |x| (y * w + x) as usize))
+        .map(|i| f64::from(a.mean[i][1]))
+        .collect()
+}
+
+/// A skinned emitter bent off its rest pose lights the floor alike by next-event estimation and
+/// by BSDF rays: light sampling draws the triangles of the cut its skinned BLAS traces, as
+/// skinned, at the density hits on them read.
+#[test]
+fn a_skinned_emitter_off_its_rest_pose_lights_the_floor_alike_by_next_event_and_bsdf_rays() {
+    let spec = Spec {
+        copies: vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
+        lights: Vec::new(),
+        environment: None,
+        eye: Vec3::new(0.0, 1.5, 4.0),
+        target: Vec3::new(0.0, 0.3, 0.0),
+        fov_y: 0.8,
+        focus: None,
+    };
+    let patch = pixel_of(&spec, Vec3::new(0.3, 0.0, 0.4));
+    let mut bed = Bed::with(spec);
+    // The second joint turns the strip's +x half down toward the floor.
+    bed.add_skinned(
+        SKINNED_EMITTER,
+        Affine3::from_translation(Vec3::new(0.0, 0.8, 0.0)),
+        &[Affine3::IDENTITY, Affine3::from_rotation_z(-0.7)],
+    );
+    let nee = patch_means(
+        &mut bed,
+        &paths(debug(LightingDebugView::NeeOnly, 1)),
+        patch,
+        16,
+        8,
+        1,
+    );
+    let stats = bed.lighting.stats(bed.last_frame()).unwrap();
+    assert_eq!(stats.emissive_entries, 1, "emissive entries");
+    assert_ne!(
+        bed.skin_state(0).blas,
+        0,
+        "the strip traces no skinned BLAS"
+    );
+    let bsdf = patch_means(
+        &mut bed,
+        &paths(debug(LightingDebugView::BsdfOnly, 1)),
+        patch,
+        16,
+        32,
+        2,
+    );
+    assert!(nee.iter().sum::<f64>() > 0.0, "next-event lit nothing");
+    assert_same_mean("next-event against BSDF", &nee, &bsdf);
+    assert_clean();
+}
+
+/// A sparse field of small emitters close over the floor lights it alike by next-event
+/// estimation with and without the local samplers, which refine the field's tree toward the
+/// floor each tile sees, by the two weighed against BSDF rays, and by BSDF rays alone; the
+/// refinement lowers the variance of next-event estimation, as the nodes near a tile's surfaces
+/// carry most of its light.
+#[test]
+fn a_sparse_emitter_field_lights_alike_by_every_technique_and_refines_toward_the_floor() {
+    const RENDERS: u32 = 24;
+    const FRAMES: u32 = 2;
+    const WARM: u32 = 4;
+    let spec = over_floor(
+        FLOOR,
+        at(EMITTER_FIELD, Mat3::IDENTITY, Vec3::new(0.0, 0.4, 0.0)),
+        Vec::new(),
+    );
+    let patch = pixel_of(&spec, Vec3::new(0.0, 0.0, 1.5));
+    let mut bed = Bed::with(spec);
+    // Local samplers run outside the reference, on the light feedback of the frames before, so
+    // each technique's renders continue one view after a camera cut and frames that feed it.
+    let refined = ViewLighting {
+        debug_view: LightingDebugView::NeeOnly,
+        reference: None,
+        ..reference(1)
+    };
+    let flat = ViewLighting {
+        local_light_share: 0.0,
+        ..refined
+    };
+    let weighed = ViewLighting {
+        debug_view: LightingDebugView::DirectOnly,
+        ..refined
+    };
+    let mut continued = |settings: ViewLighting, seed: u32| -> Vec<Accumulated> {
+        let p = paths(settings);
+        render_paths(&mut bed, &p, WARM, seed);
+        (0..RENDERS)
+            .map(|k| {
+                let first = WARM + k * FRAMES;
+                bed.accumulate_on(first, FRAMES, seed, &mut |list, f| p.record(list, f))
+            })
+            .collect()
+    };
+    let by_refined = continued(refined, 1);
+    let by_flat = continued(flat, 2);
+    let by_weighed = continued(weighed, 3);
+    let means =
+        |a: &[Accumulated]| -> Vec<f64> { a.iter().map(|a| a.around(patch, 6)[1]).collect() };
+    let by_bsdf = patch_means(
+        &mut bed,
+        &paths(debug(LightingDebugView::BsdfOnly, 1)),
+        patch,
+        RENDERS,
+        16,
+        4,
+    );
+    assert!(by_bsdf.iter().sum::<f64>() > 0.0, "the field lit nothing");
+    assert_same_mean("refined against BSDF", &means(&by_refined), &by_bsdf);
+    assert_same_mean("flat against BSDF", &means(&by_flat), &by_bsdf);
+    assert_same_mean("weighed against BSDF", &means(&by_weighed), &by_bsdf);
+    // Each pixel's variance over the renders, pooled over the patch.
+    let variance = |a: &[Accumulated]| {
+        let pixels: Vec<Vec<f64>> = a.iter().map(|a| patch_pixels(a, patch, 6)).collect();
+        let n = pixels.len() as f64;
+        let mut pooled = 0.0;
+        for i in 0..pixels[0].len() {
+            let m = pixels.iter().map(|p| p[i]).sum::<f64>() / n;
+            pooled += pixels.iter().map(|p| (p[i] - m).powi(2)).sum::<f64>() / (n - 1.0);
+        }
+        pooled / pixels[0].len() as f64
+    };
+    let (vr, vf) = (variance(&by_refined), variance(&by_flat));
+    assert!(vr < vf, "refined variance {vr} against flat {vf}");
+    assert_clean();
+}
+
+/// A sphere light and a rect light over a glossy floor show in its reflection alike by
+/// next-event estimation and by BSDF rays, which meet the lights' proxies and weigh them against
+/// light sampling.
+#[test]
+fn sphere_and_rect_lights_reach_bsdf_rays_through_their_proxies() {
+    let lights = vec![
+        Light::Sphere {
+            position: DVec3::new(-0.6, 1.2, -0.5),
+            radius: 0.15,
+            intensity: Vec3::splat(40.0),
+            cone: None,
+        },
+        Light::Rect {
+            center: DVec3::new(0.6, 1.2, -0.5),
+            edge_x: Vec3::new(0.4, 0.0, 0.0),
+            edge_y: Vec3::new(0.0, 0.0, 0.3),
+            luminance: Vec3::splat(200.0),
+        },
+    ];
+    // The rect faces edge_x x edge_y: down.
+    let spec = Spec {
+        copies: vec![at(GLOSSY_FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
+        lights,
+        environment: None,
+        eye: Vec3::new(0.0, 1.0, 3.0),
+        target: Vec3::new(0.0, 0.0, 0.0),
+        fov_y: 0.8,
+        focus: None,
+    };
+    let mut bed = Bed::with(spec.clone());
+    for (what, under) in [
+        ("sphere", Vec3::new(-0.6, 0.0, 0.2)),
+        ("rect", Vec3::new(0.6, 0.0, 0.2)),
+    ] {
+        let patch = pixel_of(&spec, under);
+        let nee = patch_means(
+            &mut bed,
+            &paths(debug(LightingDebugView::NeeOnly, 1)),
+            patch,
+            16,
+            8,
+            1,
+        );
+        let bsdf = patch_means(
+            &mut bed,
+            &paths(debug(LightingDebugView::BsdfOnly, 1)),
+            patch,
+            16,
+            16,
+            2,
+        );
+        let full = patch_means(&mut bed, &paths(reference(1)), patch, 16, 8, 3);
+        assert!(
+            bsdf.iter().sum::<f64>() > 0.0,
+            "{what}: BSDF rays met no light"
+        );
+        assert_same_mean(&format!("{what}: next-event against BSDF"), &nee, &bsdf);
+        assert_same_mean(&format!("{what}: full against BSDF"), &full, &bsdf);
+    }
+    assert_clean();
+}
+
+/// A sphere light behind a glass sphere lights the glossy floor below alike by the full
+/// estimator and by BSDF rays alone: rays bent through the glass meet the light's proxy, and
+/// what reaches the floor through the glass is owned once.
+#[test]
+#[ignore = "shadow rays cross solid glass unbent until they end at it, so next-event estimation counts light the bent BSDF rays also find"]
+fn a_sphere_light_behind_glass_lights_a_glossy_floor_alike_by_full_and_bsdf_rays() {
+    let spec = Spec {
+        copies: vec![
+            at(GLOSSY_FLOOR, Mat3::IDENTITY, Vec3::ZERO),
+            at(
+                GLASS_SPHERE,
+                Mat3::from_diagonal(Vec3::splat(0.3)),
+                Vec3::new(0.0, 0.6, 0.0),
+            ),
+        ],
+        lights: vec![Light::Sphere {
+            position: DVec3::new(0.0, 1.5, 0.0),
+            radius: 0.12,
+            intensity: Vec3::splat(60.0),
+            cone: None,
+        }],
+        environment: None,
+        eye: Vec3::new(0.0, 1.2, 2.5),
+        target: Vec3::new(0.0, 0.2, 0.0),
+        fov_y: 0.8,
+        focus: None,
+    };
+    let patch = pixel_of(&spec, Vec3::new(0.0, 0.0, 0.3));
+    let mut bed = Bed::with(spec);
+    let full = patch_means(&mut bed, &paths(reference(3)), patch, 16, 16, 1);
+    let bsdf = patch_means(
+        &mut bed,
+        &paths(debug(LightingDebugView::BsdfOnly, 3)),
+        patch,
+        16,
+        64,
+        2,
+    );
+    assert!(bsdf.iter().sum::<f64>() > 0.0, "BSDF rays met no light");
+    assert_same_mean("full against BSDF", &full, &bsdf);
     assert_clean();
 }

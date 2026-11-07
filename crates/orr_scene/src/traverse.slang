@@ -23,6 +23,7 @@ import orr_shaders.trace;
 import orr_pack.mesh;
 import orr_gpu.rtas;
 import orr_scene.hit;
+import orr_scene.lights;
 import orr_scene.tables;
 
 // `TraverseRoot.flags`.
@@ -345,6 +346,10 @@ void init(uint3 id: SV_DispatchThreadID)
     // The copy's nearer chain step; a step past the first traces a cached cut of its model.
     uint near = chain_near(st);
     InstanceGpu inst = step_record(s, s.instances[slot], near);
+    // `gather` lists the emissive clusters of a cut built this frame anew.
+    InstanceGpu base = s.instances[slot];
+    for (uint k = 0; base.first_emissive != NO_EMISSIVE && k < base.emissive_count; k++)
+        s.emissive[base.first_emissive + k].gathered = 0;
     Placement p;
     if (inst.flags == 0 || !focus_placement(s, inst, p))
     {
@@ -428,11 +433,12 @@ void init(uint3 id: SV_DispatchThreadID)
         return;
     }
 
-    // DAG: copies posed in ray tracing and steps past the first trace cached cuts; distant
-    // ones their model's merged cut; the rest a cut gathered here. An edit's copies always
-    // gather: cached cuts hold unedited CLAS. Past the frame's budget they go untraced, their
-    // one cached cut holding no BLAS.
-    bool cached = (st.rt_flags & RT_ANIMATED) != 0 || near > 0;
+    // DAG: copies posed in ray tracing and steps past the first trace cached cuts, as do
+    // copies of a mesh whose cuts can hold more clusters of an emissive section than a gathered
+    // list keeps; distant ones their model's merged cut; the rest a cut gathered here. An
+    // edit's copies always gather: cached cuts hold unedited CLAS. Past the frame's budget
+    // they go untraced, their one cached cut holding no BLAS.
+    bool cached = (st.rt_flags & RT_ANIMATED) != 0 || near > 0 || mesh.emissive.cached != 0;
     bool distant = has_focus() && radius * root.focus_offset.w / max(distance, FOCUS_NEAR) < root.merge_pixels;
     bool gather = ray && (mesh.edit != nullptr || (!cached && (!distant || l.level >= 0)));
     if (ray && !cached && !gather)
@@ -1109,7 +1115,25 @@ void prepare(uint3 id: SV_DispatchThreadID)
     a[2] = 1;
 }
 
-// One thread per gathered cluster: its CLAS address into the BLAS its slot builds.
+// Adds mesh cluster `mesh_cluster` of a slot tracing a cut built this frame to the gathered
+// list of its section's emissive entry, if it has one.
+void gather_emissive(SceneRoot* s, InstanceGpu inst, MeshGpu* mesh, uint mesh_cluster)
+{
+    if (mesh.emissive.count == 0 || inst.first_emissive == NO_EMISSIVE || mesh.edit != nullptr)
+        return;
+    ClusterRef r = s.clusters[mesh.cluster_base + mesh_cluster];
+    uint rank = mesh.emissive.ranks[load_cluster(r.page, r.local).section];
+    if (rank >= inst.emissive_count)
+        return;
+    uint entry = inst.first_emissive + rank;
+    uint at;
+    InterlockedAdd(s.emissive[entry].gathered, 1, at);
+    if (at < GATHERED_CLUSTERS)
+        gathered_list(s.emissive_lists, entry - s.producer_capacity)[at] = mesh_cluster;
+}
+
+// One thread per gathered cluster: its CLAS address into the BLAS its slot builds, and its
+// place in the gathered list of its emissive entry for every slot tracing a built cut.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void gather(uint3 id: SV_DispatchThreadID)
@@ -1121,11 +1145,14 @@ void gather(uint3 id: SV_DispatchThreadID)
     uint2 e = cut.entries[id.x];
     uint slot = e.x & ~WORK_RETRY;
     SlotCutGpu c = cut.slots[slot];
-    if ((c.flags & CUT_OWNER) == 0)
-        return;
     if (!entry_current(e, c))
         return;
-    MeshGpu* mesh = s.meshes + s.models[s.instances[slot].model].mesh;
+    InstanceGpu inst = s.instances[slot];
+    MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
+    if (c.rt_cut == RT_CUT_BUILT)
+        gather_emissive(s, inst, mesh, e.y);
+    if ((c.flags & CUT_OWNER) == 0)
+        return;
     uint k;
     uint first = c.rt_first;
     uint count = c.rt_count;

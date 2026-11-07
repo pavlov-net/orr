@@ -35,6 +35,7 @@ use crate::edit::{
     self, ClasInputs, EDIT_SPHERES, EditBatch, EditClas, EditDesc, EditDone, EditId, EditLoaded,
     EditRecorder, EditRef, EditSkin, EditSource, EditTables, EditTablesDesc, EditTask, Mirror,
 };
+use crate::lights::GATHERED_CLUSTERS;
 use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored};
 use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler};
 use crate::medium_proxy::VolumeRef;
@@ -122,6 +123,9 @@ struct PlacedMesh {
     header: MeshHeader,
     /// The ranks of its emissive and caster sets.
     ranks: [u32; 2],
+    /// Whether copies of the mesh trace cached cuts for each purpose's sets: a cut can hold more
+    /// clusters of one section than a gathered list keeps.
+    cached_only: [bool; 2],
     /// Discrete levels, finest first: error and mesh cluster range.
     level_ranges: Vec<(f32, u32, u32)>,
     /// Every cluster by mesh cluster index, as its page decoded.
@@ -1029,6 +1033,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             sections: info.sections.len() as u32,
             header,
             ranks: [info.emissive.rank_count(), info.casters.rank_count()],
+            cached_only: [&info.emissive, &info.casters].map(|t| t.widest > GATHERED_CLUSTERS),
             level_ranges,
             clusters: absent,
             micromaps: vec![None; info.pages.len()],
@@ -1564,7 +1569,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 // SAFETY: a table of blob 0, resident in the mount's block.
                 unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(m.info + u64::from(span.first))) }
             };
-            let sets = |s: orr_pack::mesh::SetSpans, count: u32| SetTablesGpu {
+            let sets = |s: orr_pack::mesh::SetSpans, count: u32, cached: bool| SetTablesGpu {
                 sets: table(s.sets).cast(),
                 ranks: table(s.ranks).cast(),
                 clusters: table(s.clusters).cast(),
@@ -1572,7 +1577,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 index: table(s.index).cast(),
                 nodes: table(s.nodes).cast(),
                 count,
-                _pad: 0,
+                cached: u32::from(cached),
             };
             ResolvedMesh {
                 id: m.id,
@@ -1622,8 +1627,8 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                         section_count: m.sections,
                         opaque_sections: m.header.opaque_sections,
                         layer_sections: m.header.layer_sections,
-                        emissive: sets(m.header.emissive, m.ranks[0]),
-                        casters: sets(m.header.casters, m.ranks[1]),
+                        emissive: sets(m.header.emissive, m.ranks[0], m.cached_only[0]),
+                        casters: sets(m.header.casters, m.ranks[1], m.cached_only[1]),
                     }
                 },
                 page_addresses,
@@ -3525,6 +3530,7 @@ impl Mounts {
                     clusters: mesh.gpu.cluster_count,
                 }),
                 emissive_sections: mesh.gpu.emissive.count,
+                emissive_stride: mesh.gpu.emissive.count,
                 cage_only: false,
                 edit: false,
             };

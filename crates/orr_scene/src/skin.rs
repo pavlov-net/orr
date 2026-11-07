@@ -81,6 +81,7 @@ pub(crate) fn mesh_table(
     }
     cut_first.push(clusters.len() as u32);
     let errors: Vec<f32> = cuts.iter().map(|c| c.error).collect();
+    let rows: Vec<u32> = cuts.iter().map(|c| c.row).collect();
     let mut templates = templates.to_vec();
     templates.resize(m.clusters.len(), 0);
 
@@ -91,6 +92,7 @@ pub(crate) fn mesh_table(
         put(&mut bytes, &clusters),
         put(&mut bytes, &cut_first),
         put(&mut bytes, &errors),
+        put(&mut bytes, &rows),
     ];
     let mut block =
         device.gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, "skin table")?;
@@ -101,6 +103,7 @@ pub(crate) fn mesh_table(
         cut_clusters: base.offset(at[2]).cast(),
         cut_first: base.offset(at[3]).cast(),
         cut_error: base.offset(at[4]).cast(),
+        cut_row: base.offset(at[5]).cast(),
         cut_count: cuts.len() as u32,
         vertex_count: total,
         bound: m

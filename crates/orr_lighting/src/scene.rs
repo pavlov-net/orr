@@ -32,9 +32,10 @@ pub struct SceneLightingSettings {
     /// Meters from the eye that every view's froxel volume covers; linked environments that
     /// march from it are built with the same value.
     pub near_range: f32,
-    /// Emissive clusters the scene's light selection holds per frame. Emitting entries past
-    /// it are left out of next-event estimation (counted in [`LightingStats`]); BSDF hits
-    /// still see them.
+    /// Producer entries' emitted clusters the scene's light selection holds per frame;
+    /// instance entries read their copies' cooked sets and gathered lists in place. Emitting
+    /// producer entries past it are left out of next-event estimation (counted in
+    /// [`LightingStats`]); BSDF hits still see them, at full weight.
     pub emissive_clusters: u32,
     /// Share of the light selection placed by where the views' pixels found their light in
     /// earlier frames, the rest by emitted power; in [0, 1). 0 selects by power alone.
@@ -105,7 +106,7 @@ pub struct LightingStats {
     pub local_lights: u32,
     /// Emissive entries next-event estimation can pick.
     pub emissive_entries: u32,
-    /// Clusters in those entries' cluster CDFs.
+    /// Clusters in those entries' lists.
     pub emissive_clusters: u32,
     /// Emitting entries left out because `SceneLightingSettings::emissive_clusters` was full.
     pub dropped_entries: u32,
@@ -174,7 +175,7 @@ pub struct SceneLighting {
     cdf: Allocation<f32>,
     light_probability: Allocation<f32>,
     emissive: Allocation<EmissiveSelection>,
-    cluster_cdf: Allocation<f32>,
+    cluster_cdf: Allocation<u32>,
     tiles: Allocation<LightSample>,
     feedback_counts: Allocation<u32>,
     feedback_weights: Allocation<f32>,
@@ -264,7 +265,7 @@ impl SceneLighting {
         &self.device
     }
 
-    /// A change of `emissive_clusters` reallocates the cluster pool, and a change of
+    /// A change of `emissive_clusters` reallocates the producer cluster pool, and a change of
     /// `world_cache` reallocates and clears the cache; old buffers are freed once the work
     /// submitted so far has completed.
     pub fn set_settings(&mut self, settings: &SceneLightingSettings) -> Result<(), Error> {

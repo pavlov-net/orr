@@ -12,6 +12,7 @@ import orr_shaders.abi;
 public static const uint MASK_OPAQUE = 0x01;     // opaque and alpha-tested geometry
 public static const uint MASK_PARTICLE = 0x02;   // particle batches
 public static const uint MASK_MEDIUM = 0x04;     // medium proxies (AABBs)
+public static const uint MASK_LIGHT = 0x08;      // sphere and rect light proxies (AABBs)
 public static const uint MASK_DIELECTRIC = 0x80; // dielectric and presence surfaces
 
 // Candidate classes. Cluster geometry holds its class in the geometry index, per cluster, under an
@@ -22,6 +23,7 @@ public static const uint CLASS_DIELECTRIC = 1;
 public static const uint CLASS_PRESENCE = 2;
 public static const uint CLASS_PARTICLE = 3;
 public static const uint CLASS_MEDIUM = 4;
+public static const uint CLASS_LIGHT = 5;
 
 // The class of a candidate or hit from its instance's custom index and its geometry index.
 public uint class_of(uint custom_index, uint geometry_index)
@@ -43,6 +45,8 @@ public uint class_mask(uint class_id)
         return MASK_PARTICLE;
     case CLASS_MEDIUM:
         return MASK_MEDIUM;
+    case CLASS_LIGHT:
+        return MASK_LIGHT;
     default:
         return 0xff;
     }
@@ -121,9 +125,11 @@ public interface ICandidate
 // order in front of the hit; other candidates commit or not through `accept`.
 public interface ITranslucent : IAnyHit
 {
-    // A translucent layer: premultiplied radiance in rgb, coverage in a. Coverage 0 means
-    // the candidate is not a layer and goes to `accept`.
-    float4 layer(Candidate c);
+    // A translucent layer: premultiplied radiance in rgb, coverage in a; coverage 0 with
+    // radiance above 0 is a layer that only emits. A procedural candidate's layer sets its
+    // distance in `c.t`. All zero means the candidate is not a layer: a triangle goes to
+    // `accept`, and a procedural candidate is never committed.
+    float4 layer(inout Candidate c);
 }
 
 // The closest hit, with non-opaque triangle candidates committed where `any_hit` accepts
@@ -216,10 +222,11 @@ public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint m
 public static const uint TRANSLUCENT_BINS = 4;
 
 // The closest hit as `trace_closest`, and the translucent layers in front of it composited
-// into `layers` (premultiplied radiance in rgb, total coverage in a). The nearest
-// `TRANSLUCENT_BINS` layers composite in depth order, later ones in arrival order behind
-// them; the arrival-order tail is dropped only when all of it lies behind the hit. At most
-// `max_candidates` candidates are visited.
+// into `layers` (premultiplied radiance in rgb, total coverage in a), procedural candidates
+// among them. The nearest `TRANSLUCENT_BINS` layers composite in depth order, later ones in
+// arrival order behind them; the arrival-order tail is dropped only when all of it lies
+// behind the hit, so a ray that holds every opaque hit out with `TMax` keeps none behind
+// one. At most `max_candidates` candidates are visited.
 [ForceInline]
 public Hit trace_resolve_translucent<H : ITranslucent>(Tlas tlas, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, out float4 layers)
 {
@@ -283,13 +290,11 @@ Hit translucent<H : ITranslucent>(Tlas tlas, RayDesc ray, uint mask, uint flags,
             q.CommitNonOpaqueTriangleHit();
             continue;
         }
-        if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
-            continue;
         Candidate c = candidate(q);
-        if (!takes(c, mask))
+        if (c.triangle && !takes(c, mask))
             continue;
         float4 layer = handler.layer(c);
-        if (layer.a > 0)
+        if (any(layer != 0))
         {
             // Insert in depth order; whatever falls off the last bin joins the tail.
             float t = c.t;
@@ -305,13 +310,13 @@ Hit translucent<H : ITranslucent>(Tlas tlas, RayDesc ray, uint mask, uint flags,
                     t = d;
                 }
             }
-            if (layer.a > 0)
+            if (any(layer != 0))
             {
                 tail = over(tail, layer);
                 tail_near = min(tail_near, t);
             }
         }
-        else if (handler.accept(c))
+        else if (c.triangle && handler.accept(c))
         {
             q.CommitNonOpaqueTriangleHit();
         }

@@ -12,12 +12,14 @@ import orr_shaders.math;
 import orr_color.luminance;
 import orr_shaders.packing;
 import orr_shaders.random;
+import orr_pack.mesh;
 import orr_scene.hit;
 import orr_scene.lights;
 import orr_scene.material;
 import orr_scene.producer;
 import orr_scene.tables;
 import orr_scene.view;
+import orr_lighting.bsdf;
 import orr_lighting.media;
 import orr_lighting.environment;
 
@@ -40,8 +42,16 @@ public static const float ENVIRONMENT_SHARE = 0.25;
 public static const float FEEDBACK_HISTORY = 0.5;
 // Pixels per side of the screen tiles that share one local sampler.
 public static const uint LOCAL_TILE = 16;
-// Lights one local sampler holds.
-public static const uint LOCAL_LIGHTS = 8;
+// Slots one local sampler holds.
+public static const uint LOCAL_LIGHTS = 32;
+
+// The offset in pixels of the local samplers' tile grid in path frame `frame`: the grid moves
+// each frame, so the edges between tiles' samplers fall somewhere new.
+public uint2 local_tile_offset(uint frame)
+{
+    uint h = pcg(frame ^ 0x6c6f6361u);
+    return uint2(h, h >> 8) % LOCAL_TILE;
+}
 
 // `LightSample` kinds (bits 0-1), and the kind of a directional candidate.
 public static const uint LIGHT_SAMPLE_ENVIRONMENT = 0;
@@ -51,6 +61,9 @@ public static const uint LIGHT_SAMPLE_EMISSIVE = 3;
 public static const uint LIGHT_SAMPLE_DIRECTIONAL = 4;
 // `LightSample.bits`: the light emits from both faces.
 public static const uint LIGHT_SAMPLE_TWO_SIDED = 4;
+// `LightSample.bits`: the emissive sample's side has a coat or fuzz, which the radiance seen
+// along the shadow ray passes through (`emitter_view_layer`).
+public static const uint LIGHT_SAMPLE_VIEW = 8;
 
 // What lighting's scene pass derives per directional light each frame.
 public struct DirectionalState
@@ -70,26 +83,39 @@ public struct DirectionalState
     public float _pad2;
 }
 
-// Selection state of one emissive list entry.
+// Selection state of one emissive list entry: its list of clusters, in the order of its
+// cooked set's tree for an instance entry, with a fixed-point CDF over them.
 public struct EmissiveSelection
 {
     // Probability that a tile sample comes from this entry.
     public float probability;
-    // The entry's cluster CDF: `count` values from `LightSetGpu.cluster_cdf[first]`,
-    // inclusive sums of luminance x area per cluster, ending at `total`.
-    public uint first;
+    // Positions in its list; 0 for none.
     public uint count;
-    public float total;
+    // Nodes of its cooked set's tree; 0 without one.
+    public uint node_count;
+    public uint _pad;
+    // Per position: the inclusive sum of the weights in fixed point, the last 0xffffffff. A
+    // position's probability is its step over 0xffffffff; a step of 0 is never drawn.
+    public uint* cdf;
+    // Per position: an instance entry's mesh cluster; null for a producer entry, whose
+    // position is the cluster's index in its batch.
+    public uint* clusters;
+    // A cooked set's (mesh cluster, position), ascending by cluster; null for a gathered list,
+    // which hits search in `clusters`.
+    public uint2* index;
+    // The cooked set's SetNode heap, mesh space.
+    public uint8_t* nodes;
 }
 
-// One presampled light sample, 32 B, in render space. Its density includes the selection
+// One presampled light sample, 40 B, in render space. Its density includes the selection
 // probability: per m² of the light for rect and emissive samples, per sr (stored negated)
 // for the environment; a sphere sample holds the sphere, whose point is drawn at resolve.
 public struct LightSample
 {
     // Environment: unit direction. Sphere: center. Rect, emissive: a point on the light.
     public float3 point;
-    // Octahedral 2x16 snorm: the surface normal (rect, emissive) or spot axis (sphere).
+    // Octahedral 2x16 snorm: the normal of the side that emits (rect, emissive) or the spot
+    // axis (sphere).
     public uint normal;
     // Emitted radiance, nits: shared-exponent rgb (`pack_rgb9e5`), times 2^(bits 8-15 - 128).
     public uint radiance;
@@ -98,9 +124,13 @@ public struct LightSample
     public float pdf;
     // The light's feedback id (`feedback_environment`).
     public uint light;
-    // Bits 0-1: LIGHT_SAMPLE_*. Bit 2: LIGHT_SAMPLE_TWO_SIDED. Bits 8-15: the radiance
-    // exponent + 128. Bits 16-31: the sphere radius, half float.
+    // Bits 0-1: LIGHT_SAMPLE_*. Bit 2: LIGHT_SAMPLE_TWO_SIDED. Bit 3: LIGHT_SAMPLE_VIEW.
+    // Bits 8-15: the radiance exponent + 128. Bits 16-31: the sphere radius, half float.
     public uint bits;
+    // Emissive: the position drawn in its entry's list; 0 for other lights.
+    public uint position;
+    // Emissive: the triangle drawn in the position's cluster; 0 for other lights.
+    public uint triangle;
 }
 
 // The scene's light set as lighting's scene pass leaves it each frame.
@@ -119,7 +149,8 @@ public struct LightSetGpu
     public float* light_probability;
     // By emissive list entry.
     public EmissiveSelection* emissive;
-    public float* cluster_cdf;
+    // The producer entries' lists' CDFs.
+    public uint* cluster_cdf;
     public LightSample* tiles;
     // Per feedback id, the pixels whose feedback named it this frame; the next scene pass
     // reads and clears them.
@@ -136,7 +167,8 @@ public struct LightSetGpu
     // rgb: the summed `focus_illuminance` of every directional light.
     public float4 directional_illuminance;
     public uint frame;
-    public uint _pad0;
+    // Sphere and rect lights with non-zero power: paths' BSDF rays look for their proxies.
+    public uint local_lights;
     public uint _pad1;
     public uint _pad2;
 }
@@ -152,7 +184,7 @@ public struct LightSetStats
     public uint emissive_entries;
     // Clusters in their CDFs.
     public uint emissive_clusters;
-    // Emitting entries left out of the selection because the cluster pool was full.
+    // Emitting producer entries left out of the selection because the cluster pool was full.
     public uint dropped_entries;
     public float environment_probability;
     // Pixels whose feedback named a light in the frame before.
@@ -161,18 +193,38 @@ public struct LightSetStats
     public uint shadow_overflows;
 }
 
-// The lights that fed back in one screen tile of a view in its last frame, as a selection.
+// One slot of a local sampler: a light that fed back in its tile, or for an emissive entry a
+// range of its list's positions, and the probability of drawing it.
+public struct LocalLight
+{
+    // Feedback id.
+    public uint id;
+    // An emissive entry's positions `first`..`first + count`; 0 and 1 for other lights.
+    public uint first;
+    public uint count;
+    // Inclusive fixed-point sum over the slots, the last 0xffffffff.
+    public uint cdf;
+    // The slot's probability over the probability the light's own distribution gives its
+    // range: what a point's density in the light takes for the slot's.
+    public float gain;
+}
+
+// The lights that fed back in one screen tile of a view in its last frame, as a selection,
+// refined toward the tile's surfaces where an entry's cooked set has a tree.
 public struct LocalLights
 {
-    // Feedback ids.
-    public uint ids[LOCAL_LIGHTS];
-    // Inclusive sums of the pixels that named each.
-    public float cdf[LOCAL_LIGHTS];
+    // Sorted by light, then first position.
+    public LocalLight lights[LOCAL_LIGHTS];
     public uint count;
     // Probability that a tile-light candidate of the tile's first vertices comes from here.
     public float share;
     public uint _pad0;
     public uint _pad1;
+    // The tile's surfaces this frame: a sphere around their points (render space, radius in w;
+    // radius below 0 for none) and a cone around their normals (axis, cosine of its half
+    // angle in w).
+    public float4 receiver;
+    public float4 normal;
 }
 
 // A receiver of next-event estimation.
@@ -208,6 +260,14 @@ public struct ResolvedLightSample
     // LIGHT_SAMPLE_DIRECTIONAL: the light's LightId; otherwise its feedback id, or NO_LIGHT
     // without a candidate.
     public uint light;
+    // Emissive: the position in its entry's list and the triangle in its cluster; 0 for
+    // other lights.
+    public uint position;
+    public uint triangle;
+    // Emissive: LIGHT_SAMPLE_VIEW, the radiance not yet through the side's coat and fuzz.
+    public bool view;
+    // Rect, sphere, emissive: the point on the light, render space.
+    public float3 point;
 }
 
 // Root of the scene pass over directional lights.
@@ -570,6 +630,8 @@ LightSample light_sample(uint kind, uint light, float3 point, float3 normal, flo
     s.pdf = pdf;
     s.light = light;
     s.bits = kind | (r.y << 8);
+    s.position = 0;
+    s.triangle = 0;
     return s;
 }
 
@@ -584,159 +646,316 @@ float spot_falloff(float c, float cos_inner, float cos_outer)
     return smoothstep(cos_outer, cos_inner, c);
 }
 
-// Producer entry `entry`'s transform: the anchor of its group in render space and its
-// [R | t] relative to that anchor. False when its group hides it.
-public bool producer_transform(SceneRoot* s, uint entry, out float3 anchor, out float3x4 m)
-{
-    ProducerGpu p = s.producers[entry];
-    GroupGpu* g = s.groups + p.group;
-    anchor = float3(0.0);
-    m = float3x4(0.0);
-    if (g.current == nullptr || p.group_index >= g.count)
-        return false;
-    m = group_transform(g, p.group_index);
-    anchor = view_relative(g.anchor_cell, g.anchor_offset, s.origin_cell.xyz, float3(0.0),
-                           uint(s.origin_cell.w));
-    return true;
-}
-
-// The material of producer cluster `k`, or null when its index is out of range.
-public MaterialGpu* cluster_material(SceneRoot* s, ProducerGpu p, ProducerClusterGpu k)
-{
-    if (k.material >= p.material_count)
-        return nullptr;
-    return s.materials + p.materials[k.material];
-}
-
-// The unit front-face normal of triangle p0 p1 p2 under `m`, with its area. Taken from
-// transformed edges, so it keeps its precision far from the render origin, and at unit size,
-// since a small transform's cross product underflows first.
-public float3 transformed_normal(float3x4 m, float3 p0, float3 p1, float3 p2, out float area)
-{
-    float3 e1 = mul(m, float4(p1 - p0, 0.0));
-    float3 e2 = mul(m, float4(p2 - p0, 0.0));
-    float size = unit_factor(max(abs(e1), abs(e2)));
-    float3 n = cross(e1 * size, e2 * size);
-    area = 0.5 * unit_length(n) / size / size;
-    return unit_direction(n) * linear_mirror(float3x3(m[0].xyz, m[1].xyz, m[2].xyz));
-}
-
-// Render-space position of `p` under producer transform `anchor`, `m`.
-public float3 render_point(float3 anchor, float3x4 m, float3 p)
-{
-    return anchor + mul(m, float4(p, 1.0));
-}
-
-// Render-space area of producer cluster `k` under `m`.
-float cluster_area(ProducerBatch b, ProducerClusterGpu k, float3x4 m)
-{
-    float area = 0.0;
-    for (uint i = 0; i < k.tri_count; i++)
-    {
-        float3 p0, p1, p2;
-        cluster_triangle(b, k, i, p0, p1, p2);
-        float a;
-        transformed_normal(m, p0, p1, p2, a);
-        area += a;
-    }
-    return area;
-}
-
-// Luminance x render-space area of cluster `c` of producer entry `entry`'s batch.
-public float producer_cluster_weight(SceneRoot* s, uint entry, uint c)
-{
-    float3 anchor;
-    float3x4 m;
-    if (!producer_transform(s, entry, anchor, m))
-        return 0.0;
-    ProducerBatch b = s.batches[entry];
-    ProducerClusterGpu k = b.clusters[c];
-    MaterialGpu* mat = cluster_material(s, s.producers[entry], k);
-    if (mat == nullptr)
-        return 0.0;
-    float y = luminance_rec2020(material_light_emission(mat));
-    return y > 0.0 ? y * cluster_area(b, k, m) : 0.0;
-}
-
 // `x` x `total`, kept below `total`.
 float below(float x, float total)
 {
     return min(x * total, asfloat(asuint(total) - 1));
 }
 
-// Density per m² of tile samples on emissive entry `entry` at a surface emitting
-// `luminance` nits.
-public float emissive_area_pdf(LightSetGpu* set, uint entry, float luminance)
+// Luminance x render-space area of cluster `c` of producer entry `entry`'s batch, both sides of
+// a surface with a back emitting; 0 where its group hides it. It weighs selection alone, so it
+// reads positions and the entry's transform only.
+public float producer_cluster_weight(SceneRoot* s, uint entry, uint c)
 {
-    EmissiveSelection e = set.emissive[entry];
-    return e.total > 0.0 ? e.probability * luminance / e.total : 0.0;
+    ProducerGpu p = s.producers[entry];
+    ProducerBatch b = s.batches[entry];
+    ProducerClusterGpu k = b.clusters[c];
+    uint material = producer_material(p, k);
+    Placement pl;
+    if (material == MATERIAL_NONE || !producer_placement(s, p, false, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))
+        return 0.0;
+    float y = luminance_rec2020(side_light_emission(s, material, false) + side_light_emission(s, material, true));
+    if (!(y > 0.0))
+        return 0.0;
+    float area = 0.0;
+    for (uint i = 0; i < k.tri_count; i++)
+    {
+        float3 p0, p1, p2;
+        cluster_triangle(b, k, i, p0, p1, p2);
+        float3 e1 = mul(pl.linear, p1 - p0);
+        float3 e2 = mul(pl.linear, p2 - p0);
+        float size = unit_factor(max(abs(e1), abs(e2)));
+        area += 0.5 * unit_length(cross(e1 * size, e2 * size)) / size / size;
+    }
+    return y * area;
 }
 
-// Sample of emissive entry `entry` from `u`, the entry chosen with `probability`: a cluster
-// by its CDF, a triangle by area and a point uniform in the triangle. A triangle's front
-// face winds counter-clockwise, and a material with a back of its own lights from the front
-// alone, the side this reads. Selection follows the material's factor, so the density is the
-// factor's, and the sample carries what a ray sees at the point: what the surface emits, in the
-// share a presence layer shows there, and none where an alpha test leaves a hole. Traversal
-// takes opaque entries' triangles whole, so no test applies to them.
-LightSample emissive_sample(LightSetGpu* set, uint entry, float4 u, float probability)
+// What section material `material` emits per channel on its front, or with `back` from a back
+// of its own, and none from a back without one. Light sampling takes the back of a
+// double-sided surface without one from its front (`LIGHT_SAMPLE_TWO_SIDED`).
+public float3 side_light_emission(SceneRoot* s, uint material, bool back)
+{
+    MaterialGpu* m = s.materials + material;
+    if (!back)
+        return material_light_emission(m);
+    if ((m.flags & MATERIAL_HAS_BACK) != 0)
+        return material_light_emission(s.materials + m.back);
+    return float3(0.0);
+}
+
+// Probability that light sampling takes the side of section material `material` that `back`
+// names: 1 for its front unless it has a back of its own, whose sides it takes by their
+// emission's luminance.
+public float side_probability(SceneRoot* s, uint material, bool back)
+{
+    MaterialGpu* m = s.materials + material;
+    if ((m.flags & MATERIAL_HAS_BACK) == 0)
+        return back ? 0.0 : 1.0;
+    float f = luminance_rec2020(side_light_emission(s, material, false));
+    float b = luminance_rec2020(side_light_emission(s, material, true));
+    if (!(f + b > 0.0))
+        return 0.0;
+    return (back ? b : f) / (f + b);
+}
+
+// Probability of position `p` of an entry's list among all of it: its fixed-point step.
+public float list_step(EmissiveSelection e, uint p)
+{
+    return float(range_mass(e, p, 1)) / 4294967295.0;
+}
+
+// The mass of positions `first`..`first + count` of an entry's list, fixed point.
+public uint range_mass(EmissiveSelection e, uint first, uint count)
+{
+    return e.cdf[first + count - 1] - (first > 0 ? e.cdf[first - 1] : 0u);
+}
+
+// The PTLAS instance and cluster id that rays meet position `p` of emissive entry `entry`
+// on, its triangle count and, on a copy, its first alpha-tested triangle. A copy's cluster on
+// an animated part of a copy holding a part run is traced by that run's part instance.
+bool list_cluster(SceneRoot* s, EmissiveSelection e, uint entry, uint p, out uint instance_index, out uint cluster_id, out uint triangles, out uint alpha_first)
+{
+    instance_index = 0;
+    cluster_id = 0;
+    triangles = 0;
+    alpha_first = 0;
+    if (entry < s.producer_capacity)
+    {
+        ProducerBatch b = s.batches[entry];
+        if (p >= emitted_clusters(b))
+            return false;
+        instance_index = s.producer_base + entry;
+        cluster_id = p;
+        triangles = b.clusters[p].tri_count;
+        return true;
+    }
+    uint slot = s.emissive[entry].source;
+    InstanceGpu inst = copy_record(s, slot);
+    MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
+    cluster_id = mesh.cluster_base + e.clusters[p];
+    ClusterRef r = s.clusters[cluster_id];
+    Cluster c = load_cluster(r.page, r.local);
+    SlotStateGpu st = s.slot_state[slot];
+    instance_index = slot;
+    if ((c.flags & CLUSTER_ANIMATED_PART) != 0 && st.part_count != 0 && c.part >= mesh.first_animated)
+        instance_index = s.part_base + st.part_run + (c.part - mesh.first_animated);
+    triangles = c.tri_count;
+    alpha_first = c.alpha_first;
+    return true;
+}
+
+// Sample of emissive entry `entry` from its list positions `first`..`first + count`, the entry
+// chosen with `probability`: a position by its fixed-point step from `bits.x`, a triangle
+// uniform by index from `bits.y`, a point uniform in it from `u`, and the side light leaves:
+// the front, or a side of a surface with a back of its own by the luminance of each side's
+// emission, from the rest of `bits.y`. A triangle's front face winds counter-clockwise. The
+// density is that of the point among the entry's whole list, whatever range drew it, and the
+// sample carries what a ray sees at the point, on the side that faces the way it leaves: what
+// the surface emits there, in the share a presence layer shows and none where an alpha test
+// leaves a hole, which only the triangles traversal tests take, and the share of a chain fade
+// the copy's nearer step shows.
+LightSample emissive_sample<S : ISurface>(LightSetGpu* set, uint entry, uint first, uint count, uint2 bits, float2 u, float probability)
 {
     SceneRoot* s = set.scene;
     EmissiveSelection e = set.emissive[entry];
     LightSample none = {};
-    float3 anchor;
-    float3x4 m;
-    if (!(e.total > 0.0) || e.count == 0 || !producer_transform(s, entry, anchor, m))
+    if (count == 0 || first + count > e.count)
         return none;
-    uint c = upper_bound(set.cluster_cdf + e.first, e.count, below(u.x, e.total));
-    ProducerBatch b = s.batches[entry];
-    ProducerClusterGpu k = b.clusters[c];
-    MaterialGpu* mat = cluster_material(s, s.producers[entry], k);
-    float area = cluster_area(b, k, m);
-    if (mat == nullptr || !(area > 0.0))
+    uint base = first > 0 ? e.cdf[first - 1] : 0u;
+    uint mass = range_mass(e, first, count);
+    if (mass == 0)
         return none;
-    float target = below(u.y, area);
-    float3 p0, p1, p2, n;
-    float sum = 0.0;
-    uint triangle = 0;
-    for (uint i = 0; i < k.tri_count; i++)
+    uint p = first + upper_bound(e.cdf + first, count, base + mulhi(bits.x, mass));
+    uint instance_index, cluster_id, triangles, alpha_first;
+    if (!list_cluster(s, e, entry, p, instance_index, cluster_id, triangles, alpha_first) || triangles == 0)
+        return none;
+    uint triangle = mulhi(bits.y, triangles);
+    TracedTriangle t;
+    if (!traced_triangle(s, instance_index, cluster_id, triangle, false, t))
+        return none;
+    float3 n;
+    float area = traced_area(t, n);
+    if (!(area > 0.0))
+        return none;
+    MaterialGpu* section = s.materials + t.material;
+    bool back = false;
+    float side = 1.0;
+    if ((section.flags & MATERIAL_HAS_BACK) != 0)
     {
-        float3 q0, q1, q2;
-        cluster_triangle(b, k, i, q0, q1, q2);
-        float a;
-        float3 ni = transformed_normal(m, q0, q1, q2, a);
-        if (!(a > 0.0))
-            continue;
-        p0 = q0;
-        p1 = q1;
-        p2 = q2;
-        n = ni;
-        triangle = i;
-        if (target < sum + a)
-            break;
-        sum += a;
+        side = side_probability(s, t.material, true);
+        back = float(bits.y * triangles) < side * 4294967296.0;
+        side = back ? side : 1.0 - side;
     }
-    float su = sqrt(u.z);
-    float b0 = 1.0 - su;
-    float b1 = u.w * su;
-    float3 p = b0 * p0 + b1 * p1 + (1.0 - b0 - b1) * p2;
-    float3 l = material_light_emission(mat);
-    Corners t = producer_triangle(b, k, triangle, false).corners;
-    float2 uv = b0 * t.attributes[0].uv[0] + b1 * t.attributes[1].uv[0] + (1.0 - b0 - b1) * t.attributes[2].uv[0];
-    ProducerGpu producer = s.producers[entry];
-    SurfaceInput at = particle_input(s, producer_material(producer, k), uv);
-    at.uv[0].inward = (t.attributes[0].uv[0] + t.attributes[1].uv[0] + t.attributes[2].uv[0]) / 3.0 - uv;
-    at.uv[1].inward = at.uv[0].inward;
-    float3 emitted = surface_emission(at, mat);
-    if ((mat.flags & MATERIAL_PRESENCE) != 0)
-        emitted *= saturate(material_opacity(at));
-    else if ((mat.flags & MATERIAL_ALPHA_TESTED) != 0 && producer.opacity != PRODUCER_OPAQUE)
-        emitted *= material_coverage(at);
-    LightSample r = light_sample(LIGHT_SAMPLE_EMISSIVE, s.light_capacity + entry, render_point(anchor, m, p),
-                                 n, emitted, probability * luminance_rec2020(l) / e.total);
-    if ((mat.flags & (MATERIAL_DOUBLE_SIDED | MATERIAL_HAS_BACK)) == MATERIAL_DOUBLE_SIDED)
+    float su = sqrt(u.x);
+    float2 bary = float2(u.y * su, su - u.y * su);
+    float3 facing = back ? -n : n;
+    SurfaceInput i = emitter_input(s, t, triangle, bary, -facing);
+    MaterialGpu* shown = s.materials + i.material;
+    float3 emitted = decal_emission(surface_decals(i), surface_emission(i, shown));
+    bool tested;
+    if (entry < s.producer_capacity)
+        tested = producer_tested(s.producers[entry], section);
+    else
+    {
+        tested = (section.flags & MATERIAL_ALPHA_TESTED) != 0 && triangle >= alpha_first;
+        SlotStateGpu st = s.slot_state[s.emissive[entry].source];
+        emitted *= step_presence(st, chain_near(st));
+    }
+    // A presence layer's and an alpha test's coverage is the section material's on both sides.
+    SurfaceInput c = i;
+    c.material = t.material;
+    c.surface = section.surface;
+    c.data = section.data != 0 ? section.data : s.surface_data;
+    if ((section.flags & MATERIAL_PRESENCE) != 0)
+        emitted *= saturate(material_opacity(c));
+    else if (tested)
+        emitted *= S.coverage(c);
+    float pdf = probability * list_step(e, p) / float(triangles) / area * side;
+    LightSample r = light_sample(LIGHT_SAMPLE_EMISSIVE, s.light_capacity + entry, i.position, facing, emitted, pdf);
+    r.position = p;
+    r.triangle = triangle;
+    if ((section.flags & (MATERIAL_DOUBLE_SIDED | MATERIAL_HAS_BACK)) == MATERIAL_DOUBLE_SIDED)
         r.bits |= LIGHT_SAMPLE_TWO_SIDED;
+    if ((shown.flags & (MATERIAL_COAT | MATERIAL_FUZZ)) != 0)
+        r.bits |= LIGHT_SAMPLE_VIEW;
     return r;
+}
+
+// What the coat and fuzz of emissive candidate `c`'s side pass of its emission toward the
+// vertex, whose medium has IOR `exterior_ior`: the share `Bsdf.emission` of a BSDF ray along
+// `c.dir` keeps. The point's barycentrics come back from the traced corners it was drawn
+// from, to rounding.
+public float3 emitter_view_layer<S : ISurface>(LightSetGpu* set, ResolvedLightSample c, float exterior_ior)
+{
+    SceneRoot* s = set.scene;
+    uint entry = c.light - s.light_capacity;
+    uint instance_index, cluster_id, triangles, alpha_first;
+    TracedTriangle t;
+    if (!list_cluster(s, set.emissive[entry], entry, c.position, instance_index, cluster_id, triangles, alpha_first)
+        || !traced_triangle(s, instance_index, cluster_id, c.triangle, false, t))
+        return float3(0.0);
+    float3 p0 = traced_point(t, float2(0.0));
+    float3 e1 = traced_point(t, float2(1.0, 0.0)) - p0;
+    float3 e2 = traced_point(t, float2(0.0, 1.0)) - p0;
+    float3 v = c.point - p0;
+    float size = unit_factor(max(abs(e1), abs(e2)));
+    e1 *= size;
+    e2 *= size;
+    v *= size;
+    float d11 = dot(e1, e1);
+    float d12 = dot(e1, e2);
+    float d22 = dot(e2, e2);
+    float v1 = dot(v, e1);
+    float v2 = dot(v, e2);
+    float det = d11 * d22 - d12 * d12;
+    float2 bary = float2(d22 * v1 - d12 * v2, d11 * v2 - d12 * v1) / det;
+    SurfaceInput i = emitter_input(s, t, c.triangle, bary, c.dir);
+    float offset;
+    GSurface g = S.surface(i, offset);
+    return bsdf_prepare(g.bsdf, g.normal, -c.dir, exterior_ior).emission_layer();
+}
+
+// What a ray finds of the emissive list on the side of a traced triangle it hit: the entry's
+// feedback id, the position, the render-space point and the unit normal of the side shown, and
+// the point's density per m^2 among its entry's list, before the light's selection; 0 where
+// light sampling never draws it: a far chain step, a cluster outside the list, a step of 0,
+// or a side it takes no light from.
+public struct EmitterHit
+{
+    public uint light;
+    public uint position;
+    public float density;
+    public float3 point;
+    public float3 normal;
+}
+
+// The emitter hit at barycentrics `bary` of triangle `primitive` of cluster `cluster_id` on
+// PTLAS instance `instance_index`, its side shown being its back with `back`.
+public EmitterHit emitter_hit(LightSetGpu* set, uint instance_index, uint cluster_id, uint primitive, float2 bary, bool back)
+{
+    SceneRoot* s = set.scene;
+    EmitterHit h = (EmitterHit)0;
+    h.light = NO_LIGHT;
+    uint entry;
+    uint p = 0;
+    uint triangles = 0;
+    if (hit_producer(s, instance_index, entry))
+    {
+        ProducerBatch b = s.batches[entry];
+        if (cluster_id >= emitted_clusters(b))
+            return h;
+        p = cluster_id;
+        triangles = b.clusters[cluster_id].tri_count;
+    }
+    else
+    {
+        uint copy;
+        if (!hit_copy(s, instance_index, copy) || (copy & COPY_FAR) != 0)
+            return h;
+        InstanceGpu inst = copy_record(s, copy);
+        MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
+        ClusterRef r = s.clusters[cluster_id];
+        Cluster c = load_cluster(r.page, r.local);
+        if (mesh.emissive.count == 0 || inst.first_emissive == NO_EMISSIVE)
+            return h;
+        uint rank = mesh.emissive.ranks[c.section];
+        if (rank >= inst.emissive_count)
+            return h;
+        entry = inst.first_emissive + rank;
+        EmissiveSelection e = set.emissive[entry];
+        uint mc = r.mesh_cluster;
+        p = e.count;
+        if (e.index != nullptr)
+        {
+            uint lo = 0;
+            uint hi = e.count;
+            while (lo < hi)
+            {
+                uint mid = (lo + hi) / 2;
+                if (e.index[mid].x < mc)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            if (lo < e.count && e.index[lo].x == mc)
+                p = e.index[lo].y;
+        }
+        else
+        {
+            for (uint k = 0; k < e.count; k++)
+            {
+                if (e.clusters[k] == mc)
+                {
+                    p = k;
+                    break;
+                }
+            }
+        }
+        triangles = c.tri_count;
+    }
+    EmissiveSelection e = set.emissive[entry];
+    TracedTriangle t;
+    if (p >= e.count || triangles == 0 || !traced_triangle(s, instance_index, cluster_id, primitive, false, t))
+        return h;
+    float3 n;
+    float area = traced_area(t, n);
+    float side = side_probability(s, t.material, back);
+    h.light = s.light_capacity + entry;
+    h.position = p;
+    h.point = traced_point(t, bary);
+    h.normal = back ? -n : n;
+    h.density = area > 0.0 ? list_step(e, p) / float(triangles) / area * side : 0.0;
+    return h;
 }
 
 // A sphere light's radius as tile samples store it.
@@ -779,30 +998,46 @@ public float global_selection(LightSetGpu* set, uint id)
     return id < lights ? set.light_probability[id] : set.emissive[id - lights].probability;
 }
 
-// Probability that local sampler `local` draws the light with feedback id `id`.
-public float local_selection(LocalLights* local, uint id)
+// The slot of local sampler `local` that holds position `position` of the light with feedback
+// id `id`, or `local.count` for none: a binary search of the slots, sorted by light and first
+// position.
+public uint local_slot(LocalLights* local, uint id, uint position)
 {
     uint n = min(local.count, LOCAL_LIGHTS);
-    for (uint k = 0; k < n; k++)
+    uint lo = 0;
+    uint hi = n;
+    while (lo < hi)
     {
-        if (local.ids[k] == id)
-            return (local.cdf[k] - (k > 0 ? local.cdf[k - 1] : 0.0)) / local.cdf[n - 1];
+        uint mid = (lo + hi) / 2;
+        LocalLight m = local.lights[mid];
+        if (m.id < id || (m.id == id && m.first <= position))
+            lo = mid + 1;
+        else
+            hi = mid;
     }
-    return 0.0;
+    if (lo == 0)
+        return n;
+    LocalLight k = local.lights[lo - 1];
+    return k.id == id && position - k.first < k.count ? lo - 1 : n;
 }
 
-// Probability that a tile-light candidate of a vertex reading `local` (null for none) is the
-// light with feedback id `id`.
-public float light_selection(LightSetGpu* set, LocalLights* local, uint id)
+// Probability that a tile-light candidate of a vertex reading `local` (null for none) is
+// position `position` of the light with feedback id `id` (0 for lights without positions), over
+// the probability the light's own distribution gives the position: the local sampler's slot
+// gain in its share, and the light's global selection in the rest.
+public float light_selection(LightSetGpu* set, LocalLights* local, uint id, uint position)
 {
     float g = global_selection(set, id);
     if (local == nullptr)
         return g;
-    return local.share * local_selection(local, id) + (1.0 - local.share) * g;
+    uint k = local_slot(local, id, position);
+    float gain = k < min(local.count, LOCAL_LIGHTS) ? local.lights[k].gain : 0.0;
+    return local.share * gain + (1.0 - local.share) * g;
 }
 
-// Sample of the light with feedback id `id` from `u`, the light chosen with `probability`.
-LightSample tile_light_sample(LightSetGpu* set, uint id, float4 u, float probability)
+// Sample of the light with feedback id `id` from `bits` and `u`, the light chosen with
+// `probability`; an emissive entry draws from its list positions `first`..`first + count`.
+LightSample tile_light_sample<S : ISurface>(LightSetGpu* set, uint id, uint first, uint count, uint2 bits, float4 u, float probability)
 {
     if (id == feedback_environment(set))
     {
@@ -814,16 +1049,16 @@ LightSample tile_light_sample(LightSetGpu* set, uint id, float4 u, float probabi
     uint lights = set.scene.light_capacity;
     if (id < lights)
         return local_sample(set, id, u.xy, probability);
-    return emissive_sample(set, id - lights, u, probability);
+    return emissive_sample<S>(set, id - lights, first, count, bits, u.xy, probability);
 }
 
 // Tile sample `index` of `frame`, drawn from the light set's selection.
-public LightSample presample_light(LightSetGpu* set, uint index, uint frame)
+public LightSample presample_light<S : ISurface>(LightSetGpu* set, uint index, uint frame)
 {
     uint4 h0 = pcg4d(uint4(index, frame, 0x6c69u, 1u));
     uint4 h1 = pcg4d(uint4(index, frame, 0x6c69u, 2u));
     float x = unit_float(h0.x);
-    float4 u = float4(unit_float(h0.y), unit_float(h0.z), unit_float(h0.w), unit_float(h1.x));
+    float4 u = float4(unit_float(h1.x), unit_float(h1.y), unit_float(h1.z), unit_float(h1.w));
     float env = set.environment_probability;
     uint id = feedback_environment(set);
     if (!(x < env))
@@ -836,17 +1071,30 @@ public LightSample presample_light(LightSetGpu* set, uint index, uint frame)
         }
         id = upper_bound(set.cdf, set.candidate_count, below((x - env) / (1.0 - env), total));
     }
-    return tile_light_sample(set, id, u, global_selection(set, id));
+    uint lights = set.scene.light_capacity;
+    uint count = id >= lights && id != feedback_environment(set) ? set.emissive[id - lights].count : 0;
+    return tile_light_sample<S>(set, id, 0, count, h0.zw, u, global_selection(set, id));
 }
 
-// The local sampler candidate of a vertex at `x` from `pick` and `u`, with the density of
-// its point alone (the light chosen with probability 1).
-ResolvedLightSample local_candidate(LightSetGpu* set, LocalLights* local, float3 x, float pick, float4 u)
+// The local sampler candidate of a vertex at `x`: a slot by its fixed-point step from `pick`,
+// then a sample of its range, with the density of its point alone (the light chosen with
+// probability 1).
+ResolvedLightSample local_candidate<S : ISurface>(LightSetGpu* set, LocalLights* local, float3 x, uint pick, uint2 bits, float4 u)
 {
     uint n = min(local.count, LOCAL_LIGHTS);
-    float target = below(pick, local.cdf[n - 1]);
-    uint k = upper_bound(local.cdf, n, target);
-    return resolve_light_sample(set, tile_light_sample(set, local.ids[k], u, 1.0), x, u.xy);
+    uint target = mulhi(pick, 0xffffffffu);
+    uint lo = 0;
+    uint hi = n - 1;
+    while (lo < hi)
+    {
+        uint mid = (lo + hi) / 2;
+        if (local.lights[mid].cdf > target)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    LocalLight k = local.lights[lo];
+    return resolve_light_sample(set, tile_light_sample<S>(set, k.id, k.first, k.count, bits, u, 1.0), x, u.xy);
 }
 
 // Adds one pixel whose feedback names `id` to the scene's feedback counts.
@@ -864,6 +1112,10 @@ public ResolvedLightSample no_candidate()
     r.pdf = 0.0;
     r.kind = LIGHT_SAMPLE_ENVIRONMENT;
     r.light = NO_LIGHT;
+    r.point = float3(0.0);
+    r.position = 0;
+    r.triangle = 0;
+    r.view = false;
     return r;
 }
 
@@ -878,6 +1130,9 @@ public ResolvedLightSample resolve_light_sample(LightSetGpu* set, LightSample s,
     uint kind = s.bits & 3;
     r.kind = kind;
     r.light = s.light;
+    r.position = s.position;
+    r.triangle = s.triangle;
+    r.view = (s.bits & LIGHT_SAMPLE_VIEW) != 0;
     float3 l = decode_radiance(s);
     if (kind == LIGHT_SAMPLE_ENVIRONMENT)
     {
@@ -902,6 +1157,7 @@ public ResolvedLightSample resolve_light_sample(LightSetGpu* set, LightSample s,
         float b = dot(to_center, r.dir);
         float3 h = to_center - b * r.dir;
         r.distance = b - sqrt(max(0.0, r2 - dot(h, h)));
+        r.point = x + r.dir * r.distance;
         LightGpu* light = set.scene.lights + s.light;
         float c = dot(oct_decode_snorm16(s.normal), -axis);
         r.radiance = l * spot_falloff(c, light.cone_cos_inner, light.cone_cos_outer);
@@ -914,6 +1170,7 @@ public ResolvedLightSample resolve_light_sample(LightSetGpu* set, LightSample s,
         return no_candidate();
     r.distance = sqrt(d2);
     r.dir = v / r.distance;
+    r.point = s.point;
     float cos_light = -dot(oct_decode_snorm16(s.normal), r.dir);
     if (cos_light == 0.0)
         return no_candidate();
@@ -942,20 +1199,21 @@ public NeeVertex nee_vertex(LightSetGpu* set, float3 position, float3 normal, ui
 
 // One next-event candidate for vertex `v`: with the vertex's directional share, a directional
 // light chosen by weight x n.l and a direction in its cone; otherwise, with the local
-// sampler's share, a light it holds and a point on it, or else a sample at a random offset
-// in the vertex's tile. The density is the candidate's in the vertex's whole mixture. Draws
-// three sampler dimensions.
-public ResolvedLightSample nee_candidate(LightSetGpu* set, NeeVertex v, inout Sampler rng)
+// sampler's share, a slot it holds and a sample of its range, or else a sample at a random
+// offset in the vertex's tile. The density is the candidate's in the vertex's whole mixture.
+// Draws five sampler dimensions.
+public ResolvedLightSample nee_candidate<S : ISurface>(LightSetGpu* set, NeeVertex v, inout Sampler rng)
 {
     float total = v.total;
     float share = v.share;
     float choice = rng.next();
-    float pick = rng.next();
+    uint pick = rng.next_bits();
+    uint2 bits = uint2(rng.next_bits(), rng.next_bits());
     OwenSobol4 u4 = rng.next4_parts();
     float2 u = u4.xy();
     if (choice < share)
     {
-        float target = pick * total;
+        float target = unit_float(pick) * total;
         uint id = NO_LIGHT;
         float w = 0.0;
         float sum = 0.0;
@@ -986,17 +1244,17 @@ public ResolvedLightSample nee_candidate(LightSetGpu* set, NeeVertex v, inout Sa
     ResolvedLightSample r;
     if (local != nullptr && (choice - share) < local.share * (1.0 - share))
     {
-        r = local_candidate(set, local, v.position, pick, float4(u, u4.zw()));
+        r = local_candidate<S>(set, local, v.position, pick, bits, float4(u, u4.zw()));
         if (r.pdf > 0.0)
-            r.pdf *= light_selection(set, local, r.light);
+            r.pdf *= light_selection(set, local, r.light, r.position);
     }
     else
     {
         uint tile = light_tile(v.pixel, set.frame);
-        uint index = min(uint(pick * float(TILE_SIZE)), TILE_SIZE - 1);
+        uint index = mulhi(pick, TILE_SIZE);
         r = resolve_light_sample(set, set.tiles[tile * TILE_SIZE + index], v.position, u);
         if (local != nullptr && r.pdf > 0.0)
-            r.pdf *= light_selection(set, local, r.light) / global_selection(set, r.light);
+            r.pdf *= light_selection(set, local, r.light, r.position) / global_selection(set, r.light);
     }
     r.pdf *= 1.0 - share;
     return r;
@@ -1004,14 +1262,14 @@ public ResolvedLightSample nee_candidate(LightSetGpu* set, NeeVertex v, inout Sa
 
 // Densities per sr of the candidates of a vertex with `normal` and local sampler `local`
 // (null for none) in direction `dir`, for weighting BSDF samples against next-event
-// estimation: from the environment, from directional light `id`, and from emissive entry
-// `entry` hit at `distance` on a surface emitting `luminance` nits whose normal makes
-// `cos_light` with the ray.
+// estimation: from the environment, from directional light `id`, from sphere or rect light
+// `id` seen from `x`, and from an emitter hit `h` `distance` m from the vertex whose side
+// shown makes `cos_light` with the direction from the vertex.
 public float nee_environment_pdf(LightSetGpu* set, LocalLights* local, float3 normal, float3 dir)
 {
     float total;
     float share = directional_share(set, normal, total);
-    float p = light_selection(set, local, feedback_environment(set));
+    float p = light_selection(set, local, feedback_environment(set), 0);
     return (1.0 - share) * p * environment_pdf(set.environment, dir);
 }
 
@@ -1020,24 +1278,29 @@ public float nee_directional_pdf(LightSetGpu* set, float3 normal, uint id, float
     return directional_probability(set, normal, id) * directional_pdf(set.scene.lights[id], dir);
 }
 
-public float nee_emissive_pdf(LightSetGpu* set, LocalLights* local, float3 normal, uint entry,
-                              float luminance, float distance, float cos_light)
+public float nee_local_light_pdf(LightSetGpu* set, LocalLights* local, float3 normal, uint id, float3 x, float3 dir)
 {
     float total;
     float share = directional_share(set, normal, total);
-    EmissiveSelection e = set.emissive[entry];
-    if (!(e.total > 0.0))
-        return 0.0;
-    float p = light_selection(set, local, set.scene.light_capacity + entry);
-    return (1.0 - share) * p * luminance / e.total * distance * distance / abs(cos_light);
+    return (1.0 - share) * light_selection(set, local, id, 0) * local_light_density(set, id, x, dir);
 }
 
-// Density per sr of tile samples from sphere or rect light `id` seen from `x` in direction
-// `dir`, without the vertex's directional share; 0 when `dir` misses the light.
-public float local_light_pdf(LightSetGpu* set, uint id, float3 x, float3 dir)
+public float nee_emissive_pdf(LightSetGpu* set, LocalLights* local, float3 normal, EmitterHit h, float distance, float cos_light)
+{
+    if (!(h.density > 0.0))
+        return 0.0;
+    float total;
+    float share = directional_share(set, normal, total);
+    float p = light_selection(set, local, h.light, h.position);
+    return (1.0 - share) * p * h.density * distance * distance / abs(cos_light);
+}
+
+// Density per sr of the samples of sphere or rect light `id` seen from `x` in direction `dir`,
+// the light given: uniform over a sphere's cone, uniform over a rect's area; 0 when `dir`
+// misses the light.
+public float local_light_density(LightSetGpu* set, uint id, float3 x, float3 dir)
 {
     LightGpu l = set.scene.lights[id];
-    float p = set.light_probability[id];
     if (l.kind == LIGHT_SPHERE)
     {
         float r = sample_radius(l.radius);
@@ -1049,7 +1312,7 @@ public float local_light_pdf(LightSetGpu* set, uint id, float3 x, float3 dir)
         if (!(d2 > r2) || b <= 0.0 || dot(h, h) > r2)
             return 0.0;
         float sin2 = r2 / d2;
-        return p / (TWO_PI * sin2 / (1.0 + sqrt(1.0 - sin2)));
+        return 1.0 / (TWO_PI * sin2 / (1.0 + sqrt(1.0 - sin2)));
     }
     if (l.kind != LIGHT_RECT)
         return 0.0;
@@ -1065,7 +1328,53 @@ public float local_light_pdf(LightSetGpu* set, uint id, float3 x, float3 dir)
     float ey = dot(q, l.edge_y) / dot(l.edge_y, l.edge_y);
     if (t <= 0.0 || abs(ex) > 0.5 || abs(ey) > 0.5)
         return 0.0;
-    return p / area * t * t / abs(dn);
+    return t * t / (area * abs(dn));
+}
+
+// Where a ray from `origin` along unit `dir` first meets sphere or rect light `id`, before
+// `t_max`, and the radiance it sees there from a vertex at `from`: a sphere's by the spot
+// falloff toward `from`, a rect's front alone. False on a miss.
+public bool light_proxy_hit(LightSetGpu* set, uint id, float3 origin, float3 dir, float t_max, float3 from, out float t, out float3 radiance)
+{
+    LightGpu l = set.scene.lights[id];
+    t = 0.0;
+    radiance = float3(0.0);
+    if (l.kind == LIGHT_SPHERE)
+    {
+        float r = sample_radius(l.radius);
+        float3 oc = origin - l.position;
+        float b = dot(oc, dir);
+        float3 h = oc - b * dir;
+        float disc = r * r - dot(h, h);
+        if (!(disc >= 0.0))
+            return false;
+        float q = sqrt(disc);
+        t = -b - q;
+        if (t <= 0.0)
+            t = -b + q;
+        if (!(t > 0.0) || !(t < t_max))
+            return false;
+        float3 away = from - l.position;
+        // The axis as tile samples store it.
+        float3 axis = oct_decode_snorm16(oct_encode_snorm16(l.cone_cos_outer > -1.0 ? l.direction : float3(0.0, 0.0, 1.0)));
+        float c = dot(axis, normalize(away));
+        radiance = l.color / (PI * r * r) * spot_falloff(c, l.cone_cos_inner, l.cone_cos_outer);
+        return true;
+    }
+    if (l.kind != LIGHT_RECT)
+        return false;
+    float3 n = cross(l.edge_x, l.edge_y);
+    float dn = dot(dir, n);
+    if (dn == 0.0)
+        return false;
+    t = dot(l.position - origin, n) / dn;
+    float3 q = origin + t * dir - l.position;
+    float ex = dot(q, l.edge_x) / dot(l.edge_x, l.edge_x);
+    float ey = dot(q, l.edge_y) / dot(l.edge_y, l.edge_y);
+    if (!(t > 0.0) || !(t < t_max) || abs(ex) > 0.5 || abs(ey) > 0.5)
+        return false;
+    radiance = dn < 0.0 ? l.color : float3(0.0);
+    return true;
 }
 
 // Illuminance of directional light `id` before the medium.

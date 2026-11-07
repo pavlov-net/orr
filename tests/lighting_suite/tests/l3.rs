@@ -4,12 +4,13 @@
 use std::f64::consts::PI;
 
 use bytemuck::Zeroable;
-use lighting_suite::shaders::{emit, hotspot_bake, nee_probe, tile_probe};
+use lighting_suite::shaders::{emit, hotspot_bake, local_probe, nee_probe, tile_probe};
 use lighting_suite::{
     TestScene, assert_clean, compute_barrier, finish, kernels, linear_clamp, pipeline, read,
     readback, render, texture, upload,
 };
 use orr_gpu::{ComputePipeline, DEFAULT_MEDIUM, GpuPtr, Hazards, KernelSet, Stages};
+use orr_lighting::types::{LocalLight, LocalLights};
 use orr_lighting::{
     DirectionalLight, DiscProfile, EmissiveSelection, LIGHT_TILE_SIZE, LIGHT_TILES, Light, LightId,
     LightSample, LightSetGpu, SceneLighting, SceneLightingSettings, ScenePass,
@@ -51,24 +52,41 @@ fn scene_pass(scene: &TestScene, lighting: &mut SceneLighting, frame: u64) {
     finish(list);
 }
 
-/// Resolved tile samples seen from one receiver over several presampled frames.
-struct Tiles {
+/// Light samples seen from one receiver, binned by direction, against the bins' probabilities.
+struct Binned {
     /// Per bin, then outside the cone.
     observed: Vec<f64>,
     expected: Vec<f64>,
     empty: u32,
     mismatches: u32,
-    /// Mean and standard error of luminance x cos to the axis / density.
-    irradiance: (f64, f64),
 }
 
-impl Tiles {
+impl Binned {
+    /// `histogram`'s bins and the samples outside the cone and empty, against the probability
+    /// in each bin of `n` samples, from the 64 lane `partials` of each.
+    fn new(histogram: &[u32], partials: &[f32], mismatches: u32, n: f64) -> Self {
+        let bins = partials.len() / 64;
+        let p: Vec<f64> = partials
+            .chunks(64)
+            .map(|lanes| lanes.iter().map(|&p| f64::from(p)).sum())
+            .collect();
+        let inside: f64 = p.iter().sum();
+        let mut expected: Vec<f64> = p.iter().map(|p| p * n).collect();
+        expected.push((1.0 - inside).max(0.0) * n);
+        Self {
+            observed: histogram[..=bins].iter().map(|&c| f64::from(c)).collect(),
+            expected,
+            empty: histogram[bins + 1],
+            mismatches,
+        }
+    }
+
     fn assert_match_density(&self, what: &str) {
         let n: f64 = self.observed.iter().sum();
         assert_eq!(self.empty, 0, "{what}: empty samples");
         assert!(
             f64::from(self.mismatches) <= 1e-4 * n,
-            "{what}: {} samples whose density differs from the tiles' density",
+            "{what}: {} samples whose density differs from the bins' density",
             self.mismatches
         );
         for (o, e) in self.observed.iter().zip(&self.expected) {
@@ -79,6 +97,19 @@ impl Tiles {
         }
         let p = chi_square_p(&self.observed, &self.expected);
         assert!(p > 0.01, "{what}: chi-square p = {p}");
+    }
+}
+
+/// Resolved tile samples seen from one receiver over several presampled frames.
+struct Tiles {
+    binned: Binned,
+    /// Mean and standard error of luminance x cos to the axis / density.
+    irradiance: (f64, f64),
+}
+
+impl Tiles {
+    fn assert_match_density(&self, what: &str) {
+        self.binned.assert_match_density(what);
     }
 
     fn assert_irradiance(&self, expected: f64, what: &str) {
@@ -129,7 +160,7 @@ fn tiles(scene: &TestScene, lighting: &mut SceneLighting, bins: &Bins) -> Tiles 
     histogram.as_mut_slice().unwrap().fill(0);
     let mut mismatches = readback::<u32>(1, "mismatches");
     mismatches.as_mut_slice().unwrap().fill(0);
-    let probability = readback::<f32>(u64::from(bins), "bin probability");
+    let partials = readback::<f32>(u64::from(bins) * 64, "bin partials");
     let values = readback::<f32>(u64::from(SAMPLES), "values");
     let omc = 2.0 * (0.5 * half_angle).sin().powi(2);
     let probe = [
@@ -144,7 +175,7 @@ fn tiles(scene: &TestScene, lighting: &mut SceneLighting, bins: &Bins) -> Tiles 
                 set: lighting.light_set(),
                 histogram: histogram.gpu(),
                 mismatches: mismatches.gpu(),
-                bin_probability: probability.gpu(),
+                bin_partials: partials.gpu(),
                 values: values.gpu(),
                 _pad: 0,
                 receiver: receiver.extend(0.0).to_array(),
@@ -177,22 +208,14 @@ fn tiles(scene: &TestScene, lighting: &mut SceneLighting, bins: &Bins) -> Tiles 
         }
     }
     let n = f64::from(SAMPLES) * f64::from(frames);
-    let h = histogram.as_slice().unwrap();
-    let p: Vec<f64> = probability
-        .as_slice()
-        .unwrap()
-        .iter()
-        .map(|&p| f64::from(p))
-        .collect();
-    let inside: f64 = p.iter().sum();
-    let mut expected: Vec<f64> = p.iter().map(|p| p * n).collect();
-    expected.push((1.0 - inside).max(0.0) * n);
     let mean = sum / n;
     Tiles {
-        observed: h[..=bins as usize].iter().map(|&c| f64::from(c)).collect(),
-        expected,
-        empty: h[bins as usize + 1],
-        mismatches: mismatches.as_slice().unwrap()[0],
+        binned: Binned::new(
+            histogram.as_slice().unwrap(),
+            partials.as_slice().unwrap(),
+            mismatches.as_slice().unwrap()[0],
+            n,
+        ),
         irradiance: (mean, ((sum2 / n - mean * mean) / n).sqrt()),
     }
 }
@@ -244,8 +267,9 @@ fn a_half_degree_hot_spot_is_sampled_at_its_own_density() {
     };
     let t = tiles(&scene, &mut lighting, &bins);
     t.assert_match_density("hot spot");
-    let n: f64 = t.observed.iter().sum();
-    let near = 1.0 - t.observed[t.observed.len() - 1] / n;
+    let observed = &t.binned.observed;
+    let n: f64 = observed.iter().sum();
+    let near = 1.0 - observed[observed.len() - 1] / n;
     assert!(
         near > 0.005,
         "{near} of the samples within 2 deg of the hot spot"
@@ -633,6 +657,176 @@ fn lit_through_a_texture(
     assert_clean();
 }
 
+/// Next-event candidates of a receiver whose tile reads `local`, binned, over `frames` frames
+/// of the scene pass.
+fn local_candidates(
+    scene: &TestScene,
+    lighting: &mut SceneLighting,
+    local: &LocalLights,
+    bins: &Bins,
+    frames: u32,
+) -> Binned {
+    let Bins {
+        receiver,
+        axis,
+        half_angle,
+        rings,
+        sectors,
+    } = *bins;
+    let bins = rings * sectors;
+    let mut histogram = readback::<u32>(u64::from(bins + 2), "histogram");
+    histogram.as_mut_slice().unwrap().fill(0);
+    let mut mismatches = readback::<u32>(1, "mismatches");
+    mismatches.as_mut_slice().unwrap().fill(0);
+    let partials = readback::<f32>(u64::from(bins) * 64, "bin partials");
+    let local = upload(std::slice::from_ref(local), "forced local sampler");
+    let omc = 2.0 * (0.5 * half_angle).sin().powi(2);
+    let probe = [
+        pipeline(&local_probe::MODULE, "candidates"),
+        pipeline(&local_probe::MODULE, "integrate"),
+    ];
+    for f in 0..frames {
+        let frame = 1000 + u64::from(f);
+        let root = upload(
+            &[local_probe::Root {
+                set: lighting.light_set(),
+                local: local.gpu(),
+                histogram: histogram.gpu(),
+                mismatches: mismatches.gpu(),
+                bin_partials: partials.gpu(),
+                _pad: 0,
+                receiver: receiver.extend(0.0).to_array(),
+                axis: axis.normalize().extend(omc as f32).to_array(),
+                rings,
+                sectors,
+                subdivisions: 96,
+                frame: frame as u32,
+            }],
+            "local probe root",
+        );
+        let mut list = render().command_list().unwrap();
+        lighting.record(
+            &mut list,
+            &ScenePass {
+                frame,
+                ..scene.pass([0.0; 3])
+            },
+        );
+        compute_barrier(&mut list);
+        list.dispatch(&probe[0], root.gpu(), [SAMPLES / 64, 1, 1]);
+        if f == 0 {
+            list.dispatch(&probe[1], root.gpu(), [bins, 1, 1]);
+        }
+        finish(list);
+    }
+    Binned::new(
+        histogram.as_slice().unwrap(),
+        partials.as_slice().unwrap(),
+        mismatches.as_slice().unwrap()[0],
+        f64::from(SAMPLES) * f64::from(frames),
+    )
+}
+
+/// A local sampler of slots `(light, first, count, probability)`, sorted by light and first
+/// position, and `share`; an emissive entry's slot ranges over positions of equal mass among
+/// `positions`.
+fn forced_local(
+    slots: &[(u32, u32, u32, f64)],
+    positions: u32,
+    lights: u32,
+    share: f32,
+) -> LocalLights {
+    let mut local = LocalLights::zeroed();
+    let mut sum = 0.0;
+    for (slot, &(id, first, count, p)) in local.lights.iter_mut().zip(slots) {
+        sum += p;
+        let range = if id >= lights {
+            f64::from(count) / f64::from(positions)
+        } else {
+            1.0
+        };
+        *slot = LocalLight {
+            id,
+            first,
+            count,
+            cdf: (sum * f64::from(u32::MAX)).round() as u32,
+            gain: (p / range) as f32,
+        };
+    }
+    local.lights[slots.len() - 1].cdf = u32::MAX;
+    local.count = slots.len() as u32;
+    local.share = share;
+    local.receiver = [0.0, 0.0, 0.0, -1.0];
+    local
+}
+
+/// Next-event candidates of a tile whose local sampler holds ranges of an emissive producer's
+/// list beside a sphere light come at the density BSDF rays read on what they hit, through the
+/// slot each falls in: drawn from the sampler alone they follow it, a position no slot holds
+/// included, and mixed with the tile samples they keep the density of the mixture.
+#[test]
+fn local_sampler_candidates_match_the_hit_side_density() {
+    let lights = 4;
+    let mut scene = TestScene::new(SceneDesc {
+        light_capacity: lights,
+        producer_capacity: 4,
+        emissive_capacity: 0,
+        ..SceneDesc::default()
+    });
+    let quads = Quads {
+        producer: 0,
+        count: 8,
+        size: 0.3,
+        origin: Vec3::new(-1.6, 0.0, -0.2),
+        step: Vec3::new(0.4, 0.0, 0.05),
+    };
+    let p = pipeline(&emit::MODULE, "main");
+    scene.frame(
+        |w, m| {
+            let id = m.create(&emitting([1.0, 0.6, 0.3], 400.0, 0)).unwrap();
+            set_producers(
+                w,
+                &[id; 3],
+                DVec3::ZERO,
+                &[Affine3::from_translation(Vec3::new(0.0, 2.0, 0.0))],
+                ProducerUpdate::Static,
+            );
+            w.set_light(
+                LightId(1),
+                Some(&Light::Sphere {
+                    position: DVec3::new(0.0, 2.5, 1.5),
+                    radius: 0.2,
+                    intensity: Vec3::splat(300.0),
+                    cone: None,
+                }),
+            )
+            .unwrap();
+        },
+        |c| quads.dispatch(c, &p),
+    );
+    let mut lighting = scene.lighting();
+    // Producer entry 0's feedback id follows the lights; its position 3 is in no slot.
+    let entry = lights;
+    let slots = [
+        (1, 0, 1, 0.2),
+        (entry, 0, 3, 0.4),
+        (entry, 4, 2, 0.15),
+        (entry, 6, 2, 0.25),
+    ];
+    let bins = Bins::around_y(70f64.to_radians(), 8, 16);
+    let alone = forced_local(&slots, quads.count, lights, 1.0);
+    local_candidates(&scene, &mut lighting, &alone, &bins, 4).assert_match_density("local sampler");
+    let mixed = forced_local(&slots, quads.count, lights, 0.5);
+    let m = local_candidates(&scene, &mut lighting, &mixed, &bins, 1);
+    assert_eq!(m.empty, 0, "mixed: empty candidates");
+    assert!(
+        f64::from(m.mismatches) <= 1e-4 * f64::from(SAMPLES),
+        "mixed: {} candidates off the hit side's density",
+        m.mismatches
+    );
+    assert_clean();
+}
+
 /// Runs the scene pass, then the NEE probe's `threads` candidate threads and its totals pass.
 fn run_nee_probe(
     scene: &TestScene,
@@ -937,16 +1131,28 @@ fn check_power(
         .map(|c| f64::from(quads.size).powi(2) * scale * luminance[(c % 3) as usize])
         .sum();
     let scene_power = y2020(entry.power);
-    for (got, source) in [
-        (scene_power, "scene power"),
-        (f64::from(selection.total), "cluster CDF total"),
-    ] {
-        assert!(
-            (got / expected - 1.0).abs() < 1e-3,
-            "{what}: {source} {got} against {expected}"
-        );
-    }
+    assert!(
+        (scene_power / expected - 1.0).abs() < 1e-3,
+        "{what}: scene power {scene_power} against {expected}"
+    );
     assert_eq!(selection.count, quads.count, "{what}: clusters in the CDF");
+    // Each cluster's fixed-point step follows its share of the power, a cluster that emits
+    // nothing keeps a step of 0, and the last value is the top.
+    let cdf: Vec<u32> = read(selection.cdf, u64::from(quads.count));
+    assert_eq!(*cdf.last().unwrap(), u32::MAX, "{what}: last CDF value");
+    let mut below = 0u32;
+    for (c, &v) in (0..).zip(&cdf) {
+        let share = f64::from(quads.size).powi(2) * scale * luminance[(c % 3) as usize] / expected;
+        let step = f64::from(v - below) / f64::from(u32::MAX);
+        assert!(
+            (step - share).abs() < 1e-4,
+            "{what}: cluster {c} step {step} against {share}"
+        );
+        if share == 0.0 {
+            assert_eq!(v, below, "{what}: cluster {c} emits nothing");
+        }
+        below = v;
+    }
 }
 
 #[test]
@@ -1158,5 +1364,114 @@ fn light_feedback_blends_into_the_selection_and_clears_on_a_reset() {
         (0..3).all(|i| (reset[i] - power[i]).abs() <= 1e-6),
         "after a reset: {reset:?} against {power:?}"
     );
+    assert_clean();
+}
+
+/// A 2 m square grid of `n` x `n` cells facing -y around the origin, its two halves along z
+/// in two sections.
+fn emitter_grid(n: u32) -> orr_cook::MeshInput {
+    let mut m = orr_cook::MeshInput::default();
+    for j in 0..=n {
+        for i in 0..=n {
+            let (x, z) = (
+                i as f32 / n as f32 * 2.0 - 1.0,
+                j as f32 / n as f32 * 2.0 - 1.0,
+            );
+            m.positions.push(Vec3::new(x, 0.0, z));
+            m.normals.push(-Vec3::Y);
+        }
+    }
+    m.uvs = Some(vec![orr_math::Vec2::ZERO; m.positions.len()]);
+    let w = n + 1;
+    for half in 0..2 {
+        let first = m.indices.len() as u32;
+        for j in n * half / 2..n * (half + 1) / 2 {
+            for i in 0..n {
+                let c = j * w + i;
+                m.indices.extend([c, c + 1, c + w, c + 1, c + w + 1, c + w]);
+            }
+        }
+        m.sections.push(orr_pack::Span {
+            first,
+            count: m.indices.len() as u32 - first,
+        });
+    }
+    m
+}
+
+/// A cooked emitter of two sections of unequal emission, stretched unevenly and tilted over the
+/// receiver: its tiles' samples follow the density that hits on it read, since the probe takes
+/// each bin's density from what a ray toward it meets.
+#[test]
+fn cooked_emitter_tiles_match_the_hit_side_density() {
+    let d = lighting_suite::device();
+    if d.caps().cluster.max_tris == 0 || d.caps().cluster.max_partitions == 0 {
+        return;
+    }
+    let emits = |color: [f32; 3], luminance: f32| orr_pack::material::Material {
+        emission_color: color,
+        emission_luminance: luminance,
+        ..orr_pack::material::Material::default()
+    };
+    let manifest = orr_cook::Manifest {
+        archives: vec![orr_cook::ArchiveSpec::new(
+            orr_pack::Target::Memory,
+            vec![orr_cook::AssetSpec {
+                name: "lamp".into(),
+                source: orr_cook::Source::Mesh {
+                    mesh: emitter_grid(24),
+                    materials: vec![emits([1.0, 0.8, 0.6], 200.0), emits([0.4, 0.6, 1.0], 60.0)],
+                    settings: orr_cook::MeshSettings::default(),
+                },
+            }],
+        )],
+    };
+    let bytes = orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory
+        .remove(0);
+    let mut scene = TestScene::new(SceneDesc {
+        light_capacity: 1,
+        producer_capacity: 0,
+        emissive_capacity: 2,
+        ..SceneDesc::default()
+    });
+    let m = scene.mount(bytes);
+    let model = scene
+        .scenes
+        .model(m, orr_pack::AssetId::from_name("lamp"))
+        .unwrap();
+    let linear = Mat3::from_rotation_x(0.3) * Mat3::from_diagonal(Vec3::new(1.5, 1.0, 0.8));
+    scene.write(|w, _| {
+        w.set_focus(DVec3::ZERO);
+        let g = w
+            .create_transform_group(&TransformGroupDesc {
+                count: 1,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .unwrap();
+        w.transforms(g, 0, 1).unwrap()[0] =
+            Affine3::from_mat3_translation(linear, Vec3::new(0.2, 1.0, -0.1)).into();
+        w.add_instances(&orr_scene::InstancesDesc {
+            model,
+            copies: 1,
+            transforms: g,
+            first: 0,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 1000.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    });
+    for _ in 0..4 {
+        scene.write(|_, _| {});
+    }
+    let mut lighting = scene.lighting();
+    let t = tiles(&scene, &mut lighting, &Bins::around_y(1.3, 6, 12));
+    t.assert_match_density("cooked emitter");
     assert_clean();
 }

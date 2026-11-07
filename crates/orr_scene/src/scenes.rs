@@ -598,6 +598,9 @@ impl Scenes {
             core.chains.remove(&model);
             if !gone.contains(&model) {
                 core.write_chain(model, &[]);
+                // New copies take entries for the model alone; live ones keep theirs.
+                let m = &mut core.model_cpu[model.0 as usize];
+                m.emissive_stride = m.emissive_sections;
             }
         }
     }
@@ -641,7 +644,10 @@ impl Scenes {
     /// distance. Copies take their step from the next frame on, and a copy that changes step
     /// cross-fades between the two over a few frames. Steps past the model itself draw and
     /// trace rigid, with their own materials, every section shown and no pose. A chain ends
-    /// when a pack holding one of its models is unmounted.
+    /// when a pack holding one of its models is unmounted. Each copy holds an emissive list
+    /// entry per emissive section of its chain's most emissive model; a chain that needs more
+    /// gives every copy of the model in every scene more, on pages too, and fails with
+    /// [`Error::Capacity`], changing nothing, where a scene's list has no room.
     pub fn set_chain(&mut self, model: ModelId, chain: &[(ModelId, f32)]) -> Result<()> {
         let invalid = |reason| Err(Error::InvalidChain { model, reason });
         if !self.core.mounts.is_live(model) {
@@ -677,6 +683,58 @@ impl Scenes {
             last = distance;
         }
         let core = &mut self.core;
+        // Every copy holds an emissive list entry per section rank of its most emissive step.
+        let ranks = |m: ModelId| {
+            core.model_cpu
+                .get(m.0 as usize)
+                .map_or(0, |c| c.emissive_sections)
+        };
+        let stride = chain
+            .iter()
+            .map(|&(m, _)| ranks(m))
+            .fold(ranks(model), u32::max);
+        let held = core
+            .model_cpu
+            .get(model.0 as usize)
+            .map_or(0, |c| c.emissive_stride);
+        if stride > held {
+            let frame = core.next_frame - 1;
+            let strides = |m: ModelId| {
+                if m == model {
+                    stride
+                } else {
+                    core.model_cpu
+                        .get(m.0 as usize)
+                        .map_or(0, |c| c.emissive_stride)
+                }
+            };
+            let page_stride = |page: PageId| {
+                core.mounts.page_prototypes(page).map_or(0, |protos| {
+                    if protos.iter().any(|p| p.model == model) {
+                        protos.iter().map(|p| strides(p.model)).max().unwrap_or(0)
+                    } else {
+                        0
+                    }
+                })
+            };
+            // Every scene's ranges first, so a scene without room changes none.
+            let mut growths = Vec::new();
+            for scene in core.scenes.iter().flatten() {
+                match scene.reserve_entries(model.0, stride, page_stride) {
+                    Ok(g) => growths.push((scene, g)),
+                    Err(e) => {
+                        for (scene, g) in growths {
+                            scene.release_entries(g);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            for (scene, g) in growths {
+                scene.grow_entries(g, frame, &core.seq);
+            }
+            core.model_cpu[model.0 as usize].emissive_stride = stride;
+        }
         if chain.is_empty() {
             core.chains.remove(&model);
         } else {
@@ -1546,7 +1604,11 @@ impl<'a> Frame<'a> {
                     + scene.desc.producer_capacity,
                 proxies: t.proxies.gpu(),
                 proxy_capacity: scene.desc.medium_proxy_capacity,
-                _pad: 0,
+                light_base: scene.desc.instance_capacity
+                    + scene.desc.part_capacity
+                    + scene.desc.producer_capacity
+                    + scene.desc.medium_proxy_capacity,
+                emissive_lists: t.emissive_lists.gpu(),
             };
             let src = window.put(device, &root)?;
             records.push(Record::values(core.next_seq(), t.root.gpu(), src, 1));
@@ -1607,11 +1669,24 @@ impl<'a> Frame<'a> {
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
         let mut expansions = Vec::new();
+        let mut entry_jobs = Vec::new();
         for &id in &self.listed {
             let scene = core.scene(id)?;
             let root = scene.tables.root.gpu();
             let mut cpu = scene.cpu.lock().unwrap();
             let cpu = &mut *cpu;
+            if !cpu.entry_jobs.is_empty() {
+                let jobs = std::mem::take(&mut cpu.entry_jobs);
+                let (src, out) = window.slice::<[u32; 4]>(device, jobs.len() as u32)?;
+                out.copy_from_slice(&jobs);
+                entry_jobs.push(emissive::Root {
+                    scene: root,
+                    jobs: src.cast(),
+                    job_count: jobs.len() as u32,
+                    _pad0: 0,
+                    _pad1: 0,
+                });
+            }
             for p in cpu.pages.iter_mut().filter(|p| !p.expanded) {
                 let records = cpu.groups[p.group.0 as usize]
                     .as_ref()
@@ -1682,8 +1757,13 @@ impl<'a> Frame<'a> {
                 });
             }
         }
-        if !expansions.is_empty() || !motions.is_empty() {
+        if !expansions.is_empty() || !motions.is_empty() || !entry_jobs.is_empty() {
             list.begin_pass("instance pages", false);
+            for r in &entry_jobs {
+                let ptr = window.put_root(device, r)?;
+                let p = self.pipelines.get(own.emissive_entries);
+                list.dispatch(p, ptr, [r.job_count.div_ceil(64), 1, 1]);
+            }
             for r in &expansions {
                 let ptr = window.put_root(device, r)?;
                 let p = self.pipelines.get(own.expand_page);
@@ -1876,6 +1956,8 @@ impl<'a> Frame<'a> {
             for &(_, scene, _, _, desc) in &roots {
                 let r = emissive::Root {
                     scene,
+                    jobs: GpuPtr::NULL,
+                    job_count: 0,
                     _pad0: 0,
                     _pad1: 0,
                 };

@@ -549,6 +549,8 @@ float3 froxel_local<S : ISurface, M : IMedium>(FroxelRoot r, uint3 f, float3 x, 
     rays++;
     // The baked environment carries the medium, as next-event estimation takes it.
     float3 vis = visibility<S, M>(r.scene, r.view, x, chosen.dir, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, around, set.shadow_overflows);
+    if (chosen.view && any(vis > 0.0))
+        vis *= emitter_view_layer<S>(set, chosen, interior_ior(r.scene, around.innermost()));
     return l * vis * (sum / chosen_target) * INV_FOUR_PI;
 }
 

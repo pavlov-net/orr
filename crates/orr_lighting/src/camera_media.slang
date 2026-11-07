@@ -492,7 +492,7 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
             if (!at_sheet && d < linked_end)
                 m = M.sample(data, p);
             NeeVertex nv = nee_vertex(set, p, float3(0.0), pixel, nullptr);
-            ResolvedLightSample c = nee_candidate(set, nv, rng);
+            ResolvedLightSample c = nee_candidate<S>(set, nv, rng);
             float cos_theta = dot(c.dir, dir);
             float3 sigma_t = float3(0.0);
             float3 sigma_s = m.sigma_s;
@@ -527,6 +527,8 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
                     float t_max = isfinite(c.distance) ? c.distance * (1.0 - 1e-4) : c.distance;
                     RayCone cone = { 0.0, 0.0 };
                     float3 vis = visibility<S, M>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind == LIGHT_SAMPLE_ENVIRONMENT, Interior(), set.shadow_overflows);
+                    if (c.view && any(vis > 0.0))
+                        vis *= emitter_view_layer<S>(set, c, AMBIENT_IOR);
                     source += scatter * l * vis / c.pdf;
                 }
                 source += sigma_s * multiple_scattered<M>(set, p);

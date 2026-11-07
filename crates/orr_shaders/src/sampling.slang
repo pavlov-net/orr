@@ -112,17 +112,51 @@ public float ggx_vndf_bounded_pdf(float3 v, float3 l, float2 alpha)
     return d * (t - v.z) / (2.0 * len2);
 }
 
-public float mis_power(float pdf_a, float pdf_b)
+// The weight of technique `a` against technique `b` by the balance heuristic (Veach 1997,
+// section 9.2): its density over their sum. Next-event estimation weighs with its
+// candidates' source density, which a resampled pick only approximates, and the balance
+// heuristic's bound on variance holds for any pair of densities, where the power heuristic
+// sharpens the error of that approximation.
+public float mis_balance(float pdf_a, float pdf_b)
 {
     if (!(pdf_a > 0.0))
         return 0.0;
-    float a = pdf_a * pdf_a;
-    return a / (a + pdf_b * pdf_b);
+    return pdf_a / (pdf_a + pdf_b);
+}
+
+// Share `share` in [0, 1] of a fixed-point CDF whose last value is 0xffffffff. A float holds
+// 0xffffffff only as 2^32, past what a conversion to uint is defined for, so the largest value
+// this gives is the largest float below it; a CDF's last position takes 0xffffffff itself.
+public uint fixed_point_share(float share)
+{
+    return uint(min(round(share * 4294967295.0), 4294967040.0));
+}
+
+// The high 32 bits of `a` x `b`: a uniform `a` maps to [0, b) in proportion.
+public uint mulhi(uint a, uint b)
+{
+    return uint((uint64_t(a) * uint64_t(b)) >> 32);
 }
 
 // The first of `count` non-decreasing cumulative sums from `cdf` above `target`, which lies
 // below the last.
 public uint upper_bound(float* cdf, uint count, float target)
+{
+    uint lo = 0;
+    uint hi = count - 1;
+    while (lo < hi)
+    {
+        uint mid = (lo + hi) / 2;
+        if (cdf[mid] > target)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return lo;
+}
+
+// As above, over fixed-point sums.
+public uint upper_bound(uint* cdf, uint count, uint target)
 {
     uint lo = 0;
     uint hi = count - 1;

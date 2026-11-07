@@ -270,6 +270,12 @@ public struct Bsdf : IDifferentiable
         return emitted;
     }
 
+    // What `emission` scales `BsdfParams.emission` by: the coat and fuzz, 0 from inside.
+    public float3 emission_layer()
+    {
+        return inside ? float3(0.0) : layer;
+    }
+
     // BSDF x cos toward `wi`, over every non-delta lobe.
     [ForwardDifferentiable]
     public float3 eval(no_diff float3 wi)

@@ -112,9 +112,9 @@ fn bounded_ggx_vndf_matches_its_density() {
 }
 
 #[test]
-fn power_heuristic_is_zero_where_its_technique_has_no_density() {
-    assert_eq!(mis_power(0.0, 0.0), 0.0);
-    assert_eq!(mis_power(0.0, 3.0), 0.0);
-    assert_eq!(mis_power(3.0, 0.0), 1.0);
-    assert_eq!(mis_power(2.0, 1.0), 0.8);
+fn balance_heuristic_is_zero_where_its_technique_has_no_density() {
+    assert_eq!(mis_balance(0.0, 0.0), 0.0);
+    assert_eq!(mis_balance(0.0, 3.0), 0.0);
+    assert_eq!(mis_balance(3.0, 0.0), 1.0);
+    assert_eq!(mis_balance(3.0, 1.0), 0.75);
 }

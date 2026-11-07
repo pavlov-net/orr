@@ -6,15 +6,15 @@ use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSetting
 use orr_gpu::{GpuPtr, MemoryKind};
 use orr_math::{Affine3, DMat3, DVec3, Mat3, Vec2, Vec3};
 use orr_pack::material::Material;
-use orr_pack::mesh::MeshInfo;
+use orr_pack::mesh::{Cluster, MeshInfo};
 use orr_pack::{Archive, AssetId, Span, Target};
 use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
-    ClusterTopology, CopyVariant, EditDesc, EmissiveGpu, FrameDesc, FrameTime, GroupWriter,
-    InstanceFlags, InstanceGpu, InstanceRange, InstancesDesc, LoadState, MaterialGpu, MaterialId,
-    MeshGpu, ModelGpu, PackSource, ProducerDesc, ProducerId, ProducerUpdate, RendererDesc,
-    RtCutGpu, SceneDesc, SceneId, SceneRoot, Scenes, SlotStateGpu, TransformGroupDesc,
-    TransformGroupId, material_flags,
+    ClusterRef, ClusterTopology, CopyVariant, EditDesc, EmissiveGpu, FrameDesc, FrameTime,
+    GroupWriter, InstanceFlags, InstanceGpu, InstanceRange, InstancesDesc, LoadState, MaterialGpu,
+    MaterialId, MeshGpu, ModelGpu, ModelId, MountId, PackSource, ProducerDesc, ProducerId,
+    ProducerUpdate, RendererDesc, RtCutGpu, SceneDesc, SceneId, SceneRoot, Scenes, SlotStateGpu,
+    TransformGroupDesc, TransformGroupId, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 use scene_suite::shaders::emit;
@@ -740,5 +740,237 @@ fn producer_power_follows_emitted_clusters_every_frame() {
     let all = entries(&root);
     assert_eq!((all[1].kind, all[1].power), (0, [0.0; 3]));
     check(&all[2], statics, "static entry");
+    assert_clean();
+}
+
+/// `lights.slang`'s `GATHERED_SET` and `GATHERED_CLUSTERS`.
+const GATHERED_SET: u32 = 0xffff_fffe;
+const GATHERED_CLUSTERS: u32 = 16;
+
+/// Mounts `bytes` on new scenes with one scene of `emissive_capacity` instance entries.
+fn mounted(bytes: Arc<[u8]>, emissive_capacity: u32) -> (Scenes, SceneId, MountId) {
+    let mut scenes = Scenes::new(device(), &RendererDesc::default()).unwrap();
+    let s = scenes
+        .create_scene(&SceneDesc {
+            emissive_capacity,
+            ..SceneDesc::default()
+        })
+        .unwrap();
+    let m = scenes.mount(PackSource::Memory(bytes));
+    while matches!(scenes.mount_state(m), LoadState::Pending) {
+        let f = scenes.begin_frame(&frame(&[])).unwrap();
+        f.end(&[]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    (scenes, s, m)
+}
+
+/// One copy of `model` at `transform`, traced, around a focus at the origin.
+fn place(
+    scenes: &mut Scenes,
+    s: SceneId,
+    model: ModelId,
+    transform: Affine3,
+) -> (InstanceRange, TransformGroupId) {
+    let list = [s];
+    let mut f = scenes.begin_frame(&frame(&list)).unwrap();
+    let mut w = f.scene(s).unwrap();
+    w.set_focus(DVec3::ZERO);
+    let g = w
+        .create_transform_group(&TransformGroupDesc {
+            count: 1,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    w.transforms(g, 0, 1).unwrap()[0] = transform.into();
+    let copy = w
+        .add_instances(&InstancesDesc {
+            model,
+            copies: 1,
+            transforms: g,
+            first: 0,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 1e5,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    drop(w);
+    f.update_scenes(&mut |_| {}).unwrap();
+    wait(f.end(&[]).unwrap());
+    (copy, g)
+}
+
+/// Runs a frame of `s`, moving group `g`'s transform to `transform` first where given, and
+/// returns the scene's root.
+fn run_frame(
+    scenes: &mut Scenes,
+    s: SceneId,
+    moved: Option<(TransformGroupId, Affine3)>,
+) -> SceneRoot {
+    let list = [s];
+    let mut f = scenes.begin_frame(&frame(&list)).unwrap();
+    if let Some((g, t)) = moved {
+        let mut w = f.scene(s).unwrap();
+        w.transforms(g, 0, 1).unwrap()[0] = t.into();
+    }
+    let mut root = GpuPtr::NULL;
+    f.update_scenes(&mut |c| root = c.root).unwrap();
+    wait(f.end(&[]).unwrap());
+    read_buffer(root, 1)[0]
+}
+
+/// A copy of a DAG mesh whose sets hold no tree gathers its cut, fine near the focus and coarse
+/// far from it; where the cut it traces is one built that frame, each entry samples the list
+/// its traversal gathered: the traced clusters of its section, at most `GATHERED_CLUSTERS`, with
+/// a fixed-point CDF by cluster area ending at the top.
+#[test]
+fn a_copy_tracing_a_cut_it_built_samples_its_gathered_clusters() {
+    let d = device();
+    if d.caps().cluster.max_tris == 0 || d.caps().cluster.max_partitions == 0 {
+        return;
+    }
+    let bytes = pack_of(vec![sheet_asset(
+        "lamp",
+        32,
+        lamp_materials(),
+        LodMode::Dag,
+    )]);
+    let archive = Archive::from_memory(Arc::clone(&bytes)).unwrap();
+    let entry = archive.find(AssetId::from_name("lamp/mesh")).unwrap();
+    let info = MeshInfo::parse(&read_blob(&archive, &archive.blobs(entry)[0])).unwrap();
+    assert!(
+        info.emissive.sets.iter().all(|s| s.node_count == 0),
+        "the sheet's sets hold no tree"
+    );
+    let ranks = info.emissive.rank_count();
+    let (mut scenes, s, m) = mounted(bytes, ranks);
+    let model = scenes.model(m, AssetId::from_name("lamp")).unwrap();
+    // 100 m across, its near corner at the focus.
+    let (copy, _) = place(
+        &mut scenes,
+        s,
+        model,
+        Affine3::from_scale(Vec3::splat(33.0)),
+    );
+    let mut gathered = 0;
+    for _ in 0..8 {
+        let root = run_frame(&mut scenes, s, None);
+        let st: SlotStateGpu = read_buffer(root.slot_state.offset(u64::from(copy.first)), 1)[0];
+        let record: ModelGpu = read_buffer(root.models.offset(u64::from(model.0)), 1)[0];
+        let mesh: MeshGpu = read_buffer(root.meshes.offset(u64::from(record.mesh)), 1)[0];
+        let live: Vec<(u32, EmissiveGpu)> = (0..)
+            .zip(entries(&root))
+            .filter(|(_, e)| e.kind != 0)
+            .collect();
+        assert_eq!(live.len(), ranks as usize);
+        if st.rt_lod != 255 {
+            assert!(
+                live.iter().all(|(_, e)| e.set != GATHERED_SET),
+                "a cached cut's entries"
+            );
+            continue;
+        }
+        gathered += 1;
+        for (i, e) in live {
+            assert_eq!(e.set, GATHERED_SET, "rank {}", e.rank);
+            let n = e.gathered.min(GATHERED_CLUSTERS);
+            assert!(n > 0, "rank {}: nothing gathered", e.rank);
+            assert_eq!(e.cluster_count, n);
+            let at = (i - root.producer_capacity) * 2 * GATHERED_CLUSTERS;
+            let list: Vec<u32> = read_buffer(
+                root.emissive_lists.offset(u64::from(at)),
+                u64::from(2 * GATHERED_CLUSTERS),
+            );
+            let section = info
+                .emissive
+                .ranks
+                .iter()
+                .position(|&r| r == e.rank)
+                .unwrap();
+            let areas: Vec<f64> = list[..n as usize]
+                .iter()
+                .map(|&c| {
+                    assert!(c < mesh.cluster_count, "rank {}: cluster {c}", e.rank);
+                    let r: ClusterRef =
+                        read_buffer(root.clusters.offset(u64::from(mesh.cluster_base + c)), 1)[0];
+                    let at = 96 + u64::from(r.local) * size_of::<Cluster>() as u64;
+                    let cl: Cluster = read_buffer(r.page.offset(at).cast(), 1)[0];
+                    assert_eq!(
+                        usize::from(cl.section),
+                        section,
+                        "rank {}: cluster {c}",
+                        e.rank
+                    );
+                    f64::from(cl.area)
+                })
+                .collect();
+            let cdf = &list[GATHERED_CLUSTERS as usize..(GATHERED_CLUSTERS + n) as usize];
+            assert_eq!(
+                *cdf.last().unwrap(),
+                u32::MAX,
+                "rank {}: last value",
+                e.rank
+            );
+            let total: f64 = areas.iter().sum();
+            let mut sum = 0.0;
+            for (k, a) in areas.iter().enumerate() {
+                sum += a;
+                let expected = sum / total * f64::from(u32::MAX);
+                assert!(
+                    (f64::from(cdf[k]) - expected).abs() <= 1e-5 * f64::from(u32::MAX),
+                    "rank {}: CDF value {k}",
+                    e.rank
+                );
+            }
+        }
+    }
+    assert!(gathered > 0, "the copy never traced a cut it built");
+    assert_clean();
+}
+
+/// A chain whose farther model has more emissive sections than the model gives every live copy
+/// an entry per section of the most emissive step, so the copy emits at that step.
+#[test]
+fn a_chain_with_a_more_emissive_step_grows_its_copies_entries() {
+    let d = device();
+    if d.caps().cluster.max_tris == 0 || d.caps().cluster.max_partitions == 0 {
+        return;
+    }
+    let (mut scenes, s, m) = mounted(pack(), 8);
+    let lamp = scenes.model(m, AssetId::from_name("lamp")).unwrap();
+    let plain = scenes.model(m, AssetId::from_name("plain")).unwrap();
+    let (copy, g) = place(&mut scenes, s, plain, Affine3::IDENTITY);
+    let root = run_frame(&mut scenes, s, None);
+    let record: InstanceGpu = read_buffer(root.instances.offset(u64::from(copy.first)), 1)[0];
+    assert_eq!(
+        (record.first_emissive, record.emissive_count),
+        (u32::MAX, 0)
+    );
+
+    scenes.set_chain(plain, &[(lamp, 10.0)]).unwrap();
+    let root = run_frame(&mut scenes, s, None);
+    let record: InstanceGpu = read_buffer(root.instances.offset(u64::from(copy.first)), 1)[0];
+    assert_eq!(record.emissive_count, 2, "entries after the chain");
+    let all = entries(&root);
+    for k in 0..2 {
+        let e = all[(record.first_emissive + k) as usize];
+        assert_eq!((e.kind, e.source, e.rank), (1, copy.first, k), "entry {k}");
+    }
+    // Past the switch distance the copy shows the lamp, whose sections emit.
+    let far = Affine3::from_translation(Vec3::new(40.0, 0.0, 0.0));
+    let mut root = root;
+    for _ in 0..24 {
+        root = run_frame(&mut scenes, s, Some((g, far)));
+    }
+    let all = entries(&root);
+    let emitting = (0..2)
+        .map(|k| all[(record.first_emissive + k) as usize])
+        .filter(|e| e.cluster_count > 0 && e.power.iter().any(|&p| p > 0.0))
+        .count();
+    assert_eq!(emitting, 2, "the lamp's sections at its step");
     assert_clean();
 }

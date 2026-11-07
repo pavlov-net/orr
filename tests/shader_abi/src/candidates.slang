@@ -41,8 +41,10 @@ struct Layers : ICandidate, ITranslucent
         return (c.primitive_index & 1) == 0 ? float3(0.5) : float3(1.0);
     }
 
-    float4 layer(Candidate c)
+    float4 layer(inout Candidate c)
     {
+        if (!c.triangle)
+            return float4(0.0);
         return (c.primitive_index & 1) == 0 ? float4(0.25, 0.25, 0.25, 0.5) : float4(0.0);
     }
 

@@ -93,7 +93,7 @@ export __extern_cpp float orr_ggx_vndf_bounded_pdf(float* v, float* l, float ax,
     return ggx_vndf_bounded_pdf(load3(v), load3(l), float2(ax, ay));
 }
 
-export __extern_cpp float orr_mis_power(float a, float b) { return mis_power(a, b); }
+export __extern_cpp float orr_mis_balance(float a, float b) { return mis_balance(a, b); }
 export __extern_cpp uint orr_pack_unorm8(float v) { return pack_unorm8(v); }
 export __extern_cpp float orr_unpack_unorm8(uint p) { return unpack_unorm8(p); }
 export __extern_cpp uint orr_pack_snorm8(float v) { return pack_snorm8(v); }

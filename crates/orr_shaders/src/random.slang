@@ -181,6 +181,14 @@ public struct Sampler
         return owen_sobol(nested_uniform_scramble(index, s), 0, s);
     }
 
+    // One dimension as 32 random bits, for picks that need the full fixed-point range.
+    [mutating]
+    public uint next_bits()
+    {
+        uint s = next_seed();
+        return nested_uniform_scramble(sobol(nested_uniform_scramble(index, s), 0), hash_combine(s, 0));
+    }
+
     [mutating]
     public float2 next2()
     {

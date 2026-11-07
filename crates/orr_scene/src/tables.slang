@@ -287,7 +287,9 @@ public struct SetTablesGpu
     public uint2* index;           // (mesh cluster, position in the set), ascending by cluster
     public uint8_t* nodes;         // SetNode table
     public uint count;             // ranks
-    public uint _pad;
+    // 1 when copies of the mesh trace cached cuts only: a cut can hold more clusters of one
+    // section than a gathered list keeps.
+    public uint cached;
 }
 
 // A mesh made resident from a mounted pack, or an edit of one. Page and node page addresses
@@ -354,6 +356,7 @@ public struct SkinMeshGpu
     public uint* cut_clusters;     // the mesh clusters of each cut, ascending, cut after cut
     public uint* cut_first;        // per cut: its first entry in `cut_clusters`, then the total
     public float* cut_error;       // per cut: the largest error of its clusters, m, mesh space
+    public uint* cut_row;          // per cut: its row of the mesh's cooked sets
     public uint cut_count;
     public uint vertex_count;
     public float bound;            // the largest deformation bound of its clusters, m; 0: unbounded
@@ -455,7 +458,8 @@ public struct SceneRoot
     public uint proxy_base;          // PTLAS index of medium proxy 0
     public MediumProxyGpu* proxies;  // by MediumProxyId
     public uint proxy_capacity;
-    public uint _pad;
+    public uint light_base;          // PTLAS index of the proxy of LightId 0
+    public uint* emissive_lists;     // per instance entry: its gathered list (`gathered_list`)
 }
 
 // The medium proxy a PTLAS instance index of class CLASS_MEDIUM names.
@@ -516,17 +520,42 @@ public uint chain_far(SlotStateGpu st)
     return word_step(chain_word(st), true);
 }
 
-// The cached cut of `mesh`, the mesh of its nearer step, that slot `slot` traces now. False
-// when its PTLAS instance holds no cached cut of that mesh: nothing, a farther step or a
-// cut gathered for the frame. An edit's copies gather level 0, which its cut 0 stands for.
-public bool traced_cut(SceneRoot* s, uint slot, MeshGpu* mesh, out uint cut)
+// What the emissive entries of slot `slot` sample: the cooked row of the cut its PTLAS
+// instance holds of `mesh`, its record `inst`'s mesh at its nearer step, or with `gathered`
+// the list its traversal gathered for the BLAS built this frame. A skinned copy's skinning cut
+// names its row, and an edit's copies gather level 0, which cut 0 stands for. False when the
+// instance holds nothing of that step.
+public bool traced_row(SceneRoot* s, uint slot, InstanceGpu inst, MeshGpu* mesh, out uint row, out bool gathered)
 {
     SlotStateGpu st = s.slot_state[slot];
-    bool edit = mesh.edit != nullptr;
-    cut = edit ? 0 : uint(st.rt_lod);
+    row = 0;
+    gathered = false;
     if ((st.rt_flags & RT_WRITTEN) == 0 || ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) != chain_near(st))
         return false;
-    return edit || (cut != RT_CUT_BUILT && cut < mesh.rt_cut_count);
+    if ((inst.flags & INSTANCE_SKINNED) != 0)
+    {
+        if (inst.pose_index >= s.skinned_capacity || mesh.skin == nullptr)
+            return false;
+        SkinStateGpu k = s.skin_state[inst.pose_index];
+        if (st.rt_lod != RT_CUT_BUILT || k.blas == 0 || k.cut >= mesh.skin.cut_count)
+            return false;
+        row = mesh.skin.cut_row[k.cut];
+        return true;
+    }
+    if (mesh.edit != nullptr)
+    {
+        row = mesh.rt_cuts[0].row;
+        return mesh.rt_cut_count > 0;
+    }
+    if (st.rt_lod == RT_CUT_BUILT)
+    {
+        gathered = true;
+        return true;
+    }
+    if (uint(st.rt_lod) >= mesh.rt_cut_count)
+        return false;
+    row = mesh.rt_cuts[st.rt_lod].row;
+    return true;
 }
 
 // The step slot copy `copy` draws and traces.

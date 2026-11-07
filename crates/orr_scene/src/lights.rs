@@ -20,14 +20,16 @@ impl LightId {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Light {
     Directional(DirectionalLight),
-    /// A sphere emitting `intensity` candela, optionally limited to a cone.
+    /// A sphere emitting `intensity` candela, optionally limited to a cone. Only the BSDF rays
+    /// of paths see its body: the camera does not, and it casts no shadow.
     Sphere {
         position: DVec3,
         radius: f32,
         intensity: Vec3,
         cone: Option<Cone>,
     },
-    /// A one-sided rectangle emitting `luminance` nits towards `edge_x` x `edge_y`.
+    /// A one-sided rectangle emitting `luminance` nits towards `edge_x` x `edge_y`. Only the
+    /// BSDF rays of paths see it: the camera does not, and it casts no shadow.
     Rect {
         center: DVec3,
         edge_x: Vec3,
@@ -81,6 +83,8 @@ pub(crate) const EMISSIVE_INSTANCE: u32 = 1;
 pub(crate) const EMISSIVE_PRODUCER: u32 = 2;
 /// `EmissiveGpu::set` of an entry that emits nothing this frame.
 pub(crate) const NO_SET: u32 = !0;
+/// `lights.slang` `GATHERED_CLUSTERS`: clusters an instance entry's gathered list holds.
+pub(crate) const GATHERED_CLUSTERS: u32 = 16;
 /// `InstanceGpu::first_emissive` of a copy with no emissive list entries.
 pub(crate) const NO_EMISSIVE: u32 = !0;
 

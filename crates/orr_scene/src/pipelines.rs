@@ -87,6 +87,7 @@ pub(crate) struct Own {
     pub(crate) rebase: PipelineId,
     pub(crate) emissive_instances: PipelineId,
     pub(crate) emissive_producers: PipelineId,
+    pub(crate) emissive_entries: PipelineId,
     pub(crate) animate: PipelineId,
     pub(crate) composite: PipelineId,
     pub(crate) expand_page: PipelineId,
@@ -114,6 +115,7 @@ impl Pipelines {
                 page_motion: PipelineId(0),
                 emissive_instances: PipelineId(0),
                 emissive_producers: PipelineId(0),
+                emissive_entries: PipelineId(0),
                 animate: PipelineId(0),
                 composite: PipelineId(0),
             },
@@ -126,6 +128,7 @@ impl Pipelines {
             page_motion: p.create(device, kernels, &page_motion::MODULE, "motion", none)?,
             emissive_instances: p.create(device, kernels, &emissive::MODULE, "instances", none)?,
             emissive_producers: p.create(device, kernels, &emissive::MODULE, "producers", none)?,
+            emissive_entries: p.create(device, kernels, &emissive::MODULE, "entries", none)?,
             animate: p.create(device, kernels, &animation::MODULE, "animate", none)?,
             composite: p.create(device, kernels, &transparency::MODULE, "composite", none)?,
         };
