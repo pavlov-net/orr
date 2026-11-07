@@ -1,5 +1,6 @@
-// The opaque dispatch: one path per G-buffer pixel. The raygen entry reorders lanes at each
-// coherence point; the compute entry runs the same body without reordering.
+// The view paths of the tiles that hold no layer: one path per pixel from the G-buffer's surface.
+// The raygen entry reorders lanes at each coherence point; the compute entry runs the same body
+// without reordering.
 #include "orr_root.h"
 import orr_shaders.coherence;
 import orr_lighting.environment;
@@ -17,7 +18,7 @@ ORR_ROOT_INLINE(PathRoot);
 void raygen_main()
 {
     ORR_OMM(raygen_main);
-    opaque_body<Reorder, Surface, Environment, Medium>(root, DispatchRaysIndex().xy);
+    view_body<Reorder, Surface, Environment, Medium, false>(root, DispatchRaysIndex().xy);
 }
 
 [shader("compute")]
@@ -26,5 +27,5 @@ void compute_main(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(compute_main);
     if (all(id.xy < root.gbuffer.extent))
-        opaque_body<NoReorder, Surface, Environment, Medium>(root, id.xy);
+        view_body<NoReorder, Surface, Environment, Medium, false>(root, id.xy);
 }

@@ -55,8 +55,6 @@ pub mod material_flags {
     pub const DISPLACEMENT_WORLD: u32 = 1 << 27;
     /// `MaterialGpu::back` is the material of the surface's back.
     pub const HAS_BACK: u32 = 1 << 28;
-    /// It is the back of the material `MaterialGpu::back`.
-    pub const BACK_SIDE: u32 = 1 << 29;
     /// Displacement reads `TEXTURE_DISPLACEMENT_U` and `TEXTURE_DISPLACEMENT_V` too.
     pub const DISPLACED_TANGENT: u32 = 1 << 30;
     /// `material_medium` reads textures.
@@ -134,24 +132,6 @@ fn binding_modes(b: &TextureBinding, t: &BoundTexture) -> u32 {
         | u32::from(t.primaries & 3) << PRIMARIES_SHIFT
         | u32::from(b.vertex & 7) << VERTEX_SHIFT
         | u32::from(b.vertex_complement) << VERTEX_COMPLEMENT_SHIFT
-}
-
-/// The `orr_shaders.trace` candidate class of a model whose sections have material flags `flags`:
-/// 1 (dielectric) where every section is `DIELECTRIC`, 2 (presence) where every section is
-/// `PRESENCE` and none `DIELECTRIC`, 0 (opaque) where none is either; `None` for a mix.
-pub(crate) fn candidate_class(flags: impl IntoIterator<Item = u32>) -> Option<u8> {
-    let class = |f: u32| {
-        if f & material_flags::DIELECTRIC != 0 {
-            1
-        } else if f & material_flags::PRESENCE != 0 {
-            2
-        } else {
-            0
-        }
-    };
-    let mut classes = flags.into_iter().map(class);
-    let first = classes.next().unwrap_or(0);
-    classes.all(|c| c == first).then_some(first)
 }
 
 /// A linear Rec.709 color in linear Rec.2020.
@@ -456,19 +436,6 @@ impl MaterialWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_model_mixing_layered_and_opaque_sections_has_no_candidate_class() {
-        use material_flags::{DIELECTRIC, EMISSIVE, PRESENCE};
-        assert_eq!(candidate_class([0, EMISSIVE]), Some(0));
-        assert_eq!(
-            candidate_class([DIELECTRIC, DIELECTRIC | PRESENCE]),
-            Some(1)
-        );
-        assert_eq!(candidate_class([PRESENCE]), Some(2));
-        assert_eq!(candidate_class([DIELECTRIC, 0]), None);
-        assert_eq!(candidate_class([PRESENCE, DIELECTRIC]), None);
-    }
 
     #[test]
     fn cooked_materials_take_their_flags_cost_class_and_slot_bits() {

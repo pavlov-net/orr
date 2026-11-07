@@ -39,7 +39,7 @@ public struct GuideRoot
     public SceneRoot* scene;
     public ViewConstants* view;
     public GBufferGpu* gbuffer;
-    // This frame's dielectric dispatch's layer memory (`traced_tiles`); null for none.
+    // This frame's layer memory (`traced_tiles`); null for none.
     public LayerGuide* layers;
     public StorageImageIndex radiance;          // RGBA16F, written only for a GUIDE_* debug view
     public StorageImageIndex diffuse_albedo;    // RGBA8
@@ -73,7 +73,7 @@ public struct OverlayFrontRoot
 // `guide_luminance(after - before)` for each blur.
 public struct FrostRoot
 {
-    // The layer memory (`traced_tiles`) of a dielectric dispatch with DIELECTRIC_FROST at
+    // The layer memory (`traced_tiles`) of a view dispatch with DIELECTRIC_FROST at
     // `width` x `height`, which keeps every pixel's `background`.
     public LayerGuide* layers;
     public StorageImageIndex guide;     // R16F

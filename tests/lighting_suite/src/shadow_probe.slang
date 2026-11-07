@@ -1,6 +1,7 @@
-// Shadow rays from a list of origins along one direction, as next-event estimation traces
-// them: per ray the shadow product, written or with `add` added to what is there, and how
-// many rays ran past the candidate limit.
+// Shadow rays from a list of origins along one direction, to `dir.w` m or without it to infinity,
+// as next-event estimation traces them, from inside `inside` where that is a material: per ray
+// the shadow product, written or with `add` added to what is there, and how many rays ran past
+// the candidate limit.
 #include "orr_root.h"
 import orr_shaders.trace;
 import orr_scene.hit;
@@ -18,7 +19,8 @@ struct Root
     float4 dir;
     uint count;
     uint add;
-    uint64_t _pad2;
+    uint inside;
+    uint _pad2;
 }
 ORR_ROOT(Root);
 
@@ -31,6 +33,10 @@ void main(uint3 id: SV_DispatchThreadID)
         return;
     RayCone cone = { 0.0, 0.0 };
     HitContext context = hit_context(HIT_SECONDARY, 1, cone, 0.0);
-    float3 t = visibility<StandardSurface, NoMedium>(root.scene, root.view, root.origins[id.x].xyz, root.dir.xyz, positive_infinity(), RAY_FLAG_NONE, context, false, root.overflows);
+    float t_max = root.dir.w > 0.0 ? root.dir.w : positive_infinity();
+    Interior start = Interior();
+    if (root.inside != MATERIAL_NONE)
+        start.cross(root.inside, true);
+    float3 t = visibility<StandardSurface, NoMedium>(root.scene, root.view, root.origins[id.x].xyz, root.dir.xyz, t_max, RAY_FLAG_NONE, context, false, start, root.overflows);
     root.transmittance[id.x] = float4(t, 0.0) + (root.add != 0 ? root.transmittance[id.x] : float4(0.0));
 }

@@ -24,6 +24,12 @@ public static const uint CLUSTER_CLASS_SHIFT = 5; // 2 bits: orr_shaders.trace C
 // `Cluster.omm_first` of a cluster without micromaps.
 public static const uint CLUSTER_NO_OMM = 0xffffffff;
 
+// Cluster `c`'s class, from orr_shaders.trace.
+public uint cluster_class(Cluster c)
+{
+    return (c.flags >> CLUSTER_CLASS_SHIFT) & 3;
+}
+
 // 96 B. Cluster records follow it.
 public struct PageHeader
 {

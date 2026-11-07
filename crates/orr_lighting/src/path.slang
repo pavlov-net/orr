@@ -1,12 +1,27 @@
-// The opaque path: per pixel, the G-buffer's surface as the first vertex, then BSDF bounces
-// through the scene's PTLAS. Every vertex runs next-event estimation by resampled importance
-// sampling over the light set's mixture and traces one shadow ray for the winner; BSDF rays
-// add the environment, directional discs and emission they reach, weighted against
-// next-event estimation by the power heuristic. Hits shade through the kernel's linked
-// surface with a `HitContext`. Paths may end in the scene's world cache; the cache's update
-// paths trace the same path and add what each vertex scattered to its cell. Radiance is
-// written pre-exposed. Each pixel also writes its light feedback, one of the lights that
-// added to its path, for the next frame's light selection and local samplers.
+// One path loop for every kind of path: a view's, from the first layer of a traced tile, the
+// G-buffer's surface or a thin lens, and the world cache's update paths. A vertex runs next-event
+// estimation by resampled importance sampling over the light set's mixture and traces one shadow
+// ray for the winner, then samples its BSDF, phase function or way out, and its ray goes through
+// the scene's PTLAS; BSDF rays add the environment, directional discs and emission they reach,
+// weighted against next-event estimation by the power heuristic. Hits shade through the kernel's
+// linked surface with a `HitContext`. Paths may end in the scene's world cache; the cache's update
+// paths trace the same loop and add what each vertex scattered to its cell. Radiance is written
+// pre-exposed. Each pixel also writes its light feedback, one of the lights that added to its
+// path, for the next frame's light selection and local samplers.
+//
+// A presence layer passes a ray on with probability 1 - opacity; a dielectric picks reflection or
+// refraction by Fresnel per path. Nested dielectrics keep an interior list of material ids,
+// innermost last: the IOR outside an interface is the innermost other entry's, so glass in water
+// refracts against water. Further layer hits are path vertices up to `dielectric_depth`. Segments
+// inside an interior take its Beer transmittance; a scattering interior takes one distance sample
+// per segment. Where the segment scatters less than once on average, a scatter there shades by
+// directional next-event estimation through the surface without bending, the Henyey-Greenstein
+// phase function and the world cache for the rest. Elsewhere it starts a walk, as subsurface
+// materials do, that reflects back or refracts out of the surface by Fresnel on the triangle's
+// plane; the way out gathers the light it reaches, and next-event estimation there the lights,
+// taking the radiance inside as uniform. A camera inside a medium starts from `camera_medium`,
+// flipped at each surface between the eye and the near plane; media apply gives its camera segment
+// from the froxels, and only without them, as under the reference, a distance sample here does.
 module path;
 
 import orr_shaders.packing;
@@ -28,6 +43,10 @@ import orr_lighting.light_sampling;
 import orr_lighting.world_cache;
 import orr_lighting.subsurface;
 import orr_lighting.shadow;
+import orr_lighting.openpbr;
+import orr_lighting.interiors;
+import orr_lighting.froxels;
+import orr_lighting.spectrum;
 
 // `PathRoot.mode`: what the radiance image holds.
 public static const uint PATH_FULL = 0;
@@ -41,10 +60,16 @@ public static const uint PATH_CACHE = 7;        // the cache's radiance at x1, a
 public static const uint PATH_CACHE_LOD = 8;    // x1's cache level in r, 1 in g where a resolved cell answers, a hash of the cell in b
 public static const uint PATH_SUBSURFACE = 9;   // light leaving through the path's subsurface walk
 
+// `PathRoot.dielectric_flags`.
+public static const uint DIELECTRIC_REFERENCE = 1 << 0;   // the accumulation reference: scatter on every interior segment, no cache
+public static const uint DIELECTRIC_DEBUG_LAYER = 1 << 1; // the radiance shows the first layer's shares
+public static const uint DIELECTRIC_DISPERSION = 1 << 2;  // dispersive materials split paths by wavelength
+public static const uint DIELECTRIC_FROST = 1 << 3;       // the view keeps each pixel's `background`
+
 // `PathRoot.cache_flags`: paths may end in the world cache.
 public static const uint CACHE_TERMINATE = 1 << 0;
 
-// `PathRoot.light_flags`: the opaque dispatch counts each pixel's light feedback into the
+// `PathRoot.light_flags`: the view dispatch counts each pixel's light feedback into the
 // scene's selection.
 public static const uint LIGHT_FEEDBACK_COUNT = 1 << 0;
 
@@ -63,11 +88,17 @@ public static const uint WALK_STREAM = 0x85EBCA6B;
 // Separates the pixel subset's sample from the path's.
 public static const uint SUBSET_STREAM = 0x27D4EB2F;
 
-// Separates an update path's samples from the opaque path's of the same pixel.
+// Separates an update path's samples from the view path's of the same pixel.
 public static const uint UPDATE_STREAM = 0x9E3779B9;
 
-// Separates the background layer's samples from the opaque path's of the same pixel.
+// Separates the background layer's samples from the view path's of the same pixel.
 public static const uint DOF_STREAM = 0x165667B1;
+
+// Seeds a path's draws of presence layers.
+public static const uint LAYER_STREAM = 0x85EBCA6B;
+
+// The stream of a dispersive path's hero wavelength.
+public static const uint WAVELENGTH_STREAM = 0xD3A2646C;
 
 // Vertices of an update path that add samples to the cache.
 public static const uint UPDATE_VERTICES = 4;
@@ -117,9 +148,9 @@ public struct PathRoot
     public StorageImageIndex feedback;
     public uint local_columns;
     public uint light_flags;            // LIGHT_*
-    // The dielectric dispatch's: its layer memory (`traced_tiles`), the view's froxels this
-    // frame (null for none), the layer vertices a path may have, the dielectric whose
-    // interior holds the eye (MATERIAL_NONE for none) and DIELECTRIC_* flags.
+    // The view's layer memory (`traced_tiles`), its froxels this frame (null for none), the
+    // layer vertices a path may have, the dielectric whose interior holds the eye (MATERIAL_NONE
+    // for none) and DIELECTRIC_* flags.
     public LayerGuide* layers;
     public FroxelVolume* froxels;
     public uint dielectric_depth;
@@ -172,7 +203,7 @@ public float2 overlay_front_motion(uint64_t word)
     return float2(f16tof32(low & 0xffff), f16tof32(low >> 16));
 }
 
-// What the dielectric dispatch leaves the guide resolve of a pixel's first dielectric or
+// What the layer guide dispatch leaves the guide resolve of a pixel's first dielectric or
 // presence layer.
 public struct LayerGuide
 {
@@ -185,16 +216,15 @@ public struct LayerGuide
     public float2 motion;           // the dominant layer's, previous uv minus current uv
     public float2 specular_motion;
     public uint dominant;           // 1: `depth` and `motion` replace the G-buffer's
-    // Where the camera segment through the linked medium ends: m from the eye to the layer
-    // the pixel shades; 0: at the G-buffer's surface or the sky; below 0: nowhere, the
-    // dispatch's path carries the segment through an interior.
+    // Written by the view dispatch: where the camera segment through the linked medium ends,
+    // m from the eye to the layer the pixel shades; 0: at the G-buffer's surface or the sky;
+    // below 0: nowhere, the path carries the segment through an interior.
     public float medium_end;
-    // 1 + the innermost interior at the pixel's near-plane point when the froxels hold its camera
-    // segment, which makes MATERIAL_NONE 0, as on every zeroed guide.
-    public uint eye_medium;
-    // With DIELECTRIC_FROST, on every pixel whether its tile was traced or not:
-    // `guide_luminance` of the radiance the opaque dispatch left the pixel, which the
-    // frosted-glass term blurs.
+    // The interiors at the pixel's near-plane point.
+    public EyeInterior near_interior;
+    // Written by the view dispatch with DIELECTRIC_FROST, on every pixel whether its tile was
+    // traced or not: `guide_luminance` of what the frosted-glass term blurs, the pixel's radiance
+    // or, where it has a blur, that of the path from its G-buffer surface.
     public float background;
     // With DIELECTRIC_FROST on a pixel whose dominant layer is rough transmission: half
     // floats of the blur its lobes give the background, as a radius in pixels (low), and of
@@ -202,10 +232,10 @@ public struct LayerGuide
     public uint frost;
 }
 
-// The dielectric dispatch's memory at G-buffer extent `extent`, from `LayerGuide*`: a guide
-// per pixel in rows of extent.x; then per LAYER_TILE tile, in rows, a word that is nonzero
-// where this frame's dispatch traced the tile and wrote its guides; then the tile indices it
-// traces; then their count, its compute workgroups and its ray extent.
+// A view's layer memory at G-buffer extent `extent`, from `LayerGuide*`: a guide per pixel in
+// rows of extent.x; then per LAYER_TILE tile, in rows, a word that is nonzero where this frame's
+// paths look for layers and the layer guides were written; then the tile indices; then their
+// count, the compute workgroups of the dispatches over them and their ray extent.
 public uint* traced_tiles(LayerGuide* layers, uint2 extent)
 {
     return (uint*)(layers + extent.x * extent.y);
@@ -221,7 +251,29 @@ public uint* layer_tile_args(LayerGuide* layers, uint2 extent)
     return layer_tile_list(layers, extent) + layer_tile_count(extent);
 }
 
-// The guide of `pixel` as this frame's dispatch left it; no layer where it did not trace.
+// The pixel of invocation `lane` (row-major in its tile) of listed tile `entry`.
+public uint2 layer_tile_pixel(PathRoot r, uint entry, uint2 lane)
+{
+    uint2 extent = r.gbuffer.extent;
+    uint columns = layer_tile_columns(extent);
+    uint index = layer_tile_list(r.layers, extent)[entry];
+    return uint2(index % columns, index / columns) * LAYER_TILE + lane;
+}
+
+// The pixel of invocation `lane` of an 8 x 4 workgroup of the dispatches over the listed tiles,
+// two workgroups to a tile; false past the list or the extent.
+public bool layer_group_pixel(PathRoot r, uint3 group, uint2 lane, out uint2 pixel)
+{
+    uint g = grid_index(group);
+    uint2 extent = r.gbuffer.extent;
+    pixel = uint2(0);
+    if ((g >> 1) >= layer_tile_args(r.layers, extent)[0])
+        return false;
+    pixel = layer_tile_pixel(r, g >> 1, lane + uint2(0, 4 * (g & 1)));
+    return all(pixel < extent);
+}
+
+// The guide of `pixel` as this frame left it; no layer where its tile was not traced.
 public LayerGuide layer_guide(LayerGuide* layers, uint2 extent, uint2 pixel)
 {
     if (traced_tiles(layers, extent)[layer_tile(extent, pixel)] == 0)
@@ -355,7 +407,7 @@ public struct ParticleEmission<A : IAnyHit> : ITranslucent
         float3 n;
         float3 e;
         float a;
-        if (c.custom_index != CLASS_PARTICLE || c.cluster_id < 0
+        if (c.class_id != CLASS_PARTICLE || c.cluster_id < 0
             || !resolve_particle(scene, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, material, n, e, a))
             return float4(0.0);
         a = saturate(a);
@@ -371,7 +423,7 @@ public struct ParticleEmission<A : IAnyHit> : ITranslucent
 
     public bool accept(Candidate c)
     {
-        return c.custom_index != CLASS_PARTICLE && other.accept(c);
+        return c.class_id != CLASS_PARTICLE && other.accept(c);
     }
 }
 
@@ -421,29 +473,6 @@ public interface IShadow
     // carries the medium. `weigh` is false where no BSDF ray reaches the same light the same
     // way, so the estimate takes weight 1.
     float3 transmittance(float3 origin, float3 dir, float t_max, HitContext context, bool environment, out bool weigh);
-}
-
-// Shadow rays through the scene and its linked medium, counting their overflows in
-// `overflows`.
-public struct SceneShadow<S : ISurface, M : IMedium> : IShadow
-{
-    public SceneRoot* scene;
-    public ViewConstants* view;
-    public uint* overflows;
-
-    public float3 transmittance(float3 origin, float3 dir, float t_max, HitContext context, bool environment, out bool weigh)
-    {
-        weigh = true;
-        // Environment light reaches vertices without the medium's transmittance, as BSDF
-        // misses see it: the baked map carries the medium.
-        return visibility<S, M>(scene, view, origin, dir, t_max, RAY_FLAG_NONE, context, environment, overflows);
-    }
-}
-
-public SceneShadow<S, M> scene_shadow<S : ISurface, M : IMedium>(PathRoot r)
-{
-    SceneShadow<S, M> shadow = { r.scene, r.view, r.set.shadow_overflows };
-    return shadow;
 }
 
 // Next-event estimation at `x` (a zero shading normal for a point in a medium), weighed by
@@ -665,44 +694,519 @@ public WalkExitScatter walk_exit(PathVertex x, BsdfParams p, inout Sampler rng)
     return f;
 }
 
-// A path vertex's scatter: its BSDF, or at a walk's exit `walk`.
-public struct PathScatter : IScatter
+// Applies an interior segment of length `t` (+inf: unbounded) to `throughput`: its Beer
+// transmittance, or with `scatter` one distance sample from the extinction, picking a channel
+// uniformly and weighing by the channels' mean density. True with `at` set where the sample
+// scatters before `t`. Draws two sampler dimensions.
+public bool interior_segment(InteriorMedium m, float t, bool scatter, inout Sampler rng, inout float3 throughput, out float at)
 {
-    public Bsdf b;
-    public bool exit;
-    public WalkExitScatter walk;
+    at = 0.0;
+    float u_channel = rng.next();
+    float u_distance = rng.next();
+    if (!scatter || !any(m.sigma_s > 0.0))
+    {
+        throughput *= beer(m.sigma_t, t);
+        return false;
+    }
+    float sigma = m.sigma_t[min(uint(u_channel * 3.0), 2u)];
+    float sampled = sigma > 0.0 ? -log(1.0 - u_distance) / sigma : positive_infinity();
+    if (sampled < t)
+    {
+        float3 tr = beer(m.sigma_t, sampled);
+        float pdf = dot(m.sigma_t * tr, float3(1.0 / 3.0));
+        throughput *= pdf > 0.0 ? m.sigma_s * tr / pdf : float3(0.0);
+        at = sampled;
+        return true;
+    }
+    float3 tr = beer(m.sigma_t, t);
+    float p = dot(select(m.sigma_t > 0.0, tr, float3(1.0)), float3(1.0 / 3.0));
+    throughput *= p > 0.0 ? tr / p : float3(0.0);
+    return false;
+}
+
+public bool is_layer(Hit h)
+{
+    return h.hit && (h.class_id == CLASS_DIELECTRIC || h.class_id == CLASS_PRESENCE);
+}
+
+// Shadow rays of a vertex: it arrived with interior list `arrived`, on the surface of material
+// `surface` (MATERIAL_NONE elsewhere) with outward geometric normal `normal` (zero inside a medium,
+// where `above` holds the medium). The shadow product takes each interior's Beer transmittance
+// and its surface's Fresnel transmission, unbent; rays leaving through an interior take weight 1,
+// since BSDF rays reach the light bent.
+public struct LayerShadow<S : ISurface, M : IMedium> : IShadow
+{
+    public SceneRoot* scene;
+    public ViewConstants* view;
+    public uint* overflows;
+    public Interior arrived;
+    public uint surface;
+    public float4 point;            // on `surface`: what its medium reads when a ray enters it here
+    public float3 normal;
+    public uint below;              // against `normal`, MATERIAL_NONE outside every interior
+    public uint above;
+
+    public float3 transmittance(float3 origin, float3 dir, float t_max, HitContext context, bool environment, out bool weigh)
+    {
+        bool down = dot(dir, normal) < 0.0;
+        weigh = (down ? below : above) == MATERIAL_NONE;
+        Interior inside = arrived;
+        if (surface != MATERIAL_NONE)
+            inside.cross(surface, down, point);
+        // Environment light reaches vertices without the medium's transmittance, as BSDF
+        // misses see it: the baked map carries the medium.
+        return visibility<S, M>(scene, view, origin, dir, t_max, RAY_FLAG_NONE, context, environment, inside, overflows);
+    }
+}
+
+// Light from outside as an interior's walk gathers it where it leaves through a surface of
+// `eta` times the outside's IOR. The radiance inside is taken as uniform, so what leaves along
+// the walk's way out arrives from `wi` by Lambert reflection on outward normal `n` times the
+// Fresnel transmission from `wi`, over its mean, which keeps the energy of uniform light.
+public struct InteriorExitScatter : IScatter
+{
+    public float3 n;
+    public float eta;
+    public float scale;             // 1 / the transmission's cosine-weighted mean
+
+    public float3 eval(float3 wi)
+    {
+        float c = dot(n, wi);
+        if (!(c > 0.0))
+            return float3(0.0);
+        return float3((1.0 - openpbr_fresnel(eta, c)) * scale * c * INV_PI);
+    }
+
+    public float pdf(float3 wi)
+    {
+        return cosine_hemisphere_pdf(dot(n, wi));
+    }
 
     public float3 eval_and_pdf(float3 wi, out float density)
     {
+        density = pdf(wi);
+        return eval(wi);
+    }
+}
+
+public InteriorExitScatter interior_exit(float3 n, float eta)
+{
+    // The mean, evenly in the cosine squared.
+    float sum = 0.0;
+    for (uint i = 0; i < 16; i++)
+        sum += 1.0 - openpbr_fresnel(eta, sqrt((float(i) + 0.5) / 16.0));
+    InteriorExitScatter f = { n, eta, 16.0 / sum };
+    return f;
+}
+// What next-event estimation weighs light by at a path's vertex: its BSDF, or at
+// a scatter in an interior the phase function.
+public struct VertexScatter : IScatter
+{
+    public Bsdf b;
+    public bool phase;
+    public float3 travel;           // a scatter's: the path's direction into it
+    public float anisotropy;
+    public bool exit;               // a walk's exit, which scatters as `walk`
+    public WalkExitScatter walk;
+    public bool leave;              // a walk leaving an interior, which scatters as `way_out`
+    public InteriorExitScatter way_out;
+
+    public float3 eval_and_pdf(float3 wi, out float density)
+    {
+        if (phase)
+        {
+            density = hg_phase(anisotropy, dot(travel, wi));
+            return float3(density);
+        }
+        if (leave)
+            return way_out.eval_and_pdf(wi, density);
         if (exit)
             return walk.eval_and_pdf(wi, density);
         return b.eval_and_pdf(wi, density);
     }
 }
+// `LayerVertex.kind`.
+public static const uint VERTEX_OPAQUE = 0;
+public static const uint VERTEX_LAYER = 1;
+public static const uint VERTEX_SCATTER = 2;
+public static const uint VERTEX_LEAVE = 3;      // a walk leaving an interior, along a way it chose
 
-// What the BSDF ray of a vertex needs after its trace to weight what it reaches.
-struct BsdfRay
+// A vertex of a path.
+public struct LayerVertex
+{
+    public PathVertex x;            // a layer's normals keep the material's orientation
+    public uint kind;               // VERTEX_*
+    public uint section;            // a layer's section material, which owns its interior
+    public bool front;              // a layer reached from its front side
+    public float anisotropy;        // a scatter's phase function
+}
+
+// The vertex of a layer hit by a ray along `dir`: the shading normal leaned toward the ray's
+// origin on the side the ray arrived from, both normals kept on the material's front side so
+// the BSDF sees which side the path is on.
+public LayerVertex layer_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
+{
+    LayerVertex l;
+    l.kind = VERTEX_LAYER;
+    l.section = sh.section;
+    l.front = dot(sh.surface.geometric_normal, dir) < 0.0;
+    l.anisotropy = 0.0;
+    PathVertex x;
+    x.surface = sh.surface;
+    x.view = -dir;
+    float side = l.front ? 1.0 : -1.0;
+    x.surface.normal = side * lean_normal(side * sh.surface.normal, x.view);
+    x.origin_error = sh.geometric_error;
+    x.plane_point = sh.surface.position - dir * sh.depth_offset;
+    x.camera_distance = length(sh.surface.position - v.eye_render.xyz);
+    l.x = x;
+    return l;
+}
+
+public LayerVertex opaque_vertex(PathVertex x)
+{
+    LayerVertex l;
+    l.x = x;
+    l.kind = VERTEX_OPAQUE;
+    l.section = MATERIAL_NONE;
+    l.front = true;
+    l.anisotropy = 0.0;
+    return l;
+}
+
+// A scatter at `p` in interior `medium`, reached along `dir`.
+public LayerVertex scatter_vertex(ViewConstants* v, float3 p, float3 dir, uint medium, float anisotropy)
+{
+    LayerVertex l;
+    l.kind = VERTEX_SCATTER;
+    l.section = MATERIAL_NONE;
+    l.front = true;
+    l.anisotropy = anisotropy;
+    PathVertex x = (PathVertex)0;
+    x.surface.position = p;
+    x.surface.material = medium;
+    x.view = -dir;
+    x.plane_point = p;
+    x.camera_distance = length(p - v.eye_render.xyz);
+    l.x = x;
+    return l;
+}
+
+// A walk leaving through the surface at `p` with outward normal `n`.
+public LayerVertex leave_vertex(ViewConstants* v, float3 p, float3 n)
+{
+    LayerVertex l;
+    l.kind = VERTEX_LEAVE;
+    l.section = MATERIAL_NONE;
+    l.front = true;
+    l.anisotropy = 0.0;
+    PathVertex x = (PathVertex)0;
+    x.surface.position = p;
+    x.surface.normal = n;
+    x.surface.geometric_normal = n;
+    x.surface.material = MATERIAL_NONE;
+    x.view = n;
+    x.plane_point = p;
+    x.camera_distance = length(p - v.eye_render.xyz);
+    l.x = x;
+    return l;
+}
+
+public bool thin_walled(GSurface s)
+{
+    return (s.bsdf.flags & BSDF_THIN_WALLED) != 0;
+}
+
+// The parameters of layer or opaque vertex `l`, its coat, fuzz and film collapsed with `collapse`.
+public BsdfParams vertex_params(LayerVertex l, bool collapse)
+{
+    return collapse ? bsdf_collapse(l.x.surface.bsdf) : l.x.surface.bsdf;
+}
+
+// Whether material `m`'s IOR varies with wavelength.
+public bool disperses(SceneRoot* s, uint m)
+{
+    if (m == MATERIAL_NONE)
+        return false;
+    MaterialGpu* g = s.materials + m;
+    return g.transmission_dispersion_scale > 0.0 && g.transmission_dispersion_abbe_number > 0.0;
+}
+
+// `ior`, the IOR of material `m` at 587.6 nm, at wavelength `nm`, with what `point` reads.
+public float dispersed_material_ior(SceneRoot* s, uint m, float ior, float nm, float4 point)
+{
+    if (m == MATERIAL_NONE)
+        return ior;
+    MediumParams p = material_medium(s.materials + m, point);
+    return dispersed_ior(ior, p.dispersion_scale, p.dispersion_abbe, nm);
+}
+
+// Whether layer vertex `l`, reached with `interior`, has a dispersive side.
+public bool layer_disperses(SceneRoot* s, LayerVertex l, Interior interior)
+{
+    uint m = l.section;
+    return l.kind == VERTEX_LAYER && (disperses(s, m) || disperses(s, interior.outside(m, m)));
+}
+
+// The BSDF of layer or opaque vertex `l`, against the interior list the path arrived with: a
+// layer's exterior IOR is the innermost other entry's, an opaque vertex's the innermost entry's,
+// so a pool floor meets water. Unless the vertex `walks`, its subsurface share is diffuse
+// reflection. A layer takes both IORs at wavelength `nm` where it is above 0, else at 587.6 nm.
+public Bsdf prepare_vertex(SceneRoot* s, LayerVertex l, Interior interior, bool collapse, bool walks, bool adjoint, float nm)
+{
+    BsdfParams p = walk_params(vertex_params(l, collapse), walks);
+    uint m = l.section;
+    bool layer = l.kind == VERTEX_LAYER;
+    uint outside = layer ? interior.outside(m, m) : interior.innermost();
+    float exterior = interior_ior(s, outside);
+    if (layer && nm > 0.0)
+    {
+        // A path inside `m` read it where it entered; a path meeting it reads it here.
+        float4 entered = interior.point(m);
+        float4 point = entered.x != NO_MEDIUM_POINT.x ? entered : l.x.surface.medium_point;
+        p.specular_ior = dispersed_material_ior(s, m, p.specular_ior, nm, point);
+        exterior = dispersed_material_ior(s, outside, exterior, nm, interior.point(outside));
+    }
+    return bsdf_prepare(p, l.x.surface.normal, l.x.view, exterior, adjoint);
+}
+
+// A path's wavelengths once it meets a dispersive layer; before that its colors are plain
+// RGB. From there the path follows the hero's refraction, and every companion's estimate is
+// weighed by its own BSDF and density at each direction the hero drew at a dispersive layer,
+// over the mean density of all four (the balance heuristic over wavelengths). The path's
+// throughput stays the hero's; `transfer` takes its contributions to Rec.2020.
+public struct Spectral
+{
+    public bool on;
+    float sample;                   // what draws the wavelengths
+    public float4 value;            // per wavelength: its BSDF values over the hero's, multiplied along the path
+    public float4 density;          // its densities over the hero's
+    public float3x3 transfer;
+
+    public __init()
+    {
+        on = false;
+        sample = 0.0;
+        value = float4(1.0);
+        density = float4(1.0);
+        transfer = float3x3(0.0);
+    }
+
+    // Draws the wavelengths from `u`.
+    [mutating]
+    public void start(float u)
+    {
+        on = true;
+        sample = u;
+        update();
+    }
+
+    // The hero's wavelength, 0 before the path disperses.
+    public float hero()
+    {
+        return on ? sample_wavelengths(sample).nm.x : 0.0;
+    }
+
+    // Whether a companion still carries an estimate.
+    public bool companions()
+    {
+        return on && any(density.yzw > 0.0);
+    }
+
+    // Weighs companion `k` by its BSDF x cos `f` and density `pdf` toward the direction the
+    // hero drew with BSDF x cos `hero_f` and density `hero_pdf`.
+    [mutating]
+    public void weigh(uint k, float3 f, float pdf, float3 hero_f, float hero_pdf)
+    {
+        float3 basis = spectrum_basis(sample_wavelengths(sample).nm[k]);
+        float own = dot(f, basis);
+        float theirs = dot(hero_f, basis);
+        value[k] *= theirs > 0.0 ? own / theirs : 0.0;
+        density[k] *= hero_pdf > 0.0 ? pdf / hero_pdf : 0.0;
+        if (!(value[k] > 0.0) || !(density[k] > 0.0) || !isfinite(value[k] * density[k]))
+        {
+            value[k] = 0.0;
+            density[k] = 0.0;
+        }
+    }
+
+    [mutating]
+    public void update()
+    {
+        float mean = dot(density, float4(1.0 / float(WAVELENGTHS)));
+        transfer = spectral_transfer(sample_wavelengths(sample), mean > 0.0 ? value / mean : float4(0.0));
+    }
+
+    // Wavelength `k`.
+    public float wavelength(uint k)
+    {
+        return sample_wavelengths(sample).nm[k];
+    }
+
+    // Contribution `c` in Rec.2020.
+    public float3 color(float3 c)
+    {
+        return on ? mul(transfer, c) : c;
+    }
+}
+
+// The hero wavelength's sample of pixel `pixel`, a dimension of its own.
+public float wavelength_sample(PathRoot r, uint2 pixel)
+{
+    Sampler rng = Sampler(pixel, r.frame, r.seed ^ LAYER_STREAM ^ WAVELENGTH_STREAM);
+    return rng.next();
+}
+
+// The shadow of vertex `l` against the interior list it was reached with.
+public LayerShadow<S, M> vertex_shadow<S : ISurface, M : IMedium>(PathRoot r, LayerVertex l, Interior interior)
+{
+    LayerShadow<S, M> shadow;
+    shadow.scene = r.scene;
+    shadow.view = r.view;
+    shadow.overflows = r.set.shadow_overflows;
+    shadow.arrived = interior;
+    shadow.surface = MATERIAL_NONE;
+    shadow.normal = float3(0.0);
+    if (l.kind == VERTEX_LAYER)
+    {
+        uint m = l.section;
+        uint out = interior.outside(m, m);
+        bool crosses = crosses_interior(r.scene, m);
+        shadow.normal = l.x.surface.geometric_normal;
+        shadow.above = out;
+        shadow.below = crosses ? m : out;
+        if (crosses)
+        {
+            shadow.surface = m;
+            shadow.point = l.x.surface.medium_point;
+        }
+    }
+    else
+    {
+        shadow.above = interior.innermost();
+        shadow.below = shadow.above;
+    }
+    return shadow;
+}
+
+// The incident radiance a scatter at `p` takes from the world cache: the mean of its cells
+// facing along and against `dir`. Draws eight sampler dimensions.
+public float3 interior_ambient(PathRoot r, float3 p, float3 dir, inout Sampler rng)
+{
+    float3 sum = float3(0.0);
+    for (uint k = 0; k < 2; k++)
+    {
+        CacheCell cell = cache_cell(r.cache, r.scene, p, k == 0 ? dir : -dir, rng.next4().xyz, true);
+        float3 cached;
+        if (cache_lookup(r.cache, cell.key, cached))
+            sum += cached;
+    }
+    return 0.5 * sum;
+}
+
+// Steps of an interior's walk through the scene: every face of opaque geometry and layers.
+// Faces of its own material seen from behind reflect it back or let it out by Fresnel on their
+// plane, the walk's `ior` times the outside's; any other surface ends the walk there.
+public struct InteriorWalk<S : ISurface> : IWalkTrace
+{
+    public SceneRoot* scene;
+    public ViewConstants* view;
+    public HitContext context;
+    public uint seed;
+    public uint material;
+    public float ior;
+
+    public Hit trace(float3 origin, float3 dir, float t_max, out float3 positions[3])
+    {
+        LayerAccept<S> a = { scene, view, dir, context, seed, PRESENCE_DRAWN };
+        return trace_closest(scene.tlas, path_ray(origin, dir, t_max), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+    }
+
+    public WalkMeet meet(Hit h, float3 origin, float3 dir, float3 positions[3], inout Sampler rng)
+    {
+        float3 normal;
+        uint m;
+        if (h.cluster_id < 0 || !hit_geometry(scene, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, normal, m))
+            return WalkMeet(WALK_BOUNDARY);
+        float c = dot(normal, dir);
+        if (m != material || !(c > 0.0))
+            return WalkMeet(WALK_BOUNDARY);
+        float3 p = origin + dir * h.t;
+        float3 way_out = refract(dir, -normal, ior);
+        if (rng.next() < openpbr_fresnel(1.0 / ior, c) || all(way_out == 0.0))
+        {
+            WalkMeet back = WalkMeet(WALK_REFLECT);
+            back.dir = reflect(dir, normal);
+            back.origin = ray_origin(p, p, normal, back.dir, ORIGIN_DEFAULT, 0.0, length(p - view.eye_render.xyz));
+            return back;
+        }
+        WalkMeet leave = WalkMeet(WALK_LEAVE);
+        leave.dir = normalize(way_out);
+        leave.origin = p;
+        leave.normal = normal;
+        return leave;
+    }
+}
+
+// The walk of interior medium `im` from a scatter at `from` reached along `dir`, its surface
+// `ior` times the outside's.
+public Walk walk_interior(float3 from, float3 dir, InteriorMedium im, float ior, inout Sampler rng)
+{
+    SubsurfaceVolume volume;
+    volume.extinction = im.sigma_t;
+    volume.albedo = im.albedo();
+    volume.anisotropy = im.anisotropy;
+    Sampler walk = walk_sampler(rng);
+    float2 u = walk.next2();
+    return walk_start(from, sample_hg(im.anisotropy, dir, u), volume, ior, walk);
+}
+
+// What traces a walk in interior `medium`, its surface `ior` times the outside's.
+public InteriorWalk<S> interior_tracer<S : ISurface>(PathRoot r, uint medium, float ior, uint seed, uint depth)
+{
+    RayCone cone = { 0.0, 0.0 };
+    InteriorWalk<S> tracer = { r.scene, r.view, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0), seed, medium, ior };
+    return tracer;
+}
+
+// What leaves a path's vertex.
+struct LayerRay
 {
     float3 origin;
     float3 dir;
-    float pdf;          // 0 for an ideal-specular direction
-    float run;          // the vertex's next-event probability
-    float3 normal;      // the vertex's shading normal
-    bool diffuse;       // sampled from a diffuse lobe
+    float pdf;                      // 0 for an ideal-specular direction
+    float run;                      // the vertex's next-event probability
+    float3 normal;                  // the vertex's shading normal, zero in a medium
+    bool diffuse;
+    bool chain;                     // left a layer or a scatter
+    bool scatter;                   // may scatter in an interior
+    bool local;                     // left the first vertex, which reads its tile's local light sampler
 }
 
 // What a path records about its vertices as it traces them.
 public interface IPathRecord
 {
-    // Whether a front-face hit at path depth `depth` (x1 is 0) may end the path in the cache,
-    // given that the ray reaching it left a diffuse lobe, that its cone is wider than the
-    // hit's cell, and that it is the last bounce's.
-    bool may_end(uint depth, bool diffuse, bool wide, bool last);
+    // Whether a front-face hit past `scattered` opaque vertices and scatters (x1 is the first)
+    // may end the path in the cache, given that the ray reaching it left a diffuse lobe, that
+    // its cone is wider than the hit's cell, and that it is the last bounce's.
+    bool may_end(uint scattered, bool diffuse, bool wide, bool last);
     // Whether its subsurface vertices may walk; where they do not, their subsurface share is
     // diffuse reflection.
     bool walks();
+    // Whether its paths meet dielectric and presence layers and keep an interior list; where
+    // they do not, its build leaves out the camera ray and the vertices on layers and in interiors.
+    bool crosses();
+    // Whether its paths carry flux from a light rather than importance from the camera, so
+    // refraction leaves their weight unscaled.
+    bool adjoint();
+    // Whether dispersive materials split its paths by wavelength.
+    bool spectral();
     // Whether the ray leaving x1 resolves particles by their emission.
     bool particles();
+    // The path reached its first vertex `x`, prepared as `b` (`t` m from the eye), a layer's
+    // where `layer` holds; a sky pixel's path reaches none.
+    [mutating]
+    void arrive(PathRoot r, PathVertex x, Bsdf b, float t, bool layer);
     // Vertex `x`, prepared as `b`, reached with `throughput` once the path's radiance (its
     // emission included) was `radiance`; next-event estimation and a BSDF ray follow it.
     [mutating]
@@ -710,19 +1214,25 @@ public interface IPathRecord
     // Light with feedback id `id` added `contribution` of luminance to the path's radiance.
     [mutating]
     void light(uint id, float contribution);
-    // The path ended with `radiance`.
+    // The path ended with `radiance` after `layers` layer vertices.
     [mutating]
-    void finish(PathRoot r, float3 radiance);
+    void finish(PathRoot r, float3 radiance, uint layers);
 }
 
 // A view's path: it ends in the cache after a diffuse bounce, where its cone outgrew the
 // cell, or at the last bounce. Its light feedback is one of the lights that added to it,
 // chosen with probability proportional to what each added.
-public struct ViewPath : IPathRecord
+public struct ViewPath<let CROSSES : bool> : IPathRecord
 {
     public uint feedback;
     float total;
     uint state;
+    public float first_t;               // m from the eye to the first vertex, 0 without one
+    public float first_distance;        // that vertex's camera distance, 0 without one
+    public bool first_layer;
+    public float reflected;             // of a first layer: luminance of its reflection and diffuse lobes
+    public float transmitted;           // and of its transmission
+    public uint layers;
 
     // `seed` picks the feedback's random choices, apart from the path's sampler.
     public __init(uint seed)
@@ -730,11 +1240,17 @@ public struct ViewPath : IPathRecord
         feedback = NO_LIGHT;
         total = 0.0;
         state = seed;
+        first_t = 0.0;
+        first_distance = 0.0;
+        first_layer = false;
+        reflected = 0.0;
+        transmitted = 0.0;
+        layers = 0;
     }
 
-    public bool may_end(uint depth, bool diffuse, bool wide, bool last)
+    public bool may_end(uint scattered, bool diffuse, bool wide, bool last)
     {
-        return depth >= 1 && (diffuse || wide || last);
+        return scattered >= 1 && (diffuse || wide || last);
     }
 
     public bool walks()
@@ -742,9 +1258,37 @@ public struct ViewPath : IPathRecord
         return true;
     }
 
+    public bool crosses()
+    {
+        return CROSSES;
+    }
+
+    public bool adjoint()
+    {
+        return false;
+    }
+
+    public bool spectral()
+    {
+        return CROSSES;
+    }
+
     public bool particles()
     {
         return true;
+    }
+
+    [mutating]
+    public void arrive(PathRoot r, PathVertex x, Bsdf b, float t, bool layer)
+    {
+        first_t = t;
+        first_distance = x.camera_distance;
+        first_layer = layer;
+        if (layer)
+        {
+            reflected = luminance_rec2020(b.albedo().specular + b.albedo().diffuse);
+            transmitted = luminance_rec2020(b.albedo().transmission);
+        }
     }
 
     [mutating]
@@ -762,11 +1306,15 @@ public struct ViewPath : IPathRecord
     }
 
     [mutating]
-    public void finish(PathRoot r, float3 radiance) {}
+    public void finish(PathRoot r, float3 radiance, uint count)
+    {
+        layers = count;
+    }
 }
 
-// An update path: it resamples the cache from depth 2 on, and adds to the cell of each of
-// its first `UPDATE_VERTICES` vertices the light that vertex scattered, over its albedo.
+// An update path: it resamples the cache from its second opaque vertex on, and adds to the
+// cell of each of its first `UPDATE_VERTICES` opaque vertices the light that vertex scattered,
+// over its albedo.
 public struct CacheUpdate : IPathRecord
 {
     uint count;
@@ -785,9 +1333,9 @@ public struct CacheUpdate : IPathRecord
         }
     }
 
-    public bool may_end(uint depth, bool diffuse, bool wide, bool last)
+    public bool may_end(uint scattered, bool diffuse, bool wide, bool last)
     {
-        return depth >= 2;
+        return scattered >= 2;
     }
 
     // The cache holds the zero mean free path limit of subsurface surfaces.
@@ -796,10 +1344,28 @@ public struct CacheUpdate : IPathRecord
         return false;
     }
 
+    public bool crosses()
+    {
+        return true;
+    }
+
+    public bool adjoint()
+    {
+        return false;
+    }
+
+    public bool spectral()
+    {
+        return false;
+    }
+
     public bool particles()
     {
         return false;
     }
+
+    [mutating]
+    public void arrive(PathRoot r, PathVertex x, Bsdf b, float t, bool layer) {}
 
     [mutating]
     public void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng)
@@ -821,263 +1387,624 @@ public struct CacheUpdate : IPathRecord
     public void light(uint id, float contribution) {}
 
     [mutating]
-    public void finish(PathRoot r, float3 radiance)
+    public void finish(PathRoot r, float3 radiance, uint layers)
     {
         for (uint i = 0; i < count; i++)
             cache_add(r.cache, keys[i], (radiance - before[i]) * scale[i]);
     }
 }
 
-// Iterations of an opaque path: a vertex and its ray each, and one subsurface walk.
-public uint path_iterations(PathRoot r)
+// How a path starts: the interiors around it and the camera ray its first iteration traces.
+public struct PathStart
 {
-    return r.max_bounces + 2;
+    public float3 origin;
+    public float3 dir;
+    public float t_max;             // m along `dir`
+    public float offset;            // m from the eye to `origin`
+    public float axis;              // cosine between `dir` and the view axis
+    public uint mask;               // 0: no ray, which starts the path at the G-buffer's surface
+    public bool gbuffer;            // the ray only looks for layers before the G-buffer's surface
+    public Interior interior;
 }
 
-// The opaque path of `pixel` from vertex `x1` (`depth` 0) through linked surface `S` and
-// medium `M`; `C` names the coherence point after each trace, and `record` sees its
-// vertices. With `CACHE_TERMINATE`, a front-face hit that `record` allows, reached by a ray
-// longer than `CACHE_MIN_RAY_CELLS` edges of its cell, ends in its resolved cell. Returns
-// unexposed radiance; `rays` counts every ray traced.
-public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRecord>(PathRoot r, PathVertex x1, uint2 pixel, inout Sampler rng, inout uint rays, inout R record)
+// Iterations of a path: a camera ray, then a vertex and its ray each, and one subsurface walk.
+// An interior's walk takes none of its own: it runs where a segment scatters, and its way out is
+// a vertex that counts as a bounce.
+public uint path_iterations(PathRoot r)
+{
+    return r.max_bounces + 4 + r.dielectric_depth;
+}
+
+// The path from `start` through linked surface `S` and medium `M`; `C` names the coherence point
+// after each trace, and `record` sees its vertices. With `CACHE_TERMINATE`, a front-face hit that
+// `record` allows, reached by a ray longer than `CACHE_MIN_RAY_CELLS` edges of its cell, ends in
+// its resolved cell. Returns unexposed radiance; `exposed` is the G-buffer's emission, which is
+// already pre-exposed, and `sky` the throughput of a camera ray that met nothing. `rays` counts
+// every ray traced.
+public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRecord>(PathRoot r, PathStart start, uint2 pixel, inout Sampler rng, inout uint rays, inout R record, out float3 exposed, out float3 sky)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
     LightSetGpu* set = r.set;
+    exposed = float3(0.0);
+    sky = float3(0.0);
     bool count_nee = r.mode != PATH_BSDF_ONLY;
     bool count_bsdf = r.mode != PATH_NEE_ONLY;
     bool one_technique = r.mode == PATH_NEE_ONLY || r.mode == PATH_BSDF_ONLY;
+    bool reference = (r.dielectric_flags & DIELECTRIC_REFERENCE) != 0;
     bool cache = (r.cache_flags & CACHE_TERMINATE) != 0 && !one_technique && r.mode != PATH_DIRECT;
+    bool disperse = record.spectral() && (r.dielectric_flags & DIELECTRIC_DISPERSION) != 0;
+    uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
 
-    PathVertex x = x1;
+    Interior interior = start.interior;
+    // The froxels hold a camera segment through an interior where this frame has them.
+    bool carried = record.crosses() && interior.count > 0 && r.froxels == nullptr;
+    LayerVertex l = (LayerVertex)0;
+    Bsdf b = bsdf_unprepared();
+    uint depth = 0;
     RayCone cone = camera_cone(v);
-    cone.width = cone_width(cone, x.camera_distance);
     bool walked = false;
-    BsdfParams params = walk_params(x.surface.bsdf, record.walks() && may_walk(r, x.surface, 0, walked, cone.width));
-    Bsdf b = bsdf_prepare(params, x.surface.normal, x.view);
-    // Set while `x` is a walk's exit, which scatters as `exit_scatter`.
-    bool exit = false;
-    WalkExitScatter exit_scatter = (WalkExitScatter)0;
+    Spectral spectral = Spectral();
+    // Whether `l` is a layer with a dispersive side.
+    bool dispersive = false;
     float3 throughput = float3(1.0);
     float3 radiance = float3(0.0);
-    bool alive = (x.surface.flags & GBUFFER_UNLIT) == 0;
-    BsdfRay ray = (BsdfRay)0;
-    // Only x1 reads its screen tile's local sampler.
-    LocalLights* x1_local = pixel_local_lights(r, pixel);
-    if (alive)
-        record.vertex(r, x, b, throughput, radiance, rng);
-
-    // A walk takes an iteration of its own, and its exit vertex the next one at the same depth.
-    uint depth = 0;
+    bool alive = true;
+    // Opaque vertices and scatters so far, which the bounce settings count.
+    uint opaque = 0;
+    // Layer vertices so far, which `dielectric_depth` limits.
+    uint layers = 0;
+    // Set once a non-delta ray enters an interior, whose vertex estimated the direct light
+    // there through the surface: the path then adds no direct light until its next opaque
+    // vertex or scatter, and its layers estimate none.
+    bool skip_direct = false;
+    // Set when a walk leaves an interior: while the path skips direct light, what it reaches
+    // still adds the environment, which the walk's exit leaves to its way out.
+    bool environment_after_walk = false;
+    // The interior the path last entered from outside and where, where a walk in that interior
+    // leaves at its cap.
+    uint entered = MATERIAL_NONE;
+    float3 entered_at = float3(0.0);
+    float3 entered_normal = float3(0.0);
+    float3 leave_dir = float3(0.0);
+    InteriorExitScatter leave_scatter = (InteriorExitScatter)0;
+    // A scatter that took the cache's light: it estimates its direct light and ends.
+    bool last = false;
+    // Set while `l` is a walk's exit, which scatters as `exit_scatter`.
+    bool exit = false;
+    WalkExitScatter exit_scatter = (WalkExitScatter)0;
+    LayerRay ray = (LayerRay)0;
+    ray.origin = start.origin;
+    ray.dir = start.dir;
     uint points = walk_points(r);
+    // Set for the first iteration, which traces the camera ray and leaves no vertex. Without
+    // one the path starts on the G-buffer's surface. Keeping that out of the loop keeps the
+    // loop's coherence point out of a branch, which costs far more than the second load.
+    bool camera = record.crosses() && start.mask != 0;
+    if (!camera)
+    {
+        PathVertex x;
+        if (!gbuffer_vertex(s, v, r.gbuffer, pixel, x))
+        {
+            sky = throughput;
+            record.finish(r, radiance, layers);
+            return radiance;
+        }
+        l = opaque_vertex(x);
+        opaque = 1;
+        cone.width = cone_width(cone, x.camera_distance);
+        bool walks = record.walks() && may_walk(r, x.surface, 0, walked, cone.width);
+        b = prepare_vertex(s, l, interior, false, walks, record.adjoint(), 0.0);
+        record.arrive(r, l.x, b, 0.0, false);
+        if (r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE)
+            exposed = b.emission();
+        alive = (x.surface.flags & GBUFFER_UNLIT) == 0;
+        if (interior.count == 0)
+        {
+            alive = alive && runs_path(r, pixel);
+            throughput /= r.pixel_fraction;
+        }
+        if (alive)
+            record.vertex(r, l.x, b, throughput, radiance, rng);
+    }
+
+    // A walk takes an iteration of its own, and its exit vertex the next one at the same
+    // depth.
     for (uint i = 0; i < path_iterations(r); i++)
     {
-        if (!alive || depth > r.max_bounces)
+        if (!alive || (!camera && l.kind != VERTEX_LAYER && opaque > r.max_bounces + 1))
             break;
         bool counted = r.mode == PATH_DIRECT ? depth == 0 : r.mode == PATH_INDIRECT ? depth > 0
             : r.mode == PATH_SUBSURFACE ? walked : true;
-        LocalLights* local = nullptr;
-        if (depth == 0)
-            local = x1_local;
         Hit h = (Hit)0;
         float3 positions[3] = { float3(0.0), float3(0.0), float3(0.0) };
-        // The particles in front of the ray's hit, premultiplied.
-        float4 particles = float4(0.0);
-        bool walking = false;
-        Walk walk = Walk();
+        // A dispersive layer with live companions adds no direct light: its BSDF differs by
+        // wavelength, and its rays reach lights at full weight.
+        bool split = dispersive && spectral.companions();
         // Constant false for records that never walk, so their kernels hold no exit code.
         bool at_exit = record.walks() && exit;
-        if (alive)
+        bool walking = false;
+        Walk walk = Walk();
+        LocalLights* local = nullptr;
+        if (depth == 0)
+            local = pixel_local_lights(r, pixel);
+        if (!camera)
         {
-            float run = at_exit ? 1.0 : nee_probability(set, x.surface);
+            bool medium_vertex = record.crosses() && l.kind == VERTEX_SCATTER;
+            bool leaving = record.crosses() && l.kind == VERTEX_LEAVE;
+            bool on_layer = record.crosses() && l.kind == VERTEX_LAYER;
+            float run = medium_vertex || at_exit || leaving ? 1.0 : nee_probability(set, l.x.surface);
             float u_run = rng.next();
             uint candidates = depth == 0 ? r.primary_candidates : r.bounce_candidates;
-            if (count_nee && candidates > 0 && u_run < run)
+            if (count_nee && candidates > 0 && u_run < run && !(skip_direct && on_layer) && !split)
             {
+                LayerShadow<S, M> shadow = vertex_shadow<S, M>(r, l, interior);
+                // Layers and scatters light from both sides.
+                PathVertex at = l.x;
+                if (on_layer || medium_vertex)
+                    at.surface.normal = float3(0.0);
                 uint light;
-                PathScatter f = { b, at_exit, exit_scatter };
-                SceneShadow<S, M> shadow = scene_shadow<S, M>(r);
-                float3 l = shade_vertex_nee(r, x, f, shadow, run, pixel, local, depth, candidates, one_technique, rng, rays, light);
+                VertexScatter f = { b, medium_vertex, -l.x.view, l.anisotropy, at_exit, exit_scatter, leaving, leave_scatter };
+                // The rays of a walk's way out reach no light this estimate is weighed against.
+                float3 e = shade_vertex_nee(r, at, f, shadow, run, pixel, local, depth, candidates, one_technique || leaving, rng, rays, light, leaving && count_bsdf);
+                float3 added = spectral.color(throughput * e);
                 if (counted)
-                    radiance += throughput * l;
+                    radiance += added;
                 if (light != NO_LIGHT)
-                    record.light(light, luminance_rec2020(throughput * l));
+                    record.light(light, luminance_rec2020(added));
             }
-            BsdfSample bs;
-            if (at_exit)
-                bs = walk_exit_sample(exit_scatter, rng);
-            else
-                bs = b.sample(rng.next4().xyz);
-            float u_roulette = rng.next();
-            alive = bs.pdf > 0.0;
+            if (last)
+                alive = false;
             if (alive)
             {
-                throughput *= bs.weight;
-                // The walk takes the place of the vertex's ray.
-                walking = record.walks() && (bs.lobe & LOBE_VOLUME) != 0;
-                if (!walking && depth >= r.roulette_depth)
+                float3 wi;
+                float pdf;
+                bool delta = false;
+                bool diffuse = false;
+                float spread;
+                bool crossed = false;
+                float4 u = rng.next4();
+                float u_roulette = rng.next();
+                uint component = 0;
+                float3 hero_f = float3(0.0);
+                if (medium_vertex)
+                {
+                    wi = sample_hg(l.anisotropy, -l.x.view, u.xy);
+                    pdf = hg_phase(l.anisotropy, dot(-l.x.view, wi));
+                    spread = 1.0;
+                }
+                else if (leaving)
+                {
+                    wi = leave_dir;
+                    pdf = 1.0;
+                    delta = true;
+                    diffuse = true;
+                    spread = 1.0;
+                }
+                else
+                {
+                    BsdfSample bs;
+                    if (at_exit)
+                        bs = walk_exit_sample(exit_scatter, rng);
+                    else
+                        bs = b.sample(u.xyz);
+                    alive = bs.pdf > 0.0;
+                    wi = bs.wi;
+                    pdf = bs.pdf;
+                    component = bs.component;
+                    hero_f = bs.weight * bs.pdf;
+                    throughput *= bs.weight;
+                    delta = (bs.lobe & LOBE_SPECULAR) != 0;
+                    diffuse = (bs.lobe & LOBE_DIFFUSE) != 0;
+                    float roughness = l.x.surface.bsdf.specular_roughness;
+                    spread = delta ? 0.0 : diffuse ? 1.0 : 2.0 * roughness * roughness;
+                    // The walk takes the place of an opaque vertex's ray.
+                    walking = record.walks() && alive && (bs.lobe & LOBE_VOLUME) != 0;
+                    crossed = on_layer && (bs.lobe & LOBE_TRANSMISSION) != 0 && crosses_interior(s, l.section);
+                }
+                if (alive && !walking && !on_layer && opaque > r.roulette_depth)
                 {
                     float keep = saturate(max_component(throughput));
                     alive = u_roulette < keep;
                     throughput /= max(keep, 1e-6);
                 }
                 alive = alive && any(throughput > 0.0) && all(isfinite(throughput));
-            }
-            if (alive && walking)
-                walk = walk_from(x, params, bs.wi, rng);
-            else if (alive)
-            {
-                bool delta = (bs.lobe & LOBE_SPECULAR) != 0;
-                ray.dir = bs.wi;
-                ray.origin = vertex_origin(x, bs.wi);
-                ray.pdf = delta ? 0.0 : bs.pdf;
-                ray.run = count_nee ? run : 0.0;
-                ray.normal = x.surface.normal;
-                ray.diffuse = (bs.lobe & LOBE_DIFFUSE) != 0;
-                float roughness = x.surface.bsdf.specular_roughness;
-                float spread = delta ? 0.0 : (bs.lobe & LOBE_DIFFUSE) != 0 ? 1.0 : 2.0 * roughness * roughness;
-                cone.spread += spread;
-                Alpha<S> a = { s, v, ray.dir, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0) };
-                rays++;
-                RayDesc rd = path_ray(ray.origin, ray.dir, positive_infinity());
-                if (depth == 0 && record.particles())
+                if (alive && split)
                 {
-                    ParticleEmission<Alpha<S> > pe = { s, set, local, ray.dir, ray.normal, one_technique ? 0.0 : ray.pdf, ray.run, a };
-                    h = trace_resolve_translucent(s.tlas, rd, MASK_OPAQUE | MASK_PARTICLE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, pe, PARTICLE_CANDIDATES, particles, positions);
+                    for (uint k = 1; k < WAVELENGTHS; k++)
+                    {
+                        if (!(spectral.density[k] > 0.0))
+                            continue;
+                        Bsdf bk = prepare_vertex(s, l, interior, opaque > 0 && !reference, false, record.adjoint(), spectral.wavelength(k));
+                        float pk;
+                        float3 fk;
+                        if (delta)
+                            fk = bk.delta_value(component, wi, pk);
+                        else
+                            fk = bk.eval_and_pdf(wi, pk);
+                        spectral.weigh(k, fk, pk, hero_f, pdf);
+                    }
+                    spectral.update();
+                }
+                if (alive && walking)
+                    walk = walk_from(l.x, vertex_params(l, opaque > 1 && !reference), wi, rng);
+                else if (alive)
+                {
+                    if (crossed)
+                    {
+                        interior.cross(l.section, l.front, l.x.surface.medium_point);
+                        if (l.front)
+                        {
+                            entered = l.section;
+                            entered_at = l.x.surface.position;
+                            entered_normal = l.x.surface.geometric_normal;
+                        }
+                    }
+                    ray.origin = vertex_origin(l.x, wi);
+                    ray.dir = wi;
+                    ray.pdf = delta ? 0.0 : pdf;
+                    ray.run = count_nee && !split && !environment_after_walk ? run : 0.0;
+                    ray.normal = l.kind == VERTEX_OPAQUE ? l.x.surface.normal : float3(0.0);
+                    ray.diffuse = diffuse;
+                    ray.chain = record.crosses() && l.kind != VERTEX_OPAQUE;
+                    ray.scatter = record.walks() && (reference || depth == 0);
+                    ray.local = depth == 0;
+                    if (record.crosses() && !delta && count_nee && !one_technique && !split && interior.innermost() != MATERIAL_NONE)
+                        skip_direct = true;
+                    cone.spread += spread;
+                }
+            }
+        }
+        float t = 0.0;
+        uint medium = MATERIAL_NONE;
+        bool scatters = false;
+        bool interior_walk = false;
+        float3 scatter_at = float3(0.0);
+        float scatter_anisotropy = 0.0;
+        if (alive && !walking)
+        {
+            {
+                uint mask = MASK_OPAQUE;
+                if (camera)
+                    mask = start.mask;
+                else if (ray.chain || interior.count > 0)
+                    mask = MASK_OPAQUE | MASK_DIELECTRIC;
+                HitContext context = hit_context(camera ? HIT_PRIMARY : HIT_SECONDARY, camera ? 0 : depth + 1, cone, 0.0);
+                LayerAccept<S> a = { s, v, ray.dir, context, camera ? seed : pcg(seed ^ (depth + 1)), PRESENCE_DRAWN };
+                rays += camera ? 0 : 1;
+                RayDesc rd = path_ray(ray.origin, ray.dir, camera ? start.t_max : positive_infinity());
+                // Rays leaving a layer or a scatter, and the first vertex's, see particles.
+                if (record.particles() && !camera && (ray.chain || depth == 0))
+                {
+                    mask |= MASK_PARTICLE;
+                    LocalLights* ray_local = nullptr;
+                    if (ray.local)
+                        ray_local = pixel_local_lights(r, pixel);
+                    ParticleEmission<LayerAccept<S> > pe = { s, set, ray_local, ray.dir, ray.normal, one_technique ? 0.0 : ray.pdf, ray.run, a };
+                    // The particles in front of the ray's hit, premultiplied.
+                    float4 particles;
+                    h = trace_resolve_translucent(s.tlas, rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, pe, PARTICLE_CANDIDATES, particles, positions);
+                    // While the path skips direct light, particles add no emission, as producer hits do.
+                    if (count_bsdf && counted && !skip_direct)
+                        radiance += spectral.color(throughput * particles.rgb);
+                    throughput *= 1.0 - particles.a;
                 }
                 else
-                    h = trace_closest(s.tlas, rd, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+                    h = trace_closest(s.tlas, rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+            }
+            if (!camera)
+                depth++;
+            t = h.hit ? h.t : camera ? start.t_max : positive_infinity();
+            if (record.crosses() && (!camera || carried))
+                medium = interior.innermost();
+            if (medium != MATERIAL_NONE)
+            {
+                InteriorMedium im = interior_medium(s, medium, interior.point(medium));
+                scatter_anisotropy = im.anisotropy;
+                // A walk takes a bounce; a ray leaving an opaque vertex takes transmittance only.
+                bool walks = record.walks() && ray.chain && (reference || !walked) && opaque < r.max_bounces
+                    && max_component(im.sigma_s) * t >= 1.0;
+                float scattered;
+                scatters = interior_segment(im, t, ray.scatter || walks || camera, rng, throughput, scattered);
+                if (scatters)
+                {
+                    scatter_at = ray.origin + ray.dir * scattered;
+                    cone = cone_after_hit(cone, scattered, 0.0);
+                    opaque++;
+                    skip_direct = false;
+                    environment_after_walk = false;
+                    if (walks)
+                    {
+                        interior_walk = true;
+                        walked = true;
+                        float ior = interior_ior(s, medium) / interior_ior(s, interior.outside(medium, medium));
+                        walk = walk_interior(scatter_at, ray.dir, im, ior, rng);
+                    }
+                }
             }
         }
         if (record.walks())
         {
-            // The iteration's main point follows the walk's last part.
+            // The last part of a walk leads to its lanes' own point, or with an interior's walk
+            // that met another surface, to the iteration's main point.
             for (uint p = 0; p <= points && walk.kind == WALK_RUNNING; p++)
             {
-                walk_part(r, walk, walk_tracer<S>(r, x.surface.instance, depth), rays);
+                if (walking || !record.crosses())
+                    walk_part(r, walk, walk_tracer<S>(r, l.x.surface.instance, depth), rays);
+                else
+                    walk_part(r, walk, interior_tracer<S>(r, medium, walk.ior, pcg(seed ^ (depth + 1)), depth), rays);
                 if (p < points)
                     C.point(uint(walk.kind == WALK_RUNNING), 1);
             }
-            if (alive && walking)
+            if (alive && (walking || interior_walk))
             {
                 throughput *= walk.throughput;
-                alive = walk.kind != WALK_NONE;
-                h = walk.hit;
-                positions = walk.positions;
+                alive = walk.kind != WALK_NONE && (walking || walk.kind != WALK_CAP || entered == medium);
+                if (walking || walk.kind == WALK_BOUNDARY)
+                {
+                    h = walk.hit;
+                    positions = walk.positions;
+                }
             }
         }
         if (!alive)
             break;
-        C.point(path_key(s, h), KEY_BITS);
         exit = false;
         if (walking)
         {
+            C.point(path_key(s, h), KEY_BITS);
             walked = true;
+            BsdfParams p = vertex_params(l, opaque > 1 && !reference);
             if (walk.kind == WALK_BOUNDARY)
             {
                 HitContext context = hit_context(HIT_SECONDARY, depth + 1, cone, h.t, texture_tap(v, pixel, r.frame, r.seed, depth + 1));
                 SurfaceHit sh = resolve_hit<S>(s, v, walk.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
                 alive = sh.valid;
                 if (alive)
-                    x = exit_vertex(v, sh, walk.dir);
+                    l = opaque_vertex(exit_vertex(v, sh, walk.dir));
                 if (alive && sh.surface.bsdf.subsurface_weight > 0.0)
-                    params = sh.surface.bsdf;
+                    p = sh.surface.bsdf;
             }
             else
-                x.view = x.surface.normal;
+                l.x.view = l.x.surface.normal;
             exit = true;
-            exit_scatter = walk_exit(x, params, rng);
+            exit_scatter = walk_exit(l.x, p, rng);
             continue;
         }
-        depth++;
+        C.point(path_key(s, h), KEY_BITS);
+        // Every lane takes a new vertex past the point. These writes tell the compiler so, which
+        // keeps the old vertex out of the state the point holds.
+        l = (LayerVertex)0;
+        b = bsdf_unprepared();
+        exit_scatter = (WalkExitScatter)0;
+        leave_scatter = (InteriorExitScatter)0;
+        leave_dir = float3(0.0);
+        bool first = camera;
+        camera = false;
 
-        if (count_bsdf && counted)
-            radiance += throughput * particles.rgb;
-        throughput *= 1.0 - particles.a;
-        bool weigh = !one_technique && ray.pdf > 0.0;
-        if (!h.hit)
+        if (medium != MATERIAL_NONE)
         {
-            if (count_bsdf && counted)
+            if (scatters && !interior_walk)
+            {
+                l = scatter_vertex(v, scatter_at, ray.dir, medium, scatter_anisotropy);
+                if (first)
+                    record.arrive(r, l.x, b, start.offset + distance(ray.origin, scatter_at), false);
+                if (cache && !reference)
+                {
+                    if (counted)
+                        radiance += spectral.color(throughput * interior_ambient(r, l.x.surface.position, ray.dir, rng));
+                    last = true;
+                }
+                continue;
+            }
+            if (interior_walk)
+            {
+                if (walk.kind != WALK_BOUNDARY)
+                {
+                    float3 from = walk.origin;
+                    float3 n = walk.normal;
+                    leave_dir = walk.dir;
+                    if (walk.kind == WALK_CAP)
+                    {
+                        from = entered_at;
+                        n = entered_normal;
+                        float3 tangent, bitangent;
+                        orthonormal_basis(n, tangent, bitangent);
+                        leave_dir = normalize(from_local(sample_cosine_hemisphere(rng.next2()), tangent, bitangent, n));
+                    }
+                    interior.cross(medium, false);
+                    l = leave_vertex(v, from, n);
+                    leave_scatter = interior_exit(n, walk.ior);
+                    // The way out is a refraction: the walk's Fresnel draw chose it, and it
+                    // scales radiance as a BSDF's does.
+                    if (!record.adjoint())
+                        throughput *= walk.ior * walk.ior;
+                    dispersive = false;
+                    skip_direct = count_nee && !one_technique;
+                    environment_after_walk = skip_direct;
+                    continue;
+                }
+                // The walk met another surface inside: it shades as this ray's hit.
+                t = h.t;
+                ray.dir = walk.dir;
+                ray.pdf = 0.0;
+                ray.diffuse = true;
+                ray.local = false;
+            }
+        }
+        else if (!first)
+        {
+            if (h.hit && (ray.chain || t >= INSCATTER_SEGMENT))
+            {
+                float3 through;
+                float3 e;
+                if (ray.chain)
+                    e = froxel_segment_inscatter<M>(r.froxels, v, set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), through);
+                else
+                    e = segment_inscatter<M>(set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), through);
+                if (counted)
+                    radiance += spectral.color(throughput * e);
+                throughput *= through;
+            }
+            else
+            {
+                // The march's jitter dimension, drawn either way so later dimensions stay put.
+                rng.next();
+                if (h.hit)
+                    throughput *= medium_transmittance<M>(s.medium, ray.origin, ray.dir, t);
+            }
+        }
+        if (!any(throughput > 0.0) || !all(isfinite(throughput)))
+        {
+            alive = false;
+            continue;
+        }
+
+        bool weigh = !one_technique && ray.pdf > 0.0;
+        LocalLights* ray_local = nullptr;
+        if (ray.local)
+            ray_local = pixel_local_lights(r, pixel);
+        // A pinhole camera ray only looks for layers: without one the path starts on the
+        // G-buffer's surface.
+        bool gbuffer = first && start.gbuffer && !(record.crosses() && is_layer(h));
+        if (!h.hit && !gbuffer)
+        {
+            if (first)
+                sky = throughput;
+            else if (count_bsdf && counted && (!skip_direct || environment_after_walk))
             {
                 float3 env = environment_map(set.environment, ray.dir);
-                float w = weigh ? mis_power(ray.pdf, ray.run * nee_environment_pdf(set, local, ray.normal, ray.dir)) : 1.0;
-                float3 l = env * w;
-                record.light(feedback_environment(set), luminance_rec2020(throughput * l));
-                for (uint k = 0; k < set.directional_count; k++)
+                float w = weigh ? mis_power(ray.pdf, ray.run * nee_environment_pdf(set, ray_local, ray.normal, ray.dir)) : 1.0;
+                float3 e = env * w;
+                record.light(feedback_environment(set), luminance_rec2020(spectral.color(throughput * e)));
+                for (uint k = 0; k < set.directional_count && !skip_direct; k++)
                 {
                     uint id = set.directional_ids[k];
                     float3 d = directional_disc<M>(set, id, ray.origin, ray.dir);
                     if (any(d > 0.0))
-                        l += d * (weigh ? mis_power(ray.pdf, ray.run * nee_directional_pdf(set, ray.normal, id, ray.dir)) : 1.0);
+                        e += d * (weigh ? mis_power(ray.pdf, ray.run * nee_directional_pdf(set, ray.normal, id, ray.dir)) : 1.0);
                 }
-                radiance += throughput * l;
+                radiance += spectral.color(throughput * e);
             }
             alive = false;
             continue;
         }
 
-        float t = h.t;
-        if (t >= INSCATTER_SEGMENT)
+        bool layer = false;
+        bool front = true;
+        // The hit shows what the light set samples, a producer entry's front.
+        bool sampled = false;
+        uint entry = 0;
+        float cos_light = 0.0;
+        if (gbuffer)
         {
-            float3 through;
-            float3 l = segment_inscatter<M>(set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), through);
-            if (counted)
-                radiance += throughput * l;
-            throughput *= through;
+            PathVertex x;
+            if (!gbuffer_vertex(s, v, r.gbuffer, pixel, x))
+            {
+                sky = throughput;
+                alive = false;
+                continue;
+            }
+            l = opaque_vertex(x);
+            opaque++;
         }
         else
         {
-            // The march's jitter dimension, drawn either way so later dimensions stay put.
-            rng.next();
-            throughput *= medium_transmittance<M>(s.medium, ray.origin, ray.dir, t);
+            float path_t = first ? start.offset + t : t;
+            HitContext context = hit_context(first ? HIT_PRIMARY : HIT_SECONDARY, depth, cone, path_t, texture_tap(v, pixel, r.frame, r.seed, depth));
+            SurfaceHit sh = resolve_hit<S>(s, v, ray.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
+            if (!sh.valid)
+            {
+                alive = false;
+                continue;
+            }
+            if (!first)
+                cone = cone_after_hit(cone, t, 0.0);
+            // Back faces of single-sided surfaces never emit; double-sided hits face the ray.
+            cos_light = dot(sh.surface.geometric_normal, ray.dir);
+            front = sh.back_face || cos_light < 0.0;
+            layer = record.crosses() && is_layer(h);
+            if (layer)
+            {
+                layers++;
+                if (layers > r.dielectric_depth && !first)
+                {
+                    if (cache && counted)
+                        radiance += spectral.color(throughput * interior_ambient(r, sh.surface.position, ray.dir, rng));
+                    alive = false;
+                    continue;
+                }
+                l = layer_vertex(v, sh, ray.dir);
+            }
+            else
+            {
+                l = opaque_vertex(hit_vertex(v, sh, ray.dir));
+                opaque++;
+            }
+            sampled = hit_producer(s, h.instance_index, entry) && !sh.swapped;
         }
-        HitContext context = hit_context(HIT_SECONDARY, depth, cone, t, texture_tap(v, pixel, r.frame, r.seed, depth));
-        SurfaceHit sh = resolve_hit<S>(s, v, ray.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
-        if (!sh.valid)
+        if (first)
+            cone.width = cone_width(cone, l.x.camera_distance);
+        dispersive = disperse && layer_disperses(s, l, interior);
+        if (dispersive && !spectral.on)
+            spectral.start(wavelength_sample(r, pixel));
+        // Coat, fuzz and film collapse once the path has scattered, outside the reference.
+        uint before = layer ? opaque : opaque - 1;
+        bool collapse = before > 0 && !reference;
+        bool walks = record.walks() && !layer && may_walk(r, l.x.surface, before, walked, cone.width);
+        b = prepare_vertex(s, l, interior, collapse, walks, record.adjoint(), spectral.hero());
+        if (first)
+            record.arrive(r, l.x, b, gbuffer ? length(l.x.surface.position - v.eye_render.xyz) : start.offset + t, layer);
+        // Emission seen from the front. Cooked emitters and a surface's back are reached by BSDF
+        // rays alone; the light set samples producer entries, so their emission is weighed
+        // against it.
+        if (gbuffer)
         {
-            alive = false;
-            continue;
+            if (counted)
+                exposed += throughput * b.emission();
         }
-        cone = cone_after_hit(cone, t, 0.0);
-        x = hit_vertex(v, sh, ray.dir);
-        params = walk_params(bsdf_collapse(x.surface.bsdf), record.walks() && may_walk(r, x.surface, depth, walked, cone.width));
-        b = bsdf_prepare(params, x.surface.normal, x.view);
-        // Back faces of single-sided surfaces never emit; double-sided hits face the ray.
-        bool front = dot(sh.surface.geometric_normal, ray.dir) < 0.0;
-        // Hits on cooked instances name no emissive entry the tiles sample, so BSDF rays are
-        // the only way to them and their emission takes weight 1. A producer entry is
-        // emissive entry `entry` of the tiles.
-        uint entry;
-        if (count_bsdf && counted && front)
+        else if ((count_bsdf || first) && counted && front && !(skip_direct && sampled))
         {
             float w = 1.0;
-            if (weigh && hit_producer(s, h.instance_index, entry))
+            if (weigh && sampled)
             {
-                float l = luminance_rec2020(material_light_emission(s.materials + sh.surface.material));
-                float cos_light = dot(sh.surface.geometric_normal, ray.dir);
-                w = mis_power(ray.pdf, ray.run * nee_emissive_pdf(set, local, ray.normal, entry, l, t, cos_light));
+                float lum = luminance_rec2020(material_light_emission(s.materials + l.x.surface.material));
+                w = mis_power(ray.pdf, ray.run * nee_emissive_pdf(set, ray_local, ray.normal, entry, lum, t, cos_light));
             }
-            radiance += throughput * b.emission() * w;
+            radiance += spectral.color(throughput * b.emission() * w);
         }
-        alive = (x.surface.flags & GBUFFER_UNLIT) == 0 && r.mode != PATH_DIRECT;
-        if (alive && cache && front)
+        if (layer)
         {
-            CacheCell cell = cache_cell(r.cache, s, x.surface.position, x.surface.geometric_normal, rng.next4().xyz, true);
+            alive = (l.x.surface.flags & GBUFFER_UNLIT) == 0;
+            continue;
+        }
+        skip_direct = false;
+        environment_after_walk = false;
+        alive = (l.x.surface.flags & GBUFFER_UNLIT) == 0 && (first || r.mode != PATH_DIRECT);
+        // The first vertex of a pixel with no layer runs on the view's share of pixels.
+        if (first && interior.count == 0)
+        {
+            alive = alive && runs_path(r, pixel);
+            throughput /= r.pixel_fraction;
+        }
+        if (alive && cache && front && !first)
+        {
+            CacheCell cell = cache_cell(r.cache, s, l.x.surface.position, l.x.surface.geometric_normal, rng.next4().xyz, true);
             float3 cached;
-            if (record.may_end(depth, ray.diffuse, cone.width > cell.size, depth == r.max_bounces + 1)
+            if (record.may_end(opaque - 1, ray.diffuse, cone.width > cell.size, opaque == r.max_bounces + 2)
                 && t > CACHE_MIN_RAY_CELLS * cell.size && cache_lookup(r.cache, cell.key, cached))
             {
                 if (counted)
-                    radiance += throughput * cache_albedo(b.albedo(), x.surface.bsdf) * cached;
+                    radiance += spectral.color(throughput * cache_albedo(b.albedo(), l.x.surface.bsdf) * cached);
                 alive = false;
                 continue;
             }
         }
         // The last bounce's hit scatters nothing the path estimates.
-        if (alive && depth <= r.max_bounces)
-            record.vertex(r, x, b, throughput, radiance, rng);
+        if (alive && opaque <= r.max_bounces + 1)
+            record.vertex(r, l.x, b, throughput, radiance, rng);
     }
-    record.finish(r, radiance);
+    record.finish(r, radiance, layers);
     return radiance;
 }
 
@@ -1097,119 +2024,180 @@ public bool gbuffer_vertex(SceneRoot* s, ViewConstants* v, GBufferGpu* gbuffer, 
     return true;
 }
 
-// A thin lens's first vertex of `pixel`: a ray from a point of the aperture disc of radius
-// `aperture` m through a jittered point of the pixel on the focal plane `focus` m along the
-// view axis, starting `start` m along that axis, its hit through linked surface `S`. False
-// on a miss, with `dir` the ray's direction. `depth` is the hit's distance along the view
-// axis in m, infinity on a miss. Draws two sampler dimensions.
-public bool lens_vertex<S : ISurface>(PathRoot r, uint2 pixel, float aperture, float focus, float start, inout Sampler rng, out PathVertex x, out float3 dir, out float depth)
+// A thin lens's camera ray of `pixel`: from a point of the aperture disc of radius `aperture` m
+// through a jittered point of the pixel on the focal plane `focus` m along the view axis, starting
+// `from` m along that axis. Draws four sampler dimensions.
+public PathStart lens_start(PathRoot r, uint2 pixel, float aperture, float focus, float from, uint mask, inout Sampler rng)
 {
-    x = (PathVertex)0;
-    depth = positive_infinity();
-    SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
     float2 uv = (float2(pixel) + rng.next2()) / float2(v.extent);
     float3 through = view_direction(v, uv);
     float3 at_focus = through * (focus / max(-through.z, 1e-6));
     float3 lens = float3(sample_disk_concentric(rng.next2()) * aperture, 0.0);
     float3 view_dir = normalize(at_focus - lens);
-    float t_start = start / max(-view_dir.z, 1e-6);
-    float3 origin = render_from_view(v, lens + view_dir * t_start);
-    dir = render_direction(v, view_dir);
-    RayCone cone = camera_cone(v);
-    Alpha<S> a = { s, v, dir, hit_context(HIT_PRIMARY, 0, cone, t_start) };
-    float3 positions[3];
-    Hit h = trace_closest(s.tlas, path_ray(origin, dir, positive_infinity()), MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
-    if (!h.hit || h.cluster_id < 0)
-        return false;
-    float t = t_start + h.t;
-    SurfaceHit sh = resolve_hit<S>(s, v, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, hit_context(HIT_PRIMARY, 0, cone, t, texture_tap(v, pixel, r.frame, r.seed, 0)));
-    if (!sh.valid)
-        return false;
-    x = hit_vertex(v, sh, dir);
-    depth = -view_dir.z * t;
-    return true;
+    PathStart start = (PathStart)0;
+    start.offset = from / max(-view_dir.z, 1e-6);
+    start.origin = render_from_view(v, lens + view_dir * start.offset);
+    start.dir = render_direction(v, view_dir);
+    start.t_max = positive_infinity();
+    start.axis = -view_dir.z;
+    start.mask = mask;
+    start.interior = Interior();
+    return start;
 }
 
-// Whether `pixel`'s opaque path runs this frame, with probability `PathRoot.pixel_fraction`.
+// The interiors at `origin`, a point of the lens: `camera_medium`, flipped at each surface between
+// the eye and it.
+Interior lens_interior<S : ISurface>(PathRoot r, float3 origin)
+{
+    ViewConstants* v = r.view;
+    Interior interior = Interior();
+    if (r.camera_medium != MATERIAL_NONE)
+        interior.cross(r.camera_medium, true);
+    float3 eye = v.eye_render.xyz;
+    float t = length(origin - eye);
+    surface_crossings<S>(r.scene, v, eye, (origin - eye) / t, t, interior);
+    return interior;
+}
+
+// The camera ray of `pixel` from the near plane: toward the G-buffer's surface, where the tile
+// may hold a layer before it.
+public PathStart pinhole_start(PathRoot r, uint2 pixel, bool traced)
+{
+    ViewConstants* v = r.view;
+    float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
+    PathStart start = (PathStart)0;
+    start.dir = render_direction(v, view_direction(v, uv));
+    start.origin = render_from_view(v, view_position(v, uv, 1.0));
+    start.offset = length(start.origin - v.eye_render.xyz);
+    float depth = r.gbuffer.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
+    start.t_max = depth > 0.0 ? max((length(view_position(v, uv, depth)) - start.offset) * (1.0 - 1e-5), 0.0) : positive_infinity();
+    start.axis = 1.0;
+    start.mask = traced ? MASK_OPAQUE | MASK_DIELECTRIC : 0;
+    start.gbuffer = true;
+    start.interior = Interior();
+    return start;
+}
+
+// Whether `pixel`'s path runs this frame, with probability `PathRoot.pixel_fraction`.
 bool runs_path(PathRoot r, uint2 pixel)
 {
     Sampler subset = Sampler(pixel, r.frame, r.seed ^ SUBSET_STREAM);
     return r.pixel_fraction >= 1.0 || subset.next() < r.pixel_fraction;
 }
 
-// What vertex `x` emits toward its view. Most surfaces emit nothing and skip the prepare, which
-// their path repeats.
-float3 vertex_emission(PathVertex x)
+// A debug view of `pixel`'s G-buffer surface alone.
+void first_vertex_view(PathRoot r, uint2 pixel, inout Sampler rng)
 {
-    if (all(x.surface.bsdf.emission == 0.0))
-        return float3(0.0);
-    return bsdf_prepare(x.surface.bsdf, x.surface.normal, x.view).emission();
+    ViewConstants* v = r.view;
+    float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
+    PathVertex x1;
+    bool surface = gbuffer_vertex(r.scene, v, r.gbuffer, pixel, x1);
+    float3 radiance = float3(0.0);
+    if (surface && r.mode != PATH_ORIGIN_BIAS)
+    {
+        CacheCell cell = cache_cell(r.cache, r.scene, x1.surface.position, x1.surface.geometric_normal, rng.next4().xyz, true);
+        float3 cached;
+        bool found = cache_lookup(r.cache, cell.key, cached);
+        if (r.mode == PATH_CACHE)
+            radiance = pre_exposure * cache_albedo(bsdf_prepare(x1.surface.bsdf, x1.surface.normal, x1.view).albedo(), x1.surface.bsdf) * cached;
+        else
+            radiance = float3(float(cell.level), found ? 1.0 : 0.0, unit_float(cache_hash(cell.key) * 2654435761u));
+    }
+    float4 out = float4(r.mode == PATH_CACHE_LOD ? radiance : apply_hdr_ceiling(radiance), surface ? 1.0 : 0.0);
+    if (r.mode == PATH_ORIGIN_BIAS)
+        out = float4(surface ? length(vertex_origin(x1, x1.surface.normal) - x1.surface.position) : 0.0, 0.0, 0.0, out.a);
+    r.radiance.get<RWTexture2D<float4>>()[pixel] = out;
+    r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(NO_LIGHT, asuint(surface ? x1.camera_distance : 0.0));
 }
 
-// The opaque dispatch's body for `pixel`: sky pixels take the linked environment and the
-// directional discs; surfaces the G-buffer's emission and their path, which runs on a random
-// `pixel_fraction` share of them each frame.
-public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint2 pixel)
+// The view paths' body for `pixel`: one path from the first layer of a traced tile or from the
+// G-buffer's surface, or from a thin lens. Sky pixels take the linked environment and the
+// directional discs. With `CROSSES` the dispatch runs over the traced tiles, without it over the
+// others, whose paths meet no layer: they start on the G-buffer's surface, with no camera ray and
+// no vertices on layers or in interiors. With DIELECTRIC_FROST, a pixel with a blur on its
+// dominant layer also runs a second path from the G-buffer's surface, for what the frosted-glass
+// term blurs.
+public void view_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMedium, let CROSSES : bool>(PathRoot r, uint2 pixel)
 {
     ViewConstants* v = r.view;
     LightSetGpu* set = r.set;
-    float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
     Sampler rng = Sampler(pixel, r.frame, r.seed);
-    uint rays = 0;
-    PathVertex x1;
-    float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
-    float3 dir = render_direction(v, view_direction(v, uv));
-    bool lens = r.aperture_radius > 0.0;
-    bool surface;
-    if (lens)
+    uint2 extent = r.gbuffer.extent;
+    uint index = pixel.y * extent.x + pixel.x;
+    bool traced = CROSSES;
+    if (!CROSSES && traced_tiles(r.layers, extent)[layer_tile(extent, pixel)] != 0)
+        return;
+    if (r.mode == PATH_CACHE || r.mode == PATH_CACHE_LOD || r.mode == PATH_ORIGIN_BIAS)
     {
-        float depth;
-        surface = lens_vertex<S>(r, pixel, r.aperture_radius, r.focus_distance, 0.0, rng, x1, dir, depth);
+        first_vertex_view(r, pixel, rng);
+        return;
+    }
+    float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
+    PathStart start;
+    if (CROSSES && r.aperture_radius > 0.0)
+    {
+        start = lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_OPAQUE | MASK_DIELECTRIC, rng);
+        start.interior = lens_interior<S>(r, start.origin);
     }
     else
-        surface = gbuffer_vertex(r.scene, v, r.gbuffer, pixel, x1);
-    float3 radiance = float3(0.0);
-    uint feedback = NO_LIGHT;
-    if (surface)
     {
-        // The G-buffer's emission is already pre-exposed.
-        if (r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE)
-            radiance = vertex_emission(x1) * (lens ? pre_exposure : 1.0);
-        if (r.mode == PATH_CACHE || r.mode == PATH_CACHE_LOD)
-        {
-            CacheCell cell = cache_cell(r.cache, r.scene, x1.surface.position, x1.surface.geometric_normal, rng.next4().xyz, true);
-            float3 cached;
-            bool found = cache_lookup(r.cache, cell.key, cached);
-            if (r.mode == PATH_CACHE)
-                radiance = pre_exposure * cache_albedo(bsdf_prepare(x1.surface.bsdf, x1.surface.normal, x1.view).albedo(), x1.surface.bsdf) * cached;
-            else
-                radiance = float3(float(cell.level), found ? 1.0 : 0.0, unit_float(cache_hash(cell.key) * 2654435761u));
-        }
-        else if (runs_path(r, pixel))
-        {
-            ViewPath view_path = ViewPath(pcg3d(uint3(pixel, r.frame ^ r.seed)).x);
-            radiance += pre_exposure / r.pixel_fraction * trace_path<C, S, M>(r, x1, pixel, rng, rays, view_path);
-            feedback = view_path.feedback;
-        }
+        start = pinhole_start(r, pixel, traced);
+        if (traced)
+            start.interior = Interior(r.layers[index].near_interior);
     }
-    else if (r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE)
-        radiance = pre_exposure * sky_radiance<E, M>(set, v.eye_render.xyz, dir);
-    float4 out = float4(apply_hdr_ceiling(radiance), surface ? 1.0 : 0.0);
-    if (r.mode == PATH_CACHE_LOD)
-        out.rgb = radiance;
-    else if (r.mode == PATH_RAYS)
-        out = float4(float(rays), all(isfinite(radiance)) ? 0.0 : 1.0, 0.0, out.a);
-    else if (r.mode == PATH_ORIGIN_BIAS)
-        out = float4(surface ? length(vertex_origin(x1, x1.surface.normal) - x1.surface.position) : 0.0, 0.0, 0.0, out.a);
+    bool frost = (r.dielectric_flags & DIELECTRIC_FROST) != 0;
+    uint passes = frost && traced && r.layers[index].frost != 0 ? 2 : 1;
+    // The froxels hold a camera segment through an interior where this frame has them.
+    bool carried = start.interior.count > 0 && r.froxels == nullptr;
+    ViewPath<CROSSES> view_path = ViewPath<CROSSES>(pcg3d(uint3(pixel, r.frame ^ r.seed)).x);
+    // What the pixel's own path left its record; the background's path adds nothing to them.
+    ViewPath<CROSSES> pixel_path = view_path;
+    uint rays = 0;
+    float3 total = float3(0.0);
+    float background = 0.0;
+    for (uint k = 0; k < passes; k++)
+    {
+        float3 exposed;
+        float3 sky;
+        float3 radiance = trace_path<C, S, M>(r, start, pixel, rng, rays, view_path, exposed, sky);
+        float3 pixel_radiance = exposed + pre_exposure * radiance;
+        if (any(sky > 0.0) && r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE)
+            pixel_radiance += pre_exposure * sky * sky_radiance<E, M>(set, v.eye_render.xyz, start.dir);
+        if (k == 0)
+        {
+            total = pixel_radiance;
+            pixel_path = view_path;
+            // The background's path starts on the G-buffer's surface, inside what holds it.
+            if (passes > 1 && isfinite(start.t_max))
+                surface_crossings<S>(r.scene, v, start.origin, start.dir, start.t_max, start.interior);
+        }
+        background = guide_luminance(pixel_radiance);
+        start.mask = 0;
+    }
+    bool arrived = pixel_path.first_distance > 0.0;
+    bool first_layer = pixel_path.first_layer;
+    float4 out = float4(apply_hdr_ceiling(total), arrived ? 1.0 : 0.0);
+    if (r.mode == PATH_RAYS)
+        out = float4(float(rays), all(isfinite(total)) ? 0.0 : 1.0, 0.0, out.a);
+    else if ((r.dielectric_flags & DIELECTRIC_DEBUG_LAYER) != 0 && first_layer)
+    {
+        float sum = max(pixel_path.reflected + pixel_path.transmitted, 1e-6);
+        out = float4(pixel_path.reflected / sum, pixel_path.transmitted / sum, float(pixel_path.layers) / float(max(r.dielectric_depth, 1u)), 1.0);
+    }
     r.radiance.get<RWTexture2D<float4>>()[pixel] = out;
-    r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(feedback, asuint(surface ? x1.camera_distance : 0.0));
+    if (traced)
+        r.layers[index].medium_end = carried ? -1.0 : first_layer ? pixel_path.first_t : 0.0;
+    if (frost)
+        r.layers[index].background = background;
+    uint feedback = pixel_path.feedback;
+    r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(feedback, asuint(pixel_path.first_distance));
     if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && feedback != NO_LIGHT)
         count_feedback(set, feedback);
 }
 
 // The background layer's texel of `pixel`: on a marked pixel, the pre-exposed radiance of
-// its lens ray past the mask's depth in RGB, the full path at the opaque path's settings,
+// its lens ray past the mask's depth in RGB, the full path at the view path's settings,
 // and the reverse-Z depth of its hit in A (0 on a miss); (0, 0, 0, -1) on other pixels.
 float4 background_texel<C : ICoherence, S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint2 pixel)
 {
@@ -1219,18 +2207,20 @@ float4 background_texel<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
         return float4(0.0, 0.0, 0.0, -1.0);
     PathRoot b = r;
     b.mode = PATH_FULL;
+    b.pixel_fraction = 1.0;
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
     float near = v.clip_from_view[2][3];
     Sampler rng = Sampler(pixel, r.frame, r.seed ^ DOF_STREAM);
-    PathVertex x1;
-    float3 dir;
-    float depth;
-    if (!lens_vertex<S>(b, pixel, r.dof_aperture, *r.dof_focus, near / mask, rng, x1, dir, depth))
-        return float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, v.eye_render.xyz, dir)), 0.0);
+    PathStart start = lens_start(b, pixel, r.dof_aperture, *r.dof_focus, near / mask, MASK_OPAQUE, rng);
+    start.interior = Interior();
     uint rays = 0;
-    ViewPath record = ViewPath(pcg3d(uint3(pixel, r.frame ^ r.seed ^ DOF_STREAM)).x);
-    float3 radiance = vertex_emission(x1) + trace_path<C, S, M>(b, x1, pixel, rng, rays, record);
-    return float4(apply_hdr_ceiling(pre_exposure * radiance), near / depth);
+    ViewPath<true> record = ViewPath<true>(pcg3d(uint3(pixel, r.frame ^ r.seed ^ DOF_STREAM)).x);
+    float3 exposed;
+    float3 sky;
+    float3 radiance = trace_path<C, S, M>(b, start, pixel, rng, rays, record, exposed, sky);
+    if (!(record.first_distance > 0.0))
+        return float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, v.eye_render.xyz, start.dir)), 0.0);
+    return float4(apply_hdr_ceiling(pre_exposure * radiance), near / (start.axis * record.first_t));
 }
 
 // The background dispatch's body for `pixel`: writes its texel of the background layer.
@@ -1241,19 +2231,27 @@ public void background_body<C : ICoherence, S : ISurface, E : IEnvironment, M : 
 
 // The update path of `block`, a square of `PathRoot.update_block` pixels: one pixel of it,
 // rotating through the block over frames, traces a path from its G-buffer surface and adds
-// what its vertices scatter to the cache.
+// what its vertices scatter to the cache. On a traced tile it first walks the camera ray to
+// that surface for the interiors around it.
 public void update_body<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r, uint2 block)
 {
     uint n = r.update_block;
     uint offset = (r.frame + pcg(block.x | (block.y << 16))) % (n * n);
     uint2 pixel = block * n + uint2(offset % n, offset / n);
+    uint2 extent = r.gbuffer.extent;
+    if (any(pixel >= extent))
+        return;
     Sampler rng = Sampler(pixel, r.frame, r.seed ^ UPDATE_STREAM);
-    PathVertex x1;
-    bool surface = all(pixel < r.gbuffer.extent) && gbuffer_vertex(r.scene, r.view, r.gbuffer, pixel, x1);
-    if (surface)
+    PathStart start = pinhole_start(r, pixel, false);
+    if (traced_tiles(r.layers, extent)[layer_tile(extent, pixel)] != 0)
     {
-        uint rays = 0;
-        CacheUpdate update = CacheUpdate();
-        trace_path<C, S, M>(r, x1, pixel, rng, rays, update);
+        start.interior = Interior(r.layers[pixel.y * extent.x + pixel.x].near_interior);
+        if (isfinite(start.t_max))
+            surface_crossings<S>(r.scene, r.view, start.origin, start.dir, start.t_max, start.interior);
     }
+    uint rays = 0;
+    CacheUpdate update = CacheUpdate();
+    float3 exposed;
+    float3 sky;
+    trace_path<C, S, M>(r, start, pixel, rng, rays, update, exposed, sky);
 }

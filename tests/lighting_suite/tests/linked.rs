@@ -1,10 +1,12 @@
 //! Linked kernels through the path kernel, kept in one target because each target compiles
 //! its own linked path pipelines: linked coverage against the equivalent alpha texture, and a
-//! linked surface in a mirror and at each bounce. A scene's data against its linked types.
+//! linked surface in a mirror, behind glass and at each bounce. A scene's data against its linked
+//! types.
 
 use lighting_suite::bed::{
-    Accumulated, BARE_LEAF, Bed, FLOOR, Item, MIRROR, PANEL, Paths, RINGS_LEAF, Spec, WHITE_SPHERE,
-    assert_close, assert_within_noise, luminance, mean_where, quad_scene, reference, surface_mean,
+    Accumulated, BARE_LEAF, Bed, FLOOR, GLASS_SLAB, Item, MIRROR, PANEL, Paths, RINGS_LEAF, Spec,
+    WHITE_SPHERE, assert_close, assert_within_noise, luminance, mean_where, quad_scene, reference,
+    surface_mean,
 };
 use lighting_suite::{TestScene, assert_clean, linked};
 use orr_gpu::{GpuPtr, KernelSet};
@@ -129,6 +131,37 @@ fn a_linked_surface_looks_the_same_in_a_mirror() {
         "the panel seen directly is not red: {seen:?}"
     );
     assert_close("panel in the mirror", reflected, seen, 0.02);
+    assert_clean();
+}
+
+/// The panel behind glass is reached only by the layer kernels' rays, whose first-layer ray and
+/// guides resolve through the linked surface. The slab's two faces put it at depth 2.
+#[test]
+fn a_linked_surface_shows_through_glass() {
+    let spec = Spec {
+        copies: vec![
+            at(PANEL, Mat3::IDENTITY, Vec3::new(0.0, 1.0, 0.0)),
+            at(
+                GLASS_SLAB,
+                Mat3::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                Vec3::new(0.0, 1.0, 1.5),
+            ),
+        ],
+        lights: Vec::new(),
+        environment: None,
+        eye: Vec3::new(0.0, 1.0, 3.0),
+        target: Vec3::new(0.0, 1.0, 0.0),
+        fov_y: 0.8,
+        focus: None,
+    };
+    let mut bed = linked_bed(spec);
+    let image = render_paths(&mut bed, &linked_paths(reference(4)), 4, 1);
+    let m = mean_where(&image, |p| luminance(p) > 1.0);
+    let total = m[0] + m[1] + m[2];
+    assert!(
+        m[1] > 0.7 * total,
+        "the panel behind glass is not in its far form: {m:?}"
+    );
     assert_clean();
 }
 

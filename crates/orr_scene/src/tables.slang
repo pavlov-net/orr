@@ -35,6 +35,18 @@ public bool layer_traced(uint flags)
     return (flags & (INSTANCE_RASTER | INSTANCE_RAY)) != 0;
 }
 
+// Whether the opaque clusters of a copy with instance flags `flags` raster.
+public bool opaque_rastered(uint flags)
+{
+    return (flags & INSTANCE_RASTER) != 0 && (flags & INSTANCE_CAST_ONLY) == 0;
+}
+
+// Whether a cluster of class `c` of a copy with instance flags `flags` raster.
+public bool class_rastered(uint c, uint flags)
+{
+    return layer_class(c) ? layer_traced(flags) : opaque_rastered(flags);
+}
+
 // `InstanceGpu.material_base` when the copy uses its model's section materials.
 public static const uint NO_MATERIAL_SET = 0xffffffff;
 // `InstanceGpu.first_part` when the copy holds no part run.
@@ -59,7 +71,7 @@ public struct InstanceGpu
     public half rt_range;      // m from the scene focus
     public half animation_range;
     public uint8_t flags;      // INSTANCE_*
-    public uint8_t candidate_class; // orr_shaders.trace CLASS_*
+    public uint8_t _pad;
     public uint16_t pose_variants;
     public uint16_t pose_stride;
     public uint16_t debug_lod; // 0 none; DEBUG_LOD_LEVEL | level; else the f16 bits of an error threshold scale
@@ -113,7 +125,7 @@ public struct SlotStateGpu
     public uint64_t rt_blas;        // 0 while null-written
     public uint rt_partition;       // cell partition, or the partition count for the global one
     public uint rt_flags;           // RT_*
-    public uint2 rt_key;            // hash of the transform, model and class it was written with
+    public uint2 rt_key;            // hash of the transform, model and shown sections it was written with
     public uint rt_age;             // frames its pending PTLAS work has waited
     public uint part_run;           // first part instance of the run it holds
     public uint part_count;         // part instances in the run; 0: none
@@ -317,8 +329,20 @@ public struct MeshGpu
     public uint* cut_stamps;       // per finer cut: the last frame it was reported in use, then wanted
     public uint fine_cuts;         // the first `fine_cuts` cached cuts need streamed pages: built once wanted, BLAS 0 until then
     public uint section_count;     // sections of the mesh, which a model's cage sections follow
+    public uint opaque_sections;   // the sections of opaque class, as `PartGpu.sections`
+    public uint layer_sections;    // the sections of dielectric or presence class, likewise
     public SetTablesGpu emissive;  // the sections that emit
     public SetTablesGpu casters;   // the sections light leaves as a caustic
+}
+
+public bool mesh_has_layers(MeshGpu* mesh)
+{
+    return mesh.layer_sections != 0;
+}
+
+public bool mesh_has_opaque(MeshGpu* mesh)
+{
+    return mesh.opaque_sections != 0;
 }
 
 // What skinned copies of a MESH_SKIN mesh read: each cluster's place in a copy's vertex

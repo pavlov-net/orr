@@ -608,11 +608,17 @@ public MaterialGpu* cluster_material(SceneRoot* s, ProducerGpu p, ProducerCluste
     return s.materials + p.materials[k.material];
 }
 
-// The front-face normal of triangle p0 p1 p2 under `m`, at twice the triangle's area. Taken
-// from transformed edges, so it keeps its precision far from the render origin.
-public float3 transformed_normal(float3x4 m, float3 p0, float3 p1, float3 p2)
+// The unit front-face normal of triangle p0 p1 p2 under `m`, with its area. Taken from
+// transformed edges, so it keeps its precision far from the render origin, and at unit size,
+// since a small transform's cross product underflows first.
+public float3 transformed_normal(float3x4 m, float3 p0, float3 p1, float3 p2, out float area)
 {
-    return cross(mul(m, float4(p1 - p0, 0.0)), mul(m, float4(p2 - p0, 0.0)));
+    float3 e1 = mul(m, float4(p1 - p0, 0.0));
+    float3 e2 = mul(m, float4(p2 - p0, 0.0));
+    float size = unit_factor(max(abs(e1), abs(e2)));
+    float3 n = cross(e1 * size, e2 * size);
+    area = 0.5 * unit_length(n) / size / size;
+    return unit_direction(n) * linear_mirror(float3x3(m[0].xyz, m[1].xyz, m[2].xyz));
 }
 
 // Render-space position of `p` under producer transform `anchor`, `m`.
@@ -629,7 +635,9 @@ float cluster_area(ProducerBatch b, ProducerClusterGpu k, float3x4 m)
     {
         float3 p0, p1, p2;
         cluster_triangle(b, k, i, p0, p1, p2);
-        area += 0.5 * length(transformed_normal(m, p0, p1, p2));
+        float a;
+        transformed_normal(m, p0, p1, p2, a);
+        area += a;
     }
     return area;
 }
@@ -666,10 +674,11 @@ public float emissive_area_pdf(LightSetGpu* set, uint entry, float luminance)
 
 // Sample of emissive entry `entry` from `u`, the entry chosen with `probability`: a cluster
 // by its CDF, a triangle by area and a point uniform in the triangle. A triangle's front
-// face winds counter-clockwise. Selection follows the material's factor, so the density is the
+// face winds counter-clockwise, and a material with a back of its own lights from the front
+// alone, the side this reads. Selection follows the material's factor, so the density is the
 // factor's, and the sample carries what a ray sees at the point: what the surface emits, in the
 // share a presence layer shows there, and none where an alpha test leaves a hole. Traversal
-// takes opaque and dielectric entries' triangles whole, so no test applies to them.
+// takes opaque entries' triangles whole, so no test applies to them.
 LightSample emissive_sample(LightSetGpu* set, uint entry, float4 u, float probability)
 {
     SceneRoot* s = set.scene;
@@ -694,8 +703,8 @@ LightSample emissive_sample(LightSetGpu* set, uint entry, float4 u, float probab
     {
         float3 q0, q1, q2;
         cluster_triangle(b, k, i, q0, q1, q2);
-        float3 ni = transformed_normal(m, q0, q1, q2);
-        float a = 0.5 * length(ni);
+        float a;
+        float3 ni = transformed_normal(m, q0, q1, q2, a);
         if (!(a > 0.0))
             continue;
         p0 = q0;
@@ -721,11 +730,11 @@ LightSample emissive_sample(LightSetGpu* set, uint entry, float4 u, float probab
     float3 emitted = surface_emission(at, mat);
     if ((mat.flags & MATERIAL_PRESENCE) != 0)
         emitted *= saturate(material_opacity(at));
-    else if ((mat.flags & MATERIAL_ALPHA_TESTED) != 0 && producer.opacity != PRODUCER_OPAQUE && producer.opacity != PRODUCER_DIELECTRIC)
+    else if ((mat.flags & MATERIAL_ALPHA_TESTED) != 0 && producer.opacity != PRODUCER_OPAQUE)
         emitted *= material_coverage(at);
     LightSample r = light_sample(LIGHT_SAMPLE_EMISSIVE, s.light_capacity + entry, render_point(anchor, m, p),
-                                 normalize(n), emitted, probability * luminance_rec2020(l) / e.total);
-    if ((mat.flags & MATERIAL_DOUBLE_SIDED) != 0)
+                                 n, emitted, probability * luminance_rec2020(l) / e.total);
+    if ((mat.flags & (MATERIAL_DOUBLE_SIDED | MATERIAL_HAS_BACK)) == MATERIAL_DOUBLE_SIDED)
         r.bits |= LIGHT_SAMPLE_TWO_SIDED;
     return r;
 }

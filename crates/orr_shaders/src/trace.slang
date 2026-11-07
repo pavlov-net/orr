@@ -14,12 +14,39 @@ public static const uint MASK_PARTICLE = 0x02;   // particle batches
 public static const uint MASK_MEDIUM = 0x04;     // medium proxies (AABBs)
 public static const uint MASK_DIELECTRIC = 0x80; // dielectric and presence surfaces
 
-// Candidate classes, held in an instance's custom index (`Candidate.custom_index`).
+// Candidate classes. Cluster geometry holds its class in the geometry index, per cluster, under an
+// instance with custom index 0 whose mask covers what it shows; other instances hold it in their
+// custom index.
 public static const uint CLASS_OPAQUE = 0; // opaque or alpha-tested
 public static const uint CLASS_DIELECTRIC = 1;
 public static const uint CLASS_PRESENCE = 2;
 public static const uint CLASS_PARTICLE = 3;
 public static const uint CLASS_MEDIUM = 4;
+
+// The class of a candidate or hit from its instance's custom index and its geometry index.
+public uint class_of(uint custom_index, uint geometry_index)
+{
+    return custom_index != 0 ? custom_index : geometry_index;
+}
+
+// The mask bit of candidate class `class_id`. Other classes pass every mask.
+public uint class_mask(uint class_id)
+{
+    switch (class_id)
+    {
+    case CLASS_OPAQUE:
+        return MASK_OPAQUE;
+    case CLASS_DIELECTRIC:
+    case CLASS_PRESENCE:
+        return MASK_DIELECTRIC;
+    case CLASS_PARTICLE:
+        return MASK_PARTICLE;
+    case CLASS_MEDIUM:
+        return MASK_MEDIUM;
+    default:
+        return 0xff;
+    }
+}
 
 // Ray flags beside Slang's `RAY_FLAG_*`: opacity micromaps forced to two states. Builds
 // without micromaps drop it.
@@ -29,8 +56,9 @@ public static const uint RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE = 0x400;
 public struct Candidate
 {
     public uint instance_index; // TLAS or PTLAS instance index
-    public uint custom_index;   // the instance's custom index: its candidate class
+    public uint custom_index;   // the instance's custom index
     public uint geometry_index;
+    public uint class_id;       // CLASS_*
     public uint primitive_index;
     public int cluster_id;      // -1 outside cluster BLAS
     public bool triangle;       // false for procedural (AABB) candidates
@@ -53,6 +81,7 @@ public struct Hit
     public uint instance_index;
     public uint custom_index;
     public uint geometry_index;
+    public uint class_id;  // CLASS_*
     public uint primitive_index;
     public int cluster_id; // -1 outside cluster BLAS and on swept sphere hits
     public float2 barycentrics;
@@ -125,8 +154,12 @@ public bool trace_any<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags
     {
         if (opaque_candidate(q, flags))
             q.CommitNonOpaqueTriangleHit();
-        else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && any_hit.accept(candidate(q)))
-            q.CommitNonOpaqueTriangleHit();
+        else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
+        {
+            Candidate c = candidate(q);
+            if (takes(c, mask) && any_hit.accept(c))
+                q.CommitNonOpaqueTriangleHit();
+        }
     }
     return q.CommittedStatus() != COMMITTED_NOTHING;
 }
@@ -150,6 +183,8 @@ public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint m
             continue;
         }
         Candidate c = candidate(q);
+        if (c.triangle && !takes(c, mask))
+            continue;
         if (c.triangle && handler.positions(c))
             candidate_positions(q, c.object_positions);
         bool counted;
@@ -208,8 +243,12 @@ Hit closest<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags, A any_hi
     {
         if (opaque_candidate(q, flags))
             q.CommitNonOpaqueTriangleHit();
-        else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && any_hit.accept(candidate(q)))
-            q.CommitNonOpaqueTriangleHit();
+        else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
+        {
+            Candidate c = candidate(q);
+            if (takes(c, mask) && any_hit.accept(c))
+                q.CommitNonOpaqueTriangleHit();
+        }
     }
     Hit h = committed(q);
     committed_positions(q, fetch, h, positions);
@@ -247,6 +286,8 @@ Hit translucent<H : ITranslucent>(Tlas tlas, RayDesc ray, uint mask, uint flags,
         if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
             continue;
         Candidate c = candidate(q);
+        if (!takes(c, mask))
+            continue;
         float4 layer = handler.layer(c);
         if (layer.a > 0)
         {
@@ -370,6 +411,7 @@ Candidate candidate(inout RayQuery<RAY_FLAG_NONE> q)
     default:
         c.cluster_id = q.CandidateClusterID();
     }
+    c.class_id = class_of(c.custom_index, c.geometry_index);
     return c;
 }
 
@@ -400,6 +442,16 @@ float3[3] metal_corners(uint64_t data)
 uint64_t metal_committed_data(inout RayQuery<RAY_FLAG_NONE> q)
 {
     __intrinsic_asm "reinterpret_cast<ulong>(($0)->get_committed_primitive_data())";
+}
+
+// Whether a ray with mask `mask` takes triangle candidate `c`. An instance's mask covers every
+// class it shows, so a ray whose mask misses a class still meets that class's clusters in a mixed
+// BLAS, where the class in the geometry index turns it away. A ray that takes both opaque and
+// dielectric geometry has no class to turn away.
+[ForceInline]
+bool takes(Candidate c, uint mask)
+{
+    return (mask & (MASK_OPAQUE | MASK_DIELECTRIC)) == (MASK_OPAQUE | MASK_DIELECTRIC) || (class_mask(c.class_id) & mask) != 0;
 }
 
 // Whether a non-opaque candidate is an opaque triangle of a cluster: Metal makes a whole
@@ -451,6 +503,7 @@ Hit committed(inout RayQuery<RAY_FLAG_NONE> q)
     default:
         h.cluster_id = h.hit ? q.CommittedClusterID() : -1;
     }
+    h.class_id = class_of(h.custom_index, h.geometry_index);
     return h;
 }
 

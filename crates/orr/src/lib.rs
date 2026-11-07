@@ -1091,8 +1091,8 @@ impl<'a> Frame<'a> {
 
     /// Steps 4-5 for one view: its raster half; the scene's lighting pass before the scene's
     /// first view this frame; the view's froxel volume; one path per pixel into the view's
-    /// radiance, then the dielectric dispatch over it, which traces each pixel's first
-    /// dielectric or presence layer; media apply over each pixel's camera segment; the
+    /// radiance, from its first dielectric or presence layer or its surface; media apply over
+    /// each pixel's camera segment; the
     /// transparency hook; ray reconstruction; `hooks.scene_referred`; a scene-referred
     /// screenshot; metering and adaptation; then, unless the view stops there, motion blur, the
     /// lens's glare, tonemap, `hooks.display_linear`, `hooks.ui`, compose and a display
@@ -1230,9 +1230,7 @@ impl<'a> Frame<'a> {
         let traced = Stages::COMPUTE | Stages::RAY;
         list.barrier(Stages::ALL, traced, Hazards::empty());
         kernels.record_media(list, scene, paths, &pass, lighting)?;
-        kernels.record_opaque(list, scene, paths, &pass, lighting)?;
-        list.barrier(traced, traced, Hazards::empty());
-        kernels.record_dielectric(list, paths, &pass, lighting);
+        kernels.record_paths(list, scene, paths, &pass, lighting)?;
         state.samples = state.samples.wrapping_add(1);
         list.barrier(traced, Stages::COMPUTE, Hazards::empty());
         kernels.record_media_apply(list, scene, paths, &pass, lighting);

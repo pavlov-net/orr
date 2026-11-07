@@ -1,4 +1,4 @@
-//! The dielectric dispatch on the bed: the interior list, Beer transmittance through a slab,
+//! Dielectric paths on the bed: the interior list, Beer transmittance through a slab,
 //! rough refraction, the glass furnace, single scattering against a CPU integral, an albedo-1
 //! medium, presence layers, a camera inside water, layer guides under camera rotation,
 //! the frosted-glass term of rough glass, dispersion: a white line through a prism against a
@@ -7,19 +7,21 @@
 //! through glass, and each pixel's front layer.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, Bed, CLOUD_SPHERE, Capture, DISPERSIVE_SPHERE, EMITTER_LUMINANCE,
-    EXTENT, FLOOR, FURNACE_RADIANCE, FrostGuide, GLASS_SPHERE, Item, LIGHT_FLOOR, LINE,
-    LINE_HALF_HEIGHT, LINE_HALF_WIDTH, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, OverlayFrontLayer,
-    PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR,
-    Particle, ParticleLook, Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec,
-    TINTED_SLAB, TWO_SIDED_SLAB, WATER_BOX, assert_close, fresnel, image_mean, prism_corners,
-    reference, surface_mean, water_transmission,
+    Accumulated, Analytic, Bed, CLOUD_SPHERE, Capture, DEPTH_SPLIT_SLAB, DISPERSIVE_SPHERE,
+    EMITTER_LUMINANCE, EXTENT, FLOOR, FURNACE_RADIANCE, FlatColor, FrostGuide, GLASS_SPHERE, Item,
+    LIGHT_FLOOR, LINE, LINE_HALF_HEIGHT, LINE_HALF_WIDTH, LIT_SLAB, MILK_SIGMA_S, MILK_SIGMA_T,
+    MILKY_SLAB, MIXED_SLAB, NEAR, OverlayFrontLayer, PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, PRISM,
+    PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Particle, ParticleLook, Paths, ROUGH_SLAB,
+    SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB, TWO_SIDED_SLAB, WATER_BOX,
+    assert_close, fresnel, image_mean, prism_corners, reference, surface_mean, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
+use lighting_suite::welch::{assert_mean, assert_same_mean};
 use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
-    DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ViewLighting,
+    DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ReferenceSettings,
+    ThinLens, ViewLighting,
 };
 use orr_math::{DMat3, DVec3, Mat3, Vec2, Vec3};
 use orr_scene::Opacity;
@@ -265,6 +267,90 @@ fn a_slab_transmits_its_beer_law_share_between_two_fresnel_faces() {
     assert_clean();
 }
 
+/// A path reads a textured `transmission_depth` where it enters the slab. The slab tilts 45
+/// degrees about x, so the view refracts along its local z and enters where the texture holds
+/// 128 / 255, taking that much more extinction than the slab's own depth, and leaves where it holds
+/// 1. Internal reflections keep the reading of the entry.
+#[test]
+fn a_path_takes_the_texels_of_a_textured_depth_where_it_enters() {
+    let tilt = std::f64::consts::FRAC_PI_4;
+    let inside = (tilt.sin() / 1.5).asin();
+    let chord = f64::from(SLAB_THICKNESS) / inside.cos();
+    let (f, t) = (
+        fresnel(1.5, tilt.cos()),
+        0.5f64.powf(chord / f64::from(SLAB_THICKNESS) * 255.0 / 128.0),
+    );
+    let through = (1.0 - f) * (1.0 - f) * t / (1.0 - f * f * t * t);
+    let spec = from_above(
+        vec![
+            at(LIGHT_FLOOR, Vec3::ZERO),
+            Item {
+                model: DEPTH_SPLIT_SLAB,
+                linear: Mat3::from_rotation_x(tilt as f32),
+                at: Vec3::new(0.0, 0.5, 0.0),
+            },
+        ],
+        Vec::new(),
+        3.0,
+    );
+    let image = render_paths(&mut Bed::with(spec), &paths(reference(2)), 32);
+    let l = f64::from(EMITTER_LUMINANCE) * through;
+    assert_close("through the slab", center(&image, 8), [l; 3], 0.015);
+    assert_clean();
+}
+
+/// One model holding the emitter and the tinted slab shows what the two models show: each cluster
+/// traces and rasters by its own class, so the emitter is the G-buffer's surface (black against a
+/// white sky and the white glass) and the slab a layer in front of it.
+#[test]
+fn a_model_mixing_classes_traces_each_cluster_by_its_class() {
+    let spec = from_above(
+        vec![at(MIXED_SLAB, Vec3::new(0.0, 0.5, 0.0))],
+        Vec::new(),
+        3.0,
+    );
+    let mut bed = Bed::with(spec);
+    let settings = paths(reference(2));
+    let frames: Vec<f64> = (0..8)
+        .map(|_| center(&render_paths(&mut bed, &settings, 4), 8)[1])
+        .collect();
+    let (f, t) = (fresnel(1.5, 1.0), 0.5);
+    let through = (1.0 - f) * (1.0 - f) * t / (1.0 - f * f * t * t);
+    assert_mean(
+        "slab",
+        &frames,
+        f64::from(EMITTER_LUMINANCE) * through,
+        0.01,
+    );
+    let flat = FlatColor::new([1.0; 3]);
+    let surface = bed.accumulate(1, 0, &mut |list, f| flat.record(list, f));
+    let [w, h] = EXTENT;
+    let held = surface.mean[(h / 2 * w + w / 2) as usize];
+    assert_eq!(held, [0.0, 0.0, 0.0, 1.0], "the G-buffer's center pixel");
+    assert_clean();
+}
+
+/// An emitter inside the tinted slab, seen straight down: the view enters by Fresnel, Beer's law
+/// runs to the emitter, and refraction scales its radiance by 1 / n^2.
+#[test]
+fn an_emitter_inside_glass_reaches_the_eye_by_beer_and_the_squared_ior() {
+    let spec = from_above(
+        vec![at(LIT_SLAB, Vec3::new(0.0, 0.5, 0.0))],
+        Vec::new(),
+        3.0,
+    );
+    let mut bed = Bed::with(spec);
+    let settings = paths(reference(2));
+    let frames: Vec<f64> = (0..8)
+        .map(|_| center(&render_paths(&mut bed, &settings, 4), 8)[1])
+        .collect();
+    let beer = 0.5f64.powf(0.5 * f64::from(SLAB_THICKNESS) / 0.3);
+    let enter = 1.0 - fresnel(1.5, 1.0);
+    let l = f64::from(EMITTER_LUMINANCE) * enter * beer / (1.5 * 1.5);
+    assert_mean("emitter in glass", &frames, l, 0.01);
+    assert_clean();
+}
+
 /// A clear glass sphere in a uniform environment keeps at most, and here nearly all, the
 /// environment's radiance.
 #[test]
@@ -297,7 +383,7 @@ fn a_glass_sphere_in_a_furnace_keeps_its_energy() {
 /// A scattering slab under a sun 10 degrees from the zenith, seen straight down, against
 /// the single-scattering integral of the same model: light enters the medium through the
 /// surface without bending, scatters isotropically once, and leaves through the camera's
-/// refraction.
+/// refraction, which scales radiance by 1 / n^2.
 #[test]
 fn a_scattering_slab_matches_single_scattering_within_5_percent() {
     let tilt = 10f32.to_radians();
@@ -320,7 +406,7 @@ fn a_scattering_slab_matches_single_scattering_within_5_percent() {
     let enter = 1.0 - fresnel(1.5, 1.0);
     let leave = 1.0 - fresnel(1.5, c);
     let phase = 1.0 / (4.0 * std::f64::consts::PI);
-    let l = 1000.0 * enter * leave * phase * sigma_s * (1.0 - (-k * depth).exp()) / k;
+    let l = 1000.0 * enter * leave * phase * sigma_s * (1.0 - (-k * depth).exp()) / k / (1.5 * 1.5);
     assert_close("single scattering", center(&image, 16), [l; 3], 0.05);
     assert_clean();
 }
@@ -405,6 +491,72 @@ fn a_camera_inside_water_sees_its_absorption() {
     let transmitted = water_transmission();
     let wanted: [f64; 3] = std::array::from_fn(|c| open[c] * leave * transmitted[c].powf(path));
     assert_close("under water", under, wanted, 0.05);
+    assert_clean();
+}
+
+/// An eye in water just over a glass slab, its near plane inside the slab: the emitter under both
+/// takes the slab from the near plane down, the face into the water, the water below it and the
+/// squared IOR ratio of that refraction, so the near-plane list keeps the water around the slab.
+#[test]
+fn a_near_plane_inside_a_solid_in_water_keeps_both_interiors() {
+    let slab = 2.0f32;
+    let gap = NEAR * 0.5;
+    let mut bed = Bed::with(from_above(
+        vec![
+            at(LIGHT_FLOOR, Vec3::ZERO),
+            at(WATER_BOX, Vec3::new(0.0, 1.99, 0.0)),
+            at(TINTED_SLAB, Vec3::new(0.0, slab, 0.0)),
+        ],
+        Vec::new(),
+        slab + SLAB_THICKNESS * 0.5 + gap,
+    ));
+    let inside = ViewLighting {
+        camera_medium: Some(bed.material(WATER_BOX)),
+        ..reference(2)
+    };
+    let got = center(&render_paths(&mut bed, &paths(inside), 16), 4);
+    let in_slab = f64::from(1.0 - (NEAR - gap) / SLAB_THICKNESS);
+    let below = f64::from(slab - SLAB_THICKNESS * 0.5);
+    let leave = 1.0 - fresnel(1.5 / 1.33, 1.0);
+    let scale = (1.5f64 / 1.33).powi(2);
+    let wanted = water_transmission().map(|c| {
+        f64::from(EMITTER_LUMINANCE) * 0.5f64.powf(in_slab) * leave * scale * c.powf(below)
+    });
+    assert_close("through the slab and water", got, wanted, 0.02);
+    assert_clean();
+}
+
+/// The same eye behind a lens: its rays start at the eye, in the water, so they cross the slab's
+/// top face themselves and take the whole slab and the water on both sides of it.
+#[test]
+fn a_lens_ray_takes_the_interiors_at_the_lens_not_the_near_plane() {
+    let slab = 2.0f32;
+    let gap = NEAR * 0.5;
+    let mut bed = Bed::with(from_above(
+        vec![
+            at(LIGHT_FLOOR, Vec3::ZERO),
+            at(WATER_BOX, Vec3::new(0.0, 1.99, 0.0)),
+            at(TINTED_SLAB, Vec3::new(0.0, slab, 0.0)),
+        ],
+        Vec::new(),
+        slab + SLAB_THICKNESS * 0.5 + gap,
+    ));
+    let lens = ViewLighting {
+        camera_medium: Some(bed.material(WATER_BOX)),
+        reference: Some(ReferenceSettings {
+            lens: Some(ThinLens {
+                aperture_radius: 1e-5,
+                focus_distance: 2.0,
+            }),
+        }),
+        ..reference(2)
+    };
+    let got = center(&render_paths(&mut bed, &paths(lens), 16), 4);
+    let water = f64::from(gap + slab - SLAB_THICKNESS * 0.5);
+    let leave = 1.0 - fresnel(1.5 / 1.33, 1.0);
+    let wanted = water_transmission()
+        .map(|c| f64::from(EMITTER_LUMINANCE) * 0.5 * leave * leave * c.powf(water));
+    assert_close("through the slab and water", got, wanted, 0.02);
     assert_clean();
 }
 
@@ -764,11 +916,46 @@ fn a_white_line_seen_through_a_prism_splits_by_the_abbe_number() {
     assert_clean();
 }
 
-/// Tracing only the tiles the layers rastered into, and those beside them, leaves the
-/// radiance, the guides and the frosted-glass term bit for bit as tracing every tile does,
-/// on scenes whose layers cover part of the image, through the compute and raygen entries,
-/// both into views of their own in the same frame. The reference's paths read no cache, so
-/// they repeat exactly within a frame.
+/// How far apart in half-float steps an entry's builds of the path loop with and without layer
+/// code may round a pixel's radiance. At 2048 x 1040 about 1 pixel in 80,000 lands a step apart
+/// through the raygen entry, fewer through the compute entry, so this extent sees one in some
+/// runs.
+const BUILD_STEPS: u16 = 1;
+
+/// An eye inside the bounds of a model, beside its opaque section, turned away from its slab far
+/// from the eye: no layer can lie before the near plane, so no tile is traced.
+#[test]
+fn a_model_reaching_the_eye_marks_no_tile_without_a_layer_cluster_there() {
+    const TILES: u64 = (EXTENT[0].div_ceil(8) * EXTENT[1].div_ceil(8)) as u64;
+    let eye = Vec3::new(0.95, -0.3, 0.95);
+    let mut bed = Bed::with(Spec {
+        copies: vec![at(MIXED_SLAB, Vec3::ZERO)],
+        lights: Vec::new(),
+        environment: None,
+        eye,
+        target: eye + Vec3::new(1.0, 0.0, 1.0),
+        fov_y: 0.3,
+        focus: None,
+    });
+    let marks = readback::<u32>(TILES + 1, "layer tiles");
+    bed.accumulate(1, 1, &mut |list, f| {
+        list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+        list.copy(
+            marks.gpu().cast(),
+            f.view.targets.layer_tiles.cast(),
+            4 * (TILES + 1),
+        );
+    });
+    assert!(marks.as_slice().unwrap().iter().all(|&m| m == 0));
+    assert_clean();
+}
+
+/// Tracing only the tiles the layers rastered into, and those beside them, leaves the guides bit
+/// for bit as tracing every tile does, on scenes whose layers cover part of the image, through both
+/// entries, into views of their own in the same frame. The radiance of a traced tile, which both
+/// views take from one build, matches bit for bit too, and that of any other within
+/// [`BUILD_STEPS`]; the frosted-glass term, which blurs that radiance, within 1%. The reference's
+/// paths read no cache, so they repeat exactly within a frame.
 #[test]
 fn layer_tiles_trace_what_every_tile_traces() {
     const TILES: u64 = (EXTENT[0].div_ceil(8) * EXTENT[1].div_ceil(8)) as u64;
@@ -835,25 +1022,48 @@ fn layer_tiles_trace_what_every_tile_traces() {
                 a.record(list, f.target);
                 b.record(list, &spare.view);
             });
-            let marked = marks.as_slice().unwrap()[..TILES as usize]
-                .iter()
-                .filter(|&&m| m != 0)
-                .count();
+            let tiles = &marks.as_slice().unwrap()[..TILES as usize];
+            let marked = tiles.iter().filter(|&&m| m != 0).count();
             assert!(
                 marked > 0 && marked < TILES as usize,
                 "{what}: layers marked {marked} of {TILES} tiles"
             );
-            let differ = a
-                .radiance()
-                .iter()
-                .zip(b.radiance())
-                .filter(|(x, y)| x != y)
+            let apart = |(x, y): (&[u16; 4], &[u16; 4])| -> u16 {
+                x.iter().zip(y).map(|(p, q)| p.abs_diff(*q)).max().unwrap()
+            };
+            let [columns, rows] = EXTENT.map(|e| e.div_ceil(8) as i32);
+            let beside = |x: i32, y: i32, dx: i32, dy: i32| {
+                let (u, v) = (x + dx, y + dy);
+                (0..columns).contains(&u)
+                    && (0..rows).contains(&v)
+                    && tiles[(v * columns + u) as usize] != 0
+            };
+            let allowed = |pixel: usize| {
+                let x = (pixel as u32 % EXTENT[0] / 8) as i32;
+                let y = (pixel as u32 / EXTENT[0] / 8) as i32;
+                let traced = (-1..=1).any(|dy| (-1..=1).any(|dx| beside(x, y, dx, dy)));
+                if traced { 0 } else { BUILD_STEPS }
+            };
+            let steps = || a.radiance().iter().zip(b.radiance()).map(apart);
+            let differ = steps()
+                .enumerate()
+                .filter(|&(pixel, s)| s > allowed(pixel))
                 .count();
-            assert_eq!(differ, 0, "{what}: radiance differs on {differ} pixels");
+            let largest = steps().max().unwrap();
+            assert_eq!(
+                differ, 0,
+                "{what}: radiance differs on {differ} pixels, by up to {largest} half-float steps"
+            );
             let frost = |p: &Paths| p.frost_guide.as_ref().unwrap().read();
+            let (x, y) = (frost(&tiled), frost(&every));
+            let frost_apart = x
+                .iter()
+                .zip(&y)
+                .map(|(p, q)| (p - q).abs() / (1.0 + p.abs()))
+                .fold(0.0f32, f32::max);
             assert!(
-                frost(&tiled) == frost(&every),
-                "{what}: frosted-glass term differs"
+                frost_apart <= 1e-2,
+                "{what}: frosted-glass term differs by {frost_apart}"
             );
             let (ga, gb) = (a.guides(), b.guides());
             for (name, x, y) in [
@@ -886,12 +1096,13 @@ fn raygen_and_compute_entries_trace_the_same_light() {
     let a = render_paths(&mut bed, &compute, 32);
     let again = render_paths(&mut bed, &compute, 32);
     let b = render_paths(&mut bed, &rays, 32);
-    assert_close(
-        "raygen against compute",
-        image_mean(&b),
-        image_mean(&a),
-        0.005,
-    );
+    let frames = |bed: &mut Bed, paths: &Paths| -> Vec<f64> {
+        (0..24)
+            .map(|_| image_mean(&render_paths(bed, paths, 1))[1])
+            .collect()
+    };
+    let (of_compute, of_rays) = (frames(&mut bed, &compute), frames(&mut bed, &rays));
+    assert_same_mean("raygen against compute", &of_rays, &of_compute);
     let noise = again.flip(&a, 1.0 / 500.0);
     let e = b.flip(&a, 1.0 / 500.0);
     assert!(

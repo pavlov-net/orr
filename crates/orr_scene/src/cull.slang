@@ -41,10 +41,18 @@ void clear(uint3 id: SV_DispatchThreadID)
         r.gbuffer.layer_tiles[id.x] = 0;
 }
 
-// Whether the sphere at eye-relative `center` of `radius` m passes the frustum test. A
-// dielectric or presence (`layer`) sphere that reaches between the eye and the near plane
-// passes and marks every tile.
-bool frustum_visible(ViewConstants* v, RasterGpu* r, bool layer, float3 center, float radius)
+// Whether the sphere at eye-relative `center` of `radius` m passes the frustum test. One holding
+// dielectric or presence clusters (`layer`) also passes where it reaches between the eye and the
+// near plane, so those clusters get their own test.
+bool frustum_visible(ViewConstants* v, bool layer, float3 center, float radius)
+{
+    return (layer && near_eye(v, center, radius)) || sphere_visible(v, center, radius);
+}
+
+// `frustum_visible` for the sphere of one cluster. A dielectric or presence cluster's surface
+// between the eye and the near plane marks every tile; a copy's sphere can't, since one layer
+// cluster anywhere in a model would then mark for all of it.
+bool cluster_frustum_visible(ViewConstants* v, RasterGpu* r, bool layer, float3 center, float radius)
 {
     if (layer && near_eye(v, center, radius))
     {
@@ -94,7 +102,7 @@ void instances(uint3 id: SV_DispatchThreadID)
     }
     float3 center = place(p, 0.5 * (lo + hi));
     float radius = 0.5 * length(hi - lo) * p.scale;
-    if (!frustum_visible(v, r, layer_class(inst.candidate_class), center, radius))
+    if (!frustum_visible(v, mesh_has_layers(s.meshes + s.models[inst.model].mesh) && layer_traced(inst.flags), center, radius))
         return;
     // Posed parts may leave the rest bounds; their clusters are tested one by one.
     bool posed = (s.slot_state[slot].rt_flags & RT_ANIMATED) != 0;
@@ -152,8 +160,8 @@ bool cluster_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement
     float reach = displacement_reach(c);
     float3 center = place(p, c.cull_sphere.xyz);
     float radius = (c.cull_sphere.w + reach) * p.scale;
-    bool layer = layer_class(inst.candidate_class);
-    if (!frustum_visible(v, r, layer, center, radius))
+    bool layer = layer_class(cluster_class(c));
+    if (!class_rastered(cluster_class(c), inst.flags) || !cluster_frustum_visible(v, r, layer, center, radius))
         return false;
     if (layer)
         return true;
@@ -181,11 +189,12 @@ void cluster_box(MeshGpu* mesh, Cluster c, out float3 lo, out float3 hi)
 
 // Whether the skinned box `lo..hi` of a cluster of `inst` survives frustum and section
 // culling; deformation leaves no back-face cone to test.
-bool skinned_visible(ViewConstants* v, InstanceGpu inst, Placement p, Cluster c, float3 lo, float3 hi)
+bool skinned_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement p, Cluster c, float3 lo, float3 hi)
 {
-    if (section_hidden(inst, c.section))
+    uint class_id = cluster_class(c);
+    if (section_hidden(inst, c.section) || !class_rastered(class_id, inst.flags))
         return false;
-    return sphere_visible(v, place(p, 0.5 * (lo + hi)), 0.5 * length(hi - lo) * p.scale);
+    return cluster_frustum_visible(v, r, layer_class(class_id), place(p, 0.5 * (lo + hi)), 0.5 * length(hi - lo) * p.scale);
 }
 
 // The visible-cluster index of a new entry, or false past capacity.
@@ -222,7 +231,7 @@ void draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint copy, InstanceGpu i
     if (!add_visible(r, vc, visible))
         return;
     s.slot_state[copy_slot(copy)].last_visible_frame = s.frame_index;
-    if (layer_class(inst.candidate_class))
+    if (layer_class(cluster_class(c)))
     {
         append(r, COUNT_COVERAGE, r.coverage, visible);
         return;
@@ -305,7 +314,7 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             else
                 cluster_box(mesh, c, lo, hi);
             shown = material != MATERIAL_NONE
-                && (skinned ? skinned_visible(v, inst, p, c, lo, hi) : cluster_visible(v, r, inst, p, c, s.materials + material));
+                && (skinned ? skinned_visible(v, r, inst, p, c, lo, hi) : cluster_visible(v, r, inst, p, c, s.materials + material));
         }
         if (shown)
         {
@@ -379,8 +388,9 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     ProducerGpu p = s.producers[entry];
     bool particle = p.opacity == PRODUCER_PARTICLE;
     bool smoke = p.opacity == PRODUCER_SMOKE;
-    bool layer = p.opacity == PRODUCER_DIELECTRIC || p.opacity == PRODUCER_PRESENCE;
-    if (!(layer ? layer_traced(p.flags) : (p.flags & INSTANCE_RASTER) != 0 && (p.flags & INSTANCE_CAST_ONLY) == 0))
+    bool sections = p.opacity == PRODUCER_SECTIONS;
+    bool entry_layer = p.opacity == PRODUCER_DIELECTRIC || p.opacity == PRODUCER_PRESENCE;
+    if (!sections && !(entry_layer ? layer_traced(p.flags) : opaque_rastered(p.flags)))
         return;
     Placement pl;
     if (!producer_placement(s, p, false, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), pl))
@@ -408,9 +418,17 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         }
         if (material == MATERIAL_NONE)
             continue;
+        bool layer = entry_layer;
+        if (sections)
+        {
+            uint class_id = material_class(s.materials + material);
+            layer = layer_class(class_id);
+            if (!class_rastered(class_id, p.flags))
+                continue;
+        }
         float3 center = place(pl, 0.5 * (lo + hi));
         float radius = 0.5 * length(hi - lo) * pl.scale;
-        if (!frustum_visible(v, r, layer, center, radius))
+        if (!cluster_frustum_visible(v, r, layer, center, radius))
             continue;
         // Diced clusters that displacement stretches past the software raster's limit
         // split their triangles between the two paths by size.
@@ -441,7 +459,7 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             append(r, COUNT_SOFTWARE, r.software, visible);
         if (software)
             continue;
-        bool alpha = p.opacity == PRODUCER_ALPHA_TESTED && (s.materials[material].flags & MATERIAL_ALPHA_TESTED) != 0;
+        bool alpha = producer_tested(p, s.materials + material);
         append(r, alpha ? COUNT_ALPHA : COUNT_OPAQUE, alpha ? r.alpha : r.opaque, visible);
     }
 }

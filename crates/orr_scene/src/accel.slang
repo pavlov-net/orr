@@ -11,7 +11,7 @@ import orr_gpu.rtas;
 
 // `ClasJob.flags`.
 public static const uint CLAS_MICROMAP = 1;   // alpha-tested triangles take the page's micromap
-public static const uint CLAS_NON_OPAQUE = 2; // every triangle is non-opaque (linked coverage)
+public static const uint CLAS_NON_OPAQUE = 2; // every triangle is non-opaque (`non_opaque` sections)
 public static const uint CLAS_TEMPLATE = 4;   // a template build for skinned copies
 
 // One cluster to build a CLAS for.
@@ -75,12 +75,13 @@ void clas(uint group: SV_GroupID, uint t: SV_GroupThreadID)
         root.vertices[at + 1] = p.y;
         root.vertices[at + 2] = p.z;
     }
-    bool non_opaque = (job.flags & CLAS_NON_OPAQUE) != 0;
+    uint class_id = cluster_class(c);
+    bool non_opaque = class_id != 0 || (job.flags & CLAS_NON_OPAQUE) != 0;
     bool micromap = (job.flags & CLAS_MICROMAP) != 0;
     for (uint i = t; i < c.tri_count; i += 64)
     {
         bool opaque = !non_opaque && i < c.alpha_first;
-        root.triangle_flags[job.triangle_first + i] = geometry_index_and_flags(0, opaque ? GEOMETRY_OPAQUE : 0);
+        root.triangle_flags[job.triangle_first + i] = geometry_index_and_flags(class_id, opaque ? GEOMETRY_OPAQUE : 0);
         if (micromap)
             root.omm_indices[job.triangle_first + i] = opaque ? OMM_INDEX_OPAQUE : load_omm_index(job.page, h, c, i);
     }

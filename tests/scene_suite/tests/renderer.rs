@@ -702,7 +702,7 @@ fn a_failed_path_compile_comes_back_from_wait_paths_and_render_view() {
     let history = r.create_view_history().unwrap();
     let failed = |e: orr::Error| match e {
         orr::Error::PathKernels(e) => assert!(
-            matches!(&*e, orr::LightingError::Compile { kernel, .. } if *kernel == "opaque paths"),
+            matches!(&*e, orr::LightingError::Compile { kernel, .. } if *kernel == "view paths"),
             "{e}"
         ),
         e => panic!("{e}"),

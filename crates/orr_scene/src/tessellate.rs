@@ -148,7 +148,7 @@ impl Patterns {
                     max_verts_per_cluster: max_vertices,
                     max_total_tris: 2 * total_tris,
                     max_total_verts: 2 * total_verts,
-                    max_geometry_index: 0,
+                    max_geometry_index: crate::accel::MAX_GEOMETRY_INDEX,
                     max_geometries_per_cluster: 1,
                     min_truncate_bits: 0,
                 }),

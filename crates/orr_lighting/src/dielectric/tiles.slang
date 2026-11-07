@@ -1,14 +1,14 @@
-// The tiles a view's dielectric dispatch traces, and its indirect arguments.
+// The tiles a view's paths look for layers in, and the arguments of its layer guide dispatch.
 #include "orr_root.h"
 import orr_lighting.dielectric;
 
 ORR_ROOT(LayerTilesRoot);
 
 [shader("compute")]
-[numthreads(64, 1, 1)]
-void tiles(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
+[numthreads(8, 8, 1)]
+void tiles(uint3 id: SV_DispatchThreadID)
 {
-    layer_tiles_body(root, group.xy, thread);
+    layer_tiles_body(root, id.xy);
 }
 
 [shader("compute")]

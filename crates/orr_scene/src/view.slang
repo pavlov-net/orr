@@ -55,13 +55,15 @@ public static const uint TEXTURE_FILTER_STOCHASTIC = 1;
 
 public static const float HDR_CEILING = 16384.0;
 
-// Scales `c` so its largest channel is at most HDR_CEILING; NaN and infinite colors give 0.
+// Scales `c` so its largest channel is at most HDR_CEILING; NaN and infinite colors give 0. A
+// channel over it lands on it exactly: the ceiling is a half float's power of two, so a rounded
+// product a step under it stores a whole half-float step lower.
 public float3 apply_hdr_ceiling(float3 c)
 {
     if (any(isnan(c)) || any(isinf(c)))
         return float3(0);
     float m = max_component(c);
-    return m > HDR_CEILING ? c * (HDR_CEILING / m) : c;
+    return m > HDR_CEILING ? select(c == m, float3(HDR_CEILING), c * (HDR_CEILING / m)) : c;
 }
 
 // How far a position may land from the center of the previous image, in NDC: far off screen

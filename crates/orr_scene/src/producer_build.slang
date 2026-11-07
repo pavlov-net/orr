@@ -12,6 +12,9 @@ import orr_shaders.abi;
 import orr_shaders.atomic;
 import orr_shaders.math;
 import orr_scene.producer;
+import orr_scene.material;
+import orr_scene.hit;
+import orr_shaders.trace;
 import orr_gpu.rtas;
 import orr_scene.tables;
 
@@ -54,7 +57,7 @@ public struct ProducerBuildGpu
     public uint* swept_indices;     // a swept-sphere entry's per-segment first vertex, the BLAS's index list
     public uint64_t swept_blas;     // a swept-sphere entry's BLAS
     public uint topology_count;
-    public uint geometry_flags;     // rtas GEOMETRY_* of every triangle
+    public uint geometry_flags;     // rtas GEOMETRY_* of every triangle, 0 for PRODUCER_SECTIONS
     public uint strands;            // STRANDS_*
     public uint _pad;
 }
@@ -248,6 +251,21 @@ void records(uint t: SV_GroupThreadID)
             grow_bounds(st, lo, hi);
         }
         uint64_t vertices = (uint64_t)(batch.positions + k.first_vertex);
+        // An entry of mixed sections decides class and opacity per cluster; its templates hold
+        // every pattern's opaque set, then its non-opaque set.
+        uint class_id = 0;
+        uint geometry_flags = b.geometry_flags;
+        uint topology = k.topology;
+        ProducerGpu p = s.producers[root.entry];
+        if (p.opacity == PRODUCER_SECTIONS)
+        {
+            MaterialGpu* m = s.materials + producer_material(p, k);
+            class_id = material_class(m);
+            if (class_id == CLASS_OPAQUE && (m.flags & MATERIAL_ALPHA_TESTED) == 0)
+                geometry_flags = GEOMETRY_OPAQUE;
+            else
+                topology += PATTERNS;
+        }
         uint index;
         if (k.topology == DIRECT_CLUSTER)
         {
@@ -257,7 +275,7 @@ void records(uint t: SV_GroupThreadID)
             r.tri_count = k.tri_count;
             r.vertex_count = k.vertex_count;
             r.index_format = 1;
-            r.base_geometry_and_flags = geometry_index_and_flags(0, b.geometry_flags);
+            r.base_geometry_and_flags = geometry_index_and_flags(class_id, geometry_flags);
             r.omm_index_format = 4;
             r.vertices = vertices;
             r.indices = (uint64_t)k.triangles;
@@ -269,8 +287,8 @@ void records(uint t: SV_GroupThreadID)
             InterlockedAdd(b.counts[BUILD_INSTANTIATED], 1, index);
             Instantiate r;
             r.cluster_id_offset = c;
-            r.geometry_index_offset = 0;
-            r.template_address = b.templates[k.topology];
+            r.geometry_index_offset = class_id;
+            r.template_address = b.templates[topology];
             r.vertices = vertices;
             store((uint64_t)b.instantiate_records, index, r);
             b.refs[c] = index;

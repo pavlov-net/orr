@@ -20,6 +20,7 @@ public static const uint PRODUCER_DIELECTRIC = 2;
 public static const uint PRODUCER_PRESENCE = 3;
 public static const uint PRODUCER_PARTICLE = 4;
 public static const uint PRODUCER_SMOKE = 5;
+public static const uint PRODUCER_SECTIONS = 6; // each cluster takes the class of its material
 
 // One cluster topology of an entry: triangles as u8x3 cluster-local corners.
 public struct TopologyGpu
@@ -78,7 +79,7 @@ public struct ProducerGpu
     public uint flags;           // INSTANCE_*
     public uint user_tag;
     public uint opacity;         // PRODUCER_*
-    public uint class_id;        // orr_shaders.trace CLASS_*
+    public uint class_id;        // orr_shaders.trace CLASS_*, 0 for PRODUCER_SECTIONS
     public uint origin;          // gbuffer ORIGIN_*
     public uint displacement;    // linked IDisplacement id; 0: the material's texture
     public uint tessellated;     // 1: clusters are base patches for the tessellator

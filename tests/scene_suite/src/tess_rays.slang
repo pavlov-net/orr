@@ -11,6 +11,7 @@ struct Depths
 {
     float raster;   // m; 0 where the raster shows no producer cluster
     float traced;   // m; 0 for a miss
+    uint class_id;  // of the traced hit
 }
 
 struct Root
@@ -19,6 +20,9 @@ struct Root
     ViewConstants* view;
     GBufferGpu* gbuffer;
     Depths* out;
+    uint mask;      // of the camera rays
+    uint _pad0;
+    uint64_t _pad1;
 }
 ORR_ROOT(Root);
 
@@ -53,8 +57,11 @@ void main(uint3 id: SV_DispatchThreadID)
     ray.TMax = 1e30;
     AcceptAll all;
     float3 positions[3];
-    Hit h = trace_closest(s.tlas, ray, 1, RAY_FLAG_NONE, all, positions);
+    Hit h = trace_closest(s.tlas, ray, root.mask, RAY_FLAG_NONE, all, positions);
     if (h.hit && hit_producer(s, h.instance_index, entry))
+    {
         o.traced = h.t;
+        o.class_id = h.class_id;
+    }
     root.out[id.x] = o;
 }

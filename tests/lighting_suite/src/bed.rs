@@ -211,6 +211,21 @@ pub struct ParticleLook {
     pub anisotropy: f32,
 }
 
+/// The double-sided material of a particle of `look`.
+fn particle_material(look: &ParticleLook) -> MaterialGpu {
+    let mut m = MaterialGpu::zeroed();
+    m.base_color = look.albedo;
+    m.base_weight = 1.0;
+    m.geometry_opacity = look.opacity;
+    m.emission_color = look.emission;
+    m.emission_luminance = 1.0;
+    m.flags = material_flags::DOUBLE_SIDED;
+    if look.emission.iter().any(|&e| e > 0.0) {
+        m.flags |= material_flags::EMISSIVE;
+    }
+    m
+}
+
 /// The bed's particle entry: its particles, the producer kernel that emits them each frame
 /// and the stock draw at the transparency point.
 struct Particles {
@@ -253,6 +268,9 @@ pub const EMITTER: &str = "emitter";
 pub const LEAF: &str = "leaf";
 /// [`LEAF`] cooked without opacity micromaps.
 pub const BARE_LEAF: &str = "bare leaf";
+/// [`LEAF`] as thin-walled clear glass of IOR 1.5, cut out by the same rings, in one model with
+/// a small opaque quad 2 m below it.
+pub const MASKED_PANE: &str = "masked pane";
 /// [`LEAF`] without its opacity texture, its material naming linked surface 2, whose
 /// coverage works the rings out from the uv.
 pub const RINGS_LEAF: &str = "rings leaf";
@@ -279,6 +297,9 @@ pub const LIGHT_FLOOR: &str = "light floor";
 pub const TINTED_SLAB: &str = "tinted slab";
 /// [`TINTED_SLAB`] whose `transmission_depth` a texture of 128 / 255 multiplies.
 pub const DEPTH_TEXTURED_SLAB: &str = "depth textured slab";
+/// [`TINTED_SLAB`] whose `transmission_depth` a texture multiplies by 128 / 255 where its top and
+/// bottom faces' u is below 1/2, which is local z below 0, and by 1 elsewhere.
+pub const DEPTH_SPLIT_SLAB: &str = "depth split slab";
 /// [`DEPTH_TEXTURED_SLAB`] [`SHEET_THICKNESS`] thick, with a `transmission_depth` of
 /// [`SHEET_DEPTH`].
 pub const DEPTH_TEXTURED_SHEET: &str = "depth textured sheet";
@@ -288,6 +309,10 @@ pub const SHEET_THICKNESS: f32 = 0.0625;
 pub const SHEET_DEPTH: f32 = 0.06;
 /// [`TINTED_SLAB`], double-sided.
 pub const TWO_SIDED_SLAB: &str = "two-sided slab";
+/// [`LIGHT_FLOOR`] 0.5 m below [`TINTED_SLAB`] in one model.
+pub const MIXED_SLAB: &str = "mixed slab";
+/// [`TINTED_SLAB`] with a small emitter at its middle, facing up, in one model.
+pub const LIT_SLAB: &str = "lit slab";
 pub const SLAB_THICKNESS: f32 = 0.3;
 /// [`TINTED_SLAB`] with specular roughness 0.3.
 pub const ROUGH_SLAB: &str = "rough slab";
@@ -632,21 +657,15 @@ fn square(half: f32, y: f32) -> [Vec3; 4] {
         .map(|(x, z)| Vec3::new(x * half, y, z * half))
 }
 
+/// The corners of an upright square of half side `half` around the origin, facing +z.
+fn upright_square(half: f32) -> [Vec3; 4] {
+    [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+        .map(|(x, y)| Vec3::new(x * half, y * half, 0.0))
+}
+
 /// An upright square of half side `half` around the origin, facing +z.
 fn upright(half: f32) -> MeshInput {
-    mesh(|b| {
-        b.quad(
-            0,
-            [
-                Vec3::new(-half, -half, 0.0),
-                Vec3::new(half, -half, 0.0),
-                Vec3::new(half, half, 0.0),
-                Vec3::new(-half, half, 0.0),
-            ],
-            Vec3::Z,
-            1,
-        );
-    })
+    mesh(|b| b.quad(0, upright_square(half), Vec3::Z, 1))
 }
 
 fn mesh(build: impl FnOnce(&mut MeshBuilder)) -> MeshInput {
@@ -655,18 +674,18 @@ fn mesh(build: impl FnOnce(&mut MeshBuilder)) -> MeshInput {
     b.finish()
 }
 
-/// A flat gray of 128 / 255.
-fn gray_png() -> PathBuf {
+/// A 16 x 16 grayscale PNG, `left` where u is below 1/2 and `right` elsewhere.
+fn halves_png(name: &str, left: u8, right: u8) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("orr_lighting_bed_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("gray.png");
-    let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 4, 4);
+    let path = dir.join(format!("{name}.png"));
+    let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 16, 16);
     enc.set_color(png::ColorType::Grayscale);
     enc.set_depth(png::BitDepth::Eight);
-    enc.write_header()
-        .unwrap()
-        .write_image_data(&[128; 16])
-        .unwrap();
+    let data: Vec<u8> = (0..256)
+        .map(|i| if i % 16 < 8 { left } else { right })
+        .collect();
+    enc.write_header().unwrap().write_image_data(&data).unwrap();
     path
 }
 
@@ -766,6 +785,14 @@ fn cook() -> Arc<[u8]> {
         specular_ior: 1.5,
         transmission_weight: 1.0,
         ..Material::default()
+    };
+    let masked_glass = Material {
+        alpha_mode: Material::MASK,
+        alpha_cutoff: 0.5,
+        double_sided: 1,
+        thin_walled: 1,
+        textures: leaf.textures,
+        ..glass
     };
     let skin = Material {
         base_color: [0.9, 0.6, 0.5],
@@ -868,6 +895,8 @@ fn cook() -> Arc<[u8]> {
     };
     let mut depth_textured = tinted;
     depth_textured.textures[slot::TRANSMISSION_DEPTH].texture = AssetId::from_name("gray");
+    let mut depth_split = tinted;
+    depth_split.textures[slot::TRANSMISSION_DEPTH].texture = AssetId::from_name("split");
     let depth_textured_sheet = Material {
         transmission_depth: SHEET_DEPTH,
         ..depth_textured
@@ -977,7 +1006,17 @@ fn cook() -> Arc<[u8]> {
                 AssetSpec {
                     name: "gray".into(),
                     source: Source::Texture {
-                        path: gray_png(),
+                        path: halves_png("gray", 128, 128),
+                        settings: TextureSettings {
+                            usage: Usage::Data(orr_cook::DataFormat::R8),
+                            ..TextureSettings::default()
+                        },
+                    },
+                },
+                AssetSpec {
+                    name: "split".into(),
+                    source: Source::Texture {
+                        path: halves_png("split", 128, 255),
                         settings: TextureSettings {
                             usage: Usage::Data(orr_cook::DataFormat::R8),
                             ..TextureSettings::default()
@@ -1045,6 +1084,14 @@ fn cook() -> Arc<[u8]> {
                         },
                     },
                 },
+                model(
+                    MASKED_PANE,
+                    mesh(|b| {
+                        b.quad(0, upright_square(1.0), Vec3::Z, 1);
+                        b.quad(1, square(0.3, -2.0), y, 1);
+                    }),
+                    vec![masked_glass, floor],
+                ),
                 model(RINGS_LEAF, upright(1.0), vec![linked_leaf(2)]),
                 model(VEIL, upright(1.0), vec![linked_leaf(3)]),
                 model(GLASS_SLAB, slab(), vec![glass]),
@@ -1087,6 +1134,11 @@ fn cook() -> Arc<[u8]> {
                     vec![depth_textured],
                 ),
                 model(
+                    DEPTH_SPLIT_SLAB,
+                    mesh(|b| b.cuboid(0, Vec3::new(0.8, SLAB_THICKNESS * 0.5, 0.5))),
+                    vec![depth_split],
+                ),
+                model(
                     DEPTH_TEXTURED_SHEET,
                     mesh(|b| b.cuboid(0, Vec3::new(0.8, SHEET_THICKNESS * 0.5, 0.5))),
                     vec![depth_textured_sheet],
@@ -1095,6 +1147,22 @@ fn cook() -> Arc<[u8]> {
                     TWO_SIDED_SLAB,
                     mesh(|b| b.cuboid(0, Vec3::new(0.8, SLAB_THICKNESS * 0.5, 0.5))),
                     vec![two_sided],
+                ),
+                model(
+                    MIXED_SLAB,
+                    mesh(|b| {
+                        b.quad(0, square(1.0, -0.5), y, 1);
+                        b.cuboid(1, Vec3::new(0.8, SLAB_THICKNESS * 0.5, 0.5));
+                    }),
+                    vec![light_floor, tinted],
+                ),
+                model(
+                    LIT_SLAB,
+                    mesh(|b| {
+                        b.quad(0, square(0.3, 0.0), y, 1);
+                        b.cuboid(1, Vec3::new(0.8, SLAB_THICKNESS * 0.5, 0.5));
+                    }),
+                    vec![light_floor, tinted],
                 ),
                 model(
                     ROUGH_SLAB,
@@ -1246,7 +1314,7 @@ pub struct BedFrame<'a> {
 }
 
 impl BedFrame<'_> {
-    /// The frame as the opaque dispatch reads it.
+    /// The frame as the view dispatch reads it.
     pub fn pass(&self) -> ViewPass {
         ViewPass {
             frame: self.frame,
@@ -1688,6 +1756,49 @@ impl Bed {
     /// the frame's kernel, lit by the lighting view's particle lighting of that frame, where it
     /// wrote one.
     pub fn set_particles(&mut self, particles: &[Particle], look: ParticleLook, opacity: Opacity) {
+        let mut m = particle_material(&look);
+        if matches!(opacity, Opacity::Particle | Opacity::Smoke) {
+            m.flags |= material_flags::PRESENCE;
+        }
+        self.set_quads(
+            particles,
+            m,
+            None,
+            Affine3::IDENTITY,
+            look.anisotropy,
+            opacity,
+        );
+    }
+
+    /// As [`Self::set_particles`], but opaque squares showing `front` on their front and `back`
+    /// on a back of its own, placed by `transform`.
+    pub fn set_sided_quads(
+        &mut self,
+        particles: &[Particle],
+        front: ParticleLook,
+        back: ParticleLook,
+        transform: Affine3,
+    ) {
+        let (front, back) = (particle_material(&front), particle_material(&back));
+        self.set_quads(
+            particles,
+            front,
+            Some(back),
+            transform,
+            0.0,
+            Opacity::Opaque,
+        );
+    }
+
+    fn set_quads(
+        &mut self,
+        particles: &[Particle],
+        mut m: MaterialGpu,
+        back: Option<MaterialGpu>,
+        transform: Affine3,
+        anisotropy: f32,
+        opacity: Opacity,
+    ) {
         self.frame += 1;
         let list = [self.scene];
         let f = self
@@ -1698,18 +1809,9 @@ impl Bed {
                 low_latency: None,
             })
             .unwrap();
-        let mut m = MaterialGpu::zeroed();
-        m.base_color = look.albedo;
-        m.base_weight = 1.0;
-        m.geometry_opacity = look.opacity;
-        m.emission_color = look.emission;
-        m.emission_luminance = 1.0;
-        m.flags = material_flags::DOUBLE_SIDED;
-        if matches!(opacity, Opacity::Particle | Opacity::Smoke) {
-            m.flags |= material_flags::PRESENCE;
-        }
-        if look.emission.iter().any(|&e| e > 0.0) {
-            m.flags |= material_flags::EMISSIVE;
+        if let Some(b) = back {
+            m.back = f.materials().create(&b).unwrap().0;
+            m.flags |= material_flags::HAS_BACK;
         }
         let material = f.materials().create(&m).unwrap();
         let count = particles.len() as u32;
@@ -1717,9 +1819,10 @@ impl Bed {
             vertex_count: 4,
             triangles: &PARTICLE_QUAD,
         }];
-        f.scene(self.scene)
-            .unwrap()
-            .set_producer(
+        {
+            let mut w = f.scene(self.scene).unwrap();
+            w.transforms(self.particle_group, 0, 1).unwrap()[0] = transform.into();
+            w.set_producer(
                 PARTICLES,
                 Some(&ProducerDesc {
                     max_clusters: count.max(1),
@@ -1733,6 +1836,7 @@ impl Bed {
                 }),
             )
             .unwrap();
+        }
         let point = f.end(&[]).unwrap();
         render().wait(point, Duration::from_secs(10)).unwrap();
         let mut list = device()
@@ -1746,7 +1850,7 @@ impl Bed {
             count,
             emit: pipeline(&particle_quads::MODULE, "main"),
             draw: ParticleDraw::new(device(), self.kernels).unwrap(),
-            anisotropy: look.anisotropy,
+            anisotropy,
         });
     }
 
@@ -2167,7 +2271,7 @@ pub fn assert_within_noise(
     );
 }
 
-/// orr_lighting's opaque dispatch and guide resolve recording into bed frames with
+/// orr_lighting's view dispatch and guide resolve recording into bed frames with
 /// `settings`.
 pub struct Paths {
     kernels: &'static LightingKernels,
@@ -2178,7 +2282,7 @@ pub struct Paths {
     pub frost_guide: Option<FrostGuide>,
     /// Every frame keeps the view's front layer, which [`Self::overlay_front`] reads.
     pub overlay_front: bool,
-    /// The kernels read a G-buffer without layer tiles, so the dielectric dispatch traces
+    /// The kernels read a G-buffer without layer tiles, so the layer guides trace
     /// every tile, as a full-screen dispatch does.
     pub every_tile: bool,
 }
@@ -2231,9 +2335,8 @@ impl Paths {
         }
     }
 
-    /// Starts the view's frame, then records the froxel passes, the opaque dispatch, the
-    /// dielectric dispatch, media apply, the guide resolve and, with a frost guide, the
-    /// frosted-glass term.
+    /// Starts the view's frame, then records the froxel passes, the view's paths, media apply,
+    /// the guide resolve and, with a frost guide, the frosted-glass term.
     pub fn record(&self, list: &mut CommandList<'_>, f: &mut BedFrame<'_>) {
         let pass = self.view_pass(f);
         self.record_into(list, f, &pass, None);
@@ -2282,11 +2385,9 @@ impl Paths {
             .record_media(list, lighting, target, pass, settings)
             .unwrap();
         self.kernels
-            .record_opaque(list, lighting, target, pass, settings)
+            .record_paths(list, lighting, target, pass, settings)
             .unwrap();
         let paths = Stages::COMPUTE | Stages::RAY;
-        list.barrier(paths, paths, Hazards::empty());
-        self.kernels.record_dielectric(list, target, pass, settings);
         list.barrier(paths, Stages::COMPUTE, Hazards::empty());
         self.kernels
             .record_media_apply(list, lighting, target, pass, settings);

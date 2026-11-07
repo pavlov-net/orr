@@ -6403,6 +6403,120 @@ fn skinned_vertices_match_the_cpu_skin_by_this_and_the_last_palette() {
     assert_clean();
 }
 
+/// Unmounting the pack of a skinned page's model takes the page from the scene whole: its copies,
+/// their skinned entries, and the groups of its records and its motion.
+#[test]
+fn an_unmount_takes_a_skinned_page_and_its_motion_from_the_scene() {
+    let _serial = serial();
+    let manifest = Manifest {
+        archives: vec![
+            ArchiveSpec::new(
+                Target::Memory,
+                vec![AssetSpec {
+                    name: "worm".into(),
+                    source: Source::Gltf {
+                        path: worm_glb(),
+                        settings: GltfSettings {
+                            mesh: MeshSettings {
+                                deformation_bound: 1.0,
+                                ..MeshSettings::default()
+                            },
+                            ..GltfSettings::default()
+                        },
+                    },
+                }],
+            ),
+            ArchiveSpec::new(
+                Target::Memory,
+                vec![AssetSpec {
+                    name: "paced crowd".into(),
+                    source: Source::Instances(paced_crowd()),
+                }],
+            ),
+        ],
+    };
+    let mut packs = orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory;
+    let (pages, models) = (packs.remove(1), packs.remove(0));
+    let archive = Archive::from_memory(Arc::clone(&pages)).unwrap();
+    let is_page = |e: &&Entry| e.class == orr_pack::Class::InstancePage as u16;
+    let entry = archive.entries().iter().find(is_page).expect("the page");
+
+    let mut scenes = Scenes::new(device(), &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
+    let list = [scene];
+    let desc = FrameDesc {
+        time: time(0),
+        scenes: &list,
+        low_latency: None,
+    };
+    let mounted = |scenes: &mut Scenes, pack| {
+        let m = scenes.mount(PackSource::Memory(pack));
+        while matches!(scenes.mount_state(m), LoadState::Pending) {
+            scenes.begin_frame(&desc).unwrap().end(&[]).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(scenes.mount_state(m), LoadState::Ready));
+        m
+    };
+    let models = mounted(&mut scenes, models);
+    let pack = mounted(&mut scenes, pages);
+    let page = scenes.instance_page(pack, entry.id).unwrap();
+    let joints = worm_rig().0.joint_count() as u32;
+
+    let frame = |scenes: &mut Scenes, write: &mut dyn FnMut(&mut SceneWriter<'_>)| {
+        let mut f = scenes.begin_frame(&desc).unwrap();
+        write(&mut f.scene(scene).unwrap());
+        let mut root = GpuPtr::NULL;
+        f.update_scenes(&mut |c| root = c.root).unwrap();
+        wait(f.end(&[]).unwrap());
+        root
+    };
+    let root: SceneRoot = read_buffer(
+        frame(&mut scenes, &mut |s| {
+            let palette = s
+                .create_transform_group(&TransformGroupDesc {
+                    count: CROWD.len() as u32 * joints,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::ZERO,
+                })
+                .unwrap();
+            s.add_skinned_page(&SkinnedPageRef {
+                frame: None,
+                page,
+                palette,
+                palette_first: 0,
+                material_set: None,
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 100.0,
+                user_tag: 0,
+            })
+            .unwrap();
+        }),
+        1,
+    )[0];
+    // Live copies, skinned entries and groups.
+    let state = || {
+        let copies = read_buffer(root.instances, u64::from(root.instance_capacity));
+        let skins = read_buffer(root.skinned, u64::from(root.skinned_capacity));
+        let groups = read_buffer(root.groups, u64::from(root.group_capacity));
+        [
+            copies.iter().filter(|c| c.flags != 0).count(),
+            skins.iter().filter(|k| k.positions != GpuPtr::NULL).count(),
+            groups.iter().filter(|g| g.count != 0).count(),
+        ]
+    };
+    assert_eq!(state(), [CROWD.len(), CROWD.len(), 3]);
+    scenes.unmount(models);
+    for _ in 0..3 {
+        frame(&mut scenes, &mut |_| {});
+    }
+    assert_eq!(state(), [0, 0, 1], "only the palette stays");
+    assert_clean();
+}
+
 /// A skinned copy of an animated page stands where its rows say, like one placed there by hand:
 /// the rows give the transform and the palette the pose.
 #[test]
@@ -9182,8 +9296,7 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
     front.flags |= orr_scene::material_flags::HAS_BACK;
     front.back = 1;
     let mut back = front;
-    back.flags ^= orr_scene::material_flags::HAS_BACK | orr_scene::material_flags::BACK_SIDE;
-    back.back = 0;
+    back.flags ^= orr_scene::material_flags::HAS_BACK;
     let glass = |mut m: MaterialGpu, first: u32| {
         m.flags |= orr_scene::material_flags::DIELECTRIC;
         m.back += first;
@@ -9193,8 +9306,8 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         m.flags |= orr_scene::material_flags::THIN_WALLED;
         m
     };
-    // The front's walls decide the interior: a thin back on a solid front leaves it, and a solid
-    // back on a thin front has none.
+    // The section material's walls decide the interior: a thin back on a solid front leaves it,
+    // and a solid back on a thin front has none.
     let records = [
         front,
         back,

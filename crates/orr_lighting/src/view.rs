@@ -1,5 +1,5 @@
 //! Per-view lighting: the settings of one `render_view` call, the view's lighting targets and
-//! history, the world cache's update paths, the opaque path dispatch, the dielectric dispatch
+//! history, the layer guides, the world cache's update paths, the view dispatch
 //! and the guide resolve.
 
 use std::sync::Arc;
@@ -17,10 +17,10 @@ use orr_scene::{
 
 use crate::media::{MediaKernels, MediaSettings, MediaStats, MediaView};
 use crate::scene::{FRAME_SLOTS, Ring, device_local};
-use crate::shaders::dielectric::{dispatch, tiles};
+use crate::shaders::dielectric::{layer_guides, tiles};
 use crate::shaders::guides::{frost, overlay_front, resolve};
 use crate::shaders::light_sampling::local;
-use crate::shaders::path::{background, opaque};
+use crate::shaders::path::{background, layers as layer_paths, view as view_paths};
 use crate::shaders::types::{
     FrostRoot, GuideRoot, LayerGuide, LayerTilesRoot, LocalLights, OverlayFrontRoot,
     ParticleLighting, PathRoot,
@@ -45,7 +45,9 @@ pub struct ViewLighting {
     /// sky its ray reaches. Dielectric vertices do not count: a path through dielectrics has
     /// this many bounces after its first opaque vertex or interior scatter.
     pub max_bounces: u32,
-    /// Dielectric and presence vertices a path may have, its first included.
+    /// Dielectric and presence vertices a path may have, its first included, at least 64 under
+    /// the reference. Past them it ends in the world cache's light at that point, where a cell
+    /// covers it.
     pub dielectric_depth: u32,
     /// Whether dielectrics with a dispersion (an Abbe number and a dispersion scale above 0)
     /// split light by wavelength. Off, they refract at their IOR at 587.6 nm.
@@ -60,11 +62,11 @@ pub struct ViewLighting {
     /// walk has ended leave the hardware threads of those still walking. It changes no result,
     /// and does nothing without reordering hardware or while no material walks.
     pub walk_compaction: bool,
-    /// Share of surface pixels whose opaque path runs, clamped to
+    /// Share of surface pixels with no layer in front whose path runs, clamped to
     /// [[`MIN_PIXEL_FRACTION`], 1]. Each frame every surface pixel runs its path with this
     /// probability, chosen independently per pixel, and divides the path's estimate by it;
-    /// the others keep their emission and add no path. Sky pixels and the dielectric, media
-    /// and guide passes run on every pixel.
+    /// the others keep their emission and add no path. Sky pixels, pixels behind a layer or
+    /// in an interior, and the media and guide passes run on every pixel.
     pub pixel_fraction: f32,
     /// The dielectric whose interior holds the eye; each pixel flips it at every dielectric
     /// surface between the eye and its near-plane point, so a near plane straddling the
@@ -85,7 +87,7 @@ impl Default for ViewLighting {
             bounce_di_candidates: 4,
             local_light_share: 0.5,
             max_bounces: 3,
-            dielectric_depth: 4,
+            dielectric_depth: 16,
             dispersion: true,
             sss_max_steps: 16,
             sss_depth: SubsurfaceDepth::FirstEvent,
@@ -238,8 +240,11 @@ const REFERENCE_ROULETTE_DEPTH: u32 = 64;
 /// `path`'s `CACHE_TERMINATE`.
 const CACHE_TERMINATE: u32 = 1;
 
-/// `dielectric`'s `DIELECTRIC_REFERENCE`, `DIELECTRIC_DEBUG_LAYER`, `DIELECTRIC_DISPERSION`
-/// and `DIELECTRIC_FROST`.
+/// The layer vertices a reference path takes at least: a ray through a solid can take many.
+const REFERENCE_DIELECTRIC_DEPTH: u32 = 64;
+
+/// `path`'s `DIELECTRIC_REFERENCE`, `DIELECTRIC_DEBUG_LAYER`, `DIELECTRIC_DISPERSION` and
+/// `DIELECTRIC_FROST`.
 const DIELECTRIC_REFERENCE: u32 = 1;
 const DIELECTRIC_DEBUG_LAYER: u32 = 2;
 const DIELECTRIC_DISPERSION: u32 = 4;
@@ -259,7 +264,7 @@ struct Target {
     store: StorageImageIndex,
 }
 
-/// A frame's light feedback: written by its opaque dispatch, read by the next frame's local
+/// A frame's light feedback: written by its view dispatch, read by the next frame's local
 /// samplers.
 struct Feedback {
     target: Target,
@@ -424,19 +429,17 @@ pub struct LightingView {
     extent: [u32; 2],
     targets: Targets,
     feedback: [Feedback; 2],
-    /// The feedback the next opaque dispatch writes; the other holds the last frame's.
+    /// The feedback the next view dispatch writes; the other holds the last frame's.
     feedback_index: usize,
     local: Allocation<LocalLights>,
     local_tiles: [u32; 2],
     slots: Vec<u32>,
-    /// The dielectric dispatch's layer memory: each pixel's first layer for the guide
-    /// resolve, the tiles it traced and its arguments (`traced_tiles` in `path.slang`); the
-    /// frame the dispatch last wrote it, and whether it kept the frosted-glass term's inputs.
+    /// The layer memory: each pixel's first layer for the guide
+    /// resolve, the traced tiles and their arguments (`traced_tiles` in `path.slang`); the
+    /// frame that last wrote it, and whether it kept the frosted-glass term's inputs.
     layers: Allocation<LayerGuide>,
     layers_frame: Option<u64>,
     layers_frost: bool,
-    /// The frame and path settings of the last opaque dispatch.
-    path: Option<(u64, PathRoot)>,
     layer_tile_roots: Ring<LayerTilesRoot>,
     local_roots: Ring<local::Root>,
     guide_roots: Ring<GuideRoot>,
@@ -532,7 +535,6 @@ impl LightingView {
             layers,
             layers_frame: None,
             layers_frost: false,
-            path: None,
             layer_tile_roots: Ring::new(device, "layer tile roots")?,
             local_roots: Ring::new(device, "local light sampler roots")?,
             guide_roots: Ring::new(device, "guide roots")?,
@@ -646,7 +648,7 @@ impl LightingView {
     }
 
     /// The sampled view of the RGBA16F background layer behind out-of-focus foreground, as the
-    /// last [`LightingKernels::record_opaque`] given a [`DofBackgroundPass`] wrote it: on each
+    /// last [`LightingKernels::record_paths`] given a [`DofBackgroundPass`] wrote it: on each
     /// marked pixel, the pre-exposed radiance its lens ray reaches past the mask's depth in RGB
     /// (with the camera segment's media where media apply ran) and that hit's reverse-Z device
     /// depth in A, 0 for sky; (0, 0, 0, -1) on unmarked pixels. `None` once a call runs without
@@ -687,7 +689,7 @@ impl LightingView {
 }
 
 impl LightingView {
-    /// The layer guides the dielectric dispatch of `frame` wrote; null when it did not run.
+    /// The layer guides of `frame`; null when its paths did not run.
     pub(crate) fn layer_guides(&self, frame: u64) -> GpuPtr<LayerGuide> {
         if self.layers_frame == Some(frame) {
             self.layers.gpu()
@@ -704,7 +706,7 @@ impl LightingView {
             .map_or(StorageImageIndex::NONE, |l| l.target.store)
     }
 
-    /// The overlay front words when the opaque dispatch of `frame` cleared them.
+    /// The overlay front words when the paths of `frame` cleared them.
     pub(crate) fn overlay_front_words(&self, frame: u64) -> GpuPtr<u64> {
         self.overlay_front
             .as_ref()
@@ -738,8 +740,8 @@ impl Drop for LightingView {
 struct LayerMemory {
     /// Guides of room the memory takes.
     guides: u64,
-    /// Bytes from its start to the dispatch's tile count, then its compute workgroups and
-    /// its ray extent.
+    /// Bytes from its start to the tile count, then the workgroups and ray extent of the
+    /// dispatches over the listed tiles.
     args: u64,
 }
 
@@ -755,14 +757,13 @@ impl LayerMemory {
     }
 }
 
-/// Pixels per side of a tile of the dielectric dispatch (`LAYER_TILE`).
+/// Pixels per side of a tile of the layer guides (`LAYER_TILE`).
 const LAYER_TILE: u32 = 8;
 
 /// `LayerTilesRoot.flags` (`dielectric.slang`).
 const LAYER_TILES_EVERYWHERE: u32 = 1 << 0;
-const LAYER_TILES_FROST: u32 = 1 << 1;
 
-/// What the opaque dispatch and the guide resolve read for one view and frame.
+/// What the view's paths and the guide resolve read for one view and frame.
 #[derive(Clone, Copy, Debug)]
 pub struct ViewPass {
     pub frame: u64,
@@ -780,11 +781,11 @@ pub struct ViewPass {
     pub sample_index: u32,
     /// Separates sample sets of the same pixels and sample index.
     pub seed: u32,
-    /// A dispatch beside the opaque one traces the view's background layer
+    /// A dispatch beside the view's traces its background layer
     /// ([`LightingView::dof_background_index`]); `None` frees it.
     pub dof_background: Option<DofBackgroundPass>,
-    /// The dielectric dispatch keeps what [`LightingKernels::record_frosted_glass`] reads:
-    /// set while output's depth-of-field guide is on.
+    /// The view dispatch keeps what [`LightingKernels::record_frosted_glass`] reads: set while
+    /// output's depth-of-field guide is on.
     pub frosted_glass: bool,
     /// The view keeps a front layer for each pixel ([`LightingView::overlay_depth`]), which
     /// [`LightingKernels::record_overlay_front`] resolves: set while output's
@@ -797,7 +798,7 @@ pub struct ViewPass {
 /// What the background layer behind out-of-focus foreground reads in one frame. Each marked
 /// pixel traces a second camera ray from a point of the lens's aperture disc through a
 /// jittered point of the pixel on the focal plane, starting past the mask's depth, and the
-/// path from its hit at the opaque path's settings. The ray sees opaque geometry only:
+/// path from its hit at the view path's settings. The ray sees opaque geometry only:
 /// dielectric and presence layers past the mask are not traced.
 #[derive(Clone, Copy, Debug)]
 pub struct DofBackgroundPass {
@@ -865,6 +866,7 @@ impl PathPipeline {
 struct SupportKernels {
     layer_tiles: ComputePipeline,
     layer_args: ComputePipeline,
+    layer_guides: ComputePipeline,
     /// A zero word that starts each frame's tile count.
     zero: Allocation<u32>,
     guides: ComputePipeline,
@@ -885,11 +887,19 @@ impl SupportKernels {
         };
         let stage = ShaderStage::new(module(kernels, &resolve::MODULE)?, "main", spec)?;
         let guides = device.create_compute_pipeline(&stage, "guide resolve")?;
+        let bytes = layer_guides::Spec::default().bytes();
+        let spec = SpecData {
+            entries: layer_guides::Spec::ENTRIES,
+            bytes: &bytes,
+        };
+        let stage = ShaderStage::new(module(kernels, &layer_guides::MODULE)?, "main", spec)?;
+        let first_layers = device.create_compute_pipeline(&stage, "layer guides")?;
         let mut zero = device.gpu_malloc::<u32>(MemoryKind::Upload, 1, "zero")?;
         zero.as_mut_slice().expect("mapped")[0] = 0;
         Ok(Self {
             layer_tiles: pipeline(device, kernels, &tiles::MODULE, "tiles")?,
             layer_args: pipeline(device, kernels, &tiles::MODULE, "args")?,
+            layer_guides: first_layers,
             zero,
             guides,
             frost: pipeline(device, kernels, &frost::MODULE, "main")?,
@@ -935,9 +945,9 @@ macro_rules! path_kernel {
     };
 }
 
-const OPAQUE: PathKernel = path_kernel!(opaque, "opaque paths");
+const VIEW: PathKernel = path_kernel!(view_paths, "view paths");
+const LAYERS: PathKernel = path_kernel!(layer_paths, "layer paths");
 const BACKGROUND: PathKernel = path_kernel!(background, "background paths");
-const DIELECTRIC: PathKernel = path_kernel!(dispatch, "dielectric paths");
 const UPDATE: PathKernel = path_kernel!(update, "world cache update paths");
 const SUPPORT: &str = "lighting compute kernels";
 
@@ -973,9 +983,9 @@ fn compiled<T>(job: &JobResult<Result<T, Error>>, kernel: &'static str) -> Resul
 /// [`LightingKernels::spawn`]. Dropping it cancels the jobs no thread has started; one
 /// already compiling finishes on its thread, since the driver cannot be interrupted.
 pub struct CompilingKernels {
-    opaque: JobResult<Result<PathPipeline, Error>>,
+    paths: JobResult<Result<PathPipeline, Error>>,
+    layers: JobResult<Result<PathPipeline, Error>>,
     background: JobResult<Result<PathPipeline, Error>>,
-    dielectric: JobResult<Result<PathPipeline, Error>>,
     update: JobResult<Result<PathPipeline, Error>>,
     support: JobResult<Result<SupportKernels, Error>>,
     tables: BsdfTables,
@@ -989,21 +999,16 @@ impl CompilingKernels {
 
     /// How many jobs have not finished.
     pub fn outstanding(&self) -> u32 {
-        let paths = [
-            &self.opaque,
-            &self.background,
-            &self.dielectric,
-            &self.update,
-        ];
+        let paths = [&self.paths, &self.layers, &self.background, &self.update];
         paths.iter().filter(|job| !job.finished()).count() as u32
             + u32::from(!self.support.finished())
     }
 
     /// Whether a thread has started any job.
     pub fn started(&self) -> bool {
-        self.opaque.started()
+        self.paths.started()
+            || self.layers.started()
             || self.background.started()
-            || self.dielectric.started()
             || self.update.started()
             || self.support.started()
     }
@@ -1011,9 +1016,9 @@ impl CompilingKernels {
     /// Blocks until every job has finished, running queued jobs on the calling thread meanwhile,
     /// so it finishes with no workers. `loading` is the side the jobs were queued on.
     pub fn wait(&self, loading: &Loading) {
-        self.opaque.wait(loading);
+        self.paths.wait(loading);
+        self.layers.wait(loading);
         self.background.wait(loading);
-        self.dielectric.wait(loading);
         self.update.wait(loading);
         self.support.wait(loading);
     }
@@ -1022,9 +1027,9 @@ impl CompilingKernels {
     pub fn finish(&self) -> Result<LightingKernels, Error> {
         assert_eq!(self.outstanding(), 0, "kernels are still compiling");
         Ok(LightingKernels {
-            opaque: compiled(&self.opaque, OPAQUE.name)?,
+            paths: compiled(&self.paths, VIEW.name)?,
+            layers: compiled(&self.layers, LAYERS.name)?,
             background: compiled(&self.background, BACKGROUND.name)?,
-            dielectric: compiled(&self.dielectric, DIELECTRIC.name)?,
             update: compiled(&self.update, UPDATE.name)?,
             support: compiled(&self.support, SUPPORT)?,
             _tables: self.tables.clone(),
@@ -1034,9 +1039,9 @@ impl CompilingKernels {
 
 /// The per-view lighting kernels of one device.
 pub struct LightingKernels {
-    opaque: PathPipeline,
+    paths: PathPipeline,
+    layers: PathPipeline,
     background: PathPipeline,
-    dielectric: PathPipeline,
     update: PathPipeline,
     support: SupportKernels,
     _tables: BsdfTables,
@@ -1053,9 +1058,9 @@ impl LightingKernels {
     ) -> Result<Self, Error> {
         let rays = runs_rays(device, entry);
         Ok(Self {
-            opaque: (OPAQUE.compile)(device, kernels, rays)?,
+            paths: (VIEW.compile)(device, kernels, rays)?,
+            layers: (LAYERS.compile)(device, kernels, rays)?,
             background: (BACKGROUND.compile)(device, kernels, rays)?,
-            dielectric: (DIELECTRIC.compile)(device, kernels, rays)?,
             update: (UPDATE.compile)(device, kernels, rays)?,
             support: SupportKernels::new(device, kernels)?,
             _tables: tables.clone(),
@@ -1078,9 +1083,9 @@ impl LightingKernels {
             compile_job(device, loading, move |d| (kernel.compile)(d, kernels, rays))
         };
         CompilingKernels {
-            opaque: path(OPAQUE),
+            paths: path(VIEW),
+            layers: path(LAYERS),
             background: path(BACKGROUND),
-            dielectric: path(DIELECTRIC),
             update: path(UPDATE),
             support: compile_job(device, loading, move |d| SupportKernels::new(d, kernels)),
             tables: tables.clone(),
@@ -1132,16 +1137,30 @@ impl LightingKernels {
             .record_apply(list, scene, view, pass, lighting);
     }
 
-    /// Records the world cache's update paths, the view's local light samplers and the
-    /// opaque dispatch of `pass` into `view`'s radiance and light feedback after the scene's
-    /// [`SceneLighting::record`] and the view's raster half in the same or an earlier list;
-    /// orders nothing after it. The scene's first view in a frame traces one update path per
-    /// `update_block`^2 pixels, its later views one per four times as many. The reference
+    /// Records the view's paths of `pass` into `view`'s radiance and light feedback after the
+    /// scene's [`SceneLighting::record`], the view's raster half in the same or an earlier list
+    /// and [`Self::record_media`] where that runs in the frame: its local light samplers, its
+    /// layer guides, the world cache's update paths and the view dispatch; orders nothing after
+    /// it. The layer guides cover the 8 x 8 tiles the G-buffer's layer tiles mark and the tiles
+    /// beside them, where a camera ray up to the opaque depth finds each pixel's first dielectric
+    /// or presence layer and leaves its guide for [`Self::record_guides`]. Every tile counts while
+    /// a layer may lie before the near plane, while [`ViewLighting::camera_medium`] is set and when
+    /// the G-buffer has no layer tiles. One path per pixel follows, from the first layer on those
+    /// tiles and elsewhere from the G-buffer's surface: one dispatch of the path loop over those
+    /// tiles and one of its build without the camera ray and layer vertices over the others.
+    /// Outside the reference, segments between layers read the froxels of [`Self::record_media`]
+    /// of the same frame where it ran, and those froxels hold the camera segment through an
+    /// interior, which media apply adds; without them the path samples it. The scene's first view in a frame traces one update path
+    /// per `update_block`^2 pixels, its later views one per four times as many. The reference
     /// traces none, never reads the cache, builds no local samplers and adds nothing to the
-    /// scene's light feedback. With [`ViewPass::dof_background`] a dispatch of its own writes the
-    /// view's background layer, made at the first such call; without it the layer is freed.
-    /// [`ViewPass::overlay_front`] clears the view's front layer the same way.
-    pub fn record_opaque(
+    /// scene's light feedback; its thin lens rays go through the same paths. With
+    /// [`ViewPass::dof_background`] a dispatch of its own writes the view's background layer, made
+    /// at the first such call; without it the layer is freed. [`ViewPass::overlay_front`] clears
+    /// the view's front layer the same way, and pixels whose dominant layer lies behind their
+    /// first layer take that first layer as their front layer. With [`ViewPass::frosted_glass`]
+    /// the view keeps each pixel's background and rough-transmission blur for
+    /// [`Self::record_frosted_glass`].
+    pub fn record_paths(
         &self,
         list: &mut CommandList<'_>,
         scene: &SceneLighting,
@@ -1253,8 +1272,23 @@ impl LightingKernels {
             };
         let walk_points = lighting.walk_compaction
             && pass.walking_materials
-            && matches!(self.opaque, PathPipeline::Rays(_))
+            && matches!(self.paths, PathPipeline::Rays(_))
             && view.device.caps().reorder;
+        let mut flags = 0;
+        let mut froxels = view.media.volume(pass.frame);
+        if reference {
+            flags |= DIELECTRIC_REFERENCE;
+            froxels = GpuPtr::NULL;
+        }
+        if lighting.debug_view == LightingDebugView::DielectricLayer {
+            flags |= DIELECTRIC_DEBUG_LAYER;
+        }
+        if lighting.dispersion {
+            flags |= DIELECTRIC_DISPERSION;
+        }
+        if pass.frosted_glass {
+            flags |= DIELECTRIC_FROST;
+        }
         let path_root = PathRoot {
             scene: pass.scene,
             view: pass.view,
@@ -1282,11 +1316,15 @@ impl LightingKernels {
             feedback: view.feedback[written].target.store,
             local_columns: view.local_tiles[0],
             light_flags: if reference { 0 } else { LIGHT_FEEDBACK_COUNT },
-            layers: GpuPtr::NULL,
-            froxels: GpuPtr::NULL,
-            dielectric_depth: 0,
-            camera_medium: NO_MATERIAL,
-            dielectric_flags: 0,
+            layers: view.layers.gpu(),
+            froxels,
+            dielectric_depth: if reference {
+                lighting.dielectric_depth.max(REFERENCE_DIELECTRIC_DEPTH)
+            } else {
+                lighting.dielectric_depth
+            },
+            camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
+            dielectric_flags: flags,
             sss_max_steps: lighting
                 .sss_max_steps
                 .clamp(*SSS_STEPS.start(), *SSS_STEPS.end()),
@@ -1301,9 +1339,9 @@ impl LightingKernels {
             dof_focus,
             dof_aperture,
             _pad0: 0,
-            overlay_front: GpuPtr::NULL,
+            overlay_front: view.overlay_front_words(pass.frame),
         };
-        view.path = Some((pass.frame, path_root));
+        self.record_layers(list, view, pass, lighting, lens.is_some(), &path_root);
         if !reference {
             let update_root = PathRoot {
                 mode: 0,
@@ -1312,6 +1350,8 @@ impl LightingKernels {
                 dof_background: StorageImageIndex::NONE,
                 // Update paths do not walk.
                 sss_flags: path_root.sss_flags & !SSS_POINTS,
+                dielectric_flags: path_root.dielectric_flags & DIELECTRIC_DISPERSION,
+                pixel_fraction: 1.0,
                 ..path_root
             };
             list.begin_pass("world cache update paths", false);
@@ -1319,8 +1359,23 @@ impl LightingKernels {
                 .record(list, &update_root, view.extent.map(|e| e.div_ceil(block)));
             list.end_pass();
         }
-        list.begin_pass("opaque paths", false);
-        self.opaque.record(list, &path_root, view.extent);
+        if lens.is_none() {
+            list.begin_pass("view paths", false);
+            self.paths.record(list, &path_root, view.extent);
+            list.end_pass();
+        }
+        let args = view
+            .layers
+            .gpu()
+            .cast::<u8>()
+            .offset(LayerMemory::new(view.extent).args);
+        list.begin_pass("layer paths", false);
+        self.layers.record_indirect(
+            list,
+            &path_root,
+            args.offset(4).cast(),
+            args.offset(16).cast(),
+        );
         list.end_pass();
         if pass.dof_background.is_some() {
             list.begin_pass("background paths", false);
@@ -1330,76 +1385,31 @@ impl LightingKernels {
         Ok(())
     }
 
-    /// Records the dielectric dispatch of `pass` after [`Self::record_opaque`] of the same
-    /// view and frame, ordered after it, with its path settings: per pixel of the 8 x 8 tiles
-    /// the G-buffer's layer tiles mark and of the tiles beside them, a camera ray against the
-    /// dielectric mask up to the opaque depth finds the first dielectric or presence layer,
-    /// whose path replaces the pixel's radiance, and leaves the layer's guide for
-    /// [`Self::record_guides`]. Every tile is traced while a layer may lie before the near
-    /// plane, while [`ViewLighting::camera_medium`] is set and when the G-buffer has no layer
-    /// tiles. Pixels whose eye lies inside
-    /// [`ViewLighting::camera_medium`] trace their path through it from the G-buffer's surface
-    /// too. Outside the reference, segments between layers read the froxels of
-    /// [`Self::record_media`] of the same frame where it ran, and those froxels hold the camera
-    /// segment through an interior, which media apply adds; without them the path samples it.
-    /// Camera rays are pinhole rays whatever the reference's lens. With [`ViewPass::frosted_glass`] it also keeps each
-    /// pixel's background and rough-transmission blur for [`Self::record_frosted_glass`]. With
-    /// [`ViewPass::overlay_front`], pixels whose dominant layer lies behind their first layer
-    /// take that first layer as their front layer.
-    /// Records nothing without the opaque dispatch of `pass.frame`. Orders nothing after it.
-    pub fn record_dielectric(
+    /// Records the tiles of `pass` that hold layers and the layer guides over them, before any
+    /// path of the frame reads them.
+    fn record_layers(
         &self,
         list: &mut CommandList<'_>,
         view: &mut LightingView,
         pass: &ViewPass,
         lighting: &ViewLighting,
+        lens: bool,
+        path: &PathRoot,
     ) {
-        let Some((_, path)) = view.path.filter(|(frame, _)| *frame == pass.frame) else {
-            return;
-        };
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
-        let mut flags = 0;
-        let mut froxels = view.media.volume(pass.frame);
-        if lighting.reference.is_some() {
-            flags |= DIELECTRIC_REFERENCE;
-            froxels = GpuPtr::NULL;
-        }
-        if lighting.debug_view == LightingDebugView::DielectricLayer {
-            flags |= DIELECTRIC_DEBUG_LAYER;
-        }
-        if lighting.dispersion {
-            flags |= DIELECTRIC_DISPERSION;
-        }
-        if pass.frosted_glass {
-            flags |= DIELECTRIC_FROST;
-        }
-        let root = PathRoot {
-            light_flags: 0,
-            dof_background: StorageImageIndex::NONE,
-            layers: view.layers.gpu(),
-            froxels,
-            dielectric_depth: lighting.dielectric_depth,
-            camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
-            dielectric_flags: flags,
-            overlay_front: view.overlay_front_words(pass.frame),
-            ..path
-        };
         let mut tile_flags = 0;
-        if lighting.camera_medium.is_some() {
+        if lighting.camera_medium.is_some() || lens {
             tile_flags |= LAYER_TILES_EVERYWHERE;
-        }
-        if pass.frosted_glass {
-            tile_flags |= LAYER_TILES_FROST;
         }
         let tiles_root = view.layer_tile_roots.write(
             slot,
             LayerTilesRoot {
                 gbuffer: pass.gbuffer,
                 layers: view.layers.gpu(),
-                radiance: view.targets.radiance.storage(0),
                 flags: tile_flags,
                 _pad0: 0,
                 _pad1: 0,
+                _pad2: 0,
             },
         );
         view.layers_frame = Some(pass.frame);
@@ -1409,7 +1419,7 @@ impl LightingKernels {
             .gpu()
             .cast::<u8>()
             .offset(LayerMemory::new(view.extent).args);
-        list.begin_pass("dielectric paths", false);
+        list.begin_pass("layer guides", false);
         list.barrier(
             Stages::COMPUTE | Stages::RAY,
             Stages::TRANSFER,
@@ -1418,7 +1428,12 @@ impl LightingKernels {
         list.copy(args, self.support.zero.gpu().cast(), 4);
         list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
         let [tx, ty] = view.extent.map(|e| e.div_ceil(LAYER_TILE));
-        list.dispatch(&self.support.layer_tiles, tiles_root, [tx, ty, 1]);
+        let [gx, gy, _] = self.support.layer_tiles.workgroup();
+        list.dispatch(
+            &self.support.layer_tiles,
+            tiles_root,
+            [tx.div_ceil(gx), ty.div_ceil(gy), 1],
+        );
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         list.dispatch(&self.support.layer_args, tiles_root, [1, 1, 1]);
         list.barrier(
@@ -1426,15 +1441,19 @@ impl LightingKernels {
             Stages::COMPUTE | Stages::RAY,
             Hazards::DRAW_ARGUMENTS,
         );
-        self.dielectric
-            .record_indirect(list, &root, args.offset(4).cast(), args.offset(16).cast());
+        list.dispatch_indirect_inline(&self.support.layer_guides, path, args.offset(4).cast());
+        list.barrier(
+            Stages::COMPUTE,
+            Stages::COMPUTE | Stages::RAY,
+            Hazards::empty(),
+        );
         list.end_pass();
     }
 
     /// Records the guide resolve of `pass` into `view`'s guide targets after the view's
-    /// raster half, and after [`Self::record_dielectric`] where that runs in the frame, whose
+    /// raster half, and after [`Self::record_paths`] where that runs in the frame, whose
     /// layer guides it blends in. Under a [`LightingDebugView::Guide`] view it also overwrites the
-    /// radiance, so it must then be ordered after [`Self::record_opaque`]. Orders nothing
+    /// radiance, so it must then be ordered after [`Self::record_paths`]. Orders nothing
     /// after it.
     pub fn record_guides(
         &self,
@@ -1487,7 +1506,7 @@ impl LightingKernels {
     /// Resolves `view`'s front layer into [`LightingView::overlay_depth`],
     /// [`LightingView::overlay_motion`] and [`LightingView::overlay_weight`]. `overlay` is the
     /// frame's premultiplied overlay, where it drew one. The caller orders it after the frame's
-    /// dielectric dispatch and transparency hook, whose fragments enter the layer through
+    /// view dispatch and transparency hook, whose fragments enter the layer through
     /// `particle_front`, while the overlay still holds its contents. Records nothing without
     /// [`ViewPass::overlay_front`]. Orders nothing after it.
     pub fn record_overlay_front(
@@ -1510,10 +1529,11 @@ impl LightingKernels {
 
     /// Adds the frosted-glass term into `guide`, ray reconstruction's depth-of-field guide
     /// (R16F at the view's extent, `luminance(after - before)`), after output wrote it and
-    /// after [`Self::record_dielectric`] of `pass` with [`ViewPass::frosted_glass`]. A pixel
+    /// after [`Self::record_paths`] of `pass` with [`ViewPass::frosted_glass`]. A pixel
     /// whose dominant layer is rough transmission adds its transmission's luminance times
     /// the change that blurring the background over its rough interfaces' disc makes. The
-    /// background is the opaque radiance at the same pixels, unbent by refraction. Other
+    /// background is the radiance of the paths from the G-buffer's surfaces at those pixels,
+    /// unbent by refraction, and each other pixel's own radiance. Other
     /// pixels keep what output wrote. Records nothing without such a dispatch in
     /// `pass.frame`. Orders nothing after it.
     pub fn record_frosted_glass(

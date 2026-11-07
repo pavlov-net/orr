@@ -1,7 +1,7 @@
 //! The subsurface walk against openpbr_ref's CPU walk: in analytic slabs through
 //! `walk_probe.slang` (the walk alone, its subsurface table and its numerics), and through the
-//! opaque path on the bed's slabs and spheres (entry, exit and geometry), and the dielectric
-//! dispatch on spheres with dense scattering interiors.
+//! path loop on the bed's slabs and spheres (entry, exit and geometry), and on dielectric
+//! spheres with dense scattering interiors.
 
 use lighting_suite::bed::{
     Accumulated, Bed, DenseInterior, EXTENT, FURNACE_RADIANCE, Item, JADE, JADE_SPHERE, MILK,

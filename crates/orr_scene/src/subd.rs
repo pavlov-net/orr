@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use orr_pack::subd::{CagePoint, Face, Page, PatchParam, SubdHeader, SubdInfo};
 
 use crate::material::MaterialId;
-use crate::producer::{Opacity, OriginPolicy};
+use crate::producer::OriginPolicy;
 use crate::scene::{InstanceFlags, ModelId, TransformGroupId};
 use crate::shaders::types::{
     SubdCageGpu, SubdPartGpu, SubdPatchGpu, SubdTriangleGpu, SubdVertexGpu,
@@ -97,9 +97,6 @@ pub(crate) struct ModelCage {
     pub(crate) shape: CageShape,
     /// One per cage section.
     pub(crate) materials: Vec<MaterialId>,
-    /// From the cage sections' materials; `None` where they mix dielectric or presence
-    /// materials with others.
-    pub(crate) opacity: Option<Opacity>,
 }
 
 /// What a copy's tessellated entry is built with.
@@ -529,17 +526,6 @@ fn close(c: [u32; 4], section: u16) -> [u32; 4] {
     [c[0], c[1], c[2], c[3] | u32::from(section) << 8]
 }
 
-/// The opacity copies of a cage take from its sections' material flags.
-pub(crate) fn opacity(flags: &[u32]) -> Option<Opacity> {
-    use crate::material::material_flags as f;
-    match crate::material::candidate_class(flags.iter().copied())? {
-        1 => Some(Opacity::Dielectric),
-        2 => Some(Opacity::Presence),
-        _ if flags.iter().any(|&x| x & f::ALPHA_TESTED != 0) => Some(Opacity::AlphaTested),
-        _ => Some(Opacity::Opaque),
-    }
-}
-
 /// Checks a copy against its model's cage.
 pub(crate) fn check(desc: &SubdDesc<'_>, cage: Option<&ModelCage>, joints: u32) -> Result<()> {
     let cage = cage.ok_or(Error::NoCage(desc.model))?;
@@ -554,8 +540,5 @@ pub(crate) fn check(desc: &SubdDesc<'_>, cage: Option<&ModelCage>, joints: u32) 
         "{:?} has no skinned cage and skeleton to pose",
         desc.model
     );
-    if cage.opacity.is_none() {
-        return Err(Error::MixedClasses(desc.model));
-    }
     Ok(())
 }

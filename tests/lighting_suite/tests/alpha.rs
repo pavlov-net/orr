@@ -3,8 +3,8 @@
 //! real ray-query candidate loop; and the shadow a micromap casts in the path kernel.
 
 use lighting_suite::bed::{
-    Accumulated, BARE_LEAF, Bed, Item, LEAF, Paths, RINGS_LEAF, SUN, Spec, VEIL,
-    assert_within_noise, quad_scene,
+    Accumulated, BARE_LEAF, Bed, Item, LEAF, MASKED_PANE, Paths, RINGS_LEAF, SUN, Spec, VEIL,
+    assert_within_noise, fresnel, quad_scene,
 };
 use lighting_suite::shaders::alpha_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, require, upload};
@@ -50,6 +50,8 @@ struct Rays {
     stopped: Vec<u32>,
     /// Alpha test calls under 4-state and forced 2-state.
     calls: [u32; 2],
+    /// The forced 2-state shadow product of each ray.
+    shadow: Vec<f32>,
 }
 
 impl Rays {
@@ -122,6 +124,7 @@ fn trace(models: &[&'static str]) -> Vec<Rays> {
     }
     let n = u64::from(GRID * GRID);
     let stopped: Vec<Allocation<u32>> = xs.iter().map(|_| readback(n, "stopped")).collect();
+    let shadow: Vec<Allocation<f32>> = xs.iter().map(|_| readback(n, "shadow")).collect();
     let mut calls: Vec<Allocation<u32>> = xs.iter().map(|_| readback(2, "calls")).collect();
     for c in &mut calls {
         c.as_mut_slice().unwrap().fill(0);
@@ -135,7 +138,7 @@ fn trace(models: &[&'static str]) -> Vec<Rays> {
                 origins: origins[k].gpu(),
                 stopped: stopped[k].gpu(),
                 calls: calls[k].gpu(),
-                _pad0: 0,
+                shadow: shadow[k].gpu(),
                 dir: dir.extend(0.0).to_array(),
                 count: n as u32,
                 _pad1: 0,
@@ -146,13 +149,14 @@ fn trace(models: &[&'static str]) -> Vec<Rays> {
         list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     });
     uvs.into_iter()
-        .zip(stopped.iter().zip(&calls))
-        .map(|(uv, (s, c))| {
+        .zip(stopped.iter().zip(&calls).zip(&shadow))
+        .map(|(uv, ((s, c), shadow))| {
             let c = c.as_slice().unwrap();
             Rays {
                 uv,
                 stopped: s.as_slice().unwrap().to_vec(),
                 calls: [c[0], c[1]],
+                shadow: shadow.as_slice().unwrap().to_vec(),
             }
         })
         .collect()
@@ -231,6 +235,42 @@ fn fractional_linked_coverage_lets_that_share_of_rays_through() {
             "{mode}: {share} of rays stopped by a quarter coverage"
         );
     }
+    assert_clean();
+}
+
+/// Beside an opaque section of its model, a cut-out glass pane stops no ray that doesn't take
+/// dielectrics, and a shadow ray takes its Fresnel only where the alpha test keeps it.
+#[test]
+fn a_masked_glass_pane_shadows_by_fresnel_where_its_alpha_test_keeps_it() {
+    let rays = trace(&[MASKED_PANE]);
+    let pane = &rays[0];
+    for (mode, bit) in [("4-state", Rays::FOUR_STATE), ("2-state", Rays::TWO_STATE)] {
+        assert_eq!(pane.stopped(bit), 0, "{mode}: opaque rays stopped at glass");
+    }
+    assert_eq!(pane.calls, [0, 0], "opaque rays asked about glass");
+    let mu = f64::from(SUN.direction_to_light.normalize().z.abs());
+    let through = (1.0 - fresnel(1.5, mu)) as f32;
+    let (mut kept, mut clear) = (0, 0);
+    for (uv, &t) in pane.uv.iter().zip(&pane.shadow) {
+        match sure(*uv, 1.5) {
+            Some(true) => {
+                assert!(
+                    (t - through).abs() < 1e-3,
+                    "glass at uv {uv}: {t}, wanted {through}"
+                );
+                kept += 1;
+            }
+            Some(false) => {
+                assert_eq!(t, 1.0, "a hole at uv {uv}");
+                clear += 1;
+            }
+            None => {}
+        }
+    }
+    assert!(
+        kept > 500 && clear > 500,
+        "{kept} glass and {clear} clear rays checked"
+    );
     assert_clean();
 }
 

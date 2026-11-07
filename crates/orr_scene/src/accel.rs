@@ -28,6 +28,10 @@ use crate::{ClusterRef, PartGpu, Result, RtCutGpu};
 /// `ClasJob.flags` (`accel.slang`).
 const CLAS_MICROMAP: u32 = 1;
 const CLAS_NON_OPAQUE: u32 = 2;
+
+/// Clusters keep their class in the geometry index, `orr_shaders.trace` `CLASS_OPAQUE` to
+/// `CLASS_PRESENCE`.
+pub(crate) const MAX_GEOMETRY_INDEX: u32 = 2;
 const CLAS_TEMPLATE: u32 = 4;
 /// `AccelRoot.op` of `records`.
 const ACCEL_BLAS: u32 = 0;
@@ -152,7 +156,8 @@ pub(crate) struct MeshInput<'a> {
     pub(crate) micromaps: &'a [Option<PageMicromap>],
     /// Discrete levels, finest first: error and mesh cluster range. Empty in DAG mode.
     pub(crate) levels: &'a [(f32, u32, u32)],
-    /// Sections whose every triangle is non-opaque (linked coverage).
+    /// Sections whose every triangle is non-opaque, with no micromap: linked coverage, dielectric
+    /// and presence.
     pub(crate) non_opaque: &'a [bool],
     /// Cluster id of mesh cluster 0.
     pub(crate) cluster_base: u32,
@@ -1432,7 +1437,7 @@ pub(crate) fn clas_batch<'a>(
             max_verts_per_cluster: max_verts,
             max_total_tris: triangles,
             max_total_verts: vertices,
-            max_geometry_index: 0,
+            max_geometry_index: MAX_GEOMETRY_INDEX,
             max_geometries_per_cluster: 1,
             min_truncate_bits: min_truncate,
         }),

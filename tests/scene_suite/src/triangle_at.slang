@@ -42,7 +42,7 @@ void main()
     root.out[1] = float4(i.geometric_normal, 0.0);
     root.out[2] = float4(i.normal, 0.0);
     uint side = side_material(root.scene, material, i);
-    root.out[3] = float4(float(side), crosses_interior(root.scene, side) ? 1.0 : 0.0, 0.0, 0.0);
+    root.out[3] = float4(float(side), crosses_interior(root.scene, material) ? 1.0 : 0.0, 0.0, 0.0);
     root.out[4] = i.tangent;
     root.out[5] = i.coat_tangent;
 }

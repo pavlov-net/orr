@@ -183,20 +183,21 @@ uint partition_bucket(uint p)
     return min(uint(max_component(d)), DISTANCE_BUCKETS - 1);
 }
 
-uint mask_of(uint class_id)
+// The rays a copy of `mesh` meets, from the sections it shows, as `PartGpu.sections`.
+uint section_ray_mask(MeshGpu* mesh, uint shown)
 {
-    switch (class_id)
-    {
-    case CLASS_DIELECTRIC:
-    case CLASS_PRESENCE:
-        return MASK_DIELECTRIC;
-    case CLASS_PARTICLE:
-        return MASK_PARTICLE;
-    case CLASS_MEDIUM:
-        return MASK_MEDIUM;
-    default:
-        return MASK_OPAQUE;
-    }
+    uint mask = 0;
+    if ((mesh.opaque_sections & shown) != 0)
+        mask |= MASK_OPAQUE;
+    if ((mesh.layer_sections & shown) != 0)
+        mask |= MASK_DIELECTRIC;
+    return mask;
+}
+
+// What copy `inst` shows of its sections, bit per section below 32; only the first 16 hide.
+uint shown_sections(InstanceGpu inst)
+{
+    return ~((inst.variant >> 16) & 0xffff);
 }
 
 uint mix(uint h, uint v)
@@ -206,7 +207,8 @@ uint mix(uint h, uint v)
     return h ^ (h >> 15);
 }
 
-// A hash of what a write puts in the PTLAS besides the BLAS: transform, model and class.
+// A hash of what a write puts in the PTLAS besides the BLAS: transform, model and shown sections,
+// which set its mask.
 uint2 instance_key(GroupGpu* g, InstanceGpu inst)
 {
     float3x4 m = group_transform(g, inst.group_index);
@@ -220,8 +222,9 @@ uint2 instance_key(GroupGpu* g, InstanceGpu inst)
             b = mix(b, asuint(m[r][c]) + 0x632be5abu);
         }
     }
-    a = mix(mix(a, inst.model), inst.candidate_class);
-    b = mix(mix(b, inst.group), inst.model ^ (uint(inst.candidate_class) << 24));
+    uint shown = shown_sections(inst);
+    a = mix(mix(a, inst.model), shown);
+    b = mix(mix(b, inst.group), inst.model ^ (shown << 16));
     return uint2(a, b);
 }
 
@@ -623,7 +626,7 @@ bool reserve(uint counter, uint capacity, uint count, out uint index)
 }
 
 // The write of an instance over `blas` placed by `pl` with mesh-space bounds `lo`..`hi`.
-PtlasWrite instance_write(uint index, uint partition, Placement pl, float3 lo, float3 hi, uint64_t blas, uint class_id)
+PtlasWrite instance_write(uint index, uint partition, Placement pl, float3 lo, float3 hi, uint64_t blas, uint custom_index, uint mask)
 {
     PtlasWrite w = (PtlasWrite)0;
     w.instance_index = index;
@@ -644,8 +647,8 @@ PtlasWrite instance_write(uint index, uint partition, Placement pl, float3 lo, f
     w.aabb_min = a;
     w.aabb_max = b;
     w.blas = blas;
-    w.custom_index = class_id;
-    w.mask = mask_of(class_id);
+    w.custom_index = custom_index;
+    w.mask = mask;
     w.flags = INSTANCE_EXPLICIT_AABB;
     return w;
 }
@@ -737,7 +740,7 @@ PtlasWrite copy_write(SceneRoot* s, PtlasGpu* t, uint index, uint partition, Ins
     float3 lo, hi;
     if ((inst.flags & INSTANCE_SKINNED) == 0 || !skinned_reach(s, inst, lo, hi))
         copy_bounds(s, inst, lo, hi);
-    return instance_write(index, partition, pl, lo, hi, blas, inst.candidate_class);
+    return instance_write(index, partition, pl, lo, hi, blas, 0, section_ray_mask(s.meshes + s.models[inst.model].mesh, shown_sections(inst)));
 }
 
 // Writes the slot's far instance: its copy's far chain step at `cut`, non-opaque.
@@ -783,7 +786,7 @@ void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot, Instanc
         w.instance_index = s.part_base + st.part_run + j;
         w.partition = ptlas_partition(partition);
         if (shown && blas != 0 && (part.sections & ~hidden) != 0 && part_pose(s, inst, mesh, mesh.first_animated + j, false, pose))
-            w = instance_write(w.instance_index, partition, placed_after(copy, pose), part.bounds_min, part.bounds_max, blas, inst.candidate_class);
+            w = instance_write(w.instance_index, partition, placed_after(copy, pose), part.bounds_min, part.bounds_max, blas, 0, section_ray_mask(mesh, part.sections & ~hidden));
         if (fading && w.blas != 0)
             w.flags |= INSTANCE_FORCE_NO_OPAQUE;
         store((uint64_t)t.writes, index + j, w);
@@ -923,6 +926,17 @@ uint2 producer_key(GroupGpu* g, ProducerGpu p)
     return uint2(mix(mix(a, p.class_id), p.group), mix(b, p.group_index ^ (p.class_id << 24)));
 }
 
+// The rays producer entry `p` meets: its class's, or the classes of its materials.
+uint producer_ray_mask(SceneRoot* s, ProducerGpu p)
+{
+    if (p.opacity != PRODUCER_SECTIONS)
+        return class_mask(p.class_id);
+    uint mask = 0;
+    for (uint i = 0; i < p.material_count; i++)
+        mask |= class_mask(material_class(s.materials + p.materials[i]));
+    return mask;
+}
+
 // The render-space placement of producer entry `p`; false when its group hides it.
 bool producer_render_placement(SceneRoot* s, ProducerGpu p, out Placement pl)
 {
@@ -992,7 +1006,7 @@ void producer_emit(uint3 id: SV_DispatchThreadID)
         float3 lo, hi;
         producer_render_placement(s, p, pl);
         producer_bounds(*st, lo, hi);
-        w = instance_write(w.instance_index, global_partition(), pl, lo, hi, st.blas, p.class_id);
+        w = instance_write(w.instance_index, global_partition(), pl, lo, hi, st.blas, p.class_id, producer_ray_mask(s, p));
         st.rt_key = producer_key(s.groups + p.group, p);
     }
     store((uint64_t)t.writes, index, w);
@@ -1031,7 +1045,7 @@ void proxy_write(uint3 id: SV_DispatchThreadID)
         pl.linear = transpose(float3x3(p.axis_x, p.axis_y, p.axis_z));
         pl.translation = proxy_render_center(s, p);
         pl.scale = max(length(p.axis_x), max(length(p.axis_y), length(p.axis_z)));
-        w = instance_write(w.instance_index, global_partition(), pl, float3(-1.0), float3(1.0), root.proxy_blas, CLASS_MEDIUM);
+        w = instance_write(w.instance_index, global_partition(), pl, float3(-1.0), float3(1.0), root.proxy_blas, CLASS_MEDIUM, MASK_MEDIUM);
     }
     store((uint64_t)t.writes, index, w);
 }

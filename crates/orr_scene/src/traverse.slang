@@ -354,10 +354,9 @@ void init(uint3 id: SV_DispatchThreadID)
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
     Lod l = slot_lod(s, inst, slot, c, false);
-    // Dielectric and presence copies raster into the layer tiles wherever camera rays may
-    // meet them.
-    bool raster = layer_class(inst.candidate_class) ? layer_traced(inst.flags)
-        : (inst.flags & INSTANCE_RASTER) != 0 && (inst.flags & INSTANCE_CAST_ONLY) == 0 && inst.candidate_class == CLASS_OPAQUE;
+    // Dielectric and presence clusters raster into the layer tiles wherever camera rays may
+    // meet them; the culling takes each cluster by its class.
+    bool raster = (mesh_has_layers(mesh) && layer_traced(inst.flags)) || (mesh_has_opaque(mesh) && opaque_rastered(inst.flags));
     // A skinned copy's raster candidates are the clusters its skinning took this frame; it
     // traces the BLAS built over them.
     if ((inst.flags & INSTANCE_SKINNED) != 0)

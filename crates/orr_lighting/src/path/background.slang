@@ -1,5 +1,5 @@
 // The background layer dispatch: per pixel the lens ray past the mask's depth. A kernel of its
-// own, dispatched only for views with a layer, so the opaque dispatch holds one path loop. The
+// own, dispatched only for views with a layer, so the view dispatch holds one path loop. The
 // raygen entry reorders lanes at each coherence point; the compute entry runs the same body
 // without reordering.
 #include "orr_root.h"

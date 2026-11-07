@@ -1,4 +1,4 @@
-// A view's overlay front words: cleared before the frame's dielectric dispatch, resolved into
+// A view's overlay front words: cleared before the frame's layer guides, resolved into
 // its front depth, motion and weight after the transparency point.
 #include "orr_root.h"
 import orr_lighting.guides;

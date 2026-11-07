@@ -7,6 +7,7 @@ import orr_shaders.abi;
 import orr_shaders.math;
 import orr_color.luminance;
 import orr_shaders.packing;
+import orr_lighting.interiors;
 
 // One point of a medium. Coefficients are per meter in linear Rec.2020.
 public struct MediumPoint
@@ -212,8 +213,8 @@ public struct FroxelLights
 // interior holds carry its absorption and scattering in place of the linked medium.
 public struct EyeColumn
 {
-    public uint medium;     // the innermost interior at the near-plane point, MATERIAL_NONE for none
-    public float start;     // m from the eye where it begins
+    public EyeInterior interior;    // the interiors at the near-plane point
+    public float start;     // m from the eye where the innermost begins
     public float end;       // m from the eye of the surface leaving it, +inf for none before `near_range`
     public uint slices;     // the slices from the eye it holds: those before the farthest `end` of the columns beside this one in the same interior
 }

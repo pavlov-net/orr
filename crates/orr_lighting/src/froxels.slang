@@ -343,7 +343,7 @@ bool eye_may_be_inside(FroxelRoot r)
 // of another material inside that interior does not end it.
 public void froxel_eye_column<S : ISurface>(FroxelRoot r, uint2 column)
 {
-    EyeColumn out = { MATERIAL_NONE, 0.0, positive_infinity(), 0 };
+    EyeColumn out = { EyeInterior(), 0.0, positive_infinity(), 0 };
     if (eye_may_be_inside(r))
     {
         SceneRoot* s = r.scene;
@@ -380,8 +380,8 @@ public void froxel_eye_column<S : ISurface>(FroxelRoot r, uint2 column)
                 break;
             }
         }
-        out.medium = list.innermost();
-        if (out.medium != MATERIAL_NONE)
+        out.interior = EyeInterior(list);
+        if (list.count > 0)
         {
             InterlockedOr(r.lights.eye, 1u);
             InterlockedAdd(r.stats.eye_columns, 1u);
@@ -398,7 +398,7 @@ public void froxel_eye_reach(FroxelRoot r, uint2 column)
     uint index = column.y * r.columns + column.x;
     EyeColumn c = r.eye[index];
     uint slices = 0;
-    if (c.medium != MATERIAL_NONE)
+    if (!c.interior.empty())
     {
         float end = c.end;
         int2 last = int2(r.columns, r.rows) - 1;
@@ -407,7 +407,7 @@ public void froxel_eye_reach(FroxelRoot r, uint2 column)
             for (int x = max(int(column.x) - 1, 0); x <= min(int(column.x) + 1, last.x); x++)
             {
                 EyeColumn other = r.eye[uint(y) * r.columns + uint(x)];
-                if (other.medium == c.medium)
+                if (other.interior.innermost() == c.interior.innermost())
                     end = max(end, other.end);
             }
         }
@@ -465,7 +465,7 @@ float3 limit_incident(float3 c)
 // shadowed directional ones, as mean radiance over the sphere: FROXEL_TILE_CANDIDATES tile
 // samples and one unshadowed directional light by selection weight, resampled by luminance,
 // with one shadow ray for the winner. Counts the ray in `rays`.
-float3 froxel_local<S : ISurface, M : IMedium>(FroxelRoot r, uint3 f, float3 x, inout Sampler rng, inout uint rays)
+float3 froxel_local<S : ISurface, M : IMedium>(FroxelRoot r, uint3 f, float3 x, Interior around, inout Sampler rng, inout uint rays)
 {
     LightSetGpu* set = r.set;
     bool tiles = set.environment_probability > 0.0 || set.candidate_total > 0.0;
@@ -548,7 +548,7 @@ float3 froxel_local<S : ISurface, M : IMedium>(FroxelRoot r, uint3 f, float3 x, 
     RayCone cone = { 0.0, 0.0 };
     rays++;
     // The baked environment carries the medium, as next-event estimation takes it.
-    float3 vis = visibility<S, M>(r.scene, r.view, x, chosen.dir, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, set.shadow_overflows);
+    float3 vis = visibility<S, M>(r.scene, r.view, x, chosen.dir, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, around, set.shadow_overflows);
     return l * vis * (sum / chosen_target) * INV_FOUR_PI;
 }
 
@@ -563,7 +563,7 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
     FroxelLights lights = *r.lights;
     float blend = r.history == 0 ? 1.0 : max(FROXEL_BLEND, 1.0 / float(r.history + 1));
     EyeColumn eye_column = r.eye[column.y * r.columns + column.x];
-    float3 eye_sigma = interior_medium(r.scene, eye_column.medium).sigma_t;
+    float3 eye_sigma = interior_medium(r.scene, eye_column.interior.innermost()).sigma_t;
     bool keep_depth = r.eye_depth.index != IMAGE_NONE;
     uint active = 0;
     uint rays = 0;
@@ -591,7 +591,12 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
             float3 x = froxel_sample(r, f, rng);
             float3 to_eye = normalize(eye - x);
             float3 l = particle_irradiance(r.cache, r.scene, x, to_eye, rng) * (0.5 * INV_PI);
-            l += froxel_local<S, M>(r, f, x, rng, rays);
+            // A light at a finite distance can lie in the interiors around `x` with no surface
+            // between to name them. Past those the walk finds what holds `x` from the back faces
+            // its rays leave through.
+            float from_eye = length(x - eye);
+            bool enclosed = from_eye > eye_column.start && from_eye < eye_column.end;
+            l += froxel_local<S, M>(r, f, x, enclosed ? Interior(eye_column.interior) : Interior(), rng, rays);
             float a = held ? blend : 1.0;
             float a_vis = held && lights.changed == 0 ? blend : 1.0;
             bool inside = keep_depth && eye_holds(eye_column, k, r.slices, near_range);
@@ -608,7 +613,7 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
                 RayCone cone = { 0.0, 0.0 };
                 rays++;
                 float3 tau;
-                float3 t = surface_visibility<S, M>(r.scene, r.view, x, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, r.set.shadow_overflows, tau);
+                float3 t = surface_visibility<S, M>(r.scene, r.view, x, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, Interior(), r.set.shadow_overflows, tau);
                 // The column's interior takes its share of the optical depth as a distance.
                 float d = 0.0;
                 if (inside && any(eye_sigma > 0.0))
@@ -782,7 +787,7 @@ public void froxel_integrate<M : IMedium>(FroxelRoot r, uint2 column)
     bool chromatic = r.chromatic != 0;
     FroxelLights lights = *r.lights;
     EyeColumn eye_column = r.eye[column.y * r.columns + column.x];
-    InteriorMedium im = interior_medium(r.scene, eye_column.medium);
+    InteriorMedium im = interior_medium(r.scene, eye_column.interior.innermost());
     bool keep_rgb = r.integrated_rgb.index != IMAGE_NONE;
     float3 inscatter = float3(0.0);
     float3 transmittance = float3(1.0);
@@ -941,7 +946,7 @@ public Fog eye_fog(EyeColumn* eye, TextureIndex integrated, TextureIndex rgb, ui
         uint2 at = min(base + uint2(i & 1u, i >> 1), grid.xy - 1u);
         float weight = ((i & 1u) != 0 ? w.x : 1.0 - w.x) * ((i >> 1) != 0 ? w.y : 1.0 - w.y);
         EyeColumn column = eye[at.y * grid.x + at.x];
-        if (column.medium != medium || !(weight > 0.0))
+        if (column.interior.innermost() != medium || !(weight > 0.0))
             continue;
         Fog g = column_fog(integrated, rgb, at, grid.z, near_range, column.slices, sigma_t, t);
         sum.inscatter += weight * g.inscatter;

@@ -1,6 +1,6 @@
 //! Builds the suite's kernels against orr_lighting's shader roots, and orr_scene's and
 //! orr_lighting's kernels with `surfaces/context.slang` linked as surface 1 and
-//! `src/rings.slang`'s `Rings` and `Veil` as surfaces 2 and 3.
+//! `src/rings.slang`'s `Rings` as surface 2.
 
 use std::env;
 use std::path::PathBuf;
@@ -28,12 +28,6 @@ fn main() {
                 "rings",
                 dir.join("src/rings.slang"),
                 "Rings",
-            )
-            .link(
-                LinkPoint::Surface,
-                "veil",
-                dir.join("src/rings.slang"),
-                "Veil",
             )
             .compile()
     });

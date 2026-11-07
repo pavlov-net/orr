@@ -36,7 +36,7 @@ use crate::edit::{
     EditRecorder, EditRef, EditSkin, EditSource, EditTables, EditTablesDesc, EditTask, Mirror,
 };
 use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored};
-use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler, candidate_class};
+use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler};
 use crate::medium_proxy::VolumeRef;
 use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::neural::{self, NeuralLink, Precision};
@@ -47,7 +47,7 @@ use crate::skin;
 use crate::stream::{
     FineInit, MeshStream, MountUnits, PoolTarget, StreamUnit, StreamedPage, Streaming,
 };
-use crate::subd::{self, CageShape, CageTables, ModelCage};
+use crate::subd::{CageShape, CageTables, ModelCage};
 use crate::tiles::{TexStream, TileGrid};
 use crate::traverse::{PAGED_DEPTH, PageFeedback};
 use crate::upload::Record;
@@ -1620,6 +1620,8 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                         cut_stamps: GpuPtr::from_address(orr_gpu::GpuAddress(m.cut_stamps)),
                         fine_cuts: 0,
                         section_count: m.sections,
+                        opaque_sections: m.header.opaque_sections,
+                        layer_sections: m.header.layer_sections,
                         emissive: sets(m.header.emissive, m.ranks[0]),
                         casters: sets(m.header.casters, m.ranks[1]),
                     }
@@ -1771,9 +1773,7 @@ fn build_accel(
         let sections = r.meshes[mesh].sections as usize;
         for (section, &mi) in model.materials.iter().take(sections).enumerate() {
             let m = &r.materials[mi].1;
-            let layered = side_flags(&r.materials, mi)
-                .iter()
-                .any(|f| f & (material_flags::DIELECTRIC | material_flags::PRESENCE) != 0);
+            let layered = m.flags & (material_flags::DIELECTRIC | material_flags::PRESENCE) != 0;
             if layered || (m.surface != 0 && m.flags & material_flags::ALPHA_TESTED != 0) {
                 non_opaque[mesh][section] = true;
             }
@@ -2180,16 +2180,6 @@ impl Apply<'_> {
 
 /// A material, its record, and the index among the pack's materials of its back.
 type ResolvedMaterial = (AssetId, MaterialGpu, Option<usize>);
-
-/// The flags of both sides of material `k`: rays take a surface by its class before they know
-/// the side they meet.
-fn side_flags(materials: &[ResolvedMaterial], k: usize) -> [u32; 2] {
-    let (_, front, back) = &materials[k];
-    [
-        front.flags,
-        back.map_or(front.flags, |b| materials[b].1.flags),
-    ]
-}
 
 type ResolvedTables = (
     Vec<ResolvedMaterial>,
@@ -3409,14 +3399,11 @@ impl Mounts {
             res.materials.insert(*id, mid);
             material_ids.push(mid);
         }
-        // A back reads its front's id, as the front reads its.
         let mut records: Vec<MaterialGpu> = materials.iter().map(|m| m.1).collect();
         for (i, &(.., back)) in materials.iter().enumerate() {
             let Some(b) = back else { continue };
             records[i].back = material_ids[b].0;
             records[i].flags |= material_flags::HAS_BACK;
-            records[b].back = material_ids[i].0;
-            records[b].flags |= material_flags::BACK_SIDE;
         }
         for (m, &mid) in records.iter().zip(&material_ids) {
             w.materials.note(mid, m);
@@ -3510,16 +3497,11 @@ impl Mounts {
             let mesh_sections = m.mesh.map_or(0, |k| meshes[k].sections as usize);
             w.cages[i] = m.cage.map(|k| {
                 let c = &cages[k];
-                let flags: Vec<u32> = m.materials[mesh_sections..]
-                    .iter()
-                    .flat_map(|&k| side_flags(&materials, k))
-                    .collect();
                 ModelCage {
                     cage: c.cage,
                     points: c.points,
                     shape: c.shape,
                     materials: section_materials[mesh_sections..].to_vec(),
-                    opacity: subd::opacity(&flags),
                 }
             });
             let Some(mesh_index) = m.mesh else {
@@ -3534,7 +3516,6 @@ impl Mounts {
             self.owners.insert(id, (mount, mesh_index as u32));
             let mesh = &meshes[mesh_index];
             let skinned = mesh.header.attributes & MeshHeader::SKIN != 0;
-            let mesh_materials = &m.materials[..mesh_sections];
             w.model_cpu[i] = ModelCpu {
                 sections: n,
                 animated_parts: mesh.gpu.animated_parts,
@@ -3543,11 +3524,6 @@ impl Mounts {
                     vertices: mesh.clusters.iter().map(|c| c.vertex_count).sum(),
                     clusters: mesh.gpu.cluster_count,
                 }),
-                candidate_class: candidate_class(
-                    mesh_materials
-                        .iter()
-                        .flat_map(|&k| side_flags(&materials, k)),
-                ),
                 emissive_sections: mesh.gpu.emissive.count,
                 cage_only: false,
                 edit: false,

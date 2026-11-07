@@ -3,6 +3,7 @@
 module material;
 
 import orr_shaders.abi;
+import orr_shaders.trace;
 import orr_color.primaries;
 __exported import orr_scene.neural_texture;
 
@@ -42,8 +43,6 @@ public static const uint MATERIAL_OBJECT_COAT_NORMAL = 1 << 26;
 public static const uint MATERIAL_DISPLACEMENT_WORLD = 1 << 27;
 // `MaterialGpu.back` is the material of the surface's back.
 public static const uint MATERIAL_HAS_BACK = 1 << 28;
-// It is the back of the material `MaterialGpu.back`.
-public static const uint MATERIAL_BACK_SIDE = 1 << 29;
 // Displacement reads TEXTURE_DISPLACEMENT_U and TEXTURE_DISPLACEMENT_V too.
 public static const uint MATERIAL_DISPLACED_TANGENT = 1 << 30;
 // `material_medium` reads textures.
@@ -228,7 +227,7 @@ public struct MaterialGpu
     public TextureSamplerGpu samplers[TEXTURE_SLOTS];
     public uint surface;                    // linked surface id; 0 = StandardSurface
     public uint tangent_set;                // the uv set its tangent frame follows; TANGENT_SET_OTHER: neither
-    public uint back;                       // with MATERIAL_HAS_BACK or MATERIAL_BACK_SIDE, the material of the other side
+    public uint back;                       // with MATERIAL_HAS_BACK, the material of the surface's back
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
     public uint coat_tangent_set;           // what the coat's normal map and tangent follow, as `tangent_set`
@@ -394,6 +393,14 @@ public float footprint_lod(UvFootprint f, float2 size)
     float major = max(a, b);
     float minor = min(a, b);
     return log2(max(max(major / 16.0, minor), 1e-8));
+}
+
+// The candidate class of material `m`.
+public uint material_class(MaterialGpu* m)
+{
+    if ((m.flags & MATERIAL_DIELECTRIC) != 0)
+        return CLASS_DIELECTRIC;
+    return (m.flags & MATERIAL_PRESENCE) != 0 ? CLASS_PRESENCE : CLASS_OPAQUE;
 }
 
 // Emitted radiance of `m` in nits: `emission_color x emission_luminance` with

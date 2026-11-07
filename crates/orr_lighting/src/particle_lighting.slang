@@ -34,7 +34,7 @@ public struct ParticleLighting
     public WorldCacheGpu* cache;
     public FroxelLights* lights;        // the froxels' shadowed directional lights
     public EyeColumn* eye;              // per froxel column; null without froxels
-    public LayerGuide* layers;          // the dielectric dispatch's layer memory, null for none
+    public LayerGuide* layers;          // the view's layer memory, null for none
     public uint64_t* overlay_front;     // per pixel of the view, its front layer; null for none
     public TextureIndex incident;       // froxel_incident; NONE without froxels
     public TextureIndex visibility;     // the shadowed lights past the first
@@ -79,7 +79,7 @@ public float3 particle_ambient(ParticleLighting* l, float3 x, float3 to_eye, ino
         EyeColumn eye = l.eye[column.y * l.columns + column.x];
         if (uint(coord.z * float(l.slices)) < eye.slices)
         {
-            float3 sigma_t = interior_medium(s, eye.medium).sigma_t;
+            float3 sigma_t = interior_medium(s, eye.interior.innermost()).sigma_t;
             float4 depth = l.eye_depth.get<Texture3D<float4>>().SampleLevel(ss, coord, 0.0);
             for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
                 vis[j] *= vis[j].x > 0.0 ? beer(sigma_t, depth[j] / vis[j].x) : float3(1.0);
@@ -103,7 +103,7 @@ public void particle_shadow_rays<S : ISurface, M : IMedium>(ParticleLighting* l,
             continue;
         float3 to_light = s.lights[l.lights.ids[j]].direction;
         float3 depth;
-        vis[j] = surface_visibility<S, M>(s, l.view, x + to_light * offset, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, l.set.shadow_overflows, depth);
+        vis[j] = surface_visibility<S, M>(s, l.view, x + to_light * offset, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, Interior(), l.set.shadow_overflows, depth);
         vis[j] *= exp(-depth);
     }
 }
@@ -211,7 +211,7 @@ public float4 particle_shade<S : ISurface, M : IMedium>(ParticleLighting* l, flo
     {
         LayerGuide guide = layer_guide(l.layers, v.extent, min(uint2(p), v.extent - 1));
         end = guide.medium_end;
-        medium = guide.eye_medium - 1;
+        medium = guide.near_interior.innermost();
     }
     if (end > 0.0 && t > end)
         return float4(0.0);

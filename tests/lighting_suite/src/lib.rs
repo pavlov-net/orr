@@ -17,13 +17,14 @@ use orr_scene::{
 pub use gpu_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
 
 pub mod bed;
+pub mod welch;
 
 pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
 }
 
-/// orr_scene's and orr_lighting's kernels with `surfaces/context.slang` linked as surface 1,
-/// `Rings` as surface 2 and `Veil` as surface 3 (`rings.slang`).
+/// orr_scene's and orr_lighting's kernels with `surfaces/context.slang` linked as surface 1
+/// and `Rings` as surface 2 (`rings.slang`).
 pub mod linked {
     include!(concat!(env!("OUT_DIR"), "/linked/orr_kernels.rs"));
 }

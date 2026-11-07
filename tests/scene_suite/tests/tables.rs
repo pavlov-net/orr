@@ -166,7 +166,7 @@ fn instance_and_material_tables_read_back_as_written() {
                 rt_range: 0x5cb0, // 300 as f16
                 animation_range: 0x5240,
                 flags: if (100..150).contains(&slot) { 4 } else { 3 },
-                candidate_class: 0,
+                _pad: 0,
                 pose_variants: 4,
                 pose_stride: 4,
                 debug_lod: 0,
@@ -187,7 +187,7 @@ fn instance_and_material_tables_read_back_as_written() {
                 rt_range: 0,
                 animation_range: 0,
                 flags: 1,
-                candidate_class: 0,
+                _pad: 0,
                 pose_variants: 0,
                 pose_stride: 0,
                 debug_lod: 0,

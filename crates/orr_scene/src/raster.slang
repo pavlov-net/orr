@@ -85,7 +85,7 @@ ClusterDraw cluster_draw(uint visible, bool alpha)
         d.k = d.b.clusters[d.vc.cluster];
         d.vertex_count = d.k.vertex_count;
         d.tri_count = d.k.tri_count;
-        bool tested = s.producers[entry].opacity == PRODUCER_ALPHA_TESTED && (m.flags & MATERIAL_ALPHA_TESTED) != 0;
+        bool tested = producer_tested(s.producers[entry], m);
         d.split = tested ? 0 : d.tri_count;
         d.by_size = (d.vc.local & VISIBLE_BY_SIZE) != 0;
     }

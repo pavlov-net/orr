@@ -279,7 +279,7 @@ impl SkinFrame {
                         max_verts_per_cluster: 256,
                         max_total_tris: clusters.max(1) * 128,
                         max_total_verts: clusters.max(1) * 256,
-                        max_geometry_index: 0,
+                        max_geometry_index: accel::MAX_GEOMETRY_INDEX,
                         max_geometries_per_cluster: 1,
                         min_truncate_bits: 0,
                     }),

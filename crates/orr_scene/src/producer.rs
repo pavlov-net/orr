@@ -91,6 +91,10 @@ pub enum Opacity {
     /// it. Past `near_range` each pixel takes the triangles on its ray as one layer at their mean
     /// distance, lit at that point; a hook's particles there draw over it.
     Smoke,
+    /// Each cluster takes the class of its material, an alpha test where the material has one.
+    /// Subdivision copies take this, from whatever materials they bind; other entries name theirs.
+    /// Only a tessellated entry has the opaque and non-opaque templates it picks between.
+    Sections,
 }
 
 impl Opacity {
@@ -102,16 +106,16 @@ impl Opacity {
     /// `orr_shaders.trace` `CLASS_*`.
     fn class(self) -> u32 {
         match self {
-            Self::Opaque | Self::AlphaTested => 0,
+            Self::Opaque | Self::AlphaTested | Self::Sections => 0,
             Self::Dielectric => 1,
             Self::Presence => 2,
             Self::Particle | Self::Smoke => 3,
         }
     }
 
-    /// Every triangle opaque in traversal.
+    /// Every triangle opaque in traversal, its templates the opaque set.
     fn opaque(self) -> bool {
-        matches!(self, Self::Opaque | Self::Dielectric)
+        matches!(self, Self::Opaque)
     }
 }
 
@@ -363,7 +367,7 @@ fn cluster_desc(op: RtasOp, args: u32, tris: u32, verts: u32) -> RtasOpDesc {
             max_verts_per_cluster: verts.max(3),
             max_total_tris: args.max(1) * tris.max(1),
             max_total_verts: args.max(1) * verts.max(3),
-            max_geometry_index: 0,
+            max_geometry_index: crate::accel::MAX_GEOMETRY_INDEX,
             max_geometries_per_cluster: 1,
             min_truncate_bits: 0,
         }),
@@ -456,6 +460,10 @@ pub(crate) fn build(
     assert!(
         subd.is_none() || desc.tessellated,
         "a subdivision copy is a tessellated entry"
+    );
+    assert!(
+        desc.opacity != Opacity::Sections || desc.tessellated,
+        "an entry of mixed sections is tessellated"
     );
     assert!(
         desc.topologies.len() < 256,
@@ -639,7 +647,11 @@ pub(crate) fn build(
         direct_records: at(direct_records_at),
         blas_record: at(blas_record_at),
         templates: if tessellated {
-            let set = if opaque { 0 } else { PATTERNS as u64 };
+            let set = if opaque || desc.opacity == Opacity::Sections {
+                0
+            } else {
+                PATTERNS as u64
+            };
             patterns.templates.offset(set)
         } else {
             at(templates_at).cast()

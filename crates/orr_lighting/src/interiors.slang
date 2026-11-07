@@ -12,19 +12,33 @@ import orr_scene.visibility;
 // Interior list entries a path keeps.
 public static const uint INTERIOR_ENTRIES = 4;
 
-// The dielectric materials whose interiors hold a point, innermost last.
+// Surfaces a walk along a camera ray crosses at most.
+public static const uint SURFACE_CROSSINGS = 8;
+
+// The dielectric materials whose interiors hold a point, innermost last. Their ids are a vector
+// rather than an array, so a path holds the list in registers; only a textured medium reads a
+// point, so those stay an array.
 public struct Interior
 {
     public uint count;
-    public uint entries[INTERIOR_ENTRIES];
+    public vector<uint, INTERIOR_ENTRIES> entries;
     public float4 points[INTERIOR_ENTRIES]; // where each was entered: `material_medium`
 
     public __init()
     {
         count = 0;
+        entries = MATERIAL_NONE;
+        for (uint i = 0; i < INTERIOR_ENTRIES; i++)
+            points[i] = NO_MEDIUM_POINT;
+    }
+
+    public __init(EyeInterior eye)
+    {
+        count = 0;
+        entries = eye.held - 1;
         for (uint i = 0; i < INTERIOR_ENTRIES; i++)
         {
-            entries[i] = MATERIAL_NONE;
+            count += eye.held[i] != 0 ? 1 : 0;
             points[i] = NO_MEDIUM_POINT;
         }
     }
@@ -45,6 +59,16 @@ public struct Interior
         return count > 0 ? entries[count - 1] : MATERIAL_NONE;
     }
 
+    public bool holds(uint m)
+    {
+        for (uint i = 0; i < count; i++)
+        {
+            if (entries[i] == m)
+                return true;
+        }
+        return false;
+    }
+
     // The innermost entry other than `a` and `b`, MATERIAL_NONE for none.
     public uint outside(uint a, uint b)
     {
@@ -55,6 +79,38 @@ public struct Interior
                 return e;
         }
         return MATERIAL_NONE;
+    }
+
+    // Adds `m`, which the list lacks, entered at `entered`: inside every entry `held` names and
+    // outside the rest. A full list drops its outermost entry, which may be `m`.
+    [mutating]
+    public void nest(uint m, Interior held, float4 entered)
+    {
+        uint at = count;
+        while (at > 0 && !held.holds(entries[at - 1]))
+            at--;
+        if (count < INTERIOR_ENTRIES)
+        {
+            for (uint i = count; i > at; i--)
+            {
+                entries[i] = entries[i - 1];
+                points[i] = points[i - 1];
+            }
+            count++;
+        }
+        else
+        {
+            if (at == 0)
+                return;
+            at--;
+            for (uint i = 0; i < at; i++)
+            {
+                entries[i] = entries[i + 1];
+                points[i] = points[i + 1];
+            }
+        }
+        entries[at] = m;
+        points[at] = entered;
     }
 
     // Crosses the surface of material `m`: into it from its front at `entered`, out of it from
@@ -102,6 +158,35 @@ public struct Interior
     }
 }
 
+// The list a walk from the eye leaves for each pixel and froxel column. The walk crosses surfaces
+// without shading them, so it knows no uv there: its entries hold no points and read by their
+// factors. Each id is held plus 1, so 0 lies past the list's end and zeroed memory is the empty
+// list.
+public struct EyeInterior
+{
+    public vector<uint, INTERIOR_ENTRIES> held;
+
+    public __init()
+    {
+        held = 0;
+    }
+
+    public __init(Interior list)
+    {
+        held = list.entries + 1;
+    }
+
+    public bool empty()
+    {
+        return all(held == 0);
+    }
+
+    public uint innermost()
+    {
+        return Interior(this).innermost();
+    }
+}
+
 // Non-opaque candidates of rays that may meet layers: presence layers commit by `presence`,
 // the rest by the alpha test.
 public static const uint PRESENCE_NONE = 0;      // never: rays that look for dielectrics only
@@ -121,7 +206,7 @@ public struct LayerAccept<S : ISurface> : IAnyHit
     {
         if (c.cluster_id < 0)
             return false;
-        if (c.custom_index == CLASS_PRESENCE)
+        if (c.class_id == CLASS_PRESENCE)
         {
             if (presence == PRESENCE_NONE)
                 return false;
@@ -135,9 +220,9 @@ public struct LayerAccept<S : ISurface> : IAnyHit
     }
 }
 
-// The nearest dielectric surface on a ray from `origin` along `dir` within `t_max`: its distance,
-// whether the ray meets its front, and its material, or MATERIAL_NONE for a surface with no
-// interior. False for none.
+// The nearest surface on a ray from `origin` along `dir` within `t_max`: its distance, whether the
+// ray meets its front, and its material where it is a dielectric's with an interior, else
+// MATERIAL_NONE. False for none.
 public bool next_surface<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, out float t, out uint material, out bool front)
 {
     t = 0.0;
@@ -150,28 +235,28 @@ public bool next_surface<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 or
     ray.Direction = dir;
     ray.TMin = 0.0;
     ray.TMax = t_max;
-    Hit h = trace_closest(s.tlas, ray, MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+    Hit h = trace_closest(s.tlas, ray, MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
     float3 n;
     uint m;
     if (!h.hit || h.cluster_id < 0 || !hit_geometry(s, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, n, m))
         return false;
     t = h.t;
     front = dot(n, dir) < 0.0;
-    if (crosses_interior(s, m))
+    if (h.class_id == CLASS_DIELECTRIC && crosses_interior(s, m))
         material = m;
     return true;
 }
 
-// The surfaces a ray from `eye` along `dir` crosses before `t_near`, flipped into `interior`.
-public void eye_crossings<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 eye, float3 dir, float t_near, inout Interior interior)
+// The surfaces a ray from `origin` along `dir` crosses before `t_max`, flipped into `interior`.
+public void surface_crossings<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, inout Interior interior)
 {
     float at = 0.0;
-    for (uint k = 0; k < INTERIOR_ENTRIES && at < t_near; k++)
+    for (uint k = 0; k < SURFACE_CROSSINGS && at < t_max; k++)
     {
         float t;
         uint m;
         bool front;
-        if (!next_surface<S>(s, v, eye + dir * at, dir, t_near - at, t, m, front))
+        if (!next_surface<S>(s, v, origin + dir * at, dir, t_max - at, t, m, front))
             return;
         if (m != MATERIAL_NONE)
             interior.cross(m, front);

@@ -51,6 +51,7 @@ public struct SurfaceInput
     public UvFootprint uv[2];       // per uv set; producer and patch geometry give both its one uv, but for a subdivision copy holding uv set 1
     public float3 geometric_normal; // the triangle's front face
     public bool back_face;          // the ray met the back of a double-sided material
+    public bool swapped;            // `material` is the section material's back
     public float3 normal;           // interpolated vertex normal, unit
     public float3 frame_normal;     // `normal` before normalizing, not always unit
     public float4 tangent;          // xyz as interpolated, not always unit; w bitangent sign

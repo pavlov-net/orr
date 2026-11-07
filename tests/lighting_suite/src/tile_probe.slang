@@ -85,7 +85,8 @@ float density(LightSetGpu* set, float3 x, float3 dir)
                                        render_point(anchor, m, p1), render_point(anchor, m, p2));
                 if (t > 0.0)
                 {
-                    float c = dot(normalize(transformed_normal(m, p0, p1, p2)), dir);
+                    float area;
+                    float c = dot(transformed_normal(m, p0, p1, p2, area), dir);
                     d += emissive_area_pdf(set, e, y) * t * t / abs(c);
                 }
             }

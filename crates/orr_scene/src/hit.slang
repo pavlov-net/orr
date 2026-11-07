@@ -113,6 +113,12 @@ public bool producer_placement(SceneRoot* s, ProducerGpu p, bool previous, int3 
     return placement(g, previous, p.group_index, cell, offset, cell_log2, pl);
 }
 
+// Whether a cluster of entry `p` with material `m` takes the alpha test.
+public bool producer_tested(ProducerGpu p, MaterialGpu* m)
+{
+    return (p.opacity == PRODUCER_ALPHA_TESTED || p.opacity == PRODUCER_SECTIONS) && (m.flags & MATERIAL_ALPHA_TESTED) != 0;
+}
+
 // The material of an emitted cluster, MATERIAL_NONE outside the entry's materials.
 public uint producer_material(ProducerGpu p, ProducerClusterGpu k)
 {
@@ -408,19 +414,12 @@ public uint side_material(SceneRoot* s, uint material, SurfaceInput i)
     return i.back_face && (m.flags & MATERIAL_HAS_BACK) != 0 ? m.back : material;
 }
 
-// The material whose interior a surface of `material` bounds: one surface has one interior, so
-// that of the material it backs.
-public uint interior_material(SceneRoot* s, uint material)
-{
-    MaterialGpu* m = s.materials + material;
-    return material != MATERIAL_NONE && (m.flags & MATERIAL_BACK_SIDE) != 0 ? m.back : material;
-}
-
-// Whether a surface of `material` bounds an interior, which only a solid dielectric has. The
-// material that owns the interior decides, so a thin back on a solid front still leaves it.
+// Whether a surface of section material `material` bounds an interior, which only a solid
+// dielectric has. One surface has one interior, the section material's, so a ray leaves it
+// through whichever side it meets.
 public bool crosses_interior(SceneRoot* s, uint material)
 {
-    uint flags = s.materials[interior_material(s, material)].flags;
+    uint flags = s.materials[material].flags;
     return (flags & (MATERIAL_DIELECTRIC | MATERIAL_THIN_WALLED)) == MATERIAL_DIELECTRIC;
 }
 
@@ -587,6 +586,8 @@ public struct SurfaceHit
     public float geometric_error; // m: the hit cluster's LOD error times the instance scale
     public float depth_offset;    // m, along the ray
     public bool back_face;        // on a double-sided material's back
+    public bool swapped;          // `surface.material` is the section material's back
+    public uint section;          // the section's material, which owns the surface's interior
     public bool valid;            // false for hits on entries this module does not resolve
 }
 
@@ -636,6 +637,7 @@ struct HitInput
     Placement placement;
     float error;       // m, mesh space: the cluster's LOD error; 0 for producer clusters
     uint origin;       // a producer entry's origin policy, else ORIGIN_DEFAULT
+    uint section;      // the section's material
 }
 
 // With `sided` the input is that of the side `d` meets, else of the section's material.
@@ -733,8 +735,12 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
         return false;
     if (!strand)
         hit_triangle(i, d, corners, t, fetched, deformed, previous, attributes, s, material, pl, primitive, bary, context, bias);
+    h.section = material;
     if (sided)
+    {
         material = side_material(s, material, i);
+        i.swapped = material != h.section;
+    }
     MaterialGpu* m = s.materials + material;
     i.uv[0].tap = i.uv[1].tap = context.tap;
     i.context = context;
@@ -824,6 +830,8 @@ public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     hit.vertex_user = h.input.vertex_user;
     hit.depth_offset = offset;
     hit.back_face = h.input.back_face;
+    hit.swapped = h.input.swapped;
+    hit.section = h.section;
     hit.valid = true;
     return hit;
 }
@@ -982,8 +990,7 @@ public bool hit_previous_position(SceneRoot* s, float3 d, uint instance_index, u
 }
 
 // The geometric normal (the triangle's front face, turned toward the ray where
-// `triangle_geometry` turns it) and the material whose interior a ray hit bounds, without
-// shading it. False where the hit does not resolve.
+// `triangle_geometry` turns it) and the section material of a ray hit, without shading it. False where the hit does not resolve.
 public bool hit_geometry(SceneRoot* s, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], out float3 normal, out uint material)
 {
     normal = float3(0.0);
@@ -995,6 +1002,6 @@ public bool hit_geometry(SceneRoot* s, float3 d, uint instance_index, uint clust
     if (!hit_input(s, nullptr, d, instance_index, cluster_id, primitive, bary, t, true, false, true, context, h))
         return false;
     normal = h.input.geometric_normal;
-    material = interior_material(s, h.input.material);
+    material = h.section;
     return true;
 }

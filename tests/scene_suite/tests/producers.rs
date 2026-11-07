@@ -60,6 +60,7 @@ const WORDS_SURFACE: u32 = 4;
 /// `orr_shaders.trace` masks.
 const MASK_OPAQUE: u32 = 1;
 const MASK_PARTICLE: u32 = 2;
+const MASK_DIELECTRIC: u32 = 0x80;
 
 const BLADE: [[u8; 3]; 3] = [[0, 1, 2], [1, 3, 2], [2, 3, 4]];
 
@@ -1234,6 +1235,10 @@ fn tessellated_patches_dice_at_mixed_rates_with_bit_identical_shared_edges() {
 /// Per pixel of `view`: the distance to the producer surface the raster shows and to the
 /// one the camera ray hits, 0 for none.
 fn depths(view: &RasterView) -> Vec<tess_rays::Depths> {
+    depths_under(view, MASK_OPAQUE)
+}
+
+fn depths_under(view: &RasterView, mask: u32) -> Vec<tess_rays::Depths> {
     let d = device();
     let n = u64::from(EXTENT[0] * EXTENT[1]);
     let out = d
@@ -1247,6 +1252,9 @@ fn depths(view: &RasterView) -> Vec<tess_rays::Depths> {
         view: view.view,
         gbuffer: view.gbuffer,
         out: out.gpu(),
+        mask,
+        _pad0: 0,
+        _pad1: 0,
     };
     let module = linked::KERNELS.module(&tess_rays::MODULE).unwrap();
     let p = pipeline(module, "main");
@@ -1997,8 +2005,35 @@ fn quilt_cage() -> CageInput {
     c
 }
 
-/// The cages: `cages` (cage only), `painted`, the skinned `arm/Arm` from USD, and a mesh and a
-/// cage past 256 sections, `quilt mesh` and `quilt cage`.
+/// A cube of side 1 around the origin, wound outward, its top face in section 1.
+fn lidded_cage() -> CageInput {
+    let mut c = CageInput {
+        positions: (0..8)
+            .map(|i| {
+                let b = |k: u32| if i & (1 << k) != 0 { 0.5 } else { -0.5 };
+                Vec3::new(b(0), b(1), b(2))
+            })
+            .collect(),
+        ..CageInput::default()
+    };
+    for (face, section) in [
+        ([0, 1, 5, 4], 0),
+        ([2, 6, 7, 3], 1),
+        ([0, 4, 6, 2], 0),
+        ([1, 3, 7, 5], 0),
+        ([0, 2, 3, 1], 0),
+        ([4, 5, 7, 6], 0),
+    ] {
+        c.face_counts.push(4);
+        c.face_indices.extend(face);
+        c.face_sections.push(section);
+    }
+    c
+}
+
+/// The cages: `cages` (cage only), `painted`, `lidded` of an opaque cube under a glass lid (cage
+/// only), `cube` of the same cube all opaque (cage only), the skinned `arm/Arm` from USD, and a
+/// mesh and a cage past 256 sections, `quilt mesh` and `quilt cage`.
 fn cage_pack() -> &'static Arc<[u8]> {
     static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
     PACK.get_or_init(|| {
@@ -2025,6 +2060,31 @@ fn cage_pack() -> &'static Arc<[u8]> {
                         name: "painted".into(),
                         source: Source::Subd {
                             cage: painted_cage(),
+                            materials: vec![material],
+                            settings: SubdSettings::default(),
+                        },
+                    },
+                    AssetSpec {
+                        name: "lidded".into(),
+                        source: Source::Subd {
+                            cage: lidded_cage(),
+                            materials: vec![
+                                material,
+                                orr_pack::material::Material {
+                                    transmission_weight: 1.0,
+                                    ..material
+                                },
+                            ],
+                            settings: SubdSettings::default(),
+                        },
+                    },
+                    AssetSpec {
+                        name: "cube".into(),
+                        source: Source::Subd {
+                            cage: CageInput {
+                                face_sections: vec![0; 6],
+                                ..lidded_cage()
+                            },
                             materials: vec![material],
                             settings: SubdSettings::default(),
                         },
@@ -2526,6 +2586,87 @@ fn a_subdivision_copy_ends_with_its_pack() {
     s.frame(|_| {}, eye, target, eye);
     assert_eq!(s.stats().entries, 0, "the copy outlived its cage");
     s.frame(|w| w.set_subd(SMOOTH, None).unwrap(), eye, target, eye);
+    assert_clean();
+}
+
+/// What the center ray from above a copy of `model` with `materials` meets: under
+/// `MASK_OPAQUE`, then under `MASK_OPAQUE | MASK_DIELECTRIC`.
+fn cage_from_above(
+    s: &mut CageScene,
+    model: ModelId,
+    materials: &[MaterialId],
+) -> [tess_rays::Depths; 2] {
+    let (eye, target) = (Vec3::new(0.0, 2.5, 1.0), Vec3::ZERO);
+    let mut group = TransformGroupId(0);
+    s.frame(
+        |w| {
+            group = w
+                .create_transform_group(&TransformGroupDesc {
+                    count: 1,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::ZERO,
+                })
+                .unwrap();
+            w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+            let desc = SubdDesc {
+                model,
+                materials,
+                transform: (group, 0),
+                max_clusters: 16_384,
+                max_vertices: 16_384 * 78,
+                ..SubdDesc::default()
+            };
+            w.set_subd(SMOOTH, Some(&desc)).unwrap();
+        },
+        eye,
+        target,
+        target,
+    );
+    for _ in 0..2 {
+        s.frame(|_| {}, eye, target, target);
+    }
+    let view = s.frame(|_| {}, eye, target, target);
+    let center = (EXTENT[1] / 2 * EXTENT[0] + EXTENT[0] / 2) as usize;
+    [MASK_OPAQUE, MASK_OPAQUE | MASK_DIELECTRIC].map(|mask| depths_under(&view, mask)[center])
+}
+
+/// A cage of opaque sides under a glass lid dices into clusters of both classes in one entry:
+/// the raster shows the opaque clusters past the lid, an opaque ray passes the lid to them, and a
+/// ray that takes dielectrics stops at the lid and reads its class.
+#[test]
+fn a_cage_mixing_classes_takes_each_clusters_class_from_its_material() {
+    if !traced(true) {
+        return;
+    }
+    let mut s = CageScene::new(32.0);
+    let model = s.model("lidded");
+    let [opaque, both] = cage_from_above(&mut s, model, &[]);
+    assert!((opaque.raster - opaque.traced).abs() < 0.02, "{opaque:?}");
+    assert_eq!(opaque.class_id, 0, "{opaque:?}");
+    assert!(
+        both.traced > 0.0 && both.traced < opaque.traced - 0.5,
+        "the lid stopped no ray: {opaque:?}, {both:?}"
+    );
+    assert_eq!(both.class_id, 1, "{both:?}");
+    assert_clean();
+}
+
+/// An opaque cage bound to glass is glass: rays that don't take dielectrics pass it.
+#[test]
+fn a_cage_takes_the_class_of_the_materials_its_copy_binds() {
+    if !traced(true) {
+        return;
+    }
+    let mut s = CageScene::new(32.0);
+    let model = s.model("cube");
+    let glass = s
+        .scenes
+        .material(s.mount, AssetId::from_name("lidded/material/1"))
+        .unwrap();
+    let [opaque, both] = cage_from_above(&mut s, model, &[glass]);
+    assert_eq!(opaque.traced, 0.0, "{opaque:?}");
+    assert!(both.traced > 0.0, "{both:?}");
+    assert_eq!(both.class_id, 1, "{both:?}");
     assert_clean();
 }
 

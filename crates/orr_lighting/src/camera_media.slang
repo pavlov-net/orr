@@ -44,7 +44,7 @@ public struct MediaApplyRoot
 {
     public FroxelRoot* froxels;                 // this frame's
     public ParticleLighting* lighting;          // this frame's: lights the proxies' steps
-    public LayerGuide* layers;                  // the dielectric dispatch's layer memory, null for none
+    public LayerGuide* layers;                  // the view's layer memory, null for none
     public StorageImageIndex radiance;          // the view's, RGBA16F
     public StorageImageIndex dof_background;    // the background dispatch's layer, NONE for none
     public uint mode;                           // MEDIA_*
@@ -63,7 +63,7 @@ Fog linked_fog<M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 
     Fog g;
     if (f.lights.eye != 0)
     {
-        uint medium = r.layers != nullptr ? layer_guide(r.layers, f.gbuffer.extent, pixel).eye_medium - 1 : MATERIAL_NONE;
+        uint medium = r.layers != nullptr ? layer_guide(r.layers, f.gbuffer.extent, pixel).near_interior.innermost() : MATERIAL_NONE;
         g = eye_fog(f.eye, f.integrated_sampled, f.integrated_rgb_sampled, uint3(f.columns, f.rows, f.slices), v.extent, near_range, float2(pixel) + 0.5, medium, interior_medium(f.scene, medium).sigma_t, t);
         if (medium != MATERIAL_NONE)
             return g;
@@ -117,7 +117,7 @@ struct ProxySpans : ICandidate
     {
         counted = false;
         ProxySpan s;
-        if (c.triangle || c.custom_index != CLASS_MEDIUM || !proxy_span(c.object_origin, c.object_direction, t_max, s.t0, s.t1))
+        if (c.triangle || c.class_id != CLASS_MEDIUM || !proxy_span(c.object_origin, c.object_direction, t_max, s.t0, s.t1))
             return float3(1.0);
         s.instance = c.instance_index;
         s.origin = c.object_origin;
@@ -403,7 +403,7 @@ bool smoke_sheet(SceneRoot* scene, Candidate c, out SmokeSheet s)
 {
     s = (SmokeSheet)0;
     s.t = c.t;
-    return c.triangle && c.custom_index == CLASS_PARTICLE && c.cluster_id >= 0
+    return c.triangle && c.class_id == CLASS_PARTICLE && c.cluster_id >= 0
         && resolve_smoke(scene, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, s.albedo, s.emission, s.opacity);
 }
 
@@ -526,7 +526,7 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
                     float3 l = c.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, c.light, c.dir) : c.radiance;
                     float t_max = isfinite(c.distance) ? c.distance * (1.0 - 1e-4) : c.distance;
                     RayCone cone = { 0.0, 0.0 };
-                    float3 vis = visibility<S, M>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind == LIGHT_SAMPLE_ENVIRONMENT, set.shadow_overflows);
+                    float3 vis = visibility<S, M>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind == LIGHT_SAMPLE_ENVIRONMENT, Interior(), set.shadow_overflows);
                     source += scatter * l * vis / c.pdf;
                 }
                 source += sigma_s * multiple_scattered<M>(set, p);

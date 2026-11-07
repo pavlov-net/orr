@@ -15,7 +15,7 @@ fn paths(settings: ViewLighting) -> Paths {
     Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
 }
 
-/// One frame of `bed` through the opaque dispatch and the guide resolve; its guides.
+/// One frame of `bed` through the view dispatch and the guide resolve; its guides.
 fn guides(bed: &mut Bed) -> GuideImages {
     let p = paths(ViewLighting::default());
     bed.accumulate(1, 0, &mut |list, f| p.record(list, f));

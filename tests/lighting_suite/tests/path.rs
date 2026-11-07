@@ -1,4 +1,4 @@
-//! The opaque path kernel on the bed's analytic scenes: the furnace, convergence, the three
+//! The path kernel on the bed's analytic scenes: the furnace, convergence, the three
 //! estimators against each other, pixel subsets, directional lights, ray counts, ray
 //! origins, the thin lens and the background layer behind foreground, and emissive particles
 //! as lights.
@@ -6,7 +6,7 @@
 use lighting_suite::bed::{
     Accumulated, Analytic, BUMPY_FLOOR, Bed, EXTENT, FLOOR, FURNACE_RADIANCE, Item, MIRROR, NEAR,
     Particle, ParticleLook, Paths, SKY, SMOOTH_FLOOR, SUN, Spec, TROUGH, assert_close, image_mean,
-    luminance, mean_where, reference, surface_mean,
+    luminance, mean_where, pixel_of, reference, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::{assert_clean, pipeline, readback, render, run, texture, upload};
@@ -15,7 +15,7 @@ use orr_lighting::{
     DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightingDebugView, PathEntry,
     ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting,
 };
-use orr_math::{DVec3, Mat3, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, Vec3};
 use orr_scene::{Opacity, RendererDesc};
 
 fn paths(settings: ViewLighting) -> Paths {
@@ -706,5 +706,57 @@ fn an_emissive_particle_lights_as_an_emitter_of_its_opacity() {
     let particle = floor(2000.0, 0.5, Opacity::Particle);
     let opaque = floor(1000.0, 1.0, Opacity::Opaque);
     assert_close("floor", particle, opaque, 0.03);
+    assert_clean();
+}
+
+/// A quad with a back of its own lights the floor in front of it by both techniques, while only
+/// BSDF rays see its back, at full weight: light sampling reads the front, and so the emission of
+/// a back reaches the floor behind whatever it shows. A mirrored placement keeps the sides.
+#[test]
+fn light_sampling_reads_the_front_of_a_surface_with_a_back() {
+    let spec = Spec {
+        copies: vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
+        lights: Vec::new(),
+        environment: None,
+        eye: Vec3::new(0.0, 2.0, 4.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        focus: None,
+    };
+    let quad = [Particle {
+        center: Vec3::new(0.0, 1.0, 0.0),
+        size: 1.0,
+    }];
+    let look = |emission: f32| ParticleLook {
+        albedo: [0.0; 3],
+        emission: [emission; 3],
+        opacity: 1.0,
+        anisotropy: 0.0,
+    };
+    let before = pixel_of(&spec, Vec3::new(0.0, 0.0, 1.4));
+    let behind = pixel_of(&spec, Vec3::new(1.5, 0.0, -1.0));
+    let full = paths(reference(1));
+    let nee = paths(debug(LightingDebugView::NeeOnly, 1));
+    let bsdf = paths(debug(LightingDebugView::BsdfOnly, 1));
+    for (back, mirror) in [(0.0, 1.0), (2000.0, 1.0), (2000.0, -1.0)] {
+        let mut bed = Bed::with(spec.clone());
+        let place = Affine3::from_scale(Vec3::new(mirror, 1.0, 1.0));
+        bed.set_sided_quads(&quad, look(1000.0), look(back), place);
+        let lit = |bed: &mut Bed, paths: &Paths, frames| {
+            let a = render_paths(bed, paths, frames, 1);
+            [a.around(before, 4), a.around(behind, 4)]
+        };
+        let by_full = lit(&mut bed, &full, 128);
+        let by_nee = lit(&mut bed, &nee, 128);
+        let by_bsdf = lit(&mut bed, &bsdf, 512);
+        assert!(by_full[0][0] > 1.0, "the floor in front: {by_full:?}");
+        assert_close("next-event in front", by_nee[0], by_full[0], 0.05);
+        assert_close("BSDF in front", by_bsdf[0], by_full[0], 0.05);
+        assert_eq!(by_nee[1], [0.0; 3], "next-event behind");
+        assert_eq!(by_bsdf[1][0] > 1.0, back > 0.0, "BSDF behind");
+        if back > 0.0 {
+            assert_close("behind", by_full[1], by_bsdf[1], 0.1);
+        }
+    }
     assert_clean();
 }

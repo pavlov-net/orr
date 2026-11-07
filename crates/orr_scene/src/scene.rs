@@ -17,7 +17,7 @@ use crate::material::{MaterialId, MaterialTable};
 use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::mount::{InstancePage, Mounts, PageId};
-use crate::producer::{self, Producer, ProducerDesc, ProducerId, ProducerUpdate};
+use crate::producer::{self, Opacity, Producer, ProducerDesc, ProducerId, ProducerUpdate};
 use crate::ptlas::Ptlas;
 use crate::shaders::instance_page::PagePrototypeGpu;
 use crate::skin::{CopyArrays, SkinFrame, SkinnedDesc};
@@ -470,9 +470,6 @@ impl Group {
 pub(crate) struct ModelCpu {
     pub(crate) sections: u32,
     pub(crate) animated_parts: u32,
-    /// The `orr_shaders.trace` candidate class its copies take; `None` where its sections mix
-    /// dielectric or presence materials with others.
-    pub(crate) candidate_class: Option<u8>,
     /// Its mesh's emissive section ranks: the emissive list entries of each copy.
     pub(crate) emissive_sections: u32,
     /// Its skeleton's joints; 0 without a skeleton.
@@ -1148,17 +1145,12 @@ impl<'f> SceneWriter<'f> {
 
     /// `desc.copies` new instance slots, and an emissive list entry per copy for each
     /// emissive section of the model. With a pose, each copy's PTLAS partition keeps room for
-    /// its part run. Copies take the candidate class of the model's own materials (a
-    /// `material_set` does not change it): dielectric or presence models are traced by
-    /// dielectric rays only and never rasterized; a model that mixes either with other
-    /// materials fails with [`Error::MixedClasses`].
+    /// its part run. Each cluster takes the class its section cooked with (a `material_set`
+    /// does not change it): dielectric and presence sections are traced by rays that look for
+    /// them and never rasterized into the visibility buffer, and one model may mix them with
+    /// opaque sections.
     pub fn add_instances(&mut self, desc: &InstancesDesc) -> Result<InstanceRange> {
         self.has_mesh(desc.model)?;
-        let candidate_class = self
-            .model_cpu
-            .get(desc.model.0 as usize)
-            .map_or(Some(0), |m| m.candidate_class)
-            .ok_or(Error::MixedClasses(desc.model))?;
         let ranks = self
             .model_cpu
             .get(desc.model.0 as usize)
@@ -1249,7 +1241,7 @@ impl<'f> SceneWriter<'f> {
                 rt_range: half::f16::from_f32(desc.rt_range).to_bits(),
                 animation_range: half::f16::from_f32(desc.animation_range).to_bits(),
                 flags: desc.flags.0 & InstanceFlags::CONSUMER,
-                candidate_class,
+                _pad: 0,
                 pose_variants: pose.variants as u16,
                 pose_stride: pose.stride as u16,
                 debug_lod: 0,
@@ -1293,14 +1285,6 @@ impl<'f> SceneWriter<'f> {
             .sum();
         let empty = ModelCpu::default();
         let model_cpu = |model: ModelId| self.model_cpu.get(model.0 as usize).unwrap_or(&empty);
-        let classes = protos
-            .iter()
-            .map(|p| {
-                model_cpu(p.model)
-                    .candidate_class
-                    .ok_or(Error::MixedClasses(p.model))
-            })
-            .collect::<Result<Vec<_>>>()?;
         // Every copy of the page takes room for the emissive sections of the most emissive
         // model.
         let stride = protos
@@ -1368,7 +1352,7 @@ impl<'f> SceneWriter<'f> {
 
         let mut copies = Vec::with_capacity(protos.len());
         let mut at_set = self.scene.desc.material_set_capacity + set_base;
-        for ((index, p), &class) in protos.iter().enumerate().zip(&classes) {
+        for (index, p) in protos.iter().enumerate() {
             let cooked_base = match &p.sets {
                 Some(set) => {
                     let values: Vec<u32> = set.iter().map(|m| m.0).collect();
@@ -1412,7 +1396,7 @@ impl<'f> SceneWriter<'f> {
                     rt_range: half::f16::from_f32(r.rt_range).to_bits(),
                     animation_range: half::f16::from_f32(r.animation_range).to_bits(),
                     flags: flags & InstanceFlags::CONSUMER,
-                    candidate_class: class,
+                    _pad: 0,
                     pose_variants: pose.map_or(0, |q| q.variants as u16),
                     pose_stride: pose.map_or(0, |q| q.stride as u16),
                     debug_lod: 0,
@@ -1761,9 +1745,6 @@ impl<'f> SceneWriter<'f> {
             .skin
             .unwrap_or_else(|| panic!("{:?} has no skinned mesh", desc.model));
         assert!(model.joints > 0, "{:?} has no skeleton", desc.model);
-        let candidate_class = model
-            .candidate_class
-            .ok_or(Error::MixedClasses(desc.model))?;
         let arrays = CopyArrays::new(self.device, desc.copies, shape.vertices, shape.clusters)?;
         let (first, entry) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
@@ -1806,7 +1787,7 @@ impl<'f> SceneWriter<'f> {
                 rt_range: half::f16::from_f32(desc.rt_range).to_bits(),
                 animation_range: 0,
                 flags: (desc.flags.0 & InstanceFlags::CONSUMER) | InstanceFlags::SKINNED,
-                candidate_class,
+                _pad: 0,
                 pose_variants: 0,
                 pose_stride: 0,
                 debug_lod: 0,
@@ -1975,11 +1956,9 @@ impl<'f> SceneWriter<'f> {
     /// tessellator dices them at rates from the scene focus, displaced through
     /// `desc.displacement`, into the clusters raster and ray tracing draw. Faces near
     /// extraordinary vertices and creases were refined to the cage's isolation level when
-    /// it cooked; each patch dices like any other. The copy takes the opacity of the cage
-    /// sections' own materials; a cage that mixes dielectric or presence materials with
-    /// others fails with [`Error::MixedClasses`]. The copy ends with its model's pack or edit,
-    /// and `id` stays the consumer's. Panics with materials for another section count, or a
-    /// palette for a cage
+    /// it cooked; each patch dices like any other. Each diced cluster takes the class and alpha
+    /// test of the material it binds. The copy ends with its model's pack or edit, and `id` stays
+    /// the consumer's. Panics with materials for another section count, or a palette for a cage
     /// without skin or a model without a skeleton.
     pub fn set_subd(&mut self, id: ProducerId, desc: Option<&SubdDesc<'_>>) -> Result<()> {
         let Some(d) = desc else {
@@ -2008,7 +1987,7 @@ impl<'f> SceneWriter<'f> {
             max_patch_vertices: cage.shape.vertices,
             displacement: d.displacement,
             displacement_reach: d.displacement_reach + cage.shape.deviation,
-            opacity: cage.opacity.expect("checked"),
+            opacity: Opacity::Sections,
             materials,
             transform: d.transform,
             origin: d.origin,

@@ -88,7 +88,8 @@ public static const uint ARGS_COVERAGE = 15;
 public static const uint ARGS_SMOKE = 18;
 public static const uint ARGS = 21;
 
-// Workgroup grids cover `n` groups in rows of GRID_X, the smallest maximum Vulkan allows.
+// Workgroup grids cover `n` groups in rows of GRID_X, the smallest maximum Vulkan allows. Every
+// row is full, so a workgroup checks `grid_index` against the count of what it reads.
 public static const uint GRID_X = 65535;
 
 public void write_grid(uint* args, uint n)
@@ -465,6 +466,7 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     i.uv[0].tap = i.uv[1].tap = i.context.tap;
     i.instance = vc.instance;
     i.material = side_material(s, vc.material, i);
+    i.swapped = i.material != vc.material;
     MaterialGpu* m = s.materials + i.material;
     i.surface = m.surface;
     i.position = hit.relative + v.eye_render.xyz;

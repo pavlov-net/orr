@@ -1,10 +1,12 @@
 // Shadow rays. One ray query over opaque geometry, particles, medium proxies and dielectric
 // and presence layers multiplies what each non-opaque candidate lets through, committing
-// none: a dielectric passes its unbent transmission and the Beer transmittance of its
-// interior over the distance the ray spends inside, a presence layer or particle 1 minus its
+// none: a dielectric passes its unbent transmission, a presence layer or particle 1 minus its
 // opacity, a medium proxy a short march of its own medium inside its box. Alpha-tested
-// candidates pass or stop the ray by the alpha test, and an opaque hit stops it. The linked
-// medium's transmittance covers the scene's medium, which proxies add to.
+// candidates pass or stop the ray by the alpha test, and an opaque hit stops it. Candidates
+// arrive in no order, so a ray keeps its dielectrics' crossings sorted by distance and walks
+// them from the interior list at its origin: each segment takes the Beer transmittance of the
+// innermost interior around it, and the walk gives the radiance scale between the two ends.
+// The linked medium's transmittance covers the scene's medium, which proxies add to.
 module shadow;
 
 import orr_shaders.abi;
@@ -15,6 +17,7 @@ import orr_lighting.openpbr;
 import orr_scene.hit;
 import orr_lighting.bsdf;
 import orr_lighting.media;
+__exported import orr_lighting.interiors;
 
 // The mask shadow rays trace.
 public static const uint SHADOW_MASK = MASK_OPAQUE | MASK_PARTICLE | MASK_MEDIUM | MASK_DIELECTRIC;
@@ -73,32 +76,20 @@ public InteriorMedium interior_medium(SceneRoot* s, uint m, float4 point = NO_ME
     return r;
 }
 
-// Textured interiors a shadow ray keeps apart; the faces of any past these sum with the last.
-public static const uint SHADOW_MEDIA = 4;
-
-// What a shadow ray's faces of one textured interior sum: the signed distance inside, and the
-// sigma of the faces it enters and leaves by, in xyz, with how many in w.
-public struct VaryingMedium
+// A shadow ray's crossing of a surface with an interior: material `material` at `t` m.
+struct ShadowCrossing
 {
-    public uint material;
-    public float reach;
-    public float4 entered;
-    public float4 left;
-
-    public float3 depth()
-    {
-        float4 sigma = entered.w > 0.0 ? entered : left;
-        return sigma.xyz * (reach / sigma.w);
-    }
+    float t;
+    uint material;
+    bool front;
+    float4 point;   // what a medium entered here reads: `material_medium`
 }
 
-// The candidates of one shadow ray from `origin` along unit `dir` to `t_max`. Dielectric
-// interiors add their optical depth to `depth` with the sign of the face crossed: minus the
-// candidate's distance times sigma at a front face, plus it at a back face, so the sum is the
-// optical depth over the ray's distance inside in any candidate order. A medium that varies by
-// its entry point has no pairing in that order: each one's faces sum its distance inside, and
-// the sigma of the faces the ray enters by, as a path along it would read, averaging at the end.
-// A ray that only leaves takes the sigma of the faces it leaves by.
+// The crossings of the shadow ray in flight. Held outside its handler, which every candidate
+// copies in and out.
+static ShadowCrossing crossings[SHADOW_CANDIDATES];
+
+// The candidates of one shadow ray from `origin` along unit `dir` to `t_max`.
 public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
 {
     public SceneRoot* scene;
@@ -107,14 +98,12 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
     public float3 dir;
     public float t_max;
     public HitContext context;
-    public float3 depth;
     public bool environment;
-    public uint varying_count;
-    public VaryingMedium varying[SHADOW_MEDIA];
+    public uint crossed;
 
     public bool positions(Candidate c)
     {
-        return c.custom_index == CLASS_DIELECTRIC;
+        return c.class_id == CLASS_DIELECTRIC;
     }
 
     [mutating]
@@ -123,7 +112,7 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
         counted = false;
         if (!c.triangle)
         {
-            if (c.custom_index != CLASS_MEDIUM)
+            if (c.class_id != CLASS_MEDIUM)
                 return float3(1.0);
             counted = true;
             return proxy(c);
@@ -131,9 +120,11 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
         if (c.cluster_id < 0)
             return float3(1.0);
         uint cluster = uint(c.cluster_id);
-        switch (c.custom_index)
+        switch (c.class_id)
         {
         case CLASS_DIELECTRIC:
+            if (!resolve_alpha<S>(scene, view, dir, c.instance_index, cluster, c.primitive_index, c.barycentrics, context))
+                return float3(1.0);
             counted = true;
             return dielectric(c);
         case CLASS_PRESENCE:
@@ -152,39 +143,69 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
         if (!sh.valid)
             return float3(1.0);
         float3 n = sh.surface.geometric_normal;
-        bool front = dot(n, dir) < 0.0;
-        uint m = interior_material(scene, sh.surface.material);
-        float reach = front ? -c.t : c.t;
-        if ((scene.materials[m].flags & (MATERIAL_MEDIUM_TEXTURED | MATERIAL_THIN_WALLED)) == MATERIAL_MEDIUM_TEXTURED)
+        if (crosses_interior(scene, sh.section) && crossed < SHADOW_CANDIDATES)
         {
-            uint k = varying_entry(m);
-            varying[k].reach += reach;
-            float4 sigma = float4(interior_medium(scene, m, sh.surface.medium_point).sigma_t, 1.0);
-            if (front)
-                varying[k].entered += sigma;
-            else
-                varying[k].left += sigma;
+            uint at = crossed;
+            for (; at > 0 && crossings[at - 1].t > c.t; at--)
+                crossings[at] = crossings[at - 1];
+            ShadowCrossing crossing = { c.t, sh.section, dot(n, dir) < 0.0, sh.surface.medium_point };
+            crossings[at] = crossing;
+            crossed++;
         }
-        else
-            depth += interior_medium(scene, m).sigma_t * reach;
         return bsdf_straight_transmission(sh.surface.bsdf, n, dir, AMBIENT_IOR, environment);
     }
 
-    // Where the faces of textured interior `m` sum.
-    [mutating]
-    uint varying_entry(uint m)
+    // The optical depth of the interiors along the ray, each segment once, walking its crossings
+    // from the list at its origin. `start` may lack interiors holding the origin: a back face
+    // the walk holds nothing for shows one, inside whatever the walk still holds there, so the
+    // first pass completes the list, reading the interior where the ray leaves it, the only point
+    // of it the ray knows. An interior a full list then drops takes the segment ending at its back
+    // face, read there. `scale` is the radiance of a light at `t_max` as the walk delivers
+    // it, over what an unbent ray gives: radiance grows with the squared IOR, and refraction
+    // shrinks the solid angle of a light seen through an interface, which is the paraxial
+    // (t_max / (n_light * sum(segment / n)))^2 and 1 for a light at infinity.
+    public float3 optical_depth(Interior start, out float scale)
     {
-        for (uint k = 0; k < varying_count; k++)
+        scale = 1.0;
+        if (crossed == 0 && start.count == 0)
+            return float3(0.0);
+        Interior inside = start;
+        Interior walked = start;
+        for (uint k = 0; k < crossed; k++)
         {
-            if (varying[k].material == m)
-                return k;
+            ShadowCrossing c = crossings[k];
+            if (c.front || walked.holds(c.material))
+                walked.cross(c.material, c.front);
+            else
+                inside.nest(c.material, walked, c.point);
         }
-        if (varying_count == SHADOW_MEDIA)
-            return SHADOW_MEDIA - 1;
-        VaryingMedium none = { m, 0.0, float4(0.0), float4(0.0) };
-        varying[varying_count] = none;
-        varying_count++;
-        return varying_count - 1;
+        float3 depth = float3(0.0);
+        float reduced = 0.0;
+        float at = 0.0;
+        float ior = AMBIENT_IOR;
+        for (uint k = 0; k <= crossed; k++)
+        {
+            bool end = k == crossed;
+            ShadowCrossing c = crossings[min(k, SHADOW_CANDIDATES - 1)];
+            bool dropped = !end && !c.front && !inside.holds(c.material);
+            uint m = dropped ? c.material : inside.innermost();
+            float length = (end ? t_max : c.t) - at;
+            float3 sigma = interior_medium(scene, m, dropped ? c.point : inside.point(m)).sigma_t;
+            ior = interior_ior(scene, m);
+            depth += select(sigma > 0.0, sigma * length, float3(0.0));
+            reduced += length / ior;
+            if (!end)
+            {
+                inside.cross(c.material, c.front, c.point);
+                at = c.t;
+            }
+        }
+        if (isfinite(t_max))
+        {
+            float s = t_max / max(ior * reduced, 1e-30);
+            scale = s * s;
+        }
+        return depth;
     }
 
     // A medium proxy is the cube [-1, 1]^3 in its instance's object space. The ray's span
@@ -232,14 +253,15 @@ struct ProxyDepth : IProxyStep
 }
 
 // What reaches `origin` from `t_max` along unit `dir` (+inf toward directional lights and the
-// environment), traced with ray flags `flags`: the product of every candidate along the
+// environment), traced with ray flags `flags` from a point inside the interiors of `inside`,
+// which need not name those the ray leaves through: the product of every candidate along the
 // segment, 0 at an opaque hit, times the linked medium's transmittance over it unless the ray
-// goes to the `environment`, whose map holds that medium. A ray past SHADOW_CANDIDATES non-opaque
-// candidates keeps the product so far and adds 1 to `overflows` (null: not counted).
-public float3 visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, uint* overflows)
+// goes to the `environment`, whose map holds that medium. A ray past SHADOW_CANDIDATES non-opaque candidates keeps the product so far and adds 1
+// to `overflows` (null: not counted).
+public float3 visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows)
 {
     float3 depth;
-    float3 product = surface_visibility<S, M>(s, v, origin, dir, t_max, flags, context, environment, overflows, depth);
+    float3 product = surface_visibility<S, M>(s, v, origin, dir, t_max, flags, context, environment, inside, overflows, depth);
     if (all(product == 0.0))
         return product;
     product *= exp(-depth);
@@ -250,9 +272,8 @@ public float3 visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants*
 
 // `visibility` without the linked medium, with the dielectric interiors' optical depth over the
 // segment left out of the product and returned in `depth`.
-public float3 surface_visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, uint* overflows, out float3 depth)
+public float3 surface_visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows, out float3 depth)
 {
-    // Field by field: an initializer list would clear `varying` on every ray.
     ShadowCandidates<S, M> h;
     h.scene = s;
     h.view = v;
@@ -260,9 +281,8 @@ public float3 surface_visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewCo
     h.dir = dir;
     h.t_max = t_max;
     h.context = context;
-    h.depth = float3(0.0);
     h.environment = environment;
-    h.varying_count = 0;
+    h.crossed = 0;
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = dir;
@@ -273,8 +293,7 @@ public float3 surface_visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewCo
     float3 product = trace_transmittance(s.tlas, ray, SHADOW_MASK, flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, h, SHADOW_CANDIDATES, overflow);
     if (overflow && overflows != nullptr)
         InterlockedAdd(*overflows, 1u);
-    for (uint k = 0; k < h.varying_count; k++)
-        h.depth += h.varying[k].depth();
-    depth = max(h.depth, 0.0);
-    return product;
+    float scale;
+    depth = h.optical_depth(inside, scale);
+    return product * scale;
 }
