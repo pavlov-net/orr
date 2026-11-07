@@ -2885,9 +2885,10 @@ fn finer_cached_cuts_build_once_wanted_lock_their_pages_and_leave_after_their_ho
     check_rows(&cached[mesh.fine_cuts as usize..]);
     let start = Instant::now();
     while built(&scenes).is_empty() {
+        let r = scenes.residency();
         assert_eq!(
-            scenes.residency().failed_cuts,
-            0,
+            (r.failed_cuts, r.out_of_memory),
+            (0, 0),
             "a finer cut failed to build"
         );
         assert!(

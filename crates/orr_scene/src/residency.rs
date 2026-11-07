@@ -89,11 +89,16 @@ pub struct ResidencyStats {
     /// in-flight limits, or waiting on a dependency still loading. Each is dropped; a unit
     /// still wanted is requested again.
     pub dropped: u32,
-    /// Units whose read or decode failed since the mount; they are not requested again.
+    /// Units whose load failed since the mount for a reason other than memory; they are not
+    /// requested again.
     pub failed: u32,
-    /// Finer cached cuts of streaming meshes whose build failed since their mount; they are
-    /// not built again.
+    /// Finer cached cuts of streaming meshes whose build failed since their mount for a reason
+    /// other than memory; they are not built again.
     pub failed_cuts: u32,
+    /// Failures for lack of memory since the start, of loads (user blobs' among them) and
+    /// finer cut builds; one failure of a whole batch counts once. Units and finer cuts are
+    /// asked for again while they are still wanted.
+    pub out_of_memory: u32,
     /// Instance page records and windows of rows that the frame wanted past the pool's budget.
     /// Copies stay hidden, or at their last pose, for as long as this holds them out.
     pub pages_over_budget: u32,
@@ -216,6 +221,8 @@ pub(crate) struct Residency {
     in_flight: (u32, u64),
     requests: FxHashMap<Key, Priority>,
     failed: u32,
+    /// A load or build ran out of memory the budgets govern since the last `react`.
+    out_of_memory: bool,
     stats: ResidencyStats,
 }
 
@@ -232,6 +239,7 @@ impl Residency {
             in_flight: (0, 0),
             requests: FxHashMap::default(),
             failed: 0,
+            out_of_memory: false,
             stats: ResidencyStats::default(),
         };
         r.refresh();
@@ -264,10 +272,18 @@ impl Residency {
         self.stats.classes[c].budget
     }
 
+    /// A load or build ran out of memory, in memory the budgets govern when `governed`:
+    /// then the next `react` shrinks them.
+    pub(crate) fn out_of_memory(&mut self, governed: bool) {
+        self.out_of_memory |= governed;
+        self.stats.out_of_memory += 1;
+    }
+
     /// Takes the share of its OS budget that device-local memory uses
-    /// (`MemoryReport::pressure`), and shrinks or grows the budgets the next plans use.
+    /// (`MemoryReport::pressure`), and shrinks or grows the budgets the next plans use. They
+    /// shrink one step, however many loads ran out of memory since the last call.
     pub(crate) fn react(&mut self, p: f64) {
-        if p > SHRINK_ABOVE {
+        if std::mem::take(&mut self.out_of_memory) || p > SHRINK_ABOVE {
             self.scale = (self.scale * SCALE_STEP).max(MIN_SCALE);
         } else if p < GROW_BELOW {
             self.scale = (self.scale / SCALE_STEP).min(1.0);
@@ -441,6 +457,11 @@ impl Residency {
     /// Whether `k` is absent, so that a request can start its load.
     pub(crate) fn absent(&self, k: Key) -> bool {
         self.unit(k).is_some_and(|u| u.state == State::Absent)
+    }
+
+    /// Whether `k` is loading.
+    pub(crate) fn loading(&self, k: Key) -> bool {
+        self.unit(k).is_some_and(|u| u.state == State::Loading)
     }
 
     /// Whether `k` is resident.
@@ -985,6 +1006,19 @@ mod tests {
         step(&mut r, &[0, 1, 2], 1);
         r.react(0.85);
         assert_eq!(class(&r).budget, 400, "between the thresholds");
+        r.out_of_memory(false);
+        r.react(0.5);
+        assert_eq!(class(&r).budget, 400, "memory the budgets don't govern");
+        r.out_of_memory(true);
+        r.out_of_memory(true);
+        r.react(0.5);
+        assert_eq!(
+            class(&r).budget,
+            380,
+            "one step for a step's failed allocations"
+        );
+        r.react(0.5);
+        assert_eq!(class(&r).budget, 400);
         for _ in 0..5 {
             r.react(0.95);
         }

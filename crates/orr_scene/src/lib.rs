@@ -222,4 +222,11 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// The device or host had no memory for the call, which may succeed once memory frees.
+    pub(crate) fn is_out_of_memory(&self) -> bool {
+        matches!(self, Error::Gpu(orr_gpu::Error::OutOfMemory { .. }))
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;

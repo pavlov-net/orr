@@ -331,6 +331,7 @@ struct ClasFree {
 }
 
 /// A bound tile to unbind and free.
+#[derive(Clone)]
 struct TileFree {
     key: Key,
     stream: Arc<TexStream>,
@@ -380,8 +381,11 @@ pub(crate) struct Streaming {
     retired_tiles: Vec<(u64, TileFree)>,
     /// Tiles the next task unbinds.
     unbinds: Vec<TileFree>,
-    /// Tiles evicted and not yet unbound by a task sent to the loading side; they do not
-    /// load again until then, so their unbind never lands after a new bind.
+    /// Unbinds of tasks whose sparse bind failed, until it is known whether the tile was
+    /// bound again.
+    carried: Vec<TileFree>,
+    /// Tiles whose unbind is queued and not yet sent to the loading side; they do not load
+    /// again until then, so their unbind never shares a sparse bind with a new one.
     unbinding: FxHashSet<Key>,
     feedback: TextureFeedback,
     /// Feedback cells freed once the frame has completed.
@@ -395,6 +399,8 @@ pub(crate) struct Streaming {
     fragmented: HashMap<(MountId, u32), u64>,
     /// Heap indices whose stream table entry the next step writes null.
     nulls: Vec<u32>,
+    /// The memory kinds on a device-local heap, whose pressure the residency budgets follow.
+    governed: Vec<MemoryKind>,
     /// Instance pages that landed (their records' address) or left (0) since the last take.
     page_events: Vec<(PageId, u64)>,
     window_events: Vec<(PageId, u32, u64)>,
@@ -458,12 +464,20 @@ impl Streaming {
             ))),
             fine: HashMap::new(),
             fine_locked: 0,
+            governed: {
+                let report = device.memory_report();
+                MemoryKind::ALL
+                    .into_iter()
+                    .filter(|&k| report.heap_of(k).device_local)
+                    .collect()
+            },
             retired_cuts: Vec::new(),
             mounts: FxHashMap::default(),
             resident: FxHashMap::default(),
             retired: Vec::new(),
             retired_tiles: Vec::new(),
             unbinds: Vec::new(),
+            carried: Vec::new(),
             unbinding: FxHashSet::default(),
             feedback: TextureFeedback::new(
                 device,
@@ -866,24 +880,22 @@ impl Streaming {
             else {
                 unreachable!("a slot has one build at a time")
             };
-            match batch.cut {
-                Ok((record, cut)) => {
-                    w.put(at, &[record])?;
-                    f.slots[slot] = FineState::Built {
-                        cut,
-                        touched: frame,
-                        locks,
-                    };
-                }
+            let (record, cut) = match batch.cut {
+                Ok(c) => c,
                 Err(e) => {
-                    log::warn!(
-                        "finer cut {} of mesh {} of {:?} failed to build: {e}",
-                        batch.slot,
-                        batch.mesh,
-                        batch.mount
-                    );
-                    f.slots[slot] = FineState::Failed;
-                    self.residency.note_failed_cut();
+                    if e.is_out_of_memory() {
+                        // The slot stays empty, so a copy that still wants it asks again.
+                        self.residency.out_of_memory(governs(&self.governed, &e));
+                    } else {
+                        log::warn!(
+                            "finer cut {} of mesh {} of {:?} failed to build: {e}",
+                            batch.slot,
+                            batch.mesh,
+                            batch.mount
+                        );
+                        f.slots[slot] = FineState::Failed;
+                        self.residency.note_failed_cut();
+                    }
                     let m = &self.mounts[&batch.mount];
                     for &p in &locks {
                         let unit = m.mesh_pages[batch.mesh as usize][p as usize];
@@ -893,8 +905,15 @@ impl Streaming {
                         });
                     }
                     self.fine_locked -= f.init.stream.pages_bytes(&locks);
+                    continue;
                 }
-            }
+            };
+            w.put(at, &[record])?;
+            f.slots[slot] = FineState::Built {
+                cut,
+                touched: frame,
+                locks,
+            };
         }
         let budget = self
             .residency
@@ -1105,6 +1124,14 @@ impl Streaming {
         let mut points = Vec::new();
         for mut batch in loading.take_streams(w.device) {
             points.extend(batch.points);
+            self.carried.append(&mut batch.unbinds);
+            match batch.error {
+                Some(e) if e.is_out_of_memory() => {
+                    self.residency.out_of_memory(governs(&self.governed, &e));
+                }
+                Some(e) => log::warn!("a stream task's GPU work failed: {e}"),
+                None => {}
+            }
             let mut staging = self.staging.lock().unwrap();
             if let Some(d) = batch.decode {
                 d.fail_pages(&mut batch.loads);
@@ -1117,11 +1144,33 @@ impl Streaming {
             }
             drop(staging);
             let clas = match batch.clas {
-                Some(c) => self.replay(c),
+                Some(mut c) => {
+                    if let Some(e) = c.take_out_of_memory() {
+                        self.residency.out_of_memory(governs(&self.governed, &e));
+                    }
+                    self.replay(c)
+                }
                 None => Vec::new(),
             };
+            self.note_failures(&batch.loads);
             for l in batch.loads {
                 self.landed(l, &clas, frame, w)?;
+            }
+        }
+        // A carried unbind's key left `unbinding` when its failed task was sent, so a later
+        // task may have loaded the tile again, binding it over the old slot, or a later
+        // eviction may have queued its own unbind: then only the slot returns. While such a
+        // load is in flight its bind decides.
+        for u in std::mem::take(&mut self.carried) {
+            let live = self.mounts.contains_key(&u.key.mount);
+            if live && self.residency.loading(u.key) {
+                self.carried.push(u);
+            } else if (live && self.residency.resident(u.key)) || self.unbinding.contains(&u.key) {
+                self.tiles.lock().unwrap().free(u.slot);
+            } else {
+                // A load of the tile waits for the task that unbinds it, as after an eviction.
+                self.unbinding.insert(u.key);
+                self.unbinds.push(u);
             }
         }
         let slot = (frame % u64::from(self.fif)) as usize;
@@ -1384,6 +1433,55 @@ impl Streaming {
         placed
     }
 
+    /// Tells the residency manager how the load of `key` ended: resident, released to load
+    /// again once memory frees, or failed. False when it isn't resident or its mount is gone.
+    fn unit_landed(&mut self, key: Key, result: &Result<(), Arc<Error>>, frame: u64) -> bool {
+        match result {
+            Ok(()) => self.residency.landed(key, true, frame),
+            Err(_) if !self.mounts.contains_key(&key.mount) => false,
+            Err(e) if e.is_out_of_memory() => {
+                self.residency.retry(key);
+                false
+            }
+            Err(_) => self.residency.landed(key, false, frame),
+        }
+    }
+
+    /// Reports each failure among a landed batch's loads once, however many loads share it:
+    /// one for lack of memory to the residency manager, another of units of live mounts as
+    /// a warning. A user blob's failure is its consumer's to report.
+    fn note_failures(&mut self, loads: &[Landed]) {
+        let mut failures: Vec<(&Arc<Error>, Vec<Key>)> = Vec::new();
+        for l in loads {
+            let Err(e) = &l.result else { continue };
+            let i = match failures.iter().position(|(f, _)| Arc::ptr_eq(f, e)) {
+                Some(i) => i,
+                None => {
+                    failures.push((e, Vec::new()));
+                    failures.len() - 1
+                }
+            };
+            if let What::Unit(k) = l.what
+                && self.mounts.contains_key(&k.mount)
+            {
+                failures[i].1.push(k);
+            }
+        }
+        for (e, units) in failures {
+            if e.is_out_of_memory() {
+                self.residency.out_of_memory(governs(&self.governed, e));
+            } else if let [k] = units[..] {
+                log::warn!("{k:?} failed to load: {e}");
+            } else if !units.is_empty() {
+                log::warn!(
+                    "{} units failed to load, {:?} first: {e}",
+                    units.len(),
+                    units[0]
+                );
+            }
+        }
+    }
+
     fn landed(
         &mut self,
         mut l: Landed,
@@ -1397,7 +1495,7 @@ impl Streaming {
         }
         match l.what {
             What::Unit(key) => {
-                let live = self.residency.landed(key, ok, frame);
+                let live = self.unit_landed(key, &l.result, frame);
                 match (live && ok, l.placed.take()) {
                     (true, Some(Placed::Pool(slot, target))) => {
                         self.point_target(target, l.gpu, w)?;
@@ -1414,6 +1512,7 @@ impl Streaming {
                     (_, Some(Placed::MeshPage(_))) => unreachable!("mesh pages land apart"),
                     (_, Some(Placed::Tile(slot))) => {
                         let (stream, tile) = l.tile.expect("a tile load names its tile");
+                        self.unbinding.insert(key);
                         self.unbinds.push(TileFree {
                             key,
                             stream,
@@ -1474,13 +1573,11 @@ impl Streaming {
             .filter(|&(u, _)| u != NO_UNIT)
             .collect();
         let placed = l.result.is_ok() && units.iter().all(|&(u, _)| u != NO_UNIT);
-        let live = if !self.mounts.contains_key(&key.mount) {
-            false
-        } else if l.result.is_ok() && !placed {
+        let live = if l.result.is_ok() && !placed && self.mounts.contains_key(&key.mount) {
             self.residency.retry(key);
             false
         } else {
-            self.residency.landed(key, l.result.is_ok(), frame)
+            self.unit_landed(key, &l.result, frame)
         };
         if !(live && placed) {
             self.free_now(p);
@@ -1688,6 +1785,11 @@ pub(crate) struct StreamBatch {
     loads: Vec<Landed>,
     clas: Option<PoolBatch>,
     decode: Option<PageDecodes>,
+    /// The task's unbinds when its sparse bind failed, for the next task.
+    unbinds: Vec<TileFree>,
+    /// A failure of the task's GPU work that no load carries: unbinds or the CLAS pool's
+    /// own work.
+    error: Option<Error>,
 }
 
 /// A batch's mesh page decode: the page records, the status word of each page and the
@@ -1700,21 +1802,24 @@ struct PageDecodes {
 }
 
 impl PageDecodes {
-    /// Fails the landed mesh pages whose decode set a status bit.
+    /// Fails the landed mesh pages whose decode set a status bit, all with one error.
     fn fail_pages(&self, loads: &mut [Landed]) {
         let mut status = vec![0u32; self.count as usize];
         let ok = self
             .block
             .read_mapped(self.status_at, bytemuck::cast_slice_mut(&mut status));
         assert!(ok, "the decode status is mapped");
+        let mut error: Option<Arc<Error>> = None;
         for l in loads {
             let failed = l
                 .mesh
                 .as_ref()
                 .is_some_and(|m| status[m.decode as usize] != 0);
             if failed && l.result.is_ok() {
-                let e = orr_pack::Error::Malformed("streamed mesh page streams");
-                l.result = Err(Arc::new(e.into()));
+                let e = error.get_or_insert_with(|| {
+                    Arc::new(orr_pack::Error::Malformed("streamed mesh page streams").into())
+                });
+                l.result = Err(Arc::clone(e));
             }
         }
     }
@@ -2027,14 +2132,32 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<StreamTask>)
     let mut loads = std::mem::take(&mut *task.done.lock().unwrap());
     let copies = std::mem::take(&mut *task.copies.lock().unwrap());
     let mut decode = None;
-    let (points, clas) = match submit(device, task, &mut loads, &copies, &mut decode) {
-        Ok(p) => p,
+    let mut points = Vec::new();
+    let mut unbound = false;
+    let mut error = None;
+    let clas = match submit(
+        device,
+        task,
+        &loads,
+        &copies,
+        &mut decode,
+        &mut points,
+        &mut unbound,
+    ) {
+        Ok(()) => match &task.clas {
+            Some(pool) => match build_clas(device, task, pool, &mut loads, &mut points) {
+                Ok(c) => c,
+                // The other loads' work is submitted; only the pages it builds need it.
+                Err(e) => {
+                    error = fail_loads(&mut loads, e, |l| l.mesh.is_some());
+                    None
+                }
+            },
+            None => None,
+        },
         Err(e) => {
-            let e = Arc::new(e);
-            for l in &mut loads {
-                l.result = Err(Arc::clone(&e));
-            }
-            (Vec::new(), None)
+            error = fail_loads(&mut loads, e, |_| true);
+            None
         }
     };
     loading.push_stream(StreamBatch {
@@ -2042,20 +2165,57 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<StreamTask>)
         loads,
         clas,
         decode,
+        unbinds: if unbound {
+            Vec::new()
+        } else {
+            task.unbinds.clone()
+        },
+        error,
     });
 }
 
-/// Submits a task's GPU work. `decode` takes the mesh page decode as soon as it is
-/// submitted, so its slot returns whatever fails after it.
+/// Whether `e` ran out of memory the residency budgets follow: of a kind in `governed`, on a
+/// device-local heap, or device memory of no named kind.
+fn governs(governed: &[MemoryKind], e: &Error) -> bool {
+    match e {
+        Error::Gpu(orr_gpu::Error::OutOfMemory { device, kind, .. }) => {
+            kind.map_or(*device, |k| governed.contains(&k))
+        }
+        _ => false,
+    }
+}
+
+/// Fails with `e` each load still on course that `which` picks; one that failed on its own
+/// keeps its error. Returns `e` when it picks none.
+fn fail_loads(loads: &mut [Landed], e: Error, which: impl Fn(&Landed) -> bool) -> Option<Error> {
+    let mut failing = loads
+        .iter_mut()
+        .filter(|l| l.result.is_ok() && which(l))
+        .peekable();
+    if failing.peek().is_none() {
+        return Some(e);
+    }
+    let e = Arc::new(e);
+    for l in failing {
+        l.result = Err(Arc::clone(&e));
+    }
+    None
+}
+
+/// Submits a task's GPU work up to its CLAS build. `decode` takes the mesh page decode and
+/// `points` each submission's point as soon as it is submitted, so the batch frees nothing
+/// the work submitted before a failure still uses; `unbound` is set once the task's
+/// unbinds are queued.
 fn submit(
     device: &Device,
     task: &StreamTask,
-    loads: &mut [Landed],
+    loads: &[Landed],
     copies: &[Copy],
     decode: &mut Option<PageDecodes>,
-) -> Result<(Vec<TimelinePoint>, Option<PoolBatch>)> {
-    let mut points = Vec::new();
-    *decode = decode_pages(device, task, &mut points)?;
+    points: &mut Vec<TimelinePoint>,
+    unbound: &mut bool,
+) -> Result<()> {
+    *decode = decode_pages(device, task, points)?;
     let bound: Vec<(&Arc<TexStream>, u32, PoolSlot, u64)> = loads
         .iter()
         .filter(|l| l.result.is_ok())
@@ -2095,6 +2255,7 @@ fn submit(
         }
         points.push(device.bind_sparse(&binds)?);
     }
+    *unbound = true;
     for u in &task.unbinds {
         tiles.free(u.slot);
     }
@@ -2114,7 +2275,7 @@ fn submit(
                 s.layout.tile_extent[0],
             );
         }
-        points.push(queue.submit(vec![list], &points)?);
+        points.push(queue.submit(vec![list], points)?);
     }
     if !copies.is_empty() {
         let queue = first_queue(
@@ -2134,11 +2295,7 @@ fn submit(
         }
         points.push(queue.submit(vec![list], &[])?);
     }
-    let clas = match &task.clas {
-        Some(pool) => build_clas(device, task, pool, loads, &mut points)?,
-        None => None,
-    };
-    Ok((points, clas))
+    Ok(())
 }
 
 /// Builds the CLAS of a batch's streamed mesh pages on the loading queue after its other
@@ -2193,7 +2350,13 @@ fn build_clas(
     drop(builds);
     let mut wait = points.clone();
     wait.extend(out.bind);
-    points.push(queue.submit(vec![list], &wait)?);
+    match queue.submit(vec![list], &wait) {
+        Ok(p) => points.push(p),
+        Err(e) => {
+            out.abandon(&mut pool, &task.staging);
+            return Err(e.into());
+        }
+    }
     for ((&i, slots), micromap) in pages.iter().zip(out.slots).zip(out.micromaps) {
         let m = loads[i].mesh.as_mut().expect("decoded");
         m.slots = slots;
@@ -2234,13 +2397,21 @@ fn decode_pages(
     let clusters = pages.iter().map(|&(_, c)| c).max().unwrap_or(0);
     let rows = n as u32;
     let queue = first_queue(device, &[QueueKind::Loading, QueueKind::Render]);
-    let mut list = queue.command_list()?;
-    let k = &task.accel.kernels;
-    let root = address::<PageDecodeRoot>(block.gpu() + root_at);
-    list.dispatch(&k.page_copy, root, [dwords.div_ceil(256), rows, 1]);
-    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-    list.dispatch(&k.page_decode, root, [clusters.max(1), rows, 1]);
-    points.push(queue.submit(vec![list], &[])?);
+    let submitted = queue.command_list().and_then(|mut list| {
+        let k = &task.accel.kernels;
+        let root = address::<PageDecodeRoot>(block.gpu() + root_at);
+        list.dispatch(&k.page_copy, root, [dwords.div_ceil(256), rows, 1]);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(&k.page_decode, root, [clusters.max(1), rows, 1]);
+        queue.submit(vec![list], &[])
+    });
+    match submitted {
+        Ok(p) => points.push(p),
+        Err(e) => {
+            task.staging.lock().unwrap().free(slot);
+            return Err(e.into());
+        }
+    }
     Ok(Some(PageDecodes {
         slot,
         block,

@@ -56,13 +56,15 @@ enum PageState {
 }
 
 /// What one batch does to the pool before its allocations, replayed once it has landed.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PoolOps {
     init: bool,
     bound: Vec<u32>,
     frees: Vec<(u32, u32)>,
     takes: Vec<u32>,
     estimate: u64,
+    /// The pool grew by fewer pages than the estimate needs for lack of memory.
+    out_of_memory: Option<crate::Error>,
 }
 
 pub(crate) struct ClasPool {
@@ -82,6 +84,8 @@ pub(crate) struct ClasPool {
     frees: Vec<(u32, u32)>,
     takes: Vec<u32>,
     unbinds: Vec<u32>,
+    /// Pages bound by a batch that was abandoned, which the next batch hands the kernel.
+    unreported: Vec<u32>,
     bits: Allocation<u32>,
     summary: Allocation<[u32; 2]>,
     initialized: bool,
@@ -121,6 +125,7 @@ impl ClasPool {
             frees: Vec::new(),
             takes: Vec::new(),
             unbinds: Vec::new(),
+            unreported: Vec::new(),
             initialized: false,
             scratch: None,
             micromaps: Pool::new(dl, 256, block, "streamed micromaps"),
@@ -147,47 +152,105 @@ impl ClasPool {
         }
     }
 
-    /// Whether a batch should run for the pool alone: frees, takes or unbinds wait.
+    /// Whether a batch should run for the pool alone: frees, takes, unbinds or unreported
+    /// pages wait.
     pub(crate) fn pending(&self) -> bool {
-        !self.frees.is_empty() || !self.takes.is_empty() || !self.unbinds.is_empty()
+        !self.frees.is_empty()
+            || !self.takes.is_empty()
+            || !self.unbinds.is_empty()
+            || !self.unreported.is_empty()
     }
 
     /// Starts a batch whose builds are taken to need `estimate` units: unbinds the pages
     /// taken earlier, binds pages until the estimate fits, and hands out the frees and takes
-    /// queued since the last batch. Returns the bind's point, if it binds anything.
+    /// queued since the last batch. Returns the bind's point, if it binds anything. On an
+    /// error the pool is as it was.
     fn begin(
         &mut self,
         device: &Device,
         estimate: u64,
     ) -> Result<(PoolOps, Option<TimelinePoint>)> {
         let n = self.page_units;
-        let mut ops = PoolOps {
+        let frees: i64 = self.frees.iter().map(|&(_, c)| i64::from(c)).sum();
+        let mut room = self.room + frees - i64::from(n) * self.takes.len() as i64 - estimate as i64;
+        let mut slots: Vec<(u32, PoolSlot)> = Vec::new();
+        let mut unbound = (0..self.pages.len()).filter(|&p| self.pages[p].0 == PageState::Unbound);
+        let mut previous = None;
+        let mut grown = Ok(());
+        let mut out_of_memory = None;
+        // Short of pages or of memory for them, the batch goes on with what it got: its
+        // unbinds and frees give memory back, and builds that find no room retry.
+        while room < 0 {
+            let Some(page) = unbound.next() else {
+                break;
+            };
+            match self.backing.alloc(device, self.range.page_size, previous) {
+                Ok((slot, _)) => {
+                    previous = Some(slot);
+                    room += i64::from(n);
+                    slots.push((page as u32, slot));
+                }
+                Err(e) if e.is_out_of_memory() => {
+                    out_of_memory = Some(e);
+                    break;
+                }
+                Err(e) => {
+                    grown = Err(e);
+                    break;
+                }
+            }
+        }
+        let point = match grown.and_then(|()| self.bind(device, &slots)) {
+            Ok(p) => p,
+            Err(e) => {
+                for (_, slot) in slots {
+                    self.backing.free(slot);
+                }
+                return Err(e);
+            }
+        };
+        for p in std::mem::take(&mut self.unbinds) {
+            let (_, slot) =
+                std::mem::replace(&mut self.pages[p as usize], (PageState::Unbound, None));
+            if let Some(slot) = slot {
+                self.backing.free(slot);
+            }
+        }
+        let mut bound = std::mem::take(&mut self.unreported);
+        for &(page, slot) in &slots {
+            self.pages[page as usize] = (PageState::Bound, Some(slot));
+            self.used[page as usize] = 0;
+            bound.push(page);
+        }
+        self.room = room;
+        let ops = PoolOps {
             init: !self.initialized,
+            bound,
             frees: std::mem::take(&mut self.frees),
             takes: std::mem::take(&mut self.takes),
             estimate,
-            ..PoolOps::default()
+            out_of_memory,
         };
         self.initialized = true;
-        self.room += ops.frees.iter().map(|&(_, c)| i64::from(c)).sum::<i64>();
-        self.room -= i64::from(n) * ops.takes.len() as i64 + estimate as i64;
-        let unbinds = std::mem::take(&mut self.unbinds);
-        let mut slots: Vec<(u32, PoolSlot)> = Vec::new();
-        let mut previous = None;
-        while self.room < 0 {
-            let Some(page) = self.pages.iter().position(|p| p.0 == PageState::Unbound) else {
-                break;
-            };
-            let (slot, _) = self.backing.alloc(device, self.range.page_size, previous)?;
-            previous = Some(slot);
-            self.pages[page] = (PageState::Bound, Some(slot));
-            self.used[page] = 0;
-            self.room += i64::from(n);
-            slots.push((page as u32, slot));
-            ops.bound.push(page as u32);
-        }
+        Ok((ops, point))
+    }
+
+    /// Takes back a batch `begin` started that was never submitted: its frees and takes go
+    /// to the next batch, as do the pages it bound, and its estimate returns to the room.
+    fn abandon(&mut self, ops: PoolOps) {
+        let n = self.page_units;
+        let frees: i64 = ops.frees.iter().map(|&(_, c)| i64::from(c)).sum();
+        self.room += i64::from(n) * ops.takes.len() as i64 + ops.estimate as i64 - frees;
+        self.initialized &= !ops.init;
+        self.unreported.splice(0..0, ops.bound);
+        self.frees.splice(0..0, ops.frees);
+        self.takes.splice(0..0, ops.takes);
+    }
+
+    /// Unbinds the pages taken earlier and binds `slots`' pages to their slots.
+    fn bind(&self, device: &Device, slots: &[(u32, PoolSlot)]) -> Result<Option<TimelinePoint>> {
         let mut runs: Vec<PageBind<'_>> = Vec::new();
-        for &p in &unbinds {
+        for &p in &self.unbinds {
             match runs.last_mut() {
                 Some(r) if r.memory.is_none() && r.first_page + r.count == u64::from(p) => {
                     r.count += 1;
@@ -199,7 +262,7 @@ impl ClasPool {
                 }),
             }
         }
-        for &(page, slot) in &slots {
+        for &(page, slot) in slots {
             let (memory, offset) = self.backing.memory(slot);
             let extends = runs.last().is_some_and(|r| {
                 r.first_page + r.count == u64::from(page)
@@ -217,22 +280,12 @@ impl ClasPool {
                 });
             }
         }
-        let point = if runs.is_empty() {
-            None
-        } else {
-            let mut binds = SparseBinds::new();
-            binds.pages(&self.range, &runs)?;
-            Some(device.bind_sparse(&binds)?)
-        };
-        drop(runs);
-        for p in unbinds {
-            let (_, slot) =
-                std::mem::replace(&mut self.pages[p as usize], (PageState::Unbound, None));
-            if let Some(slot) = slot {
-                self.backing.free(slot);
-            }
+        if runs.is_empty() {
+            return Ok(None);
         }
-        Ok((ops, point))
+        let mut binds = SparseBinds::new();
+        binds.pages(&self.range, &runs)?;
+        Ok(Some(device.bind_sparse(&binds)?))
     }
 
     /// Records the `allocate` kernel over the built CLAS, then their moves. `up` takes the
@@ -486,6 +539,13 @@ pub(crate) struct PoolBatch {
     results: (PoolSlot, Block),
 }
 
+impl PoolBatch {
+    /// Takes the error of the pool's growth when it ran out of memory.
+    pub(crate) fn take_out_of_memory(&mut self) -> Option<crate::Error> {
+        self.ops.out_of_memory.take()
+    }
+}
+
 /// What a streamed build keeps until its batch lands.
 pub(crate) struct BuildOut {
     pub(crate) batch: PoolBatch,
@@ -495,6 +555,37 @@ pub(crate) struct BuildOut {
     pub(crate) slots: Vec<Vec<u32>>,
     /// The bind of the pages it grew the pool by.
     pub(crate) bind: Option<TimelinePoint>,
+}
+
+impl BuildOut {
+    /// Gives back a build whose list was never submitted: the pool takes its batch back,
+    /// and its micromaps and staging return.
+    pub(crate) fn abandon(self, pool: &mut ClasPool, staging: &Mutex<Pool>) {
+        let PoolBatch {
+            ops,
+            upload,
+            results,
+            ..
+        } = self.batch;
+        pool.abandon(ops);
+        give_back(pool, &self.micromaps, staging, [upload, results.0]);
+    }
+}
+
+/// Returns the micromaps' storage and the staging slots of a build that never ran.
+fn give_back(
+    pool: &mut ClasPool,
+    micromaps: &[Option<(Micromap, PoolSlot)>],
+    staging: &Mutex<Pool>,
+    held: [PoolSlot; 2],
+) {
+    for (_, slot) in micromaps.iter().flatten() {
+        pool.micromaps.free(*slot);
+    }
+    let mut staging = staging.lock().unwrap();
+    for slot in held {
+        staging.free(slot);
+    }
 }
 
 /// Records on `list` the micromaps and CLAS of `pages`, at most `clas_triangles` triangles
@@ -508,7 +599,7 @@ pub(crate) fn build_pages(
     list: &mut CommandList<'_>,
     pages: &[PageBuild<'_>],
     clas_triangles: u32,
-    staging: &Mutex<Pool>,
+    staging_pool: &Mutex<Pool>,
 ) -> Result<BuildOut> {
     let caps = device.caps();
     let omm = caps.omm && caps.cluster.omm_in_clusters;
@@ -556,7 +647,7 @@ pub(crate) fn build_pages(
         + size_of::<PoolRoot>() as u64
         + 128;
     let results_bytes = 8 * n + 4 * pool.takes.len() as u64 + 64;
-    let mut staging = staging.lock().unwrap();
+    let mut staging = staging_pool.lock().unwrap();
     let (upload_slot, upload) = staging.alloc(device, upload_bytes, None)?;
     let results = match staging.alloc(device, results_bytes, None) {
         Ok(r) => r,
@@ -567,16 +658,12 @@ pub(crate) fn build_pages(
     };
     drop(staging);
 
-    let estimate: u64 = pages
-        .iter()
-        .flat_map(|p| p.clusters)
-        .map(|c| estimate(c.tri_count))
-        .sum();
-    let estimate = (estimate as f64 * pool.scale).ceil() as u64;
-    let (ops, bind) = pool.begin(device, estimate)?;
-
     // A micromap per page with a micromap region, its storage living with the page.
-    let mut micromaps = Vec::with_capacity(pages.len());
+    let mut micromaps: Vec<Option<(Micromap, PoolSlot)>> = Vec::with_capacity(pages.len());
+    // What a failure before `begin` gives back.
+    let release = |pool: &mut ClasPool, micromaps: &[Option<(Micromap, PoolSlot)>]| {
+        give_back(pool, micromaps, staging_pool, [upload_slot, results.0]);
+    };
     let mut micromap_builds = Vec::new();
     for (pi, p) in pages.iter().enumerate() {
         let Some(region) = p.micromap.filter(|_| has_micromap(p)) else {
@@ -596,9 +683,22 @@ pub(crate) fn build_pages(
             .collect();
         let at = GpuAddress(p.page + u64::from(region.offset));
         let sizes = device.micromap_sizes(&micromap_desc(&usage, at));
-        let (slot, _) = pool.micromaps.alloc(device, sizes.result_max, None)?;
+        let slot = match pool.micromaps.alloc(device, sizes.result_max, None) {
+            Ok((slot, _)) => slot,
+            Err(e) => {
+                release(pool, &micromaps);
+                return Err(e);
+            }
+        };
         let (block, offset) = pool.micromaps.memory(slot);
-        let micromap = device.create_micromap(sizes.result_max, block, offset)?;
+        let micromap = match device.create_micromap(sizes.result_max, block, offset) {
+            Ok(m) => m,
+            Err(e) => {
+                pool.micromaps.free(slot);
+                release(pool, &micromaps);
+                return Err(e.into());
+            }
+        };
         micromap_builds.push((pi, usage, at, sizes.scratch));
         micromaps.push(Some((micromap, slot)));
     }
@@ -656,7 +756,26 @@ pub(crate) fn build_pages(
             .rtas_sizes(&move_desc(n as u32, implicit_bytes))
             .scratch,
     );
-    let base = pool.scratch(device, size)?;
+    let base = match pool.scratch(device, size) {
+        Ok(b) => b,
+        Err(e) => {
+            release(pool, &micromaps);
+            return Err(e);
+        }
+    };
+    let estimate: u64 = pages
+        .iter()
+        .flat_map(|p| p.clusters)
+        .map(|c| estimate(c.tri_count))
+        .sum();
+    let estimate = (estimate as f64 * pool.scale).ceil() as u64;
+    let (ops, bind) = match pool.begin(device, estimate) {
+        Ok(b) => b,
+        Err(e) => {
+            release(pool, &micromaps);
+            return Err(e);
+        }
+    };
 
     list.barrier(Stages::ALL, Stages::ALL, Hazards::ACCEL_STRUCT);
     for ((pi, usage, at, _), &s) in micromap_builds.iter().zip(&micromap_scratch) {
