@@ -176,7 +176,8 @@ pub(crate) struct CutBatch {
     mesh: u32,
     slot: u32,
     point: Option<TimelinePoint>,
-    cut: Result<FineCut>,
+    /// Its table record and memory.
+    cut: Result<(RtCutGpu, FineCut)>,
 }
 
 impl CutBatch {
@@ -197,7 +198,7 @@ pub(crate) fn build_cut(loading: &Loading, device: &Device, t: CutTask) {
         &t.clas,
     );
     let (cut, point) = match built {
-        Ok((c, p)) => (Ok(c), Some(p)),
+        Ok((r, c, p)) => (Ok((r, c)), Some(p)),
         Err(e) => (Err(e), None),
     };
     loading.push_cut(CutBatch {
@@ -858,8 +859,8 @@ impl Streaming {
                 unreachable!("a slot has one build at a time")
             };
             match batch.cut {
-                Ok(cut) => {
-                    w.put(at, &[cut.record])?;
+                Ok((record, cut)) => {
+                    w.put(at, &[record])?;
                     f.slots[slot] = FineState::Built {
                         cut,
                         touched: frame,

@@ -1064,17 +1064,15 @@ impl BlasJobs {
     }
 }
 
-/// A finer cached cut of a streaming mesh, built after its pages landed.
+/// The memory of a finer cached cut of a streaming mesh: its BLAS and the table of its
+/// parts' BLAS.
 pub(crate) struct FineCut {
-    /// Its table record.
-    pub(crate) record: RtCutGpu,
-    /// Its BLAS and the table of its parts' BLAS.
     _blocks: Vec<Allocation<u8>>,
     _parts: Option<Allocation<u64>>,
 }
 
-/// Builds the BLAS of a finer cut over `clusters` on the loading queue. Returns its record
-/// and the point the build signals.
+/// Builds the BLAS of a finer cut over `clusters` on the loading queue. Returns its table
+/// record, its memory and the point the build signals.
 pub(crate) fn build_fine_cut(
     device: &Device,
     k: &AccelKernels,
@@ -1083,7 +1081,7 @@ pub(crate) fn build_fine_cut(
     infos: &[ClusterInfo],
     animated: Animated,
     clas: &[u64],
-) -> Result<(FineCut, TimelinePoint)> {
+) -> Result<(RtCutGpu, FineCut, TimelinePoint)> {
     let mut step = Step::new(device, build_queue(device), None)?;
     let error = clusters
         .iter()
@@ -1126,8 +1124,8 @@ pub(crate) fn build_fine_cut(
         _pad: 0,
     };
     Ok((
+        record,
         FineCut {
-            record,
             _blocks: blocks,
             _parts: part_table,
         },
