@@ -58,8 +58,8 @@ pub struct SceneDesc {
     pub material_set_capacity: u32,
     /// Producer entries: every `ProducerId` is below it.
     pub producer_capacity: u32,
-    /// Emissive list entries for instances: one per copy per emissive section of its model's
-    /// most emissive chain step.
+    /// Emissive list entries for instances: one per copy per emissive and per caster section of
+    /// the chain step of its model that has the most of them.
     pub emissive_capacity: u32,
     /// PTLAS instances for the animated parts of copies inside their animation range, and
     /// one for each copy fading between two chain steps.
@@ -476,10 +476,11 @@ impl Group {
 pub(crate) struct ModelCpu {
     pub(crate) sections: u32,
     pub(crate) animated_parts: u32,
-    /// Its mesh's emissive section ranks.
+    /// Its mesh's emissive section ranks and then its caster section ranks, an emissive list
+    /// entry each.
     pub(crate) emissive_sections: u32,
-    /// The emissive list entries of each copy: the most emissive section ranks of its mesh
-    /// and of its chain's.
+    /// The emissive list entries of each copy: the most of `emissive_sections` of its mesh and
+    /// of its chain's.
     pub(crate) emissive_stride: u32,
     /// Its skeleton's joints; 0 without a skeleton.
     pub(crate) joints: u32,

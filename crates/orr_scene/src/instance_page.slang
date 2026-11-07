@@ -9,7 +9,7 @@ import orr_scene.tables;
 public struct PagePrototypeGpu
 {
     public InstanceGpu instance;   // `first_emissive` is the slot's own
-    public uint emissive_count;    // the emissive section ranks of its model
+    public uint emissive_count;    // the emissive and caster section ranks of its model
     public uint3 _pad;
 }
 

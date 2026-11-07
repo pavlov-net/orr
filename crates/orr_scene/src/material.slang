@@ -43,6 +43,10 @@ public static const uint MATERIAL_OBJECT_COAT_NORMAL = 1 << 26;
 public static const uint MATERIAL_DISPLACEMENT_WORLD = 1 << 27;
 // `MaterialGpu.back` is the material of the surface's back.
 public static const uint MATERIAL_HAS_BACK = 1 << 28;
+// Light leaves the surface as a caustic where its roughness falls below CHAIN_ROUGHNESS.
+public static const uint MATERIAL_CASTER = 1 << 29;
+// orr_pack::material::CHAIN_ROUGHNESS: a lobe smoother than this carries light on as a caustic.
+public static const float CHAIN_ROUGHNESS = 0.1;
 // Displacement reads TEXTURE_DISPLACEMENT_U and TEXTURE_DISPLACEMENT_V too.
 public static const uint MATERIAL_DISPLACED_TANGENT = 1 << 30;
 // `material_medium` reads textures.

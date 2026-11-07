@@ -78,7 +78,8 @@ public struct InstanceGpu
     public uint user_tag;      // never read by orr
     public uint variant;       // pose u8, material set u8, section mask u16 (bit set = hidden)
     public uint first_emissive; // in SceneRoot.emissive, or NO_EMISSIVE
-    public uint emissive_count; // entries from it, one per emissive section rank of its model
+    // Entries from it: one per emissive section rank of its model, then one per caster rank.
+    public uint emissive_count;
 }
 
 // `InstanceGpu.debug_lod` holding the copy at one DAG level, in its low byte.

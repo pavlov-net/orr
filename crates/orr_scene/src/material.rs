@@ -55,6 +55,9 @@ pub mod material_flags {
     pub const DISPLACEMENT_WORLD: u32 = 1 << 27;
     /// `MaterialGpu::back` is the material of the surface's back.
     pub const HAS_BACK: u32 = 1 << 28;
+    /// Light leaves the surface as a caustic where its roughness falls below
+    /// `CHAIN_ROUGHNESS`: [`Material::casts`](orr_pack::material::Material::casts).
+    pub const CASTER: u32 = 1 << 29;
     /// Displacement reads `TEXTURE_DISPLACEMENT_U` and `TEXTURE_DISPLACEMENT_V` too.
     pub const DISPLACED_TANGENT: u32 = 1 << 30;
     /// `material_medium` reads textures.
@@ -167,6 +170,7 @@ impl MaterialGpu {
         set(dielectric, f::DIELECTRIC);
         set(presence, f::PRESENCE);
         set(m.emission_luminance > 0.0, f::EMISSIVE);
+        set(m.casts(), f::CASTER);
         set(subsurface, f::SUBSURFACE);
         set(bound(slot::DISPLACEMENT), f::DISPLACED);
         set(

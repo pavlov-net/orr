@@ -1,6 +1,6 @@
 // The power of every emissive list entry this frame: luminance x area, the area in
-// render space. Runs after the PTLAS kernels, so it sees this frame's transforms, producer
-// clusters and traced cuts.
+// render space, and for a copy's caster entry its casters' area with no power. Runs after the
+// PTLAS kernels, so it sees this frame's transforms, producer clusters and traced cuts.
 #include "orr_root.h"
 import orr_pack.mesh;
 import orr_scene.hit;
@@ -93,7 +93,8 @@ float gathered_cdf(SceneRoot* s, MeshGpu* mesh, uint entry, uint count)
 
 // One thread per instance entry: the cooked set of the row the copy traces, or the list its
 // traversal gathered for a cut built this frame, at the copy's nearer chain step, so a copy
-// outside ray tracing emits nothing. Area scales by |det|^(2/3), exact under uniform scale,
+// outside ray tracing emits and casts nothing. An entry past the mesh's emissive ranks is a
+// caster rank's, which emits nothing. Area scales by |det|^(2/3), exact under uniform scale,
 // taken at unit size since a small transform's determinant underflows first.
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
@@ -114,11 +115,14 @@ void instances(uint3 id: SV_DispatchThreadID)
     float3 power = 0.0;
     uint row;
     bool gathered;
-    if (inst.flags != 0 && e.rank < mesh.emissive.count && traced_row(s, e.source, inst, mesh, row, gathered))
+    bool caster = e.rank >= mesh.emissive.count;
+    SetTablesGpu t = caster ? mesh.casters : mesh.emissive;
+    uint rank = caster ? e.rank - mesh.emissive.count : e.rank;
+    if (inst.flags != 0 && rank < t.count && traced_row(s, e.source, inst, mesh, row, gathered))
     {
         // Every row holds a set of each rank, all of one section.
-        uint at = row * mesh.emissive.count + e.rank;
-        ClusterSet k = ((ClusterSet*)mesh.emissive.sets)[at];
+        uint at = row * t.count + rank;
+        ClusterSet k = ((ClusterSet*)t.sets)[at];
         float total = k.total;
         uint count = k.count;
         if (gathered)
@@ -135,7 +139,8 @@ void instances(uint3 id: SV_DispatchThreadID)
             float size = unit_factor(m);
             // A fading copy shows its nearer step in part.
             area = total * pow(abs(determinant(m * size)), 2.0 / 3.0) / size / size * step_presence(st, chain_near(st));
-            power = sides_emission(s, section_material(s, inst, model, k.section)) * area;
+            if (!caster)
+                power = sides_emission(s, section_material(s, inst, model, k.section)) * area;
         }
     }
     e.set = set;

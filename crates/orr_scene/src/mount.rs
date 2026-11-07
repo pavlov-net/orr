@@ -2466,9 +2466,12 @@ impl Mounts {
         let (spheres, (own, groups)) = match m.source.finest_level {
             Some(level) => (None, edit::plan_level(&m.source.pages, level)),
             None => {
-                // Emissive sets hold level 0 of the whole mesh.
+                // Emissive and caster sets hold level 0 of the whole mesh.
                 let spheres = desc.touched.filter(|t| {
-                    t.len() <= EDIT_SPHERES && m.skin.is_none() && m.gpu.emissive.count == 0
+                    t.len() <= EDIT_SPHERES
+                        && m.skin.is_none()
+                        && m.gpu.emissive.count == 0
+                        && m.gpu.casters.count == 0
                 });
                 (spheres, edit::plan(&m.source.groups, spheres))
             }
@@ -3529,8 +3532,8 @@ impl Mounts {
                     vertices: mesh.clusters.iter().map(|c| c.vertex_count).sum(),
                     clusters: mesh.gpu.cluster_count,
                 }),
-                emissive_sections: mesh.gpu.emissive.count,
-                emissive_stride: mesh.gpu.emissive.count,
+                emissive_sections: mesh.gpu.emissive.count + mesh.gpu.casters.count,
+                emissive_stride: mesh.gpu.emissive.count + mesh.gpu.casters.count,
                 cage_only: false,
                 edit: false,
             };
