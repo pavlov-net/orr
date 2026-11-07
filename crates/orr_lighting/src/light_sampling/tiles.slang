@@ -34,6 +34,8 @@ struct Root
     float* feedback_weights;
     // Shadow rays of the frame before past the candidate limit.
     uint* shadow_overflows;
+    // Reference walks of the frame before that reached their step cap.
+    uint* capped_walks;
     // This frame's slot of the statistics readback.
     LightSetStats* stats;
     // Values `cluster_cdf` holds: the producer entries' lists.
@@ -45,7 +47,6 @@ struct Root
     uint clear_feedback;
     uint _pad0;
     uint _pad1;
-    uint64_t _pad2;
 }
 ORR_ROOT(Root);
 
@@ -287,6 +288,7 @@ void select(uint lane: SV_GroupIndex)
     set.tiles = root.tiles;
     set.feedback_counts = root.feedback_counts;
     set.shadow_overflows = root.shadow_overflows;
+    set.capped_walks = root.capped_walks;
     set.candidate_count = n;
     set.candidate_total = total;
     set.environment_probability = env;
@@ -314,6 +316,8 @@ void select(uint lane: SV_GroupIndex)
     st.feedback_pixels = counts[4];
     st.shadow_overflows = root.clear_feedback != 0 ? 0 : *root.shadow_overflows;
     *root.shadow_overflows = 0;
+    st.capped_walks = root.clear_feedback != 0 ? 0 : *root.capped_walks;
+    *root.capped_walks = 0;
     *root.stats = st;
 }
 

@@ -75,7 +75,7 @@ void main(uint3 id: SV_DispatchThreadID)
     Alpha<ProbeSurface> alpha = { s, root.view, dir, context };
     RayDesc ray = path_ray(origin, dir, positive_infinity());
     uint stopped = 0;
-    if (visibility<ProbeSurface, NoMedium>(s, root.view, origin, dir, positive_infinity(), RAY_FLAG_NONE, context, false, Interior(), nullptr).x == 0.0)
+    if (visibility<ProbeSurface, NoMedium, SHADOW_PATH>(s, root.view, origin, dir, positive_infinity(), RAY_FLAG_NONE, context, false, Interior(), nullptr).x == 0.0)
         stopped |= 1;
     Counted four = { alpha, root.calls };
     if (trace_any(s.tlas, ray, MASK_OPAQUE, RAY_FLAG_NONE, four))
@@ -84,5 +84,5 @@ void main(uint3 id: SV_DispatchThreadID)
     if (trace_closest(s.tlas, ray, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, two).hit)
         stopped |= 4;
     root.stopped[id.x] = stopped;
-    root.shadow[id.x] = visibility<ProbeSurface, NoMedium>(s, root.view, origin, dir, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, context, false, Interior(), nullptr).x;
+    root.shadow[id.x] = visibility<ProbeSurface, NoMedium, SHADOW_PATH>(s, root.view, origin, dir, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, context, false, Interior(), nullptr).x;
 }

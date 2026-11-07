@@ -4,7 +4,8 @@
 //! bakes the scene's linked environment at the scene focus into an equal-area octahedral map
 //! with an importance pyramid, derives every directional light's state, builds the selection
 //! over the scene's sphere, rect and emissive lights and the environment, presamples the
-//! light tiles, writes the scene's `SkyStats`, and resolves the scene's world cache. The
+//! light tiles, weighs the caster surfaces caustic photons start from, writes the scene's
+//! `SkyStats`, and resolves the scene's world cache. The
 //! selection blends emitted power with the light feedback of the scene's views in earlier
 //! frames: each pixel of a view dispatch names one of the lights that added to its path,
 //! chosen in proportion to what each added. An emissive entry is a list of clusters with a
@@ -13,7 +14,13 @@
 //! sampling draws a cluster by its step, a triangle uniform by index and a point uniform in it,
 //! from the triangle as rays trace it, and a BSDF ray that hits an emitter reads the same
 //! density from the same triangle, so the two techniques weigh each other exactly. Sphere and
-//! rect lights stand in the ray tracing as proxies that paths' BSDF rays meet. Kernels reach
+//! rect lights stand in the ray tracing as proxies that paths' BSDF rays meet. Every path ray
+//! sees glass and bends at it; shadow rays end at solid glass and at every thin wall but an
+//! ideal window. Light from any light but the environment that reaches a surface's diffuse
+//! lobes through smooth glass or mirrors arrives as caustic photons: each frame the scene's
+//! first view traces them from its lights toward its casters into a grid that path vertices
+//! gather from ([`CausticSettings`]), and paths' BSDF rays through such a chain keep only the
+//! rest of a vertex's light. Kernels reach
 //! the result through [`SceneLighting::light_set`], [`SceneLighting::world_cache`] and the
 //! Slang modules `orr_lighting.light_sampling`, `orr_lighting.world_cache`,
 //! `orr_lighting.environment` and `orr_lighting.media` (`DEP_ORR_LIGHTING_SHADER_DIRS`).
@@ -26,8 +33,9 @@
 //! the view's rays to the scene's `near_range`, and the view's aerial-perspective LUT past it;
 //! [`LightingKernels::record_paths`] builds a local light sampler per screen tile from the
 //! view's last light feedback, finds each pixel's first dielectric or presence layer and its
-//! guide on the tiles that may hold one, traces the world cache's update paths, and traces one
-//! path per pixel from that layer or the G-buffer's surface, or per a random share of the
+//! guide on the tiles that may hold one, traces the frame's caustic photons in the scene's first
+//! view, traces the world cache's update paths, and traces one path per pixel from that layer
+//! or the G-buffer's surface, or per a random share of the
 //! surfaces with no layer in front ([`ViewLighting::pixel_fraction`]), into the view's
 //! [`LightingView`] radiance and light feedback with the settings of [`ViewLighting`];
 //! [`LightingKernels::record_media_apply`] composes
@@ -42,6 +50,7 @@
 //! first vertex on the path (see [`ViewLighting::sss_depth`]); `subsurface` holds the walk.
 
 mod bsdf;
+mod caustics;
 mod environment;
 mod media;
 pub mod openpbr;
@@ -53,6 +62,7 @@ mod view;
 mod world_cache;
 
 pub use bsdf::BsdfTables;
+pub use caustics::{CausticSettings, CausticStats, MAX_CAUSTIC_CAPACITY_LOG2, MAX_PHOTONS};
 pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
 pub use media::{
     AERIAL_SIZE, MAX_FROXEL_SHADOWED_LIGHTS, MAX_PROXY_RAYS, MediaSettings, MediaStats,

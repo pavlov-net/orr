@@ -158,6 +158,9 @@ public struct LightSetGpu
     // Shadow rays this frame past `SHADOW_CANDIDATES` non-opaque candidates; the next scene
     // pass reads and clears it.
     public uint* shadow_overflows;
+    // Reference walks this frame that reached `PathRoot.sss_max_steps`; the next scene pass
+    // reads and clears it.
+    public uint* capped_walks;
     public uint directional_count;
     public uint candidate_count;
     // The last value of `cdf`.
@@ -191,6 +194,8 @@ public struct LightSetStats
     public uint feedback_pixels;
     // Shadow rays of the frame before that met more non-opaque candidates than they multiply.
     public uint shadow_overflows;
+    // Reference walks of the frame before that reached their step cap.
+    public uint capped_walks;
 }
 
 // One slot of a local sampler: a light that fed back in its tile, or for an emissive entry a
@@ -647,7 +652,7 @@ float spot_falloff(float c, float cos_inner, float cos_outer)
 }
 
 // `x` x `total`, kept below `total`.
-float below(float x, float total)
+public float below(float x, float total)
 {
     return min(x * total, asfloat(asuint(total) - 1));
 }
@@ -720,10 +725,36 @@ public uint range_mass(EmissiveSelection e, uint first, uint count)
     return e.cdf[first + count - 1] - (first > 0 ? e.cdf[first - 1] : 0u);
 }
 
+// The position of an instance entry's list that holds mesh cluster `mesh_cluster`, or its count
+// where none does: a lower bound on a cooked set's index, a search of a gathered list.
+public uint list_position(EmissiveSelection e, uint mesh_cluster)
+{
+    if (e.index != nullptr)
+    {
+        uint lo = 0;
+        uint hi = e.count;
+        while (lo < hi)
+        {
+            uint mid = (lo + hi) / 2;
+            if (e.index[mid].x < mesh_cluster)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        return lo < e.count && e.index[lo].x == mesh_cluster ? e.index[lo].y : e.count;
+    }
+    for (uint k = 0; k < e.count; k++)
+    {
+        if (e.clusters[k] == mesh_cluster)
+            return k;
+    }
+    return e.count;
+}
+
 // The PTLAS instance and cluster id that rays meet position `p` of emissive entry `entry`
 // on, its triangle count and, on a copy, its first alpha-tested triangle. A copy's cluster on
 // an animated part of a copy holding a part run is traced by that run's part instance.
-bool list_cluster(SceneRoot* s, EmissiveSelection e, uint entry, uint p, out uint instance_index, out uint cluster_id, out uint triangles, out uint alpha_first)
+public bool list_cluster(SceneRoot* s, EmissiveSelection e, uint entry, uint p, out uint instance_index, out uint cluster_id, out uint triangles, out uint alpha_first)
 {
     instance_index = 0;
     cluster_id = 0;
@@ -912,35 +943,7 @@ public EmitterHit emitter_hit(LightSetGpu* set, uint instance_index, uint cluste
         if (rank >= inst.emissive_count)
             return h;
         entry = inst.first_emissive + rank;
-        EmissiveSelection e = set.emissive[entry];
-        uint mc = r.mesh_cluster;
-        p = e.count;
-        if (e.index != nullptr)
-        {
-            uint lo = 0;
-            uint hi = e.count;
-            while (lo < hi)
-            {
-                uint mid = (lo + hi) / 2;
-                if (e.index[mid].x < mc)
-                    lo = mid + 1;
-                else
-                    hi = mid;
-            }
-            if (lo < e.count && e.index[lo].x == mc)
-                p = e.index[lo].y;
-        }
-        else
-        {
-            for (uint k = 0; k < e.count; k++)
-            {
-                if (e.clusters[k] == mc)
-                {
-                    p = k;
-                    break;
-                }
-            }
-        }
+        p = list_position(set.emissive[entry], r.mesh_cluster);
         triangles = c.tri_count;
     }
     EmissiveSelection e = set.emissive[entry];
@@ -1197,6 +1200,40 @@ public NeeVertex nee_vertex(LightSetGpu* set, float3 position, float3 normal, ui
     return v;
 }
 
+// A directional light chosen from `pick` by weight x n.l at a vertex with shading normal
+// `normal`, whose weights there sum to `total`, and a direction in its cone from `u`; its density
+// is `probability`, the directional lights' share of the mixture, times the light's and the
+// direction's.
+ResolvedLightSample directional_candidate(LightSetGpu* set, float3 normal, float total, float probability, uint pick, float2 u)
+{
+    float target = unit_float(pick) * total;
+    uint id = NO_LIGHT;
+    float w = 0.0;
+    float sum = 0.0;
+    for (uint k = 0; k < set.directional_count; k++)
+    {
+        uint j = set.directional_ids[k];
+        float wj = directional_weight(set, j, normal);
+        if (wj > 0.0)
+        {
+            id = j;
+            w = wj;
+            if (target < sum + wj)
+                break;
+        }
+        sum += wj;
+    }
+    ResolvedLightSample r = no_candidate();
+    float cone_pdf;
+    r.dir = directional_sample(set.scene.lights[id], u, cone_pdf);
+    r.distance = positive_infinity();
+    r.radiance = disc_radiance(set, id, r.dir) * set.directional[id].transmittance;
+    r.pdf = probability * w / total * cone_pdf;
+    r.kind = LIGHT_SAMPLE_DIRECTIONAL;
+    r.light = id;
+    return r;
+}
+
 // One next-event candidate for vertex `v`: with the vertex's directional share, a directional
 // light chosen by weight x n.l and a direction in its cone; otherwise, with the local
 // sampler's share, a slot it holds and a sample of its range, or else a sample at a random
@@ -1212,34 +1249,7 @@ public ResolvedLightSample nee_candidate<S : ISurface>(LightSetGpu* set, NeeVert
     OwenSobol4 u4 = rng.next4_parts();
     float2 u = u4.xy();
     if (choice < share)
-    {
-        float target = unit_float(pick) * total;
-        uint id = NO_LIGHT;
-        float w = 0.0;
-        float sum = 0.0;
-        for (uint k = 0; k < set.directional_count; k++)
-        {
-            uint j = set.directional_ids[k];
-            float wj = directional_weight(set, j, v.normal);
-            if (wj > 0.0)
-            {
-                id = j;
-                w = wj;
-                if (target < sum + wj)
-                    break;
-            }
-            sum += wj;
-        }
-        ResolvedLightSample r = no_candidate();
-        float cone_pdf;
-        r.dir = directional_sample(set.scene.lights[id], u, cone_pdf);
-        r.distance = positive_infinity();
-        r.radiance = disc_radiance(set, id, r.dir) * set.directional[id].transmittance;
-        r.pdf = share * w / total * cone_pdf;
-        r.kind = LIGHT_SAMPLE_DIRECTIONAL;
-        r.light = id;
-        return r;
-    }
+        return directional_candidate(set, v.normal, total, share, pick, u);
     LocalLights* local = v.local;
     ResolvedLightSample r;
     if (local != nullptr && (choice - share) < local.share * (1.0 - share))
@@ -1257,6 +1267,35 @@ public ResolvedLightSample nee_candidate<S : ISurface>(LightSetGpu* set, NeeVert
             r.pdf *= light_selection(set, local, r.light, r.position) / global_selection(set, r.light);
     }
     r.pdf *= 1.0 - share;
+    return r;
+}
+
+// A light seen from `x`, from the candidate mixture of a vertex with no normal and no local
+// sampler given that the draw is not the environment: a directional light, or a sphere, rect
+// or emissive light drawn from the light set's selection itself rather than a tile. The density
+// is the candidate's in that conditioned mixture; none where the scene has no such light.
+// Draws five sampler dimensions.
+public ResolvedLightSample owned_light_candidate<S : ISurface>(LightSetGpu* set, float3 x, inout Sampler rng)
+{
+    float total;
+    float share = directional_share(set, float3(0.0), total);
+    float choice = rng.next();
+    uint pick = rng.next_bits();
+    uint2 bits = uint2(rng.next_bits(), rng.next_bits());
+    OwenSobol4 u4 = rng.next4_parts();
+    float2 u = u4.xy();
+    float tiles = set.candidate_total > 0.0 ? (1.0 - share) * (1.0 - set.environment_probability) : 0.0;
+    float owned = share + tiles;
+    if (!(owned > 0.0))
+        return no_candidate();
+    if (choice * owned < share)
+        return directional_candidate(set, float3(0.0), total, share / owned, pick, u);
+    uint id = upper_bound(set.cdf, set.candidate_count, below(unit_float(pick), set.candidate_total));
+    float selected = (set.cdf[id] - (id > 0 ? set.cdf[id - 1] : 0.0)) / set.candidate_total;
+    uint lights = set.scene.light_capacity;
+    uint count = id >= lights ? set.emissive[id - lights].count : 0;
+    ResolvedLightSample r = resolve_light_sample(set, tile_light_sample<S>(set, id, 0, count, bits, float4(u, u4.zw()), selected), x, u);
+    r.pdf *= tiles / owned;
     return r;
 }
 

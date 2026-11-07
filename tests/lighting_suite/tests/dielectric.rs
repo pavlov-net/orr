@@ -380,17 +380,20 @@ fn a_glass_sphere_in_a_furnace_keeps_its_energy() {
     assert_clean();
 }
 
-/// A scattering slab under a sun 10 degrees from the zenith, seen straight down, against
-/// the single-scattering integral of the same model: light enters the medium through the
-/// surface without bending, scatters isotropically once, and leaves through the camera's
-/// refraction, which scales radiance by 1 / n^2.
+/// A scattering slab under a wide sun disc 10 degrees from the zenith, seen straight down,
+/// against the single-scattering integral of the same model over the disc: each direction's
+/// light refracts into the medium by Fresnel, its beam narrowing to the refracted cosine,
+/// scatters isotropically once, and leaves through the camera's refraction, which scales
+/// radiance by 1 / n^2. Shadow rays end at the slab, so the light comes by the bent rays alone.
 #[test]
 fn a_scattering_slab_matches_single_scattering_within_5_percent() {
+    const RADIUS: f32 = 0.25;
     let tilt = 10f32.to_radians();
+    let axis = Vec3::new(tilt.sin(), tilt.cos(), 0.0);
     let sun = DirectionalLight {
-        direction_to_light: Vec3::new(tilt.sin(), tilt.cos(), 0.0),
+        direction_to_light: axis,
         illuminance: Vec3::splat(1000.0),
-        angular_radius: 4.65e-3,
+        angular_radius: RADIUS,
         disc: DiscProfile::Uniform,
     };
     let spec = from_above(
@@ -400,13 +403,35 @@ fn a_scattering_slab_matches_single_scattering_within_5_percent() {
     );
     let image = render_paths(&mut Bed::with(spec), &paths(reference(0)), 128);
     let (sigma_t, sigma_s) = (f64::from(MILK_SIGMA_T), f64::from(MILK_SIGMA_S));
-    let c = f64::from(tilt.cos());
-    let k = sigma_t * (1.0 + 1.0 / c);
     let depth = 1.0;
-    let enter = 1.0 - fresnel(1.5, 1.0);
-    let leave = 1.0 - fresnel(1.5, c);
+    let leave = 1.0 - fresnel(1.5, 1.0);
     let phase = 1.0 / (4.0 * std::f64::consts::PI);
-    let l = 1000.0 * enter * leave * phase * sigma_s * (1.0 - (-k * depth).exp()) / k / (1.5 * 1.5);
+    // The disc's radiance, uniform, from its illuminance on a plane facing it.
+    let r = f64::from(RADIUS);
+    let disc = 1000.0 / (std::f64::consts::PI * r.sin().powi(2));
+    let (u, v) = {
+        let a = axis.as_dvec3();
+        let u = a.cross(DVec3::Z).normalize();
+        (u, a.cross(u))
+    };
+    const STEPS: u32 = 256;
+    let mut l = 0.0;
+    let cos_r = r.cos();
+    for i in 0..STEPS {
+        for j in 0..STEPS {
+            // A uniform grid over the cap's cosine and azimuth.
+            let c = 1.0 - (1.0 - cos_r) * (f64::from(i) + 0.5) / f64::from(STEPS);
+            let phi = std::f64::consts::TAU * (f64::from(j) + 0.5) / f64::from(STEPS);
+            let s = (1.0 - c * c).sqrt();
+            let w = c * axis.as_dvec3() + s * (phi.cos() * u + phi.sin() * v);
+            let d_omega = std::f64::consts::TAU * (1.0 - cos_r) / f64::from(STEPS * STEPS);
+            let mu = w.y;
+            let mu_t = (1.0 - (1.0 - mu * mu) / (1.5 * 1.5)).sqrt();
+            let k = sigma_t * (1.0 + 1.0 / mu_t);
+            let beam = disc * d_omega * mu * (1.0 - fresnel(1.5, mu)) / mu_t;
+            l += beam * leave * phase * sigma_s * (1.0 - (-k * depth).exp()) / k / (1.5 * 1.5);
+        }
+    }
     assert_close("single scattering", center(&image, 16), [l; 3], 0.05);
     assert_clean();
 }
@@ -548,6 +573,7 @@ fn a_lens_ray_takes_the_interiors_at_the_lens_not_the_near_plane() {
                 aperture_radius: 1e-5,
                 focus_distance: 2.0,
             }),
+            ..ReferenceSettings::default()
         }),
         ..reference(2)
     };

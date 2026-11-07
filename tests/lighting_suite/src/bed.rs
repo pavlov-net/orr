@@ -257,6 +257,10 @@ pub const FURNACE_RADIANCE: [f32; 3] = [1000.0; 3];
 
 // Models of the bed's pack.
 pub const FLOOR: &str = "floor";
+/// [`FLOOR`]'s 10 m square as a diffuse surface of albedo [`WHITE_FLOOR_ALBEDO`] with no
+/// specular lobe, which takes the caustic photons' irradiance exactly.
+pub const WHITE_FLOOR: &str = "white floor";
+pub const WHITE_FLOOR_ALBEDO: f32 = 0.8;
 pub const WHITE_SPHERE: &str = "white sphere";
 /// A unit sphere with no reflection at all, so only the medium in front of it shows.
 pub const BLACK_SPHERE: &str = "black sphere";
@@ -1170,6 +1174,11 @@ fn cook() -> Arc<[u8]> {
                     FLOOR,
                     mesh(|b| b.quad(0, square(5.0, 0.0), y, 8)),
                     vec![floor],
+                ),
+                model(
+                    WHITE_FLOOR,
+                    mesh(|b| b.quad(0, square(5.0, 0.0), y, 8)),
+                    vec![diffuse([WHITE_FLOOR_ALBEDO; 3])],
                 ),
                 model(
                     WHITE_SPHERE,

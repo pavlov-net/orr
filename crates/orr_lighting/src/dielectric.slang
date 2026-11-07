@@ -64,16 +64,11 @@ public void layer_tiles_body(LayerTilesRoot r, uint2 tile)
     }
 }
 
-// Sizes the dispatches over the listed tiles: two 8 x 4 workgroups per tile for their compute
-// entries, LAYER_TILE^2 rays wide and a row per tile for a raygen entry.
+// Sizes the layer guides' dispatch over the listed tiles: two 8 x 4 workgroups per tile.
 public void layer_args_body(LayerTilesRoot r)
 {
     uint* args = layer_tile_args(r.layers, r.gbuffer.extent);
-    uint n = args[0];
-    write_grid(args + 1, 2 * n);
-    args[4] = LAYER_TILE * LAYER_TILE;
-    args[5] = n;
-    args[6] = 1;
+    write_grid(args + 1, 2 * args[0]);
 }
 
 // The refracted direction of a ray along `dir` through layer `l`, without roughness: straight

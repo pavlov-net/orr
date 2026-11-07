@@ -158,6 +158,10 @@ impl Section {
     pub const CLOSED: u8 = 8;
     /// In [`MeshHeader::casters`]: a smooth dielectric or metal.
     pub const CASTER: u8 = 16;
+    /// A dielectric with an interior, not thin-walled: rays stop at it, and its clusters
+    /// trace their triangles before `alpha_first` as opaque. The same bit as on
+    /// [`Cluster::flags`].
+    pub const SOLID: u8 = 128;
 
     pub fn class(&self) -> Option<SurfaceClass> {
         SurfaceClass::from_flags(self.flags)
@@ -359,6 +363,8 @@ impl Cluster {
     /// Where in `flags` two bits hold what the mesh's tangents here follow:
     /// [`crate::material::Material::tangent_set`] of the section's material.
     pub const TANGENT_SET_SHIFT: u8 = 3;
+    /// [`Section::SOLID`] of the cluster's section.
+    pub const SOLID: u8 = Section::SOLID;
     pub const NO_OMM: u32 = !0;
 
     pub fn class(&self) -> Option<SurfaceClass> {

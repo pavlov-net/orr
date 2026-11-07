@@ -130,6 +130,7 @@ impl Bench {
                     aperture_radius: 1e-4,
                     focus_distance: eye.distance(TARGET),
                 }),
+                ..ReferenceSettings::default()
             }),
             ..ViewLighting::default()
         };

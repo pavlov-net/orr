@@ -526,7 +526,7 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
                     float3 l = c.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, c.light, c.dir) : c.radiance;
                     float t_max = isfinite(c.distance) ? c.distance * (1.0 - 1e-4) : c.distance;
                     RayCone cone = { 0.0, 0.0 };
-                    float3 vis = visibility<S, M>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind == LIGHT_SAMPLE_ENVIRONMENT, Interior(), set.shadow_overflows);
+                    float3 vis = visibility<S, M, SHADOW_UNBENT>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind == LIGHT_SAMPLE_ENVIRONMENT, Interior(), set.shadow_overflows);
                     if (c.view && any(vis > 0.0))
                         vis *= emitter_view_layer<S>(set, c, AMBIENT_IOR);
                     source += scatter * l * vis / c.pdf;

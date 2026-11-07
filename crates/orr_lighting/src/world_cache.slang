@@ -197,14 +197,15 @@ public uint cache_check(uint64_t key)
     return max(pcg(uint(key >> 32) ^ pcg(uint(key) ^ 0x68E31DA4)), 1u);
 }
 
-public bool cache_find(WorldCacheGpu* c, uint64_t key, out uint slot)
+// The slot of a table of `mask` + 1 slots whose checks are `checks` that holds `key`.
+public bool slot_find(uint* checks, uint mask, uint64_t key, out uint slot)
 {
-    uint home = cache_hash(key) & c.capacity_mask;
+    uint home = cache_hash(key) & mask;
     uint check = cache_check(key);
     for (uint i = 0; i < CACHE_PROBE; i++)
     {
-        slot = (home + i) & c.capacity_mask;
-        if (c.checks[slot] == check)
+        slot = (home + i) & mask;
+        if (checks[slot] == check)
             return true;
     }
     slot = 0;
@@ -213,22 +214,32 @@ public bool cache_find(WorldCacheGpu* c, uint64_t key, out uint slot)
 
 // The slot holding `key`, claiming the first empty one of its probe when none does; false
 // when every slot of the probe holds another key.
-public bool cache_insert(WorldCacheGpu* c, uint64_t key, out uint slot)
+public bool slot_insert(uint* checks, uint mask, uint64_t key, out uint slot)
 {
-    if (cache_find(c, key, slot))
+    if (slot_find(checks, mask, key, slot))
         return true;
-    uint home = cache_hash(key) & c.capacity_mask;
+    uint home = cache_hash(key) & mask;
     uint check = cache_check(key);
     for (uint i = 0; i < CACHE_PROBE; i++)
     {
-        slot = (home + i) & c.capacity_mask;
+        slot = (home + i) & mask;
         uint previous;
-        InterlockedCompareExchange(c.checks[slot], 0u, check, previous);
+        InterlockedCompareExchange(checks[slot], 0u, check, previous);
         if (previous == 0 || previous == check)
             return true;
     }
     slot = 0;
     return false;
+}
+
+public bool cache_find(WorldCacheGpu* c, uint64_t key, out uint slot)
+{
+    return slot_find(c.checks, c.capacity_mask, key, slot);
+}
+
+public bool cache_insert(WorldCacheGpu* c, uint64_t key, out uint slot)
+{
+    return slot_insert(c.checks, c.capacity_mask, key, slot);
 }
 
 public uint cache_history(uint2 r)

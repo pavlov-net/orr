@@ -15,14 +15,15 @@ use orr_scene::{
     Span, ViewArena, ViewConstants, ViewDesc, ViewStep,
 };
 
+use crate::caustics::PhotonMap;
 use crate::media::{MediaKernels, MediaSettings, MediaStats, MediaView};
 use crate::scene::{FRAME_SLOTS, Ring, device_local};
 use crate::shaders::dielectric::{layer_guides, tiles};
 use crate::shaders::guides::{frost, overlay_front, resolve};
 use crate::shaders::light_sampling::local;
-use crate::shaders::path::{background, layers as layer_paths, view as view_paths};
+use crate::shaders::path::{background, photons as photon_paths, view as view_paths};
 use crate::shaders::types::{
-    FrostRoot, GuideRoot, LayerGuide, LayerTilesRoot, LocalLights, OverlayFrontRoot,
+    CausticsGpu, FrostRoot, GuideRoot, LayerGuide, LayerTilesRoot, LocalLights, OverlayFrontRoot,
     ParticleLighting, PathRoot,
 };
 use crate::shaders::world_cache::update;
@@ -54,9 +55,11 @@ pub struct ViewLighting {
     pub dispersion: bool,
     /// Steps of a walk through a subsurface material or a dense dielectric interior before it
     /// stops and keeps the share it would yet carry out, clamped to
-    /// [`SSS_STEPS`](crate::SSS_STEPS).
+    /// [`SSS_STEPS`](crate::SSS_STEPS). The reference walks the most steps and ends a path
+    /// whose walk reaches them, counting it in
+    /// [`LightingStats::capped_walks`](crate::LightingStats::capped_walks).
     pub sss_max_steps: u32,
-    /// Which subsurface vertices of a path walk.
+    /// Which subsurface vertices of a path walk; under the reference, every one.
     pub sss_depth: SubsurfaceDepth,
     /// Whether walks in ray-dispatch path kernels reorder lanes every 8 steps, so lanes whose
     /// walk has ended leave the hardware threads of those still walking. It changes no result,
@@ -186,6 +189,9 @@ pub enum LightingDebugView {
     /// Light leaving through walks of subsurface materials and dielectric interiors: what each
     /// walk's exit and the path after it add.
     Subsurface,
+    /// What the first vertex gathers of the caustic photons' light, from the scene's grid or a
+    /// reference view's map.
+    Caustics,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -200,11 +206,31 @@ pub enum GuideKind {
     SpecularMotion,
 }
 
-/// The accumulation reference: no world cache, no Russian roulette before 64 bounces, and
-/// optionally a thin lens traced from the eye for depth-of-field references.
-#[derive(Clone, Copy, PartialEq, Debug, Default)]
+/// The accumulation reference: no world cache, no Russian roulette before 64 bounces, a walk
+/// at every subsurface vertex of up to the most steps, light leaving a dense interior by its
+/// way out's ray alone, and optionally a thin lens traced from the eye for depth-of-field
+/// references. Each frame the
+/// view traces caustic photons of its own into a map that holds that frame's alone, gathered
+/// within a radius that shrinks every frame as progressive photon mapping's.
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ReferenceSettings {
     pub lens: Option<ThinLens>,
+    /// Photons each frame, at most [`crate::MAX_PHOTONS`]; 0 leaves caustics to BSDF rays, as
+    /// does a scene whose [`crate::CausticSettings::photons`] is 0, since its scene pass weighs
+    /// where the photons start.
+    pub photons: u32,
+    /// The gather radius of the first frame after a history reset, m.
+    pub photon_radius: f32,
+}
+
+impl Default for ReferenceSettings {
+    fn default() -> Self {
+        Self {
+            lens: None,
+            photons: 1 << 20,
+            photon_radius: 0.008,
+        }
+    }
 }
 
 /// A thin lens at the eye. Each frame traces every pixel's first ray from a point of the
@@ -249,6 +275,26 @@ const DIELECTRIC_REFERENCE: u32 = 1;
 const DIELECTRIC_DEBUG_LAYER: u32 = 2;
 const DIELECTRIC_DISPERSION: u32 = 4;
 const DIELECTRIC_FROST: u32 = 8;
+
+/// Photons per row of the photon dispatch (`path`'s `PHOTON_ROW`).
+const PHOTON_ROW: u32 = 4096;
+
+/// Opaque vertices a photon meets at most: the mirrors of its chain and the surface after them.
+const PHOTON_BOUNCES: u32 = 16;
+
+/// The reference photon map's cell offset in frame `index` of sample set `seed`, in [0, 1)^3 of
+/// a cell.
+fn photon_offset(index: u32, seed: u32) -> [f32; 3] {
+    let mut h = index.wrapping_mul(0x9E37_79B9) ^ seed.wrapping_mul(0x85EB_CA6B);
+    [0u32; 3].map(|_| {
+        h ^= h >> 16;
+        h = h.wrapping_mul(0x7FEB_352D);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x846C_A68B);
+        h ^= h >> 16;
+        (h >> 8) as f32 / (1u32 << 24) as f32
+    })
+}
 
 /// `path`'s `SSS_PRIMARY_ONLY`.
 const SSS_PRIMARY_ONLY: u32 = 1;
@@ -451,6 +497,8 @@ pub struct LightingView {
     pub(crate) media: MediaView,
     dof: Option<DofLayer>,
     overlay_front: Option<OverlayFront>,
+    /// The reference's photon map, while the view traces one.
+    photon_map: Option<PhotonMap>,
 }
 
 impl LightingView {
@@ -546,6 +594,7 @@ impl LightingView {
             media: MediaView::new(device)?,
             dof: None,
             overlay_front: None,
+            photon_map: None,
         })
     }
 
@@ -741,8 +790,8 @@ impl Drop for LightingView {
 struct LayerMemory {
     /// Guides of room the memory takes.
     guides: u64,
-    /// Bytes from its start to the tile count, then the workgroups and ray extent of the
-    /// dispatches over the listed tiles.
+    /// Bytes from its start to the tile count, then the workgroups of the layer guides'
+    /// dispatch over the listed tiles.
     args: u64,
 }
 
@@ -752,7 +801,7 @@ impl LayerMemory {
         let guide = size_of::<LayerGuide>() as u64;
         let args = guide * u64::from(w) * u64::from(h) + 8 * tiles;
         Self {
-            guides: (args + 4 * 7).div_ceil(guide),
+            guides: (args + 4 * 4).div_ceil(guide),
             args,
         }
     }
@@ -799,8 +848,8 @@ pub struct ViewPass {
 /// What the background layer behind out-of-focus foreground reads in one frame. Each marked
 /// pixel traces a second camera ray from a point of the lens's aperture disc through a
 /// jittered point of the pixel on the focal plane, starting past the mask's depth, and the
-/// path from its hit at the view path's settings. The ray sees opaque geometry only:
-/// dielectric and presence layers past the mask are not traced.
+/// path from its hit at the view path's settings, which meets dielectric and presence layers
+/// as any path does.
 #[derive(Clone, Copy, Debug)]
 pub struct DofBackgroundPass {
     /// Float image at the view's extent, read from its red channel: per pixel, the reverse-Z
@@ -833,21 +882,6 @@ impl PathPipeline {
             let stage = ShaderStage::new(m, "compute_main", spec)?;
             Self::Compute(device.create_compute_pipeline(&stage, name)?)
         })
-    }
-
-    /// Runs the kernel over the workgroups `groups` holds, or as rays over the extent `rays`
-    /// holds.
-    fn record_indirect(
-        &self,
-        list: &mut CommandList,
-        root: &PathRoot,
-        groups: GpuPtr<DispatchArgs>,
-        rays: GpuPtr<DispatchArgs>,
-    ) {
-        match self {
-            Self::Compute(p) => list.dispatch_indirect_inline(p, root, groups),
-            Self::Rays(p) => list.dispatch_rays_indirect(p, root, rays),
-        }
     }
 
     /// Runs the kernel over `extent` invocations.
@@ -949,7 +983,7 @@ macro_rules! path_kernel {
 }
 
 const VIEW: PathKernel = path_kernel!(view_paths, "view paths");
-const LAYERS: PathKernel = path_kernel!(layer_paths, "layer paths");
+const PHOTONS: PathKernel = path_kernel!(photon_paths, "caustic photons");
 const BACKGROUND: PathKernel = path_kernel!(background, "background paths");
 const UPDATE: PathKernel = path_kernel!(update, "world cache update paths");
 const SUPPORT: &str = "lighting compute kernels";
@@ -987,7 +1021,7 @@ fn compiled<T>(job: &JobResult<Result<T, Error>>, kernel: &'static str) -> Resul
 /// already compiling finishes on its thread, since the driver cannot be interrupted.
 pub struct CompilingKernels {
     paths: JobResult<Result<PathPipeline, Error>>,
-    layers: JobResult<Result<PathPipeline, Error>>,
+    photons: JobResult<Result<PathPipeline, Error>>,
     background: JobResult<Result<PathPipeline, Error>>,
     update: JobResult<Result<PathPipeline, Error>>,
     support: JobResult<Result<SupportKernels, Error>>,
@@ -995,14 +1029,16 @@ pub struct CompilingKernels {
 }
 
 impl CompilingKernels {
-    /// The jobs [`LightingKernels::spawn`] queues: four path kernels and the kernels beside them.
+    /// The jobs [`LightingKernels::spawn`] queues: four path kernels (the view's, the caustic
+    /// photons', the background layer's and the world cache's update paths) and the kernels beside
+    /// them.
     /// A consumer lends this many threads for them to compile at once, and more to keep loading
     /// while they do: on a first run a path kernel holds its thread for a minute or more.
     pub const JOBS: usize = 5;
 
     /// How many jobs have not finished.
     pub fn outstanding(&self) -> u32 {
-        let paths = [&self.paths, &self.layers, &self.background, &self.update];
+        let paths = [&self.paths, &self.photons, &self.background, &self.update];
         paths.iter().filter(|job| !job.finished()).count() as u32
             + u32::from(!self.support.finished())
     }
@@ -1010,7 +1046,7 @@ impl CompilingKernels {
     /// Whether a thread has started any job.
     pub fn started(&self) -> bool {
         self.paths.started()
-            || self.layers.started()
+            || self.photons.started()
             || self.background.started()
             || self.update.started()
             || self.support.started()
@@ -1020,7 +1056,7 @@ impl CompilingKernels {
     /// so it finishes with no workers. `loading` is the side the jobs were queued on.
     pub fn wait(&self, loading: &Loading) {
         self.paths.wait(loading);
-        self.layers.wait(loading);
+        self.photons.wait(loading);
         self.background.wait(loading);
         self.update.wait(loading);
         self.support.wait(loading);
@@ -1031,7 +1067,7 @@ impl CompilingKernels {
         assert_eq!(self.outstanding(), 0, "kernels are still compiling");
         Ok(LightingKernels {
             paths: compiled(&self.paths, VIEW.name)?,
-            layers: compiled(&self.layers, LAYERS.name)?,
+            photons: compiled(&self.photons, PHOTONS.name)?,
             background: compiled(&self.background, BACKGROUND.name)?,
             update: compiled(&self.update, UPDATE.name)?,
             support: compiled(&self.support, SUPPORT)?,
@@ -1043,7 +1079,7 @@ impl CompilingKernels {
 /// The per-view lighting kernels of one device.
 pub struct LightingKernels {
     paths: PathPipeline,
-    layers: PathPipeline,
+    photons: PathPipeline,
     background: PathPipeline,
     update: PathPipeline,
     support: SupportKernels,
@@ -1062,7 +1098,7 @@ impl LightingKernels {
         let rays = runs_rays(device, entry);
         Ok(Self {
             paths: (VIEW.compile)(device, kernels, rays)?,
-            layers: (LAYERS.compile)(device, kernels, rays)?,
+            photons: (PHOTONS.compile)(device, kernels, rays)?,
             background: (BACKGROUND.compile)(device, kernels, rays)?,
             update: (UPDATE.compile)(device, kernels, rays)?,
             support: SupportKernels::new(device, kernels)?,
@@ -1087,7 +1123,7 @@ impl LightingKernels {
         };
         CompilingKernels {
             paths: path(VIEW),
-            layers: path(LAYERS),
+            photons: path(PHOTONS),
             background: path(BACKGROUND),
             update: path(UPDATE),
             support: compile_job(device, loading, move |d| SupportKernels::new(d, kernels)),
@@ -1148,13 +1184,16 @@ impl LightingKernels {
     /// beside them, where a camera ray up to the opaque depth finds each pixel's first dielectric
     /// or presence layer and leaves its guide for [`Self::record_guides`]. Every tile counts while
     /// a layer may lie before the near plane, while [`ViewLighting::camera_medium`] is set and when
-    /// the G-buffer has no layer tiles. One path per pixel follows, from the first layer on those
-    /// tiles and elsewhere from the G-buffer's surface: one dispatch of the path loop over those
-    /// tiles and one of its build without the camera ray and layer vertices over the others.
-    /// Outside the reference, segments between layers read the froxels of [`Self::record_media`]
-    /// of the same frame where it ran, and those froxels hold the camera segment through an
-    /// interior, which media apply adds; without them the path samples it. The scene's first view in a frame traces one update path
-    /// per `update_block`^2 pixels, its later views one per four times as many. The reference
+    /// the G-buffer has no layer tiles. The scene's first real-time view of a frame then traces the
+    /// frame's caustic photons ([`crate::CausticSettings`]) and resolves the scene's grid, which
+    /// every view's paths of the frame gather from; the reference traces photons of its own each
+    /// frame into the view's map ([`ReferenceSettings::photons`]). One path per pixel follows, in
+    /// one dispatch of the path loop, from the first layer on those tiles and elsewhere from the
+    /// G-buffer's surface. Outside the reference, segments between layers read the froxels of
+    /// [`Self::record_media`] of the same frame where it ran, and those froxels hold the camera
+    /// segment through an interior, which media apply adds; without them the path samples it. The
+    /// scene's first view in a frame traces one update path per `update_block`^2 pixels, its
+    /// later views one per four times as many. The reference
     /// traces none, never reads the cache, builds no local samplers and adds nothing to the
     /// scene's light feedback; its thin lens rays go through the same paths. With
     /// [`ViewPass::dof_background`] a dispatch of its own writes the view's background layer, made
@@ -1190,6 +1229,7 @@ impl LightingKernels {
             LightingDebugView::WorldCache => 7,
             LightingDebugView::WorldCacheLod => 8,
             LightingDebugView::Subsurface => 9,
+            LightingDebugView::Caustics => 10,
         };
         let reference = lighting.reference.is_some();
         let first = !reference && scene.first_view(pass.frame);
@@ -1333,9 +1373,13 @@ impl LightingKernels {
             },
             camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
             dielectric_flags: flags,
-            sss_max_steps: lighting
-                .sss_max_steps
-                .clamp(*SSS_STEPS.start(), *SSS_STEPS.end()),
+            sss_max_steps: if reference {
+                *SSS_STEPS.end()
+            } else {
+                lighting
+                    .sss_max_steps
+                    .clamp(*SSS_STEPS.start(), *SSS_STEPS.end())
+            },
             subsurface_table: self.support.subsurface_table.gpu(),
             sss_flags: match lighting.sss_depth {
                 SubsurfaceDepth::FirstEvent => 0,
@@ -1348,8 +1392,14 @@ impl LightingKernels {
             dof_aperture,
             _pad0: 0,
             overlay_front: view.overlay_front_words(pass.frame),
+            caustics: GpuPtr::NULL,
+            _pad1: 0,
         };
         self.record_layers(list, view, pass, lighting, lens.is_some(), &path_root);
+        let path_root = PathRoot {
+            caustics: self.record_photons(list, scene, view, pass, lighting, &path_root)?,
+            ..path_root
+        };
         if !reference {
             let update_root = PathRoot {
                 mode: 0,
@@ -1367,23 +1417,8 @@ impl LightingKernels {
                 .record(list, &update_root, view.extent.map(|e| e.div_ceil(block)));
             list.end_pass();
         }
-        if lens.is_none() {
-            list.begin_pass("view paths", false);
-            self.paths.record(list, &path_root, view.extent);
-            list.end_pass();
-        }
-        let args = view
-            .layers
-            .gpu()
-            .cast::<u8>()
-            .offset(LayerMemory::new(view.extent).args);
-        list.begin_pass("layer paths", false);
-        self.layers.record_indirect(
-            list,
-            &path_root,
-            args.offset(4).cast(),
-            args.offset(16).cast(),
-        );
+        list.begin_pass("view paths", false);
+        self.paths.record(list, &path_root, view.extent);
         list.end_pass();
         if pass.dof_background.is_some() {
             list.begin_pass("background paths", false);
@@ -1391,6 +1426,99 @@ impl LightingKernels {
             list.end_pass();
         }
         Ok(())
+    }
+
+    /// Records the frame's caustic photons where `view` traces them, and returns the caustics
+    /// its paths gather from: the scene's grid, whose photons and resolve the scene's first
+    /// real-time view of the frame records, or under the reference the view's own map, filled
+    /// each frame; null with caustics off.
+    fn record_photons(
+        &self,
+        list: &mut CommandList<'_>,
+        scene: &SceneLighting,
+        view: &mut LightingView,
+        pass: &ViewPass,
+        lighting: &ViewLighting,
+        path: &PathRoot,
+    ) -> Result<GpuPtr<CausticsGpu>, Error> {
+        let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
+        let caustics = scene.caustics();
+        let grid = caustics.root(slot);
+        let (root, photons) = match lighting.reference {
+            Some(r) if r.photons > 0 && grid != GpuPtr::NULL => {
+                if r.photons > crate::MAX_PHOTONS {
+                    return Err(Error::Settings(
+                        "reference photons must be at most MAX_PHOTONS",
+                    ));
+                }
+                if !view.photon_map.as_ref().is_some_and(|m| m.holds(r.photons)) {
+                    view.photon_map = None;
+                    view.photon_map = Some(PhotonMap::new(&view.device, r.photons)?);
+                }
+                let map = view.photon_map.as_mut().expect("made above");
+                map.advance(view.history_reset, r.photon_radius);
+                let offset = photon_offset(pass.sample_index, pass.seed);
+                list.begin_pass("caustic photon map", false);
+                list.barrier(
+                    Stages::COMPUTE | Stages::RAY,
+                    Stages::COMPUTE,
+                    Hazards::empty(),
+                );
+                let root = caustics.record_map(list, map, slot, r.photons, offset);
+                list.barrier(
+                    Stages::COMPUTE,
+                    Stages::COMPUTE | Stages::RAY,
+                    Hazards::empty(),
+                );
+                list.end_pass();
+                (root, r.photons)
+            }
+            Some(_) => {
+                view.photon_map = None;
+                return Ok(GpuPtr::NULL);
+            }
+            None => {
+                view.photon_map = None;
+                if grid == GpuPtr::NULL || !scene.first_photons(pass.frame) {
+                    return Ok(grid);
+                }
+                (grid, caustics.photons())
+            }
+        };
+        let photon_root = PathRoot {
+            mode: 0,
+            local: GpuPtr::NULL,
+            light_flags: 0,
+            cache_flags: 0,
+            roulette_depth: REFERENCE_ROULETTE_DEPTH,
+            max_bounces: PHOTON_BOUNCES,
+            dof_background: StorageImageIndex::NONE,
+            sss_flags: path.sss_flags & !SSS_POINTS,
+            dielectric_flags: path.dielectric_flags
+                & (DIELECTRIC_DISPERSION | DIELECTRIC_REFERENCE),
+            pixel_fraction: 1.0,
+            caustics: root,
+            ..*path
+        };
+        let rows = photons.div_ceil(PHOTON_ROW);
+        list.begin_pass("caustic photons", false);
+        self.photons
+            .record(list, &photon_root, [photons.min(PHOTON_ROW), rows]);
+        if lighting.reference.is_none() {
+            list.barrier(
+                Stages::COMPUTE | Stages::RAY,
+                Stages::COMPUTE,
+                Hazards::empty(),
+            );
+            caustics.record_resolve(list, slot);
+        }
+        list.barrier(
+            Stages::COMPUTE | Stages::RAY,
+            Stages::COMPUTE | Stages::RAY,
+            Hazards::empty(),
+        );
+        list.end_pass();
+        Ok(root)
     }
 
     /// Records the tiles of `pass` that hold layers and the layer guides over them, before any

@@ -466,6 +466,7 @@ fn a_thin_lens_with_no_aperture_matches_the_gbuffer() {
                 aperture_radius: 1e-5,
                 focus_distance: 5.0,
             }),
+            ..ReferenceSettings::default()
         }),
         ..reference(2)
     };
@@ -493,7 +494,10 @@ fn the_background_layer_sees_past_the_foreground_as_a_lens_does_without_it() {
     let truth = render_paths(
         &mut without,
         &paths(ViewLighting {
-            reference: Some(ReferenceSettings { lens: Some(lens) }),
+            reference: Some(ReferenceSettings {
+                lens: Some(lens),
+                ..ReferenceSettings::default()
+            }),
             ..reference(2)
         }),
         256,
@@ -1040,7 +1044,6 @@ fn sphere_and_rect_lights_reach_bsdf_rays_through_their_proxies() {
 /// estimator and by BSDF rays alone: rays bent through the glass meet the light's proxy, and
 /// what reaches the floor through the glass is owned once.
 #[test]
-#[ignore = "shadow rays cross solid glass unbent until they end at it, so next-event estimation counts light the bent BSDF rays also find"]
 fn a_sphere_light_behind_glass_lights_a_glossy_floor_alike_by_full_and_bsdf_rays() {
     let spec = Spec {
         copies: vec![

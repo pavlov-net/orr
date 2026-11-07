@@ -5,9 +5,9 @@
 // channels, and traces one closest-hit query no longer than that distance. Scattering
 // follows Henyey-Greenstein. What a step reaching a surface does is up to the `IWalkTrace`: it
 // ends the walk there, ends it with nothing, reflects it back or lets it leave through the
-// surface. A walk that takes `max_steps` steps without leaving stops there and keeps the
-// subsurface table's share of what it would yet carry out. A caller may run a walk's steps in
-// several calls, with a coherence point between them.
+// surface. A walk that takes `max_steps` steps without leaving stops there, keeping the
+// subsurface table's share of what it would yet carry out where its caller asks. A caller may
+// run a walk's steps in several calls, with a coherence point between them.
 module subsurface;
 
 import orr_shaders.abi;
@@ -180,8 +180,9 @@ public Walk walk_start(float3 origin, float3 dir, SubsurfaceVolume volume, float
 }
 
 // Runs up to `steps` more steps of running walk `e`, at most `max_steps` in all, each traced
-// through `tracer`, and counts its queries in `rays`.
-public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, SubsurfaceTableGpu* table, uint max_steps, inout uint rays)
+// through `tracer`, and counts its queries in `rays`. A walk stopped at `max_steps` keeps
+// `table`'s share of its throughput if `share`, else its throughput as it is.
+public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, SubsurfaceTableGpu* table, uint max_steps, bool share, inout uint rays)
 {
     float3 sigma = max(e.volume.extinction, float3(1e-30));
     // The densities against the least attenuated channel, so the hero channel's term stays
@@ -236,7 +237,8 @@ public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, Subsu
     }
     if (e.step == max_steps)
     {
-        e.throughput *= capped_walk_share(table, e.volume.albedo, e.volume.anisotropy, max_steps, e.ior);
+        if (share)
+            e.throughput *= capped_walk_share(table, e.volume.albedo, e.volume.anisotropy, max_steps, e.ior);
         e.kind = all(e.throughput == 0.0) ? WALK_NONE : WALK_CAP;
     }
 }

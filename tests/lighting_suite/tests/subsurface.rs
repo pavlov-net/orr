@@ -220,18 +220,33 @@ fn sun() -> DirectionalLight {
 /// The reference with at most one bounce after the first vertex, showing `debug_view`.
 fn settings(debug_view: LightingDebugView) -> ViewLighting {
     ViewLighting {
+        reference: Some(ReferenceSettings::default()),
+        ..real_time(debug_view)
+    }
+}
+
+/// As [`settings`], with the real-time path, whose walks stop at `sss_max_steps` and take
+/// their way out's light by next-event estimation.
+fn real_time(debug_view: LightingDebugView) -> ViewLighting {
+    ViewLighting {
         debug_view,
         sss_max_steps: 1024,
         max_bounces: 1,
-        reference: Some(ReferenceSettings::default()),
+        reference: None,
         ..ViewLighting::default()
     }
 }
 
-/// `spec` through `paths`, accumulated over `frames`.
+/// `spec` through `paths`, accumulated over `frames`. The reference ends a path whose walk
+/// reaches its step cap, so none may.
 fn render_spec(paths: &Paths, spec: Spec, frames: u32) -> Accumulated {
     let mut bed = Bed::with(spec);
-    bed.accumulate(frames, 5, &mut |list, f| paths.record(list, f))
+    let image = bed.accumulate(frames, 5, &mut |list, f| paths.record(list, f));
+    if paths.settings.reference.is_some() {
+        let stats = bed.lighting.stats(bed.last_frame()).unwrap();
+        assert_eq!(stats.capped_walks, 0, "reference walks reached their cap");
+    }
+    image
 }
 
 #[test]
@@ -243,7 +258,7 @@ fn the_opaque_path_walks_as_the_cpu_walk_does() {
     );
     lit_slabs_match_the_cpu_walk(&paths);
     a_lit_sphere_matches_the_cpu_walk(&paths);
-    paths.settings = settings(LightingDebugView::None);
+    paths.settings = real_time(LightingDebugView::None);
     paths.settings.sss_max_steps = 16;
     a_furnace_sphere_returns_the_subsurface_color(&paths);
     assert_clean();
@@ -410,30 +425,38 @@ fn cpu_dielectric(interior: &DenseInterior, radius: f32) -> DielectricWalks {
     }
 }
 
-/// The light leaving through the walks of `interior`'s sphere `model` scaled to `radius`, in a
-/// uniform environment and under a sun, within `tolerance` of the CPU walk.
+/// The light an interior's sphere sits in.
+#[derive(Clone, Copy, Debug)]
+enum Lighting {
+    Uniform,
+    Sun,
+}
+
+/// The light leaving through the walks of `interior`'s sphere `model` scaled to `radius`, under
+/// each of `lighting`, within `tolerance` of the CPU walk. The CPU walk takes a sun through the
+/// way out as the real-time walk does, and uniform light exactly.
 fn interior_matches_the_cpu_walk(
     paths: &Paths,
     model: &'static str,
     interior: &DenseInterior,
     radius: f32,
+    lighting: &[Lighting],
     tolerance: f64,
 ) {
     let (eye, target, fov_y) = (Vec3::new(0.0, 1.2, 4.0) * radius, Vec3::ZERO, 0.6);
     let pixels = sphere_pixels(eye, target, fov_y, radius);
     let cpu = cpu_dielectric(interior, radius);
-    let cases = [
-        (
-            "uniform light",
-            Vec::new(),
-            Some(FURNACE_RADIANCE),
-            CpuLight::Uniform {
-                radiance: DVec3::from(FURNACE_RADIANCE.map(f64::from)),
-            },
-        ),
-        ("a sun", vec![Light::Directional(sun())], None, cpu_sun()),
-    ];
-    for (what, lights, environment, light) in cases {
+    for &what in lighting {
+        let (lights, environment, light) = match what {
+            Lighting::Uniform => (
+                Vec::new(),
+                Some(FURNACE_RADIANCE),
+                CpuLight::Uniform {
+                    radiance: DVec3::from(FURNACE_RADIANCE.map(f64::from)),
+                },
+            ),
+            Lighting::Sun => (vec![Light::Directional(sun())], None, cpu_sun()),
+        };
         let spec = Spec {
             copies: vec![Item {
                 model,
@@ -456,11 +479,12 @@ fn interior_matches_the_cpu_walk(
         let e = relative(gpu, want);
         assert!(
             e < tolerance,
-            "{model} under {what}: GPU {gpu:?}, CPU {want:?} ({e:.4})"
+            "{model} under {what:?}: GPU {gpu:?}, CPU {want:?} ({e:.4})"
         );
     }
 }
 
+/// Uniform light through the reference, and a sun through the real-time walk.
 #[test]
 fn dense_interiors_walk_as_the_cpu_walk_does() {
     let mut paths = Paths::new(
@@ -469,8 +493,12 @@ fn dense_interiors_walk_as_the_cpu_walk_does() {
         settings(LightingDebugView::Subsurface),
     );
     paths.settings.max_bounces = 2;
-    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 1.0, 0.02);
-    interior_matches_the_cpu_walk(&paths, JADE_SPHERE, &JADE, 1.0, 0.02);
+    for (model, interior) in [(MILK_SPHERE, &MILK), (JADE_SPHERE, &JADE)] {
+        paths.settings.reference = Some(ReferenceSettings::default());
+        interior_matches_the_cpu_walk(&paths, model, interior, 1.0, &[Lighting::Uniform], 0.02);
+        paths.settings.reference = None;
+        interior_matches_the_cpu_walk(&paths, model, interior, 1.0, &[Lighting::Sun], 0.02);
+    }
     assert_clean();
 }
 
@@ -483,12 +511,13 @@ fn capped_interior_walks_keep_the_table_share() {
     let mut paths = Paths::new(
         &KernelSet::default(),
         PathEntry::Compute,
-        settings(LightingDebugView::Subsurface),
+        real_time(LightingDebugView::Subsurface),
     );
     paths.settings.max_bounces = 2;
     paths.settings.sss_max_steps = 16;
-    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 4.0, 0.12);
-    interior_matches_the_cpu_walk(&paths, JADE_SPHERE, &JADE, 4.0, 0.12);
+    let both = [Lighting::Uniform, Lighting::Sun];
+    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 4.0, &both, 0.12);
+    interior_matches_the_cpu_walk(&paths, JADE_SPHERE, &JADE, 4.0, &both, 0.12);
     assert_clean();
 }
 
@@ -505,7 +534,7 @@ fn reordering_inside_walks_changes_no_path() {
     let mut paths = Paths::new(
         &KernelSet::default(),
         PathEntry::RayDispatch,
-        settings(LightingDebugView::BsdfOnly),
+        real_time(LightingDebugView::BsdfOnly),
     );
     paths.settings.max_bounces = 2;
     for model in [WALK_SPHERE, MILK_SPHERE] {
@@ -548,7 +577,7 @@ fn reordering_inside_walks_changes_no_path() {
     paths.settings.max_bounces = 2;
     paths.settings.walk_compaction = true;
     a_lit_sphere_matches_the_cpu_walk(&paths);
-    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 1.0, 0.02);
+    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 1.0, &[Lighting::Uniform], 0.02);
     assert_clean();
 }
 

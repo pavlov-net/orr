@@ -1,5 +1,5 @@
 // Shadow rays from a list of origins along one direction, to `dir.w` m or without it to infinity,
-// as next-event estimation traces them, from inside `inside` where that is a material: per ray
+// in shadow mode `mode`, from inside `inside` where that is a material: per ray
 // the shadow product, written or with `add` added to what is there, and how many rays ran past
 // the candidate limit.
 #include "orr_root.h"
@@ -20,7 +20,7 @@ struct Root
     uint count;
     uint add;
     uint inside;
-    uint _pad2;
+    uint mode;      // SHADOW_PATH or SHADOW_UNBENT
 }
 ORR_ROOT(Root);
 
@@ -37,6 +37,9 @@ void main(uint3 id: SV_DispatchThreadID)
     Interior start = Interior();
     if (root.inside != MATERIAL_NONE)
         start.cross(root.inside, true);
-    float3 t = visibility<StandardSurface, NoMedium>(root.scene, root.view, root.origins[id.x].xyz, root.dir.xyz, t_max, RAY_FLAG_NONE, context, false, start, root.overflows);
+    float3 o = root.origins[id.x].xyz;
+    float3 t = root.mode == SHADOW_PATH
+        ? visibility<StandardSurface, NoMedium, SHADOW_PATH>(root.scene, root.view, o, root.dir.xyz, t_max, RAY_FLAG_NONE, context, false, start, root.overflows)
+        : visibility<StandardSurface, NoMedium, SHADOW_UNBENT>(root.scene, root.view, o, root.dir.xyz, t_max, RAY_FLAG_NONE, context, false, start, root.overflows);
     root.transmittance[id.x] = float4(t, 0.0) + (root.add != 0 ? root.transmittance[id.x] : float4(0.0));
 }

@@ -1,8 +1,10 @@
-//! The shadow product on a real ray-query candidate loop: dielectric slabs and water against
-//! Fresnel and Beer's law for receivers above, below and inside them, nested interiors,
-//! presence layers by their opacity, the candidate limit, particles by what their opacity lets
-//! through, and a smoke volume's medium proxy against a fine march of its cooked grid; only rays
-//! with the medium mask bit see proxies.
+//! The shadow product on a real ray-query candidate loop. The unbent product that froxels,
+//! particle lighting and media apply take: dielectric slabs and water against Fresnel and Beer's
+//! law for receivers above, below and inside them, and nested interiors, each face's Fresnel
+//! against the medium around it. A path vertex's shadow rays end at solid glass. Presence layers
+//! by their opacity, the candidate limit, particles by what their opacity lets through, and a
+//! smoke volume's medium proxy against a fine march of its cooked grid; only rays with the
+//! medium mask bit see proxies.
 
 use lighting_suite::bed::{
     Bed, DEPTH_TEXTURED_SHEET, DEPTH_TEXTURED_SLAB, FLOOR, Item, PLUME, PRESENCE_VEIL,
@@ -46,19 +48,24 @@ fn spec(copies: Vec<Item>) -> Spec {
 /// `MATERIAL_NONE`.
 const NONE: u32 = u32::MAX;
 
-/// Traces one shadow ray from each of `origins` along unit `dir` through `copies`.
+/// `shadow.slang`'s `SHADOW_PATH` and `SHADOW_UNBENT`.
+const PATH: u32 = 0;
+const UNBENT: u32 = 2;
+
+/// Traces one unbent shadow ray from each of `origins` along unit `dir` through `copies`.
 fn trace(copies: Vec<Item>, origins: &[Vec3], dir: Vec3) -> Traced {
     let mut bed = Bed::with(spec(copies));
     trace_on(&mut bed, origins, dir, 0.0, 1)
 }
 
-/// The mean over `frames` frames of the shadow ray from each of `origins` along unit `dir` to
-/// `t_max` m (0: infinity) through `bed`'s scene, and the rays past the candidate limit.
+/// The mean over `frames` frames of the unbent shadow ray from each of `origins` along unit
+/// `dir` to `t_max` m (0: infinity) through `bed`'s scene, and the rays past the candidate limit.
 fn trace_on(bed: &mut Bed, origins: &[Vec3], dir: Vec3, t_max: f32, frames: u32) -> Traced {
-    trace_inside(bed, origins, dir, t_max, frames, NONE)
+    trace_inside(bed, origins, dir, t_max, frames, NONE, UNBENT)
 }
 
-/// [`trace_on`], from inside material `inside`'s interior, or none for [`NONE`].
+/// [`trace_on`] in shadow mode `mode`, from inside material `inside`'s interior, or none for
+/// [`NONE`].
 fn trace_inside(
     bed: &mut Bed,
     origins: &[Vec3],
@@ -66,6 +73,7 @@ fn trace_inside(
     t_max: f32,
     frames: u32,
     inside: u32,
+    mode: u32,
 ) -> Traced {
     let probe = pipeline(&shadow_probe::MODULE, "main");
     let o: Vec<[f32; 4]> = origins.iter().map(|p| p.extend(0.0).to_array()).collect();
@@ -87,7 +95,7 @@ fn trace_inside(
             count: n as u32,
             add: u32::from(f.index > 0),
             inside,
-            _pad2: 0,
+            mode,
         });
         list.dispatch(&probe, root, [n.div_ceil(64) as u32, 1, 1]);
         list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
@@ -272,13 +280,13 @@ fn water_shadows_receivers_inside_and_under_it_by_their_depth() {
 /// once, whether or not the list at their origin names the water: from a slab in the water, the
 /// slab and then the water; from the water under the slab, the water, the slab and the water. A
 /// ray ending in the water it starts in takes the water when the list names it, with no surface
-/// to show it.
+/// to show it. The slab's faces take Fresnel against the water around them.
 #[test]
 fn nested_interiors_shadow_each_stretch_of_a_ray_once() {
     let transmission = water_transmission();
     let (slab, top) = (2.0f32, 4.0f32);
     let thick = f64::from(SLAB_THICKNESS);
-    let [glass, wet] = [1.5, 1.33].map(|n| 1.0 - fresnel(n, 1.0));
+    let [glass, wet] = [1.5 / 1.33, 1.33].map(|n| 1.0 - fresnel(n, 1.0));
     let mut bed = Bed::with(spec(vec![
         at(WATER_BOX, Vec3::new(0.0, 2.0, 0.0)),
         at(TINTED_SLAB, Vec3::new(0.0, slab, 0.0)),
@@ -290,16 +298,59 @@ fn nested_interiors_shadow_each_stretch_of_a_ray_once() {
     };
     let row = |y: f32| grid(Vec3::new(0.0, y, 0.0), [0.4, 0.3], 0.0, Vec3::Y);
     for inside in [NONE, water] {
-        let from_slab = trace_inside(&mut bed, &row(slab), Vec3::Y, 0.0, 1, inside);
+        let from_slab = trace_inside(&mut bed, &row(slab), Vec3::Y, 0.0, 1, inside, UNBENT);
         let wanted = through(f64::from(top - slab) - thick * 0.5, thick * 0.5, 1);
         assert_all("in the slab", &from_slab.transmittance, wanted, 2e-3);
-        let under = trace_inside(&mut bed, &row(1.0), Vec3::Y, 0.0, 1, inside);
+        let under = trace_inside(&mut bed, &row(1.0), Vec3::Y, 0.0, 1, inside, UNBENT);
         let wanted = through(f64::from(top - 1.0) - thick, thick, 2);
         assert_all("under the slab", &under.transmittance, wanted, 2e-3);
     }
-    let held = trace_inside(&mut bed, &row(0.5), Vec3::Y, 0.5, 1, water);
+    let held = trace_inside(&mut bed, &row(0.5), Vec3::Y, 0.5, 1, water, UNBENT);
     let wanted = transmission.map(|c| c.powf(0.5));
     assert_all("within the water", &held.transmittance, wanted, 2e-3);
+    assert_clean();
+}
+
+/// A path vertex's shadow rays end at solid glass, where light bends, from outside it and from
+/// inside it alike, and still take the Beer transmittance of the interior they stay in.
+#[test]
+fn path_shadow_rays_end_at_solid_glass() {
+    let sun = SUN.direction_to_light.normalize();
+    let mid = Vec3::new(0.0, 1.0, 0.0);
+    let mut bed = Bed::with(spec(vec![at(TINTED_SLAB, mid)]));
+    let slab = bed.material(TINTED_SLAB).0;
+    let below = trace_inside(
+        &mut bed,
+        &grid(mid, [0.4, 0.3], 0.7 / sun.y, sun),
+        sun,
+        0.0,
+        1,
+        NONE,
+        PATH,
+    );
+    assert_all("below the slab", &below.transmittance, [0.0; 3], 0.0);
+    let top = mid + Vec3::Y * (0.5 * SLAB_THICKNESS);
+    let inside = trace_inside(
+        &mut bed,
+        &grid(top, [0.2, 0.15], 0.1 / sun.y, sun),
+        sun,
+        0.0,
+        1,
+        slab,
+        PATH,
+    );
+    assert_all("inside the slab", &inside.transmittance, [0.0; 3], 0.0);
+    let held = trace_inside(
+        &mut bed,
+        &grid(top, [0.2, 0.15], 0.1, Vec3::Y),
+        Vec3::Y,
+        0.05,
+        1,
+        slab,
+        PATH,
+    );
+    let wanted = 0.5f64.powf(0.05 / f64::from(SLAB_THICKNESS));
+    assert_all("within the slab", &held.transmittance, [wanted; 3], 2e-3);
     assert_clean();
 }
 

@@ -7,6 +7,7 @@ use orr_scene::orr_gpu::{
 };
 use orr_scene::{SceneDesc, SceneRoot, SkyStats};
 
+use crate::caustics::{CausticSettings, CausticStats, Caustics};
 use crate::environment::EnvironmentBake;
 use crate::shaders::light_sampling::{directional, tiles};
 use crate::shaders::types::{
@@ -29,6 +30,7 @@ pub const LIGHT_TILE_SIZE: u32 = 1024;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct SceneLightingSettings {
     pub world_cache: WorldCacheSettings,
+    pub caustics: CausticSettings,
     /// Meters from the eye that every view's froxel volume covers; linked environments that
     /// march from it are built with the same value.
     pub near_range: f32,
@@ -46,6 +48,7 @@ impl Default for SceneLightingSettings {
     fn default() -> Self {
         Self {
             world_cache: WorldCacheSettings::default(),
+            caustics: CausticSettings::default(),
             near_range: 256.0,
             emissive_clusters: 1 << 20,
             feedback_share: 0.5,
@@ -118,7 +121,11 @@ pub struct LightingStats {
     /// presence layers, particles, medium proxies) than the shadow product multiplies; each
     /// kept the product so far.
     pub shadow_overflows: u32,
+    /// Walks of reference views in the frame before that reached their step cap; each ended its
+    /// path.
+    pub capped_walks: u32,
     pub world_cache: WorldCacheStats,
+    pub caustics: CausticStats,
 }
 
 /// Per-root ring of one root per frame slot, in upload memory.
@@ -147,7 +154,7 @@ fn check_settings(settings: &SceneLightingSettings) -> Result<(), Error> {
     if !(0.0..1.0).contains(&settings.feedback_share) {
         return Err(Error::Settings("feedback_share must lie in [0, 1)"));
     }
-    Ok(())
+    crate::caustics::check_settings(&settings.caustics)
 }
 
 pub(crate) fn device_local<T>(
@@ -159,7 +166,8 @@ pub(crate) fn device_local<T>(
 }
 
 /// Lighting state of one scene: the baked environment, the directional light states, the
-/// light selection, the presampled light tiles and the world cache.
+/// light selection, the presampled light tiles, the caustics' photon source and grid, and the
+/// world cache.
 pub struct SceneLighting {
     device: Device,
     settings: SceneLightingSettings,
@@ -180,14 +188,19 @@ pub struct SceneLighting {
     feedback_counts: Allocation<u32>,
     feedback_weights: Allocation<f32>,
     shadow_overflows: Allocation<u32>,
+    capped_walks: Allocation<u32>,
     readback: Allocation<LightSetStats>,
     bake_roots: Ring<crate::shaders::environment::bake::Root>,
     directional_roots: Ring<directional::Root>,
     tile_roots: Ring<tiles::Root>,
     cache: WorldCache,
     cache_pipelines: ResolvePipelines,
+    caustics: Caustics,
+    scene_desc: SceneDesc,
     /// One past the frame whose first view has recorded its update paths.
     first_view: AtomicU64,
+    /// One past the frame whose first real-time view has traced its photons.
+    first_photons: AtomicU64,
     frames: [Option<u64>; FRAME_SLOTS],
     /// Calls of [`Self::reset_history`] so far.
     resets: AtomicU64,
@@ -239,6 +252,7 @@ impl SceneLighting {
             feedback_counts: device_local(device, feedback_ids, "light feedback counts")?,
             feedback_weights: device_local(device, feedback_ids, "light feedback weights")?,
             shadow_overflows: device_local(device, 1, "shadow overflows")?,
+            capped_walks: device_local(device, 1, "capped walks")?,
             readback: device.gpu_malloc(
                 MemoryKind::Readback,
                 FRAME_SLOTS as u64,
@@ -249,7 +263,10 @@ impl SceneLighting {
             tile_roots: Ring::new(device, "light tile roots")?,
             cache: WorldCache::new(device, &settings.world_cache)?,
             cache_pipelines: ResolvePipelines::new(device, kernels)?,
+            caustics: Caustics::new(device, kernels, scene, &settings.caustics)?,
+            scene_desc: *scene,
             first_view: AtomicU64::new(0),
+            first_photons: AtomicU64::new(0),
             frames: [None; FRAME_SLOTS],
             resets: AtomicU64::new(0),
             resets_applied: 0,
@@ -266,12 +283,16 @@ impl SceneLighting {
     }
 
     /// A change of `emissive_clusters` reallocates the producer cluster pool, and a change of
-    /// `world_cache` reallocates and clears the cache; old buffers are freed once the work
-    /// submitted so far has completed.
+    /// `world_cache` or `caustics` reallocates and clears the cache or the caustics; old buffers
+    /// are freed once the work submitted so far has completed.
     pub fn set_settings(&mut self, settings: &SceneLightingSettings) -> Result<(), Error> {
         check_settings(settings)?;
         if settings.world_cache != *self.cache.settings() {
             self.cache = WorldCache::new(&self.device, &settings.world_cache)?;
+        }
+        if settings.caustics != *self.caustics.settings() {
+            self.caustics
+                .resize(&self.device, &self.scene_desc, &settings.caustics)?;
         }
         if settings.emissive_clusters != self.settings.emissive_clusters {
             self.cluster_cdf = device_local(
@@ -297,6 +318,7 @@ impl SceneLighting {
         if self.resets_applied != resets {
             self.resets_applied = resets;
             self.cache.clear();
+            self.caustics.clear();
             self.clear_feedback = true;
         }
         let focus = [pass.focus[0], pass.focus[1], pass.focus[2], 0.0];
@@ -329,6 +351,7 @@ impl SceneLighting {
                 feedback_counts: self.feedback_counts.gpu(),
                 feedback_weights: self.feedback_weights.gpu(),
                 shadow_overflows: self.shadow_overflows.gpu(),
+                capped_walks: self.capped_walks.gpu(),
                 stats: self.readback.gpu().offset(slot as u64),
                 cluster_capacity: self.settings.emissive_clusters,
                 frame: pass.frame as u32,
@@ -336,7 +359,6 @@ impl SceneLighting {
                 clear_feedback: u32::from(std::mem::take(&mut self.clear_feedback)),
                 _pad0: 0,
                 _pad1: 0,
-                _pad2: 0,
             },
         );
 
@@ -359,6 +381,8 @@ impl SceneLighting {
             [LIGHT_TILES * LIGHT_TILE_SIZE / 64, 1, 1],
         );
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        self.caustics
+            .record(list, slot, pass.scene, self.set.gpu(), pass.focus);
         self.cache
             .record(list, &self.cache_pipelines, slot, pass.scene, pass.focus);
         list.barrier(
@@ -405,7 +429,9 @@ impl SceneLighting {
                 environment_probability: s.environment_probability,
                 feedback_pixels: s.feedback_pixels,
                 shadow_overflows: s.shadow_overflows,
+                capped_walks: s.capped_walks,
                 world_cache: self.cache.stats(slot),
+                caustics: self.caustics.stats(slot),
             }
         })
     }
@@ -429,6 +455,15 @@ impl SceneLighting {
 
     pub(crate) fn world_cache_settings(&self) -> &WorldCacheSettings {
         self.cache.settings()
+    }
+
+    pub(crate) fn caustics(&self) -> &Caustics {
+        &self.caustics
+    }
+
+    /// Whether this is the first real-time view of the scene in `frame` to trace its photons.
+    pub(crate) fn first_photons(&self, frame: u64) -> bool {
+        self.first_photons.swap(frame + 1, Ordering::Relaxed) != frame + 1
     }
 
     /// Per directional light, by LightId, its state for the last recorded frame.

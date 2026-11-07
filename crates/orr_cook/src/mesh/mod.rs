@@ -357,6 +357,9 @@ pub(crate) fn section_flags(m: &Material, back: Option<&Material>) -> u8 {
     if m.casts() {
         flags |= Section::CASTER;
     }
+    if m.class() == SurfaceClass::Dielectric && m.thin_walled == 0 {
+        flags |= Section::SOLID;
+    }
     flags | m.class().flags()
 }
 
@@ -1584,7 +1587,7 @@ fn build_cluster(
         vertex_count: verts.len() as u16,
         tri_count,
         alpha_first: tri_count,
-        flags: flags & Section::CLASS_MASK,
+        flags: flags & (Section::CLASS_MASK | Section::SOLID),
         local_max,
         uv_offset: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.offset)),
         uv_scale: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.scale)),

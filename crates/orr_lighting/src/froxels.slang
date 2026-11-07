@@ -548,7 +548,7 @@ float3 froxel_local<S : ISurface, M : IMedium>(FroxelRoot r, uint3 f, float3 x, 
     RayCone cone = { 0.0, 0.0 };
     rays++;
     // The baked environment carries the medium, as next-event estimation takes it.
-    float3 vis = visibility<S, M>(r.scene, r.view, x, chosen.dir, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, around, set.shadow_overflows);
+    float3 vis = visibility<S, M, SHADOW_UNBENT>(r.scene, r.view, x, chosen.dir, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, around, set.shadow_overflows);
     if (chosen.view && any(vis > 0.0))
         vis *= emitter_view_layer<S>(set, chosen, interior_ior(r.scene, around.innermost()));
     return l * vis * (sum / chosen_target) * INV_FOUR_PI;
@@ -615,7 +615,7 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
                 RayCone cone = { 0.0, 0.0 };
                 rays++;
                 float3 tau;
-                float3 t = surface_visibility<S, M>(r.scene, r.view, x, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, Interior(), r.set.shadow_overflows, tau);
+                float3 t = surface_visibility<S, M, SHADOW_UNBENT>(r.scene, r.view, x, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, Interior(), r.set.shadow_overflows, tau);
                 // The column's interior takes its share of the optical depth as a distance.
                 float d = 0.0;
                 if (inside && any(eye_sigma > 0.0))

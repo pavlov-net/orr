@@ -68,6 +68,7 @@ public struct BsdfSample
 {
     public float3 wi;
     public float3 weight;               // BSDF x cos / pdf, over every lobe
+    public float3 diffuse;              // what of `weight` the diffuse lobes give, as `Bsdf.eval`'s `diffuse`
     public float pdf;                   // 0: no sample
     public uint lobe;                   // LOBE_*
     public uint component;              // the lobe drawn, for `Bsdf.delta_value`
@@ -206,6 +207,7 @@ public struct Bsdf : IDifferentiable
     no_diff float3 emitted;
     float probability[LOBES];
     LobeAlbedo estimate;
+    no_diff float3 thin_diffuse_albedo;  // the thin-walled diffuse transmission's share of `estimate.diffuse`
 
     // Completes `bsdf_prepare_layers` with `fit`: folds the coat and fuzz when collapsed, and
     // sets the albedo estimates and lobe probabilities.
@@ -231,6 +233,7 @@ public struct Bsdf : IDifferentiable
             + layers.specular_multiple;
         // Table interpolation can leave a complement a rounding error below zero.
         estimate.diffuse = max(a.diffuse, 0.0);
+        thin_diffuse_albedo = max(layers.e[THIN_DIFFUSE], 0.0);
         estimate.specular = max(a.specular, 0.0);
         estimate.transmission = max(a.transmission, 0.0);
         estimate.subsurface = max(a.subsurface, 0.0);
@@ -264,6 +267,19 @@ public struct Bsdf : IDifferentiable
         return estimate;
     }
 
+    // Directional albedo from the view of what `eval`'s `diffuse` holds: on the view's side,
+    // diffuse reflection with the collapsed coat and fuzz's cosine lobe, and on the other, a
+    // thin wall's diffuse transmission.
+    public float3 diffuse_reflection()
+    {
+        return max(estimate.diffuse - thin_diffuse_albedo, 0.0) + fold_diffuse;
+    }
+
+    public float3 diffuse_transmission()
+    {
+        return thin_diffuse_albedo;
+    }
+
     // `BsdfParams.emission` as seen from the view: through the coat and fuzz, none from inside.
     public float3 emission()
     {
@@ -286,7 +302,7 @@ public struct Bsdf : IDifferentiable
     }
 
     // `eval`, and in `diffuse` the share of the diffuse reflection and thin-walled diffuse
-    // transmission lobes.
+    // transmission lobes and of the collapsed coat and fuzz's cosine lobe.
     public float3 eval(float3 wi, out float3 diffuse)
     {
         float density;
@@ -449,6 +465,7 @@ public struct Bsdf : IDifferentiable
                 return r;
             }
             r.weight = f / r.pdf;
+            r.diffuse = diffuse / r.pdf;
         }
         r.wi = normalize(from_local(l, t, b, n));
         r.lobe = lobe;
@@ -592,6 +609,7 @@ public struct Bsdf : IDifferentiable
         if (l.z == 0.0)
             return float3(0.0);
         float3 diffuse_base = float3(0.0);
+        float3 diffuse_top = float3(0.0);
         float3 base = float3(0.0);
         float3 top = float3(0.0);
         float lobe_pdf;
@@ -618,7 +636,8 @@ public struct Bsdf : IDifferentiable
             if (probability[DIFFUSE] > 0.0)
             {
                 diffuse_base += eon(diffuse, l) * l.z;
-                top += fold_diffuse * l.z * INV_PI;
+                diffuse_top = fold_diffuse * l.z * INV_PI;
+                top += diffuse_top;
                 pdf += probability[DIFFUSE] * l.z * INV_PI;
             }
             if (probability[METAL_MS] > 0.0)
@@ -659,7 +678,7 @@ public struct Bsdf : IDifferentiable
             pdf += probability[DIELECTRIC_MS] * INV_TWO_PI * (l.z > 0.0 ? dms_ratio : 1.0 - dms_ratio);
         }
         float3 below = layer * leaving(l);
-        diffuse_share = diffuse_base * below;
+        diffuse_share = diffuse_base * below + diffuse_top;
         return top + (base + diffuse_base) * below;
     }
 
@@ -889,6 +908,7 @@ BsdfSample no_sample()
     BsdfSample r;
     r.wi = float3(0.0);
     r.weight = float3(0.0);
+    r.diffuse = float3(0.0);
     r.pdf = 0.0;
     r.lobe = 0;
     r.component = LOBES;
@@ -1032,29 +1052,93 @@ public BsdfParams bsdf_subsurface_diffuse(BsdfParams p)
     return p;
 }
 
-// What a surface lets through straight along `wi` (unit), without bending: its transmission
-// share, surface tint and coat, times 1 - Fresnel at its interface. Shadow rays through
-// dielectric layers take it. `wi` is the light's direction outside the surface, so Fresnel is the
-// exterior side's from either side and light at any angle gets in. With `window`, for light from
-// every direction outside, `wi` is its direction on the ray's own side: light reaches a point
-// inside only within the critical angle, 0 beyond it, and what reflects there makes up the rest.
-// `n` is the unit geometric normal on the material's front side, `exterior_ior` the medium there.
+// What `straight_transmission` reads of a surface's parameters and of a ray along `wi`
+// (unit) through it, before the medium around it is known.
+public struct StraightSurface
+{
+    public float3 color;            // the transmission color
+    public float c;                 // `wi` . the unit geometric normal on the material's front side
+    public float3 specular_color;
+    public float specular_ior;
+    public float3 coat_color;
+    public float specular_weight;
+    public float coat_weight;       // 0 without a coat
+    public float coat_ior;
+    public float share;             // (1 - metalness) x transmission weight
+    public uint flags;              // BSDF_THIN_WALLED and BSDF_FRESNEL_MIX of the surface's
+}
+
+public StraightSurface straight_surface(BsdfParams p, float3 n, float3 wi)
+{
+    StraightSurface r;
+    r.color = p.transmission_color;
+    r.share = (1.0 - p.metalness) * p.transmission_weight;
+    r.c = dot(wi, n);
+    r.specular_color = p.specular_color;
+    r.specular_ior = p.specular_ior;
+    r.coat_color = p.coat_color;
+    r.specular_weight = p.specular_weight;
+    r.coat_weight = (p.flags & BSDF_COAT) != 0 ? p.coat_weight : 0.0;
+    r.coat_ior = p.coat_ior;
+    r.flags = p.flags & (BSDF_THIN_WALLED | BSDF_FRESNEL_MIX);
+    return r;
+}
+
+// What a surface lets through straight along `wi`, without bending: its transmission share,
+// surface tint and coat, times 1 - Fresnel at its interface against the medium of IOR
+// `exterior_ior` around it. `wi` is the light's direction outside the surface, so Fresnel is
+// the exterior side's from either side and light at any angle gets in. With `window`, for light
+// from every direction outside, `wi` is its direction on the ray's own side: light reaches a
+// point inside only within the critical angle, 0 beyond it, and what reflects there makes up
+// the rest.
+public float3 straight_transmission(StraightSurface s, float exterior_ior, bool window = false)
+{
+    bool thin = (s.flags & BSDF_THIN_WALLED) != 0;
+    bool inside = window && s.c > 0.0 && !thin;
+    float mu = max(abs(s.c), MIN_COS);
+    bool mix = (s.flags & BSDF_FRESNEL_MIX) != 0;
+    float weight = mix ? 1.0 : s.specular_weight;
+    float ior = exterior_ior * openpbr_apply_specular_weight_to_ior(s.specular_ior / exterior_ior, weight);
+    float eta = inside ? exterior_ior / ior : ior / exterior_ior;
+    float reflected = mix && !inside ? max_component(mix_reflection(s.specular_color, s.specular_weight, mu)) : openpbr_fresnel(eta, mu);
+    float3 t = s.share * (1.0 - reflected) * view_tint(s.color, thin && !mix, mu, eta);
+    if (s.coat_weight > 0.0)
+        t *= lerp(float3(1.0), s.coat_color * (1.0 - openpbr_fresnel(max(s.coat_ior, MIN_IOR) / exterior_ior, mu)), s.coat_weight);
+    return max(t, 0.0);
+}
+
+// `bsdf_straight_transmission` of `p` along `wi` with `n` the unit geometric normal on the
+// material's front side.
 public float3 bsdf_straight_transmission(BsdfParams p, float3 n, float3 wi, float exterior_ior = 1.0, bool window = false)
 {
-    bool thin = (p.flags & BSDF_THIN_WALLED) != 0;
-    float c = dot(wi, n);
-    bool inside = window && c > 0.0 && !thin;
-    float mu = max(abs(c), MIN_COS);
+    return straight_transmission(straight_surface(p, n, wi), exterior_ior, window);
+}
+
+// The base specular lobe's roughness once the layers above widen it, and in `coat_roughness`
+// the coat's once the fuzz widens it.
+float widened_roughness(BsdfParams p, float coat_weight, float fuzz_weight, float coat_eta, bool mix, out float coat_roughness)
+{
+    float fuzz_adjust = (p.fuzz_color.x + p.fuzz_color.y + p.fuzz_color.z) / 3.0 * p.fuzz_roughness * 0.005;
+    coat_roughness = lerp(p.coat_roughness,
+        fourth_root(min(1.0, sq(sq(p.coat_roughness)) + fuzz_adjust * sq(sq(p.fuzz_roughness)))), fuzz_weight);
+    float coat_adjust = 1.0 - (coat_eta >= 1.0 ? 1.0 / coat_eta : coat_eta);
+    return lerp(p.specular_roughness,
+        fourth_root(min(1.0, sq(sq(p.specular_roughness)) + coat_adjust * sq(sq(coat_roughness)))), mix ? 0.0 : coat_weight);
+}
+
+// Whether a thin wall of `p` in a medium of IOR `exterior_ior` is an ideal mirror and window:
+// what `Bsdf.mirror` gives it, so a ray through it keeps its direction exactly.
+public bool bsdf_thin_mirror(BsdfParams p, float exterior_ior)
+{
+    float coat_weight = (p.flags & BSDF_COAT) != 0 ? p.coat_weight : 0.0;
+    float fuzz_weight = (p.flags & BSDF_FUZZ) != 0 ? p.fuzz_weight : 0.0;
+    float anisotropy = (p.flags & BSDF_ANISOTROPY) != 0 ? p.specular_anisotropy : 0.0;
     bool mix = (p.flags & BSDF_FRESNEL_MIX) != 0;
-    float weight = mix ? 1.0 : p.specular_weight;
-    float ior = exterior_ior * openpbr_apply_specular_weight_to_ior(p.specular_ior / exterior_ior, weight);
-    float eta = inside ? exterior_ior / ior : ior / exterior_ior;
-    float reflected = mix && !inside ? max_component(mix_reflection(p.specular_color, p.specular_weight, mu)) : openpbr_fresnel(eta, mu);
-    float3 t = (1.0 - p.metalness) * p.transmission_weight * (1.0 - reflected)
-        * view_tint(p.transmission_color, thin && !mix, mu, eta);
-    if ((p.flags & BSDF_COAT) != 0 && p.coat_weight > 0.0)
-        t *= lerp(float3(1.0), p.coat_color * (1.0 - openpbr_fresnel(max(p.coat_ior, MIN_IOR) / exterior_ior, mu)), p.coat_weight);
-    return max(t, 0.0);
+    float coat_eta = coat_weight > 0.0 ? max(p.coat_ior, MIN_IOR) / exterior_ior : 1.0;
+    float coat_roughness;
+    float roughness = widened_roughness(p, coat_weight, fuzz_weight, coat_eta, mix, coat_roughness);
+    float2 alpha = openpbr_compute_anisotropic_alpha(sq(roughness), anisotropy, false, MIN_ALPHA);
+    return max(alpha.x, alpha.y) < MIRROR_ALPHA;
 }
 
 // A `Bsdf` for a path that has no vertex yet.
@@ -1163,13 +1247,8 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.eta_transparent = eta_t;
     s.eta_opaque = eta_o;
 
-    // Roughness, widened by the layers above.
-    float fuzz_adjust = (p.fuzz_color.x + p.fuzz_color.y + p.fuzz_color.z) / 3.0 * p.fuzz_roughness * 0.005;
-    float coat_roughness = lerp(p.coat_roughness,
-        fourth_root(min(1.0, sq(sq(p.coat_roughness)) + fuzz_adjust * sq(sq(p.fuzz_roughness)))), fuzz_weight);
-    float coat_adjust = 1.0 - (coat_eta >= 1.0 ? 1.0 / coat_eta : coat_eta);
-    float roughness = lerp(p.specular_roughness,
-        fourth_root(min(1.0, sq(sq(p.specular_roughness)) + coat_adjust * sq(sq(coat_roughness)))), mix ? 0.0 : coat_weight);
+    float coat_roughness;
+    float roughness = widened_roughness(p, coat_weight, fuzz_weight, coat_eta, mix, coat_roughness);
     s.alpha_iso = sq(roughness);
     s.alpha = openpbr_compute_anisotropic_alpha(s.alpha_iso, anisotropy, false, MIN_ALPHA);
     s.mirror = max(s.alpha.x, s.alpha.y) < MIRROR_ALPHA;

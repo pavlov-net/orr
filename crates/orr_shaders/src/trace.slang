@@ -451,8 +451,10 @@ uint64_t metal_committed_data(inout RayQuery<RAY_FLAG_NONE> q)
 
 // Whether a ray with mask `mask` takes triangle candidate `c`. An instance's mask covers every
 // class it shows, so a ray whose mask misses a class still meets that class's clusters in a mixed
-// BLAS, where the class in the geometry index turns it away. A ray that takes both opaque and
-// dielectric geometry has no class to turn away.
+// BLAS, where the class in the geometry index turns away its non-opaque candidates. Solid glass
+// is opaque in the AS, so it commits before any screening and stops a ray that reaches it, unless
+// the ray or its instance forces it non-opaque. A ray that takes both opaque and dielectric
+// geometry has no class to turn away.
 [ForceInline]
 bool takes(Candidate c, uint mask)
 {

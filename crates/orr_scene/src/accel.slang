@@ -76,7 +76,10 @@ void clas(uint group: SV_GroupID, uint t: SV_GroupThreadID)
         root.vertices[at + 2] = p.z;
     }
     uint class_id = cluster_class(c);
-    bool non_opaque = class_id != 0 || (job.flags & CLAS_NON_OPAQUE) != 0;
+    // Solid glass commits with no any-hit: a ray that reaches it stops there whatever its mask,
+    // unless the ray or its instance forces it non-opaque.
+    bool layer = class_id != 0 && (c.flags & CLUSTER_SOLID) == 0;
+    bool non_opaque = layer || (job.flags & CLAS_NON_OPAQUE) != 0;
     bool micromap = (job.flags & CLAS_MICROMAP) != 0;
     for (uint i = t; i < c.tri_count; i += 64)
     {

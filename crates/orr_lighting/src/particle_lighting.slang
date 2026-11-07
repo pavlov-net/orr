@@ -103,7 +103,7 @@ public void particle_shadow_rays<S : ISurface, M : IMedium>(ParticleLighting* l,
             continue;
         float3 to_light = s.lights[l.lights.ids[j]].direction;
         float3 depth;
-        vis[j] = surface_visibility<S, M>(s, l.view, x + to_light * offset, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, Interior(), l.set.shadow_overflows, depth);
+        vis[j] = surface_visibility<S, M, SHADOW_UNBENT>(s, l.view, x + to_light * offset, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, Interior(), l.set.shadow_overflows, depth);
         vis[j] *= exp(-depth);
     }
 }
