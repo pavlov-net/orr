@@ -154,8 +154,8 @@ void finish()
     s.occupied = n[CAUSTIC_OCCUPIED];
     s.evicted = n[CAUSTIC_EVICTED];
     s.quantum = quantum;
+    s.finest = root.caustics.source.finest;
     s._pad0 = 0;
-    s._pad1 = 0;
     *root.stats = s;
     if (deposits > 0)
     {

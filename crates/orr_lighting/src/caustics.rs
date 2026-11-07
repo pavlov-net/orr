@@ -35,7 +35,9 @@ pub const MAX_PHOTONS: u32 = 4096 * 65535;
 /// surfaces (smooth dielectrics and metals the cook ranks as casters, and producer clusters of
 /// casting materials), deposited in a hash grid of 2^`capacity_log2` cells of 48 B on voxels
 /// whose edge doubles with each level, from 2^`base_cell_log2` m within `lod_scale` m of the
-/// scene focus. Each cell keeps a running mean of the frames' irradiance.
+/// scene focus. Casters too wide for the photons to fill cells that fine start the levels
+/// coarser ([`CausticStats::finest`]). Each cell keeps a running mean of the frames'
+/// irradiance.
 ///
 /// Through [`crate::SceneLighting::set_settings`], `photons`, `max_temporal_samples`,
 /// `cell_lifetime` and `jitter` take effect at the next frame and keep the grid. A new
@@ -96,6 +98,9 @@ pub struct CausticStats {
     pub evicted: u32,
     /// Flux per fixed-point step of the frame's deposits.
     pub quantum: f32,
+    /// The finest level the frame's reads and deposits took, whatever level a point's distance
+    /// gives it: the finest whose cells the photons expected near the focus fill.
+    pub finest: u32,
 }
 
 pub(crate) fn check_settings(s: &CausticSettings) -> Result<(), Error> {
@@ -351,8 +356,8 @@ impl Caustics {
                 focus: [focus[0], focus[1], focus[2], s.lod_scale],
                 pool_capacity: s.producer_clusters,
                 clear: u32::from(clear),
-                _pad0: 0,
-                _pad2: 0,
+                photons: s.photons,
+                base_cell_log2: s.base_cell_log2,
             },
         );
         let grid = self.resolve_roots.write(
@@ -418,6 +423,7 @@ impl Caustics {
             occupied: s.occupied,
             evicted: s.evicted,
             quantum: s.quantum,
+            finest: s.finest,
         }
     }
 

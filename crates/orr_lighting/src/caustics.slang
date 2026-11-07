@@ -6,8 +6,9 @@
 // vertices gather what was deposited around them by their diffuse albedo.
 //
 // Real time keeps one grid per scene: cells on the world cache's absolute voxel keys, finer
-// (levels of 2^(base_cell_log2 + j) m by distance to the focus), each normal bucket its own
-// cell. A bucket's cell is the voxel column across its axis together with the voxel of where
+// (levels of 2^(base_cell_log2 + j) m by distance to the focus, from the coarsest of them whose
+// cells the frame's photons are expected to fill to CAUSTIC_MIN_PHOTONS), each normal bucket its
+// own cell. A bucket's cell is the voxel column across its axis together with the voxel of where
 // the receiver's tangent plane crosses the column's center line, so a flat receiver's whole
 // piece in a column, the column's face area over the cosine of its normal to the axis, is one
 // cell. A cell sums the frame's photon flux in 64-bit fixed point, two words per channel that
@@ -19,8 +20,8 @@
 // boundary between normal buckets it draws one of the two by how close the normal lies to it,
 // and a photon there deposits in each. A cell's irradiance holds only where every photon inside it
 // deposited there, and a cell spans points whose levels differ by one, so a photon deposits in
-// the four levels from one finer than its point's to two coarser. Only Lambertian receivers
-// take the grid's irradiance exactly.
+// the four levels from one finer than its point's to two coarser, none below the finest level.
+// Only Lambertian receivers take the grid's irradiance exactly.
 //
 // The reference keeps a map per view instead: each frame's photons in lists on a hash of
 // cells two gather radii wide, offset at random, and a gather sums the photons within the
@@ -86,8 +87,8 @@ public struct CausticStatsGpu
     public uint occupied;
     public uint evicted;
     public float quantum;
+    public uint finest;
     public uint _pad0;
-    public uint _pad1;
 }
 
 // What photons start from each frame: the caster entries of the scene's emissive list, by
@@ -107,6 +108,10 @@ public struct PhotonSourceGpu
     public EyeInterior* interiors;
     public uint entry_count;
     public float total;             // the last value of `cdf`
+    // The grid's finest level this frame, and in `floor_level` the continuous level whose cells
+    // expect CAUSTIC_MIN_PHOTONS.
+    public uint finest;
+    public float floor_level;
 }
 
 // A reference photon: where it deposited, the receiver's geometric normal on its side, its flux
@@ -153,10 +158,11 @@ public struct CausticsGpu
 }
 
 // The grid levels a point `distance` m from the focus reads: the first and, in `blend`, the
-// share of the next coarser, which its reads take with that probability.
+// share of the next coarser, which its reads take with that probability. None is finer than
+// the frame's finest level.
 public uint caustic_level(CausticsGpu* g, SceneRoot* s, float distance, out float blend)
 {
-    float level = clamp(log2(max(distance, 1e-6) / g.lod_scale), 0.0, float(caustic_max_level(g, s)));
+    float level = clamp(log2(max(distance, 1e-6) / g.lod_scale), float(g.source.finest), float(caustic_max_level(g, s)));
     float first = floor(level);
     blend = level - first;
     return uint(first);
@@ -238,7 +244,7 @@ public void grid_deposit(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float
             continue;
         uint bucket = 1 + axis * 2 + (n[axis] < 0.0 ? 1 : 0);
         float3 v = per_cosine * a[axis];
-        for (uint l = level > 0 ? level - 1 : 0; l <= min(level + 2, top); l++)
+        for (uint l = level > g.source.finest ? level - 1 : level; l <= min(level + 2, top); l++)
         {
             int e = g.base_cell_log2 + int(l);
             uint64_t key = cache_key(s.origin_cell, plane_point(p, n, axis, exp2(float(e))), e, l, bucket);
