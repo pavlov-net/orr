@@ -11,6 +11,7 @@ use orr_gpu::{
     TextureIndex,
 };
 use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
+use orr_pack::mesh::SurfaceClass;
 
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::upload::Record;
@@ -172,10 +173,9 @@ impl MaterialGpu {
             }
         };
         let thin = m.thin_walled != 0;
-        let dielectric = m.transmission_weight > 0.0;
-        let vertex_opacity = m.textures[slot::OPACITY].vertex != 0;
-        let presence = m.alpha_mode == Material::BLEND
-            && (m.geometry_opacity < 1.0 || bound(slot::OPACITY) || vertex_opacity);
+        let class = m.class();
+        let dielectric = class == SurfaceClass::Dielectric;
+        let presence = class == SurfaceClass::Presence;
         let subsurface = m.subsurface_weight > 0.0 && !thin && !dielectric;
         let lobes = m.coat_weight > 0.0
             || m.fuzz_weight > 0.0
@@ -493,6 +493,13 @@ mod tests {
             ..base
         };
         assert_eq!(cost(&skin), 3);
+        let mut veil = Material {
+            alpha_mode: Material::BLEND,
+            ..base
+        };
+        veil.textures[slot::OPACITY].vertex = 1;
+        assert_eq!(veil.class(), SurfaceClass::Presence);
+        assert_ne!(record(&veil).flags & material_flags::PRESENCE, 0);
 
         let mut m = base;
         m.textures[slot::DISPLACEMENT].channels = 3;

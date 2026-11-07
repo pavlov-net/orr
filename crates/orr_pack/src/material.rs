@@ -317,7 +317,9 @@ impl Material {
         if self.transmission_weight > 0.0 {
             SurfaceClass::Dielectric
         } else if self.alpha_mode == Self::BLEND
-            && (self.geometry_opacity < 1.0 || self.bound(slot::OPACITY))
+            && (self.geometry_opacity < 1.0
+                || self.bound(slot::OPACITY)
+                || self.textures[slot::OPACITY].vertex != 0)
         {
             SurfaceClass::Presence
         } else {
