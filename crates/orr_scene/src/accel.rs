@@ -454,12 +454,13 @@ fn page_micromap(
     )?;
     let micromap = device.create_micromap(sizes.result_max, &block, 0)?;
     let scratch = step.block(MemoryKind::DeviceLocal, sizes.scratch, "omm scratch")?;
-    step.list()
+    step.list()?
         .build_micromap(&desc, &micromap, scratch.address());
     Ok(Some((micromap, block)))
 }
 
-/// Per page, its micromap and storage if it has one, and the point the last build signals.
+/// Per page, its micromap and storage if it has one, and the point the last build signals;
+/// none when no page has a micromap.
 type PageMicromaps = (
     Vec<Option<(Micromap, Allocation<u8>)>>,
     Option<TimelinePoint>,
@@ -475,20 +476,27 @@ pub(crate) fn page_micromaps(
 ) -> Result<PageMicromaps> {
     let caps = device.caps();
     let mut out: Vec<Option<(Micromap, Allocation<u8>)>> = pages.iter().map(|_| None).collect();
-    if !(caps.omm && caps.cluster.omm_in_clusters) || pages.iter().all(|p| p.1.is_none()) {
+    if !(caps.omm && caps.cluster.omm_in_clusters) {
         return Ok((out, None));
     }
-    let mut step = Step::new(device, build_queue(device), wait)?;
+    let mut step = Step::new(device, build_queue(device), wait);
     let mut built = 0;
+    let mut point = None;
     for (o, (page, region)) in out.iter_mut().zip(pages) {
         let Some(region) = region else { continue };
         *o = page_micromap(&mut step, *page, region)?;
-        built += u32::from(o.is_some());
-        if built > 0 && built % per_submit.max(1) == 0 {
-            step.submit()?;
+        if o.is_none() {
+            continue;
+        }
+        built += 1;
+        if built % per_submit.max(1) == 0 {
+            point = Some(step.submit()?);
         }
     }
-    Ok((out, Some(step.submit()?)))
+    if step.list.is_some() {
+        point = Some(step.submit()?);
+    }
+    Ok((out, point))
 }
 
 /// One list on the loading queue, the memory it reads and the point to wait first.
@@ -504,29 +512,26 @@ struct Step<'d> {
 }
 
 impl<'d> Step<'d> {
-    fn new(device: &'d Device, kind: QueueKind, wait: Option<TimelinePoint>) -> Result<Self> {
-        let mut s = Self {
+    fn new(device: &'d Device, kind: QueueKind, wait: Option<TimelinePoint>) -> Self {
+        Self {
             device,
             kind,
             list: None,
             keep: Vec::new(),
             previous: Vec::new(),
             wait: wait.into_iter().collect(),
-        };
-        s.open()?;
-        Ok(s)
+        }
     }
 
-    fn open(&mut self) -> Result<()> {
-        let queue = self.device.queue(self.kind).expect("loading queue");
-        let mut list = queue.command_list()?;
-        list.barrier(Stages::ALL, Stages::ALL, Hazards::ACCEL_STRUCT);
-        self.list = Some(list);
-        Ok(())
-    }
-
-    fn list(&mut self) -> &mut CommandList<'d> {
-        self.list.as_mut().expect("open list")
+    /// The open list, opening one if none is.
+    fn list(&mut self) -> Result<&mut CommandList<'d>> {
+        if self.list.is_none() {
+            let queue = self.device.queue(self.kind).expect("loading queue");
+            let mut list = queue.command_list()?;
+            list.barrier(Stages::ALL, Stages::ALL, Hazards::ACCEL_STRUCT);
+            self.list = Some(list);
+        }
+        Ok(self.list.as_mut().expect("opened above"))
     }
 
     fn block(&mut self, kind: MemoryKind, bytes: u64, name: &str) -> Result<GpuPtr<u8>> {
@@ -550,7 +555,7 @@ impl<'d> Step<'d> {
 
     fn dispatch(&mut self, p: &ComputePipeline, root: &AccelRoot, groups: u32) -> Result<()> {
         let root = self.upload(std::slice::from_ref(root), "accel root")?;
-        let list = self.list();
+        let list = self.list()?;
         list.dispatch(p, root, [groups.max(1), 1, 1]);
         list.barrier(
             Stages::COMPUTE,
@@ -560,13 +565,12 @@ impl<'d> Step<'d> {
         Ok(())
     }
 
-    /// Submits the list and opens the next.
+    /// Submits the open list; the next use opens another.
     fn submit(&mut self) -> Result<TimelinePoint> {
-        let queue = self.device.queue(self.kind).expect("loading queue");
         let list = self.list.take().expect("open list");
+        let queue = self.device.queue(self.kind).expect("loading queue");
         let point = queue.submit(vec![list], &std::mem::take(&mut self.wait))?;
         self.previous = std::mem::take(&mut self.keep);
-        self.open()?;
         Ok(point)
     }
 
@@ -641,7 +645,7 @@ fn pack(
     };
     let sizes = step.device.rtas_sizes(&desc);
     let scratch = step.block(MemoryKind::DeviceLocal, sizes.scratch, "move scratch")?;
-    step.list().rtas_execute(
+    step.list()?.rtas_execute(
         &desc,
         &RtasIo {
             args: records.address(),
@@ -654,7 +658,7 @@ fn pack(
         },
     );
     // Later builds in the same list read the moved structures.
-    step.list()
+    step.list()?
         .barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);
     Ok(dst)
 }
@@ -683,7 +687,7 @@ fn implicit(
     let scratch = step.block(MemoryKind::DeviceLocal, sizes.scratch, "build scratch")?;
     let addresses = d.gpu_malloc::<u64>(MemoryKind::Readback, u64::from(n), "addresses")?;
     let built = d.gpu_malloc::<u32>(MemoryKind::Readback, u64::from(n), "built sizes")?;
-    step.list().rtas_execute(
+    step.list()?.rtas_execute(
         desc,
         &RtasIo {
             args: records.address(),
@@ -695,7 +699,7 @@ fn implicit(
             src: GpuAddress(0),
         },
     );
-    step.list()
+    step.list()?
         .barrier(Stages::AS_BUILD, Stages::HOST, Hazards::empty());
     step.submit_and_wait()?;
     Ok((
@@ -740,7 +744,7 @@ pub(crate) fn build(
             point: None,
         });
     }
-    let mut step = Step::new(device, build_queue(device), wait)?;
+    let mut step = Step::new(device, build_queue(device), wait);
 
     // Micromaps, one per page with a micromap region, at most `limits.micromaps` a submit.
     let omm = caps.omm && caps.cluster.omm_in_clusters;
@@ -761,9 +765,12 @@ pub(crate) fn build(
                 }
             }
         }
-        // The CLAS builds below read the micromaps.
-        step.list()
-            .barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);
+        // The CLAS builds below read the micromaps; a new list's opening barrier covers those
+        // already submitted.
+        if built % limits.micromaps.max(1) != 0 {
+            step.list()?
+                .barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);
+        }
     }
 
     // CLAS: clusters without micromaps first, then those with, in batches of at most
@@ -837,7 +844,6 @@ pub(crate) fn build(
         }
     }
     let blas = jobs.build(&mut step, k, &mut accel.blocks)?;
-    let point = step.submit()?;
 
     let part_rows: usize = plans
         .iter()
@@ -891,6 +897,9 @@ pub(crate) fn build(
     )?;
     parts.as_mut_slice().expect("upload is mapped")[..part_records.len()]
         .copy_from_slice(&part_records);
+    // Everything fallible comes before the last submit, so a failed build leaves its moves
+    // unsubmitted.
+    let point = step.submit()?;
 
     let mut first = 0u64;
     let mut first_part = 0u64;
@@ -1073,7 +1082,7 @@ pub(crate) fn build_fine_cut(
     animated: Animated,
     clas: &[u64],
 ) -> Result<(RtCutGpu, FineCut, TimelinePoint)> {
-    let mut step = Step::new(device, build_queue(device), None)?;
+    let mut step = Step::new(device, build_queue(device), None);
     let error = clusters
         .iter()
         .map(|&i| infos[i as usize].self_error)
