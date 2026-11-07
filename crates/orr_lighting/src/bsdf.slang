@@ -17,8 +17,9 @@
 // Differences from the reference: reflection-only GGX lobes sample bounded visible normals (Eto and Tokuyoshi 2023); a
 // roughness below 0.01 is an ideal mirror and refraction; subsurface transmission is its own
 // lobe (`LOBE_VOLUME`), which `Bsdf.subsurface_entry` samples alone for a random walk; lobes
-// are chosen by their estimated albedo, glossy ones favored by up to `SPECULAR_BIAS`; and no
-// dispersion.
+// are chosen by their estimated albedo, glossy ones favored by up to `SPECULAR_BIAS`; no
+// dispersion; and refraction scales radiance, unless `bsdf_prepare` is told the path is adjoint,
+// which is the reference's form.
 //
 // `bsdf_prepare` is `bsdf_prepare_layers` followed by `Bsdf.finish` with the fitted `FOLD_*`
 // constants. `finish`, `eval` and `pdf` are forward-differentiable in `finish`'s `BsdfFit`;
@@ -143,6 +144,7 @@ public struct Bsdf : IDifferentiable
     no_diff bool mirror;
     no_diff bool bounded;               // reflection only: bounded visible-normal sampling
     no_diff float eta_refraction;
+    no_diff float radiance_scale;       // of refraction: 1 / eta_refraction^2, 1 for an adjoint path or a thin wall
     no_diff float eta_transparent;
     no_diff float eta_opaque;
     no_diff float3 reflect_transparent;
@@ -366,7 +368,7 @@ public struct Bsdf : IDifferentiable
             {
                 ok = openpbr_refract(v, h, c, eta_refraction, l);
                 lobe |= LOBE_TRANSMISSION;
-                w = tc * layer * leaving(l);
+                w = tc * layer * leaving(l) * radiance_scale;
                 within = 1.0 - pr;
             }
             break;
@@ -486,7 +488,7 @@ public struct Bsdf : IDifferentiable
             {
                 if (!openpbr_refract(v, float3(0.0, 0.0, 1.0), v.z, eta_refraction, own))
                     return float3(0.0);
-                w = tc * layer * leaving(own);
+                w = tc * layer * leaving(own) * radiance_scale;
                 within = 1.0 - pr;
             }
             break;
@@ -647,7 +649,7 @@ public struct Bsdf : IDifferentiable
         }
         if (probability[DIELECTRIC_MS] > 0.0)
         {
-            base += (l.z > 0.0 ? dms_reflect : dms_transmit) * dielectric_ms(l.z) * abs(l.z) * INV_PI;
+            base += (l.z > 0.0 ? dms_reflect : dms_transmit * radiance_scale) * dielectric_ms(l.z) * abs(l.z) * INV_PI;
             pdf += probability[DIELECTRIC_MS] * INV_TWO_PI * (l.z > 0.0 ? dms_ratio : 1.0 - dms_ratio);
         }
         float3 below = layer * leaving(l);
@@ -697,7 +699,7 @@ public struct Bsdf : IDifferentiable
         coefficients(c, rc, tc);
         tc *= transmit;
         pdf = (1.0 - reflect_probability(rc, tc)) * d * g1v * jacobian;
-        return d * g * jacobian * tc;
+        return d * g * jacobian * tc * radiance_scale;
     }
 
     // Subsurface transmission: GGX refraction plus its share of the dielectric multiple
@@ -1049,20 +1051,30 @@ public float3 bsdf_straight_transmission(BsdfParams p, float3 n, float3 wi, floa
     return max(t, 0.0);
 }
 
+// A `Bsdf` for a path that has no vertex yet.
+public Bsdf bsdf_unprepared()
+{
+    Bsdf s;
+    s.emitted = float3(0.0);
+    return s;
+}
+
 // Prepares `p` at shading normal `n` (unit) seen along `wo` (unit, toward the viewer), with
 // `exterior_ior` the medium on the side `n` points to. A view within 1e-4 of the surface
-// plane leans up to it.
-public Bsdf bsdf_prepare(BsdfParams p, float3 n, float3 wo, float exterior_ior = 1.0)
+// plane leans up to it. Refraction scales radiance by the squared ratio of the two IORs, so
+// a path traced from the camera and leaving through another surface cancels the scale. A path
+// carrying flux from a light is `adjoint`: its refraction keeps flux unscaled.
+public Bsdf bsdf_prepare(BsdfParams p, float3 n, float3 wo, float exterior_ior = 1.0, bool adjoint = false)
 {
     BsdfLayers layers;
-    Bsdf s = bsdf_prepare_layers(p, n, wo, exterior_ior, layers);
+    Bsdf s = bsdf_prepare_layers(p, n, wo, exterior_ior, adjoint, layers);
     BsdfFit fit = { FOLD_COAT, FOLD_COAT_SLOPE, FOLD_FUZZ };
     s.finish(layers, fit);
     return s;
 }
 
 // `bsdf_prepare` up to the fitted coefficients: `Bsdf.finish` with `layers` completes it.
-public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterior_ior, out BsdfLayers layers)
+public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterior_ior, bool adjoint, out BsdfLayers layers)
 {
     Bsdf s;
     bool thin = (p.flags & BSDF_THIN_WALLED) != 0;
@@ -1141,6 +1153,7 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.mix_weight = s.fresnel_mix ? p.specular_weight : 1.0;
     eta_r = eta_r >= 1.0 ? max(eta_r, 1.0001) : min(eta_r, 1.0 / 1.0001);
     s.eta_refraction = eta_r;
+    s.radiance_scale = adjoint || thin ? 1.0 : 1.0 / (eta_r * eta_r);
     s.eta_transparent = eta_t;
     s.eta_opaque = eta_o;
 

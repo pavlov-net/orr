@@ -153,6 +153,12 @@ impl RealTime {
     }
 }
 
+/// A camera path's weight over a light path's for the sample `u` draws from `view`.
+pub fn camera_weight(inputs: &Inputs, view: V3, u: V3) -> f32 {
+    // SAFETY: `view` and `u` are 3 floats.
+    unsafe { ffi::lighting_bsdf_camera_weight(inputs, view.as_ptr(), u.as_ptr()) }
+}
+
 /// `bsdf_subsurface_volume` of the material.
 pub fn subsurface_volume(inputs: &Inputs) -> Volume {
     let mut v = Volume::default();
@@ -406,6 +412,11 @@ mod ffi {
 
     unsafe extern "C" {
         pub(crate) fn lighting_bsdf_inputs_size() -> u32;
+        pub(crate) fn lighting_bsdf_camera_weight(
+            inputs: *const Inputs,
+            view: *const f32,
+            u: *const f32,
+        ) -> f32;
         pub(crate) fn lighting_bsdf_size() -> u32;
         pub(crate) fn lighting_bsdf_prepare(
             inputs: *const Inputs,

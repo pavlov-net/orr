@@ -54,6 +54,16 @@ export __extern_cpp void lighting_bsdf_delta_value(Bsdf* p, uint component, floa
     store3(value, p.delta_value(component, load3(wi), *chance));
 }
 
+// A camera path's sample weight from `u` over a light path's.
+export __extern_cpp float lighting_bsdf_camera_weight(Inputs* m, float* view, float* u)
+{
+    float3 n = float3(0.0, 0.0, 1.0);
+    BsdfParams p = bsdf_params(*m);
+    BsdfSample camera = bsdf_prepare(p, n, load3(view), m.exterior_ior).sample(load3(u));
+    BsdfSample light = bsdf_prepare(p, n, load3(view), m.exterior_ior, true).sample(load3(u));
+    return camera.weight.x / light.weight.x;
+}
+
 export __extern_cpp float lighting_dispersed_ior(float ior, float scale, float abbe, float nm)
 {
     return dispersed_ior(ior, scale, abbe, nm);
@@ -109,7 +119,7 @@ BsdfFit load_fit(float* p)
 Bsdf prepare_layers(Inputs m, float3 view, out BsdfLayers layers)
 {
     BsdfParams p = bsdf_collapse(bsdf_params(m));
-    return bsdf_prepare_layers(p, float3(0.0, 0.0, 1.0), view, m.exterior_ior, layers);
+    return bsdf_prepare_layers(p, float3(0.0, 0.0, 1.0), view, m.exterior_ior, true, layers);
 }
 
 [ForwardDifferentiable]

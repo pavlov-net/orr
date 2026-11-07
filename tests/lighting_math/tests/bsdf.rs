@@ -6,8 +6,8 @@
 use std::thread;
 
 use lighting_math::{
-    RealTime, dispersed_ior, edge_case, edge_direction, finite_non_negative, spectral_transfer,
-    subsurface_volume,
+    RealTime, camera_weight, dispersed_ior, edge_case, edge_direction, finite_non_negative,
+    spectral_transfer, subsurface_volume,
 };
 use openpbr_ref::harness::{self, Estimate, integrate_cells};
 use openpbr_ref::materials::{Material, VIEW_COSINES, grid, view};
@@ -691,6 +691,91 @@ fn finite_for_any_parameters_and_directions() {
                 );
             }
         }
+    }
+}
+
+/// Refraction scales a camera path's radiance by the squared IOR ratio, against a light path's
+/// flux, on rough and ideal glass from either side; reflection does not. A path that enters and
+/// leaves multiplies to 1.
+#[test]
+fn camera_paths_scale_refraction_by_the_squared_ior_ratio() {
+    let mut bsdf = RealTime::new();
+    for (roughness, exterior) in [(0.0f32, 1.0f32), (0.0, 1.33), (0.3, 1.0), (0.3, 1.33)] {
+        let glass = Inputs {
+            base_color: [1.0; 3],
+            specular_roughness: roughness,
+            specular_ior: 1.5,
+            transmission_weight: 1.0,
+            exterior_ior: exterior,
+            ..Inputs::default()
+        };
+        let mut through = [1.0f64; 2];
+        for (side, view) in [[0.3f32, 0.0, 0.954], [0.3, 0.0, -0.954]]
+            .iter()
+            .enumerate()
+        {
+            let (from, to) = if side == 1 {
+                (1.5, f64::from(exterior))
+            } else {
+                (f64::from(exterior), 1.5)
+            };
+            bsdf.prepare(&glass, *view);
+            for u in [[0.5f32, 0.5, 0.0], [0.5, 0.5, 0.999_99]] {
+                let Some(s) = bsdf.sample(u) else { continue };
+                let wanted = if s.lobe.is(Lobe::TRANSMISSION) {
+                    (from / to).powi(2)
+                } else {
+                    1.0
+                };
+                let got = f64::from(camera_weight(&glass, *view, u));
+                assert!(
+                    (got - wanted).abs() < 1e-3,
+                    "{got} against {wanted}: roughness {roughness}, {from} to {to}, {s:?}"
+                );
+                if s.lobe.is(Lobe::TRANSMISSION) {
+                    through[side] = got;
+                }
+            }
+        }
+        assert!((through[0] * through[1] - 1.0).abs() < 2e-3, "{through:?}");
+    }
+}
+
+/// A thin wall refracts nothing, so a camera path's weight is a light path's for every lobe of
+/// rough glass and of a rough subsurface leaf, from either side.
+#[test]
+fn camera_paths_through_thin_walls_keep_their_radiance() {
+    let mut bsdf = RealTime::new();
+    let glass = Inputs {
+        base_color: [1.0; 3],
+        specular_roughness: 0.5,
+        specular_ior: 1.5,
+        transmission_weight: 1.0,
+        geometry_thin_walled: 1,
+        ..Inputs::default()
+    };
+    let leaf = Inputs {
+        transmission_weight: 0.0,
+        subsurface_weight: 1.0,
+        ..glass
+    };
+    let mut rng = Rng::new(7);
+    for inputs in [glass, leaf] {
+        let mut through = 0;
+        for view in [[0.3f32, 0.0, 0.954], [0.3, 0.0, -0.954]] {
+            bsdf.prepare(&inputs, view);
+            for _ in 0..4096 {
+                let u = [rng.f32(), rng.f32(), rng.f32()];
+                let Some(s) = bsdf.sample(u) else { continue };
+                through += usize::from(s.lobe.is(Lobe::TRANSMISSION));
+                let got = camera_weight(&inputs, view, u);
+                assert!(
+                    (got - 1.0).abs() < 1e-3,
+                    "{got}: {inputs:?}, {view:?}, {s:?}"
+                );
+            }
+        }
+        assert!(through > 0, "{inputs:?}");
     }
 }
 

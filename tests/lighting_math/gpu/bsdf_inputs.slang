@@ -47,5 +47,5 @@ Bsdf prepare(Inputs m, float3 view, bool collapse)
     BsdfParams p = bsdf_params(m);
     if (collapse)
         p = bsdf_collapse(p);
-    return bsdf_prepare(p, float3(0.0, 0.0, 1.0), view, m.exterior_ior);
+    return bsdf_prepare(p, float3(0.0, 0.0, 1.0), view, m.exterior_ior, true);
 }
