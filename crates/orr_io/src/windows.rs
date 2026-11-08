@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::ffi::{CStr, c_void};
 use std::fs::File;
 use std::io;
@@ -87,9 +88,18 @@ pub(crate) fn read_overlapped(
     offset: u64,
     buf: &mut [MaybeUninit<u8>],
 ) -> io::Result<usize> {
-    let event = Event::create(true)?;
+    thread_local! {
+        /// The event this thread's reads finish on. A read resets it as it starts.
+        static EVENT: OnceCell<Event> = const { OnceCell::new() };
+    }
+    let event = EVENT.with(|cell| {
+        if cell.get().is_none() {
+            let _ = cell.set(Event::create(true)?);
+        }
+        Ok::<_, io::Error>(cell.get().expect("just set").0)
+    })?;
     let mut overlapped = OVERLAPPED {
-        hEvent: event.0,
+        hEvent: event,
         ..Default::default()
     };
     overlapped.Anonymous.Anonymous = OVERLAPPED_0_0 {
