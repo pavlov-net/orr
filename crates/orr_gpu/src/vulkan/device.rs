@@ -526,7 +526,11 @@ impl Device {
                 device_local_bytes: memory.heap_size(MemoryKind::DeviceLocal),
                 upload_bytes: memory.heap_size(MemoryKind::Upload),
                 host_import_align: if host_memory {
-                    host_memory_props.min_imported_host_pointer_alignment
+                    host_memory::import_align(
+                        &device,
+                        &family_list,
+                        host_memory_props.min_imported_host_pointer_alignment,
+                    )
                 } else {
                     0
                 },

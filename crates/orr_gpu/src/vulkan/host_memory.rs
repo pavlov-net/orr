@@ -96,6 +96,30 @@ pub(super) fn usage() -> vk::BufferUsageFlags {
     U::TRANSFER_SRC | U::TRANSFER_DST | U::STORAGE_BUFFER | U::SHADER_DEVICE_ADDRESS
 }
 
+/// The alignment of imports: `min_pointer` (`minImportedHostPointerAlignment`) and the
+/// memory alignment an import's buffer asks, both powers of two, so the larger is their least
+/// common multiple.
+pub(super) fn import_align(device: &ash::Device, families: &[u32], min_pointer: u64) -> u64 {
+    let (sharing_mode, families) = sharing(families);
+    let mut external = vk::ExternalMemoryBufferCreateInfo::default()
+        .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+    let info = vk::BufferCreateInfo::default()
+        .size(min_pointer)
+        .usage(usage())
+        .sharing_mode(sharing_mode)
+        .queue_family_indices(families)
+        .push(&mut external);
+    let mut out = vk::MemoryRequirements2::default();
+    // SAFETY: valid create info.
+    unsafe {
+        device.get_device_buffer_memory_requirements(
+            &vk::DeviceBufferMemoryRequirements::default().create_info(&info),
+            &mut out,
+        );
+    }
+    min_pointer.max(out.memory_requirements.alignment)
+}
+
 /// The memory types the driver can import the host memory at `ptr` as.
 ///
 /// # Safety

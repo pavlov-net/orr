@@ -145,8 +145,9 @@ pub struct Limits {
     /// Regions one [`crate::CommandList::decompress`] may list; 0 without
     /// `Caps::memory_decompression`.
     pub max_decompress_regions: u32,
-    /// The alignment of the start and length of an import of host memory
-    /// (`minImportedHostPointerAlignment`); 0 without `Caps::host_memory_import`.
+    /// The alignment of the start and length of an import of host memory: the larger of
+    /// `minImportedHostPointerAlignment` and the memory alignment the import's buffer asks;
+    /// 0 without `Caps::host_memory_import`.
     pub host_import_align: u64,
     /// Pipelines one execution set may hold; 0 without `Caps::generated_commands`.
     pub max_generated_pipelines: u32,
