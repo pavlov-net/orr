@@ -17,7 +17,7 @@
 
 use std::collections::BTreeSet;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::MountId;
 
@@ -669,12 +669,13 @@ impl Residency {
         }
         let mut dropped = [0; SOURCES];
         let (mut waiting, mut over_limits) = (0, 0);
+        let mut started = FxHashSet::default();
         for (k, (_, source)) in requests {
             match self.unit(k).map(|u| u.state) {
                 Some(State::Absent) => {}
                 _ => continue,
             }
-            let chain = match self.closure(k) {
+            let chain = match self.closure(k, &started) {
                 Ok(chain) => chain,
                 Err(State::Loading) => {
                     waiting += 1;
@@ -698,6 +699,7 @@ impl Residency {
             }
             for u in chain {
                 self.start_load(u);
+                started.insert(u);
                 plan.loads.push(u);
             }
         }
@@ -710,9 +712,9 @@ impl Residency {
         plan
     }
 
-    /// `k` and every absent unit it depends on, dependencies first; or the state of one
-    /// still loading from an earlier plan or failed.
-    fn closure(&self, k: Key) -> Result<Vec<Key>, State> {
+    /// `k` and every absent unit it depends on, dependencies first, past those this plan
+    /// `started`; or the state of one still loading from an earlier plan or failed.
+    fn closure(&self, k: Key, started: &FxHashSet<Key>) -> Result<Vec<Key>, State> {
         let mut out = Vec::new();
         let mut stack = vec![(k, false)];
         while let Some((k, expanded)) = stack.pop() {
@@ -722,6 +724,7 @@ impl Residency {
             let u = self.unit(k).expect("a unit of a mount");
             match u.state {
                 State::Resident => continue,
+                State::Loading if started.contains(&k) => continue,
                 s @ (State::Loading | State::Failed) => return Err(s),
                 State::Absent => {}
             }
@@ -1108,6 +1111,25 @@ mod tests {
         assert!(r.landed(key(0), true, 1));
         assert_eq!(step(&mut r, &[1], 2).loads, vec![key(1)]);
         assert_eq!(class(&r).resident_bytes, 200);
+    }
+
+    #[test]
+    fn requests_sharing_a_dependency_load_together() {
+        let mut r = Residency::new(limits(u64::MAX));
+        r.register(
+            M,
+            &[
+                unit(10, &[], Start::Absent),
+                unit(10, &[0], Start::Absent),
+                unit(10, &[0], Start::Absent),
+            ],
+        )
+        .unwrap();
+        r.request(key(1), P, S);
+        r.request(key(2), P, S);
+        let plan = r.plan(1);
+        assert_eq!(plan.loads, [key(0), key(1), key(2)]);
+        assert_eq!(r.stats().waiting, 0);
     }
 
     #[test]
