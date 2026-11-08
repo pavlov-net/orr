@@ -239,6 +239,17 @@ pub(crate) fn free_pages(p: NonNull<u8>) {
     unsafe { VirtualFree(p.as_ptr().cast(), 0, MEM_RELEASE as u32) };
 }
 
+/// A file registration whose completion has not popped.
+struct Registration {
+    /// Its user data.
+    data: usize,
+    /// The handles, which the system may read until the completion pops.
+    _handles: Box<[HANDLE]>,
+    /// Their files, which keep the handles open meanwhile though the reads of a file complete
+    /// first, as reads already in the kernel do while a failed submit holds the registration.
+    _files: Vec<Arc<crate::ReadFile>>,
+}
+
 /// One IoRing with the pool's buffers registered, and the files of its reads.
 pub(crate) struct OsRing {
     fns: Fns,
@@ -248,9 +259,8 @@ pub(crate) struct OsRing {
     unsubmitted: bool,
     /// The last submit failed, leaving its entries in the queue.
     failed: bool,
-    /// The handles of each file registration whose completion has not popped, which the
-    /// system may read until then, by user data.
-    registrations: Vec<(usize, Box<[HANDLE]>)>,
+    /// The file registrations whose completions have not popped.
+    registrations: Vec<Registration>,
     /// File registrations built so far.
     registered: usize,
 }
@@ -354,15 +364,25 @@ impl OsRing {
                     .map_or(std::ptr::null_mut(), |f| f.file.handle.as_raw_handle())
             })
             .collect();
+        let open = files
+            .iter()
+            .flatten()
+            .map(|f| Arc::clone(&f.file))
+            .collect();
         self.registered += 1;
         let data = REGISTRATION | self.registered;
-        // SAFETY: the array stays in `registrations` until the registration's completion pops.
+        // SAFETY: the array and its files stay in `registrations` until the registration's
+        // completion pops.
         unsafe {
             (self.fns.register_files)(self.ring, handles.len() as u32, handles.as_ptr(), data)
         }
         .ok()
         .expect("a file registration has room in the queue");
-        self.registrations.push((data, handles));
+        self.registrations.push(Registration {
+            data,
+            _handles: handles,
+            _files: open,
+        });
         self.unsubmitted = true;
     }
 
@@ -453,7 +473,7 @@ impl OsRing {
                     "file registration: {}",
                     cqe.ResultCode.message()
                 );
-                self.registrations.retain(|&(data, _)| data != cqe.UserData);
+                self.registrations.retain(|r| r.data != cqe.UserData);
                 continue;
             }
             let n = match cqe.ResultCode.ok() {
