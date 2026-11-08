@@ -135,6 +135,7 @@ pub struct Budgets {
     /// take, which the system's ring registers and, where the device imports host memory, the
     /// GPU reads in place: room for `in_flight_bytes` of decoded units and as much again of
     /// their stored input. Reads and staging that find no room take memory of their own.
+    /// Above 0.
     pub in_flight_bytes: u64,
     /// Bytes per block of the stream pool.
     pub stream_block: u64,
@@ -427,6 +428,7 @@ impl Scenes {
         assert!(desc.frames_in_flight >= 1, "frames_in_flight is at least 1");
         assert!(desc.cell_log2 <= 16, "cells of 2^{} m", desc.cell_log2);
         let b = &desc.budgets;
+        assert!(b.in_flight_bytes > 0, "in_flight_bytes is above 0");
         // Cluster ids are 32 bits.
         let clusters =
             u32::try_from(b.mesh_page_pool / b.resident_cluster_bytes).unwrap_or(u32::MAX);
