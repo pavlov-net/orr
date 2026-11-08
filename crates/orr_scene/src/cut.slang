@@ -128,7 +128,7 @@ public struct CutGpu
     public SlotCutGpu* slots;      // per instance slot
     public NodeItem* queue[2];
     public ClusterWork* candidates; // the raster candidate cut
-    public uint2* entries;         // ray-tracing cut clusters: slot | WORK_RETRY, mesh cluster
+    public uint2* entries;         // ray-tracing cut clusters: slot | WORK_RETRY, cluster id
     public uint64_t* clas;         // CLAS addresses of the BLAS built this frame
     public BlasJob* jobs;
     public uint64_t* job_blas;     // the built BLAS addresses, by job

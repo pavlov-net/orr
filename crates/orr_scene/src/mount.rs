@@ -1413,7 +1413,9 @@ struct ResolvedMesh {
     clusters: Vec<ClusterInfo>,
     micromaps: Vec<Option<PageMicromap>>,
     parts: Vec<Part>,
-    /// Resident cluster table entries from `gpu.cluster_base` on.
+    /// The cluster id of mesh cluster 0: its pinned pages' clusters take the ids that follow.
+    cluster_base: u32,
+    /// Resident cluster table entries of its pinned pages' clusters, from `cluster_base` on.
     refs: Vec<ClusterRef>,
     rt: MeshRt,
     depth: Option<u32>,
@@ -1571,6 +1573,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                         pages: GpuPtr::NULL,
                         node_pages: GpuPtr::NULL,
                         page_clusters: GpuPtr::from_address(orr_gpu::GpuAddress(m.page_clusters)),
+                        page_bases: GpuPtr::NULL,
                         levels: GpuPtr::from_address(orr_gpu::GpuAddress(m.levels.0)),
                         page_count: pages,
                         node_page_count: node_pages,
@@ -1579,7 +1582,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                         position_step: m.header.step(),
                         attributes: u32::from(m.header.attributes),
                         merge_error: m.header.merge_error,
-                        cluster_base: 0,
+                        _pad: 0,
                         rt_cut_count: 0,
                         part_count: m.header.parts.count.max(1),
                         rt_cuts: GpuPtr::NULL,
@@ -1619,6 +1622,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 clusters,
                 micromaps: m.micromaps,
                 parts: m.parts,
+                cluster_base: 0,
                 refs: Vec::new(),
                 rt: MeshRt::default(),
                 depth: m.depth,
@@ -1779,7 +1783,7 @@ fn build_accel(
                 capacity: shared.cluster_capacity,
             })?;
         r.cluster_ranges.push((base, n));
-        m.gpu.cluster_base = base;
+        m.cluster_base = base;
     }
     let inputs: Vec<MeshInput<'_>> = r
         .meshes
@@ -1792,7 +1796,7 @@ fn build_accel(
             micromaps: &m.micromaps,
             levels: &m.levels,
             non_opaque,
-            cluster_base: m.gpu.cluster_base,
+            cluster_base: m.cluster_base,
             parts: &m.parts,
             cached: &m.cached,
             fine: &m.fine,
@@ -2131,6 +2135,8 @@ pub(crate) struct Mounts {
     model_materials: Allocation<u32>,
     model_material_ranges: RangeAllocator,
     page_table: Allocation<u64>,
+    /// Beside each page's entry of the page table, the cluster id of its first cluster.
+    page_bases: Allocation<u32>,
     page_ranges: RangeAllocator,
     sizes: TableSizes,
     pages: Vec<Option<InstancePage>>,
@@ -2243,8 +2249,8 @@ fn units(
                 header: m.header,
                 pages: pages.clone(),
                 table: *table,
-                clusters: clusters.offset(u64::from(m.gpu.cluster_base)),
-                cluster_base: m.gpu.cluster_base,
+                clusters: clusters.offset(u64::from(m.cluster_base)),
+                cluster_base: m.cluster_base,
                 non_opaque: m.non_opaque.clone(),
                 mesh,
                 pinned: m.header.pinned_pages,
@@ -2460,6 +2466,7 @@ impl Mounts {
             )?,
             model_material_ranges: RangeAllocator::new(sizes.model_materials),
             page_table: device.gpu_malloc(m, u64::from(sizes.page_table), "mesh page table")?,
+            page_bases: device.gpu_malloc(m, u64::from(sizes.page_table), "mesh page bases")?,
             page_ranges: RangeAllocator::new(sizes.page_table),
             sizes,
             pages: Vec::new(),
@@ -2679,6 +2686,7 @@ impl Mounts {
             },
         )?;
         let table = self.page_table.gpu().offset(u64::from(start));
+        let bases = self.page_bases.gpu().offset(u64::from(start));
         let clusters = self.clusters.gpu().offset(u64::from(base));
 
         let mut own = vec![false; page_count as usize];
@@ -2721,6 +2729,8 @@ impl Mounts {
             }
         }
         w.put(table, &page_table)?;
+        let firsts: Vec<u32> = stream.pages.iter().map(|q| base + q.first).collect();
+        w.put(bases, &firsts)?;
         w.put(clusters, &refs)?;
 
         let micromap = |k: usize| {
@@ -2751,7 +2761,7 @@ impl Mounts {
         // The merged stage would bypass what the edit pins. Part BLAS are gathered with the cut.
         let gpu = MeshGpu {
             pages: table,
-            cluster_base: base,
+            page_bases: bases,
             merge_error: f32::INFINITY,
             root_count: src_gpu
                 .root_count
@@ -3494,8 +3504,16 @@ impl Mounts {
             let table = self.page_table.gpu().offset(u64::from(start));
             tables.push(table);
             w.put(table, &m.page_addresses)?;
+            let bases = self.page_bases.gpu().offset(u64::from(start));
+            let firsts: Vec<u32> = m
+                .all_pages
+                .iter()
+                .map(|p| m.cluster_base + p.first)
+                .collect();
+            w.put(bases, &firsts)?;
             let gpu = MeshGpu {
                 pages: table,
+                page_bases: bases,
                 node_pages: table.offset(u64::from(m.gpu.page_count)),
                 feedback_pages: start,
                 feedback_nodes: start + m.gpu.page_count,
@@ -3503,7 +3521,7 @@ impl Mounts {
             };
             w.put(self.meshes.gpu().offset(u64::from(id)), &[gpu])?;
             w.put(
-                self.clusters.gpu().offset(u64::from(m.gpu.cluster_base)),
+                self.clusters.gpu().offset(u64::from(m.cluster_base)),
                 &m.refs,
             )?;
             res.rt.push(m.rt.clone());

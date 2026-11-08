@@ -2639,13 +2639,14 @@ fn stream_sheets(dev: &Device) {
     let (mesh, _) = mesh_of(&scenes, &gpu, models[0]);
     let first = landed[0];
     let firsts: Vec<u32> = gpu.values(mesh.page_clusters, mesh.page_count + 1);
+    let bases: Vec<u32> = gpu.values(mesh.page_bases, mesh.page_count);
     let refs: Vec<orr_scene::ClusterRef> = gpu.values(
-        root.clusters
-            .offset(u64::from(mesh.cluster_base + firsts[first])),
+        root.clusters.offset(u64::from(bases[first])),
         firsts[first + 1] - firsts[first],
     );
-    for r in &refs {
+    for (r, i) in refs.iter().zip(0..) {
         assert_eq!(r.page.address().0, near[first]);
+        assert_eq!((r.local, r.mesh_cluster), (i, firsts[first] + i));
         assert_eq!(r.clas != 0, traced, "CLAS built for traced devices");
     }
     if traced {

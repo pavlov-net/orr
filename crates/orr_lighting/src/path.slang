@@ -2626,7 +2626,8 @@ public bool surface_chains(PathRoot r, GSurface g)
     MeshGpu* mesh = s.meshes + model.mesh;
     if (mesh.casters.count == 0 || inst.first_emissive == NO_EMISSIVE)
         return false;
-    ClusterRef cr = s.clusters[mesh.cluster_base + g.cluster];
+    uint id = mesh_cluster_id(mesh, g.cluster);
+    ClusterRef cr = s.clusters[id];
     Cluster c = load_cluster(cr.page, cr.local);
     uint rank = mesh.casters.ranks[c.section];
     if (rank == NO_RANK || mesh.emissive.count + rank >= inst.emissive_count)
@@ -2634,7 +2635,7 @@ public bool surface_chains(PathRoot r, GSurface g)
     if ((s.materials[section_material(s, inst, model, c.section)].flags & MATERIAL_CASTER) == 0)
         return false;
     EmissiveSelection e = source.entries[inst.first_emissive + mesh.emissive.count + rank];
-    uint p = list_position(e, g.cluster);
+    uint p = list_position(e, id, g.cluster);
     return p < e.count && list_step(e, p) > 0.0;
 }
 

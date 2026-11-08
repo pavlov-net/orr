@@ -79,7 +79,7 @@ public struct EmissiveGpu
     public uint gathered;        // instance: clusters its copy's traversal gathered this frame
 }
 
-// An instance entry's gathered list in `SceneRoot.emissive_lists`: its mesh clusters, then
+// An instance entry's gathered list in `SceneRoot.emissive_lists`: its cluster ids, then
 // their inclusive fixed-point CDF.
 public uint* gathered_list(uint* lists, uint instance_entry)
 {

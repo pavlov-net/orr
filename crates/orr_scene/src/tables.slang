@@ -202,7 +202,8 @@ public struct MeshLevel
     public uint count;
 }
 
-// A resident cluster, named by the cluster id of its CLAS.
+// A resident cluster, named by its cluster id: the id its CLAS carries, its page's base in
+// `MeshGpu.page_bases` plus its index in the page.
 public struct ClusterRef
 {
     public uint8_t* page;
@@ -301,6 +302,7 @@ public struct MeshGpu
     public uint64_t* pages;        // resident page per MeshHeader page
     public uint64_t* node_pages;   // node page per MeshHeader node page
     public uint* page_clusters;    // first mesh cluster index per page, then the cluster count
+    public uint* page_bases;       // per page while it is resident: the cluster id of its first cluster
     public MeshLevel* levels;      // finest first; none in DAG mode
     public uint page_count;
     public uint node_page_count;
@@ -309,7 +311,7 @@ public struct MeshGpu
     public float position_step;    // m: the position grid step
     public uint attributes;        // orr_pack.mesh MESH_*
     public float merge_error;      // DAG mode: the error from which the merged stage serves; infinity without one
-    public uint cluster_base;      // cluster id of mesh cluster 0
+    public uint _pad;
     public uint rt_cut_count;      // 0: not traced
     public uint part_count;        // transforms per pose block: the mesh's parts, at least 1
     public RtCutGpu* rt_cuts;      // finest first
@@ -635,6 +637,13 @@ public uint cluster_page(MeshGpu* mesh, uint cluster)
             hi = mid;
     }
     return lo;
+}
+
+// The cluster id of mesh cluster `cluster` of `mesh`, whose page is resident.
+public uint mesh_cluster_id(MeshGpu* mesh, uint cluster)
+{
+    uint page = cluster_page(mesh, cluster);
+    return mesh.page_bases[page] + cluster - mesh.page_clusters[page];
 }
 
 // Entry `index` of the transforms in `transforms` as a row-major [L | t] relative to the group's

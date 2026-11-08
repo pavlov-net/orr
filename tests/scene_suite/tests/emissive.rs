@@ -908,9 +908,12 @@ fn a_copy_tracing_a_cut_it_built_samples_its_gathered_clusters() {
             let areas: Vec<f64> = list[..n as usize]
                 .iter()
                 .map(|&c| {
-                    assert!(c < mesh.cluster_count, "rank {}: cluster {c}", e.rank);
-                    let r: ClusterRef =
-                        read_buffer(root.clusters.offset(u64::from(mesh.cluster_base + c)), 1)[0];
+                    let r: ClusterRef = read_buffer(root.clusters.offset(u64::from(c)), 1)[0];
+                    assert!(
+                        r.mesh_cluster < mesh.cluster_count,
+                        "rank {}: cluster id {c}",
+                        e.rank
+                    );
                     let at = 96 + u64::from(r.local) * size_of::<Cluster>() as u64;
                     let cl: Cluster = read_buffer(r.page.offset(at).cast(), 1)[0];
                     assert_eq!(

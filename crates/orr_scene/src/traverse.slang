@@ -78,8 +78,9 @@ float focus_error(Placement p, float4 sphere, float error)
     return error * p.scale / d * root.focus_offset.w;
 }
 
-// Adds mesh cluster `mesh_cluster` to the ray-tracing cut of slot `c`, `work` its entry's slot.
-void gather_cluster(CutGpu* cut, SlotCutGpu* c, uint work, uint mesh_cluster)
+// Adds the cluster of cluster id `id`, mesh cluster `mesh_cluster`, to the ray-tracing cut of
+// slot `c`, `work` its entry's slot. The cut's hash is over mesh clusters, as a cached cut's.
+void gather_cluster(CutGpu* cut, SlotCutGpu* c, uint work, uint id, uint mesh_cluster)
 {
     uint e;
     InterlockedAdd(cut.counters[CUT_ENTRIES], 1, e);
@@ -89,7 +90,7 @@ void gather_cluster(CutGpu* cut, SlotCutGpu* c, uint work, uint mesh_cluster)
         InterlockedOr(c.flags, CUT_RT_LOST);
         return;
     }
-    cut.entries[e] = uint2(work, mesh_cluster);
+    cut.entries[e] = uint2(work, id);
     uint2 h = cluster_hash(mesh_cluster);
     InterlockedAdd(c.rt_count, 1);
     atomic_add_at(c.rt_hash, 0, h.x);
@@ -433,10 +434,11 @@ void init(uint3 id: SV_DispatchThreadID)
             EditGroupGpu held = mesh.edit.groups[g];
             uint8_t* data = (uint8_t*)mesh.pages[held.page];
             uint mesh_first = mesh.page_clusters[held.page] + held.first_cluster;
+            uint id_first = mesh.page_bases[held.page] + held.first_cluster;
             for (uint i = 0; i < held.cluster_count; i++)
             {
                 if (!section_hidden(inst, load_cluster(data, held.first_cluster + i).section))
-                    gather_cluster(cut, cut.slots + slot, slot, mesh_first + i);
+                    gather_cluster(cut, cut.slots + slot, slot, id_first + i, mesh_first + i);
             }
         }
         return;
@@ -750,6 +752,7 @@ void traverse(uint3 id: SV_DispatchThreadID)
     }
     report_mesh_page(cut, mesh, g.page, false, 0.0);
     uint mesh_first = mesh.page_clusters[g.page] + g.first_cluster;
+    uint id_first = mesh.page_bases[g.page] + g.first_cluster;
     for (uint run = 0; run < g.cluster_count; run += 32)
     {
         uint raster_mask = 0;
@@ -761,7 +764,7 @@ void traverse(uint3 id: SV_DispatchThreadID)
                 raster_mask |= 1u << (i - run);
             if ((mask & 2) != 0 && !section_hidden(inst, cl.section) && selected(mesh, p, cl, l, 1, g.depth, g.error))
             {
-                gather_cluster(cut, c, slot | (retry ? WORK_RETRY : 0), mesh_first + i);
+                gather_cluster(cut, c, slot | (retry ? WORK_RETRY : 0), id_first + i, mesh_first + i);
             }
         }
         if (raster_mask != 0)
@@ -988,11 +991,11 @@ void share(uint3 id: SV_DispatchThreadID)
     cut.slots[slot] = c;
 }
 
-// Which of a CUT_PARTS slot's lists mesh cluster `mesh_cluster` goes to: 0 the body, else
+// Which of a CUT_PARTS slot's lists the cluster of cluster id `id` goes to: 0 the body, else
 // 1 + its animated part.
-uint part_list(SceneRoot* s, MeshGpu* mesh, uint mesh_cluster)
+uint part_list(SceneRoot* s, MeshGpu* mesh, uint id)
 {
-    ClusterRef r = s.clusters[mesh.cluster_base + mesh_cluster];
+    ClusterRef r = s.clusters[id];
     Cluster cl = load_cluster(r.page, r.local);
     bool animated = (cl.flags & CLUSTER_ANIMATED_PART) != 0 && cl.part >= mesh.first_animated;
     return animated ? 1 + cl.part - mesh.first_animated : 0;
@@ -1117,33 +1120,33 @@ void prepare(uint3 id: SV_DispatchThreadID)
     a[2] = 1;
 }
 
-// Adds mesh cluster `mesh_cluster` of a slot tracing a cut built this frame to the gathered
+// Adds the cluster of cluster id `id` of a slot tracing a cut built this frame to the gathered
 // list of entry `entry` of its copy, which has `entries` from `first`.
-void gather_into(SceneRoot* s, uint first, uint entries, uint entry, uint mesh_cluster)
+void gather_into(SceneRoot* s, uint first, uint entries, uint entry, uint id)
 {
     if (entry >= entries)
         return;
     uint at;
     InterlockedAdd(s.emissive[first + entry].gathered, 1, at);
     if (at < GATHERED_CLUSTERS)
-        gathered_list(s.emissive_lists, first + entry - s.producer_capacity)[at] = mesh_cluster;
+        gathered_list(s.emissive_lists, first + entry - s.producer_capacity)[at] = id;
 }
 
-// Adds mesh cluster `mesh_cluster` of a slot tracing a cut built this frame to the gathered
+// Adds the cluster of cluster id `id` of a slot tracing a cut built this frame to the gathered
 // lists of its section's emissive entry and caster entry, where it has them.
-void gather_emissive(SceneRoot* s, InstanceGpu inst, MeshGpu* mesh, uint mesh_cluster)
+void gather_emissive(SceneRoot* s, InstanceGpu inst, MeshGpu* mesh, uint id)
 {
     if (inst.first_emissive == NO_EMISSIVE || mesh.edit != nullptr || (mesh.emissive.count == 0 && mesh.casters.count == 0))
         return;
-    ClusterRef r = s.clusters[mesh.cluster_base + mesh_cluster];
+    ClusterRef r = s.clusters[id];
     uint section = load_cluster(r.page, r.local).section;
     if (mesh.emissive.count != 0)
-        gather_into(s, inst.first_emissive, inst.emissive_count, mesh.emissive.ranks[section], mesh_cluster);
+        gather_into(s, inst.first_emissive, inst.emissive_count, mesh.emissive.ranks[section], id);
     if (mesh.casters.count != 0)
     {
         uint rank = mesh.casters.ranks[section];
         if (rank != NO_RANK)
-            gather_into(s, inst.first_emissive, inst.emissive_count, mesh.emissive.count + rank, mesh_cluster);
+            gather_into(s, inst.first_emissive, inst.emissive_count, mesh.emissive.count + rank, id);
     }
 }
 
@@ -1184,7 +1187,7 @@ void gather(uint3 id: SV_DispatchThreadID)
     }
     if (k >= count)
         return;
-    cut.clas[first + k] = s.clusters[mesh.cluster_base + e.y].clas;
+    cut.clas[first + k] = s.clusters[e.y].clas;
 }
 
 // One thread per BLAS built this frame: its cluster BLAS record.

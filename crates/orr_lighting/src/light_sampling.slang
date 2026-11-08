@@ -97,8 +97,9 @@ public struct EmissiveSelection
     // Per position: the inclusive sum of the weights in fixed point, the last 0xffffffff. A
     // position's probability is its step over 0xffffffff; a step of 0 is never drawn.
     public uint* cdf;
-    // Per position: an instance entry's mesh cluster; null for a producer entry, whose
-    // position is the cluster's index in its batch.
+    // Per position: an instance entry's mesh cluster in a cooked set, its cluster id in a
+    // gathered list; null for a producer entry, whose position is the cluster's index in its
+    // batch.
     public uint* clusters;
     // A cooked set's (mesh cluster, position), ascending by cluster; null for a gathered list,
     // which hits search in `clusters`.
@@ -731,9 +732,10 @@ public uint range_mass(EmissiveSelection e, uint first, uint count)
     return e.cdf[first + count - 1] - (first > 0 ? e.cdf[first - 1] : 0u);
 }
 
-// The position of an instance entry's list that holds mesh cluster `mesh_cluster`, or its count
-// where none does: a lower bound on a cooked set's index, a search of a gathered list.
-public uint list_position(EmissiveSelection e, uint mesh_cluster)
+// The position of an instance entry's list that holds the cluster of cluster id `id`, mesh
+// cluster `mesh_cluster`, or its count where none does: a lower bound on a cooked set's index,
+// a search of a gathered list.
+public uint list_position(EmissiveSelection e, uint id, uint mesh_cluster)
 {
     if (e.index != nullptr)
     {
@@ -751,7 +753,7 @@ public uint list_position(EmissiveSelection e, uint mesh_cluster)
     }
     for (uint k = 0; k < e.count; k++)
     {
-        if (e.clusters[k] == mesh_cluster)
+        if (e.clusters[k] == id)
             return k;
     }
     return e.count;
@@ -779,7 +781,7 @@ public bool list_cluster(SceneRoot* s, EmissiveSelection e, uint entry, uint p, 
     uint slot = s.emissive[entry].source;
     InstanceGpu inst = copy_record(s, slot);
     MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
-    cluster_id = mesh.cluster_base + e.clusters[p];
+    cluster_id = e.index != nullptr ? mesh_cluster_id(mesh, e.clusters[p]) : e.clusters[p];
     ClusterRef r = s.clusters[cluster_id];
     Cluster c = load_cluster(r.page, r.local);
     SlotStateGpu st = s.slot_state[slot];
@@ -949,7 +951,7 @@ public EmitterHit emitter_hit(LightSetGpu* set, uint instance_index, uint cluste
         if (rank >= inst.emissive_count)
             return h;
         entry = inst.first_emissive + rank;
-        p = list_position(set.emissive[entry], r.mesh_cluster);
+        p = list_position(set.emissive[entry], cluster_id, r.mesh_cluster);
         triangles = c.tri_count;
     }
     EmissiveSelection e = set.emissive[entry];
