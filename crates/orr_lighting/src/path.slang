@@ -490,11 +490,9 @@ public LocalLights* pixel_local_lights(PathRoot r, uint2 pixel)
 // phase function.
 public interface IScatter
 {
-    // BSDF x cos, or the phase function, toward `wi`, and in `pdf` the density the vertex's own
-    // sampling draws `wi` with.
-    float3 eval_and_pdf(float3 wi, out float pdf);
-    // What of `eval_and_pdf`'s value toward `wi` its diffuse lobes give.
-    float3 diffuse(float3 wi);
+    // BSDF x cos, or the phase function, toward `wi`; in `pdf` the density the vertex's own
+    // sampling draws `wi` with, and in `diffuse` what of the value its diffuse lobes give.
+    float3 eval_and_pdf(float3 wi, out float pdf, out float3 diffuse);
 }
 
 // The shadow rays of next-event estimation.
@@ -529,6 +527,7 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
     ResolvedLightSample chosen = no_candidate();
     float chosen_target = 0.0;
     float3 chosen_f = float3(0.0);
+    float3 chosen_diffuse = float3(0.0);
     float chosen_scatter_pdf = 0.0;
     float sum = 0.0;
     uint end = rng.dimension + 1 + 6 * candidates;
@@ -541,7 +540,8 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
         if (!(c.pdf > 0.0) || (no_environment && c.kind == LIGHT_SAMPLE_ENVIRONMENT))
             continue;
         float scatter_pdf;
-        float3 fc = f.eval_and_pdf(c.dir, scatter_pdf);
+        float3 dc;
+        float3 fc = f.eval_and_pdf(c.dir, scatter_pdf, dc);
         float target = luminance_rec2020(fc * c.radiance);
         float w = target / c.pdf;
         if (!(w > 0.0) || !isfinite(w))
@@ -552,6 +552,7 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
             chosen = c;
             chosen_target = target;
             chosen_f = fc;
+            chosen_diffuse = dc;
             chosen_scatter_pdf = scatter_pdf;
         }
     }
@@ -563,10 +564,7 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
     float3 l = chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, chosen.light, dir) : chosen.radiance;
     float3 fe = chosen_f;
     if (chain && chosen.kind != LIGHT_SAMPLE_ENVIRONMENT)
-    {
-        float3 d = f.diffuse(dir);
-        fe = d + max(chosen_f - d, 0.0) * keep;
-    }
+        fe = chosen_diffuse + max(chosen_f - chosen_diffuse, 0.0) * keep;
     float3 e = fe * l;
     if (all(e == 0.0))
         return float3(0.0);
@@ -593,14 +591,12 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
         // BSDF sampling draws at its density there.
         if (any(stack.bent != toward) && any(vis > 0.0))
         {
-            float3 fb = f.eval_and_pdf(stack.bent, chosen_scatter_pdf);
+            float3 db;
+            float3 fb = f.eval_and_pdf(stack.bent, chosen_scatter_pdf, db);
             chosen_scatter_pdf *= stack.density;
             fe = fb;
             if (chain)
-            {
-                float3 d = f.diffuse(stack.bent);
-                fe = d + max(fb - d, 0.0) * keep;
-            }
+                fe = db + max(fb - db, 0.0) * keep;
             e = fe * l * stack.jacobian;
         }
     }
@@ -694,15 +690,11 @@ public struct WalkExitScatter : IScatter
         return cosine_hemisphere_pdf(dot(n, wi));
     }
 
-    public float3 eval_and_pdf(float3 wi, out float density)
+    public float3 eval_and_pdf(float3 wi, out float density, out float3 diffuse)
     {
         density = pdf(wi);
-        return eval(wi);
-    }
-
-    public float3 diffuse(float3 wi)
-    {
-        return eval(wi);
+        diffuse = eval(wi);
+        return diffuse;
     }
 }
 
@@ -873,15 +865,11 @@ public struct InteriorExitScatter : IScatter
         return cosine_hemisphere_pdf(dot(n, wi));
     }
 
-    public float3 eval_and_pdf(float3 wi, out float density)
+    public float3 eval_and_pdf(float3 wi, out float density, out float3 diffuse)
     {
         density = pdf(wi);
-        return eval(wi);
-    }
-
-    public float3 diffuse(float3 wi)
-    {
-        return eval(wi);
+        diffuse = eval(wi);
+        return diffuse;
     }
 }
 
@@ -907,29 +895,20 @@ public struct VertexScatter : IScatter
     public bool leave;              // a walk leaving an interior, which scatters as `way_out`
     public InteriorExitScatter way_out;
 
-    public float3 eval_and_pdf(float3 wi, out float density)
+    public float3 eval_and_pdf(float3 wi, out float density, out float3 diffuse)
     {
+        diffuse = float3(0.0);
         if (phase)
         {
             density = hg_phase(anisotropy, dot(travel, wi));
             return float3(density);
         }
+        float3 none;
         if (leave)
-            return way_out.eval_and_pdf(wi, density);
+            return way_out.eval_and_pdf(wi, density, none);
         if (exit)
-            return walk.eval_and_pdf(wi, density);
-        return b.eval_and_pdf(wi, density);
-    }
-
-    public float3 diffuse(float3 wi)
-    {
-        if (phase || leave)
-            return float3(0.0);
-        if (exit)
-            return walk.eval(wi);
-        float3 d;
-        b.eval(wi, d);
-        return d;
+            return walk.eval_and_pdf(wi, density, diffuse);
+        return b.eval_and_pdf(wi, density, diffuse);
     }
 }
 // `LayerVertex.kind`.

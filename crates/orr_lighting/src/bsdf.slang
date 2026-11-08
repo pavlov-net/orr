@@ -316,6 +316,12 @@ public struct Bsdf : IDifferentiable
         return evaluate(local(wi), density, diffuse);
     }
 
+    // `eval_and_pdf`, and in `diffuse` the diffuse lobes' share `eval` gives.
+    public float3 eval_and_pdf(float3 wi, out float density, out float3 diffuse)
+    {
+        return evaluate(local(wi), density, diffuse);
+    }
+
     // The density `sample` draws `wi` with, over every non-delta lobe.
     [ForwardDifferentiable]
     public float pdf(no_diff float3 wi)
