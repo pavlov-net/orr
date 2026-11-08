@@ -141,7 +141,7 @@ pub struct Loading {
 
 impl Loading {
     /// A loading side whose reads take an arena of `arena_bytes`, which `device` imports
-    /// where it can.
+    /// where it offers and takes the import.
     pub(crate) fn new(positioned: bool, arena_bytes: u64, device: Option<&Device>) -> Result<Self> {
         let device = device.filter(|d| d.caps().host_memory_import);
         let align = device.map_or(SECTOR as u64, |d| d.caps().limits.host_import_align);
@@ -151,13 +151,17 @@ impl Loading {
         let align = usize::try_from(align).map_err(|_| too_large())?;
         let buffers = ReadBuffers::aligned(bytes, align)?;
         let (at, len) = buffers.pages();
-        let imported = match device {
+        // A driver may refuse an import it offers, as the extension allows; staging then takes
+        // the staging pool, as on a device without the import.
+        let imported = device.and_then(|d| {
             // SAFETY: the clone keeps the arena's pages until the import drops it.
-            Some(d) => Some(unsafe {
+            let import = unsafe {
                 d.import_host_memory(at, len as u64, Box::new(buffers.clone()), "read arena")
-            }?),
-            None => None,
-        };
+            };
+            import
+                .inspect_err(|e| log::warn!("the device refused the read arena's import: {e}"))
+                .ok()
+        });
         Ok(Self {
             jobs: Mutex::new(Jobs {
                 queue: VecDeque::new(),
