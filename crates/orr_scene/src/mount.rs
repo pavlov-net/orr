@@ -505,9 +505,12 @@ impl MountTask {
         }
     }
 
-    /// Whether the copies staged since the last batch have reached a batch.
-    pub(crate) fn batch_due(&self) -> bool {
-        self.staging.lock().unwrap().ticket.bytes() >= self.batch
+    /// Whether the copies staged since the last batch submit now: they hold staging bytes, and
+    /// unless `any` those bytes reach a batch. Discards alone free no room, so they wait for
+    /// copies or the mount's end.
+    pub(crate) fn batch_due(&self, any: bool) -> bool {
+        let bytes = self.staging.lock().unwrap().ticket.bytes();
+        bytes > 0 && (any || bytes >= self.batch)
     }
 }
 

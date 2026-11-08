@@ -976,10 +976,10 @@ fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
         loading
             .in_flight
             .start_mounts(&mut reads, |bytes, read| read.start(loading, bytes));
-        // A mount submits its staged copies once they reach a batch, and every mount does
-        // while reads wait for room and no batch is in flight to free some.
+        // A mount submits its staged copies once they reach a batch, and every mount holding
+        // staged bytes does while reads wait for room and no batch is in flight to free some.
         let all = !reads.is_empty() && copies.items.is_empty();
-        for task in placing.iter().filter(|t| all || t.batch_due()) {
+        for task in placing.iter().filter(|t| t.batch_due(all)) {
             copies.items.extend(submit_staged(device, task));
         }
         copies.advance();
