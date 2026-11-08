@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(dlss)]
 use orr::DlssSdk;
-use orr::orr_gpu::{Allocation, Device, DeviceDesc, QueueRequest};
+use orr::orr_gpu::{Allocation, Device, DeviceDesc, Diagnostics, QueueRequest};
 #[cfg(dlss)]
 use orr::orr_output::orr_dlss::Uuid;
 use orr::orr_pack::{Archive, AssetId};
@@ -75,7 +75,10 @@ fn pipeline_store() -> PathBuf {
 
 /// The process's device, created on first use with every queue, NGX's extensions where
 /// NGX offers them, and validation when the environment enables the layer. Logs info and
-/// above to stderr, with `RUST_LOG` adding to or overriding that.
+/// above to stderr, with `RUST_LOG` adding to or overriding that. `ORR_DIAGNOSTICS=checkpoints`
+/// creates it with [`Diagnostics::Checkpoints`], so a device-lost report names the passes it was
+/// running, and `ORR_DIAGNOSTICS=aftermath` with [`Diagnostics::Aftermath`], writing crash dumps
+/// to the directory `ORR_AFTERMATH_DIR` names.
 pub fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
@@ -104,10 +107,27 @@ pub fn device() -> &'static Device {
                 present: true,
             },
             perf_counters: PERF_COUNTERS.load(Ordering::Relaxed),
+            diagnostics: diagnostics(),
             ..DeviceDesc::default()
         };
         Device::new(&desc).expect("device")
     })
+}
+
+/// What `ORR_DIAGNOSTICS` asks the device to record.
+fn diagnostics() -> Diagnostics<'static> {
+    match std::env::var("ORR_DIAGNOSTICS").as_deref() {
+        Ok("checkpoints") => Diagnostics::Checkpoints,
+        Ok("aftermath") => {
+            let dir = std::env::var_os("ORR_AFTERMATH_DIR")
+                .expect("ORR_DIAGNOSTICS=aftermath needs ORR_AFTERMATH_DIR");
+            Diagnostics::Aftermath {
+                dump_dir: Box::leak(PathBuf::from(dir).into()),
+            }
+        }
+        Ok(other) => panic!("ORR_DIAGNOSTICS={other}: expected checkpoints or aftermath"),
+        Err(_) => Diagnostics::Off,
+    }
 }
 
 /// Gives `renderer` DLSS ray reconstruction where NGX offers it; returns whether it does.
