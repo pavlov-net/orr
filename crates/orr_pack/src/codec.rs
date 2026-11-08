@@ -1,4 +1,4 @@
-use crate::{BcLayout, Codec, Error, Filter, GDeflate, Result};
+use crate::{BcLayout, Codec, DEFAULT_CHUNK, Error, Filter, GDeflate, Result};
 
 impl Filter {
     /// The filter's nibble in [`crate::Blob::codec`].
@@ -87,20 +87,30 @@ pub(crate) fn decode_chunk(
             let n = decompress(codec, gdeflate, src, dst)?;
             check_len(n, dst.len())
         }
-        _ => FILTERED.with_borrow_mut(|scratch| {
+        _ => {
             let len = filter.max_len(dst.len());
-            if scratch.len() < len {
-                scratch.resize(len, 0);
+            let own = dst.len() > DEFAULT_CHUNK as usize;
+            let mut undo = move |scratch: &mut [u8]| {
+                let n = decompress(codec, gdeflate, src, scratch)?;
+                filter.undo(&scratch[..n], dst)
+            };
+            if own {
+                return undo(&mut vec![0; len]);
             }
-            let n = decompress(codec, gdeflate, src, &mut scratch[..len])?;
-            filter.undo(&scratch[..n], dst)
-        }),
+            FILTERED.with_borrow_mut(|scratch| {
+                if scratch.len() < len {
+                    scratch.resize(len, 0);
+                }
+                undo(&mut scratch[..len])
+            })
+        }
     }
 }
 
 thread_local! {
-    /// A filtered chunk between its decompression and the filter's undo, kept between
-    /// chunks so that each decode neither allocates nor clears it.
+    /// A filtered chunk of up to the default chunk length between its decompression and the
+    /// filter's undo, kept between chunks so that each decode neither allocates nor clears
+    /// it. Longer ones, such as whole mount blobs, take memory of their own.
     static FILTERED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
