@@ -68,6 +68,12 @@ const SURFACE: Switch = Switch {
             args: "i",
             optional: true,
         },
+        Method {
+            decl: "void coverage_feedback(SurfaceInput i)",
+            name: "coverage_feedback",
+            args: "i",
+            optional: true,
+        },
     ],
 };
 

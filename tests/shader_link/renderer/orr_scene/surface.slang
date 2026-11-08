@@ -35,6 +35,9 @@ public interface ISurface
     static void feedback(SurfaceInput i)
     {
     }
+    static void coverage_feedback(SurfaceInput i)
+    {
+    }
 }
 
 public struct StandardSurface : ISurface

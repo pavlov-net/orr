@@ -657,16 +657,22 @@ float texture_wanted_lod(uint modes, UvFootprint f, float2 size)
 }
 
 // Reports to the frame's feedback the level `texture_footprint` wants of `t` through sampler
-// `s` over footprint `f` where `t` streams (`streams`), without reading it.
-public void texture_feedback(TextureIndex t, TextureSamplerGpu s, UvFootprint f, TextureStreamGpu** streams)
+// `s` over footprint `f` where `t` streams (`streams`), without reading it. With `point` the
+// read is of `f.uv` with no extent, which wants mip 0 whatever the texture's size: a call site
+// that passes true carries no size query or level arithmetic.
+public void texture_feedback(TextureIndex t, TextureSamplerGpu s, UvFootprint f, TextureStreamGpu** streams, bool point = false)
 {
     TextureStreamGpu* stream = texture_stream(streams, t);
     if (stream == nullptr)
         return;
-    uint width;
-    uint height;
-    t.get<Texture2D<float4>>().GetDimensions(width, height);
-    float lod = texture_wanted_lod(s.modes, f, float2(width, height));
+    float lod = 0.0;
+    if (!point)
+    {
+        uint width;
+        uint height;
+        t.get<Texture2D<float4>>().GetDimensions(width, height);
+        lod = texture_wanted_lod(s.modes, f, float2(width, height));
+    }
     texture_stream_feedback(stream, texture_place(f.uv, s.modes), s.modes, 0, lod);
 }
 
@@ -796,8 +802,9 @@ public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint uv[2], flo
 }
 
 // Reports to the frame's feedback the level `material_texture` of `slot` over footprints `uv`
-// wants of the texture it reads there, where that streams, without reading it.
-public void material_feedback(MaterialGpu* m, uint slot, UvFootprint uv[2])
+// wants of the texture it reads there, where that streams, without reading it; with `point`,
+// over the footprints' uv with no extent (`texture_feedback`).
+public void material_feedback(MaterialGpu* m, uint slot, UvFootprint uv[2], bool point = false)
 {
     TextureIndex t = m.textures[slot];
     if (t.index == IMAGE_NONE)
@@ -805,7 +812,7 @@ public void material_feedback(MaterialGpu* m, uint slot, UvFootprint uv[2])
     UvFootprint f = material_footprint(m, slot, material_uv_set(m, slot) == 1 ? uv[1] : uv[0]);
     TextureSamplerGpu s = m.samplers[slot];
     if (material_reads(m, slot, s.modes, t, f))
-        texture_feedback(t, s, f, m.texture_streams);
+        texture_feedback(t, s, f, m.texture_streams, point);
 }
 
 // What scalar slot `slot`, one past TEXTURE_TRANSMISSION, reads: 1 unbound.

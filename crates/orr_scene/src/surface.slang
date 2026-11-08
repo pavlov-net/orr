@@ -30,7 +30,7 @@ public struct HitContext
     public float cone_width;   // m: the ray cone's width at the hit
     public float cone_spread;  // rad: the ray cone's spread angle
     public float2 tap;         // the hit's `UvFootprint.tap`: negative x for hardware filtering
-    public bool feedback;      // the hit reports the texture levels it reads (`FeedbackSurface`)
+    public bool feedback;      // the hit reports the texture levels it reads (`FeedbackSurface`, `CoverageFeedback`)
 }
 
 // Everything a surface knows about its hit. Directions and normals are unit vectors in
@@ -91,6 +91,15 @@ public interface ISurface
     {
         surface_feedback(i);
     }
+
+    // Reports to the frame's texture feedback the level each streamed texture `coverage` reads
+    // at the hit wants; `CoverageFeedback` calls it for hits whose context asks. Without its
+    // own, a surface reports what the material's alpha test reads
+    // (`material_coverage_feedback`).
+    static void coverage_feedback(SurfaceInput i)
+    {
+        material_coverage_feedback(i);
+    }
 }
 
 // Footprint `f` with no extent, read bilinearly from mip 0.
@@ -100,6 +109,13 @@ UvFootprint finest_footprint(UvFootprint f)
     f.dy = float2(0.0);
     f.tap = float2(-1.0);
     return f;
+}
+
+// The slot `material_opacity` and `blend_decal` read opacity from: the opacity slot where it
+// is bound, else the base color slot, whose alpha they read.
+uint opacity_slot(MaterialGpu* m)
+{
+    return material_bound(m, TEXTURE_OPACITY) ? TEXTURE_OPACITY : TEXTURE_BASE_COLOR;
 }
 
 // The material's opacity at the hit: the opacity slot, else the base color slot's alpha,
@@ -185,6 +201,16 @@ public float3 surface_emission(SurfaceInput i, MaterialGpu* m)
 public float material_coverage(SurfaceInput i)
 {
     return material_opacity(i) >= i.scene.materials[i.material].alpha_cutoff ? 1.0 : 0.0;
+}
+
+// Reports to the frame's texture feedback what `material_coverage` reads at the hit: the slot
+// `material_opacity` reads, at mip 0.
+public void material_coverage_feedback(SurfaceInput i)
+{
+    MaterialGpu* m = i.scene.materials + i.material;
+    if ((m.flags & (MATERIAL_ALPHA_TESTED | MATERIAL_PRESENCE)) == 0)
+        return;
+    material_feedback(m, opacity_slot(m), i.uv, true);
 }
 
 // The shading frame: the vertex normal, turned by the material's normal map in `slot`.
@@ -277,13 +303,6 @@ bool decal_place(SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3
     return true;
 }
 
-// The slot a decal of material `m` reads its coverage from: its opacity slot, else its base
-// color slot's alpha.
-uint decal_coverage_slot(MaterialGpu* m)
-{
-    return material_bound(m, TEXTURE_OPACITY) ? TEXTURE_OPACITY : TEXTURE_BASE_COLOR;
-}
-
 // Decal `d` blended over `layer` at hit `i`, `relative` from the decal's center, with the
 // hit's footprint `px`, `py` (m, on the surface).
 void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py)
@@ -299,7 +318,7 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
     // Past a primary hit a decal's light reads with no footprint, as `surface_emission` does.
     bool primary = i.context.kind == HIT_PRIMARY;
     UvFootprint e = primary ? f : finest_footprint(f);
-    uint cover = decal_coverage_slot(m);
+    uint cover = opacity_slot(m);
     float coverage = 1.0;
     float lit_coverage = 1.0;
     float luminance = 1.0;
@@ -409,14 +428,14 @@ void decal_feedback(SurfaceInput i, DecalGpu* d, float3 relative, float3 px, flo
     uint c = d.channels;
     bool past = i.context.kind != HIT_PRIMARY;
     bool shown = share * m.geometry_opacity > 0.0;
-    // Read 0 is the coverage's, of the slot `decal_coverage_slot` picks.
+    // Read 0 is the coverage's, of the slot `opacity_slot` picks.
     static const uint SLOTS[7] = { TEXTURE_OPACITY, TEXTURE_EMISSION, TEXTURE_EMISSION_LUMINANCE, TEXTURE_BASE_COLOR, TEXTURE_ROUGHNESS, TEXTURE_METALNESS, TEXTURE_NORMAL };
     static const uint CHANNELS[7] = { 0, DECAL_EMISSION, DECAL_EMISSION, DECAL_BASE_COLOR, DECAL_ROUGHNESS, DECAL_METALNESS, DECAL_NORMAL };
     for (uint k = 0; k < 7; k++)
     {
         if (k > 0 && !(shown && (c & CHANNELS[k]) != 0))
             continue;
-        uint slot = k == 0 ? decal_coverage_slot(m) : SLOTS[k];
+        uint slot = k == 0 ? opacity_slot(m) : SLOTS[k];
         UvFootprint g = past && k <= 2 && (c & DECAL_EMISSION) != 0 ? finest_footprint(f) : f;
         UvFootprint gs[2] = { g, g };
         material_feedback(m, slot, gs);
@@ -545,8 +564,8 @@ float surface_tangent_angle(float4 tangent, float3 normal, float rotation)
 }
 
 // Whether `StandardSurface` reads bound slot `slot` of `m` at the hit's footprint. Opacity is
-// the alpha test's, at mip 0 (`material_opacity`), displacement the tessellation's and the
-// medium's slots `material_medium`'s; emission reads at mip 0 past a primary hit
+// the alpha test's, at mip 0 (`material_coverage_feedback`), displacement the tessellation's
+// and the medium's slots `material_medium`'s; emission reads at mip 0 past a primary hit
 // (`surface_reads_point`).
 bool surface_reads(MaterialGpu* m, uint slot, bool primary)
 {
@@ -643,6 +662,39 @@ public struct FeedbackSurface<S : ISurface> : ISurface
     public override static void feedback(SurfaceInput i)
     {
         S.feedback(i);
+    }
+
+    public override static void coverage_feedback(SurfaceInput i)
+    {
+        S.coverage_feedback(i);
+    }
+}
+
+// `S` whose alpha tests report their texture feedback (`ISurface.coverage_feedback`) where their
+// context asks; its hits shade as `S`'s do and report nothing. A kernel tests through it only
+// the candidates and pixels that may report, so the others carry none of the code.
+public struct CoverageFeedback<S : ISurface> : ISurface
+{
+    public static GSurface surface(SurfaceInput i, out float depth_offset)
+    {
+        return S.surface(i, depth_offset);
+    }
+
+    public override static float coverage(SurfaceInput i)
+    {
+        if (i.context.feedback)
+            S.coverage_feedback(i);
+        return S.coverage(i);
+    }
+
+    public override static void feedback(SurfaceInput i)
+    {
+        S.feedback(i);
+    }
+
+    public override static void coverage_feedback(SurfaceInput i)
+    {
+        S.coverage_feedback(i);
     }
 }
 

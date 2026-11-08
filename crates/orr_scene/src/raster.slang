@@ -5,8 +5,9 @@
 // triangles the other leaves: overlap between them is harmless, a gap would be a hole.
 // Alpha-tested triangles keep a pixel by each surface's coverage. Strand segments draw as
 // ribbons facing the eye that cover their swept spheres. Pixel stages write only the
-// visibility buffer, except `coverage_pixel`: dielectric and presence clusters draw every
-// triangle, both faces, into the layer tiles where they lie in front of the opaque depth.
+// visibility buffer and the alpha test's texture feedback, except `coverage_pixel`: dielectric
+// and presence clusters draw every triangle, both faces, into the layer tiles where they lie in
+// front of the opaque depth.
 // `depth` copies the resolved depth into the depth target.
 #include "orr_root.h"
 import orr_shaders.atomic;
@@ -316,7 +317,9 @@ void opaque_pixel(Vertex v, uint triangle: SV_PrimitiveID)
 
 // Whether a triangle of the alpha bin keeps the pixel at `pixel_center`: on a fading copy's
 // step, by its share of the fade against a draw both steps share; then for alpha-tested
-// materials with probability the surface's coverage.
+// materials with probability the surface's coverage, whose reads report to the texture
+// feedback in the squares of pixels `texture_feedback_drawn` picks, as path hits do. It reports
+// whether it keeps the pixel or not, so texels the resident mips lose load all the same.
 bool alpha_keeps(VisibleCluster vc, uint triangle, float2 pixel_center)
 {
     SceneRoot* s = root.scene;
@@ -330,8 +333,9 @@ bool alpha_keeps(VisibleCluster vc, uint triangle, float2 pixel_center)
             return true;
     }
     PrimaryHit hit = primary_hit(s, root.view, vc, triangle, pixel_center);
+    hit.input.context.feedback = texture_feedback_drawn(uint2(pixel_center), root.view.frame_index);
     float noise = unit_float(pcg3d(uint3(uint2(pixel_center), s.frame_index)).x);
-    return Surface.coverage(hit.input) > noise;
+    return CoverageFeedback<Surface>.coverage(hit.input) > noise;
 }
 
 [shader("pixel")]

@@ -447,6 +447,7 @@ const SURFACE: &str = "module surface;\n\
         static GSurface surface(SurfaceInput i, out float depth_offset);\n\
         static float coverage(SurfaceInput i) { return 1; }\n\
         static void feedback(SurfaceInput i) {}\n\
+        static void coverage_feedback(SurfaceInput i) {}\n\
     }\n\
     public struct StandardSurface : ISurface {\n\
         public static GSurface surface(SurfaceInput i, out float d) { d = 0; return { float4(0) }; }\n\

@@ -517,9 +517,10 @@ public interface IShadow
 // directional winner or none. With `no_environment` the environment's candidates count for
 // nothing. An emitter's coat and fuzz pass its light into the vertex's medium, of IOR
 // `exterior_ior`. At a `chain` vertex, what a light other than the environment gives keeps
-// `keep` of the share outside the vertex's diffuse lobes, the caustic photons' to give. Draws
-// one sampler dimension and six per candidate, and counts the ray in `rays`.
-public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot r, PathVertex x, F f, V shadow, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, float exterior_ior, float3 keep, bool chain, inout Sampler rng, inout uint rays, out uint light, bool no_environment = false)
+// `keep` of the share outside the vertex's diffuse lobes, the caustic photons' to give. The
+// shadow ray reports texture feedback with `feedback` (`HitContext.feedback`). Draws one
+// sampler dimension and six per candidate, and counts the ray in `rays`.
+public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot r, PathVertex x, F f, V shadow, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, float exterior_ior, float3 keep, bool chain, bool feedback, inout Sampler rng, inout uint rays, out uint light, bool no_environment = false)
 {
     LightSetGpu* set = r.set;
     light = NO_LIGHT;
@@ -582,7 +583,7 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
         t_max = max(0.0, length_to - max(1e-4 * length_to, magnitude * F32_PRECISION));
     }
     RayCone cone = { 0.0, 0.0 };
-    HitContext context = hit_context(HIT_SECONDARY, depth + 1, cone, 0.0);
+    HitContext context = hit_context(HIT_SECONDARY, depth + 1, cone, 0.0, float2(-1.0), feedback);
     rays++;
     StackLight stack;
     float3 vis = shadow.transmittance(x.surface.position, origin, toward, t_max, context, chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, chosen.kind == LIGHT_SAMPLE_DIRECTIONAL, stack);
@@ -711,11 +712,12 @@ public Walk walk_from(PathVertex x, BsdfParams p, float3 wi, inout Sampler rng)
     return walk_start(origin, wi, bsdf_subsurface_volume(p), 1.0, walk_sampler(rng));
 }
 
-// What traces a walk on instance `instance` from a vertex at path depth `depth`.
-public WalkTrace<S> walk_tracer<S : ISurface>(PathRoot r, uint instance, uint depth)
+// What traces a walk on instance `instance` from a vertex at path depth `depth`, reporting
+// texture feedback with `feedback` (`HitContext.feedback`).
+public WalkTrace<S> walk_tracer<S : ISurface>(PathRoot r, uint instance, uint depth, bool feedback)
 {
     RayCone cone = { 0.0, 0.0 };
-    WalkTrace<S> tracer = { r.scene, r.view, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0), instance };
+    WalkTrace<S> tracer = { r.scene, r.view, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0, float2(-1.0), feedback), instance };
     return tracer;
 }
 
@@ -1232,11 +1234,12 @@ public Walk walk_interior(float3 from, float3 dir, InteriorMedium im, float ior,
     return walk_start(from, sample_hg(im.anisotropy, dir, u), volume, ior, walk);
 }
 
-// What traces a walk in interior `medium`, its surface `ior` times the outside's.
-public InteriorWalk<S> interior_tracer<S : ISurface>(PathRoot r, uint medium, float ior, uint seed, uint depth)
+// What traces a walk in interior `medium`, its surface `ior` times the outside's, reporting
+// texture feedback with `feedback` (`HitContext.feedback`).
+public InteriorWalk<S> interior_tracer<S : ISurface>(PathRoot r, uint medium, float ior, uint seed, uint depth, bool feedback)
 {
     RayCone cone = { 0.0, 0.0 };
-    InteriorWalk<S> tracer = { r.scene, r.view, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0), seed, medium, ior };
+    InteriorWalk<S> tracer = { r.scene, r.view, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0, float2(-1.0), feedback), seed, medium, ior };
     return tracer;
 }
 
@@ -1773,7 +1776,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             uint candidates = depth == 0 ? r.primary_candidates : r.bounce_candidates;
             if (count_nee && candidates > 0 && u_run < run && !split)
             {
-                PathShadow<S, M> shadow = vertex_shadow<S, M>(r, l, interior, disperse);
+                PathShadow<CoverageFeedback<S>, M> shadow = vertex_shadow<CoverageFeedback<S>, M>(r, l, interior, disperse);
                 // Layers and scatters light from both sides.
                 PathVertex at = l.x;
                 if (on_layer || medium_vertex)
@@ -1782,7 +1785,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                 VertexScatter f = { b, medium_vertex, -l.x.view, l.anisotropy, at_exit, exit_scatter, leaving, leave_scatter };
                 // The rays of a walk's way out reach no light this estimate is weighed against.
                 float3 e = shade_vertex_nee<S>(r, at, f, shadow, run, pixel, local, depth, candidates, one_technique || leaving, interior_ior(s, interior.innermost()),
-                                               one_technique ? float3(1.0) : keep, l.chains && !one_technique, rng, rays, light, leaving && count_bsdf);
+                                               one_technique ? float3(1.0) : keep, l.chains && !one_technique, feedback, rng, rays, light, leaving && count_bsdf);
                 float3 added = spectral.color(throughput * e);
                 if (counted)
                     radiance += added;
@@ -1979,8 +1982,8 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             else
             {
                 uint mask = camera ? start.mask : MASK_OPAQUE | MASK_DIELECTRIC;
-                HitContext context = hit_context(camera ? HIT_PRIMARY : HIT_SECONDARY, camera ? 0 : depth + 1, cone, 0.0);
-                LayerAccept<S> a = { s, v, ray.dir, context, camera ? seed : pcg(seed ^ (depth + 1)), PRESENCE_DRAWN };
+                HitContext context = hit_context(camera ? HIT_PRIMARY : HIT_SECONDARY, camera ? 0 : depth + 1, cone, 0.0, float2(-1.0), feedback);
+                LayerAccept<CoverageFeedback<S>> a = { s, v, ray.dir, context, camera ? seed : pcg(seed ^ (depth + 1)), PRESENCE_DRAWN };
                 rays += camera ? 0 : 1;
                 RayDesc rd = path_ray(ray.origin, ray.dir, camera ? start.t_max : positive_infinity());
                 h = trace_closest(s.tlas, rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
@@ -2043,9 +2046,9 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             for (uint p = 0; p <= points && walk.kind == WALK_RUNNING; p++)
             {
                 if (walking)
-                    walk_part(r, walk, walk_tracer<S>(r, l.x.surface.instance, depth), rays);
+                    walk_part(r, walk, walk_tracer<CoverageFeedback<S>>(r, l.x.surface.instance, depth, feedback), rays);
                 else
-                    walk_part(r, walk, interior_tracer<S>(r, medium, walk.ior, pcg(seed ^ (depth + 1)), depth), rays);
+                    walk_part(r, walk, interior_tracer<CoverageFeedback<S>>(r, medium, walk.ior, pcg(seed ^ (depth + 1)), depth, feedback), rays);
                 if (p < points)
                     C.point(uint(walk.kind == WALK_RUNNING), 1);
             }

@@ -59,15 +59,16 @@ struct Root
     Traced* traced;
     Seen* seen;
     Cone* cones;
-    uint mode;             // 1: `pixels` resolves its hits and `cones` reports its mirror hit's
-                           // texture feedback; 2: `pixels` gives each hit's position last frame
+    uint mode;             // 1: `pixels` resolves its hits and `cones` reports its mirror ray's
+                           // texture feedback, its alpha tests' and its hit's; 2: `pixels` gives
+                           // each hit's position last frame
     uint pad0;
     uint64_t pad1;
 }
 ORR_ROOT(Root);
 
-// Alpha-tested candidates through `resolve_alpha`.
-struct Alpha : IAnyHit
+// Alpha-tested candidates through `resolve_alpha` of surface `S`.
+struct Alpha<S : ISurface> : IAnyHit
 {
     SceneRoot* s;
     ViewConstants* v;
@@ -76,7 +77,7 @@ struct Alpha : IAnyHit
 
     bool accept(Candidate c)
     {
-        return c.cluster_id >= 0 && resolve_alpha<Surface>(s, v, d, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context);
+        return c.cluster_id >= 0 && resolve_alpha<S>(s, v, d, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context);
     }
 }
 
@@ -86,14 +87,14 @@ struct Found
     float3 positions[3];
 }
 
-Found trace(SceneRoot* s, ViewConstants* v, float3 origin, float3 d, float t_max, HitContext context)
+Found trace<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 d, float t_max, HitContext context)
 {
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = d;
     ray.TMin = 0.0;
     ray.TMax = t_max;
-    Alpha a;
+    Alpha<S> a;
     a.s = s;
     a.v = v;
     a.d = d;
@@ -132,7 +133,7 @@ void pixels(uint3 id: SV_DispatchThreadID)
     float3 d = pixel_direction(v, pixel);
     RayCone cone = camera_cone(v);
     HitContext near = hit_context(HIT_PRIMARY, 0, cone, 0.0);
-    Found f = trace(s, v, v.eye_render.xyz, d, 1e30, near);
+    Found f = trace<Surface>(s, v, v.eye_render.xyz, d, 1e30, near);
     Traced o = (Traced)0;
     if (f.hit.hit && f.hit.cluster_id >= 0)
     {
@@ -195,7 +196,7 @@ void same_point(uint3 id: SV_DispatchThreadID)
 
         RayCone cone = camera_cone(v);
         float3 d = p.direction;
-        Found f = trace(s, v, v.eye_render.xyz, d, 1e30, hit_context(HIT_PRIMARY, 0, cone, 0.0));
+        Found f = trace<Surface>(s, v, v.eye_render.xyz, d, 1e30, hit_context(HIT_PRIMARY, 0, cone, 0.0));
         if (f.hit.hit && f.hit.cluster_id >= 0)
         {
             SurfaceHit b = resolve(s, v, d, f, hit_context(HIT_PRIMARY, 0, cone, f.hit.t));
@@ -219,7 +220,7 @@ void same_point(uint3 id: SV_DispatchThreadID)
         float distance = length(to);
         float3 d2 = to / distance;
         RayCone arriving = { 0.004, 0.01 };
-        Found f2 = trace(s, v, from, d2, distance * 1.01, hit_context(HIT_SECONDARY, 1, arriving, 0.0));
+        Found f2 = trace<Surface>(s, v, from, d2, distance * 1.01, hit_context(HIT_SECONDARY, 1, arriving, 0.0));
         if (f2.hit.hit && f2.hit.cluster_id >= 0)
         {
             SurfaceHit c = resolve(s, v, d2, f2, hit_context(HIT_SECONDARY, 1, arriving, f2.hit.t));
@@ -252,7 +253,7 @@ void cones(uint3 id: SV_DispatchThreadID)
     float3 d = pixel_direction(v, pixel);
     o.direction = d;
     RayCone cone = camera_cone(v);
-    Found f = trace(s, v, v.eye_render.xyz, d, 1e30, hit_context(HIT_PRIMARY, 0, cone, 0.0));
+    Found f = trace<Surface>(s, v, v.eye_render.xyz, d, 1e30, hit_context(HIT_PRIMARY, 0, cone, 0.0));
     if (f.hit.hit && f.hit.cluster_id >= 0)
     {
         SurfaceHit a = resolve(s, v, d, f, hit_context(HIT_PRIMARY, 0, cone, f.hit.t));
@@ -263,7 +264,7 @@ void cones(uint3 id: SV_DispatchThreadID)
         float3 r = reflect(d, n);
         RayCone next = cone_after_hit(cone, f.hit.t, 0.0);
         float3 origin = a.surface.position + n * 1e-3;
-        Found f2 = trace(s, v, origin, r, 1e30, hit_context(HIT_SECONDARY, 1, next, 0.0));
+        Found f2 = trace<CoverageFeedback<Surface>>(s, v, origin, r, 1e30, hit_context(HIT_SECONDARY, 1, next, 0.0, float2(-1.0), root.mode == 1));
         if (f2.hit.hit && f2.hit.cluster_id >= 0)
         {
             HitContext reflected = hit_context(HIT_SECONDARY, 1, next, f2.hit.t, float2(-1.0), root.mode == 1);

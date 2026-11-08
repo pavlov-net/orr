@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use bytemuck::{Pod, Zeroable};
 use orr_cook::{
     ArchiveSpec, AssetSpec, Instances, Linear, LodMode, Manifest, MaterialPatch, MeshInput,
-    MeshSettings, Placement, PrototypeSpec, Source, TextureSettings,
+    MeshSettings, Placement, PrototypeSpec, Source, TextureSettings, Usage,
 };
 use orr_math::{Affine3, DVec3, Quat, Vec2, Vec3};
 use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
@@ -29,9 +29,9 @@ use orr_scene::testing::{
 };
 use orr_scene::{
     BoundTexture, Budgets, EmissiveGpu, Error, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
-    InstancesDesc, LoadState, MaterialGpu, MeshGpu, ModelGpu, ModelId, MountId, NeuralTextures,
-    PackSource, RendererDesc, ResidencyClass, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes,
-    TransformGroupDesc, material_flags,
+    InstancesDesc, LoadState, MaterialGpu, MaterialId, MeshGpu, ModelGpu, ModelId, MountId,
+    NeuralTextures, PackSource, RendererDesc, ResidencyClass, SceneDesc, SceneId, SceneRoot,
+    SceneWriter, Scenes, TransformGroupDesc, material_flags,
 };
 use scene_suite::Workers;
 
@@ -1907,11 +1907,155 @@ fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_wan
     assert_clean();
 }
 
-/// A streamed texture on a wall that rays alone see, in a mirror, loads the tiles its reflected
-/// hits want once those hits report texture feedback: they want mip 0 everywhere, so every tile
-/// of mips 0 and 1. Nothing loads while they do not report.
-#[test]
-fn a_streamed_texture_seen_only_in_a_mirror_loads_the_tiles_its_reflected_hits_want() {
+/// A quad of 2 m a side facing +z, its uv's v running down.
+fn unit_quad() -> MeshInput {
+    MeshInput {
+        positions: vec![
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+        ],
+        normals: vec![Vec3::Z; 4],
+        uvs: Some(vec![
+            Vec2::new(0.0, 1.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(0.0, 0.0),
+        ]),
+        indices: vec![0, 1, 2, 0, 2, 3],
+        sections: vec![Span { first: 0, count: 6 }],
+        ..MeshInput::default()
+    }
+}
+
+const LEAF_OPACITY: &str = "leaf/opacity";
+
+/// A pack of `unit_quad` as "quad", of the default material, and as "leaf", alpha-tested at 0.5
+/// by `LEAF_OPACITY` in its opacity slot: 1024 x 1024 texels of which a hashed quarter are 0
+/// and the rest 1, so every micro-triangle of its micromaps and both its triangles are unsure
+/// and the alpha test reads the texture wherever a ray or pixel meets it.
+fn leaf_pack() -> &'static Arc<[u8]> {
+    static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
+    PACK.get_or_init(|| {
+        let path = temp("leaf_opacity.png");
+        let size = 1024u32;
+        let texels: Vec<u8> = (0..size * size)
+            .map(|i| {
+                let mut h =
+                    (i % size).wrapping_mul(0x9e37_79b9) ^ (i / size).wrapping_mul(0x85eb_ca6b);
+                h ^= h >> 15;
+                h = h.wrapping_mul(0x2c1b_3c6d);
+                h ^= h >> 12;
+                if h & 3 == 0 { 0 } else { 255 }
+            })
+            .collect();
+        let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), size, size);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&texels)
+            .unwrap();
+        let mut leaf = Material {
+            alpha_mode: Material::MASK,
+            alpha_cutoff: 0.5,
+            ..Material::default()
+        };
+        leaf.textures[slot::OPACITY].texture = AssetId::from_name(LEAF_OPACITY);
+        let mesh = |name: &str, material| AssetSpec {
+            name: name.into(),
+            source: Source::Mesh {
+                mesh: unit_quad(),
+                materials: vec![material],
+                settings: MeshSettings::default(),
+            },
+        };
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::Memory,
+                vec![
+                    AssetSpec {
+                        name: LEAF_OPACITY.into(),
+                        source: Source::Texture {
+                            path,
+                            settings: TextureSettings {
+                                usage: Usage::Linear1,
+                                ..TextureSettings::default()
+                            },
+                        },
+                    },
+                    mesh("quad", Material::default()),
+                    mesh("leaf", leaf),
+                ],
+            )],
+        };
+        orr_cook::cook(&manifest, &Default::default())
+            .unwrap()
+            .memory
+            .remove(0)
+    })
+}
+
+/// The bytes of streamed texture `id` of mount `m`: its mip tails, and every tile of the mips
+/// above them.
+fn streamed_bytes(scenes: &Scenes, m: MountId, id: AssetId) -> (u64, u64) {
+    let texture = mounted_texture(scenes, m, id).unwrap();
+    let desc = texture.desc();
+    let l = texture.sparse_layout().unwrap();
+    let tiles: u32 = (0..l.tail_first_mip)
+        .map(|mip| {
+            let [x, y] = l.tiles(desc, mip);
+            x * y * desc.layers
+        })
+        .sum();
+    (
+        u64::from(l.tails(desc)) * l.tail_bytes,
+        u64::from(tiles) * l.tile_bytes,
+    )
+}
+
+/// The bytes the texture pool holds and is loading.
+fn texture_bytes(scenes: &Scenes) -> u64 {
+    let pool = *scenes.residency().class(ResidencyClass::Textures);
+    pool.resident_bytes + pool.loading_bytes
+}
+
+/// Runs `frame` until the texture pool holds `bytes` and loads nothing, then four frames more,
+/// after which it holds `bytes` still: `what` loaded, and nothing else.
+fn fill_textures(scenes: &mut Scenes, bytes: u64, what: &str, mut frame: impl FnMut(&mut Scenes)) {
+    let start = Instant::now();
+    while texture_bytes(scenes) < bytes || scenes.residency().loads > 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{what} never arrived"
+        );
+        frame(scenes);
+    }
+    for _ in 0..4 {
+        frame(scenes);
+    }
+    assert_eq!(
+        texture_bytes(scenes),
+        bytes,
+        "{what} loaded, and nothing else"
+    );
+}
+
+/// Frames of a camera at the origin looking down -z at a mirror of model `mirror` turned 45
+/// degrees, which sends its rays along +x to a wall of model `wall` (in `material` where given),
+/// outside the view and placed for rays alone. The wall fills most of the mirrored view, at
+/// under a texel of mip 0 per pixel. Eight frames whose mirror rays report no texture feedback,
+/// more than `reach` of them meeting the wall in each, leave the texture pool holding `before`;
+/// frames whose mirror rays report then fill it to `after`, where it stays.
+fn mirror_feedback(
+    scenes: &mut Scenes,
+    mirror: ModelId,
+    wall: ModelId,
+    material: Option<MaterialId>,
+    reach: usize,
+    [before, after]: [u64; 2],
+) {
     use orr_math::Mat3;
     use orr_scene::orr_gpu::MemoryKind;
     use orr_scene::{Lens, Projection, TextureFilter, ViewDesc};
@@ -1919,54 +2063,7 @@ fn a_streamed_texture_seen_only_in_a_mirror_loads_the_tiles_its_reflected_hits_w
     use scene_suite::shaders::trace;
 
     const EXTENT: u32 = 512;
-    let _serial = serial();
     let dev = device();
-    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
-    let _workers = Workers::start(&scenes, 2);
-    let m = scenes.mount(PackSource::Memory(Arc::clone(tiled_pack())));
-    ready(&mut scenes, m);
-    let manifest = Manifest {
-        archives: vec![ArchiveSpec::new(
-            Target::Memory,
-            vec![AssetSpec {
-                name: "quad".into(),
-                source: Source::Mesh {
-                    mesh: MeshInput {
-                        positions: vec![
-                            Vec3::new(-1.0, -1.0, 0.0),
-                            Vec3::new(1.0, -1.0, 0.0),
-                            Vec3::new(1.0, 1.0, 0.0),
-                            Vec3::new(-1.0, 1.0, 0.0),
-                        ],
-                        normals: vec![Vec3::Z; 4],
-                        uvs: Some(vec![
-                            Vec2::new(0.0, 1.0),
-                            Vec2::new(1.0, 1.0),
-                            Vec2::new(1.0, 0.0),
-                            Vec2::new(0.0, 0.0),
-                        ]),
-                        indices: vec![0, 1, 2, 0, 2, 3],
-                        sections: vec![Span { first: 0, count: 6 }],
-                        ..MeshInput::default()
-                    },
-                    materials: vec![Material::default()],
-                    settings: MeshSettings::default(),
-                },
-            }],
-        )],
-    };
-    let quad_pack = orr_cook::cook(&manifest, &Default::default())
-        .unwrap()
-        .memory
-        .remove(0);
-    let quad_mount = scenes.mount(PackSource::Memory(quad_pack));
-    ready(&mut scenes, quad_mount);
-    let quad = scenes
-        .model(quad_mount, AssetId::from_name("quad"))
-        .unwrap();
-    let wall_material = scenes
-        .material(m, AssetId::from_name(&format!("{}/material", TILED[0].0)))
-        .unwrap();
     let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
     let history = scenes.create_view_history().unwrap();
     let list = [scene];
@@ -1975,13 +2072,12 @@ fn a_streamed_texture_seen_only_in_a_mirror_loads_the_tiles_its_reflected_hits_w
         scenes: &list,
         low_latency: None,
     };
-    // The camera at the origin looks down -z at a mirror turned 45 degrees, which sends its
-    // rays along +x to the wall, outside its view and placed for rays alone. The wall fills
-    // most of the mirrored view, at under a texel of mip 0 per pixel.
     {
         let f = scenes.begin_frame(&desc).unwrap();
         let mut s = f.scene(scene).unwrap();
-        s.material_sets(0, 1).unwrap()[0] = wall_material;
+        if let Some(material) = material {
+            s.material_sets(0, 1).unwrap()[0] = material;
+        }
         let group = s
             .create_transform_group(&TransformGroupDesc {
                 count: 2,
@@ -2001,12 +2097,12 @@ fn a_streamed_texture_seen_only_in_a_mirror_loads_the_tiles_its_reflected_hits_w
             Vec3::new(2.0, 0.0, -1.0),
         )
         .into();
-        for (first, flags, material_set) in [
-            (0, InstanceFlags::RASTER | InstanceFlags::RAY, None),
-            (1, InstanceFlags::RAY, Some(0)),
+        for (first, model, flags, material_set) in [
+            (0, mirror, InstanceFlags::RASTER | InstanceFlags::RAY, None),
+            (1, wall, InstanceFlags::RAY, material.map(|_| 0)),
         ] {
             s.add_instances(&InstancesDesc {
-                model: quad,
+                model,
                 copies: 1,
                 transforms: group,
                 first,
@@ -2030,8 +2126,8 @@ fn a_streamed_texture_seen_only_in_a_mirror_loads_the_tiles_its_reflected_hits_w
         .gpu_malloc::<trace::Root>(MemoryKind::Upload, 1, "trace root")
         .unwrap();
     let p = pipeline(&trace::MODULE, "cones");
-    // One frame tracing the mirror's rays, their reflected hits reporting feedback with
-    // `report`; returns how many reached the wall.
+    // One frame tracing the mirror's rays, which report feedback with `report`; returns how
+    // many reached the wall.
     let mut mirrored = |scenes: &mut Scenes, report: bool| -> usize {
         let mut f = scenes.begin_frame(&desc).unwrap();
         f.scene(scene).unwrap().set_focus(DVec3::ZERO);
@@ -2077,39 +2173,159 @@ fn a_streamed_texture_seen_only_in_a_mirror_loads_the_tiles_its_reflected_hits_w
             .filter(|c| c.hits == 2)
             .count()
     };
-    let (_, tails) = tiled_layout(dev, 0);
-    let others: u64 = (1..TILED.len()).map(|t| tiled_layout(dev, t).1).sum();
-    let textures = |scenes: &Scenes| {
-        let pool = *scenes.residency().class(ResidencyClass::Textures);
-        pool.resident_bytes + pool.loading_bytes
-    };
     for _ in 0..8 {
-        assert!(
-            mirrored(&mut scenes, false) > (n / 2) as usize,
-            "most rays reach the wall"
-        );
+        assert!(mirrored(scenes, false) > reach, "the rays reach the wall");
     }
     assert_eq!(
-        textures(&scenes),
-        tails + others,
-        "without feedback from the reflected hits, only the mip tails"
+        texture_bytes(scenes),
+        before,
+        "nothing loads without feedback from the mirror rays"
     );
-    let tiles = orr_pack::texture::TILE_BYTES as u64 * 21;
-    let start = Instant::now();
-    while textures(&scenes) < tails + others + tiles || scenes.residency().loads > 0 {
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "the reflected hits' tiles never arrived"
-        );
-        mirrored(&mut scenes, true);
+    fill_textures(scenes, after, "the tiles the mirror rays want", |scenes| {
+        mirrored(scenes, true);
+    });
+}
+
+/// A streamed texture on a wall that rays alone see, in a mirror, loads the tiles its reflected
+/// hits want once those hits report texture feedback: they want mip 0 everywhere, so every tile
+/// of mips 0 and 1. Nothing loads while they do not report.
+#[test]
+fn a_streamed_texture_seen_only_in_a_mirror_loads_the_tiles_its_reflected_hits_want() {
+    let _serial = serial();
+    let dev = device();
+    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let m = scenes.mount(PackSource::Memory(Arc::clone(tiled_pack())));
+    ready(&mut scenes, m);
+    let leaf = scenes.mount(PackSource::Memory(Arc::clone(leaf_pack())));
+    ready(&mut scenes, leaf);
+    let quad = scenes.model(leaf, AssetId::from_name("quad")).unwrap();
+    let wall_material = scenes
+        .material(m, AssetId::from_name(&format!("{}/material", TILED[0].0)))
+        .unwrap();
+    let (tails, tiles) = streamed_bytes(&scenes, m, AssetId::from_name(TILED[0].0));
+    let others: u64 = (1..TILED.len()).map(|t| tiled_layout(dev, t).1).sum();
+    let (leaf_tails, _) = streamed_bytes(&scenes, leaf, AssetId::from_name(LEAF_OPACITY));
+    let before = tails + others + leaf_tails;
+    mirror_feedback(
+        &mut scenes,
+        quad,
+        quad,
+        Some(wall_material),
+        512 * 512 / 2,
+        [before, before + tiles],
+    );
+    assert_clean();
+}
+
+/// An alpha-tested wall that rays alone see, in a mirror, its opacity a streamed texture, loads
+/// every tile of its opacity's mips 0 and 1 once the mirror rays report texture feedback: their
+/// alpha tests read mip 0 wherever the wall's micromaps leave it unsure, whether they keep the
+/// hit or not. Nothing loads while they do not report.
+#[test]
+fn an_alpha_tested_wall_seen_only_in_a_mirror_loads_the_opacity_tiles_its_ray_alpha_tests_read() {
+    let _serial = serial();
+    let dev = device();
+    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let leaf = scenes.mount(PackSource::Memory(Arc::clone(leaf_pack())));
+    ready(&mut scenes, leaf);
+    let quad = scenes.model(leaf, AssetId::from_name("quad")).unwrap();
+    let wall = scenes.model(leaf, AssetId::from_name("leaf")).unwrap();
+    let (tails, tiles) = streamed_bytes(&scenes, leaf, AssetId::from_name(LEAF_OPACITY));
+    // A quarter of the wall's texels let the rays through.
+    mirror_feedback(
+        &mut scenes,
+        quad,
+        wall,
+        None,
+        512 * 512 / 4,
+        [tails, tails + tiles],
+    );
+    assert_clean();
+}
+
+/// An alpha-tested quad in view, its opacity a streamed texture, loads every tile of its
+/// opacity's mips 0 and 1: the raster's alpha test reads mip 0 wherever the quad's triangles
+/// are unsure, and reports those reads whether it keeps the pixel or not.
+#[test]
+fn an_alpha_tested_quad_in_view_loads_the_opacity_tiles_its_raster_alpha_test_reads() {
+    use orr_scene::{Lens, Projection, TextureFilter, ViewDesc};
+
+    let _serial = serial();
+    let dev = device();
+    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let leaf = scenes.mount(PackSource::Memory(Arc::clone(leaf_pack())));
+    ready(&mut scenes, leaf);
+    let model = scenes.model(leaf, AssetId::from_name("leaf")).unwrap();
+    let (tails, tiles) = streamed_bytes(&scenes, leaf, AssetId::from_name(LEAF_OPACITY));
+    let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
+    let history = scenes.create_view_history().unwrap();
+    let list = [scene];
+    let desc = FrameDesc {
+        time: FrameTime::default(),
+        scenes: &list,
+        low_latency: None,
+    };
+    // The camera at the origin looks down -z at the quad, which fills most of the view at two
+    // texels of mip 0 per pixel.
+    {
+        let f = scenes.begin_frame(&desc).unwrap();
+        let mut s = f.scene(scene).unwrap();
+        let group = s
+            .create_transform_group(&TransformGroupDesc {
+                count: 1,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .unwrap();
+        s.transforms(group, 0, 1).unwrap()[0] =
+            Affine3::from_translation(Vec3::new(0.0, 0.0, -2.2)).into();
+        s.add_instances(&InstancesDesc {
+            model,
+            copies: 1,
+            transforms: group,
+            first: 0,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER,
+            rt_range: 1000.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+        drop(s);
+        orr_scene::testing::wait(f.end(&[]).unwrap());
     }
-    for _ in 0..4 {
-        mirrored(&mut scenes, true);
-    }
-    assert_eq!(
-        textures(&scenes),
-        tails + others + tiles,
-        "the reflected hits loaded every tile of mips 0 and 1 of the wall's texture, and nothing else"
+    let viewed = |scenes: &mut Scenes| {
+        let mut f = scenes.begin_frame(&desc).unwrap();
+        f.scene(scene).unwrap().set_focus(DVec3::ZERO);
+        f.raster_view(&ViewDesc {
+            scene,
+            history,
+            position: DVec3::ZERO,
+            rotation: Quat::IDENTITY,
+            projection: Projection {
+                fov_y: 0.9,
+                near: 0.05,
+            },
+            lens: Lens::default(),
+            render_extent: orr_math::UVec2::splat(512),
+            output_extent: orr_math::UVec2::splat(512),
+            jitter: Vec2::ZERO,
+            camera_cut: false,
+            mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
+        })
+        .unwrap();
+        orr_scene::testing::wait(f.end(&[]).unwrap());
+    };
+    fill_textures(
+        &mut scenes,
+        tails + tiles,
+        "every tile of the quad's opacity above its mip tails",
+        viewed,
     );
     assert_clean();
 }
