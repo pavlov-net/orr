@@ -767,7 +767,13 @@ public float material_direction(MaterialGpu* m, uint slot, UvFootprint uv[2])
 {
     if ((m.flags & MATERIAL_MORE_TEXTURES) == 0 || !material_bound(m, slot))
         return 0.0;
-    float2 v = material_texture(m, slot, uv, float4(1.0, 0.5, 0.0, 1.0)).xy * 2.0 - 1.0;
+    return material_texel_direction(m, slot, material_texture(m, slot, uv, float4(1.0, 0.5, 0.0, 1.0)).xy);
+}
+
+// `material_direction` of bound slot `slot` from its texel's first two channels `texel`.
+public float material_texel_direction(MaterialGpu* m, uint slot, float2 texel)
+{
+    float2 v = texel * 2.0 - 1.0;
     float3 d = material_normal_frame(m, slot, float3(v, 0.0));
     return dot(d.xy, d.xy) > 0.0 ? atan2(d.y, d.x) : 0.0;
 }
@@ -820,13 +826,34 @@ public MediumParams material_medium(MaterialGpu* m, float4 point)
         { point.xy, float2(0.0), float2(0.0), float2(-1.0), float2(0.0) },
         { point.zw, float2(0.0), float2(0.0), float2(-1.0), float2(0.0) },
     };
-    float4 one = float4(1.0);
-    p.color = material_color(m, TEXTURE_TRANSMISSION_COLOR, uv, p.color);
-    p.depth *= material_texture(m, TEXTURE_TRANSMISSION_DEPTH, uv, one).x;
-    p.scatter = material_color(m, TEXTURE_TRANSMISSION_SCATTER, uv, p.scatter);
-    p.anisotropy = 2.0 * material_texture(m, TEXTURE_TRANSMISSION_SCATTER_ANISOTROPY, uv, float4(0.5 * p.anisotropy + 0.5)).x - 1.0;
-    p.dispersion_scale *= material_texture(m, TEXTURE_DISPERSION_SCALE, uv, one).x;
-    p.dispersion_abbe *= material_texture(m, TEXTURE_DISPERSION_ABBE, uv, one).x;
+    // The six slots through one texture read, as `StandardSurface` reads its slots; an unbound
+    // slot keeps the fallback `material_texture` gives it.
+    float depth = 1.0;
+    float anisotropy = 0.5 * p.anisotropy + 0.5;
+    float scale = 1.0;
+    float abbe = 1.0;
+    // The transmission color, then TEXTURE_TRANSMISSION_DEPTH to TEXTURE_DISPERSION_ABBE.
+    [loop]
+    for (uint k = 0; k < 6; k++)
+    {
+        uint slot = k == 0 ? TEXTURE_TRANSMISSION_COLOR : TEXTURE_TRANSMISSION_DEPTH + k - 1;
+        if (!material_bound(m, slot))
+            continue;
+        float4 v = material_texture(m, slot, uv, float4(1.0));
+        switch (slot)
+        {
+        case TEXTURE_TRANSMISSION_COLOR: p.color = material_tint(m, slot, v.rgb, p.color); break;
+        case TEXTURE_TRANSMISSION_DEPTH: depth = v.x; break;
+        case TEXTURE_TRANSMISSION_SCATTER: p.scatter = material_tint(m, slot, v.rgb, p.scatter); break;
+        case TEXTURE_TRANSMISSION_SCATTER_ANISOTROPY: anisotropy = v.x; break;
+        case TEXTURE_DISPERSION_SCALE: scale = v.x; break;
+        default: abbe = v.x; break;
+        }
+    }
+    p.depth *= depth;
+    p.anisotropy = 2.0 * anisotropy - 1.0;
+    p.dispersion_scale *= scale;
+    p.dispersion_abbe *= abbe;
     return p;
 }
 
@@ -844,7 +871,13 @@ public float3 material_color(MaterialGpu* m, uint slot, UvFootprint uv[2], float
 {
     if (!material_bound(m, slot))
         return factor;
-    float3 texel = material_texture(m, slot, uv, float4(1.0)).rgb;
+    return material_tint(m, slot, material_texture(m, slot, uv, float4(1.0)).rgb, factor);
+}
+
+// Linear Rec.2020 `factor` times `texel`, color slot `slot`'s texel, in linear Rec.2020: the
+// product `material_color` takes, in the texture's primaries.
+public float3 material_tint(MaterialGpu* m, uint slot, float3 texel, float3 factor)
+{
     uint primaries = (m.samplers[slot].modes >> TEXTURE_PRIMARIES_SHIFT) & TEXTURE_PRIMARIES_MASK;
     if (primaries == PRIMARIES_REC709)
         return mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, factor) * texel);
