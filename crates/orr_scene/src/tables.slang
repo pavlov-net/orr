@@ -268,15 +268,18 @@ public struct EditGpu
     public uint _pad;
 }
 
+// Whether `page` is one of the copies an edit of `mesh` holds.
+public bool edit_copy(MeshGpu* mesh, uint8_t* page)
+{
+    EditGpu* e = mesh.edit;
+    return e != nullptr && (uint64_t)page - (uint64_t)e.pages < e.pages_bytes;
+}
+
 // A mesh page as it stood before this frame's kernels: an edited page
 // keeps a copy of last frame's state, and no kernel writes any other page.
 public uint8_t* previous_page(MeshGpu* mesh, uint8_t* page)
 {
-    EditGpu* e = mesh.edit;
-    if (e == nullptr)
-        return page;
-    uint64_t at = (uint64_t)page - (uint64_t)e.pages;
-    return at < e.pages_bytes ? (uint8_t*)((uint64_t)page + e.pages_bytes) : page;
+    return edit_copy(mesh, page) ? (uint8_t*)((uint64_t)page + mesh.edit.pages_bytes) : page;
 }
 
 // The cooked sets of one purpose, in blob 0 (orr_pack::mesh::ClusterSets).

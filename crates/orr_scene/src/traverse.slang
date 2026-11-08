@@ -750,7 +750,9 @@ void traverse(uint3 id: SV_DispatchThreadID)
         report_mesh_page(cut, mesh, g.page, true, worst);
         return;
     }
-    report_mesh_page(cut, mesh, g.page, false, 0.0);
+    // An edit's copy of a page is no read of the source's page its entry reports.
+    if (!edit_copy(mesh, data))
+        report_mesh_page(cut, mesh, g.page, false, 0.0);
     uint mesh_first = mesh.page_clusters[g.page] + g.first_cluster;
     uint id_first = mesh.page_bases[g.page] + g.first_cluster;
     for (uint run = 0; run < g.cluster_count; run += 32)

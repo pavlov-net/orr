@@ -3506,11 +3506,8 @@ fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
     )
     .unwrap();
     let _workers = Workers::start(&scenes, 2);
-    let mounts = [
-        scenes.mount(PackSource::Memory(Arc::clone(bytes))),
-        scenes.mount(PackSource::Memory(Arc::clone(bytes))),
-    ];
-    let [source, other] = mounts.map(|m| {
+    let mounts = [(); 3].map(|()| scenes.mount(PackSource::Memory(Arc::clone(bytes))));
+    let [source, others @ ..] = mounts.map(|m| {
         ready(&mut scenes, m);
         scenes.model(m, AssetId::from_name(SHEET)).unwrap()
     });
@@ -3546,10 +3543,11 @@ fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
             })
             .collect()
     };
-    let streamed_shared = |scenes: &Scenes, held: &[usize]| {
+    // The source's resident streamed pages, past `skip`.
+    let streamed = |scenes: &Scenes, skip: &[usize]| {
         let (_, src) = mesh_of(scenes, &gpu, source);
         (pinned..src.len())
-            .filter(|p| !held.contains(p) && src[*p] != 0)
+            .filter(|p| !skip.contains(p) && src[*p] != 0)
             .count()
     };
     let held = copies(&scenes);
@@ -3560,7 +3558,7 @@ fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
     );
     // The source's pages land: the edit's table follows them.
     let start = Instant::now();
-    while streamed_shared(&scenes, &held) == 0 {
+    while streamed(&scenes, &held) == 0 {
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "the source's pages never landed"
@@ -3569,15 +3567,18 @@ fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
         streamed_frame(&mut scenes, scene, |_| {});
         assert_eq!(copies(&scenes), held, "a landing reached the edit's table");
     }
-    // Another mesh's pages push them out after their hold: the edit keeps its copies and
+    // Two other meshes' pages, more than the budget holds, push them out after their hold,
+    // those the edit reads its copies of in place of them too: the edit keeps its copies and
     // its shared entries go null with the source's.
     let start = Instant::now();
-    while streamed_shared(&scenes, &held) > 0 {
+    while streamed(&scenes, &[]) > 0 {
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "the source's pages never left"
         );
-        scenes.prefetch(other, 0);
+        for &other in &others {
+            scenes.prefetch(other, 0);
+        }
         streamed_frame(&mut scenes, scene, |_| {});
         assert_eq!(
             copies(&scenes),
