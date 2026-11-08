@@ -40,7 +40,7 @@ use orr_pack::{Blob, Codec};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::accel::{self, AccelShared, Animated, ClusterInfo, CutRow, FineCut, PageMicromap};
-use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch};
+use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch, Shortfall};
 use crate::edit::Mirror;
 use crate::loading::{BlobSource, Loading, Msg, landed, read_into, reads_straight};
 use crate::memory::{Block, Pool, PoolSlot};
@@ -1175,8 +1175,14 @@ impl Streaming {
             drop(staging);
             let mut clas = Vec::new();
             for mut c in batch.clas {
-                if let Some(e) = c.take_out_of_memory() {
-                    self.residency.out_of_memory(governs(&self.governed, &e));
+                match c.take_shortfall() {
+                    Some(Shortfall::Memory(e)) => {
+                        self.residency.out_of_memory(governs(&self.governed, &e));
+                    }
+                    // The budgets admitted more CLAS than the range holds: they shrink until
+                    // evictions free enough of it.
+                    Some(Shortfall::Range) => self.residency.out_of_memory(true),
+                    None => {}
                 }
                 clas.extend(self.replay(c));
             }

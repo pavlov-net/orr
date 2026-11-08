@@ -63,8 +63,17 @@ struct PoolOps {
     frees: Vec<(u32, u32)>,
     takes: Vec<u32>,
     estimate: u64,
-    /// The pool grew by fewer pages than the estimate needs for lack of memory.
-    out_of_memory: Option<crate::Error>,
+    /// Why the pool grew by fewer pages than the estimate needs.
+    shortfall: Option<Shortfall>,
+}
+
+/// Why a batch's pool grew by fewer pages than its estimate needs.
+#[derive(Debug)]
+pub(crate) enum Shortfall {
+    /// The pages' memory ran out, with the allocation's error.
+    Memory(crate::Error),
+    /// The address range had no unbound page left.
+    Range,
 }
 
 pub(crate) struct ClasPool {
@@ -179,13 +188,12 @@ impl ClasPool {
         let mut unbound = (0..self.pages.len()).filter(|&p| self.pages[p].0 == PageState::Unbound);
         let mut previous = None;
         let mut grown = Ok(());
-        let mut out_of_memory = None;
-        let mut full = false;
+        let mut shortfall = None;
         // Short of pages or of memory for them, the batch goes on with what it got: its
         // unbinds and frees give memory back, and builds that find no room retry.
         while room < 0 {
             let Some(page) = unbound.next() else {
-                full = true;
+                shortfall = Some(Shortfall::Range);
                 break;
             };
             match self.backing.alloc(device, self.range.page_size, previous) {
@@ -195,7 +203,7 @@ impl ClasPool {
                     slots.push((page as u32, slot));
                 }
                 Err(e) if e.is_out_of_memory() => {
-                    out_of_memory = Some(e);
+                    shortfall = Some(Shortfall::Memory(e));
                     break;
                 }
                 Err(e) => {
@@ -229,14 +237,14 @@ impl ClasPool {
             bound.push(page);
         }
         self.room = room;
-        self.range_full += u32::from(full);
+        self.range_full += u32::from(matches!(shortfall, Some(Shortfall::Range)));
         let ops = PoolOps {
             init: !self.initialized,
             bound,
             frees: std::mem::take(&mut self.frees),
             takes: std::mem::take(&mut self.takes),
             estimate,
-            out_of_memory,
+            shortfall,
         };
         self.initialized = true;
         Ok((ops, binds))
@@ -584,9 +592,9 @@ impl PoolBatch {
         self.count
     }
 
-    /// Takes the error of the pool's growth when it ran out of memory.
-    pub(crate) fn take_out_of_memory(&mut self) -> Option<crate::Error> {
-        self.ops.out_of_memory.take()
+    /// Takes why the pool grew by fewer pages than the batch's estimate needs, if it did.
+    pub(crate) fn take_shortfall(&mut self) -> Option<Shortfall> {
+        self.ops.shortfall.take()
     }
 }
 

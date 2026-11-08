@@ -137,9 +137,10 @@ pub struct ResidencyStats {
     /// Finer cached cuts of streaming meshes whose build failed since their mount for a reason
     /// other than memory; they are not built again.
     pub failed_cuts: u32,
-    /// Failures for lack of memory since the start, of loads (user blobs' among them) and
-    /// finer cut builds; one failure of a whole batch counts once. Units and finer cuts are
-    /// asked for again while they are still wanted.
+    /// Failures for lack of memory since the start, of loads (user blobs' among them), finer
+    /// cut builds and CLAS pool batches the pool could not grow for, short of memory or of
+    /// address range; one failure of a whole batch counts once. Units and finer cuts are asked
+    /// for again while they are still wanted.
     pub out_of_memory: u32,
     /// Instance page records and windows of rows that the frame wanted past the pool's budget.
     /// Copies stay hidden, or at their last pose, for as long as this holds them out.
