@@ -457,12 +457,6 @@ impl Scenes {
             max_anisotropy: 16.0,
             ..SamplerDesc::default()
         })?;
-        let loading = Arc::new(Loading::new(
-            desc.positioned_reads,
-            2 * b.in_flight_bytes,
-            Some(device),
-        )?);
-        let thread = loading::spawn(&loading, device)?;
         let mut pipelines = Pipelines::new(device, desc.kernels)?;
         let generated = desc.generated_resolve && device.caps().generated_commands;
         let raster = RasterPipelines::new(device, desc.kernels, &mut pipelines, generated)?;
@@ -483,6 +477,13 @@ impl Scenes {
             Record::fill(0, streams, 2 * device.image_slots(), 0),
             mounts.streaming.init(),
         ];
+        // Last, so no failure after it leaves the threads running with no one to stop them.
+        let loading = Arc::new(Loading::new(
+            desc.positioned_reads,
+            2 * b.in_flight_bytes,
+            Some(device),
+        )?);
+        let thread = loading::spawn(&loading, device)?;
         Ok(Self {
             loading,
             loading_thread: Some(thread),
