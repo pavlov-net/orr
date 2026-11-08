@@ -89,7 +89,14 @@ fn a_ring_reads_into_registered_buffers_and_by_address_past_the_memory_lock_limi
     // SAFETY: lowers the soft limit only, which needs no privilege.
     let set = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) };
     assert_eq!(set, 0);
-    let ring = Ring::native(&buffers).expect("a ring under a zero memory lock limit");
+    // Kernels before 5.12 charge the ring itself to the limit.
+    let Some(ring) = Ring::native(&buffers) else {
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!("skipping the by-address reads: the kernel makes no ring under the limit");
+        }
+        return;
+    };
     if !locks_past_the_limit() {
         assert!(!ring.registered_buffers(), "registered past the limit");
     }
