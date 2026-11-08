@@ -108,7 +108,7 @@ pub struct Budgets {
     /// clusters of resident mesh pages and of edits' own pages, 24 B each. A mount whose
     /// pinned pages' clusters find no room fails, and a streamed page that finds none loads
     /// later while the mesh page budget shrinks. A cooked scene of 101.8 M clusters holds
-    /// 1,376 B of resident page per cluster, before a streamed page's CLAS.
+    /// 1,376 B of resident page per cluster, before a streamed page's CLAS. Above 0.
     pub resident_cluster_bytes: u64,
     /// Bytes of pages a DAG mesh keeps resident from mount; the pages of a larger one past
     /// its pinned coarsest pages stream on the traversal's requests.
@@ -430,6 +430,10 @@ impl Scenes {
         assert!(desc.cell_log2 <= 16, "cells of 2^{} m", desc.cell_log2);
         let b = &desc.budgets;
         assert!(b.in_flight_bytes > 0, "in_flight_bytes is above 0");
+        assert!(
+            b.resident_cluster_bytes > 0,
+            "resident_cluster_bytes is above 0"
+        );
         // Cluster ids are 32 bits.
         let clusters =
             u32::try_from(b.mesh_page_pool / b.resident_cluster_bytes).unwrap_or(u32::MAX);
