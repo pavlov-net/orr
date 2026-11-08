@@ -530,6 +530,17 @@ pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
     } else {
         Ring::native(&loading.buffers)
     };
+    match &ring {
+        Some(r) => log::info!(
+            "archive reads on the system's ring, buffers {}",
+            if r.registered_buffers() {
+                "registered"
+            } else {
+                "by address"
+            }
+        ),
+        None => log::info!("archive reads on workers"),
+    }
     loop {
         let msgs: Vec<Msg> = loading.inbox.lock().unwrap().drain(..).collect();
         let idle = msgs.is_empty();

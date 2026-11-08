@@ -404,6 +404,17 @@ impl Ring {
         }
     }
 
+    /// Whether the system has its buffers registered, so that reads into them skip mapping
+    /// them; reads name the others by address. Linux refuses a registration past the memory
+    /// lock limit.
+    pub fn registered_buffers(&self) -> bool {
+        match &self.backend {
+            #[cfg(any(windows, target_os = "linux"))]
+            Backend::Native(r) => r.ring.registered_buffers(),
+            Backend::Positioned(..) => false,
+        }
+    }
+
     /// Whether reads are queued or in flight.
     pub fn busy(&self) -> bool {
         match &self.backend {

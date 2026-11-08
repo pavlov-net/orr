@@ -1,0 +1,108 @@
+//! The io_uring ring with its buffers registered, then naming them by address once the memory
+//! lock limit refuses their registration. A binary of its own, as the limit is the process's.
+#![cfg(target_os = "linux")]
+
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use orr_io::{RING_DEPTH, Read, ReadBuffers, ReadFile, Ring, SECTOR, Wake};
+
+fn bytes(len: usize) -> Vec<u8> {
+    let mut x = 0x2545_f491_4f6c_dd1d_u64;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+/// Reads of pool buffers of each size, of memory of their own and past the end of the file
+/// match the file.
+fn reads_match(mut ring: Ring, file: &Arc<ReadFile>, data: &[u8]) {
+    let reads: Vec<(usize, usize)> = (0..100)
+        .map(|i| (i * 3 % 42 * SECTOR, 1 + i * 1777 % (6 * SECTOR)))
+        .collect();
+    let got = Arc::new(Mutex::new(vec![None; reads.len()]));
+    for (i, &(offset, len)) in reads.iter().enumerate() {
+        let got = Arc::clone(&got);
+        ring.push(Read {
+            file: Arc::clone(file),
+            offset: offset as u64,
+            len,
+            into: None,
+            done: Box::new(move |r| {
+                got.lock().unwrap()[i] = Some(r.expect("ring read").as_slice().to_vec());
+            }),
+        });
+    }
+    let wake = Wake::default();
+    loop {
+        ring.pump();
+        if !ring.busy() {
+            break;
+        }
+        wake.wait(Some(&ring));
+    }
+    for (i, (&(offset, len), got)) in reads.iter().zip(got.lock().unwrap().iter()).enumerate() {
+        let start = offset.min(data.len());
+        let want = &data[start..(offset + len).min(data.len())];
+        assert!(
+            got.as_deref() == Some(want),
+            "read {i} at {offset} of {len}"
+        );
+    }
+}
+
+#[test]
+fn a_ring_reads_into_registered_buffers_and_by_address_past_the_memory_lock_limit() {
+    let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("memlock.bin");
+    let data = bytes(40 * SECTOR + 77);
+    fs::write(&p, &data).unwrap();
+    let file = Arc::new(ReadFile::open(&p).unwrap());
+    let buffers = ReadBuffers::new(&[SECTOR, 4 * SECTOR], RING_DEPTH).unwrap();
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is written only during the call.
+    let got = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) };
+    assert_eq!(got, 0);
+    let Some(ring) = Ring::native(&buffers) else {
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!("skipping: the system has no io_uring");
+        }
+        return;
+    };
+    // The limit counts every process of the user, so only one well above the buffers is sure
+    // to take them.
+    if limit.rlim_cur >= 8 * buffers.bytes() as u64 {
+        assert!(ring.registered_buffers(), "registered under {limit:?}");
+    }
+    reads_match(ring, &file, &data);
+
+    limit.rlim_cur = 0;
+    // SAFETY: lowers the soft limit only, which needs no privilege.
+    let set = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) };
+    assert_eq!(set, 0);
+    let ring = Ring::native(&buffers).expect("a ring under a zero memory lock limit");
+    if !locks_past_the_limit() {
+        assert!(!ring.registered_buffers(), "registered past the limit");
+    }
+    reads_match(ring, &file, &data);
+}
+
+/// Whether the process has `CAP_IPC_LOCK`, which locks memory past the limit.
+fn locks_past_the_limit() -> bool {
+    const CAP_IPC_LOCK: u32 = 14;
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    let caps = status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .expect("effective capabilities");
+    u64::from_str_radix(caps.trim(), 16).unwrap() & 1 << CAP_IPC_LOCK != 0
+}

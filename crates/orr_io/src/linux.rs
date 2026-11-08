@@ -206,6 +206,10 @@ impl OsRing {
         Ok(())
     }
 
+    pub(crate) fn registered_buffers(&self) -> bool {
+        self.buffers
+    }
+
     /// Never: the queue holds an entry for every slot, and registrations do not use it.
     pub(crate) fn stalled(&self) -> bool {
         false

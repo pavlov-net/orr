@@ -402,6 +402,11 @@ impl OsRing {
         Ok(())
     }
 
+    /// Always: a ring that cannot register the buffers is not made.
+    pub(crate) fn registered_buffers(&self) -> bool {
+        true
+    }
+
     /// Whether the last submit failed, leaving entries in the queue.
     pub(crate) fn stalled(&self) -> bool {
         self.failed
