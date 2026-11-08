@@ -51,6 +51,28 @@ pub fn request_perf_counters() {
 
 static PERF_COUNTERS: AtomicBool = AtomicBool::new(false);
 
+/// The most the examples' pipeline store keeps. A device loads the whole store at creation, at
+/// about 0.45 ms per MB, so a full store adds about half a second to a launch, against minutes
+/// to compile. An example's pipelines take 350 to 500 MB, so the store holds the current set
+/// and one or two left from kernel changes or other settings.
+const STORE_BYTES: u64 = 1 << 30;
+
+/// The directory the device keeps compiled pipelines in: the screenshot tests' shared store in
+/// `ORR_TEST_PIPELINE_STORE`, which the test runner trims, else the examples' own in the
+/// temporary directory, trimmed to [`STORE_BYTES`] here. Vulkan reads it as the pipeline store;
+/// Metal keeps a pipeline cache file in it per executable, as one file holds only the pipelines
+/// of the process that saved it.
+fn pipeline_store() -> PathBuf {
+    if let Some(dir) = std::env::var_os("ORR_TEST_PIPELINE_STORE") {
+        return PathBuf::from(dir);
+    }
+    let dir = std::env::temp_dir().join("orr-pipelines");
+    if let Err(e) = orr::orr_gpu::trim_pipeline_store(&dir, STORE_BYTES) {
+        log::warn!("pipeline store not trimmed: {e}");
+    }
+    dir
+}
+
 /// The process's device, created on first use with every queue, NGX's extensions where
 /// NGX offers them, and validation when the environment enables the layer. Logs info and
 /// above to stderr, with `RUST_LOG` adding to or overriding that.
@@ -64,11 +86,15 @@ pub fn device() -> &'static Device {
             .try_init();
         #[cfg(dlss)]
         let hooks = DlssSdk::device_hooks(PROJECT_ID);
-        // The test runner sets it, so the screenshot tests share compiled pipelines.
-        let store = std::env::var_os("ORR_TEST_PIPELINE_STORE").map(PathBuf::from);
+        let store = pipeline_store();
+        let exe = std::env::current_exe().expect("the executable's path");
+        let mut name = exe.file_stem().expect("the executable's name").to_owned();
+        name.push(".cache");
+        let cache = store.join(name);
         let desc = DeviceDesc {
             name: "orr-examples",
-            pipeline_store: store.as_deref(),
+            pipeline_cache: Some(&cache),
+            pipeline_store: Some(&store),
             #[cfg(dlss)]
             hooks: Some(&hooks),
             queues: QueueRequest {
