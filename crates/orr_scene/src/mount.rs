@@ -89,11 +89,34 @@ pub struct PageId {
     pub(crate) generation: u32,
 }
 
+/// A heap image slot, sampling a texture, that returns to the device once the work submitted
+/// before it drops has completed: the device can outlive the scenes that placed it.
+struct ImageSlot {
+    device: Device,
+    index: TextureIndex,
+}
+
+impl ImageSlot {
+    fn sampling(device: &Device, texture: &Texture) -> Result<Self> {
+        let slot = device.alloc_image_slot()?;
+        Ok(Self {
+            device: device.clone(),
+            index: device.write_sampled(slot, texture, &ViewDesc::default()),
+        })
+    }
+}
+
+impl Drop for ImageSlot {
+    fn drop(&mut self) {
+        self.device.free_image_slot_after_submitted(self.index.0);
+    }
+}
+
 /// Heap image slots and their textures.
 pub(crate) struct PlacedTexture {
     id: AssetId,
     texture: Arc<Texture>,
-    index: TextureIndex,
+    slot: ImageSlot,
     primaries: u8,
     staged: bool,
     /// Bytes resident from mount: the whole texture, or a streamed one's mip tails.
@@ -1172,12 +1195,11 @@ fn place_texture(
         TextureMemory::Dedicated,
         "cooked texture",
     )?);
-    let slot = t.device.alloc_image_slot()?;
-    let index = t.device.write_sampled(slot, &texture, &ViewDesc::default());
+    let slot = ImageSlot::sampling(&t.device, &texture)?;
     t.placed.lock().unwrap().textures.push(PlacedTexture {
         id,
         texture: Arc::clone(&texture),
-        index,
+        slot,
         primaries: h.primaries,
         staged: !t.host_copy,
         bytes: t.device.texture_requirements(&desc).0,
@@ -1306,11 +1328,10 @@ fn place_streamed(
             )?,
         )),
     };
-    let slot = t.device.alloc_image_slot()?;
-    let index = t.device.write_sampled(slot, &texture, &ViewDesc::default());
+    let slot = ImageSlot::sampling(&t.device, &texture)?;
     let stream = Arc::new(TexStream {
         texture: Arc::clone(&texture),
-        index,
+        index: slot.index,
         layout,
         grid,
         entry: entry as u32,
@@ -1323,7 +1344,7 @@ fn place_streamed(
     t.placed.lock().unwrap().textures.push(PlacedTexture {
         id,
         texture: Arc::clone(&texture),
-        index,
+        slot,
         primaries: h.primaries,
         staged: true,
         bytes: tail_bytes,
@@ -1469,7 +1490,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
         .iter()
         .map(|t| {
             let b = BoundTexture {
-                index: t.index,
+                index: t.slot.index,
                 primaries: t.primaries,
                 ..BoundTexture::NONE
             };
@@ -1720,7 +1741,7 @@ fn link_neural(r: &mut Resolved) -> Result<()> {
         if d.format != orr_gpu::Format::A4r4g4b4Unorm || d.layers != n.gpu.latent_layers {
             return Err(orr_pack::Error::Malformed("neural set latents").into());
         }
-        n.gpu.latents = latents.index;
+        n.gpu.latents = latents.slot.index;
     }
     let streams: HashMap<AssetId, Option<Arc<TexStream>>> = r
         .textures
@@ -1915,7 +1936,6 @@ pub(crate) fn finish<'a>(
 async fn finish_mount(loading: &Loading, device: &Device, task: &MountTask) {
     let mut placed = std::mem::take(&mut *task.placed.lock().unwrap());
     let copies = std::mem::take(&mut placed.copies);
-    let slots: Vec<u32> = placed.textures.iter().map(|t| t.index.0).collect();
     let error = task.error.lock().unwrap().take();
     let state = match error {
         _ if task.cancel.load(Ordering::Relaxed) => Err(Error::Unmounted(task.id)),
@@ -1934,9 +1954,6 @@ async fn finish_mount(loading: &Loading, device: &Device, task: &MountTask) {
     let (point, result) = match result {
         Ok((point, r)) => (point, Ok(r)),
         Err(e) => {
-            for s in slots {
-                device.free_image_slot_after_submitted(s);
-            }
             let mut ids = task.accel.cluster_ids.lock().unwrap();
             for (first, count) in ranges {
                 ids.free(first, count);
@@ -3331,13 +3348,13 @@ impl Mounts {
     }
 
     /// Frees the mounts unmounted at or before `completed`.
-    pub(crate) fn retire(&mut self, completed: u64, device: &Device, materials: &MaterialTable) {
+    pub(crate) fn retire(&mut self, completed: u64, materials: &MaterialTable) {
         let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired)
             .into_iter()
             .partition(|(f, _)| *f <= completed);
         self.retired = keep;
         for (_, r) in done {
-            self.release(r, device, materials);
+            self.release(r, materials);
         }
         self.transient.retain(|(f, _)| *f > completed);
         let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired_edits)
@@ -3363,7 +3380,7 @@ impl Mounts {
         }
     }
 
-    fn release(&mut self, mut r: Resident, device: &Device, materials: &MaterialTable) {
+    fn release(&mut self, mut r: Resident, materials: &MaterialTable) {
         for id in r.models.values() {
             self.owners.remove(id);
             self.model_ids.free(id.0, 1);
@@ -3383,9 +3400,6 @@ impl Mounts {
             materials.free(*id);
         }
         self.free_pages(&mut r);
-        for t in &r.placed_textures {
-            device.free_image_slot_after_submitted(t.index.0);
-        }
         let mut ids = self.accel.cluster_ids.lock().unwrap();
         for &(first, count) in &r.cluster_ranges {
             ids.free(first, count);
@@ -3398,9 +3412,6 @@ impl Mounts {
         let i = batch.mount.0 as usize;
         if !matches!(self.entries.get(i), Some(Some(Entry::Pending(_)))) {
             if let Ok(r) = batch.result {
-                for t in &r.textures {
-                    w.device.free_image_slot_after_submitted(t.index.0);
-                }
                 let mut ids = self.accel.cluster_ids.lock().unwrap();
                 for &(first, count) in &r.cluster_ranges {
                     ids.free(first, count);
@@ -3424,7 +3435,7 @@ impl Mounts {
     fn place(&mut self, mount: MountId, r: Resolved, w: &mut Apply<'_>) -> Result<Resident> {
         let mut res = Resident {
             models: HashMap::new(),
-            textures: r.textures.iter().map(|t| (t.id, t.index)).collect(),
+            textures: r.textures.iter().map(|t| (t.id, t.slot.index)).collect(),
             materials: HashMap::new(),
             pages: HashMap::new(),
             skeletons: r.skeletons.into_iter().collect(),
@@ -3447,13 +3458,13 @@ impl Mounts {
         let resolved = (r.materials, r.meshes, r.models, r.pages, r.cages);
         for n in &r.neural {
             if let Err(e) = w.put(n.record, &[n.gpu]) {
-                self.release(res, w.device, w.materials);
+                self.release(res, w.materials);
                 return Err(e);
             }
         }
         for (table, words) in &r.tiles {
             if let Err(e) = w.put(*table, words) {
-                self.release(res, w.device, w.materials);
+                self.release(res, w.materials);
                 return Err(e);
             }
         }
@@ -3467,7 +3478,7 @@ impl Mounts {
                     }
                 }
                 self.streaming.unregister(mount, 0);
-                self.release(res, w.device, w.materials);
+                self.release(res, w.materials);
                 Err(e)
             }
         }
@@ -3672,7 +3683,7 @@ impl Mounts {
         let neural: Vec<(u32, &NeuralLink)> = res
             .placed_textures
             .iter()
-            .filter_map(|t| Some((t.index.0, t.neural.as_ref()?)))
+            .filter_map(|t| Some((t.slot.index.0, t.neural.as_ref()?)))
             .collect();
         self.streaming
             .register(mount, Arc::clone(source), units, &neural, w)?;
@@ -3776,14 +3787,14 @@ impl Mounts {
     }
 
     /// Frees every mount at once; the device is idle.
-    pub(crate) fn clear(&mut self, device: &Device, materials: &MaterialTable) {
+    pub(crate) fn clear(&mut self, materials: &MaterialTable) {
         for e in std::mem::take(&mut self.entries).into_iter().flatten() {
             if let Entry::Ready(r) = e {
-                self.release(*r, device, materials);
+                self.release(*r, materials);
             }
         }
         for (_, r) in std::mem::take(&mut self.retired) {
-            self.release(r, device, materials);
+            self.release(r, materials);
         }
         self.transient.clear();
         self.edits.clear();

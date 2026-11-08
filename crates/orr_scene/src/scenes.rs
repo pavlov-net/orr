@@ -1077,7 +1077,7 @@ impl Scenes {
             });
             cpu.ptlas.retire(completed);
         }
-        core.mounts.retire(completed, &self.device, &core.materials);
+        core.mounts.retire(completed, &core.materials);
         core.mounts.streaming.retire(completed);
         self.device.collect_garbage();
         let slot = (frame % u64::from(core.fif)) as usize;
@@ -2597,6 +2597,6 @@ impl Drop for Scenes {
         if let Some(t) = self.loading_thread.take() {
             let _ = t.join();
         }
-        self.core.mounts.clear(&self.device, &self.core.materials);
+        self.core.mounts.clear(&self.core.materials);
     }
 }
