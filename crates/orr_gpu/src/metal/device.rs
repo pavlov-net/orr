@@ -280,6 +280,11 @@ impl Device {
         Ok(())
     }
 
+    /// Whether a call has reported the device lost; Metal reports no loss.
+    pub fn is_lost(&self) -> bool {
+        false
+    }
+
     /// A TLAS with one inactive instance: every ray misses it. For kernels with nothing to
     /// trace; `Tlas(0)` is never traced.
     pub fn empty_tlas(&self) -> Tlas {

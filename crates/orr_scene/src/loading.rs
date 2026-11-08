@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orr_io::{AlignedBuf, ReadBuffers, ReadFile, Ring, SECTOR, Wake};
 
@@ -406,14 +406,22 @@ thread_local! {
     static UNTIL: Cell<Option<TimelinePoint>> = const { Cell::new(None) };
 }
 
-/// Completes once `point` has, or with the device's error once it is lost.
+/// How long loading work waits for a point of its own submits before it fails.
+const WAIT: Duration = Duration::from_secs(60);
+
+/// Completes once `point` has; fails once the device is lost or [`WAIT`] has passed.
 pub(crate) fn completion(device: &Device, point: TimelinePoint) -> Completion<'_> {
-    Completion { device, point }
+    Completion {
+        device,
+        point,
+        since: Instant::now(),
+    }
 }
 
 pub(crate) struct Completion<'d> {
     device: &'d Device,
     point: TimelinePoint,
+    since: Instant,
 }
 
 impl Future for Completion<'_> {
@@ -423,6 +431,13 @@ impl Future for Completion<'_> {
         let render = self.device.queue(QueueKind::Render).expect("render queue");
         match render.wait(self.point, Duration::ZERO) {
             Ok(()) => Poll::Ready(Ok(())),
+            // A wait with no time left need not report the loss.
+            Err(orr_gpu::Error::Timeout) if self.device.is_lost() => {
+                Poll::Ready(Err(orr_gpu::Error::DeviceLost.into()))
+            }
+            Err(orr_gpu::Error::Timeout) if self.since.elapsed() >= WAIT => {
+                Poll::Ready(Err(orr_gpu::Error::Timeout.into()))
+            }
             Err(orr_gpu::Error::Timeout) => {
                 UNTIL.set(Some(self.point));
                 Poll::Pending
@@ -478,8 +493,9 @@ impl Watch {
         self.changed.notify_one();
     }
 
-    /// Sets `wake` each time the point it was given completes, or the device is lost, until
-    /// [`Watch::stop`]. A point it waits for when stopped was submitted, so that wait ends.
+    /// Sets `wake` each time the point it was given completes, the device is lost or [`WAIT`]
+    /// passes, until [`Watch::stop`]. Its wait starts after the [`Completion`] of that point
+    /// was made, so it ends no sooner than that one's time runs out.
     fn run(&self, device: &Device, wake: &Wake) {
         let render = device.queue(QueueKind::Render).expect("render queue");
         let mut state = self.state.lock().unwrap();
@@ -492,8 +508,8 @@ impl Watch {
                 return;
             };
             drop(state);
-            // Completion or loss; the loading thread's poll tells which.
-            let _ = render.wait(point, Duration::MAX);
+            // The loading thread's poll tells which way it ended.
+            let _ = render.wait(point, WAIT);
             state = self.state.lock().unwrap();
             if state.0 == Some(point) {
                 state.0 = None;

@@ -839,6 +839,11 @@ impl Device {
         self.shared.wait_submitted(timeout)
     }
 
+    /// Whether a call has reported the device lost.
+    pub fn is_lost(&self) -> bool {
+        self.shared.lost.get().is_some()
+    }
+
     /// A TLAS with one inactive instance: every ray misses it. For kernels with nothing to
     /// trace; `Tlas(0)` is never traced.
     pub fn empty_tlas(&self) -> Tlas {
