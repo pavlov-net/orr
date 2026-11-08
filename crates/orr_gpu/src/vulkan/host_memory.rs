@@ -120,6 +120,17 @@ pub(super) fn import_align(device: &ash::Device, families: &[u32], min_pointer: 
     min_pointer.max(out.memory_requirements.alignment)
 }
 
+/// The error of `call`: [`Error::ImportRefused`] where the driver takes the pointer for no
+/// host allocation it can import (`VK_ERROR_INVALID_EXTERNAL_HANDLE`).
+fn refused(name: &str, call: &'static str) -> impl FnOnce(vk::Result) -> Error {
+    move |r| match r {
+        vk::Result::ERROR_INVALID_EXTERNAL_HANDLE => Error::ImportRefused(format!(
+            "{name}: {call} found no host allocation it imports"
+        )),
+        r => Error::vk(call)(r),
+    }
+}
+
 /// The memory types the driver can import the host memory at `ptr` as.
 ///
 /// # Safety
@@ -182,7 +193,8 @@ impl Device {
     /// `ptr` and `len` are multiples of `Limits::host_import_align`. The memory type comes
     /// from what the driver says of the pointer, coherent where it offers one; otherwise
     /// [`ImportedMemory::flush`] makes CPU writes visible. `keep` is dropped once the import
-    /// ends and no submitted work uses it.
+    /// ends and no submitted work uses it. A driver that cannot import the memory, as the
+    /// extension lets it, gives [`Error::ImportRefused`].
     ///
     /// # Safety
     ///
@@ -207,7 +219,7 @@ impl Device {
         let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
         // SAFETY: `ptr` is a host allocation the caller keeps, aligned as the device asks.
         let pointer = unsafe { pointer_types(f, ptr) }
-            .map_err(Error::vk("vkGetMemoryHostPointerPropertiesEXT"))?;
+            .map_err(refused(name, "vkGetMemoryHostPointerPropertiesEXT"))?;
         let d = &s.device;
         let (sharing_mode, families) = sharing(&s.families);
         let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle);
@@ -229,7 +241,7 @@ impl Device {
         let required = unsafe { d.get_buffer_memory_requirements(buffer) };
         // A buffer may need more memory than its size, which the import cannot grow.
         if required.size > len {
-            return Err(destroy(Error::Invalid(format!(
+            return Err(destroy(Error::ImportRefused(format!(
                 "{name}: a buffer of {len} bytes needs {} bytes of memory",
                 required.size
             ))));
@@ -246,7 +258,7 @@ impl Device {
             .or_else(|| pick(coherent))
             .or_else(|| pick(visible))
             .ok_or_else(|| {
-                destroy(Error::Invalid(format!(
+                destroy(Error::ImportRefused(format!(
                     "{name}: no memory type imports it (pointer types {:#x}, buffer types {:#x})",
                     pointer.memory_type_bits, required.memory_type_bits
                 )))
@@ -263,7 +275,7 @@ impl Device {
             .push(&mut address_flags);
         // SAFETY: valid allocate info naming memory the caller keeps.
         let memory = unsafe { d.allocate_memory(&alloc, None) }
-            .map_err(|e| destroy(Error::vk("vkAllocateMemory")(e)))?;
+            .map_err(|e| destroy(refused(name, "vkAllocateMemory")(e)))?;
         let free = |e: Error| {
             // SAFETY: nothing else holds the memory.
             unsafe { d.free_memory(memory, None) };

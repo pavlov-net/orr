@@ -51,6 +51,10 @@ pub enum Error {
     /// An argument breaks a documented rule.
     #[error("invalid argument: {0}")]
     Invalid(String),
+    /// The driver cannot import this host memory, which the import's extension lets it
+    /// refuse ([`crate::Device::import_host_memory`]).
+    #[error("host memory import refused: {0}")]
+    ImportRefused(String),
     /// The heap has no free slot.
     #[error("{0} heap is full")]
     HeapFull(&'static str),
