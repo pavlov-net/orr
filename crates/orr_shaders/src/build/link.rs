@@ -62,6 +62,12 @@ const SURFACE: Switch = Switch {
             args: "i",
             optional: true,
         },
+        Method {
+            decl: "void feedback(SurfaceInput i)",
+            name: "feedback",
+            args: "i",
+            optional: true,
+        },
     ],
 };
 
@@ -356,6 +362,12 @@ fn source(decl: &Declared, linked: &[&Link], key_bits: u32) -> String {
     );
     for m in switch.methods {
         let modifier = if m.optional { "override " } else { "" };
+        // A void method's cases call, then return: `return` takes no void expression.
+        let (call, end) = if m.decl.starts_with("void ") {
+            ("", " return;")
+        } else {
+            ("return ", "")
+        };
         let _ = writeln!(
             out,
             "    {modifier}static {}\n    {{\n        switch ({})\n        {{",
@@ -364,7 +376,7 @@ fn source(decl: &Declared, linked: &[&Link], key_bits: u32) -> String {
         for (i, l) in linked.iter().enumerate() {
             let _ = writeln!(
                 out,
-                "        case {}: return {}.{}({});",
+                "        case {}: {call}{}.{}({});{end}",
                 i + 1,
                 l.ty,
                 m.name,
@@ -373,7 +385,7 @@ fn source(decl: &Declared, linked: &[&Link], key_bits: u32) -> String {
         }
         let _ = writeln!(
             out,
-            "        default: return {}.{}({});\n        }}\n    }}",
+            "        default: {call}{}.{}({});{end}\n        }}\n    }}",
             switch.default, m.name, m.args
         );
     }

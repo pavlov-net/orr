@@ -32,6 +32,9 @@ public interface ISurface
     {
         return 1.0;
     }
+    static void feedback(SurfaceInput i)
+    {
+    }
 }
 
 public struct StandardSurface : ISurface

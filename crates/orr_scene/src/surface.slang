@@ -30,6 +30,7 @@ public struct HitContext
     public float cone_width;   // m: the ray cone's width at the hit
     public float cone_spread;  // rad: the ray cone's spread angle
     public float2 tap;         // the hit's `UvFootprint.tap`: negative x for hardware filtering
+    public bool feedback;      // the hit reports the texture levels it reads (`FeedbackSurface`)
 }
 
 // Everything a surface knows about its hit. Directions and normals are unit vectors in
@@ -81,6 +82,14 @@ public interface ISurface
     static float coverage(SurfaceInput i)
     {
         return material_coverage(i);
+    }
+
+    // Reports to the frame's texture feedback the level each streamed texture `surface` reads
+    // at the hit wants (`material_feedback`); `FeedbackSurface` calls it for hits whose context
+    // asks. Without its own, a surface reports what `StandardSurface` reads.
+    static void feedback(SurfaceInput i)
+    {
+        surface_feedback(i);
     }
 }
 
@@ -240,38 +249,57 @@ void decal_over(inout float sum, inout float cover, float value, float share)
     cover += share - cover * share;
 }
 
-// Decal `d` blended over `layer` at hit `i`, `relative` from the decal's center, with the
-// hit's footprint `px`, `py` (m, on the surface).
-void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py)
+// Where decal `d` lies over hit `i`, `relative` from the decal's center, with the hit's
+// footprint `px`, `py` (m, on the surface): its share before its material's opacity, and the
+// footprint of the one uv it projects, which every slot reads. False where it does not cover
+// the hit.
+bool decal_place(SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py, out float share, out UvFootprint f)
 {
+    share = 0.0;
+    f = (UvFootprint)0;
     float3 axis_x = d.axis_x;
     float3 axis_y = d.axis_y;
     float3 local = float3(dot(relative, axis_x) * d.inv_half_x, dot(relative, axis_y) * d.inv_half_y, dot(relative, d.axis_z) * d.inv_half_z);
     if (any(abs(local) > 1.0))
-        return;
+        return false;
     float facing = dot(i.geometric_normal, d.axis_z);
-    float share = d.opacity * saturate((facing - d.cos_none) / max(d.cos_full - d.cos_none, 1e-6));
+    share = d.opacity * saturate((facing - d.cos_none) / max(d.cos_full - d.cos_none, 1e-6));
     if (d.depth_fade > 0.0)
         share *= saturate((1.0 - abs(local.z)) / d.depth_fade);
     if (share <= 0.0)
-        return;
-
-    MaterialGpu* m = i.scene.materials + d.material;
+        return false;
     float2 scale = float2(0.5 * d.inv_half_x, -0.5 * d.inv_half_y);
-    UvFootprint f;
     f.uv = float2(0.5, 0.5) + local.xy * float2(0.5, -0.5);
     f.dx = float2(dot(px, axis_x), dot(px, axis_y)) * scale;
     f.dy = float2(dot(py, axis_x), dot(py, axis_y)) * scale;
     f.tap = i.uv[0].tap;
     f.inward = float2(0.0);
+    return true;
+}
+
+// The slot a decal of material `m` reads its coverage from: its opacity slot, else its base
+// color slot's alpha.
+uint decal_coverage_slot(MaterialGpu* m)
+{
+    return material_bound(m, TEXTURE_OPACITY) ? TEXTURE_OPACITY : TEXTURE_BASE_COLOR;
+}
+
+// Decal `d` blended over `layer` at hit `i`, `relative` from the decal's center, with the
+// hit's footprint `px`, `py` (m, on the surface).
+void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py)
+{
+    float share;
+    UvFootprint f;
+    if (!decal_place(i, d, relative, px, py, share, f))
+        return;
+    MaterialGpu* m = i.scene.materials + d.material;
     share *= m.geometry_opacity;
     uint c = d.channels;
     bool emits = (c & DECAL_EMISSION) != 0;
     // Past a primary hit a decal's light reads with no footprint, as `surface_emission` does.
     bool primary = i.context.kind == HIT_PRIMARY;
     UvFootprint e = primary ? f : finest_footprint(f);
-    // The decal's coverage is its opacity slot, else its base color slot's alpha.
-    uint cover = material_bound(m, TEXTURE_OPACITY) ? TEXTURE_OPACITY : TEXTURE_BASE_COLOR;
+    uint cover = decal_coverage_slot(m);
     float coverage = 1.0;
     float lit_coverage = 1.0;
     float luminance = 1.0;
@@ -341,6 +369,8 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
         // its uv's v, as on a mesh whose uv runs like the decal's. A surface past 90 degrees
         // from +z sees the projection mirrored.
         float3 n = i.normal;
+        float3 axis_x = d.axis_x;
+        float3 axis_y = d.axis_y;
         float3 t = safe_normalize(axis_x - n * dot(n, axis_x), cross(n, axis_y));
         float3 b = cross(n, t);
         b = dot(b, axis_y) < 0.0 ? -b : b;
@@ -364,22 +394,79 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
     }
 }
 
-// The decals over hit `i`: those of the bin of world space holding it and the scene's global
-// ones, merged in id order. Texture footprints follow the hit's ray cone onto the triangle's
-// plane, with the view's mip bias at primary hits.
-public DecalLayer surface_decals(SurfaceInput i)
+// Reports to the frame's texture feedback what `blend_decal` of decal `d` reads at hit `i`: its
+// coverage, then its channels' slots, emission's at mip 0 past a primary hit as
+// `surface_emission` reads, with the coverage there too. The coverage is a texel this does not
+// read, so where it is 0 the channels report what the blend skips. One read site serves every
+// slot, which keeps the code small.
+void decal_feedback(SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py)
 {
-    DecalLayer layer = (DecalLayer)0;
+    float share;
+    UvFootprint f;
+    if (!decal_place(i, d, relative, px, py, share, f))
+        return;
+    MaterialGpu* m = i.scene.materials + d.material;
+    uint c = d.channels;
+    bool past = i.context.kind != HIT_PRIMARY;
+    bool shown = share * m.geometry_opacity > 0.0;
+    // Read 0 is the coverage's, of the slot `decal_coverage_slot` picks.
+    static const uint SLOTS[7] = { TEXTURE_OPACITY, TEXTURE_EMISSION, TEXTURE_EMISSION_LUMINANCE, TEXTURE_BASE_COLOR, TEXTURE_ROUGHNESS, TEXTURE_METALNESS, TEXTURE_NORMAL };
+    static const uint CHANNELS[7] = { 0, DECAL_EMISSION, DECAL_EMISSION, DECAL_BASE_COLOR, DECAL_ROUGHNESS, DECAL_METALNESS, DECAL_NORMAL };
+    for (uint k = 0; k < 7; k++)
+    {
+        if (k > 0 && !(shown && (c & CHANNELS[k]) != 0))
+            continue;
+        uint slot = k == 0 ? decal_coverage_slot(m) : SLOTS[k];
+        UvFootprint g = past && k <= 2 && (c & DECAL_EMISSION) != 0 ? finest_footprint(f) : f;
+        UvFootprint gs[2] = { g, g };
+        material_feedback(m, slot, gs);
+    }
+}
+
+// What takes each decal over a hit in turn (`surface_decals_each`).
+interface IDecalVisit
+{
+    // Decal `d` over hit `i`, `relative` from its center, with the hit's footprint `px`, `py`
+    // (m, on the surface).
+    [mutating]
+    void decal(SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py);
+}
+
+struct DecalBlend : IDecalVisit
+{
+    DecalLayer layer;
+
+    [mutating]
+    void decal(SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py)
+    {
+        blend_decal(layer, i, d, relative, px, py);
+    }
+}
+
+struct DecalFeedback : IDecalVisit
+{
+    [mutating]
+    void decal(SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py)
+    {
+        decal_feedback(i, d, relative, px, py);
+    }
+}
+
+// The decals over hit `i`, each handed to `v`: those of the bin of world space holding it and
+// the scene's global ones, merged in id order. Texture footprints follow the hit's ray cone onto
+// the triangle's plane, with the view's mip bias at primary hits.
+void surface_decals_each<V : IDecalVisit>(SurfaceInput i, inout V v)
+{
     SceneRoot* s = i.scene;
     uint globals = s.decal_globals;
     if (globals == 0 && s.decal_bin_slots == 0)
-        return layer;
+        return;
     uint cell_log2 = uint(s.origin_cell.w);
     int3 bin = (i.cell << (cell_log2 - s.decal_bin_log2)) + int3(floor(i.offset * exp2(-float(s.decal_bin_log2))));
     uint run = decal_bin_run(s.decal_bins, s.decal_bin_slots, bin);
     uint count = run != DECAL_BIN_EMPTY ? s.decal_refs[run] : 0;
     if (globals == 0 && count == 0)
-        return layer;
+        return;
 
     // The footprint: two directions across the ray, the cone's width apart, carried along
     // the ray onto the triangle's plane.
@@ -404,9 +491,16 @@ public DecalLayer surface_decals(SurfaceInput i)
         else
             b++;
         DecalGpu* dc = s.decals + min(ga, gb);
-        blend_decal(layer, i, dc, view_relative(i.cell, i.offset, dc.cell, dc.offset, cell_log2), px, py);
+        v.decal(i, dc, view_relative(i.cell, i.offset, dc.cell, dc.offset, cell_log2), px, py);
     }
-    return layer;
+}
+
+// The decals over hit `i` (`surface_decals_each`) blended in id order.
+public DecalLayer surface_decals(SurfaceInput i)
+{
+    DecalBlend b = { (DecalLayer)0 };
+    surface_decals_each(i, b);
+    return b.layer;
 }
 
 // Emission `emission` with `layer` written over it: what `apply_decals` leaves, and what light
@@ -448,6 +542,108 @@ float surface_tangent_angle(float4 tangent, float3 normal, float rotation)
     float3 t0, b0;
     orthonormal_basis(normal, t0, b0);
     return atan2(dot(d, b0), dot(d, t0));
+}
+
+// Whether `StandardSurface` reads bound slot `slot` of `m` at the hit's footprint. Opacity is
+// the alpha test's, at mip 0 (`material_opacity`), displacement the tessellation's and the
+// medium's slots `material_medium`'s; emission reads at mip 0 past a primary hit
+// (`surface_reads_point`).
+bool surface_reads(MaterialGpu* m, uint slot, bool primary)
+{
+    switch (slot)
+    {
+    case TEXTURE_OPACITY:
+    case TEXTURE_DISPLACEMENT:
+    case TEXTURE_DISPLACEMENT_U:
+    case TEXTURE_DISPLACEMENT_V:
+    case TEXTURE_TRANSMISSION_SCATTER:
+    case TEXTURE_TRANSMISSION_SCATTER_ANISOTROPY:
+    case TEXTURE_DISPERSION_SCALE:
+    case TEXTURE_DISPERSION_ABBE:
+        return false;
+    case TEXTURE_EMISSION:
+    case TEXTURE_EMISSION_LUMINANCE:
+        return primary;
+    case TEXTURE_ANISOTROPY:
+    case TEXTURE_TANGENT:
+        return (m.flags & MATERIAL_ANISOTROPY) != 0;
+    case TEXTURE_COAT_TANGENT:
+        return m.coat_weight > 0.0 && m.coat_anisotropy > 0.0;
+    case TEXTURE_TRANSMISSION_COLOR:
+        // A depth texel of 0 reads it too.
+        return (m.flags & MATERIAL_THIN_WALLED) != 0 || m.transmission_depth == 0.0 || material_bound(m, TEXTURE_TRANSMISSION_DEPTH);
+    default:
+        return true;
+    }
+}
+
+// Whether a hit on `m` reads bound slot `slot` at mip 0 at its uv: emission past a primary hit
+// (`surface_emission`) and with MATERIAL_MEDIUM_TEXTURED, the interior medium's slots
+// (`material_medium`, at the point the path enters it). A slot read here wants no coarser mip
+// where `surface_reads` reads it too.
+bool surface_reads_point(MaterialGpu* m, uint slot, bool primary)
+{
+    switch (slot)
+    {
+    case TEXTURE_EMISSION:
+    case TEXTURE_EMISSION_LUMINANCE:
+        return !primary;
+    case TEXTURE_TRANSMISSION_COLOR:
+    case TEXTURE_TRANSMISSION_DEPTH:
+    case TEXTURE_TRANSMISSION_SCATTER:
+    case TEXTURE_TRANSMISSION_SCATTER_ANISOTROPY:
+    case TEXTURE_DISPERSION_SCALE:
+    case TEXTURE_DISPERSION_ABBE:
+        return (m.flags & MATERIAL_MEDIUM_TEXTURED) != 0;
+    default:
+        return false;
+    }
+}
+
+// Reports to the frame's texture feedback the level each streamed texture of the hit's
+// material and of the decals over it wants where `StandardSurface` reads it, as its taps would
+// with `TEXTURE_FEEDBACK`, and those of the medium inside it at the point a path enters it.
+// Slots a factor of 0 leaves unread report nothing, and slots a texel of 0 leaves unread report
+// all the same.
+public void surface_feedback(SurfaceInput i)
+{
+    MaterialGpu* m = i.scene.materials + i.material;
+    bool primary = i.context.kind == HIT_PRIMARY;
+    for (uint slot = 0; slot < TEXTURE_SLOTS; slot++)
+    {
+        if (!material_bound(m, slot))
+            continue;
+        bool point = surface_reads_point(m, slot, primary);
+        if (!point && !surface_reads(m, slot, primary))
+            continue;
+        UvFootprint uv[2] = { point ? finest_footprint(i.uv[0]) : i.uv[0], point ? finest_footprint(i.uv[1]) : i.uv[1] };
+        material_feedback(m, slot, uv);
+    }
+    DecalFeedback d;
+    surface_decals_each(i, d);
+}
+
+// `S` whose hits report their texture feedback (`ISurface.feedback`) before they shade, where
+// their context asks. A kernel resolves through it only the hits that may report, so the others
+// carry none of the code.
+public struct FeedbackSurface<S : ISurface> : ISurface
+{
+    public static GSurface surface(SurfaceInput i, out float depth_offset)
+    {
+        if (i.context.feedback)
+            S.feedback(i);
+        return S.surface(i, depth_offset);
+    }
+
+    public override static float coverage(SurfaceInput i)
+    {
+        return S.coverage(i);
+    }
+
+    public override static void feedback(SurfaceInput i)
+    {
+        S.feedback(i);
+    }
 }
 
 // OpenPBR from the hit's `MaterialGpu` and its textures, with the decals over the hit

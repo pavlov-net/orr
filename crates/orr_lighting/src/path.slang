@@ -1648,6 +1648,10 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
     // One technique alone carries caustics itself.
     bool caustics = r.caustics != nullptr && !one_technique && !photon && caustics_hold_light(r.caustics);
     uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
+    // A photon's cone starts at a light, so its footprints say nothing of what the view reads.
+    // The coherence points group the lanes that report, in the key's least significant bit, so
+    // an implementation that keeps fewer bits drops it first.
+    bool feedback = !photon && texture_feedback_drawn(pixel, r.frame);
 
     Interior interior = start.interior;
     // The froxels hold a camera segment through an interior where this frame has them.
@@ -2065,13 +2069,13 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
         exit = false;
         if (walking)
         {
-            C.point(path_key(s, h), KEY_BITS);
+            C.point(path_key(s, h) << 1 | uint(feedback), KEY_BITS + 1);
             walked = true;
             BsdfParams p = vertex_params(l, opaque > 1 && !reference);
             if (walk.kind == WALK_BOUNDARY)
             {
-                HitContext context = hit_context(HIT_SECONDARY, depth + 1, cone, h.t, texture_tap(v, pixel, r.frame, r.seed, depth + 1));
-                SurfaceHit sh = resolve_hit<S>(s, v, walk.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
+                HitContext context = hit_context(HIT_SECONDARY, depth + 1, cone, h.t, texture_tap(v, pixel, r.frame, r.seed, depth + 1), feedback);
+                SurfaceHit sh = resolve_hit<FeedbackSurface<S>>(s, v, walk.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
                 alive = sh.valid;
                 if (alive)
                     l = opaque_vertex(exit_vertex(v, sh, walk.dir));
@@ -2086,7 +2090,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             exit_scatter = walk_exit(l.x, p, rng);
             continue;
         }
-        C.point(path_key(s, h), KEY_BITS);
+        C.point(path_key(s, h) << 1 | uint(feedback), KEY_BITS + 1);
         // Every lane takes a new vertex past the point. These writes tell the compiler so, which
         // keeps the old vertex out of the state the point holds.
         l = (LayerVertex)0;
@@ -2234,8 +2238,8 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
         else
         {
             float path_t = first ? start.offset + t : t;
-            HitContext context = hit_context(first ? HIT_PRIMARY : HIT_SECONDARY, depth, cone, path_t, texture_tap(v, pixel, r.frame, r.seed, depth));
-            SurfaceHit sh = resolve_hit<S>(s, v, ray.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
+            HitContext context = hit_context(first ? HIT_PRIMARY : HIT_SECONDARY, depth, cone, path_t, texture_tap(v, pixel, r.frame, r.seed, depth), feedback);
+            SurfaceHit sh = resolve_hit<FeedbackSurface<S>>(s, v, ray.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
             if (!sh.valid)
             {
                 alive = false;

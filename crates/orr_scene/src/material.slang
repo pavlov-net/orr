@@ -347,6 +347,31 @@ uint texture_stream_across(uint cell, uint n, uint mode)
     return cell == 0 ? n - 1 : cell == n - 1 ? 0 : cell;
 }
 
+// Reports to the frame's feedback that a read wants level `lod` of cell `at` of streamed texture
+// `s`: a mip above its tail finer than any wanted there this frame raises the cell and appends a
+// record.
+void texture_stream_report(TextureStreamGpu* s, uint at, float lod)
+{
+    uint wanted = uint(clamp(floor(lod), 0.0, float(s.tail_mip)));
+    if (wanted >= s.tail_mip)
+        return;
+    TextureFeedbackGpu* fb = s.feedback;
+    uint v = fb.frame << 8 | (255 - wanted);
+    uint cell_at = s.first_cell + at;
+    if (fb.cells[cell_at] < v)
+    {
+        uint old;
+        InterlockedMax(fb.cells[cell_at], v, old);
+        if (old < v)
+        {
+            uint n;
+            InterlockedAdd(fb.counts[fb.slot], 1, n);
+            if (n < fb.capacity)
+                fb.records[fb.slot * fb.capacity + n] = uint2(cell_at, v);
+        }
+    }
+}
+
 // The finest mip resident at `place` in 0..1 (`texture_place`) of `layer` of streamed texture
 // `s` read under `modes`, after reporting `lod` (the level a tap there wants) to the frame's
 // feedback with `TEXTURE_FEEDBACK`. Filtering at a repeating edge reads the cells across the
@@ -356,34 +381,34 @@ public float texture_stream_clamp(TextureStreamGpu* s, float2 place, uint modes,
     uint2 cell = min(uint2(place * float2(s.cells)), s.cells - 1);
     uint2 across = uint2(texture_stream_across(cell.x, s.cells.x, modes & TEXTURE_WRAP_MASK),
                          texture_stream_across(cell.y, s.cells.y, (modes >> TEXTURE_V_SHIFT) & TEXTURE_WRAP_MASK));
-    uint wanted = uint(clamp(floor(lod), 0.0, float(s.tail_mip)));
     uint resident = 0;
     uint reads = all(across == cell) ? 1 : 4;
     for (uint k = 0; k < reads; k++)
     {
         uint2 c = uint2((k & 1) != 0 ? across.x : cell.x, (k & 2) != 0 ? across.y : cell.y);
         uint at = layer * s.cells.x * s.cells.y + c.y * s.cells.x + c.x;
-        if (TEXTURE_FEEDBACK && wanted < s.tail_mip)
-        {
-            TextureFeedbackGpu* fb = s.feedback;
-            uint v = fb.frame << 8 | (255 - wanted);
-            uint cell_at = s.first_cell + at;
-            if (fb.cells[cell_at] < v)
-            {
-                uint old;
-                InterlockedMax(fb.cells[cell_at], v, old);
-                if (old < v)
-                {
-                    uint n;
-                    InterlockedAdd(fb.counts[fb.slot], 1, n);
-                    if (n < fb.capacity)
-                        fb.records[fb.slot * fb.capacity + n] = uint2(cell_at, v);
-                }
-            }
-        }
+        if (TEXTURE_FEEDBACK)
+            texture_stream_report(s, at, lod);
         resident = max(resident, s.map[at]);
     }
     return float(resident);
+}
+
+// Reports `lod` at `place` of `layer` of streamed texture `s` read under `modes` to the frame's
+// feedback, for the cells `texture_stream_clamp` reads, whatever the kernel exports as
+// `TEXTURE_FEEDBACK`. Its walk of the cells is the clamp's: sharing one function grows every
+// tap of the large kernels, which inline the clamp.
+public void texture_stream_feedback(TextureStreamGpu* s, float2 place, uint modes, uint layer, float lod)
+{
+    uint2 cell = min(uint2(place * float2(s.cells)), s.cells - 1);
+    uint2 across = uint2(texture_stream_across(cell.x, s.cells.x, modes & TEXTURE_WRAP_MASK),
+                         texture_stream_across(cell.y, s.cells.y, (modes >> TEXTURE_V_SHIFT) & TEXTURE_WRAP_MASK));
+    uint reads = all(across == cell) ? 1 : 4;
+    for (uint k = 0; k < reads; k++)
+    {
+        uint2 c = uint2((k & 1) != 0 ? across.x : cell.x, (k & 2) != 0 ? across.y : cell.y);
+        texture_stream_report(s, layer * s.cells.x * s.cells.y + c.y * s.cells.x + c.x, lod);
+    }
 }
 
 // The level of detail anisotropic filtering of up to 16 taps reads for footprint `f` on a
@@ -624,6 +649,27 @@ public void texture_prepare(TextureIndex t, uint modes, UvFootprint f, TextureSt
 #endif
 }
 
+// The level a read under `modes` over footprint `f` on a mip 0 of `size` texels wants of a
+// streamed texture: 0 for a sampler of one mip.
+float texture_wanted_lod(uint modes, UvFootprint f, float2 size)
+{
+    return (modes & TEXTURE_ONE_MIP) != 0 ? 0.0 : footprint_lod(f, size);
+}
+
+// Reports to the frame's feedback the level `texture_footprint` wants of `t` through sampler
+// `s` over footprint `f` where `t` streams (`streams`), without reading it.
+public void texture_feedback(TextureIndex t, TextureSamplerGpu s, UvFootprint f, TextureStreamGpu** streams)
+{
+    TextureStreamGpu* stream = texture_stream(streams, t);
+    if (stream == nullptr)
+        return;
+    uint width;
+    uint height;
+    t.get<Texture2D<float4>>().GetDimensions(width, height);
+    float lod = texture_wanted_lod(s.modes, f, float2(width, height));
+    texture_stream_feedback(stream, texture_place(f.uv, s.modes), s.modes, 0, lod);
+}
+
 // `t` read through sampler `s` over footprint `f`: one stochastic texel under magnification,
 // unless the sampler magnifies nearest, else the sampler's filtering. Streamed textures
 // (`streams`, from `MaterialGpu.texture_streams`; null for none) read no finer than their
@@ -651,7 +697,7 @@ public float4 texture_footprint(TextureIndex t, TextureSamplerGpu s, UvFootprint
         float2 size = float2(width, height);
         if (stream != nullptr)
         {
-            float lod = TEXTURE_FEEDBACK && !one_mip ? footprint_lod(f, size) : 0.0;
+            float lod = TEXTURE_FEEDBACK ? texture_wanted_lod(s.modes, f, size) : 0.0;
             min_lod = texture_stream_clamp(stream, texture_place(f.uv, s.modes), s.modes, 0, lod);
         }
         float2 texel_uv;
@@ -747,6 +793,19 @@ public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint uv[2], flo
     float4 v = texture_footprint(t, s, f, m.texture_streams);
     uint c = (s.modes >> TEXTURE_CHANNEL_SHIFT) & TEXTURE_CHANNEL_MASK;
     return c == 0 ? v : c == 1 ? float4(v.yzw, 1.0) : c == 2 ? float4(v.zw, 0.0, 1.0) : float4(v.w, 0.0, 0.0, 1.0);
+}
+
+// Reports to the frame's feedback the level `material_texture` of `slot` over footprints `uv`
+// wants of the texture it reads there, where that streams, without reading it.
+public void material_feedback(MaterialGpu* m, uint slot, UvFootprint uv[2])
+{
+    TextureIndex t = m.textures[slot];
+    if (t.index == IMAGE_NONE)
+        return;
+    UvFootprint f = material_footprint(m, slot, material_uv_set(m, slot) == 1 ? uv[1] : uv[0]);
+    TextureSamplerGpu s = m.samplers[slot];
+    if (material_reads(m, slot, s.modes, t, f))
+        texture_feedback(t, s, f, m.texture_streams);
 }
 
 // What scalar slot `slot`, one past TEXTURE_TRANSMISSION, reads: 1 unbound.

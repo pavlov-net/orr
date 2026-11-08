@@ -59,7 +59,8 @@ struct Root
     Traced* traced;
     Seen* seen;
     Cone* cones;
-    uint mode;             // 1: `pixels` resolves its hits; 2: gives each hit's position last frame
+    uint mode;             // 1: `pixels` resolves its hits and `cones` reports its mirror hit's
+                           // texture feedback; 2: `pixels` gives each hit's position last frame
     uint pad0;
     uint64_t pad1;
 }
@@ -265,7 +266,8 @@ void cones(uint3 id: SV_DispatchThreadID)
         Found f2 = trace(s, v, origin, r, 1e30, hit_context(HIT_SECONDARY, 1, next, 0.0));
         if (f2.hit.hit && f2.hit.cluster_id >= 0)
         {
-            SurfaceHit b = resolve(s, v, r, f2, hit_context(HIT_SECONDARY, 1, next, f2.hit.t));
+            HitContext reflected = hit_context(HIT_SECONDARY, 1, next, f2.hit.t, float2(-1.0), root.mode == 1);
+            SurfaceHit b = resolve_hit<FeedbackSurface<Surface>>(s, v, r, f2.hit.instance_index, uint(f2.hit.cluster_id), f2.hit.primitive_index, f2.hit.barycentrics, f2.positions, false, reflected);
             o.t[1] = f2.hit.t;
             o.context[1] = float4(b.surface.bsdf.base_color, b.surface.bsdf.specular_roughness);
             o.hits = 2;

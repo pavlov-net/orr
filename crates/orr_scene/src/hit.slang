@@ -547,8 +547,9 @@ public RayCone cone_after_hit(RayCone c, float t, float spread_change)
 }
 
 // The context of a hit `t` m along cone `c` whose stochastic texture filter draws `tap`
-// (`texture_tap`; negative x: hardware filtering).
-public HitContext hit_context(uint kind, uint depth, RayCone c, float t, float2 tap = float2(-1.0))
+// (`texture_tap`; negative x: hardware filtering), reporting texture feedback with `feedback`
+// (`texture_feedback_drawn`).
+public HitContext hit_context(uint kind, uint depth, RayCone c, float t, float2 tap = float2(-1.0), bool feedback = false)
 {
     HitContext h;
     h.kind = kind;
@@ -556,7 +557,24 @@ public HitContext hit_context(uint kind, uint depth, RayCone c, float t, float2 
     h.cone_width = cone_width(c, t);
     h.cone_spread = c.spread;
     h.tap = tap;
+    h.feedback = feedback;
     return h;
+}
+
+// Pixels per side of the squares whose paths report texture feedback together, and the frames
+// between a square's reports. A square reports in one frame of each FEEDBACK_PERIOD, well within
+// the HOLD_FRAMES (orr_scene::residency) a touch keeps a tile, so reports cost an eighth of what
+// every path's would where the lanes that report run together.
+static const uint FEEDBACK_SQUARE = 8;
+static const uint FEEDBACK_PERIOD = 8;
+
+// Whether the hits of the paths through `pixel` in frame `frame` report texture feedback
+// (`HitContext.feedback`): each square of pixels in its own frame of the period, so a frame's
+// reports spread over the view.
+public bool texture_feedback_drawn(uint2 pixel, uint frame)
+{
+    uint2 square = pixel / FEEDBACK_SQUARE;
+    return (pcg(square.x | square.y << 16) + frame) % FEEDBACK_PERIOD == 0;
 }
 
 // Separates the stochastic texture filter's samples from a pixel's other sample streams.
