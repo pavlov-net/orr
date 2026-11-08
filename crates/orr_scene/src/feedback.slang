@@ -110,6 +110,7 @@ void write(uint3 id: SV_DispatchThreadID)
         uint entry = 32 * id.x + firstbitlow(bits);
         bits &= bits - 1;
         uint error = cut.wanted_errors[entry];
+        cut.wanted_errors[entry] = 0;
         uint bucket = bucket_of(error);
         if (bucket < threshold)
             continue;

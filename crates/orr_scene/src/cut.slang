@@ -141,8 +141,8 @@ public struct CutGpu
     // What the traversal tells the loading side, per entry of the mesh page table
     // (`MeshGpu.feedback_pages`, `feedback_nodes`): the entries it read and those it wanted,
     // a bit each, and the largest error each wanted entry would refine (f32 bits, 0 until
-    // wanted), all cleared each frame. Of the wanted, `feedback` keeps those of the largest
-    // errors.
+    // wanted). The bitmaps clear each frame; an error clears where `feedback`'s `write` reads
+    // it, which keeps the wanted entries of the largest errors.
     public uint* touched;
     public uint* wanted;
     public uint* wanted_errors;    // 32 per word of `wanted`

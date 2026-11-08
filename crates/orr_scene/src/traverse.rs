@@ -53,6 +53,7 @@ const ARGS_GATHER: u64 = 3 * ARGS_PASSES as u64;
 const ARGS_JOBS: u64 = ARGS_GATHER + 3;
 const ARGS_TOTAL: u64 = ARGS_JOBS + 3;
 const TRAVERSE_FOCUS: u32 = 1;
+const TRAVERSE_ERRORS: u32 = 2;
 /// `cut.slang` `FEEDBACK_BUCKETS`.
 const FEEDBACK_BUCKETS: u32 = 4096;
 /// Passes of one traversal over a hierarchy whose depth is not known at mount.
@@ -426,6 +427,10 @@ impl Cuts {
             self.ensure_arena(device, f.max_clas)?;
         }
         let (focus_cell, focus_offset) = f.focus.unwrap_or(([0; 4], [0.0; 4]));
+        let mut flags = if f.focus.is_some() { TRAVERSE_FOCUS } else { 0 };
+        if self.updates == 0 {
+            flags |= TRAVERSE_ERRORS;
+        }
         let base = TraverseRoot {
             scene: f.scene,
             cut: self.record.gpu(),
@@ -437,7 +442,7 @@ impl Cuts {
             merge_pixels: f.merge_pixels,
             slots: f.slots,
             pass: 0,
-            flags: if f.focus.is_some() { TRAVERSE_FOCUS } else { 0 },
+            flags,
             models: self.sizes.models,
         };
         let root = |pass: u32| window.put_root(device, &TraverseRoot { pass, ..base });
@@ -447,12 +452,18 @@ impl Cuts {
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         };
         list.begin_pass("traverse", false);
+        let errors = if self.updates == 0 {
+            32 * self.sizes.feedback_words()
+        } else {
+            0
+        };
         let cleared = self
             .sizes
             .keys()
             .max(self.sizes.models)
             .max(COUNTERS as u32)
-            .max(32 * self.sizes.feedback_words())
+            .max(self.sizes.feedback_words())
+            .max(errors)
             .max(FEEDBACK_BUCKETS);
         list.dispatch(p.get(k.clear), r0, groups(cleared));
         step(list);

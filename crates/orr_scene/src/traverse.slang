@@ -28,6 +28,7 @@ import orr_scene.tables;
 
 // `TraverseRoot.flags`.
 static const uint TRAVERSE_FOCUS = 1;   // the scene has a focus
+static const uint TRAVERSE_ERRORS = 2;  // `clear` zeroes `CutGpu.wanted_errors`: the first frame
 
 // `CutGpu.args` grids after the passes': gather, then jobs.
 public static const uint ARGS_PASSES = 64;
@@ -333,7 +334,7 @@ void clear(uint3 id: SV_DispatchThreadID)
         cut.touched[id.x] = 0;
         cut.wanted[id.x] = 0;
     }
-    if (id.x < 32 * cut.feedback_words)
+    if ((root.flags & TRAVERSE_ERRORS) != 0 && id.x < 32 * cut.feedback_words)
         cut.wanted_errors[id.x] = 0;
     if (id.x < FEEDBACK_BUCKETS)
         cut.histogram[id.x] = 0;
