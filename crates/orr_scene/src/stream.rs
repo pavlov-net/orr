@@ -46,7 +46,7 @@ use crate::accel::{
 };
 use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch, PoolMicromap, Shortfall};
 use crate::edit::Mirror;
-use crate::loading::{BlobSource, Loading, Msg, landed, read_into, reads_straight};
+use crate::loading::{BlobSource, Loading, Msg, Resumable, landed, read_into, reads_straight};
 use crate::memory::{Block, Pool, PoolSlot};
 use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
@@ -202,19 +202,23 @@ impl CutBatch {
 }
 
 /// Builds a finer cut on the loading thread.
-pub(crate) fn build_cut(loading: &Loading, device: &Device, t: CutTask) {
-    let built = accel::build_fine_cut(device, &t.accel.kernels, t.cut, &t.members, t.parts);
-    let (cut, point) = match built {
-        Ok((r, c, p)) => (Ok((r, c)), Some(p)),
-        Err(e) => (Err(e), None),
-    };
-    loading.push_cut(CutBatch {
-        mount: t.mount,
-        mesh: t.mesh,
-        slot: t.slot,
-        point,
-        cut,
-    });
+pub(crate) fn build_cut(loading: &Arc<Loading>, device: &Device, t: CutTask) -> Resumable {
+    let (loading, device) = (Arc::clone(loading), device.clone());
+    Box::pin(async move {
+        let k = &t.accel.kernels;
+        let built = accel::build_fine_cut(&device, k, t.cut, &t.members, t.parts).await;
+        let (cut, point) = match built {
+            Ok((r, c, p)) => (Ok((r, c)), Some(p)),
+            Err(e) => (Err(e), None),
+        };
+        loading.push_cut(CutBatch {
+            mount: t.mount,
+            mesh: t.mesh,
+            slot: t.slot,
+            point,
+            cut,
+        });
+    })
 }
 
 /// Where a requested blob lands: consumer memory that stays alive until the blob is ready

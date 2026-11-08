@@ -8,9 +8,12 @@
 //! one cluster BLAS over the moved CLAS, sized and moved the same way; a cut with animated
 //! part clusters also builds one over its body and one per animated part. Section-mask
 //! BLAS build on the frame's list the first frame a copy names the mask.
+//!
+//! A mount's build and a finer cut's are futures the loading thread resumes once each
+//! submit whose sizes they read back has run, so the thread goes on with reads and stream
+//! tasks meanwhile and stays the one that submits the loading queue.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use orr_gpu::{
     Allocation, BlasLimits, ClusterLimits, ClusterVertexFormat, CommandList, ComputePipeline,
@@ -21,6 +24,7 @@ use orr_gpu::{
 };
 use orr_pack::mesh::{Cluster, MeshHeader, Part, in_cut};
 
+use crate::loading::completion;
 use crate::memory::{BestFit, UploadWindow};
 use crate::shaders::accel::{self, AccelRoot, AddressJob, ClasJob};
 use crate::{ClusterRef, PartGpu, Result, RtCutGpu};
@@ -40,7 +44,6 @@ const ACCEL_MOVE: u32 = 1;
 const DAG_CUTS: usize = 12;
 /// Clusters in one CLAS batch, at most.
 const BATCH_CLUSTERS: usize = 1 << 16;
-const WAIT: Duration = Duration::from_secs(60);
 
 /// The loading side's acceleration-structure kernels.
 pub(crate) struct AccelKernels {
@@ -560,10 +563,10 @@ impl<'d> Step<'d> {
         Ok(point)
     }
 
-    fn submit_and_wait(&mut self) -> Result<()> {
+    /// Submits the open list and completes once it has run.
+    async fn submit_and_wait(&mut self) -> Result<()> {
         let point = self.submit()?;
-        let queue = self.device.queue(self.kind).expect("loading queue");
-        Ok(queue.wait(point, WAIT)?)
+        completion(self.device, point).await
     }
 }
 
@@ -649,9 +652,9 @@ fn pack(
     Ok(dst)
 }
 
-/// Runs one implicit cluster op over `n` records the `dispatch` closure writes, waits for
-/// it and returns each result's address and size.
-fn implicit(
+/// Runs one implicit cluster op over `n` records the `dispatch` closure writes and, once it
+/// has run, returns each result's address and size.
+async fn implicit(
     step: &mut Step<'_>,
     desc: &RtasOpDesc,
     n: u32,
@@ -687,7 +690,7 @@ fn implicit(
     );
     step.list()?
         .barrier(Stages::AS_BUILD, Stages::HOST, Hazards::empty());
-    step.submit_and_wait()?;
+    step.submit_and_wait().await?;
     Ok((
         addresses.as_slice().expect("readback is mapped").to_vec(),
         built.as_slice().expect("readback is mapped").to_vec(),
@@ -706,7 +709,7 @@ pub(crate) struct Built {
 }
 
 /// Builds the micromaps, CLAS and cut BLAS of `meshes` on the loading queue after `wait`.
-pub(crate) fn build(
+pub(crate) async fn build(
     device: &Device,
     k: &AccelKernels,
     limits: AccelLimits,
@@ -788,7 +791,8 @@ pub(crate) fn build(
                 ClusterBuild::Clas { omm: with_omm },
                 &mut clas,
                 &mut accel.blocks,
-            )?;
+            )
+            .await?;
         }
     }
 
@@ -814,7 +818,8 @@ pub(crate) fn build(
             ClusterBuild::Template,
             &mut templates,
             &mut accel.blocks,
-        )?;
+        )
+        .await?;
     }
 
     // One cluster BLAS per cut over the moved CLAS.
@@ -851,7 +856,7 @@ pub(crate) fn build(
         }
         rt_cuts.push(rt);
     }
-    let blas = jobs.build(&mut step, k, &mut accel.blocks)?;
+    let blas = jobs.build(&mut step, k, &mut accel.blocks).await?;
 
     let part_rows: usize = plans
         .iter()
@@ -1010,7 +1015,7 @@ impl BlasJobs {
 
     /// Builds every BLAS, moved into a block of exactly their size that `keep` takes; returns
     /// their addresses.
-    fn build(
+    async fn build(
         &self,
         step: &mut Step<'_>,
         k: &AccelKernels,
@@ -1048,7 +1053,8 @@ impl BlasJobs {
                 ..bytemuck::Zeroable::zeroed()
             };
             step.dispatch(&k.records, &root, n.div_ceil(64))
-        })?;
+        })
+        .await?;
         let align = u64::from(step.device.caps().cluster.align_blas);
         pack(
             step,
@@ -1072,7 +1078,7 @@ pub(crate) struct FineCut {
 /// Builds the BLAS of finer cut `cut`, whose clusters are `members`, of a mesh with `parts`
 /// animated parts on the loading queue. Returns its table record, its memory and the point
 /// the build signals.
-pub(crate) fn build_fine_cut(
+pub(crate) async fn build_fine_cut(
     device: &Device,
     k: &AccelKernels,
     cut: Cut,
@@ -1083,7 +1089,7 @@ pub(crate) fn build_fine_cut(
     let mut jobs = BlasJobs::default();
     let p = jobs.plan_cut(cut, members, parts);
     let mut blocks = Vec::new();
-    let blas = jobs.build(&mut step, k, &mut blocks)?;
+    let blas = jobs.build(&mut step, k, &mut blocks).await?;
     // Everything fallible comes before the submit, so a failed cut has no build in flight.
     let mut part_table = None;
     let parts = match &p.parts {
@@ -1440,7 +1446,7 @@ fn tri_counts(meshes: &[MeshInput<'_>], members: &[(usize, usize)]) -> Vec<u32> 
 
 /// One CLAS or template batch: build, read the sizes back and move into a block of its own.
 #[allow(clippy::too_many_arguments)]
-fn build_clas(
+async fn build_clas(
     step: &mut Step<'_>,
     k: &AccelKernels,
     meshes: &[MeshInput<'_>],
@@ -1506,7 +1512,8 @@ fn build_clas(
             ..bytemuck::Zeroable::zeroed()
         };
         step.dispatch(&k.clas, &root, n)
-    })?;
+    })
+    .await?;
     let (kind, align) = if template {
         (MoveKind::Template, caps.cluster.align_template)
     } else {

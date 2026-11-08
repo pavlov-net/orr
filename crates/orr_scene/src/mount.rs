@@ -36,7 +36,7 @@ use crate::edit::{
     EditRecorder, EditRef, EditSkin, EditSource, EditTables, EditTablesDesc, EditTask, Mirror,
 };
 use crate::lights::GATHERED_CLUSTERS;
-use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored};
+use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, Resumable, decoded, read_stored};
 use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler};
 use crate::medium_proxy::VolumeRef;
 use crate::memory::{Block, RangeAllocator, UploadWindow};
@@ -1746,7 +1746,7 @@ fn link_neural(r: &mut Resolved) -> Result<()> {
 
 /// Takes resident cluster ids for every mesh of `r` and builds their acceleration
 /// structures after `wait`. Returns the point the build's last work signals.
-fn build_accel(
+async fn build_accel(
     device: &Device,
     shared: &AccelShared,
     r: &mut Resolved,
@@ -1805,7 +1805,7 @@ fn build_accel(
         })
         .collect();
     let refs: Vec<Vec<ClusterRef>> = inputs.iter().map(accel::cluster_refs).collect();
-    let built = accel::build(device, &shared.kernels, shared.limits, &inputs, wait)?;
+    let built = accel::build(device, &shared.kernels, shared.limits, &inputs, wait).await?;
     let mut skins = Vec::with_capacity(inputs.len());
     for (input, templates) in inputs.iter().zip(&built.templates) {
         skins.push(if input.header.attributes & MeshHeader::SKIN != 0 {
@@ -1902,9 +1902,14 @@ fn bind_tails(device: &Device, textures: &[PlacedTexture]) -> Result<Option<Time
     })
 }
 
-/// Ends a mount on the loading thread: resolves its assets, submits its staged copies and
-/// hands the batch to the render thread.
-pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<MountTask>) {
+/// Ends a mount on the loading thread: resolves its assets, submits its staged copies, builds
+/// its acceleration structures and hands the batch to the render thread.
+pub(crate) fn finish(loading: &Arc<Loading>, device: &Device, task: Arc<MountTask>) -> Resumable {
+    let (loading, device) = (Arc::clone(loading), device.clone());
+    Box::pin(async move { finish_mount(&loading, &device, &task).await })
+}
+
+async fn finish_mount(loading: &Loading, device: &Device, task: &MountTask) {
     let mut placed = std::mem::take(&mut *task.placed.lock().unwrap());
     let copies = std::mem::take(&mut placed.copies);
     let slots: Vec<u32> = placed.textures.iter().map(|t| t.index.0).collect();
@@ -1915,16 +1920,14 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<MountTask>) 
         None => Ok(()),
     };
     let mut ranges = Vec::new();
-    let result = state
-        .and_then(|()| resolve(task.source(), placed, device))
-        .and_then(|mut r| {
-            link_neural(&mut r)?;
-            let tails = bind_tails(device, &r.textures)?;
-            let copied = submit_copies(device, &copies, &r.textures, tails)?;
-            let built = build_accel(device, &task.accel, &mut r, copied);
+    let result = match state.and_then(|()| resolve(task.source(), placed, device)) {
+        Ok(mut r) => {
+            let built = build_resolved(device, task, &copies, &mut r).await;
             ranges.clone_from(&r.cluster_ranges);
-            Ok((built?.or(copied), r))
-        });
+            built.map(|point| (point, r))
+        }
+        Err(e) => Err(e),
+    };
     let (point, result) = match result {
         Ok((point, r)) => (point, Ok(r)),
         Err(e) => {
@@ -1943,6 +1946,23 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<MountTask>) 
         point,
         result,
     });
+}
+
+/// Links a resolved mount's neural sets, binds its textures' mip tails, submits its staged
+/// copies and builds its acceleration structures after them. Returns the point the last of
+/// that work signals.
+async fn build_resolved(
+    device: &Device,
+    task: &MountTask,
+    copies: &[StagedCopy],
+    r: &mut Resolved,
+) -> Result<Option<TimelinePoint>> {
+    link_neural(r)?;
+    let tails = bind_tails(device, &r.textures)?;
+    let copied = submit_copies(device, copies, &r.textures, tails)?;
+    Ok(build_accel(device, &task.accel, r, copied)
+        .await?
+        .or(copied))
 }
 
 enum Entry {

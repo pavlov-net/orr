@@ -21,8 +21,8 @@ use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, ArchiveWriter, AssetId, BlobIn, Class, Codec, Entry, Span, Target};
 use orr_scene::PageId;
 use orr_scene::orr_gpu::{
-    Device, DeviceDesc, GpuAddress, GpuPtr, Hazards, QueueKind, QueueRequest, Stages, Texture,
-    TextureIndex, TextureRegion,
+    Device, DeviceDesc, GpuAddress, GpuPtr, Hazards, HostTimeline, QueueKind, QueueRequest, Stages,
+    Texture, TextureIndex, TextureRegion,
 };
 use orr_scene::testing::{
     assert_clean, device, global_tables, mounted_texture, read_buffer_on, read_texture_on,
@@ -2605,6 +2605,70 @@ fn requested_blobs_land_in_consumer_buffers_and_images_under_their_budget() {
         0,
         "validation messages (see the log)"
     );
+    assert_clean();
+}
+
+/// Holds the loading queue behind a host timeline until dropped.
+struct Gate(HostTimeline);
+
+impl Drop for Gate {
+    fn drop(&mut self) {
+        self.0.signal(1);
+    }
+}
+
+#[test]
+fn a_requested_blob_lands_while_a_mount_build_waits_on_the_loading_queue() {
+    use orr_scene::BlobTarget;
+    use orr_scene::orr_gpu::MemoryKind;
+    let _serial = serial();
+    let dev = device();
+    let (Some(loading), Some(_)) = (dev.queue(QueueKind::Loading), dev.queue(QueueKind::Copy))
+    else {
+        return;
+    };
+    let (_, data) = consumer_blobs();
+    let desc = RendererDesc {
+        budgets: Budgets {
+            user_blob_pool: data.len() as u64,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    };
+    let mut scenes = Scenes::new(dev, &desc).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let tiled = scenes.mount(PackSource::Memory(Arc::clone(tiled_pack())));
+    ready(&mut scenes, tiled);
+
+    // The loading thread is idle, so nothing else submits its queue meanwhile.
+    let gate = Gate(dev.create_host_timeline("loading gate").unwrap());
+    let list = loading.command_list().unwrap();
+    loading.submit(vec![list], &[gate.0.point(1)]).unwrap();
+    // Without textures it stages no copies, which would hold the copy queue behind the gate.
+    let meshes = scenes.mount(PackSource::Memory(Arc::clone(sheet_pack())));
+    // Time for the mount's reads and decodes, so its build reaches the gate first.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(500) {
+        frame(&mut scenes);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let buffer = dev
+        .gpu_malloc::<u8>(MemoryKind::DeviceLocal, data.len() as u64, "consumer data")
+        .unwrap();
+    let target = BlobTarget::Buffer {
+        at: buffer.gpu(),
+        len: buffer.size(),
+    };
+    let id = AssetId::from_name(CONSUMER);
+    let blob = scenes.request_blob(tiled, id, 2, target).unwrap();
+    assert!(matches!(settle_blob(&mut scenes, blob), LoadState::Ready));
+    assert!(Gpu(dev).bytes(buffer.gpu().address().0, data.len()) == data);
+    assert!(
+        matches!(scenes.mount_state(meshes), LoadState::Pending),
+        "the mount's build waits behind the gate"
+    );
+    drop(gate);
+    ready(&mut scenes, meshes);
     assert_clean();
 }
 

@@ -462,12 +462,7 @@ impl Scenes {
             2 * b.in_flight_bytes,
             Some(device),
         )?);
-        let thread = {
-            let (l, d) = (Arc::clone(&loading), device.clone());
-            std::thread::Builder::new()
-                .name("orr loading".into())
-                .spawn(move || loading::thread(l, d))?
-        };
+        let thread = loading::spawn(&loading, device)?;
         let mut pipelines = Pipelines::new(device, desc.kernels)?;
         let generated = desc.generated_resolve && device.caps().generated_commands;
         let raster = RasterPipelines::new(device, desc.kernels, &mut pipelines, generated)?;

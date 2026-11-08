@@ -1,17 +1,27 @@
 //! The loading side: one loading thread that issues archive reads and submits the loading
 //! and copy queues, and jobs that run on threads the consumer lends.
+//!
+//! The loading thread never blocks on the GPU. Work that reads results back between submits
+//! (a mount's acceleration structures, a finer cut's BLAS) is a [`Resumable`] future it
+//! polls in place of waiting, and a watcher thread that only waits wakes it once the point
+//! such work waits for has completed, so it sleeps until a message, a read or the GPU.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::task::{Context, Poll, Waker};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use orr_io::{AlignedBuf, ReadBuffers, ReadFile, Ring, SECTOR, Wake};
 
-use orr_gpu::{Device, ImportedMemory};
+use orr_gpu::{Device, ImportedMemory, QueueKind, TimelinePoint};
 use orr_pack::{Archive, Blob, Codec, Filter};
 
 use crate::edit::{self, EditBatch, EditTask};
@@ -383,8 +393,114 @@ fn take_landed<T>(list: &Mutex<Vec<T>>, landed: impl Fn(&T) -> bool) -> Vec<T> {
 }
 
 /// Whether the work signaling `point` has completed; true without one.
-pub(crate) fn landed(device: &Device, point: Option<orr_gpu::TimelinePoint>) -> bool {
+pub(crate) fn landed(device: &Device, point: Option<TimelinePoint>) -> bool {
     point.is_none_or(|p| device.is_complete(p))
+}
+
+/// Loading-thread work that waits only on GPU points its own submits signal, through
+/// [`completion`].
+pub(crate) type Resumable = Pin<Box<dyn Future<Output = ()>>>;
+
+thread_local! {
+    /// The point the last pending [`Completion`] polled on this thread waits for.
+    static UNTIL: Cell<Option<TimelinePoint>> = const { Cell::new(None) };
+}
+
+/// Completes once `point` has, or with the device's error once it is lost.
+pub(crate) fn completion(device: &Device, point: TimelinePoint) -> Completion<'_> {
+    Completion { device, point }
+}
+
+pub(crate) struct Completion<'d> {
+    device: &'d Device,
+    point: TimelinePoint,
+}
+
+impl Future for Completion<'_> {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+        let render = self.device.queue(QueueKind::Render).expect("render queue");
+        match render.wait(self.point, Duration::ZERO) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(orr_gpu::Error::Timeout) => {
+                UNTIL.set(Some(self.point));
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e.into())),
+        }
+    }
+}
+
+/// Resumable work run one item at a time in the order it came, so a lane holds no more
+/// transient memory at once than one build does.
+#[derive(Default)]
+struct Lane {
+    items: VecDeque<Resumable>,
+    /// The point the front item waits for.
+    until: Option<TimelinePoint>,
+}
+
+impl Lane {
+    /// Polls the front item, and each next one once the one before has finished.
+    fn advance(&mut self) {
+        let mut cx = Context::from_waker(Waker::noop());
+        while let Some(item) = self.items.front_mut() {
+            UNTIL.set(None);
+            if item.as_mut().poll(&mut cx).is_pending() {
+                self.until = Some(UNTIL.take().expect("loading work waits only on the GPU"));
+                return;
+            }
+            self.items.pop_front();
+        }
+        self.until = None;
+    }
+}
+
+/// The point the watcher waits for, and whether the loading thread has stopped.
+#[derive(Default)]
+struct Watch {
+    state: Mutex<(Option<TimelinePoint>, bool)>,
+    changed: Condvar,
+}
+
+impl Watch {
+    fn until(&self, point: Option<TimelinePoint>) {
+        let mut state = self.state.lock().unwrap();
+        if state.0 != point {
+            state.0 = point;
+            self.changed.notify_one();
+        }
+    }
+
+    fn stop(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_one();
+    }
+
+    /// Sets `wake` each time the point it was given completes, or the device is lost, until
+    /// [`Watch::stop`]. A point it waits for when stopped was submitted, so that wait ends.
+    fn run(&self, device: &Device, wake: &Wake) {
+        let render = device.queue(QueueKind::Render).expect("render queue");
+        let mut state = self.state.lock().unwrap();
+        loop {
+            state = self
+                .changed
+                .wait_while(state, |s| s.0.is_none() && !s.1)
+                .unwrap();
+            let Some(point) = state.0.filter(|_| !state.1) else {
+                return;
+            };
+            drop(state);
+            // Completion or loss; the loading thread's poll tells which.
+            let _ = render.wait(point, Duration::MAX);
+            state = self.state.lock().unwrap();
+            if state.0 == Some(point) {
+                state.0 = None;
+            }
+            wake.set();
+        }
+    }
 }
 
 /// The handles of one mounted archive file, opened together at mount so that a file renamed
@@ -607,8 +723,32 @@ pub(crate) fn decoded(
     })
 }
 
-/// The loading thread: IO completions and messages, until `Msg::Stop`.
-pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
+/// Starts the loading thread, which handles IO completions, messages and resumable work until
+/// `Msg::Stop`, and its watcher, which it joins before it ends.
+pub(crate) fn spawn(loading: &Arc<Loading>, device: &Device) -> std::io::Result<JoinHandle<()>> {
+    let watch = Arc::new(Watch::default());
+    let watcher = {
+        let (w, l, d) = (Arc::clone(&watch), Arc::clone(loading), device.clone());
+        std::thread::Builder::new()
+            .name("orr loading watch".into())
+            .spawn(move || w.run(&d, &l.wake))?
+    };
+    let (w, l, d) = (Arc::clone(&watch), Arc::clone(loading), device.clone());
+    let thread = std::thread::Builder::new()
+        .name("orr loading".into())
+        .spawn(move || {
+            run(&l, &d, &w);
+            w.stop();
+            let _ = watcher.join();
+        });
+    if thread.is_err() {
+        // Its idle watcher returns.
+        watch.stop();
+    }
+    thread
+}
+
+fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
     let mut ring = if loading.positioned {
         None
     } else {
@@ -634,36 +774,47 @@ pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
     // the tasks before it have ended: a tile's unbind then submits before a later task binds
     // it again, and batches reach the render thread in the order their CLAS pool work runs.
     let mut streams: VecDeque<Arc<StreamTask>> = VecDeque::new();
+    // Mount builds and finer cut builds each run one at a time, so a cut does not wait out a
+    // mount's build.
+    let (mut mounts, mut cuts) = (Lane::default(), Lane::default());
     loop {
         let msgs: Vec<Msg> = loading.inbox.lock().unwrap().drain(..).collect();
         let idle = msgs.is_empty();
         for msg in msgs {
             match msg {
                 Msg::Stop => return,
-                Msg::Mount(task, source) => start(&loading, ring.is_some(), task, source),
+                Msg::Mount(task, source) => start(loading, ring.is_some(), task, source),
                 Msg::Read(read) => match &mut ring {
                     Some(ring) => ring.push(read),
                     None => unreachable!("reads go to the ring only when there is one"),
                 },
-                Msg::Done(task) => finish(&loading, &device, &task),
+                Msg::Done(task) => mounts.items.push_back(finish(loading, device, task)),
                 Msg::Stream(task) => {
-                    stream::start(&loading, &task);
+                    stream::start(loading, &task);
                     streams.push_back(task);
                 }
                 Msg::StreamDone => {
                     while let Some(task) = streams.pop_front_if(|t| t.read()) {
-                        stream::finish(&loading, &device, &task);
+                        stream::finish(loading, device, &task);
                     }
                 }
-                Msg::Cut(task) => stream::build_cut(&loading, &device, task),
+                Msg::Cut(task) => cuts
+                    .items
+                    .push_back(stream::build_cut(loading, device, task)),
                 Msg::Edit(task) => edit::start(&task),
-                Msg::EditDone(task) => edit::finish(&loading, &device, &task),
+                Msg::EditDone(task) => edit::finish(loading, device, &task),
             }
         }
+        mounts.advance();
+        cuts.advance();
         if let Some(r) = &mut ring {
             r.pump();
         }
         if idle && loading.inbox.lock().unwrap().is_empty() {
+            // Both lanes wait on points of the one queue their builds submit, which complete
+            // in order.
+            let until = mounts.until.into_iter().chain(cuts.until);
+            watch.until(until.min_by_key(|p| p.value()));
             loading.wake.wait(ring.as_ref());
         }
     }
