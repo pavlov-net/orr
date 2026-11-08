@@ -46,7 +46,9 @@ use crate::accel::{
 };
 use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch, PoolMicromap, Shortfall};
 use crate::edit::Mirror;
-use crate::loading::{BlobSource, Loading, Msg, Resumable, landed, read_into, reads_straight};
+use crate::loading::{
+    BlobSource, Loading, Msg, Queue, Resumable, landed, read_into, reads_straight,
+};
 use crate::memory::{Block, Pool, PoolSlot};
 use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
@@ -2224,6 +2226,7 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
             b,
             chunk,
             staged,
+            Queue::Stream,
             Box::new(move |decoded| {
                 let load = &t.loads[i];
                 let mut mesh = None;

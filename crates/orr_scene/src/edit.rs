@@ -22,7 +22,7 @@ use orr_pack::mesh::{Cluster, Group, MeshHeader, PageHeader};
 use crate::accel::{
     self, AccelKernels, ClasBatch, ClasSource, ClusterBuild, ClusterInfo, PageMicromap,
 };
-use crate::loading::{BlobSource, Loading, Msg, decoded, landed, read_stored};
+use crate::loading::{BlobSource, Loading, Msg, Queue, decoded, landed, read_stored};
 use crate::memory::{Block, UploadWindow};
 use crate::mount::{PAGE, StagedCopy, page_infos, submit_copies};
 use crate::producer::scratch_align;
@@ -286,6 +286,7 @@ pub(crate) fn start(task: &Arc<EditTask>) {
             &task.source,
             b,
             None,
+            Queue::Stream,
             Box::new(move |stored| {
                 let result = stored.and_then(|stored| {
                     decoded(&t.source.archive, &b, None, stored, |bytes| {

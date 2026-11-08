@@ -36,7 +36,9 @@ use crate::edit::{
     EditRecorder, EditRef, EditSkin, EditSource, EditTables, EditTablesDesc, EditTask, Mirror,
 };
 use crate::lights::GATHERED_CLUSTERS;
-use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, Resumable, decoded, read_stored};
+use crate::loading::{
+    ArchiveFile, BlobSource, Loading, Msg, Queue, Resumable, decoded, read_stored,
+};
 use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler};
 use crate::medium_proxy::VolumeRef;
 use crate::memory::{Block, RangeAllocator, UploadWindow};
@@ -396,7 +398,7 @@ impl MountTask {
     fn spawn(self: &Arc<Self>, job: impl FnOnce(&Arc<Self>) + Send + 'static) {
         let t = Arc::clone(self);
         match self.loading.upgrade() {
-            Some(l) => l.spawn(move || job(&t)),
+            Some(l) => l.queue(Queue::Mount, move || job(&t)),
             None => self.end(),
         }
     }
@@ -498,6 +500,7 @@ fn fetch(
         &task.source(),
         b,
         None,
+        Queue::Mount,
         Box::new(move |stored| {
             t.step(|| decoded(t.archive(), &b, None, stored?, |bytes| then(&t, bytes)));
         }),

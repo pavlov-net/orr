@@ -51,9 +51,28 @@ pub(crate) enum Msg {
     Stop,
 }
 
+/// The queue a job waits in. A worker takes the front job of the first queue that holds one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Queue {
+    /// Reads and decodes of streamed units, user blobs and edits, which frames wait on.
+    Stream,
+    /// Jobs other crates queue with [`Loading::spawn`]: pipeline compiles and hot reload.
+    Spawned,
+    /// A mount's parse, reads and placement, whose backlog waits behind the others.
+    Mount,
+}
+
+const QUEUES: usize = 3;
+
 struct Jobs {
-    queue: VecDeque<Job>,
+    queues: [VecDeque<Job>; QUEUES],
     stopped: bool,
+}
+
+impl Jobs {
+    fn pop(&mut self) -> Option<Job> {
+        self.queues.iter_mut().find_map(VecDeque::pop_front)
+    }
 }
 
 /// What a job from [`Loading::spawn_result`] leaves behind, polled from any thread. Dropping it
@@ -193,7 +212,7 @@ impl Loading {
         };
         Ok(Self {
             jobs: Mutex::new(Jobs {
-                queue: VecDeque::new(),
+                queues: Default::default(),
                 stopped: false,
             }),
             job_ready: Condvar::new(),
@@ -224,12 +243,12 @@ impl Loading {
     /// Runs jobs on the calling thread until [`Loading::stop_workers`]: archive decodes and
     /// placement, host image copies, positioned reads where the system's completion ring is
     /// missing, and jobs other crates queue with [`Loading::spawn`] (pipeline compiles, hot
-    /// reload). Call it from as many threads as loading should use, with the priority and
-    /// affinity you choose.
+    /// reload). Streamed loads go first, then jobs from [`Loading::spawn`], then mounts. Call it
+    /// from as many threads as loading should use, with the priority and affinity you choose.
     pub fn run_worker(&self) {
         let mut jobs = self.jobs.lock().unwrap();
         while !jobs.stopped {
-            match jobs.queue.pop_front() {
+            match jobs.pop() {
                 Some(job) => {
                     drop(jobs);
                     job();
@@ -240,10 +259,10 @@ impl Loading {
         }
     }
 
-    /// Runs at most one queued job; false when none was queued. For threads that interleave
-    /// loading with other work.
+    /// Runs at most one queued job, the one [`Loading::run_worker`] would take next; false when
+    /// none was queued. For threads that interleave loading with other work.
     pub fn run_one(&self) -> bool {
-        let job = self.jobs.lock().unwrap().queue.pop_front();
+        let job = self.jobs.lock().unwrap().pop();
         job.map(|job| job()).is_some()
     }
 
@@ -254,9 +273,13 @@ impl Loading {
         self.job_ready.notify_all();
     }
 
-    /// Queues `job` for the next worker.
+    /// Queues `job` for the next worker, behind streamed loads and ahead of mounts.
     pub fn spawn(&self, job: impl FnOnce() + Send + 'static) {
-        self.jobs.lock().unwrap().queue.push_back(Box::new(job));
+        self.queue(Queue::Spawned, job);
+    }
+
+    pub(crate) fn queue(&self, queue: Queue, job: impl FnOnce() + Send + 'static) {
+        self.jobs.lock().unwrap().queues[queue as usize].push_back(Box::new(job));
         self.job_ready.notify_one();
         let signal = self.signal.lock().unwrap().clone();
         if let Some(signal) = signal {
@@ -264,8 +287,8 @@ impl Loading {
         }
     }
 
-    /// Queues `job` for the next worker and returns a handle to its result. A panic in `job` ends
-    /// the job, not the worker, and comes back through the handle.
+    /// Queues `job` as [`Loading::spawn`] does and returns a handle to its result. A panic in
+    /// `job` ends the job, not the worker, and comes back through the handle.
     pub fn spawn_result<T: Send + 'static>(
         &self,
         job: impl FnOnce() -> T + Send + 'static,
@@ -548,16 +571,24 @@ pub(crate) struct BlobSource {
 
 type Stored = Box<dyn FnOnce(Result<&[u8]>) + Send>;
 
-/// Reads the stored bytes of blob `b`, or of its chunk `chunk`, then hands them to `then` on
-/// a worker. A read error goes to `then` on the thread that saw it. Without a loading side
-/// `then` is not called.
-pub(crate) fn read_stored(src: &BlobSource, b: Blob, chunk: Option<u32>, then: Stored) {
+/// Reads the stored bytes of blob `b`, or of its chunk `chunk`, then hands them to `then` in a
+/// job on `queue`. A read error goes to `then` on the thread that saw it. Without a loading
+/// side `then` is not called.
+pub(crate) fn read_stored(
+    src: &BlobSource,
+    b: Blob,
+    chunk: Option<u32>,
+    queue: Queue,
+    then: Stored,
+) {
     let Some(loading) = src.loading.upgrade() else {
         return;
     };
     if src.archive.stored(&b, chunk).is_some() {
         let a = Arc::clone(&src.archive);
-        loading.spawn(move || then(Ok(a.stored(&b, chunk).expect("stored in place"))));
+        loading.queue(queue, move || {
+            then(Ok(a.stored(&b, chunk).expect("stored in place")));
+        });
         return;
     }
     let range = src.archive.stored_range(&b, chunk);
@@ -575,6 +606,7 @@ pub(crate) fn read_stored(src: &BlobSource, b: Blob, chunk: Option<u32>, then: S
         range.offset,
         len,
         None,
+        queue,
         move |r| match r {
             Err(e) => then(Err(e)),
             Ok(buf) if buf.len() < end => then(Err(orr_pack::Error::Truncated {
@@ -588,8 +620,9 @@ pub(crate) fn read_stored(src: &BlobSource, b: Blob, chunk: Option<u32>, then: S
 }
 
 /// Reads `len` bytes of `file` from `offset` into `into`, or into a read buffer without one, on
-/// the ring or a worker, and hands the buffer, filled with at most `len` bytes, to `done` on a
-/// worker. A read error goes to `done` on the thread that saw it.
+/// the ring or a worker, and hands the buffer, filled with at most `len` bytes, to `done` in a
+/// job on `queue`. A read error goes to `done` on the thread that saw it.
+#[allow(clippy::too_many_arguments)]
 fn read_file(
     loading: &Arc<Loading>,
     ring: bool,
@@ -597,6 +630,7 @@ fn read_file(
     offset: u64,
     len: usize,
     into: Option<AlignedBuf>,
+    queue: Queue,
     done: impl FnOnce(Result<AlignedBuf>) + Send + 'static,
 ) {
     if ring {
@@ -607,14 +641,14 @@ fn read_file(
             len,
             into,
             done: Box::new(move |r| match (r, weak.upgrade()) {
-                (Ok(buf), Some(l)) => l.spawn(move || done(Ok(buf))),
+                (Ok(buf), Some(l)) => l.queue(queue, move || done(Ok(buf))),
                 (Err(e), _) => done(Err(e.into())),
                 (Ok(_), None) => {}
             }),
         }));
     } else {
         let buffers = loading.buffers.clone();
-        loading.spawn(move || {
+        loading.queue(queue, move || {
             let mut buf = into.unwrap_or_else(|| buffers.take(len));
             let read = file.read(offset, &mut buf);
             buf.truncate(len);
@@ -646,12 +680,19 @@ pub(crate) fn reads_straight(
 }
 
 /// Reads blob `b`, or its chunk `chunk`, decodes it into `dst` and hands the decoded bytes,
-/// which `dst` then starts with, to `then` on a worker. `dst` is mapped cached memory of at
+/// which `dst` then starts with, to `then` in a job on `queue`. `dst` is mapped cached memory of at
 /// least the decoded length, which nothing else uses until `then` returns; where
 /// [`reads_straight`] holds and `dst` is as it asks, the read goes straight into `dst`. A read
 /// error goes to `then` on the thread that saw it. Without a loading side `then` is not
 /// called.
-pub(crate) fn read_into(src: &BlobSource, b: Blob, chunk: Option<u32>, dst: Block, then: Stored) {
+pub(crate) fn read_into(
+    src: &BlobSource,
+    b: Blob,
+    chunk: Option<u32>,
+    dst: Block,
+    queue: Queue,
+    then: Stored,
+) {
     let len = chunk.map_or(b.raw_len, |i| b.chunk_len(i)) as usize;
     assert!(len as u64 <= dst.size(), "a decode outside its slot");
     let at = dst.cpu().expect("mapped staging");
@@ -660,7 +701,7 @@ pub(crate) fn read_into(src: &BlobSource, b: Blob, chunk: Option<u32>, dst: Bloc
         && at.is_multiple_of(SECTOR)
         && len.next_multiple_of(SECTOR) as u64 <= dst.size()
     {
-        read_straight(src, b, chunk, at, len, then);
+        read_straight(src, b, chunk, at, len, queue, then);
         return;
     }
     let a = Arc::clone(&src.archive);
@@ -668,6 +709,7 @@ pub(crate) fn read_into(src: &BlobSource, b: Blob, chunk: Option<u32>, dst: Bloc
         src,
         b,
         chunk,
+        queue,
         Box::new(move |stored| {
             // SAFETY: the caller gives this load the first `len` bytes at `at`.
             let out = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, len) };
@@ -687,6 +729,7 @@ fn read_straight(
     chunk: Option<u32>,
     at: usize,
     len: usize,
+    queue: Queue,
     then: Stored,
 ) {
     let Some(loading) = src.loading.upgrade() else {
@@ -706,6 +749,7 @@ fn read_straight(
         range.offset,
         len,
         Some(buf),
+        queue,
         move |r| match r {
             Err(e) => then(Err(e)),
             Ok(buf) if buf.len() < len => then(Err(orr_pack::Error::Truncated {
