@@ -1007,7 +1007,9 @@ fn a_waterline_at_the_near_plane_is_clean() {
 }
 
 /// A glass sphere in the water does not end the water for the pixels beside it: the blocks clear
-/// of its silhouette match the reference.
+/// of its silhouette and of its shadow match the reference. In the shadow the froxels pass the
+/// sun through the sphere unbent, their named approximation, and the reference only by paths that
+/// find the sun through it.
 #[test]
 fn a_body_in_the_water_leaves_no_halo() {
     let target = Vec3::new(0.0, 0.0, -6.0);
@@ -1016,17 +1018,39 @@ fn a_body_in_the_water_leaves_no_halo() {
     let reference = shown(&mut bed, water_view(Some(water), true), 768);
     // The sphere's silhouette at 6 m.
     let [w, h] = EXTENT;
-    let radius = h as f32 / (2.0 * (0.4f32).tan()) * (1.0 / 6.0) / (1.0 - 1.0 / 36.0f32).sqrt();
+    let tan = (0.4f32).tan();
+    let radius = h as f32 / (2.0 * tan) * (1.0 / 6.0) / (1.0 - 1.0 / 36.0f32).sqrt();
+    // The sun's way in the water, refracted at the flat top, and the m one pixel spans at 1 m.
+    let Light::Directional(sun) = directional(60.0, 30.0, 1_000.0) else {
+        unreachable!()
+    };
+    let across = sun.direction_to_light * Vec3::new(1.0, 0.0, 1.0) / 1.33;
+    let travel = -(across + Vec3::Y * (1.0 - across.length_squared()).sqrt());
+    let pixel = 2.0 * tan / h as f32;
+    // Whether the ray through a block's center passes within the sphere's radius of the shadow's
+    // axis, widened by a block and the froxel column the lookup blends.
+    let shadowed = |px: f32, py: f32| {
+        let ray = Vec3::new(
+            (2.0 * px / w as f32 - 1.0) * tan * w as f32 / h as f32,
+            (1.0 - 2.0 * py / h as f32) * tan,
+            -1.0,
+        )
+        .normalize();
+        (1..400).any(|k| {
+            let t = 0.05 * k as f32;
+            let q = ray * t - target;
+            let along = q.dot(travel);
+            along > 0.0 && (q - travel * along).length() < 1.0 + 12.0 * pixel * t
+        })
+    };
     let (a, r) = (block_rgb(&lit), block_rgb(&reference));
     let (columns, rows) = (w / 8, h / 8);
     let mut checked = 0;
     for by in 0..rows {
         for bx in 0..columns {
-            let d = Vec2::new(
-                (bx * 8 + 4) as f32 - w as f32 / 2.0,
-                (by * 8 + 4) as f32 - h as f32 / 2.0,
-            );
-            if d.length() < radius + 6.0 {
+            let (px, py) = ((bx * 8 + 4) as f32, (by * 8 + 4) as f32);
+            let d = Vec2::new(px - w as f32 / 2.0, py - h as f32 / 2.0);
+            if d.length() < radius + 6.0 || shadowed(px, py) {
                 continue;
             }
             let i = (by * columns + bx) as usize;
