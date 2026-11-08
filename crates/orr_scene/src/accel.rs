@@ -833,25 +833,24 @@ pub(crate) async fn build(
         per_mesh.push((cs.len() as u32, animated));
         let mut rt = Vec::with_capacity(cs.len());
         for cut in cs {
-            let members: Vec<CutMember> = cut
+            let (members, masked): (Vec<CutMember>, Vec<RtCluster>) = cut
                 .clusters
                 .iter()
-                .map(|&c| CutMember {
-                    clas: clas[mi][c as usize],
-                    part: animated.index(&m.clusters[c as usize]),
+                .map(|&c| {
+                    let info = &m.clusters[c as usize];
+                    let member = CutMember {
+                        clas: clas[mi][c as usize],
+                        part: animated.index(info),
+                    };
+                    let masked = RtCluster {
+                        clas: member.clas,
+                        section: info.section,
+                        animated: member.part.is_some(),
+                    };
+                    (member, masked)
                 })
-                .collect();
-            rt.push(
-                cut.clusters
-                    .iter()
-                    .zip(&members)
-                    .map(|(&c, k)| RtCluster {
-                        clas: k.clas,
-                        section: m.clusters[c as usize].section,
-                        animated: k.part.is_some(),
-                    })
-                    .collect(),
-            );
+                .unzip();
+            rt.push(masked);
             plans.push(jobs.plan_cut(cut, &members, animated.count));
         }
         rt_cuts.push(rt);
