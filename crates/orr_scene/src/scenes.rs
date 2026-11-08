@@ -722,28 +722,20 @@ impl Scenes {
             .map_or(0, |c| c.emissive_stride);
         if stride > held {
             let frame = core.next_frame - 1;
-            let strides = |m: ModelId| {
-                if m == model {
-                    stride
-                } else {
-                    core.model_cpu
-                        .get(m.0 as usize)
-                        .map_or(0, |c| c.emissive_stride)
-                }
-            };
-            let page_stride = |page: PageId| {
-                core.mounts.page_prototypes(page).map_or(0, |protos| {
-                    if protos.iter().any(|p| p.model == model) {
-                        protos.iter().map(|p| strides(p.model)).max().unwrap_or(0)
-                    } else {
-                        0
-                    }
+            // A page's other prototypes keep what they hold.
+            let page_strides = |page: PageId| {
+                let protos = core.mounts.page_prototypes(page).ok()?;
+                protos.iter().any(|p| p.model == model).then(|| {
+                    protos
+                        .iter()
+                        .map(|p| if p.model == model { stride } else { 0 })
+                        .collect()
                 })
             };
             // Every scene's ranges first, so a scene without room changes none.
             let mut growths = Vec::new();
             for scene in core.scenes.iter().flatten() {
-                match scene.reserve_entries(model.0, stride, page_stride) {
+                match scene.reserve_entries(model.0, stride, page_strides) {
                     Ok(g) => growths.push((scene, g)),
                     Err(e) => {
                         for (scene, g) in growths {
@@ -1705,6 +1697,53 @@ impl<'a> Frame<'a> {
             let root = scene.tables.root.gpu();
             let mut cpu = scene.cpu.lock().unwrap();
             let cpu = &mut *cpu;
+            let mut rewritten: Vec<std::ops::Range<u32>> = Vec::new();
+            for p in cpu.pages.iter_mut() {
+                if p.expanded && !p.entries_stale {
+                    continue;
+                }
+                let records = cpu.groups[p.group.0 as usize]
+                    .as_ref()
+                    .and_then(|g| g.page.as_ref())
+                    .map_or(0, |g| g.records);
+                if records == 0 {
+                    continue;
+                }
+                let entries_only = p.expanded;
+                if entries_only {
+                    rewritten.push(p.range.first..p.range.first + p.range.count);
+                }
+                p.expanded = true;
+                p.entries_stale = false;
+                let layout = p.entry_layout();
+                let (entries, out) = window.slice(device, layout.len() as u32)?;
+                out.copy_from_slice(&layout);
+                expansions.push(instance_page::PageExpandRoot {
+                    scene: root,
+                    // SAFETY: the records stay resident through this frame: their eviction is
+                    // written at step 1 before the event that hides them.
+                    records: unsafe { GpuPtr::from_address(GpuAddress(records)) },
+                    prototypes: p.prototypes.gpu().cast(),
+                    entries,
+                    first_slot: p.range.first,
+                    count: p.range.count,
+                    prototype_count: p.prototype_count,
+                    first_entry: p.first_entry,
+                    linear_rows: p.linear_rows,
+                    entries_only: u32::from(entries_only),
+                    _pad0: 0,
+                    _pad1: 0,
+                });
+            }
+            if !rewritten.is_empty() {
+                // Their slots take their entries here in place of holding none. Page ranges
+                // are disjoint, so one search finds the only one a slot can lie in.
+                rewritten.sort_unstable_by_key(|r| r.start);
+                cpu.entry_jobs.retain(|j| {
+                    let k = rewritten.partition_point(|r| r.start <= j[0]);
+                    k == 0 || !rewritten[k - 1].contains(&j[0])
+                });
+            }
             if !cpu.entry_jobs.is_empty() {
                 let jobs = std::mem::take(&mut cpu.entry_jobs);
                 let (src, out) = window.slice::<[u32; 4]>(device, jobs.len() as u32)?;
@@ -1715,29 +1754,6 @@ impl<'a> Frame<'a> {
                     job_count: jobs.len() as u32,
                     _pad0: 0,
                     _pad1: 0,
-                });
-            }
-            for p in cpu.pages.iter_mut().filter(|p| !p.expanded) {
-                let records = cpu.groups[p.group.0 as usize]
-                    .as_ref()
-                    .and_then(|g| g.page.as_ref())
-                    .map_or(0, |g| g.records);
-                if records == 0 {
-                    continue;
-                }
-                p.expanded = true;
-                expansions.push(instance_page::PageExpandRoot {
-                    scene: root,
-                    // SAFETY: the records stay resident through this frame: their eviction is
-                    // written at step 1 before the event that hides them.
-                    records: unsafe { GpuPtr::from_address(GpuAddress(records)) },
-                    prototypes: p.prototypes.gpu().cast(),
-                    first_slot: p.range.first,
-                    count: p.range.count,
-                    prototype_count: p.prototype_count,
-                    first_entry: p.first_entry,
-                    entry_stride: p.entry_stride,
-                    linear_rows: p.linear_rows,
                 });
             }
         }

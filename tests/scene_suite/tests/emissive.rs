@@ -2,19 +2,22 @@
 
 use std::sync::Arc;
 
-use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Source};
+use orr_cook::{
+    ArchiveSpec, AssetSpec, Instances, Linear, LodMode, Manifest, MeshInput, MeshSettings,
+    Placement, PrototypeSpec, Source,
+};
 use orr_gpu::{GpuPtr, MemoryKind};
-use orr_math::{Affine3, DMat3, DVec3, Mat3, Vec2, Vec3};
+use orr_math::{Affine3, DMat3, DVec3, Mat3, Quat, Vec2, Vec3};
 use orr_pack::material::Material;
 use orr_pack::mesh::{Cluster, MeshInfo};
-use orr_pack::{Archive, AssetId, Span, Target};
+use orr_pack::{Archive, AssetId, Class, Span, Target};
 use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
     ClusterRef, ClusterTopology, CopyVariant, EditDesc, EmissiveGpu, FrameDesc, FrameTime,
-    GroupWriter, InstanceFlags, InstanceGpu, InstanceRange, InstancesDesc, LoadState, MaterialGpu,
-    MaterialId, MeshGpu, ModelGpu, ModelId, MountId, PackSource, ProducerDesc, ProducerId,
-    ProducerUpdate, RendererDesc, RtCutGpu, SceneCompute, SceneDesc, SceneId, SceneRoot, Scenes,
-    SlotStateGpu, TransformGroupDesc, TransformGroupId, material_flags,
+    GroupWriter, InstanceFlags, InstanceGpu, InstancePageRef, InstanceRange, InstancesDesc,
+    LoadState, MaterialGpu, MaterialId, MeshGpu, ModelGpu, ModelId, MountId, PackSource,
+    ProducerDesc, ProducerId, ProducerUpdate, RendererDesc, RtCutGpu, SceneCompute, SceneDesc,
+    SceneId, SceneRoot, Scenes, SlotStateGpu, TransformGroupDesc, TransformGroupId, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 use scene_suite::shaders::emit;
@@ -989,5 +992,166 @@ fn a_chain_with_a_more_emissive_step_grows_its_copies_entries() {
         .filter(|e| e.cluster_count > 0 && e.power.iter().any(|&p| p > 0.0))
         .count();
     assert_eq!(emitting, 2, "the lamp's sections at its step");
+    assert_clean();
+}
+
+/// The prototype of each record of [`page_pack`]'s page, in x order: 0 `lamp`, 1 `plain`.
+const PAGE_PROTOTYPES: [u16; 6] = [0, 1, 1, 0, 1, 0];
+
+/// [`pack`] and a page of its `lamp` and `plain` copies along x.
+fn page_pack() -> Arc<[u8]> {
+    let prototype = |model: &str| PrototypeSpec {
+        model: model.into(),
+        ..PrototypeSpec::default()
+    };
+    let scatter = AssetSpec {
+        name: "scatter".into(),
+        source: Source::Instances(Instances {
+            records: PAGE_PROTOTYPES
+                .iter()
+                .zip(0..)
+                .map(|(&prototype, i)| Placement {
+                    position: [f64::from(i) * 9.0, 0.0, 0.0],
+                    linear: Linear::Scaled {
+                        rotation: Quat::IDENTITY.to_array(),
+                        scale: [1.0; 3],
+                    },
+                    prototype,
+                })
+                .collect(),
+            prototypes: vec![prototype("lamp"), prototype("plain")],
+            ..Instances::default()
+        }),
+    };
+    pack_of(vec![
+        sheet_asset(
+            "lamp",
+            sheet(24, (24, 12)),
+            lamp_materials(),
+            LodMode::default(),
+        ),
+        sheet_asset(
+            "plain",
+            sheet(24, (24, 12)),
+            vec![Material::default(), Material::default()],
+            LodMode::default(),
+        ),
+        scatter,
+    ])
+}
+
+/// A page reserves entries for each prototype's copies alone, and each copy takes its own by
+/// its rank among its prototype's records; a chain that grows a prototype's copies moves the
+/// page's entries, which its slots take again from its records, keeping the rest of their
+/// records.
+#[test]
+fn a_page_takes_entries_for_each_prototype_s_copies() {
+    let d = device();
+    if d.caps().cluster.max_tris == 0 || d.caps().cluster.max_partitions == 0 {
+        return;
+    }
+    let bytes = page_pack();
+    let archive = Archive::from_memory(Arc::clone(&bytes)).unwrap();
+    let page_id = archive
+        .entries()
+        .iter()
+        .find(|e| e.class == Class::InstancePage as u16)
+        .unwrap()
+        .id;
+    let (lamps, all) = (3, PAGE_PROTOTYPES.len() as u32);
+    // Room for the page's entries with the chain, and for the ones it holds before.
+    let (mut scenes, s, m, _workers) = mounted(bytes, 2 * (lamps + all));
+    let lamp = scenes.model(m, AssetId::from_name("lamp")).unwrap();
+    let plain = scenes.model(m, AssetId::from_name("plain")).unwrap();
+    let page = scenes.instance_page(m, page_id).unwrap();
+    assert_eq!(scenes.page_needs(page).unwrap().emissive, 2 * lamps);
+
+    let list = [s];
+    let mut f = scenes.begin_frame(&frame(&list)).unwrap();
+    let range = f
+        .scene(s)
+        .unwrap()
+        .add_instance_page(&InstancePageRef {
+            page,
+            frame: None,
+            poses: &[],
+            material_sets: &[],
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 1e5,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    f.update_scenes(&mut |_| {}).unwrap();
+    wait(f.end(&[]).unwrap());
+
+    // The page's slots and the list once its records have written `want` entries.
+    let settle = |scenes: &mut Scenes, want: u32| {
+        for _ in 0..600 {
+            let root = run_frame(scenes, s, None);
+            let slots: Vec<InstanceGpu> = read_buffer(
+                root.instances.offset(u64::from(range.first)),
+                u64::from(all),
+            );
+            let held: u32 = slots.iter().map(|i| i.emissive_count).sum();
+            if slots.iter().all(|i| i.flags != 0) && held == want {
+                return (slots, entries(&root));
+            }
+        }
+        panic!("the page's slots never held {want} entries");
+    };
+    let check = |slots: &[InstanceGpu], list: &[EmissiveGpu], strides: [u32; 2], what: &str| {
+        let mut taken = Vec::new();
+        for (i, (inst, &p)) in slots.iter().zip(&PAGE_PROTOTYPES).enumerate() {
+            let model = [lamp, plain][usize::from(p)];
+            assert_eq!(inst.model, model.0, "{what}: slot {i}'s model");
+            assert_eq!(inst.group_index, i as u32, "{what}: slot {i}'s record");
+            let stride = strides[usize::from(p)];
+            assert_eq!(inst.emissive_count, stride, "{what}: slot {i}'s entries");
+            if stride == 0 {
+                assert_eq!(inst.first_emissive, u32::MAX, "{what}: slot {i}");
+                continue;
+            }
+            let slot = range.first + i as u32;
+            for k in 0..stride {
+                let at = inst.first_emissive + k;
+                let e = list[at as usize];
+                assert_eq!(
+                    (e.kind, e.source, e.rank),
+                    (1, slot, k),
+                    "{what}: entry {at}"
+                );
+                taken.push(at);
+            }
+        }
+        let n = taken.len();
+        taken.sort_unstable();
+        taken.dedup();
+        assert_eq!(taken.len(), n, "{what}: slots share entries");
+    };
+    let (slots, list) = settle(&mut scenes, 2 * lamps);
+    check(&slots, &list, [2, 0], "placed");
+
+    // Flags set after the records wrote the slots stay through the move.
+    let listed = [s];
+    let mut f = scenes.begin_frame(&frame(&listed)).unwrap();
+    f.scene(s)
+        .unwrap()
+        .set_instance_flags(range, InstanceFlags::RAY);
+    f.update_scenes(&mut |_| {}).unwrap();
+    wait(f.end(&[]).unwrap());
+    scenes.set_chain(plain, &[(lamp, 10.0)]).unwrap();
+    let (slots, list) = settle(&mut scenes, 2 * all);
+    check(&slots, &list, [2, 2], "grown");
+    assert!(
+        slots.iter().all(|i| i.flags == InstanceFlags::RAY.0),
+        "the move rewrote the slots' flags"
+    );
+    let live = list.iter().filter(|e| e.kind != 0).count() as u32;
+    assert_eq!(
+        live,
+        2 * all,
+        "the entries the page held before are emptied"
+    );
     assert_clean();
 }

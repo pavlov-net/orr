@@ -8,9 +8,17 @@ import orr_scene.tables;
 // A prototype of a placed page: what each of its copies takes.
 public struct PagePrototypeGpu
 {
-    public InstanceGpu instance;   // `first_emissive` is the slot's own
-    public uint emissive_count;    // the emissive and caster section ranks of its model
+    public InstanceGpu instance;   // `first_emissive` and `emissive_count` are the slot's own
+    public uint records;           // the page's records that name it
     public uint3 _pad;
+}
+
+// The emissive list entries of a prototype's copies: `count` each from `first` past the page's
+// first entry, in the order of their ranks.
+public struct PageEntriesGpu
+{
+    public uint first;
+    public uint count;
 }
 
 public struct PageExpandRoot
@@ -18,12 +26,15 @@ public struct PageExpandRoot
     public SceneRoot* scene;
     public InstanceRecord* records;
     public PagePrototypeGpu* prototypes;
+    public PageEntriesGpu* entries; // per prototype
     public uint first_slot;
     public uint count;
     public uint prototype_count;
     public uint first_entry;       // the page's first instance entry of the emissive list
-    public uint entry_stride;      // entries per record
     public uint linear_rows;       // rows of the page's linear table
+    public uint entries_only;      // 1: the slots are written, and take new entries alone
+    public uint _pad0;
+    public uint _pad1;
 }
 ORR_ROOT(PageExpandRoot);
 
@@ -40,16 +51,28 @@ void expand(uint3 id: SV_DispatchThreadID)
         return;
     if ((r.scale & INDEXED) != 0 && r.rot >= AXIS_ROTATIONS + root.linear_rows)
         return;
+    PagePrototypeGpu p = root.prototypes[prototype];
+    if (r.rank >= p.records)
+        return;
     SceneRoot* s = root.scene;
     uint slot = root.first_slot + i;
-    PagePrototypeGpu p = root.prototypes[prototype];
-    uint entry = s.producer_capacity + root.first_entry + i * root.entry_stride;
-    InstanceGpu inst = p.instance;
-    inst.group_index = i;
-    inst.first_emissive = p.emissive_count != 0 ? entry : NO_EMISSIVE;
-    inst.emissive_count = p.emissive_count;
-    s.instances[slot] = inst;
-    for (uint k = 0; k < p.emissive_count; k++)
+    PageEntriesGpu entries = root.entries[prototype];
+    uint entry = s.producer_capacity + root.first_entry + entries.first + r.rank * entries.count;
+    uint first = entries.count != 0 ? entry : NO_EMISSIVE;
+    if (root.entries_only != 0)
+    {
+        s.instances[slot].first_emissive = first;
+        s.instances[slot].emissive_count = entries.count;
+    }
+    else
+    {
+        InstanceGpu inst = p.instance;
+        inst.group_index = i;
+        inst.first_emissive = first;
+        inst.emissive_count = entries.count;
+        s.instances[slot] = inst;
+    }
+    for (uint k = 0; k < entries.count; k++)
     {
         EmissiveGpu e = (EmissiveGpu)0;
         e.kind = EMISSIVE_INSTANCE;

@@ -32,13 +32,15 @@ public struct InstancePageHeader
     public uint motion_window;
 }
 
-// 16 B.
+// 20 B.
 public struct InstanceRecord
 {
     public uint16_t pos[3];
     public uint16_t prototype;
     public uint rot;
     public uint scale;
+    public uint16_t rank;      // the records before it that name its prototype
+    public uint16_t _pad;
 }
 
 // A row of a page's linear table, which follows its records: row-major, 36 B.

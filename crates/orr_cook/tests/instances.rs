@@ -207,6 +207,19 @@ fn fixture_page_decodes_within_its_error_bounds() {
     let raw: Vec<InstanceRecord> = bytemuck::pod_collect_to_vec(&recs);
     let codes: Vec<u64> = raw.iter().map(|r| instance::morton(r.pos)).collect();
     assert!(codes.is_sorted(), "records are not in Morton order");
+    // Each prototype's records rank from 0 in record order, up to its count.
+    let mut ranks = vec![0u16; info.prototypes.len()];
+    for r in &raw {
+        let next = &mut ranks[usize::from(r.prototype)];
+        assert_eq!(
+            r.rank, *next,
+            "rank of a record of prototype {}",
+            r.prototype
+        );
+        *next += 1;
+    }
+    let counts: Vec<u16> = info.prototypes.iter().map(|p| p.records).collect();
+    assert_eq!(counts, ranks);
 
     let step = h.extent.map(|e| f64::from(e) / 65535.0);
     let scale_half_step = f64::from(h.log2_scale_max - h.log2_scale_min) / 1023.0 / 2.0;

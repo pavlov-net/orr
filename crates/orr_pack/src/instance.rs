@@ -5,7 +5,8 @@
 //!   record per partition). Spans are byte offsets in blob 0 and record counts.
 //! - Blob 1: [`InstancePageHeader::record_count`] [`InstanceRecord`]s in Morton order of
 //!   [`InstanceRecord::pos`], at most [`MAX_RECORDS`], then the page's [`LinearRows`] table, so
-//!   both stream and stay resident together.
+//!   both stream and stay resident together. The records of a prototype rank
+//!   `0..`[`Prototype::records`] in that order ([`InstanceRecord::rank`]).
 //! - Blob 2, when `user_stride` is not 0: `user_stride` bytes of consumer data per record,
 //!   in record order.
 //! - Then on an animated page a blob per window of its [`MotionRow`]s
@@ -193,7 +194,8 @@ pub struct Prototype {
     pub flags: u32,
     /// Pose variant, below [`MAX_POSE`].
     pub pose: u16,
-    pub _pad: u16,
+    /// The page's records that name it; the prototypes' add up to the record count.
+    pub records: u16,
     /// One [`SectionOverride`] per mesh section of the model; empty uses the model as cooked.
     pub sections: Span,
 }
@@ -210,7 +212,7 @@ pub struct SectionOverride {
     pub _pad: [u8; 3],
 }
 
-/// One placement, 16 B, uploaded as stored.
+/// One placement, 20 B, uploaded as stored.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct InstanceRecord {
@@ -223,6 +225,9 @@ pub struct InstanceRecord {
     /// Bits 0-9, 10-19 and 20-29: x, y and z scale codes; bit 30 [`Self::INDEXED`], bit 31
     /// [`Self::MIRROR`]. A table row replaces the scale and mirror along with the rotation.
     pub scale: u32,
+    /// The records before it that name its prototype.
+    pub rank: u16,
+    pub _pad: u16,
 }
 
 impl InstanceRecord {
@@ -302,6 +307,10 @@ impl InstancePageInfo {
                 },
                 ..p
             });
+        }
+        let records: u32 = prototypes_out.iter().map(|p| u32::from(p.records)).sum();
+        if records != u32::from(header.record_count) {
+            return Err(Error::Malformed("instance page prototype records"));
         }
         let partitions: Vec<u16> = table(blob, header.partitions)?;
         if partitions.first().is_some_and(|&p| p != 0) || !partitions.is_sorted() {

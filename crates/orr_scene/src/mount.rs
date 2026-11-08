@@ -219,6 +219,8 @@ struct PlacedPage {
 /// A prototype of an instance page, resolved to this run's ids.
 pub(crate) struct PagePrototype {
     pub(crate) model: ModelId,
+    /// The page's records that name it.
+    pub(crate) records: u32,
     /// Its section materials where it overrides any.
     pub(crate) sets: Option<Vec<MaterialId>>,
     pub(crate) mask: u16,
@@ -2997,6 +2999,7 @@ impl Mounts {
                 })?;
                 Ok(PagePrototype {
                     model,
+                    records: u32::from(p.records),
                     sets,
                     mask,
                     pose,

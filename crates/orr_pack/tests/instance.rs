@@ -33,7 +33,7 @@ fn layouts_match_the_gpu_structs() {
     assert_eq!(size_of::<MotionRow>(), 88);
     assert_eq!(size_of::<Prototype>(), 32);
     assert_eq!(size_of::<SectionOverride>(), 20);
-    assert_eq!(size_of::<InstanceRecord>(), 16);
+    assert_eq!(size_of::<InstanceRecord>(), 20);
     assert_eq!(size_of::<LinearRows>(), 36);
     assert_eq!(std::mem::offset_of!(InstancePageHeader, user_stride), 52);
     assert_eq!(std::mem::offset_of!(InstancePageHeader, partitions), 56);
@@ -48,16 +48,18 @@ fn sheared_page() -> (InstancePageInfo, Vec<u8>) {
         Vec3::new(-0.375, 0.0, 3.0),
     );
     let mirrored = shear * Mat3::from_diagonal(Vec3::new(-1.0, 1.0, 1.0));
-    let record = |pos, rot, scale| InstanceRecord {
+    let record = |pos, rot, rank| InstanceRecord {
         pos,
         prototype: 0,
         rot,
-        scale,
+        scale: InstanceRecord::INDEXED,
+        rank,
+        _pad: 0,
     };
     let records = [
-        record([0, 0, 0], 0, InstanceRecord::INDEXED),
-        record([65535, 0, 0], AXIS_ROTATIONS, InstanceRecord::INDEXED),
-        record([0, 65535, 0], AXIS_ROTATIONS + 1, InstanceRecord::INDEXED),
+        record([0, 0, 0], 0, 0),
+        record([65535, 0, 0], AXIS_ROTATIONS, 1),
+        record([0, 65535, 0], AXIS_ROTATIONS + 1, 2),
     ];
     let table = [LinearRows::from(shear), LinearRows::from(mirrored)];
     let info = InstancePageInfo {
@@ -66,7 +68,10 @@ fn sheared_page() -> (InstancePageInfo, Vec<u8>) {
             record_count: records.len() as u16,
             ..bytemuck::Zeroable::zeroed()
         },
-        prototypes: vec![bytemuck::Zeroable::zeroed()],
+        prototypes: vec![Prototype {
+            records: records.len() as u16,
+            ..bytemuck::Zeroable::zeroed()
+        }],
         sections: Vec::new(),
         partitions: vec![0],
         motion_times: Vec::new(),

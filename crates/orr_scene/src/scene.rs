@@ -20,7 +20,7 @@ use crate::memory::{RangeAllocator, UploadWindow};
 use crate::mount::{InstancePage, Mounts, PageId, PagePrototype};
 use crate::producer::{self, Opacity, Producer, ProducerDesc, ProducerId, ProducerUpdate};
 use crate::ptlas::Ptlas;
-use crate::shaders::instance_page::PagePrototypeGpu;
+use crate::shaders::instance_page::{PageEntriesGpu, PagePrototypeGpu};
 use crate::skin::{CopyArrays, SkinFrame, SkinnedDesc};
 use crate::subd::{self, ModelCage, SubdBuild, SubdDesc};
 use crate::tessellate::Patterns;
@@ -118,16 +118,30 @@ pub struct PageNeeds {
     /// Of `page_material_sets`: the sets of the prototypes that override materials.
     pub material_sets: u32,
     /// Of `emissive_capacity`: every copy takes room for the emissive and caster sections of
-    /// the most emissive model and chain of the page.
+    /// the most emissive step of its model's chain.
     pub emissive: u32,
 }
 
-/// What placing page `id` takes, the emissive entries each copy takes, and its prototypes.
+/// What the copies of one prototype of a placed page take of the emissive list: `stride`
+/// entries each for its `records`, after the entries of the prototypes before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrototypeEntries {
+    pub(crate) records: u32,
+    pub(crate) stride: u32,
+}
+
+/// The emissive list entries of a page whose prototypes take `entries`.
+fn page_entries(entries: &[PrototypeEntries]) -> u32 {
+    entries.iter().map(|e| e.records * e.stride).sum()
+}
+
+/// What placing page `id` takes, the emissive entries of each of its prototypes, and its
+/// prototypes.
 pub(crate) fn page_needs(
     mounts: &Mounts,
     model_cpu: &[ModelCpu],
     id: PageId,
-) -> Result<(PageNeeds, u32, Vec<PagePrototype>)> {
+) -> Result<(PageNeeds, Vec<PrototypeEntries>, Vec<PagePrototype>)> {
     let page = mounts.page(id).ok_or(Error::UnknownPage(id))?;
     let instances = u32::from(page.info.header.record_count);
     let protos = mounts.page_prototypes(id)?;
@@ -135,21 +149,21 @@ pub(crate) fn page_needs(
         .iter()
         .map(|p| p.sets.as_ref().map_or(0, |s| s.len() as u32))
         .sum();
-    let stride = protos
+    let entries: Vec<PrototypeEntries> = protos
         .iter()
-        .map(|p| {
-            model_cpu
+        .map(|p| PrototypeEntries {
+            records: p.records,
+            stride: model_cpu
                 .get(p.model.0 as usize)
-                .map_or(0, |m| m.emissive_stride)
+                .map_or(0, |m| m.emissive_stride),
         })
-        .max()
-        .unwrap_or(0);
+        .collect();
     let needs = PageNeeds {
         instances,
         material_sets,
-        emissive: instances * stride,
+        emissive: page_entries(&entries),
     };
-    Ok((needs, stride, protos))
+    Ok((needs, entries, protos))
 }
 
 /// A transform group in one scene. Group 0 is the null group: it holds nothing and hides
@@ -536,7 +550,9 @@ pub(crate) struct ModelCpu {
 }
 
 /// A cooked page placed in a scene: its prototypes until its records first land, which write
-/// its slots, and what its removal frees.
+/// its slots, and what its removal frees. Its copies' emissive list entries are one range from
+/// `first_entry`, by prototype, and in a prototype's by record rank; only its records say which
+/// slot holds which.
 pub(crate) struct PagePlacement {
     pub(crate) range: InstanceRange,
     pub(crate) group: TransformGroupId,
@@ -545,10 +561,31 @@ pub(crate) struct PagePlacement {
     pub(crate) prototype_count: u32,
     pub(crate) first_entry: u32,
     pub(crate) linear_rows: u32,
-    pub(crate) entry_stride: u32,
+    pub(crate) entries: Vec<PrototypeEntries>,
     pub(crate) expanded: bool,
+    /// Its slots hold no entries since its range moved, and take their new ones the next time
+    /// its records are resident.
+    pub(crate) entries_stale: bool,
     /// Its prototypes' entries of the page part of the material-set table.
     pub(crate) sets: (u32, u32),
+}
+
+impl PagePlacement {
+    /// Where each prototype's copies take their entries, as its expansion reads it.
+    pub(crate) fn entry_layout(&self) -> Vec<PageEntriesGpu> {
+        let mut first = 0;
+        self.entries
+            .iter()
+            .map(|e| {
+                let at = first;
+                first += e.records * e.stride;
+                PageEntriesGpu {
+                    first: at,
+                    count: e.stride,
+                }
+            })
+            .collect()
+    }
 }
 
 /// A cooked page of skinned copies placed in a scene.
@@ -580,12 +617,12 @@ struct SkinRange {
 const DEFAULT_PIXELS_PER_RADIAN: f32 = 1000.0;
 
 /// Emissive list ranges taken for a chain that grows `model`'s copies to `stride` entries:
-/// one per slot, then one per page with its new stride.
+/// one per slot, then one per page with its prototypes' new entries.
 pub(crate) struct EntryGrowth {
     model: u32,
     stride: u32,
     slots: Vec<u32>,
-    pages: Vec<(usize, u32)>,
+    pages: Vec<(usize, Vec<PrototypeEntries>)>,
     taken: Vec<(u32, u32)>,
 }
 
@@ -593,7 +630,8 @@ pub(crate) struct EntryGrowth {
 #[derive(Clone, Copy)]
 struct SlotHold {
     model: u32,
-    /// Its entries of the instance part of the emissive list.
+    /// Its entries of the instance part of the emissive list; none on a page, which holds its
+    /// copies' entries.
     first_entry: u32,
     entries: u32,
 }
@@ -757,9 +795,11 @@ impl Scene {
         let n = range.count * words(size_of::<InstanceGpu>());
         let first = self.tables.instances.gpu().offset(u64::from(range.first));
         cpu.records.push(Record::fill(seq, first.address().0, n, 0));
+        let mut entries: Vec<(u32, u32)> = Vec::new();
         if let Some(i) = cpu.pages.iter().position(|p| p.range == range) {
             let p = cpu.pages.swap_remove(i);
             self.clear_group(cpu, frame, p.group, seq);
+            entries.push((p.first_entry, page_entries(&p.entries)));
             cpu.pages_removed.push((frame, p));
         }
         if let Some(i) = cpu.page_motions.iter().position(|m| m.range == range) {
@@ -798,7 +838,6 @@ impl Scene {
             cpu.skins_removed.push((frame, entry, n, arrays));
         }
         let holds = &mut cpu.slot_holds[range.first as usize..end as usize];
-        let mut entries: Vec<(u32, u32)> = Vec::new();
         for hold in holds {
             match entries.last_mut() {
                 Some((first, count)) if *first + *count == hold.first_entry => {
@@ -817,15 +856,16 @@ impl Scene {
         }
     }
 
-    /// Takes the emissive list ranges that give every copy of `model` placed by hand, and
-    /// every page whose prototypes `page_stride` gives a larger stride, `stride` entries where
-    /// it holds fewer, as a chain that grows the model's most emissive step asks. Fails without
-    /// a change when the list has no room.
+    /// Takes the emissive list ranges that give every copy of `model` placed by hand `stride`
+    /// entries where it holds fewer, and every page a range for its prototypes' strides from
+    /// `page_strides` where one is larger than the page holds, as a chain that grows the model's
+    /// most emissive step asks. `page_strides` gives one per prototype, or `None` for a page
+    /// the chain leaves alone. Fails without a change when the list has no room.
     pub(crate) fn reserve_entries(
         &self,
         model: u32,
         stride: u32,
-        page_stride: impl Fn(PageId) -> u32,
+        page_strides: impl Fn(PageId) -> Option<Vec<u32>>,
     ) -> Result<EntryGrowth> {
         let cpu = &mut *self.cpu.lock().unwrap();
         let slots: Vec<u32> = (0..cpu.slot_holds.len() as u32)
@@ -834,18 +874,29 @@ impl Scene {
                 h.model == model && h.entries < stride
             })
             .collect();
-        let pages: Vec<(usize, u32)> = cpu
+        let pages: Vec<(usize, Vec<PrototypeEntries>)> = cpu
             .pages
             .iter()
             .enumerate()
-            .map(|(i, p)| (i, page_stride(p.page)))
-            .filter(|&(i, wanted)| wanted > cpu.pages[i].entry_stride)
+            .filter_map(|(i, p)| {
+                let strides = page_strides(p.page)?;
+                let grown: Vec<PrototypeEntries> = p
+                    .entries
+                    .iter()
+                    .zip(&strides)
+                    .map(|(&e, &stride)| PrototypeEntries {
+                        stride: e.stride.max(stride),
+                        ..e
+                    })
+                    .collect();
+                (grown != p.entries).then_some((i, grown))
+            })
             .collect();
         let mut taken: Vec<(u32, u32)> = Vec::new();
         let wanted = slots
             .iter()
             .map(|_| stride)
-            .chain(pages.iter().map(|&(i, w)| cpu.pages[i].range.count * w));
+            .chain(pages.iter().map(|(_, e)| page_entries(e)));
         for n in wanted {
             match cpu.emissive.alloc(n) {
                 Some(first) => taken.push((first, n)),
@@ -878,8 +929,9 @@ impl Scene {
     }
 
     /// Moves the copies of a growth from [`reserve_entries`](Self::reserve_entries) to its
-    /// ranges. New entries are written at the next update; the old ones are emptied and freed
-    /// once this frame has completed.
+    /// ranges. New entries are written at the next update, a page's at the first one its
+    /// records are resident for; the old ones are emptied and freed once this frame has
+    /// completed.
     pub(crate) fn grow_entries(&self, growth: EntryGrowth, frame: u64, seq: &AtomicU64) {
         let cpu = &mut *self.cpu.lock().unwrap();
         let EntryGrowth {
@@ -915,35 +967,22 @@ impl Scene {
             };
             cpu.entry_jobs.push([slot, first, stride, 0]);
         }
-        for (i, wanted) in pages {
+        for (i, grown) in pages {
             let (first, _) = ranges.next().expect("one range per page");
             let p = &cpu.pages[i];
-            let (range, old, old_stride, expanded) =
-                (p.range, p.first_entry, p.entry_stride, p.expanded);
-            retire(cpu, old, range.count * old_stride);
-            for copy in 0..range.count {
-                let slot = range.first + copy;
-                let entry = first + copy * wanted;
-                cpu.slot_holds[slot as usize].first_entry = entry;
-                cpu.slot_holds[slot as usize].entries = wanted;
-                // A page not yet written takes its stride when its records land.
-                if expanded {
-                    cpu.entry_jobs.push([slot, entry, wanted, 0]);
-                }
+            let (range, old, held) = (p.range, p.first_entry, page_entries(&p.entries));
+            let expanded = p.expanded;
+            retire(cpu, old, held);
+            // Only the records say which slot takes which entries, so the slots of a page
+            // written before hold none until its records are resident again.
+            if expanded {
+                let slots = range.first..range.first + range.count;
+                cpu.entry_jobs.extend(slots.map(|slot| [slot, 0, 0, 0]));
             }
             let p = &mut cpu.pages[i];
+            p.entries_stale = expanded;
             p.first_entry = first;
-            p.entry_stride = wanted;
-            if expanded {
-                continue;
-            }
-            // No expansion has read the prototypes yet.
-            let prototypes = p.prototypes.as_mut_slice().expect("upload is mapped");
-            for proto in bytemuck::cast_slice_mut::<u8, PagePrototypeGpu>(
-                &mut prototypes[..p.prototype_count as usize * size_of::<PagePrototypeGpu>()],
-            ) {
-                proto.emissive_count = wanted;
-            }
+            p.entries = grown;
         }
     }
 
@@ -1484,7 +1523,7 @@ impl<'f> SceneWriter<'f> {
         motion: Option<TransformGroupId>,
     ) -> Result<(InstanceRange, TransformGroupId)> {
         let page = self.mounts.page(r.page).ok_or(Error::UnknownPage(r.page))?;
-        let (needs, stride, protos) = page_needs(self.mounts, self.model_cpu, r.page)?;
+        let (needs, entries, protos) = page_needs(self.mounts, self.model_cpu, r.page)?;
         if let Some(p) = protos.iter().find(|p| self.is_skinned(p.model)) {
             return Err(Error::SkinnedPage(p.model));
         }
@@ -1493,7 +1532,7 @@ impl<'f> SceneWriter<'f> {
         let PageNeeds {
             instances: count,
             material_sets: set_entries,
-            ..
+            emissive,
         } = needs;
         let copy_bytes = (protos.len() * size_of::<PagePrototypeGpu>()) as u64;
         let mut table = self.device.gpu_malloc::<u8>(
@@ -1526,8 +1565,8 @@ impl<'f> SceneWriter<'f> {
                 capacity: self.scene.desc.page_material_sets,
             });
         };
-        let entry = if stride > 0 {
-            cpu.emissive.alloc(count * stride)
+        let entry = if emissive > 0 {
+            cpu.emissive.alloc(emissive)
         } else {
             Some(0)
         };
@@ -1539,19 +1578,12 @@ impl<'f> SceneWriter<'f> {
                 capacity: self.scene.desc.emissive_capacity,
             });
         };
-        if stride > 0 {
+        if emissive > 0 {
             let at = self.scene.emissive_entry(entry).address().0;
-            let n = count * stride * words(size_of::<EmissiveGpu>());
+            let n = emissive * words(size_of::<EmissiveGpu>());
             cpu.records.push(Record::fill(self.next_seq(), at, n, 0));
         }
-        let holds = &mut cpu.slot_holds[first as usize..(first + count) as usize];
-        for (hold, copy) in holds.iter_mut().zip(0..) {
-            *hold = SlotHold {
-                model: NO_MODEL,
-                first_entry: entry + copy * stride,
-                entries: stride,
-            };
-        }
+        cpu.slot_holds[first as usize..(first + count) as usize].fill(SlotHold::FREE);
 
         let mut copies = Vec::with_capacity(protos.len());
         let mut at_set = self.scene.desc.material_set_capacity + set_base;
@@ -1608,7 +1640,7 @@ impl<'f> SceneWriter<'f> {
                     first_emissive: NO_EMISSIVE,
                     emissive_count: 0,
                 },
-                emissive_count: stride,
+                records: p.records,
                 _pad: [0; 3],
             });
         }
@@ -1643,8 +1675,9 @@ impl<'f> SceneWriter<'f> {
             prototype_count: copies.len() as u32,
             first_entry: entry,
             linear_rows,
-            entry_stride: stride,
+            entries,
             expanded: false,
+            entries_stale: false,
             sets: (set_base, set_entries),
         });
         let (src, out) = self.window.slice::<u32>(self.device, count)?;

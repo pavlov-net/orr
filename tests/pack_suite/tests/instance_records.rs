@@ -356,6 +356,8 @@ fn edge_codes_decode_alike() {
                 prototype: 0,
                 rot,
                 scale: s[0] | s[1] << 10 | s[2] << 20 | flags,
+                rank: n as u16,
+                _pad: 0,
             }
         })
         .collect();

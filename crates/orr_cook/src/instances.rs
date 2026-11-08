@@ -333,7 +333,7 @@ fn resolve_prototypes(name: &str, src: &Instances, catalog: &Catalog) -> Result<
                     model: AssetId::from_name(&p.model),
                     flags: p.flags,
                     pose: p.pose,
-                    _pad: 0,
+                    records: 0,
                     sections: Span::default(),
                 },
                 sections,
@@ -507,7 +507,7 @@ fn build_page(
         .map(|(l, &g)| (g, l as u16))
         .collect();
     let mut sections = Vec::new();
-    let page_prototypes = used
+    let mut page_prototypes: Vec<Prototype> = used
         .iter()
         .map(|&g| {
             let r = &prototypes[usize::from(g)];
@@ -619,13 +619,20 @@ fn build_page(
             prototype: local[&p.prototype],
             rot,
             scale,
+            rank: 0,
+            _pad: 0,
         });
     }
 
     // Morton order, ties in source order.
     let mut order: Vec<usize> = (0..records.len()).collect();
     order.sort_by_key(|&n| (instance::morton(records[n].pos), n));
-    let records: Vec<InstanceRecord> = order.iter().map(|&n| records[n]).collect();
+    let mut records: Vec<InstanceRecord> = order.iter().map(|&n| records[n]).collect();
+    for r in &mut records {
+        let p = &mut page_prototypes[usize::from(r.prototype)];
+        r.rank = p.records;
+        p.records += 1;
+    }
     let stride = usize::from(src.user_stride);
     let user: Vec<u8> = order
         .iter()

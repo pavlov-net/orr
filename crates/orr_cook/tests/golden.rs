@@ -44,8 +44,8 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     ),
     (
         Class::InstancePage as u16,
-        5,
-        "1df0af5c2c9c5129f7743fbc9e2bbcc40848e18e974c2c0fa249d10322215a29",
+        6,
+        "40ea40760c7833b1f7409dcb66c44c27c0c4caf9b902ce57e94271daef5e948e",
     ),
     (
         Class::RasterSet as u16,
