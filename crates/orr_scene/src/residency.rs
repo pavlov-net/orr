@@ -351,17 +351,24 @@ impl InFlight {
         mut start: impl FnMut(u64, T),
     ) {
         while let Some(&(bytes, _)) = queue.front() {
-            self.waiting.store(true, SeqCst);
-            let mounts = self.mounts.load(SeqCst);
-            let total = self.streams.load(SeqCst) + mounts;
-            if total >= self.limit || mounts > self.floor.load(SeqCst) {
-                return;
+            // A plan reads the flag to yield to mount reads, so it is set only once one waits.
+            if !self.mount_room() {
+                self.waiting.store(true, SeqCst);
+                if !self.mount_room() {
+                    return;
+                }
             }
             self.mounts.fetch_add(bytes, SeqCst);
             let (_, read) = queue.pop_front().expect("a queued read");
             start(bytes, read);
         }
         self.waiting.store(false, SeqCst);
+    }
+
+    /// Whether the mount lane has room for one more read.
+    fn mount_room(&self) -> bool {
+        let mounts = self.mounts.load(SeqCst);
+        self.streams.load(SeqCst) + mounts < self.limit && mounts <= self.floor.load(SeqCst)
     }
 
     /// A mount read of `bytes` that [`InFlight::start_mounts`] started has ended.
