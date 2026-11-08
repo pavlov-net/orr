@@ -13,12 +13,12 @@
 //!
 //! Loads start while fewer bytes than the limit are in flight, so the last one started may
 //! pass it. The limit is shared by lane: one per request source, one for user blobs and one
-//! for mounts' reads. Each load goes to the lane with demand left and the fewest bytes in
-//! flight, its highest-priority request first (user blobs and mount reads in request order),
-//! since priorities of different sources measure different things. So every lane with demand
-//! gets an equal share, and what one leaves unused goes to the others. A request whose closure
-//! the limit cuts short loads its dependencies first and the rest once they have landed and it
-//! comes again.
+//! for mounts' reads and the copies they stage. Each load goes to the lane with demand left
+//! and the fewest bytes in flight, its highest-priority request first (user blobs and mount
+//! reads in request order), since priorities of different sources measure different things.
+//! So every lane with demand gets an equal share, and what one leaves unused goes to the
+//! others. A request whose closure the limit cuts short loads its dependencies first and the
+//! rest once they have landed and it comes again.
 //!
 //! The render thread plans the streamed lanes at each step, and the loading thread starts
 //! mount reads as they come, through [`InFlight`]: a plan whose next load would go to the
@@ -321,7 +321,7 @@ pub(crate) struct InFlight {
     /// The fewest bytes in flight of a streamed lane the latest plan held loads of back for
     /// the limit; `u64::MAX` when it held none back.
     floor: AtomicU64,
-    /// Bytes of mount reads in flight.
+    /// Bytes of mount reads in flight, and of mounts' staged copies until they complete.
     mounts: AtomicU64,
     /// Whether mount reads wait for room.
     waiting: AtomicBool,
@@ -371,7 +371,17 @@ impl InFlight {
         self.streams.load(SeqCst) + mounts < self.limit && mounts <= self.floor.load(SeqCst)
     }
 
-    /// A mount read of `bytes` that [`InFlight::start_mounts`] started has ended.
+    pub(crate) fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// A mount has staged copies of `bytes`, which count until [`InFlight::end_mount`].
+    pub(crate) fn add_mount(&self, bytes: u64) {
+        self.mounts.fetch_add(bytes, SeqCst);
+    }
+
+    /// Bytes of a mount read that [`InFlight::start_mounts`] started, or of staged copies, have
+    /// ended.
     pub(crate) fn end_mount(&self, bytes: u64) {
         self.mounts.fetch_sub(bytes, SeqCst);
     }

@@ -2,9 +2,10 @@
 //! and copy queues, and jobs that run on threads the consumer lends.
 //!
 //! The loading thread never blocks on the GPU. Work that reads results back between submits
-//! (a mount's acceleration structures, a finer cut's BLAS) is a [`Resumable`] future it
-//! polls in place of waiting, and a watcher thread that only waits wakes it once the point
-//! such work waits for has completed, so it sleeps until a message, a read or the GPU.
+//! (a mount's acceleration structures, a finer cut's BLAS) or frees what a submit used once it
+//! completes (a mount's staged copies) is a [`Resumable`] future it polls in place of waiting,
+//! and watcher threads that only wait wake it once the points such work waits for have
+//! completed, so it sleeps until a message, a read or the GPU.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -26,7 +27,7 @@ use orr_pack::{Archive, Blob, Codec, Filter};
 
 use crate::edit::{self, EditBatch, EditTask};
 use crate::memory::Block;
-use crate::mount::{Batch, MountRead, MountTask, finish, start};
+use crate::mount::{Batch, MountRead, MountTask, finish, start, submit_staged};
 use crate::residency::InFlight;
 use crate::stream::{self, CutBatch, CutTask, StreamBatch, StreamTask};
 use crate::{Error, PackSource, Result};
@@ -187,18 +188,43 @@ pub struct ReadArenaStats {
     pub staging_misses: u64,
 }
 
-/// A started mount read's bytes in the in-flight limit, which end when it drops.
+/// A mount's bytes in the in-flight limit, of a started read or of staged copies, which end
+/// when it drops.
 pub(crate) struct Ticket {
     bytes: u64,
     loading: Weak<Loading>,
 }
 
 impl Ticket {
+    /// The `bytes` of a read [`InFlight::start_mounts`] started.
     pub(crate) fn new(loading: &Arc<Loading>, bytes: u64) -> Self {
         Self {
             bytes,
             loading: Arc::downgrade(loading),
         }
+    }
+
+    pub(crate) fn empty(loading: Weak<Loading>) -> Self {
+        Self { bytes: 0, loading }
+    }
+
+    /// Adds `bytes` to the ticket and to the in-flight bytes; nothing once the loading side
+    /// is gone.
+    pub(crate) fn add(&mut self, bytes: u64) {
+        if let Some(l) = self.loading.upgrade() {
+            l.in_flight.add_mount(bytes);
+            self.bytes += bytes;
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Takes the ticket's bytes, leaving it empty.
+    pub(crate) fn take(&mut self) -> Self {
+        let empty = Self::empty(Weak::clone(&self.loading));
+        std::mem::replace(self, empty)
     }
 }
 
@@ -404,6 +430,16 @@ impl Loading {
         self.wake.set();
     }
 
+    /// Wakes the loading thread, to submit a mount's staged copies that have reached their
+    /// batch.
+    pub(crate) fn wake(&self) {
+        self.wake.set();
+    }
+
+    pub(crate) fn in_flight(&self) -> &InFlight {
+        &self.in_flight
+    }
+
     /// Wakes the loading thread while mount reads wait, to start those the in-flight limit has
     /// room for now.
     pub(crate) fn wake_mounts(&self) {
@@ -513,8 +549,8 @@ impl Future for Completion<'_> {
     }
 }
 
-/// Resumable work run one item at a time in the order it came, so a lane holds no more
-/// transient memory at once than one build does.
+/// Resumable work run one item at a time in the order it came, so a lane of builds holds no
+/// more transient memory at once than one build does.
 #[derive(Default)]
 struct Lane<'a> {
     items: VecDeque<Resumable<'a>>,
@@ -538,47 +574,52 @@ impl Lane<'_> {
     }
 }
 
-/// The point the watcher waits for, and whether the loading thread has stopped.
+/// Watchers, each waiting on points of one queue: builds', then mounts' staged copies'.
+const WATCHERS: usize = 2;
+const BUILDS: usize = 0;
+const COPIES: usize = 1;
+
+/// The point each watcher waits for, and whether the loading thread has stopped.
 #[derive(Default)]
 struct Watch {
-    state: Mutex<(Option<TimelinePoint>, bool)>,
+    state: Mutex<([Option<TimelinePoint>; WATCHERS], bool)>,
     changed: Condvar,
 }
 
 impl Watch {
-    fn until(&self, point: Option<TimelinePoint>) {
+    fn until(&self, watcher: usize, point: Option<TimelinePoint>) {
         let mut state = self.state.lock().unwrap();
-        if state.0 != point {
-            state.0 = point;
-            self.changed.notify_one();
+        if state.0[watcher] != point {
+            state.0[watcher] = point;
+            self.changed.notify_all();
         }
     }
 
     fn stop(&self) {
         self.state.lock().unwrap().1 = true;
-        self.changed.notify_one();
+        self.changed.notify_all();
     }
 
-    /// Sets `wake` each time the point it was given completes, the device is lost or [`WAIT`]
-    /// passes, until [`Watch::stop`]. Its wait starts after the [`Completion`] of that point
-    /// was made, so it ends no sooner than that one's time runs out.
-    fn run(&self, device: &Device, wake: &Wake) {
+    /// Sets `wake` each time the point `watcher` was given completes, the device is lost or
+    /// [`WAIT`] passes, until [`Watch::stop`]. Its wait starts after the [`Completion`] of that
+    /// point was made, so it ends no sooner than that one's time runs out.
+    fn run(&self, watcher: usize, device: &Device, wake: &Wake) {
         let render = device.queue(QueueKind::Render).expect("render queue");
         let mut state = self.state.lock().unwrap();
         loop {
             state = self
                 .changed
-                .wait_while(state, |s| s.0.is_none() && !s.1)
+                .wait_while(state, |s| s.0[watcher].is_none() && !s.1)
                 .unwrap();
-            let Some(point) = state.0.filter(|_| !state.1) else {
+            let Some(point) = state.0[watcher].filter(|_| !state.1) else {
                 return;
             };
             drop(state);
             // The loading thread's poll tells which way it ended.
             let _ = render.wait(point, WAIT);
             state = self.state.lock().unwrap();
-            if state.0 == Some(point) {
-                state.0 = None;
+            if state.0[watcher] == Some(point) {
+                state.0[watcher] = None;
             }
             wake.set();
         }
@@ -827,25 +868,35 @@ pub(crate) fn decoded(
 }
 
 /// Starts the loading thread, which handles IO completions, messages and resumable work until
-/// `Msg::Stop`, and its watcher, which it joins before it ends.
+/// `Msg::Stop`, and its watchers, which it joins before it ends.
 pub(crate) fn spawn(loading: &Arc<Loading>, device: &Device) -> std::io::Result<JoinHandle<()>> {
     let watch = Arc::new(Watch::default());
-    let watcher = {
+    let mut watchers = Vec::with_capacity(WATCHERS);
+    for watcher in 0..WATCHERS {
         let (w, l, d) = (Arc::clone(&watch), Arc::clone(loading), device.clone());
-        std::thread::Builder::new()
-            .name("orr loading watch".into())
-            .spawn(move || w.run(&d, &l.wake))?
-    };
+        let spawned = std::thread::Builder::new()
+            .name(format!("orr loading watch {watcher}"))
+            .spawn(move || w.run(watcher, &d, &l.wake));
+        match spawned {
+            Ok(handle) => watchers.push(handle),
+            Err(e) => {
+                // The idle watchers return.
+                watch.stop();
+                return Err(e);
+            }
+        }
+    }
     let (w, l, d) = (Arc::clone(&watch), Arc::clone(loading), device.clone());
     let thread = std::thread::Builder::new()
         .name("orr loading".into())
         .spawn(move || {
             run(&l, &d, &w);
             w.stop();
-            let _ = watcher.join();
+            for watcher in watchers {
+                let _ = watcher.join();
+            }
         });
     if thread.is_err() {
-        // Its idle watcher returns.
         watch.stop();
     }
     thread
@@ -878,23 +929,33 @@ fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
     // it again, and batches reach the render thread in the order their CLAS pool work runs.
     let mut streams: VecDeque<Arc<StreamTask>> = VecDeque::new();
     // Mount builds and finer cut builds each run one at a time, so a cut does not wait out a
-    // mount's build.
-    let (mut mounts, mut cuts) = (Lane::default(), Lane::default());
+    // mount's build. Mounts' batches of staged copies complete in the order they were
+    // submitted, on one queue, each then freeing its staging.
+    let (mut mounts, mut cuts, mut copies) = (Lane::default(), Lane::default(), Lane::default());
     // Mount reads waiting for room in the in-flight limit, in the order they came.
     let mut reads = VecDeque::new();
+    // Mounts still placing, whose staged copies submit in batches.
+    let mut placing: Vec<Arc<MountTask>> = Vec::new();
     loop {
         let msgs: Vec<Msg> = loading.inbox.lock().unwrap().drain(..).collect();
         let idle = msgs.is_empty();
         for msg in msgs {
             match msg {
                 Msg::Stop => return,
-                Msg::Mount(task, source) => start(loading, ring.is_some(), task, source),
+                Msg::Mount(task, source) => {
+                    placing.push(Arc::clone(&task));
+                    start(loading, ring.is_some(), task, source);
+                }
                 Msg::MountRead(bytes, read) => reads.push_back((bytes, read)),
                 Msg::Read(read) => match &mut ring {
                     Some(ring) => ring.push(read),
                     None => unreachable!("reads go to the ring only when there is one"),
                 },
-                Msg::Done(task) => mounts.items.push_back(finish(loading, device, task)),
+                Msg::Done(task) => {
+                    placing.retain(|t| !Arc::ptr_eq(t, &task));
+                    copies.items.extend(submit_staged(device, &task));
+                    mounts.items.push_back(finish(loading, device, task));
+                }
                 Msg::Stream(task) => {
                     stream::start(loading, &task);
                     streams.push_back(task);
@@ -911,19 +972,28 @@ fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
                 Msg::EditDone(task) => edit::finish(loading, device, &task),
             }
         }
+        copies.advance();
         loading
             .in_flight
             .start_mounts(&mut reads, |bytes, read| read.start(loading, bytes));
+        // A mount submits its staged copies once they reach a batch, and every mount does
+        // while reads wait for room and no batch is in flight to free some.
+        let all = !reads.is_empty() && copies.items.is_empty();
+        for task in placing.iter().filter(|t| all || t.batch_due()) {
+            copies.items.extend(submit_staged(device, task));
+        }
+        copies.advance();
         mounts.advance();
         cuts.advance();
         if let Some(r) = &mut ring {
             r.pump();
         }
         if idle && loading.inbox.lock().unwrap().is_empty() {
-            // Both lanes wait on points of the one queue their builds submit, which complete
-            // in order.
+            // Both build lanes wait on points of the one queue their builds submit, which
+            // complete in order.
             let until = mounts.until.into_iter().chain(cuts.until);
-            watch.until(until.min_by_key(|p| p.value()));
+            watch.until(BUILDS, until.min_by_key(|p| p.value()));
+            watch.until(COPIES, copies.until);
             loading.wake.wait(ring.as_ref());
         }
     }

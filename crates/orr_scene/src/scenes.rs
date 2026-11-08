@@ -127,15 +127,15 @@ pub struct Budgets {
     pub texture_feedback_records: u32,
     /// Bytes loading at once: of streamed units and requested blobs from the step that starts
     /// their reads to the one their GPU work lands in, which hold staging and read buffers that
-    /// long, and the stored bytes of mounts' reads from their start until they are placed.
-    /// Loads start while fewer are in flight, so the last one started may pass it. Each
-    /// [`RequestSource`], the requested blobs and the mounts share it equally while they all
-    /// have loads waiting; a share one leaves unused goes to the others. A mount larger than
-    /// it loads in pieces. Twice this sizes the arena archive reads and streamed units' staging
-    /// take, which the system's ring registers and, where the device imports host memory, the
-    /// GPU reads in place: room for `in_flight_bytes` of decoded units and as much again of
-    /// their stored input. Reads and staging that find no room take memory of their own.
-    /// Above 0.
+    /// long, and mounts' reads: their stored bytes from the read's start until it is placed,
+    /// then the bytes it staged until their copies complete. Loads start while fewer are in
+    /// flight, so the last one started may pass it. Each [`RequestSource`], the requested blobs
+    /// and the mounts share it equally while they all have loads waiting; a share one leaves
+    /// unused goes to the others. A mount larger than it loads in pieces. Twice this sizes the
+    /// arena archive reads and streamed units' staging take, which the system's ring registers
+    /// and, where the device imports host memory, the GPU reads in place: room for
+    /// `in_flight_bytes` of decoded units and as much again of their stored input. Reads and
+    /// staging that find no room take memory of their own. Above 0.
     pub in_flight_bytes: u64,
     /// Bytes per block of the stream pool.
     pub stream_block: u64,

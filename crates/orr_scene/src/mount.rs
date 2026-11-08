@@ -37,7 +37,8 @@ use crate::edit::{
 };
 use crate::lights::GATHERED_CLUSTERS;
 use crate::loading::{
-    ArchiveFile, BlobSource, Loading, Msg, Queue, Resumable, Ticket, decoded, read_stored,
+    ArchiveFile, BlobSource, Loading, Msg, Queue, Resumable, Ticket, completion, decoded,
+    read_stored,
 };
 use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler};
 use crate::medium_proxy::VolumeRef;
@@ -120,7 +121,6 @@ pub(crate) struct PlacedTexture {
     texture: Arc<Texture>,
     slot: ImageSlot,
     primaries: u8,
-    staged: bool,
     /// Bytes resident from mount: the whole texture, or a streamed one's mip tails.
     bytes: u64,
     /// How a streamed texture's tiles load; none for whole textures.
@@ -254,6 +254,12 @@ pub(crate) struct PagePrototype {
 }
 
 pub(crate) enum StagedCopy {
+    /// A texture's first use, ahead of its copies: the mip tails of its stream bound, then its
+    /// contents discarded.
+    Discard {
+        texture: Arc<Texture>,
+        stream: Option<Arc<TexStream>>,
+    },
     Buffer {
         src: Allocation<u8>,
         dst: u64,
@@ -263,6 +269,27 @@ pub(crate) enum StagedCopy {
         texture: Arc<Texture>,
         region: TextureRegion,
     },
+}
+
+impl StagedCopy {
+    /// Its staging bytes.
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Discard { .. } => 0,
+            Self::Buffer { src, .. } | Self::Texture { src, .. } => src.size(),
+        }
+    }
+}
+
+/// A mount's staged copies not yet submitted, with their bytes in the in-flight limit, and
+/// the points of the batches the loading thread has submitted.
+struct Staging {
+    copies: Vec<StagedCopy>,
+    ticket: Ticket,
+    /// The latest batch, whose completion follows the earlier ones on its queue.
+    last: Option<TimelinePoint>,
+    /// The latest bind of mip tails, which every later batch waits on.
+    bound: Option<TimelinePoint>,
 }
 
 /// A subdivision cage's tables, resident in a block of the mount.
@@ -278,7 +305,6 @@ struct PlacedCage {
 #[derive(Default)]
 struct Placed {
     blocks: Vec<Allocation<u8>>,
-    copies: Vec<StagedCopy>,
     textures: Vec<PlacedTexture>,
     materials: Vec<(AssetId, Material)>,
     meshes: Vec<PlacedMesh>,
@@ -327,6 +353,10 @@ pub(crate) struct MountTask {
     file: OnceLock<Arc<ArchiveFile>>,
     ring: OnceLock<bool>,
     placed: Mutex<Placed>,
+    staging: Mutex<Staging>,
+    /// Staged bytes at which the loading thread submits a batch while the mount places: a
+    /// quarter of the in-flight limit, so batches copy while the reads after them run.
+    batch: u64,
     accel: Arc<AccelShared>,
     /// The device builds cluster acceleration structures.
     traced: bool,
@@ -359,6 +389,13 @@ impl MountTask {
             file: OnceLock::new(),
             ring: OnceLock::new(),
             placed: Mutex::new(Placed::default()),
+            staging: Mutex::new(Staging {
+                copies: Vec::new(),
+                ticket: Ticket::empty(Arc::downgrade(loading)),
+                last: None,
+                bound: None,
+            }),
+            batch: loading.in_flight().limit() / 4,
             accel: Arc::clone(accel),
             traced: caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0,
         }
@@ -430,7 +467,7 @@ impl MountTask {
 
     fn write(&self, block: Block, at: u64, bytes: &[u8]) -> Result<()> {
         if let Some(copy) = write(&self.device, block, at, bytes)? {
-            self.placed.lock().unwrap().copies.push(copy);
+            self.stage(copy);
         }
         Ok(())
     }
@@ -439,15 +476,38 @@ impl MountTask {
         if self.host_copy {
             self.device.host_copy_to_texture(t, region, texels)?;
         } else {
-            let src = staging(&self.device, texels)?;
-            let copy = StagedCopy::Texture {
-                src,
-                texture: Arc::clone(t),
-                region: *region,
-            };
-            self.placed.lock().unwrap().copies.push(copy);
+            self.stage_texture(t, region, texels)?;
         }
         Ok(())
+    }
+
+    fn stage_texture(&self, t: &Arc<Texture>, region: &TextureRegion, texels: &[u8]) -> Result<()> {
+        self.stage(StagedCopy::Texture {
+            src: staging(&self.device, texels)?,
+            texture: Arc::clone(t),
+            region: *region,
+        });
+        Ok(())
+    }
+
+    /// Queues `copy` for the loading thread's next batch, its bytes in flight until that
+    /// completes, and wakes the loading thread once the queued bytes reach a batch.
+    fn stage(&self, copy: StagedCopy) {
+        let mut s = self.staging.lock().unwrap();
+        let before = s.ticket.bytes();
+        s.ticket.add(copy.bytes());
+        s.copies.push(copy);
+        if before < self.batch
+            && s.ticket.bytes() >= self.batch
+            && let Some(l) = self.loading.upgrade()
+        {
+            l.wake();
+        }
+    }
+
+    /// Whether the copies staged since the last batch have reached a batch.
+    pub(crate) fn batch_due(&self) -> bool {
+        self.staging.lock().unwrap().ticket.bytes() >= self.batch
     }
 }
 
@@ -1240,11 +1300,16 @@ fn place_texture(
         texture: Arc::clone(&texture),
         slot,
         primaries: h.primaries,
-        staged: !t.host_copy,
         bytes: t.device.texture_requirements(&desc).0,
         stream: None,
         neural,
     });
+    if !t.host_copy {
+        t.stage(StagedCopy::Discard {
+            texture: Arc::clone(&texture),
+            stream: None,
+        });
+    }
     for blob in 1..h.blob_count() {
         let (info, texture) = (Arc::clone(&info), Arc::clone(&texture));
         fetch(t, entry, blob, move |t, bytes| {
@@ -1385,13 +1450,16 @@ fn place_streamed(
         texture: Arc::clone(&texture),
         slot,
         primaries: h.primaries,
-        staged: true,
         bytes: tail_bytes,
-        stream: Some(stream),
+        stream: Some(Arc::clone(&stream)),
         neural: neural.map(|n| NeuralLink {
             own: GpuPtr::NULL,
             ..n
         }),
+    });
+    t.stage(StagedCopy::Discard {
+        texture: Arc::clone(&texture),
+        stream: Some(stream),
     });
     if tail < desc.mips {
         let info = Arc::clone(info);
@@ -1408,12 +1476,7 @@ fn place_streamed(
                         offset: [0; 3],
                         extent: [w, hh, 1],
                     };
-                    let copy = StagedCopy::Texture {
-                        src: staging(&t.device, &texels)?,
-                        texture: Arc::clone(&texture),
-                        region,
-                    };
-                    t.placed.lock().unwrap().copies.push(copy);
+                    t.stage_texture(&texture, &region, &texels)?;
                 }
             }
             Ok(())
@@ -1904,17 +1967,15 @@ async fn build_accel(
     Ok(built.point)
 }
 
-/// Records the staged copies of a mount (and the discards of its staged textures) in one
-/// list on the copy queue, else the loading queue, else the render queue. None when nothing
-/// was staged.
+/// Records staged copies and discards, in their order, in one list on the copy queue, else the
+/// loading queue, else the render queue, submitted after `wait`. None when there are none.
 pub(crate) fn submit_copies(
     device: &Device,
     copies: &[StagedCopy],
-    textures: &[PlacedTexture],
-    wait: Option<TimelinePoint>,
+    wait: &[TimelinePoint],
 ) -> Result<Option<TimelinePoint>> {
     if copies.is_empty() {
-        return Ok(wait);
+        return Ok(None);
     }
     let kind = [QueueKind::Copy, QueueKind::Loading, QueueKind::Render]
         .into_iter()
@@ -1922,11 +1983,9 @@ pub(crate) fn submit_copies(
         .expect("render queue");
     let queue = device.queue(kind).expect("chosen queue");
     let mut list = queue.command_list()?;
-    for t in textures.iter().filter(|t| t.staged) {
-        list.discard(&t.texture);
-    }
     for c in copies {
         match c {
+            StagedCopy::Discard { texture, .. } => list.discard(texture),
             StagedCopy::Buffer { src, dst } => {
                 // SAFETY: `dst` lies inside one of the mount's blocks.
                 let dst = unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(*dst)) };
@@ -1939,14 +1998,64 @@ pub(crate) fn submit_copies(
             } => list.copy_to_texture(texture, region, src.gpu()),
         }
     }
-    Ok(Some(queue.submit(vec![list], wait.as_slice())?))
+    Ok(Some(queue.submit(vec![list], wait)?))
 }
 
-/// Binds the mip tails of a mount's streamed textures; none when they have none.
-fn bind_tails(device: &Device, textures: &[PlacedTexture]) -> Result<Option<TimelinePoint>> {
+/// Submits the copies `task` has staged since its last batch as one batch, after binding the
+/// mip tails of the streamed textures it discards, and returns the work that frees their
+/// staging and in-flight bytes once it completes. Each batch waits on the mount's latest bind,
+/// so a texture's copies in later batches follow its bind as those in its first do. None when
+/// nothing was staged, or the mount was canceled or failed, which drops its copies unsubmitted.
+pub(crate) fn submit_staged<'a>(
+    device: &'a Device,
+    task: &Arc<MountTask>,
+) -> Option<Resumable<'a>> {
+    let (copies, ticket, bound) = {
+        let mut s = task.staging.lock().unwrap();
+        if s.copies.is_empty() {
+            return None;
+        }
+        (std::mem::take(&mut s.copies), s.ticket.take(), s.bound)
+    };
+    if !task.live() {
+        return None;
+    }
+    let submitted = bind_tails(device, &copies).and_then(|binds| {
+        let bound = binds.or(bound);
+        Ok((submit_copies(device, &copies, bound.as_slice())?, bound))
+    });
+    let point = match submitted {
+        Ok((point, bound)) => {
+            let mut s = task.staging.lock().unwrap();
+            s.bound = bound;
+            s.last = point;
+            point.expect("staged copies")
+        }
+        Err(e) => {
+            task.fail(e);
+            return None;
+        }
+    };
+    let task = Arc::clone(task);
+    Some(Box::pin(async move {
+        if let Err(e) = completion(device, point).await {
+            task.fail(e);
+        }
+        drop((copies, ticket));
+    }))
+}
+
+/// Binds the mip tails of the streamed textures `copies` discards; none when they have none.
+fn bind_tails(device: &Device, copies: &[StagedCopy]) -> Result<Option<TimelinePoint>> {
     let mut binds = SparseBinds::new();
     let mut any = false;
-    for s in textures.iter().filter_map(|t| t.stream.as_ref()) {
+    for c in copies {
+        let StagedCopy::Discard {
+            stream: Some(s), ..
+        } = c
+        else {
+            continue;
+        };
         if let Some((tails, memory)) = &s.tails {
             for layer in 0..*tails {
                 let at = u64::from(layer) * s.layout.tail_bytes;
@@ -1962,8 +2071,9 @@ fn bind_tails(device: &Device, textures: &[PlacedTexture]) -> Result<Option<Time
     })
 }
 
-/// Ends a mount on the loading thread: resolves its assets, submits its staged copies, builds
-/// its acceleration structures and hands the batch to the render thread.
+/// Ends a mount on the loading thread once its last staged copies are submitted: resolves its
+/// assets, builds its acceleration structures after its copies and hands the batch to the
+/// render thread.
 pub(crate) fn finish<'a>(
     loading: &'a Loading,
     device: &'a Device,
@@ -1973,8 +2083,8 @@ pub(crate) fn finish<'a>(
 }
 
 async fn finish_mount(loading: &Loading, device: &Device, task: &MountTask) {
-    let mut placed = std::mem::take(&mut *task.placed.lock().unwrap());
-    let copies = std::mem::take(&mut placed.copies);
+    let placed = std::mem::take(&mut *task.placed.lock().unwrap());
+    let copied = task.staging.lock().unwrap().last;
     let error = task.error.lock().unwrap().take();
     let state = match error {
         _ if task.cancel.load(Ordering::Relaxed) => Err(Error::Unmounted(task.id)),
@@ -1984,7 +2094,7 @@ async fn finish_mount(loading: &Loading, device: &Device, task: &MountTask) {
     let mut ranges = Vec::new();
     let result = match state.and_then(|()| resolve(task.source(), placed, device)) {
         Ok(mut r) => {
-            let built = build_resolved(device, task, &copies, &mut r).await;
+            let built = build_resolved(device, task, copied, &mut r).await;
             ranges.clone_from(&r.cluster_ranges);
             built.map(|point| (point, r))
         }
@@ -2007,18 +2117,15 @@ async fn finish_mount(loading: &Loading, device: &Device, task: &MountTask) {
     });
 }
 
-/// Links a resolved mount's neural sets, binds its textures' mip tails, submits its staged
-/// copies and builds its acceleration structures after them. Returns the point the last of
-/// that work signals.
+/// Links a resolved mount's neural sets and builds its acceleration structures after its last
+/// batch of staged copies, `copied`. Returns the point the last of that work signals.
 async fn build_resolved(
     device: &Device,
     task: &MountTask,
-    copies: &[StagedCopy],
+    copied: Option<TimelinePoint>,
     r: &mut Resolved,
 ) -> Result<Option<TimelinePoint>> {
     link_neural(r)?;
-    let tails = bind_tails(device, &r.textures)?;
-    let copied = submit_copies(device, copies, &r.textures, tails)?;
     Ok(build_accel(device, &task.accel, r, copied)
         .await?
         .or(copied))

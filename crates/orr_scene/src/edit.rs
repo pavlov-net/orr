@@ -341,7 +341,7 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<EditTask>) {
                     dst: block.gpu().address().0,
                 })
                 .collect();
-            let built = submit_copies(device, &copies, &[], None).and_then(|copied| {
+            let built = submit_copies(device, &copies, &[]).and_then(|copied| {
                 let pages: Vec<(u64, Option<PageMicromap>)> =
                     addresses.iter().copied().zip(regions).collect();
                 accel::page_micromaps(device, &pages, task.micromaps_per_submit, copied)
