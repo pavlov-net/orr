@@ -930,6 +930,29 @@ bool fade_present(SceneRoot* s, float3 d, uint instance_index)
     return copy_present(s, copy, fade_draw_ray(d, s.frame_index, copy_slot(copy)));
 }
 
+// `resolve_alpha` as 1 or 0 with `alpha`, else `resolve_coverage`. A candidate handler that
+// takes both calls this once with the choice, so its kernel holds one copy of the hit's
+// reconstruction.
+public float resolve_presence<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, bool alpha)
+{
+    if (!fade_present(s, d, instance_index))
+        return 0.0;
+    Corners t = (Corners)0;
+    HitInput h;
+    if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, false, context, h))
+        return 0.0;
+    uint flags = s.materials[h.input.material].flags;
+    // A fading copy's triangles of materials without an alpha test are candidates only for
+    // the fade.
+    if (alpha && (flags & MATERIAL_ALPHA_TESTED) == 0)
+        return 1.0;
+    float coverage = !alpha && (flags & MATERIAL_PRESENCE) != 0 ? material_opacity(h.input) : S.coverage(h.input);
+    if (!alpha)
+        return coverage;
+    uint3 key = uint3(asuint(bary.x) ^ (instance_index * 0x9E3779B9u), asuint(bary.y) ^ (primitive * 0x85EBCA6Bu), s.frame_index ^ cluster_id);
+    return coverage > unit_float(pcg3d(key).x) ? 1.0 : 0.0;
+}
+
 // Whether a non-opaque triangle candidate is present: on a fading copy's step, by its share
 // of the fade against a draw both steps share; then for alpha-tested materials with
 // probability the surface's coverage (the material's alpha test unless a linked surface has
@@ -937,18 +960,7 @@ bool fade_present(SceneRoot* s, float3 d, uint instance_index)
 // material's on both sides, as the raster's alpha test and the opacity micromaps are.
 public bool resolve_alpha<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context)
 {
-    if (!fade_present(s, d, instance_index))
-        return false;
-    Corners t = (Corners)0;
-    HitInput h;
-    if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, false, context, h))
-        return false;
-    // A fading copy's triangles of materials without an alpha test are candidates only for
-    // the fade.
-    if ((s.materials[h.input.material].flags & MATERIAL_ALPHA_TESTED) == 0)
-        return true;
-    uint3 key = uint3(asuint(bary.x) ^ (instance_index * 0x9E3779B9u), asuint(bary.y) ^ (primitive * 0x85EBCA6Bu), s.frame_index ^ cluster_id);
-    return S.coverage(h.input) > unit_float(pcg3d(key).x);
+    return resolve_presence<S>(s, v, d, instance_index, cluster_id, primitive, bary, context, true) > 0.0;
 }
 
 // How much of a non-opaque triangle candidate is present, 0 to 1: a presence material's
@@ -956,15 +968,7 @@ public bool resolve_alpha<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d
 // pass rays through by it.
 public float resolve_coverage<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context)
 {
-    if (!fade_present(s, d, instance_index))
-        return 0.0;
-    Corners t = (Corners)0;
-    HitInput h;
-    if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, false, context, h))
-        return 0.0;
-    if ((s.materials[h.input.material].flags & MATERIAL_PRESENCE) != 0)
-        return material_opacity(h.input);
-    return S.coverage(h.input);
+    return resolve_presence<S>(s, v, d, instance_index, cluster_id, primitive, bary, context, false);
 }
 
 // What a triangle candidate of a particle producer entry shows rays along `d` that take

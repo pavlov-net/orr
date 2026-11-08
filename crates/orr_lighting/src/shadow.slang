@@ -179,21 +179,19 @@ public struct ShadowCandidates<S : ISurface, M : IMedium, let MODE : uint> : ICa
         }
         if (c.cluster_id < 0)
             return float3(1.0);
-        uint cluster = uint(c.cluster_id);
-        switch (c.class_id)
+        bool layer = c.class_id == CLASS_PRESENCE || c.class_id == CLASS_PARTICLE;
+        float present = resolve_presence<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context, !layer);
+        if (layer)
         {
-        case CLASS_DIELECTRIC:
-            if (!resolve_alpha<S>(scene, view, dir, c.instance_index, cluster, c.primitive_index, c.barycentrics, context))
-                return float3(1.0);
             counted = true;
-            return dielectric(c);
-        case CLASS_PRESENCE:
-        case CLASS_PARTICLE:
-            counted = true;
-            return float3(1.0 - saturate(resolve_coverage<S>(scene, view, dir, c.instance_index, cluster, c.primitive_index, c.barycentrics, context)));
-        default:
-            return resolve_alpha<S>(scene, view, dir, c.instance_index, cluster, c.primitive_index, c.barycentrics, context) ? float3(0.0) : float3(1.0);
+            return float3(1.0 - saturate(present));
         }
+        if (c.class_id != CLASS_DIELECTRIC)
+            return present > 0.0 ? float3(0.0) : float3(1.0);
+        if (!(present > 0.0))
+            return float3(1.0);
+        counted = true;
+        return dielectric(c);
     }
 
     [mutating]
