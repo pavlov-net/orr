@@ -5,39 +5,58 @@ use std::io;
 use std::ptr::NonNull;
 #[cfg(any(windows, target_os = "linux"))]
 use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::{AlignedBuf, SECTOR};
 
-/// Where an [`AlignedBuf`]'s memory comes from: a [`ReadBuffers`] buffer, or the global
-/// allocator with the block raised to a [`SECTOR`] boundary.
-#[derive(Clone)]
-pub(crate) struct ReadAlloc(pub(crate) Option<Arc<Pool>>);
+/// Where an [`AlignedBuf`]'s memory comes from.
+pub(crate) enum ReadAlloc {
+    /// The global allocator, with the block raised to a [`SECTOR`] boundary.
+    Own,
+    /// A [`ReadBuffers`] buffer.
+    Pool(Arc<Pool>),
+    /// Memory of the buffer's maker at `at`, which it hands out once and never frees.
+    Borrowed {
+        at: usize,
+        len: usize,
+        taken: AtomicBool,
+    },
+}
 
 fn sector_layout(layout: Layout) -> Result<Layout, AllocError> {
     layout.align_to(SECTOR).map_err(|_| AllocError)
 }
 
-// SAFETY: without a pool every call forwards to `Global` with the request's layout raised the
-// same way, so `Global` sees each block with one layout. With one, a block is a buffer of the
-// pool's pages, which live while any clone of the allocator does, and it is handed out again
-// only after its deallocation.
+// SAFETY: `Own` forwards every call to `Global` with the request's layout raised the same way,
+// so `Global` sees each block with one layout. A `Pool` block is a buffer of the pool's pages,
+// which live while the allocator does, handed out again only after its deallocation. The
+// `Borrowed` block is handed out once, and its maker keeps it valid while the allocator lives.
 unsafe impl Allocator for ReadAlloc {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        match &self.0 {
-            None => Global.allocate(sector_layout(layout)?),
-            Some(pool) => pool.take(layout),
+        match self {
+            Self::Own => Global.allocate(sector_layout(layout)?),
+            Self::Pool(pool) => pool.take(layout),
+            Self::Borrowed { at, len, taken } => {
+                let fits = layout.size() <= *len && layout.align() <= SECTOR;
+                if !fits || taken.swap(true, Ordering::Relaxed) {
+                    return Err(AllocError);
+                }
+                let ptr = NonNull::new(*at as *mut u8).ok_or(AllocError)?;
+                Ok(NonNull::slice_from_raw_parts(ptr, *len))
+            }
         }
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        match &self.0 {
-            None => {
+        match self {
+            Self::Own => {
                 let layout = sector_layout(layout).expect("raised when allocated");
                 // SAFETY: `Global` allocated `ptr` with this layout.
                 unsafe { Global.deallocate(ptr, layout) }
             }
-            Some(pool) => pool.give(ptr),
+            Self::Pool(pool) => pool.give(ptr),
+            Self::Borrowed { .. } => {}
         }
     }
 }
@@ -95,7 +114,7 @@ impl ReadBuffers {
         if capacity > self.0.largest() {
             return Some(AlignedBuf::new(len));
         }
-        let alloc = ReadAlloc(Some(Arc::clone(&self.0)));
+        let alloc = ReadAlloc::Pool(Arc::clone(&self.0));
         let layout = Layout::array::<u8>(capacity).expect("read buffer layout");
         let ptr = alloc.allocate(layout).ok()?;
         // SAFETY: `alloc` allocated `capacity` bytes for `u8`'s layout, none of them filled.

@@ -39,6 +39,7 @@ fn run_ring(mut ring: Ring, file: &Arc<ReadFile>, reads: &[(u64, usize)]) -> Vec
             file: Arc::clone(file),
             offset,
             len,
+            into: None,
             done: Box::new(move |r| {
                 let buf = r.expect("ring read");
                 results.lock().unwrap()[i] = Some(buf.as_slice().to_vec());
@@ -160,6 +161,7 @@ fn a_ring_reads_on_as_buffers_held_on_another_thread_come_back() {
                     file: Arc::clone(file),
                     offset: offset as u64,
                     len: SECTOR,
+                    into: None,
                     done: Box::new(move |r| {
                         let buf = r.expect("ring read");
                         if buf.as_slice() != want {
@@ -199,6 +201,7 @@ fn ring_finishes_when_every_read_completes_before_the_wait() {
             file: Arc::clone(&file),
             offset: 0,
             len: SECTOR,
+            into: None,
             done: Box::new(|r| drop(r.expect("ring read"))),
         });
     }

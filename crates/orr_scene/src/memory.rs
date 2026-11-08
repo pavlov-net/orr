@@ -87,8 +87,8 @@ impl RangeAllocator {
     }
 }
 
-/// Memory loading jobs write into: mapped Upload memory, or DeviceLocal memory (no mapped
-/// address) that a copy fills from staging. Valid while the allocation it came from lives.
+/// Memory loading jobs write into: mapped Upload or Staging memory, or DeviceLocal memory
+/// (no mapped address) that a copy fills from staging. Valid while the allocation it came from lives.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Block {
     gpu: u64,
@@ -115,12 +115,16 @@ impl Block {
         }
     }
 
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
     /// Device address of the first byte.
     pub(crate) fn gpu(&self) -> u64 {
         self.gpu
     }
 
-    /// Mapped address of the first byte, for Upload blocks.
+    /// Mapped address of the first byte, for host-visible blocks.
     pub(crate) fn cpu(&self) -> Option<usize> {
         self.cpu
     }

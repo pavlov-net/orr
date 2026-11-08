@@ -10,7 +10,9 @@ use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
 use std::path::Path;
+use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 #[cfg(not(any(windows, target_os = "linux")))]
 use std::sync::{Condvar, Mutex};
 
@@ -55,8 +57,25 @@ impl AlignedBuf {
     pub fn new(len: usize) -> Self {
         Self(Vec::with_capacity_in(
             Self::capacity_for(len),
-            ReadAlloc(None),
+            ReadAlloc::Own,
         ))
+    }
+
+    /// An empty buffer over the `len` bytes at `ptr`, which stay the caller's: reads write
+    /// into them, and dropping the buffer leaves them.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` is at a [`SECTOR`] boundary and `len` is a multiple of it. The bytes stay valid,
+    /// and nothing else reads or writes them, until the buffer is dropped.
+    pub unsafe fn borrowed(ptr: NonNull<u8>, len: usize) -> Self {
+        debug_assert!(ptr.as_ptr().addr().is_multiple_of(SECTOR) && len.is_multiple_of(SECTOR));
+        let alloc = ReadAlloc::Borrowed {
+            at: ptr.as_ptr().addr(),
+            len,
+            taken: AtomicBool::new(false),
+        };
+        Self(Vec::with_capacity_in(len, alloc))
     }
 
     /// The capacity of a buffer for `len` bytes.
@@ -245,6 +264,11 @@ impl ReadFile {
         Ok(Self { handle, unbuffered })
     }
 
+    /// Whether reads bypass the system's cache and so need [`SECTOR`] offsets and lengths.
+    pub fn unbuffered(&self) -> bool {
+        self.unbuffered
+    }
+
     /// Opens `path` as [`ReadFile::open`] and [`open_shared`] do, with both handles on the same
     /// file even if another file is renamed over the path during the call. A file system that
     /// cannot identify its files gets no such check.
@@ -285,6 +309,9 @@ pub struct Read {
     pub file: Arc<ReadFile>,
     pub offset: u64,
     pub len: usize,
+    /// The buffer the read fills, empty and of `len` bytes rounded up to a sector; one of the
+    /// ring's buffers when none.
+    pub into: Option<AlignedBuf>,
     /// Runs inside [`Ring::pump`] when the read completes.
     pub done: ReadDone,
 }
@@ -330,6 +357,12 @@ impl Ring {
 
     pub fn push(&mut self, read: Read) {
         debug_assert!(read.offset.is_multiple_of(SECTOR as u64));
+        if let Some(buf) = &read.into {
+            assert!(
+                buf.is_empty() && buf.capacity() == AlignedBuf::capacity_for(read.len),
+                "a read fills an empty buffer of its sectors"
+            );
+        }
         match &mut self.backend {
             #[cfg(any(windows, target_os = "linux"))]
             Backend::Native(r) => r.push(read),
@@ -343,8 +376,8 @@ impl Ring {
             #[cfg(any(windows, target_os = "linux"))]
             Backend::Native(r) => r.pump(),
             Backend::Positioned(queued, buffers) => {
-                while let Some(read) = queued.pop_front() {
-                    let mut buf = buffers.take(read.len);
+                while let Some(mut read) = queued.pop_front() {
+                    let mut buf = read.into.take().unwrap_or_else(|| buffers.take(read.len));
                     let result = read.file.read(read.offset, &mut buf).map(|()| {
                         buf.truncate(read.len);
                         buf

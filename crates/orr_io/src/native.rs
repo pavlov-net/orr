@@ -120,14 +120,14 @@ impl Native {
     fn take_queued(&mut self) -> u64 {
         let mut new = 0;
         let mut slot = 0;
-        while let Some(read) = self.queued.front() {
+        while let Some(read) = self.queued.front_mut() {
             while slot < DEPTH && self.slots[slot].is_some() {
                 slot += 1;
             }
             if slot == DEPTH {
                 break;
             }
-            let Some(buf) = self.buffers.try_take(read.len) else {
+            let Some(buf) = read.into.take().or_else(|| self.buffers.try_take(read.len)) else {
                 break;
             };
             let read = self.queued.pop_front().expect("a queued read");

@@ -81,20 +81,27 @@ pub(crate) fn decode_chunk(
     src: &[u8],
     dst: &mut [u8],
 ) -> Result<()> {
-    let mut scratch = Vec::new();
-    let decoded = match (codec, filter) {
-        (Codec::None, _) => src,
+    match (codec, filter) {
+        (Codec::None, _) => filter.undo(src, dst),
         (_, Filter::None) => {
             let n = decompress(codec, gdeflate, src, dst)?;
-            return check_len(n, dst.len());
+            check_len(n, dst.len())
         }
-        _ => {
-            scratch.resize(filter.max_len(dst.len()), 0);
-            let n = decompress(codec, gdeflate, src, &mut scratch)?;
-            &scratch[..n]
-        }
-    };
-    filter.undo(decoded, dst)
+        _ => FILTERED.with_borrow_mut(|scratch| {
+            let len = filter.max_len(dst.len());
+            if scratch.len() < len {
+                scratch.resize(len, 0);
+            }
+            let n = decompress(codec, gdeflate, src, &mut scratch[..len])?;
+            filter.undo(&scratch[..n], dst)
+        }),
+    }
+}
+
+thread_local! {
+    /// A filtered chunk between its decompression and the filter's undo, kept between
+    /// chunks so that each decode neither allocates nor clears it.
+    static FILTERED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn check_len(n: usize, want: usize) -> Result<()> {

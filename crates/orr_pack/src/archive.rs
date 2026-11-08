@@ -9,7 +9,8 @@ use crate::format::{Layout, PAGE, hash_blob, read_header, validate};
 use crate::{AssetId, Blob, Chunk, Class, Entry, Error, GDeflate, Hash32, Header, Result};
 
 /// A 4096-byte-aligned file range covering stored bytes, for unbuffered reads. The stored
-/// bytes start `skip` bytes into it.
+/// bytes start `skip` bytes into it, 0 for a payload blob, and for each chunk of a payload
+/// blob stored without a codec or filter.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct StoredRange {
     pub offset: u64,

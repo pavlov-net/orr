@@ -38,8 +38,10 @@ const DEVICE_LOCAL_ALIGN: u64 = 16 << 10;
 const PLACEMENT_MIN_BYTES: u64 = 64 << 10;
 
 /// The heap pools `gpu_malloc` places buffers in, indexed by [`MemoryKind`]: shared storage for
-/// Upload and Readback, private storage that takes sparse pages for DeviceLocal.
-pub(super) fn heap_pools(device: &Obj<ProtocolObject<dyn MTLDevice>>) -> [HeapPool; 3] {
+/// Upload, Readback and Staging, private storage that takes sparse pages for DeviceLocal.
+pub(super) fn heap_pools(
+    device: &Obj<ProtocolObject<dyn MTLDevice>>,
+) -> [HeapPool; MemoryKind::ALL.len()] {
     MemoryKind::ALL.map(|kind| {
         let desc = MTLHeapDescriptor::new();
         desc.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
@@ -57,7 +59,9 @@ pub(super) fn heap_pools(device: &Obj<ProtocolObject<dyn MTLDevice>>) -> [HeapPo
 fn options(kind: MemoryKind) -> MTLResourceOptions {
     let storage = match kind {
         MemoryKind::DeviceLocal => MTLResourceOptions::StorageModePrivate,
-        MemoryKind::Upload | MemoryKind::Readback => MTLResourceOptions::StorageModeShared,
+        MemoryKind::Upload | MemoryKind::Readback | MemoryKind::Staging => {
+            MTLResourceOptions::StorageModeShared
+        }
     };
     storage | MTLResourceOptions::HazardTrackingModeUntracked
 }
@@ -78,7 +82,8 @@ impl RawBuffer {
 }
 
 /// GPU memory from [`Device::gpu_malloc`]: `count` values of `T` at [`Allocation::gpu`],
-/// mapped on the CPU for [`MemoryKind::Upload`] and [`MemoryKind::Readback`].
+/// mapped on the CPU for [`MemoryKind::Upload`], [`MemoryKind::Readback`] and
+/// [`MemoryKind::Staging`].
 ///
 /// Dropping it frees the memory once everything submitted before the drop has completed;
 /// [`Device::gpu_free`] names the point instead.
@@ -236,7 +241,7 @@ impl Device {
                 budget,
                 usage: s.device.currentAllocatedSize() as u64,
             }],
-            kind_heaps: [0; 3],
+            kind_heaps: [0; MemoryKind::ALL.len()],
             device_allocations: s.device_allocations.load(Ordering::Relaxed),
         }
     }

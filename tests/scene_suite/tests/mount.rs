@@ -18,7 +18,7 @@ use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
 use orr_pack::mesh::{MeshHeader, MeshInfo, Node, NodePage, decode_page, in_cut};
 use orr_pack::model::ModelInfo;
 use orr_pack::texture::TextureInfo;
-use orr_pack::{Archive, ArchiveWriter, AssetId, BlobIn, Class, Entry, Span, Target};
+use orr_pack::{Archive, ArchiveWriter, AssetId, BlobIn, Class, Codec, Entry, Span, Target};
 use orr_scene::PageId;
 use orr_scene::orr_gpu::{
     Device, DeviceDesc, GpuAddress, GpuPtr, Hazards, QueueKind, QueueRequest, Stages, Texture,
@@ -1449,7 +1449,11 @@ fn tiled_pack() -> &'static Arc<[u8]> {
                     ..BlobIn::new(&head)
                 },
                 BlobIn::new(&texels),
-                BlobIn::new(&data),
+                // Stored as it decodes, so file mounts read it straight into staging.
+                BlobIn {
+                    codec: Codec::None,
+                    ..BlobIn::new(&data)
+                },
             ],
         )
         .unwrap();

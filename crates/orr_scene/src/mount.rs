@@ -533,6 +533,7 @@ fn read_head(loading: &Arc<Loading>, task: Arc<MountTask>, file: Arc<ArchiveFile
         file: Arc::clone(&file.reads),
         offset: 0,
         len: Archive::HEAD_LEN,
+        into: None,
         done: Box::new(move |r| {
             let range = r
                 .map_err(Error::from)
@@ -551,6 +552,7 @@ fn read_head(loading: &Arc<Loading>, task: Arc<MountTask>, file: Arc<ArchiveFile
                 file: Arc::clone(&f.reads),
                 offset: 0,
                 len: (range.len as usize).next_multiple_of(SECTOR),
+                into: None,
                 done: Box::new(move |r| match r {
                     Ok(buf) => task.spawn(move |t| {
                         t.step(|| open_index(t, &f, &path, &buf, range.len));

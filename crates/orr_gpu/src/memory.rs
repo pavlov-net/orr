@@ -11,14 +11,21 @@ pub enum MemoryKind {
     DeviceLocal,
     /// Host-visible and cached, mapped, for the CPU to read back GPU results.
     Readback,
+    /// Host-visible, coherent and cached system memory, mapped, for the CPU to fill while
+    /// reading what it writes, as decoders do, and the GPU to copy or read from once. Not
+    /// on the GPU's own heap: host memory on a discrete GPU, shared storage on Metal. Where
+    /// a device has no cached memory it is uncached, or on the GPU's heap where the host has
+    /// none, as Vulkan allows. Allocations start at a host page of their memory.
+    Staging,
 }
 
 impl MemoryKind {
     /// Every kind, in [`MemoryReport::kinds`] order.
-    pub const ALL: [MemoryKind; 3] = [
+    pub const ALL: [MemoryKind; 4] = [
         MemoryKind::Upload,
         MemoryKind::DeviceLocal,
         MemoryKind::Readback,
+        MemoryKind::Staging,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -44,11 +51,11 @@ pub enum MemoryPriority {
 /// Memory use per [`MemoryKind`] and per heap, and the OS budget per heap.
 #[derive(Clone, Debug)]
 pub struct MemoryReport {
-    /// Indexed like [`MemoryKind`]: Upload, DeviceLocal, Readback.
-    pub kinds: [MemoryUsage; 3],
+    /// Indexed like [`MemoryKind::ALL`].
+    pub kinds: [MemoryUsage; MemoryKind::ALL.len()],
     pub heaps: Vec<HeapReport>,
     /// Indexed like `kinds`: the index in `heaps` of the heap each kind's memory comes from.
-    pub kind_heaps: [usize; 3],
+    pub kind_heaps: [usize; MemoryKind::ALL.len()],
     /// Device memory allocations (`VkDeviceMemory` or `MTLHeap`) orr_gpu has made so far.
     pub device_allocations: u64,
 }

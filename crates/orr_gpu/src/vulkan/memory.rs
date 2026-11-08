@@ -55,7 +55,7 @@ pub(super) fn buffer_usage(ray_dispatch: bool) -> vk::BufferUsageFlags {
 
 /// The memory type behind each [`MemoryKind`].
 pub(super) struct MemoryTypes {
-    types: [u32; 3],
+    types: [u32; MemoryKind::ALL.len()],
     properties: vk::PhysicalDeviceMemoryProperties,
 }
 
@@ -82,8 +82,10 @@ impl MemoryTypes {
 
     /// Picks the types. DeviceLocal must hold buffers and optimal images alike; Upload is
     /// device-local and host-visible when `allow_rebar` and such a type covers VRAM
-    /// (resizable BAR), else host memory, leaving the small BAR heap alone. Returns the types
-    /// and whether Upload covers VRAM.
+    /// (resizable BAR), else host memory, leaving the small BAR heap alone. Staging is cached
+    /// host memory, cached memory of any heap where the host has none, and uncached host
+    /// memory where no type is cached, which Vulkan allows. Returns the types and whether
+    /// Upload covers VRAM.
     pub(super) fn select(
         properties: vk::PhysicalDeviceMemoryProperties,
         buffer_bits: u32,
@@ -116,9 +118,13 @@ impl MemoryTypes {
         let readback = find(buffer_bits, host | F::HOST_CACHED, F::empty())
             .or_else(|| find(buffer_bits, host, F::empty()))
             .ok_or("a host-visible memory type")?;
+        let staging = find(buffer_bits, host | F::HOST_CACHED, F::DEVICE_LOCAL)
+            .or_else(|| find(buffer_bits, host | F::HOST_CACHED, F::empty()))
+            .or_else(|| find(buffer_bits, host, F::DEVICE_LOCAL))
+            .unwrap_or(readback);
         let rebar = heap(upload) == heap(device_local);
         let types = MemoryTypes {
-            types: [upload, device_local, readback],
+            types: [upload, device_local, readback, staging],
             properties,
         };
         Ok((types, rebar))
@@ -128,8 +134,8 @@ impl MemoryTypes {
 /// Bytes and allocation count per kind.
 #[derive(Default)]
 pub(super) struct Usage {
-    bytes: [AtomicU64; 3],
-    count: [AtomicU64; 3],
+    bytes: [AtomicU64; MemoryKind::ALL.len()],
+    count: [AtomicU64; MemoryKind::ALL.len()],
 }
 
 impl Usage {
@@ -145,7 +151,8 @@ impl Usage {
 }
 
 /// GPU memory from [`Device::gpu_malloc`]: `count` values of `T` at [`Allocation::gpu`],
-/// mapped on the CPU for [`MemoryKind::Upload`] and [`MemoryKind::Readback`].
+/// mapped on the CPU for [`MemoryKind::Upload`], [`MemoryKind::Readback`] and
+/// [`MemoryKind::Staging`].
 ///
 /// Dropping it frees the memory once everything submitted before the drop has completed;
 /// [`Device::gpu_free`] names the point instead.
@@ -267,6 +274,9 @@ const MALLOC_ALIGN: u64 = 256;
 /// memory and span a multiple of it, so pages, tiles and textures placed at aligned offsets
 /// in them stay aligned and share no granule with a neighboring buffer.
 const PLACEMENT_MIN_BYTES: u64 = 64 << 10;
+/// Staging blocks start at this offset in their memory: a host page, so that where memory
+/// maps at a page, file reads go straight into them, as unbuffered reads need.
+const STAGING_ALIGN: u64 = 4096;
 
 /// The allocator and its pools: per kind one buffer pool per priority and one pool of
 /// transient arena blocks, image pools apart from buffer pools, and render targets apart
@@ -274,8 +284,8 @@ const PLACEMENT_MIN_BYTES: u64 = 64 << 10;
 pub(super) struct Pools {
     pub(super) allocator: Allocator,
     /// By priority, then kind.
-    buffers: [[Pool; 3]; 3],
-    transient: [Pool; 3],
+    buffers: [[Pool; MemoryKind::ALL.len()]; 3],
+    transient: [Pool; MemoryKind::ALL.len()],
     /// DeviceLocal and Upload (host-copy) textures.
     images: [Pool; 2],
     targets: Pool,
@@ -304,25 +314,25 @@ impl Pools {
                 })
                 .map_err(memory_error)
         };
-        use MemoryKind::{DeviceLocal, Readback, Upload};
+        use MemoryKind::{DeviceLocal, Upload};
         use MemoryPriority::{High, Low, Normal};
-        let buffers = |priority: MemoryPriority, suffix: &str| -> Result<[Pool; 3], Error> {
-            Ok([
-                pool(&format!("orr upload{suffix}"), Upload, priority)?,
-                pool(&format!("orr device-local{suffix}"), DeviceLocal, priority)?,
-                pool(&format!("orr readback{suffix}"), Readback, priority)?,
-            ])
+        let name = |kind: MemoryKind| match kind {
+            Upload => "upload",
+            DeviceLocal => "device-local",
+            MemoryKind::Readback => "readback",
+            MemoryKind::Staging => "staging",
+        };
+        let kinds = |prefix: &str, priority: MemoryPriority, suffix: &str| {
+            let [upload, device_local, readback, staging] = MemoryKind::ALL
+                .map(|k| pool(&format!("orr {prefix}{}{suffix}", name(k)), k, priority));
+            Ok::<_, Error>([upload?, device_local?, readback?, staging?])
         };
         let buffers = [
-            buffers(Low, " low")?,
-            buffers(Normal, "")?,
-            buffers(High, " high")?,
+            kinds("", Low, " low")?,
+            kinds("", Normal, "")?,
+            kinds("", High, " high")?,
         ];
-        let transient = [
-            pool("orr transient upload", Upload, High)?,
-            pool("orr transient device-local", DeviceLocal, High)?,
-            pool("orr transient readback", Readback, High)?,
-        ];
+        let transient = kinds("transient ", High, "")?;
         let images = [
             pool("orr textures", DeviceLocal, Normal)?,
             pool("orr host-copy textures", Upload, Normal)?,
@@ -403,9 +413,13 @@ impl Shared {
         let mut size = size.max(4);
         let align = align.max(MIN_ALIGN);
         let mut offset_align = align;
-        if kind != MemoryKind::Readback && size >= PLACEMENT_MIN_BYTES {
+        let placeable = matches!(kind, MemoryKind::DeviceLocal | MemoryKind::Upload);
+        if placeable && size >= PLACEMENT_MIN_BYTES {
             offset_align = offset_align.max(pools.placement_align);
             size = size.next_multiple_of(pools.placement_align);
+        }
+        if kind == MemoryKind::Staging {
+            offset_align = offset_align.max(STAGING_ALIGN);
         }
         // Device-generated commands preprocess into DeviceLocal arena memory.
         let mut usage2 = vk::BufferUsageFlags2CreateInfo::default().usage(
@@ -430,7 +444,7 @@ impl Shared {
             AllocationFlags::empty()
         };
         // Textures may be placed in the buffer's memory, also when it gets its own.
-        if kind != MemoryKind::Readback {
+        if placeable {
             flags |= AllocationFlags::CAN_ALIAS;
         }
         // SAFETY: valid create info for this device.

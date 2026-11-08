@@ -278,6 +278,16 @@ pub(crate) fn validate(h: &Header, index: &[u8]) -> Result<Layout> {
                 ));
             }
         }
+        // Stored as they decode, every chunk is its decoded length, and every chunk but the
+        // last a whole number of pages, so each starts on a page and reads straight into
+        // its destination.
+        if b.codec() == Codec::None
+            && b.filter() == Filter::None
+            && ((n > 1 && !c.is_multiple_of(PAGE))
+                || (0..).zip(cs).any(|(i, ch)| ch.stored_len != b.chunk_len(i)))
+        {
+            return Err(Error::Malformed("chunks of a blob stored as it decodes"));
+        }
         let end = b.offset + u64::from(b.stored_len);
         let placed = if b.is_mount() {
             b.offset >= mount.start && end <= mount.end

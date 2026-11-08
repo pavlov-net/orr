@@ -54,9 +54,9 @@ pub(super) struct Shared {
     pub(super) collecting: Mutex<()>,
     pub(super) buffers: Mutex<Buffers>,
     /// The heaps `gpu_malloc` places buffers in, by [`MemoryKind`](crate::MemoryKind).
-    pub(super) heaps: [Mutex<HeapPool>; 3],
+    pub(super) heaps: [Mutex<HeapPool>; crate::MemoryKind::ALL.len()],
     /// Live `gpu_malloc` memory by [`MemoryKind`](crate::MemoryKind).
-    pub(super) usage: Mutex<[MemoryUsage; 3]>,
+    pub(super) usage: Mutex<[MemoryUsage; crate::MemoryKind::ALL.len()]>,
     /// Heaps the pools have created so far.
     pub(super) device_allocations: AtomicU64,
     /// Pass results by the point of their submit, oldest first.

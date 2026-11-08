@@ -5,14 +5,16 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use orr_io::{AlignedBuf, RING_DEPTH, ReadBuffers, ReadFile, Ring, SECTOR, Wake};
 
 use orr_gpu::Device;
-use orr_pack::{Archive, Blob};
+use orr_pack::{Archive, Blob, Codec, Filter};
 
 use crate::edit::{self, EditBatch, EditTask};
+use crate::memory::Block;
 use crate::mount::{Batch, MountTask, finish, start};
 use crate::stream::{self, CutBatch, CutTask, StreamBatch, StreamTask};
 use crate::{Error, PackSource, Result};
@@ -373,6 +375,7 @@ pub(crate) fn read_stored(src: &BlobSource, b: Blob, chunk: Option<u32>, then: S
             file: Arc::clone(&file.reads),
             offset: range.offset,
             len: range.len as usize,
+            into: None,
             done: Box::new(move |r| match (r, weak.upgrade()) {
                 (Ok(buf), Some(l)) => l.spawn(move || check(&buf, then)),
                 (Err(e), _) => then(Err(e.into())),
@@ -391,12 +394,105 @@ pub(crate) fn read_stored(src: &BlobSource, b: Blob, chunk: Option<u32>, then: S
     }
 }
 
+/// Reads blob `b`, or its chunk `chunk`, decodes it into `dst` and hands the decoded bytes,
+/// which `dst` then starts with, to `then` on a worker. `dst` is mapped cached memory of at
+/// least the decoded length rounded up to a sector, which nothing else uses until `then`
+/// returns. A stored form that is the decoded form reads straight into `dst`. A read error
+/// goes to `then` on the thread that saw it. Without a loading side `then` is not called.
+pub(crate) fn read_into(src: &BlobSource, b: Blob, chunk: Option<u32>, dst: Block, then: Stored) {
+    let len = chunk.map_or(b.raw_len, |i| b.chunk_len(i)) as usize;
+    assert!(
+        len.next_multiple_of(SECTOR) as u64 <= dst.size(),
+        "a decode outside its slot"
+    );
+    let at = dst.cpu().expect("mapped staging");
+    let as_stored = b.codec() == Codec::None && b.filter() == Filter::None;
+    // Linux pins the pages of an unbuffered read, which it refuses for driver mappings
+    // (VM_PFNMAP), so staging there takes buffered reads only.
+    let pinnable =
+        !cfg!(target_os = "linux") || src.file.as_ref().is_some_and(|f| !f.reads.unbuffered());
+    // Vulkan maps memory at `minMemoryMapAlignment`, which may be below a sector. An empty
+    // blob covers no sector, and a ring read fills at least one.
+    if as_stored
+        && pinnable
+        && len > 0
+        && at.is_multiple_of(SECTOR)
+        && src.archive.stored(&b, chunk).is_none()
+    {
+        read_straight(src, b, chunk, dst, then);
+        return;
+    }
+    let a = Arc::clone(&src.archive);
+    read_stored(
+        src,
+        b,
+        chunk,
+        Box::new(move |stored| {
+            // SAFETY: the caller gives this load the first `len` bytes at `at`.
+            let out = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, len) };
+            then(stored.and_then(|s| {
+                a.decode(&b, chunk, s, out)?;
+                Ok(&*out)
+            }));
+        }),
+    );
+}
+
+/// Reads stored bytes that need no decode straight into `dst`, on the ring or a worker, as
+/// [`read_into`] does.
+fn read_straight(src: &BlobSource, b: Blob, chunk: Option<u32>, dst: Block, then: Stored) {
+    let Some(loading) = src.loading.upgrade() else {
+        return;
+    };
+    let len = chunk.map_or(b.raw_len, |i| b.chunk_len(i)) as usize;
+    let range = src.archive.stored_range(&b, chunk);
+    debug_assert_eq!(range.skip, 0, "such chunks start on a page");
+    let at = NonNull::new(dst.cpu().expect("mapped staging") as *mut u8).expect("a mapping");
+    // SAFETY: `at` is at a sector boundary and holds `range.len` bytes, the decoded length
+    // rounded up to a sector, which only this read uses until `then` returns.
+    let buf = unsafe { AlignedBuf::borrowed(at, range.len as usize) };
+    let check = move |buf: AlignedBuf, then: Stored| {
+        if buf.len() < len {
+            then(Err(orr_pack::Error::Truncated {
+                need: range.offset + len as u64,
+                have: range.offset + buf.len() as u64,
+            }
+            .into()));
+            return;
+        }
+        then(Ok(&buf.as_slice()[..len]));
+    };
+    let file = Arc::clone(&src.file.as_ref().expect("file archive").reads);
+    if src.ring {
+        let weak = Arc::downgrade(&loading);
+        loading.send(Msg::Read(orr_io::Read {
+            file,
+            offset: range.offset,
+            len,
+            into: Some(buf),
+            done: Box::new(move |r| match (r, weak.upgrade()) {
+                (Ok(buf), Some(l)) => l.spawn(move || check(buf, then)),
+                (Err(e), _) => then(Err(e.into())),
+                (Ok(_), None) => {}
+            }),
+        }));
+    } else {
+        loading.spawn(move || {
+            let mut buf = buf;
+            match file.read(range.offset, &mut buf) {
+                Ok(()) => check(buf, then),
+                Err(e) => then(Err(Error::from(e))),
+            }
+        });
+    }
+}
+
 thread_local! {
     static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Decodes blob `b`, or its chunk `chunk`, from its stored bytes into the calling worker's
-/// scratch and hands the decoded bytes to `then`.
+/// scratch and hands the decoded bytes to `then`, for decoded bytes the CPU reads.
 pub(crate) fn decoded(
     archive: &Archive,
     b: &Blob,
