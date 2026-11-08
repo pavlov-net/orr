@@ -84,8 +84,10 @@ pub(crate) struct ClasPool {
     frees: Vec<(u32, u32)>,
     takes: Vec<u32>,
     unbinds: Vec<u32>,
-    /// Pages bound by a batch that was abandoned, which the next batch hands the kernel.
+    /// Pages bound by a batch that was abandoned, which the next batch hands the kernel, and
+    /// the binds it waits for first.
     unreported: Vec<u32>,
+    unreported_binds: Vec<TimelinePoint>,
     /// Batches that needed more pages than the range had unbound.
     range_full: u32,
     bits: Allocation<u32>,
@@ -129,6 +131,7 @@ impl ClasPool {
             takes: Vec::new(),
             unbinds: Vec::new(),
             unreported: Vec::new(),
+            unreported_binds: Vec::new(),
             range_full: 0,
             initialized: false,
             scratch: None,
@@ -167,13 +170,9 @@ impl ClasPool {
 
     /// Starts a batch whose builds are taken to need `estimate` units: unbinds the pages
     /// taken earlier, binds pages until the estimate fits, and hands out the frees and takes
-    /// queued since the last batch. Returns the bind's point, if it binds anything. On an
-    /// error the pool is as it was.
-    fn begin(
-        &mut self,
-        device: &Device,
-        estimate: u64,
-    ) -> Result<(PoolOps, Option<TimelinePoint>)> {
+    /// queued since the last batch. Returns the points of the binds of the pages it reports
+    /// bound, which its work waits for. On an error the pool is as it was.
+    fn begin(&mut self, device: &Device, estimate: u64) -> Result<(PoolOps, Vec<TimelinePoint>)> {
         let n = self.page_units;
         let mut room = self.room_after(estimate);
         let mut slots: Vec<(u32, PoolSlot)> = Vec::new();
@@ -222,6 +221,8 @@ impl ClasPool {
             }
         }
         let mut bound = std::mem::take(&mut self.unreported);
+        let mut binds = std::mem::take(&mut self.unreported_binds);
+        binds.extend(point);
         for &(page, slot) in &slots {
             self.pages[page as usize] = (PageState::Bound, Some(slot));
             self.used[page as usize] = 0;
@@ -238,7 +239,7 @@ impl ClasPool {
             out_of_memory,
         };
         self.initialized = true;
-        Ok((ops, point))
+        Ok((ops, binds))
     }
 
     /// The room once the queued frees and takes apply and builds of `estimate` units fit.
@@ -267,13 +268,15 @@ impl ClasPool {
     }
 
     /// Takes back a batch `begin` started that was never submitted: its frees and takes go
-    /// to the next batch, as do the pages it bound, and its estimate returns to the room.
-    fn abandon(&mut self, ops: PoolOps) {
+    /// to the next batch, as do the pages it bound with their `binds`, and its estimate
+    /// returns to the room.
+    fn abandon(&mut self, ops: PoolOps, binds: Vec<TimelinePoint>) {
         let n = self.page_units;
         let frees: i64 = ops.frees.iter().map(|&(_, c)| i64::from(c)).sum();
         self.room += i64::from(n) * ops.takes.len() as i64 + ops.estimate as i64 - frees;
         self.initialized &= !ops.init;
         self.unreported.splice(0..0, ops.bound);
+        self.unreported_binds.splice(0..0, binds);
         self.frees.splice(0..0, ops.frees);
         self.takes.splice(0..0, ops.takes);
     }
@@ -594,8 +597,8 @@ pub(crate) struct BuildOut {
     pub(crate) micromaps: Vec<Option<(Micromap, PoolSlot)>>,
     /// Per page, the results index of each of its clusters.
     pub(crate) slots: Vec<Vec<u32>>,
-    /// The bind of the pages it grew the pool by.
-    pub(crate) bind: Option<TimelinePoint>,
+    /// The binds of the pages it reports bound.
+    pub(crate) binds: Vec<TimelinePoint>,
 }
 
 impl BuildOut {
@@ -608,7 +611,7 @@ impl BuildOut {
             results,
             ..
         } = self.batch;
-        pool.abandon(ops);
+        pool.abandon(ops, self.binds);
         give_back(pool, &self.micromaps, staging, [upload, results.0]);
     }
 }
@@ -812,7 +815,7 @@ pub(crate) fn build_pages(
             return Err(e);
         }
     };
-    let (ops, bind) = match pool.begin(device, estimate) {
+    let (ops, binds) = match pool.begin(device, estimate) {
         Ok(b) => b,
         Err(e) => {
             release(pool, &micromaps);
@@ -885,7 +888,7 @@ pub(crate) fn build_pages(
         },
         micromaps,
         slots,
-        bind,
+        binds,
     })
 }
 

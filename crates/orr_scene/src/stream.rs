@@ -2470,7 +2470,7 @@ fn build_group(
     )?;
     drop(builds);
     let mut wait = points.clone();
-    wait.extend(out.bind);
+    wait.extend(&out.binds);
     match queue.submit(vec![list], &wait) {
         Ok(p) => points.push(p),
         Err(e) => {
