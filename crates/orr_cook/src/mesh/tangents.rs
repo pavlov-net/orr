@@ -364,67 +364,118 @@ fn phase(t: u64) -> [f64; 2] {
 /// a grid coarse enough to stay at the map's texel count, each sample weighted by its cell's
 /// texels; a triangle covering no center samples its centroid. With `lattice`, a stride and a
 /// point of the unit square, the grid is at least that coarse in whole texels and starts at the
-/// texel center the point picks in its first cell, and a triangle it misses has no sample.
+/// texel center the point picks in its first cell. A triangle covering no center then samples its
+/// centroid, at the grid's weight, where that center is the cell's first, so each sample and the
+/// centroid keep their dense weight in expectation.
 fn texel_centers(
     size: [u32; 2],
     uv: [[f64; 2]; 3],
     lattice: Option<(f64, [f64; 2])>,
     mut f: impl FnMut(Vec3, f64),
 ) {
+    let cap = (texel_area(size, uv) / (f64::from(size[0]) * f64::from(size[1]))).sqrt();
     let size = size.map(f64::from);
     let p = uv.map(|t| DVec2::new(t[0] * size[0], t[1] * size[1]));
+    let dense = cap.max(1.0);
+    // Bilinear reads between texel centers would smooth the normals a lattice samples.
+    let (step, phase, first) = match lattice {
+        Some((stride, at)) => {
+            let step = cap.max(stride).ceil();
+            let cell = at.map(|a| (a * step).floor());
+            (step, cell.map(|c| (c + 0.5) / step), cell == [0.0; 2])
+        }
+        None => (dense, [0.5; 2], true),
+    };
+    let weight = step * step;
+    let any = grid_points(p, step, phase, |w| {
+        f(w, weight);
+        true
+    });
+    if !any && first && (lattice.is_none() || !grid_points(p, dense, [0.5; 2], |_| false)) {
+        let centroid = if lattice.is_some() { weight } else { 1.0 };
+        f(Vec3::splat(1.0 / 3.0), centroid);
+    }
+}
+
+/// Calls `f` with the barycentrics of each point `(i + phase) * step` inside the triangle `p`, in
+/// texels, until it returns false, and returns whether there was one. A triangle of no area has
+/// none.
+fn grid_points(p: [DVec2; 3], step: f64, phase: [f64; 2], mut f: impl FnMut(Vec3) -> bool) -> bool {
     let cross = |a: DVec2, b: DVec2, c: DVec2| (b - a).perp_dot(c - a);
     let area2 = cross(p[0], p[1], p[2]);
-    let mut any = false;
-    if area2 != 0.0 {
-        let cap = (area2.abs() * 0.5 / (size[0] * size[1])).sqrt();
-        // Bilinear reads between texel centers would smooth the normals a lattice samples.
-        let (step, [phase_x, phase_y]) = match lattice {
-            Some((stride, at)) => {
-                let step = cap.max(stride).ceil();
-                (step, at.map(|a| ((a * step).floor() + 0.5) / step))
-            }
-            None => (cap.max(1.0), [0.5; 2]),
-        };
-        let weight = step * step;
-        // Inside where every edge function ex x + ey y + e0, signed by the winding, is >= 0.
-        let s = area2.signum();
-        let edges = [0, 1, 2].map(|i| {
-            let (a, b) = (p[(i + 1) % 3], p[(i + 2) % 3]);
-            let (ex, ey) = (-(b[1] - a[1]) * s, (b[0] - a[0]) * s);
-            (ex, ey, -(ex * a[0] + ey * a[1]))
-        });
-        let lo_y = p.iter().map(|q| q[1]).fold(f64::INFINITY, f64::min);
-        let hi_y = p.iter().map(|q| q[1]).fold(f64::NEG_INFINITY, f64::max);
-        let mut row = ((lo_y / step) - phase_y).ceil();
-        while (row + phase_y) * step <= hi_y {
-            let y = (row + phase_y) * step;
-            let (mut x0, mut x1) = (f64::NEG_INFINITY, f64::INFINITY);
-            for &(ex, ey, e0) in &edges {
-                let c = ey * y + e0;
-                if ex > 0.0 {
-                    x0 = x0.max(-c / ex);
-                } else if ex < 0.0 {
-                    x1 = x1.min(-c / ex);
-                } else if c < 0.0 {
-                    x1 = f64::NEG_INFINITY;
-                }
-            }
-            let mut col = ((x0 / step) - phase_x).ceil();
-            while (col + phase_x) * step <= x1 {
-                let x = (col + phase_x) * step;
-                let q = DVec2::new(x, y);
-                let b1 = cross(p[0], q, p[2]) / area2;
-                let b2 = cross(p[0], p[1], q) / area2;
-                let w = Vec3::new((1.0 - b1 - b2) as f32, b1 as f32, b2 as f32);
-                f(w.max(Vec3::ZERO) / w.max(Vec3::ZERO).element_sum(), weight);
-                any = true;
-                col += 1.0;
-            }
-            row += 1.0;
-        }
+    if area2 == 0.0 {
+        return false;
     }
-    if !any && lattice.is_none() {
-        f(Vec3::splat(1.0 / 3.0), 1.0);
+    let [phase_x, phase_y] = phase;
+    // Inside where every edge function ex x + ey y + e0, signed by the winding, is >= 0.
+    let s = area2.signum();
+    let edges = [0, 1, 2].map(|i| {
+        let (a, b) = (p[(i + 1) % 3], p[(i + 2) % 3]);
+        let (ex, ey) = (-(b[1] - a[1]) * s, (b[0] - a[0]) * s);
+        (ex, ey, -(ex * a[0] + ey * a[1]))
+    });
+    let lo_y = p.iter().map(|q| q[1]).fold(f64::INFINITY, f64::min);
+    let hi_y = p.iter().map(|q| q[1]).fold(f64::NEG_INFINITY, f64::max);
+    let mut any = false;
+    let mut row = ((lo_y / step) - phase_y).ceil();
+    while (row + phase_y) * step <= hi_y {
+        let y = (row + phase_y) * step;
+        let (mut x0, mut x1) = (f64::NEG_INFINITY, f64::INFINITY);
+        for &(ex, ey, e0) in &edges {
+            let c = ey * y + e0;
+            if ex > 0.0 {
+                x0 = x0.max(-c / ex);
+            } else if ex < 0.0 {
+                x1 = x1.min(-c / ex);
+            } else if c < 0.0 {
+                x1 = f64::NEG_INFINITY;
+            }
+        }
+        let mut col = ((x0 / step) - phase_x).ceil();
+        while (col + phase_x) * step <= x1 {
+            let x = (col + phase_x) * step;
+            let q = DVec2::new(x, y);
+            let b1 = cross(p[0], q, p[2]) / area2;
+            let b2 = cross(p[0], p[1], q) / area2;
+            let w = Vec3::new((1.0 - b1 - b2) as f32, b1 as f32, b2 as f32);
+            any = true;
+            if !f(w.max(Vec3::ZERO) / w.max(Vec3::ZERO).element_sum()) {
+                return true;
+            }
+            col += 1.0;
+        }
+        row += 1.0;
+    }
+    any
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Over phases spread evenly across the unit square, a lattice gives each triangle its dense
+    /// weight: one per texel center it covers, and one for its centroid where it covers none or
+    /// has no area.
+    #[test]
+    fn a_lattice_keeps_each_triangles_dense_weight_in_expectation() {
+        let texel = |c: [f64; 2]| c.map(|v| v / 64.0);
+        let triangles = [
+            [[0.1, 0.1], [0.3, 0.1], [0.1, 0.3]],
+            [[0.0, 0.0], [7.2, 0.0], [0.0, 7.2]],
+            [[0.2, 0.2], [0.4, 0.4], [0.6, 0.6]],
+        ];
+        for t in triangles {
+            let uv = t.map(texel);
+            let mut dense = 0.0;
+            texel_centers([64, 64], uv, None, |_, w| dense += w);
+            let n = 64;
+            let mut sum = 0.0;
+            for i in 0..n * n {
+                let at = [i % n, i / n].map(|k| (f64::from(k) + 0.5) / f64::from(n));
+                texel_centers([64, 64], uv, Some((4.0, at)), |_, w| sum += w);
+            }
+            let mean = sum / f64::from(n * n);
+            assert!((mean - dense).abs() < 1e-9, "{t:?}: {mean} against {dense}");
+        }
     }
 }
