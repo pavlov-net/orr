@@ -240,17 +240,6 @@ void decal_over(inout float sum, inout float cover, float value, float share)
     cover += share - cover * share;
 }
 
-// How much of decal material `m` covers its footprints `fs`: its opacity slot, else its base
-// color slot's alpha.
-float decal_coverage(MaterialGpu* m, UvFootprint fs[2])
-{
-    uint slot = material_bound(m, TEXTURE_OPACITY) ? TEXTURE_OPACITY : TEXTURE_BASE_COLOR;
-    if (!material_bound(m, slot))
-        return 1.0;
-    float4 texel = material_texture(m, slot, fs, float4(1.0));
-    return slot == TEXTURE_OPACITY ? texel.x : texel.w;
-}
-
 // Decal `d` blended over `layer` at hit `i`, `relative` from the decal's center, with the
 // hit's footprint `px`, `py` (m, on the surface).
 void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py)
@@ -275,32 +264,77 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
     f.dy = float2(dot(py, axis_x), dot(py, axis_y)) * scale;
     f.tap = i.uv[0].tap;
     f.inward = float2(0.0);
-    // A decal projects one uv, which every slot reads.
-    UvFootprint fs[2] = { f, f };
-    float4 one = float4(1.0);
     share *= m.geometry_opacity;
-    float coverage = decal_coverage(m, fs);
     uint c = d.channels;
+    bool emits = (c & DECAL_EMISSION) != 0;
     // Past a primary hit a decal's light reads with no footprint, as `surface_emission` does.
-    if ((c & DECAL_EMISSION) != 0)
+    bool primary = i.context.kind == HIT_PRIMARY;
+    UvFootprint e = primary ? f : finest_footprint(f);
+    // The decal's coverage is its opacity slot, else its base color slot's alpha.
+    uint cover = material_bound(m, TEXTURE_OPACITY) ? TEXTURE_OPACITY : TEXTURE_BASE_COLOR;
+    float coverage = 1.0;
+    float lit_coverage = 1.0;
+    float luminance = 1.0;
+    float3 emission = material_emission(m);
+    float3 base_color = m.base_color;
+    float roughness = 1.0;
+    float metalness = 1.0;
+    float4 normal_texel = float4(0.0);
+    // Every slot the decal reads goes through one texture read, as `StandardSurface` reads its
+    // slots: its coverage, its light's coverage, luminance and color, then the channels it
+    // writes over the surface, which a decal that covers nothing leaves unread.
+    [loop]
+    for (uint k = 0; k < 8; k++)
     {
-        bool primary = i.context.kind == HIT_PRIMARY;
-        UvFootprint e = primary ? f : finest_footprint(f);
-        UvFootprint es[2] = { e, e };
-        float lit = share * (primary ? coverage : decal_coverage(m, es));
+        float lit = share * (primary ? coverage : lit_coverage);
+        bool covers = !(share * coverage <= 0.0);
+        uint slot;
+        bool read;
+        switch (k)
+        {
+        case 0: slot = cover; read = true; break;
+        case 1: slot = cover; read = emits && !primary; break;
+        case 2: slot = TEXTURE_EMISSION_LUMINANCE; read = emits && lit > 0.0 && (m.flags & MATERIAL_MORE_TEXTURES) != 0; break;
+        case 3: slot = TEXTURE_EMISSION; read = emits && lit > 0.0; break;
+        case 4: slot = TEXTURE_BASE_COLOR; read = covers && (c & DECAL_BASE_COLOR) != 0; break;
+        case 5: slot = TEXTURE_ROUGHNESS; read = covers && (c & DECAL_ROUGHNESS) != 0; break;
+        case 6: slot = TEXTURE_METALNESS; read = covers && (c & DECAL_METALNESS) != 0; break;
+        default: slot = TEXTURE_NORMAL; read = covers && (c & DECAL_NORMAL) != 0; break;
+        }
+        if (!read || !material_bound(m, slot))
+            continue;
+        // A decal projects one uv, which every slot reads.
+        UvFootprint g = k >= 1 && k <= 3 ? e : f;
+        UvFootprint at[2] = { g, g };
+        float4 v = material_texture(m, slot, at, float4(1.0));
+        switch (k)
+        {
+        case 0: coverage = cover == TEXTURE_OPACITY ? v.x : v.w; break;
+        case 1: lit_coverage = cover == TEXTURE_OPACITY ? v.x : v.w; break;
+        case 2: luminance = v.x; break;
+        case 3: emission = material_tint(m, slot, v.rgb, emission); break;
+        case 4: base_color = material_tint(m, slot, v.rgb, base_color); break;
+        case 5: roughness = v.x; break;
+        case 6: metalness = v.x; break;
+        default: normal_texel = v; break;
+        }
+    }
+    if (emits)
+    {
+        float lit = share * (primary ? coverage : lit_coverage);
         if (lit > 0.0)
-            decal_over(layer.emission, layer.emission_cover, material_emission_at(m, es), lit);
+            decal_over(layer.emission, layer.emission_cover, luminance * emission, lit);
     }
     share *= coverage;
     if (share <= 0.0)
         return;
 
     if ((c & DECAL_BASE_COLOR) != 0)
-        decal_over(layer.base_color, layer.base_color_cover, m.base_weight * material_color(m, TEXTURE_BASE_COLOR, fs, m.base_color), share);
+        decal_over(layer.base_color, layer.base_color_cover, m.base_weight * base_color, share);
     if ((c & DECAL_ROUGHNESS) != 0)
-        decal_over(layer.roughness, layer.roughness_cover, m.specular_roughness * material_texture(m, TEXTURE_ROUGHNESS, fs, one).x, share);
+        decal_over(layer.roughness, layer.roughness_cover, m.specular_roughness * roughness, share);
     if ((c & DECAL_METALNESS) != 0)
-        decal_over(layer.metalness, layer.metalness_cover, m.metalness * material_texture(m, TEXTURE_METALNESS, fs, one).x, share);
+        decal_over(layer.metalness, layer.metalness_cover, m.metalness * metalness, share);
     if ((c & DECAL_NORMAL) != 0)
     {
         // The decal's tangent frame on the surface: its x axis, and up its y axis, against
@@ -313,7 +347,7 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
         float3 normal = n;
         if (material_bound(m, TEXTURE_NORMAL))
         {
-            float4 texel = material_texture(m, TEXTURE_NORMAL, fs, float4(0.5, 0.5, 1.0, 1.0));
+            float4 texel = normal_texel;
             if ((m.flags & MATERIAL_OBJECT_NORMAL) != 0)
             {
                 // A decal has no mesh: its box stands for the space the map states.
