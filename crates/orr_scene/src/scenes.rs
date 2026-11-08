@@ -102,10 +102,14 @@ pub struct Budgets {
     /// Bytes of resident mesh pages and of the CLAS and micromaps streamed pages build, which
     /// count at an estimate from their triangles until a page's first load has built them.
     /// The CLAS pool's address range is as large, up to the 512 GiB its 32-bit unit indices
-    /// name, and bound in pages as they need. The resident cluster table holds an entry per KiB
-    /// of it for the clusters of resident pages and of edits' own pages; a streamed page that
-    /// finds no room for its clusters loads later, and the budget shrinks.
+    /// name, and bound in pages as they need.
     pub mesh_page_pool: u64,
+    /// Bytes of `mesh_page_pool` per entry of the resident cluster table, which holds the
+    /// clusters of resident mesh pages and of edits' own pages, 24 B each. A mount whose
+    /// pinned pages' clusters find no room fails, and a streamed page that finds none loads
+    /// later while the mesh page budget shrinks. A cooked scene of 101.8 M clusters holds
+    /// 1,376 B of resident page per cluster, before a streamed page's CLAS.
+    pub resident_cluster_bytes: u64,
     /// Bytes of pages a DAG mesh keeps resident from mount; the pages of a larger one past
     /// its pinned coarsest pages stream on the traversal's requests.
     pub mesh_resident_max: u64,
@@ -154,6 +158,7 @@ impl Default for Budgets {
             micromap_pages: 64,
             ptlas_rebuilt: 250_000,
             mesh_page_pool: 3 << 30,
+            resident_cluster_bytes: 1024,
             mesh_resident_max: 1 << 20,
             hierarchy_page_pool: 256 << 20,
             texture_pool: 4 << 30,
@@ -166,10 +171,6 @@ impl Default for Budgets {
         }
     }
 }
-
-/// Bytes of [`Budgets::mesh_page_pool`] per entry of the resident cluster table: a cooked scene
-/// of 101.8 M clusters holds 1,376 B of resident page per cluster, before a streamed page's CLAS.
-const CLUSTER_BYTES: u64 = 1024;
 
 /// Farther models a representation chain holds: the length of `ModelGpu::chain`.
 const MAX_CHAIN: usize = 3;
@@ -425,7 +426,8 @@ impl Scenes {
         assert!(desc.cell_log2 <= 16, "cells of 2^{} m", desc.cell_log2);
         let b = &desc.budgets;
         // Cluster ids are 32 bits.
-        let clusters = u32::try_from(b.mesh_page_pool / CLUSTER_BYTES).unwrap_or(u32::MAX);
+        let clusters =
+            u32::try_from(b.mesh_page_pool / b.resident_cluster_bytes).unwrap_or(u32::MAX);
         let accel = Arc::new(AccelShared {
             kernels: AccelKernels::new(device, desc.kernels)?,
             limits: AccelLimits {
