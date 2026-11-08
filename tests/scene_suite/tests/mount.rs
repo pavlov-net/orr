@@ -1546,7 +1546,7 @@ fn stream_tiles(scenes: &mut Scenes, m: MountId, wanted: &[usize], budget: u64) 
         let r = *scenes.residency();
         let pool = *r.class(ResidencyClass::Textures);
         assert!(pool.resident_bytes + pool.loading_bytes <= budget);
-        if frames > 1 && r.loads == 0 && r.dropped == 0 && pool.loading_bytes == 0 {
+        if frames > 1 && r.loads == 0 && r.unserved() == 0 && pool.loading_bytes == 0 {
             return frames;
         }
         std::thread::sleep(Duration::from_millis(1));
@@ -3090,7 +3090,7 @@ fn tiles_apart_from_their_textures_others_move_beside_them_and_stay_exact() {
             frame(scenes);
             let r = *scenes.residency();
             let pool = *r.class(ResidencyClass::Textures);
-            if frames > 1 && r.loads == 0 && r.dropped == 0 && pool.loading_bytes == 0 {
+            if frames > 1 && r.loads == 0 && r.unserved() == 0 && pool.loading_bytes == 0 {
                 return;
             }
             std::thread::sleep(Duration::from_millis(1));

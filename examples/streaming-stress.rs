@@ -468,7 +468,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         mesh_high = mesh_high.max(meshes.resident_bytes);
         if i % 60 == 0 {
             log::info!(
-                "{:.1} m: mesh pages {:.1} of {:.1} MiB, CLAS {:.1} MiB, texture pool {:.1} of {:.1} MiB ({} units, {:.1} MiB loading), {} loads, {} evictions, {} dropped",
+                "{:.1} m: mesh pages {:.1} of {:.1} MiB, CLAS {:.1} MiB, texture pool {:.1} of {:.1} MiB ({} units, {:.1} MiB loading), {} loads, {} evictions, {} unserved",
                 along,
                 meshes.resident_bytes as f64 / f64::from(1 << 20),
                 mesh_budget as f64 / f64::from(1 << 20),
@@ -479,7 +479,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 pool.loading_bytes as f64 / f64::from(1 << 20),
                 r.loads,
                 r.evictions,
-                r.dropped,
+                r.unserved(),
             );
         }
     }

@@ -47,7 +47,8 @@ use crate::memory::{Block, Pool, PoolSlot};
 use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
 use crate::residency::{
-    HOLD_FRAMES, Key, Limits, Plan, Priority, Residency, ResidencyClass, ResidencyStats, UnitDesc,
+    HOLD_FRAMES, Key, Limits, Plan, Priority, RequestSource, Residency, ResidencyClass,
+    ResidencyStats, UnitDesc,
 };
 use crate::shaders::page_decode::PageDecodeRoot;
 use crate::tiles::{TexResidency, TexStream, TextureFeedback, compaction_move};
@@ -763,12 +764,18 @@ impl Streaming {
     }
 
     /// Requests unit `unit` of `mount` with hint priority for the next step.
-    pub(crate) fn request_unit(&mut self, mount: MountId, unit: u32, cell_distance: u32) {
+    pub(crate) fn request_unit(
+        &mut self,
+        mount: MountId,
+        unit: u32,
+        cell_distance: u32,
+        source: RequestSource,
+    ) {
         let p = Priority {
             error: 0.0,
             cell_distance,
         };
-        self.residency.request(Key { mount, unit }, p);
+        self.residency.request(Key { mount, unit }, p, source);
     }
 
     /// The budget instance pages plan under.
@@ -789,7 +796,8 @@ impl Streaming {
             cell_distance,
         };
         for &unit in &m.meshes[mesh as usize] {
-            self.residency.request(Key { mount, unit }, p);
+            self.residency
+                .request(Key { mount, unit }, p, RequestSource::Hints);
         }
     }
 
@@ -819,7 +827,8 @@ impl Streaming {
             let g = &t.stream.grid;
             for tile in (0..g.tile_count()).filter(|&tile| g.tile(tile).mip >= finest) {
                 let unit = t.first_unit + tile;
-                self.residency.request(Key { mount, unit }, p);
+                self.residency
+                    .request(Key { mount, unit }, p, RequestSource::Hints);
             }
         }
     }
@@ -857,6 +866,7 @@ impl Streaming {
                     error,
                     cell_distance: 0,
                 },
+                RequestSource::Traversal,
             ),
             None => self.residency.touch(k, frame),
         }
@@ -979,7 +989,7 @@ impl Streaming {
                         };
                         if !absent.is_empty() {
                             for q in absent {
-                                self.residency.request(unit(q), p);
+                                self.residency.request(unit(q), p, RequestSource::FinerCuts);
                             }
                             continue;
                         }
@@ -1030,7 +1040,9 @@ impl Streaming {
     /// cell's eight neighbors too: the residency map holds a cell at the coarsest of them, so
     /// without them it would never reach the mip it wants.
     pub(crate) fn texture_feedback(&mut self, slot: usize, frame: u64) {
-        for ((mount, texture), cell, mip) in self.feedback.read(slot, frame) {
+        let (wanted, lost) = self.feedback.read(slot, frame);
+        self.residency.note_texture_feedback_lost(lost);
+        for ((mount, texture), cell, mip) in wanted {
             let Some(t) = self
                 .mounts
                 .get(&mount)
@@ -1058,7 +1070,7 @@ impl Streaming {
                             error: (finest - mip) as f32,
                             cell_distance: 0,
                         };
-                        self.residency.request(k, p);
+                        self.residency.request(k, p, RequestSource::Textures);
                     } else {
                         self.residency.touch(k, frame);
                     }
@@ -1169,6 +1181,8 @@ impl Streaming {
                 clas.extend(self.replay(c));
             }
             self.note_failures(&batch.loads);
+            self.residency
+                .note_read(batch.loads.iter().map(|l| l.read).sum());
             for l in batch.loads {
                 self.landed(l, &clas, frame, w)?;
             }
@@ -1197,8 +1211,9 @@ impl Streaming {
         points.extend(self.fine_step(frame, settled, loading, w)?);
         self.residency.react(w.device.memory_report().pressure());
         if let Some(c) = &self.clas {
-            let bytes = c.lock().unwrap().bound_bytes();
-            self.residency.note_clas_pool(bytes);
+            let c = c.lock().unwrap();
+            self.residency
+                .note_clas_pool(c.bound_bytes(), c.range_full());
         }
         self.moving.retain(|_, m| m.1 >= frame);
         let waiting: Vec<Key> = self.moving.keys().copied().collect();
@@ -1209,6 +1224,7 @@ impl Streaming {
                     error: 0.0,
                     cell_distance: 0,
                 },
+                RequestSource::Textures,
             );
         }
         let Plan { loads, evictions } = self.residency.plan(frame);
@@ -1592,6 +1608,7 @@ impl Streaming {
         let placed = l.result.is_ok() && units.iter().all(|&(u, _)| u != NO_UNIT);
         let live = if l.result.is_ok() && !placed && self.mounts.contains_key(&key.mount) {
             self.residency.retry(key);
+            self.residency.note_clas_retry();
             false
         } else {
             self.unit_landed(key, &l.result, frame)
@@ -1792,6 +1809,8 @@ struct Landed {
     staged_at: u64,
     /// A mesh page's clusters as it decoded, and what its CLAS build made.
     mesh: Option<MeshLanded>,
+    /// The stored bytes of its blob or chunk, once read and decoded.
+    read: u64,
     result: Result<(), Arc<Error>>,
 }
 
@@ -1875,6 +1894,7 @@ impl StreamTask {
             staging: None,
             staged_at: 0,
             mesh: None,
+            read: 0,
             result: Err(Arc::new(e)),
         });
     }
@@ -2071,6 +2091,13 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
             Box::new(move |decoded| {
                 let load = &t.loads[i];
                 let mut mesh = None;
+                let read = match (&decoded, chunk) {
+                    (Err(_), _) => 0,
+                    (Ok(_), Some(c)) => {
+                        u64::from(load.source.archive.chunks(&b)[c as usize].stored_len)
+                    }
+                    (Ok(_), None) => u64::from(b.stored_len),
+                };
                 let result = decoded.and_then(|bytes| {
                     if let Some(l) = l.upgrade() {
                         l.flush(&staged)?;
@@ -2092,6 +2119,7 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                     staging,
                     staged_at: staged.gpu(),
                     mesh,
+                    read,
                     result: result.map_err(Arc::new),
                 };
                 if landed.result.is_err() {

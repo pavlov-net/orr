@@ -241,6 +241,10 @@ fn readback_words(capacity: u32) -> usize {
     1 + 2 * capacity as usize
 }
 
+/// A mip a frame wants: its texture's mount and index among the mount's streamed textures,
+/// the cell's offset in the texture's cells, and the mip.
+pub(crate) type WantedMip = ((MountId, u32), u32, u32);
+
 /// Feedback the frame's texture taps write: per-cell wanted mips and the records of their
 /// raises, copied back per frame in flight.
 pub(crate) struct TextureFeedback {
@@ -343,12 +347,13 @@ impl TextureFeedback {
         list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     }
 
-    /// The wanted mips frame `frame` reported from readback slot `slot`: the texture's
-    /// mount and index, the cell's offset in the texture's cells, and the mip.
-    pub(crate) fn read(&self, slot: usize, frame: u64) -> Vec<((MountId, u32), u32, u32)> {
+    /// The wanted mips frame `frame` reported from readback slot `slot`, and the raises past
+    /// the record capacity, which the frame lost.
+    pub(crate) fn read(&self, slot: usize, frame: u64) -> (Vec<WantedMip>, u32) {
         let words = readback_words(self.capacity);
         let data = &self.readback.as_slice().expect("readback is mapped")[slot * words..][..words];
         let n = data[0].min(self.capacity) as usize;
+        let lost = data[0] - n as u32;
         let stamp = (frame & 0xff_ffff) as u32;
         let mut out = Vec::with_capacity(n);
         for r in data[1..1 + 2 * n].as_chunks::<2>().0 {
@@ -364,7 +369,7 @@ impl TextureFeedback {
                 out.push(((mount, texture), cell - first, 255 - (value & 255)));
             }
         }
-        out
+        (out, lost)
     }
 }
 

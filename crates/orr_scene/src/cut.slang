@@ -49,9 +49,9 @@ public static const uint CUT_CACHED = 12;             // of them, equal to a cac
 public static const uint CUT_SHARED = 13;             // of them, sharing another slot's BLAS
 public static const uint CUT_FALLBACK = 14;           // of them, past the BLAS budget: a cached cut
 public static const uint CUT_MERGED = 15;             // slots tracing their model's merged cut
-public static const uint CUT_REQUESTS = 16;           // node pages requested
+public static const uint CUT_REQUESTS = 16;           // pages and finer cuts requested
 public static const uint CUT_RETRIES = 17;            // slots the second traversal ran on
-public static const uint CUT_FEEDBACK = 18;           // feedback records written
+public static const uint CUT_FEEDBACK = 18;           // feedback records, past the capacity too
 public static const uint CUT_PART_LISTS = 19;         // entries of `part_lists` handed out
 public static const uint CUT_COUNTERS = 20;
 

@@ -41,7 +41,7 @@ use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler};
 use crate::medium_proxy::VolumeRef;
 use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::neural::{self, NeuralLink, Precision};
-use crate::residency::{ResidencyClass, Start, UnitDesc};
+use crate::residency::{RequestSource, ResidencyClass, Start, UnitDesc};
 use crate::scene::{ModelCpu, ModelId, SkinShape};
 use crate::shaders::types::SubdCageGpu;
 use crate::skin;
@@ -3018,10 +3018,11 @@ impl Mounts {
         self.page_keys[self.page_slot(id)?]
     }
 
-    /// Requests the records of page `id` for the next step.
-    pub(crate) fn request_page(&mut self, id: PageId, cell_distance: u32) {
+    /// Requests the records of page `id` for the next step, from `source`.
+    pub(crate) fn request_page(&mut self, id: PageId, cell_distance: u32, source: RequestSource) {
         if let Some((mount, unit)) = self.page_key(id) {
-            self.streaming.request_unit(mount, unit, cell_distance);
+            self.streaming
+                .request_unit(mount, unit, cell_distance, source);
         }
     }
 
@@ -3032,25 +3033,32 @@ impl Mounts {
         })
     }
 
-    /// Requests window `window` of page `id`'s rows for the next step.
-    pub(crate) fn request_window(&mut self, id: PageId, window: u32, cell_distance: u32) {
+    /// Requests window `window` of page `id`'s rows for the next step, from `source`.
+    pub(crate) fn request_window(
+        &mut self,
+        id: PageId,
+        window: u32,
+        cell_distance: u32,
+        source: RequestSource,
+    ) {
         if let Some((mount, unit)) = self.page_key(id) {
             self.streaming
-                .request_unit(mount, unit + 1 + window, cell_distance);
+                .request_unit(mount, unit + 1 + window, cell_distance, source);
         }
     }
 
     /// Requests what page `id` needs to stand where it starts: its records, and on an animated
     /// page the window of its start.
     pub(crate) fn prefetch_page(&mut self, id: PageId, cell_distance: u32) {
-        self.request_page(id, cell_distance);
+        self.request_page(id, cell_distance, RequestSource::Hints);
         let Some(p) = self.page(id) else {
             return;
         };
         if !p.info.motion_times.is_empty() {
             let h = p.info.header;
             let (k, _) = orr_pack::instance::motion_interval(&p.info.motion_times, h.motion_start);
-            self.request_window(id, k as u32 / h.motion_window, cell_distance);
+            let window = k as u32 / h.motion_window;
+            self.request_window(id, window, cell_distance, RequestSource::Hints);
         }
     }
 

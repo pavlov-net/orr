@@ -95,7 +95,7 @@ pub use producer::{
     ClusterTopology, Opacity, OriginPolicy, ProducerDesc, ProducerId, ProducerStats, ProducerUpdate,
 };
 pub use ptlas::RtStats;
-pub use residency::{ClassStats, ResidencyClass, ResidencyStats};
+pub use residency::{ClassStats, RequestSource, ResidencyClass, ResidencyStats};
 pub use scene::{
     AffineRows, CopyVariant, DebugLod, EnvironmentData, GroupWriter, InstanceFlags,
     InstancePageRef, InstanceRange, InstancesDesc, MediumData, ModelId, PageNeeds, Pose, SceneDesc,

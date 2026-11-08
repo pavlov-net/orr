@@ -67,11 +67,11 @@ pub use orr_scene::{
     LoadState, Loading, MaterialGpu, MaterialId, MaterialWriter, MediumData, ModelId, MountId,
     NeuralTextures, Opacity, OriginPolicy, PackSource, PageId, PageNeeds, PipelineId, Pose,
     ProducerBatch, ProducerDesc, ProducerId, ProducerStats, ProducerUpdate, Projection, RasterGpu,
-    ReloadReport, RendererDesc, ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc,
-    SceneId, SceneRoot, SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats, Span,
-    TextureFilter, TextureSamplerGpu, TextureStreamGpu, TransformGroupDesc, TransformGroupId,
-    TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId, ViewStep, WorldPos, abi,
-    binding_sampler, material_flags, orr_gpu, orr_pack,
+    ReloadReport, RendererDesc, RequestSource, ResidencyClass, ResidencyStats, RtStats,
+    SceneCompute, SceneDesc, SceneId, SceneRoot, SkeletonRef, SkinStats, SkinnedDesc,
+    SkinnedPageRef, SkyStats, Span, TextureFilter, TextureSamplerGpu, TextureStreamGpu,
+    TransformGroupDesc, TransformGroupId, TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId,
+    ViewStep, WorldPos, abi, binding_sampler, material_flags, orr_gpu, orr_pack,
 };
 
 use orr_gpu::{

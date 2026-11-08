@@ -86,6 +86,8 @@ pub(crate) struct ClasPool {
     unbinds: Vec<u32>,
     /// Pages bound by a batch that was abandoned, which the next batch hands the kernel.
     unreported: Vec<u32>,
+    /// Batches that needed more pages than the range had unbound.
+    range_full: u32,
     bits: Allocation<u32>,
     summary: Allocation<[u32; 2]>,
     initialized: bool,
@@ -127,6 +129,7 @@ impl ClasPool {
             takes: Vec::new(),
             unbinds: Vec::new(),
             unreported: Vec::new(),
+            range_full: 0,
             initialized: false,
             scratch: None,
             micromaps: Pool::new(dl, 256, block, "streamed micromaps"),
@@ -178,10 +181,12 @@ impl ClasPool {
         let mut previous = None;
         let mut grown = Ok(());
         let mut out_of_memory = None;
+        let mut full = false;
         // Short of pages or of memory for them, the batch goes on with what it got: its
         // unbinds and frees give memory back, and builds that find no room retry.
         while room < 0 {
             let Some(page) = unbound.next() else {
+                full = true;
                 break;
             };
             match self.backing.alloc(device, self.range.page_size, previous) {
@@ -223,6 +228,7 @@ impl ClasPool {
             bound.push(page);
         }
         self.room = room;
+        self.range_full += u32::from(full);
         let ops = PoolOps {
             init: !self.initialized,
             bound,
@@ -473,6 +479,11 @@ impl ClasPool {
     pub(crate) fn bound_bytes(&self) -> u64 {
         let bound = self.pages.iter().filter(|p| p.1.is_some()).count() as u64;
         bound * self.range.page_size
+    }
+
+    /// Batches since the pool's start that needed more pages than its range had unbound.
+    pub(crate) fn range_full(&self) -> u32 {
+        self.range_full
     }
 
     /// The build scratch, grown to at least `bytes`; reused by every batch on the loading

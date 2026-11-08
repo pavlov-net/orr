@@ -89,9 +89,14 @@ pub struct CutStats {
     pub rt_built_clas: u32,
     /// Distant copies tracing their model's merged cut.
     pub rt_merged: u32,
-    /// Copies a non-resident hierarchy page stopped, and the pages requested.
+    /// Copies a non-resident hierarchy page stopped, and the pages and finer cuts requested.
     pub retries: u32,
     pub page_requests: u32,
+    /// Requests and touches of pages and finer cuts past the feedback's record capacity,
+    /// which the loading side never sees: what they request waits for a later frame, and
+    /// what they touch ages as though unused.
+    pub requests_lost: u32,
+    pub touches_lost: u32,
 }
 
 impl CutStats {
@@ -358,7 +363,18 @@ impl Cuts {
 
     /// The traversal figures of the frame that used readback slot `slot`.
     pub(crate) fn figures(&self, slot: usize, stats: &mut CutStats) {
-        stats.add(&self.readback(slot)[..COUNTERS]);
+        let data = self.readback(slot);
+        stats.add(&data[..COUNTERS]);
+        // Both counters count past the capacity; the records kept say which kind each was.
+        let reported = data[CUT_FEEDBACK];
+        let kept = reported.min(FEEDBACK);
+        let kept_requests = data[COUNTERS..][..4 * kept as usize]
+            .chunks_exact(4)
+            .filter(|r| r[2] & FEEDBACK_TOUCH == 0)
+            .count() as u32;
+        let requests_lost = data[CUT_REQUESTS] - kept_requests;
+        stats.requests_lost += requests_lost;
+        stats.touches_lost += reported - kept - requests_lost;
     }
 
     /// The pages the frame that used readback slot `slot` requested or read.

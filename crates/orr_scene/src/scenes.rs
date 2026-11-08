@@ -35,7 +35,7 @@ use crate::ptlas::{FrameInputs, PtlasPipelines, RtStats};
 use crate::raster::{self, RasterPipelines, TargetSizes, ViewTargets};
 #[cfg(feature = "hot-reload")]
 use crate::reload::Reloader;
-use crate::residency::ResidencyStats;
+use crate::residency::{RequestSource, ResidencyStats};
 use crate::scene::{GroupWriter, ModelCpu, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
 use crate::shaders::transparency::CompositeRoot;
 use crate::shaders::{animation, emissive, instance_page, page_motion, world as world_kernel};
@@ -1239,6 +1239,7 @@ impl Core {
         let budget = self.mounts.streaming.instance_page_budget();
         let mut bytes = 0;
         let mut over = 0;
+        let source = RequestSource::InstancePages;
         for (at, page, window) in units {
             let size = match window {
                 Some(w) => self.mounts.window_bytes(page, w),
@@ -1250,8 +1251,8 @@ impl Core {
             }
             bytes += size;
             match window {
-                Some(w) => self.mounts.request_window(page, w, at as u32),
-                None => self.mounts.request_page(page, at as u32),
+                Some(w) => self.mounts.request_window(page, w, at as u32, source),
+                None => self.mounts.request_page(page, at as u32, source),
             }
         }
         self.mounts.streaming.note_pages_over_budget(over);
