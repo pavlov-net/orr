@@ -458,6 +458,7 @@ impl Device {
             ),
             driver_version: props.driver_version,
             rebar,
+            staging_device_local: !desc.force_staging && memory.device_local(MemoryKind::Staging),
             ray_dispatch: optional.ray_dispatch,
             lss: optional.lss,
             reorder: optional.ray_dispatch
@@ -754,10 +755,11 @@ impl Device {
             hooks.device_created(&device.shared.raw_device());
         }
         log::info!(
-            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, lss {}, address commands {}, indirect copy {}, cooperative vector combinations {}, host image copy {}, decompression {}, occupancy priority {}, memory priority {} (pageable {}), generated commands {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
+            "device {} ({}): rebar {}, staging device-local {}, ray dispatch {} (reorder {}), omm {}, lss {}, address commands {}, indirect copy {}, cooperative vector combinations {}, host image copy {}, decompression {}, occupancy priority {}, memory priority {} (pageable {}), generated commands {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
             device.shared.caps.device_name,
             device.shared.caps.driver,
             device.shared.caps.rebar,
+            device.shared.caps.staging_device_local,
             device.shared.caps.ray_dispatch,
             device.shared.caps.reorder,
             optional.omm,

@@ -41,6 +41,17 @@ impl RangeAllocator {
         Some(start)
     }
 
+    /// The start, a multiple of `align`, of `count` free indices, or `None` when no free run
+    /// holds them there.
+    pub fn alloc_aligned(&mut self, count: u32, align: u32) -> Option<u32> {
+        let at = self.free.iter().find_map(|(&s, &e)| {
+            let at = s.checked_next_multiple_of(align)?;
+            (at <= e && e - at >= count).then_some(at)
+        })?;
+        assert!(self.take(at, count), "a free run holds the range");
+        Some(at)
+    }
+
     /// Whether `at..at + count` is all free.
     fn is_free(&self, at: u32, count: u32) -> bool {
         self.free
@@ -211,6 +222,28 @@ impl Pool {
         bytes: u64,
         after: Option<PoolSlot>,
     ) -> Result<(PoolSlot, Block)> {
+        self.place(device, bytes, 1, after)
+    }
+
+    /// `bytes` bytes at an offset of their block that is a multiple of `align`, itself a
+    /// multiple of the unit.
+    pub(crate) fn alloc_aligned(
+        &mut self,
+        device: &Device,
+        bytes: u64,
+        align: u64,
+    ) -> Result<(PoolSlot, Block)> {
+        assert!(align.is_multiple_of(self.unit), "alignment of whole units");
+        self.place(device, bytes, (align / self.unit) as u32, None)
+    }
+
+    fn place(
+        &mut self,
+        device: &Device,
+        bytes: u64,
+        align: u32,
+        after: Option<PoolSlot>,
+    ) -> Result<(PoolSlot, Block)> {
         let units = bytes.max(1).div_ceil(self.unit) as u32;
         let next = after.and_then(|a| {
             let first = a.first + a.units;
@@ -221,7 +254,7 @@ impl Pool {
         });
         let found = next.or_else(|| {
             self.blocks.iter_mut().enumerate().find_map(|(i, b)| {
-                let first = b.as_mut()?.ranges.alloc(units)?;
+                let first = b.as_mut()?.ranges.alloc_aligned(units, align)?;
                 Some((i, first))
             })
         });
@@ -233,7 +266,9 @@ impl Pool {
                 let memory =
                     device.gpu_malloc_with_priority::<u8>(self.kind, low, size, self.name)?;
                 let mut ranges = RangeAllocator::new((size / self.unit) as u32);
-                let first = ranges.alloc(units).expect("a new block fits");
+                let first = ranges
+                    .alloc_aligned(units, align)
+                    .expect("a new block fits");
                 let b = Some(PoolBlock {
                     memory,
                     ranges,
@@ -501,5 +536,13 @@ mod tests {
             (a.alloc(5), a.alloc(4), a.alloc(1)),
             (Some(40), Some(46), None)
         );
+        a.free(3, 30);
+        assert_eq!(a.alloc_aligned(8, 16), Some(16));
+        assert_eq!(
+            a.alloc_aligned(10, 8),
+            None,
+            "8..16 and 24..33 are too short"
+        );
+        assert_eq!((a.alloc_aligned(9, 8), a.alloc(13)), (Some(24), Some(3)));
     }
 }

@@ -12,10 +12,11 @@ pub enum MemoryKind {
     /// Host-visible and cached, mapped, for the CPU to read back GPU results.
     Readback,
     /// Host-visible, coherent and cached system memory, mapped, for the CPU to fill while
-    /// reading what it writes, as decoders do, and the GPU to copy or read from once. Not
-    /// on the GPU's own heap: host memory on a discrete GPU, shared storage on Metal. Where
-    /// a device has no cached memory it is uncached, or on the GPU's heap where the host has
-    /// none, as Vulkan allows. Allocations start at a host page of their memory.
+    /// reading what it writes, as decoders do, and the GPU to copy or read from: host memory
+    /// on a discrete GPU, shared storage on Metal. Where a device has no cached memory it is
+    /// uncached, and where the host has no memory of its own, as on unified memory, it is on
+    /// the GPU's heap, which `Caps::staging_device_local` reports. Allocations start at a
+    /// host page of their memory.
     Staging,
 }
 

@@ -13,7 +13,8 @@
 //! On the loading side a unit's blob, or a tile's chunk, is read through its mount's path
 //! and decompressed on a worker into the staging pool, cached host memory; mesh pages stay
 //! in their stored form there. A blob stored as it decodes is read straight into its
-//! staging slot. When a task's last read ends, the loading thread unbinds the tiles evicted
+//! staging slot. Where staging memory is device-local, as on unified memory, the stream pool
+//! is staging memory, and hierarchy and instance pages land in their pool slot. When a task's last read ends, the loading thread unbinds the tiles evicted
 //! since the last task and binds the new ones in one sparse bind, copies the tiles in and
 //! decodes the mesh pages into their stream pool slots on the loading queue, submits the
 //! copies into the stream pool and the users' targets, builds the mesh pages' CLAS and
@@ -39,7 +40,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::accel::{self, AccelShared, Animated, ClusterInfo, CutRow, FineCut, PageMicromap};
 use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch};
 use crate::edit::Mirror;
-use crate::loading::{BlobSource, Loading, Msg, landed, read_into};
+use crate::loading::{BlobSource, Loading, Msg, landed, read_into, reads_straight};
 use crate::memory::{Block, Pool, PoolSlot};
 use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
@@ -440,8 +441,13 @@ impl Streaming {
                 io_requests: b.io_requests,
                 io_bytes: b.io_bytes,
             }),
+            // Where staging memory is device-local, pool loads land in it with no copy.
             pool: Arc::new(Mutex::new(Pool::new(
-                MemoryKind::DeviceLocal,
+                if caps.staging_device_local {
+                    MemoryKind::Staging
+                } else {
+                    MemoryKind::DeviceLocal
+                },
                 256,
                 b.stream_block,
                 "stream pool",
@@ -1933,9 +1939,20 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                 continue;
             }
         };
+        // A pool slot in staging memory is where the load lands: it reads or decodes into
+        // the slot, and no copy follows.
+        let direct =
+            matches!(load.kind, LoadKind::Pool { .. }) && task.device.caps().staging_device_local;
         let (placed, block) = match &load.kind {
             LoadKind::Pool { target, .. } => {
-                match task.pool.lock().unwrap().alloc(&task.device, len, None) {
+                let mut pool = task.pool.lock().unwrap();
+                let slot = if direct && reads_straight(&load.source, &b, chunk) {
+                    let sector = SECTOR as u64;
+                    pool.alloc_aligned(&task.device, len.next_multiple_of(sector), sector)
+                } else {
+                    pool.alloc(&task.device, len, None)
+                };
+                match slot {
                     Ok((slot, block)) => (Some(Placed::Pool(slot, *target)), Some(block)),
                     Err(e) => {
                         task.fail(load.what, e);
@@ -1990,17 +2007,21 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
         };
         // Decoders read what they write, so they write cached memory, which a copy or the
         // mesh page decode then reads; a read straight into the slot fills whole sectors.
-        let staged = task.staging.lock().unwrap().alloc(
-            &task.device,
-            len.next_multiple_of(SECTOR as u64),
-            None,
-        );
-        let (staging, staged) = match staged {
-            Ok(s) => s,
-            Err(e) => {
-                task.free(placed, None);
-                task.fail(load.what, e);
-                continue;
+        let (staging, staged) = if direct {
+            (None, block.expect("a pool slot"))
+        } else {
+            let staged = task.staging.lock().unwrap().alloc(
+                &task.device,
+                len.next_multiple_of(SECTOR as u64),
+                None,
+            );
+            match staged {
+                Ok((slot, staged)) => (Some(slot), staged),
+                Err(e) => {
+                    task.free(placed, None);
+                    task.fail(load.what, e);
+                    continue;
+                }
             }
         };
         task.outstanding.fetch_add(1, Ordering::AcqRel);
@@ -2029,14 +2050,14 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                         LoadKind::Tile { stream, tile, .. } => Some((Arc::clone(stream), *tile)),
                         _ => None,
                     },
-                    staging: Some(staging),
+                    staging,
                     staged_at: staged.gpu(),
                     mesh,
                     result: result.map_err(Arc::new),
                 };
                 if landed.result.is_err() {
                     t.free(landed.placed.take(), landed.staging.take());
-                } else {
+                } else if !direct {
                     let copy = match (&load.kind, block) {
                         (LoadKind::Pool { .. }, Some(block)) => Some(Copy::Buffer {
                             src: staged.gpu(),

@@ -328,6 +328,7 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
         driver: "Metal 4".to_owned(),
         driver_version: 0,
         rebar: !desc.force_staging,
+        staging_device_local: !desc.force_staging,
         host_image_copy: false,
         memory_decompression: false,
         occupancy_priority: false,

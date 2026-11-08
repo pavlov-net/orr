@@ -11,6 +11,10 @@ pub struct Caps {
     /// Host-visible device-local memory covers VRAM, so [`crate::MemoryKind::Upload`] is
     /// device-local. Without it Upload is host memory.
     pub rebar: bool,
+    /// [`crate::MemoryKind::Staging`] is device-local, as on unified memory, so the GPU
+    /// reads data the CPU writes there in place, with no copy into
+    /// [`crate::MemoryKind::DeviceLocal`] memory.
+    pub staging_device_local: bool,
     /// Host image copy into [`crate::TextureUsage::HOST_COPY`] textures (`hostImageCopy`).
     /// Only with `rebar`: host-copy textures take Upload memory.
     pub host_image_copy: bool,

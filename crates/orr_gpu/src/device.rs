@@ -32,9 +32,10 @@ pub struct DeviceDesc<'a> {
     /// Optional extensions to leave off even when the device offers them; their `Caps`
     /// stay false. Vulkan only.
     pub skip_extensions: &'a [&'a CStr],
-    /// Reports `Caps::rebar` and `Caps::host_image_copy` false and, on Vulkan, puts
-    /// [`MemoryKind::Upload`](crate::MemoryKind::Upload) in host memory whatever the device
-    /// offers, so callers take the staging path, as on a device without resizable BAR.
+    /// Reports `Caps::rebar`, `Caps::staging_device_local` and `Caps::host_image_copy` false
+    /// and, on Vulkan, puts [`MemoryKind::Upload`](crate::MemoryKind::Upload) in host memory
+    /// whatever the device offers, so callers take the staging path, as on a discrete device
+    /// without resizable BAR.
     pub force_staging: bool,
     /// Loads the Nsight Perf SDK and enables the extensions its range profiler needs, for
     /// counter frames ([`crate::Caps::perf_counters`]). Builds without `NSIGHT_PERF_SDK`

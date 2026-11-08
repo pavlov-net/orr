@@ -413,30 +413,36 @@ fn read_file(
     }
 }
 
+/// Whether [`read_into`] reads blob `b`, or its chunk `chunk`, straight into a destination at
+/// a sector boundary that holds its decoded length rounded up to a sector: its stored form is
+/// its decoded form, read from the file. An empty blob covers no sector, and a ring read
+/// fills at least one.
+pub(crate) fn reads_straight(src: &BlobSource, b: &Blob, chunk: Option<u32>) -> bool {
+    let len = chunk.map_or(b.raw_len, |i| b.chunk_len(i));
+    b.codec() == Codec::None
+        && b.filter() == Filter::None
+        && len > 0
+        && src.archive.stored(b, chunk).is_none()
+        && src
+            .file
+            .as_ref()
+            .is_some_and(|f| f.reads.reads_into_driver_mappings())
+}
+
 /// Reads blob `b`, or its chunk `chunk`, decodes it into `dst` and hands the decoded bytes,
 /// which `dst` then starts with, to `then` on a worker. `dst` is mapped cached memory of at
-/// least the decoded length rounded up to a sector, which nothing else uses until `then`
-/// returns. A stored form that is the decoded form reads straight into `dst`. A read error
-/// goes to `then` on the thread that saw it. Without a loading side `then` is not called.
+/// least the decoded length, which nothing else uses until `then` returns; where
+/// [`reads_straight`] holds and `dst` is as it asks, the read goes straight into `dst`. A read
+/// error goes to `then` on the thread that saw it. Without a loading side `then` is not
+/// called.
 pub(crate) fn read_into(src: &BlobSource, b: Blob, chunk: Option<u32>, dst: Block, then: Stored) {
     let len = chunk.map_or(b.raw_len, |i| b.chunk_len(i)) as usize;
-    assert!(
-        len.next_multiple_of(SECTOR) as u64 <= dst.size(),
-        "a decode outside its slot"
-    );
+    assert!(len as u64 <= dst.size(), "a decode outside its slot");
     let at = dst.cpu().expect("mapped staging");
-    let as_stored = b.codec() == Codec::None && b.filter() == Filter::None;
-    let mappable = src
-        .file
-        .as_ref()
-        .is_some_and(|f| f.reads.reads_into_driver_mappings());
-    // Vulkan maps memory at `minMemoryMapAlignment`, which may be below a sector. An empty
-    // blob covers no sector, and a ring read fills at least one.
-    if as_stored
-        && mappable
-        && len > 0
+    // Vulkan maps memory at `minMemoryMapAlignment`, which may be below a sector.
+    if reads_straight(src, &b, chunk)
         && at.is_multiple_of(SECTOR)
-        && src.archive.stored(&b, chunk).is_none()
+        && len.next_multiple_of(SECTOR) as u64 <= dst.size()
     {
         read_straight(src, b, chunk, at, len, then);
         return;

@@ -74,6 +74,12 @@ impl MemoryTypes {
         self.properties.memory_types[self.of(kind) as usize].heap_index as usize
     }
 
+    pub(super) fn device_local(&self, kind: MemoryKind) -> bool {
+        self.properties.memory_types[self.of(kind) as usize]
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    }
+
     fn host_visible(&self, kind: MemoryKind) -> bool {
         self.properties.memory_types[self.of(kind) as usize]
             .property_flags
