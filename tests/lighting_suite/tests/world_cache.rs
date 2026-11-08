@@ -530,6 +530,9 @@ fn surface_mean(a: &Accumulated) -> [f64; 3] {
 fn cache_terminated_paths_match_the_reference_in_diffuse_regions() {
     for analytic in [Analytic::CornellBox, Analytic::SunAndGround] {
         let mut bed = Bed::new(analytic);
+        // At a pre-exposure of 1 the sunlit ground passes the HDR ceiling, which would clip the
+        // samples that draw the sun.
+        bed.set_pre_exposure(1.0 / 64.0);
         let warm = 256;
         let frames = 512;
         let realtime_paths = paths(realtime());
