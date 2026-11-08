@@ -358,6 +358,13 @@ impl Device {
         if misses == saved.misses {
             return Ok(());
         }
+        // The archive is serialized beside the file, before `write` would create its directory.
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| Error::Io {
+                path: dir.to_path_buf(),
+                source: e,
+            })?;
+        }
         let _saving = cache
             .saving
             .write()
