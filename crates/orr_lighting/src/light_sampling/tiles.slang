@@ -14,6 +14,7 @@ import orr_scene.tables;
 import orr_scene.view;
 import orr_lighting.environment;
 import orr_lighting.light_sampling;
+import orr_lighting.shadow;
 
 extern struct Surface : ISurface = StandardSurface;
 
@@ -54,8 +55,9 @@ static const uint SELECT_GROUP = 1024;
 
 groupshared float scan_w[SELECT_GROUP];
 groupshared uint scan_c[SELECT_GROUP];
-// Local lights, emissive entries and clusters kept, entries dropped, and feedback pixels.
-groupshared uint counts[5];
+// Local lights, emissive entries and clusters kept, entries dropped, feedback pixels, and
+// stack entries.
+groupshared uint counts[6];
 groupshared float environment_feedback;
 
 // Inclusive sums over the workgroup; `total` is the group's sum.
@@ -175,6 +177,40 @@ void candidate(SceneRoot* s, uint i, out float w, out uint count, out uint poole
     w = count > 0 ? y : 0.0;
 }
 
+// Whether emissive list entry `e` is a caster entry with a material that could be a plane stack
+// face, at any dispersion setting. Every stack face casts, so its section is a caster section and
+// its copy holds an entry for it; a producer entry counts by any of its materials.
+bool stack_entry(SceneRoot* s, uint e)
+{
+    EmissiveGpu g = s.emissive[e];
+    BsdfParams p;
+    if (g.kind == EMISSIVE_PRODUCER)
+    {
+        ProducerGpu q = s.producers[g.source];
+        for (uint k = 0; k < q.material_count; k++)
+        {
+            if (stack_material(s, q.materials[k], false, p))
+                return true;
+        }
+        return false;
+    }
+    if (g.kind != EMISSIVE_INSTANCE)
+        return false;
+    InstanceGpu inst = copy_record(s, g.source);
+    ModelGpu* model = s.models + inst.model;
+    MeshGpu* mesh = s.meshes + model.mesh;
+    // A copy's entries hold its chain's largest rank count, which the step it shows can lack.
+    if (g.rank < mesh.emissive.count || g.rank - mesh.emissive.count >= mesh.casters.count)
+        return false;
+    uint rank = g.rank - mesh.emissive.count;
+    for (uint k = 0; k < model.section_count; k++)
+    {
+        if (mesh.casters.ranks[k] == rank)
+            return stack_material(s, section_material(s, inst, model, k), false, p);
+    }
+    return false;
+}
+
 // The list of instance entry `e` (from `s.producer_capacity`) as `select` hands it to
 // sampling: its cooked set at the row its copy traces, or the list its traversal gathered.
 void instance_list(SceneRoot* s, uint e, inout EmissiveSelection sel)
@@ -224,7 +260,7 @@ void select(uint lane: SV_GroupIndex)
     SceneRoot* s = root.scene;
     uint lights = s.light_capacity;
     uint n = lights + s.producer_capacity + s.emissive_capacity;
-    if (lane < 5)
+    if (lane < 6)
         counts[lane] = 0;
     GroupMemoryBarrierWithGroupSync();
     bool environment = root.environment.mean.a > 0.0;
@@ -247,6 +283,8 @@ void select(uint lane: SV_GroupIndex)
         {
             candidate(s, i, w, c, pooled);
             h = feedback(i);
+            if (i >= lights && stack_entry(s, i - lights))
+                InterlockedAdd(counts[5], 1);
         }
         uint chunk_c;
         uint first = carry_c + scan_uint(lane, pooled, chunk_c) - pooled;
@@ -340,6 +378,7 @@ void select(uint lane: SV_GroupIndex)
     set.environment_probability = env;
     set.frame = root.frame;
     set.local_lights = counts[0];
+    set.stack_entries = counts[5];
 
     float3 mean = root.environment.mean.rgb;
     float3 xyz = mul(REC2020_TO_XYZ, mean);
@@ -366,6 +405,7 @@ void select(uint lane: SV_GroupIndex)
     st.photon_overflows = root.clear_feedback != 0 ? 0 : root.reference_counts[1];
     root.reference_counts[0] = 0;
     root.reference_counts[1] = 0;
+    st.stack_entries = counts[5];
     *root.stats = st;
 }
 

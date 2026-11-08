@@ -833,6 +833,8 @@ public struct PathShadow<S : ISurface, M : IMedium> : IShadow
     public float3 normal;
     // The path splits light by wavelength at dispersive faces, which end plane stacks.
     public bool dispersion;
+    // Directional lights' rays look for plane stacks: the scene holds a stack entry.
+    public bool bend;
 
     Interior inside(float3 dir)
     {
@@ -846,7 +848,7 @@ public struct PathShadow<S : ISurface, M : IMedium> : IShadow
     {
         // Environment light reaches vertices without the medium's transmittance, as BSDF
         // misses see it: the baked map carries the medium.
-        if (path_light<S, M>(scene, view, start, origin, dir, t_max, RAY_FLAG_NONE, context, environment, inside(dir), directional, dispersion, true, overflows, stack) == STACK_BROKEN)
+        if (path_light<S, M>(scene, view, start, origin, dir, t_max, RAY_FLAG_NONE, context, environment, inside(dir), directional && bend, dispersion, true, overflows, stack) == STACK_BROKEN)
             return float3(0.0);
         return any(stack.transmittance > 0.0) ? stack.transmittance * exp(-stack.depth) : float3(0.0);
     }
@@ -1167,6 +1169,7 @@ public PathShadow<S, M> vertex_shadow<S : ISurface, M : IMedium>(PathRoot r, Lay
 {
     PathShadow<S, M> shadow;
     shadow.dispersion = dispersion;
+    shadow.bend = r.set.stack_entries != 0;
     shadow.scene = r.scene;
     shadow.view = r.view;
     shadow.overflows = r.set.shadow_overflows;
@@ -1602,7 +1605,7 @@ public struct PathStart
 // light.
 struct PathStack
 {
-    bool valid;                     // every vertex since `x` is a stack face or a null crossing
+    bool valid;                     // every vertex since `x` is a stack face or a null crossing, in a scene with stack entries
     uint crossed;                   // stack faces so far
     float3 normal;                  // the first face's shading normal
     float3 origin;                  // `x`'s ray origin
@@ -1697,7 +1700,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
     // A photon's chain vertices so far.
     uint chains = 0;
     PathStack stack = (PathStack)0;
-    stack.valid = photon && start.directional;
+    stack.valid = photon && start.directional && set.stack_entries != 0;
     // The interior the path last entered from outside and where, where a walk in that interior
     // leaves at its cap.
     uint entered = MATERIAL_NONE;
@@ -1964,7 +1967,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                             stack.valid = false;
                         else
                         {
-                            stack.valid = ray.pdf > 0.0 && !one_technique;
+                            stack.valid = ray.pdf > 0.0 && !one_technique && set.stack_entries != 0;
                             stack.crossed = 0;
                             stack.origin = ray.origin;
                             stack.dir = wi;

@@ -173,7 +173,9 @@ public struct LightSetGpu
     public uint frame;
     // Sphere and rect lights with non-zero power: paths' BSDF rays look for their proxies.
     public uint local_lights;
-    public uint _pad1;
+    // Caster entries whose material could be a plane stack face (`stack_material`): with none,
+    // no ray can meet a stack face, and directional lights' rays are not probed for one.
+    public uint stack_entries;
     public uint _pad2;
 }
 
@@ -199,6 +201,7 @@ public struct LightSetStats
     public uint capped_walks;
     // Reference photon map deposits of the frame before that found their map full.
     public uint photon_overflows;
+    public uint stack_entries;
 }
 
 // One slot of a local sampler: a light that fed back in its tile, or for an emissive entry a

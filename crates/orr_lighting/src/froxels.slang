@@ -621,7 +621,7 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
                 rays++;
                 float3 tau;
                 StackLight stack;
-                float3 t = directional_visibility<S, M>(r.scene, r.view, x, to_light, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), enclosed ? Interior(eye_column.interior) : Interior(), r.set.shadow_overflows, tau, stack);
+                float3 t = directional_visibility<S, M>(r.scene, r.view, x, to_light, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), enclosed ? Interior(eye_column.interior) : Interior(), r.set.stack_entries != 0, r.set.shadow_overflows, tau, stack);
                 t *= stack.jacobian;
                 if (inside && stack.jacobian != 1.0 && stacks[j].w == 0.0)
                     stacks[j] = float4(stack.normal, 1.0);
