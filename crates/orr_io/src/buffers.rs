@@ -3,7 +3,7 @@
 use std::alloc::{AllocError, Allocator, Global, Layout};
 use std::io;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{AlignedBuf, RangeAllocator, SECTOR};
@@ -85,6 +85,7 @@ impl ReadBuffers {
         Ok(Self(Arc::new(Arena {
             pages: Pages::new(len, align)?,
             free: Mutex::new(RangeAllocator::new(units)),
+            misses: AtomicU64::new(0),
         })))
     }
 
@@ -103,7 +104,16 @@ impl ReadBuffers {
 
     /// As [`ReadBuffers::try_take`], with memory of its own where the arena has no room.
     pub fn take(&self, len: usize) -> AlignedBuf {
-        self.try_take(len).unwrap_or_else(|| AlignedBuf::new(len))
+        self.try_take(len).unwrap_or_else(|| {
+            self.0.misses.fetch_add(1, Ordering::Relaxed);
+            AlignedBuf::new(len)
+        })
+    }
+
+    /// The [`ReadBuffers::take`]s so far that found no room in the arena and took memory of
+    /// their own.
+    pub fn misses(&self) -> u64 {
+        self.0.misses.load(Ordering::Relaxed)
     }
 
     /// Bytes of the arena.
@@ -127,6 +137,8 @@ impl ReadBuffers {
 pub(crate) struct Arena {
     pages: Pages,
     free: Mutex<RangeAllocator>,
+    /// Takes that found no room and took memory of their own.
+    misses: AtomicU64,
 }
 
 /// The most bytes of one registered piece of the arena. io_uring takes at most 1 GiB per

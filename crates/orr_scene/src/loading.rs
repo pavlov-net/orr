@@ -6,6 +6,7 @@ use std::fs::File;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use orr_io::{AlignedBuf, ReadBuffers, ReadFile, Ring, SECTOR, Wake};
@@ -137,6 +138,20 @@ pub struct Loading {
     buffers: ReadBuffers,
     /// The arena of `buffers` as the device reads it, where it imports host memory.
     imported: Option<ImportedMemory>,
+    /// Staging that found no room in the imported arena and took the staging pool.
+    staging_misses: AtomicU64,
+}
+
+/// The read arena's figures, from [`Loading::read_arena`], to weigh its size and allocator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadArenaStats {
+    pub bytes: u64,
+    /// Whether the device imports it, so streamed units stage in it.
+    pub imported: bool,
+    /// Archive reads so far that found no room and read into memory of their own.
+    pub read_misses: u64,
+    /// Streamed units so far that found no room to stage in it and took the staging pool.
+    pub staging_misses: u64,
 }
 
 impl Loading {
@@ -178,7 +193,18 @@ impl Loading {
             positioned,
             buffers,
             imported,
+            staging_misses: AtomicU64::new(0),
         })
+    }
+
+    /// The read arena's figures so far.
+    pub fn read_arena(&self) -> ReadArenaStats {
+        ReadArenaStats {
+            bytes: self.buffers.bytes() as u64,
+            imported: self.imported.is_some(),
+            read_misses: self.buffers.misses(),
+            staging_misses: self.staging_misses.load(Ordering::Relaxed),
+        }
     }
 
     /// Runs jobs on the calling thread until [`Loading::stop_workers`]: archive decodes and
@@ -277,7 +303,10 @@ impl Loading {
     /// range returns when the buffer drops.
     pub(crate) fn staging(&self, len: u64) -> Option<(AlignedBuf, Block)> {
         let imported = self.imported.as_ref()?;
-        let mut buf = self.buffers.try_take(usize::try_from(len).ok()?)?;
+        let Some(mut buf) = self.buffers.try_take(usize::try_from(len).ok()?) else {
+            self.staging_misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
         let at = self.buffers.offset(&buf).expect("an arena range") as u64;
         let block = Block::arena(
             imported.gpu().0 + at,
