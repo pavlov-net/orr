@@ -4,6 +4,9 @@
 //! `cpu/calls.slang` calls the same linked types on the CPU. The same environment and medium
 //! also link into orr's own kernels.
 
+// The build script reads `DEP_ORR_*`, which Cargo sets only while orr is a normal dependency.
+use orr as _;
+
 /// The renderer fixture's own build.
 pub mod renderer {
     include!(concat!(env!("OUT_DIR"), "/renderer/orr_shaders.rs"));

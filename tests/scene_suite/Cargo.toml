@@ -8,13 +8,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
-orr = { workspace = true, features = ["hot-reload"] }
 orr_scene = { workspace = true, features = ["testing"] }
 orr_gpu.workspace = true
 orr_shaders.workspace = true
 orr_math.workspace = true
 
 [dev-dependencies]
+orr = { workspace = true, features = ["hot-reload"] }
 bytemuck.workspace = true
 half.workspace = true
 orr_color.workspace = true
