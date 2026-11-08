@@ -132,16 +132,19 @@ pub struct Queue {
 
 impl Queue {
     pub(super) fn new(shared: &Arc<Shared>, kind: QueueKind) -> Result<Queue, Error> {
-        let raw = shared.device.newMTL4CommandQueue().ok_or(Error::Metal {
-            call: "newMTL4CommandQueue",
-            message: format!("{kind:?} queue"),
-        })?;
+        let raw = shared
+            .device
+            .newMTL4CommandQueue()
+            .ok_or_else(|| Error::Metal {
+                call: "newMTL4CommandQueue",
+                message: format!("{kind:?} queue"),
+            })?;
         raw.addResidencySet(&lock(&shared.residency).set);
         Ok(Queue {
             kind,
             raw: Obj(raw),
             backlog: Mutex::default(),
-            host_event: Obj(shared.device.newSharedEvent().ok_or(Error::Metal {
+            host_event: Obj(shared.device.newSharedEvent().ok_or_else(|| Error::Metal {
                 call: "newSharedEvent",
                 message: format!("{kind:?} queue CPU steps"),
             })?),
@@ -507,10 +510,14 @@ impl HostTimeline {
 impl Device {
     /// A host timeline at 0.
     pub fn create_host_timeline(&self, name: &str) -> Result<HostTimeline, Error> {
-        let event = self.shared.device.newSharedEvent().ok_or(Error::Metal {
-            call: "newSharedEvent",
-            message: format!("host timeline {name}"),
-        })?;
+        let event = self
+            .shared
+            .device
+            .newSharedEvent()
+            .ok_or_else(|| Error::Metal {
+                call: "newSharedEvent",
+                message: format!("host timeline {name}"),
+            })?;
         event.setLabel(Some(&NSString::from_str(name)));
         let event = Obj(event);
         let mut hosts = lock(&self.shared.host_timelines);

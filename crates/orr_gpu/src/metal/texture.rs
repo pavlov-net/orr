@@ -326,11 +326,10 @@ pub(super) fn pixel_format(f: Format) -> Result<MTLPixelFormat, Error> {
         R32Uint => MTLPixelFormat::R32Uint,
         R32Sint => MTLPixelFormat::R32Sint,
         Rg32Float => MTLPixelFormat::RG32Float,
-        Rg32Uint => MTLPixelFormat::RG32Uint,
+        // Metal's 64-bit texture atomics work on two-channel 32-bit texels.
+        Rg32Uint | R64Uint => MTLPixelFormat::RG32Uint,
         Rgba32Float => MTLPixelFormat::RGBA32Float,
         Rgba32Uint => MTLPixelFormat::RGBA32Uint,
-        // Metal's 64-bit texture atomics work on two-channel 32-bit texels.
-        R64Uint => MTLPixelFormat::RG32Uint,
         A2b10g10r10Unorm => MTLPixelFormat::RGB10A2Unorm,
         B10g11r11Ufloat => MTLPixelFormat::RG11B10Float,
         E5b9g9r9Ufloat => MTLPixelFormat::RGB9E5Float,
