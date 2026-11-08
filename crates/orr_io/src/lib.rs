@@ -5,7 +5,7 @@
 //! and where the system refuses them, [`Ring::positioned`] runs the same reads as positioned
 //! reads.
 
-use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::alloc::{AllocError, Allocator, Global, Layout, handle_alloc_error};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
@@ -34,43 +34,56 @@ pub const SECTOR: usize = 4096;
 /// The most bytes one read asks the system for, which is under every platform's limit.
 const CHUNK: usize = 1 << 30;
 
-/// A zeroed buffer at a [`SECTOR`] boundary, a whole number of sectors long.
-pub struct AlignedBuf {
-    ptr: NonNull<u8>,
-    len: usize,
+/// The global allocator with every block aligned to [`SECTOR`].
+struct Sector;
+
+fn sector_layout(layout: Layout) -> Result<Layout, AllocError> {
+    layout.align_to(SECTOR).map_err(|_| AllocError)
 }
 
-// SAFETY: the buffer owns its memory.
-unsafe impl Send for AlignedBuf {}
-// SAFETY: shared access only reads.
-unsafe impl Sync for AlignedBuf {}
+// SAFETY: every call forwards to `Global` with the request's layout raised the same way, so
+// `Global` sees each block with one layout.
+unsafe impl Allocator for Sector {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        Global.allocate(sector_layout(layout)?)
+    }
+
+    // The default writes every zero; the global allocator can instead take pages the system
+    // zeroed.
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        Global.allocate_zeroed(sector_layout(layout)?)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        let layout = sector_layout(layout).expect("raised when allocated");
+        // SAFETY: `Global` allocated `ptr` with this layout.
+        unsafe { Global.deallocate(ptr, layout) }
+    }
+}
+
+/// A zeroed buffer at a [`SECTOR`] boundary, a whole number of sectors long.
+// A `Vec` rather than a `Box`: the ring moves the buffer while the system writes through a
+// pointer into it, which a `Box`'s uniqueness forbids.
+pub struct AlignedBuf(Vec<u8, Sector>);
 
 impl AlignedBuf {
     /// A buffer of at least `len` bytes (at least one sector).
     pub fn new(len: usize) -> Self {
         let len = len.max(1).next_multiple_of(SECTOR);
-        let layout = Layout::from_size_align(len, SECTOR).expect("read buffer layout");
-        // SAFETY: the layout has a non-zero size.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("read buffer");
-        Self { ptr, len }
+        let layout = Layout::array::<u8>(len).expect("read buffer layout");
+        let ptr = Sector
+            .allocate_zeroed(layout)
+            .unwrap_or_else(|_| handle_alloc_error(layout));
+        // SAFETY: `Sector` allocated `len` zeroed bytes for `u8`'s layout.
+        Self(unsafe { Vec::from_parts_in(ptr.cast(), len, len, Sector) })
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: `len` initialized bytes owned by the buffer.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        &self.0
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: as above, borrowed mutably.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-    }
-}
-
-impl Drop for AlignedBuf {
-    fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.len, SECTOR).expect("read buffer layout");
-        // SAFETY: allocated with this layout.
-        unsafe { dealloc(self.ptr.as_ptr(), layout) };
+        &mut self.0
     }
 }
 
