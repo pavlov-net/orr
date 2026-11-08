@@ -22,10 +22,10 @@ use std::os::raw::c_int;
 
 use meshopt::ffi;
 use orr_pack::mesh::{
-    Cluster, ClusterSets, Group, MeshHeader, MeshInfo, NODE_PAGE_MAX, Node, NodePage, OMM_ALIGN,
-    PAGE_MAX, PageHeader, PageInfo, Section, SurfaceClass, cluster_resident_len,
+    ClusterSets, Group, MeshHeader, MeshInfo, NODE_PAGE_MAX, Node, NodePage, OMM_ALIGN, PAGE_MAX,
+    PageHeader, PageInfo, Section, SurfaceClass, cluster_resident_len,
 };
-use orr_pack::{Aabb, Span, Sphere};
+use orr_pack::{Span, Sphere};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -756,11 +756,9 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
             })
         })
         .collect();
-    let mut part_bounds = vec![Aabb::EMPTY; cx.parts.table.len()];
+    let mut parts = cx.parts.table.clone();
     for c in groups.iter().flat_map(|g| &g.clusters) {
-        if c.record.flags & Cluster::MERGED == 0 {
-            c.extend(&mut part_bounds[usize::from(c.record.part)], cx.grid);
-        }
+        c.add_to(&mut parts, cx.grid);
     }
 
     // Hierarchy: each stage's nodes, then breadth first from the roots.
@@ -834,7 +832,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
             ..bytemuck::Zeroable::zeroed()
         },
         sections: Vec::new(),
-        parts: Vec::new(),
+        parts,
         part_levels: Vec::new(),
         levels: Vec::new(),
         nodes,
@@ -851,7 +849,6 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         info,
         pages,
         node_pages: node_blobs,
-        part_bounds,
         clusters: set_clusters,
     })
 }

@@ -205,6 +205,10 @@ pub struct Part {
     pub pivot: [f32; 3],
     pub joint: u16,
     pub _pad: u16,
+    /// The sections of its clusters with [`Cluster::ANIMATED_PART`], a bit each as in
+    /// [`MeshHeader::opaque_sections`]: of every page, streamed ones too. 0 on a part that isn't
+    /// animated.
+    pub sections: u32,
 }
 
 /// The clusters of one part at one discrete level: a range of mesh cluster indices.

@@ -270,19 +270,7 @@ fn cuts_cover_the_surface_once() {
 #[test]
 fn parts_merge_past_the_merge_error() {
     let mut input = wavy(64, true);
-    let n = input.positions.len();
-    let values: Vec<u16> = input
-        .positions
-        .iter()
-        .map(|p| ((p.x + 2.0) / 4.0 * 4.999).floor() as u16)
-        .collect();
-    assert_eq!(values.len(), n);
-    input.parts = Some(MeshParts {
-        values,
-        count: 5,
-        by_section: false,
-        pivots: None,
-    });
+    x_parts(&mut input, 5);
     let merge = 0.004;
     let settings = MeshSettings {
         merge_error: Some(merge),
@@ -361,6 +349,71 @@ fn parts_merge_past_the_merge_error() {
     };
     let merged_coarsest = d.select(Cut::Uniform(f32::MAX), merged_stage);
     assert!(tris(&merged_coarsest) < tris(&coarsest));
+}
+
+/// A part's sections come from the clusters of every page: single quads of a second section
+/// simplify away before the terminal groups, so only streamed pages hold them.
+#[test]
+fn part_sections_cover_streamed_clusters() {
+    let n = 64;
+    let mut input = wavy(n, false);
+    x_parts(&mut input, 3);
+    let (mut plain, mut islands) = (Vec::new(), Vec::new());
+    for (k, quad) in input.indices.chunks(6).enumerate() {
+        let (i, j) = (k as u32 % n, k as u32 / n);
+        if i % 13 == 5 && j % 17 == 7 {
+            islands.extend(quad);
+        } else {
+            plain.extend(quad);
+        }
+    }
+    input.sections = vec![
+        Span {
+            first: 0,
+            count: plain.len() as u32,
+        },
+        Span {
+            first: plain.len() as u32,
+            count: islands.len() as u32,
+        },
+    ];
+    input.indices = [plain, islands].concat();
+    let a = cook(input, &[0, 0], dag());
+    let d = load(&a, "m/mesh");
+    let pinned = d.info.header.pinned_pages as usize;
+    let mut sections = [0u32; 3];
+    let mut pinned_sections = [0u32; 3];
+    for c in &d.clusters {
+        let r = &c.record;
+        if r.flags & Cluster::ANIMATED_PART != 0 {
+            sections[usize::from(r.part)] |= 1 << r.section;
+            if c.page < pinned {
+                pinned_sections[usize::from(r.part)] |= 1 << r.section;
+            }
+        }
+    }
+    assert_eq!(sections, [0, 3, 3]);
+    assert_ne!(
+        pinned_sections, sections,
+        "some islands are on streamed pages alone"
+    );
+    let cooked: Vec<u32> = d.info.parts.iter().map(|p| p.sections).collect();
+    assert_eq!(cooked, sections);
+}
+
+/// Splits a [`wavy`] mesh into `count` parts, in equal bands along x.
+fn x_parts(input: &mut MeshInput, count: u16) {
+    let values = input
+        .positions
+        .iter()
+        .map(|p| ((p.x + 2.0) / 4.0 * (f32::from(count) - 0.001)).floor() as u16)
+        .collect();
+    input.parts = Some(MeshParts {
+        values,
+        count,
+        by_section: false,
+        pivots: None,
+    });
 }
 
 /// The cluster vertex positions of a cooked DAG, as bits.

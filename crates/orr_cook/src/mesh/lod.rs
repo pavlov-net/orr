@@ -103,7 +103,7 @@ const MAX_PARTS: usize = 1 << 16;
 
 /// The part table and each triangle's part.
 pub(super) struct Parts {
-    /// Pivot and joint per part; bounds are filled from the clusters.
+    /// Pivot and joint per part; bounds and sections are filled from the clusters.
     pub(super) table: Vec<Part>,
     /// Part value is not 0.
     pub(super) animated: Vec<bool>,
@@ -120,6 +120,7 @@ impl Parts {
             pivot,
             joint,
             _pad: 0,
+            sections: 0,
         };
         let (Some(p), Some(values)) = (&m.parts, &w.values) else {
             return Ok(Self {

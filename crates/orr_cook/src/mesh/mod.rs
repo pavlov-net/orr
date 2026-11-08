@@ -787,12 +787,6 @@ pub(crate) fn cook(
         }
     }
     sets::build(&mut built.info, &m.sections, &built.clusters);
-    built.info.parts = parts
-        .table
-        .iter()
-        .zip(built.part_bounds)
-        .map(|(p, bounds)| Part { bounds, ..*p })
-        .collect();
     Ok(CookedMesh {
         info: built.info,
         pages: built.pages,
@@ -803,12 +797,11 @@ pub(crate) fn cook(
 }
 
 /// What both LOD modes leave for [`cook`] to finish: the info without its header's mesh
-/// facts, sections and parts.
+/// facts and sections.
 struct Built {
     info: MeshInfo,
     pages: Vec<Vec<u8>>,
     node_pages: Vec<Vec<u8>>,
-    part_bounds: Vec<Aabb>,
     /// What the sets read of every cluster, in mesh cluster order.
     clusters: Vec<sets::SetCluster>,
 }
@@ -1025,7 +1018,7 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
     let mut page_info = Vec::new();
     let mut level_spans = vec![Span::default(); level_count];
     let mut part_level_spans = vec![Span::default(); part_count * level_count];
-    let mut part_bounds = vec![Aabb::EMPTY; part_count];
+    let mut parts = cx.parts.table.clone();
     let mut set_clusters = Vec::new();
     let mut next = 0u32;
     let mut pinned_pages = 0;
@@ -1045,9 +1038,7 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
                 span.first = next + i as u32;
             }
             span.count += 1;
-            if c.record.flags & Cluster::MERGED == 0 {
-                c.extend(&mut part_bounds[usize::from(c.record.part)], cx.grid);
-            }
+            c.add_to(&mut parts, cx.grid);
         }
         let paged = paginate(clusters, cx.stride);
         let stored = paged
@@ -1082,7 +1073,7 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
             ..bytemuck::Zeroable::zeroed()
         },
         sections: Vec::new(),
-        parts: Vec::new(),
+        parts,
         part_levels: part_level_spans
             .into_iter()
             .map(|clusters| PartLevel { clusters })
@@ -1109,7 +1100,6 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
         info,
         pages,
         node_pages: Vec::new(),
-        part_bounds,
         clusters: set_clusters,
     })
 }
@@ -1489,6 +1479,19 @@ impl ClusterData {
     fn cost(&self, stride: usize) -> usize {
         orr_pack::mesh::cluster_resident_len(self.local.len(), self.tris.len() / 3, stride)
             + self.omm.as_ref().map_or(0, ClusterOmm::bytes)
+    }
+
+    /// Adds the cluster to its part's record in `parts`: its rest AABB unless it is merged, and
+    /// its section when it is of an animated part.
+    fn add_to(&self, parts: &mut [Part], grid: &Grid) {
+        let r = &self.record;
+        let part = &mut parts[usize::from(r.part)];
+        if r.flags & Cluster::MERGED == 0 {
+            self.extend(&mut part.bounds, grid);
+        }
+        if r.flags & Cluster::ANIMATED_PART != 0 {
+            part.sections |= 1 << usize::from(r.section).min(MAX_HIDDEN_SECTION);
+        }
     }
 
     /// Extends `b` by the cluster's rest AABB.

@@ -194,8 +194,8 @@ pub(crate) fn cut_rows(table: &[f32], streams: bool, fine: bool) -> (Vec<CutRow>
     )
 }
 
-/// A mesh's animated parts: those of its clusters with `ANIMATED_PART`, from the lowest
-/// such part to the last of the part table.
+/// A mesh's animated parts: from the lowest part whose clusters have `ANIMATED_PART`, by the
+/// cooked [`Part::sections`] of every page, to the last of the part table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Animated {
     pub(crate) first: u32,
@@ -203,22 +203,12 @@ pub(crate) struct Animated {
 }
 
 impl Animated {
-    fn of(clusters: &[ClusterInfo], part_count: u32) -> Self {
-        let parts = part_count.max(1);
-        let first = clusters
-            .iter()
-            .filter(|c| c.flags & Cluster::ANIMATED_PART != 0)
-            .map(|c| u32::from(c.part))
-            .min();
-        match first {
-            Some(first) => Self {
-                first,
-                count: parts.saturating_sub(first),
-            },
-            None => Self {
-                first: parts,
-                count: 0,
-            },
+    fn of(parts: &[Part]) -> Self {
+        let first = parts.iter().position(|p| p.sections != 0);
+        let first = first.unwrap_or(parts.len());
+        Self {
+            first: first as u32,
+            count: (parts.len() - first) as u32,
         }
     }
 
@@ -732,7 +722,7 @@ pub(crate) fn build(
             cuts: meshes
                 .iter()
                 .map(|m| MeshCuts {
-                    animated: Animated::of(m.clusters, m.header.parts.count),
+                    animated: Animated::of(m.parts),
                     ..MeshCuts::default()
                 })
                 .collect(),
@@ -833,7 +823,7 @@ pub(crate) fn build(
     let mut per_mesh = Vec::with_capacity(meshes.len());
     let mut rt_cuts: Vec<Vec<Vec<RtCluster>>> = Vec::with_capacity(meshes.len());
     for (mi, m) in meshes.iter().enumerate() {
-        let animated = Animated::of(m.clusters, m.header.parts.count);
+        let animated = Animated::of(m.parts);
         let cs = cuts(m);
         per_mesh.push((cs.len() as u32, animated));
         let mut rt = Vec::with_capacity(cs.len());
@@ -1151,26 +1141,15 @@ impl CutPlan {
 
 /// Each animated part's rest bounds and the sections its clusters use.
 fn part_records(m: &MeshInput<'_>, animated: Animated) -> Vec<PartGpu> {
-    let mut out: Vec<PartGpu> = (0..animated.count)
-        .map(|j| {
-            let bounds = m
-                .parts
-                .get((animated.first + j) as usize)
-                .map_or(orr_pack::Aabb::EMPTY, |p| p.bounds);
-            PartGpu {
-                bounds_min: bounds.min,
-                sections: 0,
-                bounds_max: bounds.max,
-                _pad: 0,
-            }
+    m.parts[animated.first as usize..]
+        .iter()
+        .map(|p| PartGpu {
+            bounds_min: p.bounds.min,
+            sections: p.sections,
+            bounds_max: p.bounds.max,
+            _pad: 0,
         })
-        .collect();
-    for c in m.clusters {
-        if let Some(j) = animated.index(c) {
-            out[j as usize].sections |= 1 << c.section.min(16);
-        }
-    }
-    out
+        .collect()
 }
 
 /// The BLAS of one (mesh, section mask): a block of their implicit results and the table
