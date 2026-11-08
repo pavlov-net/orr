@@ -6,7 +6,7 @@
 //! pixel.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytemuck::Pod;
@@ -16,6 +16,7 @@ use orr_gpu::{
 };
 
 use crate::Loading;
+use crate::residency::InFlight;
 
 struct StderrLog;
 
@@ -60,7 +61,7 @@ pub fn device() -> &'static Device {
 
 /// A loading side with no renderer, for a test that only queues jobs on it.
 pub fn loading() -> Loading {
-    Loading::new(false, 1 << 20, None).expect("read buffers")
+    Loading::new(false, 1 << 20, None, Arc::new(InFlight::new(u64::MAX))).expect("read buffers")
 }
 
 /// Fails the calling test if the validation layer has reported anything on [`device`].
@@ -339,7 +340,7 @@ pub fn mounted_texture(
     scenes: &crate::Scenes,
     m: crate::MountId,
     id: orr_pack::AssetId,
-) -> Option<std::sync::Arc<Texture>> {
+) -> Option<Arc<Texture>> {
     scenes.texture_object(m, id)
 }
 

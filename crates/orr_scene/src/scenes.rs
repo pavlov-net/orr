@@ -125,15 +125,16 @@ pub struct Budgets {
     pub texture_feedback_cells: u32,
     /// Texture feedback records a frame keeps; taps past it report nothing that frame.
     pub texture_feedback_records: u32,
-    /// Bytes of streamed units and requested blobs loading at once, from the step that
-    /// starts their reads to the one their GPU work lands in, which hold staging and read
-    /// buffers that long. Loads start while fewer are in flight, so the last one started may
-    /// pass it. Each [`RequestSource`] and the requested blobs share it equally while they all
-    /// have loads waiting; a share one leaves unused goes to the others. Twice this sizes the
-    /// arena archive reads and streamed units' staging take, which the system's ring registers
-    /// and, where the device imports host memory, the GPU reads in place: room for
-    /// `in_flight_bytes` of decoded units and as much again of their stored input, which
-    /// mounts' reads share. Reads and staging that find no room take memory of their own.
+    /// Bytes loading at once: of streamed units and requested blobs from the step that starts
+    /// their reads to the one their GPU work lands in, which hold staging and read buffers that
+    /// long, and the stored bytes of mounts' reads from their start until they are placed.
+    /// Loads start while fewer are in flight, so the last one started may pass it. Each
+    /// [`RequestSource`], the requested blobs and the mounts share it equally while they all
+    /// have loads waiting; a share one leaves unused goes to the others. A mount larger than
+    /// it loads in pieces. Twice this sizes the arena archive reads and streamed units' staging
+    /// take, which the system's ring registers and, where the device imports host memory, the
+    /// GPU reads in place: room for `in_flight_bytes` of decoded units and as much again of
+    /// their stored input. Reads and staging that find no room take memory of their own.
     pub in_flight_bytes: u64,
     /// Bytes per block of the stream pool.
     pub stream_block: u64,
@@ -478,10 +479,12 @@ impl Scenes {
             mounts.streaming.init(),
         ];
         // Last, so no failure after it leaves the threads running with no one to stop them.
+        let in_flight = Arc::clone(mounts.streaming.in_flight());
         let loading = Arc::new(Loading::new(
             desc.positioned_reads,
             2 * b.in_flight_bytes,
             Some(device),
+            in_flight,
         )?);
         let thread = loading::spawn(&loading, device)?;
         Ok(Self {

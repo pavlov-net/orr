@@ -12,12 +12,18 @@
 //! their class budget and the in-flight limit only.
 //!
 //! Loads start while fewer bytes than the limit are in flight, so the last one started may
-//! pass it. The limit is shared by lane: one per request source and one for user blobs. Each
-//! load goes to the lane with demand left and the fewest bytes in flight, its highest-priority
-//! request first (user blobs in request order), since priorities of different sources measure
-//! different things. So every lane with demand gets an equal share, and what one leaves unused
-//! goes to the others. A request whose closure the limit cuts short loads its dependencies
-//! first and the rest once they have landed and it comes again.
+//! pass it. The limit is shared by lane: one per request source, one for user blobs and one
+//! for mounts' reads. Each load goes to the lane with demand left and the fewest bytes in
+//! flight, its highest-priority request first (user blobs and mount reads in request order),
+//! since priorities of different sources measure different things. So every lane with demand
+//! gets an equal share, and what one leaves unused goes to the others. A request whose closure
+//! the limit cuts short loads its dependencies first and the rest once they have landed and it
+//! comes again.
+//!
+//! The render thread plans the streamed lanes at each step, and the loading thread starts
+//! mount reads as they come, through [`InFlight`]: a plan whose next load would go to the
+//! mount lane leaves the rest to it, and the mount lane starts reads while it has no more
+//! bytes in flight than the emptiest lane the latest plan held back for the limit.
 //!
 //! A unit's bytes are what its load places and what it builds beside them; the built bytes
 //! are an estimate until its first load reports them.
@@ -26,8 +32,10 @@
 //! shrinks step by step and units past their hold are evicted down to it; below 80% the
 //! budgets grow back. A class whose units' shared address range runs out shrinks alone.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::ops::Bound::{Excluded, Unbounded};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -304,6 +312,82 @@ pub(crate) struct Limits {
     pub(crate) in_flight: u64,
 }
 
+/// The in-flight limit's figures that the render thread's plans and the loading thread's
+/// mount reads share.
+pub(crate) struct InFlight {
+    limit: u64,
+    /// Bytes in flight of the streamed lanes, as their plans and landings leave them.
+    streams: AtomicU64,
+    /// The fewest bytes in flight of a streamed lane the latest plan held loads of back for
+    /// the limit; `u64::MAX` when it held none back.
+    floor: AtomicU64,
+    /// Bytes of mount reads in flight.
+    mounts: AtomicU64,
+    /// Whether mount reads wait for room.
+    waiting: AtomicBool,
+}
+
+impl InFlight {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            streams: AtomicU64::new(0),
+            floor: AtomicU64::new(u64::MAX),
+            mounts: AtomicU64::new(0),
+            waiting: AtomicBool::new(false),
+        }
+    }
+
+    /// Takes mount reads, each with its bytes, from the front of `queue` while the mount lane
+    /// has room: fewer bytes than the limit in flight, the mounts' no more than those of the
+    /// emptiest lane the latest plan held back. `start` gets each, whose bytes count until
+    /// [`InFlight::end_mount`]. Only the loading thread calls it.
+    ///
+    /// A thread that frees room after this finds none sees [`InFlight::mounts_waiting`], as
+    /// both sides write before they read, in one order.
+    pub(crate) fn start_mounts<T>(
+        &self,
+        queue: &mut VecDeque<(u64, T)>,
+        mut start: impl FnMut(u64, T),
+    ) {
+        while let Some(&(bytes, _)) = queue.front() {
+            self.waiting.store(true, SeqCst);
+            let mounts = self.mounts.load(SeqCst);
+            let total = self.streams.load(SeqCst) + mounts;
+            if total >= self.limit || mounts > self.floor.load(SeqCst) {
+                return;
+            }
+            self.mounts.fetch_add(bytes, SeqCst);
+            let (_, read) = queue.pop_front().expect("a queued read");
+            start(bytes, read);
+        }
+        self.waiting.store(false, SeqCst);
+    }
+
+    /// A mount read of `bytes` that [`InFlight::start_mounts`] started has ended.
+    pub(crate) fn end_mount(&self, bytes: u64) {
+        self.mounts.fetch_sub(bytes, SeqCst);
+    }
+
+    /// Whether mount reads wait for room.
+    pub(crate) fn mounts_waiting(&self) -> bool {
+        self.waiting.load(SeqCst)
+    }
+
+    fn mounts(&self) -> u64 {
+        self.mounts.load(SeqCst)
+    }
+}
+
+/// Why a plan starts none of a request's closure or a user blob.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Short {
+    /// The loads in flight have reached the limit, or the mount lane takes the next load.
+    InFlight,
+    /// Its budget cannot take the first unit.
+    Budget,
+}
+
 pub(crate) struct Residency {
     limits: Limits,
     /// Per class, the share of its budget in `limits.budgets` that loads and evictions plan
@@ -318,9 +402,10 @@ pub(crate) struct Residency {
     used: [u64; CLASSES],
     loading_bytes: [u64; CLASSES],
     resident_units: [u32; CLASSES],
-    /// Bytes of the loads in flight, in all and by lane.
+    /// Bytes of the streamed lanes' loads in flight, in all and by lane.
     in_flight: u64,
     lane_in_flight: [u64; LANES],
+    shared: Arc<InFlight>,
     requests: FxHashMap<Key, (Priority, RequestSource)>,
     failed: u32,
     /// A load or build ran out of memory the budgets govern since the last `react`.
@@ -342,6 +427,7 @@ impl Residency {
             resident_units: [0; CLASSES],
             in_flight: 0,
             lane_in_flight: [0; LANES],
+            shared: Arc::new(InFlight::new(limits.in_flight)),
             requests: FxHashMap::default(),
             failed: 0,
             out_of_memory: false,
@@ -354,6 +440,16 @@ impl Residency {
 
     pub(crate) fn stats(&self) -> &ResidencyStats {
         &self.stats
+    }
+
+    /// What the loading thread's mount reads share the in-flight limit through.
+    pub(crate) fn in_flight(&self) -> &Arc<InFlight> {
+        &self.shared
+    }
+
+    /// Whether the loads in flight, mount reads' among them, have reached the limit.
+    fn full(&self) -> bool {
+        self.in_flight + self.shared.mounts() >= self.limits.in_flight
     }
 
     pub(crate) fn note_pages_over_budget(&mut self, count: u32) {
@@ -697,18 +793,21 @@ impl Residency {
         self.refresh();
     }
 
-    /// Starts a user blob's load of `bytes`, outside any mount's units: true when the user
-    /// blob budget has room for it and the loads in flight are short of the in-flight limit.
-    fn start_blob(&mut self, bytes: u64) -> bool {
+    /// Starts a user blob's load of `bytes`, outside any mount's units, unless the user blob
+    /// budget has no room for it or `full`.
+    fn start_blob(&mut self, bytes: u64, full: bool) -> Result<(), Short> {
         let c = ResidencyClass::UserBlobs as usize;
-        if self.used[c] + bytes > self.budget(c) || self.in_flight >= self.limits.in_flight {
-            return false;
+        if self.used[c] + bytes > self.budget(c) {
+            return Err(Short::Budget);
+        }
+        if full {
+            return Err(Short::InFlight);
         }
         self.used[c] += bytes;
         self.loading_bytes[c] += bytes;
         self.in_flight += bytes;
         self.lane_in_flight[BLOB_LANE] += bytes;
-        true
+        Ok(())
     }
 
     /// A user blob's load of `bytes` that a plan started ([`Plan::blobs`]) ended: its bytes
@@ -796,6 +895,10 @@ impl Residency {
         let mut blobs = blobs.into_iter();
         // The next queued blob; none once one cannot start, as it holds back those after it.
         let mut blob = blobs.next();
+        // The lanes that held loads back for the limit, and whether the next load went to the
+        // mount lane, which then takes the rest.
+        let mut short = [false; LANES];
+        let mut yielded = false;
         loop {
             let left = |l: usize| match l {
                 BLOB_LANE => blob.is_some(),
@@ -807,13 +910,20 @@ impl Residency {
             else {
                 break;
             };
+            yielded |=
+                self.shared.mounts_waiting() && self.shared.mounts() < self.lane_in_flight[lane];
+            let full = yielded || self.full();
             if lane == BLOB_LANE {
                 let bytes = blob.expect("a blob lane with demand left");
-                blob = if self.start_blob(bytes) {
-                    plan.blobs += 1;
-                    blobs.next()
-                } else {
-                    None
+                blob = match self.start_blob(bytes, full) {
+                    Ok(()) => {
+                        plan.blobs += 1;
+                        blobs.next()
+                    }
+                    Err(s) => {
+                        short[lane] |= s == Short::InFlight;
+                        None
+                    }
                 };
                 continue;
             }
@@ -834,13 +944,23 @@ impl Residency {
             };
             let longest = &mut self.stats.longest_closure;
             *longest = (*longest).max(chain.len() as u32);
-            let admitted = self.admit(&chain, frame, &mut plan.evictions);
-            if admitted == 0 {
-                dropped[lane] += 1;
-                continue;
-            }
+            // One request the limit holds back is enough to know the lane's demand.
+            let admitted = if full && short[lane] {
+                Err(Short::InFlight)
+            } else {
+                self.admit(&chain, full, frame, &mut plan.evictions)
+            };
+            let admitted = match admitted {
+                Ok(n) => n,
+                Err(s) => {
+                    short[lane] |= s == Short::InFlight;
+                    dropped[lane] += 1;
+                    continue;
+                }
+            };
             if admitted < chain.len() {
                 waiting += 1;
+                short[lane] = true;
             }
             for &u in &chain[..admitted] {
                 self.start_load(u, lane);
@@ -848,6 +968,11 @@ impl Residency {
                 plan.loads.push(u);
             }
         }
+        let floor = (0..LANES)
+            .filter(|&l| short[l])
+            .map(|l| self.lane_in_flight[l])
+            .min();
+        self.shared.floor.store(floor.unwrap_or(u64::MAX), SeqCst);
         self.stats.loads = plan.loads.len() as u32;
         self.stats.evictions = plan.evictions.len() as u32;
         self.stats.dropped = dropped;
@@ -891,29 +1016,35 @@ impl Residency {
     }
 
     /// How many units from the start of `chain` load now, evicting what they need: those
-    /// that start before the loads in flight reach the in-flight limit, when their budgets
-    /// take them all; 0 when none do. Any start of a closure holds its own dependencies.
-    fn admit(&mut self, chain: &[Key], frame: u64, evictions: &mut Vec<Key>) -> usize {
-        let mut need = [0u64; CLASSES];
-        let mut in_flight = self.in_flight;
-        // Their resident dependencies, which must stay.
-        let mut held = Vec::new();
+    /// that start before the loads in flight reach the in-flight limit, none when `full`, if
+    /// their budgets take them all. Any start of a closure holds its own dependencies. When
+    /// none start, the budgets' answer for the first unit tells why.
+    fn admit(
+        &mut self,
+        chain: &[Key],
+        full: bool,
+        frame: u64,
+        evictions: &mut Vec<Key>,
+    ) -> Result<usize, Short> {
+        let mut in_flight = self.in_flight + self.shared.mounts();
         let mut admitted = 0;
         for &k in chain {
-            if in_flight >= self.limits.in_flight {
+            if full || in_flight >= self.limits.in_flight {
                 break;
             }
+            in_flight += self.unit(k).expect("unit of a closure").bytes;
+            admitted += 1;
+        }
+        let mut need = [0u64; CLASSES];
+        // Their resident dependencies, which must stay.
+        let mut held = Vec::new();
+        for &k in &chain[..admitted.max(1)] {
             let u = self.unit(k).expect("unit of a closure");
             need[u.class as usize] += u.held();
-            in_flight += u.bytes;
             held.extend(u.deps.iter().map(|&unit| Key {
                 mount: k.mount,
                 unit,
             }));
-            admitted += 1;
-        }
-        if admitted == 0 {
-            return 0;
         }
         let mut victims = Vec::new();
         for class in ResidencyClass::ALL {
@@ -921,15 +1052,18 @@ impl Residency {
             let over = (self.used[c] + need[c]).saturating_sub(self.budget(c));
             let (v, short) = self.victims(c, over, frame, &held);
             if short > 0 {
-                return 0;
+                return Err(Short::Budget);
             }
             victims.extend(v);
+        }
+        if admitted == 0 {
+            return Err(Short::InFlight);
         }
         for k in victims {
             self.evict(k);
             evictions.push(k);
         }
-        admitted
+        Ok(admitted)
     }
 
     /// Units of class `c` past their hold, least recently touched first, whose eviction
@@ -1005,6 +1139,7 @@ impl Residency {
             s.resident_units = self.resident_units[c];
         }
         self.stats.failed = self.failed;
+        self.shared.streams.store(self.in_flight, SeqCst);
     }
 }
 
@@ -1162,6 +1297,55 @@ mod tests {
         assert_eq!(r.plan(3, []).loads, []);
         r.request(key(8), P, Hints);
         assert_eq!(r.plan(3, []).loads, [key(8)]);
+    }
+
+    #[test]
+    fn mount_reads_past_the_in_flight_limit_share_it_with_streamed_loads_and_all_start() {
+        let mut r = Residency::new(Limits {
+            in_flight: 100,
+            ..limits(u64::MAX)
+        });
+        let units: Vec<UnitDesc> = (0..20).map(|_| unit(10, &[], Start::Absent)).collect();
+        r.register(M, &units).unwrap();
+        // Six times the limit, the last read alone past it.
+        let mut queue: VecDeque<(u64, ())> = (0..25).map(|_| (20, ())).collect();
+        queue.push_back((100, ()));
+        let shared = Arc::clone(r.in_flight());
+        let mut frame = 0;
+        while !queue.is_empty() {
+            frame += 1;
+            assert!(frame < 40, "mount reads still waiting at frame {frame}");
+            let absent: Vec<u32> = (0..20).filter(|&u| r.absent(key(u))).collect();
+            for &u in &absent {
+                r.request(key(u), P, S);
+            }
+            let plan = r.plan(frame, []);
+            assert!(
+                absent.is_empty() || !plan.loads.is_empty(),
+                "no streamed load starts beside the mount's at frame {frame}"
+            );
+            assert!(r.in_flight + shared.mounts() < 100 + 10);
+            let mut reading = Vec::new();
+            shared.start_mounts(&mut queue, |bytes, ()| reading.push(bytes));
+            match reading.last() {
+                // The first plan took the limit before any read waited.
+                None => assert_eq!(frame, 1, "no mount read starts at frame {frame}"),
+                Some(&last) => {
+                    assert!(r.in_flight + shared.mounts() < 100 + last);
+                    if r.stats().dropped_from(S) > 0 {
+                        assert!(
+                            shared.mounts() <= r.in_flight + last,
+                            "an equal share at frame {frame}"
+                        );
+                    }
+                }
+            }
+            for bytes in reading {
+                shared.end_mount(bytes);
+            }
+            land_all(&mut r, &plan, frame);
+        }
+        assert!((0..20).all(|u| r.resident(key(u))));
     }
 
     #[test]

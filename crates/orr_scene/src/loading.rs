@@ -26,7 +26,8 @@ use orr_pack::{Archive, Blob, Codec, Filter};
 
 use crate::edit::{self, EditBatch, EditTask};
 use crate::memory::Block;
-use crate::mount::{Batch, MountTask, finish, start};
+use crate::mount::{Batch, MountRead, MountTask, finish, start};
+use crate::residency::InFlight;
 use crate::stream::{self, CutBatch, CutTask, StreamBatch, StreamTask};
 use crate::{Error, PackSource, Result};
 
@@ -35,6 +36,8 @@ type Job = Box<dyn FnOnce() + Send>;
 /// Messages to the loading thread.
 pub(crate) enum Msg {
     Mount(Arc<MountTask>, PackSource),
+    /// A mount's read of this many bytes, to start once the in-flight limit has room.
+    MountRead(u64, MountRead),
     Read(orr_io::Read),
     /// Every job and read of the mount has finished.
     Done(Arc<MountTask>),
@@ -169,6 +172,7 @@ pub struct Loading {
     imported: Option<ImportedMemory>,
     /// Staging that found no room in the imported arena and took the staging pool.
     staging_misses: AtomicU64,
+    in_flight: Arc<InFlight>,
 }
 
 /// The read arena's figures, from [`Loading::read_arena`], to weigh its size and allocator.
@@ -183,10 +187,40 @@ pub struct ReadArenaStats {
     pub staging_misses: u64,
 }
 
+/// A started mount read's bytes in the in-flight limit, which end when it drops.
+pub(crate) struct Ticket {
+    bytes: u64,
+    loading: Weak<Loading>,
+}
+
+impl Ticket {
+    pub(crate) fn new(loading: &Arc<Loading>, bytes: u64) -> Self {
+        Self {
+            bytes,
+            loading: Arc::downgrade(loading),
+        }
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        if let Some(l) = self.loading.upgrade() {
+            l.in_flight.end_mount(self.bytes);
+            l.wake_mounts();
+        }
+    }
+}
+
 impl Loading {
     /// A loading side whose reads take an arena of `arena_bytes`, which `device` imports
-    /// where it offers and takes the import.
-    pub(crate) fn new(positioned: bool, arena_bytes: u64, device: Option<&Device>) -> Result<Self> {
+    /// where it offers and takes the import. `in_flight` is what mount reads share the
+    /// in-flight limit with streamed loads through.
+    pub(crate) fn new(
+        positioned: bool,
+        arena_bytes: u64,
+        device: Option<&Device>,
+        in_flight: Arc<InFlight>,
+    ) -> Result<Self> {
         let device = device.filter(|d| d.caps().host_memory_import);
         let align = device.map_or(SECTOR as u64, |d| d.caps().limits.host_import_align);
         let too_large = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
@@ -227,6 +261,7 @@ impl Loading {
             buffers,
             imported,
             staging_misses: AtomicU64::new(0),
+            in_flight,
         })
     }
 
@@ -367,6 +402,14 @@ impl Loading {
     pub(crate) fn send(&self, msg: Msg) {
         self.inbox.lock().unwrap().push_back(msg);
         self.wake.set();
+    }
+
+    /// Wakes the loading thread while mount reads wait, to start those the in-flight limit has
+    /// room for now.
+    pub(crate) fn wake_mounts(&self) {
+        if self.in_flight.mounts_waiting() {
+            self.wake.set();
+        }
     }
 
     pub(crate) fn push_batch(&self, batch: Batch) {
@@ -837,6 +880,8 @@ fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
     // Mount builds and finer cut builds each run one at a time, so a cut does not wait out a
     // mount's build.
     let (mut mounts, mut cuts) = (Lane::default(), Lane::default());
+    // Mount reads waiting for room in the in-flight limit, in the order they came.
+    let mut reads = VecDeque::new();
     loop {
         let msgs: Vec<Msg> = loading.inbox.lock().unwrap().drain(..).collect();
         let idle = msgs.is_empty();
@@ -844,6 +889,7 @@ fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
             match msg {
                 Msg::Stop => return,
                 Msg::Mount(task, source) => start(loading, ring.is_some(), task, source),
+                Msg::MountRead(bytes, read) => reads.push_back((bytes, read)),
                 Msg::Read(read) => match &mut ring {
                     Some(ring) => ring.push(read),
                     None => unreachable!("reads go to the ring only when there is one"),
@@ -865,6 +911,9 @@ fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
                 Msg::EditDone(task) => edit::finish(loading, device, &task),
             }
         }
+        loading
+            .in_flight
+            .start_mounts(&mut reads, |bytes, read| read.start(loading, bytes));
         mounts.advance();
         cuts.advance();
         if let Some(r) = &mut ring {
@@ -889,7 +938,7 @@ mod tests {
 
     #[test]
     fn a_result_job_finishes_with_no_workers_and_after_a_stop() {
-        let loading = Loading::new(true, 1 << 20, None).unwrap();
+        let loading = Loading::new(true, 1 << 20, None, Arc::new(InFlight::new(u64::MAX))).unwrap();
         loading.stop_workers();
         let first = loading.spawn_result(|| 1);
         let second = loading.spawn_result(|| 2);
@@ -906,7 +955,8 @@ mod tests {
 
     #[test]
     fn a_panicking_job_reports_it_and_leaves_its_worker_running() {
-        let loading = Arc::new(Loading::new(true, 1 << 20, None).unwrap());
+        let loading =
+            Arc::new(Loading::new(true, 1 << 20, None, Arc::new(InFlight::new(u64::MAX))).unwrap());
         let worker = {
             let l = Arc::clone(&loading);
             std::thread::spawn(move || l.run_worker())
@@ -923,7 +973,8 @@ mod tests {
 
     #[test]
     fn waiting_for_a_job_on_a_worker_returns_when_it_finishes() {
-        let loading = Arc::new(Loading::new(true, 1 << 20, None).unwrap());
+        let loading =
+            Arc::new(Loading::new(true, 1 << 20, None, Arc::new(InFlight::new(u64::MAX))).unwrap());
         let worker = {
             let l = Arc::clone(&loading);
             std::thread::spawn(move || l.run_worker())
@@ -943,7 +994,7 @@ mod tests {
 
     #[test]
     fn dropping_the_handle_cancels_a_queued_job() {
-        let loading = Loading::new(true, 1 << 20, None).unwrap();
+        let loading = Loading::new(true, 1 << 20, None, Arc::new(InFlight::new(u64::MAX))).unwrap();
         let ran = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&ran);
         drop(loading.spawn_result(move || flag.store(true, Ordering::Relaxed)));

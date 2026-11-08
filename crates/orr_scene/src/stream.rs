@@ -53,8 +53,8 @@ use crate::memory::{Block, Pool, PoolSlot};
 use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
 use crate::residency::{
-    HOLD_FRAMES, Held, Key, Limits, Plan, Priority, RequestSource, Residency, ResidencyClass,
-    ResidencyStats, UnitDesc,
+    HOLD_FRAMES, Held, InFlight, Key, Limits, Plan, Priority, RequestSource, Residency,
+    ResidencyClass, ResidencyStats, UnitDesc,
 };
 use crate::shaders::page_decode::PageDecodeRoot;
 use crate::tiles::{TexResidency, TexStream, TextureFeedback, compaction_move};
@@ -549,6 +549,11 @@ impl Streaming {
 
     pub(crate) fn stats(&self) -> &ResidencyStats {
         self.residency.stats()
+    }
+
+    /// What mount reads share the in-flight limit with streamed loads through.
+    pub(crate) fn in_flight(&self) -> &Arc<InFlight> {
+        self.residency.in_flight()
     }
 
     /// Mesh `mesh` of `mount`'s page `page` where it streams: its address and the cluster id
@@ -1423,6 +1428,8 @@ impl Streaming {
             };
             loading.send(Msg::Stream(Arc::new(task)));
         }
+        // Landings and the plan may have made room for mount reads.
+        loading.wake_mounts();
         Ok(points)
     }
 

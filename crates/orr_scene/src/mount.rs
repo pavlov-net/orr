@@ -37,7 +37,7 @@ use crate::edit::{
 };
 use crate::lights::GATHERED_CLUSTERS;
 use crate::loading::{
-    ArchiveFile, BlobSource, Loading, Msg, Queue, Resumable, decoded, read_stored,
+    ArchiveFile, BlobSource, Loading, Msg, Queue, Resumable, Ticket, decoded, read_stored,
 };
 use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler};
 use crate::medium_proxy::VolumeRef;
@@ -476,8 +476,30 @@ thread_local! {
     pub(crate) static PAGE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// A mount's read from its file, waiting on the loading thread for room in the in-flight
+/// limit.
+pub(crate) struct MountRead {
+    task: Arc<MountTask>,
+    read: Box<dyn FnOnce(Option<Ticket>) + Send>,
+}
+
+impl MountRead {
+    /// Starts the read, its `bytes` in flight until its placement has run; a read of a mount
+    /// canceled or failed meanwhile ends unread.
+    pub(crate) fn start(self, loading: &Arc<Loading>, bytes: u64) {
+        let ticket = Ticket::new(loading, bytes);
+        if self.task.live() {
+            (self.read)(Some(ticket));
+        } else {
+            drop((self.read, ticket));
+            self.task.end();
+        }
+    }
+}
+
 /// Reads and decodes blob `blob` of entry `entry`, then runs `then` on a worker with its
-/// decoded bytes.
+/// decoded bytes. A read from the file waits for room in the in-flight limit, which its
+/// stored bytes take until `then` has run.
 fn fetch(
     task: &Arc<MountTask>,
     entry: usize,
@@ -496,15 +518,29 @@ fn fetch(
     }
     task.begin();
     let t = Arc::clone(task);
-    read_stored(
-        &task.source(),
-        b,
-        None,
-        Queue::Mount,
-        Box::new(move |stored| {
-            t.step(|| decoded(t.archive(), &b, None, stored?, |bytes| then(&t, bytes)));
-        }),
-    );
+    let source = task.source();
+    let read = move |ticket: Option<Ticket>| {
+        read_stored(
+            &source,
+            b,
+            None,
+            Queue::Mount,
+            Box::new(move |stored| {
+                t.step(|| decoded(t.archive(), &b, None, stored?, |bytes| then(&t, bytes)));
+                drop(ticket);
+            }),
+        );
+    };
+    if archive.stored(&b, None).is_some() {
+        read(None);
+    } else if let Some(loading) = task.loading.upgrade() {
+        let bytes = u64::from(archive.stored_range(&b, None).len);
+        let read = MountRead {
+            task: Arc::clone(task),
+            read: Box::new(read),
+        };
+        loading.send(Msg::MountRead(bytes, read));
+    }
 }
 
 /// Starts a mount on the loading thread: the first reads of a file archive, or the parse of
