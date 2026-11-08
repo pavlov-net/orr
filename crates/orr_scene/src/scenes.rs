@@ -1872,7 +1872,7 @@ impl<'a> Frame<'a> {
                 merge_pixels: core.rt_merge_pixels,
                 slots: cpu.ptlas.high_water,
                 passes: hierarchy.depth,
-                paged: hierarchy.paged,
+                streamed: hierarchy.streamed,
                 max_clas: hierarchy.max_clusters,
                 parted_edits: core.mounts.has_parted_edit(),
                 slot: (self.id % u64::from(core.fif)) as usize,

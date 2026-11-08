@@ -226,8 +226,9 @@ pub(crate) struct CutInputs {
     pub(crate) slots: u32,
     /// Passes of one traversal: the deepest resident hierarchy's levels.
     pub(crate) passes: u32,
-    /// A resident mesh has a paged hierarchy: the second traversal runs.
-    pub(crate) paged: bool,
+    /// A resident mesh pages its hierarchy or streams its cluster pages: the second traversal
+    /// runs for the cuts a page that is not resident stopped.
+    pub(crate) streamed: bool,
     /// CLAS in the largest cut a mesh can trace.
     pub(crate) max_clas: u32,
     /// A copy of an edit may gather one BLAS per animated part.
@@ -440,7 +441,7 @@ impl Cuts {
         };
         if passes > 0 {
             run(list, 0)?;
-            if f.paged {
+            if f.streamed {
                 list.dispatch(p.get(k.retry), root(passes)?, groups(f.slots));
                 step(list);
                 run(list, passes)?;

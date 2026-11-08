@@ -787,8 +787,8 @@ void finish(uint3 id: SV_DispatchThreadID)
     cut.counters[CUT_QUEUE + 1] = 0;
 }
 
-// The second traversal's roots: every cut a non-resident node stopped, at its scaled errors.
-// Its raster candidates replace the first's for both steps of a fading copy.
+// The second traversal's roots: every cut a node or page not resident stopped, at its scaled
+// errors. Its raster candidates replace the first's for both steps of a fading copy.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void retry(uint3 id: SV_DispatchThreadID)

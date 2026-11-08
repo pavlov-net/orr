@@ -1985,8 +1985,9 @@ pub(crate) struct Resident {
     meshes: Vec<u32>,
     /// Per mesh of `meshes`: what its section-mask BLAS build from.
     rt: Vec<MeshRt>,
-    /// Per mesh of `meshes`: the levels of its hierarchy (None when paged) and its clusters.
-    hierarchy: Vec<(Option<u32>, u32)>,
+    /// Per mesh of `meshes`: the levels of its hierarchy (None when paged), whether its
+    /// cluster pages stream, and its clusters.
+    hierarchy: Vec<(Option<u32>, bool, u32)>,
     /// Per mesh of `meshes`: what an edit starts from.
     edit_sources: Vec<EditMesh>,
     /// The record of each model.
@@ -2091,8 +2092,9 @@ fn record_page_copies(
 pub(crate) struct Hierarchy {
     /// Levels of the deepest hierarchy; paged ones count as `PAGED_DEPTH`.
     pub(crate) depth: u32,
-    /// Some resident mesh has a paged hierarchy.
-    pub(crate) paged: bool,
+    /// Some resident mesh pages its hierarchy or streams its cluster pages, so a cut can stop
+    /// at a page that is not resident.
+    pub(crate) streamed: bool,
     /// Clusters of the largest resident mesh.
     pub(crate) max_clusters: u32,
 }
@@ -3085,9 +3087,9 @@ impl Mounts {
         let mut h = Hierarchy::default();
         for e in self.entries.iter().flatten() {
             let Entry::Ready(r) = e else { continue };
-            for &(depth, clusters) in &r.hierarchy {
+            for &(depth, streamed, clusters) in &r.hierarchy {
                 h.depth = h.depth.max(depth.unwrap_or(PAGED_DEPTH));
-                h.paged |= depth.is_none();
+                h.streamed |= depth.is_none() || streamed;
                 h.max_clusters = h.max_clusters.max(clusters);
             }
         }
@@ -3455,7 +3457,8 @@ impl Mounts {
                 &m.refs,
             )?;
             res.rt.push(m.rt.clone());
-            res.hierarchy.push((m.depth, m.gpu.cluster_count));
+            res.hierarchy
+                .push((m.depth, m.streamed.is_some(), m.gpu.cluster_count));
             res.edit_sources.push(EditMesh {
                 gpu,
                 addresses: m.page_addresses.clone(),
