@@ -799,7 +799,10 @@ impl Scene {
         if let Some(i) = cpu.pages.iter().position(|p| p.range == range) {
             let p = cpu.pages.swap_remove(i);
             self.clear_group(cpu, frame, p.group, seq);
-            entries.push((p.first_entry, page_entries(&p.entries)));
+            let n = page_entries(&p.entries);
+            if n > 0 {
+                entries.push((p.first_entry, n));
+            }
             cpu.pages_removed.push((frame, p));
         }
         if let Some(i) = cpu.page_motions.iter().position(|m| m.range == range) {
