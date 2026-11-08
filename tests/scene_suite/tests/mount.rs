@@ -2671,6 +2671,7 @@ fn stream_sheets(dev: &Device) {
 /// size of what one step of 1,024 streamed loads lands.
 #[test]
 fn the_clas_pool_allocator_places_like_a_first_fit_reference() {
+    let _serial = serial();
     first_fit_rounds(12, 96, 40);
     first_fit_rounds(1000, 512, 20);
     first_fit_rounds(98_304, 40_000, 3);
