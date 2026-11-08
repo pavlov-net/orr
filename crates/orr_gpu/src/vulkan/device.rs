@@ -468,7 +468,7 @@ impl Device {
             ),
             driver_version: props.driver_version,
             rebar,
-            staging_device_local: !desc.force_staging && memory.device_local(MemoryKind::Staging),
+            staging_device_local: !desc.force_staging && memory.unified(),
             ray_dispatch: optional.ray_dispatch,
             lss: optional.lss,
             reorder: optional.ray_dispatch

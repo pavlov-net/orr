@@ -74,10 +74,13 @@ impl MemoryTypes {
         self.properties.memory_types[self.of(kind) as usize].heap_index as usize
     }
 
-    pub(super) fn device_local(&self, kind: MemoryKind) -> bool {
-        self.properties.memory_types[self.of(kind) as usize]
-            .property_flags
-            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    /// Whether every heap is device-local: the host has no memory apart from the GPU's, as
+    /// on unified memory, so every kind's memory is on a device-local heap.
+    pub(super) fn unified(&self) -> bool {
+        let p = &self.properties;
+        p.memory_heaps[..p.memory_heap_count as usize]
+            .iter()
+            .all(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
     }
 
     fn host_visible(&self, kind: MemoryKind) -> bool {
