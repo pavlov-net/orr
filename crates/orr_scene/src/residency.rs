@@ -970,6 +970,10 @@ impl Residency {
             next[lane] += 1;
             match self.unit(k).map(|u| u.state) {
                 Some(State::Absent) => {}
+                Some(State::Loading) if !started.contains(&k) => {
+                    waiting += 1;
+                    continue;
+                }
                 _ => continue,
             }
             let chain = match self.closure(k, &started) {
@@ -1499,9 +1503,14 @@ mod tests {
         .unwrap();
         r.request(key(0), P, S);
         assert_eq!(r.plan(1, []).loads, [key(0)]);
+        r.request(key(0), P, S);
         r.request(key(1), P, S);
         assert_eq!(r.plan(2, []).loads, []);
-        assert_eq!((r.stats().waiting, r.stats().dropped), (1, [0; SOURCES]));
+        assert_eq!(
+            (r.stats().waiting, r.stats().dropped),
+            (2, [0; SOURCES]),
+            "0 itself and 1 on it"
+        );
         r.landed(key(0), true, 2);
         r.request(key(1), P, S);
         assert_eq!(r.plan(3, []).loads, [key(1)]);
