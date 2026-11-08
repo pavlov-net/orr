@@ -5,19 +5,23 @@ use std::mem::MaybeUninit;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
+use std::ptr::NonNull;
+use std::sync::Arc;
 
 use crate::SECTOR;
-use crate::native::InFlight;
+use crate::buffers::Pool;
+use crate::native::{InFlight, OpenFile};
 
 mod bindings;
 mod ioring;
 use bindings::*;
 use ioring::{
-    BuildIoRingReadFile, CloseIoRing, CreateIoRing, HIORING, IORING_BUFFER_REF,
-    IORING_BUFFER_REF_0, IORING_CQE, IORING_CREATE_ADVISORY_FLAGS_NONE, IORING_CREATE_FLAGS,
-    IORING_CREATE_REQUIRED_FLAGS_NONE, IORING_HANDLE_REF, IORING_HANDLE_REF_0, IORING_REF_RAW,
-    IORING_VERSION_3, IOSQE_FLAGS_NONE, PopIoRingCompletion, SetIoRingCompletionEvent,
-    SubmitIoRing,
+    BuildIoRingReadFile, BuildIoRingRegisterBuffers, BuildIoRingRegisterFileHandles, CloseIoRing,
+    CreateIoRing, HIORING, IORING_BUFFER_INFO, IORING_BUFFER_REF, IORING_BUFFER_REF_0, IORING_CQE,
+    IORING_CREATE_ADVISORY_FLAGS_NONE, IORING_CREATE_FLAGS, IORING_CREATE_REQUIRED_FLAGS_NONE,
+    IORING_HANDLE_REF, IORING_HANDLE_REF_0, IORING_REF_RAW, IORING_REF_REGISTERED,
+    IORING_REGISTERED_BUFFER, IORING_VERSION_3, IOSQE_FLAGS_NONE, PopIoRingCompletion,
+    SetIoRingCompletionEvent, SubmitIoRing,
 };
 
 fn open(path: &Path, flags: u32) -> io::Result<File> {
@@ -185,6 +189,7 @@ type Proc = unsafe extern "system" fn() -> isize;
 
 struct Fns {
     build_read: BuildIoRingReadFile,
+    register_files: BuildIoRingRegisterFileHandles,
     submit: SubmitIoRing,
     pop: PopIoRingCompletion,
     close: CloseIoRing,
@@ -200,76 +205,195 @@ fn ring_library() -> Option<HMODULE> {
     (!lib.is_null()).then_some(lib)
 }
 
-/// One IoRing with raw handle and buffer references.
+/// The user data of registrations, which no read slot takes.
+const REGISTRATION: usize = usize::MAX;
+
+/// Pages for read buffers.
+pub(crate) fn alloc_pages(len: usize) -> io::Result<NonNull<u8>> {
+    // SAFETY: a new private allocation, which aliases nothing.
+    let p = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            len,
+            (MEM_RESERVE | MEM_COMMIT) as u32,
+            PAGE_READWRITE as u32,
+        )
+    };
+    NonNull::new(p.cast()).ok_or_else(io::Error::last_os_error)
+}
+
+/// Frees what [`alloc_pages`] returned.
+pub(crate) fn free_pages(p: NonNull<u8>) {
+    // SAFETY: `p` is an allocation of `alloc_pages`, freed once.
+    unsafe { VirtualFree(p.as_ptr().cast(), 0, MEM_RELEASE as u32) };
+}
+
+/// One IoRing with the pool's buffers registered, and the files of its reads.
 pub(crate) struct OsRing {
     fns: Fns,
     ring: HIORING,
-    event: Event,
+    event: Arc<Event>,
     /// Entries are built that no submit has taken.
     unsubmitted: bool,
+    /// Whether reads name their files by their entry in the registered handles, which they
+    /// do until a registration fails.
+    files: bool,
+    /// Handles of registrations no submit has taken, which the system reads when it does.
+    pending: Vec<Box<[HANDLE]>>,
 }
 
 // SAFETY: the ring is used only by the thread that owns it.
 unsafe impl Send for OsRing {}
 
 impl OsRing {
-    pub(crate) fn new() -> Option<Self> {
+    pub(crate) fn new(pool: &Pool) -> Option<Self> {
         // SAFETY: loading a system library and looking up exports by their documented
         // names and signatures.
-        unsafe {
+        let (create, set_event, register_buffers, fns) = unsafe {
             let lib = ring_library()?;
             let get = |name: &CStr| GetProcAddress(lib, name.as_ptr().cast());
-            let create = std::mem::transmute::<Proc, CreateIoRing>(get(c"CreateIoRing")?);
-            let set_event = std::mem::transmute::<Proc, SetIoRingCompletionEvent>(get(
-                c"SetIoRingCompletionEvent",
-            )?);
-            let fns = Fns {
-                build_read: std::mem::transmute::<Proc, BuildIoRingReadFile>(get(
-                    c"BuildIoRingReadFile",
+            (
+                std::mem::transmute::<Proc, CreateIoRing>(get(c"CreateIoRing")?),
+                std::mem::transmute::<Proc, SetIoRingCompletionEvent>(get(
+                    c"SetIoRingCompletionEvent",
                 )?),
-                submit: std::mem::transmute::<Proc, SubmitIoRing>(get(c"SubmitIoRing")?),
-                pop: std::mem::transmute::<Proc, PopIoRingCompletion>(get(c"PopIoRingCompletion")?),
-                close: std::mem::transmute::<Proc, CloseIoRing>(get(c"CloseIoRing")?),
-            };
-            let flags = IORING_CREATE_FLAGS {
-                Required: IORING_CREATE_REQUIRED_FLAGS_NONE,
-                Advisory: IORING_CREATE_ADVISORY_FLAGS_NONE,
-            };
-            let mut ring = std::ptr::null_mut();
-            create(IORING_VERSION_3, flags, 256, 512, &mut ring)
-                .ok()
-                .ok()?;
-            let event = Event::new();
-            if set_event(ring, event.0).is_err() {
-                let _ = (fns.close)(ring);
-                return None;
-            }
-            Some(Self {
-                fns,
-                ring,
-                event,
-                unsubmitted: false,
+                std::mem::transmute::<Proc, BuildIoRingRegisterBuffers>(get(
+                    c"BuildIoRingRegisterBuffers",
+                )?),
+                Fns {
+                    build_read: std::mem::transmute::<Proc, BuildIoRingReadFile>(get(
+                        c"BuildIoRingReadFile",
+                    )?),
+                    register_files: std::mem::transmute::<Proc, BuildIoRingRegisterFileHandles>(
+                        get(c"BuildIoRingRegisterFileHandles")?,
+                    ),
+                    submit: std::mem::transmute::<Proc, SubmitIoRing>(get(c"SubmitIoRing")?),
+                    pop: std::mem::transmute::<Proc, PopIoRingCompletion>(get(
+                        c"PopIoRingCompletion",
+                    )?),
+                    close: std::mem::transmute::<Proc, CloseIoRing>(get(c"CloseIoRing")?),
+                },
+            )
+        };
+        let flags = IORING_CREATE_FLAGS {
+            Required: IORING_CREATE_REQUIRED_FLAGS_NONE,
+            Advisory: IORING_CREATE_ADVISORY_FLAGS_NONE,
+        };
+        let mut ring = std::ptr::null_mut();
+        // SAFETY: plain ring creation into `ring`.
+        unsafe { create(IORING_VERSION_3, flags, 256, 512, &mut ring) }
+            .ok()
+            .ok()?;
+        let ring = Self {
+            fns,
+            ring,
+            event: Arc::new(Event::new()),
+            unsubmitted: false,
+            files: true,
+            pending: Vec::new(),
+        };
+        // SAFETY: the ring and the event are live.
+        unsafe { set_event(ring.ring, ring.event.0) }.ok().ok()?;
+        let buffers: Vec<IORING_BUFFER_INFO> = pool
+            .buffers()
+            .map(|(address, len)| IORING_BUFFER_INFO {
+                Address: address.cast(),
+                Length: len as u32,
             })
+            .collect();
+        // SAFETY: the buffers stay mapped while the ring lives, as its owner holds the pool;
+        // the array outlives the submit below, which takes it.
+        unsafe {
+            register_buffers(
+                ring.ring,
+                buffers.len() as u32,
+                buffers.as_ptr(),
+                REGISTRATION,
+            )
         }
+        .ok()
+        .ok()?;
+        let mut submitted = 0;
+        // SAFETY: the ring is live; waits for the registration.
+        unsafe { (ring.fns.submit)(ring.ring, 1, INFINITE, &mut submitted) }
+            .ok()
+            .ok()?;
+        let mut cqe = IORING_CQE::default();
+        // SAFETY: the ring is live; `cqe` is written on S_OK.
+        let popped = unsafe { (ring.fns.pop)(ring.ring, &mut cqe) }.0 == S_OK;
+        (popped && cqe.UserData == REGISTRATION && cqe.ResultCode.is_ok()).then_some(ring)
     }
 
-    pub(crate) fn event(&self) -> &Event {
+    pub(crate) fn event(&self) -> &Arc<Event> {
         &self.event
     }
 
-    /// Builds the next chunk of `f`, which goes in `slot`, into the ring.
-    pub(crate) fn start(&mut self, slot: usize, f: &mut InFlight) -> io::Result<()> {
-        let (address, len) = f.chunk();
-        let file = IORING_HANDLE_REF {
-            Kind: IORING_REF_RAW,
-            Handle: IORING_HANDLE_REF_0 {
-                Handle: f.read.file.handle.as_raw_handle(),
-            },
+    /// Registers the handles of `files` at their entries, replacing those registered before,
+    /// and submits the registration ahead of the reads built next. The system holds a file's
+    /// object while its handle is registered.
+    pub(crate) fn set_files(&mut self, files: &[Option<OpenFile>]) {
+        if !self.files {
+            return;
+        }
+        // Entries without a file are null, which the system takes as unused.
+        let handles: Box<[HANDLE]> = files
+            .iter()
+            .map(|f| {
+                f.as_ref()
+                    .map_or(std::ptr::null_mut(), |f| f.file.handle.as_raw_handle())
+            })
+            .collect();
+        // SAFETY: the array stays in `pending` until a submit takes it.
+        let built = unsafe {
+            (self.fns.register_files)(
+                self.ring,
+                handles.len() as u32,
+                handles.as_ptr(),
+                REGISTRATION,
+            )
         };
-        let data = IORING_BUFFER_REF {
-            Kind: IORING_REF_RAW,
-            Buffer: IORING_BUFFER_REF_0 {
-                Address: address.cast::<c_void>(),
+        if built.is_err() {
+            self.files = false;
+            return;
+        }
+        self.pending.push(handles);
+        self.unsubmitted = true;
+        self.submit();
+    }
+
+    /// Builds the next chunk of `f`, which goes in `slot`, into the ring.
+    pub(crate) fn start(&mut self, slot: usize, f: &mut InFlight, pool: &Pool) -> io::Result<()> {
+        let (address, len) = f.chunk();
+        let file = if self.files {
+            IORING_HANDLE_REF {
+                Kind: IORING_REF_REGISTERED,
+                Handle: IORING_HANDLE_REF_0 {
+                    Index: f.file as u32,
+                },
+            }
+        } else {
+            IORING_HANDLE_REF {
+                Kind: IORING_REF_RAW,
+                Handle: IORING_HANDLE_REF_0 {
+                    Handle: f.read.file.handle.as_raw_handle(),
+                },
+            }
+        };
+        let data = match pool.index(address) {
+            Some((index, offset)) => IORING_BUFFER_REF {
+                Kind: IORING_REF_REGISTERED,
+                Buffer: IORING_BUFFER_REF_0 {
+                    IndexAndOffset: IORING_REGISTERED_BUFFER {
+                        BufferIndex: index,
+                        Offset: offset,
+                    },
+                },
+            },
+            None => IORING_BUFFER_REF {
+                Kind: IORING_REF_RAW,
+                Buffer: IORING_BUFFER_REF_0 {
+                    Address: address.cast::<c_void>(),
+                },
             },
         };
         // SAFETY: the handle and the buffer stay alive in the slot until the completion is
@@ -293,6 +417,8 @@ impl OsRing {
             self.unsubmitted = h.is_err();
             if self.unsubmitted {
                 self.event.set();
+            } else {
+                self.pending.clear();
             }
         }
     }
@@ -305,18 +431,27 @@ impl OsRing {
         h.0 != IORING_E_CORRUPT
     }
 
-    /// The next completion: its slot and the bytes read, none at or past the end of the file.
+    /// The next read's completion: its slot and the bytes read, none at or past the end of
+    /// the file. After a failed file registration, reads name their files by handle.
     pub(crate) fn pop(&mut self) -> Option<(usize, io::Result<usize>)> {
-        let mut cqe = IORING_CQE::default();
-        // SAFETY: the ring is live; `cqe` is written on S_OK.
-        if unsafe { (self.fns.pop)(self.ring, &mut cqe) }.0 != S_OK {
-            return None;
+        loop {
+            let mut cqe = IORING_CQE::default();
+            // SAFETY: the ring is live; `cqe` is written on S_OK.
+            if unsafe { (self.fns.pop)(self.ring, &mut cqe) }.0 != S_OK {
+                return None;
+            }
+            if cqe.UserData == REGISTRATION {
+                if cqe.ResultCode.is_err() {
+                    self.files = false;
+                }
+                continue;
+            }
+            let n = match cqe.ResultCode.ok() {
+                Ok(()) => Ok(cqe.Information),
+                Err(e) => read_error(e.into()),
+            };
+            return Some((cqe.UserData, n));
         }
-        let n = match cqe.ResultCode.ok() {
-            Ok(()) => Ok(cqe.Information),
-            Err(e) => read_error(e.into()),
-        };
-        Some((cqe.UserData, n))
     }
 }
 
@@ -350,7 +485,8 @@ mod tests {
     #[test]
     fn a_system_offering_the_ring_makes_one() {
         if ring_version().is_some_and(|version| version >= IORING_VERSION_3) {
-            assert!(OsRing::new().is_some());
+            let buffers = crate::ReadBuffers::new(&[SECTOR], 2).unwrap();
+            assert!(OsRing::new(&buffers.0).is_some());
         }
     }
 }

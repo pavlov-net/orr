@@ -5,17 +5,16 @@
 //! and where the system refuses them, [`Ring::positioned`] runs the same reads as positioned
 //! reads.
 
-use std::alloc::{AllocError, Allocator, Global, Layout};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
 use std::path::Path;
-use std::ptr::NonNull;
 use std::sync::Arc;
 #[cfg(not(any(windows, target_os = "linux")))]
 use std::sync::{Condvar, Mutex};
 
+mod buffers;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(any(windows, target_os = "linux"))]
@@ -28,48 +27,41 @@ use crate::linux as sys;
 #[cfg(windows)]
 use crate::windows as sys;
 
+use crate::buffers::ReadAlloc;
+pub use crate::buffers::ReadBuffers;
+
 /// Alignment and size granule of unbuffered reads. A [`ReadFile`] on a volume whose sectors do
 /// not divide it is buffered.
 pub const SECTOR: usize = 4096;
 
+/// Reads a [`Ring`] keeps in flight at once; 64 reach a fast NVMe drive's rate. With this
+/// many [`ReadBuffers`] of each size, a ring's reads wait for a buffer only while those the
+/// reads before them filled are still held.
+pub const RING_DEPTH: usize = 64;
+
 /// The most bytes one read asks the system for, which is under every platform's limit.
 const CHUNK: usize = 1 << 30;
-
-/// The global allocator with every block aligned to [`SECTOR`].
-struct Sector;
-
-fn sector_layout(layout: Layout) -> Result<Layout, AllocError> {
-    layout.align_to(SECTOR).map_err(|_| AllocError)
-}
-
-// SAFETY: every call forwards to `Global` with the request's layout raised the same way, so
-// `Global` sees each block with one layout.
-unsafe impl Allocator for Sector {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        Global.allocate(sector_layout(layout)?)
-    }
-
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        let layout = sector_layout(layout).expect("raised when allocated");
-        // SAFETY: `Global` allocated `ptr` with this layout.
-        unsafe { Global.deallocate(ptr, layout) }
-    }
-}
 
 /// A read buffer at a [`SECTOR`] boundary, a whole number of sectors long. Reads write its
 /// uninitialized spare capacity and record what they wrote with [`AlignedBuf::set_filled`];
 /// only those filled bytes can be read.
 // A `Vec` rather than a `Box`: the ring moves the buffer while the system writes through a
 // pointer into it, which a `Box`'s uniqueness forbids.
-pub struct AlignedBuf(Vec<u8, Sector>);
+pub struct AlignedBuf(Vec<u8, ReadAlloc>);
 
 impl AlignedBuf {
-    /// An empty buffer with room for at least `len` bytes (at least one sector).
+    /// An empty buffer with room for at least `len` bytes (at least one sector), of its own
+    /// memory. [`ReadBuffers`] hands out buffers it keeps.
     pub fn new(len: usize) -> Self {
         Self(Vec::with_capacity_in(
-            len.max(1).next_multiple_of(SECTOR),
-            Sector,
+            Self::capacity_for(len),
+            ReadAlloc(None),
         ))
+    }
+
+    /// The capacity of a buffer for `len` bytes.
+    pub(crate) fn capacity_for(len: usize) -> usize {
+        len.max(1).next_multiple_of(SECTOR)
     }
 
     /// The bytes it holds, a multiple of [`SECTOR`].
@@ -309,25 +301,30 @@ pub struct Ring {
 enum Backend {
     #[cfg(any(windows, target_os = "linux"))]
     Native(Box<native::Native>),
-    Positioned(VecDeque<Read>),
+    Positioned(VecDeque<Read>, ReadBuffers),
 }
 
 impl Ring {
     /// A ring backed by the operating system's completion ring, or `None` where it is
-    /// missing or refused, as on old Linux kernels or where seccomp blocks io_uring.
-    pub fn native() -> Option<Self> {
+    /// missing or refused, as on old Linux kernels or where seccomp blocks io_uring. Reads go
+    /// into `buffers`, which it registers with the system where it can; a read waits in the
+    /// queue while every buffer of its size is out.
+    pub fn native(buffers: &ReadBuffers) -> Option<Self> {
         #[cfg(any(windows, target_os = "linux"))]
-        let backend = native::Native::new().map(|r| Backend::Native(Box::new(r)));
+        let backend = native::Native::new(buffers).map(|r| Backend::Native(Box::new(r)));
         #[cfg(not(any(windows, target_os = "linux")))]
-        let backend = None;
+        let backend = {
+            let _ = buffers;
+            None
+        };
         backend.map(|backend| Self { backend })
     }
 
-    /// A ring that runs each read as a positioned read on the thread calling
-    /// [`Ring::pump`].
-    pub fn positioned() -> Self {
+    /// A ring that runs each read as a positioned read into `buffers` on the thread calling
+    /// [`Ring::pump`], which blocks while every buffer of the read's size is out.
+    pub fn positioned(buffers: &ReadBuffers) -> Self {
         Self {
-            backend: Backend::Positioned(VecDeque::new()),
+            backend: Backend::Positioned(VecDeque::new(), buffers.clone()),
         }
     }
 
@@ -336,7 +333,7 @@ impl Ring {
         match &mut self.backend {
             #[cfg(any(windows, target_os = "linux"))]
             Backend::Native(r) => r.push(read),
-            Backend::Positioned(queued) => queued.push_back(read),
+            Backend::Positioned(queued, _) => queued.push_back(read),
         }
     }
 
@@ -345,9 +342,9 @@ impl Ring {
         match &mut self.backend {
             #[cfg(any(windows, target_os = "linux"))]
             Backend::Native(r) => r.pump(),
-            Backend::Positioned(queued) => {
+            Backend::Positioned(queued, buffers) => {
                 while let Some(read) = queued.pop_front() {
-                    let mut buf = AlignedBuf::new(read.len);
+                    let mut buf = buffers.take(read.len);
                     let result = read.file.read(read.offset, &mut buf).map(|()| {
                         buf.truncate(read.len);
                         buf
@@ -363,7 +360,7 @@ impl Ring {
         match &self.backend {
             #[cfg(any(windows, target_os = "linux"))]
             Backend::Native(r) => r.busy(),
-            Backend::Positioned(queued) => !queued.is_empty(),
+            Backend::Positioned(queued, _) => !queued.is_empty(),
         }
     }
 }
@@ -402,14 +399,15 @@ impl Wake {
         }
     }
 
-    /// Blocks until [`Wake::set`] is called or `ring` has a completion to pump. Returns at
-    /// once while a positioned ring has queued reads, and may return early otherwise.
+    /// Blocks until [`Wake::set`] is called, or `ring` has a completion to pump or a buffer
+    /// back for a read it holds. Returns at once while a positioned ring has queued reads, and
+    /// may return early otherwise.
     pub fn wait(&self, ring: Option<&Ring>) {
         let ring = ring.filter(|r| r.busy());
         #[cfg(any(windows, target_os = "linux"))]
         match ring.map(|r| &r.backend) {
-            Some(Backend::Native(r)) => sys::wait_any(&[&self.event, r.ring.event()]),
-            Some(Backend::Positioned(_)) => {}
+            Some(Backend::Native(r)) => sys::wait_any(&[&self.event, &**r.ring.event()]),
+            Some(Backend::Positioned(..)) => {}
             None => sys::wait_any(&[&self.event]),
         }
         #[cfg(not(any(windows, target_os = "linux")))]

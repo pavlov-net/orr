@@ -438,7 +438,7 @@ impl Scenes {
             max_anisotropy: 16.0,
             ..SamplerDesc::default()
         })?;
-        let loading = Arc::new(Loading::new(desc.positioned_reads));
+        let loading = Arc::new(Loading::new(desc.positioned_reads)?);
         let thread = {
             let (l, d) = (Arc::clone(&loading), device.clone());
             std::thread::Builder::new()

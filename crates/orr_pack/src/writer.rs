@@ -232,7 +232,8 @@ pub enum Target {
     Memory,
 }
 
-const DEFAULT_CHUNK: u32 = 256 << 10;
+/// Decoded length of the chunks of a payload blob over it whose [`BlobIn::chunk_len`] is 0.
+pub const DEFAULT_CHUNK: u32 = 256 << 10;
 
 enum Payload {
     Memory(Vec<u8>),

@@ -19,6 +19,18 @@ pub type BuildIoRingReadFile = unsafe extern "system" fn(
     userdata: usize,
     sqeflags: IORING_SQE_FLAGS,
 ) -> windows_result::HRESULT;
+pub type BuildIoRingRegisterBuffers = unsafe extern "system" fn(
+    ioring: HIORING,
+    count: u32,
+    buffers: *const IORING_BUFFER_INFO,
+    userdata: usize,
+) -> windows_result::HRESULT;
+pub type BuildIoRingRegisterFileHandles = unsafe extern "system" fn(
+    ioring: HIORING,
+    count: u32,
+    handles: *const HANDLE,
+    userdata: usize,
+) -> windows_result::HRESULT;
 pub type CloseIoRing = unsafe extern "system" fn(ioring: HIORING) -> windows_result::HRESULT;
 pub type CreateIoRing = unsafe extern "system" fn(
     ioringversion: IORING_VERSION,
@@ -41,6 +53,17 @@ pub type SubmitIoRing = unsafe extern "system" fn(
 ) -> windows_result::HRESULT;
 pub type HANDLE = *mut core::ffi::c_void;
 pub type HIORING = *mut core::ffi::c_void;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IORING_BUFFER_INFO {
+    pub Address: *mut core::ffi::c_void,
+    pub Length: u32,
+}
+impl Default for IORING_BUFFER_INFO {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IORING_BUFFER_REF {
@@ -113,6 +136,7 @@ impl Default for IORING_HANDLE_REF_0 {
 }
 pub type IORING_REF_KIND = i32;
 pub const IORING_REF_RAW: IORING_REF_KIND = 0i32;
+pub const IORING_REF_REGISTERED: IORING_REF_KIND = 1i32;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct IORING_REGISTERED_BUFFER {

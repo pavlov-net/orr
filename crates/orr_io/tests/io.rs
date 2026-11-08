@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use orr_io::{AlignedBuf, Read, ReadFile, Ring, SECTOR, Wake, open_shared, read_at};
+use orr_io::{
+    AlignedBuf, RING_DEPTH, Read, ReadBuffers, ReadFile, Ring, SECTOR, Wake, open_shared, read_at,
+};
 
 fn path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -20,6 +22,11 @@ fn bytes(len: usize) -> Vec<u8> {
             x as u8
         })
         .collect()
+}
+
+/// Buffers of one and two sectors: longer reads take memory of their own.
+fn buffers() -> ReadBuffers {
+    ReadBuffers::new(&[SECTOR, 2 * SECTOR], RING_DEPTH).unwrap()
 }
 
 type Results = Arc<Mutex<Vec<Option<Vec<u8>>>>>;
@@ -89,8 +96,9 @@ fn ring_matches_positioned_reads() {
             })
             .collect();
 
-        let mut rings = vec![("positioned", Ring::positioned())];
-        match Ring::native() {
+        let buffers = buffers();
+        let mut rings = vec![("positioned", Ring::positioned(&buffers))];
+        match Ring::native(&buffers) {
             Some(r) => rings.push(("native", r)),
             #[allow(clippy::print_stderr)]
             None => eprintln!("skipping the native ring: the system has none"),
@@ -105,11 +113,84 @@ fn ring_matches_positioned_reads() {
 }
 
 #[test]
+fn a_ring_reads_on_as_buffers_held_on_another_thread_come_back() {
+    // Two files, so the ring's file registrations change between and within bursts.
+    let a = bytes(8 * SECTOR);
+    let b: Vec<u8> = a.iter().rev().copied().collect();
+    let files: Vec<(Arc<ReadFile>, Vec<u8>)> = [("held-a.bin", a), ("held-b.bin", b)]
+        .into_iter()
+        .map(|(name, data)| {
+            let p = path(name);
+            fs::write(&p, &data).unwrap();
+            (Arc::new(ReadFile::open(&p).unwrap()), data)
+        })
+        .collect();
+    // Two buffers for sixteen reads a burst: most reads wait for one to come back.
+    let Some(mut ring) = Ring::native(&ReadBuffers::new(&[SECTOR], 2).unwrap()) else {
+        return;
+    };
+    let (held, holder) = std::sync::mpsc::channel::<AlignedBuf>();
+    let holder = std::thread::spawn(move || {
+        for buf in holder {
+            std::thread::sleep(Duration::from_millis(2));
+            drop(buf);
+        }
+    });
+    let wrong = Arc::new(Mutex::new(Vec::new()));
+    let wake = Wake::default();
+    let finished = AtomicBool::new(false);
+    let limit = Duration::from_secs(10);
+    let start = Instant::now();
+    std::thread::scope(|s| {
+        // Ends a wait that nothing else would, so that a stuck ring fails the test.
+        s.spawn(|| {
+            while !finished.load(Ordering::Relaxed) && start.elapsed() < limit {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            wake.set();
+        });
+        for burst in 0..6 {
+            for i in 0..16 {
+                let f = if burst < 4 { burst % 2 } else { i % 2 };
+                let (file, data) = &files[f];
+                let offset = i % 8 * SECTOR;
+                let want = data[offset..offset + SECTOR].to_vec();
+                let (held, wrong) = (held.clone(), Arc::clone(&wrong));
+                ring.push(Read {
+                    file: Arc::clone(file),
+                    offset: offset as u64,
+                    len: SECTOR,
+                    done: Box::new(move |r| {
+                        let buf = r.expect("ring read");
+                        if buf.as_slice() != want {
+                            wrong.lock().unwrap().push((burst, i));
+                        }
+                        held.send(buf).unwrap();
+                    }),
+                });
+            }
+            loop {
+                ring.pump();
+                if !ring.busy() {
+                    break;
+                }
+                wake.wait(Some(&ring));
+                assert!(start.elapsed() < limit, "the ring stopped reading");
+            }
+        }
+        finished.store(true, Ordering::Relaxed);
+    });
+    drop(held);
+    holder.join().unwrap();
+    assert_eq!(*wrong.lock().unwrap(), []);
+}
+
+#[test]
 fn ring_finishes_when_every_read_completes_before_the_wait() {
     let p = path("drain.bin");
     fs::write(&p, bytes(SECTOR)).unwrap();
     let file = Arc::new(ReadFile::open(&p).unwrap());
-    let Some(mut ring) = Ring::native() else {
+    let Some(mut ring) = Ring::native(&buffers()) else {
         return;
     };
     // More reads than the ring keeps in flight.
@@ -211,7 +292,8 @@ fn open_file_can_be_replaced_by_rename() {
     let mut sector = AlignedBuf::new(SECTOR);
     file.read(0, &mut sector).unwrap();
     assert_eq!(sector.as_slice(), b"old contents");
-    for ring in [Some(Ring::positioned()), Ring::native()]
+    let buffers = buffers();
+    for ring in [Some(Ring::positioned(&buffers)), Ring::native(&buffers)]
         .into_iter()
         .flatten()
     {

@@ -1,13 +1,15 @@
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use io_uring::{IoUring, Probe, opcode, types};
 
 use crate::SECTOR;
-use crate::native::{DEPTH, InFlight};
+use crate::buffers::Pool;
+use crate::native::{DEPTH, InFlight, OpenFile};
 
 /// Opens with `O_DIRECT`, or buffered where the file system refuses it or needs an alignment
 /// that [`SECTOR`] does not meet. Returns the file and whether it is unbuffered.
@@ -93,38 +95,112 @@ pub(crate) fn wait_any(events: &[&Event]) {
     }
 }
 
-/// One io_uring with an eventfd for completions.
+/// One io_uring with an eventfd for completions, the pool's buffers registered where the
+/// memory lock limit allows, and the files of its reads registered.
 pub(crate) struct OsRing {
     ring: IoUring,
-    event: Event,
+    event: Arc<Event>,
+    /// Whether the pool's buffers are registered.
+    buffers: bool,
+    /// The descriptor in each entry of the registered file table, -1 for none, until an
+    /// update fails and reads name their files by descriptor.
+    files: Option<Vec<RawFd>>,
 }
 
 impl OsRing {
-    pub(crate) fn new() -> Option<Self> {
+    pub(crate) fn new(pool: &Pool) -> Option<Self> {
         let ring = IoUring::new(DEPTH as u32).ok()?;
         let mut probe = Probe::new();
         ring.submitter().register_probe(&mut probe).ok()?;
-        if !probe.is_supported(opcode::Read::CODE) {
+        if !probe.is_supported(opcode::Read::CODE) || !probe.is_supported(opcode::ReadFixed::CODE) {
             return None;
         }
-        let event = Event::new();
+        let event = Arc::new(Event::new());
         ring.submitter()
             .register_eventfd(event.0.as_raw_fd())
             .ok()?;
-        Some(Self { ring, event })
+        let iovecs: Vec<libc::iovec> = pool
+            .buffers()
+            .map(|(address, len)| libc::iovec {
+                iov_base: address.cast(),
+                iov_len: len,
+            })
+            .collect();
+        // SAFETY: the buffers stay mapped while the ring lives, as its owner holds the pool.
+        let buffers = match unsafe { ring.submitter().register_buffers(&iovecs) } {
+            Ok(()) => true,
+            // Registered buffers count against the user's RLIMIT_MEMLOCK unless the process has
+            // CAP_IPC_LOCK, and the limit is often a few MiB: reads then name their buffers by
+            // address.
+            Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => false,
+            Err(_) => return None,
+        };
+        // Kernels before 5.5 refuse a table of empty entries; reads there name their files by
+        // descriptor.
+        let files = ring
+            .submitter()
+            .register_files(&[-1; DEPTH])
+            .ok()
+            .map(|()| vec![-1; DEPTH]);
+        Some(Self {
+            ring,
+            event,
+            buffers,
+            files,
+        })
     }
 
-    pub(crate) fn event(&self) -> &Event {
+    pub(crate) fn event(&self) -> &Arc<Event> {
         &self.event
     }
 
+    /// Points each entry of the registered file table at the file of `files`, dropping the
+    /// files no read uses, which the kernel keeps open while they are registered.
+    pub(crate) fn set_files(&mut self, files: &[Option<OpenFile>]) {
+        let Some(table) = &mut self.files else { return };
+        for (i, (t, f)) in table.iter_mut().zip(files).enumerate() {
+            let fd = f.as_ref().map_or(-1, |f| f.file.handle.as_raw_fd());
+            if *t == fd {
+                continue;
+            }
+            if self
+                .ring
+                .submitter()
+                .register_files_update(i as u32, &[fd])
+                .is_err()
+            {
+                // The table would keep its files open until the ring drops.
+                let _ = self.ring.submitter().unregister_files();
+                self.files = None;
+                return;
+            }
+            *t = fd;
+        }
+    }
+
     /// Queues the next chunk of `f`, which goes in `slot`.
-    pub(crate) fn start(&mut self, slot: usize, f: &mut InFlight) -> io::Result<()> {
+    pub(crate) fn start(&mut self, slot: usize, f: &mut InFlight, pool: &Pool) -> io::Result<()> {
         let (address, len) = f.chunk();
-        let sqe = opcode::Read::new(types::Fd(f.read.file.handle.as_raw_fd()), address, len)
-            .offset(f.at())
-            .build()
-            .user_data(slot as u64);
+        let fd = f.read.file.handle.as_raw_fd();
+        let fixed = self.files.is_some().then_some(types::Fixed(f.file as u32));
+        let buffer = pool.index(address).filter(|_| self.buffers);
+        let sqe = match (fixed, buffer) {
+            (Some(file), Some((index, _))) => {
+                opcode::ReadFixed::new(file, address, len, index as u16)
+                    .offset(f.at())
+                    .build()
+            }
+            (None, Some((index, _))) => {
+                opcode::ReadFixed::new(types::Fd(fd), address, len, index as u16)
+                    .offset(f.at())
+                    .build()
+            }
+            (Some(file), None) => opcode::Read::new(file, address, len).offset(f.at()).build(),
+            (None, None) => opcode::Read::new(types::Fd(fd), address, len)
+                .offset(f.at())
+                .build(),
+        };
+        let sqe = sqe.user_data(slot as u64);
         // SAFETY: the fd and the buffer stay alive in the slot until the completion is popped.
         // The queue has room: it holds DEPTH entries, and each entry in it holds a slot.
         unsafe { self.ring.submission().push(&sqe) }.expect("io_uring queue has room");

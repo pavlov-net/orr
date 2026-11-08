@@ -19,6 +19,8 @@ windows_link::link!("kernel32.dll" "system" fn GlobalMemoryStatusEx(lpbuffer : *
 windows_link::link!("kernel32.dll" "system" fn LoadLibraryW(lplibfilename : PCWSTR) -> HMODULE);
 windows_link::link!("kernel32.dll" "system" fn ReadFile(hfile : HANDLE, lpbuffer : *mut core::ffi::c_void, nnumberofbytestoread : u32, lpnumberofbytesread : *mut u32, lpoverlapped : *mut OVERLAPPED) -> BOOL);
 windows_link::link!("kernel32.dll" "system" fn SetEvent(hevent : HANDLE) -> BOOL);
+windows_link::link!("kernel32.dll" "system" fn VirtualAlloc(lpaddress : *const core::ffi::c_void, dwsize : usize, flallocationtype : u32, flprotect : u32) -> *mut core::ffi::c_void);
+windows_link::link!("kernel32.dll" "system" fn VirtualFree(lpaddress : *mut core::ffi::c_void, dwsize : usize, dwfreetype : u32) -> BOOL);
 windows_link::link!("kernel32.dll" "system" fn WaitForMultipleObjects(ncount : u32, lphandles : *const HANDLE, bwaitall : BOOL, dwmilliseconds : u32) -> u32);
 pub type BOOL = i32;
 pub type DWORDLONG = u64;
@@ -78,6 +80,9 @@ pub struct MEMORYSTATUSEX {
     pub ullAvailVirtual: DWORDLONG,
     pub ullAvailExtendedVirtual: DWORDLONG,
 }
+pub const MEM_COMMIT: i32 = 4096;
+pub const MEM_RELEASE: i32 = 32768;
+pub const MEM_RESERVE: i32 = 8192;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct OVERLAPPED {
@@ -108,6 +113,7 @@ pub struct OVERLAPPED_0_0 {
     pub Offset: u32,
     pub OffsetHigh: u32,
 }
+pub const PAGE_READWRITE: i32 = 4;
 pub type PCSTR = *const u8;
 pub type PCWSTR = *const u16;
 #[repr(C)]

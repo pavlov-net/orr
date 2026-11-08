@@ -2,26 +2,23 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc;
 
-use crate::{AlignedBuf, CHUNK, Read, ended_off_sector, sys};
+use crate::{AlignedBuf, CHUNK, Read, ReadBuffers, ReadFile, ended_off_sector, sys};
 
-/// Reads in flight at once; 64 reach a fast NVMe drive's rate.
-pub(crate) const DEPTH: usize = 64;
+pub(crate) use crate::RING_DEPTH as DEPTH;
+
+const _: () = assert!(DEPTH <= u64::BITS as usize, "a bit per slot");
 
 /// A read on the ring, which runs it a chunk at a time as [`crate::read_all`] does.
 pub(crate) struct InFlight {
     pub(crate) read: Read,
     buf: AlignedBuf,
+    /// The read's entry in [`Native::files`].
+    pub(crate) file: usize,
 }
 
 impl InFlight {
-    fn new(read: Read) -> Self {
-        Self {
-            buf: AlignedBuf::new(read.len),
-            read,
-        }
-    }
-
     /// The file offset of the next chunk.
     pub(crate) fn at(&self) -> u64 {
         self.read.offset + self.buf.len() as u64
@@ -49,19 +46,38 @@ impl InFlight {
     }
 }
 
+/// A file that reads on the ring use, and how many of them are in flight.
+pub(crate) struct OpenFile {
+    pub(crate) file: Arc<ReadFile>,
+    reads: usize,
+}
+
 /// One [`sys::OsRing`], at most [`DEPTH`] reads in flight.
 pub(crate) struct Native {
     pub(crate) ring: sys::OsRing,
     slots: Vec<Option<InFlight>>,
     queued: VecDeque<Read>,
+    /// The files of the reads in flight, at most one entry per read; the ring registers
+    /// them, so a file drops out once its last read completes and the system lets it go.
+    files: Vec<Option<OpenFile>>,
+    files_changed: bool,
+    /// Dropped after the ring, which may hold its buffers registered until then.
+    pub(crate) buffers: ReadBuffers,
 }
 
 impl Native {
-    pub(crate) fn new() -> Option<Self> {
+    pub(crate) fn new(buffers: &ReadBuffers) -> Option<Self> {
         Some(Self {
-            ring: sys::OsRing::new()?,
+            ring: {
+                let ring = sys::OsRing::new(&buffers.0)?;
+                buffers.0.wake(ring.event());
+                ring
+            },
             slots: (0..DEPTH).map(|_| None).collect(),
             queued: VecDeque::new(),
+            files: (0..DEPTH).map(|_| None).collect(),
+            files_changed: false,
+            buffers: buffers.clone(),
         })
     }
 
@@ -81,24 +97,91 @@ impl Native {
         // Completions go first: each frees a slot for a queued read, and the wait that follows
         // has no event to end it if it took the event for those completions already.
         self.complete();
-        self.issue();
+        let new = self.take_queued();
+        self.update_files();
+        for slot in (0..DEPTH).filter(|&s| new & 1 << s != 0) {
+            let f = self.slots[slot].take().expect("a new read");
+            self.start(slot, f);
+        }
+        // A read that failed to start dropped its file, which the ring must let go of though
+        // no pump may follow.
+        self.update_files();
         self.ring.submit();
     }
 
-    fn issue(&mut self) {
-        while let Some(slot) = self.slots.iter().position(Option::is_none) {
-            let Some(read) = self.queued.pop_front() else {
+    fn update_files(&mut self) {
+        if std::mem::take(&mut self.files_changed) {
+            self.ring.set_files(&self.files);
+        }
+    }
+
+    /// Puts queued reads, in order, into the free slots while their buffers are in. Returns
+    /// a bit for each slot it filled.
+    fn take_queued(&mut self) -> u64 {
+        let mut new = 0;
+        let mut slot = 0;
+        while let Some(read) = self.queued.front() {
+            while slot < DEPTH && self.slots[slot].is_some() {
+                slot += 1;
+            }
+            if slot == DEPTH {
+                break;
+            }
+            let Some(buf) = self.buffers.try_take(read.len) else {
                 break;
             };
-            self.start(slot, InFlight::new(read));
+            let read = self.queued.pop_front().expect("a queued read");
+            let file = self.open(&read.file);
+            self.slots[slot] = Some(InFlight { read, buf, file });
+            new |= 1 << slot;
+        }
+        new
+    }
+
+    /// The entry of `file` in [`Native::files`], with one more read.
+    fn open(&mut self, file: &Arc<ReadFile>) -> usize {
+        let found = self
+            .files
+            .iter()
+            .position(|f| f.as_ref().is_some_and(|f| Arc::ptr_eq(&f.file, file)));
+        let i = found.unwrap_or_else(|| {
+            self.files_changed = true;
+            // Every read in flight holds an entry, so one of DEPTH is free for a new read.
+            let i = self
+                .files
+                .iter()
+                .position(Option::is_none)
+                .expect("a free file");
+            self.files[i] = Some(OpenFile {
+                file: Arc::clone(file),
+                reads: 0,
+            });
+            i
+        });
+        self.files[i].as_mut().expect("an open file").reads += 1;
+        i
+    }
+
+    /// Counts the end of a read of entry `i`.
+    fn close(&mut self, i: usize) {
+        let f = self.files[i].as_mut().expect("an open file");
+        f.reads -= 1;
+        if f.reads == 0 {
+            self.files[i] = None;
+            self.files_changed = true;
         }
     }
 
     fn start(&mut self, slot: usize, mut f: InFlight) {
-        match self.ring.start(slot, &mut f) {
+        match self.ring.start(slot, &mut f, &self.buffers.0) {
             Ok(()) => self.slots[slot] = Some(f),
-            Err(e) => (f.read.done)(Err(e)),
+            Err(e) => self.fail(f, e),
         }
+    }
+
+    fn fail(&mut self, f: InFlight, e: io::Error) {
+        self.close(f.file);
+        (f.read.done)(Err(e));
     }
 
     /// Runs `done` for every completed read and starts the next chunk of the others.
@@ -109,9 +192,12 @@ impl Native {
             };
             match result {
                 Ok(n) if f.advance(n) => self.start(slot, f),
-                Ok(_) => f.finish(),
+                Ok(_) => {
+                    self.close(f.file);
+                    f.finish();
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => self.start(slot, f),
-                Err(e) => (f.read.done)(Err(e)),
+                Err(e) => self.fail(f, e),
             }
         }
     }

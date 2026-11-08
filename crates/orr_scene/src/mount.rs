@@ -507,13 +507,15 @@ pub(crate) fn start(loading: &Arc<Loading>, ring: bool, task: Arc<MountTask>, so
             if ring {
                 read_head(loading, task, file, path);
             } else {
+                let buffers = loading.buffers().clone();
                 task.spawn(move |t| {
                     t.step(|| {
-                        let mut head = AlignedBuf::new(Archive::HEAD_LEN);
+                        let mut head = buffers.take(Archive::HEAD_LEN);
                         file.reads.read(0, &mut head)?;
                         let range = Archive::index_range(head.as_slice())?;
+                        // A worker holds one buffer at a time, so takes never wait on each other.
                         drop(head);
-                        let mut index = AlignedBuf::new(range.len as usize);
+                        let mut index = buffers.take(range.len as usize);
                         file.reads.read(0, &mut index)?;
                         open_index(t, &file, &path, &index, range.len)
                     });

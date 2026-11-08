@@ -7,7 +7,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
-use orr_io::{AlignedBuf, ReadFile, Ring, Wake};
+use orr_io::{AlignedBuf, RING_DEPTH, ReadBuffers, ReadFile, Ring, SECTOR, Wake};
 
 use orr_gpu::Device;
 use orr_pack::{Archive, Blob};
@@ -131,11 +131,22 @@ pub struct Loading {
     edits: Mutex<Vec<EditBatch>>,
     cuts: Mutex<Vec<CutBatch>>,
     positioned: bool,
+    /// What archive reads read into, on the ring or on workers.
+    buffers: ReadBuffers,
 }
 
+/// The sizes of the read buffers: up to a stream chunk's stored range, which is at most its
+/// decoded length and starts anywhere in a sector. Longer reads take memory of their own.
+const READ_SIZES: [usize; 4] = [
+    SECTOR,
+    4 * SECTOR,
+    orr_pack::texture::TILE_BYTES + SECTOR,
+    orr_pack::DEFAULT_CHUNK as usize + SECTOR,
+];
+
 impl Loading {
-    pub(crate) fn new(positioned: bool) -> Self {
-        Self {
+    pub(crate) fn new(positioned: bool) -> std::io::Result<Self> {
+        Ok(Self {
             jobs: Mutex::new(Jobs {
                 queue: VecDeque::new(),
                 stopped: false,
@@ -149,7 +160,8 @@ impl Loading {
             edits: Mutex::new(Vec::new()),
             cuts: Mutex::new(Vec::new()),
             positioned,
-        }
+            buffers: ReadBuffers::new(&READ_SIZES, RING_DEPTH)?,
+        })
     }
 
     /// Runs jobs on the calling thread until [`Loading::stop_workers`]: archive decodes and
@@ -236,6 +248,11 @@ impl Loading {
     /// signal.
     pub fn set_job_signal(&self, signal: impl Fn() + Send + Sync + 'static) {
         *self.signal.lock().unwrap() = Some(Arc::new(signal));
+    }
+
+    /// The buffers reads on workers take.
+    pub(crate) fn buffers(&self) -> &ReadBuffers {
+        &self.buffers
     }
 
     pub(crate) fn send(&self, msg: Msg) {
@@ -363,8 +380,9 @@ pub(crate) fn read_stored(src: &BlobSource, b: Blob, chunk: Option<u32>, then: S
             }),
         }));
     } else {
+        let buffers = loading.buffers.clone();
         loading.spawn(move || {
-            let mut buf = AlignedBuf::new(range.len as usize);
+            let mut buf = buffers.take(range.len as usize);
             match file.reads.read(range.offset, &mut buf) {
                 Ok(()) => check(&buf, then),
                 Err(e) => then(Err(Error::from(e))),
@@ -399,7 +417,7 @@ pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
     let mut ring = if loading.positioned {
         None
     } else {
-        Ring::native()
+        Ring::native(&loading.buffers)
     };
     loop {
         let msgs: Vec<Msg> = loading.inbox.lock().unwrap().drain(..).collect();
@@ -438,7 +456,7 @@ mod tests {
 
     #[test]
     fn a_result_job_finishes_with_no_workers_and_after_a_stop() {
-        let loading = Loading::new(true);
+        let loading = Loading::new(true).unwrap();
         loading.stop_workers();
         let first = loading.spawn_result(|| 1);
         let second = loading.spawn_result(|| 2);
@@ -455,7 +473,7 @@ mod tests {
 
     #[test]
     fn a_panicking_job_reports_it_and_leaves_its_worker_running() {
-        let loading = Arc::new(Loading::new(true));
+        let loading = Arc::new(Loading::new(true).unwrap());
         let worker = {
             let l = Arc::clone(&loading);
             std::thread::spawn(move || l.run_worker())
@@ -472,7 +490,7 @@ mod tests {
 
     #[test]
     fn waiting_for_a_job_on_a_worker_returns_when_it_finishes() {
-        let loading = Arc::new(Loading::new(true));
+        let loading = Arc::new(Loading::new(true).unwrap());
         let worker = {
             let l = Arc::clone(&loading);
             std::thread::spawn(move || l.run_worker())
@@ -492,7 +510,7 @@ mod tests {
 
     #[test]
     fn dropping_the_handle_cancels_a_queued_job() {
-        let loading = Loading::new(true);
+        let loading = Loading::new(true).unwrap();
         let ran = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&ran);
         drop(loading.spawn_result(move || flag.store(true, Ordering::Relaxed)));
