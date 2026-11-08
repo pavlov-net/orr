@@ -216,14 +216,18 @@ impl Pages {
                 return Err(io::Error::last_os_error());
             }
             let head = (p as usize).next_multiple_of(align) - p as usize;
-            // SAFETY: the parts of the mapping before the aligned start and past its `len`
-            // bytes, whole pages as both ends are, which nothing uses.
+            // The mapping holds whole pages, and the arena's last page ends past `len` where
+            // pages are larger than a sector.
+            let end = (len + extra).next_multiple_of(page);
+            let tail = (head + len).next_multiple_of(page);
+            // SAFETY: the whole pages of the mapping before the aligned start and after the
+            // arena's last page, which nothing uses.
             unsafe {
                 if head > 0 {
                     libc::munmap(p, head);
                 }
-                if extra > head {
-                    libc::munmap(p.cast::<u8>().add(head + len).cast(), extra - head);
+                if end > tail {
+                    libc::munmap(p.cast::<u8>().add(tail).cast(), end - tail);
                 }
             }
             // SAFETY: inside the mapping.
