@@ -1161,15 +1161,13 @@ impl Streaming {
                 }
             }
             drop(staging);
-            let clas = match batch.clas {
-                Some(mut c) => {
-                    if let Some(e) = c.take_out_of_memory() {
-                        self.residency.out_of_memory(governs(&self.governed, &e));
-                    }
-                    self.replay(c)
+            let mut clas = Vec::new();
+            for mut c in batch.clas {
+                if let Some(e) = c.take_out_of_memory() {
+                    self.residency.out_of_memory(governs(&self.governed, &e));
                 }
-                None => Vec::new(),
-            };
+                clas.extend(self.replay(c));
+            }
             self.note_failures(&batch.loads);
             for l in batch.loads {
                 self.landed(l, &clas, frame, w)?;
@@ -1812,7 +1810,8 @@ struct MeshLanded {
 pub(crate) struct StreamBatch {
     points: Vec<TimelinePoint>,
     loads: Vec<Landed>,
-    clas: Option<PoolBatch>,
+    /// Its CLAS pool batches in submit order; a page's slots index their CLAS in order.
+    clas: Vec<PoolBatch>,
     decode: Option<PageDecodes>,
     /// The task's unbinds when its sparse bind failed, for the next task.
     unbinds: Vec<TileFree>,
@@ -2192,19 +2191,17 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<StreamTask>)
         &mut unbound,
     ) {
         Ok(()) => match &task.clas {
-            Some(pool) => match build_clas(device, task, pool, &mut loads, &mut points) {
-                Ok(c) => c,
-                // The other loads' work is submitted; only the pages it builds need it.
-                Err(e) => {
-                    error = fail_loads(&mut loads, e, |l| l.mesh.is_some());
-                    None
-                }
-            },
-            None => None,
+            // The other loads' work is submitted; only the pages it builds need it.
+            Some(pool) => {
+                let (batches, e) = build_clas(device, task, pool, &mut loads, &mut points);
+                error = e;
+                batches
+            }
+            None => Vec::new(),
         },
         Err(e) => {
             error = fail_loads(&mut loads, e, |_| true);
-            None
+            Vec::new()
         }
     };
     loading.push_stream(StreamBatch {
@@ -2345,22 +2342,73 @@ fn submit(
     Ok(())
 }
 
+/// CLAS one pool batch places at most. The allocator places a batch's CLAS one after another
+/// in one workgroup, at up to about 10 us each in a 98,304-page (6 GiB) pool, so a batch's
+/// dispatch stays near 40 ms however many pages land in one task.
+const BATCH_CLAS: u32 = 4096;
+
 /// Builds the CLAS of a batch's streamed mesh pages on the loading queue after its other
-/// work, and applies the pool's queued frees and takes; none when there is neither.
+/// work, in pool batches of at most [`BATCH_CLAS`] CLAS (a page of more alone), and applies
+/// the pool's queued frees and takes with the first. Returns the batches submitted, in order,
+/// and an error no load carries. A batch that fails fails its pages and those of the batches
+/// after it; the ones before it still land.
 fn build_clas(
     device: &Device,
     task: &StreamTask,
     pool: &Mutex<ClasPool>,
     loads: &mut [Landed],
     points: &mut Vec<TimelinePoint>,
-) -> Result<Option<PoolBatch>> {
+) -> (Vec<PoolBatch>, Option<Error>) {
     let mut pool = pool.lock().unwrap();
     let pages: Vec<usize> = (0..loads.len())
         .filter(|&i| loads[i].result.is_ok() && loads[i].mesh.is_some())
         .collect();
     if pages.is_empty() && !pool.pending() {
-        return Ok(None);
+        return (Vec::new(), None);
     }
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut in_group = 0;
+    for &i in &pages {
+        let clusters = loads[i].mesh.as_ref().expect("decoded").clusters.len() as u32;
+        if !groups[groups.len() - 1].is_empty() && in_group + clusters > BATCH_CLAS {
+            groups.push(Vec::new());
+            in_group = 0;
+        }
+        groups.last_mut().expect("a group").push(i);
+        in_group += clusters;
+    }
+    let mut batches: Vec<PoolBatch> = Vec::new();
+    for (g, group) in groups.iter().enumerate() {
+        let offset = batches.iter().map(PoolBatch::clas).sum();
+        match build_group(device, task, &mut pool, loads, group, offset, points) {
+            Ok(b) => batches.push(b),
+            Err(e) => {
+                let failing: Vec<usize> = groups[g..].concat();
+                if failing.is_empty() {
+                    return (batches, Some(e));
+                }
+                let e = Arc::new(e);
+                for i in failing {
+                    loads[i].result = Err(Arc::clone(&e));
+                }
+                return (batches, None);
+            }
+        }
+    }
+    (batches, None)
+}
+
+/// Builds the CLAS of the mesh pages `pages` of `loads` as one pool batch, their results
+/// indices past `offset`.
+fn build_group(
+    device: &Device,
+    task: &StreamTask,
+    pool: &mut ClasPool,
+    loads: &mut [Landed],
+    pages: &[usize],
+    offset: u32,
+    points: &mut Vec<TimelinePoint>,
+) -> Result<PoolBatch> {
     let builds: Vec<PageBuild<'_>> = pages
         .iter()
         .map(|&i| {
@@ -2386,7 +2434,7 @@ fn build_clas(
     let k = &task.accel.kernels;
     let triangles = task.accel.limits.clas_triangles;
     let out = clas_pool::build_pages(
-        &mut pool,
+        pool,
         device,
         k,
         &mut list,
@@ -2400,16 +2448,16 @@ fn build_clas(
     match queue.submit(vec![list], &wait) {
         Ok(p) => points.push(p),
         Err(e) => {
-            out.abandon(&mut pool, &task.staging);
+            out.abandon(pool, &task.staging);
             return Err(e.into());
         }
     }
     for ((&i, slots), micromap) in pages.iter().zip(out.slots).zip(out.micromaps) {
         let m = loads[i].mesh.as_mut().expect("decoded");
-        m.slots = slots;
+        m.slots = slots.into_iter().map(|s| offset + s).collect();
         m.micromap = micromap;
     }
-    Ok(Some(out.batch))
+    Ok(out.batch)
 }
 
 /// Decodes the task's staged mesh pages into their pool slots on the loading queue.

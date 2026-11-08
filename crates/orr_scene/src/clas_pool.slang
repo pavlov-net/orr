@@ -2,6 +2,9 @@
 // pool's free bitmap, then gives each built CLAS the lowest run of free 128 B units that
 // holds it and writes its move. Thread t owns a fixed block of pages: it alone reads and
 // writes their bits and summaries, and shares the free run at the start of its first page.
+// It also keeps the first page of its block with a free unit, and splits the block into
+// `POOL_SUBS` runs of pages with a bound each on the longest free run that starts in them, so a
+// CLAS costs a thread nothing where it cannot fit, and a scan of the pages where it may.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_gpu.rtas;
@@ -36,41 +39,91 @@ public struct PoolRoot
 }
 ORR_ROOT(PoolRoot);
 
+static const uint POOL_SUBS = 32;
+
 groupshared uint g_head[POOL_THREADS];
 groupshared uint g_best;
+// Per sub-block and thread: at least the longest free run that starts in its pages and ends
+// in the thread's block.
+groupshared uint g_sub[POOL_SUBS * POOL_THREADS];
 
-bool unit_free(uint page, uint u)
+static const uint ALL = 0xffffffff;
+
+// Set bits of `x` from bit 0 up to its first clear bit.
+uint low_ones(uint x)
 {
-    return (root.bits[page * root.words + u / 32] >> (u % 32) & 1) != 0;
+    return x == ALL ? 32 : firstbitlow(~x);
 }
 
+// Set bits of `x` from bit 31 down to its last clear bit.
+uint high_ones(uint x)
+{
+    return x == ALL ? 32 : 31 - firstbithigh(~x);
+}
+
+// The longest run of set bits in `x`: each step shortens every run by one.
+uint longest_ones(uint x)
+{
+    uint n = 0;
+    while (x != 0)
+    {
+        x &= x >> 1;
+        n++;
+    }
+    return n;
+}
+
+// Words `4 q..4 q + 4` of `page`'s bits; the CPU side keeps `words` a multiple of 4.
+uint4 quad(uint page, uint q)
+{
+    return ((uint4*)(root.bits + page * root.words))[q];
+}
+
+// Sets units `lo..hi` of `page` free or used.
 void mark(uint page, uint lo, uint hi, bool free)
 {
-    for (uint u = lo; u < hi; u++)
+    uint u = lo;
+    while (u < hi)
     {
-        uint w = page * root.words + u / 32;
-        uint bit = 1u << (u % 32);
-        root.bits[w] = free ? root.bits[w] | bit : root.bits[w] & ~bit;
+        uint b = u % 32;
+        uint span = min(32 - b, hi - u);
+        uint mask = (span == 32 ? ALL : (1u << span) - 1) << b;
+        uint at = page * root.words + u / 32;
+        root.bits[at] = free ? root.bits[at] | mask : root.bits[at] & ~mask;
+        u += span;
     }
 }
 
 void summarize(uint page)
 {
-    uint n = root.words * 32;
     uint head = 0;
-    while (head < n && unit_free(page, head))
-        head++;
-    uint tail = 0;
-    while (tail < n && unit_free(page, n - 1 - tail))
-        tail++;
+    bool leading = true;
+    uint run = 0;      // the free run reaching the end of the words read
     uint longest = 0;
-    uint run = 0;
-    for (uint u = 0; u < n; u++)
+    for (uint q = 0; q < root.words / 4; q++)
     {
-        run = unit_free(page, u) ? run + 1 : 0;
-        longest = max(longest, run);
+        uint4 v = quad(page, q);
+        for (uint k = 0; k < 4; k++)
+        {
+            uint x = v[k];
+            if (leading)
+            {
+                head += low_ones(x);
+                leading = x == ALL;
+            }
+            if (x == ALL)
+            {
+                run += 32;
+            }
+            else
+            {
+                longest = max(longest, max(run + low_ones(x), longest_ones(x)));
+                run = high_ones(x);
+            }
+            longest = max(longest, run);
+        }
     }
-    root.summary[page] = uint2(head | tail << 16, longest);
+    root.summary[page] = uint2(head | run << 16, longest);
 }
 
 // Sets units `first..first + count` free or used where they fall in pages `lo..hi`.
@@ -96,17 +149,47 @@ uint fit(uint page, uint need, uint next_head)
     if (s.y >= need)
     {
         uint run = 0;
-        for (uint u = 0; u < n; u++)
+        for (uint q = 0; q < root.words / 4; q++)
         {
-            run = unit_free(page, u) ? run + 1 : 0;
-            if (run == need)
-                return page * n + u + 1 - need;
+            uint4 v = quad(page, q);
+            for (uint k = 0; k < 4; k++)
+            {
+                uint x = v[k];
+                uint w = 4 * q + k;
+                // The run reaching into this word, then one inside it, then the one leaving it.
+                if (run + low_ones(x) >= need)
+                    return page * n + w * 32 - run;
+                if (need <= 32)
+                {
+                    // Bits that start `have` set bits, doubling `have` towards `need`.
+                    uint starts = x;
+                    uint have = 1;
+                    while (have * 2 <= need)
+                    {
+                        starts &= starts >> have;
+                        have *= 2;
+                    }
+                    starts &= starts >> (need - have);
+                    if (starts != 0)
+                        return page * n + w * 32 + firstbitlow(starts);
+                }
+                run = x == ALL ? run + 32 : high_ones(x);
+            }
         }
     }
     uint tail = s.x >> 16;
     if (tail > 0 && tail < n && tail + next_head >= need)
         return page * n + n - tail;
     return NO_UNIT;
+}
+
+// The longest run that starts in `page` and ends in it or in the page after it, when that is
+// in the block too.
+uint runs_from(uint page, uint hi)
+{
+    uint2 s = root.summary[page];
+    uint joined = page + 1 < hi ? (s.x >> 16) + (root.summary[page + 1].x & 0xffff) : 0;
+    return max(s.y, joined);
 }
 
 [shader("compute")]
@@ -139,6 +222,26 @@ void allocate(uint t: SV_GroupThreadID)
         root.taken[i] = whole ? 1 : 0;
     }
     g_head[t] = lo < hi ? root.summary[lo].x & 0xffff : 0;
+    // Pages before `room` are full, `bound` is at least every sub-block's bound, and `tail`
+    // is the run at the end of the block's last page. Allocations only fill pages, so each
+    // bound stays one as the batch goes on.
+    uint sub = max((per + POOL_SUBS - 1) / POOL_SUBS, 1u);
+    uint subs = (per + sub - 1) / sub;
+    uint room = hi;
+    uint bound = 0;
+    for (uint j = 0; j < subs; j++)
+    {
+        uint longest = 0;
+        for (uint page = lo + j * sub; page < min(lo + (j + 1) * sub, hi); page++)
+        {
+            if (room == hi && root.summary[page].y > 0)
+                room = page;
+            longest = max(longest, runs_from(page, hi));
+        }
+        g_sub[j * POOL_THREADS + t] = longest;
+        bound = max(bound, longest);
+    }
+    uint tail = lo < hi ? root.summary[hi - 1].x >> 16 : 0;
     GroupMemoryBarrierWithGroupSync();
 
     uint moves = 0;
@@ -148,17 +251,40 @@ void allocate(uint t: SV_GroupThreadID)
         if (t == 0)
             g_best = NO_UNIT;
         GroupMemoryBarrierWithGroupSync();
-        if (need > 0 && need < n)
+        uint next_block = t + 1 < POOL_THREADS ? g_head[t + 1] : 0;
+        bool across = tail > 0 && tail < n && tail + next_block >= need;
+        if (need > 0 && need < n && (bound >= need || across))
         {
-            for (uint page = lo; page < hi; page++)
+            bool found = false;
+            for (uint j = 0; j < subs && !found; j++)
             {
-                uint next = page + 1 < hi ? root.summary[page + 1].x & 0xffff : (t + 1 < POOL_THREADS ? g_head[t + 1] : 0);
-                uint at = fit(page, need, next);
-                if (at != NO_UNIT)
+                uint a = max(lo + j * sub, room);
+                uint b = min(lo + (j + 1) * sub, hi);
+                // Only the block's last page reaches into the next block.
+                bool reaches = b == hi && across;
+                if (a >= b || (g_sub[j * POOL_THREADS + t] < need && !reaches))
+                    continue;
+                uint seen = 0;
+                for (uint page = a; page < b; page++)
                 {
-                    InterlockedMin(g_best, at);
-                    break;
+                    uint next = page + 1 < hi ? root.summary[page + 1].x & 0xffff : next_block;
+                    uint at = fit(page, need, next);
+                    if (at != NO_UNIT)
+                    {
+                        InterlockedMin(g_best, at);
+                        found = true;
+                        break;
+                    }
+                    seen = max(seen, runs_from(page, hi));
                 }
+                if (!found)
+                    g_sub[j * POOL_THREADS + t] = seen;
+            }
+            if (!found)
+            {
+                bound = 0;
+                for (uint j = 0; j < subs; j++)
+                    bound = max(bound, g_sub[j * POOL_THREADS + t]);
             }
         }
         GroupMemoryBarrierWithGroupSync();
@@ -167,7 +293,12 @@ void allocate(uint t: SV_GroupThreadID)
         {
             apply(best, need, false, lo, hi);
             if (lo < hi)
+            {
                 g_head[t] = root.summary[lo].x & 0xffff;
+                tail = root.summary[hi - 1].x >> 16;
+                while (room < hi && root.summary[room].y == 0)
+                    room++;
+            }
         }
         if (t == 0)
         {

@@ -99,8 +99,9 @@ impl ClasPool {
     pub(crate) fn new(device: &Device, bytes: u64, block: u64) -> Result<Self> {
         let range = device.gpu_malloc_sparse::<u8>(bytes.max(1), "CLAS pool")?;
         let page_units = (range.page_size / UNIT) as u32;
+        // `clas_pool.slang` reads a page's bitmap four words at a time.
         assert!(
-            page_units.is_multiple_of(32) && page_units < 1 << 16,
+            page_units.is_multiple_of(128) && page_units < 1 << 16,
             "CLAS pool pages of {} bytes",
             range.page_size
         );
@@ -171,8 +172,7 @@ impl ClasPool {
         estimate: u64,
     ) -> Result<(PoolOps, Option<TimelinePoint>)> {
         let n = self.page_units;
-        let frees: i64 = self.frees.iter().map(|&(_, c)| i64::from(c)).sum();
-        let mut room = self.room + frees - i64::from(n) * self.takes.len() as i64 - estimate as i64;
+        let mut room = self.room_after(estimate);
         let mut slots: Vec<(u32, PoolSlot)> = Vec::new();
         let mut unbound = (0..self.pages.len()).filter(|&p| self.pages[p].0 == PageState::Unbound);
         let mut previous = None;
@@ -233,6 +233,31 @@ impl ClasPool {
         };
         self.initialized = true;
         Ok((ops, point))
+    }
+
+    /// The room once the queued frees and takes apply and builds of `estimate` units fit.
+    fn room_after(&self, estimate: u64) -> i64 {
+        let frees: i64 = self.frees.iter().map(|&(_, c)| i64::from(c)).sum();
+        self.room + frees - i64::from(self.page_units) * self.takes.len() as i64 - estimate as i64
+    }
+
+    /// The most frees and takes the batch [`Self::begin`] starts for `estimate` hands the
+    /// kernel: the pages it reports bound, at most those it binds, and the queued ops.
+    fn ops_at_most(&self, estimate: u64) -> (usize, usize) {
+        let room = self.room_after(estimate);
+        let short = if room < 0 {
+            room.unsigned_abs().div_ceil(u64::from(self.page_units)) as usize
+        } else {
+            0
+        };
+        let binds = self
+            .pages
+            .iter()
+            .filter(|p| p.0 == PageState::Unbound)
+            .take(short)
+            .count();
+        let frees = self.unreported.len() + binds + self.frees.len();
+        (frees, self.takes.len())
     }
 
     /// Takes back a batch `begin` started that was never submitted: its frees and takes go
@@ -540,6 +565,11 @@ pub(crate) struct PoolBatch {
 }
 
 impl PoolBatch {
+    /// The CLAS it places, one results index each.
+    pub(crate) fn clas(&self) -> u32 {
+        self.count
+    }
+
     /// Takes the error of the pool's growth when it ran out of memory.
     pub(crate) fn take_out_of_memory(&mut self) -> Option<crate::Error> {
         self.ops.out_of_memory.take()
@@ -639,14 +669,22 @@ pub(crate) fn build_pages(
     }
     let n = members.len() as u64;
 
+    let estimate: u64 = pages
+        .iter()
+        .flat_map(|p| p.clusters)
+        .map(|c| estimate(c.tri_count))
+        .sum();
+    let estimate = (estimate as f64 * pool.scale).ceil() as u64;
+
     // The op lists and outputs, before the pool hands out its queued ops.
-    let ops_max = pool.frees.len() + pool.takes.len() + pool.pages.len();
+    let (frees, takes) = pool.ops_at_most(estimate);
     let upload_bytes = n * size_of::<ClasJob>() as u64
         + builds.len() as u64 * (size_of::<AccelRoot>() as u64 + 32)
-        + 8 * ops_max as u64
+        + 8 * frees as u64
+        + 4 * takes as u64
         + size_of::<PoolRoot>() as u64
         + 128;
-    let results_bytes = 8 * n + 4 * pool.takes.len() as u64 + 64;
+    let results_bytes = 8 * n + 4 * takes as u64 + 64;
     let mut staging = staging_pool.lock().unwrap();
     let (upload_slot, upload) = staging.alloc(device, upload_bytes, None)?;
     let results = match staging.alloc(device, results_bytes, None) {
@@ -763,12 +801,6 @@ pub(crate) fn build_pages(
             return Err(e);
         }
     };
-    let estimate: u64 = pages
-        .iter()
-        .flat_map(|p| p.clusters)
-        .map(|c| estimate(c.tri_count))
-        .sum();
-    let estimate = (estimate as f64 * pool.scale).ceil() as u64;
     let (ops, bind) = match pool.begin(device, estimate) {
         Ok(b) => b,
         Err(e) => {

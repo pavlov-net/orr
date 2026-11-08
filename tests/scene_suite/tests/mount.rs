@@ -2666,14 +2666,27 @@ fn stream_sheets(dev: &Device) {
     assert_eq!(scenes.residency().failed, 0);
 }
 
+/// Pools of a page or less per allocator thread, of several pages per thread, where runs cross
+/// from one thread's pages to the next, and of a 6 GiB pool's 98,304 pages with a batch the
+/// size of what one step of 1,024 streamed loads lands.
 #[test]
 fn the_clas_pool_allocator_places_like_a_first_fit_reference() {
+    first_fit_rounds(12, 96, 40);
+    first_fit_rounds(1000, 512, 20);
+    first_fit_rounds(98_304, 40_000, 3);
+    first_fit_rounds(98_304, 96, 3);
+    first_fit_rounds(12, 40_000, 3);
+    first_fit_rounds(1024, 40_000, 3);
+    assert_clean();
+}
+
+/// `rounds` batches of `clas_count` CLAS into a pool of `page_count` pages, each against a
+/// first-fit reference.
+fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
     use orr_scene::memory::RangeAllocator;
     use orr_scene::orr_gpu::{MemoryKind, RtasOp};
-    const PAGES: u32 = 12;
     const WORDS: u32 = 16;
     const UNITS: u32 = 32 * WORDS;
-    const N: usize = 96;
     let dev = device();
     let module = orr_scene::MODULES
         .iter()
@@ -2682,23 +2695,39 @@ fn the_clas_pool_allocator_places_like_a_first_fit_reference() {
     let pipeline = scene_suite::pipeline(module, "allocate");
     let up = MemoryKind::Upload;
     let bits = dev
-        .gpu_malloc::<u32>(MemoryKind::DeviceLocal, u64::from(PAGES * WORDS), "bits")
+        .gpu_malloc::<u32>(
+            MemoryKind::DeviceLocal,
+            u64::from(page_count * WORDS),
+            "bits",
+        )
         .unwrap();
     let summary = dev
-        .gpu_malloc::<[u32; 2]>(MemoryKind::DeviceLocal, u64::from(PAGES), "runs")
+        .gpu_malloc::<[u32; 2]>(MemoryKind::DeviceLocal, u64::from(page_count), "runs")
         .unwrap();
     let mut frees = dev
-        .gpu_malloc::<[u32; 2]>(up, (N + PAGES as usize) as u64, "frees")
+        .gpu_malloc::<[u32; 2]>(up, (clas_count + page_count as usize) as u64, "frees")
         .unwrap();
-    let mut takes = dev.gpu_malloc::<u32>(up, 16, "takes").unwrap();
-    let taken = dev.gpu_malloc::<u32>(up, 16, "taken").unwrap();
-    let mut sizes = dev.gpu_malloc::<u32>(up, N as u64, "sizes").unwrap();
-    let mut sources = dev.gpu_malloc::<u64>(up, N as u64, "sources").unwrap();
-    let units = dev.gpu_malloc::<u32>(up, N as u64, "units").unwrap();
-    let destinations = dev.gpu_malloc::<u64>(up, N as u64, "destinations").unwrap();
+    let mut takes = dev
+        .gpu_malloc::<u32>(up, u64::from(page_count), "takes")
+        .unwrap();
+    let taken = dev
+        .gpu_malloc::<u32>(up, u64::from(page_count), "taken")
+        .unwrap();
+    let mut sizes = dev
+        .gpu_malloc::<u32>(up, clas_count as u64, "sizes")
+        .unwrap();
+    let mut sources = dev
+        .gpu_malloc::<u64>(up, clas_count as u64, "sources")
+        .unwrap();
+    let units = dev
+        .gpu_malloc::<u32>(up, clas_count as u64, "units")
+        .unwrap();
+    let destinations = dev
+        .gpu_malloc::<u64>(up, clas_count as u64, "destinations")
+        .unwrap();
     let stride = u64::from(dev.rtas_args_stride(RtasOp::Move));
     let moves = dev
-        .gpu_malloc::<u8>(up, stride * N as u64, "moves")
+        .gpu_malloc::<u8>(up, stride * clas_count as u64, "moves")
         .unwrap();
     let count = dev.gpu_malloc::<u32>(up, 1, "move count").unwrap();
     let mut root = dev
@@ -2706,9 +2735,9 @@ fn the_clas_pool_allocator_places_like_a_first_fit_reference() {
         .unwrap();
     let base = 1u64 << 40;
 
-    let mut reference = RangeAllocator::new(PAGES * UNITS);
-    assert!(reference.take(0, PAGES * UNITS));
-    let mut bound = [false; PAGES as usize];
+    let mut reference = RangeAllocator::new(page_count * UNITS);
+    assert!(reference.take(0, page_count * UNITS));
+    let mut bound = vec![false; page_count as usize];
     let mut live: Vec<(u32, u32)> = Vec::new();
     let mut rand = {
         let mut x = 0x2545_f491u32;
@@ -2720,10 +2749,10 @@ fn the_clas_pool_allocator_places_like_a_first_fit_reference() {
         }
     };
     let render = dev.queue(QueueKind::Render).unwrap();
-    for round in 0..40 {
+    for round in 0..rounds {
         // Bind some pages, free some CLAS, ask to take some pages, then allocate.
         let mut free_list: Vec<[u32; 2]> = Vec::new();
-        for p in 0..PAGES {
+        for p in 0..page_count {
             if !bound[p as usize] && rand() % 4 == 0 {
                 bound[p as usize] = true;
                 free_list.push([p * UNITS, UNITS]);
@@ -2736,10 +2765,10 @@ fn the_clas_pool_allocator_places_like_a_first_fit_reference() {
             }
             keep
         });
-        let take_list: Vec<u32> = (0..PAGES)
+        let take_list: Vec<u32> = (0..page_count)
             .filter(|&p| bound[p as usize] && rand() % 5 == 0)
             .collect();
-        let size_list: Vec<u32> = (0..N).map(|_| 128 + rand() % 6000).collect();
+        let size_list: Vec<u32> = (0..clas_count).map(|_| 128 + rand() % 6000).collect();
         for &[f, n] in &free_list {
             reference.free(f, n);
         }
@@ -2783,11 +2812,11 @@ fn the_clas_pool_allocator_places_like_a_first_fit_reference() {
             moves: moves.gpu(),
             move_count: count.gpu(),
             base,
-            pages: PAGES,
+            pages: page_count,
             words: WORDS,
             free_count: free_list.len() as u32,
             take_count: take_list.len() as u32,
-            clas_count: N as u32,
+            clas_count: clas_count as u32,
             flags: u32::from(round == 0),
             _pad: 0,
         };
@@ -2817,7 +2846,6 @@ fn the_clas_pool_allocator_places_like_a_first_fit_reference() {
             placed.as_slice()
         );
     }
-    assert_clean();
 }
 
 /// A streaming sheet's budgets: everything resident fits, nothing keeps whole.
