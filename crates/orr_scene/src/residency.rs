@@ -22,8 +22,9 @@
 //!
 //! The render thread plans the streamed lanes at each step, and the loading thread starts
 //! mount reads as they come, through [`InFlight`]: a plan whose next load would go to the
-//! mount lane leaves the rest to it, and the mount lane starts reads while it has no more
-//! bytes in flight than the emptiest lane the latest plan held back for the limit.
+//! mount lane leaves the rest to it, and the mount lane starts reads while it has fewer bytes
+//! in flight than the emptiest lane the latest plan held back for the limit. When the two tie
+//! the lanes take turns, so neither side's timing decides which loads first.
 //!
 //! A unit's bytes are what its load places and what it builds beside them; the built bytes
 //! are an estimate until its first load reports them.
@@ -325,6 +326,9 @@ pub(crate) struct InFlight {
     mounts: AtomicU64,
     /// Whether mount reads wait for room.
     waiting: AtomicBool,
+    /// Whether the mount lane starts next when it ties with the emptiest streamed lane: set by
+    /// a streamed load that starts while mount reads wait, cleared by a mount read that starts.
+    mount_turn: AtomicBool,
 }
 
 impl InFlight {
@@ -335,13 +339,15 @@ impl InFlight {
             floor: AtomicU64::new(u64::MAX),
             mounts: AtomicU64::new(0),
             waiting: AtomicBool::new(false),
+            mount_turn: AtomicBool::new(false),
         }
     }
 
     /// Takes mount reads, each with its bytes, from the front of `queue` while the mount lane
-    /// has room: fewer bytes than the limit in flight, the mounts' no more than those of the
-    /// emptiest lane the latest plan held back. `start` gets each, whose bytes count until
-    /// [`InFlight::end_mount`]. Only the loading thread calls it.
+    /// has room: fewer bytes than the limit in flight, the mounts' fewer than those of the
+    /// emptiest lane the latest plan held back, or as many on the mount lane's turn. `start`
+    /// gets each, whose bytes count until [`InFlight::end_mount`]. Only the loading thread
+    /// calls it.
     ///
     /// A thread that frees room after this finds none sees [`InFlight::mounts_waiting`], as
     /// both sides write before they read, in one order.
@@ -359,6 +365,7 @@ impl InFlight {
                 }
             }
             self.mounts.fetch_add(bytes, SeqCst);
+            self.mount_turn.store(false, SeqCst);
             let (_, read) = queue.pop_front().expect("a queued read");
             start(bytes, read);
         }
@@ -368,7 +375,21 @@ impl InFlight {
     /// Whether the mount lane has room for one more read.
     fn mount_room(&self) -> bool {
         let mounts = self.mounts.load(SeqCst);
-        self.streams.load(SeqCst) + mounts < self.limit && mounts <= self.floor.load(SeqCst)
+        self.streams.load(SeqCst) + mounts < self.limit
+            && self.mounts_before(self.floor.load(SeqCst))
+    }
+
+    /// Whether the mount lane, against a streamed lane with `bytes` in flight, starts first.
+    fn mounts_before(&self, bytes: u64) -> bool {
+        let mounts = self.mounts.load(SeqCst);
+        mounts < bytes || (mounts == bytes && self.mount_turn.load(SeqCst))
+    }
+
+    /// A plan started a streamed load: the mount lane has the next tie if its reads wait.
+    fn streamed_started(&self) {
+        if self.waiting.load(SeqCst) {
+            self.mount_turn.store(true, SeqCst);
+        }
     }
 
     pub(crate) fn limit(&self) -> u64 {
@@ -927,13 +948,14 @@ impl Residency {
             else {
                 break;
             };
-            yielded |=
-                self.shared.mounts_waiting() && self.shared.mounts() < self.lane_in_flight[lane];
+            yielded |= self.shared.mounts_waiting()
+                && self.shared.mounts_before(self.lane_in_flight[lane]);
             let full = yielded || self.full();
             if lane == BLOB_LANE {
                 let bytes = blob.expect("a blob lane with demand left");
                 blob = match self.start_blob(bytes, full) {
                     Ok(()) => {
+                        self.shared.streamed_started();
                         plan.blobs += 1;
                         blobs.next()
                     }
@@ -984,6 +1006,7 @@ impl Residency {
                 started.insert(u);
                 plan.loads.push(u);
             }
+            self.shared.streamed_started();
         }
         let floor = (0..LANES)
             .filter(|&l| short[l])
@@ -1363,6 +1386,50 @@ mod tests {
             land_all(&mut r, &plan, frame);
         }
         assert!((0..20).all(|u| r.resident(key(u))));
+    }
+
+    #[test]
+    fn a_mount_read_that_starts_as_the_last_ends_leaves_streamed_loads_their_turn() {
+        let mut r = Residency::new(Limits {
+            in_flight: 100,
+            ..limits(u64::MAX)
+        });
+        let units: Vec<UnitDesc> = (0..30).map(|_| unit(10, &[], Start::Absent)).collect();
+        r.register(M, &units).unwrap();
+        // Each read alone fills the limit.
+        let mut queue: VecDeque<(u64, ())> = (0..20).map(|_| (100, ())).collect();
+        let shared = Arc::clone(r.in_flight());
+        let mut reading = VecDeque::new();
+        let mut plan = Plan::default();
+        let mut idle = 0;
+        for frame in 1.. {
+            land_all(&mut r, &plan, frame);
+            let absent: Vec<u32> = (0..30).filter(|&u| r.absent(key(u))).collect();
+            if absent.is_empty() && queue.is_empty() {
+                break;
+            }
+            assert!(frame < 40, "loads still waiting at frame {frame}");
+            for &u in &absent {
+                r.request(key(u), P, S);
+            }
+            plan = r.plan(frame, []);
+            idle = if absent.is_empty() || !plan.loads.is_empty() {
+                0
+            } else {
+                idle + 1
+            };
+            assert!(
+                idle < 2,
+                "no streamed load starts at frame {frame} or the one before"
+            );
+            // The wake after the plan, then a read ending on a worker, whose ticket starts the
+            // next before the next plan.
+            shared.start_mounts(&mut queue, |bytes, ()| reading.push_back(bytes));
+            if let Some(bytes) = reading.pop_front() {
+                shared.end_mount(bytes);
+                shared.start_mounts(&mut queue, |bytes, ()| reading.push_back(bytes));
+            }
+        }
     }
 
     #[test]
