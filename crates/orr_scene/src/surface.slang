@@ -95,10 +95,18 @@ public interface ISurface
     // Reports to the frame's texture feedback the level each streamed texture `coverage` reads
     // at the hit wants; `CoverageFeedback` calls it for hits whose context asks. Without its
     // own, a surface reports what the material's alpha test reads
-    // (`material_coverage_feedback`).
+    // (`material_opacity_feedback`).
     static void coverage_feedback(SurfaceInput i)
     {
-        material_coverage_feedback(i);
+        material_opacity_feedback(i);
+    }
+
+    // How much of a presence layer is present at the hit, 0 to 1: its material's opacity, which
+    // no linked surface changes, so the switch over linked surfaces forwards none. It is a
+    // method so that `CoverageFeedback` can report its read.
+    static float presence(SurfaceInput i)
+    {
+        return material_opacity(i);
     }
 }
 
@@ -111,7 +119,7 @@ UvFootprint finest_footprint(UvFootprint f)
     return f;
 }
 
-// The slot `material_opacity`, `blend_decal` and `material_coverage_feedback` read opacity
+// The slot `material_opacity`, `blend_decal` and `material_opacity_feedback` read opacity
 // from: the opacity slot where it is bound, else the base color slot, whose alpha they read.
 uint opacity_slot(MaterialGpu* m)
 {
@@ -203,9 +211,9 @@ public float material_coverage(SurfaceInput i)
     return material_opacity(i) >= i.scene.materials[i.material].alpha_cutoff ? 1.0 : 0.0;
 }
 
-// Reports to the frame's texture feedback what `material_coverage` reads at the hit: the slot
-// `material_opacity` reads, at mip 0.
-public void material_coverage_feedback(SurfaceInput i)
+// Reports to the frame's texture feedback what `material_opacity` reads at the hit: the slot
+// `opacity_slot` picks, at mip 0.
+public void material_opacity_feedback(SurfaceInput i)
 {
     MaterialGpu* m = i.scene.materials + i.material;
     if ((m.flags & (MATERIAL_ALPHA_TESTED | MATERIAL_PRESENCE)) == 0)
@@ -564,7 +572,7 @@ float surface_tangent_angle(float4 tangent, float3 normal, float rotation)
 }
 
 // Whether `StandardSurface` reads bound slot `slot` of `m` at the hit's footprint. Opacity is
-// the alpha test's, at mip 0 (`material_coverage_feedback`), displacement the tessellation's
+// the alpha test's, at mip 0 (`material_opacity_feedback`), displacement the tessellation's
 // and the medium's slots `material_medium`'s; emission reads at mip 0 past a primary hit
 // (`surface_reads_point`).
 bool surface_reads(MaterialGpu* m, uint slot, bool primary)
@@ -668,11 +676,17 @@ public struct FeedbackSurface<S : ISurface> : ISurface
     {
         S.coverage_feedback(i);
     }
+
+    public override static float presence(SurfaceInput i)
+    {
+        return S.presence(i);
+    }
 }
 
-// `S` whose alpha tests report their texture feedback (`ISurface.coverage_feedback`) where their
-// context asks; its hits shade as `S`'s do and report nothing. A kernel tests through it only
-// the candidates and pixels that may report, so the others carry none of the code.
+// `S` whose alpha tests (`ISurface.coverage_feedback`) and presence layers' opacity
+// (`material_opacity_feedback`) report their texture feedback where their context asks; its
+// hits shade as `S`'s do and report nothing. A kernel tests through it only the candidates and
+// pixels that may report, so the others carry none of the code.
 public struct CoverageFeedback<S : ISurface> : ISurface
 {
     public static GSurface surface(SurfaceInput i, out float depth_offset)
@@ -695,6 +709,13 @@ public struct CoverageFeedback<S : ISurface> : ISurface
     public override static void coverage_feedback(SurfaceInput i)
     {
         S.coverage_feedback(i);
+    }
+
+    public override static float presence(SurfaceInput i)
+    {
+        if (i.context.feedback)
+            material_opacity_feedback(i);
+        return S.presence(i);
     }
 }
 

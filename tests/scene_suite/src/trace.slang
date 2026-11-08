@@ -1,7 +1,8 @@
 // Rays through a scene's PTLAS. `pixels` traces one camera ray per pixel and resolves its
 // hit; `same_point` resolves each pixel's visible point three ways, as the material resolve
 // does, from a camera ray and from a ray arriving from elsewhere; `cones` follows a camera
-// ray to its hit and a mirror ray from there to the next, with their ray cones.
+// ray to its hit and a mirror ray from there to the next, presence layers among them, with
+// their ray cones.
 #include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.trace;
@@ -60,14 +61,15 @@ struct Root
     Seen* seen;
     Cone* cones;
     uint mode;             // 1: `pixels` resolves its hits and `cones` reports its mirror ray's
-                           // texture feedback, its alpha tests' and its hit's; 2: `pixels` gives
-                           // each hit's position last frame
+                           // texture feedback, its alpha tests', its presence layers' and its
+                           // hit's; 2: `pixels` gives each hit's position last frame
     uint pad0;
     uint64_t pad1;
 }
 ORR_ROOT(Root);
 
-// Alpha-tested candidates through `resolve_alpha` of surface `S`.
+// Candidates through surface `S`: presence layers wherever their opacity (`resolve_coverage`) is
+// above 0, the rest through `resolve_alpha`.
 struct Alpha<S : ISurface> : IAnyHit
 {
     SceneRoot* s;
@@ -77,7 +79,11 @@ struct Alpha<S : ISurface> : IAnyHit
 
     bool accept(Candidate c)
     {
-        return c.cluster_id >= 0 && resolve_alpha<S>(s, v, d, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context);
+        if (c.cluster_id < 0)
+            return false;
+        if (c.class_id == CLASS_PRESENCE)
+            return resolve_coverage<S>(s, v, d, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context) > 0.0;
+        return resolve_alpha<S>(s, v, d, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context);
     }
 }
 
@@ -87,7 +93,8 @@ struct Found
     float3 positions[3];
 }
 
-Found trace<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 d, float t_max, HitContext context)
+// The nearest hit along `d` of the geometry in `mask`.
+Found trace<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 d, float t_max, HitContext context, uint mask = MASK_OPAQUE)
 {
     RayDesc ray;
     ray.Origin = origin;
@@ -100,7 +107,7 @@ Found trace<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 
     a.d = d;
     a.context = context;
     Found f;
-    f.hit = trace_closest(s.tlas, ray, MASK_OPAQUE, RAY_FLAG_NONE, a, f.positions);
+    f.hit = trace_closest(s.tlas, ray, mask, RAY_FLAG_NONE, a, f.positions);
     return f;
 }
 
@@ -264,7 +271,7 @@ void cones(uint3 id: SV_DispatchThreadID)
         float3 r = reflect(d, n);
         RayCone next = cone_after_hit(cone, f.hit.t, 0.0);
         float3 origin = a.surface.position + n * 1e-3;
-        Found f2 = trace<CoverageFeedback<Surface>>(s, v, origin, r, 1e30, hit_context(HIT_SECONDARY, 1, next, 0.0, float2(-1.0), root.mode == 1));
+        Found f2 = trace<CoverageFeedback<Surface>>(s, v, origin, r, 1e30, hit_context(HIT_SECONDARY, 1, next, 0.0, float2(-1.0), root.mode == 1), MASK_OPAQUE | MASK_DIELECTRIC);
         if (f2.hit.hit && f2.hit.cluster_id >= 0)
         {
             HitContext reflected = hit_context(HIT_SECONDARY, 1, next, f2.hit.t, float2(-1.0), root.mode == 1);

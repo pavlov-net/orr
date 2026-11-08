@@ -45,7 +45,8 @@ struct Switch {
 }
 
 /// The interface's methods as contracts.md 6 defines them. A link-point interface change
-/// edits this table in the same change.
+/// edits this table in the same change. `ISurface.presence` stays out: a presence layer's
+/// opacity is its material's whatever the surface.
 const SURFACE: Switch = Switch {
     id: "i.surface",
     default: "StandardSurface",

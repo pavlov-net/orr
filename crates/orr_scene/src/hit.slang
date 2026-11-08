@@ -964,7 +964,7 @@ public float resolve_presence<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     // the fade.
     if (alpha && (flags & MATERIAL_ALPHA_TESTED) == 0)
         return 1.0;
-    float coverage = !alpha && (flags & MATERIAL_PRESENCE) != 0 ? material_opacity(h.input) : S.coverage(h.input);
+    float coverage = !alpha && (flags & MATERIAL_PRESENCE) != 0 ? S.presence(h.input) : S.coverage(h.input);
     if (!alpha)
         return coverage;
     uint3 key = uint3(asuint(bary.x) ^ (instance_index * 0x9E3779B9u), asuint(bary.y) ^ (primitive * 0x85EBCA6Bu), s.frame_index ^ cluster_id);
@@ -982,8 +982,8 @@ public bool resolve_alpha<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d
 }
 
 // How much of a non-opaque triangle candidate is present, 0 to 1: a presence material's
-// opacity, else the linked surface's coverage or the material's alpha test. Presence layers
-// pass rays through by it.
+// opacity (`ISurface.presence`), else the linked surface's coverage or the material's alpha
+// test. Presence layers pass rays through by it.
 public float resolve_coverage<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context)
 {
     return resolve_presence<S>(s, v, d, instance_index, cluster_id, primitive, bary, context, false);

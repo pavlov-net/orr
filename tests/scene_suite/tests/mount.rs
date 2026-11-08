@@ -1931,10 +1931,11 @@ fn unit_quad() -> MeshInput {
 
 const LEAF_OPACITY: &str = "leaf/opacity";
 
-/// A pack of `unit_quad` as "quad", of the default material, and as "leaf", alpha-tested at 0.5
-/// by `LEAF_OPACITY` in its opacity slot: 1024 x 1024 texels of which a hashed quarter are 0
-/// and the rest 1, so every micro-triangle of its micromaps and both its triangles are unsure
-/// and the alpha test reads the texture wherever a ray or pixel meets it.
+/// A pack of `unit_quad` as "quad", of the default material, as "leaf", alpha-tested at 0.5 by
+/// `LEAF_OPACITY` in its opacity slot, and as "veil", a presence layer of that opacity.
+/// `LEAF_OPACITY` is 1024 x 1024 texels of which a hashed quarter are 0 and the rest 1, so every
+/// micro-triangle of the leaf's micromaps and both its triangles are unsure and the alpha test
+/// reads the texture wherever a ray or pixel meets it.
 fn leaf_pack() -> &'static Arc<[u8]> {
     static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
     PACK.get_or_init(|| {
@@ -1963,6 +1964,11 @@ fn leaf_pack() -> &'static Arc<[u8]> {
             ..Material::default()
         };
         leaf.textures[slot::OPACITY].texture = AssetId::from_name(LEAF_OPACITY);
+        let mut veil = Material {
+            alpha_mode: Material::BLEND,
+            ..Material::default()
+        };
+        veil.textures[slot::OPACITY].texture = AssetId::from_name(LEAF_OPACITY);
         let mesh = |name: &str, material| AssetSpec {
             name: name.into(),
             source: Source::Mesh {
@@ -1987,6 +1993,7 @@ fn leaf_pack() -> &'static Arc<[u8]> {
                     },
                     mesh("quad", Material::default()),
                     mesh("leaf", leaf),
+                    mesh("veil", veil),
                 ],
             )],
         };
@@ -2240,6 +2247,31 @@ fn an_alpha_tested_wall_seen_only_in_a_mirror_loads_the_opacity_tiles_its_ray_al
         wall,
         None,
         512 * 512 / 4,
+        [tails, tails + tiles],
+    );
+    assert_clean();
+}
+
+/// A presence layer that rays alone see, in a mirror, its opacity a streamed texture, loads every
+/// tile of its opacity's mips 0 and 1 once the mirror rays report texture feedback: each
+/// candidate of theirs on it reads its opacity at mip 0. Nothing loads while they do not report.
+#[test]
+fn a_presence_layer_seen_only_in_a_mirror_loads_the_opacity_tiles_its_ray_candidates_read() {
+    let _serial = serial();
+    let dev = device();
+    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let leaf = scenes.mount(PackSource::Memory(Arc::clone(leaf_pack())));
+    ready(&mut scenes, leaf);
+    let quad = scenes.model(leaf, AssetId::from_name("quad")).unwrap();
+    let veil = scenes.model(leaf, AssetId::from_name("veil")).unwrap();
+    let (tails, tiles) = streamed_bytes(&scenes, leaf, AssetId::from_name(LEAF_OPACITY));
+    mirror_feedback(
+        &mut scenes,
+        quad,
+        veil,
+        None,
+        512 * 512 / 2,
         [tails, tails + tiles],
     );
     assert_clean();
