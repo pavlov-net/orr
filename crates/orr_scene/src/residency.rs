@@ -16,6 +16,7 @@
 //! budgets grow back.
 
 use std::collections::BTreeSet;
+use std::ops::Bound::{Excluded, Unbounded};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -237,6 +238,8 @@ struct Unit {
     /// Units in `Loading` or `Resident` that depend on this one.
     dependents: u32,
     touched: u64,
+    /// The touch its class's LRU holds it under, at most `touched`.
+    listed: u64,
 }
 
 /// Whether a request's closure loads this step.
@@ -273,7 +276,9 @@ pub(crate) struct Residency {
     /// The share of `limits.budgets` that loads and evictions plan under.
     scale: f64,
     mounts: FxHashMap<MountId, Vec<Unit>>,
-    /// Resident units that are not pinned, by last touch, per class.
+    /// Resident units that are not pinned, per class, by a touch no later than their last:
+    /// a touch only marks the unit, and the unit moves to its last touch once an eviction
+    /// reaches it.
     lru: [BTreeSet<(u64, Key)>; CLASSES],
     /// Resident plus loading bytes per class.
     used: [u64; CLASSES],
@@ -394,6 +399,7 @@ impl Residency {
                 locks: u32::from(u.start == Start::Locked),
                 dependents: 0,
                 touched: 0,
+                listed: 0,
             })
             .collect();
         for i in 0..list.len() {
@@ -435,7 +441,7 @@ impl Residency {
                     self.used[c] -= u.bytes;
                     self.resident_units[c] -= 1;
                     self.lru[c].remove(&(
-                        u.touched,
+                        u.listed,
                         Key {
                             mount,
                             unit: i as u32,
@@ -486,15 +492,9 @@ impl Residency {
         else {
             return;
         };
-        if u.state != State::Resident || u.touched >= frame {
-            return;
+        if u.state == State::Resident {
+            u.touched = u.touched.max(frame);
         }
-        if !u.pinned {
-            let lru = &mut self.lru[u.class as usize];
-            lru.remove(&(u.touched, k));
-            lru.insert((frame, k));
-        }
-        u.touched = frame;
     }
 
     /// Keeps resident `k` from being evicted until as many [`Residency::unlock`]s: a cached
@@ -665,6 +665,7 @@ impl Residency {
         if ok {
             u.state = State::Resident;
             u.touched = frame;
+            u.listed = frame;
             self.resident_units[c] += 1;
             self.stats.landed += 1;
             self.lru[c].insert((frame, k));
@@ -819,14 +820,32 @@ impl Residency {
 
     /// Units of class `c` past their hold, least recently touched first, whose eviction
     /// frees `over` bytes, leaving `held` units and those with resident dependents; and the
-    /// bytes still over when no more can go.
-    fn victims(&self, c: usize, mut over: u64, frame: u64, held: &[Key]) -> (Vec<Key>, u64) {
+    /// bytes still over when no more can go. Moves each unit it reaches that was touched since
+    /// it was listed to its last touch.
+    fn victims(&mut self, c: usize, mut over: u64, frame: u64, held: &[Key]) -> (Vec<Key>, u64) {
         let mut victims = Vec::new();
-        for &(touched, k) in &self.lru[c] {
-            if over == 0 || touched + HOLD_FRAMES >= frame {
+        let mut after = None;
+        while over > 0 {
+            let next = match after {
+                None => self.lru[c].first(),
+                Some(a) => self.lru[c].range((Excluded(a), Unbounded)).next(),
+            };
+            let Some(&(listed, k)) = next else { break };
+            if listed + HOLD_FRAMES >= frame {
                 break;
             }
-            let u = self.unit(k).expect("resident unit");
+            let u = self
+                .mounts
+                .get_mut(&k.mount)
+                .and_then(|m| m.get_mut(k.unit as usize))
+                .expect("resident unit");
+            if u.touched != listed {
+                u.listed = u.touched;
+                self.lru[c].remove(&(listed, k));
+                self.lru[c].insert((u.touched, k));
+                continue;
+            }
+            after = Some((listed, k));
             if u.locks == 0 && u.dependents == 0 && !held.contains(&k) {
                 victims.push(k);
                 over = over.saturating_sub(u.bytes);
@@ -840,7 +859,7 @@ impl Residency {
         let units = self.mounts.get_mut(&k.mount).expect("mounted");
         let u = &mut units[k.unit as usize];
         let c = u.class as usize;
-        self.lru[c].remove(&(u.touched, k));
+        self.lru[c].remove(&(u.listed, k));
         u.state = State::Absent;
         self.used[c] -= u.bytes;
         self.resident_units[c] -= 1;
