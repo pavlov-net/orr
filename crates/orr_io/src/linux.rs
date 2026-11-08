@@ -8,7 +8,7 @@ use std::sync::Arc;
 use io_uring::{IoUring, Probe, opcode, types};
 
 use crate::SECTOR;
-use crate::buffers::Arena;
+use crate::buffers::{Arena, MAX_PIECE};
 use crate::native::{DEPTH, InFlight, OpenFile};
 
 /// Opens with `O_DIRECT`, or buffered where the file system refuses it or needs an alignment
@@ -100,7 +100,9 @@ pub(crate) fn wait_any(events: &[&Event]) {
 pub(crate) struct OsRing {
     ring: IoUring,
     event: Arc<Event>,
-    /// The pieces of the arena registered, from its start.
+    /// The bytes of each registered piece of the arena, as [`Arena::pieces`] cuts it.
+    piece: usize,
+    /// The pieces registered, from the arena's start.
     registered: u32,
     /// The descriptor in each entry of the registered file table, -1 for none, until an
     /// update fails and reads name their files by descriptor.
@@ -119,26 +121,35 @@ impl OsRing {
         ring.submitter()
             .register_eventfd(event.0.as_raw_fd())
             .ok()?;
-        let iovecs: Vec<libc::iovec> = arena
-            .pieces()
-            .map(|(address, len)| libc::iovec {
-                iov_base: address.cast(),
-                iov_len: len,
-            })
-            .collect();
         // Registered buffers count against the user's RLIMIT_MEMLOCK unless the process has
-        // CAP_IPC_LOCK, and the limit is often a few MiB. Halving the pieces until the kernel
-        // takes them registers the arena's start, where first-fit keeps the ranges in use.
-        // Reads name unregistered buffers by address.
-        let register = |pieces: &[libc::iovec]| {
+        // CAP_IPC_LOCK, and the limit is often a few MiB. Where the kernel refuses the whole
+        // arena, halving the bytes until it takes them registers the arena's start as one
+        // piece, where first-fit keeps the ranges in use. Reads name unregistered buffers by
+        // address.
+        let register = |piece: usize, count: usize| {
+            let iovecs: Vec<libc::iovec> = arena
+                .pieces(piece)
+                .take(count)
+                .map(|(address, len)| libc::iovec {
+                    iov_base: address.cast(),
+                    iov_len: len,
+                })
+                .collect();
             // SAFETY: the arena stays mapped while the ring lives, as its owner holds it.
-            unsafe { ring.submitter().register_buffers(pieces) }.is_ok()
+            unsafe { ring.submitter().register_buffers(&iovecs) }.is_ok()
         };
-        let mut registered = iovecs.len();
-        while registered > 0 && !register(&iovecs[..registered]) {
-            registered /= 2;
-        }
-        let registered = registered as u32;
+        let mut bytes = arena.len();
+        let (piece, registered) = loop {
+            let piece = bytes.min(MAX_PIECE);
+            let count = bytes.div_ceil(piece);
+            if register(piece, count) {
+                break (piece, count as u32);
+            }
+            bytes = bytes / 2 / SECTOR * SECTOR;
+            if bytes == 0 {
+                break (MAX_PIECE, 0);
+            }
+        };
         // Kernels before 5.5 refuse a table of empty entries; reads there name their files by
         // descriptor.
         let files = ring
@@ -149,6 +160,7 @@ impl OsRing {
         Some(Self {
             ring,
             event,
+            piece,
             registered,
             files,
         })
@@ -191,7 +203,7 @@ impl OsRing {
         let fd = f.read.file.handle.as_raw_fd();
         let fixed = self.files.is_some().then_some(types::Fixed(f.file as u32));
         let buffer = arena
-            .index(address, len as usize)
+            .index(address, len as usize, self.piece)
             .filter(|&(piece, _)| piece < self.registered);
         let sqe = match (fixed, buffer) {
             (Some(file), Some((index, _))) => {
@@ -216,8 +228,9 @@ impl OsRing {
         Ok(())
     }
 
-    pub(crate) fn registered_pieces(&self) -> usize {
-        self.registered as usize
+    pub(crate) fn registered_bytes(&self, arena: &Arena) -> usize {
+        let pieces = arena.pieces(self.piece).take(self.registered as usize);
+        pieces.map(|(_, len)| len).sum()
     }
 
     /// Never: the queue holds an entry for every slot, and registrations do not use it.

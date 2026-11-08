@@ -141,13 +141,10 @@ pub(crate) struct Arena {
     misses: AtomicU64,
 }
 
-/// The most bytes of one registered piece of the arena. io_uring takes at most 1 GiB per
-/// buffer and counts them against the memory lock limit, so on Linux the pieces are small
-/// enough that a limit of a few of them registers a prefix of the arena.
-#[cfg(windows)]
-const PIECE: usize = 1 << 30;
-#[cfg(target_os = "linux")]
-const PIECE: usize = 16 << 20;
+/// The most bytes of one registered piece of the arena: io_uring takes at most 1 GiB per
+/// buffer.
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) const MAX_PIECE: usize = 1 << 30;
 
 impl Arena {
     fn take(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
@@ -172,25 +169,31 @@ impl Arena {
         (at < self.pages.len).then_some(at)
     }
 
-    /// The arena in pieces of at most [`PIECE`] bytes, in the order [`Arena::index`] counts
-    /// them, for the system to register.
+    /// Bytes of the arena.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn len(&self) -> usize {
+        self.pages.len
+    }
+
+    /// The arena in pieces of `piece` bytes, the last one shorter where the arena ends, in the
+    /// order [`Arena::index`] counts them, for the system to register.
     #[cfg(any(windows, target_os = "linux"))]
-    pub(crate) fn pieces(&self) -> impl Iterator<Item = (*mut u8, usize)> + '_ {
-        (0..self.pages.len).step_by(PIECE).map(|at| {
+    pub(crate) fn pieces(&self, piece: usize) -> impl Iterator<Item = (*mut u8, usize)> + '_ {
+        (0..self.pages.len).step_by(piece).map(move |at| {
             // SAFETY: `at` lies inside the pages.
             let ptr = unsafe { self.pages.ptr.add(at) }.as_ptr();
-            (ptr, (self.pages.len - at).min(PIECE))
+            (ptr, (self.pages.len - at).min(piece))
         })
     }
 
-    /// The piece among [`Arena::pieces`] holding the `len` bytes at `ptr`, and `ptr`'s offset
-    /// in it; `None` when they are not all in one piece.
+    /// The piece among [`Arena::pieces`] of `piece` bytes holding the `len` bytes at `ptr`,
+    /// and `ptr`'s offset in it; `None` when they are not all in one piece.
     #[cfg(any(windows, target_os = "linux"))]
-    pub(crate) fn index(&self, ptr: *const u8, len: usize) -> Option<(u32, u32)> {
+    pub(crate) fn index(&self, ptr: *const u8, len: usize, piece: usize) -> Option<(u32, u32)> {
         let at = self.offset(ptr)?;
-        let (piece, offset) = (at / PIECE, at % PIECE);
-        let piece_len = (self.pages.len - piece * PIECE).min(PIECE);
-        (offset + len <= piece_len).then_some((piece as u32, offset as u32))
+        let (index, offset) = (at / piece, at % piece);
+        let piece_len = (self.pages.len - index * piece).min(piece);
+        (offset + len <= piece_len).then_some((index as u32, offset as u32))
     }
 }
 

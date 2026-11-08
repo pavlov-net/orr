@@ -10,7 +10,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::SECTOR;
-use crate::buffers::Arena;
+use crate::buffers::{Arena, MAX_PIECE};
 use crate::native::{InFlight, OpenFile};
 
 mod bindings;
@@ -349,7 +349,7 @@ impl OsRing {
         // SAFETY: the ring and the event are live.
         unsafe { set_event(ring.ring, ring.event.0) }.ok().ok()?;
         let buffers: Vec<IORING_BUFFER_INFO> = arena
-            .pieces()
+            .pieces(MAX_PIECE)
             .map(|(address, len)| IORING_BUFFER_INFO {
                 Address: address.cast(),
                 Length: len as u32,
@@ -425,7 +425,7 @@ impl OsRing {
                 Index: f.file as u32,
             },
         };
-        let data = match arena.index(address, len as usize) {
+        let data = match arena.index(address, len as usize, MAX_PIECE) {
             Some((index, offset)) => IORING_BUFFER_REF {
                 Kind: IORING_REF_REGISTERED,
                 Buffer: IORING_BUFFER_REF_0 {
@@ -452,9 +452,9 @@ impl OsRing {
         Ok(())
     }
 
-    /// Every piece: a ring that cannot register the arena is not made.
-    pub(crate) fn registered_pieces(&self) -> usize {
-        usize::MAX
+    /// The whole arena: a ring that cannot register it is not made.
+    pub(crate) fn registered_bytes(&self, arena: &Arena) -> usize {
+        arena.pieces(MAX_PIECE).map(|(_, len)| len).sum()
     }
 
     /// Whether the last submit failed, leaving entries in the queue.

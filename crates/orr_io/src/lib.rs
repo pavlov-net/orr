@@ -417,20 +417,9 @@ impl Ring {
     pub fn registered_bytes(&self) -> usize {
         match &self.backend {
             #[cfg(any(windows, target_os = "linux"))]
-            Backend::Native(r) => r
-                .buffers
-                .0
-                .pieces()
-                .take(r.ring.registered_pieces())
-                .map(|(_, len)| len)
-                .sum(),
+            Backend::Native(r) => r.ring.registered_bytes(&r.buffers.0),
             Backend::Positioned(..) => 0,
         }
-    }
-
-    /// Whether the system has any of its buffers' arena registered.
-    pub fn registered_buffers(&self) -> bool {
-        self.registered_bytes() > 0
     }
 
     /// Whether reads are queued or in flight.
