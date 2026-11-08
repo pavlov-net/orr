@@ -1,5 +1,6 @@
-//! File reads: sector-aligned buffers, file handles that let a file be replaced by rename
-//! while open, positioned reads, and a completion ring for batched reads.
+//! File reads: sector-aligned buffers from one arena, file handles that let a file be
+//! replaced by rename while open, positioned reads, and a completion ring for batched reads;
+//! and the first-fit range allocator the arena uses.
 //!
 //! On Windows the ring is an IoRing, loaded at run time, and on Linux an io_uring. Elsewhere,
 //! and where the system refuses them, [`Ring::positioned`] runs the same reads as positioned
@@ -21,6 +22,7 @@ mod buffers;
 mod linux;
 #[cfg(any(windows, target_os = "linux"))]
 mod native;
+mod range;
 #[cfg(windows)]
 mod windows;
 
@@ -31,14 +33,13 @@ use crate::windows as sys;
 
 use crate::buffers::ReadAlloc;
 pub use crate::buffers::ReadBuffers;
+pub use crate::range::RangeAllocator;
 
 /// Alignment and size granule of unbuffered reads. A [`ReadFile`] on a volume whose sectors do
 /// not divide it is buffered.
 pub const SECTOR: usize = 4096;
 
-/// Reads a [`Ring`] keeps in flight at once; 64 reach a fast NVMe drive's rate. With this
-/// many [`ReadBuffers`] of each size, a ring's reads wait for a buffer only while those the
-/// reads before them filled are still held.
+/// Reads a [`Ring`] keeps in flight at once; 64 reach a fast NVMe drive's rate.
 pub const RING_DEPTH: usize = 64;
 
 /// The most bytes one read asks the system for, which is under every platform's limit.
@@ -53,7 +54,7 @@ pub struct AlignedBuf(Vec<u8, ReadAlloc>);
 
 impl AlignedBuf {
     /// An empty buffer with room for at least `len` bytes (at least one sector), of its own
-    /// memory. [`ReadBuffers`] hands out buffers it keeps.
+    /// memory. [`ReadBuffers`] hands out ranges of its arena.
     pub fn new(len: usize) -> Self {
         Self(Vec::with_capacity_in(
             Self::capacity_for(len),
@@ -91,6 +92,12 @@ impl AlignedBuf {
     /// The filled bytes.
     pub fn as_slice(&self) -> &[u8] {
         &self.0
+    }
+
+    /// The first byte, filled or not, for memory that reads and writes it elsewhere, such as
+    /// a GPU's import of the arena.
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr()
     }
 
     pub fn len(&self) -> usize {
@@ -280,7 +287,8 @@ impl ReadFile {
     }
 
     /// Whether reads can go straight into memory a GPU driver mapped. Linux pins the pages of
-    /// an unbuffered read, which it refuses for driver mappings (`VM_PFNMAP`).
+    /// an unbuffered read, which it refuses for driver mappings (`VM_PFNMAP`). Every read can
+    /// go into the process's own pages, such as a [`ReadBuffers`] arena a GPU imports.
     pub fn reads_into_driver_mappings(&self) -> bool {
         !(cfg!(target_os = "linux") && self.unbuffered)
     }
@@ -325,8 +333,8 @@ pub struct Read {
     pub file: Arc<ReadFile>,
     pub offset: u64,
     pub len: usize,
-    /// The buffer the read fills, empty and of `len` bytes rounded up to a sector; one of the
-    /// ring's buffers when none.
+    /// The buffer the read fills, empty and of `len` bytes rounded up to a sector; one from
+    /// the ring's [`ReadBuffers`] when none.
     pub into: Option<AlignedBuf>,
     /// Runs inside [`Ring::pump`] when the read completes.
     pub done: ReadDone,
@@ -350,8 +358,7 @@ enum Backend {
 impl Ring {
     /// A ring backed by the operating system's completion ring, or `None` where it is
     /// missing or refused, as on old Linux kernels or where seccomp blocks io_uring. Reads go
-    /// into `buffers`, which it registers with the system where it can; a read waits in the
-    /// queue while every buffer of its size is out.
+    /// into `buffers`, whose arena it registers with the system where it can.
     pub fn native(buffers: &ReadBuffers) -> Option<Self> {
         #[cfg(any(windows, target_os = "linux"))]
         let backend = native::Native::new(buffers).map(|r| Backend::Native(Box::new(r)));
@@ -364,7 +371,7 @@ impl Ring {
     }
 
     /// A ring that runs each read as a positioned read into `buffers` on the thread calling
-    /// [`Ring::pump`], which blocks while every buffer of the read's size is out.
+    /// [`Ring::pump`].
     pub fn positioned(buffers: &ReadBuffers) -> Self {
         Self {
             backend: Backend::Positioned(VecDeque::new(), buffers.clone()),
@@ -404,9 +411,9 @@ impl Ring {
         }
     }
 
-    /// Whether the system has its buffers registered, so that reads into them skip mapping
-    /// them; reads name the others by address. Linux refuses a registration past the memory
-    /// lock limit.
+    /// Whether the system has the arena of its buffers registered, so that reads into it skip
+    /// mapping their buffers; reads name the others by address. Linux refuses a registration
+    /// past the memory lock limit.
     pub fn registered_buffers(&self) -> bool {
         match &self.backend {
             #[cfg(any(windows, target_os = "linux"))]
@@ -459,9 +466,8 @@ impl Wake {
         }
     }
 
-    /// Blocks until [`Wake::set`] is called, or `ring` has a completion to pump or a buffer
-    /// back for a read it holds. Returns at once while a positioned ring has queued reads, and
-    /// may return early otherwise.
+    /// Blocks until [`Wake::set`] is called or `ring` has a completion to pump. Returns at once
+    /// while a positioned ring has queued reads, and may return early otherwise.
     pub fn wait(&self, ring: Option<&Ring>) {
         let ring = ring.filter(|r| r.busy());
         #[cfg(any(windows, target_os = "linux"))]

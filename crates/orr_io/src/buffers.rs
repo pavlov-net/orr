@@ -1,21 +1,19 @@
-//! Read buffers in size classes, in pages taken from the system once.
+//! Read buffers: sector ranges of one arena of pages taken from the system once.
 
 use std::alloc::{AllocError, Allocator, Global, Layout};
 use std::io;
 use std::ptr::NonNull;
-#[cfg(any(windows, target_os = "linux"))]
-use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
-use crate::{AlignedBuf, SECTOR};
+use crate::{AlignedBuf, RangeAllocator, SECTOR};
 
 /// Where an [`AlignedBuf`]'s memory comes from.
 pub(crate) enum ReadAlloc {
     /// The global allocator, with the block raised to a [`SECTOR`] boundary.
     Own,
-    /// A [`ReadBuffers`] buffer.
-    Pool(Arc<Pool>),
+    /// A range of a [`ReadBuffers`] arena.
+    Arena(Arc<Arena>),
     /// Memory of the buffer's maker at `at`, which it hands out once and never frees.
     Borrowed {
         at: usize,
@@ -29,14 +27,15 @@ fn sector_layout(layout: Layout) -> Result<Layout, AllocError> {
 }
 
 // SAFETY: `Own` forwards every call to `Global` with the request's layout raised the same way,
-// so `Global` sees each block with one layout. A `Pool` block is a buffer of the pool's pages,
-// which live while the allocator does, handed out again only after its deallocation. The
-// `Borrowed` block is handed out once, and its maker keeps it valid while the allocator lives.
+// so `Global` sees each block with one layout. An `Arena` block is a range of the arena's
+// pages, which live while the allocator does, handed out again only after its deallocation.
+// The `Borrowed` block is handed out once, and its maker keeps it valid while the allocator
+// lives.
 unsafe impl Allocator for ReadAlloc {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         match self {
             Self::Own => Global.allocate(sector_layout(layout)?),
-            Self::Pool(pool) => pool.take(layout),
+            Self::Arena(arena) => arena.take(layout),
             Self::Borrowed { at, len, taken } => {
                 let fits = layout.size() <= *len && layout.align() <= SECTOR;
                 if !fits || taken.swap(true, Ordering::Relaxed) {
@@ -55,68 +54,39 @@ unsafe impl Allocator for ReadAlloc {
                 // SAFETY: `Global` allocated `ptr` with this layout.
                 unsafe { Global.deallocate(ptr, layout) }
             }
-            Self::Pool(pool) => pool.give(ptr),
+            Self::Arena(arena) => arena.give(ptr, layout),
             Self::Borrowed { .. } => {}
         }
     }
 }
 
-/// Read buffers for a [`crate::Ring`] and for positioned reads: `count` buffers of each size,
-/// in pages taken from the system once and kept until the last clone and the last buffer
-/// are dropped. A buffer comes back when dropped, on any thread. A ring made with them
-/// registers them with the system where it can, which spares it mapping a buffer per read.
+/// Read buffers for a [`crate::Ring`] and for positioned reads: sector ranges of one arena of
+/// pages, taken from the system once and kept until the last clone and the last buffer are
+/// dropped. A range comes back when its buffer drops, on any thread. A ring made with them
+/// registers the arena with the system where it can, which spares it mapping the buffer of
+/// each read, and a GPU can import the arena's pages ([`ReadBuffers::pages`]) to read
+/// buffers in place.
 #[derive(Clone)]
-pub struct ReadBuffers(pub(crate) Arc<Pool>);
+pub struct ReadBuffers(pub(crate) Arc<Arena>);
 
 impl ReadBuffers {
-    /// `count` buffers of each of `sizes`, at most 64 multiples of [`SECTOR`] in rising order.
-    /// A pool holds at least one buffer.
-    pub fn new(sizes: &[usize], count: usize) -> io::Result<Self> {
-        assert!(
-            sizes.is_sorted_by(|a, b| a < b) && sizes.iter().all(|s| s.is_multiple_of(SECTOR)),
-            "read buffer sizes are rising multiples of a sector"
-        );
-        assert!(
-            sizes.first().is_some_and(|&s| s > 0) && count > 0,
-            "a read buffer pool holds buffers"
-        );
-        assert!(sizes.len() <= 64, "at most 64 sizes of read buffer");
-        let mut at = 0;
-        let classes: Box<[Class]> = sizes
-            .iter()
-            .map(|&size| {
-                let c = Class { size, at };
-                at += size * count;
-                c
-            })
-            .collect();
-        let pages = Pages::new(at)?;
-        let free = (0..sizes.len())
-            .map(|_| (0..count as u32).rev().collect())
-            .collect();
-        Ok(Self(Arc::new(Pool {
-            pages,
-            classes,
-            count,
-            free: Mutex::new(Free {
-                lists: free,
-                starved: false,
-            }),
-            returned: Condvar::new(),
-            #[cfg(any(windows, target_os = "linux"))]
-            rings: Mutex::new(Vec::new()),
+    /// An arena of at least `bytes`, and at least a sector.
+    pub fn new(bytes: usize) -> io::Result<Self> {
+        let len = AlignedBuf::capacity_for(bytes);
+        let units = u32::try_from(len / SECTOR)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "read arena too large"))?;
+        Ok(Self(Arc::new(Arena {
+            pages: Pages::new(len)?,
+            free: Mutex::new(RangeAllocator::new(units)),
         })))
     }
 
-    /// A buffer of at least `len` bytes, empty. `None` while every buffer of its size is
-    /// out. A read larger than the largest buffer gets memory of its own.
+    /// An empty buffer of at least `len` bytes in the arena; `None` while the arena has no free
+    /// range that long.
     pub fn try_take(&self, len: usize) -> Option<AlignedBuf> {
         let capacity = AlignedBuf::capacity_for(len);
-        if capacity > self.0.largest() {
-            return Some(AlignedBuf::new(len));
-        }
-        let alloc = ReadAlloc::Pool(Arc::clone(&self.0));
-        let layout = Layout::array::<u8>(capacity).expect("read buffer layout");
+        let alloc = ReadAlloc::Arena(Arc::clone(&self.0));
+        let layout = Layout::array::<u8>(capacity).ok()?;
         let ptr = alloc.allocate(layout).ok()?;
         // SAFETY: `alloc` allocated `capacity` bytes for `u8`'s layout, none of them filled.
         Some(AlignedBuf(unsafe {
@@ -124,155 +94,81 @@ impl ReadBuffers {
         }))
     }
 
-    /// As [`ReadBuffers::try_take`], blocking while every buffer of the size is out.
+    /// As [`ReadBuffers::try_take`], with memory of its own where the arena has no room.
     pub fn take(&self, len: usize) -> AlignedBuf {
-        loop {
-            if let Some(buf) = self.try_take(len) {
-                return buf;
-            }
-            let class = self
-                .0
-                .class(AlignedBuf::capacity_for(len))
-                .expect("a class fits");
-            let free = self.0.free();
-            drop(
-                self.0
-                    .returned
-                    .wait_while(free, |f| {
-                        let empty = f.lists[class].is_empty();
-                        f.starved |= empty;
-                        empty
-                    })
-                    .unwrap(),
-            );
-        }
+        self.try_take(len).unwrap_or_else(|| AlignedBuf::new(len))
     }
 
-    /// Bytes of the buffers.
+    /// Bytes of the arena.
     pub fn bytes(&self) -> usize {
         self.0.pages.len
     }
+
+    /// The arena's pages, from the system's page allocator: where they start and how many
+    /// bytes they hold.
+    pub fn pages(&self) -> (NonNull<u8>, usize) {
+        (self.0.pages.ptr, self.0.pages.len)
+    }
+
+    /// Where `buf`'s memory starts in the arena, if it is there.
+    pub fn offset(&self, buf: &AlignedBuf) -> Option<usize> {
+        self.0.offset(buf.0.as_ptr())
+    }
 }
 
-/// One size of buffer: its size and where its buffers start in the pages.
-struct Class {
-    size: usize,
-    at: usize,
-}
-
-struct Free {
-    /// Indices of each class's buffers that are in the pool.
-    lists: Vec<Vec<u32>>,
-    /// A take found its class empty, or a blocked take waits; the next buffer back wakes
-    /// the takes and the rings.
-    starved: bool,
-}
-
-pub(crate) struct Pool {
+/// The arena behind [`ReadBuffers`]: its pages and their free sectors.
+pub(crate) struct Arena {
     pages: Pages,
-    classes: Box<[Class]>,
-    count: usize,
-    free: Mutex<Free>,
-    returned: Condvar,
-    /// The completion events of the rings reading into the buffers, set when a buffer comes
-    /// back after a take found none, so that a ring waiting for one issues its next reads.
-    #[cfg(any(windows, target_os = "linux"))]
-    rings: Mutex<Vec<Weak<crate::sys::Event>>>,
+    free: Mutex<RangeAllocator>,
 }
 
-impl Pool {
-    /// Sets `event` whenever a buffer comes back that a take found missing, while the event
-    /// lives.
-    #[cfg(any(windows, target_os = "linux"))]
-    pub(crate) fn wake(&self, event: &Arc<crate::sys::Event>) {
-        let mut rings = self.rings.lock().unwrap();
-        rings.retain(|r| r.strong_count() > 0);
-        rings.push(Arc::downgrade(event));
-    }
+/// The most bytes of one registered piece of the arena: io_uring takes at most 1 GiB per
+/// buffer.
+#[cfg(any(windows, target_os = "linux"))]
+const PIECE: usize = 1 << 30;
 
-    /// The size of buffer a read of `len` bytes takes, none when it is larger than all.
-    #[cfg(any(windows, target_os = "linux"))]
-    pub(crate) fn size_of(&self, len: usize) -> Option<usize> {
-        self.class(AlignedBuf::capacity_for(len))
-    }
-
-    fn largest(&self) -> usize {
-        self.classes.last().map_or(0, |c| c.size)
-    }
-
-    fn class(&self, size: usize) -> Option<usize> {
-        self.classes.iter().position(|c| c.size >= size)
-    }
-
-    fn free(&self) -> MutexGuard<'_, Free> {
-        self.free.lock().unwrap()
-    }
-
+impl Arena {
     fn take(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        if layout.align() > SECTOR {
+        if layout.align() > SECTOR || !layout.size().is_multiple_of(SECTOR) {
             return Err(AllocError);
         }
-        let class = self.class(layout.size()).ok_or(AllocError)?;
-        let mut free = self.free();
-        let Some(i) = free.lists[class].pop() else {
-            free.starved = true;
-            return Err(AllocError);
-        };
-        let c = &self.classes[class];
-        // SAFETY: buffer `i` of the class lies inside the pages.
-        let ptr = unsafe { self.pages.ptr.add(c.at + i as usize * c.size) };
-        Ok(NonNull::slice_from_raw_parts(ptr, c.size))
+        let units = u32::try_from(layout.size() / SECTOR).map_err(|_| AllocError)?;
+        let first = self.free.lock().unwrap().alloc(units).ok_or(AllocError)?;
+        // SAFETY: the range lies inside the pages.
+        let ptr = unsafe { self.pages.ptr.add(first as usize * SECTOR) };
+        Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
     }
 
-    fn give(&self, ptr: NonNull<u8>) {
-        let (class, i) = self.locate(ptr.as_ptr()).expect("a buffer of the pool");
-        let mut free = self.free();
-        free.lists[class].push(i);
-        let starved = std::mem::take(&mut free.starved);
-        drop(free);
-        if starved {
-            self.returned.notify_all();
-            #[cfg(any(windows, target_os = "linux"))]
-            for ring in self.rings.lock().unwrap().iter().filter_map(Weak::upgrade) {
-                ring.set();
-            }
-        }
+    fn give(&self, ptr: NonNull<u8>, layout: Layout) {
+        let at = self.offset(ptr.as_ptr()).expect("a range of the arena");
+        let mut free = self.free.lock().unwrap();
+        free.free((at / SECTOR) as u32, (layout.size() / SECTOR) as u32);
     }
 
-    /// The class of the buffer at `ptr` and its index in the class.
-    fn locate(&self, ptr: *const u8) -> Option<(usize, u32)> {
-        let off = (ptr as usize).checked_sub(self.pages.ptr.as_ptr() as usize)?;
-        let class = self
-            .classes
-            .iter()
-            .rposition(|c| c.at <= off)
-            .filter(|&k| off - self.classes[k].at < self.classes[k].size * self.count)?;
-        let c = &self.classes[class];
-        Some((class, ((off - c.at) / c.size) as u32))
+    fn offset(&self, ptr: *const u8) -> Option<usize> {
+        let at = (ptr as usize).checked_sub(self.pages.ptr.as_ptr() as usize)?;
+        (at < self.pages.len).then_some(at)
     }
 
+    /// The arena in pieces of at most [`PIECE`] bytes, in the order [`Arena::index`] counts
+    /// them, for the system to register.
     #[cfg(any(windows, target_os = "linux"))]
-    /// Every buffer, in the order [`Pool::index`] counts them.
-    pub(crate) fn buffers(&self) -> impl Iterator<Item = (*mut u8, usize)> + '_ {
-        self.classes.iter().flat_map(move |c| {
-            (0..self.count).map(move |i| {
-                // SAFETY: buffer `i` of the class lies inside the pages.
-                (
-                    unsafe { self.pages.ptr.add(c.at + i * c.size) }.as_ptr(),
-                    c.size,
-                )
-            })
+    pub(crate) fn pieces(&self) -> impl Iterator<Item = (*mut u8, usize)> + '_ {
+        (0..self.pages.len).step_by(PIECE).map(|at| {
+            // SAFETY: `at` lies inside the pages.
+            let ptr = unsafe { self.pages.ptr.add(at) }.as_ptr();
+            (ptr, (self.pages.len - at).min(PIECE))
         })
     }
 
+    /// The piece among [`Arena::pieces`] holding the `len` bytes at `ptr`, and `ptr`'s offset
+    /// in it; `None` when they are not all in one piece.
     #[cfg(any(windows, target_os = "linux"))]
-    /// The index among [`Pool::buffers`] of the buffer holding `ptr`, and `ptr`'s offset in it.
-    pub(crate) fn index(&self, ptr: *const u8) -> Option<(u32, u32)> {
-        let (class, i) = self.locate(ptr)?;
-        let c = &self.classes[class];
-        let start = self.pages.ptr.as_ptr() as usize + c.at + i as usize * c.size;
-        let index = class * self.count + i as usize;
-        Some((index as u32, (ptr as usize - start) as u32))
+    pub(crate) fn index(&self, ptr: *const u8, len: usize) -> Option<(u32, u32)> {
+        let at = self.offset(ptr)?;
+        let (piece, offset) = (at / PIECE, at % PIECE);
+        let piece_len = (self.pages.len - piece * PIECE).min(PIECE);
+        (offset + len <= piece_len).then_some((piece as u32, offset as u32))
     }
 }
 
@@ -282,7 +178,7 @@ struct Pages {
     len: usize,
 }
 
-// SAFETY: plain memory, which any thread may use; `Pool` orders the uses of each buffer.
+// SAFETY: plain memory, which any thread may use; `Arena` orders the uses of each range.
 unsafe impl Send for Pages {}
 // SAFETY: as above.
 unsafe impl Sync for Pages {}

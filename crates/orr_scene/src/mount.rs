@@ -513,7 +513,6 @@ pub(crate) fn start(loading: &Arc<Loading>, ring: bool, task: Arc<MountTask>, so
                         let mut head = buffers.take(Archive::HEAD_LEN);
                         file.reads.read(0, &mut head)?;
                         let range = Archive::index_range(head.as_slice())?;
-                        // A worker holds one buffer at a time, so takes never wait on each other.
                         drop(head);
                         let mut index = buffers.take(range.len as usize);
                         file.reads.read(0, &mut index)?;

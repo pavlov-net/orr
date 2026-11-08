@@ -8,9 +8,9 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
-use orr_io::{AlignedBuf, RING_DEPTH, ReadBuffers, ReadFile, Ring, SECTOR, Wake};
+use orr_io::{AlignedBuf, ReadBuffers, ReadFile, Ring, SECTOR, Wake};
 
-use orr_gpu::Device;
+use orr_gpu::{Device, ImportedMemory};
 use orr_pack::{Archive, Blob, Codec, Filter};
 
 use crate::edit::{self, EditBatch, EditTask};
@@ -133,21 +133,35 @@ pub struct Loading {
     edits: Mutex<Vec<EditBatch>>,
     cuts: Mutex<Vec<CutBatch>>,
     positioned: bool,
-    /// What archive reads read into, on the ring or on workers.
+    /// What archive reads read into, on the ring or on workers, and streamed units stage in.
     buffers: ReadBuffers,
+    /// The arena of `buffers` as the device reads it, where it imports host memory.
+    imported: Option<ImportedMemory>,
 }
 
-/// The sizes of the read buffers: up to a stream chunk's stored range, which is at most its
-/// decoded length and starts anywhere in a sector. Longer reads take memory of their own.
-const READ_SIZES: [usize; 4] = [
-    SECTOR,
-    4 * SECTOR,
-    orr_pack::texture::TILE_BYTES + SECTOR,
-    orr_pack::DEFAULT_CHUNK as usize + SECTOR,
-];
-
 impl Loading {
-    pub(crate) fn new(positioned: bool) -> std::io::Result<Self> {
+    /// A loading side whose reads take an arena of `arena_bytes`, which `device` imports
+    /// where it can.
+    pub(crate) fn new(positioned: bool, arena_bytes: u64, device: Option<&Device>) -> Result<Self> {
+        let device = device.filter(|d| d.caps().host_memory_import);
+        let align = device.map_or(1, |d| d.caps().limits.host_import_align.max(1));
+        let bytes = usize::try_from(arena_bytes.next_multiple_of(align))
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let buffers = ReadBuffers::new(bytes)?;
+        let (at, len) = buffers.pages();
+        let imported = match device {
+            Some(_) if !(at.as_ptr() as u64).is_multiple_of(align) => {
+                log::warn!(
+                    "the read arena's pages at {at:p} miss the device's import alignment {align}"
+                );
+                None
+            }
+            // SAFETY: the clone keeps the arena's pages until the import drops it.
+            Some(d) => Some(unsafe {
+                d.import_host_memory(at, len as u64, Box::new(buffers.clone()), "read arena")
+            }?),
+            None => None,
+        };
         Ok(Self {
             jobs: Mutex::new(Jobs {
                 queue: VecDeque::new(),
@@ -162,7 +176,8 @@ impl Loading {
             edits: Mutex::new(Vec::new()),
             cuts: Mutex::new(Vec::new()),
             positioned,
-            buffers: ReadBuffers::new(&READ_SIZES, RING_DEPTH)?,
+            buffers,
+            imported,
         })
     }
 
@@ -255,6 +270,36 @@ impl Loading {
     /// The buffers reads on workers take.
     pub(crate) fn buffers(&self) -> &ReadBuffers {
         &self.buffers
+    }
+
+    /// Staging of at least `len` bytes in the arena, which the device reads in place, and
+    /// its memory; `None` where the device does not import the arena or it has no room. The
+    /// range returns when the buffer drops.
+    pub(crate) fn staging(&self, len: u64) -> Option<(AlignedBuf, Block)> {
+        let imported = self.imported.as_ref()?;
+        let mut buf = self.buffers.try_take(usize::try_from(len).ok()?)?;
+        let at = self.buffers.offset(&buf).expect("an arena range") as u64;
+        let block = Block::arena(
+            imported.gpu().0 + at,
+            buf.as_mut_ptr() as usize,
+            buf.capacity() as u64,
+        );
+        Some((buf, block))
+    }
+
+    /// Makes the CPU's writes to `block` visible to the GPU work submitted next, where the
+    /// device imports the arena as memory that is not coherent.
+    pub(crate) fn flush(&self, block: &Block) -> Result<()> {
+        let Some(imported) = &self.imported else {
+            return Ok(());
+        };
+        let Some(at) = block.gpu().checked_sub(imported.gpu().0) else {
+            return Ok(());
+        };
+        if at < imported.size() {
+            imported.flush(at, block.size())?;
+        }
+        Ok(())
     }
 
     pub(crate) fn send(&self, msg: Msg) {
@@ -414,10 +459,16 @@ fn read_file(
 }
 
 /// Whether [`read_into`] reads blob `b`, or its chunk `chunk`, straight into a destination at
-/// a sector boundary that holds its decoded length rounded up to a sector: its stored form is
-/// its decoded form, read from the file. An empty blob covers no sector, and a ring read
-/// fills at least one.
-pub(crate) fn reads_straight(src: &BlobSource, b: &Blob, chunk: Option<u32>) -> bool {
+/// a sector that holds its decoded length rounded up to a sector, of the process's own pages
+/// ([`Block::own_pages`]) or not: its stored form is its decoded form, read from the file,
+/// and the destination is memory the file's reads can go into. An empty blob covers no
+/// sector, and a ring read fills at least one.
+pub(crate) fn reads_straight(
+    src: &BlobSource,
+    b: &Blob,
+    chunk: Option<u32>,
+    own_pages: bool,
+) -> bool {
     let len = chunk.map_or(b.raw_len, |i| b.chunk_len(i));
     b.codec() == Codec::None
         && b.filter() == Filter::None
@@ -426,7 +477,7 @@ pub(crate) fn reads_straight(src: &BlobSource, b: &Blob, chunk: Option<u32>) -> 
         && src
             .file
             .as_ref()
-            .is_some_and(|f| f.reads.reads_into_driver_mappings())
+            .is_some_and(|f| own_pages || f.reads.reads_into_driver_mappings())
 }
 
 /// Reads blob `b`, or its chunk `chunk`, decodes it into `dst` and hands the decoded bytes,
@@ -440,7 +491,7 @@ pub(crate) fn read_into(src: &BlobSource, b: Blob, chunk: Option<u32>, dst: Bloc
     assert!(len as u64 <= dst.size(), "a decode outside its slot");
     let at = dst.cpu().expect("mapped staging");
     // Vulkan maps memory at `minMemoryMapAlignment`, which may be below a sector.
-    if reads_straight(src, &b, chunk)
+    if reads_straight(src, &b, chunk, dst.own_pages())
         && at.is_multiple_of(SECTOR)
         && len.next_multiple_of(SECTOR) as u64 <= dst.size()
     {
@@ -530,16 +581,25 @@ pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
     } else {
         Ring::native(&loading.buffers)
     };
+    let arena = format!(
+        "a read arena of {} bytes{}",
+        loading.buffers.bytes(),
+        if loading.imported.is_some() {
+            " the GPU imports"
+        } else {
+            ""
+        }
+    );
     match &ring {
         Some(r) => log::info!(
-            "archive reads on the system's ring, buffers {}",
+            "archive reads on the system's ring into {arena}, {}",
             if r.registered_buffers() {
                 "registered"
             } else {
                 "by address"
             }
         ),
-        None => log::info!("archive reads on workers"),
+        None => log::info!("archive reads on workers into {arena}"),
     }
     loop {
         let msgs: Vec<Msg> = loading.inbox.lock().unwrap().drain(..).collect();
@@ -578,7 +638,7 @@ mod tests {
 
     #[test]
     fn a_result_job_finishes_with_no_workers_and_after_a_stop() {
-        let loading = Loading::new(true).unwrap();
+        let loading = Loading::new(true, 1 << 20, None).unwrap();
         loading.stop_workers();
         let first = loading.spawn_result(|| 1);
         let second = loading.spawn_result(|| 2);
@@ -595,7 +655,7 @@ mod tests {
 
     #[test]
     fn a_panicking_job_reports_it_and_leaves_its_worker_running() {
-        let loading = Arc::new(Loading::new(true).unwrap());
+        let loading = Arc::new(Loading::new(true, 1 << 20, None).unwrap());
         let worker = {
             let l = Arc::clone(&loading);
             std::thread::spawn(move || l.run_worker())
@@ -612,7 +672,7 @@ mod tests {
 
     #[test]
     fn waiting_for_a_job_on_a_worker_returns_when_it_finishes() {
-        let loading = Arc::new(Loading::new(true).unwrap());
+        let loading = Arc::new(Loading::new(true, 1 << 20, None).unwrap());
         let worker = {
             let l = Arc::clone(&loading);
             std::thread::spawn(move || l.run_worker())
@@ -632,7 +692,7 @@ mod tests {
 
     #[test]
     fn dropping_the_handle_cancels_a_queued_job() {
-        let loading = Loading::new(true).unwrap();
+        let loading = Loading::new(true, 1 << 20, None).unwrap();
         let ran = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&ran);
         drop(loading.spawn_result(move || flag.store(true, Ordering::Relaxed)));

@@ -68,11 +68,7 @@ pub(crate) struct Native {
 impl Native {
     pub(crate) fn new(buffers: &ReadBuffers) -> Option<Self> {
         Some(Self {
-            ring: {
-                let ring = sys::OsRing::new(&buffers.0)?;
-                buffers.0.wake(ring.event());
-                ring
-            },
+            ring: sys::OsRing::new(&buffers.0)?,
             slots: (0..DEPTH).map(|_| None).collect(),
             queued: VecDeque::new(),
             files: (0..DEPTH).map(|_| None).collect(),
@@ -125,32 +121,21 @@ impl Native {
         }
     }
 
-    /// Puts queued reads, in order, into the free slots. A read whose size of buffer is out
-    /// stays queued, and the reads after it pass it. Returns a bit for each slot it filled.
+    /// Puts queued reads, in order, into the free slots, each into its buffer or a new one.
+    /// Returns a bit for each slot it filled.
     fn take_queued(&mut self) -> u64 {
         let mut new = 0;
-        let mut slot = 0;
-        // A bit for each size of buffer found out in this pass.
-        let mut out = 0u64;
-        let mut i = 0;
-        while let Some(read) = self.queued.get_mut(i) {
-            while slot < DEPTH && self.slots[slot].is_some() {
-                slot += 1;
+        for slot in 0..DEPTH {
+            if self.slots[slot].is_some() {
+                continue;
             }
-            if slot == DEPTH {
+            let Some(mut read) = self.queued.pop_front() else {
                 break;
-            }
-            let size = self.buffers.0.size_of(read.len);
-            if read.into.is_none() && size.is_some_and(|s| out & 1 << s != 0) {
-                i += 1;
-                continue;
-            }
-            let Some(buf) = read.into.take().or_else(|| self.buffers.try_take(read.len)) else {
-                out |= 1 << size.expect("only pool buffers run out");
-                i += 1;
-                continue;
             };
-            let read = self.queued.remove(i).expect("a queued read");
+            let buf = read
+                .into
+                .take()
+                .unwrap_or_else(|| self.buffers.take(read.len));
             let file = self.open(&read.file);
             self.slots[slot] = Some(InFlight { read, buf, file });
             new |= 1 << slot;

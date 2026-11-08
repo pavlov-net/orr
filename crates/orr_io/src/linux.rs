@@ -8,7 +8,7 @@ use std::sync::Arc;
 use io_uring::{IoUring, Probe, opcode, types};
 
 use crate::SECTOR;
-use crate::buffers::Pool;
+use crate::buffers::Arena;
 use crate::native::{DEPTH, InFlight, OpenFile};
 
 /// Opens with `O_DIRECT`, or buffered where the file system refuses it or needs an alignment
@@ -95,12 +95,12 @@ pub(crate) fn wait_any(events: &[&Event]) {
     }
 }
 
-/// One io_uring with an eventfd for completions, the pool's buffers registered where the
-/// memory lock limit allows, and the files of its reads registered.
+/// One io_uring with an eventfd for completions, the read arena registered where the memory
+/// lock limit allows, and the files of its reads registered.
 pub(crate) struct OsRing {
     ring: IoUring,
     event: Arc<Event>,
-    /// Whether the pool's buffers are registered.
+    /// Whether the arena is registered.
     buffers: bool,
     /// The descriptor in each entry of the registered file table, -1 for none, until an
     /// update fails and reads name their files by descriptor.
@@ -108,7 +108,7 @@ pub(crate) struct OsRing {
 }
 
 impl OsRing {
-    pub(crate) fn new(pool: &Pool) -> Option<Self> {
+    pub(crate) fn new(arena: &Arena) -> Option<Self> {
         let ring = IoUring::new(DEPTH as u32).ok()?;
         let mut probe = Probe::new();
         ring.submitter().register_probe(&mut probe).ok()?;
@@ -119,17 +119,17 @@ impl OsRing {
         ring.submitter()
             .register_eventfd(event.0.as_raw_fd())
             .ok()?;
-        let iovecs: Vec<libc::iovec> = pool
-            .buffers()
+        let iovecs: Vec<libc::iovec> = arena
+            .pieces()
             .map(|(address, len)| libc::iovec {
                 iov_base: address.cast(),
                 iov_len: len,
             })
             .collect();
         // Registered buffers count against the user's RLIMIT_MEMLOCK unless the process has
-        // CAP_IPC_LOCK, and the limit is often a few MiB; the kernel also takes at most 16384
-        // buffers of at most 1 GiB. Reads name unregistered buffers by address.
-        // SAFETY: the buffers stay mapped while the ring lives, as its owner holds the pool.
+        // CAP_IPC_LOCK, and the limit is often a few MiB; the kernel takes buffers of at most
+        // 1 GiB, which the pieces are. Reads name unregistered buffers by address.
+        // SAFETY: the arena stays mapped while the ring lives, as its owner holds it.
         let buffers = unsafe { ring.submitter().register_buffers(&iovecs) }.is_ok();
         // Kernels before 5.5 refuse a table of empty entries; reads there name their files by
         // descriptor.
@@ -178,11 +178,11 @@ impl OsRing {
     }
 
     /// Queues the next chunk of `f`, which goes in `slot`.
-    pub(crate) fn start(&mut self, slot: usize, f: &mut InFlight, pool: &Pool) -> io::Result<()> {
+    pub(crate) fn start(&mut self, slot: usize, f: &mut InFlight, arena: &Arena) -> io::Result<()> {
         let (address, len) = f.chunk();
         let fd = f.read.file.handle.as_raw_fd();
         let fixed = self.files.is_some().then_some(types::Fixed(f.file as u32));
-        let buffer = pool.index(address).filter(|_| self.buffers);
+        let buffer = arena.index(address, len as usize).filter(|_| self.buffers);
         let sqe = match (fixed, buffer) {
             (Some(file), Some((index, _))) => {
                 opcode::ReadFixed::new(file, address, len, index as u16)

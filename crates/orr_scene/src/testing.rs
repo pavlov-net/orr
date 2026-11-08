@@ -60,7 +60,7 @@ pub fn device() -> &'static Device {
 
 /// A loading side with no renderer, for a test that only queues jobs on it.
 pub fn loading() -> Loading {
-    Loading::new(false).expect("read buffers")
+    Loading::new(false, 1 << 20, None).expect("read buffers")
 }
 
 /// Fails the calling test if the validation layer has reported anything on [`device`].

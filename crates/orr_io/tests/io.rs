@@ -24,9 +24,9 @@ fn bytes(len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Buffers of one and two sectors: longer reads take memory of their own.
+/// An arena for fewer reads than a ring keeps in flight: the others take memory of their own.
 fn buffers() -> ReadBuffers {
-    ReadBuffers::new(&[SECTOR, 2 * SECTOR], RING_DEPTH).unwrap()
+    ReadBuffers::new(RING_DEPTH / 2 * SECTOR).unwrap()
 }
 
 type Results = Arc<Mutex<Vec<Option<Vec<u8>>>>>;
@@ -114,7 +114,7 @@ fn ring_matches_positioned_reads() {
 }
 
 #[test]
-fn a_ring_reads_on_as_buffers_held_on_another_thread_come_back() {
+fn a_ring_reads_on_while_buffers_held_on_another_thread_fill_its_arena() {
     // Two files, so the ring's file registrations change between and within bursts.
     let a = bytes(8 * SECTOR);
     let b: Vec<u8> = a.iter().rev().copied().collect();
@@ -126,8 +126,9 @@ fn a_ring_reads_on_as_buffers_held_on_another_thread_come_back() {
             (Arc::new(ReadFile::open(&p).unwrap()), data)
         })
         .collect();
-    // Two buffers for sixteen reads a burst: most reads wait for one to come back.
-    let Some(mut ring) = Ring::native(&ReadBuffers::new(&[SECTOR], 2).unwrap()) else {
+    // Room for two of the sixteen reads a burst: the others take memory of their own.
+    let buffers = ReadBuffers::new(2 * SECTOR).unwrap();
+    let Some(mut ring) = Ring::native(&buffers) else {
         return;
     };
     let (held, holder) = std::sync::mpsc::channel::<AlignedBuf>();
@@ -185,6 +186,10 @@ fn a_ring_reads_on_as_buffers_held_on_another_thread_come_back() {
     drop(held);
     holder.join().unwrap();
     assert_eq!(*wrong.lock().unwrap(), []);
+    let whole = buffers
+        .try_take(2 * SECTOR)
+        .expect("the held ranges came back");
+    assert_eq!(buffers.offset(&whole), Some(0));
 }
 
 #[test]

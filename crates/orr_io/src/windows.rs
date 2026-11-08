@@ -10,7 +10,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::SECTOR;
-use crate::buffers::Pool;
+use crate::buffers::Arena;
 use crate::native::{InFlight, OpenFile};
 
 mod bindings;
@@ -250,7 +250,7 @@ struct Registration {
     _files: Vec<Arc<crate::ReadFile>>,
 }
 
-/// One IoRing with the pool's buffers registered, and the files of its reads.
+/// One IoRing with the read arena registered, and the files of its reads.
 pub(crate) struct OsRing {
     fns: Fns,
     ring: HIORING,
@@ -269,7 +269,7 @@ pub(crate) struct OsRing {
 unsafe impl Send for OsRing {}
 
 impl OsRing {
-    pub(crate) fn new(pool: &Pool) -> Option<Self> {
+    pub(crate) fn new(arena: &Arena) -> Option<Self> {
         // SAFETY: loading a system library and looking up exports by their documented
         // names and signatures.
         let (create, set_event, register_buffers, fns) = unsafe {
@@ -318,15 +318,15 @@ impl OsRing {
         };
         // SAFETY: the ring and the event are live.
         unsafe { set_event(ring.ring, ring.event.0) }.ok().ok()?;
-        let buffers: Vec<IORING_BUFFER_INFO> = pool
-            .buffers()
+        let buffers: Vec<IORING_BUFFER_INFO> = arena
+            .pieces()
             .map(|(address, len)| IORING_BUFFER_INFO {
                 Address: address.cast(),
                 Length: len as u32,
             })
             .collect();
-        // SAFETY: the buffers stay mapped while the ring lives, as its owner holds the pool;
-        // the array outlives the submit below, which takes it.
+        // SAFETY: the arena stays mapped while the ring lives, as its owner holds it; the array
+        // outlives the submit below, which takes it.
         unsafe {
             register_buffers(
                 ring.ring,
@@ -387,7 +387,7 @@ impl OsRing {
     }
 
     /// Builds the next chunk of `f`, which goes in `slot`, into the ring.
-    pub(crate) fn start(&mut self, slot: usize, f: &mut InFlight, pool: &Pool) -> io::Result<()> {
+    pub(crate) fn start(&mut self, slot: usize, f: &mut InFlight, arena: &Arena) -> io::Result<()> {
         let (address, len) = f.chunk();
         let file = IORING_HANDLE_REF {
             Kind: IORING_REF_REGISTERED,
@@ -395,7 +395,7 @@ impl OsRing {
                 Index: f.file as u32,
             },
         };
-        let data = match pool.index(address) {
+        let data = match arena.index(address, len as usize) {
             Some((index, offset)) => IORING_BUFFER_REF {
                 Kind: IORING_REF_REGISTERED,
                 Buffer: IORING_BUFFER_REF_0 {
@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn a_system_offering_the_ring_makes_one() {
         if ring_version().is_some_and(|version| version >= IORING_VERSION_3) {
-            let buffers = crate::ReadBuffers::new(&[SECTOR], 2).unwrap();
+            let buffers = crate::ReadBuffers::new(2 * SECTOR).unwrap();
             assert!(OsRing::new(&buffers.0).is_some());
         }
     }

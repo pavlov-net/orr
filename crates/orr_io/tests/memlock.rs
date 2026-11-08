@@ -20,8 +20,8 @@ fn bytes(len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Reads of pool buffers of each size, of memory of their own and past the end of the file
-/// match the file.
+/// Reads into the arena, into memory of their own once it is full and past the end of the
+/// file match the file.
 fn reads_match(mut ring: Ring, file: &Arc<ReadFile>, data: &[u8]) {
     let reads: Vec<(usize, usize)> = (0..100)
         .map(|i| (i * 3 % 42 * SECTOR, 1 + i * 1777 % (6 * SECTOR)))
@@ -63,7 +63,7 @@ fn a_ring_reads_into_registered_buffers_and_by_address_past_the_memory_lock_limi
     let data = bytes(40 * SECTOR + 77);
     fs::write(&p, &data).unwrap();
     let file = Arc::new(ReadFile::open(&p).unwrap());
-    let buffers = ReadBuffers::new(&[SECTOR, 4 * SECTOR], RING_DEPTH).unwrap();
+    let buffers = ReadBuffers::new(RING_DEPTH * SECTOR).unwrap();
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

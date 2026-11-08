@@ -11,15 +11,16 @@
 //! blocks sit at low priority so the OS pages them out before anything else.
 //!
 //! On the loading side a unit's blob, or a tile's chunk, is read through its mount's path
-//! and decompressed on a worker into the staging pool, cached host memory; mesh pages stay
-//! in their stored form there. A blob stored as it decodes is read straight into its
-//! staging slot. Where staging memory is device-local, as on unified memory, hierarchy and
-//! instance pages take their slots in staging memory and land there. When a task's last
-//! read ends, the loading thread unbinds the tiles evicted since the last task and binds the
-//! new ones in one sparse bind, copies the tiles in and decodes the mesh pages into their
-//! stream pool slots on the loading queue, submits the copies into the stream pool and the
-//! users' targets, builds the mesh pages' CLAS and hands the batch to the render thread,
-//! which drops the pages whose decode failed.
+//! and decompressed on a worker into staging, cached host memory: a range of the read arena
+//! where the device imports it, else a slot of the staging pool; mesh pages stay in their
+//! stored form there. A blob stored as it decodes is read straight into its staging. Where
+//! staging memory is device-local, as on unified memory, hierarchy and instance pages take
+//! their slots in staging memory and land there. When a task's last read ends, the loading
+//! thread unbinds the tiles evicted since the last task and binds the new ones in one sparse
+//! bind, copies the tiles in and decodes the mesh pages into their stream pool slots on the
+//! loading queue, submits the copies into the stream pool and the users' targets, builds the
+//! mesh pages' CLAS and hands the batch to the render thread, which drops the pages whose
+//! decode failed.
 //!
 //! The step also builds a streaming mesh's finer cached cuts once their pages are resident,
 //! holding those pages locked until no copy uses the cut, and moves tiles of a texture that
@@ -33,7 +34,7 @@ use orr_gpu::{
     CommandList, Device, GpuAddress, GpuPtr, Hazards, MemoryKind, Micromap, QueueKind, SparseBinds,
     Stages, Texture, TextureRegion, TileBind, TimelinePoint,
 };
-use orr_io::SECTOR;
+use orr_io::{AlignedBuf, SECTOR};
 use orr_pack::mesh::{MeshHeader, StoredPage};
 use orr_pack::{Blob, Codec};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1154,8 +1155,8 @@ impl Streaming {
                 d.fail_pages(&mut batch.loads);
                 staging.free(d.slot);
             }
-            for l in &batch.loads {
-                if let Some(s) = l.staging {
+            for l in &mut batch.loads {
+                if let Some(Staged::Pool(s)) = l.staging.take() {
                     staging.free(s);
                 }
             }
@@ -1788,8 +1789,8 @@ struct Landed {
     gpu: u64,
     /// A tile's texture and index, for its bind and copy.
     tile: Option<(Arc<TexStream>, u32)>,
-    /// The staging slot and its address.
-    staging: Option<PoolSlot>,
+    /// Where it staged, and the address.
+    staging: Option<Staged>,
     staged_at: u64,
     /// A mesh page's clusters as it decoded, and what its CLAS build made.
     mesh: Option<MeshLanded>,
@@ -1880,17 +1881,24 @@ impl StreamTask {
     }
 
     /// Returns what a failed load took.
-    fn free(&self, placed: Option<Placed>, staging: Option<PoolSlot>) {
+    fn free(&self, placed: Option<Placed>, staging: Option<Staged>) {
         match placed {
             Some(Placed::Pool(slot, _)) => self.units.lock().unwrap().free(slot),
             Some(Placed::Tile(slot)) => self.tiles.lock().unwrap().free(slot),
             Some(Placed::MeshPage(p)) => self.pool.lock().unwrap().free(p.slot),
             None => {}
         }
-        if let Some(s) = staging {
+        if let Some(Staged::Pool(s)) = staging {
             self.staging.lock().unwrap().free(s);
         }
     }
+}
+
+/// The staging a load reads or decodes into: a slot of the staging pool, or a range of the
+/// read arena, which returns when the buffer drops.
+enum Staged {
+    Pool(PoolSlot),
+    Arena { _range: AlignedBuf },
 }
 
 /// The blob and chunk a load reads, the length it decodes to and the bytes it lands in.
@@ -1971,7 +1979,7 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
         let (placed, block) = match &load.kind {
             LoadKind::Pool { target, .. } => {
                 let mut pool = task.units.lock().unwrap();
-                let slot = if direct && reads_straight(&load.source, &b, chunk) {
+                let slot = if direct && reads_straight(&load.source, &b, chunk, false) {
                     let sector = SECTOR as u64;
                     pool.alloc_aligned(&task.device, len.next_multiple_of(sector), sector)
                 } else {
@@ -2031,17 +2039,21 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
             LoadKind::User { .. } => (None, None),
         };
         // Decoders read what they write, so they write cached memory, which a copy or the
-        // mesh page decode then reads; a read straight into the slot fills whole sectors.
+        // mesh page decode then reads: the read arena where the device imports it, else the
+        // staging pool. A read straight into the slot fills whole sectors.
+        let staged_len = len.next_multiple_of(SECTOR as u64);
         let (staging, staged) = if direct {
             (None, block.expect("a pool slot"))
+        } else if let Some((buf, staged)) = loading.staging(staged_len) {
+            (Some(Staged::Arena { _range: buf }), staged)
         } else {
-            let staged = task.staging.lock().unwrap().alloc(
-                &task.device,
-                len.next_multiple_of(SECTOR as u64),
-                None,
-            );
+            let staged = task
+                .staging
+                .lock()
+                .unwrap()
+                .alloc(&task.device, staged_len, None);
             match staged {
-                Ok((slot, staged)) => (Some(slot), staged),
+                Ok((slot, staged)) => (Some(Staged::Pool(slot)), staged),
                 Err(e) => {
                     task.free(placed, None);
                     task.fail(load.what, e);
@@ -2061,6 +2073,9 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                 let load = &t.loads[i];
                 let mut mesh = None;
                 let result = decoded.and_then(|bytes| {
+                    if let Some(l) = l.upgrade() {
+                        l.flush(&staged)?;
+                    }
                     if let LoadKind::MeshPage { stream, page } = &load.kind {
                         let to = (block.expect("a pool slot").gpu(), slot_len);
                         mesh = Some(stage_page(stream, *page, bytes, &staged, to, &t.decodes)?);
