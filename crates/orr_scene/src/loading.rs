@@ -398,8 +398,8 @@ pub(crate) fn landed(device: &Device, point: Option<TimelinePoint>) -> bool {
 }
 
 /// Loading-thread work that waits only on GPU points its own submits signal, through
-/// [`completion`].
-pub(crate) type Resumable = Pin<Box<dyn Future<Output = ()>>>;
+/// [`completion`], borrowing what the loading thread holds while it runs.
+pub(crate) type Resumable<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 
 thread_local! {
     /// The point the last pending [`Completion`] polled on this thread waits for.
@@ -435,13 +435,13 @@ impl Future for Completion<'_> {
 /// Resumable work run one item at a time in the order it came, so a lane holds no more
 /// transient memory at once than one build does.
 #[derive(Default)]
-struct Lane {
-    items: VecDeque<Resumable>,
+struct Lane<'a> {
+    items: VecDeque<Resumable<'a>>,
     /// The point the front item waits for.
     until: Option<TimelinePoint>,
 }
 
-impl Lane {
+impl Lane<'_> {
     /// Polls the front item, and each next one once the one before has finished.
     fn advance(&mut self) {
         let mut cx = Context::from_waker(Waker::noop());

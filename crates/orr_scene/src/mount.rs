@@ -1904,9 +1904,12 @@ fn bind_tails(device: &Device, textures: &[PlacedTexture]) -> Result<Option<Time
 
 /// Ends a mount on the loading thread: resolves its assets, submits its staged copies, builds
 /// its acceleration structures and hands the batch to the render thread.
-pub(crate) fn finish(loading: &Arc<Loading>, device: &Device, task: Arc<MountTask>) -> Resumable {
-    let (loading, device) = (Arc::clone(loading), device.clone());
-    Box::pin(async move { finish_mount(&loading, &device, &task).await })
+pub(crate) fn finish<'a>(
+    loading: &'a Loading,
+    device: &'a Device,
+    task: Arc<MountTask>,
+) -> Resumable<'a> {
+    Box::pin(async move { finish_mount(loading, device, &task).await })
 }
 
 async fn finish_mount(loading: &Loading, device: &Device, task: &MountTask) {

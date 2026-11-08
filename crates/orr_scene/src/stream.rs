@@ -202,11 +202,10 @@ impl CutBatch {
 }
 
 /// Builds a finer cut on the loading thread.
-pub(crate) fn build_cut(loading: &Arc<Loading>, device: &Device, t: CutTask) -> Resumable {
-    let (loading, device) = (Arc::clone(loading), device.clone());
+pub(crate) fn build_cut<'a>(loading: &'a Loading, device: &'a Device, t: CutTask) -> Resumable<'a> {
     Box::pin(async move {
         let k = &t.accel.kernels;
-        let built = accel::build_fine_cut(&device, k, t.cut, &t.members, t.parts).await;
+        let built = accel::build_fine_cut(device, k, t.cut, &t.members, t.parts).await;
         let (cut, point) = match built {
             Ok((r, c, p)) => (Ok((r, c)), Some(p)),
             Err(e) => (Err(e), None),
