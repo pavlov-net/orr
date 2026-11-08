@@ -126,15 +126,11 @@ impl OsRing {
                 iov_len: len,
             })
             .collect();
+        // Registered buffers count against the user's RLIMIT_MEMLOCK unless the process has
+        // CAP_IPC_LOCK, and the limit is often a few MiB; the kernel also takes at most 16384
+        // buffers of at most 1 GiB. Reads name unregistered buffers by address.
         // SAFETY: the buffers stay mapped while the ring lives, as its owner holds the pool.
-        let buffers = match unsafe { ring.submitter().register_buffers(&iovecs) } {
-            Ok(()) => true,
-            // Registered buffers count against the user's RLIMIT_MEMLOCK unless the process has
-            // CAP_IPC_LOCK, and the limit is often a few MiB: reads then name their buffers by
-            // address.
-            Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => false,
-            Err(_) => return None,
-        };
+        let buffers = unsafe { ring.submitter().register_buffers(&iovecs) }.is_ok();
         // Kernels before 5.5 refuse a table of empty entries; reads there name their files by
         // descriptor.
         let files = ring
@@ -169,7 +165,10 @@ impl OsRing {
                 .register_files_update(i as u32, &[fd])
                 .is_err()
             {
-                // The table would keep its files open until the ring drops.
+                // The table would keep its files open until the ring drops. Queued reads that
+                // name their files by entry go to the kernel first, which takes each file as
+                // it issues the read.
+                let _ = self.ring.submit();
                 let _ = self.ring.submitter().unregister_files();
                 self.files = None;
                 return;

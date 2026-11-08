@@ -264,9 +264,10 @@ impl ReadFile {
         Ok(Self { handle, unbuffered })
     }
 
-    /// Whether reads bypass the system's cache and so need [`SECTOR`] offsets and lengths.
-    pub fn unbuffered(&self) -> bool {
-        self.unbuffered
+    /// Whether reads can go straight into memory a GPU driver mapped. Linux pins the pages of
+    /// an unbuffered read, which it refuses for driver mappings (`VM_PFNMAP`).
+    pub fn reads_into_driver_mappings(&self) -> bool {
+        !(cfg!(target_os = "linux") && self.unbuffered)
     }
 
     /// Opens `path` as [`ReadFile::open`] and [`open_shared`] do, with both handles on the same

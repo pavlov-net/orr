@@ -355,41 +355,60 @@ pub(crate) fn read_stored(src: &BlobSource, b: Blob, chunk: Option<u32>, then: S
         Some(i) => src.archive.chunks(&b)[i as usize].stored_len,
         None => b.stored_len,
     };
-    let file = Arc::clone(src.file.as_ref().expect("file archive"));
-    let check = move |buf: &AlignedBuf, then: Stored| {
-        let end = range.skip as usize + stored_len as usize;
-        let n = buf.len();
-        if n < end {
-            then(Err(orr_pack::Error::Truncated {
+    let file = Arc::clone(&src.file.as_ref().expect("file archive").reads);
+    let end = range.skip as usize + stored_len as usize;
+    let len = range.len as usize;
+    read_file(
+        &loading,
+        src.ring,
+        file,
+        range.offset,
+        len,
+        None,
+        move |r| match r {
+            Err(e) => then(Err(e)),
+            Ok(buf) if buf.len() < end => then(Err(orr_pack::Error::Truncated {
                 need: range.offset + end as u64,
-                have: range.offset + n as u64,
+                have: range.offset + buf.len() as u64,
             }
-            .into()));
-            return;
-        }
-        then(Ok(&buf.as_slice()[range.skip as usize..end]));
-    };
-    if src.ring {
-        let weak = Arc::downgrade(&loading);
+            .into())),
+            Ok(buf) => then(Ok(&buf.as_slice()[range.skip as usize..end])),
+        },
+    );
+}
+
+/// Reads `len` bytes of `file` from `offset` into `into`, or into a read buffer without one, on
+/// the ring or a worker, and hands the buffer, filled with at most `len` bytes, to `done` on a
+/// worker. A read error goes to `done` on the thread that saw it.
+fn read_file(
+    loading: &Arc<Loading>,
+    ring: bool,
+    file: Arc<ReadFile>,
+    offset: u64,
+    len: usize,
+    into: Option<AlignedBuf>,
+    done: impl FnOnce(Result<AlignedBuf>) + Send + 'static,
+) {
+    if ring {
+        let weak = Arc::downgrade(loading);
         loading.send(Msg::Read(orr_io::Read {
-            file: Arc::clone(&file.reads),
-            offset: range.offset,
-            len: range.len as usize,
-            into: None,
+            file,
+            offset,
+            len,
+            into,
             done: Box::new(move |r| match (r, weak.upgrade()) {
-                (Ok(buf), Some(l)) => l.spawn(move || check(&buf, then)),
-                (Err(e), _) => then(Err(e.into())),
+                (Ok(buf), Some(l)) => l.spawn(move || done(Ok(buf))),
+                (Err(e), _) => done(Err(e.into())),
                 (Ok(_), None) => {}
             }),
         }));
     } else {
         let buffers = loading.buffers.clone();
         loading.spawn(move || {
-            let mut buf = buffers.take(range.len as usize);
-            match file.reads.read(range.offset, &mut buf) {
-                Ok(()) => check(&buf, then),
-                Err(e) => then(Err(Error::from(e))),
-            }
+            let mut buf = into.unwrap_or_else(|| buffers.take(len));
+            let read = file.read(offset, &mut buf);
+            buf.truncate(len);
+            done(read.map(|()| buf).map_err(Error::from));
         });
     }
 }
@@ -407,19 +426,19 @@ pub(crate) fn read_into(src: &BlobSource, b: Blob, chunk: Option<u32>, dst: Bloc
     );
     let at = dst.cpu().expect("mapped staging");
     let as_stored = b.codec() == Codec::None && b.filter() == Filter::None;
-    // Linux pins the pages of an unbuffered read, which it refuses for driver mappings
-    // (VM_PFNMAP), so staging there takes buffered reads only.
-    let pinnable =
-        !cfg!(target_os = "linux") || src.file.as_ref().is_some_and(|f| !f.reads.unbuffered());
+    let mappable = src
+        .file
+        .as_ref()
+        .is_some_and(|f| f.reads.reads_into_driver_mappings());
     // Vulkan maps memory at `minMemoryMapAlignment`, which may be below a sector. An empty
     // blob covers no sector, and a ring read fills at least one.
     if as_stored
-        && pinnable
+        && mappable
         && len > 0
         && at.is_multiple_of(SECTOR)
         && src.archive.stored(&b, chunk).is_none()
     {
-        read_straight(src, b, chunk, dst, then);
+        read_straight(src, b, chunk, at, len, then);
         return;
     }
     let a = Arc::clone(&src.archive);
@@ -438,53 +457,43 @@ pub(crate) fn read_into(src: &BlobSource, b: Blob, chunk: Option<u32>, dst: Bloc
     );
 }
 
-/// Reads stored bytes that need no decode straight into `dst`, on the ring or a worker, as
-/// [`read_into`] does.
-fn read_straight(src: &BlobSource, b: Blob, chunk: Option<u32>, dst: Block, then: Stored) {
+/// Reads the `len` stored bytes of blob `b` or chunk `chunk`, which need no decode, straight
+/// into the mapped memory at `at`, on the ring or a worker, as [`read_into`] does.
+fn read_straight(
+    src: &BlobSource,
+    b: Blob,
+    chunk: Option<u32>,
+    at: usize,
+    len: usize,
+    then: Stored,
+) {
     let Some(loading) = src.loading.upgrade() else {
         return;
     };
-    let len = chunk.map_or(b.raw_len, |i| b.chunk_len(i)) as usize;
     let range = src.archive.stored_range(&b, chunk);
     debug_assert_eq!(range.skip, 0, "such chunks start on a page");
-    let at = NonNull::new(dst.cpu().expect("mapped staging") as *mut u8).expect("a mapping");
+    let at = NonNull::new(at as *mut u8).expect("a mapping");
     // SAFETY: `at` is at a sector boundary and holds `range.len` bytes, the decoded length
     // rounded up to a sector, which only this read uses until `then` returns.
     let buf = unsafe { AlignedBuf::borrowed(at, range.len as usize) };
-    let check = move |buf: AlignedBuf, then: Stored| {
-        if buf.len() < len {
-            then(Err(orr_pack::Error::Truncated {
+    let file = Arc::clone(&src.file.as_ref().expect("file archive").reads);
+    read_file(
+        &loading,
+        src.ring,
+        file,
+        range.offset,
+        len,
+        Some(buf),
+        move |r| match r {
+            Err(e) => then(Err(e)),
+            Ok(buf) if buf.len() < len => then(Err(orr_pack::Error::Truncated {
                 need: range.offset + len as u64,
                 have: range.offset + buf.len() as u64,
             }
-            .into()));
-            return;
-        }
-        then(Ok(&buf.as_slice()[..len]));
-    };
-    let file = Arc::clone(&src.file.as_ref().expect("file archive").reads);
-    if src.ring {
-        let weak = Arc::downgrade(&loading);
-        loading.send(Msg::Read(orr_io::Read {
-            file,
-            offset: range.offset,
-            len,
-            into: Some(buf),
-            done: Box::new(move |r| match (r, weak.upgrade()) {
-                (Ok(buf), Some(l)) => l.spawn(move || check(buf, then)),
-                (Err(e), _) => then(Err(e.into())),
-                (Ok(_), None) => {}
-            }),
-        }));
-    } else {
-        loading.spawn(move || {
-            let mut buf = buf;
-            match file.read(range.offset, &mut buf) {
-                Ok(()) => check(buf, then),
-                Err(e) => then(Err(Error::from(e))),
-            }
-        });
-    }
+            .into())),
+            Ok(buf) => then(Ok(buf.as_slice())),
+        },
+    );
 }
 
 thread_local! {
