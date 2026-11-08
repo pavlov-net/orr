@@ -602,8 +602,19 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
             // between to name them. Past those the walk finds what holds `x` from the back faces
             // its rays leave through.
             float from_eye = length(x - eye);
-            bool enclosed = from_eye > eye_column.start && from_eye < eye_column.end;
-            l += froxel_local<S, M>(r, f, x, enclosed ? Interior(eye_column.interior) : Interior(), rng, rays);
+            Interior around = Interior();
+            if (from_eye > eye_column.start && from_eye < eye_column.end)
+            {
+                // The jitter carries `x` off the column's ray, and can carry it across the
+                // interior's surface: the surfaces between the ray's point at its distance and `x`
+                // flip the column's list into its own.
+                around = Interior(eye_column.interior);
+                float3 on_ray = eye + dir * from_eye;
+                float lateral = length(x - on_ray);
+                if (lateral > 0.0)
+                    surface_crossings<S>(r.scene, r.view, on_ray, (x - on_ray) / lateral, lateral, around);
+            }
+            l += froxel_local<S, M>(r, f, x, around, rng, rays);
             float a = held ? blend : 1.0;
             float a_vis = held && lights.changed == 0 ? blend : 1.0;
             bool inside = keep_depth && eye_holds(eye_column, k, r.slices, near_range);
@@ -621,18 +632,22 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
                 rays++;
                 float3 tau;
                 StackLight stack;
-                float3 t = directional_visibility<S, M>(r.scene, r.view, x, to_light, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), enclosed ? Interior(eye_column.interior) : Interior(), r.set.stack_entries != 0, r.set.shadow_overflows, tau, stack);
+                float3 t = directional_visibility<S, M>(r.scene, r.view, x, to_light, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), around, r.set.stack_entries != 0, r.set.shadow_overflows, tau, stack);
                 t *= stack.jacobian;
                 if (inside && stack.jacobian != 1.0 && stacks[j].w == 0.0)
                     stacks[j] = float4(stack.normal, 1.0);
-                // The column's interior takes its share of the optical depth as a distance.
+                // The column's interior takes its share of the optical depth as a distance. A
+                // blocked ray's depth can run to infinity, and weighs nothing.
                 float d = 0.0;
-                if (inside && any(eye_sigma > 0.0))
+                if (any(t > 0.0))
                 {
-                    d = dot(tau, eye_sigma) / dot(eye_sigma, eye_sigma);
-                    tau = max(tau - eye_sigma * d, 0.0);
+                    if (inside && any(eye_sigma > 0.0))
+                    {
+                        d = dot(tau, eye_sigma) / dot(eye_sigma, eye_sigma);
+                        tau = max(tau - eye_sigma * d, 0.0);
+                    }
+                    t *= exp(-tau);
                 }
-                t *= exp(-tau);
                 vis[j] = (t.x + t.y + t.z) / 3.0;
                 depth_now[j] = vis[j] * d;
             }
