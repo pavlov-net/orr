@@ -214,6 +214,10 @@ impl Pool {
         }
     }
 
+    pub(crate) fn kind(&self) -> MemoryKind {
+        self.kind
+    }
+
     /// `bytes` bytes at a unit-aligned offset of their block, right after `after` when those
     /// units are free.
     pub(crate) fn alloc(

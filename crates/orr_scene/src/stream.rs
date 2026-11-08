@@ -13,12 +13,13 @@
 //! On the loading side a unit's blob, or a tile's chunk, is read through its mount's path
 //! and decompressed on a worker into the staging pool, cached host memory; mesh pages stay
 //! in their stored form there. A blob stored as it decodes is read straight into its
-//! staging slot. Where staging memory is device-local, as on unified memory, the stream pool
-//! is staging memory, and hierarchy and instance pages land in their pool slot. When a task's last read ends, the loading thread unbinds the tiles evicted
-//! since the last task and binds the new ones in one sparse bind, copies the tiles in and
-//! decodes the mesh pages into their stream pool slots on the loading queue, submits the
-//! copies into the stream pool and the users' targets, builds the mesh pages' CLAS and
-//! hands the batch to the render thread, which drops the pages whose decode failed.
+//! staging slot. Where staging memory is device-local, as on unified memory, hierarchy and
+//! instance pages take their slots in staging memory and land there. When a task's last
+//! read ends, the loading thread unbinds the tiles evicted since the last task and binds the
+//! new ones in one sparse bind, copies the tiles in and decodes the mesh pages into their
+//! stream pool slots on the loading queue, submits the copies into the stream pool and the
+//! users' targets, builds the mesh pages' CLAS and hands the batch to the render thread,
+//! which drops the pages whose decode failed.
 //!
 //! The step also builds a streaming mesh's finer cached cuts once their pages are resident,
 //! holding those pages locked until no copy uses the cut, and moves tiles of a texture that
@@ -366,7 +367,11 @@ pub(crate) struct Streaming {
     clas: Option<Arc<Mutex<ClasPool>>>,
     /// CLAS freed once the frame has completed.
     retired_clas: Vec<(u64, ClasFree)>,
+    /// Mesh pages, and the other pool units where `units` is this pool.
     pool: Arc<Mutex<Pool>>,
+    /// Hierarchy and instance pages: the stream pool, or staging memory where it is
+    /// device-local, which they land in with no copy.
+    units: Arc<Mutex<Pool>>,
     staging: Arc<Mutex<Pool>>,
     tiles: Arc<Mutex<Pool>>,
     /// Finer cached cuts by mount and mesh.
@@ -379,6 +384,8 @@ pub(crate) struct Streaming {
     resident: FxHashMap<Key, Placed>,
     /// Pool slots freed once the frame has completed.
     retired: Vec<(u64, PoolSlot)>,
+    /// `units` slots freed once the frame has completed.
+    retired_units: Vec<(u64, PoolSlot)>,
     /// Tiles unbound once the frame has completed.
     retired_tiles: Vec<(u64, TileFree)>,
     /// Tiles the next task unbinds.
@@ -426,6 +433,12 @@ impl Streaming {
         budgets[ResidencyClass::InstancePages as usize] = b.instance_page_pool;
         budgets[ResidencyClass::UserBlobs as usize] = b.user_blob_pool;
         let caps = device.caps();
+        let pool = Arc::new(Mutex::new(Pool::new(
+            MemoryKind::DeviceLocal,
+            256,
+            b.stream_block,
+            "stream pool",
+        )));
         let clas = if caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0 {
             let pool = ClasPool::new(device, b.clas_pool, b.stream_block)?;
             Some(Arc::new(Mutex::new(pool)))
@@ -441,17 +454,17 @@ impl Streaming {
                 io_requests: b.io_requests,
                 io_bytes: b.io_bytes,
             }),
-            // Where staging memory is device-local, pool loads land in it with no copy.
-            pool: Arc::new(Mutex::new(Pool::new(
-                if caps.staging_device_local {
-                    MemoryKind::Staging
-                } else {
-                    MemoryKind::DeviceLocal
-                },
-                256,
-                b.stream_block,
-                "stream pool",
-            ))),
+            units: if caps.staging_device_local {
+                Arc::new(Mutex::new(Pool::new(
+                    MemoryKind::Staging,
+                    256,
+                    b.stream_block,
+                    "stream units",
+                )))
+            } else {
+                Arc::clone(&pool)
+            },
+            pool,
             // Sector units, so that reads go straight into a slot.
             staging: Arc::new(Mutex::new(Pool::new(
                 MemoryKind::Staging,
@@ -478,6 +491,7 @@ impl Streaming {
             mounts: FxHashMap::default(),
             resident: FxHashMap::default(),
             retired: Vec::new(),
+            retired_units: Vec::new(),
             retired_tiles: Vec::new(),
             unbinds: Vec::new(),
             carried: Vec::new(),
@@ -690,7 +704,7 @@ impl Streaming {
             .collect();
         for k in gone {
             match self.resident.remove(&k).expect("resident") {
-                Placed::Pool(slot, _) => self.retired.push((frame, slot)),
+                Placed::Pool(slot, _) => self.retired_units.push((frame, slot)),
                 Placed::MeshPage(p) => {
                     self.retired.push((frame, p.slot));
                     let free = ClasFree {
@@ -1293,6 +1307,7 @@ impl Streaming {
                 accel: Arc::clone(&self.accel),
                 clas: self.clas.clone(),
                 pool: Arc::clone(&self.pool),
+                units: Arc::clone(&self.units),
                 staging: Arc::clone(&self.staging),
                 tiles: Arc::clone(&self.tiles),
                 device: w.device.clone(),
@@ -1326,7 +1341,7 @@ impl Streaming {
         match self.resident.remove(&k).expect("evicted unit is resident") {
             Placed::Pool(slot, target) => {
                 self.point_target(target, 0, w)?;
-                self.retired.push((frame - 1, slot));
+                self.retired_units.push((frame - 1, slot));
             }
             Placed::MeshPage(p) => {
                 let (table, refs, count) = p.entries();
@@ -1511,7 +1526,7 @@ impl Streaming {
                         t.dirty = true;
                         self.resident.insert(key, Placed::Tile(slot));
                     }
-                    (_, Some(Placed::Pool(slot, _))) => self.pool.lock().unwrap().free(slot),
+                    (_, Some(Placed::Pool(slot, _))) => self.units.lock().unwrap().free(slot),
                     (_, Some(Placed::MeshPage(_))) => unreachable!("mesh pages land apart"),
                     (_, Some(Placed::Tile(slot))) => {
                         let (stream, tile) = l.tile.expect("a tile load names its tile");
@@ -1665,6 +1680,15 @@ impl Streaming {
             !done
         });
         drop(pool);
+        let mut units = self.units.lock().unwrap();
+        self.retired_units.retain(|&(frame, slot)| {
+            let done = frame <= completed;
+            if done {
+                units.free(slot);
+            }
+            !done
+        });
+        drop(units);
         let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired_clas)
             .into_iter()
             .partition(|(f, _)| *f <= completed);
@@ -1742,6 +1766,7 @@ pub(crate) struct StreamTask {
     accel: Arc<AccelShared>,
     clas: Option<Arc<Mutex<ClasPool>>>,
     pool: Arc<Mutex<Pool>>,
+    units: Arc<Mutex<Pool>>,
     staging: Arc<Mutex<Pool>>,
     tiles: Arc<Mutex<Pool>>,
     device: Device,
@@ -1857,7 +1882,7 @@ impl StreamTask {
     /// Returns what a failed load took.
     fn free(&self, placed: Option<Placed>, staging: Option<PoolSlot>) {
         match placed {
-            Some(Placed::Pool(slot, _)) => self.pool.lock().unwrap().free(slot),
+            Some(Placed::Pool(slot, _)) => self.units.lock().unwrap().free(slot),
             Some(Placed::Tile(slot)) => self.tiles.lock().unwrap().free(slot),
             Some(Placed::MeshPage(p)) => self.pool.lock().unwrap().free(p.slot),
             None => {}
@@ -1941,11 +1966,11 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
         };
         // A pool slot in staging memory is where the load lands: it reads or decodes into
         // the slot, and no copy follows.
-        let direct =
-            matches!(load.kind, LoadKind::Pool { .. }) && task.device.caps().staging_device_local;
+        let direct = matches!(load.kind, LoadKind::Pool { .. })
+            && task.units.lock().unwrap().kind() == MemoryKind::Staging;
         let (placed, block) = match &load.kind {
             LoadKind::Pool { target, .. } => {
-                let mut pool = task.pool.lock().unwrap();
+                let mut pool = task.units.lock().unwrap();
                 let slot = if direct && reads_straight(&load.source, &b, chunk) {
                     let sector = SECTOR as u64;
                     pool.alloc_aligned(&task.device, len.next_multiple_of(sector), sector)
