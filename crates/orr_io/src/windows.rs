@@ -489,7 +489,8 @@ impl Drop for OsRing {
     fn drop(&mut self) {
         // The reads have completed; the registrations' handles stay until theirs pop.
         while !self.registrations.is_empty() {
-            if !self.wait() {
+            self.submit();
+            if self.failed || !self.wait() {
                 std::mem::forget(std::mem::take(&mut self.registrations));
                 break;
             }

@@ -225,10 +225,12 @@ impl Native {
 
 impl Drop for Native {
     fn drop(&mut self) {
-        // Closing the ring cancels nothing in flight; wait for the reads first.
+        // Closing the ring cancels nothing in flight; wait for the reads first. Entries a
+        // failed submit leaves in the queue may never run, so they wait for nothing.
         while self.in_flight() {
-            if !self.ring.wait() {
-                // The ring is broken and the kernel may still write into these buffers.
+            self.ring.submit();
+            if self.ring.stalled() || !self.ring.wait() {
+                // The kernel may still write into these buffers.
                 for s in &mut self.slots {
                     std::mem::forget(s.take());
                 }
