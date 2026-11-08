@@ -117,7 +117,8 @@ pub struct ResidencyStats {
     /// dropped; a unit still wanted is requested again.
     pub dropped: [u32; SOURCES],
     /// Requests the step held back for a unit still loading from an earlier step, or for a
-    /// tile still unbinding. They are dropped too, and load once requested after it lands.
+    /// tile still unbinding, theirs or a dependency's. They are dropped too, and load once
+    /// requested after it lands.
     pub waiting: u32,
     /// Requests whose absent units, the requested one and those it depends on, alone pass the
     /// in-flight limits (`io_requests` units or `io_bytes`): no step admits them.
@@ -549,9 +550,38 @@ impl Residency {
         self.unit(k).is_some_and(|u| u.state == State::Resident)
     }
 
-    /// Takes back the load of `k` this step's plan started, which waits on its tile's unbind:
-    /// absent again, its bytes released, and counted as waiting instead of loaded.
-    pub(crate) fn cancel(&mut self, k: Key) {
+    /// Takes back the loads of this step's plan, `loads` in plan order, that `waits` holds
+    /// back for their tile's unbind, and those depending on one of them, as
+    /// [`Residency::cancel`] does; returns the rest in order.
+    pub(crate) fn cancel_waiting(
+        &mut self,
+        loads: Vec<Key>,
+        waits: impl Fn(Key) -> bool,
+    ) -> Vec<Key> {
+        let mut canceled = FxHashSet::default();
+        let mut kept = Vec::with_capacity(loads.len());
+        for k in loads {
+            let u = self.unit(k).expect("a planned unit");
+            let blocked = waits(k)
+                || u.deps.iter().any(|&unit| {
+                    canceled.contains(&Key {
+                        mount: k.mount,
+                        unit,
+                    })
+                });
+            if blocked {
+                self.cancel(k);
+                canceled.insert(k);
+            } else {
+                kept.push(k);
+            }
+        }
+        kept
+    }
+
+    /// Takes back the load of `k` this step's plan started: absent again, its bytes released,
+    /// and counted as waiting instead of loaded.
+    fn cancel(&mut self, k: Key) {
         self.release_load(k);
         self.stats.loads -= 1;
         self.stats.waiting += 1;
@@ -1114,7 +1144,7 @@ mod tests {
     }
 
     #[test]
-    fn requests_sharing_a_dependency_load_together() {
+    fn requests_sharing_a_dependency_load_together_and_cancel_with_it() {
         let mut r = Residency::new(limits(u64::MAX));
         r.register(
             M,
@@ -1130,6 +1160,11 @@ mod tests {
         let plan = r.plan(1);
         assert_eq!(plan.loads, [key(0), key(1), key(2)]);
         assert_eq!(r.stats().waiting, 0);
+        // Its dependency waiting on an unbind, neither dependent may load without it.
+        assert_eq!(r.cancel_waiting(plan.loads, |k| k == key(0)), []);
+        assert_eq!((r.stats().loads, r.stats().waiting), (0, 3));
+        assert_eq!(class(&r).loading_bytes, 0);
+        assert_eq!(step(&mut r, &[1, 2], 2).loads, [key(0), key(1), key(2)]);
     }
 
     #[test]

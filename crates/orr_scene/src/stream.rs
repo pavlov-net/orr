@@ -1244,11 +1244,9 @@ impl Streaming {
                 t.write_map(w)?;
             }
         }
-        let (loads, waiting): (Vec<Key>, Vec<Key>) =
-            loads.into_iter().partition(|k| !self.unbinding.contains(k));
-        for k in waiting {
-            self.residency.cancel(k);
-        }
+        let loads = self
+            .residency
+            .cancel_waiting(loads, |k| self.unbinding.contains(&k));
         for u in &self.unbinds {
             self.unbinding.remove(&u.key);
         }
