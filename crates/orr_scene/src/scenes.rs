@@ -167,8 +167,8 @@ impl Default for Budgets {
     }
 }
 
-/// Bytes of [`Budgets::mesh_page_pool`] per entry of the resident cluster table. Zorah's meshes
-/// hold 1,376 B of resident page per cluster, before a streamed page's CLAS.
+/// Bytes of [`Budgets::mesh_page_pool`] per entry of the resident cluster table: a cooked scene
+/// of 101.8 M clusters holds 1,376 B of resident page per cluster, before a streamed page's CLAS.
 const CLUSTER_BYTES: u64 = 1024;
 
 /// Farther models a representation chain holds: the length of `ModelGpu::chain`.
