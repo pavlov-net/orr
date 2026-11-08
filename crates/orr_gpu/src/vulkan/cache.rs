@@ -29,13 +29,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use ash::vk;
 
 use super::device::{Device, Shared};
 use super::pipeline::StageParts;
-use crate::cache_file::{Identity, decode, encode, write};
+use crate::cache_file::{Identity, decode, encode, mark_used, write};
 use crate::{Error, PipelineCacheReport};
 
 /// The bytes `vkGetPipelineCacheData` would write for `cache`.
@@ -309,6 +309,9 @@ impl PipelineCache {
                 initial.len()
             ),
         }
+        if cache.loaded {
+            mark_used(path);
+        }
         cache
     }
 
@@ -456,13 +459,7 @@ impl PipelineCache {
                 .is_some_and(|used| !used.swap(true, Ordering::Relaxed));
         drop(merged);
         if first_use {
-            let touched = File::options()
-                .write(true)
-                .open(stored_path(dir, key))
-                .and_then(|file| file.set_modified(SystemTime::now()));
-            if let Err(e) = touched {
-                log::warn!("pipeline store: {e}");
-            }
+            mark_used(&stored_path(dir, key));
         }
         created
     }

@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+orr_gpu.workspace = true
 serde_json.workspace = true
 
 [lints]

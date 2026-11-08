@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -454,31 +454,6 @@ fn pipeline_store(ws: &Workspace) -> Result<PathBuf, String> {
     Ok(clone.join("target").join("test-pipelines"))
 }
 
-/// Removes the pipelines used longest ago until the store fits [`STORE_BYTES`]. A pipeline
-/// removed while another run reads it is only a miss.
-fn trim_store(store: &Path) {
-    let Ok(entries) = fs::read_dir(store) else {
-        return;
-    };
-    let mut files: Vec<(SystemTime, u64, PathBuf)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let meta = entry.metadata().ok()?;
-            Some((meta.modified().ok()?, meta.len(), entry.path()))
-        })
-        .collect();
-    files.sort();
-    let mut total: u64 = files.iter().map(|(_, len, _)| len).sum();
-    for (_, len, path) in files {
-        if total <= STORE_BYTES {
-            break;
-        }
-        if fs::remove_file(&path).is_ok() {
-            total -= len;
-        }
-    }
-}
-
 /// Each executable runs as under `cargo test`: in its package's directory, with
 /// `CARGO_MANIFEST_DIR` and `CARGO_PKG_NAME` set and the dependency directory on `PATH`, and
 /// with the pipeline store in `STORE_VAR`.
@@ -785,7 +760,7 @@ fn try_run(args: Vec<String>) -> Result<ExitCode, String> {
     let wrapper = env::var("ORR_TEST_WRAPPER").unwrap_or_default();
     let wrapper: Vec<String> = wrapper.split_whitespace().map(str::to_owned).collect();
     let store = pipeline_store(&ws)?;
-    trim_store(&store);
+    orr_gpu::trim_pipeline_store(&store, STORE_BYTES).map_err(|e| e.to_string())?;
     let mut jobs: Vec<Job> = ws
         .selected(&options)
         .filter_map(|t| {

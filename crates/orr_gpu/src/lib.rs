@@ -56,7 +56,7 @@ pub use caps::{Caps, ComponentType, CooperativeVectorCombination, Limits};
 pub use command::{DecompressRegion, DispatchArgs, MemoryCopy, MeshArgs, TextureCopy};
 pub use coopvec::{MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout};
 pub use counters::{COUNTER_METRICS, CounterRange, CounterReport};
-pub use device::DeviceDesc;
+pub use device::{DeviceDesc, trim_pipeline_store};
 pub use diagnostics::{
     Checkpoint, DeviceFault, DiagnosticsReport, FaultAccess, FaultAddress, QueueProgress,
 };

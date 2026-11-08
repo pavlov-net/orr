@@ -28,7 +28,7 @@ use objc2_metal::{
 
 use super::device::{Device, Shared, metal_error};
 use super::{Obj, lock};
-use crate::cache_file::{Identity, decode, encode, write};
+use crate::cache_file::{Identity, decode, encode, mark_used, write};
 use crate::{Error, PipelineCacheReport};
 
 /// Apple's PCI vendor ID.
@@ -225,6 +225,7 @@ impl PipelineCache {
                 );
                 cache.archive = Mutex::new(Some((Obj(a), file)));
                 cache.loaded = true;
+                mark_used(path);
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&file);

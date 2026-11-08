@@ -2,7 +2,9 @@
 //! device, driver version, cache UUID), the backend's cache data, then a BLAKE3 hash of
 //! everything before it. A file from another device, driver or format is refused whole.
 
+use std::fs::File;
 use std::path::Path;
+use std::time::SystemTime;
 
 use crate::Error;
 
@@ -100,6 +102,18 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
         return Err(io(e));
     }
     Ok(())
+}
+
+/// Sets the modification time of `path`, a file a pipeline was just loaded from, to now, so
+/// [`trim_pipeline_store`](crate::trim_pipeline_store) sees it as used.
+pub(crate) fn mark_used(path: &Path) {
+    let touched = File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(SystemTime::now()));
+    if let Err(e) = touched {
+        log::warn!("pipeline file {}: {e}", path.display());
+    }
 }
 
 #[cfg(test)]
