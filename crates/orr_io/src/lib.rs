@@ -158,7 +158,21 @@ pub fn open_shared(path: &Path) -> io::Result<File> {
 #[cfg(any(windows, target_os = "linux"))]
 use crate::sys::open_unbuffered;
 
-#[cfg(not(any(windows, target_os = "linux")))]
+/// Opens with the buffer cache off (`F_NOCACHE`), so that archive reads, each read once,
+/// neither go through it nor push out what it holds. The reads stay free to start and end
+/// anywhere, so the file reads as buffered.
+#[cfg(target_vendor = "apple")]
+fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
+    use std::os::fd::AsRawFd;
+    let file = File::open(path)?;
+    // SAFETY: `F_NOCACHE` takes an int and changes only the descriptor's caching.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((file, false))
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_vendor = "apple")))]
 fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
     Ok((File::open(path)?, false))
 }
@@ -249,8 +263,9 @@ fn read_all<T>(
 
 /// A file opened for unbuffered reads at [`SECTOR`] offsets, from any number of threads at
 /// once or through a [`Ring`]. The file is buffered where the file system refuses unbuffered
-/// reads or needs a larger alignment than [`SECTOR`]. The handle names the file as it was when
-/// opened, so a file renamed over the path later is never read through it.
+/// reads or needs a larger alignment than [`SECTOR`]; on Apple systems its reads skip the
+/// buffer cache. The handle names the file as it was when opened, so a file renamed over the
+/// path later is never read through it.
 pub struct ReadFile {
     /// Overlapped on Windows, where reads on a synchronous handle take turns. No read through
     /// it may come from std, which aborts the process on a read that does not finish at once.
