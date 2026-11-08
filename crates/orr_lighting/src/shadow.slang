@@ -157,6 +157,9 @@ public struct ShadowCandidates<S : ISurface, M : IMedium, let MODE : uint> : ICa
     // The IOR of the innermost interior at the origin, around a SHADOW_PATH ray's windows.
     public float exterior_ior;
     public uint crossed;
+    // A SHADOW_PATH ray's distance to the solid glass candidate that ended it, +inf for none: where
+    // a fading copy keeps solid glass non-opaque, it ends the ray as a committed hit would.
+    public float solid_t;
 
     public bool positions(Candidate c)
     {
@@ -205,6 +208,8 @@ public struct ShadowCandidates<S : ISurface, M : IMedium, let MODE : uint> : ICa
         bool thin = !crosses_interior(scene, sh.section);
         if (MODE == SHADOW_PATH)
         {
+            if (!thin)
+                solid_t = c.t;
             if (!thin || !bsdf_thin_mirror(sh.surface.bsdf, exterior_ior))
                 return float3(0.0);
             return bsdf_straight_transmission(sh.surface.bsdf, n, dir, exterior_ior, environment);
@@ -374,6 +379,7 @@ public float3 surface_visibility<S : ISurface, M : IMedium, let MODE : uint>(Sce
     h.environment = environment;
     h.exterior_ior = interior_ior(s, inside.innermost());
     h.crossed = 0;
+    h.solid_t = positive_infinity();
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = dir;
@@ -419,6 +425,11 @@ public float3 surface_visibility<S : ISurface, M : IMedium, let MODE : uint>(Sce
         else
             mask = MASK_DIELECTRIC;
         pass_flags = flags | RAY_FLAG_FORCE_NON_OPAQUE;
+    }
+    if (committed == ~0u && h.solid_t < positive_infinity())
+    {
+        committed = CLASS_DIELECTRIC;
+        committed_t = h.solid_t;
     }
     if (overflow && overflows != nullptr)
         InterlockedAdd(*overflows, 1u);
@@ -574,8 +585,9 @@ public bool stack_direction(float3 dir, float3 normal, float ior, out float3 ben
     return true;
 }
 
-// Commits the opaque and alpha-tested candidates that are present: what ends a stack's leg
-// beside the AS's opaque geometry and solid glass.
+// Commits the opaque and alpha-tested candidates that are present and cooked solid glass that a
+// fading copy keeps non-opaque: what ends a stack's leg beside the AS's opaque geometry and solid
+// glass.
 struct StackAccept<S : ISurface> : IAnyHit
 {
     SceneRoot* scene;
@@ -585,13 +597,23 @@ struct StackAccept<S : ISurface> : IAnyHit
 
     bool accept(Candidate c)
     {
-        return c.cluster_id >= 0 && c.class_id == CLASS_OPAQUE
-            && resolve_alpha<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context);
+        if (c.cluster_id < 0)
+            return false;
+        uint entry;
+        if (c.class_id == CLASS_DIELECTRIC && !hit_producer(scene, c.instance_index, entry))
+        {
+            ClusterRef r = scene.clusters[uint(c.cluster_id)];
+            if ((load_cluster(r.page, r.local).flags & CLUSTER_SOLID) == 0)
+                return false;
+        }
+        else if (c.class_id != CLASS_OPAQUE)
+            return false;
+        return resolve_alpha<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context);
     }
 }
 
 // The nearest opaque surface or solid glass from `origin` along unit `dir` within `t_max`.
-Hit stack_trace<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context)
+public Hit stack_trace<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context)
 {
     StackAccept<S> a = { s, v, dir, context };
     RayDesc ray;
@@ -678,9 +700,9 @@ public uint path_light<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v
             if (phase == 0)
             {
                 // The ray ends at the first opaque surface or solid glass it found, which need not
-                // be the nearest.
+                // be the nearest; the probe reaches past it by its rounding.
                 phase = 1;
-                probe_max = committed_t;
+                probe_max = committed_t * (1.0 + 1e-4) + T_MIN_BASE;
                 continue;
             }
             t *= seg;

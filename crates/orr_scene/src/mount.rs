@@ -1770,8 +1770,9 @@ fn build_accel(
     r: &mut Resolved,
     wait: Option<TimelinePoint>,
 ) -> Result<Option<TimelinePoint>> {
-    // Sections whose linked coverage decides every triangle at run time, and dielectric and
-    // presence sections, whose every candidate goes to the ray's candidate handler.
+    // Sections whose linked coverage decides every triangle at run time, and thin dielectric and
+    // presence sections, whose every candidate goes to the ray's candidate handler. Solid glass
+    // traces opaque (`CLUSTER_SOLID`).
     let mut non_opaque: Vec<Vec<bool>> = r
         .meshes
         .iter()
@@ -1782,7 +1783,9 @@ fn build_accel(
         let sections = r.meshes[mesh].sections as usize;
         for (section, &mi) in model.materials.iter().take(sections).enumerate() {
             let m = &r.materials[mi].1;
-            let layered = m.flags & (material_flags::DIELECTRIC | material_flags::PRESENCE) != 0;
+            let thin_dielectric = m.flags & material_flags::DIELECTRIC != 0
+                && m.flags & material_flags::THIN_WALLED != 0;
+            let layered = thin_dielectric || m.flags & material_flags::PRESENCE != 0;
             if layered || (m.surface != 0 && m.flags & material_flags::ALPHA_TESTED != 0) {
                 non_opaque[mesh][section] = true;
             }
