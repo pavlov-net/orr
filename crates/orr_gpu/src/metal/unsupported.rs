@@ -36,8 +36,8 @@ impl Device {
     }
 }
 
-/// Host memory imported for the GPU to read in place; not on Metal, whose shared storage the
-/// CPU and the GPU already reach alike.
+/// Host memory imported for the GPU to read in place; not on Metal yet, where
+/// `newBufferWithBytesNoCopy` would wrap the pages.
 pub struct ImportedMemory {
     never: Infallible,
 }
