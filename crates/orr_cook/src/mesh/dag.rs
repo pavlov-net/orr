@@ -30,7 +30,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::lod::{self, Parts, Welded};
-use super::{Built, ClusterData, Ctx, Grid, MeshSettings, store_page, write_page};
+use super::{Built, ClusterData, Ctx, Grid, MeshSettings, page_triangles, store_page, write_page};
 
 /// Sections that share a stage: the cluster vertex limit, and the section itself when its
 /// borders dilate.
@@ -685,18 +685,23 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
     let mut page_info = Vec::with_capacity(page_groups.len());
     let mut page_deps = Vec::new();
     let mut group_table: Vec<Group> = vec![bytemuck::Zeroable::zeroed(); groups.len()];
-    // Per page: its resident length, its cluster count and its stored bytes.
-    let built: Vec<(usize, usize, Vec<u8>)> = page_groups
+    // Per page: its resident length, its cluster and triangle counts and its stored bytes.
+    let built: Vec<(usize, usize, u32, Vec<u8>)> = page_groups
         .par_iter()
         .map(|members| {
             let clusters: Vec<&ClusterData> =
                 members.iter().flat_map(|&g| &groups[g].clusters).collect();
             let bytes = write_page(&clusters, cx.stride);
             let stored = store_page(&bytes).map_err(|e| e.to_string())?;
-            Ok((bytes.len(), clusters.len(), stored))
+            Ok((
+                bytes.len(),
+                clusters.len(),
+                page_triangles(&clusters),
+                stored,
+            ))
         })
         .collect::<Result<_, String>>()?;
-    for (p, (members, (resident_len, cluster_count, stored))) in
+    for (p, (members, (resident_len, cluster_count, tri_count, stored))) in
         page_groups.iter().zip(built).enumerate()
     {
         let mut deps: Vec<u32> = members
@@ -713,6 +718,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         page_info.push(PageInfo {
             blob: p as u32 + 1,
             resident_len: resident_len as u32,
+            tri_count,
             cluster_count: cluster_count as u16,
             _pad: 0,
             deps: Span {

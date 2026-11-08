@@ -332,6 +332,8 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
         assert_eq!(layout.len, page.resident_len);
         let view = PageView::new(&resident, &h).unwrap();
         assert_eq!(view.cluster_count(), u32::from(page.cluster_count));
+        let tris = (0..view.cluster_count()).map(|ci| u32::from(view.cluster(ci).tri_count));
+        assert_eq!(tris.sum::<u32>(), page.tri_count, "page {pi}");
         for ci in 0..view.cluster_count() {
             clusters += 1;
             let c = view.cluster(ci);

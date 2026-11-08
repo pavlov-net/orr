@@ -1052,12 +1052,13 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
         let paged = paginate(clusters, cx.stride);
         let stored = paged
             .par_iter()
-            .map(|(bytes, _)| store_page(bytes))
+            .map(|(bytes, ..)| store_page(bytes))
             .collect::<Result<Vec<_>>>()?;
-        for ((bytes, n), stored) in paged.into_iter().zip(stored) {
+        for ((bytes, n, tri_count), stored) in paged.into_iter().zip(stored) {
             page_info.push(PageInfo {
                 blob: pages.len() as u32 + 1,
                 resident_len: bytes.len() as u32,
+                tri_count,
                 cluster_count: n as u16,
                 _pad: 0,
                 deps: Span::default(),
@@ -1608,7 +1609,7 @@ fn build_cluster(
 
 /// Packs clusters in order into resident pages of at most [`PAGE_MAX`] bytes; returns each
 /// page and its cluster count.
-fn paginate(clusters: &[ClusterData], stride: usize) -> Vec<(Vec<u8>, usize)> {
+fn paginate(clusters: &[ClusterData], stride: usize) -> Vec<(Vec<u8>, usize, u32)> {
     let mut pages = Vec::new();
     let mut first = 0;
     while first < clusters.len() {
@@ -1628,10 +1629,19 @@ fn paginate(clusters: &[ClusterData], stride: usize) -> Vec<(Vec<u8>, usize)> {
             end += 1;
         }
         let page: Vec<&ClusterData> = clusters[first..end].iter().collect();
-        pages.push((write_page(&page, stride), end - first));
+        pages.push((
+            write_page(&page, stride),
+            end - first,
+            page_triangles(&page),
+        ));
         first = end;
     }
     pages
+}
+
+/// The triangles of a page's clusters.
+fn page_triangles(clusters: &[&ClusterData]) -> u32 {
+    clusters.iter().map(|c| u32::from(c.record.tri_count)).sum()
 }
 
 fn write_page(clusters: &[&ClusterData], stride: usize) -> Vec<u8> {

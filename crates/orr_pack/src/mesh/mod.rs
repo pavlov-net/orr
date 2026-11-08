@@ -224,13 +224,16 @@ pub struct Level {
     pub clusters: Span,
 }
 
-/// One page: the blob that holds it and the size it decodes to.
+/// One page: the blob that holds it, the size it decodes to and its clusters' counts.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct PageInfo {
     /// Blob index within the mesh entry.
     pub blob: u32,
     pub resident_len: u32,
+    /// The sum of its clusters' [`Cluster::tri_count`], which sizes the acceleration
+    /// structures a streamed page builds before it loads.
+    pub tri_count: u32,
     pub cluster_count: u16,
     pub _pad: u16,
     /// Range of [`MeshInfo::page_deps`]: the earlier pages holding the coarser clusters this

@@ -42,6 +42,8 @@ pub(crate) fn load(a: &Archive, name: &str) -> Dag {
         mesh::decode_page(&read(a, b), &mut page).unwrap();
         let view = PageView::new(&page, &info.header).unwrap();
         let mut here = Vec::new();
+        let tris = (0..view.cluster_count()).map(|i| u32::from(view.cluster(i).tri_count));
+        assert_eq!(tris.sum::<u32>(), p.tri_count, "page {pi}");
         for i in 0..view.cluster_count() {
             let c = view.cluster(i);
             let tris = (0..u32::from(c.tri_count))
