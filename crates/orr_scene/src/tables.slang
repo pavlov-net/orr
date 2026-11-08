@@ -639,9 +639,12 @@ public uint cluster_page(MeshGpu* mesh, uint cluster)
     return lo;
 }
 
-// The cluster id of mesh cluster `cluster` of `mesh`, whose page is resident.
+// The cluster id of mesh cluster `cluster` of `mesh`, whose page is resident. A mounted mesh's
+// pinned pages take one run of ids from page 0's; an edit's own pages take ids of the edit's.
 public uint mesh_cluster_id(MeshGpu* mesh, uint cluster)
 {
+    if (mesh.edit == nullptr && cluster < mesh.page_clusters[mesh.pinned_pages])
+        return mesh.page_bases[0] + cluster;
     uint page = cluster_page(mesh, cluster);
     return mesh.page_bases[page] + cluster - mesh.page_clusters[page];
 }
