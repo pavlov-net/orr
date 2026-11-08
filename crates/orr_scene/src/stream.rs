@@ -28,7 +28,7 @@
 //! holding those pages locked until no copy uses the cut, and moves tiles of a texture that
 //! lost one back beside its others.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -394,8 +394,9 @@ pub(crate) struct Streaming {
     units: Arc<Mutex<Pool>>,
     staging: Arc<Mutex<Pool>>,
     tiles: Arc<Mutex<Pool>>,
-    /// Finer cached cuts by mount and mesh.
-    fine: HashMap<(MountId, u32), MeshFine>,
+    /// Finer cached cuts by mount and mesh; their builds take the half of the mesh page
+    /// budget they may lock in this order.
+    fine: BTreeMap<(MountId, u32), MeshFine>,
     /// Bytes of mesh pages they hold locked.
     fine_locked: u64,
     /// Finer cuts freed once the frame has completed.
@@ -424,8 +425,9 @@ pub(crate) struct Streaming {
     /// the frame it stops asking.
     moving: HashMap<Key, (PoolSlot, u64)>,
     /// Textures that lost a tile, whose others may move, until the given frame: the room a
-    /// move wants comes free some frames after other textures' evictions.
-    fragmented: HashMap<(MountId, u32), u64>,
+    /// move wants comes free some frames after other textures' evictions. Moves take their
+    /// per-step limit in this order.
+    fragmented: BTreeMap<(MountId, u32), u64>,
     /// Heap indices whose stream table entry the next step writes null.
     nulls: Vec<u32>,
     /// The memory kinds on a device-local heap, whose pressure the residency budgets follow.
@@ -498,7 +500,7 @@ impl Streaming {
                 b.stream_block,
                 "texture tile pool",
             ))),
-            fine: HashMap::new(),
+            fine: BTreeMap::new(),
             fine_locked: 0,
             governed: {
                 let report = device.memory_report();
@@ -525,7 +527,7 @@ impl Streaming {
             retired_cells: Vec::new(),
             streams,
             moving: HashMap::new(),
-            fragmented: HashMap::new(),
+            fragmented: BTreeMap::new(),
             nulls: Vec::new(),
             page_events: Vec::new(),
             window_events: Vec::new(),
