@@ -143,7 +143,8 @@ pub struct ResidencyStats {
     pub failed_cuts: u32,
     /// Failures for lack of memory since the start, of loads (user blobs' among them), finer
     /// cut builds and CLAS pool batches the pool could not grow for, short of memory or of
-    /// address range; one failure of a whole batch counts once. Units and finer cuts are asked
+    /// address range, and steps that held loads back for cluster ids; one failure of a whole
+    /// batch or step counts once. Units and finer cuts are asked
     /// for again while they are still wanted.
     pub out_of_memory: u32,
     /// Instance page records and windows of rows that the frame wanted past the pool's budget.
