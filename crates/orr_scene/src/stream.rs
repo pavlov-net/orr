@@ -1964,6 +1964,7 @@ fn source_of(load: &StreamLoad) -> Result<(Blob, Option<u32>, u64, u64)> {
 pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
     // Each texture's last tile slot, so its next tile goes beside it.
     let mut near: HashMap<*const TexStream, PoolSlot> = HashMap::new();
+    let units_staged = task.units.lock().unwrap().kind() == MemoryKind::Staging;
     for (i, load) in task.loads.iter().enumerate() {
         let (b, chunk, len, slot_len) = match source_of(load) {
             Ok(s) => s,
@@ -1974,8 +1975,7 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
         };
         // A pool slot in staging memory is where the load lands: it reads or decodes into
         // the slot, and no copy follows.
-        let direct = matches!(load.kind, LoadKind::Pool { .. })
-            && task.units.lock().unwrap().kind() == MemoryKind::Staging;
+        let direct = units_staged && matches!(load.kind, LoadKind::Pool { .. });
         let (placed, block) = match &load.kind {
             LoadKind::Pool { target, .. } => {
                 let mut pool = task.units.lock().unwrap();

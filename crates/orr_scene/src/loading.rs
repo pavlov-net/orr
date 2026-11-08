@@ -144,7 +144,7 @@ impl Loading {
     /// where it can.
     pub(crate) fn new(positioned: bool, arena_bytes: u64, device: Option<&Device>) -> Result<Self> {
         let device = device.filter(|d| d.caps().host_memory_import);
-        let align = device.map_or(1, |d| d.caps().limits.host_import_align.max(1));
+        let align = device.map_or(1, |d| d.caps().limits.host_import_align);
         let bytes = usize::try_from(arena_bytes.next_multiple_of(align))
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         let buffers = ReadBuffers::new(bytes)?;
@@ -290,16 +290,12 @@ impl Loading {
     /// Makes the CPU's writes to `block` visible to the GPU work submitted next, where the
     /// device imports the arena as memory that is not coherent.
     pub(crate) fn flush(&self, block: &Block) -> Result<()> {
-        let Some(imported) = &self.imported else {
-            return Ok(());
-        };
-        let Some(at) = block.gpu().checked_sub(imported.gpu().0) else {
-            return Ok(());
-        };
-        if at < imported.size() {
-            imported.flush(at, block.size())?;
+        match &self.imported {
+            Some(imported) if block.own_pages() => {
+                Ok(imported.flush(block.gpu() - imported.gpu().0, block.size())?)
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     pub(crate) fn send(&self, msg: Msg) {
