@@ -121,14 +121,15 @@ pub struct Budgets {
     pub texture_feedback_cells: u32,
     /// Texture feedback records a frame keeps; taps past it report nothing that frame.
     pub texture_feedback_records: u32,
-    /// Streamed units the loading side reads at once, at most.
-    pub io_requests: u32,
-    /// Bytes of streamed units the loading side reads at once, at most. Twice this sizes the
-    /// arena archive reads and streamed units' staging take, which the system's ring
-    /// registers and, where the device imports host memory, the GPU reads in place: room for
-    /// `io_bytes` of decoded units and as much again of their stored input, which mounts'
-    /// reads share. Reads and staging that find no room take memory of their own.
-    pub io_bytes: u64,
+    /// Bytes of streamed units and requested blobs loading at once, from the step that
+    /// starts their reads to the one their GPU work lands in, which hold staging and read
+    /// buffers that long. Loads start while fewer are in flight, so the last one started may
+    /// pass it. Twice this sizes the arena archive reads and streamed units' staging take,
+    /// which the system's ring registers and, where the device imports host memory, the GPU
+    /// reads in place: room for `in_flight_bytes` of decoded units and as much again of their
+    /// stored input, which mounts' reads share. Reads and staging that find no room take
+    /// memory of their own.
+    pub in_flight_bytes: u64,
     /// Bytes per block of the stream pool.
     pub stream_block: u64,
 }
@@ -161,8 +162,7 @@ impl Default for Budgets {
             user_blob_pool: 256 << 20,
             texture_feedback_cells: 1 << 20,
             texture_feedback_records: 1 << 14,
-            io_requests: 64,
-            io_bytes: 64 << 20,
+            in_flight_bytes: 256 << 20,
             stream_block: 16 << 20,
         }
     }
@@ -451,7 +451,7 @@ impl Scenes {
         })?;
         let loading = Arc::new(Loading::new(
             desc.positioned_reads,
-            2 * b.io_bytes,
+            2 * b.in_flight_bytes,
             Some(device),
         )?);
         let thread = {

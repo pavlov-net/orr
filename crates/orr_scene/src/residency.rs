@@ -1,5 +1,5 @@
 //! Which streamed units are resident, which load next and which are evicted, under each
-//! class's byte budget and the loading side's in-flight limits.
+//! class's byte budget and the loading side's in-flight limit.
 //!
 //! A unit is one residency step of a mounted pack: a mesh page (its DAG groups), a hierarchy
 //! page, a whole texture, a streamed texture's mip tails or one of its tiles, or an instance
@@ -9,7 +9,11 @@
 //! loads only with its dependencies (coarser pages, a hierarchy page's parent, a tile's
 //! coarser tile) resident or loading in the same plan, and a unit stays while a resident or
 //! loading unit depends on it. Loads outside any mount's units (user blobs) count against
-//! their class budget and the in-flight limits only.
+//! their class budget and the in-flight limit only.
+//!
+//! Loads start in the order of their requests' priorities while fewer bytes than the limit
+//! are in flight, so the last one started may pass it. A request whose closure the limit cuts
+//! short loads its dependencies first and the rest once they have landed and it comes again.
 //!
 //! A unit's bytes are what its load places and what it builds beside them; the built bytes
 //! are an estimate until its first load reports them.
@@ -117,16 +121,13 @@ pub struct ResidencyStats {
     pub loads: u32,
     pub evictions: u32,
     /// Requests the step could not serve, by [`RequestSource::ALL`] order: over budget with
-    /// too little evictable, or past the in-flight limits beside the loads in flight. Each is
-    /// dropped; a unit still wanted is requested again.
+    /// too little evictable, or with the in-flight limit reached. Each is dropped; a unit still
+    /// wanted is requested again.
     pub dropped: [u32; SOURCES],
-    /// Requests the step held back for a unit still loading from an earlier step, or for a
-    /// tile still unbinding, theirs or a dependency's. They are dropped too, and load once
-    /// requested after it lands.
+    /// Requests the step held back for units still loading, theirs or a dependency's: from an
+    /// earlier step, from this one when the in-flight limit cut their closure short, or a tile
+    /// still unbinding. They are dropped too, and load once requested after those land.
     pub waiting: u32,
-    /// Requests whose absent units, the requested one and those it depends on, alone pass the
-    /// in-flight limits (`io_requests` units or `io_bytes`): no step admits them.
-    pub over_limits: u32,
     /// The most absent units one request needed loaded together since the start.
     pub longest_closure: u32,
     /// Loads landed resident since the start, user blobs' among them.
@@ -172,9 +173,9 @@ impl ResidencyStats {
         self.dropped[source as usize]
     }
 
-    /// Requests the step left unserved: dropped, waiting and over the limits.
+    /// Requests the step left unserved: dropped and waiting.
     pub fn unserved(&self) -> u32 {
-        self.dropped.iter().sum::<u32>() + self.waiting + self.over_limits
+        self.dropped.iter().sum::<u32>() + self.waiting
     }
 }
 
@@ -217,7 +218,7 @@ pub(crate) enum Start {
 #[derive(Clone, Debug)]
 pub(crate) struct UnitDesc {
     pub(crate) class: ResidencyClass,
-    /// What its load reads and places, which the in-flight limits count.
+    /// What its load reads and places, which the in-flight limit counts.
     pub(crate) bytes: u64,
     /// What its load is taken to build beside them (a streamed mesh page's CLAS and
     /// micromaps), until a load reports what it built ([`Residency::built`]).
@@ -258,16 +259,6 @@ impl Unit {
     }
 }
 
-/// Whether a request's closure loads this step.
-enum Admission {
-    Admitted,
-    /// Not this step: past the in-flight limits beside the loads in flight, or over budget
-    /// with too little evictable.
-    Refused,
-    /// Past the in-flight limits on its own.
-    Never,
-}
-
 /// What one step decided.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
@@ -283,8 +274,8 @@ pub(crate) struct Limits {
     /// By [`ResidencyClass::ALL`] order, without memory pressure. Pinned and locked units
     /// must fit them.
     pub(crate) budgets: [u64; CLASSES],
-    pub(crate) io_requests: u32,
-    pub(crate) io_bytes: u64,
+    /// Bytes of loads in flight at which no more start.
+    pub(crate) in_flight: u64,
 }
 
 pub(crate) struct Residency {
@@ -301,7 +292,8 @@ pub(crate) struct Residency {
     used: [u64; CLASSES],
     loading_bytes: [u64; CLASSES],
     resident_units: [u32; CLASSES],
-    in_flight: (u32, u64),
+    /// Bytes of the loads in flight.
+    in_flight: u64,
     requests: FxHashMap<Key, (Priority, RequestSource)>,
     failed: u32,
     /// A load or build ran out of memory the budgets govern since the last `react`.
@@ -321,7 +313,7 @@ impl Residency {
             used: [0; CLASSES],
             loading_bytes: [0; CLASSES],
             resident_units: [0; CLASSES],
-            in_flight: (0, 0),
+            in_flight: 0,
             requests: FxHashMap::default(),
             failed: 0,
             out_of_memory: false,
@@ -484,8 +476,7 @@ impl Residency {
                 State::Loading => {
                     self.used[c] -= u.held();
                     self.loading_bytes[c] -= u.held();
-                    self.in_flight.0 -= 1;
-                    self.in_flight.1 -= u.bytes;
+                    self.in_flight -= u.bytes;
                 }
                 State::Failed => self.failed -= 1,
                 State::Absent => {}
@@ -639,8 +630,7 @@ impl Residency {
         u.state = State::Absent;
         self.used[c] -= u.held();
         self.loading_bytes[c] -= u.held();
-        self.in_flight.0 -= 1;
-        self.in_flight.1 -= u.bytes;
+        self.in_flight -= u.bytes;
         for d in u.deps.clone() {
             units[d as usize].dependents -= 1;
         }
@@ -664,19 +654,16 @@ impl Residency {
     }
 
     /// Starts a load of `bytes` of class `c` outside any mount's units (user blobs): true
-    /// when the class budget and the in-flight limits have room for it.
+    /// when the class budget has room for it and the loads in flight are short of the
+    /// in-flight limit.
     pub(crate) fn start_loose(&mut self, class: ResidencyClass, bytes: u64) -> bool {
         let c = class as usize;
-        if self.used[c] + bytes > self.budget(c)
-            || self.in_flight.0 + 1 > self.limits.io_requests
-            || self.in_flight.1 + bytes > self.limits.io_bytes
-        {
+        if self.used[c] + bytes > self.budget(c) || self.in_flight >= self.limits.in_flight {
             return false;
         }
         self.used[c] += bytes;
         self.loading_bytes[c] += bytes;
-        self.in_flight.0 += 1;
-        self.in_flight.1 += bytes;
+        self.in_flight += bytes;
         self.refresh();
         true
     }
@@ -685,8 +672,7 @@ impl Residency {
     pub(crate) fn loose_landed(&mut self, class: ResidencyClass, bytes: u64, ok: bool) {
         let c = class as usize;
         self.loading_bytes[c] -= bytes;
-        self.in_flight.0 -= 1;
-        self.in_flight.1 -= bytes;
+        self.in_flight -= bytes;
         if ok {
             self.resident_units[c] += 1;
             self.stats.landed += 1;
@@ -714,8 +700,7 @@ impl Residency {
         debug_assert_eq!(u.state, State::Loading);
         let c = u.class as usize;
         self.loading_bytes[c] -= u.held();
-        self.in_flight.0 -= 1;
-        self.in_flight.1 -= u.bytes;
+        self.in_flight -= u.bytes;
         if ok {
             u.state = State::Resident;
             u.touched = frame;
@@ -753,7 +738,7 @@ impl Residency {
             }
         }
         let mut dropped = [0; SOURCES];
-        let (mut waiting, mut over_limits) = (0, 0);
+        let mut waiting = 0;
         let mut started = FxHashSet::default();
         for (k, (_, source)) in requests {
             match self.unit(k).map(|u| u.state) {
@@ -771,18 +756,15 @@ impl Residency {
             };
             let longest = &mut self.stats.longest_closure;
             *longest = (*longest).max(chain.len() as u32);
-            match self.admit(&chain, frame, &mut plan.evictions) {
-                Admission::Admitted => {}
-                Admission::Refused => {
-                    dropped[source as usize] += 1;
-                    continue;
-                }
-                Admission::Never => {
-                    over_limits += 1;
-                    continue;
-                }
+            let admitted = self.admit(&chain, frame, &mut plan.evictions);
+            if admitted == 0 {
+                dropped[source as usize] += 1;
+                continue;
             }
-            for u in chain {
+            if admitted < chain.len() {
+                waiting += 1;
+            }
+            for &u in &chain[..admitted] {
                 self.start_load(u);
                 started.insert(u);
                 plan.loads.push(u);
@@ -792,7 +774,6 @@ impl Residency {
         self.stats.evictions = plan.evictions.len() as u32;
         self.stats.dropped = dropped;
         self.stats.waiting = waiting;
-        self.stats.over_limits = over_limits;
         self.refresh();
         plan
     }
@@ -831,29 +812,30 @@ impl Residency {
         Ok(out)
     }
 
-    /// Whether `chain` fits the in-flight limits and its budgets, evicting what it needs.
-    fn admit(&mut self, chain: &[Key], frame: u64, evictions: &mut Vec<Key>) -> Admission {
+    /// How many units from the start of `chain` load now, evicting what they need: those
+    /// that start before the loads in flight reach the in-flight limit, when their budgets
+    /// take them all; 0 when none do. Any start of a closure holds its own dependencies.
+    fn admit(&mut self, chain: &[Key], frame: u64, evictions: &mut Vec<Key>) -> usize {
         let mut need = [0u64; CLASSES];
-        let mut bytes = 0;
-        // The chain's resident dependencies, which must stay.
+        let mut in_flight = self.in_flight;
+        // Their resident dependencies, which must stay.
         let mut held = Vec::new();
+        let mut admitted = 0;
         for &k in chain {
+            if in_flight >= self.limits.in_flight {
+                break;
+            }
             let u = self.unit(k).expect("unit of a closure");
             need[u.class as usize] += u.held();
-            bytes += u.bytes;
+            in_flight += u.bytes;
             held.extend(u.deps.iter().map(|&unit| Key {
                 mount: k.mount,
                 unit,
             }));
+            admitted += 1;
         }
-        let (io_requests, io_bytes) = (self.limits.io_requests, self.limits.io_bytes);
-        if chain.len() as u32 > io_requests || bytes > io_bytes {
-            return Admission::Never;
-        }
-        if self.in_flight.0 + chain.len() as u32 > io_requests
-            || self.in_flight.1 + bytes > io_bytes
-        {
-            return Admission::Refused;
+        if admitted == 0 {
+            return 0;
         }
         let mut victims = Vec::new();
         for class in ResidencyClass::ALL {
@@ -861,7 +843,7 @@ impl Residency {
             let over = (self.used[c] + need[c]).saturating_sub(self.budget(c));
             let (v, short) = self.victims(c, over, frame, &held);
             if short > 0 {
-                return Admission::Refused;
+                return 0;
             }
             victims.extend(v);
         }
@@ -869,7 +851,7 @@ impl Residency {
             self.evict(k);
             evictions.push(k);
         }
-        Admission::Admitted
+        admitted
     }
 
     /// Units of class `c` past their hold, least recently touched first, whose eviction
@@ -929,8 +911,7 @@ impl Residency {
         u.state = State::Loading;
         self.used[c] += u.held();
         self.loading_bytes[c] += u.held();
-        self.in_flight.0 += 1;
-        self.in_flight.1 += u.bytes;
+        self.in_flight += u.bytes;
         for d in u.deps.clone() {
             units[d as usize].dependents += 1;
         }
@@ -972,8 +953,7 @@ mod tests {
         budgets[ResidencyClass::HierarchyPages as usize] = budget;
         Limits {
             budgets,
-            io_requests: 64,
-            io_bytes: u64::MAX,
+            in_flight: u64::MAX,
         }
     }
 
@@ -1066,9 +1046,9 @@ mod tests {
     }
 
     #[test]
-    fn requests_rank_by_error_then_cell_distance_within_the_in_flight_limits() {
+    fn requests_rank_by_error_then_cell_distance_within_the_in_flight_limit() {
         let mut r = Residency::new(Limits {
-            io_requests: 2,
+            in_flight: 20,
             ..limits(u64::MAX)
         });
         let units: Vec<UnitDesc> = (0..4).map(|_| unit(10, &[], Start::Absent)).collect();
@@ -1095,32 +1075,59 @@ mod tests {
         assert_eq!(r.plan(2).loads, []);
         r.request(key(3), P, S);
         assert_eq!(r.plan(2).loads, [key(3)]);
+    }
 
-        // Three absent units loaded together pass the limit of two on their own.
-        let deep = MountId(1);
+    #[test]
+    fn a_closure_past_the_in_flight_limit_loads_across_steps_in_dependency_order() {
+        let mut r = Residency::new(Limits {
+            in_flight: 25,
+            ..limits(u64::MAX)
+        });
+        // A chain of three, and 3, which alone takes more than the limit.
         r.register(
-            deep,
+            M,
             &[
                 unit(10, &[], Start::Absent),
                 unit(10, &[0], Start::Absent),
                 unit(10, &[1], Start::Absent),
+                unit(40, &[], Start::Absent),
             ],
         )
         .unwrap();
-        r.landed(key(2), true, 2);
-        r.landed(key(3), true, 2);
-        r.request(
-            Key {
-                mount: deep,
-                unit: 2,
-            },
-            P,
-            S,
+        let plan = step(&mut r, &[2, 3], 1);
+        assert_eq!(plan.loads, [key(0), key(1), key(2)], "the last passes 25");
+        assert_eq!(r.stats().dropped_from(S), 1, "3 waits for room");
+        assert_eq!(
+            step(&mut r, &[3], 2).loads,
+            [key(3)],
+            "alone past the limit"
         );
-        assert_eq!(r.plan(3).loads, []);
+
+        // A closure of four cut short at three.
+        let deep = MountId(1);
+        let deep_key = |unit| Key { mount: deep, unit };
+        let chain: Vec<UnitDesc> = (0..4)
+            .map(|u| match u {
+                0 => unit(10, &[], Start::Absent),
+                _ => unit(10, &[u - 1], Start::Absent),
+            })
+            .collect();
+        r.register(deep, &chain).unwrap();
+        r.request(deep_key(3), P, S);
+        assert_eq!(r.plan(3).loads, [deep_key(0), deep_key(1), deep_key(2)]);
         let s = r.stats();
-        assert_eq!((s.dropped, s.over_limits), ([0; SOURCES], 1));
-        assert_eq!((s.longest_closure, s.landed), (3, 3));
+        assert_eq!(
+            (s.waiting, s.dropped, s.longest_closure),
+            (1, [0; SOURCES], 4)
+        );
+        r.request(deep_key(3), P, S);
+        assert_eq!(r.plan(4).loads, [], "its dependencies are still loading");
+        assert_eq!(r.stats().waiting, 1);
+        for u in 0..3 {
+            r.landed(deep_key(u), true, 4);
+        }
+        r.request(deep_key(3), P, S);
+        assert_eq!(r.plan(5).loads, [deep_key(3)]);
     }
 
     #[test]
@@ -1162,7 +1169,7 @@ mod tests {
     #[test]
     fn built_bytes_take_the_budget_but_not_the_in_flight_bytes_and_replace_their_estimate() {
         let mut l = limits(300);
-        l.io_bytes = 100;
+        l.in_flight = 100;
         let mut r = Residency::new(l);
         let built = |bytes, estimate| UnitDesc {
             built: estimate,
@@ -1280,16 +1287,16 @@ mod tests {
     }
 
     #[test]
-    fn loose_loads_take_their_class_budget_and_the_in_flight_limits() {
+    fn loose_loads_take_their_class_budget_and_the_in_flight_limit() {
         let mut l = limits(u64::MAX);
         l.budgets[ResidencyClass::UserBlobs as usize] = 150;
-        l.io_requests = 2;
+        l.in_flight = 120;
         let mut r = Residency::new(l);
         let user = ResidencyClass::UserBlobs;
         assert!(r.start_loose(user, 100));
         assert!(!r.start_loose(user, 100), "over the class budget");
-        assert!(r.start_loose(user, 50));
-        assert!(!r.start_loose(user, 0), "over the in-flight requests");
+        assert!(r.start_loose(user, 50), "passing the in-flight limit");
+        assert!(!r.start_loose(user, 0), "at the in-flight limit");
         r.loose_landed(user, 100, true);
         r.loose_landed(user, 50, false);
         let c = *r.stats().class(user);

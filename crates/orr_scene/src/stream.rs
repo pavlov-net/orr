@@ -453,8 +453,7 @@ impl Streaming {
             retired_clas: Vec::new(),
             residency: Residency::new(Limits {
                 budgets,
-                io_requests: b.io_requests,
-                io_bytes: b.io_bytes,
+                in_flight: b.in_flight_bytes,
             }),
             units: if caps.staging_device_local {
                 Arc::new(Mutex::new(Pool::new(
@@ -1092,8 +1091,8 @@ impl Streaming {
         }
     }
 
-    /// Queues `blob` of `source` into `target`. It loads once the user blob budget and the
-    /// in-flight limits have room, in request order.
+    /// Queues `blob` of `source` into `target`. It loads once the user blob budget has room
+    /// and the loads in flight are short of the in-flight limit, in request order.
     pub(crate) fn request_blob(
         &mut self,
         source: &Arc<BlobSource>,
