@@ -128,11 +128,12 @@ pub struct Budgets {
     /// Bytes of streamed units and requested blobs loading at once, from the step that
     /// starts their reads to the one their GPU work lands in, which hold staging and read
     /// buffers that long. Loads start while fewer are in flight, so the last one started may
-    /// pass it. Twice this sizes the arena archive reads and streamed units' staging take,
-    /// which the system's ring registers and, where the device imports host memory, the GPU
-    /// reads in place: room for `in_flight_bytes` of decoded units and as much again of their
-    /// stored input, which mounts' reads share. Reads and staging that find no room take
-    /// memory of their own.
+    /// pass it. Each [`RequestSource`] and the requested blobs share it equally while they all
+    /// have loads waiting; a share one leaves unused goes to the others. Twice this sizes the
+    /// arena archive reads and streamed units' staging take, which the system's ring registers
+    /// and, where the device imports host memory, the GPU reads in place: room for
+    /// `in_flight_bytes` of decoded units and as much again of their stored input, which
+    /// mounts' reads share. Reads and staging that find no room take memory of their own.
     pub in_flight_bytes: u64,
     /// Bytes per block of the stream pool.
     pub stream_block: u64,

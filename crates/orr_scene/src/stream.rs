@@ -1125,7 +1125,8 @@ impl Streaming {
     }
 
     /// Queues `blob` of `source` into `target`. It loads once the user blob budget has room
-    /// and the loads in flight are short of the in-flight limit, in request order.
+    /// and the in-flight limit has room for it beside the shares of the other requests, in
+    /// request order.
     pub(crate) fn request_blob(
         &mut self,
         source: &Arc<BlobSource>,
@@ -1178,8 +1179,7 @@ impl Streaming {
                 self.queued.retain(|&q| q != id.0);
             }
             BlobState::Ready => {
-                self.residency
-                    .release_loose(ResidencyClass::UserBlobs, b.bytes);
+                self.residency.release_blob(b.bytes);
                 *slot = None;
             }
             BlobState::Loading { .. } => b.state = BlobState::Loading { released: true },
@@ -1280,7 +1280,34 @@ impl Streaming {
                 RequestSource::Textures,
             );
         }
-        let Plan { loads, evictions } = self.residency.plan(frame);
+        let queued = self
+            .queued
+            .iter()
+            .map(|&id| self.blobs[id as usize].as_ref().expect("queued blob").bytes);
+        let Plan {
+            loads,
+            evictions,
+            blobs,
+        } = self.residency.plan(frame, queued);
+        let blob_loads: Vec<StreamLoad> = self
+            .queued
+            .drain(..blobs)
+            .map(|id| {
+                let b = self.blobs[id as usize].as_mut().expect("queued blob");
+                let state = std::mem::replace(&mut b.state, BlobState::Loading { released: false });
+                let BlobState::Queued(r) = state else {
+                    unreachable!("a queued blob is queued")
+                };
+                StreamLoad {
+                    what: What::Blob(id),
+                    source: r.source,
+                    kind: LoadKind::User {
+                        blob: r.blob,
+                        target: r.target,
+                    },
+                }
+            })
+            .collect();
         for k in &evictions {
             let m = &self.mounts[&k.mount];
             if let Some(StreamUnit::Tile { texture, .. }) = m.units[k.unit as usize] {
@@ -1361,28 +1388,7 @@ impl Streaming {
             .into_iter()
             .filter(|(k, _)| self.residency.absent(*k))
             .collect();
-        while let Some(&id) = self.queued.front() {
-            let b = self.blobs[id as usize].as_mut().expect("queued blob");
-            if !self
-                .residency
-                .start_loose(ResidencyClass::UserBlobs, b.bytes)
-            {
-                break;
-            }
-            self.queued.pop_front();
-            let state = std::mem::replace(&mut b.state, BlobState::Loading { released: false });
-            let BlobState::Queued(r) = state else {
-                unreachable!("a queued blob is queued")
-            };
-            loads.push(StreamLoad {
-                what: What::Blob(id),
-                source: r.source,
-                kind: LoadKind::User {
-                    blob: r.blob,
-                    target: r.target,
-                },
-            });
-        }
+        loads.extend(blob_loads);
         let mut tasks = split_tasks(loads, self.clas.is_some());
         let clas_waits = self.clas.as_ref().is_some_and(|c| c.pending());
         if tasks.is_empty() && (!self.unbinds.is_empty() || clas_waits) {
@@ -1637,12 +1643,10 @@ impl Streaming {
                 let slot = &mut self.blobs[id as usize];
                 let b = slot.as_mut().expect("a loading blob");
                 let released = matches!(b.state, BlobState::Loading { released: true });
-                self.residency
-                    .loose_landed(ResidencyClass::UserBlobs, b.bytes, ok);
+                self.residency.blob_landed(b.bytes, ok);
                 if released {
                     if ok {
-                        self.residency
-                            .release_loose(ResidencyClass::UserBlobs, b.bytes);
+                        self.residency.release_blob(b.bytes);
                     }
                     *slot = None;
                 } else {

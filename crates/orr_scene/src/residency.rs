@@ -11,9 +11,13 @@
 //! loading unit depends on it. Loads outside any mount's units (user blobs) count against
 //! their class budget and the in-flight limit only.
 //!
-//! Loads start in the order of their requests' priorities while fewer bytes than the limit
-//! are in flight, so the last one started may pass it. A request whose closure the limit cuts
-//! short loads its dependencies first and the rest once they have landed and it comes again.
+//! Loads start while fewer bytes than the limit are in flight, so the last one started may
+//! pass it. The limit is shared by lane: one per request source and one for user blobs. Each
+//! load goes to the lane with demand left and the fewest bytes in flight, its highest-priority
+//! request first (user blobs in request order), since priorities of different sources measure
+//! different things. So every lane with demand gets an equal share, and what one leaves unused
+//! goes to the others. A request whose closure the limit cuts short loads its dependencies
+//! first and the rest once they have landed and it comes again.
 //!
 //! A unit's bytes are what its load places and what it builds beside them; the built bytes
 //! are an estimate until its first load reports them.
@@ -45,6 +49,9 @@ const MIN_SCALE: f64 = 0.125;
 const CLASSES: usize = 5;
 /// Request sources.
 const SOURCES: usize = 5;
+/// Lanes sharing the in-flight limit: the request sources, then user blobs.
+const LANES: usize = SOURCES + 1;
+const BLOB_LANE: usize = SOURCES;
 
 /// A residency class: one pool and one byte budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -184,7 +191,8 @@ impl ResidencyStats {
     }
 }
 
-/// A request's priority: the larger projected error first, then the nearer cell.
+/// A request's priority among its source's: the larger projected error first, then the nearer
+/// cell.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Priority {
     /// Projected error in pixels that the unit would remove; 0 for hints.
@@ -255,6 +263,8 @@ struct Unit {
     touched: u64,
     /// The touch its class's LRU holds it under, at most `touched`.
     listed: u64,
+    /// While it loads, the lane whose request started it.
+    lane: usize,
 }
 
 impl Unit {
@@ -280,6 +290,8 @@ pub(crate) struct Plan {
     pub(crate) loads: Vec<Key>,
     /// Units no longer resident from this step on.
     pub(crate) evictions: Vec<Key>,
+    /// User blobs that start loading, from the front of the queue the plan was given.
+    pub(crate) blobs: usize,
 }
 
 /// The budgets and limits a [`Residency`] plans under.
@@ -306,8 +318,9 @@ pub(crate) struct Residency {
     used: [u64; CLASSES],
     loading_bytes: [u64; CLASSES],
     resident_units: [u32; CLASSES],
-    /// Bytes of the loads in flight.
+    /// Bytes of the loads in flight, in all and by lane.
     in_flight: u64,
+    lane_in_flight: [u64; LANES],
     requests: FxHashMap<Key, (Priority, RequestSource)>,
     failed: u32,
     /// A load or build ran out of memory the budgets govern since the last `react`.
@@ -328,6 +341,7 @@ impl Residency {
             loading_bytes: [0; CLASSES],
             resident_units: [0; CLASSES],
             in_flight: 0,
+            lane_in_flight: [0; LANES],
             requests: FxHashMap::default(),
             failed: 0,
             out_of_memory: false,
@@ -439,6 +453,7 @@ impl Residency {
                 dependents: 0,
                 touched: 0,
                 listed: 0,
+                lane: 0,
             })
             .collect();
         for i in 0..list.len() {
@@ -491,6 +506,7 @@ impl Residency {
                     self.used[c] -= u.held();
                     self.loading_bytes[c] -= u.held();
                     self.in_flight -= u.bytes;
+                    self.lane_in_flight[u.lane] -= u.bytes;
                 }
                 State::Failed => self.failed -= 1,
                 State::Absent => {}
@@ -658,6 +674,7 @@ impl Residency {
         self.used[c] -= u.held();
         self.loading_bytes[c] -= u.held();
         self.in_flight -= u.bytes;
+        self.lane_in_flight[u.lane] -= u.bytes;
         for d in u.deps.clone() {
             units[d as usize].dependents -= 1;
         }
@@ -680,26 +697,27 @@ impl Residency {
         self.refresh();
     }
 
-    /// Starts a load of `bytes` of class `c` outside any mount's units (user blobs): true
-    /// when the class budget has room for it and the loads in flight are short of the
-    /// in-flight limit.
-    pub(crate) fn start_loose(&mut self, class: ResidencyClass, bytes: u64) -> bool {
-        let c = class as usize;
+    /// Starts a user blob's load of `bytes`, outside any mount's units: true when the user
+    /// blob budget has room for it and the loads in flight are short of the in-flight limit.
+    fn start_blob(&mut self, bytes: u64) -> bool {
+        let c = ResidencyClass::UserBlobs as usize;
         if self.used[c] + bytes > self.budget(c) || self.in_flight >= self.limits.in_flight {
             return false;
         }
         self.used[c] += bytes;
         self.loading_bytes[c] += bytes;
         self.in_flight += bytes;
-        self.refresh();
+        self.lane_in_flight[BLOB_LANE] += bytes;
         true
     }
 
-    /// A [`Residency::start_loose`] load ended: its bytes stay resident when `ok`.
-    pub(crate) fn loose_landed(&mut self, class: ResidencyClass, bytes: u64, ok: bool) {
-        let c = class as usize;
+    /// A user blob's load of `bytes` that a plan started ([`Plan::blobs`]) ended: its bytes
+    /// stay resident when `ok`.
+    pub(crate) fn blob_landed(&mut self, bytes: u64, ok: bool) {
+        let c = ResidencyClass::UserBlobs as usize;
         self.loading_bytes[c] -= bytes;
         self.in_flight -= bytes;
+        self.lane_in_flight[BLOB_LANE] -= bytes;
         if ok {
             self.resident_units[c] += 1;
             self.stats.landed += 1;
@@ -709,9 +727,9 @@ impl Residency {
         self.refresh();
     }
 
-    /// Releases a resident [`Residency::start_loose`] load.
-    pub(crate) fn release_loose(&mut self, class: ResidencyClass, bytes: u64) {
-        let c = class as usize;
+    /// Releases a resident user blob of `bytes`.
+    pub(crate) fn release_blob(&mut self, bytes: u64) {
+        let c = ResidencyClass::UserBlobs as usize;
         self.used[c] -= bytes;
         self.resident_units[c] -= 1;
         self.refresh();
@@ -728,6 +746,7 @@ impl Residency {
         let c = u.class as usize;
         self.loading_bytes[c] -= u.held();
         self.in_flight -= u.bytes;
+        self.lane_in_flight[u.lane] -= u.bytes;
         if ok {
             u.state = State::Resident;
             u.touched = frame;
@@ -748,12 +767,18 @@ impl Residency {
     }
 
     /// Decides this step's loads and evictions from the requests since the last plan, then
-    /// drops every request. Classes over their budget first evict units past their hold.
-    pub(crate) fn plan(&mut self, frame: u64) -> Plan {
-        let mut requests: Vec<(Key, (Priority, RequestSource))> = self.requests.drain().collect();
-        requests.sort_by(|a, b| a.1.0.rank(&b.1.0).then(a.0.cmp(&b.0)));
-        for &(k, _) in &requests {
-            self.touch(k, frame);
+    /// drops every request; and how many of the queued user blobs of `blobs` bytes start, in
+    /// queue order. Classes over their budget first evict units past their hold.
+    pub(crate) fn plan(&mut self, frame: u64, blobs: impl IntoIterator<Item = u64>) -> Plan {
+        let mut lanes: [Vec<(Key, Priority)>; SOURCES] = Default::default();
+        for (k, (p, source)) in self.requests.drain() {
+            lanes[source as usize].push((k, p));
+        }
+        for lane in &mut lanes {
+            lane.sort_by(|a, b| a.1.rank(&b.1).then(a.0.cmp(&b.0)));
+            for &(k, _) in lane.iter() {
+                self.touch(k, frame);
+            }
         }
         let mut plan = Plan::default();
         for class in ResidencyClass::ALL {
@@ -767,7 +792,33 @@ impl Residency {
         let mut dropped = [0; SOURCES];
         let mut waiting = 0;
         let mut started = FxHashSet::default();
-        for (k, (_, source)) in requests {
+        let mut next = [0; SOURCES];
+        let mut blobs = blobs.into_iter();
+        // The next queued blob; none once one cannot start, as it holds back those after it.
+        let mut blob = blobs.next();
+        loop {
+            let left = |l: usize| match l {
+                BLOB_LANE => blob.is_some(),
+                _ => next[l] < lanes[l].len(),
+            };
+            let Some(lane) = (0..LANES)
+                .filter(|&l| left(l))
+                .min_by_key(|&l| self.lane_in_flight[l])
+            else {
+                break;
+            };
+            if lane == BLOB_LANE {
+                let bytes = blob.expect("a blob lane with demand left");
+                blob = if self.start_blob(bytes) {
+                    plan.blobs += 1;
+                    blobs.next()
+                } else {
+                    None
+                };
+                continue;
+            }
+            let k = lanes[lane][next[lane]].0;
+            next[lane] += 1;
             match self.unit(k).map(|u| u.state) {
                 Some(State::Absent) => {}
                 _ => continue,
@@ -785,14 +836,14 @@ impl Residency {
             *longest = (*longest).max(chain.len() as u32);
             let admitted = self.admit(&chain, frame, &mut plan.evictions);
             if admitted == 0 {
-                dropped[source as usize] += 1;
+                dropped[lane] += 1;
                 continue;
             }
             if admitted < chain.len() {
                 waiting += 1;
             }
             for &u in &chain[..admitted] {
-                self.start_load(u);
+                self.start_load(u, lane);
                 started.insert(u);
                 plan.loads.push(u);
             }
@@ -931,14 +982,16 @@ impl Residency {
         }
     }
 
-    fn start_load(&mut self, k: Key) {
+    fn start_load(&mut self, k: Key, lane: usize) {
         let units = self.mounts.get_mut(&k.mount).expect("mounted");
         let u = &mut units[k.unit as usize];
         let c = u.class as usize;
         u.state = State::Loading;
+        u.lane = lane;
         self.used[c] += u.held();
         self.loading_bytes[c] += u.held();
         self.in_flight += u.bytes;
+        self.lane_in_flight[lane] += u.bytes;
         for d in u.deps.clone() {
             units[d as usize].dependents += 1;
         }
@@ -1001,7 +1054,7 @@ mod tests {
         for &u in units {
             r.request(key(u), P, S);
         }
-        let plan = r.plan(frame);
+        let plan = r.plan(frame, []);
         land_all(r, &plan, frame);
         plan
     }
@@ -1073,35 +1126,42 @@ mod tests {
     }
 
     #[test]
-    fn requests_rank_by_error_then_cell_distance_within_the_in_flight_limit() {
+    fn sources_share_the_in_flight_limit_and_rank_their_own_requests() {
         let mut r = Residency::new(Limits {
-            in_flight: 20,
+            in_flight: 40,
             ..limits(u64::MAX)
         });
-        let units: Vec<UnitDesc> = (0..4).map(|_| unit(10, &[], Start::Absent)).collect();
+        let units: Vec<UnitDesc> = (0..9).map(|_| unit(10, &[], Start::Absent)).collect();
         r.register(M, &units).unwrap();
         let at = |error, cell_distance| Priority {
             error,
             cell_distance,
         };
         use RequestSource::*;
-        r.request(key(0), at(0.0, 1), Textures);
-        r.request(key(1), at(0.0, 5), Hints);
-        r.request(key(2), at(2.0, 9), FinerCuts);
-        r.request(key(3), at(0.0, 0), Hints);
-        r.request(key(1), at(3.0, 9), Traversal);
-        let plan = r.plan(1);
-        assert_eq!(plan.loads, [key(1), key(2)]);
+        for (u, error, cell_distance) in [(0, 50.0, 3), (1, 50.0, 1), (2, 90.0, 9), (3, 10.0, 0)] {
+            r.request(key(u), at(error, cell_distance), Traversal);
+        }
+        r.request(key(4), at(20.0, 0), Traversal);
+        r.request(key(5), at(30.0, 0), Traversal);
+        r.request(key(6), at(1.0, 0), Textures);
+        let plan = r.plan(1, []);
         assert_eq!(
-            r.stats().dropped,
-            [0, 0, 1, 0, 1],
-            "by the dropped requests' sources"
+            plan.loads,
+            [key(2), key(6), key(1), key(0)],
+            "a texture beside larger mesh errors, and the shares no other source wants"
         );
-        // Unserved requests are dropped: nothing loads until they come again.
-        r.landed(key(1), true, 1);
-        assert_eq!(r.plan(2).loads, []);
-        r.request(key(3), P, S);
-        assert_eq!(r.plan(2).loads, [key(3)]);
+        assert_eq!(r.stats().dropped, [3, 0, 0, 0, 0], "by source");
+
+        // The source with fewer bytes in flight goes first, and unserved requests are
+        // dropped: nothing loads until they come again.
+        r.landed(key(2), true, 1);
+        r.request(key(5), at(30.0, 0), Traversal);
+        r.request(key(7), at(0.5, 0), Textures);
+        assert_eq!(r.plan(2, []).loads, [key(7)]);
+        r.landed(key(7), true, 2);
+        assert_eq!(r.plan(3, []).loads, []);
+        r.request(key(8), P, Hints);
+        assert_eq!(r.plan(3, []).loads, [key(8)]);
     }
 
     #[test]
@@ -1141,20 +1201,24 @@ mod tests {
             .collect();
         r.register(deep, &chain).unwrap();
         r.request(deep_key(3), P, S);
-        assert_eq!(r.plan(3).loads, [deep_key(0), deep_key(1), deep_key(2)]);
+        assert_eq!(r.plan(3, []).loads, [deep_key(0), deep_key(1), deep_key(2)]);
         let s = r.stats();
         assert_eq!(
             (s.waiting, s.dropped, s.longest_closure),
             (1, [0; SOURCES], 4)
         );
         r.request(deep_key(3), P, S);
-        assert_eq!(r.plan(4).loads, [], "its dependencies are still loading");
+        assert_eq!(
+            r.plan(4, []).loads,
+            [],
+            "its dependencies are still loading"
+        );
         assert_eq!(r.stats().waiting, 1);
         for u in 0..3 {
             r.landed(deep_key(u), true, 4);
         }
         r.request(deep_key(3), P, S);
-        assert_eq!(r.plan(5).loads, [deep_key(3)]);
+        assert_eq!(r.plan(5, []).loads, [deep_key(3)]);
     }
 
     #[test]
@@ -1166,13 +1230,13 @@ mod tests {
         )
         .unwrap();
         r.request(key(0), P, S);
-        assert_eq!(r.plan(1).loads, [key(0)]);
+        assert_eq!(r.plan(1, []).loads, [key(0)]);
         r.request(key(1), P, S);
-        assert_eq!(r.plan(2).loads, []);
+        assert_eq!(r.plan(2, []).loads, []);
         assert_eq!((r.stats().waiting, r.stats().dropped), (1, [0; SOURCES]));
         r.landed(key(0), true, 2);
         r.request(key(1), P, S);
-        assert_eq!(r.plan(3).loads, [key(1)]);
+        assert_eq!(r.plan(3, []).loads, [key(1)]);
     }
 
     #[test]
@@ -1184,13 +1248,13 @@ mod tests {
         )
         .unwrap();
         r.request(key(1), P, S);
-        assert_eq!(r.plan(1).loads, [key(1)]);
+        assert_eq!(r.plan(1, []).loads, [key(1)]);
         assert_eq!(class(&r).loading_bytes, 50);
         r.landed(key(1), false, 1);
         assert_eq!(r.stats().failed, 1);
         assert_eq!(class(&r).resident_bytes, 50);
         r.request(key(1), P, S);
-        assert_eq!(r.plan(2).loads, []);
+        assert_eq!(r.plan(2, []).loads, []);
     }
 
     #[test]
@@ -1209,14 +1273,18 @@ mod tests {
         };
         r.request(key(0), P, S);
         r.request(key(1), P, S);
-        assert_eq!(r.plan(1).loads, [key(0)], "250 of 300, 100 bytes in flight");
+        assert_eq!(
+            r.plan(1, []).loads,
+            [key(0)],
+            "250 of 300, 100 bytes in flight"
+        );
         assert_eq!(class(&r).loading_bytes, 250);
         land(&mut r, key(0), 1);
         assert_eq!(class(&r).resident_bytes, 140);
         assert_eq!(step(&mut r, &[1], 2).loads, [], "140 and 250 pass 300");
         let late = 1 + HOLD_FRAMES + 1;
         r.request(key(1), P, S);
-        let plan = r.plan(late);
+        let plan = r.plan(late, []);
         assert_eq!((plan.evictions, plan.loads), (vec![key(0)], vec![key(1)]));
         land(&mut r, key(1), late);
         // 0 comes back at what it built, beside 1 in its hold.
@@ -1249,13 +1317,13 @@ mod tests {
         .unwrap();
         r.request(Key { mount: b, unit: 1 }, P, S);
         assert_eq!(
-            r.plan(1).loads,
+            r.plan(1, []).loads,
             [],
             "nothing of the other mount can be evicted"
         );
         r.unregister(a);
         r.request(Key { mount: b, unit: 1 }, P, S);
-        assert_eq!(r.plan(2).loads, [Key { mount: b, unit: 1 }]);
+        assert_eq!(r.plan(2, []).loads, [Key { mount: b, unit: 1 }]);
         r.unregister(b);
         assert_eq!(
             class(&r),
@@ -1279,7 +1347,7 @@ mod tests {
         )
         .unwrap();
         r.request(key(1), P, S);
-        let plan = r.plan(1);
+        let plan = r.plan(1, []);
         assert_eq!(plan.loads, vec![key(0), key(1)]);
         r.cancel(key(1), Held::Waiting);
         assert_eq!((r.stats().loads, r.stats().waiting), (1, 1));
@@ -1303,7 +1371,7 @@ mod tests {
         .unwrap();
         r.request(key(1), P, S);
         r.request(key(2), P, S);
-        let plan = r.plan(1);
+        let plan = r.plan(1, []);
         assert_eq!(plan.loads, [key(0), key(1), key(2)]);
         assert_eq!(r.stats().waiting, 0);
         // Its dependency waiting on an unbind, neither dependent may load without it.
@@ -1315,26 +1383,42 @@ mod tests {
     }
 
     #[test]
-    fn loose_loads_take_their_class_budget_and_the_in_flight_limit() {
+    fn user_blobs_start_in_queue_order_under_their_budget_with_a_share_of_the_in_flight_limit() {
         let mut l = limits(u64::MAX);
         l.budgets[ResidencyClass::UserBlobs as usize] = 150;
         l.in_flight = 120;
         let mut r = Residency::new(l);
         let user = ResidencyClass::UserBlobs;
-        assert!(r.start_loose(user, 100));
-        assert!(!r.start_loose(user, 100), "over the class budget");
-        assert!(r.start_loose(user, 50), "passing the in-flight limit");
-        assert!(!r.start_loose(user, 0), "at the in-flight limit");
-        r.loose_landed(user, 100, true);
-        r.loose_landed(user, 50, false);
+        assert_eq!(
+            r.plan(1, [100, 100, 10]).blobs,
+            1,
+            "the second is over the class budget and holds back the third"
+        );
+        assert_eq!(
+            r.plan(2, [50, 0]).blobs,
+            1,
+            "the first passes the in-flight limit"
+        );
+        r.blob_landed(100, true);
+        r.blob_landed(50, false);
         let c = *r.stats().class(user);
         assert_eq!(
             (c.resident_bytes, c.loading_bytes, c.resident_units),
             (100, 0, 1)
         );
-        r.release_loose(user, 100);
+        r.release_blob(100);
         assert_eq!(r.stats().class(user).resident_bytes, 0);
-        assert!(r.start_loose(user, 150));
+
+        let units: Vec<UnitDesc> = (0..4).map(|_| unit(30, &[], Start::Absent)).collect();
+        r.register(M, &units).unwrap();
+        for u in 0..4 {
+            r.request(key(u), P, RequestSource::Traversal);
+        }
+        let plan = r.plan(3, [30]);
+        assert_eq!(
+            (&plan.loads[..], plan.blobs),
+            (&[key(0), key(1), key(2)][..], 1)
+        );
     }
 
     #[test]
