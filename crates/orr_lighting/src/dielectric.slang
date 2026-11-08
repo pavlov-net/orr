@@ -75,8 +75,7 @@ public void layer_args_body(LayerTilesRoot r)
 // along `dir` with `interior` the eye's list. Presence layers give their own guides at their
 // opacity `coverage`. A dielectric gives its `layer_chain`; the dominant one of its reflection
 // and its chain gives depth and motion: the hit's own where reflection carries more, the
-// virtual point of the chain otherwise. Diffuse albedo holds emission, and `caustic` what the
-// layer and its chain gather of `r.caustics`' grid. Specular motion follows
+// virtual point of the chain otherwise. Diffuse albedo holds emission. Specular motion follows
 // the mirror reflection's virtual point. Where transmission dominates, `frost` gets the blur
 // the chain's rough interfaces give what it reaches, the widths adding in quadrature.
 // `front` is the layer's overlay front word where the dominant layer lies behind it, else 0.
@@ -113,19 +112,17 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
         g.dominant = coverage >= 0.5 ? 1 : 0;
         g.depth = own_depth;
         g.motion = own_motion;
-        g.caustic = guide_luminance(apply_hdr_ceiling(exposure * caustic_guide(r.caustics, s, l, interior, false, cone.width)));
         front = g.dominant == 0 ? overlay_front_word(own_depth, own_motion, coverage) : 0;
         return g;
     }
 
-    LayerChain c = layer_chain<S>(s, v, l, b, false, dir, interior, r.dielectric_depth, cone, exposure, r.caustics);
+    LayerChain c = layer_chain<S>(s, v, l, b, dir, interior, r.dielectric_depth, cone, exposure);
     float wr = c.reflected;
     float wt = c.transmitted;
     g.diffuse = c.guides.diffuse + c.guides.emission;
     g.specular = c.guides.specular;
     g.normal = c.guides.normal;
     g.roughness = c.guides.roughness;
-    g.caustic = guide_luminance(apply_hdr_ceiling(exposure * c.caustic));
     g.weight = 1.0;
     g.dominant = 1;
     front = wr < wt ? overlay_front_word(own_depth, own_motion, wr / (wr + wt)) : 0;

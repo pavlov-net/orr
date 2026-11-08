@@ -235,10 +235,6 @@ public struct LayerGuide
     // floats of the blur its lobes give the background, as a radius in pixels (low), and of
     // the transmission's `guide_luminance` (high); 0 elsewhere.
     public uint frost;
-    // `guide_luminance` of the pre-exposed light the layer and its refraction chain gather of
-    // the caustic grid (`LayerChain.caustic`), ceiled as radiance, where `PathRoot.caustics` is
-    // set in the layer guides' dispatch; 0 elsewhere.
-    public float caustic;
 }
 
 // A view's layer memory at G-buffer extent `extent`, from `LayerGuide*`: a guide per pixel in

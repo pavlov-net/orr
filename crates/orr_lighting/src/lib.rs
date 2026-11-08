@@ -46,7 +46,7 @@
 //! diffuse albedo adds each surface's pre-exposed emission and mirror chains take the guides of
 //! the glass they meet as a pixel's first layer does; and
 //! [`LightingKernels::record_frosted_glass`] adds what rough glass blurs into the depth-of-field
-//! guide, which with [`GuideSettings::caustic_guide`] also holds the caustic grid's light. Rays
+//! guide. Rays
 //! leaving the first vertex and dielectric vertices see particles by their emission, and
 //! shadow rays by what their opacity lets through. The `path` module holds the path loop,
 //! `dielectric` the layer tiles and guides, `froxels` the froxel passes and `camera_media` media

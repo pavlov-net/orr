@@ -111,12 +111,6 @@ pub struct GuideSettings {
     /// in `specular_motion`; others take their surface's motion.
     pub specular_motion_roughness: f32,
     pub camera_jump: CameraJump,
-    /// The depth-of-field guide ([`LightingView::depth_of_field_guide`]) holds, before the
-    /// frosted-glass term, the luminance of the light each pixel's guides show gathered of the
-    /// caustic grid, read without jitter: by its G-buffer surface, the surfaces a near-mirror's
-    /// chain reaches, and a layer's surface and refraction chain by the layer's weight;
-    /// otherwise 0.
-    pub caustic_guide: bool,
 }
 
 impl Default for GuideSettings {
@@ -124,7 +118,6 @@ impl Default for GuideSettings {
         Self {
             specular_motion_roughness: 0.25,
             camera_jump: CameraJump::default(),
-            caustic_guide: false,
         }
     }
 }
@@ -506,8 +499,6 @@ pub struct LightingView {
     layers: Allocation<LayerGuide>,
     layers_frame: Option<u64>,
     layers_frost: bool,
-    /// The caustics the paths of a frame gathered from, and that frame.
-    caustics: Option<(u64, GpuPtr<CausticsGpu>)>,
     layer_tile_roots: Ring<LayerTilesRoot>,
     local_roots: Ring<local::Root>,
     guide_roots: Ring<GuideRoot>,
@@ -610,7 +601,6 @@ impl LightingView {
             layers,
             layers_frame: None,
             layers_frost: false,
-            caustics: None,
             layer_tile_roots: Ring::new(device, "layer tile roots")?,
             local_roots: Ring::new(device, "local light sampler roots")?,
             guide_roots: Ring::new(device, "guide roots")?,
@@ -709,8 +699,8 @@ impl LightingView {
     /// R16F, ray reconstruction's depth-of-field guide, held where [`Self::requests`] was
     /// `reconstructed`: per pixel `guide_luminance(after - before)` (`(r + 2g + b) / 4`) of
     /// what changed the radiance from what the other guides show. The guide resolve given the
-    /// target writes its caustic term ([`GuideSettings::caustic_guide`]) or 0, and
-    /// [`LightingKernels::record_frosted_glass`] adds the frosted-glass term.
+    /// target clears it, and [`LightingKernels::record_frosted_glass`] adds the frosted-glass
+    /// term.
     pub fn depth_of_field_guide(&self) -> Option<&Texture> {
         self.targets.dof_guide.as_ref().map(|t| &**t.texture())
     }
@@ -1436,17 +1426,7 @@ impl LightingKernels {
             caustics: self.record_photons(list, scene, view, pass, lighting, &path_root)?,
             ..path_root
         };
-        view.caustics = Some((pass.frame, path_root.caustics));
-        // The layer guides gather the caustics only for the guide resolve's caustic term.
-        let layer_root = PathRoot {
-            caustics: if lighting.guides.caustic_guide && view.targets.dof_guide.is_some() {
-                path_root.caustics
-            } else {
-                GpuPtr::NULL
-            },
-            ..path_root
-        };
-        self.record_layers(list, view, pass, lighting, lens.is_some(), &layer_root);
+        self.record_layers(list, view, pass, lighting, lens.is_some(), &path_root);
         if !reference {
             let update_root = PathRoot {
                 mode: 0,
@@ -1635,7 +1615,7 @@ impl LightingKernels {
 
     /// Records the guide resolve of `pass` into `view`'s guide targets after the view's
     /// raster half, and after [`Self::record_paths`] where that runs in the frame, whose
-    /// layer guides and caustics it reads. It writes every pixel of the view's
+    /// layer guides it reads. It writes every pixel of the view's
     /// [`LightingView::depth_of_field_guide`] where it holds one. Under a
     /// [`LightingDebugView::Guide`] view it also overwrites the radiance, so it must then be
     /// ordered after [`Self::record_paths`]. Orders nothing after it.
@@ -1671,22 +1651,10 @@ impl LightingKernels {
                 depth: view.targets.depth.storage(0),
                 motion: view.targets.motion.storage(0),
                 dof_guide: dof_guide.unwrap_or(StorageImageIndex::NONE),
-                caustics: match view.caustics {
-                    Some((frame, caustics))
-                        if frame == pass.frame
-                            && lighting.guides.caustic_guide
-                            && dof_guide.is_some() =>
-                    {
-                        caustics
-                    }
-                    _ => GpuPtr::NULL,
-                },
                 motion_roughness: lighting.guides.specular_motion_roughness,
                 debug,
                 dielectric_depth: dielectric_depth(lighting),
                 _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
             },
         );
         let [w, h] = view.extent;
