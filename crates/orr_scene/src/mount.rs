@@ -986,6 +986,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             bytes: p.resident_len,
             first,
             clusters: u32::from(p.cluster_count),
+            triangles: p.tri_count,
         })
         .collect();
     // Clusters of streamed pages are known once they load; until then they take no cut.
@@ -2306,6 +2307,7 @@ fn units(
             let unit = UnitDesc {
                 class: ResidencyClass::MeshPages,
                 bytes: bytes.next_multiple_of(256),
+                built: 0,
                 deps: deps.iter().map(|d| base + d).collect(),
                 start,
             };
@@ -2334,6 +2336,7 @@ fn units(
             let unit = UnitDesc {
                 class: ResidencyClass::HierarchyPages,
                 bytes: u64::from(bytes),
+                built: 0,
                 deps,
                 start,
             };
@@ -2345,6 +2348,7 @@ fn units(
         let unit = UnitDesc {
             class,
             bytes,
+            built: 0,
             deps: Vec::new(),
             start: Start::Pinned,
         };
@@ -2360,6 +2364,7 @@ fn units(
             let unit = UnitDesc {
                 class: ResidencyClass::Textures,
                 bytes: s.layout.tile_bytes,
+                built: 0,
                 deps: s.grid.parent(tile).map(|p| first + p).into_iter().collect(),
                 start: Start::Absent,
             };
@@ -2377,6 +2382,7 @@ fn units(
         let unit = UnitDesc {
             class: ResidencyClass::InstancePages,
             bytes: u64::from(p.bytes).next_multiple_of(256),
+            built: 0,
             deps: Vec::new(),
             start: Start::Absent,
         };
@@ -2393,6 +2399,7 @@ fn units(
             let unit = UnitDesc {
                 class: ResidencyClass::InstancePages,
                 bytes: u64::from(bytes).next_multiple_of(256),
+                built: 0,
                 deps: Vec::new(),
                 start: Start::Absent,
             };

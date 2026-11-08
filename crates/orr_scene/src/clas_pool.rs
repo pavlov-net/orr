@@ -30,7 +30,7 @@ use crate::shaders::accel::{AccelRoot, ClasJob};
 use crate::shaders::clas_pool::PoolRoot;
 
 /// Bytes per allocation unit.
-const UNIT: u64 = 128;
+pub(crate) const UNIT: u64 = 128;
 /// `clas_pool.slang` constants.
 const POOL_INIT: u32 = 1;
 pub(crate) const NO_UNIT: u32 = u32::MAX;
@@ -39,10 +39,10 @@ const RESERVE_PAGES: usize = 2;
 /// Alignment of every region carved from the build scratch.
 const ALIGN: u64 = 256;
 
-/// Units a cluster's CLAS is taken to need before it is built, before the pool's
-/// [`ClasPool::scale`].
-fn estimate(tris: u32) -> u64 {
-    (u64::from(tris) * 32 + 256).div_ceil(UNIT)
+/// Units the CLAS of `clusters` clusters of `triangles` triangles in all are taken to need
+/// before they are built, before the pool's [`ClasPool::scale`].
+pub(crate) fn estimate(triangles: u32, clusters: u32) -> u64 {
+    (u64::from(triangles) * 32 + u64::from(clusters) * 256).div_ceil(UNIT)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -691,10 +691,11 @@ pub(crate) fn build_pages(
     }
     let n = members.len() as u64;
 
+    // Per cluster, as each CLAS takes whole units.
     let estimate: u64 = pages
         .iter()
         .flat_map(|p| p.clusters)
-        .map(|c| estimate(c.tri_count))
+        .map(|c| estimate(c.tri_count, 1))
         .sum();
     let estimate = (estimate as f64 * pool.scale).ceil() as u64;
 

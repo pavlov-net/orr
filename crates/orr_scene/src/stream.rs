@@ -106,25 +106,16 @@ pub(crate) struct MeshStream {
     pub(crate) mirrors: Mutex<Vec<Arc<Mirror>>>,
 }
 
-impl MeshStream {
-    /// The resident bytes of `pages`.
-    fn pages_bytes(&self, pages: &[u32]) -> u64 {
-        pages
-            .iter()
-            .map(|&p| u64::from(self.pages[p as usize].bytes))
-            .sum()
-    }
-}
-
 /// One page of a [`MeshStream`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StreamedPage {
     pub(crate) blob: u32,
     /// Resident bytes.
     pub(crate) bytes: u32,
-    /// Its first mesh cluster and cluster count.
+    /// Its first mesh cluster, cluster count and triangle count.
     pub(crate) first: u32,
     pub(crate) clusters: u32,
+    pub(crate) triangles: u32,
 }
 
 /// What a streaming mesh's finer cached cuts are built from.
@@ -143,16 +134,23 @@ pub(crate) struct FineInit {
     pub(crate) clas: Vec<u64>,
 }
 
+/// The streamed pages a finer cut holds locked, and the bytes they hold against the mesh
+/// page budget.
+struct Locks {
+    pages: Vec<u32>,
+    bytes: u64,
+}
+
 enum FineState {
     /// Not built; asked for at this frame, if ever.
     Empty(u64),
     /// Being built, holding `locks`.
-    Building { locks: Vec<u32> },
+    Building { locks: Locks },
     /// Built, last reported in use at `touched`, referencing `locks`.
     Built {
         cut: FineCut,
         touched: u64,
-        locks: Vec<u32>,
+        locks: Locks,
     },
     /// Its build failed; not built again while mounted.
     Failed,
@@ -599,7 +597,18 @@ impl Streaming {
                 stream,
             });
         }
-        let descs: Vec<UnitDesc> = units.units.iter().map(|(d, _)| d.clone()).collect();
+        let descs: Vec<UnitDesc> = units
+            .units
+            .iter()
+            .map(|(d, s)| {
+                let mut d = d.clone();
+                if let (Some(StreamUnit::MeshPage { mesh, page }), Some(_)) = (s, &self.clas) {
+                    let p = units.mesh_streams[*mesh as usize].pages[*page as usize];
+                    d.built = clas_pool::estimate(p.triangles, p.clusters) * clas_pool::UNIT;
+                }
+                d
+            })
+            .collect();
         if let Err(e) = self.residency.register(mount, &descs) {
             for t in &textures {
                 self.feedback.free(t.first_cell);
@@ -694,7 +703,7 @@ impl Streaming {
                         locks
                     }
                 };
-                self.fine_locked -= f.init.stream.pages_bytes(&locks);
+                self.fine_locked -= locks.bytes;
             }
         }
         self.residency.forget_failed_cuts(failed);
@@ -925,14 +934,14 @@ impl Streaming {
                         self.residency.note_failed_cut();
                     }
                     let m = &self.mounts[&batch.mount];
-                    for &p in &locks {
+                    for &p in &locks.pages {
                         let unit = m.mesh_pages[batch.mesh as usize][p as usize];
                         self.residency.unlock(Key {
                             mount: batch.mount,
                             unit,
                         });
                     }
-                    self.fine_locked -= f.init.stream.pages_bytes(&locks);
+                    self.fine_locked -= locks.bytes;
                     continue;
                 }
             };
@@ -972,10 +981,10 @@ impl Streaming {
                         };
                         w.put(f.init.table.offset(k as u64), &[empty])?;
                         self.retired_cuts.push((frame - 1, cut));
-                        for &p in &locks {
+                        for &p in &locks.pages {
                             self.residency.unlock(unit(p));
                         }
-                        self.fine_locked -= f.init.stream.pages_bytes(&locks);
+                        self.fine_locked -= locks.bytes;
                     }
                     FineState::Empty(at) if *at + 2 >= frame && *at != 0 => {
                         let absent: Vec<u32> = f.init.pages[k]
@@ -1002,7 +1011,7 @@ impl Streaming {
                             .collect();
                         pages.sort_unstable();
                         pages.dedup();
-                        let bytes = stream.pages_bytes(&pages);
+                        let bytes = pages.iter().map(|&q| self.residency.held(unit(q))).sum();
                         if clusters.is_empty() || self.fine_locked + bytes > budget / 2 {
                             continue;
                         }
@@ -1014,7 +1023,9 @@ impl Streaming {
                             self.residency.lock(unit(q));
                         }
                         self.fine_locked += bytes;
-                        f.slots[k] = FineState::Building { locks: pages };
+                        f.slots[k] = FineState::Building {
+                            locks: Locks { pages, bytes },
+                        };
                         loading.send(Msg::Cut(CutTask {
                             mount,
                             mesh,
@@ -1610,6 +1621,14 @@ impl Streaming {
             .filter(|&(u, _)| u != NO_UNIT)
             .collect();
         let placed = l.result.is_ok() && units.iter().all(|&(u, _)| u != NO_UNIT);
+        if l.result.is_ok() && self.mounts.contains_key(&key.mount) {
+            let clas: u64 = units.iter().map(|&(_, n)| u64::from(n)).sum();
+            let micromap = match (&p.micromap, &self.clas) {
+                (Some((_, slot)), Some(pool)) => pool.lock().unwrap().micromaps.bytes(*slot),
+                _ => 0,
+            };
+            self.residency.built(key, clas * clas_pool::UNIT + micromap);
+        }
         let live = if l.result.is_ok() && !placed && self.mounts.contains_key(&key.mount) {
             self.residency.retry(key);
             self.residency.note_clas_retry();

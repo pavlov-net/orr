@@ -247,6 +247,11 @@ impl Pool {
             .is_some_and(|b| b.ranges.is_free(slot.first + slot.units, slot.units))
     }
 
+    /// The bytes `slot` takes.
+    pub(crate) fn bytes(&self, slot: PoolSlot) -> u64 {
+        u64::from(slot.units) * self.unit
+    }
+
     /// The allocation `slot` lies in and its offset there, for sparse binds.
     pub(crate) fn memory(&self, slot: PoolSlot) -> (&Allocation<u8>, u64) {
         let b = self.blocks[slot.block as usize]

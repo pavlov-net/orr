@@ -101,7 +101,8 @@ pub struct Budgets {
     /// Per-frame PTLAS work beyond mandatory work, in rebuilt instances: the full instance
     /// count of every partition a write touches plus one per update.
     pub ptlas_rebuilt: u32,
-    /// Bytes of resident mesh pages.
+    /// Bytes of resident mesh pages and of the CLAS and micromaps streamed pages build, which
+    /// count at an estimate from their triangles until a page's first load has built them.
     pub mesh_page_pool: u64,
     /// Bytes of pages a DAG mesh keeps resident from mount; the pages of a larger one past
     /// its pinned coarsest pages stream on the traversal's requests.

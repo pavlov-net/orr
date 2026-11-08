@@ -2517,6 +2517,27 @@ fn streamed_mesh_pages_stop_the_cut_at_resident_groups_and_evict_beside_traced_c
     assert_clean();
 }
 
+/// A mesh page budget on `dev` for two mounts of [`sheet_pack`]'s mesh `info`: both mounts'
+/// pinned pages and one mount's streamed pages, which with a CLAS pool also hold the CLAS they
+/// build, at 32 B a triangle and 256 B a cluster until they have built them.
+fn sheet_budget(info: &MeshInfo, dev: &Device) -> u64 {
+    let c = dev.caps().cluster;
+    let traced = c.max_tris > 0 && c.max_partitions > 0;
+    let pinned = info.header.pinned_pages as usize;
+    let page = |p: &orr_pack::mesh::PageInfo| u64::from(p.resident_len).next_multiple_of(256);
+    let clas = |p: &orr_pack::mesh::PageInfo| {
+        let bytes = 32 * u64::from(p.tri_count) + 256 * u64::from(p.cluster_count);
+        if traced {
+            bytes.next_multiple_of(128)
+        } else {
+            0
+        }
+    };
+    let pinned_bytes: u64 = info.pages[..pinned].iter().map(page).sum();
+    let streamed_bytes: u64 = info.pages[pinned..].iter().map(|p| page(p) + clas(p)).sum();
+    2 * pinned_bytes + streamed_bytes
+}
+
 /// Two mounts of [`sheet_pack`] under a mesh page budget that holds one mount's streamed
 /// pages: the near copy streams its pages in on the traversal's requests, then the other
 /// mount's pages take their place.
@@ -2527,11 +2548,8 @@ fn stream_sheets(dev: &Device) {
     let info = MeshInfo::parse(&blob(&a, e, 0)).unwrap();
     let pinned = info.header.pinned_pages as usize;
     assert!(pinned < info.pages.len(), "the sheet has streamed pages");
-    let unit = |p: &orr_pack::mesh::PageInfo| u64::from(p.resident_len).next_multiple_of(256);
-    let pinned_bytes: u64 = info.pages[..pinned].iter().map(unit).sum();
-    let streamed_bytes: u64 = info.pages[pinned..].iter().map(unit).sum();
-    // Both mounts' pinned pages and one mount's streamed pages.
-    let budget = 2 * pinned_bytes + streamed_bytes;
+    let traced = dev.caps().cluster.max_tris > 0;
+    let budget = sheet_budget(&info, dev);
     let desc = RendererDesc {
         budgets: Budgets {
             mesh_resident_max: 0,
@@ -2541,7 +2559,6 @@ fn stream_sheets(dev: &Device) {
         ..RendererDesc::default()
     };
     let gpu = Gpu(dev);
-    let traced = dev.caps().cluster.max_tris > 0;
     let mut scenes = Scenes::new(dev, &desc).unwrap();
     let _workers = Workers::start(&scenes, 2);
     let mounts = [
@@ -2655,9 +2672,10 @@ fn stream_sheets(dev: &Device) {
             break;
         }
     }
+    // Pages that built less than their estimate leave room for some of the first mount's.
     let (_, first_mount) = mesh_of(&scenes, &gpu, models[0]);
     assert!(
-        first_mount[pinned..].iter().all(|&p| p == 0),
+        first_mount[pinned..].contains(&0),
         "the first mount's streamed pages were evicted"
     );
     for _ in 0..4 {
@@ -3084,16 +3102,13 @@ fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
     let a = Archive::from_memory(Arc::clone(bytes)).unwrap();
     let e = entry(&a, AssetId::from_name("kit/sheet/mesh"));
     let info = MeshInfo::parse(&blob(&a, e, 0)).unwrap();
-    let unit = |p: &orr_pack::mesh::PageInfo| u64::from(p.resident_len).next_multiple_of(256);
     let pinned = info.header.pinned_pages as usize;
-    let pinned_bytes: u64 = info.pages[..pinned].iter().map(unit).sum();
-    let streamed_bytes: u64 = info.pages[pinned..].iter().map(unit).sum();
     let mut scenes = Scenes::new(
         dev,
         &RendererDesc {
             budgets: Budgets {
                 mesh_resident_max: 0,
-                mesh_page_pool: 2 * pinned_bytes + streamed_bytes,
+                mesh_page_pool: sheet_budget(&info, dev),
                 ..Budgets::default()
             },
             ..RendererDesc::default()

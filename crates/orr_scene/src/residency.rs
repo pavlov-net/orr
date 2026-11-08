@@ -11,6 +11,9 @@
 //! loading unit depends on it. Loads outside any mount's units (user blobs) count against
 //! their class budget and the in-flight limits only.
 //!
+//! A unit's bytes are what its load places and what it builds beside them; the built bytes
+//! are an estimate until its first load reports them.
+//!
 //! While device-local memory use sits above 90% of the OS budget, every class's budget
 //! shrinks step by step and units past their hold are evicted down to it; below 80% the
 //! budgets grow back.
@@ -214,7 +217,11 @@ pub(crate) enum Start {
 #[derive(Clone, Debug)]
 pub(crate) struct UnitDesc {
     pub(crate) class: ResidencyClass,
+    /// What its load reads and places, which the in-flight limits count.
     pub(crate) bytes: u64,
+    /// What its load is taken to build beside them (a streamed mesh page's CLAS and
+    /// micromaps), until a load reports what it built ([`Residency::built`]).
+    pub(crate) built: u64,
     /// Units of the same mount that must be resident first.
     pub(crate) deps: Vec<u32>,
     pub(crate) start: Start,
@@ -231,6 +238,7 @@ enum State {
 struct Unit {
     class: ResidencyClass,
     bytes: u64,
+    built: u64,
     deps: Vec<u32>,
     state: State,
     pinned: bool,
@@ -241,6 +249,13 @@ struct Unit {
     touched: u64,
     /// The touch its class's LRU holds it under, at most `touched`.
     listed: u64,
+}
+
+impl Unit {
+    /// The bytes its class's budget counts while it is loading or resident.
+    fn held(&self) -> u64 {
+        self.bytes + self.built
+    }
 }
 
 /// Whether a request's closure loads this step.
@@ -378,7 +393,7 @@ impl Residency {
     pub(crate) fn register(&mut self, mount: MountId, units: &[UnitDesc]) -> crate::Result<()> {
         let mut add = [0u64; CLASSES];
         for u in units.iter().filter(|u| u.start != Start::Absent) {
-            add[u.class as usize] += u.bytes;
+            add[u.class as usize] += u.bytes + u.built;
         }
         for class in ResidencyClass::ALL {
             let c = class as usize;
@@ -394,6 +409,7 @@ impl Residency {
             .map(|u| Unit {
                 class: u.class,
                 bytes: u.bytes,
+                built: u.built,
                 deps: u.deps.clone(),
                 state: State::Absent,
                 pinned: u.start == Start::Pinned,
@@ -410,7 +426,7 @@ impl Residency {
             let u = &mut list[i];
             u.state = State::Resident;
             let c = u.class as usize;
-            self.used[c] += u.bytes;
+            self.used[c] += u.held();
             self.resident_units[c] += 1;
             if !u.pinned {
                 self.lru[c].insert((
@@ -439,7 +455,7 @@ impl Residency {
             let c = u.class as usize;
             match u.state {
                 State::Resident => {
-                    self.used[c] -= u.bytes;
+                    self.used[c] -= u.held();
                     self.resident_units[c] -= 1;
                     self.lru[c].remove(&(
                         u.listed,
@@ -450,8 +466,8 @@ impl Residency {
                     ));
                 }
                 State::Loading => {
-                    self.used[c] -= u.bytes;
-                    self.loading_bytes[c] -= u.bytes;
+                    self.used[c] -= u.held();
+                    self.loading_bytes[c] -= u.held();
                     self.in_flight.0 -= 1;
                     self.in_flight.1 -= u.bytes;
                 }
@@ -536,6 +552,11 @@ impl Residency {
         })
     }
 
+    /// The bytes `k` holds against its class's budget while it is loading or resident.
+    pub(crate) fn held(&self, k: Key) -> u64 {
+        self.unit(k).expect("a unit of a mount").held()
+    }
+
     /// Whether `k` is absent, so that a request can start its load.
     pub(crate) fn absent(&self, k: Key) -> bool {
         self.unit(k).is_some_and(|u| u.state == State::Absent)
@@ -600,13 +621,29 @@ impl Residency {
         debug_assert_eq!(u.state, State::Loading);
         let c = u.class as usize;
         u.state = State::Absent;
-        self.used[c] -= u.bytes;
-        self.loading_bytes[c] -= u.bytes;
+        self.used[c] -= u.held();
+        self.loading_bytes[c] -= u.held();
         self.in_flight.0 -= 1;
         self.in_flight.1 -= u.bytes;
         for d in u.deps.clone() {
             units[d as usize].dependents -= 1;
         }
+        self.refresh();
+    }
+
+    /// Loading `k` built `bytes` beside what it read: they take the place of its estimate,
+    /// on its later loads too.
+    pub(crate) fn built(&mut self, k: Key, bytes: u64) {
+        let u = self
+            .mounts
+            .get_mut(&k.mount)
+            .and_then(|m| m.get_mut(k.unit as usize))
+            .expect("a unit of a mount");
+        debug_assert_eq!(u.state, State::Loading);
+        let c = u.class as usize;
+        self.used[c] = self.used[c] - u.built + bytes;
+        self.loading_bytes[c] = self.loading_bytes[c] - u.built + bytes;
+        u.built = bytes;
         self.refresh();
     }
 
@@ -660,7 +697,7 @@ impl Residency {
         let u = &mut units[k.unit as usize];
         debug_assert_eq!(u.state, State::Loading);
         let c = u.class as usize;
-        self.loading_bytes[c] -= u.bytes;
+        self.loading_bytes[c] -= u.held();
         self.in_flight.0 -= 1;
         self.in_flight.1 -= u.bytes;
         if ok {
@@ -672,7 +709,7 @@ impl Residency {
             self.lru[c].insert((frame, k));
         } else {
             u.state = State::Failed;
-            self.used[c] -= u.bytes;
+            self.used[c] -= u.held();
             self.failed += 1;
             for d in u.deps.clone() {
                 units[d as usize].dependents -= 1;
@@ -786,7 +823,7 @@ impl Residency {
         let mut held = Vec::new();
         for &k in chain {
             let u = self.unit(k).expect("unit of a closure");
-            need[u.class as usize] += u.bytes;
+            need[u.class as usize] += u.held();
             bytes += u.bytes;
             held.extend(u.deps.iter().map(|&unit| Key {
                 mount: k.mount,
@@ -849,7 +886,7 @@ impl Residency {
             after = Some((listed, k));
             if u.locks == 0 && u.dependents == 0 && !held.contains(&k) {
                 victims.push(k);
-                over = over.saturating_sub(u.bytes);
+                over = over.saturating_sub(u.held());
             }
         }
         (victims, over)
@@ -862,7 +899,7 @@ impl Residency {
         let c = u.class as usize;
         self.lru[c].remove(&(u.listed, k));
         u.state = State::Absent;
-        self.used[c] -= u.bytes;
+        self.used[c] -= u.held();
         self.resident_units[c] -= 1;
         for d in u.deps.clone() {
             units[d as usize].dependents -= 1;
@@ -874,8 +911,8 @@ impl Residency {
         let u = &mut units[k.unit as usize];
         let c = u.class as usize;
         u.state = State::Loading;
-        self.used[c] += u.bytes;
-        self.loading_bytes[c] += u.bytes;
+        self.used[c] += u.held();
+        self.loading_bytes[c] += u.held();
         self.in_flight.0 += 1;
         self.in_flight.1 += u.bytes;
         for d in u.deps.clone() {
@@ -908,6 +945,7 @@ mod tests {
         UnitDesc {
             class: ResidencyClass::HierarchyPages,
             bytes,
+            built: 0,
             deps: deps.to_vec(),
             start,
         }
@@ -1103,6 +1141,37 @@ mod tests {
         assert_eq!(class(&r).resident_bytes, 50);
         r.request(key(1), P, S);
         assert_eq!(r.plan(2).loads, []);
+    }
+
+    #[test]
+    fn built_bytes_take_the_budget_but_not_the_in_flight_bytes_and_replace_their_estimate() {
+        let mut l = limits(300);
+        l.io_bytes = 100;
+        let mut r = Residency::new(l);
+        let built = |bytes, estimate| UnitDesc {
+            built: estimate,
+            ..unit(bytes, &[], Start::Absent)
+        };
+        r.register(M, &[built(100, 150), built(100, 150)]).unwrap();
+        let land = |r: &mut Residency, k, frame| {
+            r.built(k, 40);
+            assert!(r.landed(k, true, frame));
+        };
+        r.request(key(0), P, S);
+        r.request(key(1), P, S);
+        assert_eq!(r.plan(1).loads, [key(0)], "250 of 300, 100 bytes in flight");
+        assert_eq!(class(&r).loading_bytes, 250);
+        land(&mut r, key(0), 1);
+        assert_eq!(class(&r).resident_bytes, 140);
+        assert_eq!(step(&mut r, &[1], 2).loads, [], "140 and 250 pass 300");
+        let late = 1 + HOLD_FRAMES + 1;
+        r.request(key(1), P, S);
+        let plan = r.plan(late);
+        assert_eq!((plan.evictions, plan.loads), (vec![key(0)], vec![key(1)]));
+        land(&mut r, key(1), late);
+        // 0 comes back at what it built, beside 1 in its hold.
+        assert_eq!(step(&mut r, &[0], late + 1).loads, [key(0)]);
+        assert_eq!(class(&r).resident_bytes, 280);
     }
 
     #[test]

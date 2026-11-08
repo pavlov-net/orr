@@ -190,8 +190,10 @@ fn cook() -> Arc<[u8]> {
     pack
 }
 
-/// Bytes of the pack's mesh pages: those pinned from mount and those that stream.
-fn mesh_bytes(pack: &Arc<[u8]>) -> (u64, u64) {
+/// Bytes of the pack's mesh pages: those pinned from mount and those that stream, which on a
+/// `traced` device also hold the CLAS they build, at 32 B a triangle and 256 B a cluster until
+/// they have built them.
+fn mesh_bytes(pack: &Arc<[u8]>, traced: bool) -> (u64, u64) {
     let a = Archive::from_memory(Arc::clone(pack)).expect("archive");
     let (mut pinned, mut streamed) = (0, 0);
     for e in a.entries().iter().filter(|e| e.class == Class::Mesh as u16) {
@@ -204,7 +206,12 @@ fn mesh_bytes(pack: &Arc<[u8]>) -> (u64, u64) {
             if (p as u32) < info.header.pinned_pages || !info.levels.is_empty() {
                 pinned += n;
             } else {
-                streamed += n;
+                let clas = 32 * u64::from(page.tri_count) + 256 * u64::from(page.cluster_count);
+                streamed += n + if traced {
+                    clas.next_multiple_of(128)
+                } else {
+                    0
+                };
             }
         }
     }
@@ -240,7 +247,9 @@ fn texture_bytes(gpu: &Device) -> (u64, u64) {
 pub(crate) fn run(options: &Options) -> Option<Capture> {
     let gpu = device();
     let pack = cook();
-    let (mesh_pinned, mesh_streamed) = mesh_bytes(&pack);
+    let caps = gpu.caps();
+    let traced = caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0;
+    let (mesh_pinned, mesh_streamed) = mesh_bytes(&pack, traced);
     assert!(mesh_streamed > 0, "the panels' meshes stream");
     let mesh_budget = mesh_pinned + mesh_streamed / 4;
     let (tail, whole) = texture_bytes(gpu);
