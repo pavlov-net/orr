@@ -1,6 +1,7 @@
 //! Runtime mesh edits. An edit is a model of its own over a mesh of its own: the pages that
 //! hold what it touches are per-edit copies a consumer kernel writes at the scene compute
-//! point, every other page table entry and cluster entry follows the source mesh. Edited
+//! point, whose clusters take cluster ids of the edit's, and every other page table entry and
+//! page base follows the source mesh, whose clusters it traces under the source's ids. Edited
 //! clusters stay at level 0 and their CLAS rebuild on the render queue right after the
 //! scene compute point of a frame that marks the edit dirty; the edit's copies gather their
 //! ray-tracing cut every frame, since cached cuts hold unedited CLAS. A skinned mesh's edit
@@ -82,11 +83,11 @@ pub(crate) struct EditSource {
     pub(crate) finest_level: Option<(u32, u32)>,
 }
 
-/// An edit's page table and cluster entries, which a streaming source keeps in step for the
-/// pages the edit has no copy of.
+/// An edit's page table and page bases, which a streaming source keeps in step for the pages
+/// the edit has no copy of.
 pub(crate) struct Mirror {
     pub(crate) table: GpuPtr<u64>,
-    pub(crate) clusters: GpuPtr<ClusterRef>,
+    pub(crate) bases: GpuPtr<u32>,
     /// By page: the edit holds a copy.
     pub(crate) own: Vec<bool>,
 }
@@ -381,9 +382,8 @@ pub(crate) struct EditClas {
     edited: Vec<Build>,
     frozen: Vec<Build>,
     block: Option<Allocation<u8>>,
-    /// A skinned mesh's edit: its template table and the cluster id of its mesh cluster 0.
+    /// A skinned mesh's edit: its template table, by mesh cluster.
     templates: GpuPtr<u64>,
-    cluster_base: u32,
     /// Triangles one rebuild takes.
     pub(crate) triangles: u32,
     pub(crate) built: bool,
@@ -393,8 +393,9 @@ pub(crate) struct EditClas {
 pub(crate) struct ClasInputs<'a> {
     /// By own page: its address, micromap address (or 0) and clusters.
     pub(crate) pages: Vec<(u64, u64, &'a [ClusterInfo])>,
-    /// The cluster id of each own page's first cluster.
+    /// The cluster id and the mesh cluster of each own page's first cluster.
     pub(crate) cluster_bases: Vec<u32>,
+    pub(crate) firsts: Vec<u32>,
     pub(crate) header: &'a MeshHeader,
     pub(crate) non_opaque: &'a [bool],
     /// Clusters of coarser levels are built once only when the cut may take them.
@@ -402,7 +403,6 @@ pub(crate) struct ClasInputs<'a> {
     pub(crate) clas_triangles: u32,
     /// A skinned mesh's edit: the template table its level 0's builds fill.
     pub(crate) templates: Option<GpuPtr<u64>>,
-    pub(crate) cluster_base: u32,
 }
 
 impl EditClas {
@@ -469,7 +469,7 @@ impl EditClas {
                             local: local as u32,
                             cluster_id: i.cluster_bases[pi] + local as u32,
                             step,
-                            _pad: 0,
+                            mesh_cluster: i.firsts[pi] + local as u32,
                         })
                         .collect();
                     let at = bytes;
@@ -491,7 +491,6 @@ impl EditClas {
             frozen,
             block,
             templates: i.templates.unwrap_or(GpuPtr::NULL),
-            cluster_base: i.cluster_base,
             triangles,
             built: false,
         })
@@ -530,7 +529,6 @@ impl EditRecorder<'_> {
             edited: bool,
             dst: GpuAddress,
             templates: GpuPtr<u64>,
-            cluster_base: u32,
         }
         let d = self.device;
         let align = scratch_align(d);
@@ -566,7 +564,6 @@ impl EditRecorder<'_> {
                     edited,
                     dst: GpuAddress(block + b.at),
                     templates: e.templates,
-                    cluster_base: e.cluster_base,
                 });
             }
         }
@@ -603,8 +600,8 @@ impl EditRecorder<'_> {
                     addresses,
                     templates: t.templates,
                     count: n,
-                    cluster_base: t.cluster_base,
-                    _pad: 0,
+                    _pad0: 0,
+                    _pad1: 0,
                 },
             )?;
             if t.edited {
@@ -680,6 +677,7 @@ pub(crate) struct EditTablesDesc<'a> {
     pub(crate) groups: &'a [EditGroupGpu],
     /// The block of its pages and their bytes.
     pub(crate) pages: (GpuPtr<u8>, u64),
+    /// Its mesh's clusters, which a skinned mesh's edit takes a template of each.
     pub(crate) clusters: u32,
     /// The cooked sets' row of level 0: past the pinned cut's row on a DAG mesh.
     pub(crate) row: u32,

@@ -15,7 +15,7 @@ public struct EditJob
     public uint local;             // cluster index in the page
     public uint cluster_id;
     public float step;             // m: the mesh's position grid step
-    public uint _pad;
+    public uint mesh_cluster;
 }
 
 public struct EditRoot
@@ -25,8 +25,8 @@ public struct EditRoot
     public uint64_t* addresses;    // per job: its built CLAS or template
     public uint64_t* templates;    // a skinned mesh's edit: per mesh cluster, its template; else null
     public uint count;
-    public uint cluster_base;      // with `templates`: the cluster id of mesh cluster 0
-    public uint64_t _pad;
+    public uint _pad0;
+    public uint64_t _pad1;
 }
 ORR_ROOT(EditRoot);
 
@@ -86,9 +86,9 @@ void refs(uint3 id: SV_DispatchThreadID)
 {
     if (id.x >= root.count)
         return;
-    uint cluster = root.jobs[id.x].cluster_id;
+    EditJob job = root.jobs[id.x];
     if (root.templates != nullptr)
-        root.templates[cluster - root.cluster_base] = root.addresses[id.x];
+        root.templates[job.mesh_cluster] = root.addresses[id.x];
     else
-        root.clusters[cluster].clas = root.addresses[id.x];
+        root.clusters[job.cluster_id].clas = root.addresses[id.x];
 }

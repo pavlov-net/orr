@@ -312,9 +312,8 @@ struct MeshPlaced {
     stream: Arc<MeshStream>,
     page: u32,
     ids: u32,
-    /// Its resident address and each cluster's CLAS, once it has landed.
+    /// Its resident address, once it has landed.
     address: u64,
-    clas_addresses: Vec<u64>,
     clas: Vec<(u32, u32)>,
     micromap: Option<PoolMicromap>,
 }
@@ -544,19 +543,20 @@ impl Streaming {
         self.residency.stats()
     }
 
-    /// Mesh `mesh` of `mount`'s page `page` where it streams: its address and its clusters'
-    /// CLAS, or `None` while it is not resident. The outer `None`: the page does not stream.
+    /// Mesh `mesh` of `mount`'s page `page` where it streams: its address and the cluster id
+    /// of its first cluster, or `None` while it is not resident. The outer `None`: the page
+    /// does not stream.
     pub(crate) fn streamed_page(
         &self,
         mount: MountId,
         mesh: u32,
         page: u32,
-    ) -> Option<Option<(u64, Vec<u64>)>> {
+    ) -> Option<Option<(u64, u32)>> {
         let m = self.mounts.get(&mount)?;
         let unit = *m.mesh_pages.get(mesh as usize)?.get(page as usize)?;
         m.units[unit as usize]?;
         Some(match self.resident.get(&Key { mount, unit }) {
-            Some(Placed::MeshPage(p)) => Some((p.address, p.clas_addresses.clone())),
+            Some(Placed::MeshPage(p)) => Some((p.address, p.ids)),
             _ => None,
         })
     }
@@ -1437,14 +1437,12 @@ impl Streaming {
                 let zeros = vec![bytemuck::Zeroable::zeroed(); count as usize];
                 w.put(table, &[0])?;
                 w.put(refs, &zeros)?;
-                let first = p.stream.pages[p.page as usize].first;
                 if let Some(f) = self.fine.get_mut(&(k.mount, p.stream.mesh)) {
                     f.init.resident[p.page as usize] = None;
                 }
                 for mirror in p.stream.mirrors.lock().unwrap().iter() {
                     if !mirror.own[p.page as usize] {
                         w.put(mirror.table.offset(u64::from(p.page)), &[0])?;
-                        w.put(mirror.clusters.offset(u64::from(first)), &zeros)?;
                     }
                 }
                 let (slot, free) = p.free();
@@ -1718,15 +1716,14 @@ impl Streaming {
         for mirror in p.stream.mirrors.lock().unwrap().iter() {
             if !mirror.own[p.page as usize] {
                 w.put(mirror.table.offset(u64::from(p.page)), &[l.gpu])?;
-                w.put(mirror.clusters.offset(u64::from(first)), &entries)?;
+                w.put(mirror.bases.offset(u64::from(p.page)), &[p.ids])?;
             }
         }
         p.address = l.gpu;
-        p.clas_addresses = entries.iter().map(|e| e.clas).collect();
         if let (Some(f), Some(infos)) = (self.fine.get_mut(&(key.mount, p.stream.mesh)), infos) {
             f.init.resident[p.page as usize] = Some(Box::new(PageClusters {
                 infos,
-                clas: p.clas_addresses.clone(),
+                clas: entries.iter().map(|e| e.clas).collect(),
             }));
         }
         self.resident.insert(key, Placed::MeshPage(p));
@@ -2155,7 +2152,6 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                             page: *page,
                             ids: *ids,
                             address: 0,
-                            clas_addresses: Vec::new(),
                             clas: Vec::new(),
                             micromap: None,
                         };

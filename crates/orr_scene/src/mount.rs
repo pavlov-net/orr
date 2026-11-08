@@ -1986,8 +1986,8 @@ pub(crate) struct Resident {
 struct EditMesh {
     gpu: MeshGpu,
     addresses: Vec<u64>,
-    /// The CLAS of its pinned pages' clusters, by mesh cluster index.
-    clas: Vec<u64>,
+    /// The cluster id of mesh cluster 0: its pinned pages' clusters take the ids that follow.
+    cluster_base: u32,
     source: Arc<EditSource>,
     /// A skinned mesh's skin table.
     skin: Option<SkinMeshGpu>,
@@ -2033,7 +2033,8 @@ impl EntryOwner {
     }
 }
 
-/// The table ranges an edit holds.
+/// The table ranges an edit holds: the cluster ids of its own pages' clusters, page after page,
+/// and its mesh, mesh page table range and model.
 #[derive(Clone)]
 struct EditIds {
     cluster_base: u32,
@@ -2590,7 +2591,8 @@ impl Mounts {
     ) -> Result<EditLive> {
         let source = &self.resident(p.mount)?.edit_sources[p.mesh as usize];
         let page_count = source.gpu.page_count;
-        let clusters: u32 = source.source.pages.iter().map(|q| q.clusters).sum();
+        let pages = &source.source.pages;
+        let clusters: u32 = p.own.iter().map(|&q| pages[q as usize].clusters).sum();
         let ids = EditIds {
             cluster_base: self
                 .accel
@@ -2648,11 +2650,10 @@ impl Mounts {
         let stream = Arc::clone(&source.source);
         let src_gpu = source.gpu;
         let addresses = source.addresses.clone();
-        let src_clas = source.clas.clone();
+        let src_base = source.cluster_base;
         let src_model = r.model_gpus[&p.model];
         let src_skin = source.skin;
         let page_count = ids.page_count;
-        let n = ids.clusters;
         let base = ids.cluster_base;
         let bounds = p.bounds.unwrap_or(Aabb {
             min: src_model.bounds_min,
@@ -2676,7 +2677,7 @@ impl Mounts {
                 spheres: p.spheres.as_deref(),
                 groups: &p.groups,
                 pages: (loaded.block.gpu(), loaded.pages_bytes),
-                clusters: n,
+                clusters: src_gpu.cluster_count,
                 row: u32::from(stream.finest_level.is_none()),
                 parts: &parts,
                 skin: src_skin.map(|source| EditSkin {
@@ -2687,51 +2688,41 @@ impl Mounts {
         )?;
         let table = self.page_table.gpu().offset(u64::from(start));
         let bases = self.page_bases.gpu().offset(u64::from(start));
-        let clusters = self.clusters.gpu().offset(u64::from(base));
 
+        // Its own pages' clusters take its ids, page after page; the rest of its pages are the
+        // source's, under the source's ids.
         let mut own = vec![false; page_count as usize];
-        for &q in &p.own {
+        let mut own_bases = Vec::with_capacity(p.own.len());
+        let mut refs: Vec<ClusterRef> = Vec::with_capacity(ids.clusters as usize);
+        for (&q, &address) in p.own.iter().zip(&loaded.addresses) {
             own[q as usize] = true;
+            own_bases.push(base + refs.len() as u32);
+            let info = stream.pages[q as usize];
+            refs.extend((0..info.clusters).map(|local| ClusterRef {
+                // SAFETY: the page lives in the edit's block.
+                page: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(address)) },
+                local,
+                mesh_cluster: info.first + local,
+                clas: 0,
+            }));
         }
         let at_own = |q: u32| p.own.binary_search(&q).ok();
         let mut page_table = vec![0u64; page_count as usize];
-        let mut refs: Vec<ClusterRef> = vec![bytemuck::Zeroable::zeroed(); n as usize];
+        let mut page_bases = vec![0u32; page_count as usize];
         for (q, info) in stream.pages.iter().enumerate() {
             let q32 = q as u32;
-            let range = info.first as usize..(info.first + info.clusters) as usize;
-            let (address, clas): (u64, Vec<u64>) = match at_own(q32) {
-                Some(k) => (loaded.addresses[k], vec![0; info.clusters as usize]),
+            (page_table[q], page_bases[q]) = match at_own(q32) {
+                Some(k) => (loaded.addresses[k], own_bases[k]),
                 None => match self.streaming.streamed_page(p.mount, p.mesh, q32) {
                     Some(Some(state)) => state,
-                    Some(None) => (0, Vec::new()),
-                    None => (
-                        addresses[q],
-                        range
-                            .clone()
-                            .map(|c| src_clas.get(c).copied().unwrap_or(0))
-                            .collect(),
-                    ),
+                    Some(None) => (0, 0),
+                    None => (addresses[q], src_base + info.first),
                 },
             };
-            page_table[q] = address;
-            if address == 0 {
-                continue;
-            }
-            for (local, c) in range.enumerate() {
-                refs[c] = ClusterRef {
-                    // SAFETY: the page stays resident while the entry names it: the edit's
-                    // block, or a source page whose eviction nulls this entry.
-                    page: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(address)) },
-                    local: local as u32,
-                    mesh_cluster: c as u32,
-                    clas: clas.get(local).copied().unwrap_or(0),
-                };
-            }
         }
         w.put(table, &page_table)?;
-        let firsts: Vec<u32> = stream.pages.iter().map(|q| base + q.first).collect();
-        w.put(bases, &firsts)?;
-        w.put(clusters, &refs)?;
+        w.put(bases, &page_bases)?;
+        w.put(self.clusters.gpu().offset(u64::from(base)), &refs)?;
 
         let micromap = |k: usize| {
             loaded.micromaps[k]
@@ -2744,17 +2735,17 @@ impl Mounts {
                 pages: (0..p.own.len())
                     .map(|k| (loaded.addresses[k], micromap(k), &loaded.clusters[k][..]))
                     .collect(),
-                cluster_bases: p
+                cluster_bases: own_bases,
+                firsts: p
                     .own
                     .iter()
-                    .map(|&q| base + stream.pages[q as usize].first)
+                    .map(|&q| stream.pages[q as usize].first)
                     .collect(),
                 header: &stream.header,
                 non_opaque: &stream.non_opaque,
                 whole: p.spheres.is_none(),
                 clas_triangles: self.accel.limits.clas_triangles,
                 templates: src_skin.map(|_| tables.templates),
-                cluster_base: base,
             },
         )?;
 
@@ -2811,11 +2802,7 @@ impl Mounts {
                 nodes: 0,
             },
         );
-        let mirror = Arc::new(Mirror {
-            table,
-            clusters,
-            own,
-        });
+        let mirror = Arc::new(Mirror { table, bases, own });
         self.streaming.add_mirror(p.mount, p.mesh, &mirror);
         Ok(EditLive {
             model: id,
@@ -3527,7 +3514,7 @@ impl Mounts {
             res.edit_sources.push(EditMesh {
                 gpu,
                 addresses: m.page_addresses.clone(),
-                clas: m.refs.iter().map(|r| r.clas).collect(),
+                cluster_base: m.cluster_base,
                 source: Arc::new(EditSource {
                     entry: m.entry,
                     header: m.header,
