@@ -2627,6 +2627,10 @@ fn a_requested_blob_lands_while_a_mount_build_waits_on_the_loading_queue() {
     else {
         return;
     };
+    // Without cluster acceleration structures the mount builds nothing to wait on.
+    if dev.caps().cluster.max_tris == 0 || dev.caps().cluster.max_partitions == 0 {
+        return;
+    }
     let (_, data) = consumer_blobs();
     let desc = RendererDesc {
         budgets: Budgets {
