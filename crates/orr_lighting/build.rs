@@ -64,7 +64,7 @@ fn openpbr_luts(dir: &Path) {
         );
         let mut bytes = Vec::new();
         if rgba {
-            for rgb in values.chunks_exact(3) {
+            for rgb in values.as_chunks::<3>().0 {
                 for v in [rgb[0], rgb[1], rgb[2], 0.0] {
                     bytes.extend_from_slice(&(v as f32).to_le_bytes());
                 }

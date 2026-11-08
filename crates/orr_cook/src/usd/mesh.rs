@@ -77,8 +77,10 @@ impl MeshPrim {
         let points: Vec<DVec3> = r
             .numbers("points")?
             .ok_or_else(|| format!("{path}: no points"))?
-            .chunks_exact(3)
-            .map(DVec3::from_slice)
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|&p| DVec3::from_array(p))
             .collect();
         let usize_list = |name: &str| -> Result<Vec<usize>, String> {
             r.ints(name)?
@@ -842,8 +844,7 @@ fn corner_values<T>(
     let mut seen: HashMap<(usize, Option<[u64; 4]>), u32> = HashMap::new();
     let mut corner = 0;
     for (face, &count) in mesh.counts.iter().enumerate() {
-        for k in corner..corner + count {
-            let point = mesh.indices[k];
+        for (k, &point) in (corner..).zip(&mesh.indices[corner..corner + count]) {
             let v = p.at(point, face, k);
             let element = match (p.interp, &p.indices) {
                 (Interp::FaceVarying, Some(ix)) => ix.get(k).map_or(usize::MAX, |&i| i as usize),

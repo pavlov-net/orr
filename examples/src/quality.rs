@@ -14,7 +14,9 @@ const QUIET: f64 = 0.02;
 
 /// Luminance of Rec.709 RGBA pixels.
 pub fn luminance(rgba: &[f32]) -> Vec<f32> {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2])
         .collect()
 }
@@ -220,7 +222,7 @@ impl Series {
             let settled = tile[step..]
                 .windows(8)
                 .position(|w| (w.iter().sum::<f64>() / 8.0 - after).abs() <= 0.1 * change);
-            frames.push(settled.map_or(tile.len() - step, |k| k) as u32);
+            frames.push(settled.unwrap_or(tile.len() - step) as u32);
         }
         frames.sort_unstable();
         frames

@@ -592,8 +592,10 @@ pub fn nodes(blob: &[u8]) -> Result<Vec<Node>> {
         return Err(Error::Malformed("node page length"));
     }
     Ok(blob
-        .chunks_exact(size_of::<Node>())
-        .map(bytemuck::pod_read_unaligned)
+        .as_chunks::<{ size_of::<Node>() }>()
+        .0
+        .iter()
+        .map(|&b| bytemuck::cast(b))
         .collect())
 }
 

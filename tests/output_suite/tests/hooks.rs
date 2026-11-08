@@ -357,10 +357,7 @@ fn dump_texture(t: TextureIndex, extent: [u32; 2]) -> Vec<[f32; 4]> {
     list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
     list.dispatch(&p, root, groups(extent));
     wait(queue.submit(vec![list], &[]).unwrap());
-    read_buffer(out.gpu(), 4 * n)
-        .chunks_exact(4)
-        .map(|c| [c[0], c[1], c[2], c[3]])
-        .collect()
+    read_buffer(out.gpu(), 4 * n).as_chunks::<4>().0.to_vec()
 }
 
 /// A hook drawing the debug line, depth-tested against the hook's depth. It records the

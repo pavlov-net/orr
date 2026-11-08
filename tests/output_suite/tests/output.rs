@@ -244,7 +244,9 @@ fn sdr_pq_and_scrgb_match_cpu_target() {
     .resolve(&supported, Some(&HDR_MONITOR), false);
     assert_eq!(sdr.encoding, OutputFormat::Sdr);
     let got: Vec<[f32; 3]> = run(&sdr, Format::Bgra8Unorm)
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|t| [f32::from(t[2]), f32::from(t[1]), f32::from(t[0])])
         .collect();
     let sdr_nits = |v: f32| srgb_decode(f64::from(v)) * f64::from(sdr.paper_white_nits);
@@ -253,9 +255,11 @@ fn sdr_pq_and_scrgb_match_cpu_target() {
     let pq = DisplayRequest::default().resolve(&supported, Some(&HDR_MONITOR), false);
     assert_eq!(pq.encoding, OutputFormat::Hdr10Pq);
     let got: Vec<[f32; 3]> = run(&pq, Format::A2b10g10r10Unorm)
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|t| {
-            let v = u32::from_le_bytes(t.try_into().unwrap());
+            let v = u32::from_le_bytes(*t);
             [0, 10, 20].map(|shift| ((v >> shift) & 0x3ff) as f32)
         })
         .collect();
@@ -276,8 +280,12 @@ fn sdr_pq_and_scrgb_match_cpu_target() {
     .resolve(&supported, Some(&HDR_MONITOR), false);
     let run_scrgb = |display| -> Vec<[f32; 3]> {
         run(display, Format::Rgba16Float)
-            .chunks_exact(8)
-            .map(|t| [0, 2, 4].map(|o| f16::from_le_bytes([t[o], t[o + 1]]).to_f32()))
+            .as_chunks::<2>()
+            .0
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|t| [t[0], t[1], t[2]].map(|c| f16::from_le_bytes(c).to_f32()))
             .collect()
     };
     let got = run_scrgb(&scrgb);

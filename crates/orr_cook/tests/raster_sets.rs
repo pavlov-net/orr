@@ -76,7 +76,9 @@ fn tiff_texels(path: &Path) -> (Vec<u8>, u32, &'static str) {
     match ct {
         ColorType::RGB(8) => (
             bytes
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .flat_map(|p| [p[0], p[1], p[2], 255])
                 .collect(),
             w,

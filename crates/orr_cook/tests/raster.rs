@@ -314,10 +314,7 @@ fn producer_tiles_match_the_cooks_tiling() {
     write_raw(&craw, 8, "rgba8", &color);
     // The producer side: the same border and LOD rules, written as TIFF tiles.
     let h = levels(finest, 8, 2, mean_f32);
-    let px: Vec<[u8; 4]> = color
-        .chunks_exact(4)
-        .map(|p| [p[0], p[1], p[2], p[3]])
-        .collect();
+    let px: Vec<[u8; 4]> = color.as_chunks::<4>().0.to_vec();
     let c = levels(px, 8, 2, |v| v[0]);
     for lod in 0..2u32 {
         for y in 0..1 << lod {
@@ -371,7 +368,9 @@ fn rgb_tiles_store_rgba_with_opaque_alpha() {
     }])));
     assert_eq!(s.info.layers[0].vk_format, vk::R8G8B8A8_SRGB);
     let want: Vec<u8> = rgb
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2], 255])
         .collect();
     assert_eq!(s.tile(0, 0, 0, 0), want);
@@ -496,7 +495,7 @@ fn bc4_layer_encodes_through_the_texture_path() {
     assert_eq!(blocks.len(), 2 * 2 * 8);
     let want = cut(&v, 16, 4, 2, 1, 1);
     let mut texels = [0u8; 16];
-    for (b, block) in blocks.chunks_exact(8).enumerate() {
+    for (b, block) in blocks.as_chunks::<8>().0.iter().enumerate() {
         bcdec_rs::bc4(block, &mut texels, 4, false);
         for (i, t) in texels.iter().enumerate() {
             let (x, y) = ((b % 2) * 4 + i % 4, (b / 2) * 4 + i / 4);

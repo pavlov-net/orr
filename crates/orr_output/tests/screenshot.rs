@@ -58,7 +58,9 @@ fn read_png(name: &str) -> (png::Info<'static>, Vec<u8>) {
 fn rec2020_nits(shot: &Screenshot) -> Vec<[f64; 3]> {
     let pw = f64::from(shot.paper_white_nits);
     shot.rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| {
             rec709_to_rec2020(Vec3::from_slice(p))
                 .to_array()
@@ -95,8 +97,10 @@ fn pq_png_decodes_to_the_capture() {
 
     let nits = rec2020_nits(&shot);
     let samples: Vec<f64> = data
-        .chunks_exact(2)
-        .map(|s| f64::from(u16::from_be_bytes([s[0], s[1]])) / 65535.0)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|s| f64::from(u16::from_be_bytes(*s)) / 65535.0)
         .collect();
     for (i, want) in nits.iter().enumerate() {
         for c in 0..3 {
@@ -136,7 +140,7 @@ fn srgb_png_clips_at_paper_white() {
     let (info, data) = read_png("srgb.png");
     assert_eq!(info.bit_depth, png::BitDepth::Eight);
     assert!(info.srgb.is_some());
-    for (i, p) in shot.rgba.chunks_exact(4).enumerate() {
+    for (i, p) in shot.rgba.as_chunks::<4>().0.iter().enumerate() {
         for c in 0..3 {
             let want = srgb_encode(f64::from(p[c]).clamp(0.0, 1.0)) * 255.0;
             let got = f64::from(data[3 * i + c]);

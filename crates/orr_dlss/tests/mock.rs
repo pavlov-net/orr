@@ -67,7 +67,7 @@ fn mock_rr_upscales_color_bilinearly() {
         let have = got[(x * 4) as usize];
         assert!((have - want).abs() < 0.02, "x {x}: {have} vs {want}");
     }
-    assert!(got.chunks_exact(4).all(|p| p[1] == 1.0));
+    assert!(got.as_chunks::<4>().0.iter().all(|p| p[1] == 1.0));
     if gpu.validation {
         assert_eq!(Gpu::validation_messages(), 0, "validation messages");
     }

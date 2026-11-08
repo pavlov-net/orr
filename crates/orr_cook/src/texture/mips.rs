@@ -999,9 +999,7 @@ mod tests {
         }
         let base_rough = 0.3f32;
         let mut img = Img::new(w, h);
-        for p in &mut img.px {
-            *p = [base_rough, 0.0, 0.0, 1.0];
-        }
+        img.px.fill([base_rough, 0.0, 0.0, 1.0]);
         let s = spec(MipFilter::Box);
         let mut c = full_chain(img, &s);
         Toksvig {
@@ -1039,9 +1037,7 @@ mod tests {
         }
         let base_rough = 0.05f32;
         let mut img = Img::new(size, size);
-        for p in &mut img.px {
-            *p = [base_rough, 0.0, 0.0, 1.0];
-        }
+        img.px.fill([base_rough, 0.0, 0.0, 1.0]);
         let s = spec(MipFilter::Kaiser);
         let mut c = full_chain(img, &s);
         Toksvig {

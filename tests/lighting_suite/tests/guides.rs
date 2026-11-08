@@ -372,7 +372,7 @@ fn mirrors_take_the_guides_of_the_glass_they_reflect() {
     };
     let (mut clear, mut clears) = (Vec3::ZERO, 0);
     let mut through = Vec::new();
-    for i in 0..g.depth.len() {
+    for (i, &albedo) in g.diffuse_albedo.iter().enumerate() {
         let (dir, _) = camera.pixel(i);
         if meets_box(camera.eye, dir, lo - margin, hi + margin) {
             continue;
@@ -381,7 +381,7 @@ fn mirrors_take_the_guides_of_the_glass_they_reflect() {
             continue;
         };
         let r = dir - 2.0 * dir.dot(n) * n;
-        let diffuse = rgb(g.diffuse_albedo[i]);
+        let diffuse = rgb(albedo);
         if !meets_box(x1, r, lo - margin, hi + margin) {
             clear += diffuse;
             clears += 1;

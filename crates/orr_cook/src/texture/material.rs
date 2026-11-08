@@ -2537,7 +2537,9 @@ impl TextureJob {
                 Some(h) => {
                     let h = usize::from(h) * 8;
                     level
-                        .chunks_exact(16)
+                        .as_chunks::<16>()
+                        .0
+                        .iter()
                         .flat_map(|b| &b[h..h + 8])
                         .copied()
                         .collect()

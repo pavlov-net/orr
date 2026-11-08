@@ -199,7 +199,12 @@ fn rgb8(i: &Image) -> nv_flip::FlipImageRgb8 {
     let Pixels::Rgba8(p) = &i.pixels else {
         panic!("FLIP compares 8-bit display-encoded images");
     };
-    let rgb: Vec<u8> = p.chunks_exact(4).flat_map(|c| [c[0], c[1], c[2]]).collect();
+    let rgb: Vec<u8> = p
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|c| [c[0], c[1], c[2]])
+        .collect();
     nv_flip::FlipImageRgb8::with_data(i.width, i.height, &rgb)
 }
 

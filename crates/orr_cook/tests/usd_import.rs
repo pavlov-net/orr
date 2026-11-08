@@ -1088,7 +1088,9 @@ fn tree_pair(d: &Path) -> (PathBuf, PathBuf) {
 
     // glTF: triangles as the USD importer cuts each quad (a b c d into d a b, b c d).
     let tris = |q: &[u32]| -> Vec<u32> {
-        q.chunks_exact(4)
+        q.as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|c| [c[3], c[0], c[1], c[1], c[2], c[3]])
             .collect()
     };

@@ -2136,7 +2136,7 @@ fn tangents_are_derived_unless_a_seam_turns_the_shading() {
     let info = TextureInfo::parse(&read(&a, &blobs[0])).unwrap();
     assert_eq!(info.header.vk_format, orr_pack::texture::vk::BC5_UNORM);
     let bytes = info.mip_texels(&read(&a, &blobs[1]), 0, 0).unwrap();
-    for block in bytes.chunks_exact(16) {
+    for block in bytes.as_chunks::<16>().0 {
         let mut px = [0u8; 32];
         bcdec_rs::bc5(block, &mut px, 8, false);
         for xy in px.as_chunks::<2>().0 {

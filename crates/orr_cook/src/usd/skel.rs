@@ -175,7 +175,12 @@ impl Skel {
             if v.len() != 16 * joints.len() {
                 return Err(format!("{path} {name}: not one matrix per joint"));
             }
-            let m: Vec<DMat4> = v.chunks_exact(16).map(matrix).collect();
+            let m: Vec<DMat4> = v
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .map(DMat4::from_cols_array)
+                .collect();
             if !m
                 .iter()
                 .all(|m| m.is_finite() && m.row(3).abs_diff_eq(DVec4::W, 1e-5))

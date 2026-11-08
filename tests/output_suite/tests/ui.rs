@@ -114,24 +114,34 @@ impl Drop for Target {
 fn signals(bytes: &[u8], format: Format) -> Vec<[f64; 4]> {
     match format {
         Format::Bgra8Unorm => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|t| [t[2], t[1], t[0], t[3]].map(|c| f64::from(c) / 255.0))
             .collect(),
         Format::Rgba8Unorm => bytes
-            .chunks_exact(4)
-            .map(|t| [t[0], t[1], t[2], t[3]].map(|c| f64::from(c) / 255.0))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|t| t.map(|c| f64::from(c) / 255.0))
             .collect(),
         Format::A2b10g10r10Unorm => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|t| {
-                let v = u32::from_le_bytes(t.try_into().unwrap());
+                let v = u32::from_le_bytes(*t);
                 let c = |shift: u32| f64::from((v >> shift) & 0x3ff) / 1023.0;
                 [c(0), c(10), c(20), f64::from(v >> 30) / 3.0]
             })
             .collect(),
         Format::Rgba16Float => bytes
-            .chunks_exact(8)
-            .map(|t| std::array::from_fn(|c| f16::from_le_bytes([t[2 * c], t[2 * c + 1]]).to_f64()))
+            .as_chunks::<2>()
+            .0
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|t| t.map(|c| f16::from_le_bytes(c).to_f64()))
             .collect(),
         _ => unreachable!(),
     }
@@ -570,7 +580,7 @@ fn painter_draws_textures_clips_and_split_meshes() {
             );
         }
     }
-    for (i, t) in user_texels.chunks_exact(4).enumerate() {
+    for (i, t) in user_texels.as_chunks::<4>().0.iter().enumerate() {
         let (x, y) = (i as u32 % 2, i as u32 / 2);
         let want = [0, 1, 2].map(|c| (srgb_encode(f64::from(t[c]) / 255.0) * 255.0).round() as u8);
         let want = [want[0], want[1], want[2], t[3]];

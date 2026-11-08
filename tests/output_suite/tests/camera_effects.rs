@@ -218,9 +218,9 @@ impl Blur {
         list.dispatch(&self.reference, self.root.gpu(), groups(OUT));
         wait(queue.submit(vec![list], &[]).unwrap());
         read_buffer(self.reference_out.gpu(), 4 * u64::from(OUT[0] * OUT[1]))
-            .chunks_exact(4)
-            .map(|c| [c[0], c[1], c[2], c[3]])
-            .collect()
+            .as_chunks::<4>()
+            .0
+            .to_vec()
     }
 }
 
@@ -670,8 +670,10 @@ mod depth_of_field {
                 &self.targets[0],
                 &TextureRegion::whole_mip(self.targets[0].desc(), 0),
             )
-            .chunks_exact(4)
-            .map(|p| f32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| f32::from_le_bytes(*p))
             .collect()
         }
 
@@ -684,16 +686,18 @@ mod depth_of_field {
             list.dispatch(&self.reference, self.root.gpu(), groups(OUT));
             wait(queue.submit(vec![list], &[]).unwrap());
             read_buffer(self.reference_out.gpu(), 4 * u64::from(OUT[0] * OUT[1]))
-                .chunks_exact(4)
-                .map(|c| [c[0], c[1], c[2], c[3]])
-                .collect()
+                .as_chunks::<4>()
+                .0
+                .to_vec()
         }
     }
 
     fn read_r16f(t: &Texture) -> Vec<f32> {
         read_texture(t, &TextureRegion::whole_mip(t.desc(), 0))
-            .chunks_exact(2)
-            .map(|p| half::f16::from_le_bytes([p[0], p[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| half::f16::from_le_bytes(*p).to_f32())
             .collect()
     }
 
@@ -1980,11 +1984,13 @@ mod lens_distortion {
             );
             wait(queue.submit(vec![list], &[]).unwrap());
             read_texture(&self.target, &whole)
-                .chunks_exact(16)
+                .as_chunks::<4>()
+                .0
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|p| {
-                    let c: [f64; 3] = std::array::from_fn(|i| {
-                        f64::from(f32::from_le_bytes(p[4 * i..4 * i + 4].try_into().unwrap()))
-                    });
+                    let c: [f64; 3] = std::array::from_fn(|i| f64::from(f32::from_le_bytes(p[i])));
                     orr_color::rec709_to_rec2020(c).to_array()
                 })
                 .collect()

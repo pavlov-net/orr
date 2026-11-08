@@ -683,7 +683,9 @@ pub fn f16_bytes(values: &[f32]) -> Vec<u8> {
 
 pub fn f16_values(bytes: &[u8], count: usize) -> Vec<f32> {
     bytes[..count * 2]
-        .chunks_exact(2)
-        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| half::f16::from_le_bytes(*c).to_f32())
         .collect()
 }

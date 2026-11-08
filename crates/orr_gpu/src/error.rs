@@ -29,7 +29,7 @@ pub enum Error {
     #[error(
         "{call}: out of {} memory{}",
         if *.device { "device" } else { "host" },
-        .kind.map_or(String::new(), |k| format!(" ({k:?})"))
+        .kind.map_or_default(|k| format!(" ({k:?})"))
     )]
     OutOfMemory {
         call: &'static str,

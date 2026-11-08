@@ -340,8 +340,10 @@ fn instructions(words: &[u32]) -> Vec<(u32, &[u32])> {
 fn read_words(path: &Path) -> Vec<u32> {
     fs::read(path)
         .unwrap()
-        .chunks_exact(4)
-        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&w| u32::from_le_bytes(w))
         .collect()
 }
 

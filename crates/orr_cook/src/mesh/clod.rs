@@ -399,14 +399,14 @@ fn boundary_area(
             remap[t[if e == 2 { 0 } else { e + 1 }] as usize],
         )
     };
-    for t in indices.chunks_exact(3) {
+    for t in indices.as_chunks::<3>().0 {
         for e in 0..3 {
             let (a, b) = edge(t, e);
             edges.insert(u64::from(a) << 32 | u64::from(b));
         }
     }
     let mut area = 0.0f32;
-    for t in indices.chunks_exact(3) {
+    for t in indices.as_chunks::<3>().0 {
         let border = (0..3).any(|e| {
             let (a, b) = edge(t, e);
             locks[a as usize] & locks[b as usize] & LOCK == 0
@@ -445,7 +445,7 @@ fn dilate_borders(
     let mut offsets: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
     let mut perimeter = 0.0f32;
     let at = |v: u32| positions.get(v as usize);
-    for t in simplified.chunks_exact(3) {
+    for t in simplified.as_chunks::<3>().0 {
         for e in 0..3 {
             let (ia, ib, ic) = (t[e], t[if e == 2 { 0 } else { e + 1 }], t[(e + 2) % 3]);
             let (a, b) = (remap[ia as usize], remap[ib as usize]);

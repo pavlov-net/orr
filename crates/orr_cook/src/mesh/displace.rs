@@ -88,8 +88,8 @@ pub(super) fn bake(
 /// st's t grows, which is against the cook's v.
 fn uv_frames(w: &Welded, indices: &[u32], set: usize) -> FxHashMap<u32, [DVec3; 2]> {
     let mut sums: FxHashMap<u32, [DVec3; 2]> = FxHashMap::default();
-    for t in indices.chunks_exact(3) {
-        let [a, b, c] = [t[0], t[1], t[2]].map(|v| v as usize);
+    for t in indices.as_chunks::<3>().0 {
+        let [a, b, c] = t.map(|v| v as usize);
         let point = |i: usize| Vec3::from(w.positions[i]).as_dvec3();
         let uv = |i: usize| w.uvs[set][i].map(f64::from);
         let (e1, e2) = (point(b) - point(a), point(c) - point(a));
@@ -227,7 +227,7 @@ fn smooth_normals(w: &mut Welded, baked: &[bool]) {
         if !baked[s] {
             continue;
         }
-        for t in w.indices[r.clone()].chunks_exact(3) {
+        for t in w.indices[r.clone()].as_chunks::<3>().0 {
             let face = (p(w, t[1]) - p(w, t[0])).cross(p(w, t[2]) - p(w, t[0]));
             for &v in t {
                 *sums

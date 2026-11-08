@@ -399,7 +399,11 @@ fn append_primitive(
                 .get(&Semantic::Colors(0))
                 .is_some_and(|a| a.dimensions() == gltf::accessor::Dimensions::Vec3);
             if opaque {
-                colors.chunks_exact_mut(4).for_each(|r| r[3] += 1.0);
+                colors
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .for_each(|r| r[3] += 1.0);
             }
             if weights.iter().any(|&w| w != 0.0) {
                 colors.iter_mut().for_each(|c| *c = c.clamp(0.0, 1.0));
@@ -450,7 +454,11 @@ fn append_primitive(
         corners.into_iter().map(place_tangent).collect()
     });
     if flip {
-        indices.chunks_exact_mut(3).for_each(|t| t.swap(1, 2));
+        indices
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .for_each(|t| t.swap(1, 2));
         if let Some(c) = &mut computed {
             c.as_chunks_mut::<3>()
                 .0

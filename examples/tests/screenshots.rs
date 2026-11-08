@@ -713,7 +713,7 @@ fn render_view_runs_ray_reconstruction() {
 
     let red_share = |c: &Capture| {
         let (mut red, mut all) = (0.0, 0.0);
-        for p in c.rgba8.chunks_exact(4) {
+        for p in c.rgba8.as_chunks::<4>().0 {
             red += f64::from(p[0]);
             all += f64::from(p[0]) + f64::from(p[1]) + f64::from(p[2]);
         }
@@ -800,7 +800,7 @@ impl Spread {
     /// Of the green channel of a linear RGBA image `width` wide.
     fn of(rgba: &[f32], width: u32) -> Self {
         let lit = || {
-            rgba.chunks_exact(4).enumerate().map(|(i, p)| {
+            rgba.as_chunks::<4>().0.iter().enumerate().map(|(i, p)| {
                 let at = [i % width as usize, i / width as usize].map(|n| n as f64 + 0.5);
                 (at, f64::from(p[1]))
             })
@@ -1175,7 +1175,14 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
         debug_view: LightingDebugView::None,
     };
     let sharp = lamp.run(extent, frames, moving.closed());
-    let lit = |image: &[f32]| image.chunks_exact(4).filter(|p| p[1] > 0.0).count();
+    let lit = |image: &[f32]| {
+        image
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[1] > 0.0)
+            .count()
+    };
     assert_eq!(lit(&sharp), 8 * 8, "a sharp lamp is its near face");
 
     // Without ray reconstruction the images repeat exactly.

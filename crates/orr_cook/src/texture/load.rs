@@ -802,10 +802,11 @@ fn container(image: ctt::Image, bytes: &[u8]) -> Result<Source, String> {
             let mut out = Img::new(s.width, s.height);
             for (y, row) in out.px.chunks_exact_mut(s.width as usize).enumerate() {
                 let src = &s.data[y * s.stride as usize..][..s.width as usize * 16];
-                for (p, b) in row.iter_mut().zip(src.chunks_exact(16)) {
-                    *p = std::array::from_fn(|c| {
-                        f32::from_le_bytes(b[c * 4..c * 4 + 4].try_into().expect("4 bytes"))
-                    });
+                for (p, b) in row
+                    .iter_mut()
+                    .zip(src.as_chunks::<4>().0.as_chunks::<4>().0)
+                {
+                    *p = b.map(f32::from_le_bytes);
                 }
             }
             out
@@ -915,7 +916,9 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
     let (w, h) = rgba.dimensions();
     let px = rgba
         .into_raw()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| [p[0] * scale[0], p[1] * scale[1], p[2] * scale[2], p[3]])
         .collect();
     Ok(Source {
@@ -1361,7 +1364,7 @@ mod tests {
             }
             let mut out = [0u8; 64];
             bcdec_rs::bc7(&block, &mut out, 16);
-            let decoded = out.chunks_exact(4).all(|t| t[3] == 255);
+            let decoded = out.as_chunks::<4>().0.iter().all(|t| t[3] == 255);
             if bc7_opaque(&block) {
                 opaque += 1;
                 assert!(decoded, "{block:02x?}");

@@ -150,8 +150,10 @@ impl BcLayout {
             }
         } else {
             let blocks: Vec<u128> = src[..n * 16]
-                .chunks_exact(16)
-                .map(|b| u128::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .map(|&b| u128::from_le_bytes(b))
                 .collect();
             dst.extend(blocks.iter().map(|&b| self.mode_of(b)));
             let mut cursors = self.cursors(dst);
@@ -226,7 +228,7 @@ impl BcLayout {
                 return Err(bad());
             }
             let streams = &src[n..n + len];
-            for (b, &code) in dst[..n * 16].chunks_exact_mut(16).zip(modes) {
+            for (b, &code) in dst[..n * 16].as_chunks_mut::<16>().0.iter_mut().zip(modes) {
                 let m = self.mode(code).ok_or_else(bad)?;
                 let (mut v, mut shift) = (m.value, m.bits);
                 for (f, &w) in m.fields.iter().enumerate() {
@@ -301,8 +303,10 @@ mod tests {
         }
         let raw = blocks(BcLayout::Bc6h, 4000, 0);
         let modes: std::collections::HashSet<u8> = raw
-            .chunks_exact(16)
-            .map(|b| BcLayout::Bc6h.mode_of(u128::from_le_bytes(b.try_into().unwrap())))
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|&b| BcLayout::Bc6h.mode_of(u128::from_le_bytes(b)))
             .collect();
         assert_eq!(modes.len(), 18, "every BC6H mode and reserved code");
     }

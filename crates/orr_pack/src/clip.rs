@@ -56,8 +56,10 @@ impl Clip {
         Ok(Self {
             header,
             samples: samples
-                .chunks_exact(size_of::<Trs>())
-                .map(bytemuck::pod_read_unaligned)
+                .as_chunks::<{ size_of::<Trs>() }>()
+                .0
+                .iter()
+                .map(|&b| bytemuck::cast(b))
                 .collect(),
         })
     }

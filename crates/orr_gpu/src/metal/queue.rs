@@ -72,8 +72,10 @@ impl TimestampRing {
                     if let Some(d) = data {
                         let t: Vec<u64> = d
                             .to_vec()
-                            .chunks_exact(8)
-                            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|&c| u64::from_le_bytes(c))
                             .collect();
                         gpu_ms = t[1].saturating_sub(t[0]) as f64 * ms_per_tick;
                     }

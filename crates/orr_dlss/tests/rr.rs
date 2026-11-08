@@ -257,7 +257,7 @@ fn run(
 
 /// Asserts RR wrote every pixel with a finite value and kept the input's mean radiance.
 fn check_output(out: &[f32], render: [u32; 2]) {
-    let pixels: Vec<&[f32]> = out.chunks_exact(4).collect();
+    let pixels = out.as_chunks::<4>().0;
     let untouched = pixels.iter().filter(|p| **p == SENTINEL).count();
     assert_eq!(
         untouched,

@@ -468,8 +468,8 @@ fn encoders_hold_what_no_filter_settled() {
     let (a, _) = cook(Source::Texture { path, settings });
     let (_, levels) = mips(&a, "u");
     for m in &levels[0] {
-        for b in m.chunks_exact(2) {
-            let v = half::f16::from_le_bytes([b[0], b[1]]);
+        for b in m.as_chunks::<2>().0 {
+            let v = half::f16::from_le_bytes(*b);
             assert!(v.is_finite(), "{v}");
         }
     }
@@ -687,8 +687,10 @@ fn ktx_swizzle_is_applied() {
         let (a, _) = cook(Source::Texture { path, settings });
         let (_, levels) = mips(&a, "u");
         let got: Vec<f32> = levels[0][0][..16]
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| f32::from_le_bytes(b))
             .collect();
         for (g, w) in got.iter().zip(want) {
             assert!((g - w).abs() < 0.01, "{swizzle}: {got:?}, want {want:?}");
@@ -748,8 +750,12 @@ fn decoded_block(d: &Path, format: u32, block: &[u8]) -> Vec<[f32; 4]> {
     let (a, _) = cook(Source::Texture { path, settings });
     let (_, levels) = mips(&a, "u");
     levels[0][0]
-        .chunks_exact(16)
-        .map(|t| std::array::from_fn(|c| f32::from_le_bytes(t[c * 4..][..4].try_into().unwrap())))
+        .as_chunks::<4>()
+        .0
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|t| t.map(f32::from_le_bytes))
         .collect()
 }
 

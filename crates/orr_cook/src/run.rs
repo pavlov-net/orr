@@ -2781,7 +2781,7 @@ fn emission_map(arc: &Archive, id: AssetId) -> Result<EmissionMap> {
 fn mip_planes(format: u32, w: u32, h: u32, bytes: &[u8], channels: usize) -> Result<Vec<Vec<f32>>> {
     use orr_pack::texture::vk;
     let unread = |_| orr_pack::Error::Malformed("texture format the mesh cook reads");
-    let pairs = || bytes.chunks_exact(2).map(|b| [b[0], b[1]]);
+    let pairs = || bytes.as_chunks::<2>().0.iter().copied();
     let red = |r: Vec<f32>| {
         let n = r.len();
         let mut planes = vec![r];
@@ -2797,8 +2797,10 @@ fn mip_planes(format: u32, w: u32, h: u32, bytes: &[u8], channels: usize) -> Res
             .map(|b| (f32::from(i16::from_le_bytes(b)) / 32767.0).max(-1.0))
             .collect()),
         vk::R32_SFLOAT => red(bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect()),
         f if channels == 1 => {
             vec![texture::decode_channel(f, w, h, bytes, 0).map_err(unread)?]

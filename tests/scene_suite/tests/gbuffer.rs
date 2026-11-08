@@ -4277,7 +4277,7 @@ fn posed_rigid_parts_trace_where_the_raster_draws_them() {
                         assert!(moved > 100, "{context}: only {moved} pixels moved");
                     }
                 }
-                previous = Some(g.depth.clone());
+                previous = Some(g.depth);
                 let rt = last_rt(&mut w, frame);
                 assert_eq!(
                     (rt.parts, rt.parts_refused),

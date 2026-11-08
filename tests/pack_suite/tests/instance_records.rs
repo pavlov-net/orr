@@ -58,10 +58,10 @@ fn decode_on_gpu(
     assert_clean();
     out.as_slice()
         .unwrap()
-        .chunks_exact(3)
-        .map(|m| AffineRows {
-            rows: [m[0], m[1], m[2]],
-        })
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|m| AffineRows { rows: *m })
         .collect()
 }
 

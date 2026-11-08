@@ -409,13 +409,15 @@ fn group_of(
         // One cluster per section: a triangle's corners all lie in one section.
         let mut pieces: Vec<(u16, Vec<u32>, Vec<u8>)> = Vec::new();
         if tris
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .all(|t| section_of(t) == section_of(tris))
         {
             pieces.push((section_of(tris), local.to_vec(), tris.to_vec()));
         } else {
             let mut by_section: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
-            for t in tris.chunks_exact(3) {
+            for t in tris.as_chunks::<3>().0 {
                 by_section
                     .entry(section_of(t))
                     .or_default()

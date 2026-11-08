@@ -1156,7 +1156,7 @@ fn red(a: &Archive, m: &Material, s: usize) -> Vec<f32> {
         .mip_texels(&read(a, &blobs[h.mip_blob(0)]), 0, 0)
         .unwrap();
     let mut out = Vec::new();
-    for block in bytes.chunks_exact(8) {
+    for block in bytes.as_chunks::<8>().0 {
         let mut px = [0u8; 16];
         bcdec_rs::bc4(block, &mut px, 4, false);
         out.extend(px.iter().map(|&v| f32::from(v) / 255.0));
@@ -1841,10 +1841,12 @@ fn usd_list<const N: usize>(v: impl IntoIterator<Item = [f32; N]>) -> String {
 fn framed(name: &str, mesh: &str, material: &str, reversed: bool) -> Vec<(Vec3, [f32; 4])> {
     let (p, n, uv, _, idx) = tangent_quads::arrays();
     let idx: Vec<u32> = idx
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .flat_map(|t| match reversed {
             true => [t[0], t[2], t[1]],
-            false => [t[0], t[1], t[2]],
+            false => *t,
         })
         .collect();
     let counts = vec!["3"; idx.len() / 3].join(", ");

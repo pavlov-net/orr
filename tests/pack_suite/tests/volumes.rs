@@ -314,7 +314,7 @@ fn majorant_cells_along_a_ray_bound_every_sample() {
     assert_clean();
     let s = GridSampler::new(info, 0, &c.pages[0]).unwrap();
     let mut empty = 0;
-    let found = spans.as_slice().unwrap().chunks_exact(SAMPLES);
+    let found = spans.as_slice().unwrap().as_chunks::<SAMPLES>().0;
     for ((p, d), m) in points.iter().zip(&dirs).zip(found) {
         for (k, &m) in m.iter().enumerate() {
             let t = (k as f32 + 0.5) / SAMPLES as f32 * d[3];

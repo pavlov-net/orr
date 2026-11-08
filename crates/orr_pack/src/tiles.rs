@@ -223,7 +223,10 @@ mod tests {
         for t in &s.tiles {
             let bucket = hashed(key(t.column, t.row), words[0], words[1]);
             let first = HEADER_WORDS + 2 * (bucket * BUCKET) as usize;
-            let entries = words[first..first + 2 * BUCKET as usize].chunks_exact(2);
+            let entries = words[first..first + 2 * BUCKET as usize]
+                .as_chunks::<2>()
+                .0
+                .iter();
             let found = entries.filter(|e| e[0] == key(t.column, t.row) && e[1] == 7);
             assert_eq!(found.count(), 1, "{t:?}");
         }

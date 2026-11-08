@@ -38,8 +38,10 @@ pub static TABLES: [[[[f64; 3]; pyramid::LAST_LEVEL as usize + 1]; fit::F_NUMBER
 pub fn fft_kernel() -> fft::Kernel {
     let bytes = include_bytes!(concat!(env!("ORR_GLARE_FFT"), "/glare_fft_table.bin"));
     let floats: Vec<f64> = bytes
-        .chunks_exact(4)
-        .map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap())))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| f64::from(f32::from_le_bytes(b)))
         .collect();
     let mut levels = Vec::new();
     let mut at = 0;

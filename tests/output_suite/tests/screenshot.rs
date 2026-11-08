@@ -61,7 +61,7 @@ fn captures_carry_their_frames() {
             )
         };
         assert_eq!(shot.primaries, primaries);
-        for (i, p) in shot.rgba.chunks_exact(4).enumerate() {
+        for (i, p) in shot.rgba.as_chunks::<4>().0.iter().enumerate() {
             let want = f64::from(nits[i] * scale);
             let got = luminance(p, y);
             assert!(
@@ -79,7 +79,9 @@ fn captures_carry_their_frames() {
     assert_eq!(last.paper_white_nits, display.signal_white_nits);
     for (i, (got, linear)) in last
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .zip(h.display_linear())
         .enumerate()
     {

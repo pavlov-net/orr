@@ -460,7 +460,7 @@ fn a_smoke_volume_shadows_as_a_fine_march_of_its_grid() {
     let mut worst = (0.0f64, String::new());
     for (r, rays) in receivers
         .iter()
-        .zip(traced.transmittance.chunks_exact(RAYS))
+        .zip(traced.transmittance.as_chunks::<RAYS>().0)
     {
         let want = plume_reference(&s, &proxy, *r, sun);
         if want[0] < 0.9 {

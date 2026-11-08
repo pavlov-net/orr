@@ -361,8 +361,12 @@ impl Harness {
 pub fn read_rgba16f(t: &Texture) -> Vec<[f32; 4]> {
     let region = TextureRegion::whole_mip(t.desc(), 0);
     read_texture(t, &region)
-        .chunks_exact(8)
-        .map(|p| std::array::from_fn(|c| f16::from_le_bytes([p[2 * c], p[2 * c + 1]]).to_f32()))
+        .as_chunks::<2>()
+        .0
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| p.map(|c| f16::from_le_bytes(c).to_f32()))
         .collect()
 }
 

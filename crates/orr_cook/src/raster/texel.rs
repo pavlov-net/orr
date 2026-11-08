@@ -43,7 +43,7 @@ impl RasterFormat {
     pub(super) fn expand(self, src: &[u8], out: &mut Vec<u8>) {
         if self == Self::Rgb8 {
             out.reserve(src.len() / 3 * 4);
-            for p in src.chunks_exact(3) {
+            for p in src.as_chunks::<3>().0 {
                 out.extend_from_slice(&[p[0], p[1], p[2], 255]);
             }
         } else {
@@ -61,11 +61,15 @@ impl RasterFormat {
         };
         match self {
             Self::R32f => src
-                .chunks_exact(4)
-                .for_each(|b| add(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .for_each(|b| add(f32::from_le_bytes(*b))),
             Self::R16 => src
-                .chunks_exact(2)
-                .for_each(|b| add(f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0)),
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .for_each(|b| add(f32::from(u16::from_le_bytes(*b)) / 65535.0)),
             _ => {
                 let (mut lo, mut hi) = (u8::MAX, u8::MIN);
                 for &b in src {
@@ -191,7 +195,7 @@ pub(super) fn reduce_rows(
     match t {
         Texel::R32f => {
             let f = |b: &[u8], i: usize| f32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
-            for (i, o) in out.chunks_exact_mut(4).enumerate() {
+            for (i, o) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let (a, b) = (f(top, 8 * i), f(top, 8 * i + 4));
                 let (c, d) = (f(bottom, 8 * i), f(bottom, 8 * i + 4));
                 let v = match r {
@@ -205,7 +209,7 @@ pub(super) fn reduce_rows(
         }
         Texel::R16 => {
             let u = |b: &[u8], i: usize| u32::from(u16::from_le_bytes([b[i], b[i + 1]]));
-            for (i, o) in out.chunks_exact_mut(2).enumerate() {
+            for (i, o) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                 let v = [
                     u(top, 4 * i),
                     u(top, 4 * i + 2),

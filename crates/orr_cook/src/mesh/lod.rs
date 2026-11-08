@@ -94,7 +94,7 @@ impl Welded {
 
     pub(super) fn section_triangles(&self, s: usize) -> impl Iterator<Item = [u32; 3]> + '_ {
         let r = self.sections[s].clone();
-        self.indices[r].chunks_exact(3).map(|t| [t[0], t[1], t[2]])
+        self.indices[r].as_chunks::<3>().0.iter().copied()
     }
 }
 

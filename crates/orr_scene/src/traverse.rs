@@ -365,7 +365,9 @@ impl Cuts {
         let data = self.readback(slot);
         let n = (data[CUT_FEEDBACK] as usize).min(FEEDBACK as usize);
         data[COUNTERS..COUNTERS + 4 * n]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|r| PageFeedback {
                 mesh: r[0],
                 page: r[1],

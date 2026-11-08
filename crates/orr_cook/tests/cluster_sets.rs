@@ -168,7 +168,7 @@ fn check_sets(d: &Dag, sets: &ClusterSets, two_sided: bool, weight: impl Fn(&C) 
             assert_eq!(*cdf.last().unwrap(), u32::MAX);
             let index = &sets.index[list.clone()];
             assert!(index.windows(2).all(|p| p[0][0] < p[1][0]));
-            for (p, &c) in sets.clusters[list.clone()].iter().enumerate() {
+            for (p, &c) in sets.clusters[list].iter().enumerate() {
                 let step = cdf[p] - if p > 0 { cdf[p - 1] } else { 0 };
                 assert!(step >= 1);
                 let share = weight(&d.clusters[c as usize]) / total;

@@ -351,7 +351,7 @@ impl TextureFeedback {
         let n = data[0].min(self.capacity) as usize;
         let stamp = (frame & 0xff_ffff) as u32;
         let mut out = Vec::with_capacity(n);
-        for r in data[1..1 + 2 * n].chunks_exact(2) {
+        for r in data[1..1 + 2 * n].as_chunks::<2>().0 {
             let (cell, value) = (r[0], r[1]);
             if value >> 8 != stamp {
                 continue;

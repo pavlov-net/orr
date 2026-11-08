@@ -976,8 +976,10 @@ fn stored_heights(a: &Archive, m: &Material) -> Vec<f32> {
     let (info, levels) = mips(a, a.name(texture));
     assert_eq!(info.header.vk_format, vk::R16_UNORM);
     levels[0][0]
-        .chunks_exact(2)
-        .map(|t| f32::from(u16::from_le_bytes([t[0], t[1]])) / 65535.0)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|t| f32::from(u16::from_le_bytes(*t)) / 65535.0)
         .collect()
 }
 
@@ -1104,8 +1106,8 @@ fn float_standalone_heights_stay_finite_and_in_range_at_every_mip() {
     let (info, levels) = mips(&cook(vec![texture(&path, "t", settings)]), "t");
     assert_eq!(info.header.vk_format, vk::R32_SFLOAT);
     for (m, level) in levels[0].iter().enumerate() {
-        for t in level.chunks_exact(4) {
-            let h = f32::from_le_bytes(t.try_into().unwrap());
+        for &t in level.as_chunks::<4>().0 {
+            let h = f32::from_le_bytes(t);
             assert!((-2.5..=3.0).contains(&h), "mip {m}: {h}");
         }
     }
@@ -1148,15 +1150,19 @@ fn signed_standalone_sources_keep_their_values_in_signed_formats() {
     let read = |vk_format: u32, w: u32, h: u32, data: &[u8]| -> Vec<[f32; 4]> {
         if vk_format == vk::R32_SFLOAT {
             return data
-                .chunks_exact(4)
-                .map(|t| [f32::from_le_bytes(t.try_into().unwrap()), 0.0, 0.0, 0.0])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&t| [f32::from_le_bytes(t), 0.0, 0.0, 0.0])
                 .collect();
         }
         if vk_format == vk::R16_SNORM {
             return data
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|t| {
-                    let v = f32::from(i16::from_le_bytes([t[0], t[1]])) / 32767.0;
+                    let v = f32::from(i16::from_le_bytes(*t)) / 32767.0;
                     [v, 0.0, 0.0, 0.0]
                 })
                 .collect();
@@ -1439,7 +1445,9 @@ fn bcn_material_checks(a: &Archive, remade: bool, blocks: [&Vec<Vec<u8>>; 5]) {
     assert_eq!(info.header.vk_format, vk::BC4_UNORM);
     assert_eq!(levels[0].len(), rough_blocks.len());
     let red: Vec<u8> = rough_blocks[0]
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .flat_map(|b| &b[..8])
         .copied()
         .collect();

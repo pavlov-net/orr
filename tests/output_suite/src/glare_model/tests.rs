@@ -181,7 +181,9 @@ fn spectral_weights_source(committed: &str) -> Option<String> {
         .collect();
     let to_rec2020 = RgbPrimaries::REC2020.xyz_to_rgb();
     let rows: Vec<(f64, [f64; 3])> = cie
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|r| {
             let &(_, s) = illuminant
                 .iter()

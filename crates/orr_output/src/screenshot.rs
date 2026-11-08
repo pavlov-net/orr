@@ -40,7 +40,11 @@ const MAX_CLL_PERCENTILE: f64 = 0.9999;
 
 impl Screenshot {
     fn pixels(&self) -> impl Iterator<Item = [f32; 3]> + '_ {
-        self.rgba.chunks_exact(4).map(|p| [p[0], p[1], p[2]])
+        self.rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| [p[0], p[1], p[2]])
     }
 
     fn display_only(&self, what: &str) -> io::Result<()> {
