@@ -31,8 +31,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use orr_gpu::{
-    CommandList, Device, GpuAddress, GpuPtr, Hazards, MemoryKind, Micromap, QueueKind, SparseBinds,
-    Stages, Texture, TextureRegion, TileBind, TimelinePoint,
+    CommandList, Device, GpuAddress, GpuPtr, Hazards, MemoryKind, QueueKind, SparseBinds, Stages,
+    Texture, TextureRegion, TileBind, TimelinePoint,
 };
 use orr_io::{AlignedBuf, SECTOR};
 use orr_pack::mesh::{MeshHeader, StoredPage};
@@ -40,7 +40,9 @@ use orr_pack::{Blob, Codec};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::accel::{self, AccelShared, Animated, ClusterInfo, CutRow, FineCut, PageMicromap};
-use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch, Shortfall};
+use crate::clas_pool::{
+    self, ClasPool, LoadingSide, NO_UNIT, PageBuild, PoolBatch, PoolMicromap, Shortfall,
+};
 use crate::edit::Mirror;
 use crate::loading::{BlobSource, Loading, Msg, landed, read_into, reads_straight};
 use crate::memory::{Block, Pool, PoolSlot};
@@ -312,7 +314,7 @@ struct MeshPlaced {
     address: u64,
     clas_addresses: Vec<u64>,
     clas: Vec<(u32, u32)>,
-    micromap: Option<(Micromap, PoolSlot)>,
+    micromap: Option<PoolMicromap>,
 }
 
 impl MeshPlaced {
@@ -330,7 +332,7 @@ impl MeshPlaced {
 /// A streamed page's CLAS and micromap, freed once no frame reads them.
 struct ClasFree {
     clas: Vec<(u32, u32)>,
-    micromap: Option<(Micromap, PoolSlot)>,
+    micromap: Option<PoolMicromap>,
 }
 
 /// A bound tile to unbind and free.
@@ -364,7 +366,7 @@ pub(crate) struct Streaming {
     residency: Residency,
     accel: Arc<AccelShared>,
     /// Streamed pages' CLAS; none without cluster acceleration structures.
-    clas: Option<Arc<Mutex<ClasPool>>>,
+    clas: Option<Arc<ClasPool>>,
     /// CLAS freed once the frame has completed.
     retired_clas: Vec<(u64, ClasFree)>,
     /// Mesh pages, and the other pool units where `units` is this pool.
@@ -441,7 +443,7 @@ impl Streaming {
         )));
         let clas = if caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0 {
             let pool = ClasPool::new(device, b.mesh_page_pool, b.stream_block)?;
-            Some(Arc::new(Mutex::new(pool)))
+            Some(Arc::new(pool))
         } else {
             None
         };
@@ -1231,9 +1233,8 @@ impl Streaming {
         points.extend(self.fine_step(frame, settled, loading, w)?);
         self.residency.react(w.device.memory_report().pressure());
         if let Some(c) = &self.clas {
-            let c = c.lock().unwrap();
-            self.residency
-                .note_clas_pool(c.bound_bytes(), c.range_full());
+            let (bound, range_full) = c.report();
+            self.residency.note_clas_pool(bound, range_full);
         }
         self.moving.retain(|_, m| m.1 >= frame);
         let waiting: Vec<Key> = self.moving.keys().copied().collect();
@@ -1331,10 +1332,7 @@ impl Streaming {
                 },
             });
         }
-        let clas_waits = self
-            .clas
-            .as_ref()
-            .is_some_and(|c| c.lock().unwrap().pending());
+        let clas_waits = self.clas.as_ref().is_some_and(|c| c.pending());
         if !loads.is_empty() || !self.unbinds.is_empty() || clas_waits {
             let task = StreamTask {
                 accel: Arc::clone(&self.accel),
@@ -1476,7 +1474,7 @@ impl Streaming {
     /// unit count of each of its CLAS.
     fn replay(&mut self, batch: PoolBatch) -> Vec<(u32, u32)> {
         let pool = self.clas.as_ref().expect("a CLAS batch has its pool");
-        let (placed, held) = pool.lock().unwrap().replay(batch);
+        let (placed, held) = pool.replay(batch);
         let mut staging = self.staging.lock().unwrap();
         for slot in held {
             staging.free(slot);
@@ -1622,10 +1620,7 @@ impl Streaming {
         let placed = l.result.is_ok() && units.iter().all(|&(u, _)| u != NO_UNIT);
         if l.result.is_ok() && self.mounts.contains_key(&key.mount) {
             let clas: u64 = units.iter().map(|&(_, n)| u64::from(n)).sum();
-            let micromap = match (&p.micromap, &self.clas) {
-                (Some((_, slot)), Some(pool)) => pool.lock().unwrap().micromaps.bytes(*slot),
-                _ => 0,
-            };
+            let micromap = p.micromap.as_ref().map_or(0, |m| m.bytes);
             self.residency.built(key, clas * clas_pool::UNIT + micromap);
         }
         let live = if l.result.is_ok() && !placed && self.mounts.contains_key(&key.mount) {
@@ -1641,7 +1636,7 @@ impl Streaming {
         }
         let (table, refs, count) = p.entries();
         let first = p.stream.pages[p.page as usize].first;
-        let pool = self.clas.as_ref().map(|c| c.lock().unwrap());
+        let pool = self.clas.as_deref();
         let entries: Vec<ClusterRef> = (0..count)
             .map(|i| ClusterRef {
                 // SAFETY: the page is resident in its slot until it is evicted, which writes
@@ -1649,13 +1644,12 @@ impl Streaming {
                 page: unsafe { GpuPtr::from_address(GpuAddress(l.gpu)) },
                 local: i,
                 mesh_cluster: first + i,
-                clas: match (&pool, units.get(i as usize)) {
+                clas: match (pool, units.get(i as usize)) {
                     (Some(pool), Some(&(u, _))) => pool.address(u),
                     _ => 0,
                 },
             })
             .collect();
-        drop(pool);
         w.put(table, &[l.gpu])?;
         w.put(refs, &entries)?;
         for mirror in p.stream.mirrors.lock().unwrap().iter() {
@@ -1688,14 +1682,8 @@ impl Streaming {
     }
 
     fn free_clas(&mut self, f: ClasFree) {
-        let Some(pool) = &self.clas else { return };
-        let mut pool = pool.lock().unwrap();
-        for (u, n) in f.clas {
-            pool.free(u, n);
-        }
-        if let Some((micromap, slot)) = f.micromap {
-            drop(micromap);
-            pool.micromaps.free(slot);
+        if let Some(pool) = &self.clas {
+            pool.free(&f.clas, f.micromap);
         }
     }
 
@@ -1802,7 +1790,7 @@ enum Copy {
 /// One step's loads on the loading side.
 pub(crate) struct StreamTask {
     accel: Arc<AccelShared>,
-    clas: Option<Arc<Mutex<ClasPool>>>,
+    clas: Option<Arc<ClasPool>>,
     pool: Arc<Mutex<Pool>>,
     units: Arc<Mutex<Pool>>,
     staging: Arc<Mutex<Pool>>,
@@ -1844,7 +1832,7 @@ struct MeshLanded {
     decode: u32,
     /// The results index of each cluster's CLAS.
     slots: Vec<u32>,
-    micromap: Option<(Micromap, PoolSlot)>,
+    micromap: Option<PoolMicromap>,
 }
 
 /// A stream task's loads, handed to the render thread once its GPU work has landed.
@@ -2406,11 +2394,11 @@ const BATCH_CLAS: u32 = 4096;
 fn build_clas(
     device: &Device,
     task: &StreamTask,
-    pool: &Mutex<ClasPool>,
+    pool: &ClasPool,
     loads: &mut [Landed],
     points: &mut Vec<TimelinePoint>,
 ) -> (Vec<PoolBatch>, Option<Error>) {
-    let mut pool = pool.lock().unwrap();
+    let mut side = pool.side();
     let pages: Vec<usize> = (0..loads.len())
         .filter(|&i| loads[i].result.is_ok() && loads[i].mesh.is_some())
         .collect();
@@ -2431,7 +2419,7 @@ fn build_clas(
     let mut batches: Vec<PoolBatch> = Vec::new();
     for (g, group) in groups.iter().enumerate() {
         let offset = batches.iter().map(PoolBatch::clas).sum();
-        match build_group(device, task, &mut pool, loads, group, offset, points) {
+        match build_group(device, task, pool, &mut side, loads, group, offset, points) {
             Ok(b) => batches.push(b),
             Err(e) => {
                 let failing: Vec<usize> = groups[g..].concat();
@@ -2451,10 +2439,12 @@ fn build_clas(
 
 /// Builds the CLAS of the mesh pages `pages` of `loads` as one pool batch, their results
 /// indices past `offset`.
+#[allow(clippy::too_many_arguments)]
 fn build_group(
     device: &Device,
     task: &StreamTask,
-    pool: &mut ClasPool,
+    pool: &ClasPool,
+    side: &mut LoadingSide,
     loads: &mut [Landed],
     pages: &[usize],
     offset: u32,
@@ -2486,6 +2476,7 @@ fn build_group(
     let triangles = task.accel.limits.clas_triangles;
     let out = clas_pool::build_pages(
         pool,
+        side,
         device,
         k,
         &mut list,
@@ -2499,7 +2490,7 @@ fn build_group(
     match queue.submit(vec![list], &wait) {
         Ok(p) => points.push(p),
         Err(e) => {
-            out.abandon(pool, &task.staging);
+            out.abandon(pool, side, &task.staging);
             return Err(e.into());
         }
     }
