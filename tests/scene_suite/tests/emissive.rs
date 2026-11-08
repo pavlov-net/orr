@@ -563,6 +563,7 @@ fn emitted(m: DMat3, count: u32, size: f64) -> [f64; 3] {
 fn producer_power_follows_emitted_clusters_every_frame() {
     let d = device();
     let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
     let s = scenes
         .create_scene(&SceneDesc {
             producer_capacity: PRODUCERS,
