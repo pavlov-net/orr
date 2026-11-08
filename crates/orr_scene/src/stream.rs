@@ -51,7 +51,7 @@ use crate::memory::{Block, Pool, PoolSlot};
 use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
 use crate::residency::{
-    HOLD_FRAMES, Key, Limits, Plan, Priority, RequestSource, Residency, ResidencyClass,
+    HOLD_FRAMES, Held, Key, Limits, Plan, Priority, RequestSource, Residency, ResidencyClass,
     ResidencyStats, UnitDesc,
 };
 use crate::shaders::page_decode::PageDecodeRoot;
@@ -96,11 +96,12 @@ pub(crate) struct MeshStream {
     pub(crate) entry: u32,
     pub(crate) header: MeshHeader,
     pub(crate) pages: Vec<StreamedPage>,
-    /// The mesh's page table.
+    /// The mesh's page table, and beside it the cluster id of each resident page's first
+    /// cluster.
     pub(crate) table: GpuPtr<u64>,
-    /// The entry of mesh cluster 0 in the resident cluster table, and its cluster id.
+    pub(crate) bases: GpuPtr<u32>,
+    /// The resident cluster table.
     pub(crate) clusters: GpuPtr<ClusterRef>,
-    pub(crate) cluster_base: u32,
     /// Sections whose every triangle is non-opaque.
     pub(crate) non_opaque: Vec<bool>,
     /// Its index in its mount, and the first page that streams.
@@ -304,11 +305,13 @@ enum Placed {
     MeshPage(MeshPlaced),
 }
 
-/// A streamed mesh page: its slot, the unit ranges its CLAS take and its micromap.
+/// A streamed mesh page: its slot, the cluster id of its first cluster, the unit ranges its
+/// CLAS take and its micromap.
 struct MeshPlaced {
     slot: PoolSlot,
     stream: Arc<MeshStream>,
     page: u32,
+    ids: u32,
     /// Its resident address and each cluster's CLAS, once it has landed.
     address: u64,
     clas_addresses: Vec<u64>,
@@ -319,19 +322,33 @@ struct MeshPlaced {
 impl MeshPlaced {
     /// Its page table entry and its clusters' entries in the resident cluster table.
     fn entries(&self) -> (GpuPtr<u64>, GpuPtr<ClusterRef>, u32) {
-        let p = self.stream.pages[self.page as usize];
         (
             self.stream.table.offset(u64::from(self.page)),
-            self.stream.clusters.offset(u64::from(p.first)),
-            p.clusters,
+            self.stream.clusters.offset(u64::from(self.ids)),
+            self.clusters(),
         )
+    }
+
+    fn clusters(&self) -> u32 {
+        self.stream.pages[self.page as usize].clusters
+    }
+
+    /// What it holds besides its slot.
+    fn free(self) -> (PoolSlot, PageFree) {
+        let free = PageFree {
+            clas: self.clas,
+            micromap: self.micromap,
+            ids: (self.ids, self.stream.pages[self.page as usize].clusters),
+        };
+        (self.slot, free)
     }
 }
 
-/// A streamed page's CLAS and micromap, freed once no frame reads them.
-struct ClasFree {
+/// A streamed page's CLAS, micromap and cluster ids, freed once no frame reads them.
+struct PageFree {
     clas: Vec<(u32, u32)>,
     micromap: Option<PoolMicromap>,
+    ids: (u32, u32),
 }
 
 /// A bound tile to unbind and free.
@@ -366,8 +383,10 @@ pub(crate) struct Streaming {
     accel: Arc<AccelShared>,
     /// Streamed pages' CLAS; none without cluster acceleration structures.
     clas: Option<Arc<ClasPool>>,
-    /// CLAS freed once the frame has completed.
-    retired_clas: Vec<(u64, ClasFree)>,
+    /// Streamed pages' CLAS and cluster ids, freed once the frame has completed.
+    retired_pages: Vec<(u64, PageFree)>,
+    /// The first cluster id each streamed mesh page loading holds, and its cluster count.
+    loading_ids: FxHashMap<Key, (u32, u32)>,
     /// Mesh pages, and the other pool units where `units` is this pool.
     pool: Arc<Mutex<Pool>>,
     /// Hierarchy and instance pages: the stream pool, or staging memory where it is
@@ -449,7 +468,8 @@ impl Streaming {
         Ok(Self {
             accel: Arc::clone(accel),
             clas,
-            retired_clas: Vec::new(),
+            retired_pages: Vec::new(),
+            loading_ids: FxHashMap::default(),
             residency: Residency::new(Limits {
                 budgets,
                 in_flight: b.in_flight_bytes,
@@ -717,12 +737,9 @@ impl Streaming {
             match self.resident.remove(&k).expect("resident") {
                 Placed::Pool(slot, _) => self.retired_units.push((frame, slot)),
                 Placed::MeshPage(p) => {
-                    self.retired.push((frame, p.slot));
-                    let free = ClasFree {
-                        clas: p.clas,
-                        micromap: p.micromap,
-                    };
-                    self.retired_clas.push((frame, free));
+                    let (slot, free) = p.free();
+                    self.retired.push((frame, slot));
+                    self.retired_pages.push((frame, free));
                 }
                 Placed::Tile(slot) => {
                     let (t, tile) = m.tile(k.unit);
@@ -1279,9 +1296,27 @@ impl Streaming {
                 t.write_map(w)?;
             }
         }
-        let loads = self
-            .residency
-            .cancel_waiting(loads, |k| self.unbinding.contains(&k));
+        let mut ids = self.accel.cluster_ids.lock().unwrap();
+        let mut taken = FxHashMap::default();
+        let loads = self.residency.cancel_held(loads, |k| {
+            if self.unbinding.contains(&k) {
+                return Some(Held::Waiting);
+            }
+            let m = &self.mounts[&k.mount];
+            let Some(StreamUnit::MeshPage { mesh, page }) = m.units[k.unit as usize] else {
+                return None;
+            };
+            let n = m.mesh_streams[mesh as usize].pages[page as usize].clusters;
+            match ids.alloc(n) {
+                Some(first) => {
+                    taken.insert(k, (first, n));
+                    None
+                }
+                None => Some(Held::ClusterIds),
+            }
+        });
+        drop(ids);
+        self.loading_ids.extend(taken);
         for u in &self.unbinds {
             self.unbinding.remove(&u.key);
         }
@@ -1310,6 +1345,7 @@ impl Streaming {
                     StreamUnit::MeshPage { mesh, page } => LoadKind::MeshPage {
                         stream: Arc::clone(&m.mesh_streams[mesh as usize]),
                         page,
+                        ids: self.loading_ids[&key].0,
                     },
                 };
                 StreamLoad {
@@ -1411,12 +1447,9 @@ impl Streaming {
                         w.put(mirror.clusters.offset(u64::from(first)), &zeros)?;
                     }
                 }
-                self.retired.push((frame - 1, p.slot));
-                let free = ClasFree {
-                    clas: p.clas,
-                    micromap: p.micromap,
-                };
-                self.retired_clas.push((frame - 1, free));
+                let (slot, free) = p.free();
+                self.retired.push((frame - 1, slot));
+                self.retired_pages.push((frame - 1, free));
             }
             Placed::Tile(slot) => {
                 let m = self.mounts.get_mut(&k.mount).expect("mounted");
@@ -1560,6 +1593,14 @@ impl Streaming {
         w: &mut Apply<'_>,
     ) -> Result<()> {
         let ok = l.result.is_ok();
+        // A mesh page's placement holds its ids from here; one that failed before it was
+        // placed returns them now.
+        if let What::Unit(key) = l.what
+            && let Some((first, n)) = self.loading_ids.remove(&key)
+            && !matches!(l.placed, Some(Placed::MeshPage(_)))
+        {
+            self.accel.cluster_ids.lock().unwrap().free(first, n);
+        }
         if let (What::Unit(key), Some(Placed::MeshPage(_))) = (l.what, &l.placed) {
             return self.mesh_landed(key, l, clas, frame, w);
         }
@@ -1672,6 +1713,7 @@ impl Streaming {
             })
             .collect();
         w.put(table, &[l.gpu])?;
+        w.put(p.stream.bases.offset(u64::from(p.page)), &[p.ids])?;
         w.put(refs, &entries)?;
         for mirror in p.stream.mirrors.lock().unwrap().iter() {
             if !mirror.own[p.page as usize] {
@@ -1693,17 +1735,20 @@ impl Streaming {
 
     /// Frees a mesh page no frame has read.
     fn free_now(&mut self, p: MeshPlaced) {
-        self.pool.lock().unwrap().free(p.slot);
-        self.free_clas(ClasFree {
-            clas: p.clas,
-            micromap: p.micromap,
-        });
+        let (slot, free) = p.free();
+        self.pool.lock().unwrap().free(slot);
+        self.free_page(free);
     }
 
-    fn free_clas(&mut self, f: ClasFree) {
+    fn free_page(&mut self, f: PageFree) {
         if let Some(pool) = &self.clas {
             pool.free(&f.clas, f.micromap);
         }
+        self.accel
+            .cluster_ids
+            .lock()
+            .unwrap()
+            .free(f.ids.0, f.ids.1);
     }
 
     /// Copies frame `frame`'s texture feedback back after every tap of the frame on `list`.
@@ -1734,12 +1779,12 @@ impl Streaming {
             !done
         });
         drop(units);
-        let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired_clas)
+        let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired_pages)
             .into_iter()
             .partition(|(f, _)| *f <= completed);
-        self.retired_clas = keep;
+        self.retired_pages = keep;
         for (_, f) in done {
-            self.free_clas(f);
+            self.free_page(f);
         }
         let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired_tiles)
             .into_iter()
@@ -1783,6 +1828,8 @@ enum LoadKind {
     MeshPage {
         stream: Arc<MeshStream>,
         page: u32,
+        /// The cluster id of its first cluster.
+        ids: u32,
     },
 }
 
@@ -1799,7 +1846,7 @@ impl StreamLoad {
             LoadKind::Pool { bytes, .. } => (u64::from(*bytes), 0),
             LoadKind::Tile { stream, .. } => (stream.layout.tile_bytes, 0),
             LoadKind::User { blob, .. } => (u64::from(blob.raw_len), 0),
-            LoadKind::MeshPage { stream, page } => {
+            LoadKind::MeshPage { stream, page, .. } => {
                 let p = stream.pages[*page as usize];
                 (u64::from(p.bytes), p.clusters)
             }
@@ -2022,7 +2069,7 @@ fn source_of(load: &StreamLoad) -> Result<(Blob, Option<u32>, u64, u64)> {
             let len = u64::from(*bytes);
             (entry_blob(*entry, *blob)?, None, len, len)
         }
-        LoadKind::MeshPage { stream, page } => {
+        LoadKind::MeshPage { stream, page, .. } => {
             let p = stream.pages[*page as usize];
             let b = entry_blob(stream.entry, p.blob)?;
             (b, None, u64::from(b.raw_len), u64::from(p.bytes))
@@ -2094,7 +2141,7 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                     }
                 }
             }
-            LoadKind::MeshPage { stream, page } => {
+            LoadKind::MeshPage { stream, page, ids } => {
                 match task
                     .pool
                     .lock()
@@ -2106,6 +2153,7 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                             slot,
                             stream: Arc::clone(stream),
                             page: *page,
+                            ids: *ids,
                             address: 0,
                             clas_addresses: Vec::new(),
                             clas: Vec::new(),
@@ -2184,7 +2232,7 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                     if let Some(l) = l.upgrade() {
                         l.flush(&staged)?;
                     }
-                    if let LoadKind::MeshPage { stream, page } = &load.kind {
+                    if let LoadKind::MeshPage { stream, page, .. } = &load.kind {
                         let to = (block.expect("a pool slot").gpu(), slot_len);
                         mesh = Some(stage_page(stream, *page, bytes, &staged, to, &t.decodes)?);
                     }
@@ -2489,7 +2537,7 @@ fn build_clas(
             PageBuild {
                 page: l.gpu,
                 clusters: &m.clusters,
-                cluster_base: p.stream.cluster_base + p.stream.pages[p.page as usize].first,
+                cluster_base: p.ids,
                 micromap: m.region,
                 step: header.step(),
                 truncate_bits: u32::from(header.clas_truncate_bits),

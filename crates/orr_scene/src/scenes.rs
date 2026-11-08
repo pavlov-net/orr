@@ -23,7 +23,7 @@ use crate::decals::{self, build_bins};
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
 use crate::medium_proxy::{ProxyBlas, VolumeRef};
-use crate::memory::{PreprocessArenas, RangeAllocator, UploadWindow};
+use crate::memory::{BestFit, PreprocessArenas, UploadWindow};
 use crate::mount::{
     Apply, ClipRef, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId,
     SkeletonRef, TableSizes,
@@ -87,8 +87,6 @@ pub struct Budgets {
     /// Cluster BLAS a scene builds in a frame for the cuts of copies near the focus; copies
     /// past it trace a cached cut.
     pub rt_cut_blas: u32,
-    /// Entries in the resident cluster table: every cluster of every resident mesh.
-    pub resident_clusters: u32,
     /// Triangles of edited clusters whose CLAS rebuild in one frame, at most; a first edit
     /// past it still rebuilds alone.
     pub edit_triangles: u32,
@@ -104,7 +102,9 @@ pub struct Budgets {
     /// Bytes of resident mesh pages and of the CLAS and micromaps streamed pages build, which
     /// count at an estimate from their triangles until a page's first load has built them.
     /// The CLAS pool's address range is as large, up to the 512 GiB its 32-bit unit indices
-    /// name, and bound in pages as they need.
+    /// name, and bound in pages as they need. The resident cluster table holds an entry per KiB
+    /// of it for the clusters of resident pages and of edits' own pages; a streamed page that
+    /// finds no room for its clusters loads later, and the budget shrinks.
     pub mesh_page_pool: u64,
     /// Bytes of pages a DAG mesh keeps resident from mount; the pages of a larger one past
     /// its pinned coarsest pages stream on the traversal's requests.
@@ -149,7 +149,6 @@ impl Default for Budgets {
             traversal_requests: 4096,
             rt_cut_clusters: 1 << 18,
             rt_cut_blas: 1024,
-            resident_clusters: 1 << 21,
             edit_triangles: 1 << 18,
             stream_clas_triangles: 1 << 18,
             micromap_pages: 64,
@@ -167,6 +166,10 @@ impl Default for Budgets {
         }
     }
 }
+
+/// Bytes of [`Budgets::mesh_page_pool`] per entry of the resident cluster table. Zorah's meshes
+/// hold 1,376 B of resident page per cluster, before a streamed page's CLAS.
+const CLUSTER_BYTES: u64 = 1024;
 
 /// Farther models a representation chain holds: the length of `ModelGpu::chain`.
 const MAX_CHAIN: usize = 3;
@@ -421,6 +424,8 @@ impl Scenes {
         assert!(desc.frames_in_flight >= 1, "frames_in_flight is at least 1");
         assert!(desc.cell_log2 <= 16, "cells of 2^{} m", desc.cell_log2);
         let b = &desc.budgets;
+        // Cluster ids are 32 bits.
+        let clusters = u32::try_from(b.mesh_page_pool / CLUSTER_BYTES).unwrap_or(u32::MAX);
         let accel = Arc::new(AccelShared {
             kernels: AccelKernels::new(device, desc.kernels)?,
             limits: AccelLimits {
@@ -428,8 +433,8 @@ impl Scenes {
                 micromaps: b.micromap_pages,
                 mesh_resident_max: b.mesh_resident_max,
             },
-            cluster_ids: Mutex::new(RangeAllocator::new(b.resident_clusters)),
-            cluster_capacity: b.resident_clusters,
+            cluster_ids: Mutex::new(BestFit::new(clusters)),
+            cluster_capacity: clusters,
         });
         let materials = MaterialTable::new(device, b.materials)?;
         let mounts = Mounts::new(

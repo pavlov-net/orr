@@ -21,7 +21,7 @@ use orr_gpu::{
 };
 use orr_pack::mesh::{Cluster, MeshHeader, Part, in_cut};
 
-use crate::memory::{RangeAllocator, UploadWindow};
+use crate::memory::{BestFit, UploadWindow};
 use crate::shaders::accel::{self, AccelRoot, AddressJob, ClasJob};
 use crate::{ClusterRef, PartGpu, Result, RtCutGpu};
 
@@ -149,7 +149,7 @@ pub(crate) struct MeshInput<'a> {
     /// Sections whose every triangle is non-opaque, with no micromap: linked coverage, dielectric
     /// and presence.
     pub(crate) non_opaque: &'a [bool],
-    /// Cluster id of mesh cluster 0.
+    /// The cluster id of mesh cluster 0; the rest of `clusters` take the ids that follow.
     pub(crate) cluster_base: u32,
     /// The mesh's part table.
     pub(crate) parts: &'a [Part],
@@ -295,12 +295,13 @@ pub(crate) struct MountAccel {
 }
 
 /// What mounts on the loading side share with the render thread: the kernels, the batch
-/// limits and the resident cluster ids, which the loading side takes and the render thread
-/// frees with their mount.
+/// limits and the resident cluster ids. A mount takes its pinned pages' ids on the loading
+/// side and the render thread frees them with the mount; the render thread takes a streamed
+/// page's when its load starts and frees them once it is evicted, and an edit's own pages'.
 pub(crate) struct AccelShared {
     pub(crate) kernels: AccelKernels,
     pub(crate) limits: AccelLimits,
-    pub(crate) cluster_ids: Mutex<RangeAllocator>,
+    pub(crate) cluster_ids: Mutex<BestFit>,
     pub(crate) cluster_capacity: u32,
 }
 

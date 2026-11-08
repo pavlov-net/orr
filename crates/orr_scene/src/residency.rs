@@ -157,6 +157,10 @@ pub struct ResidencyStats {
     /// CLAS pool batches since the start that needed more pages bound than the pool's
     /// address range had left.
     pub clas_range_full: u32,
+    /// Streamed mesh page loads since the start that the steps planning them held back for
+    /// want of a run of free entries in the resident cluster table; each loads again on
+    /// request.
+    pub cluster_ids_full: u32,
     /// Raises of a texture cell's wanted mip in the latest texture feedback past its record
     /// capacity: their requests are lost for that frame.
     pub texture_feedback_lost: u32,
@@ -257,6 +261,15 @@ impl Unit {
     fn held(&self) -> u64 {
         self.bytes + self.built
     }
+}
+
+/// Why a step takes back a load its plan started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// It waits for a tile's unbind, or on a dependency taken back.
+    Waiting,
+    /// A streamed mesh page whose clusters find no run of free resident cluster ids.
+    ClusterIds,
 }
 
 /// What one step decided.
@@ -372,9 +385,9 @@ impl Residency {
         self.stats.out_of_memory += 1;
     }
 
-    /// A build of class `class` ran out of the address range its class's units share (the
-    /// CLAS pool's, for mesh pages) under the class's budget: the next `react` shrinks that
-    /// budget alone.
+    /// A load of class `class` ran out of a range its class's units share (for mesh pages the
+    /// CLAS pool's address range and the resident cluster table) under the class's budget: the
+    /// next `react` shrinks that budget alone.
     pub(crate) fn range_full(&mut self, class: ResidencyClass) {
         self.range_full[class as usize] = true;
         self.stats.out_of_memory += 1;
@@ -579,41 +592,54 @@ impl Residency {
         self.unit(k).is_some_and(|u| u.state == State::Resident)
     }
 
-    /// Takes back the loads of this step's plan, `loads` in plan order, that `waits` holds
-    /// back for their tile's unbind, and those depending on one of them, as
-    /// [`Residency::cancel`] does; returns the rest in order.
-    pub(crate) fn cancel_waiting(
+    /// Takes back the loads of this step's plan, `loads` in plan order, that `held` holds
+    /// back, and those depending on one taken back, as [`Residency::cancel`] does; returns
+    /// the rest in order. `held` sees, in order, each load none of whose dependencies went
+    /// back. A load held for cluster ids shrinks its class's budget at the next `react`.
+    pub(crate) fn cancel_held(
         &mut self,
         loads: Vec<Key>,
-        waits: impl Fn(Key) -> bool,
+        mut held: impl FnMut(Key) -> Option<Held>,
     ) -> Vec<Key> {
         let mut canceled = FxHashSet::default();
         let mut kept = Vec::with_capacity(loads.len());
+        let mut full = None;
         for k in loads {
             let u = self.unit(k).expect("a planned unit");
-            let blocked = waits(k)
-                || u.deps.iter().any(|&unit| {
-                    canceled.contains(&Key {
-                        mount: k.mount,
-                        unit,
-                    })
-                });
-            if blocked {
-                self.cancel(k);
-                canceled.insert(k);
-            } else {
-                kept.push(k);
+            let class = u.class;
+            let after = u.deps.iter().any(|&unit| {
+                canceled.contains(&Key {
+                    mount: k.mount,
+                    unit,
+                })
+            });
+            let reason = if after { Some(Held::Waiting) } else { held(k) };
+            match reason {
+                Some(r) => {
+                    self.cancel(k, r);
+                    canceled.insert(k);
+                    if r == Held::ClusterIds {
+                        full = Some(class);
+                    }
+                }
+                None => kept.push(k),
             }
+        }
+        if let Some(class) = full {
+            self.range_full(class);
         }
         kept
     }
 
     /// Takes back the load of `k` this step's plan started: absent again, its bytes released,
-    /// and counted as waiting instead of loaded.
-    fn cancel(&mut self, k: Key) {
+    /// and counted for why instead of loaded.
+    fn cancel(&mut self, k: Key, why: Held) {
         self.release_load(k);
         self.stats.loads -= 1;
-        self.stats.waiting += 1;
+        match why {
+            Held::Waiting => self.stats.waiting += 1,
+            Held::ClusterIds => self.stats.cluster_ids_full += 1,
+        }
     }
 
     /// Takes back the load of `k` an earlier step started, which landed unusable: absent
@@ -1254,7 +1280,7 @@ mod tests {
         r.request(key(1), P, S);
         let plan = r.plan(1);
         assert_eq!(plan.loads, vec![key(0), key(1)]);
-        r.cancel(key(1));
+        r.cancel(key(1), Held::Waiting);
         assert_eq!((r.stats().loads, r.stats().waiting), (1, 1));
         assert_eq!(class(&r).loading_bytes, 100);
         assert!(r.landed(key(0), true, 1));
@@ -1280,7 +1306,8 @@ mod tests {
         assert_eq!(plan.loads, [key(0), key(1), key(2)]);
         assert_eq!(r.stats().waiting, 0);
         // Its dependency waiting on an unbind, neither dependent may load without it.
-        assert_eq!(r.cancel_waiting(plan.loads, |k| k == key(0)), []);
+        let held = |k| (k == key(0)).then_some(Held::Waiting);
+        assert_eq!(r.cancel_held(plan.loads, held), []);
         assert_eq!((r.stats().loads, r.stats().waiting), (0, 3));
         assert_eq!(class(&r).loading_bytes, 0);
         assert_eq!(step(&mut r, &[1, 2], 2).loads, [key(0), key(1), key(2)]);

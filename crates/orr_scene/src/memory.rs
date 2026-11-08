@@ -2,6 +2,7 @@
 //! frames' preprocess memory.
 
 use std::alloc::Layout;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
@@ -14,6 +15,68 @@ use orr_gpu::{
 use crate::Result;
 
 pub use orr_io::RangeAllocator;
+
+/// Ranges of indices handed out best fit: the shortest free run that holds a request, the
+/// lowest of those, so runs freed and taken in any order cost a search of the runs by length.
+pub(crate) struct BestFit {
+    /// Free runs by start: start -> end.
+    free: BTreeMap<u32, u32>,
+    /// The same runs by length, then start.
+    by_len: BTreeSet<(u32, u32)>,
+}
+
+impl BestFit {
+    pub(crate) fn new(capacity: u32) -> Self {
+        let mut s = Self {
+            free: BTreeMap::new(),
+            by_len: BTreeSet::new(),
+        };
+        if capacity > 0 {
+            s.insert(0, capacity);
+        }
+        s
+    }
+
+    fn insert(&mut self, start: u32, end: u32) {
+        self.free.insert(start, end);
+        self.by_len.insert((end - start, start));
+    }
+
+    fn remove(&mut self, start: u32, end: u32) {
+        self.free.remove(&start);
+        self.by_len.remove(&(end - start, start));
+    }
+
+    /// The start of `count` free indices, or `None` when no free run is that long.
+    pub(crate) fn alloc(&mut self, count: u32) -> Option<u32> {
+        let &(len, start) = self.by_len.range((count, 0)..).next()?;
+        self.remove(start, start + len);
+        if len > count {
+            self.insert(start + count, start + len);
+        }
+        Some(start)
+    }
+
+    /// Returns `start..start + count` to the free runs.
+    pub(crate) fn free(&mut self, start: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let (mut s, mut e) = (start, start + count);
+        if let Some((&ps, &pe)) = self.free.range(..s).next_back() {
+            debug_assert!(pe <= s, "range {start}+{count} freed twice");
+            if pe == s {
+                self.remove(ps, pe);
+                s = ps;
+            }
+        }
+        if let Some(&ne) = self.free.get(&e) {
+            self.remove(e, ne);
+            e = ne;
+        }
+        self.insert(s, e);
+    }
+}
 
 /// Memory loading jobs write into: mapped Upload or Staging memory, a range of the read arena
 /// the device imports, or DeviceLocal memory (no mapped address) that a copy fills from
@@ -453,5 +516,30 @@ impl PreprocessArenas {
         }
         self.outgrown.clear();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BestFit;
+
+    #[test]
+    fn best_fit_takes_the_shortest_run_that_holds_a_request_and_frees_merge() {
+        let mut a = BestFit::new(100);
+        let taken = [10, 20, 5, 30].map(|n| a.alloc(n).unwrap());
+        assert_eq!(taken, [0, 10, 30, 35]);
+        a.free(0, 10);
+        a.free(30, 5);
+        // Free runs of 10 at 0, 5 at 30 and 35 at 65.
+        assert_eq!(a.alloc(4), Some(30), "the 5-run");
+        assert_eq!(a.alloc(8), Some(0), "the 10-run, not the 35-run");
+        assert_eq!(a.alloc(30), Some(65));
+        assert_eq!(a.alloc(6), None);
+        a.free(10, 20);
+        a.free(65, 30);
+        a.free(0, 8);
+        a.free(35, 30);
+        a.free(30, 4);
+        assert_eq!(a.alloc(100), Some(0), "every run merged back");
     }
 }

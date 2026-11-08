@@ -1772,7 +1772,7 @@ fn build_accel(
         }
     }
     for m in &mut r.meshes {
-        let n = m.gpu.cluster_count;
+        let n = m.clusters.len() as u32;
         let base = shared
             .cluster_ids
             .lock()
@@ -2228,7 +2228,7 @@ type ResolvedTables = (
 /// stream, each after the coarser tile covering it, and instance pages' records stream.
 fn units(
     meshes: &[ResolvedMesh],
-    tables: &[GpuPtr<u64>],
+    tables: &[(GpuPtr<u64>, GpuPtr<u32>)],
     clusters: GpuPtr<ClusterRef>,
     textures: &[PlacedTexture],
     pages: &[(PageId, &PlacedPage)],
@@ -2240,7 +2240,7 @@ fn units(
     let mut mesh_pages = Vec::with_capacity(meshes.len());
     let mut mesh_streams = Vec::new();
     let mut fine = Vec::new();
-    for (mesh, (m, table)) in (0u32..).zip(meshes.iter().zip(tables)) {
+    for (mesh, (m, &(table, bases))) in (0u32..).zip(meshes.iter().zip(tables)) {
         let base = units.len() as u32;
         let mut mesh_streamed = Vec::new();
         let stream = m.streamed.as_ref().map(|pages| {
@@ -2248,9 +2248,9 @@ fn units(
                 entry: m.entry,
                 header: m.header,
                 pages: pages.clone(),
-                table: *table,
-                clusters: clusters.offset(u64::from(m.cluster_base)),
-                cluster_base: m.cluster_base,
+                table,
+                bases,
+                clusters,
                 non_opaque: m.non_opaque.clone(),
                 mesh,
                 pinned: m.header.pinned_pages,
@@ -3502,14 +3502,11 @@ impl Mounts {
                 .ok_or_else(|| capacity("mesh page table", self.sizes.page_table))?;
             res.page_ranges.push((start, n));
             let table = self.page_table.gpu().offset(u64::from(start));
-            tables.push(table);
             w.put(table, &m.page_addresses)?;
             let bases = self.page_bases.gpu().offset(u64::from(start));
-            let firsts: Vec<u32> = m
-                .all_pages
-                .iter()
-                .map(|p| m.cluster_base + p.first)
-                .collect();
+            tables.push((table, bases));
+            let pinned = &m.all_pages[..m.gpu.pinned_pages as usize];
+            let firsts: Vec<u32> = pinned.iter().map(|p| m.cluster_base + p.first).collect();
             w.put(bases, &firsts)?;
             let gpu = MeshGpu {
                 pages: table,
