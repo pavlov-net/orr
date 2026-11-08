@@ -6,9 +6,8 @@
 // vertices gather what was deposited around them by their diffuse albedo.
 //
 // Real time keeps one grid per scene: cells on the world cache's absolute voxel keys, finer
-// (levels of 2^(base_cell_log2 + j) m by distance to the focus, from the coarsest of them whose
-// cells the frame's photons are expected to fill to CAUSTIC_MIN_PHOTONS), each normal bucket its
-// own cell. A bucket's cell is the voxel column across its axis together with the voxel of where
+// (levels of 2^(base_cell_log2 + j) m by distance to the focus, from a finest level that grows
+// coarser while the grid runs full), each normal bucket its own cell. A bucket's cell is the voxel column across its axis together with the voxel of where
 // the receiver's tangent plane crosses the column's center line, so a flat receiver's whole
 // piece in a column, the column's face area over the cosine of its normal to the axis, is one
 // cell. A cell sums the frame's photon flux in 64-bit fixed point, two words per channel that
@@ -54,6 +53,11 @@ public static const float CAUSTIC_QUANTA = 65536.0;
 // Photons a level's cell takes per frame, as its running mean, before a read prefers it over
 // the next coarser level.
 public static const float CAUSTIC_MIN_PHOTONS = 4.0;
+
+// Shares of the grid's cells occupied above which the finest level grows coarser, and below which
+// it grows finer again.
+public static const float CAUSTIC_LOAD_HIGH = 0.5;
+public static const float CAUSTIC_LOAD_LOW = 0.08;
 
 // Where the second normal bucket starts to share a read: the ratio of the normal's second
 // largest axis component to its largest.
@@ -108,10 +112,9 @@ public struct PhotonSourceGpu
     public EyeInterior* interiors;
     public uint entry_count;
     public float total;             // the last value of `cdf`
-    // The grid's finest level this frame, and in `floor_level` the continuous level whose cells
-    // expect CAUSTIC_MIN_PHOTONS.
+    // The grid's finest level this frame, and the frames it has held.
     public uint finest;
-    public float floor_level;
+    public uint held;
 }
 
 // A reference photon: where it deposited, the receiver's geometric normal on its side, its flux

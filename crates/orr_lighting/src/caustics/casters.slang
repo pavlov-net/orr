@@ -38,14 +38,19 @@ struct Root
     // The producer entries' caster lists' CDFs.
     uint* pool;
     EyeInterior* interiors;
-    uint64_t _pad1;
+    // The grid's counters (`caustics`' CAUSTIC_*), as the last frame's resolve left them.
+    uint* counters;
     // The focus in render space, and in w the m over which an entry's weight falls with the
     // square of its distance from the focus.
     float4 focus;
     uint pool_capacity;
     uint clear;                     // 1: forget the yields, the last photons' counts and level
-    uint photons;                   // photons the frame starts
+    uint capacity;                  // the grid's cells
     int base_cell_log2;             // the grid's level 0, as for `CausticsGpu`
+    uint cell_lifetime;             // frames without a deposit before a cell is evicted
+    uint _pad0;
+    uint _pad2;
+    uint _pad3;
 }
 ORR_ROOT(Root);
 
@@ -272,11 +277,10 @@ EmissiveSelection instance_casters(SceneRoot* s, uint e, MeshGpu* mesh)
     return sel;
 }
 
-// Weight of entry `i` this frame and its casters' render-space area, and its caster list, which
-// instance entries write here.
-float entry_weight(SceneRoot* s, uint i, out float area)
+// Weight of entry `i` this frame and its caster list, which instance entries write here.
+float entry_weight(SceneRoot* s, uint i)
 {
-    area = 0.0;
+    float area = 0.0;
     float3 center = root.focus.xyz;
     if (i < s.producer_capacity)
     {
@@ -322,13 +326,10 @@ void weigh(uint lane: SV_GroupIndex)
     SceneRoot* s = root.scene;
     uint n = s.producer_capacity + s.emissive_capacity;
     float carry = 0.0;
-    // Sums w^2 x yield / area over the entries.
-    float spread = 0.0;
     for (uint base = 0; base < n; base += GROUP)
     {
         uint i = base + lane;
         float w = 0.0;
-        float spread_w = 0.0;
         if (i < n)
         {
             // A clear follows new buffers, whose counts hold nothing yet.
@@ -340,20 +341,15 @@ void weigh(uint lane: SV_GroupIndex)
             root.yields[i] = y;
             root.started[i] = 0;
             root.deposited[i] = 0;
-            float area;
-            w = entry_weight(s, i, area) * (y + YIELD_FLOOR);
+            w = entry_weight(s, i) * (y + YIELD_FLOOR);
             if (!isfinite(w))
                 w = 0.0;
-            spread_w = w > 0.0 && area > 0.0 ? w * w * y / area : 0.0;
         }
         float chunk;
         float cdf = carry + scan_float(lane, GROUP, w, chunk);
         if (i < n)
             root.cdf[i] = cdf;
         carry += chunk;
-        float spread_chunk;
-        scan_float(lane, GROUP, spread_w, spread_chunk);
-        spread += spread_chunk;
     }
     if (lane != 0)
         return;
@@ -367,20 +363,28 @@ void weigh(uint lane: SV_GroupIndex)
     p.entry_count = n;
     p.total = carry;
 
-    // The grid's finest level: one whose cells, 2^(base_cell_log2 + l) m wide, expect
-    // CAUSTIC_MIN_PHOTONS deposits near the focus. An entry's photons fall on its casters alike,
-    // a share of them deposits by its yield, and they land on about as much receiver area, so
-    // the photons' mean density there is photons x sum(w^2 x yield / area) / total^2 per m^2.
-    // Half a level of hysteresis keeps a scene near a boundary on one level set, since the cells
-    // of a level it comes back to start with no history.
-    float density = carry > 0.0 ? float(root.photons) * spread / (carry * carry) : 0.0;
-    float level = density > 0.0 ? 0.5 * log2(CAUSTIC_MIN_PHOTONS / density) - float(root.base_cell_log2) : 0.0;
-    if (!isfinite(level))
-        level = 0.0;
-    float top = float(clamp(s.origin_cell.w - root.base_cell_log2, 0, int(CACHE_MAX_LEVEL)));
-    float last = root.clear != 0 ? ceil(level) : float(p.finest);
-    p.finest = uint(clamp(last, clamp(ceil(level - 0.5), 0.0, top), clamp(ceil(level + 0.5), 0.0, top)));
-    p.floor_level = level;
+    // The grid's finest level: one coarser while the last resolve left more than
+    // CAUSTIC_LOAD_HIGH of the grid occupied, one finer below CAUSTIC_LOAD_LOW, so that casters
+    // too wide for the grid give up their finest cells rather than overflow it. A level changes
+    // the load by about 4, which the band spans with room to spare; cells of the level left stay
+    // occupied until they are evicted, so a level holds for longer than a cell lives before it
+    // moves again.
+    uint top = uint(clamp(s.origin_cell.w - root.base_cell_log2, 0, int(CACHE_MAX_LEVEL)));
+    uint finest = 0;
+    uint held = 0;
+    if (root.clear == 0)
+    {
+        float load = float(root.counters[CAUSTIC_OCCUPIED]) / float(root.capacity);
+        finest = p.finest;
+        held = p.held + 1;
+        if (held > root.cell_lifetime && ((load > CAUSTIC_LOAD_HIGH && finest < top) || (load < CAUSTIC_LOAD_LOW && finest > 0)))
+        {
+            finest = load > CAUSTIC_LOAD_HIGH ? finest + 1 : finest - 1;
+            held = 0;
+        }
+    }
+    p.finest = min(finest, top);
+    p.held = held;
 }
 
 // A point on light `id` (a feedback id) to walk out from, and the way out: a sphere or rect

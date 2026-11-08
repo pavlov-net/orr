@@ -35,9 +35,8 @@ pub const MAX_PHOTONS: u32 = 4096 * 65535;
 /// surfaces (smooth dielectrics and metals the cook ranks as casters, and producer clusters of
 /// casting materials), deposited in a hash grid of 2^`capacity_log2` cells of 48 B on voxels
 /// whose edge doubles with each level, from 2^`base_cell_log2` m within `lod_scale` m of the
-/// scene focus. Casters too wide for the photons to fill cells that fine start the levels
-/// coarser ([`CausticStats::finest`]). Each cell keeps a running mean of the frames'
-/// irradiance.
+/// scene focus; while the grid runs full the levels start coarser ([`CausticStats::finest`]).
+/// Each cell keeps a running mean of the frames' irradiance.
 ///
 /// Through [`crate::SceneLighting::set_settings`], `photons`, `max_temporal_samples`,
 /// `cell_lifetime` and `jitter` take effect at the next frame and keep the grid. A new
@@ -99,7 +98,8 @@ pub struct CausticStats {
     /// Flux per fixed-point step of the frame's deposits.
     pub quantum: f32,
     /// The finest level the frame's reads and deposits took, whatever level a point's distance
-    /// gives it: the finest whose cells the photons expected near the focus fill.
+    /// gives it: one coarser while more than half the grid is occupied, one finer again below
+    /// 8%, each move held for longer than a cell's lifetime.
     pub finest: u32,
 }
 
@@ -352,12 +352,16 @@ impl Caustics {
                 areas: self.b.areas.gpu(),
                 pool: self.b.pool.gpu(),
                 interiors: self.b.interiors.gpu(),
-                _pad1: 0,
                 focus: [focus[0], focus[1], focus[2], s.lod_scale],
                 pool_capacity: s.producer_clusters,
                 clear: u32::from(clear),
-                photons: s.photons,
+                counters: self.b.counters.gpu(),
+                capacity: capacity as u32,
                 base_cell_log2: s.base_cell_log2,
+                cell_lifetime: s.cell_lifetime,
+                _pad0: 0,
+                _pad2: 0,
+                _pad3: 0,
             },
         );
         let grid = self.resolve_roots.write(
