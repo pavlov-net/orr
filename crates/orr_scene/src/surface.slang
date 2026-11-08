@@ -111,8 +111,8 @@ UvFootprint finest_footprint(UvFootprint f)
     return f;
 }
 
-// The slot `material_opacity` and `blend_decal` read opacity from: the opacity slot where it
-// is bound, else the base color slot, whose alpha they read.
+// The slot `material_opacity`, `blend_decal` and `material_coverage_feedback` read opacity
+// from: the opacity slot where it is bound, else the base color slot, whose alpha they read.
 uint opacity_slot(MaterialGpu* m)
 {
     return material_bound(m, TEXTURE_OPACITY) ? TEXTURE_OPACITY : TEXTURE_BASE_COLOR;
@@ -129,7 +129,7 @@ public float material_opacity(SurfaceInput i)
     UvFootprint finest[2] = { finest_footprint(i.uv[0]), finest_footprint(i.uv[1]) };
     float opacity = m.geometry_opacity * surface_vertex(i, m, TEXTURE_OPACITY).x;
     // One read of whichever slot holds the opacity.
-    uint slot = material_bound(m, TEXTURE_OPACITY) ? TEXTURE_OPACITY : TEXTURE_BASE_COLOR;
+    uint slot = opacity_slot(m);
     if (material_bound(m, slot))
     {
         float4 texel = material_texture(m, slot, finest, float4(1.0));
