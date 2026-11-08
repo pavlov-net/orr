@@ -100,8 +100,8 @@ pub(crate) fn wait_any(events: &[&Event]) {
 pub(crate) struct OsRing {
     ring: IoUring,
     event: Arc<Event>,
-    /// Whether the arena is registered.
-    buffers: bool,
+    /// The pieces of the arena registered, from its start.
+    registered: u32,
     /// The descriptor in each entry of the registered file table, -1 for none, until an
     /// update fails and reads name their files by descriptor.
     files: Option<Vec<RawFd>>,
@@ -127,10 +127,18 @@ impl OsRing {
             })
             .collect();
         // Registered buffers count against the user's RLIMIT_MEMLOCK unless the process has
-        // CAP_IPC_LOCK, and the limit is often a few MiB; the kernel takes buffers of at most
-        // 1 GiB, which the pieces are. Reads name unregistered buffers by address.
-        // SAFETY: the arena stays mapped while the ring lives, as its owner holds it.
-        let buffers = unsafe { ring.submitter().register_buffers(&iovecs) }.is_ok();
+        // CAP_IPC_LOCK, and the limit is often a few MiB. Halving the pieces until the kernel
+        // takes them registers the arena's start, where first-fit keeps the ranges in use.
+        // Reads name unregistered buffers by address.
+        let register = |pieces: &[libc::iovec]| {
+            // SAFETY: the arena stays mapped while the ring lives, as its owner holds it.
+            unsafe { ring.submitter().register_buffers(pieces) }.is_ok()
+        };
+        let mut registered = iovecs.len();
+        while registered > 0 && !register(&iovecs[..registered]) {
+            registered /= 2;
+        }
+        let registered = registered as u32;
         // Kernels before 5.5 refuse a table of empty entries; reads there name their files by
         // descriptor.
         let files = ring
@@ -141,7 +149,7 @@ impl OsRing {
         Some(Self {
             ring,
             event,
-            buffers,
+            registered,
             files,
         })
     }
@@ -182,7 +190,9 @@ impl OsRing {
         let (address, len) = f.chunk();
         let fd = f.read.file.handle.as_raw_fd();
         let fixed = self.files.is_some().then_some(types::Fixed(f.file as u32));
-        let buffer = arena.index(address, len as usize).filter(|_| self.buffers);
+        let buffer = arena
+            .index(address, len as usize)
+            .filter(|&(piece, _)| piece < self.registered);
         let sqe = match (fixed, buffer) {
             (Some(file), Some((index, _))) => {
                 opcode::ReadFixed::new(file, address, len, index as u16)
@@ -206,8 +216,8 @@ impl OsRing {
         Ok(())
     }
 
-    pub(crate) fn registered_buffers(&self) -> bool {
-        self.buffers
+    pub(crate) fn registered_pieces(&self) -> usize {
+        self.registered as usize
     }
 
     /// Never: the queue holds an entry for every slot, and registrations do not use it.

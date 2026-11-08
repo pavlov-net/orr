@@ -129,10 +129,13 @@ pub(crate) struct Arena {
     free: Mutex<RangeAllocator>,
 }
 
-/// The most bytes of one registered piece of the arena: io_uring takes at most 1 GiB per
-/// buffer.
-#[cfg(any(windows, target_os = "linux"))]
+/// The most bytes of one registered piece of the arena. io_uring takes at most 1 GiB per
+/// buffer and counts them against the memory lock limit, so on Linux the pieces are small
+/// enough that a limit of a few of them registers a prefix of the arena.
+#[cfg(windows)]
 const PIECE: usize = 1 << 30;
+#[cfg(target_os = "linux")]
+const PIECE: usize = 16 << 20;
 
 impl Arena {
     fn take(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {

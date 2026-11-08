@@ -588,12 +588,8 @@ pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
     );
     match &ring {
         Some(r) => log::info!(
-            "archive reads on the system's ring into {arena}, {}",
-            if r.registered_buffers() {
-                "registered"
-            } else {
-                "by address"
-            }
+            "archive reads on the system's ring into {arena}, {} bytes of it registered",
+            r.registered_bytes()
         ),
         None => log::info!("archive reads on workers into {arena}"),
     }

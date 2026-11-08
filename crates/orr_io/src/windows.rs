@@ -452,9 +452,9 @@ impl OsRing {
         Ok(())
     }
 
-    /// Always: a ring that cannot register the buffers is not made.
-    pub(crate) fn registered_buffers(&self) -> bool {
-        true
+    /// Every piece: a ring that cannot register the arena is not made.
+    pub(crate) fn registered_pieces(&self) -> usize {
+        usize::MAX
     }
 
     /// Whether the last submit failed, leaving entries in the queue.

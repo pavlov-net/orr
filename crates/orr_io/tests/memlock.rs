@@ -6,7 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use orr_io::{RING_DEPTH, Read, ReadBuffers, ReadFile, Ring, SECTOR, Wake};
+use orr_io::{Read, ReadBuffers, ReadFile, Ring, SECTOR, Wake};
 
 fn bytes(len: usize) -> Vec<u8> {
     let mut x = 0x2545_f491_4f6c_dd1d_u64;
@@ -63,7 +63,8 @@ fn a_ring_reads_into_registered_buffers_and_by_address_past_the_memory_lock_limi
     let data = bytes(40 * SECTOR + 77);
     fs::write(&p, &data).unwrap();
     let file = Arc::new(ReadFile::open(&p).unwrap());
-    let buffers = ReadBuffers::new(RING_DEPTH * SECTOR).unwrap();
+    // Three of the 16 MiB pieces Linux registers, so a limit between them registers a prefix.
+    let buffers = ReadBuffers::new(48 << 20).unwrap();
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -78,10 +79,17 @@ fn a_ring_reads_into_registered_buffers_and_by_address_past_the_memory_lock_limi
         }
         return;
     };
-    // The limit counts every process of the user, so only one well above the buffers is sure
-    // to take them.
-    if limit.rlim_cur >= 8 * buffers.bytes() as u64 {
-        assert!(ring.registered_buffers(), "registered under {limit:?}");
+    // The limit counts every process of the user, so one of a piece or more may still take
+    // none; reads stay in the registered prefix, where the arena's first ranges are.
+    let registered = ring.registered_bytes();
+    if limit.rlim_cur >= 16 << 20 {
+        assert!(registered > 0, "nothing registered under {limit:?}");
+    }
+    if limit.rlim_cur < buffers.bytes() as u64 && !locks_past_the_limit() {
+        assert!(
+            registered < buffers.bytes(),
+            "all registered under {limit:?}"
+        );
     }
     reads_match(ring, &file, &data);
 
@@ -98,7 +106,7 @@ fn a_ring_reads_into_registered_buffers_and_by_address_past_the_memory_lock_limi
         return;
     };
     if !locks_past_the_limit() {
-        assert!(!ring.registered_buffers(), "registered past the limit");
+        assert_eq!(ring.registered_bytes(), 0, "registered past the limit");
     }
     reads_match(ring, &file, &data);
 }

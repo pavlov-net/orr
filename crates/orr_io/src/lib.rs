@@ -411,15 +411,26 @@ impl Ring {
         }
     }
 
-    /// Whether the system has the arena of its buffers registered, so that reads into it skip
-    /// mapping their buffers; reads name the others by address. Linux refuses a registration
-    /// past the memory lock limit.
-    pub fn registered_buffers(&self) -> bool {
+    /// Bytes from the start of its buffers' arena that the system has registered, so that
+    /// reads into them skip mapping their buffers; reads name the others by address. Linux
+    /// registers no more than the memory lock limit allows.
+    pub fn registered_bytes(&self) -> usize {
         match &self.backend {
             #[cfg(any(windows, target_os = "linux"))]
-            Backend::Native(r) => r.ring.registered_buffers(),
-            Backend::Positioned(..) => false,
+            Backend::Native(r) => r
+                .buffers
+                .0
+                .pieces()
+                .take(r.ring.registered_pieces())
+                .map(|(_, len)| len)
+                .sum(),
+            Backend::Positioned(..) => 0,
         }
+    }
+
+    /// Whether the system has any of its buffers' arena registered.
+    pub fn registered_buffers(&self) -> bool {
+        self.registered_bytes() > 0
     }
 
     /// Whether reads are queued or in flight.
