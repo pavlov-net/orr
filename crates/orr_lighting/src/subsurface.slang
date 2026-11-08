@@ -11,6 +11,7 @@
 module subsurface;
 
 import orr_shaders.abi;
+import orr_shaders.math;
 import orr_shaders.random;
 import orr_shaders.trace;
 import orr_scene.hit;
@@ -181,7 +182,9 @@ public Walk walk_start(float3 origin, float3 dir, SubsurfaceVolume volume, float
 
 // Runs up to `steps` more steps of running walk `e`, at most `max_steps` in all, each traced
 // through `tracer`, and counts its queries in `rays`. A walk stopped at `max_steps` keeps
-// `table`'s share of its throughput if `share`, else its throughput as it is.
+// `table`'s share of its throughput if `share`, else its throughput as it is. Without `share`, a
+// walk goes on past each scatter with the probability of its throughput's largest channel,
+// divided by it, so its steps end by absorption unbiased rather than at the cap.
 public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, SubsurfaceTableGpu* table, uint max_steps, bool share, inout uint rays)
 {
     float3 sigma = max(e.volume.extinction, float3(1e-30));
@@ -234,6 +237,17 @@ public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, Subsu
         e.throughput *= e.volume.albedo * sigma * a / dot(choose, sigma * a);
         e.origin += e.dir * t;
         e.dir = sample_hg(e.volume.anisotropy, e.dir, u.zw);
+        if (!share)
+        {
+            float q = min(1.0, max_component(e.throughput));
+            if (!(e.rng.next() < q))
+            {
+                e.kind = WALK_NONE;
+                e.throughput = float3(0.0);
+                return;
+            }
+            e.throughput /= q;
+        }
     }
     if (e.step == max_steps)
     {

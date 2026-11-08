@@ -55,8 +55,8 @@ pub struct ViewLighting {
     pub dispersion: bool,
     /// Steps of a walk through a subsurface material or a dense dielectric interior before it
     /// stops and keeps the share it would yet carry out, clamped to
-    /// [`SSS_STEPS`](crate::SSS_STEPS). The reference walks the most steps and ends a path
-    /// whose walk reaches them, counting it in
+    /// [`SSS_STEPS`](crate::SSS_STEPS). The reference walks up to 65,536 steps, past what the
+    /// subsurface table covers, and ends a path whose walk reaches them, counting it in
     /// [`LightingStats::capped_walks`](crate::LightingStats::capped_walks).
     pub sss_max_steps: u32,
     /// Which subsurface vertices of a path walk; under the reference, every one.
@@ -268,6 +268,11 @@ const CACHE_TERMINATE: u32 = 1;
 
 /// The layer vertices a reference path takes at least: a ray through a solid can take many.
 const REFERENCE_DIELECTRIC_DEPTH: u32 = 64;
+
+/// The steps a reference walk takes at most. The reference ends a path whose walk reaches them
+/// instead of keeping the subsurface table's share, and its walks end by Russian roulette on
+/// their throughput, so only a medium that absorbs nothing walks this far.
+const REFERENCE_SSS_STEPS: u32 = 1 << 16;
 
 /// The layer vertices `lighting`'s paths and dielectric guides take.
 fn dielectric_depth(lighting: &ViewLighting) -> u32 {
@@ -1401,7 +1406,7 @@ impl LightingKernels {
             camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
             dielectric_flags: flags,
             sss_max_steps: if reference {
-                *SSS_STEPS.end()
+                REFERENCE_SSS_STEPS
             } else {
                 lighting
                     .sss_max_steps
