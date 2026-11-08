@@ -62,8 +62,9 @@ fn close3(got: [f32; 3], expected: DVec3, what: &str) {
     }
 }
 
-/// A mesh of two sections, wavy so its clusters differ.
-fn sheet(n: u32) -> MeshInput {
+/// A mesh of `n` by `n` quads in two sections, the first the quads of its first `block.0`
+/// columns and `block.1` rows, wavy so its clusters differ.
+fn sheet(n: u32, block: (u32, u32)) -> MeshInput {
     let mut m = MeshInput::default();
     for j in 0..=n {
         for i in 0..=n {
@@ -74,10 +75,10 @@ fn sheet(n: u32) -> MeshInput {
     }
     m.uvs = Some(vec![Vec2::ZERO; m.positions.len()]);
     let w = n + 1;
-    for half in 0..2 {
+    for inside in [true, false] {
         let first = m.indices.len() as u32;
-        for j in n * half / 2..n * (half + 1) / 2 {
-            for i in 0..n {
+        for j in 0..n {
+            for i in (0..n).filter(|&i| (i < block.0 && j < block.1) == inside) {
                 let c = j * w + i;
                 m.indices.extend([c, c + w, c + 1, c + 1, c + w, c + w + 1]);
             }
@@ -108,11 +109,11 @@ fn pack_of(assets: Vec<AssetSpec>) -> Arc<[u8]> {
         .remove(0)
 }
 
-fn sheet_asset(name: &str, n: u32, materials: Vec<Material>, lod: LodMode) -> AssetSpec {
+fn sheet_asset(name: &str, mesh: MeshInput, materials: Vec<Material>, lod: LodMode) -> AssetSpec {
     AssetSpec {
         name: name.into(),
         source: Source::Mesh {
-            mesh: sheet(n),
+            mesh,
             materials,
             settings: MeshSettings {
                 lod,
@@ -132,10 +133,15 @@ fn lamp_materials() -> Vec<Material> {
 /// A model `lamp` of two emissive sections, and `plain` of none.
 fn pack() -> Arc<[u8]> {
     pack_of(vec![
-        sheet_asset("lamp", 24, lamp_materials(), LodMode::default()),
+        sheet_asset(
+            "lamp",
+            sheet(24, (24, 12)),
+            lamp_materials(),
+            LodMode::default(),
+        ),
         sheet_asset(
             "plain",
-            24,
+            sheet(24, (24, 12)),
             vec![Material::default(), Material::default()],
             LodMode::default(),
         ),
@@ -345,7 +351,7 @@ fn an_edit_of_a_dag_mesh_takes_the_sets_of_level_0() {
     let d = device();
     let bytes = pack_of(vec![sheet_asset(
         "lamp",
-        64,
+        sheet(64, (64, 32)),
         lamp_materials(),
         LodMode::Dag,
     )]);
@@ -432,7 +438,7 @@ fn a_copy_takes_the_sets_of_the_cached_cut_it_traces() {
     }
     let bytes = pack_of(vec![sheet_asset(
         "lamp",
-        64,
+        sheet(64, (64, 32)),
         lamp_materials(),
         LodMode::Dag,
     )]);
@@ -745,9 +751,11 @@ fn producer_power_follows_emitted_clusters_every_frame() {
 const GATHERED_SET: u32 = 0xffff_fffe;
 const GATHERED_CLUSTERS: u32 = 16;
 
-/// Mounts `bytes` on new scenes with one scene of `emissive_capacity` instance entries.
-fn mounted(bytes: Arc<[u8]>, emissive_capacity: u32) -> (Scenes, SceneId, MountId) {
+/// Mounts `bytes` on new scenes with one scene of `emissive_capacity` instance entries, and the
+/// workers that load it.
+fn mounted(bytes: Arc<[u8]>, emissive_capacity: u32) -> (Scenes, SceneId, MountId, Workers) {
     let mut scenes = Scenes::new(device(), &RendererDesc::default()).unwrap();
+    let workers = Workers::start(&scenes, 2);
     let s = scenes
         .create_scene(&SceneDesc {
             emissive_capacity,
@@ -760,7 +768,7 @@ fn mounted(bytes: Arc<[u8]>, emissive_capacity: u32) -> (Scenes, SceneId, MountI
         f.end(&[]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    (scenes, s, m)
+    (scenes, s, m, workers)
 }
 
 /// One copy of `model` at `transform`, traced, around a focus at the origin.
@@ -824,7 +832,10 @@ fn run_frame(
 /// A copy of a DAG mesh whose sets hold no tree gathers its cut, fine near the focus and coarse
 /// far from it; where the cut it traces is one built that frame, each entry samples the list
 /// its traversal gathered: the traced clusters of its section, at most `GATHERED_CLUSTERS`, with
-/// a fixed-point CDF by cluster area ending at the top.
+/// a fixed-point CDF by cluster area ending at the top. The sheet's one emissive section is a
+/// corner block of few enough clusters for a gathered list, and the sheet is large enough for
+/// its DAG to hold many groups, so its cut changes across it. Its pages stream, so the cut is
+/// first gathered while some are not resident.
 #[test]
 fn a_copy_tracing_a_cut_it_built_samples_its_gathered_clusters() {
     let d = device();
@@ -833,8 +844,8 @@ fn a_copy_tracing_a_cut_it_built_samples_its_gathered_clusters() {
     }
     let bytes = pack_of(vec![sheet_asset(
         "lamp",
-        32,
-        lamp_materials(),
+        sheet(128, (16, 16)),
+        vec![cooked([1.0, 0.0, 0.0], 100.0), Material::default()],
         LodMode::Dag,
     )]);
     let archive = Archive::from_memory(Arc::clone(&bytes)).unwrap();
@@ -844,8 +855,12 @@ fn a_copy_tracing_a_cut_it_built_samples_its_gathered_clusters() {
         info.emissive.sets.iter().all(|s| s.node_count == 0),
         "the sheet's sets hold no tree"
     );
+    assert!(
+        info.emissive.widest <= GATHERED_CLUSTERS,
+        "the block's cuts fit a gathered list"
+    );
     let ranks = info.emissive.rank_count();
-    let (mut scenes, s, m) = mounted(bytes, ranks);
+    let (mut scenes, s, m, _workers) = mounted(bytes, ranks);
     let model = scenes.model(m, AssetId::from_name("lamp")).unwrap();
     // 100 m across, its near corner at the focus.
     let (copy, _) = place(
@@ -938,7 +953,7 @@ fn a_chain_with_a_more_emissive_step_grows_its_copies_entries() {
     if d.caps().cluster.max_tris == 0 || d.caps().cluster.max_partitions == 0 {
         return;
     }
-    let (mut scenes, s, m) = mounted(pack(), 8);
+    let (mut scenes, s, m, _workers) = mounted(pack(), 8);
     let lamp = scenes.model(m, AssetId::from_name("lamp")).unwrap();
     let plain = scenes.model(m, AssetId::from_name("plain")).unwrap();
     let (copy, g) = place(&mut scenes, s, plain, Affine3::IDENTITY);
