@@ -108,9 +108,11 @@ pub(crate) struct ClasPool {
 }
 
 impl ClasPool {
-    /// A pool over a range of `bytes`, bound in DeviceLocal blocks of `block` bytes.
+    /// A pool over a range of `bytes`, at most the whole pages whose units a u32 below
+    /// [`NO_UNIT`] names, bound in DeviceLocal blocks of `block` bytes.
     pub(crate) fn new(device: &Device, bytes: u64, block: u64) -> Result<Self> {
-        let range = device.gpu_malloc_sparse::<u8>(bytes.max(1), "CLAS pool")?;
+        let named = u64::from(NO_UNIT) * UNIT;
+        let range = device.gpu_malloc_sparse::<u8>(bytes.clamp(1, named), "CLAS pool")?;
         let page_units = (range.page_size / UNIT) as u32;
         // `clas_pool.slang` reads a page's bitmap four words at a time.
         assert!(
@@ -118,7 +120,7 @@ impl ClasPool {
             "CLAS pool pages of {} bytes",
             range.page_size
         );
-        let pages = range.pages() as u32;
+        let pages = range.pages().min(named / range.page_size) as u32;
         let words = u64::from(pages) * u64::from(page_units / 32);
         let dl = MemoryKind::DeviceLocal;
         let mut reference = RangeAllocator::new(pages * page_units);

@@ -440,7 +440,7 @@ impl Streaming {
             "stream pool",
         )));
         let clas = if caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0 {
-            let pool = ClasPool::new(device, b.clas_pool, b.stream_block)?;
+            let pool = ClasPool::new(device, b.mesh_page_pool, b.stream_block)?;
             Some(Arc::new(Mutex::new(pool)))
         } else {
             None
@@ -1190,9 +1190,12 @@ impl Streaming {
                     Some(Shortfall::Memory(e)) => {
                         self.residency.out_of_memory(governs(&self.governed, &e));
                     }
-                    // The budgets admitted more CLAS than the range holds: they shrink until
-                    // evictions free enough of it.
-                    Some(Shortfall::Range) => self.residency.out_of_memory(true),
+                    // The range is as large as the mesh page budget, but beside the CLAS that
+                    // budget counts it holds those of evicted pages until their frees apply
+                    // and the scaled estimates of batches in flight: that budget alone shrinks.
+                    Some(Shortfall::Range) => {
+                        self.residency.range_full(ResidencyClass::MeshPages);
+                    }
                     None => {}
                 }
                 clas.extend(self.replay(c));

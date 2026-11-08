@@ -16,7 +16,7 @@
 //!
 //! While device-local memory use sits above 90% of the OS budget, every class's budget
 //! shrinks step by step and units past their hold are evicted down to it; below 80% the
-//! budgets grow back.
+//! budgets grow back. A class whose units' shared address range runs out shrinks alone.
 
 use std::collections::BTreeSet;
 use std::ops::Bound::{Excluded, Unbounded};
@@ -289,8 +289,9 @@ pub(crate) struct Limits {
 
 pub(crate) struct Residency {
     limits: Limits,
-    /// The share of `limits.budgets` that loads and evictions plan under.
-    scale: f64,
+    /// Per class, the share of its budget in `limits.budgets` that loads and evictions plan
+    /// under.
+    scale: [f64; CLASSES],
     mounts: FxHashMap<MountId, Vec<Unit>>,
     /// Resident units that are not pinned, per class, by a touch no later than their last:
     /// a touch only marks the unit, and the unit moves to its last touch once an eviction
@@ -305,6 +306,8 @@ pub(crate) struct Residency {
     failed: u32,
     /// A load or build ran out of memory the budgets govern since the last `react`.
     out_of_memory: bool,
+    /// Per class, its units' shared address range ran out since the last `react`.
+    range_full: [bool; CLASSES],
     stats: ResidencyStats,
 }
 
@@ -312,7 +315,7 @@ impl Residency {
     pub(crate) fn new(limits: Limits) -> Self {
         let mut r = Self {
             limits,
-            scale: 1.0,
+            scale: [1.0; CLASSES],
             mounts: FxHashMap::default(),
             lru: Default::default(),
             used: [0; CLASSES],
@@ -322,6 +325,7 @@ impl Residency {
             requests: FxHashMap::default(),
             failed: 0,
             out_of_memory: false,
+            range_full: [false; CLASSES],
             stats: ResidencyStats::default(),
         };
         r.refresh();
@@ -376,14 +380,26 @@ impl Residency {
         self.stats.out_of_memory += 1;
     }
 
+    /// A build of class `class` ran out of the address range its class's units share (the
+    /// CLAS pool's, for mesh pages) under the class's budget: the next `react` shrinks that
+    /// budget alone.
+    pub(crate) fn range_full(&mut self, class: ResidencyClass) {
+        self.range_full[class as usize] = true;
+        self.stats.out_of_memory += 1;
+    }
+
     /// Takes the share of its OS budget that device-local memory uses
     /// (`MemoryReport::pressure`), and shrinks or grows the budgets the next plans use. They
     /// shrink one step, however many loads ran out of memory since the last call.
     pub(crate) fn react(&mut self, p: f64) {
-        if std::mem::take(&mut self.out_of_memory) || p > SHRINK_ABOVE {
-            self.scale = (self.scale * SCALE_STEP).max(MIN_SCALE);
-        } else if p < GROW_BELOW {
-            self.scale = (self.scale / SCALE_STEP).min(1.0);
+        let all = std::mem::take(&mut self.out_of_memory) || p > SHRINK_ABOVE;
+        let full = std::mem::take(&mut self.range_full);
+        for (scale, full) in self.scale.iter_mut().zip(full) {
+            if all || full {
+                *scale = (*scale * SCALE_STEP).max(MIN_SCALE);
+            } else if p < GROW_BELOW {
+                *scale = (*scale / SCALE_STEP).min(1.0);
+            }
         }
         self.refresh();
     }
@@ -922,7 +938,7 @@ impl Residency {
 
     fn refresh(&mut self) {
         for (c, s) in self.stats.classes.iter_mut().enumerate() {
-            s.budget = (self.limits.budgets[c] as f64 * self.scale) as u64;
+            s.budget = (self.limits.budgets[c] as f64 * self.scale[c]) as u64;
             s.resident_bytes = self.used[c] - self.loading_bytes[c];
             s.loading_bytes = self.loading_bytes[c];
             s.resident_units = self.resident_units[c];
@@ -1172,6 +1188,13 @@ mod tests {
         // 0 comes back at what it built, beside 1 in its hold.
         assert_eq!(step(&mut r, &[0], late + 1).loads, [key(0)]);
         assert_eq!(class(&r).resident_bytes, 280);
+
+        // A full range shrinks its class's budget alone.
+        r.range_full(ResidencyClass::HierarchyPages);
+        r.react(0.85);
+        let texture = r.stats().class(ResidencyClass::Textures).budget;
+        assert_eq!((class(&r).budget, texture), (285, u64::MAX));
+        assert_eq!(r.stats().out_of_memory, 1);
     }
 
     #[test]

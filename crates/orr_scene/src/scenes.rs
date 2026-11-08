@@ -103,12 +103,12 @@ pub struct Budgets {
     pub ptlas_rebuilt: u32,
     /// Bytes of resident mesh pages and of the CLAS and micromaps streamed pages build, which
     /// count at an estimate from their triangles until a page's first load has built them.
+    /// The CLAS pool's address range is as large, up to the 512 GiB its 32-bit unit indices
+    /// name, and bound in pages as they need.
     pub mesh_page_pool: u64,
     /// Bytes of pages a DAG mesh keeps resident from mount; the pages of a larger one past
     /// its pinned coarsest pages stream on the traversal's requests.
     pub mesh_resident_max: u64,
-    /// Bytes of the address range streamed pages' CLAS take, bound in pages as they need.
-    pub clas_pool: u64,
     /// Bytes of resident hierarchy pages.
     pub hierarchy_page_pool: u64,
     /// Bytes of resident textures: whole textures, streamed textures' mip tails and tiles.
@@ -155,7 +155,6 @@ impl Default for Budgets {
             ptlas_rebuilt: 250_000,
             mesh_page_pool: 3 << 30,
             mesh_resident_max: 1 << 20,
-            clas_pool: 1 << 30,
             hierarchy_page_pool: 256 << 20,
             texture_pool: 4 << 30,
             instance_page_pool: 256 << 20,
