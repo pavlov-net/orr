@@ -231,14 +231,15 @@ pub(crate) fn alloc_pages(len: usize, align: usize) -> io::Result<NonNull<u8>> {
                 PAGE_READWRITE as u32,
             )
         };
-        NonNull::new(p.cast::<u8>())
+        NonNull::new(p.cast::<u8>()).ok_or_else(io::Error::last_os_error)
     };
     // Allocations start at the allocation granularity, 64 KiB on every Windows.
     if align <= 1 << 16 {
-        return commit(std::ptr::null()).ok_or_else(io::Error::last_os_error);
+        return commit(std::ptr::null());
     }
     // Past it, find an aligned start in a reservation with room for one, then free the
-    // reservation and allocate there, again if another thread took the range meanwhile.
+    // reservation and allocate there; again while that fails as an invalid address, as when
+    // another thread took the range meanwhile.
     loop {
         // SAFETY: a reservation of nothing anything uses.
         let room = unsafe {
@@ -255,8 +256,9 @@ pub(crate) fn alloc_pages(len: usize, align: usize) -> io::Result<NonNull<u8>> {
         let at = (room as usize).next_multiple_of(align);
         // SAFETY: the reservation made above, freed once.
         unsafe { VirtualFree(room, 0, MEM_RELEASE as u32) };
-        if let Some(p) = commit(at as *const c_void) {
-            return Ok(p);
+        match commit(at as *const c_void) {
+            Err(e) if e.raw_os_error() == Some(ERROR_INVALID_ADDRESS) => {}
+            done => return done,
         }
     }
 }

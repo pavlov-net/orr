@@ -25,6 +25,7 @@ windows_link::link!("kernel32.dll" "system" fn WaitForMultipleObjects(ncount : u
 pub type BOOL = i32;
 pub type DWORDLONG = u64;
 pub const ERROR_HANDLE_EOF: i32 = 38;
+pub const ERROR_INVALID_ADDRESS: i32 = 487;
 pub const ERROR_IO_PENDING: i32 = 997;
 pub type FARPROC = Option<unsafe extern "system" fn() -> isize>;
 pub const FILE_FLAG_NO_BUFFERING: i32 = 536870912;
