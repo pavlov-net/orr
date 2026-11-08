@@ -69,8 +69,8 @@ unsafe impl Allocator for ReadAlloc {
 pub struct ReadBuffers(pub(crate) Arc<Pool>);
 
 impl ReadBuffers {
-    /// `count` buffers of each of `sizes`, multiples of [`SECTOR`] in rising order. A pool
-    /// holds at least one buffer.
+    /// `count` buffers of each of `sizes`, at most 64 multiples of [`SECTOR`] in rising order.
+    /// A pool holds at least one buffer.
     pub fn new(sizes: &[usize], count: usize) -> io::Result<Self> {
         assert!(
             sizes.is_sorted_by(|a, b| a < b) && sizes.iter().all(|s| s.is_multiple_of(SECTOR)),
@@ -80,6 +80,7 @@ impl ReadBuffers {
             sizes.first().is_some_and(|&s| s > 0) && count > 0,
             "a read buffer pool holds buffers"
         );
+        assert!(sizes.len() <= 64, "at most 64 sizes of read buffer");
         let mut at = 0;
         let classes: Box<[Class]> = sizes
             .iter()
@@ -187,6 +188,12 @@ impl Pool {
         let mut rings = self.rings.lock().unwrap();
         rings.retain(|r| r.strong_count() > 0);
         rings.push(Arc::downgrade(event));
+    }
+
+    /// The size of buffer a read of `len` bytes takes, none when it is larger than all.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn size_of(&self, len: usize) -> Option<usize> {
+        self.class(AlignedBuf::capacity_for(len))
     }
 
     fn largest(&self) -> usize {

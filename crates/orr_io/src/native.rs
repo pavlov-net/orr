@@ -115,22 +115,32 @@ impl Native {
         }
     }
 
-    /// Puts queued reads, in order, into the free slots while their buffers are in. Returns
-    /// a bit for each slot it filled.
+    /// Puts queued reads, in order, into the free slots. A read whose size of buffer is out
+    /// stays queued, and the reads after it pass it. Returns a bit for each slot it filled.
     fn take_queued(&mut self) -> u64 {
         let mut new = 0;
         let mut slot = 0;
-        while let Some(read) = self.queued.front_mut() {
+        // A bit for each size of buffer found out in this pass.
+        let mut out = 0u64;
+        let mut i = 0;
+        while let Some(read) = self.queued.get_mut(i) {
             while slot < DEPTH && self.slots[slot].is_some() {
                 slot += 1;
             }
             if slot == DEPTH {
                 break;
             }
+            let size = self.buffers.0.size_of(read.len);
+            if read.into.is_none() && size.is_some_and(|s| out & 1 << s != 0) {
+                i += 1;
+                continue;
+            }
             let Some(buf) = read.into.take().or_else(|| self.buffers.try_take(read.len)) else {
-                break;
+                out |= 1 << size.expect("only pool buffers run out");
+                i += 1;
+                continue;
             };
-            let read = self.queued.pop_front().expect("a queued read");
+            let read = self.queued.remove(i).expect("a queued read");
             let file = self.open(&read.file);
             self.slots[slot] = Some(InFlight { read, buf, file });
             new |= 1 << slot;
