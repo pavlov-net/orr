@@ -558,12 +558,15 @@ impl MountRead {
 }
 
 /// Reads and decodes blob `blob` of entry `entry`, then runs `then` on a worker with its
-/// decoded bytes. A read from the file waits for room in the in-flight limit, which its
-/// stored bytes take until `then` has run.
+/// decoded bytes. A read from the file, or one whose placement `stages` copies, waits for room
+/// in the in-flight limit, which its stored bytes read from the file and, when it stages, its
+/// decoded bytes take until `then` has run; the decoded bytes stand in for those it stages,
+/// which then take their own until their batch completes.
 fn fetch(
     task: &Arc<MountTask>,
     entry: usize,
     blob: usize,
+    stages: bool,
     then: impl FnOnce(&Arc<MountTask>, &[u8]) -> Result<()> + Send + 'static,
 ) {
     let archive = task.archive();
@@ -591,10 +594,16 @@ fn fetch(
             }),
         );
     };
-    if archive.stored(&b, None).is_some() {
+    let in_place = archive.stored(&b, None).is_some();
+    if in_place && !stages {
         read(None);
     } else if let Some(loading) = task.loading.upgrade() {
-        let bytes = u64::from(archive.stored_range(&b, None).len);
+        let stored = if in_place {
+            0
+        } else {
+            u64::from(archive.stored_range(&b, None).len)
+        };
+        let bytes = stored + if stages { u64::from(b.raw_len) } else { 0 };
         let read = MountRead {
             task: Arc::clone(task),
             read: Box::new(read),
@@ -828,38 +837,39 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
         let schema = class.schema().expect("built-in class format");
         let e = archive.expect(e.id, e.class, schema)?;
         let id = e.id;
+        let staged = t.staged;
         match class {
-            Class::Mesh => fetch(t, i, 0, move |t, b| place_mesh(t, i, id, b)),
+            Class::Mesh => fetch(t, i, 0, staged, move |t, b| place_mesh(t, i, id, b)),
             Class::Texture => {
                 if unread_latents.contains(&id) {
                     continue;
                 }
                 let stream = bound.contains(&id);
                 let neural = linked.get(&id).copied();
-                fetch(t, i, 0, move |t, b| {
+                fetch(t, i, 0, staged, move |t, b| {
                     place_texture(t, i, id, b, stream, neural)
                 });
             }
-            Class::Material => fetch(t, i, 0, move |t, b| {
+            Class::Material => fetch(t, i, 0, false, move |t, b| {
                 let m = Material::from_bytes(b)?;
                 t.placed.lock().unwrap().materials.push((id, m));
                 Ok(())
             }),
-            Class::Model => fetch(t, i, 0, move |t, b| {
+            Class::Model => fetch(t, i, 0, false, move |t, b| {
                 let m = ModelInfo::parse(b)?;
                 t.placed.lock().unwrap().models.push((id, m));
                 Ok(())
             }),
-            Class::Skeleton => fetch(t, i, 0, move |t, b| place_skeleton(t, id, b)),
-            Class::Clip => fetch(t, i, 0, move |t, b| place_clip(t, i, id, b)),
-            Class::Subd => fetch(t, i, 0, move |t, b| place_subd(t, i, id, b)),
-            Class::Volume => fetch(t, i, 0, move |t, b| place_volume(t, i, id, b)),
-            Class::TextureTiles => fetch(t, i, 0, move |t, b| place_tiles(t, id, b)),
-            _ => fetch(t, i, 0, move |t, b| place_page(t, i, id, b)),
+            Class::Skeleton => fetch(t, i, 0, staged, move |t, b| place_skeleton(t, id, b)),
+            Class::Clip => fetch(t, i, 0, staged, move |t, b| place_clip(t, i, id, b)),
+            Class::Subd => fetch(t, i, 0, false, move |t, b| place_subd(t, i, id, b)),
+            Class::Volume => fetch(t, i, 0, staged, move |t, b| place_volume(t, i, id, b)),
+            Class::TextureTiles => fetch(t, i, 0, false, move |t, b| place_tiles(t, id, b)),
+            _ => fetch(t, i, 0, false, move |t, b| place_page(t, i, id, b)),
         }
     }
     for s in sets {
-        fetch(t, s.entry, s.blob as usize, move |t, b| {
+        fetch(t, s.entry, s.blob as usize, t.staged, move |t, b| {
             place_neural(t, &s, b)
         });
     }
@@ -910,7 +920,7 @@ fn place_volume(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> 
     let cells = info.header.majorant_cells.iter().product::<u32>() as usize;
     let majorant_bytes = 4 * cells * info.grids.len();
     let at = layout.majorants;
-    fetch(t, entry, 1, move |t, b| {
+    fetch(t, entry, 1, t.staged, move |t, b| {
         if b.len() != majorant_bytes {
             return Err(orr_pack::Error::Malformed("volume majorants").into());
         }
@@ -922,12 +932,18 @@ fn place_volume(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> 
         for p in 0..grid.pages.count as usize {
             let bytes = (count - p * per_page).min(per_page) * grid.brick_bytes();
             let at = layout.page(&info, g, p);
-            fetch(t, entry, grid.pages.first as usize + p, move |t, b| {
-                if b.len() != bytes {
-                    return Err(orr_pack::Error::Malformed("volume page").into());
-                }
-                t.write(block, at, b)
-            });
+            fetch(
+                t,
+                entry,
+                grid.pages.first as usize + p,
+                t.staged,
+                move |t, b| {
+                    if b.len() != bytes {
+                        return Err(orr_pack::Error::Malformed("volume page").into());
+                    }
+                    t.write(block, at, b)
+                },
+            );
         }
     }
     Ok(())
@@ -950,7 +966,7 @@ fn place_subd(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     }));
     for (k, blob) in blobs.into_iter().enumerate() {
         let pending = Arc::clone(&pending);
-        fetch(t, entry, blob as usize, move |t, b| {
+        fetch(t, entry, blob as usize, t.staged, move |t, b| {
             let page = SubdPage::parse(b)?;
             let mut p = pending.lock().unwrap();
             p.pages[k] = Some(page);
@@ -1021,7 +1037,7 @@ fn place_clip(t: &Arc<MountTask>, entry: usize, id: AssetId, head: &[u8]) -> Res
         duration: h.duration,
     };
     t.placed.lock().unwrap().clips.push((id, r));
-    fetch(t, entry, 1, move |t, bytes| {
+    fetch(t, entry, 1, t.staged, move |t, bytes| {
         orr_pack::clip::Clip::parse(bytemuck::bytes_of(&h), bytes)?;
         t.write(block, at, bytes)
     });
@@ -1153,7 +1169,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     };
     for (p, page) in info.pages[..pinned].iter().enumerate() {
         let (at, first, len) = (page_at[p], firsts[p], page.resident_len as usize);
-        fetch(t, entry, page.blob as usize, move |t, stored| {
+        fetch(t, entry, page.blob as usize, t.staged, move |t, stored| {
             PAGE.with_borrow_mut(|resident| {
                 resident.resize(len, 0);
                 orr_pack::mesh::decode_page(stored, resident)?;
@@ -1176,14 +1192,20 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     for (n, node_page) in info.node_pages.iter().enumerate() {
         let Some(at) = node_at[n] else { continue };
         let len = node_page.node_count as usize * size_of::<orr_pack::mesh::Node>();
-        fetch(t, entry, node_page.blob as usize, move |t, nodes| {
-            if nodes.len() != len {
-                return Err(orr_pack::Error::Malformed("node page length").into());
-            }
-            t.write(block, at, nodes)?;
-            t.placed.lock().unwrap().meshes[mesh].node_pages[n] = block.gpu() + at;
-            Ok(())
-        });
+        fetch(
+            t,
+            entry,
+            node_page.blob as usize,
+            t.staged,
+            move |t, nodes| {
+                if nodes.len() != len {
+                    return Err(orr_pack::Error::Malformed("node page length").into());
+                }
+                t.write(block, at, nodes)?;
+                t.placed.lock().unwrap().meshes[mesh].node_pages[n] = block.gpu() + at;
+                Ok(())
+            },
+        );
     }
     Ok(())
 }
@@ -1312,7 +1334,7 @@ fn place_texture(
     }
     for blob in 1..h.blob_count() {
         let (info, texture) = (Arc::clone(&info), Arc::clone(&texture));
-        fetch(t, entry, blob, move |t, bytes| {
+        fetch(t, entry, blob, !t.host_copy, move |t, bytes| {
             let h = &info.header;
             for mip in (0..u32::from(h.mip_count)).filter(|&m| h.mip_blob(m) == blob) {
                 let [w, hh] = h.mip_size(mip);
@@ -1463,7 +1485,7 @@ fn place_streamed(
     });
     if tail < desc.mips {
         let info = Arc::clone(info);
-        fetch(t, entry, h.mip_blob(tail), move |t, bytes| {
+        fetch(t, entry, h.mip_blob(tail), true, move |t, bytes| {
             let h = &info.header;
             for mip in tail..u32::from(h.mip_count) {
                 let [w, hh] = h.mip_size(mip);

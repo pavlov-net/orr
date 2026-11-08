@@ -659,16 +659,82 @@ fn staged_device() -> Device {
     staged
 }
 
+/// A memory pack of `count` whole textures, which no material binds: every mip of each is
+/// staged at mount. Returns it with the bytes of their texels.
+fn whole_textures(count: usize) -> (Arc<[u8]>, u64) {
+    use orr_pack::texture::{mip_size, vk};
+    const EDGE: u32 = 256;
+    let mut w = ArchiveWriter::create(Target::Memory).unwrap();
+    let mut bytes = 0;
+    for t in 0..count {
+        let texels = |mip: u32, _| -> Vec<u8> {
+            let [mw, mh] = mip_size(EDGE, EDGE, mip);
+            (0..4 * mw * mh)
+                .map(|i| (i ^ (i >> 9) ^ (mip * 31) ^ (t as u32 * 7)) as u8)
+                .collect()
+        };
+        let name = format!("whole/{t}");
+        let tail = add_texture(
+            &mut w,
+            &name,
+            vk::R8G8B8A8_UNORM,
+            [EDGE; 2],
+            1,
+            false,
+            texels,
+        );
+        assert!(tail > 0, "{name} has mips above its tail");
+        bytes += (0..orr_pack::texture::full_mip_count(EDGE, EDGE))
+            .map(|m| texels(m, 0).len() as u64)
+            .sum::<u64>();
+    }
+    (w.finish().unwrap().unwrap(), bytes)
+}
+
 #[test]
-fn staged_device_places_the_same_assets() {
+fn staged_mounts_past_the_in_flight_limit_copy_in_batches_and_place_the_same_assets() {
+    use orr_scene::orr_gpu::MemoryKind;
     let _serial = serial();
     let staged = staged_device();
     let bytes = pack();
     let a = Archive::from_memory(Arc::clone(bytes)).unwrap();
+    let (whole, texel_bytes) = whole_textures(64);
+    let b = Archive::from_memory(Arc::clone(&whole)).unwrap();
     {
-        let mut scenes = Scenes::new(&staged, &RendererDesc::default()).unwrap();
+        let desc = RendererDesc {
+            budgets: Budgets {
+                in_flight_bytes: 512 << 10,
+                ..Budgets::default()
+            },
+            ..RendererDesc::default()
+        };
+        let mut scenes = Scenes::new(&staged, &desc).unwrap();
         let _workers = Workers::start(&scenes, 2);
+        let upload = || staged.memory_report().kind(MemoryKind::Upload).bytes;
+        for _ in 0..4 {
+            frame(&mut scenes);
+        }
+        let base = upload();
         let m = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
+        let n = scenes.mount(PackSource::Memory(Arc::clone(&whole)));
+        // Staging frees once its copies complete and a frame has collected it, so frames run
+        // back to back.
+        let mut peak = 0;
+        let start = Instant::now();
+        while [m, n]
+            .iter()
+            .any(|&k| matches!(scenes.mount_state(k), LoadState::Pending))
+        {
+            assert!(start.elapsed() < Duration::from_secs(60), "mounts pending");
+            frame(&mut scenes);
+            peak = peak.max(upload().saturating_sub(base));
+        }
+        assert!(
+            peak < texel_bytes / 4,
+            "{peak} bytes of upload memory at once while staging {texel_bytes}"
+        );
+        ready(&mut scenes, n);
+        snapshot(&scenes, &Gpu(&staged), n, &b);
         ready_whole(&mut scenes, m, &a);
         let on_staged = snapshot(&scenes, &Gpu(&staged), m, &a);
 
