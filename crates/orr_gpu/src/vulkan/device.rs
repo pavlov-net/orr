@@ -18,6 +18,7 @@ use super::diagnostics::{Breadcrumbs, Diagnostics, FaultFns, Trail};
 use super::features::{self, SURFACE_INSTANCE_EXTENSIONS, Selection};
 use super::garbage::{Garbage, Item, MAX_TIMELINES};
 use super::heap::Heaps;
+use super::host_memory;
 use super::interop::ClassicBind;
 use super::memory::{MemoryTypes, Pools, Range, Usage, buffer_usage, sharing};
 use super::perf::{self, Perf};
@@ -57,6 +58,10 @@ pub(crate) struct Shared {
     pub(super) occupancy_fn: Option<ash::nv::compute_occupancy_priority::Device>,
     /// With `Caps::generated_commands`.
     pub(super) generated_fn: Option<ash::ext::device_generated_commands::Device>,
+    /// With `Caps::host_memory_import`.
+    pub(super) host_memory_fn: Option<ash::ext::external_memory_host::Device>,
+    /// `nonCoherentAtomSize`.
+    pub(super) non_coherent_atom: u64,
     pub(super) mesh_fn: ash::ext::mesh_shader::Device,
     pub(super) rt_fn: Option<ash::khr::ray_tracing_pipeline::Device>,
     pub(super) debug_fn: ash::ext::debug_utils::Device,
@@ -372,6 +377,7 @@ impl Device {
         let mut decompress_props = vk::PhysicalDeviceMemoryDecompressionPropertiesEXT::default();
         let mut generated_props = vk::PhysicalDeviceDeviceGeneratedCommandsPropertiesEXT::default();
         let mut indirect_copy_props = vk::PhysicalDeviceCopyMemoryIndirectPropertiesKHR::default();
+        let mut host_memory_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
             .push(&mut heap_props)
             .push(&mut as_props)
@@ -390,10 +396,14 @@ impl Device {
         if optional.indirect_copy {
             props2 = props2.push(&mut indirect_copy_props);
         }
+        if optional.host_memory {
+            props2 = props2.push(&mut host_memory_props);
+        }
         // SAFETY: every struct in the chain belongs to an enabled extension or core 1.4.
         unsafe { instance.get_physical_device_properties2(physical, &mut props2) };
         let props = props2.properties;
         let generated = optional.generated_commands && generated_stages(&generated_props);
+        let host_memory = optional.host_memory && host_buffers_import(&instance, physical);
         heap_props.p_next = std::ptr::null_mut();
         rt_props.p_next = std::ptr::null_mut();
         let device_name = c_string(&props.device_name);
@@ -466,6 +476,7 @@ impl Device {
                     == vk::RayTracingInvocationReorderModeEXT::REORDER,
             host_image_copy: optional.host_image_copy && rebar,
             memory_decompression: optional.memory_decompression,
+            host_memory_import: host_memory,
             occupancy_priority: optional.occupancy_priority,
             generated_commands: generated,
             omm: optional.omm,
@@ -514,6 +525,11 @@ impl Device {
                 max_ray_dispatch_invocations: rt_props.max_ray_dispatch_invocation_count,
                 device_local_bytes: memory.heap_size(MemoryKind::DeviceLocal),
                 upload_bytes: memory.heap_size(MemoryKind::Upload),
+                host_import_align: if host_memory {
+                    host_memory_props.min_imported_host_pointer_alignment
+                } else {
+                    0
+                },
                 max_decompress_regions: if optional.memory_decompression {
                     decompress_props
                         .max_decompression_indirect_count
@@ -637,6 +653,9 @@ impl Device {
                 .then(|| ash::nv::compute_occupancy_priority::Device::load(&instance, &device)),
             generated_fn: generated
                 .then(|| ash::ext::device_generated_commands::Device::load(&instance, &device)),
+            host_memory_fn: host_memory
+                .then(|| ash::ext::external_memory_host::Device::load(&instance, &device)),
+            non_coherent_atom: props.limits.non_coherent_atom_size,
             mesh_fn: ash::ext::mesh_shader::Device::load(&instance, &device),
             rt_fn: optional
                 .ray_dispatch
@@ -780,6 +799,7 @@ impl Device {
             optional.aftermath,
             device.shared.caps.device_fault,
         );
+        host_memory::log_pointer_types(&device.shared);
         Ok(device)
     }
 
@@ -1047,6 +1067,19 @@ fn placement_align(
         .max(granularity)
         .max(64 << 10)
         .next_power_of_two()
+}
+
+/// Whether buffers of imported host memory's usage take host allocations.
+fn host_buffers_import(instance: &ash::Instance, physical: vk::PhysicalDevice) -> bool {
+    let info = vk::PhysicalDeviceExternalBufferInfo::default()
+        .usage(host_memory::usage())
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+    let mut out = vk::ExternalBufferProperties::default();
+    // SAFETY: the physical device belongs to the instance.
+    unsafe { instance.get_physical_device_external_buffer_properties(physical, &info, &mut out) };
+    out.external_memory_properties
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
 }
 
 /// Memory requirements of the universal buffer and of optimal images decide the types.

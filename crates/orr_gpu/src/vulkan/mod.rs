@@ -13,6 +13,7 @@ mod features;
 mod garbage;
 mod generated;
 mod heap;
+mod host_memory;
 mod interop;
 mod memory;
 mod mesh;
@@ -39,6 +40,7 @@ pub use command::CommandList;
 pub use device::Device;
 pub use diagnostics::Diagnostics;
 pub use generated::ExecutionSet;
+pub use host_memory::ImportedMemory;
 pub use interop::{
     DeviceHooks, Features, ImageHandles, RawCommandBuffer, RawDevice, buffer_handle,
     defer_after_submitted, image_handles, raw_device,

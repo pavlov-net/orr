@@ -1,7 +1,7 @@
 //! The parts of orr_gpu the Metal backend does not implement yet, or that Metal has no
 //! counterpart for: crash diagnostics, device-generated commands, cooperative vectors,
-//! counter frames and ray-dispatch pipelines. The types mirror the Vulkan
-//! backend's; the calls fail, panic, or take handles no call creates.
+//! counter frames, ray-dispatch pipelines and host memory imports. The types mirror the
+//! Vulkan backend's; the calls fail, panic, or take handles no call creates.
 
 use std::alloc::Layout;
 use std::convert::Infallible;
@@ -33,6 +33,46 @@ impl Device {
     /// An empty report: Metal records no diagnostics yet.
     pub fn diagnostics_report(&self) -> DiagnosticsReport {
         DiagnosticsReport::default()
+    }
+}
+
+/// Host memory imported for the GPU to read in place; not on Metal, whose shared storage the
+/// CPU and the GPU already reach alike.
+pub struct ImportedMemory {
+    never: Infallible,
+}
+
+impl ImportedMemory {
+    pub fn gpu(&self) -> GpuAddress {
+        match self.never {}
+    }
+
+    pub fn size(&self) -> u64 {
+        match self.never {}
+    }
+
+    pub fn flush(&self, offset: u64, len: u64) -> Result<(), Error> {
+        let _ = (offset, len);
+        match self.never {}
+    }
+}
+
+impl Device {
+    /// Fails: Metal reports `Caps::host_memory_import` false.
+    ///
+    /// # Safety
+    ///
+    /// As on Vulkan: the memory stays allocated, readable and writable, until `keep` is
+    /// dropped.
+    pub unsafe fn import_host_memory(
+        &self,
+        ptr: std::ptr::NonNull<u8>,
+        len: u64,
+        keep: Box<dyn std::any::Any + Send + Sync>,
+        name: &str,
+    ) -> Result<ImportedMemory, Error> {
+        let _ = (ptr, len, keep, name);
+        Err(Error::NotImplemented("Device::import_host_memory"))
     }
 }
 

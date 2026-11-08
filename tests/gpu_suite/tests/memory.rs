@@ -2,13 +2,71 @@
 //! reads are its own.
 
 use std::alloc::Layout;
+use std::ptr::NonNull;
 use std::time::Duration;
 
 use gpu_suite::shaders::gate;
 use gpu_suite::{assert_clean, device, pipeline};
 use orr_gpu::{
-    Device, DeviceDesc, Hazards, MemoryKind, QueueKind, QueueRequest, Stages, TimelinePoint,
+    Device, DeviceDesc, GpuAddress, GpuPtr, Hazards, MemoryKind, QueueKind, QueueRequest, Stages,
+    TimelinePoint,
 };
+
+/// Host pages from the global allocator, freed when dropped.
+struct Pages(NonNull<u8>, Layout);
+
+// SAFETY: plain memory, which any thread may free.
+unsafe impl Send for Pages {}
+// SAFETY: as above; nothing reads through a shared `Pages`.
+unsafe impl Sync for Pages {}
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        // SAFETY: allocated with this layout, freed once.
+        unsafe { std::alloc::dealloc(self.0.as_ptr(), self.1) };
+    }
+}
+
+#[test]
+fn the_gpu_reads_imported_host_memory_as_the_cpu_wrote_it() {
+    let d = device();
+    if !d.caps().host_memory_import {
+        return;
+    }
+    let align = d.caps().limits.host_import_align.max(4096) as usize;
+    let len = 4 * align;
+    let layout = Layout::from_size_align(len, align).unwrap();
+    // SAFETY: a nonzero size.
+    let at = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
+    let bytes: Vec<u8> = (0..len).map(|i| (i * 131 % 251) as u8).collect();
+    // SAFETY: `at` holds `len` bytes.
+    unsafe { at.copy_from_nonoverlapping(NonNull::from(&bytes[..]).cast(), len) };
+    // SAFETY: `Pages` keeps the memory until the import drops it.
+    let imported =
+        unsafe { d.import_host_memory(at, len as u64, Box::new(Pages(at, layout)), "import") }
+            .unwrap();
+    imported.flush(0, len as u64).unwrap();
+    let rest = (len - align) as u64;
+    let middle = d
+        .gpu_malloc::<u8>(MemoryKind::DeviceLocal, rest, "import middle")
+        .unwrap();
+    let out = d
+        .gpu_malloc::<u8>(MemoryKind::Readback, rest, "import out")
+        .unwrap();
+    let queue = d.queue(QueueKind::Render).unwrap();
+    let mut list = queue.command_list().unwrap();
+    // SAFETY: the address lies inside the import, `rest` bytes before its end.
+    let src = unsafe { GpuPtr::from_address(GpuAddress(imported.gpu().0 + align as u64)) };
+    list.copy(middle.gpu(), src, rest);
+    list.barrier(Stages::TRANSFER, Stages::TRANSFER, Hazards::empty());
+    list.copy(out.gpu(), middle.gpu(), rest);
+    list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
+    let point = queue.submit(vec![list], &[]).unwrap();
+    queue.wait(point, Duration::from_secs(10)).unwrap();
+    assert!(out.as_slice().unwrap() == &bytes[align..], "imported bytes");
+    drop(imported);
+    assert_clean();
+}
 
 #[test]
 fn steady_frames_reuse_memory_without_allocating() {

@@ -56,7 +56,7 @@ pub(super) fn buffer_usage(ray_dispatch: bool) -> vk::BufferUsageFlags {
 /// The memory type behind each [`MemoryKind`].
 pub(super) struct MemoryTypes {
     types: [u32; MemoryKind::ALL.len()],
-    properties: vk::PhysicalDeviceMemoryProperties,
+    pub(super) properties: vk::PhysicalDeviceMemoryProperties,
 }
 
 impl MemoryTypes {

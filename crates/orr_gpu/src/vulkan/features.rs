@@ -70,6 +70,8 @@ pub(super) struct Optional {
     pub(super) cooperative_vector: bool,
     pub(super) shader_float8: bool,
     pub(super) memory_decompression: bool,
+    /// `VK_EXT_external_memory_host`.
+    pub(super) host_memory: bool,
     pub(super) calibrated_timestamps: bool,
     pub(super) frame_boundary: bool,
     pub(super) executable_info: bool,
@@ -398,6 +400,7 @@ pub(super) fn select(
             && present(ash::ext::shader_replicated_composites::NAME),
         shader_float8: present(ash::ext::shader_float8::NAME),
         memory_decompression: present(ash::ext::memory_decompression::NAME),
+        host_memory: present(ash::ext::external_memory_host::NAME),
         calibrated_timestamps: present(ash::khr::calibrated_timestamps::NAME),
         frame_boundary: present(ash::ext::frame_boundary::NAME),
         executable_info: present(ash::khr::pipeline_executable_properties::NAME),
@@ -737,6 +740,7 @@ pub(super) fn select(
         opt.memory_decompression,
         &[ash::ext::memory_decompression::NAME],
     );
+    add(opt.host_memory, &[ash::ext::external_memory_host::NAME]);
     add(
         opt.calibrated_timestamps,
         &[ash::khr::calibrated_timestamps::NAME],

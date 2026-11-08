@@ -36,6 +36,8 @@ pub(super) enum Item {
     RaygenRecord(u32),
     /// A library's objects, released by its closure.
     Release(Box<dyn FnOnce() + Send>),
+    /// An import of host memory.
+    Imported(super::host_memory::Imported),
 }
 
 /// A buffer bound to memory from orr_gpu's pools, as `gpu_malloc` creates it.
@@ -158,6 +160,7 @@ impl Shared {
                     }
                 }
                 Item::Release(release) => release(),
+                Item::Imported(i) => self.destroy_imported(i),
             }
         }
     }

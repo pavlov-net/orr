@@ -331,6 +331,7 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
         staging_device_local: !desc.force_staging,
         host_image_copy: false,
         memory_decompression: false,
+        host_memory_import: false,
         occupancy_priority: false,
         generated_commands: false,
         ray_dispatch: false,
@@ -399,6 +400,7 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
             max_decompress_regions: 0,
             max_generated_pipelines: 0,
             max_generated_sequences: 0,
+            host_import_align: 0,
         },
     }
 }

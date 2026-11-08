@@ -48,7 +48,7 @@ pub use queue::{HostTimeline, Queue};
 pub use sparse::{SparseAllocation, SparseBinds};
 pub use swapchain::{LowLatency, Swapchain, SwapchainFrame, WindowExtent};
 pub use texture::Texture;
-pub use unsupported::{Diagnostics, ExecutionSet, RayDispatchPipeline};
+pub use unsupported::{Diagnostics, ExecutionSet, ImportedMemory, RayDispatchPipeline};
 
 /// The most queues a device has, one per [`QueueKind`].
 const MAX_TIMELINES: usize = 5;

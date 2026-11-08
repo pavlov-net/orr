@@ -20,6 +20,10 @@ pub struct Caps {
     pub host_image_copy: bool,
     /// GDeflate 1.0 memory decompression ([`crate::CommandList::decompress`]).
     pub memory_decompression: bool,
+    /// [`crate::Device::import_host_memory`] imports host memory the GPU then reads and
+    /// writes in place (`VK_EXT_external_memory_host`), in units of
+    /// `Limits::host_import_align`.
+    pub host_memory_import: bool,
     /// [`crate::CommandList::set_occupancy`] sets the occupancy priority of dispatches
     /// (`VK_NV_compute_occupancy_priority`); without it the call does nothing.
     pub occupancy_priority: bool,
@@ -140,6 +144,9 @@ pub struct Limits {
     /// Regions one [`crate::CommandList::decompress`] may list; 0 without
     /// `Caps::memory_decompression`.
     pub max_decompress_regions: u32,
+    /// The alignment of the start and length of an import of host memory
+    /// (`minImportedHostPointerAlignment`); 0 without `Caps::host_memory_import`.
+    pub host_import_align: u64,
     /// Pipelines one execution set may hold; 0 without `Caps::generated_commands`.
     pub max_generated_pipelines: u32,
     /// Sequences one [`crate::CommandList::execute_generated`] may run; 0 without

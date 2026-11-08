@@ -99,16 +99,16 @@ pub use texture::{
 #[cfg(target_vendor = "apple")]
 pub use metal::{
     Allocation, ClassicAs, CommandList, ComputePipeline, Device, DeviceArenas, DeviceHooks,
-    Diagnostics, ExecutionSet, HostArenas, HostTimeline, LowLatency, MeshPipeline, Micromap, Queue,
-    RayDispatchPipeline, ShaderStage, SparseAllocation, SparseBinds, Swapchain, SwapchainFrame,
-    Texture, WindowExtent,
+    Diagnostics, ExecutionSet, HostArenas, HostTimeline, ImportedMemory, LowLatency, MeshPipeline,
+    Micromap, Queue, RayDispatchPipeline, ShaderStage, SparseAllocation, SparseBinds, Swapchain,
+    SwapchainFrame, Texture, WindowExtent,
 };
 #[cfg(not(target_vendor = "apple"))]
 pub use vulkan::{
     Allocation, ClassicAs, CommandList, ComputePipeline, Device, DeviceArenas, DeviceHooks,
-    Diagnostics, ExecutionSet, HostArenas, HostTimeline, LowLatency, MeshPipeline, Micromap, Queue,
-    RayDispatchPipeline, ShaderStage, SparseAllocation, SparseBinds, Swapchain, SwapchainFrame,
-    Texture, WindowExtent,
+    Diagnostics, ExecutionSet, HostArenas, HostTimeline, ImportedMemory, LowLatency, MeshPipeline,
+    Micromap, Queue, RayDispatchPipeline, ShaderStage, SparseAllocation, SparseBinds, Swapchain,
+    SwapchainFrame, Texture, WindowExtent,
 };
 
 #[cfg(not(target_vendor = "apple"))]

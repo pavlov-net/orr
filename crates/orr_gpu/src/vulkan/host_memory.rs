@@ -1,0 +1,272 @@
+//! Host memory the device reads in place (`VK_EXT_external_memory_host`).
+
+use std::alloc::Layout;
+use std::any::Any;
+use std::ptr::NonNull;
+use std::sync::Arc;
+
+use ash::vk;
+use ash::vk::TaggedStructure as _;
+
+use super::debug::name_object;
+use super::device::{Device, Shared};
+use super::garbage::Item;
+use super::memory::sharing;
+use crate::{Error, GpuAddress};
+
+/// Host memory imported with [`Device::import_host_memory`]: the GPU reads and writes it at
+/// [`ImportedMemory::gpu`] while the CPU uses it where it lies.
+///
+/// Dropping it ends the import once everything submitted before the drop has completed, and
+/// then drops what the import keeps.
+pub struct ImportedMemory {
+    gpu: GpuAddress,
+    size: u64,
+    /// Without a coherent type: the memory, mapped, flushed in atoms of this many bytes.
+    atom: Option<u64>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    keep: Option<Box<dyn Any + Send + Sync>>,
+    shared: Arc<Shared>,
+}
+
+/// What [`Shared::destroy`] frees of an import.
+pub(super) struct Imported {
+    pub(super) buffer: vk::Buffer,
+    pub(super) memory: vk::DeviceMemory,
+    pub(super) address: u64,
+    pub(super) keep: Box<dyn Any + Send + Sync>,
+}
+
+impl ImportedMemory {
+    /// The device address of the first byte.
+    pub fn gpu(&self) -> GpuAddress {
+        self.gpu
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Makes the CPU's writes to the `len` bytes at `offset` visible to work submitted next;
+    /// nothing to do where the memory is coherent.
+    pub fn flush(&self, offset: u64, len: u64) -> Result<(), Error> {
+        let Some(atom) = self.atom else {
+            return Ok(());
+        };
+        let start = offset - offset % atom;
+        let end = (offset + len).next_multiple_of(atom).min(self.size);
+        let range = vk::MappedMemoryRange::default()
+            .memory(self.memory)
+            .offset(start)
+            .size(end - start);
+        // SAFETY: the memory is mapped whole while the import lives.
+        unsafe { self.shared.device.flush_mapped_memory_ranges(&[range]) }
+            .map_err(Error::vk("vkFlushMappedMemoryRanges"))
+    }
+}
+
+impl Drop for ImportedMemory {
+    fn drop(&mut self) {
+        let keep = self.keep.take().expect("kept until dropped");
+        self.shared.defer_after_submitted(Item::Imported(Imported {
+            buffer: self.buffer,
+            memory: self.memory,
+            address: self.gpu.0,
+            keep,
+        }));
+    }
+}
+
+impl Shared {
+    pub(super) fn destroy_imported(&self, i: Imported) {
+        self.unregister_range(i.address);
+        // SAFETY: no submitted work uses the buffer or its memory any more.
+        unsafe {
+            self.device.destroy_buffer(i.buffer, None);
+            self.device.free_memory(i.memory, None);
+        }
+        drop(i.keep);
+    }
+}
+
+/// Usage of imported buffers: copies from and into them and kernels reading them by address.
+pub(super) fn usage() -> vk::BufferUsageFlags {
+    use vk::BufferUsageFlags as U;
+    U::TRANSFER_SRC | U::TRANSFER_DST | U::STORAGE_BUFFER | U::SHADER_DEVICE_ADDRESS
+}
+
+/// The memory types the driver can import the host memory at `ptr` as.
+///
+/// # Safety
+///
+/// `ptr` is host memory aligned to `minImportedHostPointerAlignment`.
+unsafe fn pointer_types(
+    f: &ash::ext::external_memory_host::Device,
+    ptr: NonNull<u8>,
+) -> Result<vk::MemoryHostPointerPropertiesEXT<'static>, vk::Result> {
+    let mut out = vk::MemoryHostPointerPropertiesEXT::default();
+    let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+    // SAFETY: the caller's contract; `out` is written only during the call.
+    unsafe {
+        (f.fp().get_memory_host_pointer_properties_ext)(
+            f.device(),
+            handle,
+            ptr.as_ptr().cast(),
+            &mut out,
+        )
+    }
+    .result()?;
+    Ok(out)
+}
+
+/// Logs the memory types the driver offers for importing a page of ordinary host memory, so
+/// that each vendor's choice shows in the log.
+pub(super) fn log_pointer_types(s: &Shared) {
+    let Some(f) = &s.host_memory_fn else { return };
+    let align = s.caps.limits.host_import_align.max(4096) as usize;
+    let layout = Layout::from_size_align(align, align).expect("a page layout");
+    // SAFETY: a nonzero size.
+    let Some(page) = NonNull::new(unsafe { std::alloc::alloc(layout) }) else {
+        return;
+    };
+    // SAFETY: a host allocation aligned as the device asks.
+    let types = unsafe { pointer_types(f, page) };
+    // SAFETY: allocated above with this layout.
+    unsafe { std::alloc::dealloc(page.as_ptr(), layout) };
+    let props = &s.memory.properties;
+    match types {
+        Ok(t) => {
+            let flags: Vec<String> = (0..props.memory_type_count)
+                .filter(|&i| t.memory_type_bits & (1 << i) != 0)
+                .map(|i| format!("{i} {:?}", props.memory_types[i as usize].property_flags))
+                .collect();
+            log::info!(
+                "host memory import (align {}): host pointers import as types {}",
+                s.caps.limits.host_import_align,
+                flags.join(", ")
+            );
+        }
+        Err(e) => log::warn!("host memory import: vkGetMemoryHostPointerPropertiesEXT: {e}"),
+    }
+}
+
+impl Device {
+    /// Imports the `len` bytes of host memory at `ptr` (`VK_EXT_external_memory_host`), with
+    /// `Caps::host_memory_import`: the GPU reads and writes them at [`ImportedMemory::gpu`],
+    /// as copies and kernels name addresses, while the CPU reads and writes them at `ptr`.
+    /// `ptr` and `len` are multiples of `Limits::host_import_align`. The memory type comes
+    /// from what the driver says of the pointer, coherent where it offers one; otherwise
+    /// [`ImportedMemory::flush`] makes CPU writes visible. `keep` is dropped once the import
+    /// ends and no submitted work uses it.
+    ///
+    /// # Safety
+    ///
+    /// The memory stays allocated, readable and writable, until `keep` is dropped.
+    pub unsafe fn import_host_memory(
+        &self,
+        ptr: NonNull<u8>,
+        len: u64,
+        keep: Box<dyn Any + Send + Sync>,
+        name: &str,
+    ) -> Result<ImportedMemory, Error> {
+        let s = &self.shared;
+        let f = s.host_memory_fn.as_ref().ok_or_else(|| {
+            Error::Invalid("host memory import needs Caps::host_memory_import".into())
+        })?;
+        let align = s.caps.limits.host_import_align;
+        if !(ptr.as_ptr() as u64).is_multiple_of(align) || !len.is_multiple_of(align) || len == 0 {
+            return Err(Error::Invalid(format!(
+                "{name}: {len} bytes at {ptr:p} are not whole units of {align}"
+            )));
+        }
+        let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+        // SAFETY: `ptr` is a host allocation the caller keeps, aligned as the device asks.
+        let pointer = unsafe { pointer_types(f, ptr) }
+            .map_err(Error::vk("vkGetMemoryHostPointerPropertiesEXT"))?;
+        let d = &s.device;
+        let (sharing_mode, families) = sharing(&s.families);
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle);
+        let info = vk::BufferCreateInfo::default()
+            .size(len)
+            .usage(usage())
+            .sharing_mode(sharing_mode)
+            .queue_family_indices(families)
+            .push(&mut external);
+        // SAFETY: valid create info.
+        let buffer =
+            unsafe { d.create_buffer(&info, None) }.map_err(Error::vk("vkCreateBuffer"))?;
+        let destroy = |e: Error| {
+            // SAFETY: nothing else holds the buffer.
+            unsafe { d.destroy_buffer(buffer, None) };
+            e
+        };
+        // SAFETY: the buffer is live.
+        let required = unsafe { d.get_buffer_memory_requirements(buffer) };
+        let bits = pointer.memory_type_bits & required.memory_type_bits;
+        let props = &s.memory.properties;
+        let flags = |i: u32| props.memory_types[i as usize].property_flags;
+        let pick = |want: vk::MemoryPropertyFlags| {
+            (0..props.memory_type_count).find(|&i| bits & (1 << i) != 0 && flags(i).contains(want))
+        };
+        let coherent = vk::MemoryPropertyFlags::HOST_COHERENT;
+        let ty = pick(coherent | vk::MemoryPropertyFlags::HOST_CACHED)
+            .or_else(|| pick(coherent))
+            .or_else(|| pick(vk::MemoryPropertyFlags::empty()))
+            .ok_or_else(|| {
+                destroy(Error::Invalid(format!(
+                    "{name}: no memory type imports it (pointer types {:#x}, buffer types {:#x})",
+                    pointer.memory_type_bits, required.memory_type_bits
+                )))
+            })?;
+        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(handle)
+            .host_pointer(ptr.as_ptr().cast());
+        let mut address_flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(len)
+            .memory_type_index(ty)
+            .push(&mut import)
+            .push(&mut address_flags);
+        // SAFETY: valid allocate info naming memory the caller keeps.
+        let memory = unsafe { d.allocate_memory(&alloc, None) }
+            .map_err(|e| destroy(Error::vk("vkAllocateMemory")(e)))?;
+        let free = |e: Error| {
+            // SAFETY: nothing else holds the memory.
+            unsafe { d.free_memory(memory, None) };
+            destroy(e)
+        };
+        // SAFETY: fresh buffer and memory of a type it takes, big enough for it.
+        unsafe { d.bind_buffer_memory(buffer, memory, 0) }
+            .map_err(|e| free(Error::vk("vkBindBufferMemory")(e)))?;
+        let atom = if flags(ty).contains(coherent) {
+            None
+        } else {
+            // SAFETY: host-visible memory, mapped once for the flushes.
+            unsafe { d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }
+                .map_err(|e| free(Error::vk("vkMapMemory")(e)))?;
+            Some(s.non_coherent_atom)
+        };
+        // SAFETY: the buffer has device-address usage and bound memory.
+        let address = unsafe {
+            d.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        };
+        name_object(&s.debug_fn, buffer, name);
+        s.register_range(address, len, buffer, name);
+        log::info!(
+            "{name}: imported {len} bytes of host memory as type {ty} ({:?}) of pointer types {:#x}",
+            flags(ty),
+            pointer.memory_type_bits
+        );
+        Ok(ImportedMemory {
+            gpu: GpuAddress(address),
+            size: len,
+            atom,
+            buffer,
+            memory,
+            keep: Some(keep),
+            shared: Arc::clone(s),
+        })
+    }
+}
