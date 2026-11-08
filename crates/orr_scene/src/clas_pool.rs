@@ -768,11 +768,6 @@ pub(crate) struct PoolBatch {
 }
 
 impl PoolBatch {
-    /// The CLAS it places, one results index each.
-    pub(crate) fn clas(&self) -> u32 {
-        self.count
-    }
-
     /// Takes why the pool grew by fewer pages than the batch's estimate needs, if it did.
     pub(crate) fn take_shortfall(&mut self) -> Option<Shortfall> {
         self.ops.shortfall.take()

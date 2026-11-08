@@ -6,21 +6,23 @@
 //! requests since the last step to the [`Residency`] manager, writes null over the entries
 //! of the units it evicts or coarsens their textures' residency maps (their memory returns
 //! once the frames that could read it have completed) and sends the loads to the loading
-//! thread. The frame's submit waits the taken batches' points. Under memory pressure the
-//! step shrinks the residency budgets, evicting streamed units, and the stream pool's
-//! blocks sit at low priority so the OS pages them out before anything else.
+//! thread in tasks of a few MiB, so the GPU work of a task starts while the later ones still
+//! read. The frame's submit waits the taken batches' points. Under memory pressure the step
+//! shrinks the residency budgets, evicting streamed units, and the stream pool's blocks sit
+//! at low priority so the OS pages them out before anything else.
 //!
 //! On the loading side a unit's blob, or a tile's chunk, is read through its mount's path
 //! and decompressed on a worker into staging, cached host memory: a range of the read arena
 //! where the device imports it, else a slot of the staging pool; mesh pages stay in their
 //! stored form there. A blob stored as it decodes is read straight into its staging. Where
 //! staging memory is device-local, as on unified memory, hierarchy and instance pages take
-//! their slots in staging memory and land there. When a task's last read ends, the loading
-//! thread unbinds the tiles evicted since the last task and binds the new ones in one sparse
-//! bind, copies the tiles in and decodes the mesh pages into their stream pool slots on the
-//! loading queue, submits the copies into the stream pool and the users' targets, builds the
-//! mesh pages' CLAS and hands the batch to the render thread, which drops the pages whose
-//! decode failed.
+//! their slots in staging memory and land there. Once a task's reads and those of the tasks
+//! sent before it have ended, the loading thread unbinds the tiles evicted since the last
+//! task and binds the new ones in one sparse bind, copies the tiles in and decodes the mesh
+//! pages into their stream pool slots on the loading queue, submits the copies into the
+//! stream pool and the users' targets, builds the mesh pages' CLAS and hands the batch to the
+//! render thread, which takes batches in the order their tasks were sent and drops the pages
+//! whose decode failed.
 //!
 //! The step also builds a streaming mesh's finer cached cuts once their pages are resident,
 //! holding those pages locked until no copy uses the cut, and moves tiles of a texture that
@@ -40,9 +42,7 @@ use orr_pack::{Blob, Codec};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::accel::{self, AccelShared, Animated, ClusterInfo, CutRow, FineCut, PageMicromap};
-use crate::clas_pool::{
-    self, ClasPool, LoadingSide, NO_UNIT, PageBuild, PoolBatch, PoolMicromap, Shortfall,
-};
+use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch, PoolMicromap, Shortfall};
 use crate::edit::Mirror;
 use crate::loading::{BlobSource, Loading, Msg, landed, read_into, reads_straight};
 use crate::memory::{Block, Pool, PoolSlot};
@@ -1186,7 +1186,7 @@ impl Streaming {
             }
             drop(staging);
             let mut clas = Vec::new();
-            for mut c in batch.clas {
+            if let Some(mut c) = batch.clas {
                 match c.take_shortfall() {
                     Some(Shortfall::Memory(e)) => {
                         self.residency.out_of_memory(governs(&self.governed, &e));
@@ -1199,7 +1199,7 @@ impl Streaming {
                     }
                     None => {}
                 }
-                clas.extend(self.replay(c));
+                clas = self.replay(c);
             }
             self.note_failures(&batch.loads);
             self.residency
@@ -1331,8 +1331,15 @@ impl Streaming {
                 },
             });
         }
+        let mut tasks = split_tasks(loads, self.clas.is_some());
         let clas_waits = self.clas.as_ref().is_some_and(|c| c.pending());
-        if !loads.is_empty() || !self.unbinds.is_empty() || clas_waits {
+        if tasks.is_empty() && (!self.unbinds.is_empty() || clas_waits) {
+            tasks.push(Vec::new());
+        }
+        // The first task unbinds, before any later one binds a tile again.
+        let mut unbinds = std::mem::take(&mut self.unbinds);
+        let near = Arc::new(Mutex::new(FxHashMap::default()));
+        for loads in tasks {
             let task = StreamTask {
                 accel: Arc::clone(&self.accel),
                 clas: self.clas.clone(),
@@ -1345,7 +1352,8 @@ impl Streaming {
                 done: Mutex::new(Vec::with_capacity(loads.len())),
                 copies: Mutex::new(Vec::new()),
                 decodes: Mutex::new(Vec::new()),
-                unbinds: std::mem::take(&mut self.unbinds),
+                unbinds: std::mem::take(&mut unbinds),
+                near: Arc::clone(&near),
                 loads,
             };
             loading.send(Msg::Stream(Arc::new(task)));
@@ -1772,6 +1780,49 @@ struct StreamLoad {
     kind: LoadKind,
 }
 
+impl StreamLoad {
+    /// The bytes it reads and places, and the CLAS it builds.
+    fn size(&self) -> (u64, u32) {
+        match &self.kind {
+            LoadKind::Pool { bytes, .. } => (u64::from(*bytes), 0),
+            LoadKind::Tile { stream, .. } => (stream.layout.tile_bytes, 0),
+            LoadKind::User { blob, .. } => (u64::from(blob.raw_len), 0),
+            LoadKind::MeshPage { stream, page } => {
+                let p = stream.pages[*page as usize];
+                (u64::from(p.bytes), p.clusters)
+            }
+        }
+    }
+}
+
+/// Bytes the loads of one stream task read and place, at most, past its first load. A task
+/// lands once every one of its reads and its GPU work have, so a step's loads go in tasks
+/// whose GPU work submits as their own reads end, while the later tasks still read.
+const TASK_BYTES: u64 = 8 << 20;
+
+/// A step's loads, in order, in tasks of at most [`TASK_BYTES`] and, when `builds` (mesh
+/// pages build CLAS), [`BATCH_CLAS`] CLAS each past their first load.
+fn split_tasks(loads: Vec<StreamLoad>, builds: bool) -> Vec<Vec<StreamLoad>> {
+    let mut tasks: Vec<Vec<StreamLoad>> = Vec::new();
+    let (mut bytes, mut clas) = (0, 0);
+    for load in loads {
+        let (b, c) = load.size();
+        let c = if builds { c } else { 0 };
+        match tasks.last_mut() {
+            Some(task) if bytes + b <= TASK_BYTES && clas + c <= BATCH_CLAS => {
+                task.push(load);
+                bytes += b;
+                clas += c;
+            }
+            _ => {
+                tasks.push(vec![load]);
+                (bytes, clas) = (b, c);
+            }
+        }
+    }
+    tasks
+}
+
 /// A copy from the staging pool.
 enum Copy {
     Buffer {
@@ -1786,6 +1837,9 @@ enum Copy {
     },
 }
 
+/// Each listed texture's last tile slot, by its stream's address.
+type NearTiles = FxHashMap<usize, (Arc<TexStream>, PoolSlot)>;
+
 /// One step's loads on the loading side.
 pub(crate) struct StreamTask {
     accel: Arc<AccelShared>,
@@ -1797,6 +1851,9 @@ pub(crate) struct StreamTask {
     device: Device,
     loads: Vec<StreamLoad>,
     unbinds: Vec<TileFree>,
+    /// Each texture's last tile slot among its step's tasks, by its stream's address, so its
+    /// next tile goes beside it; the stream stays alive while listed.
+    near: Arc<Mutex<NearTiles>>,
     /// The start chain plus one per read.
     outstanding: AtomicUsize,
     done: Mutex<Vec<Landed>>,
@@ -1838,8 +1895,8 @@ struct MeshLanded {
 pub(crate) struct StreamBatch {
     points: Vec<TimelinePoint>,
     loads: Vec<Landed>,
-    /// Its CLAS pool batches in submit order; a page's slots index their CLAS in order.
-    clas: Vec<PoolBatch>,
+    /// Its CLAS pool batch, whose results its pages' slots index.
+    clas: Option<PoolBatch>,
     decode: Option<PageDecodes>,
     /// The task's unbinds when its sparse bind failed, for the next task.
     unbinds: Vec<TileFree>,
@@ -1888,10 +1945,15 @@ impl StreamBatch {
 }
 
 impl StreamTask {
-    fn end(self: &Arc<Self>, loading: &Loading) {
+    fn end(&self, loading: &Loading) {
         if self.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
-            loading.send(Msg::StreamDone(Arc::clone(self)));
+            loading.send(Msg::StreamDone);
         }
+    }
+
+    /// Whether every one of its reads has ended.
+    pub(crate) fn read(&self) -> bool {
+        self.outstanding.load(Ordering::Acquire) == 0
     }
 
     fn fail(&self, what: What, e: Error) {
@@ -1990,8 +2052,7 @@ fn source_of(load: &StreamLoad) -> Result<(Blob, Option<u32>, u64, u64)> {
 
 /// Places a stream task's loads on the loading thread: memory for each, then its read.
 pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
-    // Each texture's last tile slot, so its next tile goes beside it.
-    let mut near: HashMap<*const TexStream, PoolSlot> = HashMap::new();
+    let mut near = task.near.lock().unwrap();
     let units_staged = task.units.lock().unwrap().kind() == MemoryKind::Staging;
     for (i, load) in task.loads.iter().enumerate() {
         let (b, chunk, len, slot_len) = match source_of(load) {
@@ -2047,15 +2108,15 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                 }
             }
             LoadKind::Tile { stream, after, .. } => {
-                let key = Arc::as_ptr(stream);
+                let key = Arc::as_ptr(stream).addr();
                 let slot = task.tiles.lock().unwrap().alloc(
                     &task.device,
                     len,
-                    after.or_else(|| near.get(&key).copied()),
+                    after.or_else(|| near.get(&key).map(|n| n.1)),
                 );
                 match slot {
                     Ok((slot, _)) => {
-                        near.insert(key, slot);
+                        near.insert(key, (Arc::clone(stream), slot));
                         (Some(Placed::Tile(slot)), None)
                     }
                     Err(e) => {
@@ -2229,16 +2290,18 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<StreamTask>)
     ) {
         Ok(()) => match &task.clas {
             // The other loads' work is submitted; only the pages it builds need it.
-            Some(pool) => {
-                let (batches, e) = build_clas(device, task, pool, &mut loads, &mut points);
-                error = e;
-                batches
-            }
-            None => Vec::new(),
+            Some(pool) => match build_clas(device, task, pool, &mut loads, &mut points) {
+                Ok(batch) => batch,
+                Err(e) => {
+                    error = fail_loads(&mut loads, e, |l| l.mesh.is_some());
+                    None
+                }
+            },
+            None => None,
         },
         Err(e) => {
             error = fail_loads(&mut loads, e, |_| true);
-            Vec::new()
+            None
         }
     };
     loading.push_stream(StreamBatch {
@@ -2379,76 +2442,29 @@ fn submit(
     Ok(())
 }
 
-/// CLAS one pool batch places at most. Every build of a batch takes its own region of the
-/// build scratch, so this bounds the scratch and staging a batch holds however many pages land
-/// in one task. The allocator itself places 40,000 CLAS in 20 to 40 ms in a 98,304-page
-/// (6 GiB) pool, about 10 to 20 us per run of CLAS.
+/// CLAS one stream task builds at most, past its first page: its pages build as one pool
+/// batch, and every build of a batch takes its own region of the build scratch, so this
+/// bounds the scratch and staging a batch holds. The allocator itself places 40,000 CLAS in
+/// 20 to 40 ms in a 98,304-page (6 GiB) pool, about 10 to 20 us per run of CLAS.
 const BATCH_CLAS: u32 = 4096;
 
-/// Builds the CLAS of a batch's streamed mesh pages on the loading queue after its other
-/// work, in pool batches of at most [`BATCH_CLAS`] CLAS (a page of more alone), and applies
-/// the pool's queued frees and takes with the first. Returns the batches submitted, in order,
-/// and an error no load carries. A batch that fails fails its pages and those of the batches
-/// after it; the ones before it still land.
+/// Builds the CLAS of a task's streamed mesh pages on the loading queue after its other work
+/// as one pool batch, which also applies the pool's queued frees and takes. Returns the batch
+/// submitted; none when there is nothing to build or apply.
 fn build_clas(
     device: &Device,
     task: &StreamTask,
     pool: &ClasPool,
     loads: &mut [Landed],
     points: &mut Vec<TimelinePoint>,
-) -> (Vec<PoolBatch>, Option<Error>) {
+) -> Result<Option<PoolBatch>> {
     let mut side = pool.side();
     let pages: Vec<usize> = (0..loads.len())
         .filter(|&i| loads[i].result.is_ok() && loads[i].mesh.is_some())
         .collect();
     if pages.is_empty() && !pool.pending() {
-        return (Vec::new(), None);
+        return Ok(None);
     }
-    let mut groups: Vec<Vec<usize>> = vec![Vec::new()];
-    let mut in_group = 0;
-    for &i in &pages {
-        let clusters = loads[i].mesh.as_ref().expect("decoded").clusters.len() as u32;
-        if !groups[groups.len() - 1].is_empty() && in_group + clusters > BATCH_CLAS {
-            groups.push(Vec::new());
-            in_group = 0;
-        }
-        groups.last_mut().expect("a group").push(i);
-        in_group += clusters;
-    }
-    let mut batches: Vec<PoolBatch> = Vec::new();
-    for (g, group) in groups.iter().enumerate() {
-        let offset = batches.iter().map(PoolBatch::clas).sum();
-        match build_group(device, task, pool, &mut side, loads, group, offset, points) {
-            Ok(b) => batches.push(b),
-            Err(e) => {
-                let failing: Vec<usize> = groups[g..].concat();
-                if failing.is_empty() {
-                    return (batches, Some(e));
-                }
-                let e = Arc::new(e);
-                for i in failing {
-                    loads[i].result = Err(Arc::clone(&e));
-                }
-                return (batches, None);
-            }
-        }
-    }
-    (batches, None)
-}
-
-/// Builds the CLAS of the mesh pages `pages` of `loads` as one pool batch, their results
-/// indices past `offset`.
-#[allow(clippy::too_many_arguments)]
-fn build_group(
-    device: &Device,
-    task: &StreamTask,
-    pool: &ClasPool,
-    side: &mut LoadingSide,
-    loads: &mut [Landed],
-    pages: &[usize],
-    offset: u32,
-    points: &mut Vec<TimelinePoint>,
-) -> Result<PoolBatch> {
     let builds: Vec<PageBuild<'_>> = pages
         .iter()
         .map(|&i| {
@@ -2475,7 +2491,7 @@ fn build_group(
     let triangles = task.accel.limits.clas_triangles;
     let out = clas_pool::build_pages(
         pool,
-        side,
+        &mut side,
         device,
         k,
         &mut list,
@@ -2489,16 +2505,16 @@ fn build_group(
     match queue.submit(vec![list], &wait) {
         Ok(p) => points.push(p),
         Err(e) => {
-            out.abandon(pool, side, &task.staging);
+            out.abandon(pool, &mut side, &task.staging);
             return Err(e.into());
         }
     }
     for ((&i, slots), micromap) in pages.iter().zip(out.slots).zip(out.micromaps) {
         let m = loads[i].mesh.as_mut().expect("decoded");
-        m.slots = slots.into_iter().map(|s| offset + s).collect();
+        m.slots = slots;
         m.micromap = micromap;
     }
-    Ok(out.batch)
+    Ok(Some(out.batch))
 }
 
 /// Decodes the task's staged mesh pages into their pool slots on the loading queue.

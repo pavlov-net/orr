@@ -30,8 +30,8 @@ pub(crate) enum Msg {
     Done(Arc<MountTask>),
     /// Streamed units to read and place.
     Stream(Arc<StreamTask>),
-    /// Every read of the stream task has finished.
-    StreamDone(Arc<StreamTask>),
+    /// Every read of a stream task has finished.
+    StreamDone,
     /// A finer cached cut to build.
     Cut(CutTask),
     /// An edit's pages to read and place.
@@ -367,9 +367,13 @@ impl Loading {
         take_landed(&self.edits, |b| b.landed(device))
     }
 
-    /// Takes every stream batch whose copies have completed, without waiting.
+    /// Takes the stream batches whose GPU work has completed, without waiting, in the order
+    /// their tasks were sent up to the first that has not: a load lands no earlier than one
+    /// it depends on, and CLAS pool batches replay in the order they ran.
     pub(crate) fn take_streams(&self, device: &Device) -> Vec<StreamBatch> {
-        take_landed(&self.streams, |b| b.landed(device))
+        let mut streams = self.streams.lock().unwrap();
+        let landed = streams.iter().take_while(|b| b.landed(device)).count();
+        streams.drain(..landed).collect()
     }
 }
 
@@ -626,6 +630,10 @@ pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
         ),
         None => log::info!("archive reads on workers into {arena}"),
     }
+    // Stream tasks finish in the order they were sent, each once its own reads and those of
+    // the tasks before it have ended: a tile's unbind then submits before a later task binds
+    // it again, and batches reach the render thread in the order their CLAS pool work runs.
+    let mut streams: VecDeque<Arc<StreamTask>> = VecDeque::new();
     loop {
         let msgs: Vec<Msg> = loading.inbox.lock().unwrap().drain(..).collect();
         let idle = msgs.is_empty();
@@ -638,8 +646,15 @@ pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
                     None => unreachable!("reads go to the ring only when there is one"),
                 },
                 Msg::Done(task) => finish(&loading, &device, &task),
-                Msg::Stream(task) => stream::start(&loading, &task),
-                Msg::StreamDone(task) => stream::finish(&loading, &device, &task),
+                Msg::Stream(task) => {
+                    stream::start(&loading, &task);
+                    streams.push_back(task);
+                }
+                Msg::StreamDone => {
+                    while let Some(task) = streams.pop_front_if(|t| t.read()) {
+                        stream::finish(&loading, &device, &task);
+                    }
+                }
                 Msg::Cut(task) => stream::build_cut(&loading, &device, task),
                 Msg::Edit(task) => edit::start(&task),
                 Msg::EditDone(task) => edit::finish(&loading, &device, &task),
