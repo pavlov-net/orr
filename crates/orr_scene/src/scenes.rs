@@ -866,6 +866,11 @@ impl Scenes {
         self.core.mounts.page(id)
     }
 
+    /// What placing instance page `id` takes of a scene's capacities.
+    pub fn page_needs(&self, id: PageId) -> Result<crate::PageNeeds> {
+        crate::scene::page_needs(&self.core.mounts, &self.core.model_cpu, id).map(|(n, ..)| n)
+    }
+
     #[cfg(feature = "testing")]
     pub(crate) fn texture_object(&self, m: MountId, id: AssetId) -> Option<Arc<orr_gpu::Texture>> {
         self.core.mounts.texture_object(m, id)

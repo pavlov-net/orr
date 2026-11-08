@@ -65,13 +65,13 @@ pub use orr_scene::{
     ExposureState, Focus, FrameStats, FrameTime, Glare, GroupWriter, InstanceFlags, InstancePage,
     InstancePageRef, InstanceRange, InstancesDesc, JobResult, Lens, LensDistortion, Light, LightId,
     LoadState, Loading, MaterialGpu, MaterialId, MaterialWriter, MediumData, ModelId, MountId,
-    NeuralTextures, Opacity, OriginPolicy, PackSource, PageId, PipelineId, Pose, ProducerBatch,
-    ProducerDesc, ProducerId, ProducerStats, ProducerUpdate, Projection, RasterGpu, ReloadReport,
-    RendererDesc, ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc, SceneId,
-    SceneRoot, SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats, Span, TextureFilter,
-    TextureSamplerGpu, TextureStreamGpu, TransformGroupDesc, TransformGroupId, TransparencyPass,
-    ViewConstants, ViewDesc, ViewHistoryId, ViewStep, WorldPos, abi, binding_sampler,
-    material_flags, orr_gpu, orr_pack,
+    NeuralTextures, Opacity, OriginPolicy, PackSource, PageId, PageNeeds, PipelineId, Pose,
+    ProducerBatch, ProducerDesc, ProducerId, ProducerStats, ProducerUpdate, Projection, RasterGpu,
+    ReloadReport, RendererDesc, ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc,
+    SceneId, SceneRoot, SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats, Span,
+    TextureFilter, TextureSamplerGpu, TextureStreamGpu, TransformGroupDesc, TransformGroupId,
+    TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId, ViewStep, WorldPos, abi,
+    binding_sampler, material_flags, orr_gpu, orr_pack,
 };
 
 use orr_gpu::{
@@ -789,6 +789,11 @@ impl Renderer {
 
     pub fn page(&self, id: PageId) -> Option<&InstancePage> {
         self.scenes.page(id)
+    }
+
+    /// What placing instance page `id` takes of a scene's capacities.
+    pub fn page_needs(&self, id: PageId) -> Result<PageNeeds> {
+        Ok(self.scenes.page_needs(id)?)
     }
 
     /// Wants the records of instance page `id` resident from the next frame on. Requests last

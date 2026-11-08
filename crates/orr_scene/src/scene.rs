@@ -17,7 +17,7 @@ use crate::lights::{
 use crate::material::{MaterialId, MaterialTable};
 use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
 use crate::memory::{RangeAllocator, UploadWindow};
-use crate::mount::{InstancePage, Mounts, PageId};
+use crate::mount::{InstancePage, Mounts, PageId, PagePrototype};
 use crate::producer::{self, Opacity, Producer, ProducerDesc, ProducerId, ProducerUpdate};
 use crate::ptlas::Ptlas;
 use crate::shaders::instance_page::PagePrototypeGpu;
@@ -108,6 +108,49 @@ impl Default for SceneDesc {
 }
 
 pub use orr_pack::AffineRows;
+
+/// What placing an instance page takes of a scene's capacities ([`SceneDesc`]), with the chains
+/// its models have now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageNeeds {
+    /// Of `instance_capacity`: one per record.
+    pub instances: u32,
+    /// Of `page_material_sets`: the sets of the prototypes that override materials.
+    pub material_sets: u32,
+    /// Of `emissive_capacity`: every copy takes room for the emissive and caster sections of
+    /// the most emissive model and chain of the page.
+    pub emissive: u32,
+}
+
+/// What placing page `id` takes, the emissive entries each copy takes, and its prototypes.
+pub(crate) fn page_needs(
+    mounts: &Mounts,
+    model_cpu: &[ModelCpu],
+    id: PageId,
+) -> Result<(PageNeeds, u32, Vec<PagePrototype>)> {
+    let page = mounts.page(id).ok_or(Error::UnknownPage(id))?;
+    let instances = u32::from(page.info.header.record_count);
+    let protos = mounts.page_prototypes(id)?;
+    let material_sets = protos
+        .iter()
+        .map(|p| p.sets.as_ref().map_or(0, |s| s.len() as u32))
+        .sum();
+    let stride = protos
+        .iter()
+        .map(|p| {
+            model_cpu
+                .get(p.model.0 as usize)
+                .map_or(0, |m| m.emissive_stride)
+        })
+        .max()
+        .unwrap_or(0);
+    let needs = PageNeeds {
+        instances,
+        material_sets,
+        emissive: instances * stride,
+    };
+    Ok((needs, stride, protos))
+}
 
 /// A transform group in one scene. Group 0 is the null group: it holds nothing and hides
 /// whatever names it.
@@ -1441,26 +1484,17 @@ impl<'f> SceneWriter<'f> {
         motion: Option<TransformGroupId>,
     ) -> Result<(InstanceRange, TransformGroupId)> {
         let page = self.mounts.page(r.page).ok_or(Error::UnknownPage(r.page))?;
-        let count = u32::from(page.info.header.record_count);
-        let protos = self.mounts.page_prototypes(r.page)?;
+        let (needs, stride, protos) = page_needs(self.mounts, self.model_cpu, r.page)?;
         if let Some(p) = protos.iter().find(|p| self.is_skinned(p.model)) {
             return Err(Error::SkinnedPage(p.model));
         }
         let header = page.info.header;
         let linear_rows = header.linear_rows(page.bytes as usize)? as u32;
-        let set_entries: u32 = protos
-            .iter()
-            .map(|p| p.sets.as_ref().map_or(0, |s| s.len() as u32))
-            .sum();
-        let empty = ModelCpu::default();
-        let model_cpu = |model: ModelId| self.model_cpu.get(model.0 as usize).unwrap_or(&empty);
-        // Every copy of the page takes room for the emissive sections of the most emissive
-        // model and chain.
-        let stride = protos
-            .iter()
-            .map(|p| model_cpu(p.model).emissive_stride)
-            .max()
-            .unwrap_or(0);
+        let PageNeeds {
+            instances: count,
+            material_sets: set_entries,
+            ..
+        } = needs;
         let copy_bytes = (protos.len() * size_of::<PagePrototypeGpu>()) as u64;
         let mut table = self.device.gpu_malloc::<u8>(
             MemoryKind::Upload,

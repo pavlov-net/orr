@@ -98,8 +98,8 @@ pub use ptlas::RtStats;
 pub use residency::{ClassStats, ResidencyClass, ResidencyStats};
 pub use scene::{
     AffineRows, CopyVariant, DebugLod, EnvironmentData, GroupWriter, InstanceFlags,
-    InstancePageRef, InstanceRange, InstancesDesc, MediumData, ModelId, Pose, SceneDesc, SceneId,
-    SceneWriter, SkinnedPageRef, TransformGroupDesc, TransformGroupId,
+    InstancePageRef, InstanceRange, InstancesDesc, MediumData, ModelId, PageNeeds, Pose, SceneDesc,
+    SceneId, SceneWriter, SkinnedPageRef, TransformGroupDesc, TransformGroupId,
 };
 pub use scenes::{
     Budgets, ConsumerMarker, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes,
