@@ -70,6 +70,13 @@ impl BestFit {
                 s = ps;
             }
         }
+        debug_assert!(
+            self.free
+                .range(start..)
+                .next()
+                .is_none_or(|(&ns, _)| ns >= e),
+            "range {start}+{count} freed twice"
+        );
         if let Some(&ne) = self.free.get(&e) {
             self.remove(e, ne);
             e = ne;
