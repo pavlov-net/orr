@@ -219,18 +219,46 @@ fn ring_library() -> Option<HMODULE> {
 /// them.
 const REGISTRATION: usize = 1 << (usize::BITS - 1);
 
-/// Pages for read buffers.
-pub(crate) fn alloc_pages(len: usize) -> io::Result<NonNull<u8>> {
-    // SAFETY: a new private allocation, which aliases nothing.
-    let p = unsafe {
-        VirtualAlloc(
-            std::ptr::null(),
-            len,
-            (MEM_RESERVE | MEM_COMMIT) as u32,
-            PAGE_READWRITE as u32,
-        )
+/// Pages for read buffers, from a multiple of `align`, a power of two.
+pub(crate) fn alloc_pages(len: usize, align: usize) -> io::Result<NonNull<u8>> {
+    let commit = |at: *const c_void| {
+        // SAFETY: a new private allocation, which aliases nothing.
+        let p = unsafe {
+            VirtualAlloc(
+                at,
+                len,
+                (MEM_RESERVE | MEM_COMMIT) as u32,
+                PAGE_READWRITE as u32,
+            )
+        };
+        NonNull::new(p.cast::<u8>())
     };
-    NonNull::new(p.cast()).ok_or_else(io::Error::last_os_error)
+    // Allocations start at the allocation granularity, 64 KiB on every Windows.
+    if align <= 1 << 16 {
+        return commit(std::ptr::null()).ok_or_else(io::Error::last_os_error);
+    }
+    // Past it, find an aligned start in a reservation with room for one, then free the
+    // reservation and allocate there, again if another thread took the range meanwhile.
+    loop {
+        // SAFETY: a reservation of nothing anything uses.
+        let room = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len + align,
+                MEM_RESERVE as u32,
+                PAGE_READWRITE as u32,
+            )
+        };
+        if room.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let at = (room as usize).next_multiple_of(align);
+        // SAFETY: the reservation made above, freed once.
+        unsafe { VirtualFree(room, 0, MEM_RELEASE as u32) };
+        if let Some(p) = commit(at as *const c_void) {
+            return Ok(p);
+        }
+    }
 }
 
 /// Frees what [`alloc_pages`] returned.

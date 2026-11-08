@@ -144,18 +144,14 @@ impl Loading {
     /// where it can.
     pub(crate) fn new(positioned: bool, arena_bytes: u64, device: Option<&Device>) -> Result<Self> {
         let device = device.filter(|d| d.caps().host_memory_import);
-        let align = device.map_or(1, |d| d.caps().limits.host_import_align);
-        let bytes = usize::try_from(arena_bytes.next_multiple_of(align))
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-        let buffers = ReadBuffers::new(bytes)?;
+        let align = device.map_or(SECTOR as u64, |d| d.caps().limits.host_import_align);
+        let too_large = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        let bytes =
+            usize::try_from(arena_bytes.next_multiple_of(align)).map_err(|_| too_large())?;
+        let align = usize::try_from(align).map_err(|_| too_large())?;
+        let buffers = ReadBuffers::aligned(bytes, align)?;
         let (at, len) = buffers.pages();
         let imported = match device {
-            Some(_) if !(at.as_ptr() as u64).is_multiple_of(align) => {
-                log::warn!(
-                    "the read arena's pages at {at:p} miss the device's import alignment {align}"
-                );
-                None
-            }
             // SAFETY: the clone keeps the arena's pages until the import drops it.
             Some(d) => Some(unsafe {
                 d.import_host_memory(at, len as u64, Box::new(buffers.clone()), "read arena")

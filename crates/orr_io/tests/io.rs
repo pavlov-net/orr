@@ -333,3 +333,16 @@ fn handles_opened_together_name_one_file_while_the_path_is_replaced() {
         }
     });
 }
+
+#[test]
+fn an_arena_starts_at_an_alignment_past_the_page_and_holds_its_bytes() {
+    let align = 1 << 21;
+    let buffers = ReadBuffers::aligned(3 * SECTOR, align).unwrap();
+    let (at, len) = buffers.pages();
+    assert!(at.as_ptr().addr().is_multiple_of(align) && len == 3 * SECTOR);
+    let mut buf = buffers.try_take(len).expect("the whole arena");
+    buf.spare_capacity_mut().fill(std::mem::MaybeUninit::new(7));
+    // SAFETY: every byte was just written.
+    unsafe { buf.set_filled(len) };
+    assert!(buf.as_slice().iter().all(|&b| b == 7));
+}

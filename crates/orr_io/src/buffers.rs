@@ -72,11 +72,18 @@ pub struct ReadBuffers(pub(crate) Arc<Arena>);
 impl ReadBuffers {
     /// An arena of at least `bytes`, and at least a sector.
     pub fn new(bytes: usize) -> io::Result<Self> {
+        Self::aligned(bytes, SECTOR)
+    }
+
+    /// As [`ReadBuffers::new`], with the arena's pages starting at a multiple of `align`, a
+    /// power of two, as a GPU importing them may ask.
+    pub fn aligned(bytes: usize, align: usize) -> io::Result<Self> {
+        assert!(align.is_power_of_two(), "a power-of-two alignment");
         let len = AlignedBuf::capacity_for(bytes);
         let units = u32::try_from(len / SECTOR)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "read arena too large"))?;
         Ok(Self(Arc::new(Arena {
-            pages: Pages::new(len)?,
+            pages: Pages::new(len, align)?,
             free: Mutex::new(RangeAllocator::new(units)),
         })))
     }
@@ -184,16 +191,21 @@ unsafe impl Send for Pages {}
 unsafe impl Sync for Pages {}
 
 impl Pages {
-    fn new(len: usize) -> io::Result<Self> {
+    /// `len` bytes from a multiple of `align`, a power of two.
+    fn new(len: usize, align: usize) -> io::Result<Self> {
         #[cfg(windows)]
-        let ptr = crate::windows::alloc_pages(len)?;
+        let ptr = crate::windows::alloc_pages(len, align)?;
         #[cfg(unix)]
         let ptr = {
+            // SAFETY: sysconf has no preconditions.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            // Past a page, map room for an aligned start and unmap what lies around it.
+            let extra = if align > page { align } else { 0 };
             // SAFETY: a new private anonymous mapping, which aliases nothing.
             let p = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
-                    len,
+                    len + extra,
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                     -1,
@@ -203,7 +215,19 @@ impl Pages {
             if p == libc::MAP_FAILED {
                 return Err(io::Error::last_os_error());
             }
-            NonNull::new(p.cast()).expect("a mapping is not null")
+            let head = (p as usize).next_multiple_of(align) - p as usize;
+            // SAFETY: the parts of the mapping before the aligned start and past its `len`
+            // bytes, whole pages as both ends are, which nothing uses.
+            unsafe {
+                if head > 0 {
+                    libc::munmap(p, head);
+                }
+                if extra > head {
+                    libc::munmap(p.cast::<u8>().add(head + len).cast(), extra - head);
+                }
+            }
+            // SAFETY: inside the mapping.
+            NonNull::new(unsafe { p.cast::<u8>().add(head) }).expect("a mapping is not null")
         };
         Ok(Self { ptr, len })
     }
