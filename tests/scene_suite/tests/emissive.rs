@@ -13,7 +13,7 @@ use orr_pack::mesh::{Cluster, MeshInfo};
 use orr_pack::{Archive, AssetId, Class, Span, Target};
 use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
-    ClusterRef, ClusterTopology, CopyVariant, EditDesc, EmissiveGpu, FrameDesc, FrameTime,
+    Budgets, ClusterRef, ClusterTopology, CopyVariant, EditDesc, EmissiveGpu, FrameDesc, FrameTime,
     GroupWriter, InstanceFlags, InstanceGpu, InstancePageRef, InstanceRange, InstancesDesc,
     LoadState, MaterialGpu, MaterialId, MeshGpu, ModelGpu, ModelId, MountId, PackSource,
     ProducerDesc, ProducerId, ProducerUpdate, RendererDesc, RtCutGpu, SceneCompute, SceneDesc,
@@ -1152,6 +1152,214 @@ fn a_page_takes_entries_for_each_prototype_s_copies() {
         live,
         2 * all,
         "the entries the page held before are emptied"
+    );
+    assert_clean();
+}
+
+/// The clusters of streamed pages that `root`'s instance entries list this frame, after checking
+/// that every cluster an entry lists, by a cooked set of `sets` or a gathered list, is the cluster
+/// its id names, on a page resident this frame.
+fn listed_streamed_clusters(root: &SceneRoot, sets: &orr_pack::mesh::ClusterSets) -> u32 {
+    let mut streamed = 0;
+    let all = entries(root);
+    for (i, e) in (0..).zip(&all).skip(root.producer_capacity as usize) {
+        if e.kind != 1 || e.set == u32::MAX {
+            continue;
+        }
+        let inst: InstanceGpu = read_buffer(root.instances.offset(u64::from(e.source)), 1)[0];
+        let model: ModelGpu = read_buffer(root.models.offset(u64::from(inst.model)), 1)[0];
+        let mesh: MeshGpu = read_buffer(root.meshes.offset(u64::from(model.mesh)), 1)[0];
+        let n = u64::from(mesh.page_count);
+        let pages: Vec<u64> = read_buffer(mesh.pages, n);
+        let firsts: Vec<u32> = read_buffer(mesh.page_clusters, n + 1);
+        let bases: Vec<u32> = read_buffer(mesh.page_bases, n);
+        let page_of = |c: u32| firsts.partition_point(|&f| f <= c) - 1;
+        let ids: Vec<u32> = if e.set == GATHERED_SET {
+            let at = (i - root.producer_capacity) * 2 * GATHERED_CLUSTERS;
+            let n = e.gathered.min(GATHERED_CLUSTERS);
+            read_buffer(root.emissive_lists.offset(u64::from(at)), u64::from(n))
+        } else {
+            let k = sets.sets[e.set as usize];
+            sets.clusters[k.first as usize..(k.first + k.count) as usize]
+                .iter()
+                .map(|&c| {
+                    let p = page_of(c);
+                    assert_ne!(pages[p], 0, "a cooked set lists page {p}, which is absent");
+                    bases[p] + c - firsts[p]
+                })
+                .collect()
+        };
+        assert_eq!(ids.len() as u32, e.cluster_count, "entry {i}'s clusters");
+        assert!(e.area > 0.0, "entry {i} lists clusters of no area");
+        for id in ids {
+            let r: ClusterRef = read_buffer(root.clusters.offset(u64::from(id)), 1)[0];
+            let p = page_of(r.mesh_cluster);
+            assert_ne!(pages[p], 0, "entry {i}: id {id} is on absent page {p}");
+            assert_eq!(r.page.address().0, pages[p], "entry {i}: id {id}'s page");
+            assert_eq!(
+                (bases[p] + r.local, firsts[p] + r.local),
+                (id, r.mesh_cluster),
+                "entry {i}: id {id}"
+            );
+            if p >= mesh.pinned_pages as usize {
+                streamed += 1;
+            }
+        }
+    }
+    streamed
+}
+
+/// Copies of an emissive mesh in two mounts, under a mesh page budget that holds one mount's
+/// streamed pages: as the near copy's pages land, and as they give way to the other mount's,
+/// each frame's entries list only clusters of pages resident in that frame, by their ids.
+#[test]
+fn a_streaming_emissive_mesh_lists_only_resident_clusters() {
+    let d = device();
+    let c = d.caps().cluster;
+    if c.max_tris == 0 || c.max_partitions == 0 {
+        return;
+    }
+    let bytes = pack_of(vec![sheet_asset(
+        "lamp",
+        sheet(160, (160, 80)),
+        lamp_materials(),
+        LodMode::Dag,
+    )]);
+    let archive = Archive::from_memory(Arc::clone(&bytes)).unwrap();
+    let entry = archive.find(AssetId::from_name("lamp/mesh")).unwrap();
+    let info = MeshInfo::parse(&read_blob(&archive, &archive.blobs(entry)[0])).unwrap();
+    let pinned = info.header.pinned_pages as usize;
+    assert!(pinned < info.pages.len(), "the lamp has streamed pages");
+    // Both mounts' pinned pages and one mount's streamed pages with their CLAS estimates.
+    let page = |p: &orr_pack::mesh::PageInfo| u64::from(p.resident_len).next_multiple_of(256);
+    let clas = |p: &orr_pack::mesh::PageInfo| {
+        (32 * u64::from(p.tri_count) + 256 * u64::from(p.cluster_count)).next_multiple_of(128)
+    };
+    let budget = 2 * info.pages[..pinned].iter().map(page).sum::<u64>()
+        + info.pages[pinned..]
+            .iter()
+            .map(|p| page(p) + clas(p))
+            .sum::<u64>();
+    let desc = RendererDesc {
+        budgets: Budgets {
+            mesh_resident_max: 0,
+            mesh_page_pool: budget,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    };
+    let mut scenes = Scenes::new(d, &desc).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let s = scenes
+        .create_scene(&SceneDesc {
+            emissive_capacity: 4,
+            ..SceneDesc::default()
+        })
+        .unwrap();
+    let mut models = [ModelId(0); 2];
+    for model in &mut models {
+        let m = scenes.mount(PackSource::Memory(Arc::clone(&bytes)));
+        while matches!(scenes.mount_state(m), LoadState::Pending) {
+            let f = scenes.begin_frame(&frame(&[])).unwrap();
+            f.end(&[]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        *model = scenes.model(m, AssetId::from_name("lamp")).unwrap();
+    }
+    let list = [s];
+    // 100 m across, its near corner `x` m along x from the focus.
+    let at = |x: f32| {
+        Affine3::from_scale_rotation_translation(
+            Vec3::splat(33.0),
+            Quat::IDENTITY,
+            Vec3::new(x, 0.0, 0.0),
+        )
+    };
+    let step = |scenes: &mut Scenes, moves: &[(u32, f32)]| {
+        let mut f = scenes.begin_frame(&frame(&list)).unwrap();
+        let mut w = f.scene(s).unwrap();
+        w.set_focus(DVec3::new(0.0, 3.0, 0.0));
+        for &(i, x) in moves {
+            w.transforms(TransformGroupId(1), i, 1).unwrap()[0] = at(x).into();
+        }
+        drop(w);
+        let mut root = GpuPtr::NULL;
+        f.update_scenes(&mut |c| root = c.root).unwrap();
+        wait(f.end(&[]).unwrap());
+        let root: SceneRoot = read_buffer(root, 1)[0];
+        (listed_streamed_clusters(&root, &info.emissive), root)
+    };
+    // The streamed pages of the first mount's mesh that are resident.
+    let resident = |root: &SceneRoot| -> Vec<usize> {
+        let model: ModelGpu = read_buffer(root.models.offset(u64::from(models[0].0)), 1)[0];
+        let mesh: MeshGpu = read_buffer(root.meshes.offset(u64::from(model.mesh)), 1)[0];
+        let pages: Vec<u64> = read_buffer(mesh.pages, u64::from(mesh.page_count));
+        (pinned..pages.len()).filter(|&p| pages[p] != 0).collect()
+    };
+    let mut f = scenes.begin_frame(&frame(&list)).unwrap();
+    let mut w = f.scene(s).unwrap();
+    let g = w
+        .create_transform_group(&TransformGroupDesc {
+            count: 2,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    assert_eq!(g, TransformGroupId(1));
+    w.transforms(g, 0, 2).unwrap().fill(at(0.0).into());
+    for (i, &model) in (0..).zip(&models) {
+        w.add_instances(&InstancesDesc {
+            model,
+            copies: 1,
+            transforms: g,
+            first: i,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 1000.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    }
+    drop(w);
+    f.update_scenes(&mut |_| {}).unwrap();
+    wait(f.end(&[]).unwrap());
+
+    // Until the near copy traces a finer cut over its streamed pages, and a few frames on.
+    let (mut streamed, mut root) = step(&mut scenes, &[(1, 800.0)]);
+    let mut after = 0;
+    for _ in 0..2000 {
+        let (n, r) = step(&mut scenes, &[]);
+        (streamed, root) = (streamed + n, r);
+        if streamed > 0 {
+            after += 1;
+        }
+        if after == 8 {
+            break;
+        }
+    }
+    assert_eq!(after, 8, "the near copy never listed a streamed cluster");
+    let landed = resident(&root);
+    assert!(!landed.is_empty(), "the near copy's pages landed");
+
+    // The far mount's pages move in near the focus and the first mount's give way.
+    step(&mut scenes, &[(0, 800.0), (1, 0.0)]);
+    let mut after = 0;
+    for _ in 0..2000 {
+        scenes.prefetch(models[1], 0);
+        let (_, root) = step(&mut scenes, &[]);
+        let now = resident(&root);
+        if after > 0 || landed.iter().any(|p| !now.contains(p)) {
+            after += 1;
+        }
+        if after == 8 {
+            break;
+        }
+    }
+    assert_eq!(
+        after, 8,
+        "none of the first mount's streamed pages gave way"
     );
     assert_clean();
 }
