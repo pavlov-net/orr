@@ -13,8 +13,8 @@ use orr_scene::{
     ClusterRef, ClusterTopology, CopyVariant, EditDesc, EmissiveGpu, FrameDesc, FrameTime,
     GroupWriter, InstanceFlags, InstanceGpu, InstanceRange, InstancesDesc, LoadState, MaterialGpu,
     MaterialId, MeshGpu, ModelGpu, ModelId, MountId, PackSource, ProducerDesc, ProducerId,
-    ProducerUpdate, RendererDesc, RtCutGpu, SceneDesc, SceneId, SceneRoot, Scenes, SlotStateGpu,
-    TransformGroupDesc, TransformGroupId, material_flags,
+    ProducerUpdate, RendererDesc, RtCutGpu, SceneCompute, SceneDesc, SceneId, SceneRoot, Scenes,
+    SlotStateGpu, TransformGroupDesc, TransformGroupId, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 use scene_suite::shaders::emit;
@@ -589,6 +589,21 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         DVec3::new(0.25, 0.5, 1.0) * 4.0,
     ];
     let list = [s];
+    let dispatch = |c: &mut SceneCompute<'_, '_>, emits: &[(ProducerId, u32, f32)]| {
+        for &(producer, count, size) in emits {
+            let r = c
+                .put_root(&emit::Root {
+                    scene: c.root,
+                    triangles: quad.gpu(),
+                    producer: producer.0,
+                    count,
+                    size,
+                    _pad: 0,
+                })
+                .unwrap();
+            c.cmd.dispatch(&p, r, [count.div_ceil(64).max(1), 1, 1]);
+        }
+    };
     let run = |scenes: &mut Scenes,
                write: &mut dyn FnMut(&mut orr_scene::SceneWriter<'_>),
                emits: &[(ProducerId, u32, f32)]|
@@ -598,19 +613,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         let mut root = GpuPtr::NULL;
         f.update_scenes(&mut |c| {
             root = c.root;
-            for &(producer, count, size) in emits {
-                let r = c
-                    .put_root(&emit::Root {
-                        scene: c.root,
-                        triangles: quad.gpu(),
-                        producer: producer.0,
-                        count,
-                        size,
-                        _pad: 0,
-                    })
-                    .unwrap();
-                c.cmd.dispatch(&p, r, [count.div_ceil(64).max(1), 1, 1]);
-            }
+            dispatch(c, emits);
         })
         .unwrap();
         wait(f.end(&[]).unwrap());
@@ -666,7 +669,9 @@ fn producer_power_follows_emitted_clusters_every_frame() {
     )
     .unwrap();
     drop(w);
-    f.update_scenes(&mut |_| {}).unwrap();
+    // A static entry emits in the frame of its `set_producer` only.
+    f.update_scenes(&mut |c| dispatch(c, &[(ProducerId(2), 11, 0.5)]))
+        .unwrap();
     wait(f.end(&[]).unwrap());
 
     let expected = |m: DMat3, count: u32, size: f64| {
@@ -684,22 +689,15 @@ fn producer_power_follows_emitted_clusters_every_frame() {
     // The static entry emits once; the other changes count and size every frame with no
     // write to the list.
     let statics = expected(DMat3::IDENTITY, 11, 0.5);
-    for (frame, &(count, size)) in [
+    for &(count, size) in &[
         (11, 0.5),
         (7, 1.0),
         (64, 0.25),
         (99, 2.0),
         (3, 0.125),
         (0, 1.0),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let mut emits = vec![(ProducerId(1), count, size)];
-        if frame == 0 {
-            emits.push((ProducerId(2), 11, 0.5));
-        }
-        let root = run(&mut scenes, &mut |_| {}, &emits);
+    ] {
+        let root = run(&mut scenes, &mut |_| {}, &[(ProducerId(1), count, size)]);
         let all = entries(&root);
         check(
             &all[1],
