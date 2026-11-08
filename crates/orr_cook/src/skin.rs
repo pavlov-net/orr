@@ -591,7 +591,7 @@ impl Skeleton {
                 let joints = self.joints_from(usize::from(first));
                 let mut seated = joints.filter(|&j| self.bind(j as u16).is_ok());
                 let shaped = |&j: &usize| holds_shape(self.inverse_binds[j]);
-                let j = seated.clone().find(shaped).or(seated.next_back());
+                let j = seated.clone().find(shaped).or_else(|| seated.next_back());
                 let j = j.map_or(first, |j| j as u16);
                 return Ok((j, self.bind(j)? * graph.relative(n, node)));
             }

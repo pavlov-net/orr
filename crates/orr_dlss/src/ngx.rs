@@ -414,7 +414,7 @@ impl Ngx {
         }
         let r = self
             .callback(callback)
-            .ok_or(DlssError::Unsupported(upscaler.name()))?;
+            .ok_or_else(|| DlssError::Unsupported(upscaler.name()))?;
         check(call, r)?;
         let render = [
             self.get_ui(NVSDK_NGX_Parameter_OutWidth),

@@ -642,9 +642,10 @@ impl Swapchain {
             .timeout(timeout.as_nanos().min(u128::from(u64::MAX)) as u64);
         // SAFETY: the swapchain is live and the lock is held.
         match unsafe { wait2.wait_for_present2(locked.raw, &info) } {
-            Ok(()) => Ok(true),
+            Ok(()) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => {
+                Ok(true)
+            }
             Err(vk::Result::TIMEOUT) => Ok(false),
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => Ok(true),
             Err(e) => Err(self.shared().vk_error("vkWaitForPresent2KHR", e)),
         }
     }

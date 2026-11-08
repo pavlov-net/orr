@@ -1505,7 +1505,6 @@ impl<'a> Frame<'a> {
                 let before = g.record();
                 let fresh = g.created_frame == self.id;
                 match g.writer {
-                    GroupWriter::Page => {}
                     GroupWriter::Cpu => {
                         if g.written && !fresh {
                             copies.push((
@@ -1520,7 +1519,7 @@ impl<'a> Frame<'a> {
                         g.current = 1 - g.current;
                         g.previous_is_current = false;
                     }
-                    GroupWriter::Gpu => {}
+                    GroupWriter::Page | GroupWriter::Gpu => {}
                 }
                 g.written = false;
                 let after = g.record();

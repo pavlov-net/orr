@@ -268,7 +268,7 @@ impl Library {
         let library = unsafe { libloading::Library::new(path)? };
         // SAFETY: the symbols are declared with the signatures of the release's slang.h.
         let api = unsafe { sys::SlangLib::from_library(library)? };
-        let dir = path.parent().unwrap_or(Path::new("."));
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let dir = CString::new(dir.to_string_lossy().as_bytes()).expect("path has no nul");
         Ok(Arc::new(Self {
             api,
@@ -609,7 +609,7 @@ impl Program {
                 let r = (v.get_item_data)(result.as_ptr(), i, &mut blob);
                 let blob = Com::from_raw(blob)
                     .filter(|_| !failed(r))
-                    .ok_or(format!("getItemData({i}) failed: {r:#x}"))?;
+                    .ok_or_else(|| format!("getItemData({i}) failed: {r:#x}"))?;
                 words(blob_bytes(&blob))
             };
             Ok((item(0)?, item(1)?))

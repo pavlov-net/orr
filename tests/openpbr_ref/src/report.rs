@@ -314,7 +314,7 @@ impl Results {
                     Some(l) => a.lobes.get(&l).copied().unwrap_or_default(),
                     None => a.total,
                 };
-                let label = lobe.map_or("total".to_owned(), Lobe::name);
+                let label = lobe.map_or_else(|| "total".to_owned(), Lobe::name);
                 let cells: Vec<String> = m
                     .albedo
                     .iter()

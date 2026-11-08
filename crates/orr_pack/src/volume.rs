@@ -304,7 +304,7 @@ pub struct VolumeInfo {
 impl VolumeInfo {
     pub fn parse(blob: &[u8]) -> Result<Self> {
         let malformed = Error::Malformed;
-        let h: VolumeHeader = read(blob, 0).ok_or(malformed("volume header"))?;
+        let h: VolumeHeader = read(blob, 0).ok_or_else(|| malformed("volume header"))?;
         let grids: Vec<VolumeGrid> = table(blob, h.grids)?;
         let name_bytes: Vec<u8> = table(blob, h.names)?;
         let bricks: Vec<VolumeBrick> = table(blob, h.brick_table)?;
@@ -327,13 +327,13 @@ impl VolumeInfo {
                 .checked_add(g.name.count as usize)
                 .and_then(|end| name_bytes.get(at..end))
                 .and_then(|b| std::str::from_utf8(b).ok())
-                .ok_or(malformed("volume grid name"))?;
+                .ok_or_else(|| malformed("volume grid name"))?;
             names.push(name.to_owned());
             let first = g.bricks.first as usize;
             let own = first
                 .checked_add(g.bricks.count as usize)
                 .and_then(|end| bricks.get(first..end))
-                .ok_or(malformed("volume grid bricks"))?;
+                .ok_or_else(|| malformed("volume grid bricks"))?;
             let mut last = None;
             for b in own {
                 if (0..3).any(|a| u32::from(b.coord[a]) >= h.bricks[a]) {

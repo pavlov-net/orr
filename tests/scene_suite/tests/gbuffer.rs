@@ -8868,7 +8868,7 @@ fn surface_params_under(
     };
     let materials = upload(bytemuck::cast_slice(records), "materials");
     let decals = upload(
-        bytemuck::cast_slice(&[decal.unwrap_or(bytemuck::Zeroable::zeroed())]),
+        bytemuck::cast_slice(&[decal.unwrap_or_else(bytemuck::Zeroable::zeroed)]),
         "decals",
     );
     let refs = upload(bytemuck::bytes_of(&0u32), "decal refs");

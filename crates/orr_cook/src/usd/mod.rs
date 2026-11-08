@@ -624,13 +624,13 @@ impl<'s> Importer<'s> {
                 ));
             }
         }
-        let time = settings
-            .time
-            .unwrap_or(if stage.has_authored_time_code_range() {
+        let time = settings.time.unwrap_or_else(|| {
+            if stage.has_authored_time_code_range() {
                 stage.start_time_code()
             } else {
                 0.0
-            });
+            }
+        });
         Ok(Self {
             settings,
             stage,
@@ -2506,7 +2506,7 @@ impl<'s> Importer<'s> {
             .attribute(name)
             .time_sample_times()
             .map_err(|e| format!("{} {name}: {e}", r.path()))?;
-        let first = times.first().map_or(f64::from(self.time), |&t| t);
+        let first = times.first().map_or_else(|| f64::from(self.time), |&t| t);
         let empty = r.at(first).numbers(name)?.is_none_or(|v| v.is_empty());
         Ok(if empty { "orientations" } else { name })
     }

@@ -131,7 +131,7 @@ impl KernelSet {
                 .entry_points
                 .iter()
                 .find(|r| r.name == e.name)
-                .ok_or(mismatch(Mismatch::EntryPoints))?;
+                .ok_or_else(|| mismatch(Mismatch::EntryPoints))?;
             if r.stage != e.stage || r.workgroup != e.workgroup {
                 return Err(mismatch(Mismatch::Stage { entry: e.name }));
             }

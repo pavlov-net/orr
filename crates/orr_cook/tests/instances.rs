@@ -820,7 +820,7 @@ fn assemblies_place_their_units_through_instance_sources() {
     let r = cook_with_report(vec![assembly_model(&path), paint.clone(), scatter(joined)]);
     assert!(matches!(r, Err(Error::Instances { .. })), "{:?}", r.err());
     // Uneven scale over a unit copy's rotation shears it, which a table row holds.
-    let mut uneven = src.clone();
+    let mut uneven = src;
     uneven.records[0].linear = Linear::Scaled {
         rotation: Quat::from_rotation_y(0.4).to_array(),
         scale: [1.0, 2.0, 1.0],

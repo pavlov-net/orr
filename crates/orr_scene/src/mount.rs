@@ -2558,7 +2558,7 @@ impl Mounts {
                 .lock()
                 .unwrap()
                 .alloc(clusters)
-                .ok_or(capacity("resident clusters", self.accel.cluster_capacity))?,
+                .ok_or_else(|| capacity("resident clusters", self.accel.cluster_capacity))?,
             clusters,
             mesh: self.mesh_ids.alloc(1),
             pages_at: self.page_ranges.alloc(page_count),
@@ -3426,13 +3426,13 @@ impl Mounts {
             let id = self
                 .mesh_ids
                 .alloc(1)
-                .ok_or(capacity("meshes", self.sizes.meshes))?;
+                .ok_or_else(|| capacity("meshes", self.sizes.meshes))?;
             res.meshes.push(id);
             let n = m.page_addresses.len() as u32;
             let start = self
                 .page_ranges
                 .alloc(n)
-                .ok_or(capacity("mesh page table", self.sizes.page_table))?;
+                .ok_or_else(|| capacity("mesh page table", self.sizes.page_table))?;
             res.page_ranges.push((start, n));
             let table = self.page_table.gpu().offset(u64::from(start));
             tables.push(table);
@@ -3470,14 +3470,14 @@ impl Mounts {
             let id = ModelId(
                 self.model_ids
                     .alloc(1)
-                    .ok_or(capacity("models", self.sizes.models))?,
+                    .ok_or_else(|| capacity("models", self.sizes.models))?,
             );
             res.models.insert(m.id, id);
             let n = m.materials.len() as u32;
             let start = self
                 .model_material_ranges
                 .alloc(n)
-                .ok_or(capacity("model materials", self.sizes.model_materials))?;
+                .ok_or_else(|| capacity("model materials", self.sizes.model_materials))?;
             res.material_ranges.push((start, n));
             let section_materials: Vec<MaterialId> =
                 m.materials.iter().map(|&i| material_ids[i]).collect();

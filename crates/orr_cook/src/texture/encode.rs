@@ -33,9 +33,8 @@ impl Encoding {
     pub(super) fn of(usage: Usage, signed: bool, float: bool) -> Self {
         match usage {
             Usage::Color | Usage::ColorAlpha => Self::Bc7Srgb,
-            Usage::Normal => Self::Bc5,
             Usage::Linear2 if signed => Self::Bc5Snorm,
-            Usage::Linear2 => Self::Bc5,
+            Usage::Normal | Usage::Linear2 => Self::Bc5,
             Usage::Linear1 if signed => Self::Bc4Snorm,
             Usage::Linear1 => Self::Bc4,
             Usage::Linear4 => Self::Bc7,

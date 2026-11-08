@@ -639,7 +639,7 @@ impl Builder {
         let sizes = d
             .gpu_malloc::<u32>(MemoryKind::Readback, u64::from(n), "sizes")
             .unwrap();
-        let dst_addresses = addrs.unwrap_or(out_addrs.gpu());
+        let dst_addresses = addrs.unwrap_or_else(|| out_addrs.gpu());
         self.list().rtas_execute(
             desc,
             &RtasIo {

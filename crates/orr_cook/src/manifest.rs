@@ -53,7 +53,7 @@ impl Manifest {
             path: path.to_owned(),
             message: e.to_string(),
         })?;
-        let dir = path.parent().unwrap_or(Path::new(""));
+        let dir = path.parent().unwrap_or_else(|| Path::new(""));
         let resolve = |p: &mut PathBuf| {
             if p.is_relative() {
                 *p = dir.join(&*p);
@@ -68,7 +68,11 @@ impl Manifest {
                     Source::Gltf { path, .. }
                     | Source::Usd { path, .. }
                     | Source::MaterialX { path, .. }
-                    | Source::Texture { path, .. } => resolve(path),
+                    | Source::Texture { path, .. }
+                    | Source::Volume {
+                        input: VolumeInput::Vdb { path },
+                        ..
+                    } => resolve(path),
                     Source::Raster(set) => {
                         for l in &mut set.layers {
                             match &mut l.input {
@@ -77,10 +81,6 @@ impl Manifest {
                             }
                         }
                     }
-                    Source::Volume {
-                        input: VolumeInput::Vdb { path },
-                        ..
-                    } => resolve(path),
                     Source::Instances(_)
                     | Source::Volume { .. }
                     | Source::User { .. }

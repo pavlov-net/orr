@@ -78,10 +78,7 @@ impl Builder<'_> {
             .split_property()
             .ok_or_else(|| format!("connection {target} is not to a property"))?;
         let property = property.to_string();
-        let prim = self
-            .stage
-            .prim(prim_path.clone())
-            .map_err(|e| e.to_string())?;
+        let prim = self.stage.prim(prim_path).map_err(|e| e.to_string())?;
         let ty = prim
             .type_name()
             .map_err(|e| e.to_string())?

@@ -448,7 +448,7 @@ impl Device {
         let perf = perf_library.and_then(|l| Perf::new(l, &entry, &instance, physical, &device));
         let p = &heap_props;
         let caps = Caps {
-            device_name: device_name.clone(),
+            device_name,
             vendor_id: props.vendor_id,
             device_id: props.device_id,
             driver: format!(

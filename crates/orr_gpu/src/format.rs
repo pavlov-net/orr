@@ -65,11 +65,10 @@ impl Format {
             Rgba8Unorm | Rgba8Srgb | Rgba8Snorm | Rgba8Uint | Bgra8Unorm | Bgra8Srgb
             | Rg16Unorm | Rg16Float | Rg16Uint | R32Float | R32Uint | R32Sint
             | A2b10g10r10Unorm | B10g11r11Ufloat | E5b9g9r9Ufloat | D32Float | D32FloatS8Uint => 4,
-            Rgba16Unorm | Rgba16Float | Rgba16Uint | Rg32Float | Rg32Uint | R64Uint => 8,
-            Rgba32Float | Rgba32Uint => 16,
-            Bc1Unorm | Bc1Srgb | Bc4Unorm | Bc4Snorm => 8,
-            Bc3Unorm | Bc3Srgb | Bc5Unorm | Bc5Snorm | Bc6hUfloat | Bc6hSfloat | Bc7Unorm
-            | Bc7Srgb => 16,
+            Rgba16Unorm | Rgba16Float | Rgba16Uint | Rg32Float | Rg32Uint | R64Uint | Bc1Unorm
+            | Bc1Srgb | Bc4Unorm | Bc4Snorm => 8,
+            Rgba32Float | Rgba32Uint | Bc3Unorm | Bc3Srgb | Bc5Unorm | Bc5Snorm | Bc6hUfloat
+            | Bc6hSfloat | Bc7Unorm | Bc7Srgb => 16,
         }
     }
 

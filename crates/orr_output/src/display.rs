@@ -119,17 +119,17 @@ impl DisplayRequest {
                 requested_peak.map_or(room, |r| r.min(room))
             }
             None => requested_peak
-                .or(positive(info.max_nits))
+                .or_else(|| positive(info.max_nits))
                 .unwrap_or(DEFAULT_PEAK_NITS),
         }
         .clamp(SDR_WHITE_NITS, MAX_NITS);
         let paper_white = positive(self.paper_white_nits)
-            .or(positive(info.sdr_white_nits))
+            .or_else(|| positive(info.sdr_white_nits))
             .unwrap_or(SDR_WHITE_NITS)
             .min(peak);
         let non_negative = |v: Option<f32>| v.filter(|v| v.is_finite() && *v >= 0.0);
         let black = non_negative(self.black_nits)
-            .or(non_negative(info.min_nits))
+            .or_else(|| non_negative(info.min_nits))
             .unwrap_or(0.0)
             .min(paper_white);
         let signal_white = match headroom {

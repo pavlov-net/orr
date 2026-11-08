@@ -76,7 +76,7 @@ pub(super) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
         emission_color: emissive,
         emission_luminance: if emissive.iter().any(|&c| c > 0.0) {
             ext("KHR_materials_emissive_strength")
-                .or(raw(json, m))
+                .or_else(|| raw(json, m))
                 .map_or(1.0, |e| num(e, "emissiveStrength", 1.0))
         } else {
             0.0
@@ -207,7 +207,7 @@ fn uv_transform(info: &Value) -> ([f32; 6], u32) {
     let [sx, sy] = pair("scale", [1.0, 1.0]);
     let (sin, cos) = num(t, "rotation", 0.0).sin_cos();
     let uv = [cos * sx - 1.0, sin * sy, ox, -sin * sx, cos * sy - 1.0, oy];
-    (uv, coord(t).or(coord(info)).unwrap_or(0))
+    (uv, coord(t).or_else(|| coord(info)).unwrap_or(0))
 }
 
 pub(super) fn textures(
@@ -267,11 +267,11 @@ pub(super) fn textures(
         };
         let index = i["index"]
             .as_u64()
-            .ok_or(format!("{ext} {key}: no index"))?;
+            .ok_or_else(|| format!("{ext} {key}: no index"))?;
         let t = doc
             .textures()
             .nth(index as usize)
-            .ok_or(format!("{ext} {key}: texture {index} does not exist"))?;
+            .ok_or_else(|| format!("{ext} {key}: texture {index} does not exist"))?;
         tex(t, i, channel).map(Some)
     };
     let pbr = m.pbr_metallic_roughness();

@@ -2756,7 +2756,7 @@ fn emission_map(arc: &Archive, id: AssetId) -> Result<EmissionMap> {
     let h = info.header;
     let mip = (0..u32::from(h.mip_count))
         .find(|&m| h.mip_size(m).into_iter().max() <= Some(EmissionMap::SIDE_MAX))
-        .unwrap_or(u32::from(h.mip_count) - 1);
+        .unwrap_or_else(|| u32::from(h.mip_count) - 1);
     let b = h.mip_blob(mip);
     let mut blob = vec![0; blobs[b].raw_len as usize];
     arc.read(&blobs[b], &mut blob)?;
@@ -2876,7 +2876,7 @@ fn cook_unit(
         .cache
         .as_ref()
         .map(|c| c.path(key))
-        .or(scratch.clone());
+        .or_else(|| scratch.clone());
     let mut w = ArchiveWriter::create(path.clone().map_or(Target::Memory, Target::File))?;
     w.set_zstd_level(shared.zstd_level);
     w.set_gdeflate(gdeflate);

@@ -105,12 +105,12 @@ fn phase(
     use OutputFormat::{Hdr10Pq, ScRgb, Sdr};
     match p {
         0 => (Fixed(1), Sdr, Sdr),
-        1 => (Fixed(most), Sdr, Sdr),
+        1 | 6 => (Fixed(most), Sdr, Sdr),
         2 => (Off, Sdr, Sdr),
         3 => (recommended, Hdr10Pq, Hdr10Pq),
         4 => (Fixed(1), ScRgb, Hdr10Pq),
         5 => (Off, ScRgb, ScRgb),
-        _ => (Fixed(most), Sdr, Sdr),
+        _ => unreachable!(),
     }
 }
 

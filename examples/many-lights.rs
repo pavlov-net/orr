@@ -282,7 +282,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let still = options.headless || options.has("--still");
     let frames = options
         .frames
-        .or(options.headless.then_some(HEADLESS_FRAMES));
+        .or_else(|| options.headless.then_some(HEADLESS_FRAMES));
     let started = Instant::now();
     let mut previous = 0.0;
     let mut last: Option<(u64, TimelinePoint)> = None;

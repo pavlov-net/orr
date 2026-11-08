@@ -2297,7 +2297,7 @@ impl<'f> SceneWriter<'f> {
             cpu.ptlas.set_light(id.0, proxied);
             cpu.origin_cell
         };
-        let record = light.map_or(LightGpu::zeroed(), |l| light_gpu(l, origin, self.cell_log2));
+        let record = light.map_or_else(LightGpu::zeroed, |l| light_gpu(l, origin, self.cell_log2));
         self.write(
             self.scene.tables.lights.gpu().offset(u64::from(id.0)),
             record,
@@ -2310,7 +2310,7 @@ impl<'f> SceneWriter<'f> {
             id.0 < self.scene.desc.decal_capacity,
             "{id:?} outside the decal table"
         );
-        let record = decal.map_or(DecalGpu::zeroed(), |d| decal_gpu(d, self.cell_log2));
+        let record = decal.map_or_else(DecalGpu::zeroed, |d| decal_gpu(d, self.cell_log2));
         {
             let mut cpu = self.scene.cpu.lock().unwrap();
             cpu.decals[id.0 as usize] = decal.map(|d| listing(d, self.cell_log2));
@@ -2332,7 +2332,7 @@ impl<'f> SceneWriter<'f> {
             id.0 < self.scene.desc.medium_proxy_capacity,
             "{id:?} outside the medium proxy table"
         );
-        let record = proxy.map_or(MediumProxyGpu::zeroed(), |p| proxy_gpu(p, self.cell_log2));
+        let record = proxy.map_or_else(MediumProxyGpu::zeroed, |p| proxy_gpu(p, self.cell_log2));
         self.scene
             .cpu
             .lock()

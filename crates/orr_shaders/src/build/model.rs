@@ -797,9 +797,8 @@ fn first_type_argument(full: &str) -> Option<&str> {
     for (i, c) in full[open + 1..].char_indices() {
         match c {
             '<' => depth += 1,
-            '>' if depth == 0 => return Some(full[open + 1..open + 1 + i].trim()),
+            '>' | ',' if depth == 0 => return Some(full[open + 1..open + 1 + i].trim()),
             '>' => depth -= 1,
-            ',' if depth == 0 => return Some(full[open + 1..open + 1 + i].trim()),
             _ => {}
         }
     }

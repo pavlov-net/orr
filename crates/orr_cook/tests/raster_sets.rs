@@ -212,7 +212,7 @@ fn external_pyramid_cooks_exactly() {
             l.raw,
             l.stored,
             l.zstd,
-            l.byte_planes.map_or("-".into(), |b| b.to_string()),
+            l.byte_planes.map_or_else(|| "-".into(), |b| b.to_string()),
             l.byte_plane_tiles
         )
         .unwrap();

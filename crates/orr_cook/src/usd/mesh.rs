@@ -847,8 +847,7 @@ fn corner_values<T>(
             let v = p.at(point, face, k);
             let element = match (p.interp, &p.indices) {
                 (Interp::FaceVarying, Some(ix)) => ix.get(k).map_or(usize::MAX, |&i| i as usize),
-                (Interp::FaceVarying, None) => point,
-                (Interp::Vertex | Interp::Varying, _) => point,
+                (Interp::FaceVarying, None) | (Interp::Vertex | Interp::Varying, _) => point,
                 (Interp::Uniform, _) => usize::MAX - face,
                 (Interp::Constant, _) => usize::MAX,
             };

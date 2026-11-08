@@ -164,7 +164,7 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         .map(|t| {
             Ok(Doc {
                 doc: Document::parse(&t.text).map_err(|e| fail(e.to_string()))?,
-                dir: t.path.parent().unwrap_or(Path::new("")),
+                dir: t.path.parent().unwrap_or_else(|| Path::new("")),
                 parent: t.parent,
             })
         })
@@ -471,7 +471,7 @@ impl Reader<'_> {
             parent,
         });
         self.open.push(key);
-        let dir = path.parent().unwrap_or(Path::new(""));
+        let dir = path.parent().unwrap_or_else(|| Path::new(""));
         let result = self.includes(id, dir, &includes, None);
         self.open.pop();
         self.order.push(Part {
@@ -664,7 +664,7 @@ impl<'a> Units<'a> {
         let Some(unit) = stated(e, "unit").or(declared_unit) else {
             return Ok(Unit::Unstated);
         };
-        let unit_type = declared_type.or(stated(e, "unittype"));
+        let unit_type = declared_type.or_else(|| stated(e, "unittype"));
         let found = self
             .scales
             .iter()

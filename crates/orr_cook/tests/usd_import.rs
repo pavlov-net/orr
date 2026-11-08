@@ -735,7 +735,7 @@ fn bound_vertices_land_where_the_stage_puts_them() {
         (
             "usd-bind-squashed",
             [BIND_IDENTITY, BIND_ARM],
-            authored.clone(),
+            authored,
             squashed,
             scale(2.0, 2.0, 0.0),
         ),

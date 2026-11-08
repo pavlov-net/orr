@@ -1500,7 +1500,7 @@ fn gltf_materials_cook_their_canonical_channel_set() {
     let a = cook(vec![AssetSpec {
         name: "quad".into(),
         source: Source::Gltf {
-            path: path.clone(),
+            path,
             settings: GltfSettings::default(),
         },
     }]);

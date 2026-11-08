@@ -96,6 +96,16 @@ clone_on_ref_ptr = "warn"
 dbg_macro = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
+match_same_arms = "warn"
+redundant_else = "warn"
+unwrap_or_default = "warn"
+nonstandard_macro_braces = "warn"
+lossy_float_literal = "warn"
+if_let_mutex = "deny"
+or_fun_call = "warn"
+large_enum_variant = "warn"
+redundant_clone = "warn"
+todo = "warn"
 
 [profile.dev.package."*"]
 opt-level = 3

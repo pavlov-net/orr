@@ -363,8 +363,8 @@ fn element_width(v: &sdf::Value) -> Option<usize> {
         | V::Vec4hVec(_)
         | V::QuatfVec(_)
         | V::QuatdVec(_)
-        | V::QuathVec(_) => Some(4),
-        V::Matrix2dVec(_) => Some(4),
+        | V::QuathVec(_)
+        | V::Matrix2dVec(_) => Some(4),
         V::Matrix3dVec(_) => Some(9),
         V::Matrix4dVec(_) => Some(16),
         _ => None,
@@ -640,11 +640,10 @@ impl PrimReader<'_> {
             Some("constant") => Interp::Constant,
             Some("uniform") => Interp::Uniform,
             Some("faceVarying") => Interp::FaceVarying,
-            Some("vertex") => Interp::Vertex,
             Some("varying") => Interp::Varying,
             // A primvar unauthored is constant; the plain attribute has vertex as its fallback.
             None if attr == full => Interp::Constant,
-            None => Interp::Vertex,
+            Some("vertex") | None => Interp::Vertex,
             Some(i) => return Err(format!("{} {attr}: interpolation {i}", self.path())),
         };
         let indices = if attr == full {

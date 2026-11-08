@@ -150,7 +150,7 @@ fn module(kernels: &KernelSet, own: &'static ShaderModule) -> Result<&'static Sh
     for e in own.entry_points {
         let r = m
             .entry_point(e.name.to_str().unwrap_or_default())
-            .ok_or(mismatch("entry point missing"))?;
+            .ok_or_else(|| mismatch("entry point missing"))?;
         if r.stage != e.stage || r.workgroup != e.workgroup {
             return Err(mismatch("entry point stage or workgroup differs"));
         }

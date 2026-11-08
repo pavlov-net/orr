@@ -263,7 +263,7 @@ impl VertexRead {
     /// mesh holds none, the fallback.
     pub(crate) fn put(&self, v: Option<&[f64]>, c: &mut [f32; 4]) {
         for k in 0..usize::from(self.width) {
-            let x = v.map_or(f64::from(self.fallback[k]), |v| v[k]);
+            let x = v.map_or_else(|| f64::from(self.fallback[k]), |v| v[k]);
             c[usize::from(self.first) + k] = (x / f64::from(self.scale)) as f32;
         }
     }
@@ -1326,8 +1326,8 @@ impl Mapper<'_, '_> {
                         .iter()
                         .position(|p| *p == name)
                         .map(|s| s as u8)
-                        .or((name == "UV0").then_some(0))
-                        .or(self.net.uv_sets.get(name).copied())
+                        .or_else(|| (name == "UV0").then_some(0))
+                        .or_else(|| self.net.uv_sets.get(name).copied())
                         .filter(|s| *s < 2);
                     match set {
                         Some(s) => return Ok((s, outer)),

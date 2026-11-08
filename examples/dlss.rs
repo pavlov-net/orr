@@ -352,7 +352,7 @@ fn sr_quality(options: &Options) -> Quality {
     ]
     .into_iter()
     .find(|(flag, _)| options.has(flag))
-    .map_or(Quality::default(), |(_, q)| q)
+    .map_or_else(Quality::default, |(_, q)| q)
 }
 
 /// `image`, remade at `extent` when it holds none or one of another size; true when made.
@@ -431,7 +431,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
 
     let frames = options
         .frames
-        .or(options.headless.then_some(SR_HEADLESS_FRAMES));
+        .or_else(|| options.headless.then_some(SR_HEADLESS_FRAMES));
     let mut sr: Option<SuperResolution> = None;
     let mut preset = None;
     let mut shaded: Option<Image> = None;

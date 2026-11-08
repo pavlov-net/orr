@@ -160,7 +160,7 @@ fn cook_tree(args: &Args) -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     let stem = source
         .file_stem()
-        .map_or("tree".into(), |s| s.to_string_lossy());
+        .map_or_else(|| "tree".into(), |s| s.to_string_lossy());
     let out = dir.join(format!("{stem}-{:016x}.orr", h.finish()));
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
@@ -215,7 +215,7 @@ fn model_name(archive: &Archive, wanted: Option<&str>) -> String {
             names
                 .iter()
                 .find(rigged)
-                .or(names.first())
+                .or_else(|| names.first())
                 .expect("the archive holds no model")
                 .to_string()
         }
@@ -337,9 +337,8 @@ fn rig(
     let flutter = |j: usize| match joint_hints[j].flutter {
         _ if j == body => 0.0,
         Some(f) if most > 0.0 => f / most,
-        Some(_) => 0.0,
         None if leaf[j] => 1.0,
-        None => 0.0,
+        _ => 0.0,
     };
     let joints = (0..n)
         .map(|j| tree_wind::Joint {
@@ -570,7 +569,7 @@ fn run(options: &Options) -> Option<Capture> {
     let capture = options.headless || options.out.is_some();
     let frames = options
         .frames
-        .or(options.headless.then_some(HEADLESS_FRAMES));
+        .or_else(|| options.headless.then_some(HEADLESS_FRAMES));
     let distance = radius / (0.5 * FOV_Y).tan() * 0.9;
     let started = Instant::now();
     let mut previous = 0.0;

@@ -578,7 +578,7 @@ mod depth_of_field {
         ) -> (Vec<[f32; 4]>, Vec<&'static str>, Option<Vec<f32>>) {
             let gpu = device();
             self.frame += 1;
-            self.put_root(scene, &dof.unwrap_or(lens(0, 1.4)));
+            self.put_root(scene, &dof.unwrap_or_else(|| lens(0, 1.4)));
             let queue = gpu.queue(QueueKind::Render).unwrap();
             let mut list = queue.command_list().unwrap();
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());

@@ -434,7 +434,7 @@ fn append_primitive(
             .map(place_tangent)
             .collect()
     });
-    let tangent_set = at.tangent_set.or(b.tangents.then_some(0));
+    let tangent_set = at.tangent_set.or_else(|| b.tangents.then_some(0));
     let mut computed: Option<Vec<[f32; 4]>> = tangent_set.filter(|_| stated.is_none()).map(|set| {
         let uv = if set == 1 { &uvs1 } else { &uvs };
         let corners = match local_normals {
@@ -691,7 +691,7 @@ pub(crate) fn import(
         path: path.to_owned(),
         hash,
     }];
-    let dir = path.parent().unwrap_or(Path::new("")).to_owned();
+    let dir = path.parent().unwrap_or_else(|| Path::new("")).to_owned();
     let src = data::open(&bytes, &dir).map_err(|m| fail(format!("{}: {m}", path.display())))?;
     drop(bytes);
     let src = Arc::new(src);
@@ -957,7 +957,9 @@ impl Imported<'_> {
                 Document::accessor_views(&a, &mut views);
             }
             let positions = prim.get(&Semantic::Positions).expect("a surface");
-            let vertices = prim.indices().map_or(positions.count(), |a| a.count());
+            let vertices = prim
+                .indices()
+                .map_or_else(|| positions.count(), |a| a.count());
             let count = match prim.mode() {
                 Mode::Triangles => vertices,
                 _ => 3 * vertices.saturating_sub(2),
@@ -1351,7 +1353,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
             let transforms = node_transforms(&inst, graph, n).map_err(fail)?;
             let at = node(n);
             let mesh = at.mesh().expect("instanced nodes have meshes");
-            let weights = at.weights().or(mesh.weights()).unwrap_or_default();
+            let weights = at.weights().or_else(|| mesh.weights()).unwrap_or_default();
             b.placed(&name, mesh.index(), weights, &transforms, None)?;
         }
     }
@@ -1498,7 +1500,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
                 (mat, Some(Binding::Rigid(j)))
             }
         };
-        let weights = at.weights().or(mesh.weights()).unwrap_or_default();
+        let weights = at.weights().or_else(|| mesh.weights()).unwrap_or_default();
         for prim in surfaces(&mesh) {
             let placing = Placing {
                 mesh: mesh.index(),
@@ -1607,7 +1609,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
         let transforms: Vec<DMat4> = locals.into_iter().map(|l| to_bind * l).collect();
         let at = node(n);
         let mesh = at.mesh().expect("instanced nodes have meshes");
-        let weights = at.weights().or(mesh.weights()).unwrap_or_default();
+        let weights = at.weights().or_else(|| mesh.weights()).unwrap_or_default();
         let frame = skeleton_of[m].map(|s| (s, joint));
         // Node names repeat, and a rig may have taken this one.
         let name = instanced_name(doc, n);

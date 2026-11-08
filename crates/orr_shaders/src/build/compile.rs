@@ -124,7 +124,8 @@ impl Build {
             asserts: flag("ORR_SHADER_ASSERTS", !release && !capture),
             omm: flag("ORR_SHADER_OMM", !capture),
             neural: flag("ORR_SHADER_NEURAL", true),
-            metal_check: env::var_os("ORR_METAL_CHECK").map_or(metal_sdk.is_some(), |v| v == "1"),
+            metal_check: env::var_os("ORR_METAL_CHECK")
+                .map_or_else(|| metal_sdk.is_some(), |v| v == "1"),
             metal_sdk,
             allowed: BTreeSet::new(),
             out_dir: None,
@@ -465,7 +466,7 @@ impl Build {
                                 message: format!(
                                     "struct {s} is declared in {} under {}; map it with .extern_type({s:?}, \"<crate>::<path>::{}\")",
                                     file.display(),
-                                    root.map_or("no shader root".to_owned(), |r| format!("shader root {}", r.dir.display())),
+                                    root.map_or_else(|| "no shader root".to_owned(), |r| format!("shader root {}", r.dir.display())),
                                     codegen::rust_name(s)
                                 ),
                             });

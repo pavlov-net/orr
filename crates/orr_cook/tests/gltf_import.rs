@@ -1761,7 +1761,7 @@ fn gpu_instancing_becomes_instance_pages() {
             vec![AssetSpec {
                 name: "g".into(),
                 source: Source::Gltf {
-                    path: path.clone(),
+                    path,
                     settings: GltfSettings::default(),
                 },
             }],

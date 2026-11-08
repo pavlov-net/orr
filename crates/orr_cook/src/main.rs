@@ -93,7 +93,7 @@ fn build(args: &[String]) -> Result<bool> {
             "{}: {} entries, {} B{}",
             a.output
                 .as_deref()
-                .unwrap_or(Path::new("(memory)"))
+                .unwrap_or_else(|| Path::new("(memory)"))
                 .display(),
             a.entries,
             a.bytes,

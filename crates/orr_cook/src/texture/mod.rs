@@ -671,7 +671,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         return env::cook(src, s, primaries, light_threshold, max_lights, quality)
             .map(|b| b.with_clips(&clipped));
     }
-    let full_chain = s.mips.unwrap_or(s.usage.has_mips());
+    let full_chain = s.mips.unwrap_or_else(|| s.usage.has_mips());
     let kept_levels = |b: &Blocks| kept_mip_count(b.w, b.h, s.max_size, full_chain) as usize;
     if let Some(b) = &mut src.blocks {
         let n = kept_levels(b);
