@@ -287,7 +287,7 @@ void skin(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     if (f.traced == 0)
         return;
     Instantiate r;
-    r.cluster_id_offset = mesh_cluster_id(mesh, c);
+    r.cluster_id_offset = mesh.page_bases[page] + local;
     r.geometry_index_offset = 0;
     r.template_address = sm.templates[c];
     r.vertices = (uint64_t)(k.positions + base);

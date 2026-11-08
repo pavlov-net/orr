@@ -334,10 +334,11 @@ impl MeshPlaced {
 
     /// What it holds besides its slot.
     fn free(self) -> (PoolSlot, PageFree) {
+        let ids = (self.ids, self.clusters());
         let free = PageFree {
             clas: self.clas,
             micromap: self.micromap,
-            ids: (self.ids, self.stream.pages[self.page as usize].clusters),
+            ids,
         };
         (self.slot, free)
     }
