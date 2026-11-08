@@ -205,8 +205,9 @@ fn ring_library() -> Option<HMODULE> {
     (!lib.is_null()).then_some(lib)
 }
 
-/// The user data of registrations, which no read slot takes.
-const REGISTRATION: usize = usize::MAX;
+/// The bit of the user data of registrations, which no read slot has; the other bits count
+/// them.
+const REGISTRATION: usize = 1 << (usize::BITS - 1);
 
 /// Pages for read buffers.
 pub(crate) fn alloc_pages(len: usize) -> io::Result<NonNull<u8>> {
@@ -235,11 +236,13 @@ pub(crate) struct OsRing {
     event: Arc<Event>,
     /// Entries are built that no submit has taken.
     unsubmitted: bool,
-    /// Whether reads name their files by their entry in the registered handles, which they
-    /// do until a registration fails.
-    files: bool,
-    /// Handles of registrations no submit has taken, which the system reads when it does.
-    pending: Vec<Box<[HANDLE]>>,
+    /// The last submit failed, leaving its entries in the queue.
+    failed: bool,
+    /// The handles of each file registration whose completion has not popped, which the
+    /// system may read until then, by user data.
+    registrations: Vec<(usize, Box<[HANDLE]>)>,
+    /// File registrations built so far.
+    registered: usize,
 }
 
 // SAFETY: the ring is used only by the thread that owns it.
@@ -289,8 +292,9 @@ impl OsRing {
             ring,
             event: Arc::new(Event::new()),
             unsubmitted: false,
-            files: true,
-            pending: Vec::new(),
+            failed: false,
+            registrations: Vec::new(),
+            registered: 0,
         };
         // SAFETY: the ring and the event are live.
         unsafe { set_event(ring.ring, ring.event.0) }.ok().ok()?;
@@ -328,14 +332,11 @@ impl OsRing {
         &self.event
     }
 
-    /// Registers the handles of `files` at their entries, replacing those registered before,
-    /// and submits the registration ahead of the reads built next. The system holds a file's
-    /// object while its handle is registered.
+    /// Registers the handles of `files` at their entries, replacing the table registered
+    /// before, ahead of the reads built next, which see the new table in the same submit. The
+    /// system holds a file's object while its handle is registered, and takes a null handle
+    /// as an unused entry.
     pub(crate) fn set_files(&mut self, files: &[Option<OpenFile>]) {
-        if !self.files {
-            return;
-        }
-        // Entries without a file are null, which the system takes as unused.
         let handles: Box<[HANDLE]> = files
             .iter()
             .map(|f| {
@@ -343,41 +344,26 @@ impl OsRing {
                     .map_or(std::ptr::null_mut(), |f| f.file.handle.as_raw_handle())
             })
             .collect();
-        // SAFETY: the array stays in `pending` until a submit takes it.
-        let built = unsafe {
-            (self.fns.register_files)(
-                self.ring,
-                handles.len() as u32,
-                handles.as_ptr(),
-                REGISTRATION,
-            )
-        };
-        if built.is_err() {
-            self.files = false;
-            return;
+        self.registered += 1;
+        let data = REGISTRATION | self.registered;
+        // SAFETY: the array stays in `registrations` until the registration's completion pops.
+        unsafe {
+            (self.fns.register_files)(self.ring, handles.len() as u32, handles.as_ptr(), data)
         }
-        self.pending.push(handles);
+        .ok()
+        .expect("a file registration has room in the queue");
+        self.registrations.push((data, handles));
         self.unsubmitted = true;
-        self.submit();
     }
 
     /// Builds the next chunk of `f`, which goes in `slot`, into the ring.
     pub(crate) fn start(&mut self, slot: usize, f: &mut InFlight, pool: &Pool) -> io::Result<()> {
         let (address, len) = f.chunk();
-        let file = if self.files {
-            IORING_HANDLE_REF {
-                Kind: IORING_REF_REGISTERED,
-                Handle: IORING_HANDLE_REF_0 {
-                    Index: f.file as u32,
-                },
-            }
-        } else {
-            IORING_HANDLE_REF {
-                Kind: IORING_REF_RAW,
-                Handle: IORING_HANDLE_REF_0 {
-                    Handle: f.read.file.handle.as_raw_handle(),
-                },
-            }
+        let file = IORING_HANDLE_REF {
+            Kind: IORING_REF_REGISTERED,
+            Handle: IORING_HANDLE_REF_0 {
+                Index: f.file as u32,
+            },
         };
         let data = match pool.index(address) {
             Some((index, offset)) => IORING_BUFFER_REF {
@@ -396,14 +382,19 @@ impl OsRing {
                 },
             },
         };
-        // SAFETY: the handle and the buffer stay alive in the slot until the completion is
-        // popped.
+        // SAFETY: the file stays registered and the buffer alive in the slot until the
+        // completion is popped.
         unsafe {
             (self.fns.build_read)(self.ring, file, data, len, f.at(), slot, IOSQE_FLAGS_NONE)
         }
         .ok()?;
         self.unsubmitted = true;
         Ok(())
+    }
+
+    /// Whether the last submit failed, leaving entries in the queue.
+    pub(crate) fn stalled(&self) -> bool {
+        self.failed
     }
 
     pub(crate) fn submit(&mut self) {
@@ -414,11 +405,10 @@ impl OsRing {
             // Entries a failed submit leaves in the queue go with the next one; setting the
             // event makes the next wait return so that it happens. Reads already in the kernel
             // keep their slots and buffers until they complete.
-            self.unsubmitted = h.is_err();
-            if self.unsubmitted {
+            self.failed = h.is_err();
+            self.unsubmitted = self.failed;
+            if self.failed {
                 self.event.set();
-            } else {
-                self.pending.clear();
             }
         }
     }
@@ -432,7 +422,7 @@ impl OsRing {
     }
 
     /// The next read's completion: its slot and the bytes read, none at or past the end of
-    /// the file. After a failed file registration, reads name their files by handle.
+    /// the file. Takes the completions of file registrations on the way.
     pub(crate) fn pop(&mut self) -> Option<(usize, io::Result<usize>)> {
         loop {
             let mut cqe = IORING_CQE::default();
@@ -440,10 +430,15 @@ impl OsRing {
             if unsafe { (self.fns.pop)(self.ring, &mut cqe) }.0 != S_OK {
                 return None;
             }
-            if cqe.UserData == REGISTRATION {
-                if cqe.ResultCode.is_err() {
-                    self.files = false;
-                }
+            if cqe.UserData & REGISTRATION != 0 {
+                // The system registers any table of handles and nulls; only a read names an
+                // entry's file.
+                assert!(
+                    cqe.ResultCode.is_ok(),
+                    "file registration: {}",
+                    cqe.ResultCode.message()
+                );
+                self.registrations.retain(|&(data, _)| data != cqe.UserData);
                 continue;
             }
             let n = match cqe.ResultCode.ok() {
@@ -457,7 +452,16 @@ impl OsRing {
 
 impl Drop for OsRing {
     fn drop(&mut self) {
-        // SAFETY: a read still in flight here is on a broken ring and owns leaked memory.
+        // The reads have completed; the registrations' handles stay until theirs pop.
+        while !self.registrations.is_empty() {
+            if !self.wait() {
+                std::mem::forget(std::mem::take(&mut self.registrations));
+                break;
+            }
+            while self.pop().is_some() {}
+        }
+        // SAFETY: a read or registration still in flight here is on a broken ring and owns
+        // leaked memory.
         let _ = unsafe { (self.fns.close)(self.ring) };
     }
 }

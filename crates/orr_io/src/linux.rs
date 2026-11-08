@@ -206,6 +206,11 @@ impl OsRing {
         Ok(())
     }
 
+    /// Never: the queue holds an entry for every slot, and registrations do not use it.
+    pub(crate) fn stalled(&self) -> bool {
+        false
+    }
+
     pub(crate) fn submit(&mut self) {
         if !self.ring.submission().is_empty() {
             let _ = self.ring.submit();
