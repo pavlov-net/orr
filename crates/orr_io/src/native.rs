@@ -12,7 +12,6 @@ pub(crate) const DEPTH: usize = 64;
 pub(crate) struct InFlight {
     pub(crate) read: Read,
     buf: AlignedBuf,
-    filled: usize,
 }
 
 impl InFlight {
@@ -20,32 +19,33 @@ impl InFlight {
         Self {
             buf: AlignedBuf::new(read.len),
             read,
-            filled: 0,
         }
     }
 
     /// The file offset of the next chunk.
     pub(crate) fn at(&self) -> u64 {
-        self.read.offset + self.filled as u64
+        self.read.offset + self.buf.len() as u64
     }
 
-    /// The address and length of the next chunk.
+    /// The address and length of the next chunk, in the buffer's spare capacity.
     pub(crate) fn chunk(&mut self) -> (*mut u8, u32) {
-        let dst = &mut self.buf.as_mut_slice()[self.filled..];
-        (dst.as_mut_ptr(), dst.len().min(CHUNK) as u32)
+        let dst = self.buf.spare_capacity_mut();
+        (dst.as_mut_ptr().cast(), dst.len().min(CHUNK) as u32)
     }
 
     /// Counts a finished chunk of `n` bytes. Returns whether the read needs another.
     fn advance(&mut self, n: usize) -> bool {
-        self.filled += n;
+        // SAFETY: the system wrote `n` bytes of the chunk, which starts after the filled bytes
+        // and ends within the capacity.
+        unsafe { self.buf.set_filled(self.buf.len() + n) };
         n > 0
-            && self.filled < self.read.len
+            && self.buf.len() < self.read.len
             && !ended_off_sector(self.read.file.unbuffered, self.at())
     }
 
-    fn finish(self) {
-        let n = self.filled.min(self.read.len);
-        (self.read.done)(Ok((self.buf, n)));
+    fn finish(mut self) {
+        self.buf.truncate(self.read.len);
+        (self.read.done)(Ok(self.buf));
     }
 }
 

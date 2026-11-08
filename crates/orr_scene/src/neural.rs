@@ -7,7 +7,6 @@ use half::f16;
 use orr_gpu::{
     ComponentType, Device, GpuPtr, MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout,
 };
-use orr_io::AlignedBuf;
 use orr_pack::AssetId;
 use orr_pack::neural::{
     self, Constants, Fp8Network, LAYERS, NeuralInfo, NeuralTexture, NeuralWeights, e4m3_to_f32,
@@ -86,13 +85,28 @@ fn srgb_channels(info: &NeuralInfo) -> u32 {
         .fold(0, |a, b| a | b)
 }
 
-/// A set's decoder weights as the device multiplies them (`len` bytes of `bytes`, a multiple
-/// of 16), and the set's record without its weights' address, latents and sampler.
+/// A set's decoder weights as the device multiplies them, and the set's record without its
+/// weights' address, latents and sampler.
 pub(crate) struct DeviceWeights {
-    pub(crate) bytes: AlignedBuf,
-    pub(crate) len: usize,
+    bytes: Vec<MatrixBlock>,
+    len: usize,
     pub(crate) record: NeuralSetGpu,
 }
+
+impl DeviceWeights {
+    /// The weights, a multiple of 16 bytes.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &bytemuck::cast_slice(&self.bytes)[..self.len]
+    }
+}
+
+/// Weights memory comes in these, so a matrix at a multiple of [`MATRIX_ALIGN`] from its start
+/// is at an aligned host address, as converting a matrix into it needs.
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C, align(64))]
+struct MatrixBlock([u8; 64]);
+
+const _: () = assert!(align_of::<MatrixBlock>() as u64 == MATRIX_ALIGN);
 
 /// Every layer is padded with zero weights and biases to this width, so that kernels run
 /// the four layers as one multiply in a loop (`NEURAL_WIDTH`).
@@ -157,8 +171,9 @@ pub(crate) fn device_weights(
     }
     let biases: [u32; 4] = std::array::from_fn(|l| (at as usize + l * BIAS_BYTES) as u32);
     let len = at as usize + biases.len() * BIAS_BYTES;
-    let mut bytes = AlignedBuf::new(len);
-    let out = bytes.as_mut_slice();
+    // Zeros fill the padding of biases narrower than WIDTH, which kernels read in full.
+    let mut bytes = vec![MatrixBlock([0; 64]); len.div_ceil(size_of::<MatrixBlock>())];
+    let out: &mut [u8] = bytemuck::cast_slice_mut(&mut bytes);
     for (l, (component, src)) in sources.iter().enumerate() {
         let c = MatrixConversion {
             rows: n,

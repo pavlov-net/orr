@@ -337,8 +337,9 @@ pub(crate) fn read_stored(src: &BlobSource, b: Blob, chunk: Option<u32>, then: S
         None => b.stored_len,
     };
     let file = Arc::clone(src.file.as_ref().expect("file archive"));
-    let check = move |buf: &AlignedBuf, n: usize, then: Stored| {
+    let check = move |buf: &AlignedBuf, then: Stored| {
         let end = range.skip as usize + stored_len as usize;
+        let n = buf.len();
         if n < end {
             then(Err(orr_pack::Error::Truncated {
                 need: range.offset + end as u64,
@@ -356,7 +357,7 @@ pub(crate) fn read_stored(src: &BlobSource, b: Blob, chunk: Option<u32>, then: S
             offset: range.offset,
             len: range.len as usize,
             done: Box::new(move |r| match (r, weak.upgrade()) {
-                (Ok((buf, n)), Some(l)) => l.spawn(move || check(&buf, n, then)),
+                (Ok(buf), Some(l)) => l.spawn(move || check(&buf, then)),
                 (Err(e), _) => then(Err(e.into())),
                 (Ok(_), None) => {}
             }),
@@ -365,7 +366,7 @@ pub(crate) fn read_stored(src: &BlobSource, b: Blob, chunk: Option<u32>, then: S
         loading.spawn(move || {
             let mut buf = AlignedBuf::new(range.len as usize);
             match file.reads.read(range.offset, &mut buf) {
-                Ok(n) => check(&buf, n, then),
+                Ok(()) => check(&buf, then),
                 Err(e) => then(Err(Error::from(e))),
             }
         });

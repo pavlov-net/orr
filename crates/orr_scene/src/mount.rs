@@ -510,11 +510,12 @@ pub(crate) fn start(loading: &Arc<Loading>, ring: bool, task: Arc<MountTask>, so
                 task.spawn(move |t| {
                     t.step(|| {
                         let mut head = AlignedBuf::new(Archive::HEAD_LEN);
-                        let n = file.reads.read(0, &mut head)?;
-                        let range = Archive::index_range(&head.as_slice()[..n])?;
+                        file.reads.read(0, &mut head)?;
+                        let range = Archive::index_range(head.as_slice())?;
+                        drop(head);
                         let mut index = AlignedBuf::new(range.len as usize);
-                        let n = file.reads.read(0, &mut index)?;
-                        open_index(t, &file, &path, &index, n, range.len)
+                        file.reads.read(0, &mut index)?;
+                        open_index(t, &file, &path, &index, range.len)
                     });
                 });
             }
@@ -533,7 +534,7 @@ fn read_head(loading: &Arc<Loading>, task: Arc<MountTask>, file: Arc<ArchiveFile
         done: Box::new(move |r| {
             let range = r
                 .map_err(Error::from)
-                .and_then(|(buf, n)| Ok(Archive::index_range(&buf.as_slice()[..n])?));
+                .and_then(|buf| Ok(Archive::index_range(buf.as_slice())?));
             let range = match (range, l.upgrade()) {
                 (Ok(range), Some(l)) => (range, l),
                 (Err(e), _) => {
@@ -549,8 +550,8 @@ fn read_head(loading: &Arc<Loading>, task: Arc<MountTask>, file: Arc<ArchiveFile
                 offset: 0,
                 len: (range.len as usize).next_multiple_of(SECTOR),
                 done: Box::new(move |r| match r {
-                    Ok((buf, n)) => task.spawn(move |t| {
-                        t.step(|| open_index(t, &f, &path, &buf, n, range.len));
+                    Ok(buf) => task.spawn(move |t| {
+                        t.step(|| open_index(t, &f, &path, &buf, range.len));
                     }),
                     Err(e) => {
                         task.fail(e.into());
@@ -569,14 +570,13 @@ fn open_index(
     file: &ArchiveFile,
     path: &std::path::Path,
     buf: &AlignedBuf,
-    n: usize,
     len: u32,
 ) -> Result<()> {
     let len = len as usize;
-    if n < len {
+    if buf.len() < len {
         return Err(orr_pack::Error::Truncated {
             need: len as u64,
-            have: n as u64,
+            have: buf.len() as u64,
         }
         .into());
     }
@@ -749,7 +749,7 @@ fn place_neural(t: &Arc<MountTask>, s: &DecodedSet, blob: &[u8]) -> Result<()> {
     let p = t.neural.expect("sets are read with neural decoding");
     let net = Fp8Network::parse(blob)?;
     let mut w = neural::device_weights(&t.device, &s.info, &s.constants, &net, p)?;
-    let record_at = w.len as u64;
+    let record_at = w.bytes().len() as u64;
     let record_bytes = size_of::<NeuralSetGpu>() as u64;
     let block = t.block(record_at + record_bytes, "neural texture set")?;
     assert!(
@@ -757,7 +757,7 @@ fn place_neural(t: &Arc<MountTask>, s: &DecodedSet, blob: &[u8]) -> Result<()> {
         "neural weights at {:#x}",
         block.gpu()
     );
-    t.write(block, 0, &w.bytes.as_slice()[..w.len])?;
+    t.write(block, 0, w.bytes())?;
     w.record.weights = block.gpu();
     w.record.sampler = t.sampler;
     t.placed.lock().unwrap().neural.push(PlacedNeural {

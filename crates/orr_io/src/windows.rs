@@ -1,6 +1,7 @@
 use std::ffi::{CStr, c_void};
 use std::fs::File;
 use std::io;
+use std::mem::MaybeUninit;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
@@ -77,7 +78,11 @@ fn sectors_fit(f: &File) -> bool {
 
 /// One read at `offset` on an overlapped handle, which can run alongside reads on other
 /// threads. Reads nothing at the end of the file.
-pub(crate) fn read_overlapped(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn read_overlapped(
+    file: &File,
+    offset: u64,
+    buf: &mut [MaybeUninit<u8>],
+) -> io::Result<usize> {
     let event = Event::create(true)?;
     let mut overlapped = OVERLAPPED {
         hEvent: event.0,

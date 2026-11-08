@@ -22,7 +22,7 @@ fn bytes(len: usize) -> Vec<u8> {
         .collect()
 }
 
-type Results = Arc<Mutex<Vec<Option<(Vec<u8>, usize)>>>>;
+type Results = Arc<Mutex<Vec<Option<Vec<u8>>>>>;
 
 fn run_ring(mut ring: Ring, file: &Arc<ReadFile>, reads: &[(u64, usize)]) -> Vec<Vec<u8>> {
     let results: Results = Arc::new(Mutex::new(vec![None; reads.len()]));
@@ -33,8 +33,8 @@ fn run_ring(mut ring: Ring, file: &Arc<ReadFile>, reads: &[(u64, usize)]) -> Vec
             offset,
             len,
             done: Box::new(move |r| {
-                let (buf, n) = r.expect("ring read");
-                results.lock().unwrap()[i] = Some((buf.as_slice().to_vec(), n));
+                let buf = r.expect("ring read");
+                results.lock().unwrap()[i] = Some(buf.as_slice().to_vec());
             }),
         });
     }
@@ -46,13 +46,10 @@ fn run_ring(mut ring: Ring, file: &Arc<ReadFile>, reads: &[(u64, usize)]) -> Vec
         }
         wake.wait(Some(&ring));
     }
-    let results = results.lock().unwrap();
+    let results = std::mem::take(&mut *results.lock().unwrap());
     results
-        .iter()
-        .map(|r| {
-            let (buf, n) = r.as_ref().expect("every read completes");
-            buf[..*n].to_vec()
-        })
+        .into_iter()
+        .map(|r| r.expect("every read completes"))
         .collect()
 }
 
@@ -185,11 +182,10 @@ fn reads_on_many_threads_match_the_file() {
                     for i in 0..200 {
                         // Every thread reaches the last sectors and the sector past the end.
                         let offset = (i * 7 + t) % 66 * SECTOR;
-                        let n = file.read(offset as u64, &mut buf).unwrap();
+                        file.read(offset as u64, &mut buf).unwrap();
                         let start = offset.min(len);
                         let end = (offset + 3 * SECTOR).min(len);
-                        assert_eq!(n, end - start, "offset {offset}");
-                        assert!(buf.as_slice()[..n] == data[start..end], "offset {offset}");
+                        assert!(buf.as_slice() == &data[start..end], "offset {offset}");
                     }
                 });
             }
@@ -213,8 +209,8 @@ fn open_file_can_be_replaced_by_rename() {
     let n = read_at(&shared, 0, &mut buf).unwrap();
     assert_eq!(&buf[..n], b"old contents");
     let mut sector = AlignedBuf::new(SECTOR);
-    let n = file.read(0, &mut sector).unwrap();
-    assert_eq!(&sector.as_slice()[..n], b"old contents");
+    file.read(0, &mut sector).unwrap();
+    assert_eq!(sector.as_slice(), b"old contents");
     for ring in [Some(Ring::positioned()), Ring::native()]
         .into_iter()
         .flatten()

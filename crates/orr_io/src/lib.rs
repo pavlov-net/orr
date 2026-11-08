@@ -5,10 +5,11 @@
 //! and where the system refuses them, [`Ring::positioned`] runs the same reads as positioned
 //! reads.
 
-use std::alloc::{AllocError, Allocator, Global, Layout, handle_alloc_error};
+use std::alloc::{AllocError, Allocator, Global, Layout};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
+use std::mem::MaybeUninit;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -48,12 +49,6 @@ unsafe impl Allocator for Sector {
         Global.allocate(sector_layout(layout)?)
     }
 
-    // The default writes every zero; the global allocator can instead take pages the system
-    // zeroed.
-    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        Global.allocate_zeroed(sector_layout(layout)?)
-    }
-
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         let layout = sector_layout(layout).expect("raised when allocated");
         // SAFETY: `Global` allocated `ptr` with this layout.
@@ -61,29 +56,58 @@ unsafe impl Allocator for Sector {
     }
 }
 
-/// A zeroed buffer at a [`SECTOR`] boundary, a whole number of sectors long.
+/// A read buffer at a [`SECTOR`] boundary, a whole number of sectors long. Reads write its
+/// uninitialized spare capacity and record what they wrote with [`AlignedBuf::set_filled`];
+/// only those filled bytes can be read.
 // A `Vec` rather than a `Box`: the ring moves the buffer while the system writes through a
 // pointer into it, which a `Box`'s uniqueness forbids.
 pub struct AlignedBuf(Vec<u8, Sector>);
 
 impl AlignedBuf {
-    /// A buffer of at least `len` bytes (at least one sector).
+    /// An empty buffer with room for at least `len` bytes (at least one sector).
     pub fn new(len: usize) -> Self {
-        let len = len.max(1).next_multiple_of(SECTOR);
-        let layout = Layout::array::<u8>(len).expect("read buffer layout");
-        let ptr = Sector
-            .allocate_zeroed(layout)
-            .unwrap_or_else(|_| handle_alloc_error(layout));
-        // SAFETY: `Sector` allocated `len` zeroed bytes for `u8`'s layout.
-        Self(unsafe { Vec::from_parts_in(ptr.cast(), len, len, Sector) })
+        Self(Vec::with_capacity_in(
+            len.max(1).next_multiple_of(SECTOR),
+            Sector,
+        ))
     }
 
+    /// The bytes it holds, a multiple of [`SECTOR`].
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    /// The filled bytes.
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
 
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.0
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The bytes after the filled ones, for a read to write.
+    pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        self.0.spare_capacity_mut()
+    }
+
+    /// Records that the first `n` bytes are filled.
+    ///
+    /// # Safety
+    ///
+    /// `n` is at most [`AlignedBuf::capacity`], and the first `n` bytes have been written.
+    pub unsafe fn set_filled(&mut self, n: usize) {
+        // SAFETY: the caller's contract.
+        unsafe { self.0.set_len(n) }
+    }
+
+    /// Keeps at most the first `n` filled bytes.
+    pub fn truncate(&mut self, n: usize) {
+        self.0.truncate(n);
     }
 }
 
@@ -166,6 +190,21 @@ pub fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
     })
 }
 
+/// One positioned read into `dst`, which need not be initialized.
+#[cfg(unix)]
+fn pread(file: &File, offset: u64, dst: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    // On 32-bit glibc `off_t` is 32 bits, too narrow for large files.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    use libc::{off_t, pread};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use libc::{off64_t as off_t, pread64 as pread};
+    let offset = off_t::try_from(offset).map_err(|_| io::ErrorKind::InvalidInput)?;
+    // SAFETY: `dst` is writable for its length, and the call writes only within it.
+    let n = unsafe { pread(file.as_raw_fd(), dst.as_mut_ptr().cast(), dst.len(), offset) };
+    usize::try_from(n).map_err(|_| io::Error::last_os_error())
+}
+
 /// Whether a read that has reached `at` is at the end of the file though it read something. An
 /// unbuffered handle rejects offsets that are not whole sectors, and a read on one only ends
 /// off a sector at the end of the file.
@@ -175,11 +214,11 @@ fn ended_off_sector(unbuffered: bool, at: u64) -> bool {
 
 /// Fills `buf` from `offset` with calls to `read`, each for at most [`CHUNK`] bytes, until `buf`
 /// is full or the file ends.
-fn read_all(
+fn read_all<T>(
     offset: u64,
-    buf: &mut [u8],
+    buf: &mut [T],
     unbuffered: bool,
-    read: impl Fn(u64, &mut [u8]) -> io::Result<usize>,
+    read: impl Fn(u64, &mut [T]) -> io::Result<usize>,
 ) -> io::Result<usize> {
     let mut done = 0;
     while done < buf.len() {
@@ -227,16 +266,25 @@ impl ReadFile {
         }
     }
 
-    /// Reads at `offset`, a multiple of [`SECTOR`], into `buf`. Returns the bytes read; fewer
-    /// than the buffer only at the end of the file.
-    pub fn read(&self, offset: u64, buf: &mut AlignedBuf) -> io::Result<usize> {
+    /// Fills `buf` with the file from `offset`, a multiple of [`SECTOR`], replacing what it
+    /// held. It holds its whole capacity after the read but at the end of the file.
+    pub fn read(&self, offset: u64, buf: &mut AlignedBuf) -> io::Result<()> {
         debug_assert!(offset.is_multiple_of(SECTOR as u64));
-        read_all(offset, buf.as_mut_slice(), self.unbuffered, |at, dst| {
-            #[cfg(windows)]
-            return windows::read_overlapped(&self.handle, at, dst);
-            #[cfg(unix)]
-            std::os::unix::fs::FileExt::read_at(&self.handle, dst, at)
-        })
+        buf.truncate(0);
+        let n = read_all(
+            offset,
+            buf.spare_capacity_mut(),
+            self.unbuffered,
+            |at, dst| {
+                #[cfg(windows)]
+                return windows::read_overlapped(&self.handle, at, dst);
+                #[cfg(unix)]
+                pread(&self.handle, at, dst)
+            },
+        )?;
+        // SAFETY: the reads wrote the first `n` bytes, within the capacity.
+        unsafe { buf.set_filled(n) };
+        Ok(())
     }
 }
 
@@ -249,8 +297,8 @@ pub struct Read {
     pub done: ReadDone,
 }
 
-/// Receives the read's buffer and the bytes read: `len`, or fewer at the end of the file.
-pub type ReadDone = Box<dyn FnOnce(io::Result<(AlignedBuf, usize)>) + Send>;
+/// Receives the read's buffer, filled with `len` bytes, or fewer at the end of the file.
+pub type ReadDone = Box<dyn FnOnce(io::Result<AlignedBuf>) + Send>;
 
 /// Batched reads with completions. Reads are queued with [`Ring::push`] and issued and
 /// completed by [`Ring::pump`]; the ring belongs to the one thread that pumps it.
@@ -300,10 +348,10 @@ impl Ring {
             Backend::Positioned(queued) => {
                 while let Some(read) = queued.pop_front() {
                     let mut buf = AlignedBuf::new(read.len);
-                    let result = read
-                        .file
-                        .read(read.offset, &mut buf)
-                        .map(|n| (buf, n.min(read.len)));
+                    let result = read.file.read(read.offset, &mut buf).map(|()| {
+                        buf.truncate(read.len);
+                        buf
+                    });
                     (read.done)(result);
                 }
             }
