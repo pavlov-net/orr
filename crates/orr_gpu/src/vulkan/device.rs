@@ -62,6 +62,8 @@ pub(crate) struct Shared {
     pub(super) host_memory_fn: Option<ash::ext::external_memory_host::Device>,
     /// `nonCoherentAtomSize`.
     pub(super) non_coherent_atom: u64,
+    /// `maxMemoryAllocationSize`.
+    pub(super) max_allocation: u64,
     pub(super) mesh_fn: ash::ext::mesh_shader::Device,
     pub(super) rt_fn: Option<ash::khr::ray_tracing_pipeline::Device>,
     pub(super) debug_fn: ash::ext::debug_utils::Device,
@@ -378,7 +380,9 @@ impl Device {
         let mut generated_props = vk::PhysicalDeviceDeviceGeneratedCommandsPropertiesEXT::default();
         let mut indirect_copy_props = vk::PhysicalDeviceCopyMemoryIndirectPropertiesKHR::default();
         let mut host_memory_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+        let mut v11_props = vk::PhysicalDeviceVulkan11Properties::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
+            .push(&mut v11_props)
             .push(&mut heap_props)
             .push(&mut as_props)
             .push(&mut driver)
@@ -660,6 +664,7 @@ impl Device {
             host_memory_fn: host_memory
                 .then(|| ash::ext::external_memory_host::Device::load(&instance, &device)),
             non_coherent_atom: props.limits.non_coherent_atom_size,
+            max_allocation: v11_props.max_memory_allocation_size,
             mesh_fn: ash::ext::mesh_shader::Device::load(&instance, &device),
             rt_fn: optional
                 .ray_dispatch

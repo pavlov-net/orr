@@ -168,18 +168,17 @@ impl Loading {
         let (at, len) = buffers.pages();
         // A driver may refuse an import it offers, as the extension allows; staging then takes
         // the staging pool, as on a device without the import.
-        let imported = match device {
-            // SAFETY: the clone keeps the arena's pages until the import drops it.
-            Some(d) => match unsafe {
-                d.import_host_memory(at, len as u64, Box::new(buffers.clone()), "read arena")
-            } {
-                Ok(m) => Some(m),
-                Err(e @ orr_gpu::Error::ImportRefused(_)) => {
-                    log::warn!("the device refused the read arena's import: {e}");
-                    None
-                }
-                Err(e) => return Err(e.into()),
-            },
+        // SAFETY: the clone keeps the arena's pages until the import drops it.
+        let import = device.map(|d| unsafe {
+            d.import_host_memory(at, len as u64, Box::new(buffers.clone()), "read arena")
+        });
+        let imported = match import {
+            Some(Ok(m)) => Some(m),
+            Some(Err(e @ orr_gpu::Error::ImportRefused(_))) => {
+                log::warn!("the device refused the read arena's import: {e}");
+                None
+            }
+            Some(Err(e)) => return Err(e.into()),
             None => None,
         };
         Ok(Self {

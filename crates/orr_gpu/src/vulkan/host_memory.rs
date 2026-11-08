@@ -216,6 +216,13 @@ impl Device {
                 "{name}: {len} bytes at {ptr:p} are not whole units of {align}"
             )));
         }
+        // The driver states no allocation past `maxMemoryAllocationSize` need succeed.
+        if len > s.max_allocation {
+            return Err(Error::ImportRefused(format!(
+                "{name}: {len} bytes exceed the device's largest allocation of {} bytes",
+                s.max_allocation
+            )));
+        }
         let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
         // SAFETY: `ptr` is a host allocation the caller keeps, aligned as the device asks.
         let pointer = unsafe { pointer_types(f, ptr) }
@@ -249,8 +256,12 @@ impl Device {
         let bits = pointer.memory_type_bits & required.memory_type_bits;
         let props = &s.memory.properties;
         let flags = |i: u32| props.memory_types[i as usize].property_flags;
+        let heap_size =
+            |i: u32| props.memory_heaps[props.memory_types[i as usize].heap_index as usize].size;
+        // An allocation may not exceed its type's heap.
         let pick = |want: vk::MemoryPropertyFlags| {
-            (0..props.memory_type_count).find(|&i| bits & (1 << i) != 0 && flags(i).contains(want))
+            (0..props.memory_type_count)
+                .find(|&i| bits & (1 << i) != 0 && flags(i).contains(want) && heap_size(i) >= len)
         };
         let visible = vk::MemoryPropertyFlags::HOST_VISIBLE;
         let coherent = visible | vk::MemoryPropertyFlags::HOST_COHERENT;
@@ -259,7 +270,8 @@ impl Device {
             .or_else(|| pick(visible))
             .ok_or_else(|| {
                 destroy(Error::ImportRefused(format!(
-                    "{name}: no memory type imports it (pointer types {:#x}, buffer types {:#x})",
+                    "{name}: no memory type with a heap of {len} bytes imports it (pointer types \
+                     {:#x}, buffer types {:#x})",
                     pointer.memory_type_bits, required.memory_type_bits
                 )))
             })?;
