@@ -41,7 +41,9 @@ use orr_pack::mesh::{MeshHeader, StoredPage};
 use orr_pack::{Blob, Codec};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::accel::{self, AccelShared, Animated, ClusterInfo, CutRow, FineCut, PageMicromap};
+use crate::accel::{
+    self, AccelShared, Animated, ClusterInfo, Cut, CutMember, CutRow, FineCut, PageMicromap,
+};
 use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch, PoolMicromap, Shortfall};
 use crate::edit::Mirror;
 use crate::loading::{BlobSource, Loading, Msg, landed, read_into, reads_straight};
@@ -131,8 +133,14 @@ pub(crate) struct FineInit {
     pub(crate) pages: Vec<Vec<u32>>,
     pub(crate) merge: f32,
     pub(crate) animated: Animated,
-    /// By mesh cluster: as known so far, and its CLAS.
-    pub(crate) clusters: Vec<ClusterInfo>,
+    /// By page: its clusters and their CLAS while it is resident, the pinned pages' from
+    /// mount. A cut's clusters sit in the pinned pages and its `pages`.
+    pub(crate) resident: Vec<Option<Box<PageClusters>>>,
+}
+
+/// A resident page's clusters as its records name them, and the CLAS of each.
+pub(crate) struct PageClusters {
+    pub(crate) infos: Vec<ClusterInfo>,
     pub(crate) clas: Vec<u64>,
 }
 
@@ -170,11 +178,10 @@ pub(crate) struct CutTask {
     mesh: u32,
     slot: u32,
     accel: Arc<AccelShared>,
-    clusters: Vec<u32>,
-    row: u32,
-    infos: Vec<ClusterInfo>,
-    animated: Animated,
-    clas: Vec<u64>,
+    cut: Cut,
+    members: Vec<CutMember>,
+    /// The mesh's animated parts.
+    parts: u32,
 }
 
 /// A finer cut built, handed over once its build has completed.
@@ -195,15 +202,7 @@ impl CutBatch {
 
 /// Builds a finer cut on the loading thread.
 pub(crate) fn build_cut(loading: &Loading, device: &Device, t: CutTask) {
-    let built = accel::build_fine_cut(
-        device,
-        &t.accel.kernels,
-        t.clusters,
-        t.row,
-        &t.infos,
-        t.animated,
-        &t.clas,
-    );
+    let built = accel::build_fine_cut(device, &t.accel.kernels, t.cut, &t.members, t.parts);
     let (cut, point) = match built {
         Ok((r, c, p)) => (Ok((r, c)), Some(p)),
         Err(e) => (Err(e), None),
@@ -1003,21 +1002,35 @@ impl Streaming {
                             }
                             continue;
                         }
-                        let clusters = accel::cut_clusters(&f.init.clusters, t, f.init.merge);
+                        // A page lists its clusters here in the step the residency takes it
+                        // as resident, and the cut's clusters sit in these pages.
                         let stream = &f.init.stream;
-                        let mut pages: Vec<u32> = clusters
-                            .iter()
-                            .map(|&c| f.init.clusters[c as usize].page)
-                            .filter(|&q| q >= stream.pinned)
-                            .collect();
-                        pages.sort_unstable();
-                        pages.dedup();
+                        let (mut clusters, mut members) = (Vec::new(), Vec::new());
+                        let mut pages = Vec::new();
+                        let mut error = 0.0f32;
+                        let held = (0..stream.pinned).chain(f.init.pages[k].iter().copied());
+                        for q in held {
+                            let r = f.init.resident[q as usize]
+                                .as_ref()
+                                .expect("a resident page's clusters");
+                            let first = stream.pages[q as usize].first;
+                            let before = clusters.len();
+                            for ((c, &clas), i) in r.infos.iter().zip(&r.clas).zip(first..) {
+                                if c.in_cut(t, f.init.merge) {
+                                    clusters.push(i);
+                                    members.push(CutMember {
+                                        clas,
+                                        part: f.init.animated.index(c),
+                                    });
+                                    error = error.max(c.self_error);
+                                }
+                            }
+                            if q >= stream.pinned && clusters.len() > before {
+                                pages.push(q);
+                            }
+                        }
                         let bytes = pages.iter().map(|&q| self.residency.held(unit(q))).sum();
                         if clusters.is_empty() || self.fine_locked + bytes > budget / 2 {
-                            continue;
-                        }
-                        // A landing's CLAS may still be on its way into the pool.
-                        if clusters.iter().any(|&c| f.init.clas[c as usize] == 0) {
                             continue;
                         }
                         for &q in &pages {
@@ -1032,11 +1045,13 @@ impl Streaming {
                             mesh,
                             slot: k as u32,
                             accel: Arc::clone(&self.accel),
-                            clusters,
-                            row,
-                            infos: f.init.clusters.clone(),
-                            animated: f.init.animated,
-                            clas: f.init.clas.clone(),
+                            cut: Cut {
+                                error,
+                                clusters,
+                                row,
+                            },
+                            members,
+                            parts: f.init.animated.count,
                         }));
                     }
                     _ => {}
@@ -1388,8 +1403,7 @@ impl Streaming {
                 w.put(refs, &zeros)?;
                 let first = p.stream.pages[p.page as usize].first;
                 if let Some(f) = self.fine.get_mut(&(k.mount, p.stream.mesh)) {
-                    let at = first as usize;
-                    f.init.clas[at..at + count as usize].fill(0);
+                    f.init.resident[p.page as usize] = None;
                 }
                 for mirror in p.stream.mirrors.lock().unwrap().iter() {
                     if !mirror.own[p.page as usize] {
@@ -1616,8 +1630,8 @@ impl Streaming {
         let Some(Placed::MeshPage(mut p)) = l.placed.take() else {
             unreachable!("a mesh page load")
         };
-        let mesh = l.mesh.take();
-        let landed_clusters = mesh.as_ref().map(|m| m.clusters.clone());
+        let mut mesh = l.mesh.take();
+        let infos = mesh.as_mut().map(|m| std::mem::take(&mut m.clusters));
         let units: Vec<(u32, u32)> = match (&mesh, &self.clas) {
             (Some(m), Some(_)) => m.slots.iter().map(|&s| clas[s as usize]).collect(),
             _ => Vec::new(),
@@ -1667,13 +1681,11 @@ impl Streaming {
         }
         p.address = l.gpu;
         p.clas_addresses = entries.iter().map(|e| e.clas).collect();
-        if let Some(f) = self.fine.get_mut(&(key.mount, p.stream.mesh)) {
-            let at = first as usize;
-            if let Some(clusters) = landed_clusters {
-                f.init.clusters[at..at + clusters.len()].clone_from_slice(&clusters);
-            }
-            let n = p.clas_addresses.len();
-            f.init.clas[at..at + n].copy_from_slice(&p.clas_addresses);
+        if let (Some(f), Some(infos)) = (self.fine.get_mut(&(key.mount, p.stream.mesh)), infos) {
+            f.init.resident[p.page as usize] = Some(Box::new(PageClusters {
+                infos,
+                clas: p.clas_addresses.clone(),
+            }));
         }
         self.resident.insert(key, Placed::MeshPage(p));
         Ok(())

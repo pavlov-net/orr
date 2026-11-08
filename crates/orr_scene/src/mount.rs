@@ -46,7 +46,7 @@ use crate::scene::{ModelCpu, ModelId, SkinShape};
 use crate::shaders::types::SubdCageGpu;
 use crate::skin;
 use crate::stream::{
-    FineInit, MeshStream, MountUnits, PoolTarget, StreamUnit, StreamedPage, Streaming,
+    FineInit, MeshStream, MountUnits, PageClusters, PoolTarget, StreamUnit, StreamedPage, Streaming,
 };
 use crate::subd::{CageShape, CageTables, ModelCage};
 use crate::tiles::{TexStream, TileGrid};
@@ -128,7 +128,7 @@ struct PlacedMesh {
     cached_only: [bool; 2],
     /// Discrete levels, finest first: error and mesh cluster range.
     level_ranges: Vec<(f32, u32, u32)>,
-    /// Every cluster by mesh cluster index, as its page decoded.
+    /// The clusters of its pinned pages by mesh cluster index, as their pages decoded.
     clusters: Vec<(u32, ClusterInfo)>,
     /// Per page, its micromap region.
     micromaps: Vec<Option<PageMicromap>>,
@@ -989,14 +989,6 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             triangles: p.tri_count,
         })
         .collect();
-    // Clusters of streamed pages are known once they load; until then they take no cut.
-    let absent: Vec<(u32, ClusterInfo)> = all_pages[pinned..]
-        .iter()
-        .zip(pinned as u32..)
-        .flat_map(|(p, page)| {
-            (0..p.clusters).map(move |i| (p.first + i, ClusterInfo::absent(page, i)))
-        })
-        .collect();
     let level_ranges = info
         .levels
         .iter()
@@ -1023,7 +1015,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             ranks: [info.emissive.rank_count(), info.casters.rank_count()],
             cached_only: [&info.emissive, &info.casters].map(|t| t.widest > GATHERED_CLUSTERS),
             level_ranges,
-            clusters: absent,
+            clusters: Vec::new(),
             micromaps: vec![None; info.pages.len()],
             parts: info.parts.clone(),
             depth,
@@ -1417,6 +1409,7 @@ struct ResolvedMesh {
     sections: u32,
     header: MeshHeader,
     levels: Vec<(f32, u32, u32)>,
+    /// The clusters of its pinned pages, which come first, by mesh cluster index.
     clusters: Vec<ClusterInfo>,
     micromaps: Vec<Option<PageMicromap>>,
     parts: Vec<Part>,
@@ -1775,7 +1768,7 @@ fn build_accel(
         }
     }
     for m in &mut r.meshes {
-        let n = m.clusters.len() as u32;
+        let n = m.gpu.cluster_count;
         let base = shared
             .cluster_ids
             .lock()
@@ -1828,7 +1821,7 @@ fn build_accel(
             ));
             r.accel.skins.push(table);
         }
-        for (r, &clas) in refs.iter_mut().zip(&cuts.rt.clas) {
+        for (r, &clas) in refs.iter_mut().zip(&cuts.clas) {
             r.clas = clas;
         }
         m.refs = refs;
@@ -1989,6 +1982,8 @@ pub(crate) struct Resident {
 struct EditMesh {
     gpu: MeshGpu,
     addresses: Vec<u64>,
+    /// The CLAS of its pinned pages' clusters, by mesh cluster index.
+    clas: Vec<u64>,
     source: Arc<EditSource>,
     /// A skinned mesh's skin table.
     skin: Option<SkinMeshGpu>,
@@ -2272,8 +2267,16 @@ fn units(
                     pages
                 })
                 .collect();
-            let mut clas = m.rt.clas.clone();
-            clas.resize(m.clusters.len(), 0);
+            let mut resident: Vec<Option<Box<PageClusters>>> = std::iter::repeat_with(|| None)
+                .take(m.all_pages.len())
+                .collect();
+            for (r, p) in resident.iter_mut().zip(&m.all_pages[..s.pinned as usize]) {
+                let at = p.first as usize..(p.first + p.clusters) as usize;
+                *r = Some(Box::new(PageClusters {
+                    infos: m.clusters[at.clone()].to_vec(),
+                    clas: m.refs[at].iter().map(|r| r.clas).collect(),
+                }));
+            }
             fine.push(FineInit {
                 mesh,
                 stream: Arc::clone(s),
@@ -2282,8 +2285,7 @@ fn units(
                 pages,
                 merge: m.header.merge_error,
                 animated: m.animated,
-                clusters: m.clusters.clone(),
-                clas,
+                resident,
             });
         }
         let stream_index = mesh_streams.len() as u32;
@@ -2639,7 +2641,7 @@ impl Mounts {
         let stream = Arc::clone(&source.source);
         let src_gpu = source.gpu;
         let addresses = source.addresses.clone();
-        let src_clas = r.rt[p.mesh as usize].clas.clone();
+        let src_clas = source.clas.clone();
         let src_model = r.model_gpus[&p.model];
         let src_skin = source.skin;
         let page_count = ids.page_count;
@@ -3510,6 +3512,7 @@ impl Mounts {
             res.edit_sources.push(EditMesh {
                 gpu,
                 addresses: m.page_addresses.clone(),
+                clas: m.refs.iter().map(|r| r.clas).collect(),
                 source: Arc::new(EditSource {
                     entry: m.entry,
                     header: m.header,

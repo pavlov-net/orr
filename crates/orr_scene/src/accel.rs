@@ -104,23 +104,6 @@ pub(crate) struct ClusterInfo {
 }
 
 impl ClusterInfo {
-    /// A cluster of a page not resident: no triangles, and never in a cut.
-    pub(crate) fn absent(page: u32, local: u32) -> Self {
-        Self {
-            page,
-            local,
-            vertex_count: 0,
-            tri_count: 0,
-            section: 0,
-            part: 0,
-            flags: 0,
-            micromap: false,
-            self_error: f32::INFINITY,
-            parent_error: 0.0,
-            deformation_bound: 0.0,
-        }
-    }
-
     pub(crate) fn new(page: u32, local: u32, c: &Cluster) -> Self {
         Self {
             page,
@@ -136,6 +119,12 @@ impl ClusterInfo {
             deformation_bound: half::f16::from_bits(c.deformation_bound).to_f32(),
         }
     }
+
+    /// Whether it is in the cut at threshold `t` of a mesh whose merged stage serves from
+    /// `merge`.
+    pub(crate) fn in_cut(&self, t: f32, merge: f32) -> bool {
+        in_cut(self.self_error, self.parent_error, self.flags, t, merge)
+    }
 }
 
 /// A page's micromap region: its offset in the page and the entries per subdivision level.
@@ -150,7 +139,8 @@ pub(crate) struct MeshInput<'a> {
     pub(crate) header: &'a MeshHeader,
     /// Resident page addresses.
     pub(crate) pages: &'a [u64],
-    /// By mesh cluster index.
+    /// The clusters of its pinned pages, which come first, by mesh cluster index: every
+    /// cluster unless its pages stream.
     pub(crate) clusters: &'a [ClusterInfo],
     /// By page; `None` where the page has no micromap region.
     pub(crate) micromaps: &'a [Option<PageMicromap>],
@@ -232,20 +222,25 @@ impl Animated {
         }
     }
 
-    fn index(&self, c: &ClusterInfo) -> Option<usize> {
+    pub(crate) fn index(&self, c: &ClusterInfo) -> Option<u32> {
         let animated = c.flags & Cluster::ANIMATED_PART != 0 && u32::from(c.part) >= self.first;
-        animated.then(|| (u32::from(c.part) - self.first) as usize)
+        animated.then(|| u32::from(c.part) - self.first)
     }
 }
 
-/// What a mesh keeps for its section-mask BLAS: the CLAS of each cluster and the clusters
-/// of each cut.
+/// A cluster of a cached cut as its section-mask BLAS take it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RtCluster {
+    clas: u64,
+    section: u16,
+    animated: bool,
+}
+
+/// What a mesh keeps for its section-mask BLAS: the clusters of each cut.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MeshRt {
-    pub(crate) clas: Vec<u64>,
-    sections: Vec<u16>,
-    animated: Vec<bool>,
-    pub(crate) cuts: Vec<Vec<u32>>,
+    /// Per cut, finest first; empty for a finer cut, which masks leave out.
+    pub(crate) cuts: Vec<Vec<RtCluster>>,
     /// Per cut: it has animated part clusters, so its body BLAS differs from its rest one.
     parted: Vec<bool>,
 }
@@ -254,23 +249,16 @@ impl MeshRt {
     /// Per table slot (rest of each cut, then body of each cut): the clusters left by
     /// `mask`, or None where the slot repeats the rest slot of its cut.
     fn mask_lists(&self, mask: u16) -> Vec<Option<Vec<u64>>> {
-        let shown = |c: u32| {
-            let s = self.sections[c as usize];
-            s >= 16 || mask >> s & 1 == 0
-        };
-        let rest = self.cuts.iter().map(|cut| {
-            Some(
-                cut.iter()
-                    .filter(|&&c| shown(c))
-                    .map(|&c| self.clas[c as usize])
-                    .collect(),
-            )
-        });
+        let shown = |c: &RtCluster| c.section >= 16 || mask >> c.section & 1 == 0;
+        let rest = self
+            .cuts
+            .iter()
+            .map(|cut| Some(cut.iter().filter(|c| shown(c)).map(|c| c.clas).collect()));
         let body = self.cuts.iter().zip(&self.parted).map(|(cut, &parted)| {
             parted.then(|| {
                 cut.iter()
-                    .filter(|&&c| shown(c) && !self.animated[c as usize])
-                    .map(|&c| self.clas[c as usize])
+                    .filter(|c| shown(c) && !c.animated)
+                    .map(|c| c.clas)
                     .collect()
             })
         });
@@ -290,6 +278,8 @@ pub(crate) struct MeshCuts {
     /// The finer cuts at the start of the table.
     pub(crate) fine: u32,
     pub(crate) rt: MeshRt,
+    /// By mesh cluster of [`MeshInput::clusters`]: its CLAS, 0 where none is built.
+    pub(crate) clas: Vec<u64>,
 }
 
 /// The acceleration structures of a mount, kept alive while it is resident.
@@ -354,13 +344,10 @@ pub(super) fn cut_hash(clusters: &[u32]) -> [u32; 2] {
     })
 }
 
-/// The mesh clusters of the cut at threshold `t`.
-pub(crate) fn cut_clusters(clusters: &[ClusterInfo], t: f32, merge: f32) -> Vec<u32> {
+/// The mesh clusters among `clusters` (by mesh cluster index) of the cut at threshold `t`.
+fn cut_clusters(clusters: &[ClusterInfo], t: f32, merge: f32) -> Vec<u32> {
     (0..clusters.len() as u32)
-        .filter(|&i| {
-            let c = &clusters[i as usize];
-            in_cut(c.self_error, c.parent_error, c.flags, t, merge)
-        })
+        .filter(|&i| clusters[i as usize].in_cut(t, merge))
         .collect()
 }
 
@@ -370,6 +357,14 @@ pub(crate) struct Cut {
     pub(crate) error: f32,
     pub(crate) clusters: Vec<u32>,
     pub(crate) row: u32,
+}
+
+/// A cluster of a cut as its BLAS take it: its CLAS and, on an animated part, that part's
+/// index among the mesh's animated parts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CutMember {
+    pub(crate) clas: u64,
+    pub(crate) part: Option<u32>,
 }
 
 /// The clusters of each cut a mesh caches, finest first. Discrete meshes cache their levels,
@@ -835,13 +830,35 @@ pub(crate) fn build(
     let mut jobs = BlasJobs::default();
     let mut plans = Vec::new();
     let mut per_mesh = Vec::with_capacity(meshes.len());
+    let mut rt_cuts: Vec<Vec<Vec<RtCluster>>> = Vec::with_capacity(meshes.len());
     for (mi, m) in meshes.iter().enumerate() {
         let animated = Animated::of(m.clusters, m.header.parts.count);
         let cs = cuts(m);
         per_mesh.push((cs.len() as u32, animated));
+        let mut rt = Vec::with_capacity(cs.len());
         for cut in cs {
-            plans.push(jobs.plan_cut(cut, m.clusters, animated, &clas[mi]));
+            let members: Vec<CutMember> = cut
+                .clusters
+                .iter()
+                .map(|&c| CutMember {
+                    clas: clas[mi][c as usize],
+                    part: animated.index(&m.clusters[c as usize]),
+                })
+                .collect();
+            rt.push(
+                cut.clusters
+                    .iter()
+                    .zip(&members)
+                    .map(|(&c, k)| RtCluster {
+                        clas: k.clas,
+                        section: m.clusters[c as usize].section,
+                        animated: k.part.is_some(),
+                    })
+                    .collect(),
+            );
+            plans.push(jobs.plan_cut(cut, &members, animated.count));
         }
+        rt_cuts.push(rt);
     }
     let blas = jobs.build(&mut step, k, &mut accel.blocks)?;
 
@@ -906,10 +923,11 @@ pub(crate) fn build(
     let mut plans = plans.into_iter();
     let cuts = meshes
         .iter()
-        .zip(&clas)
+        .zip(clas)
+        .zip(rt_cuts)
         .zip(&per_mesh)
         .zip(&per_part)
-        .map(|(((m, clas), &(count, animated)), parts_of)| {
+        .map(|((((m, clas), rt), &(count, animated)), parts_of)| {
             let mine: Vec<CutPlan> = plans.by_ref().take(count as usize).collect();
             let fine = m.fine.len() as u32;
             let c = MeshCuts {
@@ -920,20 +938,14 @@ pub(crate) fn build(
                 animated_sections: parts_of.iter().fold(0, |s, p| s | p.sections),
                 fine,
                 rt: MeshRt {
-                    clas: clas.clone(),
-                    sections: m.clusters.iter().map(|c| c.section).collect(),
-                    animated: m
-                        .clusters
-                        .iter()
-                        .map(|c| animated.index(c).is_some())
-                        .collect(),
                     parted: std::iter::repeat_n(false, fine as usize)
                         .chain(mine.iter().map(|p| p.parts.is_some()))
                         .collect(),
                     cuts: std::iter::repeat_n(Vec::new(), fine as usize)
-                        .chain(mine.into_iter().map(|p| p.clusters))
+                        .chain(rt)
                         .collect(),
                 },
+                clas,
             };
             first += u64::from(fine + count);
             first_part += u64::from(animated.count);
@@ -959,42 +971,37 @@ struct BlasJobs {
 }
 
 impl BlasJobs {
-    fn add(&mut self, clusters: &[u32], clas: &[u64]) -> usize {
-        self.jobs.push((self.lists.len(), clusters.len() as u32));
-        self.lists
-            .extend(clusters.iter().map(|&c| clas[c as usize]));
+    fn add(&mut self, clas: impl IntoIterator<Item = u64>) -> usize {
+        let first = self.lists.len();
+        self.lists.extend(clas);
+        self.jobs.push((first, (self.lists.len() - first) as u32));
         self.jobs.len() - 1
     }
 
-    /// The BLAS of a cut: over its clusters; with animated part clusters also over its body
-    /// (when not empty) and one per animated part with clusters in it.
-    fn plan_cut(
-        &mut self,
-        cut: Cut,
-        infos: &[ClusterInfo],
-        animated: Animated,
-        clas: &[u64],
-    ) -> CutPlan {
+    /// The BLAS of a cut whose clusters are `members`: over all of them; with animated part
+    /// clusters also over its body (when not empty) and one per animated part of `parts`
+    /// with clusters in it.
+    fn plan_cut(&mut self, cut: Cut, members: &[CutMember], parts: u32) -> CutPlan {
         let Cut {
             error,
             clusters,
             row,
         } = cut;
-        let rest = self.add(&clusters, clas);
-        let mut parts = vec![Vec::new(); animated.count as usize];
+        let rest = self.add(members.iter().map(|m| m.clas));
+        let mut lists = vec![Vec::new(); parts as usize];
         let mut body = Vec::new();
-        for &c in &clusters {
-            match animated.index(&infos[c as usize]) {
-                Some(j) => parts[j].push(c),
-                None => body.push(c),
+        for m in members {
+            match m.part {
+                Some(j) => lists[j as usize].push(m.clas),
+                None => body.push(m.clas),
             }
         }
-        let parted = parts.iter().any(|p| !p.is_empty());
+        let parted = lists.iter().any(|p| !p.is_empty());
         let (body, parts) = if parted {
-            let body = (!body.is_empty()).then(|| self.add(&body, clas));
-            let parts: Vec<Option<usize>> = parts
-                .iter()
-                .map(|p| (!p.is_empty()).then(|| self.add(p, clas)))
+            let body = (!body.is_empty()).then(|| self.add(body));
+            let parts: Vec<Option<usize>> = lists
+                .into_iter()
+                .map(|p| (!p.is_empty()).then(|| self.add(p)))
                 .collect();
             (body, Some(parts))
         } else {
@@ -1071,29 +1078,19 @@ pub(crate) struct FineCut {
     _parts: Option<Allocation<u64>>,
 }
 
-/// Builds the BLAS of a finer cut over `clusters` on the loading queue. Returns its table
-/// record, its memory and the point the build signals.
+/// Builds the BLAS of finer cut `cut`, whose clusters are `members`, of a mesh with `parts`
+/// animated parts on the loading queue. Returns its table record, its memory and the point
+/// the build signals.
 pub(crate) fn build_fine_cut(
     device: &Device,
     k: &AccelKernels,
-    clusters: Vec<u32>,
-    row: u32,
-    infos: &[ClusterInfo],
-    animated: Animated,
-    clas: &[u64],
+    cut: Cut,
+    members: &[CutMember],
+    parts: u32,
 ) -> Result<(RtCutGpu, FineCut, TimelinePoint)> {
     let mut step = Step::new(device, build_queue(device), None);
-    let error = clusters
-        .iter()
-        .map(|&i| infos[i as usize].self_error)
-        .fold(0.0, f32::max);
     let mut jobs = BlasJobs::default();
-    let cut = Cut {
-        error,
-        clusters,
-        row,
-    };
-    let p = jobs.plan_cut(cut, infos, animated, clas);
+    let p = jobs.plan_cut(cut, members, parts);
     let mut blocks = Vec::new();
     let blas = jobs.build(&mut step, k, &mut blocks)?;
     // Everything fallible comes before the submit, so a failed cut has no build in flight.
@@ -1169,7 +1166,7 @@ fn part_records(m: &MeshInput<'_>, animated: Animated) -> Vec<PartGpu> {
         .collect();
     for c in m.clusters {
         if let Some(j) = animated.index(c) {
-            out[j].sections |= 1 << c.section.min(16);
+            out[j as usize].sections |= 1 << c.section.min(16);
         }
     }
     out
