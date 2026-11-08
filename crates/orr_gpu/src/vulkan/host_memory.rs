@@ -203,16 +203,24 @@ impl Device {
         };
         // SAFETY: the buffer is live.
         let required = unsafe { d.get_buffer_memory_requirements(buffer) };
+        // A buffer may need more memory than its size, which the import cannot grow.
+        if required.size > len {
+            return Err(destroy(Error::Invalid(format!(
+                "{name}: a buffer of {len} bytes needs {} bytes of memory",
+                required.size
+            ))));
+        }
         let bits = pointer.memory_type_bits & required.memory_type_bits;
         let props = &s.memory.properties;
         let flags = |i: u32| props.memory_types[i as usize].property_flags;
         let pick = |want: vk::MemoryPropertyFlags| {
             (0..props.memory_type_count).find(|&i| bits & (1 << i) != 0 && flags(i).contains(want))
         };
-        let coherent = vk::MemoryPropertyFlags::HOST_COHERENT;
+        let visible = vk::MemoryPropertyFlags::HOST_VISIBLE;
+        let coherent = visible | vk::MemoryPropertyFlags::HOST_COHERENT;
         let ty = pick(coherent | vk::MemoryPropertyFlags::HOST_CACHED)
             .or_else(|| pick(coherent))
-            .or_else(|| pick(vk::MemoryPropertyFlags::empty()))
+            .or_else(|| pick(visible))
             .ok_or_else(|| {
                 destroy(Error::Invalid(format!(
                     "{name}: no memory type imports it (pointer types {:#x}, buffer types {:#x})",
