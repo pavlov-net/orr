@@ -984,9 +984,22 @@ impl Scenes {
 
     /// Step 1: waits until frame N - frames_in_flight has completed, sleeps on the low
     /// latency handle when one is given, recycles the upload window and the slots freed
-    /// before it, swaps in hot-reloaded pipelines, and opens frame N.
+    /// before it, swaps in hot-reloaded pipelines, and opens frame N. Raises a panic of the
+    /// loading thread.
     pub fn begin_frame(&mut self, desc: &FrameDesc<'_>) -> Result<Frame<'_>> {
         let started = Instant::now();
+        // The loading thread ends only at `Msg::Stop`, so one that has ended panicked, and
+        // nothing would load again.
+        if self
+            .loading_thread
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            let thread = self.loading_thread.take().expect("a loading thread");
+            if let Err(panic) = thread.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
         let core = &mut self.core;
         for (i, id) in desc.scenes.iter().enumerate() {
             core.scene(*id)?;
@@ -2600,9 +2613,14 @@ impl Drop for Scenes {
     fn drop(&mut self) {
         self.loading.send(Msg::Stop);
         self.loading.stop_workers();
-        if let Some(t) = self.loading_thread.take() {
-            let _ = t.join();
-        }
+        let ended = self.loading_thread.take().map(JoinHandle::join);
         self.core.mounts.clear(&self.core.materials);
+        // A panic of the loading thread is the scenes'. Raising it while another unwinds would
+        // abort, and the panic hook printed it when it happened.
+        if let Some(Err(panic)) = ended
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

@@ -867,39 +867,48 @@ pub(crate) fn decoded(
     })
 }
 
+/// The watcher threads, stopped and joined when this drops: as the loading thread ends, by
+/// `Msg::Stop` or a panic, or when a thread fails to start.
+struct Watchers {
+    watch: Arc<Watch>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl Drop for Watchers {
+    fn drop(&mut self) {
+        self.watch.stop();
+        for t in self.threads.drain(..) {
+            // A watcher only waits; it has nothing to report.
+            let _ = t.join();
+        }
+    }
+}
+
 /// Starts the loading thread, which handles IO completions, messages and resumable work until
 /// `Msg::Stop`, and its watchers, which it joins before it ends.
 pub(crate) fn spawn(loading: &Arc<Loading>, device: &Device) -> std::io::Result<JoinHandle<()>> {
-    let watch = Arc::new(Watch::default());
-    let mut watchers = Vec::with_capacity(WATCHERS);
+    let mut watchers = Watchers {
+        watch: Arc::new(Watch::default()),
+        threads: Vec::with_capacity(WATCHERS),
+    };
     for watcher in 0..WATCHERS {
-        let (w, l, d) = (Arc::clone(&watch), Arc::clone(loading), device.clone());
-        let spawned = std::thread::Builder::new()
+        let (w, l, d) = (
+            Arc::clone(&watchers.watch),
+            Arc::clone(loading),
+            device.clone(),
+        );
+        let handle = std::thread::Builder::new()
             .name(format!("orr loading watch {watcher}"))
-            .spawn(move || w.run(watcher, &d, &l.wake));
-        match spawned {
-            Ok(handle) => watchers.push(handle),
-            Err(e) => {
-                // The idle watchers return.
-                watch.stop();
-                return Err(e);
-            }
-        }
+            .spawn(move || w.run(watcher, &d, &l.wake))?;
+        watchers.threads.push(handle);
     }
-    let (w, l, d) = (Arc::clone(&watch), Arc::clone(loading), device.clone());
-    let thread = std::thread::Builder::new()
+    let (l, d) = (Arc::clone(loading), device.clone());
+    std::thread::Builder::new()
         .name("orr loading".into())
         .spawn(move || {
-            run(&l, &d, &w);
-            w.stop();
-            for watcher in watchers {
-                let _ = watcher.join();
-            }
-        });
-    if thread.is_err() {
-        watch.stop();
-    }
-    thread
+            let watchers = watchers;
+            run(&l, &d, &watchers.watch);
+        })
 }
 
 fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
