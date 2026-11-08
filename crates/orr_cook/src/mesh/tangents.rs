@@ -5,7 +5,10 @@
 //! Over every texel center of each normal map that a triangle covers, the check builds the
 //! shading normal `material_normal` gives from the stored tangent and from the derived one,
 //! and takes the 99th percentile of the angle between them. A tile set counts each tile's texels,
-//! and the cells it has no tile in at the density of its largest.
+//! and the cells it has no tile in at the density of its largest. A mesh whose triangles cover
+//! more than [`SAMPLES`] texels, as uvs that repeat a map many times do, samples a lattice of
+//! texel centers at a whole-texel stride instead, offset by a hash of each triangle, so every
+//! center has the same chance of a sample and the histogram is the dense one's in expectation.
 
 use meshopt::TangentOptions;
 use orr_math::{DVec2, Vec3};
@@ -13,6 +16,7 @@ use orr_pack::texture::normal;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
+use super::maps::{Map, Raster};
 use super::{MeshData, NormalSpec, SectionMaps};
 
 /// Histogram bin width, degrees.
@@ -21,6 +25,10 @@ const BINS: usize = (180.0 / BIN) as usize + 1;
 
 /// Triangles per parallel job.
 const CHUNK: usize = 1024;
+
+/// Samples a mesh's check takes, at most about: a 99th percentile from them is within a few
+/// thousandths of a percentile of the dense one.
+const SAMPLES: u64 = 1 << 22;
 
 /// The tangent of a vertex nothing reads, and of one only degenerate triangles touch: xyz and
 /// bitangent sign.
@@ -136,8 +144,7 @@ pub(super) fn check(
     max_deg: f32,
 ) -> TangentCheck {
     let _z = crate::profile::zone!("mesh.tangent_check");
-    let mut hist = vec![0.0f64; BINS];
-    let mut texels = 0u64;
+    let mut checked = Vec::new();
     for (sec, sm) in m.sections.iter().zip(maps) {
         let (map, set, frame) = match (&sec.maps.normal, &sm.normal) {
             (NormalSpec::None, _) => continue,
@@ -149,44 +156,84 @@ pub(super) fn check(
             ) if frame_set < m.uvs.len() => (map, uv_set, frame_set),
             _ => return TangentCheck::KEPT,
         };
-        // Tiles of a set weigh by the uv area they cover, as texels of one image do, whatever
-        // their sizes: each texel counts as the largest tile's do.
-        let texels_of = |[w, h]: [u32; 2]| f64::from(w) * f64::from(h);
-        let largest = map
-            .each()
+        checked.push((sec, map, set, frame));
+    }
+    // Tiles of a set weigh by the uv area they cover, as texels of one image do, whatever
+    // their sizes: each texel counts as the largest tile's do.
+    let texels_of = |[w, h]: [u32; 2]| f64::from(w) * f64::from(h);
+    let largest = |map: &Map<[Raster; 2]>| {
+        map.each()
             .map(|t| [t[0].w, t[0].h])
             .max_by(|a, b| texels_of(*a).total_cmp(&texels_of(*b)))
-            .expect("a map holds a texture");
+            .expect("a map holds a texture")
+    };
+    // Whole texels per part, so neither the sum nor the stride depends on the order threads
+    // add in.
+    let area: u64 = checked
+        .iter()
+        .map(|&(sec, map, set, _)| {
+            let largest = largest(map);
+            m.indices[sec.indices.clone()]
+                .par_chunks(3 * CHUNK)
+                .map(|chunk| {
+                    let mut area = 0u64;
+                    for t in chunk.as_chunks::<3>().0 {
+                        map.parts(t.map(|i| m.uvs[set][i as usize]), |p| {
+                            let [x, ..] = p.read;
+                            let size = match [x.w, x.h] {
+                                [1, 1] => largest,
+                                s => s,
+                            };
+                            area += texel_area(size, p.uv.map(|c| x.mapped(c))).ceil() as u64;
+                            true
+                        });
+                    }
+                    area
+                })
+                .sum::<u64>()
+        })
+        .sum();
+    let stride = (area > SAMPLES).then(|| (area as f64 / SAMPLES as f64).sqrt().ceil());
+    let mut hist = vec![0.0f64; BINS];
+    let mut texels = 0u64;
+    for (sec, map, set, frame) in checked {
+        let largest = largest(map);
+        let first = sec.indices.start / 3;
         let (h, n) = m.indices[sec.indices.clone()]
             .par_chunks(3 * CHUNK)
-            .map(|chunk| {
-                let mut h = vec![0.0f64; BINS];
-                let mut n = 0u64;
-                for t in chunk.as_chunks::<3>().0 {
-                    let tri = Triangle::new(m, [set, frame], tangents, t.map(|i| i as usize));
-                    map.parts(tri.uv, |p| {
-                        let [x, ..] = p.read;
-                        // One texel holds one value and no grid: it reads as finely as the set.
-                        let (size, scale) = match [x.w, x.h] {
-                            [1, 1] => (largest, 1.0),
-                            s => (s, texels_of(largest) / texels_of(s)),
-                        };
-                        let uv = p.uv.map(|c| x.mapped(c));
-                        texel_centers(size, uv, |w, weight| {
-                            let [a, b, c] = p.weights;
-                            let at = [0, 1]
-                                .map(|i| w.x * p.uv[0][i] + w.y * p.uv[1][i] + w.z * p.uv[2][i]);
-                            let v = normal::decode([p.read[0].sample(at), p.read[1].sample(at)]);
-                            let v = Vec3::from(map.normal_frame(v));
-                            let deg = tri.angle(v, a * w.x + b * w.y + c * w.z);
-                            h[((deg / BIN) as usize).min(BINS - 1)] += weight * scale;
-                            n += 1;
+            .enumerate()
+            .fold(
+                || (vec![0.0f64; BINS], 0u64),
+                |(mut h, mut n), (k, chunk)| {
+                    for (j, t) in chunk.as_chunks::<3>().0.iter().enumerate() {
+                        let tri = Triangle::new(m, [set, frame], tangents, t.map(|i| i as usize));
+                        let lattice = stride.map(|s| (s, phase((first + k * CHUNK + j) as u64)));
+                        map.parts(tri.uv, |p| {
+                            let [x, ..] = p.read;
+                            // One texel holds one value and no grid: it reads as finely as the set.
+                            let (size, scale) = match [x.w, x.h] {
+                                [1, 1] => (largest, 1.0),
+                                s => (s, texels_of(largest) / texels_of(s)),
+                            };
+                            let uv = p.uv.map(|c| x.mapped(c));
+                            texel_centers(size, uv, lattice, |w, weight| {
+                                let [a, b, c] = p.weights;
+                                let at = [0, 1].map(|i| {
+                                    w.x * p.uv[0][i] + w.y * p.uv[1][i] + w.z * p.uv[2][i]
+                                });
+                                let v =
+                                    normal::decode([p.read[0].sample(at), p.read[1].sample(at)]);
+                                let v = Vec3::from(map.normal_frame(v));
+                                let deg = tri.angle(v, a * w.x + b * w.y + c * w.z);
+                                h[((deg / BIN) as usize).min(BINS - 1)] += weight * scale;
+                                n += 1;
+                            });
+                            true
                         });
-                        true
-                    });
-                }
-                (h, n)
-            })
+                    }
+                    (h, n)
+                },
+            )
             .reduce(
                 || (vec![0.0; BINS], 0),
                 |(mut a, na), (b, nb)| {
@@ -295,18 +342,50 @@ fn orthonormal_basis(n: Vec3) -> (Vec3, Vec3) {
     )
 }
 
+/// Texels of a map of `size` texels that the mapped uv triangle `uv` covers.
+fn texel_area(size: [u32; 2], uv: [[f64; 2]; 3]) -> f64 {
+    let [w, h] = size.map(f64::from);
+    let [a, b, c] = uv.map(|t| DVec2::new(t[0] * w, t[1] * h));
+    (b - a).perp_dot(c - a).abs() * 0.5
+}
+
+/// A point of the unit square from triangle `t`'s index.
+fn phase(t: u64) -> [f64; 2] {
+    // splitmix64's finalizer.
+    let mut z = t.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    [z >> 32, z & 0xffff_ffff].map(|h| h as f64 / 4_294_967_296.0)
+}
+
 /// Calls `f` with the barycentrics and weight of every texel center of a map of `size` texels
 /// inside the mapped uv triangle `uv`. A triangle covering more texels than the map holds samples
 /// a grid coarse enough to stay at the map's texel count, each sample weighted by its cell's
-/// texels; a triangle covering no center samples its centroid.
-fn texel_centers(size: [u32; 2], uv: [[f64; 2]; 3], mut f: impl FnMut(Vec3, f64)) {
+/// texels; a triangle covering no center samples its centroid. With `lattice`, a stride and a
+/// point of the unit square, the grid is at least that coarse in whole texels and starts at the
+/// texel center the point picks in its first cell, and a triangle it misses has no sample.
+fn texel_centers(
+    size: [u32; 2],
+    uv: [[f64; 2]; 3],
+    lattice: Option<(f64, [f64; 2])>,
+    mut f: impl FnMut(Vec3, f64),
+) {
     let size = size.map(f64::from);
     let p = uv.map(|t| DVec2::new(t[0] * size[0], t[1] * size[1]));
     let cross = |a: DVec2, b: DVec2, c: DVec2| (b - a).perp_dot(c - a);
     let area2 = cross(p[0], p[1], p[2]);
     let mut any = false;
     if area2 != 0.0 {
-        let step = (area2.abs() * 0.5 / (size[0] * size[1])).sqrt().max(1.0);
+        let cap = (area2.abs() * 0.5 / (size[0] * size[1])).sqrt();
+        // Bilinear reads between texel centers would smooth the normals a lattice samples.
+        let (step, [phase_x, phase_y]) = match lattice {
+            Some((stride, at)) => {
+                let step = cap.max(stride).ceil();
+                (step, at.map(|a| ((a * step).floor() + 0.5) / step))
+            }
+            None => (cap.max(1.0), [0.5; 2]),
+        };
         let weight = step * step;
         // Inside where every edge function ex x + ey y + e0, signed by the winding, is >= 0.
         let s = area2.signum();
@@ -317,9 +396,9 @@ fn texel_centers(size: [u32; 2], uv: [[f64; 2]; 3], mut f: impl FnMut(Vec3, f64)
         });
         let lo_y = p.iter().map(|q| q[1]).fold(f64::INFINITY, f64::min);
         let hi_y = p.iter().map(|q| q[1]).fold(f64::NEG_INFINITY, f64::max);
-        let mut row = ((lo_y / step) - 0.5).ceil();
-        while (row + 0.5) * step <= hi_y {
-            let y = (row + 0.5) * step;
+        let mut row = ((lo_y / step) - phase_y).ceil();
+        while (row + phase_y) * step <= hi_y {
+            let y = (row + phase_y) * step;
             let (mut x0, mut x1) = (f64::NEG_INFINITY, f64::INFINITY);
             for &(ex, ey, e0) in &edges {
                 let c = ey * y + e0;
@@ -331,9 +410,9 @@ fn texel_centers(size: [u32; 2], uv: [[f64; 2]; 3], mut f: impl FnMut(Vec3, f64)
                     x1 = f64::NEG_INFINITY;
                 }
             }
-            let mut col = ((x0 / step) - 0.5).ceil();
-            while (col + 0.5) * step <= x1 {
-                let x = (col + 0.5) * step;
+            let mut col = ((x0 / step) - phase_x).ceil();
+            while (col + phase_x) * step <= x1 {
+                let x = (col + phase_x) * step;
                 let q = DVec2::new(x, y);
                 let b1 = cross(p[0], q, p[2]) / area2;
                 let b2 = cross(p[0], p[1], q) / area2;
@@ -345,7 +424,7 @@ fn texel_centers(size: [u32; 2], uv: [[f64; 2]; 3], mut f: impl FnMut(Vec3, f64)
             row += 1.0;
         }
     }
-    if !any {
+    if !any && lattice.is_none() {
         f(Vec3::splat(1.0 / 3.0), 1.0);
     }
 }
