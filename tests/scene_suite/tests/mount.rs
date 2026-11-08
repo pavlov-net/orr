@@ -2699,9 +2699,11 @@ fn the_clas_pool_allocator_places_like_a_first_fit_reference() {
     assert_clean();
 }
 
-/// `rounds` batches of `clas_count` CLAS into a pool of `page_count` pages, each against a
-/// first-fit reference.
+/// `rounds` batches of `clas_count` CLAS in streamed pages of up to 400 into a pool of
+/// `page_count` pages, each against [`orr_scene::ClasOrder::place`]. A few CLAS have no bytes
+/// or more than a page, and a streamed page's CLAS free together.
 fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
+    use orr_scene::ClasOrder;
     use orr_scene::memory::RangeAllocator;
     use orr_scene::orr_gpu::{MemoryKind, RtasOp};
     const WORDS: u32 = 16;
@@ -2732,6 +2734,12 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
     let taken = dev
         .gpu_malloc::<u32>(up, u64::from(page_count), "taken")
         .unwrap();
+    let mut order = dev
+        .gpu_malloc::<u32>(up, clas_count as u64, "order")
+        .unwrap();
+    let mut groups = dev
+        .gpu_malloc::<[u32; 2]>(up, clas_count as u64, "groups")
+        .unwrap();
     let mut sizes = dev
         .gpu_malloc::<u32>(up, clas_count as u64, "sizes")
         .unwrap();
@@ -2744,20 +2752,25 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
     let destinations = dev
         .gpu_malloc::<u64>(up, clas_count as u64, "destinations")
         .unwrap();
-    let stride = u64::from(dev.rtas_args_stride(RtasOp::Move));
+    let stride = dev.rtas_args_stride(RtasOp::Move) as usize;
     let moves = dev
-        .gpu_malloc::<u8>(up, stride * clas_count as u64, "moves")
+        .gpu_malloc::<u8>(up, (stride * clas_count) as u64, "moves")
         .unwrap();
     let count = dev.gpu_malloc::<u32>(up, 1, "move count").unwrap();
     let mut root = dev
         .gpu_malloc::<orr_scene::PoolRoot>(up, 1, "root")
         .unwrap();
     let base = 1u64 << 40;
+    for (i, s) in sources.as_mut_slice().unwrap().iter_mut().enumerate() {
+        *s = 0x1000 * (i as u64 + 1);
+    }
 
     let mut reference = RangeAllocator::new(page_count * UNITS);
     assert!(reference.take(0, page_count * UNITS));
     let mut bound = vec![false; page_count as usize];
-    let mut live: Vec<(u32, u32)> = Vec::new();
+    // Per streamed page, the unit ranges its CLAS take, joined as the pool joins them, so a
+    // free can reach across pool pages and allocator threads' blocks.
+    let mut live: Vec<Vec<[u32; 2]>> = Vec::new();
     let mut rand = {
         let mut x = 0x2545_f491u32;
         move || {
@@ -2777,17 +2790,39 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
                 free_list.push([p * UNITS, UNITS]);
             }
         }
-        live.retain(|&(u, n)| {
+        live.retain(|ranges| {
             let keep = rand() % 3 != 0;
             if !keep {
-                free_list.push([u, n]);
+                free_list.extend_from_slice(ranges);
             }
             keep
         });
+        free_list.sort_unstable_by_key(|f| f[0]);
         let take_list: Vec<u32> = (0..page_count)
             .filter(|&p| bound[p as usize] && rand() % 5 == 0)
             .collect();
-        let size_list: Vec<u32> = (0..clas_count).map(|_| 128 + rand() % 6000).collect();
+        let size_list: Vec<u32> = (0..clas_count)
+            .map(|_| match rand() % 1000 {
+                0 => 0,
+                1 => 128 * UNITS + 1,
+                _ => 128 + rand() % 6000,
+            })
+            .collect();
+        // Results indices shuffled, as a batch's builds order them apart from its pages.
+        let mut results: Vec<u32> = (0..clas_count as u32).collect();
+        for i in (1..results.len()).rev() {
+            results.swap(i, rand() as usize % (i + 1));
+        }
+        let mut pages = ClasOrder::default();
+        let mut page_clas: Vec<&[u32]> = Vec::new();
+        let mut rest = results.as_slice();
+        while !rest.is_empty() {
+            let wide = if rand() % 8 == 0 { 400 } else { 160 };
+            let (page, after) = rest.split_at((1 + rand() as usize % wide).min(rest.len()));
+            pages.push_page(page);
+            page_clas.push(page);
+            rest = after;
+        }
         for &[f, n] in &free_list {
             reference.free(f, n);
         }
@@ -2801,29 +2836,44 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
                 u32::from(t)
             })
             .collect();
-        let expect_units: Vec<u32> = size_list
+        let expect_units = pages.place(&mut reference, UNITS, &size_list);
+        let placed: Vec<u32> = pages
+            .order()
             .iter()
-            .map(|&s| {
-                let need = s.div_ceil(128);
-                reference
-                    .alloc(need)
-                    .inspect(|&u| live.push((u, need)))
-                    .unwrap_or(u32::MAX)
-            })
+            .copied()
+            .filter(|&i| expect_units[i as usize] != u32::MAX)
             .collect();
+        for page in &page_clas {
+            let mut ranges: Vec<[u32; 2]> = Vec::new();
+            for &i in page
+                .iter()
+                .filter(|&&i| expect_units[i as usize] != u32::MAX)
+            {
+                let (u, n) = (
+                    expect_units[i as usize],
+                    size_list[i as usize].div_ceil(128),
+                );
+                match ranges.last_mut() {
+                    Some(r) if r[0] + r[1] == u => r[1] += n,
+                    _ => ranges.push([u, n]),
+                }
+            }
+            live.push(ranges);
+        }
 
         frees.as_mut_slice().unwrap()[..free_list.len()].copy_from_slice(&free_list);
         takes.as_mut_slice().unwrap()[..take_list.len()].copy_from_slice(&take_list);
+        order.as_mut_slice().unwrap().copy_from_slice(pages.order());
+        groups.as_mut_slice().unwrap()[..pages.groups().len()].copy_from_slice(pages.groups());
         sizes.as_mut_slice().unwrap().copy_from_slice(&size_list);
-        for (i, s) in sources.as_mut_slice().unwrap().iter_mut().enumerate() {
-            *s = 0x1000 * (i as u64 + 1);
-        }
         root.as_mut_slice().unwrap()[0] = orr_scene::PoolRoot {
             bits: bits.gpu(),
             summary: summary.gpu().cast(),
             frees: frees.gpu().cast(),
             takes: takes.gpu(),
             taken: taken.gpu(),
+            order: order.gpu(),
+            groups: groups.gpu().cast(),
             sizes: sizes.gpu(),
             sources: sources.gpu(),
             units: units.gpu(),
@@ -2835,7 +2885,7 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
             words: WORDS,
             free_count: free_list.len() as u32,
             take_count: take_list.len() as u32,
-            clas_count: clas_count as u32,
+            group_count: pages.groups().len() as u32,
             flags: u32::from(round == 0),
             _pad: 0,
         };
@@ -2854,16 +2904,14 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
             expect_units.as_slice(),
             "units of round {round}"
         );
-        let placed: Vec<u64> = expect_units
-            .iter()
-            .filter(|&&u| u != u32::MAX)
-            .map(|&u| base + 128 * u64::from(u))
-            .collect();
         assert_eq!(count.as_slice().unwrap()[0] as usize, placed.len());
-        assert_eq!(
-            &destinations.as_slice().unwrap()[..placed.len()],
-            placed.as_slice()
-        );
+        let records = moves.as_slice().unwrap();
+        for (k, &i) in placed.iter().enumerate() {
+            let at = base + 128 * u64::from(expect_units[i as usize]);
+            assert_eq!(destinations.as_slice().unwrap()[k], at, "move {k}");
+            let src = u64::from_le_bytes(records[k * stride..][..8].try_into().unwrap());
+            assert_eq!(src, 0x1000 * (u64::from(i) + 1), "move {k}'s source");
+        }
     }
 }
 

@@ -303,7 +303,7 @@ enum Placed {
     MeshPage(MeshPlaced),
 }
 
-/// A streamed mesh page: its slot, its clusters' CLAS units and its micromap.
+/// A streamed mesh page: its slot, the unit ranges its CLAS take and its micromap.
 struct MeshPlaced {
     slot: PoolSlot,
     stream: Arc<MeshStream>,
@@ -1618,11 +1618,7 @@ impl Streaming {
             _ => Vec::new(),
         };
         p.micromap = mesh.and_then(|m| m.micromap);
-        p.clas = units
-            .iter()
-            .copied()
-            .filter(|&(u, _)| u != NO_UNIT)
-            .collect();
+        p.clas = clas_pool::ranges(&units);
         let placed = l.result.is_ok() && units.iter().all(|&(u, _)| u != NO_UNIT);
         if l.result.is_ok() && self.mounts.contains_key(&key.mount) {
             let clas: u64 = units.iter().map(|&(_, n)| u64::from(n)).sum();
@@ -2396,9 +2392,10 @@ fn submit(
     Ok(())
 }
 
-/// CLAS one pool batch places at most. The allocator places a batch's CLAS one after another
-/// in one workgroup, at up to about 10 us each in a 98,304-page (6 GiB) pool, so a batch's
-/// dispatch stays near 40 ms however many pages land in one task.
+/// CLAS one pool batch places at most. Every build of a batch takes its own region of the
+/// build scratch, so this bounds the scratch and staging a batch holds however many pages land
+/// in one task. The allocator itself places 40,000 CLAS in 20 to 40 ms in a 98,304-page
+/// (6 GiB) pool, about 10 to 20 us per run of CLAS.
 const BATCH_CLAS: u32 = 4096;
 
 /// Builds the CLAS of a batch's streamed mesh pages on the loading queue after its other

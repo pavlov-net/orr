@@ -140,6 +140,8 @@ pub mod types {
     pub use crate::{ExposureState, ViewConstants, VolumeGpu, VolumeGridGpu};
 }
 
+/// The order the CLAS pool's `allocate` kernel places a batch's CLAS in, and its placement.
+pub use clas_pool::ClasOrder;
 /// orr_scene's compiled-in kernel modules.
 pub use shaders::MODULES;
 /// The root of the CLAS pool's `allocate` kernel.

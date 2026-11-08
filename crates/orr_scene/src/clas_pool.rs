@@ -3,13 +3,14 @@
 //! The pool is a sparse address range of pages, so a CLAS never moves. It grows by binding
 //! DeviceLocal pages in runs and shrinks by unbinding a page whose CLAS are all gone. A
 //! streamed page's clusters build implicitly into scratch; the `allocate` kernel
-//! (`clas_pool.slang`) gives each the lowest run of free 128 B units that holds its built
-//! size and writes its move, so no build waits on the host. A batch's frees, the pages it
-//! binds and the pages it asks to take come before its allocations. Once a batch has
-//! landed the render thread replays it on a [`RangeAllocator`] over the same units, which
-//! allocates first-fit like the kernel and tells which pages hold no CLAS. A page is taken
-//! for unbinding by the kernel itself, only while wholly free, so an allocation the render
-//! thread has not seen yet never lands in a page it unbinds.
+//! (`clas_pool.slang`) places them from their built sizes and writes their moves, so no build
+//! waits on the host. It cuts each streamed page's CLAS into runs that each fit one pool page
+//! and gives each run the lowest run of free 128 B units that holds it, as
+//! [`ClasOrder::place`] does. A batch's frees, the pages it binds and the pages it asks to take
+//! come before its allocations. Once a batch has landed the render thread replays it on a
+//! [`RangeAllocator`] over the same units, which tells which pages hold no CLAS. A page is
+//! taken for unbinding by the kernel itself, only while wholly free, so an allocation the
+//! render thread has not seen yet never lands in a page it unbinds.
 
 use std::sync::Mutex;
 
@@ -33,6 +34,7 @@ use crate::shaders::clas_pool::PoolRoot;
 pub(crate) const UNIT: u64 = 128;
 /// `clas_pool.slang` constants.
 const POOL_INIT: u32 = 1;
+const POOL_THREADS: usize = 256;
 pub(crate) const NO_UNIT: u32 = u32::MAX;
 /// Wholly free pages the pool keeps bound instead of unbinding.
 const RESERVE_PAGES: usize = 2;
@@ -40,9 +42,101 @@ const RESERVE_PAGES: usize = 2;
 const ALIGN: u64 = 256;
 
 /// Units the CLAS of `clusters` clusters of `triangles` triangles in all are taken to need
-/// before they are built, before the pool's [`ClasPool::scale`].
+/// before they are built, before the pool's scale.
 pub(crate) fn estimate(triangles: u32, clusters: u32) -> u64 {
     (u64::from(triangles) * 32 + u64::from(clusters) * 256).div_ceil(UNIT)
+}
+
+/// The units a CLAS of `bytes` built bytes takes.
+fn units(bytes: u32) -> u32 {
+    u64::from(bytes).div_ceil(UNIT) as u32
+}
+
+/// The order the `allocate` kernel places a batch's CLAS in, by results index: per streamed
+/// page its CLAS, in groups of at most the kernel's workgroup.
+#[derive(Clone, Debug, Default)]
+pub struct ClasOrder {
+    order: Vec<u32>,
+    /// Per group: its end in `order` and its page.
+    groups: Vec<[u32; 2]>,
+    pages: u32,
+}
+
+impl ClasOrder {
+    /// Appends a streamed page's CLAS, by results index.
+    pub fn push_page(&mut self, clas: &[u32]) {
+        for group in clas.chunks(POOL_THREADS) {
+            self.order.extend_from_slice(group);
+            self.groups.push([self.order.len() as u32, self.pages]);
+        }
+        self.pages += 1;
+    }
+
+    pub fn order(&self) -> &[u32] {
+        &self.order
+    }
+
+    pub fn groups(&self) -> &[[u32; 2]] {
+        &self.groups
+    }
+
+    /// Places CLAS of `sizes` built bytes on `free`, a pool of `page_units`-unit pages, as the
+    /// `allocate` kernel does: each group is cut into runs, each as many of its next CLAS as
+    /// fit in a page, and a run takes the lowest free range that holds it, its CLAS one after
+    /// another from there. From a CLAS of no bytes or of more than a page on, or a run that
+    /// finds no room, its page places nothing more. Returns each CLAS's first unit, or
+    /// `u32::MAX`.
+    pub fn place(&self, free: &mut RangeAllocator, page_units: u32, sizes: &[u32]) -> Vec<u32> {
+        let mut out = vec![NO_UNIT; sizes.len()];
+        let mut failed = None;
+        let mut start = 0;
+        for &[end, page] in &self.groups {
+            let group = &self.order[start as usize..end as usize];
+            start = end;
+            if failed == Some(page) {
+                continue;
+            }
+            let needs: Vec<u32> = group.iter().map(|&i| units(sizes[i as usize])).collect();
+            let placeable = needs
+                .iter()
+                .position(|&u| u == 0 || u > page_units)
+                .unwrap_or(needs.len());
+            let mut placed = 0;
+            while placed < placeable {
+                let mut last = placed;
+                let mut total = 0;
+                while last < placeable && total + needs[last] <= page_units {
+                    total += needs[last];
+                    last += 1;
+                }
+                let Some(mut at) = free.alloc(total) else {
+                    break;
+                };
+                for k in placed..last {
+                    out[group[k] as usize] = at;
+                    at += needs[k];
+                }
+                placed = last;
+            }
+            if placed < group.len() {
+                failed = Some(page);
+            }
+        }
+        out
+    }
+}
+
+/// The unit ranges placed CLAS take, `(first, count)` each in order, with the CLAS that
+/// follow one another joined.
+pub(crate) fn ranges(clas: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for &(first, count) in clas.iter().filter(|&&(u, _)| u != NO_UNIT) {
+        match out.last_mut() {
+            Some(r) if r.0 + r.1 == first => r.1 += count,
+            _ => out.push((first, count)),
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,9 +208,10 @@ impl ClasPool {
         let named = u64::from(NO_UNIT) * UNIT;
         let range = device.gpu_malloc_sparse::<u8>(bytes.clamp(1, named), "CLAS pool")?;
         let page_units = (range.page_size / UNIT) as u32;
-        // `clas_pool.slang` reads a page's bitmap four words at a time.
+        // `clas_pool.slang` reads a page's bitmap four words at a time and keeps a group's
+        // units, at most `POOL_THREADS` pages' worth, below `BAD`.
         assert!(
-            page_units.is_multiple_of(128) && page_units < 1 << 16,
+            page_units.is_multiple_of(128) && page_units < 1 << 15,
             "CLAS pool pages of {} bytes",
             range.page_size
         );
@@ -155,11 +250,6 @@ impl ClasPool {
     /// The address of unit `unit`.
     pub(crate) fn address(&self, unit: u32) -> u64 {
         self.range.gpu.address().0 + u64::from(unit) * UNIT
-    }
-
-    /// The units a CLAS of `bytes` built bytes takes.
-    fn units(bytes: u32) -> u32 {
-        u64::from(bytes).div_ceil(UNIT) as u32
     }
 
     /// Returns units `first..first + count` with the next batch; call once no frame reads
@@ -240,7 +330,7 @@ impl ClasPool {
         }
         self.room = room;
         self.range_full += u32::from(matches!(shortfall, Some(Shortfall::Range)));
-        let ops = PoolOps {
+        let mut ops = PoolOps {
             init: !self.initialized,
             bound,
             frees: std::mem::take(&mut self.frees),
@@ -248,6 +338,8 @@ impl ClasPool {
             estimate,
             shortfall,
         };
+        // Ascending, so each allocator thread finds those in its pages.
+        ops.takes.sort_unstable();
         self.initialized = true;
         Ok((ops, binds))
     }
@@ -332,29 +424,35 @@ impl ClasPool {
         Ok(Some(device.bind_sparse(&binds)?))
     }
 
-    /// Records the `allocate` kernel over the built CLAS, then their moves. `up` takes the
-    /// op lists; `results` receives each CLAS's unit and each take's outcome after the
-    /// built sizes.
+    /// Records the `allocate` kernel over the built CLAS in `order`, then their moves. `up`
+    /// takes the op lists; `results` receives each CLAS's unit and each take's outcome after
+    /// the built sizes.
     #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         k: &AccelKernels,
         list: &mut CommandList<'_>,
         ops: &PoolOps,
+        order: &ClasOrder,
         built: Built,
         up: &mut Carve,
         results: Block,
         moves: Moves,
     ) {
         let n = self.page_units;
-        let frees: Vec<[u32; 2]> = ops
+        // Ascending, so each allocator thread finds those in its pages; no two meet, as a unit
+        // frees once and a page binds only while it holds no CLAS.
+        let mut frees: Vec<[u32; 2]> = ops
             .bound
             .iter()
             .map(|&p| [p * n, n])
             .chain(ops.frees.iter().map(|&(f, c)| [f, c]))
             .collect();
+        frees.sort_unstable_by_key(|f| f[0]);
         let frees_at = up.put(&frees);
         let takes_at = up.put(&ops.takes);
+        let order_at = up.put(order.order());
+        let groups_at = up.put(order.groups());
         let root_at = up.take(size_of::<PoolRoot>() as u64);
         let mut down = Carve::new(results);
         let _sizes = down.take(4 * u64::from(built.count));
@@ -366,6 +464,8 @@ impl ClasPool {
             frees: ptr(frees_at),
             takes: ptr(takes_at),
             taken: ptr(taken),
+            order: ptr(order_at),
+            groups: ptr(groups_at),
             sizes: built.sizes,
             sources: built.sources,
             units: ptr(units),
@@ -377,7 +477,7 @@ impl ClasPool {
             words: n / 32,
             free_count: frees.len() as u32,
             take_count: ops.takes.len() as u32,
-            clas_count: built.count,
+            group_count: order.groups().len() as u32,
             flags: if ops.init { POOL_INIT } else { 0 },
             _pad: 0,
         };
@@ -408,21 +508,29 @@ impl ClasPool {
     pub(crate) fn replay(&mut self, batch: PoolBatch) -> (Vec<(u32, u32)>, [PoolSlot; 2]) {
         let PoolBatch {
             ops,
+            order,
             count,
             upload,
             results: (results_slot, results),
         } = batch;
-        let [sizes, units, taken] = read_results(&results, count, ops.takes.len());
-        self.apply(ops, &sizes, &units, &taken);
-        let placed = units
+        let [sizes, placed, taken] = read_results(&results, count, ops.takes.len());
+        self.apply(ops, &order, &sizes, &placed, &taken);
+        let placed = placed
             .iter()
             .zip(&sizes)
-            .map(|(&u, &s)| (u, Self::units(s)))
+            .map(|(&u, &b)| (u, units(b)))
             .collect();
         (placed, [upload, results_slot])
     }
 
-    fn apply(&mut self, ops: PoolOps, sizes: &[u32], units: &[u32], taken: &[u32]) {
+    fn apply(
+        &mut self,
+        ops: PoolOps,
+        order: &ClasOrder,
+        sizes: &[u32],
+        placed: &[u32],
+        taken: &[u32],
+    ) {
         let n = self.page_units;
         for &p in &ops.bound {
             self.reference.free(p * n, n);
@@ -445,24 +553,23 @@ impl ClasPool {
                 self.room += i64::from(n);
             }
         }
-        let built: u64 = sizes.iter().map(|&b| u64::from(Self::units(b))).sum();
+        let built: u64 = sizes.iter().map(|&b| u64::from(units(b))).sum();
         if ops.estimate > 0 && built > ops.estimate {
             self.scale *= built as f64 / ops.estimate as f64;
         }
+        let expected = order.place(&mut self.reference, n, sizes);
+        let apart = expected.iter().zip(placed).position(|(e, u)| e != u);
+        assert!(
+            apart.is_none(),
+            "the kernel and the reference place CLAS {apart:?} of {:?} bytes apart",
+            apart.map(|i| sizes[i])
+        );
         let mut allocated = 0u64;
-        for (&bytes, &unit) in sizes.iter().zip(units) {
-            if unit == NO_UNIT {
-                continue;
+        for (&bytes, &unit) in sizes.iter().zip(placed) {
+            if unit != NO_UNIT {
+                self.count(unit, units(bytes), true);
+                allocated += u64::from(units(bytes));
             }
-            let need = Self::units(bytes);
-            let expected = self.reference.alloc(need);
-            assert_eq!(
-                expected,
-                Some(unit),
-                "the kernel and the reference place {need} units apart"
-            );
-            self.count(unit, need, true);
-            allocated += u64::from(need);
         }
         self.room += ops.estimate as i64 - allocated as i64;
         let free: Vec<usize> = (0..self.pages.len())
@@ -583,6 +690,7 @@ pub(crate) struct PageBuild<'a> {
 /// A batch's pool work and the staging that holds its outcome, replayed once it lands.
 pub(crate) struct PoolBatch {
     ops: PoolOps,
+    order: ClasOrder,
     count: u32,
     upload: PoolSlot,
     results: (PoolSlot, Block),
@@ -691,6 +799,10 @@ pub(crate) fn build_pages(
     for (slot, &(pi, local)) in members.iter().enumerate() {
         slots[pi][local] = slot as u32;
     }
+    let mut order = ClasOrder::default();
+    for s in &slots {
+        order.push_page(s);
+    }
     let n = members.len() as u64;
 
     // Per cluster, as each CLAS takes whole units.
@@ -707,6 +819,8 @@ pub(crate) fn build_pages(
         + builds.len() as u64 * (size_of::<AccelRoot>() as u64 + 32)
         + 8 * frees as u64
         + 4 * takes as u64
+        + 4 * n
+        + 8 * order.groups().len() as u64
         + size_of::<PoolRoot>() as u64
         + 128;
     let results_bytes = 8 * n + 4 * takes as u64 + 64;
@@ -875,6 +989,7 @@ pub(crate) fn build_pages(
         k,
         list,
         &ops,
+        &order,
         Built {
             sizes: ptr(results.1.gpu()),
             sources: ptr(base + addresses),
@@ -893,6 +1008,7 @@ pub(crate) fn build_pages(
     Ok(BuildOut {
         batch: PoolBatch {
             ops,
+            order,
             count: n as u32,
             upload: upload_slot,
             results,
@@ -950,4 +1066,26 @@ fn read_results(results: &Block, clas: u32, takes: usize) -> [Vec<u32>; 3] {
     let part = (4 * u64::from(clas)).max(16).next_multiple_of(16);
     let n = clas as usize;
     [words(0, n), words(part, n), words(2 * part, takes)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs as long as a page allows, the next run where the last left off, and a page's CLAS
+    /// from one with no bytes, one over a page or a run with no room on left out.
+    #[test]
+    fn a_page_places_in_runs_of_at_most_a_pool_page() {
+        let page = 512;
+        // Units per results index; the pages take them out of order.
+        let units: [u32; 11] = [200, 0, 300, 50, 100, 400, 512, 512, 100, 20, 513];
+        let sizes: Vec<u32> = units.iter().map(|&u| (u * 128).saturating_sub(1)).collect();
+        let mut order = ClasOrder::default();
+        for clas in [&[2, 0, 4, 1, 3][..], &[5, 10], &[6, 7, 8], &[9]] {
+            order.push_page(clas);
+        }
+        let placed = order.place(&mut RangeAllocator::new(4 * page), page, &sizes);
+        let x = NO_UNIT;
+        assert_eq!(placed, [300, x, 0, x, 500, 600, 1000, 1512, x, 2024, x]);
+    }
 }
