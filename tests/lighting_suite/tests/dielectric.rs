@@ -1169,12 +1169,13 @@ fn raygen_and_compute_entries_trace_the_same_light() {
     let a = render_paths(&mut bed, &compute, 32);
     let again = render_paths(&mut bed, &compute, 32);
     let b = render_paths(&mut bed, &rays, 32);
-    let frames = |bed: &mut Bed, paths: &Paths| -> Vec<f64> {
-        (0..24)
-            .map(|_| image_mean(&render_paths(bed, paths, 1))[1])
-            .collect()
-    };
-    let (of_compute, of_rays) = (frames(&mut bed, &compute), frames(&mut bed, &rays));
+    // The world cache outlives a camera cut and settles over frames of one seed, so the two
+    // entries' frames alternate and see it alike.
+    let (mut of_compute, mut of_rays) = (Vec::new(), Vec::new());
+    for _ in 0..24 {
+        of_compute.push(image_mean(&render_paths(&mut bed, &compute, 1))[1]);
+        of_rays.push(image_mean(&render_paths(&mut bed, &rays, 1))[1]);
+    }
     assert_same_mean("raygen against compute", &of_rays, &of_compute);
     let noise = again.flip(&a, 1.0 / 500.0);
     let e = b.flip(&a, 1.0 / 500.0);
