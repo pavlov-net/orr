@@ -3,6 +3,7 @@
 //! selection with joined grids, and the textures a mesh cook reads (opacity for opaque-first
 //! triangles and micromaps, displacement bounds).
 
+#[allow(dead_code)]
 #[path = "common/float_ktx2.rs"]
 mod float_ktx2;
 #[path = "common/glb.rs"]

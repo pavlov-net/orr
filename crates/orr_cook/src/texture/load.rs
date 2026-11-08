@@ -3,7 +3,8 @@
 //! of BCn blocks, plain or zstd-compressed, are read here instead, each level decompressed
 //! once straight into its blocks. Formats are recognized by their bytes. An animated WebP
 //! decodes to its first frame. The spec leaves `KTXswizzle` to applications; the cook applies
-//! it, because the file states it, and a file it changes loses its blocks.
+//! it, because the file states it: decoded texels are the swizzled ones, and a material that
+//! keeps a file's blocks reads its channels through the swizzle ([`open_blocks`]).
 //!
 //! A [`Source`] holds a file's values as stored, beside what the file states of them
 //! ([`FileColor`]); the importers' rules decide which of that applies. Radiance's `EXPOSURE` and
@@ -268,15 +269,24 @@ pub(super) fn decode_layers(src: &mut Source) -> Result<(), String> {
 }
 
 /// Whether `test` holds of an image `src` stores: mip 0 of each layer, and of blocks every mip,
-/// which a cook can keep. Each is decoded for the test, so it stops at the first that holds.
-pub(super) fn any_stored(src: &Source, mut test: impl FnMut(&Img) -> bool) -> Result<bool, String> {
+/// which a cook can keep, each block's texels read through `swizzled`. Each is decoded for the
+/// test, so it stops at the first that holds.
+pub(super) fn any_stored(
+    src: &Source,
+    swizzled: Option<Swizzle>,
+    mut test: impl FnMut(&Img) -> bool,
+) -> Result<bool, String> {
     let Some(b) = &src.blocks else {
         return Ok(src.layers.iter().any(test));
     };
     for layer in &b.levels {
         for (m, bytes) in layer.iter().enumerate() {
             let [w, h] = mip_size(b.w, b.h, m as u32);
-            if test(&decode_blocks(b.vk_format, w, h, bytes)?) {
+            let mut img = decode_blocks(b.vk_format, w, h, bytes)?;
+            if let Some(s) = swizzled {
+                swizzle(&mut img.px, s);
+            }
+            if test(&img) {
                 return Ok(true);
             }
         }
@@ -284,17 +294,29 @@ pub(super) fn any_stored(src: &Source, mut test: impl FnMut(&Img) -> bool) -> Re
     Ok(false)
 }
 
-/// Per channel, the lowest and highest finite value of every image `src` stores.
-pub(super) fn stored_range(src: &Source) -> Result<[(f32, f32); 4], String> {
+/// Per channel, the lowest and highest finite value of every image `src` stores, its blocks read
+/// through `swizzled`.
+pub(super) fn stored_range(
+    src: &Source,
+    swizzled: Option<Swizzle>,
+) -> Result<[(f32, f32); 4], String> {
     let mut range = [(f32::MAX, f32::MIN); 4];
-    any_stored(src, |l| {
+    any_stored(src, None, |l| {
         for (c, r) in range.iter_mut().enumerate() {
             let (lo, hi) = l.finite_range(c);
             *r = (r.0.min(lo), r.1.max(hi));
         }
         false
     })?;
-    Ok(range)
+    Ok(swizzled.map_or(range, |s| swizzle_range(range, s)))
+}
+
+/// Per channel, the range of a channel read through `s` from channels of `range`.
+fn swizzle_range(range: [(f32, f32); 4], s: Swizzle) -> [(f32, f32); 4] {
+    s.map(|c| match c {
+        Component::Channel(i) => range[i],
+        Component::Value(v) => (v, v),
+    })
 }
 
 /// Opens an image file with every mip it stores, leaving `layers` empty when the file holds
@@ -303,13 +325,57 @@ pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
     open_levels(bytes, usize::MAX)
 }
 
+/// [`open`] with its blocks as stored, and what each channel reads of them where the file's
+/// `KTXswizzle` changes any. Its blocks decode to the stored texels: [`swizzle`] makes them
+/// what [`open`] decodes. A file without blocks is as [`open`] reads it.
+pub(super) fn open_blocks(bytes: &[u8]) -> Result<(Source, Option<Swizzle>), String> {
+    let src = open_stored(bytes, usize::MAX)?;
+    match ktx2_swizzle(bytes) {
+        Some(s) if src.blocks.is_none() => Ok((swizzled(src, s)?, None)),
+        s => Ok((src, s)),
+    }
+}
+
+/// Texels `px` as swizzle `s` reads them.
+pub(super) fn swizzle(px: &mut [[f32; 4]], s: Swizzle) {
+    for p in px {
+        let t = *p;
+        *p = s.map(|c| match c {
+            Component::Channel(i) => t[i],
+            Component::Value(v) => v,
+        });
+    }
+}
+
 /// [`open`], taking at most `levels` mips of a KTX2 file.
 fn open_levels(bytes: &[u8], levels: usize) -> Result<Source, String> {
+    let src = open_stored(bytes, levels)?;
+    match ktx2_swizzle(bytes) {
+        Some(s) => swizzled(src, s),
+        None => Ok(src),
+    }
+}
+
+/// `src` decoded and read through swizzle `s`, without its blocks.
+fn swizzled(mut src: Source, s: Swizzle) -> Result<Source, String> {
+    decode_layers(&mut src)?;
+    src.blocks = None;
+    src.gray = Gray::No;
+    // Past the file's two channels, only what decoding fills in leaves it two.
+    src.rg &= s[2].keeps(2, 2) && s[3].keeps(3, 2);
+    for l in &mut src.layers {
+        swizzle(&mut l.px, s);
+    }
+    Ok(src)
+}
+
+/// [`open_levels`] without the file's `KTXswizzle`.
+fn open_stored(bytes: &[u8], levels: usize) -> Result<Source, String> {
     const KTX1: &[u8] = b"\xABKTX 11\xBB\r\n\x1A\n";
     if bytes.starts_with(KTX1) {
         return Err("KTX1 images are not supported; convert them to KTX2".into());
     }
-    let mut src = match Ktx2Blocks::of(bytes) {
+    Ok(match Ktx2Blocks::of(bytes) {
         Some(k) => k.open(levels)?,
         None => {
             let dds = dds_with_known_blocks(bytes);
@@ -318,22 +384,7 @@ fn open_levels(bytes: &[u8], levels: usize) -> Result<Source, String> {
                 None => file(bytes)?,
             }
         }
-    };
-    if let Some(s) = ktx2_swizzle(bytes) {
-        decode_layers(&mut src)?;
-        src.blocks = None;
-        src.gray = Gray::No;
-        // Past the file's two channels, only what decoding fills in leaves it two.
-        src.rg &= s[2].keeps(2, 2) && s[3].keeps(3, 2);
-        for p in src.layers.iter_mut().flat_map(|l| &mut l.px) {
-            let t = *p;
-            *p = s.map(|c| match c {
-                Component::Channel(i) => t[i],
-                Component::Value(v) => v,
-            });
-        }
-    }
-    Ok(src)
+    })
 }
 
 const DDS_MAGIC: &[u8] = b"DDS ";
@@ -407,9 +458,12 @@ fn container_color(bytes: &[u8], format: ctt::Format, srgb: bool, numeric: bool)
     }
 }
 
+/// What each channel reads under a `KTXswizzle`.
+pub(super) type Swizzle = [Component; 4];
+
 /// What one channel of a `KTXswizzle` mapping reads.
-#[derive(Copy, Clone, PartialEq)]
-enum Component {
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) enum Component {
     Channel(usize),
     Value(f32),
 }
@@ -424,7 +478,7 @@ impl Component {
 }
 
 /// The `KTXswizzle` of a KTX2 file, unless it leaves every channel as it decodes.
-fn ktx2_swizzle(bytes: &[u8]) -> Option<[Component; 4]> {
+fn ktx2_swizzle(bytes: &[u8]) -> Option<Swizzle> {
     let reader = ktx2::Reader::new(bytes).ok()?;
     let (_, value) = reader
         .key_value_data()
@@ -465,16 +519,25 @@ pub(crate) struct Scan {
     pub(super) float: bool,
     pub(super) negatives: bool,
     pub(super) gray: Gray,
+    /// Of the channels as swizzled, as every field above but `vk_format`.
     pub(super) range: [(f32, f32); 4],
+    /// What each channel reads of the blocks, where the file's `KTXswizzle` changes any.
+    pub(super) swizzle: Option<Swizzle>,
 }
 
-/// The [`Scan`] of a KTX2 file of BCn blocks that it holds as they are; `None` for every other
-/// file.
+/// The [`Scan`] of a KTX2 file of BCn blocks; `None` for every other file.
 pub(crate) fn scan_ktx2(bytes: &[u8], spread: f32) -> Option<Result<Scan, String>> {
-    if ktx2_swizzle(bytes).is_some() {
-        return None;
-    }
-    Ktx2Blocks::of(bytes).map(|k| k.scan(spread))
+    let scan = Ktx2Blocks::of(bytes)?.scan(spread);
+    let Some(s) = ktx2_swizzle(bytes) else {
+        return Some(scan);
+    };
+    Some(scan.map(|mut scan| {
+        scan.range = swizzle_range(scan.range, s);
+        scan.gray = Gray::No;
+        scan.rg &= s[2].keeps(2, 2) && s[3].keeps(3, 2);
+        scan.swizzle = Some(s);
+        scan
+    }))
 }
 
 /// A KTX2 file whose levels hold BCn blocks, stored plain or with zstd.
@@ -621,6 +684,7 @@ impl<'a> Ktx2Blocks<'a> {
             negatives: negative_blocks(vk_format),
             gray: gray_blocks(vk_format),
             range,
+            swizzle: None,
         })
     }
 }

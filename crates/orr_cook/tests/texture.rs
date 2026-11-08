@@ -8,7 +8,7 @@ mod texels;
 use std::f32::consts::{PI, TAU};
 use std::path::{Path, PathBuf};
 
-use float_ktx2::float_ktx2;
+use float_ktx2::{float_ktx2, with_swizzle};
 use orr_color::RgbPrimaries;
 use orr_cook::{
     ArchiveSpec, AssetSpec, CookOptions, DataFormat, GltfSettings, InputChannels, Manifest,
@@ -803,6 +803,96 @@ fn bcn_material_textures_keep_their_blocks() {
             ],
         );
     }
+}
+
+/// A `KTXswizzle` that moves stored channels into glTF's places keeps the blocks, and the
+/// bindings read the stored channels: roughness in red and metalness in green under `1rg1`.
+/// Mips made below a passed mip 0 read the channels as swizzled.
+#[test]
+fn swizzled_roughness_and_metalness_keep_their_blocks() {
+    let d = dir("bcn-swizzle");
+    let n = 64;
+    let (rough, metal) = (210u8, 50u8);
+    let wobble = |x: u32| (x % 2 * 20) as u8;
+    let (rm, rm_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |_, x, _| {
+        [rough + wobble(x), metal + wobble(x), 0, 255]
+    });
+    // Constant metalness: roughness alone, a BC4 taken from the red half of the BC5.
+    let (smooth, smooth_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |_, x, _| {
+        [rough + wobble(x), metal, 0, 255]
+    });
+    let normal = png(n, n, |x, _| [118 + (x % 2 * 20) as u8, 128, 255, 255]);
+    let path = d.join("swizzled.glb");
+    write_glb(
+        &path,
+        &[
+            r#"{"pbrMetallicRoughness":{"metallicRoughnessTexture":{"index":0}}}"#.into(),
+            r#"{"pbrMetallicRoughness":{"metallicRoughnessTexture":{"index":1}}}"#.into(),
+            r#"{"pbrMetallicRoughness":{"metallicRoughnessTexture":{"index":0}},
+                "normalTexture":{"index":2}}"#
+                .into(),
+        ],
+        &[
+            with_swizzle(&rm, "1rg1"),
+            with_swizzle(&smooth, "1rg1"),
+            normal,
+        ],
+    );
+    let cooked = |quality| {
+        let a = cook_at(
+            vec![AssetSpec {
+                name: "g".into(),
+                source: Source::Gltf {
+                    path: path.clone(),
+                    settings: GltfSettings::default(),
+                },
+            }],
+            quality,
+        );
+        let material = |i: usize| {
+            let e = a
+                .find(AssetId::from_name(&format!("g/material/{i}")))
+                .unwrap();
+            Material::from_bytes(&read_blob(&a, e, 0)).unwrap()
+        };
+        let m = [0, 1, 2].map(material);
+        (a, m)
+    };
+    let name = |a: &Archive, t: AssetId| a.name(a.find(t).unwrap()).to_string();
+
+    let (a, [m0, m1, _]) = cooked(Quality::Fast);
+    let (r, t) = (m0.textures[slot::ROUGHNESS], m0.textures[slot::METALNESS]);
+    assert_eq!(r.texture, t.texture);
+    assert_eq!((r.channels, t.channels), (0, 1));
+    assert_eq!(mips(&a, &name(&a, r.texture)).1[0], rm_blocks);
+    assert_eq!(m1.textures[slot::METALNESS].texture, AssetId::NONE);
+    let (info, levels) = mips(&a, &name(&a, m1.textures[slot::ROUGHNESS].texture));
+    assert_eq!(info.header.vk_format, vk::BC4_UNORM);
+    let red: Vec<Vec<u8>> = smooth_blocks
+        .iter()
+        .map(|m| {
+            m.as_chunks::<16>()
+                .0
+                .iter()
+                .flat_map(|b| &b[..8])
+                .copied()
+                .collect()
+        })
+        .collect();
+    assert_eq!(levels[0], red);
+
+    // Toksvig roughness makes the mips below mip 0.
+    let (a, [_, _, m2]) = cooked(Quality::Slow);
+    let (r, t) = (m2.textures[slot::ROUGHNESS], m2.textures[slot::METALNESS]);
+    assert_eq!(r.texture, t.texture);
+    let (_, levels) = mips(&a, &name(&a, r.texture));
+    assert_eq!(levels[0][0], rm_blocks[0]);
+    let texels = decode(vk::BC5_UNORM, n / 2, n / 2, &levels[0][1]);
+    let mean = |c: u8| texels.iter().map(|t| t[usize::from(c)]).sum::<f32>() / texels.len() as f32;
+    let (got_rough, got_metal) = (mean(r.channels), mean(t.channels));
+    let (rough, metal) = (f32::from(rough + 10) / 255.0, f32::from(metal + 10) / 255.0);
+    assert!(got_rough >= rough - 0.05, "roughness {got_rough}");
+    assert!((got_metal - metal).abs() < 0.05, "metalness {got_metal}");
 }
 
 /// Mips made below a passed mip 0 hold their channels where mip 0 does, which is where the

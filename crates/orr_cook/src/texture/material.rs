@@ -69,7 +69,7 @@ use rayon::prelude::*;
 use serde::Deserialize;
 
 use super::color::{BELOW_ZERO, Decode, FileColor, ImageColor, Read, clipped, multiply};
-use super::load::{self, Blocks, Gray, Source};
+use super::load::{self, Blocks, Component, Gray, Source, Swizzle};
 use super::mips::{MipSpec, Toksvig, normalized, settled};
 use super::neural::{self, NeuralJob, NeuralSettings};
 use super::tiles::Cell;
@@ -507,6 +507,9 @@ pub(crate) struct ImageFacts {
     hash: Hash32,
     /// The block format of a block-compressed file, and whether it has every mip.
     blocks: Option<(u32, bool)>,
+    /// What each channel reads of [`Self::blocks`], where the file's `KTXswizzle` changes any;
+    /// every other fact is of the channels as swizzled.
+    swizzle: Option<Swizzle>,
     /// The file holds two channels, red and green.
     rg: bool,
     /// The file stores signed normalized values.
@@ -537,6 +540,7 @@ impl ImageFacts {
             minus_infinity: false,
             hash: Hash32::of(bytemuck::cast_slice(&texel)),
             blocks: None,
+            swizzle: None,
             rg: false,
             signed: false,
             float: true,
@@ -562,6 +566,7 @@ impl ImageFacts {
             minus_infinity: any(|t| t.minus_infinity),
             hash: Hash32::of(&tiles.clone().flat_map(|t| t.hash.0).collect::<Vec<u8>>()),
             blocks: None,
+            swizzle: None,
             rg: all(|t| t.rg),
             signed: all(|t| t.signed),
             float: any(|t| t.float),
@@ -752,9 +757,10 @@ fn facts_of(
         let mut s = scan?;
         let mut opened = None;
         if every_mip(s.negatives, &s.color) {
-            let src = load::open(bytes)?;
-            s.range = load::stored_range(&src)?;
-            opened = Some(src);
+            // The blocks keep every mip, each read through the swizzle.
+            let (src, swizzled) = load::open_blocks(bytes)?;
+            s.range = load::stored_range(&src, swizzled)?;
+            opened = swizzled.is_none().then_some(src);
         }
         let vectors = normal && s.float && s.negatives;
         let stored_normals = s.signed
@@ -777,6 +783,7 @@ fn facts_of(
             minus_infinity: false,
             hash,
             blocks: Some((s.vk_format, s.complete)),
+            swizzle: s.swizzle,
             rg: s.rg,
             signed: s.signed,
             float: s.float,
@@ -797,7 +804,9 @@ fn facts_of(
         load::decode_layers(&mut src)?;
     }
     let (w, h, range) = match &src.blocks {
-        Some(b) if every_mip(src.negatives, &src.color) => (b.w, b.h, load::stored_range(&src)?),
+        Some(b) if every_mip(src.negatives, &src.color) => {
+            (b.w, b.h, load::stored_range(&src, None)?)
+        }
         Some(b) => {
             let range = load::block_range(b.vk_format, b.w, b.h, &mut &b.levels[0][0][..], spread)?;
             (b.w, b.h, range)
@@ -819,6 +828,8 @@ fn facts_of(
         minus_infinity,
         hash,
         blocks: src.blocks.as_ref().map(|b| (b.vk_format, b.complete())),
+        // `open` has applied it, and dropped the blocks of a file it changes.
+        swizzle: None,
         rg: src.rg,
         signed: src.signed,
         float: src.float,
@@ -1420,8 +1431,10 @@ impl<'a> Packer<'a> {
                     asset: self.asset.into(),
                     message: format!("image {}: {message}", file.name),
                 };
-                let src = load::open(&file.bytes()?).map_err(fail)?;
-                let clips = load::any_stored(&src, |l| refs.iter().any(|r| self.texels_clip(r, l)));
+                let (src, swizzled) = load::open_blocks(&file.bytes()?).map_err(fail)?;
+                let clips = load::any_stored(&src, swizzled, |l| {
+                    refs.iter().any(|r| self.texels_clip(r, l))
+                });
                 Ok(clips.map_err(fail)?.then_some(*named))
             })
             .collect::<Result<_>>()?;
@@ -2267,13 +2280,19 @@ impl<'a> Packer<'a> {
                     if !identity || *image.get_or_insert(*i) != *i || !read.is(stored) {
                         return None;
                     }
-                    channels[c] = *channel as u8;
+                    channels[c] = match self.image(*i).swizzle.map(|s| s[*channel]) {
+                        None => *channel as u8,
+                        Some(Component::Channel(s)) => s as u8,
+                        Some(Component::Value(_)) => return None,
+                    };
                 }
                 Texels::Unused => {}
                 // A color texture's alpha of 1 holds where the source's is 1.
                 Texels::Constant(v) if count == 4 && c == 3 => {
-                    let opaque = self.image(image?).constant[3]
-                        .is_some_and(|a| (a - 1.0).abs() <= 1.0 / 255.0);
+                    let f = self.image(image?);
+                    // The blocks keep the stored alpha.
+                    let opaque = f.constant[3].is_some_and(|a| (a - 1.0).abs() <= 1.0 / 255.0)
+                        && f.swizzle.is_none_or(|s| s[3] == Component::Channel(3));
                     if *v != 1.0 || !opaque {
                         return None;
                     }
@@ -2522,10 +2541,10 @@ impl TextureJob {
         images: &[ImageFile],
         decoded: &Decoded<Img>,
     ) -> Result<Built, String> {
-        let src = {
+        let bytes = images[pass.image].bytes().map_err(|e| e.to_string())?;
+        let (src, swizzled) = {
             let _z = crate::profile::zone!("texture.open");
-            let bytes = images[pass.image].bytes().map_err(|e| e.to_string())?;
-            load::open(&bytes)?
+            load::open_blocks(&bytes)?
         };
         let b = src
             .blocks
@@ -2556,6 +2575,14 @@ impl TextureJob {
             )
         } else {
             let first = half(&b.levels[0][0]);
+            // The made mips read the channels as swizzled.
+            let mut src = src;
+            if let Some(s) = swizzled {
+                load::decode_layers(&mut src)?;
+                for l in &mut src.layers {
+                    load::swizzle(&mut l.px, s);
+                }
+            }
             let (img, plan) = self
                 .prepare(images, decoded, Some((pass.image, src)))
                 .map_err(|e| e.to_string())?;
@@ -2670,9 +2697,14 @@ impl TextureJob {
                         if let Entry::Vacant(e) = sources.entry(i) {
                             e.insert(self.source_blocks(images, i)?);
                         }
-                        let b: &Blocks = &sources[&i];
-                        load::decode_blocks(b.vk_format, mw, mh, &b.levels[0][m as usize])
-                            .map_err(&fail)
+                        let (b, swizzled) = &sources[&i];
+                        let mut img =
+                            load::decode_blocks(b.vk_format, mw, mh, &b.levels[0][m as usize])
+                                .map_err(&fail)?;
+                        if let Some(s) = *swizzled {
+                            load::swizzle(&mut img.px, s);
+                        }
+                        Ok::<_, Error>(img)
                     })?;
                     mips.insert(i, img);
                 }
@@ -2685,16 +2717,17 @@ impl TextureJob {
             .collect()
     }
 
-    /// The blocks of source image `i`, which must still hold every mip at the texture's size.
-    fn source_blocks(&self, images: &[ImageFile], i: usize) -> Result<Blocks> {
-        let src = load::open(&images[i].bytes()?).map_err(|m| self.fail(m))?;
+    /// The blocks of source image `i`, which must still hold every mip at the texture's size,
+    /// and what its channels read of them.
+    fn source_blocks(&self, images: &[ImageFile], i: usize) -> Result<(Blocks, Option<Swizzle>)> {
+        let (src, swizzled) = load::open_blocks(&images[i].bytes()?).map_err(|m| self.fail(m))?;
         let b = src
             .blocks
             .ok_or_else(|| self.fail("the image no longer holds blocks".into()))?;
         if [b.w, b.h] != self.size || !b.complete() {
             return Err(self.fail("the image's mips changed".into()));
         }
-        Ok(b)
+        Ok((b, swizzled))
     }
 
     /// The packed texture of `decoded` source images, each `w` x `h`.

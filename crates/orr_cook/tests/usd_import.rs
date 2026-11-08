@@ -4,6 +4,7 @@
 
 #![allow(clippy::print_stdout)] // the set test reports what each stage cooked
 
+#[allow(dead_code)]
 #[path = "common/float_ktx2.rs"]
 mod float_ktx2;
 #[allow(dead_code)]

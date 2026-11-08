@@ -634,7 +634,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
     let color = reads_color(s.usage);
     let negatives = color && (src.negatives || src.color.can_read_below());
     let lowest = if negatives {
-        load::stored_range(&src)?.map(|r| r.0)
+        load::stored_range(&src, None)?.map(|r| r.0)
     } else {
         [0.0; 4]
     };
