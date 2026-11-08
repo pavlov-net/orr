@@ -545,6 +545,7 @@ public struct Bsdf : IDifferentiable
         if (all(walk == 0.0))
             return r;
         float3 l;
+        bool specular = false;
         if (u.x < walk_ms_share)
         {
             l = mirrored(sample_uniform_hemisphere(u.yz));
@@ -555,19 +556,24 @@ public struct Bsdf : IDifferentiable
             float3 h = mirror ? float3(0.0, 0.0, 1.0) : openpbr_sample_aniso_ggx_smith_vndf(alpha, v, float2(x, u.y));
             if (!openpbr_refract(v, h, dot(v, h), eta_refraction, l) || l.z >= 0.0)
                 return r;
-            if (mirror)
-            {
-                float3 rc, tc;
-                coefficients(v.z, rc, tc);
-                r.wi = normalize(from_local(l, t, b, n));
-                r.pdf = 1.0 - walk_ms_share;
-                r.weight = walk * tc * layer / r.pdf;
-                r.lobe = LOBE_TRANSMISSION | LOBE_SPECULAR | LOBE_VOLUME;
-                return r;
-            }
+            specular = mirror;
+        }
+        // The mirror's refraction and the walk lobe take their coefficients from one call.
+        Facet m = (Facet)0;
+        if (!mirror)
+            m = facet(l);
+        if (specular || m.valid)
+            coefficients(specular ? v.z : m.c, m.rc, m.tc);
+        if (specular)
+        {
+            r.wi = normalize(from_local(l, t, b, n));
+            r.pdf = 1.0 - walk_ms_share;
+            r.weight = walk * m.tc * layer / r.pdf;
+            r.lobe = LOBE_TRANSMISSION | LOBE_SPECULAR | LOBE_VOLUME;
+            return r;
         }
         float pdf;
-        float3 f = walk_lobe(l, pdf) * layer * leaving(l);
+        float3 f = walk_lobe(l, m, pdf) * layer * leaving(l);
         if (!(pdf > 0.0))
             return r;
         r.wi = normalize(from_local(l, t, b, n));
@@ -619,6 +625,12 @@ public struct Bsdf : IDifferentiable
         float3 base = float3(0.0);
         float3 top = float3(0.0);
         float lobe_pdf;
+        // The specular and walk lobes share the microfacet toward `l` and its coefficients.
+        bool specular = probability[SPECULAR] > 0.0 && !mirror;
+        bool walks = !(l.z > 0.0) && probability[WALK] > 0.0 && !mirror;
+        Facet micro = (Facet)0;
+        if ((specular && (l.z > 0.0 || any(transmit != 0.0))) || walks)
+            micro = facet_coefficients(l);
         if (probability[COAT] > 0.0 && !coat_mirror)
         {
             float3 c = in_frame(l, coat_basis);
@@ -667,14 +679,14 @@ public struct Bsdf : IDifferentiable
             }
             if (probability[WALK] > 0.0)
             {
-                base += walk_lobe(l, lobe_pdf);
+                base += walk_lobe(l, micro, lobe_pdf);
                 pdf += probability[WALK] * lobe_pdf;
             }
         }
-        if (probability[SPECULAR] > 0.0 && !mirror)
+        if (specular)
         {
             float shape;
-            base += specular_lobe(l, lobe_pdf, shape);
+            base += specular_lobe(l, micro, lobe_pdf, shape);
             top += fold * shape;
             pdf += probability[SPECULAR] * lobe_pdf;
         }
@@ -698,59 +710,72 @@ public struct Bsdf : IDifferentiable
             * openpbr_eval_aniso_smith_g1(l, alpha) / (4.0 * v.z);
     }
 
-    // The specular lobe below the layers, and in `shape` the white reflection the collapsed
-    // layers' `fold` scales.
+    // The microfacet toward local `l`, without its coefficients: the half vector's for `l` above
+    // the surface, else the one that refracts the view into `l`.
     [TreatAsDifferentiable]
-    float3 specular_lobe(float3 l, out float pdf, out float shape)
+    Facet facet(float3 l)
+    {
+        Facet f = (Facet)0;
+        if (l.z > 0.0)
+        {
+            float3 h = normalize(v + l);
+            f.d = openpbr_eval_aniso_ggx(h, alpha);
+            f.c = abs(dot(v, h));
+            f.valid = true;
+            return f;
+        }
+        f.c = refraction(l, f.jacobian);
+        f.valid = f.jacobian != 0.0;
+        if (f.valid)
+            f.d = openpbr_eval_aniso_ggx(refraction_half(l), alpha);
+        return f;
+    }
+
+    // `facet`, with its coefficients where it is valid.
+    [TreatAsDifferentiable]
+    Facet facet_coefficients(float3 l)
+    {
+        Facet f = facet(l);
+        if (f.valid)
+            coefficients(f.c, f.rc, f.tc);
+        return f;
+    }
+
+    // The specular lobe below the layers toward `l`, with its `facet` and coefficients, and in
+    // `shape` the white reflection the collapsed layers' `fold` scales.
+    [TreatAsDifferentiable]
+    float3 specular_lobe(float3 l, Facet m, out float pdf, out float shape)
     {
         pdf = 0.0;
         shape = 0.0;
         float g = g1v * openpbr_eval_aniso_smith_g1(l, alpha);
         if (l.z > 0.0)
         {
-            float3 h = normalize(v + l);
-            float d = openpbr_eval_aniso_ggx(h, alpha);
-            float3 rc, tc;
-            coefficients(abs(dot(v, h)), rc, tc);
             if (bounded)
                 pdf = ggx_vndf_bounded_pdf(v, l, alpha);
             else
-                pdf = reflect_probability(rc, tc * transmit) * d * g1v / (4.0 * v.z);
-            shape = d * g / (4.0 * v.z);
-            return rc * shape;
+                pdf = reflect_probability(m.rc, m.tc * transmit) * m.d * g1v / (4.0 * v.z);
+            shape = m.d * g / (4.0 * v.z);
+            return m.rc * shape;
         }
-        if (all(transmit == 0.0))
+        if (all(transmit == 0.0) || !m.valid)
             return float3(0.0);
-        float jacobian;
-        float c = refraction(l, jacobian);
-        if (jacobian == 0.0)
-            return float3(0.0);
-        float d = openpbr_eval_aniso_ggx(refraction_half(l), alpha);
-        float3 rc, tc;
-        coefficients(c, rc, tc);
-        tc *= transmit;
-        pdf = (1.0 - reflect_probability(rc, tc)) * d * g1v * jacobian;
-        return d * g * jacobian * tc * radiance_scale;
+        float3 tc = m.tc * transmit;
+        pdf = (1.0 - reflect_probability(m.rc, tc)) * m.d * g1v * m.jacobian;
+        return m.d * g * m.jacobian * tc * radiance_scale;
     }
 
-    // Subsurface transmission: GGX refraction plus its share of the dielectric multiple
-    // scattering.
+    // Subsurface transmission toward `l` below the surface, with its `facet` and coefficients:
+    // GGX refraction plus its share of the dielectric multiple scattering.
     [TreatAsDifferentiable]
-    float3 walk_lobe(float3 l, out float pdf)
+    float3 walk_lobe(float3 l, Facet m, out float pdf)
     {
         pdf = walk_ms_share * INV_TWO_PI;
         float3 f = walk * dielectric_ms(l.z) * abs(l.z) * INV_PI;
-        if (mirror)
+        if (mirror || !m.valid)
             return f;
-        float jacobian;
-        float c = refraction(l, jacobian);
-        if (jacobian == 0.0)
-            return f;
-        float d = openpbr_eval_aniso_ggx(refraction_half(l), alpha);
-        float3 rc, tc;
-        coefficients(c, rc, tc);
-        pdf += (1.0 - walk_ms_share) * d * g1v * jacobian;
-        return f + d * g1v * openpbr_eval_aniso_smith_g1(l, alpha) * jacobian * walk * tc;
+        pdf += (1.0 - walk_ms_share) * m.d * g1v * m.jacobian;
+        return f + m.d * g1v * openpbr_eval_aniso_smith_g1(l, alpha) * m.jacobian * walk * m.tc;
     }
 
     float3 refraction_half(float3 l)
@@ -907,6 +932,19 @@ public struct Bsdf : IDifferentiable
         float3 through = pow(sqrt(max(coat_tint, 0.0)), float3(1.0 / max(refracted, 1e-6)));
         return lerp(float3(1.0), through, coat_tint_presence);
     }
+}
+
+// A specular microfacet toward a direction: GGX's density `d` there, its cosine `c` to the view,
+// the refraction Jacobian below the surface, and the coefficients at `c`, which callers fill.
+// Not `valid` where no microfacet refracts the view into the direction.
+struct Facet
+{
+    float d;
+    float c;
+    float jacobian;
+    bool valid;
+    float3 rc;
+    float3 tc;
 }
 
 BsdfSample no_sample()
