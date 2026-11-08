@@ -47,8 +47,12 @@ impl BestFit {
         self.by_len.remove(&(end - start, start));
     }
 
-    /// The start of `count` free indices, or `None` when no free run is that long.
+    /// The start of `count` free indices, or `None` when no free run is that long. No indices
+    /// take none, from 0, however full the runs are.
     pub(crate) fn alloc(&mut self, count: u32) -> Option<u32> {
+        if count == 0 {
+            return Some(0);
+        }
         let &(len, start) = self.by_len.range((count, 0)..).next()?;
         self.remove(start, start + len);
         if len > count {
