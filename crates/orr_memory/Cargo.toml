@@ -8,13 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-bitflags.workspace = true
-log.workspace = true
-thiserror.workspace = true
 vulkan-memory-allocator-sys.workspace = true
 
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
 ash.workspace = true
+bitflags.workspace = true
+log.workspace = true
+thiserror.workspace = true
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2.workspace = true

@@ -9,10 +9,10 @@ repository.workspace = true
 
 [dependencies]
 raw-window-handle.workspace = true
-log.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+log.workspace = true
 windows-core.workspace = true
 windows-future.workspace = true
 

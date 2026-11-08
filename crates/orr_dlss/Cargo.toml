@@ -15,7 +15,8 @@ mock = []
 # NGX development DLLs, which draw the DLSS debug overlay.
 debug_overlay = []
 
-[dependencies]
+# The crate is empty on Apple targets, where orr_gpu has no Vulkan backend.
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
 ash.workspace = true
 orr_gpu.workspace = true
 log.workspace = true
@@ -25,7 +26,7 @@ uuid = { version = "1", default-features = false }
 [build-dependencies]
 bindgen.workspace = true
 
-[dev-dependencies]
+[target.'cfg(not(target_vendor = "apple"))'.dev-dependencies]
 half.workspace = true
 
 [lints]
