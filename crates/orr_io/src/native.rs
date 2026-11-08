@@ -98,24 +98,25 @@ impl Native {
         // has no event to end it if it took the event for those completions already.
         self.complete();
         // New reads wait while a failed submit leaves entries in the system's queue, so the
-        // queue never holds more than a chunk per slot and this pump's registrations.
-        let stalled = self.ring.stalled();
-        if !stalled {
-            let new = self.take_queued();
-            self.update_files();
-            for slot in (0..DEPTH).filter(|&s| new & 1 << s != 0) {
-                let f = self.slots[slot].take().expect("a new read");
-                self.start(slot, f);
+        // queue never holds more than a chunk per slot and one pump's registrations. A retry
+        // that takes them lets this pump go on.
+        if self.ring.stalled() {
+            self.ring.submit();
+            if self.ring.stalled() {
+                return;
             }
-            // A read that failed to start dropped its file, which the ring must let go of
-            // though no pump may follow.
-            self.update_files();
         }
+        let new = self.take_queued();
+        self.update_files();
+        for slot in (0..DEPTH).filter(|&s| new & 1 << s != 0) {
+            let f = self.slots[slot].take().expect("a new read");
+            self.start(slot, f);
+        }
+        // A read that failed to start dropped its file, which the ring must let go of though
+        // no pump may follow.
+        self.update_files();
         // One submit carries the file registrations and the reads that name their entries.
         self.ring.submit();
-        if stalled && !self.queued.is_empty() {
-            self.ring.event().set();
-        }
     }
 
     fn update_files(&mut self) {
