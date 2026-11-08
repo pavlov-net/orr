@@ -129,3 +129,20 @@ opt-level = 3
 # The real-time BSDF runs through the same harness.
 [profile.dev.package.lighting_math]
 opt-level = 3
+
+# The debug profile inherits dev's opt-level overrides; at 1 these crates stay fast enough to run
+# their tests and a debugger can still step through them.
+[profile.debug.package.orr_pack]
+opt-level = 1
+
+[profile.debug.package.orr_cook]
+opt-level = 1
+
+[profile.debug.package.orr_atmosphere]
+opt-level = 1
+
+[profile.debug.package.openpbr_ref]
+opt-level = 1
+
+[profile.debug.package.lighting_math]
+opt-level = 1
