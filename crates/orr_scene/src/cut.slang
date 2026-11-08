@@ -49,11 +49,14 @@ public static const uint CUT_CACHED = 12;             // of them, equal to a cac
 public static const uint CUT_SHARED = 13;             // of them, sharing another slot's BLAS
 public static const uint CUT_FALLBACK = 14;           // of them, past the BLAS budget: a cached cut
 public static const uint CUT_MERGED = 15;             // slots tracing their model's merged cut
-public static const uint CUT_REQUESTS = 16;           // pages and finer cuts requested
+public static const uint CUT_REQUESTS = 16;           // pages and finer cuts wanted
 public static const uint CUT_RETRIES = 17;            // slots the second traversal ran on
-public static const uint CUT_FEEDBACK = 18;           // feedback records, past the capacity too
+public static const uint CUT_FEEDBACK = 18;           // of the wanted, those kept in `feedback`
 public static const uint CUT_PART_LISTS = 19;         // entries of `part_lists` handed out
-public static const uint CUT_COUNTERS = 20;
+public static const uint CUT_FEEDBACK_BUCKET = 20;    // the error bucket `feedback` fills up in
+public static const uint CUT_FEEDBACK_ROOM = 21;      // the requests of that bucket it keeps
+public static const uint CUT_FEEDBACK_TAKEN = 22;     // the requests of that bucket seen so far
+public static const uint CUT_COUNTERS = 23;
 
 // One instance slot's cuts this frame.
 public struct SlotCutGpu
@@ -107,19 +110,16 @@ public struct CutKey
     public uint _pad;
 }
 
-// `FeedbackGpu.kind`.
-public static const uint FEEDBACK_REQUEST = 0;   // a page the traversal needed
-public static const uint FEEDBACK_TOUCH = 1;     // a resident page it read
-public static const uint FEEDBACK_MESH_PAGE = 2; // with either: a mesh page, else a node page
-public static const uint FEEDBACK_CUT = 4;       // with either: a finer cached cut of a streaming mesh, in `page`
+// Error buckets of the requests `feedback` keeps: the top bits of an error's f32 bits, which
+// order like the errors they hold.
+public static const uint FEEDBACK_BUCKETS = 4096;
+public static const uint FEEDBACK_BUCKET_SHIFT = 19;
 
-// What the traversal tells the loading side, read back once the frame completes.
+// A page, node page or finer cut the traversal wanted, read back once the frame completes.
 public struct FeedbackGpu
 {
-    public uint mesh;              // in SceneRoot.meshes
-    public uint page;              // node page or mesh page of the mesh
-    public uint kind;              // FEEDBACK_*
-    public float error;            // pixels the page's nodes would refine
+    public uint entry;             // its mesh page table entry
+    public float error;            // the largest of the pixels it would refine for a copy
 }
 
 // The scene's cut tables, written by the traversal each frame it updates the scene.
@@ -136,9 +136,18 @@ public struct CutGpu
     public uint* model_cut;        // per model: the merged cut of its distant copies
     public uint* counters;         // CUT_*
     public uint* args;             // dispatch grids of the passes
-    public FeedbackGpu* feedback;
     public uint8_t* records;       // cluster BLAS build records, by job
     public PartListGpu* part_lists;
+    // What the traversal tells the loading side, per entry of the mesh page table
+    // (`MeshGpu.feedback_pages`, `feedback_nodes`): the entries it read and those it wanted,
+    // a bit each, and the largest error each wanted entry would refine (f32 bits, 0 until
+    // wanted), all cleared each frame. Of the wanted, `feedback` keeps those of the largest
+    // errors.
+    public uint* touched;
+    public uint* wanted;
+    public uint* wanted_errors;    // 32 per word of `wanted`
+    public uint* histogram;        // FEEDBACK_BUCKETS: the wanted entries by error bucket
+    public FeedbackGpu* feedback;
     public uint queue_capacity;
     public uint candidate_capacity;
     public uint entry_capacity;
@@ -148,5 +157,5 @@ public struct CutGpu
     public uint model_capacity;
     public uint feedback_capacity;
     public uint part_list_capacity;
-    public uint _pad;
+    public uint feedback_words;    // of `touched` and `wanted`
 }

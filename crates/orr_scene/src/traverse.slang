@@ -1,9 +1,9 @@
 // A scene's cuts for the frame, from one hierarchical traversal of its meshes' DAGs at the
-// scene focus. `clear` resets the frame's counters, keys and merged cuts; `init` decides per
-// slot what it needs (raster candidates, a gathered ray-tracing cut, a model's merged cut or
-// a cached cut), writes the candidate items of discrete meshes and pushes the DAG roots of
-// each stage a cut takes; `args` sizes each pass to the items the previous one pushed and
-// `traverse` runs one level: an internal node pushes the children whose projected error
+// scene focus. `clear` resets the frame's counters, keys, merged cuts and feedback; `init`
+// decides per slot what it needs (raster candidates, a gathered ray-tracing cut, a model's
+// merged cut or a cached cut), writes the candidate items of discrete meshes and pushes the
+// DAG roots of each stage a cut takes; `args` sizes each pass to the items the previous one
+// pushed and `traverse` runs one level: an internal node pushes the children whose projected error
 // exceeds a cut's threshold, a leaf applies the cluster rule to its group's clusters and
 // writes raster candidate items and ray-tracing cut clusters. A child in a non-resident
 // node page stops the cut at its parent, and a leaf whose group's mesh page is not resident
@@ -327,6 +327,15 @@ void clear(uint3 id: SV_DispatchThreadID)
         cut.keys[id.x].owner = 0;
     if (id.x < root.models)
         cut.model_cut[id.x] = 0xffffffff;
+    if (id.x < cut.feedback_words)
+    {
+        cut.touched[id.x] = 0;
+        cut.wanted[id.x] = 0;
+    }
+    if (id.x < 32 * cut.feedback_words)
+        cut.wanted_errors[id.x] = 0;
+    if (id.x < FEEDBACK_BUCKETS)
+        cut.histogram[id.x] = 0;
 }
 
 [shader("compute")]
@@ -382,9 +391,9 @@ void init(uint3 id: SV_DispatchThreadID)
     // The BLAS of a finer cut stay while a slot's PTLAS instance or this frame's cut names them.
     bool holds = (st.rt_flags & RT_WRITTEN) != 0 && ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) == near;
     if (holds)
-        touch_cut(s, cut, mesh, model.mesh, st.rt_lod);
+        touch_cut(cut, mesh, st.rt_lod);
     if (ray)
-        touch_cut(s, cut, mesh, model.mesh, c.rt_cut);
+        touch_cut(cut, mesh, c.rt_cut);
 
     // A fading copy also draws its far step and traces a cached cut of it.
     if (st.fade != 0)
@@ -397,9 +406,9 @@ void init(uint3 id: SV_DispatchThreadID)
         if (ray && far_mesh.rt_cut_count > 0)
         {
             c.far_cut = coarsest_cut(far_mesh, p.scale * l.scale[1], far_distance, l.threshold[1], 0);
-            touch_cut(s, cut, far_mesh, far_model.mesh, c.far_cut);
-            touch_cut(s, cut, far_mesh, far_model.mesh, (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff);
-            want_cut(s, cut, far_mesh, far_model.mesh, p.scale * l.scale[1], far_distance, l.threshold[1], 0);
+            touch_cut(cut, far_mesh, c.far_cut);
+            touch_cut(cut, far_mesh, (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff);
+            want_cut(cut, far_mesh, p.scale * l.scale[1], far_distance, l.threshold[1], 0);
         }
         if (raster)
             raster_roots(s, cut, slot | COPY_FAR, far_mesh, p, far_sphere, l, 0);
@@ -447,7 +456,7 @@ void init(uint3 id: SV_DispatchThreadID)
         InterlockedMin(cut.model_cut[inst.model], c.rt_cut);
     }
     if (ray && !gather)
-        want_cut(s, cut, mesh, model.mesh, p.scale * l.scale[1], distance, l.threshold[1], lowest_cut(mesh, inst));
+        want_cut(cut, mesh, p.scale * l.scale[1], distance, l.threshold[1], lowest_cut(mesh, inst));
     if (gather)
         c.flags |= CUT_TRAVERSED | (gathers_parts(mesh, inst, st) ? CUT_PARTS : 0);
     if (raster)
@@ -564,38 +573,31 @@ bool node_at(MeshGpu* mesh, uint node, out Node* at, out uint page)
     return true;
 }
 
-// Tells the loading side about page `page` once a frame, `stamps` holding the frame each
-// page was last reported.
-void report(SceneRoot* s, CutGpu* cut, uint* stamps, uint mesh_index, uint page, uint kind, float error)
+// Tells the loading side that the traversal read mesh page table entry `entry` this frame,
+// or with `wanted` that it wanted it to refine `error` pixels; the largest error a copy
+// wants it for stands.
+void report(CutGpu* cut, uint entry, bool wanted, float error)
 {
-    uint old;
-    InterlockedExchange(stamps[page], s.frame_index, old);
-    if (old == s.frame_index)
+    uint bit = 1u << (entry % 32);
+    if (!wanted)
+    {
+        InterlockedOr(cut.touched[entry / 32], bit);
         return;
-    if ((kind & FEEDBACK_TOUCH) == 0)
-        InterlockedAdd(cut.counters[CUT_REQUESTS], 1);
-    uint at;
-    InterlockedAdd(cut.counters[CUT_FEEDBACK], 1, at);
-    if (at >= cut.feedback_capacity)
-        return;
-    FeedbackGpu f;
-    f.mesh = mesh_index;
-    f.page = page;
-    f.kind = kind;
-    f.error = error;
-    cut.feedback[at] = f;
+    }
+    InterlockedOr(cut.wanted[entry / 32], bit);
+    InterlockedMax(cut.wanted_errors[entry], asuint(error));
 }
 
 // Reports finer cut `k` of a streaming mesh in use.
-void touch_cut(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint mesh_index, uint k)
+void touch_cut(CutGpu* cut, MeshGpu* mesh, uint k)
 {
     if (k < mesh.fine_cuts)
-        report(s, cut, mesh.cut_stamps, mesh_index, k, FEEDBACK_TOUCH | FEEDBACK_CUT, 0.0);
+        report(cut, mesh.feedback_nodes + mesh.node_page_count + k, false, 0.0);
 }
 
 // Asks for the finer cut of a streaming mesh that would serve a copy tracing a cached cut, when
 // no built cut does. From `lowest` on, no finer cut can serve it.
-void want_cut(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint mesh_index, float scale, float distance, float limit, uint lowest)
+void want_cut(CutGpu* cut, MeshGpu* mesh, float scale, float distance, float limit, uint lowest)
 {
     if (mesh.fine_cuts == 0 || lowest >= mesh.fine_cuts || !has_focus())
         return;
@@ -612,25 +614,25 @@ void want_cut(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint mesh_index, float s
         }
     }
     if (mesh.rt_cuts[target].blas != 0)
-        touch_cut(s, cut, mesh, mesh_index, target);
+        touch_cut(cut, mesh, target);
     else
-        report(s, cut, mesh.cut_stamps + mesh.fine_cuts, mesh_index, target, FEEDBACK_REQUEST | FEEDBACK_CUT, have);
+        report(cut, mesh.feedback_nodes + mesh.node_page_count + target, true, have);
 }
 
 // Node page `page`, unless it is pinned.
-void report_node_page(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint mesh_index, uint page, uint kind, float error)
+void report_node_page(CutGpu* cut, MeshGpu* mesh, uint page, bool wanted, float error)
 {
     if (page == 0xffffffff || ((NodePage*)mesh.node_table)[page].parent_page == NODE_PAGE_TOP)
         return;
-    report(s, cut, mesh.node_stamps, mesh_index, page, kind, error);
+    report(cut, mesh.feedback_nodes + page, wanted, error);
 }
 
 // Mesh page `page`, if it streams.
-void report_mesh_page(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint mesh_index, uint page, uint kind, float error)
+void report_mesh_page(CutGpu* cut, MeshGpu* mesh, uint page, bool wanted, float error)
 {
-    if (mesh.page_stamps == nullptr || page < mesh.pinned_pages)
+    if (page < mesh.pinned_pages)
         return;
-    report(s, cut, mesh.page_stamps, mesh_index, page, kind | FEEDBACK_MESH_PAGE, error);
+    report(cut, mesh.feedback_pages + page, wanted, error);
 }
 
 // Scales the slot's errors so that, in the cuts of `mask`, nothing of projected error
@@ -708,10 +710,10 @@ void traverse(uint3 id: SV_DispatchThreadID)
             if (retry)
                 return;
             float worst = coarsen(c, p, l, mask, node.sphere, node.max_error);
-            report_node_page(s, cut, mesh, model.mesh, child_page, FEEDBACK_REQUEST, worst);
+            report_node_page(cut, mesh, child_page, true, worst);
             return;
         }
-        report_node_page(s, cut, mesh, model.mesh, child_page, FEEDBACK_TOUCH, 0.0);
+        report_node_page(cut, mesh, child_page, false, 0.0);
         for (uint i = 0; i < node.child_count; i++)
         {
             Node child = children[i];
@@ -743,10 +745,10 @@ void traverse(uint3 id: SV_DispatchThreadID)
         if (retry)
             return;
         float worst = coarsen(c, p, l, mask, g.simplified, g.error);
-        report_mesh_page(s, cut, mesh, model.mesh, g.page, FEEDBACK_REQUEST, worst);
+        report_mesh_page(cut, mesh, g.page, true, worst);
         return;
     }
-    report_mesh_page(s, cut, mesh, model.mesh, g.page, FEEDBACK_TOUCH, 0.0);
+    report_mesh_page(cut, mesh, g.page, false, 0.0);
     uint mesh_first = mesh.page_clusters[g.page] + g.first_cluster;
     for (uint run = 0; run < g.cluster_count; run += 32)
     {

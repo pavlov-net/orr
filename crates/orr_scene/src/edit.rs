@@ -680,9 +680,7 @@ pub(crate) struct EditTablesDesc<'a> {
     pub(crate) groups: &'a [EditGroupGpu],
     /// The block of its pages and their bytes.
     pub(crate) pages: (GpuPtr<u8>, u64),
-    pub(crate) page_count: u32,
     pub(crate) clusters: u32,
-    pub(crate) stamps: bool,
     /// The cooked sets' row of level 0: past the pinned cut's row on a DAG mesh.
     pub(crate) row: u32,
     /// Its animated parts, which share the box its edited triangles stay inside.
@@ -691,14 +689,13 @@ pub(crate) struct EditTablesDesc<'a> {
 }
 
 /// An edit's small tables in one mapped block: the pin spheres, the groups, the one empty
-/// cached cut its copies fall back on, its animated parts and, when its source streams or is
-/// skinned, its page stamps or skin table.
+/// cached cut its copies fall back on, its animated parts and, when its source is skinned, its
+/// skin table.
 pub(crate) struct EditTables {
     _block: Allocation<u8>,
     pub(crate) edit: GpuPtr<EditGpu>,
     pub(crate) groups: GpuPtr<EditGroupGpu>,
     pub(crate) rt_cut: GpuPtr<crate::RtCutGpu>,
-    pub(crate) stamps: GpuPtr<u32>,
     pub(crate) parts: GpuPtr<PartGpu>,
     pub(crate) skin: GpuPtr<SkinMeshGpu>,
     pub(crate) templates: GpuPtr<u64>,
@@ -717,12 +714,6 @@ impl EditTables {
         let spheres_at = take(size_of_val(spheres) as u64);
         let groups_at = take(size_of_val(d.groups) as u64);
         let cut_at = take(size_of::<crate::RtCutGpu>() as u64);
-        let stamp_bytes = if d.stamps {
-            4 * u64::from(d.page_count)
-        } else {
-            0
-        };
-        let stamps_at = take(stamp_bytes);
         let parts_at = take(size_of_val(d.parts) as u64);
         let skin_at = take(size_of::<SkinMeshGpu>() as u64);
         let templates_bytes = if d.skin.is_some() {
@@ -759,7 +750,6 @@ impl EditTables {
             && block.write_mapped(spheres_at, bytemuck::cast_slice(spheres))
             && block.write_mapped(groups_at, bytemuck::cast_slice(d.groups))
             && block.write_mapped(cut_at, bytemuck::bytes_of(&empty_cut))
-            && block.write_mapped(stamps_at, &vec![0; stamp_bytes as usize])
             && block.write_mapped(parts_at, bytemuck::cast_slice(d.parts));
         assert!(wrote, "edit tables are mapped");
         let skin = d.skin.as_ref().map(|s| SkinMeshGpu {
@@ -782,11 +772,6 @@ impl EditTables {
             edit: at(edit_at).cast(),
             groups: at(groups_at).cast(),
             rt_cut: at(cut_at).cast(),
-            stamps: if d.stamps {
-                at(stamps_at).cast()
-            } else {
-                GpuPtr::NULL
-            },
             parts: at(parts_at).cast(),
             skin: if skin.is_some() {
                 at(skin_at).cast()

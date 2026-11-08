@@ -21,6 +21,7 @@ use orr_gpu::{
 
 use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
+use crate::shaders::feedback::{self, FeedbackRoot};
 use crate::shaders::traverse::{self, TraverseRoot};
 use crate::{
     BlasJob, ClusterWork, CutGpu, CutKey, FeedbackGpu, NodeItem, PartListGpu, Result, SceneRoot,
@@ -28,7 +29,7 @@ use crate::{
 };
 
 /// `CutGpu.counters` entries (`cut.slang`), the BLAS build count after them.
-const COUNTERS: usize = 21;
+const COUNTERS: usize = 24;
 const CUT_CANDIDATES: usize = 2;
 const CUT_CANDIDATE_CLUSTERS: usize = 3;
 const CUT_ENTRIES: usize = 4;
@@ -45,23 +46,17 @@ const CUT_MERGED: usize = 15;
 const CUT_REQUESTS: usize = 16;
 const CUT_RETRIES: usize = 17;
 const CUT_FEEDBACK: usize = 18;
-const CUT_BUILDS: u64 = 20;
+const CUT_BUILDS: u64 = 23;
 /// `traverse.slang` args layout.
 const ARGS_PASSES: u32 = 64;
 const ARGS_GATHER: u64 = 3 * ARGS_PASSES as u64;
 const ARGS_JOBS: u64 = ARGS_GATHER + 3;
 const ARGS_TOTAL: u64 = ARGS_JOBS + 3;
 const TRAVERSE_FOCUS: u32 = 1;
-/// `cut.slang` `FEEDBACK_TOUCH`, `FEEDBACK_MESH_PAGE` and `FEEDBACK_CUT`.
-const FEEDBACK_TOUCH: u32 = 1;
-const FEEDBACK_MESH_PAGE: u32 = 2;
-const FEEDBACK_CUT: u32 = 4;
+/// `cut.slang` `FEEDBACK_BUCKETS`.
+const FEEDBACK_BUCKETS: u32 = 4096;
 /// Passes of one traversal over a hierarchy whose depth is not known at mount.
 pub(crate) const PAGED_DEPTH: u32 = 32;
-/// Feedback records one frame keeps.
-const FEEDBACK: u32 = 4096;
-/// Readback words per frame in flight: counters, then feedback records.
-const READBACK_WORDS: usize = COUNTERS + 4 * FEEDBACK as usize;
 
 /// Traversal figures of a frame, summed over its scenes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -92,11 +87,9 @@ pub struct CutStats {
     /// Copies a non-resident hierarchy page stopped, and the pages and finer cuts requested.
     pub retries: u32,
     pub page_requests: u32,
-    /// Requests and touches of pages and finer cuts past the feedback's record capacity,
-    /// which the loading side never sees: what they request waits for a later frame, and
-    /// what they touch ages as though unused.
+    /// Of those requests, the ones past [`crate::Budgets::traversal_requests`] in a scene,
+    /// of the smallest errors, which the loading side does not see that frame.
     pub requests_lost: u32,
-    pub touches_lost: u32,
 }
 
 impl CutStats {
@@ -119,17 +112,13 @@ impl CutStats {
     }
 }
 
-/// A node page or streamed mesh page the traversal needed (a request) or read (a touch),
-/// with the projected error in pixels it would refine.
-#[derive(Clone, Copy, Debug)]
+/// What the traversals of a frame report by mesh page table entry: a bit per entry whose
+/// node page, streamed mesh page or finer cut they read, and the entries they wanted with the
+/// projected error in pixels each would refine.
+#[derive(Debug, Default)]
 pub(crate) struct PageFeedback {
-    pub(crate) mesh: u32,
-    pub(crate) page: u32,
-    pub(crate) mesh_page: bool,
-    /// `page` is a finer cached cut of a streaming mesh.
-    pub(crate) cut: bool,
-    pub(crate) request: bool,
-    pub(crate) error: f32,
+    pub(crate) touched: Vec<u32>,
+    pub(crate) wanted: Vec<(u32, f32)>,
 }
 
 pub(crate) struct CutPipelines {
@@ -147,27 +136,33 @@ pub(crate) struct CutPipelines {
     prepare: PipelineId,
     gather: PipelineId,
     jobs: PipelineId,
+    count: PipelineId,
+    select: PipelineId,
+    write: PipelineId,
 }
 
 impl CutPipelines {
     pub(crate) fn new(device: &Device, kernels: &KernelSet, p: &mut Pipelines) -> Result<Self> {
-        let m = &traverse::MODULE;
-        let mut c = |entry| p.create(device, kernels, m, entry, Default::default());
+        let mut c = |m, entry| p.create(device, kernels, m, entry, Default::default());
+        let (t, f) = (&traverse::MODULE, &feedback::MODULE);
         Ok(Self {
-            clear: c("clear")?,
-            init: c("init")?,
-            args: c("args")?,
-            traverse: c("traverse")?,
-            finish: c("finish")?,
-            retry: c("retry")?,
-            assign: c("assign")?,
-            share: c("share")?,
-            split: c("split")?,
-            place_lists: c("place_lists")?,
-            link: c("link")?,
-            prepare: c("prepare")?,
-            gather: c("gather")?,
-            jobs: c("jobs")?,
+            clear: c(t, "clear")?,
+            init: c(t, "init")?,
+            args: c(t, "args")?,
+            traverse: c(t, "traverse")?,
+            finish: c(t, "finish")?,
+            retry: c(t, "retry")?,
+            assign: c(t, "assign")?,
+            share: c(t, "share")?,
+            split: c(t, "split")?,
+            place_lists: c(t, "place_lists")?,
+            link: c(t, "link")?,
+            prepare: c(t, "prepare")?,
+            gather: c(t, "gather")?,
+            jobs: c(t, "jobs")?,
+            count: c(f, "count")?,
+            select: c(f, "select")?,
+            write: c(f, "write")?,
         })
     }
 }
@@ -181,6 +176,10 @@ pub(crate) struct CutSizes {
     pub(crate) rt_clusters: u32,
     pub(crate) rt_blas: u32,
     pub(crate) models: u32,
+    /// Entries of the mesh page table, by which the feedback reports.
+    pub(crate) entries: u32,
+    /// Wanted entries the feedback keeps.
+    pub(crate) requests: u32,
 }
 
 impl CutSizes {
@@ -192,6 +191,16 @@ impl CutSizes {
     /// Entries of the table of per-part cluster lists: empty parts hold one too.
     fn part_lists(&self) -> u32 {
         4 * self.rt_blas.max(256)
+    }
+
+    /// Words of the feedback's bitmaps.
+    fn feedback_words(&self) -> u32 {
+        self.entries.div_ceil(32)
+    }
+
+    /// Readback words per frame in flight: counters, touched entries, then kept requests.
+    fn readback_words(&self) -> usize {
+        COUNTERS + self.feedback_words() as usize + 2 * self.requests as usize
     }
 }
 
@@ -208,6 +217,7 @@ pub(crate) struct Cuts {
     _blocks: Vec<Allocation<u8>>,
     counters: GpuPtr<u32>,
     args: GpuPtr<u32>,
+    touched: GpuPtr<u32>,
     feedback: GpuPtr<FeedbackGpu>,
     records: GpuPtr<u8>,
     job_blas: GpuPtr<u64>,
@@ -215,7 +225,7 @@ pub(crate) struct Cuts {
     /// Two arenas: a frame builds into one while the PTLAS may still reference the other.
     arenas: [Option<Arena>; 2],
     scratch: Option<Allocation<u8>>,
-    /// Counters, then feedback records, per frame in flight.
+    /// Counters, touched entries, then kept requests, per frame in flight.
     readback: Allocation<u32>,
     updates: u64,
 }
@@ -284,9 +294,14 @@ impl Cuts {
         let model_cut = block(4 * n(sizes.models), "merged cuts")?;
         let counters = block(4 * COUNTERS as u64, "cut counters")?.cast();
         let args = block(4 * ARGS_TOTAL, "cut args")?.cast();
+        let words = u64::from(sizes.feedback_words());
+        let touched = block(4 * words, "touched page entries")?.cast();
+        let wanted = block(4 * words, "wanted page entries")?.cast();
+        let wanted_errors = block(4 * 32 * words, "wanted page errors")?.cast();
+        let histogram = block(4 * u64::from(FEEDBACK_BUCKETS), "wanted page buckets")?.cast();
         let feedback = block(
-            u64::from(FEEDBACK) * size_of::<FeedbackGpu>() as u64,
-            "cut feedback",
+            u64::from(sizes.requests) * size_of::<FeedbackGpu>() as u64,
+            "page requests",
         )?
         .cast();
         let gpu = CutGpu {
@@ -301,9 +316,13 @@ impl Cuts {
             model_cut: model_cut.cast(),
             counters,
             args,
-            feedback,
             records,
             part_lists: part_lists.cast(),
+            touched,
+            wanted,
+            wanted_errors,
+            histogram,
+            feedback,
             queue_capacity: sizes.queue,
             candidate_capacity: sizes.candidates,
             entry_capacity: sizes.rt_clusters,
@@ -311,9 +330,9 @@ impl Cuts {
             job_capacity: sizes.rt_blas,
             key_mask: keys - 1,
             model_capacity: sizes.models,
-            feedback_capacity: FEEDBACK,
+            feedback_capacity: sizes.requests,
             part_list_capacity: sizes.part_lists(),
-            _pad: 0,
+            feedback_words: sizes.feedback_words(),
         };
         let mut record = device.gpu_malloc::<CutGpu>(MemoryKind::Upload, 1, "cut tables")?;
         record.as_mut_slice().expect("upload is mapped")[0] = gpu;
@@ -323,6 +342,7 @@ impl Cuts {
             _blocks: blocks,
             counters,
             args,
+            touched,
             feedback,
             records,
             job_blas,
@@ -331,7 +351,7 @@ impl Cuts {
             scratch: None,
             readback: device.gpu_malloc(
                 MemoryKind::Readback,
-                (READBACK_WORDS * fif.max(1) as usize) as u64,
+                (sizes.readback_words() * fif.max(1) as usize) as u64,
                 "cut readback",
             )?,
             updates: 0,
@@ -358,42 +378,37 @@ impl Cuts {
 
     fn readback(&self, slot: usize) -> &[u32] {
         let data = self.readback.as_slice().expect("readback is mapped");
-        &data[slot * READBACK_WORDS..(slot + 1) * READBACK_WORDS]
+        let words = self.sizes.readback_words();
+        &data[slot * words..(slot + 1) * words]
     }
 
     /// The traversal figures of the frame that used readback slot `slot`.
     pub(crate) fn figures(&self, slot: usize, stats: &mut CutStats) {
         let data = self.readback(slot);
         stats.add(&data[..COUNTERS]);
-        // Both counters count past the capacity; the records kept say which kind each was.
-        let reported = data[CUT_FEEDBACK];
-        let kept = reported.min(FEEDBACK);
-        let kept_requests = data[COUNTERS..][..4 * kept as usize]
-            .chunks_exact(4)
-            .filter(|r| r[2] & FEEDBACK_TOUCH == 0)
-            .count() as u32;
-        let requests_lost = data[CUT_REQUESTS] - kept_requests;
-        stats.requests_lost += requests_lost;
-        stats.touches_lost += reported - kept - requests_lost;
+        stats.requests_lost += data[CUT_REQUESTS] - data[CUT_FEEDBACK];
     }
 
-    /// The pages the frame that used readback slot `slot` requested or read.
-    pub(crate) fn feedback(&self, slot: usize) -> Vec<PageFeedback> {
+    /// Adds what the frame that used readback slot `slot` read and wanted to `out`.
+    pub(crate) fn feedback(&self, slot: usize, out: &mut PageFeedback) {
         let data = self.readback(slot);
-        let n = (data[CUT_FEEDBACK] as usize).min(FEEDBACK as usize);
-        data[COUNTERS..COUNTERS + 4 * n]
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|r| PageFeedback {
-                mesh: r[0],
-                page: r[1],
-                mesh_page: r[2] & FEEDBACK_MESH_PAGE != 0,
-                cut: r[2] & FEEDBACK_CUT != 0,
-                request: r[2] & FEEDBACK_TOUCH == 0,
-                error: f32::from_bits(r[3]),
-            })
-            .collect()
+        let words = self.sizes.feedback_words() as usize;
+        let touched = &data[COUNTERS..][..words];
+        if out.touched.len() < words {
+            out.touched.resize(words, 0);
+        }
+        for (o, &w) in out.touched.iter_mut().zip(touched) {
+            *o |= w;
+        }
+        let kept = data[CUT_FEEDBACK] as usize;
+        let requests = &data[COUNTERS + words..][..2 * kept];
+        out.wanted.extend(
+            requests
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|r| (r[0], f32::from_bits(r[1]))),
+        );
     }
 
     /// Records the frame's traversal and its cluster BLAS builds.
@@ -436,7 +451,9 @@ impl Cuts {
             .sizes
             .keys()
             .max(self.sizes.models)
-            .max(COUNTERS as u32);
+            .max(COUNTERS as u32)
+            .max(32 * self.sizes.feedback_words())
+            .max(FEEDBACK_BUCKETS);
         list.dispatch(p.get(k.clear), r0, groups(cleared));
         step(list);
         list.dispatch(p.get(k.init), r0, groups(f.slots));
@@ -463,6 +480,20 @@ impl Cuts {
                 run(list, passes)?;
             }
         }
+        let fb = window.put_root(
+            device,
+            &FeedbackRoot {
+                cut: self.record.gpu(),
+                _pad: 0,
+            },
+        )?;
+        let words = groups(self.sizes.feedback_words());
+        list.dispatch(p.get(k.count), fb, words);
+        step(list);
+        list.dispatch(p.get(k.select), fb, [1, 1, 1]);
+        step(list);
+        list.dispatch(p.get(k.write), fb, words);
+        step(list);
         list.dispatch(p.get(k.assign), r0, groups(f.slots));
         step(list);
         list.dispatch(p.get(k.share), r0, groups(f.slots));
@@ -506,14 +537,27 @@ impl Cuts {
         } else {
             step(list);
         }
-        let at = self.readback.gpu().offset((READBACK_WORDS * f.slot) as u64);
+        let at = self
+            .readback
+            .gpu()
+            .offset((self.sizes.readback_words() * f.slot) as u64);
+        let words = u64::from(self.sizes.feedback_words());
         list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
         list.copy(at.cast(), self.counters.cast(), 4 * COUNTERS as u64);
-        list.copy(
-            at.offset(COUNTERS as u64).cast(),
-            self.feedback.cast(),
-            u64::from(FEEDBACK) * size_of::<FeedbackGpu>() as u64,
-        );
+        if words > 0 {
+            list.copy(
+                at.offset(COUNTERS as u64).cast(),
+                self.touched.cast(),
+                4 * words,
+            );
+        }
+        if self.sizes.requests > 0 {
+            list.copy(
+                at.offset(COUNTERS as u64 + words).cast(),
+                self.feedback.cast(),
+                u64::from(self.sizes.requests) * size_of::<FeedbackGpu>() as u64,
+            );
+        }
         list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
         list.end_pass();
         self.updates += 1;

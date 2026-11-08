@@ -44,7 +44,7 @@ use crate::subd::ModelCage;
 use crate::tessellate::{self, Patterns, SeenBy, TessKernels, TessellationStats};
 use crate::time::FrameTime;
 use crate::transparency::TransparencyPass;
-use crate::traverse::{CutInputs, CutPipelines, CutSizes, CutStats, Cuts};
+use crate::traverse::{CutInputs, CutPipelines, CutSizes, CutStats, Cuts, PageFeedback};
 use crate::upload::{Record, scatter};
 use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constants};
 use crate::world::{WorldPos, needs_rebase, origin_for};
@@ -66,7 +66,9 @@ pub struct Budgets {
     pub meshes: u32,
     /// Section materials of every resident model.
     pub model_materials: u32,
-    /// Page and node page addresses of every resident mesh.
+    /// Entries of the mesh page table: per mounted mesh one per page and node page, which
+    /// hold their addresses, and one per finer cached cut of a streaming mesh, and per edit one
+    /// per page. A scene's traversal reports what it reads and wants by entry, a bit each.
     pub mesh_pages: u32,
     /// Clusters one view can draw.
     pub visible_clusters: u32,
@@ -75,6 +77,10 @@ pub struct Budgets {
     pub cluster_work: u32,
     /// Hierarchy nodes one traversal pass of a scene visits, at most.
     pub traversal_nodes: u32,
+    /// Mesh pages, hierarchy pages and finer cached cuts a scene's traversal asks the loading
+    /// side for in a frame, at most: those of the largest projected errors. The others wait
+    /// for a later frame.
+    pub traversal_requests: u32,
     /// Clusters of the ray-tracing cuts a scene's traversal gathers in a frame, and CLAS
     /// that frame's cluster BLAS take; copies past it trace a cached cut.
     pub rt_cut_clusters: u32,
@@ -138,6 +144,7 @@ impl Default for Budgets {
             visible_clusters: 1 << 20,
             cluster_work: 1 << 18,
             traversal_nodes: 1 << 18,
+            traversal_requests: 4096,
             rt_cut_clusters: 1 << 18,
             rt_cut_blas: 1024,
             resident_clusters: 1 << 21,
@@ -1005,7 +1012,7 @@ impl Scenes {
                     f.stats.rt.add(&figures);
                 }
             }
-            let mut feedback = Vec::new();
+            let mut feedback = PageFeedback::default();
             for id in &f.updated {
                 let Ok(scene) = core.scene(*id) else { continue };
                 let cpu = scene.cpu.lock().unwrap();
@@ -1016,7 +1023,7 @@ impl Scenes {
                 }
                 if let Some(cuts) = &cpu.cuts {
                     cuts.figures(slot, &mut f.stats.cuts);
-                    feedback.extend(cuts.feedback(slot));
+                    cuts.feedback(slot, &mut feedback);
                 }
                 if let Some(skin) = &cpu.skin_frame {
                     f.stats.skin.add(&skin.figures(slot));
@@ -1500,6 +1507,8 @@ impl<'a> Frame<'a> {
                     rt_clusters: core.budgets.rt_cut_clusters,
                     rt_blas: core.budgets.rt_cut_blas,
                     models: core.budgets.models,
+                    entries: core.budgets.mesh_pages,
+                    requests: core.budgets.traversal_requests,
                 };
                 cpu.cuts = Some(Cuts::new(device, sizes, core.fif)?);
             }

@@ -4,7 +4,7 @@
 //! the textures its materials bind and of neural sets' latents. The render thread takes the
 //! finished batch at step 1 and applies its tables with the frame's scatter.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -133,21 +133,17 @@ struct PlacedMesh {
     /// Per page, its micromap region.
     micromaps: Vec<Option<PageMicromap>>,
     parts: Vec<Part>,
-    /// Per node page, the frame the traversal last reported it, in the mesh's block.
-    node_stamps: u64,
     /// Levels of a resident hierarchy; None when it is paged.
     depth: Option<u32>,
-    /// Pages past the pinned ones stream: per page its blob, bytes and clusters, and the
-    /// frame the traversal last reported each, in the mesh's block.
-    streamed: Option<(Vec<StreamedPage>, u64)>,
+    /// Pages past the pinned ones stream: per page its blob, bytes and clusters.
+    streamed: Option<Vec<StreamedPage>>,
     /// DAG mode: the cuts whose clusters are all resident from mount.
     cached: Vec<CutRow>,
     /// What edits of the mesh read: its groups, and every page's blob, bytes and clusters.
     groups: Vec<Group>,
     all_pages: Vec<StreamedPage>,
-    /// Its finer cached cuts where its pages stream, and their stamps in the mesh's block.
+    /// Its finer cached cuts where its pages stream.
     fine: Vec<CutRow>,
-    cut_stamps: u64,
 }
 
 /// The levels of a hierarchy whose nodes are numbered breadth first from `roots`.
@@ -927,14 +923,11 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         at
     };
     let page_clusters_at = place(4 * (info.pages.len() as u64 + 1));
-    let stamps_at = place(4 * info.node_pages.len() as u64);
-    let page_stamps_at = streams.then(|| place(4 * info.pages.len() as u64));
     let (fine, cached) = if info.levels.is_empty() {
         accel::cut_rows(&info.cut_rows, streams, t.traced)
     } else {
         Default::default()
     };
-    let cut_stamps_at = place(8 * fine.len() as u64);
     let page_at: Vec<u64> = info.pages[..pinned]
         .iter()
         .map(|p| place(u64::from(p.resident_len)))
@@ -963,12 +956,6 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         .collect();
     let block = t.block(size, "mesh")?;
     t.write(block, 0, blob0)?;
-    if !info.node_pages.is_empty() {
-        t.write(block, stamps_at, &vec![0u8; 4 * info.node_pages.len()])?;
-    }
-    if let Some(at) = page_stamps_at {
-        t.write(block, at, &vec![0u8; 4 * info.pages.len()])?;
-    }
     let depth = info
         .node_pages
         .is_empty()
@@ -1009,9 +996,6 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             (0..p.clusters).map(move |i| (p.first + i, ClusterInfo::absent(page, i)))
         })
         .collect();
-    if !fine.is_empty() {
-        t.write(block, cut_stamps_at, &vec![0u8; 8 * fine.len()])?;
-    }
     let level_ranges = info
         .levels
         .iter()
@@ -1041,14 +1025,12 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             clusters: absent,
             micromaps: vec![None; info.pages.len()],
             parts: info.parts.clone(),
-            node_stamps: block.gpu() + stamps_at,
             depth,
-            streamed: page_stamps_at.map(|at| (all_pages.clone(), block.gpu() + at)),
+            streamed: streams.then(|| all_pages.clone()),
             cached,
             groups: info.groups.clone(),
             all_pages,
             fine,
-            cut_stamps: block.gpu() + cut_stamps_at,
         });
         placed.meshes.len() - 1
     };
@@ -1617,15 +1599,16 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                         node_table: table(m.header.node_pages),
                         groups: table(m.header.groups),
                         roots: table(m.header.roots).cast(),
-                        node_stamps: GpuPtr::from_address(orr_gpu::GpuAddress(m.node_stamps)),
                         root_count: m.header.roots.count,
-                        pinned_pages: m.header.pinned_pages,
+                        pinned_pages: if m.streamed.is_some() {
+                            m.header.pinned_pages
+                        } else {
+                            pages
+                        },
                         skin: GpuPtr::NULL,
-                        page_stamps: m.streamed.as_ref().map_or(GpuPtr::NULL, |(_, at)| {
-                            GpuPtr::from_address(orr_gpu::GpuAddress(*at))
-                        }),
                         edit: GpuPtr::NULL,
-                        cut_stamps: GpuPtr::from_address(orr_gpu::GpuAddress(m.cut_stamps)),
+                        feedback_pages: 0,
+                        feedback_nodes: 0,
                         fine_cuts: 0,
                         section_count: m.sections,
                         opaque_sections: m.header.opaque_sections,
@@ -1645,7 +1628,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 refs: Vec::new(),
                 rt: MeshRt::default(),
                 depth: m.depth,
-                streamed: m.streamed.map(|(pages, _)| pages),
+                streamed: m.streamed,
                 cached: m.cached,
                 non_opaque: Vec::new(),
                 groups: m.groups,
@@ -2017,6 +2000,39 @@ enum EditEntry {
     Failed(Arc<Error>),
 }
 
+/// A range of the mesh page table by its owner's mesh: `pages` entries for its pages, then
+/// `nodes` for its node pages, then one per finer cut.
+#[derive(Clone, Copy, Debug)]
+struct EntryOwner {
+    mount: MountId,
+    /// Of the mount's meshes.
+    mesh: u32,
+    pages: u32,
+    nodes: u32,
+}
+
+impl EntryOwner {
+    /// Hands entry `local` of this range to `s`: wanted to refine `request` pixels, or read in
+    /// `frame`.
+    fn feedback(self, s: &mut Streaming, local: u32, request: Option<f32>, frame: u64) {
+        if local < self.pages {
+            s.page(self.mount, self.mesh, local, true, request, frame);
+        } else if local < self.pages + self.nodes {
+            s.page(
+                self.mount,
+                self.mesh,
+                local - self.pages,
+                false,
+                request,
+                frame,
+            );
+        } else {
+            let k = local - self.pages - self.nodes;
+            s.fine_cut(self.mount, self.mesh, k, request.is_some(), frame);
+        }
+    }
+}
+
 /// The table ranges an edit holds.
 #[derive(Clone)]
 struct EditIds {
@@ -2043,7 +2059,6 @@ struct EditPending {
 /// A landed edit.
 struct EditLive {
     model: ModelId,
-    mesh: u32,
     mesh_gpu: GpuPtr<MeshGpu>,
     mount: MountId,
     source_mesh: u32,
@@ -2131,8 +2146,9 @@ pub(crate) struct Mounts {
     pub(crate) streaming: Streaming,
     /// The mount and mesh of each resident model.
     owners: FxHashMap<ModelId, (MountId, u32)>,
-    /// The mount and mesh of each resident mesh id.
-    mesh_owners: FxHashMap<u32, (MountId, u32)>,
+    /// The mount and mesh whose pages, node pages and finer cuts take each range of the mesh
+    /// page table, by its first entry. An edit's range takes its source mesh's pages.
+    entry_owners: BTreeMap<u32, EntryOwner>,
     /// Section-mask BLAS by mesh id.
     masks: HashMap<u32, MeshMasks>,
     /// Scratch of mask builds, freed once their frame has completed.
@@ -2443,7 +2459,7 @@ impl Mounts {
             retired: Vec::new(),
             streaming: Streaming::new(device, budgets, accel, streams, fif)?,
             owners: FxHashMap::default(),
-            mesh_owners: FxHashMap::default(),
+            entry_owners: BTreeMap::new(),
             masks: HashMap::new(),
             transient: Vec::new(),
             edits: Vec::new(),
@@ -2644,9 +2660,7 @@ impl Mounts {
                 spheres: p.spheres.as_deref(),
                 groups: &p.groups,
                 pages: (loaded.block.gpu(), loaded.pages_bytes),
-                page_count,
                 clusters: n,
-                stamps: src_gpu.page_stamps.address().0 != 0,
                 row: u32::from(stream.finest_level.is_none()),
                 parts: &parts,
                 skin: src_skin.map(|source| EditSkin {
@@ -2740,9 +2754,8 @@ impl Mounts {
             masks: GpuPtr::NULL,
             mask_count: 0,
             skin: tables.skin,
-            page_stamps: tables.stamps,
             edit: tables.edit,
-            cut_stamps: GpuPtr::NULL,
+            feedback_pages: start,
             fine_cuts: 0,
             ..src_gpu
         };
@@ -2770,7 +2783,15 @@ impl Mounts {
         };
         w.cages[i] = None;
         self.owners.insert(id, (p.mount, p.mesh));
-        self.mesh_owners.insert(mesh, (p.mount, p.mesh));
+        self.entry_owners.insert(
+            start,
+            EntryOwner {
+                mount: p.mount,
+                mesh: p.mesh,
+                pages: page_count,
+                nodes: 0,
+            },
+        );
         let mirror = Arc::new(Mirror {
             table,
             clusters,
@@ -2779,7 +2800,6 @@ impl Mounts {
         self.streaming.add_mirror(p.mount, p.mesh, &mirror);
         Ok(EditLive {
             model: id,
-            mesh,
             mesh_gpu,
             mount: p.mount,
             source_mesh: p.mesh,
@@ -3130,17 +3150,27 @@ impl Mounts {
 
     /// Hands the traversal's page requests and reads of a completed frame to the residency
     /// step of `frame`.
-    pub(crate) fn page_feedback(&mut self, feedback: &[PageFeedback], frame: u64) {
-        for f in feedback {
-            if let Some(&(mount, mesh)) = self.mesh_owners.get(&f.mesh) {
-                if f.cut {
-                    self.streaming
-                        .fine_cut(mount, mesh, f.page, f.request, frame);
-                    continue;
+    pub(crate) fn page_feedback(&mut self, feedback: &PageFeedback, frame: u64) {
+        for &(entry, error) in &feedback.wanted {
+            let owner = self.entry_owners.range(..=entry).next_back();
+            if let Some((&start, &o)) = owner {
+                o.feedback(&mut self.streaming, entry - start, Some(error), frame);
+            }
+        }
+        // Touched entries rise, so the owner of each is the last range starting at or before it.
+        let mut owners = self.entry_owners.iter().peekable();
+        let mut owner: Option<(u32, EntryOwner)> = None;
+        for (w, &word) in feedback.touched.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let entry = 32 * w as u32 + bits.trailing_zeros();
+                bits &= bits - 1;
+                while let Some((&start, &o)) = owners.next_if(|&(&start, _)| start <= entry) {
+                    owner = Some((start, o));
                 }
-                let request = f.request.then_some(f.error);
-                self.streaming
-                    .page(mount, mesh, f.page, f.mesh_page, request, frame);
+                if let Some((start, o)) = owner {
+                    o.feedback(&mut self.streaming, entry - start, None, frame);
+                }
             }
         }
     }
@@ -3283,7 +3313,9 @@ impl Mounts {
             .partition(|(f, _)| *f <= completed);
         self.retired_edits = keep;
         for (_, e) in done {
-            self.mesh_owners.remove(&e.mesh);
+            if let Some(start) = e.ids.pages_at {
+                self.entry_owners.remove(&start);
+            }
             self.free_edit_ids(&e.ids);
         }
     }
@@ -3307,9 +3339,9 @@ impl Mounts {
         for &id in &r.meshes {
             self.mesh_ids.free(id, 1);
             self.masks.remove(&id);
-            self.mesh_owners.remove(&id);
         }
         for &(s, n) in &r.page_ranges {
+            self.entry_owners.remove(&s);
             self.page_ranges.free(s, n);
         }
         for &(s, n) in &r.material_ranges {
@@ -3444,7 +3476,7 @@ impl Mounts {
                 .alloc(1)
                 .ok_or_else(|| capacity("meshes", self.sizes.meshes))?;
             res.meshes.push(id);
-            let n = m.page_addresses.len() as u32;
+            let n = m.page_addresses.len() as u32 + m.gpu.fine_cuts;
             let start = self
                 .page_ranges
                 .alloc(n)
@@ -3456,6 +3488,8 @@ impl Mounts {
             let gpu = MeshGpu {
                 pages: table,
                 node_pages: table.offset(u64::from(m.gpu.page_count)),
+                feedback_pages: start,
+                feedback_nodes: start + m.gpu.page_count,
                 ..m.gpu
             };
             w.put(self.meshes.gpu().offset(u64::from(id)), &[gpu])?;
@@ -3479,8 +3513,15 @@ impl Mounts {
                 }),
                 skin: m.skin_record,
             });
-            self.mesh_owners
-                .insert(id, (mount, res.meshes.len() as u32 - 1));
+            self.entry_owners.insert(
+                start,
+                EntryOwner {
+                    mount,
+                    mesh: res.meshes.len() as u32 - 1,
+                    pages: gpu.page_count,
+                    nodes: gpu.node_page_count,
+                },
+            );
             mesh_ids.push(id);
         }
         for m in &models {

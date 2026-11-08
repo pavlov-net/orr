@@ -144,6 +144,8 @@ pub mod types {
 pub use shaders::MODULES;
 /// The root of the CLAS pool's `allocate` kernel.
 pub use shaders::clas_pool::PoolRoot;
+/// The root of the kernels that choose the traversal's requests.
+pub use shaders::feedback::FeedbackRoot;
 
 /// orr_scene's compiled kernels and the Rust types of its Slang structs.
 mod shaders {

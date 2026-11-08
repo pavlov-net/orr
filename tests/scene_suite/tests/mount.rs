@@ -2554,7 +2554,7 @@ fn stream_sheets(dev: &Device) {
     });
     for &m in &models {
         let (mesh, pages) = mesh_of(&scenes, &gpu, m);
-        assert_ne!(mesh.page_stamps, GpuPtr::NULL);
+        assert!(mesh.pinned_pages < mesh.page_count, "its pages stream");
         assert!(
             pages[..pinned].iter().all(|&p| p != 0),
             "pinned pages placed"
@@ -2846,6 +2846,134 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
             placed.as_slice()
         );
     }
+}
+
+/// Wanted mesh page table entries past the request capacity, with ties in the bucket the
+/// capacity fills up in: the kernels keep that many of the largest errors, each once with its
+/// error.
+#[test]
+fn the_traversal_requests_kept_are_those_of_the_largest_errors() {
+    use orr_scene::orr_gpu::MemoryKind;
+    // `cut.slang`: the counters, CUT_REQUESTS, CUT_FEEDBACK, FEEDBACK_BUCKETS and its shift.
+    const COUNTERS: u64 = 24;
+    const REQUESTS: usize = 16;
+    const KEPT: usize = 18;
+    const BUCKETS: u64 = 4096;
+    let bucket = |error: u32| error >> 19;
+    let dev = device();
+    let module = orr_scene::MODULES
+        .iter()
+        .find(|m| m.name == "feedback")
+        .unwrap();
+    let kernels = ["count", "select", "write"].map(|e| scene_suite::pipeline(module, e));
+    let entries = 50_003u32;
+    let words = entries.div_ceil(32);
+    let up = MemoryKind::Upload;
+    let mut counters = dev.gpu_malloc::<u32>(up, COUNTERS, "counters").unwrap();
+    let mut wanted = dev
+        .gpu_malloc::<u32>(up, u64::from(words), "wanted")
+        .unwrap();
+    let mut errors = dev
+        .gpu_malloc::<u32>(up, u64::from(entries), "errors")
+        .unwrap();
+    let mut histogram = dev.gpu_malloc::<u32>(up, BUCKETS, "histogram").unwrap();
+    let mut cut = dev.gpu_malloc::<orr_scene::CutGpu>(up, 1, "cut").unwrap();
+    let mut root = dev
+        .gpu_malloc::<orr_scene::FeedbackRoot>(up, 1, "root")
+        .unwrap();
+    let mut rand = {
+        let mut x = 0x9e37_79b9u32;
+        move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        }
+    };
+    let render = dev.queue(QueueKind::Render).unwrap();
+    // Errors from a few buckets, so that many tie in the one the capacity fills up in.
+    let levels = [0.0f32, 0.3, 1.0, 1.01, 4.0, 250.0, f32::INFINITY];
+    for capacity in [0u32, 1, 700, 9_000, 40_000] {
+        let mut want = vec![None; entries as usize];
+        for w in want.iter_mut() {
+            if rand() % 4 == 0 {
+                *w = Some(levels[rand() as usize % levels.len()].to_bits());
+            }
+        }
+        let total = want.iter().flatten().count();
+        let mut bits = vec![0u32; words as usize];
+        for (i, w) in want.iter().enumerate() {
+            if w.is_some() {
+                bits[i / 32] |= 1 << (i % 32);
+            }
+        }
+        wanted.as_mut_slice().unwrap().copy_from_slice(&bits);
+        for (e, w) in errors.as_mut_slice().unwrap().iter_mut().zip(&want) {
+            *e = w.unwrap_or(0);
+        }
+        counters.as_mut_slice().unwrap().fill(0);
+        histogram.as_mut_slice().unwrap().fill(0);
+        let feedback = dev
+            .gpu_malloc::<[u32; 2]>(up, u64::from(capacity.max(1)), "feedback")
+            .unwrap();
+        cut.as_mut_slice().unwrap()[0] = orr_scene::CutGpu {
+            counters: counters.gpu(),
+            wanted: wanted.gpu(),
+            wanted_errors: errors.gpu(),
+            histogram: histogram.gpu(),
+            feedback: feedback.gpu().cast(),
+            feedback_capacity: capacity,
+            feedback_words: words,
+            ..Zeroable::zeroed()
+        };
+        root.as_mut_slice().unwrap()[0] = orr_scene::FeedbackRoot {
+            cut: cut.gpu(),
+            _pad: 0,
+        };
+        let mut list = render.command_list().unwrap();
+        let groups = [words.div_ceil(64), 1, 1];
+        for (k, grid) in kernels.iter().zip([groups, [1, 1, 1], groups]) {
+            list.dispatch(k, root.gpu(), grid);
+            list.barrier(
+                Stages::COMPUTE,
+                Stages::COMPUTE | Stages::HOST,
+                Hazards::empty(),
+            );
+        }
+        orr_scene::testing::wait(render.submit(vec![list], &[]).unwrap());
+
+        let c = counters.as_slice().unwrap();
+        assert_eq!(
+            c[REQUESTS] as usize, total,
+            "requests at capacity {capacity}"
+        );
+        let kept = c[KEPT] as usize;
+        assert_eq!(
+            kept,
+            total.min(capacity as usize),
+            "kept at capacity {capacity}"
+        );
+        let mut seen = vec![false; entries as usize];
+        let mut lowest = u32::MAX;
+        for &[entry, error] in &feedback.as_slice().unwrap()[..kept] {
+            let i = entry as usize;
+            assert_eq!(want[i], Some(error), "entry {entry} with its error");
+            assert!(!seen[i], "entry {entry} kept twice");
+            seen[i] = true;
+            lowest = lowest.min(bucket(error));
+        }
+        for (i, w) in want.iter().enumerate() {
+            if let Some(error) = *w
+                && !seen[i]
+            {
+                assert!(
+                    bucket(error) <= lowest,
+                    "entry {i} dropped above a kept bucket at capacity {capacity}"
+                );
+            }
+        }
+    }
+    assert_clean();
 }
 
 /// A streaming sheet's budgets: everything resident fits, nothing keeps whole.

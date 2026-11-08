@@ -323,13 +323,12 @@ public struct MeshGpu
     public uint8_t* node_table;    // DAG mode: the NodePage table of a paged hierarchy, else null
     public uint8_t* groups;        // DAG mode: the Group table
     public uint* roots;            // DAG mode: MeshHeader.roots
-    public uint* node_stamps;      // per node page: the last frame the traversal reported it
     public uint root_count;
-    public uint pinned_pages;      // pages resident from mount; the others stream when `page_stamps` is set
+    public uint pinned_pages;      // pages resident from mount, all of them unless pages stream
     public SkinMeshGpu* skin;      // MESH_SKIN meshes: what skinned copies build from, else null
-    public uint* page_stamps;      // per page: the last frame the traversal reported it; null when every page is resident
     public EditGpu* edit;          // an edit's mesh: what stays at level 0; its copies always gather their cut
-    public uint* cut_stamps;       // per finer cut: the last frame it was reported in use, then wanted
+    public uint feedback_pages;    // the mesh page table entry the traversal's feedback reports page 0 at
+    public uint feedback_nodes;    // ...node page 0 at, the finer cuts following the node pages
     public uint fine_cuts;         // the first `fine_cuts` cached cuts need streamed pages: built once wanted, BLAS 0 until then
     public uint section_count;     // sections of the mesh, which a model's cage sections follow
     public uint opaque_sections;   // the sections of opaque class, as `PartGpu.sections`
