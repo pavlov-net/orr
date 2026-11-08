@@ -82,9 +82,12 @@ fn a_slab_passes_the_sun_to_the_floor_by_fresnel_and_beer_law() {
             ],
             lights: vec![Light::Directional(SUN)],
             environment: None,
-            eye: Vec3::new(0.0, 4.0, 0.01),
+            // Off the slab's footprint, so the eye sees the patch past the slab, not through it,
+            // and narrow, so the patch's pixels on the receding floor stay clear of the folded
+            // bands.
+            eye: Vec3::new(6.0, 4.0, 0.01),
             target: Vec3::ZERO,
-            fov_y: 0.6,
+            fov_y: 0.3,
             focus: None,
         };
         // Where the sun through `through_at`, in the slab's middle plane, meets the floor.
