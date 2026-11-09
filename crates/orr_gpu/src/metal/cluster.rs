@@ -39,7 +39,8 @@ use objc2_metal::{
     MTL4PrimitiveAccelerationStructureDescriptor, MTLAccelerationStructure,
     MTLAccelerationStructureDescriptor, MTLAccelerationStructureInstanceDescriptorType,
     MTLAccelerationStructureUsage, MTLAttributeFormat, MTLBuffer, MTLComputePipelineState,
-    MTLDevice, MTLIndexType, MTLResidencySet, MTLResource, MTLResourceOptions,
+    MTLDevice, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLIndexType,
+    MTLResidencySet, MTLResource, MTLResourceOptions, MTLStorageMode,
 };
 
 use super::command::CommandList;
@@ -179,13 +180,28 @@ impl Shared {
         let mut held = lock(&ids.held);
         if need > *held {
             let target = need.next_power_of_two().max(256);
+            // SAFETY: any size is valid to ask about.
+            let placed = unsafe {
+                self.device
+                    .heapAccelerationStructureSizeAndAlignWithSize(16)
+            };
+            let desc = MTLHeapDescriptor::new();
+            desc.setType(MTLHeapType::Placement);
+            desc.setStorageMode(MTLStorageMode::Private);
+            desc.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
+            desc.setSize(placed.size);
+            let heap = self
+                .device
+                .newHeapWithDescriptor(&desc)
+                .expect("newHeapWithDescriptor");
             // New IDs take the lowest free ones: the last of `target` structures has an ID
-            // at least `target - 1`, which makes the table hold `target`.
+            // at least `target - 1`, which makes the table hold `target`. They all alias one
+            // heap range because device allocations scan a free list per object, which takes
+            // minutes at a million structures.
             let mut throwaway = Vec::new();
             while (throwaway.len() as u64) < target {
-                let s = self
-                    .device
-                    .newAccelerationStructureWithSize(16)
+                // SAFETY: the structure fills the heap, and nothing builds or traces it.
+                let s = unsafe { heap.newAccelerationStructureWithSize_offset(16, 0) }
                     .expect("newAccelerationStructureWithSize");
                 let id = id_bits(s.gpuResourceID());
                 throwaway.push(s);
