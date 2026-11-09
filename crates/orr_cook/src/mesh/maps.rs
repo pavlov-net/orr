@@ -855,6 +855,22 @@ impl OpacityMap {
     }
 }
 
+/// A cooked normal map's mip 0, its stored x and y.
+pub(crate) struct NormalMap {
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) texels: [Arc<Vec<f32>>; 2],
+}
+
+impl NormalMap {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.texels
+            .iter()
+            .map(|t| (t.len() * size_of::<f32>()) as u64)
+            .sum()
+    }
+}
+
 /// An opacity texture's mip 0 under a section's cutoff.
 pub(crate) struct OpacityRead {
     pub(crate) mip0: Raster,

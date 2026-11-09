@@ -41,8 +41,8 @@ use crate::import::{PlacedModel, Scene};
 use crate::instances::{self, Catalog, ModelFacts, PageFrame};
 use crate::key::{self, Key};
 use crate::mesh::maps::{
-    Displacement, Emission, EmissionMap, Map, Opacity, OpacityMap, OpacityRead, Passes, Raster,
-    Reach, Tiles,
+    Displacement, Emission, EmissionMap, Map, NormalMap, Opacity, OpacityMap, OpacityRead, Passes,
+    Raster, Reach, Tiles,
 };
 use crate::mesh::{
     self, DisplacementSpec, DisplacementTexture, EmissionSpec, MapRead, MapSpec, MapTexture,
@@ -70,7 +70,7 @@ use crate::{
 /// Each of the [`DECODED_CACHES`] caches of decoded data holds up to this part of the working
 /// set, which the jobs' estimates leave free.
 const DECODED_SHARE: u64 = 16;
-const DECODED_CACHES: u64 = 3;
+const DECODED_CACHES: u64 = 4;
 
 /// Peak bytes of a subdivision cage cook per cage face, an estimate.
 const SUBD_BYTES_PER_FACE: u64 = 16 << 10;
@@ -86,9 +86,14 @@ const DAG_BYTES_PER_TRIANGLE: u64 = 180;
 
 /// Bytes a mesh cook holds per decoded texel channel of the maps its sections read
 /// ([`map_channels`]): an f32 each. Decoding them peaks at [`MAP_DECODE_BYTES_PER_CHANNEL`],
-/// before the geometry's peak. Both measured over the scene [`DAG_BYTES_PER_TRIANGLE`] names.
+/// while the mesh is read and before the geometry's peak. Both measured over the scene
+/// [`DAG_BYTES_PER_TRIANGLE`] names.
 const MAP_BYTES_PER_CHANNEL: u64 = 4;
 const MAP_DECODE_BYTES_PER_CHANNEL: u64 = 13;
+
+/// Peak bytes of reading a mesh per source triangle, which its maps decode beside: the most
+/// measured over the scene [`DAG_BYTES_PER_TRIANGLE`] names, 149 B.
+const LOAD_BYTES_PER_TRIANGLE: u64 = 150;
 
 pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
     let start = Instant::now();
@@ -109,6 +114,7 @@ pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
         images: Decoded::new(opts.working_set / DECODED_SHARE, Img::bytes),
         opacity: Decoded::new(opts.working_set / DECODED_SHARE, OpacityMap::bytes),
         emission: Decoded::new(opts.working_set / DECODED_SHARE, EmissionMap::bytes),
+        normals: Decoded::new(opts.working_set / DECODED_SHARE, NormalMap::bytes),
     };
     let threads = rayon::current_num_threads();
     let mut run = Run::new(manifest, opts, &shared)?;
@@ -143,6 +149,8 @@ struct Shared {
     opacity: Decoded<OpacityMap>,
     /// Cooked emission luminance by cook key, for the mesh jobs that read it.
     emission: Decoded<EmissionMap>,
+    /// Cooked normal maps' mip 0 by cook key, for the tangent checks that read them.
+    normals: Decoded<NormalMap>,
 }
 
 struct Unit<'m> {
@@ -911,9 +919,11 @@ impl<'m, 's> Run<'m, 's> {
             };
             let normals = settings.tangent_error_max.is_some();
             let channels = map_channels(source.sections(), normals, header);
-            let geometry = mesh_working_set(source.triangles(), settings);
-            self.units[u].working_set = (channels * MAP_DECODE_BYTES_PER_CHANNEL)
-                .max(geometry + channels * MAP_BYTES_PER_CHANNEL);
+            let triangles = source.triangles();
+            let load =
+                triangles * LOAD_BYTES_PER_TRIANGLE + channels * MAP_DECODE_BYTES_PER_CHANNEL;
+            let geometry = mesh_working_set(triangles, settings) + channels * MAP_BYTES_PER_CHANNEL;
+            self.units[u].working_set = load.max(geometry);
         }
         self.ready.insert((Reverse(self.units[u].working_set), u));
         Ok(())
@@ -2725,13 +2735,104 @@ fn subd_units(
     Ok(units)
 }
 
+/// Mip 0 of opacity texture `unit` (cook key `key`) under `cutoff`, from `cache` when held.
+fn opacity_map(
+    archives: &HashMap<String, Arc<Archive>>,
+    unit: &str,
+    key: Hash32,
+    cutoff: f32,
+    at: MapRead,
+    cache: &Decoded<OpacityMap>,
+) -> Result<Arc<OpacityMap>> {
+    cache.get((key, cutoff.to_bits()), || {
+        let mip0 = texture_mips(&archives[unit], AssetId::from_name(unit), false, at, 1)?.remove(0);
+        if mip0.w > u32::from(u16::MAX) {
+            return Err(Error::Texture {
+                asset: unit.to_string(),
+                message: format!("opacity texture {} texels wide, over 65535", mip0.w),
+            });
+        }
+        Ok(OpacityMap {
+            w: mip0.w,
+            h: mip0.h,
+            passes: Arc::new(Passes::new(&mip0, cutoff)),
+            texels: mip0.texels,
+        })
+    })
+}
+
+/// Mip 0 of normal map `unit` (cook key `key`), from `cache` when held.
+fn normal_map(
+    archives: &HashMap<String, Arc<Archive>>,
+    unit: &str,
+    key: Hash32,
+    at: MapRead,
+    cache: &Decoded<NormalMap>,
+) -> Result<Arc<NormalMap>> {
+    cache.get((key, 0), || {
+        let mips = texture_mips(&archives[unit], AssetId::from_name(unit), false, at, 2)?;
+        let [x, y]: [Raster; 2] = mips
+            .try_into()
+            .unwrap_or_else(|_| panic!("a mip of {unit} has two channels"));
+        Ok(NormalMap {
+            w: x.w,
+            h: x.h,
+            texels: [x.texels, y.texels],
+        })
+    })
+}
+
+/// Decodes into the caches the lone textures [`section_maps`] reads for `sections` through
+/// them, so it finds them there. Tile sets wait for the mesh: its uvs pick their tiles.
+fn decode_maps(
+    sections: &[SectionData],
+    archives: &HashMap<String, Arc<Archive>>,
+    normals: bool,
+    shared: &Shared,
+) -> Result<()> {
+    let _z = crate::profile::zone!("mesh.decode_maps");
+    for s in sections {
+        if let OpacitySpec::Texture {
+            texture,
+            cutoff,
+            read,
+            ..
+        } = &s.maps.opacity
+            && texture.tiles.is_empty()
+        {
+            opacity_map(
+                archives,
+                &texture.unit,
+                texture.key,
+                *cutoff,
+                *read,
+                &shared.opacity,
+            )?;
+        }
+        if let NormalSpec::Texture { texture, read, .. } = &s.maps.normal
+            && normals
+            && texture.tiles.is_empty()
+        {
+            normal_map(archives, &texture.unit, texture.key, *read, &shared.normals)?;
+        }
+        if let Some(e) = &s.maps.emission
+            && e.texture.tiles.is_empty()
+        {
+            let unit = &e.texture.unit;
+            shared.emission.get((e.texture.key, 0), || {
+                emission_map(&archives[unit], AssetId::from_name(unit))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// The cooked maps a mesh's sections read, from the archives holding their texture units.
 fn section_maps(
     m: &MeshData,
     archives: &HashMap<String, Arc<Archive>>,
     normals: bool,
-    opacity_maps: &Decoded<OpacityMap>,
-    emission_maps: &Decoded<EmissionMap>,
+    shared: &Shared,
 ) -> Result<Vec<SectionMaps>> {
     let _z = crate::profile::zone!("mesh.maps");
     let read = |unit: &str, all: bool, read, channels| {
@@ -2762,24 +2863,7 @@ fn section_maps(
                 uv_set,
             } => {
                 let texture_read = |unit: &str, key: Hash32, at: MapRead| {
-                    let map = opacity_maps.get((key, cutoff.to_bits()), || {
-                        let mip0 = read(unit, false, at, 1)?.remove(0);
-                        if mip0.w > u32::from(u16::MAX) {
-                            return Err(Error::Texture {
-                                asset: unit.to_string(),
-                                message: format!(
-                                    "opacity texture {} texels wide, over 65535",
-                                    mip0.w
-                                ),
-                            });
-                        }
-                        Ok(OpacityMap {
-                            w: mip0.w,
-                            h: mip0.h,
-                            passes: Arc::new(Passes::new(&mip0, *cutoff)),
-                            texels: mip0.texels,
-                        })
-                    })?;
+                    let map = opacity_map(archives, unit, key, *cutoff, at, &shared.opacity)?;
                     Ok(OpacityRead {
                         mip0: Raster {
                             w: map.w,
@@ -2845,9 +2929,16 @@ fn section_maps(
                 uv_set,
                 ..
             } if normals => {
-                let pair = |unit: &str, _, at| {
-                    let channels = read(unit, false, at, 2)?.try_into();
-                    Ok(channels.unwrap_or_else(|_| panic!("a mip of {unit} has two channels")))
+                let pair = |unit: &str, key, at: MapRead| {
+                    let map = normal_map(archives, unit, key, at, &shared.normals)?;
+                    Ok([0, 1].map(|c| Raster {
+                        w: map.w,
+                        h: map.h,
+                        texels: Arc::clone(&map.texels[c]),
+                        wrap: at.wrap,
+                        uv: at.uv,
+                        outside: at.outside[c],
+                    }))
                 };
                 let missing = |o: [f32; 4]| [Raster::solid(o[0]), Raster::solid(o[1])];
                 Some(read_map(texture, *at, uvs(*uv_set), pair, missing)?)
@@ -2862,7 +2953,7 @@ fn section_maps(
                 let y = luminance_weights(&archives[unit], AssetId::from_name(unit))?;
                 let luminance = |[r, g, b, _]: [f32; 4]| y.x * r + y.y * g + y.z * b;
                 let tile = |unit: &str, key: Hash32, at: MapRead| {
-                    let map = emission_maps.get((key, 0), || {
+                    let map = shared.emission.get((key, 0), || {
                         emission_map(&archives[unit], AssetId::from_name(unit))
                     })?;
                     Ok(Raster {
@@ -3154,16 +3245,29 @@ fn cook_unit(
             w.add(name, class, schema, key, &blobs)?;
         }
         Work::Mesh(source, settings, archives) => {
-            let mut data = source.read(name, &shared.memo)?;
+            // The tangent check reads normal maps, and every section reading one has
+            // tangents once they are computed.
+            let normals = settings.tangent_error_max.is_some();
+            let sections = source.sections().to_vec();
+            let job = crate::job::current();
+            let (data, decoded) = std::thread::scope(|s| {
+                let decode = s.spawn(|| {
+                    crate::profile::name_thread("cook maps");
+                    let _job = crate::job::enter(job);
+                    decode_maps(&sections, &archives, normals, shared)
+                });
+                let data = source.read(name, &shared.memo);
+                (data, decode.join().unwrap_or_else(|p| resume_unwind(p)))
+            });
+            let mut data = data?;
+            decoded?;
             let uv_warnings = data.pad_uv_sets();
             mesh::check(&data, &settings).map_err(|message| Error::Mesh {
                 asset: name.into(),
                 message,
             })?;
             data.compute_tangents();
-            // Only the tangent check reads normal maps.
-            let normals = data.tangents.is_some() && settings.tangent_error_max.is_some();
-            let maps = section_maps(&data, &archives, normals, &shared.opacity, &shared.emission)?;
+            let maps = section_maps(&data, &archives, normals, shared)?;
             drop(archives);
             let gdeflate = w.gdeflate();
             let compress = mesh::Compress {
