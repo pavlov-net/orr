@@ -9,7 +9,7 @@ use orr_pack::mesh::{
 };
 use serde::Deserialize;
 
-use super::maps::{self, FAIL, Map, Opacity, OpacityRead, PASS, Ranges, Raster};
+use super::maps::{self, FAIL, Map, Opacity, OpacityRead, PASS, Raster};
 use crate::texture::Wrap;
 
 const STATES: OpacityStates = OpacityStates::Four;
@@ -66,95 +66,6 @@ pub(super) struct OmmAlpha {
     alpha: Vec<u8>,
     w: u32,
     h: u32,
-    sides: Sides,
-}
-
-/// Tiles of `TILE`, `TILE`², ... texels a side, finest first: per tile, which sides of the
-/// cutoff its texels are on (`PASS`, `FAIL` or both).
-struct Sides {
-    levels: Vec<SideLevel>,
-}
-
-struct SideLevel {
-    tile: usize,
-    cols: usize,
-    flags: Vec<u8>,
-}
-
-impl Sides {
-    const TILE: usize = 8;
-    /// Most tiles one query reads at a level before it walks the texels instead.
-    const QUERY_MAX: usize = 4096;
-
-    fn new(alpha: &[u8], w: usize, h: usize) -> Self {
-        let (mut cols, mut rows) = (w.div_ceil(Self::TILE), h.div_ceil(Self::TILE));
-        let mut flags = vec![0u8; cols * rows];
-        flags
-            .par_chunks_mut(cols)
-            .zip(alpha.par_chunks(w * Self::TILE))
-            .for_each(|(out, band)| {
-                for row in band.chunks_exact(w) {
-                    for (x, &a) in row.iter().enumerate() {
-                        out[x / Self::TILE] |= if a >= 128 { PASS } else { FAIL };
-                    }
-                }
-            });
-        let mut levels = vec![SideLevel {
-            tile: Self::TILE,
-            cols,
-            flags,
-        }];
-        while cols > 1 || rows > 1 {
-            let fine = levels.last().expect("a level");
-            let (c, r) = (cols.div_ceil(Self::TILE), rows.div_ceil(Self::TILE));
-            let mut flags = vec![0u8; c * r];
-            for (y, row) in fine.flags.chunks_exact(cols).enumerate() {
-                let out = &mut flags[y / Self::TILE * c..][..c];
-                for (x, &f) in row.iter().enumerate() {
-                    out[x / Self::TILE] |= f;
-                }
-            }
-            levels.push(SideLevel {
-                tile: fine.tile * Self::TILE,
-                cols: c,
-                flags,
-            });
-            (cols, rows) = (c, r);
-        }
-        Self { levels }
-    }
-
-    /// `PASS` or `FAIL` when every texel in `xs` by `ys` is on that side; `None` when
-    /// tiles small enough to read hold both.
-    fn uniform(&self, [xs, ys]: &[Ranges; 2]) -> Option<u8> {
-        let ranges = |r: &Ranges| r.0.into_iter().filter(|r| r[0] <= r[1]);
-        for l in self.levels.iter().rev() {
-            let span = |r: &Ranges| -> usize {
-                ranges(r).map(|r| r[1] / l.tile - r[0] / l.tile + 1).sum()
-            };
-            if span(xs) * span(ys) > Self::QUERY_MAX {
-                return None;
-            }
-            let mut sides = 0;
-            'tiles: for y in ranges(ys) {
-                for x in ranges(xs) {
-                    for ty in y[0] / l.tile..=y[1] / l.tile {
-                        let row = &l.flags[ty * l.cols..];
-                        for &f in &row[x[0] / l.tile..=x[1] / l.tile] {
-                            sides |= f;
-                        }
-                        if sides == PASS | FAIL {
-                            break 'tiles;
-                        }
-                    }
-                }
-            }
-            if sides != PASS | FAIL {
-                return Some(sides);
-            }
-        }
-        None
-    }
 }
 
 impl OmmAlpha {
@@ -167,13 +78,16 @@ impl OmmAlpha {
         if mip0.w > Self::MAX_SIZE || mip0.h > Self::MAX_SIZE {
             return None;
         }
-        let alpha: Vec<u8> = mip0.texels.par_iter().map(|&t| remap(t, cutoff)).collect();
-        let sides = Sides::new(&alpha, mip0.w as usize, mip0.h as usize);
+        let alpha: Vec<u8> = mip0
+            .texels
+            .par_iter()
+            .light()
+            .map(|&t| remap(t, cutoff))
+            .collect();
         Some(Self {
             alpha,
             w: mip0.w,
             h: mip0.h,
-            sides,
         })
     }
 
@@ -211,14 +125,9 @@ impl<'a> OmmRead<'a> {
     fn sides(&self, tri: [[f32; 2]; 3]) -> u8 {
         let mip0 = &self.read.mip0;
         // Tiles on one side settle the footprint they hold without walking its texels.
-        // The tiles rarely settle a footprint narrower than 16 of them; the runs are cheaper.
         let ranges = mip0.footprint_ranges(tri);
-        let uniform = || ranges.and_then(|r| self.alpha.sides.uniform(&r));
-        let wide = ranges.is_some_and(|r| r.iter().any(|r| r.len() > 16 * Sides::TILE));
-        let sides = wide
-            .then(uniform)
-            .flatten()
-            .unwrap_or_else(|| self.read.passes.footprint(mip0, tri, PASS | FAIL));
+        let uniform = || ranges.and_then(|r| self.read.passes.uniform(&r));
+        let sides = uniform().unwrap_or_else(|| self.read.passes.footprint(mip0, tri, PASS | FAIL));
         // An empty footprint keeps the side its tiles are on.
         if sides == 0 {
             uniform().unwrap_or(0)
@@ -617,10 +526,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ClusterOmm, FAIL, Map, OMM_OPAQUE, OMM_STATE_OPAQUE, OMM_STATE_TRANSPARENT, OmmAlpha,
-        OmmRead, OmmSettings, Opacity, OpacityRead, PASS, cluster_omm, remap,
+        ClusterOmm, FAIL, Map, OMM_OPAQUE, OMM_STATE_OPAQUE, OMM_STATE_TRANSPARENT, OmmRead,
+        OmmSettings, Opacity, OpacityRead, PASS, cluster_omm, remap,
     };
-    use crate::mesh::maps::{Raster, Tiles};
+    use crate::mesh::maps::{Passes, Raster, Tiles};
     use crate::texture::Wrap;
 
     #[test]
@@ -648,7 +557,7 @@ mod tests {
         };
         for wrap in [Wrap::Repeat, Wrap::Clamp, Wrap::Mirror] {
             raster.wrap = [wrap, Wrap::Repeat];
-            let alpha = OmmAlpha::new(&raster, 0.5).unwrap();
+            let passes = Passes::new(&raster, 0.5);
             let mut settled = 0;
             for k in 0..4000 {
                 let size = [0.5, 0.05, 0.005][k % 3];
@@ -657,7 +566,7 @@ mod tests {
                 let Some(r) = raster.footprint_ranges(tri) else {
                     continue;
                 };
-                if let Some(side) = alpha.sides.uniform(&r) {
+                if let Some(side) = passes.uniform(&r) {
                     settled += 1;
                     let mut walked = 0;
                     raster.footprint(tri, |t| {

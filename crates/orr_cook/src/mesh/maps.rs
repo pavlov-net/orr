@@ -486,13 +486,25 @@ pub(super) const PASS: u8 = 1;
 pub(super) const FAIL: u8 = 2;
 
 /// Per row of an opacity mip, how many of its first `x` texels pass the cutoff, for every
-/// `x` up to the row's width.
+/// `x` up to the row's width; and tiles of 2, 4, 8, ... texels a side, finest first, each
+/// with the sides of the cutoff its texels are on (`PASS`, `FAIL` or both).
 pub(crate) struct Passes {
     prefix: Vec<u16>,
     cutoff: f32,
+    levels: Vec<SideLevel>,
+}
+
+struct SideLevel {
+    /// Texels a side, log2.
+    shift: u32,
+    cols: usize,
+    flags: Vec<u8>,
 }
 
 impl Passes {
+    /// Tiles one range of a footprint's box may span per axis at the level that settles it.
+    const SPAN_MAX: usize = 3;
+
     pub(crate) fn new(mip: &Raster, cutoff: f32) -> Self {
         assert!(
             mip.w <= u32::from(u16::MAX),
@@ -510,7 +522,88 @@ impl Passes {
                     *o = n;
                 }
             });
-        Self { prefix, cutoff }
+        let (mut cols, mut rows) = (w.div_ceil(2), (mip.h as usize).div_ceil(2));
+        let mut flags = vec![0u8; cols * rows];
+        flags
+            .par_chunks_mut(cols)
+            .zip(mip.texels.par_chunks(2 * w))
+            .for_each(|(out, band)| {
+                for row in band.chunks_exact(w) {
+                    for (x, &t) in row.iter().enumerate() {
+                        out[x / 2] |= if t >= cutoff { PASS } else { FAIL };
+                    }
+                }
+            });
+        let mut levels = vec![SideLevel {
+            shift: 1,
+            cols,
+            flags,
+        }];
+        while cols > 1 || rows > 1 {
+            let fine = levels.last().expect("a level");
+            let (c, r) = (cols.div_ceil(2), rows.div_ceil(2));
+            // A quarter of the level below, which took one pass over the texels.
+            let mut flags = vec![0u8; c * r];
+            for (y, row) in fine.flags.chunks_exact(cols).enumerate() {
+                let out = &mut flags[y / 2 * c..][..c];
+                for (x, &f) in row.iter().enumerate() {
+                    out[x / 2] |= f;
+                }
+            }
+            levels.push(SideLevel {
+                shift: fine.shift + 1,
+                cols: c,
+                flags,
+            });
+            (cols, rows) = (c, r);
+        }
+        Self {
+            prefix,
+            cutoff,
+            levels,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.prefix.len() * size_of::<u16>()
+            + self.levels.iter().map(|l| l.flags.len()).sum::<usize>()
+    }
+
+    /// `PASS` or `FAIL` when every texel in `xs` by `ys` is on that side; `None` when the
+    /// tiles that hold them, at the finest level where each range spans at most
+    /// [`Self::SPAN_MAX`] tiles a side, hold both.
+    pub(super) fn uniform(&self, [xs, ys]: &[Ranges; 2]) -> Option<u8> {
+        let ranges = |r: &Ranges| r.0.into_iter().filter(|r| r[0] <= r[1]);
+        let fits = |l: &SideLevel| {
+            ranges(xs)
+                .chain(ranges(ys))
+                .all(|r| (r[1] >> l.shift) - (r[0] >> l.shift) < Self::SPAN_MAX)
+        };
+        let l = self
+            .levels
+            .iter()
+            .find(|l| fits(l))
+            .unwrap_or_else(|| self.levels.last().expect("a level"));
+        let mut sides = 0;
+        for y in ranges(ys) {
+            for x in ranges(xs) {
+                for ty in y[0] >> l.shift..=y[1] >> l.shift {
+                    let row = &l.flags[ty * l.cols..];
+                    for &f in &row[x[0] >> l.shift..=x[1] >> l.shift] {
+                        sides |= f;
+                    }
+                }
+            }
+        }
+        (sides != PASS | FAIL).then_some(sides)
+    }
+
+    /// [`Self::footprint`], settled by the tiles when the box of texels that holds the
+    /// footprint lies on one side.
+    pub(super) fn sides(&self, mip: &Raster, uv: [[f32; 2]; 3], stop: u8) -> u8 {
+        mip.footprint_ranges(uv)
+            .and_then(|r| self.uniform(&r))
+            .unwrap_or_else(|| self.footprint(mip, uv, stop))
     }
 
     /// Which sides of the cutoff the texels `mip.footprint(uv)` visits are on, as `PASS`
@@ -543,11 +636,6 @@ impl Passes {
 pub(super) struct Ranges(pub(super) [[usize; 2]; 2]);
 
 impl Ranges {
-    /// Indices the ranges hold, counting overlaps twice.
-    pub(super) fn len(&self) -> usize {
-        self.0.iter().map(|r| (r[1] + 1).saturating_sub(r[0])).sum()
-    }
-
     fn all(n: u32) -> Self {
         Self([[0, n as usize - 1], [1, 0]])
     }
@@ -851,7 +939,7 @@ pub(crate) struct OpacityMap {
 
 impl OpacityMap {
     pub(crate) fn bytes(&self) -> u64 {
-        (self.texels.len() * size_of::<f32>() + self.passes.prefix.len() * size_of::<u16>()) as u64
+        (self.texels.len() * size_of::<f32>() + self.passes.bytes()) as u64
     }
 }
 
@@ -917,7 +1005,7 @@ impl Opacity {
         match self {
             Self::Constant(pass) => *pass,
             Self::Texture { map, .. } => map.parts(uv, |p| {
-                p.read.passes.footprint(&p.read.mip0, p.uv, FAIL) & FAIL == 0
+                p.read.passes.sides(&p.read.mip0, p.uv, FAIL) & FAIL == 0
             }),
             Self::Unknown => false,
         }
