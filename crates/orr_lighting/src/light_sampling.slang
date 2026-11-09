@@ -177,7 +177,9 @@ public struct LightSetGpu
     // Caster entries whose material could be a plane stack face (`stack_material`): with none,
     // no ray can meet a stack face, and directional lights' rays are not probed for one.
     public uint stack_entries;
-    public uint _pad2;
+    // Producer entries whose PTLAS instance takes MASK_PARTICLE rays: with none, no ray is
+    // traced for particles alone.
+    public uint particle_entries;
 }
 
 // Counts and statistics of one frame's scene pass, read back by the CPU.

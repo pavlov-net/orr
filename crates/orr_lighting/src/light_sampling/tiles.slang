@@ -3,6 +3,7 @@
 #include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.sampling;
+import orr_shaders.trace;
 import orr_pack.mesh;
 import orr_scene.hit;
 import orr_color.chromaticity;
@@ -55,9 +56,9 @@ static const uint SELECT_GROUP = 1024;
 
 groupshared float scan_w[SELECT_GROUP];
 groupshared uint scan_c[SELECT_GROUP];
-// Local lights, emissive entries and clusters kept, entries dropped, feedback pixels, and
-// stack entries.
-groupshared uint counts[6];
+// Local lights, emissive entries and clusters kept, entries dropped, feedback pixels,
+// stack entries and particle entries.
+groupshared uint counts[7];
 groupshared float environment_feedback;
 
 // Inclusive sums over the workgroup; `total` is the group's sum.
@@ -211,6 +212,13 @@ bool stack_entry(SceneRoot* s, uint e)
     return false;
 }
 
+// Whether producer entry `e` has an instance in the PTLAS that MASK_PARTICLE rays meet: the
+// mask its class gave it when it was written.
+bool particle_entry(SceneRoot* s, uint e)
+{
+    return s.producers[e].class_id == CLASS_PARTICLE && (s.producer_state[e].rt_flags & PRODUCER_RT_WRITTEN) != 0;
+}
+
 // The list of instance entry `e` (from `s.producer_capacity`) as `select` hands it to
 // sampling: its cooked set at the row its copy traces, or the list its traversal gathered.
 void instance_list(SceneRoot* s, uint e, inout EmissiveSelection sel)
@@ -260,7 +268,7 @@ void select(uint lane: SV_GroupIndex)
     SceneRoot* s = root.scene;
     uint lights = s.light_capacity;
     uint n = lights + s.producer_capacity + s.emissive_capacity;
-    if (lane < 6)
+    if (lane < 7)
         counts[lane] = 0;
     GroupMemoryBarrierWithGroupSync();
     bool environment = root.environment.mean.a > 0.0;
@@ -285,6 +293,8 @@ void select(uint lane: SV_GroupIndex)
             h = feedback(i);
             if (i >= lights && stack_entry(s, i - lights))
                 InterlockedAdd(counts[5], 1);
+            if (i >= lights && i - lights < s.producer_capacity && particle_entry(s, i - lights))
+                InterlockedAdd(counts[6], 1);
         }
         uint chunk_c;
         uint first = carry_c + scan_uint(lane, pooled, chunk_c) - pooled;
@@ -379,6 +389,7 @@ void select(uint lane: SV_GroupIndex)
     set.frame = root.frame;
     set.local_lights = counts[0];
     set.stack_entries = counts[5];
+    set.particle_entries = counts[6];
 
     float3 mean = root.environment.mean.rgb;
     float3 xyz = mul(REC2020_TO_XYZ, mean);

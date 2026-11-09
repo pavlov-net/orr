@@ -2016,7 +2016,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                 // every path ray that adds emission sees the proxies of sphere and rect lights,
                 // which cover nothing: a second trace finds them in front of the hit.
                 bool adds = count_bsdf && counted;
-                bool particles = record.particles() && !camera && (ray.chain || depth == 0);
+                bool particles = record.particles() && !camera && (ray.chain || depth == 0) && set.particle_entries > 0;
                 bool lights = !camera && adds && set.local_lights > 0;
                 if (particles || lights)
                 {
