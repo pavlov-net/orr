@@ -80,10 +80,17 @@ const SUBD_BYTES_PER_FACE: u64 = 16 << 10;
 /// bound.
 const MESH_BYTES_PER_TRIANGLE: u64 = 480;
 
-/// Peak bytes of a DAG mesh cook per source triangle besides its maps: the most measured on
-/// large meshes and a margin, since a job over its estimate takes working set others count
-/// on.
-const DAG_BYTES_PER_TRIANGLE: u64 = 180;
+/// Peak bytes of a DAG mesh cook past its read besides its maps, per source triangle and per
+/// source vertex, as vertices cost apart from triangles: fitted to the job peaks of a large
+/// scene's meshes that peaked past the read, a byte under a peak weighed far above a byte
+/// over it, since a job over its estimate takes working set others count on.
+const DAG_BYTES_PER_TRIANGLE: u64 = 57;
+const DAG_BYTES_PER_VERTEX: u64 = 215;
+
+/// Peak bytes a DAG mesh with subsurface sections adds per source triangle, as it cooks its
+/// groups in one batch for thickness to read every cluster: the least that covers meshes of
+/// few and of many vertices per triangle cooked with a subsurface material.
+const SUBSURFACE_BYTES_PER_TRIANGLE: u64 = 168;
 
 /// Bytes a mesh cook holds per decoded texel channel of the maps its sections read
 /// ([`map_channels`]): an f32 each. Textures decode one at a time, each taking
@@ -92,9 +99,10 @@ const DAG_BYTES_PER_TRIANGLE: u64 = 180;
 const MAP_BYTES_PER_CHANNEL: u64 = 4;
 const MAP_DECODE_BYTES_PER_CHANNEL: u64 = 9;
 
-/// Peak bytes of reading a mesh per source triangle, which its maps decode beside: the most
-/// measured.
-const LOAD_BYTES_PER_TRIANGLE: u64 = 150;
+/// Peak bytes of reading a mesh per source triangle and per source vertex, which its maps
+/// decode beside: fitted to the read peaks of a large scene's meshes as the DAG constants are.
+const LOAD_BYTES_PER_TRIANGLE: u64 = 140;
+const LOAD_BYTES_PER_VERTEX: u64 = 88;
 
 pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
     let start = Instant::now();
@@ -924,11 +932,12 @@ impl<'m, 's> Run<'m, 's> {
             };
             let normals = settings.tangent_error_max.is_some();
             let (channels, largest) = map_channels(source.sections(), normals, header);
-            let triangles = source.triangles();
             let held = channels * MAP_BYTES_PER_CHANNEL;
-            let load =
-                triangles * LOAD_BYTES_PER_TRIANGLE + held + largest * MAP_DECODE_BYTES_PER_CHANNEL;
-            let geometry = mesh_working_set(triangles, settings) + held;
+            let load = source.triangles() * LOAD_BYTES_PER_TRIANGLE
+                + source.vertices() * LOAD_BYTES_PER_VERTEX
+                + held
+                + largest * MAP_DECODE_BYTES_PER_CHANNEL;
+            let geometry = mesh_working_set(source, settings) + held;
             self.units[u].working_set = load.max(geometry);
         }
         self.ready.insert(self.ready_key(u));
@@ -2703,7 +2712,7 @@ fn geometry_units(
             name: m.name,
             class: Class::Mesh as u16,
             key,
-            working_set: mesh_working_set(triangles, &m.settings),
+            working_set: mesh_working_set(&m.mesh, &m.settings),
             triangles,
             work: Work::Mesh(m.mesh, m.settings, HashMap::new()),
             deps: m.deps,
@@ -3231,12 +3240,17 @@ fn texture_mips(
 }
 
 /// The estimated peak bytes of a mesh cook besides its maps.
-fn mesh_working_set(triangles: u64, settings: &MeshSettings) -> u64 {
-    triangles
-        * match settings.lod {
-            mesh::LodMode::Dag => DAG_BYTES_PER_TRIANGLE,
-            mesh::LodMode::Discrete { .. } => MESH_BYTES_PER_TRIANGLE,
+fn mesh_working_set(mesh: &MeshSource, settings: &MeshSettings) -> u64 {
+    let triangles = mesh.triangles();
+    match settings.lod {
+        mesh::LodMode::Dag => {
+            let subsurface = mesh.sections().iter().any(|s| s.subsurface);
+            triangles * DAG_BYTES_PER_TRIANGLE
+                + mesh.vertices() * DAG_BYTES_PER_VERTEX
+                + u64::from(subsurface) * triangles * SUBSURFACE_BYTES_PER_TRIANGLE
         }
+        mesh::LodMode::Discrete { .. } => triangles * MESH_BYTES_PER_TRIANGLE,
+    }
 }
 
 /// Texel channels [`section_maps`] decodes for these sections, each texture once per use:

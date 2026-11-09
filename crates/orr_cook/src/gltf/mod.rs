@@ -1045,6 +1045,7 @@ impl Imported<'_> {
         let m = src.doc.meshes().nth(mesh).expect("mesh index");
         let mut views = Vec::new();
         let mut groups: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut vertex_count = 0;
         let mut tangent_sets = Vec::new();
         let mut displaced = Vec::new();
         for prim in surfaces(&m) {
@@ -1056,6 +1057,7 @@ impl Imported<'_> {
                 Document::accessor_views(&a, &mut views);
             }
             let positions = prim.get(&Semantic::Positions).expect("a surface");
+            vertex_count += positions.count() as u64;
             let vertices = prim
                 .indices()
                 .map_or_else(|| positions.count(), |a| a.count());
@@ -1183,6 +1185,7 @@ impl Imported<'_> {
         let lazy = LazyMesh {
             sections,
             triangles: at as u64 / 3,
+            vertices: vertex_count,
             source: Hash32(*h.finalize().as_bytes()),
             load: Arc::new(load),
         };

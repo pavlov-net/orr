@@ -228,6 +228,8 @@ pub(crate) struct LazyMesh {
     /// Sections of the mesh `load` returns; the plan sets their maps.
     pub(crate) sections: Vec<SectionData>,
     pub(crate) triangles: u64,
+    /// Vertices of the source's primitives, which `load` reads.
+    pub(crate) vertices: u64,
     /// Hash of everything `load` reads, besides the sections.
     pub(crate) source: Hash32,
     /// Reads the mesh; its sections are left empty.
@@ -260,6 +262,13 @@ impl MeshSource {
         match self {
             Self::Data(m) => m.triangles(),
             Self::Lazy(l) => l.triangles,
+        }
+    }
+
+    pub(crate) fn vertices(&self) -> u64 {
+        match self {
+            Self::Data(m) => m.positions.len() as u64,
+            Self::Lazy(l) => l.vertices,
         }
     }
 
