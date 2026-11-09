@@ -356,13 +356,17 @@ pub(super) fn seams(
             *f = v;
             continue;
         }
-        let (f, v) = (*f as usize, v as usize);
-        let colors_differ = w.colors.as_ref().is_some_and(|c| c[f] != c[v]);
-        if colors_differ || w.uvs.iter().any(|u| u[f] != u[v]) {
+        if attributes_differ(w, *f, v) {
             seams[id as usize] = true;
         }
     }
     seams
+}
+
+/// Whether welded vertices `a` and `b` differ in uvs, in either set, or colors.
+pub(super) fn attributes_differ(w: &Welded, a: u32, b: u32) -> bool {
+    let (a, b) = (a as usize, b as usize);
+    w.colors.as_ref().is_some_and(|c| c[a] != c[b]) || w.uvs.iter().any(|u| u[a] != u[b])
 }
 
 /// Per position id below `positions`: whether more than one piece uses it, as on part and

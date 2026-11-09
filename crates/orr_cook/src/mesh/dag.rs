@@ -323,26 +323,51 @@ fn part_corners<'a>(
 /// Positions the stages share, which stay locked, and uv and section seams, which stay
 /// protected, by the ids below `positions` that the stages' corners (welded vertex, position
 /// id, section) name.
-fn borders<C: Iterator<Item = (u32, u32, u16)> + Clone>(
+fn borders<C: Iterator<Item = (u32, u32, u16)>>(
     w: &Welded,
     positions: usize,
-    stages: impl Iterator<Item = C> + Clone,
+    stages: impl Iterator<Item = C>,
 ) -> (Vec<bool>, Vec<bool>) {
     let _z = crate::profile::zone!("dag.borders");
-    let shared = lod::shared(positions, stages.clone().map(|c| c.map(|(_, id, _)| id)));
-    let corners = stages.clone().flatten().map(|(v, id, _)| (v, id));
-    let mut seams = lod::seams(w, positions, corners);
-    let _sections = crate::profile::zone!("dag.section_seams");
-    // Per position: the last stage that used it and its section there.
-    let mut used = vec![(u32::MAX, 0u16); positions];
+    /// What the corners so far say of a position.
+    #[derive(Copy, Clone)]
+    struct Seen {
+        /// The first stage and welded vertex to use it.
+        owner: u32,
+        first: u32,
+        /// The last stage to use it and its section there.
+        stage: u32,
+        section: u16,
+    }
+    let mut seen = vec![
+        Seen {
+            owner: u32::MAX,
+            first: 0,
+            stage: u32::MAX,
+            section: 0,
+        };
+        positions
+    ];
+    let (mut shared, mut seams) = (vec![false; positions], vec![false; positions]);
     for (si, corners) in stages.enumerate() {
         let si = si as u32;
-        for (_, id, section) in corners {
-            let u = &mut used[id as usize];
-            if u.0 != si {
-                *u = (si, section);
-            } else if u.1 != section {
-                seams[id as usize] = true;
+        for (v, id, section) in corners {
+            let (s, i) = (&mut seen[id as usize], id as usize);
+            if s.owner == u32::MAX {
+                *s = Seen {
+                    owner: si,
+                    first: v,
+                    stage: si,
+                    section,
+                };
+                continue;
+            }
+            shared[i] |= s.owner != si;
+            seams[i] |= lod::attributes_differ(w, s.first, v);
+            if s.stage != si {
+                (s.stage, s.section) = (si, section);
+            } else if s.section != section {
+                seams[i] = true;
             }
         }
     }
