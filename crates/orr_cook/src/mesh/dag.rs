@@ -280,7 +280,8 @@ fn stages(
         .zip(&ids)
         .map(|((sections, corners), ids)| {
             let _z = crate::profile::zone!("dag.build_merged_stage");
-            let input = merged_input(corners, ids, positions, attrs, &shared, &seams);
+            let welded = w.positions.len();
+            let input = merged_input(corners, ids, positions, welded, attrs, &shared, &seams);
             let mut groups = build(&input, w, &snap, options(sections[0]));
             for g in &mut groups {
                 g.error += m;
@@ -425,33 +426,40 @@ fn part_inputs(
 }
 
 /// The `clodBuild` input of a merged stage over `corners`, whose positions have the ids
-/// `ids` below `positions`: one vertex per position, attributes (`attrs`) and section, in
-/// the order the corners first use them.
+/// `ids` below `positions`: one vertex per position, attributes (`attrs` of its welded
+/// vertex, one of `welded`) and section, in the order the corners first use them.
 fn merged_input<K: std::hash::Hash + Eq>(
     corners: &[Corner],
     ids: &[u32],
     positions: usize,
+    welded: usize,
     attrs: impl Fn(u32) -> K,
     shared: &[bool],
     seams: &[bool],
 ) -> Input {
     let _z = crate::profile::zone!("dag.input");
-    let mut local_of: FxHashMap<([i32; 3], K, u16), u32> = FxHashMap::default();
+    // Per welded vertex, the id of its attributes among those the corners use.
+    let mut class_of = vec![u32::MAX; welded];
+    let mut classes: FxHashMap<K, u32> = FxHashMap::default();
+    let mut local_of: FxHashMap<(u32, u32, u16), u32> = FxHashMap::default();
     let mut first = vec![u32::MAX; positions];
     let mut input = Input::with_capacity(corners.len());
     for (&(v, cell, section), &id) in corners.iter().zip(ids) {
-        let l = *local_of
-            .entry((cell, attrs(v), section))
-            .or_insert_with(|| {
-                let f = &mut first[id as usize];
-                let stands = (*f != u32::MAX).then_some(*f);
-                let lock = lod::vertex_flags(id, shared, seams).bits();
-                let l = input.push(v, cell, section, lock, stands);
-                if stands.is_none() {
-                    *f = l;
-                }
-                l
-            });
+        let class = &mut class_of[v as usize];
+        if *class == u32::MAX {
+            let next = classes.len() as u32;
+            *class = *classes.entry(attrs(v)).or_insert(next);
+        }
+        let l = *local_of.entry((id, *class, section)).or_insert_with(|| {
+            let f = &mut first[id as usize];
+            let stands = (*f != u32::MAX).then_some(*f);
+            let lock = lod::vertex_flags(id, shared, seams).bits();
+            let l = input.push(v, cell, section, lock, stands);
+            if stands.is_none() {
+                *f = l;
+            }
+            l
+        });
         input.indices.push(l);
     }
     input
