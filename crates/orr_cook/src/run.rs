@@ -346,7 +346,7 @@ struct Write {
     working_set: u64,
     triangles: u64,
     detail: Option<Detail>,
-    waited: f64,
+    waited: Option<f64>,
 }
 
 enum WriteFrom {
@@ -1477,28 +1477,31 @@ impl<'m, 's> Run<'m, 's> {
                     .filter(|&u| !full || self.scratch[self.units[u].archive].is_some()),
             );
             // A unit that does not fit stays first in line while smaller ones that fit start.
-            let mut skipped = Vec::new();
+            let (mut skipped, mut passed) = (Vec::new(), 0);
+            let now = Instant::now();
             for u in candidates {
                 if running >= jobs {
                     break;
                 }
                 let ws = self.units[u].working_set;
+                if !self.ready.contains(&(Reverse(ws), u)) {
+                    continue;
+                }
                 if running > 0 && bytes + ws > budget {
                     skipped.push(u);
                     continue;
                 }
-                if self.ready.remove(&(Reverse(ws), u)) {
-                    running += 1;
-                    bytes += ws;
-                    let now = Instant::now();
-                    for &s in &skipped {
-                        self.passed.entry(s).or_insert(now);
-                    }
-                    if let Some(at) = self.passed.remove(&u) {
-                        self.waited.insert(u, now.duration_since(at).as_secs_f64());
-                    }
-                    self.spawn(scope, tx, u);
+                self.ready.remove(&(Reverse(ws), u));
+                running += 1;
+                bytes += ws;
+                passed = skipped.len();
+                if let Some(at) = self.passed.remove(&u) {
+                    self.waited.insert(u, now.duration_since(at).as_secs_f64());
                 }
+                self.spawn(scope, tx, u);
+            }
+            for &s in &skipped[..passed] {
+                self.passed.entry(s).or_insert(now);
             }
             crate::profile::plot!("jobs running", running as f64);
             crate::profile::plot!("jobs working set GiB", bytes as f64 / f64::from(1 << 30));
@@ -1762,7 +1765,7 @@ impl<'m, 's> Run<'m, 's> {
                     working_set: unit.working_set,
                     triangles: unit.triangles,
                     detail: self.details.remove(&u),
-                    waited: self.waited.remove(&u).unwrap_or(0.0),
+                    waited: self.waited.remove(&u),
                 };
                 self.units[u].state = State::Written(Some(d.from));
                 self.writing.insert(u, d.memory);
