@@ -756,6 +756,10 @@ pub(crate) fn cook(
         },
         stride: orr_pack::mesh::attr_stride(attributes) as usize,
     };
+    let closed: Vec<bool> = (0..sections.len())
+        .into_par_iter()
+        .map(|i| lod::closed(&w, &grid, i))
+        .collect();
     let mut built = match &s.lod {
         LodMode::Discrete { errors } => discrete(&cx, errors)?,
         LodMode::Dag => dag::cook(&cx).map_err(fail)?,
@@ -784,12 +788,7 @@ pub(crate) fn cook(
         .enumerate()
         .map(|(i, sec)| Section {
             material_slot: i as u16,
-            flags: sec.flags
-                | if lod::closed(&w, &grid, i) {
-                    Section::CLOSED
-                } else {
-                    0
-                },
+            flags: sec.flags | if closed[i] { Section::CLOSED } else { 0 },
             _pad: 0,
         })
         .collect();
@@ -1416,6 +1415,8 @@ struct Grid {
     truncate_bits: u8,
     cells: Vec<[i32; 3]>,
     floats: Vec<[f32; 3]>,
+    /// Per vertex: the first vertex at its grid position, the id of that position.
+    reps: Vec<u32>,
 }
 
 impl Grid {
@@ -1437,7 +1438,7 @@ impl Grid {
             max_abs = g.iter().fold(max_abs, |m, v| m.max(v.unsigned_abs()));
             cells.push(g);
         }
-        let floats = cells
+        let floats: Vec<[f32; 3]> = cells
             .iter()
             .map(|g| g.map(|v| (f64::from(v) * step) as f32))
             .collect();
@@ -1449,11 +1450,17 @@ impl Grid {
             m == own || m == own + 1,
             "grid exponent {own}, meshoptimizer {m}"
         );
+        // Grid positions are exact floats, so equal floats are equal cells.
+        let reps = meshopt::generate_position_remap(
+            &VertexDataAdapter::new(bytemuck::cast_slice(&floats), 12, 0)
+                .expect("positions are 12-byte vertices"),
+        );
         Ok(Self {
             k: k as i8,
             truncate_bits: (24 - (32 - max_abs.leading_zeros())) as u8,
             cells,
             floats,
+            reps,
         })
     }
 

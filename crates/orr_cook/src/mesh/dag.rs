@@ -27,7 +27,7 @@ use orr_pack::mesh::{
     PageHeader, PageInfo, Section, SurfaceClass, cluster_resident_len,
 };
 use orr_pack::{Span, Sphere};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use super::lod::{self, Parts, Welded};
 use super::{Built, ClusterData, Ctx, Grid, MeshSettings, page_triangles, store_page, write_page};
@@ -46,7 +46,34 @@ struct Input {
     cells: Vec<[i32; 3]>,
     sections: Vec<u16>,
     lock: Vec<u8>,
+    /// Per vertex, the first vertex at its position.
+    remap: Vec<u32>,
     indices: Vec<u32>,
+}
+
+impl Input {
+    fn with_capacity(corners: usize) -> Self {
+        Self {
+            welded: Vec::new(),
+            cells: Vec::new(),
+            sections: Vec::new(),
+            lock: Vec::new(),
+            remap: Vec::new(),
+            indices: Vec::with_capacity(corners),
+        }
+    }
+
+    /// Adds a vertex of welded vertex `v` at `cell` in `section` whose position the vertex
+    /// `first` stands for, the new one when it is `None`; returns it.
+    fn push(&mut self, v: u32, cell: [i32; 3], section: u16, lock: u8, first: Option<u32>) -> u32 {
+        let l = self.welded.len() as u32;
+        self.welded.push(v);
+        self.cells.push(cell);
+        self.sections.push(section);
+        self.lock.push(lock);
+        self.remap.push(first.unwrap_or(l));
+        l
+    }
 }
 
 struct DagCluster {
@@ -145,17 +172,22 @@ fn stages(
         .map(|((part, _), pieces)| (part, pieces))
         .collect();
     let corners = |pieces| part_corners(w, grid, pieces);
-    let (shared, seams) = borders(w, pieces.iter().map(|p| corners(p.1.as_slice())));
+    let (shared, seams) = borders(
+        w,
+        grid.reps.len(),
+        pieces.iter().map(|p| corners(p.1.as_slice())),
+    );
+    let inputs = part_inputs(w, grid, &pieces, &shared, &seams);
+    drop((shared, seams));
     let mut stages: Vec<Stage> = pieces
-        .par_iter()
-        .map(|(part, pieces)| {
+        .into_par_iter()
+        .zip(inputs)
+        .map(|((part, pieces), input)| {
             let _z = crate::profile::zone!("dag.build_stage");
-            let count = 3 * pieces.iter().map(|p| p.triangles.len()).sum::<usize>();
-            let key = |v, _, section| (v, section);
-            let input = input(corners(pieces), count, key, &shared, &seams);
             let sections: Vec<u16> = pieces.iter().map(|p| p.section).collect();
+            drop(pieces);
             Stage {
-                part: *part,
+                part,
                 groups: build(&input, w, &snap, options(sections[0])),
                 sections,
                 merged: false,
@@ -163,7 +195,6 @@ fn stages(
             }
         })
         .collect();
-    drop(pieces);
 
     let Some(m) = merge_error(s, parts) else {
         return stages;
@@ -195,8 +226,34 @@ fn stages(
             (sections, corners)
         })
         .collect();
+    // Dense ids of the positions the merged sources use.
+    let mut id_of: FxHashMap<[i32; 3], u32> = FxHashMap::default();
+    let ids: Vec<Vec<u32>> = sources
+        .iter()
+        .map(|(_, corners)| {
+            let next = |id_of: &FxHashMap<_, _>| id_of.len() as u32;
+            corners
+                .iter()
+                .map(|&(_, cell, _)| {
+                    let n = next(&id_of);
+                    *id_of.entry(cell).or_insert(n)
+                })
+                .collect()
+        })
+        .collect();
+    let positions = id_of.len();
+    drop(id_of);
     drop(_sources);
-    let (shared, seams) = borders(w, sources.iter().map(|s| s.1.iter().copied()));
+    let (shared, seams) = borders(
+        w,
+        positions,
+        sources.iter().zip(&ids).map(|((_, corners), ids)| {
+            corners
+                .iter()
+                .zip(ids)
+                .map(|(&(v, _, section), &id)| (v, id, section))
+        }),
+    );
     // Vertices of different parts join where they share a position, attributes and section.
     let attrs = |v: u32| {
         let v = v as usize;
@@ -220,15 +277,10 @@ fn stages(
     };
     let merged: Vec<Stage> = sources
         .par_iter()
-        .map(|(sections, corners)| {
+        .zip(&ids)
+        .map(|((sections, corners), ids)| {
             let _z = crate::profile::zone!("dag.build_merged_stage");
-            let input = input(
-                corners.iter().copied(),
-                corners.len(),
-                |v, cell, section| (cell, attrs(v), section),
-                &shared,
-                &seams,
-            );
+            let input = merged_input(corners, ids, positions, attrs, &shared, &seams);
             let mut groups = build(&input, w, &snap, options(sections[0]));
             for g in &mut groups {
                 g.error += m;
@@ -253,69 +305,128 @@ fn dilates(s: &MeshSettings, flags: u8) -> bool {
         && SurfaceClass::from_flags(flags) != Some(SurfaceClass::Dielectric)
 }
 
-/// The corners of a part stage's pieces, at their welded grid positions.
+/// The corners of a part stage's pieces: welded vertex, the id of its grid position (its
+/// [`Grid::reps`] entry) and section.
 fn part_corners<'a>(
     w: &'a Welded,
     grid: &'a Grid,
     pieces: &'a [lod::PieceTriangles],
-) -> impl Iterator<Item = Corner> + Clone + 'a {
+) -> impl Iterator<Item = (u32, u32, u16)> + Clone + 'a {
     pieces.iter().flat_map(move |p| {
         p.triangles.iter().flat_map(move |&t| {
             w.triangle(t as usize)
-                .map(|v| (v, grid.cells[v as usize], p.section))
+                .map(|v| (v, grid.reps[v as usize], p.section))
         })
     })
 }
 
 /// Positions the stages share, which stay locked, and uv and section seams, which stay
-/// protected.
-fn borders<C: Iterator<Item = Corner> + Clone>(
+/// protected, by the ids below `positions` that the stages' corners (welded vertex, position
+/// id, section) name.
+fn borders<C: Iterator<Item = (u32, u32, u16)> + Clone>(
     w: &Welded,
+    positions: usize,
     stages: impl Iterator<Item = C> + Clone,
-) -> (FxHashSet<[i32; 3]>, FxHashSet<[i32; 3]>) {
+) -> (Vec<bool>, Vec<bool>) {
     let _z = crate::profile::zone!("dag.borders");
-    let shared = lod::shared_cells(stages.clone().map(|c| c.map(|(_, cell, _)| cell)));
-    let mut seams = lod::seam_cells(w, stages.clone().flatten().map(|(v, cell, _)| (v, cell)));
+    let shared = lod::shared(positions, stages.clone().map(|c| c.map(|(_, id, _)| id)));
+    let corners = stages.clone().flatten().map(|(v, id, _)| (v, id));
+    let mut seams = lod::seams(w, positions, corners);
     let _sections = crate::profile::zone!("dag.section_seams");
-    for corners in stages {
-        let mut section_of: FxHashMap<[i32; 3], u16> = FxHashMap::default();
-        for (_, cell, section) in corners {
-            if *section_of.entry(cell).or_insert(section) != section {
-                seams.insert(cell);
+    // Per position: the last stage that used it and its section there.
+    let mut used = vec![(u32::MAX, 0u16); positions];
+    for (si, corners) in stages.enumerate() {
+        let si = si as u32;
+        for (_, id, section) in corners {
+            let u = &mut used[id as usize];
+            if u.0 != si {
+                *u = (si, section);
+            } else if u.1 != section {
+                seams[id as usize] = true;
             }
         }
     }
     (shared, seams)
 }
 
-/// A compact `clodBuild` input over `corners`, one vertex per distinct `key`; corners with
-/// different keys never share a vertex.
-fn input<K: std::hash::Hash + Eq>(
-    corners: impl Iterator<Item = Corner>,
-    count: usize,
-    key: impl Fn(u32, [i32; 3], u16) -> K,
-    shared: &FxHashSet<[i32; 3]>,
-    seams: &FxHashSet<[i32; 3]>,
+/// The `clodBuild` input of each part stage: one vertex per welded vertex and section, in
+/// the order the stage's corners first use them.
+fn part_inputs(
+    w: &Welded,
+    grid: &Grid,
+    stages: &[(u16, Vec<lod::PieceTriangles>)],
+    shared: &[bool],
+    seams: &[bool],
+) -> Vec<Input> {
+    let _z = crate::profile::zone!("dag.input");
+    let n = grid.reps.len();
+    // Per welded vertex: the last stage that numbered it, its section and vertex there.
+    let mut numbered = vec![(u32::MAX, 0u16, 0u32); n];
+    // Per position: the last stage that used it and its first vertex there.
+    let mut first = vec![(u32::MAX, 0u32); n];
+    let mut out = Vec::with_capacity(stages.len());
+    for (si, (_, pieces)) in stages.iter().enumerate() {
+        let si = si as u32;
+        let corners = 3 * pieces.iter().map(|p| p.triangles.len()).sum::<usize>();
+        let mut input = Input::with_capacity(corners);
+        // A welded vertex in a second section of the stage, which seams protect.
+        let mut more: FxHashMap<(u32, u16), u32> = FxHashMap::default();
+        for (v, id, section) in part_corners(w, grid, pieces) {
+            let mut add = |input: &mut Input| {
+                let f = &mut first[id as usize];
+                let stands = (f.0 == si).then_some(f.1);
+                let lock = lod::vertex_flags(id, shared, seams).bits();
+                let l = input.push(v, grid.cells[v as usize], section, lock, stands);
+                if stands.is_none() {
+                    *f = (si, l);
+                }
+                l
+            };
+            let at = &mut numbered[v as usize];
+            let l = if at.0 != si {
+                let l = add(&mut input);
+                *at = (si, section, l);
+                l
+            } else if at.1 == section {
+                at.2
+            } else {
+                *more.entry((v, section)).or_insert_with(|| add(&mut input))
+            };
+            input.indices.push(l);
+        }
+        out.push(input);
+    }
+    out
+}
+
+/// The `clodBuild` input of a merged stage over `corners`, whose positions have the ids
+/// `ids` below `positions`: one vertex per position, attributes (`attrs`) and section, in
+/// the order the corners first use them.
+fn merged_input<K: std::hash::Hash + Eq>(
+    corners: &[Corner],
+    ids: &[u32],
+    positions: usize,
+    attrs: impl Fn(u32) -> K,
+    shared: &[bool],
+    seams: &[bool],
 ) -> Input {
     let _z = crate::profile::zone!("dag.input");
-    let mut local_of: FxHashMap<K, u32> = FxHashMap::default();
-    let mut input = Input {
-        welded: Vec::new(),
-        cells: Vec::new(),
-        sections: Vec::new(),
-        lock: Vec::new(),
-        indices: Vec::with_capacity(count),
-    };
-    for (v, cell, section) in corners {
-        let l = *local_of.entry(key(v, cell, section)).or_insert_with(|| {
-            input.welded.push(v);
-            input.cells.push(cell);
-            input.sections.push(section);
-            input
-                .lock
-                .push(lod::vertex_flags(cell, shared, seams).bits());
-            input.welded.len() as u32 - 1
-        });
+    let mut local_of: FxHashMap<([i32; 3], K, u16), u32> = FxHashMap::default();
+    let mut first = vec![u32::MAX; positions];
+    let mut input = Input::with_capacity(corners.len());
+    for (&(v, cell, section), &id) in corners.iter().zip(ids) {
+        let l = *local_of
+            .entry((cell, attrs(v), section))
+            .or_insert_with(|| {
+                let f = &mut first[id as usize];
+                let stands = (*f != u32::MAX).then_some(*f);
+                let lock = lod::vertex_flags(id, shared, seams).bits();
+                let l = input.push(v, cell, section, lock, stands);
+                if stands.is_none() {
+                    *f = l;
+                }
+                l
+            });
         input.indices.push(l);
     }
     input
@@ -389,6 +500,7 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
         attributes: &normals,
         weights: &weights,
         lock: &input.lock,
+        remap: &input.remap,
     };
     super::clod::build(&config, mesh, &mut positions, |e| {
         group_of(&e, &input.welded, &input.sections, snap, max_indices)

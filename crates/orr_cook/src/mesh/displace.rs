@@ -264,9 +264,9 @@ pub(super) fn simplify(
         return;
     }
     let mut pieces = lod::pieces(w, parts);
-    let cell = |v: &u32| grid.cells[*v as usize];
-    let shared = lod::shared_cells(pieces.iter().map(|p| p.indices.iter().map(cell)));
-    let seams = lod::seam_cells(w, w.indices.iter().map(|v| (*v, cell(v))));
+    let (n, id) = (grid.reps.len(), |v: &u32| grid.reps[*v as usize]);
+    let shared = lod::shared(n, pieces.iter().map(|p| p.indices.iter().map(id)));
+    let seams = lod::seams(w, n, w.indices.iter().map(|v| (*v, id(v))));
     for p in &mut pieces {
         if baked[usize::from(p.section)] {
             p.indices = lod::simplify(&p.indices, w, grid, &shared, &seams, target, false).0;

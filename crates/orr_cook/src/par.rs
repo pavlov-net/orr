@@ -199,14 +199,25 @@ impl<T: Sync> ParSlice<T> for [T] {
     }
 }
 
-/// rayon's mutable slice iterators in the calling job.
+/// rayon's mutable slice iterators in the calling job, and its unstable sort, which
+/// allocates nothing to charge a job.
 pub(crate) trait ParSliceMut<T: Send> {
     fn par_chunks_mut(&mut self, size: usize) -> InJob<rayon::slice::ChunksMut<'_, T>>;
+    fn par_sort_unstable(&mut self)
+    where
+        T: Ord;
 }
 
 impl<T: Send> ParSliceMut<T> for [T] {
     fn par_chunks_mut(&mut self, size: usize) -> InJob<rayon::slice::ChunksMut<'_, T>> {
         InJob::new(ParallelSliceMut::par_chunks_mut(self, size))
+    }
+
+    fn par_sort_unstable(&mut self)
+    where
+        T: Ord,
+    {
+        ParallelSliceMut::par_sort_unstable(self);
     }
 }
 

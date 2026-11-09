@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use meshopt::{SimplifyOptions, SimplifyVertex, VertexDataAdapter, VertexStream};
 use orr_pack::Aabb;
 use orr_pack::mesh::Part;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
+
+use crate::par::prelude::*;
 
 use super::maps::Displacement;
 use super::{Grid, MeshData, MeshSettings, Pivots, Skin};
@@ -240,7 +242,8 @@ pub(crate) fn levels(
         })
         .collect();
     let mut out = vec![LevelGeometry { error: 0.0, pieces }];
-    let seams = seam_cells(w, w.indices.iter().map(|&v| (v, grid.cells[v as usize])));
+    let n = grid.reps.len();
+    let seams = seams(w, n, w.indices.iter().map(|&v| (v, grid.reps[v as usize])));
     let mergeable = parts.table.len() > 1;
     for (i, &target) in errors.iter().enumerate() {
         let level = i + 1;
@@ -263,10 +266,11 @@ pub(crate) fn levels(
         } else {
             prev.pieces.clone()
         };
-        let shared = shared_cells(
+        let shared = shared(
+            n,
             input
                 .iter()
-                .map(|p| p.indices.iter().map(|&v| grid.cells[v as usize])),
+                .map(|p| p.indices.iter().map(|&v| grid.reps[v as usize])),
         );
         let mut step_error = 0f32;
         let pieces = input
@@ -336,55 +340,62 @@ pub(crate) fn piece_triangles(w: &Welded, parts: &Parts) -> Vec<PieceTriangles> 
     out
 }
 
-/// Grid positions where corners (welded vertex, grid position) with different uvs, in
-/// either set, meet.
-pub(super) fn seam_cells(
+/// Per position id below `positions`: whether corners (welded vertex, position id) with
+/// different uvs, in either set, or colors meet there.
+pub(super) fn seams(
     w: &Welded,
-    corners: impl IntoIterator<Item = (u32, [i32; 3])>,
-) -> FxHashSet<[i32; 3]> {
-    let _z = crate::profile::zone!("mesh.seam_cells");
-    let mut first: FxHashMap<[i32; 3], u32> = FxHashMap::default();
-    let mut seams = FxHashSet::default();
-    for (v, cell) in corners {
-        let f = *first.entry(cell).or_insert(v);
-        let (f, v) = (f as usize, v as usize);
+    positions: usize,
+    corners: impl IntoIterator<Item = (u32, u32)>,
+) -> Vec<bool> {
+    let _z = crate::profile::zone!("mesh.seams");
+    let mut first = vec![u32::MAX; positions];
+    let mut seams = vec![false; positions];
+    for (v, id) in corners {
+        let f = &mut first[id as usize];
+        if *f == u32::MAX {
+            *f = v;
+            continue;
+        }
+        let (f, v) = (*f as usize, v as usize);
         let colors_differ = w.colors.as_ref().is_some_and(|c| c[f] != c[v]);
         if colors_differ || w.uvs.iter().any(|u| u[f] != u[v]) {
-            seams.insert(cell);
+            seams[id as usize] = true;
         }
     }
     seams
 }
 
-/// Grid positions used by more than one piece: part and section borders.
-pub(super) fn shared_cells<P: IntoIterator<Item = [i32; 3]>>(
+/// Per position id below `positions`: whether more than one piece uses it, as on part and
+/// section borders.
+pub(super) fn shared<P: IntoIterator<Item = u32>>(
+    positions: usize,
     pieces: impl IntoIterator<Item = P>,
-) -> FxHashSet<[i32; 3]> {
-    let _z = crate::profile::zone!("mesh.shared_cells");
-    let mut owner: FxHashMap<[i32; 3], usize> = FxHashMap::default();
-    let mut shared = FxHashSet::default();
-    for (pi, cells) in pieces.into_iter().enumerate() {
-        for c in cells {
-            if *owner.entry(c).or_insert(pi) != pi {
-                shared.insert(c);
+) -> Vec<bool> {
+    let _z = crate::profile::zone!("mesh.shared");
+    let mut owner = vec![u32::MAX; positions];
+    let mut shared = vec![false; positions];
+    for (pi, ids) in pieces.into_iter().enumerate() {
+        let pi = pi as u32;
+        for id in ids {
+            let o = &mut owner[id as usize];
+            if *o == u32::MAX {
+                *o = pi;
+            } else if *o != pi {
+                shared[id as usize] = true;
             }
         }
     }
     shared
 }
 
-/// Simplifier flags of a vertex at `cell`: locked on a shared position, protected on a
-/// seam.
-pub(super) fn vertex_flags(
-    cell: [i32; 3],
-    shared: &FxHashSet<[i32; 3]>,
-    seams: &FxHashSet<[i32; 3]>,
-) -> SimplifyVertex {
+/// Simplifier flags of a vertex at position id `id`: locked on a shared position, protected
+/// on a seam.
+pub(super) fn vertex_flags(id: u32, shared: &[bool], seams: &[bool]) -> SimplifyVertex {
     let mut f = SimplifyVertex::None;
-    if shared.contains(&cell) {
+    if shared[id as usize] {
         f |= SimplifyVertex::Lock;
     }
-    if seams.contains(&cell) {
+    if seams[id as usize] {
         f |= SimplifyVertex::Protect;
     }
     f
@@ -396,8 +407,8 @@ pub(super) fn simplify(
     indices: &[u32],
     w: &Welded,
     grid: &Grid,
-    shared: &FxHashSet<[i32; 3]>,
-    seams: &FxHashSet<[i32; 3]>,
+    shared: &[bool],
+    seams: &[bool],
     target: f32,
     sloppy: bool,
 ) -> (Vec<u32>, f32) {
@@ -417,7 +428,7 @@ pub(super) fn simplify(
     let normals: Vec<f32> = global.iter().flat_map(|&v| w.normals[v as usize]).collect();
     let locks: Vec<SimplifyVertex> = global
         .iter()
-        .map(|&v| vertex_flags(grid.cells[v as usize], shared, seams))
+        .map(|&v| vertex_flags(grid.reps[v as usize], shared, seams))
         .collect();
     let adapter = VertexDataAdapter::new(bytemuck::cast_slice(&positions), 12, 0)
         .expect("positions are 12-byte vertices");
@@ -472,21 +483,21 @@ pub(super) fn displacement_seams(
     };
     let _z = crate::profile::zone!("mesh.displacement_seams");
     let tolerance = (d.max - d.min) / 1024.0;
-    let mut heights: FxHashMap<[i32; 3], [f32; 2]> = FxHashMap::default();
+    // Per position: the least and most height its corners read.
+    let mut heights = vec![[f32::INFINITY, f32::NEG_INFINITY]; grid.reps.len()];
     for t in w.section_triangles(s) {
         let uv = t.map(|v| w.uvs[d.uv_set][v as usize]);
         for (k, &v) in t.iter().enumerate() {
             let (height, _) = d.corner(map, uv, k);
-            let e = heights
-                .entry(grid.cells[v as usize])
-                .or_insert([height, height]);
+            let e = &mut heights[grid.reps[v as usize] as usize];
             *e = [e[0].min(height), e[1].max(height)];
         }
     }
     let mut bad: Vec<[i32; 3]> = heights
         .iter()
+        .enumerate()
         .filter(|(_, [lo, hi])| hi - lo > tolerance)
-        .map(|(c, _)| *c)
+        .map(|(id, _)| grid.cells[id])
         .collect();
     if bad.is_empty() {
         return Vec::new();
@@ -510,32 +521,44 @@ pub(super) fn displacement_seams(
 /// as often in one direction as in the other.
 pub(super) fn closed(w: &Welded, grid: &Grid, s: usize) -> bool {
     let _z = crate::profile::zone!("mesh.closed");
-    let mut uses: FxHashMap<([i32; 3], [i32; 3]), i32> = FxHashMap::default();
-    let mut any = false;
-    for t in w.section_triangles(s) {
-        let c = t.map(|v| grid.cells[v as usize]);
-        if c[0] == c[1] || c[1] == c[2] || c[0] == c[2] {
-            continue;
-        }
-        any = true;
-        for i in 0..3 {
-            let (a, b) = (c[i], c[(i + 1) % 3]);
-            *uses.entry((a.min(b), a.max(b))).or_default() += if a < b { 1 } else { -1 };
-        }
+    // Directed edges between position ids, from triangles over three positions.
+    let mut edges: Vec<u64> = w
+        .section_triangles(s)
+        .map(|t| t.map(|v| grid.reps[v as usize]))
+        .filter(|p| p[0] != p[1] && p[1] != p[2] && p[0] != p[2])
+        .flat_map(|p| (0..3).map(move |i| u64::from(p[i]) << 32 | u64::from(p[(i + 1) % 3])))
+        .collect();
+    if edges.is_empty() {
+        return false;
     }
-    any && uses.values().all(|&n| n == 0)
+    edges.par_sort_unstable();
+    let count = |e: u64| {
+        let start = edges.partition_point(|&x| x < e);
+        edges[start..].partition_point(|&x| x == e)
+    };
+    // Each run of equal edges, at its first, against the run of the edge reversed.
+    (0..edges.len()).into_par_iter().all(|i| {
+        let e = edges[i];
+        (i > 0 && edges[i - 1] == e) || count(e) == count(e.rotate_left(32))
+    })
 }
 
 /// Edges of section `s` used by one triangle, by grid position.
 pub(super) fn border_edges(w: &Welded, grid: &Grid, s: usize) -> usize {
     let _z = crate::profile::zone!("mesh.border_edges");
-    let mut uses: FxHashMap<([i32; 3], [i32; 3]), u32> = FxHashMap::default();
-    for t in w.section_triangles(s) {
-        let c = t.map(|v| grid.cells[v as usize]);
-        for i in 0..3 {
-            let (a, b) = (c[i], c[(i + 1) % 3]);
-            *uses.entry(if a < b { (a, b) } else { (b, a) }).or_default() += 1;
-        }
-    }
-    uses.values().filter(|&&n| n == 1).count()
+    let mut edges: Vec<u64> = w
+        .section_triangles(s)
+        .map(|t| t.map(|v| grid.reps[v as usize]))
+        .flat_map(|p| {
+            (0..3).map(move |i| {
+                let (a, b) = (p[i], p[(i + 1) % 3]);
+                u64::from(a.min(b)) << 32 | u64::from(a.max(b))
+            })
+        })
+        .collect();
+    edges.par_sort_unstable();
+    edges
+        .chunk_by(|a, b| a == b)
+        .filter(|run| run.len() == 1)
+        .count()
 }

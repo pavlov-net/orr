@@ -33,12 +33,14 @@ impl Cluster {
     }
 }
 
-/// The mesh `build` reads besides its positions: 3 floats of attributes per vertex.
+/// The mesh `build` reads besides its positions: 3 floats of attributes per vertex, and per
+/// vertex the first vertex at its position, as `meshopt_generatePositionRemap` gives it.
 pub(super) struct Mesh<'a> {
     pub(super) indices: &'a [u32],
     pub(super) attributes: &'a [f32],
     pub(crate) weights: &'a [f32],
     pub(super) lock: &'a [u8],
+    pub(super) remap: &'a [u32],
 }
 
 /// Positions that groups of one level write at disjoint unlocked vertices.
@@ -526,18 +528,12 @@ pub(super) fn build<G: Send>(
         "clusterlod options the port leaves out"
     );
     let vertex_count = positions.len() / 3;
-    let remap_zone = crate::profile::zone!("clod.remap");
-    let mut remap = vec![0u32; vertex_count];
-    // SAFETY: one position per vertex.
-    unsafe {
-        ffi::meshopt_generatePositionRemap(
-            remap.as_mut_ptr(),
-            positions.as_ptr(),
-            vertex_count,
-            12,
-        );
-    }
-    drop(remap_zone);
+    let remap = mesh.remap;
+    assert_eq!(
+        remap.len(),
+        vertex_count,
+        "a position remap entry per vertex"
+    );
     let mut locks = vec![0u8; vertex_count];
     let positions = Positions(positions.as_mut_ptr(), positions.len());
     let mut out = Vec::new();
@@ -561,14 +557,14 @@ pub(super) fn build<G: Send>(
     let mut depth = 0u32;
     while clusters.len() > 1 {
         let _z = crate::profile::zone!("clod.level");
-        let offsets = partition(&mut clusters, c, positions.read(), &cluster_indices, &remap);
+        let offsets = partition(&mut clusters, c, positions.read(), &cluster_indices, remap);
         let lock = crate::profile::zone!("clod.lock");
         lock_boundary(
             &mut locks,
             &clusters,
             &offsets,
             &cluster_indices,
-            &remap,
+            remap,
             mesh.lock,
         );
         drop(lock);
@@ -613,14 +609,7 @@ pub(super) fn build<G: Send>(
                     + error * c.simplify_error_merge_additive;
                 let g = emitted(bounds);
                 if c.simplify_dilate_borders {
-                    dilate_borders(
-                        &positions,
-                        &merged,
-                        &simplified,
-                        &locks,
-                        &remap,
-                        &mut bounds,
-                    );
+                    dilate_borders(&positions, &merged, &simplified, &locks, remap, &mut bounds);
                 }
                 let (mut next, mut next_indices) = (Vec::new(), Vec::new());
                 clusterize(
