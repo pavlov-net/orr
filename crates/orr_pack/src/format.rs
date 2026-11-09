@@ -96,6 +96,11 @@ impl Header {
     pub fn index_offset(&self) -> u64 {
         self.file_len - u64::from(self.index_len)
     }
+
+    /// Where payload blobs lie: past the header's page, before the index range.
+    pub fn payload(&self) -> std::ops::Range<u64> {
+        PAGE..self.index_offset()
+    }
 }
 
 impl Blob {
@@ -303,7 +308,8 @@ pub(crate) fn validate(h: &Header, index: &[u8]) -> Result<Layout> {
         let placed = if b.is_mount() {
             b.offset >= mount.start && end <= mount.end
         } else {
-            b.offset.is_multiple_of(PAGE) && b.offset >= PAGE && end <= h.index_offset()
+            let payload = h.payload();
+            b.offset.is_multiple_of(PAGE) && b.offset >= payload.start && end <= payload.end
         };
         if !placed {
             return Err(Error::Malformed("blob outside its section"));
