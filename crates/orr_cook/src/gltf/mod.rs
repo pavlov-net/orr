@@ -1148,7 +1148,6 @@ impl Imported<'_> {
                 Document::accessor_views(&a, &mut views);
             }
             let positions = prim.get(&Semantic::Positions).expect("a surface");
-            vertex_count += positions.count() as u64;
             let vertices = prim
                 .indices()
                 .map_or_else(|| positions.count(), |a| a.count());
@@ -1160,6 +1159,11 @@ impl Imported<'_> {
                 let what = format!("mesh {mesh} primitive {}", prim.index());
                 return Err(self.fail(format!("{what}: bad index list")));
             }
+            // Without normals, a primitive takes a vertex per corner.
+            vertex_count += match prim.get(&Semantic::Normals) {
+                Some(_) => positions.count(),
+                None => count,
+            } as u64;
             *groups.entry(material_index(&prim)).or_default() += count as u64;
         }
         let checked = self.record(&mut views)?;

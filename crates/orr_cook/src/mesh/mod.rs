@@ -228,7 +228,7 @@ pub(crate) struct LazyMesh {
     /// Sections of the mesh `load` returns; the plan sets their maps.
     pub(crate) sections: Vec<SectionData>,
     pub(crate) triangles: u64,
-    /// Vertices of the source's primitives, which `load` reads.
+    /// Vertices of the mesh `load` returns, besides the copies its tangents add.
     pub(crate) vertices: u64,
     /// Hash of everything `load` reads, besides the sections.
     pub(crate) source: Hash32,
