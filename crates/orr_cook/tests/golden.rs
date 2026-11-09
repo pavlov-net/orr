@@ -25,17 +25,17 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     (
         Class::Mesh as u16,
         17,
-        "8da77882c2c5e1e01a39f785bcefb6eb7fa6e1dcd42658b1b8c8bb202c9eea0e",
+        "2fc123946f1f4e0f936db90631ae83b3b99893e4ed4572dbbefbd3dcb77b08c8",
     ),
     (
         Class::Material as u16,
         11,
-        "edeb9aa4a04caf030732f6c31307b6578322e9d0a1b7d73ece457fe0223e17e1",
+        "331006336e726360d430c6f64f05fb32191ceba5a496942261396a18cdd414e8",
     ),
     (
         Class::Model as u16,
         3,
-        "f88a9bd90ab88d29ffab4f1e5b374b686704e3bbee80f0808c8017d103883757",
+        "59bb63af5e4d5e7730cdb0f2fe30eb8494af01c027cc804883efc9598be430f9",
     ),
     (
         Class::Texture as u16,
@@ -73,6 +73,63 @@ const GOLDEN: &[(u16, u32, &str)] = &[
         "4ba4fdc45927952e6db847bca8db82d192871fc2f541209f7c4f776ada77d9e4",
     ),
 ];
+
+/// A 32 x 32 quad height grid in two sections, 4 x 4 quad blocks of each in a checkerboard, so
+/// a DAG of it has clusters of each section and clusters that mix them.
+fn sections_grid_glb() -> std::path::PathBuf {
+    const N: u32 = 32;
+    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("golden-grid.glb");
+    let mut bin = Vec::new();
+    for y in 0..=N {
+        for x in 0..=N {
+            let z = ((x * x + 3 * y) % 7) as f32 * 0.03125;
+            bin.extend_from_slice(bytemuck::cast_slice(&[x as f32 * 0.25, z, y as f32 * 0.25]));
+        }
+    }
+    let mut sections = [Vec::new(), Vec::new()];
+    for y in 0..N {
+        for x in 0..N {
+            let v = y * (N + 1) + x;
+            let s = &mut sections[((x / 4 + y / 4) % 2) as usize];
+            s.extend_from_slice(&[v, v + N + 1, v + 1, v + 1, v + N + 1, v + N + 2]);
+        }
+    }
+    let positions = bin.len();
+    for s in &sections {
+        bin.extend_from_slice(bytemuck::cast_slice(s));
+    }
+    let count = sections[0].len();
+    let json = format!(
+        r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1,"material":0}},{{"attributes":{{"POSITION":0}},"indices":2,"material":1}}]}}],
+"materials":[{{"name":"a"}},{{"name":"b"}}],
+"buffers":[{{"byteLength":{len}}}],
+"bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":{positions}}},{{"buffer":0,"byteOffset":{positions},"byteLength":{indices}}}],
+"accessors":[{{"bufferView":0,"componentType":5126,"count":{verts},"type":"VEC3","min":[0,0,0],"max":[{max},{zmax},{max}]}},
+ {{"bufferView":1,"byteOffset":0,"componentType":5125,"count":{count},"type":"SCALAR"}},
+ {{"bufferView":1,"byteOffset":{half},"componentType":5125,"count":{count},"type":"SCALAR"}}]}}"#,
+        len = bin.len(),
+        indices = bin.len() - positions,
+        verts = (N + 1) * (N + 1),
+        max = N as f32 * 0.25,
+        zmax = 6.0 * 0.03125,
+        half = count * 4,
+    );
+    let mut json = json.into_bytes();
+    json.resize(json.len().next_multiple_of(4), b' ');
+    let mut glb = Vec::new();
+    glb.extend_from_slice(b"glTF");
+    glb.extend_from_slice(&2u32.to_le_bytes());
+    glb.extend_from_slice(&((12 + 8 + json.len() + 8 + bin.len()) as u32).to_le_bytes());
+    glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&json);
+    glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"BIN\0");
+    glb.extend_from_slice(&bin);
+    std::fs::write(&path, glb).unwrap();
+    path
+}
 
 #[test]
 fn cooked_bytes_match_their_cook_versions() {
@@ -121,6 +178,19 @@ fn cooked_bytes_match_their_cook_versions() {
                     name: "block-dag".into(),
                     source: Source::Gltf {
                         path: common::block_glb(),
+                        settings: GltfSettings {
+                            mesh: MeshSettings {
+                                lod: LodMode::Dag,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    },
+                },
+                AssetSpec {
+                    name: "grid-dag".into(),
+                    source: Source::Gltf {
+                        path: sections_grid_glb(),
                         settings: GltfSettings {
                             mesh: MeshSettings {
                                 lod: LodMode::Dag,
