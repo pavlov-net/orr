@@ -52,7 +52,8 @@ impl ClusterBounds {
             .map(|&p| p.distance(center))
             .fold(0.0, f64::max);
         let (mut area, mut weighted, mut sum) = (0.0, 0.0, DVec3::ZERO);
-        let mut faces = Vec::with_capacity(tris.len());
+        let mut faces = [DVec3::ZERO; 128];
+        let mut nf = 0;
         for t in tris {
             let p = t.map(|i| positions[usize::from(i)]);
             let n = (p[1] - p[0]).cross(p[2] - p[0]);
@@ -63,11 +64,12 @@ impl ClusterBounds {
             area += a;
             weighted += a * emission.map_or(1.0, |(e, uvs)| e.mean(t.map(|i| uvs[usize::from(i)])));
             sum += n;
-            faces.push(n / (2.0 * a));
+            faces[nf] = n / (2.0 * a);
+            nf += 1;
         }
         let axis = sum.normalize_or(DVec3::Z);
         let cos = if sum.length() > 0.0 {
-            faces.iter().map(|f| f.dot(axis)).fold(1.0, f64::min)
+            faces[..nf].iter().map(|f| f.dot(axis)).fold(1.0, f64::min)
         } else {
             -1.0
         };

@@ -887,14 +887,26 @@ impl Ctx<'_> {
         let (verts, cells) = (&by_order[..n], &cells_by_order[..n]);
         let sec = &self.sections[usize::from(section)];
         let section_maps = &self.maps[usize::from(section)];
-        let uv: Vec<ClusterUvs> = w.uvs.iter().map(|u| ClusterUvs::new(u, verts)).collect();
-        let stored = |set: usize| -> Vec<[f32; 2]> {
-            let at = |&v: &u32| uv[set].stored(w.uvs[set][v as usize]);
-            verts.iter().map(at).collect()
+        let mut uv = [ClusterUvs::ZERO; 2];
+        for (r, u) in uv.iter_mut().zip(&w.uvs) {
+            *r = ClusterUvs::new(u, verts);
+        }
+        let uv = &uv[..w.uvs.len()];
+        // The uvs of set `set` as the page stores them, per cluster vertex.
+        let stored = |set: usize| {
+            let mut out = [[0.0f32; 2]; MAX_CLUSTER_VERTICES];
+            for (o, &v) in out.iter_mut().zip(verts) {
+                *o = uv[set].stored(w.uvs[set][v as usize]);
+            }
+            out
         };
         let uvs = stored(section_maps.opacity.as_ref().map_or(0, Opacity::uv_set));
-        let opaque = partition_opaque(&uvs, &mut tris, section_maps.opacity.as_ref());
+        let opaque = {
+            let _z = crate::profile::zone!("mesh.cluster.opaque");
+            partition_opaque(&uvs[..n], &mut tris, section_maps.opacity.as_ref())
+        };
         let flat = if sec.flags & Section::CASTER != 0 {
+            let _z = crate::profile::zone!("mesh.cluster.flat");
             partition_flat(
                 w,
                 self.grid,
@@ -906,27 +918,34 @@ impl Ctx<'_> {
             0
         };
         stored_corner_order(&mut tris);
-        let mut c = build_cluster(w, self.grid, verts, cells, &tris, sec.flags, &uv);
+        let mut c = build_cluster(w, self.grid, verts, cells, tris, sec.flags, uv);
         if sec.flags & (Section::EMISSIVE | Section::CASTER) != 0 {
+            let _z = if section_maps.emission.is_some() {
+                crate::profile::zone!("mesh.cluster.emission")
+            } else {
+                crate::profile::zone!("mesh.cluster.bounds")
+            };
             let step = self.grid.step();
-            let positions: Vec<DVec3> = cells
-                .iter()
-                .map(|g| DVec3::from(g.map(|v| f64::from(v) * step)))
-                .collect();
+            let mut positions = [DVec3::ZERO; MAX_CLUSTER_VERTICES];
+            for (p, g) in positions.iter_mut().zip(cells) {
+                *p = DVec3::from(g.map(|v| f64::from(v) * step));
+            }
+            let mut emission_uvs = [[0.0f32; 2]; MAX_CLUSTER_VERTICES];
             let emission = section_maps.emission.as_ref().map(|e| {
-                let uvs: Vec<[f32; 2]> =
-                    verts.iter().map(|&v| w.uvs[e.uv_set][v as usize]).collect();
-                (e, uvs)
+                for (o, &v) in emission_uvs.iter_mut().zip(verts) {
+                    *o = w.uvs[e.uv_set][v as usize];
+                }
+                (e, &emission_uvs[..n])
             });
             c.bounds = Some(sets::ClusterBounds::new(
-                &positions,
-                tris.as_chunks::<3>().0,
-                emission.as_ref().map(|(e, uvs)| (*e, uvs.as_slice())),
+                &positions[..n],
+                c.tris.as_chunks::<3>().0,
+                emission,
             ));
         }
         c.record.flat_triangles = flat;
         if self.s.omm.is_some() && section_maps.opacity.is_some() && sec.takes_micromaps() {
-            c.uvs = uvs;
+            c.uvs = uvs[..n].to_vec();
         }
         c.record.section = section;
         c.record.part = part;
@@ -948,7 +967,7 @@ impl Ctx<'_> {
             let bounds = |d: &Displacement| {
                 let stored = stored(d.uv_set);
                 let at = |i: u8| stored[usize::from(i)];
-                d.bounds(tris.as_chunks::<3>().0.iter().map(|t| t.map(at)))
+                d.bounds(c.tris.as_chunks::<3>().0.iter().map(|t| t.map(at)))
             };
             let [lo, hi] = bounds(d);
             // A move across the surface is no longer than these, in any direction.
@@ -1286,19 +1305,32 @@ fn partition_opaque(uvs: &[[f32; 2]], tris: &mut [u8], opacity: Option<&Opacity>
     let Some(opacity) = opacity else {
         return n as u8;
     };
-    let (mut opaque, mut tested) = (Vec::with_capacity(n * 3), Vec::with_capacity(n * 3));
-    for t in tris.as_chunks::<3>().0 {
-        let uv = t.map(|i| uvs[usize::from(i)]);
-        if opacity.opaque(uv) {
-            opaque.extend_from_slice(t);
-        } else {
-            tested.extend_from_slice(t);
+    let mut opaque = [false; MAX_CLUSTER_CORNERS / 3];
+    for (o, t) in opaque.iter_mut().zip(tris.as_chunks::<3>().0) {
+        *o = opacity.opaque(t.map(|i| uvs[usize::from(i)]));
+    }
+    stable_partition(tris, &opaque[..n])
+}
+
+/// Moves the triangles marked in `first` ahead of the rest, each side in order; returns how
+/// many are marked.
+fn stable_partition(tris: &mut [u8], first: &[bool]) -> u8 {
+    let mut out = [0u8; MAX_CLUSTER_CORNERS];
+    let mut k = 0;
+    for pass in [true, false] {
+        for (t, _) in tris
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(first)
+            .filter(|(_, f)| **f == pass)
+        {
+            out[k..k + 3].copy_from_slice(t);
+            k += 3;
         }
     }
-    let first = opaque.len() / 3;
-    opaque.extend_from_slice(&tested);
-    tris.copy_from_slice(&opaque);
-    first as u8
+    tris.copy_from_slice(&out[..tris.len()]);
+    first.iter().filter(|&&f| f).count() as u8
 }
 
 /// Stable partition of a cluster's triangles: those whose vertex normals all lie within
@@ -1311,30 +1343,30 @@ fn partition_flat(
     cells: &[[i32; 3]],
     tris: &mut [u8],
 ) -> u8 {
-    let (mut flat, mut curved) = (Vec::with_capacity(tris.len()), Vec::new());
-    for t in tris.as_chunks::<3>().0 {
-        let at = t.map(|i| verts[usize::from(i)] as usize);
-        let welded = t
-            .iter()
-            .zip(at)
-            .all(|(&i, v)| cells[usize::from(i)] == grid.cells[v]);
-        let p = at.map(|v| Vec3::from(w.positions[v]).as_dvec3());
-        let face = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
-        let unit = at.map(|v| Vec3::from(w.normals[v]).as_dvec3().normalize_or_zero());
-        if welded
-            && unit
-                .iter()
-                .all(|n| n.distance(face) <= f64::from(FLAT_NORMAL))
-        {
-            flat.extend_from_slice(t);
-        } else {
-            curved.extend_from_slice(t);
-        }
+    // Per cluster vertex: whether it sits at its welded grid position, its welded position
+    // and its unit normal.
+    let mut welded = [false; MAX_CLUSTER_VERTICES];
+    let (mut p, mut unit) = (
+        [DVec3::ZERO; MAX_CLUSTER_VERTICES],
+        [DVec3::ZERO; MAX_CLUSTER_VERTICES],
+    );
+    for (k, &v) in verts.iter().enumerate() {
+        let v = v as usize;
+        welded[k] = cells[k] == grid.cells[v];
+        p[k] = Vec3::from(w.positions[v]).as_dvec3();
+        unit[k] = Vec3::from(w.normals[v]).as_dvec3().normalize_or_zero();
     }
-    let first = flat.len() / 3;
-    flat.extend_from_slice(&curved);
-    tris.copy_from_slice(&flat);
-    first as u8
+    let mut flat = [false; MAX_CLUSTER_CORNERS / 3];
+    for (f, t) in flat.iter_mut().zip(tris.as_chunks::<3>().0) {
+        let t = t.map(usize::from);
+        let face = (p[t[1]] - p[t[0]])
+            .cross(p[t[2]] - p[t[0]])
+            .normalize_or_zero();
+        *f = t.iter().all(|&i| welded[i])
+            && t.iter()
+                .all(|&i| unit[i].distance(face) <= f64::from(FLAT_NORMAL));
+    }
+    stable_partition(tris, &flat[..tris.len() / 3])
 }
 
 /// Rotates each triangle's corners as the page codec stores them; order and winding stay.
@@ -1369,8 +1401,9 @@ fn stored_corner_order(tris: &mut [u8]) {
     }
 }
 
-/// Most vertices a cluster holds ([`check`] bounds the limits).
+/// Most vertices and corners a cluster holds ([`check`] bounds the limits).
 const MAX_CLUSTER_VERTICES: usize = 256;
+const MAX_CLUSTER_CORNERS: usize = 3 * 128;
 
 /// Cluster-local vertex `i` at index `i`.
 const IDENTITY: [u32; MAX_CLUSTER_VERTICES] = {
@@ -1384,12 +1417,18 @@ const IDENTITY: [u32; MAX_CLUSTER_VERTICES] = {
 };
 
 /// A cluster's uvs of one set as the page stores them: unorm16 over the cluster's uv range.
+#[derive(Copy, Clone)]
 struct ClusterUvs {
     offset: [f32; 2],
     scale: [f32; 2],
 }
 
 impl ClusterUvs {
+    const ZERO: Self = Self {
+        offset: [0.0; 2],
+        scale: [0.0; 2],
+    };
+
     fn new(uvs: &[[f32; 2]], verts: &[u32]) -> Self {
         let (lo, hi) = verts
             .iter()
@@ -1597,7 +1636,7 @@ fn build_cluster(
     grid: &Grid,
     verts: &[u32],
     cells: &[[i32; 3]],
-    tris: &[u8],
+    tris: Vec<u8>,
     flags: u8,
     uv: &[ClusterUvs],
 ) -> ClusterData {
@@ -1618,7 +1657,7 @@ fn build_cluster(
     let bounds = meshopt::compute_meshlet_bounds(
         meshopt::Meshlet {
             vertices: &IDENTITY[..verts.len()],
-            triangles: tris,
+            triangles: &tris,
         },
         &adapter,
     );
@@ -1689,7 +1728,7 @@ fn build_cluster(
         record,
         local,
         attrs,
-        tris: tris.to_vec(),
+        tris,
         uvs: Vec::new(),
         omm: None,
         bounds: None,
