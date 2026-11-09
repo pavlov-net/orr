@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -105,7 +106,7 @@ impl<'a> BlobIn<'a> {
                 mount: u8::from(self.mount),
             },
             key: plan.key(self),
-            raw: self.bytes,
+            raw: Cow::Borrowed(self.bytes),
             stored,
             chunks: lens,
         })
@@ -173,15 +174,45 @@ impl Plan {
     }
 }
 
-/// A blob compressed by [`BlobIn::encode`]; it borrows the decoded bytes for the entry's
-/// content hash.
+/// A blob compressed by [`BlobIn::encode`]; it borrows or holds the decoded bytes for the
+/// entry's content hash.
 pub struct EncodedBlob<'a> {
     rec: Blob,
     /// Dedup key of the decoded bytes and settings.
     key: Hash32,
-    raw: &'a [u8],
+    raw: Cow<'a, [u8]>,
     stored: Vec<u8>,
     chunks: Vec<u32>,
+}
+
+impl EncodedBlob<'static> {
+    /// A zstd blob of `bytes` with default chunking, in the mount section with `mount`, as
+    /// [`BlobIn::encode`] makes it; it holds `bytes`.
+    pub fn owned(
+        bytes: Vec<u8>,
+        mount: bool,
+        zstd_level: i32,
+        gdeflate: Option<&dyn GDeflate>,
+    ) -> Result<Self> {
+        let b = BlobIn {
+            mount,
+            ..BlobIn::new(&bytes)
+        };
+        let EncodedBlob {
+            rec,
+            key,
+            stored,
+            chunks,
+            ..
+        } = b.encode(zstd_level, gdeflate)?;
+        Ok(EncodedBlob {
+            rec,
+            key,
+            raw: Cow::Owned(bytes),
+            stored,
+            chunks,
+        })
+    }
 }
 
 impl EncodedBlob<'_> {
@@ -217,7 +248,7 @@ impl EntryBlobs<'_> {
                 .writer
                 .place(e.rec, &e.stored, &e.chunks, Some(e.key))?,
         };
-        hash_blob(self.content, e.raw);
+        hash_blob(self.content, &e.raw);
         self.writer.blobs.push(rec);
         Ok(())
     }

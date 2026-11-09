@@ -26,7 +26,7 @@ use orr_pack::mesh::{
     ClusterSets, Group, MeshHeader, MeshInfo, NODE_PAGE_MAX, Node, NodePage, OMM_ALIGN, PAGE_MAX,
     PageHeader, PageInfo, Section, SurfaceClass, cluster_resident_len,
 };
-use orr_pack::{Span, Sphere};
+use orr_pack::{EncodedBlob, Span, Sphere};
 use rustc_hash::FxHashMap;
 
 use super::lod::{self, Parts, Welded};
@@ -856,7 +856,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         written = full;
         // Per page: its resident length, its cluster and triangle counts and its stored
         // bytes.
-        let built: Vec<(usize, usize, u32, Vec<u8>)> = ready
+        let built: Vec<(usize, usize, u32, EncodedBlob<'static>)> = ready
             .par_iter()
             .map(|members| {
                 let clusters: Vec<&ClusterData> = members
@@ -864,7 +864,9 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
                     .flat_map(|&g| &cooked[g].as_ref().expect("cooked").clusters)
                     .collect();
                 let bytes = write_page(&clusters, cx.stride);
-                let stored = store_page(&bytes).map_err(|e| e.to_string())?;
+                // Terminal groups' pages are the pinned ones.
+                let pinned = terminal(stages, members[0]);
+                let stored = store_page(&bytes, pinned, cx.compress).map_err(|e| e.to_string())?;
                 Ok((
                     bytes.len(),
                     clusters.len(),

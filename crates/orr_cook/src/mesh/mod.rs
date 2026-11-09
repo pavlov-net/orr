@@ -36,7 +36,7 @@ use orr_pack::mesh::{
     Cluster, ClusterSets, FLAT_NORMAL, Level, MAX_SECTIONS, MeshHeader, MeshInfo, OMM_ALIGN,
     PAGE_MAX, PageHeader, PageInfo, Part, PartLevel, Section, SurfaceClass, oct_encode,
 };
-use orr_pack::{Aabb, AssetId, Hash32, Span, Sphere};
+use orr_pack::{Aabb, AssetId, EncodedBlob, GDeflate, Hash32, Span, Sphere};
 use serde::Deserialize;
 
 use crate::assembly::AssemblySettings;
@@ -599,10 +599,18 @@ impl SectionMaps {
     }
 }
 
+/// How cooked pages are compressed: as the archive writer would, with this zstd level and
+/// GDeflate codec.
+#[derive(Clone, Copy)]
+pub(crate) struct Compress<'a> {
+    pub(crate) zstd_level: i32,
+    pub(crate) gdeflate: Option<&'a dyn GDeflate>,
+}
+
 pub(crate) struct CookedMesh {
     pub(crate) info: MeshInfo,
-    /// Stored page blobs, in [`MeshInfo::pages`] order.
-    pub(crate) pages: Vec<Vec<u8>>,
+    /// Page blobs, compressed, in [`MeshInfo::pages`] order; pinned pages are mount blobs.
+    pub(crate) pages: Vec<EncodedBlob<'static>>,
     /// Node page blobs, in [`MeshInfo::node_pages`] order; the first is the top page.
     pub(crate) node_pages: Vec<Vec<u8>>,
     pub(crate) warnings: Vec<String>,
@@ -617,6 +625,7 @@ pub(crate) fn cook(
     mut m: MeshData,
     s: &MeshSettings,
     mut maps: Vec<SectionMaps>,
+    compress: Compress<'_>,
 ) -> Result<CookedMesh> {
     let _z = crate::profile::zone!("mesh.cook");
     let fail = |message: String| Error::Mesh {
@@ -749,6 +758,7 @@ pub(crate) fn cook(
         baked: &baked,
         stretch: &stretch,
         s,
+        compress,
         deformation_bound: if skinned {
             f16_up(s.deformation_bound)
         } else {
@@ -816,7 +826,7 @@ pub(crate) fn cook(
 /// facts and sections.
 struct Built {
     info: MeshInfo,
-    pages: Vec<Vec<u8>>,
+    pages: Vec<EncodedBlob<'static>>,
     node_pages: Vec<Vec<u8>>,
     /// What the sets read of every cluster, in mesh cluster order.
     clusters: Vec<sets::SetCluster>,
@@ -836,6 +846,7 @@ struct Ctx<'a> {
     /// as a run time displacement does.
     stretch: &'a [[f32; 2]],
     s: &'a MeshSettings,
+    compress: Compress<'a>,
     deformation_bound: u16,
     stride: usize,
 }
@@ -1057,9 +1068,11 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
             c.add_to(&mut parts, cx.grid);
         }
         let paged = paginate(clusters, cx.stride);
+        // The coarsest level's pages are pinned.
+        let pinned = li + 1 == level_count;
         let stored = paged
             .par_iter()
-            .map(|(bytes, ..)| store_page(bytes))
+            .map(|(bytes, ..)| store_page(bytes, pinned, cx.compress))
             .collect::<Result<Vec<_>>>()?;
         for ((bytes, n, tri_count), stored) in paged.into_iter().zip(stored) {
             page_info.push(PageInfo {
@@ -1120,18 +1133,27 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
     })
 }
 
-/// The stored form of a resident page, checked to decode to the same bytes: micromaps
-/// follow the stored corner order.
-fn store_page(bytes: &[u8]) -> Result<Vec<u8>> {
+/// The stored form of a resident page, checked to decode to the same bytes (micromaps
+/// follow the stored corner order), compressed as a blob, in the mount section when
+/// `pinned`.
+fn store_page(bytes: &[u8], pinned: bool, compress: Compress<'_>) -> Result<EncodedBlob<'static>> {
     let stored = {
         let _z = crate::profile::zone!("page.encode");
         orr_pack::mesh::encode_page(bytes)?
     };
-    let _z = crate::profile::zone!("page.verify");
-    let mut decoded = vec![0; bytes.len()];
-    orr_pack::mesh::decode_page(&stored, &mut decoded)?;
-    assert!(decoded == bytes, "a cooked page decodes to itself");
-    Ok(stored)
+    {
+        let _z = crate::profile::zone!("page.verify");
+        let mut decoded = vec![0; bytes.len()];
+        orr_pack::mesh::decode_page(&stored, &mut decoded)?;
+        assert!(decoded == bytes, "a cooked page decodes to itself");
+    }
+    let _z = crate::profile::zone!("page.compress");
+    Ok(EncodedBlob::owned(
+        stored,
+        pinned,
+        compress.zstd_level,
+        compress.gdeflate,
+    )?)
 }
 
 pub(crate) fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {

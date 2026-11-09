@@ -3143,23 +3143,28 @@ fn cook_unit(
             let normals = data.tangents.is_some() && settings.tangent_error_max.is_some();
             let maps = section_maps(&data, &archives, normals, &shared.opacity, &shared.emission)?;
             drop(archives);
-            let cooked = mesh::cook(name, data, &settings, maps)?;
+            let gdeflate = w.gdeflate();
+            let compress = mesh::Compress {
+                zstd_level: w.zstd_level(),
+                gdeflate: gdeflate.as_deref(),
+            };
+            let cooked = mesh::cook(name, data, &settings, maps, compress)?;
             detail.warnings = cooked.warnings;
             detail.warnings.extend(uv_warnings);
             detail.tangents = cooked.tangents;
             let info = cooked.info.to_bytes();
-            let pinned = cooked.info.header.pinned_pages as usize;
-            let mut blobs = vec![mount(&info)];
-            blobs.extend(cooked.pages.iter().enumerate().map(|(i, p)| BlobIn {
-                mount: i < pinned,
-                ..BlobIn::new(p)
-            }));
-            blobs.extend(cooked.node_pages.iter().enumerate().map(|(i, p)| BlobIn {
-                mount: i == 0,
-                ..BlobIn::new(p)
-            }));
             let _z = crate::profile::zone!("archive.add");
-            w.add(name, class, orr_pack::mesh::SCHEMA, key, &blobs)?;
+            w.add_streamed(name, class, orr_pack::mesh::SCHEMA, key, |e| {
+                e.push(&mount(&info))?;
+                cooked.pages.iter().try_for_each(|p| e.push_encoded(p))?;
+                for (i, p) in cooked.node_pages.iter().enumerate() {
+                    e.push(&BlobIn {
+                        mount: i == 0,
+                        ..BlobIn::new(p)
+                    })?;
+                }
+                Ok::<_, orr_pack::Error>(())
+            })?;
         }
         Work::Texture(job, images) => {
             let built = job.run(&images, &shared.images)?;
