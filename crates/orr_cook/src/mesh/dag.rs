@@ -679,8 +679,6 @@ struct Cooked {
     sphere: Sphere,
     error: f32,
     clusters: Vec<ClusterData>,
-    /// Per cluster: the global group it was simplified from, or -1.
-    refined: Vec<i32>,
 }
 
 /// The DAG mode mesh: stages, clusters, pages of whole groups coarse to fine with the
@@ -770,7 +768,8 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
             })
             .collect();
         let stages = &stages;
-        let mut made: Vec<(usize, Cooked)> = work
+        // Each group, cooked, with per cluster the global group it was simplified from, or -1.
+        let mut made: Vec<(usize, Cooked, Vec<i32>)> = work
             .into_par_iter()
             .map(|(gl, clusters)| {
                 let _z = crate::profile::zone!("dag.group_clusters");
@@ -799,30 +798,36 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
                         sphere: g.sphere,
                         error: g.error,
                         clusters,
-                        refined,
                     },
+                    refined,
                 )
             })
             .collect();
-        cx.omm_all(made.iter_mut().flat_map(|(_, g)| &mut g.clusters).collect());
+        cx.omm_all(
+            made.iter_mut()
+                .flat_map(|(_, g, _)| &mut g.clusters)
+                .collect(),
+        );
         {
             let _z = crate::profile::zone!("dag.fit");
             made.par_iter_mut()
-                .try_for_each(|(_, g)| fit(cx, &mut g.clusters))?;
+                .try_for_each(|(_, g, _)| fit(cx, &mut g.clusters))?;
         }
         super::thickness::assign(
-            made.iter_mut().flat_map(|(_, g)| &mut g.clusters).collect(),
+            made.iter_mut()
+                .flat_map(|(_, g, _)| &mut g.clusters)
+                .collect(),
             cx.grid,
             cx.sections,
         );
-        for (g, c) in made {
+        for (g, c, r) in made {
             cooked[g] = Some(c);
+            refined[g] = r;
         }
 
         let _z = crate::profile::zone!("dag.pages");
         for (k, &gi) in order.iter().enumerate().take(end).skip(next) {
             let g = cooked[gi].as_ref().expect("cooked in this batch");
-            refined[gi] = g.refined.clone();
             let omm = g.clusters.iter().any(|c| c.omm.is_some());
             let bytes = |aligned: bool| {
                 g.clusters.iter().map(|c| c.cost(cx.stride)).sum::<usize>()
@@ -899,7 +904,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
                     _pad: [0; 3],
                 };
                 first_cluster += g.clusters.len() as u16;
-                for (c, &r) in g.clusters.iter().zip(&g.refined) {
+                for (c, &r) in g.clusters.iter().zip(&refined[gi]) {
                     let refined = usize::try_from(r).map_or(-1, |r| table_index[r] as i32);
                     set_clusters.push(c.set_cluster(table_index[gi], refined));
                     c.add_to(&mut parts, cx.grid);
