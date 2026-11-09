@@ -58,12 +58,13 @@ pub fn encode_page(page: &[u8]) -> Result<Vec<u8>> {
         put_offset(&mut out, table, 2 * i);
         // SAFETY: plain bound query.
         let bound = unsafe { ffi::meshopt_encodeVertexBufferBound(vn, stride) };
+        out.reserve(bound);
         let at = out.len();
-        out.resize(at + bound, 0);
-        // SAFETY: `vertices` holds vn vertices of `stride` bytes and `out` has `bound` bytes
-        // from `at`.
-        let len = unsafe {
-            ffi::meshopt_encodeVertexBufferLevel(
+        // SAFETY: `vertices` holds vn vertices of `stride` bytes and `out` has room for
+        // `bound` bytes from `at`, which the encoder only writes; it writes the `len` it
+        // returns.
+        unsafe {
+            let len = ffi::meshopt_encodeVertexBufferLevel(
                 out.as_mut_ptr().add(at),
                 bound,
                 vertices.as_ptr().cast(),
@@ -71,32 +72,33 @@ pub fn encode_page(page: &[u8]) -> Result<Vec<u8>> {
                 stride,
                 VERTEX_CODEC_LEVEL,
                 VERTEX_CODEC_VERSION,
-            )
-        };
-        assert!(len > 0, "the vertex codec bound holds the stream");
-        out.truncate(at + len);
+            );
+            assert!(len > 0, "the vertex codec bound holds the stream");
+            out.set_len(at + len);
+        }
 
         put_offset(&mut out, table, 2 * i + 1);
         let tn = usize::from(c.tri_count);
         let tris = &page[(h.tris_offset + c.tri_first) as usize..][..tn * 3];
         // SAFETY: plain bound query.
         let bound = unsafe { ffi::meshopt_encodeMeshletBound(0, tn) };
+        out.reserve(bound);
         let at = out.len();
-        out.resize(at + bound, 0);
         // SAFETY: triangles only, so no vertex references; `tris` holds tn triangles and
-        // `out` has `bound` bytes from `at`.
-        let len = unsafe {
-            ffi::meshopt_encodeMeshlet(
+        // `out` has room for `bound` bytes from `at`, which the encoder only writes; it
+        // writes the `len` it returns.
+        unsafe {
+            let len = ffi::meshopt_encodeMeshlet(
                 out.as_mut_ptr().add(at),
                 bound,
                 std::ptr::null(),
                 0,
                 tris.as_ptr(),
                 tn,
-            )
-        };
-        assert!(len > 0, "the meshlet codec bound holds the stream");
-        out.truncate(at + len);
+            );
+            assert!(len > 0, "the meshlet codec bound holds the stream");
+            out.set_len(at + len);
+        }
     }
     put_offset(&mut out, table, 2 * n);
     out.extend_from_slice(&page[h.omm_offset as usize..h.len as usize]);
