@@ -168,16 +168,22 @@ pub(crate) struct Record {
     #[serde(with = "hex_hash")]
     pub(crate) identity: Hash32,
     pub(crate) files: Vec<Input>,
-    #[serde(with = "hex_hashes")]
-    pub(crate) units: Vec<Hash32>,
-    /// Per unit, its planned working set, which places it in the payload.
-    pub(crate) planned: Vec<u64>,
+    pub(crate) units: Vec<RecordUnit>,
     /// The source's models with assemblies, which its linked units do not hold.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) assemblies: Vec<Assembly>,
     /// What the report says of the source, which its linked units do not hold.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) warnings: Vec<String>,
+}
+
+/// A unit a source cooked: its key, and its planned working set, which places it in the
+/// payload.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct RecordUnit {
+    #[serde(with = "hex_hash")]
+    pub(crate) key: Hash32,
+    pub(crate) planned: u64,
 }
 
 /// A file an importer read and the hash of the bytes it read.
@@ -293,22 +299,5 @@ mod hex_hash {
     pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Hash32, D::Error> {
         let s = String::deserialize(d)?;
         from_hex(&s).ok_or_else(|| serde::de::Error::custom("not a 64-digit hex hash"))
-    }
-}
-
-mod hex_hashes {
-    use super::*;
-
-    pub(super) fn serialize<S: serde::Serializer>(h: &[Hash32], s: S) -> Result<S::Ok, S::Error> {
-        s.collect_seq(h.iter().map(|h| hex(*h)))
-    }
-
-    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
-        d: D,
-    ) -> Result<Vec<Hash32>, D::Error> {
-        Vec::<String>::deserialize(d)?
-            .iter()
-            .map(|s| from_hex(s).ok_or_else(|| serde::de::Error::custom("not a 64-digit hex hash")))
-            .collect()
     }
 }

@@ -53,7 +53,7 @@ use crate::raster::{self, RasterReport};
 use crate::report::{
     self, ArchiveReport, AssemblyReport, AssemblyUnitReport, AssetReport, Outcome, TangentReport,
 };
-use crate::state::{self, Input, Memo, Record};
+use crate::state::{self, Input, Memo, Record, RecordUnit};
 use crate::subd::{self, CageData, CageInput, SubdSettings};
 use crate::texture::material::{
     ImageData, ImageFile, ImageReads, ImageRules, Packer, TextureJob, TextureRules, image_facts,
@@ -164,6 +164,8 @@ struct Unit<'m> {
     /// For a done mesh or subdivision cage: its bounds and what its model's instance pages
     /// need.
     mesh: Option<(Aabb, ModelFacts)>,
+    /// For a done texture: its header, which the estimates of the meshes reading it count.
+    texture: Option<orr_pack::texture::TextureHeader>,
 }
 
 enum Work<'m> {
@@ -754,7 +756,7 @@ impl<'m, 's> Run<'m, 's> {
             return Ok(false);
         }
         let mut links = Vec::with_capacity(record.units.len());
-        for (&key, &planned) in record.units.iter().zip(&record.planned) {
+        for &RecordUnit { key, planned } in &record.units {
             match self.find_link(a, key) {
                 Some(l) => links.push((key, planned, l)),
                 None => return Ok(false),
@@ -784,6 +786,7 @@ impl<'m, 's> Run<'m, 's> {
                 triangles: 0,
                 state: State::Waiting,
                 mesh: None,
+                texture: None,
             });
             self.done(u, from, Some(entries), outcome, 0.0)?;
         }
@@ -840,7 +843,7 @@ impl<'m, 's> Run<'m, 's> {
         let a = self.units[u].archive;
         let class = self.units[u].class;
         let name = self.units[u].name.clone();
-        let (entries, mesh) = self.with_archive(a, &from, |arc| {
+        let (entries, mesh, texture) = self.with_archive(a, &from, |arc| {
             let mut entries = entries.unwrap_or_else(|| (0..arc.entries().len()).collect());
             if class == Class::InstancePage as u16 {
                 entries.sort_by_key(|&e| instances::page_order(&name, arc.name(&arc.entries()[e])));
@@ -851,8 +854,12 @@ impl<'m, 's> Run<'m, 's> {
                 Some(Class::Subd) => subd_facts(arc, e),
                 _ => None,
             };
-            (entries, mesh)
-        })?;
+            // Its head is a mount blob, in the index already read.
+            let texture = (class == Class::Texture as u16)
+                .then(|| texture_head(arc, e.id).map(|(_, info)| info.header))
+                .transpose();
+            texture.map(|t| (entries, mesh, t))
+        })??;
         let memory = match &from {
             From::Memory(arc) => arc.header().file_len,
             From::Scratch(path) => {
@@ -870,6 +877,7 @@ impl<'m, 's> Run<'m, 's> {
             memory,
         });
         self.units[u].mesh = mesh;
+        self.units[u].texture = texture;
         let dependents = self.dependents.get_mut(u).map(std::mem::take);
         for d in dependents.into_iter().flatten() {
             self.pending[d] -= 1;
@@ -889,17 +897,12 @@ impl<'m, 's> Run<'m, 's> {
         if let Some(Work::Mesh(source, settings, _)) = &self.units[u].work {
             let a = self.units[u].archive;
             let header = |unit: &str| {
-                let from = match &self.units[self.by_name[&(a, unit.to_owned())]].state {
-                    State::Done(d) => &d.from,
-                    State::Written(Some(f)) => f,
-                    _ => unreachable!("a mesh is ready after the textures it reads"),
-                };
-                self.with_archive(a, from, |arc| {
-                    texture_head(arc, AssetId::from_name(unit)).map(|(_, info)| info.header)
-                })?
+                self.units[self.by_name[&(a, unit.to_owned())]]
+                    .texture
+                    .expect("a mesh is ready after the textures it reads")
             };
             let normals = settings.tangent_error_max.is_some();
-            let channels = map_channels(source.sections(), normals, header)?;
+            let channels = map_channels(source.sections(), normals, header);
             let geometry = mesh_working_set(source.triangles(), settings);
             self.units[u].working_set = (channels * MAP_DECODE_BYTES_PER_CHANNEL)
                 .max(geometry + channels * MAP_BYTES_PER_CHANNEL);
@@ -978,18 +981,15 @@ impl<'m, 's> Run<'m, 's> {
 
     /// Adds units whose dependencies name units of the same list; returns their keys and
     /// planned working sets.
-    fn add_units(
-        &mut self,
-        a: usize,
-        asset: usize,
-        units: Vec<NewUnit<'m>>,
-    ) -> (Vec<Hash32>, Vec<u64>) {
-        let (mut keys, mut planned) = (Vec::new(), Vec::new());
+    fn add_units(&mut self, a: usize, asset: usize, units: Vec<NewUnit<'m>>) -> Vec<RecordUnit> {
+        let mut out = Vec::new();
         let mut deps = Vec::new();
         for nu in units {
             let key = self.stored(a, nu.key);
-            keys.push(key);
-            planned.push(nu.working_set);
+            out.push(RecordUnit {
+                key,
+                planned: nu.working_set,
+            });
             deps.push(nu.deps);
             self.add(Unit {
                 archive: a,
@@ -1004,6 +1004,7 @@ impl<'m, 's> Run<'m, 's> {
                 triangles: nu.triangles,
                 state: State::Waiting,
                 mesh: None,
+                texture: None,
             });
         }
         let first = self.units.len() - deps.len();
@@ -1013,7 +1014,7 @@ impl<'m, 's> Run<'m, 's> {
                 .map(|n| self.by_name[&(a, n.clone())])
                 .collect();
         }
-        (keys, planned)
+        out
     }
 
     /// Registers assemblies of models just added to archive `a`.
@@ -1029,7 +1030,7 @@ impl<'m, 's> Run<'m, 's> {
             let imp = &self.imports[i];
             (imp.archive, imp.asset, imp.identity)
         };
-        let (keys, planned) = self.add_units(a, asset, imported.units);
+        let units = self.add_units(a, asset, imported.units);
         for f in &imported.files {
             self.input(a, asset, &f.path);
         }
@@ -1040,8 +1041,7 @@ impl<'m, 's> Run<'m, 's> {
         self.records[a].push(Record {
             identity,
             files: imported.files,
-            units: keys,
-            planned,
+            units,
             assemblies: imported.assemblies,
             warnings: imported.warnings,
         });
@@ -1258,8 +1258,10 @@ impl<'m, 's> Run<'m, 's> {
             let key = self.stored(a, key.finish());
             let working_set = src.records.len() as u64 * 256;
             if let Some((ra, r)) = record {
-                self.records[ra][r].units.push(key);
-                self.records[ra][r].planned.push(working_set);
+                self.records[ra][r].units.push(RecordUnit {
+                    key,
+                    planned: working_set,
+                });
             }
             self.add(Unit {
                 archive: a,
@@ -1274,6 +1276,7 @@ impl<'m, 's> Run<'m, 's> {
                 triangles: 0,
                 state: State::Waiting,
                 mesh: None,
+                texture: None,
             });
         }
         Ok(())
@@ -3043,16 +3046,16 @@ fn mesh_working_set(triangles: u64, settings: &MeshSettings) -> u64 {
 fn map_channels(
     sections: &[SectionData],
     normals: bool,
-    mut header: impl FnMut(&str) -> Result<orr_pack::texture::TextureHeader>,
-) -> Result<u64> {
+    header: impl Fn(&str) -> orr_pack::texture::TextureHeader,
+) -> u64 {
     let mut seen = HashSet::new();
     let mut total = 0;
-    let mut add = |texture: &MapTexture, use_: u8, total: &mut u64| -> Result<()> {
+    let mut add = |texture: &MapTexture, use_: u8, total: &mut u64| {
         for unit in texture.units() {
             if !seen.insert((unit.to_owned(), use_)) {
                 continue;
             }
-            let h = header(unit)?;
+            let h = header(unit);
             let texels = |mip: u32| {
                 let [w, h] = h.mip_size(mip);
                 u64::from(w) * u64::from(h)
@@ -3069,15 +3072,14 @@ fn map_channels(
                 }
             };
         }
-        Ok(())
     };
     for s in sections {
         let m = &s.maps;
         if let OpacitySpec::Texture { texture, .. } = &m.opacity {
-            add(texture, 0, &mut total)?;
+            add(texture, 0, &mut total);
         }
         if normals && let NormalSpec::Texture { texture, .. } = &m.normal {
-            add(texture, 1, &mut total)?;
+            add(texture, 1, &mut total);
         }
         let heights = m
             .displacement
@@ -3085,14 +3087,14 @@ fn map_channels(
             .chain(m.tangent_displacement.iter().flatten());
         for d in heights {
             if let Some(t) = &d.texture {
-                add(&t.texture, 2, &mut total)?;
+                add(&t.texture, 2, &mut total);
             }
         }
         if let Some(e) = &m.emission {
-            add(&e.texture, 3, &mut total)?;
+            add(&e.texture, 3, &mut total);
         }
     }
-    Ok(total)
+    total
 }
 
 /// Cooks one unit into a one-unit archive: in the cache when there is one, else in `spill`
