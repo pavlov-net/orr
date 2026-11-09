@@ -84,9 +84,11 @@ const MESH_BYTES_PER_TRIANGLE: u64 = 480;
 /// tenth more.
 const DAG_BYTES_PER_TRIANGLE: u64 = 180;
 
-/// Peak bytes of a mesh cook per decoded texel channel of the maps its sections read
-/// ([`map_channels`]).
-const MAP_BYTES_PER_CHANNEL: u64 = 16;
+/// Bytes a mesh cook holds per decoded texel channel of the maps its sections read
+/// ([`map_channels`]): an f32 each. Decoding them peaks at [`MAP_DECODE_BYTES_PER_CHANNEL`],
+/// before the geometry's peak. Both measured over the scene [`DAG_BYTES_PER_TRIANGLE`] names.
+const MAP_BYTES_PER_CHANNEL: u64 = 4;
+const MAP_DECODE_BYTES_PER_CHANNEL: u64 = 13;
 
 pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
     let start = Instant::now();
@@ -891,8 +893,9 @@ impl<'m, 's> Run<'m, 's> {
                 })?
             };
             let channels = map_channels(source.sections(), header)?;
-            self.units[u].working_set =
-                mesh_working_set(source.triangles(), settings) + channels * MAP_BYTES_PER_CHANNEL;
+            let geometry = mesh_working_set(source.triangles(), settings);
+            self.units[u].working_set = (channels * MAP_DECODE_BYTES_PER_CHANNEL)
+                .max(geometry + channels * MAP_BYTES_PER_CHANNEL);
         }
         self.ready.insert((Reverse(self.units[u].working_set), u));
         Ok(())
