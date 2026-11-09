@@ -165,18 +165,21 @@ impl Building {
         skinned: bool,
     ) -> (MeshData, Vec<(usize, Range<usize>)>) {
         let ps = &mut self.parts;
-        let mut materials: Vec<usize> = ps.iter().map(|p| p.material).collect();
-        materials.sort_unstable();
-        materials.dedup();
+        // A stable sort keeps each material's primitives in order.
+        let mut order: Vec<usize> = (0..ps.len()).collect();
+        order.sort_by_key(|&i| ps[i].material);
         let mut indices = Vec::with_capacity(ps.iter().map(|p| p.indices.len()).sum());
-        let mut groups = Vec::new();
-        for m in materials {
-            let start = indices.len();
-            for p in ps.iter_mut().filter(|p| p.material == m) {
-                indices.extend(std::mem::take(&mut p.indices));
+        let mut groups: Vec<(usize, Range<usize>)> = Vec::new();
+        for i in order {
+            let p = &mut ps[i];
+            if p.indices.is_empty() {
+                continue;
             }
-            if indices.len() > start {
-                groups.push((m, start..indices.len()));
+            let start = indices.len();
+            indices.extend(std::mem::take(&mut p.indices));
+            match groups.last_mut() {
+                Some((m, range)) if *m == p.material => range.end = indices.len(),
+                _ => groups.push((p.material, start..indices.len())),
             }
         }
         let counts: Vec<usize> = ps.iter().map(|p| p.positions.len()).collect();
