@@ -178,6 +178,7 @@ fn inspect(args: &[String]) -> Result<bool> {
     }
     let a = Archive::open(path.ok_or(USAGE)?)?;
     let h = a.header();
+    let payload = h.payload();
     let mut out = io::stdout().lock();
     writeln!(
         out,
@@ -187,7 +188,7 @@ fn inspect(args: &[String]) -> Result<bool> {
         h.chunk_count,
         h.index_len,
         h.mount_len,
-        h.payload().end - h.payload().start
+        payload.end - payload.start
     )?;
     writeln!(
         out,

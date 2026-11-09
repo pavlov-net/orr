@@ -898,16 +898,16 @@ impl<'m, 's> Run<'m, 's> {
         for d in dependents.into_iter().flatten() {
             self.pending[d] -= 1;
             if self.pending[d] == 0 {
-                self.make_ready(d)?;
+                self.make_ready(d);
             }
         }
         Ok(())
     }
 
-    fn make_ready(&mut self, u: usize) -> Result<()> {
+    fn make_ready(&mut self, u: usize) {
         if let Some(Work::Model(..) | Work::Same) = self.units[u].work {
             self.local.push(u);
-            return Ok(());
+            return;
         }
         // A mesh's maps are cooked once it is ready, so its estimate can count them.
         if let Some(Work::Mesh(source, settings, _)) = &self.units[u].work {
@@ -926,7 +926,6 @@ impl<'m, 's> Run<'m, 's> {
             self.units[u].working_set = load.max(geometry);
         }
         self.ready.insert((Reverse(self.units[u].working_set), u));
-        Ok(())
     }
 
     fn run<'t>(&mut self, scope: &'t Scope<'t, '_>, threads: usize) -> Result<()>
@@ -1382,7 +1381,7 @@ impl<'m, 's> Run<'m, 's> {
                 }
             }
             if self.pending[u] == 0 {
-                self.make_ready(u)?;
+                self.make_ready(u);
             }
         }
         Ok(())
