@@ -34,6 +34,8 @@ egui = { workspace = true, features = ["monochrome_emoji_fonts"] }
 [dev-dependencies]
 orr_scene = { workspace = true, features = ["testing"] }
 serde_json.workspace = true
+# cornell-box downloads its scene at startup without --assets.
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }
@@ -101,6 +103,10 @@ path = "skinned.rs"
 [[example]]
 name = "tree-viewer"
 path = "tree-viewer.rs"
+
+[[example]]
+name = "cornell-box"
+path = "cornell-box.rs"
 
 [lints]
 workspace = true

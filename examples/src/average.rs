@@ -44,6 +44,17 @@ impl Average {
         }
     }
 
+    /// Frames in the sum.
+    pub fn frames(&self) -> u32 {
+        self.frames
+    }
+
+    /// Starts the sum over after `skip` more lit frames, for a view that has changed.
+    pub fn restart(&mut self, skip: u64) {
+        self.frames = 0;
+        self.skip = skip;
+    }
+
     /// The scene-referred hook of frame `f` at `extent`. Call once per frame, whether the hook is
     /// used or not.
     pub fn hook<'s, 'a>(
