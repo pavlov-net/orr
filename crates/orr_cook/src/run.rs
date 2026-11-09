@@ -338,6 +338,7 @@ struct Write {
     working_set: u64,
     triangles: u64,
     detail: Option<Detail>,
+    waited: f64,
 }
 
 enum WriteFrom {
@@ -389,6 +390,7 @@ fn write_unit(writers: &mut [Option<ArchiveWriter>], w: Write) -> Result<Vec<rep
     }
     for r in &mut reports {
         r.peak = w.detail.as_ref().and_then(|d| d.peak);
+        r.budget_wait = w.waited;
     }
     if let (Some(d), Some(first)) = (w.detail, reports.first_mut()) {
         if let (Some(m), Some(t)) = (first.mesh.as_mut(), d.tangents) {
@@ -450,6 +452,10 @@ struct Run<'m, 's> {
     writing: HashMap<usize, u64>,
     /// Entry reports of written units.
     reports: HashMap<usize, Vec<report::EntryReport>>,
+    /// Ready units that did not fit the budget while a later one started: since when.
+    passed: HashMap<usize, Instant>,
+    /// Seconds such units waited from then until they started.
+    waited: HashMap<usize, f64>,
     window: u64,
 }
 
@@ -486,6 +492,8 @@ impl<'m, 's> Run<'m, 's> {
             map_reads: HashMap::new(),
             writing: HashMap::new(),
             reports: HashMap::new(),
+            passed: HashMap::new(),
+            waited: HashMap::new(),
             window: 0,
         };
         for (a, spec) in manifest.archives.iter().enumerate() {
@@ -1459,17 +1467,26 @@ impl<'m, 's> Run<'m, 's> {
                     .filter(|&u| !full || self.scratch[self.units[u].archive].is_some()),
             );
             // A unit that does not fit stays first in line while smaller ones that fit start.
+            let mut skipped = Vec::new();
             for u in candidates {
                 if running >= jobs {
                     break;
                 }
                 let ws = self.units[u].working_set;
                 if running > 0 && bytes + ws > budget {
+                    skipped.push(u);
                     continue;
                 }
                 if self.ready.remove(&(Reverse(ws), u)) {
                     running += 1;
                     bytes += ws;
+                    let now = Instant::now();
+                    for &s in &skipped {
+                        self.passed.entry(s).or_insert(now);
+                    }
+                    if let Some(at) = self.passed.remove(&u) {
+                        self.waited.insert(u, now.duration_since(at).as_secs_f64());
+                    }
                     self.spawn(scope, tx, u);
                 }
             }
@@ -1735,6 +1752,7 @@ impl<'m, 's> Run<'m, 's> {
                     working_set: unit.working_set,
                     triangles: unit.triangles,
                     detail: self.details.remove(&u),
+                    waited: self.waited.remove(&u).unwrap_or(0.0),
                 };
                 self.units[u].state = State::Written(Some(d.from));
                 self.writing.insert(u, d.memory);

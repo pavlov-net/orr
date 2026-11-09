@@ -87,6 +87,10 @@ pub struct EntryReport {
     /// for linked entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak: Option<u64>,
+    /// Seconds the job waited for working set while later, smaller jobs that fit started
+    /// ahead of it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub budget_wait: f64,
     /// Decoded and stored bytes over its blobs.
     pub raw: u64,
     pub stored: u64,
@@ -104,6 +108,10 @@ pub struct EntryReport {
     /// subsurface materials on open meshes. Reported only when the entry cooks.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+fn is_zero(x: &f64) -> bool {
+    *x == 0.0
 }
 
 /// How an entry was obtained.
@@ -276,6 +284,7 @@ pub(crate) fn entry(
         seconds,
         working_set,
         peak: None,
+        budget_wait: 0.0,
         raw: blobs.iter().map(|b| u64::from(b.raw_len)).sum(),
         stored,
         mesh,
