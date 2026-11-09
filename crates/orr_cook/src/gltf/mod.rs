@@ -375,7 +375,7 @@ fn append_primitive(
     };
     let local = rows(Semantic::Positions, 3)?.expect("checked above");
     let local = local.as_chunks::<3>().0;
-    let positions: Vec<[f32; 3]> = local.iter().map(|&p| place(p)).collect();
+    let positions: Vec<[f32; 3]> = local.par_iter().map(|&p| place(p)).collect();
     let vertices: Vec<u32> = match prim.indices() {
         Some(a) => src.indices(&a)?,
         None => (0..n as u32).collect(),

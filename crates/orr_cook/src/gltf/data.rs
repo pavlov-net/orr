@@ -25,6 +25,8 @@ use gltf::buffer::Source as BufferSource;
 use meshopt::ffi;
 use orr_pack::Hash32;
 use percent_encoding::percent_decode_str;
+
+use crate::par::prelude::*;
 use serde_json::{Map, Value};
 
 /// Extensions the cook reads itself, removed from `extensionsRequired` before validation.
@@ -488,18 +490,29 @@ impl<'d> Data<'d> {
         };
         let ty = a.data_type();
         let normalized = a.normalized();
+        let k = comps.min(n);
         let read = |b: &[u8], out: &mut [f32]| {
-            for (c, o) in out.iter_mut().enumerate().take(comps.min(n)) {
-                *o = component(b, ty, c, normalized);
+            if ty == DataType::F32 {
+                for (o, x) in out[..k].iter_mut().zip(b.as_chunks::<4>().0) {
+                    *o = f32::from_le_bytes(*x);
+                }
+            } else {
+                for (c, o) in out.iter_mut().enumerate().take(k) {
+                    *o = component(b, ty, c, normalized);
+                }
             }
         };
         let mut out = vec![0.0; a.count() * n];
         if let Some(v) = a.view() {
             let (data, stride) = self.view_elements(&v, a.size())?;
             let base = &data[a.offset()..];
-            for (i, row) in out.chunks_exact_mut(n).enumerate() {
-                read(&base[i * stride..], row);
-            }
+            out.par_chunks_mut(n * ROWS)
+                .enumerate()
+                .for_each(|(block, rows)| {
+                    for (i, row) in (block * ROWS..).zip(rows.chunks_exact_mut(n)) {
+                        read(&base[i * stride..], row);
+                    }
+                });
         }
         self.sparse_elements(a, |i, b| read(b, &mut out[i * n..(i + 1) * n]))?;
         Ok(out)
@@ -546,7 +559,10 @@ impl<'d> Data<'d> {
             Some(v) => {
                 let (data, stride) = self.view_elements(&v, a.size())?;
                 let base = &data[a.offset()..];
-                (0..a.count()).map(|i| read(&base[i * stride..])).collect()
+                (0..a.count())
+                    .into_par_iter()
+                    .map(|i| read(&base[i * stride..]))
+                    .collect()
             }
             None => vec![0; a.count()],
         };
@@ -592,6 +608,9 @@ impl<'d> Data<'d> {
         Ok(out)
     }
 }
+
+/// Rows of an accessor one task converts.
+const ROWS: usize = 1 << 14;
 
 fn component(b: &[u8], ty: DataType, c: usize, normalized: bool) -> f32 {
     match ty {
