@@ -148,8 +148,7 @@ pub struct ResidencyStats {
     pub longest_closure: u32,
     /// Loads landed resident since the start, user blobs' among them.
     pub landed: u32,
-    /// Stored bytes the loads read and decoded since the start, those of loads that then failed
-    /// too.
+    /// Stored bytes the loads read since the start, those of loads that then failed too.
     pub bytes_read: u64,
     /// Units whose load failed since the mount for a reason other than memory; they and the
     /// units depending on them do not load again.

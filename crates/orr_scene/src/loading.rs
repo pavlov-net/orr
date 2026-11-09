@@ -655,6 +655,10 @@ pub(crate) struct BlobSource {
 
 type Stored = Box<dyn FnOnce(Result<&[u8]>) + Send>;
 
+/// What [`read_into`] hands its decoded bytes to, with the stored bytes its read returned: 0
+/// where the read failed, all of them where only the decode did.
+type Decoded = Box<dyn FnOnce(Result<&[u8]>, u64) + Send>;
+
 /// Reads the stored bytes of blob `b`, or of its chunk `chunk`, then hands them to `then` in a
 /// job on `queue`. A read error goes to `then` on the thread that saw it. Without a loading
 /// side `then` is not called.
@@ -764,18 +768,18 @@ pub(crate) fn reads_straight(
 }
 
 /// Reads blob `b`, or its chunk `chunk`, decodes it into `dst` and hands the decoded bytes,
-/// which `dst` then starts with, to `then` in a job on `queue`. `dst` is mapped cached memory of at
-/// least the decoded length, which nothing else uses until `then` returns; where
-/// [`reads_straight`] holds and `dst` is as it asks, the read goes straight into `dst`. A read
-/// error goes to `then` on the thread that saw it. Without a loading side `then` is not
-/// called.
+/// which `dst` then starts with, and the stored bytes read to `then` in a job on `queue`.
+/// `dst` is mapped cached memory of at least the decoded length, which nothing else uses until
+/// `then` returns; where [`reads_straight`] holds and `dst` is as it asks, the read goes
+/// straight into `dst`. A read error goes to `then` on the thread that saw it. Without a
+/// loading side `then` is not called.
 pub(crate) fn read_into(
     src: &BlobSource,
     b: Blob,
     chunk: Option<u32>,
     dst: Block,
     queue: Queue,
-    then: Stored,
+    then: Decoded,
 ) {
     let len = chunk.map_or(b.raw_len, |i| b.chunk_len(i)) as usize;
     assert!(len as u64 <= dst.size(), "a decode outside its slot");
@@ -797,10 +801,12 @@ pub(crate) fn read_into(
         Box::new(move |stored| {
             // SAFETY: the caller gives this load the first `len` bytes at `at`.
             let out = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, len) };
-            then(stored.and_then(|s| {
+            let read = stored.as_ref().map_or(0, |s| s.len() as u64);
+            let decoded = stored.and_then(|s| {
                 a.decode(&b, chunk, s, out)?;
                 Ok(&*out)
-            }));
+            });
+            then(decoded, read);
         }),
     );
 }
@@ -814,7 +820,7 @@ fn read_straight(
     at: usize,
     len: usize,
     queue: Queue,
-    then: Stored,
+    then: Decoded,
 ) {
     let Some(loading) = src.loading.upgrade() else {
         return;
@@ -835,13 +841,16 @@ fn read_straight(
         Some(buf),
         queue,
         move |r| match r {
-            Err(e) => then(Err(e)),
-            Ok(buf) if buf.len() < len => then(Err(orr_pack::Error::Truncated {
-                need: range.offset + len as u64,
-                have: range.offset + buf.len() as u64,
-            }
-            .into())),
-            Ok(buf) => then(Ok(buf.as_slice())),
+            Err(e) => then(Err(e), 0),
+            Ok(buf) if buf.len() < len => then(
+                Err(orr_pack::Error::Truncated {
+                    need: range.offset + len as u64,
+                    have: range.offset + buf.len() as u64,
+                }
+                .into()),
+                0,
+            ),
+            Ok(buf) => then(Ok(buf.as_slice()), len as u64),
         },
     );
 }

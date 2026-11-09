@@ -1950,7 +1950,7 @@ struct Landed {
     staged_at: u64,
     /// A mesh page's clusters as it decoded, and what its CLAS build made.
     mesh: Option<MeshLanded>,
-    /// The stored bytes of its blob or chunk, once read and decoded.
+    /// The stored bytes its read returned.
     read: u64,
     result: Result<(), Arc<Error>>,
 }
@@ -2234,16 +2234,9 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
             chunk,
             staged,
             Queue::Stream,
-            Box::new(move |decoded| {
+            Box::new(move |decoded, read| {
                 let load = &t.loads[i];
                 let mut mesh = None;
-                let read = match (&decoded, chunk) {
-                    (Err(_), _) => 0,
-                    (Ok(_), Some(c)) => {
-                        u64::from(load.source.archive.chunks(&b)[c as usize].stored_len)
-                    }
-                    (Ok(_), None) => u64::from(b.stored_len),
-                };
                 let result = decoded.and_then(|bytes| {
                     if let Some(l) = l.upgrade() {
                         l.flush(&staged)?;
