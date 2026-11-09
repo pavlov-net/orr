@@ -464,9 +464,9 @@ struct Run<'m, 's> {
     writing: HashMap<usize, u64>,
     /// Entry reports of written units.
     reports: HashMap<usize, Vec<report::EntryReport>>,
-    /// Units that did not fit the budget first in line: since when.
-    held: HashMap<usize, Instant>,
-    /// Seconds such units waited from then until they started.
+    /// The unit first in line that does not fit the budget, and since when.
+    held: Option<(usize, Instant)>,
+    /// Seconds units waited there.
     waited: HashMap<usize, f64>,
     window: u64,
 }
@@ -505,7 +505,7 @@ impl<'m, 's> Run<'m, 's> {
             map_reads: HashMap::new(),
             writing: HashMap::new(),
             reports: HashMap::new(),
-            held: HashMap::new(),
+            held: None,
             waited: HashMap::new(),
             window: 0,
         };
@@ -1510,6 +1510,7 @@ impl<'m, 's> Run<'m, 's> {
             );
             // A unit that does not fit stays first in line: a smaller one started past it
             // would hold budget it waits for.
+            let mut head = None;
             for u in candidates {
                 if running >= jobs {
                     break;
@@ -1519,16 +1520,22 @@ impl<'m, 's> Run<'m, 's> {
                 }
                 let ws = self.units[u].working_set;
                 if running > 0 && bytes + ws > budget {
-                    self.held.entry(u).or_insert_with(Instant::now);
+                    head = Some(u);
                     break;
                 }
                 self.ready.remove(&self.ready_key(u));
                 running += 1;
                 bytes += ws;
-                if let Some(at) = self.held.remove(&u) {
-                    self.waited.insert(u, at.elapsed().as_secs_f64());
-                }
                 self.spawn(scope, tx, u);
+            }
+            match (self.held, head) {
+                (Some((h, _)), Some(u)) if h == u => {}
+                (held, head) => {
+                    if let Some((h, since)) = held {
+                        *self.waited.entry(h).or_default() += since.elapsed().as_secs_f64();
+                    }
+                    self.held = head.map(|u| (u, Instant::now()));
+                }
             }
             crate::profile::plot!("jobs running", running as f64);
             crate::profile::plot!("jobs working set GiB", bytes as f64 / f64::from(1 << 30));
