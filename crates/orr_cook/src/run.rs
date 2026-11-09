@@ -898,7 +898,8 @@ impl<'m, 's> Run<'m, 's> {
                     texture_head(arc, AssetId::from_name(unit)).map(|(_, info)| info.header)
                 })?
             };
-            let channels = map_channels(source.sections(), header)?;
+            let normals = settings.tangent_error_max.is_some();
+            let channels = map_channels(source.sections(), normals, header)?;
             let geometry = mesh_working_set(source.triangles(), settings);
             self.units[u].working_set = (channels * MAP_DECODE_BYTES_PER_CHANNEL)
                 .max(geometry + channels * MAP_BYTES_PER_CHANNEL);
@@ -3036,11 +3037,12 @@ fn mesh_working_set(triangles: u64, settings: &MeshSettings) -> u64 {
 }
 
 /// Texel channels [`section_maps`] decodes for these sections, each texture once per use:
-/// mip 0 of an opacity texture (one channel) and of a normal map (two), every mip of a
-/// height (one) and an emission texture's mip at most [`EmissionMap::SIDE_MAX`] a side
-/// (three). `header` gives a texture unit's header.
+/// mip 0 of an opacity texture (one channel) and, with `normals` (the tangent check runs), of
+/// a normal map (two), every mip of a height (one) and an emission texture's mip at most
+/// [`EmissionMap::SIDE_MAX`] a side (three). `header` gives a texture unit's header.
 fn map_channels(
     sections: &[SectionData],
+    normals: bool,
     mut header: impl FnMut(&str) -> Result<orr_pack::texture::TextureHeader>,
 ) -> Result<u64> {
     let mut seen = HashSet::new();
@@ -3074,7 +3076,7 @@ fn map_channels(
         if let OpacitySpec::Texture { texture, .. } = &m.opacity {
             add(texture, 0, &mut total)?;
         }
-        if let NormalSpec::Texture { texture, .. } = &m.normal {
+        if normals && let NormalSpec::Texture { texture, .. } = &m.normal {
             add(texture, 1, &mut total)?;
         }
         let heights = m
