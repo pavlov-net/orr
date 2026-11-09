@@ -123,17 +123,7 @@ impl<'a> OmmRead<'a> {
 
     /// Which sides of the cutoff a bilinear sample on uv triangle `tri` can read.
     fn sides(&self, tri: [[f32; 2]; 3]) -> u8 {
-        let mip0 = &self.read.mip0;
-        // Tiles on one side settle the footprint they hold without walking its texels.
-        let ranges = mip0.footprint_ranges(tri);
-        let uniform = || ranges.and_then(|r| self.read.passes.uniform(&r));
-        let sides = uniform().unwrap_or_else(|| self.read.passes.footprint(mip0, tri, PASS | FAIL));
-        // An empty footprint keeps the side its tiles are on.
-        if sides == 0 {
-            uniform().unwrap_or(0)
-        } else {
-            sides
-        }
+        self.read.passes.sides(&self.read.mip0, tri, PASS | FAIL)
     }
 }
 
