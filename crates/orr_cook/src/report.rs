@@ -87,8 +87,7 @@ pub struct EntryReport {
     /// for linked entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak: Option<u64>,
-    /// Seconds the job waited for working set while later, smaller jobs that fit started
-    /// ahead of it.
+    /// Seconds the job waited first in line for working set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_wait: Option<f64>,
     /// Decoded and stored bytes over its blobs.

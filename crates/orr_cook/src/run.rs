@@ -6,13 +6,12 @@
 //! Scheduling: the jobs the next unwritten units wait on start first, then the rest by the
 //! largest planned job among them and the units waiting on them, so the textures of the
 //! largest meshes cook first, each while the estimated working set of the running jobs stays
-//! under [`CookOptions::working_set`] with it (a job over it runs alone); a job that does not
-//! fit keeps its place while smaller ones start only with its working set left free.
-//! Finished units wait for their turn to
-//! be written, which a writer thread does while the coordinator starts jobs. While the bytes
-//! waiting in memory exceed [`CookOptions::reorder_window`], jobs of a file archive without
-//! a cache write their units to `<archive>.units/` beside it, removed once written, and the
-//! jobs of an archive in memory start only when the next unwritten units wait on them.
+//! under [`CookOptions::working_set`] with it (a job over it runs alone); no job starts past
+//! one that does not fit. Finished units wait for their turn to be written, which a writer
+//! thread does while the coordinator starts jobs. While the bytes waiting in memory exceed
+//! [`CookOptions::reorder_window`], jobs of a file archive without a cache write their units
+//! to `<archive>.units/` beside it, removed once written, and the jobs of an archive in
+//! memory start only when the next unwritten units wait on them.
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
@@ -466,8 +465,8 @@ struct Run<'m, 's> {
     writing: HashMap<usize, u64>,
     /// Entry reports of written units.
     reports: HashMap<usize, Vec<report::EntryReport>>,
-    /// Ready units that did not fit the budget while a later one started: since when.
-    passed: HashMap<usize, Instant>,
+    /// Units that did not fit the budget first in line: since when.
+    held: HashMap<usize, Instant>,
     /// Seconds such units waited from then until they started.
     waited: HashMap<usize, f64>,
     window: u64,
@@ -507,7 +506,7 @@ impl<'m, 's> Run<'m, 's> {
             map_reads: HashMap::new(),
             writing: HashMap::new(),
             reports: HashMap::new(),
-            passed: HashMap::new(),
+            held: HashMap::new(),
             waited: HashMap::new(),
             window: 0,
         };
@@ -1510,18 +1509,8 @@ impl<'m, 's> Run<'m, 's> {
                     .map(|&(_, u)| u)
                     .filter(|&u| !full || self.scratch[self.units[u].archive].is_some()),
             );
-            // A unit that does not fit stays first in line while smaller ones start beside
-            // it: they fit with the budget it waits for left to it, so they never put it off.
-            // A unit reserves for the largest other waiter at least its size, so of two that
-            // wait, the smaller never holds the larger back.
-            let (mut skipped, mut passed) = (Vec::new(), 0);
-            let now = Instant::now();
-            // Units waiting for working set, largest first.
-            let mut waiting: BTreeSet<(Reverse<u64>, usize)> = self
-                .passed
-                .keys()
-                .map(|&p| (Reverse(self.units[p].working_set), p))
-                .collect();
+            // A unit that does not fit stays first in line: a smaller one started past it
+            // would hold budget it waits for.
             for u in candidates {
                 if running >= jobs {
                     break;
@@ -1530,26 +1519,17 @@ impl<'m, 's> Run<'m, 's> {
                     continue;
                 }
                 let ws = self.units[u].working_set;
-                let other = waiting.iter().find(|w| w.1 != u).map_or(0, |w| w.0.0);
-                let reserved = if other >= ws { other } else { 0 };
-                if running > 0 && bytes + ws + reserved > budget {
-                    waiting.insert((Reverse(ws), u));
-                    skipped.push(u);
-                    continue;
+                if running > 0 && bytes + ws > budget {
+                    self.held.entry(u).or_insert_with(Instant::now);
+                    break;
                 }
-                // A waiter that starts reserves nothing more.
-                waiting.remove(&(Reverse(ws), u));
                 self.ready.remove(&self.ready_key(u));
                 running += 1;
                 bytes += ws;
-                passed = skipped.len();
-                if let Some(at) = self.passed.remove(&u) {
-                    self.waited.insert(u, now.duration_since(at).as_secs_f64());
+                if let Some(at) = self.held.remove(&u) {
+                    self.waited.insert(u, at.elapsed().as_secs_f64());
                 }
                 self.spawn(scope, tx, u);
-            }
-            for &s in &skipped[..passed] {
-                self.passed.entry(s).or_insert(now);
             }
             crate::profile::plot!("jobs running", running as f64);
             crate::profile::plot!("jobs working set GiB", bytes as f64 / f64::from(1 << 30));
