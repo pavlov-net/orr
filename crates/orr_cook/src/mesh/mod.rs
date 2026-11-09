@@ -381,18 +381,19 @@ impl SectionData {
         SurfaceClass::from_flags(self.flags) == Some(SurfaceClass::Opaque)
     }
 
-    /// Bytes the section's micromaps bake from for its opacity texture, whose units' mip 0
-    /// sizes are `sizes`, under `settings`: each unit as a byte per texel, when they bake from
-    /// it, which is only when every unit fits the rasterizer.
+    /// The most bytes the section's micromaps bake from for its opacity texture, whose units'
+    /// mip 0 sizes are `sizes`, under `settings`: a byte per texel of each unit that fits the
+    /// rasterizer. The bake reads the tiles of a set the mesh's uvs reach, which are not known
+    /// before it is read, and bakes when those all fit.
     pub(crate) fn micromap_bytes(&self, settings: &MeshSettings, sizes: &[[u32; 2]]) -> u64 {
-        let fits = |[w, h]: [u32; 2]| w <= OmmAlpha::MAX_SIZE && h <= OmmAlpha::MAX_SIZE;
-        let bakes =
-            settings.omm.is_some() && self.takes_micromaps() && sizes.iter().all(|&s| fits(s));
-        let texels: u64 = sizes
+        if settings.omm.is_none() || !self.takes_micromaps() {
+            return 0;
+        }
+        sizes
             .iter()
+            .filter(|&&[w, h]| w <= OmmAlpha::MAX_SIZE && h <= OmmAlpha::MAX_SIZE)
             .map(|&[w, h]| u64::from(w) * u64::from(h))
-            .sum();
-        u64::from(bakes) * texels
+            .sum()
     }
 
     /// A section of `indices` drawn with material `m`, whose back is `back` where it has one
