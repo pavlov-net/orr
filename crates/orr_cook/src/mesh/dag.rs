@@ -98,6 +98,28 @@ struct Clusters {
     tris: Vec<u8>,
 }
 
+impl Clusters {
+    /// Keeps the clusters `keep` takes, and only what they hold.
+    fn retain(&mut self, mut keep: impl FnMut(&DagCluster) -> bool) {
+        let (mut v, mut t) = (0, 0);
+        self.list.retain_mut(|c| {
+            if !keep(c) {
+                return false;
+            }
+            let (vn, tn) = (c.verts.len(), c.tris.len());
+            self.verts.copy_within(c.verts.clone(), v);
+            self.cells.copy_within(c.verts.clone(), v);
+            self.tris.copy_within(c.tris.clone(), t);
+            (c.verts, c.tris) = (v..v + vn, t..t + tn);
+            (v, t) = (v + vn, t + tn);
+            true
+        });
+        self.verts.truncate(v);
+        self.cells.truncate(v);
+        self.tris.truncate(t);
+    }
+}
+
 struct DagGroup {
     depth: u32,
     /// Bounds and error of the geometry the group simplifies into; infinity when terminal.
@@ -488,7 +510,6 @@ fn truncate(groups: &mut Vec<DagGroup>, m: f32) {
     let terminal: Vec<bool> = groups.iter().map(|g| g.error == f32::INFINITY).collect();
     for g in groups.iter_mut() {
         g.clusters
-            .list
             .retain(|c| c.refined < 0 || !terminal[c.refined as usize]);
     }
     let mut new_index = vec![-1i32; groups.len()];
