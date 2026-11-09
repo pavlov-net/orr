@@ -3,6 +3,7 @@
 #[path = "common/assembly.rs"]
 mod common_assembly;
 
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -13,7 +14,7 @@ use orr_cook::{
     Source, TextureSettings, Usage,
 };
 use orr_math::{DVec3, Quat, Vec3};
-use orr_pack::{Archive, AssetId, Class, Target};
+use orr_pack::{Archive, ArchiveWriter, AssetId, Class, Target};
 
 fn dir(name: &str) -> PathBuf {
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -389,6 +390,31 @@ fn rebuilds_cook_only_what_changed() {
         names(&recompressed, Outcome::Cooked).len(),
         entry_count(&recompressed)
     );
+}
+
+/// An archive holding every entry in another order, as one planned under other estimates does,
+/// is written anew in planned order.
+#[test]
+fn linked_entries_in_another_order_are_written_in_planned_order() {
+    let d = dir("incremental-order");
+    write_scene(&d);
+    let file = d.join("out.orr");
+    let m = manifest(&d, Target::File(file.clone()), MipFilter::Kaiser);
+    orr_cook::cook(&m, &opts(0)).unwrap();
+    let clean = std::fs::read(&file).unwrap();
+    let a = Archive::from_memory(clean.clone().into()).unwrap();
+    let mut entries: Vec<_> = a.entries().iter().collect();
+    entries.sort_by_key(|e| Reverse(e.name.offset));
+    let mut w = ArchiveWriter::create(Target::File(file.clone())).unwrap();
+    for e in entries {
+        w.copy_entry(&a, e).unwrap();
+    }
+    w.finish().unwrap();
+    assert_ne!(clean, std::fs::read(&file).unwrap());
+
+    let warm = orr_cook::cook(&m, &opts(0)).unwrap();
+    assert_eq!(names(&warm, Outcome::Archive).len(), entry_count(&warm));
+    assert_eq!(clean, std::fs::read(&file).unwrap());
 }
 
 #[test]

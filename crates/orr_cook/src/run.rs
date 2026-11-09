@@ -1434,16 +1434,24 @@ impl<'m, 's> Run<'m, 's> {
                 k(x).cmp(&k(y))
             });
             self.order[a] = order;
+            // A writer appends each entry's name and blob records after the previous entry's,
+            // so the old archive is the one this cook would write when every entry is linked
+            // from it and each follows on from the one before in write order.
             let unchanged = self.old[a].as_ref().is_some_and(|old| {
-                let mut linked = 0;
-                let all_old = self.order[a].iter().all(|&u| match &self.units[u].state {
-                    State::Done(d) if matches!(d.from, From::Old) => {
-                        linked += d.entries.len();
-                        true
-                    }
+                let entries = old.archive.entries();
+                let (mut linked, mut name, mut blob) = (0, 0, 0);
+                let in_order = self.order[a].iter().all(|&u| match &self.units[u].state {
+                    State::Done(d) if matches!(d.from, From::Old) => d.entries.iter().all(|&e| {
+                        let e = &entries[e];
+                        let next = e.name.offset == name && e.first_blob == blob;
+                        linked += 1;
+                        name += e.name.len;
+                        blob += e.blob_count;
+                        next
+                    }),
                     _ => false,
                 });
-                all_old && linked == old.archive.entries().len()
+                in_order && linked == entries.len()
             });
             self.writers.push(if unchanged {
                 None
