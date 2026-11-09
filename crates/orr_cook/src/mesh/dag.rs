@@ -6,8 +6,9 @@
 //! sections stay apart as attribute seams: a vertex belongs to one section, and positions
 //! where sections meet are protected, so the (permissive) simplifier moves them only along
 //! the border and never onto another section's vertex; the border coarsens with the rest.
-//! Clusters are cut by section as they are emitted; the pieces of one cluster share its
-//! group and bounds, so a cut takes all of them or none. With parts and a merge error the
+//! The finest clusters each lie in one section; coarser clusters are cut by section as they
+//! are emitted, and the pieces of one cluster share its group and bounds, so a cut takes all
+//! of them or none. With parts and a merge error the
 //! part stage is cut at that error: groups at or over it become terminal and the clusters
 //! simplified from them go. Each class then starts a merged stage from the terminal
 //! clusters of all its parts at rest pose, its errors raised by the merge error. A copy
@@ -570,6 +571,7 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
         weights: &weights,
         lock: &input.lock,
         remap: &input.remap,
+        sections: &input.sections,
     };
     super::clod::build(&config, mesh, &mut positions, |e| {
         group_of(&e, &input.welded, &input.sections, snap, max_indices)

@@ -33,14 +33,16 @@ impl Cluster {
     }
 }
 
-/// The mesh `build` reads besides its positions: 3 floats of attributes per vertex, and per
-/// vertex the first vertex at its position, as `meshopt_generatePositionRemap` gives it.
+/// The mesh `build` reads besides its positions: 3 floats of attributes per vertex, per
+/// vertex the first vertex at its position, as `meshopt_generatePositionRemap` gives it, and
+/// per vertex its section, which a triangle takes from its first corner.
 pub(super) struct Mesh<'a> {
     pub(super) indices: &'a [u32],
     pub(super) attributes: &'a [f32],
     pub(crate) weights: &'a [f32],
     pub(super) lock: &'a [u8],
     pub(super) remap: &'a [u32],
+    pub(super) sections: &'a [u16],
 }
 
 /// Positions that groups of one level write at disjoint unlocked vertices.
@@ -112,16 +114,92 @@ fn bounds_merge(clusters: &[Cluster]) -> Bounds {
     }
 }
 
-/// Splits `indices` into clusters appended to `clusters`, their corners to `out`.
+/// Splits `indices` into clusters and their corners, in the order meshoptimizer emits them.
+/// With `sections`, each section's triangles cluster apart and in parallel, sections
+/// ascending.
 fn clusterize(
-    clusters: &mut Vec<Cluster>,
-    out: &mut Vec<u32>,
     c: &ffi::clodConfig,
     positions: &[f32],
     indices: &[u32],
+    sections: Option<&[u16]>,
     refined: i32,
-) {
+) -> (Vec<Cluster>, Vec<u32>) {
     let _z = crate::profile::zone!("clod.clusterize");
+    let tris = indices.as_chunks::<3>().0;
+    let section = |t: &[u32; 3]| sections.map_or(0, |s| s[t[0] as usize]);
+    let (lo, hi) = match sections {
+        Some(_) => tris.iter().fold((u16::MAX, 0), |(lo, hi), t| {
+            let s = section(t);
+            (lo.min(s), hi.max(s))
+        }),
+        None => (0, 0),
+    };
+    // Each section's corners, sections ascending, which become its clusters' corners in
+    // place: the clusters of a section hold every one of its triangles once.
+    let (mut corners, ends) = if lo >= hi {
+        (indices.to_vec(), vec![indices.len()])
+    } else {
+        let mut ends = vec![0usize; usize::from(hi - lo) + 1];
+        for t in tris {
+            ends[usize::from(section(t) - lo)] += 3;
+        }
+        let mut at = 0;
+        for e in &mut ends {
+            at += *e;
+            *e = at - *e;
+        }
+        let mut corners = vec![0u32; indices.len()];
+        for t in tris {
+            let e = &mut ends[usize::from(section(t) - lo)];
+            corners[*e..*e + 3].copy_from_slice(t);
+            *e += 3;
+        }
+        ends.dedup();
+        (corners, ends)
+    };
+    let mut rest = corners.as_mut_slice();
+    let mut parts = Vec::with_capacity(ends.len());
+    let mut start = 0;
+    for &end in &ends {
+        let (part, tail) = rest.split_at_mut(end - start);
+        parts.push((start, part));
+        rest = tail;
+        start = end;
+    }
+    let cluster = |(start, part): (usize, &mut [u32])| {
+        let mut clusters = meshlets(c, positions, part, refined);
+        for k in &mut clusters {
+            k.index_offset += start;
+        }
+        clusters
+    };
+    let clusters = if parts.len() > 1 {
+        let each: Vec<Vec<Cluster>> = parts.into_par_iter().map(cluster).collect();
+        each.concat()
+    } else {
+        parts.into_iter().flat_map(cluster).collect()
+    };
+    (clusters, corners)
+}
+
+/// Clusters `corners`, over vertices of `positions`, and writes their corners over it in
+/// cluster order; returns the clusters, their offsets into `corners`.
+fn meshlets(
+    c: &ffi::clodConfig,
+    positions: &[f32],
+    corners: &mut [u32],
+    refined: i32,
+) -> Vec<Cluster> {
+    // meshoptimizer sizes scratch by the vertex count, so it sees only the vertices from
+    // the first `corners` uses to the last.
+    let (Some(&first), Some(&last)) = (corners.iter().min(), corners.iter().max()) else {
+        return Vec::new();
+    };
+    for v in corners.iter_mut() {
+        *v -= first;
+    }
+    let positions = &positions[first as usize * 3..last as usize * 3 + 3];
+    let indices = &*corners;
     // SAFETY: plain bound query.
     let max =
         unsafe { ffi::meshopt_buildMeshletsBound(indices.len(), c.max_vertices, c.min_triangles) };
@@ -171,11 +249,13 @@ fn clusterize(
             )
         }
     };
+    let mut clusters = Vec::with_capacity(count);
+    let mut at = 0;
     for m in &meshlets[..count] {
         let (vo, to) = (m.vertex_offset as usize, m.triangle_offset as usize);
         let n = m.triangle_count as usize * 3;
         clusters.push(Cluster {
-            index_offset: out.len(),
+            index_offset: at,
             index_count: n,
             refined,
             bounds: Bounds {
@@ -184,12 +264,13 @@ fn clusterize(
                 error: 0.0,
             },
         });
-        out.extend(
-            triangles[to..to + n]
-                .iter()
-                .map(|&t| vertices[vo + usize::from(t)]),
-        );
+        for (o, &t) in corners[at..at + n].iter_mut().zip(&triangles[to..to + n]) {
+            *o = first + vertices[vo + usize::from(t)];
+        }
+        at += n;
     }
+    assert_eq!(at, corners.len(), "clusters hold every triangle once");
+    clusters
 }
 
 /// Partitions `clusters` into groups in place; returns the group offsets.
@@ -542,15 +623,16 @@ pub(super) fn build<G: Send>(
     let positions = Positions(positions.as_mut_ptr(), positions.len());
     let mut out = Vec::new();
 
-    let (mut clusters, mut cluster_indices) = (Vec::new(), Vec::new());
-    clusterize(
-        &mut clusters,
-        &mut cluster_indices,
-        c,
-        positions.read(),
-        mesh.indices,
-        -1,
-    );
+    // Level 0 clusters each section apart, unless the triangles make one cluster: that one is
+    // the root, as in clodBuild.
+    let (mut clusters, mut cluster_indices) =
+        clusterize(c, positions.read(), mesh.indices, Some(mesh.sections), -1);
+    if clusters.len() > 1 && mesh.indices.len() <= c.max_triangles * 3 {
+        let one = clusterize(c, positions.read(), mesh.indices, None, -1);
+        if one.0.len() == 1 {
+            (clusters, cluster_indices) = one;
+        }
+    }
     {
         let _z = crate::profile::zone!("clod.bounds");
         clusters.par_iter_mut().for_each(|k| {
@@ -616,15 +698,8 @@ pub(super) fn build<G: Send>(
                 if c.simplify_dilate_borders {
                     dilate_borders(&positions, &merged, &simplified, &locks, remap, &mut bounds);
                 }
-                let (mut next, mut next_indices) = (Vec::new(), Vec::new());
-                clusterize(
-                    &mut next,
-                    &mut next_indices,
-                    c,
-                    positions.read(),
-                    &simplified,
-                    base + gi as i32,
-                );
+                let (mut next, next_indices) =
+                    clusterize(c, positions.read(), &simplified, None, base + gi as i32);
                 for k in &mut next {
                     k.bounds = bounds;
                 }
