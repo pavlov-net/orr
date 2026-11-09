@@ -105,13 +105,13 @@ const MESH_BYTES_PER_TRIANGLE: u64 = 480;
 /// source vertex, as vertices cost apart from triangles: fitted to the job peaks of a large
 /// scene's meshes that peaked past the read, a byte under a peak weighed far above a byte
 /// over it, since a job over its estimate takes working set others count on.
-const DAG_BYTES_PER_TRIANGLE: u64 = 57;
-const DAG_BYTES_PER_VERTEX: u64 = 215;
+const DAG_BYTES_PER_TRIANGLE: u64 = 74;
+const DAG_BYTES_PER_VERTEX: u64 = 196;
 
 /// Peak bytes a DAG mesh with subsurface sections adds per source triangle, as it cooks its
 /// groups in one batch for thickness to read every cluster: the least that covers meshes of
 /// few and of many vertices per triangle cooked with a subsurface material.
-const SUBSURFACE_BYTES_PER_TRIANGLE: u64 = 168;
+const SUBSURFACE_BYTES_PER_TRIANGLE: u64 = 163;
 
 /// Bytes a mesh cook holds per decoded texel channel of the maps its sections read
 /// ([`map_bytes`]): an f32 each. Textures decode one at a time, each taking
@@ -122,8 +122,8 @@ const MAP_DECODE_BYTES_PER_CHANNEL: u64 = 9;
 
 /// Peak bytes of reading a mesh per source triangle and per source vertex, which its maps
 /// decode beside: fitted to the read peaks of a large scene's meshes as the DAG constants are.
-const LOAD_BYTES_PER_TRIANGLE: u64 = 140;
-const LOAD_BYTES_PER_VERTEX: u64 = 88;
+const LOAD_BYTES_PER_TRIANGLE: u64 = 131;
+const LOAD_BYTES_PER_VERTEX: u64 = 66;
 
 pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
     let start = Instant::now();
