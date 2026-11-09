@@ -493,6 +493,8 @@ public interface IScatter
     // BSDF x cos, or the phase function, toward `wi`; in `pdf` the density the vertex's own
     // sampling draws `wi` with, and in `diffuse` what of the value its diffuse lobes give.
     float3 eval_and_pdf(float3 wi, out float pdf, out float3 diffuse);
+    // Whether `eval_and_pdf` gives 0 toward every direction.
+    bool specular_only();
 }
 
 // The shadow rays of next-event estimation.
@@ -519,11 +521,18 @@ public interface IShadow
 // `exterior_ior`. At a `chain` vertex, what a light other than the environment gives keeps
 // `keep` of the share outside the vertex's diffuse lobes, the caustic photons' to give. The
 // shadow ray reports texture feedback with `feedback` (`HitContext.feedback`). Draws one
-// sampler dimension and six per candidate, and counts the ray in `rays`.
+// sampler dimension and six per candidate, and counts the ray in `rays`. Where `f` is
+// `specular_only` no candidate has a value, so it takes the dimensions and draws none.
 public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot r, PathVertex x, F f, V shadow, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, float exterior_ior, float3 keep, bool chain, bool feedback, inout Sampler rng, inout uint rays, out uint light, bool no_environment = false)
 {
     LightSetGpu* set = r.set;
     light = NO_LIGHT;
+    uint end = rng.dimension + 1 + 6 * candidates;
+    if (f.specular_only())
+    {
+        rng.dimension = end;
+        return float3(0.0);
+    }
     NeeVertex v = nee_vertex(set, x.surface.position, x.surface.normal, pixel, local);
     ResolvedLightSample chosen = no_candidate();
     float chosen_target = 0.0;
@@ -531,7 +540,6 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
     float3 chosen_diffuse = float3(0.0);
     float chosen_scatter_pdf = 0.0;
     float sum = 0.0;
-    uint end = rng.dimension + 1 + 6 * candidates;
     bool directional = rng.next() < v.share;
     uint drawn = directional ? 1 : candidates;
     for (uint i = 0; i < drawn; i++)
@@ -696,6 +704,11 @@ public struct WalkExitScatter : IScatter
         density = pdf(wi);
         diffuse = eval(wi);
         return diffuse;
+    }
+
+    public bool specular_only()
+    {
+        return false;
     }
 }
 
@@ -873,6 +886,11 @@ public struct InteriorExitScatter : IScatter
         diffuse = eval(wi);
         return diffuse;
     }
+
+    public bool specular_only()
+    {
+        return false;
+    }
 }
 
 public InteriorExitScatter interior_exit(float3 n, float eta)
@@ -911,6 +929,11 @@ public struct VertexScatter : IScatter
         if (exit)
             return walk.eval_and_pdf(wi, density, diffuse);
         return b.eval_and_pdf(wi, density, diffuse);
+    }
+
+    public bool specular_only()
+    {
+        return !phase && !leave && !exit && b.specular_only();
     }
 }
 // `LayerVertex.kind`.

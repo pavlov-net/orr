@@ -122,6 +122,12 @@ impl RealTime {
         e
     }
 
+    /// `Bsdf.specular_only`.
+    pub fn specular_only(&self) -> bool {
+        // SAFETY: as in `albedo`.
+        unsafe { ffi::lighting_bsdf_specular_only(self.ptr()) != 0 }
+    }
+
     /// The lobe `Bsdf.sample` draws from `u` (`BsdfSample.component`).
     pub fn sample_component(&self, u: V3) -> u32 {
         // SAFETY: as in `albedo`; `u` is 3 floats.
@@ -439,6 +445,7 @@ mod ffi {
             specular: *mut f32,
         );
         pub(crate) fn lighting_bsdf_pdf(p: *const c_void, wi: *const f32) -> f32;
+        pub(crate) fn lighting_bsdf_specular_only(p: *const c_void) -> u32;
         pub(crate) fn lighting_bsdf_sample(
             p: *const c_void,
             u: *const f32,

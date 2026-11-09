@@ -322,6 +322,17 @@ public struct Bsdf : IDifferentiable
         return evaluate(local(wi), density, diffuse);
     }
 
+    // Whether `eval` gives 0 toward every direction: each lobe with a share is delta.
+    public bool specular_only()
+    {
+        bool glossy = (probability[SPECULAR] > 0.0 || probability[THIN_SPECULAR] > 0.0) && !mirror;
+        bool coat = probability[COAT] > 0.0 && !coat_mirror;
+        // At a mirror the walk lobe evaluates its multiple-scattering share alone.
+        bool walk = probability[WALK] > 0.0 && !(mirror && dms_ec == 0.0);
+        return !(glossy || coat || walk || probability[FUZZ] > 0.0 || probability[DIFFUSE] > 0.0 || probability[METAL_MS] > 0.0
+            || probability[THIN_DIFFUSE] > 0.0 || probability[DIELECTRIC_MS] > 0.0);
+    }
+
     // The density `sample` draws `wi` with, over every non-delta lobe.
     [ForwardDifferentiable]
     public float pdf(no_diff float3 wi)

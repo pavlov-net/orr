@@ -952,6 +952,94 @@ fn delta_values_match_the_samples_that_drew_them() {
     }
 }
 
+/// Next-event estimation skips a vertex that says it is specular only, so every non-delta
+/// sample must come from one that says it is not, and one that says it is must evaluate to
+/// nothing in every direction.
+#[test]
+fn specular_only_means_no_value_in_any_direction() {
+    let mut rng = Rng::new(23);
+    let mut bsdf = RealTime::new();
+    let mut collapsed = RealTime::collapsed();
+    let mut found = 0;
+    for case in 0..100_000 {
+        let (inputs, view_dir) = edge_case(&mut rng, case);
+        for b in [&mut bsdf, &mut collapsed] {
+            b.prepare(&inputs, view_dir);
+            let only = b.specular_only();
+            found += u32::from(only);
+            for _ in 0..8 {
+                let wi = edge_direction(&mut rng);
+                let u = [rng.f32(), rng.f32(), rng.f32()];
+                if !only {
+                    continue;
+                }
+                let e = b.eval(wi);
+                assert!(
+                    e.diffuse == [0.0; 3] && e.specular == [0.0; 3] && b.pdf(wi) == 0.0,
+                    "case {case}: {e:?} toward {wi:?} for {inputs:?} from {view_dir:?}"
+                );
+                if let Some(s) = b.sample(u) {
+                    assert!(
+                        s.lobe.is(Lobe::SPECULAR),
+                        "case {case}: {s:?} for {inputs:?} from {view_dir:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(found > 100, "{found} specular-only cases");
+
+    let glass = Inputs {
+        specular_roughness: 0.0,
+        transmission_weight: 1.0,
+        ..Inputs::default()
+    };
+    let mirror = Inputs {
+        specular_roughness: 0.0,
+        base_metalness: 1.0,
+        ..Inputs::default()
+    };
+    let window = Inputs {
+        geometry_thin_walled: 1,
+        ..glass
+    };
+    // From the front and from the back, where a solid shows no fuzz.
+    for (name, m, only) in [
+        ("glass", glass, [true, true]),
+        ("mirror", mirror, [true, true]),
+        ("window", window, [true, true]),
+        (
+            "rough glass",
+            Inputs {
+                specular_roughness: 0.3,
+                ..glass
+            },
+            [false, false],
+        ),
+        (
+            "polished plastic",
+            Inputs {
+                specular_roughness: 0.0,
+                ..Inputs::default()
+            },
+            [false, false],
+        ),
+        (
+            "fuzzy mirror",
+            Inputs {
+                fuzz_weight: 0.5,
+                ..mirror
+            },
+            [false, true],
+        ),
+    ] {
+        for (z, only) in [0.6f32, -0.6].into_iter().zip(only) {
+            bsdf.prepare(&m, [0.8, 0.0, z]);
+            assert_eq!(bsdf.specular_only(), only, "{name} from z {z}");
+        }
+    }
+}
+
 #[test]
 fn dispersed_iors_follow_the_abbe_number() {
     for (ior, scale, abbe) in [

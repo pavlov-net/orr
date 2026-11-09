@@ -38,6 +38,11 @@ export __extern_cpp float lighting_bsdf_pdf(Bsdf* p, float* wi)
     return p.pdf(load3(wi));
 }
 
+export __extern_cpp uint lighting_bsdf_specular_only(Bsdf* p)
+{
+    return p.specular_only() ? 1 : 0;
+}
+
 export __extern_cpp void lighting_bsdf_sample(Bsdf* p, float* u, float* wi, float* weight, float* pdf, uint* lobe)
 {
     store_sample(p.sample(load3(u)), wi, weight, pdf, lobe);
