@@ -76,6 +76,27 @@ const DECODED_CACHES: u64 = 4;
 /// Peak bytes of a subdivision cage cook per cage face, an estimate.
 const SUBD_BYTES_PER_FACE: u64 = 16 << 10;
 
+/// Estimated peak bytes of an instance unit's cook per placement.
+const INSTANCE_BYTES_PER_PLACEMENT: u64 = 256;
+
+/// The estimates that plan a scene source's units, which place them in the payload: its
+/// record carries their planned bytes, so these enter the source's identity, and a warm cook
+/// drops records planned otherwise and writes the payload as a clean cook does. Each
+/// estimate's constants, then a version to raise when an estimate changes in another way.
+const PLAN: &[&[u64]] = &[
+    &[
+        SUBD_BYTES_PER_FACE,
+        INSTANCE_BYTES_PER_PLACEMENT,
+        MESH_BYTES_PER_TRIANGLE,
+        DAG_BYTES_PER_TRIANGLE,
+        DAG_BYTES_PER_VERTEX,
+        SUBSURFACE_BYTES_PER_TRIANGLE,
+    ],
+    &texture::material::ESTIMATE,
+    &[neural::BYTES_PER_CHANNEL_TEXEL],
+    &[1],
+];
+
 /// Peak bytes of a discrete-level mesh cook per source triangle besides its maps, an upper
 /// bound.
 const MESH_BYTES_PER_TRIANGLE: u64 = 480;
@@ -721,6 +742,7 @@ impl<'m, 's> Run<'m, 's> {
             .str(&path.to_string_lossy())
             .debug(&kind)
             .debug(&self.shared.quality)
+            .debug(&PLAN)
             .finish();
         let identity = self.stored(a, identity);
         if let Some(record) = previous.get(&identity)
@@ -1291,7 +1313,7 @@ impl<'m, 's> Run<'m, 's> {
             deps.sort_unstable();
             deps.dedup();
             let key = self.stored(a, key.finish());
-            let working_set = src.records.len() as u64 * 256;
+            let working_set = src.records.len() as u64 * INSTANCE_BYTES_PER_PLACEMENT;
             if let Some((ra, r)) = record {
                 self.records[ra][r].units.push(RecordUnit {
                     key,

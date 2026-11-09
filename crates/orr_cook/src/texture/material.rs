@@ -2513,6 +2513,18 @@ impl Packer<'_> {
     }
 }
 
+/// Constants of [`TextureJob::working_set`], in the order its doc names them.
+pub(crate) const ESTIMATE: [u64; 4] = [
+    PASS_BYTES_PER_BYTE,
+    PASS_BYTES,
+    SOURCE_BYTES_PER_BYTE,
+    BYTES_PER_TEXEL,
+];
+const PASS_BYTES_PER_BYTE: u64 = 4;
+const PASS_BYTES: u64 = 4 << 20;
+const SOURCE_BYTES_PER_BYTE: u64 = 8;
+const BYTES_PER_TEXEL: u64 = 48;
+
 impl TextureJob {
     /// Estimated peak bytes. Passing every mip of a source's blocks through holds the source,
     /// its blocks and the texture's blobs as built and stored: 4 bytes per byte of the source
@@ -2535,10 +2547,14 @@ impl TextureJob {
                     f.mip_bytes(mw, mh) as u64
                 })
                 .sum();
-            return images[p.image].len().max(blocks) * 4 + (4 << 20);
+            return images[p.image].len().max(blocks) * PASS_BYTES_PER_BYTE + PASS_BYTES;
         }
-        let sources: u64 = self.images.iter().map(|&(i, _)| images[i].len() * 8).sum();
-        sources + u64::from(self.size[0]) * u64::from(self.size[1]) * 48
+        let sources: u64 = self
+            .images
+            .iter()
+            .map(|&(i, _)| images[i].len() * SOURCE_BYTES_PER_BYTE)
+            .sum();
+        sources + u64::from(self.size[0]) * u64::from(self.size[1]) * BYTES_PER_TEXEL
     }
 
     pub(crate) fn run(&self, images: &[ImageFile], decoded: &Decoded<Img>) -> Result<Built> {

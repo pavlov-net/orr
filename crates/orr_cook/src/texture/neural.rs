@@ -62,6 +62,10 @@ impl Default for NeuralSettings {
 /// LibNTC's channel limit.
 const MAX_CHANNELS: usize = 16;
 
+/// Bytes a set's cook holds per channel texel past its members' texture jobs, for the chains
+/// and the decoded mip 0: three f32s.
+pub(crate) const BYTES_PER_CHANNEL_TEXEL: u64 = 4 * 3;
+
 /// LibNTC's `ChannelFormat` values.
 const UNORM8: i32 = 1;
 const UNORM16: i32 = 2;
@@ -198,12 +202,15 @@ impl NeuralJob {
             .collect()
     }
 
-    /// Estimated peak bytes: the members' texture jobs, then 4 bytes per channel texel of
-    /// the chains and the decoded mip 0.
+    /// Estimated peak bytes: the members' texture jobs, then [`BYTES_PER_CHANNEL_TEXEL`] per
+    /// channel texel of the chains and the decoded mip 0.
     pub(crate) fn working_set(&self, images: &[ImageFile]) -> u64 {
         let jobs: u64 = self.members.iter().map(|m| m.job.working_set(images)).sum();
         let channels: u64 = self.members.iter().map(|m| u64::from(m.channels)).sum();
-        jobs + u64::from(self.size[0]) * u64::from(self.size[1]) * channels * 4 * 3
+        jobs + u64::from(self.size[0])
+            * u64::from(self.size[1])
+            * channels
+            * BYTES_PER_CHANNEL_TEXEL
     }
 
     fn fail(&self, message: String) -> Error {
