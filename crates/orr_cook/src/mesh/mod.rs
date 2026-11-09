@@ -1549,25 +1549,25 @@ impl Grid {
         let step = 2f64.powi(k);
         // Dividing by a power of two is multiplying by its exact inverse.
         let inverse = 2f64.powi(-k);
-        let cell = |p: &[f32; 3]| p.map(|x| (f64::from(x) * inverse + 0.5).floor());
-        let over = |p: &[f32; 3]| cell(p).iter().any(|v| v.abs() >= f64::from(1 << 23));
-        if let Some(i) = positions.par_iter().light().position_first(over) {
+        // `as` saturates, so a cell past 2^23 stays past it.
+        let cells: Vec<[i32; 3]> = positions
+            .par_iter()
+            .light()
+            .map(|p| p.map(|x| (f64::from(x) * inverse + 0.5).floor() as i32))
+            .collect();
+        let largest = |g: &[i32; 3]| g.iter().fold(0, |m, v| m.max(v.unsigned_abs()));
+        let max_abs = cells.par_iter().light().map(largest).max().unwrap_or(0);
+        if max_abs >= 1 << 23 {
+            let i = cells
+                .par_iter()
+                .light()
+                .position_first(|g| largest(g) >= 1 << 23)
+                .expect("a cell past 2^23");
             let p = positions[i];
             return Err(format!(
                 "position {p:?} m needs more than 24 bits on the 2^{k} m grid"
             ));
         }
-        let cells: Vec<[i32; 3]> = positions
-            .par_iter()
-            .light()
-            .map(|p| cell(p).map(|v| v as i32))
-            .collect();
-        let max_abs = cells
-            .par_iter()
-            .light()
-            .map(|g| g.iter().fold(0, |m, v| m.max(v.unsigned_abs())))
-            .max()
-            .unwrap_or(0);
         let floats: Vec<[f32; 3]> = cells
             .par_iter()
             .light()
