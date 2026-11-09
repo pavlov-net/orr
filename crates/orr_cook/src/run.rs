@@ -74,9 +74,18 @@ const DECODED_CACHES: u64 = 3;
 /// Peak bytes of a subdivision cage cook per cage face, an estimate.
 const SUBD_BYTES_PER_FACE: u64 = 16 << 10;
 
-/// Peak bytes of a mesh cook per source triangle (P2's clodBuild process peak, an upper
-/// bound).
+/// Peak bytes of a discrete-level mesh cook per source triangle besides its maps (P2's
+/// clodBuild process peak, an upper bound).
 const MESH_BYTES_PER_TRIANGLE: u64 = 480;
+
+/// Peak bytes of a DAG mesh cook per source triangle besides its maps: the most measured
+/// over the 9 to 32 million triangle meshes of a 302 million triangle scene, 164 B, and a
+/// tenth more.
+const DAG_BYTES_PER_TRIANGLE: u64 = 180;
+
+/// Peak bytes of a mesh cook per decoded texel channel of the maps its sections read
+/// ([`map_channels`]).
+const MAP_BYTES_PER_CHANNEL: u64 = 16;
 
 pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
     let start = Instant::now();
@@ -775,18 +784,36 @@ impl<'m, 's> Run<'m, 's> {
         for d in dependents.into_iter().flatten() {
             self.pending[d] -= 1;
             if self.pending[d] == 0 {
-                self.make_ready(d);
+                self.make_ready(d)?;
             }
         }
         Ok(())
     }
 
-    fn make_ready(&mut self, u: usize) {
+    fn make_ready(&mut self, u: usize) -> Result<()> {
         if let Some(Work::Model(..) | Work::Same) = self.units[u].work {
             self.local.push(u);
-        } else {
-            self.ready.insert((Reverse(self.units[u].working_set), u));
+            return Ok(());
         }
+        // A mesh's maps are cooked once it is ready, so its estimate can count them.
+        if let Some(Work::Mesh(source, settings, _)) = &self.units[u].work {
+            let a = self.units[u].archive;
+            let header = |unit: &str| {
+                let from = match &self.units[self.by_name[&(a, unit.to_owned())]].state {
+                    State::Done(d) => &d.from,
+                    State::Written(Some(f)) => f,
+                    _ => unreachable!("a mesh is ready after the textures it reads"),
+                };
+                self.with_archive(a, from, |arc| {
+                    texture_head(arc, AssetId::from_name(unit)).map(|(_, info)| info.header)
+                })?
+            };
+            let channels = map_channels(source.sections(), header)?;
+            self.units[u].working_set =
+                mesh_working_set(source.triangles(), settings) + channels * MAP_BYTES_PER_CHANNEL;
+        }
+        self.ready.insert((Reverse(self.units[u].working_set), u));
+        Ok(())
     }
 
     fn run<'t>(&mut self, scope: &'t Scope<'t, '_>, threads: usize) -> Result<()>
@@ -1231,7 +1258,7 @@ impl<'m, 's> Run<'m, 's> {
                 }
             }
             if self.pending[u] == 0 {
-                self.make_ready(u);
+                self.make_ready(u)?;
             }
         }
         Ok(())
@@ -2467,7 +2494,7 @@ fn geometry_units(
             name: m.name,
             class: Class::Mesh as u16,
             key,
-            working_set: triangles * MESH_BYTES_PER_TRIANGLE,
+            working_set: mesh_working_set(triangles, &m.settings),
             triangles,
             work: Work::Mesh(m.mesh, m.settings, HashMap::new()),
             deps: m.deps,
@@ -2867,6 +2894,73 @@ fn texture_mips(
         }
     }
     Ok(out)
+}
+
+/// The estimated peak bytes of a mesh cook besides its maps.
+fn mesh_working_set(triangles: u64, settings: &MeshSettings) -> u64 {
+    triangles
+        * match settings.lod {
+            mesh::LodMode::Dag => DAG_BYTES_PER_TRIANGLE,
+            mesh::LodMode::Discrete { .. } => MESH_BYTES_PER_TRIANGLE,
+        }
+}
+
+/// Texel channels [`section_maps`] decodes for these sections, each texture once per use:
+/// mip 0 of an opacity texture (one channel) and of a normal map (two), every mip of a
+/// height (one) and an emission texture's mip at most [`EmissionMap::SIDE_MAX`] a side
+/// (three). `header` gives a texture unit's header.
+fn map_channels(
+    sections: &[SectionData],
+    mut header: impl FnMut(&str) -> Result<orr_pack::texture::TextureHeader>,
+) -> Result<u64> {
+    let mut seen = HashSet::new();
+    let mut total = 0;
+    let mut add = |texture: &MapTexture, use_: u8, total: &mut u64| -> Result<()> {
+        for unit in texture.units() {
+            if !seen.insert((unit.to_owned(), use_)) {
+                continue;
+            }
+            let h = header(unit)?;
+            let texels = |mip: u32| {
+                let [w, h] = h.mip_size(mip);
+                u64::from(w) * u64::from(h)
+            };
+            *total += match use_ {
+                0 => texels(0),
+                1 => 2 * texels(0),
+                2 => (0..u32::from(h.mip_count)).map(texels).sum(),
+                _ => {
+                    let mip = (0..u32::from(h.mip_count))
+                        .find(|&m| h.mip_size(m).into_iter().max() <= Some(EmissionMap::SIDE_MAX))
+                        .unwrap_or_else(|| u32::from(h.mip_count) - 1);
+                    3 * texels(mip)
+                }
+            };
+        }
+        Ok(())
+    };
+    for s in sections {
+        let m = &s.maps;
+        if let OpacitySpec::Texture { texture, .. } = &m.opacity {
+            add(texture, 0, &mut total)?;
+        }
+        if let NormalSpec::Texture { texture, .. } = &m.normal {
+            add(texture, 1, &mut total)?;
+        }
+        let heights = m
+            .displacement
+            .iter()
+            .chain(m.tangent_displacement.iter().flatten());
+        for d in heights {
+            if let Some(t) = &d.texture {
+                add(&t.texture, 2, &mut total)?;
+            }
+        }
+        if let Some(e) = &m.emission {
+            add(&e.texture, 3, &mut total)?;
+        }
+    }
+    Ok(total)
 }
 
 /// Cooks one unit into a one-unit archive: in the cache when there is one, else in `spill`
