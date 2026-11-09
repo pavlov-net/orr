@@ -471,7 +471,7 @@ impl<'q> CommandList<'q> {
             e.writeTimestampWithGranularity_intoHeap_atIndex(
                 MTL4TimestampGranularity::Precise,
                 &ring.heap,
-                TimestampRing::index(seq) as usize,
+                TimestampRing::index(seq),
             );
         }
         self.end_encoder();
