@@ -1511,10 +1511,9 @@ fn position_bounds(positions: &[[f32; 3]]) -> Aabb {
         })
         .reduce(
             || Aabb::EMPTY,
-            |mut a, b| {
-                a.extend(b.min);
-                a.extend(b.max);
-                a
+            |a, b| Aabb {
+                min: [0, 1, 2].map(|i| a.min[i].min(b.min[i])),
+                max: [0, 1, 2].map(|i| a.max[i].max(b.max[i])),
             },
         )
 }
