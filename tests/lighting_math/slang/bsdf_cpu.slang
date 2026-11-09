@@ -97,6 +97,12 @@ export __extern_cpp void lighting_bsdf_emission(Bsdf* p, float* out)
     store3(out, p.emission());
 }
 
+// Along `wi`, through a surface whose geometric normal is the shading normal.
+export __extern_cpp void lighting_bsdf_straight_transmission(Inputs* m, float* wi, float* out)
+{
+    store3(out, bsdf_straight_transmission(bsdf_params(*m), float3(0.0, 0.0, 1.0), load3(wi), m.exterior_ior));
+}
+
 export __extern_cpp void lighting_bsdf_volume(Inputs* m, float* extinction, float* albedo, float* anisotropy)
 {
     SubsurfaceVolume v = bsdf_subsurface_volume(bsdf_params(*m));

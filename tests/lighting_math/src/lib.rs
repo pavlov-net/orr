@@ -159,6 +159,14 @@ pub fn camera_weight(inputs: &Inputs, view: V3, u: V3) -> f32 {
     unsafe { ffi::lighting_bsdf_camera_weight(inputs, view.as_ptr(), u.as_ptr()) }
 }
 
+/// `bsdf_straight_transmission` of the material along `wi`.
+pub fn straight_transmission(inputs: &Inputs, wi: V3) -> V3 {
+    let mut t = [0.0; 3];
+    // SAFETY: `wi` and the output are 3 floats.
+    unsafe { ffi::lighting_bsdf_straight_transmission(inputs, wi.as_ptr(), t.as_mut_ptr()) };
+    t
+}
+
 /// `bsdf_subsurface_volume` of the material.
 pub fn subsurface_volume(inputs: &Inputs) -> Volume {
     let mut v = Volume::default();
@@ -483,6 +491,11 @@ mod ffi {
             pdf: *mut f32,
             d_eval: *mut f32,
             d_pdf: *mut f32,
+        );
+        pub(crate) fn lighting_bsdf_straight_transmission(
+            inputs: *const Inputs,
+            wi: *const f32,
+            out: *mut f32,
         );
         pub(crate) fn lighting_bsdf_volume(
             inputs: *const Inputs,

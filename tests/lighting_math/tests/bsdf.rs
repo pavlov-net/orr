@@ -7,7 +7,7 @@ use std::thread;
 
 use lighting_math::{
     RealTime, camera_weight, dispersed_ior, edge_case, edge_direction, finite_non_negative,
-    spectral_transfer, subsurface_volume,
+    spectral_transfer, straight_transmission, subsurface_volume,
 };
 use openpbr_ref::harness::{self, Estimate, integrate_cells};
 use openpbr_ref::materials::{Material, VIEW_COSINES, grid, view};
@@ -776,6 +776,52 @@ fn camera_paths_through_thin_walls_keep_their_radiance() {
             }
         }
         assert!(through > 0, "{inputs:?}");
+    }
+}
+
+/// OpenPBR's `coat_color` is the square of the coat's transmittance at normal incidence, for light
+/// in and back out. A ray straight through a coated window crosses the coat once, as the window's
+/// transmission lobe does.
+#[test]
+fn a_coat_tints_straight_transmission_as_it_tints_a_windows_lobe() {
+    const THIN_SPECULAR: u32 = 7;
+    let coated = Inputs {
+        transmission_weight: 1.0,
+        geometry_thin_walled: 1,
+        specular_roughness: 0.0,
+        coat_weight: 1.0,
+        coat_color: [0.25, 0.5, 0.81],
+        ..Inputs::default()
+    };
+    let bare = Inputs {
+        coat_weight: 0.0,
+        ..coated
+    };
+    let mut bsdf = RealTime::new();
+    for c in [1.0f32, 0.6, 0.2] {
+        let view = [(1.0 - c * c).sqrt(), 0.0, c];
+        let wi = view.map(|x| -x);
+        let mut lobe = |inputs: &Inputs| {
+            bsdf.prepare(inputs, view);
+            let (value, chance) = bsdf.delta_value(THIN_SPECULAR, wi);
+            assert!(chance > 0.0);
+            value
+        };
+        let (lobe_coated, lobe_bare) = (lobe(&coated), lobe(&bare));
+        let (straight_coated, straight_bare) = (
+            straight_transmission(&coated, wi),
+            straight_transmission(&bare, wi),
+        );
+        for k in 0..3 {
+            let (straight, lobe) = (
+                straight_coated[k] / straight_bare[k],
+                lobe_coated[k] / lobe_bare[k],
+            );
+            assert!(
+                (straight - lobe).abs() < 1e-4,
+                "cos {c}: {straight} through, {lobe} in the lobe"
+            );
+        }
     }
 }
 

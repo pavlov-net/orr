@@ -927,11 +927,18 @@ public struct Bsdf : IDifferentiable
     {
         if (coat_tint_presence == 0.0 || all(coat_tint >= 1.0))
             return float3(1.0);
-        float s2 = (1.0 - c * c) / (coat_eta * coat_eta);
-        float refracted = sqrt(max(0.0, 1.0 - s2));
-        float3 through = pow(sqrt(max(coat_tint, 0.0)), float3(1.0 / max(refracted, 1e-6)));
-        return lerp(float3(1.0), through, coat_tint_presence);
+        return lerp(float3(1.0), coat_transmittance(coat_tint, coat_eta, c), coat_tint_presence);
     }
+}
+
+// The transmittance of one passage through a coat of relative IOR `eta`, along a direction at
+// cosine `c` > 0 outside it. `color` is OpenPBR's `coat_color`, the square of this at `c` = 1
+// for light in and back out.
+float3 coat_transmittance(float3 color, float eta, float c)
+{
+    float s2 = (1.0 - c * c) / (eta * eta);
+    float refracted = sqrt(max(0.0, 1.0 - s2));
+    return pow(sqrt(max(color, 0.0)), float3(1.0 / max(refracted, 1e-6)));
 }
 
 // A specular microfacet toward a direction: GGX's density `d` there, its cosine `c` to the view,
@@ -1147,7 +1154,10 @@ public float3 straight_transmission(StraightSurface s, float exterior_ior, bool 
     float reflected = mix && !inside ? max_component(mix_reflection(s.specular_color, s.specular_weight, mu)) : openpbr_fresnel(eta, mu);
     float3 t = s.share * (1.0 - reflected) * view_tint(s.color, thin && !mix, mu, eta);
     if (s.coat_weight > 0.0)
-        t *= lerp(float3(1.0), s.coat_color * (1.0 - openpbr_fresnel(max(s.coat_ior, MIN_IOR) / exterior_ior, mu)), s.coat_weight);
+    {
+        float coat_eta = max(s.coat_ior, MIN_IOR) / exterior_ior;
+        t *= lerp(float3(1.0), coat_transmittance(s.coat_color, coat_eta, mu) * (1.0 - openpbr_fresnel(coat_eta, mu)), s.coat_weight);
+    }
     return max(t, 0.0);
 }
 
