@@ -2782,15 +2782,26 @@ fn normal_map(
     })
 }
 
-/// Decodes into the caches the lone textures [`section_maps`] reads for `sections` through
-/// them, so it finds them there. Tile sets wait for the mesh: its uvs pick their tiles.
+/// Maps [`decode_maps`] decoded for [`section_maps`], held for it by cook key: a cache keeps
+/// no map over its limit, and other jobs' maps can push one out.
+#[derive(Default)]
+struct Prefetched {
+    /// By key and cutoff bits.
+    opacity: HashMap<(Hash32, u32), Arc<OpacityMap>>,
+    normals: HashMap<Hash32, Arc<NormalMap>>,
+    emission: HashMap<Hash32, Arc<EmissionMap>>,
+}
+
+/// Decodes, through the caches, the lone textures [`section_maps`] reads for `sections`.
+/// Tile sets wait for the mesh: its uvs pick their tiles.
 fn decode_maps(
     sections: &[SectionData],
     archives: &HashMap<String, Arc<Archive>>,
     normals: bool,
     shared: &Shared,
-) -> Result<()> {
+) -> Result<Prefetched> {
     let _z = crate::profile::zone!("mesh.decode_maps");
+    let mut held = Prefetched::default();
     for s in sections {
         if let OpacitySpec::Texture {
             texture,
@@ -2799,40 +2810,66 @@ fn decode_maps(
             ..
         } = &s.maps.opacity
             && texture.tiles.is_empty()
+            && let Entry::Vacant(v) = held.opacity.entry((texture.key, cutoff.to_bits()))
         {
-            opacity_map(
+            v.insert(opacity_map(
                 archives,
                 &texture.unit,
                 texture.key,
                 *cutoff,
                 *read,
                 &shared.opacity,
-            )?;
+            )?);
         }
         if let NormalSpec::Texture { texture, read, .. } = &s.maps.normal
             && normals
             && texture.tiles.is_empty()
+            && let Entry::Vacant(v) = held.normals.entry(texture.key)
         {
-            normal_map(archives, &texture.unit, texture.key, *read, &shared.normals)?;
+            v.insert(normal_map(
+                archives,
+                &texture.unit,
+                texture.key,
+                *read,
+                &shared.normals,
+            )?);
         }
         if let Some(e) = &s.maps.emission
             && e.texture.tiles.is_empty()
+            && let Entry::Vacant(v) = held.emission.entry(e.texture.key)
         {
             let unit = &e.texture.unit;
-            shared.emission.get((e.texture.key, 0), || {
-                emission_map(&archives[unit], AssetId::from_name(unit))
-            })?;
+            v.insert(emission_map_cached(
+                archives,
+                unit,
+                e.texture.key,
+                &shared.emission,
+            )?);
         }
     }
-    Ok(())
+    Ok(held)
 }
 
-/// The cooked maps a mesh's sections read, from the archives holding their texture units.
+/// The [`emission_map`] of emission texture `unit` (cook key `key`), from `cache` when held.
+fn emission_map_cached(
+    archives: &HashMap<String, Arc<Archive>>,
+    unit: &str,
+    key: Hash32,
+    cache: &Decoded<EmissionMap>,
+) -> Result<Arc<EmissionMap>> {
+    cache.get((key, 0), || {
+        emission_map(&archives[unit], AssetId::from_name(unit))
+    })
+}
+
+/// The cooked maps a mesh's sections read, from `held` or the archives holding their texture
+/// units.
 fn section_maps(
     m: &MeshData,
     archives: &HashMap<String, Arc<Archive>>,
     normals: bool,
     shared: &Shared,
+    held: &Prefetched,
 ) -> Result<Vec<SectionMaps>> {
     let _z = crate::profile::zone!("mesh.maps");
     let read = |unit: &str, all: bool, read, channels| {
@@ -2863,7 +2900,10 @@ fn section_maps(
                 uv_set,
             } => {
                 let texture_read = |unit: &str, key: Hash32, at: MapRead| {
-                    let map = opacity_map(archives, unit, key, *cutoff, at, &shared.opacity)?;
+                    let map = match held.opacity.get(&(key, cutoff.to_bits())) {
+                        Some(map) => Arc::clone(map),
+                        None => opacity_map(archives, unit, key, *cutoff, at, &shared.opacity)?,
+                    };
                     Ok(OpacityRead {
                         mip0: Raster {
                             w: map.w,
@@ -2930,7 +2970,10 @@ fn section_maps(
                 ..
             } if normals => {
                 let pair = |unit: &str, key, at: MapRead| {
-                    let map = normal_map(archives, unit, key, at, &shared.normals)?;
+                    let map = match held.normals.get(&key) {
+                        Some(map) => Arc::clone(map),
+                        None => normal_map(archives, unit, key, at, &shared.normals)?,
+                    };
                     Ok([0, 1].map(|c| Raster {
                         w: map.w,
                         h: map.h,
@@ -2953,9 +2996,10 @@ fn section_maps(
                 let y = luminance_weights(&archives[unit], AssetId::from_name(unit))?;
                 let luminance = |[r, g, b, _]: [f32; 4]| y.x * r + y.y * g + y.z * b;
                 let tile = |unit: &str, key: Hash32, at: MapRead| {
-                    let map = shared.emission.get((key, 0), || {
-                        emission_map(&archives[unit], AssetId::from_name(unit))
-                    })?;
+                    let map = match held.emission.get(&key) {
+                        Some(map) => Arc::clone(map),
+                        None => emission_map_cached(archives, unit, key, &shared.emission)?,
+                    };
                     Ok(Raster {
                         w: map.w,
                         h: map.h,
@@ -3260,15 +3304,15 @@ fn cook_unit(
                 (data, decode.join().unwrap_or_else(|p| resume_unwind(p)))
             });
             let mut data = data?;
-            decoded?;
+            let held = decoded?;
             let uv_warnings = data.pad_uv_sets();
             mesh::check(&data, &settings).map_err(|message| Error::Mesh {
                 asset: name.into(),
                 message,
             })?;
             data.compute_tangents();
-            let maps = section_maps(&data, &archives, normals, shared)?;
-            drop(archives);
+            let maps = section_maps(&data, &archives, normals, shared, &held)?;
+            drop((held, archives));
             let gdeflate = w.gdeflate();
             let compress = mesh::Compress {
                 zstd_level: w.zstd_level(),
