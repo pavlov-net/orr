@@ -74,6 +74,7 @@ pub(crate) fn face_normal(p: [Vec3; 3]) -> Vec3 {
 /// `v` with the elements `copies` names appended, unless it is empty.
 pub(crate) fn with_copies<T: Copy>(mut v: Vec<T>, copies: &[u32]) -> Vec<T> {
     if !v.is_empty() {
+        v.reserve_exact(copies.len());
         for &i in copies {
             v.push(v[i as usize]);
         }
@@ -113,6 +114,7 @@ pub(crate) fn per_vertex(
         })
         .collect();
     let mut copies = Vec::new();
+    let mut moved = Vec::new();
     let mut copied: FxHashMap<(u32, [u32; 4]), u32> = FxHashMap::default();
     for c in differ {
         let (source, t) = (indices[c], corners[c]);
@@ -120,10 +122,12 @@ pub(crate) fn per_vertex(
         let key = t.map(|x| (x + 0.0).to_bits());
         indices[c] = *copied.entry((source, key)).or_insert_with(|| {
             copies.push(source);
-            tangents.push(t);
+            moved.push(t);
             (count + copies.len() - 1) as u32
         });
     }
+    tangents.reserve_exact(moved.len());
+    tangents.extend(moved);
     (tangents, copies)
 }
 
