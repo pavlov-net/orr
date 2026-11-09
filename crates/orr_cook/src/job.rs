@@ -15,10 +15,13 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 /// Bytes a thread's changes reach before they are added to the counts.
 pub(crate) const BATCH: i64 = 256 << 10;
 
-/// Live bytes and their peak since the counter was reset.
+/// Live bytes and their peak since the counter was reset, and with the `tracy` feature the
+/// name of the job counting on it.
 struct Counter {
     live: AtomicI64,
     peak: AtomicI64,
+    #[cfg(feature = "tracy")]
+    name: Mutex<Option<std::sync::Arc<str>>>,
 }
 
 impl Counter {
@@ -26,6 +29,8 @@ impl Counter {
         Self {
             live: AtomicI64::new(0),
             peak: AtomicI64::new(0),
+            #[cfg(feature = "tracy")]
+            name: Mutex::new(None),
         }
     }
 
@@ -51,9 +56,6 @@ static FREE: Mutex<Vec<&'static Counter>> = Mutex::new(Vec::new());
 #[derive(Copy, Clone)]
 pub(crate) struct Job {
     counter: &'static Counter,
-    /// The unit's name, for profiler zones.
-    #[cfg(feature = "tracy")]
-    name: &'static str,
 }
 
 impl PartialEq for Job {
@@ -66,6 +68,13 @@ thread_local! {
     static CURRENT: Cell<Option<Job>> = const { Cell::new(None) };
     /// Changes not yet added: to the current job's count, and to the total.
     static PENDING: Cell<[i64; 2]> = const { Cell::new([0; 2]) };
+}
+
+#[cfg(feature = "tracy")]
+thread_local! {
+    /// The current job's name, for profiler zones.
+    static NAME: std::cell::RefCell<Option<std::sync::Arc<str>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The counter of one running job, given back when it drops.
@@ -83,12 +92,14 @@ impl Meter {
 
     /// The context of the job named `name`.
     pub(crate) fn job(&self, name: &str) -> Job {
+        #[cfg(feature = "tracy")]
+        {
+            *self.counter.name.lock().expect("job name") = Some(name.into());
+        }
         #[cfg(not(feature = "tracy"))]
         let _ = name;
         Job {
             counter: self.counter,
-            #[cfg(feature = "tracy")]
-            name: Box::leak(name.into()),
         }
     }
 
@@ -104,6 +115,10 @@ impl Meter {
 
 impl Drop for Meter {
     fn drop(&mut self) {
+        #[cfg(feature = "tracy")]
+        {
+            *self.counter.name.lock().expect("job name") = None;
+        }
         FREE.lock().expect("meter list").push(self.counter);
     }
 }
@@ -121,10 +136,14 @@ pub(crate) fn current() -> Option<Job> {
     CURRENT.get()
 }
 
-/// The name of the calling thread's job.
+/// Calls `f` with the name of the calling thread's job, if it has one.
 #[cfg(feature = "tracy")]
-pub(crate) fn name() -> Option<&'static str> {
-    CURRENT.get().map(|j| j.name)
+pub(crate) fn with_name(f: impl FnOnce(&str)) {
+    NAME.with_borrow(|n| {
+        if let Some(n) = n {
+            f(n);
+        }
+    });
 }
 
 /// Enters `job` on the calling thread until the returned value drops; entering the job the
@@ -132,21 +151,40 @@ pub(crate) fn name() -> Option<&'static str> {
 pub(crate) fn enter(job: Option<Job>) -> Entered {
     let previous = CURRENT.get();
     if previous == job {
-        return Entered(None);
+        return Entered {
+            previous: None,
+            #[cfg(feature = "tracy")]
+            name: None,
+        };
     }
     flush();
     CURRENT.set(job);
-    Entered(Some(previous))
+    #[cfg(feature = "tracy")]
+    let name = {
+        let name = job.and_then(|j| j.counter.name.lock().expect("job name").clone());
+        NAME.replace(name)
+    };
+    Entered {
+        previous: Some(previous),
+        #[cfg(feature = "tracy")]
+        name,
+    }
 }
 
 /// Restores the thread's previous job when it drops.
-pub(crate) struct Entered(Option<Option<Job>>);
+pub(crate) struct Entered {
+    previous: Option<Option<Job>>,
+    #[cfg(feature = "tracy")]
+    name: Option<std::sync::Arc<str>>,
+}
 
 impl Drop for Entered {
     fn drop(&mut self) {
-        if let Some(previous) = self.0 {
+        if let Some(previous) = self.previous {
             flush();
             CURRENT.set(previous);
+            #[cfg(feature = "tracy")]
+            NAME.set(self.name.take());
         }
     }
 }

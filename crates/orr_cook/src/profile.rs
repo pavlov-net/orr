@@ -7,9 +7,7 @@ macro_rules! zone {
     ($name:literal) => {
         ::tracy_client::Client::running().map(|c| {
             let span = c.span(::tracy_client::span_location!($name), 0);
-            if let Some(job) = $crate::job::name() {
-                span.emit_text(job);
-            }
+            $crate::job::with_name(|job| span.emit_text(job));
             span
         })
     };
