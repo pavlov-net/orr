@@ -98,31 +98,33 @@ struct Scene {
 impl Scene {
     fn new(clusters: &[&mut ClusterData], grid: &Grid) -> Self {
         let step = grid.step();
-        let own: Vec<Vec<[DVec3; 3]>> = clusters
-            .par_iter()
-            .map(|c| {
-                let corner = |i: u8| {
-                    let l = c.local[usize::from(i)];
-                    DVec3::from_array(
-                        [0, 1, 2].map(|a| (f64::from(c.record.anchor[a]) + f64::from(l[a])) * step),
-                    )
-                };
-                c.tris
-                    .as_chunks::<3>()
-                    .0
-                    .iter()
-                    .map(|t| t.map(corner))
-                    .collect()
-            })
-            .collect();
         let mut first = vec![0];
         let mut cluster_of = Vec::new();
-        for (ci, t) in own.iter().enumerate() {
-            cluster_of.extend(std::iter::repeat_n(ci as u32, t.len()));
+        for (ci, c) in clusters.iter().enumerate() {
+            cluster_of.extend(std::iter::repeat_n(ci as u32, c.tris.len() / 3));
             first.push(cluster_of.len());
         }
+        let mut tris = vec![[DVec3::ZERO; 3]; cluster_of.len()];
+        let mut rest = tris.as_mut_slice();
+        let mut slots = Vec::with_capacity(clusters.len());
+        for c in clusters {
+            let (head, tail) = rest.split_at_mut(c.tris.len() / 3);
+            slots.push(head);
+            rest = tail;
+        }
+        clusters.par_iter().zip(slots).for_each(|(c, out)| {
+            let corner = |i: u8| {
+                let l = c.local[usize::from(i)];
+                DVec3::from_array(
+                    [0, 1, 2].map(|a| (f64::from(c.record.anchor[a]) + f64::from(l[a])) * step),
+                )
+            };
+            for (o, t) in out.iter_mut().zip(c.tris.as_chunks::<3>().0) {
+                *o = t.map(corner);
+            }
+        });
         let mut s = Self {
-            tris: own.concat(),
+            tris,
             cluster_of,
             first,
             order: Vec::new(),
