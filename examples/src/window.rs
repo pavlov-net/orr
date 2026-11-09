@@ -1,12 +1,13 @@
 //! A winit window driven by the example's own frame loop: [`Window::pump`] handles pending
 //! events between frames. One per process, since winit allows one event loop.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use orr::Renderer;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
@@ -23,6 +24,11 @@ struct App {
     window: Option<winit::window::Window>,
     closed: bool,
     keys: Vec<KeyCode>,
+    held: HashSet<KeyCode>,
+    /// Whether the right mouse button is down in the window.
+    looking: bool,
+    /// Pointer motion while looking, in device units, since the last take.
+    look: [f64; 2],
 }
 
 impl ApplicationHandler for App {
@@ -39,12 +45,36 @@ impl ApplicationHandler for App {
                 event,
                 is_synthetic: false,
                 ..
-            } if event.state == ElementState::Pressed && !event.repeat => {
+            } => {
                 if let PhysicalKey::Code(key) = event.physical_key {
-                    self.keys.push(key);
+                    if event.state == ElementState::Released {
+                        self.held.remove(&key);
+                    } else if !event.repeat {
+                        self.held.insert(key);
+                        self.keys.push(key);
+                    }
                 }
             }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Right,
+                ..
+            } => self.looking = state == ElementState::Pressed,
+            // Keys and buttons released elsewhere send no event here.
+            WindowEvent::Focused(false) => {
+                self.held.clear();
+                self.looking = false;
+            }
             _ => {}
+        }
+    }
+
+    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta: (x, y) } = event
+            && self.looking
+        {
+            self.look[0] += x;
+            self.look[1] += y;
         }
     }
 }
@@ -88,6 +118,9 @@ impl Window {
                 window: None,
                 closed: false,
                 keys: Vec::new(),
+                held: HashSet::new(),
+                looking: false,
+                look: [0.0; 2],
             },
             event_loop,
             title: title.to_owned(),
@@ -127,6 +160,17 @@ impl Window {
     /// The keys pressed since the last call, in order.
     pub fn take_keys(&mut self) -> Vec<KeyCode> {
         std::mem::take(&mut self.app.keys)
+    }
+
+    /// Whether `key` is down.
+    pub fn held(&self, key: KeyCode) -> bool {
+        self.app.held.contains(&key)
+    }
+
+    /// Pointer motion, in device units, while the right mouse button was down since the last
+    /// call.
+    pub fn take_look(&mut self) -> [f64; 2] {
+        std::mem::take(&mut self.app.look)
     }
 
     /// [`Window::pump`], saying in the title how many path tracing kernels are still compiling

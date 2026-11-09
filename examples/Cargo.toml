@@ -108,5 +108,9 @@ path = "tree-viewer.rs"
 name = "cornell-box"
 path = "cornell-box.rs"
 
+[[example]]
+name = "zorah"
+path = "zorah.rs"
+
 [lints]
 workspace = true

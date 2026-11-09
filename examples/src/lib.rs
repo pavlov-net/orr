@@ -77,20 +77,26 @@ fn pipeline_store() -> PathBuf {
     dir
 }
 
+/// Logs info and above to stderr, with `RUST_LOG` adding to or overriding that. [`device`]
+/// starts it; examples that log before creating the device start it first.
+pub fn init_logging() {
+    let _ = env_logger::Builder::new()
+        .parse_filters("info")
+        .parse_default_env()
+        .is_test(true)
+        .try_init();
+}
+
 /// The process's device, created on first use with every queue, NGX's extensions where
-/// NGX offers them, and validation when the environment enables the layer. Logs info and
-/// above to stderr, with `RUST_LOG` adding to or overriding that. `ORR_DIAGNOSTICS=checkpoints`
-/// creates it with [`Diagnostics::Checkpoints`], so a device-lost report names the passes it was
-/// running, and `ORR_DIAGNOSTICS=aftermath` with [`Diagnostics::Aftermath`], writing crash dumps
-/// to the directory `ORR_AFTERMATH_DIR` names.
+/// NGX offers them, and validation when the environment enables the layer. Starts
+/// [`init_logging`]. `ORR_DIAGNOSTICS=checkpoints` creates it with
+/// [`Diagnostics::Checkpoints`], so a device-lost report names the passes it was running, and
+/// `ORR_DIAGNOSTICS=aftermath` with [`Diagnostics::Aftermath`], writing crash dumps to the
+/// directory `ORR_AFTERMATH_DIR` names.
 pub fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
-        let _ = env_logger::Builder::new()
-            .parse_filters("info")
-            .parse_default_env()
-            .is_test(true)
-            .try_init();
+        init_logging();
         #[cfg(dlss)]
         let hooks = DlssSdk::device_hooks(PROJECT_ID);
         let store = pipeline_store();
