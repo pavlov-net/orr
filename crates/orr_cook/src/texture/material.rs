@@ -2514,9 +2514,15 @@ impl Packer<'_> {
 }
 
 impl TextureJob {
-    /// Estimated peak bytes: 8 per compressed source byte for the decoded sources, 48 per
-    /// output texel for the packed image and its chain.
+    /// Estimated peak bytes. Passing every mip of a source's blocks through holds the source,
+    /// its blocks and the texture's blobs as built and stored: 4 bytes per source byte and 4
+    /// MiB, the most measured over 480 such textures being 4 per output byte and 3.2 MiB.
+    /// Otherwise 8 per compressed source byte for the decoded sources and 48 per output texel
+    /// for the packed image and its chain, over the 42 measured.
     pub(crate) fn working_set(&self, images: &[ImageFile]) -> u64 {
+        if let Some(p) = self.pass.filter(|p| p.all_mips) {
+            return images[p.image].len() * 4 + (4 << 20);
+        }
         let sources: u64 = self.images.iter().map(|&(i, _)| images[i].len() * 8).sum();
         sources + u64::from(self.size[0]) * u64::from(self.size[1]) * 48
     }
