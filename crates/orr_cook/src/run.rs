@@ -85,11 +85,12 @@ const MESH_BYTES_PER_TRIANGLE: u64 = 480;
 const DAG_BYTES_PER_TRIANGLE: u64 = 180;
 
 /// Bytes a mesh cook holds per decoded texel channel of the maps its sections read
-/// ([`map_channels`]): an f32 each. Decoding them peaks at [`MAP_DECODE_BYTES_PER_CHANNEL`],
-/// while the mesh is read and before the geometry's peak. Both measured over the scene
-/// [`DAG_BYTES_PER_TRIANGLE`] names.
+/// ([`map_channels`]): an f32 each. Textures decode one at a time, each taking
+/// [`MAP_DECODE_BYTES_PER_CHANNEL`] more per channel while it decodes, while the mesh is read
+/// and before the geometry's peak. Both measured over the scene [`DAG_BYTES_PER_TRIANGLE`]
+/// names: 13 B per channel at most for a mesh with one map.
 const MAP_BYTES_PER_CHANNEL: u64 = 4;
-const MAP_DECODE_BYTES_PER_CHANNEL: u64 = 13;
+const MAP_DECODE_BYTES_PER_CHANNEL: u64 = 9;
 
 /// Peak bytes of reading a mesh per source triangle, which its maps decode beside: the most
 /// measured over the scene [`DAG_BYTES_PER_TRIANGLE`] names, 149 B.
@@ -918,11 +919,12 @@ impl<'m, 's> Run<'m, 's> {
                     .expect("a mesh is ready after the textures it reads")
             };
             let normals = settings.tangent_error_max.is_some();
-            let channels = map_channels(source.sections(), normals, header);
+            let (channels, largest) = map_channels(source.sections(), normals, header);
             let triangles = source.triangles();
+            let held = channels * MAP_BYTES_PER_CHANNEL;
             let load =
-                triangles * LOAD_BYTES_PER_TRIANGLE + channels * MAP_DECODE_BYTES_PER_CHANNEL;
-            let geometry = mesh_working_set(triangles, settings) + channels * MAP_BYTES_PER_CHANNEL;
+                triangles * LOAD_BYTES_PER_TRIANGLE + held + largest * MAP_DECODE_BYTES_PER_CHANNEL;
+            let geometry = mesh_working_set(triangles, settings) + held;
             self.units[u].working_set = load.max(geometry);
         }
         self.ready.insert((Reverse(self.units[u].working_set), u));
@@ -3197,14 +3199,15 @@ fn mesh_working_set(triangles: u64, settings: &MeshSettings) -> u64 {
 /// Texel channels [`section_maps`] decodes for these sections, each texture once per use:
 /// mip 0 of an opacity texture (one channel) and, with `normals` (the tangent check runs), of
 /// a normal map (two), every mip of a height (one) and an emission texture's mip at most
-/// [`EmissionMap::SIDE_MAX`] a side (three). `header` gives a texture unit's header.
+/// [`EmissionMap::SIDE_MAX`] a side (three). `header` gives a texture unit's header. Returns
+/// them all, and the most one texture use decodes.
 fn map_channels(
     sections: &[SectionData],
     normals: bool,
     header: impl Fn(&str) -> orr_pack::texture::TextureHeader,
-) -> u64 {
+) -> (u64, u64) {
     let mut seen = HashSet::new();
-    let mut total = 0;
+    let (mut total, mut largest) = (0, 0);
     let mut add = |texture: &MapTexture, use_: u8, total: &mut u64| {
         for unit in texture.units() {
             if !seen.insert((unit.to_owned(), use_)) {
@@ -3215,7 +3218,7 @@ fn map_channels(
                 let [w, h] = h.mip_size(mip);
                 u64::from(w) * u64::from(h)
             };
-            *total += match use_ {
+            let n = match use_ {
                 0 => texels(0),
                 1 => 2 * texels(0),
                 2 => (0..u32::from(h.mip_count)).map(texels).sum(),
@@ -3226,6 +3229,8 @@ fn map_channels(
                     3 * texels(mip)
                 }
             };
+            *total += n;
+            largest = largest.max(n);
         }
     };
     for s in sections {
@@ -3249,7 +3254,7 @@ fn map_channels(
             add(&e.texture, 3, &mut total);
         }
     }
-    total
+    (total, largest)
 }
 
 /// Cooks one unit into a one-unit archive: in the cache when there is one, else in `spill`
