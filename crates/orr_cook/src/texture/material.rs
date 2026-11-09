@@ -2515,13 +2515,27 @@ impl Packer<'_> {
 
 impl TextureJob {
     /// Estimated peak bytes. Passing every mip of a source's blocks through holds the source,
-    /// its blocks and the texture's blobs as built and stored: 4 bytes per source byte and 4
-    /// MiB, the most measured over 480 such textures being 4 per output byte and 3.2 MiB.
-    /// Otherwise 8 per compressed source byte for the decoded sources and 48 per output texel
-    /// for the packed image and its chain, over the 42 measured.
+    /// its blocks and the texture's blobs as built and stored: 4 bytes per byte of the source
+    /// or of its full chain of blocks, whichever is larger (a KTX2 source can hold them
+    /// zstd-compressed), and 4 MiB, the most measured over 480 such textures being 4 per
+    /// output byte and 3.2 MiB. Otherwise 8 per compressed source byte for the decoded sources
+    /// and 48 per output texel for the packed image and its chain, over the 42 measured.
     pub(crate) fn working_set(&self, images: &[ImageFile]) -> u64 {
         if let Some(p) = self.pass.filter(|p| p.all_mips) {
-            return images[p.image].len() * 4 + (4 << 20);
+            // A half pass takes a BC4 texture from a BC5 source.
+            let format = match p.half {
+                Some(_) => orr_pack::texture::vk::BC5_UNORM,
+                None => self.pack.encoding.vk_format(),
+            };
+            let f = orr_pack::texture::FormatInfo::of(format).expect("a passed format is known");
+            let [w, h] = self.size;
+            let blocks: u64 = (0..full_mip_count(w, h))
+                .map(|m| {
+                    let [mw, mh] = mip_size(w, h, m);
+                    f.mip_bytes(mw, mh) as u64
+                })
+                .sum();
+            return images[p.image].len().max(blocks) * 4 + (4 << 20);
         }
         let sources: u64 = self.images.iter().map(|&(i, _)| images[i].len() * 8).sum();
         sources + u64::from(self.size[0]) * u64::from(self.size[1]) * 48
