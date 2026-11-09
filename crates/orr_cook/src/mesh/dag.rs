@@ -31,7 +31,10 @@ use orr_pack::{EncodedBlob, Span, Sphere};
 use rustc_hash::FxHashMap;
 
 use super::lod::{self, Parts, Welded};
-use super::{Built, ClusterData, Ctx, Grid, MeshSettings, page_triangles, store_page, write_page};
+use super::{
+    Built, ClusterData, Ctx, Grid, MAX_CLUSTER_CORNERS, MAX_CLUSTER_VERTICES, MeshSettings,
+    page_triangles, store_page, write_page,
+};
 
 /// Sections that share a stage: the cluster vertex limit, and the section itself when its
 /// borders dilate.
@@ -593,9 +596,8 @@ fn group_of(
     max_indices: usize,
 ) -> DagGroup {
     let positions = e.positions;
-    // A cluster holds at most 128 triangles, and so 256 vertices.
-    let mut local_vertices = [0u32; 384];
-    let mut local_triangles = [0u8; 384];
+    let mut local_vertices = [0u32; MAX_CLUSTER_CORNERS];
+    let mut local_triangles = [0u8; MAX_CLUSTER_CORNERS];
     let mut out = Clusters::default();
     let push = |out: &mut Clusters, section: u16, refined: i32, used: &[u32], tris: &[u8]| {
         let (v, t) = (out.verts.len(), out.tris.len());
@@ -637,14 +639,18 @@ fn group_of(
             continue;
         }
         // The triangles by section, ascending, each section's in order.
-        let mut by_section = [(0u16, 0u8); 128];
+        let mut by_section = [(0u16, 0u8); MAX_CLUSTER_CORNERS / 3];
         let by_section = &mut by_section[..triangles.len()];
         for (b, (i, t)) in by_section.iter_mut().zip(triangles.iter().enumerate()) {
             *b = (section_of(t), i as u8);
         }
         by_section.sort_unstable();
         for run in by_section.chunk_by(|a, b| a.0 == b.0) {
-            let (mut new_of, mut used, mut corners) = ([u16::MAX; 256], [0u32; 256], [0u8; 384]);
+            let (mut new_of, mut used, mut corners) = (
+                [u16::MAX; MAX_CLUSTER_VERTICES],
+                [0u32; MAX_CLUSTER_VERTICES],
+                [0u8; MAX_CLUSTER_CORNERS],
+            );
             let (mut nv, mut nc) = (0, 0);
             for &(_, i) in run {
                 for &k in &triangles[usize::from(i)] {

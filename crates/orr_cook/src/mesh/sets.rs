@@ -12,8 +12,8 @@ use orr_pack::mesh::{
     cut_thresholds, in_cut, oct_decode, oct_encode,
 };
 
-use super::SectionData;
 use super::maps::Emission;
+use super::{MAX_CLUSTER_CORNERS, SectionData};
 
 /// Where a cluster of a ranked section lies and what it weighs, in mesh space.
 #[derive(Copy, Clone, Debug)]
@@ -51,7 +51,7 @@ impl ClusterBounds {
             .map(|&p| p.distance(center))
             .fold(0.0, f64::max);
         let (mut area, mut weighted, mut sum) = (0.0, 0.0, DVec3::ZERO);
-        let mut faces = [DVec3::ZERO; 128];
+        let mut faces = [DVec3::ZERO; MAX_CLUSTER_CORNERS / 3];
         let mut nf = 0;
         for t in tris {
             let p = t.map(|i| positions[usize::from(i)]);
