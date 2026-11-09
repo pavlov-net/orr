@@ -335,8 +335,8 @@ pub struct CookOptions {
     pub cache: Option<PathBuf>,
     /// After the cook, least recently used cache archives are removed down to this size.
     pub cache_cap: Option<u64>,
-    /// Bytes the running jobs may hold by their estimates, with the decoded images and opacity
-    /// maps they share, which take up to an eighth of it; a job over it runs alone.
+    /// Bytes the running jobs may hold by their estimates, with the decoded images and maps
+    /// they share, whose four caches take up to a quarter of it; a job over it runs alone.
     pub working_set: u64,
     /// Bytes of finished entries that may wait for their turn to be written; past it only
     /// the jobs the next entries wait on start.

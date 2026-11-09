@@ -4,8 +4,11 @@ use std::alloc::{GlobalAlloc, Layout};
 
 /// A global allocator around `A` that counts live bytes per cook job for the cook report:
 /// `peak` per entry and `heap_peak` over the cook. Counts are requested bytes, not what `A`
-/// holds for them, and memory C libraries take from their own heaps is not counted. A
-/// program opts in with `#[global_allocator]`; without it the report has no peaks.
+/// holds for them, and memory C libraries take from their own heaps is not counted. ctt's
+/// texture encoders run their loops on rayon directly, outside the job's context
+/// ([`crate::par`]): the texture's `peak` leaves out what their pool threads allocate, which a
+/// pool thread working for another job charges to that job. A program opts in with
+/// `#[global_allocator]`; without it the report has no peaks.
 pub struct Metered<A>(pub A);
 
 // SAFETY: every call goes to `A` unchanged, and counting allocates nothing.
