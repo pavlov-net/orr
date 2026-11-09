@@ -1,4 +1,4 @@
-//! The OpenPBR 1.1.1 reference BSDF on the CPU and GPU and the harness that checks a BSDF
+//! The OpenPBR reference BSDF on the CPU and GPU and the harness that checks a BSDF
 //! with it.
 //!
 //! Builds of adobe/openpbr-bsdf implement [`Bsdf`]: [`Reference`], its own C++ with GLM;
@@ -38,7 +38,9 @@ pub use gpu::types::Inputs;
 type V3 = [f32; 3];
 
 impl Default for Inputs {
-    /// OpenPBR 1.1.1's defaults (`openpbr_make_default_resolved_inputs`) in vacuum.
+    /// The reference's defaults (`openpbr_make_default_resolved_inputs`) in vacuum. Its lengths
+    /// other than `thin_film_thickness` are in world units, which the BSDFs under test read as
+    /// meters.
     fn default() -> Self {
         Self {
             base_weight: 1.0,

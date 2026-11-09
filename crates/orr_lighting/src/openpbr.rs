@@ -1,4 +1,4 @@
-//! The lookup tables of `orr_lighting.openpbr`, the OpenPBR 1.1.1 reference BSDF from
+//! The lookup tables of `orr_lighting.openpbr`, the OpenPBR reference BSDF from
 //! adobe/openpbr-bsdf.
 //!
 //! Kernels that import `orr_lighting.openpbr` read the tables from eight consecutive heap slots, in

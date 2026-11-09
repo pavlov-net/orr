@@ -1,4 +1,4 @@
-// The real-time OpenPBR 1.1.1 BSDF.
+// The real-time OpenPBR 1.1.2 BSDF.
 //
 // `bsdf_prepare` takes a shading point's `BsdfParams`, its shading normal and the direction
 // toward the viewer, and returns a `Bsdf` that evaluates, samples and gives densities for
@@ -1322,7 +1322,7 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.metal_flat = (p.flags & BSDF_METAL_FLAT) != 0;
     float3 metal_average = s.metal_flat ? p.base_color : openpbr_metal_average_fresnel_with_f82_tint(p.base_color, edge);
 
-    // Coat darkening from internal reflections (OpenPBR 1.1.1).
+    // Coat darkening from internal reflections (OpenPBR 1.1.2).
     float k_smooth = openpbr_average_fresnel(coat_eta);
     float k_rough = 1.0 - (1.0 - k_smooth) / sq(coat_eta);
     float specularity = opaque * openpbr_average_fresnel(eta_o) + (sss + trans) * openpbr_average_fresnel(eta_t) + p.metalness;

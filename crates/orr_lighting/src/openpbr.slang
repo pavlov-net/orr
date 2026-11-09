@@ -1,5 +1,6 @@
-// The OpenPBR 1.1.1 reference BSDF (adobe/openpbr-bsdf, unedited): `openpbr_prepare`,
-// `openpbr_eval`, `openpbr_sample`, `openpbr_pdf` and their types. A build that imports it
+// The OpenPBR reference BSDF (adobe/openpbr-bsdf, unedited): `openpbr_prepare`,
+// `openpbr_eval`, `openpbr_sample`, `openpbr_pdf` and their types. It implements OpenPBR 1.1.1;
+// 1.1.2 changes nothing a BSDF computes from its resolved inputs. A build that imports it
 // has the fetched openpbr-bsdf directory among its include roots, which orr_lighting's build
 // script publishes to dependents.
 //
