@@ -11,7 +11,6 @@ use orr_pack::mesh::{
     Cluster, ClusterSet, ClusterSets, MeshInfo, NO_RANK, SET_LEAF, Section, SetNode,
     cut_thresholds, in_cut, oct_decode, oct_encode,
 };
-use rustc_hash::FxHashMap;
 
 use super::SectionData;
 use super::maps::Emission;
@@ -175,19 +174,24 @@ fn cut_bound(section_count: usize, clusters: &[SetCluster]) -> Vec<u32> {
     let mut out = vec![0u32; section_count];
     for merged in [false, true] {
         let mut base = vec![0i64; section_count];
-        let mut grows: FxHashMap<(u32, u16), i64> = FxHashMap::default();
+        // Per (group, section): +1 for each cluster simplified from the group, -1 for each in
+        // it; summed by sorting.
+        let key = |group: u32, section: u16| u64::from(group) << 16 | u64::from(section);
+        let mut grows: Vec<(u64, i64)> = Vec::with_capacity(2 * clusters.len());
         for c in clusters
             .iter()
             .filter(|c| (c.flags & Cluster::MERGED != 0) == merged)
         {
             match u32::try_from(c.refined) {
-                Ok(from) => *grows.entry((from, c.section)).or_default() += 1,
+                Ok(from) => grows.push((key(from, c.section), 1)),
                 Err(_) => base[usize::from(c.section)] += 1,
             }
-            *grows.entry((c.group, c.section)).or_default() -= 1;
+            grows.push((key(c.group, c.section), -1));
         }
-        for (&(_, s), &w) in &grows {
-            base[usize::from(s)] += w.max(0);
+        grows.sort_unstable_by_key(|g| g.0);
+        for run in grows.chunk_by(|a, b| a.0 == b.0) {
+            let w: i64 = run.iter().map(|g| g.1).sum();
+            base[(run[0].0 & 0xFFFF) as usize] += w.max(0);
         }
         for (o, b) in out.iter_mut().zip(base) {
             *o = (*o).max(b as u32);
