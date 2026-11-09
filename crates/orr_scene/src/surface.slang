@@ -560,14 +560,15 @@ public float3 surface_specular_color(MaterialGpu* m, float3 color, float ior)
 }
 
 // The direction `rotation` turns from `tangent` about `normal`, measured from
-// orthonormal_basis(normal).
+// orthonormal_basis(normal). A `tangent` zero or parallel to `normal` takes that basis's tangent
+// instead, as OpenPBR allows any unit vector orthogonal to the normal there.
 float surface_tangent_angle(float4 tangent, float3 normal, float rotation)
 {
-    float3 t = safe_normalize(tangent.xyz - normal * dot(normal, tangent.xyz), float3(1, 0, 0));
-    float3 b = cross(normal, t) * tangent.w;
-    float3 d = cos(rotation) * t + sin(rotation) * b;
     float3 t0, b0;
     orthonormal_basis(normal, t0, b0);
+    float3 t = safe_normalize(tangent.xyz - normal * dot(normal, tangent.xyz), t0);
+    float3 b = cross(normal, t) * tangent.w;
+    float3 d = cos(rotation) * t + sin(rotation) * b;
     return atan2(dot(d, b0), dot(d, t0));
 }
 
