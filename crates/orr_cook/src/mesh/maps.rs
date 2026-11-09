@@ -542,14 +542,17 @@ impl Passes {
         while cols > 1 || rows > 1 {
             let fine = levels.last().expect("a level");
             let (c, r) = (cols.div_ceil(2), rows.div_ceil(2));
-            // A quarter of the level below, which took one pass over the texels.
             let mut flags = vec![0u8; c * r];
-            for (y, row) in fine.flags.chunks_exact(cols).enumerate() {
-                let out = &mut flags[y / 2 * c..][..c];
-                for (x, &f) in row.iter().enumerate() {
-                    out[x / 2] |= f;
-                }
-            }
+            flags
+                .par_chunks_mut(c)
+                .zip(fine.flags.par_chunks(2 * cols))
+                .for_each(|(out, band)| {
+                    for row in band.chunks_exact(cols) {
+                        for (x, &f) in row.iter().enumerate() {
+                            out[x / 2] |= f;
+                        }
+                    }
+                });
             levels.push(SideLevel {
                 shift: fine.shift + 1,
                 cols: c,
