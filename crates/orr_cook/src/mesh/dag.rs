@@ -18,6 +18,7 @@
 //! as the group is emitted and snap them to the mesh grid.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::os::raw::c_int;
 
 use crate::par::prelude::*;
@@ -77,15 +78,24 @@ impl Input {
 }
 
 struct DagCluster {
+    /// Its vertices in its group's `verts` and `cells`, and its cluster-local corners in the
+    /// group's `tris`.
+    verts: Range<usize>,
+    tris: Range<usize>,
+    /// The stage group whose simplification made the cluster; -1 for the stage's source.
+    refined: i32,
+    section: u16,
+}
+
+/// A group's clusters, and what they hold.
+#[derive(Default)]
+struct Clusters {
+    list: Vec<DagCluster>,
     /// Welded vertex per cluster vertex, for the attributes.
     verts: Vec<u32>,
     /// Grid position per cluster vertex, as emitted.
     cells: Vec<[i32; 3]>,
-    /// Cluster-local corners.
     tris: Vec<u8>,
-    /// The stage group whose simplification made the cluster; -1 for the stage's source.
-    refined: i32,
-    section: u16,
 }
 
 struct DagGroup {
@@ -93,7 +103,7 @@ struct DagGroup {
     /// Bounds and error of the geometry the group simplifies into; infinity when terminal.
     sphere: Sphere,
     error: f32,
-    clusters: Vec<DagCluster>,
+    clusters: Clusters,
 }
 
 struct Stage {
@@ -209,10 +219,11 @@ fn stages(
         let (sections, corners) = sources.entry(class(st.sections[0])).or_default();
         sections.extend(&st.sections);
         for g in st.groups.iter().filter(|g| g.error == f32::INFINITY) {
-            for c in &g.clusters {
-                for &k in &c.tris {
-                    let k = usize::from(k);
-                    corners.push((c.verts[k], c.cells[k], c.section));
+            let gc = &g.clusters;
+            for c in &gc.list {
+                for &k in &gc.tris[c.tris.clone()] {
+                    let k = c.verts.start + usize::from(k);
+                    corners.push((gc.verts[k], gc.cells[k], c.section));
                 }
             }
         }
@@ -477,18 +488,19 @@ fn truncate(groups: &mut Vec<DagGroup>, m: f32) {
     let terminal: Vec<bool> = groups.iter().map(|g| g.error == f32::INFINITY).collect();
     for g in groups.iter_mut() {
         g.clusters
+            .list
             .retain(|c| c.refined < 0 || !terminal[c.refined as usize]);
     }
     let mut new_index = vec![-1i32; groups.len()];
     let mut next = 0;
     for (i, g) in groups.iter().enumerate() {
-        if !g.clusters.is_empty() {
+        if !g.clusters.list.is_empty() {
             new_index[i] = next;
             next += 1;
         }
     }
-    groups.retain(|g| !g.clusters.is_empty());
-    for c in groups.iter_mut().flat_map(|g| &mut g.clusters) {
+    groups.retain(|g| !g.clusters.list.is_empty());
+    for c in groups.iter_mut().flat_map(|g| &mut g.clusters.list) {
         if c.refined >= 0 {
             c.refined = new_index[c.refined as usize];
             debug_assert!(c.refined >= 0, "a kept cluster comes from a kept group");
@@ -560,12 +572,31 @@ fn group_of(
     max_indices: usize,
 ) -> DagGroup {
     let positions = e.positions;
-    let mut local_vertices = vec![0u32; max_indices];
-    let mut local_triangles = vec![0u8; max_indices];
-    let mut out = Vec::new();
+    // A cluster holds at most 128 triangles, and so 256 vertices.
+    let mut local_vertices = [0u32; 384];
+    let mut local_triangles = [0u8; 384];
+    let mut out = Clusters::default();
+    let push = |out: &mut Clusters, section: u16, refined: i32, used: &[u32], tris: &[u8]| {
+        let (v, t) = (out.verts.len(), out.tris.len());
+        out.verts.extend(used.iter().map(|&v| welded[v as usize]));
+        out.cells.extend(used.iter().map(|&v| {
+            let p = &positions[v as usize * 3..v as usize * 3 + 3];
+            snap.cell([p[0], p[1], p[2]])
+        }));
+        out.tris.extend_from_slice(tris);
+        out.list.push(DagCluster {
+            verts: v..out.verts.len(),
+            tris: t..out.tris.len(),
+            refined,
+            section,
+        });
+    };
     for k in e.clusters {
         let (refined, indices) = (k.refined, k.corners(e.indices));
-        assert!(indices.len() <= max_indices, "cluster over its limits");
+        assert!(
+            indices.len() <= max_indices && max_indices <= local_triangles.len(),
+            "cluster over its limits"
+        );
         // SAFETY: the local buffers hold `indices.len()` entries.
         let n = unsafe {
             ffi::meshopt_extractMeshletIndices(
@@ -579,54 +610,34 @@ fn group_of(
         let tris = &local_triangles[..indices.len()];
         let section_of = |t: &[u8]| sections[local[usize::from(t[0])] as usize];
         // One cluster per section: a triangle's corners all lie in one section.
-        let mut pieces: Vec<(u16, Vec<u32>, Vec<u8>)> = Vec::new();
-        if tris
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .all(|t| section_of(t) == section_of(tris))
-        {
-            pieces.push((section_of(tris), local.to_vec(), tris.to_vec()));
-        } else {
-            let mut by_section: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
-            for t in tris.as_chunks::<3>().0 {
-                by_section
-                    .entry(section_of(t))
-                    .or_default()
-                    .extend_from_slice(t);
-            }
-            for (section, corners) in by_section {
-                let mut new_of = [u16::MAX; 256];
-                let mut used = Vec::new();
-                let tris = corners
-                    .iter()
-                    .map(|&k| {
-                        let k = usize::from(k);
-                        if new_of[k] == u16::MAX {
-                            new_of[k] = used.len() as u16;
-                            used.push(local[k]);
-                        }
-                        new_of[k] as u8
-                    })
-                    .collect();
-                pieces.push((section, used, tris));
-            }
+        let triangles = tris.as_chunks::<3>().0;
+        if triangles.iter().all(|t| section_of(t) == section_of(tris)) {
+            push(&mut out, section_of(tris), refined, local, tris);
+            continue;
         }
-        for (section, used, tris) in pieces {
-            let cells = used
-                .iter()
-                .map(|&v| {
-                    let p = &positions[v as usize * 3..v as usize * 3 + 3];
-                    snap.cell([p[0], p[1], p[2]])
-                })
-                .collect();
-            out.push(DagCluster {
-                verts: used.iter().map(|&v| welded[v as usize]).collect(),
-                cells,
-                tris,
-                refined,
-                section,
-            });
+        // The triangles by section, ascending, each section's in order.
+        let mut by_section = [(0u16, 0u8); 128];
+        let by_section = &mut by_section[..triangles.len()];
+        for (b, (i, t)) in by_section.iter_mut().zip(triangles.iter().enumerate()) {
+            *b = (section_of(t), i as u8);
+        }
+        by_section.sort_unstable();
+        for run in by_section.chunk_by(|a, b| a.0 == b.0) {
+            let (mut new_of, mut used, mut corners) = ([u16::MAX; 256], [0u32; 256], [0u8; 384]);
+            let (mut nv, mut nc) = (0, 0);
+            for &(_, i) in run {
+                for &k in &triangles[usize::from(i)] {
+                    let k = usize::from(k);
+                    if new_of[k] == u16::MAX {
+                        new_of[k] = nv as u16;
+                        used[nv] = local[k];
+                        nv += 1;
+                    }
+                    corners[nc] = new_of[k] as u8;
+                    nc += 1;
+                }
+            }
+            push(&mut out, run[0].0, refined, &used[..nv], &corners[..nc]);
         }
     }
     let b = e.bounds;
@@ -789,11 +800,11 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         while end < order.len() && (whole || triangles < BATCH_TRIANGLES) {
             let (si, gi) = at[order[end]];
             let g = &stages[si].groups[gi];
-            triangles += g.clusters.iter().map(|c| c.tris.len() / 3).sum::<usize>();
+            triangles += g.clusters.tris.len() / 3;
             end += 1;
         }
         let batch = &order[next..end];
-        let work: Vec<(usize, Vec<DagCluster>)> = batch
+        let work: Vec<(usize, Clusters)> = batch
             .iter()
             .map(|&g| {
                 let (si, gi) = at[g];
@@ -809,12 +820,21 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
                 let (si, gi) = at[gl];
                 let st = &stages[si];
                 let g = &st.groups[gi];
-                let refined = clusters.iter().map(|c| refined_of(si, c.refined)).collect();
+                let refined = clusters
+                    .list
+                    .iter()
+                    .map(|c| refined_of(si, c.refined))
+                    .collect();
                 let clusters = clusters
-                    .into_iter()
+                    .list
+                    .iter()
                     .map(|c| {
-                        let mut d =
-                            cx.cluster(c.section, st.part, st.merged, &c.verts, &c.cells, c.tris);
+                        let (verts, cells) = (
+                            &clusters.verts[c.verts.clone()],
+                            &clusters.cells[c.verts.clone()],
+                        );
+                        let tris = clusters.tris[c.tris.clone()].to_vec();
+                        let mut d = cx.cluster(c.section, st.part, st.merged, verts, cells, tris);
                         let r = &mut d.record;
                         (r.self_sphere, r.self_error) = match usize::try_from(c.refined) {
                             Ok(from) => (st.groups[from].sphere, st.groups[from].error),
