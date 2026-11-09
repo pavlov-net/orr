@@ -277,6 +277,10 @@ impl Queue {
         if let Some(d) = drawable {
             self.raw.signalDrawable(d);
         }
+        // What a CPU step recorded can run for longer than a wait's timeout, which is for hangs.
+        if !steps.is_empty() {
+            self.wait_for_gpu();
+        }
         finished.extend(steps);
         self.signal(point);
         self.shared.defer_until(
@@ -376,8 +380,8 @@ impl Queue {
             .signalEvent_value(ProtocolObject::from_ref(&*self.host_event.0), value);
         assert!(
             self.host_event
-                .waitUntilSignaledValue_timeoutMS(value, 60_000),
-            "the GPU did not reach a CPU step within a minute"
+                .waitUntilSignaledValue_timeoutMS(value, 600_000),
+            "the GPU did not reach a CPU step within ten minutes"
         );
     }
 

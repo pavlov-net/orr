@@ -53,6 +53,24 @@ use crate::{Error, GpuAddress, GpuPtr, Hazards, MemoryKind, RtasFlags, Stages};
 
 type Structure = ProtocolObject<dyn MTLAccelerationStructure>;
 
+/// A structure, what to build it from and the scratch the build needs.
+type Build = (
+    Obj<Structure>,
+    Retained<MTL4AccelerationStructureDescriptor>,
+    u64,
+);
+
+/// Builds in one encoder. Metal flushes an encoder's builds as one batch, which at hundreds of
+/// thousands takes minutes on the CPU and again on the GPU, past any timeout that detects a
+/// hang; smaller batches let the queue wait for each in turn.
+const BUILDS_PER_ENCODER: usize = 4096;
+
+/// The builds left for a later CPU step.
+struct RemainingBuilds(Vec<Build>);
+
+// SAFETY: the step takes the descriptors whole; no other thread holds them.
+unsafe impl Send for RemainingBuilds {}
+
 const SOURCE: &str = include_str!("cluster.msl");
 const HEADER: u64 = 64;
 /// Bytes of a triangle's data: cluster ID, geometry index and flags, triangle in the
@@ -757,18 +775,12 @@ impl CommandList<'_> {
         self.run_jobs(&state, &jobs);
     }
 
-    /// Encodes `builds` with scratch of their own.
-    fn encode_builds(
-        &mut self,
-        builds: &[(
-            Obj<Structure>,
-            Retained<MTL4AccelerationStructureDescriptor>,
-            u64,
-        )],
-    ) {
+    /// Encodes `builds` with scratch of their own, in batches.
+    fn encode_builds(&mut self, mut builds: Vec<Build>) {
         if builds.is_empty() {
             return;
         }
+        let rest = builds.split_off(builds.len().min(BUILDS_PER_ENCODER));
         let offsets: Vec<u64> = builds
             .iter()
             .scan(0u64, |at, (_, _, s)| {
@@ -795,6 +807,13 @@ impl CommandList<'_> {
             self.keep.push(Box::new(raw.clone()));
         }
         self.keep.push(Box::new(scratch));
+        if !rest.is_empty() {
+            let rest = RemainingBuilds(rest);
+            self.split(Box::new(move |list: &mut CommandList<'_>| {
+                let rest = rest;
+                list.encode_builds(rest.0);
+            }));
+        }
     }
 
     /// CLAS builds, template builds and instantiations.
@@ -884,7 +903,7 @@ impl CommandList<'_> {
         let pack = Kernels::get(&shared).pack.clone();
         self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         self.run_jobs(&pack, &jobs);
-        self.encode_builds(&builds);
+        self.encode_builds(builds);
         self.write_results(io, &addresses, &sizes);
     }
 
@@ -998,7 +1017,7 @@ impl CommandList<'_> {
         self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         self.run_jobs(&instances_state, &jobs);
         self.write_headers(&headers);
-        self.encode_builds(&builds);
+        self.encode_builds(builds);
         self.keep.push(Box::new(descriptors));
     }
 
@@ -1078,7 +1097,7 @@ impl CommandList<'_> {
         self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         self.run_jobs(&gather, &jobs);
         self.write_headers(&headers);
-        self.encode_builds(&builds);
+        self.encode_builds(builds);
         self.keep.push(Box::new(vertices));
         self.keep.push(Box::new(data));
     }
