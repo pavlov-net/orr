@@ -13,7 +13,9 @@
 //!
 //! A vertex stream holds `vertex_count` vertices of `8 + attr_stride` bytes: the three u16
 //! grid offsets, a zero u16, then the vertex's attributes. The vertex codec is version 1,
-//! encoded at level 3. A triangle stream is the meshlet codec over triangles only.
+//! encoded at level 2: level 3 searches channel rotations and a third channel mode for a
+//! stream zstd then packs no smaller, at a third more encoding time. A triangle stream is
+//! the meshlet codec over triangles only.
 //!
 //! Every region of a page starts 4-aligned. `orr_pack.page_codec` decodes the same
 //! form on the GPU and accepts exactly the pages [`decode_page`] accepts.
@@ -25,7 +27,7 @@ use crate::blob::read;
 use crate::{Error, Result};
 
 const VERTEX_CODEC_VERSION: i32 = 1;
-const VERTEX_CODEC_LEVEL: i32 = 3;
+const VERTEX_CODEC_LEVEL: i32 = 2;
 /// First byte of a vertex stream: the codec's 0xA0 and its version. Other versions are
 /// rejected.
 const VERTEX_CODEC_HEADER: u8 = 0xA0 | VERTEX_CODEC_VERSION as u8;
