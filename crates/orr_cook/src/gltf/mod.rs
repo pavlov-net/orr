@@ -75,12 +75,12 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::par::prelude::*;
 use gltf::image::Source as ImageSource;
 use gltf::mesh::{Mode, Semantic};
 use orr_math::{DMat3, DMat4, Quat, Vec3};
 use orr_pack::Hash32;
 use orr_pack::material::slot;
-use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::import::{

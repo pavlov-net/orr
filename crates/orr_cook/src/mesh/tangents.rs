@@ -10,10 +10,10 @@
 //! texel centers at a whole-texel stride instead, offset by a hash of each triangle, so every
 //! center has the same chance of a sample and the histogram is the dense one's in expectation.
 
+use crate::par::prelude::*;
 use meshopt::TangentOptions;
 use orr_math::{DVec2, Vec3};
 use orr_pack::texture::normal;
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::maps::{Map, Raster};

@@ -9,9 +9,9 @@
 use std::collections::HashSet;
 use std::f32::consts::{PI, TAU};
 
+use crate::par::prelude::*;
 use ctt::Quality;
 use orr_pack::texture::{ExtractedLight, octahedral};
-use rayon::prelude::*;
 
 use super::load::Source;
 use super::mips::{MipSpec, settled};

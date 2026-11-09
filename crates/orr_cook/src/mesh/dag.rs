@@ -20,13 +20,13 @@
 use std::collections::BTreeMap;
 use std::os::raw::c_int;
 
+use crate::par::prelude::*;
 use meshopt::ffi;
 use orr_pack::mesh::{
     ClusterSets, Group, MeshHeader, MeshInfo, NODE_PAGE_MAX, Node, NodePage, OMM_ALIGN, PAGE_MAX,
     PageHeader, PageInfo, Section, SurfaceClass, cluster_resident_len,
 };
 use orr_pack::{Span, Sphere};
-use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::lod::{self, Parts, Welded};
@@ -132,8 +132,10 @@ fn stages(
         let o = options(section);
         (o.limits.max_vertices, o.dilate.then_some(section))
     };
+    let pieces = lod::pieces(w, parts);
+    let _corners = crate::profile::zone!("dag.corners");
     let mut by_stage: BTreeMap<(u16, Class), (Vec<u16>, Vec<Corner>)> = BTreeMap::new();
-    for p in lod::pieces(w, parts) {
+    for p in pieces {
         let (sections, corners) = by_stage.entry((p.part, class(p.section))).or_default();
         sections.push(p.section);
         corners.extend(
@@ -146,6 +148,7 @@ fn stages(
         .into_iter()
         .map(|((part, _), (sections, corners))| (part, sections, corners))
         .collect();
+    drop(_corners);
     let (shared, seams) = borders(w, pieces.iter().map(|p| p.2.as_slice()));
     let mut stages: Vec<Stage> = pieces
         .par_iter()
@@ -168,6 +171,7 @@ fn stages(
     for st in &mut stages {
         truncate(&mut st.groups, m);
     }
+    let _sources = crate::profile::zone!("dag.merged_sources");
     // Each class's merged source: its parts' terminal clusters at their emitted positions.
     let mut sources: BTreeMap<Class, (Vec<u16>, Vec<Corner>)> = BTreeMap::new();
     for st in &stages {
@@ -191,6 +195,7 @@ fn stages(
             (sections, corners)
         })
         .collect();
+    drop(_sources);
     let (shared, seams) = borders(w, sources.iter().map(|s| s.1.as_slice()));
     // Vertices of different parts join where they share a position, attributes and section.
     let attrs = |v: u32| {
@@ -253,8 +258,10 @@ fn borders<'a>(
     w: &Welded,
     stages: impl Iterator<Item = &'a [Corner]> + Clone,
 ) -> (FxHashSet<[i32; 3]>, FxHashSet<[i32; 3]>) {
+    let _z = crate::profile::zone!("dag.borders");
     let shared = lod::shared_cells(stages.clone().map(|c| c.iter().map(|&(_, cell, _)| cell)));
     let mut seams = lod::seam_cells(w, stages.clone().flatten().map(|&(v, cell, _)| (v, cell)));
+    let _sections = crate::profile::zone!("dag.section_seams");
     for corners in stages {
         let mut section_of: FxHashMap<[i32; 3], u16> = FxHashMap::default();
         for &(_, cell, section) in corners {
@@ -274,6 +281,7 @@ fn input<K: std::hash::Hash + Eq>(
     shared: &FxHashSet<[i32; 3]>,
     seams: &FxHashSet<[i32; 3]>,
 ) -> Input {
+    let _z = crate::profile::zone!("dag.input");
     let mut local_of: FxHashMap<K, u32> = FxHashMap::default();
     let mut input = Input {
         welded: Vec::new(),
@@ -300,6 +308,7 @@ fn input<K: std::hash::Hash + Eq>(
 /// Groups at or over `m` become terminal; clusters made from them go, and so do groups
 /// left without clusters.
 fn truncate(groups: &mut Vec<DagGroup>, m: f32) {
+    let _z = crate::profile::zone!("dag.truncate");
     for g in groups.iter_mut() {
         if g.error >= m {
             g.error = f32::INFINITY;
@@ -336,6 +345,7 @@ struct Options {
 
 /// The DAG groups of one stage, in emission order.
 fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
+    let attributes = crate::profile::zone!("dag.attributes");
     let mut positions: Vec<f32> = input
         .cells
         .iter()
@@ -346,6 +356,7 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
         .iter()
         .flat_map(|&v| w.normals[v as usize])
         .collect();
+    drop(attributes);
     let weights = [0.5f32; 3];
     let mut config = meshopt::clod_default_config_rt(usize::from(o.limits.max_triangles));
     config.max_vertices = usize::from(o.limits.max_vertices);
@@ -636,6 +647,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
             i,
         )
     });
+    let _order = crate::profile::zone!("dag.order");
     let mut table_index = vec![0u32; groups.len()];
     for (t, &g) in order.iter().enumerate() {
         table_index[g] = t as u32;
@@ -685,6 +697,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
     let mut page_info = Vec::with_capacity(page_groups.len());
     let mut page_deps = Vec::new();
     let mut group_table: Vec<Group> = vec![bytemuck::Zeroable::zeroed(); groups.len()];
+    drop(_order);
     // Per page: its resident length, its cluster and triangle counts and its stored bytes.
     let built: Vec<(usize, usize, u32, Vec<u8>)> = page_groups
         .par_iter()
@@ -744,6 +757,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         }
     }
 
+    let _sets = crate::profile::zone!("dag.set_clusters");
     let table = &table_index;
     let set_clusters = page_groups
         .iter()
@@ -761,6 +775,8 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         c.add_to(&mut parts, cx.grid);
     }
 
+    drop(_sets);
+    let _hierarchy = crate::profile::zone!("dag.hierarchy");
     // Hierarchy: each stage's nodes, then breadth first from the roots.
     let mut nodes = Vec::new();
     let mut stage_root = Vec::with_capacity(stages.len());
@@ -815,6 +831,8 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         roots.extend((0..sections).map(|sec| stage_of(0, sec, true)));
     }
     let (nodes, roots) = breadth_first(&nodes, &roots);
+    drop(_hierarchy);
+    let _node_pages = crate::profile::zone!("dag.node_pages");
     let (nodes, node_pages, node_blobs) =
         if nodes.len() * size_of::<Node>() <= s.hierarchy_resident_max as usize {
             (nodes, Vec::new(), Vec::new())
@@ -845,6 +863,8 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         emissive: ClusterSets::default(),
         casters: ClusterSets::default(),
     };
+    let _free = crate::profile::zone!("dag.free");
+    drop((groups, stages));
     Ok(Built {
         info,
         pages,

@@ -278,6 +278,7 @@ pub(crate) fn levels(
 
 /// The triangles of each (part, section), sorted by part, then section.
 pub(crate) fn pieces(w: &Welded, parts: &Parts) -> Vec<Piece> {
+    let _z = crate::profile::zone!("mesh.pieces");
     let mut by_key: BTreeMap<(u16, u16), Vec<u32>> = Default::default();
     for (sec, r) in w.sections.iter().enumerate() {
         for t in r.start / 3..r.end / 3 {
@@ -304,6 +305,7 @@ pub(super) fn seam_cells(
     w: &Welded,
     corners: impl IntoIterator<Item = (u32, [i32; 3])>,
 ) -> FxHashSet<[i32; 3]> {
+    let _z = crate::profile::zone!("mesh.seam_cells");
     let mut first: FxHashMap<[i32; 3], u32> = FxHashMap::default();
     let mut seams = FxHashSet::default();
     for (v, cell) in corners {
@@ -321,6 +323,7 @@ pub(super) fn seam_cells(
 pub(super) fn shared_cells<P: IntoIterator<Item = [i32; 3]>>(
     pieces: impl IntoIterator<Item = P>,
 ) -> FxHashSet<[i32; 3]> {
+    let _z = crate::profile::zone!("mesh.shared_cells");
     let mut owner: FxHashMap<[i32; 3], usize> = FxHashMap::default();
     let mut shared = FxHashSet::default();
     for (pi, cells) in pieces.into_iter().enumerate() {
@@ -430,6 +433,7 @@ pub(super) fn displacement_seams(
     let Some(map) = &d.map else {
         return Vec::new();
     };
+    let _z = crate::profile::zone!("mesh.displacement_seams");
     let tolerance = (d.max - d.min) / 1024.0;
     let mut heights: FxHashMap<[i32; 3], [f32; 2]> = FxHashMap::default();
     for t in w.section_triangles(s) {
@@ -468,6 +472,7 @@ pub(super) fn displacement_seams(
 /// Whether section `s` is closed: on the mesh grid, each edge between two positions is used
 /// as often in one direction as in the other.
 pub(super) fn closed(w: &Welded, grid: &Grid, s: usize) -> bool {
+    let _z = crate::profile::zone!("mesh.closed");
     let mut uses: FxHashMap<([i32; 3], [i32; 3]), i32> = FxHashMap::default();
     let mut any = false;
     for t in w.section_triangles(s) {
@@ -486,6 +491,7 @@ pub(super) fn closed(w: &Welded, grid: &Grid, s: usize) -> bool {
 
 /// Edges of section `s` used by one triangle, by grid position.
 pub(super) fn border_edges(w: &Welded, grid: &Grid, s: usize) -> usize {
+    let _z = crate::profile::zone!("mesh.border_edges");
     let mut uses: FxHashMap<([i32; 3], [i32; 3]), u32> = FxHashMap::default();
     for t in w.section_triangles(s) {
         let c = t.map(|v| grid.cells[v as usize]);

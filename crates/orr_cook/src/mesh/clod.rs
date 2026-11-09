@@ -5,8 +5,8 @@
 
 use meshopt::{SimplifyOptions, SimplifyVertex, ffi};
 
+use crate::par::prelude::*;
 use orr_math::Vec3;
-use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// A sphere and the simplification error of the geometry it bounds.
@@ -526,6 +526,7 @@ pub(super) fn build<G: Send>(
         "clusterlod options the port leaves out"
     );
     let vertex_count = positions.len() / 3;
+    let remap_zone = crate::profile::zone!("clod.remap");
     let mut remap = vec![0u32; vertex_count];
     // SAFETY: one position per vertex.
     unsafe {
@@ -536,6 +537,7 @@ pub(super) fn build<G: Send>(
             12,
         );
     }
+    drop(remap_zone);
     let mut locks = vec![0u8; vertex_count];
     let positions = Positions(positions.as_mut_ptr(), positions.len());
     let mut out = Vec::new();
@@ -549,14 +551,18 @@ pub(super) fn build<G: Send>(
         mesh.indices,
         -1,
     );
-    clusters.par_iter_mut().for_each(|k| {
-        k.bounds = bounds_compute(positions.read(), k.corners(&cluster_indices), 0.0);
-    });
+    {
+        let _z = crate::profile::zone!("clod.bounds");
+        clusters.par_iter_mut().for_each(|k| {
+            k.bounds = bounds_compute(positions.read(), k.corners(&cluster_indices), 0.0);
+        });
+    }
 
     let mut depth = 0u32;
     while clusters.len() > 1 {
         let _z = crate::profile::zone!("clod.level");
         let offsets = partition(&mut clusters, c, positions.read(), &cluster_indices, &remap);
+        let lock = crate::profile::zone!("clod.lock");
         lock_boundary(
             &mut locks,
             &clusters,
@@ -565,6 +571,7 @@ pub(super) fn build<G: Send>(
             &remap,
             mesh.lock,
         );
+        drop(lock);
         let base = out.len() as i32;
         let groups: Vec<(G, Vec<Cluster>, Vec<u32>)> = offsets
             .par_windows(2)
@@ -630,6 +637,7 @@ pub(super) fn build<G: Send>(
                 (g, next, next_indices)
             })
             .collect();
+        let _gather = crate::profile::zone!("clod.gather");
         let (mut pending, mut pending_indices) = (Vec::new(), Vec::new());
         for (g, next, next_indices) in groups {
             out.push(g);

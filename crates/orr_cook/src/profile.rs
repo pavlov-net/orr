@@ -1,13 +1,22 @@
 //! Tracy zones, plots and thread names, compiled to nothing without the `tracy` feature.
 
 /// A zone named `$name` that lasts until the value drops, with `$text` (a `&str`) shown on
-/// it when given.
+/// it when given, and otherwise the name of the thread's cook job when it has one.
 #[cfg(feature = "tracy")]
 macro_rules! zone {
-    ($name:literal $(, $text:expr)?) => {
+    ($name:literal) => {
         ::tracy_client::Client::running().map(|c| {
             let span = c.span(::tracy_client::span_location!($name), 0);
-            $(span.emit_text($text);)?
+            if let Some(job) = $crate::job::name() {
+                span.emit_text(job);
+            }
+            span
+        })
+    };
+    ($name:literal, $text:expr) => {
+        ::tracy_client::Client::running().map(|c| {
+            let span = c.span(::tracy_client::span_location!($name), 0);
+            span.emit_text($text);
             span
         })
     };
@@ -40,6 +49,12 @@ pub(crate) use {plot, zone};
 /// What [`zone!`] gives without the `tracy` feature.
 #[cfg(not(feature = "tracy"))]
 pub(crate) struct Off;
+
+// A zone ends early with `drop`, with the feature and without.
+#[cfg(not(feature = "tracy"))]
+impl Drop for Off {
+    fn drop(&mut self) {}
+}
 
 /// Starts the profiler client; later calls do nothing.
 pub(crate) fn start() {

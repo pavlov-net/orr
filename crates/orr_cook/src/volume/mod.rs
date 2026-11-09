@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use crate::par::prelude::*;
 use orr_pack::instance::morton;
 use orr_pack::texture::vk;
 use orr_pack::volume::{
@@ -15,7 +16,6 @@ use orr_pack::volume::{
     VolumeHeader, VolumeInfo,
 };
 use orr_pack::{Aabb, ArchiveWriter, BlobIn, Class, Hash32, Span};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::key::Key;

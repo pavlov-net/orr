@@ -108,6 +108,7 @@ pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
     }
     let mut cooked = run.finish()?;
     cooked.report.seconds = start.elapsed().as_secs_f64();
+    cooked.report.heap_peak = crate::job::total_peak();
     if let Some(path) = &opts.report {
         let json = serde_json::to_vec_pretty(&cooked.report).expect("report serializes");
         std::fs::write(path, json).map_err(|source| Error::Write {
@@ -294,6 +295,8 @@ type UnitResult = (From, f64, Detail);
 /// What a cooked unit adds to its first entry's report.
 #[derive(Default)]
 struct Detail {
+    /// The job's measured peak bytes.
+    peak: Option<u64>,
     tangents: Option<mesh::TangentCheck>,
     raster: Option<RasterReport>,
     volume: Option<VolumeReport>,
@@ -1442,14 +1445,20 @@ impl<'m, 's> Run<'m, 's> {
             .clone()
             .filter(|_| self.window > self.opts.reorder_window);
         let (tx, shared) = (tx.clone(), self.shared);
+        let meter = crate::job::Meter::new();
         scope.spawn(move || {
             crate::profile::name_thread("cook job");
             let r = catch_unwind(AssertUnwindSafe(|| {
-                let _z = crate::profile::zone!("job", &name);
+                let entered = crate::job::enter(Some(meter.job(&name)));
+                let z = crate::profile::zone!("job", &name);
                 let start = Instant::now();
-                let (from, detail) =
+                let (from, mut detail) =
                     cook_unit(shared, &name, class, key, gdeflate, spill.as_deref(), work)?;
-                Ok((from, start.elapsed().as_secs_f64(), detail))
+                let seconds = start.elapsed().as_secs_f64();
+                drop(z);
+                drop(entered);
+                detail.peak = meter.peak();
+                Ok((from, seconds, detail))
             }));
             let _ = tx.send(Msg::Unit(u, r));
         });
@@ -1584,7 +1593,11 @@ impl<'m, 's> Run<'m, 's> {
                 if self.map_users[u] == 0 {
                     self.release(&d.from);
                 }
-                if let (Some(d), Some(first)) = (self.details.remove(&u), reports.first_mut()) {
+                let detail = self.details.remove(&u);
+                for r in &mut reports {
+                    r.peak = detail.as_ref().and_then(|d| d.peak);
+                }
+                if let (Some(d), Some(first)) = (detail, reports.first_mut()) {
                     if let (Some(m), Some(t)) = (first.mesh.as_mut(), d.tangents) {
                         m.tangents = Some(tangent_report(m.vertices, t));
                     }
@@ -1644,7 +1657,11 @@ impl<'m, 's> Run<'m, 's> {
                 entries,
                 bytes: 0,
             };
-            match writer.map(ArchiveWriter::finish).transpose()?.flatten() {
+            let finished = {
+                let _z = crate::profile::zone!("archive.complete");
+                writer.map(ArchiveWriter::finish).transpose()?.flatten()
+            };
+            match finished {
                 Some(bytes) => {
                     report.bytes = bytes.len() as u64;
                     cooked.memory.push(bytes);
@@ -2903,7 +2920,9 @@ fn cook_unit(
             let maps = section_maps(&data, &archives, normals, &shared.opacity, &shared.emission)?;
             drop(archives);
             let cooked = mesh::cook(name, &data, &settings, &maps)?;
+            let free = crate::profile::zone!("mesh.free");
             drop((data, maps));
+            drop(free);
             detail.warnings = cooked.warnings;
             detail.warnings.extend(uv_warnings);
             detail.tangents = cooked.tangents;

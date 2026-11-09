@@ -8,8 +8,8 @@
 //! distance, rounded down to f16, is the cluster's `min_thickness`; f16 infinity when no ray
 //! hits.
 
+use crate::par::prelude::*;
 use orr_math::DVec3;
-use rayon::prelude::*;
 
 use super::{ClusterData, Grid, SectionData, f16_down};
 use orr_pack::mesh::{Cluster, SurfaceClass};

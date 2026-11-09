@@ -58,6 +58,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::par::prelude::*;
 use ctt::Quality;
 use orr_color::RgbPrimaries;
 use orr_math::{DMat3, DVec3};
@@ -65,7 +66,6 @@ use orr_pack::material::{Material, TextureBinding, slot};
 use orr_pack::texture::{full_mip_count, mip_size, normal};
 use orr_pack::tiles::{TextureTiles, Tile};
 use orr_pack::{AssetId, Class, Hash32};
-use rayon::prelude::*;
 use serde::Deserialize;
 
 use super::color::{BELOW_ZERO, Decode, FileColor, ImageColor, Read, clipped, multiply};

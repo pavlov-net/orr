@@ -27,6 +27,7 @@ mod thickness;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::par::prelude::*;
 use meshopt::VertexDataAdapter;
 use orr_math::{DVec3, Vec2, Vec3};
 use orr_pack::instance::MAX_HIDDEN_SECTION;
@@ -36,7 +37,6 @@ use orr_pack::mesh::{
     PAGE_MAX, PageHeader, PageInfo, Part, PartLevel, Section, SurfaceClass, oct_encode,
 };
 use orr_pack::{Aabb, AssetId, Hash32, Span, Sphere};
-use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::assembly::AssemblySettings;
@@ -629,6 +629,7 @@ pub(crate) fn cook(
         (Some(t), Some(max)) if !bakes => tangents::check(m, t, maps, max),
         _ => TangentCheck::KEPT,
     };
+    let stretch_zone = crate::profile::zone!("mesh.stretch");
     let stretch: Vec<[f32; 2]> = m
         .sections
         .iter()
@@ -640,6 +641,7 @@ pub(crate) fn cook(
             vertices.fold([1.0f32; 2], |[lo, hi], l| [lo.min(l), hi.max(l)])
         })
         .collect();
+    drop(stretch_zone);
     let mut w = lod::Welded::new(m, !tangent_check.derive, bakes);
     let source_grid =
         Grid::new(&w.positions, s.position_step_log2, m.min_exponent).map_err(fail)?;
@@ -733,6 +735,7 @@ pub(crate) fn cook(
         LodMode::Dag => dag::cook(&cx).map_err(fail)?,
     };
 
+    let bounds_zone = crate::profile::zone!("mesh.bounds");
     let mut bounds = Aabb::EMPTY;
     grid.floats.iter().for_each(|&p| bounds.extend(p));
     let sphere = meshopt::compute_sphere_bounds(
@@ -744,6 +747,7 @@ pub(crate) fn cook(
         },
         None,
     );
+    drop(bounds_zone);
     built.info.header = MeshHeader {
         bounds,
         sphere: Sphere {
@@ -787,6 +791,8 @@ pub(crate) fn cook(
         }
     }
     sets::build(&mut built.info, &m.sections, &built.clusters);
+    let _free = crate::profile::zone!("mesh.free");
+    drop((built.clusters, w, parts, grid, omm_alpha));
     Ok(CookedMesh {
         info: built.info,
         pages: built.pages,
@@ -1403,6 +1409,7 @@ struct Grid {
 
 impl Grid {
     fn new(positions: &[[f32; 3]], step_log2: i8, min: Option<i8>) -> Result<Self, String> {
+        let _z = crate::profile::zone!("mesh.grid");
         let own = grid_exponent(positions, step_log2);
         let k = i32::from(own.max(min.unwrap_or(i8::MIN)));
         let step = 2f64.powi(k);

@@ -16,6 +16,10 @@ use crate::{RasterReport, VolumeReport};
 pub struct CookReport {
     /// Wall time of the whole cook.
     pub seconds: f64,
+    /// The most live heap bytes over the cook, with [`crate::Metered`] as the global
+    /// allocator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heap_peak: Option<u64>,
     pub archives: Vec<ArchiveReport>,
     /// One per manifest asset, in manifest order.
     pub assets: Vec<AssetReport>,
@@ -78,6 +82,11 @@ pub struct EntryReport {
     pub seconds: f64,
     /// The scheduler's estimate of the job's peak bytes.
     pub working_set: u64,
+    /// The job's measured peak, with [`crate::Metered`] as the global allocator: the most
+    /// live heap bytes it added, its parallel loops' included. `None` without the meter and
+    /// for linked entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak: Option<u64>,
     /// Decoded and stored bytes over its blobs.
     pub raw: u64,
     pub stored: u64,
@@ -266,6 +275,7 @@ pub(crate) fn entry(
         outcome,
         seconds,
         working_set,
+        peak: None,
         raw: blobs.iter().map(|b| u64::from(b.raw_len)).sum(),
         stored,
         mesh,

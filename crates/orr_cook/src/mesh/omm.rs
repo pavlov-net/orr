@@ -1,12 +1,12 @@
 //! Opacity micromaps of alpha-tested clusters, rasterized from the cooked opacity mip 0 over
 //! the triangles and corners as the page stores them.
 
+use crate::par::prelude::*;
 use meshopt::{AlphaTexture, OpacityStates};
 use orr_pack::mesh::{
     MicromapEntry, OMM_OPAQUE, OMM_STATE_OPAQUE, OMM_STATE_TRANSPARENT, OMM_STATE_UNKNOWN_OPAQUE,
     OMM_STATE_UNKNOWN_TRANSPARENT, OMM_TRANSPARENT,
 };
-use rayon::prelude::*;
 use serde::Deserialize;
 
 use super::maps::{self, FAIL, Map, Opacity, OpacityRead, PASS, Ranges, Raster};

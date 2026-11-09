@@ -1,9 +1,9 @@
 //! Mip chains in linear float: separable box or Kaiser downsampling, per atlas cell where
 //! cells allow, normal renormalization, alpha-coverage scaling and Toksvig roughness.
 
+use crate::par::prelude::*;
 use orr_math::Vec3;
 use orr_pack::texture::mip_size;
-use rayon::prelude::*;
 
 use super::{Img, MipFilter, Wrap};
 

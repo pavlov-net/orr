@@ -15,13 +15,13 @@ use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek};
 use std::path::Path;
 
+use crate::par::prelude::*;
 use ctt::input::{InputOverrides, decode_container};
 use ctt::{ColorSpace, FormatExt, TextureKind};
 use image::ImageDecoder;
 use image::codecs::hdr::HdrDecoder;
 use image::codecs::webp::WebPDecoder;
 use orr_pack::texture::{FormatInfo, full_mip_count, mip_size, vk};
-use rayon::prelude::*;
 
 use super::color::{self, FileColor, Gamut, ImageColor, Transfer};
 use super::material::Layer;

@@ -9,10 +9,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::par::prelude::*;
 use crate::texture::Wrap;
 use crate::texture::tiles::Cell;
 use orr_math::{Mat3, Vec3};
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 /// One mip of one channel, row-major, with the sampler's edge modes, the material slot's uv

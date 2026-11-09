@@ -12,10 +12,10 @@ mod texel;
 
 use std::path::{Path, PathBuf};
 
+use crate::par::prelude::*;
 use ctt::Quality;
 use orr_pack::raster::{self, RasterLayer, RasterSetHeader, RasterSetInfo, TileKey, morton};
 use orr_pack::{ArchiveWriter, BlobIn, Class, EncodedBlob, Filter, GDeflate, Hash32, Span};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::key::Key;
