@@ -560,16 +560,29 @@ impl Passes {
             });
             (cols, rows) = (c, r);
         }
-        Self {
+        let passes = Self {
             prefix,
             cutoff,
             levels,
-        }
+        };
+        debug_assert_eq!(passes.bytes() as u64, Self::bytes_of(mip.w, mip.h));
+        passes
     }
 
     fn bytes(&self) -> usize {
         self.prefix.len() * size_of::<u16>()
             + self.levels.iter().map(|l| l.flags.len()).sum::<usize>()
+    }
+
+    /// [`Self::bytes`] of the passes of a `w` by `h` mip.
+    pub(crate) fn bytes_of(w: u32, h: u32) -> u64 {
+        let (mut cols, mut rows) = (u64::from(w).div_ceil(2), u64::from(h).div_ceil(2));
+        let mut bytes = (u64::from(w) + 1) * u64::from(h) * size_of::<u16>() as u64 + cols * rows;
+        while cols > 1 || rows > 1 {
+            (cols, rows) = (cols.div_ceil(2), rows.div_ceil(2));
+            bytes += cols * rows;
+        }
+        bytes
     }
 
     /// `PASS` or `FAIL` when every texel in `xs` by `ys` is on that side; `None` when the

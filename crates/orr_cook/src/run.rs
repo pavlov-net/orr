@@ -93,7 +93,7 @@ const DAG_BYTES_PER_VERTEX: u64 = 215;
 const SUBSURFACE_BYTES_PER_TRIANGLE: u64 = 168;
 
 /// Bytes a mesh cook holds per decoded texel channel of the maps its sections read
-/// ([`map_channels`]): an f32 each. Textures decode one at a time, each taking
+/// ([`map_bytes`]): an f32 each. Textures decode one at a time, each taking
 /// [`MAP_DECODE_BYTES_PER_CHANNEL`] more per channel while it decodes, while the mesh is read
 /// and before the geometry's peak.
 const MAP_BYTES_PER_CHANNEL: u64 = 4;
@@ -930,14 +930,12 @@ impl<'m, 's> Run<'m, 's> {
                     .texture
                     .expect("a mesh is ready after the textures it reads")
             };
-            let normals = settings.tangent_error_max.is_some();
-            let (channels, largest) = map_channels(source.sections(), normals, header);
-            let held = channels * MAP_BYTES_PER_CHANNEL;
+            let maps = map_bytes(source.sections(), settings, header);
             let load = source.triangles() * LOAD_BYTES_PER_TRIANGLE
                 + source.vertices() * LOAD_BYTES_PER_VERTEX
-                + held
-                + largest * MAP_DECODE_BYTES_PER_CHANNEL;
-            let geometry = mesh_working_set(source, settings) + held;
+                + maps.held
+                + maps.decode_channels * MAP_DECODE_BYTES_PER_CHANNEL;
+            let geometry = mesh_working_set(source, settings) + maps.held + maps.micromaps;
             self.units[u].working_set = load.max(geometry);
         }
         self.ready.insert(self.ready_key(u));
@@ -3253,19 +3251,43 @@ fn mesh_working_set(mesh: &MeshSource, settings: &MeshSettings) -> u64 {
     }
 }
 
-/// Texel channels [`section_maps`] decodes for these sections, each texture once per use:
-/// mip 0 of an opacity texture (one channel) and, with `normals` (the tangent check runs), of
-/// a normal map (two), every mip of a height (one) and an emission texture's mip at most
-/// [`EmissionMap::SIDE_MAX`] a side (three). `header` gives a texture unit's header. Returns
-/// them all, and the most one texture use decodes.
-fn map_channels(
+/// What a mesh cook holds of the maps its sections read ([`section_maps`]).
+struct MapBytes {
+    /// The decoded maps, each texture once per use ([`MapUse`]).
+    held: u64,
+    /// The opacity micromaps bake from: a byte per mip 0 texel, per section that bakes them.
+    micromaps: u64,
+    /// The most texel channels one texture use decodes.
+    decode_channels: u64,
+}
+
+/// A use of a texture, which holds one decoded map of it.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+enum MapUse {
+    /// Mip 0 under the cutoff of these bits, and its [`Passes`].
+    Opacity(u32),
+    /// Mip 0, two channels; only while the tangent check runs.
+    Normal,
+    /// Every mip, one channel.
+    Height,
+    /// The luminance of the mip at most [`EmissionMap::SIDE_MAX`] a side, decoded from three
+    /// channels.
+    Emission,
+}
+
+/// [`MapBytes`] of these sections, with `header` giving a texture unit's header.
+fn map_bytes(
     sections: &[SectionData],
-    normals: bool,
+    settings: &MeshSettings,
     header: impl Fn(&str) -> orr_pack::texture::TextureHeader,
-) -> (u64, u64) {
+) -> MapBytes {
     let mut seen = HashSet::new();
-    let (mut total, mut largest) = (0, 0);
-    let mut add = |texture: &MapTexture, use_: u8, total: &mut u64| {
+    let mut out = MapBytes {
+        held: 0,
+        micromaps: 0,
+        decode_channels: 0,
+    };
+    let mut add = |texture: &MapTexture, use_: MapUse, out: &mut MapBytes| {
         for unit in texture.units() {
             if !seen.insert((unit.to_owned(), use_)) {
                 continue;
@@ -3275,28 +3297,43 @@ fn map_channels(
                 let [w, h] = h.mip_size(mip);
                 u64::from(w) * u64::from(h)
             };
-            let n = match use_ {
-                0 => texels(0),
-                1 => 2 * texels(0),
-                2 => (0..u32::from(h.mip_count)).map(texels).sum(),
-                _ => {
+            let (held, decoded) = match use_ {
+                MapUse::Opacity(_) => {
+                    let [w, hh] = h.mip_size(0);
+                    out.held += Passes::bytes_of(w, hh);
+                    (texels(0), texels(0))
+                }
+                MapUse::Normal => (2 * texels(0), 2 * texels(0)),
+                MapUse::Height => {
+                    let all = (0..u32::from(h.mip_count)).map(texels).sum();
+                    (all, all)
+                }
+                MapUse::Emission => {
                     let mip = (0..u32::from(h.mip_count))
                         .find(|&m| h.mip_size(m).into_iter().max() <= Some(EmissionMap::SIDE_MAX))
                         .unwrap_or_else(|| u32::from(h.mip_count) - 1);
-                    3 * texels(mip)
+                    (texels(mip), 3 * texels(mip))
                 }
             };
-            *total += n;
-            largest = largest.max(n);
+            out.held += held * MAP_BYTES_PER_CHANNEL;
+            out.decode_channels = out.decode_channels.max(decoded);
         }
     };
     for s in sections {
         let m = &s.maps;
-        if let OpacitySpec::Texture { texture, .. } = &m.opacity {
-            add(texture, 0, &mut total);
+        if let OpacitySpec::Texture {
+            texture, cutoff, ..
+        } = &m.opacity
+        {
+            add(texture, MapUse::Opacity(cutoff.to_bits()), &mut out);
+            for unit in texture.units() {
+                out.micromaps += s.micromap_bytes(settings, header(unit).mip_size(0));
+            }
         }
-        if normals && let NormalSpec::Texture { texture, .. } = &m.normal {
-            add(texture, 1, &mut total);
+        if settings.tangent_error_max.is_some()
+            && let NormalSpec::Texture { texture, .. } = &m.normal
+        {
+            add(texture, MapUse::Normal, &mut out);
         }
         let heights = m
             .displacement
@@ -3304,14 +3341,14 @@ fn map_channels(
             .chain(m.tangent_displacement.iter().flatten());
         for d in heights {
             if let Some(t) = &d.texture {
-                add(&t.texture, 2, &mut total);
+                add(&t.texture, MapUse::Height, &mut out);
             }
         }
         if let Some(e) = &m.emission {
-            add(&e.texture, 3, &mut total);
+            add(&e.texture, MapUse::Emission, &mut out);
         }
     }
-    (total, largest)
+    out
 }
 
 /// Cooks one unit into a one-unit archive: in the cache when there is one, else in `spill`

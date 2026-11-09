@@ -381,6 +381,16 @@ impl SectionData {
         SurfaceClass::from_flags(self.flags) == Some(SurfaceClass::Opaque)
     }
 
+    /// Bytes the section's micromaps bake from for its opacity texture of mip 0 size `size`
+    /// under `settings`: the texture as a byte per texel, when they bake from it.
+    pub(crate) fn micromap_bytes(&self, settings: &MeshSettings, [w, h]: [u32; 2]) -> u64 {
+        let bakes = settings.omm.is_some()
+            && self.takes_micromaps()
+            && w <= OmmAlpha::MAX_SIZE
+            && h <= OmmAlpha::MAX_SIZE;
+        u64::from(bakes) * u64::from(w) * u64::from(h)
+    }
+
     /// A section of `indices` drawn with material `m`, whose back is `back` where it has one
     /// of its own.
     pub(crate) fn new(
