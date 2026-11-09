@@ -1339,7 +1339,9 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     float3 coat_in = s.passage(s.coat_v.z) * (1.0 - coat_reflected) * darkening;
     float fuzz_presence = s.inside ? 0.0 : fuzz_weight;
     s.fuzz_tint = p.fuzz_color;
-    s.fuzz_ltc = ltc_coeffs(p.fuzz_roughness, s.fuzz_v.z);
+    s.fuzz_ltc = float3(0.0);
+    if (fuzz_presence != 0.0)
+        s.fuzz_ltc = ltc_coeffs(p.fuzz_roughness, s.fuzz_v.z);
     float fuzz_in = 1.0 - fuzz_presence * s.fuzz_ltc.z;
     s.layer = s.inside ? float3(1.0) : coat_in * fuzz_in;
     s.emitted = s.inside ? float3(0.0) : p.emission * coat_in * fuzz_in;
@@ -1399,28 +1401,38 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.g1v = openpbr_eval_aniso_smith_g1(s.v, s.alpha);
     s.dms_reflect = s.inside ? float3(trans + sss) : specular_tint * s.mix_weight * (trans + sss);
     s.dms_transmit = tinted + (walk_on ? 0.0 : sss);
+    float metal_ec = openpbr_look_up_ideal_metal_energy_complement(s.alpha_iso, mu);
     if (s.alpha_iso >= MIN_MS_ALPHA)
     {
-        s.dms_ratio = openpbr_look_up_ideal_dielectric_reflection_ratio(eta_r, s.alpha_iso);
-        s.dms_ec = openpbr_look_up_ideal_dielectric_energy_complement(eta_r, s.alpha_iso, mu);
-        s.mms_ec = openpbr_look_up_ideal_metal_energy_complement(s.alpha_iso, mu);
+        // Each of these multiplies the base's transmitting or walking share.
+        if (walk_on || any(s.dms_reflect != 0.0) || any(s.dms_transmit != 0.0))
+        {
+            s.dms_ratio = openpbr_look_up_ideal_dielectric_reflection_ratio(eta_r, s.alpha_iso);
+            s.dms_ec = openpbr_look_up_ideal_dielectric_energy_complement(eta_r, s.alpha_iso, mu);
+            s.dms_average_above = openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_dielectric_average_energy_complement(eta_r, s.alpha_iso));
+            if (walk_on || any(s.dms_transmit > 0.0))
+                s.dms_average_below = openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_dielectric_average_energy_complement(1.0 / eta_r, s.alpha_iso));
+        }
+        s.mms_ec = metal_ec;
         if (s.metal > 0.0)
             s.mms_average = openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_metal_average_energy_complement(s.alpha_iso));
-        s.dms_average_above = openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_dielectric_average_energy_complement(eta_r, s.alpha_iso));
-        if (walk_on || any(s.dms_transmit > 0.0))
-            s.dms_average_below = openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_dielectric_average_energy_complement(1.0 / eta_r, s.alpha_iso));
     }
     s.mms = metal_average * metal_average * darkened_metal;
 
-    // Diffuse under the specular layer.
+    // Diffuse under the specular layer. The complement at the view multiplies the diffuse lobes
+    // alone. Their average is read without them too: a Fresnel mix's weight can cancel it, and
+    // the infinite ratio times 0 is not 0.
     s.diffuse_roughness = p.diffuse_roughness;
-    s.diffuse_comp = weighted_complement(openpbr_look_up_opaque_dielectric_energy_complement(eta_o, s.alpha_iso, mu), s.mix_weight)
-        / weighted_complement(openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_opaque_dielectric_average_energy_complement(eta_o, s.alpha_iso)), s.mix_weight);
     s.diffuse = p.base_color * opaque + thin_reflect_diffuse;
+    float diffuse_ec = 1.0;
+    if (any(s.diffuse != 0.0) || any(s.thin_diffuse != 0.0))
+        diffuse_ec = openpbr_look_up_opaque_dielectric_energy_complement(eta_o, s.alpha_iso, mu);
+    s.diffuse_comp = weighted_complement(diffuse_ec, s.mix_weight)
+        / weighted_complement(openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_opaque_dielectric_average_energy_complement(eta_o, s.alpha_iso)), s.mix_weight);
 
     // Directional albedo estimates without the coat and fuzz: `finish` adds them, folded or
     // not, and turns the estimates into lobe probabilities.
-    float e_ss = 1.0 - openpbr_look_up_ideal_metal_energy_complement(s.alpha_iso, mu);
+    float e_ss = 1.0 - metal_ec;
     float3 below = s.layer * s.leaving(v);
     float3 rc;
     float3 tc;
