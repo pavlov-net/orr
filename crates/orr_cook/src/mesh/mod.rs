@@ -1497,8 +1497,30 @@ fn f16_next(h: half::f16, up: bool) -> u16 {
 /// The grid exponent `k` of positions: `max(step_log2, ceil(log2(extent / 65535)))`,
 /// computed without log2 rounding.
 pub(crate) fn grid_exponent(positions: &[[f32; 3]], step_log2: i8) -> i8 {
-    let mut b = Aabb::EMPTY;
-    positions.iter().for_each(|&p| b.extend(p));
+    bounds_exponent(&position_bounds(positions), step_log2)
+}
+
+/// The box of `positions`, found in parallel.
+fn position_bounds(positions: &[[f32; 3]]) -> Aabb {
+    positions
+        .par_chunks(1 << 16)
+        .map(|c| {
+            let mut b = Aabb::EMPTY;
+            c.iter().for_each(|&p| b.extend(p));
+            b
+        })
+        .reduce(
+            || Aabb::EMPTY,
+            |mut a, b| {
+                a.extend(b.min);
+                a.extend(b.max);
+                a
+            },
+        )
+}
+
+/// [`grid_exponent`] of positions with box `b`.
+fn bounds_exponent(b: &Aabb, step_log2: i8) -> i8 {
     let extent = (0..3)
         .map(|a| f64::from(b.max[a]) - f64::from(b.min[a]))
         .fold(0.0, f64::max);
@@ -1522,28 +1544,36 @@ struct Grid {
 impl Grid {
     fn new(positions: &[[f32; 3]], step_log2: i8, min: Option<i8>) -> Result<Self, String> {
         let _z = crate::profile::zone!("mesh.grid");
-        let own = grid_exponent(positions, step_log2);
+        let b = position_bounds(positions);
+        let own = bounds_exponent(&b, step_log2);
         let k = i32::from(own.max(min.unwrap_or(i8::MIN)));
         let step = 2f64.powi(k);
-        let mut max_abs = 0;
-        let mut cells = Vec::with_capacity(positions.len());
-        for p in positions {
-            let g = p.map(|x| (f64::from(x) / step + 0.5).floor());
-            if g.iter().any(|v| v.abs() >= f64::from(1 << 23)) {
-                return Err(format!(
-                    "position {p:?} m needs more than 24 bits on the 2^{k} m grid"
-                ));
-            }
-            let g = g.map(|v| v as i32);
-            max_abs = g.iter().fold(max_abs, |m, v| m.max(v.unsigned_abs()));
-            cells.push(g);
+        // Dividing by a power of two is multiplying by its exact inverse.
+        let inverse = 2f64.powi(-k);
+        let cell = |p: &[f32; 3]| p.map(|x| (f64::from(x) * inverse + 0.5).floor());
+        let over = |p: &[f32; 3]| cell(p).iter().any(|v| v.abs() >= f64::from(1 << 23));
+        if let Some(i) = positions.par_iter().light().position_first(over) {
+            let p = positions[i];
+            return Err(format!(
+                "position {p:?} m needs more than 24 bits on the 2^{k} m grid"
+            ));
         }
+        let cells: Vec<[i32; 3]> = positions
+            .par_iter()
+            .light()
+            .map(|p| cell(p).map(|v| v as i32))
+            .collect();
+        let max_abs = cells
+            .par_iter()
+            .light()
+            .map(|g| g.iter().fold(0, |m, v| m.max(v.unsigned_abs())))
+            .max()
+            .unwrap_or(0);
         let floats: Vec<[f32; 3]> = cells
-            .iter()
+            .par_iter()
+            .light()
             .map(|g| g.map(|v| (f64::from(v) * step) as f32))
             .collect();
-        let mut b = Aabb::EMPTY;
-        positions.iter().for_each(|&p| b.extend(p));
         let m = meshopt::compute_position_exponent(b.min, b.max, step_log2.into(), 16);
         let own = i32::from(own);
         assert!(
