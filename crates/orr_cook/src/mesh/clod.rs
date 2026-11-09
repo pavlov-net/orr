@@ -1,7 +1,8 @@
 //! meshoptimizer's `clodBuild` (demo/clusterlod.h), ported so each level's groups
 //! simplify in parallel. Groups of one level share only locked vertices, so each reads the
 //! positions it needs and moves only its own vertices when it dilates borders; groups come
-//! out in the order the original emits them, with the same numbering.
+//! out in the order the original emits them, with the same numbering. Unlike the original,
+//! level 0 clusters each section apart.
 
 use meshopt::{SimplifyOptions, SimplifyVertex, ffi};
 
