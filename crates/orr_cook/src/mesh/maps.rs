@@ -586,7 +586,7 @@ impl Passes {
             .levels
             .iter()
             .find(|l| fits(l))
-            .unwrap_or_else(|| self.levels.last().expect("a level"));
+            .expect("the coarsest level is one tile");
         let mut sides = 0;
         for y in ranges(ys) {
             for x in ranges(xs) {
