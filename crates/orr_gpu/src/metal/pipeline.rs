@@ -3,12 +3,12 @@ use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSDictionary, NSString};
 use objc2_metal::{
     MTL4Archive, MTL4Compiler, MTL4CompilerTaskOptions, MTL4ComputePipelineDescriptor,
     MTL4FunctionDescriptor, MTL4LibraryFunctionDescriptor, MTL4SpecializedFunctionDescriptor,
-    MTLComputePipelineState, MTLDataType, MTLDevice, MTLFunction, MTLFunctionConstantValues,
-    MTLLibrary,
+    MTLComputePipelineState, MTLDataType, MTLDevice, MTLFunction, MTLFunctionConstant,
+    MTLFunctionConstantValues, MTLLibrary,
 };
 
 use super::device::{Device, Shared, metal_error};
@@ -72,7 +72,7 @@ impl<'a> ShaderStage<'a> {
     }
 
     /// The Metal function descriptor of the entry: its name in the module's library, the
-    /// fragment library for pixel entries, specialized when the stage has constants.
+    /// fragment library for pixel entries, specialized when the function declares constants.
     pub(super) fn function(
         &self,
         shared: &Shared,
@@ -89,10 +89,18 @@ impl<'a> ShaderStage<'a> {
         let f = MTL4LibraryFunctionDescriptor::new();
         f.setName(Some(&NSString::from_str(name)));
         f.setLibrary(Some(&library));
-        if self.spec.entries.is_empty() {
+        let function = library
+            .newFunctionWithName(&NSString::from_str(name))
+            .ok_or_else(|| {
+                Error::Shader(format!("{}: no Metal function {name}", self.module.name))
+            })?;
+        let constants = function.functionConstantsDictionary();
+        // Metal refuses a function with constants that isn't specialized, even when every
+        // constant keeps its default.
+        if constants.count() == 0 {
             return Ok(Retained::into_super(f));
         }
-        let values = self.constant_values(&library, name)?;
+        let values = self.constant_values(&constants)?;
         let specialized = MTL4SpecializedFunctionDescriptor::new();
         specialized.setFunctionDescriptor(Some(&f));
         specialized.setConstantValues(Some(&values));
@@ -119,16 +127,9 @@ impl<'a> ShaderStage<'a> {
     /// bytes here and one byte in Metal; constants the function lacks are skipped.
     fn constant_values(
         &self,
-        library: &ProtocolObject<dyn MTLLibrary>,
-        name: &str,
+        constants: &NSDictionary<NSString, MTLFunctionConstant>,
     ) -> Result<Retained<MTLFunctionConstantValues>, Error> {
-        let function = library
-            .newFunctionWithName(&NSString::from_str(name))
-            .ok_or_else(|| {
-                Error::Shader(format!("{}: no Metal function {name}", self.module.name))
-            })?;
-        let dictionary = function.functionConstantsDictionary();
-        let types: HashMap<usize, MTLDataType> = dictionary
+        let types: HashMap<usize, MTLDataType> = constants
             .allValues()
             .iter()
             .map(|c| (c.index(), c.r#type()))
