@@ -110,22 +110,6 @@ pub enum GltfLayout {
     Meshes,
 }
 
-#[derive(Default)]
-struct Vertices {
-    positions: Vec<[f32; 3]>,
-    normals: Vec<[f32; 3]>,
-    tangents: Vec<[f32; 4]>,
-    uvs: Vec<[f32; 2]>,
-    uvs1: Vec<[f32; 2]>,
-    colors: Vec<[f32; 4]>,
-    /// See [`MeshData::moves`].
-    moves: Vec<[[f32; 3]; 2]>,
-    joints: Vec<[u8; 4]>,
-    weights: Vec<[u8; 4]>,
-    values: Vec<u16>,
-    pivots: Vec<[f32; 3]>,
-}
-
 /// How a primitive's vertices are skinned.
 enum Binding<'a> {
     /// A skin: skeleton joint per skin joint.
@@ -134,19 +118,17 @@ enum Binding<'a> {
     Rigid(u16),
 }
 
-/// One model being assembled: its vertices and triangles per glTF material.
+/// One model being assembled: the primitives read for it, in order, joined when it is done so
+/// each stream is built once at its size.
 struct Building {
     /// The node that frames it; without one, its space is the scene's.
     frame: Option<usize>,
-    v: Vertices,
     /// The model carries tangents, on every primitive: one states them or its material reads
     /// them, and a prototype's material can read them on the others.
     tangents: bool,
-    /// A primitive has TEXCOORD_1.
-    uv1: bool,
-    /// A primitive has COLOR_0.
-    colors: bool,
-    groups: BTreeMap<usize, Vec<u32>>,
+    parts: Vec<Part>,
+    /// Vertices of `parts`.
+    vertices: usize,
     /// Bind position and skeleton joint per part value, from skins.
     joint_pivots: Vec<Option<([f32; 3], u16)>>,
 }
@@ -155,70 +137,123 @@ impl Building {
     fn new(frame: Option<usize>, parts: usize) -> Self {
         Self {
             frame,
-            v: Vertices::default(),
             tangents: false,
-            uv1: false,
-            colors: false,
-            groups: BTreeMap::new(),
+            parts: Vec::new(),
+            vertices: 0,
             joint_pivots: vec![None; parts],
         }
+    }
+
+    /// Whether the model has no triangles.
+    fn is_empty(&self) -> bool {
+        self.parts.iter().all(|p| p.indices.is_empty())
+    }
+
+    /// The part value of each vertex.
+    fn values(&self) -> Vec<u16> {
+        self.parts
+            .iter()
+            .flat_map(|p| p.values.iter().copied())
+            .collect()
     }
 
     /// The model's mesh without sections, and the glTF material and index range of each
     /// non-empty triangle group, in material order.
     fn finish(
-        self,
+        mut self,
         parts: Option<&PartAttribute>,
         skinned: bool,
     ) -> (MeshData, Vec<(usize, Range<usize>)>) {
-        let mut indices = Vec::new();
+        let ps = &mut self.parts;
+        let mut materials: Vec<usize> = ps.iter().map(|p| p.material).collect();
+        materials.sort_unstable();
+        materials.dedup();
+        let mut indices = Vec::with_capacity(ps.iter().map(|p| p.indices.len()).sum());
         let mut groups = Vec::new();
-        for (index, tris) in self.groups {
-            if tris.is_empty() {
-                continue;
+        for m in materials {
+            let start = indices.len();
+            for p in ps.iter_mut().filter(|p| p.material == m) {
+                indices.extend(std::mem::take(&mut p.indices));
             }
-            groups.push((index, indices.len()..indices.len() + tris.len()));
-            indices.extend(tris);
+            if indices.len() > start {
+                groups.push((m, start..indices.len()));
+            }
         }
+        let counts: Vec<usize> = ps.iter().map(|p| p.positions.len()).collect();
+        let uv1 = ps.iter().any(|p| p.uvs1.is_some());
+        let colors = ps.iter().any(|p| p.colors.is_some());
+        let moves = ps.iter().any(|p| p.moves.is_some());
         let jp = &self.joint_pivots;
-        let v = self.v;
         let mesh_parts = parts.map(|pa| PartData {
-            values: v.values,
+            values: joined(ps, |p| &mut p.values),
             count: pa.parts,
             by_section: pa.by_section,
             pivots: match (skinned, &pa.pivot) {
                 (true, _) => {
                     Pivots::PerValue(jp.iter().map(|p| p.map_or([0.0; 3], |p| p.0)).collect())
                 }
-                (false, Some(_)) => Pivots::PerVertex(v.pivots),
+                (false, Some(_)) => Pivots::PerVertex(joined(ps, |p| &mut p.pivots)),
                 (false, None) => Pivots::Origin,
             },
             joints: skinned.then(|| jp.iter().map(|p| p.map_or(0, |p| p.1)).collect()),
         });
-        let len = v.positions.len();
-        let moves = (!v.moves.is_empty()).then(|| filled(v.moves, len, [[0.0; 3]; 2]));
         let mesh = MeshData {
-            positions: v.positions,
-            normals: v.normals,
+            positions: joined(ps, |p| &mut p.positions),
+            normals: joined(ps, |p| &mut p.normals),
             tangents: self
                 .tangents
-                .then(|| filled(v.tangents, len, tangents::UNREAD)),
-            uvs: std::iter::once(v.uvs)
-                .chain(self.uv1.then(|| filled(v.uvs1, len, [0.0; 2])))
+                .then(|| joined_or(ps, &counts, |p| &mut p.tangents, tangents::UNREAD)),
+            uvs: std::iter::once(joined(ps, |p| &mut p.uvs))
+                .chain(uv1.then(|| joined_or(ps, &counts, |p| &mut p.uvs1, [0.0; 2])))
                 .collect(),
-            colors: self.colors.then(|| filled(v.colors, len, [1.0; 4])),
-            moves,
+            colors: colors.then(|| joined_or(ps, &counts, |p| &mut p.colors, [1.0; 4])),
+            moves: moves.then(|| joined_or(ps, &counts, |p| &mut p.moves, [[0.0; 3]; 2])),
             indices,
             sections: Vec::new(),
-            skin: skinned.then_some(Skin {
-                joints: v.joints,
-                weights: v.weights,
+            skin: skinned.then(|| Skin {
+                joints: joined(ps, |p| &mut p.joints),
+                weights: joined(ps, |p| &mut p.weights),
             }),
             parts: mesh_parts,
             min_exponent: None,
         };
         (mesh, groups)
     }
+}
+
+/// One stream of `parts` joined, taken from them.
+fn joined<T>(parts: &mut [Part], stream: impl Fn(&mut Part) -> &mut Vec<T>) -> Vec<T> {
+    if let [p] = parts {
+        return std::mem::take(stream(p));
+    }
+    let mut out = Vec::with_capacity(parts.iter_mut().map(|p| stream(p).len()).sum());
+    for p in parts {
+        out.extend(std::mem::take(stream(p)));
+    }
+    out
+}
+
+/// [`joined`] for a stream parts may lack, with `fill` for the `counts` vertices of each part
+/// without it.
+fn joined_or<T: Clone>(
+    parts: &mut [Part],
+    counts: &[usize],
+    stream: impl Fn(&mut Part) -> &mut Option<Vec<T>>,
+    fill: T,
+) -> Vec<T> {
+    if let [p] = parts
+        && let Some(v) = stream(p).take()
+    {
+        return v;
+    }
+    let mut out = Vec::with_capacity(counts.iter().sum());
+    for (p, &n) in parts.iter_mut().zip(counts) {
+        match stream(p).take() {
+            Some(v) => out.extend(v),
+            None => out.resize(out.len() + n, fill.clone()),
+        }
+    }
+    out
 }
 
 /// The glTF material index of a primitive; `usize::MAX` for the default material.
@@ -416,7 +451,7 @@ struct Part {
     values: Vec<u16>,
     /// Empty without pivots from an attribute.
     pivots: Vec<[f32; 3]>,
-    /// Triangles over the part's vertices.
+    /// Triangles over the part's vertices, and over the model's once appended.
     indices: Vec<u32>,
     material: usize,
 }
@@ -742,39 +777,9 @@ fn per_corner<T: Copy>(v: &[T], indices: &[u32]) -> Vec<T> {
     indices.iter().map(|&i| v[i as usize]).collect()
 }
 
-/// `v` grown to `len` with `x`, by exactly what it lacks.
-fn filled<T: Clone>(mut v: Vec<T>, len: usize, x: T) -> Vec<T> {
-    v.reserve_exact(len - v.len());
-    v.resize(len, x);
-    v
-}
-
-/// `from` appended to `to`, which takes it whole when empty, else grows by exactly its length.
-fn extend_exact<T>(to: &mut Vec<T>, from: Vec<T>) {
-    if to.is_empty() {
-        *to = from;
-    } else {
-        to.reserve_exact(from.len());
-        to.extend(from);
-    }
-}
-
-/// [`extend_exact`] for a stream a model's earlier parts may lack, which start at `base`
-/// with `fill` before it.
-fn extend_from<T: Clone>(to: &mut Vec<T>, base: usize, from: Option<Vec<T>>, fill: T) {
-    let Some(from) = from else {
-        return;
-    };
-    if to.len() < base {
-        to.reserve_exact(base + from.len() - to.len());
-        to.resize(base, fill);
-    }
-    extend_exact(to, from);
-}
-
 impl Building {
     /// Appends a primitive read for this model, placed as `at`.
-    fn append(&mut self, part: Part, at: &Placing<'_>, cx: &Context<'_>) -> Result<(), String> {
+    fn append(&mut self, mut part: Part, at: &Placing<'_>, cx: &Context<'_>) -> Result<(), String> {
         if let (Some(pa), Some(sk), Some(binding), false) =
             (cx.parts, cx.skeleton, at.binding, cx.rigid)
         {
@@ -795,25 +800,10 @@ impl Building {
                 *slot = Some((sk.bind_origin(joint), joint));
             }
         }
-        let base = self.v.positions.len();
-        self.uv1 |= part.uvs1.is_some();
-        self.colors |= part.colors.is_some();
-        let v = &mut self.v;
-        extend_exact(&mut v.positions, part.positions);
-        extend_exact(&mut v.normals, part.normals);
-        extend_from(&mut v.tangents, base, part.tangents, tangents::UNREAD);
-        extend_exact(&mut v.uvs, part.uvs);
-        extend_from(&mut v.uvs1, base, part.uvs1, [0.0; 2]);
-        extend_from(&mut v.colors, base, part.colors, [1.0; 4]);
-        extend_from(&mut v.moves, base, part.moves, [[0.0; 3]; 2]);
-        extend_exact(&mut v.joints, part.joints);
-        extend_exact(&mut v.weights, part.weights);
-        extend_exact(&mut v.values, part.values);
-        extend_exact(&mut v.pivots, part.pivots);
-        let mut indices = part.indices;
-        let base = base as u32;
-        indices.iter_mut().for_each(|i| *i += base);
-        extend_exact(self.groups.entry(part.material).or_default(), indices);
+        let base = self.vertices as u32;
+        part.indices.iter_mut().for_each(|i| *i += base);
+        self.vertices += part.positions.len();
+        self.parts.push(part);
         Ok(())
     }
 }
@@ -1740,7 +1730,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     let mut skeleton_of: Vec<Option<usize>> = vec![None; slots.len()];
     for (m, (building, slot)) in models.into_iter().zip(slots.iter_mut()).enumerate() {
         let frame = building.frame;
-        let empty = building.groups.values().all(Vec::is_empty);
+        let empty = building.is_empty();
         let sk = skeletons[m].as_ref();
         let skeleton = match sk {
             Some(sk) => {
@@ -1764,7 +1754,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
             b.name(name)?;
         }
         let parts_of = sk.filter(|_| rigid[m]);
-        let joint_values = parts_of.map(|_| building.v.values.clone());
+        let joint_values = parts_of.map(|_| building.values());
         let (mut mesh, groups) = building.finish(parts, sk.is_some() && parts_of.is_none());
         if let (Some(sk), Some(values)) = (parts_of, joint_values) {
             let joints = 0..sk.info.joint_count() as u16;
