@@ -193,7 +193,11 @@ impl Queue {
         let mut backlog = lock(&self.backlog);
         let point = self.next_point();
         self.resolve_passes(point, passes);
-        if steps || backlog.queued > 0 {
+        let unissued = wait.iter().any(|&p| {
+            self.queue_timeline(p)
+                .is_some_and(|t| !t.is_issued(p.value))
+        });
+        if steps || backlog.queued > 0 || unissued {
             self.send(
                 &mut backlog,
                 Box::new(move |q: &Queue| q.commit_submit(&wait, finished, point, drawable)),
@@ -215,6 +219,7 @@ impl Queue {
                     let queue = queue;
                     // SAFETY: the queue outlives the thread (`QueueRef`).
                     let q = unsafe { &*queue.0 };
+                    let _release = ReleaseWaiters(q);
                     for job in receive {
                         autoreleasepool(|_| job(q));
                         lock(&q.backlog).queued -= 1;
@@ -243,6 +248,13 @@ impl Queue {
         let drawable = drawable
             .as_ref()
             .map(|d| ProtocolObject::<dyn MTLDrawable>::from_ref(&*d.0));
+        // Metal releases a queue's wait after about 4 s if it has not been given the signal
+        // yet, so a wait on a queue in a CPU step that takes longer would complete early.
+        for &p in wait {
+            if let Some(t) = self.queue_timeline(p) {
+                t.wait_issued(p.value);
+            }
+        }
         self.shared.commit_residency();
         // A point of this queue's own timeline is waited on too: Metal 4 runs a queue's
         // command buffers concurrently, so only the event orders them after that point.
@@ -386,6 +398,12 @@ impl Queue {
         let timeline = &self.shared.timelines[self.timeline() as usize];
         self.raw
             .signalEvent_value(ProtocolObject::from_ref(&*timeline.event.0), point.value);
+        timeline.issue(point.value);
+    }
+
+    /// The queue timeline of `point`; `None` for a host timeline, which only the CPU signals.
+    fn queue_timeline(&self, point: TimelinePoint) -> Option<&super::Timeline> {
+        self.shared.timelines.get(point.timeline as usize)
     }
 
     /// Queues sparse mapping updates through `update`, in order with this queue's submits.
@@ -455,6 +473,12 @@ impl Queue {
 
     /// Waits until `point` has completed.
     pub fn wait(&self, point: TimelinePoint, timeout: Duration) -> Result<(), Error> {
+        // The timeout bounds the GPU, not a CPU step that has yet to hand it the work.
+        if !timeout.is_zero()
+            && let Some(t) = self.queue_timeline(point)
+        {
+            t.wait_issued(point.value);
+        }
         let ms = timeout.as_millis().try_into().unwrap_or(u64::MAX);
         if self
             .shared
@@ -465,6 +489,16 @@ impl Queue {
         } else {
             Err(Error::Timeout)
         }
+    }
+}
+
+/// Frees whoever waits for a signal of this queue when its step thread ends, panicking or
+/// not: no later signal can come from it.
+struct ReleaseWaiters<'q>(&'q Queue);
+
+impl Drop for ReleaseWaiters<'_> {
+    fn drop(&mut self) {
+        self.0.shared.timelines[self.0.timeline() as usize].issue(u64::MAX);
     }
 }
 
