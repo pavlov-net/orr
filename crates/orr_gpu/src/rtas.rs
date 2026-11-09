@@ -19,6 +19,10 @@ bitflags::bitflags! {
         /// structures build a cluster BLAS so marked for a cheap build over a fast trace;
         /// others ignore it.
         const TRANSIENT = 1 << 4;
+        /// A cluster op's CLAS only go into cluster BLAS built without [`Self::TRANSIENT`].
+        /// Backends without cluster acceleration structures then need no structure per CLAS;
+        /// others ignore it.
+        const FLAT_ONLY = 1 << 5;
     }
 }
 

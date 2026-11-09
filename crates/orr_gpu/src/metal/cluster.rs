@@ -9,6 +9,7 @@
 //!
 //! - A CLAS holds its triangles (vertices, indices and per-triangle data: cluster ID,
 //!   geometry index and flags, triangle in the cluster) and a Metal BLAS over them.
+//!   A CLAS of an op marked [`RtasFlags::FLAT_ONLY`] has no Metal BLAS.
 //! - A cluster BLAS marked [`RtasFlags::TRANSIENT`] is an instance structure over its CLAS'
 //!   BLAS, a cheap build that traces through three levels; any other is one flat BLAS over
 //!   its CLAS' triangles, slower to build and faster to trace.
@@ -611,6 +612,7 @@ impl CommandList<'_> {
             let readback = self.read_records(&d, &io);
             let creates = match d.op {
                 RtasOp::BuildTemplates | RtasOp::Move => 0,
+                _ if d.flags.contains(RtasFlags::FLAT_ONLY) => 0,
                 _ => u64::from(max_args(&d)),
             };
             let reservation = self.queue.shared.reserve_structures(creates);
@@ -820,6 +822,7 @@ impl CommandList<'_> {
     fn build_objects(&mut self, d: &RtasOpDesc, io: &RtasIo, rb: &Readback, count: usize) {
         let shared = Arc::clone(&self.queue.shared);
         let clas = d.op != RtasOp::BuildTemplates;
+        let structures = clas && !d.flags.contains(RtasFlags::FLAT_ONLY);
         // Triangles, vertices and opacity of each record.
         let shapes: Vec<(u32, u32, bool)> = (0..count)
             .map(|i| {
@@ -857,7 +860,7 @@ impl CommandList<'_> {
         for (i, (&(tris, verts, opaque), &at)) in shapes.iter().zip(&addresses).enumerate() {
             let mut id = 0;
             let mut raw = None;
-            if clas {
+            if structures {
                 let vertices = at + HEADER;
                 let indices = vertices + 12 * u64::from(verts);
                 let data = indices + 12 * u64::from(tris);

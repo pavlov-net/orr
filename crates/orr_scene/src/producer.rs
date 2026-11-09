@@ -359,7 +359,7 @@ fn cluster_desc(op: RtasOp, args: u32, tris: u32, verts: u32) -> RtasOpDesc {
     RtasOpDesc {
         op,
         mode: RtasMode::Implicit,
-        flags: RtasFlags::FAST_TRACE | RtasFlags::ALLOW_DATA_ACCESS,
+        flags: RtasFlags::FAST_TRACE | RtasFlags::ALLOW_DATA_ACCESS | RtasFlags::FLAT_ONLY,
         vertex_format: ClusterVertexFormat::F32x3,
         limits: RtasLimits::Cluster(ClusterLimits {
             max_args: args.max(1),
@@ -796,7 +796,7 @@ pub(crate) fn build(
                 RtasOpDesc {
                     op: RtasOp::BuildClusterBlas,
                     mode: RtasMode::Implicit,
-                    flags: RtasFlags::FAST_TRACE | RtasFlags::TRANSIENT,
+                    flags: RtasFlags::FAST_TRACE,
                     vertex_format: ClusterVertexFormat::F32x3,
                     limits: RtasLimits::Blas(BlasLimits {
                         max_args: 1,
