@@ -4,6 +4,8 @@
 //! out in the order the original emits them, with the same numbering. Unlike the original,
 //! level 0 clusters each section apart.
 
+use std::borrow::Cow;
+
 use meshopt::{SimplifyOptions, SimplifyVertex, ffi};
 
 use crate::par::prelude::*;
@@ -121,7 +123,7 @@ fn bounds_merge(clusters: &[Cluster]) -> Bounds {
 fn clusterize(
     c: &ffi::clodConfig,
     positions: &[f32],
-    indices: &[u32],
+    indices: Cow<'_, [u32]>,
     sections: Option<&[u16]>,
     refined: i32,
 ) -> (Vec<Cluster>, Vec<u32>) {
@@ -138,7 +140,8 @@ fn clusterize(
     // Each section's corners, sections ascending, which become its clusters' corners in
     // place: the clusters of a section hold every one of its triangles once.
     let (mut corners, ends) = if lo >= hi {
-        (indices.to_vec(), vec![indices.len()])
+        let n = indices.len();
+        (indices.into_owned(), vec![n])
     } else {
         let mut ends = vec![0usize; usize::from(hi - lo) + 1];
         for t in tris {
@@ -626,10 +629,15 @@ pub(super) fn build<G: Send>(
 
     // Level 0 clusters each section apart, unless the triangles make one cluster: that one is
     // the root, as in clodBuild.
-    let (mut clusters, mut cluster_indices) =
-        clusterize(c, positions.read(), mesh.indices, Some(mesh.sections), -1);
+    let (mut clusters, mut cluster_indices) = clusterize(
+        c,
+        positions.read(),
+        mesh.indices.into(),
+        Some(mesh.sections),
+        -1,
+    );
     if clusters.len() > 1 && mesh.indices.len() <= c.max_triangles * 3 {
-        let one = clusterize(c, positions.read(), mesh.indices, None, -1);
+        let one = clusterize(c, positions.read(), mesh.indices.into(), None, -1);
         if one.0.len() == 1 {
             (clusters, cluster_indices) = one;
         }
@@ -699,8 +707,13 @@ pub(super) fn build<G: Send>(
                 if c.simplify_dilate_borders {
                     dilate_borders(&positions, &merged, &simplified, &locks, remap, &mut bounds);
                 }
-                let (mut next, next_indices) =
-                    clusterize(c, positions.read(), &simplified, None, base + gi as i32);
+                let (mut next, next_indices) = clusterize(
+                    c,
+                    positions.read(),
+                    simplified.into(),
+                    None,
+                    base + gi as i32,
+                );
                 for k in &mut next {
                     k.bounds = bounds;
                 }
