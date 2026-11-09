@@ -610,12 +610,13 @@ pub(crate) struct CookedMesh {
     pub(crate) tangents: Option<TangentCheck>,
 }
 
-/// Cooks a [`check`]ed mesh.
+/// Cooks a [`check`]ed mesh, dropping its vertex streams once the welded mesh holds them and its
+/// normal maps once the tangent check has read them.
 pub(crate) fn cook(
     asset: &str,
-    m: &MeshData,
+    mut m: MeshData,
     s: &MeshSettings,
-    maps: &[SectionMaps],
+    mut maps: Vec<SectionMaps>,
 ) -> Result<CookedMesh> {
     let _z = crate::profile::zone!("mesh.cook");
     let fail = |message: String| Error::Mesh {
@@ -626,9 +627,13 @@ pub(crate) fn cook(
     // Baked displacement moves the geometry the derived tangents would follow.
     let bakes = s.displace_static.is_some() && maps.iter().any(SectionMaps::bakes);
     let tangent_check = match (&m.tangents, s.tangent_error_max) {
-        (Some(t), Some(max)) if !bakes => tangents::check(m, t, maps, max),
+        (Some(t), Some(max)) if !bakes => tangents::check(&m, t, &maps, max),
         _ => TangentCheck::KEPT,
     };
+    for sm in &mut maps {
+        sm.normal = None;
+    }
+    let maps = maps.as_slice();
     let stretch_zone = crate::profile::zone!("mesh.stretch");
     let stretch: Vec<[f32; 2]> = m
         .sections
@@ -642,11 +647,17 @@ pub(crate) fn cook(
         })
         .collect();
     drop(stretch_zone);
-    let mut w = lod::Welded::new(m, !tangent_check.derive, bakes);
-    let source_grid =
-        Grid::new(&w.positions, s.position_step_log2, m.min_exponent).map_err(fail)?;
-    let mut parts = lod::Parts::new(&w, m, &source_grid).map_err(fail)?;
-    for (si, sec) in m.sections.iter().enumerate() {
+    let mut w = lod::Welded::new(&m, !tangent_check.derive, bakes);
+    let min_exponent = m.min_exponent;
+    let source_grid = Grid::new(&w.positions, s.position_step_log2, min_exponent).map_err(fail)?;
+    let mut parts = lod::Parts::new(&w, &m, &source_grid).map_err(fail)?;
+    let (skinned, stored_tangents) = (m.skin.is_some(), m.tangents.is_some());
+    let sections = std::mem::take(&mut m.sections);
+    {
+        let _z = crate::profile::zone!("mesh.free");
+        drop(m);
+    }
+    for (si, sec) in sections.iter().enumerate() {
         let tangents = maps[si].tangent_displacement.iter().flatten();
         for d in maps[si].displacement.iter().chain(tangents) {
             d.check_range()
@@ -662,13 +673,14 @@ pub(crate) fn cook(
             }
         }
     }
-    let mut baked = vec![false; m.sections.len()];
-    let grid = match &s.displace_static {
+    let mut baked = vec![false; sections.len()];
+    let mut grid = match &s.displace_static {
         Some(d) => {
             baked = displace::bake(&mut w, &mut parts, maps, d);
             if baked.iter().any(|&b| b) {
+                drop(source_grid);
                 let grid =
-                    Grid::new(&w.positions, s.position_step_log2, m.min_exponent).map_err(fail)?;
+                    Grid::new(&w.positions, s.position_step_log2, min_exponent).map_err(fail)?;
                 displace::simplify(&mut w, &mut parts, &grid, &baked, d.target_error);
                 grid
             } else {
@@ -677,8 +689,25 @@ pub(crate) fn cook(
         }
         None => source_grid,
     };
+    let bounds_zone = crate::profile::zone!("mesh.bounds");
+    let mut bounds = Aabb::EMPTY;
+    grid.floats.iter().for_each(|&p| bounds.extend(p));
+    let sphere = meshopt::compute_sphere_bounds(
+        meshopt::PositionDataAdapter {
+            data: bytemuck::cast_slice(&grid.floats),
+            position_count: grid.floats.len(),
+            position_stride: 12,
+            position_offset: 0,
+        },
+        None,
+    );
+    drop(bounds_zone);
+    // Only discrete levels read the float positions past here.
+    if s.lod == LodMode::Dag {
+        grid.floats = Vec::new();
+    }
     let mut omm_alpha = Vec::with_capacity(maps.len());
-    for (si, (sm, sec)) in maps.iter().zip(&m.sections).enumerate() {
+    for (si, (sm, sec)) in maps.iter().zip(&sections).enumerate() {
         let alpha = match (&s.omm, &sm.opacity) {
             (Some(_), Some(Opacity::Texture { map, cutoff, .. })) if sec.takes_micromaps() => {
                 let a = map.try_map(|t| OmmRead::new(t, *cutoff));
@@ -703,11 +732,8 @@ pub(crate) fn cook(
         MeshHeader::TANGENT
     } else {
         0
-    } | if m.skin.is_some() {
-        MeshHeader::SKIN
-    } else {
-        0
-    } | if w.uvs.len() > 1 { MeshHeader::UV1 } else { 0 }
+    } | if skinned { MeshHeader::SKIN } else { 0 }
+        | if w.uvs.len() > 1 { MeshHeader::UV1 } else { 0 }
         | if w.colors.is_some() {
             MeshHeader::COLOR
         } else {
@@ -717,13 +743,13 @@ pub(crate) fn cook(
         w: &w,
         grid: &grid,
         parts: &parts,
-        sections: &m.sections,
+        sections: &sections,
         maps,
         omm_alpha: &omm_alpha,
         baked: &baked,
         stretch: &stretch,
         s,
-        deformation_bound: if m.skin.is_some() {
+        deformation_bound: if skinned {
             f16_up(s.deformation_bound)
         } else {
             0
@@ -735,19 +761,6 @@ pub(crate) fn cook(
         LodMode::Dag => dag::cook(&cx).map_err(fail)?,
     };
 
-    let bounds_zone = crate::profile::zone!("mesh.bounds");
-    let mut bounds = Aabb::EMPTY;
-    grid.floats.iter().for_each(|&p| bounds.extend(p));
-    let sphere = meshopt::compute_sphere_bounds(
-        meshopt::PositionDataAdapter {
-            data: bytemuck::cast_slice(&grid.floats),
-            position_count: grid.floats.len(),
-            position_stride: 12,
-            position_offset: 0,
-        },
-        None,
-    );
-    drop(bounds_zone);
     built.info.header = MeshHeader {
         bounds,
         sphere: Sphere {
@@ -758,8 +771,7 @@ pub(crate) fn cook(
         position_exponent: grid.k,
         clas_truncate_bits: grid.truncate_bits,
         attributes,
-        max_vertices: m
-            .sections
+        max_vertices: sections
             .iter()
             .map(|sec| cx.max_vertices(sec.flags))
             .max()
@@ -767,8 +779,7 @@ pub(crate) fn cook(
         max_triangles: s.max_triangles,
         ..built.info.header
     };
-    built.info.sections = m
-        .sections
+    built.info.sections = sections
         .iter()
         .enumerate()
         .map(|(i, sec)| Section {
@@ -790,7 +801,7 @@ pub(crate) fn cook(
             _ => h.layer_sections |= bit,
         }
     }
-    sets::build(&mut built.info, &m.sections, &built.clusters);
+    sets::build(&mut built.info, &sections, &built.clusters);
     let _free = crate::profile::zone!("mesh.free");
     drop((built.clusters, w, parts, grid, omm_alpha));
     Ok(CookedMesh {
@@ -798,7 +809,7 @@ pub(crate) fn cook(
         pages: built.pages,
         node_pages: built.node_pages,
         warnings,
-        tangents: m.tangents.is_some().then_some(tangent_check),
+        tangents: stored_tangents.then_some(tangent_check),
     })
 }
 

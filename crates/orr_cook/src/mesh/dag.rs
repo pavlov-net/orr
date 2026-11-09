@@ -132,38 +132,38 @@ fn stages(
         let o = options(section);
         (o.limits.max_vertices, o.dilate.then_some(section))
     };
-    let pieces = lod::pieces(w, parts);
-    let _corners = crate::profile::zone!("dag.corners");
-    let mut by_stage: BTreeMap<(u16, Class), (Vec<u16>, Vec<Corner>)> = BTreeMap::new();
-    for p in pieces {
-        let (sections, corners) = by_stage.entry((p.part, class(p.section))).or_default();
-        sections.push(p.section);
-        corners.extend(
-            p.indices
-                .iter()
-                .map(|&v| (v, grid.cells[v as usize], p.section)),
-        );
+    // Each part stage's pieces, in (part, section) order.
+    let mut by_stage: BTreeMap<(u16, Class), Vec<lod::PieceTriangles>> = BTreeMap::new();
+    for p in lod::piece_triangles(w, parts) {
+        by_stage
+            .entry((p.part, class(p.section)))
+            .or_default()
+            .push(p);
     }
-    let pieces: Vec<(u16, Vec<u16>, Vec<Corner>)> = by_stage
+    let pieces: Vec<(u16, Vec<lod::PieceTriangles>)> = by_stage
         .into_iter()
-        .map(|((part, _), (sections, corners))| (part, sections, corners))
+        .map(|((part, _), pieces)| (part, pieces))
         .collect();
-    drop(_corners);
-    let (shared, seams) = borders(w, pieces.iter().map(|p| p.2.as_slice()));
+    let corners = |pieces| part_corners(w, grid, pieces);
+    let (shared, seams) = borders(w, pieces.iter().map(|p| corners(p.1.as_slice())));
     let mut stages: Vec<Stage> = pieces
         .par_iter()
-        .map(|(part, sections, corners)| {
+        .map(|(part, pieces)| {
             let _z = crate::profile::zone!("dag.build_stage");
-            let input = input(corners, |v, _, section| (v, section), &shared, &seams);
+            let count = 3 * pieces.iter().map(|p| p.triangles.len()).sum::<usize>();
+            let key = |v, _, section| (v, section);
+            let input = input(corners(pieces), count, key, &shared, &seams);
+            let sections: Vec<u16> = pieces.iter().map(|p| p.section).collect();
             Stage {
                 part: *part,
-                sections: sections.clone(),
+                groups: build(&input, w, &snap, options(sections[0])),
+                sections,
                 merged: false,
                 base: 0.0,
-                groups: build(&input, w, &snap, options(sections[0])),
             }
         })
         .collect();
+    drop(pieces);
 
     let Some(m) = merge_error(s, parts) else {
         return stages;
@@ -196,7 +196,7 @@ fn stages(
         })
         .collect();
     drop(_sources);
-    let (shared, seams) = borders(w, sources.iter().map(|s| s.1.as_slice()));
+    let (shared, seams) = borders(w, sources.iter().map(|s| s.1.iter().copied()));
     // Vertices of different parts join where they share a position, attributes and section.
     let attrs = |v: u32| {
         let v = v as usize;
@@ -223,7 +223,8 @@ fn stages(
         .map(|(sections, corners)| {
             let _z = crate::profile::zone!("dag.build_merged_stage");
             let input = input(
-                corners,
+                corners.iter().copied(),
+                corners.len(),
                 |v, cell, section| (cell, attrs(v), section),
                 &shared,
                 &seams,
@@ -252,19 +253,33 @@ fn dilates(s: &MeshSettings, flags: u8) -> bool {
         && SurfaceClass::from_flags(flags) != Some(SurfaceClass::Dielectric)
 }
 
+/// The corners of a part stage's pieces, at their welded grid positions.
+fn part_corners<'a>(
+    w: &'a Welded,
+    grid: &'a Grid,
+    pieces: &'a [lod::PieceTriangles],
+) -> impl Iterator<Item = Corner> + Clone + 'a {
+    pieces.iter().flat_map(move |p| {
+        p.triangles.iter().flat_map(move |&t| {
+            w.triangle(t as usize)
+                .map(|v| (v, grid.cells[v as usize], p.section))
+        })
+    })
+}
+
 /// Positions the stages share, which stay locked, and uv and section seams, which stay
 /// protected.
-fn borders<'a>(
+fn borders<C: Iterator<Item = Corner> + Clone>(
     w: &Welded,
-    stages: impl Iterator<Item = &'a [Corner]> + Clone,
+    stages: impl Iterator<Item = C> + Clone,
 ) -> (FxHashSet<[i32; 3]>, FxHashSet<[i32; 3]>) {
     let _z = crate::profile::zone!("dag.borders");
-    let shared = lod::shared_cells(stages.clone().map(|c| c.iter().map(|&(_, cell, _)| cell)));
-    let mut seams = lod::seam_cells(w, stages.clone().flatten().map(|&(v, cell, _)| (v, cell)));
+    let shared = lod::shared_cells(stages.clone().map(|c| c.map(|(_, cell, _)| cell)));
+    let mut seams = lod::seam_cells(w, stages.clone().flatten().map(|(v, cell, _)| (v, cell)));
     let _sections = crate::profile::zone!("dag.section_seams");
     for corners in stages {
         let mut section_of: FxHashMap<[i32; 3], u16> = FxHashMap::default();
-        for &(_, cell, section) in corners {
+        for (_, cell, section) in corners {
             if *section_of.entry(cell).or_insert(section) != section {
                 seams.insert(cell);
             }
@@ -276,7 +291,8 @@ fn borders<'a>(
 /// A compact `clodBuild` input over `corners`, one vertex per distinct `key`; corners with
 /// different keys never share a vertex.
 fn input<K: std::hash::Hash + Eq>(
-    corners: &[Corner],
+    corners: impl Iterator<Item = Corner>,
+    count: usize,
     key: impl Fn(u32, [i32; 3], u16) -> K,
     shared: &FxHashSet<[i32; 3]>,
     seams: &FxHashSet<[i32; 3]>,
@@ -288,9 +304,9 @@ fn input<K: std::hash::Hash + Eq>(
         cells: Vec::new(),
         sections: Vec::new(),
         lock: Vec::new(),
-        indices: Vec::with_capacity(corners.len()),
+        indices: Vec::with_capacity(count),
     };
-    for &(v, cell, section) in corners {
+    for (v, cell, section) in corners {
         let l = *local_of.entry(key(v, cell, section)).or_insert_with(|| {
             input.welded.push(v);
             input.cells.push(cell);
@@ -542,10 +558,11 @@ fn merge_error(s: &MeshSettings, parts: &Parts) -> Option<f32> {
     s.merge_error.filter(|_| parts.table.len() > 1)
 }
 
-/// A group with its cooked clusters, by global group index (stages in order, each stage's
-/// groups in emission order).
+/// Triangles of the groups one batch of [`cook`] cooks at once, unless the mesh cooks whole.
+const BATCH_TRIANGLES: usize = 1 << 22;
+
+/// A group with its cooked clusters.
 struct Cooked {
-    stage: usize,
     depth: u32,
     sphere: Sphere,
     error: f32,
@@ -570,7 +587,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
             group_max: (PAGE_MAX - header) / cluster_max,
         }
     };
-    let stages = stages(
+    let mut stages = stages(
         cx.w,
         cx.grid,
         cx.parts,
@@ -579,144 +596,218 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         limits,
         cx.w.skin.is_some(),
     );
+    // Global group index: stages in order, each stage's groups in emission order.
     let mut first = Vec::with_capacity(stages.len());
-    let mut flat = Vec::new();
+    let mut at: Vec<(usize, usize)> = Vec::new();
     for (si, st) in stages.iter().enumerate() {
-        first.push(flat.len());
-        flat.extend(st.groups.iter().map(|g| (si, g)));
+        first.push(at.len());
+        at.extend((0..st.groups.len()).map(|gi| (si, gi)));
     }
-    let mut groups: Vec<Cooked> = flat
-        .par_iter()
-        .map(|&(si, g)| {
-            let _z = crate::profile::zone!("dag.group_clusters");
-            let st = &stages[si];
-            let clusters = g
-                .clusters
-                .iter()
-                .map(|c| {
-                    let tris = c.tris.clone();
-                    let mut d = cx.cluster(c.section, st.part, st.merged, &c.verts, &c.cells, tris);
-                    let r = &mut d.record;
-                    (r.self_sphere, r.self_error) = match usize::try_from(c.refined) {
-                        Ok(from) => (st.groups[from].sphere, st.groups[from].error),
-                        Err(_) => (r.cull_sphere, st.base),
-                    };
-                    (r.parent_sphere, r.parent_error) = (g.sphere, g.error);
-                    d
-                })
-                .collect();
-            Cooked {
-                stage: si,
-                depth: g.depth,
-                sphere: g.sphere,
-                error: g.error,
-                clusters,
-                refined: g
-                    .clusters
-                    .iter()
-                    .map(|c| usize::try_from(c.refined).map_or(-1, |r| (first[si] + r) as i32))
-                    .collect(),
-            }
-        })
-        .collect();
-    drop(flat);
-    cx.omm_all(groups.iter_mut().flat_map(|g| &mut g.clusters).collect());
-    {
-        let _z = crate::profile::zone!("dag.fit");
-        groups
-            .par_iter_mut()
-            .try_for_each(|g| fit(cx, &mut g.clusters))?;
-    }
-    super::thickness::assign(
-        groups.iter_mut().flat_map(|g| &mut g.clusters).collect(),
-        cx.grid,
-        cx.sections,
-    );
-
-    let _z = crate::profile::zone!("dag.pages");
+    let group = |stages: &[Stage], g: usize| -> (bool, u32) {
+        let (si, gi) = at[g];
+        (stages[si].merged, stages[si].groups[gi].depth)
+    };
+    let terminal = |stages: &[Stage], g: usize| {
+        let (si, gi) = at[g];
+        stages[si].groups[gi].error == f32::INFINITY
+    };
     // Terminal groups first and on pages of their own, then merged stages, then coarse to
     // fine.
-    let terminal = |g: &Cooked| g.error == f32::INFINITY;
-    let mut order: Vec<usize> = (0..groups.len()).collect();
-    order.sort_by_key(|&i| {
-        let g = &groups[i];
-        (
-            !terminal(g),
-            !stages[g.stage].merged,
-            std::cmp::Reverse(g.depth),
-            i,
-        )
+    let mut order: Vec<usize> = (0..at.len()).collect();
+    order.sort_by_key(|&g| {
+        let (merged, depth) = group(&stages, g);
+        (!terminal(&stages, g), !merged, std::cmp::Reverse(depth), g)
     });
-    let _order = crate::profile::zone!("dag.order");
-    let mut table_index = vec![0u32; groups.len()];
+    let mut table_index = vec![0u32; at.len()];
     for (t, &g) in order.iter().enumerate() {
         table_index[g] = t as u32;
     }
+    let refined_of = |si: usize, r: i32| usize::try_from(r).map_or(-1, |r| (first[si] + r) as i32);
+
+    // Groups cook in page order a batch at a time, and each page is written and its clusters
+    // freed once it is full. Thickness reads every cluster, so a mesh with subsurface
+    // sections cooks in one batch.
+    let whole = cx.sections.iter().any(|sec| sec.subsurface);
+    let mut cooked: Vec<Option<Cooked>> = (0..at.len()).map(|_| None).collect();
+    let mut refined: Vec<Vec<i32>> = vec![Vec::new(); at.len()];
     let mut page_groups: Vec<Vec<usize>> = Vec::new();
-    let mut page_of = vec![0u32; groups.len()];
+    let mut page_of = vec![0u32; at.len()];
     let mut pinned_pages = 0;
     let (mut size, mut aligned) = (header, false);
-    for (k, &gi) in order.iter().enumerate() {
-        let g = &groups[gi];
-        let omm = g.clusters.iter().any(|c| c.omm.is_some());
-        let bytes = |aligned: bool| {
-            g.clusters.iter().map(|c| c.cost(cx.stride)).sum::<usize>()
-                + if omm && !aligned {
-                    OMM_ALIGN as usize - 1
-                } else {
-                    0
-                }
+    let mut pages = Vec::new();
+    let mut page_info: Vec<PageInfo> = Vec::new();
+    let mut group_table: Vec<Group> = vec![bytemuck::Zeroable::zeroed(); at.len()];
+    let mut set_clusters = Vec::new();
+    let mut parts = cx.parts.table.clone();
+    let (mut next, mut written) = (0, 0);
+    while next < order.len() {
+        let mut end = next;
+        let mut triangles = 0;
+        while end < order.len() && (whole || triangles < BATCH_TRIANGLES) {
+            let (si, gi) = at[order[end]];
+            let g = &stages[si].groups[gi];
+            triangles += g.clusters.iter().map(|c| c.tris.len() / 3).sum::<usize>();
+            end += 1;
+        }
+        let batch = &order[next..end];
+        let work: Vec<(usize, Vec<DagCluster>)> = batch
+            .iter()
+            .map(|&g| {
+                let (si, gi) = at[g];
+                (g, std::mem::take(&mut stages[si].groups[gi].clusters))
+            })
+            .collect();
+        let stages = &stages;
+        let mut made: Vec<(usize, Cooked)> = work
+            .into_par_iter()
+            .map(|(gl, clusters)| {
+                let _z = crate::profile::zone!("dag.group_clusters");
+                let (si, gi) = at[gl];
+                let st = &stages[si];
+                let g = &st.groups[gi];
+                let refined = clusters.iter().map(|c| refined_of(si, c.refined)).collect();
+                let clusters = clusters
+                    .into_iter()
+                    .map(|c| {
+                        let mut d =
+                            cx.cluster(c.section, st.part, st.merged, &c.verts, &c.cells, c.tris);
+                        let r = &mut d.record;
+                        (r.self_sphere, r.self_error) = match usize::try_from(c.refined) {
+                            Ok(from) => (st.groups[from].sphere, st.groups[from].error),
+                            Err(_) => (r.cull_sphere, st.base),
+                        };
+                        (r.parent_sphere, r.parent_error) = (g.sphere, g.error);
+                        d
+                    })
+                    .collect();
+                (
+                    gl,
+                    Cooked {
+                        depth: g.depth,
+                        sphere: g.sphere,
+                        error: g.error,
+                        clusters,
+                        refined,
+                    },
+                )
+            })
+            .collect();
+        cx.omm_all(made.iter_mut().flat_map(|(_, g)| &mut g.clusters).collect());
+        {
+            let _z = crate::profile::zone!("dag.fit");
+            made.par_iter_mut()
+                .try_for_each(|(_, g)| fit(cx, &mut g.clusters))?;
+        }
+        super::thickness::assign(
+            made.iter_mut().flat_map(|(_, g)| &mut g.clusters).collect(),
+            cx.grid,
+            cx.sections,
+        );
+        for (g, c) in made {
+            cooked[g] = Some(c);
+        }
+
+        let _z = crate::profile::zone!("dag.pages");
+        for (k, &gi) in order.iter().enumerate().take(end).skip(next) {
+            let g = cooked[gi].as_ref().expect("cooked in this batch");
+            refined[gi] = g.refined.clone();
+            let omm = g.clusters.iter().any(|c| c.omm.is_some());
+            let bytes = |aligned: bool| {
+                g.clusters.iter().map(|c| c.cost(cx.stride)).sum::<usize>()
+                    + if omm && !aligned {
+                        OMM_ALIGN as usize - 1
+                    } else {
+                        0
+                    }
+            };
+            let block_end = k > 0 && terminal(stages, order[k - 1]) && !terminal(stages, gi);
+            if block_end {
+                pinned_pages = page_groups.len() as u32;
+            }
+            if page_groups.is_empty() || block_end || size + bytes(aligned) > PAGE_MAX {
+                page_groups.push(Vec::new());
+                (size, aligned) = (header, false);
+            }
+            size += bytes(aligned);
+            aligned |= omm;
+            page_of[gi] = page_groups.len() as u32 - 1;
+            page_groups.last_mut().expect("a page").push(gi);
+        }
+        next = end;
+        // Every page but the last is full; the last is too once every group has cooked.
+        let full = if next == order.len() {
+            page_groups.len()
+        } else {
+            page_groups.len() - 1
         };
-        let block_end = k > 0 && terminal(&groups[order[k - 1]]) && !terminal(g);
-        if block_end {
-            pinned_pages = page_groups.len() as u32;
+        let ready = &page_groups[written..full];
+        written = full;
+        // Per page: its resident length, its cluster and triangle counts and its stored
+        // bytes.
+        let built: Vec<(usize, usize, u32, Vec<u8>)> = ready
+            .par_iter()
+            .map(|members| {
+                let clusters: Vec<&ClusterData> = members
+                    .iter()
+                    .flat_map(|&g| &cooked[g].as_ref().expect("cooked").clusters)
+                    .collect();
+                let bytes = write_page(&clusters, cx.stride);
+                let stored = store_page(&bytes).map_err(|e| e.to_string())?;
+                Ok((
+                    bytes.len(),
+                    clusters.len(),
+                    page_triangles(&clusters),
+                    stored,
+                ))
+            })
+            .collect::<Result<_, String>>()?;
+        for (members, (resident_len, cluster_count, tri_count, stored)) in ready.iter().zip(built) {
+            let p = pages.len() as u32;
+            page_info.push(PageInfo {
+                blob: p + 1,
+                resident_len: resident_len as u32,
+                tri_count,
+                cluster_count: cluster_count as u16,
+                _pad: 0,
+                deps: Span::default(),
+            });
+            pages.push(stored);
+            let mut first_cluster = 0u16;
+            for &gi in members {
+                let g = cooked[gi].take().expect("cooked");
+                group_table[table_index[gi] as usize] = Group {
+                    simplified: g.sphere,
+                    error: g.error,
+                    page: p,
+                    first_cluster,
+                    cluster_count: g.clusters.len() as u16,
+                    depth: u8::try_from(g.depth).map_err(|_| format!("DAG depth {}", g.depth))?,
+                    _pad: [0; 3],
+                };
+                first_cluster += g.clusters.len() as u16;
+                for (c, &r) in g.clusters.iter().zip(&g.refined) {
+                    let refined = usize::try_from(r).map_or(-1, |r| table_index[r] as i32);
+                    set_clusters.push(c.set_cluster(table_index[gi], refined));
+                    c.add_to(&mut parts, cx.grid);
+                }
+            }
         }
-        if page_groups.is_empty() || block_end || size + bytes(aligned) > PAGE_MAX {
-            page_groups.push(Vec::new());
-            (size, aligned) = (header, false);
-        }
-        size += bytes(aligned);
-        aligned |= omm;
-        page_of[gi] = page_groups.len() as u32 - 1;
-        page_groups.last_mut().expect("a page").push(gi);
     }
-    if order.last().is_some_and(|&g| terminal(&groups[g])) {
+    if order.last().is_some_and(|&g| terminal(&stages, g)) {
         pinned_pages = page_groups.len() as u32;
     }
 
     // Each page depends on the pages holding the coarser clusters its groups simplify into.
-    let mut into: Vec<Vec<u32>> = vec![Vec::new(); groups.len()];
-    for (gi, g) in groups.iter().enumerate() {
-        for &r in &g.refined {
+    let mut into: Vec<Vec<u32>> = vec![Vec::new(); at.len()];
+    for (gi, r) in refined.iter().enumerate() {
+        for &r in r {
             if let Ok(r) = usize::try_from(r) {
                 into[r].push(page_of[gi]);
             }
         }
     }
-    let mut pages = Vec::with_capacity(page_groups.len());
-    let mut page_info = Vec::with_capacity(page_groups.len());
     let mut page_deps = Vec::new();
-    let mut group_table: Vec<Group> = vec![bytemuck::Zeroable::zeroed(); groups.len()];
-    drop(_order);
-    // Per page: its resident length, its cluster and triangle counts and its stored bytes.
-    let built: Vec<(usize, usize, u32, Vec<u8>)> = page_groups
-        .par_iter()
-        .map(|members| {
-            let clusters: Vec<&ClusterData> =
-                members.iter().flat_map(|&g| &groups[g].clusters).collect();
-            let bytes = write_page(&clusters, cx.stride);
-            let stored = store_page(&bytes).map_err(|e| e.to_string())?;
-            Ok((
-                bytes.len(),
-                clusters.len(),
-                page_triangles(&clusters),
-                stored,
-            ))
-        })
-        .collect::<Result<_, String>>()?;
-    for (p, (members, (resident_len, cluster_count, tri_count, stored))) in
-        page_groups.iter().zip(built).enumerate()
-    {
+    for (p, members) in page_groups.iter().enumerate() {
         let mut deps: Vec<u32> = members
             .iter()
             .flat_map(|&g| into[g].iter().copied())
@@ -728,54 +819,12 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
             deps.iter().all(|&q| (q as usize) < p),
             "pages depend on earlier pages"
         );
-        page_info.push(PageInfo {
-            blob: p as u32 + 1,
-            resident_len: resident_len as u32,
-            tri_count,
-            cluster_count: cluster_count as u16,
-            _pad: 0,
-            deps: Span {
-                first: page_deps.len() as u32,
-                count: deps.len() as u32,
-            },
-        });
+        page_info[p].deps = Span {
+            first: page_deps.len() as u32,
+            count: deps.len() as u32,
+        };
         page_deps.extend(deps);
-        pages.push(stored);
-        let mut first_cluster = 0u16;
-        for &gi in members {
-            let g = &groups[gi];
-            group_table[table_index[gi] as usize] = Group {
-                simplified: g.sphere,
-                error: g.error,
-                page: p as u32,
-                first_cluster,
-                cluster_count: g.clusters.len() as u16,
-                depth: u8::try_from(g.depth).map_err(|_| format!("DAG depth {}", g.depth))?,
-                _pad: [0; 3],
-            };
-            first_cluster += g.clusters.len() as u16;
-        }
     }
-
-    let _sets = crate::profile::zone!("dag.set_clusters");
-    let table = &table_index;
-    let set_clusters = page_groups
-        .iter()
-        .flatten()
-        .flat_map(|&gi| {
-            let g = &groups[gi];
-            g.clusters.iter().zip(&g.refined).map(move |(c, &r)| {
-                let refined = usize::try_from(r).map_or(-1, |r| table[r] as i32);
-                c.set_cluster(table[gi], refined)
-            })
-        })
-        .collect();
-    let mut parts = cx.parts.table.clone();
-    for c in groups.iter().flat_map(|g| &g.clusters) {
-        c.add_to(&mut parts, cx.grid);
-    }
-
-    drop(_sets);
     let _hierarchy = crate::profile::zone!("dag.hierarchy");
     // Hierarchy: each stage's nodes, then breadth first from the roots.
     let mut nodes = Vec::new();
@@ -864,7 +913,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         casters: ClusterSets::default(),
     };
     let _free = crate::profile::zone!("dag.free");
-    drop((groups, stages));
+    drop(stages);
     Ok(Built {
         info,
         pages,

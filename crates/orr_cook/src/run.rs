@@ -2919,10 +2919,7 @@ fn cook_unit(
             let normals = data.tangents.is_some() && settings.tangent_error_max.is_some();
             let maps = section_maps(&data, &archives, normals, &shared.opacity, &shared.emission)?;
             drop(archives);
-            let cooked = mesh::cook(name, &data, &settings, &maps)?;
-            let free = crate::profile::zone!("mesh.free");
-            drop((data, maps));
-            drop(free);
+            let cooked = mesh::cook(name, data, &settings, maps)?;
             detail.warnings = cooked.warnings;
             detail.warnings.extend(uv_warnings);
             detail.tangents = cooked.tangents;

@@ -92,6 +92,13 @@ impl Welded {
         }
     }
 
+    /// The welded vertices of triangle `t`.
+    pub(super) fn triangle(&self, t: usize) -> [u32; 3] {
+        self.indices[3 * t..3 * t + 3]
+            .try_into()
+            .expect("three corners")
+    }
+
     pub(super) fn section_triangles(&self, s: usize) -> impl Iterator<Item = [u32; 3]> + '_ {
         let r = self.sections[s].clone();
         self.indices[r].as_chunks::<3>().0.iter().copied()
@@ -278,25 +285,55 @@ pub(crate) fn levels(
 
 /// The triangles of each (part, section), sorted by part, then section.
 pub(crate) fn pieces(w: &Welded, parts: &Parts) -> Vec<Piece> {
-    let _z = crate::profile::zone!("mesh.pieces");
-    let mut by_key: BTreeMap<(u16, u16), Vec<u32>> = Default::default();
-    for (sec, r) in w.sections.iter().enumerate() {
-        for t in r.start / 3..r.end / 3 {
-            by_key
-                .entry((parts.of_triangle[t], sec as u16))
-                .or_default()
-                .extend_from_slice(&w.indices[3 * t..3 * t + 3]);
-        }
-    }
-    by_key
+    piece_triangles(w, parts)
         .into_iter()
-        .map(|((part, section), indices)| Piece {
-            part,
-            section,
+        .map(|p| Piece {
+            part: p.part,
+            section: p.section,
             merged: false,
-            indices,
+            indices: p
+                .triangles
+                .iter()
+                .flat_map(|&t| w.triangle(t as usize))
+                .collect(),
         })
         .collect()
+}
+
+/// The triangles of one part and section, by index.
+pub(crate) struct PieceTriangles {
+    pub(super) part: u16,
+    pub(super) section: u16,
+    pub(super) triangles: Vec<u32>,
+}
+
+/// The triangles of each (part, section), ascending, sorted by part, then section.
+pub(crate) fn piece_triangles(w: &Welded, parts: &Parts) -> Vec<PieceTriangles> {
+    let _z = crate::profile::zone!("mesh.pieces");
+    let mut index: FxHashMap<(u16, u16), usize> = FxHashMap::default();
+    let mut out: Vec<PieceTriangles> = Vec::new();
+    for (sec, r) in w.sections.iter().enumerate() {
+        let section = sec as u16;
+        let mut last = None;
+        let first = r.start / 3;
+        for (t, &part) in (first..).zip(&parts.of_triangle[first..r.end / 3]) {
+            let i = match last {
+                Some((p, i)) if p == part => i,
+                _ => *index.entry((part, section)).or_insert_with(|| {
+                    out.push(PieceTriangles {
+                        part,
+                        section,
+                        triangles: Vec::new(),
+                    });
+                    out.len() - 1
+                }),
+            };
+            last = Some((part, i));
+            out[i].triangles.push(t as u32);
+        }
+    }
+    out.sort_unstable_by_key(|p| (p.part, p.section));
+    out
 }
 
 /// Grid positions where corners (welded vertex, grid position) with different uvs, in
