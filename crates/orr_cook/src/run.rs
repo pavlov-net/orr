@@ -4,12 +4,13 @@
 //! written in a fixed order.
 //!
 //! Scheduling: the jobs the next unwritten units wait on start first, then the rest largest
-//! first, while the estimated working set of the running jobs stays under
-//! [`CookOptions::working_set`] (a job over it runs alone). Finished units wait for their
-//! turn to be written. While the bytes waiting in memory exceed
-//! [`CookOptions::reorder_window`], jobs of a file archive without a cache write their
-//! units to `<archive>.units/` beside it, removed once written, and the jobs of an archive
-//! in memory start only when the next unwritten units wait on them.
+//! first, each while the estimated working set of the running jobs stays under
+//! [`CookOptions::working_set`] with it (a job over it runs alone); a job that does not fit
+//! keeps its place while smaller ones that fit start. Finished units wait for their turn to
+//! be written, which a writer thread does while the coordinator starts jobs. While the bytes
+//! waiting in memory exceed [`CookOptions::reorder_window`], jobs of a file archive without
+//! a cache write their units to `<archive>.units/` beside it, removed once written, and the
+//! jobs of an archive in memory start only when the next unwritten units wait on them.
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
@@ -316,6 +317,83 @@ struct Detail {
 enum Msg {
     Import(usize, std::thread::Result<Result<Imported>>),
     Unit(usize, std::thread::Result<Result<UnitResult>>),
+    /// The writer thread wrote a unit's entries, with their reports.
+    Written(usize, std::thread::Result<Result<Vec<report::EntryReport>>>),
+}
+
+/// A done unit for the writer thread to copy into its archive and report, in write order.
+struct Write {
+    unit: usize,
+    archive: usize,
+    from: WriteFrom,
+    entries: Vec<usize>,
+    outcome: Outcome,
+    seconds: f64,
+    working_set: u64,
+    triangles: u64,
+    detail: Option<Detail>,
+}
+
+enum WriteFrom {
+    Archive(Arc<Archive>),
+    Path(PathBuf),
+}
+
+/// The writer thread: copies each unit's entries into its archive's writer, when it has one,
+/// and reports them, until the coordinator stops sending.
+fn write_units(
+    writers: &mut [Option<ArchiveWriter>],
+    writes: &mpsc::Receiver<Write>,
+    tx: &mpsc::Sender<Msg>,
+) {
+    crate::profile::name_thread("cook writer");
+    for w in writes {
+        let unit = w.unit;
+        let r = catch_unwind(AssertUnwindSafe(|| write_unit(writers, w)));
+        if tx.send(Msg::Written(unit, r)).is_err() {
+            return;
+        }
+    }
+}
+
+fn write_unit(writers: &mut [Option<ArchiveWriter>], w: Write) -> Result<Vec<report::EntryReport>> {
+    let _z = crate::profile::zone!("archive.write");
+    let opened;
+    let arc = match &w.from {
+        WriteFrom::Archive(arc) => arc.as_ref(),
+        WriteFrom::Path(path) => {
+            opened = Archive::open(path)?;
+            &opened
+        }
+    };
+    let mut reports = Vec::with_capacity(w.entries.len());
+    for &e in &w.entries {
+        let entry = &arc.entries()[e];
+        if let Some(writer) = writers[w.archive].as_mut() {
+            writer.copy_entry(arc, entry)?;
+        }
+        reports.push(report::entry(
+            arc,
+            entry,
+            w.outcome,
+            w.seconds,
+            w.working_set,
+            w.triangles,
+        ));
+    }
+    for r in &mut reports {
+        r.peak = w.detail.as_ref().and_then(|d| d.peak);
+    }
+    if let (Some(d), Some(first)) = (w.detail, reports.first_mut()) {
+        if let (Some(m), Some(t)) = (first.mesh.as_mut(), d.tangents) {
+            m.tangents = Some(tangent_report(m.vertices, t));
+        }
+        first.raster = d.raster;
+        first.volume = d.volume;
+        first.neural = d.neural;
+        first.warnings = d.warnings;
+    }
+    Ok(reports)
 }
 
 struct Run<'m, 's> {
@@ -361,6 +439,9 @@ struct Run<'m, 's> {
     map_users: Vec<usize>,
     /// Per running mesh unit: the texture units it reads, one per read.
     map_reads: HashMap<usize, Vec<usize>>,
+    /// Units the writer thread has not yet written, with the bytes of their entries held in
+    /// memory.
+    writing: HashMap<usize, u64>,
     window: u64,
 }
 
@@ -395,6 +476,7 @@ impl<'m, 's> Run<'m, 's> {
             dependents: Vec::new(),
             map_users: Vec::new(),
             map_reads: HashMap::new(),
+            writing: HashMap::new(),
             window: 0,
         };
         for (a, spec) in manifest.archives.iter().enumerate() {
@@ -1310,6 +1392,15 @@ impl<'m, 's> Run<'m, 's> {
         'm: 't,
         's: 't,
     {
+        // The writer thread copies done units into the archives, so the coordinator keeps
+        // starting jobs while it writes.
+        let (writes, queue) = mpsc::channel::<Write>();
+        let mut writers = std::mem::take(&mut self.writers);
+        let wtx = tx.clone();
+        let writer = scope.spawn(move || {
+            write_units(&mut writers, &queue, &wtx);
+            writers
+        });
         let (mut running, mut bytes) = (0usize, 0u64);
         let budget =
             self.opts.working_set - DECODED_CACHES * (self.opts.working_set / DECODED_SHARE);
@@ -1317,14 +1408,14 @@ impl<'m, 's> Run<'m, 's> {
             while let Some(u) = self.local.pop() {
                 self.finish_local(u)?;
             }
-            self.write_ready()?;
-            if self
+            self.send_ready(&writes);
+            let sent = self
                 .cursor
                 .iter()
                 .zip(&self.order)
-                .all(|(c, o)| *c == o.len())
-            {
-                return Ok(());
+                .all(|(c, o)| *c == o.len());
+            if sent && self.writing.is_empty() {
+                break;
             }
             // The units the next unwritten ones wait on start first.
             let mut candidates: Vec<usize> = (0..self.order.len())
@@ -1342,10 +1433,14 @@ impl<'m, 's> Run<'m, 's> {
                     .map(|&(_, u)| u)
                     .filter(|&u| !full || self.scratch[self.units[u].archive].is_some()),
             );
+            // A unit that does not fit stays first in line while smaller ones that fit start.
             for u in candidates {
-                let ws = self.units[u].working_set;
-                if running >= jobs || (running > 0 && bytes + ws > budget) {
+                if running >= jobs {
                     break;
+                }
+                let ws = self.units[u].working_set;
+                if running > 0 && bytes + ws > budget {
+                    continue;
                 }
                 if self.ready.remove(&(Reverse(ws), u)) {
                     running += 1;
@@ -1356,24 +1451,33 @@ impl<'m, 's> Run<'m, 's> {
             crate::profile::plot!("jobs running", running as f64);
             crate::profile::plot!("jobs working set GiB", bytes as f64 / f64::from(1 << 30));
             assert!(
-                running > 0 || !self.local.is_empty(),
+                running > 0 || !self.local.is_empty() || !self.writing.is_empty(),
                 "the cook has nothing to run and entries left to write"
             );
-            if running == 0 {
+            if running == 0 && self.writing.is_empty() {
                 continue;
             }
-            let Ok(Msg::Unit(u, r)) = rx.recv() else {
-                unreachable!("only units run");
-            };
-            running -= 1;
-            bytes -= self.units[u].working_set;
-            if let Some(reads) = self.map_reads.remove(&u) {
-                self.release_maps(reads);
+            match rx.recv().expect("the coordinator holds a sender") {
+                Msg::Unit(u, r) => {
+                    running -= 1;
+                    bytes -= self.units[u].working_set;
+                    if let Some(reads) = self.map_reads.remove(&u) {
+                        self.release_maps(reads);
+                    }
+                    let (from, seconds, detail) = r.unwrap_or_else(|p| resume_unwind(p))?;
+                    self.details.insert(u, detail);
+                    self.done(u, from, None, Outcome::Cooked, seconds)?;
+                }
+                Msg::Written(u, r) => {
+                    let reports = r.unwrap_or_else(|p| resume_unwind(p))?;
+                    self.written(u, reports);
+                }
+                Msg::Import(..) => unreachable!("imports are done"),
             }
-            let (from, seconds, detail) = r.unwrap_or_else(|p| resume_unwind(p))?;
-            self.details.insert(u, detail);
-            self.done(u, from, None, Outcome::Cooked, seconds)?;
         }
+        drop(writes);
+        self.writers = writer.join().unwrap_or_else(|p| resume_unwind(p));
+        Ok(())
     }
 
     /// A ready unit that `u`, the next unit to write, waits on.
@@ -1429,6 +1533,7 @@ impl<'m, 's> Run<'m, 's> {
         for t in reads {
             self.map_users[t] -= 1;
             if self.map_users[t] == 0
+                && !self.writing.contains_key(&t)
                 && matches!(self.units[t].state, State::Written(_))
                 && let State::Written(Some(from)) =
                     std::mem::replace(&mut self.units[t].state, State::Written(None))
@@ -1572,9 +1677,8 @@ impl<'m, 's> Run<'m, 's> {
         }
     }
 
-    /// Writes every unit that is next in its archive's order and done.
-    fn write_ready(&mut self) -> Result<()> {
-        let _z = crate::profile::zone!("archive.write");
+    /// Sends every unit that is next in its archive's order and done to the writer thread.
+    fn send_ready(&mut self, writes: &mpsc::Sender<Write>) {
         for a in 0..self.order.len() {
             while let Some(&u) = self.order[a].get(self.cursor[a]) {
                 if !matches!(self.units[u].state, State::Done(_)) {
@@ -1585,60 +1689,50 @@ impl<'m, 's> Run<'m, 's> {
                 else {
                     unreachable!("checked above");
                 };
-                if self.map_users[u] > 0 {
-                    self.units[u].state = State::Written(Some(d.from.clone()));
-                }
-                let unit = &self.units[u];
-                let (asset, working_set, triangles) =
-                    (unit.asset, unit.working_set, unit.triangles);
-                let writer = self.writers[a].as_mut();
-                let old = self.old[a].as_ref().map(|o| &o.archive);
-                let mut reports = Vec::new();
-                let write = |arc: &Archive| -> Result<()> {
-                    let mut writer = writer;
-                    for &e in &d.entries {
-                        let entry = &arc.entries()[e];
-                        if let Some(w) = writer.as_deref_mut() {
-                            w.copy_entry(arc, entry)?;
-                        }
-                        reports.push(report::entry(
-                            arc,
-                            entry,
-                            d.outcome,
-                            d.seconds,
-                            working_set,
-                            triangles,
-                        ));
-                    }
-                    Ok(())
+                let from = match &d.from {
+                    From::Memory(arc) => WriteFrom::Archive(Arc::clone(arc)),
+                    From::Old => WriteFrom::Archive(Arc::clone(
+                        &self.old[a]
+                            .as_ref()
+                            .expect("linked from the old archive")
+                            .archive,
+                    )),
+                    From::Cache(path) | From::Scratch(path) => WriteFrom::Path(path.clone()),
                 };
-                match &d.from {
-                    From::Memory(arc) => write(arc)?,
-                    From::Old => write(old.expect("linked from the old archive"))?,
-                    From::Cache(path) | From::Scratch(path) => write(&Archive::open(path)?)?,
-                }
-                if self.map_users[u] == 0 {
-                    self.release(&d.from);
-                }
-                let detail = self.details.remove(&u);
-                for r in &mut reports {
-                    r.peak = detail.as_ref().and_then(|d| d.peak);
-                }
-                if let (Some(d), Some(first)) = (detail, reports.first_mut()) {
-                    if let (Some(m), Some(t)) = (first.mesh.as_mut(), d.tangents) {
-                        m.tangents = Some(tangent_report(m.vertices, t));
-                    }
-                    first.raster = d.raster;
-                    first.volume = d.volume;
-                    first.neural = d.neural;
-                    first.warnings = d.warnings;
-                }
-                self.assets[asset].entries.extend(reports);
-                self.window -= d.memory;
+                let unit = &self.units[u];
+                let write = Write {
+                    unit: u,
+                    archive: a,
+                    from,
+                    entries: d.entries,
+                    outcome: d.outcome,
+                    seconds: d.seconds,
+                    working_set: unit.working_set,
+                    triangles: unit.triangles,
+                    detail: self.details.remove(&u),
+                };
+                self.units[u].state = State::Written(Some(d.from));
+                self.writing.insert(u, d.memory);
+                writes
+                    .send(write)
+                    .expect("the writer runs until the cook ends");
                 self.cursor[a] += 1;
             }
         }
-        Ok(())
+    }
+
+    /// Takes a unit the writer thread has written: its reports, and its entries' memory and
+    /// scratch archive unless a mesh still reads them.
+    fn written(&mut self, u: usize, reports: Vec<report::EntryReport>) {
+        let memory = self.writing.remove(&u).expect("sent to the writer");
+        self.window -= memory;
+        self.assets[self.units[u].asset].entries.extend(reports);
+        if self.map_users[u] == 0
+            && let State::Written(Some(from)) =
+                std::mem::replace(&mut self.units[u].state, State::Written(None))
+        {
+            self.release(&from);
+        }
     }
 
     fn remove_scratch(&self) {
