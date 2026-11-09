@@ -3,10 +3,12 @@
 //! threads of their own with their parallel loops on the rayon pool, and every archive is
 //! written in a fixed order.
 //!
-//! Scheduling: the jobs the next unwritten units wait on start first, then the rest largest
-//! first, each while the estimated working set of the running jobs stays under
-//! [`CookOptions::working_set`] with it (a job over it runs alone); a job that does not fit
-//! keeps its place while smaller ones that fit start. Finished units wait for their turn to
+//! Scheduling: the jobs the next unwritten units wait on start first, then the rest by the
+//! largest planned job among them and the units waiting on them, so the textures of the
+//! largest meshes cook first, each while the estimated working set of the running jobs stays
+//! under [`CookOptions::working_set`] with it (a job over it runs alone); a job that does not
+//! fit keeps its place while smaller ones start only with its working set left free.
+//! Finished units wait for their turn to
 //! be written, which a writer thread does while the coordinator starts jobs. While the bytes
 //! waiting in memory exceed [`CookOptions::reorder_window`], jobs of a file archive without
 //! a cache write their units to `<archive>.units/` beside it, removed once written, and the
@@ -446,12 +448,15 @@ struct Run<'m, 's> {
     assets: Vec<AssetReport>,
     /// Report details of cooked units, by unit, until written.
     details: HashMap<usize, Detail>,
-    /// Units whose dependencies are done, largest first; models and shared results apart,
-    /// as they finish on the coordinator.
+    /// Units whose dependencies are done, by [`Self::ready_key`]; models and shared results
+    /// apart, as they finish on the coordinator.
     ready: BTreeSet<(Reverse<u64>, usize)>,
     local: Vec<usize>,
     pending: Vec<usize>,
     dependents: Vec<Vec<usize>>,
+    /// Per unit: its planned working set or the largest of any unit that waits on it, so the
+    /// units the biggest jobs wait on start first.
+    priority: Vec<u64>,
     /// Per unit: mesh units that read its texture and have not finished.
     map_users: Vec<usize>,
     /// Per running mesh unit: the texture units it reads, one per read.
@@ -497,6 +502,7 @@ impl<'m, 's> Run<'m, 's> {
             local: Vec::new(),
             pending: Vec::new(),
             dependents: Vec::new(),
+            priority: Vec::new(),
             map_users: Vec::new(),
             map_reads: HashMap::new(),
             writing: HashMap::new(),
@@ -927,7 +933,12 @@ impl<'m, 's> Run<'m, 's> {
             let geometry = mesh_working_set(triangles, settings) + held;
             self.units[u].working_set = load.max(geometry);
         }
-        self.ready.insert((Reverse(self.units[u].working_set), u));
+        self.ready.insert(self.ready_key(u));
+    }
+
+    /// Unit `u`'s place in [`Self::ready`]: highest priority first.
+    fn ready_key(&self, u: usize) -> (Reverse<u64>, usize) {
+        (Reverse(self.priority[u]), u)
     }
 
     fn run<'t>(&mut self, scope: &'t Scope<'t, '_>, threads: usize) -> Result<()>
@@ -1382,7 +1393,29 @@ impl<'m, 's> Run<'m, 's> {
                     self.dependents[d].push(u);
                 }
             }
-            if self.pending[u] == 0 {
+        }
+        self.priority = self.units.iter().map(|u| u.planned).collect();
+        // Dependents are added after the units they wait on, mostly; the loop settles the
+        // rest.
+        loop {
+            let mut raised = false;
+            for u in (0..self.units.len()).rev() {
+                let most = self.dependents[u]
+                    .iter()
+                    .map(|&d| self.priority[d])
+                    .max()
+                    .unwrap_or(0);
+                if most > self.priority[u] {
+                    self.priority[u] = most;
+                    raised = true;
+                }
+            }
+            if !raised {
+                break;
+            }
+        }
+        for u in 0..self.units.len() {
+            if matches!(self.units[u].state, State::Waiting) && self.pending[u] == 0 {
                 self.make_ready(u);
             }
         }
@@ -1477,22 +1510,36 @@ impl<'m, 's> Run<'m, 's> {
                     .map(|&(_, u)| u)
                     .filter(|&u| !full || self.scratch[self.units[u].archive].is_some()),
             );
-            // A unit that does not fit stays first in line while smaller ones that fit start.
+            // A unit that does not fit stays first in line while smaller ones start beside
+            // it: they fit with the budget it waits for left to it, so they never put it off.
+            // A unit reserves for the largest other waiter at least its size, so of two that
+            // wait, the smaller never holds the larger back.
             let (mut skipped, mut passed) = (Vec::new(), 0);
             let now = Instant::now();
+            // Units waiting for working set, largest first.
+            let mut waiting: BTreeSet<(Reverse<u64>, usize)> = self
+                .passed
+                .keys()
+                .map(|&p| (Reverse(self.units[p].working_set), p))
+                .collect();
             for u in candidates {
                 if running >= jobs {
                     break;
                 }
-                let ws = self.units[u].working_set;
-                if !self.ready.contains(&(Reverse(ws), u)) {
+                if !self.ready.contains(&self.ready_key(u)) {
                     continue;
                 }
-                if running > 0 && bytes + ws > budget {
+                let ws = self.units[u].working_set;
+                let other = waiting.iter().find(|w| w.1 != u).map_or(0, |w| w.0.0);
+                let reserved = if other >= ws { other } else { 0 };
+                if running > 0 && bytes + ws + reserved > budget {
+                    waiting.insert((Reverse(ws), u));
                     skipped.push(u);
                     continue;
                 }
-                self.ready.remove(&(Reverse(ws), u));
+                // A waiter that starts reserves nothing more.
+                waiting.remove(&(Reverse(ws), u));
+                self.ready.remove(&self.ready_key(u));
                 running += 1;
                 bytes += ws;
                 passed = skipped.len();
@@ -1539,10 +1586,9 @@ impl<'m, 's> Run<'m, 's> {
     /// A ready unit that `u`, the next unit to write, waits on.
     fn blocking(&self, u: usize) -> Option<usize> {
         match self.units[u].state {
-            State::Waiting if self.pending[u] == 0 => self
-                .ready
-                .contains(&(Reverse(self.units[u].working_set), u))
-                .then_some(u),
+            State::Waiting if self.pending[u] == 0 => {
+                self.ready.contains(&self.ready_key(u)).then_some(u)
+            }
             State::Waiting => self.units[u].deps.iter().find_map(|&d| self.blocking(d)),
             _ => None,
         }
