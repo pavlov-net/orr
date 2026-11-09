@@ -561,6 +561,7 @@ impl<'d> Data<'d> {
                 let base = &data[a.offset()..];
                 (0..a.count())
                     .into_par_iter()
+                    .light()
                     .map(|i| read(&base[i * stride..]))
                     .collect()
             }

@@ -15,10 +15,14 @@ pub(crate) mod prelude {
     pub(crate) use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 }
 
-/// A parallel iterator whose pieces run in `job`.
+/// Items of a loop of light items each piece takes at least ([`InJob::light`]).
+const LIGHT_MIN: usize = 1 << 16;
+
+/// A parallel iterator whose pieces run in `job`, each at least `min` items.
 pub(crate) struct InJob<I> {
     base: I,
     job: Option<Job>,
+    min: usize,
 }
 
 impl<I> InJob<I> {
@@ -26,6 +30,17 @@ impl<I> InJob<I> {
         Self {
             base,
             job: job::current(),
+            min: 1,
+        }
+    }
+
+    /// Pieces of at least [`LIGHT_MIN`] items, for items that each take a few nanoseconds: a
+    /// shorter loop then runs on the calling thread, where a job thread would otherwise wait
+    /// for a busy pool to take it, longer than the loop takes.
+    pub(crate) fn light(self) -> Self {
+        Self {
+            min: LIGHT_MIN,
+            ..self
         }
     }
 }
@@ -52,14 +67,15 @@ impl<I: IndexedParallelIterator> IndexedParallelIterator for InJob<I> {
     }
 
     fn with_producer<CB: ProducerCallback<Self::Item>>(self, callback: CB) -> CB::Output {
-        let job = self.job;
-        self.base.with_producer(Callback { callback, job })
+        let (job, min) = (self.job, self.min);
+        self.base.with_producer(Callback { callback, job, min })
     }
 }
 
 struct Callback<CB> {
     callback: CB,
     job: Option<Job>,
+    min: usize,
 }
 
 impl<T, CB: ProducerCallback<T>> ProducerCallback<T> for Callback<CB> {
@@ -69,6 +85,7 @@ impl<T, CB: ProducerCallback<T>> ProducerCallback<T> for Callback<CB> {
         self.callback.callback(InJobProducer {
             base,
             job: self.job,
+            min: self.min,
         })
     }
 }
@@ -77,6 +94,7 @@ impl<T, CB: ProducerCallback<T>> ProducerCallback<T> for Callback<CB> {
 struct InJobProducer<P> {
     base: P,
     job: Option<Job>,
+    min: usize,
 }
 
 impl<P: Producer> Producer for InJobProducer<P> {
@@ -92,7 +110,7 @@ impl<P: Producer> Producer for InJobProducer<P> {
     }
 
     fn min_len(&self) -> usize {
-        self.base.min_len()
+        self.base.min_len().max(self.min)
     }
 
     fn max_len(&self) -> usize {
@@ -101,8 +119,8 @@ impl<P: Producer> Producer for InJobProducer<P> {
 
     fn split_at(self, index: usize) -> (Self, Self) {
         let (a, b) = self.base.split_at(index);
-        let job = self.job;
-        (Self { base: a, job }, Self { base: b, job })
+        let (job, min) = (self.job, self.min);
+        (Self { base: a, job, min }, Self { base: b, job, min })
     }
 
     fn fold_with<F: Folder<Self::Item>>(self, folder: F) -> F {

@@ -78,7 +78,7 @@ use std::sync::Arc;
 use crate::par::prelude::*;
 use gltf::image::Source as ImageSource;
 use gltf::mesh::{Mode, Semantic};
-use orr_math::{DMat3, DMat4, Quat, Vec3};
+use orr_math::{DMat3, DMat4, Mat3, Quat, Vec3};
 use orr_pack::Hash32;
 use orr_pack::material::slot;
 use serde::Deserialize;
@@ -312,22 +312,149 @@ struct Placing<'a> {
     displaced: bool,
 }
 
+/// A primitive attribute as rows of `k` floats with the weighted morph target deltas added,
+/// `None` when the primitive lacks it; every one holds `n` rows. L1991: a tangent's deltas
+/// leave its w. L1926 gives joints and their weights no deltas.
+fn morphed_rows(
+    src: &Data<'_>,
+    prim: &gltf::Primitive<'_>,
+    at: &Placing<'_>,
+    n: usize,
+    s: Semantic,
+    k: usize,
+) -> Result<Option<Vec<f32>>, String> {
+    let counted = |a: &gltf::Accessor<'_>, k| {
+        if a.count() != n {
+            return Err("attribute counts differ".to_string());
+        }
+        src.floats(a, k)
+    };
+    let Some(a) = prim.get(&s) else {
+        return Ok(None);
+    };
+    let mut out = counted(&a, k)?;
+    if matches!(s, Semantic::Joints(_) | Semantic::Weights(_)) {
+        return Ok(Some(out));
+    }
+    let width = if s == Semantic::Tangents { 3 } else { k };
+    let name = s.to_string();
+    for (t, &w) in at.weights.iter().enumerate().filter(|&(_, &w)| w != 0.0) {
+        let Some(d) = src.doc.morph_deltas(at.mesh, prim.index(), t, &name) else {
+            continue;
+        };
+        let d = counted(&d, width)?;
+        let components = out.chunks_exact_mut(k).flat_map(|r| &mut r[..width]);
+        for (x, d) in components.zip(&d) {
+            *x += w * d;
+        }
+    }
+    Ok(Some(out))
+}
+
+/// The world transform's linear part, and whether it mirrors. As `normal_matrix` takes it:
+/// where `world` flattens, the sign is rounding, and the winding and the normals have to
+/// agree on it.
+fn placing_linear(world: DMat4) -> (DMat3, bool) {
+    let linear = DMat3::from_mat4(world);
+    (linear, linear.determinant() < 0.0)
+}
+
+/// MikkTSpace's tangents of a primitive per corner of `indices`, in its own space from its
+/// morphed `local` positions, normals (flat ones without) and uvs of set `set`, then placed by
+/// `linear` and with their sign flipped where it mirrors.
+fn corner_tangents(
+    indices: &[u32],
+    local: &[[f32; 3]],
+    local_normals: Option<&[[f32; 3]]>,
+    uv: &[[f32; 2]],
+    linear: Mat3,
+    flip: bool,
+) -> Vec<[f32; 4]> {
+    let place_tangent = |[x, y, z, w]: [f32; 4]| {
+        let t = (linear * Vec3::new(x, y, z)).to_array();
+        [t[0], t[1], t[2], if flip { -w } else { w }]
+    };
+    let corners = match local_normals {
+        Some(n) => {
+            let unit: Vec<[f32; 3]> = n
+                .par_iter()
+                .light()
+                .map(|&n| Vec3::from(n).normalize_or_zero().to_array())
+                .collect();
+            tangents::generate(Some(indices), local, &unit, uv)
+        }
+        None => tangents::generate_flat(indices, local, uv),
+    };
+    corners.into_iter().map(place_tangent).collect()
+}
+
+/// The uv set of the tangents [`append_primitive`] computes for `prim`, if it computes them:
+/// when the model carries tangents (`carries`) and the primitive states none. glTF ignores the
+/// tangents of a primitive without normals.
+fn tangents_set(prim: &gltf::Primitive<'_>, at: &Placing<'_>, carries: bool) -> Option<usize> {
+    let stated = prim.get(&Semantic::Normals).is_some() && prim.get(&Semantic::Tangents).is_some();
+    at.tangent_set
+        .or_else(|| carries.then_some(0))
+        .filter(|_| !stated)
+}
+
+/// The tangents [`append_primitive`] computes for `prim` per corner, before a mirror swaps its
+/// corners, when the model carries tangents (`carries`) and the primitive states none; read
+/// on their own, so primitives compute them in parallel.
+fn computed_tangents(
+    src: &Data<'_>,
+    prim: &gltf::Primitive<'_>,
+    at: &Placing<'_>,
+    carries: bool,
+) -> Result<Option<Vec<[f32; 4]>>, String> {
+    let Some(set) = tangents_set(prim, at, carries) else {
+        return Ok(None);
+    };
+    let n = prim
+        .get(&Semantic::Positions)
+        .ok_or("no positions")?
+        .count();
+    let rows = |s, k| morphed_rows(src, prim, at, n, s, k);
+    let local = rows(Semantic::Positions, 3)?.expect("checked above");
+    let vertices: Vec<u32> = match prim.indices() {
+        Some(a) => src.indices(&a)?,
+        None => (0..n as u32).collect(),
+    };
+    let indices = corners(prim.mode(), vertices);
+    if !indices.len().is_multiple_of(3) || indices.iter().any(|&i| i as usize >= n) {
+        return Err("bad index list".into());
+    }
+    let uv = match rows(Semantic::TexCoords(if set == 1 { 1 } else { 0 }), 2)? {
+        Some(v) => v.as_chunks::<2>().0.to_vec(),
+        None => vec![[0.0; 2]; n],
+    };
+    let local_normals = rows(Semantic::Normals, 3)?;
+    let (linear, flip) = placing_linear(at.world);
+    Ok(Some(corner_tangents(
+        &indices,
+        local.as_chunks::<3>().0,
+        local_normals.as_ref().map(|n| n.as_chunks::<3>().0),
+        &uv,
+        linear.as_mat3(),
+        flip,
+    )))
+}
+
 /// Appends a triangle primitive to `b` with its morph targets at the weights, its positions
 /// taken to model space by the world transform (winding and tangent signs flipped under a
 /// mirroring one). Tangents are the primitive's own, or MikkTSpace's where the model carries
-/// them, computed from its morphed attributes in its own space as the glTF spec asks.
+/// them, computed from its morphed attributes in its own space as the glTF spec asks, or
+/// given as [`computed_tangents`] computed them.
 fn append_primitive(
     src: &Data<'_>,
     prim: &gltf::Primitive<'_>,
     at: &Placing<'_>,
     cx: &Context<'_>,
     b: &mut Building,
+    given: Option<Vec<[f32; 4]>>,
 ) -> Result<(), String> {
     let (world, weights, binding) = (at.world, at.weights, at.binding);
-    let linear = DMat3::from_mat4(world);
-    // As `normal_matrix` takes it: where `world` flattens, the sign is rounding, and the
-    // winding and the normals have to agree on it.
-    let flip = linear.determinant() < 0.0;
+    let (linear, flip) = placing_linear(world);
     let normal_m = normal_matrix(linear).as_mat3();
     let linear = linear.as_mat3();
     let place = |p: [f32; 3]| {
@@ -336,37 +463,7 @@ fn append_primitive(
     };
     let position = prim.get(&Semantic::Positions).ok_or("no positions")?;
     let n = position.count();
-    let counted = |a: &gltf::Accessor<'_>, k| {
-        if a.count() != n {
-            return Err("attribute counts differ".to_string());
-        }
-        src.floats(a, k)
-    };
-    // An attribute as rows of `k` floats with the weighted morph target deltas added, `None` when
-    // the primitive lacks it. L1991: a tangent's deltas leave its w. L1926 gives joints and their
-    // weights no deltas.
-    let rows = |s: Semantic, k: usize| -> Result<Option<Vec<f32>>, String> {
-        let Some(a) = prim.get(&s) else {
-            return Ok(None);
-        };
-        let mut out = counted(&a, k)?;
-        if matches!(s, Semantic::Joints(_) | Semantic::Weights(_)) {
-            return Ok(Some(out));
-        }
-        let width = if s == Semantic::Tangents { 3 } else { k };
-        let name = s.to_string();
-        for (t, &w) in weights.iter().enumerate().filter(|&(_, &w)| w != 0.0) {
-            let Some(d) = src.doc.morph_deltas(at.mesh, prim.index(), t, &name) else {
-                continue;
-            };
-            let d = counted(&d, width)?;
-            let components = out.chunks_exact_mut(k).flat_map(|r| &mut r[..width]);
-            for (x, d) in components.zip(&d) {
-                *x += w * d;
-            }
-        }
-        Ok(Some(out))
-    };
+    let rows = |s: Semantic, k: usize| morphed_rows(src, prim, at, n, s, k);
     let custom = |name: &str, k| -> Result<Option<Vec<f32>>, String> {
         let key = name
             .strip_prefix('_')
@@ -375,7 +472,7 @@ fn append_primitive(
     };
     let local = rows(Semantic::Positions, 3)?.expect("checked above");
     let local = local.as_chunks::<3>().0;
-    let positions: Vec<[f32; 3]> = local.par_iter().map(|&p| place(p)).collect();
+    let positions: Vec<[f32; 3]> = local.par_iter().light().map(|&p| place(p)).collect();
     let vertices: Vec<u32> = match prim.indices() {
         Some(a) => src.indices(&a)?,
         None => (0..n as u32).collect(),
@@ -416,7 +513,8 @@ fn append_primitive(
     let local_normals = rows(Semantic::Normals, 3)?;
     let local_normals = local_normals.as_ref().map(|n| n.as_chunks::<3>().0);
     let normals: Option<Vec<[f32; 3]>> = local_normals.map(|ns| {
-        ns.iter()
+        ns.par_iter()
+            .light()
             .map(|&nv| (normal_m * Vec3::from(nv)).normalize_or_zero().to_array())
             .collect()
     });
@@ -440,18 +538,10 @@ fn append_primitive(
     });
     let tangent_set = at.tangent_set.or_else(|| b.tangents.then_some(0));
     let mut computed: Option<Vec<[f32; 4]>> = tangent_set.filter(|_| stated.is_none()).map(|set| {
-        let uv = if set == 1 { &uvs1 } else { &uvs };
-        let corners = match local_normals {
-            Some(n) => {
-                let unit = n
-                    .iter()
-                    .map(|&n| Vec3::from(n).normalize_or_zero().to_array());
-                let unit: Vec<[f32; 3]> = unit.collect();
-                tangents::generate(Some(&indices), local, &unit, uv)
-            }
-            None => tangents::generate_flat(&indices, local, uv),
-        };
-        corners.into_iter().map(place_tangent).collect()
+        given.unwrap_or_else(|| {
+            let uv = if set == 1 { &uvs1 } else { &uvs };
+            corner_tangents(&indices, local, local_normals, uv, linear, flip)
+        })
     });
     if flip {
         indices
@@ -1052,18 +1142,40 @@ impl Imported<'_> {
             b.tangents = tangents;
             let gm = src.doc.meshes().nth(mesh).expect("mesh index");
             let placings = tangent_sets.iter().zip(&displaced);
-            for (prim, (&tangent_set, &displaced)) in surfaces(&gm).zip(placings) {
-                let at = Placing {
-                    mesh,
-                    world: linear,
-                    weights: &weights,
-                    binding: None,
-                    tangent_set,
-                    displaced,
-                };
-                append_primitive(&data, &prim, &at, &cx, &mut b).map_err(|m| Error::Import {
-                    asset: asset.clone(),
-                    message: format!("mesh {mesh} primitive {}: {m}", prim.index()),
+            let prims: Vec<_> = surfaces(&gm)
+                .zip(placings)
+                .map(|(prim, (&tangent_set, &displaced))| {
+                    let at = Placing {
+                        mesh,
+                        world: linear,
+                        weights: &weights,
+                        binding: None,
+                        tangent_set,
+                        displaced,
+                    };
+                    (prim, at)
+                })
+                .collect();
+            // Primitives that compute tangents do so in parallel, each reading what they need
+            // on its own; one that fails to read gets them, and its error, as it is appended.
+            let computing = prims
+                .iter()
+                .filter(|(prim, at)| tangents_set(prim, at, tangents).is_some())
+                .count();
+            let given: Vec<Option<Vec<[f32; 4]>>> = if computing > 1 {
+                prims
+                    .par_iter()
+                    .map(|(prim, at)| computed_tangents(&data, prim, at, tangents).ok().flatten())
+                    .collect()
+            } else {
+                prims.iter().map(|_| None).collect()
+            };
+            for ((prim, at), given) in prims.iter().zip(given) {
+                append_primitive(&data, prim, at, &cx, &mut b, given).map_err(|m| {
+                    Error::Import {
+                        asset: asset.clone(),
+                        message: format!("mesh {mesh} primitive {}: {m}", prim.index()),
+                    }
                 })?;
             }
             Ok(b.finish(parts.as_ref(), false).0)
@@ -1519,7 +1631,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
                 tangent_set: b.tangent_set(&prim),
                 displaced: b.displaces(&prim),
             };
-            append_primitive(&data, &prim, &placing, &cx, &mut models[m]).map_err(|e| {
+            append_primitive(&data, &prim, &placing, &cx, &mut models[m], None).map_err(|e| {
                 fail(format!(
                     "mesh {} primitive {}: {e}",
                     mesh.index(),

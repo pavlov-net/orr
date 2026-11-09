@@ -89,28 +89,41 @@ pub(crate) fn per_vertex(
     indices: &mut [u32],
     corners: &[[f32; 4]],
 ) -> (Vec<[f32; 4]>, Vec<u32>) {
-    let mut tangents = vec![None; count];
-    let mut copies = Vec::new();
-    let mut copied: FxHashMap<(u32, [u32; 4]), u32> = FxHashMap::default();
-    for (i, &t) in indices.iter_mut().zip(corners) {
-        match &mut tangents[*i as usize] {
-            slot @ None => *slot = Some(t),
-            Some(first) if *first == t => {}
-            Some(_) => {
-                let source = *i;
-                // Adding zero turns -0.0 into 0.0, which `==` counts as equal.
-                let key = t.map(|x| (x + 0.0).to_bits());
-                *i = *copied.entry((source, key)).or_insert_with(|| {
-                    copies.push(source);
-                    (count + copies.len() - 1) as u32
-                });
-                if *i as usize == tangents.len() {
-                    tangents.push(Some(t));
-                }
-            }
+    // Each vertex keeps the tangent of its first corner.
+    let mut first = vec![usize::MAX; count];
+    for (c, &v) in indices.iter().enumerate() {
+        let f = &mut first[v as usize];
+        if *f == usize::MAX {
+            *f = c;
         }
     }
-    let tangents = tangents.into_iter().map(|t| t.unwrap_or(UNREAD)).collect();
+    let mut tangents: Vec<[f32; 4]> = first
+        .par_iter()
+        .light()
+        .map(|&c| if c == usize::MAX { UNREAD } else { corners[c] })
+        .collect();
+    // Corners whose tangent differs from their vertex's move to copies, numbered in corner
+    // order.
+    let differ: Vec<usize> = (0..indices.len())
+        .into_par_iter()
+        .light()
+        .filter(|&c| {
+            let v = indices[c] as usize;
+            c != first[v] && tangents[v] != corners[c]
+        })
+        .collect();
+    let mut copies = Vec::new();
+    let mut copied: FxHashMap<(u32, [u32; 4]), u32> = FxHashMap::default();
+    for c in differ {
+        let (source, t) = (indices[c], corners[c]);
+        // Adding zero turns -0.0 into 0.0, which `==` counts as equal.
+        let key = t.map(|x| (x + 0.0).to_bits());
+        indices[c] = *copied.entry((source, key)).or_insert_with(|| {
+            copies.push(source);
+            tangents.push(t);
+            (count + copies.len() - 1) as u32
+        });
+    }
     (tangents, copies)
 }
 
