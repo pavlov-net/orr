@@ -1829,6 +1829,9 @@ impl<'m, 's> Run<'m, 's> {
                 assets[units[u].asset].entries.extend(r);
             }
         }
+        // By unit, so models of one name keep a fixed order.
+        let mut assemblies: Vec<(usize, Assembly)> = assemblies.into_iter().collect();
+        assemblies.sort_unstable_by_key(|a| a.0);
         for (u, a) in assemblies {
             let asset = &mut assets[units[u].asset];
             let report = assembly_report(&a, &asset.entries);
