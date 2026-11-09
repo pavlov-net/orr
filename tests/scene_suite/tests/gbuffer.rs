@@ -8945,6 +8945,7 @@ fn every_slot_reaches_its_parameter() {
         thin_film_weight: 0.5,
         specular_anisotropy: 0.5,
         subsurface_weight: 0.5,
+        subsurface_radius: 1.0,
         emission_luminance: 2.0,
         ..Material::default()
     };

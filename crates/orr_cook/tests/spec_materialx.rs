@@ -705,6 +705,12 @@ fn documents_map_as_the_clauses_say() {
             check: |m| close(m.transmission_depth, 0.05) && close(m.subsurface_radius, 0.6096),
         },
         Row {
+            clause: "OpenPBR Metadata: without a unit a length is in centimeters, its default too",
+            body: "",
+            inputs: r#"<input name="transmission_depth" type="float" value="2"/>"#,
+            check: |m| close(m.transmission_depth, 0.02) && close(m.subsurface_radius, 0.01),
+        },
+        Row {
             clause: "Spec Units: a unit names its own type, which open_pbr_surface does not declare",
             body: "",
             inputs: r#"<input name="transmission_depth" type="float" value="5" unit="centimeter"/>"#,
@@ -859,7 +865,7 @@ fn documents_map_as_the_clauses_say() {
             body: r#"<constant name="c" type="float">
                   <input name="value" type="float" value="4"/></constant>"#,
             inputs: r#"<input name="transmission_depth" type="float" nodename="c" unit="cubit"/>"#,
-            check: |m| close(m.transmission_depth, 4.0),
+            check: |m| close(m.transmission_depth, 0.04),
         },
         Row {
             clause: "Spec NodeDef: an empty unit declares none",
@@ -867,7 +873,7 @@ fn documents_map_as_the_clauses_say() {
                   <input name="transmission_depth" type="float" unittype="" unit=""/>
                   <output name="out" type="surfaceshader"/></nodedef>"#,
             inputs: r#"<input name="transmission_depth" type="float" value="2"/>"#,
-            check: |m| close(m.transmission_depth, 2.0),
+            check: |m| close(m.transmission_depth, 0.02),
         },
         Row {
             clause: "Spec Inputs: the constant example's unit reaches what reads the constant",
@@ -905,7 +911,7 @@ fn documents_map_as_the_clauses_say() {
                   <output name="out" type="surfaceshader"/></nodedef>"#,
             inputs: r#"<input name="transmission_depth" type="float" value="7"/>
                 <input name="subsurface_radius" type="float" value="2"/>"#,
-            check: |m| close(m.transmission_depth, 0.007) && m.subsurface_radius == 2.0,
+            check: |m| close(m.transmission_depth, 0.007) && close(m.subsurface_radius, 0.02),
         },
         Row {
             clause: "ND_place2d_vector2: rotate declares degrees, so radians convert to them",
@@ -2117,6 +2123,11 @@ fn a_medium_reads_its_textures() {
         report.assets[0].warnings
     );
     let m = material(&a);
+    assert!(
+        close(m.transmission_depth, 0.01),
+        "{}",
+        m.transmission_depth
+    );
     for s in [
         slot::TRANSMISSION_DEPTH,
         slot::TRANSMISSION_COLOR,
@@ -2257,7 +2268,7 @@ fn a_back_takes_the_class_of_its_front() {
     let (front, back) = (material(&a), back_of(&a));
     assert_eq!(back.class(), front.class());
     assert_eq!(back.transmission_weight, 1.0);
-    assert_eq!(back.transmission_depth, 0.5);
+    assert_eq!(back.transmission_depth, 0.005);
     assert!(bound(&back, slot::DISPERSION_SCALE));
     assert_eq!(back.thin_walled, 1);
     assert_eq!(back.geometry_opacity, 1.0);

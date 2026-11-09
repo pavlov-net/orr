@@ -2443,24 +2443,27 @@ fn a_matrix_row_extracts_through_node_definition_ids() {
     assert!(near(m.specular_roughness, 0.6), "{}", m.specular_roughness);
 }
 
-/// OpenPBR Metadata asks for "the floating-point conversion factor from the parameters given in
-/// world space length units to meters", which `metersPerUnit` is on a stage. OpenPBR states
-/// `thin_film_thickness` in micrometers, which no stage changes.
+/// OpenPBR Metadata: "If no unit is given, the length is assumed to be in centimeters", and
+/// `thin_film_thickness` "is always in micrometers". A stage's `metersPerUnit` is the unit of its
+/// geometry, not of these parameters.
 #[test]
-fn open_pbr_lengths_read_in_the_stage_metric() {
+fn open_pbr_lengths_read_in_centimeters_on_any_stage() {
     let surface = "token outputs:mtlx:surface.connect = </M/S.outputs:out>";
     let inputs = "float inputs:transmission_depth = 2
         float inputs:thin_film_weight = 1
         float inputs:thin_film_thickness = 0.5";
     let body = mtlx_material(surface, &open_pbr(inputs));
-    let m = material(&cook_centimeters("stage-lengths", &body, &[]));
-    assert!(near(m.transmission_depth, 0.02), "{}", m.transmission_depth);
-    assert_eq!(m.thin_film_thickness, 500.0);
-    // The nodedef's default radius of 1 is a length like any other.
-    assert!(near(m.subsurface_radius, 0.01), "{}", m.subsurface_radius);
+    for m in [
+        material(&cook("meter-stage-lengths", &body)),
+        material(&cook_centimeters("stage-lengths", &body, &[])),
+    ] {
+        assert!(near(m.transmission_depth, 0.02), "{}", m.transmission_depth);
+        assert_eq!(m.thin_film_thickness, 500.0);
+        assert!(near(m.subsurface_radius, 0.01), "{}", m.subsurface_radius);
+    }
 
     let body = mtlx_material(surface, &open_pbr("float inputs:subsurface_radius = 3"));
-    let m = material(&cook_centimeters("stage-radius", &body, &[]));
+    let m = material(&cook("meter-stage-radius", &body));
     assert!(near(m.subsurface_radius, 0.03), "{}", m.subsurface_radius);
 }
 

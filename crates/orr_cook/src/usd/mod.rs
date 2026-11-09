@@ -6,7 +6,7 @@
 //! selections of [`UsdSettings::variants`] in a session layer; any composition error fails
 //! the import. Values are read at [`UsdSettings::time`]. The stage's `upAxis` and
 //! `metersPerUnit` (0.01 when unauthored, as USD's) turn stage space into scene space (Y
-//! up, meters), and `metersPerUnit` is the length unit of materials. Inactive prims (and their
+//! up, meters), and `metersPerUnit` is the length unit of displacements. Inactive prims (and their
 //! subtrees) are not read, and prims under a `class` or `over` are read only as prototypes. An
 //! Imageable prim that is `invisible`, or has an effective purpose of `guide` or `proxy`, is not
 //! drawn: invisibility holds for the subtree, and a prim takes the purpose of the nearest

@@ -53,12 +53,12 @@
 //! hold what they state. Coordinate nodes set each slot's `Material::uv_transforms`,
 //! conjugated by the flip of t between st and the cook's top-left uvs.
 //!
-//! A value that states a [`Unit`] converts to meters or degrees. `transmission_depth`,
-//! `subsurface_radius` (its default too) and both kinds of `displacement` are lengths: without a
-//! unit they are in the scene's length unit ([`Host::meters_per_unit`]). They are world space
-//! lengths, so no object scale enters them, and a displacement keeps its length under a
-//! placement's scale ([`Material::displacement_world`]). `thin_film_thickness` without a unit is
-//! in micrometers, as OpenPBR states it, whatever the scene's unit.
+//! A value that states a [`Unit`] converts to meters or degrees. Without one, `transmission_depth`
+//! and `subsurface_radius` are in centimeters and `thin_film_thickness` in micrometers, as OpenPBR
+//! states them, whatever the scene's unit. Both kinds of `displacement` are not OpenPBR inputs:
+//! without a unit they are in the scene's length unit ([`Host::meters_per_unit`]). Depths, radii
+//! and displacements are world space lengths, so no object scale enters them, and a displacement
+//! keeps its length under a placement's scale ([`Material::displacement_world`]).
 //!
 //! A texture whose file can't be read, or which names none, reads what its node states for that
 //! everywhere: `UsdUVTexture` `fallback`, default (0, 0, 0, 1), taking the texture's place in
@@ -144,6 +144,9 @@ impl Unit {
 fn scaled(v: f32, by: f64) -> f32 {
     (f64::from(v) * by) as f32
 }
+
+/// Meters per unit of an `open_pbr_surface` length that states no unit: OpenPBR's centimeter.
+const SURFACE_LENGTH: f64 = 0.01;
 
 /// What a `constant` or `dot` without a value reads.
 static ZERO: LazyLock<Input> = LazyLock::new(|| Input::Value(vec![0.0], Unit::Unstated));
@@ -328,7 +331,7 @@ pub(crate) fn fold_stream_scales(m: &mut Material, reads: &[VertexRead]) {
 
 /// What mapping asks of the scene a material lands in.
 pub(crate) struct Host<'a> {
-    /// The scene's length unit, which a length that states none is in.
+    /// The scene's length unit, which a displacement that states none is in.
     pub(crate) meters_per_unit: f64,
     /// The mesh primvar of each uv set, which geometric properties name.
     pub(crate) primvars: &'a [&'a str],
@@ -1425,22 +1428,6 @@ impl Mapper<'_, '_> {
         Ok(())
     }
 
-    /// A length field, in meters. Its default is a length in the scene's unit as well.
-    fn length(
-        &mut self,
-        n: usize,
-        input: &str,
-        field: fn(&mut Material) -> &mut f32,
-    ) -> Result<(), String> {
-        let (v, unit) = match self.value(n, input)? {
-            None => (*field(&mut self.material), Unit::Unstated),
-            Some(Value::Constant(v, unit)) => (v[0], unit),
-            Some(Value::Texture(_) | Value::Vertex { .. }) => return Err(self.no_slot(n, input)),
-        };
-        *field(&mut self.material) = scaled(v, self.meters(n, input, unit)?);
-        Ok(())
-    }
-
     /// A color field, set or bound like [`Self::scalar`].
     fn color(
         &mut self,
@@ -1695,10 +1682,10 @@ impl Mapper<'_, '_> {
         for &(name, field, slot) in colors {
             self.color(n, name, field, slot)?;
         }
-        self.textured_length(n, "transmission_depth", slot::TRANSMISSION_DEPTH, |m| {
+        self.surface_length(n, "transmission_depth", slot::TRANSMISSION_DEPTH, |m| {
             &mut m.transmission_depth
         })?;
-        self.textured_length(n, "subsurface_radius", slot::SUBSURFACE_RADIUS, |m| {
+        self.surface_length(n, "subsurface_radius", slot::SUBSURFACE_RADIUS, |m| {
             &mut m.subsurface_radius
         })?;
         self.film_thickness(n)?;
@@ -1798,15 +1785,18 @@ impl Mapper<'_, '_> {
         Ok(())
     }
 
-    /// A length input with a slot: [`Self::length`], or a texture that multiplies the field.
-    fn textured_length(
+    /// A length input of `open_pbr_surface`, in meters: a constant sets the field, and a texture
+    /// binds slot `s` and multiplies it. A value without a unit is in centimeters.
+    fn surface_length(
         &mut self,
         n: usize,
         input: &str,
         s: usize,
         field: fn(&mut Material) -> &mut f32,
     ) -> Result<(), String> {
-        match self.value(n, input)? {
+        let (value, unit, texture) = match self.value(n, input)? {
+            None => return Ok(()),
+            Some(Value::Constant(v, unit)) => (v[0], unit, None),
             Some(Value::Texture(t)) => {
                 if t.channels == Channels::Rgb {
                     return Err(format!(
@@ -1815,12 +1805,19 @@ impl Mapper<'_, '_> {
                     ));
                 }
                 let (r, value) = t.scalar();
-                *field(&mut self.material) = scaled(value, self.meters(n, input, t.unit)?);
-                self.textures.more.insert(s, Some(r));
-                Ok(())
+                (value, t.unit, Some(r))
             }
-            _ => self.length(n, input, field),
+            Some(Value::Vertex { .. }) => return Err(self.no_slot(n, input)),
+        };
+        let meters = match unit {
+            Unit::Unstated => SURFACE_LENGTH,
+            stated => self.meters(n, input, stated)?,
+        };
+        *field(&mut self.material) = scaled(value, meters);
+        if let Some(r) = texture {
+            self.textures.more.insert(s, Some(r));
         }
+        Ok(())
     }
 
     /// `thin_film_thickness`, in nanometers, whose values without a unit are in micrometers.

@@ -62,7 +62,7 @@ pub mod filter {
     pub const ONE_MIP: u8 = 1 << 3;
 }
 
-/// OpenPBR 1.1.1 parameters of one material, as authored: colors linear Rec.709, lengths
+/// OpenPBR 1.1.2 parameters of one material, as authored: colors linear Rec.709, lengths
 /// in world space meters, thin-film thickness in nanometers, emission luminance in nits, angles
 /// in radians. The displacement fields are the exception: lengths in mesh space, unless
 /// [`Self::displacement_world`] says otherwise.
@@ -336,7 +336,7 @@ impl Material {
     }
 }
 
-/// The OpenPBR 1.1.1 defaults, opaque, single-sided, no textures.
+/// The OpenPBR 1.1.2 defaults, opaque, single-sided, no textures.
 impl Default for Material {
     fn default() -> Self {
         Self {
@@ -353,7 +353,7 @@ impl Default for Material {
             subsurface_color: [0.8; 3],
             subsurface_weight: 0.0,
             subsurface_radius_scale: [1.0, 0.5, 0.25],
-            subsurface_radius: 1.0,
+            subsurface_radius: 0.01,
             coat_color: [1.0; 3],
             coat_weight: 0.0,
             fuzz_color: [1.0; 3],

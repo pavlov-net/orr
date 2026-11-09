@@ -15,7 +15,7 @@ pub(crate) const GDEFLATE_LEVEL: i32 = 12;
 const VERSIONS: &[(Class, u32)] = &[
     (Class::Mesh, 16),
     (Class::Texture, 7),
-    (Class::Material, 10),
+    (Class::Material, 11),
     (Class::Model, 3),
     (Class::InstancePage, 6),
     (Class::RasterSet, 2),
