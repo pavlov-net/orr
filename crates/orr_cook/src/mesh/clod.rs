@@ -261,65 +261,40 @@ fn partition(
     offsets
 }
 
-/// What [`lock_boundary`] keeps between levels, so it clears nothing: per position, the last
-/// group to use it, numbered on across levels, and the last level in which two groups used
-/// it.
-struct Owners {
-    group: Vec<u32>,
-    shared: Vec<u32>,
-    /// Groups numbered so far, and levels.
-    groups: u32,
-    levels: u32,
-}
-
-impl Owners {
-    fn new(n: usize) -> Self {
-        Self {
-            group: vec![0; n],
-            shared: vec![0; n],
-            groups: 0,
-            levels: 0,
-        }
-    }
-}
+/// [`lock_boundary`]'s mark on a position some group of the level has used.
+const USED: u8 = 0x80;
 
 /// Locks the positions groups share, and keeps protect bits and the mesh's own locks: each
 /// vertex takes its position's lock, and the lock the mesh puts on the position's first
-/// vertex, which `remap` gives.
+/// vertex, which `remap` gives. `marks` is scratch of a byte per vertex: a byte, so the
+/// random access of a level's corners stays in cache.
 fn lock_boundary(
     locks: &mut [u8],
-    owners: &mut Owners,
+    marks: &mut [u8],
     clusters: &[Cluster],
     offsets: &[u32],
     indices: &[u32],
     remap: &[u32],
     mesh_lock: &[u8],
 ) {
-    // This level's groups number past every earlier one, so a lower number is stale.
-    let first = owners.groups;
-    owners.levels += 1;
-    let level = owners.levels;
-    for (gi, g) in offsets.windows(2).enumerate() {
-        let id = first + gi as u32 + 1;
-        for k in &clusters[g[0] as usize..g[1] as usize] {
-            for &v in &indices[k.index_offset..k.index_offset + k.index_count] {
-                let r = remap[v as usize] as usize;
-                let owner = &mut owners.group[r];
-                if *owner <= first {
-                    *owner = id;
-                } else if *owner != id {
-                    owners.shared[r] = level;
-                }
-            }
+    const { assert!(USED >> 7 == LOCK) };
+    marks.fill(0);
+    for g in offsets.windows(2) {
+        let group = &clusters[g[0] as usize..g[1] as usize];
+        let corners = || group.iter().flat_map(|k| k.corners(indices));
+        // A position an earlier group used is shared.
+        for &v in corners() {
+            let m = &mut marks[remap[v as usize] as usize];
+            *m |= *m >> 7;
+        }
+        for &v in corners() {
+            marks[remap[v as usize] as usize] |= USED;
         }
     }
-    owners.groups = first + offsets.len().saturating_sub(1) as u32;
-    let shared = &owners.shared;
-    locks.par_iter_mut().light().enumerate().for_each(|(i, l)| {
+    for (i, l) in locks.iter_mut().enumerate() {
         let r = remap[i] as usize;
-        let lock = if shared[r] == level { LOCK } else { 0 };
-        *l = lock | (mesh_lock[r] & LOCK) | (*l & PROTECT) | mesh_lock[i];
-    });
+        *l = (marks[r] & LOCK) | (mesh_lock[r] & LOCK) | (*l & PROTECT) | mesh_lock[i];
+    }
 }
 
 fn simplify_fallback(
@@ -563,7 +538,7 @@ pub(super) fn build<G: Send>(
         "a position remap entry per vertex"
     );
     let mut locks = vec![0u8; vertex_count];
-    let mut owners = Owners::new(vertex_count);
+    let mut marks = vec![0u8; vertex_count];
     let positions = Positions(positions.as_mut_ptr(), positions.len());
     let mut out = Vec::new();
 
@@ -590,7 +565,7 @@ pub(super) fn build<G: Send>(
         let lock = crate::profile::zone!("clod.lock");
         lock_boundary(
             &mut locks,
-            &mut owners,
+            &mut marks,
             &clusters,
             &offsets,
             &cluster_indices,
