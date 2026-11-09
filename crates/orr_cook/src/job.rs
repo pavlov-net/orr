@@ -107,9 +107,7 @@ impl Meter {
     /// without the meter.
     pub(crate) fn peak(&self) -> Option<u64> {
         let peak = self.counter.peak.load(Ordering::Relaxed);
-        METERED
-            .load(Ordering::Relaxed)
-            .then_some(peak.max(0) as u64)
+        METERED.load(Ordering::Relaxed).then_some(peak as u64)
     }
 }
 
@@ -126,9 +124,7 @@ impl Drop for Meter {
 /// The most live bytes the meter counted over the process, `None` without it.
 pub(crate) fn total_peak() -> Option<u64> {
     let peak = TOTAL.peak.load(Ordering::Relaxed);
-    METERED
-        .load(Ordering::Relaxed)
-        .then_some(peak.max(0) as u64)
+    METERED.load(Ordering::Relaxed).then_some(peak as u64)
 }
 
 /// The calling thread's job.
