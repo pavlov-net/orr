@@ -446,10 +446,18 @@ fn synthetic_pages_decode_alike_on_the_gpu() {
         MeshHeader::SKIN,
         MeshHeader::UV1,
         MeshHeader::TANGENT | MeshHeader::UV1 | MeshHeader::SKIN,
+        MeshHeader::TANGENT | MeshHeader::COLOR | MeshHeader::SKIN,
+        MeshHeader::TANGENT | MeshHeader::UV1 | MeshHeader::COLOR | MeshHeader::SKIN,
     ] {
         for entries in [0, 23] {
             let stride = mesh::attr_stride(attributes) as usize;
-            let p = synthetic(&mut rng, 24, stride, entries);
+            // The widest vertices fill a page in fewer clusters.
+            let clusters = if attributes & MeshHeader::COLOR != 0 {
+                16
+            } else {
+                24
+            };
+            let p = synthetic(&mut rng, clusters, stride, entries);
             stored.push(mesh::encode_page(&p).unwrap());
         }
     }
