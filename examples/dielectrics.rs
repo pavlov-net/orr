@@ -17,17 +17,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{
-    AddressMode, Allocation, Device, Filter, Format, MemoryKind, QueueKind, SamplerDesc, SpecData,
-    TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
+    Format, QueueKind, SpecData, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
-use orr::orr_lighting::EnvironmentMapGpu;
 use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     BoundTexture, ClusterTopology, CompilingKernels, DirectionalLight, DiscProfile, Display,
     DisplayRequest, FrameDesc, FrameTime, GroupWriter, HookPass, InstanceFlags, InstancesDesc,
-    Lens, Light, LightId, LitView, MaterialGpu, MountId, PackSource, ProducerId, Projection,
-    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
+    Lens, Light, LightId, LitView, MaterialGpu, PackSource, ProducerId, Projection, Renderer,
+    RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
     TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{
@@ -38,7 +36,9 @@ use orr_examples::field::{Slab, patch_triangles};
 use orr_examples::mesh::MeshBuilder;
 use orr_examples::shaders::slab;
 use orr_examples::window::Window;
-use orr_examples::{Capture, Options, Workers, assert_clean, device, fixed_time, mount_at};
+use orr_examples::{
+    Capture, Options, Workers, assert_clean, device, environment_map, fixed_time, mount_at,
+};
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, Vec3};
 
@@ -137,7 +137,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .model(mount, AssetId::from_name(name))
             .unwrap_or_else(|e| panic!("model {name}: {e}"))
     });
-    let environment = sky_environment(&renderer, gpu, mount);
+    let environment = environment_map(&renderer, gpu, mount, SKY, Affine3::IDENTITY);
     let slab_kernel = renderer
         .compute_pipeline(&slab::MODULE, "main", SpecData::default())
         .expect("slab pipeline");
@@ -499,35 +499,6 @@ fn write_sky(path: &Path) {
         }
     }
     std::fs::write(path, bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
-}
-
-/// The environment record of the sky cooked into `mount`, for `SceneWriter::set_environment`.
-fn sky_environment(
-    renderer: &Renderer,
-    gpu: &Device,
-    mount: MountId,
-) -> Allocation<EnvironmentMapGpu> {
-    let mut environment = gpu
-        .gpu_malloc::<EnvironmentMapGpu>(MemoryKind::Upload, 1, "sky environment")
-        .expect("environment");
-    environment.as_mut_slice().expect("environment")[0] = EnvironmentMapGpu {
-        map: renderer
-            .texture(mount, AssetId::from_name(SKY))
-            .expect("sky texture"),
-        sampler: gpu
-            .sampler(&SamplerDesc {
-                mag: Filter::Linear,
-                min: Filter::Linear,
-                mip: Filter::Linear,
-                address: [AddressMode::ClampToEdge; 3],
-                ..SamplerDesc::default()
-            })
-            .expect("sky sampler"),
-        intensity: 1.0,
-        primaries: orr_color::Primaries::Rec709.id().into(),
-        from_world: Affine3::IDENTITY.into(),
-    };
-    environment
 }
 
 /// Sky radiance in nits, linear Rec.709, along unit direction `d`.

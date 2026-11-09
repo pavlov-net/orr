@@ -387,16 +387,14 @@ fn print_row(r: &Value) {
 
 fn main() {
     let options = Options::from_args();
-    let value = |flag: &str| {
-        let at = options.rest.iter().position(|a| a == flag)?;
-        Some(options.rest[at + 1].clone())
-    };
-    let extent = value("--extent").map_or([1280, 720], |v| {
+    let extent = options.value("--extent").map_or([1280, 720], |v| {
         let (w, h) = v.split_once('x').expect("--extent WxH");
         [w.parse().expect("width"), h.parse().expect("height")]
     });
     let frames = options.frames.map_or(64, |n| n as u32);
-    let reference_frames = value("--reference-frames").map_or(512, |v| v.parse().expect("count"));
+    let reference_frames = options
+        .value("--reference-frames")
+        .map_or(512, |v| v.parse().expect("count"));
 
     let rev = git_rev();
     let images = report_dir().join(format!("quality-{rev}"));

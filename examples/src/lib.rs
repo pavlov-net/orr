@@ -10,7 +10,11 @@ use std::time::{Duration, Instant};
 
 #[cfg(dlss)]
 use orr::DlssSdk;
-use orr::orr_gpu::{Allocation, Device, DeviceDesc, Diagnostics, QueueRequest};
+use orr::orr_gpu::{
+    AddressMode, Allocation, Device, DeviceDesc, Diagnostics, Filter, MemoryKind, QueueRequest,
+    SamplerDesc,
+};
+use orr::orr_lighting::EnvironmentMapGpu;
 #[cfg(dlss)]
 use orr::orr_output::orr_dlss::Uuid;
 use orr::orr_pack::{Archive, AssetId};
@@ -292,6 +296,13 @@ impl Options {
         self.rest.iter().any(|a| a == flag)
     }
 
+    /// The argument after `flag` among the example's own arguments.
+    pub fn value(&self, flag: &str) -> Option<&str> {
+        let at = self.rest.iter().position(|a| a == flag)?;
+        let value = self.rest.get(at + 1);
+        Some(value.unwrap_or_else(|| panic!("{flag} takes a value")))
+    }
+
     /// `out`, or `<name>.png` beside the executable.
     pub fn out_path(&self, name: &str) -> PathBuf {
         self.out.clone().unwrap_or_else(|| {
@@ -426,6 +437,38 @@ pub fn mount_all_at(
         }
     }
     (mounts, frame)
+}
+
+/// The environment record of the Rec.709 map `name` cooked into `mount`, for
+/// `SceneWriter::set_environment`. `from_world` takes world directions into map space.
+pub fn environment_map(
+    renderer: &Renderer,
+    gpu: &Device,
+    mount: MountId,
+    name: &str,
+    from_world: orr_math::Affine3,
+) -> Allocation<EnvironmentMapGpu> {
+    let mut environment = gpu
+        .gpu_malloc::<EnvironmentMapGpu>(MemoryKind::Upload, 1, "environment")
+        .expect("environment");
+    environment.as_mut_slice().expect("environment")[0] = EnvironmentMapGpu {
+        map: renderer
+            .texture(mount, AssetId::from_name(name))
+            .expect("environment texture"),
+        sampler: gpu
+            .sampler(&SamplerDesc {
+                mag: Filter::Linear,
+                min: Filter::Linear,
+                mip: Filter::Linear,
+                address: [AddressMode::ClampToEdge; 3],
+                ..SamplerDesc::default()
+            })
+            .expect("environment sampler"),
+        intensity: 1.0,
+        primaries: orr_color::Primaries::Rec709.id().into(),
+        from_world: from_world.into(),
+    };
+    environment
 }
 
 /// Blob 0 of entry `id` in `archive`, decoded: the header a CPU reader parses.
