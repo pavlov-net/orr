@@ -1597,14 +1597,16 @@ struct PathStack
 
 // Whether next-event estimation at a vertex of depth `depth` whose rays leave from `origin`
 // reaches a directional light along `dir` through the plane stack `stack` the path crossed: its
-// probe meets a face parallel to the stack's first.
-bool stack_owns<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, PathStack stack, uint depth, bool dispersion)
+// probe meets a face parallel to the stack's first. The probe's alpha tests report texture
+// feedback with `feedback` (`HitContext.feedback`).
+bool stack_owns<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, PathStack stack, uint depth, bool dispersion, bool feedback)
 {
     if (!stack.valid || stack.crossed == 0)
         return false;
     float3 normal;
     RayCone cone = { 0.0, 0.0 };
-    return stack_probe<S>(s, v, origin, dir, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0), dispersion, normal)
+    HitContext context = hit_context(HIT_SECONDARY, depth + 1, cone, 0.0, float2(-1.0), feedback);
+    return stack_probe<CoverageFeedback<S>>(s, v, origin, dir, RAY_FLAG_NONE, context, dispersion, normal)
         && abs(dot(normal, stack.normal)) >= STACK_PARALLEL;
 }
 
@@ -1762,7 +1764,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             // Light that next-event estimation takes through a plane stack is not deposited.
             if (photon)
             {
-                if (chains > 0 && !medium_vertex && !leaving && !stack_owns<S>(s, v, vertex_origin(l.x, -start.dir), -start.dir, stack, depth, disperse))
+                if (chains > 0 && !medium_vertex && !leaving && !stack_owns<S>(s, v, vertex_origin(l.x, -start.dir), -start.dir, stack, depth, disperse, feedback))
                     record.deposit(r, l, b, spectral.color(throughput), rng);
                 if (!l.chains)
                     break;
@@ -2205,7 +2207,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                         continue;
                     // Through a plane stack next-event estimation at the vertex before it reaches
                     // the light too, by all of the vertex's lobes.
-                    if (stack_owns<S>(s, v, stack.origin, ray.dir, stack, stack.depth, disperse))
+                    if (stack_owns<S>(s, v, stack.origin, ray.dir, stack, stack.depth, disperse, feedback))
                     {
                         float jacobian = abs(dot(ray.dir, stack.normal)) / abs(dot(stack.dir, stack.normal));
                         e += d * mis_balance(stack.pdf * jacobian / (stack.ior * stack.ior), stack.run * nee_directional_pdf(set, stack.x_normal, id, ray.dir));
