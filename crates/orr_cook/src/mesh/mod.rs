@@ -381,14 +381,18 @@ impl SectionData {
         SurfaceClass::from_flags(self.flags) == Some(SurfaceClass::Opaque)
     }
 
-    /// Bytes the section's micromaps bake from for its opacity texture of mip 0 size `size`
-    /// under `settings`: the texture as a byte per texel, when they bake from it.
-    pub(crate) fn micromap_bytes(&self, settings: &MeshSettings, [w, h]: [u32; 2]) -> u64 {
-        let bakes = settings.omm.is_some()
-            && self.takes_micromaps()
-            && w <= OmmAlpha::MAX_SIZE
-            && h <= OmmAlpha::MAX_SIZE;
-        u64::from(bakes) * u64::from(w) * u64::from(h)
+    /// Bytes the section's micromaps bake from for its opacity texture, whose units' mip 0
+    /// sizes are `sizes`, under `settings`: each unit as a byte per texel, when they bake from
+    /// it, which is only when every unit fits the rasterizer.
+    pub(crate) fn micromap_bytes(&self, settings: &MeshSettings, sizes: &[[u32; 2]]) -> u64 {
+        let fits = |[w, h]: [u32; 2]| w <= OmmAlpha::MAX_SIZE && h <= OmmAlpha::MAX_SIZE;
+        let bakes =
+            settings.omm.is_some() && self.takes_micromaps() && sizes.iter().all(|&s| fits(s));
+        let texels: u64 = sizes
+            .iter()
+            .map(|&[w, h]| u64::from(w) * u64::from(h))
+            .sum();
+        u64::from(bakes) * texels
     }
 
     /// A section of `indices` drawn with material `m`, whose back is `back` where it has one

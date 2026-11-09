@@ -3348,9 +3348,8 @@ fn map_bytes(
         } = &m.opacity
         {
             add(texture, MapUse::Opacity(cutoff.to_bits()), &mut out);
-            for unit in texture.units() {
-                out.micromaps += s.micromap_bytes(settings, header(unit).mip_size(0));
-            }
+            let sizes: Vec<_> = texture.units().map(|u| header(u).mip_size(0)).collect();
+            out.micromaps += s.micromap_bytes(settings, &sizes);
         }
         if settings.tangent_error_max.is_some()
             && let NormalSpec::Texture { texture, .. } = &m.normal
