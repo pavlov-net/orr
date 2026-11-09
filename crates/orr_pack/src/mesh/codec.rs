@@ -13,8 +13,8 @@
 //!
 //! A vertex stream holds `vertex_count` vertices of `8 + attr_stride` bytes: the three u16
 //! grid offsets, a zero u16, then the vertex's attributes. The vertex codec is version 1,
-//! encoded at level 2: level 3 searches channel rotations and a third channel mode for a
-//! stream zstd then packs no smaller, at a third more encoding time. A triangle stream is
+//! encoded at level 2: level 3 adds a search over channel rotations and a third channel mode
+//! that the zstd pass after it all but cancels, for more encoding time. A triangle stream is
 //! the meshlet codec over triangles only.
 //!
 //! Every region of a page starts 4-aligned. `orr_pack.page_codec` decodes the same

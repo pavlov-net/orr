@@ -76,25 +76,24 @@ const DECODED_CACHES: u64 = 4;
 /// Peak bytes of a subdivision cage cook per cage face, an estimate.
 const SUBD_BYTES_PER_FACE: u64 = 16 << 10;
 
-/// Peak bytes of a discrete-level mesh cook per source triangle besides its maps (P2's
-/// clodBuild process peak, an upper bound).
+/// Peak bytes of a discrete-level mesh cook per source triangle besides its maps, an upper
+/// bound.
 const MESH_BYTES_PER_TRIANGLE: u64 = 480;
 
-/// Peak bytes of a DAG mesh cook per source triangle besides its maps: the most measured
-/// over the 9 to 32 million triangle meshes of a 302 million triangle scene, 164 B, and a
-/// tenth more.
+/// Peak bytes of a DAG mesh cook per source triangle besides its maps: the most measured on
+/// large meshes and a margin, since a job over its estimate takes working set others count
+/// on.
 const DAG_BYTES_PER_TRIANGLE: u64 = 180;
 
 /// Bytes a mesh cook holds per decoded texel channel of the maps its sections read
 /// ([`map_channels`]): an f32 each. Textures decode one at a time, each taking
 /// [`MAP_DECODE_BYTES_PER_CHANNEL`] more per channel while it decodes, while the mesh is read
-/// and before the geometry's peak. Both measured over the scene [`DAG_BYTES_PER_TRIANGLE`]
-/// names: 13 B per channel at most for a mesh with one map.
+/// and before the geometry's peak.
 const MAP_BYTES_PER_CHANNEL: u64 = 4;
 const MAP_DECODE_BYTES_PER_CHANNEL: u64 = 9;
 
 /// Peak bytes of reading a mesh per source triangle, which its maps decode beside: the most
-/// measured over the scene [`DAG_BYTES_PER_TRIANGLE`] names, 149 B.
+/// measured.
 const LOAD_BYTES_PER_TRIANGLE: u64 = 150;
 
 pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {

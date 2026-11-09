@@ -2517,9 +2517,9 @@ impl TextureJob {
     /// Estimated peak bytes. Passing every mip of a source's blocks through holds the source,
     /// its blocks and the texture's blobs as built and stored: 4 bytes per byte of the source
     /// or of its full chain of blocks, whichever is larger (a KTX2 source can hold them
-    /// zstd-compressed), and 4 MiB, the most measured over 480 such textures being 4 per
-    /// output byte and 3.2 MiB. Otherwise 8 per compressed source byte for the decoded sources
-    /// and 48 per output texel for the packed image and its chain, over the 42 measured.
+    /// zstd-compressed), and 4 MiB, the most measured rounded up. Otherwise 8 per compressed
+    /// source byte for the decoded sources and 48 per output texel for the packed image and its
+    /// chain.
     pub(crate) fn working_set(&self, images: &[ImageFile]) -> u64 {
         if let Some(p) = self.pass.filter(|p| p.all_mips) {
             // A half pass takes a BC4 texture from a BC5 source.
