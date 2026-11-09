@@ -647,7 +647,7 @@ pub(crate) fn start(loading: &Arc<Loading>, ring: bool, task: Arc<MountTask>, so
                         let range = Archive::index_range(head.as_slice())?;
                         drop(head);
                         let mut index = buffers.take(range.len as usize);
-                        file.reads.read(0, &mut index)?;
+                        file.reads.read(range.offset, &mut index)?;
                         open_index(t, &file, &path, &index, range.len)
                     });
                 });
@@ -681,7 +681,7 @@ fn read_head(loading: &Arc<Loading>, task: Arc<MountTask>, file: Arc<ArchiveFile
             let (range, l) = range;
             let index = Read {
                 file: Arc::clone(&f.reads),
-                offset: 0,
+                offset: range.offset,
                 len: (range.len as usize).next_multiple_of(SECTOR),
                 into: None,
                 done: Box::new(move |r| match r {

@@ -7,15 +7,16 @@ pub(crate) const MAGIC: [u8; 8] = *b"ORRPACK\0";
 pub(crate) const PAGE: u64 = 4096;
 pub(crate) const MOUNT_ALIGN: usize = 16;
 
-/// First 128 bytes of an archive. The table of contents follows in this order: entries,
-/// blobs, chunks, names; then the mount section at 16-byte alignment, then zeros up to
-/// `index_len`.
+/// First 128 bytes of an archive, alone in its first 4096 bytes. Payload blobs follow, and the
+/// index range ends the archive: a copy of the header, the table of contents in this order:
+/// entries, blobs, chunks, names; then the mount section at 16-byte alignment, then zeros up
+/// to `index_len`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Header {
     pub magic: [u8; 8],
     pub version: u32,
-    /// Length of the index range at offset 0, a multiple of 4096.
+    /// Length of the index range at the end of the archive, a multiple of 4096.
     pub index_len: u32,
     /// Length of the whole archive, a multiple of 4096.
     pub file_len: u64,
@@ -23,6 +24,7 @@ pub struct Header {
     pub blob_count: u32,
     pub chunk_count: u32,
     pub names_len: u32,
+    /// Offset of the mount section in the index range.
     pub mount_offset: u32,
     pub mount_len: u32,
     /// blake3 of the bytes from the end of the header to `mount_offset`.
@@ -58,7 +60,8 @@ pub struct Entry {
 }
 
 /// One blob (24 bytes). Payload blobs start on a 4096-byte boundary; mount blobs sit in the
-/// index range at 16-byte alignment. Identical blobs share their stored bytes.
+/// index range's mount section at 16-byte alignment. Identical blobs share their stored
+/// bytes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct Blob {
@@ -87,6 +90,13 @@ const _: () = {
     assert!(size_of::<Entry>() == 128);
     assert!(size_of::<Blob>() == 24);
 };
+
+impl Header {
+    /// Offset of the index range: the end of the payload.
+    pub fn index_offset(&self) -> u64 {
+        self.file_len - u64::from(self.index_len)
+    }
+}
 
 impl Blob {
     pub fn codec(&self) -> Codec {
@@ -203,7 +213,7 @@ pub(crate) fn read_header(head: &[u8]) -> Result<Header> {
     if h.index_len == 0
         || !u64::from(h.index_len).is_multiple_of(PAGE)
         || !h.file_len.is_multiple_of(PAGE)
-        || h.file_len < u64::from(h.index_len)
+        || h.file_len < PAGE + u64::from(h.index_len)
     {
         return Err(Error::Malformed("index or file length"));
     }
@@ -245,7 +255,8 @@ pub(crate) fn validate(h: &Header, index: &[u8]) -> Result<Layout> {
             return Err(Error::Malformed("entry name"));
         }
     }
-    let mount = u64::from(h.mount_offset)..u64::from(h.mount_offset) + u64::from(h.mount_len);
+    let mount = h.index_offset() + u64::from(h.mount_offset);
+    let mount = mount..mount + u64::from(h.mount_len);
     for b in blobs {
         let first = b.first_chunk as usize;
         let Some(cs) = chunks.get(first..first + usize::from(b.chunk_count)) else {
@@ -292,7 +303,7 @@ pub(crate) fn validate(h: &Header, index: &[u8]) -> Result<Layout> {
         let placed = if b.is_mount() {
             b.offset >= mount.start && end <= mount.end
         } else {
-            b.offset.is_multiple_of(PAGE) && b.offset >= u64::from(h.index_len) && end <= h.file_len
+            b.offset.is_multiple_of(PAGE) && b.offset >= PAGE && end <= h.index_offset()
         };
         if !placed {
             return Err(Error::Malformed("blob outside its section"));

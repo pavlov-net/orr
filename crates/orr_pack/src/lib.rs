@@ -1,7 +1,8 @@
 //! Cooked asset archives: the container format, asset identity and the readers and writer.
 //!
-//! An archive starts with one 4 KiB-aligned index range (header, table of contents and the
-//! mount section), followed by 4 KiB-aligned payload blobs. Each asset is an [`Entry`] with
+//! An archive starts with its header in a 4 KiB page, then 4 KiB-aligned payload blobs, and
+//! ends with one 4 KiB-aligned index range (a copy of the header, the table of contents and
+//! the mount section), so a writer streams the payload and appends the index. Each asset is an [`Entry`] with
 //! one or more [`Blob`]s; blobs are compressed per chunk so a chunk reads and decodes alone.
 
 mod archive;

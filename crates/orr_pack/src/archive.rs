@@ -60,7 +60,10 @@ impl Bytes {
 /// A mounted archive: its index range in memory, plus either the open file or the whole
 /// archive in memory. `Send + Sync`; every read takes `&self`.
 pub struct Archive {
+    /// The index range, or the whole archive in memory.
     bytes: Bytes,
+    /// Where the index range starts in `bytes`.
+    index_at: usize,
     file: Option<(File, PathBuf)>,
     header: Header,
     layout: Layout,
@@ -70,12 +73,12 @@ impl Archive {
     /// Bytes to read first: enough to find the index range.
     pub const HEAD_LEN: usize = 4096;
 
-    /// The index range (header, table of contents and mount section) from the first
+    /// The index range (header copy, table of contents and mount section) from the first
     /// [`Archive::HEAD_LEN`] bytes, or fewer if the archive is shorter.
     pub fn index_range(head: &[u8]) -> Result<StoredRange> {
         let h = read_header(head)?;
         Ok(StoredRange {
-            offset: 0,
+            offset: h.index_offset(),
             len: h.index_len,
             skip: 0,
         })
@@ -104,9 +107,15 @@ impl Archive {
             });
         }
         let bytes = Bytes::shared(bytes);
-        let layout = validate(&header, &bytes.get()[..header.index_len as usize])?;
+        let index_at = header.index_offset() as usize;
+        let index = &bytes.get()[index_at..header.file_len as usize];
+        if read_header(index)?.file_len != header.file_len {
+            return Err(Error::CorruptToc);
+        }
+        let layout = validate(&header, index)?;
         Ok(Self {
             bytes,
+            index_at,
             file: None,
             header,
             layout,
@@ -120,7 +129,7 @@ impl Archive {
         let n = orr_io::read_at(&file, 0, &mut head)?;
         let range = Self::index_range(&head[..n])?;
         let mut index = vec![0; range.len as usize].into_boxed_slice();
-        read_exact(&file, 0, &mut index)?;
+        read_exact(&file, range.offset, &mut index)?;
         Self::with_file(file, path, index)
     }
 
@@ -136,6 +145,7 @@ impl Archive {
         let layout = validate(&header, &index)?;
         Ok(Self {
             bytes: Bytes::boxed(index),
+            index_at: 0,
             file: Some((file, path.to_owned())),
             header,
             layout,
@@ -149,7 +159,12 @@ impl Archive {
     /// Every entry, sorted by id.
     pub fn entries(&self) -> &[Entry] {
         let l = self.layout;
-        bytemuck::cast_slice(&self.bytes.get()[l.entries..l.blobs])
+        bytemuck::cast_slice(&self.index()[l.entries..l.blobs])
+    }
+
+    /// The index range.
+    fn index(&self) -> &[u8] {
+        &self.bytes.get()[self.index_at..self.index_at + self.header.index_len as usize]
     }
 
     pub fn find(&self, id: AssetId) -> Option<&Entry> {
@@ -182,13 +197,13 @@ impl Archive {
 
     pub fn blobs(&self, e: &Entry) -> &[Blob] {
         let l = self.layout;
-        let all: &[Blob] = bytemuck::cast_slice(&self.bytes.get()[l.blobs..l.chunks]);
+        let all: &[Blob] = bytemuck::cast_slice(&self.index()[l.blobs..l.chunks]);
         &all[e.first_blob as usize..(e.first_blob + e.blob_count) as usize]
     }
 
     pub fn chunks(&self, b: &Blob) -> &[Chunk] {
         let l = self.layout;
-        let all: &[Chunk] = bytemuck::cast_slice(&self.bytes.get()[l.chunks..l.names]);
+        let all: &[Chunk] = bytemuck::cast_slice(&self.index()[l.chunks..l.names]);
         &all[b.first_chunk as usize..b.first_chunk as usize + usize::from(b.chunk_count)]
     }
 
@@ -196,7 +211,7 @@ impl Archive {
         let l = self.layout;
         let o = l.names + e.name.offset as usize;
         // The name table was checked to be UTF-8 and every name to lie on char boundaries.
-        std::str::from_utf8(&self.bytes.get()[o..o + e.name.len as usize]).unwrap_or_default()
+        std::str::from_utf8(&self.index()[o..o + e.name.len as usize]).unwrap_or_default()
     }
 
     /// Archive offset and stored length of the whole blob or of one chunk.
@@ -234,7 +249,13 @@ impl Archive {
             return None;
         }
         let (offset, len) = self.span(b, chunk);
-        Some(&self.bytes.get()[offset as usize..offset as usize + len as usize])
+        // Mount blobs sit in the index range, which a file archive holds alone.
+        let at = if b.is_mount() {
+            self.index_at + (offset - self.header.index_offset()) as usize
+        } else {
+            offset as usize
+        };
+        Some(&self.bytes.get()[at..at + len as usize])
     }
 
     /// Decodes stored bytes the caller already has. `stored` starts at the stored bytes of the

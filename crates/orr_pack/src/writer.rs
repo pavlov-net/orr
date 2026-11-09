@@ -264,24 +264,25 @@ pub struct ArchiveWriter {
 
 impl ArchiveWriter {
     pub fn create(target: Target) -> Result<Self> {
+        // The header's page comes first; finish writes it.
         let payload = match target {
-            Target::Memory => Payload::Memory(Vec::new()),
+            Target::Memory => Payload::Memory(vec![0; PAGE as usize]),
             Target::File(path) => {
                 let scratch = suffixed(&path, ".payload.tmp");
-                let out = BufWriter::with_capacity(
+                let mut out = BufWriter::with_capacity(
                     1 << 20,
                     File::options()
-                        .read(true)
                         .write(true)
                         .create(true)
                         .truncate(true)
                         .open(&scratch)?,
                 );
+                out.write_all(&[0; PAGE as usize])?;
                 Payload::File {
                     out,
                     scratch,
                     path,
-                    len: 0,
+                    len: PAGE,
                 }
             }
         };
@@ -475,7 +476,7 @@ impl ArchiveWriter {
         Ok(rec)
     }
 
-    /// Appends to the payload and pads it to 4096 bytes; returns the payload-relative offset.
+    /// Appends to the payload and pads it to 4096 bytes; returns the archive offset.
     fn write_payload(&mut self, bytes: &[u8]) -> Result<u64> {
         let pad = &[0; PAGE as usize][..bytes.len().next_multiple_of(PAGE as usize) - bytes.len()];
         Ok(match self.payload.as_mut().expect("writer is live") {
@@ -495,10 +496,10 @@ impl ArchiveWriter {
         })
     }
 
-    /// Writes the index range and completes the archive. A file target's payload file gets
-    /// the index in front of it in place, is synced and renamed over the path; readers that
-    /// opened the old file with delete sharing keep reading the old bytes. Returns the bytes
-    /// for a memory target.
+    /// Writes the index range after the payload and the header in front, and completes the
+    /// archive. A file target's payload file is synced and renamed over the path; readers
+    /// that opened the old file with delete sharing keep reading the old bytes. Returns the
+    /// bytes for a memory target.
     pub fn finish(mut self) -> Result<Option<Arc<[u8]>>> {
         let l = Layout::new(
             self.entries.len(),
@@ -507,12 +508,13 @@ impl ArchiveWriter {
             self.names.len(),
             self.mount.len(),
         );
-        for b in &mut self.blobs {
-            b.offset += if b.is_mount() {
-                l.mount as u64
-            } else {
-                l.index_len as u64
-            };
+        let payload = self.payload.take().expect("writer is live");
+        let index_offset = match &payload {
+            Payload::Memory(v) => v.len() as u64,
+            Payload::File { len, .. } => *len,
+        };
+        for b in self.blobs.iter_mut().filter(|b| b.is_mount()) {
+            b.offset += index_offset + l.mount as u64;
         }
         self.entries.sort_unstable_by_key(|e| e.id);
 
@@ -523,16 +525,11 @@ impl ArchiveWriter {
         index[l.names..l.names + self.names.len()].copy_from_slice(self.names.as_bytes());
         index[l.mount..l.mount + self.mount.len()].copy_from_slice(&self.mount);
 
-        let payload = self.payload.take().expect("writer is live");
-        let payload_len = match &payload {
-            Payload::Memory(v) => v.len() as u64,
-            Payload::File { len, .. } => *len,
-        };
         let header = Header {
             magic: MAGIC,
             version: FORMAT_VERSION,
             index_len: l.index_len as u32,
-            file_len: l.index_len as u64 + payload_len,
+            file_len: index_offset + l.index_len as u64,
             entry_count: self.entries.len() as u32,
             blob_count: self.blobs.len() as u32,
             chunk_count: self.chunks.len() as u32,
@@ -545,9 +542,10 @@ impl ArchiveWriter {
         index[..HEADER_LEN].copy_from_slice(bytemuck::bytes_of(&header));
 
         match payload {
-            Payload::Memory(v) => {
-                index.extend_from_slice(&v);
-                Ok(Some(index.into()))
+            Payload::Memory(mut v) => {
+                v.extend_from_slice(&index);
+                v[..HEADER_LEN].copy_from_slice(&index[..HEADER_LEN]);
+                Ok(Some(v.into()))
             }
             Payload::File {
                 out, scratch, path, ..
@@ -570,29 +568,14 @@ impl Drop for ArchiveWriter {
     }
 }
 
-/// Puts `index` in front of the payload in the payload's own file, moving the payload up
-/// from its end down in place so the disk never holds it twice, then renames the file to
-/// `path` through `<path>.tmp`.
+/// Appends `index` to the payload in the payload's own file and writes its header over the
+/// first page, then renames the file to `path` through `<path>.tmp`.
 fn write_file(path: &Path, scratch: &Path, index: &[u8], payload: BufWriter<File>) -> Result<()> {
-    let mut f = payload
-        .into_inner()
-        .map_err(io::IntoInnerError::into_error)?;
-    let len = f.seek(io::SeekFrom::End(0))?;
-    let shift = index.len() as u64;
-    let mut buf = vec![0u8; 8 << 20];
-    let mut end = len;
-    while end > 0 {
-        let n = (buf.len() as u64).min(end);
-        let start = end - n;
-        let chunk = &mut buf[..n as usize];
-        f.seek(io::SeekFrom::Start(start))?;
-        io::Read::read_exact(&mut f, chunk)?;
-        f.seek(io::SeekFrom::Start(start + shift))?;
-        f.write_all(chunk)?;
-        end = start;
-    }
+    let mut out = payload;
+    out.write_all(index)?;
+    let mut f = out.into_inner().map_err(io::IntoInnerError::into_error)?;
     f.seek(io::SeekFrom::Start(0))?;
-    f.write_all(index)?;
+    f.write_all(&index[..HEADER_LEN])?;
     f.sync_all()?;
     drop(f);
     // The finished archive waits at `<path>.tmp` when the path cannot be replaced.

@@ -187,7 +187,7 @@ fn inspect(args: &[String]) -> Result<bool> {
         h.chunk_count,
         h.index_len,
         h.mount_len,
-        h.file_len - u64::from(h.index_len)
+        h.index_offset() - Archive::HEAD_LEN as u64
     )?;
     writeln!(
         out,

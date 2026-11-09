@@ -534,7 +534,7 @@ fn truncated_archives_fail() {
     let index_len = Archive::index_range(&bytes[..Archive::HEAD_LEN])
         .unwrap()
         .len as usize;
-    let short: Arc<[u8]> = bytes[..index_len * 3 / 4].into();
+    let short: Arc<[u8]> = bytes[..bytes.len() - index_len / 4].into();
     let path = write_pack("short.orr", &short);
     for positioned_reads in [false, true] {
         let desc = RendererDesc {

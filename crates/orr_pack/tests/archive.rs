@@ -317,7 +317,10 @@ fn damaged_archives_fail_by_name() {
     let from = |v: Vec<u8>| Archive::from_memory(v.into());
 
     let mut toc = good.to_vec();
-    toc[200] ^= 1;
+    let index = Archive::index_range(&good[..Archive::HEAD_LEN])
+        .unwrap()
+        .offset;
+    toc[index as usize + 200] ^= 1;
     assert!(matches!(from(toc), Err(Error::CorruptToc)));
 
     let short = good[..good.len() - 4096].to_vec();
@@ -386,7 +389,9 @@ fn many_entries_open_from_the_index_range() {
 
     let file = std::fs::read(&path).unwrap();
     let range = Archive::index_range(&file[..Archive::HEAD_LEN]).unwrap();
-    let index = file[..range.len as usize].to_vec().into_boxed_slice();
+    let index = file[range.offset as usize..][..range.len as usize]
+        .to_vec()
+        .into_boxed_slice();
     let a = Archive::from_index(&path, index).unwrap();
     assert_eq!(a.entries().len(), 100_000);
     for i in [0u32, 1, 4242, 99_999] {
