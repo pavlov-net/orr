@@ -525,25 +525,31 @@ pub(super) fn displacement_seams(
 /// as often in one direction as in the other.
 pub(super) fn closed(w: &Welded, grid: &Grid, s: usize) -> bool {
     let _z = crate::profile::zone!("mesh.closed");
-    // Directed edges between position ids, from triangles over three positions.
+    assert!(
+        grid.reps.len() <= 1 << 31,
+        "edge keys hold two position ids of 31 bits"
+    );
+    // Edges between position ids, from triangles over three positions: the lower id, the
+    // higher, and the direction in the lowest bit.
     let mut edges: Vec<u64> = w
         .section_triangles(s)
         .map(|t| t.map(|v| grid.reps[v as usize]))
         .filter(|p| p[0] != p[1] && p[1] != p[2] && p[0] != p[2])
-        .flat_map(|p| (0..3).map(move |i| u64::from(p[i]) << 32 | u64::from(p[(i + 1) % 3])))
+        .flat_map(|p| {
+            (0..3).map(move |i| {
+                let (a, b) = (p[i], p[(i + 1) % 3]);
+                u64::from(a.min(b)) << 33 | u64::from(a.max(b)) << 1 | u64::from(a > b)
+            })
+        })
         .collect();
     if edges.is_empty() {
         return false;
     }
     edges.par_sort_unstable();
-    let count = |e: u64| {
-        let start = edges.partition_point(|&x| x < e);
-        edges[start..].partition_point(|&x| x == e)
-    };
-    // Each run of equal edges, at its first, against the run of the edge reversed.
-    (0..edges.len()).into_par_iter().all(|i| {
-        let e = edges[i];
-        (i > 0 && edges[i - 1] == e) || count(e) == count(e.rotate_left(32))
+    // Each edge's run holds its uses one way, then the other: as many of each.
+    edges.chunk_by(|a, b| a >> 1 == b >> 1).all(|run| {
+        let back = run.iter().filter(|&&e| e & 1 == 1).count();
+        2 * back == run.len()
     })
 }
 
