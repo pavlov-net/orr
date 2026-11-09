@@ -480,6 +480,23 @@ impl<'d> Data<'d> {
     /// An accessor as `count` rows of `n` floats: normalized integers map to 0..1 or -1..1,
     /// other integers to their value; components past the accessor's read 0.
     pub(crate) fn floats(&self, a: &gltf::Accessor<'_>, n: usize) -> Result<Vec<f32>, String> {
+        let mut out = vec![0.0; a.count() * n];
+        self.read_floats(a, n, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Self::floats`] as rows of `K`.
+    pub(crate) fn rows<const K: usize>(
+        &self,
+        a: &gltf::Accessor<'_>,
+    ) -> Result<Vec<[f32; K]>, String> {
+        let mut out = vec![[0.0; K]; a.count()];
+        self.read_floats(a, K, out.as_flattened_mut())?;
+        Ok(out)
+    }
+
+    /// Reads [`Self::floats`] into `out`, which holds its `count * n` floats.
+    fn read_floats(&self, a: &gltf::Accessor<'_>, n: usize, out: &mut [f32]) -> Result<(), String> {
         let comps = match a.dimensions() {
             Dimensions::Scalar => 1,
             Dimensions::Vec2 => 2,
@@ -502,7 +519,6 @@ impl<'d> Data<'d> {
                 }
             }
         };
-        let mut out = vec![0.0; a.count() * n];
         if let Some(v) = a.view() {
             let (data, stride) = self.view_elements(&v, a.size())?;
             let base = &data[a.offset()..];
@@ -514,8 +530,7 @@ impl<'d> Data<'d> {
                     }
                 });
         }
-        self.sparse_elements(a, |i, b| read(b, &mut out[i * n..(i + 1) * n]))?;
-        Ok(out)
+        self.sparse_elements(a, |i, b| read(b, &mut out[i * n..(i + 1) * n]))
     }
 
     /// Calls `replace` with the index and bytes of each sparse element of `a`.
