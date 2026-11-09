@@ -156,6 +156,8 @@ struct Unit<'m> {
     /// Units this one waits for.
     deps: Vec<usize>,
     working_set: u64,
+    /// The working set planned before anything cooked, which places the unit in the payload.
+    planned: u64,
     /// Source triangles of a mesh, for the report.
     triangles: u64,
     state: State,
@@ -444,6 +446,8 @@ struct Run<'m, 's> {
     /// Units the writer thread has not yet written, with the bytes of their entries held in
     /// memory.
     writing: HashMap<usize, u64>,
+    /// Entry reports of written units.
+    reports: HashMap<usize, Vec<report::EntryReport>>,
     window: u64,
 }
 
@@ -479,6 +483,7 @@ impl<'m, 's> Run<'m, 's> {
             map_users: Vec::new(),
             map_reads: HashMap::new(),
             writing: HashMap::new(),
+            reports: HashMap::new(),
             window: 0,
         };
         for (a, spec) in manifest.archives.iter().enumerate() {
@@ -749,13 +754,13 @@ impl<'m, 's> Run<'m, 's> {
             return Ok(false);
         }
         let mut links = Vec::with_capacity(record.units.len());
-        for &key in &record.units {
+        for (&key, &planned) in record.units.iter().zip(&record.planned) {
             match self.find_link(a, key) {
-                Some(l) => links.push((key, l)),
+                Some(l) => links.push((key, planned, l)),
                 None => return Ok(false),
             }
         }
-        for (key, (from, entries, outcome)) in links {
+        for (key, planned, (from, entries, outcome)) in links {
             let (mut name, class) = self.with_archive(a, &from, |arc| {
                 let e = &arc.entries()[entries[0]];
                 (arc.name(e).to_owned(), e.class)
@@ -775,6 +780,7 @@ impl<'m, 's> Run<'m, 's> {
                 work: None,
                 deps: Vec::new(),
                 working_set: 0,
+                planned,
                 triangles: 0,
                 state: State::Waiting,
                 mesh: None,
@@ -969,13 +975,20 @@ impl<'m, 's> Run<'m, 's> {
         }
     }
 
-    /// Adds units whose dependencies name units of the same list.
-    fn add_units(&mut self, a: usize, asset: usize, units: Vec<NewUnit<'m>>) -> Vec<Hash32> {
-        let mut keys = Vec::new();
+    /// Adds units whose dependencies name units of the same list; returns their keys and
+    /// planned working sets.
+    fn add_units(
+        &mut self,
+        a: usize,
+        asset: usize,
+        units: Vec<NewUnit<'m>>,
+    ) -> (Vec<Hash32>, Vec<u64>) {
+        let (mut keys, mut planned) = (Vec::new(), Vec::new());
         let mut deps = Vec::new();
         for nu in units {
             let key = self.stored(a, nu.key);
             keys.push(key);
+            planned.push(nu.working_set);
             deps.push(nu.deps);
             self.add(Unit {
                 archive: a,
@@ -986,6 +999,7 @@ impl<'m, 's> Run<'m, 's> {
                 work: Some(nu.work),
                 deps: Vec::new(),
                 working_set: nu.working_set,
+                planned: nu.working_set,
                 triangles: nu.triangles,
                 state: State::Waiting,
                 mesh: None,
@@ -998,7 +1012,7 @@ impl<'m, 's> Run<'m, 's> {
                 .map(|n| self.by_name[&(a, n.clone())])
                 .collect();
         }
-        keys
+        (keys, planned)
     }
 
     /// Registers assemblies of models just added to archive `a`.
@@ -1014,7 +1028,7 @@ impl<'m, 's> Run<'m, 's> {
             let imp = &self.imports[i];
             (imp.archive, imp.asset, imp.identity)
         };
-        let keys = self.add_units(a, asset, imported.units);
+        let (keys, planned) = self.add_units(a, asset, imported.units);
         for f in &imported.files {
             self.input(a, asset, &f.path);
         }
@@ -1026,6 +1040,7 @@ impl<'m, 's> Run<'m, 's> {
             identity,
             files: imported.files,
             units: keys,
+            planned,
             assemblies: imported.assemblies,
             warnings: imported.warnings,
         });
@@ -1240,10 +1255,11 @@ impl<'m, 's> Run<'m, 's> {
             deps.sort_unstable();
             deps.dedup();
             let key = self.stored(a, key.finish());
+            let working_set = src.records.len() as u64 * 256;
             if let Some((ra, r)) = record {
                 self.records[ra][r].units.push(key);
+                self.records[ra][r].planned.push(working_set);
             }
-            let working_set = src.records.len() as u64 * 256;
             self.add(Unit {
                 archive: a,
                 asset,
@@ -1253,6 +1269,7 @@ impl<'m, 's> Run<'m, 's> {
                 work: Some(Work::Instances(src, cell_log2, Catalog::new(), meshes)),
                 deps,
                 working_set,
+                planned: working_set,
                 triangles: 0,
                 state: State::Waiting,
                 mesh: None,
@@ -1357,7 +1374,8 @@ impl<'m, 's> Run<'m, 's> {
             order.sort_by(|&x, &y| {
                 let k = |u: usize| {
                     let unit = &self.units[u];
-                    (unit.class == Class::InstancePage as u16, unit.name.as_str())
+                    let instances = unit.class == Class::InstancePage as u16;
+                    (instances, Reverse(unit.planned), unit.name.as_str())
                 };
                 k(x).cmp(&k(y))
             });
@@ -1729,7 +1747,7 @@ impl<'m, 's> Run<'m, 's> {
     fn written(&mut self, u: usize, reports: Vec<report::EntryReport>) {
         let memory = self.writing.remove(&u).expect("sent to the writer");
         self.window -= memory;
-        self.assets[self.units[u].asset].entries.extend(reports);
+        self.reports.insert(u, reports);
         if self.map_users[u] == 0
             && let State::Written(Some(from)) =
                 std::mem::replace(&mut self.units[u].state, State::Written(None))
@@ -1758,8 +1776,23 @@ impl<'m, 's> Run<'m, 's> {
             mut assets,
             units,
             assemblies,
+            mut reports,
             ..
         } = self;
+        // Reports list each asset's entries by unit name, instance pages last.
+        let mut by_name: Vec<usize> = (0..units.len()).collect();
+        by_name.sort_by(|&x, &y| {
+            let k = |u: usize| {
+                let unit = &units[u];
+                (unit.class == Class::InstancePage as u16, unit.name.as_str())
+            };
+            k(x).cmp(&k(y))
+        });
+        for u in by_name {
+            if let Some(r) = reports.remove(&u) {
+                assets[units[u].asset].entries.extend(r);
+            }
+        }
         for (u, a) in assemblies {
             let asset = &mut assets[units[u].asset];
             let report = assembly_report(&a, &asset.entries);

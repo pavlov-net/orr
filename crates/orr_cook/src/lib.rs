@@ -96,9 +96,11 @@
 //! without cooking; an archive whose entries all match is left as it is. A file archive
 //! keeps `<archive>.cookstate` beside it: the hash of each input file by size and time, and
 //! the files and keys of each source, so a source whose files did not change is not even
-//! imported. Entries are written in a fixed order (sorted by name, instance pages last in
-//! Morton order of their cells), so the same inputs give the same bytes whatever the thread
-//! count, the target and the mix of cooked and linked entries.
+//! imported. Entries are written in a fixed order: by unit, instance pages last, then the
+//! largest planned working set first, then by name, a unit's instance pages in Morton order
+//! of their cells. So the same inputs give the same bytes whatever the thread count, the
+//! target and the mix of cooked and linked entries, and the payload follows the order jobs
+//! start in. The index and the report list entries by id and by name.
 
 mod alloc;
 mod assembly;

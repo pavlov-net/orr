@@ -15,7 +15,7 @@ use crate::assembly::Assembly;
 use crate::key::{from_hex, hex};
 use crate::{Error, Result};
 
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// Files modified this recently are not memoised: a write within the clock's resolution
 /// could keep size and time and change the bytes.
@@ -170,6 +170,8 @@ pub(crate) struct Record {
     pub(crate) files: Vec<Input>,
     #[serde(with = "hex_hashes")]
     pub(crate) units: Vec<Hash32>,
+    /// Per unit, its planned working set, which places it in the payload.
+    pub(crate) planned: Vec<u64>,
     /// The source's models with assemblies, which its linked units do not hold.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) assemblies: Vec<Assembly>,
