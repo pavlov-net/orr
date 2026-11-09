@@ -875,13 +875,19 @@ impl Ctx<'_> {
     ) -> ClusterData {
         let _z = crate::profile::zone!("mesh.cluster");
         let w = self.w;
-        let mut order: Vec<u32> = (0..verts.len() as u32).collect();
-        meshopt::optimize_meshlet_level(&mut order, &mut tris, 3);
-        let verts: Vec<u32> = order.iter().map(|&i| verts[i as usize]).collect();
-        let cells: Vec<[i32; 3]> = order.iter().map(|&i| cells[i as usize]).collect();
+        let n = verts.len();
+        let mut order = IDENTITY;
+        meshopt::optimize_meshlet_level(&mut order[..n], &mut tris, 3);
+        let (mut by_order, mut cells_by_order) =
+            ([0; MAX_CLUSTER_VERTICES], [[0; 3]; MAX_CLUSTER_VERTICES]);
+        for (k, &i) in order[..n].iter().enumerate() {
+            by_order[k] = verts[i as usize];
+            cells_by_order[k] = cells[i as usize];
+        }
+        let (verts, cells) = (&by_order[..n], &cells_by_order[..n]);
         let sec = &self.sections[usize::from(section)];
         let section_maps = &self.maps[usize::from(section)];
-        let uv: Vec<ClusterUvs> = w.uvs.iter().map(|u| ClusterUvs::new(u, &verts)).collect();
+        let uv: Vec<ClusterUvs> = w.uvs.iter().map(|u| ClusterUvs::new(u, verts)).collect();
         let stored = |set: usize| -> Vec<[f32; 2]> {
             let at = |&v: &u32| uv[set].stored(w.uvs[set][v as usize]);
             verts.iter().map(at).collect()
@@ -892,15 +898,15 @@ impl Ctx<'_> {
             partition_flat(
                 w,
                 self.grid,
-                &verts,
-                &cells,
+                verts,
+                cells,
                 &mut tris[..3 * usize::from(opaque)],
             )
         } else {
             0
         };
         stored_corner_order(&mut tris);
-        let mut c = build_cluster(w, self.grid, &verts, &cells, &tris, sec.flags, &uv);
+        let mut c = build_cluster(w, self.grid, verts, cells, &tris, sec.flags, &uv);
         if sec.flags & (Section::EMISSIVE | Section::CASTER) != 0 {
             let step = self.grid.step();
             let positions: Vec<DVec3> = cells
@@ -1332,17 +1338,50 @@ fn partition_flat(
 }
 
 /// Rotates each triangle's corners as the page codec stores them; order and winding stay.
+/// meshoptimizer's meshlet encoder (`encodeTriangles`) rotates a triangle to start at the
+/// edge it shares with one of the last 6 of the 8 edges it remembers, or else at its largest
+/// corner, and remembers its two new edges.
 fn stored_corner_order(tris: &mut [u8]) {
-    let n = tris.len() / 3;
-    let meshlet = meshopt::Meshlet {
-        vertices: &[],
-        triangles: tris,
-    };
-    let stored = meshopt::encode_meshlet(meshlet).expect("the meshlet codec takes a cluster");
-    let (_, decoded) =
-        meshopt::decode_meshlet(&stored, 0, n).expect("the meshlet codec decodes its own stream");
-    tris.copy_from_slice(&decoded);
+    const ROTATIONS: [usize; 5] = [0, 1, 2, 0, 1];
+    let mut fifo = [[u16::MAX; 2]; 8];
+    let mut next = 0;
+    for t in tris.as_chunks_mut::<3>().0 {
+        let [a, b, c] = t.map(u16::from);
+        let shared = (0..8).find_map(|i| {
+            let [e0, e1] = fifo[(next + 7 - i) & 7];
+            [(a, b), (b, c), (c, a)]
+                .iter()
+                .position(|&e| e == (e0, e1))
+                .map(|edge| (i, edge))
+        });
+        let rotation = match shared {
+            Some((i, edge)) if i < 6 => edge,
+            _ if a > b && a > c => 1,
+            _ if b > c => 2,
+            _ => 0,
+        };
+        let r = &ROTATIONS[rotation..rotation + 3];
+        *t = [t[r[0]], t[r[1]], t[r[2]]];
+        let [a, b, c] = t.map(u16::from);
+        fifo[next] = [c, b];
+        fifo[(next + 1) & 7] = [a, c];
+        next = (next + 2) & 7;
+    }
 }
+
+/// Most vertices a cluster holds ([`check`] bounds the limits).
+const MAX_CLUSTER_VERTICES: usize = 256;
+
+/// Cluster-local vertex `i` at index `i`.
+const IDENTITY: [u32; MAX_CLUSTER_VERTICES] = {
+    let mut a = [0; MAX_CLUSTER_VERTICES];
+    let mut i = 0;
+    while i < MAX_CLUSTER_VERTICES {
+        a[i] = i as u32;
+        i += 1;
+    }
+    a
+};
 
 /// A cluster's uvs of one set as the page stores them: unorm16 over the cluster's uv range.
 struct ClusterUvs {
@@ -1569,16 +1608,16 @@ fn build_cluster(
         .collect();
     let local_max = [0, 1, 2].map(|a| local.iter().map(|l| l[a]).max().unwrap());
     let step = grid.step();
-    let floats: Vec<[f32; 3]> = cells
-        .iter()
-        .map(|g| g.map(|v| (f64::from(v) * step) as f32))
-        .collect();
-    let order: Vec<u32> = (0..verts.len() as u32).collect();
-    let adapter = VertexDataAdapter::new(bytemuck::cast_slice(&floats), 12, 0)
+    let mut floats = [[0.0f32; 3]; MAX_CLUSTER_VERTICES];
+    for (f, g) in floats.iter_mut().zip(cells) {
+        *f = g.map(|v| (f64::from(v) * step) as f32);
+    }
+    let floats = &floats[..cells.len()];
+    let adapter = VertexDataAdapter::new(bytemuck::cast_slice(floats), 12, 0)
         .expect("positions are 12-byte vertices");
     let bounds = meshopt::compute_meshlet_bounds(
         meshopt::Meshlet {
-            vertices: &order,
+            vertices: &IDENTITY[..verts.len()],
             triangles: tris,
         },
         &adapter,
@@ -1880,5 +1919,58 @@ impl MeshData {
 
     pub(crate) fn triangles(&self) -> u64 {
         self.indices.len() as u64 / 3
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stored_corner_order;
+
+    /// The port of the meshlet encoder's rotations matches the codec: random clusters and
+    /// strips that reuse edges, after an encode and decode.
+    #[test]
+    fn stored_corner_order_matches_the_meshlet_codec() {
+        let mut state = 0x9e37_79b9_u32;
+        let mut random = |n: u32| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state % n
+        };
+        for case in 0..400 {
+            let n = 1 + random(128) as usize;
+            let verts = 4 + random(252);
+            let mut tris = Vec::with_capacity(3 * n);
+            for k in 0..n {
+                let t = if case % 2 == 0 || k == 0 {
+                    let a = random(verts);
+                    let b = (a + 1 + random(verts - 1)) % verts;
+                    let mut c = random(verts);
+                    while c == a || c == b {
+                        c = random(verts);
+                    }
+                    [a, b, c]
+                } else {
+                    // A neighbor of the previous triangle across one of its edges.
+                    let p: [u32; 3] =
+                        [tris[3 * k - 3], tris[3 * k - 2], tris[3 * k - 1]].map(u32::from);
+                    let e = random(3) as usize;
+                    let mut c = random(verts);
+                    while p.contains(&c) {
+                        c = random(verts);
+                    }
+                    [p[(e + 1) % 3], p[e], c]
+                };
+                tris.extend(t.map(|v| v as u8));
+            }
+            let stored = meshopt::encode_meshlet(meshopt::Meshlet {
+                vertices: &[],
+                triangles: &tris,
+            })
+            .unwrap();
+            let (_, decoded) = meshopt::decode_meshlet(&stored, 0, n).unwrap();
+            stored_corner_order(&mut tris);
+            assert_eq!(tris, decoded[..3 * n], "case {case}");
+        }
     }
 }
