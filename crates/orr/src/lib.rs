@@ -142,7 +142,8 @@ pub struct ViewHooks<'a> {
     /// media apply, at the render extent, with the view's [`ParticleLighting`] for this
     /// frame, which [`ParticleDraw`] and a hook's own `particle_shade` light and fog
     /// particles with; the overlay is composited over the radiance before `scene_referred`.
-    /// Particle producer entries are drawn here or not at all for primary visibility.
+    /// Particle producer entries are drawn here or not at all for primary visibility. While it
+    /// is set the view's froxels are lit every frame, whether or not anything else reads them.
     pub transparency: Option<&'a mut TransparencyHook<'a>>,
     /// On the view's pre-exposed radiance before metering, at the output extent; compute
     /// work in [`Frame::output_list`].
@@ -1231,6 +1232,10 @@ impl<'a> Frame<'a> {
             frosted_glass: reconstructed,
             overlay_front: blurs && view.lens.shutter > 0.0,
             walking_materials: raster.walking_materials,
+            interior_materials: raster.interior_materials,
+            scattering_interiors: raster.scattering_interiors,
+            medium_proxies: raster.medium_proxies,
+            particle_lighting: hooks.transparency.is_some(),
         };
         paths.begin(scene, &desc, lighting);
         state.scene_resets = Some(scene_resets);

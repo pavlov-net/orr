@@ -2137,10 +2137,10 @@ impl<'a> Frame<'a> {
                 core.cell_log2,
             )
             .to_array();
-        let (slots, smoke) = {
+        let (slots, smoke, medium_proxies) = {
             let cpu = scene.cpu.lock().unwrap();
             let smoke = cpu.producers.iter().flatten().any(|p| p.smoke);
-            (cpu.ptlas.high_water, smoke)
+            (cpu.ptlas.high_water, smoke, cpu.ptlas.has_medium_proxies())
         };
         let producer_capacity = scene.desc.producer_capacity;
         let sizes = TargetSizes {
@@ -2216,6 +2216,9 @@ impl<'a> Frame<'a> {
             raster,
             smoke_args: smoke.then(|| targets.smoke_args()),
             walking_materials: core.materials.any_walking(),
+            interior_materials: core.materials.any_interior(),
+            scattering_interiors: core.materials.any_scattering_interior(),
+            medium_proxies,
             history: view.history,
             sky_stats,
             focus,

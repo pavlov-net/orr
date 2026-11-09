@@ -800,15 +800,17 @@ impl LightingView {
             .map_or(GpuPtr::NULL, |f| f.words.gpu())
     }
 
-    /// The froxel counts of `frame`, once its submit has completed; `None` when that frame
-    /// recorded no froxels or its slot holds a later frame.
+    /// The froxel counts of `frame`, once its submit has completed; `None` when
+    /// [`LightingKernels::record_media`] did not run in that frame or its slot holds a later
+    /// frame.
     pub fn media_stats(&self, frame: u64) -> Option<MediaStats> {
         self.media.stats(frame)
     }
 
     /// The light and fog transparency hooks of `frame` shade particles with, through
     /// [`crate::ParticleDraw`] or their own `particle_shade`; written by
-    /// [`LightingKernels::record_media_apply`], null when that frame recorded none.
+    /// [`LightingKernels::record_media_apply`], null when that frame recorded none or its
+    /// [`ViewPass::particle_lighting`] was not set.
     pub fn particle_lighting(&self, frame: u64) -> GpuPtr<ParticleLighting> {
         self.media.particle_lighting(frame)
     }
@@ -879,6 +881,15 @@ pub struct ViewPass {
     pub overlay_front: bool,
     /// [`orr_scene::RasterView::walking_materials`].
     pub walking_materials: bool,
+    /// [`orr_scene::RasterView::interior_materials`].
+    pub interior_materials: bool,
+    /// [`orr_scene::RasterView::scattering_interiors`].
+    pub scattering_interiors: bool,
+    /// [`orr_scene::RasterView::medium_proxies`].
+    pub medium_proxies: bool,
+    /// Something reads the frame's [`LightingView::particle_lighting`], as a transparency hook
+    /// that shades particles does; `false` leaves it null.
+    pub particle_lighting: bool,
 }
 
 /// What the background layer behind out-of-focus foreground reads in one frame. Each marked
@@ -1176,6 +1187,17 @@ impl LightingKernels {
     /// Makes the view's froxel targets at its first call and when the extent or the media
     /// settings that shape them change; a history reset, a new `near_range` and new targets
     /// restart the froxel history.
+    ///
+    /// A pass runs only where something reads what it writes. A camera segment can hold a
+    /// medium, which the froxels' medium, their integration, the aerial-perspective LUT and
+    /// media apply serve, while the kernels link one, the scene holds a medium proxy, a smoke
+    /// entry or a material that bounds an interior, or [`ViewLighting::camera_medium`] is set.
+    /// The froxels' light has a reader while the kernels link a medium, the scene holds a
+    /// medium proxy, a smoke entry or an interior that scatters, `camera_medium` is set or
+    /// [`ViewPass::particle_lighting`] is. [`LightingDebugView::Media`] and
+    /// [`LightingDebugView::Froxels`] read everything. With neither kind of reader the view
+    /// frees its froxel targets and only the shadowed lights are picked. The froxel history
+    /// starts over when the light gets a reader again.
     pub fn record_media(
         &self,
         list: &mut CommandList<'_>,
@@ -1196,7 +1218,8 @@ impl LightingKernels {
     /// marched per pixel at their voxel spacing, lit by the froxels' isotropic light and
     /// [`MediaSettings::proxy_shadow_rays`] shadow rays. Smoke producers come through the
     /// froxels inside `near_range` and as one lit layer per pixel past it. The reference marches
-    /// the segment per pixel instead. Also writes the frame's
+    /// the segment per pixel instead. Where no camera segment can hold a medium
+    /// ([`Self::record_media`]) the radiance stays as the paths wrote it. Also writes the frame's
     /// [`LightingView::particle_lighting`] for the transparency hook after it. Orders nothing
     /// after it.
     pub fn record_media_apply(

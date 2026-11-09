@@ -385,6 +385,11 @@ impl Ptlas {
         }
     }
 
+    /// Whether a medium proxy is set.
+    pub(crate) fn has_medium_proxies(&self) -> bool {
+        self.proxies_live > 0
+    }
+
     /// Whether a medium or light proxy is set or awaits its null write.
     pub(crate) fn has_proxy_work(&self) -> bool {
         self.proxies_live > 0 || self.lights_live > 0 || !self.proxy_dirty.is_empty()

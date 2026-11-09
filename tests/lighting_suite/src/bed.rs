@@ -1494,6 +1494,8 @@ pub struct BedFrame<'a> {
     pub lighting: &'a SceneLighting,
     /// The radiance target the kernel writes, at [`EXTENT`].
     pub target: &'a mut LightingView,
+    /// The bed draws particles after the kernel.
+    particles: bool,
     roots: &'a mut Roots,
 }
 
@@ -1513,6 +1515,10 @@ impl BedFrame<'_> {
             frosted_glass: false,
             overlay_front: false,
             walking_materials: self.view.walking_materials,
+            interior_materials: self.view.interior_materials,
+            scattering_interiors: self.view.scattering_interiors,
+            medium_proxies: self.view.medium_proxies,
+            particle_lighting: self.particles,
         }
     }
 
@@ -2338,6 +2344,7 @@ impl Bed {
                 desc,
                 lighting: &self.lighting,
                 target: &mut self.target,
+                particles: self.particles.is_some(),
                 roots: &mut self.roots,
             },
         );

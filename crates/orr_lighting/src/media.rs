@@ -3,9 +3,9 @@
 
 use orr_scene::MaterialId;
 use orr_scene::orr_gpu::{
-    self, AddressMode, Allocation, CommandList, ComputePipeline, Device, Filter, Format, GpuPtr,
-    Hazards, MemoryKind, SamplerDesc, SamplerIndex, Stages, StorageImageIndex, Texture,
-    TextureDesc, TextureIndex, TextureKind, TextureMemory, TextureUsage,
+    self, AddressMode, Allocation, CommandList, ComputePipeline, DEFAULT_MEDIUM, Device, Filter,
+    Format, GpuPtr, Hazards, MemoryKind, SamplerDesc, SamplerIndex, Stages, StorageImageIndex,
+    Texture, TextureDesc, TextureIndex, TextureKind, TextureMemory, TextureUsage,
 };
 
 use crate::scene::{FRAME_SLOTS, Ring};
@@ -90,7 +90,8 @@ impl Default for MediaSettings {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MediaStats {
     pub frame: u64,
-    /// Froxels in front of the surfaces of their tiles and the tiles around them.
+    /// Froxels in front of the surfaces of their tiles and the tiles around them, which the light
+    /// pass lit: 0 in a frame where nothing reads the froxels' light.
     pub active_froxels: u32,
     /// Rays the froxels traced.
     pub froxel_rays: u32,
@@ -248,8 +249,41 @@ impl Drop for Volumes {
     }
 }
 
-/// A view's media state: its froxel targets, made at the first [`MediaKernels::record`]
-/// and remade when the grid or the settings that shape it change, and their history.
+/// What reads a frame's froxels, from what the kernels, the scene and the view hold. Each
+/// names a reader exactly or errs toward one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Readers {
+    /// A camera segment can hold a medium: the linked one, a proxy, smoke or an interior. Then
+    /// the froxels' medium and integration, the aerial-perspective LUT and media apply are
+    /// read, and paths read the volume; otherwise they would hold no medium and leave every
+    /// radiance as it is.
+    fogged: bool,
+    /// The froxels' light is read: by a medium that scatters, which the linked one, a proxy,
+    /// smoke and an interior with scatter can be, or by particle lighting.
+    lit: bool,
+}
+
+impl Readers {
+    const NONE: Self = Self {
+        fogged: false,
+        lit: false,
+    };
+
+    fn any(self) -> bool {
+        self.fogged || self.lit
+    }
+}
+
+/// What [`MediaKernels::record`] recorded in a frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Recorded {
+    frame: u64,
+    readers: Readers,
+}
+
+/// A view's media state: its froxel targets, made at the first [`MediaKernels::record`] whose
+/// froxels have a reader, remade when the grid or the settings that shape it change and freed
+/// when no reader is left, and their light's history.
 pub(crate) struct MediaView {
     volumes: Option<Volumes>,
     /// The `incident` and `visibility` this frame writes; the other holds the last frame's.
@@ -262,7 +296,7 @@ pub(crate) struct MediaView {
     eye: bool,
     lights: Allocation<FroxelLights>,
     stats: Allocation<MediaStatsGpu>,
-    frames: [Option<u64>; FRAME_SLOTS],
+    recorded: [Option<Recorded>; FRAME_SLOTS],
     roots: Ring<FroxelRoot>,
     apply_roots: Ring<MediaApplyRoot>,
     volume_roots: Ring<FroxelVolume>,
@@ -291,7 +325,7 @@ impl MediaView {
             eye: false,
             lights,
             stats: device.gpu_malloc(MemoryKind::Readback, FRAME_SLOTS as u64, "media stats")?,
-            frames: [None; FRAME_SLOTS],
+            recorded: [None; FRAME_SLOTS],
             roots: Ring::new(device, "froxel roots")?,
             apply_roots: Ring::new(device, "media apply roots")?,
             volume_roots: Ring::new(device, "froxel volumes")?,
@@ -300,10 +334,15 @@ impl MediaView {
         })
     }
 
+    /// What `frame` recorded, while its slot holds it.
+    fn recorded(&self, frame: u64) -> Option<Recorded> {
+        self.recorded[(frame % FRAME_SLOTS as u64) as usize].filter(|r| r.frame == frame)
+    }
+
     /// Froxel counts of `frame`, once its submit has completed.
     pub(crate) fn stats(&self, frame: u64) -> Option<MediaStats> {
         let slot = (frame % FRAME_SLOTS as u64) as usize;
-        (self.frames[slot] == Some(frame)).then(|| {
+        self.recorded(frame).map(|_| {
             let s = self.stats.as_slice().unwrap()[slot];
             MediaStats {
                 frame,
@@ -316,10 +355,11 @@ impl MediaView {
     }
 
     /// The froxel volume `frame` recorded, for kernels after its passes; null when it
-    /// recorded none.
+    /// recorded none, as when no camera segment can hold a medium: a path's segments then read
+    /// the linked medium, which is none, and no path starts in an interior.
     pub(crate) fn volume(&self, frame: u64) -> GpuPtr<FroxelVolume> {
         let slot = (frame % FRAME_SLOTS as u64) as usize;
-        if self.frames[slot] == Some(frame) {
+        if self.recorded(frame).is_some_and(|r| r.readers.fogged) {
             self.volume_roots.at(slot)
         } else {
             GpuPtr::NULL
@@ -349,6 +389,8 @@ pub(crate) struct MediaKernels {
     aerial: ComputePipeline,
     apply: ComputePipeline,
     sampler: SamplerIndex,
+    /// The kernels link a medium.
+    linked_medium: bool,
 }
 
 impl MediaKernels {
@@ -370,9 +412,29 @@ impl MediaKernels {
                 address: [AddressMode::ClampToEdge; 3],
                 ..SamplerDesc::default()
             })?,
+            linked_medium: kernels.medium != DEFAULT_MEDIUM,
         })
     }
 
+    /// What reads the froxels of `pass`. A debug view of them reads all of them, and the
+    /// interior a view names counts as one that scatters.
+    fn readers(&self, pass: &ViewPass, lighting: &ViewLighting) -> Readers {
+        let scatters = self.linked_medium
+            || pass.medium_proxies
+            || pass.smoke_args.is_some()
+            || lighting.camera_medium.is_some()
+            || matches!(
+                lighting.debug_view,
+                LightingDebugView::Media | LightingDebugView::Froxels
+            );
+        Readers {
+            fogged: scatters || pass.interior_materials,
+            lit: scatters || pass.scattering_interiors || pass.particle_lighting,
+        }
+    }
+
+    /// The froxel passes' root of `pass`, with no targets while `media` holds none: what the
+    /// order pass alone reads.
     fn root(
         &self,
         media: &MediaView,
@@ -382,28 +444,30 @@ impl MediaKernels {
     ) -> FroxelRoot {
         let settings = &lighting.media;
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
-        let v = media.volumes.as_ref().expect("froxel volumes");
-        let [columns, rows, slices] = v.shape.grid;
+        let v = media.volumes.as_ref();
+        let [columns, rows, slices] = v.map_or([0; 3], |v| v.shape.grid);
         let (cur, prev) = (media.current, 1 - media.current);
-        let (visibility, visibility_history) = v
-            .visibility
-            .as_ref()
-            .map_or((StorageImageIndex::NONE, TextureIndex::NONE), |p| {
-                (p[cur].store, p[prev].sampled)
-            });
         let pair = |t: Option<&Volume>| {
             t.map_or((StorageImageIndex::NONE, TextureIndex::NONE), |t| {
                 (t.store, t.sampled)
             })
         };
-        let (integrated_rgb, integrated_rgb_sampled) = pair(v.integrated_rgb.as_ref());
-        let (aerial_rgb, aerial_rgb_sampled) = pair(v.aerial_rgb.as_ref());
-        let (eye_depth, eye_depth_history) = v
-            .eye_depth
-            .as_ref()
-            .map_or((StorageImageIndex::NONE, TextureIndex::NONE), |p| {
+        // This frame's storage view and the last frame's sampled view.
+        let history = |p: Option<&[Volume; 2]>| {
+            p.map_or((StorageImageIndex::NONE, TextureIndex::NONE), |p| {
                 (p[cur].store, p[prev].sampled)
-            });
+            })
+        };
+        let (sigma, _) = pair(v.map(|v| &v.sigma));
+        let (words, _) = pair(v.map(|v| &v.words));
+        let (incident, incident_history) = history(v.map(|v| &v.incident));
+        let (visibility, visibility_history) = history(v.and_then(|v| v.visibility.as_ref()));
+        let (integrated, integrated_sampled) = pair(v.map(|v| &v.integrated));
+        let (integrated_rgb, integrated_rgb_sampled) =
+            pair(v.and_then(|v| v.integrated_rgb.as_ref()));
+        let (aerial, aerial_sampled) = pair(v.map(|v| &v.aerial));
+        let (aerial_rgb, aerial_rgb_sampled) = pair(v.and_then(|v| v.aerial_rgb.as_ref()));
+        let (eye_depth, eye_depth_history) = history(v.and_then(|v| v.eye_depth.as_ref()));
         FroxelRoot {
             scene: pass.scene,
             view: pass.view,
@@ -413,17 +477,19 @@ impl MediaKernels {
             lights: media.lights.gpu(),
             stats: media.stats.gpu().offset(slot as u64),
             raster: pass.raster,
-            smoke: v.smoke.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
-            eye: v.eye.gpu(),
-            sigma: v.sigma.store,
-            words: v.words.store,
-            incident: v.incident[cur].store,
-            incident_history: v.incident[prev].sampled,
+            smoke: v
+                .and_then(|v| v.smoke.as_ref())
+                .map_or(GpuPtr::NULL, Allocation::gpu),
+            eye: v.map_or(GpuPtr::NULL, |v| v.eye.gpu()),
+            sigma,
+            words,
+            incident,
+            incident_history,
             visibility,
             visibility_history,
-            integrated: v.integrated.store,
+            integrated,
             integrated_rgb,
-            integrated_sampled: v.integrated.sampled,
+            integrated_sampled,
             integrated_rgb_sampled,
             sampler: self.sampler,
             columns,
@@ -435,10 +501,10 @@ impl MediaKernels {
             frame: pass.sample_index,
             seed: pass.seed,
             history: media.history,
-            chromatic: u32::from(v.shape.chromatic),
-            aerial: v.aerial.store,
+            chromatic: u32::from(v.is_some_and(|v| v.shape.chromatic)),
+            aerial,
             aerial_rgb,
-            aerial_sampled: v.aerial.sampled,
+            aerial_sampled,
             aerial_rgb_sampled,
             ap_range: settings.ap_range,
             smoke_anisotropy: settings.smoke_anisotropy,
@@ -448,19 +514,24 @@ impl MediaKernels {
         }
     }
 
-    /// What transparency hooks light and fog particles with after media apply of `pass`:
-    /// this frame's froxels and aerial-perspective LUT where `media` holds them.
+    /// What transparency hooks light and fog particles with after media apply of `pass`: the
+    /// frame's froxels where its light pass ran (`readers.lit`), and their fog and the
+    /// aerial-perspective LUT where a camera segment can hold a medium (`readers.fogged`).
+    /// Without those the fog is none.
     fn particle_lighting(
         &self,
         media: &MediaView,
+        readers: Readers,
         scene: &SceneLighting,
         pass: &ViewPass,
         lighting: &ViewLighting,
-        layers: GpuPtr<LayerGuide>,
-        overlay_front: GpuPtr<u64>,
+        guides: (GpuPtr<LayerGuide>, GpuPtr<u64>),
     ) -> ParticleLighting {
-        let v = media.volumes.as_ref();
-        let [columns, rows, slices] = v.map_or([0; 3], |v| v.shape.grid);
+        let (layers, overlay_front) = guides;
+        let held = media.volumes.as_ref().filter(|_| readers.any());
+        let v = held.filter(|_| readers.lit);
+        let fog = held.filter(|_| readers.fogged);
+        let [columns, rows, slices] = held.map_or([0; 3], |v| v.shape.grid);
         let current = |p: &[Volume; 2]| p[media.current].sampled;
         ParticleLighting {
             scene: pass.scene,
@@ -468,15 +539,15 @@ impl MediaKernels {
             set: scene.light_set(),
             cache: scene.world_cache(pass.frame),
             lights: media.lights.gpu(),
-            eye: v.map_or(GpuPtr::NULL, |v| v.eye.gpu()),
+            eye: held.map_or(GpuPtr::NULL, |v| v.eye.gpu()),
             layers,
             overlay_front,
             incident: v.map_or(TextureIndex::NONE, |v| current(&v.incident)),
             visibility: v
                 .and_then(|v| v.visibility.as_ref())
                 .map_or(TextureIndex::NONE, current),
-            integrated: v.map_or(TextureIndex::NONE, |v| v.integrated.sampled),
-            integrated_rgb: v
+            integrated: fog.map_or(TextureIndex::NONE, |v| v.integrated.sampled),
+            integrated_rgb: fog
                 .and_then(|v| v.integrated_rgb.as_ref())
                 .map_or(TextureIndex::NONE, |t| t.sampled),
             sampler: self.sampler,
@@ -485,8 +556,8 @@ impl MediaKernels {
             slices,
             frame: pass.sample_index,
             seed: pass.seed,
-            aerial: v.map_or(TextureIndex::NONE, |v| v.aerial.sampled),
-            aerial_rgb: v
+            aerial: fog.map_or(TextureIndex::NONE, |v| v.aerial.sampled),
+            aerial_rgb: fog
                 .and_then(|v| v.aerial_rgb.as_ref())
                 .map_or(TextureIndex::NONE, |t| t.sampled),
             ap_range: lighting.media.ap_range,
@@ -498,7 +569,9 @@ impl MediaKernels {
 
     /// Records the froxel passes and the aerial-perspective LUT of `pass` after the scene's
     /// [`SceneLighting::record`] and the view's raster half; their outputs are visible to
-    /// later compute and ray stages.
+    /// later compute and ray stages. Each pass runs where something reads what it writes
+    /// ([`Readers`]); the order pass always does, since the shadowed lights it picks depend on
+    /// the frames before. The light's history starts over after a frame without its pass.
     pub(crate) fn record(
         &self,
         list: &mut CommandList<'_>,
@@ -511,6 +584,7 @@ impl MediaKernels {
         let reset = view.history_reset();
         let media = &mut view.media;
         let settings = &lighting.media;
+        let readers = self.readers(pass, lighting);
         let shadowed = settings
             .froxel_shadowed_lights
             .min(MAX_FROXEL_SHADOWED_LIGHTS);
@@ -519,85 +593,112 @@ impl MediaKernels {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         media.eye = media.eye
             || lighting.camera_medium.is_some()
-            || (media.frames[slot].is_some()
+            || (media.recorded[slot].is_some()
                 && media.stats.as_slice().unwrap()[slot].eye_columns > 0);
-        let shape = Shape {
-            grid: [
-                extent[0].div_ceil(FROXEL_TILE),
-                extent[1].div_ceil(FROXEL_TILE),
-                settings.slices.max(1),
-            ],
-            extra: shadowed.saturating_sub(1),
-            chromatic: settings.chromatic_transmittance,
-            smoke: pass.smoke_args.is_some(),
-            eye: media.eye,
-        };
-        let mut fresh = false;
-        if media.volumes.as_ref().is_none_or(|v| v.shape != shape) {
-            let device = scene.device();
-            media.volumes = Some(Volumes::new(device, list, shape)?);
-            fresh = true;
-        }
         let near_range = scene.settings().near_range;
-        if fresh
-            || reset
-            || media.near_range != near_range
-            || media.camera_medium != lighting.camera_medium
-        {
-            media.history = 0;
+        let mut grid = [0; 3];
+        if readers.any() {
+            let shape = Shape {
+                grid: [
+                    extent[0].div_ceil(FROXEL_TILE),
+                    extent[1].div_ceil(FROXEL_TILE),
+                    settings.slices.max(1),
+                ],
+                extra: shadowed.saturating_sub(1),
+                chromatic: settings.chromatic_transmittance,
+                smoke: pass.smoke_args.is_some(),
+                eye: media.eye,
+            };
+            let mut fresh = false;
+            if media.volumes.as_ref().is_none_or(|v| v.shape != shape) {
+                let device = scene.device();
+                media.volumes = Some(Volumes::new(device, list, shape)?);
+                fresh = true;
+            }
+            if fresh
+                || reset
+                || media.near_range != near_range
+                || media.camera_medium != lighting.camera_medium
+            {
+                media.history = 0;
+            }
+            media.current = 1 - media.current;
+            grid = shape.grid;
+        } else {
+            media.volumes = None;
         }
         media.near_range = near_range;
         media.camera_medium = lighting.camera_medium;
-        media.current = 1 - media.current;
-        media.frames[slot] = Some(pass.frame);
+        media.recorded[slot] = Some(Recorded {
+            frame: pass.frame,
+            readers,
+        });
         let root = self.root(media, scene, pass, lighting);
-        media.volume_roots.write(
-            slot,
-            FroxelVolume {
-                lights: root.lights,
-                eye: root.eye,
-                sigma: root.sigma,
-                words: root.words,
-                incident: root.incident,
-                visibility: root.visibility,
-                columns: root.columns,
-                rows: root.rows,
-                slices: root.slices,
-                chromatic: root.chromatic,
-            },
-        );
+        if readers.fogged {
+            media.volume_roots.write(
+                slot,
+                FroxelVolume {
+                    lights: root.lights,
+                    eye: root.eye,
+                    sigma: root.sigma,
+                    words: root.words,
+                    incident: root.incident,
+                    visibility: root.visibility,
+                    columns: root.columns,
+                    rows: root.rows,
+                    slices: root.slices,
+                    chromatic: root.chromatic,
+                },
+            );
+        }
         let root = media.roots.write(slot, root);
-        let [columns, rows, slices] = shape.grid;
+        let [columns, rows, slices] = grid;
+        let step = |list: &mut CommandList<'_>| {
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        };
         list.begin_pass("froxels", false);
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
         list.dispatch(&self.order, root, [1, 1, 1]);
-        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        let column_groups = [columns.div_ceil(8), rows.div_ceil(8), 1];
-        list.dispatch(&self.eye_column, root, column_groups);
-        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        list.dispatch(&self.eye_reach, root, column_groups);
-        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        list.dispatch(
-            &self.inject,
-            root,
-            [columns.div_ceil(4), rows.div_ceil(4), slices.div_ceil(4)],
-        );
-        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        if let Some(args) = pass.smoke_args {
-            list.dispatch_indirect(&self.smoke, root, args);
-            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        step(list);
+        if readers.any() {
+            // With no reader at all no column can lie in an interior, and nothing reads the
+            // columns.
+            let column_groups = [columns.div_ceil(8), rows.div_ceil(8), 1];
+            list.dispatch(&self.eye_column, root, column_groups);
+            step(list);
+            list.dispatch(&self.eye_reach, root, column_groups);
+            step(list);
         }
-        let [light_group, ..] = self.light.workgroup();
-        list.dispatch(&self.light, root, [columns.div_ceil(light_group), rows, 1]);
-        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        list.dispatch(
-            &self.integrate,
-            root,
-            [columns.div_ceil(8), rows.div_ceil(8), 1],
-        );
+        if readers.fogged {
+            list.dispatch(
+                &self.inject,
+                root,
+                [columns.div_ceil(4), rows.div_ceil(4), slices.div_ceil(4)],
+            );
+            step(list);
+            if let Some(args) = pass.smoke_args {
+                list.dispatch_indirect(&self.smoke, root, args);
+                step(list);
+            }
+        }
+        if readers.lit {
+            let [light_group, ..] = self.light.workgroup();
+            list.dispatch(&self.light, root, [columns.div_ceil(light_group), rows, 1]);
+            step(list);
+            media.history = (media.history + 1).min(MAX_HISTORY);
+        } else {
+            media.history = 0;
+        }
+        if readers.fogged {
+            list.dispatch(
+                &self.integrate,
+                root,
+                [columns.div_ceil(8), rows.div_ceil(8), 1],
+            );
+        }
         list.end_pass();
         list.begin_pass("aerial perspective", false);
-        if lighting.media.ap_range > near_range {
+        if readers.fogged && lighting.media.ap_range > near_range {
             let groups = AERIAL_SIZE.div_ceil(8);
             list.dispatch(&self.aerial, root, [groups, groups, 1]);
         }
@@ -607,12 +708,12 @@ impl MediaKernels {
             Hazards::empty(),
         );
         list.end_pass();
-        media.history = (media.history + 1).min(MAX_HISTORY);
         Ok(())
     }
 
     /// Records media apply of `pass` into the view's radiance after the froxel passes and
-    /// the paths that wrote it; orders nothing after it.
+    /// the paths that wrote it, where a camera segment can hold a medium and the debug view
+    /// shows media apply; orders nothing after it.
     pub(crate) fn record_apply(
         &self,
         list: &mut CommandList<'_>,
@@ -628,12 +729,13 @@ impl MediaKernels {
         let overlay_front = view.overlay_front_words(pass.frame);
         let media = &mut view.media;
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
-        media.particle_frames[slot] = Some(pass.frame);
-        let particles = self.particle_lighting(media, scene, pass, lighting, layers, overlay_front);
+        let readers = media
+            .recorded(pass.frame)
+            .map_or(Readers::NONE, |r| r.readers);
+        media.particle_frames[slot] = pass.particle_lighting.then_some(pass.frame);
+        let guides = (layers, overlay_front);
+        let particles = self.particle_lighting(media, readers, scene, pass, lighting, guides);
         let particles = media.particles.write(slot, particles);
-        if media.frames[slot] != Some(pass.frame) {
-            return;
-        }
         let mode = match lighting.debug_view {
             LightingDebugView::Media => MEDIA_INSCATTER,
             LightingDebugView::Froxels => MEDIA_FROXELS,
@@ -646,6 +748,9 @@ impl MediaKernels {
             | LightingDebugView::Subsurface => MEDIA_OFF,
             _ => MEDIA_COMPOSE,
         };
+        if !readers.fogged || mode == MEDIA_OFF {
+            return;
+        }
         let root = media.apply_roots.write(
             slot,
             MediaApplyRoot {
