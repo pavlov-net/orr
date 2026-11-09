@@ -5,7 +5,7 @@ use std::sync::Arc;
 use orr_io::open_shared;
 
 use crate::codec::decode_chunk;
-use crate::format::{Layout, PAGE, hash_blob, read_header, validate};
+use crate::format::{HEADER_LEN, Layout, PAGE, hash_blob, read_header, validate};
 use crate::{AssetId, Blob, Chunk, Class, Entry, Error, GDeflate, Hash32, Header, Result};
 
 /// A 4096-byte-aligned file range covering stored bytes, for unbuffered reads. The stored
@@ -109,7 +109,8 @@ impl Archive {
         let bytes = Bytes::shared(bytes);
         let index_at = header.index_offset() as usize;
         let index = &bytes.get()[index_at..header.file_len as usize];
-        if read_header(index)?.file_len != header.file_len {
+        // File readers take the copy, so the two must agree for both to read the same archive.
+        if index[..HEADER_LEN] != bytes.get()[..HEADER_LEN] {
             return Err(Error::CorruptToc);
         }
         let layout = validate(&header, index)?;
