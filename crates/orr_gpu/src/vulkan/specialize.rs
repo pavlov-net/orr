@@ -3,11 +3,13 @@
 //! The driver folds them too, but only after it has read the whole module, and a kernel made
 //! for many feature masks is mostly code its mask rules out. [`specialize`] gives the constants
 //! their values, follows them through the integer and boolean tests that read them, and removes
-//! the blocks no path of the function reaches, with every other entry point's function. It
-//! changes nothing a reachable instruction computes.
+//! the blocks no path of the function reaches, with every other entry point's function and the
+//! local variables nothing left reads. It changes nothing a reachable instruction computes.
 //!
 //! A test may reach its branch as a value or through a scalar local variable that only loads
-//! and stores touch: such a variable holds what its stores that run agree on.
+//! and stores touch. A load of such a variable reads the store that reaches it, and where the
+//! paths into a block bring different ones, what those of them that run agree on. Where no
+//! store reaches a load on some path that runs, the pass knows nothing of what it reads.
 
 use std::collections::{HashMap, HashSet};
 
@@ -52,6 +54,7 @@ const STORAGE_FUNCTION: u32 = 7;
 const OP_DECORATE: u32 = 71;
 const OP_MEMBER_DECORATE: u32 = 72;
 const OP_COPY_OBJECT: u32 = 83;
+const OP_BITCAST: u32 = 124;
 const OP_LOGICAL_EQUAL: u32 = 164;
 const OP_LOGICAL_NOT_EQUAL: u32 = 165;
 const OP_LOGICAL_OR: u32 = 166;
@@ -134,6 +137,26 @@ fn string(words: &[u32]) -> &[u8] {
     &bytes[..len]
 }
 
+/// Where a load of a local reads its value from.
+#[derive(Clone, Copy)]
+enum Definition {
+    /// Not a load the pass follows.
+    Unknown,
+    /// No store reaches it: it reads an undefined value.
+    None,
+    /// The value a store wrote.
+    Stored(u32),
+    /// What the paths into a block bring, a [`Join`] of the function.
+    Join(u32),
+}
+
+/// A local's value where a block's predecessors bring different definitions of it.
+struct Join {
+    /// Each predecessor's label and the definition at its end.
+    sources: Vec<(u32, Definition)>,
+    value: Value,
+}
+
 /// A block of a function: its label's id and its words, from the label to the next.
 struct Block {
     id: u32,
@@ -152,10 +175,16 @@ struct Folder<'a> {
     scalar: Vec<bool>,
     /// Ids of the types of pointers to a function's variables of those types.
     scalar_pointer: Vec<bool>,
-    /// Ids of the function's variables of those types that only loads and stores name. A
-    /// variable's value is what every store to it that runs wrote.
+    /// Ids of the function's variables of those types that only loads and stores name.
     local: Vec<bool>,
     value: Vec<Value>,
+    /// The definition each load of a local reads, by the load's id.
+    reaching: Vec<Definition>,
+    joins: Vec<Join>,
+    /// Scratch for [`reaching_definitions`]: a local's place among its function's, by id.
+    dense: Vec<u32>,
+    /// Scratch for [`drop_unread_variables`].
+    unread: Vec<bool>,
 }
 
 impl Folder<'_> {
@@ -164,6 +193,14 @@ impl Folder<'_> {
             .get(id as usize)
             .copied()
             .unwrap_or(Value::Varying)
+    }
+
+    fn defined(&self, definition: Definition) -> Value {
+        match definition {
+            Definition::Unknown | Definition::None => Value::Varying,
+            Definition::Stored(id) => self.known(id),
+            Definition::Join(join) => self.joins[join as usize].value,
+        }
     }
 
     /// What `inst`, an instruction with a result of a scalar type, computes; `None` for one
@@ -196,8 +233,10 @@ impl Folder<'_> {
                 .get(inst[3] as usize)
                 .copied()
                 .unwrap_or(false)
-                .then_some(a),
-            OP_COPY_OBJECT => Some(a),
+                .then(|| self.defined(self.reaching[inst[2] as usize])),
+            // A bit cast of anything but a 32-bit integer has an operand the pass holds no
+            // value of.
+            OP_COPY_OBJECT | OP_BITCAST => Some(a),
             OP_BITWISE_AND => both(|x, y| x & y, Some(0)),
             OP_BITWISE_OR => both(|x, y| x | y, Some(u32::MAX)),
             OP_BITWISE_XOR => both(|x, y| x ^ y, None),
@@ -401,6 +440,10 @@ pub(super) fn specialize(
         scalar_pointer,
         local: vec![false; bound],
         value,
+        reaching: vec![Definition::Unknown; bound],
+        joins: Vec::new(),
+        dense: vec![u32::MAX; bound],
+        unread: vec![false; bound],
     };
     let mut body: Vec<u32> = Vec::with_capacity(code.len() - functions_at);
     // Undefined values a kept loop's removed continue block hands its header, by type.
@@ -505,6 +548,7 @@ fn fold_function(
     next_id: &mut u32,
 ) -> Option<()> {
     let code = folder.code;
+    folder.joins.clear();
     // The scalar variables only loads and stores name. An id anywhere else, a literal of its
     // value among them, leaves the variable out.
     for item in instructions(&code[..end], at) {
@@ -517,9 +561,7 @@ fn fold_function(
                 .copied()
                 .unwrap_or(false)
         {
-            let initial = inst.get(4).map_or(Value::Unreached, |&id| folder.known(id));
             *folder.local.get_mut(inst[2] as usize)? = true;
-            folder.value[inst[2] as usize] = initial;
         }
     }
     for item in instructions(&code[..end], at) {
@@ -533,7 +575,6 @@ fn fold_function(
             };
             if !named && folder.local.get(word as usize).copied().unwrap_or(false) {
                 folder.local[word as usize] = false;
-                folder.value[word as usize] = Value::Varying;
             }
         }
     }
@@ -597,6 +638,7 @@ fn fold_function(
         &code[start..start + count]
     };
     let loops = |b: &Block| b.merge.is_some_and(|m| op(inst_at(m)) == OP_LOOP_MERGE);
+    let joins_at = reaching_definitions(folder, &blocks, &index)?;
 
     // Which blocks run and which values are constant, to a fixed point: a block runs once an
     // edge that runs reaches it, and a branch on a constant runs one edge.
@@ -610,20 +652,21 @@ fn fold_function(
                 continue;
             }
             let b = &blocks[k];
+            for &join in &joins_at[k] {
+                let Join { sources, value } = &folder.joins[join as usize];
+                let met = sources
+                    .iter()
+                    .filter(|(from, _)| edges.contains(&(*from, b.id)))
+                    .fold(*value, |v, &(_, definition)| {
+                        v.meet(folder.defined(definition))
+                    });
+                if met != *value {
+                    folder.joins[join as usize].value = met;
+                    changed = true;
+                }
+            }
             for item in instructions(&code[..b.end], b.start) {
                 let (_, inst) = item?;
-                if op(inst) == OP_STORE
-                    && inst.len() >= 3
-                    && folder.local.get(inst[1] as usize).copied().unwrap_or(false)
-                {
-                    let stored = folder.known(inst[2]);
-                    let slot = &mut folder.value[inst[1] as usize];
-                    let met = slot.meet(stored);
-                    if met != *slot {
-                        *slot = met;
-                        changed = true;
-                    }
-                }
                 if inst.len() < 4 {
                     continue;
                 }
@@ -716,6 +759,7 @@ fn fold_function(
         }
     }
 
+    let function_at = out.len();
     out.extend_from_slice(&code[at..first_label]);
     for (k, b) in blocks.iter().enumerate() {
         if !runs[k] {
@@ -778,7 +822,334 @@ fn fold_function(
         }
     }
     out.extend_from_slice(&code[function_end..end]);
+    drop_unread_variables(out, function_at, &mut folder.unread)
+}
+
+/// Removes from the function in `out[from..]` its variables that only stores name, with
+/// those stores. `unread` is false for every id on entry and on return.
+fn drop_unread_variables(out: &mut Vec<u32>, from: usize, unread: &mut [bool]) -> Option<()> {
+    let mut variables: Vec<u32> = Vec::new();
+    for item in instructions(out, from) {
+        let (_, inst) = item?;
+        match op(inst) {
+            OP_VARIABLE if inst.get(3) == Some(&STORAGE_FUNCTION) => {
+                *unread.get_mut(inst[2] as usize)? = true;
+                variables.push(inst[2]);
+            }
+            // Their literals are not ids.
+            OP_LINE | OP_NO_LINE | OP_VARIABLE => {}
+            _ => {
+                // A word that names a variable anywhere but as a store's pointer reads it. A
+                // literal with a variable's id only keeps that variable.
+                let skip = if op(inst) == OP_STORE { 2 } else { 1 };
+                for &word in inst.iter().skip(skip) {
+                    if let Some(slot) = unread.get_mut(word as usize) {
+                        *slot = false;
+                    }
+                }
+            }
+        }
+    }
+    let mut to = from;
+    let mut at = from;
+    while at < out.len() {
+        let count = (out[at] >> 16) as usize;
+        let named = match out[at] & 0xffff {
+            OP_VARIABLE => out[at + 2],
+            OP_STORE => out[at + 1],
+            _ => u32::MAX,
+        };
+        if !unread.get(named as usize).copied().unwrap_or(false) {
+            out.copy_within(at..at + count, to);
+            to += count;
+        }
+        at += count;
+    }
+    out.truncate(to);
+    for variable in variables {
+        unread[variable as usize] = false;
+    }
     Some(())
+}
+
+/// The labels `last`, a block's last instruction, may branch to.
+fn targets(last: &[u32]) -> impl Iterator<Item = u32> + '_ {
+    let (one, pairs): (&[u32], &[u32]) = match op(last) {
+        OP_BRANCH => (last.get(1..2).unwrap_or(&[]), &[]),
+        OP_BRANCH_CONDITIONAL => (last.get(2..4).unwrap_or(&[]), &[]),
+        OP_SWITCH => (last.get(2..3).unwrap_or(&[]), last.get(3..).unwrap_or(&[])),
+        _ => (&[], &[]),
+    };
+    one.iter()
+        .copied()
+        .chain(pairs.as_chunks::<2>().0.iter().map(|pair| pair[1]))
+}
+
+/// Finds the definition every load of a local of the function reads: fills `folder.reaching`
+/// and `folder.joins`, and returns each block's joins.
+///
+/// A definition is the nearest store or join that dominates the load, as in SSA form, where
+/// a variable's joins lie on the iterated dominance frontier of its stores. Only the joins a
+/// load reads, directly or through another join, are made.
+fn reaching_definitions(
+    folder: &mut Folder<'_>,
+    blocks: &[Block],
+    index: &HashMap<u32, usize>,
+) -> Option<Vec<Vec<u32>>> {
+    const NONE: u32 = u32::MAX;
+    let code = folder.code;
+    let n = blocks.len();
+    let mut joins_at: Vec<Vec<u32>> = vec![Vec::new(); n];
+
+    // The blocks the entry block reaches, in reverse postorder, and each one's predecessors.
+    let mut successors: Vec<Vec<u32>> = Vec::with_capacity(n);
+    for b in blocks {
+        let count = (code[b.terminator] >> 16) as usize;
+        let last = code.get(b.terminator..b.terminator + count)?;
+        let mut to = Vec::new();
+        for target in targets(last) {
+            to.push(*index.get(&target)? as u32);
+        }
+        successors.push(to);
+    }
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    let mut number = vec![NONE; n];
+    let mut seen = vec![false; n];
+    let mut stack: Vec<(u32, usize)> = vec![(0, 0)];
+    seen[0] = true;
+    while let Some((b, next)) = stack.last_mut() {
+        if let Some(&to) = successors[*b as usize].get(*next) {
+            *next += 1;
+            if !seen[to as usize] {
+                seen[to as usize] = true;
+                stack.push((to, 0));
+            }
+        } else {
+            order.push(*b);
+            stack.pop();
+        }
+    }
+    order.reverse();
+    for (k, &b) in order.iter().enumerate() {
+        number[b as usize] = k as u32;
+    }
+    let mut predecessors: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &b in &order {
+        for &to in &successors[b as usize] {
+            predecessors[to as usize].push(b);
+        }
+    }
+
+    // Each block's immediate dominator (Cooper, Harvey and Kennedy), then the dominator
+    // tree's depths and its preorder intervals, by which one block dominates another.
+    let mut dominator = vec![NONE; n];
+    dominator[0] = 0;
+    loop {
+        let mut changed = false;
+        for &b in order.iter().skip(1) {
+            let mut new = NONE;
+            for &p in &predecessors[b as usize] {
+                if dominator[p as usize] == NONE {
+                    continue;
+                }
+                if new == NONE {
+                    new = p;
+                    continue;
+                }
+                let (mut x, mut y) = (p, new);
+                while x != y {
+                    while number[x as usize] > number[y as usize] {
+                        x = dominator[x as usize];
+                    }
+                    while number[y as usize] > number[x as usize] {
+                        y = dominator[y as usize];
+                    }
+                }
+                new = x;
+            }
+            if dominator[b as usize] != new {
+                dominator[b as usize] = new;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut depth = vec![0u32; n];
+    let mut children: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &b in order.iter().skip(1) {
+        // Reverse postorder visits a block after its dominator.
+        depth[b as usize] = depth[dominator[b as usize] as usize] + 1;
+        children[dominator[b as usize] as usize].push(b);
+    }
+    let mut enters = vec![0u32; n];
+    let mut leaves = vec![0u32; n];
+    let mut clock = 0;
+    let mut stack: Vec<(u32, usize)> = vec![(0, 0)];
+    while let Some((b, next)) = stack.last_mut() {
+        if *next == 0 {
+            enters[*b as usize] = clock;
+            clock += 1;
+        }
+        if let Some(&child) = children[*b as usize].get(*next) {
+            *next += 1;
+            stack.push((child, 0));
+        } else {
+            leaves[*b as usize] = clock;
+            stack.pop();
+        }
+    }
+    let dominates = |x: u32, b: u32| {
+        enters[x as usize] <= enters[b as usize] && leaves[b as usize] <= leaves[x as usize]
+    };
+    let mut frontier: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &b in &order {
+        if predecessors[b as usize].len() < 2 {
+            continue;
+        }
+        for &p in &predecessors[b as usize] {
+            let mut runner = p;
+            while runner != dominator[b as usize] {
+                frontier[runner as usize].push(b);
+                runner = dominator[runner as usize];
+            }
+        }
+    }
+
+    // Each local's stores, an initializer among them: the last of each block, in block order.
+    let mut written: Vec<Vec<(u32, u32)>> = Vec::new();
+    for (k, b) in blocks.iter().enumerate() {
+        if number[k] == NONE {
+            continue;
+        }
+        for item in instructions(&code[..b.end], b.start) {
+            let (_, inst) = item?;
+            let (variable, stored) = match op(inst) {
+                OP_VARIABLE if inst.len() > 4 => (inst[2], inst[4]),
+                OP_STORE if inst.len() >= 3 => (inst[1], inst[2]),
+                _ => continue,
+            };
+            if !folder
+                .local
+                .get(variable as usize)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let v = &mut folder.dense[variable as usize];
+            if *v == NONE {
+                *v = written.len() as u32;
+                written.push(Vec::new());
+            }
+            match written[*v as usize].last_mut() {
+                Some(last) if last.0 == k as u32 => last.1 = stored,
+                _ => written[*v as usize].push((k as u32, stored)),
+            }
+        }
+    }
+    // The blocks where a local's definitions may join: the iterated dominance frontier of
+    // its stores.
+    let mut may_join: Vec<Vec<u32>> = vec![Vec::new(); written.len()];
+    let mut marked = vec![NONE; n];
+    let mut work: Vec<u32> = Vec::new();
+    for (v, written) in written.iter().enumerate() {
+        work.extend(written.iter().map(|&(b, _)| b));
+        while let Some(b) = work.pop() {
+            for &f in &frontier[b as usize] {
+                if marked[f as usize] != v as u32 {
+                    marked[f as usize] = v as u32;
+                    may_join[v].push(f);
+                    work.push(f);
+                }
+            }
+        }
+    }
+
+    // The definition of local `v` at the start of block `b`: the deepest of the joins that
+    // dominate `b` and the stores of blocks that dominate it from above, a store over its
+    // own block's join.
+    let mut made: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut pending: Vec<(u32, u32, u32)> = Vec::new();
+    let mut at_start =
+        |v: u32, b: u32, joins: &mut Vec<Join>, pending: &mut Vec<(u32, u32, u32)>| {
+            let mut best: Option<(u32, Result<u32, u32>)> = None;
+            for &x in &may_join[v as usize] {
+                if dominates(x, b) && best.is_none_or(|(d, _)| depth[x as usize] > d) {
+                    best = Some((depth[x as usize], Err(x)));
+                }
+            }
+            for &(x, stored) in &written[v as usize] {
+                if x != b && dominates(x, b) && best.is_none_or(|(d, _)| depth[x as usize] >= d) {
+                    best = Some((depth[x as usize], Ok(stored)));
+                }
+            }
+            match best {
+                None => Definition::None,
+                Some((_, Ok(stored))) => Definition::Stored(stored),
+                Some((_, Err(x))) => Definition::Join(*made.entry((v, x)).or_insert_with(|| {
+                    joins.push(Join {
+                        sources: Vec::new(),
+                        value: Value::Unreached,
+                    });
+                    let join = joins.len() as u32 - 1;
+                    pending.push((join, v, x));
+                    join
+                })),
+            }
+        };
+
+    // A local's last store in the block at hand, where `stamp` names the block.
+    let mut current = vec![(NONE, 0u32); written.len()];
+    for (k, b) in blocks.iter().enumerate() {
+        if number[k] == NONE {
+            continue;
+        }
+        for item in instructions(&code[..b.end], b.start) {
+            let (_, inst) = item?;
+            let (variable, stored) = match op(inst) {
+                OP_VARIABLE if inst.len() > 4 => (inst[2], Some(inst[4])),
+                OP_STORE if inst.len() >= 3 => (inst[1], Some(inst[2])),
+                OP_LOAD if inst.len() >= 4 => (inst[3], None),
+                _ => continue,
+            };
+            let local = folder
+                .local
+                .get(variable as usize)
+                .copied()
+                .unwrap_or(false);
+            let v = folder.dense.get(variable as usize).copied().unwrap_or(NONE);
+            if !local {
+                continue;
+            }
+            if let Some(stored) = stored {
+                current[v as usize] = (k as u32, stored);
+            } else {
+                // A local nothing stores to has no definition anywhere.
+                let definition = match current.get(v as usize) {
+                    None => Definition::None,
+                    Some(&(stamp, stored)) if stamp == k as u32 => Definition::Stored(stored),
+                    Some(_) => at_start(v, k as u32, &mut folder.joins, &mut pending),
+                };
+                *folder.reaching.get_mut(inst[2] as usize)? = definition;
+            }
+        }
+    }
+    while let Some((join, v, b)) = pending.pop() {
+        joins_at[b as usize].push(join);
+        for &p in &predecessors[b as usize] {
+            let stores = &written[v as usize];
+            let definition = match stores.binary_search_by_key(&p, |&(x, _)| x) {
+                Ok(found) => Definition::Stored(stores[found].1),
+                Err(_) => at_start(v, p, &mut folder.joins, &mut pending),
+            };
+            folder.joins[join as usize]
+                .sources
+                .push((blocks[p as usize].id, definition));
+        }
+    }
+    Some(joins_at)
 }
 
 /// The label an OpSwitch on a 32-bit selector of value `selector` branches to.
@@ -1005,6 +1376,72 @@ mod tests {
         let kept = folded(true);
         assert!(!has(&kept, inst(OP_LABEL, &[13])));
         assert!(has(&kept, inst(OP_BRANCH_CONDITIONAL, &[16, 17, 18])));
+    }
+
+    /// A load reads the store that reaches it: of two stores in a row the nearer, and past a
+    /// branch whose arms leave different values, neither. A variable nothing reads goes with
+    /// its stores.
+    #[test]
+    fn a_load_reads_the_store_that_reaches_it() {
+        let mut parts = vec![
+            named(OP_ENTRY_POINT, &[5, 8], "keep"),
+            inst(OP_DECORATE, &[5, DECORATION_SPEC_ID, 7]),
+            inst(OP_DECORATE, &[30, DECORATION_SPEC_ID, 8]),
+        ];
+        parts.extend(declarations(inst(OP_SPEC_CONSTANT, &[4, 5, 1])));
+        parts.extend([
+            inst(OP_TYPE_POINTER, &[9, STORAGE_FUNCTION, 3]),
+            inst(OP_CONSTANT_TRUE, &[3, 21]),
+            inst(OP_CONSTANT_FALSE, &[3, 22]),
+            // Given no value, so a test of it varies.
+            inst(OP_SPEC_CONSTANT_TRUE, &[3, 30]),
+            inst(OP_FUNCTION, &[1, 8, 0, 2]),
+            inst(OP_LABEL, &[10]),
+            inst(OP_VARIABLE, &[9, 20, STORAGE_FUNCTION]),
+            inst(OP_VARIABLE, &[9, 28, STORAGE_FUNCTION]),
+            inst(OP_STORE, &[28, 21]),
+            inst(OP_STORE, &[20, 21]),
+            inst(OP_LOAD, &[3, 16, 20]),
+            inst(OP_SELECTION_MERGE, &[14, 0]),
+            inst(OP_BRANCH_CONDITIONAL, &[16, 13, 14]),
+            inst(OP_LABEL, &[13]),
+            inst(OP_BRANCH, &[14]),
+            inst(OP_LABEL, &[14]),
+            inst(OP_STORE, &[20, 22]),
+            inst(OP_LOAD, &[3, 19, 20]),
+            inst(OP_SELECTION_MERGE, &[26, 0]),
+            inst(OP_BRANCH_CONDITIONAL, &[30, 24, 25]),
+            inst(OP_LABEL, &[24]),
+            inst(OP_STORE, &[20, 21]),
+            inst(OP_BRANCH, &[26]),
+            inst(OP_LABEL, &[25]),
+            inst(OP_SELECTION_MERGE, &[29, 0]),
+            inst(OP_BRANCH_CONDITIONAL, &[19, 27, 29]),
+            inst(OP_LABEL, &[27]),
+            inst(OP_BRANCH, &[29]),
+            inst(OP_LABEL, &[29]),
+            inst(OP_BRANCH, &[26]),
+            inst(OP_LABEL, &[26]),
+            inst(OP_LOAD, &[3, 23, 20]),
+            inst(OP_SELECTION_MERGE, &[18, 0]),
+            inst(OP_BRANCH_CONDITIONAL, &[23, 17, 18]),
+            inst(OP_LABEL, &[17]),
+            inst(OP_BRANCH, &[18]),
+            inst(OP_LABEL, &[18]),
+            inst(OP_RETURN, &[]),
+            inst(OP_FUNCTION_END, &[]),
+        ]);
+        let folded = specialize(&module(31, &parts), b"keep", &SPEC, &0u32.to_le_bytes()).unwrap();
+        let has = |i: Vec<u32>| folded.windows(i.len()).any(|w| w == i);
+        // The first load reads true, the second false.
+        assert!(has(inst(OP_LABEL, &[13])));
+        assert!(!has(inst(OP_BRANCH_CONDITIONAL, &[16, 13, 14])));
+        assert!(!has(inst(OP_LABEL, &[27])));
+        // The third reads true from one arm and false from the other.
+        assert!(has(inst(OP_BRANCH_CONDITIONAL, &[23, 17, 18])));
+        assert!(!has(inst(OP_VARIABLE, &[9, 28, STORAGE_FUNCTION])));
+        assert!(!has(inst(OP_STORE, &[28, 21])));
+        assert!(has(inst(OP_VARIABLE, &[9, 20, STORAGE_FUNCTION])));
     }
 
     /// A switch on a constant keeps its merge instruction and its one live target: a block
