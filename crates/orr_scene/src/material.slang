@@ -655,7 +655,7 @@ public void texture_prepare(TextureIndex t, uint modes, UvFootprint f, TextureSt
 
 // The level a read under `modes` over footprint `f` on a mip 0 of `size` texels wants of a
 // streamed texture: 0 for a sampler of one mip.
-float texture_wanted_lod(uint modes, UvFootprint f, float2 size)
+public float texture_wanted_lod(uint modes, UvFootprint f, float2 size)
 {
     return (modes & TEXTURE_ONE_MIP) != 0 ? 0.0 : footprint_lod(f, size);
 }
@@ -778,7 +778,7 @@ public uint material_uv_set(MaterialGpu* m, uint slot)
 
 // Whether `slot`, a bound one, reads a texture at `f.uv`, that texture being `t`. A tile set moves
 // `t` to the tile there and `f` into it.
-bool material_reads(MaterialGpu* m, uint slot, uint modes, inout TextureIndex t, inout UvFootprint f)
+public bool material_reads(MaterialGpu* m, uint slot, uint modes, inout TextureIndex t, inout UvFootprint f)
 {
     if (!may2(MAY2_TILES) || (modes & TEXTURE_TILED) == 0)
         return !texture_outside(f.uv, modes);
