@@ -564,14 +564,18 @@ impl StagedKernels {
         }
     }
 
-    /// The ready set that holds `stages` for paths that may meet `may` with the least beyond
-    /// it, which a view is about to run.
-    fn covering(&self, may: u32, stages: &[Stage], now: Instant) -> Option<Arc<StageSet>> {
+    /// The ready set that holds `stages` for paths that may meet `may`, which a view that asked
+    /// its pipelines to hold `asked` is about to run: [`chosen`] of them.
+    fn covering(
+        &self,
+        may: u32,
+        asked: u32,
+        stages: &[Stage],
+        now: Instant,
+    ) -> Option<Arc<StageSet>> {
         let sets = self.sets.lock().unwrap();
-        let set = sets
-            .iter()
-            .filter(|s| s.may & may == may && s.holds(stages))
-            .min_by_key(|s| s.may.count_ones())?;
+        let ready: Vec<&Arc<StageSet>> = sets.iter().filter(|s| s.holds(stages)).collect();
+        let set = ready[chosen(ready.iter().map(|s| s.may), may, asked)?];
         set.ready.get_or_init(|| now);
         *set.used.lock().unwrap() = now;
         Some(Arc::clone(set))
@@ -614,7 +618,7 @@ impl StagedKernels {
     pub(crate) fn prepare(&self, may: u32, stages: &[Stage]) -> Result<bool, Error> {
         let now = Instant::now();
         let stable = self.note(may, now);
-        let covering = self.covering(may, stages, now);
+        let covering = self.covering(may, may, stages, now);
         match &covering {
             None => drop(self.request(may, stages, Urgency::Needed)),
             Some(set) if set.may != may && stable => {
@@ -666,13 +670,13 @@ impl StagedKernels {
         Ok(set)
     }
 
-    /// Pipelines that hold `stages` for paths that may meet `may`, which a frame runs now:
-    /// the ready ones with the least beyond `may`, or with none ready those made for it, after
-    /// waiting for them with queued jobs running on this thread meanwhile.
-    fn wait(&self, may: u32, stages: &[Stage]) -> Result<Arc<StageSet>, Error> {
+    /// Pipelines that hold `stages` for paths that may meet `may`, which a frame of a view that
+    /// asked for `asked` runs now: the ready ones [`chosen`] names, or with none ready those
+    /// made for `may`, after waiting for them with queued jobs running on this thread meanwhile.
+    fn wait(&self, may: u32, asked: u32, stages: &[Stage]) -> Result<Arc<StageSet>, Error> {
         let now = Instant::now();
         self.note(may, now);
-        if let Some(set) = self.covering(may, stages, now) {
+        if let Some(set) = self.covering(may, asked, stages, now) {
             return Ok(set);
         }
         let set = self
@@ -722,8 +726,8 @@ impl StagedKernels {
         );
         let walks = root.features & FEATURE_WALK != 0;
         let stages = source.stages(walks);
-        let set = self.wait(may, &stages)?;
         let asked = memory.asked();
+        let set = self.wait(may, asked, &stages)?;
         if set.may != asked {
             log::debug!(
                 "{source:?} paths that may meet {may:#x} run pipelines made for {:#x}; their                  view asked for {asked:#x}",
@@ -823,6 +827,18 @@ impl StagedKernels {
         );
         Ok(())
     }
+}
+
+/// Which of the ready sets with masks `sets` runs paths that may meet `may` in a frame of a view
+/// that asked its pipelines to hold `asked`: one that holds what the paths may meet; of those
+/// one that holds nothing beyond what the view asked for, where there is one, so that a source
+/// runs its view's pipelines and not another view's that happen to hold as little; and of those
+/// the one that holds least.
+fn chosen(sets: impl Iterator<Item = u32>, may: u32, asked: u32) -> Option<usize> {
+    sets.enumerate()
+        .filter(|(_, set)| set & may == may)
+        .min_by_key(|(_, set)| (set & !asked != 0, set.count_ones()))
+        .map(|(at, _)| at)
 }
 
 /// Which sets [`StagedKernels::prune`] keeps, of sets given by their mask, when they first held
@@ -1109,6 +1125,33 @@ impl StagedMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A source runs the smallest ready set within what its view asked for, before another
+    /// view's set that holds as little or less, and a larger set only with none within.
+    #[test]
+    fn a_source_runs_its_views_pipelines_before_another_views() {
+        // Another view's set of equal size comes first; the view's own is chosen.
+        assert_eq!(
+            chosen([0b1_0111, 0b0_1111].into_iter(), 0b0011, 0b0_1111),
+            Some(1)
+        );
+        // A smaller set made for the source alone, within what the view asked.
+        assert_eq!(
+            chosen([0b1111, 0b0011].into_iter(), 0b0011, 0b1111),
+            Some(1)
+        );
+        // Another view's smaller set that holds a bit this view did not ask for.
+        assert_eq!(
+            chosen([0b1_0011, 0b0_1111].into_iter(), 0b0011, 0b0_1111),
+            Some(1)
+        );
+        // Nothing within what the view asked: the smallest that holds the paths.
+        assert_eq!(
+            chosen([MAY_ALL, 0b1_0011].into_iter(), 0b0011, 0b0111),
+            Some(1)
+        );
+        assert_eq!(chosen([0b0101].into_iter(), 0b0011, 0b0111), None);
+    }
 
     /// A set goes once no frame has run it since a newer one became ready, a compiling one once
     /// no view asks for its mask, and the set that may meet everything never.
