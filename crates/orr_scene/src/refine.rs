@@ -30,6 +30,10 @@ fn key(depth: u8, s: &Sphere, error: f32) -> Key {
     (depth, [x, y, z, s.radius.to_bits()], error.to_bits())
 }
 
+fn group_key(g: &Group) -> Key {
+    key(g.depth, &g.simplified, g.error)
+}
+
 /// A streaming mesh's streamed groups, ordered for the search: 4 B per streamed group, beside
 /// the group table the mount keeps for edits, and the runs of the keys shared across pages.
 pub(crate) struct FinerPages {
@@ -46,10 +50,7 @@ pub(crate) struct FinerPages {
 
 impl FinerPages {
     pub(crate) fn new(groups: Arc<[Group]>, pinned_pages: u32) -> Self {
-        let key_of = |g: u32| {
-            let g = &groups[g as usize];
-            key(g.depth, &g.simplified, g.error)
-        };
+        let key_of = |g: u32| group_key(&groups[g as usize]);
         let mut order: Vec<u32> = (0..groups.len() as u32)
             .filter(|&g| groups[g as usize].page >= pinned_pages)
             .collect();
@@ -102,10 +103,7 @@ impl FinerPages {
     }
 
     fn finer(&self, k: Key) -> u32 {
-        let key_of = |g: &u32| {
-            let g = &self.groups[*g as usize];
-            key(g.depth, &g.simplified, g.error)
-        };
+        let key_of = |g: &u32| group_key(&self.groups[*g as usize]);
         let lo = self.order.partition_point(|g| key_of(g) < k);
         match self.order.get(lo) {
             Some(g) if key_of(g) == k => {}

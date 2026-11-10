@@ -700,10 +700,14 @@ uint rule(MeshGpu* mesh, Placement p, Cluster cl, Lod l, uint k, uint depth, flo
     return self_e <= l.threshold[k] ? RULE_IN : RULE_STANDS_IN;
 }
 
-// Whether a page `ClusterRef.finer` names is not resident: the cluster then stands in for the
-// clusters of the group it was simplified from.
-bool finer_absent(MeshGpu* mesh, uint finer)
+// Whether a page the `ClusterRef.finer` of cluster id `id` names is not resident: the cluster
+// then stands in for the clusters of the group it was simplified from. Only a mesh whose pages
+// stream names any, so no other mesh reads the entry.
+bool finer_absent(SceneRoot* s, MeshGpu* mesh, uint id)
 {
+    if (mesh.pinned_pages == mesh.page_count)
+        return false;
+    uint finer = s.clusters[id].finer;
     if (finer == FINER_NONE)
         return false;
     if ((finer & FINER_RUN) == 0)
@@ -814,7 +818,7 @@ void traverse(uint3 id: SV_DispatchThreadID)
             uint ray = traced ? rule(mesh, p, cl, l, 1, g.depth, g.error) : RULE_OUT;
             if (raster == RULE_STANDS_IN || ray == RULE_STANDS_IN)
             {
-                uint stands = finer_absent(mesh, s.clusters[id_first + i].finer) ? RULE_IN : RULE_OUT;
+                uint stands = finer_absent(s, mesh, id_first + i) ? RULE_IN : RULE_OUT;
                 raster = raster == RULE_STANDS_IN ? stands : raster;
                 ray = ray == RULE_STANDS_IN ? stands : ray;
             }
