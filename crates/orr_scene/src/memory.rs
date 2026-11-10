@@ -2,6 +2,7 @@
 //! frames' preprocess memory.
 
 use std::alloc::Layout;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 use std::sync::Mutex;
@@ -260,6 +261,8 @@ pub(crate) struct Placement {
     /// Units of a block made for ranges no longer than it.
     block_units: u32,
     blocks: Vec<Option<PlacedBlock>>,
+    /// Live blocks by units in use, the fullest first, then by index.
+    by_fill: BTreeSet<(Reverse<u32>, u32)>,
     used: u64,
 }
 
@@ -284,6 +287,7 @@ impl Placement {
             unit,
             block_units: block_bytes.div_ceil(unit) as u32,
             blocks: Vec::new(),
+            by_fill: BTreeSet::new(),
             used: 0,
         }
     }
@@ -294,7 +298,8 @@ impl Placement {
     }
 
     /// A range of `units` units at a multiple of `align` units, right after `after` when those
-    /// units are free, else in a block with room. `None` when no block has room.
+    /// units are free, else in the fullest block with room, so that blocks with few units in
+    /// use drain and go. `None` when no block has room.
     fn find(&mut self, units: u32, align: u32, after: Option<PoolSlot>) -> Option<PoolSlot> {
         let next = after.and_then(|a| {
             let first = a.first + a.units;
@@ -302,9 +307,10 @@ impl Placement {
             b.ranges.take(first, units).then_some((a.block, first))
         });
         let (block, first) = next.or_else(|| {
-            self.blocks.iter_mut().enumerate().find_map(|(i, b)| {
-                let first = b.as_mut()?.ranges.alloc_aligned(units, align)?;
-                Some((i as u32, first))
+            let blocks = &mut self.blocks;
+            self.by_fill.iter().find_map(|&(_, i)| {
+                let b = blocks[i as usize].as_mut().expect("a live block");
+                Some((i, b.ranges.alloc_aligned(units, align)?))
             })
         })?;
         Some(self.took(block, first, units))
@@ -312,8 +318,10 @@ impl Placement {
 
     fn took(&mut self, block: u32, first: u32, units: u32) -> PoolSlot {
         let b = self.blocks[block as usize].as_mut().expect("live block");
+        self.by_fill.remove(&(Reverse(b.used), block));
         b.slots += 1;
         b.used += units;
+        self.by_fill.insert((Reverse(b.used), block));
         self.used += u64::from(units);
         PoolSlot {
             block,
@@ -360,12 +368,15 @@ impl Placement {
         let entry = &mut self.blocks[slot.block as usize];
         let b = entry.as_mut().expect("slot of a live block");
         b.ranges.free(slot.first, slot.units);
+        self.by_fill.remove(&(Reverse(b.used), slot.block));
         b.slots -= 1;
         b.used -= slot.units;
         self.used -= u64::from(slot.units);
         let empty = b.slots == 0;
         if empty {
             *entry = None;
+        } else {
+            self.by_fill.insert((Reverse(b.used), slot.block));
         }
         empty
     }
@@ -724,7 +735,7 @@ impl PreprocessArenas {
 
 #[cfg(test)]
 mod tests {
-    use super::BestFit;
+    use super::{BestFit, Placement, PoolSlot};
 
     #[test]
     fn best_fit_takes_the_shortest_run_that_holds_a_request_and_frees_merge() {
@@ -744,5 +755,104 @@ mod tests {
         a.free(35, 30);
         a.free(30, 4);
         assert_eq!(a.alloc(100), Some(0), "every run merged back");
+    }
+
+    /// Ranges of random sizes and alignments, some asked right after a live one, placed and
+    /// freed at random against a map of every block's units: no two overlap, a range follows
+    /// the one it asks to when those units are free, else it takes the fullest block with room
+    /// and a new block only when none has room, and a block goes exactly at its last free.
+    #[test]
+    fn ranges_fill_the_fullest_block_with_room_and_a_block_goes_at_its_last_free() {
+        const BLOCK: u32 = 64;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rng = move |below: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(below)) as u32
+        };
+        let mut p = Placement::new(256, u64::from(BLOCK) * 256);
+        // Per block index, which units hold a live range, while the block lives.
+        let mut map: Vec<Option<Vec<bool>>> = Vec::new();
+        let mut live: Vec<PoolSlot> = Vec::new();
+        let used = |m: &[bool]| m.iter().filter(|&&u| u).count() as u32;
+        let room = |m: &[bool], units: u32, align: u32| {
+            (0..m.len() as u32).step_by(align as usize).any(|at| {
+                at + units <= m.len() as u32 && !m[at as usize..][..units as usize].contains(&true)
+            })
+        };
+        for step in 0..8_000 {
+            if !live.is_empty() && rng(5) < 2 {
+                let slot = live.swap_remove(rng(live.len() as u32) as usize);
+                let m = map[slot.block as usize].as_mut().expect("a live block");
+                m[slot.first as usize..][..slot.units as usize].fill(false);
+                let last = !live.iter().any(|s| s.block == slot.block);
+                assert_eq!(
+                    p.free(slot),
+                    last,
+                    "step {step}: a block went early or stayed"
+                );
+                if last {
+                    map[slot.block as usize] = None;
+                }
+                continue;
+            }
+            let units = if rng(50) == 0 {
+                BLOCK + rng(BLOCK)
+            } else {
+                1 + rng(12)
+            };
+            let align = [1, 1, 2, 4][rng(4) as usize];
+            let after =
+                (!live.is_empty() && rng(3) == 0).then(|| live[rng(live.len() as u32) as usize]);
+            let follows = after.is_some_and(|a| {
+                let m = map[a.block as usize].as_ref().expect("a live block");
+                let at = (a.first + a.units) as usize;
+                at + units as usize <= m.len() && !m[at..][..units as usize].contains(&true)
+            });
+            let fullest = map
+                .iter()
+                .flatten()
+                .filter(|m| room(m, units, align))
+                .map(|m| used(m))
+                .max();
+            let slot = match p.find(units, align, after) {
+                Some(s) => s,
+                None => {
+                    assert!(
+                        fullest.is_none() && !follows,
+                        "step {step}: a new block past room"
+                    );
+                    let s = p.add(p.block_for(units), units, align);
+                    let i = s.block as usize;
+                    if i >= map.len() {
+                        map.resize(i + 1, None);
+                    }
+                    assert!(map[i].is_none(), "step {step}: a new block over a live one");
+                    map[i] = Some(vec![false; p.block_for(units) as usize]);
+                    s
+                }
+            };
+            let m = map[slot.block as usize].as_mut().expect("a live block");
+            if follows {
+                let a = after.expect("an earlier range");
+                assert_eq!(
+                    (slot.block, slot.first),
+                    (a.block, a.first + a.units),
+                    "step {step}"
+                );
+            } else {
+                assert_eq!(slot.first % align, 0, "step {step}: alignment");
+                let before = used(m);
+                assert!(
+                    fullest.is_none_or(|f| f == before),
+                    "step {step}: block of {before} used units past one of {fullest:?}"
+                );
+            }
+            let range = &mut m[slot.first as usize..][..units as usize];
+            assert!(!range.contains(&true), "step {step}: ranges overlap");
+            range.fill(true);
+            live.push(slot);
+        }
     }
 }

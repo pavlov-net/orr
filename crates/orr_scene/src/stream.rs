@@ -422,10 +422,10 @@ pub(crate) struct Streaming {
     retired_pages: Vec<(u64, PageFree)>,
     /// The first cluster id each streamed mesh page loading holds, and its cluster count.
     loading_ids: FxHashMap<Key, (u32, u32)>,
-    /// Mesh pages, and the other pool units where `units` is this pool.
+    /// Mesh pages.
     pool: Arc<Mutex<Pool>>,
-    /// Hierarchy and instance pages: the stream pool, or staging memory where it is
-    /// device-local, which they land in with no copy.
+    /// Hierarchy and instance pages, in blocks of their own: DeviceLocal memory, or staging
+    /// memory where it is device-local, which they land in with no copy.
     units: Arc<Mutex<Pool>>,
     staging: Arc<Mutex<Pool>>,
     tiles: Arc<Mutex<Pool>>,
@@ -498,9 +498,9 @@ impl Streaming {
         budgets[ResidencyClass::InstancePages as usize] = b.instance_page_pool;
         budgets[ResidencyClass::UserBlobs as usize] = b.user_blob_pool;
         let caps = device.caps();
-        // Mesh pages take the stream pool and the CLAS pool, tiles the tile pool, and the units
-        // the stream pool places otherwise, node pages among them, take `units`; user blobs take
-        // the consumer's memory.
+        // Mesh pages take the stream pool and the CLAS pool, tiles the tile pool, and the other
+        // units, node pages among them, take `units`, as they come and go apart from mesh pages;
+        // user blobs take the consumer's memory.
         let units_kind = if caps.staging_device_local {
             MemoryKind::Staging
         } else {
@@ -542,16 +542,12 @@ impl Streaming {
                 period: response_period(fif),
                 in_flight: b.in_flight_bytes,
             }),
-            units: if caps.staging_device_local {
-                Arc::new(Mutex::new(Pool::new(
-                    units_kind,
-                    256,
-                    block,
-                    "stream units",
-                )))
-            } else {
-                Arc::clone(&pool)
-            },
+            units: Arc::new(Mutex::new(Pool::new(
+                units_kind,
+                256,
+                block,
+                "stream units",
+            ))),
             pool,
             // Sector units, so that reads go straight into a slot.
             staging: Arc::new(Mutex::new(
@@ -608,10 +604,7 @@ impl Streaming {
 
     /// The streamed pools' fill and the CLAS pool's pages.
     pub(crate) fn memory(&self, out: &mut SceneMemory) {
-        let mut pools = vec![&self.pool, &self.staging, &self.tiles];
-        if !Arc::ptr_eq(&self.units, &self.pool) {
-            pools.push(&self.units);
-        }
+        let pools = [&self.pool, &self.units, &self.staging, &self.tiles];
         out.pools
             .extend(pools.into_iter().map(|p| p.lock().unwrap().fill()));
         if let Some(c) = &self.clas {
