@@ -3,7 +3,8 @@
 //! with old keys never link stale entries.
 //!
 //! The fixtures avoid the BCn encoders and transcendental math, whose results can differ
-//! between CPUs and platforms.
+//! between CPUs and platforms. The C++ libraries compile without fused multiply-adds
+//! (`.cargo/config.toml`), which round differently.
 
 mod common;
 #[path = "common/skinned.rs"]

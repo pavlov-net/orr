@@ -1,0 +1,5 @@
+# Cooked bytes hold what the cook's C++ libraries compute, meshoptimizer's simplifier among
+# them, and are the same from every platform. Clang rounds `a * b + c` once where the target
+# has the instruction, as arm64 does, and twice elsewhere.
+[env]
+CXXFLAGS_aarch64_apple_darwin = "-ffp-contract=off"
