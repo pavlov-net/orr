@@ -404,6 +404,13 @@ impl Loading {
         self.run_one_through(Queue::Idle)
     }
 
+    /// [`Self::run_one`] among the jobs that come no later than those queued at `urgency`: for
+    /// threads that help a wait for jobs of that urgency without taking on what is queued
+    /// behind them.
+    pub fn run_one_at(&self, urgency: Urgency) -> bool {
+        self.run_one_through(urgency.queue())
+    }
+
     fn run_one_through(&self, last: Queue) -> bool {
         let job = self.jobs.lock().unwrap().pop_through(last);
         job.map(|job| job()).is_some()

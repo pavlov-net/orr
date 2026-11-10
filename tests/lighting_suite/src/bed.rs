@@ -32,7 +32,7 @@ use orr_scene::{
     MediumProxyId, MountId, Opacity, PackSource, ProducerDesc, ProducerId, ProducerUpdate,
     Projection, RasterView, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter,
     Scenes, SkinStateGpu, SkinnedDesc, TextureFilter, TransformGroupDesc, TransformGroupId,
-    ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
+    Urgency, ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 
@@ -2809,12 +2809,13 @@ impl Paths {
                 .prepare_paths(lighting, &needs, settings)
                 .unwrap();
         // The pipelines these paths first ask for compile on threads of their own, which go on
-        // with other beds' compiles after this one's are ready: the frame records once they
-        // return, with its own pipelines held for it until then.
+        // with the compiles other beds wait for after this one's are ready: the frame records
+        // once they return, with its own pipelines held for it until then. They leave what is
+        // queued behind those, a rest stage's compile, to the frame that waits for it.
         let waited = waits.then(|| {
             std::thread::scope(|threads| {
                 for _ in 1..compile_threads() {
-                    threads.spawn(|| while self.loading.run_one() {});
+                    threads.spawn(|| while self.loading.run_one_at(Urgency::Useful) {});
                 }
                 self.kernels.wait_paths(lighting, &needs, settings).unwrap()
             })
