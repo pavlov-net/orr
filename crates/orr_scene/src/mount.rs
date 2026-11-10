@@ -61,6 +61,8 @@ use crate::{
     NeuralTextureGpu, PartGpu, Result, SetTablesGpu, SkinMeshGpu, TextureStreamGpu, material_flags,
 };
 
+mod probe;
+
 /// Where a pack's bytes come from.
 #[derive(Clone, Debug)]
 pub enum PackSource {

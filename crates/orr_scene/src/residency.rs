@@ -58,6 +58,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::MountId;
+use crate::probe::{PlanOutcome, UnitState, UnitStatus};
 
 /// Frames a resident unit is kept after its last request or touch.
 pub(crate) const HOLD_FRAMES: u64 = 30;
@@ -604,6 +605,9 @@ pub(crate) struct Residency {
     /// Per class, its units' shared address range ran out since the last `react`.
     range_full: [bool; CLASSES],
     stats: ResidencyStats,
+    /// While a pixel probe waits, what each plan did with each request it held, and the plan's
+    /// frame.
+    outcomes: Option<FxHashMap<Key, (u64, PlanOutcome)>>,
 }
 
 impl Residency {
@@ -633,6 +637,7 @@ impl Residency {
             out_of_memory: false,
             range_full: [false; CLASSES],
             stats: ResidencyStats::default(),
+            outcomes: None,
         };
         r.refresh();
         r
@@ -640,6 +645,38 @@ impl Residency {
 
     pub(crate) fn stats(&self) -> &ResidencyStats {
         &self.stats
+    }
+
+    /// Keeps what each plan does with the requests it holds, for pixel probes, or stops.
+    pub(crate) fn note_outcomes(&mut self, on: bool) {
+        if on != self.outcomes.is_some() {
+            self.outcomes = on.then(FxHashMap::default);
+        }
+    }
+
+    fn note(&mut self, k: Key, frame: u64, outcome: PlanOutcome) {
+        if let Some(o) = &mut self.outcomes {
+            o.insert(k, (frame, outcome));
+        }
+    }
+
+    /// What a pixel probe reports of `k`: its state and what the last plan that held a request
+    /// for it did with it, while outcomes are kept.
+    pub(crate) fn status(&self, k: Key) -> Option<UnitStatus> {
+        let u = self.unit(k)?;
+        Some(UnitStatus {
+            state: match u.state {
+                State::Absent => UnitState::Absent,
+                State::Loading => UnitState::Loading,
+                State::Resident => UnitState::Resident,
+                State::Failed => UnitState::Failed,
+            },
+            pinned: u.pinned,
+            locks: u.locks,
+            touched: u.touched,
+            requested: self.requests.contains_key(&k),
+            outcome: self.outcomes.as_ref().and_then(|o| o.get(&k).copied()),
+        })
     }
 
     /// What the loading thread's mount reads share the in-flight limit through.
@@ -1196,6 +1233,13 @@ impl Residency {
     /// Takes back the load of `k` this step's plan started: absent again, its bytes released,
     /// and counted for why instead of loaded.
     fn cancel(&mut self, k: Key, why: Held) {
+        if let Some(&(frame, _)) = self.outcomes.as_ref().and_then(|o| o.get(&k)) {
+            let held = match why {
+                Held::Waiting => PlanOutcome::HeldWaiting,
+                Held::ClusterIds => PlanOutcome::HeldClusterIds,
+            };
+            self.note(k, frame, held);
+        }
         self.release_load(k);
         self.stats.loads -= 1;
         match why {
@@ -1390,6 +1434,7 @@ impl Residency {
             match self.unit(k).map(|u| u.state) {
                 Some(State::Absent) => {}
                 Some(State::Loading) if !started.contains(&k) => {
+                    self.note(k, frame, PlanOutcome::Loading);
                     waiting += 1;
                     continue;
                 }
@@ -1397,12 +1442,14 @@ impl Residency {
             }
             // One request the limit holds back is enough to know the lane's demand.
             if full && short[lane] {
+                self.note(k, frame, PlanOutcome::InFlight);
                 dropped[lane] += 1;
                 continue;
             }
             let chain = match self.closure(k, &started) {
                 Ok(chain) => chain,
                 Err(State::Loading) => {
+                    self.note(k, frame, PlanOutcome::DependencyLoading);
                     waiting += 1;
                     continue;
                 }
@@ -1412,6 +1459,11 @@ impl Residency {
             let admitted = match self.admit(&chain, full, frame, &mut plan.evictions) {
                 Ok(n) => n,
                 Err(s) => {
+                    let outcome = match s {
+                        Short::InFlight => PlanOutcome::InFlight,
+                        Short::Budget => PlanOutcome::OverBudget,
+                    };
+                    self.note(k, frame, outcome);
                     short[lane] |= s == Short::InFlight;
                     dropped[lane] += 1;
                     continue;
@@ -1420,8 +1472,11 @@ impl Residency {
             let longest = &mut self.stats.longest_closure;
             *longest = (*longest).max(chain.len() as u32);
             if admitted < chain.len() {
+                self.note(k, frame, PlanOutcome::DependenciesFirst);
                 waiting += 1;
                 short[lane] = true;
+            } else {
+                self.note(k, frame, PlanOutcome::Started);
             }
             for &u in &chain[..admitted] {
                 self.start_load(u, lane);

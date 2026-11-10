@@ -50,6 +50,8 @@ use crate::traverse::{CutInputs, CutPipelines, CutSizes, CutStats, Cuts, PageFee
 use crate::upload::{Record, scatter};
 use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constants};
 use crate::world::{WorldPos, needs_rebase, origin_for};
+mod probe;
+
 use crate::{
     BlobId, BlobTarget, EditDesc, EditId, EditRef, Error, ExposureState, ProducerBatch, Result,
     SceneRoot, SeenView, TextureStreamGpu,
@@ -483,6 +485,8 @@ struct Core {
     patterns: Patterns,
     tess: TessKernels,
     dice_pixels: f32,
+    /// The pixel probe's pipelines, made at the first probe.
+    probe: Option<[ComputePipeline; 2]>,
 }
 
 /// Global scene state, mounted packs and every resident scene. Render thread only.
@@ -649,6 +653,7 @@ impl Scenes {
                 patterns,
                 tess,
                 dice_pixels: desc.dice_pixels,
+                probe: None,
             },
         })
     }

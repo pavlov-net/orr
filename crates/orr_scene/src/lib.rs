@@ -58,6 +58,7 @@ mod mount;
 mod neural;
 mod pattern;
 mod pipelines;
+mod probe;
 mod producer;
 mod ptlas;
 mod raster;
@@ -98,6 +99,9 @@ pub use memory::{ClasPages, PoolFill, SceneMemory, WindowFill};
 pub use mount::{ClipRef, InstancePage, LoadState, MountId, PackSource, PageId, SkeletonRef};
 pub use neural::NeuralTextures;
 pub use pipelines::{PipelineId, ReloadReport};
+pub use probe::{
+    PixelProbe, PlanOutcome, ProbeSettings, ProbeTap, ProbeTile, ProbeView, UnitState, UnitStatus,
+};
 pub use producer::{
     ClusterTopology, Opacity, OriginPolicy, ProducerDesc, ProducerId, ProducerStats, ProducerUpdate,
 };
@@ -112,6 +116,7 @@ pub use scenes::{
     Budgets, ConsumerMarker, DetailStats, Frame, FrameDesc, FrameStats, PoolSize, RendererDesc,
     SceneCompute, Scenes,
 };
+pub use shaders::probe::{ProbeGpu, ProbeTexture};
 pub(crate) use shaders::types::{
     BlasJob, CutKey, DecalBinGpu, EditGpu, FeedbackGpu, GroupGpu, MaskGpu, MediumProxyGpu,
     NeuralMipGpu, NeuralSetGpu, NeuralTextureGpu, NodeItem, PartGpu, PartListGpu, ProducerGpu,

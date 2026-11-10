@@ -59,6 +59,7 @@ mod environment;
 mod media;
 pub mod openpbr;
 mod particles;
+mod probe;
 mod scene;
 mod staged;
 mod subsurface;
@@ -76,10 +77,12 @@ pub use media::{
 use orr_scene::orr_gpu::KernelSet;
 pub use orr_scene::{DirectionalLight, DiscProfile, Light, LightId, PathEntry};
 pub use particles::ParticleDraw;
+pub use probe::{OriginProbe, OriginProbes};
 pub use scene::{
     LIGHT_TILE_SIZE, LIGHT_TILES, LightingStats, SceneLighting, SceneLightingSettings, ScenePass,
     WorldCacheSettings,
 };
+pub use shaders::probe::OriginProbeGpu;
 pub use shaders::types::{
     DirectionalState, EmissiveSelection, LightSample, LightSetGpu, ParticleLighting, WorldCacheGpu,
 };

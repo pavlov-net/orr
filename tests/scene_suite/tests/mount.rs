@@ -2387,6 +2387,137 @@ fn an_alpha_tested_quad_in_view_loads_the_opacity_tiles_its_raster_alpha_test_re
     assert_clean();
 }
 
+/// Pixel probes of a quad in view whose material reads a streamed texture: the first frame's
+/// tap wants a mip above the tail while only the tail is resident, and the probe says so, names
+/// the texture and finds the tile it wants absent; once the tap's feedback has loaded that tile
+/// the probe reads it resident and the tap no coarser than the mip it wants.
+#[test]
+fn pixel_probes_report_the_mip_a_tap_wants_and_the_finest_resident_under_it() {
+    use orr_scene::{Lens, Projection, TextureFilter, UnitState, ViewDesc};
+
+    let _serial = serial();
+    let dev = device();
+    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let m = scenes.mount(PackSource::Memory(Arc::clone(tiled_pack())));
+    ready(&mut scenes, m);
+    let leaf = scenes.mount(PackSource::Memory(Arc::clone(leaf_pack())));
+    ready(&mut scenes, leaf);
+    let quad = scenes.model(leaf, AssetId::from_name("quad")).unwrap();
+    let name = TILED[0].0;
+    let texture = scenes.texture(m, AssetId::from_name(name)).unwrap();
+    let material = scenes
+        .material(m, AssetId::from_name(&format!("{name}/material")))
+        .unwrap();
+    let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
+    let history = scenes.create_view_history().unwrap();
+    let list = [scene];
+    let desc = FrameDesc {
+        time: FrameTime::default(),
+        scenes: &list,
+        low_latency: None,
+    };
+    {
+        let f = scenes.begin_frame(&desc).unwrap();
+        let mut s = f.scene(scene).unwrap();
+        s.material_sets(0, 1).unwrap()[0] = material;
+        let group = s
+            .create_transform_group(&TransformGroupDesc {
+                count: 1,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .unwrap();
+        s.transforms(group, 0, 1).unwrap()[0] =
+            Affine3::from_translation(Vec3::new(0.0, 0.0, -2.2)).into();
+        s.add_instances(&InstancesDesc {
+            model: quad,
+            copies: 1,
+            transforms: group,
+            first: 0,
+            pose: None,
+            material_set: Some(0),
+            flags: InstanceFlags::RASTER,
+            rt_range: 1000.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+        drop(s);
+        orr_scene::testing::wait(f.end(&[]).unwrap());
+    }
+    let probed = |scenes: &mut Scenes| {
+        let mut f = scenes.begin_frame(&desc).unwrap();
+        f.scene(scene).unwrap().set_focus(DVec3::ZERO);
+        let view = f
+            .raster_view(&ViewDesc {
+                scene,
+                history,
+                position: DVec3::ZERO,
+                rotation: Quat::IDENTITY,
+                projection: Projection {
+                    fov_y: 0.9,
+                    near: 0.05,
+                },
+                lens: Lens::default(),
+                render_extent: orr_math::UVec2::splat(512),
+                output_extent: orr_math::UVec2::splat(512),
+                jitter: Vec2::ZERO,
+                camera_cut: false,
+                mip_bias: 0.0,
+                texture_filter: TextureFilter::Hardware,
+            })
+            .unwrap();
+        f.probe(&view, [256, 256]).unwrap();
+        let id = f.id();
+        orr_scene::testing::wait(f.end(&[]).unwrap());
+        let mut probes = scenes.probes(history, id);
+        assert_eq!(probes.len(), 1);
+        let probe = probes.remove(0);
+        assert!(probe.hit(), "{probe}");
+        let tap = probe
+            .textures
+            .iter()
+            .find(|t| t.gpu.texture == texture.0)
+            .unwrap_or_else(|| panic!("no tap of {name}:\n{probe}"))
+            .clone();
+        assert_eq!(tap.name.as_deref(), Some(name), "{probe}");
+        (probe, tap)
+    };
+    let (probe, tap) = probed(&mut scenes);
+    let tail = tap.gpu.tail_mip as f32;
+    assert!(tail > 0.0 && tap.gpu.wanted < tail, "{probe}");
+    assert_eq!(
+        tap.gpu.resident, tail,
+        "only the tail is resident at first:\n{probe}"
+    );
+    let tile = tap
+        .tile
+        .unwrap_or_else(|| panic!("no tile state:\n{probe}"));
+    assert_eq!(tile.mip, tap.gpu.wanted.floor().max(0.0) as u32, "{probe}");
+    assert!(
+        !tile.mapped && tile.status.state != UnitState::Resident,
+        "{probe}"
+    );
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the tap's tile never arrived"
+        );
+        let (probe, tap) = probed(&mut scenes);
+        let tile = tap
+            .tile
+            .unwrap_or_else(|| panic!("no tile state:\n{probe}"));
+        if tap.gpu.resident <= tap.gpu.wanted.floor().max(0.0) {
+            assert!(tile.mapped, "{probe}");
+            assert_eq!(tile.status.state, UnitState::Resident, "{probe}");
+            break;
+        }
+    }
+    assert_clean();
+}
+
 /// A tile set mounts as a table of its tiles' heap indices, its cells without one left empty, and
 /// each tile streams as a texture a material binds does.
 #[test]

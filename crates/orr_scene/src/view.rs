@@ -261,7 +261,7 @@ pub(crate) struct ViewHistory {
     pub(crate) exposure: Allocation<ExposureState>,
     /// The exposure slot the view's next render reads.
     slot: u32,
-    previous: Option<ViewDesc>,
+    pub(crate) previous: Option<ViewDesc>,
     pub(crate) targets: Option<ViewTargets>,
     /// The transient targets of the view's render, orr_scene's and the later passes'.
     pub(crate) arena: ViewArena,
@@ -276,6 +276,8 @@ pub(crate) struct ViewHistory {
     /// rendered into each slot.
     pub(crate) readback: Allocation<u32>,
     pub(crate) rendered: Vec<Option<u64>>,
+    /// Pixel probes recorded into frames not yet read.
+    pub(crate) probes: Vec<crate::probe::PendingProbe>,
 }
 
 impl ViewHistory {
@@ -297,6 +299,7 @@ impl ViewHistory {
             draws: Vec::new(),
             rendered: vec![None; readback.len() as usize],
             readback,
+            probes: Vec::new(),
         }
     }
 }

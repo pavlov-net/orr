@@ -63,6 +63,8 @@ use crate::shaders::page_decode::PageDecodeRoot;
 use crate::tiles::{TexResidency, TexStream, TextureFeedback, Tile, compaction_move};
 use crate::{Budgets, ClusterRef, Error, LoadState, MountId, Result, RtCutGpu, TextureStreamGpu};
 
+mod probe;
+
 /// Tiles one step moves beside their texture's others, at most.
 const MOVES_PER_STEP: usize = 8;
 /// Frames a tile goes unused before it may move: its map coarsens until it lands again.

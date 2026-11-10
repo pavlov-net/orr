@@ -49,7 +49,7 @@ use orr_scene::{
     SkinnedGpu, SkinnedPageRef, SlotCutGpu, TextureFilter, TransformGroupDesc, TransformGroupId,
     ViewDesc, ViewHistoryId,
 };
-use orr_scene::{Budgets, InstancePageRef, PageId, PoolSize, RequestSource};
+use orr_scene::{Budgets, InstancePageRef, PageId, PixelProbe, PoolSize, RequestSource};
 use scene_suite::shaders::{
     codec, fracture, grid, pose, skin_pose, surface_at, surface_params, trace, triangle_at,
 };
@@ -2582,8 +2582,20 @@ fn shoot_computed(
     placed: &Placed,
     shot: &Shot,
     write: impl FnOnce(&mut SceneWriter<'_>),
-    mut compute: impl FnMut(&mut SceneCompute<'_, '_>),
+    compute: impl FnMut(&mut SceneCompute<'_, '_>),
 ) -> Frame {
+    shoot_probed(w, placed, shot, write, compute, &[]).0
+}
+
+/// [`shoot_computed`] with pixel probes of `pixels`, read once the frame completes.
+fn shoot_probed(
+    w: &mut World,
+    placed: &Placed,
+    shot: &Shot,
+    write: impl FnOnce(&mut SceneWriter<'_>),
+    mut compute: impl FnMut(&mut SceneCompute<'_, '_>),
+    pixels: &[[u32; 2]],
+) -> (Frame, Vec<PixelProbe>) {
     let list = [placed.scene];
     let mut f = w
         .scenes
@@ -2624,8 +2636,13 @@ fn shoot_computed(
             texture_filter: TextureFilter::Hardware,
         })
         .unwrap();
+    for &pixel in pixels {
+        f.probe(&view, pixel).unwrap();
+    }
+    let id = f.id();
     wait(f.end(&[]).unwrap());
-    read_back(&view)
+    let probes = w.scenes.probes(placed.history, id);
+    (read_back(&view), probes)
 }
 
 /// What the `trace` kernels wrote for one view.
@@ -6697,6 +6714,121 @@ fn stand_in(bytes: &Arc<[u8]>, paged: bool) {
         }
     }
     assert_eq!(w.scenes.residency().failed, 0);
+}
+
+/// Pixel probes over the streaming ground while its pages land a request a frame: each names
+/// the copy, its model and the visible cluster the visibility buffer holds, gives the
+/// cluster's group, DAG depth and projected errors as the CPU rule computes them at the focus,
+/// and says it stands in exactly when its own error is over the threshold and the group it was
+/// simplified from cannot be drawn. Early frames show stand-ins, and once every page is
+/// resident none.
+#[test]
+fn pixel_probes_name_the_drawn_cluster_its_depth_and_whether_it_stands_in() {
+    let _serial = serial();
+    let mut w = World::with(&RendererDesc {
+        rt_merge_pixels: 0.0,
+        budgets: Budgets {
+            mesh_resident_max: 0,
+            traversal_requests: 1,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    });
+    let items = [Item {
+        model: "dag ground",
+        linear: Mat3::from_rotation_x(0.25) * Mat3::from_diagonal(Vec3::new(2.0, 1.0, 4.0)),
+        at: Vec3::new(0.0, -1.0, -12.0),
+    }];
+    let placed = place(&mut w, &items);
+    let model = w.model("dag ground");
+    let eye = Vec3::new(0.3, 1.2, 4.0);
+    let target = Vec3::new(0.0, 0.0, -10.0);
+    let m = CpuMesh::of("dag ground");
+    let clusters = m.clusters();
+    let p = Projector::new(&items[0], eye);
+    let slot = placed.ranges[0].first;
+    let archive = Archive::from_memory(Arc::clone(pack())).unwrap();
+    let ground = archive.find(AssetId::from_name("dag ground")).unwrap();
+    let mesh_id = ModelInfo::parse(&blob(&archive, ground, 0))
+        .unwrap()
+        .header
+        .mesh;
+    let mesh_name = archive.name(archive.find(mesh_id).unwrap()).to_owned();
+    let pixels: Vec<[u32; 2]> = [0.3, 0.5, 0.7]
+        .into_iter()
+        .flat_map(|x| {
+            [0.55, 0.7, 0.85]
+                .map(|y| [(x * EXTENT[0] as f32) as u32, (y * EXTENT[1] as f32) as u32])
+        })
+        .collect();
+    let close = |a: f32, b: f32| (a - b).abs() <= 1e-3 * b.abs().max(1e-3);
+    let (mut standing, mut whole) = (0, false);
+    let start = Instant::now();
+    for frame in 1.. {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the ground's pages never all landed; {standing} probes stood in"
+        );
+        let shot = Shot::at(eye.as_dvec3(), target.as_dvec3(), frame);
+        let (g, probes) = shoot_probed(&mut w, &placed, &shot, |_| {}, |_| {}, &pixels);
+        let (pages, _, nodes) = mesh_pages(&w, model);
+        let resident = Resident {
+            pages: pages.iter().map(|&a| a != 0).collect(),
+            nodes: nodes.iter().map(|&a| a != 0).collect(),
+        };
+        assert_eq!(probes.len(), pixels.len());
+        for (probe, pixel) in probes.iter().zip(&pixels) {
+            let at = (pixel[1] * EXTENT[0] + pixel[0]) as usize;
+            let what = format!("frame {frame}, pixel {pixel:?}:\n{probe}");
+            assert_eq!(probe.hit(), g.ids[at] != 0, "{what}");
+            if !probe.hit() {
+                continue;
+            }
+            let gpu = &probe.gpu;
+            assert_eq!(gpu.copy + 1, g.ids[at], "{what}");
+            assert_eq!(gpu.copy, slot, "{what}");
+            assert_eq!(gpu.cluster + 1, g.clusters[at], "{what}");
+            assert_eq!(gpu.model, model.0, "{what}");
+            assert_eq!(probe.model_name.as_deref(), Some("dag ground"), "{what}");
+            assert_eq!(
+                probe.mesh_name.as_deref(),
+                Some(mesh_name.as_str()),
+                "{what}"
+            );
+            assert_eq!(gpu.raster_threshold, 1.0, "{what}");
+            let c = &clusters[gpu.cluster as usize];
+            assert_eq!(probe.depth(), Some(c.depth), "{what}");
+            assert_eq!(probe.group.map(|(i, _)| i), Some(c.group), "{what}");
+            let own = p.error(&c.cluster.self_sphere, c.cluster.self_error);
+            let parent = p.error(&c.cluster.parent_sphere, c.cluster.parent_error);
+            assert!(
+                close(gpu.self_pixels, own),
+                "{what}: self {own} px on the CPU"
+            );
+            assert!(
+                parent.is_infinite() == gpu.parent_pixels.is_infinite()
+                    && (parent.is_infinite() || close(gpu.parent_pixels, parent)),
+                "{what}: parent {parent} px on the CPU"
+            );
+            // f32 rounding decides either way within a hair of the threshold.
+            if close(own, 1.0) || close(parent, 1.0) {
+                continue;
+            }
+            let stands = own > 1.0 && c.depth > 0 && m.stands_in(c, &resident);
+            assert_eq!(probe.stands_in(), stands, "{what}");
+            standing += usize::from(stands);
+        }
+        if resident.pages.iter().all(|&r| r) && resident.nodes.iter().all(|&r| r) {
+            whole = true;
+            break;
+        }
+        // The view wants only some pages; once stand-ins showed, every page loads.
+        if standing > 0 {
+            w.scenes.prefetch(model, 0);
+        }
+    }
+    assert!(whole && standing > 0, "{standing} probes stood in");
+    assert_clean();
 }
 
 /// The streaming ground's view under an ample mesh page pool, then under one a third the

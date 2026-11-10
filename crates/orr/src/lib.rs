@@ -90,6 +90,14 @@ use orr_output::{
 };
 use orr_scene::{ArenaRequest, Scenes};
 
+mod probe;
+
+pub use orr_lighting::OriginProbe;
+use orr_lighting::OriginProbes;
+pub use orr_scene::{PlanOutcome, ProbeTap, ProbeTile, UnitState, UnitStatus};
+pub use probe::PixelProbe;
+use probe::{ProbeAt, record_probe, take_probe};
+
 /// A scene, lighting or output failure.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -384,6 +392,9 @@ struct ViewState {
     /// The scene of the view's last lit render and that scene's lighting resets then.
     scene_resets: Option<(SceneId, u64)>,
     reconstruction: Option<ViewReconstruction>,
+    /// The lighting side of the view's pixel probes, and what each probe's render was.
+    origin_probes: OriginProbes,
+    probes: Vec<ProbeAt>,
 }
 
 /// A view's ray reconstruction feature and what it was made for.
@@ -707,6 +718,8 @@ impl Renderer {
             samples: 0,
             scene_resets: None,
             reconstruction: None,
+            origin_probes: OriginProbes::default(),
+            probes: Vec::new(),
         };
         let id = self.scenes.create_view_history()?;
         self.output.views.insert(id, state);
@@ -772,6 +785,46 @@ impl Renderer {
             .views
             .get_mut(&history)
             .map_or_else(Vec::new, |v| v.output.screenshots(completed))
+    }
+
+    /// Takes the view's pixel probes ([`Frame::probe`]) of frames at or before `completed`, a
+    /// frame whose work has completed ([`FrameStats::frame`]), oldest first. The names and
+    /// residency states in them are what the renderer holds when they are taken.
+    pub fn probes(&mut self, history: ViewHistoryId, completed: u64) -> Vec<PixelProbe> {
+        let scene = self.scenes.probes(history, completed);
+        let Some(state) = self.output.views.get_mut(&history) else {
+            return scene
+                .into_iter()
+                .map(|s| PixelProbe {
+                    output_pixel: s.pixel,
+                    output_extent: s.view.render_extent,
+                    reconstructed: false,
+                    upscale_mode: None,
+                    scene: s,
+                    lighting: None,
+                })
+                .collect();
+        };
+        let mut lighting = state.origin_probes.take(completed);
+        let (done, pending): (Vec<ProbeAt>, _) = std::mem::take(&mut state.probes)
+            .into_iter()
+            .partition(|p| p.frame <= completed);
+        state.probes = pending;
+        scene
+            .into_iter()
+            .map(|s| {
+                let at = done.iter().find(|p| p.frame == s.frame);
+                let l = lighting.iter().position(|l| l.frame == s.frame);
+                PixelProbe {
+                    output_pixel: at.map_or(s.pixel, |p| p.output),
+                    output_extent: at.map_or(s.view.output_extent, |p| p.output_extent),
+                    reconstructed: at.is_some_and(|p| p.reconstructed),
+                    upscale_mode: at.and_then(|p| p.upscale_mode),
+                    lighting: l.map(|i| lighting.swap_remove(i)),
+                    scene: s,
+                }
+            })
+            .collect()
     }
 
     /// The loading side's job queue, for the threads the consumer lends to it.
@@ -957,6 +1010,7 @@ impl Renderer {
             output: &mut self.output,
             lit: Vec::new(),
             slots: Vec::new(),
+            probes: Vec::new(),
         })
     }
 
@@ -976,6 +1030,8 @@ pub struct Frame<'a> {
     lit: Vec<SceneId>,
     /// Heap slots of texture targets' storage views, freed once the frame completes.
     slots: Vec<u32>,
+    /// Pixels to probe in the views' renders this frame, in output pixels.
+    probes: Vec<(ViewHistoryId, [u32; 2])>,
 }
 
 impl<'a> Frame<'a> {
@@ -1065,7 +1121,21 @@ impl<'a> Frame<'a> {
     /// whose TLAS they trace, for passes it records after it into [`Frame::list`].
     pub fn raster_view(&mut self, view: &ViewDesc) -> Result<RasterView> {
         self.prepare_raster_view(view)?;
-        Ok(self.scenes.raster_view(view)?)
+        let raster = self.scenes.raster_view(view)?;
+        if let Some(at) = take_probe(&mut self.probes, view.history) {
+            self.scenes.probe(&raster, at)?;
+        }
+        Ok(raster)
+    }
+
+    /// Probes pixel `pixel` of the output image of view `history`'s render this frame, a render
+    /// pixel for a view [`Frame::raster_view`] renders: what was drawn there, at which level of
+    /// detail and why, the G-buffer and texture taps the lighting read, what ray tracing traces
+    /// of the copy and the frame's detail and memory. [`Renderer::probes`] returns it once the
+    /// frame has completed. A debug aid: a frame without a probe records and keeps nothing.
+    pub fn probe(&mut self, history: ViewHistoryId, pixel: [u32; 2]) {
+        self.probes.retain(|(h, _)| *h != history);
+        self.probes.push((history, pixel));
     }
 
     /// Whether [`Frame::render_view`] renders `view` lit this frame under `lighting`, or black
@@ -1322,6 +1392,23 @@ impl<'a> Frame<'a> {
         }
         let raster = self.scenes.raster_view_with(&desc, &requests)?;
         let gpu = self.output.device.clone();
+        if let Some(at) = take_probe(&mut self.probes, view.history) {
+            let probe = ProbeAt {
+                frame: id,
+                output: at,
+                output_extent: extent,
+                upscale_mode,
+                reconstructed,
+            };
+            record_probe(
+                &mut self.scenes,
+                self.lighting.kernels,
+                &gpu,
+                state,
+                &raster,
+                probe,
+            )?;
+        }
         let (list, arena) = self.scenes.list_and_arena(view.history)?;
         arena.enter(ViewStep::Lighting, list);
 
@@ -1663,6 +1750,24 @@ impl<'a> Frame<'a> {
             requests.extend(orr_output::hook_requests(extent));
         }
         let raster = self.scenes.raster_view_with(&desc, &requests)?;
+        if let Some(at) = take_probe(&mut self.probes, view.history) {
+            let probe = ProbeAt {
+                frame: id,
+                output: at,
+                output_extent: extent,
+                upscale_mode: None,
+                reconstructed: false,
+            };
+            let gpu = self.output.device.clone();
+            record_probe(
+                &mut self.scenes,
+                self.lighting.kernels,
+                &gpu,
+                state,
+                &raster,
+                probe,
+            )?;
+        }
         let (list, arena) = self.scenes.output_list_and_arena(view.history)?;
         arena.enter(ViewStep::Rr, list);
         let radiance = arena
