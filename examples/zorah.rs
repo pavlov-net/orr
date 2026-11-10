@@ -952,9 +952,39 @@ fn run(options: &Options) -> Option<Capture> {
         )
     });
     let mut held = Vec::new();
+    // At frame `ZORAH_CUT_FRAME` the mesh page and texture budgets drop to
+    // `ZORAH_CUT_MESH_MIB` and `ZORAH_CUT_TEXTURE_MIB`.
+    let cut = std::env::var("ZORAH_CUT_FRAME").ok().map(|f| {
+        let mib = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|m| m.parse::<u64>().expect("a count of MiB") << 20)
+        };
+        let frame = f.parse::<u64>().expect("ZORAH_CUT_FRAME is a frame count");
+        (
+            frame,
+            mib("ZORAH_CUT_MESH_MIB"),
+            mib("ZORAH_CUT_TEXTURE_MIB"),
+        )
+    });
     for i in 0.. {
         if frames.is_some_and(|n| i >= n) {
             break;
+        }
+        if let Some((at, mesh, textures)) = cut
+            && i == at
+        {
+            log::info!(
+                "lowering the budgets at frame {i}: mesh pages {mesh:?}, textures {textures:?}"
+            );
+            for (class, bytes) in [
+                (ResidencyClass::MeshPages, mesh),
+                (ResidencyClass::Textures, textures),
+            ] {
+                if let Some(b) = bytes {
+                    renderer.lower_budget(class, b);
+                }
+            }
         }
         if let Some((at, gib)) = pressure
             && i == at
