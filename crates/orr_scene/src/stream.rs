@@ -54,7 +54,7 @@ use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
 use crate::residency::{
     HOLD_FRAMES, Held, InFlight, Key, Limits, Plan, Priority, RequestSource, Residency,
-    ResidencyClass, ResidencyStats, UnitDesc,
+    ResidencyClass, ResidencyStats, UnitDesc, response_period,
 };
 use crate::shaders::page_decode::PageDecodeRoot;
 use crate::tiles::{TexResidency, TexStream, TextureFeedback, compaction_move};
@@ -476,6 +476,25 @@ impl Streaming {
         budgets[ResidencyClass::InstancePages as usize] = b.instance_page_pool;
         budgets[ResidencyClass::UserBlobs as usize] = b.user_blob_pool;
         let caps = device.caps();
+        // Mesh pages take the stream pool and the CLAS pool, tiles the tile pool, and the units
+        // the stream pool places otherwise, node pages among them, take `units`; user blobs take
+        // the consumer's memory.
+        let units_kind = if caps.staging_device_local {
+            MemoryKind::Staging
+        } else {
+            MemoryKind::DeviceLocal
+        };
+        let report = device.memory_report();
+        let heap = |kinds: &[MemoryKind]| {
+            kinds.iter().fold(0u32, |bits, k| {
+                let kind = MemoryKind::ALL.iter().position(|a| a == k).expect("a kind");
+                bits | 1 << report.kind_heaps[kind]
+            })
+        };
+        let mut heaps = [0; ResidencyClass::ALL.len()];
+        heaps[ResidencyClass::MeshPages as usize] = heap(&[MemoryKind::DeviceLocal, units_kind]);
+        heaps[ResidencyClass::Textures as usize] = heap(&[units_kind, MemoryKind::DeviceLocal]);
+        heaps[ResidencyClass::InstancePages as usize] = heap(&[units_kind]);
         let pool = Arc::new(Mutex::new(Pool::new(
             MemoryKind::DeviceLocal,
             256,
@@ -495,11 +514,13 @@ impl Streaming {
             loading_ids: FxHashMap::default(),
             residency: Residency::new(Limits {
                 budgets,
+                heaps,
+                period: response_period(fif),
                 in_flight: b.in_flight_bytes,
             }),
             units: if caps.staging_device_local {
                 Arc::new(Mutex::new(Pool::new(
-                    MemoryKind::Staging,
+                    units_kind,
                     256,
                     b.stream_block,
                     "stream units",
@@ -1377,7 +1398,9 @@ impl Streaming {
             w.put(self.streams.offset(u64::from(index)), &[GpuPtr::NULL])?;
         }
         points.extend(self.fine_step(frame, settled, loading, w)?);
-        self.residency.react(w.device.memory_report().pressure());
+        let report = w.device.memory_report();
+        let heaps: Vec<(u64, u64)> = report.heaps.iter().map(|h| (h.usage, h.budget)).collect();
+        self.residency.react(frame, &heaps);
         if let Some(c) = &self.clas {
             let (bound, used, range_full) = c.end_step();
             self.residency.note_clas_pool(bound, used, range_full);

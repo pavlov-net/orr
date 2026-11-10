@@ -35,9 +35,14 @@
 //! A unit's bytes are what its load places and what it builds beside them; the built bytes
 //! are an estimate until its first load reports them.
 //!
-//! While device-local memory use sits above 90% of the OS budget, every class's budget
-//! shrinks step by step and units past their hold are evicted down to it; below 80% the
-//! budgets grow back. A class whose units' shared address range runs out shrinks alone.
+//! Each step sets the budgets of the classes on a heap from its use against its OS budget.
+//! Under 90% of it, every class there may use the bytes free below that mark beside what it
+//! uses, up to its configured budget. Past the mark, at most once per response period
+//! ([`response_period`]), the classes give back the excess, each in proportion to what it
+//! uses, and units past their hold are evicted down to the budgets. User blobs live in the
+//! consumer's memory and keep their configured budget. A failed allocation shrinks every
+//! budget by a step, and a class whose units' shared address range runs out shrinks alone;
+//! each grows back a step after a response period without.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -50,12 +55,22 @@ use crate::MountId;
 /// Frames a resident unit is kept after its last request or touch.
 pub(crate) const HOLD_FRAMES: u64 = 30;
 
-/// Budgets shrink while device-local use is above this share of the OS budget...
-const SHRINK_ABOVE: f64 = 0.9;
-/// ...and grow back while it is below this share.
-const GROW_BELOW: f64 = 0.8;
-/// Budget factor change per step.
+/// Tenths of a heap's OS budget that its use is kept under.
+const MARK_TENTHS: u64 = 9;
+/// Budget factor change after a failed allocation or a full range, and after a response period
+/// without.
 const SCALE_STEP: f64 = 0.95;
+
+/// Frames between two cuts of the budgets on a heap past its mark, and before a failure's step
+/// down is taken back: what the evictions of one cut take to leave memory, with `fif` frames in
+/// flight. A unit the cut needs gone may still be in its hold ([`HOLD_FRAMES`]). An evicted
+/// unit's slot retires under the frame before and returns once that frame completes, `fif`
+/// frames; a pool block it empties is freed once the work submitted before has completed, `fif`
+/// more; a tile's unbind and a page's CLAS frees go with the next loading task or CLAS batch,
+/// one step later, whose GPU work completes within `fif` more.
+pub(crate) fn response_period(fif: u32) -> u64 {
+    HOLD_FRAMES + 1 + 3 * u64::from(fif)
+}
 /// The least share of its configured budget a class keeps.
 const MIN_SCALE: f64 = 0.125;
 
@@ -125,7 +140,11 @@ impl RequestSource {
 /// One class's figures.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ClassStats {
+    /// The bytes loads and evictions plan under: [`Self::configured`], or less while device
+    /// memory is short or allocations failed.
     pub budget: u64,
+    /// The budget the scenes were configured with ([`crate::Budgets`]).
+    pub configured: u64,
     pub resident_bytes: u64,
     pub loading_bytes: u64,
     pub resident_units: u32,
@@ -384,6 +403,11 @@ pub(crate) struct Limits {
     /// By [`ResidencyClass::ALL`] order, without memory pressure. Pinned and locked units
     /// must fit them.
     pub(crate) budgets: [u64; CLASSES],
+    /// By class, a bit per heap index ([`orr_gpu::MemoryReport::heaps`]) its memory comes
+    /// from; none for memory of the consumer's.
+    pub(crate) heaps: [u32; CLASSES],
+    /// [`response_period`] of the frames in flight.
+    pub(crate) period: u64,
     /// Bytes of loads in flight at which no more start.
     pub(crate) in_flight: u64,
 }
@@ -503,9 +527,14 @@ enum Short {
 
 pub(crate) struct Residency {
     limits: Limits,
-    /// Per class, the share of its budget in `limits.budgets` that loads and evictions plan
-    /// under.
+    /// Per class, the share of its budget in `limits.budgets` that failed allocations and a
+    /// full range leave it, and the frame of its last step since which it has had none.
     scale: [f64; CLASSES],
+    quiet: [u64; CLASSES],
+    /// Per class, the bytes loads and evictions plan under.
+    budgets: [u64; CLASSES],
+    /// Per heap, the frame its budgets were last cut at.
+    cut: Vec<Option<u64>>,
     mounts: FxHashMap<MountId, Vec<Unit>>,
     evictable: [Evictable; CLASSES],
     /// Resident plus loading bytes per class.
@@ -530,6 +559,9 @@ impl Residency {
         let mut r = Self {
             limits,
             scale: [1.0; CLASSES],
+            quiet: [0; CLASSES],
+            budgets: limits.budgets,
+            cut: Vec::new(),
             mounts: FxHashMap::default(),
             evictable: Default::default(),
             used: [0; CLASSES],
@@ -598,7 +630,7 @@ impl Residency {
 
     /// The budget of class `c` under the current memory pressure.
     fn budget(&self, c: usize) -> u64 {
-        self.stats.classes[c].budget
+        self.budgets[c]
     }
 
     /// A load or build ran out of memory, in memory the budgets govern when `governed`:
@@ -616,19 +648,70 @@ impl Residency {
         self.stats.out_of_memory += 1;
     }
 
-    /// Takes the share of its OS budget that device-local memory uses
-    /// (`MemoryReport::pressure`), and shrinks or grows the budgets the next plans use. They
-    /// shrink one step, however many loads ran out of memory since the last call.
-    pub(crate) fn react(&mut self, p: f64) {
-        let all = std::mem::take(&mut self.out_of_memory) || p > SHRINK_ABOVE;
+    /// Takes, at `frame`, each heap's use and OS budget in bytes by heap index, and sets the
+    /// budgets the next plans use. Failed allocations shrink them one step, however many ran
+    /// out of memory since the last call.
+    pub(crate) fn react(&mut self, frame: u64, heaps: &[(u64, u64)]) {
+        let failed = std::mem::take(&mut self.out_of_memory);
         let full = std::mem::take(&mut self.range_full);
-        for (scale, full) in self.scale.iter_mut().zip(full) {
-            if all || full {
+        let period = self.limits.period;
+        for c in 0..CLASSES {
+            let scale = &mut self.scale[c];
+            if failed || full[c] {
                 *scale = (*scale * SCALE_STEP).max(MIN_SCALE);
-            } else if p < GROW_BELOW {
+                self.quiet[c] = frame;
+            } else if frame >= self.quiet[c] + period {
                 *scale = (*scale / SCALE_STEP).min(1.0);
+                self.quiet[c] = frame;
             }
         }
+        let configured = self.limits.budgets;
+        let mut budgets: [u64; CLASSES] = std::array::from_fn(|c| {
+            if self.limits.heaps[c] == 0 {
+                configured[c]
+            } else {
+                (configured[c] as f64 * self.scale[c]) as u64
+            }
+        });
+        self.cut.resize(heaps.len(), None);
+        // A cut asks each class on the heap for its share of the excess out of what it uses at
+        // that moment, so a cut that finds nothing evicted since the last one sets the same
+        // budgets. When evictions leave the heap no smaller, as blocks with other units in them
+        // stay, the next cut, a period later, asks again for the excess still there. The
+        // budgets reach the floor only by failing to get memory back, one period at a time.
+        for (h, &(usage, budget)) in heaps.iter().enumerate() {
+            let on: Vec<usize> = (0..CLASSES)
+                .filter(|&c| self.limits.heaps[c] & (1 << h) != 0)
+                .collect();
+            if on.is_empty() {
+                continue;
+            }
+            let mark = budget / 10 * MARK_TENTHS;
+            if usage <= mark {
+                for &c in &on {
+                    budgets[c] = budgets[c].min(self.used[c].saturating_add(mark - usage));
+                }
+            } else if self.cut[h].is_none_or(|f| frame >= f + period) {
+                self.cut[h] = Some(frame);
+                let excess = u128::from(usage - mark);
+                let total: u128 = on.iter().map(|&c| u128::from(self.used[c])).sum();
+                for &c in &on {
+                    let used = u128::from(self.used[c]);
+                    let kept = if excess >= total {
+                        0
+                    } else {
+                        (used * (total - excess) / total) as u64
+                    };
+                    let floor = (configured[c] as f64 * MIN_SCALE) as u64;
+                    budgets[c] = budgets[c].min(kept.max(floor));
+                }
+            } else {
+                for &c in &on {
+                    budgets[c] = budgets[c].min(self.budgets[c]);
+                }
+            }
+        }
+        self.budgets = budgets;
         self.refresh();
     }
 
@@ -1325,7 +1408,8 @@ impl Residency {
 
     fn refresh(&mut self) {
         for (c, s) in self.stats.classes.iter_mut().enumerate() {
-            s.budget = (self.limits.budgets[c] as f64 * self.scale[c]) as u64;
+            s.budget = self.budgets[c];
+            s.configured = self.limits.budgets[c];
             s.resident_bytes = self.used[c] - self.loading_bytes[c];
             s.loading_bytes = self.loading_bytes[c];
             s.resident_units = self.resident_units[c];
@@ -1355,13 +1439,24 @@ mod tests {
         }
     }
 
+    /// `budget` for instance pages, nothing for the other classes, every class but user blobs
+    /// on heap 0, two frames in flight.
     fn limits(budget: u64) -> Limits {
-        let mut budgets = [u64::MAX; CLASSES];
+        let mut budgets = [0; CLASSES];
         budgets[ResidencyClass::InstancePages as usize] = budget;
+        let mut heaps = [1; CLASSES];
+        heaps[ResidencyClass::UserBlobs as usize] = 0;
         Limits {
             budgets,
+            heaps,
+            period: response_period(2),
             in_flight: u64::MAX,
         }
+    }
+
+    /// Heap 0 using `usage` of its OS budget of 1000, whose mark is 900.
+    fn heap(usage: u64) -> [(u64, u64); 1] {
+        [(usage, 1000)]
     }
 
     const P: Priority = Priority {
@@ -1757,6 +1852,7 @@ mod tests {
     fn built_bytes_take_the_budget_but_not_the_in_flight_bytes_and_replace_their_estimate() {
         let mut l = limits(300);
         l.in_flight = 100;
+        l.budgets[ResidencyClass::Textures as usize] = 1000;
         let mut r = Residency::new(l);
         let built = |bytes, estimate| UnitDesc {
             built: estimate,
@@ -1789,9 +1885,9 @@ mod tests {
 
         // A full range shrinks its class's budget alone.
         r.range_full(ResidencyClass::InstancePages);
-        r.react(0.85);
+        r.react(1, &[(0, 1 << 40)]);
         let texture = r.stats().class(ResidencyClass::Textures).budget;
-        assert_eq!((class(&r).budget, texture), (285, u64::MAX));
+        assert_eq!((class(&r).budget, texture), (285, 1000));
         assert_eq!(r.stats().out_of_memory, 1);
     }
 
@@ -1825,6 +1921,7 @@ mod tests {
             class(&r),
             ClassStats {
                 budget: 250,
+                configured: 250,
                 ..ClassStats::default()
             }
         );
@@ -1918,54 +2015,127 @@ mod tests {
     }
 
     #[test]
-    fn budgets_shrink_under_memory_pressure_and_grow_back() {
-        let mut r = Residency::new(limits(400));
+    fn budgets_give_back_the_excess_once_a_period_and_take_the_room_under_the_mark() {
+        let period = response_period(2);
+        let texture = ResidencyClass::Textures;
+        let mut l = limits(400);
+        l.budgets[texture as usize] = 200;
+        let mut r = Residency::new(l);
         let mut units: Vec<UnitDesc> = (0..4).map(|_| unit(100, &[], Start::Absent)).collect();
         units.push(unit(100, &[], Start::Pinned));
+        let tile = UnitDesc {
+            class: texture,
+            ..unit(100, &[], Start::Absent)
+        };
+        units.extend([tile.clone(), tile]);
         r.register(M, &units).unwrap();
-        // 300 of 400 resident beside the pinned 100.
-        step(&mut r, &[0, 1, 2], 1);
-        r.react(0.85);
-        assert_eq!(class(&r).budget, 400, "between the thresholds");
+        let budgets = |r: &Residency| (class(r).budget, r.stats().class(texture).budget);
+        // Instance pages use 400 with the pinned 100, textures 200; none can be evicted yet.
+        let loaded = [0, 1, 2, 5, 6];
+        step(&mut r, &loaded, 1);
+        for k in loaded {
+            r.lock(key(k));
+        }
+        r.react(1, &heap(600));
+        assert_eq!(
+            budgets(&r),
+            (400, 200),
+            "300 free: up to the configured budgets"
+        );
+        assert_eq!(class(&r).configured, 400);
+
+        // 300 over the mark: half of the 600 the classes use, from each its half.
+        r.react(2, &heap(1200));
+        assert_eq!(budgets(&r), (200, 100));
+        for frame in 3..2 + period {
+            r.react(frame, &heap(1300));
+            assert_eq!(budgets(&r), (200, 100), "frame {frame}: one cut a period");
+        }
+        let second = 2 + period;
+        assert_eq!(step(&mut r, &[], second).evictions, []);
+        r.react(second, &heap(1200));
+        assert_eq!(budgets(&r), (200, 100), "nothing went: the same cut");
+
+        // Evictions leave the heap 150 over: the cut a period later asks for that.
+        for k in loaded {
+            r.unlock(key(k));
+        }
+        assert_eq!(
+            step(&mut r, &[], second).evictions,
+            [key(5), key(0), key(1)]
+        );
+        r.react(second + 1, &heap(1050));
+        assert_eq!(budgets(&r), (200, 100));
+        let third = second + period;
+        r.react(third, &heap(1050));
+        assert_eq!(budgets(&r), (100, 50));
+
+        // Under the mark a budget is never below use, so nothing is evicted for it.
+        r.react(third + 1, &heap(880));
+        assert_eq!(budgets(&r), (220, 120));
+        assert_eq!(step(&mut r, &[], third + 1).evictions, []);
+        // A load in flight counts as used.
+        r.react(third + 2, &heap(700));
+        r.request(key(3), P, S);
+        assert_eq!(r.plan(third + 2, []).loads, [key(3)]);
+        r.react(third + 3, &heap(800));
+        assert_eq!(budgets(&r), (400, 200));
+        r.react(third + 4, &heap(850));
+        assert_eq!(budgets(&r), (350, 150));
+
+        r.react(third + period, &heap(2000));
+        assert_eq!(budgets(&r), (50, 25), "the floor");
+        // At 85% of the heap's budget a class far over its floor gets room the next step.
+        r.react(third + period + 1, &heap(850));
+        assert_eq!(budgets(&r), (350, 150));
+        check(&r);
+    }
+
+    #[test]
+    fn failures_step_budgets_down_until_a_quiet_period_and_leave_user_blobs_alone() {
+        let period = response_period(2);
+        let blobs = ResidencyClass::UserBlobs;
+        let texture = ResidencyClass::Textures;
+        let mut l = limits(400);
+        l.budgets[texture as usize] = u64::MAX;
+        l.budgets[blobs as usize] = 150;
+        let mut r = Residency::new(l);
+        let budgets = |r: &Residency| {
+            let s = r.stats();
+            (
+                class(r).budget,
+                s.class(texture).budget,
+                s.class(blobs).budget,
+            )
+        };
+        r.react(1, &heap(600));
+        assert_eq!(
+            budgets(&r),
+            (300, 300, 150),
+            "an unbounded class starves none"
+        );
+        r.react(2, &heap(2000));
+        assert_eq!(budgets(&r).2, 150, "user blobs are not on the heap");
+
+        // A failure every step steps down every step.
+        let mut scale = 1.0f64;
+        for frame in 3..8 {
+            r.out_of_memory(true);
+            r.out_of_memory(true);
+            r.react(frame, &heap(0));
+            scale *= SCALE_STEP;
+            assert_eq!(budgets(&r).0, (400.0 * scale) as u64, "frame {frame}");
+        }
         r.out_of_memory(false);
-        r.react(0.5);
-        assert_eq!(class(&r).budget, 400, "memory the budgets don't govern");
-        r.out_of_memory(true);
-        r.out_of_memory(true);
-        r.react(0.5);
+        r.react(8, &heap(0));
+        assert_eq!(budgets(&r), ((400.0 * scale) as u64, 900, 150));
+        r.react(6 + period, &heap(0));
         assert_eq!(
-            class(&r).budget,
-            380,
-            "one step for a step's failed allocations"
+            budgets(&r).0,
+            (400.0 * scale) as u64,
+            "a period has not passed"
         );
-        r.react(0.5);
-        assert_eq!(class(&r).budget, 400);
-        for _ in 0..5 {
-            r.react(0.95);
-        }
-        assert_eq!(class(&r).budget, (400.0 * 0.95f64.powi(5)) as u64);
-        assert_eq!(
-            step(&mut r, &[], HOLD_FRAMES).evictions,
-            [],
-            "units in their hold stay"
-        );
-        // Over 309 by 91: one unit goes, the oldest.
-        let late = 1 + HOLD_FRAMES + 1;
-        assert_eq!(step(&mut r, &[], late).evictions, [key(0)]);
-        assert_eq!(class(&r).resident_bytes, 300);
-        let plan = step(&mut r, &[3], late);
-        assert_eq!((plan.evictions, plan.loads), (vec![key(1)], vec![key(3)]));
-        for _ in 0..100 {
-            r.react(2.0);
-        }
-        assert_eq!(class(&r).budget, 50, "the floor");
-        let later = late + HOLD_FRAMES + 1;
-        assert_eq!(step(&mut r, &[], later).evictions, [key(2), key(3)]);
-        assert_eq!(class(&r).resident_bytes, 100, "the pinned unit stays");
-        for _ in 0..100 {
-            r.react(0.5);
-        }
-        assert_eq!(class(&r).budget, 400);
-        assert_eq!(step(&mut r, &[0, 1, 2], later).loads.len(), 3);
+        r.react(7 + period, &heap(0));
+        assert_eq!(budgets(&r).0, (400.0 * (scale / SCALE_STEP)) as u64);
     }
 }
