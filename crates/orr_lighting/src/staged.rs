@@ -652,8 +652,10 @@ impl StagedKernels {
 
     /// Lets go of the sets no view runs any more: one that never held what a view asked, once
     /// no view asks for its mask, and one no frame has run for [`KEEP`] since another became
-    /// ready. The set that may meet everything stays: any view may need it. A set's pipelines
-    /// go with its last holder, and its compiles that no thread has started are canceled.
+    /// ready. The set that may meet everything stays: any view may need it. So does a set
+    /// someone holds, a caller that waits for it or a view whose last frame ran it, so that a
+    /// frame finds it. A set's pipelines go with its last holder, and its compiles that no
+    /// thread has started are canceled.
     fn prune(&self, now: Instant) {
         let wanted: Vec<u32> = self.wanted.lock().unwrap().iter().map(|w| w.may).collect();
         let mut sets = self.sets.lock().unwrap();
@@ -662,7 +664,10 @@ impl StagedKernels {
             .map(|s| (s.may, s.ready.get().copied(), *s.used.lock().unwrap()))
             .collect();
         let mut keep = kept(&state, &wanted, now).into_iter();
-        sets.retain(|_| keep.next().expect("one per set"));
+        sets.retain(|set| {
+            let keep = keep.next().expect("one per set");
+            keep || Arc::strong_count(set) > 1
+        });
     }
 
     /// Asks for pipelines that hold `stages` for paths that may meet `may`, and says whether
@@ -716,6 +721,11 @@ impl StagedKernels {
         for stage in StageSet::runs(may, stages) {
             set.stage(stage).wait(self.loading())?;
         }
+        // The wait may have outlasted the caller's request for the mask: the set stands as one
+        // a view runs from here on, until the frame that waited for it has.
+        let now = Instant::now();
+        set.ready.get_or_init(|| now);
+        *set.used.lock().unwrap() = now;
         Ok(())
     }
 

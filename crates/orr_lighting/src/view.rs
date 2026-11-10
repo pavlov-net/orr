@@ -1380,10 +1380,11 @@ pub struct PathsRan {
 }
 
 impl PathsRan {
-    /// Every source ran the pipelines made for exactly what the view asked, not ones that
-    /// hold more while those compile.
+    /// No source ran pipelines that hold more than the view asked for, as it does while the
+    /// ones made for it compile. A source may run ones that hold less: those made for it alone,
+    /// where the view asked for several sources' together.
     pub fn exact(&self) -> bool {
-        self.ran.iter().all(|&made| made == self.asked)
+        self.ran.iter().all(|&made| made & !self.asked == 0)
     }
 }
 

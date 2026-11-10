@@ -242,9 +242,9 @@ pub struct RenderedView {
     /// The path tracing kernels are still compiling: the view rendered its raster half, and
     /// `radiance`, `linear` and its target hold black.
     pub compiling: bool,
-    /// The view's paths ran the pipelines made for exactly what its scene and settings ask
-    /// for, which is everything without [`ViewLighting::specialize`]; false while pipelines
-    /// that hold more run them until those have compiled, and while `compiling`.
+    /// The view's paths ran pipelines that hold no more than its scene and settings ask for,
+    /// which is everything without [`ViewLighting::specialize`]; false while pipelines that
+    /// hold more run them until those have compiled, and while `compiling`.
     pub exact_paths: bool,
     pub raster: RasterView,
     /// The extent the view rendered at.
