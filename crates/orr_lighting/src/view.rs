@@ -1232,6 +1232,10 @@ pub struct PathNeeds {
     pub frosted_glass: bool,
     /// Whether [`ViewPass::dof_background`] will be set.
     pub dof_background: bool,
+    /// [`ViewPass::particle_lighting`] to be: the froxels' light pass is then among the kernels
+    /// asked for. A caller that cannot tell says false; once a pass has declared it, it is
+    /// asked for whatever this says.
+    pub particle_lighting: bool,
 }
 
 /// What each source's paths may meet in a frame (`specialize.slang`'s bits).
@@ -1470,7 +1474,8 @@ fn ask_support(
         needs.frosted_glass,
         lighting,
     );
-    let runs = support_runs(masked, needs.features, masked.particle_lighting(), lighting);
+    let particle_lighting = needs.particle_lighting || masked.particle_lighting();
+    let runs = support_runs(masked, needs.features, particle_lighting, lighting);
     masked.ask(may, runs, lighting.specialize)
 }
 
@@ -1709,7 +1714,8 @@ impl LightingKernels {
             needs.frosted_glass,
             lighting,
         );
-        let runs = support_runs(masked, needs.features, masked.particle_lighting(), lighting);
+        let particle_lighting = needs.particle_lighting || masked.particle_lighting();
+        let runs = support_runs(masked, needs.features, particle_lighting, lighting);
         masked.wait_exact(may, runs)?;
         Ok(WaitedPaths(waited))
     }
@@ -1928,6 +1934,7 @@ impl LightingKernels {
             features: pass.scene_features,
             frosted_glass: pass.frosted_glass,
             dof_background: pass.dof_background.is_some(),
+            particle_lighting: pass.particle_lighting,
         };
         let k = &self.paths;
         let predicted = k.predict(scene, &needs, lighting);

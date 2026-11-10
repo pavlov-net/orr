@@ -2677,6 +2677,7 @@ impl Paths {
             features: pass.scene_features,
             frosted_glass: pass.frosted_glass,
             dof_background: pass.dof_background.is_some(),
+            particle_lighting: pass.particle_lighting,
         };
         // A bed that runs specialized takes the pipelines made for exactly its scene.
         let waits = settings.specialize

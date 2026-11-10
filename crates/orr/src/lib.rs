@@ -1063,7 +1063,7 @@ impl<'a> Frame<'a> {
         if let Paths::Failed(e) = &self.lighting.paths {
             return Err(Error::PathKernels(Arc::clone(e)));
         }
-        self.ask_paths(view, lighting, false)
+        self.ask_paths(view, lighting, false, false)
     }
 
     /// Asks for the path pipelines `view` takes under `lighting` and says whether it renders
@@ -1075,6 +1075,7 @@ impl<'a> Frame<'a> {
         &mut self,
         view: &LitView<'_>,
         lighting: &ViewLighting,
+        particle_lighting: bool,
         wait: bool,
     ) -> Result<bool> {
         if !matches!(
@@ -1096,6 +1097,7 @@ impl<'a> Frame<'a> {
                 .get(&view.history)
                 .is_some_and(|state| state.reconstruction.is_some()),
             dof_background: false,
+            particle_lighting,
         };
         let waits = self.lighting.waits;
         let asked = match &self.lighting.paths {
@@ -1240,7 +1242,7 @@ impl<'a> Frame<'a> {
             return Err(Error::PathKernels(Arc::clone(e)));
         }
         let (extent, render) = self.resolve_view(view, lighting, output)?;
-        let lit = self.ask_paths(view, lighting, true)?;
+        let lit = self.ask_paths(view, lighting, hooks.transparency.is_some(), true)?;
         let Paths::Ready(kernels) = &self.lighting.paths else {
             return self.render_view_black(view, output, hooks, extent, render);
         };
