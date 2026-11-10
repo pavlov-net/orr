@@ -20,7 +20,7 @@ use super::garbage::{Garbage, Item, MAX_TIMELINES};
 use super::heap::Heaps;
 use super::host_memory;
 use super::interop::ClassicBind;
-use super::memory::{MemoryTypes, Pools, Range, Usage, buffer_usage, sharing};
+use super::memory::{MemoryTypes, Pools, Range, buffer_usage, sharing};
 use super::perf::{self, Perf};
 use super::queue::{Calibration, Queue, Timeline};
 use super::ray::RecordBlock;
@@ -98,7 +98,8 @@ pub(crate) struct Shared {
     pub(super) buffers: RwLock<BTreeMap<u64, Range>>,
     /// The most recently freed ranges, oldest first.
     pub(super) freed: Mutex<VecDeque<(u64, Range)>>,
-    pub(super) usage: Usage,
+    /// Live allocator memory by label and kind.
+    pub(super) ledger: crate::memory::Ledger,
     /// Usage of every `gpu_malloc` buffer.
     pub(super) buffer_usage: vk::BufferUsageFlags,
     pub(super) garbage: Mutex<Garbage>,
@@ -534,6 +535,7 @@ impl Device {
                 max_ray_dispatch_invocations: rt_props.max_ray_dispatch_invocation_count,
                 device_local_bytes: memory.heap_size(MemoryKind::DeviceLocal),
                 upload_bytes: memory.heap_size(MemoryKind::Upload),
+                max_memory_allocations: props.limits.max_memory_allocation_count,
                 host_import_align: if host_memory {
                     host_memory::import_align(
                         &device,
@@ -716,7 +718,7 @@ impl Device {
             rtas_check: OnceLock::new(),
             buffers: RwLock::default(),
             freed: Mutex::default(),
-            usage: Usage::default(),
+            ledger: crate::memory::Ledger::default(),
             buffer_usage: usage,
             garbage: Mutex::default(),
             results: Mutex::default(),

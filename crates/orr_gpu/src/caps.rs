@@ -145,6 +145,9 @@ pub struct Limits {
     pub device_local_bytes: u64,
     /// Size of the heap behind [`crate::MemoryKind::Upload`].
     pub upload_bytes: u64,
+    /// Device memory allocations (`VkDeviceMemory`) that may exist at once
+    /// (`maxMemoryAllocationCount`); Metal sets no limit on its heaps and reports `u32::MAX`.
+    pub max_memory_allocations: u32,
     /// Regions one [`crate::CommandList::decompress`] may list; 0 without
     /// `Caps::memory_decompression`.
     pub max_decompress_regions: u32,

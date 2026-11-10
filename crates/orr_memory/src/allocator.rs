@@ -30,7 +30,7 @@ pub struct Allocator {
     raw: sys::VmaAllocator,
     /// `vkAllocateMemory` calls, counted by VMA's callback; boxed so its address is stable.
     allocations: Box<AtomicU64>,
-    pools: Mutex<Vec<sys::VmaPool>>,
+    pools: Mutex<Vec<(sys::VmaPool, Box<str>, u32)>>,
 }
 
 // SAFETY: VMA allocators are internally synchronized (created without
@@ -92,10 +92,25 @@ pub struct Allocation {
     raw: sys::VmaAllocation,
     pub memory: vk::DeviceMemory,
     pub offset: u64,
+    /// Bytes the allocation takes of its memory, at least what the resource asked for.
     pub size: u64,
     pub memory_type: u32,
     /// The start of the allocation in the mapping, with [`AllocationFlags::MAPPED`].
     pub mapped: Option<NonNull<u8>>,
+    /// `memory` is the allocation's own, freed with it.
+    pub dedicated: bool,
+}
+
+/// What one [`Pool`] holds: its `VkDeviceMemory` blocks, dedicated allocations among them,
+/// and the allocations in them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolStats {
+    pub name: Box<str>,
+    pub memory_type: u32,
+    pub blocks: u32,
+    pub allocations: u32,
+    pub block_bytes: u64,
+    pub allocation_bytes: u64,
 }
 
 // SAFETY: the handle is used only through its internally synchronized allocator; the
@@ -199,7 +214,10 @@ impl Allocator {
             // SAFETY: VMA copies the name.
             unsafe { sys::vmaSetPoolName(self.raw, pool, name.as_ptr()) };
         }
-        self.pools.lock().unwrap().push(pool);
+        self.pools
+            .lock()
+            .unwrap()
+            .push((pool, desc.name.into(), desc.memory_type));
         Ok(Pool {
             raw: pool,
             memory_type: desc.memory_type,
@@ -229,23 +247,23 @@ impl Allocator {
         }
     }
 
-    fn finish(
-        &self,
-        raw: sys::VmaAllocation,
-        info: &sys::VmaAllocationInfo,
-        name: &str,
-    ) -> Allocation {
+    fn finish(&self, raw: sys::VmaAllocation, name: &str) -> Allocation {
         if let Ok(name) = CString::new(name) {
             // SAFETY: a live allocation; VMA copies the name.
             unsafe { sys::vmaSetAllocationName(self.raw, raw, name.as_ptr()) };
         }
+        let mut info = sys::VmaAllocationInfo2::default();
+        // SAFETY: a live allocation.
+        unsafe { sys::vmaGetAllocationInfo2(self.raw, raw, &mut info) };
+        let a = &info.allocationInfo;
         Allocation {
             raw,
-            memory: sys::from_raw(info.deviceMemory),
-            offset: info.offset,
-            size: info.size,
-            memory_type: info.memoryType,
-            mapped: NonNull::new(info.pMappedData.cast()),
+            memory: sys::from_raw(a.deviceMemory),
+            offset: a.offset,
+            size: a.size,
+            memory_type: a.memoryType,
+            mapped: NonNull::new(a.pMappedData.cast()),
+            dedicated: info.dedicatedMemory != 0,
         }
     }
 
@@ -267,7 +285,6 @@ impl Allocator {
         let create = Self::create_info(pool, flags, align);
         let mut buffer = ptr::null_mut();
         let mut allocation = ptr::null_mut();
-        let mut out = sys::VmaAllocationInfo::default();
         // SAFETY: forwarded from the caller; VMA reads the info only during the call.
         check("vmaCreateBuffer", unsafe {
             sys::vmaCreateBuffer(
@@ -276,10 +293,10 @@ impl Allocator {
                 &create,
                 &mut buffer,
                 &mut allocation,
-                &mut out,
+                ptr::null_mut(),
             )
         })?;
-        Ok((sys::from_raw(buffer), self.finish(allocation, &out, name)))
+        Ok((sys::from_raw(buffer), self.finish(allocation, name)))
     }
 
     /// Creates an image bound to new memory from `pool`, in its own memory with
@@ -298,7 +315,6 @@ impl Allocator {
         let create = Self::create_info(pool, flags, 1);
         let mut image = ptr::null_mut();
         let mut allocation = ptr::null_mut();
-        let mut out = sys::VmaAllocationInfo::default();
         // SAFETY: as above.
         check("vmaCreateImage", unsafe {
             sys::vmaCreateImage(
@@ -307,10 +323,10 @@ impl Allocator {
                 &create,
                 &mut image,
                 &mut allocation,
-                &mut out,
+                ptr::null_mut(),
             )
         })?;
-        Ok((sys::from_raw(image), self.finish(allocation, &out, name)))
+        Ok((sys::from_raw(image), self.finish(allocation, name)))
     }
 
     /// Memory from `pool` meeting `requirements`, bound to nothing.
@@ -323,7 +339,6 @@ impl Allocator {
     ) -> Result<Allocation> {
         let create = Self::create_info(pool, flags, 1);
         let mut allocation = ptr::null_mut();
-        let mut out = sys::VmaAllocationInfo::default();
         // SAFETY: a live allocator and valid create info.
         check("vmaAllocateMemory", unsafe {
             sys::vmaAllocateMemory(
@@ -331,10 +346,10 @@ impl Allocator {
                 sys::memory_requirements(requirements),
                 &create,
                 &mut allocation,
-                &mut out,
+                ptr::null_mut(),
             )
         })?;
-        Ok(self.finish(allocation, &out, name))
+        Ok(self.finish(allocation, name))
     }
 
     /// Binds `image` at `offset` bytes into `a`.
@@ -410,6 +425,27 @@ impl Allocator {
             .collect()
     }
 
+    /// What each pool holds, in the order the pools were created.
+    pub fn pool_stats(&self) -> Vec<PoolStats> {
+        let pools = self.pools.lock().unwrap();
+        pools
+            .iter()
+            .map(|(pool, name, memory_type)| {
+                let mut s = sys::VmaStatistics::default();
+                // SAFETY: a live allocator and pool.
+                unsafe { sys::vmaGetPoolStatistics(self.raw, *pool, &mut s) };
+                PoolStats {
+                    name: name.clone(),
+                    memory_type: *memory_type,
+                    blocks: s.blockCount,
+                    allocations: s.allocationCount,
+                    block_bytes: s.blockBytes,
+                    allocation_bytes: s.allocationBytes,
+                }
+            })
+            .collect()
+    }
+
     /// VMA's JSON statistics: totals per heap, memory type and pool, and with `detailed`
     /// every block and named allocation.
     pub fn stats_json(&self, detailed: bool) -> String {
@@ -433,7 +469,7 @@ impl Drop for Allocator {
     fn drop(&mut self) {
         // SAFETY: the pools and allocator are live and destroyed once, pools first.
         unsafe {
-            for pool in self.pools.get_mut().unwrap().drain(..) {
+            for (pool, ..) in self.pools.get_mut().unwrap().drain(..) {
                 sys::vmaDestroyPool(self.raw, pool);
             }
             sys::vmaDestroyAllocator(self.raw);

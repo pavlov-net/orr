@@ -68,8 +68,8 @@ pub use orr_scene::{
     MediumData, ModelId, MountId, NeuralTextures, Opacity, OriginPolicy, PackSource, PageId,
     PageNeeds, PipelineId, PoolSize, Pose, ProducerBatch, ProducerDesc, ProducerId, ProducerStats,
     ProducerUpdate, Projection, RasterGpu, ReloadReport, RendererDesc, RequestSource,
-    ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc, SceneId, SceneRoot,
-    SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats, Span, TextureFilter,
+    ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc, SceneId, SceneMemory,
+    SceneRoot, SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats, Span, TextureFilter,
     TextureSamplerGpu, TextureStreamGpu, TransformGroupDesc, TransformGroupId, TransparencyPass,
     ViewConstants, ViewDesc, ViewHistoryId, ViewStep, WorldPos, abi, binding_sampler,
     material_flags, orr_gpu, orr_pack,
@@ -910,6 +910,12 @@ impl Renderer {
     /// Residency figures of the latest frame's step 1.
     pub fn residency(&self) -> &ResidencyStats {
         self.scenes.residency()
+    }
+
+    /// What the streamed pools, the CLAS pool and the frames' upload windows hold, gathered
+    /// on demand.
+    pub fn scene_memory(&self) -> SceneMemory {
+        self.scenes.memory()
     }
 
     /// A compute pipeline of `module`'s `entry`, created on the calling thread. With the

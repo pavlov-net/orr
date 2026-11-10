@@ -55,7 +55,7 @@ use crate::accel::{
     AccelKernels, ClasBatch, ClasSource, ClusterBuild, ClusterInfo, PageMicromap, batches,
     clas_batch,
 };
-use crate::memory::{Block, Pool, PoolSlot, RangeAllocator};
+use crate::memory::{Block, ClasPages, Pool, PoolFill, PoolSlot, RangeAllocator};
 use crate::shaders::accel::{AccelRoot, ClasJob};
 use crate::shaders::clas_pool::PoolRoot;
 
@@ -367,6 +367,27 @@ impl ClasPool {
             s.used_units * UNIT,
             s.range_full,
         )
+    }
+
+    /// The pages as of the last replayed batch, and the pools of the page memory and the
+    /// micromaps. Waits for a batch holding the loading side to submit.
+    pub(crate) fn fill(&self) -> (ClasPages, [PoolFill; 2]) {
+        let s = self.state.lock().unwrap();
+        let wholly_free = s
+            .pages
+            .iter()
+            .zip(&s.used)
+            .filter(|&(&p, &u)| u == 0 && matches!(p, PageState::Bound | PageState::Taking));
+        let pages = ClasPages {
+            page_bytes: self.range.page_size,
+            bound: s.bound,
+            wholly_free: wholly_free.count() as u32,
+            reserved: s.reserved,
+            used: s.used_units * UNIT,
+        };
+        drop(s);
+        let side = self.side();
+        (pages, [side.backing.fill(), side.micromaps.fill()])
     }
 
     /// Starts a batch: takes the frees, takes and pages to unbind queued since the last

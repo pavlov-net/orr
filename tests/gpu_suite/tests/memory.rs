@@ -8,8 +8,8 @@ use std::time::Duration;
 use gpu_suite::shaders::gate;
 use gpu_suite::{assert_clean, device, pipeline};
 use orr_gpu::{
-    Device, DeviceDesc, GpuAddress, GpuPtr, Hazards, MemoryKind, QueueKind, QueueRequest, Stages,
-    TimelinePoint,
+    Device, DeviceDesc, Format, GpuAddress, GpuPtr, Hazards, MemoryKind, QueueKind, QueueRequest,
+    Stages, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
 
 /// Host pages from the global allocator, freed when dropped.
@@ -148,6 +148,96 @@ fn steady_frames_reuse_memory_without_allocating() {
         "steady frames called vkAllocateMemory"
     );
     assert_clean();
+}
+
+/// The bytes counted by label are those the allocator's pools hold in allocations, and the
+/// pools hold every block on the heaps, while buffers of every kind, transient rings and
+/// textures with memory of their own come and go.
+#[test]
+fn labels_add_up_to_the_pools_allocations() {
+    let d = Device::new(&DeviceDesc {
+        name: "orr-test-ledger",
+        queues: QueueRequest {
+            render_compute: true,
+            ..QueueRequest::default()
+        },
+        ..DeviceDesc::default()
+    })
+    .unwrap();
+    let queue = d.queue(QueueKind::Render).unwrap();
+    let settle = || {
+        let done = queue
+            .submit(vec![queue.command_list().unwrap()], &[])
+            .unwrap();
+        queue.wait(done, Duration::from_secs(10)).unwrap();
+        d.collect_garbage();
+    };
+    let check = |when: &str| {
+        let b = d.memory_breakdown();
+        let labels: u64 = b.labels.iter().map(|l| l.bytes).sum();
+        let live: u64 = b.pools.iter().map(|p| p.allocation_bytes).sum();
+        assert_eq!(
+            labels, live,
+            "{when}: label bytes against the pools' allocations"
+        );
+        let count: u64 = b.labels.iter().map(|l| l.allocations).sum();
+        let allocations: u64 = b.pools.iter().map(|p| p.allocations).sum();
+        assert_eq!(count, allocations, "{when}: label allocations");
+        let pools: u64 = b.pools.iter().map(|p| p.block_bytes).sum();
+        let heaps: u64 = b.heaps.iter().map(|h| h.block_bytes).sum();
+        assert_eq!(pools, heaps, "{when}: blocks outside the pools");
+        let kinds: u64 = d.memory_report().kinds.iter().map(|k| k.bytes).sum();
+        assert_eq!(kinds, labels, "{when}: kinds against labels");
+        b
+    };
+    check("at creation");
+    let mut held = Vec::new();
+    for (i, kind) in MemoryKind::ALL.into_iter().enumerate() {
+        for bytes in [4, 1000, 70 << 10, 3 << 20, 200 << 20] {
+            held.push(
+                d.gpu_malloc::<u8>(kind, bytes + i as u64, "ledger buffer")
+                    .unwrap(),
+            );
+        }
+    }
+    let rings = d
+        .create_host_arenas(MemoryKind::Upload, 3, 1 << 20, "ledger ring")
+        .unwrap();
+    let textures: Vec<_> = [64, 4096]
+        .map(|extent| {
+            let desc = TextureDesc::d2(
+                Format::Rgba8Unorm,
+                extent,
+                extent,
+                TextureUsage::SAMPLED | TextureUsage::STORAGE,
+            );
+            d.create_texture(&desc, TextureMemory::Dedicated, "ledger texture")
+                .unwrap()
+        })
+        .into();
+    let b = check("with everything held");
+    let ring = b
+        .labels
+        .iter()
+        .find(|l| &*l.label == "ledger ring")
+        .unwrap();
+    assert_eq!(ring.allocations, 3, "a ring's blocks share its label");
+    let texture = b
+        .labels
+        .iter()
+        .find(|l| &*l.label == "ledger texture")
+        .unwrap();
+    assert!(texture.dedicated >= 1, "a large texture's own memory");
+    held.truncate(7);
+    drop(rings);
+    drop(textures);
+    settle();
+    let b = check("after frees");
+    assert!(!b.labels.iter().any(|l| &*l.label == "ledger ring"));
+    drop(held);
+    settle();
+    check("with nothing held");
+    assert_eq!(d.validation_messages(), 0);
 }
 
 /// Host memory blocks can start on any 4 KiB page, which meets neither the resource heap's

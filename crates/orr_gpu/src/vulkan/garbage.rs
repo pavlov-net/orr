@@ -5,6 +5,7 @@ use ash::vk;
 
 use super::device::Shared;
 use crate::MemoryKind;
+use crate::memory::Charge;
 
 /// Timelines a device can have: one per queue kind.
 pub(super) const MAX_TIMELINES: usize = 5;
@@ -16,7 +17,7 @@ pub(super) enum Item {
     Buffer(RawBuffer),
     Image {
         image: vk::Image,
-        memory: Option<orr_memory::Allocation>,
+        memory: Option<(orr_memory::Allocation, Charge)>,
         views: [vk::ImageView; 2],
     },
     Pipeline(vk::Pipeline),
@@ -47,6 +48,7 @@ pub(super) struct RawBuffer {
     pub(super) kind: MemoryKind,
     pub(super) size: u64,
     pub(super) address: u64,
+    pub(super) charge: Charge,
 }
 
 impl RawBuffer {
@@ -124,7 +126,10 @@ impl Shared {
                         d.destroy_image_view(v, None);
                     }
                     match memory {
-                        Some(m) => self.pools.allocator.destroy_image(image, m),
+                        Some((m, charge)) => {
+                            self.ledger.release(charge);
+                            self.pools.allocator.destroy_image(image, m);
+                        }
                         None => d.destroy_image(image, None),
                     }
                 }

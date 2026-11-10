@@ -28,7 +28,8 @@ pub(super) struct SparseTail {
 /// Dropping it destroys it once everything submitted before the drop has completed.
 pub struct Texture {
     pub(super) image: vk::Image,
-    memory: Option<orr_memory::Allocation>,
+    /// Memory of its own and its entry in the ledger.
+    memory: Option<(orr_memory::Allocation, crate::memory::Charge)>,
     /// The view rendering writes through: mip 0, layer 0. Null without `COLOR` or `DEPTH`
     /// usage.
     attachment: vk::ImageView,
@@ -504,7 +505,14 @@ impl Device {
                 )),
                 e => memory_error(e),
             })?;
-            (image, Some(allocation))
+            // Host-copy textures take Upload memory, the rest DeviceLocal.
+            let kind = if host {
+                MemoryKind::Upload
+            } else {
+                MemoryKind::DeviceLocal
+            };
+            let charge = (shared.ledger).charge(name, kind, allocation.size, allocation.dedicated);
+            (image, Some((allocation, charge)))
         } else {
             // SAFETY: valid create info for this device.
             let image =

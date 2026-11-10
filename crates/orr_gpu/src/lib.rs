@@ -70,7 +70,10 @@ pub use error::Error;
 pub use error::VkResult;
 pub use format::Format;
 pub use generated::{Generated, Sequence, SetKind};
-pub use memory::{HeapReport, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage};
+pub use memory::{
+    HeapReport, LabelUsage, MemoryBreakdown, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage,
+    PoolUsage,
+};
 pub use orr_memory::AllocError;
 pub use orr_shaders::abi::*;
 pub use orr_shaders::{

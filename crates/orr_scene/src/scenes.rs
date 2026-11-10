@@ -25,7 +25,7 @@ use crate::features::SceneFeatures;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
 use crate::medium_proxy::{ProxyBlas, VolumeRef};
-use crate::memory::{BestFit, PreprocessArenas, UploadWindow};
+use crate::memory::{BestFit, PreprocessArenas, SceneMemory, UploadWindow};
 use crate::mount::{
     Apply, ClipRef, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId,
     SkeletonRef, TableSizes,
@@ -974,6 +974,17 @@ impl Scenes {
     /// Residency figures of the latest step 1.
     pub fn residency(&self) -> &ResidencyStats {
         self.core.mounts.streaming.stats()
+    }
+
+    /// What the streamed pools, the CLAS pool and the frames' upload windows hold, gathered
+    /// on demand; it can wait for a streamed CLAS build to submit.
+    pub fn memory(&self) -> SceneMemory {
+        let mut out = SceneMemory {
+            windows: self.core.windows.iter().map(UploadWindow::fill).collect(),
+            ..SceneMemory::default()
+        };
+        self.core.mounts.streaming.memory(&mut out);
+        out
     }
 
     /// A resident instance page.

@@ -94,6 +94,7 @@ pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
 pub use loading::{JobResult, Loading, ReadArenaStats, Urgency};
 pub use material::{BoundTexture, MaterialId, MaterialWriter, binding_sampler, material_flags};
 pub use medium_proxy::{MediumProxy, MediumProxyId, ProxyDensity, VolumeRef};
+pub use memory::{ClasPages, PoolFill, SceneMemory, WindowFill};
 pub use mount::{ClipRef, InstancePage, LoadState, MountId, PackSource, PageId, SkeletonRef};
 pub use neural::NeuralTextures;
 pub use pipelines::{PipelineId, ReloadReport};

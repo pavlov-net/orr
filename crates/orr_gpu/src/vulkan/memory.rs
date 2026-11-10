@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use ash::vk;
@@ -19,8 +19,8 @@ use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::{Item, RawBuffer};
 use crate::{
-    Error, GpuAddress, GpuPtr, HeapReport, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage,
-    TimelinePoint,
+    Error, GpuAddress, GpuPtr, HeapReport, MemoryBreakdown, MemoryKind, MemoryPriority,
+    MemoryReport, PoolUsage, TimelinePoint,
 };
 
 impl MemoryPriority {
@@ -137,25 +137,6 @@ impl MemoryTypes {
             properties,
         };
         Ok((types, rebar))
-    }
-}
-
-/// Bytes and allocation count per kind.
-#[derive(Default)]
-pub(super) struct Usage {
-    bytes: [AtomicU64; MemoryKind::ALL.len()],
-    count: [AtomicU64; MemoryKind::ALL.len()],
-}
-
-impl Usage {
-    fn add(&self, kind: MemoryKind, bytes: u64) {
-        self.bytes[kind.index()].fetch_add(bytes, Ordering::Relaxed);
-        self.count[kind.index()].fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn sub(&self, kind: MemoryKind, bytes: u64) {
-        self.bytes[kind.index()].fetch_sub(bytes, Ordering::Relaxed);
-        self.count[kind.index()].fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -400,13 +381,15 @@ impl Shared {
         align: u64,
         name: &str,
     ) -> Result<(RawBuffer, Option<NonNull<u8>>), Error> {
-        self.create_buffer_in(Some(MemoryPriority::Normal), kind, size, usage, align, name)
+        let normal = Some(MemoryPriority::Normal);
+        self.create_buffer_in(normal, kind, size, usage, align, name, name)
     }
 
     /// Creates a buffer of `kind` in the buffer pool of `priority`, or the transient pool
-    /// for `None`, at an address that is a multiple of `align` (a power of two). Fails when
-    /// its memory cannot give that: the allocator aligns offsets in a block, and host memory
-    /// blocks can start on any 4 KiB page.
+    /// for `None`, at an address that is a multiple of `align` (a power of two), counted
+    /// under `label`. Fails when its memory cannot give that: the allocator aligns offsets in
+    /// a block, and host memory blocks can start on any 4 KiB page.
+    #[allow(clippy::too_many_arguments)]
     fn create_buffer_in(
         &self,
         priority: Option<MemoryPriority>,
@@ -415,6 +398,7 @@ impl Shared {
         usage: vk::BufferUsageFlags,
         align: u64,
         name: &str,
+        label: &str,
     ) -> Result<(RawBuffer, Option<NonNull<u8>>), Error> {
         let d = &self.device;
         let (sharing, families) = sharing(&self.families);
@@ -486,21 +470,24 @@ impl Shared {
             )));
         }
         name_object(&self.debug_fn, buffer, name);
+        let charge = self
+            .ledger
+            .charge(label, kind, allocation.size, allocation.dedicated);
         let raw = RawBuffer {
             buffer,
             allocation,
             kind,
             size,
             address,
+            charge,
         };
         self.register_range(address, size, buffer, name);
-        self.usage.add(kind, size);
         Ok((raw, mapped))
     }
 
     pub(super) fn unregister_buffer(&self, b: &RawBuffer) {
         self.unregister_range(b.address);
-        self.usage.sub(b.kind, b.size);
+        self.ledger.release(b.charge);
     }
 
     /// Records `size` bytes at `address` as `buffer`, for [`Shared::locate`] and fault
@@ -541,14 +528,18 @@ impl Shared {
     }
 
     fn report(&self) -> MemoryReport {
-        let kinds = MemoryKind::ALL.map(|k| MemoryUsage {
-            bytes: self.usage.bytes[k.index()].load(Ordering::Relaxed),
-            allocations: self.usage.count[k.index()].load(Ordering::Relaxed),
-        });
         let allocator = &self.pools.allocator;
+        MemoryReport {
+            kinds: self.ledger.kinds(),
+            heaps: self.heap_reports(&allocator.heap_budgets()),
+            kind_heaps: MemoryKind::ALL.map(|k| self.memory.heap(k)),
+            device_allocations: allocator.device_memory_allocations(),
+        }
+    }
+
+    fn heap_reports(&self, budgets: &[orr_memory::HeapBudget]) -> Vec<HeapReport> {
         let p = &self.memory.properties;
-        let heaps = allocator
-            .heap_budgets()
+        budgets
             .iter()
             .enumerate()
             .map(|(i, b)| HeapReport {
@@ -560,12 +551,31 @@ impl Shared {
                 budget: b.budget,
                 usage: b.usage,
             })
+            .collect()
+    }
+
+    fn breakdown(&self) -> MemoryBreakdown {
+        let allocator = &self.pools.allocator;
+        let budgets = allocator.heap_budgets();
+        let p = &self.memory.properties;
+        let pools = allocator
+            .pool_stats()
+            .into_iter()
+            .map(|s| PoolUsage {
+                name: s.name,
+                heap: p.memory_types[s.memory_type as usize].heap_index as usize,
+                blocks: u64::from(s.blocks),
+                block_bytes: s.block_bytes,
+                allocations: u64::from(s.allocations),
+                allocation_bytes: s.allocation_bytes,
+            })
             .collect();
-        MemoryReport {
-            kinds,
-            heaps,
-            kind_heaps: MemoryKind::ALL.map(|k| self.memory.heap(k)),
-            device_allocations: allocator.device_memory_allocations(),
+        MemoryBreakdown {
+            labels: self.ledger.labels(),
+            pools,
+            heaps: self.heap_reports(&budgets),
+            device_allocations: budgets.iter().map(|b| u64::from(b.blocks)).sum(),
+            max_device_allocations: u64::from(self.caps.limits.max_memory_allocations),
         }
     }
 }
@@ -609,7 +619,7 @@ impl Device {
         let usage = self.shared.buffer_usage;
         let (raw, mapped) =
             self.shared
-                .create_buffer_in(Some(priority), kind, size, usage, align, name)?;
+                .create_buffer_in(Some(priority), kind, size, usage, align, name, name)?;
         let cpu = mapped.map(NonNull::cast::<T>);
         if let Some(p) = cpu {
             assert!(
@@ -638,6 +648,12 @@ impl Device {
     /// Live allocations per kind, and blocks and the OS budget per heap.
     pub fn memory_report(&self) -> MemoryReport {
         self.shared.report()
+    }
+
+    /// Live allocations per label and the blocks of each allocator pool; slower than
+    /// [`Device::memory_report`], for reading on demand.
+    pub fn memory_breakdown(&self) -> MemoryBreakdown {
+        self.shared.breakdown()
     }
 }
 
@@ -700,6 +716,7 @@ impl Ring {
                     shared.buffer_usage,
                     MALLOC_ALIGN,
                     &format!("{name} {i}"),
+                    name,
                 )?;
                 Ok(Block {
                     raw,

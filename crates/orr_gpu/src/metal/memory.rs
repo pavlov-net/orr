@@ -18,8 +18,10 @@ use orr_memory::{AllocError, Arena, HeapAllocation, HeapPool};
 use super::device::{Device, Shared};
 use super::sparse::SPARSE_PAGE;
 use super::{Buffer, Obj, lock};
+use crate::memory::Charge;
 use crate::{
-    Error, GpuAddress, GpuPtr, HeapReport, MemoryKind, MemoryPriority, MemoryReport, TimelinePoint,
+    Error, GpuAddress, GpuPtr, HeapReport, MemoryBreakdown, MemoryKind, MemoryPriority,
+    MemoryReport, PoolUsage, TimelinePoint,
 };
 
 /// Every allocation starts at a multiple of this many bytes.
@@ -71,6 +73,7 @@ pub(super) struct RawBuffer {
     pub(super) kind: MemoryKind,
     pub(super) buffer: Obj<Buffer>,
     memory: HeapAllocation,
+    charge: Charge,
 }
 
 impl RawBuffer {
@@ -171,6 +174,7 @@ fn release_buffer(shared: &Shared, start: u64, raw: RawBuffer) {
         kind,
         buffer,
         memory,
+        charge,
     } = raw;
     let size = buffer.length() as u64;
     shared.forget_objects(start, start + size);
@@ -180,10 +184,7 @@ fn release_buffer(shared: &Shared, start: u64, raw: RawBuffer) {
         r.set.removeAllocation(ProtocolObject::from_ref(&*heap));
         r.dirty = true;
     }
-    let mut usage = lock(&shared.usage);
-    let u = &mut usage[kind.index()];
-    u.bytes -= size;
-    u.allocations -= 1;
+    shared.ledger.release(charge);
 }
 
 impl Device {
@@ -229,7 +230,7 @@ impl Device {
     /// its usage.
     pub fn memory_report(&self) -> MemoryReport {
         let s = &self.shared;
-        let kinds = *lock(&s.usage);
+        let kinds = s.ledger.kinds();
         // The working set Metal recommends, against what the device has allocated.
         let budget = s.device.recommendedMaxWorkingSetSize();
         MemoryReport {
@@ -237,12 +238,50 @@ impl Device {
             heaps: vec![HeapReport {
                 size: budget,
                 device_local: true,
-                block_bytes: s.heaps.iter().map(|p| lock(p).heap_bytes()).sum(),
+                block_bytes: s.heaps.iter().map(|p| lock(p).heap_bytes()).sum::<u64>()
+                    + lock(&s.own_textures).bytes,
                 budget,
                 usage: s.device.currentAllocatedSize() as u64,
             }],
             kind_heaps: [0; MemoryKind::ALL.len()],
             device_allocations: s.device_allocations.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Live allocations per label and the heaps of each heap pool; slower than
+    /// [`Device::memory_report`], for reading on demand.
+    pub fn memory_breakdown(&self) -> MemoryBreakdown {
+        let s = &self.shared;
+        let mut pools: Vec<PoolUsage> = MemoryKind::ALL
+            .iter()
+            .map(|&kind| {
+                let p = lock(&s.heaps[kind.index()]).stats();
+                PoolUsage {
+                    name: format!("orr {kind:?}").into(),
+                    heap: 0,
+                    blocks: u64::from(p.heaps),
+                    block_bytes: p.heap_bytes,
+                    allocations: u64::from(p.ranges),
+                    allocation_bytes: p.range_bytes,
+                }
+            })
+            .collect();
+        let live = pools.iter().map(|p| p.blocks).sum();
+        let own = *lock(&s.own_textures);
+        pools.push(PoolUsage {
+            name: "orr textures".into(),
+            heap: 0,
+            blocks: own.allocations,
+            block_bytes: own.bytes,
+            allocations: own.allocations,
+            allocation_bytes: own.bytes,
+        });
+        MemoryBreakdown {
+            labels: s.ledger.labels(),
+            device_allocations: live,
+            pools,
+            heaps: self.memory_report().heaps,
+            max_device_allocations: u64::from(s.caps.limits.max_memory_allocations),
         }
     }
 
@@ -291,7 +330,7 @@ pub(super) fn malloc<T>(
                 size_of::<T>()
             ))
         })?;
-    let raw = shared.create_buffer(kind, size, name)?;
+    let raw = shared.create_buffer(kind, size, name, name)?;
     let cpu = (kind != MemoryKind::DeviceLocal).then(|| raw.buffer.contents().cast::<T>());
     if let Some(p) = cpu {
         assert!(
@@ -312,13 +351,14 @@ pub(super) fn malloc<T>(
 }
 
 impl Shared {
-    /// A buffer of `size` bytes of `kind` memory, placed in one of the kind's heaps, resident
-    /// and in the address map.
+    /// A buffer of `size` bytes of `kind` memory, placed in one of the kind's heaps, resident,
+    /// in the address map and counted under `label`.
     pub(super) fn create_buffer(
         &self,
         kind: MemoryKind,
         size: u64,
         name: &str,
+        label: &str,
     ) -> Result<RawBuffer, Error> {
         let no_memory = || Error::OutOfMemory {
             call: "newBufferWithLength",
@@ -373,16 +413,14 @@ impl Shared {
             r.dirty = true;
             self.device_allocations.fetch_add(1, Ordering::Relaxed);
         }
+        let charge = (self.ledger).charge(label, kind, memory.size(), memory.own_heap());
         let raw = RawBuffer {
             kind,
             buffer: Obj(buffer),
             memory,
+            charge,
         };
         lock(&self.buffers).insert(raw.buffer.gpuAddress(), size, raw.buffer.clone());
-        let mut usage = lock(&self.usage);
-        let u = &mut usage[kind.index()];
-        u.bytes += size;
-        u.allocations += 1;
         Ok(raw)
     }
 
@@ -457,7 +495,7 @@ impl Ring {
         }
         let mut blocks = Vec::with_capacity(count as usize);
         for i in 0..count {
-            let raw = shared.create_buffer(kind, bytes, &format!("{name} {i}"))?;
+            let raw = shared.create_buffer(kind, bytes, &format!("{name} {i}"), name)?;
             let mapped = (kind != MemoryKind::DeviceLocal)
                 .then(|| NonNull::new(raw.buffer.contents().as_ptr().cast::<u8>()))
                 .flatten();

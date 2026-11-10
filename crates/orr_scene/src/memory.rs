@@ -189,20 +189,74 @@ impl Block {
     }
 }
 
+/// What one streamed pool holds, from [`Scenes::memory`](crate::Scenes::memory).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolFill {
+    pub name: &'static str,
+    pub kind: MemoryKind,
+    pub blocks: u32,
+    /// Bytes of the blocks.
+    pub bytes: u64,
+    /// Bytes of their units in use.
+    pub used: u64,
+    /// Blocks with at most half their units in use.
+    pub half_empty: u32,
+}
+
+/// The CLAS pool's pages, as of the last replayed batch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClasPages {
+    pub page_bytes: u64,
+    /// Pages with memory bound.
+    pub bound: u32,
+    /// Bound pages that hold no CLAS: free for reservations, or asked to be taken.
+    pub wholly_free: u32,
+    /// Wholly free pages that batches in flight reserve.
+    pub reserved: u32,
+    /// Bytes of the units holding CLAS.
+    pub used: u64,
+}
+
+/// One frame's upload window: its blocks and what the last frame that used it took.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowFill {
+    pub blocks: u32,
+    pub bytes: u64,
+    pub used: u64,
+}
+
+/// Where the scenes' streamed and per-frame memory goes, from
+/// [`Scenes::memory`](crate::Scenes::memory).
+#[derive(Clone, Debug, Default)]
+pub struct SceneMemory {
+    pub pools: Vec<PoolFill>,
+    pub clas: Option<ClasPages>,
+    pub windows: Vec<WindowFill>,
+}
+
 /// A streamed class's memory: blocks of one kind, sub-allocated in units of a fixed size. A
 /// block is allocated when no block has room and dropped once it is empty again.
 pub(crate) struct Pool {
     kind: MemoryKind,
-    unit: u64,
-    block_bytes: u64,
     name: &'static str,
-    blocks: Vec<Option<PoolBlock>>,
+    places: Placement,
+    memory: Vec<Option<Allocation<u8>>>,
 }
 
-struct PoolBlock {
-    memory: Allocation<u8>,
+/// Where a [`Pool`]'s ranges go, apart from the memory of its blocks.
+pub(crate) struct Placement {
+    unit: u64,
+    /// Units of a block made for ranges no longer than it.
+    block_units: u32,
+    blocks: Vec<Option<PlacedBlock>>,
+    used: u64,
+}
+
+struct PlacedBlock {
     ranges: RangeAllocator,
+    units: u32,
     slots: u32,
+    used: u32,
 }
 
 /// A range of a [`Pool`]: its block, first unit and unit count.
@@ -213,20 +267,138 @@ pub(crate) struct PoolSlot {
     pub(crate) units: u32,
 }
 
+impl Placement {
+    pub(crate) fn new(unit: u64, block_bytes: u64) -> Self {
+        Self {
+            unit,
+            block_units: block_bytes.div_ceil(unit) as u32,
+            blocks: Vec::new(),
+            used: 0,
+        }
+    }
+
+    /// Units of a block made for a range of `units`.
+    fn block_for(&self, units: u32) -> u32 {
+        self.block_units.max(units)
+    }
+
+    /// A range of `units` units at a multiple of `align` units, right after `after` when those
+    /// units are free, else in a block with room. `None` when no block has room.
+    fn find(&mut self, units: u32, align: u32, after: Option<PoolSlot>) -> Option<PoolSlot> {
+        let next = after.and_then(|a| {
+            let first = a.first + a.units;
+            let b = self.blocks.get_mut(a.block as usize)?.as_mut()?;
+            b.ranges.take(first, units).then_some((a.block, first))
+        });
+        let (block, first) = next.or_else(|| {
+            self.blocks.iter_mut().enumerate().find_map(|(i, b)| {
+                let first = b.as_mut()?.ranges.alloc_aligned(units, align)?;
+                Some((i as u32, first))
+            })
+        })?;
+        Some(self.took(block, first, units))
+    }
+
+    fn took(&mut self, block: u32, first: u32, units: u32) -> PoolSlot {
+        let b = self.blocks[block as usize].as_mut().expect("live block");
+        b.slots += 1;
+        b.used += units;
+        self.used += u64::from(units);
+        PoolSlot {
+            block,
+            first,
+            units,
+        }
+    }
+
+    /// Adds an empty block of `units` units and places `units` units at a multiple of `align`
+    /// in it.
+    fn add(&mut self, block_units: u32, units: u32, align: u32) -> PoolSlot {
+        let mut ranges = RangeAllocator::new(block_units);
+        let first = ranges
+            .alloc_aligned(units, align)
+            .expect("a new block fits");
+        let b = Some(PlacedBlock {
+            ranges,
+            units: block_units,
+            slots: 0,
+            used: 0,
+        });
+        let block = match self.blocks.iter().position(Option::is_none) {
+            Some(i) => {
+                self.blocks[i] = b;
+                i
+            }
+            None => {
+                self.blocks.push(b);
+                self.blocks.len() - 1
+            }
+        };
+        self.took(block as u32, first, units)
+    }
+
+    fn free_after(&self, slot: PoolSlot) -> bool {
+        self.blocks
+            .get(slot.block as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|b| b.ranges.is_free(slot.first + slot.units, slot.units))
+    }
+
+    /// Returns `slot`; true when its block is empty and gone.
+    fn free(&mut self, slot: PoolSlot) -> bool {
+        let entry = &mut self.blocks[slot.block as usize];
+        let b = entry.as_mut().expect("slot of a live block");
+        b.ranges.free(slot.first, slot.units);
+        b.slots -= 1;
+        b.used -= slot.units;
+        self.used -= u64::from(slot.units);
+        let empty = b.slots == 0;
+        if empty {
+            *entry = None;
+        }
+        empty
+    }
+
+    /// Live blocks, their units, units in use and blocks at most half in use.
+    fn fill(&self) -> (u32, u64, u64, u32) {
+        let live = self.blocks.iter().flatten();
+        let (mut blocks, mut units, mut half) = (0, 0, 0);
+        for b in live {
+            blocks += 1;
+            units += u64::from(b.units);
+            half += u32::from(2 * b.used <= b.units);
+        }
+        (blocks, units, self.used, half)
+    }
+}
+
 impl Pool {
     /// A pool of `unit`-byte units in blocks of at least `block_bytes`.
     pub(crate) fn new(kind: MemoryKind, unit: u64, block_bytes: u64, name: &'static str) -> Self {
         Self {
             kind,
-            unit,
-            block_bytes: block_bytes.next_multiple_of(unit),
             name,
-            blocks: Vec::new(),
+            places: Placement::new(unit, block_bytes),
+            memory: Vec::new(),
         }
     }
 
     pub(crate) fn kind(&self) -> MemoryKind {
         self.kind
+    }
+
+    /// What the pool holds.
+    pub(crate) fn fill(&self) -> PoolFill {
+        let (blocks, units, used, half_empty) = self.places.fill();
+        let unit = self.places.unit;
+        PoolFill {
+            name: self.name,
+            kind: self.kind,
+            blocks,
+            bytes: units * unit,
+            used: used * unit,
+            half_empty,
+        }
     }
 
     /// `bytes` bytes at a unit-aligned offset of their block, right after `after` when those
@@ -248,8 +420,9 @@ impl Pool {
         bytes: u64,
         align: u64,
     ) -> Result<(PoolSlot, Block)> {
-        assert!(align.is_multiple_of(self.unit), "alignment of whole units");
-        self.place(device, bytes, (align / self.unit) as u32, None)
+        let unit = self.places.unit;
+        assert!(align.is_multiple_of(unit), "alignment of whole units");
+        self.place(device, bytes, (align / unit) as u32, None)
     }
 
     fn place(
@@ -259,89 +432,56 @@ impl Pool {
         align: u32,
         after: Option<PoolSlot>,
     ) -> Result<(PoolSlot, Block)> {
-        let units = bytes.max(1).div_ceil(self.unit) as u32;
-        let next = after.and_then(|a| {
-            let first = a.first + a.units;
-            let b = self.blocks.get_mut(a.block as usize)?.as_mut()?;
-            b.ranges
-                .take(first, units)
-                .then_some((a.block as usize, first))
-        });
-        let found = next.or_else(|| {
-            self.blocks.iter_mut().enumerate().find_map(|(i, b)| {
-                let first = b.as_mut()?.ranges.alloc_aligned(units, align)?;
-                Some((i, first))
-            })
-        });
-        let (block, first) = match found {
-            Some(f) => f,
+        let unit = self.places.unit;
+        let units = bytes.max(1).div_ceil(unit) as u32;
+        let slot = match self.places.find(units, align, after) {
+            Some(s) => s,
             None => {
-                let size = self.block_bytes.max(u64::from(units) * self.unit);
+                let block_units = self.places.block_for(units);
+                let size = u64::from(block_units) * unit;
                 let low = MemoryPriority::Low;
                 let memory =
                     device.gpu_malloc_with_priority::<u8>(self.kind, low, size, self.name)?;
-                let mut ranges = RangeAllocator::new((size / self.unit) as u32);
-                let first = ranges
-                    .alloc_aligned(units, align)
-                    .expect("a new block fits");
-                let b = Some(PoolBlock {
-                    memory,
-                    ranges,
-                    slots: 0,
-                });
-                match self.blocks.iter().position(Option::is_none) {
-                    Some(i) => {
-                        self.blocks[i] = b;
-                        (i, first)
-                    }
-                    None => {
-                        self.blocks.push(b);
-                        (self.blocks.len() - 1, first)
-                    }
+                let slot = self.places.add(block_units, units, align);
+                let i = slot.block as usize;
+                if i >= self.memory.len() {
+                    self.memory.resize_with(i + 1, || None);
                 }
+                self.memory[i] = Some(memory);
+                slot
             }
         };
-        let b = self.blocks[block].as_mut().expect("live block");
-        b.slots += 1;
-        let at = u64::from(first) * self.unit;
-        let memory = Block::of(&b.memory).sub(at, bytes);
-        let slot = PoolSlot {
-            block: block as u32,
-            first,
-            units,
-        };
-        Ok((slot, memory))
+        let at = u64::from(slot.first) * unit;
+        let memory = Block::of(
+            self.memory[slot.block as usize]
+                .as_ref()
+                .expect("live block"),
+        );
+        Ok((slot, memory.sub(at, bytes)))
     }
 
     /// Whether the units right after `slot`, as many as it holds, are free.
     pub(crate) fn free_after(&self, slot: PoolSlot) -> bool {
-        self.blocks
-            .get(slot.block as usize)
-            .and_then(Option::as_ref)
-            .is_some_and(|b| b.ranges.is_free(slot.first + slot.units, slot.units))
+        self.places.free_after(slot)
     }
 
     /// The bytes `slot` takes.
     pub(crate) fn bytes(&self, slot: PoolSlot) -> u64 {
-        u64::from(slot.units) * self.unit
+        u64::from(slot.units) * self.places.unit
     }
 
     /// The allocation `slot` lies in and its offset there, for sparse binds.
     pub(crate) fn memory(&self, slot: PoolSlot) -> (&Allocation<u8>, u64) {
-        let b = self.blocks[slot.block as usize]
+        let m = self.memory[slot.block as usize]
             .as_ref()
             .expect("slot of a live block");
-        (&b.memory, u64::from(slot.first) * self.unit)
+        (m, u64::from(slot.first) * self.places.unit)
     }
 
     /// Returns `slot`; call only once the GPU no longer reads it.
     pub(crate) fn free(&mut self, slot: PoolSlot) {
-        let entry = &mut self.blocks[slot.block as usize];
-        let b = entry.as_mut().expect("slot of a live block");
-        b.ranges.free(slot.first, slot.units);
-        b.slots -= 1;
-        if b.slots == 0 {
-            *entry = None;
+        if self.places.free(slot) {
+            self.memory[slot.block as usize] = None;
         }
     }
 }
@@ -359,6 +499,8 @@ struct WindowBlocks {
     block: usize,
     offset: u64,
     used: u64,
+    /// `used` at the last reset.
+    last: u64,
 }
 
 impl UploadWindow {
@@ -369,6 +511,7 @@ impl UploadWindow {
                 block: 0,
                 offset: 0,
                 used: 0,
+                last: 0,
             }),
             block_bytes,
         }
@@ -474,7 +617,18 @@ impl UploadWindow {
         let w = self.inner.get_mut().unwrap();
         w.block = 0;
         w.offset = 0;
+        w.last = w.used;
         w.used = 0;
+    }
+
+    /// Its blocks, and what the frame before the last reset took of them.
+    pub(crate) fn fill(&self) -> WindowFill {
+        let w = self.inner.lock().unwrap();
+        WindowFill {
+            blocks: w.blocks.len() as u32,
+            bytes: w.blocks.iter().map(Allocation::size).sum(),
+            used: w.last,
+        }
     }
 }
 

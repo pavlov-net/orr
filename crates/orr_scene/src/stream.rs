@@ -51,7 +51,7 @@ use crate::edit::Mirror;
 use crate::loading::{
     BlobSource, Loading, Msg, Queue, Resumable, landed, read_into, reads_straight,
 };
-use crate::memory::{Block, Pool, PoolSlot};
+use crate::memory::{Block, Pool, PoolSlot, SceneMemory};
 use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
 use crate::residency::{
@@ -598,6 +598,21 @@ impl Streaming {
 
     pub(crate) fn stats(&self) -> &ResidencyStats {
         self.residency.stats()
+    }
+
+    /// The streamed pools' fill and the CLAS pool's pages.
+    pub(crate) fn memory(&self, out: &mut SceneMemory) {
+        let mut pools = vec![&self.pool, &self.staging, &self.tiles];
+        if !Arc::ptr_eq(&self.units, &self.pool) {
+            pools.push(&self.units);
+        }
+        out.pools
+            .extend(pools.into_iter().map(|p| p.lock().unwrap().fill()));
+        if let Some(c) = &self.clas {
+            let (pages, fills) = c.fill();
+            out.clas = Some(pages);
+            out.pools.extend(fills);
+        }
     }
 
     /// What mount reads share the in-flight limit with streamed loads through.

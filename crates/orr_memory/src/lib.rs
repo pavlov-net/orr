@@ -32,11 +32,11 @@ mod virtual_block;
 
 #[cfg(not(target_vendor = "apple"))]
 pub use allocator::{
-    Allocation, AllocationFlags, Allocator, AllocatorDesc, HeapBudget, Pool, PoolDesc,
+    Allocation, AllocationFlags, Allocator, AllocatorDesc, HeapBudget, Pool, PoolDesc, PoolStats,
 };
 pub use arena::Arena;
 #[cfg(target_vendor = "apple")]
-pub use heap::{HeapAllocation, HeapPool};
+pub use heap::{HeapAllocation, HeapPool, HeapPoolStats};
 pub use virtual_block::{VirtualAllocation, VirtualBlock, VirtualStats};
 pub use vulkan_memory_allocator_sys::LOG_TARGET;
 

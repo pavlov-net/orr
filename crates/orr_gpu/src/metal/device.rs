@@ -55,8 +55,10 @@ pub(super) struct Shared {
     pub(super) buffers: Mutex<Buffers>,
     /// The heaps `gpu_malloc` places buffers in, by [`MemoryKind`](crate::MemoryKind).
     pub(super) heaps: [Mutex<HeapPool>; crate::MemoryKind::ALL.len()],
-    /// Live `gpu_malloc` memory by [`MemoryKind`](crate::MemoryKind).
-    pub(super) usage: Mutex<[MemoryUsage; crate::MemoryKind::ALL.len()]>,
+    /// Live `gpu_malloc` memory and textures of their own by label and kind.
+    pub(super) ledger: crate::memory::Ledger,
+    /// Textures with memory of their own, outside the heaps.
+    pub(super) own_textures: Mutex<MemoryUsage>,
     /// Heaps the pools have created so far.
     pub(super) device_allocations: AtomicU64,
     /// Pass results by the point of their submit, oldest first.
@@ -216,7 +218,8 @@ impl Device {
             collecting: Mutex::default(),
             buffers: Mutex::default(),
             heaps,
-            usage: Mutex::default(),
+            ledger: crate::memory::Ledger::default(),
+            own_textures: Mutex::default(),
             device_allocations: AtomicU64::new(0),
             results: Mutex::default(),
             timestamps,
@@ -404,6 +407,7 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
             max_ray_dispatch_invocations: 0,
             device_local_bytes: working_set,
             upload_bytes: working_set,
+            max_memory_allocations: u32::MAX,
             max_decompress_regions: 0,
             max_generated_pipelines: 0,
             max_generated_sequences: 0,

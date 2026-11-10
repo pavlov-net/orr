@@ -12,9 +12,10 @@ use super::command::CommandList;
 use super::device::{Device, Shared};
 use super::sparse::SPARSE_PAGE;
 use super::{Obj, lock};
+use crate::memory::Charge;
 use crate::{
-    Error, Format, GpuPtr, SparseLayout, TextureDesc, TextureKind, TextureMemory, TextureRegion,
-    TextureUsage,
+    Error, Format, GpuPtr, MemoryKind, SparseLayout, TextureDesc, TextureKind, TextureMemory,
+    TextureRegion, TextureUsage,
 };
 
 /// A texture and its memory. It has no layout state.
@@ -25,6 +26,8 @@ pub struct Texture {
     desc: TextureDesc,
     /// The texture is in the residency set itself, not through a heap.
     dedicated: bool,
+    /// Its entry in the ledger and its bytes, for a texture with memory of its own.
+    charge: Option<(Charge, u64)>,
     /// With [`TextureMemory::Sparse`].
     sparse: Option<(SparseLayout, MetalTail)>,
     shared: Arc<Shared>,
@@ -57,6 +60,7 @@ impl Texture {
             raw: Obj(raw),
             desc,
             dedicated: false,
+            charge: None,
             sparse: None,
             shared: Arc::clone(shared),
         }
@@ -68,7 +72,14 @@ impl Drop for Texture {
         let raw = self.raw.clone();
         let shared = Arc::clone(&self.shared);
         let dedicated = self.dedicated;
+        let charge = self.charge;
         self.shared.defer(Box::new(move || {
+            if let Some((c, bytes)) = charge {
+                shared.ledger.release(c);
+                let mut own = lock(&shared.own_textures);
+                own.bytes -= bytes;
+                own.allocations -= 1;
+            }
             if dedicated {
                 let mut r = lock(&shared.residency);
                 r.set.removeAllocation(ProtocolObject::from_ref(&*raw));
@@ -158,11 +169,20 @@ impl Device {
             }
         };
         raw.setLabel(Some(&NSString::from_str(name)));
+        let charge = matches!(memory, TextureMemory::Dedicated).then(|| {
+            let bytes = raw.allocatedSize() as u64;
+            let mut own = lock(&self.shared.own_textures);
+            own.bytes += bytes;
+            own.allocations += 1;
+            let c = (self.shared.ledger).charge(name, MemoryKind::DeviceLocal, bytes, true);
+            (c, bytes)
+        });
         let sparse = sparse.then(|| self.sparse_layout(&raw, &d, desc));
         Ok(Texture {
             raw: Obj(raw),
             desc: *desc,
             dedicated,
+            charge,
             sparse,
             shared: Arc::clone(&self.shared),
         })

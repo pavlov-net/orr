@@ -66,6 +66,21 @@ impl HeapAllocation {
     pub fn size(&self) -> u64 {
         self.size
     }
+
+    /// The heap is the range's own, released when the range is freed.
+    pub fn own_heap(&self) -> bool {
+        self.range.is_none()
+    }
+}
+
+/// What a [`HeapPool`] holds: its heaps, those of one range among them, and the ranges in
+/// them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeapPoolStats {
+    pub heaps: u32,
+    pub heap_bytes: u64,
+    pub ranges: u32,
+    pub range_bytes: u64,
 }
 
 impl HeapPool {
@@ -183,6 +198,28 @@ impl HeapPool {
     /// Bytes of every live heap.
     pub fn heap_bytes(&self) -> u64 {
         self.heaps().map(|h| h.allocatedSize() as u64).sum()
+    }
+
+    /// The heaps and the ranges in them.
+    pub fn stats(&self) -> HeapPoolStats {
+        let mut s = HeapPoolStats::default();
+        for b in self.blocks.iter().flatten() {
+            let bytes = b.heap.allocatedSize() as u64;
+            s.heaps += 1;
+            s.heap_bytes += bytes;
+            match &b.space {
+                Some(space) => {
+                    let v = space.stats();
+                    s.ranges += v.allocations;
+                    s.range_bytes += v.allocation_bytes;
+                }
+                None => {
+                    s.ranges += 1;
+                    s.range_bytes += bytes;
+                }
+            }
+        }
+        s
     }
 
     fn new_heap(&self, size: u64) -> Result<Retained<Heap>, AllocError> {
