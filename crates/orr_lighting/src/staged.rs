@@ -712,19 +712,19 @@ impl StagedKernels {
 
     /// Waits for the pipelines made for exactly `may` that hold `stages`, running queued jobs
     /// on this thread meanwhile: a caller that waits runs what its view asks for, whatever
-    /// else is ready.
-    pub(crate) fn wait_exact(&self, may: u32, stages: &[Stage]) -> Result<(), Error> {
+    /// else is ready. The set stays while the caller holds what this returns, which it does
+    /// until its frame has recorded: other views' frames let go of a set no frame has run for
+    /// [`KEEP`], however long the caller takes to record its own.
+    pub(crate) fn wait_exact(&self, may: u32, stages: &[Stage]) -> Result<Arc<StageSet>, Error> {
         self.note(may, Instant::now());
         let set = self.request(may, stages, Urgency::Needed);
         for stage in StageSet::runs(may, stages) {
             set.stage(stage).wait(self.loading())?;
         }
-        // The wait may have outlasted the caller's request for the mask: the set stands as one
-        // a view runs from here on, until the frame that waited for it has.
         let now = Instant::now();
         set.ready.get_or_init(|| now);
         *set.used.lock().unwrap() = now;
-        Ok(())
+        Ok(set)
     }
 
     /// Waits for a pipeline the paths do without, as [`Self::start_late`] starts it.

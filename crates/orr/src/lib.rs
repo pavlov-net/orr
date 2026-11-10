@@ -1107,13 +1107,15 @@ impl<'a> Frame<'a> {
             Paths::Ready(kernels) => {
                 // A caller that waits takes the pipelines made for exactly its view, so its
                 // frames do not depend on what else has compiled.
+                // Held until the pipelines are asked for below, which marks them as run now:
+                // the render records them in this same call.
                 let waited = if waits {
-                    kernels.wait_paths(scene, &needs, lighting)
+                    kernels.wait_paths(scene, &needs, lighting).map(Some)
                 } else {
-                    Ok(())
+                    Ok(None)
                 };
                 waited
-                    .and_then(|()| kernels.prepare_paths(scene, &needs, lighting))
+                    .and_then(|_held| kernels.prepare_paths(scene, &needs, lighting))
                     .map(|ready| ready || waits)
             }
             Paths::NotStarted | Paths::Failed(_) => unreachable!("returned above"),

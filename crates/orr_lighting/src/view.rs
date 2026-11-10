@@ -32,7 +32,7 @@ use crate::staged::{
     MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION,
     MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS,
     MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_REFERENCE, MAY_STACK, MAY_SUBSURFACE, MAY_WALK,
-    Source, Stage, StagedKernels, StagedMemory, StateParts,
+    Source, Stage, StageSet, StagedKernels, StagedMemory, StateParts,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::{
@@ -1401,6 +1401,10 @@ impl PathsRan {
     }
 }
 
+/// The path pipelines [`LightingKernels::wait_paths`] waited for, which stay while this does.
+#[must_use = "the pipelines waited for stay only while this is held"]
+pub struct WaitedPaths(#[allow(dead_code)] Option<Arc<StageSet>>);
+
 /// What decides the path pipelines of a view's frame, known before the view is rastered.
 #[derive(Clone, Copy, Debug)]
 pub struct PathNeeds {
@@ -1807,24 +1811,25 @@ impl LightingKernels {
     /// Waits for the kernels paths do without until they are ready and then for the pipelines
     /// made for exactly what a view's frame with `needs` takes under `lighting`, running queued
     /// loading jobs on this thread meanwhile: the frame then runs what it would once every
-    /// compile had finished, whatever else is ready.
+    /// compile had finished, whatever else is ready. The caller keeps what this returns until
+    /// [`Self::record_paths`] has recorded that frame: the pipelines stay for it meanwhile.
     pub fn wait_paths(
         &self,
         scene: &SceneLighting,
         needs: &PathNeeds,
         lighting: &ViewLighting,
-    ) -> Result<(), Error> {
-        if let PathKernels::Staged(k) = &self.paths {
-            // A caller that waits runs from its first frame what a view runs once every
-            // compile has finished.
-            k.start_late();
-            k.stages.wait_tail();
-            k.stages.wait_late(&k.update);
-            k.stages.wait_late(&k.photons);
-            let (wanted, stages) = k.wanted(scene, needs, lighting);
-            k.stages.wait_exact(wanted, &stages)?;
-        }
-        Ok(())
+    ) -> Result<WaitedPaths, Error> {
+        let PathKernels::Staged(k) = &self.paths else {
+            return Ok(WaitedPaths(None));
+        };
+        // A caller that waits runs from its first frame what a view runs once every
+        // compile has finished.
+        k.start_late();
+        k.stages.wait_tail();
+        k.stages.wait_late(&k.update);
+        k.stages.wait_late(&k.photons);
+        let (wanted, stages) = k.wanted(scene, needs, lighting);
+        Ok(WaitedPaths(Some(k.stages.wait_exact(wanted, &stages)?)))
     }
 
     /// How many path pipelines asked for are still compiling.

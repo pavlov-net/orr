@@ -2679,20 +2679,22 @@ impl Paths {
             dof_background: pass.dof_background.is_some(),
         };
         // A bed that runs specialized takes the pipelines made for exactly its scene.
-        if settings.specialize
+        let waits = settings.specialize
             || !self
                 .kernels
                 .prepare_paths(lighting, &needs, settings)
-                .unwrap()
-        {
-            // The pipelines these paths first ask for compile on threads of their own.
+                .unwrap();
+        // The pipelines these paths first ask for compile on threads of their own, which go on
+        // with other beds' compiles after this one's are ready: the frame records once they
+        // return, with its own pipelines held for it until then.
+        let _waited = waits.then(|| {
             std::thread::scope(|threads| {
                 for _ in 1..compile_threads() {
                     threads.spawn(|| while self.loading.run_one() {});
                 }
-                self.kernels.wait_paths(lighting, &needs, settings).unwrap();
-            });
-        }
+                self.kernels.wait_paths(lighting, &needs, settings).unwrap()
+            })
+        });
         self.kernels
             .record_media(list, lighting, target, pass, settings)
             .unwrap();

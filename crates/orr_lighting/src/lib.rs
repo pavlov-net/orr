@@ -86,7 +86,7 @@ pub use subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 pub use view::{
     CameraJump, CompilingKernels, DofBackgroundPass, GuideKind, GuideSettings, LightingDebugView,
     LightingKernels, LightingView, MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION, PathNeeds, PathsRan,
-    ReferenceSettings, ThinLens, ViewLighting, ViewPass,
+    ReferenceSettings, ThinLens, ViewLighting, ViewPass, WaitedPaths,
 };
 pub use world_cache::{MAX_CAPACITY_LOG2, WorldCacheStats};
 
