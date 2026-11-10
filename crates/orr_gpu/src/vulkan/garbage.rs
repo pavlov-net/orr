@@ -58,6 +58,22 @@ impl RawBuffer {
     }
 }
 
+/// Allocations with device memory of their own one collection frees at most: a
+/// `vkFreeMemory` costs the driver real time, and an eviction can empty hundreds of pool
+/// blocks at once. The rest wait for the next collections.
+const OWN_FREES: usize = 2;
+
+impl Item {
+    /// It frees a `VkDeviceMemory` of its own.
+    fn owns_memory(&self) -> bool {
+        match self {
+            Item::Buffer(b) => b.allocation.dedicated,
+            Item::Image { memory, .. } => memory.as_ref().is_some_and(|(m, _)| m.dedicated),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Garbage {
     entries: Vec<(After, Item)>,
@@ -68,12 +84,17 @@ impl Garbage {
         self.entries.push((after, item));
     }
 
-    /// Removes and returns the items whose points have all completed.
+    /// Removes and returns the items whose points have all completed, with at most
+    /// [`OWN_FREES`] of those holding device memory of their own.
     fn take_due(&mut self, completed: &After) -> Vec<Item> {
         let mut due = Vec::new();
+        let mut own = 0;
         let mut i = 0;
         while i < self.entries.len() {
-            if self.entries[i].0.iter().zip(completed).all(|(a, c)| a <= c) {
+            let (after, item) = &self.entries[i];
+            let ready = after.iter().zip(completed).all(|(a, c)| a <= c);
+            if ready && (own < OWN_FREES || !item.owns_memory()) {
+                own += usize::from(item.owns_memory());
                 due.push(self.entries.swap_remove(i).1);
             } else {
                 i += 1;

@@ -55,8 +55,8 @@ use crate::memory::{Block, Pool, PoolSlot, SceneMemory};
 use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
 use crate::residency::{
-    Demand, HOLD_FRAMES, Held, InFlight, Key, Limits, Plan, Priority, RequestSource, Residency,
-    ResidencyClass, ResidencyStats, UnitDesc, response_period,
+    Demand, HOLD_FRAMES, Held, InFlight, Key, Limits, MARK_TENTHS, Plan, Priority, RequestSource,
+    Residency, ResidencyClass, ResidencyStats, UnitDesc, response_period,
 };
 use crate::scenes::PoolBytes;
 use crate::shaders::page_decode::PageDecodeRoot;
@@ -515,14 +515,16 @@ impl Streaming {
         heaps[ResidencyClass::MeshPages as usize] = heap(&[MemoryKind::DeviceLocal, units_kind]);
         heaps[ResidencyClass::Textures as usize] = heap(&[units_kind, MemoryKind::DeviceLocal]);
         heaps[ResidencyClass::InstancePages as usize] = heap(&[units_kind]);
+        let full = pools.mesh + pools.textures + b.instance_page_pool + 2 * b.in_flight_bytes;
+        let block = block_bytes(b.stream_block, full, caps.limits.max_memory_allocations);
         let pool = Arc::new(Mutex::new(Pool::new(
             MemoryKind::DeviceLocal,
             256,
-            b.stream_block,
+            block,
             "stream pool",
         )));
         let clas = if caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0 {
-            let pool = ClasPool::new(device, pools.mesh, b.stream_block)?;
+            let pool = ClasPool::new(device, pools.mesh, block)?;
             Some(Arc::new(pool))
         } else {
             None
@@ -542,7 +544,7 @@ impl Streaming {
                 Arc::new(Mutex::new(Pool::new(
                     units_kind,
                     256,
-                    b.stream_block,
+                    block,
                     "stream units",
                 )))
             } else {
@@ -550,16 +552,13 @@ impl Streaming {
             },
             pool,
             // Sector units, so that reads go straight into a slot.
-            staging: Arc::new(Mutex::new(Pool::new(
-                MemoryKind::Staging,
-                SECTOR as u64,
-                b.stream_block,
-                "stream staging",
-            ))),
+            staging: Arc::new(Mutex::new(
+                Pool::new(MemoryKind::Staging, SECTOR as u64, block, "stream staging").keep_spare(),
+            )),
             tiles: Arc::new(Mutex::new(Pool::new(
                 MemoryKind::DeviceLocal,
                 orr_pack::texture::TILE_BYTES as u64,
-                b.stream_block,
+                block,
                 "texture tile pool",
             ))),
             fine: BTreeMap::new(),
@@ -1625,6 +1624,10 @@ impl Streaming {
         let report = w.device.memory_report();
         let heaps: Vec<(u64, u64)> = report.heaps.iter().map(|h| (h.usage, h.budget)).collect();
         self.residency.react(frame, &heaps);
+        let staging = report.heap_of(MemoryKind::Staging);
+        if staging.usage > staging.budget / 10 * MARK_TENTHS {
+            self.staging.lock().unwrap().release_spare();
+        }
         if let Some(c) = &self.clas {
             let (bound, used, range_full) = c.end_step();
             self.residency.note_clas_pool(bound, used, range_full);
@@ -2750,6 +2753,18 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<StreamTask>)
         },
         error,
     });
+}
+
+/// Bytes of a block of the streamed pools: `stream_block`, or the next power of two past it
+/// that keeps `full` bytes, the pools at their full budgets with staging, within a quarter of
+/// the device's `max_allocations`, as each block is device memory of its own.
+fn block_bytes(stream_block: u64, full: u64, max_allocations: u32) -> u64 {
+    let least = full.div_ceil(u64::from(max_allocations / 4));
+    if least <= stream_block {
+        stream_block
+    } else {
+        least.next_power_of_two()
+    }
 }
 
 /// Whether `e` ran out of memory the residency budgets follow: of a kind in `governed`, on a

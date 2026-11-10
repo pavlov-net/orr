@@ -201,6 +201,10 @@ pub struct PoolFill {
     pub used: u64,
     /// Blocks with at most half their units in use.
     pub half_empty: u32,
+    /// Device memory blocks it has allocated so far.
+    pub made: u64,
+    /// Bytes of the empty block it keeps for the next, outside `blocks`.
+    pub spare: u64,
 }
 
 /// The CLAS pool's pages, as of the last replayed batch.
@@ -235,12 +239,19 @@ pub struct SceneMemory {
 }
 
 /// A streamed class's memory: blocks of one kind, sub-allocated in units of a fixed size. A
-/// block is allocated when no block has room and dropped once it is empty again.
+/// block is device memory of its own, allocated when no block has room and dropped once it is
+/// empty again, so what eviction empties goes back to the system.
 pub(crate) struct Pool {
     kind: MemoryKind,
     name: &'static str,
     places: Placement,
     memory: Vec<Option<Allocation<u8>>>,
+    /// With `keep_spare`, the last block of the standard size that emptied, which the next
+    /// block takes, until `release_spare`.
+    spare: Option<Allocation<u8>>,
+    keep_spare: bool,
+    /// Device memory blocks allocated so far.
+    made: u64,
 }
 
 /// Where a [`Pool`]'s ranges go, apart from the memory of its blocks.
@@ -380,6 +391,9 @@ impl Pool {
             name,
             places: Placement::new(unit, block_bytes),
             memory: Vec::new(),
+            spare: None,
+            keep_spare: false,
+            made: 0,
         }
     }
 
@@ -398,6 +412,8 @@ impl Pool {
             bytes: units * unit,
             used: used * unit,
             half_empty,
+            made: self.made,
+            spare: self.spare.as_ref().map_or(0, Allocation::size),
         }
     }
 
@@ -439,9 +455,15 @@ impl Pool {
             None => {
                 let block_units = self.places.block_for(units);
                 let size = u64::from(block_units) * unit;
-                let low = MemoryPriority::Low;
-                let memory =
-                    device.gpu_malloc_with_priority::<u8>(self.kind, low, size, self.name)?;
+                let memory = match self.spare.take_if(|s| s.size() == size) {
+                    Some(s) => s,
+                    None => {
+                        let low = MemoryPriority::Low;
+                        let m = device.gpu_malloc_block::<u8>(self.kind, low, size, self.name)?;
+                        self.made += 1;
+                        m
+                    }
+                };
                 let slot = self.places.add(block_units, units, align);
                 let i = slot.block as usize;
                 if i >= self.memory.len() {
@@ -481,8 +503,24 @@ impl Pool {
     /// Returns `slot`; call only once the GPU no longer reads it.
     pub(crate) fn free(&mut self, slot: PoolSlot) {
         if self.places.free(slot) {
-            self.memory[slot.block as usize] = None;
+            let memory = self.memory[slot.block as usize].take();
+            let standard = u64::from(self.places.block_units) * self.places.unit;
+            if self.keep_spare && self.spare.is_none() {
+                self.spare = memory.filter(|m| m.size() == standard);
+            }
         }
+    }
+
+    /// Keeps the last block of the standard size that empties for the next block: for a pool
+    /// whose blocks empty and fill again as loads come and go.
+    pub(crate) fn keep_spare(mut self) -> Self {
+        self.keep_spare = true;
+        self
+    }
+
+    /// Frees the spare block.
+    pub(crate) fn release_spare(&mut self) {
+        self.spare = None;
     }
 }
 

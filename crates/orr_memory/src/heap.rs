@@ -113,20 +113,7 @@ impl HeapPool {
             return Err(AllocError);
         }
         if size > self.block_bytes / 2 {
-            // A heap's own placement offsets start at 0, which every alignment divides.
-            let heap = self.new_heap(size)?;
-            let block = self.insert(Block {
-                heap: heap.clone(),
-                space: None,
-            });
-            let a = HeapAllocation {
-                heap,
-                offset: 0,
-                size,
-                block,
-                range: None,
-            };
-            return Ok((a, true));
+            return self.allocate_own(layout).map(|a| (a, true));
         }
         for (i, b) in self.blocks.iter_mut().enumerate() {
             if let Some(Block {
@@ -161,6 +148,29 @@ impl HeapPool {
             range: Some(range),
         };
         Ok((a, true))
+    }
+
+    /// `layout.size()` bytes in a new heap of their own, which the pool releases when they
+    /// are freed; the caller makes it resident. Fails when the size is 0 or the device has no
+    /// memory for the heap.
+    pub fn allocate_own(&mut self, layout: Layout) -> Result<HeapAllocation, AllocError> {
+        let size = layout.size() as u64;
+        if size == 0 {
+            return Err(AllocError);
+        }
+        // A heap's own placement offsets start at 0, which every alignment divides.
+        let heap = self.new_heap(size)?;
+        let block = self.insert(Block {
+            heap: heap.clone(),
+            space: None,
+        });
+        Ok(HeapAllocation {
+            heap,
+            offset: 0,
+            size,
+            block,
+            range: None,
+        })
     }
 
     /// Frees `a` now. Returns its heap when the pool releases it, for the caller to take out

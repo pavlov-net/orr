@@ -63,7 +63,7 @@ use crate::MountId;
 pub(crate) const HOLD_FRAMES: u64 = 30;
 
 /// Tenths of a heap's OS budget that its use is kept under.
-const MARK_TENTHS: u64 = 9;
+pub(crate) const MARK_TENTHS: u64 = 9;
 /// Budget factor change after a failed allocation or a full range, and after a response period
 /// without.
 const SCALE_STEP: f64 = 0.95;

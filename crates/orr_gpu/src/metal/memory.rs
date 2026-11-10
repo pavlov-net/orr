@@ -207,7 +207,20 @@ impl Device {
         name: &str,
     ) -> Result<Allocation<T>, Error> {
         let _ = priority;
-        malloc(&self.shared, kind, count, name)
+        malloc(&self.shared, kind, count, name, false)
+    }
+
+    /// As [`Device::gpu_malloc_with_priority`], in a heap of its own, released once it is
+    /// freed.
+    pub fn gpu_malloc_block<T>(
+        &self,
+        kind: MemoryKind,
+        priority: MemoryPriority,
+        count: u64,
+        name: &str,
+    ) -> Result<Allocation<T>, Error> {
+        let _ = priority;
+        malloc(&self.shared, kind, count, name, true)
     }
 
     /// Frees `a` once `after` has completed.
@@ -314,12 +327,14 @@ impl Device {
     }
 }
 
-/// `count` values of `T` in `kind` memory of `shared`'s device.
+/// `count` values of `T` in `kind` memory of `shared`'s device, in a heap of their own with
+/// `own`.
 pub(super) fn malloc<T>(
     shared: &Arc<Shared>,
     kind: MemoryKind,
     count: u64,
     name: &str,
+    own: bool,
 ) -> Result<Allocation<T>, Error> {
     let size = count
         .checked_mul(size_of::<T>() as u64)
@@ -330,7 +345,7 @@ pub(super) fn malloc<T>(
                 size_of::<T>()
             ))
         })?;
-    let raw = shared.create_buffer(kind, size, name, name)?;
+    let raw = shared.create_buffer(kind, size, name, name, own)?;
     let cpu = (kind != MemoryKind::DeviceLocal).then(|| raw.buffer.contents().cast::<T>());
     if let Some(p) = cpu {
         assert!(
@@ -352,13 +367,14 @@ pub(super) fn malloc<T>(
 
 impl Shared {
     /// A buffer of `size` bytes of `kind` memory, placed in one of the kind's heaps, resident,
-    /// in the address map and counted under `label`.
+    /// in the address map and counted under `label`; with `own` in a heap of its own.
     pub(super) fn create_buffer(
         &self,
         kind: MemoryKind,
         size: u64,
         name: &str,
         label: &str,
+        own: bool,
     ) -> Result<RawBuffer, Error> {
         let no_memory = || Error::OutOfMemory {
             call: "newBufferWithLength",
@@ -386,9 +402,14 @@ impl Shared {
                 "{name}: {bytes} bytes aligned to {align} exceed the address space"
             ))
         })?;
-        let (memory, new_heap) = lock(&self.heaps[kind.index()])
-            .allocate(layout)
-            .map_err(|_| no_memory())?;
+        let mut pool = lock(&self.heaps[kind.index()]);
+        let placed = if own {
+            pool.allocate_own(layout).map(|a| (a, true))
+        } else {
+            pool.allocate(layout)
+        };
+        drop(pool);
+        let (memory, new_heap) = placed.map_err(|_| no_memory())?;
         // SAFETY: the buffer lies in the range the pool placed, which no other resource uses.
         let buffer = unsafe {
             memory.heap().newBufferWithLength_options_offset(
@@ -495,7 +516,7 @@ impl Ring {
         }
         let mut blocks = Vec::with_capacity(count as usize);
         for i in 0..count {
-            let raw = shared.create_buffer(kind, bytes, &format!("{name} {i}"), name)?;
+            let raw = shared.create_buffer(kind, bytes, &format!("{name} {i}"), name, false)?;
             let mapped = (kind != MemoryKind::DeviceLocal)
                 .then(|| NonNull::new(raw.buffer.contents().as_ptr().cast::<u8>()))
                 .flatten();

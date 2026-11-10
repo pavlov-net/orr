@@ -187,7 +187,10 @@ pub struct Budgets {
     /// staging and as much again of the stored bytes archive reads take. Reads and staging that
     /// find no room take memory of their own. Above 0.
     pub in_flight_bytes: u64,
-    /// Bytes per block of the stream pool.
+    /// Bytes per block of the streamed pools, each block device memory of its own that goes
+    /// back to the system once eviction empties it. Where the pools at their full budgets would
+    /// take more than a quarter of the device's `Limits::max_memory_allocations` in blocks this
+    /// large, they take blocks of the next power of two that keeps them within it.
     pub stream_block: u64,
 }
 

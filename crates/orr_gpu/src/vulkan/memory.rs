@@ -371,6 +371,17 @@ pub(super) fn memory_error(e: orr_memory::Error) -> Error {
     }
 }
 
+/// Where a buffer's memory comes from.
+#[derive(Clone, Copy)]
+enum Place {
+    /// The buffer pool of a priority.
+    Pool(MemoryPriority),
+    /// A `VkDeviceMemory` of its own, at the priority of that pool.
+    Own(MemoryPriority),
+    /// The transient pool of arena blocks.
+    Transient,
+}
+
 impl Shared {
     /// Creates a buffer in the normal-priority pool of `kind`, mapped when host-visible.
     pub(super) fn create_buffer(
@@ -381,18 +392,18 @@ impl Shared {
         align: u64,
         name: &str,
     ) -> Result<(RawBuffer, Option<NonNull<u8>>), Error> {
-        let normal = Some(MemoryPriority::Normal);
+        let normal = Place::Pool(MemoryPriority::Normal);
         self.create_buffer_in(normal, kind, size, usage, align, name, name)
     }
 
-    /// Creates a buffer of `kind` in the buffer pool of `priority`, or the transient pool
-    /// for `None`, at an address that is a multiple of `align` (a power of two), counted
-    /// under `label`. Fails when its memory cannot give that: the allocator aligns offsets in
-    /// a block, and host memory blocks can start on any 4 KiB page.
+    /// Creates a buffer of `kind` where `place` says, at an address that is a multiple of
+    /// `align` (a power of two), counted under `label`. Fails when its memory cannot give
+    /// that: the allocator aligns offsets in a block, and host memory blocks can start on any
+    /// 4 KiB page.
     #[allow(clippy::too_many_arguments)]
     fn create_buffer_in(
         &self,
-        priority: Option<MemoryPriority>,
+        place: Place,
         kind: MemoryKind,
         size: u64,
         usage: vk::BufferUsageFlags,
@@ -424,18 +435,22 @@ impl Shared {
             .usage(usage)
             .sharing_mode(sharing)
             .queue_family_indices(families);
-        if priority.is_none() && kind == MemoryKind::DeviceLocal && self.caps.generated_commands {
+        let transient = matches!(place, Place::Transient);
+        if transient && kind == MemoryKind::DeviceLocal && self.caps.generated_commands {
             info = info.push(&mut usage2);
         }
-        let pool = match priority {
-            Some(p) => pools.buffers[p as usize][kind.index()],
-            None => pools.transient[kind.index()],
+        let pool = match place {
+            Place::Pool(p) | Place::Own(p) => pools.buffers[p as usize][kind.index()],
+            Place::Transient => pools.transient[kind.index()],
         };
         let mut flags = if self.memory.host_visible(kind) {
             AllocationFlags::MAPPED
         } else {
             AllocationFlags::empty()
         };
+        if matches!(place, Place::Own(_)) {
+            flags |= AllocationFlags::DEDICATED;
+        }
         // Textures may be placed in the buffer's memory, also when it gets its own.
         if placeable {
             flags |= AllocationFlags::CAN_ALIAS;
@@ -606,6 +621,30 @@ impl Device {
         count: u64,
         name: &str,
     ) -> Result<Allocation<T>, Error> {
+        self.malloc(Place::Pool(priority), kind, count, name)
+    }
+
+    /// As [`Device::gpu_malloc_with_priority`], in a `VkDeviceMemory` of its own, which goes
+    /// back to the system when the allocation is freed. Each one takes one of
+    /// `Limits::max_memory_allocations`. Textures and sparse pages can be placed in it as in
+    /// any DeviceLocal or Upload allocation.
+    pub fn gpu_malloc_block<T>(
+        &self,
+        kind: MemoryKind,
+        priority: MemoryPriority,
+        count: u64,
+        name: &str,
+    ) -> Result<Allocation<T>, Error> {
+        self.malloc(Place::Own(priority), kind, count, name)
+    }
+
+    fn malloc<T>(
+        &self,
+        place: Place,
+        kind: MemoryKind,
+        count: u64,
+        name: &str,
+    ) -> Result<Allocation<T>, Error> {
         let size = count
             .checked_mul(size_of::<T>() as u64)
             .filter(|&s| s > 0)
@@ -617,9 +656,9 @@ impl Device {
             })?;
         let align = (align_of::<T>() as u64).max(MALLOC_ALIGN);
         let usage = self.shared.buffer_usage;
-        let (raw, mapped) =
-            self.shared
-                .create_buffer_in(Some(priority), kind, size, usage, align, name, name)?;
+        let (raw, mapped) = self
+            .shared
+            .create_buffer_in(place, kind, size, usage, align, name, name)?;
         let cpu = mapped.map(NonNull::cast::<T>);
         if let Some(p) = cpu {
             assert!(
@@ -710,7 +749,7 @@ impl Ring {
         let blocks = (0..count)
             .map(|i| {
                 let (raw, mapped) = shared.create_buffer_in(
-                    None,
+                    Place::Transient,
                     kind,
                     bytes,
                     shared.buffer_usage,

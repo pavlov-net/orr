@@ -8,8 +8,8 @@ use std::time::Duration;
 use gpu_suite::shaders::gate;
 use gpu_suite::{assert_clean, device, pipeline};
 use orr_gpu::{
-    Device, DeviceDesc, Format, GpuAddress, GpuPtr, Hazards, MemoryKind, QueueKind, QueueRequest,
-    Stages, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
+    Device, DeviceDesc, Format, GpuAddress, GpuPtr, Hazards, MemoryKind, MemoryPriority, QueueKind,
+    QueueRequest, Stages, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
 
 /// Host pages from the global allocator, freed when dropped.
@@ -170,7 +170,15 @@ fn labels_add_up_to_the_pools_allocations() {
             .submit(vec![queue.command_list().unwrap()], &[])
             .unwrap();
         queue.wait(done, Duration::from_secs(10)).unwrap();
-        d.collect_garbage();
+        // A collection frees a few allocations of their own memory; the rest wait for the next.
+        let live = || d.memory_report().kinds.map(|k| k.allocations);
+        loop {
+            let before = live();
+            d.collect_garbage();
+            if live() == before {
+                break;
+            }
+        }
     };
     let check = |when: &str| {
         let b = d.memory_breakdown();
@@ -237,6 +245,33 @@ fn labels_add_up_to_the_pools_allocations() {
     drop(held);
     settle();
     check("with nothing held");
+
+    // A block of its own goes back to the system at the collection after its free.
+    let low = MemoryPriority::Low;
+    let block = d
+        .gpu_malloc_block::<u8>(MemoryKind::DeviceLocal, low, 16 << 20, "ledger block")
+        .unwrap();
+    let heap = d.memory_report().kind_heaps[MemoryKind::ALL
+        .iter()
+        .position(|&k| k == MemoryKind::DeviceLocal)
+        .unwrap()];
+    let b = check("with a block");
+    let own = b
+        .labels
+        .iter()
+        .find(|l| &*l.label == "ledger block")
+        .unwrap();
+    assert_eq!((own.dedicated, own.dedicated_bytes), (1, own.bytes));
+    let before = b.heaps[heap].block_bytes;
+    drop(block);
+    assert_eq!(
+        d.memory_breakdown().heaps[heap].block_bytes,
+        before,
+        "freed early"
+    );
+    settle();
+    let after = check("after the block").heaps[heap].block_bytes;
+    assert_eq!(before - after, own.bytes, "the block's memory went back");
     assert_eq!(d.validation_messages(), 0);
 }
 
