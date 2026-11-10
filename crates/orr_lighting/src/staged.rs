@@ -34,8 +34,8 @@ const BASE_WORDS: u64 = 20;
 const INTERIOR_PARTS: u64 = 11;
 const STACK_PART: u64 = 5;
 const SPECTRAL_PART: u64 = 5;
-const SHADOW_WORDS: u64 = 11;
-const SHADOW_ARRIVED_WORDS: u64 = 6;
+const SHADOW_WORDS: u64 = 3;
+const SHADOW_INTERIOR_WORDS: u64 = 9;
 const RECORD_WORDS: u64 = 3;
 const UPDATE_RECORD_WORDS: u64 = 9;
 const WALK_WORDS: u64 = 22;
@@ -1058,7 +1058,7 @@ impl StateParts {
     }
 
     fn shadow_words(self) -> u64 {
-        SHADOW_WORDS + Self::part(self.interiors, SHADOW_ARRIVED_WORDS)
+        SHADOW_WORDS + Self::part(self.interiors, SHADOW_INTERIOR_WORDS)
     }
 
     /// Bytes a path slot takes.

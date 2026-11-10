@@ -226,23 +226,24 @@ struct PathPending
     uint medium;                    // a scatter's
 }
 
-// A deferred shadow ray: what next-event estimation adds where its ray reaches the light.
+// A deferred shadow ray: what next-event estimation adds where its ray reaches the light. A
+// path that tracks no interiors keeps the fields before `start`: no surface it shades bounds
+// one, and the vertex's point only scales the optical depth of interiors.
 struct PathShadowRay
 {
-    float3 throughput;              // the path's at the vertex
-    float scale;                    // W x MIS / run, along the straight way
-    float3 e;                       // the estimate, unshadowed
+    // The path's throughput at the vertex x the estimate, unshadowed, weighed along the
+    // straight way and through the coat and fuzz of an emitter.
+    float3 contribution;
     uint light;                     // the winner's feedback id, NO_LIGHT for a directional winner
-    float3 start;                   // the vertex's point
-    uint flags;                     // SHADOW_*, and from SHADOW_DEPTH_SHIFT the vertex's depth, which is below the rounds a root may ask for
     float3 origin;
     float t_max;
     float3 dir;
+    uint flags;                     // SHADOW_*, and from SHADOW_DEPTH_SHIFT the vertex's depth, which is below the rounds a root may ask for
+    float3 start;                   // the vertex's point
     uint surface;
     float4 point;
     float3 normal;
-    float exterior_ior;
-    ResolvedLightSample chosen;
+    uint _pad;
     Interior arrived;
 }
 
@@ -286,10 +287,10 @@ static const uint MEDIUM_FIRST = ENTERED_FIRST + ENTERED_WORDS;
 public static const uint INTERIOR_PARTS = INTERIOR_WORDS + ENTERED_WORDS + MEDIUM_WORDS;
 public static const uint STACK_PART = STACK_WORDS;
 public static const uint SPECTRAL_PART = SPECTRAL_WORDS;
-// A deferred shadow ray's words, and with FEATURE_INTERIORS those of the interiors its vertex
-// arrived with after them.
-public static const uint SHADOW_WORDS = 11;
-public static const uint SHADOW_ARRIVED_WORDS = 6;
+// A deferred shadow ray's words, and with FEATURE_INTERIORS those of its vertex's point, the
+// surface it lies on and the interiors it arrived with after them.
+public static const uint SHADOW_WORDS = 3;
+public static const uint SHADOW_INTERIOR_WORDS = 9;
 // A record's words: a view's and a photon's, and an update path's, whose slices hold as many
 // fewer paths.
 public static const uint RECORD_WORDS = 3;
@@ -604,37 +605,41 @@ void store_interior(PathRoot r, uint slot, Interior v)
         store_words<Interior, INTERIOR_WORDS>(r.stages.words, r.stages.capacity, INTERIOR_FIRST, slot, v);
 }
 
-// A deferred shadow ray: `PathShadowRay.arrived` is its last field, in words of its own that
-// only paths that track interiors keep.
+// A deferred shadow ray: the fields from `PathShadowRay.start` on lie in words of their own
+// that only paths that track interiors keep.
 PathShadowRay load_shadow(PathRoot r, uint slot)
 {
-    static_assert(sizeof(PathShadowRay) - sizeof(Interior) == SHADOW_WORDS * 16, "PathShadowRay.arrived shares a word");
-    static_assert(sizeof(PathShadowRay) <= (SHADOW_WORDS + SHADOW_ARRIVED_WORDS) * 16, "a shadow ray outgrows its words");
+    static_assert(sizeof(PathShadowRay) - sizeof(Interior) == (SHADOW_WORDS + 3) * 16, "PathShadowRay.arrived shares a word");
+    static_assert(sizeof(PathShadowRay) <= (SHADOW_WORDS + SHADOW_INTERIOR_WORDS) * 16, "a shadow ray outgrows its words");
     PathStages* st = r.stages;
-    bool arrived = interiors_tracked(r);
-    Words<SHADOW_WORDS + SHADOW_ARRIVED_WORDS> w;
+    bool interiors = interiors_tracked(r);
+    Words<SHADOW_WORDS + SHADOW_INTERIOR_WORDS> w;
     [ForceUnroll]
-    for (uint k = 0; k < SHADOW_WORDS + SHADOW_ARRIVED_WORDS; k++)
+    for (uint k = 0; k < SHADOW_WORDS + SHADOW_INTERIOR_WORDS; k++)
     {
         w.w[k] = uint4(0);
-        if (k < SHADOW_WORDS || arrived)
+        if (k < SHADOW_WORDS || interiors)
             w.w[k] = st.shadows[k * st.capacity + slot];
     }
     PathShadowRay q = reinterpret<PathShadowRay>(w);
-    if (!arrived)
+    if (!interiors)
+    {
+        q.start = q.origin;
+        q.surface = MATERIAL_NONE;
         q.arrived = Interior();
+    }
     return q;
 }
 
 void store_shadow(PathRoot r, uint slot, PathShadowRay q)
 {
     PathStages* st = r.stages;
-    bool arrived = interiors_tracked(r);
-    Words<SHADOW_WORDS + SHADOW_ARRIVED_WORDS> w = reinterpret<Words<SHADOW_WORDS + SHADOW_ARRIVED_WORDS>>(q);
+    bool interiors = interiors_tracked(r);
+    Words<SHADOW_WORDS + SHADOW_INTERIOR_WORDS> w = reinterpret<Words<SHADOW_WORDS + SHADOW_INTERIOR_WORDS>>(q);
     [ForceUnroll]
-    for (uint k = 0; k < SHADOW_WORDS + SHADOW_ARRIVED_WORDS; k++)
+    for (uint k = 0; k < SHADOW_WORDS + SHADOW_INTERIOR_WORDS; k++)
     {
-        if (k < SHADOW_WORDS || arrived)
+        if (k < SHADOW_WORDS || interiors)
             st.shadows[k * st.capacity + slot] = w.w[k];
     }
 }
@@ -1191,15 +1196,22 @@ public void photon_start_stage<S : ISurface, M : IMedium>(PathRoot root, uint la
 // ---------------------------------------------------------------------------------------------
 // Shadow rays
 
-// The shadow ray of next-event estimation `d` at a vertex at `start` of depth `depth`, with
-// vertex shadow `shadow`: it adds `throughput` times what it finds to the path's radiance,
-// weighed along the straight way by `scale`.
-PathShadowRay shadow_ray<S : ISurface, M : IMedium>(NeeDraw d, float scale, PathShadow<S, M> shadow, float3 start, float3 throughput, uint depth, bool feedback, bool counted, float exterior_ior)
+// `vis` of a shadow ray to `chosen` through the coat and fuzz of the emitter it reached, from
+// a vertex in a medium of IOR `exterior_ior`.
+float3 emitter_view<S : ISurface>(PathRoot r, ResolvedLightSample chosen, float exterior_ior, float3 vis)
+{
+    if (chosen.view && any(vis > 0.0))
+        vis *= emitter_view_layer<S>(r.set, chosen, exterior_ior);
+    return vis;
+}
+
+// The shadow ray of next-event estimation `d` at a vertex at `start` of depth `depth`, in a
+// medium of IOR `exterior_ior`, with vertex shadow `shadow`: it adds `throughput` times what it
+// finds to the path's radiance, weighed along the straight way by `scale`.
+PathShadowRay shadow_ray<S : ISurface, M : IMedium>(PathRoot r, NeeDraw d, float scale, PathShadow<S, M> shadow, float3 start, float3 throughput, uint depth, bool feedback, bool counted, float exterior_ior)
 {
     PathShadowRay q = (PathShadowRay)0;
-    q.throughput = throughput;
-    q.e = d.e;
-    q.scale = scale;
+    q.contribution = throughput * emitter_view<S>(r, d.chosen, exterior_ior, d.e * scale);
     q.light = d.chosen.kind != LIGHT_SAMPLE_DIRECTIONAL ? d.chosen.light : NO_LIGHT;
     q.start = start;
     q.flags = (d.chosen.kind == LIGHT_SAMPLE_ENVIRONMENT ? SHADOW_ENVIRONMENT : 0) | (d.chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? SHADOW_DIRECTIONAL : 0)
@@ -1212,14 +1224,12 @@ PathShadowRay shadow_ray<S : ISurface, M : IMedium>(NeeDraw d, float scale, Path
     q.surface = shadow.surface;
     q.point = shadow.point;
     q.normal = shadow.normal;
-    q.exterior_ior = exterior_ior;
-    q.chosen = d.chosen;
     return q;
 }
 
 // What shadow ray `q` finds: 0 or 1 for opaque blockers, times what lies between, with the
 // plane stack a directional light's ray met in `stack`. An emitter's coat and fuzz are not in
-// it (`shadow_emitter`).
+// it (`emitter_view`).
 float3 shadow_trace<S : ISurface, M : IMedium>(PathRoot r, PathShadowRay q, out StackLight stack)
 {
     PathShadow<CoverageFeedback<S>, M> shadow;
@@ -1237,18 +1247,9 @@ float3 shadow_trace<S : ISurface, M : IMedium>(PathRoot r, PathShadowRay q, out 
     return shadow.transmittance(q.start, q.origin, q.dir, q.t_max, context, has(q.flags, SHADOW_ENVIRONMENT), has(q.flags, SHADOW_DIRECTIONAL), stack);
 }
 
-// `vis` of shadow ray `q` through the coat and fuzz of the emitter it reached.
-float3 shadow_emitter<S : ISurface>(PathRoot r, PathShadowRay q, float3 vis)
+// Adds what shadow ray `q` gave, `added`, to the path.
+void shadow_add(PathShadowRay q, float3 added, inout PathLoop p, inout StagedRecord record)
 {
-    if (q.chosen.view && any(vis > 0.0))
-        vis *= emitter_view_layer<CoverageFeedback<S>>(r.set, q.chosen, q.exterior_ior);
-    return vis;
-}
-
-// Adds what shadow ray `q` gave, `e` x `scale` of it, to the path.
-void shadow_add(PathShadowRay q, float3 e, float scale, float3 vis, Spectral spectral, inout PathLoop p, inout StagedRecord record)
-{
-    float3 added = spectral.color(q.throughput * (e * vis * scale));
     if (has(q.flags, SHADOW_COUNTED))
         p.radiance += added;
     if (q.light != NO_LIGHT)
@@ -1373,8 +1374,7 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     {
         PathShadowRay q = load_shadow(r, slot);
         StackLight stack;
-        float3 vis = shadow_emitter<S>(r, q, shadow_trace<S, M>(r, q, stack));
-        shadow_add(q, q.e, q.scale, vis, spectral, p, record);
+        shadow_add(q, spectral.color(q.contribution * shadow_trace<S, M>(r, q, stack)), p, record);
         set_flag(p.flags, LOOP_SHADOW, false);
     }
     PathFixed f = load_fixed(r, slot);
@@ -1663,6 +1663,8 @@ struct ShadeNee
     NeeDraw d;
     float run;
     bool weight_one;
+    float3 throughput;              // the path's at the vertex
+    float exterior_ior;             // of the medium the vertex lies in
 }
 
 // Resolves the vertex the trace stage's ray reached (a layer for `layer`), and takes its
@@ -1883,10 +1885,12 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
                 count_ray(p);
                 float mis = weight_one ? 1.0 : mis_balance(run * d.chosen.pdf, d.scatter_pdf);
                 nee.traced = true;
-                nee.q = shadow_ray<CoverageFeedback<S>, M>(d, d.W * mis / run, shadow, l.x.surface.position, p.throughput, p.depth, x.feedback, counted, exterior);
+                nee.q = shadow_ray<CoverageFeedback<S>, M>(r, d, d.W * mis / run, shadow, l.x.surface.position, p.throughput, p.depth, x.feedback, counted, exterior);
                 nee.d = d;
                 nee.run = run;
                 nee.weight_one = weight_one;
+                nee.throughput = p.throughput;
+                nee.exterior_ior = exterior;
             }
         }
     }
@@ -2258,17 +2262,16 @@ public void walk_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         PathShadowRay q = rays[i];
         StackLight stack;
         float3 vis = shadow_trace<S, M>(r, q, stack);
-        float3 e = q.e;
-        float scale = q.scale;
+        float3 added = q.contribution * vis;
         // Through a plane stack the exit's scatter weighs the light again.
         if (i == 1)
         {
             float scatter_pdf;
-            e = nee_bent(nee.d, sv.exit_scatter, vis, stack, float3(1.0), false, scatter_pdf);
+            float3 e = nee_bent(nee.d, sv.exit_scatter, vis, stack, float3(1.0), false, scatter_pdf);
             float mis = nee.weight_one ? 1.0 : mis_balance(nee.run * nee.d.chosen.pdf, scatter_pdf);
-            scale = nee.d.W * mis / nee.run;
+            added = nee.throughput * (e * emitter_view<CoverageFeedback<S>>(r, nee.d.chosen, nee.exterior_ior, vis) * (nee.d.W * mis / nee.run));
         }
-        shadow_add(q, e, scale, shadow_emitter<S>(r, q, vis), c.spectral, p, record);
+        shadow_add(q, c.spectral.color(added), p, record);
     }
     p.rng = rng;
     leave_shade(r, slot, f, p, c, alive, false, round_now(r) + 1);
@@ -2294,8 +2297,7 @@ public void tail_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     {
         PathShadowRay q = load_shadow(r, slot);
         StackLight stack;
-        float3 vis = shadow_emitter<S>(r, q, shadow_trace<S, M>(r, q, stack));
-        shadow_add(q, q.e, q.scale, vis, spectral, p, record);
+        shadow_add(q, spectral.color(q.contribution * shadow_trace<S, M>(r, q, stack)), p, record);
         set_flag(p.flags, LOOP_SHADOW, false);
     }
     PathFixed f = load_fixed(r, slot);
