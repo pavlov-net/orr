@@ -697,7 +697,10 @@ fn particles_in_shade_are_darker_than_in_the_sun() {
 /// An emissive opaque particle 40 m away in height fog under a uniform sky: what reaches the
 /// eye from it is its emission through the fog's transmittance plus the sky's single
 /// scattering over the segment in front of it, L (1 - T), not its emission pasted over the
-/// fogged sky.
+/// fogged sky. The froxels' light resamples a few of the light tiles the scene draws each frame
+/// by its frame count, and blends the result into a history that fills over 16 frames: the
+/// frames before it has filled weigh single draws, so the comparison takes the frames after
+/// them.
 #[test]
 fn particles_in_fog_take_the_fog_in_front_of_them() {
     let fog = Fog {
@@ -725,7 +728,8 @@ fn particles_in_fog_take_the_fog_in_front_of_them() {
     );
     let mut paths = fog_paths();
     paths.settings = ViewLighting::default();
-    let a = bed.accumulate(16, 3, &mut |list, f| paths.record(list, f));
+    bed.accumulate(16, 3, &mut |list, f| paths.record(list, f));
+    let a = bed.accumulate_on(16, 32, 3, &mut |list, f| paths.record(list, f));
     let got = luminance(a.around(pixel_of(&bed.spec, target), 2));
     let sigma = f64::from(fog.density) * (-f64::from(eye.y) / f64::from(fog.falloff_height)).exp();
     let transmittance = (-sigma * 40.0).exp();
