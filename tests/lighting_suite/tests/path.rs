@@ -4,10 +4,11 @@
 //! as lights.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD, EXTENT, FLOOR,
-    FURNACE_RADIANCE, GLASS_SPHERE, GLOSSY_FLOOR, Item, MIRROR, NEAR, Particle, ParticleLook,
-    Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec, TROUGH, assert_close,
-    image_mean, luminance, mean_where, pixel_of, reference, surface_mean,
+    Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD,
+    EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, GLASS_SPHERE, GLOSSY_FLOOR, Item, MIRROR, NEAR,
+    Particle, ParticleLook, Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec,
+    TINTED_FLOOR, TROUGH, assert_close, image_mean, luminance, mean_where, pixel_of, reference,
+    surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::assert_same_mean;
@@ -893,6 +894,90 @@ fn a_coated_emitter_lights_a_floor_seen_in_a_mirror_alike_by_next_event_and_bsdf
         assert_same_mean(&format!("{emitter}: next-event against BSDF"), &nee, &bsdf);
         assert_same_mean(&format!("{emitter}: full against BSDF"), &full, &bsdf);
     }
+    assert_clean();
+}
+
+/// Pipelines compiled for what a scene may hold read what its surfaces read at a hit: a floor
+/// whose vertex colors tint its base color, under a decal, seen in a mirror, so the path's
+/// second vertex is resolved from its hit and not from the G-buffer. The pipelines that hold
+/// everything show the tint and the decal there, and the scene's own render the same image.
+#[test]
+fn specialized_pipelines_read_vertex_colors_and_decals_at_a_hit() {
+    const MIRROR_Z: f32 = -1.5;
+    let spec = Spec {
+        copies: vec![
+            at(TINTED_FLOOR, Mat3::IDENTITY, Vec3::ZERO),
+            at(MIRROR, Mat3::IDENTITY, Vec3::new(0.0, 1.0, MIRROR_Z)),
+        ],
+        lights: Vec::new(),
+        environment: Some(FURNACE_RADIANCE),
+        eye: Vec3::new(2.0, 1.6, 3.0),
+        target: Vec3::new(0.3, 0.5, MIRROR_Z),
+        fov_y: 0.8,
+        focus: None,
+    };
+    // A black decal on the floor, and the floor points left of it the mirror shows.
+    let decal = FloorDecal {
+        material: BLACK_SPHERE,
+        center: Vec3::new(0.0, 0.0, 0.6),
+        half_extent: Vec3::new(0.8, 0.8, 0.5),
+    };
+    let seen = |x: f32| pixel_of(&spec, Vec3::new(x, 0.0, 2.0 * MIRROR_Z - decal.center.z));
+    let mut paths = paths(ViewLighting {
+        debug_view: LightingDebugView::BsdfOnly,
+        max_bounces: 2,
+        ..ViewLighting::default()
+    });
+    let mut render = |specialize| {
+        paths.specialize = specialize;
+        let mut bed = Bed::with_features(spec.clone(), &[decal]);
+        render_paths(&mut bed, &paths, 8, 1)
+    };
+    let general = render(false);
+    let [under, near, far] = [0.0, -1.4, -2.2].map(|x| general.around(seen(x), 2));
+    assert!(
+        under[1] < 0.1 * near[1],
+        "the decal: green {} under it, {} beside it",
+        under[1],
+        near[1]
+    );
+    // The floor's vertex colors go from red at -x to green at +x.
+    let (near, far) = (near[0] / near[1], far[0] / far[1]);
+    assert!(
+        far > 1.2 * near,
+        "the tint: red over green {far} at -2.2 m, {near} at -1.4 m"
+    );
+    let specialized = render(true);
+    let bits = |a: &Accumulated| {
+        a.mean
+            .iter()
+            .map(|p| p.map(f32::to_bits))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        bits(&general) == bits(&specialized),
+        "the scene's own pipelines changed the image"
+    );
+    assert_clean();
+}
+
+/// A view whose frames stop tracing photons keeps none of their pipelines among those its
+/// frames ran: the bed checks each frame on its scene's own pipelines against what it asked.
+#[test]
+fn a_view_that_stops_tracing_photons_runs_only_what_it_asks_for() {
+    let mut bed = Bed::new(Analytic::CornellBox);
+    let mut real_time = paths(ViewLighting::default());
+    real_time.specialize = true;
+    render_paths(&mut bed, &real_time, 2, 1);
+    let mut reference = paths(ViewLighting {
+        reference: Some(ReferenceSettings {
+            photons: 0,
+            ..ReferenceSettings::default()
+        }),
+        ..reference(2)
+    });
+    reference.specialize = true;
+    render_paths(&mut bed, &reference, 2, 1);
     assert_clean();
 }
 

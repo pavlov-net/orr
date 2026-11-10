@@ -27,12 +27,12 @@ use orr_pack::material::{Material, slot};
 use orr_pack::{AssetId, Span, Target};
 use orr_scene::testing::{FlipError, Image, Pixels, flip};
 use orr_scene::{
-    ClusterTopology, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
-    LoadState, MaterialGpu, MaterialId, MediumProxy, MediumProxyId, MountId, Opacity, PackSource,
-    ProducerDesc, ProducerId, ProducerUpdate, Projection, RasterView, RendererDesc, SceneCompute,
-    SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, TextureFilter,
-    TransformGroupDesc, TransformGroupId, ViewArena, ViewDesc, ViewHistoryId, VolumeRef,
-    material_flags,
+    ClusterTopology, Decal, DecalChannels, DecalId, FrameDesc, FrameTime, GroupWriter,
+    InstanceFlags, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, MediumProxy,
+    MediumProxyId, MountId, Opacity, PackSource, ProducerDesc, ProducerId, ProducerUpdate,
+    Projection, RasterView, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter,
+    Scenes, SkinStateGpu, SkinnedDesc, TextureFilter, TransformGroupDesc, TransformGroupId,
+    ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 
@@ -1454,6 +1454,53 @@ fn pack() -> &'static Arc<[u8]> {
     PACK.get_or_init(cook)
 }
 
+/// [`FLOOR`]'s square with a color at each vertex, red at -x to green at +x, that its material's
+/// base color reads; a model of the feature pack ([`Bed::with_features`]).
+pub const TINTED_FLOOR: &str = "tinted floor";
+
+/// A pack of what the bed's own leaves out, which [`Bed::with_features`] alone mounts beside
+/// it: a scene may hold what any material of a mounted pack shows, so these stay out of every
+/// other bed's scenes and their pipelines.
+fn feature_pack() -> &'static Arc<[u8]> {
+    static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
+    PACK.get_or_init(|| {
+        let mut tinted = mesh(|b| b.quad(0, square(5.0, 0.0), Vec3::Y, 8));
+        let colors = tinted.positions.iter().map(|p| {
+            let t = (p.x + 5.0) / 10.0;
+            orr_math::Vec4::new(1.0 - t, t, 0.1, 1.0)
+        });
+        tinted.colors = Some(colors.collect());
+        let mut material = diffuse([0.8; 3]);
+        material.textures[slot::BASE_COLOR].vertex = 1;
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::Memory,
+                vec![AssetSpec {
+                    name: TINTED_FLOOR.into(),
+                    source: Source::Mesh {
+                        mesh: tinted,
+                        materials: vec![material],
+                        settings: MeshSettings::default(),
+                    },
+                }],
+            )],
+        };
+        orr_cook::cook(&manifest, &Default::default())
+            .unwrap()
+            .memory
+            .remove(0)
+    })
+}
+
+/// A decal of a bed scene: the base color of model `material`'s material, projected down
+/// onto the surfaces within `half_extent` of `center` that face up.
+#[derive(Clone, Copy, Debug)]
+pub struct FloorDecal {
+    pub material: &'static str,
+    pub center: Vec3,
+    pub half_extent: Vec3,
+}
+
 fn time(frame: u64) -> FrameTime {
     FrameTime {
         absolute: frame as f64 / 60.0,
@@ -1776,29 +1823,57 @@ impl Bed {
         rt_range: f32,
         linked: impl FnOnce(&mut SceneWriter<'_>),
     ) -> Self {
+        Self::build(spec, renderer, rt_range, None, linked)
+    }
+
+    /// As [`Self::with`], with the feature pack mounted beside the bed's, whose models `spec`
+    /// may place too, and `decals` on the scene.
+    pub fn with_features(spec: Spec, decals: &[FloorDecal]) -> Self {
+        Self::build(
+            spec,
+            &RendererDesc::default(),
+            RT_RANGE,
+            Some(decals),
+            |_| {},
+        )
+    }
+
+    /// The bed of [`Self::with_linked`]; with `features`, of [`Self::with_features`].
+    fn build(
+        spec: Spec,
+        renderer: &RendererDesc,
+        rt_range: f32,
+        features: Option<&[FloorDecal]>,
+        linked: impl FnOnce(&mut SceneWriter<'_>),
+    ) -> Self {
         let kernels = renderer.kernels;
         let d = device();
         let mut scenes = Scenes::new(d, renderer).unwrap();
         let workers = Workers::start(&scenes);
-        let mount = scenes.mount(PackSource::Memory(Arc::clone(pack())));
-        let start = Instant::now();
         let mut frame = 0;
-        while matches!(scenes.mount_state(mount), LoadState::Pending) {
-            frame += 1;
-            let f = scenes
-                .begin_frame(&FrameDesc {
-                    time: time(frame),
-                    scenes: &[],
-                    low_latency: None,
-                })
-                .unwrap();
-            f.end(&[]).unwrap();
-            assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        if let LoadState::Failed(e) = scenes.mount_state(mount) {
-            panic!("mount failed: {e}");
-        }
+        let mut mounted = |scenes: &mut Scenes, pack: &Arc<[u8]>| {
+            let mount = scenes.mount(PackSource::Memory(Arc::clone(pack)));
+            let start = Instant::now();
+            while matches!(scenes.mount_state(mount), LoadState::Pending) {
+                frame += 1;
+                let f = scenes
+                    .begin_frame(&FrameDesc {
+                        time: time(frame),
+                        scenes: &[],
+                        low_latency: None,
+                    })
+                    .unwrap();
+                f.end(&[]).unwrap();
+                assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if let LoadState::Failed(e) = scenes.mount_state(mount) {
+                panic!("mount failed: {e}");
+            }
+            mount
+        };
+        let mount = mounted(&mut scenes, pack());
+        let feature_mount = features.map(|_| mounted(&mut scenes, feature_pack()));
 
         let desc = SceneDesc {
             light_capacity: spec.lights.len().max(8) as u32,
@@ -1825,9 +1900,33 @@ impl Bed {
             .copies
             .iter()
             .map(|c| {
-                scenes
-                    .model(mount, AssetId::from_name(c.model))
-                    .unwrap_or_else(|e| panic!("model {}: {e}", c.model))
+                let id = AssetId::from_name(c.model);
+                let found = scenes.model(mount, id);
+                let found = match (found, feature_mount) {
+                    (Err(_), Some(features)) => scenes.model(features, id),
+                    (found, _) => found,
+                };
+                found.unwrap_or_else(|e| panic!("model {}: {e}", c.model))
+            })
+            .collect();
+        let decals: Vec<Decal> = features
+            .unwrap_or_default()
+            .iter()
+            .map(|decal| Decal {
+                center: decal.center.as_dvec3(),
+                // The box projects along its -z: down.
+                rotation: Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+                half_extent: decal.half_extent,
+                material: scenes
+                    .material(
+                        mount,
+                        AssetId::from_name(&format!("{}/material/0", decal.material)),
+                    )
+                    .unwrap_or_else(|e| panic!("material {}: {e}", decal.material)),
+                channels: DecalChannels::BASE_COLOR,
+                opacity: 1.0,
+                fade_angles: [1.0, 1.4],
+                depth_fade: 0.0,
             })
             .collect();
         frame += 1;
@@ -1879,6 +1978,9 @@ impl Bed {
             w.set_environment(data.gpu());
         }
         linked(&mut w);
+        for (i, decal) in decals.iter().enumerate() {
+            w.set_decal(DecalId(i as u32), Some(decal)).unwrap();
+        }
         if let Some((at, pixels_per_radian)) = spec.focus {
             w.set_focus(at.as_dvec3());
             f.request_detail(scene, pixels_per_radian).unwrap();
