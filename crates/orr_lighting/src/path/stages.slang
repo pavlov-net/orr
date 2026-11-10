@@ -2341,7 +2341,9 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, 
     ShadeNee nee;
     bool alive = shade_vertex<S, M, SHADE_VERTEX>(r, f, p, c, record, x, kind, nee_mode, rng, sv, walking, wi, nee);
     p.rng = rng;
-    if (K != QUEUE_OTHER && alive && walking)
+    // Only a vertex with a subsurface lobe, on a path that may walk, starts a walk: a pipeline
+    // made for neither holds none of what follows.
+    if (K != QUEUE_OTHER && may(MAY_WALK) && may(MAY_SUBSURFACE) && alive && walking)
     {
         // The walk takes the place of the vertex's ray, and its stage resolves the vertex again
         // from the hit the span holds: the vertex's shadow ray, which would take the span, is
