@@ -702,6 +702,125 @@ fn double_sided_foliage_keeps_its_coverage() {
     assert!(levels > 2);
 }
 
+/// Half of a curved 4 m sheet: x from 0 to 2 m on the `side` of x = 0, the cut both halves
+/// share and that bends in y, so neither half keeps it straight.
+fn half_sheet(side: f32) -> MeshInput {
+    let (nx, nz) = (48u32, 96u32);
+    let mut m = MeshInput::default();
+    for j in 0..=nz {
+        for i in 0..=nx {
+            let x = side * 2.0 * i as f32 / nx as f32;
+            let z = 4.0 * j as f32 / nz as f32 - 2.0;
+            let y = 0.3 * (1.7 * z).cos() * (1.1 * x).cos() + 0.1 * (3.0 * z + x).sin();
+            m.positions.push(Vec3::new(x, y, z));
+            m.normals.push(Vec3::Y);
+        }
+    }
+    let w = nx + 1;
+    for j in 0..nz {
+        for i in 0..nx {
+            let c = j * w + i;
+            let quad = [c, c + w, c + 1, c + 1, c + w, c + w + 1];
+            if side < 0.0 {
+                m.indices
+                    .extend(quad.chunks(3).flat_map(|t| [t[0], t[2], t[1]]));
+            } else {
+                m.indices.extend(quad);
+            }
+        }
+    }
+    m.uvs = None;
+    m.sections = vec![Span {
+        first: 0,
+        count: m.indices.len() as u32,
+    }];
+    m
+}
+
+#[test]
+fn abutting_meshes_stay_closed_at_every_cut() {
+    // Each half cooks on its own, as two meshes that meet in a scene do: neither sees the
+    // other, so each keeps its open border where it was, at every cut.
+    let halves = [-1.0, 1.0].map(|side| load(&cook(half_sheet(side), &[0], dag()), "m/mesh"));
+    let step = 2f32.powi(-11);
+    let rim = |p: [f32; 3]| p[0].abs() > 1.99 || p[2].abs() > 1.99;
+    let cut = |d: &Dag, t: f32| -> Vec<[[f32; 3]; 3]> {
+        d.select(Cut::Uniform(t), |_| true)
+            .into_iter()
+            .flat_map(|c| d.clusters[c].tris.iter().copied())
+            .collect()
+    };
+    let mut levels = 0;
+    for (a, b) in [(0, 1), (1, 0)] {
+        let (da, db) = (&halves[a], &halves[b]);
+        check_structure(da);
+        let ta = da.thresholds(f32::MAX);
+        assert!(ta.len() >= 4, "{ta:?}");
+        levels = levels.max(ta.len());
+        for &t in &ta {
+            let tris = cut(da, t);
+            // Open edges off the rim: the border the halves share.
+            let mut edges = HashSet::new();
+            for tri in &tris {
+                for k in 0..3 {
+                    edges.insert((tri[k].map(f32::to_bits), tri[(k + 1) % 3].map(f32::to_bits)));
+                }
+            }
+            let shared: Vec<([f32; 3], [f32; 3])> = edges
+                .iter()
+                .filter(|&&(p, q)| !edges.contains(&(q, p)))
+                .map(|&(p, q)| (p.map(f32::from_bits), q.map(f32::from_bits)))
+                .filter(|&(p, q)| !(rim(p) && rim(q)))
+                .collect();
+            assert!(!shared.is_empty());
+            for &u in &db.thresholds(f32::MAX) {
+                let other: Vec<[[f32; 3]; 3]> = cut(db, u)
+                    .into_iter()
+                    .filter(|tri| tri.iter().any(|p| p[0].abs() < 0.5))
+                    .collect();
+                for &(p, q) in &shared {
+                    for s in 0..=4 {
+                        let x = Vec3::from(p).lerp(Vec3::from(q), s as f32 / 4.0);
+                        let d = other
+                            .iter()
+                            .map(|tri| point_triangle(x, tri.map(Vec3::from)))
+                            .fold(f32::INFINITY, f32::min);
+                        assert!(
+                            d <= 3.0 * step,
+                            "half {a} at {t} is {d} m from half {b} at {u} at {x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(levels >= 4);
+}
+
+/// Distance from `p` to the triangle `t`.
+fn point_triangle(p: Vec3, t: [Vec3; 3]) -> f32 {
+    let [a, b, c] = t;
+    let n = (b - a).cross(c - a);
+    if n.length_squared() > 0.0 {
+        let n = n.normalize();
+        let q = p - n * n.dot(p - a);
+        let inside = [(a, b), (b, c), (c, a)]
+            .iter()
+            .all(|&(u, v)| (v - u).cross(q - u).dot(n) >= 0.0);
+        if inside {
+            return (p - q).length();
+        }
+    }
+    [(a, b), (b, c), (c, a)]
+        .iter()
+        .map(|&(u, v)| {
+            let d = v - u;
+            let s = ((p - u).dot(d) / d.length_squared()).clamp(0.0, 1.0);
+            (p - (u + d * s)).length()
+        })
+        .fold(f32::INFINITY, f32::min)
+}
+
 fn tmp(name: &str) -> PathBuf {
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_dir_all(&d);

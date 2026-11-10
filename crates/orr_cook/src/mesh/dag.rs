@@ -14,16 +14,20 @@
 //! clusters of all its parts at rest pose, its errors raised by the merge error. A copy
 //! draws one stage or the other as a whole, so the stages need no crack-free join.
 //!
+//! A stage's open borders stay on their source curve ([`lod::open_borders`]), so a mesh or
+//! copy that meets one stays closed at every cut, except in a class whose borders dilate.
+//!
 //! Each DAG is `clodBuild` as ported in [`super::clod`], one level's groups in parallel.
 //! Border dilation moves positions in place, so each group's clusters take their positions
 //! as the group is emitted and snap them to the mesh grid.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::os::raw::c_int;
 
 use crate::par::prelude::*;
-use meshopt::ffi;
+use meshopt::{SimplifyVertex, ffi};
 use orr_pack::mesh::{
     ClusterSets, Group, MeshHeader, MeshInfo, NODE_PAGE_MAX, Node, NodePage, OMM_ALIGN, PAGE_MAX,
     PageHeader, PageInfo, Section, SurfaceClass, cluster_resident_len,
@@ -337,7 +341,7 @@ fn stages(
 }
 
 /// Whether a section with `flags` dilates its open borders. Glass has no coverage to keep.
-fn dilates(s: &MeshSettings, flags: u8) -> bool {
+pub(super) fn dilates(s: &MeshSettings, flags: u8) -> bool {
     s.dilate_double_sided
         && flags & Section::DOUBLE_SIDED != 0
         && SurfaceClass::from_flags(flags) != Some(SurfaceClass::Dielectric)
@@ -565,19 +569,37 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
     config.simplify_regularize = o.regularize;
     config.optimize_clusters = false;
     let max_indices = usize::from(o.limits.max_triangles) * 3;
+    let lock = if o.dilate {
+        Cow::Borrowed(&input.lock)
+    } else {
+        Cow::Owned(lock_open_borders(input))
+    };
     let mesh = super::clod::Mesh {
         indices: &input.indices,
         attributes: &normals,
         weights: &weights,
-        lock: &input.lock,
+        lock: &lock,
         remap: &input.remap,
         sections: &input.sections,
+        keep_borders: !o.dilate,
     };
     let mut groups = super::clod::build(&config, mesh, &mut positions, |e| {
         group_of(&e, &input.welded, &input.sections, snap, max_indices)
     });
     bound_groups(&mut groups, snap.step);
     groups
+}
+
+/// `input`'s locks, with the positions [`lod::open_borders`] keeps locked.
+fn lock_open_borders(input: &Input) -> Vec<u8> {
+    let marks = lod::open_borders(&input.indices, &input.remap, |p| input.cells[p as usize]);
+    let mut lock = input.lock.clone();
+    for (l, m) in lock.iter_mut().zip(marks) {
+        if m & lod::KEEP != 0 {
+            *l |= SimplifyVertex::Lock.bits();
+        }
+    }
+    lock
 }
 
 /// Grows each group's sphere about its center to hold the stored positions of its clusters

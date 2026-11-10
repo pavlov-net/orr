@@ -714,7 +714,11 @@ pub(crate) fn cook(
                 drop(source_grid);
                 let grid =
                     Grid::new(&w.positions, s.position_step_log2, min_exponent).map_err(fail)?;
-                displace::simplify(&mut w, &mut parts, &grid, &baked, d.target_error);
+                let keep: Vec<bool> = sections
+                    .iter()
+                    .map(|sec| !dag::dilates(s, sec.flags))
+                    .collect();
+                displace::simplify(&mut w, &mut parts, &grid, &baked, &keep, d.target_error);
                 grid
             } else {
                 source_grid
@@ -1042,7 +1046,12 @@ impl Ctx<'_> {
 
 /// Discrete levels: pages of whole clusters of one level, coarsest level first.
 fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
-    let levels = lod::levels(cx.w, cx.grid, cx.parts, cx.s, errors);
+    let keep: Vec<bool> = cx
+        .sections
+        .iter()
+        .map(|sec| !dag::dilates(cx.s, sec.flags))
+        .collect();
+    let levels = lod::levels(cx.w, cx.grid, cx.parts, cx.s, errors, &keep);
     let level_count = levels.len();
     let part_count = cx.parts.table.len();
     let adapter = VertexDataAdapter::new(bytemuck::cast_slice(&cx.grid.floats), 12, 0)

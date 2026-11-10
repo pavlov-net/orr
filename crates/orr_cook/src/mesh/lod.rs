@@ -225,12 +225,15 @@ pub(crate) struct LevelGeometry {
     pub(super) pieces: Vec<Piece>,
 }
 
+/// The levels of the mesh at `errors`, past level 0; `keep_borders` per section says whether its
+/// open borders stay ([`simplify`]).
 pub(crate) fn levels(
     w: &Welded,
     grid: &Grid,
     parts: &Parts,
     s: &MeshSettings,
     errors: &[f32],
+    keep_borders: &[bool],
 ) -> Vec<LevelGeometry> {
     let adapter = VertexDataAdapter::new(bytemuck::cast_slice(&grid.floats), 12, 0)
         .expect("positions are 12-byte vertices");
@@ -276,7 +279,12 @@ pub(crate) fn levels(
         let pieces = input
             .into_iter()
             .map(|p| {
-                let (indices, e) = simplify(&p.indices, w, grid, &shared, &seams, target, true);
+                let how = Simplify {
+                    target,
+                    sloppy: true,
+                    keep_borders: keep_borders[usize::from(p.section)],
+                };
+                let (indices, e) = simplify(&p.indices, w, grid, &shared, &seams, how);
                 step_error = step_error.max(e);
                 Piece { indices, ..p }
             })
@@ -392,6 +400,119 @@ pub(super) fn shared<P: IntoIterator<Item = u32>>(
     shared
 }
 
+/// [`open_borders`]' mark of a position on an open edge.
+pub(super) const BORDER: u8 = 1;
+/// [`open_borders`]' mark of a border position the simplifier keeps.
+pub(super) const KEEP: u8 = 2;
+
+/// Marks of the positions of the triangles `indices` on open edges: an open border may
+/// meet geometry the cook does not see, another mesh or another copy of this one, which a
+/// receding border would open a crack to, however small the simplifier's error, and that
+/// error does not bound how far a border recedes. Every border position is kept except the
+/// inner vertices of straight runs, within a grid cell of the segment between the run's kept
+/// ends: a border vertex collapses only along its border loop, so the border there stays on
+/// the run. Positions on more than two open edges, or with more than one vertex, are kept,
+/// as the simplifier may move those off the loop. Vertex `v` is at position `pos[v]`, itself
+/// a vertex, whose grid cell is `cell(pos[v])`.
+pub(super) fn open_borders(
+    indices: &[u32],
+    pos: &[u32],
+    cell: impl Fn(u32) -> [i32; 3],
+) -> Vec<u8> {
+    let _z = crate::profile::zone!("mesh.open_borders");
+    const SEEN: u8 = 4;
+    let tris = indices.as_chunks::<3>().0;
+    let edge = |t: &[u32; 3], e: usize| (pos[t[e] as usize], pos[t[(e + 1) % 3] as usize]);
+    let mut edges: rustc_hash::FxHashSet<(u32, u32)> = Default::default();
+    edges.reserve(indices.len());
+    for t in tris {
+        for e in 0..3 {
+            edges.insert(edge(t, e));
+        }
+    }
+    // Per position: its open edges out and in, and an open edge out.
+    let n = pos.len();
+    let (mut outs, mut ins) = (vec![0u8; n], vec![0u8; n]);
+    let mut next = vec![u32::MAX; n];
+    let mut open = Vec::new();
+    for t in tris {
+        for e in 0..3 {
+            let (a, b) = edge(t, e);
+            if a != b && !edges.contains(&(b, a)) {
+                outs[a as usize] = outs[a as usize].saturating_add(1);
+                ins[b as usize] = ins[b as usize].saturating_add(1);
+                next[a as usize] = b;
+                open.push((a, b));
+            }
+        }
+    }
+    drop(edges);
+    let mut vertices = vec![0u8; n];
+    for &p in pos {
+        vertices[p as usize] = vertices[p as usize].saturating_add(1);
+    }
+    let mut marks = vec![0u8; n];
+    for p in 0..n {
+        if outs[p] > 0 || ins[p] > 0 {
+            marks[p] = BORDER;
+            if outs[p] != 1 || ins[p] != 1 || vertices[p] != 1 {
+                marks[p] |= KEEP;
+            }
+        }
+    }
+    let cell = |p: u32| cell(p).map(f64::from);
+    // Squared distance in cells from `p` to the segment `a`..`b`.
+    let off = |a: [f64; 3], b: [f64; 3], p: [f64; 3]| {
+        let d = [0, 1, 2].map(|i| b[i] - a[i]);
+        let q = [0, 1, 2].map(|i| p[i] - a[i]);
+        let dd: f64 = (0..3).map(|i| d[i] * d[i]).sum();
+        let t = if dd > 0.0 {
+            ((0..3).map(|i| q[i] * d[i]).sum::<f64>() / dd).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (0..3).map(|i| (q[i] - d[i] * t).powi(2)).sum::<f64>()
+    };
+    // Splits the chain of free positions from `q`, after the kept `start`, into runs, keeping
+    // where a run ends. A free position has one open edge out, so the chain ends at a kept one.
+    let mut chain = Vec::new();
+    let mut runs = |marks: &mut [u8], start: u32, mut q: u32| {
+        chain.clear();
+        while marks[q as usize] & KEEP == 0 {
+            chain.push(q);
+            marks[q as usize] |= SEEN;
+            q = next[q as usize];
+        }
+        let (mut s, mut first) = (cell(start), 0);
+        for j in 0..=chain.len() {
+            let e = cell(chain.get(j).copied().unwrap_or(q));
+            if !chain[first..j].iter().all(|&i| off(s, e, cell(i)) <= 1.0) {
+                let k = chain[j - 1];
+                marks[k as usize] |= KEEP;
+                s = cell(k);
+                first = j;
+            }
+        }
+    };
+    // A chain starts on each open edge from a kept position to a free one; a loop with no
+    // kept position keeps one.
+    for &(a, b) in &open {
+        if marks[a as usize] & KEEP != 0 && marks[b as usize] & (KEEP | SEEN) == 0 {
+            runs(&mut marks, a, b);
+        }
+    }
+    for p in 0..n {
+        if marks[p] & (BORDER | KEEP | SEEN) == BORDER {
+            marks[p] |= KEEP;
+            runs(&mut marks, p as u32, next[p]);
+        }
+    }
+    for m in &mut marks {
+        *m &= !SEEN;
+    }
+    marks
+}
+
 /// Simplifier flags of a vertex at position id `id`: locked on a shared position, protected
 /// on a seam.
 pub(super) fn vertex_flags(id: u32, shared: &[bool], seams: &[bool]) -> SimplifyVertex {
@@ -405,17 +526,31 @@ pub(super) fn vertex_flags(id: u32, shared: &[bool], seams: &[bool]) -> Simplify
     f
 }
 
-/// Simplifies one piece to an absolute error, with sloppy simplification where permissive
-/// keeps more than three quarters when `sloppy`; returns its indices and the error reached.
+/// How [`simplify`] simplifies a piece.
+#[derive(Copy, Clone)]
+pub(super) struct Simplify {
+    /// Absolute error, meters.
+    pub(super) target: f32,
+    /// Sloppy simplification where permissive keeps more than three quarters.
+    pub(super) sloppy: bool,
+    /// The open borders stay where [`open_borders`] keeps them.
+    pub(super) keep_borders: bool,
+}
+
+/// Simplifies one piece as `how` says; returns its indices and the error reached.
 pub(super) fn simplify(
     indices: &[u32],
     w: &Welded,
     grid: &Grid,
     shared: &[bool],
     seams: &[bool],
-    target: f32,
-    sloppy: bool,
+    how: Simplify,
 ) -> (Vec<u32>, f32) {
+    let Simplify {
+        target,
+        sloppy,
+        keep_borders,
+    } = how;
     // A compact vertex buffer of the piece, so the simplifier's work follows its size.
     let mut local_of: FxHashMap<u32, u32> = FxHashMap::default();
     let mut global = Vec::new();
@@ -430,10 +565,28 @@ pub(super) fn simplify(
         .collect();
     let positions: Vec<[f32; 3]> = global.iter().map(|&v| grid.floats[v as usize]).collect();
     let normals: Vec<f32> = global.iter().flat_map(|&v| w.normals[v as usize]).collect();
-    let locks: Vec<SimplifyVertex> = global
+    let mut locks: Vec<SimplifyVertex> = global
         .iter()
         .map(|&v| vertex_flags(grid.reps[v as usize], shared, seams))
         .collect();
+    // Per local vertex, the marks of its position, which the first local vertex there names.
+    let borders: Option<Vec<u8>> = keep_borders.then(|| {
+        let mut first: FxHashMap<u32, u32> = FxHashMap::default();
+        let pos: Vec<u32> = (0..global.len() as u32)
+            .map(|i| {
+                *first
+                    .entry(grid.reps[global[i as usize] as usize])
+                    .or_insert(i)
+            })
+            .collect();
+        let marks = open_borders(&local, &pos, |p| grid.cells[global[p as usize] as usize]);
+        pos.iter().map(|&p| marks[p as usize]).collect()
+    });
+    for (l, &m) in locks.iter_mut().zip(borders.iter().flatten()) {
+        if m & KEEP != 0 {
+            *l |= SimplifyVertex::Lock;
+        }
+    }
     let adapter = VertexDataAdapter::new(bytemuck::cast_slice(&positions), 12, 0)
         .expect("positions are 12-byte vertices");
     let mut error = 0.0;
@@ -453,9 +606,12 @@ pub(super) fn simplify(
     );
     if sloppy && out.len() * 4 > local.len() * 3 {
         let scale = meshopt::simplify_scale(&adapter);
+        // Sloppy simplification moves any vertex it does not lock, along a border or not.
+        let on_border = |i: usize| borders.as_ref().is_some_and(|b| b[i] & BORDER != 0);
         let lock: Vec<bool> = locks
             .iter()
-            .map(|l| l.contains(SimplifyVertex::Lock))
+            .enumerate()
+            .map(|(i, l)| l.contains(SimplifyVertex::Lock) || on_border(i))
             .collect();
         let mut sloppy_error = 0.0;
         let sloppy = meshopt::simplify_sloppy_with_locks(

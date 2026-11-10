@@ -2,7 +2,8 @@
 //! simplify in parallel. Groups of one level share only locked vertices, so each reads the
 //! positions it needs and moves only its own vertices when it dilates borders; groups come
 //! out in the order the original emits them, with the same numbering. Unlike the original,
-//! level 0 clusters each section apart, unless the triangles make one cluster.
+//! level 0 clusters each section apart, unless the triangles make one cluster, and the
+//! sloppy fallback can keep open borders ([`Mesh::keep_borders`]).
 
 use std::borrow::Cow;
 
@@ -46,6 +47,9 @@ pub(super) struct Mesh<'a> {
     pub(super) lock: &'a [u8],
     pub(super) remap: &'a [u32],
     pub(super) sections: &'a [u16],
+    /// The open borders stay where `lock` leaves them: the sloppy fallback, which does not
+    /// keep to border loops, locks every vertex on one.
+    pub(super) keep_borders: bool,
 }
 
 /// Positions that groups of one level write at disjoint unlocked vertices.
@@ -386,6 +390,7 @@ fn simplify_fallback(
     positions: &[f32],
     indices: &[u32],
     locks: &[u8],
+    keep_borders: Option<&[u32]>,
     target: usize,
     error: &mut f32,
 ) -> Vec<u32> {
@@ -396,7 +401,33 @@ fn simplify_fallback(
             [positions[v], positions[v + 1], positions[v + 2]]
         })
         .collect();
-    let subset_locks: Vec<u8> = indices.iter().map(|&v| locks[v as usize]).collect();
+    let mut subset_locks: Vec<u8> = indices.iter().map(|&v| locks[v as usize]).collect();
+    // `keep_borders` is the position remap when open borders stay: every corner at a position
+    // on an open edge of the group locks, as sloppy simplification moves any vertex it does
+    // not lock.
+    if let Some(remap) = keep_borders {
+        let at = |v: u32| remap[v as usize];
+        let tris = indices.as_chunks::<3>().0;
+        let edge = |t: &[u32; 3], e: usize| (at(t[e]), at(t[(e + 1) % 3]));
+        let edges: FxHashSet<(u32, u32)> = tris
+            .iter()
+            .flat_map(|t| (0..3).map(move |e| edge(t, e)))
+            .collect();
+        let mut border = FxHashSet::default();
+        for t in tris {
+            for e in 0..3 {
+                let (a, b) = edge(t, e);
+                if !edges.contains(&(b, a)) {
+                    border.extend([a, b]);
+                }
+            }
+        }
+        for (l, &v) in subset_locks.iter_mut().zip(indices) {
+            if border.contains(&at(v)) {
+                *l |= LOCK;
+            }
+        }
+    }
     let mut lod: Vec<u32> = (0..indices.len() as u32).collect();
     // SAFETY: the subset holds one vertex per corner and `lod` indexes it; sloppy
     // simplification may run in place.
@@ -465,7 +496,8 @@ fn simplify(
         lod = run(options | SimplifyOptions::Permissive, error);
     }
     if lod.len() > target && c.simplify_fallback_sloppy {
-        lod = simplify_fallback(positions, indices, locks, target, error);
+        let keep = mesh.keep_borders.then_some(mesh.remap);
+        lod = simplify_fallback(positions, indices, locks, keep, target, error);
         *error *= c.simplify_error_factor_sloppy;
     }
     if lod.is_empty() && !indices.is_empty() {

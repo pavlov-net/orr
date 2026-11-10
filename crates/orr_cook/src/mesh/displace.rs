@@ -251,12 +251,14 @@ fn smooth_normals(w: &mut Welded, baked: &[bool]) {
 }
 
 /// Simplifies each (part, section) piece of the baked sections to `target` meters, with
-/// grid positions shared with any other piece locked and uv seams kept.
+/// grid positions shared with any other piece locked, uv seams kept, and the open borders of
+/// sections in `keep_borders` kept ([`lod::simplify`]).
 pub(super) fn simplify(
     w: &mut Welded,
     parts: &mut Parts,
     grid: &Grid,
     baked: &[bool],
+    keep_borders: &[bool],
     target: f32,
 ) {
     let _z = crate::profile::zone!("mesh.displace_simplify");
@@ -269,7 +271,12 @@ pub(super) fn simplify(
     let seams = lod::seams(w, n, w.indices.iter().map(|v| (*v, id(v))));
     for p in &mut pieces {
         if baked[usize::from(p.section)] {
-            p.indices = lod::simplify(&p.indices, w, grid, &shared, &seams, target, false).0;
+            let how = lod::Simplify {
+                target,
+                sloppy: false,
+                keep_borders: keep_borders[usize::from(p.section)],
+            };
+            p.indices = lod::simplify(&p.indices, w, grid, &shared, &seams, how).0;
         }
     }
     let mut indices = Vec::with_capacity(w.indices.len());
