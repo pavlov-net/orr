@@ -1199,9 +1199,9 @@ impl Core {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Writes `model`'s chain into its `ModelGpu` with the next frame's records.
     /// What any scene may hold by the tables every scene shares: what a material may show,
-    /// and candidates on every triangle of a copy fading between the steps of a chain.
+    /// candidates on every triangle of a copy fading between the steps of a chain, and textures
+    /// that have streamed.
     fn features(&self) -> SceneFeatures {
         let fades = if self.chained {
             SceneFeatures::COVERAGE
@@ -1216,6 +1216,7 @@ impl Core {
         self.materials.features() | fades | streams
     }
 
+    /// Writes `model`'s chain into its `ModelGpu` with the next frame's records.
     fn write_chain(&mut self, model: ModelId, chain: &[(ModelId, f32)]) {
         let mut words = [0u32; 1 + 2 * MAX_CHAIN];
         words[0] = chain.len() as u32;
