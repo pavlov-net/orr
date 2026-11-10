@@ -9,7 +9,7 @@ use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, DispatchArgs, GpuPtr, Hazards, MemoryKind,
     RayDispatchPipeline, ShaderModule, ShaderStage, SpecData, Stages,
 };
-use orr_scene::{JobResult, Loading};
+use orr_scene::{JobResult, Loading, Urgency};
 use orr_shaders::abi::SpecEntry;
 
 use crate::shaders::path::staged::{
@@ -298,11 +298,14 @@ fn compile_stage(
     Ok(pipeline)
 }
 
+/// A compile job and the urgency it was queued at.
+type Queued<T> = (Urgency, JobResult<Result<T, Error>>);
+
 /// A pipeline made after the kernels are ready, in a job of its own on the loading side;
 /// whoever asks for it does without until then.
 pub(crate) struct Late<T> {
     name: &'static str,
-    job: Mutex<Option<JobResult<Result<T, Error>>>>,
+    job: Mutex<Option<Queued<T>>>,
     ready: OnceLock<T>,
     /// How its compile failed.
     failed: OnceLock<String>,
@@ -324,7 +327,7 @@ impl<T: Send + 'static> Late<T> {
             return Some(p);
         }
         let mut job = self.job.lock().unwrap();
-        let result = job.as_ref()?.take()?;
+        let result = job.as_ref()?.1.take()?;
         *job = None;
         self.settle(result.unwrap_or_else(|message| {
             Err(Error::CompilePanicked {
@@ -373,7 +376,7 @@ impl<T: Send + 'static> Late<T> {
     pub(crate) fn start(
         &self,
         device: &Device,
-        loading: Option<&Loading>,
+        loading: Option<(&Loading, Urgency)>,
         compile: impl FnOnce(&Device) -> Result<T, Error> + Send + 'static,
     ) {
         let mut job = self.job.lock().unwrap();
@@ -381,7 +384,10 @@ impl<T: Send + 'static> Late<T> {
             return;
         }
         match loading {
-            Some(loading) => *job = Some(crate::view::compile_job(device, loading, compile)),
+            Some((loading, urgency)) => {
+                let queued = crate::view::compile_job(device, loading, urgency, compile);
+                *job = Some((urgency, queued));
+            }
             None => self.settle(compile(device)),
         }
     }
@@ -389,8 +395,9 @@ impl<T: Send + 'static> Late<T> {
     /// The pipeline, after waiting for its job and running queued jobs of `loading` on this
     /// thread meanwhile; an error where its compile failed or never started.
     fn wait(&self, loading: Option<&Loading>) -> Result<&T, Error> {
-        if let (Some(loading), Some(job)) = (loading, self.job.lock().unwrap().as_ref()) {
-            job.wait(loading);
+        if let (Some(loading), Some((urgency, job))) = (loading, self.job.lock().unwrap().as_ref())
+        {
+            job.wait_at(loading, *urgency);
         }
         self.get().ok_or_else(|| {
             self.failure().unwrap_or_else(|| Error::LateCompile {
@@ -494,19 +501,22 @@ impl StagedKernels {
         let _ = self.compiler.set((device.clone(), Arc::clone(loading)));
     }
 
-    /// Queues what paths do without until it is ready, after the pipelines a view asked for:
-    /// the tail stage, which holds `trace_path`'s whole loop and so compiles for minutes
-    /// (until then a pass runs every round), and the pipelines of `stages` that may meet
-    /// everything, which run a scene that comes to hold more than its own were made for.
-    pub(crate) fn start_background(&self, stages: &[Stage]) {
+    /// Queues the pipelines of `stages` that may meet everything, behind what a view cannot
+    /// render without and ahead of mounts.
+    pub(crate) fn start_general(&self, stages: &[Stage]) {
+        if self.loading().is_some() && scratch_late() == Some(false) {
+            self.request(MAY_ALL, stages, Urgency::Useful);
+        }
+    }
+
+    /// Queues the tail stage, which holds `trace_path`'s whole loop and so compiles for minutes;
+    /// until it is ready a pass runs every round.
+    pub(crate) fn start_tail(&self) {
         self.start_late(&self.tail, |d, kernels| {
             let stage =
                 ShaderStage::new(module(kernels, &tail::MODULE)?, "main", SpecData::default())?;
             Ok(d.create_compute_pipeline(&stage, "staged tail")?)
         });
-        if self.loading().is_some() && scratch_late() == Some(false) {
-            self.request(MAY_ALL, stages);
-        }
     }
 
     /// Scratch: whether the pipelines paths do without compile before a view's own, on the
@@ -515,8 +525,8 @@ impl StagedKernels {
         scratch_late() == Some(true)
     }
 
-    /// Starts `compile` for a pipeline the paths do without until it is ready, as a job on the
-    /// loading side.
+    /// Starts `compile` for a pipeline the paths do without until it is ready, as a job behind
+    /// everything else on the loading side.
     pub(crate) fn start_late<T: Send + 'static>(
         &self,
         late: &Late<T>,
@@ -526,9 +536,12 @@ impl StagedKernels {
             return;
         };
         let kernels = self.kernels;
-        late.start(self.device(), self.loading().filter(|_| !sync), move |d| {
-            compile(d, &kernels)
-        });
+        let loading = self.loading().filter(|_| !sync);
+        late.start(
+            self.device(),
+            loading.map(|l| (l, Urgency::Idle)),
+            move |d| compile(d, &kernels),
+        );
     }
 
     fn loading(&self) -> Option<&Loading> {
@@ -551,14 +564,14 @@ impl StagedKernels {
     }
 
     /// Starts the compiles of `stages` for exactly `may` that have not started.
-    fn request(&self, may: u32, stages: &[Stage]) -> Arc<StageSet> {
+    fn request(&self, may: u32, stages: &[Stage], urgency: Urgency) -> Arc<StageSet> {
         let set = self.set(may);
         for stage in StageSet::runs(may, stages) {
             let (kernels, rays) = (self.kernels, self.rays);
-            set.stage(stage)
-                .start(self.device(), self.loading(), move |d| {
-                    compile_stage(d, &kernels, stage, may, rays)
-                });
+            let loading = self.loading().map(|l| (l, urgency));
+            set.stage(stage).start(self.device(), loading, move |d| {
+                compile_stage(d, &kernels, stage, may, rays)
+            });
         }
         set
     }
@@ -587,7 +600,7 @@ impl StagedKernels {
     /// them are ready.
     /// An error where one made for `may` failed to compile.
     pub(crate) fn prepare(&self, may: u32, stages: &[Stage]) -> Result<bool, Error> {
-        let set = self.request(may, stages);
+        let set = self.request(may, stages, Urgency::Needed);
         for stage in StageSet::runs(may, stages) {
             if let Some(e) = set.stage(stage).failure() {
                 return Err(e);
@@ -613,7 +626,7 @@ impl StagedKernels {
         }
         let set = self
             .compiling(may, stages)
-            .unwrap_or_else(|| self.request(may, stages));
+            .unwrap_or_else(|| self.request(may, stages, Urgency::Needed));
         for stage in StageSet::runs(set.may, stages) {
             set.stage(stage).wait(self.loading())?;
         }

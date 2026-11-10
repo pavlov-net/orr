@@ -62,11 +62,36 @@ pub(crate) enum Queue {
     Stream,
     /// Jobs other crates queue with [`Loading::spawn`]: pipeline compiles and hot reload.
     Spawned,
+    /// [`Urgency::Useful`] jobs.
+    Useful,
     /// A mount's parse, reads and placement, whose backlog waits behind the others.
     Mount,
+    /// [`Urgency::Idle`] jobs.
+    Idle,
 }
 
-const QUEUES: usize = 3;
+const QUEUES: usize = 5;
+
+/// How soon a job from [`Loading::spawn_result_at`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Urgency {
+    /// A frame or a caller waits on it: behind streamed loads alone, as [`Loading::spawn`]'s.
+    Needed,
+    /// Behind those and ahead of mounts.
+    Useful,
+    /// Behind everything else, mounts included: work that only saves time later.
+    Idle,
+}
+
+impl Urgency {
+    fn queue(self) -> Queue {
+        match self {
+            Self::Needed => Queue::Spawned,
+            Self::Useful => Queue::Useful,
+            Self::Idle => Queue::Idle,
+        }
+    }
+}
 
 struct Jobs {
     queues: [VecDeque<Job>; QUEUES],
@@ -75,7 +100,14 @@ struct Jobs {
 
 impl Jobs {
     fn pop(&mut self) -> Option<Job> {
-        self.queues.iter_mut().find_map(VecDeque::pop_front)
+        self.pop_through(Queue::Idle)
+    }
+
+    /// The front job of the first queue up to `last` that holds one.
+    fn pop_through(&mut self, last: Queue) -> Option<Job> {
+        self.queues[..=last as usize]
+            .iter_mut()
+            .find_map(VecDeque::pop_front)
     }
 }
 
@@ -133,8 +165,14 @@ impl<T> JobResult<T> {
     /// it finishes with no workers and after [`Loading::stop_workers`]. `loading` is the side that
     /// made the job.
     pub fn wait(&self, loading: &Loading) {
-        while !self.finished() && loading.run_one() {}
-        // Nothing is queued, so an unfinished job is on another thread.
+        self.wait_at(loading, Urgency::Idle);
+    }
+
+    /// [`Self::wait`] for a job queued at `urgency`, running only the queued jobs that come
+    /// no later than it, so the wait for a needed job never takes on a mount.
+    pub fn wait_at(&self, loading: &Loading, urgency: Urgency) {
+        while !self.finished() && loading.run_one_through(urgency.queue()) {}
+        // Nothing ahead of it is queued, so an unfinished job is on another thread.
         let state = self.slot.state.lock().unwrap();
         drop(
             self.slot
@@ -323,7 +361,11 @@ impl Loading {
     /// Runs at most one queued job, the one [`Loading::run_worker`] would take next; false when
     /// none was queued. For threads that interleave loading with other work.
     pub fn run_one(&self) -> bool {
-        let job = self.jobs.lock().unwrap().pop();
+        self.run_one_through(Queue::Idle)
+    }
+
+    fn run_one_through(&self, last: Queue) -> bool {
+        let job = self.jobs.lock().unwrap().pop_through(last);
         job.map(|job| job()).is_some()
     }
 
@@ -354,12 +396,21 @@ impl Loading {
         &self,
         job: impl FnOnce() -> T + Send + 'static,
     ) -> JobResult<T> {
+        self.spawn_result_at(Urgency::Needed, job)
+    }
+
+    /// [`Loading::spawn_result`] with the job queued at `urgency`.
+    pub fn spawn_result_at<T: Send + 'static>(
+        &self,
+        urgency: Urgency,
+        job: impl FnOnce() -> T + Send + 'static,
+    ) -> JobResult<T> {
         let slot = Arc::new(JobSlot {
             state: Mutex::new(JobState::Queued(Box::new(job))),
             finished: Condvar::new(),
         });
         let out = Arc::clone(&slot);
-        self.spawn(move || {
+        self.queue(urgency.queue(), move || {
             let job = {
                 let mut state = out.state.lock().unwrap();
                 match std::mem::replace(&mut *state, JobState::Running) {

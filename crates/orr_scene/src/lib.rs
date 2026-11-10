@@ -87,7 +87,7 @@ pub use decals::{Decal, DecalChannels, DecalId};
 pub use edit::{EditDesc, EditId, EditRef};
 pub use features::SceneFeatures;
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
-pub use loading::{JobResult, Loading, ReadArenaStats};
+pub use loading::{JobResult, Loading, ReadArenaStats, Urgency};
 pub use material::{BoundTexture, MaterialId, MaterialWriter, binding_sampler, material_flags};
 pub use medium_proxy::{MediumProxy, MediumProxyId, ProxyDensity, VolumeRef};
 pub use mount::{ClipRef, InstancePage, LoadState, MountId, PackSource, PageId, SkeletonRef};

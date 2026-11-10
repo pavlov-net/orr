@@ -12,7 +12,7 @@ use orr_scene::orr_gpu::{
 };
 use orr_scene::{
     ArenaRequest, ArenaTexture, GBufferGpu, JobResult, Loading, MaterialId, RasterGpu,
-    SceneFeatures, SceneRoot, Span, ViewArena, ViewConstants, ViewDesc, ViewStep,
+    SceneFeatures, SceneRoot, Span, Urgency, ViewArena, ViewConstants, ViewDesc, ViewStep,
 };
 
 use crate::caustics::PhotonMap;
@@ -1154,14 +1154,15 @@ const BACKGROUND: PathKernel = path_kernel!(background, "background paths");
 const UPDATE: PathKernel = path_kernel!(update, "world cache update paths");
 const SUPPORT: &str = "lighting compute kernels";
 
-/// Queues `compile`, which writes the device's pipeline cache file when it finishes.
+/// Queues `compile` at `urgency`, which writes the device's pipeline cache file when it finishes.
 pub(crate) fn compile_job<T: Send + 'static>(
     device: &Device,
     loading: &Loading,
+    urgency: Urgency,
     compile: impl FnOnce(&Device) -> Result<T, Error> + Send + 'static,
 ) -> JobResult<Result<T, Error>> {
     let device = device.clone();
-    loading.spawn_result(move || {
+    loading.spawn_result_at(urgency, move || {
         let compiled = compile(&device);
         if let Err(e) = device.save_pipeline_cache() {
             log::warn!("pipeline cache not saved: {e}");
@@ -1523,7 +1524,9 @@ impl LightingKernels {
     ) -> CompilingKernels {
         let rays = runs_rays(device, entry);
         let path = |kernel: PathKernel| {
-            compile_job(device, loading, move |d| (kernel.compile)(d, kernels, rays))
+            compile_job(device, loading, Urgency::Needed, move |d| {
+                (kernel.compile)(d, kernels, rays)
+            })
         };
         let paths = if runs_staged() {
             CompilingPaths::Staged
@@ -1542,7 +1545,11 @@ impl LightingKernels {
             loading: Arc::clone(loading),
             paths,
             support: SupportKernels::pipelines()
-                .map(|compile| compile_job(device, loading, move |d| compile(d, kernels)))
+                .map(|compile| {
+                    compile_job(device, loading, Urgency::Needed, move |d| {
+                        compile(d, kernels)
+                    })
+                })
                 .collect(),
             tables: tables.clone(),
         }
@@ -1559,25 +1566,31 @@ impl LightingKernels {
     }
 
     /// Queues every path pipeline no view has asked for yet: what [`Self::prepare_paths`] queues
-    /// once a view's own are ready. A caller that compiles ahead of its first frame calls this
+    /// behind a view's own. A caller that compiles ahead of its first frame calls this
     /// and runs the loading side's jobs.
     pub fn compile_rest(&self) {
         if let PathKernels::Staged(k) = &self.paths {
-            Self::start_background(k, true);
+            Self::start_general(k);
+            Self::start_late(k);
         }
     }
 
-    /// Queues, behind the pipelines a view asked for, the ones that take minutes on a first run
-    /// and that paths do without until they are ready: the staged loop's tail stage, the single
-    /// kernels of the update paths and the photons, and with `specialize` the stages that may
-    /// meet everything. Until the first three finish the stages run every path to its end,
-    /// which costs time and changes no image.
-    fn start_background(k: &StagedPaths, specialize: bool) {
+    /// Queues, behind the pipelines a view cannot render without and ahead of mounts, the
+    /// stages that may meet everything: they run a scene that comes to hold more than its own
+    /// were made for, which would wait in black for new ones otherwise.
+    fn start_general(k: &StagedPaths) {
         // Every source's stages: a scene that comes to hold more runs any of them.
         let mut stages = Source::View.stages(true);
         stages.extend([Stage::Background, Stage::Update, Stage::Photon]);
-        k.stages
-            .start_background(if specialize { &stages } else { &[] });
+        k.stages.start_general(&stages);
+    }
+
+    /// Queues, behind everything else the loading side has, the pipelines that take minutes on
+    /// a first run and only save time: the staged loop's tail stage and the single kernels of
+    /// the update paths and the photons. Until they finish the stages run every path to its
+    /// end, which costs time and changes no image.
+    fn start_late(k: &StagedPaths) {
+        k.stages.start_tail();
         // The update paths' kernel is a compute kernel: nothing of theirs gains by reordering.
         k.stages
             .start_late(&k.update, |d, kernels| (UPDATE.compile)(d, kernels, false));
@@ -1673,11 +1686,18 @@ impl LightingKernels {
         let PathKernels::Staged(k) = &self.paths else {
             return Ok(true);
         };
+        // Scratch: the late kernels compile here, ahead of everything.
+        if k.stages.late_first() {
+            Self::start_late(k);
+        }
         let (wanted, stages) = self.wanted(k, scene, needs, lighting);
         let ready = k.stages.prepare(wanted, &stages)?;
-        // What a view asked for compiles first.
-        if ready || k.stages.late_first() {
-            Self::start_background(k, lighting.specialize);
+        if lighting.specialize {
+            Self::start_general(k);
+        }
+        // What only saves time starts once the view renders.
+        if ready {
+            Self::start_late(k);
         }
         Ok(ready)
     }
