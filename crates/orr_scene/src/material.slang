@@ -6,6 +6,7 @@ import orr_shaders.abi;
 import orr_shaders.trace;
 import orr_color.primaries;
 __exported import orr_scene.neural_texture;
+import orr_scene.scene_may;
 
 // `MaterialGpu.flags`.
 public static const uint MATERIAL_ALPHA_TESTED = 1 << 0;
@@ -773,7 +774,7 @@ public uint material_uv_set(MaterialGpu* m, uint slot)
 // `t` to the tile there and `f` into it.
 bool material_reads(MaterialGpu* m, uint slot, uint modes, inout TextureIndex t, inout UvFootprint f)
 {
-    if ((modes & TEXTURE_TILED) == 0)
+    if (!may2(MAY2_TILES) || (modes & TEXTURE_TILED) == 0)
         return !texture_outside(f.uv, modes);
     t = texture_tile(m.tiles[slot], f.uv, f.inward);
     return t.index != IMAGE_NONE;
