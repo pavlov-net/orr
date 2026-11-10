@@ -13,7 +13,7 @@ use orr_scene::{JobResult, Loading, Urgency};
 use orr_shaders::abi::SpecEntry;
 
 use crate::shaders::path::staged::{
-    primary, reset, shade_opaque, shade_other, sources, tail, trace, walk,
+    primary, reset, shade_opaque, shade_other, sources, trace, walk,
 };
 use crate::shaders::types::{PathRoot, PathStages, StageQueue};
 use crate::{Error, KernelSet, module};
@@ -46,14 +46,6 @@ const MAX_SLOTS: u32 = 65535 * STAGE_GROUP;
 /// in the 24 bits beside its flags (`SHADOW_DEPTH_SHIFT`). The queues of that many rounds take
 /// more memory than a device has, so no root gets there.
 pub(crate) const MAX_ROUNDS: u32 = 1 << 24;
-
-/// Rounds a pass of a view's or background layer's paths runs before the tail stage takes the
-/// paths still running. More rounds keep more paths in the stages that run them together; each
-/// costs its dispatches whether or not a path is left for them.
-const WIDE_ROUNDS: u32 = 6;
-/// The same for update paths and photons, which are few: one round shades the vertex an update
-/// path starts on.
-const FEW_ROUNDS: u32 = 1;
 
 /// `PathRoot.source`.
 pub(crate) const PATH_SOURCE_VIEW: u32 = 0;
@@ -124,21 +116,6 @@ impl Source {
             Self::Background => PATH_SOURCE_BACKGROUND,
             Self::Update => PATH_SOURCE_UPDATE,
             Self::Photon => PATH_SOURCE_PHOTON,
-        }
-    }
-
-    /// The rounds a pass of its paths runs before the tail stage.
-    fn wide(self) -> u32 {
-        // Scratch: `ORR_SCRATCH_WIDE` and `ORR_SCRATCH_FEW` set them, at least 1.
-        let scratch = |name, rounds| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map_or(rounds, |n: u32| n.max(1))
-        };
-        match self {
-            Self::View | Self::Background => scratch("ORR_SCRATCH_WIDE", WIDE_ROUNDS),
-            Self::Update | Self::Photon => scratch("ORR_SCRATCH_FEW", FEW_ROUNDS),
         }
     }
 
@@ -502,7 +479,6 @@ pub(crate) struct StagedKernels {
     /// The device and loading side pipelines compile on once [`Self::attach`] names them; on
     /// `device` and the calling thread before that.
     compiler: OnceLock<(Device, Arc<Loading>)>,
-    tail: Late<ComputePipeline>,
     sets: Mutex<Vec<Arc<StageSet>>>,
     wanted: Mutex<Vec<Wanted>>,
 }
@@ -516,7 +492,6 @@ impl StagedKernels {
             kernels: *kernels,
             rays,
             compiler: OnceLock::new(),
-            tail: Late::new("staged tail kernel"),
             sets: Mutex::new(Vec::new()),
             wanted: Mutex::new(Vec::new()),
         }
@@ -531,45 +506,9 @@ impl StagedKernels {
     /// Queues the pipelines of `stages` that may meet everything, behind what a view cannot
     /// render without and ahead of mounts.
     pub(crate) fn start_general(&self, stages: &[Stage]) {
-        if self.loading().is_some() && scratch_late("general") == Some(false) {
+        if self.loading().is_some() {
             self.request(MAY_ALL, stages, Urgency::Useful);
         }
-    }
-
-    /// Queues the tail stage, which holds `trace_path`'s whole loop and so compiles for minutes;
-    /// until it is ready a pass runs every round.
-    pub(crate) fn start_tail(&self) {
-        self.start_late(&self.tail, "tail", |d, kernels| {
-            let stage =
-                ShaderStage::new(module(kernels, &tail::MODULE)?, "main", SpecData::default())?;
-            Ok(d.create_compute_pipeline(&stage, "staged tail")?)
-        });
-    }
-
-    /// Scratch: whether the pipelines paths do without compile before a view's own, on the
-    /// calling thread (`ORR_SCRATCH_TAIL_SYNC`).
-    pub(crate) fn late_first(&self) -> bool {
-        scratch_late("general") == Some(true)
-    }
-
-    /// Starts `compile` for a pipeline the paths do without until it is ready, as a job behind
-    /// everything else on the loading side.
-    pub(crate) fn start_late<T: Send + 'static>(
-        &self,
-        late: &Late<T>,
-        what: &str,
-        compile: impl FnOnce(&Device, &KernelSet) -> Result<T, Error> + Send + 'static,
-    ) {
-        let Some(sync) = scratch_late(what) else {
-            return;
-        };
-        let kernels = self.kernels;
-        let loading = self.loading().filter(|_| !sync);
-        late.start(
-            self.device(),
-            loading.map(|l| (l, Urgency::Idle)),
-            move |d| compile(d, &kernels),
-        );
     }
 
     fn loading(&self) -> Option<&Loading> {
@@ -727,18 +666,6 @@ impl StagedKernels {
         Ok(set)
     }
 
-    /// Waits for a pipeline the paths do without, as [`Self::start_late`] starts it.
-    pub(crate) fn wait_late<T: Send + 'static>(&self, late: &Late<T>) {
-        // A late pipeline that failed or was left out is done without.
-        let _ = late.wait(self.loading());
-    }
-
-    /// [`Self::wait_late`] for the tail stage.
-    pub(crate) fn wait_tail(&self) {
-        self.start_tail();
-        self.wait_late(&self.tail);
-    }
-
     /// Pipelines that hold `stages` for paths that may meet `may`, which a frame runs now:
     /// the ready ones with the least beyond `may`, or with none ready those made for it, after
     /// waiting for them with queued jobs running on this thread meanwhile.
@@ -766,9 +693,8 @@ impl StagedKernels {
     /// trace stage, the shade stages and, where a material walks, the walk stage, over the
     /// workgroups their queues gathered; a pass ends in the finish stage. `rounds` is at least
     /// one more than the traces a path of the source takes, and a view's pixels with a
-    /// frosted-glass path take a second pass. Once the tail stage has compiled, a pass runs
-    /// [`Source::wide`] rounds and the tail stage takes its paths from there. With
-    /// `stage_passes` each stage records in a pass of its own. Orders nothing after it.
+    /// frosted-glass path take a second pass. With `stage_passes` each stage records in a pass
+    /// of its own. Orders nothing after it.
     ///
     /// The pipelines are those ready that hold the least beyond `may`; with none ready it
     /// waits for the ones made for `may`, as nothing else may run these paths.
@@ -814,12 +740,6 @@ impl StagedKernels {
         if matches!(pipeline(Stage::Opaque), StagePipeline::Rays(_)) {
             root.features |= FEATURE_RAY_SHADES;
         }
-        let tail = self.tail.get().filter(|_| rounds > source.wide());
-        let run = if tail.is_some() {
-            source.wide()
-        } else {
-            rounds
-        };
         let mut base = 0;
         while base < items {
             root.slice_base = base;
@@ -846,7 +766,7 @@ impl StagedKernels {
             );
             for pass in 0..passes {
                 let first = pass * rounds;
-                for round in first..first + run {
+                for round in first..first + rounds {
                     (root.round, root.round_first, root.round_next) =
                         (round, first, first + rounds);
                     barrier(list);
@@ -887,29 +807,8 @@ impl StagedKernels {
                         );
                     }
                 }
-                if let Some(tail) = tail {
-                    (root.round, root.round_first, root.round_next) =
-                        (first + run, first, first + rounds);
-                    barrier(list);
-                    stage_pass(list, stage_passes, source, 4);
-                    // Scratch: `ORR_SCRATCH_TAIL_DIRECT` runs it over every slot of the slice,
-                    // whose lanes past the queue's count end at once.
-                    if std::env::var_os("ORR_SCRATCH_TAIL_DIRECT").is_some() {
-                        list.dispatch_inline(
-                            tail,
-                            &root,
-                            [root.slice_count.div_ceil(STAGE_GROUP), 1, 1],
-                        );
-                    } else {
-                        list.dispatch_indirect_inline(
-                            tail,
-                            &root,
-                            memory.groups(first + run, QUEUE_TRACE),
-                        );
-                    }
-                }
                 barrier(list);
-                stage_pass(list, stage_passes, source, 5);
+                stage_pass(list, stage_passes, source, 4);
                 list.dispatch_indirect_inline(
                     pipeline(Stage::Finish).compute(),
                     &root,
@@ -947,19 +846,6 @@ fn kept(sets: &[(u32, Option<Instant>, Instant)], wanted: &[u32], now: Instant) 
         .collect()
 }
 
-/// Scratch: whether the pipelines paths do without compile on the calling thread, so the first
-/// frame runs them (`ORR_SCRATCH_TAIL_SYNC`); none for `what` ("tail" or "sources", the update
-/// and photon kernels) where `ORR_SCRATCH_NO_TAIL` names it or names neither.
-fn scratch_late(what: &str) -> Option<bool> {
-    match std::env::var("ORR_SCRATCH_NO_TAIL").as_deref() {
-        Ok("tail") if what != "tail" => {}
-        Ok("sources") if what != "sources" => {}
-        Ok(_) => return None,
-        Err(_) => {}
-    }
-    Some(std::env::var_os("ORR_SCRATCH_TAIL_SYNC").is_some())
-}
-
 /// Scratch: `ORR_SCRATCH_SLOTS` caps the path slots of a view.
 fn scratch_slots() -> u32 {
     std::env::var("ORR_SCRATCH_SLOTS")
@@ -969,31 +855,22 @@ fn scratch_slots() -> u32 {
 }
 
 /// With `on`, ends the open pass and opens one named for `source`'s stage `stage` (start,
-/// trace, shade, walk, tail, finish), so the pass results time the stages apart.
+/// trace, shade, walk, finish), so the pass results time the stages apart.
 fn stage_pass(list: &mut CommandList<'_>, on: bool, source: Source, stage: usize) {
-    const NAMES: [[&str; 6]; 4] = [
+    const NAMES: [[&str; 5]; 4] = [
         [
             "view start",
             "view trace",
             "view shade",
             "view walk",
-            "view tail",
             "view finish",
         ],
-        [
-            "bg start",
-            "bg trace",
-            "bg shade",
-            "bg walk",
-            "bg tail",
-            "bg finish",
-        ],
+        ["bg start", "bg trace", "bg shade", "bg walk", "bg finish"],
         [
             "update start",
             "update trace",
             "update shade",
             "update walk",
-            "update tail",
             "update finish",
         ],
         [
@@ -1001,7 +878,6 @@ fn stage_pass(list: &mut CommandList<'_>, on: bool, source: Source, stage: usize
             "photon trace",
             "photon shade",
             "photon walk",
-            "photon tail",
             "photon finish",
         ],
     ];

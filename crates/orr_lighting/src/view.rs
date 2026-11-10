@@ -28,7 +28,7 @@ use crate::shaders::types::{
 };
 use crate::shaders::world_cache::update;
 use crate::staged::{
-    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_STACK, FEATURE_WALK, Late, MAX_ROUNDS, MAY_ALL,
+    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_STACK, FEATURE_WALK, MAX_ROUNDS, MAY_ALL,
     MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION,
     MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS,
     MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_REFERENCE, MAY_STACK, MAY_SUBSURFACE, MAY_WALK,
@@ -1282,7 +1282,7 @@ impl CompilingKernels {
     ) -> Result<(), Error> {
         if let CompilingPaths::Staged(k) = &self.paths {
             let (wanted, stages) = k.wanted(scene, needs, lighting);
-            k.ask(wanted, &stages, lighting, false)?;
+            k.ask(wanted, &stages, lighting)?;
         }
         Ok(())
     }
@@ -1369,15 +1369,9 @@ enum PathKernels {
     Staged(Arc<StagedPaths>),
 }
 
-/// The staged loop's pipelines, and the single kernels of the update paths and the photons.
-/// Those sources' paths are few, so one kernel runs them in less time than the stages'
-/// dispatches cost; it compiles for minutes, after the kernels are ready, and the stages run
-/// its paths until then.
+/// The staged loop's pipelines, which run every source's paths.
 struct StagedPaths {
     stages: StagedKernels,
-    update: Late<PathPipeline>,
-    photons: Late<PathPipeline>,
-    rays: bool,
     /// The kernels link a medium.
     linked_medium: bool,
 }
@@ -1546,12 +1540,9 @@ fn gathers_caustics(scene: &SceneLighting, lighting: &ViewLighting) -> bool {
 }
 
 impl StagedPaths {
-    fn new(stages: StagedKernels, rays: bool, linked_medium: bool) -> Self {
+    fn new(stages: StagedKernels, linked_medium: bool) -> Self {
         Self {
             stages,
-            update: Late::new("update path kernel"),
-            photons: Late::new("photon path kernel"),
-            rays,
             linked_medium,
         }
     }
@@ -1564,24 +1555,6 @@ impl StagedPaths {
         let mut stages = Source::View.stages(true);
         stages.extend([Stage::Background, Stage::Update, Stage::Photon]);
         self.stages.start_general(&stages);
-    }
-
-    /// Queues, behind everything else the loading side has, the pipelines that take minutes on
-    /// a first run and only save time: the staged loop's tail stage and the single kernels of
-    /// the update paths and the photons. Until they finish the stages run every path to its
-    /// end, which costs time and changes no image.
-    fn start_late(&self) {
-        self.stages.start_tail();
-        // The update paths' kernel is a compute kernel: nothing of theirs gains by reordering.
-        self.stages
-            .start_late(&self.update, "sources", |d, kernels| {
-                (UPDATE.compile)(d, kernels, false)
-            });
-        let rays = self.rays;
-        self.stages
-            .start_late(&self.photons, "sources", move |d, kernels| {
-                (PHOTONS.compile)(d, kernels, rays)
-            });
     }
 
     /// What the paths of a frame with `needs` under `lighting` may meet: what a view asks
@@ -1641,17 +1614,13 @@ impl StagedPaths {
             wanted |= may.background | Source::Background.may();
             stages.push(Stage::Background);
         }
-        // The stages run the update paths and the photons until their own kernels are ready:
-        // both sources stay in the pipelines asked for until both kernels are, so the view's
-        // own pipelines are asked for once.
-        let update = lighting.reference.is_none();
-        let late =
-            (update && self.update.get().is_none()) || (caustics && self.photons.get().is_none());
-        if late && update {
+        // Asked for together, a frame's sources share their pipelines. Update paths run
+        // outside the reference.
+        if lighting.reference.is_none() {
             wanted |= may.update | Source::Update.may();
             stages.push(Stage::Update);
         }
-        if late && caustics {
+        if caustics {
             wanted |= may.photons | Source::Photon.may();
             stages.push(Stage::Photon);
         }
@@ -1659,26 +1628,11 @@ impl StagedPaths {
     }
 
     /// Asks for pipelines that hold `wanted` over `stages`, as [`Self::wanted`] gives them, and
-    /// says whether some are ready. `renders` where the view renders with them once they are:
-    /// the kernels every view runs have compiled.
-    fn ask(
-        &self,
-        wanted: u32,
-        stages: &[Stage],
-        lighting: &ViewLighting,
-        renders: bool,
-    ) -> Result<bool, Error> {
-        // Scratch: the late kernels compile here, ahead of everything.
-        if self.stages.late_first() {
-            self.start_late();
-        }
+    /// says whether some are ready.
+    fn ask(&self, wanted: u32, stages: &[Stage], lighting: &ViewLighting) -> Result<bool, Error> {
         let ready = self.stages.prepare(wanted, stages)?;
         if lighting.specialize {
             self.start_general();
-        }
-        // What only saves time starts once the view renders.
-        if ready && renders {
-            self.start_late();
         }
         Ok(ready)
     }
@@ -1704,7 +1658,6 @@ impl LightingKernels {
         let paths = if runs_staged() {
             PathKernels::Staged(Arc::new(StagedPaths::new(
                 StagedKernels::new(device, kernels, rays),
-                rays,
                 links_medium(kernels),
             )))
         } else {
@@ -1742,7 +1695,6 @@ impl LightingKernels {
         let paths = if runs_staged() {
             let staged = StagedPaths::new(
                 StagedKernels::new(device, kernels, rays),
-                rays,
                 links_medium(kernels),
             );
             staged.stages.attach(device, loading);
@@ -1787,7 +1739,6 @@ impl LightingKernels {
     pub fn compile_rest(&self) {
         if let PathKernels::Staged(k) = &self.paths {
             k.start_general();
-            k.start_late();
         }
     }
 
@@ -1805,7 +1756,7 @@ impl LightingKernels {
             return Ok(true);
         };
         let (wanted, stages) = k.wanted(scene, needs, lighting);
-        k.ask(wanted, &stages, lighting, true)
+        k.ask(wanted, &stages, lighting)
     }
 
     /// Waits for the kernels paths do without until they are ready and then for the pipelines
@@ -1822,12 +1773,6 @@ impl LightingKernels {
         let PathKernels::Staged(k) = &self.paths else {
             return Ok(WaitedPaths(None));
         };
-        // A caller that waits runs from its first frame what a view runs once every
-        // compile has finished.
-        k.start_late();
-        k.stages.wait_tail();
-        k.stages.wait_late(&k.update);
-        k.stages.wait_late(&k.photons);
         let (wanted, stages) = k.wanted(scene, needs, lighting);
         Ok(WaitedPaths(Some(k.stages.wait_exact(wanted, &stages)?)))
     }
@@ -2082,7 +2027,7 @@ impl LightingKernels {
                 view.staged = Some(StagedMemory::new(&view.device, pixels, parts, rows)?);
             }
             let (wanted, stages) = k.wanted(scene, &needs, lighting);
-            k.ask(wanted, &stages, lighting, true)?;
+            k.ask(wanted, &stages, lighting)?;
             view.staged
                 .as_ref()
                 .expect("made above")
@@ -2187,10 +2132,6 @@ impl LightingKernels {
             let blocks = view.extent.map(|e| e.div_ceil(block));
             match &self.paths {
                 PathKernels::Mega { update, .. } => update.record(list, &update_root, blocks),
-                PathKernels::Staged(k) if k.update.get().is_some() => {
-                    let update = k.update.get().expect("checked above");
-                    update.record(list, &update_root, blocks);
-                }
                 PathKernels::Staged(k) => k.stages.record(
                     list,
                     view.staged.as_ref().expect("made above"),
@@ -2333,11 +2274,6 @@ impl LightingKernels {
         list.begin_pass("caustic photons", false);
         match &self.paths {
             PathKernels::Mega { photons: p, .. } => {
-                p.record(list, &photon_root, [photons.min(PHOTON_ROW), rows]);
-            }
-            PathKernels::Staged(k) if k.photons.get().is_some() => {
-                view.staged_photons = None;
-                let p = k.photons.get().expect("checked above");
                 p.record(list, &photon_root, [photons.min(PHOTON_ROW), rows]);
             }
             PathKernels::Staged(k) => {
