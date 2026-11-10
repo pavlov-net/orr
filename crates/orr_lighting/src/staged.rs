@@ -39,8 +39,8 @@ const RECORD_WORDS: u64 = 2;
 const UPDATE_RECORD_WORDS: u64 = 9;
 /// Lanes per workgroup of its stages.
 const STAGE_GROUP: u32 = 32;
-/// Path slots of a view at most, which a stage covers in the 65535 workgroups a dispatch may
-/// have: a source with more paths runs them in slices.
+/// Path slots of a source's own at most: one with more paths runs them in slices, which bounds
+/// the state its view keeps.
 const MAX_SLOTS: u32 = 65535 * STAGE_GROUP;
 /// Rounds a source's paths may ask for at most: a deferred shadow ray keeps its vertex's depth
 /// in the 24 bits beside its flags (`SHADOW_DEPTH_SHIFT`). The queues of that many rounds take
@@ -1007,6 +1007,55 @@ fn scratch_rest() -> Option<u32> {
     }
 }
 
+/// The slots one queue may hold on `device`: a stage runs a queue's slots in one dispatch, a
+/// compute one of a workgroup per [`STAGE_GROUP`] of them, a ray one of a row of rays each.
+fn queue_slots(device: &Device) -> u32 {
+    let limits = device.caps().limits;
+    let group = u64::from(STAGE_GROUP);
+    let mut slots = u64::from(limits.max_workgroup_count[0]) * group;
+    if limits.max_ray_dispatch_invocations != 0 {
+        // A ray dispatch's height is bounded as a compute dispatch's workgroups times their
+        // size along y are, and its rays in all by the device.
+        let rows =
+            u64::from(limits.max_workgroup_count[1]) * u64::from(limits.max_workgroup_size[1]);
+        let rays = u64::from(limits.max_ray_dispatch_invocations) / group;
+        slots = slots.min(rows.min(rays) * group);
+    }
+    u32::try_from(slots).unwrap_or(u32::MAX)
+}
+
+/// The slots of one slice of a source's paths: its own, and the update paths that ride with
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Slots {
+    own: u32,
+    riders: u32,
+}
+
+impl Slots {
+    /// The fewest equal slices of `items` paths, with `update` update paths shared out over
+    /// them, whose own slots are at most `own_most` and whose slots are at most `most` in all:
+    /// a queue may come to hold every slot of a slice.
+    fn plan(items: u32, update: u32, own_most: u32, most: u32) -> Self {
+        assert!(
+            most >= 2,
+            "a queue holds a path and an update path at least"
+        );
+        let items = items.max(1);
+        let mut slices = items.div_ceil(own_most.clamp(1, most));
+        loop {
+            let slots = Self {
+                own: items.div_ceil(slices),
+                riders: update.div_ceil(slices),
+            };
+            if u64::from(slots.own) + u64::from(slots.riders) <= u64::from(most) {
+                return slots;
+            }
+            slices += 1;
+        }
+    }
+}
+
 /// Scratch: `ORR_SCRATCH_SLOTS` caps the path slots of a view.
 fn scratch_slots() -> u32 {
     std::env::var("ORR_SCRATCH_SLOTS")
@@ -1114,6 +1163,8 @@ pub(crate) struct StagedMemory {
     capacity: u32,
     /// Rounds its queues hold: one more than a source's paths may take over their passes.
     rows: u32,
+    /// The slots a queue may hold on the device (`queue_slots`).
+    most: u32,
     /// Of `capacity`, the slots of the source's own paths: the rest hold the update paths that
     /// ride with a view's.
     own: u32,
@@ -1135,17 +1186,18 @@ pub(crate) struct StagedMemory {
 }
 
 impl StagedMemory {
-    /// Slots for the paths of a view of `pixels` pixels, or for as many photons, at most
-    /// [`MAX_SLOTS`], and past them for the `riders` update paths that ride in a slice of a
-    /// view's, each with `parts`, and queues for `rows` rounds.
+    /// Slots for a slice of the paths of a view of `pixels` pixels, or of as many photons, and
+    /// past them for the share of the view's `update` update paths that rides in it
+    /// ([`Slots::plan`]), each with `parts`, and queues for `rows` rounds.
     pub(crate) fn new(
         device: &Device,
         pixels: u32,
         parts: StateParts,
         rows: u32,
-        riders: u32,
+        update: u32,
     ) -> Result<Self, Error> {
-        let own = pixels.clamp(1, scratch_slots());
+        let most = queue_slots(device);
+        let Slots { own, riders } = Slots::plan(pixels, update, scratch_slots(), most);
         let capacity = own + riders;
         let n = u64::from(capacity);
         let words =
@@ -1196,6 +1248,7 @@ impl StagedMemory {
         };
         Ok(Self {
             capacity,
+            most,
             own,
             rows,
             parts,
@@ -1256,21 +1309,21 @@ impl StagedMemory {
     /// Whether one slice of it holds `items` paths, or as many as any memory may, each with
     /// `parts`, and its queues `rows` rounds.
     pub(crate) fn holds(&self, items: u32, parts: StateParts, rows: u32) -> bool {
-        self.own >= items.clamp(1, scratch_slots()) && self.parts.holds(parts) && self.rows >= rows
-    }
-
-    /// Whether it holds the slots a view of `pixels` pixels asks for and those of `riders`
-    /// update paths a slice, each with `parts`, and queues for `rows` rounds.
-    pub(crate) fn fits(&self, pixels: u32, parts: StateParts, rows: u32, riders: u32) -> bool {
-        self.own == pixels.clamp(1, scratch_slots())
-            && self.capacity - self.own == riders
+        self.own >= Slots::plan(items, 0, scratch_slots(), self.most).own
             && self.parts.holds(parts)
             && self.rows >= rows
     }
 
-    /// The slices a view of `pixels` pixels runs in.
-    pub(crate) fn slices(pixels: u32) -> u32 {
-        pixels.div_ceil(pixels.clamp(1, scratch_slots()))
+    /// Whether it holds the slots a view of `pixels` pixels with `update` update paths asks
+    /// for, each with `parts`, and queues for `rows` rounds.
+    pub(crate) fn fits(&self, pixels: u32, parts: StateParts, rows: u32, update: u32) -> bool {
+        let slots = Slots {
+            own: self.own,
+            riders: self.capacity - self.own,
+        };
+        slots == Slots::plan(pixels, update, scratch_slots(), self.most)
+            && self.parts.holds(parts)
+            && self.rows >= rows
     }
 
     /// The paths of its source a slice holds.
@@ -1343,5 +1396,62 @@ mod tests {
         // Within KEEP of its last frame a superseded set still stays.
         let recent = [(0b0011, Some(at(0)), at(2)), (0b0001, Some(at(3)), at(3))];
         assert_eq!(kept(&recent, &[0b0001], at(11)), [true, true]);
+    }
+
+    /// A slice's own paths and the update paths that ride with them fit the workgroups a queue's
+    /// dispatch may have, in as few equal slices as hold every path.
+    #[test]
+    fn a_slice_and_its_riders_fit_one_queue() {
+        // The workgroups along x Vulkan guarantees a compute dispatch.
+        let guaranteed = 65535 * STAGE_GROUP;
+        for most in [guaranteed, u32::MAX] {
+            for (pixels, update) in [
+                (1, 0),
+                (128 * 96, 768),
+                (1920 * 1080, 129_600),
+                (guaranteed - 1, 1),
+                (guaranteed, 1),
+                (guaranteed + 1, 0),
+                (5120 * 2160, 691_200),
+                (7680 * 4320, 2_073_600),
+            ] {
+                let slots = Slots::plan(pixels, update, MAX_SLOTS, most);
+                let what = format!("{pixels} pixels with {update} update paths: {slots:?}");
+                let slices = u64::from(pixels.div_ceil(slots.own));
+                assert!(slots.own <= MAX_SLOTS, "{what}");
+                assert!(
+                    u64::from(slots.own) + u64::from(slots.riders) <= u64::from(most),
+                    "{what}"
+                );
+                assert!(
+                    slices * u64::from(slots.riders) >= u64::from(update),
+                    "{what}"
+                );
+                // One slice fewer would not hold them.
+                if slices > 1 {
+                    let fewer = slices - 1;
+                    let own = u64::from(pixels).div_ceil(fewer);
+                    let riders = u64::from(update).div_ceil(fewer);
+                    assert!(
+                        own > u64::from(MAX_SLOTS) || own + riders > u64::from(most),
+                        "{what}"
+                    );
+                }
+            }
+        }
+        // A 1080p view and its update paths pass 65535 workgroups together, so they take two
+        // slices where a queue may hold no more, and one where it may.
+        let (own, riders) = (1920 * 1080, 129_600);
+        assert_eq!(
+            Slots::plan(own, riders, MAX_SLOTS, guaranteed),
+            Slots {
+                own: own / 2,
+                riders: riders / 2
+            }
+        );
+        assert_eq!(
+            Slots::plan(own, riders, MAX_SLOTS, u32::MAX),
+            Slots { own, riders }
+        );
     }
 }

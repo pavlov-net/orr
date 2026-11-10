@@ -1962,18 +1962,17 @@ impl LightingKernels {
             depth,
             reference,
         )?) + 1;
-        // The update paths of a view's blocks ride with its own, as many a slice as shares
-        // them out over its slices.
-        let riders = if reference {
+        // The update paths of a view's blocks ride with its own, shared out over its slices.
+        let update = if reference {
             0
         } else {
             let blocks = view.extent.map(|e| e.div_ceil(block));
-            (blocks[0] * blocks[1]).div_ceil(StagedMemory::slices(pixels))
+            blocks[0] * blocks[1]
         };
         if !view
             .staged
             .as_ref()
-            .is_some_and(|m| m.fits(pixels, parts, rows, riders))
+            .is_some_and(|m| m.fits(pixels, parts, rows, update))
         {
             view.staged = None;
             view.staged = Some(StagedMemory::new(
@@ -1981,7 +1980,7 @@ impl LightingKernels {
                 pixels,
                 parts,
                 rows,
-                riders,
+                update,
             )?);
         }
         let (wanted, stages) = k.wanted(scene, &needs, lighting);
