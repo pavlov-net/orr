@@ -538,6 +538,10 @@ pub struct LightingView {
     photon_map: Option<PhotonMap>,
     /// What the staged paths keep between stages, made at their first frame.
     staged: Option<StagedMemory>,
+    /// The memory of the scene's photons while they run on the stages and one slice of
+    /// `staged` holds fewer paths than the scene has photons: a slice costs its rounds of
+    /// dispatches whatever it holds, so the photons take memory of their own number.
+    staged_photons: Option<StagedMemory>,
 }
 
 impl LightingView {
@@ -635,6 +639,7 @@ impl LightingView {
             scene_resets: 0,
             history_reset: true,
             staged: None,
+            staged_photons: None,
             media: MediaView::new(device)?,
             dof: None,
             overlay_front: None,
@@ -833,7 +838,11 @@ impl LightingView {
     /// staged loop ran them.
     pub fn paths_ran(&self) -> Option<PathsRan> {
         self.staged.as_ref().map(|m| {
-            let (asked, ran) = m.ran();
+            let (asked, mut ran) = m.ran();
+            // The photons ran the sets their own memory holds.
+            if let Some(photons) = &self.staged_photons {
+                ran.extend(photons.ran().1);
+            }
             PathsRan { asked, ran }
         })
     }
@@ -1130,6 +1139,10 @@ fn path_rounds(root: &PathRoot) -> u32 {
     rounds(root.max_bounces, root.dielectric_depth, reference)
         .expect("record_paths checked the view's and the photons' rounds")
 }
+
+/// Slots of the memory a view keeps for the scene's photons at most, where its own holds
+/// fewer: the photons of a frame at [`crate::CausticSettings`]'s default count.
+const PHOTON_SLOTS: u32 = 1 << 18;
 
 /// Whether path kernels run as ray dispatches on `device`.
 fn runs_rays(device: &Device, entry: PathEntry) -> bool {
@@ -2318,27 +2331,52 @@ impl LightingKernels {
                 p.record(list, &photon_root, [photons.min(PHOTON_ROW), rows]);
             }
             PathKernels::Staged(k) if k.photons.get().is_some() => {
+                view.staged_photons = None;
                 let p = k.photons.get().expect("checked above");
                 p.record(list, &photon_root, [photons.min(PHOTON_ROW), rows]);
             }
-            PathKernels::Staged(k) => k.stages.record(
-                list,
-                view.staged.as_ref().expect("made by record_paths"),
-                &photon_root,
-                Source::Photon,
+            PathKernels::Staged(k) => {
+                let parts = StateParts::of(photon_root.features);
+                let own = view.staged.as_ref().expect("made by record_paths");
+                // As many slots as the photons of a frame at its default count: more photons
+                // than that run in slices that each hold as many.
+                let slots = photons.min(PHOTON_SLOTS);
+                let queues = path_rounds(&photon_root) + 1;
+                if own.holds(slots, parts, queues) {
+                    view.staged_photons = None;
+                } else if !view
+                    .staged_photons
+                    .as_ref()
+                    .is_some_and(|m| m.fits(slots, parts, queues))
                 {
-                    let asks = scene_may(pass.scene_features) | root_may(&photon_root);
-                    assert!(
-                        asks & !may == 0,
-                        "the photons' root asks for {asks:#x}, beyond the {may:#x} its pipelines                          hold"
-                    );
-                    may
-                },
-                photons,
-                path_rounds(&photon_root),
-                1,
-                lighting.stage_passes,
-            )?,
+                    view.staged_photons = None;
+                    view.staged_photons =
+                        Some(StagedMemory::new(&view.device, slots, parts, queues)?);
+                }
+                // The memory holds the sets this frame's photons run until its next one, under
+                // what the view asked its pipelines for.
+                if let Some(memory) = &view.staged_photons {
+                    memory.begin_frame(own.ran().0);
+                }
+                k.stages.record(
+                    list,
+                    view.staged_photons.as_ref().unwrap_or(own),
+                    &photon_root,
+                    Source::Photon,
+                    {
+                        let asks = scene_may(pass.scene_features) | root_may(&photon_root);
+                        assert!(
+                            asks & !may == 0,
+                            "the photons' root asks for {asks:#x}, beyond the {may:#x} its pipelines                          hold"
+                        );
+                        may
+                    },
+                    photons,
+                    path_rounds(&photon_root),
+                    1,
+                    lighting.stage_passes,
+                )?;
+            }
         }
         if lighting.reference.is_none() {
             list.barrier(

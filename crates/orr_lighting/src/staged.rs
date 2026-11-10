@@ -1084,8 +1084,8 @@ pub(crate) struct StagedMemory {
 }
 
 impl StagedMemory {
-    /// Slots for the paths of a view of `pixels` pixels, at most [`MAX_SLOTS`], each with
-    /// `parts`, and queues for `rows` rounds.
+    /// Slots for the paths of a view of `pixels` pixels, or for as many photons, at most
+    /// [`MAX_SLOTS`], each with `parts`, and queues for `rows` rounds.
     pub(crate) fn new(
         device: &Device,
         pixels: u32,
@@ -1192,6 +1192,14 @@ impl StagedMemory {
     pub(crate) fn ran(&self) -> (u32, Vec<u32>) {
         let held = self.held.lock().unwrap();
         (self.asked(), held.iter().map(|set| set.may).collect())
+    }
+
+    /// Whether one slice of it holds `items` paths, or as many as any memory may, each with
+    /// `parts`, and its queues `rows` rounds.
+    pub(crate) fn holds(&self, items: u32, parts: StateParts, rows: u32) -> bool {
+        self.capacity >= items.clamp(1, scratch_slots())
+            && self.parts.holds(parts)
+            && self.rows >= rows
     }
 
     /// Whether it holds the slots a view of `pixels` pixels asks for, each with `parts`, and
