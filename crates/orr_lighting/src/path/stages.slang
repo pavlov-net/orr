@@ -112,6 +112,46 @@ bool from_background(PathRoot r) { return may(MAY_BACKGROUND) && r.source == PAT
 bool from_update(PathRoot r) { return may(MAY_UPDATE) && r.source == PATH_SOURCE_UPDATE; }
 bool from_photon(PathRoot r) { return may(MAY_PHOTON) && r.source == PATH_SOURCE_PHOTON; }
 
+// The root an update path runs under, from its view's `r`: every vertex in full, without the
+// view's local light samplers, debug views, depth-of-field layer or walk points, and with the
+// parts of the state an update path keeps (it does not walk, nor split by wavelength).
+PathRoot update_root(PathRoot r)
+{
+    r.source = PATH_SOURCE_UPDATE;
+    r.mode = PATH_FULL;
+    r.local = nullptr;
+    r.light_flags = 0;
+    r.dof_background.index = IMAGE_NONE;
+    r.sss_flags &= ~SSS_POINTS;
+    r.dielectric_flags &= DIELECTRIC_DISPERSION;
+    r.features &= FEATURE_INTERIORS | FEATURE_STACK | FEATURE_RAY_SHADES;
+    r.pixel_fraction = 1.0;
+    return r;
+}
+
+// Whether `slot` holds an update path riding with the view's paths of `r`.
+bool rides(PathRoot r, uint slot)
+{
+    return may(MAY_UPDATE) && slot >= r.stages.update_first;
+}
+
+// The root `slot`'s path runs under in a stage recorded with `r`: an update path that rides
+// with a view's paths takes its own.
+PathRoot slot_root(PathRoot r, uint slot)
+{
+    if (rides(r, slot))
+        return update_root(r);
+    return r;
+}
+
+// The first of the view's update blocks whose paths ride in the slice of `r`: each slice
+// carries as many as the memory holds slots for.
+uint update_base(PathRoot r)
+{
+    PathStages* st = r.stages;
+    return r.slice_base / st.update_first * (st.capacity - st.update_first);
+}
+
 // `r` with what the pipeline's paths cannot meet (`may`) written into it, which changes no
 // value and lets the compiler see it: a pipeline that runs one source knows its source.
 PathRoot specialized(PathRoot r)
@@ -417,6 +457,7 @@ uint2 slot_pixel(PathRoot r, uint slot)
         return uint2(index % PHOTON_ROW, index / PHOTON_ROW);
     if (from_update(r))
     {
+        index = update_base(r) + slot - r.stages.update_first;
         uint n = r.update_block;
         uint2 blocks = (extent + n - 1) / n;
         uint2 block = uint2(index % blocks.x, index / blocks.x);
@@ -841,12 +882,15 @@ T load_record<T>(PathStages* st, uint slot)
 {
     Words<UPDATE_RECORD_WORDS> w;
     uint n = (sizeof(T) + 15) / 16;
+    bool update = record_stride<T>() == UPDATE_RECORD_WORDS;
+    uint4* records = update ? st.update_records : st.records;
+    uint first = update ? (slot - st.update_first) * UPDATE_RECORD_WORDS : slot * RECORD_WORDS;
     [ForceUnroll]
     for (uint k = 0; k < UPDATE_RECORD_WORDS; k++)
     {
         w.w[k] = uint4(0);
         if (k < n)
-            w.w[k] = st.records[slot * record_stride<T>() + k];
+            w.w[k] = records[first + k];
     }
     return reinterpret<T>(w);
 }
@@ -855,8 +899,11 @@ void store_record<T>(PathStages* st, uint slot, T value)
 {
     Words<UPDATE_RECORD_WORDS> w = reinterpret<Words<UPDATE_RECORD_WORDS>>(value);
     uint n = (sizeof(T) + 15) / 16;
+    bool update = record_stride<T>() == UPDATE_RECORD_WORDS;
+    uint4* records = update ? st.update_records : st.records;
+    uint first = update ? (slot - st.update_first) * UPDATE_RECORD_WORDS : slot * RECORD_WORDS;
     for (uint k = 0; k < n; k++)
-        st.records[slot * record_stride<T>() + k] = w.w[k];
+        records[first + k] = w.w[k];
 }
 
 // A view's or the background layer's record (`ViewPath`) as its words hold it. A first vertex
@@ -1297,16 +1344,19 @@ public void background_start(PathRoot root, uint lane)
     begin_path(r, lane, pixel, start, rng, round_now(r));
 }
 
-// The update path of the slice's `lane`th block, as `update_body` starts it.
+// The update path of the `lane`th of the blocks whose paths ride in the slice, as
+// `update_body` starts it, in the slot of its lane past the view's.
 public void update_start<S : ISurface>(PathRoot root, uint lane)
 {
-    PathRoot r = specialized(root);
+    PathRoot r = update_root(specialized(root));
+    PathStages* st = r.stages;
     uint n = r.update_block;
     uint2 extent = r.gbuffer.extent;
     uint2 blocks = (extent + n - 1) / n;
-    uint index = r.slice_base + lane;
-    if (lane >= r.slice_count || index >= blocks.x * blocks.y)
+    uint index = update_base(r) + lane;
+    if (lane >= st.capacity - st.update_first || index >= blocks.x * blocks.y)
         return;
+    uint slot = st.update_first + lane;
     uint2 block = uint2(index % blocks.x, index / blocks.x);
     uint offset = (r.frame + pcg(block.x | (block.y << 16))) % (n * n);
     uint2 pixel = block * n + uint2(offset % n, offset / n);
@@ -1315,8 +1365,8 @@ public void update_start<S : ISurface>(PathRoot root, uint lane)
     Sampler rng = Sampler(pixel, r.frame, r.seed ^ UPDATE_STREAM);
     PathStart start = pinhole_start(r.view, r.gbuffer, pixel, false);
     start.interior = gbuffer_interior<S>(r.scene, r.view, r.layers, extent, pixel, start);
-    store_record(r.stages, lane, CacheUpdate());
-    begin_path(r, lane, pixel, start, rng, round_now(r));
+    store_record(r.stages, slot, CacheUpdate());
+    begin_path(r, slot, pixel, start, rng, round_now(r));
 }
 
 // Caustic photon `r.slice_base + lane`, as `photon_body` starts it.
@@ -1516,6 +1566,7 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     uint slot;
     if (!queued_slot(r, QUEUE_TRACE, round_now(r), lane, slot))
         return;
+    r = slot_root(r, slot);
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
     LightSetGpu* set = r.set;
@@ -2294,6 +2345,7 @@ public void shade_stage<C : ICoherence, S : ISurface, M : IMedium, let K : uint>
     uint slot;
     if (!queued_slot(r, K, round_now(r), lane, slot))
         return;
+    r = slot_root(r, slot);
     C.point(pending_key(r, slot), KEY_BITS + 1);
     PathFixed f = load_fixed(r, slot);
     PathLoop p = load_loop(r, slot);
@@ -2400,6 +2452,7 @@ public void walk_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     uint slot;
     if (!queued_slot(r, QUEUE_WALK, round_now(r), lane, slot))
         return;
+    r = slot_root(r, slot);
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
     LightSetGpu* set = r.set;
@@ -2571,6 +2624,7 @@ public void finish_stage<S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r
     uint slot;
     if (!queued_slot(r, QUEUE_FINISH, round_pass(r), lane, slot))
         return;
+    r = slot_root(r, slot);
     PathFixed f = load_fixed(r, slot);
     PathLoop p = load_loop(r, slot);
     StagedRecord record = staged_record(r, slot);

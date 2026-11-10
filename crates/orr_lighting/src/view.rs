@@ -32,7 +32,7 @@ use crate::staged::{
     MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION,
     MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS,
     MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_REFERENCE, MAY_STACK, MAY_SUBSURFACE, MAY_WALK,
-    Source, Stage, StageSet, StagedKernels, StagedMemory, StateParts,
+    Source, SourcePaths, Stage, StageSet, StagedKernels, StagedMemory, StateParts,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::{
@@ -536,7 +536,8 @@ pub struct LightingView {
     overlay_front: Option<OverlayFront>,
     /// The reference's photon map, while the view traces one.
     photon_map: Option<PhotonMap>,
-    /// What the staged paths keep between stages, made at their first frame.
+    /// What the staged paths keep between stages, made at their first frame: the view's and
+    /// its update paths'.
     staged: Option<StagedMemory>,
     /// The memory of the scene's photons while they run on the stages and one slice of
     /// `staged` holds fewer paths than the scene has photons: a slice costs its rounds of
@@ -2018,13 +2019,27 @@ impl LightingKernels {
                 depth,
                 reference,
             )?) + 1;
+            // The update paths of a view's blocks ride with its own, as many a slice as shares
+            // them out over its slices.
+            let riders = if reference {
+                0
+            } else {
+                let blocks = view.extent.map(|e| e.div_ceil(block));
+                (blocks[0] * blocks[1]).div_ceil(StagedMemory::slices(pixels))
+            };
             if !view
                 .staged
                 .as_ref()
-                .is_some_and(|m| m.fits(pixels, parts, rows))
+                .is_some_and(|m| m.fits(pixels, parts, rows, riders))
             {
                 view.staged = None;
-                view.staged = Some(StagedMemory::new(&view.device, pixels, parts, rows)?);
+                view.staged = Some(StagedMemory::new(
+                    &view.device,
+                    pixels,
+                    parts,
+                    rows,
+                    riders,
+                )?);
             }
             let (wanted, stages) = k.wanted(scene, &needs, lighting);
             k.ask(wanted, &stages, lighting)?;
@@ -2116,53 +2131,69 @@ impl LightingKernels {
             ..path_root
         };
         self.record_layers(list, view, pass, lighting, lens.is_some(), &path_root);
-        if !reference {
-            let update_root = PathRoot {
-                mode: 0,
-                local: GpuPtr::NULL,
-                light_flags: 0,
-                dof_background: StorageImageIndex::NONE,
-                sss_flags: path_root.sss_flags & !SSS_POINTS,
-                dielectric_flags: path_root.dielectric_flags & DIELECTRIC_DISPERSION,
-                features: path_root.features & UPDATE_FEATURES,
-                pixel_fraction: 1.0,
-                ..path_root
-            };
-            list.begin_pass("world cache update paths", false);
-            let blocks = view.extent.map(|e| e.div_ceil(block));
-            match &self.paths {
-                PathKernels::Mega { update, .. } => update.record(list, &update_root, blocks),
-                PathKernels::Staged(k) => k.stages.record(
-                    list,
-                    view.staged.as_ref().expect("made above"),
-                    &update_root,
-                    Source::Update,
-                    may(&update_root, predicted.update),
-                    blocks[0] * blocks[1],
-                    path_rounds(&update_root),
-                    1,
-                    lighting.stage_passes,
-                )?,
-            }
-            list.end_pass();
-        }
+        let update_root = (!reference).then_some(PathRoot {
+            mode: 0,
+            local: GpuPtr::NULL,
+            light_flags: 0,
+            dof_background: StorageImageIndex::NONE,
+            sss_flags: path_root.sss_flags & !SSS_POINTS,
+            dielectric_flags: path_root.dielectric_flags & DIELECTRIC_DISPERSION,
+            features: path_root.features & UPDATE_FEATURES,
+            pixel_fraction: 1.0,
+            ..path_root
+        });
+        let blocks = view.extent.map(|e| e.div_ceil(block));
         let pixels = view.extent[0] * view.extent[1];
-        list.begin_pass("view paths", false);
         match &self.paths {
-            PathKernels::Mega { paths, .. } => paths.record(list, &path_root, view.extent),
-            PathKernels::Staged(k) => k.stages.record(
-                list,
-                view.staged.as_ref().expect("made above"),
-                &path_root,
-                Source::View,
-                may(&path_root, predicted.view),
-                pixels,
-                path_rounds(&path_root),
-                if pass.frosted_glass { 2 } else { 1 },
-                lighting.stage_passes,
-            )?,
+            PathKernels::Mega { update, paths, .. } => {
+                if let Some(update_root) = &update_root {
+                    list.begin_pass("world cache update paths", false);
+                    update.record(list, update_root, blocks);
+                    list.end_pass();
+                }
+                list.begin_pass("view paths", false);
+                paths.record(list, &path_root, view.extent);
+                list.end_pass();
+            }
+            PathKernels::Staged(k) => {
+                // The update paths ride in the view's stages, under the root the start stage
+                // makes of the view's as `update_root` is made here.
+                let mut meets = may(&path_root, predicted.view);
+                let mut update = 0;
+                if let Some(update_root) = &update_root {
+                    assert_eq!(
+                        path_rounds(update_root),
+                        path_rounds(&path_root),
+                        "update paths take the rounds of their view's"
+                    );
+                    meets |= may(update_root, predicted.update) | Source::Update.may();
+                    update = blocks[0] * blocks[1];
+                }
+                list.begin_pass(
+                    if update == 0 {
+                        "view paths"
+                    } else {
+                        "view and update paths"
+                    },
+                    false,
+                );
+                k.stages.record(
+                    list,
+                    &SourcePaths {
+                        memory: view.staged.as_ref().expect("made above"),
+                        root: &path_root,
+                        source: Source::View,
+                        may: meets,
+                        items: pixels,
+                        rounds: path_rounds(&path_root),
+                        passes: if pass.frosted_glass { 2 } else { 1 },
+                        update,
+                    },
+                    lighting.stage_passes,
+                )?;
+                list.end_pass();
+            }
         }
-        list.end_pass();
         if pass.dof_background.is_some() {
             list.begin_pass("background paths", false);
             match &self.paths {
@@ -2178,13 +2209,16 @@ impl LightingKernels {
                     };
                     k.stages.record(
                         list,
-                        view.staged.as_ref().expect("made above"),
-                        &background_root,
-                        Source::Background,
-                        may(&background_root, predicted.background),
-                        pixels,
-                        path_rounds(&background_root),
-                        1,
+                        &SourcePaths {
+                            memory: view.staged.as_ref().expect("made above"),
+                            root: &background_root,
+                            source: Source::Background,
+                            may: may(&background_root, predicted.background),
+                            items: pixels,
+                            rounds: path_rounds(&background_root),
+                            passes: 1,
+                            update: 0,
+                        },
                         lighting.stage_passes,
                     )?;
                 }
@@ -2288,33 +2322,34 @@ impl LightingKernels {
                 } else if !view
                     .staged_photons
                     .as_ref()
-                    .is_some_and(|m| m.fits(slots, parts, queues))
+                    .is_some_and(|m| m.fits(slots, parts, queues, 0))
                 {
                     view.staged_photons = None;
                     view.staged_photons =
-                        Some(StagedMemory::new(&view.device, slots, parts, queues)?);
+                        Some(StagedMemory::new(&view.device, slots, parts, queues, 0)?);
                 }
                 // The memory holds the sets this frame's photons run until its next one, under
                 // what the view asked its pipelines for.
                 if let Some(memory) = &view.staged_photons {
                     memory.begin_frame(own.ran().0);
                 }
+                let asks = scene_may(pass.scene_features) | root_may(&photon_root);
+                assert!(
+                    asks & !may == 0,
+                    "the photons' root asks for {asks:#x}, beyond the {may:#x} its pipelines hold"
+                );
                 k.stages.record(
                     list,
-                    view.staged_photons.as_ref().unwrap_or(own),
-                    &photon_root,
-                    Source::Photon,
-                    {
-                        let asks = scene_may(pass.scene_features) | root_may(&photon_root);
-                        assert!(
-                            asks & !may == 0,
-                            "the photons' root asks for {asks:#x}, beyond the {may:#x} its pipelines                          hold"
-                        );
-                        may
+                    &SourcePaths {
+                        memory: view.staged_photons.as_ref().unwrap_or(own),
+                        root: &photon_root,
+                        source: Source::Photon,
+                        may,
+                        items: photons,
+                        rounds: path_rounds(&photon_root),
+                        passes: 1,
+                        update: 0,
                     },
-                    photons,
-                    path_rounds(&photon_root),
-                    1,
                     lighting.stage_passes,
                 )?;
             }

@@ -131,6 +131,13 @@ public struct PathStages
     public uint4* words;                // a path's state: the words its root's features name (path/stages.slang)
     public uint4* shadows;              // what a deferred shadow ray keeps of its vertex where paths track interiors; null elsewhere
     public uint4* records;              // RECORD_WORDS words per slot: the path records
+    // The slots from `update_first` on hold the update paths that ride with a view's: the
+    // slice's share of the view's update blocks, a block's path in the slot of its place in
+    // that share. Their records, UPDATE_RECORD_WORDS words each, are apart. `capacity` where
+    // the memory holds none.
+    public uint4* update_records;
+    public uint update_first;
+    public uint _pad0;
 }
 
 // A queue of path slots in one round: the workgroups its stage runs over, which whoever

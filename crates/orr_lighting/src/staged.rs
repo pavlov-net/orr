@@ -100,7 +100,8 @@ const MAY_OTHER: u32 = MAY_LAYERS | MAY_INTERIORS;
 /// Everything: what a pipeline made without a value may meet.
 pub(crate) const MAY_ALL: u32 = u32::MAX;
 
-/// A path source's start stage.
+/// A path source's start stage. Update paths have no stages of their own: they ride in their
+/// view's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Source {
     View,
@@ -690,31 +691,65 @@ impl StagedKernels {
         Ok(set)
     }
 
-    /// Records `source`'s paths, which may meet `may`, over `items` (pixels, update blocks or
-    /// photons) with `root`, in slices of `memory`'s slots. A slice starts in the source's
-    /// start stage, the view's its primary stage, which also shades the paths that start on
-    /// the G-buffer's surface. It then runs `passes` passes of `rounds` rounds, each round the
-    /// trace stage, the shade stages and, where a material walks, the walk stage, over the
-    /// workgroups their queues gathered; a pass ends in the finish stage. `rounds` is at least
-    /// one more than the traces a path of the source takes, and a view's pixels with a
-    /// frosted-glass path take a second pass. With `stage_passes` each stage records in a pass
-    /// of its own. Orders nothing after it.
+    /// Records the paths of a source: over its `items` (pixels or photons) in slices of its
+    /// memory's slots. A slice starts in the source's start stage, the view's its primary stage,
+    /// which also shades the paths that start on the G-buffer's surface. It then runs `passes`
+    /// passes of `rounds` rounds, each round the trace stage, the shade stages and, where a
+    /// material walks, the walk stage, over the workgroups their queues gathered; a pass ends
+    /// in the finish stage. `rounds` is at least one more than the traces a path of the source
+    /// takes, and a view's pixels with a frosted-glass path take a second pass.
     ///
-    /// The pipelines are those ready that hold the least beyond `may`; with none ready it
-    /// waits for the ones made for `may`, as nothing else may run these paths.
-    #[allow(clippy::too_many_arguments)]
+    /// A view's update paths ride in its stages, the paths of `update` blocks shared out over
+    /// its slices: a stage waits for the one before it and takes as long as its slowest path
+    /// however few it holds, so paths of their own stages would wait through every round
+    /// again. They read the world cache's resolved cells and add to its accumulated ones, and
+    /// the view's paths read the resolved ones only, so neither reads what the other writes.
+    ///
+    /// With `stage_passes` each stage records in a pass of its own. Orders nothing after it.
+    ///
+    /// The pipelines are those ready that hold the least beyond what the paths may meet; with
+    /// none ready it waits for the ones made for that, as nothing else may run these paths.
     pub(crate) fn record(
         &self,
         list: &mut CommandList<'_>,
-        memory: &StagedMemory,
-        root: &PathRoot,
-        source: Source,
-        may: u32,
-        items: u32,
-        rounds: u32,
-        passes: u32,
+        paths: &SourcePaths<'_>,
         stage_passes: bool,
     ) -> Result<(), Error> {
+        let (set, steps) = self.steps(paths)?;
+        for step in &steps {
+            barrier(list);
+            stage_pass(list, stage_passes, paths.source, step.pass);
+            for (stage, groups) in &step.runs {
+                let pipeline = set.stage(*stage).get().expect("the set holds the stage");
+                match *groups {
+                    Groups::Count(count) => {
+                        list.dispatch_inline(pipeline.compute(), &step.root, [count, 1, 1]);
+                    }
+                    Groups::Queue(args) => pipeline.dispatch(list, &step.root, args),
+                }
+            }
+        }
+        list.barrier(
+            Stages::COMPUTE | Stages::RAY,
+            Stages::COMPUTE | Stages::RAY,
+            Hazards::empty(),
+        );
+        Ok(())
+    }
+
+    /// The pipelines `paths` run and their stages in order, each after a wait for the one
+    /// before it.
+    fn steps(&self, paths: &SourcePaths<'_>) -> Result<(Arc<StageSet>, Vec<Step>), Error> {
+        let &SourcePaths {
+            memory,
+            root,
+            source,
+            may,
+            items,
+            rounds,
+            passes,
+            update,
+        } = paths;
         assert!(
             memory.rows > rounds * passes,
             "the paths' memory holds fewer rounds than they take"
@@ -725,108 +760,135 @@ impl StagedKernels {
             "the paths' memory lacks a part their root names"
         );
         let walks = root.features & FEATURE_WALK != 0;
-        let stages = source.stages(walks);
+        let mut stages = source.stages(walks);
+        if update != 0 {
+            stages.push(Stage::Update);
+        }
+        // The blocks whose update paths ride in each slice.
+        let riders = memory.capacity - memory.own;
+        assert!(
+            u64::from(update) <= u64::from(items.div_ceil(memory.own)) * u64::from(riders),
+            "the paths' memory holds fewer update paths than ride with them"
+        );
         let asked = memory.asked();
         let set = self.wait(may, asked, &stages)?;
         if set.may != asked {
             log::debug!(
-                "{source:?} paths that may meet {may:#x} run pipelines made for {:#x}; their                  view asked for {asked:#x}",
+                "{source:?} paths that may meet {may:#x} run pipelines made for {:#x}; their \
+                 view asked for {asked:#x}",
                 set.may
             );
         }
         memory.hold(&set);
-        let pipeline = |stage: Stage| set.stage(stage).get().expect("the set holds the stage");
         let mut root = PathRoot {
             stages: memory.header.gpu(),
             source: source.id(),
             ..*root
         };
-        if matches!(pipeline(Stage::Opaque), StagePipeline::Rays(_)) {
+        let opaque = set.stage(Stage::Opaque).get();
+        if matches!(opaque, Some(StagePipeline::Rays(_))) {
             root.features |= FEATURE_RAY_SHADES;
         }
+        let mut steps = Vec::new();
         let mut base = 0;
         while base < items {
             root.slice_base = base;
-            root.slice_count = (items - base).min(memory.slice(source));
+            root.slice_count = (items - base).min(memory.slice());
             (root.round, root.round_first, root.round_next) = (0, 0, rounds);
             base += root.slice_count;
-            list.barrier(
-                Stages::COMPUTE | Stages::RAY,
-                Stages::COMPUTE | Stages::RAY,
-                Hazards::empty(),
-            );
-            stage_pass(list, stage_passes, source, 0);
             let queues = (rounds * passes + 1) * STAGE_QUEUES as u32;
-            list.dispatch_inline(
-                pipeline(Stage::Reset).compute(),
-                &root,
-                [queues.div_ceil(STAGE_GROUP), 1, 1],
-            );
-            barrier(list);
-            list.dispatch_inline(
-                pipeline(source.start()).compute(),
-                &root,
-                [root.slice_count.div_ceil(STAGE_GROUP), 1, 1],
-            );
+            steps.push(Step {
+                root,
+                pass: 0,
+                runs: vec![(Stage::Reset, Groups::Count(queues.div_ceil(STAGE_GROUP)))],
+            });
+            let mut starts = vec![(
+                source.start(),
+                Groups::Count(root.slice_count.div_ceil(STAGE_GROUP)),
+            )];
+            let before = (root.slice_base / memory.own) * riders;
+            if update > before {
+                let count = (update - before).min(riders);
+                starts.push((Stage::Update, Groups::Count(count.div_ceil(STAGE_GROUP))));
+            }
+            steps.push(Step {
+                root,
+                pass: 0,
+                runs: starts,
+            });
             for pass in 0..passes {
                 let first = pass * rounds;
                 for round in first..first + rounds {
                     (root.round, root.round_first, root.round_next) =
                         (round, first, first + rounds);
-                    barrier(list);
-                    stage_pass(list, stage_passes, source, 1);
-                    list.dispatch_indirect_inline(
-                        pipeline(Stage::Trace).compute(),
-                        &root,
-                        memory.groups(round, QUEUE_TRACE),
-                    );
-                    barrier(list);
-                    stage_pass(list, stage_passes, source, 2);
-                    pipeline(Stage::Opaque).dispatch(
-                        list,
-                        &root,
-                        memory.groups(round, QUEUE_OPAQUE),
-                    );
+                    let queue = |queue| Groups::Queue(memory.groups(round, queue));
+                    steps.push(Step {
+                        root,
+                        pass: 1,
+                        runs: vec![(Stage::Trace, queue(QUEUE_TRACE))],
+                    });
+                    let mut shades = vec![(Stage::Opaque, queue(QUEUE_OPAQUE))];
                     if set.may & MAY_OTHER != 0 {
-                        pipeline(Stage::Other).dispatch(
-                            list,
-                            &root,
-                            memory.groups(round, QUEUE_OTHER),
-                        );
+                        shades.push((Stage::Other, queue(QUEUE_OTHER)));
                     }
                     if set.may & MAY_LOBES != 0 {
-                        pipeline(Stage::Rich).dispatch(
-                            list,
-                            &root,
-                            memory.groups(round, QUEUE_RICH),
-                        );
+                        shades.push((Stage::Rich, queue(QUEUE_RICH)));
                     }
+                    steps.push(Step {
+                        root,
+                        pass: 2,
+                        runs: shades,
+                    });
                     if walks {
-                        barrier(list);
-                        stage_pass(list, stage_passes, source, 3);
-                        list.dispatch_indirect_inline(
-                            pipeline(Stage::Walk).compute(),
-                            &root,
-                            memory.groups(round, QUEUE_WALK),
-                        );
+                        steps.push(Step {
+                            root,
+                            pass: 3,
+                            runs: vec![(Stage::Walk, queue(QUEUE_WALK))],
+                        });
                     }
                 }
-                barrier(list);
-                stage_pass(list, stage_passes, source, 4);
-                list.dispatch_indirect_inline(
-                    pipeline(Stage::Finish).compute(),
-                    &root,
-                    memory.groups(first, QUEUE_FINISH),
-                );
+                steps.push(Step {
+                    root,
+                    pass: 4,
+                    runs: vec![(
+                        Stage::Finish,
+                        Groups::Queue(memory.groups(first, QUEUE_FINISH)),
+                    )],
+                });
             }
         }
-        list.barrier(
-            Stages::COMPUTE | Stages::RAY,
-            Stages::COMPUTE | Stages::RAY,
-            Hazards::empty(),
-        );
-        Ok(())
+        Ok((set, steps))
     }
+}
+
+/// The paths of one source for [`StagedKernels::record`]: over `items` with `root`, which may
+/// meet `may`, in `memory`, for `passes` passes of `rounds` rounds, and the update paths of
+/// `update` blocks that ride with a view's.
+#[derive(Clone, Copy)]
+pub(crate) struct SourcePaths<'a> {
+    pub(crate) memory: &'a StagedMemory,
+    pub(crate) root: &'a PathRoot,
+    pub(crate) source: Source,
+    pub(crate) may: u32,
+    pub(crate) items: u32,
+    pub(crate) rounds: u32,
+    pub(crate) passes: u32,
+    pub(crate) update: u32,
+}
+
+/// The workgroups a stage runs over: a count, or those a queue gathered.
+#[derive(Clone, Copy)]
+enum Groups {
+    Count(u32),
+    Queue(GpuPtr<DispatchArgs>),
+}
+
+/// The stages of a source that run between two waits, and the root they run with.
+struct Step {
+    root: PathRoot,
+    /// Which of [`stage_pass`]'s passes times it.
+    pass: usize,
+    runs: Vec<(Stage, Groups)>,
 }
 
 /// Which of the ready sets with masks `sets` runs paths that may meet `may` in a frame of a view
@@ -959,6 +1021,9 @@ pub(crate) struct StagedMemory {
     capacity: u32,
     /// Rounds its queues hold: one more than a source's paths may take over their passes.
     rows: u32,
+    /// Of `capacity`, the slots of the source's own paths: the rest hold the update paths that
+    /// ride with a view's.
+    own: u32,
     parts: StateParts,
     /// The pipelines the view's last frame recorded, kept until its next: a set let go
     /// meanwhile outlives the commands that run it.
@@ -973,18 +1038,22 @@ pub(crate) struct StagedMemory {
     _words: Allocation<[u32; 4]>,
     _shadows: Option<Allocation<[u32; 4]>>,
     _records: Allocation<[u32; 4]>,
+    _update_records: Allocation<[u32; 4]>,
 }
 
 impl StagedMemory {
     /// Slots for the paths of a view of `pixels` pixels, or for as many photons, at most
-    /// [`MAX_SLOTS`], each with `parts`, and queues for `rows` rounds.
+    /// [`MAX_SLOTS`], and past them for the `riders` update paths that ride in a slice of a
+    /// view's, each with `parts`, and queues for `rows` rounds.
     pub(crate) fn new(
         device: &Device,
         pixels: u32,
         parts: StateParts,
         rows: u32,
+        riders: u32,
     ) -> Result<Self, Error> {
-        let capacity = pixels.clamp(1, scratch_slots());
+        let own = pixels.clamp(1, scratch_slots());
+        let capacity = own + riders;
         let n = u64::from(capacity);
         let words =
             |count: u64, name| device.gpu_malloc::<[u32; 4]>(MemoryKind::DeviceLocal, count, name);
@@ -1010,10 +1079,10 @@ impl StagedMemory {
         } else {
             None
         };
-        // A slice of update paths holds one record at least.
-        let records = words(
-            (RECORD_WORDS * n).max(UPDATE_RECORD_WORDS),
-            "staged path records",
+        let records = words(RECORD_WORDS * n, "staged path records")?;
+        let update_records = words(
+            UPDATE_RECORD_WORDS * u64::from(riders.max(1)),
+            "staged update path records",
         )?;
         log::debug!(
             "staged paths: {capacity} slots of {} bytes ({parts:?})",
@@ -1028,9 +1097,13 @@ impl StagedMemory {
             words: state.gpu(),
             shadows: shadows.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             records: records.gpu(),
+            update_records: update_records.gpu(),
+            update_first: own,
+            _pad0: 0,
         };
         Ok(Self {
             capacity,
+            own,
             rows,
             parts,
             held: Mutex::new(Vec::new()),
@@ -1042,6 +1115,7 @@ impl StagedMemory {
             _words: state,
             _shadows: shadows,
             _records: records,
+            _update_records: update_records,
         })
     }
 
@@ -1089,28 +1163,26 @@ impl StagedMemory {
     /// Whether one slice of it holds `items` paths, or as many as any memory may, each with
     /// `parts`, and its queues `rows` rounds.
     pub(crate) fn holds(&self, items: u32, parts: StateParts, rows: u32) -> bool {
-        self.capacity >= items.clamp(1, scratch_slots())
+        self.own >= items.clamp(1, scratch_slots()) && self.parts.holds(parts) && self.rows >= rows
+    }
+
+    /// Whether it holds the slots a view of `pixels` pixels asks for and those of `riders`
+    /// update paths a slice, each with `parts`, and queues for `rows` rounds.
+    pub(crate) fn fits(&self, pixels: u32, parts: StateParts, rows: u32, riders: u32) -> bool {
+        self.own == pixels.clamp(1, scratch_slots())
+            && self.capacity - self.own == riders
             && self.parts.holds(parts)
             && self.rows >= rows
     }
 
-    /// Whether it holds the slots a view of `pixels` pixels asks for, each with `parts`, and
-    /// queues for `rows` rounds.
-    pub(crate) fn fits(&self, pixels: u32, parts: StateParts, rows: u32) -> bool {
-        self.capacity == pixels.clamp(1, scratch_slots())
-            && self.parts.holds(parts)
-            && self.rows >= rows
+    /// The slices a view of `pixels` pixels runs in.
+    pub(crate) fn slices(pixels: u32) -> u32 {
+        pixels.div_ceil(pixels.clamp(1, scratch_slots()))
     }
 
-    /// The paths of `source` a slice holds: an update path's record takes the words of
-    /// several slots'.
-    fn slice(&self, source: Source) -> u32 {
-        match source {
-            Source::Update => {
-                (u64::from(self.capacity) * RECORD_WORDS / UPDATE_RECORD_WORDS).max(1) as u32
-            }
-            _ => self.capacity,
-        }
+    /// The paths of its source a slice holds.
+    fn slice(&self) -> u32 {
+        self.own
     }
 
     /// The workgroups of `queue` in `round`.
