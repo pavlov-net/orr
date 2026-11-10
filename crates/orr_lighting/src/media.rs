@@ -377,6 +377,31 @@ impl MediaView {
     }
 }
 
+/// Whether `kernels` link a medium.
+pub(crate) fn links_medium(kernels: &KernelSet) -> bool {
+    kernels.medium != DEFAULT_MEDIUM
+}
+
+/// Whether a medium that scatters may lie on a camera segment of a scene that may hold
+/// `features`, under kernels that link a medium where `linked`.
+fn scatters(linked: bool, features: SceneFeatures, lighting: &ViewLighting) -> bool {
+    linked
+        || features.contains(SceneFeatures::MEDIUM_PROXIES)
+        || features.contains(SceneFeatures::SMOKE)
+        || lighting.camera_medium.is_some()
+        || matches!(
+            lighting.debug_view,
+            LightingDebugView::Media | LightingDebugView::Froxels
+        )
+}
+
+/// Whether a camera segment of a scene that may hold `features` can hold a medium, under
+/// kernels that link one where `linked`: then a frame's froxels hold it, and its paths read
+/// them.
+pub(crate) fn fogged(linked: bool, features: SceneFeatures, lighting: &ViewLighting) -> bool {
+    scatters(linked, features, lighting) || features.contains(SceneFeatures::INTERIORS)
+}
+
 /// The media kernels of one device.
 pub(crate) struct MediaKernels {
     order: ComputePipeline,
@@ -432,27 +457,16 @@ impl MediaKernels {
                 address: [AddressMode::ClampToEdge; 3],
                 ..SamplerDesc::default()
             })?,
-            linked_medium: kernels.medium != DEFAULT_MEDIUM,
+            linked_medium: links_medium(kernels),
         })
     }
 
-    /// Whether a medium that scatters may lie on a camera segment of a scene that may hold
-    /// `features`.
     fn scatters(&self, features: SceneFeatures, lighting: &ViewLighting) -> bool {
-        self.linked_medium
-            || features.contains(SceneFeatures::MEDIUM_PROXIES)
-            || features.contains(SceneFeatures::SMOKE)
-            || lighting.camera_medium.is_some()
-            || matches!(
-                lighting.debug_view,
-                LightingDebugView::Media | LightingDebugView::Froxels
-            )
+        scatters(self.linked_medium, features, lighting)
     }
 
-    /// Whether a camera segment of a scene that may hold `features` can hold a medium: then a
-    /// frame's froxels hold it, and its paths read them.
-    pub(crate) fn fogged(&self, features: SceneFeatures, lighting: &ViewLighting) -> bool {
-        self.scatters(features, lighting) || features.contains(SceneFeatures::INTERIORS)
+    fn fogged(&self, features: SceneFeatures, lighting: &ViewLighting) -> bool {
+        fogged(self.linked_medium, features, lighting)
     }
 
     /// What reads the froxels of `pass`. A debug view of them reads all of them, and the

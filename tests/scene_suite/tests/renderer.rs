@@ -576,7 +576,8 @@ fn frames_around_the_compile(
         .unwrap();
     assert!(!r.kernels_ready());
     let history = r.create_view_history().unwrap();
-    assert!(r.paths_outstanding() > 0);
+    let kernels = r.paths_outstanding();
+    assert!(kernels > 0);
     let [w, h] = [320, 240];
     let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
     let image = d
@@ -590,9 +591,13 @@ fn frames_around_the_compile(
     let (mut before, mut after) = (Vec::new(), Vec::new());
     for i in 0..waiting + lit {
         if i == waiting {
+            // A view that rendered black asked for its own path pipelines beside the kernels,
+            // which the wait for the kernels leaves to the view's first lit render.
+            let asked = black && waiting > 0;
+            assert_eq!(r.paths_outstanding() > kernels, asked);
             r.wait_paths().unwrap();
             assert!(r.kernels_ready());
-            assert_eq!(r.paths_outstanding(), 0);
+            assert_eq!(r.paths_outstanding() > 0, asked);
         }
         frame += 1;
         let mut f = r

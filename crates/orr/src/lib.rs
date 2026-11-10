@@ -723,7 +723,7 @@ impl Renderer {
     /// How many of the path tracing kernels' compile jobs have not finished.
     pub fn paths_outstanding(&self) -> u32 {
         match &self.lighting.paths {
-            Paths::Compiling { jobs, .. } => jobs.outstanding(),
+            Paths::Compiling { jobs, .. } => jobs.outstanding() + jobs.paths_outstanding(),
             Paths::Ready(kernels) => kernels.outstanding(),
             _ => 0,
         }
@@ -1068,16 +1068,21 @@ impl<'a> Frame<'a> {
 
     /// Asks for the path pipelines `view` takes under `lighting` and says whether it renders
     /// lit: they are ready, or the caller waits for them ([`Renderer::wait_paths`]), which
-    /// `wait` does here. A failed compile fails the kernels.
+    /// `wait` does here. While the kernels every view runs compile, the view's pipelines are
+    /// asked for all the same, so they compile beside those. A failed compile fails the
+    /// kernels.
     fn ask_paths(
         &mut self,
         view: &LitView<'_>,
         lighting: &ViewLighting,
         wait: bool,
     ) -> Result<bool> {
-        let Paths::Ready(kernels) = &self.lighting.paths else {
+        if !matches!(
+            self.lighting.paths,
+            Paths::Ready(_) | Paths::Compiling { .. }
+        ) {
             return Ok(false);
-        };
+        }
         let scene = self
             .lighting
             .scenes
@@ -1093,20 +1098,26 @@ impl<'a> Frame<'a> {
             dof_background: false,
         };
         let waits = self.lighting.waits;
-        // The render of a caller that waits asks for them itself, once it has waited.
-        if waits && !wait {
-            return Ok(true);
-        }
-        // A caller that waits takes the pipelines made for exactly its view, so its frames do
-        // not depend on what else has compiled.
-        let waited = if waits {
-            kernels.wait_paths(scene, &needs, lighting)
-        } else {
-            Ok(())
+        let asked = match &self.lighting.paths {
+            Paths::Compiling { jobs, .. } => {
+                jobs.prepare_paths(scene, &needs, lighting).map(|()| false)
+            }
+            // The render of a caller that waits asks for them itself, once it has waited.
+            Paths::Ready(_) if waits && !wait => return Ok(true),
+            Paths::Ready(kernels) => {
+                // A caller that waits takes the pipelines made for exactly its view, so its
+                // frames do not depend on what else has compiled.
+                let waited = if waits {
+                    kernels.wait_paths(scene, &needs, lighting)
+                } else {
+                    Ok(())
+                };
+                waited
+                    .and_then(|()| kernels.prepare_paths(scene, &needs, lighting))
+                    .map(|ready| ready || waits)
+            }
+            Paths::NotStarted | Paths::Failed(_) => unreachable!("returned above"),
         };
-        let asked = waited
-            .and_then(|()| kernels.prepare_paths(scene, &needs, lighting))
-            .map(|ready| ready || waits);
         asked.map_err(|e| {
             log::error!("{e}");
             let e = Arc::new(e);
