@@ -9,8 +9,8 @@
 // codec) into its slots. Both return 0 or PAGE_CODEC_* bits; a page that sets any bit in
 // either pass is malformed, and the thread or workgroup that found it writes nothing.
 //
-// The decode keeps its working set in groupshared memory (about 27 KiB, under Apple GPUs'
-// 32 KiB) declared here, so a kernel that calls `page_decode_cluster` holds it; the module
+// The decode keeps its working set in groupshared memory (32444 bytes, under Apple GPUs'
+// 32768) declared here, so a kernel that calls `page_decode_cluster` holds it; the module
 // has no bindings.
 module page_codec;
 
@@ -41,10 +41,15 @@ static const uint MAX_VERTICES = 256;
 static const uint MAX_VERTEX_BYTES = 8 + 32;
 static const uint MAX_CHANNELS = MAX_VERTEX_BYTES / 4;
 static const uint MAX_GROUPS = MAX_VERTICES / 16;
+static const uint COLUMN_GROUP_WORDS = MAX_GROUPS / 2;
+// The codec splits a stream at vertex_block's vertices: only the widest vertices take a second.
+static const uint MAX_BLOCKS = 2;
 
-// The longest stream either decoder accepts: every byte column as 16 groups of 4-bit values
-// that all escape, or every triangle with three extra corners, the odd count's pad included.
-static const uint VERTEX_STREAM_MAX = 1 + MAX_CHANNELS + MAX_VERTEX_BYTES * (4 + MAX_GROUPS * 24) + 35;
+// The longest stream either decoder accepts: the widest vertices with every byte column as
+// 16 groups of 4-bit values that all escape, two blocks' control and group headers and the
+// tail, or every triangle with three extra corners, the odd count's pad included.
+static const uint VERTEX_STREAM_MAX = 1 + MAX_BLOCKS * MAX_CHANNELS
+    + MAX_VERTEX_BYTES * (4 + MAX_GROUPS * 24) + MAX_VERTEX_BYTES + MAX_CHANNELS;
 static const uint TRIANGLE_STREAM_MAX = 256 * 3 + 128 + 16;
 static const uint VERTEX_STREAM_WORDS = (VERTEX_STREAM_MAX + 3) / 4;
 static const uint TRIANGLE_STREAM_WORDS = (TRIANGLE_STREAM_MAX + 3) / 4;
@@ -62,8 +67,11 @@ static const uint VERTEX_CODEC_HEADER = 0xA1;
 
 groupshared uint codec_vstream[VERTEX_STREAM_WORDS];
 groupshared uint codec_tstream[TRIANGLE_STREAM_WORDS];
-groupshared uint codec_columns[MAX_VERTEX_BYTES];               // kind << 16 | stream offset
-groupshared uint codec_groups[MAX_VERTEX_BYTES * MAX_GROUPS];   // bits << 16 | stream offset
+groupshared uint codec_columns[MAX_BLOCKS * MAX_VERTEX_BYTES];  // kind << 16 | stream offset
+// Two 16-bit entries per word, bits << 12 | offset from the column's first group in its block;
+// a column's groups span at most 16 * 24 bytes. Blocks start on a group, so the table is indexed
+// by vertex / 16 across them. Lane 0 alone writes them.
+groupshared uint codec_groups[MAX_VERTEX_BYTES * COLUMN_GROUP_WORDS];
 // The byte columns (MAX_VERTEX_BYTES * MAX_VERTICES / 4 words), then the channels built from them.
 groupshared uint codec_channels[MAX_CHANNELS * MAX_VERTICES];
 groupshared uint codec_prefix[MAX_VERTICES];                     // extra | next << 16
@@ -228,8 +236,14 @@ uint group_bits(uint ctrl, uint header_bits)
     return b == 0 ? 0 : 1u << (b - 1);
 }
 
-// Walks the vertex stream's structure: header, control bytes, every byte column and group,
-// and the tail; fills codec_columns and codec_groups. Returns false where the CPU decoder
+// Vertices per block of the codec's stream: as many as 8 KiB holds, in whole groups.
+uint vertex_block(uint stride)
+{
+    return min((8192 / stride) & ~15u, MAX_VERTICES);
+}
+
+// Walks the vertex stream's structure: header, each block's control bytes, byte columns and
+// groups, and the tail; fills codec_columns and codec_groups. Returns false where the CPU decoder
 // fails.
 bool walk_vertices(uint len, uint vn, uint stride)
 {
@@ -242,40 +256,47 @@ bool walk_vertices(uint len, uint vn, uint stride)
     if (len - 1 < tail_pad)
         return false;
     uint at = 1;
-    if (vn > 0)
+    uint block = vertex_block(stride);
+    for (uint b = 0; b * block < vn; b++)
     {
+        uint count = min(vn - b * block, block);
         uint control = at;
         uint control_size = stride / 4;
         if (len - at < control_size)
             return false;
         at += control_size;
-        uint groups = (vn + 15) / 16;
+        uint groups = (count + 15) / 16;
         uint header_size = (groups + 3) / 4;
         for (uint k = 0; k < stride; k++)
         {
+            uint column = b * MAX_VERTEX_BYTES + k;
             uint ctrl = (vbyte(control + k / 4) >> (k % 4 * 2)) & 3;
             if (ctrl == 3)
             {
-                if (len - at < vn)
+                if (len - at < count)
                     return false;
-                codec_columns[k] = COLUMN_LITERAL << 16 | at;
-                at += vn;
+                codec_columns[column] = COLUMN_LITERAL << 16 | at;
+                at += count;
             }
             else if (ctrl == 2)
-                codec_columns[k] = COLUMN_ZERO << 16;
+                codec_columns[column] = COLUMN_ZERO << 16;
             else
             {
                 if (len - at < header_size)
                     return false;
                 uint header = at;
                 at += header_size;
-                codec_columns[k] = COLUMN_GROUPS << 16;
+                uint first = at;
+                codec_columns[column] = COLUMN_GROUPS << 16 | first;
                 for (uint g = 0; g < groups; g++)
                 {
                     if (len - at < 24)
                         return false;
                     uint bits = group_bits(ctrl, (vbyte(header + g / 4) >> (g % 4 * 2)) & 3);
-                    codec_groups[k * MAX_GROUPS + g] = bits << 16 | at;
+                    uint entry = bits << 12 | (at - first);
+                    uint index = b * block / 16 + g;
+                    uint word = k * COLUMN_GROUP_WORDS + index / 2;
+                    codec_groups[word] = index % 2 == 0 ? entry : codec_groups[word] | entry << 16;
                     at += group_len(at, bits);
                 }
             }
@@ -286,16 +307,17 @@ bool walk_vertices(uint len, uint vn, uint stride)
     return len - at == tail_pad;
 }
 
-uint column_byte(uint k, uint i)
+uint column_byte(uint k, uint i, uint block)
 {
-    uint d = codec_columns[k];
+    uint d = codec_columns[i / block * MAX_VERTEX_BYTES + k];
     uint kind = d >> 16;
     if (kind == COLUMN_ZERO)
         return 0;
     if (kind == COLUMN_LITERAL)
-        return vbyte((d & 0xFFFF) + i);
-    uint g = codec_groups[k * MAX_GROUPS + i / 16];
-    return group_value(g & 0xFFFF, g >> 16, i % 16);
+        return vbyte((d & 0xFFFF) + i % block);
+    uint g = i / 16;
+    uint entry = (codec_groups[k * COLUMN_GROUP_WORDS + g / 2] >> (g % 2 * 16)) & 0xFFFF;
+    return group_value((d & 0xFFFF) + (entry & 0xFFF), entry >> 12, i % 16);
 }
 
 uint unzigzag8x4(uint x)
@@ -437,13 +459,14 @@ public uint page_decode_cluster(StoredPage p, uint cluster, uint lane)
     if (codec_status != 0)
         return codec_status;
 
+    uint block = vertex_block(stride);
     for (uint task = lane; task < stride * MAX_VERTICES / 4; task += PAGE_CODEC_THREADS)
     {
         uint col = task / (MAX_VERTICES / 4);
         uint i = task % (MAX_VERTICES / 4) * 4;
         uint v = 0;
         for (uint j = 0; j < 4 && i + j < vn; j++)
-            v |= column_byte(col, i + j) << (8 * j);
+            v |= column_byte(col, i + j, block) << (8 * j);
         codec_channels[task] = v;
     }
     for (uint d = 1; d < MAX_VERTICES; d *= 2)

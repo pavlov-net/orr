@@ -81,16 +81,48 @@ impl<T: Message> Clone for Obj<T> {
 
 type Buffer = ProtocolObject<dyn MTLBuffer>;
 
-/// One queue's timeline: values up to `submitted` have been submitted, and the event reaches
-/// each as its work completes.
+/// One queue's timeline: values up to `submitted` have been submitted, those up to `issued`
+/// have had their signals handed to Metal, and the event reaches each as its work completes.
 pub(super) struct Timeline {
     pub(super) event: Obj<ProtocolObject<dyn MTLSharedEvent>>,
     pub(super) submitted: std::sync::atomic::AtomicU64,
+    issued: Mutex<u64>,
+    issued_changed: std::sync::Condvar,
 }
 
 impl Timeline {
+    pub(super) fn new(event: Obj<ProtocolObject<dyn MTLSharedEvent>>) -> Self {
+        Self {
+            event,
+            submitted: std::sync::atomic::AtomicU64::new(0),
+            issued: Mutex::new(0),
+            issued_changed: std::sync::Condvar::new(),
+        }
+    }
+
     pub(super) fn completed(&self) -> u64 {
         self.event.signaledValue()
+    }
+
+    pub(super) fn issue(&self, value: u64) {
+        let mut issued = lock(&self.issued);
+        *issued = value.max(*issued);
+        self.issued_changed.notify_all();
+    }
+
+    pub(super) fn is_issued(&self, value: u64) -> bool {
+        *lock(&self.issued) >= value
+    }
+
+    /// Blocks until `value`'s signal has been handed to Metal. Every point waited on comes
+    /// from an earlier submit, so these waits cannot form a cycle.
+    pub(super) fn wait_issued(&self, value: u64) {
+        let issued = lock(&self.issued);
+        drop(
+            self.issued_changed
+                .wait_while(issued, |issued| *issued < value)
+                .unwrap(),
+        );
     }
 }
 

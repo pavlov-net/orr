@@ -9,6 +9,7 @@
 //!
 //! - A CLAS holds its triangles (vertices, indices and per-triangle data: cluster ID,
 //!   geometry index and flags, triangle in the cluster) and a Metal BLAS over them.
+//!   A CLAS of an op marked [`RtasFlags::FLAT_ONLY`] has no Metal BLAS.
 //! - A cluster BLAS marked [`RtasFlags::TRANSIENT`] is an instance structure over its CLAS'
 //!   BLAS, a cheap build that traces through three levels; any other is one flat BLAS over
 //!   its CLAS' triangles, slower to build and faster to trace.
@@ -39,7 +40,8 @@ use objc2_metal::{
     MTL4PrimitiveAccelerationStructureDescriptor, MTLAccelerationStructure,
     MTLAccelerationStructureDescriptor, MTLAccelerationStructureInstanceDescriptorType,
     MTLAccelerationStructureUsage, MTLAttributeFormat, MTLBuffer, MTLComputePipelineState,
-    MTLDevice, MTLIndexType, MTLResidencySet, MTLResource, MTLResourceOptions,
+    MTLDevice, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLIndexType,
+    MTLResidencySet, MTLResource, MTLResourceOptions, MTLStorageMode,
 };
 
 use super::command::CommandList;
@@ -51,6 +53,24 @@ use crate::rtas::{PtlasArgs, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, R
 use crate::{Error, GpuAddress, GpuPtr, Hazards, MemoryKind, RtasFlags, Stages};
 
 type Structure = ProtocolObject<dyn MTLAccelerationStructure>;
+
+/// A structure, what to build it from and the scratch the build needs.
+type Build = (
+    Obj<Structure>,
+    Retained<MTL4AccelerationStructureDescriptor>,
+    u64,
+);
+
+/// Builds in one encoder. Metal flushes an encoder's builds as one batch, which at hundreds of
+/// thousands takes minutes on the CPU and again on the GPU, past any timeout that detects a
+/// hang; smaller batches let the queue wait for each in turn.
+const BUILDS_PER_ENCODER: usize = 4096;
+
+/// The builds left for a later CPU step.
+struct RemainingBuilds(Vec<Build>);
+
+// SAFETY: the step takes the descriptors whole; no other thread holds them.
+unsafe impl Send for RemainingBuilds {}
 
 const SOURCE: &str = include_str!("cluster.msl");
 const HEADER: u64 = 64;
@@ -179,13 +199,28 @@ impl Shared {
         let mut held = lock(&ids.held);
         if need > *held {
             let target = need.next_power_of_two().max(256);
+            // SAFETY: any size is valid to ask about.
+            let placed = unsafe {
+                self.device
+                    .heapAccelerationStructureSizeAndAlignWithSize(16)
+            };
+            let desc = MTLHeapDescriptor::new();
+            desc.setType(MTLHeapType::Placement);
+            desc.setStorageMode(MTLStorageMode::Private);
+            desc.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
+            desc.setSize(placed.size);
+            let heap = self
+                .device
+                .newHeapWithDescriptor(&desc)
+                .expect("newHeapWithDescriptor");
             // New IDs take the lowest free ones: the last of `target` structures has an ID
-            // at least `target - 1`, which makes the table hold `target`.
+            // at least `target - 1`, which makes the table hold `target`. They all alias one
+            // heap range because device allocations scan a free list per object, which takes
+            // minutes at a million structures.
             let mut throwaway = Vec::new();
             while (throwaway.len() as u64) < target {
-                let s = self
-                    .device
-                    .newAccelerationStructureWithSize(16)
+                // SAFETY: the structure fills the heap, and nothing builds or traces it.
+                let s = unsafe { heap.newAccelerationStructureWithSize_offset(16, 0) }
                     .expect("newAccelerationStructureWithSize");
                 let id = id_bits(s.gpuResourceID());
                 throwaway.push(s);
@@ -577,6 +612,7 @@ impl CommandList<'_> {
             let readback = self.read_records(&d, &io);
             let creates = match d.op {
                 RtasOp::BuildTemplates | RtasOp::Move => 0,
+                _ if d.flags.contains(RtasFlags::FLAT_ONLY) => 0,
                 _ => u64::from(max_args(&d)),
             };
             let reservation = self.queue.shared.reserve_structures(creates);
@@ -741,18 +777,12 @@ impl CommandList<'_> {
         self.run_jobs(&state, &jobs);
     }
 
-    /// Encodes `builds` with scratch of their own.
-    fn encode_builds(
-        &mut self,
-        builds: &[(
-            Obj<Structure>,
-            Retained<MTL4AccelerationStructureDescriptor>,
-            u64,
-        )],
-    ) {
+    /// Encodes `builds` with scratch of their own, in batches.
+    fn encode_builds(&mut self, mut builds: Vec<Build>) {
         if builds.is_empty() {
             return;
         }
+        let rest = builds.split_off(builds.len().min(BUILDS_PER_ENCODER));
         let offsets: Vec<u64> = builds
             .iter()
             .scan(0u64, |at, (_, _, s)| {
@@ -779,12 +809,20 @@ impl CommandList<'_> {
             self.keep.push(Box::new(raw.clone()));
         }
         self.keep.push(Box::new(scratch));
+        if !rest.is_empty() {
+            let rest = RemainingBuilds(rest);
+            self.split(Box::new(move |list: &mut CommandList<'_>| {
+                let rest = rest;
+                list.encode_builds(rest.0);
+            }));
+        }
     }
 
     /// CLAS builds, template builds and instantiations.
     fn build_objects(&mut self, d: &RtasOpDesc, io: &RtasIo, rb: &Readback, count: usize) {
         let shared = Arc::clone(&self.queue.shared);
         let clas = d.op != RtasOp::BuildTemplates;
+        let structures = clas && !d.flags.contains(RtasFlags::FLAT_ONLY);
         // Triangles, vertices and opacity of each record.
         let shapes: Vec<(u32, u32, bool)> = (0..count)
             .map(|i| {
@@ -822,7 +860,7 @@ impl CommandList<'_> {
         for (i, (&(tris, verts, opaque), &at)) in shapes.iter().zip(&addresses).enumerate() {
             let mut id = 0;
             let mut raw = None;
-            if clas {
+            if structures {
                 let vertices = at + HEADER;
                 let indices = vertices + 12 * u64::from(verts);
                 let data = indices + 12 * u64::from(tris);
@@ -868,7 +906,7 @@ impl CommandList<'_> {
         let pack = Kernels::get(&shared).pack.clone();
         self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         self.run_jobs(&pack, &jobs);
-        self.encode_builds(&builds);
+        self.encode_builds(builds);
         self.write_results(io, &addresses, &sizes);
     }
 
@@ -982,7 +1020,7 @@ impl CommandList<'_> {
         self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         self.run_jobs(&instances_state, &jobs);
         self.write_headers(&headers);
-        self.encode_builds(&builds);
+        self.encode_builds(builds);
         self.keep.push(Box::new(descriptors));
     }
 
@@ -1062,7 +1100,7 @@ impl CommandList<'_> {
         self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         self.run_jobs(&gather, &jobs);
         self.write_headers(&headers);
-        self.encode_builds(&builds);
+        self.encode_builds(builds);
         self.keep.push(Box::new(vertices));
         self.keep.push(Box::new(data));
     }

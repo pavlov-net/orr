@@ -7,8 +7,9 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
-    MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4RenderCommandEncoder, MTL4VisibilityOptions,
-    MTLBuffer, MTLComputePipelineState, MTLDevice, MTLSize, MTLStages,
+    MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4RenderCommandEncoder,
+    MTL4TimestampGranularity, MTL4VisibilityOptions, MTLBuffer, MTLComputePipelineState, MTLDevice,
+    MTLSize, MTLStages,
 };
 
 use super::memory::{Allocation, malloc};
@@ -427,13 +428,13 @@ impl<'q> CommandList<'q> {
         assert!(!self.in_pass, "pass {name} begun inside another pass");
         self.end_encoder();
         self.buffer.pushDebugGroup(&NSString::from_str(name));
-        let ring = &self.queue.shared.timestamps;
-        let seq = ring.next.fetch_add(2, Ordering::Relaxed);
-        // SAFETY: ring indices are within the heap.
-        unsafe {
-            self.buffer
-                .writeTimestampIntoHeap_atIndex(&ring.heap, TimestampRing::index(seq));
-        }
+        let seq = self
+            .queue
+            .shared
+            .timestamps
+            .next
+            .fetch_add(2, Ordering::Relaxed);
+        self.write_timestamp(seq);
         self.passes.push((name, seq));
         self.in_pass = true;
     }
@@ -441,15 +442,40 @@ impl<'q> CommandList<'q> {
     pub fn end_pass(&mut self) {
         assert!(self.in_pass, "end_pass without begin_pass");
         self.end_encoder();
-        let ring = &self.queue.shared.timestamps;
         let (_, seq) = *self.passes.last().unwrap();
-        // SAFETY: as in `begin_pass`.
-        unsafe {
-            self.buffer
-                .writeTimestampIntoHeap_atIndex(&ring.heap, TimestampRing::index(seq + 1));
-        }
+        self.write_timestamp(seq + 1);
         self.buffer.popDebugGroup();
         self.in_pass = false;
+    }
+
+    /// Writes ring entry `seq` once everything before it on the queue has finished. A
+    /// command buffer's own timestamp follows only that buffer's work, and earlier buffers
+    /// run concurrently with it; the barrier on this encoder takes in all of them. What the
+    /// caller recorded for the next encoder stays pending for it.
+    fn write_timestamp(&mut self, seq: u64) {
+        let pending = self.pending.replace((MTLStages::All, MTLStages::All));
+        // Metal drops an encoder without work, its barrier and timestamp with it.
+        let at = self.inline_bytes(&[0; 8]);
+        // SAFETY: the two halves of inline memory this list keeps.
+        unsafe {
+            self.copy(
+                GpuPtr::from_address(crate::GpuAddress(at + 4)),
+                GpuPtr::from_address(crate::GpuAddress(at)),
+                4,
+            );
+        }
+        let e = self.compute();
+        let ring = &self.queue.shared.timestamps;
+        // SAFETY: ring indices are within the heap.
+        unsafe {
+            e.writeTimestampWithGranularity_intoHeap_atIndex(
+                MTL4TimestampGranularity::Precise,
+                &ring.heap,
+                TimestampRing::index(seq),
+            );
+        }
+        self.end_encoder();
+        self.pending = pending;
     }
 }
 

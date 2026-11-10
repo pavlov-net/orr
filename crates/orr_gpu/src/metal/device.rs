@@ -194,9 +194,8 @@ impl Device {
         let set = device
             .newResidencySetWithDescriptor_error(&residency_desc)
             .map_err(|e| metal_error("newResidencySetWithDescriptor", &e))?;
-        let timelines = std::array::from_fn(|_| Timeline {
-            event: Obj(device.newSharedEvent().expect("newSharedEvent")),
-            submitted: AtomicU64::new(0),
+        let timelines = std::array::from_fn(|_| {
+            Timeline::new(Obj(device.newSharedEvent().expect("newSharedEvent")))
         });
         let caps = caps(&device, desc);
         let timestamps = TimestampRing::new(&device)?;
