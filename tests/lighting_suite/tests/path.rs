@@ -843,6 +843,59 @@ fn a_cooked_emitter_lights_the_floor_alike_by_next_event_and_bsdf_rays() {
     assert_clean();
 }
 
+/// The floor seen in a mirror takes a cooked emitter's light alike by next-event estimation and
+/// by BSDF rays, under a coat and fuzz too: the floor is then the path's second vertex, which
+/// the plain opaque shade takes, and its next-event estimate passes the winner's light through
+/// the emitter's coat and fuzz as the BSDF ray that hits the emitter sees it.
+#[test]
+fn a_coated_emitter_lights_a_floor_seen_in_a_mirror_alike_by_next_event_and_bsdf_rays() {
+    let linear = Mat3::from_rotation_x(-0.6) * Mat3::from_diagonal(Vec3::new(1.6, 1.0, 0.7));
+    const MIRROR_Z: f32 = -1.5;
+    for emitter in [EMITTER, COATED_EMITTER] {
+        let spec = Spec {
+            copies: vec![
+                at(FLOOR, Mat3::IDENTITY, Vec3::ZERO),
+                at(emitter, linear, Vec3::new(0.0, 1.0, 0.0)),
+                at(MIRROR, Mat3::IDENTITY, Vec3::new(0.0, 1.0, MIRROR_Z)),
+            ],
+            lights: Vec::new(),
+            environment: None,
+            eye: Vec3::new(2.0, 1.6, 3.0),
+            target: Vec3::new(0.3, 0.5, MIRROR_Z),
+            fov_y: 0.8,
+            focus: None,
+        };
+        // The floor point the emitter lights, where the mirror shows it.
+        let lit = Vec3::new(0.0, 0.0, 0.6);
+        let patch = pixel_of(&spec, Vec3::new(lit.x, lit.y, 2.0 * MIRROR_Z - lit.z));
+        let mut bed = Bed::with(spec);
+        let nee = patch_means(
+            &mut bed,
+            &paths(debug(LightingDebugView::NeeOnly, 2)),
+            patch,
+            16,
+            8,
+            1,
+        );
+        let bsdf = patch_means(
+            &mut bed,
+            &paths(debug(LightingDebugView::BsdfOnly, 2)),
+            patch,
+            16,
+            32,
+            2,
+        );
+        let full = patch_means(&mut bed, &paths(reference(2)), patch, 16, 8, 3);
+        assert!(
+            nee.iter().sum::<f64>() > 0.0,
+            "{emitter}: next-event lit nothing"
+        );
+        assert_same_mean(&format!("{emitter}: next-event against BSDF"), &nee, &bsdf);
+        assert_same_mean(&format!("{emitter}: full against BSDF"), &full, &bsdf);
+    }
+    assert_clean();
+}
+
 /// Green of each of the `2 half` square pixels around `at`, row by row.
 fn patch_pixels(a: &Accumulated, at: Vec2, half: u32) -> Vec<f64> {
     let w = EXTENT[0];

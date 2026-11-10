@@ -1236,14 +1236,30 @@ public Bsdf bsdf_prepare(BsdfParams p, float3 n, float3 wo, float exterior_ior =
 // `bsdf_prepare` up to the fitted coefficients: `Bsdf.finish` with `layers` completes it.
 public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterior_ior, bool adjoint, out BsdfLayers layers)
 {
+    // A pipeline whose surfaces have none of a lobe (`may`) reads its weight as the 0 it is.
+    return prepare_layers(p, n, wo, exterior_ior, adjoint, layers, may(MAY_COAT), may(MAY_FUZZ), may(MAY_FILM), may(MAY_SUBSURFACE));
+}
+
+// What the coat and fuzz of a surface of `p` pass of its emission toward `wo`
+// (`Bsdf.emission_layer`), for a surface other than the vertex a pipeline shades: every lobe
+// `p` has counts, whichever the pipeline's own vertices may have.
+public float3 bsdf_emission_layer(BsdfParams p, float3 n, float3 wo, float exterior_ior)
+{
+    BsdfLayers layers;
+    return prepare_layers(p, n, wo, exterior_ior, false, layers, true, true, true, true).emission_layer();
+}
+
+// `bsdf_prepare_layers` of a surface that has a coat, a fuzz, a thin film and subsurface only
+// where `coat`, `fuzz`, `film` and `subsurface` allow them.
+Bsdf prepare_layers(BsdfParams p, float3 n, float3 wo, float exterior_ior, bool adjoint, out BsdfLayers layers, bool coat, bool fuzz, bool film, bool subsurface)
+{
     Bsdf s;
     bool thin = (p.flags & BSDF_THIN_WALLED) != 0;
     bool collapsed = (p.flags & BSDF_COLLAPSED) != 0;
-    // A pipeline whose surfaces have none of a lobe (`may`) reads its weight as the 0 it is.
-    float coat_weight = may(MAY_COAT) && (p.flags & BSDF_COAT) != 0 ? p.coat_weight : 0.0;
-    float fuzz_weight = may(MAY_FUZZ) && (p.flags & BSDF_FUZZ) != 0 ? p.fuzz_weight : 0.0;
-    float film_weight = may(MAY_FILM) && (p.flags & BSDF_THIN_FILM) != 0 ? p.thin_film_weight : 0.0;
-    if (!may(MAY_SUBSURFACE))
+    float coat_weight = coat && (p.flags & BSDF_COAT) != 0 ? p.coat_weight : 0.0;
+    float fuzz_weight = fuzz && (p.flags & BSDF_FUZZ) != 0 ? p.fuzz_weight : 0.0;
+    float film_weight = film && (p.flags & BSDF_THIN_FILM) != 0 ? p.thin_film_weight : 0.0;
+    if (!subsurface)
         p.subsurface_weight = 0.0;
     float anisotropy = (p.flags & BSDF_ANISOTROPY) != 0 ? p.specular_anisotropy : 0.0;
 
@@ -1381,7 +1397,7 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.film_thickness = p.thin_film_thickness;
     s.film_exterior = s.inside ? specular_ior : coat_ior;
     s.film_interior = float3(s.inside ? coat_ior : specular_ior);
-    if (may(MAY_FILM) && s.fresnel_mix && s.film > 0.0)
+    if (film && s.fresnel_mix && s.film > 0.0)
     {
         float3 root = sqrt(min(p.specular_color, MAX_F0));
         s.film_interior = (1.0 + root) / (1.0 - root);

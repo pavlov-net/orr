@@ -2147,7 +2147,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
             count_ray(p);
             float mis = weight_one ? 1.0 : mis_balance(run * d.chosen.pdf, d.scatter_pdf);
             nee.traced = true;
-            nee.here = X != SHADE_EXIT && (stack_tracked(r) || (may(MAY_EMISSIVE) && may_any(MAY_COAT | MAY_FUZZ) && may2(MAY2_COATED_EMITTERS) && d.chosen.view));
+            nee.here = X != SHADE_EXIT && (stack_tracked(r) || (may(MAY_EMISSIVE) && may2(MAY2_COATED_EMITTERS) && d.chosen.view));
             nee.q = shadow_ray<CoverageFeedback<S>, M>(d, d.W * mis / run, shadow, l.x.surface.position, p.throughput, p.depth, x.feedback, counted);
             nee.d = d;
             nee.run = run;

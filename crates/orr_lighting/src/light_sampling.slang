@@ -907,7 +907,7 @@ public float3 emitter_view_layer<S : ISurface>(LightSetGpu* set, ResolvedLightSa
     SurfaceInput i = emitter_input(s, t, c.triangle, bary, c.dir);
     float offset;
     GSurface g = S.surface(i, offset);
-    return bsdf_prepare(g.bsdf, g.normal, -c.dir, exterior_ior).emission_layer();
+    return bsdf_emission_layer(g.bsdf, g.normal, -c.dir, exterior_ior);
 }
 
 // What a ray finds of the emissive list on the side of a traced triangle it hit: the entry's
