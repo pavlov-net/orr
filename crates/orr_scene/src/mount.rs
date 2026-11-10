@@ -44,12 +44,13 @@ use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler};
 use crate::medium_proxy::VolumeRef;
 use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::neural::{self, NeuralLink, Precision};
-use crate::residency::{RequestSource, ResidencyClass, Start, UnitDesc};
+use crate::residency::{Key, RequestSource, ResidencyClass, Start, UnitDesc};
 use crate::scene::{ModelCpu, ModelId, SkinShape};
 use crate::shaders::types::SubdCageGpu;
 use crate::skin;
 use crate::stream::{
-    FineInit, MeshStream, MountUnits, PageClusters, PoolTarget, StreamUnit, StreamedPage, Streaming,
+    FineInit, Hold, MeshStream, MountUnits, PageClusters, PoolTarget, StreamUnit, StreamedPage,
+    Streaming,
 };
 use crate::subd::{CageShape, CageTables, ModelCage};
 use crate::tiles::{TexStream, TileGrid};
@@ -2290,7 +2291,7 @@ struct EditIds {
     model: Option<u32>,
 }
 
-/// What an edit's landing still needs.
+/// What an edit's landing still needs: its copies, and the source's units they depend on.
 struct EditPending {
     model: ModelId,
     mount: MountId,
@@ -2300,6 +2301,10 @@ struct EditPending {
     spheres: Option<Vec<[f32; 4]>>,
     bounds: Option<Aabb>,
     cancel: Arc<AtomicBool>,
+    /// What [`Streaming::edit_holds`] keeps resident for it.
+    holds: Vec<Key>,
+    /// Its copies once they have landed.
+    loaded: Option<Box<EditLoaded>>,
 }
 
 /// A landed edit.
@@ -2322,6 +2327,8 @@ struct EditLive {
     parted: bool,
     mirror: Arc<Mirror>,
     loaded: EditLoaded,
+    /// What it keeps locked.
+    holds: Vec<Key>,
 }
 
 impl EditLive {
@@ -2763,6 +2770,9 @@ impl Mounts {
                 (spheres, edit::plan(&m.source.groups, spheres))
             }
         };
+        let holds = self
+            .streaming
+            .edit_holds(mount, mesh, &own, spheres.is_some());
         let cancel = Arc::new(AtomicBool::new(false));
         let task = EditTask {
             id: EditId(self.edits.len() as u32),
@@ -2786,6 +2796,8 @@ impl Mounts {
             spheres: spheres.map(<[_]>::to_vec),
             bounds: desc.bounds,
             cancel,
+            holds,
+            loaded: None,
         })));
         loading.send(Msg::Edit(Arc::new(task)));
         Ok(id)
@@ -2813,20 +2825,54 @@ impl Mounts {
         }
     }
 
-    /// Takes a landed edit's ids and table ranges and writes its tables.
-    pub(crate) fn land_edit(&mut self, batch: EditBatch, w: &mut Apply<'_>) {
+    /// Keeps an edit's landed copies until the units they depend on are resident.
+    pub(crate) fn land_edit(&mut self, batch: EditBatch) {
         let slot = &mut self.edits[batch.id.0 as usize];
-        let Some(EditEntry::Pending(pending)) = slot.take() else {
+        let Some(EditEntry::Pending(pending)) = slot else {
             return;
         };
-        let entry = match batch.result {
-            Err(e) => EditEntry::Failed(e),
-            Ok(loaded) => match self.place_edit(pending, loaded, w) {
-                Ok(live) => EditEntry::Live(Box::new(live)),
-                Err(e) => EditEntry::Failed(Arc::new(e)),
-            },
-        };
-        self.edits[batch.id.0 as usize] = Some(entry);
+        match batch.result {
+            Err(e) => *slot = Some(EditEntry::Failed(e)),
+            Ok(loaded) => pending.loaded = Some(Box::new(loaded)),
+        }
+    }
+
+    /// Asks for what pending edits depend on, and takes the ids and table ranges of each whose
+    /// copies have landed beside it, with it locked, and writes their tables. An edit's copies
+    /// are drawn whatever the source streams, so they are drawn only with what the traversal
+    /// reads around them.
+    pub(crate) fn step_edits(&mut self, w: &mut Apply<'_>) {
+        for i in 0..self.edits.len() {
+            let Some(EditEntry::Pending(p)) = &self.edits[i] else {
+                continue;
+            };
+            if p.loaded.is_none() {
+                self.streaming.want(&p.holds);
+                continue;
+            }
+            let entry = match self.streaming.hold(&p.holds) {
+                Hold::Waiting => continue,
+                Hold::Failed => EditEntry::Failed(Arc::new(Error::NotEditable {
+                    model: p.model,
+                    reason: "a page its copies depend on failed to load",
+                })),
+                Hold::Held => {
+                    let Some(EditEntry::Pending(mut p)) = self.edits[i].take() else {
+                        unreachable!("matched above")
+                    };
+                    let loaded = *p.loaded.take().expect("landed");
+                    let holds = p.holds.clone();
+                    match self.place_edit(p, loaded, w) {
+                        Ok(live) => EditEntry::Live(Box::new(live)),
+                        Err(e) => {
+                            self.streaming.release(&holds);
+                            EditEntry::Failed(Arc::new(e))
+                        }
+                    }
+                }
+            };
+            self.edits[i] = Some(entry);
+        }
     }
 
     fn place_edit(
@@ -3066,6 +3112,7 @@ impl Mounts {
             parted: src_gpu.animated_parts > 0,
             mirror,
             loaded,
+            holds: p.holds.clone(),
         })
     }
 
@@ -3177,6 +3224,7 @@ impl Mounts {
                 }
                 self.streaming
                     .remove_mirror(e.mount, e.source_mesh, &e.mirror);
+                self.streaming.release(&e.holds);
                 self.owners.remove(&e.model);
                 self.retired_edits.push((frame, e));
             }

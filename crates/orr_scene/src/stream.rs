@@ -77,6 +77,14 @@ pub(crate) enum PoolTarget {
     PageWindow { page: PageId, window: u32 },
 }
 
+/// What [`Streaming::hold`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hold {
+    Held,
+    Waiting,
+    Failed,
+}
+
 /// How a streamed unit loads.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum StreamUnit {
@@ -810,6 +818,75 @@ impl Streaming {
     /// The windows of rows, by page, that landed or left since the last call.
     pub(crate) fn take_window_events(&mut self) -> Vec<(PageId, u32, u64)> {
         std::mem::take(&mut self.window_events)
+    }
+
+    /// The units an edit of mesh `mesh` of `mount` with copies of pages `own` keeps resident
+    /// while it is drawn, since its copies are: the node pages over the copies' groups' leaves
+    /// and, with `coarser`, the pages holding the coarser clusters those groups simplify into,
+    /// each with what it depends on. None where the mesh's pages do not stream.
+    pub(crate) fn edit_holds(
+        &self,
+        mount: MountId,
+        mesh: u32,
+        own: &[u32],
+        coarser: bool,
+    ) -> Vec<Key> {
+        let Some(m) = self.mounts.get(&mount) else {
+            return Vec::new();
+        };
+        if m.stream_of_mesh(mesh).is_none() {
+            return Vec::new();
+        }
+        let pages = &m.mesh_pages[mesh as usize];
+        let own: FxHashSet<u32> = own.iter().map(|&q| pages[q as usize]).collect();
+        let mut held: Vec<u32> = own
+            .iter()
+            .flat_map(|&unit| self.residency.deps(Key { mount, unit }))
+            .copied()
+            .filter(|d| !own.contains(d) && (coarser || !pages.contains(d)))
+            .collect();
+        held.sort_unstable();
+        held.dedup();
+        held.into_iter().map(|unit| Key { mount, unit }).collect()
+    }
+
+    /// Asks for those of `keys` that are not resident for the next step; returns whether
+    /// there were any.
+    pub(crate) fn want(&mut self, keys: &[Key]) -> bool {
+        let p = Priority {
+            error: 0.0,
+            cell_distance: 0,
+        };
+        let mut waiting = false;
+        for &k in keys {
+            if !self.residency.resident(k) {
+                self.residency.request(k, p, RequestSource::Hints);
+                waiting = true;
+            }
+        }
+        waiting
+    }
+
+    /// Locks `keys` once they are all resident, and asks for them until then. A failed unit
+    /// never loads.
+    pub(crate) fn hold(&mut self, keys: &[Key]) -> Hold {
+        if keys.iter().any(|&k| self.residency.failed(k)) {
+            return Hold::Failed;
+        }
+        if self.want(keys) {
+            return Hold::Waiting;
+        }
+        for &k in keys {
+            self.residency.lock(k);
+        }
+        Hold::Held
+    }
+
+    /// Unlocks what [`Self::hold`] locked.
+    pub(crate) fn release(&mut self, keys: &[Key]) {
+        for &k in keys {
+            self.residency.unlock(k);
+        }
     }
 
     /// Requests unit `unit` of `mount` with hint priority for the next step.

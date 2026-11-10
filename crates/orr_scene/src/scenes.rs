@@ -1138,8 +1138,9 @@ impl Scenes {
         }
         for batch in self.loading.take_edits(&self.device) {
             loading_points.extend(batch.point);
-            core.mounts.land_edit(batch, &mut apply);
+            core.mounts.land_edit(batch);
         }
+        core.mounts.step_edits(&mut apply);
         loading_points.extend(core.mounts.streaming.step(
             frame,
             settled,

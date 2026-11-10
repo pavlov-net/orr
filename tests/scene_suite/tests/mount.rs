@@ -3810,9 +3810,52 @@ fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
         held.len() < info.pages.len(),
         "the edit shares untouched pages"
     );
+    // The source's pages the copies depend on, and what they depend on.
+    let deps = |p: usize| {
+        let d = info.pages[p].deps;
+        &info.page_deps[d.first as usize..][..d.count as usize]
+    };
+    let mut needed: Vec<usize> = Vec::new();
+    let mut todo: Vec<usize> = held.clone();
+    while let Some(p) = todo.pop() {
+        for &d in deps(p) {
+            let d = d as usize;
+            if !held.contains(&d) && !needed.contains(&d) {
+                needed.push(d);
+                todo.push(d);
+            }
+        }
+    }
+    assert!(
+        needed.iter().any(|&p| p >= pinned),
+        "the copies depend on streamed pages"
+    );
+    // Every page of the edit's table is drawn with the coarser pages it depends on.
+    let whole = |scenes: &Scenes| {
+        let (_, own) = mesh_of(scenes, &gpu, model);
+        for p in (0..own.len()).filter(|&p| own[p] != 0) {
+            assert!(
+                deps(p).iter().all(|&d| own[d as usize] != 0),
+                "page {p} of the edit without the pages it depends on"
+            );
+        }
+    };
+    whole(&scenes);
+    let skip: Vec<usize> = held.iter().chain(&needed).copied().collect();
+    // What the source keeps for them: those pages and the pages they depend on.
+    let mut kept = needed.clone();
+    let mut todo = needed.clone();
+    while let Some(p) = todo.pop() {
+        for &d in deps(p) {
+            if !kept.contains(&(d as usize)) {
+                kept.push(d as usize);
+                todo.push(d as usize);
+            }
+        }
+    }
     // The source's pages land: the edit's table follows them.
     let start = Instant::now();
-    while streamed(&scenes, &held) == 0 {
+    while streamed(&scenes, &skip) == 0 {
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "the source's pages never landed"
@@ -3820,12 +3863,13 @@ fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
         scenes.prefetch(source, 0);
         streamed_frame(&mut scenes, scene, |_| {});
         assert_eq!(copies(&scenes), held, "a landing reached the edit's table");
+        whole(&scenes);
     }
-    // Two other meshes' pages, more than the budget holds, push them out after their hold,
-    // those the edit reads its copies of in place of them too: the edit keeps its copies and
-    // its shared entries go null with the source's.
+    // Two other meshes' pages, more than the budget holds, push the rest out after their
+    // hold, those the edit reads its copies of in place of them too: the edit keeps its
+    // copies and the pages they depend on, and its shared entries go null with the source's.
     let start = Instant::now();
-    while streamed(&scenes, &[]) > 0 {
+    while streamed(&scenes, &kept) > 0 {
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "the source's pages never left"
@@ -3839,6 +3883,7 @@ fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
             held,
             "an eviction reached the edit's table"
         );
+        whole(&scenes);
     }
     scenes.destroy_edit(edit);
     assert_eq!(scenes.residency().failed, 0);

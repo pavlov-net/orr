@@ -819,6 +819,11 @@ impl Residency {
         self.unit(k).is_some_and(|u| u.state == State::Resident)
     }
 
+    /// Whether `k`'s load failed, so that it never loads.
+    pub(crate) fn failed(&self, k: Key) -> bool {
+        self.unit(k).is_some_and(|u| u.state == State::Failed)
+    }
+
     /// The units of `k`'s mount that `k` depends on; none once its mount is gone.
     pub(crate) fn deps(&self, k: Key) -> &[u32] {
         self.unit(k).map_or(&[], |u| &u.deps)
