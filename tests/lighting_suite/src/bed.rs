@@ -365,9 +365,10 @@ pub const PRISM_IOR: f32 = 1.6;
 pub const PRISM_ABBE: f32 = 20.0;
 pub const PRISM_HALF_HEIGHT: f32 = 1.0;
 /// A white emitter of [`EMITTER_LUMINANCE`] facing +z: a strip 2 [`LINE_HALF_WIDTH`] wide
-/// and 2 [`LINE_HALF_HEIGHT`] tall.
+/// and 2 [`LINE_HALF_HEIGHT`] tall, both on the cook's 2^-11 m position grid, so the cooked
+/// strip has the size a CPU model takes from them.
 pub const LINE: &str = "line";
-pub const LINE_HALF_WIDTH: f32 = 0.01;
+pub const LINE_HALF_WIDTH: f32 = 20.0 / 2048.0;
 pub const LINE_HALF_HEIGHT: f32 = 2.0;
 
 /// The corners of [`PRISM`]'s cross section in the xz plane: an equilateral triangle of
