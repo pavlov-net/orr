@@ -328,14 +328,16 @@ impl<T: Send + 'static> Late<T> {
             return Some(p);
         }
         let mut job = self.job.lock().unwrap();
-        let result = job.as_ref()?.1.take()?;
-        *job = None;
-        self.settle(result.unwrap_or_else(|message| {
-            Err(Error::CompilePanicked {
-                kernel: self.name,
-                message,
-            })
-        }));
+        if let Some(result) = job.as_ref().and_then(|(_, queued)| queued.take()) {
+            *job = None;
+            self.settle(result.unwrap_or_else(|message| {
+                Err(Error::CompilePanicked {
+                    kernel: self.name,
+                    message,
+                })
+            }));
+        }
+        // Another thread may have settled it while this one waited for the lock.
         self.ready.get()
     }
 
