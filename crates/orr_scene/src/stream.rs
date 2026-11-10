@@ -1261,8 +1261,25 @@ impl Streaming {
             self.note_failures(&batch.loads);
             self.residency
                 .note_read(batch.loads.iter().map(|l| l.read).sum());
-            for l in batch.loads {
-                self.landed(l, &clas, frame, w)?;
+            // A load lands after the loads of its batch it depends on.
+            let mut loads = batch.loads;
+            while !loads.is_empty() {
+                let pending: FxHashSet<Key> = loads
+                    .iter()
+                    .filter_map(|l| match l.what {
+                        What::Unit(k) => Some(k),
+                        What::Blob(_) => None,
+                    })
+                    .collect();
+                let (ready, later): (Vec<Landed>, Vec<Landed>) =
+                    loads.into_iter().partition(|l| match l.what {
+                        What::Unit(k) => !self.depends_on(k, &pending),
+                        What::Blob(_) => true,
+                    });
+                for l in ready {
+                    self.landed(l, &clas, frame, w)?;
+                }
+                loads = later;
             }
         }
         // A carried unbind's key left `unbinding` when its failed task was sent, so a later
@@ -1569,6 +1586,16 @@ impl Streaming {
 
     /// Tells the residency manager how the load of `key` ended: resident, released to load
     /// again once memory frees, or failed. False when it isn't resident or its mount is gone.
+    /// Whether `k` depends on one of `keys`.
+    fn depends_on(&self, k: Key, keys: &FxHashSet<Key>) -> bool {
+        self.residency.deps(k).iter().any(|&unit| {
+            keys.contains(&Key {
+                mount: k.mount,
+                unit,
+            })
+        })
+    }
+
     fn unit_landed(&mut self, key: Key, result: &Result<(), Arc<Error>>, frame: u64) -> bool {
         match result {
             Ok(()) => self.residency.landed(key, true, frame),

@@ -7,8 +7,8 @@
 //! references are locked. Every other resident unit can be evicted once it has gone
 //! [`HOLD_FRAMES`] frames without a request or touch, least recently touched first. A unit
 //! loads only with its dependencies (coarser pages, a hierarchy page's parent, a tile's
-//! coarser tile) resident or loading in the same plan, and a unit stays while a resident or
-//! loading unit depends on it. Loads outside any mount's units (user blobs) count against
+//! coarser tile) resident or loading in the same plan, lands only once they have, and stays
+//! while a resident or loading unit depends on it. Loads outside any mount's units (user blobs) count against
 //! their class budget and the in-flight limit only.
 //!
 //! Each class lists the units that can be evicted, and no others, with the bytes of those
@@ -819,6 +819,11 @@ impl Residency {
         self.unit(k).is_some_and(|u| u.state == State::Resident)
     }
 
+    /// The units of `k`'s mount that `k` depends on; none once its mount is gone.
+    pub(crate) fn deps(&self, k: Key) -> &[u32] {
+        self.unit(k).map_or(&[], |u| &u.deps)
+    }
+
     /// Takes back the loads of this step's plan, `loads` in plan order, that `held` holds
     /// back, and those depending on one taken back, as [`Residency::cancel`] does; returns
     /// the rest in order. `held` sees, in order, each load none of whose dependencies went
@@ -947,11 +952,22 @@ impl Residency {
     }
 
     /// The loading side finished `k`: resident at `frame` when `ok`, failed otherwise.
-    /// False when its mount is gone, so the caller frees what was loaded.
+    /// False when its mount is gone, or when a unit it depends on failed or was taken back
+    /// and `k` is absent again, so the caller frees what was loaded. Its dependencies of the
+    /// same batch land first.
     pub(crate) fn landed(&mut self, k: Key, ok: bool, frame: u64) -> bool {
         let Some(units) = self.mounts.get_mut(&k.mount) else {
             return false;
         };
+        let deps = &units[k.unit as usize].deps;
+        if ok
+            && deps
+                .iter()
+                .any(|&d| units[d as usize].state != State::Resident)
+        {
+            self.release_load(k);
+            return false;
+        }
         let u = &mut units[k.unit as usize];
         debug_assert_eq!(u.state, State::Loading);
         let c = u.class as usize;
