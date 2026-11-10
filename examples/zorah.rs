@@ -468,13 +468,14 @@ impl Readout {
         let rate = |n: f64| n / self.seconds;
         let dropped = |source| r.dropped_from(source);
         self.text = format!(
-            "{:.1} fps  {:.2} ms\nmesh pages {}\nhierarchy {}\ntextures {}\ninstance pages {}\nCLAS {:.0} MiB, {:.0} retries/s, range full {} times, cluster ids full {} times\nread {:.0} MiB/s, {:.0} loads/s landed\n{} loads  {} evictions  {} failed  {} out of memory  {} pages over budget\ndropped: {} traversal, {} finer cuts, {} textures, {} instance pages, {} hints\n{} waiting  longest closure {}\nfeedback lost: {} requests, {} texture raises",
+            "{:.1} fps  {:.2} ms\nmesh pages {}\nhierarchy {}\ntextures {}\ninstance pages {}\nCLAS {:.0} / {:.0} MiB used, {:.0} retries/s, range full {} times, cluster ids full {} times\nread {:.0} MiB/s, {:.0} loads/s landed\n{} loads  {} evictions  {} failed  {} out of memory  {} pages over budget\ndropped: {} traversal, {} finer cuts, {} textures, {} instance pages, {} hints\n{} waiting  longest closure {}\nfeedback lost: {} requests, {} texture raises",
             f64::from(self.frames) / self.seconds,
             self.seconds * 1000.0 / f64::from(self.frames),
             class(ResidencyClass::MeshPages),
             class(ResidencyClass::HierarchyPages),
             class(ResidencyClass::Textures),
             class(ResidencyClass::InstancePages),
+            mib(r.clas_pool_used_bytes),
             mib(r.clas_pool_bytes),
             rate(f64::from(r.clas_retries - s.clas_retries)),
             r.clas_range_full - s.clas_range_full,
