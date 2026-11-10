@@ -211,7 +211,13 @@ public struct PathRoot
     public uint slice_base;
     public uint slice_count;
     public uint features;           // FEATURE_* (path/stages.slang)
-    public uint round;              // the rounds this root runs: `round_now`, `round_pass`, `round_next` (path/stages.slang)
+    // The round a stage runs in, the first round of its pass, where every path of the pass
+    // finishes, and the first round of the next pass.
+    public uint round;
+    public uint round_first;
+    public uint round_next;
+    public uint _pad0;
+    public uint _pad1;
 }
 
 // A pixel's front layer over the G-buffer: the top 24 bits of the reverse-Z device depth, so

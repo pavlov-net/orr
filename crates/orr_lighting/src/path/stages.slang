@@ -78,11 +78,9 @@ public static const uint FEATURE_RAY_SHADES = 1 << 3;
 public static const uint FEATURE_INTERIORS = 1 << 4;
 public static const uint FEATURE_STACK = 1 << 5;
 
-// `PathRoot.round`: the round a stage runs in, the first round of its pass, where every path of
-// the pass finishes, and the first round of the next pass.
-uint round_now(PathRoot r) { return r.round & 0x3ff; }
-uint round_pass(PathRoot r) { return (r.round >> 10) & 0x3ff; }
-uint round_next(PathRoot r) { return (r.round >> 20) & 0x3ff; }
+uint round_now(PathRoot r) { return r.round; }
+uint round_pass(PathRoot r) { return r.round_first; }
+uint round_next(PathRoot r) { return r.round_next; }
 
 // Whether paths of `r` track plane stacks: the light set holds a stack entry and a directional
 // light, the one light a stack bends. Without either no stack changes what a path gathers.
@@ -236,7 +234,7 @@ struct PathShadowRay
     float3 e;                       // the estimate, unshadowed
     uint light;                     // the winner's feedback id, NO_LIGHT for a directional winner
     float3 start;                   // the vertex's point
-    uint flags;                     // SHADOW_*, and the vertex's depth from SHADOW_DEPTH_SHIFT
+    uint flags;                     // SHADOW_*, and from SHADOW_DEPTH_SHIFT the vertex's depth, which is below the rounds a root may ask for
     float3 origin;
     float t_max;
     float3 dir;
@@ -269,7 +267,7 @@ struct WalkEntry
 // track plane stacks (FEATURE_STACK) and may split by wavelength (FEATURE_DISPERSION). A slot
 // holds only the parts its root's features name, which every pipeline reads from the root.
 static const uint FIXED_WORDS = 3;
-static const uint LOOP_WORDS = 6;
+static const uint LOOP_WORDS = 7;
 static const uint PENDING_WORDS = 5;
 static const uint RAY_WORDS = 5;
 static const uint INTERIOR_WORDS = 6;
@@ -356,8 +354,11 @@ struct StoredFixed
 struct StoredLoop
 {
     Sampler rng;
-    uint counters;                  // iteration, depth and opaque, 10 bits each: a path's rounds fit 10
-    uint more;                      // layers and chains, 10 bits each
+    uint iteration;
+    uint depth;
+    uint opaque;
+    uint layers;
+    uint chains;
     uint flags;
     uint rays;
     float3 throughput;
@@ -448,11 +449,11 @@ PathLoop load_loop(PathRoot r, uint slot)
     StoredLoop v = load_words<StoredLoop, LOOP_WORDS>(st.words, st.capacity, LOOP_FIRST, slot);
     PathLoop p;
     p.rng = v.rng;
-    p.iteration = v.counters & 0x3ff;
-    p.depth = (v.counters >> 10) & 0x3ff;
-    p.opaque = (v.counters >> 20) & 0x3ff;
-    p.layers = v.more & 0x3ff;
-    p.chains = (v.more >> 10) & 0x3ff;
+    p.iteration = v.iteration;
+    p.depth = v.depth;
+    p.opaque = v.opaque;
+    p.layers = v.layers;
+    p.chains = v.chains;
     p.flags = v.flags;
     p.rays = v.rays;
     p.throughput = v.throughput;
@@ -480,8 +481,11 @@ void store_loop(PathRoot r, uint slot, PathLoop p)
     PathStages* st = r.stages;
     StoredLoop v;
     v.rng = p.rng;
-    v.counters = p.iteration | (p.depth << 10) | (p.opaque << 20);
-    v.more = p.layers | (p.chains << 10);
+    v.iteration = p.iteration;
+    v.depth = p.depth;
+    v.opaque = p.opaque;
+    v.layers = p.layers;
+    v.chains = p.chains;
     v.flags = p.flags;
     v.rays = p.rays;
     v.throughput = p.throughput;
@@ -503,9 +507,8 @@ void store_loop(PathRoot r, uint slot, PathLoop p)
 uint pending_key(PathRoot r, uint slot)
 {
     static_assert(sizeof(Sampler) == 12, "StoredLoop.flags moved");
-    // `flags` follows the sampler and two words of counters: the second scalar of the loop's
-    // second word.
-    return r.stages.words[(LOOP_FIRST + 1) * r.stages.capacity + slot].y >> LOOP_KEY_SHIFT;
+    // `flags` follows the sampler and five counters: the first scalar of the loop's third word.
+    return r.stages.words[(LOOP_FIRST + 2) * r.stages.capacity + slot].x >> LOOP_KEY_SHIFT;
 }
 
 PathPending load_pending(PathRoot r, uint slot)

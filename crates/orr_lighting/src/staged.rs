@@ -30,7 +30,7 @@ const STAGE_QUEUES: u64 = 6;
 /// may lie in an interior, track plane stacks and may split by wavelength; a deferred shadow
 /// ray, and the interiors its vertex arrived with; the record, and an update path's; and a
 /// walk's entry.
-const BASE_WORDS: u64 = 19;
+const BASE_WORDS: u64 = 20;
 const INTERIOR_PARTS: u64 = 11;
 const STACK_PART: u64 = 5;
 const SPECTRAL_PART: u64 = 5;
@@ -44,9 +44,10 @@ const STAGE_GROUP: u32 = 32;
 /// Path slots of a view at most, which a stage covers in the 65535 workgroups a dispatch may
 /// have: a source with more paths runs them in slices.
 const MAX_SLOTS: u32 = 65535 * STAGE_GROUP;
-/// Rounds of stages a slice may take over all its passes, which `PathRoot.round` holds in 10
-/// bits; the queues hold their state for one more, which the last round's stages append to.
-const MAX_ROUNDS: u32 = 1023;
+/// Rounds a source's paths may ask for at most: a deferred shadow ray keeps its vertex's depth
+/// in the 24 bits beside its flags (`SHADOW_DEPTH_SHIFT`). The queues of that many rounds take
+/// more memory than a device has, so no root gets there.
+pub(crate) const MAX_ROUNDS: u32 = 1 << 24;
 
 /// Rounds a pass of a view's or background layer's paths runs before the tail stage takes the
 /// paths still running. More rounds keep more paths in the stages that run them together; each
@@ -769,11 +770,10 @@ impl StagedKernels {
         passes: u32,
         stage_passes: bool,
     ) -> Result<(), Error> {
-        if rounds * passes > MAX_ROUNDS {
-            return Err(Error::Settings(
-                "the bounces and dielectric depth give paths more rounds than MAX_ROUNDS",
-            ));
-        }
+        assert!(
+            memory.rows > rounds * passes,
+            "the paths' memory holds fewer rounds than they take"
+        );
         let may = may | source.may();
         assert!(
             memory.parts.holds(StateParts::of(root.features)),
@@ -802,7 +802,7 @@ impl StagedKernels {
         while base < items {
             root.slice_base = base;
             root.slice_count = (items - base).min(memory.slice(source));
-            root.round = round_word(0, 0, rounds);
+            (root.round, root.round_first, root.round_next) = (0, 0, rounds);
             base += root.slice_count;
             list.barrier(
                 Stages::COMPUTE | Stages::RAY,
@@ -810,7 +810,7 @@ impl StagedKernels {
                 Hazards::empty(),
             );
             stage_pass(list, stage_passes, source, 0);
-            let queues = (MAX_ROUNDS + 1) * STAGE_QUEUES as u32;
+            let queues = (rounds * passes + 1) * STAGE_QUEUES as u32;
             list.dispatch_inline(
                 pipeline(Stage::Reset).compute(),
                 &root,
@@ -825,7 +825,8 @@ impl StagedKernels {
             for pass in 0..passes {
                 let first = pass * rounds;
                 for round in first..first + run {
-                    root.round = round_word(round, first, first + rounds);
+                    (root.round, root.round_first, root.round_next) =
+                        (round, first, first + rounds);
                     barrier(list);
                     stage_pass(list, stage_passes, source, 1);
                     list.dispatch_indirect_inline(
@@ -865,7 +866,8 @@ impl StagedKernels {
                     }
                 }
                 if let Some(tail) = tail {
-                    root.round = round_word(first + run, first, first + rounds);
+                    (root.round, root.round_first, root.round_next) =
+                        (first + run, first, first + rounds);
                     barrier(list);
                     stage_pass(list, stage_passes, source, 4);
                     // Scratch: `ORR_SCRATCH_TAIL_DIRECT` runs it over every slot of the slice,
@@ -976,12 +978,6 @@ fn stage_pass(list: &mut CommandList<'_>, on: bool, source: Source, stage: usize
     }
 }
 
-/// `PathRoot.round` of a stage in `round` of the pass whose first round is `first`, before the
-/// pass that starts at round `next`.
-fn round_word(round: u32, first: u32, next: u32) -> u32 {
-    round | first << 10 | next << 20
-}
-
 /// A barrier between stages: the next reads the state, queues and workgroup counts the last
 /// wrote.
 fn barrier(list: &mut CommandList<'_>) {
@@ -1042,6 +1038,8 @@ impl StateParts {
 /// The memory a view's staged paths keep between stages, for `capacity` paths at once.
 pub(crate) struct StagedMemory {
     capacity: u32,
+    /// Rounds its queues hold: one more than a source's paths may take over their passes.
+    rows: u32,
     parts: StateParts,
     /// The pipelines the view's last frame recorded, kept until its next: a set let go
     /// meanwhile outlives the commands that run it.
@@ -1057,15 +1055,20 @@ pub(crate) struct StagedMemory {
 
 impl StagedMemory {
     /// Slots for the paths of a view of `pixels` pixels, at most [`MAX_SLOTS`], each with
-    /// `parts`.
-    pub(crate) fn new(device: &Device, pixels: u32, parts: StateParts) -> Result<Self, Error> {
+    /// `parts`, and queues for `rows` rounds.
+    pub(crate) fn new(
+        device: &Device,
+        pixels: u32,
+        parts: StateParts,
+        rows: u32,
+    ) -> Result<Self, Error> {
         let capacity = pixels.clamp(1, MAX_SLOTS);
         let n = u64::from(capacity);
         let words =
             |count: u64, name| device.gpu_malloc::<[u32; 4]>(MemoryKind::DeviceLocal, count, name);
         let queues = device.gpu_malloc::<StageQueue>(
             MemoryKind::DeviceLocal,
-            u64::from(MAX_ROUNDS + 1) * STAGE_QUEUES,
+            u64::from(rows) * STAGE_QUEUES,
             "staged path queues",
         )?;
         let lists = device.gpu_malloc::<u32>(
@@ -1092,7 +1095,7 @@ impl StagedMemory {
         let mut header = device.gpu_malloc::<PathStages>(MemoryKind::Upload, 1, "staged paths")?;
         header.as_mut_slice().expect("mapped")[0] = PathStages {
             capacity,
-            rounds: MAX_ROUNDS + 1,
+            rounds: rows,
             queues: queues.gpu(),
             lists: lists.gpu(),
             words: state.gpu(),
@@ -1102,6 +1105,7 @@ impl StagedMemory {
         };
         Ok(Self {
             capacity,
+            rows,
             parts,
             held: Mutex::new(Vec::new()),
             header,
@@ -1123,9 +1127,10 @@ impl StagedMemory {
         self.held.lock().unwrap().push(Arc::clone(set));
     }
 
-    /// Whether it holds the slots a view of `pixels` pixels asks for, each with `parts`.
-    pub(crate) fn fits(&self, pixels: u32, parts: StateParts) -> bool {
-        self.capacity == pixels.clamp(1, MAX_SLOTS) && self.parts.holds(parts)
+    /// Whether it holds the slots a view of `pixels` pixels asks for, each with `parts`, and
+    /// queues for `rows` rounds.
+    pub(crate) fn fits(&self, pixels: u32, parts: StateParts, rows: u32) -> bool {
+        self.capacity == pixels.clamp(1, MAX_SLOTS) && self.parts.holds(parts) && self.rows >= rows
     }
 
     /// The paths of `source` a slice holds: an update path's record takes the words of

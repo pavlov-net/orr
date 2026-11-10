@@ -28,11 +28,11 @@ use crate::shaders::types::{
 };
 use crate::shaders::world_cache::update;
 use crate::staged::{
-    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_STACK, FEATURE_WALK, Late, MAY_ALL, MAY_CACHE,
-    MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION, MAY_EMISSIVE,
-    MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL,
-    MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_REFERENCE, MAY_STACK, MAY_SUBSURFACE, MAY_WALK, Source,
-    Stage, StagedKernels, StagedMemory, StateParts,
+    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_STACK, FEATURE_WALK, Late, MAX_ROUNDS, MAY_ALL,
+    MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION,
+    MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS,
+    MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_REFERENCE, MAY_STACK, MAY_SUBSURFACE, MAY_WALK,
+    Source, Stage, StagedKernels, StagedMemory, StateParts,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::{
@@ -1097,16 +1097,29 @@ impl SupportKernels {
     }
 }
 
-/// The rounds of the staged loop a path under `root` may take: one per iteration of `trace_path`
-/// (`path_iterations`), which traces at most once, and one for the vertex its start leaves to
-/// shade.
-fn path_rounds(root: &PathRoot) -> u32 {
-    let walks = if root.dielectric_flags & DIELECTRIC_REFERENCE != 0 {
-        root.max_bounces + 1
+/// The rounds of the staged loop a path of `max_bounces` bounces and `dielectric_depth` layers
+/// may take: one per iteration of `trace_path` (`path_iterations`), which traces at most once,
+/// and one for the vertex its start leaves to shade.
+fn rounds(max_bounces: u32, dielectric_depth: u32, reference: bool) -> Result<u32, Error> {
+    let walks = if reference {
+        u64::from(max_bounces) + 1
     } else {
         1
     };
-    root.max_bounces + 3 + walks + root.dielectric_depth + 1
+    let rounds = u64::from(max_bounces) + 3 + walks + u64::from(dielectric_depth) + 1;
+    if rounds > u64::from(MAX_ROUNDS) {
+        return Err(Error::Settings(
+            "the bounces and dielectric depth give paths more rounds than their queues can hold",
+        ));
+    }
+    Ok(rounds as u32)
+}
+
+/// [`rounds`] of a path under `root`.
+fn path_rounds(root: &PathRoot) -> u32 {
+    let reference = root.dielectric_flags & DIELECTRIC_REFERENCE != 0;
+    rounds(root.max_bounces, root.dielectric_depth, reference)
+        .expect("record_paths checked the view's and the photons' rounds")
 }
 
 /// Whether path kernels run as ray dispatches on `device`.
@@ -1946,9 +1959,23 @@ impl LightingKernels {
         if matches!(self.paths, PathKernels::Staged(_)) {
             let pixels = view.extent[0] * view.extent[1];
             let parts = StateParts::of(features);
-            if !view.staged.as_ref().is_some_and(|m| m.fits(pixels, parts)) {
+            // The queues' rounds: a view's passes or a photon's bounces, and one more that the
+            // last round's stages append to.
+            let depth = dielectric_depth(lighting);
+            let max_bounces = scratch_u32("ORR_SCRATCH_BOUNCES", lighting.max_bounces);
+            let passes = if pass.frosted_glass { 2 } else { 1 };
+            let rows = (rounds(max_bounces, depth, reference)? * passes).max(rounds(
+                PHOTON_BOUNCES,
+                depth,
+                reference,
+            )?) + 1;
+            if !view
+                .staged
+                .as_ref()
+                .is_some_and(|m| m.fits(pixels, parts, rows))
+            {
                 view.staged = None;
-                view.staged = Some(StagedMemory::new(&view.device, pixels, parts)?);
+                view.staged = Some(StagedMemory::new(&view.device, pixels, parts, rows)?);
             }
             view.staged.as_ref().expect("made above").begin_frame();
         }
@@ -2012,6 +2039,10 @@ impl LightingKernels {
             slice_count: 0,
             features,
             round: 0,
+            round_first: 0,
+            round_next: 0,
+            _pad0: 0,
+            _pad1: 0,
         };
         // Asked for together, the sources that run in the stages share their pipelines.
         let needs = PathNeeds {
