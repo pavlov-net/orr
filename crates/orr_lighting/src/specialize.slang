@@ -53,6 +53,20 @@ public static const uint MAY_FILM = 1 << 17;
 public static const uint MAY_SUBSURFACE = 1 << 18;
 public static const uint MAY_LOBES = MAY_COAT | MAY_FUZZ | MAY_FILM | MAY_SUBSURFACE;
 
+// A path may lie in an interior: a material bounds one, or the view names the eye's.
+public static const uint MAY_INTERIORS = 1 << 19;
+// A ray may meet a dielectric or a presence layer: geometry of those classes.
+public static const uint MAY_LAYERS = 1 << 20;
+// A ray may meet a triangle that is not opaque in traversal, particles apart, so its candidate
+// handler runs.
+public static const uint MAY_COVERAGE = 1 << 21;
+// The light set may hold a particle entry, a sphere or rect light, a directional light; a
+// surface may emit.
+public static const uint MAY_PARTICLES = 1 << 22;
+public static const uint MAY_LOCAL_LIGHTS = 1 << 23;
+public static const uint MAY_DIRECTIONAL = 1 << 24;
+public static const uint MAY_EMISSIVE = 1 << 25;
+
 // Whether any of `bits` may be met.
 public bool may_any(uint bits)
 {

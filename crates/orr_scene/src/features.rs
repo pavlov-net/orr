@@ -39,6 +39,20 @@ impl SceneFeatures {
     pub const FUZZ: Self = Self(1 << 9);
     pub const THIN_FILM: Self = Self(1 << 10);
     pub const SUBSURFACE: Self = Self(1 << 11);
+    /// Geometry may have the class of a dielectric or a presence layer: a material that gave
+    /// a mesh its class was one, or a producer entry is.
+    pub const LAYERS: Self = Self(1 << 12);
+    /// Geometry may hold triangles that are not opaque in traversal, particles apart: a
+    /// material that a mesh was built with tested alpha, was a presence layer or a thin
+    /// dielectric, or a producer entry is not opaque.
+    pub const COVERAGE: Self = Self(1 << 13);
+    /// The scene holds a particle or smoke entry.
+    pub const PARTICLES: Self = Self(1 << 14);
+    /// A material emits.
+    pub const EMISSIVE: Self = Self(1 << 15);
+    /// What a mesh keeps from the material it was built with, whatever the record holds now:
+    /// once a record has shown one of these, the table keeps it.
+    const BUILT: Self = Self(Self::LAYERS.0 | Self::COVERAGE.0);
     /// Every bit a material record sets.
     const MATERIAL: Self = Self(
         Self::WALKING.0
@@ -48,7 +62,10 @@ impl SceneFeatures {
             | Self::COAT.0
             | Self::FUZZ.0
             | Self::THIN_FILM.0
-            | Self::SUBSURFACE.0,
+            | Self::SUBSURFACE.0
+            | Self::LAYERS.0
+            | Self::COVERAGE.0
+            | Self::EMISSIVE.0,
     );
 
     pub fn contains(self, other: Self) -> bool {
@@ -79,6 +96,13 @@ impl SceneFeatures {
             (m.fuzz_weight > 0.0, Self::FUZZ),
             (m.thin_film_weight > 0.0, Self::THIN_FILM),
             (m.subsurface_weight > 0.0, Self::SUBSURFACE),
+            (m.flags & (f::DIELECTRIC | f::PRESENCE) != 0, Self::LAYERS),
+            (
+                m.flags & (f::ALPHA_TESTED | f::PRESENCE) != 0
+                    || m.flags & (f::DIELECTRIC | f::THIN_WALLED) == f::DIELECTRIC | f::THIN_WALLED,
+                Self::COVERAGE,
+            ),
+            (m.emission_luminance != 0.0, Self::EMISSIVE),
         ] {
             if on {
                 out |= bit;
@@ -106,6 +130,8 @@ impl BitOrAssign for SceneFeatures {
 pub(crate) struct MaterialFeatures {
     held: HashMap<u32, u32>,
     counts: [u32; 32],
+    /// The [`SceneFeatures::BUILT`] features any record has held.
+    built: u32,
 }
 
 impl MaterialFeatures {
@@ -117,6 +143,7 @@ impl MaterialFeatures {
             self.held.insert(id, features.0)
         }
         .unwrap_or(0);
+        self.built |= features.0 & SceneFeatures::BUILT.0;
         for (bit, count) in self.counts.iter_mut().enumerate() {
             let mask = 1 << bit;
             *count = *count + u32::from(features.0 & mask != 0) - u32::from(was & mask != 0);
@@ -131,6 +158,6 @@ impl MaterialFeatures {
                 out |= 1 << bit;
             }
         }
-        SceneFeatures(out)
+        SceneFeatures(out | self.built)
     }
 }

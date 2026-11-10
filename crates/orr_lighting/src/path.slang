@@ -54,6 +54,7 @@ import orr_lighting.interiors;
 import orr_lighting.froxels;
 import orr_lighting.spectrum;
 import orr_lighting.caustics;
+import orr_lighting.specialize;
 
 // `PathRoot.mode`: what the radiance image holds.
 public static const uint PATH_FULL = 0;
@@ -890,7 +891,7 @@ public bool interior_segment(InteriorMedium m, float t, bool scatter, inout Samp
 
 public bool is_layer(Hit h)
 {
-    return h.hit && (h.class_id == CLASS_DIELECTRIC || h.class_id == CLASS_PRESENCE);
+    return may(MAY_LAYERS) && h.hit && (h.class_id == CLASS_DIELECTRIC || h.class_id == CLASS_PRESENCE);
 }
 
 // Shadow rays of a vertex: it arrived with interior list `arrived`, on the surface of material

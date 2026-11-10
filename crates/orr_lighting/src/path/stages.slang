@@ -315,14 +315,24 @@ PathFixed load_fixed(PathStages* st, uint slot) { return load_words<PathFixed, F
 PathLoop load_loop(PathStages* st, uint slot) { return load_words<PathLoop, LOOP_WORDS>(st.words, st.capacity, LOOP_FIRST, slot); }
 PathPending load_pending(PathStages* st, uint slot) { return load_words<PathPending, PENDING_WORDS>(st.words, st.capacity, PENDING_FIRST, slot); }
 LayerRay load_ray(PathStages* st, uint slot) { return load_words<LayerRay, RAY_WORDS>(st.words, st.capacity, RAY_FIRST, slot); }
-Interior load_interior(PathStages* st, uint slot) { return load_words<Interior, INTERIOR_WORDS>(st.words, st.capacity, INTERIOR_FIRST, slot); }
+// The path's interiors, which only paths that may lie in one keep.
+Interior load_interior(PathStages* st, uint slot)
+{
+    if (!may(MAY_INTERIORS))
+        return Interior();
+    return load_words<Interior, INTERIOR_WORDS>(st.words, st.capacity, INTERIOR_FIRST, slot);
+}
 PathShadowRay load_shadow(PathStages* st, uint slot) { return load_words<PathShadowRay, SHADOW_WORDS>(st.shadows, st.capacity, 0, slot); }
 WalkEntry load_walk(PathStages* st, uint slot) { return load_words<WalkEntry, WALK_WORDS>(st.walks, st.capacity, 0, slot); }
 void store_fixed(PathStages* st, uint slot, PathFixed v) { store_words<PathFixed, FIXED_WORDS>(st.words, st.capacity, FIXED_FIRST, slot, v); }
 void store_loop(PathStages* st, uint slot, PathLoop v) { store_words<PathLoop, LOOP_WORDS>(st.words, st.capacity, LOOP_FIRST, slot, v); }
 void store_pending(PathStages* st, uint slot, PathPending v) { store_words<PathPending, PENDING_WORDS>(st.words, st.capacity, PENDING_FIRST, slot, v); }
 void store_ray(PathStages* st, uint slot, LayerRay v) { store_words<LayerRay, RAY_WORDS>(st.words, st.capacity, RAY_FIRST, slot, v); }
-void store_interior(PathStages* st, uint slot, Interior v) { store_words<Interior, INTERIOR_WORDS>(st.words, st.capacity, INTERIOR_FIRST, slot, v); }
+void store_interior(PathStages* st, uint slot, Interior v)
+{
+    if (may(MAY_INTERIORS))
+        store_words<Interior, INTERIOR_WORDS>(st.words, st.capacity, INTERIOR_FIRST, slot, v);
+}
 void store_shadow(PathStages* st, uint slot, PathShadowRay v) { store_words<PathShadowRay, SHADOW_WORDS>(st.shadows, st.capacity, 0, slot, v); }
 void store_walk(PathStages* st, uint slot, WalkEntry v) { store_words<WalkEntry, WALK_WORDS>(st.walks, st.capacity, 0, slot, v); }
 
@@ -949,7 +959,7 @@ void miss_light<S : ISurface, M : IMedium>(PathRoot r, PathFixed f, inout PathLo
     float w = weigh ? mis_balance(ray.pdf, ray.run * nee_environment_pdf(set, ray_local, ray.normal, ray.dir)) : 1.0;
     float3 e = env * w;
     record.light(feedback_environment(set), luminance_rec2020(spectral.color(p.throughput * e)));
-    if (set.directional_count != 0)
+    if (may(MAY_DIRECTIONAL) && set.directional_count != 0)
     {
         PathStack stack = load_stack(r, slot);
         for (uint k = 0; k < set.directional_count; k++)
@@ -989,6 +999,18 @@ void medium_vertex(PathRoot r, uint slot, PathFixed f, inout PathLoop p, PathPen
     store_pending(r.stages, slot, pending);
     store_loop(r.stages, slot, p);
     append(r, QUEUE_OTHER, round_now(r), slot);
+}
+
+// Candidate handler `inner` in a pipeline whose rays may meet triangles that are not opaque in
+// traversal: no candidate reaches any other pipeline's.
+struct MayAccept<A : IAnyHit> : IAnyHit
+{
+    A inner;
+
+    bool accept(Candidate c)
+    {
+        return may(MAY_COVERAGE) && inner.accept(c);
+    }
 }
 
 // Whether material `material` may give a surface one of MAY_LOBES' lobes, on either side.
@@ -1081,13 +1103,14 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         if (!camera)
             count_ray(p);
         RayDesc rd = path_ray(ray.origin, ray.dir, camera ? f.t_max : positive_infinity());
-        h = trace_closest(s.tlas, rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+        MayAccept<LayerAccept<CoverageFeedback<S>>> accept = { a };
+        h = trace_closest(s.tlas, rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, accept, positions);
         // Rays leaving a layer or a scatter, and the first vertex's, see particles, and every
         // path ray that adds emission sees the proxies of sphere and rect lights, which cover
         // nothing: a second trace finds them in front of the hit.
         bool adds = x.count_bsdf && counted;
-        bool particles = record.particles() && !camera && (ray.chain || p.depth == 0) && set.particle_entries > 0;
-        bool lights = !camera && adds && set.local_lights > 0;
+        bool particles = may(MAY_PARTICLES) && record.particles() && !camera && (ray.chain || p.depth == 0) && set.particle_entries > 0;
+        bool lights = may(MAY_LOCAL_LIGHTS) && !camera && adds && set.local_lights > 0;
         if (particles || lights)
         {
             LocalLights* ray_local = nullptr;
@@ -1422,7 +1445,7 @@ bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, ino
         if (counted)
             p.exposed += p.throughput * sv.b.emission();
     }
-    else if ((x.count_bsdf || (first && !x.photon)) && counted && front && any(sv.b.emission() > 0.0))
+    else if (may(MAY_EMISSIVE) && (x.count_bsdf || (first && !x.photon)) && counted && front && any(sv.b.emission() > 0.0))
     {
         if (!first && (weigh || any(own != 1.0)))
             emitter = emitter_hit(set, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, swapped);

@@ -28,9 +28,11 @@ use crate::shaders::types::{
 };
 use crate::shaders::world_cache::update;
 use crate::staged::{
-    FEATURE_DISPERSION, FEATURE_WALK, Late, MAY_ALL, MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_DEBUG,
-    MAY_DISPERSION, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_LENS, MAY_LOCAL, MAY_REFERENCE,
-    MAY_STACK, MAY_SUBSURFACE, MAY_WALK, Source, Stage, StagedKernels, StagedMemory,
+    FEATURE_DISPERSION, FEATURE_WALK, Late, MAY_ALL, MAY_CACHE, MAY_CAUSTICS, MAY_COAT,
+    MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION, MAY_EMISSIVE, MAY_FILM, MAY_FROST,
+    MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL, MAY_LOCAL_LIGHTS,
+    MAY_PARTICLES, MAY_REFERENCE, MAY_STACK, MAY_SUBSURFACE, MAY_WALK, Source, Stage,
+    StagedKernels, StagedMemory,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::{
@@ -1355,8 +1357,9 @@ fn bit(on: bool, bit: u32) -> u32 {
     if on { bit } else { 0 }
 }
 
-/// What the paths of a scene that may hold `features` may meet, beyond what their roots say.
-fn scene_may(features: SceneFeatures) -> u32 {
+/// What the paths of a scene that may hold `features` may meet under `lighting`, beyond what
+/// their roots say.
+fn scene_may(features: SceneFeatures, lighting: &ViewLighting) -> u32 {
     // A stack face bounds an interior, and a stack bends directional lights alone.
     let stack = features.contains(SceneFeatures::INTERIORS)
         && features.contains(SceneFeatures::DIRECTIONAL_LIGHTS);
@@ -1365,6 +1368,20 @@ fn scene_may(features: SceneFeatures) -> u32 {
         | bit(features.contains(SceneFeatures::FUZZ), MAY_FUZZ)
         | bit(features.contains(SceneFeatures::THIN_FILM), MAY_FILM)
         | bit(features.contains(SceneFeatures::SUBSURFACE), MAY_SUBSURFACE)
+        // The eye's interior is one whatever the materials say.
+        | bit(
+            features.contains(SceneFeatures::INTERIORS) || lighting.camera_medium.is_some(),
+            MAY_INTERIORS,
+        )
+        | bit(features.contains(SceneFeatures::LAYERS), MAY_LAYERS)
+        | bit(features.contains(SceneFeatures::COVERAGE), MAY_COVERAGE)
+        | bit(features.contains(SceneFeatures::PARTICLES), MAY_PARTICLES)
+        | bit(features.contains(SceneFeatures::LOCAL_LIGHTS), MAY_LOCAL_LIGHTS)
+        | bit(
+            features.contains(SceneFeatures::DIRECTIONAL_LIGHTS),
+            MAY_DIRECTIONAL,
+        )
+        | bit(features.contains(SceneFeatures::EMISSIVE), MAY_EMISSIVE)
 }
 
 /// What `root` says its paths may meet: the bits of `specialize.slang` a root decides.
@@ -1548,7 +1565,7 @@ impl LightingKernels {
             .and_then(|r| r.lens)
             .is_some_and(|l| l.aperture_radius > 0.0);
         let froxels = !reference && self.support.media.fogged(features, lighting);
-        let shared = scene_may(features)
+        let shared = scene_may(features, lighting)
             | bit(gathers_caustics(scene, lighting), MAY_CAUSTICS)
             | bit(lens, MAY_LENS)
             | bit(froxels, MAY_FROXELS);
@@ -1918,7 +1935,7 @@ impl LightingKernels {
             if !lighting.specialize {
                 return MAY_ALL;
             }
-            let may = scene_may(pass.scene_features) | root_may(root);
+            let may = scene_may(pass.scene_features, lighting) | root_may(root);
             if may != predicted {
                 log::debug!("paths asked for {predicted:#x} may meet {may:#x}");
             }
@@ -2099,7 +2116,7 @@ impl LightingKernels {
                 &photon_root,
                 Source::Photon,
                 if lighting.specialize {
-                    scene_may(pass.scene_features) | root_may(&photon_root)
+                    scene_may(pass.scene_features, lighting) | root_may(&photon_root)
                 } else {
                     MAY_ALL
                 },

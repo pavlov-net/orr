@@ -86,6 +86,16 @@ pub(crate) const MAY_SUBSURFACE: u32 = 1 << 18;
 /// goes with them: only a subsurface vertex starts a walk.
 const MAY_LOBES: u32 = MAY_COAT | MAY_FUZZ | MAY_FILM | MAY_SUBSURFACE;
 const MAY_RICH: u32 = MAY_LOBES | MAY_WALK;
+pub(crate) const MAY_INTERIORS: u32 = 1 << 19;
+pub(crate) const MAY_LAYERS: u32 = 1 << 20;
+pub(crate) const MAY_COVERAGE: u32 = 1 << 21;
+pub(crate) const MAY_PARTICLES: u32 = 1 << 22;
+pub(crate) const MAY_LOCAL_LIGHTS: u32 = 1 << 23;
+pub(crate) const MAY_DIRECTIONAL: u32 = 1 << 24;
+pub(crate) const MAY_EMISSIVE: u32 = 1 << 25;
+/// What gives the other shade stage a vertex: a layer, or a scatter in or a way out of an
+/// interior.
+const MAY_OTHER: u32 = MAY_LAYERS | MAY_INTERIORS;
 /// Everything: what a pipeline made without a value may meet.
 pub(crate) const MAY_ALL: u32 = u32::MAX;
 
@@ -405,10 +415,15 @@ impl StageSet {
         &self.stages[stage as usize]
     }
 
-    /// `stages` and what a set for `may` runs beside them: the rich opaque stage where its
-    /// surfaces may have lobes a plain one lacks.
-    fn with_rich(may: u32, stages: &[Stage]) -> Vec<Stage> {
-        let mut out = stages.to_vec();
+    /// The stages a set for `may` runs for a source with `stages`: with the rich opaque stage
+    /// where its surfaces may have lobes a plain one lacks, and without the other shade stage
+    /// where nothing gives it a vertex.
+    fn runs(may: u32, stages: &[Stage]) -> Vec<Stage> {
+        let mut out: Vec<_> = stages
+            .iter()
+            .copied()
+            .filter(|&s| s != Stage::Other || may & MAY_OTHER != 0)
+            .collect();
         if may & MAY_LOBES != 0 {
             out.push(Stage::Rich);
         }
@@ -417,14 +432,14 @@ impl StageSet {
 
     /// Whether every stage a source with `stages` runs is ready.
     fn holds(&self, stages: &[Stage]) -> bool {
-        Self::with_rich(self.may, stages)
+        Self::runs(self.may, stages)
             .iter()
             .all(|&s| self.stage(s).get().is_some())
     }
 
     /// Whether every stage a source with `stages` runs has started compiling.
     fn started(&self, stages: &[Stage]) -> bool {
-        Self::with_rich(self.may, stages)
+        Self::runs(self.may, stages)
             .iter()
             .all(|&s| self.stage(s).started())
     }
@@ -510,7 +525,7 @@ impl StagedKernels {
     /// Starts the compiles of `stages` for exactly `may` that have not started.
     fn request(&self, may: u32, stages: &[Stage]) -> Arc<StageSet> {
         let set = self.set(may);
-        for stage in StageSet::with_rich(may, stages) {
+        for stage in StageSet::runs(may, stages) {
             let (kernels, rays) = (self.kernels, self.rays);
             set.stage(stage)
                 .start(self.device(), self.loading(), move |d| {
@@ -605,7 +620,7 @@ impl StagedKernels {
                 let set = self
                     .compiling(may, &stages)
                     .unwrap_or_else(|| self.request(may, &stages));
-                for stage in StageSet::with_rich(set.may, &stages) {
+                for stage in StageSet::runs(set.may, &stages) {
                     set.stage(stage).wait(self.loading())?;
                 }
                 set
@@ -671,7 +686,13 @@ impl StagedKernels {
                         &root,
                         memory.groups(round, QUEUE_OPAQUE),
                     );
-                    pipeline(Stage::Other).dispatch(list, &root, memory.groups(round, QUEUE_OTHER));
+                    if set.may & MAY_OTHER != 0 {
+                        pipeline(Stage::Other).dispatch(
+                            list,
+                            &root,
+                            memory.groups(round, QUEUE_OTHER),
+                        );
+                    }
                     if set.may & MAY_LOBES != 0 {
                         pipeline(Stage::Rich).dispatch(
                             list,

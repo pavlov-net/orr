@@ -659,6 +659,11 @@ impl SceneCpu {
         if self.producers.iter().flatten().any(|p| p.smoke) {
             out |= crate::SceneFeatures::SMOKE;
         }
+        // A replaced entry's geometry stays until its frame has completed.
+        let retired = self.retired.iter().map(|(_, p)| p);
+        for p in self.producers.iter().flatten().chain(retired) {
+            out |= p.features;
+        }
         out
     }
 }
