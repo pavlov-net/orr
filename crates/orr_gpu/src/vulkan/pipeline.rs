@@ -12,6 +12,7 @@ use ash::vk::TaggedStructure as _;
 use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::Item;
+use super::specialize;
 use super::spirv;
 use crate::{EntryPoint, Error, ShaderModule, SpecData, Stage};
 
@@ -193,6 +194,26 @@ impl<'a> StageParts<'a> {
             spirv::payload_first(s.spirv, s.entry.name.to_bytes())
         } else {
             Cow::Borrowed(s.spirv)
+        };
+        let code = if s.spec.entries.is_empty() {
+            code
+        } else {
+            let started = Instant::now();
+            let folded = specialize::specialize(
+                &code,
+                s.entry.name.to_bytes(),
+                s.spec.entries,
+                s.spec.bytes,
+            );
+            if let Some(folded) = &folded {
+                log::debug!(
+                    "{name}: {} of {} words left by its specialization, in {:.1} ms",
+                    folded.len(),
+                    code.len(),
+                    started.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            folded.map_or(code, Cow::Owned)
         };
         if shared.caps.cooperative_vector.is_empty() && spirv::cooperative_vectors(&code) {
             return Err(Error::Shader(format!(

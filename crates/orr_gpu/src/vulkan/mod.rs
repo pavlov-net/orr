@@ -23,6 +23,7 @@ mod queue;
 mod ray;
 mod rtas;
 mod sparse;
+mod specialize;
 mod spirv;
 mod swapchain;
 mod texture;
