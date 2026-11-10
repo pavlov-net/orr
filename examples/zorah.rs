@@ -637,13 +637,98 @@ allocated: {}",
             kinds.join(", ")
         );
         if std::env::var_os("ZORAH_LOG_READOUT").is_some() {
-            log::info!("readout\n{}", self.text);
+            log::info!("readout\n{}{}", self.text, breakdown(renderer));
         }
         self.start = *r;
         self.frames = 0;
         self.seconds = 0.0;
         self.cut_ms = [0.0; 4];
     }
+}
+
+/// Labels the breakdown lists, the largest first.
+const TOP_LABELS: usize = 16;
+
+/// Where device memory goes: the largest labels, the allocator's pools with what their blocks
+/// leave free, the scenes' pools with their fill, and per device-local heap what the process
+/// uses outside orr_gpu's blocks.
+fn breakdown(renderer: &Renderer) -> String {
+    let b = device().memory_breakdown();
+    let scene = renderer.scene_memory();
+    let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
+    let mut s = format!(
+        "\ndevice memory allocations: {} of {}",
+        b.device_allocations, b.max_device_allocations
+    );
+    for l in b.labels.iter().take(TOP_LABELS) {
+        s += &format!(
+            "\n  label {:?} {:?}: {:.3} GiB in {}, {:.3} GiB in {} of their own",
+            l.label,
+            l.kind,
+            gib(l.bytes),
+            l.allocations,
+            gib(l.dedicated_bytes),
+            l.dedicated
+        );
+    }
+    let rest: u64 = b.labels.iter().skip(TOP_LABELS).map(|l| l.bytes).sum();
+    s += &format!(
+        "\n  {} more labels: {:.3} GiB",
+        b.labels.len().saturating_sub(TOP_LABELS),
+        gib(rest)
+    );
+    for p in b.pools.iter().filter(|p| p.blocks > 0) {
+        s += &format!(
+            "\n  pool {:?} heap {}: {} blocks {:.3} GiB, {} allocations {:.3} GiB, {:.3} GiB free in blocks",
+            p.name,
+            p.heap,
+            p.blocks,
+            gib(p.block_bytes),
+            p.allocations,
+            gib(p.allocation_bytes),
+            gib(p.free_in_blocks())
+        );
+    }
+    for p in &scene.pools {
+        s += &format!(
+            "\n  scene pool {:?} {:?}: {} blocks {:.3} GiB, {:.3} GiB used, {} at most half used",
+            p.name,
+            p.kind,
+            p.blocks,
+            gib(p.bytes),
+            gib(p.used),
+            p.half_empty
+        );
+    }
+    if let Some(c) = scene.clas {
+        s += &format!(
+            "\n  CLAS pages of {} KiB: {} bound, {} wholly free, {} reserved, {:.3} GiB used",
+            c.page_bytes >> 10,
+            c.bound,
+            c.wholly_free,
+            c.reserved,
+            gib(c.used)
+        );
+    }
+    let windows = scene.windows.iter();
+    let (blocks, bytes, used) = windows.fold((0, 0, 0), |(n, b, u), w| {
+        (n + w.blocks, b + w.bytes, u + w.used)
+    });
+    s += &format!(
+        "\n  upload windows: {} blocks {:.3} GiB, {:.3} GiB used by their last frames",
+        blocks,
+        gib(bytes),
+        gib(used)
+    );
+    for (i, h) in b.heaps.iter().enumerate().filter(|(_, h)| h.device_local) {
+        s += &format!(
+            "\n  heap {i}: {:.3} GiB used, {:.3} in blocks, {:.3} outside orr_gpu",
+            gib(h.usage),
+            gib(h.block_bytes),
+            h.outside() as f64 / f64::from(1u32 << 30)
+        );
+    }
+    s
 }
 
 /// Runs the example; headless runs and windowed runs with `--out` and `--frames` return their
