@@ -1084,9 +1084,13 @@ impl<'a> Frame<'a> {
             dof_background: false,
         };
         let waits = self.lighting.waits;
+        // The render of a caller that waits asks for them itself, once it has waited.
+        if waits && !wait {
+            return Ok(true);
+        }
         // A caller that waits takes the pipelines made for exactly its view, so its frames do
         // not depend on what else has compiled.
-        let waited = if waits && wait {
+        let waited = if waits {
             kernels.wait_paths(scene, &needs, lighting)
         } else {
             Ok(())
