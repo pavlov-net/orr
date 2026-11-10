@@ -1031,7 +1031,6 @@ impl Scenes {
                 .iter()
                 .flat_map(|p| self.device.pass_results(*p).unwrap_or_default())
                 .collect();
-            scratch_pass_log(&f.stats.gpu);
             let slot = (f.id % u64::from(core.fif)) as usize;
             for id in &f.traced {
                 let Ok(scene) = core.scene(*id) else { continue };
@@ -2658,87 +2657,5 @@ impl Drop for Scenes {
         {
             std::panic::resume_unwind(panic);
         }
-    }
-}
-
-fn scratch_pass_log(gpu: &[PassResult]) {
-    use std::sync::Mutex;
-    struct Log {
-        frames: u64,
-        totals: Vec<f64>,
-        passes: std::collections::BTreeMap<&'static str, (f64, u64)>,
-        last: Option<Instant>,
-        intervals: Vec<f64>,
-    }
-    static LOG: Mutex<Option<Log>> = Mutex::new(None);
-    let Some(path) = std::env::var_os("ORR_PASS_LOG") else {
-        return;
-    };
-    let skip: u64 = std::env::var("ORR_PASS_SKIP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(200);
-    if gpu.is_empty() {
-        return;
-    }
-    let mut g = LOG.lock().unwrap();
-    let l = g.get_or_insert_with(|| Log {
-        frames: 0,
-        totals: Vec::new(),
-        passes: Default::default(),
-        last: None,
-        intervals: Vec::new(),
-    });
-    l.frames += 1;
-    let now = Instant::now();
-    let prev = l.last.replace(now);
-    if l.frames <= skip {
-        return;
-    }
-    if let Some(p) = prev {
-        l.intervals.push((now - p).as_secs_f64() * 1e3);
-    }
-    let mut total = 0.0;
-    for r in gpu {
-        let e = l.passes.entry(r.name).or_default();
-        e.0 += r.gpu_ms;
-        e.1 += 1;
-        total += r.gpu_ms;
-    }
-    l.totals.push(total);
-    if l.totals.len().is_multiple_of(25) {
-        let n = l.totals.len();
-        let mut t = l.totals.clone();
-        t.sort_by(f64::total_cmp);
-        let mean = t.iter().sum::<f64>() / n as f64;
-        let mut out = format!(
-            "total {mean:.3} median {:.3} p90 {:.3} frames {n}
-",
-            t[n / 2],
-            t[n * 9 / 10]
-        );
-        let mut iv = l.intervals.clone();
-        iv.sort_by(f64::total_cmp);
-        if !iv.is_empty() {
-            out += &format!(
-                "frame interval median {:.3} p90 {:.3}
-",
-                iv[iv.len() / 2],
-                iv[iv.len() * 9 / 10]
-            );
-        }
-        let mut v: Vec<_> = l
-            .passes
-            .iter()
-            .map(|(k, (s, c))| (*k, s / *c as f64, *c))
-            .collect();
-        v.sort_by(|a, b| b.1.total_cmp(&a.1));
-        for (k, ms, c) in v {
-            out += &format!(
-                "{ms:9.3} {c:6} {k}
-"
-            );
-        }
-        let _ = std::fs::write(&path, out);
     }
 }

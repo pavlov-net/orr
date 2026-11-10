@@ -779,12 +779,11 @@ impl StagedKernels {
     /// stage, and takes several times as long to compile as the largest of them. The set that
     /// may meet everything has none: it stands in while a view's own compiles.
     fn rest(&self, set: &Arc<StageSet>, rounds: u32) -> Option<u32> {
-        let round = scratch_rest().filter(|&k| k < rounds)?;
-        if set.may == MAY_ALL {
+        if rounds <= REST_ROUND || set.may == MAY_ALL {
             return None;
         }
         self.start_rest(set, Urgency::Idle);
-        set.stage(Stage::Rest).get().map(|_| round)
+        set.stage(Stage::Rest).get().map(|_| REST_ROUND)
     }
 
     /// Starts the compile of `set`'s rest stage unless it has started, as a job where the loop
@@ -1010,15 +1009,6 @@ fn kept(sets: &[(u64, Option<Instant>, Instant)], wanted: &[u64], now: Instant) 
         .collect()
 }
 
-/// The round a pass's rest stage starts at. Scratch: `ORR_SCRATCH_REST=K` moves it, and any
-/// other value leaves the stage out.
-fn scratch_rest() -> Option<u32> {
-    match std::env::var("ORR_SCRATCH_REST") {
-        Ok(v) => v.parse().ok(),
-        Err(_) => Some(REST_ROUND),
-    }
-}
-
 /// The slots one queue may hold on `device`: a stage runs a queue's slots in one dispatch, a
 /// compute one of a workgroup per [`STAGE_GROUP`] of them, a ray one of a row of rays each.
 fn queue_slots(device: &Device) -> u32 {
@@ -1066,14 +1056,6 @@ impl Slots {
             slices += 1;
         }
     }
-}
-
-/// Scratch: `ORR_SCRATCH_SLOTS` caps the path slots of a view.
-fn scratch_slots() -> u32 {
-    std::env::var("ORR_SCRATCH_SLOTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map_or(MAX_SLOTS, |n: u32| n.clamp(1, MAX_SLOTS))
 }
 
 /// With `on`, ends the open pass and opens one named for `source`'s stage `stage` (start,
@@ -1186,8 +1168,6 @@ pub(crate) struct StagedMemory {
     held: Mutex<Vec<Arc<StageSet>>>,
     /// What the view asked its last frame's pipelines to hold.
     asked: std::sync::atomic::AtomicU64,
-    /// Scratch: frames begun, for `ORR_SCRATCH_QUEUE_COUNTS`.
-    frames: std::sync::atomic::AtomicU32,
     header: Allocation<PathStages>,
     queues: Allocation<StageQueue>,
     _lists: Allocation<u32>,
@@ -1209,19 +1189,13 @@ impl StagedMemory {
         update: u32,
     ) -> Result<Self, Error> {
         let most = queue_slots(device);
-        let Slots { own, riders } = Slots::plan(pixels, update, scratch_slots(), most);
+        let Slots { own, riders } = Slots::plan(pixels, update, MAX_SLOTS, most);
         let capacity = own + riders;
         let n = u64::from(capacity);
         let words =
             |count: u64, name| device.gpu_malloc::<[u32; 4]>(MemoryKind::DeviceLocal, count, name);
-        // Scratch: `ORR_SCRATCH_QUEUE_COUNTS` keeps the queues where the CPU reads them.
-        let counted = std::env::var_os("ORR_SCRATCH_QUEUE_COUNTS").is_some();
         let queues = device.gpu_malloc::<StageQueue>(
-            if counted {
-                MemoryKind::Readback
-            } else {
-                MemoryKind::DeviceLocal
-            },
+            MemoryKind::DeviceLocal,
             u64::from(rows) * STAGE_QUEUES,
             "staged path queues",
         )?;
@@ -1266,7 +1240,6 @@ impl StagedMemory {
             parts,
             held: Mutex::new(Vec::new()),
             asked: std::sync::atomic::AtomicU64::new(0),
-            frames: std::sync::atomic::AtomicU32::new(0),
             header,
             queues,
             _lists: lists,
@@ -1283,24 +1256,6 @@ impl StagedMemory {
         self.held.lock().unwrap().clear();
         self.asked
             .store(asked, std::sync::atomic::Ordering::Relaxed);
-        // Scratch: with `ORR_SCRATCH_QUEUE_COUNTS=N`, logs at the view's Nth frame the paths
-        // each queue held in each round of the last slice recorded before it.
-        let frame = self
-            .frames
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let wanted = std::env::var("ORR_SCRATCH_QUEUE_COUNTS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok());
-        if let (Some(at), Some(queues)) = (wanted, self.queues.as_slice())
-            && frame == at
-        {
-            for (round, row) in queues.chunks(STAGE_QUEUES as usize).enumerate() {
-                let counts: Vec<u32> = row.iter().map(|q| q.count).collect();
-                if counts.iter().any(|&c| c != 0) {
-                    log::info!("queue counts round {round}: {counts:?}");
-                }
-            }
-        }
     }
 
     fn hold(&self, set: &Arc<StageSet>) {
@@ -1321,7 +1276,7 @@ impl StagedMemory {
     /// Whether one slice of it holds `items` paths, or as many as any memory may, each with
     /// `parts`, and its queues `rows` rounds.
     pub(crate) fn holds(&self, items: u32, parts: StateParts, rows: u32) -> bool {
-        self.own >= Slots::plan(items, 0, scratch_slots(), self.most).own
+        self.own >= Slots::plan(items, 0, MAX_SLOTS, self.most).own
             && self.parts.holds(parts)
             && self.rows >= rows
     }
@@ -1333,7 +1288,7 @@ impl StagedMemory {
             own: self.own,
             riders: self.capacity - self.own,
         };
-        slots == Slots::plan(pixels, update, scratch_slots(), self.most)
+        slots == Slots::plan(pixels, update, MAX_SLOTS, self.most)
             && self.parts.holds(parts)
             && self.rows >= rows
     }

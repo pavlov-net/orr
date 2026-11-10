@@ -938,14 +938,6 @@ pub struct DofBackgroundPass {
     pub focus_distance: GpuPtr<f32>,
 }
 
-/// Scratch: `value`, or the environment variable `name` parsed as a number when set.
-fn scratch_u32(name: &str, value: u32) -> u32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(value)
-}
-
 /// The kernels beside the path kernels, each compiled as a job of its own, and the small tables
 /// they use.
 struct SupportKernels {
@@ -1051,12 +1043,6 @@ const PHOTON_SLOTS: u32 = 1 << 18;
 
 /// Whether path kernels run as ray dispatches.
 fn runs_rays(entry: PathEntry) -> bool {
-    // Scratch: `ORR_SCRATCH_ENTRY` overrides the renderer's choice in every example.
-    let entry = match std::env::var("ORR_SCRATCH_ENTRY").as_deref() {
-        Ok("compute") => PathEntry::Compute,
-        Ok("rays") => PathEntry::RayDispatch,
-        _ => entry,
-    };
     match entry {
         // The compute entries: a shade stage's reorder costs more than its sorted lanes save.
         PathEntry::Fastest | PathEntry::Compute => false,
@@ -1299,10 +1285,7 @@ fn features_may(features: u32) -> u64 {
 /// the low word's bits the scene decides, and the high word, what its surface evaluations and
 /// hits may meet.
 fn scene_may(features: SceneFeatures) -> u64 {
-    // Scratch: `ORR_SCRATCH_MAY` adds bits to every mask's low word and `ORR_SCRATCH_MAY2` to
-    // its high word.
-    u64::from(scratch_u32("ORR_SCRATCH_MAY", 0))
-        | u64::from(features.surface_may() | scratch_u32("ORR_SCRATCH_MAY2", 0)) << 32
+    u64::from(features.surface_may()) << 32
         | bit(features.contains(SceneFeatures::COAT), MAY_COAT)
         | bit(features.contains(SceneFeatures::FUZZ), MAY_FUZZ)
         | bit(features.contains(SceneFeatures::THIN_FILM), MAY_FILM)

@@ -367,24 +367,9 @@ fn run(options: &Options) -> Option<Capture> {
     let title = |camera: &Camera| format!("orr cornell-box: {}", camera.name);
 
     let gpu = device();
-    let mut window = (!options.headless).then(|| {
-        let (w, h) = std::env::var("ORR_SCRATCH_WINDOW")
-            .ok()
-            .and_then(|v| {
-                let (w, h) = v.split_once('x')?;
-                Some((w.parse().ok()?, h.parse().ok()?))
-            })
-            .unwrap_or((1920, 1080));
-        Window::new(&title(&cameras[current]), w, h)
-    });
-    let desc = RendererDesc {
-        path_entry: match std::env::var("ORR_SCRATCH_ENTRY").as_deref() {
-            Ok("compute") => orr::PathEntry::Compute,
-            Ok("rays") => orr::PathEntry::RayDispatch,
-            _ => orr::PathEntry::Fastest,
-        },
-        ..RendererDesc::default()
-    };
+    let mut window =
+        (!options.headless).then(|| Window::new(&title(&cameras[current]), 1920, 1080));
+    let desc = RendererDesc::default();
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,
@@ -399,7 +384,7 @@ fn run(options: &Options) -> Option<Capture> {
         .expect("display")
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
-    if !options.headless && !reference && std::env::var_os("ORR_SCRATCH_NO_DLSS").is_none() {
+    if !options.headless && !reference {
         enable_dlss(&mut renderer);
     }
     let _workers = Workers::machine(renderer.loading());
@@ -502,8 +487,6 @@ fn run(options: &Options) -> Option<Capture> {
             DIELECTRIC_DEPTH
         },
         reference: reference.then(ReferenceSettings::default),
-        // Scratch: `ORR_SCRATCH_STAGE_TIMES` times the staged path loop's stages apart.
-        stage_passes: std::env::var_os("ORR_SCRATCH_STAGE_TIMES").is_some(),
         ..ViewLighting::default()
     };
     let capture = options.headless || options.out.is_some();
