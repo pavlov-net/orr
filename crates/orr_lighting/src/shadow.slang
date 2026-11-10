@@ -202,7 +202,7 @@ public struct ShadowCandidates<S : ISurface, M : IMedium, let MODE : uint> : ICa
     {
         if (MODE == SHADOW_PHOTON)
             return float3(0.0);
-        bool thin = !crosses_interior(scene, section);
+        bool thin = may2(MAY2_THIN_DIELECTRICS) && !crosses_interior(scene, section);
         // Solid glass ends a path's shadow ray whatever its surface is.
         if (MODE == SHADOW_PATH && !thin)
         {
