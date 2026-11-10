@@ -1075,6 +1075,7 @@ public LayerVertex scatter_vertex(ViewConstants* v, float3 p, float3 dir, uint m
     l.front = true;
     l.anisotropy = anisotropy;
     l.stack = false;
+    l.chains = false;
     PathVertex x = (PathVertex)0;
     x.surface.position = p;
     x.surface.material = medium;
@@ -1093,6 +1094,8 @@ public LayerVertex leave_vertex(ViewConstants* v, float3 p, float3 n)
     l.section = MATERIAL_NONE;
     l.front = true;
     l.anisotropy = 0.0;
+    l.stack = false;
+    l.chains = false;
     PathVertex x = (PathVertex)0;
     x.surface.position = p;
     x.surface.normal = n;
