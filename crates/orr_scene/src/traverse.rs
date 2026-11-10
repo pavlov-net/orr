@@ -646,6 +646,7 @@ impl Cuts {
             demand: u64::from(clas),
             capacity,
             sheddable: entries > fixed,
+            whole: false,
         });
     }
 

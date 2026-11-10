@@ -3,8 +3,9 @@
 //!
 //! What a frame wants falls roughly with the square of the threshold it ran at. A sample whose
 //! load (demand over capacity) is above the band moves the scale to where that model puts its
-//! load at the target, and one below it relaxes the scale a little toward 1: a frame shows only
-//! the frontier of what a finer threshold would want, which the rest follows once it has
+//! load at the target. One below it moves the scale toward 1: by the same model when all the
+//! frame wanted is resident, as its demand is then whole, and else by a little, as a frame shows
+//! only the frontier of what a finer threshold would want, which the rest follows once it has
 //! landed. Inside the band the scale stays. Each step starts from the scale its own sample ran
 //! at, so the samples read in the frames before a step's effect shows, which ran at the same
 //! scale, ask for no more than it did.
@@ -18,9 +19,9 @@ const HIGH: f64 = 0.92;
 pub(crate) const LOW: f64 = 0.80;
 /// The factor a sample under the band relaxes the scale it ran at by.
 const RELAX: f32 = 0.995;
-/// Samples for which relaxing stops just above the scale of a sample above the band. A step
-/// of demand wider than the band, such as one page too large for what is left of the pool,
-/// would otherwise come back each time relaxing reaches it.
+/// Samples for which relaxing stops just above the scale of a sample above the band that
+/// relaxing led to. A step of demand wider than the band, such as one page too large for what
+/// is left of the pool, would otherwise come back each time relaxing reaches it.
 const FLOOR_SAMPLES: u32 = 600;
 
 /// What one completed frame wanted.
@@ -33,18 +34,22 @@ pub(crate) struct Sample {
     /// Whether a coarser threshold would want less: some of the demand is not held whatever
     /// the threshold.
     pub(crate) sheddable: bool,
+    /// Whether everything the frame wanted is resident, so the demand holds no unknown part.
+    pub(crate) whole: bool,
 }
 
 /// One detail scale and its steering.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Detail {
     scale: f32,
-    /// For [`FLOOR_SAMPLES`] samples after one above the band: the largest scale a sample
-    /// above the band ran at, and the least above it one under the band ran at, between which
-    /// relaxing stops.
+    /// For [`FLOOR_SAMPLES`] samples after one above the band that relaxing led to: the
+    /// largest scale such a sample ran at, and the least above it one under the band ran at,
+    /// between which relaxing stops.
     over: f32,
     under: f32,
     held: u32,
+    /// Whether the scale has relaxed since it last rose.
+    relaxed: bool,
 }
 
 impl Detail {
@@ -54,6 +59,7 @@ impl Detail {
             over: 1.0,
             under: f32::INFINITY,
             held: 0,
+            relaxed: false,
         }
     }
 
@@ -72,11 +78,16 @@ impl Detail {
             if s.sheddable {
                 let want = f64::from(s.scale) * (load / TARGET).sqrt();
                 self.scale = self.scale.max(want as f32);
-                self.over = self.over.max(s.scale);
-                if self.under <= self.over {
-                    self.under = f32::INFINITY;
+                // Demand that rose says nothing about the scales under this one; a sample
+                // that relaxing led above the band does.
+                if self.relaxed {
+                    self.over = self.over.max(s.scale);
+                    if self.under <= self.over {
+                        self.under = f32::INFINITY;
+                    }
+                    self.held = FLOOR_SAMPLES;
+                    self.relaxed = false;
                 }
-                self.held = FLOOR_SAMPLES;
             }
         } else if load < LOW {
             if self.held > 0 && s.scale > self.over {
@@ -93,7 +104,16 @@ impl Detail {
             } else {
                 self.over / RELAX
             };
-            self.scale = self.scale.min((s.scale * RELAX).max(floor).max(1.0));
+            let to = if s.whole {
+                (f64::from(s.scale) * (load / TARGET).sqrt()) as f32
+            } else {
+                s.scale * RELAX
+            };
+            let to = to.max(floor).max(1.0);
+            if to < self.scale {
+                self.scale = to;
+                self.relaxed = true;
+            }
         }
     }
 }
@@ -113,6 +133,8 @@ mod tests {
         exponent: f64,
         cliff: (f32, f64),
         late: usize,
+        /// Whether its samples hold everything a frame wants, or only a frontier.
+        whole: bool,
     }
 
     impl Plant {
@@ -138,6 +160,7 @@ mod tests {
                     demand: demand as u64,
                     capacity: CAPACITY,
                     sheddable: p.streamed > 0.0,
+                    whole: p.whole,
                 });
             }
             let scale = d.scale();
@@ -172,6 +195,7 @@ mod tests {
                 exponent: 2.0,
                 cliff: (0.0, 0.0),
                 late,
+                whole: false,
             };
             let frames = run(&mut d, &up, 200, &mut ran);
             let want = (3.0 / TARGET).sqrt() as f32;
@@ -206,6 +230,35 @@ mod tests {
         }
     }
 
+    /// Demand that falls to a tenth: whole samples bring the scale into the band in a few
+    /// steps without passing it, where frontier samples take hundreds, and a fall is not held
+    /// off as a step of demand is.
+    #[test]
+    fn whole_samples_relax_by_the_model_after_demand_falls() {
+        let c = CAPACITY as f64;
+        for exponent in [1.0, 2.0] {
+            let mut d = Detail::new();
+            let mut ran = Vec::new();
+            let mut p = Plant {
+                fixed: 0.0,
+                streamed: 40.0 * c,
+                exponent,
+                cliff: (0.0, 0.0),
+                late: 2,
+                whole: true,
+            };
+            run(&mut d, &p, 80, &mut ran);
+            p.streamed = 4.0 * c;
+            let frames = run(&mut d, &p, 40, &mut ran);
+            assert_eq!(turns(&frames), 0, "exponent {exponent}");
+            let (_, load) = *frames.last().unwrap();
+            assert!(
+                (LOW..=HIGH).contains(&load),
+                "exponent {exponent}: load {load}"
+            );
+        }
+    }
+
     #[test]
     fn exponents_off_the_model_still_settle_in_the_band() {
         let c = CAPACITY as f64;
@@ -217,6 +270,7 @@ mod tests {
                 exponent,
                 cliff: (0.0, 0.0),
                 late: 2,
+                whole: false,
             };
             let frames = run(&mut d, &p, 3000, &mut Vec::new());
             let what = format!("exponent {exponent}, fixed {fixed}");
@@ -234,6 +288,7 @@ mod tests {
             exponent: 2.0,
             cliff: (0.0, 0.0),
             late: 2,
+            whole: false,
         };
         run(&mut d, &fixed, 100, &mut Vec::new());
         assert_eq!(d.scale(), 1.0);
@@ -249,6 +304,7 @@ mod tests {
             exponent: 2.0,
             cliff: (2.0, 0.6 * c),
             late: 2,
+            whole: false,
         };
         let mut d = Detail::new();
         let frames = run(&mut d, &p, FLOOR_SAMPLES as usize / 2, &mut Vec::new());

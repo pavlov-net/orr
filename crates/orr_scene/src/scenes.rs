@@ -1160,6 +1160,7 @@ impl Scenes {
                     demand: mesh.bytes,
                     capacity: mesh.budget,
                     sheddable: mesh.streamed > 0,
+                    whole: mesh.absent == 0,
                 });
                 f.stats.detail.mesh_demand = mesh.bytes;
                 f.stats.detail.mesh_budget = mesh.budget;
