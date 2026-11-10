@@ -251,30 +251,33 @@ struct WalkEntry
 
 // Words of each part of a path's state, in `PathStages.words` in this order: the parts every
 // path keeps, then those of paths that may lie in an interior (FEATURE_INTERIORS: their
-// interiors, where they entered the last, and a scatter or a way out the trace stage made),
-// track plane stacks (FEATURE_STACK) and may split by wavelength (FEATURE_DISPERSION). A slot
-// holds only the parts its root's features name, which every pipeline reads from the root.
-static const uint LOOP_WORDS = 5;
-static const uint PENDING_WORDS = 5;
-static const uint RAY_WORDS = 5;
+// interiors and where they entered the last), track plane stacks (FEATURE_STACK) and may split
+// by wavelength (FEATURE_DISPERSION). A slot holds only the parts its root's features name,
+// which every pipeline reads from the root.
+//
+// The span is what lives from one stage to the next alone, so its words hold two things by
+// turns: from a shade to the trace, the origin of the ray the vertex left and its deferred
+// shadow ray; from the trace to a shade, the hit and its corners, or the scatter or way out the
+// trace stage made. Its first word's last scalar counts the path's rays and its last word's
+// the ray's flags, in both.
+static const uint LOOP_WORDS = 4;
+static const uint RAY_WORDS = 3;
+static const uint SPAN_WORDS = 5;
 static const uint INTERIOR_WORDS = 6;
 static const uint ENTERED_WORDS = 2;
-static const uint MEDIUM_WORDS = 3;
 static const uint STACK_WORDS = 5;
 static const uint SPECTRAL_WORDS = 5;
 static const uint LOOP_FIRST = 0;
-static const uint PENDING_FIRST = LOOP_FIRST + LOOP_WORDS;
-static const uint RAY_FIRST = PENDING_FIRST + PENDING_WORDS;
-public static const uint BASE_WORDS = RAY_FIRST + RAY_WORDS;
+static const uint RAY_FIRST = LOOP_FIRST + LOOP_WORDS;
+static const uint SPAN_FIRST = RAY_FIRST + RAY_WORDS;
+public static const uint BASE_WORDS = SPAN_FIRST + SPAN_WORDS;
 static const uint INTERIOR_FIRST = BASE_WORDS;
 static const uint ENTERED_FIRST = INTERIOR_FIRST + INTERIOR_WORDS;
-static const uint MEDIUM_FIRST = ENTERED_FIRST + ENTERED_WORDS;
-public static const uint INTERIOR_PARTS = INTERIOR_WORDS + ENTERED_WORDS + MEDIUM_WORDS;
+public static const uint INTERIOR_PARTS = INTERIOR_WORDS + ENTERED_WORDS;
 public static const uint STACK_PART = STACK_WORDS;
 public static const uint SPECTRAL_PART = SPECTRAL_WORDS;
-// A deferred shadow ray's words, and with FEATURE_INTERIORS those of its vertex's point, the
-// surface it lies on and the interiors it arrived with after them.
-public static const uint SHADOW_WORDS = 3;
+// The words of `PathStages.shadows`, which only paths that track interiors keep: a deferred
+// shadow ray's vertex, the surface it lies on and the interiors it arrived with.
 public static const uint SHADOW_INTERIOR_WORDS = 9;
 // A record's words: a view's and a photon's, and an update path's, whose slices hold as many
 // fewer paths.
@@ -326,7 +329,8 @@ void store_words<T, let N : int>(uint4* words, uint capacity, uint first, uint s
 
 // The parts as their words hold them. A counter is below the rounds a root may ask for, which
 // 24 bits hold: the bytes of `chains` lie above `iteration`, `depth` and `opaque`. The sampler
-// keeps its dimension alone, as its seed is the pixel's and its index the frame's.
+// keeps its dimension alone, beside the ray's direction, as its seed is the pixel's and its
+// index the frame's.
 struct StoredLoop
 {
     float3 throughput;
@@ -338,9 +342,17 @@ struct StoredLoop
     RayCone cone;
     uint opaque;
     uint layers;
-    uint dimension;
-    uint rays;
-    uint2 _spare;
+}
+
+// What a ray keeps of the vertex it left until the next vertex is shaded.
+struct StoredRay
+{
+    float3 dir;
+    uint dimension;                 // the loop's sampler's
+    float3 normal;
+    float pdf;
+    float3 from;
+    float run;
 }
 
 struct StoredEntered
@@ -354,20 +366,6 @@ static const uint HIT_HIT = 1 << 0;
 static const uint HIT_TRIANGLE = 1 << 1;
 static const uint HIT_FRONT = 1 << 2;
 static const uint HIT_CLASS_SHIFT = 8;
-
-struct StoredPending
-{
-    uint flags;                     // HIT_*, and the hit's class from HIT_CLASS_SHIFT
-    float hit_t;
-    uint instance_index;
-    uint custom_index;
-    uint geometry_index;
-    uint primitive_index;
-    int cluster_id;
-    float2 barycentrics;
-    float3 positions[3];
-    float t;
-}
 
 struct StoredMedium
 {
@@ -384,16 +382,10 @@ static const uint RAY_SCATTER = 1 << 2;
 static const uint RAY_LOCAL = 1 << 3;
 static const uint RAY_LIT = 1 << 4;
 
-struct StoredRay
+// Word `word` of `slot`'s state.
+uint word_index(PathStages* st, uint word, uint slot)
 {
-    float3 origin;
-    float3 dir;
-    float3 start;
-    float pdf;
-    float run;
-    float3 normal;
-    float3 from;
-    uint flags;                     // RAY_*
+    return word * st.capacity + slot;
 }
 
 // The pixel of `slot`'s path, as its source's start stage took it from the slot's item.
@@ -480,14 +472,14 @@ PathLoop load_loop(PathRoot r, uint slot)
     StoredLoop v = load_words<StoredLoop, LOOP_WORDS>(st.words, st.capacity, LOOP_FIRST, slot);
     PathLoop p;
     p.rng = Sampler(slot_pixel(r, slot), r.frame, path_stream(r));
-    p.rng.dimension = v.dimension;
+    p.rng.dimension = st.words[word_index(st, RAY_FIRST, slot)].w;
     p.iteration = v.iteration & 0xffffff;
     p.depth = v.depth & 0xffffff;
     p.opaque = v.opaque & 0xffffff;
     p.layers = v.layers;
     p.chains = (v.iteration >> 24) | ((v.depth >> 24) << 8) | ((v.opaque >> 24) << 16);
     p.flags = v.flags;
-    p.rays = v.rays;
+    p.rays = st.words[word_index(st, SPAN_FIRST, slot)].w;
     p.throughput = v.throughput;
     p.radiance = v.radiance;
     p.keep = v.keep;
@@ -511,20 +503,19 @@ void store_loop(PathRoot r, uint slot, PathLoop p)
 {
     PathStages* st = r.stages;
     StoredLoop v;
-    v.dimension = p.rng.dimension;
     v.iteration = p.iteration | ((p.chains & 0xff) << 24);
     v.depth = p.depth | (((p.chains >> 8) & 0xff) << 24);
     v.opaque = p.opaque | ((p.chains >> 16) << 24);
     v.layers = p.layers;
     // The sky a path keeps is its throughput where its camera ray met nothing.
     v.flags = any(p.sky > 0.0) ? p.flags | LOOP_SKY : p.flags & ~LOOP_SKY;
-    v.rays = p.rays;
     v.throughput = p.throughput;
     v.radiance = p.radiance;
     v.keep = p.keep;
     v.cone = p.cone;
-    v._spare = uint2(0);
     store_words<StoredLoop, LOOP_WORDS>(st.words, st.capacity, LOOP_FIRST, slot, v);
+    st.words[word_index(st, RAY_FIRST, slot)].w = p.rng.dimension;
+    st.words[word_index(st, SPAN_FIRST, slot)].w = p.rays;
     if (interiors_tracked(r))
     {
         StoredEntered e = { p.entered, p.entered_at, p.entered_normal };
@@ -540,86 +531,120 @@ uint pending_key(PathRoot r, uint slot)
     return r.stages.words[LOOP_FIRST * r.stages.capacity + slot].w >> LOOP_KEY_SHIFT;
 }
 
-PathPending load_pending(PathRoot r, uint slot)
+// The vertex the trace stage left `slot`'s path: its hit and corners, or with `medium` the
+// scatter or way out it made, which takes the corners' words.
+PathPending load_pending(PathRoot r, uint slot, bool medium)
 {
     PathStages* st = r.stages;
-    StoredPending v = load_words<StoredPending, PENDING_WORDS>(st.words, st.capacity, PENDING_FIRST, slot);
+    uint4 ids = st.words[word_index(st, SPAN_FIRST, slot)];
+    uint4 at = st.words[word_index(st, SPAN_FIRST + 1, slot)];
     PathPending q = (PathPending)0;
-    q.hit.hit = (v.flags & HIT_HIT) != 0;
-    q.hit.triangle = (v.flags & HIT_TRIANGLE) != 0;
-    q.hit.front_face = (v.flags & HIT_FRONT) != 0;
-    q.hit.class_id = v.flags >> HIT_CLASS_SHIFT;
-    q.hit.t = v.hit_t;
-    q.hit.instance_index = v.instance_index;
-    q.hit.custom_index = v.custom_index;
-    q.hit.geometry_index = v.geometry_index;
-    q.hit.primitive_index = v.primitive_index;
-    q.hit.cluster_id = v.cluster_id;
-    q.hit.barycentrics = v.barycentrics;
-    q.positions = v.positions;
-    q.t = v.t;
-    // The trace stage makes a scatter or a way out only where paths track interiors.
-    if (interiors_tracked(r))
+    q.hit.hit = (at.w & HIT_HIT) != 0;
+    q.hit.triangle = (at.w & HIT_TRIANGLE) != 0;
+    q.hit.front_face = (at.w & HIT_FRONT) != 0;
+    q.hit.class_id = at.w >> HIT_CLASS_SHIFT;
+    q.hit.instance_index = ids.x;
+    q.hit.cluster_id = int(ids.y);
+    q.hit.primitive_index = ids.z;
+    q.hit.barycentrics = asfloat(at.xy);
+    q.t = asfloat(at.z);
+    q.hit.t = q.t;
+    if (medium)
     {
-        StoredMedium m = load_words<StoredMedium, MEDIUM_WORDS>(st.words, st.capacity, MEDIUM_FIRST, slot);
+        StoredMedium m = load_words<StoredMedium, 3>(st.words, st.capacity, SPAN_FIRST + 2, slot);
         q.point = m.point;
         q.normal = m.normal;
         q.dir = m.dir;
         q.value = m.value;
         q.medium = m.medium;
     }
+    else
+    {
+        Words<3> w;
+        [ForceUnroll]
+        for (uint k = 0; k < 3; k++)
+            w.w[k] = st.words[word_index(st, SPAN_FIRST + 2 + k, slot)];
+        float3 positions[3] = reinterpret<float3[3]>(w);
+        q.positions = positions;
+    }
     return q;
 }
 
-void store_pending(PathRoot r, uint slot, PathPending q)
+// The span's last three words but their last scalar, the ray's flags.
+void store_span_tail(PathStages* st, uint slot, Words<3> w)
 {
-    PathStages* st = r.stages;
-    StoredPending v;
-    v.flags = (q.hit.hit ? HIT_HIT : 0) | (q.hit.triangle ? HIT_TRIANGLE : 0) | (q.hit.front_face ? HIT_FRONT : 0) | (q.hit.class_id << HIT_CLASS_SHIFT);
-    v.hit_t = q.hit.t;
-    v.instance_index = q.hit.instance_index;
-    v.custom_index = q.hit.custom_index;
-    v.geometry_index = q.hit.geometry_index;
-    v.primitive_index = q.hit.primitive_index;
-    v.cluster_id = q.hit.cluster_id;
-    v.barycentrics = q.hit.barycentrics;
-    v.positions = q.positions;
-    v.t = q.t;
-    store_words<StoredPending, PENDING_WORDS>(st.words, st.capacity, PENDING_FIRST, slot, v);
-    if (interiors_tracked(r))
-    {
-        StoredMedium m = { q.point, q.normal, q.dir, q.value, q.medium };
-        store_words<StoredMedium, MEDIUM_WORDS>(st.words, st.capacity, MEDIUM_FIRST, slot, m);
-    }
+    st.words[word_index(st, SPAN_FIRST + 2, slot)] = w.w[0];
+    st.words[word_index(st, SPAN_FIRST + 3, slot)] = w.w[1];
+    st.words[word_index(st, SPAN_FIRST + 4, slot)].xyz = w.w[2].xyz;
 }
 
-LayerRay load_ray(PathRoot r, uint slot)
+// `q.t` is the hit's distance too: a given hit's on a path's start, the ray's length after.
+void store_pending(PathRoot r, uint slot, PathPending q, bool medium)
 {
-    StoredRay v = load_words<StoredRay, RAY_WORDS>(r.stages.words, r.stages.capacity, RAY_FIRST, slot);
+    PathStages* st = r.stages;
+    uint flags = (q.hit.hit ? HIT_HIT : 0) | (q.hit.triangle ? HIT_TRIANGLE : 0) | (q.hit.front_face ? HIT_FRONT : 0) | (q.hit.class_id << HIT_CLASS_SHIFT);
+    st.words[word_index(st, SPAN_FIRST, slot)].xyz = uint3(q.hit.instance_index, uint(q.hit.cluster_id), q.hit.primitive_index);
+    st.words[word_index(st, SPAN_FIRST + 1, slot)] = uint4(asuint(q.hit.barycentrics), asuint(q.t), flags);
+    if (medium)
+    {
+        StoredMedium m = { q.point, q.normal, q.dir, q.value, q.medium };
+        store_span_tail(st, slot, reinterpret<Words<3>>(m));
+    }
+    else
+        store_span_tail(st, slot, reinterpret<Words<3>>(q.positions));
+}
+
+// The ray `slot`'s last vertex left. Its origin lasts to the trace alone, so a shade, `after`
+// it, reads none; its start is the origin but where interiors have a segment between the two.
+LayerRay load_ray(PathRoot r, uint slot, bool after)
+{
+    PathStages* st = r.stages;
+    StoredRay v = load_words<StoredRay, RAY_WORDS>(st.words, st.capacity, RAY_FIRST, slot);
+    uint flags = st.words[word_index(st, SPAN_FIRST + 4, slot)].w;
     LayerRay ray;
-    ray.origin = v.origin;
+    ray.origin = float3(0.0);
+    ray.start = float3(0.0);
+    if (!after)
+    {
+        ray.origin = asfloat(st.words[word_index(st, SPAN_FIRST, slot)].xyz);
+        ray.start = ray.origin;
+        if (interiors_tracked(r))
+            ray.start = asfloat(st.words[word_index(st, INTERIOR_FIRST + INTERIOR_WORDS - 1, slot)].yzw);
+    }
     ray.dir = v.dir;
-    ray.start = v.start;
     ray.pdf = v.pdf;
     ray.run = v.run;
     ray.normal = v.normal;
     ray.from = v.from;
-    ray.diffuse = (v.flags & RAY_DIFFUSE) != 0;
-    ray.chain = (v.flags & RAY_CHAIN) != 0;
-    ray.scatter = (v.flags & RAY_SCATTER) != 0;
-    ray.local = (v.flags & RAY_LOCAL) != 0;
-    ray.lit = (v.flags & RAY_LIT) != 0;
+    ray.diffuse = (flags & RAY_DIFFUSE) != 0;
+    ray.chain = (flags & RAY_CHAIN) != 0;
+    ray.scatter = (flags & RAY_SCATTER) != 0;
+    ray.local = (flags & RAY_LOCAL) != 0;
+    ray.lit = (flags & RAY_LIT) != 0;
     return ray;
 }
 
 void store_ray(PathRoot r, uint slot, LayerRay ray)
 {
+    PathStages* st = r.stages;
     uint flags = (ray.diffuse ? RAY_DIFFUSE : 0) | (ray.chain ? RAY_CHAIN : 0) | (ray.scatter ? RAY_SCATTER : 0) | (ray.local ? RAY_LOCAL : 0) | (ray.lit ? RAY_LIT : 0);
-    StoredRay v = { ray.origin, ray.dir, ray.start, ray.pdf, ray.run, ray.normal, ray.from, flags };
-    store_words<StoredRay, RAY_WORDS>(r.stages.words, r.stages.capacity, RAY_FIRST, slot, v);
+    st.words[word_index(st, RAY_FIRST, slot)].xyz = asuint(ray.dir);
+    st.words[word_index(st, RAY_FIRST + 1, slot)] = uint4(asuint(ray.normal), asuint(ray.pdf));
+    st.words[word_index(st, RAY_FIRST + 2, slot)] = uint4(asuint(ray.from), asuint(ray.run));
+    st.words[word_index(st, SPAN_FIRST, slot)].xyz = asuint(ray.origin);
+    st.words[word_index(st, SPAN_FIRST + 4, slot)].w = flags;
+    if (interiors_tracked(r))
+        st.words[word_index(st, INTERIOR_FIRST + INTERIOR_WORDS - 1, slot)].yzw = asuint(ray.start);
 }
 
-// The path's interiors, which only paths that may lie in one keep.
+// The point a ray's light densities are taken from, apart from the rest of the ray.
+void store_ray_from(PathRoot r, uint slot, float3 from)
+{
+    r.stages.words[word_index(r.stages, RAY_FIRST + 2, slot)].xyz = asuint(from);
+}
+
+// The path's interiors, which only paths that may lie in one keep. The last word's other
+// scalars are the ray's start.
 Interior load_interior(PathRoot r, uint slot)
 {
     if (!interiors_tracked(r))
@@ -629,25 +654,35 @@ Interior load_interior(PathRoot r, uint slot)
 
 void store_interior(PathRoot r, uint slot, Interior v)
 {
-    if (interiors_tracked(r))
-        store_words<Interior, INTERIOR_WORDS>(r.stages.words, r.stages.capacity, INTERIOR_FIRST, slot, v);
+    static_assert(sizeof(Interior) == (INTERIOR_WORDS - 1) * 16 + 4, "the interiors leave no room for the ray's start");
+    PathStages* st = r.stages;
+    if (!interiors_tracked(r))
+        return;
+    Words<INTERIOR_WORDS> w = reinterpret<Words<INTERIOR_WORDS>>(v);
+    [ForceUnroll]
+    for (uint k = 0; k < INTERIOR_WORDS - 1; k++)
+        st.words[word_index(st, INTERIOR_FIRST + k, slot)] = w.w[k];
+    st.words[word_index(st, INTERIOR_FIRST + INTERIOR_WORDS - 1, slot)].x = w.w[INTERIOR_WORDS - 1].x;
 }
 
-// A deferred shadow ray: the fields from `PathShadowRay.start` on lie in words of their own
-// that only paths that track interiors keep.
+// A deferred shadow ray, in the span from a shade to the trace: the fields from
+// `PathShadowRay.start` on lie in `PathStages.shadows`, which only paths that track interiors
+// keep.
 PathShadowRay load_shadow(PathRoot r, uint slot)
 {
-    static_assert(sizeof(PathShadowRay) - sizeof(Interior) == (SHADOW_WORDS + 3) * 16, "PathShadowRay.arrived shares a word");
-    static_assert(sizeof(PathShadowRay) <= (SHADOW_WORDS + SHADOW_INTERIOR_WORDS) * 16, "a shadow ray outgrows its words");
+    static_assert(sizeof(PathShadowRay) - sizeof(Interior) == 6 * 16, "PathShadowRay.arrived shares a word");
+    static_assert(sizeof(PathShadowRay) <= (3 + SHADOW_INTERIOR_WORDS) * 16, "a shadow ray outgrows its words");
     PathStages* st = r.stages;
     bool interiors = interiors_tracked(r);
-    Words<SHADOW_WORDS + SHADOW_INTERIOR_WORDS> w;
+    Words<3 + SHADOW_INTERIOR_WORDS> w;
     [ForceUnroll]
-    for (uint k = 0; k < SHADOW_WORDS + SHADOW_INTERIOR_WORDS; k++)
+    for (uint k = 0; k < 3 + SHADOW_INTERIOR_WORDS; k++)
     {
         w.w[k] = uint4(0);
-        if (k < SHADOW_WORDS || interiors)
-            w.w[k] = st.shadows[k * st.capacity + slot];
+        if (k < 3)
+            w.w[k] = st.words[word_index(st, SPAN_FIRST + 1 + k, slot)];
+        else if (interiors)
+            w.w[k] = st.shadows[(k - 3) * st.capacity + slot];
     }
     PathShadowRay q = reinterpret<PathShadowRay>(w);
     if (!interiors)
@@ -663,12 +698,14 @@ void store_shadow(PathRoot r, uint slot, PathShadowRay q)
 {
     PathStages* st = r.stages;
     bool interiors = interiors_tracked(r);
-    Words<SHADOW_WORDS + SHADOW_INTERIOR_WORDS> w = reinterpret<Words<SHADOW_WORDS + SHADOW_INTERIOR_WORDS>>(q);
+    Words<3 + SHADOW_INTERIOR_WORDS> w = reinterpret<Words<3 + SHADOW_INTERIOR_WORDS>>(q);
     [ForceUnroll]
-    for (uint k = 0; k < SHADOW_WORDS + SHADOW_INTERIOR_WORDS; k++)
+    for (uint k = 0; k < 3 + SHADOW_INTERIOR_WORDS; k++)
     {
-        if (k < SHADOW_WORDS || interiors)
-            st.shadows[k * st.capacity + slot] = w.w[k];
+        if (k < 3)
+            st.words[word_index(st, SPAN_FIRST + 1 + k, slot)] = w.w[k];
+        else if (interiors)
+            st.shadows[(k - 3) * st.capacity + slot] = w.w[k];
     }
 }
 
@@ -1130,17 +1167,24 @@ void begin_path(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler rng
     PathLoop p;
     ShadeState c;
     start_state(r, pixel, start, rng, staged_record(r, slot).photon(), f, p, c);
+    bool camera = start.mask != 0;
+    bool given = camera && start.given;
+    // A given hit takes the span, where the ray's origin would lie: the trace stage finds the
+    // origin where the ray keeps the point its light densities are taken from, which a camera
+    // ray has none of.
+    if (given)
+        c.ray.from = start.origin;
     store_ray(r, slot, c.ray);
     store_interior(r, slot, c.interior);
     store_stack(r, slot, c.stack);
     store_spectral(r, slot, c.spectral);
-    bool camera = start.mask != 0;
-    if (camera && start.given)
+    if (given)
     {
         PathPending pending = (PathPending)0;
         pending.hit = start.hit;
         pending.positions = start.positions;
-        store_pending(r, slot, pending);
+        pending.t = start.hit.t;
+        store_pending(r, slot, pending, false);
     }
     store_loop(r, slot, p);
     append(r, camera ? QUEUE_TRACE : opaque_queue(r.scene, (Hit)0, true), round, slot);
@@ -1384,7 +1428,7 @@ void medium_vertex(PathRoot r, uint slot, PathFixed f, inout PathLoop p, PathPen
     set_flag(p.flags, LOOP_MEDIUM, true);
     set_flag(p.flags, LOOP_LEAVING, leaving);
     set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
-    store_pending(r, slot, pending);
+    store_pending(r, slot, pending, true);
     store_loop(r, slot, p);
     append(r, QUEUE_OTHER, round_now(r), slot);
 }
@@ -1454,7 +1498,7 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         finish_path(r, slot, f, p);
         return;
     }
-    LayerRay ray = load_ray(r, slot);
+    LayerRay ray = load_ray(r, slot, false);
     Interior interior = load_interior(r, slot);
     uint2 pixel = f.pixel;
     PathContext x = path_context(r, record, pixel);
@@ -1482,9 +1526,14 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     float3 own = ray.lit ? float3(0.0) : through ? p.keep : float3(1.0);
     if (camera && camera_ray.given)
     {
-        PathPending given = load_pending(r, slot);
+        PathPending given = load_pending(r, slot, false);
         h = given.hit;
         positions = given.positions;
+        // The hit lay where the ray's origin would (`begin_path`).
+        ray.origin = ray.from;
+        ray.start = ray.from;
+        ray.from = float3(0.0);
+        store_ray_from(r, slot, ray.from);
     }
     else
     {
@@ -1683,7 +1732,7 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     }
     set_flag(p.flags, LOOP_GBUFFER_HIT, gbuffer);
     set_flag(p.flags, LOOP_MEDIUM, false);
-    store_pending(r, slot, pending);
+    store_pending(r, slot, pending, false);
     store_loop(r, slot, p);
     append(r, !gbuffer && is_layer(h) ? QUEUE_OTHER : opaque_queue(s, h, gbuffer), round_now(r), slot);
 }
@@ -2177,9 +2226,9 @@ public void shade_stage<C : ICoherence, S : ISurface, M : IMedium, let K : uint>
     C.point(pending_key(r, slot), KEY_BITS + 1);
     PathFixed f = load_fixed(r, slot);
     PathLoop p = load_loop(r, slot);
-    PathPending pending = load_pending(r, slot);
+    PathPending pending = load_pending(r, slot, K == QUEUE_OTHER && has(p.flags, LOOP_MEDIUM));
     ShadeState c;
-    c.ray = load_ray(r, slot);
+    c.ray = load_ray(r, slot, true);
     c.interior = load_interior(r, slot);
     c.stack = load_stack(r, slot);
     c.spectral = load_spectral(r, slot);
@@ -2241,9 +2290,8 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, 
         // The walk takes the place of the vertex's ray.
         WalkEntry entry = { sv.l, wi };
         store_walk(r, slot, entry);
-        // The walk stage goes on from the ray, interiors and stack the path holds here, which no
-        // stage has stored for a vertex the primary stage shades.
-        store_ray(r, slot, c.ray);
+        // The walk stage goes on from the interiors and stack the path holds here, which no stage
+        // has stored for a vertex the primary stage shades. The walk's exit leaves the next ray.
         store_interior(r, slot, c.interior);
         store_stack(r, slot, c.stack);
         set_flag(p.flags, LOOP_SHADOW, nee.traced);
@@ -2273,7 +2321,8 @@ public void walk_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     StagedRecord record = staged_record(r, slot);
     PathContext x = path_context(r, record, f.pixel);
     ShadeState c;
-    c.ray = load_ray(r, slot);
+    // The exit's shade leaves the next ray: nothing reads the one that reached the vertex.
+    c.ray = (LayerRay)0;
     c.interior = load_interior(r, slot);
     c.stack = load_stack(r, slot);
     c.spectral = load_spectral(r, slot);
@@ -2402,7 +2451,7 @@ public void tail_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         resume.entered = p.entered;
         resume.entered_at = p.entered_at;
         resume.entered_normal = p.entered_normal;
-        resume.ray = load_ray(r, slot);
+        resume.ray = load_ray(r, slot, false);
         resume.spectral = spectral;
         record.tail = true;
         record.layers = p.layers;

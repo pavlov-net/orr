@@ -27,14 +27,13 @@ const QUEUE_FINISH: u64 = 4;
 const QUEUE_RICH: u64 = 5;
 const STAGE_QUEUES: u64 = 6;
 /// Its words of 16 bytes per path slot: the state every path keeps and the parts of paths that
-/// may lie in an interior, track plane stacks and may split by wavelength; a deferred shadow
-/// ray, and the interiors its vertex arrived with; the record, and an update path's; and a
-/// walk's entry.
-const BASE_WORDS: u64 = 15;
-const INTERIOR_PARTS: u64 = 11;
+/// may lie in an interior, track plane stacks and may split by wavelength; what a deferred
+/// shadow ray keeps of its vertex where paths track interiors; the record, and an update
+/// path's; and a walk's entry.
+const BASE_WORDS: u64 = 12;
+const INTERIOR_PARTS: u64 = 8;
 const STACK_PART: u64 = 5;
 const SPECTRAL_PART: u64 = 5;
-const SHADOW_WORDS: u64 = 3;
 const SHADOW_INTERIOR_WORDS: u64 = 9;
 const RECORD_WORDS: u64 = 2;
 const UPDATE_RECORD_WORDS: u64 = 9;
@@ -1058,7 +1057,7 @@ impl StateParts {
     }
 
     fn shadow_words(self) -> u64 {
-        SHADOW_WORDS + Self::part(self.interiors, SHADOW_INTERIOR_WORDS)
+        Self::part(self.interiors, SHADOW_INTERIOR_WORDS)
     }
 
     /// Bytes a path slot takes.
@@ -1088,7 +1087,7 @@ pub(crate) struct StagedMemory {
     _walks: Option<Allocation<[u32; 4]>>,
     _lists: Allocation<u32>,
     _words: Allocation<[u32; 4]>,
-    _shadows: Allocation<[u32; 4]>,
+    _shadows: Option<Allocation<[u32; 4]>>,
     _records: Allocation<[u32; 4]>,
 }
 
@@ -1122,7 +1121,11 @@ impl StagedMemory {
             "staged path lists",
         )?;
         let state = words(parts.state_words() * n, "staged path state")?;
-        let shadows = words(parts.shadow_words() * n, "staged shadow rays")?;
+        let shadows = if parts.interiors {
+            Some(words(parts.shadow_words() * n, "staged shadow rays")?)
+        } else {
+            None
+        };
         // A slice of update paths holds one record at least.
         let records = words(
             (RECORD_WORDS * n).max(UPDATE_RECORD_WORDS),
@@ -1144,7 +1147,7 @@ impl StagedMemory {
             queues: queues.gpu(),
             lists: lists.gpu(),
             words: state.gpu(),
-            shadows: shadows.gpu(),
+            shadows: shadows.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             records: records.gpu(),
             walks: walks.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
         };

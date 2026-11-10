@@ -129,7 +129,7 @@ public struct PathStages
     public StageQueue* queues;          // STAGE_QUEUES per round
     public uint* lists;                 // a list of `capacity` slots per queue
     public uint4* words;                // a path's state: the words its root's features name (path/stages.slang)
-    public uint4* shadows;              // a deferred shadow ray: SHADOW_WORDS words per slot, and its interiors' where tracked
+    public uint4* shadows;              // what a deferred shadow ray keeps of its vertex where paths track interiors; null elsewhere
     public uint4* records;              // RECORD_WORDS words per slot: the path records
     public uint4* walks;                // WALK_WORDS words per slot: a walk's entry; null where no material walks
 }
