@@ -72,8 +72,8 @@ pub(crate) enum Queue {
 
 const QUEUES: usize = 5;
 
-/// How soon a job from [`Loading::spawn_result_at`] runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How soon a job from [`Loading::spawn_result_at`] runs, the soonest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Urgency {
     /// A frame or a caller waits on it: behind streamed loads alone, as [`Loading::spawn`]'s.
     Needed,
@@ -137,6 +137,32 @@ impl<T> JobState<T> {
     }
 }
 
+impl<T> JobSlot<T> {
+    /// Runs the job where it is still queued: its handle may have canceled it, or another of
+    /// its places in the queues ([`JobResult::raise`]) have come up first.
+    fn run(&self) {
+        let job = {
+            let mut state = self.state.lock().unwrap();
+            match std::mem::replace(&mut *state, JobState::Running) {
+                JobState::Queued(job) => job,
+                other => {
+                    *state = other;
+                    return;
+                }
+            }
+        };
+        let result = catch_unwind(AssertUnwindSafe(job)).map_err(|payload| {
+            let text = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned());
+            text.unwrap_or_else(|| "panicked".to_owned())
+        });
+        *self.state.lock().unwrap() = JobState::Finished(result);
+        self.finished.notify_all();
+    }
+}
+
 impl<T> JobResult<T> {
     /// Whether a thread has started the job.
     pub fn started(&self) -> bool {
@@ -166,6 +192,20 @@ impl<T> JobResult<T> {
     /// made the job.
     pub fn wait(&self, loading: &Loading) {
         self.wait_at(loading, Urgency::Idle);
+    }
+
+    /// Queues the job again at `urgency`, sooner than it was queued: it runs when the first
+    /// of its places in the queues comes up, once. For a job queued behind work that something
+    /// has since come to wait on.
+    pub fn raise(&self, loading: &Loading, urgency: Urgency)
+    where
+        T: Send + 'static,
+    {
+        if self.started() {
+            return;
+        }
+        let slot = Arc::clone(&self.slot);
+        loading.queue(urgency.queue(), move || slot.run());
     }
 
     /// [`Self::wait`] for a job queued at `urgency`, running only the queued jobs that come
@@ -410,28 +450,7 @@ impl Loading {
             finished: Condvar::new(),
         });
         let out = Arc::clone(&slot);
-        self.queue(urgency.queue(), move || {
-            let job = {
-                let mut state = out.state.lock().unwrap();
-                match std::mem::replace(&mut *state, JobState::Running) {
-                    JobState::Queued(job) => job,
-                    // The handle canceled it.
-                    canceled => {
-                        *state = canceled;
-                        return;
-                    }
-                }
-            };
-            let result = catch_unwind(AssertUnwindSafe(job)).map_err(|payload| {
-                let text = payload
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_owned())
-                    .or_else(|| payload.downcast_ref::<String>().cloned());
-                text.unwrap_or_else(|| "panicked".to_owned())
-            });
-            *out.state.lock().unwrap() = JobState::Finished(result);
-            out.finished.notify_all();
-        });
+        self.queue(urgency.queue(), move || out.run());
         JobResult { slot }
     }
 
@@ -1139,5 +1158,27 @@ mod tests {
         drop(loading.spawn_result(move || flag.store(true, Ordering::Relaxed)));
         assert!(loading.run_one());
         assert!(!ran.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_raised_job_runs_ahead_of_mounts_and_once() {
+        let loading = Loading::new(true, 1 << 20, None, Arc::new(InFlight::new(u64::MAX))).unwrap();
+        loading.stop_workers();
+        let mounted = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&mounted);
+        loading.queue(Queue::Mount, move || flag.store(true, Ordering::Relaxed));
+        let runs = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&runs);
+        let job =
+            loading.spawn_result_at(Urgency::Idle, move || count.fetch_add(1, Ordering::Relaxed));
+        // Where it stands, behind the mount, a wait for it as needed would not reach it.
+        job.raise(&loading, Urgency::Needed);
+        job.wait_at(&loading, Urgency::Needed);
+        assert_eq!(job.take(), Some(Ok(0)));
+        assert!(!mounted.load(Ordering::Relaxed));
+        // Its place in the idle queue is still there and does nothing.
+        while loading.run_one() {}
+        assert!(mounted.load(Ordering::Relaxed));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
     }
 }

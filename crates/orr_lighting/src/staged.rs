@@ -296,8 +296,8 @@ fn compile_stage(
     Ok(pipeline)
 }
 
-/// A compile job and the urgency it was queued at.
-type Queued<T> = Arc<(Urgency, JobResult<Result<T, Error>>)>;
+/// A compile job and the urgency it is queued at.
+type Queued<T> = Arc<(Mutex<Urgency>, JobResult<Result<T, Error>>)>;
 
 /// A pipeline made after the kernels are ready, in a job of its own on the loading side;
 /// whoever asks for it does without until then.
@@ -372,7 +372,8 @@ impl<T: Send + 'static> Late<T> {
     }
 
     /// Starts `compile` unless the pipeline is ready, compiling or failed: as a job on
-    /// `loading`, or without one here.
+    /// `loading`, or without one here. A job queued less urgently than this asks moves up to
+    /// where it asks.
     pub(crate) fn start(
         &self,
         device: &Device,
@@ -380,13 +381,23 @@ impl<T: Send + 'static> Late<T> {
         compile: impl FnOnce(&Device) -> Result<T, Error> + Send + 'static,
     ) {
         let mut job = self.job.lock().unwrap();
-        if self.ready.get().is_some() || self.failed.get().is_some() || job.is_some() {
+        if self.ready.get().is_some() || self.failed.get().is_some() {
+            return;
+        }
+        if let Some(queued) = job.as_ref() {
+            if let Some((loading, urgency)) = loading {
+                let mut at = queued.0.lock().unwrap();
+                if urgency < *at {
+                    queued.1.raise(loading, urgency);
+                    *at = urgency;
+                }
+            }
             return;
         }
         match loading {
             Some((loading, urgency)) => {
                 let queued = crate::view::compile_job(device, loading, urgency, compile);
-                *job = Some(Arc::new((urgency, queued)));
+                *job = Some(Arc::new((Mutex::new(urgency), queued)));
             }
             None => self.settle(compile(device)),
         }
@@ -398,7 +409,8 @@ impl<T: Send + 'static> Late<T> {
         // The job is waited for without its lock, which whoever asks whether it is ready takes.
         let queued = self.job.lock().unwrap().clone();
         if let (Some(loading), Some(queued)) = (loading, queued) {
-            queued.1.wait_at(loading, queued.0);
+            let urgency = *queued.0.lock().unwrap();
+            queued.1.wait_at(loading, urgency);
         }
         self.get().ok_or_else(|| {
             self.failure().unwrap_or_else(|| Error::LateCompile {
