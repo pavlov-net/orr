@@ -126,6 +126,56 @@ impl Camera {
     fn rotation(&self) -> Quat {
         Quat::from_rotation_y(self.yaw) * Quat::from_rotation_x(self.pitch)
     }
+
+    /// `--view`'s value: `x,y,z,yaw,pitch,fov`, the angles in degrees.
+    fn parse(view: &str) -> Self {
+        let v: Vec<f32> = view
+            .split(',')
+            .map(|x| x.trim().parse().expect("a --view number"))
+            .collect();
+        let [x, y, z, yaw, pitch, fov] = v[..] else {
+            panic!("--view takes x,y,z,yaw,pitch,fov");
+        };
+        Camera {
+            name: "view",
+            position: Vec3::new(x, y, z),
+            yaw: yaw.to_radians(),
+            pitch: pitch.to_radians(),
+            fov_y: fov.to_radians(),
+        }
+    }
+
+    /// This view as a `--view` value.
+    fn view(&self) -> String {
+        let p = self.position;
+        format!(
+            "{:.3},{:.3},{:.3},{:.2},{:.2},{:.2}",
+            p.x,
+            p.y,
+            p.z,
+            self.yaw.to_degrees(),
+            self.pitch.to_degrees(),
+            self.fov_y.to_degrees()
+        )
+    }
+}
+
+/// Logs `camera` as a `--view` value and appends it to `zorah-views.txt` beside the executable.
+fn note_view(camera: &Camera) {
+    use std::io::Write as _;
+    let view = camera.view();
+    log::info!("--view {view}");
+    let path = std::env::current_exe()
+        .expect("executable path")
+        .with_file_name("zorah-views.txt");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path);
+    match file.and_then(|mut f| writeln!(f, "{view}")) {
+        Ok(()) => {}
+        Err(e) => log::warn!("{}: {e}", path.display()),
+    }
 }
 
 /// What the export's files say beyond the glTF.
@@ -321,8 +371,22 @@ fn budgets(pack: &Path) -> Budgets {
     log::info!("the archive's meshes take {pages} mesh page table entries");
     let defaults = Budgets::default();
     let fit = |n: u64, default: u32| u32::try_from(n).expect("a u32 count").max(default);
+    let mesh_page_pool =
+        std::env::var("ZORAH_MESH_POOL_GIB").map_or(defaults.mesh_page_pool, |g| {
+            orr::PoolSize::Bytes(
+                g.parse::<u64>()
+                    .expect("ZORAH_MESH_POOL_GIB is a count of GiB")
+                    << 30,
+            )
+        });
+    let count = |name: &str, default: u32| {
+        std::env::var(name).map_or(default, |n| n.parse().expect("a count"))
+    };
     Budgets {
         mesh_pages: fit(pages, defaults.mesh_pages),
+        mesh_page_pool,
+        rt_cut_clusters: count("ZORAH_RT_CUT_CLUSTERS", defaults.rt_cut_clusters),
+        rt_cut_blas: count("ZORAH_RT_CUT_BLAS", defaults.rt_cut_blas),
         ..defaults
     }
 }
@@ -471,7 +535,7 @@ impl Readout {
         let rate = |n: f64| n / self.seconds;
         let dropped = |source| r.dropped_from(source);
         self.text = format!(
-            "{:.1} fps  {:.2} ms\ndetail x{:.3}, gathers x{:.3}, mesh pages {:.0} of {:.0} MiB wanted\nmesh pages {}\ntextures {}\ninstance pages {}\nCLAS {:.0} / {:.0} MiB used, {:.0} retries/s, range full {} times, cluster ids full {} times\nread {:.0} MiB/s, {:.0} loads/s landed\n{} loads  {} evictions  {} failed  {} out of memory  {} pages over budget\ndropped: {} traversal, {} finer cuts, {} textures, {} instance pages, {} hints\n{} waiting  longest closure {}\nfeedback lost: {} requests, {} texture raises",
+            "{:.1} fps  {:.2} ms\ndetail x{:.3}, gathers x{:.3}, mesh pages {:.0} of {:.0} MiB wanted\nmesh pages {}\ntextures {}\ninstance pages {}\nCLAS {:.0} / {:.0} MiB used, {:.0} retries/s, range full {} times, cluster ids full {} times\nread {:.0} MiB/s, {:.0} loads/s landed\n{} loads  {} evictions  {} failed  {} out of memory  {} pages over budget\ndropped: {} traversal, {} finer cuts, {} textures, {} instance pages, {} hints\n{} waiting  longest closure {}\nfeedback lost: {} requests, {} texture raises\nray cuts: {} gathered ({} cached, {} shared, {} fell back), {} merged, {} BLAS built of {} CLAS, {} clusters dropped\nraster: {} candidate items, {} dropped, {} nodes dropped",
             f64::from(self.frames) / self.seconds,
             self.seconds * 1000.0 / f64::from(self.frames),
             detail.memory_scale,
@@ -502,7 +566,21 @@ impl Readout {
             r.longest_closure,
             cuts.requests_lost,
             r.texture_feedback_lost,
+            cuts.rt_gathered,
+            cuts.rt_cached,
+            cuts.rt_shared,
+            cuts.rt_fallback,
+            cuts.rt_merged,
+            cuts.rt_built,
+            cuts.rt_built_clas,
+            cuts.rt_clusters_dropped,
+            cuts.candidate_items,
+            cuts.candidates_dropped,
+            cuts.nodes_dropped,
         );
+        if std::env::var_os("ZORAH_LOG_READOUT").is_some() {
+            log::info!("readout\n{}", self.text);
+        }
         self.start = *r;
         self.frames = 0;
         self.seconds = 0.0;
@@ -534,8 +612,8 @@ fn run(options: &Options) -> Option<Capture> {
         return None;
     }
     let cameras = export.cameras;
-    // The view: the export's camera last jumped to, as flown since.
-    let mut camera = cameras[0];
+    // The view: `--view`'s, else the export's camera last jumped to, as flown since.
+    let mut camera = options.value("--view").map_or(cameras[0], Camera::parse);
     let title = |camera: &Camera| format!("orr zorah: {}", camera.name);
 
     let gpu = device();
@@ -712,6 +790,9 @@ fn run(options: &Options) -> Option<Capture> {
                     streaming = Streaming::new(Instant::now(), "the cut", *renderer.residency());
                     w.set_title(&title(&camera));
                 }
+                if key == KeyCode::KeyC {
+                    note_view(&camera);
+                }
             }
             fly(w, &mut camera, dt as f32);
         }
@@ -734,8 +815,13 @@ fn run(options: &Options) -> Option<Capture> {
             (Some(t), _) => ViewTarget::Texture(t),
             (None, Some((_, extent))) => {
                 let text = format!(
-                    "{}  {} x {}\n{}\n{}",
-                    camera.name, extent[0], extent[1], streaming.status, readout.text
+                    "{}  {} x {}  view {}\n{}\n{}",
+                    camera.name,
+                    extent[0],
+                    extent[1],
+                    camera.view(),
+                    streaming.status,
+                    readout.text
                 );
                 overlay.layout(extent, time, &text);
                 ViewTarget::Display
