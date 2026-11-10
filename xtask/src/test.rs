@@ -429,9 +429,11 @@ struct Job {
 /// Names the directory of the pipeline store to test devices.
 const STORE_VAR: &str = "ORR_TEST_PIPELINE_STORE";
 
-/// The most the pipeline store keeps. Every test device loads the whole store, at about 0.6 ms
-/// per MB, and a full set of path kernels takes about 350 MB of it.
-const STORE_BYTES: u64 = 4 << 30;
+/// The most the pipeline store keeps. What bounds it is that every test device merges the whole
+/// store when it is created; what fills it is a set of path stages for each scene mask the
+/// tests render, a rest kernel for many of them, and each bed mode's own sets, which a pass
+/// over the modes must find again.
+const STORE_BYTES: u64 = 16 << 30;
 
 /// The pipeline store test devices share: `STORE_VAR` if set, else one directory for every
 /// worktree of the clone, or in the workspace outside a clone. NVIDIA's driver keeps its shader
