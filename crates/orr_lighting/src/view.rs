@@ -2198,11 +2198,15 @@ impl LightingKernels {
             }
             Some(_) => {
                 view.photon_map = None;
+                view.staged_photons = None;
                 return Ok(GpuPtr::NULL);
             }
             None => {
                 view.photon_map = None;
                 if grid == GpuPtr::NULL || !scene.first_photons(pass.frame) {
+                    // No photons of this frame run in the view: it keeps no memory for them,
+                    // and the sets its last ones ran are no longer among those its frame ran.
+                    view.staged_photons = None;
                     return Ok(grid);
                 }
                 (grid, caustics.photons())
