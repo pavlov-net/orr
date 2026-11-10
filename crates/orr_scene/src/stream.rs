@@ -599,6 +599,11 @@ impl Streaming {
         self.residency.stats()
     }
 
+    /// See [`Residency::lower_budget`].
+    pub(crate) fn lower_budget(&mut self, class: ResidencyClass, bytes: u64) {
+        self.residency.lower_budget(class, bytes);
+    }
+
     /// The streamed pools' fill and the CLAS pool's pages.
     pub(crate) fn memory(&self, out: &mut SceneMemory) {
         let mut pools = vec![&self.pool, &self.staging, &self.tiles];

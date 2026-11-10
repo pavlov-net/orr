@@ -912,6 +912,12 @@ impl Renderer {
         self.scenes.residency()
     }
 
+    /// Lowers the budget of `class`'s streamed units to `bytes`, at most what it is: the
+    /// next frame evicts down to it.
+    pub fn lower_budget(&mut self, class: ResidencyClass, bytes: u64) {
+        self.scenes.lower_budget(class, bytes);
+    }
+
     /// What the streamed pools, the CLAS pool and the frames' upload windows hold, gathered
     /// on demand.
     pub fn scene_memory(&self) -> SceneMemory {

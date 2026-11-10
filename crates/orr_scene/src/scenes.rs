@@ -979,6 +979,12 @@ impl Scenes {
         self.core.mounts.streaming.stats()
     }
 
+    /// Lowers the budget of `class`'s streamed units to `bytes`, at most what it is: the
+    /// next step 1 evicts down to it, and the pools give back the blocks that empties.
+    pub fn lower_budget(&mut self, class: crate::ResidencyClass, bytes: u64) {
+        self.core.mounts.streaming.lower_budget(class, bytes);
+    }
+
     /// What the streamed pools, the CLAS pool and the frames' upload windows hold, gathered
     /// on demand; it can wait for a streamed CLAS build to submit.
     pub fn memory(&self) -> SceneMemory {

@@ -652,6 +652,17 @@ impl Residency {
         self.in_flight + self.shared.mounts() >= self.limits.in_flight
     }
 
+    /// Lowers class `class`'s budget without memory pressure to `bytes`, at most what it is;
+    /// the next `react` plans with it.
+    pub(crate) fn lower_budget(&mut self, class: ResidencyClass, bytes: u64) {
+        let budget = &mut self.limits.budgets[class as usize];
+        assert!(
+            bytes <= *budget,
+            "{class:?} budget raised to {bytes} from {budget}"
+        );
+        *budget = bytes;
+    }
+
     pub(crate) fn note_pages_over_budget(&mut self, count: u32) {
         self.stats.pages_over_budget = count;
     }
