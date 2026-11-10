@@ -1,5 +1,7 @@
 //! Device, memory, heaps, compute, timestamps and the empty TLAS.
 
+use std::time::{Duration, Instant};
+
 use gpu_suite::shaders::{
     atomic_max, bins, classify_bins, coopvec, fold, heap_views, pattern, rays, root_layout,
 };
@@ -8,7 +10,7 @@ use gpu_suite::{
     upload,
 };
 use orr_gpu::{
-    Device, DeviceDesc, Filter, Format, Generated, GpuPtr, Hazards, MemoryKind, SamplerDesc,
+    Device, DeviceDesc, Error, Filter, Format, Generated, GpuPtr, Hazards, MemoryKind, SamplerDesc,
     SamplerIndex, Sequence, ShaderStage, SpecData, Stages, TextureDesc, TextureMemory,
     TextureRegion, TextureUsage, Tlas, ViewDesc,
 };
@@ -259,6 +261,43 @@ fn a_folded_mask_writes_what_a_root_mask_writes() {
 }
 
 /// Traces 1024x1024 rays at `scene` through `entry`; returns the per-pixel results.
+/// A wait that goes on while the queue completes work outlasts its stall time behind a
+/// submission that completes within it, and ends once the queue has completed nothing for
+/// that long.
+#[test]
+fn a_wait_goes_on_while_the_queue_completes_work() {
+    let gate = device().create_host_timeline("gate").unwrap();
+    let after = |value| {
+        let list = render().command_list().unwrap();
+        render().submit(vec![list], &[gate.point(value)]).unwrap()
+    };
+    let (first, second) = (after(1), after(2));
+    let stall = Duration::from_secs(1);
+    // Both wait for the gate, so the queue completes nothing.
+    assert!(matches!(
+        render().wait_while_completing(second, stall),
+        Err(Error::Timeout)
+    ));
+    // The first completes inside one stall time and the second inside the next.
+    let started = Instant::now();
+    std::thread::scope(|threads| {
+        threads.spawn(|| {
+            std::thread::sleep(stall / 2);
+            gate.signal(1);
+            std::thread::sleep(stall * 4 / 5);
+            gate.signal(2);
+        });
+        render().wait_while_completing(second, stall).unwrap();
+    });
+    assert!(
+        started.elapsed() > stall,
+        "the second submission completed {:?} in, within one stall time",
+        started.elapsed()
+    );
+    assert!(render().completed() >= second.value().max(first.value()));
+    assert_clean();
+}
+
 fn trace(scene: Tlas, entry: &str) -> Vec<u32> {
     let (w, h) = (1024u32, 1024u32);
     let out = readback::<u32>(u64::from(w * h), "rays out");
@@ -366,9 +405,7 @@ fn lists_recorded_on_two_threads() {
         vec![ta.join().unwrap(), tb.join().unwrap()]
     });
     let point = queue.submit(lists, &[]).unwrap();
-    queue
-        .wait(point, std::time::Duration::from_secs(10))
-        .unwrap();
+    queue.wait(point, Duration::from_secs(10)).unwrap();
     for (out, seed) in [(&a, 1u32), (&b, 2)] {
         let got = out.as_slice().unwrap();
         assert!(
@@ -690,9 +727,7 @@ fn address_command_workload(d: &Device) -> u64 {
         Hazards::empty(),
     );
     let point = queue.submit(vec![list], &[]).unwrap();
-    queue
-        .wait(point, std::time::Duration::from_secs(10))
-        .unwrap();
+    queue.wait(point, Duration::from_secs(10)).unwrap();
 
     assert_eq!(copied.as_slice().unwrap(), &words[..], "buffer copies");
     let rows: Vec<u32> = (0..24)

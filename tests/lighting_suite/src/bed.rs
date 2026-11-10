@@ -1987,7 +1987,9 @@ impl Bed {
         }
         drop(w);
         let point = f.end(&[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
 
         let lighting =
             SceneLighting::new(d, kernels, &desc, &SceneLightingSettings::default()).unwrap();
@@ -1998,7 +2000,9 @@ impl Bed {
             .layout(&LightingView::requests(EXTENT, false), &mut list)
             .unwrap();
         let point = render().submit(vec![list], &[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
         Self {
             spec,
             lighting,
@@ -2085,7 +2089,9 @@ impl Bed {
             .unwrap();
         }
         let point = f.end(&[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
     }
 
     /// The state the last frame left skinned entry `entry` in, the bed's skinned copies taking
@@ -2183,7 +2189,9 @@ impl Bed {
             .unwrap();
         }
         let point = f.end(&[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
         let mut list = device()
             .gpu_malloc::<[f32; 4]>(MemoryKind::Upload, u64::from(count.max(1)), "bed particles")
             .unwrap();
@@ -2495,7 +2503,9 @@ impl Bed {
             list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
         }
         let point = f.end(&[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
         let stats = self.lighting.stats(id).unwrap();
         assert_eq!(
             stats.photon_overflows, 0,
@@ -2910,7 +2920,9 @@ impl SpareView {
             .layout(&LightingView::requests(EXTENT, false), &mut list)
             .unwrap();
         let point = render().submit(vec![list], &[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
         Self {
             view: LightingView::new(d, &arena).unwrap(),
             _arena: arena,

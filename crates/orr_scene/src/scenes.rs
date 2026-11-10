@@ -992,10 +992,11 @@ impl Scenes {
         &self.core.stats
     }
 
-    /// Step 1: waits until frame N - frames_in_flight has completed, sleeps on the low
-    /// latency handle when one is given, recycles the upload window and the slots freed
-    /// before it, swaps in hot-reloaded pipelines, and opens frame N. Raises a panic of the
-    /// loading thread.
+    /// Step 1: waits until frame N - frames_in_flight has completed, for as long as the render
+    /// queue goes on completing work (an error once it completes nothing for 10 s), sleeps on
+    /// the low latency handle when one is given, recycles the upload window and the slots
+    /// freed before it, swaps in hot-reloaded pipelines, and opens frame N. Raises a panic of
+    /// the loading thread.
     pub fn begin_frame(&mut self, desc: &FrameDesc<'_>) -> Result<Frame<'_>> {
         let started = Instant::now();
         // The loading thread ends only at `Msg::Stop`, so one that has ended panicked, and
@@ -1023,7 +1024,7 @@ impl Scenes {
             if !due && !self.device.is_complete(last) {
                 break;
             }
-            render.wait(last, Duration::from_secs(10))?;
+            render.wait_while_completing(last, Duration::from_secs(10))?;
             let mut f = core.in_flight.pop_front().unwrap();
             f.stats.gpu = f
                 .points

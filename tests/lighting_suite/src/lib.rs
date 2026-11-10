@@ -290,7 +290,9 @@ impl TestScene {
         })
         .unwrap();
         let point = f.end(&[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
         self.root = root;
     }
 

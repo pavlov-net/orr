@@ -86,7 +86,9 @@ pub fn wait(point: TimelinePoint) {
 /// [`wait`] on device `d`.
 pub fn wait_on(d: &Device, point: TimelinePoint) {
     let render = d.queue(QueueKind::Render).unwrap();
-    render.wait(point, Duration::from_secs(10)).expect("wait");
+    render
+        .wait_while_completing(point, Duration::from_secs(10))
+        .expect("wait");
 }
 
 /// Copies `count` values at `src` back to the CPU, after all work submitted so far.
@@ -105,7 +107,9 @@ pub fn read_buffer_on<T: Pod>(d: &Device, src: GpuPtr<T>, count: u64) -> Vec<T> 
     list.copy(out.gpu().cast(), src.cast(), out.size());
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     let point = render.submit(vec![list], &[]).unwrap();
-    render.wait(point, Duration::from_secs(10)).expect("wait");
+    render
+        .wait_while_completing(point, Duration::from_secs(10))
+        .expect("wait");
     out.as_slice().unwrap().to_vec()
 }
 
@@ -126,7 +130,9 @@ pub fn read_texture_on(d: &Device, t: &Texture, region: &TextureRegion) -> Vec<u
     list.copy_from_texture(out.gpu(), t, region);
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     let point = render.submit(vec![list], &[]).unwrap();
-    render.wait(point, Duration::from_secs(10)).expect("wait");
+    render
+        .wait_while_completing(point, Duration::from_secs(10))
+        .expect("wait");
     out.as_slice().unwrap().to_vec()
 }
 
