@@ -330,6 +330,8 @@ struct Lighting {
     /// [`Renderer::wait_paths`] was called: a view waits for the path pipelines its scene asks
     /// for instead of rendering without them.
     waits: bool,
+    /// When the kernels started, until a view first renders lit.
+    started: Option<Instant>,
     scenes: HashMap<SceneId, SceneLighting>,
     tables: BsdfTables,
 }
@@ -343,6 +345,7 @@ impl Lighting {
         if matches!(self.paths, Paths::Ready(_) | Paths::Compiling { .. }) {
             return;
         }
+        self.started = Some(Instant::now());
         if self.try_cached_paths {
             let cached = gpu.cached_pipelines_only();
             if let Ok(kernels) =
@@ -595,6 +598,7 @@ impl Renderer {
                 try_cached_paths: desc.try_cached_paths,
                 paths: Paths::NotStarted,
                 waits: false,
+                started: None,
                 scenes: HashMap::new(),
                 tables,
             },
@@ -1216,6 +1220,12 @@ impl<'a> Frame<'a> {
         };
         if !lit {
             return self.render_view_black(view, output, hooks, extent, render);
+        }
+        if let Some(started) = self.lighting.started.take() {
+            log::info!(
+                "first lit view {:.1} s after the path tracing kernels started",
+                started.elapsed().as_secs_f64()
+            );
         }
         let id = self.scenes.id();
         let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);

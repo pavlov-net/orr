@@ -527,7 +527,7 @@ impl StagedKernels {
     /// Queues the pipelines of `stages` that may meet everything, behind what a view cannot
     /// render without and ahead of mounts.
     pub(crate) fn start_general(&self, stages: &[Stage]) {
-        if self.loading().is_some() && scratch_late() == Some(false) {
+        if self.loading().is_some() && scratch_late("general") == Some(false) {
             self.request(MAY_ALL, stages, Urgency::Useful);
         }
     }
@@ -535,7 +535,7 @@ impl StagedKernels {
     /// Queues the tail stage, which holds `trace_path`'s whole loop and so compiles for minutes;
     /// until it is ready a pass runs every round.
     pub(crate) fn start_tail(&self) {
-        self.start_late(&self.tail, |d, kernels| {
+        self.start_late(&self.tail, "tail", |d, kernels| {
             let stage =
                 ShaderStage::new(module(kernels, &tail::MODULE)?, "main", SpecData::default())?;
             Ok(d.create_compute_pipeline(&stage, "staged tail")?)
@@ -545,7 +545,7 @@ impl StagedKernels {
     /// Scratch: whether the pipelines paths do without compile before a view's own, on the
     /// calling thread (`ORR_SCRATCH_TAIL_SYNC`).
     pub(crate) fn late_first(&self) -> bool {
-        scratch_late() == Some(true)
+        scratch_late("general") == Some(true)
     }
 
     /// Starts `compile` for a pipeline the paths do without until it is ready, as a job behind
@@ -553,9 +553,10 @@ impl StagedKernels {
     pub(crate) fn start_late<T: Send + 'static>(
         &self,
         late: &Late<T>,
+        what: &str,
         compile: impl FnOnce(&Device, &KernelSet) -> Result<T, Error> + Send + 'static,
     ) {
-        let Some(sync) = scratch_late() else {
+        let Some(sync) = scratch_late(what) else {
             return;
         };
         let kernels = self.kernels;
@@ -926,13 +927,24 @@ fn kept(sets: &[(u32, Option<Instant>, Instant)], wanted: &[u32], now: Instant) 
 }
 
 /// Scratch: whether the pipelines paths do without compile on the calling thread, so the first
-/// frame runs them (`ORR_SCRATCH_TAIL_SYNC`); none with `ORR_SCRATCH_NO_TAIL`, which leaves
-/// them out.
-fn scratch_late() -> Option<bool> {
-    if std::env::var_os("ORR_SCRATCH_NO_TAIL").is_some() {
-        return None;
+/// frame runs them (`ORR_SCRATCH_TAIL_SYNC`); none for `what` ("tail" or "sources", the update
+/// and photon kernels) where `ORR_SCRATCH_NO_TAIL` names it or names neither.
+fn scratch_late(what: &str) -> Option<bool> {
+    match std::env::var("ORR_SCRATCH_NO_TAIL").as_deref() {
+        Ok("tail") if what != "tail" => {}
+        Ok("sources") if what != "sources" => {}
+        Ok(_) => return None,
+        Err(_) => {}
     }
     Some(std::env::var_os("ORR_SCRATCH_TAIL_SYNC").is_some())
+}
+
+/// Scratch: `ORR_SCRATCH_SLOTS` caps the path slots of a view.
+fn scratch_slots() -> u32 {
+    std::env::var("ORR_SCRATCH_SLOTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(MAX_SLOTS, |n: u32| n.clamp(1, MAX_SLOTS))
 }
 
 /// With `on`, ends the open pass and opens one named for `source`'s stage `stage` (start,
@@ -1044,6 +1056,8 @@ pub(crate) struct StagedMemory {
     /// The pipelines the view's last frame recorded, kept until its next: a set let go
     /// meanwhile outlives the commands that run it.
     held: Mutex<Vec<Arc<StageSet>>>,
+    /// Scratch: frames begun, for `ORR_SCRATCH_QUEUE_COUNTS`.
+    frames: std::sync::atomic::AtomicU32,
     header: Allocation<PathStages>,
     queues: Allocation<StageQueue>,
     _walks: Option<Allocation<[u32; 4]>>,
@@ -1062,12 +1076,18 @@ impl StagedMemory {
         parts: StateParts,
         rows: u32,
     ) -> Result<Self, Error> {
-        let capacity = pixels.clamp(1, MAX_SLOTS);
+        let capacity = pixels.clamp(1, scratch_slots());
         let n = u64::from(capacity);
         let words =
             |count: u64, name| device.gpu_malloc::<[u32; 4]>(MemoryKind::DeviceLocal, count, name);
+        // Scratch: `ORR_SCRATCH_QUEUE_COUNTS` keeps the queues where the CPU reads them.
+        let counted = std::env::var_os("ORR_SCRATCH_QUEUE_COUNTS").is_some();
         let queues = device.gpu_malloc::<StageQueue>(
-            MemoryKind::DeviceLocal,
+            if counted {
+                MemoryKind::Readback
+            } else {
+                MemoryKind::DeviceLocal
+            },
             u64::from(rows) * STAGE_QUEUES,
             "staged path queues",
         )?;
@@ -1108,6 +1128,7 @@ impl StagedMemory {
             rows,
             parts,
             held: Mutex::new(Vec::new()),
+            frames: std::sync::atomic::AtomicU32::new(0),
             header,
             queues,
             _walks: walks,
@@ -1121,6 +1142,24 @@ impl StagedMemory {
     /// Starts a frame of the view: the last one's commands have been submitted.
     pub(crate) fn begin_frame(&self) {
         self.held.lock().unwrap().clear();
+        // Scratch: with `ORR_SCRATCH_QUEUE_COUNTS=N`, logs at the view's Nth frame the paths
+        // each queue held in each round of the last slice recorded before it.
+        let frame = self
+            .frames
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let wanted = std::env::var("ORR_SCRATCH_QUEUE_COUNTS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
+        if let (Some(at), Some(queues)) = (wanted, self.queues.as_slice())
+            && frame == at
+        {
+            for (round, row) in queues.chunks(STAGE_QUEUES as usize).enumerate() {
+                let counts: Vec<u32> = row.iter().map(|q| q.count).collect();
+                if counts.iter().any(|&c| c != 0) {
+                    log::info!("queue counts round {round}: {counts:?}");
+                }
+            }
+        }
     }
 
     fn hold(&self, set: &Arc<StageSet>) {
@@ -1130,7 +1169,9 @@ impl StagedMemory {
     /// Whether it holds the slots a view of `pixels` pixels asks for, each with `parts`, and
     /// queues for `rows` rounds.
     pub(crate) fn fits(&self, pixels: u32, parts: StateParts, rows: u32) -> bool {
-        self.capacity == pixels.clamp(1, MAX_SLOTS) && self.parts.holds(parts) && self.rows >= rows
+        self.capacity == pixels.clamp(1, scratch_slots())
+            && self.parts.holds(parts)
+            && self.rows >= rows
     }
 
     /// The paths of `source` a slice holds: an update path's record takes the words of

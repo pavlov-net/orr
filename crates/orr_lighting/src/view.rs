@@ -1603,12 +1603,14 @@ impl LightingKernels {
     fn start_late(k: &StagedPaths) {
         k.stages.start_tail();
         // The update paths' kernel is a compute kernel: nothing of theirs gains by reordering.
-        k.stages
-            .start_late(&k.update, |d, kernels| (UPDATE.compile)(d, kernels, false));
-        let rays = k.rays;
-        k.stages.start_late(&k.photons, move |d, kernels| {
-            (PHOTONS.compile)(d, kernels, rays)
+        k.stages.start_late(&k.update, "sources", |d, kernels| {
+            (UPDATE.compile)(d, kernels, false)
         });
+        let rays = k.rays;
+        k.stages
+            .start_late(&k.photons, "sources", move |d, kernels| {
+                (PHOTONS.compile)(d, kernels, rays)
+            });
     }
 
     /// What the paths of a frame with `needs` under `lighting` may meet, as
