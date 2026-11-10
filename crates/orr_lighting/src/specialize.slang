@@ -73,6 +73,9 @@ public static const uint MAY_PARTICLES = 1 << 22;
 public static const uint MAY_LOCAL_LIGHTS = 1 << 23;
 public static const uint MAY_DIRECTIONAL = 1 << 24;
 public static const uint MAY_EMISSIVE = 1 << 25;
+// The scene may hold a medium proxy; a smoke entry.
+public static const uint MAY_PROXIES = 1u << 30;
+public static const uint MAY_SMOKE = 1u << 31;
 
 // Whether any of `bits` may be met.
 public bool may_any(uint bits)

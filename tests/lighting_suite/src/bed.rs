@@ -2708,9 +2708,12 @@ impl Paths {
         let paths = Stages::COMPUTE | Stages::RAY;
         list.barrier(paths, Stages::COMPUTE, Hazards::empty());
         self.kernels
-            .record_media_apply(list, lighting, target, pass, settings);
+            .record_media_apply(list, lighting, target, pass, settings)
+            .unwrap();
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        self.kernels.record_guides(list, target, pass, settings);
+        self.kernels
+            .record_guides(list, target, pass, settings)
+            .unwrap();
         if let Some(g) = &self.frost_guide {
             g.fill(list);
             self.kernels

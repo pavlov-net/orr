@@ -1348,7 +1348,7 @@ impl<'a> Frame<'a> {
         let exact_paths = paths.paths_ran().is_none_or(|ran| ran.exact());
         state.samples = state.samples.wrapping_add(1);
         list.barrier(traced, Stages::COMPUTE, Hazards::empty());
-        kernels.record_media_apply(list, scene, paths, &pass, lighting);
+        kernels.record_media_apply(list, scene, paths, &pass, lighting)?;
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         let mut overlay = None;
         if let Some(hook) = hooks.transparency.as_mut() {
@@ -1369,7 +1369,7 @@ impl<'a> Frame<'a> {
         }
         if reconstructed || matches!(lighting.debug_view, LightingDebugView::Guide(_)) {
             let list = self.scenes.list()?;
-            kernels.record_guides(list, paths, &pass, lighting);
+            kernels.record_guides(list, paths, &pass, lighting)?;
             if let Some(guide) = paths.depth_of_field_guide_storage() {
                 list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
                 kernels.record_frosted_glass(list, paths, &pass, guide);

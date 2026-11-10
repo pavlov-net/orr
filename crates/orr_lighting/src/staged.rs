@@ -63,7 +63,7 @@ const FEATURE_RAY_SHADES: u32 = 1 << 3;
 
 /// The id of `specialize.slang`'s `path_may`, and its bits: what the paths of a pipeline may
 /// meet.
-const PATH_MAY_ID: u32 = 110;
+pub(crate) const PATH_MAY_ID: u32 = 110;
 pub(crate) const MAY_STACK: u32 = 1 << 0;
 pub(crate) const MAY_DISPERSION: u32 = 1 << 1;
 pub(crate) const MAY_CAUSTICS: u32 = 1 << 2;
@@ -94,6 +94,8 @@ pub(crate) const MAY_PARTICLES: u32 = 1 << 22;
 pub(crate) const MAY_LOCAL_LIGHTS: u32 = 1 << 23;
 pub(crate) const MAY_DIRECTIONAL: u32 = 1 << 24;
 pub(crate) const MAY_EMISSIVE: u32 = 1 << 25;
+pub(crate) const MAY_PROXIES: u32 = 1 << 30;
+pub(crate) const MAY_SMOKE: u32 = 1 << 31;
 /// What gives the other shade stage a vertex: a layer, or a scatter in or a way out of an
 /// interior.
 const MAY_OTHER: u32 = MAY_LAYERS | MAY_INTERIORS;
@@ -332,7 +334,7 @@ impl<T: Send + 'static> Late<T> {
     }
 
     /// How its compile failed, where it did.
-    fn failure(&self) -> Option<Error> {
+    pub(crate) fn failure(&self) -> Option<Error> {
         self.get();
         self.failed.get().map(|message| Error::LateCompile {
             kernel: self.name,
@@ -346,7 +348,7 @@ impl<T: Send + 'static> Late<T> {
     }
 
     /// Whether its job is queued or running.
-    fn pending(&self) -> bool {
+    pub(crate) fn pending(&self) -> bool {
         self.get().is_none() && self.job.lock().unwrap().is_some()
     }
 
@@ -373,7 +375,7 @@ impl<T: Send + 'static> Late<T> {
 
     /// The pipeline, after waiting for its job and running queued jobs of `loading` on this
     /// thread meanwhile; an error where its compile failed or never started.
-    fn wait(&self, loading: Option<&Loading>) -> Result<&T, Error> {
+    pub(crate) fn wait(&self, loading: Option<&Loading>) -> Result<&T, Error> {
         // The job is waited for without its lock, which whoever asks whether it is ready takes.
         let queued = self.job.lock().unwrap().clone();
         if let (Some(loading), Some(queued)) = (loading, queued) {

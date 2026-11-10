@@ -21,8 +21,8 @@ use lighting_suite::bed::{
     fresnel, look, pixel_of, plume_volume, water_transmission,
 };
 use lighting_suite::shaders::{
-    fog_aerial, fog_apply, fog_directional, fog_froxel, fog_particles, froxel_lookup, froxel_probe,
-    segment_probe,
+    fog_aerial, fog_apply, fog_directional, fog_froxel, fog_froxel_light, fog_particles,
+    froxel_lookup, froxel_probe, segment_probe,
 };
 use lighting_suite::{assert_clean, finish, kernels, pipeline, readback, render, upload};
 use orr_color::luminance;
@@ -47,6 +47,7 @@ fn fog_kernels() -> &'static KernelSet {
             FogGpu::TYPE,
             &[
                 (&fog_froxel::MODULE, "media/froxel"),
+                (&fog_froxel_light::MODULE, "media/froxel_light"),
                 (&fog_aerial::MODULE, "media/aerial"),
                 (&fog_apply::MODULE, "media/apply"),
                 (&fog_directional::MODULE, "light_sampling/directional"),

@@ -5,6 +5,8 @@ import lighting_suite.media_types;
 import orr_scene.surface;
 import orr_lighting.camera_media;
 
+export static const bool PATH_SPECIALIZES = true;
+
 ORR_ROOT(MediaApplyRoot);
 
 [shader("compute")]

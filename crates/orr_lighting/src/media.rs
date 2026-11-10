@@ -9,11 +9,12 @@ use orr_scene::orr_gpu::{
 use orr_scene::{MaterialId, SceneFeatures};
 
 use crate::scene::{FRAME_SLOTS, Ring};
-use crate::shaders::media::{aerial, apply, froxel, smoke};
+use crate::shaders::media::{aerial, froxel, smoke};
 use crate::shaders::types::{
     EyeColumn, FroxelLights, FroxelRoot, FroxelVolume, LayerGuide, MediaApplyRoot, MediaStatsGpu,
     ParticleLighting,
 };
+use crate::support::{Masked, MaskedFrame};
 use crate::view::{LightingDebugView, LightingView, NO_MATERIAL, ViewLighting, ViewPass};
 use crate::{CompilePipeline, Error, KernelSet, SceneLighting, pipeline};
 
@@ -252,15 +253,15 @@ impl Drop for Volumes {
 /// What reads a frame's froxels, from what the kernels, the scene and the view hold. Each
 /// names a reader exactly or errs toward one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Readers {
+pub(crate) struct Readers {
     /// A camera segment can hold a medium: the linked one, a proxy, smoke or an interior. Then
     /// the froxels' medium and integration, the aerial-perspective LUT and media apply are
     /// read, and paths read the volume; otherwise they would hold no medium and leave every
     /// radiance as it is.
-    fogged: bool,
+    pub(crate) fogged: bool,
     /// The froxels' light is read: by a medium that scatters, which the linked one, a proxy,
     /// smoke and an interior with scatter can be, or by particle lighting.
-    lit: bool,
+    pub(crate) lit: bool,
 }
 
 impl Readers {
@@ -382,6 +383,45 @@ pub(crate) fn links_medium(kernels: &KernelSet) -> bool {
     kernels.medium != DEFAULT_MEDIUM
 }
 
+/// What reads a frame's froxels in a scene that may hold `features`, under kernels that link a
+/// medium where `linked` and with [`ViewPass::particle_lighting`] as `particle_lighting`. A debug
+/// view of them reads all of them, and the interior a view names counts as one that scatters.
+pub(crate) fn readers(
+    linked: bool,
+    features: SceneFeatures,
+    particle_lighting: bool,
+    lighting: &ViewLighting,
+) -> Readers {
+    let scatters = scatters(linked, features, lighting);
+    Readers {
+        fogged: fogged(linked, features, lighting),
+        lit: scatters
+            || features.contains(SceneFeatures::SCATTERING_INTERIORS)
+            || particle_lighting,
+    }
+}
+
+/// What media apply writes under `lighting`'s debug view: `MediaApplyRoot.mode`.
+fn apply_mode(lighting: &ViewLighting) -> u32 {
+    match lighting.debug_view {
+        LightingDebugView::Media => MEDIA_INSCATTER,
+        LightingDebugView::Froxels => MEDIA_FROXELS,
+        LightingDebugView::RaysPerPixel
+        | LightingDebugView::RayOriginBias
+        | LightingDebugView::WorldCache
+        | LightingDebugView::WorldCacheLod
+        | LightingDebugView::Guide(_)
+        | LightingDebugView::DielectricLayer
+        | LightingDebugView::Subsurface => MEDIA_OFF,
+        _ => MEDIA_COMPOSE,
+    }
+}
+
+/// Whether `lighting`'s debug view shows media apply, where a camera segment can hold a medium.
+pub(crate) fn shows_media(lighting: &ViewLighting) -> bool {
+    apply_mode(lighting) != MEDIA_OFF
+}
+
 /// Whether a medium that scatters may lie on a camera segment of a scene that may hold
 /// `features`, under kernels that link a medium where `linked`.
 fn scatters(linked: bool, features: SceneFeatures, lighting: &ViewLighting) -> bool {
@@ -409,10 +449,8 @@ pub(crate) struct MediaKernels {
     eye_reach: ComputePipeline,
     inject: ComputePipeline,
     smoke: ComputePipeline,
-    light: ComputePipeline,
     integrate: ComputePipeline,
     aerial: ComputePipeline,
-    apply: ComputePipeline,
     sampler: SamplerIndex,
     /// The kernels link a medium.
     linked_medium: bool,
@@ -420,16 +458,14 @@ pub(crate) struct MediaKernels {
 
 impl MediaKernels {
     /// Its pipelines, in the order [`Self::new`] takes them.
-    pub(crate) const PIPELINES: [CompilePipeline; 9] = [
+    pub(crate) const PIPELINES: [CompilePipeline; 7] = [
         |d, k| pipeline(d, k, &froxel::MODULE, "order"),
         |d, k| pipeline(d, k, &froxel::MODULE, "eye_column"),
         |d, k| pipeline(d, k, &froxel::MODULE, "eye_reach"),
         |d, k| pipeline(d, k, &froxel::MODULE, "inject"),
         |d, k| pipeline(d, k, &smoke::MODULE, "main"),
-        |d, k| pipeline(d, k, &froxel::MODULE, "light"),
         |d, k| pipeline(d, k, &froxel::MODULE, "integrate"),
         |d, k| pipeline(d, k, &aerial::MODULE, "main"),
-        |d, k| pipeline(d, k, &apply::MODULE, "main"),
     ];
 
     /// The kernels over the next of `pipelines`, which [`Self::PIPELINES`] compiled from
@@ -446,10 +482,8 @@ impl MediaKernels {
             eye_reach: next(),
             inject: next(),
             smoke: next(),
-            light: next(),
             integrate: next(),
             aerial: next(),
-            apply: next(),
             sampler: device.sampler(&SamplerDesc {
                 mag: Filter::Linear,
                 min: Filter::Linear,
@@ -461,26 +495,14 @@ impl MediaKernels {
         })
     }
 
-    fn scatters(&self, features: SceneFeatures, lighting: &ViewLighting) -> bool {
-        scatters(self.linked_medium, features, lighting)
-    }
-
-    fn fogged(&self, features: SceneFeatures, lighting: &ViewLighting) -> bool {
-        fogged(self.linked_medium, features, lighting)
-    }
-
-    /// What reads the froxels of `pass`. A debug view of them reads all of them, and the
-    /// interior a view names counts as one that scatters.
+    /// What reads the froxels of `pass`.
     fn readers(&self, pass: &ViewPass, lighting: &ViewLighting) -> Readers {
-        let scatters = self.scatters(pass.scene_features, lighting);
-        Readers {
-            fogged: self.fogged(pass.scene_features, lighting),
-            lit: scatters
-                || pass
-                    .scene_features
-                    .contains(SceneFeatures::SCATTERING_INTERIORS)
-                || pass.particle_lighting,
-        }
+        readers(
+            self.linked_medium,
+            pass.scene_features,
+            pass.particle_lighting,
+            lighting,
+        )
     }
 
     /// The froxel passes' root of `pass`, with no targets while `media` holds none: what the
@@ -629,12 +651,23 @@ impl MediaKernels {
         view: &mut LightingView,
         pass: &ViewPass,
         lighting: &ViewLighting,
+        masked: MaskedFrame<'_>,
     ) -> Result<(), Error> {
         let extent = view.extent();
         let reset = view.history_reset();
         let media = &mut view.media;
         let settings = &lighting.media;
         let readers = self.readers(pass, lighting);
+        if pass.particle_lighting {
+            masked.kernels.declare_particle_lighting();
+        }
+        // The light pass's pipeline is made for what the scene may hold; a view that did not ask
+        // for it ahead waits for it here.
+        let light = if readers.lit {
+            Some(masked.take(Masked::FroxelLight)?)
+        } else {
+            None
+        };
         let shadowed = settings
             .froxel_shadowed_lights
             .min(MAX_FROXEL_SHADOWED_LIGHTS);
@@ -731,9 +764,10 @@ impl MediaKernels {
                 step(list);
             }
         }
-        if readers.lit {
-            let [light_group, ..] = self.light.workgroup();
-            list.dispatch(&self.light, root, [columns.div_ceil(light_group), rows, 1]);
+        if let Some(set) = &light {
+            let light = set.get(Masked::FroxelLight).expect("taken above");
+            let [light_group, ..] = light.workgroup();
+            list.dispatch(light, root, [columns.div_ceil(light_group), rows, 1]);
             step(list);
             media.history = (media.history + 1).min(MAX_HISTORY);
         } else {
@@ -771,7 +805,8 @@ impl MediaKernels {
         view: &mut LightingView,
         pass: &ViewPass,
         lighting: &ViewLighting,
-    ) {
+        masked: MaskedFrame<'_>,
+    ) -> Result<(), Error> {
         let extent = view.extent();
         let radiance = view.radiance_storage();
         let layers = view.layer_guides(pass.frame);
@@ -786,21 +821,12 @@ impl MediaKernels {
         let guides = (layers, overlay_front);
         let particles = self.particle_lighting(media, readers, scene, pass, lighting, guides);
         let particles = media.particles.write(slot, particles);
-        let mode = match lighting.debug_view {
-            LightingDebugView::Media => MEDIA_INSCATTER,
-            LightingDebugView::Froxels => MEDIA_FROXELS,
-            LightingDebugView::RaysPerPixel
-            | LightingDebugView::RayOriginBias
-            | LightingDebugView::WorldCache
-            | LightingDebugView::WorldCacheLod
-            | LightingDebugView::Guide(_)
-            | LightingDebugView::DielectricLayer
-            | LightingDebugView::Subsurface => MEDIA_OFF,
-            _ => MEDIA_COMPOSE,
-        };
+        let mode = apply_mode(lighting);
         if !readers.fogged || mode == MEDIA_OFF {
-            return;
+            return Ok(());
         }
+        let set = masked.take(Masked::MediaApply)?;
+        let apply = set.get(Masked::MediaApply).expect("taken above");
         let root = media.apply_roots.write(
             slot,
             MediaApplyRoot {
@@ -817,7 +843,8 @@ impl MediaKernels {
         );
         let [w, h] = extent;
         list.begin_pass("media apply", false);
-        list.dispatch(&self.apply, root, [w.div_ceil(8), h.div_ceil(8), 1]);
+        list.dispatch(apply, root, [w.div_ceil(8), h.div_ceil(8), 1]);
         list.end_pass();
+        Ok(())
     }
 }

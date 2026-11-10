@@ -63,6 +63,7 @@ mod scene;
 mod staged;
 mod subsurface;
 mod subsurface_table;
+mod support;
 mod view;
 mod world_cache;
 
