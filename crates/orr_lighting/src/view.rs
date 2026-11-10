@@ -1134,9 +1134,8 @@ fn path_rounds(root: &PathRoot) -> u32 {
 /// fewer: the photons of a frame at [`crate::CausticSettings`]'s default count.
 const PHOTON_SLOTS: u32 = 1 << 18;
 
-/// Whether path kernels run as ray dispatches on `device`.
-fn runs_rays(device: &Device, entry: PathEntry) -> bool {
-    let caps = device.caps();
+/// Whether path kernels run as ray dispatches.
+fn runs_rays(entry: PathEntry) -> bool {
     // Scratch: `ORR_SCRATCH_ENTRY` overrides the renderer's choice in every example.
     let entry = match std::env::var("ORR_SCRATCH_ENTRY").as_deref() {
         Ok("compute") => PathEntry::Compute,
@@ -1144,8 +1143,8 @@ fn runs_rays(device: &Device, entry: PathEntry) -> bool {
         _ => entry,
     };
     match entry {
-        PathEntry::Fastest => caps.ray_dispatch && caps.reorder,
-        PathEntry::Compute => false,
+        // The compute entries: a shade stage's reorder costs more than its sorted lanes save.
+        PathEntry::Fastest | PathEntry::Compute => false,
         PathEntry::RayDispatch => true,
     }
 }
@@ -1768,7 +1767,7 @@ impl LightingKernels {
         tables: &BsdfTables,
         entry: PathEntry,
     ) -> Result<Self, Error> {
-        let rays = runs_rays(device, entry);
+        let rays = runs_rays(entry);
         let paths = if runs_staged() {
             PathKernels::Staged(Arc::new(StagedPaths::new(
                 StagedKernels::new(device, kernels, rays),
@@ -1800,7 +1799,7 @@ impl LightingKernels {
         entry: PathEntry,
         loading: &Arc<Loading>,
     ) -> CompilingKernels {
-        let rays = runs_rays(device, entry);
+        let rays = runs_rays(entry);
         let path = |kernel: PathKernel| {
             compile_job(device, loading, Urgency::Needed, move |d| {
                 (kernel.compile)(d, kernels, rays)
