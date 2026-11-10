@@ -585,6 +585,50 @@ fn reordering_inside_walks_changes_no_path() {
     assert_clean();
 }
 
+/// Pipelines compiled for what a scene and its settings may meet hold the code its paths run:
+/// a subsurface sphere and a dense interior trace the same paths through them as through the
+/// pipelines that hold everything. The images compare BSDF rays alone, as above.
+#[test]
+fn specialized_pipelines_trace_the_paths_the_general_ones_do() {
+    let mut paths = Paths::new(
+        &KernelSet::default(),
+        PathEntry::Compute,
+        real_time(LightingDebugView::BsdfOnly),
+    );
+    paths.settings.max_bounces = 2;
+    paths.settings.sss_max_steps = 16;
+    for model in [WALK_SPHERE, MILK_SPHERE] {
+        let spec = Spec {
+            copies: vec![Item {
+                model,
+                linear: Mat3::IDENTITY,
+                at: Vec3::ZERO,
+            }],
+            lights: vec![Light::Directional(sun())],
+            environment: Some(FURNACE_RADIANCE),
+            eye: Vec3::new(0.0, 1.2, 4.0),
+            target: Vec3::ZERO,
+            fov_y: 0.6,
+            focus: None,
+        };
+        let bits = |a: &Accumulated| {
+            a.mean
+                .iter()
+                .map(|p| p.map(f32::to_bits))
+                .collect::<Vec<_>>()
+        };
+        paths.settings.specialize = false;
+        let general = render_spec(&paths, spec.clone(), 4);
+        paths.settings.specialize = true;
+        let specialized = render_spec(&paths, spec, 4);
+        assert!(
+            bits(&general) == bits(&specialized),
+            "{model}: the specialized pipelines changed the image"
+        );
+    }
+    assert_clean();
+}
+
 /// With the default cap, so the subsurface table takes part.
 fn a_furnace_sphere_returns_the_subsurface_color(paths: &Paths) {
     let (eye, target, fov_y) = (Vec3::new(0.0, 0.0, 4.0), Vec3::ZERO, 0.6);

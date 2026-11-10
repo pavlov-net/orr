@@ -161,3 +161,25 @@ impl MaterialFeatures {
         SceneFeatures(out | self.built)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A feature stays while any record holds it, a rewritten or freed record gives its own
+    /// back, and what a mesh was built with stays for good.
+    #[test]
+    fn the_table_holds_what_its_records_hold_and_keeps_what_meshes_were_built_with() {
+        let mut t = MaterialFeatures::default();
+        let (coat, layers) = (SceneFeatures::COAT, SceneFeatures::LAYERS);
+        t.set(3, coat | SceneFeatures::WALKING);
+        t.set(7, coat | layers);
+        assert_eq!(t.any(), coat | SceneFeatures::WALKING | layers);
+        t.set(3, SceneFeatures::NONE);
+        assert_eq!(t.any(), coat | layers);
+        t.set(7, SceneFeatures::DISPERSIVE);
+        assert_eq!(t.any(), SceneFeatures::DISPERSIVE | layers);
+        t.set(7, SceneFeatures::NONE);
+        assert_eq!(t.any(), layers);
+    }
+}
