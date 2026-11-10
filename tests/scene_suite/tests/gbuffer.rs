@@ -28,7 +28,7 @@ use orr_gpu::{
     ComputePipeline, GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, ShaderModule, Stages,
     Texture, TextureRegion,
 };
-use orr_math::{Affine3, DMat4, DVec3, Mat3, Quat, UVec2, Vec2, Vec3, Vec4};
+use orr_math::{Affine3, DMat4, DVec2, DVec3, DVec4, Mat3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_pack::clip::Clip;
 use orr_pack::instance::{InstanceRecord, LinearRows, MOTION_WINDOW_BYTES, MotionRow};
 use orr_pack::material::{Material, slot};
@@ -5576,7 +5576,7 @@ const RT_CUT_BUILT: u32 = 255;
 fn read_cut(view: &RasterView, slots: u32) -> CutRead {
     let root: SceneRoot = read_buffer(view.scene, 1)[0];
     let cut: CutGpu = read_buffer(root.cut, 1)[0];
-    let counters: Vec<u32> = read_buffer(cut.counters, 29);
+    let counters: Vec<u32> = read_buffer(cut.counters, 32);
     let n = counters[2].min(cut.candidate_capacity);
     let e = counters[5];
     CutRead {
@@ -5646,12 +5646,200 @@ fn cut_hash(clusters: &BTreeSet<u32>) -> [u32; 2] {
     orr_scene::testing::cut_hash(&clusters)
 }
 
-/// A world that traces the cut it rasters, every copy's own.
+/// A world that traces the cut it rasters, every copy's own, at the same detail wherever the
+/// views saw it.
 fn traversed_world() -> World {
     World::with(&RendererDesc {
         rt_merge_pixels: 0.0,
+        culled_error_scale: 1.0,
         ..RendererDesc::default()
     })
+}
+
+/// A view's render as the traversal tests what it saw: its constants, the camera, and its HZB's
+/// mips.
+struct SeenRender {
+    v: orr_scene::ViewConstants,
+    eye: DVec3,
+    hzb: Vec<Vec<f32>>,
+}
+
+impl SeenRender {
+    fn of(view: &RasterView, eye: DVec3) -> Self {
+        let mips = view.hzb.desc().mips;
+        Self {
+            v: read_buffer(view.view, 1)[0],
+            eye,
+            hzb: (0..mips)
+                .map(|m| {
+                    let bytes =
+                        read_texture(&view.hzb, &TextureRegion::whole_mip(view.hzb.desc(), m));
+                    bytemuck::pod_collect_to_vec(&bytes)
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether `traverse.slang`'s hidden test finds the mesh-space sphere `s` of `item`, placed
+    /// with its radius times `grow`, unseen: outside the frustum or with its box behind the
+    /// HZB (`visibility.slang` `sphere_unseen`), in f64.
+    fn unseen(&self, item: &Item, s: &orr_pack::Sphere, grow: f64) -> bool {
+        let rows = |r: [[f32; 4]; 4]| r.map(|row| DVec4::from_array(row.map(f64::from)));
+        let m = rows(self.v.clip_from_view_jittered);
+        let r = self
+            .v
+            .view_from_world_rotation
+            .map(|row| DVec3::new(row[0].into(), row[1].into(), row[2].into()));
+        let l = item.linear.as_dmat3();
+        let a = l.transpose() * l;
+        let scale = (0..3)
+            .map(|i| a.row(i).abs().element_sum())
+            .fold(0.0, f64::max)
+            .sqrt();
+        let c = l * DVec3::from(s.center.map(f64::from)) + item.at.as_dvec3() - self.eye;
+        let radius = f64::from(s.radius) * scale * grow;
+        let view = |x: DVec3| DVec3::new(r[0].dot(x), r[1].dot(x), r[2].dot(x));
+        let p = view(c).extend(1.0);
+        for plane in [
+            m[3] + m[0],
+            m[3] - m[0],
+            m[3] + m[1],
+            m[3] - m[1],
+            m[3] - m[2],
+        ] {
+            if plane.dot(p) < -radius * plane.truncate().length() {
+                return true;
+            }
+        }
+        let extent = DVec2::new(f64::from(EXTENT[0]), f64::from(EXTENT[1]));
+        let (mut lo, mut hi, mut nearest) = (DVec2::splat(1e30), DVec2::splat(-1e30), 0.0f64);
+        for i in 0..8 {
+            let corner = c + DVec3::new(
+                if i & 1 != 0 { radius } else { -radius },
+                if i & 2 != 0 { radius } else { -radius },
+                if i & 4 != 0 { radius } else { -radius },
+            );
+            let v = view(corner).extend(1.0);
+            let clip = DVec4::new(m[0].dot(v), m[1].dot(v), m[2].dot(v), m[3].dot(v));
+            if !(clip.w > 0.0 && clip.z < clip.w) {
+                return false;
+            }
+            let xy = (DVec2::new(clip.x, clip.y) / clip.w * 0.5 + 0.5) * extent;
+            lo = lo.min(xy);
+            hi = hi.max(xy);
+            nearest = nearest.max(clip.z / clip.w);
+        }
+        let lo = (lo - 1.0).max(DVec2::ZERO);
+        let hi = (hi + 1.0).min(extent - 1.0);
+        if lo.x > hi.x || lo.y > hi.y {
+            return false;
+        }
+        let size = hi - lo;
+        let mips = self.hzb.len() as u32;
+        let mip = ((size.x.max(size.y).max(1.0).log2().ceil() - 1.0).max(0.0) as u32).min(mips - 1);
+        let [w, h] = EXTENT.map(|e| (e >> mip).max(1));
+        let (a, b) = (
+            [
+                (lo.x as u32 >> mip).min(w - 1),
+                (lo.y as u32 >> mip).min(h - 1),
+            ],
+            [
+                (hi.x as u32 >> mip).min(w - 1),
+                (hi.y as u32 >> mip).min(h - 1),
+            ],
+        );
+        let texels = &self.hzb[mip as usize];
+        let farthest = (a[1]..=b[1])
+            .flat_map(|y| (a[0]..=b[0]).map(move |x| texels[(y * w + x) as usize]))
+            .fold(1.0f32, f32::min);
+        nearest < f64::from(farthest)
+    }
+
+    /// [`Self::unseen`], or None where a sphere a little smaller or larger is decided
+    /// otherwise, so the GPU's f32 may decide either way.
+    fn hidden(&self, item: &Item, s: &orr_pack::Sphere) -> Option<bool> {
+        let (small, large) = (
+            self.unseen(item, s, 1.0 - 1e-4),
+            self.unseen(item, s, 1.0 + 1e-4),
+        );
+        (small == large).then_some(small)
+    }
+}
+
+/// [`rule_cut`] where the traversal saw `seen`: an error over the threshold is over it at
+/// `culled` times the threshold over a group sphere `seen` hides. Also returns the clusters the
+/// hidden threshold took out or put in, and the near clusters take those whose decision hangs
+/// on a sphere whose test is near a tie, or on an error near either threshold.
+fn seen_rule_cut(
+    m: &CpuMesh,
+    clusters: &[CutCluster],
+    item: &Item,
+    threshold: f32,
+    culled: f32,
+    seen: &SeenRender,
+    resident: &Resident,
+) -> (BTreeSet<u32>, BTreeSet<u32>, BTreeSet<u32>) {
+    let p = Projector::new(item, seen.eye.as_vec3());
+    let (mut cut, mut near, mut decided) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    let mut tests = std::collections::HashMap::new();
+    let mut hidden = |s: &orr_pack::Sphere| {
+        let key = (s.center.map(f32::to_bits), s.radius.to_bits());
+        *tests.entry(key).or_insert_with(|| seen.hidden(item, s))
+    };
+    let hidden_threshold = threshold * culled;
+    for (i, c) in clusters.iter().enumerate() {
+        let k = &c.cluster;
+        let own = p.error(&k.self_sphere, k.self_error);
+        let parent = p.error(&k.parent_sphere, k.parent_error);
+        // Over the threshold its sphere takes; None where that hangs on a near tie.
+        let mut over = |e: f32, s: &orr_pack::Sphere| -> Option<bool> {
+            if e <= threshold {
+                Some(false)
+            } else if e > hidden_threshold {
+                Some(true)
+            } else {
+                hidden(s).map(|h| !h)
+            }
+        };
+        let parent_over = over(parent, &k.parent_sphere);
+        let own_over = if c.depth == 0 || m.stands_in(c, resident) {
+            Some(false)
+        } else {
+            over(own, &k.self_sphere)
+        };
+        let close = |e: f32| {
+            e.is_finite()
+                && [threshold, hidden_threshold]
+                    .iter()
+                    .any(|&t| (e - t).abs() <= 1e-4 * t)
+        };
+        if parent_over.is_none() || own_over.is_none() || close(own) || close(parent) {
+            near.insert(i as u32);
+        }
+        let fine = own_over == Some(false) || c.depth == 0 || m.stands_in(c, resident);
+        let taken = m.drawable(c.group, resident) && fine && parent_over == Some(true);
+        if taken {
+            cut.insert(i as u32);
+        }
+        let uniform = m.drawable(c.group, resident)
+            && (own <= threshold || c.depth == 0 || m.stands_in(c, resident))
+            && parent > threshold;
+        if taken != uniform {
+            decided.insert(i as u32);
+        }
+    }
+    (cut, near, decided)
+}
+
+/// Panics unless `got` is `want` outside `near`.
+fn assert_cut(got: &BTreeSet<u32>, want: &BTreeSet<u32>, near: &BTreeSet<u32>, what: &str) {
+    let differ: Vec<u32> = want.symmetric_difference(got).copied().collect();
+    assert!(
+        differ.iter().all(|c| near.contains(c)),
+        "{what}: the cut differs from the reference at {differ:?} ({} against {})",
+        got.len(),
+        want.len()
+    );
 }
 
 /// The DAG ground tilted away from the camera, so its cut spans several levels, and balls
@@ -5770,6 +5958,116 @@ fn traced_dag_cuts_hit_what_the_raster_drew_and_close_without_cracks() {
     assert_clean();
 }
 
+/// `CutGpu.counters` of the hidden test: spheres tested, clusters it decided.
+const CUT_HIDDEN_TESTS: usize = 29;
+const CUT_HIDDEN_RULES: usize = 31;
+
+/// A still view of the streaming ground that a wall and the frustum hide in part, at a
+/// threshold fine enough that its cut spans many levels. The first frame, with no view yet,
+/// takes the cluster rule; each later one takes the culled threshold over the group spheres
+/// the frame before hid, as a CPU reference of the hidden test over that frame's camera and HZB
+/// says, both cuts whole, while the pages it wants land. Some clusters are the hidden
+/// threshold's. Once the loads settle the cut holds still, and every cluster drawn to a pixel
+/// is the rule's.
+#[test]
+fn hidden_groups_take_the_culled_threshold_and_a_still_view_draws_the_rule() {
+    let _serial = serial();
+    const ERROR_PIXELS: f32 = 0.004;
+    let bytes = fine_ground_pack();
+    // A band between the thresholds wide enough to take groups of several levels.
+    let desc = RendererDesc {
+        raster_error_pixels: ERROR_PIXELS,
+        rt_error_pixels: ERROR_PIXELS,
+        rt_merge_pixels: 0.0,
+        culled_error_scale: 4.0,
+        ..RendererDesc::default()
+    };
+    let mut w = World::with_pack(&desc, bytes);
+    let items = walled_fine_ground();
+    let placed = place(&mut w, &items);
+    let eye = DVec3::new(0.3, 1.2, 4.0);
+    let target = DVec3::new(0.0, 0.0, -10.0);
+    let m = CpuMesh::of_pack(bytes, "fine ground");
+    let clusters = m.clusters();
+    let p = Projector::new(&items[0], eye.as_vec3());
+    let slot = placed.ranges[0].first;
+    let model = w.model("fine ground");
+    let culled = desc.culled_error_scale;
+    let (uniform, uniform_near) = rule_cut(&m, &clusters, &p, ERROR_PIXELS, 1.0, &m.all_resident());
+    let mut seen: Option<SeenRender> = None;
+    let (mut still, mut idle, mut taken) = (None, 0, 0);
+    let start = Instant::now();
+    for frame in 1.. {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "the loads never settled"
+        );
+        let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+        let cut = read_cut(&g.view, placed.count);
+        let (pages, bases, nodes) = mesh_pages(&w, model);
+        let resident = Resident {
+            pages: pages.iter().map(|&a| a != 0).collect(),
+            nodes: nodes.iter().map(|&a| a != 0).collect(),
+        };
+        let raster = cut.raster(&m, slot);
+        let ray = cut.ray(&m, slot, &pages, &bases, &raster);
+        let what = format!("frame {frame}");
+        assert_whole(&m, &clusters, &raster, &format!("{what}: raster"));
+        assert_whole(&m, &clusters, &ray, &format!("{what}: ray tracing"));
+        match &seen {
+            None => {
+                let (want, near) = rule_cut(&m, &clusters, &p, ERROR_PIXELS, 1.0, &resident);
+                assert_cut(&raster, &want, &near, &what);
+            }
+            Some(s) => {
+                let (want, near, decided) =
+                    seen_rule_cut(&m, &clusters, &items[0], ERROR_PIXELS, culled, s, &resident);
+                assert_cut(&raster, &want, &near, &format!("{what}: raster"));
+                // The copy was drawn the frame before, so it traces at the raster's thresholds.
+                assert_cut(&ray, &want, &near, &format!("{what}: ray tracing"));
+                let by_hidden = decided.difference(&near).count();
+                taken = taken.max(by_hidden);
+                assert!(
+                    by_hidden == 0
+                        || cut.counters[CUT_HIDDEN_TESTS] > 0 && cut.counters[CUT_HIDDEN_RULES] > 0,
+                    "{what}: counters {:?}",
+                    cut.counters
+                );
+            }
+        }
+        let r = w.scenes.residency();
+        let loading =
+            r.loads > 0 || r.class(orr_scene::ResidencyClass::MeshPages).loading_bytes > 0;
+        idle = if loading { 0 } else { idle + 1 };
+        if idle >= 8 {
+            let ground = slot + 1;
+            let drawn: BTreeSet<u32> = (0..g.ids.len())
+                .filter(|&i| g.ids[i] == ground)
+                .map(|i| g.clusters[i] - 1)
+                .collect();
+            assert!(!drawn.is_empty(), "{what}: the ground shows");
+            let off: Vec<u32> = drawn
+                .iter()
+                .filter(|c| !uniform.contains(c) && !uniform_near.contains(c))
+                .copied()
+                .collect();
+            assert!(
+                off.is_empty(),
+                "{what}: drawn clusters off the rule: {off:?}"
+            );
+            let s = still.get_or_insert_with(|| raster.clone());
+            assert_eq!(&raster, s, "{what}: the cut moved");
+        }
+        seen = Some(SeenRender::of(&g.view, eye));
+        if idle >= 12 {
+            break;
+        }
+    }
+    assert!(taken > 0, "no cluster is the hidden threshold's");
+    assert_eq!(w.scenes.residency().failed, 0);
+    assert_clean();
+}
+
 /// The figures of the last completed frame, taken in by an empty one.
 fn last_stats(w: &mut World, frame: u32) -> orr_scene::FrameStats {
     let f = w
@@ -5864,6 +6162,7 @@ fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_clust
     let _serial = serial();
     let mut w = World::with(&RendererDesc {
         rt_merge_pixels: 0.0,
+        culled_error_scale: 1.0,
         budgets: Budgets {
             initial_traversal_nodes: 1,
             initial_candidate_items: 1,
@@ -6418,26 +6717,55 @@ fn a_mesh_page_pool_short_of_what_the_view_wants_coarsens_the_whole_cut_evenly()
 }
 
 /// A pack of one DAG ground over a fine grid, whose many pages stream in steps small beside
-/// a pool of a few times their size.
+/// a pool of a few times their size, a second ground of pages of its own, and a wall.
 fn fine_ground_pack() -> &'static Arc<[u8]> {
     static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
     PACK.get_or_init(|| {
+        let unit = [
+            Vec3::new(-0.5, -0.5, 0.0),
+            Vec3::new(0.5, -0.5, 0.0),
+            Vec3::new(0.5, 0.5, 0.0),
+            Vec3::new(-0.5, 0.5, 0.0),
+        ];
         let manifest = Manifest {
             archives: vec![ArchiveSpec::new(
                 Target::Memory,
-                vec![AssetSpec {
-                    name: "fine ground".into(),
-                    source: Source::Mesh {
-                        mesh: grid(320, 8.0, 2.0, |x, z| {
-                            0.15 * (x * 1.3).sin() * (z * 0.9).cos()
-                        }),
-                        materials: vec![Material::default()],
-                        settings: MeshSettings {
-                            lod: LodMode::Dag,
-                            ..MeshSettings::default()
+                vec![
+                    AssetSpec {
+                        name: "fine ground".into(),
+                        source: Source::Mesh {
+                            mesh: grid(320, 8.0, 2.0, |x, z| {
+                                0.15 * (x * 1.3).sin() * (z * 0.9).cos()
+                            }),
+                            materials: vec![Material::default()],
+                            settings: MeshSettings {
+                                lod: LodMode::Dag,
+                                ..MeshSettings::default()
+                            },
                         },
                     },
-                }],
+                    AssetSpec {
+                        name: "hidden ground".into(),
+                        source: Source::Mesh {
+                            mesh: grid(320, 8.0, 2.0, |x, z| {
+                                0.15 * (x * 0.7).cos() * (z * 1.1).sin()
+                            }),
+                            materials: vec![Material::default()],
+                            settings: MeshSettings {
+                                lod: LodMode::Dag,
+                                ..MeshSettings::default()
+                            },
+                        },
+                    },
+                    AssetSpec {
+                        name: "wall".into(),
+                        source: Source::Mesh {
+                            mesh: quad(unit),
+                            materials: vec![Material::default()],
+                            settings: MeshSettings::default(),
+                        },
+                    },
+                ],
             )],
         };
         orr_cook::cook(&manifest, &Default::default())
@@ -6461,6 +6789,7 @@ fn settled_detail(pool: PoolSize) -> (f32, u64, u64) {
             rt_error_pixels: ERROR_PIXELS,
             rt_merge_pixels: 0.0,
             culled_error_scale: 1.0,
+            hidden_detail_lead: 1.0,
             budgets: Budgets {
                 mesh_page_pool: pool,
                 ..Budgets::default()
@@ -6549,6 +6878,221 @@ fn settled_detail(pool: PoolSize) -> (f32, u64, u64) {
     }
     assert_eq!(w.scenes.residency().failed, 0);
     (scale, demand, pinned)
+}
+
+/// The streaming ground, a wall before most of it, which the camera sees from in front, and a
+/// second ground standing upright wholly behind the wall.
+fn walled_fine_ground() -> [Item; 3] {
+    [
+        Item {
+            model: "fine ground",
+            linear: Mat3::from_rotation_x(0.25) * Mat3::from_diagonal(Vec3::new(2.0, 1.0, 4.0)),
+            at: Vec3::new(0.0, -1.0, -12.0),
+        },
+        Item {
+            model: "wall",
+            linear: Mat3::from_diagonal(Vec3::new(10.0, 8.0, 1.0)),
+            at: Vec3::new(0.0, 2.5, -6.0),
+        },
+        Item {
+            model: "hidden ground",
+            linear: Mat3::from_rotation_x(std::f32::consts::FRAC_PI_2)
+                * Mat3::from_diagonal(Vec3::splat(0.8)),
+            at: Vec3::new(0.3, 2.5, -8.0),
+        },
+    ]
+}
+
+/// Shoots frames of `placed` from the walled ground's camera, `moved` written each frame,
+/// until the loads are idle and the detail scales have held for 24 frames; returns the last
+/// frame and its detail.
+fn settle_walled(
+    w: &mut World,
+    placed: &Placed,
+    frame: &mut u32,
+    moved: &[(u32, Affine3)],
+) -> (Frame, orr_scene::DetailStats) {
+    let eye = DVec3::new(0.3, 1.2, 4.0);
+    let target = DVec3::new(0.0, 0.0, -10.0);
+    let start = Instant::now();
+    let (mut still, mut scale) = (0, -1.0);
+    loop {
+        *frame += 1;
+        let mut shot = Shot::at(eye, target, *frame);
+        shot.moved = moved.to_vec();
+        let g = shoot(w, placed, &shot);
+        let d = w.scenes.stats().detail;
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "the detail never settled, at {d:?}"
+        );
+        let pool = *w
+            .scenes
+            .residency()
+            .class(orr_scene::ResidencyClass::MeshPages);
+        let idle = w.scenes.residency().loads == 0 && pool.loading_bytes == 0;
+        still = if idle && d.memory_scale == scale {
+            still + 1
+        } else {
+            0
+        };
+        scale = d.memory_scale;
+        if still >= 24 {
+            return (g, d);
+        }
+    }
+}
+
+/// The streaming grounds behind and before a wall. Under an ample mesh page pool the view
+/// wants less with hidden thresholds coarser than at one threshold over everything
+/// (`culled_error_scale` 1). At one threshold, a pool short of what that wants coarsens hidden
+/// geometry alone, the visible scale holding at 1. Under a pool shorter still the wall goes:
+/// every frame's cut is whole while the pages the revealed ground wants land, some clusters
+/// standing in for them, and once the loads and the scales settle it takes the reference of
+/// the hidden test over the last frame at the scales the frame ran at.
+#[test]
+fn hidden_geometry_sheds_mesh_pages_first_and_a_revealed_ground_stays_whole() {
+    let _serial = serial();
+    // Fine enough that the view wants the streamed pages of both grounds.
+    const ERROR_PIXELS: f32 = 0.001;
+    let bytes = fine_ground_pack();
+    let world = |culled: f32, pool: PoolSize| {
+        World::with_pack(
+            &RendererDesc {
+                raster_error_pixels: ERROR_PIXELS,
+                rt_error_pixels: ERROR_PIXELS,
+                rt_merge_pixels: 0.0,
+                culled_error_scale: culled,
+                budgets: Budgets {
+                    mesh_page_pool: pool,
+                    ..Budgets::default()
+                },
+                ..RendererDesc::default()
+            },
+            bytes,
+        )
+    };
+    let items = walled_fine_ground();
+    let ample = Budgets::default().mesh_page_pool;
+    // Hidden thresholds the lead times coarser, as the short pool below takes them.
+    let culled = RendererDesc::default().hidden_detail_lead;
+
+    let mut w = world(1.0, ample);
+    let placed = place(&mut w, &items);
+    let (_, even) = settle_walled(&mut w, &placed, &mut 0, &[]);
+    drop(w);
+
+    let mut w = world(culled, ample);
+    let placed = place(&mut w, &items);
+    let mut frame = 0;
+    let (_, seen) = settle_walled(&mut w, &placed, &mut frame, &[]);
+    assert_eq!(seen.memory_scale, 1.0, "{seen:?}");
+    assert!(
+        seen.mesh_demand < even.mesh_demand,
+        "the hidden test sheds no pages: {seen:?} against {even:?}"
+    );
+
+    drop(w);
+
+    // At one threshold over everything, a pool that holds what the view wants with hidden
+    // thresholds the lead times coarser, and not what it wants at one threshold: the memory
+    // scale goes to the hidden thresholds.
+    let pool = seen.mesh_demand * 5 / 4;
+    assert!(
+        even.mesh_demand as f64 > 0.92 * pool as f64,
+        "the wall hides too little: {seen:?} against {even:?}"
+    );
+    let mut w = world(1.0, PoolSize::Bytes(pool));
+    let placed = place(&mut w, &items);
+    let mut frame = 0;
+    let (_, short) = settle_walled(&mut w, &placed, &mut frame, &[]);
+    assert!(
+        short.memory_scale > 1.0,
+        "a pool of {pool} B coarsens: {short:?}"
+    );
+    assert_eq!(
+        short.visible_scale, 1.0,
+        "visible detail holds while hidden detail coarsens: {short:?}"
+    );
+    assert!(
+        short.mesh_demand as f64 <= 0.92 * short.mesh_budget as f64,
+        "{short:?}"
+    );
+    drop(w);
+
+    // Under a pool short enough that the pages the ground behind the wall would want are not
+    // resident, the wall goes.
+    let mut w = world(1.0, PoolSize::Bytes(seen.mesh_demand * 3 / 4));
+    let placed = place(&mut w, &items);
+    let mut frame = 0;
+    settle_walled(&mut w, &placed, &mut frame, &[]);
+    let model = w.model("fine ground");
+    let m = CpuMesh::of_pack(bytes, "fine ground");
+    let clusters = m.clusters();
+    let eye = DVec3::new(0.3, 1.2, 4.0);
+    let slot = placed.ranges[0].first;
+    let gone = [(1, Affine3::from_mat3_translation(Mat3::ZERO, Vec3::ZERO))];
+    let target = DVec3::new(0.0, 0.0, -10.0);
+    let start = Instant::now();
+    let (mut standing, mut still, mut scale) = (0, 0, -1.0);
+    let mut last: Option<SeenRender> = None;
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "the reveal never settled"
+        );
+        frame += 1;
+        let mut shot = Shot::at(eye, target, frame);
+        shot.moved = gone.to_vec();
+        let g = shoot(&mut w, &placed, &shot);
+        let (pages, bases, nodes) = mesh_pages(&w, model);
+        let resident = Resident {
+            pages: pages.iter().map(|&a| a != 0).collect(),
+            nodes: nodes.iter().map(|&a| a != 0).collect(),
+        };
+        let cut = read_cut(&g.view, placed.count);
+        let raster = cut.raster(&m, slot);
+        let ray = cut.ray(&m, slot, &pages, &bases, &raster);
+        let what = format!("frame {frame} after the wall");
+        assert_whole(&m, &clusters, &raster, &format!("{what}: raster"));
+        assert_whole(&m, &clusters, &ray, &format!("{what}: ray tracing"));
+        standing = standing.max(
+            raster
+                .iter()
+                .filter(|&&c| m.stands_in(&clusters[c as usize], &resident))
+                .count(),
+        );
+        let d = w.scenes.stats().detail;
+        let r = w.scenes.residency();
+        let idle = r.loads == 0 && r.class(orr_scene::ResidencyClass::MeshPages).loading_bytes == 0;
+        still = if idle && d.memory_scale == scale {
+            still + 1
+        } else {
+            0
+        };
+        scale = d.memory_scale;
+        if still >= 24 {
+            let s = last.as_ref().expect("a frame before");
+            let (want, near, _) = seen_rule_cut(
+                &m,
+                &clusters,
+                &items[0],
+                ERROR_PIXELS * d.visible_scale,
+                d.hidden_scale,
+                s,
+                &resident,
+            );
+            assert_cut(&raster, &want, &near, &format!("{what} at {d:?}: raster"));
+            break;
+        }
+        last = Some(SeenRender::of(&g.view, eye));
+    }
+    assert!(
+        standing > 0,
+        "no cluster stood in for the revealed ground's pages"
+    );
+    assert_eq!(w.scenes.residency().failed, 0);
+    assert_clean();
 }
 
 // --- Skinned copies ------------------------------------------------------------------------

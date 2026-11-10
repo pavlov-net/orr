@@ -37,13 +37,13 @@ use crate::ptlas::{FrameInputs, PtlasPipelines, RtStats};
 use crate::raster::{self, ListSizes, RasterPipelines, TargetSizes, ViewLists, ViewTargets};
 #[cfg(feature = "hot-reload")]
 use crate::reload::Reloader;
-use crate::residency::{RequestSource, ResidencyStats, response_period};
+use crate::residency::{HOLD_FRAMES, RequestSource, ResidencyStats, response_period};
 use crate::scene::{GroupWriter, ModelCpu, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
 use crate::shaders::transparency::CompositeRoot;
 use crate::shaders::{animation, emissive, instance_page, page_motion, world as world_kernel};
 use crate::skin::{SkinFrame, SkinKernels, SkinStats};
 use crate::subd::ModelCage;
-use crate::tessellate::{self, Patterns, SeenBy, TessKernels, TessellationStats};
+use crate::tessellate::{self, Patterns, TessKernels, TessellationStats};
 use crate::time::FrameTime;
 use crate::transparency::TransparencyPass;
 use crate::traverse::{CutInputs, CutPipelines, CutSizes, CutStats, Cuts, PageFeedback};
@@ -52,7 +52,7 @@ use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constan
 use crate::world::{WorldPos, needs_rebase, origin_for};
 use crate::{
     BlobId, BlobTarget, EditDesc, EditId, EditRef, Error, ExposureState, ProducerBatch, Result,
-    SceneRoot, TextureStreamGpu,
+    SceneRoot, SeenView, TextureStreamGpu,
 };
 
 /// The size of a pool: bytes, or a share of the device-local heap its memory is on, which
@@ -247,14 +247,22 @@ pub struct RendererDesc {
     /// ring (IoRing, io_uring) is available.
     pub positioned_reads: bool,
     /// Raster LOD: the largest cluster error drawn, in render pixels at the scene focus, times
-    /// [`DetailStats::memory_scale`].
+    /// [`DetailStats::visible_scale`].
     pub raster_error_pixels: f32,
     /// Ray-tracing LOD: the largest cluster error traced, in render pixels at the scene focus,
-    /// times [`DetailStats::memory_scale`] and, in a gathered cut, its scene's
+    /// times [`DetailStats::visible_scale`] and, in a gathered cut, its scene's
     /// [`DetailStats::rt_scale`].
     pub rt_error_pixels: f32,
-    /// Copies no view drew last frame trace at this many times `rt_error_pixels`.
+    /// Where no view saw a group's bounds in its last render of the scene (outside its
+    /// frustum or behind the depth it drew), raster and ray tracing take this many times
+    /// their thresholds, times [`DetailStats::hidden_scale`]; so do the ray-tracing thresholds
+    /// of copies no view drew last frame. At least 1.
     pub culled_error_scale: f32,
+    /// How far the mesh page pool's detail scale ([`DetailStats::memory_scale`]) coarsens
+    /// hidden geometry before visible geometry: hidden thresholds take up to this much of it
+    /// ([`DetailStats::hidden_scale`]), visible ones the rest. At least 1; 1 coarsens both
+    /// alike.
+    pub hidden_detail_lead: f32,
     /// Copies whose bounding sphere projects to a radius under this many render pixels at the
     /// focus trace their model's merged cut: the finest cached cut any of them needs. 0 turns
     /// merging off.
@@ -289,6 +297,7 @@ impl Default for RendererDesc {
             raster_error_pixels: 1.0,
             rt_error_pixels: 1.0,
             culled_error_scale: 2.0,
+            hidden_detail_lead: 4.0,
             rt_merge_pixels: 32.0,
             software_raster_pixels: 32.0,
             alias_view_targets: true,
@@ -355,8 +364,13 @@ pub struct FrameStats {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DetailStats {
     /// The scale of both thresholds, from the mesh page pool's demand; 1 at the configured
-    /// detail.
+    /// detail. It is `visible_scale` times `hidden_scale`.
     pub memory_scale: f32,
+    /// The part of `memory_scale` every threshold takes, over visible geometry too.
+    pub visible_scale: f32,
+    /// The part of `memory_scale` only the thresholds of hidden geometry take: up to
+    /// [`RendererDesc::hidden_detail_lead`].
+    pub hidden_scale: f32,
     /// The largest further scale of the ray-tracing threshold of gathered cuts in its scenes,
     /// from the CLAS they wanted against what their tables hold once those can grow no
     /// further ([`Budgets::rt_cut_memory`]).
@@ -420,6 +434,7 @@ struct Core {
     raster_error_pixels: f32,
     rt_error_pixels: f32,
     culled_error_scale: f32,
+    hidden_detail_lead: f32,
     /// The scale of both thresholds for the mesh page pool ([`DetailStats::memory_scale`]).
     memory: Detail,
     rt_merge_pixels: f32,
@@ -515,6 +530,10 @@ impl Scenes {
             b.initial_rt_cut_clusters > 0 && b.initial_rt_cut_blas > 0,
             "initial_rt_cut_clusters and initial_rt_cut_blas are above 0"
         );
+        assert!(
+            desc.culled_error_scale >= 1.0 && desc.hidden_detail_lead >= 1.0,
+            "culled_error_scale and hidden_detail_lead are at least 1"
+        );
         let pools = PoolBytes::new(device, b);
         // Cluster ids are 32 bits.
         let clusters = u32::try_from(pools.mesh / b.resident_cluster_bytes).unwrap_or(u32::MAX);
@@ -590,6 +609,7 @@ impl Scenes {
                 raster_error_pixels: desc.raster_error_pixels,
                 rt_error_pixels: desc.rt_error_pixels,
                 culled_error_scale: desc.culled_error_scale,
+                hidden_detail_lead: desc.hidden_detail_lead,
                 memory: Detail::new(),
                 rt_merge_pixels: desc.rt_merge_pixels,
                 software_raster_pixels: desc.software_raster_pixels,
@@ -1059,6 +1079,15 @@ impl Scenes {
         else {
             return;
         };
+        // A later history may take its id.
+        for scene in self.core.scenes.iter().flatten() {
+            scene
+                .cpu
+                .lock()
+                .unwrap()
+                .seen_by
+                .retain(|s| s.history != id);
+        }
         // Its slots' initialization may not have been applied yet.
         let base = h.exposure.gpu().address().0;
         let end = base + h.exposure.size();
@@ -1324,6 +1353,14 @@ impl Core {
             SceneFeatures::NONE
         };
         self.materials.features() | fades | streams
+    }
+
+    /// The memory scale's parts ([`DetailStats::visible_scale`], `hidden_scale`): hidden
+    /// geometry takes up to the lead first.
+    fn detail_scales(&self) -> (f32, f32) {
+        let m = self.memory.scale();
+        let hidden = m.min(self.hidden_detail_lead);
+        (m / hidden, hidden)
     }
 
     /// Writes `model`'s chain into its `ModelGpu` with the next frame's records.
@@ -2062,7 +2099,7 @@ impl<'a> Frame<'a> {
                 &core.skin,
                 root,
                 focus,
-                core.raster_error_pixels * core.memory.scale(),
+                core.raster_error_pixels * core.detail_scales().0,
                 cpu.skinned_high_water,
                 (self.id % u64::from(core.fif)) as usize,
             )?;
@@ -2075,14 +2112,24 @@ impl<'a> Frame<'a> {
                 let w = WorldPos::new(f, core.cell_log2);
                 (w.cell.extend(1).to_array(), w.offset.extend(ppr).to_array())
             });
-            let memory_scale = core.memory.scale();
+            let (visible, hidden) = core.detail_scales();
+            let views = seen_views(
+                device,
+                &core.histories,
+                window,
+                id,
+                &mut cpu.seen_by,
+                self.id,
+            )?;
             let inputs = CutInputs {
                 scene: root,
                 focus,
-                raster_pixels: core.raster_error_pixels * memory_scale,
-                rt_pixels: core.rt_error_pixels * memory_scale,
-                memory_scale,
-                culled_scale: core.culled_error_scale,
+                raster_pixels: core.raster_error_pixels * visible,
+                rt_pixels: core.rt_error_pixels * visible,
+                visible_scale: visible,
+                culled_scale: core.culled_error_scale * hidden,
+                views: views.0,
+                view_count: views.1,
                 merge_pixels: core.rt_merge_pixels,
                 slots: cpu.ptlas.high_water,
                 passes: hierarchy.depth,
@@ -2412,12 +2459,21 @@ impl<'a> Frame<'a> {
             core.mounts.streaming.out_of_memory(&e);
         }
         let mut cpu = core.scene(view.scene)?.cpu.lock().unwrap();
-        if cpu.seen_by.is_none_or(|s| s.frame != self.id) {
-            cpu.seen_by = Some(crate::scene::LastView {
-                history: view.history,
-                frame: self.id,
-                constants: seen,
-            });
+        let last = crate::scene::LastView {
+            history: view.history,
+            frame: self.id,
+            constants: seen,
+        };
+        // The views stay in the order of their last renders; a second render in one frame
+        // keeps its place, its constants those of the render the HZB holds.
+        let views = &mut cpu.seen_by;
+        match views.iter().position(|s| s.history == view.history) {
+            Some(i) if views[i].frame == self.id => views[i] = last,
+            Some(i) => {
+                views.remove(i);
+                views.push(last);
+            }
+            None => views.push(last),
         }
         drop(cpu);
         self.step("raster_view");
@@ -2624,6 +2680,8 @@ impl<'a> Frame<'a> {
             // `begin_frame` alone steps the scale, so it is the one this frame recorded at.
             detail: DetailStats {
                 memory_scale: self.core.memory.scale(),
+                visible_scale: self.core.detail_scales().0,
+                hidden_scale: self.core.detail_scales().1,
                 rt_scale: 1.0,
                 ..DetailStats::default()
             },
@@ -2669,9 +2727,10 @@ fn record_producers(
             let w = WorldPos::new(f, core.cell_log2);
             (w.cell.extend(1).to_array(), w.offset.extend(ppr).to_array())
         });
-        let seen = match cpu.seen_by {
-            Some(s) if s.frame + 1 == frame => seen_by(device, core, window, id, &s)?,
-            _ => None,
+        // Last frame's first view of the scene.
+        let seen = match cpu.seen_by.iter().find(|s| s.frame + 1 == frame) {
+            Some(s) => seen_view(device, &core.histories, window, id, s)?,
+            None => None,
         };
         for (i, p) in cpu.producers.iter().enumerate() {
             let Some(tess) = p.as_ref().and_then(|p| p.tess) else {
@@ -2779,17 +2838,17 @@ fn record_producers(
     Ok(())
 }
 
-/// Last frame's first view of scene `id` as the tessellator reads it, from `seen`: its
-/// constants and, while its history's HZB still holds that render, the HZB.
-fn seen_by(
+/// A render of scene `id` as kernels that test what it saw read it, from `seen`: its constants
+/// and, while its history's HZB still holds that render, the HZB. None once the history is
+/// gone.
+fn seen_view(
     device: &Device,
-    core: &Core,
+    histories: &[Option<ViewHistory>],
     window: &UploadWindow,
     id: SceneId,
     seen: &crate::scene::LastView,
-) -> Result<Option<SeenBy>> {
-    let Some(history) = core
-        .histories
+) -> Result<Option<SeenView>> {
+    let Some(history) = histories
         .get(seen.history.0 as usize)
         .and_then(Option::as_ref)
     else {
@@ -2804,10 +2863,45 @@ fn seen_by(
         }
         _ => GpuPtr::NULL,
     };
-    Ok(Some(SeenBy {
+    Ok(Some(SeenView {
         view: window.put(device, &seen.constants)?,
         raster,
     }))
+}
+
+/// The views the traversal of scene `id` at frame `frame` tests, each history's last render of
+/// the scene ([`seen_view`]), and their count. First drops from `seen` the renders of histories
+/// that are gone or have rendered another scene since, and those older than the page hold: a
+/// view that renders the scene now and then keeps its place between its renders.
+fn seen_views(
+    device: &Device,
+    histories: &[Option<ViewHistory>],
+    window: &UploadWindow,
+    id: SceneId,
+    seen: &mut Vec<crate::scene::LastView>,
+    frame: u64,
+) -> Result<(GpuPtr<SeenView>, u32)> {
+    seen.retain(|s| {
+        let Some(h) = histories.get(s.history.0 as usize).and_then(Option::as_ref) else {
+            return false;
+        };
+        let other = h
+            .targets
+            .as_ref()
+            .and_then(|t| t.hzb_view)
+            .is_some_and(|(scene, _)| scene != id);
+        !other && s.frame + HOLD_FRAMES >= frame
+    });
+    let mut views = Vec::with_capacity(seen.len());
+    for s in seen.iter() {
+        views.extend(seen_view(device, histories, window, id, s)?);
+    }
+    if views.is_empty() {
+        return Ok((GpuPtr::NULL, 0));
+    }
+    let (at, out) = window.slice::<SeenView>(device, views.len() as u32)?;
+    out.copy_from_slice(&views);
+    Ok((at, views.len() as u32))
 }
 
 impl Drop for Scenes {

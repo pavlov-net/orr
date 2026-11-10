@@ -20,7 +20,7 @@ use crate::shaders::types::{
     PatchItem, PatternGpu, PatternTable, SubdCopyGpu, TessGpu, TessStateGpu,
 };
 use crate::subd::CageShape;
-use crate::{RasterGpu, Result, SceneRoot, TopologyGpu, ViewConstants};
+use crate::{Result, SceneRoot, SeenView, TopologyGpu};
 
 pub(crate) use crate::pattern::PATTERNS;
 pub use crate::pattern::{BARY_ONE, Pattern};
@@ -356,14 +356,6 @@ impl TessKernels {
     }
 }
 
-/// Last frame's first view of a scene, which edge factors test for what it saw.
-#[derive(Clone, Copy)]
-pub(crate) struct SeenBy {
-    pub(crate) view: GpuPtr<ViewConstants>,
-    /// Its HZB; null tests the frustum alone.
-    pub(crate) raster: GpuPtr<RasterGpu>,
-}
-
 /// One tessellated entry this frame.
 pub(crate) struct Job {
     pub(crate) scene: GpuPtr<SceneRoot>,
@@ -372,7 +364,9 @@ pub(crate) struct Job {
     pub(crate) state: GpuPtr<TessStateGpu>,
     /// The scene focus as a cell, an offset and pixels per radian.
     pub(crate) focus: Option<([i32; 4], [f32; 4])>,
-    pub(crate) seen: Option<SeenBy>,
+    /// Last frame's first view of the scene, which edge factors test for what it saw; its
+    /// null HZB tests the frustum alone.
+    pub(crate) seen: Option<SeenView>,
     /// A subdivision copy's record and its cage's sizes.
     pub(crate) subd: Option<(GpuPtr<SubdCopyGpu>, CageShape)>,
 }

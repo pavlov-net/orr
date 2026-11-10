@@ -114,7 +114,7 @@ pub use scenes::{
 pub(crate) use shaders::types::{
     BlasJob, CutKey, DecalBinGpu, EditGpu, FeedbackGpu, GroupGpu, MaskGpu, MediumProxyGpu,
     NeuralMipGpu, NeuralSetGpu, NeuralTextureGpu, NodeItem, PartGpu, PartListGpu, ProducerGpu,
-    RasterRoot, SetTablesGpu, SkinMeshGpu, TessStateGpu, TextureFeedbackGpu, TopologyGpu,
+    RasterRoot, SeenView, SetTablesGpu, SkinMeshGpu, TessStateGpu, TextureFeedbackGpu, TopologyGpu,
 };
 pub use shaders::types::{
     ClusterRef, ClusterWork, CutGpu, DecalGpu, EditGroupGpu, EmissiveGpu, GBufferGpu,

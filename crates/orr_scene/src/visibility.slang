@@ -182,14 +182,15 @@ public float projected_error(ViewConstants* v, float3 center, float radius, floa
 // False when the sphere at eye-relative `center` lies wholly outside the view frustum.
 public bool sphere_visible(ViewConstants* v, float3 center, float radius)
 {
-    float3 c = view_from_relative(v, center);
+    precise float3 c = view_from_relative(v, center);
     float4x4 m = v.clip_from_view_jittered;
     float4 p = float4(c, 1.0);
     float4 planes[5] = { m[3] + m[0], m[3] - m[0], m[3] + m[1], m[3] - m[1], m[3] - m[2] };
     for (uint i = 0; i < 5; i++)
     {
-        float l = length(planes[i].xyz);
-        if (dot(planes[i], p) < -radius * l)
+        precise float l = length(planes[i].xyz);
+        precise float d = dot(planes[i], p);
+        if (d < -radius * l)
             return false;
     }
     return true;
@@ -201,8 +202,40 @@ public bool near_eye(ViewConstants* v, float3 center, float radius)
 {
     float4x4 m = v.clip_from_view;
     float near = m[2][3];
-    float corner = near * sqrt(1.0 + 1.0 / (m[0][0] * m[0][0]) + 1.0 / (m[1][1] * m[1][1]));
-    return length(center) - radius < 1.01 * corner;
+    precise float corner = near * sqrt(1.0 + 1.0 / (m[0][0] * m[0][0]) + 1.0 / (m[1][1] * m[1][1]));
+    precise float gap = length(center) - radius;
+    return gap < 1.01 * corner;
+}
+
+// A view's last render of a scene, for kernels outside its raster that test what it saw: its
+// constants and, while its history's HZB still holds that render, a raster record holding the
+// HZB (`ViewTargets::hzb_record`), else nullptr.
+public struct SeenView
+{
+    public ViewConstants* view;
+    public RasterGpu* raster;
+}
+
+// Whether view `v`'s render saw none of the sphere at eye-relative `center` of `radius` m: it
+// lies outside the frustum or, with `r` holding the render's HZB, its box lies behind the depth
+// the render drew. A sphere holding dielectric or presence clusters (`layer`) is seen wherever
+// it reaches between the eye and the near plane, as the culling's frustum test takes it. The
+// tests are precise and grow with the sphere, so a sphere inside another is unseen wherever
+// the other is.
+public bool sphere_unseen(ViewConstants* v, RasterGpu* r, bool layer, float3 center, float radius)
+{
+    if (layer && near_eye(v, center, radius))
+        return false;
+    if (!sphere_visible(v, center, radius))
+        return true;
+    if (r == nullptr)
+        return false;
+    Placement here = (Placement)0;
+    here.linear = float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
+    here.scale = 1.0;
+    precise float3 lo = center - radius;
+    precise float3 hi = center + radius;
+    return box_occluded(v, r, here, lo, hi, false);
 }
 
 // Pixel coordinates of clip-space `clip`, as the viewport places them.
@@ -259,15 +292,16 @@ public bool box_occluded(ViewConstants* v, RasterGpu* r, Placement p, float3 lo,
     for (uint i = 0; i < 8; i++)
     {
         float3 corner = float3((i & 1) != 0 ? hi.x : lo.x, (i & 2) != 0 ? hi.y : lo.y, (i & 4) != 0 ? hi.z : lo.z);
-        float3 x = place(p, corner);
-        float3 view = previous ? mul(v.prev_view_from_world_rotation, float4(x + v.eye_motion.xyz, 0.0)) : view_from_relative(v, x);
-        float4 clip = mul(previous ? v.prev_clip_from_view : v.clip_from_view_jittered, float4(view, 1.0));
+        precise float3 x = place(p, corner);
+        precise float3 view = previous ? mul(v.prev_view_from_world_rotation, float4(x + v.eye_motion.xyz, 0.0)) : view_from_relative(v, x);
+        precise float4 clip = mul(previous ? v.prev_clip_from_view : v.clip_from_view_jittered, float4(view, 1.0));
         if (!(clip.w > 0.0 && clip.z < clip.w))
             return false;
-        float2 xy = pixel_from_clip(v, clip);
+        precise float2 xy = pixel_from_clip(v, clip);
         rect_min = min(rect_min, xy);
         rect_max = max(rect_max, xy);
-        nearest = max(nearest, clip.z / clip.w);
+        precise float depth = clip.z / clip.w;
+        nearest = max(nearest, depth);
     }
     // A pixel more on each side covers the jitter between the frames.
     float2 extent = float2(r.gbuffer.extent);
@@ -276,7 +310,7 @@ public bool box_occluded(ViewConstants* v, RasterGpu* r, Placement p, float3 lo,
     if (any(rect_min > rect_max))
         return false;
     // A mip whose texels are half the rect's longer side: at most 3 x 3 texels cover it.
-    float2 size = rect_max - rect_min;
+    precise float2 size = rect_max - rect_min;
     uint mip = min(uint(max(ceil(log2(max(max(size.x, size.y), 1.0))) - 1.0, 0.0)), r.hzb_mips - 1);
     uint2 top = max(r.gbuffer.extent >> mip, 1) - 1;
     uint2 a = min(uint2(rect_min) >> mip, top);

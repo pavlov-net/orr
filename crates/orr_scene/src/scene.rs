@@ -727,9 +727,10 @@ pub(crate) struct SceneCpu {
     pub(crate) skins_removed: Vec<(u64, u32, u32, Option<CopyArrays>)>,
     /// Made at the first update with skinned copies.
     pub(crate) skin_frame: Option<SkinFrame>,
-    /// The first view `raster_view` rendered of the scene in its last frame, which the
-    /// tessellator's edge factors test for what it saw.
-    pub(crate) seen_by: Option<LastView>,
+    /// Each view history's last render of the scene, in the order the renders ran: the
+    /// traversal tests what they saw, the tessellator's edge factors what last frame's first
+    /// saw.
+    pub(crate) seen_by: Vec<LastView>,
     /// Where each decal is listed, by `DecalId`.
     pub(crate) decals: Vec<Option<Listing>>,
     /// Set when a decal changed since the bin table was last written.
@@ -1213,7 +1214,7 @@ impl Scene {
                 skins: Vec::new(),
                 skins_removed: Vec::new(),
                 skin_frame: None,
-                seen_by: None,
+                seen_by: Vec::new(),
                 decals: vec![None; desc.decal_capacity as usize],
                 decals_changed: false,
                 decal_bin_slots: 0,

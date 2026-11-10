@@ -5,9 +5,12 @@
 // DAG roots of each stage a cut takes; `args` sizes each pass to the items the previous one
 // pushed and `traverse` runs one level: an internal node pushes the children whose projected error
 // exceeds a cut's threshold, a leaf applies the cluster rule to its group's clusters and
-// writes raster candidate items and ray-tracing cut clusters. While the mesh page of a group
-// is not resident, the clusters simplified from it stand in for its clusters even where their
-// own error is over the threshold, and the page is requested: only what the page holds stays
+// writes raster candidate items and ray-tracing cut clusters. A group's own sphere, at its
+// leaf and in the cluster rule, takes the hidden threshold where no view's last render saw
+// it (`sphere_hidden`); merged spheres of several groups take the visible one. While the mesh
+// page of a group is not resident, the clusters simplified from it stand in for its clusters
+// even where their own error is over the threshold, and the page is requested: only what the
+// page holds stays
 // coarser. A child in a non-resident node page is requested and not entered: a streamed mesh
 // page is resident only with the node pages over its groups' leaves, so the groups below it
 // are not resident either and their stand-ins cover them. These passes count and hash each
@@ -71,10 +74,16 @@ public struct TraverseRoot
     public uint flags;             // TRAVERSE_*
     public uint models;
     public float gather_scale;     // RT error threshold scale of gathered cuts, so that they fit
-    public uint _pad0;
-    public uint64_t _pad1;
+    public uint view_count;
+    public SeenView* views;        // `view_count`: each view's last render of the scene
 }
 ORR_ROOT(TraverseRoot);
+
+// `NodeItem.flags` past the cuts' bits: a merged stage, and of a leaf whether the parent's
+// pass tested its group's sphere and found it hidden.
+static const uint ITEM_MERGED = 0x10000;
+static const uint ITEM_TESTED = 0x20000;
+static const uint ITEM_HIDDEN = 0x40000;
 
 bool has_focus()
 {
@@ -160,6 +169,7 @@ float cut_error(MeshGpu* mesh, Placement p, float4 sphere, float error)
 struct Lod
 {
     float threshold[2];   // raster, gathered ray tracing: pixels
+    float hidden[2];      // the same over a group sphere no view saw: at least `threshold`
     float cached;         // the ray-tracing threshold of the cached cuts it traces or wants
     float scale;          // the error scale debug_lod sets
     int level;            // DAG level held by debug_lod, -1 none
@@ -175,12 +185,92 @@ Lod slot_lod(SceneRoot* s, InstanceGpu inst, uint slot)
         l.level = int(d & 0xff);
     else if (d != 0)
         debug = 1.0 / f16tof32(d);
+    // A copy no view drew traces at the hidden threshold throughout; the raster takes no such
+    // term, as what it draws would decide what it draws.
     bool seen = s.slot_state[slot].last_visible_frame + 1 >= s.frame_index && s.slot_state[slot].last_visible_frame != 0;
     l.threshold[0] = root.raster_pixels;
+    l.hidden[0] = root.raster_pixels * root.culled_scale;
     l.cached = root.rt_pixels * (seen ? 1.0 : root.culled_scale);
     l.threshold[1] = l.cached * root.gather_scale;
+    l.hidden[1] = root.rt_pixels * root.culled_scale * root.gather_scale;
     l.scale = debug;
     return l;
+}
+
+// The placement of stage part `part` of slot copy `copy` (record `inst`) relative to the eye
+// of view `v` as the view's last render placed it: the copy's previous transform, posed by the
+// part's previous pose where that render posed the part. False when unknown: the group or the
+// pose hid it then.
+bool seen_placement(SceneRoot* s, uint copy, InstanceGpu inst, MeshGpu* mesh, uint part, bool merged, ViewConstants* v, out Placement p)
+{
+    GroupGpu* g = s.groups + inst.group;
+    if (!placement(g, true, inst.group_index, v, p))
+        return false;
+    bool animated = !merged && mesh.animated_parts > 0 && part >= mesh.first_animated && part < mesh.first_animated + mesh.animated_parts;
+    if (!animated || (copy & COPY_FAR) != 0 || (s.slot_state[copy].rt_flags & RT_WAS_ANIMATED) == 0)
+        return true;
+    float3x4 pose;
+    if (!part_pose(s, inst, mesh, part, true, pose))
+        return false;
+    p = placed_after(p, pose);
+    return true;
+}
+
+// A copy's stage part as the hidden test reads it.
+struct Stage
+{
+    SceneRoot* scene;
+    uint copy;
+    InstanceGpu inst;
+    MeshGpu* mesh;
+    uint part;
+    bool merged;
+}
+
+// Whether no view saw group sphere `sphere` (mesh space) of stage `st`: the scene has a view,
+// and for every view, the sphere placed as the view's last render placed the copy lies
+// outside that render's frustum or behind its depth (`sphere_unseen`). Unknown is seen: a
+// copy or part with no previous placement, a box reaching the near plane. A pure function of
+// the copy, the part, the sphere and the frame's views, so the two sides of a replacement read
+// one answer; and since a group's sphere holds the spheres of the groups its clusters come
+// from and the test grows with the sphere, a hidden group's finer groups are hidden too.
+bool sphere_hidden(Stage st, float4 sphere)
+{
+    if (root.view_count == 0)
+        return false;
+    bool layer = mesh_has_layers(st.mesh) && layer_traced(st.inst.flags);
+    SeenView* views = root.views;
+    for (uint i = 0; i < root.view_count; i++)
+    {
+        ViewConstants* v = views[i].view;
+        Placement p;
+        if (!seen_placement(st.scene, st.copy, st.inst, st.mesh, st.part, st.merged, v, p))
+            return false;
+        precise float3 center = place(p, sphere.xyz);
+        precise float radius = sphere.w * p.scale;
+        if (!sphere_unseen(v, views[i].raster, layer, center, radius))
+            return false;
+    }
+    return true;
+}
+
+// Whether error `e` (pixels) of group sphere `sphere` is over cut `k`'s threshold: over the
+// hidden one, or over the visible one with the sphere seen. The sphere is tested only for an
+// error between the two; `known` holds its test once run (-1 before, then 0 or 1), which
+// `tests` counts. `decided` is set where the hidden threshold kept the error under.
+bool over(Stage st, Lod l, uint k, float e, float4 sphere, inout int known, inout uint tests, inout bool decided)
+{
+    if (e <= l.threshold[k])
+        return false;
+    if (e > l.hidden[k])
+        return true;
+    if (known < 0)
+    {
+        known = sphere_hidden(st, sphere) ? 1 : 0;
+        tests += root.view_count > 0 ? 1 : 0;
+    }
+    decided = decided || known != 0;
+    return known == 0;
 }
 
 // The sphere around the model's bounds, in mesh space.
@@ -578,7 +668,7 @@ void push_roots(SceneRoot* s, CutGpu* cut, uint slot, MeshGpu* mesh, Placement p
         NodeItem item;
         item.slot = slot;
         item.node = node;
-        item.flags = m | (stage_merged ? 0x10000 : 0);
+        item.flags = m | (stage_merged ? ITEM_MERGED : 0);
         item.part = part;
         push(cut, root.pass % 2, item);
     }
@@ -700,9 +790,11 @@ static const uint RULE_STANDS_IN = 2;
 // Where cluster `cl` of a group at `depth` with error `group_error` stands in cut `k`: in when
 // its parent geometry is too coarse and its own is fine enough; with its own too coarse, it
 // stands in for finer geometry. A source cluster, at depth 0, has none finer and is in
-// whatever its own error. Under a debug level the groups at that level are in and the coarser
-// ones stand in.
-uint rule(MeshGpu* mesh, Placement p, Cluster cl, Lod l, uint k, uint depth, float group_error)
+// whatever its own error. Each geometry's error goes against the threshold its group's sphere
+// takes (`over`): `parent` holds the test of the sphere of the cluster's group, `self` that
+// of the group it was simplified from. Under a debug level the groups at that level are in and
+// the coarser ones stand in.
+uint rule(Stage st, Placement p, Cluster cl, Lod l, uint k, uint depth, float group_error, inout int parent, inout int self, inout uint tests, inout bool decided)
 {
     if (l.level >= 0)
     {
@@ -710,13 +802,13 @@ uint rule(MeshGpu* mesh, Placement p, Cluster cl, Lod l, uint k, uint depth, flo
             return RULE_IN;
         return int(depth) > l.level ? RULE_STANDS_IN : RULE_OUT;
     }
-    float parent_e = cut_error(mesh, p, cl.parent_sphere, cl.parent_error * l.scale);
-    if (parent_e <= l.threshold[k])
+    float parent_e = cut_error(st.mesh, p, cl.parent_sphere, cl.parent_error * l.scale);
+    if (!over(st, l, k, parent_e, cl.parent_sphere, parent, tests, decided))
         return RULE_OUT;
     if (depth == 0)
         return RULE_IN;
-    float self_e = cut_error(mesh, p, cl.self_sphere, cl.self_error * l.scale);
-    return self_e <= l.threshold[k] ? RULE_IN : RULE_STANDS_IN;
+    float self_e = cut_error(st.mesh, p, cl.self_sphere, cl.self_error * l.scale);
+    return over(st, l, k, self_e, cl.self_sphere, self, tests, decided) ? RULE_STANDS_IN : RULE_IN;
 }
 
 // Whether the group cluster `cl` was simplified from cannot be drawn: its mesh page is not
@@ -729,6 +821,18 @@ bool finer_absent(MeshGpu* mesh, Cluster cl)
     if (mesh.pinned_pages == mesh.page_count)
         return false;
     return mesh.pages[((Group*)mesh.groups)[cl.from_group].page] == 0;
+}
+
+// Adds a thread's hidden tests and the decisions the hidden threshold took to counter
+// `decided`, in the count passes.
+void tally(uint tests, uint decisions, uint decided)
+{
+    if (filling())
+        return;
+    if (tests != 0)
+        InterlockedAdd(root.cut.counters[CUT_HIDDEN_TESTS], tests);
+    if (decisions != 0)
+        InterlockedAdd(root.cut.counters[decided], decisions);
 }
 
 // One thread per item of the pass. The fill passes report nothing to the loading side: the
@@ -749,7 +853,7 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     uint slot = copy_slot(copy);
     uint mask = item.flags & 3;
     uint part = item.part;
-    bool merged = (item.flags & 0x10000) != 0;
+    bool merged = (item.flags & ITEM_MERGED) != 0;
     InstanceGpu inst = copy_record(s, copy);
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
@@ -765,6 +869,15 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         return;
     InterlockedAdd(cut.counters[CUT_NODES], 1);
     Node node = *at;
+    Stage st;
+    st.scene = s;
+    st.copy = copy;
+    st.inst = inst;
+    st.mesh = mesh;
+    st.part = part;
+    st.merged = merged;
+    uint tests = 0;
+    uint decisions = 0;
 
     if (node.group < 0)
     {
@@ -778,20 +891,31 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         for (uint i = 0; i < node.child_count; i++)
         {
             Node child = children[i];
+            // A leaf's sphere is its group's, which the hidden threshold may take; a merged
+            // sphere of several groups takes the visible one, which enters it wherever a
+            // group below it may be wanted.
+            bool leaf = child.group >= 0;
+            float e = cut_error(mesh, p, child.sphere, child.max_error * l.scale);
+            int known = -1;
+            bool decided = false;
             uint m = 0;
             for (uint k = 0; k < 2; k++)
             {
-                bool enter = l.level >= 0 || cut_error(mesh, p, child.sphere, child.max_error * l.scale) > l.threshold[k];
-                if ((mask & (1u << k)) != 0 && enter)
+                if ((mask & (1u << k)) == 0)
+                    continue;
+                bool enter = l.level >= 0 || (leaf ? over(st, l, k, e, child.sphere, known, tests, decided) : e > l.threshold[k]);
+                if (enter)
                     m |= 1u << k;
             }
+            decisions += decided ? 1 : 0;
             if (m == 0)
                 continue;
             NodeItem next = item;
             next.node = node.child_first + i;
-            next.flags = (item.flags & ~3u) | m;
+            next.flags = (item.flags & ~(3u | ITEM_TESTED | ITEM_HIDDEN)) | m | (known >= 0 ? ITEM_TESTED : 0) | (known > 0 ? ITEM_HIDDEN : 0);
             push(cut, (pass + 1) % 2, next);
         }
+        tally(tests, decisions, CUT_HIDDEN_LEAVES);
         return;
     }
 
@@ -803,12 +927,28 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     // group is terminal, so its page is neither wanted nor read.
     if (l.level >= 0 && int(g.depth) < l.level && !isinf(g.error))
         return;
+    // The test of the group's sphere, which is its leaf's: from the parent's pass when it ran.
+    int group_known = (item.flags & ITEM_TESTED) == 0 ? -1 : (item.flags & ITEM_HIDDEN) != 0 ? 1 : 0;
     uint8_t* data = (uint8_t*)mesh.pages[g.page];
     if (data == nullptr)
     {
-        // The clusters this group simplifies into stand in for it.
+        // The clusters this group simplifies into stand in for it. The request ranks by the
+        // error the cut compares: over a hidden sphere, the error over the hidden scale.
         if (!filling())
-            report_mesh_page(cut, mesh, g.page, true, focus_error(p, g.simplified, g.error * l.scale));
+        {
+            float e = focus_error(p, g.simplified, g.error * l.scale);
+            if (root.view_count > 0 && l.level < 0)
+            {
+                if (group_known < 0)
+                {
+                    group_known = sphere_hidden(st, g.simplified) ? 1 : 0;
+                    tests++;
+                }
+                e /= group_known != 0 ? root.culled_scale : 1.0;
+            }
+            report_mesh_page(cut, mesh, g.page, true, e);
+            tally(tests, 0, CUT_HIDDEN_RULES);
+        }
         return;
     }
     // An edit's copy of a page is no read of the source's page its entry reports.
@@ -816,6 +956,9 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         report_mesh_page(cut, mesh, g.page, false, 0.0);
     uint mesh_first = mesh.page_clusters[g.page] + g.first_cluster;
     uint id_first = mesh.page_bases[g.page] + g.first_cluster;
+    // The test of the sphere of the group the last cluster was simplified from.
+    uint from = CLUSTER_SOURCE;
+    int from_known = -1;
     for (uint run = 0; run < g.cluster_count; run += 32)
     {
         uint raster_mask = 0;
@@ -823,9 +966,16 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         for (uint i = run; i < end; i++)
         {
             Cluster cl = load_cluster(data, g.first_cluster + i);
-            uint raster = (mask & 1) != 0 ? rule(mesh, p, cl, l, 0, g.depth, g.error) : RULE_OUT;
+            if (cl.from_group != from)
+            {
+                from = cl.from_group;
+                from_known = -1;
+            }
+            bool decided = false;
+            uint raster = (mask & 1) != 0 ? rule(st, p, cl, l, 0, g.depth, g.error, group_known, from_known, tests, decided) : RULE_OUT;
             bool traced = (mask & 2) != 0 && !section_hidden(inst, cl.section);
-            uint ray = traced ? rule(mesh, p, cl, l, 1, g.depth, g.error) : RULE_OUT;
+            uint ray = traced ? rule(st, p, cl, l, 1, g.depth, g.error, group_known, from_known, tests, decided) : RULE_OUT;
+            decisions += decided ? 1 : 0;
             if (raster == RULE_STANDS_IN || ray == RULE_STANDS_IN)
             {
                 uint stands = finer_absent(mesh, cl) ? RULE_IN : RULE_OUT;
@@ -855,6 +1005,7 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             candidate(cut, w);
         }
     }
+    tally(tests, decisions, CUT_HIDDEN_RULES);
 }
 
 // Counts the items the last count pass left as dropped and empties the queues for the fill

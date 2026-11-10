@@ -60,7 +60,10 @@ public static const uint CUT_KEYS = 25;               // slots asking the table 
 public static const uint CUT_LOST = 26;               // gathering slots of a traversal that dropped nodes: a cached cut
 public static const uint CUT_EMPTY = 27;              // gathering slots whose cut holds no cluster
 public static const uint CUT_ADMITTED = 28;           // the first distance bucket whose cuts are not built
-public static const uint CUT_COUNTERS = 29;
+public static const uint CUT_HIDDEN_TESTS = 29;       // group spheres tested against the views
+public static const uint CUT_HIDDEN_LEAVES = 30;      // leaves the hidden threshold left out of a cut
+public static const uint CUT_HIDDEN_RULES = 31;       // clusters the hidden threshold decided in a cut
+public static const uint CUT_COUNTERS = 32;
 
 // Distance buckets of the cuts' admission: the top bits of a distance's f32 bits, which order
 // like the distances they hold.

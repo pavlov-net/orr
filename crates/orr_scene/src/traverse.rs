@@ -3,7 +3,11 @@
 //!
 //! The `traverse` kernels walk each mesh's hierarchy one level a pass (multipass, no
 //! persistent threads), entering a node while its projected error exceeds a cut's threshold
-//! and applying the cluster rule at each leaf's group. While a group's streamed mesh page is
+//! and applying the cluster rule at each leaf's group. Where no view saw a group's sphere in
+//! its last render of the scene (outside its frustum or behind its HZB), the group's error goes
+//! against a threshold [`crate::RendererDesc::culled_error_scale`] times coarser; a group's
+//! sphere holds those of the groups its clusters come from, so the cut stays whole across the
+//! change of threshold. While a group's streamed mesh page is
 //! not resident, the clusters simplified from it stand in for its clusters, so a missing page
 //! coarsens only what it holds, and the page is requested through the frame's feedback. A
 //! streamed mesh page is resident only with the node pages over its groups' leaves, so a node
@@ -37,11 +41,11 @@ use crate::shaders::feedback::{self, FeedbackRoot};
 use crate::shaders::traverse::{self, TraverseRoot};
 use crate::{
     BlasJob, ClusterWork, CutGpu, CutKey, FeedbackGpu, NodeItem, PartListGpu, Result, SceneRoot,
-    SlotCutGpu,
+    SeenView, SlotCutGpu,
 };
 
 /// `CutGpu.counters` entries (`cut.slang`), the BLAS build count after them.
-const COUNTERS: usize = 30;
+const COUNTERS: usize = 33;
 const CUT_CANDIDATES: usize = 2;
 const CUT_CANDIDATE_CLUSTERS: usize = 3;
 const CUT_ENTRIES: usize = 4;
@@ -63,7 +67,10 @@ const CUT_JOBS_WANTED: usize = 24;
 const CUT_KEYS: usize = 25;
 const CUT_LOST: usize = 26;
 const CUT_EMPTY: usize = 27;
-const CUT_BUILDS: u64 = 29;
+const CUT_HIDDEN_TESTS: usize = 29;
+const CUT_HIDDEN_LEAVES: usize = 30;
+const CUT_HIDDEN_RULES: usize = 31;
+const CUT_BUILDS: u64 = 32;
 /// `traverse.slang` args layout.
 const ARGS_PASSES: u32 = 64;
 const ARGS_GATHER: u64 = 3 * ARGS_PASSES as u64;
@@ -123,6 +130,13 @@ pub struct CutStats {
     /// Of those requests, the ones past [`crate::Budgets::traversal_requests`] in a scene,
     /// of the smallest errors, which the loading side does not see that frame.
     pub requests_lost: u32,
+    /// Group spheres tested against the views' last renders: those whose error lay between a
+    /// cut's visible and hidden thresholds ([`crate::RendererDesc::culled_error_scale`]).
+    pub hidden_tests: u32,
+    /// Leaves, and the clusters of entered leaves, that a hidden sphere's threshold kept out
+    /// of a cut or decided in one.
+    pub hidden_leaves: u32,
+    pub hidden_clusters: u32,
 }
 
 impl CutStats {
@@ -147,6 +161,9 @@ impl CutStats {
         self.rt_table_bytes += bytes;
         self.rt_merged += c[CUT_MERGED];
         self.page_requests += c[CUT_REQUESTS];
+        self.hidden_tests += c[CUT_HIDDEN_TESTS];
+        self.hidden_leaves += c[CUT_HIDDEN_LEAVES];
+        self.hidden_clusters += c[CUT_HIDDEN_RULES];
     }
 }
 
@@ -488,12 +505,17 @@ struct Ran {
 pub(crate) struct CutInputs {
     pub(crate) scene: GpuPtr<SceneRoot>,
     pub(crate) focus: Option<([i32; 4], [f32; 4])>,
-    /// The thresholds, each with `memory_scale` in it.
+    /// The thresholds, each with `visible_scale` in it.
     pub(crate) raster_pixels: f32,
     pub(crate) rt_pixels: f32,
-    /// The detail scale for the mesh page pool.
-    pub(crate) memory_scale: f32,
+    /// The part of the mesh page pool's detail scale visible geometry takes.
+    pub(crate) visible_scale: f32,
+    /// The thresholds' scale over a group sphere no view saw, and for ray tracing over a copy
+    /// no view drew.
     pub(crate) culled_scale: f32,
+    /// The views' last renders of the scene, which the hidden test reads.
+    pub(crate) views: GpuPtr<SeenView>,
+    pub(crate) view_count: u32,
     pub(crate) merge_pixels: f32,
     pub(crate) slots: u32,
     /// Passes of the traversal: the deepest resident hierarchy's levels.
@@ -800,9 +822,9 @@ impl Cuts {
         if self.updates == 0 {
             flags |= TRAVERSE_ERRORS;
         }
-        let rt_scale = (self.gather.scale() / f.memory_scale).max(1.0);
+        let rt_scale = (self.gather.scale() / f.visible_scale).max(1.0);
         self.ran[f.slot] = Ran {
-            scale: f.memory_scale * rt_scale,
+            scale: f.visible_scale * rt_scale,
             rt_scale,
             sizes: self.rt.sizes,
             bytes: self.rt.bytes,
@@ -821,8 +843,8 @@ impl Cuts {
             flags,
             models: self.sizes.models,
             gather_scale: rt_scale,
-            _pad0: 0,
-            _pad1: 0,
+            view_count: f.view_count,
+            views: f.views,
         };
         let root = |pass: u32, fill: bool| {
             let flags = if fill { flags | TRAVERSE_FILL } else { flags };

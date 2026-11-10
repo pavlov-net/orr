@@ -144,17 +144,7 @@ bool seen(Rates r, float3 center, float radius)
 {
     if (!r.seen_test)
         return true;
-    ViewConstants* v = root.view;
-    float3 c = place(r.view, center);
-    float rad = radius * r.view.scale;
-    if (!sphere_visible(v, c, rad))
-        return false;
-    if (root.raster == nullptr)
-        return true;
-    Placement here = (Placement)0;
-    here.linear = float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
-    here.scale = 1.0;
-    return !box_occluded(v, root.raster, here, c - rad, c + rad, false);
+    return !sphere_unseen(root.view, root.raster, false, place(r.view, center), radius * r.view.scale);
 }
 
 // Segments edge a-b asks for: the same from either end, bit for bit.
