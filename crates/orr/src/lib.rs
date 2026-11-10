@@ -1583,6 +1583,8 @@ impl<'a> Frame<'a> {
             .views
             .get_mut(&view.history)
             .ok_or(SceneError::UnknownViewHistory(view.history))?;
+        // The next lit render starts every history over, as a view's first does.
+        state.scene_resets = None;
         // The render size, jitter and bias the first lit render will use, so geometry and
         // streaming settle for it.
         let desc = state.raster_desc(view, extent, render);
