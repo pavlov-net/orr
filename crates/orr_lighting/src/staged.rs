@@ -34,7 +34,7 @@ const BASE_WORDS: u64 = 12;
 const INTERIOR_PARTS: u64 = 8;
 const STACK_PART: u64 = 5;
 const SPECTRAL_PART: u64 = 5;
-const SHADOW_INTERIOR_WORDS: u64 = 9;
+const SHADOW_INTERIOR_WORDS: u64 = 2;
 const RECORD_WORDS: u64 = 2;
 const UPDATE_RECORD_WORDS: u64 = 9;
 /// Lanes per workgroup of its stages.

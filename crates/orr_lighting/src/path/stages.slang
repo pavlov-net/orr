@@ -170,6 +170,8 @@ static const uint LOOP_GBUFFER_HIT = 1 << 10;  // the camera ray found no layer:
 static const uint LOOP_SHADOW = 1 << 11;       // the last vertex left a shadow ray for the trace stage
 static const uint LOOP_ENDED = 1 << 12;        // and no ray of its own: the path ends past the shadow ray
 static const uint LOOP_SKY = 1 << 13;          // the camera ray met nothing: `PathLoop.sky` is the throughput
+static const uint LOOP_CROSS = 1 << 14;        // the vertex's ray crosses its surface into or out of an interior, which the trace stage does past the shadow ray
+static const uint LOOP_CROSS_FRONT = 1 << 15;  // and enters it
 
 // What a path keeps from its start, which every stage finds again from its slot (`load_fixed`):
 // a slot holds the path of the slice's item of its number.
@@ -215,7 +217,8 @@ struct PathPending
 
 // A deferred shadow ray: what next-event estimation adds where its ray reaches the light. A
 // path that tracks no interiors keeps the fields before `start`: no surface it shades bounds
-// one, and the vertex's point only scales the optical depth of interiors.
+// one, and the vertex's point only scales the optical depth of interiors. The interiors its
+// vertex arrived with are the path's until the trace stage has traced it.
 struct PathShadowRay
 {
     // The path's throughput at the vertex x the estimate, unshadowed, weighed along the
@@ -229,8 +232,6 @@ struct PathShadowRay
     float3 start;                   // the vertex's point
     uint surface;
     float4 point;
-    float3 normal;
-    uint _pad;
     Interior arrived;
 }
 
@@ -240,6 +241,7 @@ static const uint SHADOW_DISPERSION = 1 << 2;
 static const uint SHADOW_FEEDBACK = 1 << 3;
 static const uint SHADOW_COUNTED = 1 << 4;
 static const uint SHADOW_BEND = 1 << 5;     // a directional light's ray looks for plane stacks
+static const uint SHADOW_INTO = 1 << 6;     // the ray leaves into the surface the vertex lies on
 static const uint SHADOW_DEPTH_SHIFT = 8;
 
 // The direction a walk enters its vertex along, for the walk stage, and what it resolves the
@@ -285,8 +287,8 @@ public static const uint INTERIOR_PARTS = INTERIOR_WORDS + ENTERED_WORDS;
 public static const uint STACK_PART = STACK_WORDS;
 public static const uint SPECTRAL_PART = SPECTRAL_WORDS;
 // The words of `PathStages.shadows`, which only paths that track interiors keep: a deferred
-// shadow ray's vertex, the surface it lies on and the interiors it arrived with.
-public static const uint SHADOW_INTERIOR_WORDS = 9;
+// shadow ray's vertex and the surface it lies on.
+public static const uint SHADOW_INTERIOR_WORDS = 2;
 // A record's words: a view's and a photon's, and an update path's, whose slices hold as many
 // fewer paths.
 public static const uint RECORD_WORDS = 2;
@@ -674,21 +676,20 @@ void store_interior(PathRoot r, uint slot, Interior v)
 
 // A deferred shadow ray, in the span from a shade to the trace: the fields from
 // `PathShadowRay.start` on lie in `PathStages.shadows`, which only paths that track interiors
-// keep.
-PathShadowRay load_shadow(PathRoot r, uint slot)
+// keep, but the interiors its vertex `arrived` with, which the path holds.
+PathShadowRay load_shadow(PathRoot r, uint slot, Interior arrived)
 {
-    static_assert(sizeof(PathShadowRay) - sizeof(Interior) == 6 * 16, "PathShadowRay.arrived shares a word");
-    static_assert(sizeof(PathShadowRay) <= (3 + SHADOW_INTERIOR_WORDS) * 16, "a shadow ray outgrows its words");
+    static_assert(sizeof(PathShadowRay) - sizeof(Interior) == (3 + SHADOW_INTERIOR_WORDS) * 16, "PathShadowRay.arrived shares a word");
     PathStages* st = r.stages;
     bool interiors = interiors_tracked(r);
-    Words<3 + SHADOW_INTERIOR_WORDS> w;
+    Words<3 + SHADOW_INTERIOR_WORDS + INTERIOR_WORDS> w;
     [ForceUnroll]
-    for (uint k = 0; k < 3 + SHADOW_INTERIOR_WORDS; k++)
+    for (uint k = 0; k < 3 + SHADOW_INTERIOR_WORDS + INTERIOR_WORDS; k++)
     {
         w.w[k] = uint4(0);
         if (k < 3)
             w.w[k] = st.words[word_index(st, SPAN_FIRST + 1 + k, slot)];
-        else if (interiors)
+        else if (k < 3 + SHADOW_INTERIOR_WORDS && interiors)
             w.w[k] = st.shadows[(k - 3) * st.capacity + slot];
     }
     PathShadowRay q = reinterpret<PathShadowRay>(w);
@@ -696,8 +697,8 @@ PathShadowRay load_shadow(PathRoot r, uint slot)
     {
         q.start = q.origin;
         q.surface = MATERIAL_NONE;
-        q.arrived = Interior();
     }
+    q.arrived = arrived;
     return q;
 }
 
@@ -705,7 +706,7 @@ void store_shadow(PathRoot r, uint slot, PathShadowRay q)
 {
     PathStages* st = r.stages;
     bool interiors = interiors_tracked(r);
-    Words<3 + SHADOW_INTERIOR_WORDS> w = reinterpret<Words<3 + SHADOW_INTERIOR_WORDS>>(q);
+    Words<3 + SHADOW_INTERIOR_WORDS + INTERIOR_WORDS> w = reinterpret<Words<3 + SHADOW_INTERIOR_WORDS + INTERIOR_WORDS>>(q);
     [ForceUnroll]
     for (uint k = 0; k < 3 + SHADOW_INTERIOR_WORDS; k++)
     {
@@ -1355,14 +1356,13 @@ PathShadowRay shadow_ray<S : ISurface, M : IMedium>(PathRoot r, NeeDraw d, float
     q.start = start;
     q.flags = (d.chosen.kind == LIGHT_SAMPLE_ENVIRONMENT ? SHADOW_ENVIRONMENT : 0) | (d.chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? SHADOW_DIRECTIONAL : 0)
         | (shadow.dispersion ? SHADOW_DISPERSION : 0) | (feedback ? SHADOW_FEEDBACK : 0) | (counted ? SHADOW_COUNTED : 0)
-        | (shadow.bend ? SHADOW_BEND : 0) | (depth << SHADOW_DEPTH_SHIFT);
+        | (shadow.bend ? SHADOW_BEND : 0) | (dot(d.toward, shadow.normal) < 0.0 ? SHADOW_INTO : 0) | (depth << SHADOW_DEPTH_SHIFT);
     q.origin = d.origin;
     q.t_max = d.t_max;
     q.dir = d.toward;
     q.arrived = shadow.arrived;
     q.surface = shadow.surface;
     q.point = shadow.point;
-    q.normal = shadow.normal;
     return q;
 }
 
@@ -1378,7 +1378,8 @@ float3 shadow_trace<S : ISurface, M : IMedium>(PathRoot r, PathShadowRay q, out 
     shadow.arrived = q.arrived;
     shadow.surface = q.surface;
     shadow.point = q.point;
-    shadow.normal = q.normal;
+    // The shadow reads which side of the surface the ray leaves on alone.
+    shadow.normal = has(q.flags, SHADOW_INTO) ? -q.dir : q.dir;
     shadow.dispersion = has(q.flags, SHADOW_DISPERSION);
     shadow.bend = has(q.flags, SHADOW_BEND);
     RayCone cone = { 0.0, 0.0 };
@@ -1509,12 +1510,20 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     PathLoop p = load_loop(r, slot);
     StagedRecord record = staged_record(r, slot);
     Spectral spectral = load_spectral(r, slot);
+    Interior interior = load_interior(r, slot);
     if (has(p.flags, LOOP_SHADOW))
     {
-        PathShadowRay q = load_shadow(r, slot);
+        PathShadowRay q = load_shadow(r, slot, interior);
         StackLight stack;
         shadow_add(q, spectral.color(q.contribution * shadow_trace<S, M>(r, q, stack)), p, record);
         set_flag(p.flags, LOOP_SHADOW, false);
+        // The vertex's ray crossed its surface (`shade_vertex`).
+        if (has(p.flags, LOOP_CROSS))
+        {
+            interior.cross(q.surface, has(p.flags, LOOP_CROSS_FRONT), q.point);
+            store_interior(r, slot, interior);
+            p.flags &= ~(LOOP_CROSS | LOOP_CROSS_FRONT);
+        }
     }
     PathFixed f = load_fixed(r, slot);
     if (has(p.flags, LOOP_ENDED))
@@ -1523,7 +1532,6 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         return;
     }
     LayerRay ray = load_ray(r, slot, false);
-    Interior interior = load_interior(r, slot);
     uint2 pixel = f.pixel;
     PathContext x = path_context(r, record, pixel);
     Sampler rng = p.rng;
@@ -2162,9 +2170,16 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
     }
     if (alive && !walking)
     {
+        // The interiors past the vertex. A deferred shadow ray reads the ones its vertex arrived
+        // with from the path's, so the trace stage crosses the surface once it has traced it.
+        Interior past = c.interior;
         if (crossed)
         {
-            c.interior.cross(l.section, l.front, l.x.surface.medium_point);
+            past.cross(l.section, l.front, l.x.surface.medium_point);
+            if (nee.traced)
+                p.flags |= LOOP_CROSS | (l.front ? LOOP_CROSS_FRONT : 0);
+            else
+                c.interior = past;
             if (l.front)
             {
                 p.entered = l.section;
@@ -2204,7 +2219,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
                 c.stack.x_normal = c.ray.normal;
                 c.stack.pdf = c.ray.pdf;
                 c.stack.run = c.ray.run;
-                c.stack.ior = interior_ior(s, c.interior.innermost());
+                c.stack.ior = interior_ior(s, past.innermost());
                 c.stack.depth = p.depth;
             }
         }
@@ -2223,9 +2238,12 @@ void leave_shade(PathRoot r, uint slot, PathFixed f, inout PathLoop p, ShadeStat
     if (alive)
     {
         store_ray(r, slot, c.ray);
-        store_interior(r, slot, c.interior);
         store_stack(r, slot, c.stack);
     }
+    // A deferred shadow ray reads the interiors its vertex arrived with from the path's, which
+    // no stage has stored for a vertex the primary stage shades.
+    if (alive || shadow)
+        store_interior(r, slot, c.interior);
     store_spectral(r, slot, c.spectral);
     if (!alive && !shadow)
     {
@@ -2450,12 +2468,20 @@ public void tail_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     PathLoop p = load_loop(r, slot);
     StagedRecord record = staged_record(r, slot);
     Spectral spectral = load_spectral(r, slot);
+    Interior interior = load_interior(r, slot);
     if (has(p.flags, LOOP_SHADOW))
     {
-        PathShadowRay q = load_shadow(r, slot);
+        PathShadowRay q = load_shadow(r, slot, interior);
         StackLight stack;
         shadow_add(q, spectral.color(q.contribution * shadow_trace<S, M>(r, q, stack)), p, record);
         set_flag(p.flags, LOOP_SHADOW, false);
+        // The vertex's ray crossed its surface (`shade_vertex`).
+        if (has(p.flags, LOOP_CROSS))
+        {
+            interior.cross(q.surface, has(p.flags, LOOP_CROSS_FRONT), q.point);
+            store_interior(r, slot, interior);
+            p.flags &= ~(LOOP_CROSS | LOOP_CROSS_FRONT);
+        }
     }
     PathFixed f = load_fixed(r, slot);
     if (!has(p.flags, LOOP_ENDED))
@@ -2466,7 +2492,7 @@ public void tail_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         // `resume_path` reads the start's direction for a photon alone.
         if (from_photon(r))
             start.dir = resume.stack.dir;
-        start.interior = load_interior(r, slot);
+        start.interior = interior;
         start.throughput = p.throughput;
         resume.on = true;
         resume.iteration = p.iteration;
