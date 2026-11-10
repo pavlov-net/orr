@@ -50,6 +50,7 @@ pub(super) fn cook(
         Input::Equirect(l)
     };
     let mut map = octahedral_map(&input, n);
+    drop(src);
     let lights = match light_threshold {
         Some(t) => {
             let weights = primaries.rgb().luminance_weights().as_vec3().to_array();
