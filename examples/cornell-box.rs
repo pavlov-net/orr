@@ -609,8 +609,15 @@ fn run(options: &Options) -> Option<Capture> {
             ui: Some(&mut ui),
             ..ViewHooks::default()
         };
-        f.render_view(&view, &lighting, &output, &mut hooks)
+        let rendered = f
+            .render_view(&view, &lighting, &output, &mut hooks)
             .expect("render view");
+        // A headless run waits for its path pipelines, so each frame runs the ones made for
+        // exactly what its scene and settings ask for.
+        assert!(
+            !options.headless || rendered.exact_paths,
+            "a frame ran path pipelines that hold more than its view asked for"
+        );
         camera_cut = false;
         last = Some((id, f.end().expect("end frame")));
     }

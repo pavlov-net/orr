@@ -829,6 +829,15 @@ impl LightingView {
         self.media.stats(frame)
     }
 
+    /// The path pipelines the view's last [`LightingKernels::record_paths`] ran, where the
+    /// staged loop ran them.
+    pub fn paths_ran(&self) -> Option<PathsRan> {
+        self.staged.as_ref().map(|m| {
+            let (asked, ran) = m.ran();
+            PathsRan { asked, ran }
+        })
+    }
+
     /// The light and fog transparency hooks of `frame` shade particles with, through
     /// [`crate::ParticleDraw`] or their own `particle_shade`; written by
     /// [`LightingKernels::record_media_apply`], null when that frame recorded none or its
@@ -1336,6 +1345,24 @@ struct StagedPaths {
     rays: bool,
 }
 
+/// The path pipelines a view's frame ran, by what they hold (`specialize.slang`'s bits).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathsRan {
+    /// What the view asked its pipelines to hold: what its scene and settings say its paths
+    /// may meet, or everything without [`ViewLighting::specialize`].
+    pub asked: u32,
+    /// What the pipelines each of its sources ran were made to hold.
+    pub ran: Vec<u32>,
+}
+
+impl PathsRan {
+    /// Every source ran the pipelines made for exactly what the view asked, not ones that
+    /// hold more while those compile.
+    pub fn exact(&self) -> bool {
+        self.ran.iter().all(|&made| made == self.asked)
+    }
+}
+
 /// What decides the path pipelines of a view's frame, known before the view is rastered.
 #[derive(Clone, Copy, Debug)]
 pub struct PathNeeds {
@@ -1615,8 +1642,8 @@ impl LightingKernels {
             });
     }
 
-    /// What the paths of a frame with `needs` under `lighting` may meet, as
-    /// [`Self::record_paths`] will read it from the roots it writes.
+    /// What the paths of a frame with `needs` under `lighting` may meet: what a view asks
+    /// pipelines for, and what [`Self::record_paths`] runs each of its sources with.
     fn predict(
         &self,
         scene: &SceneLighting,
@@ -1702,12 +1729,24 @@ impl LightingKernels {
         let PathKernels::Staged(k) = &self.paths else {
             return Ok(true);
         };
+        let (wanted, stages) = self.wanted(k, scene, needs, lighting);
+        self.ask(k, wanted, &stages, lighting)
+    }
+
+    /// Asks for pipelines that hold `wanted` over `stages`, as [`Self::wanted`] gives them, and
+    /// says whether some are ready.
+    fn ask(
+        &self,
+        k: &StagedPaths,
+        wanted: u32,
+        stages: &[Stage],
+        lighting: &ViewLighting,
+    ) -> Result<bool, Error> {
         // Scratch: the late kernels compile here, ahead of everything.
         if k.stages.late_first() {
             Self::start_late(k);
         }
-        let (wanted, stages) = self.wanted(k, scene, needs, lighting);
-        let ready = k.stages.prepare(wanted, &stages)?;
+        let ready = k.stages.prepare(wanted, stages)?;
         if lighting.specialize {
             Self::start_general(k);
         }
@@ -1959,7 +1998,14 @@ impl LightingKernels {
             flags |= DIELECTRIC_FROST;
         }
         let features = path_features(pass.scene_features, lighting);
-        if matches!(self.paths, PathKernels::Staged(_)) {
+        // Asked for together, the sources that run in the stages share their pipelines.
+        let needs = PathNeeds {
+            features: pass.scene_features,
+            frosted_glass: pass.frosted_glass,
+            dof_background: pass.dof_background.is_some(),
+        };
+        let predicted = self.predict(scene, &needs, lighting);
+        if let PathKernels::Staged(k) = &self.paths {
             let pixels = view.extent[0] * view.extent[1];
             let parts = StateParts::of(features);
             // The queues' rounds: a view's passes or a photon's bounces, and one more that the
@@ -1980,7 +2026,12 @@ impl LightingKernels {
                 view.staged = None;
                 view.staged = Some(StagedMemory::new(&view.device, pixels, parts, rows)?);
             }
-            view.staged.as_ref().expect("made above").begin_frame();
+            let (wanted, stages) = self.wanted(k, scene, &needs, lighting);
+            self.ask(k, wanted, &stages, lighting)?;
+            view.staged
+                .as_ref()
+                .expect("made above")
+                .begin_frame(wanted);
         }
         let path_root = PathRoot {
             scene: pass.scene,
@@ -2047,27 +2098,21 @@ impl LightingKernels {
             _pad0: 0,
             _pad1: 0,
         };
-        // Asked for together, the sources that run in the stages share their pipelines.
-        let needs = PathNeeds {
-            features: pass.scene_features,
-            frosted_glass: pass.frosted_glass,
-            dof_background: pass.dof_background.is_some(),
-        };
-        self.prepare_paths(scene, &needs, lighting)?;
-        let predicted = self.predict(scene, &needs, lighting);
-        // What a root's paths may meet, read from the root itself.
+        // What a source's paths may meet is what the view asked pipelines for, which its root
+        // asks nothing beyond: a pipeline leaves out what its mask rules out whatever a root
+        // says.
         let may = |root: &PathRoot, predicted: u32| {
-            if !lighting.specialize {
-                return MAY_ALL;
-            }
-            let may = scene_may(pass.scene_features) | root_may(root);
-            if may != predicted {
-                log::debug!("paths asked for {predicted:#x} may meet {may:#x}");
-            }
-            may
+            let asks = scene_may(pass.scene_features) | root_may(root);
+            assert!(
+                asks & !predicted == 0,
+                "a path root asks for {asks:#x}, beyond the {predicted:#x} its pipelines hold"
+            );
+            predicted
         };
+        let photons = predicted.photons;
         let path_root = PathRoot {
-            caustics: self.record_photons(list, scene, view, pass, lighting, &path_root)?,
+            caustics: self
+                .record_photons(list, scene, view, pass, lighting, &path_root, photons)?,
             ..path_root
         };
         self.record_layers(list, view, pass, lighting, lens.is_some(), &path_root);
@@ -2157,6 +2202,7 @@ impl LightingKernels {
     /// its paths gather from: the scene's grid, whose photons and resolve the scene's first
     /// real-time view of the frame records, or under the reference the view's own map, filled
     /// each frame; null with caustics off.
+    #[allow(clippy::too_many_arguments)]
     fn record_photons(
         &self,
         list: &mut CommandList<'_>,
@@ -2165,6 +2211,7 @@ impl LightingKernels {
         pass: &ViewPass,
         lighting: &ViewLighting,
         path: &PathRoot,
+        may: u32,
     ) -> Result<GpuPtr<CausticsGpu>, Error> {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         let caustics = scene.caustics();
@@ -2242,10 +2289,13 @@ impl LightingKernels {
                 view.staged.as_ref().expect("made by record_paths"),
                 &photon_root,
                 Source::Photon,
-                if lighting.specialize {
-                    scene_may(pass.scene_features) | root_may(&photon_root)
-                } else {
-                    MAY_ALL
+                {
+                    let asks = scene_may(pass.scene_features) | root_may(&photon_root);
+                    assert!(
+                        asks & !may == 0,
+                        "the photons' root asks for {asks:#x}, beyond the {may:#x} its pipelines                          hold"
+                    );
+                    may
                 },
                 photons,
                 path_rounds(&photon_root),

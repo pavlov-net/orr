@@ -735,6 +735,134 @@ fn a_chain_marks_its_scenes_for_ray_candidates() {
     assert_clean();
 }
 
+/// A copy fading between two steps of its chain is written with every triangle a candidate of
+/// the rays that meet it. Path pipelines made for a scene of plain materials take them too: a
+/// view on them renders each frame of the box's fade as a view of the same frames on the
+/// pipelines that hold everything does, and runs the pipelines it asked for.
+#[test]
+fn a_fading_copy_stops_rays_under_the_pipelines_made_for_its_scene() {
+    let pack = floor_and_box();
+    let d = device();
+    let desc = RendererDesc {
+        path_entry: PathEntry::Compute,
+        ..RendererDesc::default()
+    };
+    let mut r = Renderer::new(d, desc).unwrap();
+    let loading = r.loading();
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let l = Arc::clone(&loading);
+            std::thread::spawn(move || l.run_worker())
+        })
+        .collect();
+    let mut frame = 0;
+    let mount = mount_pack(&mut r, &pack, &mut frame);
+    let models = ["floor", "box"].map(|name| r.model(mount, AssetId::from_name(name)).unwrap());
+    // A copy takes its step at once when it is first seen, so the box has its chain from the
+    // start and is seen near before the focus moves away.
+    r.set_chain(models[1], &[(models[0], 10.0)]).unwrap();
+    let scene = r
+        .create_scene(
+            &SceneDesc {
+                light_capacity: 1,
+                ..SceneDesc::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    // One view on the pipelines that hold everything and one on those made for the scene.
+    let views = [false, true].map(|specialize| {
+        let history = r.create_view_history().unwrap();
+        let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+        let image = d
+            .create_texture(
+                &TextureDesc::d2(Format::Rgba16Float, 160, 120, usage),
+                TextureMemory::Dedicated,
+                "view image",
+            )
+            .unwrap();
+        let lighting = ViewLighting {
+            specialize,
+            ..ViewLighting::default()
+        };
+        (history, image, lighting)
+    });
+    r.wait_paths().unwrap();
+    let listed = [scene];
+    let mut frames = Vec::new();
+    for i in 0..14 {
+        frame += 1;
+        let mut f = r
+            .begin_frame(FrameDesc {
+                time: time(frame),
+                scenes: &listed,
+                display: None,
+            })
+            .unwrap();
+        if i == 0 {
+            place_floor_and_box(&f, scene, models);
+        }
+        if i >= 2 {
+            f.scene(scene)
+                .unwrap()
+                .set_focus(DVec3::new(0.0, 0.0, 100.0));
+        }
+        f.update_scenes(&mut |_| {}).unwrap();
+        let eye = DVec3::new(0.0, 2.0, 4.0);
+        for (history, image, lighting) in &views {
+            let rendered = f
+                .render_view(
+                    &view_of(scene, *history, eye, image),
+                    lighting,
+                    &ViewOutput::default(),
+                    &mut ViewHooks::default(),
+                )
+                .unwrap();
+            assert!(
+                rendered.exact_paths,
+                "frame {i} ran path pipelines that hold more than its view asked for"
+            );
+        }
+        wait(f.end().unwrap());
+        frames.push(
+            views.each_ref().map(|(_, image, _)| {
+                read_texture(image, &TextureRegion::whole_mip(image.desc(), 0))
+            }),
+        );
+    }
+    drop(r);
+    loading.stop_workers();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    // Half floats of the red channel.
+    let red = |image: &[u8]| -> Vec<f32> {
+        image
+            .chunks(8)
+            .map(|t| half::f16::from_le_bytes([t[0], t[1]]).to_f32())
+            .collect()
+    };
+    let apart = |a: &[u8], b: &[u8]| -> f64 {
+        let (a, b) = (red(a), red(b));
+        let sum: f64 = a.iter().map(|&v| f64::from(v)).sum();
+        let diff: f64 = a
+            .iter()
+            .zip(&b)
+            .map(|(&x, &y)| f64::from((x - y).abs()))
+            .sum();
+        diff / sum
+    };
+    assert!(
+        apart(&frames[1][0], &frames[13][0]) > 0.02,
+        "the box took no farther step"
+    );
+    for (i, [general, exact]) in frames.iter().enumerate() {
+        let d = apart(general, exact);
+        assert!(d < 0.005, "frame {i} differs by {d} of its light");
+    }
+    assert_clean();
+}
+
 /// A path pipeline that cannot compile: the device has no ray dispatch and the renderer asks for
 /// it. The pipelines compile when a view first asks for them, so the view's render reports it,
 /// and every wait and render after it.

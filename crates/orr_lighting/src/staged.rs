@@ -738,12 +738,6 @@ impl StagedKernels {
         let now = Instant::now();
         self.note(may, now);
         if let Some(set) = self.covering(may, stages, now) {
-            if set.may != may {
-                log::debug!(
-                    "paths that may meet {may:#x} run pipelines made for {:#x}",
-                    set.may
-                );
-            }
             return Ok(set);
         }
         let set = self
@@ -795,6 +789,13 @@ impl StagedKernels {
         let walks = root.features & FEATURE_WALK != 0;
         let stages = source.stages(walks);
         let set = self.wait(may, &stages)?;
+        let asked = memory.asked();
+        if set.may != asked {
+            log::debug!(
+                "{source:?} paths that may meet {may:#x} run pipelines made for {:#x}; their                  view asked for {asked:#x}",
+                set.may
+            );
+        }
         memory.hold(&set);
         let pipeline = |stage: Stage| set.stage(stage).get().expect("the set holds the stage");
         let mut root = PathRoot {
@@ -1068,6 +1069,8 @@ pub(crate) struct StagedMemory {
     /// The pipelines the view's last frame recorded, kept until its next: a set let go
     /// meanwhile outlives the commands that run it.
     held: Mutex<Vec<Arc<StageSet>>>,
+    /// What the view asked its last frame's pipelines to hold.
+    asked: std::sync::atomic::AtomicU32,
     /// Scratch: frames begun, for `ORR_SCRATCH_QUEUE_COUNTS`.
     frames: std::sync::atomic::AtomicU32,
     header: Allocation<PathStages>,
@@ -1140,6 +1143,7 @@ impl StagedMemory {
             rows,
             parts,
             held: Mutex::new(Vec::new()),
+            asked: std::sync::atomic::AtomicU32::new(0),
             frames: std::sync::atomic::AtomicU32::new(0),
             header,
             queues,
@@ -1151,9 +1155,12 @@ impl StagedMemory {
         })
     }
 
-    /// Starts a frame of the view: the last one's commands have been submitted.
-    pub(crate) fn begin_frame(&self) {
+    /// Starts a frame of the view, whose sources ask together for pipelines that hold `asked`:
+    /// the last one's commands have been submitted.
+    pub(crate) fn begin_frame(&self, asked: u32) {
         self.held.lock().unwrap().clear();
+        self.asked
+            .store(asked, std::sync::atomic::Ordering::Relaxed);
         // Scratch: with `ORR_SCRATCH_QUEUE_COUNTS=N`, logs at the view's Nth frame the paths
         // each queue held in each round of the last slice recorded before it.
         let frame = self
@@ -1176,6 +1183,17 @@ impl StagedMemory {
 
     fn hold(&self, set: &Arc<StageSet>) {
         self.held.lock().unwrap().push(Arc::clone(set));
+    }
+
+    fn asked(&self) -> u32 {
+        self.asked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What the view asked its last frame's pipelines to hold, and what each set a source of
+    /// that frame ran was made to hold.
+    pub(crate) fn ran(&self) -> (u32, Vec<u32>) {
+        let held = self.held.lock().unwrap();
+        (self.asked(), held.iter().map(|set| set.may).collect())
     }
 
     /// Whether it holds the slots a view of `pixels` pixels asks for, each with `parts`, and

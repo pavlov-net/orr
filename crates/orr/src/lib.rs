@@ -242,6 +242,10 @@ pub struct RenderedView {
     /// The path tracing kernels are still compiling: the view rendered its raster half, and
     /// `radiance`, `linear` and its target hold black.
     pub compiling: bool,
+    /// The view's paths ran the pipelines made for exactly what its scene and settings ask
+    /// for, which is everything without [`ViewLighting::specialize`]; false while pipelines
+    /// that hold more run them until those have compiled, and while `compiling`.
+    pub exact_paths: bool,
     pub raster: RasterView,
     /// The extent the view rendered at.
     pub render_extent: [u32; 2],
@@ -1328,6 +1332,7 @@ impl<'a> Frame<'a> {
         list.barrier(Stages::ALL, traced, Hazards::empty());
         kernels.record_media(list, scene, paths, &pass, lighting)?;
         kernels.record_paths(list, scene, paths, &pass, lighting)?;
+        let exact_paths = paths.paths_ran().is_none_or(|ran| ran.exact());
         state.samples = state.samples.wrapping_add(1);
         list.barrier(traced, Stages::COMPUTE, Hazards::empty());
         kernels.record_media_apply(list, scene, paths, &pass, lighting);
@@ -1529,6 +1534,7 @@ impl<'a> Frame<'a> {
                 radiance: chain.rr_output,
                 linear: TextureIndex::NONE,
                 compiling: false,
+                exact_paths,
             });
         }
 
@@ -1578,6 +1584,7 @@ impl<'a> Frame<'a> {
             radiance: chain.rr_output,
             linear: chain.linear,
             compiling: false,
+            exact_paths,
         })
     }
 
@@ -1699,6 +1706,7 @@ impl<'a> Frame<'a> {
         }
         Ok(RenderedView {
             compiling: true,
+            exact_paths: false,
             raster,
             render_extent: render,
             reconstructed: false,
