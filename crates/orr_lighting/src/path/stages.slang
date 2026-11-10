@@ -4,7 +4,9 @@
 // vertex they reached; a shade stage per kind of vertex resolves and shades it and leaves the
 // next ray; a walk stage runs the subsurface walks the shades started. A finish stage hands
 // ended paths to their source. Each stage is its own pipeline, so the driver compiles and
-// allocates registers for each apart; a path's state between them lives in `PathStages`.
+// allocates registers for each apart; a path's state between them lives in `PathStages`. From
+// the round where few paths are left a rest stage may run the round's stages and the later
+// rounds' in one lane per path: a dispatch takes as long as its slowest lane.
 //
 // An iteration of a path is split at its trace, so the vertex a shade stage resolves it also
 // shades and never stores.
@@ -77,6 +79,13 @@ public static const uint STAGE_QUEUES = 6;
 
 // Lanes per workgroup of the stages over a queue.
 public static const uint STAGE_GROUP = 32;
+
+// Whether the kernel runs a path through its stages in one lane (the rest stage), which
+// exports true: a stage then leaves the queue and round its path goes to next here, in place of
+// appending it for a later dispatch.
+public extern static const bool PATH_LOOPS = false;
+static uint lane_queue = QUEUE_FINISH;
+static uint lane_round = 0;
 
 // `PathRoot.features`: a material of the scene may walk, so the walk stage runs; paths may
 // split by wavelength; and the shade stages run as ray dispatches, which reorder their lanes by
@@ -837,6 +846,12 @@ bool ray_queue(PathRoot r, uint queue)
 // Appends `slot` to `queue` of round `round`, and counts the workgroup it starts.
 void append(PathRoot r, uint queue, uint round, uint slot)
 {
+    if (PATH_LOOPS && queue != QUEUE_FINISH)
+    {
+        lane_queue = queue;
+        lane_round = round;
+        return;
+    }
     PathStages* st = r.stages;
     StageQueue* q = st.queues + (round * STAGE_QUEUES + queue);
     uint at;
@@ -1572,11 +1587,16 @@ uint opaque_queue(SceneRoot* s, Hit h, bool gbuffer)
 public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
 {
     PathRoot r = specialized(root);
-    PathStages* st = r.stages;
     uint slot;
-    if (!queued_slot(r, QUEUE_TRACE, round_now(r), lane, slot))
-        return;
-    r = slot_root(r, slot);
+    if (queued_slot(r, QUEUE_TRACE, round_now(r), lane, slot))
+        trace_slot<S, M>(root, slot);
+}
+
+// The trace stage of `slot`'s path.
+void trace_slot<S : ISurface, M : IMedium>(PathRoot root, uint slot)
+{
+    PathRoot r = slot_root(specialized(root), slot);
+    PathStages* st = r.stages;
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
     LightSetGpu* set = r.set;
@@ -2464,11 +2484,16 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, 
 public void walk_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
 {
     PathRoot r = specialized(root);
-    PathStages* st = r.stages;
     uint slot;
-    if (!queued_slot(r, QUEUE_WALK, round_now(r), lane, slot))
-        return;
-    r = slot_root(r, slot);
+    if (queued_slot(r, QUEUE_WALK, round_now(r), lane, slot))
+        walk_slot<S, M>(root, slot);
+}
+
+// The walk stage of `slot`'s path.
+void walk_slot<S : ISurface, M : IMedium>(PathRoot root, uint slot)
+{
+    PathRoot r = slot_root(specialized(root), slot);
+    PathStages* st = r.stages;
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
     LightSetGpu* set = r.set;
@@ -2560,6 +2585,35 @@ public void walk_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
 
 // ---------------------------------------------------------------------------------------------
 // Finish
+
+// The rest stage: each path the trace queue of the root's round holds runs on in its lane
+// through the trace, shade and walk stages of that round and the pass's later ones, until it
+// ends. A stage takes as long as its slowest lane however few it holds, so the rounds that few
+// paths reach cost their stages' time each; here a lane takes its own path's.
+public void rest_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
+{
+    PathRoot r = specialized(root);
+    uint slot;
+    if (!queued_slot(r, QUEUE_TRACE, round_now(r), lane, slot))
+        return;
+    lane_queue = QUEUE_TRACE;
+    lane_round = round_now(r);
+    // A path the pass's rounds would not reach is not run on, as they would leave it.
+    while (lane_queue != QUEUE_FINISH && lane_round < round_next(r))
+    {
+        uint queue = lane_queue;
+        root.round = lane_round;
+        lane_queue = QUEUE_FINISH;
+        if (queue == QUEUE_TRACE)
+            trace_slot<S, M>(root, slot);
+        else if (queue == QUEUE_OTHER)
+            shade_stage<S, M, QUEUE_OTHER>(root, slot);
+        else if (queue == QUEUE_WALK)
+            walk_slot<S, M>(root, slot);
+        else
+            shade_stage<S, M, QUEUE_RICH>(root, slot);
+    }
+}
 
 // The finish stage: the record of each path of the pass sees its end, and its source takes its
 // radiance.

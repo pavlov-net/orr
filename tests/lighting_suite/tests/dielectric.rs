@@ -381,6 +381,42 @@ fn a_glass_sphere_in_a_furnace_keeps_its_energy() {
     assert_clean();
 }
 
+/// The rest stage runs a path's later rounds in one lane. Light inside a clear glass sphere
+/// reflects on past the round it starts at, and the sphere renders bit for bit as it does when
+/// the stages run every round.
+#[test]
+fn the_rest_stage_traces_the_paths_the_stages_do() {
+    let spec = Spec {
+        copies: vec![at(GLASS_SPHERE, Vec3::ZERO)],
+        lights: Vec::new(),
+        environment: Some(FURNACE_RADIANCE),
+        eye: Vec3::new(0.0, 0.0, 4.0),
+        target: Vec3::ZERO,
+        fov_y: 0.6,
+        focus: None,
+    };
+    let bits = |a: &Accumulated| {
+        a.mean
+            .iter()
+            .map(|p| p.map(f32::to_bits))
+            .collect::<Vec<_>>()
+    };
+    let mut paths = paths(ViewLighting {
+        rest_stage: false,
+        ..ViewLighting::default()
+    });
+    paths.specialize = true;
+    let stages = render_paths(&mut Bed::with(spec.clone()), &paths, 4);
+    paths.settings.rest_stage = true;
+    paths.rest = true;
+    let rest = render_paths(&mut Bed::with(spec), &paths, 4);
+    assert!(
+        bits(&stages) == bits(&rest),
+        "the rest stage changed the image"
+    );
+    assert_clean();
+}
+
 /// A white diffuse sphere beside a clear glass one in a uniform environment returns the
 /// environment on its side that faces the glass, in real time and in the reference: the light
 /// it takes through the glass, where shadow rays end, comes in full by BSDF rays.

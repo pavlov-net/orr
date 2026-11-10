@@ -2548,6 +2548,10 @@ pub struct Paths {
     /// `settings.specialize`: set from `ORR_TEST_SPECIALIZED`. The beds' scenes are many and
     /// small, so one set of pipelines runs them all without it.
     pub specialize: bool,
+    /// Frames that run the pipelines made for their scene wait for its rest stage too, which
+    /// compiles behind everything else and would not be ready within a test: set from
+    /// `ORR_TEST_REST`.
+    pub rest: bool,
     /// The background layer request of every frame.
     pub dof_background: Option<DofBackgroundPass>,
     /// The depth-of-field guide every frame adds the frosted-glass term into.
@@ -2616,6 +2620,7 @@ impl Paths {
             loading,
             settings,
             specialize: std::env::var_os("ORR_TEST_SPECIALIZED").is_some(),
+            rest: std::env::var_os("ORR_TEST_REST").is_some(),
             dof_background: None,
             frost_guide: None,
             overlay_front: false,
@@ -2688,7 +2693,7 @@ impl Paths {
         // The pipelines these paths first ask for compile on threads of their own, which go on
         // with other beds' compiles after this one's are ready: the frame records once they
         // return, with its own pipelines held for it until then.
-        let _waited = waits.then(|| {
+        let waited = waits.then(|| {
             std::thread::scope(|threads| {
                 for _ in 1..compile_threads() {
                     threads.spawn(|| while self.loading.run_one() {});
@@ -2696,6 +2701,9 @@ impl Paths {
                 self.kernels.wait_paths(lighting, &needs, settings).unwrap()
             })
         });
+        if let Some(waited) = waited.as_ref().filter(|_| self.rest) {
+            self.kernels.wait_rest(waited).unwrap();
+        }
         self.kernels
             .record_media(list, lighting, target, pass, settings)
             .unwrap();
