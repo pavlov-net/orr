@@ -135,6 +135,9 @@ pub struct Limits {
     pub max_image_layers: u32,
     /// Color targets one mesh pipeline can write.
     pub max_color_targets: u32,
+    /// Workgroups one mesh draw may launch in all, of its task stage or, without one, its
+    /// mesh stage: the smaller of `maxTaskWorkGroupTotalCount` and `maxMeshWorkGroupTotalCount`.
+    pub max_mesh_draw_groups: u32,
     /// Invocations one [`crate::CommandList::dispatch_rays`] may launch; 0 without
     /// `Caps::ray_dispatch`.
     pub max_ray_dispatch_invocations: u32,

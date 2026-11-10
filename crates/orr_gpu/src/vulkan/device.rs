@@ -381,8 +381,10 @@ impl Device {
         let mut indirect_copy_props = vk::PhysicalDeviceCopyMemoryIndirectPropertiesKHR::default();
         let mut host_memory_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
         let mut v11_props = vk::PhysicalDeviceVulkan11Properties::default();
+        let mut mesh_props = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
             .push(&mut v11_props)
+            .push(&mut mesh_props)
             .push(&mut heap_props)
             .push(&mut as_props)
             .push(&mut driver)
@@ -526,6 +528,9 @@ impl Device {
                 max_image_extent_3d: props.limits.max_image_dimension3_d,
                 max_image_layers: props.limits.max_image_array_layers,
                 max_color_targets: props.limits.max_color_attachments,
+                max_mesh_draw_groups: mesh_props
+                    .max_task_work_group_total_count
+                    .min(mesh_props.max_mesh_work_group_total_count),
                 max_ray_dispatch_invocations: rt_props.max_ray_dispatch_invocation_count,
                 device_local_bytes: memory.heap_size(MemoryKind::DeviceLocal),
                 upload_bytes: memory.heap_size(MemoryKind::Upload),

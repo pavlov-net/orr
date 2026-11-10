@@ -3518,7 +3518,7 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
 fn the_traversal_requests_kept_are_those_of_the_largest_errors() {
     use orr_scene::orr_gpu::MemoryKind;
     // `cut.slang`: the counters, CUT_REQUESTS, CUT_FEEDBACK, FEEDBACK_BUCKETS and its shift.
-    const COUNTERS: u64 = 23;
+    const COUNTERS: u64 = 24;
     const REQUESTS: usize = 16;
     const KEPT: usize = 17;
     const BUCKETS: u64 = 4096;

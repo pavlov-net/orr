@@ -21,6 +21,7 @@ use orr_gpu::{
     RtasMode, RtasOp, RtasOpDesc, Stages,
 };
 
+use crate::capacity::Capacity;
 use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::shaders::feedback::{self, FeedbackRoot};
@@ -31,7 +32,7 @@ use crate::{
 };
 
 /// `CutGpu.counters` entries (`cut.slang`), the BLAS build count after them.
-const COUNTERS: usize = 23;
+const COUNTERS: usize = 24;
 const CUT_CANDIDATES: usize = 2;
 const CUT_CANDIDATE_CLUSTERS: usize = 3;
 const CUT_ENTRIES: usize = 4;
@@ -47,7 +48,8 @@ const CUT_FALLBACK: usize = 14;
 const CUT_MERGED: usize = 15;
 const CUT_REQUESTS: usize = 16;
 const CUT_FEEDBACK: usize = 17;
-const CUT_BUILDS: u64 = 22;
+const CUT_QUEUE_PEAK: usize = 22;
+const CUT_BUILDS: u64 = 23;
 /// `traverse.slang` args layout.
 const ARGS_PASSES: u32 = 64;
 const ARGS_GATHER: u64 = 3 * ARGS_PASSES as u64;
@@ -68,9 +70,12 @@ pub struct CutStats {
     pub candidate_clusters: u32,
     /// Hierarchy nodes the passes visited.
     pub nodes: u32,
-    /// Nodes, candidate items and ray-tracing cut clusters past their capacity
-    /// ([`crate::Budgets::traversal_nodes`], `cluster_work`, `rt_cut_clusters`), and nodes
-    /// a hierarchy deeper than the passes left.
+    /// Nodes, candidate items and ray-tracing cut clusters past their capacity, and nodes a
+    /// hierarchy deeper than the passes left. The traversal queues and the candidate cut grow
+    /// to what the frames want from their first sizes
+    /// ([`crate::Budgets::initial_traversal_nodes`], `initial_candidate_items`), so they drop
+    /// only in the frames before they have grown and while device memory has no room for
+    /// them; ray-tracing cut clusters drop past `rt_cut_clusters`.
     pub nodes_dropped: u32,
     pub candidates_dropped: u32,
     pub rt_clusters_dropped: u32,
@@ -169,6 +174,7 @@ impl CutPipelines {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CutSizes {
     pub(crate) slots: u32,
+    /// The first sizes of each traversal queue and of the candidate cut, which grow.
     pub(crate) queue: u32,
     pub(crate) candidates: u32,
     pub(crate) rt_clusters: u32,
@@ -202,16 +208,50 @@ impl CutSizes {
     }
 }
 
+/// The record of the cut tables `gpu` names.
+fn cut_record(device: &Device, gpu: CutGpu) -> Result<Allocation<CutGpu>> {
+    let mut record = device.gpu_malloc::<CutGpu>(MemoryKind::Upload, 1, "cut tables")?;
+    record.as_mut_slice().expect("upload is mapped")[0] = gpu;
+    Ok(record)
+}
+
 /// The cluster BLAS of one frame: implicit results in one block, its CLAS per BLAS at most.
 struct Arena {
     block: Allocation<u8>,
     max_clas: u32,
 }
 
+/// The traversal queues and the candidate cut, sized to what the frames want.
+struct Lists {
+    queue: [Allocation<NodeItem>; 2],
+    candidates: Allocation<ClusterWork>,
+}
+
+impl Lists {
+    fn new(device: &Device, queue: u32, candidates: u32) -> Result<Self> {
+        let dl = MemoryKind::DeviceLocal;
+        let n = |c: u32| u64::from(c.max(1));
+        Ok(Self {
+            queue: [
+                device.gpu_malloc(dl, n(queue), "traversal queue")?,
+                device.gpu_malloc(dl, n(queue), "traversal queue")?,
+            ],
+            candidates: device.gpu_malloc(dl, n(candidates), "candidate cut")?,
+        })
+    }
+}
+
 /// One scene's cut tables, made at its first update.
 pub(crate) struct Cuts {
     sizes: CutSizes,
+    /// What the kernels read, in `record`.
+    gpu: CutGpu,
     record: Allocation<CutGpu>,
+    lists: Lists,
+    queue: Capacity,
+    candidates: Capacity,
+    /// The frame from which a growth that found no memory may be tried again.
+    retry: u64,
     _blocks: Vec<Allocation<u8>>,
     counters: GpuPtr<u32>,
     args: GpuPtr<u32>,
@@ -260,15 +300,7 @@ impl Cuts {
         let n = |c: u32| u64::from(c.max(1));
         let keys = sizes.keys();
         let slots = block(n(sizes.slots) * size_of::<SlotCutGpu>() as u64, "slot cuts")?;
-        let queue_bytes = n(sizes.queue) * size_of::<NodeItem>() as u64;
-        let queue = [
-            block(queue_bytes, "traversal queue")?,
-            block(queue_bytes, "traversal queue")?,
-        ];
-        let candidates = block(
-            n(sizes.candidates) * size_of::<ClusterWork>() as u64,
-            "candidate cut",
-        )?;
+        let lists = Lists::new(device, sizes.queue, sizes.candidates)?;
         let entries = block(8 * n(sizes.rt_clusters), "ray-tracing cut clusters")?;
         let clas = block(8 * n(sizes.rt_clusters), "cut CLAS addresses")?;
         let jobs = block(
@@ -301,8 +333,8 @@ impl Cuts {
         .cast();
         let gpu = CutGpu {
             slots: slots.cast(),
-            queue: queue.map(GpuPtr::cast),
-            candidates: candidates.cast(),
+            queue: lists.queue.each_ref().map(Allocation::gpu),
+            candidates: lists.candidates.gpu(),
             entries: entries.cast(),
             clas: clas.cast(),
             jobs: jobs.cast(),
@@ -329,11 +361,14 @@ impl Cuts {
             part_list_capacity: sizes.part_lists(),
             feedback_words: sizes.feedback_words(),
         };
-        let mut record = device.gpu_malloc::<CutGpu>(MemoryKind::Upload, 1, "cut tables")?;
-        record.as_mut_slice().expect("upload is mapped")[0] = gpu;
         Ok(Self {
             sizes,
-            record,
+            gpu,
+            record: cut_record(device, gpu)?,
+            lists,
+            queue: Capacity::new(sizes.queue, u32::MAX),
+            candidates: Capacity::new(sizes.candidates, u32::MAX),
+            retry: 0,
             _blocks: blocks,
             counters,
             args,
@@ -355,6 +390,59 @@ impl Cuts {
 
     pub(crate) fn gpu(&self) -> GpuPtr<CutGpu> {
         self.record.gpu()
+    }
+
+    /// Items the candidate cut holds.
+    pub(crate) fn candidate_capacity(&self) -> u32 {
+        self.gpu.candidate_capacity
+    }
+
+    /// Takes what the frame that used readback slot `slot` wanted of the queues and the
+    /// candidate cut.
+    pub(crate) fn observe(&mut self, slot: usize) {
+        let data = self.readback(slot);
+        let (queue, candidates) = (data[CUT_QUEUE_PEAK], data[CUT_CANDIDATES]);
+        self.queue.observe(queue);
+        self.candidates.observe(candidates);
+    }
+
+    /// Resizes the queues and the candidate cut to what the completed frames wanted, before
+    /// `frame` records anything that reads them; the frames before keep the old ones, whose
+    /// memory is freed after the work submitted so far. Without device memory for new ones the
+    /// old ones stay, the error is returned, and no resize is tried before `period` frames
+    /// have passed.
+    pub(crate) fn fit(&mut self, device: &Device, frame: u64, period: u64) -> Result<()> {
+        let resize = self.queue.resize().is_some() || self.candidates.resize().is_some();
+        if !resize || frame < self.retry {
+            return Ok(());
+        }
+        let (queue, candidates) = (self.queue.wanted(), self.candidates.wanted());
+        let made = Lists::new(device, queue, candidates).and_then(|lists| {
+            let gpu = CutGpu {
+                queue: lists.queue.each_ref().map(Allocation::gpu),
+                candidates: lists.candidates.gpu(),
+                queue_capacity: queue,
+                candidate_capacity: candidates,
+                ..self.gpu
+            };
+            let record = cut_record(device, gpu)?;
+            Ok((lists, gpu, record))
+        });
+        let (lists, gpu, record) = match made {
+            Ok(m) => m,
+            Err(e) => {
+                if e.is_out_of_memory() {
+                    self.retry = frame + period;
+                }
+                return Err(e);
+            }
+        };
+        self.lists = lists;
+        self.record = record;
+        self.gpu = gpu;
+        self.queue.set(queue);
+        self.candidates.set(candidates);
+        Ok(())
     }
 
     fn blas_desc(&self, max_clas: u32) -> RtasOpDesc {

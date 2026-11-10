@@ -18,11 +18,12 @@ public struct ParticleDraw
     public Placement placement;
 }
 
-// The draw of mesh workgroup `group` of the particle draws; false past the list.
+// The draw of mesh workgroup `group` of a particle draw with the raster record `r` it took;
+// false past the list.
 public bool particle_draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint3 group, out ParticleDraw d)
 {
     d = (ParticleDraw)0;
-    uint index = grid_index(group);
+    uint index = grid_index(group) + r.draw_first;
     return index < r.counts[COUNT_PARTICLES] && listed_draw(s, v, r, r.particles[index], d);
 }
 

@@ -9,9 +9,10 @@ use orr_math::{Affine3, DVec3, IVec3, Mat4, Quat, UVec2, Vec2, Vec4};
 use orr_pack::AffineRows;
 
 use crate::arena::ViewArena;
-use crate::raster::ViewTargets;
+use crate::capacity::Capacity;
+use crate::raster::{VISIBLE_CLUSTER_LIMIT, ViewLists, ViewTargets};
 use crate::world::WorldPos;
-use crate::{GBufferGpu, SceneId};
+use crate::{GBufferGpu, RasterGpu, SceneId};
 
 /// Per-view constants (`view.slang`). View space has no translation: x right, y up, looking
 /// down -z. Clip space is Vulkan's (y down) with reverse Z and an infinite far plane.
@@ -231,15 +232,18 @@ pub struct RasterView {
     pub gbuf_y: Option<Arc<Texture>>,
     /// R32F: the farthest reverse-Z depth per texel, mip 0 at the render extent.
     pub hzb: Arc<Texture>,
-    /// Visible clusters written, then visible clusters and cluster work dropped for want
-    /// of room (`Budgets::visible_clusters`, `Budgets::cluster_work`), 1, cluster work
-    /// items asked for, mesh-shader opaque and alpha draws, software-rastered clusters, and
-    /// visible particle clusters; entry 16 counts the visible dielectric and presence
-    /// clusters that drew into `targets.layer_tiles`, and entry 17 the visible smoke clusters.
+    /// Visible clusters asked for, then visible clusters and cluster work dropped for want
+    /// of room, 1, cluster work items asked for, mesh-shader opaque and alpha draws,
+    /// software-rastered clusters, and visible particle clusters; entry 16 counts the visible
+    /// dielectric and presence clusters that drew into `targets.layer_tiles`, and entry 17 the
+    /// visible smoke clusters. The lists grow to what the frames ask for from
+    /// [`crate::Budgets::initial_visible_clusters`], so they drop only in the frames before
+    /// they have grown, while device memory has no room for them, and past the 2^25 visible
+    /// clusters a visibility buffer word can name.
     pub counts: GpuPtr<u32>,
     /// The view's raster state: `gbuffer` and the culling lists, the particle list among
     /// them.
-    pub raster: GpuPtr<crate::RasterGpu>,
+    pub raster: GpuPtr<RasterGpu>,
     /// Workgroups of one per cluster of `raster`'s smoke list, when the scene holds a smoke
     /// entry.
     pub smoke_args: Option<GpuPtr<DispatchArgs>>,
@@ -261,16 +265,38 @@ pub(crate) struct ViewHistory {
     pub(crate) targets: Option<ViewTargets>,
     /// The transient targets of the view's render, orr_scene's and the later passes'.
     pub(crate) arena: ViewArena,
+    /// The cluster lists, the visible list's capacity, and the frame from which a growth that
+    /// found no memory may be tried again.
+    pub(crate) lists: Option<ViewLists>,
+    pub(crate) visible: Capacity,
+    pub(crate) lists_retry: u64,
+    /// The raster records of this frame's mesh draws over the lists.
+    pub(crate) draws: Vec<GpuPtr<RasterGpu>>,
+    /// Per frame in flight, the visible clusters its render wanted, and the frame that
+    /// rendered into each slot.
+    pub(crate) readback: Allocation<u32>,
+    pub(crate) rendered: Vec<Option<u64>>,
 }
 
 impl ViewHistory {
-    pub(crate) fn new(exposure: Allocation<ExposureState>, arena: ViewArena) -> Self {
+    pub(crate) fn new(
+        exposure: Allocation<ExposureState>,
+        arena: ViewArena,
+        visible: u32,
+        readback: Allocation<u32>,
+    ) -> Self {
         Self {
             exposure,
             slot: 0,
             previous: None,
             targets: None,
             arena,
+            lists: None,
+            visible: Capacity::new(visible, VISIBLE_CLUSTER_LIMIT),
+            lists_retry: 0,
+            draws: Vec::new(),
+            rendered: vec![None; readback.len() as usize],
+            readback,
         }
     }
 }

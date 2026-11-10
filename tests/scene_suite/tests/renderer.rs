@@ -450,8 +450,8 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
         alias_view_targets: alias,
         path_entry: PathEntry::Compute,
         budgets: Budgets {
-            visible_clusters: 1024,
-            cluster_work: 1024,
+            initial_visible_clusters: 1024,
+            initial_candidate_items: 1024,
             ..Budgets::default()
         },
         ..RendererDesc::default()

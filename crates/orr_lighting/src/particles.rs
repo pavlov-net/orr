@@ -61,15 +61,7 @@ impl ParticleDraw {
         if lighting == GpuPtr::NULL {
             return Ok(());
         }
-        let root = pass.put_root(&particle_draw::Root {
-            scene: pass.scene,
-            view: pass.view,
-            raster: pass.raster,
-            lighting,
-            anisotropy,
-            _pad0: 0,
-            _pad1: 0,
-        })?;
+        let (scene, view) = (pass.scene, pass.view);
         pass.cmd.begin_rendering(&Rendering {
             extent: pass.extent,
             colors: &[ColorAttachment {
@@ -83,13 +75,15 @@ impl ParticleDraw {
                 store: true,
             }),
         });
-        pass.cmd.draw_mesh_tasks_indirect_count(
-            &self.pipeline,
-            root,
-            pass.particle_args,
-            pass.particle_draws,
-            1,
-        );
+        pass.draw_particles(&self.pipeline, |raster| particle_draw::Root {
+            scene,
+            view,
+            raster,
+            lighting,
+            anisotropy,
+            _pad0: 0,
+            _pad1: 0,
+        })?;
         pass.cmd.end_rendering();
         Ok(())
     }

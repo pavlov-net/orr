@@ -37,7 +37,8 @@ use orr_pack::model::ModelInfo;
 use orr_pack::skeleton::{SkeletonInfo, Trs};
 use orr_pack::{Archive, AssetId, Entry, Span, Target};
 use orr_scene::testing::{
-    Image, Pixels, Tolerance, assert_clean, check, device, flip, read_buffer, read_texture, wait,
+    Image, Pixels, Tolerance, assert_clean, check, device, flip, read_buffer, read_texture,
+    visible_clusters, wait,
 };
 use orr_scene::{
     AffineRows, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, Decal, DecalChannels,
@@ -46,11 +47,11 @@ use orr_scene::{
     ModelId, MountId, PackSource, Pose, Projection, RasterGpu, RasterView, RendererDesc,
     SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc,
     SkinnedGpu, SkinnedPageRef, SlotCutGpu, TextureFilter, TransformGroupDesc, TransformGroupId,
-    ViewDesc, ViewHistoryId, VisibleCluster,
+    ViewDesc, ViewHistoryId,
 };
 use orr_scene::{Budgets, InstancePageRef, PageId};
 use scene_suite::shaders::{
-    codec, fracture, pose, skin_pose, surface_at, surface_params, trace, triangle_at,
+    codec, fracture, grid, pose, skin_pose, surface_at, surface_params, trace, triangle_at,
 };
 use scene_suite::{Workers, linked, pipeline};
 
@@ -1536,8 +1537,7 @@ fn read_back(view: &RasterView) -> Frame {
     let pixels = u64::from(EXTENT[0] * EXTENT[1]);
     let vis: Vec<u64> = read_buffer(view.targets.visibility, pixels);
     let counts = read_buffer(view.counts, 16);
-    let clusters: Vec<VisibleCluster> =
-        read_buffer(view.targets.clusters, u64::from(counts[0].max(1)));
+    let clusters = visible_clusters(view);
     let ids = vis
         .iter()
         .map(|&w| {
@@ -1821,11 +1821,19 @@ fn the_generated_resolve_writes_the_recorded_resolves_gbuffer_and_runs_only_bins
     let bits = |f: &Frame| {
         let depth: Vec<u32> = f.depth.iter().map(|d| d.to_bits()).collect();
         let motion: Vec<[u32; 2]> = f.motion.iter().map(|m| m.map(f32::to_bits)).collect();
+        // The extended targets hold words only where a pixel's flags say so.
+        let held = |t: &Option<Vec<[u32; 4]>>, flag: u32| {
+            t.as_ref().map(|t| {
+                (t.iter().zip(&f.a))
+                    .map(|(&w, a)| if (a[3] >> 24) & flag != 0 { w } else { [0; 4] })
+                    .collect::<Vec<_>>()
+            })
+        };
         (
             f.a.clone(),
             f.b.clone(),
-            f.x.clone(),
-            f.y.clone(),
+            held(&f.x, EXTENDED),
+            held(&f.y, LAYERS),
             depth,
             motion,
         )
@@ -2306,8 +2314,7 @@ fn load_gsurface_reads_the_visible_surface() {
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     wait(render.submit(vec![list], &[]).unwrap());
     let vis: Vec<u64> = read_buffer(g.view.targets.visibility, n);
-    let clusters: Vec<VisibleCluster> =
-        read_buffer(g.view.targets.clusters, u64::from(g.counts[0]));
+    let clusters = visible_clusters(&g.view);
     for (i, (a, &v)) in out.as_slice().unwrap().iter().zip(&vis).enumerate() {
         if v == 0 {
             assert_eq!(a.material, u32::MAX, "pixel {i}: sky has no material");
@@ -2383,8 +2390,7 @@ type Surfaces = Vec<Option<((u32, u32, u32), f32)>>;
 fn surfaces(view: &RasterView) -> (Surfaces, Vec<u32>) {
     let vis: Vec<u64> = read_buffer(view.targets.visibility, u64::from(EXTENT[0] * EXTENT[1]));
     let counts: Vec<u32> = read_buffer(view.counts, 8);
-    let clusters: Vec<VisibleCluster> =
-        read_buffer(view.targets.clusters, u64::from(counts[0].max(1)));
+    let clusters = visible_clusters(view);
     let decoded = vis
         .iter()
         .map(|&w| {
@@ -3566,9 +3572,7 @@ fn model_materials(root: &SceneRoot, models: &[ModelId]) -> Vec<[u32; 2]> {
 fn pixel_materials(view: &RasterView) -> Vec<u32> {
     let pixels = u64::from(EXTENT[0] * EXTENT[1]);
     let vis: Vec<u64> = read_buffer(view.targets.visibility, pixels);
-    let counts = read_buffer(view.counts, 16);
-    let clusters: Vec<VisibleCluster> =
-        read_buffer(view.targets.clusters, u64::from(counts[0].max(1)));
+    let clusters = visible_clusters(view);
     vis.iter()
         .map(|&w| {
             if w == 0 {
@@ -5757,6 +5761,132 @@ fn last_stats(w: &mut World, frame: u32) -> orr_scene::FrameStats {
         .unwrap();
     wait(f.end(&[]).unwrap());
     w.scenes.stats().clone()
+}
+
+/// Frames by which the work lists, from one entry, hold what the DAG scene wants: each frame's
+/// readback grows them for the next to half again what it wanted, and what a list drops hides
+/// only what the lists after it want.
+const GROWTH_FRAMES: u32 = 4;
+
+/// Two mesh draws of two rows each over three rows and a few groups of list entries: each draw
+/// keeps to its whole rows, and every entry is drawn once.
+#[test]
+fn list_draws_cover_every_entry_once_past_a_row_and_a_draw() {
+    let _serial = serial();
+    const GRID_X: u32 = 65535;
+    let d = device();
+    let up = MemoryKind::Upload;
+    let (draws, draw_groups, count) = (2, 2 * GRID_X, 3 * GRID_X + 7);
+    let args = d
+        .gpu_malloc::<u32>(up, 3 * u64::from(draws), "draw args")
+        .unwrap();
+    let mut raster: RasterGpu = bytemuck::Zeroable::zeroed();
+    raster.draw_args = args.gpu();
+    raster.draws = draws;
+    raster.draw_groups = draw_groups;
+    let mut record = d.gpu_malloc::<RasterGpu>(up, 1, "raster").unwrap();
+    record.as_mut_slice().unwrap()[0] = raster;
+    let mut hits = d
+        .gpu_malloc::<u32>(up, u64::from(count + 1), "hits")
+        .unwrap();
+    hits.as_mut_slice().unwrap().fill(0);
+    let root = |first: u32| {
+        let mut r = d.gpu_malloc::<grid::Root>(up, 1, "grid root").unwrap();
+        r.as_mut_slice().unwrap()[0] = grid::Root {
+            raster: record.gpu(),
+            hits: hits.gpu(),
+            count,
+            first,
+            pad0: 0,
+            pad1: 0,
+        };
+        r
+    };
+    let sized = root(0);
+    let roots: Vec<_> = (0..draws).map(|i| root(i * draw_groups)).collect();
+    let (size, mark) = (
+        pipeline(&grid::MODULE, "size"),
+        pipeline(&grid::MODULE, "mark"),
+    );
+    let render = d.queue(QueueKind::Render).unwrap();
+    let mut list = render.command_list().unwrap();
+    list.dispatch(&size, sized.gpu(), [1, 1, 1]);
+    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
+    for (i, r) in (0u64..).zip(&roots) {
+        list.dispatch_indirect(&mark, r.gpu(), args.gpu().offset(3 * i).cast());
+    }
+    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+    wait(render.submit(vec![list], &[]).unwrap());
+    let grids: Vec<u32> = read_buffer(args.gpu(), 3 * u64::from(draws));
+    assert_eq!(grids, [GRID_X, 2, 1, GRID_X, 2, 1]);
+    let hits: Vec<u32> = read_buffer(hits.gpu(), u64::from(count + 1));
+    let missed: Vec<usize> = (0..count as usize).filter(|&i| hits[i] != 1).collect();
+    assert!(missed.is_empty(), "{} entries not drawn once", missed.len());
+    assert_eq!(
+        hits[count as usize],
+        2 * draw_groups - count,
+        "the last row's groups past it"
+    );
+    assert_clean();
+}
+
+#[test]
+fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_cluster_rule() {
+    let _serial = serial();
+    let mut w = World::with(&RendererDesc {
+        rt_merge_pixels: 0.0,
+        budgets: Budgets {
+            initial_traversal_nodes: 1,
+            initial_candidate_items: 1,
+            initial_visible_clusters: 1,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    });
+    let items = dag_items();
+    let placed = place(&mut w, &items);
+    let eye = Vec3::new(0.3, 1.2, 4.0);
+    let target = Vec3::new(0.0, 0.0, -10.0);
+    // Per frame: nodes, candidate items, visible clusters and second-pass work dropped.
+    let mut drops = Vec::new();
+    let mut last = None;
+    for frame in 1..=GROWTH_FRAMES + 3 {
+        let g = shoot(
+            &mut w,
+            &placed,
+            &Shot::at(eye.as_dvec3(), target.as_dvec3(), frame),
+        );
+        let c = read_cut(&g.view, placed.count).counters;
+        drops.push([c[8], c[9], g.counts[1], g.counts[2]]);
+        last = Some(g);
+    }
+    let clean = drops.iter().position(|d| *d == [0; 4]);
+    assert!(
+        drops[0][..3].iter().all(|&d| d > 0) && clean.is_some_and(|f| f < GROWTH_FRAMES as usize),
+        "drops by frame: {drops:?}"
+    );
+    assert!(
+        drops[clean.unwrap()..].iter().all(|d| *d == [0; 4]),
+        "drops by frame: {drops:?}"
+    );
+    let cut = read_cut(&last.unwrap().view, placed.count);
+    for (slot, item) in items.iter().enumerate() {
+        let slot = placed.ranges[slot].first;
+        let m = CpuMesh::of(item.model);
+        let clusters = m.clusters();
+        let p = Projector::new(item, eye);
+        let (want, near) = rule_cut(&m, &clusters, &p, 1.0, 1.0, &m.all_resident());
+        let got = cut.raster(&m, slot);
+        let differ: Vec<u32> = want.symmetric_difference(&got).copied().collect();
+        assert!(
+            differ.iter().all(|c| near.contains(c)),
+            "{}: raster cut differs from the rule at {differ:?} ({} against {})",
+            item.model,
+            got.len(),
+            want.len()
+        );
+    }
+    assert_clean();
 }
 
 #[test]

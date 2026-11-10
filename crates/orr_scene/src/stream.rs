@@ -1908,6 +1908,12 @@ impl Streaming {
         self.feedback.record_end(list, slot);
     }
 
+    /// Memory outside the streamed units ran out with `e`: the next step shrinks the budgets
+    /// when they govern its kind.
+    pub(crate) fn out_of_memory(&mut self, e: &Error) {
+        self.residency.out_of_memory(governs(&self.governed, e));
+    }
+
     /// Frees the slots retired at or before `completed`; the tiles among them unbind with
     /// the next task.
     pub(crate) fn retire(&mut self, completed: u64) {

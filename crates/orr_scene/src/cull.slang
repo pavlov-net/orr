@@ -466,10 +466,10 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
 void raster_args(uint3 id: SV_DispatchThreadID)
 {
     RasterGpu* r = root.raster;
-    write_grid(r.args + ARGS_OPAQUE, r.counts[COUNT_OPAQUE] - r.counts[COUNT_OPAQUE_BASE]);
-    write_grid(r.args + ARGS_ALPHA, r.counts[COUNT_ALPHA] - r.counts[COUNT_ALPHA_BASE]);
+    write_draws(r, DRAW_OPAQUE, r.counts[COUNT_OPAQUE] - r.counts[COUNT_OPAQUE_BASE]);
+    write_draws(r, DRAW_ALPHA, r.counts[COUNT_ALPHA] - r.counts[COUNT_ALPHA_BASE]);
     write_grid(r.args + ARGS_SOFTWARE, r.counts[COUNT_SOFTWARE] - r.counts[COUNT_SOFTWARE_BASE]);
-    write_grid(r.args + ARGS_PARTICLES, r.counts[COUNT_PARTICLES]);
-    write_grid(r.args + ARGS_COVERAGE, r.counts[COUNT_COVERAGE]);
+    write_draws(r, DRAW_PARTICLES, r.counts[COUNT_PARTICLES]);
+    write_draws(r, DRAW_COVERAGE, r.counts[COUNT_COVERAGE]);
     write_grid(r.args + ARGS_SMOKE, r.counts[COUNT_SMOKE]);
 }

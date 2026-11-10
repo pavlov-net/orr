@@ -207,7 +207,8 @@ Primitive cluster_primitive(ClusterDraw d, uint t, out uint3 corners_out)
 }
 
 // One workgroup per entry of the opaque list, or with root value 1 the alpha list, past the
-// entries an earlier pass drew, drawing the cluster's opaque or alpha-tested triangles.
+// entries an earlier pass drew and those of the earlier draws of this pass, drawing the
+// cluster's opaque or alpha-tested triangles.
 [shader("mesh")]
 [numthreads(128, 1, 1)]
 [outputtopology("triangle")]
@@ -220,7 +221,7 @@ void cluster_mesh(
 {
     RasterGpu* r = root.raster;
     bool alpha = root.value == 1;
-    uint index = grid_index(group) + r.counts[alpha ? COUNT_ALPHA_BASE : COUNT_OPAQUE_BASE];
+    uint index = grid_index(group) + r.draw_first + r.counts[alpha ? COUNT_ALPHA_BASE : COUNT_OPAQUE_BASE];
     if (index >= r.counts[alpha ? COUNT_ALPHA : COUNT_OPAQUE])
     {
         SetMeshOutputCounts(0, 0);
@@ -245,7 +246,8 @@ void cluster_mesh(
     }
 }
 
-// One workgroup per entry of the coverage list, drawing all the cluster's triangles.
+// One workgroup per entry of the coverage list past those of the earlier draws, drawing all
+// the cluster's triangles.
 [shader("mesh")]
 [numthreads(128, 1, 1)]
 [outputtopology("triangle")]
@@ -257,7 +259,7 @@ void coverage_mesh(
     out primitives Primitive primitives[128])
 {
     RasterGpu* r = root.raster;
-    uint index = grid_index(group);
+    uint index = grid_index(group) + r.draw_first;
     if (index >= r.counts[COUNT_COVERAGE])
     {
         SetMeshOutputCounts(0, 0);

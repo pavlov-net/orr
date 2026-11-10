@@ -398,6 +398,9 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
             max_image_extent_3d: 2048,
             max_image_layers: 2048,
             max_color_targets: 8,
+            // Metal's feature tables name no such total for mesh grids that this was checked
+            // against, so draws keep to the least `VK_EXT_mesh_shader` guarantees.
+            max_mesh_draw_groups: 1 << 22,
             max_ray_dispatch_invocations: 0,
             device_local_bytes: working_set,
             upload_bytes: working_set,

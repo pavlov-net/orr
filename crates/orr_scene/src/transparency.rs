@@ -3,7 +3,7 @@
 //! radiance. Particle producer entries are drawn only here for primary visibility; the
 //! view's culling lists their visible clusters for the hook's mesh draws (`particles.slang`).
 
-use orr_gpu::{CommandList, Device, GpuPtr, MeshArgs, Texture, TextureIndex};
+use orr_gpu::{CommandList, Device, GpuPtr, MeshArgs, MeshPipeline, Texture, TextureIndex};
 
 use crate::memory::UploadWindow;
 use crate::{RasterGpu, Result, SceneRoot, ViewConstants};
@@ -22,17 +22,38 @@ pub struct TransparencyPass<'a, 'q> {
     pub view: GpuPtr<ViewConstants>,
     pub scene: GpuPtr<SceneRoot>,
     pub raster: GpuPtr<RasterGpu>,
-    /// One mesh workgroup per visible particle cluster, for
-    /// `draw_mesh_tasks_indirect_count` with `particle_draws` as the count.
-    pub particle_args: GpuPtr<MeshArgs>,
-    pub particle_draws: GpuPtr<u32>,
+    pub(crate) particle_draws: Vec<ParticleDraws>,
     pub(crate) device: &'a Device,
     pub(crate) window: &'a UploadWindow,
+}
+
+/// One mesh draw over the view's particle list, with the raster record it takes.
+pub(crate) struct ParticleDraws {
+    pub(crate) raster: GpuPtr<RasterGpu>,
+    pub(crate) args: GpuPtr<MeshArgs>,
+    pub(crate) count: GpuPtr<u32>,
 }
 
 impl TransparencyPass<'_, '_> {
     /// `root` in this frame's upload window at an address a draw can take as its root.
     pub fn put_root<T: bytemuck::Pod>(&self, root: &T) -> Result<GpuPtr<T>> {
         self.window.put_root(self.device, root)
+    }
+
+    /// Draws one mesh workgroup of `pipeline` per visible particle cluster, inside rendering,
+    /// in as many draws as the device bounds them to. Each draw's root is what `root` makes of
+    /// the raster record that draw takes, to give `particle_draw` in place of
+    /// [`Self::raster`].
+    pub fn draw_particles<T: bytemuck::Pod>(
+        &mut self,
+        pipeline: &MeshPipeline,
+        root: impl Fn(GpuPtr<RasterGpu>) -> T,
+    ) -> Result<()> {
+        for d in &self.particle_draws {
+            let r = self.window.put_root(self.device, &root(d.raster))?;
+            self.cmd
+                .draw_mesh_tasks_indirect_count(pipeline, r, d.args, d.count, 1);
+        }
+        Ok(())
     }
 }

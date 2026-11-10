@@ -10,7 +10,7 @@ import orr_scene.producer;
 __exported import orr_scene.hit;
 
 // `RasterGpu.counts` entries.
-public static const uint COUNT_VISIBLE = 0;          // visible clusters written
+public static const uint COUNT_VISIBLE = 0;          // visible clusters asked for, past capacity too
 public static const uint COUNT_VISIBLE_DROPPED = 1;  // visible clusters past capacity
 public static const uint COUNT_WORK_DROPPED = 2;     // second-pass work past capacity
 public static const uint COUNT_DRAWS = 3;            // 1: the draw count of the indirect draws
@@ -47,7 +47,8 @@ public struct RasterGpu
 {
     public GBufferGpu gbuffer;       // what later passes read
     public ClusterWork* work;        // what the second pass retests
-    public uint* args;               // workgroups x, y, z: work, opaque, alpha, software, particles, coverage, smoke
+    public uint* args;               // workgroups x, y, z: work, software, smoke
+    public uint* draw_args;          // per DRAW_* list, each of its `draws` mesh draws' workgroups x, y, z
     public uint* opaque;             // visible clusters with opaque triangles, hardware path
     public uint* alpha;              // visible clusters with alpha-tested triangles, hardware path
     public uint* software;           // visible clusters of the software raster
@@ -76,17 +77,26 @@ public struct RasterGpu
     public uint flags;               // RASTER_*
     public uint slots;               // instance slots to walk
     public uint hzb_mips;            // HZB mips the occlusion tests read
+    public uint draws;               // mesh draws over each DRAW_* list
+    public uint draw_groups;         // list entries one of them covers at most, whole rows of GRID_X
+    public uint draw_first;          // in the record a mesh draw takes: the first list entry it covers
+    public uint _pad;
 }
 
 // `RasterGpu.args` offsets.
 public static const uint ARGS_WORK = 0;
-public static const uint ARGS_OPAQUE = 3;
-public static const uint ARGS_ALPHA = 6;
-public static const uint ARGS_SOFTWARE = 9;
-public static const uint ARGS_PARTICLES = 12;
-public static const uint ARGS_COVERAGE = 15;
-public static const uint ARGS_SMOKE = 18;
-public static const uint ARGS = 21;
+public static const uint ARGS_SOFTWARE = 3;
+public static const uint ARGS_SMOKE = 6;
+public static const uint ARGS = 9;
+
+// The lists mesh draws take, by their place in `RasterGpu.draw_args`. A mesh draw launches a
+// bounded number of workgroups, so each list takes `RasterGpu.draws` draws of up to
+// `draw_groups` entries.
+public static const uint DRAW_OPAQUE = 0;
+public static const uint DRAW_ALPHA = 1;
+public static const uint DRAW_COVERAGE = 2;
+public static const uint DRAW_PARTICLES = 3;
+public static const uint DRAW_LISTS = 4;
 
 // Workgroup grids cover `n` groups in rows of GRID_X, the smallest maximum Vulkan allows. Every
 // row is full, so a workgroup checks `grid_index` against the count of what it reads.
@@ -102,6 +112,16 @@ public void write_grid(uint* args, uint n)
 public uint grid_index(uint3 group)
 {
     return group.y * GRID_X + group.x;
+}
+
+// Sizes the mesh draws over list `list`'s `n` entries: draw i takes them from i * draw_groups.
+public void write_draws(RasterGpu* r, uint list, uint n)
+{
+    for (uint i = 0; i < r.draws; i++)
+    {
+        uint first = min(n, i * r.draw_groups);
+        write_grid(r.draw_args + 3 * (list * r.draws + i), min(n - first, r.draw_groups));
+    }
 }
 
 // Bytes between the bins' roots: the largest uniform buffer offset alignment Vulkan allows.

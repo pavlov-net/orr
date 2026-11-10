@@ -1527,9 +1527,6 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
     let readback = gpu
         .gpu_malloc::<[u32; COUNTS]>(MemoryKind::Readback, slots, "raster counts")
         .expect("counts readback");
-    let mut glow_roots = gpu
-        .gpu_malloc::<glow::Root>(MemoryKind::Upload, slots, "particle draw roots")
-        .expect("particle roots");
 
     let frames_per_script = options.frames.or(settings.script_frames);
     let mut collected: Vec<(Script, Vec<Sample>)> = Vec::new();
@@ -1645,15 +1642,8 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                     .expect("update scenes");
                 let slot = id % slots;
                 let glow = &scene.glow;
-                let roots = &mut glow_roots;
                 let mut particles = |pass: &mut TransparencyPass<'_, '_>, _| {
-                    roots.as_mut_slice().expect("particle roots")[slot as usize] = glow::Root {
-                        scene: pass.scene,
-                        view: pass.view,
-                        raster: pass.raster,
-                        _pad0: 0,
-                        radiance: [4000.0, 3200.0, 1400.0, 0.0],
-                    };
+                    let (scene, view) = (pass.scene, pass.view);
                     pass.cmd.begin_rendering(&Rendering {
                         extent: pass.extent,
                         colors: &[ColorAttachment {
@@ -1667,13 +1657,14 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                             store: true,
                         }),
                     });
-                    pass.cmd.draw_mesh_tasks_indirect_count(
-                        glow,
-                        roots.gpu().offset(slot),
-                        pass.particle_args,
-                        pass.particle_draws,
-                        1,
-                    );
+                    pass.draw_particles(glow, |raster| glow::Root {
+                        scene,
+                        view,
+                        raster,
+                        _pad0: 0,
+                        radiance: [4000.0, 3200.0, 1400.0, 0.0],
+                    })
+                    .expect("particle draws");
                     pass.cmd.end_rendering();
                 };
                 let mut hooks = ViewHooks {
@@ -1776,7 +1767,6 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
     if let Some(m) = scene.streaming.take() {
         renderer.unmount(m);
     }
-    drop(glow_roots);
     drop(readback);
     drop(headless_target);
     drop(scene);

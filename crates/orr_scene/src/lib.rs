@@ -41,6 +41,7 @@
 
 mod accel;
 mod arena;
+mod capacity;
 mod clas_pool;
 mod decals;
 mod edit;

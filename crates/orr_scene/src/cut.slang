@@ -29,7 +29,7 @@ public struct ClusterWork
 
 // `CutGpu.counters`.
 public static const uint CUT_QUEUE = 0;               // two: items in each queue
-public static const uint CUT_CANDIDATES = 2;          // raster candidate items written
+public static const uint CUT_CANDIDATES = 2;          // raster candidate items asked for, past capacity too
 public static const uint CUT_CANDIDATE_CLUSTERS = 3;  // clusters in them
 public static const uint CUT_ENTRIES = 4;             // ray-tracing cut clusters gathered
 public static const uint CUT_CLAS = 5;                // CLAS addresses handed to BLAS builds
@@ -49,7 +49,8 @@ public static const uint CUT_PART_LISTS = 18;         // entries of `part_lists`
 public static const uint CUT_FEEDBACK_BUCKET = 19;    // the error bucket `feedback` fills up in
 public static const uint CUT_FEEDBACK_ROOM = 20;      // the requests of that bucket it keeps
 public static const uint CUT_FEEDBACK_TAKEN = 21;     // the requests of that bucket seen so far
-public static const uint CUT_COUNTERS = 22;
+public static const uint CUT_QUEUE_PEAK = 22;         // the most items a pass's queue was asked to hold, past capacity too
+public static const uint CUT_COUNTERS = 23;
 
 // One instance slot's cuts this frame.
 public struct SlotCutGpu

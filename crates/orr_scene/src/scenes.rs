@@ -33,10 +33,10 @@ use crate::neural::{NeuralTextures, Precision};
 use crate::pipelines::{PipelineId, Pipelines, ReloadReport};
 use crate::producer::{self, Job, ProducerKernels, ProducerStats, ProducerUpdate, Readback};
 use crate::ptlas::{FrameInputs, PtlasPipelines, RtStats};
-use crate::raster::{self, RasterPipelines, TargetSizes, ViewTargets};
+use crate::raster::{self, ListSizes, RasterPipelines, TargetSizes, ViewLists, ViewTargets};
 #[cfg(feature = "hot-reload")]
 use crate::reload::Reloader;
-use crate::residency::{RequestSource, ResidencyStats};
+use crate::residency::{RequestSource, ResidencyStats, response_period};
 use crate::scene::{GroupWriter, ModelCpu, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
 use crate::shaders::transparency::CompositeRoot;
 use crate::shaders::{animation, emissive, instance_page, page_motion, world as world_kernel};
@@ -71,13 +71,17 @@ pub struct Budgets {
     /// hold their addresses, and one per finer cached cut of a streaming mesh, and per edit one
     /// per page. A scene's traversal reports what it reads and wants by entry, a bit each.
     pub mesh_pages: u32,
-    /// Clusters one view can draw.
-    pub visible_clusters: u32,
-    /// Items of up to 32 clusters in a scene's raster candidate cut, and in the work one
-    /// view's first culling pass leaves to its second.
-    pub cluster_work: u32,
-    /// Hierarchy nodes one traversal pass of a scene visits, at most.
-    pub traversal_nodes: u32,
+    /// Visible clusters one view's list holds at first. A list grows a few frames after a
+    /// frame wanted more than it holds, and gives memory back after a long run of frames that
+    /// want far less. It holds 2^25 at most, the clusters a visibility buffer word can name.
+    pub initial_visible_clusters: u32,
+    /// Items of up to 32 clusters a scene's raster candidate cut holds at first; it grows like
+    /// the visible clusters. The work a view's first culling pass leaves to its second holds
+    /// as many as its scene's candidate cut.
+    pub initial_candidate_items: u32,
+    /// Hierarchy nodes each of a scene's traversal queues holds at first, the nodes one pass
+    /// visits; they grow like the visible clusters.
+    pub initial_traversal_nodes: u32,
     /// Mesh pages, hierarchy pages and finer cached cuts a scene's traversal asks the loading
     /// side for in a frame, at most: those of the largest projected errors. The others wait
     /// for a later frame.
@@ -151,9 +155,9 @@ impl Default for Budgets {
             meshes: 65_536,
             model_materials: 262_144,
             mesh_pages: 1 << 20,
-            visible_clusters: 1 << 20,
-            cluster_work: 1 << 18,
-            traversal_nodes: 1 << 18,
+            initial_visible_clusters: 1 << 20,
+            initial_candidate_items: 1 << 18,
+            initial_traversal_nodes: 1 << 18,
             traversal_requests: 4096,
             rt_cut_clusters: 1 << 18,
             rt_cut_blas: 1024,
@@ -953,7 +957,13 @@ impl Scenes {
                 ]
             }));
         let arena = ViewArena::new(&self.device, self.core.alias_view_targets);
-        let history = ViewHistory::new(exposure, arena);
+        let readback = self.device.gpu_malloc(
+            MemoryKind::Readback,
+            u64::from(self.core.fif),
+            "visible cluster readback",
+        )?;
+        let visible = self.core.budgets.initial_visible_clusters;
+        let history = ViewHistory::new(exposure, arena, visible, readback);
         Ok(ViewHistoryId(insert(&mut self.core.histories, history)))
     }
 
@@ -1039,18 +1049,25 @@ impl Scenes {
             let mut feedback = PageFeedback::default();
             for id in &f.updated {
                 let Ok(scene) = core.scene(*id) else { continue };
-                let cpu = scene.cpu.lock().unwrap();
+                let mut cpu = scene.cpu.lock().unwrap();
                 if let Some(r) = &cpu.producer_readback {
                     let (producers, tessellation) = r.figures(slot);
                     f.stats.producers.add(&producers);
                     f.stats.tessellation.add(&tessellation);
                 }
-                if let Some(cuts) = &cpu.cuts {
+                if let Some(cuts) = &mut cpu.cuts {
                     cuts.figures(slot, &mut f.stats.cuts);
                     cuts.feedback(slot, &mut feedback);
+                    cuts.observe(slot);
                 }
                 if let Some(skin) = &cpu.skin_frame {
                     f.stats.skin.add(&skin.figures(slot));
+                }
+            }
+            for h in core.histories.iter_mut().flatten() {
+                if h.rendered[slot] == Some(f.id) {
+                    let wanted = h.readback.as_slice().expect("readback is mapped")[slot];
+                    h.visible.observe(wanted);
                 }
             }
             core.mounts.page_feedback(&feedback, frame);
@@ -1508,6 +1525,8 @@ impl<'a> Frame<'a> {
         let mut roots = Vec::new();
         let mut traced = Vec::new();
         let mut masks = Vec::new();
+        // Cut tables that found no memory to grow.
+        let mut short = Vec::new();
         for &id in &self.listed {
             let scene = core.scene(id)?;
             let cpu = &mut *scene.cpu.lock().unwrap();
@@ -1544,8 +1563,8 @@ impl<'a> Frame<'a> {
             if cpu.cuts.is_none() {
                 let sizes = CutSizes {
                     slots: scene.desc.instance_capacity,
-                    queue: core.budgets.traversal_nodes,
-                    candidates: core.budgets.cluster_work,
+                    queue: core.budgets.initial_traversal_nodes,
+                    candidates: core.budgets.initial_candidate_items,
                     rt_clusters: core.budgets.rt_cut_clusters,
                     rt_blas: core.budgets.rt_cut_blas,
                     models: core.budgets.models,
@@ -1554,7 +1573,12 @@ impl<'a> Frame<'a> {
                 };
                 cpu.cuts = Some(Cuts::new(device, sizes, core.fif)?);
             }
-            let cut = cpu.cuts.as_ref().expect("made above").gpu();
+            let cuts = cpu.cuts.as_mut().expect("made above");
+            match cuts.fit(device, self.id, response_period(core.fif)) {
+                Err(e) if e.is_out_of_memory() => short.push(e),
+                r => r?,
+            }
+            let cut = cuts.gpu();
             if cpu.skinned_high_water > 0 && cpu.skin_frame.is_none() {
                 cpu.skin_frame = Some(SkinFrame::new(
                     device,
@@ -1686,6 +1710,9 @@ impl<'a> Frame<'a> {
                 cpu.focus_detail(),
                 scene.desc,
             ));
+        }
+        for e in &short {
+            core.mounts.streaming.out_of_memory(e);
         }
 
         if !masks.is_empty() {
@@ -2165,18 +2192,23 @@ impl<'a> Frame<'a> {
                 core.cell_log2,
             )
             .to_array();
-        let (slots, smoke, scene_features) = {
+        let (slots, smoke, scene_features, work) = {
             let cpu = scene.cpu.lock().unwrap();
             let features = cpu.features();
             let smoke = features.contains(SceneFeatures::SMOKE);
-            (cpu.ptlas.high_water, smoke, features)
+            let cuts = cpu.cuts.as_ref().expect("an updated scene has cut tables");
+            (
+                cpu.ptlas.high_water,
+                smoke,
+                features,
+                cuts.candidate_capacity(),
+            )
         };
+        let features = core.features() | scene_features;
         let producer_capacity = scene.desc.producer_capacity;
         let sizes = TargetSizes {
             extent: view.render_extent.to_array(),
             extended: core.materials.any_extended(),
-            visible_clusters: core.budgets.visible_clusters,
-            work: core.budgets.cluster_work,
             bins: core.raster.bins,
             slots: scene.desc.instance_capacity,
         };
@@ -2202,24 +2234,47 @@ impl<'a> Frame<'a> {
         let mut all = ViewTargets::requests(&sizes);
         all.extend_from_slice(requests);
         history.arena.layout(&all, list)?;
+        // The second culling pass takes at most one work item per candidate item.
+        let want = ListSizes {
+            visible_clusters: history.visible.wanted(),
+            work,
+        };
+        let held = history.lists.as_ref().map(|l| l.sizes);
+        let mut short = None;
+        if held != Some(want) && (held.is_none() || self.id >= history.lists_retry) {
+            match ViewLists::new(device, want) {
+                Ok(lists) => {
+                    history.visible.set(want.visible_clusters);
+                    history.lists = Some(lists);
+                }
+                // The view keeps the lists it has while the streaming budgets make room.
+                Err(e) if e.is_out_of_memory() && held.is_some() => {
+                    history.lists_retry = self.id + response_period(core.fif);
+                    short = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
         history.arena.enter(ViewStep::Raster, list);
         match &mut history.targets {
             Some(t) if t.sizes == sizes => t.bind(&history.arena),
             t => *t = Some(ViewTargets::new(device, sizes, &history.arena, list)?),
         }
+        let lists = history.lists.as_ref().expect("lists made above");
         let targets = history.targets.as_mut().expect("view targets");
         let hzb_view = (view.scene, view.output_extent.to_array());
         let occlusion = targets.hzb_view.replace(hzb_view) == Some(hzb_view) && !view.camera_cut;
         let targets = &*targets;
         let seen = constants;
         let constants = window.put(device, &constants)?;
-        let raster = raster::record(
+        let draws = raster::record(
             device,
             &core.raster,
             self.pipelines,
             window,
             list,
             targets,
+            lists,
             root,
             slots,
             producer_capacity,
@@ -2228,12 +2283,18 @@ impl<'a> Frame<'a> {
             occlusion,
             preprocess,
         )?;
+        let raster = draws[0];
+        let slot = (self.id % u64::from(core.fif)) as usize;
+        let wanted = history.readback.gpu().offset(slot as u64);
+        list.copy(wanted.cast(), targets.counts().cast(), 4);
+        list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
+        history.rendered[slot] = Some(self.id);
         let (gbuf_a, gbuf_b, gbuf_x, gbuf_y) = targets.gbuffer_textures();
         let out = RasterView {
             view: constants,
             scene: root,
             gbuffer: raster.cast(),
-            targets: targets.gbuffer(),
+            targets: targets.gbuffer(lists),
             depth: Arc::clone(&targets.depth.texture),
             motion: Arc::clone(&targets.motion.texture),
             gbuf_a,
@@ -2244,11 +2305,15 @@ impl<'a> Frame<'a> {
             counts: targets.counts(),
             raster,
             smoke_args: smoke.then(|| targets.smoke_args()),
-            features: core.features() | scene_features,
+            features,
             history: view.history,
             sky_stats,
             focus,
         };
+        history.draws = draws;
+        if let Some(e) = short {
+            core.mounts.streaming.out_of_memory(&e);
+        }
         let mut cpu = core.scene(view.scene)?.cpu.lock().unwrap();
         if cpu.seen_by.is_none_or(|s| s.frame != self.id) {
             cpu.seen_by = Some(crate::scene::LastView {
@@ -2308,7 +2373,8 @@ impl<'a> Frame<'a> {
         history.arena.enter(ViewStep::Transparency, list);
         let targets = history.targets.as_ref().expect("view targets");
         let extent = targets.sizes.extent;
-        let (particle_args, particle_draws) = targets.particle_draws();
+        let lists = history.lists.as_ref().expect("lists of the view's raster");
+        let particle_draws = targets.particle_draws(lists, &history.draws);
         let depth = Arc::clone(&targets.depth.texture);
         let depth_index = targets.depth.sampled;
         let overlay = targets.overlay();
@@ -2334,7 +2400,6 @@ impl<'a> Frame<'a> {
             view: view.view,
             scene: view.scene,
             raster: view.raster,
-            particle_args,
             particle_draws,
             device,
             window,

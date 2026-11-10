@@ -31,8 +31,8 @@ use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_pack::AssetId;
 use orr_pack::subd::{Page as SubdPage, SubdInfo};
 use orr_scene::testing::{
-    Image, Pixels, assert_clean, assert_clean_on, device, flip, read_buffer, read_texture, wait,
-    wait_on,
+    Image, Pixels, assert_clean, assert_clean_on, device, flip, read_buffer, read_texture,
+    visible_clusters, wait, wait_on,
 };
 use orr_scene::{
     AffineRows, ClusterTopology, Frame, FrameDesc, FrameTime, GeneratedClusterGpu, GroupWriter,
@@ -41,7 +41,7 @@ use orr_scene::{
     ProducerStateGpu, ProducerStats, ProducerUpdate, Projection, RasterView, RendererDesc,
     SceneDesc, SceneId, SceneWriter, Scenes, SubdDesc, TessellationStats, TextureFilter,
     TransformGroupDesc, TransformGroupId, TransparencyPass, ViewDesc, ViewHistoryId,
-    VisibleCluster, material_flags, tessellation,
+    material_flags, tessellation,
 };
 use orr_shaders::bytemuck::Zeroable;
 use scene_suite::shaders::{
@@ -560,8 +560,7 @@ fn clusters_and_vertices_past_capacity_are_dropped_and_counted() {
         &[emit(ProducerId(0), -1.0), emit(ProducerId(3), -3.0)],
         None,
     );
-    let counts: Vec<u32> = read_buffer(view.counts, 1);
-    let clusters: Vec<VisibleCluster> = read_buffer(view.targets.clusters, u64::from(counts[0]));
+    let clusters = visible_clusters(&view);
     let stats = field.stats();
     assert_eq!(stats.entries, 2);
     // 100 vertex runs of 5 into 1280 and 200 vertices; 100 and 40 clusters into 64 and 256.
@@ -653,14 +652,7 @@ fn particles_are_drawn_only_at_the_transparency_point_and_traced_only_under_thei
         },
     ];
     let mut hook = |pass: &mut TransparencyPass<'_, '_>| {
-        let root = pass
-            .put_root(&particle_draw::Root {
-                scene: pass.scene,
-                view: pass.view,
-                raster: pass.raster,
-                _pad: 0,
-            })
-            .unwrap();
+        let (scene, view) = (pass.scene, pass.view);
         pass.cmd.begin_rendering(&Rendering {
             extent: pass.extent,
             colors: &[ColorAttachment {
@@ -670,13 +662,13 @@ fn particles_are_drawn_only_at_the_transparency_point_and_traced_only_under_thei
             }],
             depth: None,
         });
-        pass.cmd.draw_mesh_tasks_indirect_count(
-            &draw,
-            root,
-            pass.particle_args,
-            pass.particle_draws,
-            1,
-        );
+        pass.draw_particles(&draw, |raster| particle_draw::Root {
+            scene,
+            view,
+            raster,
+            _pad: 0,
+        })
+        .unwrap();
         pass.cmd.end_rendering();
     };
     let view = field.frame(&emits, Some((store, &mut hook)));
@@ -1632,8 +1624,7 @@ fn steep_cliffs_draw_stretched_diced_triangles_in_hardware_without_holes() {
         }
         let view = plane.frame(None, eye, target, eye);
         let counts: Vec<u32> = read_buffer(view.counts, 8);
-        let clusters: Vec<VisibleCluster> =
-            read_buffer(view.targets.clusters, u64::from(counts[0]));
+        let clusters = visible_clusters(&view);
         let stats = plane.stats();
         assert_eq!(
             stats.dice_dropped + stats.split_dropped + stats.weld_dropped,

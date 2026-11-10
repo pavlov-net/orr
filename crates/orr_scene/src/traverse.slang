@@ -26,6 +26,7 @@ import orr_gpu.rtas;
 import orr_scene.hit;
 import orr_scene.lights;
 import orr_scene.tables;
+import orr_scene.visibility;
 
 // `TraverseRoot.flags`.
 static const uint TRAVERSE_FOCUS = 1;   // the scene has a focus
@@ -536,11 +537,10 @@ void args(uint3 id: SV_DispatchThreadID)
 {
     CutGpu* cut = root.cut;
     uint pass = root.pass;
-    uint n = min(cut.counters[CUT_QUEUE + pass % 2], cut.queue_capacity);
-    uint* a = cut.args + 3 * pass;
-    a[0] = (n + 63) / 64;
-    a[1] = 1;
-    a[2] = 1;
+    uint pushed = cut.counters[CUT_QUEUE + pass % 2];
+    cut.counters[CUT_QUEUE_PEAK] = max(cut.counters[CUT_QUEUE_PEAK], pushed);
+    uint n = min(pushed, cut.queue_capacity);
+    write_grid(cut.args + 3 * pass, (n + 63) / 64);
     cut.counters[CUT_QUEUE + (pass + 1) % 2] = 0;
 }
 
@@ -680,15 +680,16 @@ bool finer_absent(MeshGpu* mesh, Cluster cl)
 // One thread per item of the pass.
 [shader("compute")]
 [numthreads(64, 1, 1)]
-void traverse(uint3 id: SV_DispatchThreadID)
+void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
 {
     SceneRoot* s = root.scene;
     CutGpu* cut = root.cut;
     uint pass = root.pass;
     uint n = min(cut.counters[CUT_QUEUE + pass % 2], cut.queue_capacity);
-    if (id.x >= n)
+    uint index = grid_index(group) * 64 + thread;
+    if (index >= n)
         return;
-    NodeItem item = cut.queue[pass % 2][id.x];
+    NodeItem item = cut.queue[pass % 2][index];
     uint copy = item.slot;
     uint slot = copy_slot(copy);
     uint mask = item.flags & 3;

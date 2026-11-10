@@ -10,16 +10,17 @@ use std::sync::Arc;
 use bytemuck::Zeroable;
 use orr_gpu::{
     Allocation, ColorTarget, CommandList, CompareOp, DepthAttachment, DepthLoad, DepthTarget,
-    Device, DispatchArgs, Format, Generated, GpuPtr, Hazards, KernelSet, MemoryKind, MeshArgs,
-    MeshPipeline, MeshPipelineDesc, ROOT_ALIGN, RasterState, Rendering, Sequence, ShaderStage,
-    SpecData, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
-    TextureUsage, ViewDesc,
+    Device, DispatchArgs, Format, Generated, GpuPtr, Hazards, KernelSet, MemoryKind,
+    MemoryPriority, MeshArgs, MeshPipeline, MeshPipelineDesc, ROOT_ALIGN, RasterState, Rendering,
+    Sequence, ShaderStage, SpecData, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex,
+    TextureMemory, TextureUsage, ViewDesc,
 };
 
 use crate::arena::{ArenaBuffer, ArenaRequest, ArenaTexture, Span, ViewArena, ViewStep};
 use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::shaders::{cull, hzb, raster, resolve};
+use crate::transparency::ParticleDraws;
 use crate::{
     ClusterWork, GBufferGpu, RasterGpu, RasterRoot, Result, SceneId, SceneRoot, ViewConstants,
     VisibleCluster,
@@ -31,14 +32,18 @@ const RASTER_OCCLUSION: u32 = 1;
 /// `RasterGpu.counts` entries and `RasterGpu.args` offsets (`visibility.slang`).
 const COUNTS: u64 = 18;
 const COUNT_DRAWS: u64 = 3;
-const ARGS: u64 = 21;
+const ARGS: u64 = 9;
 const ARGS_WORK: u64 = 0;
-const ARGS_OPAQUE: u64 = 3;
-const ARGS_ALPHA: u64 = 6;
-const ARGS_SOFTWARE: u64 = 9;
-const ARGS_PARTICLES: u64 = 12;
-const ARGS_COVERAGE: u64 = 15;
-const ARGS_SMOKE: u64 = 18;
+const ARGS_SOFTWARE: u64 = 3;
+const ARGS_SMOKE: u64 = 6;
+/// The lists mesh draws take, in `RasterGpu.draw_args` (`DRAW_*` in `visibility.slang`).
+const DRAW_OPAQUE: u32 = 0;
+const DRAW_ALPHA: u32 = 1;
+const DRAW_COVERAGE: u32 = 2;
+const DRAW_PARTICLES: u32 = 3;
+const DRAW_LISTS: u32 = 4;
+/// Workgroups per row of a workgroup grid (`GRID_X` in `visibility.slang`).
+const GRID_X: u32 = 65535;
 const MAX_HZB_MIPS: u32 = 16;
 /// Pixels per side of a resolve tile and of a layer tile (`LAYER_TILE` in `gbuffer.slang`).
 const TILE: u32 = 8;
@@ -219,28 +224,89 @@ type GBufferTextures = (
     Option<Arc<Texture>>,
 );
 
-/// Sizes of a view's raster buffers.
+/// Sizes of a view's raster targets past its lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TargetSizes {
     pub(crate) extent: [u32; 2],
     pub(crate) extended: bool,
-    pub(crate) visible_clusters: u32,
-    pub(crate) work: u32,
     pub(crate) bins: u32,
     /// The scene's instance slots.
     pub(crate) slots: u32,
 }
 
+/// Capacities of a view's cluster lists, which follow what its frames want.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ListSizes {
+    /// Visible clusters, and so the entries of each raster list.
+    pub(crate) visible_clusters: u32,
+    /// Work the first culling pass leaves to the second.
+    pub(crate) work: u32,
+}
+
+/// Visible clusters a view's list holds at most: a visibility buffer word names one in 25 bits
+/// (`VISIBLE_CLUSTER_MAX`, `gbuffer.slang`).
+pub(crate) const VISIBLE_CLUSTER_LIMIT: u32 = 1 << 25;
+
+/// A view's cluster lists, each in memory of its own, so that a change of capacity leaves the
+/// view's other targets as they are.
+pub(crate) struct ViewLists {
+    pub(crate) sizes: ListSizes,
+    /// Mesh draws over each list they take, and the entries one covers at most.
+    draws: u32,
+    draw_groups: u32,
+    clusters: Allocation<VisibleCluster>,
+    work: Allocation<ClusterWork>,
+    opaque: Allocation<u32>,
+    alpha: Allocation<u32>,
+    software: Allocation<u32>,
+    particles: Allocation<u32>,
+    coverage: Allocation<u32>,
+    smoke: Allocation<u32>,
+    /// Per `DRAW_*` list, its draws' workgroups.
+    draw_args: Allocation<MeshArgs>,
+}
+
+impl ViewLists {
+    pub(crate) fn new(device: &Device, sizes: ListSizes) -> Result<Self> {
+        let (dl, high) = (MemoryKind::DeviceLocal, MemoryPriority::High);
+        let n = |c: u32| u64::from(c.max(1));
+        let visible = n(sizes.visible_clusters);
+        let list = |name| device.gpu_malloc_with_priority::<u32>(dl, high, visible, name);
+        // A grid fills whole rows, so a draw covers whole rows within the device's limit.
+        let rows = device.caps().limits.max_mesh_draw_groups / GRID_X;
+        let draw_groups = rows * GRID_X;
+        let draws = sizes.visible_clusters.div_ceil(draw_groups).max(1);
+        Ok(Self {
+            sizes,
+            draws,
+            draw_groups,
+            clusters: device.gpu_malloc_with_priority(dl, high, visible, "visible clusters")?,
+            work: device.gpu_malloc_with_priority(dl, high, n(sizes.work), "cluster work")?,
+            opaque: list("opaque clusters")?,
+            alpha: list("alpha clusters")?,
+            software: list("software clusters")?,
+            particles: list("particle clusters")?,
+            coverage: list("coverage clusters")?,
+            smoke: list("smoke clusters")?,
+            draw_args: device.gpu_malloc_with_priority(
+                dl,
+                high,
+                u64::from(DRAW_LISTS * draws),
+                "cluster draw args",
+            )?,
+        })
+    }
+
+    /// The workgroups of draw `i` over list `list` (`DRAW_*`).
+    fn draw_args(&self, list: u32, i: u32) -> GpuPtr<MeshArgs> {
+        self.draw_args
+            .gpu()
+            .offset(u64::from(list * self.draws + i))
+    }
+}
+
 /// Arena names of the raster's transient targets.
 const VISIBILITY: &str = "visibility buffer";
-const CLUSTERS: &str = "visible clusters";
-const WORK: &str = "cluster work";
-const OPAQUE: &str = "opaque clusters";
-const ALPHA: &str = "alpha clusters";
-const SOFTWARE: &str = "software clusters";
-const PARTICLES: &str = "particle clusters";
-const COVERAGE: &str = "coverage clusters";
-const SMOKE: &str = "smoke clusters";
 const LAYER_TILES: &str = "layer tiles";
 const BIN_ARGS: &str = "bin args";
 const BIN_TILES: &str = "bin tiles";
@@ -252,7 +318,7 @@ const GBUF_X: &str = "gbuf_x";
 const GBUF_Y: &str = "gbuf_y";
 const OVERLAY: &str = "transparency overlay";
 
-/// Raster's working lists and the depth it resolves, which only the raster half reads.
+/// Raster's bins and the depth it resolves, which only the raster half reads.
 const CULL: Span = Span::new(ViewStep::Raster, ViewStep::Raster);
 /// The G-buffer and what `load_gsurface` and the transparency point read beside it.
 const GBUFFER: Span = Span::new(ViewStep::Raster, ViewStep::Transparency);
@@ -263,14 +329,6 @@ const OVERLAY_SPAN: Span = Span::new(ViewStep::Transparency, ViewStep::Rr);
 struct Transient {
     generation: u64,
     visibility: ArenaBuffer,
-    clusters: ArenaBuffer,
-    work: ArenaBuffer,
-    opaque: ArenaBuffer,
-    alpha: ArenaBuffer,
-    software: ArenaBuffer,
-    particles: ArenaBuffer,
-    smoke: ArenaBuffer,
-    coverage: ArenaBuffer,
     layer_tiles: ArenaBuffer,
     bin_args: ArenaBuffer,
     bin_tiles: ArenaBuffer,
@@ -290,14 +348,6 @@ impl Transient {
         Self {
             generation: arena.generation(),
             visibility: buffer(VISIBILITY),
-            clusters: buffer(CLUSTERS),
-            work: buffer(WORK),
-            opaque: buffer(OPAQUE),
-            alpha: buffer(ALPHA),
-            software: buffer(SOFTWARE),
-            particles: buffer(PARTICLES),
-            smoke: buffer(SMOKE),
-            coverage: buffer(COVERAGE),
             layer_tiles: buffer(LAYER_TILES),
             bin_args: buffer(BIN_ARGS),
             bin_tiles: buffer(BIN_TILES),
@@ -341,19 +391,10 @@ impl ViewTargets {
         let [w, h] = s.extent;
         let pixels = u64::from(w) * u64::from(h);
         let [tx, ty] = tiles(s.extent);
-        let clusters = u64::from(s.visible_clusters);
-        let list = 4 * clusters;
         let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
         let d2 = |format| TextureDesc::d2(format, w, h, usage);
         let mut r = vec![
             ArenaRequest::buffer(VISIBILITY, 8 * pixels, GBUFFER),
-            ArenaRequest::buffer(
-                CLUSTERS,
-                size_of::<VisibleCluster>() as u64 * clusters,
-                GBUFFER,
-            ),
-            ArenaRequest::buffer(PARTICLES, list, GBUFFER),
-            ArenaRequest::buffer(SMOKE, list, GBUFFER),
             // Then the word marking every tile.
             ArenaRequest::buffer(
                 LAYER_TILES,
@@ -362,15 +403,6 @@ impl ViewTargets {
             ),
             ArenaRequest::texture(GBUF_A, d2(Format::Rgba32Uint), GBUFFER),
             ArenaRequest::texture(GBUF_B, d2(Format::Rg32Uint), GBUFFER),
-            ArenaRequest::buffer(
-                WORK,
-                size_of::<ClusterWork>() as u64 * u64::from(s.work),
-                CULL,
-            ),
-            ArenaRequest::buffer(OPAQUE, list, CULL),
-            ArenaRequest::buffer(ALPHA, list, CULL),
-            ArenaRequest::buffer(SOFTWARE, list, CULL),
-            ArenaRequest::buffer(COVERAGE, list, CULL),
             // Then the sequence count.
             ArenaRequest::buffer(BIN_ARGS, 12 * u64::from(s.bins) + 4, CULL),
             ArenaRequest::buffer(
@@ -459,11 +491,11 @@ impl ViewTargets {
         }
     }
 
-    pub(crate) fn gbuffer(&self) -> GBufferGpu {
+    pub(crate) fn gbuffer(&self, lists: &ViewLists) -> GBufferGpu {
         let t = &self.transient;
         GBufferGpu {
             visibility: t.visibility.gpu(),
-            clusters: t.clusters.gpu(),
+            clusters: lists.clusters.gpu(),
             depth: self.depth.sampled,
             a: t.a.sampled(),
             b: t.b.sampled(),
@@ -495,6 +527,7 @@ impl ViewTargets {
 
     fn record(
         &self,
+        lists: &ViewLists,
         software_pixels: f32,
         occlusion: bool,
         slots: u32,
@@ -505,15 +538,16 @@ impl ViewTargets {
         hzb[..self.hzb.storage.len()].copy_from_slice(&self.hzb.storage);
         let t = &self.transient;
         RasterGpu {
-            gbuffer: self.gbuffer(),
-            work: t.work.gpu(),
+            gbuffer: self.gbuffer(lists),
+            work: lists.work.gpu(),
             args: self.args.gpu(),
-            opaque: t.opaque.gpu(),
-            alpha: t.alpha.gpu(),
-            software: t.software.gpu(),
-            particles: t.particles.gpu(),
-            coverage: t.coverage.gpu(),
-            smoke: t.smoke.gpu(),
+            draw_args: lists.draw_args.gpu().cast(),
+            opaque: lists.opaque.gpu(),
+            alpha: lists.alpha.gpu(),
+            software: lists.software.gpu(),
+            particles: lists.particles.gpu(),
+            coverage: lists.coverage.gpu(),
+            smoke: lists.smoke.gpu(),
             counts: self.counts(),
             slot_visibility: self.slot_visibility.gpu(),
             bin_args: t.bin_args.gpu(),
@@ -533,13 +567,17 @@ impl ViewTargets {
             hzb,
             tiles_x: tx,
             tile_capacity: tx * ty,
-            work_capacity: self.sizes.work,
-            visible_capacity: self.sizes.visible_clusters,
+            work_capacity: lists.sizes.work,
+            visible_capacity: lists.sizes.visible_clusters,
             bins: self.sizes.bins,
             software_pixels,
             flags: if occlusion { RASTER_OCCLUSION } else { 0 },
             slots,
             hzb_mips: self.hzb.storage.len() as u32,
+            draws: lists.draws,
+            draw_groups: lists.draw_groups,
+            draw_first: 0,
+            _pad: 0,
         }
     }
 
@@ -560,12 +598,21 @@ impl ViewTargets {
         &self.transient.overlay
     }
 
-    /// Mesh args of the particle draws, and the draw count beside them.
-    pub(crate) fn particle_draws(&self) -> (GpuPtr<MeshArgs>, GpuPtr<u32>) {
-        (
-            self.args.gpu().offset(ARGS_PARTICLES).cast(),
-            self.counts().offset(COUNT_DRAWS),
-        )
+    /// The mesh draws over the particle list: each takes the record of `draws` at its
+    /// index, those [`record`] gave.
+    pub(crate) fn particle_draws(
+        &self,
+        lists: &ViewLists,
+        draws: &[GpuPtr<RasterGpu>],
+    ) -> Vec<ParticleDraws> {
+        (0..lists.draws)
+            .zip(draws)
+            .map(|(i, &raster)| ParticleDraws {
+                raster,
+                args: lists.draw_args(DRAW_PARTICLES, i),
+                count: self.counts().offset(COUNT_DRAWS),
+            })
+            .collect()
     }
 
     /// Workgroups of one per visible smoke cluster.
@@ -608,7 +655,8 @@ fn bin_root(roots: GpuPtr<RasterRoot>, bin: u32) -> GpuPtr<RasterRoot> {
 
 /// Records one view's raster half into `list`. With `occlusion` the first pass tests the
 /// previous frame's HZB, which the view's previous render left. `preprocess` is memory of
-/// [`RasterPipelines::preprocess_layout`], when it gives one.
+/// [`RasterPipelines::preprocess_layout`], when it gives one. Returns the raster record of
+/// each mesh draw over a list, the first of which every other pass takes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record(
     device: &Device,
@@ -617,6 +665,7 @@ pub(crate) fn record(
     window: &UploadWindow,
     list: &mut CommandList<'_>,
     targets: &ViewTargets,
+    lists: &ViewLists,
     scene: GpuPtr<SceneRoot>,
     slots: u32,
     producer_capacity: u32,
@@ -624,7 +673,7 @@ pub(crate) fn record(
     software_pixels: f32,
     occlusion: bool,
     preprocess: Option<GpuPtr<u8>>,
-) -> Result<GpuPtr<RasterGpu>> {
+) -> Result<Vec<GpuPtr<RasterGpu>>> {
     let s = targets.sizes;
     let (raster, record) = window.slice::<RasterGpu>(device, 1)?;
     let root_of = |value| RasterRoot {
@@ -636,7 +685,31 @@ pub(crate) fn record(
     };
     // The bins' roots; bin 0's is also the root of every pass with value 0.
     let roots = window.put_roots(device, s.bins, root_of)?;
-    record[0] = targets.record(software_pixels, occlusion, slots, roots);
+    record[0] = targets.record(lists, software_pixels, occlusion, slots, roots);
+    let first = record[0];
+    let mut draws = vec![raster];
+    for i in 1..lists.draws {
+        let (at, r) = window.slice::<RasterGpu>(device, 1)?;
+        r[0] = RasterGpu {
+            draw_first: i * lists.draw_groups,
+            ..first
+        };
+        draws.push(at);
+    }
+    // Per draw over a list, the roots of its opaque or coverage draw and of its alpha draw.
+    let draw_roots = draws
+        .iter()
+        .map(|&raster| {
+            let at = |value| RasterRoot {
+                raster,
+                ..root_of(value)
+            };
+            Ok([
+                window.put_root(device, &at(0))?,
+                window.put_root(device, &at(1))?,
+            ])
+        })
+        .collect::<Result<Vec<_>>>()?;
     let root = |value| window.put_root(device, &root_of(value));
     let r0 = roots;
     let r1 = root(1)?;
@@ -644,8 +717,7 @@ pub(crate) fn record(
     let [tx, ty] = tiles(s.extent);
     let args = targets.args.gpu();
     let grid = |at: u64| args.offset(at).cast::<DispatchArgs>();
-    let mesh_args = |at: u64| args.offset(at).cast::<MeshArgs>();
-    let draws = targets.counts().offset(COUNT_DRAWS);
+    let one = targets.counts().offset(COUNT_DRAWS);
     let rendering = Rendering {
         extent: s.extent,
         colors: &[],
@@ -671,8 +743,14 @@ pub(crate) fn record(
     let draw = |list: &mut CommandList<'_>| {
         list.dispatch_indirect(pipelines.get(p.software), r0, grid(ARGS_SOFTWARE));
         list.begin_rendering(&rendering);
-        list.draw_mesh_tasks_indirect_count(&p.opaque, r0, mesh_args(ARGS_OPAQUE), draws, 1);
-        list.draw_mesh_tasks_indirect_count(&p.alpha, r1, mesh_args(ARGS_ALPHA), draws, 1);
+        for (i, [opaque, alpha]) in (0..).zip(&draw_roots) {
+            let (o, a) = (
+                lists.draw_args(DRAW_OPAQUE, i),
+                lists.draw_args(DRAW_ALPHA, i),
+            );
+            list.draw_mesh_tasks_indirect_count(&p.opaque, *opaque, o, one, 1);
+            list.draw_mesh_tasks_indirect_count(&p.alpha, *alpha, a, one, 1);
+        }
         list.end_rendering();
         list.barrier(
             raster_stages | Stages::COMPUTE,
@@ -718,7 +796,10 @@ pub(crate) fn record(
         Hazards::DRAW_ARGUMENTS,
     );
     list.begin_rendering(&rendering);
-    list.draw_mesh_tasks_indirect_count(&p.coverage, r0, mesh_args(ARGS_COVERAGE), draws, 1);
+    for (i, [coverage, _]) in (0..).zip(&draw_roots) {
+        let args = lists.draw_args(DRAW_COVERAGE, i);
+        list.draw_mesh_tasks_indirect_count(&p.coverage, *coverage, args, one, 1);
+    }
     list.end_rendering();
     list.end_pass();
     list.barrier(raster_stages, Stages::COMPUTE, Hazards::empty());
@@ -777,7 +858,7 @@ pub(crate) fn record(
     list.end_rendering();
     list.end_pass();
     list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
-    Ok(raster)
+    Ok(draws)
 }
 
 /// Builds the HZB's mips from mip 0, after `seed` writes mip 0 from the visibility buffer

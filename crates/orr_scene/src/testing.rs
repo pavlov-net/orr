@@ -114,6 +114,17 @@ pub fn read_buffer_on<T: Pod>(d: &Device, src: GpuPtr<T>, count: u64) -> Vec<T> 
 }
 
 /// Copies `region` of `t` back to the CPU, tightly packed, after all work submitted so far.
+/// The visible clusters `view`'s culling wrote. Its count holds those past the list's capacity
+/// too.
+pub fn visible_clusters(view: &crate::RasterView) -> Vec<crate::VisibleCluster> {
+    let count = read_buffer(view.counts, 1)[0];
+    let raster: crate::RasterGpu = read_buffer(view.raster, 1)[0];
+    let n = count.min(raster.visible_capacity);
+    let mut clusters = read_buffer(view.targets.clusters, u64::from(n.max(1)));
+    clusters.truncate(n as usize);
+    clusters
+}
+
 pub fn read_texture(t: &Texture, region: &TextureRegion) -> Vec<u8> {
     read_texture_on(device(), t, region)
 }
