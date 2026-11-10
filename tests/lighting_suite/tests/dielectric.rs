@@ -383,7 +383,9 @@ fn a_glass_sphere_in_a_furnace_keeps_its_energy() {
 
 /// A white diffuse sphere beside a clear glass one in a uniform environment returns the
 /// environment on its side that faces the glass, in real time and in the reference: the light
-/// it takes through the glass, where shadow rays end, comes in full by BSDF rays.
+/// it takes through the glass, where shadow rays end, comes in full by BSDF rays. The window's
+/// pixels read at most four light tiles between them in a frame, so its mean settles slowly:
+/// the frames are as many as put the 1% several times past its spread.
 #[test]
 fn a_diffuse_sphere_beside_glass_in_a_furnace_returns_the_environment() {
     let white = Vec3::new(-1.1, 0.0, 0.0);
@@ -410,7 +412,7 @@ fn a_diffuse_sphere_beside_glass_in_a_furnace_returns_the_environment() {
         ..reference(8)
     };
     for (what, settings) in [("real time", real_time), ("reference", truth)] {
-        let image = render_paths(&mut bed, &paths(settings), 32);
+        let image = render_paths(&mut bed, &paths(settings), 512);
         let got = image.around(facing, 4);
         assert_close(what, got, FURNACE_RADIANCE.map(f64::from), 0.01);
     }
