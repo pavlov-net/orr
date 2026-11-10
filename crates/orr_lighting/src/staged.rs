@@ -9,7 +9,7 @@ use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, DispatchArgs, GpuPtr, Hazards, MemoryKind,
     RayDispatchPipeline, ShaderModule, ShaderStage, SpecData, Stages,
 };
-use orr_scene::{JobResult, Loading, Urgency};
+use orr_scene::{JobResult, Loading, SceneFeatures, Urgency};
 use orr_shaders::abi::SpecEntry;
 
 use crate::shaders::path::staged::{
@@ -64,43 +64,57 @@ const FEATURE_RAY_SHADES: u32 = 1 << 3;
 /// The id of `specialize.slang`'s `path_may`, and its bits: what the paths of a pipeline may
 /// meet.
 pub(crate) const PATH_MAY_ID: u32 = 110;
-pub(crate) const MAY_STACK: u32 = 1 << 0;
-pub(crate) const MAY_DISPERSION: u32 = 1 << 1;
-pub(crate) const MAY_CAUSTICS: u32 = 1 << 2;
-const MAY_VIEW: u32 = 1 << 3;
-const MAY_BACKGROUND: u32 = 1 << 4;
-const MAY_UPDATE: u32 = 1 << 5;
-const MAY_PHOTON: u32 = 1 << 6;
-pub(crate) const MAY_DEBUG: u32 = 1 << 7;
-pub(crate) const MAY_REFERENCE: u32 = 1 << 8;
-pub(crate) const MAY_FROST: u32 = 1 << 9;
-pub(crate) const MAY_LENS: u32 = 1 << 10;
-pub(crate) const MAY_WALK: u32 = 1 << 11;
-pub(crate) const MAY_LOCAL: u32 = 1 << 12;
-pub(crate) const MAY_FROXELS: u32 = 1 << 13;
-pub(crate) const MAY_CACHE: u32 = 1 << 14;
-pub(crate) const MAY_COAT: u32 = 1 << 15;
-pub(crate) const MAY_FUZZ: u32 = 1 << 16;
-pub(crate) const MAY_FILM: u32 = 1 << 17;
-pub(crate) const MAY_SUBSURFACE: u32 = 1 << 18;
+/// The specialization entries of a mask: its low word is `path_may` and its high word
+/// `scene_may.slang`'s `path_may2`, what a scene's surface evaluations and hits may meet.
+pub(crate) const SPEC_ENTRIES: [SpecEntry; 2] = [
+    SpecEntry {
+        constant_id: PATH_MAY_ID,
+        offset: 0,
+        size: 4,
+    },
+    SpecEntry {
+        constant_id: SceneFeatures::SURFACE_MAY_ID,
+        offset: 4,
+        size: 4,
+    },
+];
+pub(crate) const MAY_STACK: u64 = 1 << 0;
+pub(crate) const MAY_DISPERSION: u64 = 1 << 1;
+pub(crate) const MAY_CAUSTICS: u64 = 1 << 2;
+const MAY_VIEW: u64 = 1 << 3;
+const MAY_BACKGROUND: u64 = 1 << 4;
+const MAY_UPDATE: u64 = 1 << 5;
+const MAY_PHOTON: u64 = 1 << 6;
+pub(crate) const MAY_DEBUG: u64 = 1 << 7;
+pub(crate) const MAY_REFERENCE: u64 = 1 << 8;
+pub(crate) const MAY_FROST: u64 = 1 << 9;
+pub(crate) const MAY_LENS: u64 = 1 << 10;
+pub(crate) const MAY_WALK: u64 = 1 << 11;
+pub(crate) const MAY_LOCAL: u64 = 1 << 12;
+pub(crate) const MAY_FROXELS: u64 = 1 << 13;
+pub(crate) const MAY_CACHE: u64 = 1 << 14;
+pub(crate) const MAY_COAT: u64 = 1 << 15;
+pub(crate) const MAY_FUZZ: u64 = 1 << 16;
+pub(crate) const MAY_FILM: u64 = 1 << 17;
+pub(crate) const MAY_SUBSURFACE: u64 = 1 << 18;
 /// The lobes a plain surface lacks, which the opaque shade stage is compiled without; and what
 /// goes with them: only a subsurface vertex starts a walk.
-const MAY_LOBES: u32 = MAY_COAT | MAY_FUZZ | MAY_FILM | MAY_SUBSURFACE;
-const MAY_RICH: u32 = MAY_LOBES | MAY_WALK;
-pub(crate) const MAY_INTERIORS: u32 = 1 << 19;
-pub(crate) const MAY_LAYERS: u32 = 1 << 20;
-pub(crate) const MAY_COVERAGE: u32 = 1 << 21;
-pub(crate) const MAY_PARTICLES: u32 = 1 << 22;
-pub(crate) const MAY_LOCAL_LIGHTS: u32 = 1 << 23;
-pub(crate) const MAY_DIRECTIONAL: u32 = 1 << 24;
-pub(crate) const MAY_EMISSIVE: u32 = 1 << 25;
-pub(crate) const MAY_PROXIES: u32 = 1 << 30;
-pub(crate) const MAY_SMOKE: u32 = 1 << 31;
+const MAY_LOBES: u64 = MAY_COAT | MAY_FUZZ | MAY_FILM | MAY_SUBSURFACE;
+const MAY_RICH: u64 = MAY_LOBES | MAY_WALK;
+pub(crate) const MAY_INTERIORS: u64 = 1 << 19;
+pub(crate) const MAY_LAYERS: u64 = 1 << 20;
+pub(crate) const MAY_COVERAGE: u64 = 1 << 21;
+pub(crate) const MAY_PARTICLES: u64 = 1 << 22;
+pub(crate) const MAY_LOCAL_LIGHTS: u64 = 1 << 23;
+pub(crate) const MAY_DIRECTIONAL: u64 = 1 << 24;
+pub(crate) const MAY_EMISSIVE: u64 = 1 << 25;
+pub(crate) const MAY_PROXIES: u64 = 1 << 30;
+pub(crate) const MAY_SMOKE: u64 = 1 << 31;
 /// What gives the other shade stage a vertex: a layer, or a scatter in or a way out of an
 /// interior.
-const MAY_OTHER: u32 = MAY_LAYERS | MAY_INTERIORS;
+const MAY_OTHER: u64 = MAY_LAYERS | MAY_INTERIORS;
 /// Everything: what a pipeline made without a value may meet.
-pub(crate) const MAY_ALL: u32 = u32::MAX;
+pub(crate) const MAY_ALL: u64 = u64::MAX;
 
 /// A path source's start stage. Update paths have no stages of their own: they ride in their
 /// view's.
@@ -123,7 +137,7 @@ impl Source {
     }
 
     /// `specialize.slang`'s bit of a pipeline that may run its paths.
-    pub(crate) fn may(self) -> u32 {
+    pub(crate) fn may(self) -> u64 {
         match self {
             Self::View => MAY_VIEW,
             Self::Background => MAY_BACKGROUND,
@@ -210,7 +224,7 @@ impl Stage {
     }
 
     /// What its pipeline in a set for `may` may meet: the opaque stage's surfaces are plain.
-    fn may(self, may: u32) -> u32 {
+    fn may(self, may: u64) -> u64 {
         match self {
             Self::Opaque => may & !MAY_RICH,
             _ => may,
@@ -247,19 +261,16 @@ fn compile_stage(
     device: &Device,
     kernels: &KernelSet,
     stage: Stage,
-    may: u32,
+    may: u64,
     rays: bool,
 ) -> Result<StagePipeline, Error> {
     let (own, entry, name) = stage.source();
     let m = module(kernels, own)?;
     let may = stage.may(may);
+    // The low word is `path_may` and the high one `path_may2`.
     let bytes = may.to_le_bytes();
     let spec = SpecData {
-        entries: &[SpecEntry {
-            constant_id: PATH_MAY_ID,
-            offset: 0,
-            size: 4,
-        }],
+        entries: &SPEC_ENTRIES,
         bytes: &bytes,
     };
     let started = Instant::now();
@@ -392,7 +403,7 @@ impl<T: Send + 'static> Late<T> {
 
 /// The stage pipelines for one value of `path_may`, each made when a source first asks for it.
 pub(crate) struct StageSet {
-    may: u32,
+    may: u64,
     stages: [Late<StagePipeline>; STAGES],
     /// When a view last asked for it or a frame last ran it.
     used: Mutex<Instant>,
@@ -402,7 +413,7 @@ pub(crate) struct StageSet {
 
 /// A mask a view asks pipelines for: since when without a break, and when last.
 struct Wanted {
-    may: u32,
+    may: u64,
     since: Instant,
     seen: Instant,
 }
@@ -418,7 +429,7 @@ const IDLE: Duration = Duration::from_secs(1);
 const KEEP: Duration = Duration::from_secs(10);
 
 impl StageSet {
-    fn new(may: u32) -> Self {
+    fn new(may: u64) -> Self {
         let late = |stage: Stage| Late::new(stage.source().2);
         Self {
             may,
@@ -447,7 +458,7 @@ impl StageSet {
     /// The stages a set for `may` runs for a source with `stages`: with the rich opaque stage
     /// where its surfaces may have lobes a plain one lacks, and without the other shade stage
     /// where nothing gives it a vertex.
-    fn runs(may: u32, stages: &[Stage]) -> Vec<Stage> {
+    fn runs(may: u64, stages: &[Stage]) -> Vec<Stage> {
         let mut out: Vec<_> = stages
             .iter()
             .copied()
@@ -523,7 +534,7 @@ impl StagedKernels {
     }
 
     /// The set made for exactly `may`.
-    fn set(&self, may: u32) -> Arc<StageSet> {
+    fn set(&self, may: u64) -> Arc<StageSet> {
         let mut sets = self.sets.lock().unwrap();
         if let Some(set) = sets.iter().find(|s| s.may == may) {
             return Arc::clone(set);
@@ -534,7 +545,7 @@ impl StagedKernels {
     }
 
     /// Starts the compiles of `stages` for exactly `may` that have not started.
-    fn request(&self, may: u32, stages: &[Stage], urgency: Urgency) -> Arc<StageSet> {
+    fn request(&self, may: u64, stages: &[Stage], urgency: Urgency) -> Arc<StageSet> {
         let set = self.set(may);
         for stage in StageSet::runs(may, stages) {
             let (kernels, rays) = (self.kernels, self.rays);
@@ -548,7 +559,7 @@ impl StagedKernels {
 
     /// Notes that a view asks for `may` now, and says whether it has asked for it without a
     /// break for [`STABLE`].
-    fn note(&self, may: u32, now: Instant) -> bool {
+    fn note(&self, may: u64, now: Instant) -> bool {
         let mut wanted = self.wanted.lock().unwrap();
         wanted.retain(|w| now.duration_since(w.seen) <= IDLE);
         match wanted.iter_mut().find(|w| w.may == may) {
@@ -571,8 +582,8 @@ impl StagedKernels {
     /// its pipelines to hold `asked` is about to run: [`chosen`] of them.
     fn covering(
         &self,
-        may: u32,
-        asked: u32,
+        may: u64,
+        asked: u64,
         stages: &[Stage],
         now: Instant,
     ) -> Option<Arc<StageSet>> {
@@ -586,7 +597,7 @@ impl StagedKernels {
 
     /// The set asked to hold `stages` for paths that may meet `may` with the least beyond it,
     /// ready or not.
-    fn compiling(&self, may: u32, stages: &[Stage]) -> Option<Arc<StageSet>> {
+    fn compiling(&self, may: u64, stages: &[Stage]) -> Option<Arc<StageSet>> {
         let sets = self.sets.lock().unwrap();
         sets.iter()
             .filter(|s| s.may & may == may && s.started(stages))
@@ -601,7 +612,7 @@ impl StagedKernels {
     /// frame finds it. A set's pipelines go with its last holder, and its compiles that no
     /// thread has started are canceled.
     fn prune(&self, now: Instant) {
-        let wanted: Vec<u32> = self.wanted.lock().unwrap().iter().map(|w| w.may).collect();
+        let wanted: Vec<u64> = self.wanted.lock().unwrap().iter().map(|w| w.may).collect();
         let mut sets = self.sets.lock().unwrap();
         let state: Vec<_> = sets
             .iter()
@@ -618,7 +629,7 @@ impl StagedKernels {
     /// some are ready. With none ready, those for exactly `may` compile at once; with a ready
     /// set that holds more, they compile behind everything else once the view has asked for
     /// `may` for [`STABLE`]. An error where one made for `may` failed to compile.
-    pub(crate) fn prepare(&self, may: u32, stages: &[Stage]) -> Result<bool, Error> {
+    pub(crate) fn prepare(&self, may: u64, stages: &[Stage]) -> Result<bool, Error> {
         let now = Instant::now();
         let stable = self.note(may, now);
         let covering = self.covering(may, may, stages, now);
@@ -661,7 +672,7 @@ impl StagedKernels {
     /// else is ready. The set stays while the caller holds what this returns, which it does
     /// until its frame has recorded: other views' frames let go of a set no frame has run for
     /// [`KEEP`], however long the caller takes to record its own.
-    pub(crate) fn wait_exact(&self, may: u32, stages: &[Stage]) -> Result<Arc<StageSet>, Error> {
+    pub(crate) fn wait_exact(&self, may: u64, stages: &[Stage]) -> Result<Arc<StageSet>, Error> {
         self.note(may, Instant::now());
         let set = self.request(may, stages, Urgency::Needed);
         for stage in StageSet::runs(may, stages) {
@@ -676,7 +687,7 @@ impl StagedKernels {
     /// Pipelines that hold `stages` for paths that may meet `may`, which a frame of a view that
     /// asked for `asked` runs now: the ready ones [`chosen`] names, or with none ready those
     /// made for `may`, after waiting for them with queued jobs running on this thread meanwhile.
-    fn wait(&self, may: u32, asked: u32, stages: &[Stage]) -> Result<Arc<StageSet>, Error> {
+    fn wait(&self, may: u64, asked: u64, stages: &[Stage]) -> Result<Arc<StageSet>, Error> {
         let now = Instant::now();
         self.note(may, now);
         if let Some(set) = self.covering(may, asked, stages, now) {
@@ -871,7 +882,7 @@ pub(crate) struct SourcePaths<'a> {
     pub(crate) memory: &'a StagedMemory,
     pub(crate) root: &'a PathRoot,
     pub(crate) source: Source,
-    pub(crate) may: u32,
+    pub(crate) may: u64,
     pub(crate) items: u32,
     pub(crate) rounds: u32,
     pub(crate) passes: u32,
@@ -898,7 +909,7 @@ struct Step {
 /// one that holds nothing beyond what the view asked for, where there is one, so that a source
 /// runs its view's pipelines and not another view's that happen to hold as little; and of those
 /// the one that holds least.
-fn chosen(sets: impl Iterator<Item = u32>, may: u32, asked: u32) -> Option<usize> {
+fn chosen(sets: impl Iterator<Item = u64>, may: u64, asked: u64) -> Option<usize> {
     sets.enumerate()
         .filter(|(_, set)| set & may == may)
         .min_by_key(|(_, set)| (set & !asked != 0, set.count_ones()))
@@ -907,7 +918,7 @@ fn chosen(sets: impl Iterator<Item = u32>, may: u32, asked: u32) -> Option<usize
 
 /// Which sets [`StagedKernels::prune`] keeps, of sets given by their mask, when they first held
 /// what a view asked and when they were last used, while views ask for `wanted`.
-fn kept(sets: &[(u32, Option<Instant>, Instant)], wanted: &[u32], now: Instant) -> Vec<bool> {
+fn kept(sets: &[(u64, Option<Instant>, Instant)], wanted: &[u64], now: Instant) -> Vec<bool> {
     sets.iter()
         .enumerate()
         .map(|(own, &(may, ready, used))| {
@@ -1031,7 +1042,7 @@ pub(crate) struct StagedMemory {
     /// meanwhile outlives the commands that run it.
     held: Mutex<Vec<Arc<StageSet>>>,
     /// What the view asked its last frame's pipelines to hold.
-    asked: std::sync::atomic::AtomicU32,
+    asked: std::sync::atomic::AtomicU64,
     /// Scratch: frames begun, for `ORR_SCRATCH_QUEUE_COUNTS`.
     frames: std::sync::atomic::AtomicU32,
     header: Allocation<PathStages>,
@@ -1109,7 +1120,7 @@ impl StagedMemory {
             rows,
             parts,
             held: Mutex::new(Vec::new()),
-            asked: std::sync::atomic::AtomicU32::new(0),
+            asked: std::sync::atomic::AtomicU64::new(0),
             frames: std::sync::atomic::AtomicU32::new(0),
             header,
             queues,
@@ -1123,7 +1134,7 @@ impl StagedMemory {
 
     /// Starts a frame of the view, whose sources ask together for pipelines that hold `asked`:
     /// the last one's commands have been submitted.
-    pub(crate) fn begin_frame(&self, asked: u32) {
+    pub(crate) fn begin_frame(&self, asked: u64) {
         self.held.lock().unwrap().clear();
         self.asked
             .store(asked, std::sync::atomic::Ordering::Relaxed);
@@ -1151,13 +1162,13 @@ impl StagedMemory {
         self.held.lock().unwrap().push(Arc::clone(set));
     }
 
-    fn asked(&self) -> u32 {
+    fn asked(&self) -> u64 {
         self.asked.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// What the view asked its last frame's pipelines to hold, and what each set a source of
     /// that frame ran was made to hold.
-    pub(crate) fn ran(&self) -> (u32, Vec<u32>) {
+    pub(crate) fn ran(&self) -> (u64, Vec<u64>) {
         let held = self.held.lock().unwrap();
         (self.asked(), held.iter().map(|set| set.may).collect())
     }

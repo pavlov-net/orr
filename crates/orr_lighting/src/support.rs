@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use orr_scene::orr_gpu::{ComputePipeline, Device, ShaderModule, ShaderStage, SpecData};
-use orr_scene::{Loading, Urgency};
+use orr_scene::{Loading, SceneFeatures, Urgency};
 use orr_shaders::abi::SpecEntry;
 
 use crate::media::links_medium;
@@ -79,14 +79,17 @@ fn compile(
     device: &Device,
     kernels: &KernelSet,
     kernel: Masked,
-    may: u32,
+    may: u64,
 ) -> Result<ComputePipeline, Error> {
     let (own, entries, mut bytes, name) = kernel.source();
-    let at = entries
-        .iter()
-        .find(|e| e.constant_id == PATH_MAY_ID)
-        .expect("a masked support kernel takes the mask");
-    bytes[at.offset as usize..][..4].copy_from_slice(&may.to_le_bytes());
+    // The mask's low word is `path_may`, which every masked kernel takes, and its high word
+    // `path_may2`, which a kernel takes where it evaluates surfaces or resolves hits.
+    let word = |id| entries.iter().find(|e| e.constant_id == id);
+    let at = word(PATH_MAY_ID).expect("a masked support kernel takes the mask");
+    bytes[at.offset as usize..][..4].copy_from_slice(&(may as u32).to_le_bytes());
+    if let Some(at) = word(SceneFeatures::SURFACE_MAY_ID) {
+        bytes[at.offset as usize..][..4].copy_from_slice(&((may >> 32) as u32).to_le_bytes());
+    }
     let spec = SpecData {
         entries,
         bytes: &bytes,
@@ -131,7 +134,7 @@ impl Runs {
 #[derive(Clone, Copy)]
 pub(crate) struct MaskedFrame<'a> {
     pub(crate) kernels: &'a MaskedSupport,
-    pub(crate) may: u32,
+    pub(crate) may: u64,
 }
 
 impl MaskedFrame<'_> {
@@ -143,12 +146,12 @@ impl MaskedFrame<'_> {
 
 /// The masked kernels' pipelines for one mask, each made when a view first runs it.
 pub(crate) struct SupportSet {
-    may: u32,
+    may: u64,
     pipelines: [Late<ComputePipeline>; 4],
 }
 
 impl SupportSet {
-    fn new(may: u32) -> Self {
+    fn new(may: u64) -> Self {
         Self {
             may,
             pipelines: MASKED.map(|k| Late::new(k.source().3)),
@@ -217,7 +220,7 @@ impl MaskedSupport {
         self.particle_lighting.load(Ordering::Relaxed)
     }
 
-    fn set(&self, may: u32) -> Arc<SupportSet> {
+    fn set(&self, may: u64) -> Arc<SupportSet> {
         let mut sets = self.sets.lock().unwrap();
         if let Some(set) = sets.iter().find(|s| s.may == may) {
             return Arc::clone(set);
@@ -251,7 +254,7 @@ impl MaskedSupport {
     /// side has, and behind those the ones that may meet everything where `general`: they run a
     /// scene that comes to hold more than its own were made for. Says whether pipelines that
     /// hold `may` are ready for all of `runs`.
-    pub(crate) fn ask(&self, may: u32, runs: Runs, general: bool) -> Result<bool, Error> {
+    pub(crate) fn ask(&self, may: u64, runs: Runs, general: bool) -> Result<bool, Error> {
         let exact = self.set(may);
         self.start(&exact, runs, Urgency::Needed);
         Self::failure(&exact, runs)?;
@@ -278,7 +281,7 @@ impl MaskedSupport {
     /// pipeline is ready, else the one that may meet everything where that is, else the one
     /// made for `may` after waiting for it, running queued loading jobs on this thread
     /// meanwhile.
-    pub(crate) fn take(&self, may: u32, kernel: Masked) -> Result<Arc<SupportSet>, Error> {
+    pub(crate) fn take(&self, may: u64, kernel: Masked) -> Result<Arc<SupportSet>, Error> {
         let exact = self.set(may);
         if exact.get(kernel).is_some() {
             return Ok(exact);
@@ -311,7 +314,7 @@ impl MaskedSupport {
     }
 
     /// Waits for the pipelines of `runs` made for exactly `may`.
-    pub(crate) fn wait_exact(&self, may: u32, runs: Runs) -> Result<(), Error> {
+    pub(crate) fn wait_exact(&self, may: u64, runs: Runs) -> Result<(), Error> {
         let exact = self.set(may);
         for kernel in runs.kernels() {
             self.wait(&exact, kernel)?;

@@ -1375,14 +1375,15 @@ struct StagedPaths {
     linked_medium: bool,
 }
 
-/// The path pipelines a view's frame ran, by what they hold (`specialize.slang`'s bits).
+/// The path pipelines a view's frame ran, by what they hold: `specialize.slang`'s bits in the
+/// low word and `scene_may.slang`'s in the high one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathsRan {
     /// What the view asked its pipelines to hold: what its scene and settings say its paths
     /// may meet, or everything without [`ViewLighting::specialize`].
-    pub asked: u32,
+    pub asked: u64,
     /// What the pipelines each of its sources ran were made to hold.
-    pub ran: Vec<u32>,
+    pub ran: Vec<u64>,
 }
 
 impl PathsRan {
@@ -1412,10 +1413,10 @@ pub struct PathNeeds {
 /// What each source's paths may meet in a frame (`specialize.slang`'s bits).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PathMay {
-    view: u32,
-    background: u32,
-    update: u32,
-    photons: u32,
+    view: u64,
+    background: u64,
+    update: u64,
+    photons: u64,
 }
 
 impl PathMay {
@@ -1427,7 +1428,7 @@ impl PathMay {
     };
 }
 
-fn bit(on: bool, bit: u32) -> u32 {
+fn bit(on: bool, bit: u64) -> u64 {
     if on { bit } else { 0 }
 }
 
@@ -1443,27 +1444,32 @@ fn path_features(features: SceneFeatures, lighting: &ViewLighting) -> u32 {
     // trace stage's.
     let walk =
         features.contains(SceneFeatures::WALKING) && features.contains(SceneFeatures::SUBSURFACE);
-    bit(walk, FEATURE_WALK)
-        | bit(disperses(features, lighting), FEATURE_DISPERSION)
-        | bit(interiors, FEATURE_INTERIORS)
-        | bit(stack, FEATURE_STACK)
+    let part = |on: bool, feature: u32| if on { feature } else { 0 };
+    part(walk, FEATURE_WALK)
+        | part(disperses(features, lighting), FEATURE_DISPERSION)
+        | part(interiors, FEATURE_INTERIORS)
+        | part(stack, FEATURE_STACK)
 }
 
 /// The features an update path keeps of its view's: it does not walk, nor split by wavelength.
 const UPDATE_FEATURES: u32 = FEATURE_INTERIORS | FEATURE_STACK;
 
 /// What paths whose root has `features` may meet.
-fn features_may(features: u32) -> u32 {
+fn features_may(features: u32) -> u64 {
     bit(features & FEATURE_WALK != 0, MAY_WALK)
         | bit(features & FEATURE_DISPERSION != 0, MAY_DISPERSION)
         | bit(features & FEATURE_INTERIORS != 0, MAY_INTERIORS)
         | bit(features & FEATURE_STACK != 0, MAY_STACK)
 }
 
-/// What the paths of a scene that may hold `features` may meet, beyond what their roots say.
-fn scene_may(features: SceneFeatures) -> u32 {
-    // Scratch: `ORR_SCRATCH_MAY` adds bits to every mask.
-    scratch_u32("ORR_SCRATCH_MAY", 0)
+/// What the paths of a scene that may hold `features` may meet, beyond what their roots say:
+/// the low word's bits the scene decides, and the high word, what its surface evaluations and
+/// hits may meet.
+fn scene_may(features: SceneFeatures) -> u64 {
+    // Scratch: `ORR_SCRATCH_MAY` adds bits to every mask's low word and `ORR_SCRATCH_MAY2` to
+    // its high word.
+    u64::from(scratch_u32("ORR_SCRATCH_MAY", 0))
+        | u64::from(features.surface_may() | scratch_u32("ORR_SCRATCH_MAY2", 0)) << 32
         | bit(features.contains(SceneFeatures::COAT), MAY_COAT)
         | bit(features.contains(SceneFeatures::FUZZ), MAY_FUZZ)
         | bit(features.contains(SceneFeatures::THIN_FILM), MAY_FILM)
@@ -1488,7 +1494,7 @@ fn scene_may(features: SceneFeatures) -> u32 {
 }
 
 /// What `root` says its paths may meet: the bits of `specialize.slang` a root decides.
-fn root_may(root: &PathRoot) -> u32 {
+fn root_may(root: &PathRoot) -> u64 {
     let flag = |f: u32| root.dielectric_flags & f != 0;
     features_may(root.features)
         | bit(root.caustics != GpuPtr::NULL, MAY_CAUSTICS)
@@ -1543,7 +1549,7 @@ fn gathers_caustics(scene: &SceneLighting, lighting: &ViewLighting) -> bool {
     scene.caustics().photons() > 0 && lighting.reference.is_none_or(|r| r.photons > 0)
 }
 
-/// What the masked support kernels of a view's frame may meet (`specialize.slang`'s bits), under
+/// What the masked support kernels of a view's frame may meet (a mask as the path pipelines'), under
 /// kernels that link a medium where `linked_medium`: what the scene's features, the view's
 /// settings and `frosted_glass` ([`ViewPass::frosted_glass`]) rule in. The layer guides run under
 /// the view's path root, which asks nothing beyond it. The bits no input here decides stay set.
@@ -1552,11 +1558,11 @@ fn support_may(
     features: SceneFeatures,
     frosted_glass: bool,
     lighting: &ViewLighting,
-) -> u32 {
+) -> u64 {
     if !lighting.specialize {
         return MAY_ALL;
     }
-    const DECIDED: u32 = MAY_COAT
+    const DECIDED: u64 = MAY_COAT
         | MAY_FUZZ
         | MAY_FILM
         | MAY_SUBSURFACE
@@ -1585,7 +1591,8 @@ fn support_may(
         .and_then(|r| r.lens)
         .is_some_and(|l| l.aperture_radius > 0.0);
     let froxels = !reference && fogged(linked_medium, features, lighting);
-    (MAY_ALL & !DECIDED)
+    // The scene decides the whole high word.
+    (u64::from(u32::MAX) & !DECIDED)
         | scene_may(features)
         | features_may(path_features(features, lighting))
         | bit(lens, MAY_LENS)
@@ -1708,7 +1715,7 @@ impl StagedPaths {
         scene: &SceneLighting,
         needs: &PathNeeds,
         lighting: &ViewLighting,
-    ) -> (u32, Vec<Stage>) {
+    ) -> (u64, Vec<Stage>) {
         let caustics = gathers_caustics(scene, lighting);
         let may = self.predict(scene, needs, lighting);
         let mut wanted = may.view | Source::View.may();
@@ -1733,7 +1740,7 @@ impl StagedPaths {
 
     /// Asks for pipelines that hold `wanted` over `stages`, as [`Self::wanted`] gives them, and
     /// says whether some are ready.
-    fn ask(&self, wanted: u32, stages: &[Stage], lighting: &ViewLighting) -> Result<bool, Error> {
+    fn ask(&self, wanted: u64, stages: &[Stage], lighting: &ViewLighting) -> Result<bool, Error> {
         let ready = self.stages.prepare(wanted, stages)?;
         if lighting.specialize {
             self.start_general();
@@ -2262,7 +2269,7 @@ impl LightingKernels {
         // What a source's paths may meet is what the view asked pipelines for, which its root
         // asks nothing beyond: a pipeline leaves out what its mask rules out whatever a root
         // says.
-        let may = |root: &PathRoot, predicted: u32| {
+        let may = |root: &PathRoot, predicted: u64| {
             let asks = scene_may(pass.scene_features) | root_may(root);
             assert!(
                 asks & !predicted == 0,
@@ -2387,7 +2394,7 @@ impl LightingKernels {
         pass: &ViewPass,
         lighting: &ViewLighting,
         path: &PathRoot,
-        may: u32,
+        may: u64,
     ) -> Result<GpuPtr<CausticsGpu>, Error> {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         let caustics = scene.caustics();
