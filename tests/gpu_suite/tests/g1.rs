@@ -1,7 +1,7 @@
 //! Device, memory, heaps, compute, timestamps and the empty TLAS.
 
 use gpu_suite::shaders::{
-    atomic_max, bins, classify_bins, coopvec, heap_views, pattern, rays, root_layout,
+    atomic_max, bins, classify_bins, coopvec, fold, heap_views, pattern, rays, root_layout,
 };
 use gpu_suite::{
     CUSTOM_INDEX, assert_clean, device, noise, pipeline, readback, render, run, triangle_scene,
@@ -212,6 +212,49 @@ fn atomic_max_u64_matches_cpu() {
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     run(list);
     assert_eq!(out.as_slice().unwrap(), &expected[..]);
+    assert_clean();
+}
+
+/// A kernel whose feature mask the device folds into its module before the driver compiles it
+/// writes the words the same kernel writes with the mask read from its root, where nothing
+/// folds, for masks that leave each shape of its control flow live and dead.
+#[test]
+fn a_folded_mask_writes_what_a_root_mask_writes() {
+    const COUNT: u32 = 256;
+    let d = device();
+    let reference = pipeline(&fold::MODULE, "reference");
+    let out = readback::<u32>(u64::from(COUNT), "fold out");
+    let write = |p: &orr_gpu::ComputePipeline, mask: u32| {
+        let root = upload(
+            &[fold::Root {
+                out: out.gpu(),
+                mask,
+                count: COUNT,
+            }],
+            "fold root",
+        );
+        let mut list = render().command_list().unwrap();
+        list.dispatch(p, root.gpu(), [COUNT.div_ceil(64), 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+        run(list);
+        out.as_slice().unwrap().to_vec()
+    };
+    // Each bit alone, none, all, and mixes that take every case of the kernel's switch.
+    let masks = (0..9).map(|bit| 1 << bit).chain([
+        0, 0x1ff, 0x003, 0x00b, 0x013, 0x033, 0x01f, 0x0c4, 0x155, 0x0aa, 0x1e7,
+    ]);
+    for mask in masks {
+        let bytes = fold::Spec { mask }.bytes();
+        let spec = SpecData {
+            entries: fold::Spec::ENTRIES,
+            bytes: &bytes,
+        };
+        let stage = ShaderStage::new(&fold::MODULE, "main", spec).unwrap();
+        let folded = d.create_compute_pipeline(&stage, "fold").unwrap();
+        let wanted = write(&reference, mask);
+        // The root's mask is another, so only the folded one can give these words.
+        assert_eq!(write(&folded, !mask), wanted, "mask {mask:#x}");
+    }
     assert_clean();
 }
 
