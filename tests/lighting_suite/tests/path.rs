@@ -7,8 +7,8 @@ use lighting_suite::bed::{
     Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD,
     EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, GLASS_SPHERE, GLOSSY_FLOOR, Item, MIRROR, NEAR,
     Particle, ParticleLook, Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec,
-    TINTED_FLOOR, TROUGH, assert_close, image_mean, luminance, mean_where, pixel_of, reference,
-    surface_mean,
+    StrandRow, TILED_FLOOR, TINTED_FLOOR, TROUGH, assert_close, image_mean, luminance, mean_where,
+    pixel_of, reference, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::assert_same_mean;
@@ -948,12 +948,105 @@ fn specialized_pipelines_read_vertex_colors_and_decals_at_a_hit() {
         "the tint: red over green {far} at -2.2 m, {near} at -1.4 m"
     );
     let specialized = render(true);
-    let bits = |a: &Accumulated| {
-        a.mean
-            .iter()
-            .map(|p| p.map(f32::to_bits))
-            .collect::<Vec<_>>()
+    assert!(
+        bits(&general) == bits(&specialized),
+        "the scene's own pipelines changed the image"
+    );
+    assert_clean();
+}
+
+/// The image as bits, for renders that must agree exactly.
+fn bits(a: &Accumulated) -> Vec<[u32; 4]> {
+    a.mean.iter().map(|p| p.map(f32::to_bits)).collect()
+}
+
+/// A floor at `floor_x` along x and the mirror standing over it at `mirror_z`, in a furnace,
+/// from an eye that sees the floor in front of the mirror reflected in it.
+fn mirrored_floor(floor: &'static str, floor_x: f32, mirror_z: f32) -> Spec {
+    Spec {
+        copies: vec![
+            at(floor, Mat3::IDENTITY, Vec3::new(floor_x, 0.0, 0.0)),
+            at(MIRROR, Mat3::IDENTITY, Vec3::new(0.0, 1.0, mirror_z)),
+        ],
+        lights: Vec::new(),
+        environment: Some(FURNACE_RADIANCE),
+        eye: Vec3::new(2.0, 1.6, 3.0),
+        target: Vec3::new(0.3, 0.5, mirror_z),
+        fov_y: 0.8,
+        focus: None,
+    }
+}
+
+/// Pipelines compiled for what a scene may hold read a tile set at a hit: a floor whose base
+/// color is two tiles, a dark one and a bright one, seen in a mirror, so the path's second
+/// vertex is resolved from its hit. The pipelines that hold everything show each tile where its
+/// square of uv lies, and the scene's own render the same image.
+#[test]
+fn specialized_pipelines_read_a_tile_set_at_a_hit() {
+    const MIRROR_Z: f32 = -1.5;
+    // The tiles meet under x = -1.
+    let spec = mirrored_floor(TILED_FLOOR, -1.0, MIRROR_Z);
+    let seen = |x: f32| pixel_of(&spec, Vec3::new(x, 0.0, 2.0 * MIRROR_Z - 0.6));
+    let mut paths = paths(ViewLighting {
+        debug_view: LightingDebugView::BsdfOnly,
+        max_bounces: 2,
+        ..ViewLighting::default()
+    });
+    let mut render = |specialize| {
+        paths.specialize = specialize;
+        let mut bed = Bed::with_features(spec.clone(), &[]);
+        render_paths(&mut bed, &paths, 8, 1)
     };
+    let general = render(false);
+    let [dark, bright] = [-1.8, -0.3].map(|x| general.around(seen(x), 2)[1]);
+    assert!(
+        bright > 5.0 * dark,
+        "the tiles: green {dark} on the dark one, {bright} on the bright one"
+    );
+    let specialized = render(true);
+    assert!(
+        bits(&general) == bits(&specialized),
+        "the scene's own pipelines changed the image"
+    );
+    assert_clean();
+}
+
+/// Pipelines compiled for what a scene may hold shade a strand at a hit: a fence of dark
+/// strands on the floor, seen in a mirror, so the path's second vertex is resolved from its
+/// hit on a strand. The pipelines that hold everything show the fence darker than the floor
+/// beside it, and the scene's own render the same image.
+#[test]
+fn specialized_pipelines_shade_strands_at_a_hit() {
+    const MIRROR_Z: f32 = -1.5;
+    let spec = mirrored_floor(FLOOR, 0.0, MIRROR_Z);
+    // Strands that touch, from x = -0.5 to 0.1 in front of the mirror.
+    let row = StrandRow {
+        count: 16,
+        first: Vec3::new(-0.5, 0.0, 0.6),
+        step: Vec3::new(0.04, 0.0, 0.0),
+        height: 1.0,
+        radius: 0.03,
+        albedo: [0.05; 3],
+    };
+    let seen = |x: f32| pixel_of(&spec, Vec3::new(x, 0.5, 2.0 * MIRROR_Z - row.first.z));
+    let mut paths = paths(ViewLighting {
+        debug_view: LightingDebugView::BsdfOnly,
+        max_bounces: 2,
+        ..ViewLighting::default()
+    });
+    let mut render = |specialize| {
+        paths.specialize = specialize;
+        let mut bed = Bed::with(spec.clone());
+        bed.set_strands(row);
+        render_paths(&mut bed, &paths, 8, 1)
+    };
+    let general = render(false);
+    let [fence, beside] = [-0.2, -1.4].map(|x| general.around(seen(x), 2)[1]);
+    assert!(
+        fence < 0.5 * beside,
+        "the strands: green {fence} on them, {beside} beside them"
+    );
+    let specialized = render(true);
     assert!(
         bits(&general) == bits(&specialized),
         "the scene's own pipelines changed the image"

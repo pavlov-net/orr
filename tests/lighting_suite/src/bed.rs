@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 pub use openpbr_ref::walk::fresnel;
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, GridInput, GridVoxels, LodMode, Manifest, MeshInput,
-    MeshSettings, Source, TextureSettings, Usage, VolumeGrids, VolumeInput, VolumeSettings,
+    MeshSettings, Source, TextureRules, TextureSettings, Usage, VolumeGrids, VolumeInput,
+    VolumeSettings,
 };
 use orr_gpu::{
     Allocation, CommandList, ComputePipeline, Format, GpuPtr, Hazards, KernelSet, MemoryKind,
@@ -36,7 +37,7 @@ use orr_scene::{
 };
 use orr_shaders::bytemuck::Zeroable;
 
-use crate::shaders::{accumulate, exposure, flat_color, guide_read, particle_quads};
+use crate::shaders::{accumulate, exposure, flat_color, guide_read, particle_quads, strands};
 use crate::{
     ScenePermit, TestTexture, Workers, device, linear_clamp, pipeline, read, render, texture,
     upload,
@@ -239,7 +240,22 @@ struct Particles {
     anisotropy: f32,
 }
 
-/// The producer entry of the bed's particles.
+/// A row of upright strands, the bed's producer entry in place of particles: strand i stands
+/// `height` m tall on the foot `first + i * step`, a tube of `radius` m showing `albedo`.
+#[derive(Clone, Copy, Debug)]
+pub struct StrandRow {
+    pub count: u32,
+    pub first: Vec3,
+    pub step: Vec3,
+    pub height: f32,
+    pub radius: f32,
+    pub albedo: [f32; 3],
+}
+
+/// Segments of each of a [`StrandRow`]'s strands.
+const STRAND_SEGMENTS: u32 = 4;
+
+/// The producer entry of the bed's particles, or of its strands.
 const PARTICLES: ProducerId = ProducerId(0);
 
 /// `SceneDesc::producer_capacity` of every bed scene.
@@ -1461,6 +1477,48 @@ fn pack() -> &'static Arc<[u8]> {
 /// base color reads; a model of the feature pack ([`Bed::with_features`]).
 pub const TINTED_FLOOR: &str = "tinted floor";
 
+/// [`FLOOR`]'s square with a set of two tiles for its base color, which [`Bed::with_features`]
+/// binds in place of its own material: a dark tile under the half at -x and a bright one under
+/// the half at +x. A model of the feature pack.
+pub const TILED_FLOOR: &str = "tiled floor";
+
+/// The material of the feature pack that [`TILED_FLOOR`] shows.
+const TILED: &str = "tiled";
+
+/// [`TILED`]'s document beside its base color's two tiles, one file per unit square of uv.
+fn tiled_mtlx() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("orr_lighting_bed_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (tile, level) in [(1001, 32u8), (1002, 224)] {
+        let path = dir.join(format!("tiled.{tile}.png"));
+        let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 4, 4);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        let texels: Vec<u8> = (0..16u8).flat_map(|i| [level + 8 * (i % 2); 3]).collect();
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&texels)
+            .unwrap();
+    }
+    let path = dir.join("tiled.mtlx");
+    let doc = r#"<?xml version="1.0"?>
+<materialx version="1.39">
+  <image name="i" type="color3">
+    <input name="file" type="filename" value="tiled.&lt;UDIM&gt;.png" colorspace="srgb_texture"/>
+  </image>
+  <open_pbr_surface name="S" type="surfaceshader">
+    <input name="base_color" type="color3" nodename="i"/>
+    <input name="specular_weight" type="float" value="0"/>
+  </open_pbr_surface>
+  <surfacematerial name="M" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="S"/>
+  </surfacematerial>
+</materialx>
+"#;
+    std::fs::write(&path, doc).unwrap();
+    path
+}
+
 /// A pack of what the bed's own leaves out, which [`Bed::with_features`] alone mounts beside
 /// it: a scene may hold what any material of a mounted pack shows, so these stay out of every
 /// other bed's scenes and their pipelines.
@@ -1475,17 +1533,40 @@ fn feature_pack() -> &'static Arc<[u8]> {
         tinted.colors = Some(colors.collect());
         let mut material = diffuse([0.8; 3]);
         material.textures[slot::BASE_COLOR].vertex = 1;
+        // Across x the tiled floor's uv runs over two unit squares, inside both.
+        let mut tiled = mesh(|b| b.quad(0, square(5.0, 0.0), Vec3::Y, 8));
+        for uv in tiled.uvs.iter_mut().flatten() {
+            *uv = Vec2::new(0.05 + 1.9 * uv.x, 0.05 + 0.9 * uv.y);
+        }
         let manifest = Manifest {
             archives: vec![ArchiveSpec::new(
                 Target::Memory,
-                vec![AssetSpec {
-                    name: TINTED_FLOOR.into(),
-                    source: Source::Mesh {
-                        mesh: tinted,
-                        materials: vec![material],
-                        settings: MeshSettings::default(),
+                vec![
+                    AssetSpec {
+                        name: TINTED_FLOOR.into(),
+                        source: Source::Mesh {
+                            mesh: tinted,
+                            materials: vec![material],
+                            settings: MeshSettings::default(),
+                        },
                     },
-                }],
+                    AssetSpec {
+                        name: TILED_FLOOR.into(),
+                        source: Source::Mesh {
+                            mesh: tiled,
+                            materials: vec![diffuse([0.8; 3])],
+                            settings: MeshSettings::default(),
+                        },
+                    },
+                    AssetSpec {
+                        name: TILED.into(),
+                        source: Source::MaterialX {
+                            path: tiled_mtlx(),
+                            material: "M".into(),
+                            textures: TextureRules::default(),
+                        },
+                    },
+                ],
             )],
         };
         orr_cook::cook(&manifest, &Default::default())
@@ -1934,6 +2015,14 @@ impl Bed {
                 depth_fade: 0.0,
             })
             .collect();
+        // The tiled floor shows the feature pack's tiled material, as material set 0.
+        let tiled = feature_mount
+            .filter(|_| spec.copies.iter().any(|c| c.model == TILED_FLOOR))
+            .map(|features| {
+                scenes
+                    .material(features, AssetId::from_name(TILED))
+                    .unwrap_or_else(|e| panic!("material {TILED}: {e}"))
+            });
         frame += 1;
         let list = [scene];
         let f = scenes
@@ -1944,6 +2033,9 @@ impl Bed {
             })
             .unwrap();
         let mut w = f.scene(scene).unwrap();
+        if let Some(material) = tiled {
+            w.material_sets(0, 1).unwrap()[0] = material;
+        }
         let group = w
             .create_transform_group(&TransformGroupDesc {
                 count: spec.copies.len() as u32,
@@ -1960,7 +2052,7 @@ impl Bed {
                 transforms: group,
                 first: i as u32,
                 pose: None,
-                material_set: None,
+                material_set: (c.model == TILED_FLOOR && tiled.is_some()).then_some(0),
                 flags: InstanceFlags::RASTER | InstanceFlags::RAY,
                 rt_range,
                 animation_range: 0.0,
@@ -2211,6 +2303,61 @@ impl Bed {
             draw: ParticleDraw::new(device(), self.kernels).unwrap(),
             anisotropy,
         });
+    }
+
+    /// Makes the bed's producer entry `row`'s strands, opaque, which each frame's scene compute
+    /// emits; in place of particles and of a hook of [`Self::set_scene_compute`].
+    pub fn set_strands(&mut self, row: StrandRow) {
+        self.frame += 1;
+        let list = [self.scene];
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let mut m = MaterialGpu::zeroed();
+        m.base_color = row.albedo;
+        m.base_weight = 1.0;
+        let material = f.materials().create(&m).unwrap();
+        {
+            let mut w = f.scene(self.scene).unwrap();
+            w.transforms(self.particle_group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+            w.set_producer(
+                PARTICLES,
+                Some(&ProducerDesc {
+                    max_vertices: row.count * (STRAND_SEGMENTS + 1),
+                    max_segments: row.count * STRAND_SEGMENTS,
+                    update: ProducerUpdate::EveryFrame,
+                    materials: &[material],
+                    transform: (self.particle_group, 0),
+                    ..ProducerDesc::default()
+                }),
+            )
+            .unwrap();
+        }
+        let point = f.end(&[]).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
+        let emit = pipeline(&strands::MODULE, "main");
+        self.scene_compute = Some(Box::new(move |c| {
+            let root = c
+                .put_root(&strands::Root {
+                    scene: c.root,
+                    producer: PARTICLES.0,
+                    count: row.count,
+                    first: [row.first.x, row.first.y, row.first.z, row.height],
+                    step: [row.step.x, row.step.y, row.step.z, row.radius],
+                    segments: STRAND_SEGMENTS,
+                    base: 0,
+                    _pad: 0,
+                })
+                .unwrap();
+            c.cmd.dispatch(&emit, root, [row.count.div_ceil(64), 1, 1]);
+        }));
     }
 
     /// Runs `frames` frames of the scene, each recording `kernel` after the scene pass and
