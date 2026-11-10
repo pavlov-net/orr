@@ -1662,23 +1662,24 @@ impl LightingKernels {
 
     /// Asks for the path pipelines a view's frame with `needs` takes under `lighting`, and says
     /// whether they are ready. [`Self::record_paths`] waits for them otherwise, so a caller
-    /// that would rather show a frame without paths asks here first.
+    /// that would rather show a frame without paths asks here first. An error where one of
+    /// them failed to compile.
     pub fn prepare_paths(
         &self,
         scene: &SceneLighting,
         needs: &PathNeeds,
         lighting: &ViewLighting,
-    ) -> bool {
+    ) -> Result<bool, Error> {
         let PathKernels::Staged(k) = &self.paths else {
-            return true;
+            return Ok(true);
         };
         let (wanted, stages) = self.wanted(k, scene, needs, lighting);
-        let ready = k.stages.prepare(wanted, &stages);
+        let ready = k.stages.prepare(wanted, &stages)?;
         // What a view asked for compiles first.
         if ready || k.stages.late_first() {
             Self::start_background(k, lighting.specialize);
         }
-        ready
+        Ok(ready)
     }
 
     /// Waits for the pipelines [`Self::prepare_paths`] asked for with the same arguments,
@@ -1989,7 +1990,7 @@ impl LightingKernels {
             frosted_glass: pass.frosted_glass,
             dof_background: pass.dof_background.is_some(),
         };
-        self.prepare_paths(scene, &needs, lighting);
+        self.prepare_paths(scene, &needs, lighting)?;
         let predicted = self.predict(scene, &needs, lighting);
         // What a root's paths may meet, read from the root itself.
         let may = |root: &PathRoot, predicted: u32| {

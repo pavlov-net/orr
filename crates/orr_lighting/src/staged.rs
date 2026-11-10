@@ -349,6 +349,15 @@ impl<T: Send + 'static> Late<T> {
         }
     }
 
+    /// How its compile failed, where it did.
+    fn failure(&self) -> Option<Error> {
+        self.get();
+        self.failed.get().map(|message| Error::LateCompile {
+            kernel: self.name,
+            message: message.clone(),
+        })
+    }
+
     /// Whether its compile has started, whatever came of it.
     fn started(&self) -> bool {
         self.get().is_some() || self.failed.get().is_some() || self.job.lock().unwrap().is_some()
@@ -383,13 +392,11 @@ impl<T: Send + 'static> Late<T> {
         if let (Some(loading), Some(job)) = (loading, self.job.lock().unwrap().as_ref()) {
             job.wait(loading);
         }
-        self.get().ok_or_else(|| Error::LateCompile {
-            kernel: self.name,
-            message: self
-                .failed
-                .get()
-                .cloned()
-                .unwrap_or_else(|| "its compile never started".to_owned()),
+        self.get().ok_or_else(|| {
+            self.failure().unwrap_or_else(|| Error::LateCompile {
+                kernel: self.name,
+                message: "its compile never started".to_owned(),
+            })
         })
     }
 }
@@ -578,9 +585,15 @@ impl StagedKernels {
 
     /// Asks for `stages` for paths that may meet `may`, and says whether pipelines that hold
     /// them are ready.
-    pub(crate) fn prepare(&self, may: u32, stages: &[Stage]) -> bool {
-        self.request(may, stages);
-        self.covering(may, stages).is_some()
+    /// An error where one made for `may` failed to compile.
+    pub(crate) fn prepare(&self, may: u32, stages: &[Stage]) -> Result<bool, Error> {
+        let set = self.request(may, stages);
+        for stage in StageSet::runs(may, stages) {
+            if let Some(e) = set.stage(stage).failure() {
+                return Err(e);
+            }
+        }
+        Ok(self.covering(may, stages).is_some())
     }
 
     /// How many pipelines asked for are still compiling.

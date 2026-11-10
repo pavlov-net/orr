@@ -682,9 +682,11 @@ fn a_view_is_black_while_the_path_kernels_compile_and_then_renders_as_if_it_neve
     assert_clean();
 }
 
-/// A path kernel that cannot compile: the device has no ray dispatch and the renderer asks for it.
+/// A path pipeline that cannot compile: the device has no ray dispatch and the renderer asks for
+/// it. The pipelines compile when a view first asks for them, so the view's render reports it,
+/// and every wait and render after it.
 #[test]
-fn a_failed_path_compile_comes_back_from_wait_paths_and_render_view() {
+fn a_failed_path_compile_comes_back_from_render_view_and_wait_paths() {
     let d = orr_gpu::Device::new(&orr_gpu::DeviceDesc {
         name: "no ray dispatch",
         skip_extensions: &[c"VK_KHR_ray_tracing_pipeline"],
@@ -702,15 +704,15 @@ fn a_failed_path_compile_comes_back_from_wait_paths_and_render_view() {
     let history = r.create_view_history().unwrap();
     let failed = |e: orr::Error| match e {
         orr::Error::PathKernels(e) => assert!(
-            matches!(&*e, orr::LightingError::Compile { kernel, .. } if *kernel == "view paths"),
+            matches!(
+                &*e,
+                orr::LightingError::LateCompile { kernel, .. } if *kernel == "staged opaque shade"
+            ),
             "{e}"
         ),
         e => panic!("{e}"),
     };
-    failed(r.wait_paths().unwrap_err());
-    assert!(!r.paths_ready());
-    assert_eq!(r.paths_outstanding(), 0);
-    failed(r.wait_paths().unwrap_err());
+    r.wait_paths().unwrap();
     let image = d
         .create_texture(
             &TextureDesc::d2(
@@ -731,7 +733,6 @@ fn a_failed_path_compile_comes_back_from_wait_paths_and_render_view() {
             display: None,
         })
         .unwrap();
-    assert!(!f.paths_ready());
     let eye = DVec3::new(0.0, 2.0, 4.0);
     let error = f
         .render_view(
@@ -741,10 +742,13 @@ fn a_failed_path_compile_comes_back_from_wait_paths_and_render_view() {
             &mut ViewHooks::default(),
         )
         .err()
-        .expect("render_view with no kernels");
+        .expect("render_view with a pipeline that failed");
     failed(error);
     f.end().unwrap();
     d.wait_submitted(Duration::from_secs(10)).unwrap();
+    failed(r.wait_paths().unwrap_err());
+    assert!(!r.paths_ready());
+    assert_eq!(r.paths_outstanding(), 0);
 }
 
 #[test]

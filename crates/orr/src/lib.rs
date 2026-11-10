@@ -1146,7 +1146,8 @@ impl<'a> Frame<'a> {
     /// since no radiance exists for them to draw into or to keep. `display_linear` and `ui` run over
     /// the black image, so a consumer can draw its own message there. The first render after that
     /// starts every history as a view's first render does. A compile that failed returns
-    /// [`Error::PathKernels`].
+    /// [`Error::PathKernels`], from here where it is a path pipeline's, which compile when a view
+    /// first asks for them.
     pub fn render_view(
         &mut self,
         view: &LitView<'_>,
@@ -1160,7 +1161,7 @@ impl<'a> Frame<'a> {
         let (extent, render) = self.resolve_view(view, lighting, output)?;
         // The path pipelines compile for what the scene and the settings may meet: a view
         // asks for its own here and stays black until they are ready, unless the caller waits.
-        let lit = match &self.lighting.paths {
+        let asked = match &self.lighting.paths {
             Paths::Ready(kernels) => {
                 let features = self.scenes.scene_features(view.scene)?;
                 let scene = self
@@ -1177,9 +1178,26 @@ impl<'a> Frame<'a> {
                         .is_some_and(|state| state.reconstruction.is_some()),
                     dof_background: false,
                 };
-                kernels.prepare_paths(scene, &needs, lighting) || self.lighting.waits
+                let waits = self.lighting.waits;
+                kernels
+                    .prepare_paths(scene, &needs, lighting)
+                    .and_then(|ready| {
+                        if !ready && waits {
+                            kernels.wait_paths(scene, &needs, lighting)?;
+                        }
+                        Ok(ready || waits)
+                    })
             }
-            _ => false,
+            _ => Ok(false),
+        };
+        let lit = match asked {
+            Ok(lit) => lit,
+            Err(e) => {
+                log::error!("{e}");
+                let e = Arc::new(e);
+                self.lighting.paths = Paths::Failed(Arc::clone(&e));
+                return Err(Error::PathKernels(e));
+            }
         };
         let Paths::Ready(kernels) = &self.lighting.paths else {
             return self.render_view_black(view, output, hooks, extent, render);
