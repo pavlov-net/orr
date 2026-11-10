@@ -181,7 +181,8 @@ public struct ShadowCandidates<S : ISurface, M : IMedium, let MODE : uint> : ICa
         if (c.cluster_id < 0)
             return float3(1.0);
         bool layer = (may(MAY_LAYERS) && c.class_id == CLASS_PRESENCE) || (may(MAY_PARTICLES) && c.class_id == CLASS_PARTICLE);
-        float present = resolve_presence<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context, !layer);
+        uint section;
+        float present = resolve_presence_section<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context, !layer, section);
         if (layer)
         {
             counted = true;
@@ -192,24 +193,29 @@ public struct ShadowCandidates<S : ISurface, M : IMedium, let MODE : uint> : ICa
         if (!(present > 0.0))
             return float3(1.0);
         counted = true;
-        return dielectric(c);
+        return dielectric(c, section);
     }
 
+    // A dielectric candidate of section material `section` that is present.
     [mutating]
-    float3 dielectric(Candidate c)
+    float3 dielectric(Candidate c, uint section)
     {
         if (MODE == SHADOW_PHOTON)
             return float3(0.0);
+        bool thin = !crosses_interior(scene, section);
+        // Solid glass ends a path's shadow ray whatever its surface is.
+        if (MODE == SHADOW_PATH && !thin)
+        {
+            solid_t = c.t;
+            return float3(0.0);
+        }
         SurfaceHit sh = resolve_hit<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, c.object_positions, false, context);
         if (!sh.valid)
             return float3(1.0);
         float3 n = sh.surface.geometric_normal;
-        bool thin = !crosses_interior(scene, sh.section);
         if (MODE == SHADOW_PATH)
         {
-            if (!thin)
-                solid_t = c.t;
-            if (!thin || !bsdf_thin_mirror(sh.surface.bsdf, exterior_ior))
+            if (!bsdf_thin_mirror(sh.surface.bsdf, exterior_ior))
                 return float3(0.0);
             return bsdf_straight_transmission(sh.surface.bsdf, n, dir, exterior_ior, environment);
         }

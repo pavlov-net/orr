@@ -953,12 +953,22 @@ bool fade_present(SceneRoot* s, float3 d, uint instance_index)
 // reconstruction.
 public float resolve_presence<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, bool alpha)
 {
+    uint section;
+    return resolve_presence_section<S>(s, v, d, instance_index, cluster_id, primitive, bary, context, alpha, section);
+}
+
+// `resolve_presence`, and in `section` the material of the triangle's section, MATERIAL_NONE
+// where nothing is present.
+public float resolve_presence_section<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, bool alpha, out uint section)
+{
+    section = MATERIAL_NONE;
     if (!fade_present(s, d, instance_index))
         return 0.0;
     Corners t = (Corners)0;
     HitInput h;
     if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, false, context, h))
         return 0.0;
+    section = h.section;
     uint flags = s.materials[h.input.material].flags;
     // A fading copy's triangles of materials without an alpha test are candidates only for
     // the fade.
