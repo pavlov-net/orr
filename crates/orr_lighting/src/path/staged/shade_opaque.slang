@@ -1,5 +1,6 @@
-// The staged paths' shade stage of opaque vertices. The compute entry shades its queue in
-// order; the raygen entry reorders its lanes by coherence key first.
+// The staged paths' shade stage of opaque vertices: the plain ones' queue, and the queue of
+// those whose surface may have more lobes. The compute entries shade their queue in order; the
+// raygen entries reorder its lanes by coherence key first.
 #include "orr_root.h"
 import orr_shaders.coherence;
 import orr_lighting.environment;
@@ -28,4 +29,20 @@ void rays()
     ORR_OMM(rays);
     uint3 ray = DispatchRaysIndex();
     shade_stage<Reorder, Surface, Medium, QUEUE_OPAQUE>(root, ray.y * STAGE_GROUP + ray.x);
+}
+
+[shader("compute")]
+[numthreads(STAGE_GROUP, 1, 1)]
+void rich_main(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(rich_main);
+    shade_stage<NoReorder, Surface, Medium, QUEUE_RICH>(root, id.x);
+}
+
+[shader("raygeneration")]
+void rich_rays()
+{
+    ORR_OMM(rich_rays);
+    uint3 ray = DispatchRaysIndex();
+    shade_stage<Reorder, Surface, Medium, QUEUE_RICH>(root, ray.y * STAGE_GROUP + ray.x);
 }

@@ -8,7 +8,12 @@
 // pipeline: that is what each bit's line below promises.
 module specialize;
 
+#ifdef ORR_UNSPECIALIZED
+// A build whose target has no specialization constants (the CPU tests') holds everything.
+static const uint path_may = 0xffffffffu;
+#else
 [vk::constant_id(110)] const uint path_may = 0xffffffffu;
+#endif
 
 // A plane stack bends a directional light: the light set may hold a stack entry and a
 // directional light.
@@ -40,6 +45,19 @@ public static const uint MAY_LOCAL = 1 << 12;
 public static const uint MAY_FROXELS = 1 << 13;
 // paths that end in the world cache (CACHE_TERMINATE).
 public static const uint MAY_CACHE = 1 << 14;
+// A surface the pipeline shades may have a coat, fuzz, a thin film or a subsurface weight
+// above 0: the BSDF holds the lobe.
+public static const uint MAY_COAT = 1 << 15;
+public static const uint MAY_FUZZ = 1 << 16;
+public static const uint MAY_FILM = 1 << 17;
+public static const uint MAY_SUBSURFACE = 1 << 18;
+public static const uint MAY_LOBES = MAY_COAT | MAY_FUZZ | MAY_FILM | MAY_SUBSURFACE;
+
+// Whether any of `bits` may be met.
+public bool may_any(uint bits)
+{
+    return (path_may & bits) != 0;
+}
 
 public bool may(uint bit)
 {

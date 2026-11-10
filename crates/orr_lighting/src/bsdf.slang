@@ -29,6 +29,7 @@ module bsdf;
 import orr_shaders.math;
 import orr_shaders.sampling;
 import orr_lighting.openpbr;
+import orr_lighting.specialize;
 // `BsdfParams` and its flags.
 __exported import orr_scene.gbuffer;
 
@@ -365,6 +366,8 @@ public struct Bsdf : IDifferentiable
         {
         case COAT:
         {
+            if (!may(MAY_COAT))
+                return r;
             delta = coat_mirror;
             float3 c = delta ? float3(-coat_v.xy, coat_v.z) : sample_ggx_vndf_bounded(coat_v, coat_alpha, uv);
             facing = c.z;
@@ -375,6 +378,8 @@ public struct Bsdf : IDifferentiable
         }
         case FUZZ:
         {
+            if (!may(MAY_FUZZ))
+                return r;
             float3 f = sample_fuzz(uv);
             facing = f.z;
             l = own_frames ? mul(f, fuzz_basis) : f;
@@ -503,7 +508,7 @@ public struct Bsdf : IDifferentiable
         switch (component)
         {
         case COAT:
-            if (!coat_mirror)
+            if (!may(MAY_COAT) || !coat_mirror)
                 return float3(0.0);
             own = float3(-coat_v.xy, coat_v.z);
             if (own_frames)
@@ -642,7 +647,7 @@ public struct Bsdf : IDifferentiable
         Facet micro = (Facet)0;
         if ((specular && (l.z > 0.0 || any(transmit != 0.0))) || walks)
             micro = facet_coefficients(l);
-        if (probability[COAT] > 0.0 && !coat_mirror)
+        if (may(MAY_COAT) && probability[COAT] > 0.0 && !coat_mirror)
         {
             float3 c = in_frame(l, coat_basis);
             if (c.z > 0.0)
@@ -651,7 +656,7 @@ public struct Bsdf : IDifferentiable
                 pdf += probability[COAT] * lobe_pdf;
             }
         }
-        if (probability[FUZZ] > 0.0)
+        if (may(MAY_FUZZ) && probability[FUZZ] > 0.0)
         {
             float3 f = in_frame(l, fuzz_basis);
             if (f.z > 0.0)
@@ -908,7 +913,7 @@ public struct Bsdf : IDifferentiable
         if (metal > 0.0)
             reflection += metal * (metal_flat ? f0 : openpbr_metal_schlick_with_f82_tint(f0, f82, c));
         transmission = float3(1.0 - ft);
-        if (film > 0.0)
+        if (may(MAY_FILM) && film > 0.0)
         {
             bool dielectric = any(reflect_transparent > 0.0) || any(reflect_opaque > 0.0);
             OpenPBR_ThinFilmResults r = openpbr_thin_film_and_base_reflectance(
@@ -1234,9 +1239,12 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     Bsdf s;
     bool thin = (p.flags & BSDF_THIN_WALLED) != 0;
     bool collapsed = (p.flags & BSDF_COLLAPSED) != 0;
-    float coat_weight = (p.flags & BSDF_COAT) != 0 ? p.coat_weight : 0.0;
-    float fuzz_weight = (p.flags & BSDF_FUZZ) != 0 ? p.fuzz_weight : 0.0;
-    float film_weight = (p.flags & BSDF_THIN_FILM) != 0 ? p.thin_film_weight : 0.0;
+    // A pipeline whose surfaces have none of a lobe (`may`) reads its weight as the 0 it is.
+    float coat_weight = may(MAY_COAT) && (p.flags & BSDF_COAT) != 0 ? p.coat_weight : 0.0;
+    float fuzz_weight = may(MAY_FUZZ) && (p.flags & BSDF_FUZZ) != 0 ? p.fuzz_weight : 0.0;
+    float film_weight = may(MAY_FILM) && (p.flags & BSDF_THIN_FILM) != 0 ? p.thin_film_weight : 0.0;
+    if (!may(MAY_SUBSURFACE))
+        p.subsurface_weight = 0.0;
     float anisotropy = (p.flags & BSDF_ANISOTROPY) != 0 ? p.specular_anisotropy : 0.0;
 
     bool back = dot(wo, n) < 0.0;
@@ -1373,7 +1381,7 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.film_thickness = p.thin_film_thickness;
     s.film_exterior = s.inside ? specular_ior : coat_ior;
     s.film_interior = float3(s.inside ? coat_ior : specular_ior);
-    if (s.fresnel_mix && s.film > 0.0)
+    if (may(MAY_FILM) && s.fresnel_mix && s.film > 0.0)
     {
         float3 root = sqrt(min(p.specular_color, MAX_F0));
         s.film_interior = (1.0 + root) / (1.0 - root);

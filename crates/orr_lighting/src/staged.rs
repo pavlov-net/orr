@@ -24,7 +24,8 @@ const QUEUE_OTHER: u64 = 1;
 const QUEUE_WALK: u64 = 2;
 const QUEUE_TRACE: u64 = 3;
 const QUEUE_FINISH: u64 = 4;
-const STAGE_QUEUES: u64 = 5;
+const QUEUE_RICH: u64 = 5;
+const STAGE_QUEUES: u64 = 6;
 /// Its words of 16 bytes per path slot: the state, a deferred shadow ray, the record and a
 /// walk's entry.
 const PATH_WORDS: u64 = 44;
@@ -77,6 +78,14 @@ pub(crate) const MAY_WALK: u32 = 1 << 11;
 pub(crate) const MAY_LOCAL: u32 = 1 << 12;
 pub(crate) const MAY_FROXELS: u32 = 1 << 13;
 pub(crate) const MAY_CACHE: u32 = 1 << 14;
+pub(crate) const MAY_COAT: u32 = 1 << 15;
+pub(crate) const MAY_FUZZ: u32 = 1 << 16;
+pub(crate) const MAY_FILM: u32 = 1 << 17;
+pub(crate) const MAY_SUBSURFACE: u32 = 1 << 18;
+/// The lobes a plain surface lacks, which the opaque shade stage is compiled without; and what
+/// goes with them: only a subsurface vertex starts a walk.
+const MAY_LOBES: u32 = MAY_COAT | MAY_FUZZ | MAY_FILM | MAY_SUBSURFACE;
+const MAY_RICH: u32 = MAY_LOBES | MAY_WALK;
 /// Everything: what a pipeline made without a value may meet.
 pub(crate) const MAY_ALL: u32 = u32::MAX;
 
@@ -163,9 +172,11 @@ pub(crate) enum Stage {
     Other,
     Walk,
     Finish,
+    /// The opaque shade stage with every lobe the set may meet, over QUEUE_RICH.
+    Rich,
 }
 
-const STAGES: usize = 10;
+const STAGES: usize = 11;
 
 impl Stage {
     /// Its module, entry point and name.
@@ -185,12 +196,26 @@ impl Stage {
             Self::Other => (&shade_other::MODULE, "main", "staged other shade"),
             Self::Walk => (&walk::MODULE, "main", "staged walk"),
             Self::Finish => (&sources::MODULE, "finish_main", "staged finish"),
+            Self::Rich => (
+                &shade_opaque::MODULE,
+                "rich_main",
+                "staged rich opaque shade",
+            ),
         }
     }
 
-    /// Whether it is a shade stage, which may run as a ray dispatch with a `rays` entry.
+    /// Whether it is a shade stage, which may run as a ray dispatch with a `rays` entry in
+    /// place of its `main` one.
     fn reorders(self) -> bool {
-        matches!(self, Self::Opaque | Self::Other)
+        matches!(self, Self::Opaque | Self::Other | Self::Rich)
+    }
+
+    /// What its pipeline in a set for `may` may meet: the opaque stage's surfaces are plain.
+    fn may(self, may: u32) -> u32 {
+        match self {
+            Self::Opaque => may & !MAY_RICH,
+            _ => may,
+        }
     }
 }
 
@@ -228,6 +253,7 @@ fn compile_stage(
 ) -> Result<StagePipeline, Error> {
     let (own, entry, name) = stage.source();
     let m = module(kernels, own)?;
+    let may = stage.may(may);
     let bytes = may.to_le_bytes();
     let spec = SpecData {
         entries: &[SpecEntry {
@@ -239,7 +265,7 @@ fn compile_stage(
     };
     let started = Instant::now();
     let pipeline = if rays && stage.reorders() {
-        let stage = ShaderStage::new(m, "rays", spec)?;
+        let stage = ShaderStage::new(m, &entry.replace("main", "rays"), spec)?;
         StagePipeline::Rays(device.create_ray_dispatch_pipeline(&stage, name)?)
     } else {
         let stage = ShaderStage::new(m, entry, spec)?;
@@ -370,6 +396,7 @@ impl StageSet {
                 late(Stage::Other),
                 late(Stage::Walk),
                 late(Stage::Finish),
+                late(Stage::Rich),
             ],
         }
     }
@@ -378,9 +405,28 @@ impl StageSet {
         &self.stages[stage as usize]
     }
 
-    /// Whether every one of `stages` is ready.
+    /// `stages` and what a set for `may` runs beside them: the rich opaque stage where its
+    /// surfaces may have lobes a plain one lacks.
+    fn with_rich(may: u32, stages: &[Stage]) -> Vec<Stage> {
+        let mut out = stages.to_vec();
+        if may & MAY_LOBES != 0 {
+            out.push(Stage::Rich);
+        }
+        out
+    }
+
+    /// Whether every stage a source with `stages` runs is ready.
     fn holds(&self, stages: &[Stage]) -> bool {
-        stages.iter().all(|&s| self.stage(s).get().is_some())
+        Self::with_rich(self.may, stages)
+            .iter()
+            .all(|&s| self.stage(s).get().is_some())
+    }
+
+    /// Whether every stage a source with `stages` runs has started compiling.
+    fn started(&self, stages: &[Stage]) -> bool {
+        Self::with_rich(self.may, stages)
+            .iter()
+            .all(|&s| self.stage(s).started())
     }
 }
 
@@ -464,7 +510,7 @@ impl StagedKernels {
     /// Starts the compiles of `stages` for exactly `may` that have not started.
     fn request(&self, may: u32, stages: &[Stage]) -> Arc<StageSet> {
         let set = self.set(may);
-        for &stage in stages {
+        for stage in StageSet::with_rich(may, stages) {
             let (kernels, rays) = (self.kernels, self.rays);
             set.stage(stage)
                 .start(self.device(), self.loading(), move |d| {
@@ -489,7 +535,7 @@ impl StagedKernels {
     fn compiling(&self, may: u32, stages: &[Stage]) -> Option<Arc<StageSet>> {
         let sets = self.sets.lock().unwrap();
         sets.iter()
-            .filter(|s| s.may & may == may && stages.iter().all(|&st| s.stage(st).started()))
+            .filter(|s| s.may & may == may && s.started(stages))
             .min_by_key(|s| s.may.count_ones())
             .cloned()
     }
@@ -559,7 +605,7 @@ impl StagedKernels {
                 let set = self
                     .compiling(may, &stages)
                     .unwrap_or_else(|| self.request(may, &stages));
-                for &stage in &stages {
+                for stage in StageSet::with_rich(set.may, &stages) {
                     set.stage(stage).wait(self.loading())?;
                 }
                 set
@@ -626,6 +672,13 @@ impl StagedKernels {
                         memory.groups(round, QUEUE_OPAQUE),
                     );
                     pipeline(Stage::Other).dispatch(list, &root, memory.groups(round, QUEUE_OTHER));
+                    if set.may & MAY_LOBES != 0 {
+                        pipeline(Stage::Rich).dispatch(
+                            list,
+                            &root,
+                            memory.groups(round, QUEUE_RICH),
+                        );
+                    }
                     if walks {
                         barrier(list);
                         scratch_mark(list, source, 3);

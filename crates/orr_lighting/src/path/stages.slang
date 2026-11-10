@@ -49,14 +49,19 @@ public static const uint PATH_SOURCE_BACKGROUND = 1;
 public static const uint PATH_SOURCE_UPDATE = 2;
 public static const uint PATH_SOURCE_PHOTON = 3;
 
-// The queues. The shade stages are named by theirs: opaque vertices, and the others (layers,
-// scatters in interiors and walks' ways out of them).
+// The queues. The shade stages are named by theirs: opaque vertices, apart those whose material
+// may have a lobe a plain surface lacks (QUEUE_RICH, below), and the others (layers, scatters in
+// interiors and walks' ways out of them).
 public static const uint QUEUE_OPAQUE = 0;
 public static const uint QUEUE_OTHER = 1;
 public static const uint QUEUE_WALK = 2;
 public static const uint QUEUE_TRACE = 3;
 public static const uint QUEUE_FINISH = 4;
-public static const uint STAGE_QUEUES = 5;
+// Opaque vertices whose surface may have a coat, fuzz, a thin film or a subsurface weight, or
+// that the trace stage reads no material for. QUEUE_OPAQUE's pipeline is compiled without
+// those lobes; with none in the scene every opaque vertex goes there.
+public static const uint QUEUE_RICH = 5;
+public static const uint STAGE_QUEUES = 6;
 
 // Lanes per workgroup of the stages over a queue.
 public static const uint STAGE_GROUP = 32;
@@ -352,7 +357,7 @@ void store_spectral(PathRoot r, uint slot, Spectral v)
 // Whether `queue`'s stage runs as a ray dispatch, whose workgroups are rows of rays.
 bool ray_queue(PathRoot r, uint queue)
 {
-    return (r.features & FEATURE_RAY_SHADES) != 0 && (queue == QUEUE_OPAQUE || queue == QUEUE_OTHER);
+    return (r.features & FEATURE_RAY_SHADES) != 0 && (queue == QUEUE_OPAQUE || queue == QUEUE_OTHER || queue == QUEUE_RICH);
 }
 
 // Appends `slot` to `queue` of round `round`, and counts the workgroup it starts.
@@ -731,7 +736,7 @@ void begin_path(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler rng
         store_pending(st, slot, pending);
     }
     store_loop(st, slot, p);
-    append(r, camera ? QUEUE_TRACE : QUEUE_OPAQUE, round, slot);
+    append(r, camera ? QUEUE_TRACE : opaque_queue(r.scene, (Hit)0, true), round, slot);
 }
 
 // The view's primary stage: the path of the slice's `lane`th
@@ -984,6 +989,29 @@ void medium_vertex(PathRoot r, uint slot, PathFixed f, inout PathLoop p, PathPen
     store_pending(r.stages, slot, pending);
     store_loop(r.stages, slot, p);
     append(r, QUEUE_OTHER, round_now(r), slot);
+}
+
+// Whether material `material` may give a surface one of MAY_LOBES' lobes, on either side.
+bool rich_material(SceneRoot* s, uint material)
+{
+    MaterialGpu* m = s.materials + material;
+    bool rich = m.surface != 0 || m.coat_weight > 0.0 || m.fuzz_weight > 0.0 || m.thin_film_weight > 0.0 || m.subsurface_weight > 0.0;
+    if (!rich && (m.flags & MATERIAL_HAS_BACK) != 0)
+    {
+        MaterialGpu* b = s.materials + m.back;
+        rich = b.surface != 0 || b.coat_weight > 0.0 || b.fuzz_weight > 0.0 || b.thin_film_weight > 0.0 || b.subsurface_weight > 0.0;
+    }
+    return rich;
+}
+
+// The queue of the opaque vertex at hit `h`, or with `gbuffer` on the G-buffer's surface, whose
+// material this stage does not read.
+uint opaque_queue(SceneRoot* s, Hit h, bool gbuffer)
+{
+    if (!may_any(MAY_LOBES))
+        return QUEUE_OPAQUE;
+    uint material = gbuffer ? MATERIAL_NONE : hit_material(s, h);
+    return material == MATERIAL_NONE || rich_material(s, material) ? QUEUE_RICH : QUEUE_OPAQUE;
 }
 
 // The trace stage: the shadow ray the path's last vertex left, then the ray of the iteration
@@ -1242,7 +1270,7 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     set_flag(p.flags, LOOP_MEDIUM, false);
     store_pending(st, slot, pending);
     store_loop(st, slot, p);
-    append(r, !gbuffer && is_layer(h) ? QUEUE_OTHER : QUEUE_OPAQUE, round_now(r), slot);
+    append(r, !gbuffer && is_layer(h) ? QUEUE_OTHER : opaque_queue(s, h, gbuffer), round_now(r), slot);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1716,7 +1744,7 @@ void leave_shade(PathRoot r, uint slot, PathFixed f, inout PathLoop p, ShadeStat
     append(r, QUEUE_TRACE, next, slot);
 }
 
-// The shade stage over `K` (QUEUE_OPAQUE or QUEUE_OTHER): the
+// The shade stage over `K` (QUEUE_OPAQUE, QUEUE_RICH or QUEUE_OTHER): the
 // vertex the trace stage reached, the end of its iteration, and the next iteration up to its
 // ray, which the trace stage traces, or its walk, which the walk stage runs. `C` names its
 // coherence point, before anything of the vertex is loaded.
@@ -1768,7 +1796,7 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, 
     else
     {
         // A path that starts on the G-buffer's surface resolves it before its first iteration.
-        bool start_vertex = K == QUEUE_OPAQUE && has(p.flags, LOOP_GBUFFER_START);
+        bool start_vertex = K != QUEUE_OTHER && has(p.flags, LOOP_GBUFFER_START);
         set_flag(p.flags, LOOP_GBUFFER_START, false);
         if (!start_vertex)
             p.iteration++;
@@ -1789,7 +1817,7 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, 
     p.rng = rng;
     if (nee.traced)
         store_shadow(st, slot, nee.q);
-    if (K == QUEUE_OPAQUE && alive && walking)
+    if (K != QUEUE_OTHER && alive && walking)
     {
         // The walk takes the place of the vertex's ray.
         WalkEntry entry = { sv.l, wi };

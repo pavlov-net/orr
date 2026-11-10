@@ -34,9 +34,21 @@ impl SceneFeatures {
     /// The scene holds a smoke entry: a view's [`RasterView::smoke_args`](crate::RasterView)
     /// is then set.
     pub const SMOKE: Self = Self(1 << 7);
+    /// A material has a coat, fuzz, a thin film or a subsurface weight above 0.
+    pub const COAT: Self = Self(1 << 8);
+    pub const FUZZ: Self = Self(1 << 9);
+    pub const THIN_FILM: Self = Self(1 << 10);
+    pub const SUBSURFACE: Self = Self(1 << 11);
     /// Every bit a material record sets.
     const MATERIAL: Self = Self(
-        Self::WALKING.0 | Self::INTERIORS.0 | Self::SCATTERING_INTERIORS.0 | Self::DISPERSIVE.0,
+        Self::WALKING.0
+            | Self::INTERIORS.0
+            | Self::SCATTERING_INTERIORS.0
+            | Self::DISPERSIVE.0
+            | Self::COAT.0
+            | Self::FUZZ.0
+            | Self::THIN_FILM.0
+            | Self::SUBSURFACE.0,
     );
 
     pub fn contains(self, other: Self) -> bool {
@@ -63,6 +75,10 @@ impl SceneFeatures {
             (bounds, Self::INTERIORS),
             (bounds && scatters, Self::SCATTERING_INTERIORS),
             (disperses, Self::DISPERSIVE),
+            (m.coat_weight > 0.0, Self::COAT),
+            (m.fuzz_weight > 0.0, Self::FUZZ),
+            (m.thin_film_weight > 0.0, Self::THIN_FILM),
+            (m.subsurface_weight > 0.0, Self::SUBSURFACE),
         ] {
             if on {
                 out |= bit;

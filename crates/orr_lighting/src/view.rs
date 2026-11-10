@@ -28,9 +28,9 @@ use crate::shaders::types::{
 };
 use crate::shaders::world_cache::update;
 use crate::staged::{
-    FEATURE_DISPERSION, FEATURE_WALK, Late, MAY_ALL, MAY_CACHE, MAY_CAUSTICS, MAY_DEBUG,
-    MAY_DISPERSION, MAY_FROST, MAY_FROXELS, MAY_LENS, MAY_LOCAL, MAY_REFERENCE, MAY_STACK,
-    MAY_WALK, Source, Stage, StagedKernels, StagedMemory,
+    FEATURE_DISPERSION, FEATURE_WALK, Late, MAY_ALL, MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_DEBUG,
+    MAY_DISPERSION, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_LENS, MAY_LOCAL, MAY_REFERENCE,
+    MAY_STACK, MAY_SUBSURFACE, MAY_WALK, Source, Stage, StagedKernels, StagedMemory,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::{
@@ -1361,6 +1361,10 @@ fn scene_may(features: SceneFeatures) -> u32 {
     let stack = features.contains(SceneFeatures::INTERIORS)
         && features.contains(SceneFeatures::DIRECTIONAL_LIGHTS);
     bit(stack, MAY_STACK)
+        | bit(features.contains(SceneFeatures::COAT), MAY_COAT)
+        | bit(features.contains(SceneFeatures::FUZZ), MAY_FUZZ)
+        | bit(features.contains(SceneFeatures::THIN_FILM), MAY_FILM)
+        | bit(features.contains(SceneFeatures::SUBSURFACE), MAY_SUBSURFACE)
 }
 
 /// What `root` says its paths may meet: the bits of `specialize.slang` a root decides.
