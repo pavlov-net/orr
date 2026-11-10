@@ -26,6 +26,7 @@ use crate::loading::{BlobSource, Loading, Msg, Queue, decoded, landed, read_stor
 use crate::memory::{Block, UploadWindow};
 use crate::mount::{PAGE, StagedCopy, page_infos, submit_copies};
 use crate::producer::scratch_align;
+use crate::refine::FinerPages;
 use crate::scene::ModelId;
 use crate::shaders::accel::{AccelRoot, ClasJob};
 use crate::shaders::edit::{EditJob, EditRoot};
@@ -75,7 +76,9 @@ pub struct EditRef {
 pub(crate) struct EditSource {
     pub(crate) entry: u32,
     pub(crate) header: MeshHeader,
-    pub(crate) groups: Vec<Group>,
+    pub(crate) groups: Arc<[Group]>,
+    /// Where its pages stream: what finds each cluster's `ClusterRef.finer`.
+    pub(crate) finer: Option<Arc<FinerPages>>,
     pub(crate) pages: Vec<StreamedPage>,
     /// Sections whose every triangle is non-opaque.
     pub(crate) non_opaque: Vec<bool>,
@@ -298,8 +301,14 @@ pub(crate) fn start(task: &Arc<EditTask>) {
                             let h: PageHeader =
                                 bytemuck::pod_read_unaligned(&resident[..size_of::<PageHeader>()]);
                             let view = orr_pack::mesh::PageView::new(resident, &t.stream.header)?;
-                            let records = (0..view.cluster_count()).map(|c| view.cluster(c));
-                            let (clusters, region) = page_infos(&h, records, page);
+                            if view.cluster_count() != p.clusters {
+                                let e = orr_pack::Error::Malformed("edit page cluster count");
+                                return Err(e.into());
+                            }
+                            let records: Vec<Cluster> =
+                                (0..view.cluster_count()).map(|c| view.cluster(c)).collect();
+                            let finer = t.stream.finer.as_deref();
+                            let (clusters, region) = page_infos(&h, &records, page, finer)?;
                             let mut done = t.done.lock().unwrap();
                             done.clusters[i] = clusters;
                             done.regions[i] = region;

@@ -5,16 +5,17 @@
 // DAG roots of each stage a cut takes; `args` sizes each pass to the items the previous one
 // pushed and `traverse` runs one level: an internal node pushes the children whose projected error
 // exceeds a cut's threshold, a leaf applies the cluster rule to its group's clusters and
-// writes raster candidate items and ray-tracing cut clusters. A child in a non-resident
-// node page stops the cut at its parent, and a leaf whose group's mesh page is not resident
-// stops it at the coarser clusters the group simplifies into: the slot's errors for that
-// cut are scaled so neither is entered, the page is requested, and with `retry` a second
-// traversal replaces the slot's output for that cut. `assign`, `share` and `link` then give
-// each gathered ray-tracing cut a cached cut equal to it, the BLAS another slot with an
-// equal cut builds, a BLAS of its own within the frame's budget, or else its cached cut;
-// `gather` writes the CLAS addresses each built BLAS takes and `jobs` its build record. A posed
-// copy of an edit builds a BLAS for its body and one per animated part with clusters in the cut:
-// `split` counts them and `place` gives them their jobs and CLAS ranges.
+// writes raster candidate items and ray-tracing cut clusters. While the mesh page of a group
+// is not resident, the clusters simplified from it stand in for its clusters even where their
+// own error is over the threshold, and the page is requested: only what the page holds stays
+// coarser. A child in a non-resident node page stops the cut at its parent: the slot's errors
+// for that cut are scaled so the parent is not entered, the page is requested, and with
+// `retry` a second traversal replaces the slot's output for that cut. `assign`, `share` and
+// `link` then give each gathered ray-tracing cut a cached cut equal to it, the BLAS another
+// slot with an equal cut builds, a BLAS of its own within the frame's budget, or else its
+// cached cut; `gather` writes the CLAS addresses each built BLAS takes and `jobs` its build
+// record. A posed copy of an edit builds a BLAS for its body and one per animated part with
+// clusters in the cut: `split` counts them and `place` gives them their jobs and CLAS ranges.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.atomic;
@@ -638,6 +639,18 @@ void report_mesh_page(CutGpu* cut, MeshGpu* mesh, uint page, bool wanted, float 
     report(cut, mesh.feedback_pages + page, wanted, error);
 }
 
+// The largest projected error of `error` over `sphere` in the cuts of `mask`.
+float largest_error(Placement p, Lod l, uint mask, float4 sphere, float error)
+{
+    float worst = 0.0;
+    for (uint k = 0; k < 2; k++)
+    {
+        if ((mask & (1u << k)) != 0)
+            worst = max(worst, focus_error(p, sphere, error * l.scale[k]));
+    }
+    return worst;
+}
+
 // Scales the slot's errors so that, in the cuts of `mask`, nothing of projected error
 // `error` over `sphere` is entered, and marks those cuts for retry. Returns the largest
 // projected error.
@@ -659,14 +672,49 @@ float coarsen(SlotCutGpu* c, Placement p, Lod l, uint mask, float4 sphere, float
     return worst;
 }
 
-// Whether cluster `cl` of a group at `depth` with error `group_error` is in cut `k`.
-bool selected(MeshGpu* mesh, Placement p, Cluster cl, Lod l, uint k, uint depth, float group_error)
+// What `rule` says of a cluster in a cut.
+static const uint RULE_OUT = 0;
+static const uint RULE_IN = 1;
+// In while the group it was simplified from is not resident.
+static const uint RULE_STANDS_IN = 2;
+
+// Where cluster `cl` of a group at `depth` with error `group_error` stands in cut `k`: in when
+// its parent geometry is too coarse and its own is fine enough; with its own too coarse, it
+// stands in for finer geometry. A source cluster, at depth 0, has none finer and is in
+// whatever its own error. Under a debug level the groups at that level are in and the coarser
+// ones stand in.
+uint rule(MeshGpu* mesh, Placement p, Cluster cl, Lod l, uint k, uint depth, float group_error)
 {
     if (l.level >= 0)
-        return int(depth) == l.level || (int(depth) < l.level && isinf(group_error));
-    float self_e = cut_error(mesh, p, cl.self_sphere, cl.self_error * l.scale[k]);
+    {
+        if (int(depth) == l.level || (int(depth) < l.level && isinf(group_error)))
+            return RULE_IN;
+        return int(depth) > l.level ? RULE_STANDS_IN : RULE_OUT;
+    }
     float parent_e = cut_error(mesh, p, cl.parent_sphere, cl.parent_error * l.scale[k]);
-    return self_e <= l.threshold[k] && parent_e > l.threshold[k];
+    if (parent_e <= l.threshold[k])
+        return RULE_OUT;
+    if (depth == 0)
+        return RULE_IN;
+    float self_e = cut_error(mesh, p, cl.self_sphere, cl.self_error * l.scale[k]);
+    return self_e <= l.threshold[k] ? RULE_IN : RULE_STANDS_IN;
+}
+
+// Whether a page `ClusterRef.finer` names is not resident: the cluster then stands in for the
+// clusters of the group it was simplified from.
+bool finer_absent(MeshGpu* mesh, uint finer)
+{
+    if (finer == FINER_NONE)
+        return false;
+    if ((finer & FINER_RUN) == 0)
+        return mesh.pages[finer] == 0;
+    uint* run = mesh.finer_runs + (finer & ~FINER_RUN);
+    for (uint i = 1; i <= run[0]; i++)
+    {
+        if (mesh.pages[run[i]] == 0)
+            return true;
+    }
+    return false;
 }
 
 // One thread per item of the pass.
@@ -744,11 +792,9 @@ void traverse(uint3 id: SV_DispatchThreadID)
     uint8_t* data = (uint8_t*)mesh.pages[g.page];
     if (data == nullptr)
     {
-        // The cut stops at the coarser clusters this group simplifies into.
-        if (retry)
-            return;
-        float worst = coarsen(c, p, l, mask, g.simplified, g.error);
-        report_mesh_page(cut, mesh, g.page, true, worst);
+        // The clusters this group simplifies into stand in for it.
+        if (!retry)
+            report_mesh_page(cut, mesh, g.page, true, largest_error(p, l, mask, g.simplified, g.error));
         return;
     }
     // An edit's copy of a page is no read of the source's page its entry reports.
@@ -763,12 +809,19 @@ void traverse(uint3 id: SV_DispatchThreadID)
         for (uint i = run; i < end; i++)
         {
             Cluster cl = load_cluster(data, g.first_cluster + i);
-            if ((mask & 1) != 0 && selected(mesh, p, cl, l, 0, g.depth, g.error))
-                raster_mask |= 1u << (i - run);
-            if ((mask & 2) != 0 && !section_hidden(inst, cl.section) && selected(mesh, p, cl, l, 1, g.depth, g.error))
+            uint raster = (mask & 1) != 0 ? rule(mesh, p, cl, l, 0, g.depth, g.error) : RULE_OUT;
+            bool traced = (mask & 2) != 0 && !section_hidden(inst, cl.section);
+            uint ray = traced ? rule(mesh, p, cl, l, 1, g.depth, g.error) : RULE_OUT;
+            if (raster == RULE_STANDS_IN || ray == RULE_STANDS_IN)
             {
-                gather_cluster(cut, c, slot | (retry ? WORK_RETRY : 0), id_first + i, mesh_first + i);
+                uint stands = finer_absent(mesh, s.clusters[id_first + i].finer) ? RULE_IN : RULE_OUT;
+                raster = raster == RULE_STANDS_IN ? stands : raster;
+                ray = ray == RULE_STANDS_IN ? stands : ray;
             }
+            if (raster == RULE_IN)
+                raster_mask |= 1u << (i - run);
+            if (ray == RULE_IN)
+                gather_cluster(cut, c, slot | (retry ? WORK_RETRY : 0), id_first + i, mesh_first + i);
         }
         if (raster_mask != 0)
         {
@@ -795,7 +848,7 @@ void finish(uint3 id: SV_DispatchThreadID)
     cut.counters[CUT_QUEUE + 1] = 0;
 }
 
-// The second traversal's roots: every cut a node or page not resident stopped, at its scaled
+// The second traversal's roots: every cut a node page not resident stopped, at its scaled
 // errors. Its raster candidates replace the first's for both steps of a fading copy.
 [shader("compute")]
 [numthreads(64, 1, 1)]

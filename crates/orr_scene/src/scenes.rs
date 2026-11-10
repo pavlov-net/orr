@@ -106,7 +106,7 @@ pub struct Budgets {
     /// name, and bound in pages as they need.
     pub mesh_page_pool: u64,
     /// Bytes of `mesh_page_pool` per entry of the resident cluster table, which holds the
-    /// clusters of resident mesh pages and of edits' own pages, 24 B each. A mount whose
+    /// clusters of resident mesh pages and of edits' own pages, 32 B each. A mount whose
     /// pinned pages' clusters find no room fails, and a streamed page that finds none loads
     /// later while the mesh page budget shrinks. A cooked scene of 101.8 M clusters holds
     /// 1,376 B of resident page per cluster, before a streamed page's CLAS. Above 0.
@@ -1962,7 +1962,7 @@ impl<'a> Frame<'a> {
                 merge_pixels: core.rt_merge_pixels,
                 slots: cpu.ptlas.high_water,
                 passes: hierarchy.depth,
-                streamed: hierarchy.streamed,
+                paged: hierarchy.paged,
                 max_clas: hierarchy.max_clusters,
                 parted_edits: core.mounts.has_parted_edit(),
                 slot: (self.id % u64::from(core.fif)) as usize,

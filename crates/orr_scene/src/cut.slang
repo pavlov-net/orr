@@ -9,8 +9,8 @@ import orr_shaders.abi;
 public static const uint CUT_RASTER = 1;        // the slot has raster candidates this frame
 public static const uint CUT_TRAVERSED = 2;     // the traversal gathered its ray-tracing cut
 public static const uint CUT_DISTANT = 4;       // it traces its model's merged cut
-public static const uint CUT_RETRY_RASTER = 8;  // a node or page not resident stopped its raster cut
-public static const uint CUT_RETRY_RT = 16;     // a node or page not resident stopped its ray-tracing cut
+public static const uint CUT_RETRY_RASTER = 8;  // a node page not resident stopped its raster cut
+public static const uint CUT_RETRY_RT = 16;     // a node page not resident stopped its ray-tracing cut
 public static const uint CUT_OWNER = 32;        // it builds the BLAS its equal cuts share
 public static const uint CUT_PARTS = 64;        // its gathered cut builds a body BLAS and one per animated part
 

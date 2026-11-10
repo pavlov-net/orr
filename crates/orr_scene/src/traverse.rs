@@ -3,10 +3,12 @@
 //!
 //! The `traverse` kernels walk each mesh's hierarchy one level a pass (multipass, no
 //! persistent threads), entering a node while its projected error exceeds a cut's threshold
-//! and applying the cluster rule at each leaf's group. A node in a non-resident hierarchy
-//! page stops the cut at its parent: the copy's errors for that cut scale down so the parent
-//! is not entered, a second traversal replaces the copy's output, and the page is requested
-//! through the frame's feedback. Ray-tracing cuts of distant copies are their model's merged
+//! and applying the cluster rule at each leaf's group. While a group's streamed mesh page is
+//! not resident, the clusters simplified from it stand in for its clusters, so a missing page
+//! coarsens only what it holds, and the page is requested through the frame's feedback. A node
+//! in a non-resident hierarchy page stops the cut at its parent: the copy's errors for that cut
+//! scale down so the parent is not entered, a second traversal replaces the copy's output, and
+//! the page is requested likewise. Ray-tracing cuts of distant copies are their model's merged
 //! cut; the cuts of near copies are matched against their mesh's cached cuts, shared between
 //! copies with equal cuts, and otherwise built as cluster BLAS within the frame's budget.
 //! Copies tracing a cached cut of a streaming mesh ask for the finer cut that would serve
@@ -242,9 +244,9 @@ pub(crate) struct CutInputs {
     pub(crate) slots: u32,
     /// Passes of one traversal: the deepest resident hierarchy's levels.
     pub(crate) passes: u32,
-    /// A resident mesh pages its hierarchy or streams its cluster pages: the second traversal
-    /// runs for the cuts a page that is not resident stopped.
-    pub(crate) streamed: bool,
+    /// A resident mesh pages its hierarchy: the second traversal runs for the cuts a node page
+    /// that is not resident stopped.
+    pub(crate) paged: bool,
     /// CLAS in the largest cut a mesh can trace.
     pub(crate) max_clas: u32,
     /// A copy of an edit may gather one BLAS per animated part.
@@ -485,7 +487,7 @@ impl Cuts {
         };
         if passes > 0 {
             run(list, 0)?;
-            if f.streamed {
+            if f.paged {
                 list.dispatch(p.get(k.retry), root(passes)?, groups(f.slots));
                 step(list);
                 run(list, passes)?;

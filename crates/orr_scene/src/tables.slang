@@ -203,6 +203,12 @@ public struct MeshLevel
     public uint count;
 }
 
+// `ClusterRef.finer` of a cluster simplified from no streamed group.
+public static const uint FINER_NONE = 0xffffffff;
+// `ClusterRef.finer` with this bit: the rest is an offset in `MeshGpu.finer_runs`, where a
+// page count and that many pages follow.
+public static const uint FINER_RUN = 0x80000000;
+
 // A resident cluster, named by its cluster id: the id its CLAS carries, its page's base in
 // `MeshGpu.page_bases` plus its index in the page.
 public struct ClusterRef
@@ -211,6 +217,12 @@ public struct ClusterRef
     public uint local;             // index in the page
     public uint mesh_cluster;      // mesh cluster index
     public uint64_t clas;          // 0 where the device builds none
+    // The streamed page of the group the cluster was simplified from, whose clusters take its
+    // place while that page is resident, or FINER_NONE. Where groups in several pages hold
+    // the bounds and error the cluster was simplified from, FINER_RUN and the offset of their
+    // pages, any of which may hold its group.
+    public uint finer;
+    public uint _pad;
 }
 
 // One cut of a mesh that ray tracing can use: the cluster BLAS over its clusters, the
@@ -328,6 +340,7 @@ public struct MeshGpu
     public uint8_t* nodes;         // DAG mode: the Node table of a resident hierarchy, else null
     public uint8_t* node_table;    // DAG mode: the NodePage table of a paged hierarchy, else null
     public uint8_t* groups;        // DAG mode: the Group table
+    public uint* finer_runs;       // a streaming mesh's runs of pages `ClusterRef.finer` names; null without
     public uint* roots;            // DAG mode: MeshHeader.roots
     public uint root_count;
     public uint pinned_pages;      // pages resident from mount, all of them unless pages stream
