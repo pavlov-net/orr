@@ -24,11 +24,11 @@ use std::time::{Duration, Instant};
 use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    CausticSettings, CompilingKernels, Display, DisplayRequest, ExposureTelemetry, FrameDesc,
-    FrameStats, FrameTime, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, LitView,
-    PackSource, Projection, ReferenceSettings, Renderer, RendererDesc, ResolvedDisplay, SceneDesc,
-    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, UiPass, ViewHooks,
-    ViewLighting, ViewOutput, ViewTarget,
+    CausticSettings, Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameStats, FrameTime,
+    GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, LitView, PackSource, Projection,
+    ReferenceSettings, Renderer, RendererDesc, ResolvedDisplay, SceneDesc, SceneLightingSettings,
+    ScreenshotRequest, TextureFilter, TransformGroupDesc, UiPass, ViewHooks, ViewLighting,
+    ViewOutput, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, Manifest, MeshSettings, Source, TextureSettings, Usage,
@@ -402,7 +402,7 @@ fn run(options: &Options) -> Option<Capture> {
     if !options.headless && !reference && std::env::var_os("ORR_SCRATCH_NO_DLSS").is_none() {
         enable_dlss(&mut renderer);
     }
-    let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
+    let _workers = Workers::machine(renderer.loading());
     let (mount, mut frame) = mount_at(
         &mut renderer,
         PackSource::Memory(cook(gltf, studio)),

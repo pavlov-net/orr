@@ -1229,12 +1229,6 @@ pub struct CompilingKernels {
 }
 
 impl CompilingKernels {
-    /// The jobs [`LightingKernels::spawn`] queues: one per pipeline of the kernels beside the
-    /// path kernels. The path kernels' pipelines compile as jobs of their own once a view's
-    /// first frame says what its paths may meet, at most ten at a time. A consumer lends this
-    /// many threads for them to compile at once, and more to keep loading while they do.
-    pub const JOBS: usize = 18;
-
     fn jobs(&self) -> Vec<&dyn JobState> {
         let mut out: Vec<&dyn JobState> = self.support.iter().map(|j| j as &dyn JobState).collect();
         match &self.paths {
@@ -1524,7 +1518,7 @@ impl LightingKernels {
         })
     }
 
-    /// [`Self::new`] as jobs on `loading`, at most [`CompilingKernels::JOBS`] of them, each
+    /// [`Self::new`] as jobs on `loading`, one per pipeline, each
     /// writing the device's pipeline cache file when it finishes, so an interrupted first run
     /// keeps what it compiled. Returns at once; a job that fails or panics reports it through
     /// [`CompilingKernels::finish`].

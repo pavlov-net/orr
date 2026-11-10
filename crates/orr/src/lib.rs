@@ -672,13 +672,13 @@ impl Renderer {
     /// The first call, and the first after a failed compile, starts the lighting kernels
     /// without compiling on this thread. If the pipeline caches hold those every view runs
     /// ([`RendererDesc::try_cached_paths`]), they are ready when it returns. Otherwise they
-    /// compile as jobs on [`Renderer::loading`], [`CompilingKernels::JOBS`] of them, which take
-    /// minutes on a first run, holding their threads the whole time. The path pipelines are
+    /// compile as jobs on [`Renderer::loading`], one per pipeline, which take up to a minute
+    /// on a first run, holding their threads the whole time. The path pipelines are
     /// compiled for what a view's scene and settings may meet, as jobs of their own when the
     /// view first renders. Until both are ready [`Frame::render_view`] renders black.
     /// The jobs need threads: lend them with [`Loading::run_worker`] or
-    /// [`Loading::run_one`], at least [`CompilingKernels::JOBS`] to compile in parallel and more
-    /// to keep loading meanwhile, or block in [`Renderer::wait_paths`]. With neither, views stay
+    /// [`Loading::run_one`], as many as the machine has to spare so that they compile in
+    /// parallel while loading goes on, or block in [`Renderer::wait_paths`]. With neither, views stay
     /// black, and a warning is logged after a few seconds of frames.
     ///
     /// Each job writes the device's pipeline cache file when it finishes. Dropping the renderer

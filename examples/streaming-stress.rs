@@ -20,11 +20,11 @@ use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::mesh::MeshInfo;
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
-    Budgets, CompilingKernels, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc,
-    FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView,
-    PackSource, Projection, Renderer, RendererDesc, ResidencyClass, SceneDesc,
-    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewHooks,
-    ViewLighting, ViewOutput, ViewTarget,
+    Budgets, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
+    GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource,
+    Projection, Renderer, RendererDesc, ResidencyClass, SceneDesc, SceneLightingSettings,
+    ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput,
+    ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source, TextureSettings, Usage,
@@ -276,7 +276,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .expect("display")
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
-    let _workers = Workers::new(renderer.loading(), 4 + CompilingKernels::JOBS);
+    let _workers = Workers::machine(renderer.loading());
     let (mount, mut frame) = mount_at(&mut renderer, PackSource::Memory(pack), FIRST_FRAME);
     let scene = renderer
         .create_scene(

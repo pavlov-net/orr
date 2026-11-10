@@ -18,10 +18,9 @@ use orr_gpu::{
     TextureUsage,
 };
 use orr_lighting::{
-    BsdfTables, CompilingKernels, DirectionalLight, DiscProfile, DofBackgroundPass,
-    EnvironmentMapGpu, Light, LightId, LightingKernels, LightingView, ParticleDraw, PathEntry,
-    PathNeeds, ReferenceSettings, SceneLighting, SceneLightingSettings, ScenePass, ViewLighting,
-    ViewPass,
+    BsdfTables, DirectionalLight, DiscProfile, DofBackgroundPass, EnvironmentMapGpu, Light,
+    LightId, LightingKernels, LightingView, ParticleDraw, PathEntry, PathNeeds, ReferenceSettings,
+    SceneLighting, SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
 };
 use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
@@ -2556,6 +2555,11 @@ pub struct Paths {
     pub every_tile: bool,
 }
 
+/// Threads that compile a bed's pipelines at once: the machine's.
+fn compile_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, std::num::NonZero::get)
+}
+
 impl Paths {
     /// The kernels of a set and entry compile once per process, on threads of their own, and
     /// stay: under the validation layer each compile takes minutes.
@@ -2587,7 +2591,7 @@ impl Paths {
             let loading = Arc::new(orr_scene::testing::loading());
             let jobs = LightingKernels::spawn(device(), kernels, &tables, entry, &loading);
             std::thread::scope(|threads| {
-                for _ in 1..CompilingKernels::JOBS {
+                for _ in 1..compile_threads() {
                     threads.spawn(|| while loading.run_one() {});
                 }
                 jobs.wait(&loading);
@@ -2597,7 +2601,7 @@ impl Paths {
             // the stages and kernels a view runs once its compiles have finished.
             kernels.compile_rest();
             std::thread::scope(|threads| {
-                for _ in 0..CompilingKernels::JOBS {
+                for _ in 0..compile_threads() {
                     threads.spawn(|| while loading.run_one() {});
                 }
             });
@@ -2678,7 +2682,7 @@ impl Paths {
         {
             // The pipelines these paths first ask for compile on threads of their own.
             std::thread::scope(|threads| {
-                for _ in 1..CompilingKernels::JOBS {
+                for _ in 1..compile_threads() {
                     threads.spawn(|| while self.loading.run_one() {});
                 }
                 self.kernels.wait_paths(lighting, &needs, settings).unwrap();

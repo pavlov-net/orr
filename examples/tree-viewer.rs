@@ -38,10 +38,10 @@ use orr::orr_pack::model::ModelInfo;
 use orr::orr_pack::skeleton::{NO_PARENT, SkeletonInfo};
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
-    CompilingKernels, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
-    InstancesDesc, LightId, LitView, PackSource, Pose, Projection, Renderer, RendererDesc,
-    SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc,
-    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc,
+    LightId, LitView, PackSource, Pose, Projection, Renderer, RendererDesc, SceneDesc,
+    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewHooks,
+    ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_atmosphere::{Atmosphere, AtmosphereState};
 use orr_cook::{
@@ -435,7 +435,7 @@ fn run(options: &Options) -> Option<Capture> {
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
     enable_dlss(&mut renderer);
-    let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
+    let _workers = Workers::machine(renderer.loading());
     let surroundings = cook_surroundings((radius * 8.0).max(40.0));
     let (mounts, mut frame) = mount_all_at(
         &mut renderer,

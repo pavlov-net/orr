@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
 use orr::{
-    CompilingKernels, Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameTime, HookPass,
-    Lens, LitView, Projection, Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest,
-    TextureFilter, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameTime, HookPass, Lens, LitView,
+    Projection, Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest, TextureFilter,
+    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_examples::average::Average;
 use orr_examples::linked::KERNELS;
@@ -68,7 +68,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     if !options.headless {
         enable_dlss(&mut renderer);
     }
-    let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
+    let _workers = Workers::machine(renderer.loading());
     let mut showcase = Showcase::load(&mut renderer, gpu);
     let scene = showcase.scene;
     let history = renderer.create_view_history().expect("view history");

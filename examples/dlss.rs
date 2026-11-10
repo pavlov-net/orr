@@ -36,9 +36,9 @@ use orr::orr_output::Image;
 use orr::orr_output::orr_dlss::raw::Ngx;
 use orr::orr_output::orr_dlss::{Quality, SrInputs, SuperResolution};
 use orr::{
-    CompilingKernels, Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime,
-    Lens, LitView, Projection, Reconstruction, Renderer, RendererDesc, TextureFilter,
-    UpscaleQuality, ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime, Lens, LitView,
+    Projection, Reconstruction, Renderer, RendererDesc, TextureFilter, UpscaleQuality, ViewDesc,
+    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_examples::linked::KERNELS;
 use orr_examples::overlay::Overlay;
@@ -176,7 +176,7 @@ fn run(options: &Options) {
     if let Some(sdk) = &sdk {
         renderer.set_reconstruction(sdk.clone());
     }
-    let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
+    let _workers = Workers::machine(renderer.loading());
     let mut showcase = Showcase::load(&mut renderer, gpu);
     let scene = showcase.scene;
     let history = renderer.create_view_history().expect("view history");
