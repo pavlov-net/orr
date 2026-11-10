@@ -704,9 +704,10 @@ impl Renderer {
         Ok(id)
     }
 
-    /// Whether the path tracing kernels have compiled, so the next frame's views render lit. False
-    /// also before the first view history and after a failed compile.
-    pub fn paths_ready(&mut self) -> bool {
+    /// Whether the lighting kernels every view runs have compiled. False also before the first
+    /// view history and after a failed compile. A view's own path pipelines compile when it
+    /// first renders: [`Frame::view_lit`] says whether a view renders lit.
+    pub fn kernels_ready(&mut self) -> bool {
         self.lighting.paths.poll();
         matches!(self.lighting.paths, Paths::Ready(_))
     }
@@ -962,12 +963,6 @@ impl<'a> Frame<'a> {
         self.scenes.id()
     }
 
-    /// Whether this frame's views render lit, or black because the path tracing kernels are still
-    /// compiling. The answer holds for the whole frame.
-    pub fn paths_ready(&self) -> bool {
-        matches!(self.lighting.paths, Paths::Ready(_))
-    }
-
     /// The exposure telemetry of the view's newest completed render. Read it before the
     /// view renders this frame: the frame's render reuses the oldest render's readback.
     pub fn exposure_telemetry(&self, history: ViewHistoryId) -> Option<ExposureTelemetry> {
@@ -1045,6 +1040,60 @@ impl<'a> Frame<'a> {
     pub fn raster_view(&mut self, view: &ViewDesc) -> Result<RasterView> {
         self.prepare_raster_view(view)?;
         Ok(self.scenes.raster_view(view)?)
+    }
+
+    /// Whether [`Frame::render_view`] renders `view` lit this frame under `lighting`, or black
+    /// because the kernels or the path pipelines its scene and settings ask for are still
+    /// compiling; it asks for those pipelines. The answer holds for the frame once
+    /// [`Frame::update_scenes`] has run. A compile that failed returns [`Error::PathKernels`].
+    pub fn view_lit(&mut self, view: &LitView<'_>, lighting: &ViewLighting) -> Result<bool> {
+        if let Paths::Failed(e) = &self.lighting.paths {
+            return Err(Error::PathKernels(Arc::clone(e)));
+        }
+        self.ask_paths(view, lighting, false)
+    }
+
+    /// Asks for the path pipelines `view` takes under `lighting` and says whether it renders
+    /// lit: they are ready, or the caller waits for them ([`Renderer::wait_paths`]), which
+    /// `wait` does here. A failed compile fails the kernels.
+    fn ask_paths(
+        &mut self,
+        view: &LitView<'_>,
+        lighting: &ViewLighting,
+        wait: bool,
+    ) -> Result<bool> {
+        let Paths::Ready(kernels) = &self.lighting.paths else {
+            return Ok(false);
+        };
+        let scene = self
+            .lighting
+            .scenes
+            .get(&view.scene)
+            .ok_or(SceneError::UnknownScene(view.scene))?;
+        let needs = PathNeeds {
+            features: self.scenes.scene_features(view.scene)?,
+            frosted_glass: self
+                .output
+                .views
+                .get(&view.history)
+                .is_some_and(|state| state.reconstruction.is_some()),
+            dof_background: false,
+        };
+        let waits = self.lighting.waits;
+        let asked = kernels
+            .prepare_paths(scene, &needs, lighting)
+            .and_then(|ready| {
+                if !ready && waits && wait {
+                    kernels.wait_paths(scene, &needs, lighting)?;
+                }
+                Ok(ready || waits)
+            });
+        asked.map_err(|e| {
+            log::error!("{e}");
+            let e = Arc::new(e);
+            self.lighting.paths = Paths::Failed(Arc::clone(&e));
+            Error::PathKernels(e)
+        })
     }
 
     /// Step 2: works out the render extent [`Frame::render_view`] gives `view` with these
@@ -1138,7 +1187,7 @@ impl<'a> Frame<'a> {
     /// ([`orr_lighting::LightingView::depth_of_field_guide`] among them, with the blur rough
     /// glass gives what lies behind it).
     ///
-    /// While the path tracing kernels compile ([`Frame::paths_ready`] false) only the view's raster
+    /// While the kernels or the view's path pipelines compile ([`Frame::view_lit`] false) only the view's raster
     /// half runs, so streaming goes on while a loading thread is free, and everything after it
     /// holds black:
     /// [`RenderedView::compiling`] is set, ray reconstruction, exposure, motion blur, glare and
@@ -1159,46 +1208,7 @@ impl<'a> Frame<'a> {
             return Err(Error::PathKernels(Arc::clone(e)));
         }
         let (extent, render) = self.resolve_view(view, lighting, output)?;
-        // The path pipelines compile for what the scene and the settings may meet: a view
-        // asks for its own here and stays black until they are ready, unless the caller waits.
-        let asked = match &self.lighting.paths {
-            Paths::Ready(kernels) => {
-                let features = self.scenes.scene_features(view.scene)?;
-                let scene = self
-                    .lighting
-                    .scenes
-                    .get(&view.scene)
-                    .ok_or(SceneError::UnknownScene(view.scene))?;
-                let needs = PathNeeds {
-                    features,
-                    frosted_glass: self
-                        .output
-                        .views
-                        .get(&view.history)
-                        .is_some_and(|state| state.reconstruction.is_some()),
-                    dof_background: false,
-                };
-                let waits = self.lighting.waits;
-                kernels
-                    .prepare_paths(scene, &needs, lighting)
-                    .and_then(|ready| {
-                        if !ready && waits {
-                            kernels.wait_paths(scene, &needs, lighting)?;
-                        }
-                        Ok(ready || waits)
-                    })
-            }
-            _ => Ok(false),
-        };
-        let lit = match asked {
-            Ok(lit) => lit,
-            Err(e) => {
-                log::error!("{e}");
-                let e = Arc::new(e);
-                self.lighting.paths = Paths::Failed(Arc::clone(&e));
-                return Err(Error::PathKernels(e));
-            }
-        };
+        let lit = self.ask_paths(view, lighting, true)?;
         let Paths::Ready(kernels) = &self.lighting.paths else {
             return self.render_view_black(view, output, hooks, extent, render);
         };

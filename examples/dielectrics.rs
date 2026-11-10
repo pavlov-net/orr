@@ -321,7 +321,8 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .expect("prepare view");
         f.update_scenes(&mut |c| pond.record(c, POND, slab_kernel, t as f32))
             .expect("update scenes");
-        let mut average = average.hook(&f, extent);
+        let lit = f.view_lit(&view, &lighting).expect("path pipelines");
+        let mut average = average.hook(&f, extent, lit);
         let mut hooks = ViewHooks {
             scene_referred: average_frames
                 .then_some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),

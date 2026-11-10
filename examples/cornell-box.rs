@@ -601,7 +601,8 @@ fn run(options: &Options) -> Option<Capture> {
         f.prepare_view(&view, &lighting, &output)
             .expect("prepare view");
         f.update_scenes(&mut |_| {}).expect("update scenes");
-        let mut average = average.hook(&f, extent);
+        let lit = f.view_lit(&view, &lighting).expect("path pipelines");
+        let mut average = average.hook(&f, extent, lit);
         let mut ui = |pass: &mut UiPass<'_, '_>| overlay.paint(pass, id);
         let mut hooks = ViewHooks {
             scene_referred: Some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),

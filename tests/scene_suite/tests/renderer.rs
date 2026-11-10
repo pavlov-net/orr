@@ -574,7 +574,7 @@ fn frames_around_the_compile(
             &Default::default(),
         )
         .unwrap();
-    assert!(!r.paths_ready());
+    assert!(!r.kernels_ready());
     let history = r.create_view_history().unwrap();
     assert_eq!(r.paths_outstanding() as usize, CompilingKernels::JOBS);
     let [w, h] = [320, 240];
@@ -591,7 +591,7 @@ fn frames_around_the_compile(
     for i in 0..waiting + lit {
         if i == waiting {
             r.wait_paths().unwrap();
-            assert!(r.paths_ready());
+            assert!(r.kernels_ready());
             assert_eq!(r.paths_outstanding(), 0);
         }
         frame += 1;
@@ -602,7 +602,6 @@ fn frames_around_the_compile(
                 display: None,
             })
             .unwrap();
-        assert_eq!(f.paths_ready(), i >= waiting);
         if i == 0 {
             place_floor_and_box(&f, scene, models);
         }
@@ -631,9 +630,12 @@ fn frames_around_the_compile(
             } else {
                 DVec3::new(0.2 * f64::from(i - waiting), 2.0, 4.0)
             };
+            let view = view_of(scene, history, eye, &image);
+            let lit = f.view_lit(&view, &ViewLighting::default()).unwrap();
+            assert_eq!(lit, !waited);
             let rendered = f
                 .render_view(
-                    &view_of(scene, history, eye, &image),
+                    &view,
                     &ViewLighting::default(),
                     &ViewOutput::default(),
                     &mut hooks,
@@ -747,7 +749,7 @@ fn a_failed_path_compile_comes_back_from_render_view_and_wait_paths() {
     f.end().unwrap();
     d.wait_submitted(Duration::from_secs(10)).unwrap();
     failed(r.wait_paths().unwrap_err());
-    assert!(!r.paths_ready());
+    assert!(!r.kernels_ready());
     assert_eq!(r.paths_outstanding(), 0);
 }
 
