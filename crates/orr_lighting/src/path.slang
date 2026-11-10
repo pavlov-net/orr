@@ -131,7 +131,6 @@ public struct PathStages
     public uint4* words;                // a path's state: the words its root's features name (path/stages.slang)
     public uint4* shadows;              // what a deferred shadow ray keeps of its vertex where paths track interiors; null elsewhere
     public uint4* records;              // RECORD_WORDS words per slot: the path records
-    public uint4* walks;                // WALK_WORDS words per slot: a walk's entry; null where no material walks
 }
 
 // A queue of path slots in one round: the workgroups its stage runs over, which whoever

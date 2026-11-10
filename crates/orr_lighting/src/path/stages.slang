@@ -242,12 +242,18 @@ static const uint SHADOW_COUNTED = 1 << 4;
 static const uint SHADOW_BEND = 1 << 5;     // a directional light's ray looks for plane stacks
 static const uint SHADOW_DEPTH_SHIFT = 8;
 
-// The vertex a walk starts from and the direction it enters along, for the walk stage.
+// The direction a walk enters its vertex along, for the walk stage, and what it resolves the
+// vertex again with: the hit the span still holds, with the cone that reached it, or the
+// G-buffer's surface.
 struct WalkEntry
 {
-    LayerVertex l;
     float3 wi;
+    uint flags;                     // WALK_*
+    RayCone cone;
 }
+
+static const uint WALK_FIRST = 1 << 0;      // the vertex is the camera ray's
+static const uint WALK_GBUFFER = 1 << 1;    // the vertex is the G-buffer's surface
 
 // Words of each part of a path's state, in `PathStages.words` in this order: the parts every
 // path keeps, then those of paths that may lie in an interior (FEATURE_INTERIORS: their
@@ -257,9 +263,11 @@ struct WalkEntry
 //
 // The span is what lives from one stage to the next alone, so its words hold two things by
 // turns: from a shade to the trace, the origin of the ray the vertex left and its deferred
-// shadow ray; from the trace to a shade, the hit and its corners, or the scatter or way out the
-// trace stage made. Its first word's last scalar counts the path's rays and its last word's
-// the ray's flags, in both.
+// shadow ray; from the trace to a shade, and on to the walk a shade starts, the hit and its
+// corners, or the scatter or way out the trace stage made. Its first word's last scalar counts
+// the path's rays and its last word's the ray's flags, in both. A walk's entry takes what the
+// vertex's ray leaves unused until the walk's exit leaves the next: the words of the point its
+// light densities are taken from, and two scalars of the span beside the corners.
 static const uint LOOP_WORDS = 4;
 static const uint RAY_WORDS = 3;
 static const uint SPAN_WORDS = 5;
@@ -283,7 +291,6 @@ public static const uint SHADOW_INTERIOR_WORDS = 9;
 // fewer paths.
 public static const uint RECORD_WORDS = 2;
 public static const uint UPDATE_RECORD_WORDS = 9;
-public static const uint WALK_WORDS = 22;
 
 bool interiors_tracked(PathRoot r)
 {
@@ -709,8 +716,25 @@ void store_shadow(PathRoot r, uint slot, PathShadowRay q)
     }
 }
 
-WalkEntry load_walk(PathRoot r, uint slot) { return load_words<WalkEntry, WALK_WORDS>(r.stages.walks, r.stages.capacity, 0, slot); }
-void store_walk(PathRoot r, uint slot, WalkEntry v) { store_words<WalkEntry, WALK_WORDS>(r.stages.walks, r.stages.capacity, 0, slot, v); }
+WalkEntry load_walk(PathRoot r, uint slot)
+{
+    PathStages* st = r.stages;
+    uint4 w = st.words[word_index(st, RAY_FIRST + 2, slot)];
+    WalkEntry v;
+    v.wi = asfloat(w.xyz);
+    v.flags = w.w;
+    float2 cone = asfloat(st.words[word_index(st, SPAN_FIRST + 4, slot)].yz);
+    v.cone.width = cone.x;
+    v.cone.spread = cone.y;
+    return v;
+}
+
+void store_walk(PathRoot r, uint slot, WalkEntry v)
+{
+    PathStages* st = r.stages;
+    st.words[word_index(st, RAY_FIRST + 2, slot)] = uint4(asuint(v.wi), v.flags);
+    st.words[word_index(st, SPAN_FIRST + 4, slot)].yz = asuint(float2(v.cone.width, v.cone.spread));
+}
 
 // The path's plane stack, which only paths that track stacks keep.
 PathStack load_stack(PathRoot r, uint slot)
@@ -2245,6 +2269,7 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, 
     PathContext x = path_context(r, record, f.pixel);
     Sampler rng = p.rng;
     ShadeVertex sv = no_vertex();
+    WalkEntry reached = (WalkEntry)0;
     uint kind = VERTEX_OPAQUE;
     if (K == QUEUE_OTHER)
         kind = !has(p.flags, LOOP_MEDIUM) ? VERTEX_LAYER : has(p.flags, LOOP_LEAVING) ? VERTEX_LEAVE : VERTEX_SCATTER;
@@ -2263,6 +2288,8 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, 
     }
     else
     {
+        reached.cone = p.cone;
+        reached.flags = (has(p.flags, LOOP_CAMERA) ? WALK_FIRST : 0) | (K != QUEUE_OTHER && has(p.flags, LOOP_GBUFFER_HIT) ? WALK_GBUFFER : 0);
         // A path that starts on the G-buffer's surface resolves it before its first iteration.
         bool start_vertex = K != QUEUE_OTHER && has(p.flags, LOOP_GBUFFER_START);
         set_flag(p.flags, LOOP_GBUFFER_START, false);
@@ -2283,28 +2310,35 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, 
     ShadeNee nee;
     bool alive = shade_vertex<S, M, SHADE_VERTEX>(r, f, p, c, record, x, kind, nee_mode, rng, sv, walking, wi, nee);
     p.rng = rng;
-    if (nee.traced)
-        store_shadow(r, slot, nee.q);
     if (K != QUEUE_OTHER && alive && walking)
     {
-        // The walk takes the place of the vertex's ray.
-        WalkEntry entry = { sv.l, wi };
-        store_walk(r, slot, entry);
+        // The walk takes the place of the vertex's ray, and its stage resolves the vertex again
+        // from the hit the span holds: the vertex's shadow ray, which would take the span, is
+        // traced here.
+        if (nee.traced)
+        {
+            StackLight stack;
+            shadow_add(nee.q, c.spectral.color(nee.q.contribution * shadow_trace<S, M>(r, nee.q, stack)), p, record);
+        }
+        reached.wi = wi;
+        store_walk(r, slot, reached);
         // The walk stage goes on from the interiors and stack the path holds here, which no stage
         // has stored for a vertex the primary stage shades. The walk's exit leaves the next ray.
         store_interior(r, slot, c.interior);
         store_stack(r, slot, c.stack);
-        set_flag(p.flags, LOOP_SHADOW, nee.traced);
+        set_flag(p.flags, LOOP_SHADOW, false);
         store_spectral(r, slot, c.spectral);
         store_loop(r, slot, p);
         append(r, QUEUE_WALK, round_now(r), slot);
         return;
     }
+    if (nee.traced)
+        store_shadow(r, slot, nee.q);
     leave_shade(r, slot, f, p, c, alive, nee.traced, next);
 }
 
 // The walk stage: the subsurface walk an opaque vertex started, its exit vertex and that
-// vertex's iteration up to its ray, with the shadow rays of both vertices.
+// vertex's iteration up to its ray, with the exit's shadow ray.
 public void walk_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
 {
     PathRoot r = specialized(root);
@@ -2328,14 +2362,21 @@ public void walk_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     c.spectral = load_spectral(r, slot);
     Sampler rng = p.rng;
     ShadeVertex sv = no_vertex();
-    sv.l = entry.l;
-    // The shadow rays of the vertex the walk left and of its exit.
-    PathShadowRay rays[2];
-    bool traced[2] = { has(p.flags, LOOP_SHADOW), false };
-    rays[0] = (PathShadowRay)0;
-    rays[1] = (PathShadowRay)0;
-    if (traced[0])
-        rays[0] = load_shadow(r, slot);
+    // The vertex the walk starts from, as its shade resolved it.
+    if (has(entry.flags, WALK_GBUFFER))
+    {
+        PathVertex gx;
+        gbuffer_vertex(s, v, r.gbuffer, f.pixel, gx);
+        sv.l = opaque_vertex(gx);
+    }
+    else
+    {
+        PathPending pending = load_pending(r, slot, false);
+        float3 dir = asfloat(st.words[word_index(st, RAY_FIRST, slot)].xyz);
+        HitContext context = hit_context(has(entry.flags, WALK_FIRST) ? HIT_PRIMARY : HIT_SECONDARY, p.depth, entry.cone, pending.t, texture_tap(v, f.pixel, r.frame, r.seed, p.depth), x.feedback);
+        SurfaceHit sh = resolve_hit<FeedbackSurface<S>>(s, v, dir, pending.hit.instance_index, uint(pending.hit.cluster_id), pending.hit.primitive_index, pending.hit.barycentrics, pending.positions, false, context);
+        sv.l = opaque_vertex(hit_vertex(v, sh, dir));
+    }
     ShadeNee nee = (ShadeNee)0;
 
     Walk walk = walk_from(sv.l.x, vertex_params(sv.l, p.opaque > 1 && !x.reference), entry.wi, rng);
@@ -2377,26 +2418,17 @@ public void walk_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         bool walking;
         float3 wi;
         alive = shade_vertex<S, M, SHADE_EXIT>(r, f, p, c, record, x, VERTEX_OPAQUE, NEE_DEFER, rng, sv, walking, wi, nee);
-        traced[1] = nee.traced;
-        rays[1] = nee.q;
     }
-    for (uint i = 0; i < 2; i++)
+    if (nee.traced)
     {
-        if (!traced[i])
-            continue;
-        PathShadowRay q = rays[i];
         StackLight stack;
-        float3 vis = shadow_trace<S, M>(r, q, stack);
-        float3 added = q.contribution * vis;
+        float3 vis = shadow_trace<S, M>(r, nee.q, stack);
         // Through a plane stack the exit's scatter weighs the light again.
-        if (i == 1)
-        {
-            float scatter_pdf;
-            float3 e = nee_bent(nee.d, sv.exit_scatter, vis, stack, float3(1.0), false, scatter_pdf);
-            float mis = nee.weight_one ? 1.0 : mis_balance(nee.run * nee.d.chosen.pdf, scatter_pdf);
-            added = nee.throughput * (e * emitter_view<CoverageFeedback<S>>(r, nee.d.chosen, nee.exterior_ior, vis) * (nee.d.W * mis / nee.run));
-        }
-        shadow_add(q, c.spectral.color(added), p, record);
+        float scatter_pdf;
+        float3 e = nee_bent(nee.d, sv.exit_scatter, vis, stack, float3(1.0), false, scatter_pdf);
+        float mis = nee.weight_one ? 1.0 : mis_balance(nee.run * nee.d.chosen.pdf, scatter_pdf);
+        float3 added = nee.throughput * (e * emitter_view<CoverageFeedback<S>>(r, nee.d.chosen, nee.exterior_ior, vis) * (nee.d.W * mis / nee.run));
+        shadow_add(nee.q, c.spectral.color(added), p, record);
     }
     p.rng = rng;
     leave_shade(r, slot, f, p, c, alive, false, round_now(r) + 1);

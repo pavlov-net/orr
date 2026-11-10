@@ -28,8 +28,8 @@ const QUEUE_RICH: u64 = 5;
 const STAGE_QUEUES: u64 = 6;
 /// Its words of 16 bytes per path slot: the state every path keeps and the parts of paths that
 /// may lie in an interior, track plane stacks and may split by wavelength; what a deferred
-/// shadow ray keeps of its vertex where paths track interiors; the record, and an update
-/// path's; and a walk's entry.
+/// shadow ray keeps of its vertex where paths track interiors; and the record, and an
+/// update path's.
 const BASE_WORDS: u64 = 12;
 const INTERIOR_PARTS: u64 = 8;
 const STACK_PART: u64 = 5;
@@ -37,7 +37,6 @@ const SPECTRAL_PART: u64 = 5;
 const SHADOW_INTERIOR_WORDS: u64 = 9;
 const RECORD_WORDS: u64 = 2;
 const UPDATE_RECORD_WORDS: u64 = 9;
-const WALK_WORDS: u64 = 22;
 /// Lanes per workgroup of its stages.
 const STAGE_GROUP: u32 = 32;
 /// Path slots of a view at most, which a stage covers in the 65535 workgroups a dispatch may
@@ -1022,7 +1021,6 @@ fn barrier(list: &mut CommandList<'_>) {
 /// The parts of a path's state that `PathRoot.features` names, beside those every path keeps.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StateParts {
-    walks: bool,
     interiors: bool,
     stack: bool,
     spectral: bool,
@@ -1031,7 +1029,6 @@ pub(crate) struct StateParts {
 impl StateParts {
     pub(crate) fn of(features: u32) -> Self {
         Self {
-            walks: features & FEATURE_WALK != 0,
             interiors: features & FEATURE_INTERIORS != 0,
             stack: features & FEATURE_STACK != 0,
             spectral: features & FEATURE_DISPERSION != 0,
@@ -1039,8 +1036,7 @@ impl StateParts {
     }
 
     fn holds(self, other: Self) -> bool {
-        (self.walks || !other.walks)
-            && (self.interiors || !other.interiors)
+        (self.interiors || !other.interiors)
             && (self.stack || !other.stack)
             && (self.spectral || !other.spectral)
     }
@@ -1062,10 +1058,7 @@ impl StateParts {
 
     /// Bytes a path slot takes.
     fn bytes(self) -> u64 {
-        16 * (self.state_words()
-            + self.shadow_words()
-            + RECORD_WORDS
-            + Self::part(self.walks, WALK_WORDS))
+        16 * (self.state_words() + self.shadow_words() + RECORD_WORDS)
     }
 }
 
@@ -1084,7 +1077,6 @@ pub(crate) struct StagedMemory {
     frames: std::sync::atomic::AtomicU32,
     header: Allocation<PathStages>,
     queues: Allocation<StageQueue>,
-    _walks: Option<Allocation<[u32; 4]>>,
     _lists: Allocation<u32>,
     _words: Allocation<[u32; 4]>,
     _shadows: Option<Allocation<[u32; 4]>>,
@@ -1131,11 +1123,6 @@ impl StagedMemory {
             (RECORD_WORDS * n).max(UPDATE_RECORD_WORDS),
             "staged path records",
         )?;
-        let walks = if parts.walks {
-            Some(words(WALK_WORDS * n, "staged walk entries")?)
-        } else {
-            None
-        };
         log::debug!(
             "staged paths: {capacity} slots of {} bytes ({parts:?})",
             parts.bytes()
@@ -1149,7 +1136,6 @@ impl StagedMemory {
             words: state.gpu(),
             shadows: shadows.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             records: records.gpu(),
-            walks: walks.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
         };
         Ok(Self {
             capacity,
@@ -1160,7 +1146,6 @@ impl StagedMemory {
             frames: std::sync::atomic::AtomicU32::new(0),
             header,
             queues,
-            _walks: walks,
             _lists: lists,
             _words: state,
             _shadows: shadows,
