@@ -328,7 +328,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         f.update_scenes(&mut |c| sky.record(c, &[]).expect("sky passes"))
             .expect("update scenes");
         let lit = f
-            .view_lit(&view, &ViewLighting::default())
+            .view_lit(&view, &ViewLighting::default(), false)
             .expect("path pipelines");
         let mut average = average.hook(&f, extent, lit);
         let mut hooks = ViewHooks {

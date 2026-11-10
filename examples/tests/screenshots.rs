@@ -387,7 +387,9 @@ impl StillShowcase {
                 .expect("prepare view");
             f.update_scenes(&mut |c| self.showcase.sky.record(c, &[]).expect("sky passes"))
                 .expect("update scenes");
-            let lit = f.view_lit(&view, &lighting).expect("path pipelines");
+            let lit = f
+                .view_lit(&view, &lighting, settings.overlay.is_some())
+                .expect("path pipelines");
             let mut sum = average.as_mut().map(|a| a.hook(&f, extent, lit));
             let mut overlay = |pass: &mut TransparencyPass<'_, '_>, _| {
                 pass.cmd.begin_rendering(&Rendering {

@@ -636,7 +636,13 @@ fn frames_around_the_compile(
                 DVec3::new(0.2 * f64::from(i - waiting), 2.0, 4.0)
             };
             let view = view_of(scene, history, eye, &image);
-            let lit = f.view_lit(&view, &ViewLighting::default()).unwrap();
+            let lit = f
+                .view_lit(
+                    &view,
+                    &ViewLighting::default(),
+                    hooks.transparency.is_some(),
+                )
+                .unwrap();
             assert_eq!(lit, !waited);
             let rendered = f
                 .render_view(

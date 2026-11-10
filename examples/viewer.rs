@@ -180,7 +180,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .expect("prepare view");
         f.update_scenes(&mut |c| showcase.sky.record(c, &[]).expect("sky passes"))
             .expect("update scenes");
-        let lit = f.view_lit(&view, &lighting).expect("path pipelines");
+        let lit = f.view_lit(&view, &lighting, false).expect("path pipelines");
         let mut average = average.hook(&f, extent, lit);
         let mut ui = |pass: &mut orr::UiPass<'_, '_>| overlay.paint(pass, id);
         let mut hooks = ViewHooks {

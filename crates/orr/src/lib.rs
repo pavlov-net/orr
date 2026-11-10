@@ -1056,14 +1056,21 @@ impl<'a> Frame<'a> {
     }
 
     /// Whether [`Frame::render_view`] renders `view` lit this frame under `lighting`, or black
-    /// because the kernels or the path pipelines its scene and settings ask for are still
-    /// compiling; it asks for those pipelines. The answer holds for the frame once
-    /// [`Frame::update_scenes`] has run. A compile that failed returns [`Error::PathKernels`].
-    pub fn view_lit(&mut self, view: &LitView<'_>, lighting: &ViewLighting) -> Result<bool> {
+    /// because the kernels or the pipelines its scene and settings ask for are still compiling;
+    /// it asks for those pipelines. `transparency` is whether that render gets a
+    /// [`ViewHooks::transparency`] hook, whose particles the froxels' light pass lights. The
+    /// answer holds for the frame once [`Frame::update_scenes`] has run. A compile that failed
+    /// returns [`Error::PathKernels`].
+    pub fn view_lit(
+        &mut self,
+        view: &LitView<'_>,
+        lighting: &ViewLighting,
+        transparency: bool,
+    ) -> Result<bool> {
         if let Paths::Failed(e) = &self.lighting.paths {
             return Err(Error::PathKernels(Arc::clone(e)));
         }
-        self.ask_paths(view, lighting, false, false)
+        self.ask_paths(view, lighting, transparency, false)
     }
 
     /// Asks for the path pipelines `view` takes under `lighting` and says whether it renders
