@@ -169,25 +169,13 @@ static const uint LOOP_LEAVING = 1 << 9;       // and of those a walk leaving an
 static const uint LOOP_GBUFFER_HIT = 1 << 10;  // the camera ray found no layer: the pending vertex is the G-buffer's surface
 static const uint LOOP_SHADOW = 1 << 11;       // the last vertex left a shadow ray for the trace stage
 static const uint LOOP_ENDED = 1 << 12;        // and no ray of its own: the path ends past the shadow ray
+static const uint LOOP_SKY = 1 << 13;          // the camera ray met nothing: `PathLoop.sky` is the throughput
 
-// `PathFixed.flags`.
-static const uint FIXED_GBUFFER = 1 << 0;      // the camera ray only looks for layers before the G-buffer's surface
-static const uint FIXED_GIVEN = 1 << 1;        // the camera ray's hit is given
-static const uint FIXED_TRACED = 1 << 2;       // a view pixel on a tile the layer guides traced
-static const uint FIXED_TWO_PASSES = 1 << 3;   // a view pixel that also runs a path for the frosted-glass term
-static const uint FIXED_SECOND = 1 << 4;       // and runs it now
-
-// What a path keeps from its start.
+// What a path keeps from its start, which every stage finds again from its slot (`load_fixed`):
+// a slot holds the path of the slice's item of its number.
 struct PathFixed
 {
     uint2 pixel;
-    float3 origin;                  // the camera ray's
-    float3 dir;
-    float offset;
-    float t_max;
-    uint mask;
-    uint flags;                     // FIXED_*
-    float axis;
 }
 
 // The loop's state between stages.
@@ -206,7 +194,6 @@ struct PathLoop
     float3 radiance;
     float3 keep;
     RayCone cone;
-    float3 exposed;
     float3 sky;
     float3 entered_at;
     float3 entered_normal;
@@ -267,8 +254,7 @@ struct WalkEntry
 // interiors, where they entered the last, and a scatter or a way out the trace stage made),
 // track plane stacks (FEATURE_STACK) and may split by wavelength (FEATURE_DISPERSION). A slot
 // holds only the parts its root's features name, which every pipeline reads from the root.
-static const uint FIXED_WORDS = 3;
-static const uint LOOP_WORDS = 7;
+static const uint LOOP_WORDS = 5;
 static const uint PENDING_WORDS = 5;
 static const uint RAY_WORDS = 5;
 static const uint INTERIOR_WORDS = 6;
@@ -276,8 +262,7 @@ static const uint ENTERED_WORDS = 2;
 static const uint MEDIUM_WORDS = 3;
 static const uint STACK_WORDS = 5;
 static const uint SPECTRAL_WORDS = 5;
-static const uint FIXED_FIRST = 0;
-static const uint LOOP_FIRST = FIXED_FIRST + FIXED_WORDS;
+static const uint LOOP_FIRST = 0;
 static const uint PENDING_FIRST = LOOP_FIRST + LOOP_WORDS;
 static const uint RAY_FIRST = PENDING_FIRST + PENDING_WORDS;
 public static const uint BASE_WORDS = RAY_FIRST + RAY_WORDS;
@@ -293,7 +278,7 @@ public static const uint SHADOW_WORDS = 3;
 public static const uint SHADOW_INTERIOR_WORDS = 9;
 // A record's words: a view's and a photon's, and an update path's, whose slices hold as many
 // fewer paths.
-public static const uint RECORD_WORDS = 3;
+public static const uint RECORD_WORDS = 2;
 public static const uint UPDATE_RECORD_WORDS = 9;
 public static const uint WALK_WORDS = 22;
 
@@ -339,35 +324,23 @@ void store_words<T, let N : int>(uint4* words, uint capacity, uint first, uint s
         words[(first + k) * capacity + slot] = w.w[k];
 }
 
-// The parts as their words hold them: flags and small counters share words.
-struct StoredFixed
-{
-    uint pixel;                     // x, and y from bit 16
-    float3 origin;
-    float3 dir;
-    float offset;
-    float t_max;
-    uint mask;
-    uint flags;
-    float axis;
-}
-
+// The parts as their words hold them. A counter is below the rounds a root may ask for, which
+// 24 bits hold: the bytes of `chains` lie above `iteration`, `depth` and `opaque`. The sampler
+// keeps its dimension alone, as its seed is the pixel's and its index the frame's.
 struct StoredLoop
 {
-    Sampler rng;
+    float3 throughput;
+    uint flags;                     // LOOP_*, without LOOP_SKY's `sky`, which is the throughput
+    float3 radiance;
     uint iteration;
+    float3 keep;
     uint depth;
+    RayCone cone;
     uint opaque;
     uint layers;
-    uint chains;
-    uint flags;
+    uint dimension;
     uint rays;
-    float3 throughput;
-    float3 radiance;
-    float3 keep;
-    RayCone cone;
-    float3 exposed;
-    float3 sky;
+    uint2 _spare;
 }
 
 struct StoredEntered
@@ -423,25 +396,82 @@ struct StoredRay
     uint flags;                     // RAY_*
 }
 
+// The pixel of `slot`'s path, as its source's start stage took it from the slot's item.
+uint2 slot_pixel(PathRoot r, uint slot)
+{
+    uint index = r.slice_base + slot;
+    uint2 extent = r.gbuffer.extent;
+    if (from_photon(r))
+        return uint2(index % PHOTON_ROW, index / PHOTON_ROW);
+    if (from_update(r))
+    {
+        uint n = r.update_block;
+        uint2 blocks = (extent + n - 1) / n;
+        uint2 block = uint2(index % blocks.x, index / blocks.x);
+        uint offset = (r.frame + pcg(block.x | (block.y << 16))) % (n * n);
+        return block * n + uint2(offset % n, offset / n);
+    }
+    return uint2(index % extent.x, index / extent.x);
+}
+
+// The stream of the sampler a path of the root's source draws from.
+uint path_stream(PathRoot r)
+{
+    return r.seed ^ (from_background(r) ? DOF_STREAM : from_update(r) ? UPDATE_STREAM : from_photon(r) ? PHOTON_STREAM : 0u);
+}
+
 PathFixed load_fixed(PathRoot r, uint slot)
 {
-    StoredFixed v = load_words<StoredFixed, FIXED_WORDS>(r.stages.words, r.stages.capacity, FIXED_FIRST, slot);
-    PathFixed f;
-    f.pixel = uint2(v.pixel & 0xffff, v.pixel >> 16);
-    f.origin = v.origin;
-    f.dir = v.dir;
-    f.offset = v.offset;
-    f.t_max = v.t_max;
-    f.mask = v.mask;
-    f.flags = v.flags;
-    f.axis = v.axis;
+    PathFixed f = { slot_pixel(r, slot) };
     return f;
 }
 
-void store_fixed(PathRoot r, uint slot, PathFixed f)
+// Whether `pixel` lies on a tile the view's layer guides traced.
+bool pixel_traced(PathRoot r, uint2 pixel)
 {
-    StoredFixed v = { f.pixel.x | (f.pixel.y << 16), f.origin, f.dir, f.offset, f.t_max, f.mask, f.flags, f.axis };
-    store_words<StoredFixed, FIXED_WORDS>(r.stages.words, r.stages.capacity, FIXED_FIRST, slot, v);
+    uint2 extent = r.gbuffer.extent;
+    return traced_tiles(r.layers, extent)[layer_tile(extent, pixel)] != 0;
+}
+
+// Whether a view's `pixel` also runs a path for the frosted-glass term, in a second pass.
+bool two_passes(PathRoot r, uint2 pixel)
+{
+    if ((r.dielectric_flags & DIELECTRIC_FROST) == 0 || !pixel_traced(r, pixel))
+        return false;
+    return r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].frost != 0;
+}
+
+// Whether the stage runs in a view's second pass.
+bool second_pass(PathRoot r)
+{
+    return round_pass(r) != 0;
+}
+
+// The camera ray a path of `pixel` started with, as its source's start stage made it: a view's
+// on a traced tile or through the lens, the background layer's, or a photon's, whose hit is
+// given.
+PathStart camera_start(PathRoot r, uint2 pixel)
+{
+    if (from_photon(r))
+    {
+        PathStart given = (PathStart)0;
+        given.mask = MASK_OPAQUE | MASK_DIELECTRIC;
+        given.given = true;
+        return given;
+    }
+    if (from_background(r))
+    {
+        float mask = r.dof_mask.get<Texture2D<float>>().Load(int3(pixel, 0));
+        float near = r.view.clip_from_view[2][3];
+        Sampler rng = Sampler(pixel, r.frame, r.seed ^ DOF_STREAM);
+        return lens_start(r, pixel, r.dof_aperture, *r.dof_focus, near / mask, MASK_OPAQUE | MASK_DIELECTRIC, rng);
+    }
+    if (r.aperture_radius > 0.0)
+    {
+        Sampler rng = Sampler(pixel, r.frame, r.seed);
+        return lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_OPAQUE | MASK_DIELECTRIC, rng);
+    }
+    return pinhole_start(r.view, r.gbuffer, pixel, true);
 }
 
 PathLoop load_loop(PathRoot r, uint slot)
@@ -449,20 +479,20 @@ PathLoop load_loop(PathRoot r, uint slot)
     PathStages* st = r.stages;
     StoredLoop v = load_words<StoredLoop, LOOP_WORDS>(st.words, st.capacity, LOOP_FIRST, slot);
     PathLoop p;
-    p.rng = v.rng;
-    p.iteration = v.iteration;
-    p.depth = v.depth;
-    p.opaque = v.opaque;
+    p.rng = Sampler(slot_pixel(r, slot), r.frame, path_stream(r));
+    p.rng.dimension = v.dimension;
+    p.iteration = v.iteration & 0xffffff;
+    p.depth = v.depth & 0xffffff;
+    p.opaque = v.opaque & 0xffffff;
     p.layers = v.layers;
-    p.chains = v.chains;
+    p.chains = (v.iteration >> 24) | ((v.depth >> 24) << 8) | ((v.opaque >> 24) << 16);
     p.flags = v.flags;
     p.rays = v.rays;
     p.throughput = v.throughput;
     p.radiance = v.radiance;
     p.keep = v.keep;
     p.cone = v.cone;
-    p.exposed = v.exposed;
-    p.sky = v.sky;
+    p.sky = has(v.flags, LOOP_SKY) ? v.throughput : float3(0.0);
     // A path enters an interior only where it tracks them.
     p.entered = MATERIAL_NONE;
     p.entered_at = float3(0.0);
@@ -481,20 +511,19 @@ void store_loop(PathRoot r, uint slot, PathLoop p)
 {
     PathStages* st = r.stages;
     StoredLoop v;
-    v.rng = p.rng;
-    v.iteration = p.iteration;
-    v.depth = p.depth;
-    v.opaque = p.opaque;
+    v.dimension = p.rng.dimension;
+    v.iteration = p.iteration | ((p.chains & 0xff) << 24);
+    v.depth = p.depth | (((p.chains >> 8) & 0xff) << 24);
+    v.opaque = p.opaque | ((p.chains >> 16) << 24);
     v.layers = p.layers;
-    v.chains = p.chains;
-    v.flags = p.flags;
+    // The sky a path keeps is its throughput where its camera ray met nothing.
+    v.flags = any(p.sky > 0.0) ? p.flags | LOOP_SKY : p.flags & ~LOOP_SKY;
     v.rays = p.rays;
     v.throughput = p.throughput;
     v.radiance = p.radiance;
     v.keep = p.keep;
     v.cone = p.cone;
-    v.exposed = p.exposed;
-    v.sky = p.sky;
+    v._spare = uint2(0);
     store_words<StoredLoop, LOOP_WORDS>(st.words, st.capacity, LOOP_FIRST, slot, v);
     if (interiors_tracked(r))
     {
@@ -507,9 +536,8 @@ void store_loop(PathRoot r, uint slot, PathLoop p)
 // a shade stage reads before its coherence point so the point holds nothing else.
 uint pending_key(PathRoot r, uint slot)
 {
-    static_assert(sizeof(Sampler) == 12, "StoredLoop.flags moved");
-    // `flags` follows the sampler and five counters: the first scalar of the loop's third word.
-    return r.stages.words[(LOOP_FIRST + 2) * r.stages.capacity + slot].x >> LOOP_KEY_SHIFT;
+    // `flags` follows the throughput: the last scalar of the loop's first word.
+    return r.stages.words[LOOP_FIRST * r.stages.capacity + slot].w >> LOOP_KEY_SHIFT;
 }
 
 PathPending load_pending(PathRoot r, uint slot)
@@ -758,6 +786,49 @@ void store_record<T>(PathStages* st, uint slot, T value)
         st.records[slot * record_stride<T>() + k] = w.w[k];
 }
 
+// A view's or the background layer's record (`ViewPath`) as its words hold it. A first vertex
+// that is a layer leaves no G-buffer emission, so the two share words.
+struct StoredView
+{
+    uint feedback;
+    float total;
+    uint state;
+    float first_distance;
+    float3 own;                     // the G-buffer's emission, pre-exposed; of a first layer its reflected and transmitted luminance
+    float first_t;                  // with its sign bit set on a first layer
+}
+
+// The first word of `StoredView`.
+struct StoredViewLights
+{
+    uint feedback;
+    float total;
+    uint state;
+    float first_distance;
+}
+
+StoredView new_view_record(uint seed)
+{
+    StoredView v = { NO_LIGHT, 0.0, seed, 0.0, float3(0.0), 0.0 };
+    return v;
+}
+
+bool view_first_layer(StoredView v)
+{
+    return (asuint(v.first_t) >> 31) != 0;
+}
+
+float view_first_t(StoredView v)
+{
+    return asfloat(asuint(v.first_t) & 0x7fffffff);
+}
+
+// The G-buffer's emission the path took, which is already pre-exposed.
+float3 view_exposed(StoredView v)
+{
+    return view_first_layer(v) ? float3(0.0) : v.own;
+}
+
 // The record of a staged path, in its slot of `PathStages.records`, by the root's source.
 public struct StagedRecord : IPathRecord
 {
@@ -816,8 +887,23 @@ public struct StagedRecord : IPathRecord
     {
         if (!view_record())
             return;
-        ViewPath p = load_record<ViewPath>(st, slot);
-        p.arrive(r, x, b, t, layer);
+        StoredView p = load_record<StoredView>(st, slot);
+        p.first_distance = x.camera_distance;
+        p.own = float3(0.0);
+        if (layer)
+            p.own = float3(luminance_rec2020(b.albedo().specular + b.albedo().diffuse), luminance_rec2020(b.albedo().transmission), 0.0);
+        p.first_t = asfloat((asuint(t) & 0x7fffffff) | (layer ? 0x80000000u : 0u));
+        store_record(st, slot, p);
+    }
+
+    // The G-buffer's surface, the path's first vertex, emits `e` toward the eye, pre-exposed.
+    [mutating]
+    public void expose(float3 e)
+    {
+        if (!view_record())
+            return;
+        StoredView p = load_record<StoredView>(st, slot);
+        p.own += e;
         store_record(st, slot, p);
     }
 
@@ -844,10 +930,13 @@ public struct StagedRecord : IPathRecord
     [mutating]
     public void light(uint id, float contribution)
     {
-        if (!view_record())
+        if (!view_record() || !(contribution > 0.0) || !isfinite(contribution))
             return;
-        ViewPath p = load_record<ViewPath>(st, slot);
-        p.light(id, contribution);
+        StoredViewLights p = load_record<StoredViewLights>(st, slot);
+        p.total += contribution;
+        p.state = pcg(p.state);
+        if (unit_float(p.state) * p.total < contribution)
+            p.feedback = id;
         store_record(st, slot, p);
     }
 
@@ -859,13 +948,7 @@ public struct StagedRecord : IPathRecord
             layers = count;
             return;
         }
-        if (view_record())
-        {
-            ViewPath p = load_record<ViewPath>(st, slot);
-            p.finish(r, radiance, count);
-            store_record(st, slot, p);
-        }
-        else if (update)
+        if (update)
         {
             CacheUpdate u = load_record<CacheUpdate>(st, slot);
             u.finish(r, radiance, count);
@@ -952,10 +1035,11 @@ bool iteration_runs(PathRoot r, PathLoop p, uint kind, bool alive)
 // any other goes to the pass's finish stage.
 void finish_path(PathRoot r, uint slot, PathFixed f, PathLoop p)
 {
-    if (from_view(r) && !any(p.sky > 0.0) && !has(f.flags, FIXED_TWO_PASSES))
+    if (from_view(r) && !any(p.sky > 0.0) && !two_passes(r, f.pixel))
     {
         float pre_exposure = r.view.exposure[r.view.exposure_slot].pre_exposure;
-        view_outputs(r, slot, f, p, p.exposed + pre_exposure * p.radiance);
+        StoredView record = load_record<StoredView>(r.stages, slot);
+        view_outputs(r, f, p, record, view_exposed(record) + pre_exposure * p.radiance);
         return;
     }
     store_loop(r, slot, p);
@@ -964,25 +1048,23 @@ void finish_path(PathRoot r, uint slot, PathFixed f, PathLoop p)
 
 // What `view_body` writes of a pixel's own path once it ended with `pixel_radiance`: its
 // radiance, layer memory and light feedback, and with frost its background's luminance.
-void view_outputs(PathRoot r, uint slot, PathFixed f, PathLoop p, float3 pixel_radiance)
+void view_outputs(PathRoot r, PathFixed f, PathLoop p, StoredView pixel_path, float3 pixel_radiance)
 {
     uint2 pixel = f.pixel;
     uint index = pixel.y * r.gbuffer.extent.x + pixel.x;
-    ViewPath pixel_path = load_record<ViewPath>(r.stages, slot);
-    pixel_path.finish(r, p.radiance, p.layers);
     bool arrived = pixel_path.first_distance > 0.0;
-    bool first_layer = pixel_path.first_layer;
+    bool first_layer = view_first_layer(pixel_path);
     float4 out = float4(apply_hdr_ceiling(pixel_radiance), arrived ? 1.0 : 0.0);
     if (r.mode == PATH_RAYS)
         out = float4(float(p.rays), all(isfinite(pixel_radiance)) ? 0.0 : 1.0, 0.0, out.a);
     else if ((r.dielectric_flags & DIELECTRIC_DEBUG_LAYER) != 0 && first_layer)
     {
-        float sum = max(pixel_path.reflected + pixel_path.transmitted, 1e-6);
-        out = float4(pixel_path.reflected / sum, pixel_path.transmitted / sum, float(pixel_path.layers) / float(max(r.dielectric_depth, 1u)), 1.0);
+        float sum = max(pixel_path.own.x + pixel_path.own.y, 1e-6);
+        out = float4(pixel_path.own.x / sum, pixel_path.own.y / sum, float(p.layers) / float(max(r.dielectric_depth, 1u)), 1.0);
     }
     r.radiance.get<RWTexture2D<float4>>()[pixel] = out;
-    if (has(f.flags, FIXED_TRACED))
-        r.layers[index].medium_end = has(p.flags, LOOP_CARRIED) ? -1.0 : first_layer ? pixel_path.first_t : 0.0;
+    if (pixel_traced(r, pixel))
+        r.layers[index].medium_end = has(p.flags, LOOP_CARRIED) ? -1.0 : first_layer ? view_first_t(pixel_path) : 0.0;
     uint feedback = pixel_path.feedback;
     r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(feedback, asuint(pixel_path.first_distance));
     if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && feedback != NO_LIGHT)
@@ -995,18 +1077,9 @@ void view_outputs(PathRoot r, uint slot, PathFixed f, PathLoop p, float3 pixel_r
 // Sources
 
 // The state a path of `pixel` starts from `start` with.
-void start_state(PathRoot r, uint2 pixel, PathStart start, Sampler rng, uint fixed_flags, bool photon, out PathFixed f, out PathLoop p, out ShadeState c)
+void start_state(PathRoot r, uint2 pixel, PathStart start, Sampler rng, bool photon, out PathFixed f, out PathLoop p, out ShadeState c)
 {
     f.pixel = pixel;
-    f.origin = start.origin;
-    f.dir = start.dir;
-    f.offset = start.offset;
-    f.t_max = start.t_max;
-    f.mask = start.mask;
-    f.axis = start.axis;
-    f.flags = fixed_flags;
-    set_flag(f.flags, FIXED_GBUFFER, start.gbuffer);
-    set_flag(f.flags, FIXED_GIVEN, start.given);
 
     p.rng = rng;
     p.iteration = 0;
@@ -1017,7 +1090,6 @@ void start_state(PathRoot r, uint2 pixel, PathStart start, Sampler rng, uint fix
     p.flags = 0;
     p.rays = 0;
     p.radiance = float3(0.0);
-    p.exposed = float3(0.0);
     p.sky = float3(0.0);
     p.entered_at = float3(0.0);
     p.entered_normal = float3(0.0);
@@ -1042,19 +1114,22 @@ void start_state(PathRoot r, uint2 pixel, PathStart start, Sampler rng, uint fix
     c.interior = start.interior;
     c.stack = (PathStack)0;
     c.stack.valid = photon && start.directional && r.set.stack_entries != 0;
+    // A photon's stack keeps no vertex's ray: its direction is the one the photon started
+    // along, which `shade_vertex` probes back along.
+    if (photon)
+        c.stack.dir = start.dir;
     c.spectral = Spectral();
 }
 
 // Starts a path from `start` in `slot` in round `round`: its camera ray to the trace stage, or
 // its first vertex on the G-buffer's surface to the opaque shade stage.
-void begin_path(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler rng, uint fixed_flags, uint round)
+void begin_path(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler rng, uint round)
 {
     PathStages* st = r.stages;
     PathFixed f;
     PathLoop p;
     ShadeState c;
-    start_state(r, pixel, start, rng, fixed_flags, staged_record(r, slot).photon(), f, p, c);
-    store_fixed(r, slot, f);
+    start_state(r, pixel, start, rng, staged_record(r, slot).photon(), f, p, c);
     store_ray(r, slot, c.ray);
     store_interior(r, slot, c.interior);
     store_stack(r, slot, c.stack);
@@ -1102,20 +1177,16 @@ public void primary_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         if (traced)
             start.interior = Interior(r.layers[index].near_interior);
     }
-    bool frost = (r.dielectric_flags & DIELECTRIC_FROST) != 0;
-    bool two = frost && traced && r.layers[index].frost != 0;
-    store_record(r.stages, lane, ViewPath(pcg3d(uint3(pixel, r.frame ^ r.seed)).x));
-    uint flags = (traced ? FIXED_TRACED : 0) | (two ? FIXED_TWO_PASSES : 0);
+    store_record(r.stages, lane, new_view_record(pcg3d(uint3(pixel, r.frame ^ r.seed)).x));
     if (start.mask != 0)
     {
-        begin_path(r, lane, pixel, start, rng, flags, round_now(r));
+        begin_path(r, lane, pixel, start, rng, round_now(r));
         return;
     }
     PathFixed f;
     PathLoop p;
     ShadeState c;
-    start_state(r, pixel, start, rng, flags, false, f, p, c);
-    store_fixed(r, lane, f);
+    start_state(r, pixel, start, rng, false, f, p, c);
     // The round's trace stage, which runs next, traces these paths' rays beside the camera
     // rays: a queue's list holds one round at a time.
     shade_slot<S, M, QUEUE_OPAQUE>(r, lane, f, p, (PathPending)0, c, round_now(r));
@@ -1141,8 +1212,8 @@ public void background_start(PathRoot root, uint lane)
     Sampler rng = Sampler(pixel, r.frame, r.seed ^ DOF_STREAM);
     PathStart start = lens_start(r, pixel, r.dof_aperture, *r.dof_focus, near / mask, MASK_OPAQUE | MASK_DIELECTRIC, rng);
     start.interior = Interior();
-    store_record(r.stages, lane, ViewPath(pcg3d(uint3(pixel, r.frame ^ r.seed ^ DOF_STREAM)).x));
-    begin_path(r, lane, pixel, start, rng, 0, round_now(r));
+    store_record(r.stages, lane, new_view_record(pcg3d(uint3(pixel, r.frame ^ r.seed ^ DOF_STREAM)).x));
+    begin_path(r, lane, pixel, start, rng, round_now(r));
 }
 
 // The update path of the slice's `lane`th block, as `update_body` starts it.
@@ -1164,7 +1235,7 @@ public void update_start<S : ISurface>(PathRoot root, uint lane)
     PathStart start = pinhole_start(r.view, r.gbuffer, pixel, false);
     start.interior = gbuffer_interior<S>(r.scene, r.view, r.layers, extent, pixel, start);
     store_record(r.stages, lane, CacheUpdate());
-    begin_path(r, lane, pixel, start, rng, 0, round_now(r));
+    begin_path(r, lane, pixel, start, rng, round_now(r));
 }
 
 // Caustic photon `r.slice_base + lane`, as `photon_body` starts it.
@@ -1190,7 +1261,7 @@ public void photon_start_stage<S : ISurface, M : IMedium>(PathRoot root, uint la
     start.positions = p.positions;
     start.directional = p.directional;
     store_record(r.stages, lane, CausticPhoton(p.entry));
-    begin_path(r, lane, pixel, start, rng, 0, round_now(r));
+    begin_path(r, lane, pixel, start, rng, round_now(r));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1393,6 +1464,10 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     bool through = has(p.flags, LOOP_THROUGH);
     bool reference = x.reference;
     bool alive = true;
+    // The camera ray's reach, mask and distance from the eye, which only its trace reads.
+    PathStart camera_ray = (PathStart)0;
+    if (camera)
+        camera_ray = camera_start(r, pixel);
 
     Hit h = (Hit)0;
     float3 positions[3] = { float3(0.0), float3(0.0), float3(0.0) };
@@ -1405,7 +1480,7 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     Walk walk = Walk();
     // What owned light the ray finds keeps.
     float3 own = ray.lit ? float3(0.0) : through ? p.keep : float3(1.0);
-    if (camera && has(f.flags, FIXED_GIVEN))
+    if (camera && camera_ray.given)
     {
         PathPending given = load_pending(r, slot);
         h = given.hit;
@@ -1413,12 +1488,12 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     }
     else
     {
-        uint mask = camera ? f.mask : MASK_OPAQUE | MASK_DIELECTRIC;
+        uint mask = camera ? camera_ray.mask : MASK_OPAQUE | MASK_DIELECTRIC;
         HitContext context = hit_context(camera ? HIT_PRIMARY : HIT_SECONDARY, camera ? 0 : p.depth + 1, p.cone, 0.0, float2(-1.0), x.feedback);
         LayerAccept<CoverageFeedback<S>> a = { s, v, ray.dir, context, camera ? x.seed : pcg(x.seed ^ (p.depth + 1)), PRESENCE_DRAWN };
         if (!camera)
             count_ray(p);
-        RayDesc rd = path_ray(ray.origin, ray.dir, camera ? f.t_max : positive_infinity());
+        RayDesc rd = path_ray(ray.origin, ray.dir, camera ? camera_ray.t_max : positive_infinity());
         MayAccept<LayerAccept<CoverageFeedback<S>>> accept = { a };
         h = trace_closest(s.tlas, rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, accept, positions);
         // Rays leaving a layer or a scatter, and the first vertex's, see particles, and every
@@ -1444,7 +1519,7 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     }
     if (!camera)
         p.depth++;
-    t = h.hit ? h.t : camera ? f.t_max : positive_infinity();
+    t = h.hit ? h.t : camera ? camera_ray.t_max : positive_infinity();
     if (!camera || has(p.flags, LOOP_CARRIED))
         medium = interior.innermost();
     if (medium != MATERIAL_NONE)
@@ -1457,7 +1532,7 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         bool walks = record.walks() && ray.chain && (reference || !has(p.flags, LOOP_WALKED)) && p.opaque < r.max_bounces
             && max_component(im.sigma_s) * span >= 1.0;
         float scattered;
-        scatters = interior_segment(im, span, ray.scatter || walks || (camera && !has(f.flags, FIXED_GIVEN)), rng, p.throughput, scattered);
+        scatters = interior_segment(im, span, ray.scatter || walks || (camera && !camera_ray.given), rng, p.throughput, scattered);
         if (scatters)
         {
             scatter_at = ray.origin + ray.dir * max(scattered - (span - t), 0.0);
@@ -1513,7 +1588,7 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
             pending.value = scatter_anisotropy;
             LayerVertex l = scatter_vertex(v, scatter_at, ray.dir, medium, scatter_anisotropy);
             if (first)
-                record.arrive(r, l.x, bsdf_unprepared(), f.offset + distance(ray.origin, scatter_at), false);
+                record.arrive(r, l.x, bsdf_unprepared(), camera_ray.offset + distance(ray.origin, scatter_at), false);
             if (x.cache && !reference)
             {
                 if (counted)
@@ -1586,7 +1661,8 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         }
     }
     p.rng = rng;
-    pending.t = t;
+    // The camera ray's vertex lies its origin's distance further from the eye.
+    pending.t = first ? camera_ray.offset + t : t;
     if (!any(p.throughput > 0.0) || !all(isfinite(p.throughput)))
     {
         finish_path(r, slot, f, p);
@@ -1594,7 +1670,7 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     }
     // A pinhole camera ray only looks for layers: without one the path starts on the
     // G-buffer's surface.
-    bool gbuffer = first && has(f.flags, FIXED_GBUFFER) && !is_layer(h);
+    bool gbuffer = first && camera_ray.gbuffer && !is_layer(h);
     if (!h.hit && !gbuffer)
     {
         if (first)
@@ -1681,6 +1757,7 @@ bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, ino
     LayerRay ray = c.ray;
     Hit h = pending.hit;
     float3 positions[3] = pending.positions;
+    // The ray's length, and for the camera ray's vertex its distance from the eye.
     float t = pending.t;
     bool first = has(p.flags, LOOP_CAMERA);
     bool gbuffer = !layer && has(p.flags, LOOP_GBUFFER_HIT);
@@ -1710,8 +1787,7 @@ bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, ino
     }
     else
     {
-        float path_t = first ? f.offset + t : t;
-        HitContext context = hit_context(first ? HIT_PRIMARY : HIT_SECONDARY, p.depth, p.cone, path_t, texture_tap(v, pixel, r.frame, r.seed, p.depth), x.feedback);
+        HitContext context = hit_context(first ? HIT_PRIMARY : HIT_SECONDARY, p.depth, p.cone, t, texture_tap(v, pixel, r.frame, r.seed, p.depth), x.feedback);
         SurfaceHit sh = resolve_hit<FeedbackSurface<S>>(s, v, ray.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
         if (!sh.valid)
             return false;
@@ -1754,14 +1830,14 @@ bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, ino
     bool walks = (r.features & FEATURE_WALK) != 0 && record.walks() && !layer && may_walk(r, sv.l.x.surface, before, has(p.flags, LOOP_WALKED), p.cone.width);
     sv.b = prepare_vertex(s, sv.l, c.interior, collapse, walks, record.adjoint(), c.spectral.hero());
     if (first)
-        record.arrive(r, sv.l.x, sv.b, start_vertex ? 0.0 : gbuffer ? length(sv.l.x.surface.position - v.eye_render.xyz) : f.offset + t, layer);
+        record.arrive(r, sv.l.x, sv.b, start_vertex ? 0.0 : gbuffer ? length(sv.l.x.surface.position - v.eye_render.xyz) : t, layer);
     // Emission seen from the side that emits, weighed against the light set's sampling of the
     // point, which takes its density from the vertex the ray left; a point the light set never
     // draws takes weight 1, and as no photon leaves it, the whole of its light.
     if (gbuffer)
     {
         if (counted)
-            p.exposed += p.throughput * sv.b.emission();
+            record.expose(p.throughput * sv.b.emission());
     }
     else if (may(MAY_EMISSIVE) && (x.count_bsdf || (first && !x.photon)) && counted && front && any(sv.b.emission() > 0.0))
     {
@@ -1841,7 +1917,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
     // that next-event estimation takes through a plane stack is not deposited. No photon walks.
     if (X != SHADE_EXIT && x.photon)
     {
-        if (p.chains > 0 && !medium_vertex && !leaving && !(may(MAY_STACK) && stack_owns<S>(s, v, vertex_origin(l.x, -f.dir), -f.dir, c.stack, p.depth, disperse, x.feedback)))
+        if (p.chains > 0 && !medium_vertex && !leaving && !(may(MAY_STACK) && stack_owns<S>(s, v, vertex_origin(l.x, -c.stack.dir), -c.stack.dir, c.stack, p.depth, disperse, x.feedback)))
             record.deposit(r, l, b, c.spectral.color(p.throughput), rng);
         if (!l.chains)
             return false;
@@ -2303,11 +2379,14 @@ public void tail_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     PathFixed f = load_fixed(r, slot);
     if (!has(p.flags, LOOP_ENDED))
     {
+        PathResume resume;
         PathStart start = (PathStart)0;
-        start.dir = f.dir;
+        resume.stack = load_stack(r, slot);
+        // `resume_path` reads the start's direction for a photon alone.
+        if (from_photon(r))
+            start.dir = resume.stack.dir;
         start.interior = load_interior(r, slot);
         start.throughput = p.throughput;
-        PathResume resume;
         resume.on = true;
         resume.iteration = p.iteration;
         resume.depth = p.depth;
@@ -2324,7 +2403,6 @@ public void tail_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         resume.entered_at = p.entered_at;
         resume.entered_normal = p.entered_normal;
         resume.ray = load_ray(r, slot);
-        resume.stack = load_stack(r, slot);
         resume.spectral = spectral;
         record.tail = true;
         record.layers = p.layers;
@@ -2369,12 +2447,19 @@ void view_finish<S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint s
     uint2 extent = r.gbuffer.extent;
     uint index = pixel.y * extent.x + pixel.x;
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
-    float3 pixel_radiance = p.exposed + pre_exposure * p.radiance;
-    if (any(p.sky > 0.0) && r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE)
-        pixel_radiance += pre_exposure * p.sky * sky_radiance<E, M>(r.set, v.eye_render.xyz, f.dir);
-    bool second = has(f.flags, FIXED_SECOND);
+    StoredView record = load_record<StoredView>(st, slot);
+    float3 pixel_radiance = view_exposed(record) + pre_exposure * p.radiance;
+    bool sky = any(p.sky > 0.0) && r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE;
+    bool two = two_passes(r, pixel);
+    bool second = second_pass(r);
+    // The camera ray the pixel started with, where what is left to do reads it.
+    PathStart camera_ray = (PathStart)0;
+    if (sky || (two && !second))
+        camera_ray = camera_start(r, pixel);
+    if (sky)
+        pixel_radiance += pre_exposure * p.sky * sky_radiance<E, M>(r.set, v.eye_render.xyz, camera_ray.dir);
     if (!second)
-        view_outputs(r, slot, f, p, pixel_radiance);
+        view_outputs(r, f, p, record, pixel_radiance);
     else
     {
         // The pixel's rays count both passes.
@@ -2386,7 +2471,7 @@ void view_finish<S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint s
         if ((r.dielectric_flags & DIELECTRIC_FROST) != 0)
             r.layers[index].background = guide_luminance(pixel_radiance);
     }
-    if (!has(f.flags, FIXED_TWO_PASSES) || second)
+    if (!two || second)
         return;
     // The background's path starts on the G-buffer's surface, inside what holds it, with the
     // sampler, rays and record the first pass left.
@@ -2394,7 +2479,7 @@ void view_finish<S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint s
     if (r.aperture_radius > 0.0)
     {
         start = (PathStart)0;
-        start.interior = lens_interior<S>(r, f.origin);
+        start.interior = lens_interior<S>(r, camera_ray.origin);
     }
     else
     {
@@ -2403,12 +2488,15 @@ void view_finish<S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint s
         if (isfinite(start.t_max))
             surface_crossings<S>(r.scene, v, start.origin, start.dir, start.t_max, start.interior);
     }
-    start.dir = f.dir;
+    start.dir = camera_ray.dir;
     start.throughput = float3(1.0);
     start.mask = 0;
     start.gbuffer = true;
+    // The second pass's path takes the G-buffer's emission anew.
+    record.own = float3(0.0);
+    store_record(st, slot, record);
     uint rays = p.rays;
-    begin_path(r, slot, pixel, start, p.rng, f.flags | FIXED_SECOND, round_next(r));
+    begin_path(r, slot, pixel, start, p.rng, round_next(r));
     PathLoop q = load_loop(r, slot);
     q.rays = rays;
     store_loop(r, slot, q);
@@ -2420,11 +2508,12 @@ void background_finish<E : IEnvironment, M : IMedium>(PathRoot r, uint slot, Pat
     ViewConstants* v = r.view;
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
     float near = v.clip_from_view[2][3];
-    ViewPath record = load_record<ViewPath>(r.stages, slot);
+    StoredView record = load_record<StoredView>(r.stages, slot);
+    PathStart camera_ray = camera_start(r, f.pixel);
     float4 texel;
     if (!(record.first_distance > 0.0))
-        texel = float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, v.eye_render.xyz, f.dir)), 0.0);
+        texel = float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, v.eye_render.xyz, camera_ray.dir)), 0.0);
     else
-        texel = float4(apply_hdr_ceiling(pre_exposure * p.radiance), near / (f.axis * record.first_t));
+        texel = float4(apply_hdr_ceiling(pre_exposure * p.radiance), near / (camera_ray.axis * view_first_t(record)));
     r.dof_background.get<RWTexture2D<float4>>()[f.pixel] = texel;
 }

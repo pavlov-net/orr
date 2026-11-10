@@ -30,13 +30,13 @@ const STAGE_QUEUES: u64 = 6;
 /// may lie in an interior, track plane stacks and may split by wavelength; a deferred shadow
 /// ray, and the interiors its vertex arrived with; the record, and an update path's; and a
 /// walk's entry.
-const BASE_WORDS: u64 = 20;
+const BASE_WORDS: u64 = 15;
 const INTERIOR_PARTS: u64 = 11;
 const STACK_PART: u64 = 5;
 const SPECTRAL_PART: u64 = 5;
 const SHADOW_WORDS: u64 = 3;
 const SHADOW_INTERIOR_WORDS: u64 = 9;
-const RECORD_WORDS: u64 = 3;
+const RECORD_WORDS: u64 = 2;
 const UPDATE_RECORD_WORDS: u64 = 9;
 const WALK_WORDS: u64 = 22;
 /// Lanes per workgroup of its stages.
