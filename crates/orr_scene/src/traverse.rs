@@ -282,15 +282,17 @@ impl RtSizes {
         }
     }
 
-    /// Bytes of the tables, and with `traced` of the two arenas and the scratch.
-    fn bytes(&self, device: &Device, traced: bool) -> u64 {
+    /// Bytes the budget holds: of the tables of the built cuts, and with `traced` of the two
+    /// arenas and the scratch. The table of equal cuts, like the slots' records, takes a few
+    /// words per copy that asks it, and stays out.
+    fn budgeted(&self, device: &Device, traced: bool) -> u64 {
         let (clas, jobs) = (u64::from(self.clas), u64::from(self.jobs));
         let per_job = size_of::<BlasJob>() as u64
             + 8
             + 4
             + u64::from(device.rtas_args_stride(RtasOp::BuildClusterBlas))
             + size_of::<PartListGpu>() as u64;
-        let tables = 16 * clas + per_job * jobs + u64::from(self.keys) * size_of::<CutKey>() as u64;
+        let tables = 16 * clas + per_job * jobs;
         if !traced {
             return tables;
         }
@@ -298,8 +300,13 @@ impl RtSizes {
         tables + 2 * sizes.result_max.max(256) + sizes.scratch.max(256)
     }
 
-    /// The largest sizes from `held` toward `self` that take at most `budget` bytes: lists
-    /// that shrink take their new size, lists that grow the same share of their growth.
+    /// Bytes of all of it.
+    fn bytes(&self, device: &Device, traced: bool) -> u64 {
+        self.budgeted(device, traced) + u64::from(self.keys) * size_of::<CutKey>() as u64
+    }
+
+    /// `self` with the largest CLAS and builds from `held` toward it that the budget holds:
+    /// lists that shrink take their new size, lists that grow the same share of their growth.
     fn within(&self, held: Self, budget: u64, device: &Device, traced: bool) -> Self {
         let toward = |t: f64| {
             let step = |h: u32, w: u32| {
@@ -312,16 +319,16 @@ impl RtSizes {
             Self {
                 clas: step(held.clas, self.clas),
                 jobs: step(held.jobs, self.jobs),
-                keys: key_entries(step(held.keys / 2, self.keys / 2)),
+                keys: self.keys,
             }
         };
-        if self.bytes(device, traced) <= budget {
+        if self.budgeted(device, traced) <= budget {
             return *self;
         }
         let (mut lo, mut hi) = (0.0, 1.0);
         for _ in 0..16 {
             let mid = 0.5 * (lo + hi);
-            if toward(mid).bytes(device, traced) <= budget {
+            if toward(mid).budgeted(device, traced) <= budget {
                 lo = mid;
             } else {
                 hi = mid;
@@ -722,7 +729,7 @@ impl Cuts {
         if wanted == held || frame < self.rt_retry {
             return Ok(None);
         }
-        let budget = self.sizes.rt_bytes.max(self.rt.bytes);
+        let budget = self.sizes.rt_bytes.max(held.budgeted(device, self.traced));
         let fit = wanted.within(held, budget, device, self.traced);
         if fit != wanted {
             self.rt_retry = frame + period;
