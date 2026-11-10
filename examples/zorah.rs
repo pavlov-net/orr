@@ -657,8 +657,10 @@ fn breakdown(renderer: &Renderer) -> String {
     let scene = renderer.scene_memory();
     let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
     let mut s = format!(
-        "\ndevice memory allocations: {} of {}",
-        b.device_allocations, b.max_device_allocations
+        "\ndevice memory allocations: {} of {}, {} made so far",
+        b.device_allocations,
+        b.max_device_allocations,
+        device().memory_report().device_allocations
     );
     for l in b.labels.iter().take(TOP_LABELS) {
         s += &format!(
@@ -691,13 +693,15 @@ fn breakdown(renderer: &Renderer) -> String {
     }
     for p in &scene.pools {
         s += &format!(
-            "\n  scene pool {:?} {:?}: {} blocks {:.3} GiB, {:.3} GiB used, {} at most half used",
+            "\n  scene pool {:?} {:?}: {} blocks {:.3} GiB, {:.3} GiB used, {} at most half used, {} made, {:.3} GiB spare",
             p.name,
             p.kind,
             p.blocks,
             gib(p.bytes),
             gib(p.used),
-            p.half_empty
+            p.half_empty,
+            p.made,
+            gib(p.spare)
         );
     }
     if let Some(c) = scene.clas {
