@@ -617,9 +617,9 @@ fn specialized_pipelines_trace_the_paths_the_general_ones_do() {
                 .map(|p| p.map(f32::to_bits))
                 .collect::<Vec<_>>()
         };
-        paths.settings.specialize = false;
+        paths.specialize = false;
         let general = render_spec(&paths, spec.clone(), 4);
-        paths.settings.specialize = true;
+        paths.specialize = true;
         let specialized = render_spec(&paths, spec, 4);
         assert!(
             bits(&general) == bits(&specialized),

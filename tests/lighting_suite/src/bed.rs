@@ -2544,6 +2544,10 @@ pub struct Paths {
     /// Where the kernels compile the path pipelines a frame first asks for.
     loading: &'static orr_scene::Loading,
     pub settings: ViewLighting,
+    /// Frames run the pipelines made for each scene, as a view's default is, in place of
+    /// `settings.specialize`: set from `ORR_TEST_SPECIALIZED`. The beds' scenes are many and
+    /// small, so one set of pipelines runs them all without it.
+    pub specialize: bool,
     /// The background layer request of every frame.
     pub dof_background: Option<DofBackgroundPass>,
     /// The depth-of-field guide every frame adds the frosted-glass term into.
@@ -2610,13 +2614,8 @@ impl Paths {
         Self {
             kernels,
             loading,
-            // The beds' scenes are many and small: one set of pipelines runs them all, unless
-            // `ORR_TEST_SPECIALIZED` asks for the pipelines made for each scene, as a view's
-            // default is.
-            settings: ViewLighting {
-                specialize: std::env::var_os("ORR_TEST_SPECIALIZED").is_some(),
-                ..settings
-            },
+            settings,
+            specialize: std::env::var_os("ORR_TEST_SPECIALIZED").is_some(),
             dof_background: None,
             frost_guide: None,
             overlay_front: false,
@@ -2668,7 +2667,11 @@ impl Paths {
             Some(t) => t,
             None => &mut *f.target,
         };
-        let (lighting, settings) = (f.lighting, &self.settings);
+        let settings = &ViewLighting {
+            specialize: self.specialize,
+            ..self.settings
+        };
+        let lighting = f.lighting;
         target.begin(lighting, &f.desc, settings);
         let needs = PathNeeds {
             features: pass.scene_features,
@@ -2696,6 +2699,10 @@ impl Paths {
         self.kernels
             .record_paths(list, lighting, target, pass, settings)
             .unwrap();
+        // A frame that waited for its pipelines runs the ones made for exactly what it asked.
+        if let Some(ran) = target.paths_ran().filter(|_| settings.specialize) {
+            assert!(ran.exact(), "paths ran pipelines that hold more: {ran:x?}");
+        }
         let paths = Stages::COMPUTE | Stages::RAY;
         list.barrier(paths, Stages::COMPUTE, Hazards::empty());
         self.kernels
