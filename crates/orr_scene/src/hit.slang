@@ -428,7 +428,7 @@ public bool crosses_interior(SceneRoot* s, uint material)
 public bool copy_skin(SceneRoot* s, InstanceGpu inst, out SkinnedGpu k)
 {
     k = (SkinnedGpu)0;
-    if ((inst.flags & INSTANCE_SKINNED) == 0 || inst.pose_index >= s.skinned_capacity)
+    if (!may2(MAY2_SKINNING) || (inst.flags & INSTANCE_SKINNED) == 0 || inst.pose_index >= s.skinned_capacity)
         return false;
     k = s.skinned[inst.pose_index];
     return k.positions != nullptr;
