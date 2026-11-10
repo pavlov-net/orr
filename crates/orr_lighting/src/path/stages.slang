@@ -2392,7 +2392,8 @@ public void walk_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         PathPending pending = load_pending(r, slot, false);
         float3 dir = asfloat(st.words[word_index(st, RAY_FIRST, slot)].xyz);
         HitContext context = hit_context(has(entry.flags, WALK_FIRST) ? HIT_PRIMARY : HIT_SECONDARY, p.depth, entry.cone, pending.t, texture_tap(v, f.pixel, r.frame, r.seed, p.depth), x.feedback);
-        SurfaceHit sh = resolve_hit<FeedbackSurface<S>>(s, v, dir, pending.hit.instance_index, uint(pending.hit.cluster_id), pending.hit.primitive_index, pending.hit.barycentrics, pending.positions, false, context);
+        // The vertex's shade reported its texture feedback: this resolve reports none.
+        SurfaceHit sh = resolve_hit<S>(s, v, dir, pending.hit.instance_index, uint(pending.hit.cluster_id), pending.hit.primitive_index, pending.hit.barycentrics, pending.positions, false, context);
         sv.l = opaque_vertex(hit_vertex(v, sh, dir));
     }
     ShadeNee nee = (ShadeNee)0;
