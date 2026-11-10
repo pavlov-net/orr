@@ -222,7 +222,7 @@ struct PathPending
 struct PathShadowRay
 {
     // The path's throughput at the vertex x the estimate, unshadowed, weighed along the
-    // straight way and through the coat and fuzz of an emitter.
+    // straight way.
     float3 contribution;
     uint light;                     // the winner's feedback id, NO_LIGHT for a directional winner
     float3 origin;
@@ -1345,13 +1345,13 @@ float3 emitter_view<S : ISurface>(PathRoot r, ResolvedLightSample chosen, float 
     return vis;
 }
 
-// The shadow ray of next-event estimation `d` at a vertex at `start` of depth `depth`, in a
-// medium of IOR `exterior_ior`, with vertex shadow `shadow`: it adds `throughput` times what it
-// finds to the path's radiance, weighed along the straight way by `scale`.
-PathShadowRay shadow_ray<S : ISurface, M : IMedium>(PathRoot r, NeeDraw d, float scale, PathShadow<S, M> shadow, float3 start, float3 throughput, uint depth, bool feedback, bool counted, float exterior_ior)
+// The shadow ray of next-event estimation `d` at a vertex at `start` of depth `depth`, with
+// vertex shadow `shadow`: it adds `throughput` times what it finds to the path's radiance,
+// weighed along the straight way by `scale`. An emitter's coat and fuzz are not in it.
+PathShadowRay shadow_ray<S : ISurface, M : IMedium>(NeeDraw d, float scale, PathShadow<S, M> shadow, float3 start, float3 throughput, uint depth, bool feedback, bool counted)
 {
     PathShadowRay q = (PathShadowRay)0;
-    q.contribution = throughput * emitter_view<S>(r, d.chosen, exterior_ior, d.e * scale);
+    q.contribution = throughput * (d.e * scale);
     q.light = d.chosen.kind != LIGHT_SAMPLE_DIRECTIONAL ? d.chosen.light : NO_LIGHT;
     q.start = start;
     q.flags = (d.chosen.kind == LIGHT_SAMPLE_ENVIRONMENT ? SHADOW_ENVIRONMENT : 0) | (d.chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? SHADOW_DIRECTIONAL : 0)
@@ -2041,13 +2041,26 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
             {
                 count_ray(p);
                 float mis = weight_one ? 1.0 : mis_balance(run * d.chosen.pdf, d.scatter_pdf);
-                nee.traced = true;
-                nee.q = shadow_ray<CoverageFeedback<S>, M>(r, d, d.W * mis / run, shadow, l.x.surface.position, p.throughput, p.depth, x.feedback, counted, exterior);
-                nee.d = d;
-                nee.run = run;
-                nee.weight_one = weight_one;
-                nee.throughput = p.throughput;
-                nee.exterior_ior = exterior;
+                PathShadowRay q = shadow_ray<CoverageFeedback<S>, M>(d, d.W * mis / run, shadow, l.x.surface.position, p.throughput, p.depth, x.feedback, counted);
+                // An emitter's coat and fuzz pass its light on only where the ray reaches it, and
+                // the trace stage keeps no light sample to ask them with: a ray to such an emitter
+                // is traced here. A walk's exit traces its own.
+                if (X != SHADE_EXIT && may(MAY_EMISSIVE) && may_any(MAY_COAT | MAY_FUZZ) && d.chosen.view)
+                {
+                    StackLight stack;
+                    float3 vis = emitter_view<CoverageFeedback<S>>(r, d.chosen, exterior, shadow_trace<S, M>(r, q, stack));
+                    shadow_add(q, c.spectral.color(q.contribution * vis), p, record);
+                }
+                else
+                {
+                    nee.traced = true;
+                    nee.q = q;
+                    nee.d = d;
+                    nee.run = run;
+                    nee.weight_one = weight_one;
+                    nee.throughput = p.throughput;
+                    nee.exterior_ior = exterior;
+                }
             }
         }
     }
