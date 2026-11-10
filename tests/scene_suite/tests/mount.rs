@@ -1127,7 +1127,7 @@ fn dome_budget(info: &MeshInfo, nodes: &[Vec<u8>], dev: &Device) -> u64 {
         .iter()
         .map(|p| u64::from(p.resident_len).next_multiple_of(256))
         .sum();
-    2 * (placed + nodes[1].len() as u64) + sheet_budget(info, dev) - 2 * pinned_bytes
+    2 * (placed + nodes[1].len() as u64) + sheet_budget(info, dev, 2) - 2 * pinned_bytes
 }
 
 /// The node page table and the mesh page table of `model`'s mesh.
@@ -3080,8 +3080,17 @@ fn streamed_frame(
     (root, scenes.stats().cuts)
 }
 
-/// Places one traced copy of each of `models` at `positions`.
+/// Places one copy of each of `models` at the origin, drawn and traced.
 fn place_copies(s: &mut SceneWriter<'_>, models: &[ModelId]) -> orr_scene::TransformGroupId {
+    place_copies_as(s, models, InstanceFlags::RASTER | InstanceFlags::RAY)
+}
+
+/// Places one copy of each of `models` at the origin with `flags`.
+fn place_copies_as(
+    s: &mut SceneWriter<'_>,
+    models: &[ModelId],
+    flags: InstanceFlags,
+) -> orr_scene::TransformGroupId {
     let group = s
         .create_transform_group(&TransformGroupDesc {
             count: models.len() as u32,
@@ -3100,7 +3109,7 @@ fn place_copies(s: &mut SceneWriter<'_>, models: &[ModelId]) -> orr_scene::Trans
             first: i as u32,
             pose: None,
             material_set: None,
-            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            flags,
             rt_range: 1000.0,
             animation_range: 0.0,
             user_tag: 0,
@@ -3131,10 +3140,10 @@ fn streamed_mesh_pages_stop_the_cut_at_resident_groups_and_evict_beside_traced_c
     assert_clean();
 }
 
-/// A mesh page budget on `dev` for two mounts of [`sheet_pack`]'s mesh `info`: both mounts'
-/// pinned pages and one mount's streamed pages, which with a CLAS pool also hold the CLAS they
-/// build, at 32 B a triangle and 256 B a cluster until they have built them.
-fn sheet_budget(info: &MeshInfo, dev: &Device) -> u64 {
+/// A mesh page budget on `dev` for `mounts` mounts of [`sheet_pack`]'s mesh `info`: every
+/// mount's pinned pages and one mount's streamed pages, which with a CLAS pool also hold the
+/// CLAS they build, at 32 B a triangle and 256 B a cluster until they have built them.
+fn sheet_budget(info: &MeshInfo, dev: &Device, mounts: u64) -> u64 {
     let c = dev.caps().cluster;
     let traced = c.max_tris > 0 && c.max_partitions > 0;
     let pinned = info.header.pinned_pages as usize;
@@ -3149,7 +3158,7 @@ fn sheet_budget(info: &MeshInfo, dev: &Device) -> u64 {
     };
     let pinned_bytes: u64 = info.pages[..pinned].iter().map(page).sum();
     let streamed_bytes: u64 = info.pages[pinned..].iter().map(|p| page(p) + clas(p)).sum();
-    2 * pinned_bytes + streamed_bytes
+    mounts * pinned_bytes + streamed_bytes
 }
 
 /// Two mounts of [`sheet_pack`] under a mesh page budget that holds one mount's streamed
@@ -3163,7 +3172,7 @@ fn stream_sheets(dev: &Device) {
     let pinned = info.header.pinned_pages as usize;
     assert!(pinned < info.pages.len(), "the sheet has streamed pages");
     let traced = dev.caps().cluster.max_tris > 0;
-    let budget = sheet_budget(&info, dev);
+    let budget = sheet_budget(&info, dev, 2);
     let desc = RendererDesc {
         budgets: Budgets {
             mesh_resident_max: 0,
@@ -3756,6 +3765,64 @@ fn finer_cached_cuts_build_once_wanted_lock_their_pages_and_leave_after_their_ho
     assert_eq!(scenes.residency().failed, 0);
 }
 
+/// A copy that only traces loads no page through the traversal, so the finer cut it wants loads
+/// its own. The mesh page budget holds the mesh's pages at their CLAS estimates with room to
+/// spare, but its half, the share finer cuts may lock, holds only what the cut locks once they
+/// have built their CLAS, not the cut's pages at those estimates.
+#[test]
+fn a_finer_cut_whose_pages_no_view_loaded_builds_once_they_land() {
+    let _serial = serial();
+    let dev = device();
+    if dev.caps().cluster.max_tris == 0 || dev.caps().cluster.max_partitions == 0 {
+        return;
+    }
+    let gpu = Gpu(dev);
+    let a = Archive::from_memory(Arc::clone(sheet_pack())).unwrap();
+    let info = MeshInfo::parse(&blob(
+        &a,
+        entry(&a, AssetId::from_name("kit/sheet/mesh")),
+        0,
+    ))
+    .unwrap();
+    let desc = RendererDesc {
+        budgets: Budgets {
+            mesh_resident_max: 0,
+            mesh_page_pool: PoolSize::Bytes(sheet_budget(&info, dev, 1) * 3 / 2),
+            ..Budgets::default()
+        },
+        ..streaming_desc()
+    };
+    let mut scenes = Scenes::new(dev, &desc).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let m = scenes.mount(PackSource::Memory(Arc::clone(sheet_pack())));
+    ready(&mut scenes, m);
+    let model = scenes.model(m, AssetId::from_name(SHEET)).unwrap();
+    let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
+    streamed_frame(&mut scenes, scene, |s| {
+        place_copies_as(s, &[model], InstanceFlags::RAY);
+    });
+    let start = Instant::now();
+    loop {
+        let (mesh, _) = mesh_of(&scenes, &gpu, model);
+        let cuts: Vec<orr_scene::RtCutGpu> = gpu.values(mesh.rt_cuts, mesh.fine_cuts);
+        if cuts.iter().any(|c| c.blas != 0) {
+            break;
+        }
+        let r = scenes.residency();
+        assert_eq!(
+            (r.failed_cuts, r.out_of_memory),
+            (0, 0),
+            "a finer cut failed to build"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "no finer cut was built"
+        );
+        streamed_frame(&mut scenes, scene, |_| {});
+    }
+    assert_eq!(scenes.residency().failed, 0);
+}
+
 #[test]
 fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
     let _serial = serial();
@@ -3771,7 +3838,7 @@ fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
         &RendererDesc {
             budgets: Budgets {
                 mesh_resident_max: 0,
-                mesh_page_pool: PoolSize::Bytes(sheet_budget(&info, dev)),
+                mesh_page_pool: PoolSize::Bytes(sheet_budget(&info, dev, 2)),
                 ..Budgets::default()
             },
             ..RendererDesc::default()

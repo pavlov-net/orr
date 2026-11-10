@@ -198,6 +198,9 @@ impl FineState {
 struct MeshFine {
     init: FineInit,
     slots: Vec<FineState>,
+    /// By cut, the pages its build locks, those of its pages holding its clusters, once its
+    /// pages have all been resident.
+    locks: Vec<Option<Vec<u32>>>,
 }
 
 /// A finer cut for the loading thread to build.
@@ -710,8 +713,9 @@ impl Streaming {
         }
         for init in units.fine {
             let slots = init.cuts.iter().map(|_| FineState::EMPTY).collect();
+            let locks = vec![None; init.cuts.len()];
             self.fine
-                .insert((mount, init.mesh), MeshFine { init, slots });
+                .insert((mount, init.mesh), MeshFine { init, slots, locks });
         }
         let mut linked = Vec::with_capacity(neural.len());
         for &(index, n) in neural {
@@ -1070,10 +1074,13 @@ impl Streaming {
     /// A cut is admitted whole, the larger error it would remove first, while the pages it
     /// would lock fit half the mesh page budget beside those of the cuts built and admitted,
     /// and what its loads add to the latest sample's demand keeps it, beside what those of the
-    /// cuts admitted add, under [`LOW`] of the budget. None is admitted under `pressure`, while
-    /// the detail is coarsened for the pool: the traversal's cut comes first. An admitted cut
-    /// asks for its pages and keeps them in their hold until it builds; it leaves admission when
-    /// no copy has wanted it for a hold, or under pressure.
+    /// cuts admitted add, under [`LOW`] of the budget. Which of its pages it locks, and what
+    /// they hold once built, shows only after they have all been resident: until then its loads
+    /// alone admit it, and the bytes of all its pages stand for its locks beside the cuts after
+    /// it. None is admitted under `pressure`, while the detail is coarsened for the pool: the
+    /// traversal's cut comes first. An admitted cut asks for its pages and keeps them in their
+    /// hold until it builds; it leaves admission when no copy has wanted it for a hold, or under
+    /// pressure.
     fn fine_step(
         &mut self,
         frame: u64,
@@ -1197,7 +1204,7 @@ impl Streaming {
                 .unsampled(keys, &FxHashSet::default(), &mut seen)
             {
                 Some(more) => {
-                    locking += bytes;
+                    locking += self.fine_lock_bytes(mount, mesh, k).unwrap_or(bytes);
                     adding += more;
                     true
                 }
@@ -1221,11 +1228,12 @@ impl Streaming {
                     self.fail_cut(mount, mesh, k);
                     continue;
                 };
-                let locks = self.fine_locked + locking + bytes;
-                if locks > budget / 2 || demand + adding + more > room {
+                let lock = self.fine_lock_bytes(mount, mesh, k);
+                let over = lock.is_some_and(|b| self.fine_locked + locking + b > budget / 2);
+                if over || demand + adding + more > room {
                     continue;
                 }
-                locking += bytes;
+                locking += lock.unwrap_or(bytes);
                 adding += more;
                 seen.extend(mine);
                 let f = self.fine.get_mut(&(mount, mesh)).expect("listed");
@@ -1256,6 +1264,20 @@ impl Streaming {
         (keys, bytes)
     }
 
+    /// The bytes finer cut `k` of mesh `mesh` of `mount` locks once built, when its pages have
+    /// all been resident.
+    fn fine_lock_bytes(&self, mount: MountId, mesh: u32, k: usize) -> Option<u64> {
+        let m = &self.mounts[&mount];
+        let pages = self.fine[&(mount, mesh)].locks[k].as_ref()?;
+        let held = |&p: &u32| {
+            self.residency.held(Key {
+                mount,
+                unit: m.mesh_pages[mesh as usize][p as usize],
+            })
+        };
+        Some(pages.iter().map(held).sum())
+    }
+
     /// Finer cut `k` of mesh `mesh` of `mount` never builds: a page of it failed to load.
     fn fail_cut(&mut self, mount: MountId, mesh: u32, k: usize) {
         let f = self.fine.get_mut(&(mount, mesh)).expect("listed");
@@ -1265,8 +1287,8 @@ impl Streaming {
 
     /// Asks for the absent pages of admitted finer cut `k` of mesh `mesh` of `mount` and keeps
     /// the resident ones in their hold at `frame`; once they are all resident, locks the ones
-    /// holding its clusters and sends it to be built, unless those no longer fit half of the
-    /// mesh page `budget` beside the locks of the other cuts, which takes back its admission.
+    /// holding its clusters and sends it to be built, unless those do not fit half of the mesh
+    /// page `budget` beside the locks of the other cuts, which takes back its admission.
     fn build_admitted(
         &mut self,
         mount: MountId,
@@ -1333,6 +1355,7 @@ impl Streaming {
             return;
         }
         let bytes = pages.iter().map(|&q| self.residency.held(unit(q))).sum();
+        f.locks[k] = Some(pages.clone());
         if self.fine_locked + bytes > budget / 2 {
             f.slots[k] = FineState::EMPTY;
             return;
