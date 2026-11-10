@@ -20,7 +20,9 @@ ORR_ROOT_INLINE(PathRoot);
 void main(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(main);
-    shade_stage<NoReorder, Surface, Medium, QUEUE_OTHER>(root, id.x);
+    uint slot, key;
+    if (shade_lane<QUEUE_OTHER>(root, id.x, slot, key))
+        shade_stage<Surface, Medium, QUEUE_OTHER>(root, slot);
 }
 
 [shader("raygeneration")]
@@ -28,5 +30,9 @@ void rays()
 {
     ORR_OMM(rays);
     uint3 ray = DispatchRaysIndex();
-    shade_stage<Reorder, Surface, Medium, QUEUE_OTHER>(root, ray.y * STAGE_GROUP + ray.x);
+    uint slot, key;
+    if (!shade_lane<QUEUE_OTHER>(root, ray.y * STAGE_GROUP + ray.x, slot, key))
+        return;
+    Reorder.point(key, KEY_BITS + 1);
+    shade_stage<Surface, Medium, QUEUE_OTHER>(root, slot);
 }

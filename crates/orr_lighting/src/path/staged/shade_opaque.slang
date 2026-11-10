@@ -21,7 +21,9 @@ ORR_ROOT_INLINE(PathRoot);
 void main(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(main);
-    shade_stage<NoReorder, Surface, Medium, QUEUE_OPAQUE>(root, id.x);
+    uint slot, key;
+    if (shade_lane<QUEUE_OPAQUE>(root, id.x, slot, key))
+        shade_stage<Surface, Medium, QUEUE_OPAQUE>(root, slot);
 }
 
 [shader("raygeneration")]
@@ -29,7 +31,11 @@ void rays()
 {
     ORR_OMM(rays);
     uint3 ray = DispatchRaysIndex();
-    shade_stage<Reorder, Surface, Medium, QUEUE_OPAQUE>(root, ray.y * STAGE_GROUP + ray.x);
+    uint slot, key;
+    if (!shade_lane<QUEUE_OPAQUE>(root, ray.y * STAGE_GROUP + ray.x, slot, key))
+        return;
+    Reorder.point(key, KEY_BITS + 1);
+    shade_stage<Surface, Medium, QUEUE_OPAQUE>(root, slot);
 }
 
 [shader("compute")]
@@ -37,7 +43,9 @@ void rays()
 void rich_main(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(rich_main);
-    shade_stage<NoReorder, Surface, Medium, QUEUE_RICH>(root, id.x);
+    uint slot, key;
+    if (shade_lane<QUEUE_RICH>(root, id.x, slot, key))
+        shade_stage<Surface, Medium, QUEUE_RICH>(root, slot);
 }
 
 [shader("raygeneration")]
@@ -45,5 +53,9 @@ void rich_rays()
 {
     ORR_OMM(rich_rays);
     uint3 ray = DispatchRaysIndex();
-    shade_stage<Reorder, Surface, Medium, QUEUE_RICH>(root, ray.y * STAGE_GROUP + ray.x);
+    uint slot, key;
+    if (!shade_lane<QUEUE_RICH>(root, ray.y * STAGE_GROUP + ray.x, slot, key))
+        return;
+    Reorder.point(key, KEY_BITS + 1);
+    shade_stage<Surface, Medium, QUEUE_RICH>(root, slot);
 }

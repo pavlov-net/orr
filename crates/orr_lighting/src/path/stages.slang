@@ -2343,19 +2343,26 @@ void leave_shade(PathRoot r, uint slot, PathFixed f, inout PathLoop p, ShadeStat
     append(r, QUEUE_TRACE, next, slot);
 }
 
-// The shade stage over `K` (QUEUE_OPAQUE, QUEUE_RICH or QUEUE_OTHER): the
-// vertex the trace stage reached, the end of its iteration, and the next iteration up to its
-// ray, which the trace stage traces, or its walk, which the walk stage runs. `C` names its
-// coherence point, before anything of the vertex is loaded.
-public void shade_stage<C : ICoherence, S : ISurface, M : IMedium, let K : uint>(PathRoot root, uint lane)
+// Whether `lane` of the shade stage over `K` (QUEUE_OPAQUE, QUEUE_RICH or QUEUE_OTHER) holds a
+// vertex, with its path's slot and the coherence key the trace stage left it: all a stage reads
+// before its coherence point.
+public bool shade_lane<let K : uint>(PathRoot root, uint lane, out uint slot, out uint key)
 {
     PathRoot r = specialized(root);
-    PathStages* st = r.stages;
-    uint slot;
+    key = 0;
     if (!queued_slot(r, K, round_now(r), lane, slot))
-        return;
-    r = slot_root(r, slot);
-    C.point(pending_key(r, slot), KEY_BITS + 1);
+        return false;
+    key = pending_key(r, slot);
+    return true;
+}
+
+// The shade stage over `K` of `slot`'s path: the vertex the trace stage reached, the end of its
+// iteration, and the next iteration up to its ray, which the trace stage traces, or its walk,
+// which the walk stage runs. It takes the root anew and loads everything of the vertex, so a
+// stage that reorders its lanes before it carries the slot alone across its coherence point.
+public void shade_stage<S : ISurface, M : IMedium, let K : uint>(PathRoot root, uint slot)
+{
+    PathRoot r = slot_root(specialized(root), slot);
     PathFixed f = load_fixed(r, slot);
     PathLoop p = load_loop(r, slot);
     PathPending pending = load_pending(r, slot, K == QUEUE_OTHER && has(p.flags, LOOP_MEDIUM));
