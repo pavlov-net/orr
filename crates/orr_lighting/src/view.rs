@@ -1377,7 +1377,11 @@ fn path_features(features: SceneFeatures, lighting: &ViewLighting) -> u32 {
     let interiors = bounded || lighting.camera_medium.is_some();
     // A stack face bounds an interior, and a stack bends directional lights alone.
     let stack = bounded && features.contains(SceneFeatures::DIRECTIONAL_LIGHTS);
-    bit(features.contains(SceneFeatures::WALKING), FEATURE_WALK)
+    // The walk stage runs a subsurface walk an opaque vertex starts; an interior's walk is the
+    // trace stage's.
+    let walk =
+        features.contains(SceneFeatures::WALKING) && features.contains(SceneFeatures::SUBSURFACE);
+    bit(walk, FEATURE_WALK)
         | bit(disperses(features, lighting), FEATURE_DISPERSION)
         | bit(interiors, FEATURE_INTERIORS)
         | bit(stack, FEATURE_STACK)
@@ -1659,7 +1663,8 @@ impl LightingKernels {
         let caustics = gathers_caustics(scene, lighting);
         let may = self.predict(scene, needs, lighting);
         let mut wanted = may.view | Source::View.may();
-        let mut stages = Source::View.stages(needs.features.contains(SceneFeatures::WALKING));
+        let mut stages =
+            Source::View.stages(path_features(needs.features, lighting) & FEATURE_WALK != 0);
         if needs.dof_background {
             wanted |= may.background | Source::Background.may();
             stages.push(Stage::Background);

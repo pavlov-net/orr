@@ -53,37 +53,21 @@ impl SceneFeatures {
     /// What a mesh keeps from the material it was built with, whatever the record holds now:
     /// once a record has shown one of these, the table keeps it.
     const BUILT: Self = Self(Self::LAYERS.0 | Self::COVERAGE.0);
-    /// Every bit a material record sets.
-    const MATERIAL: Self = Self(
-        Self::WALKING.0
-            | Self::INTERIORS.0
-            | Self::SCATTERING_INTERIORS.0
-            | Self::DISPERSIVE.0
-            | Self::COAT.0
-            | Self::FUZZ.0
-            | Self::THIN_FILM.0
-            | Self::SUBSURFACE.0
-            | Self::LAYERS.0
-            | Self::COVERAGE.0
-            | Self::EMISSIVE.0,
-    );
-
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
     /// What record `m` may show. A linked surface may set any lobe, so its record counts for
-    /// every feature a record can have.
+    /// every lobe, for walks and for emission; what a material's flags and its own medium
+    /// decide stays as the record has it.
     pub(crate) fn of_material(m: &MaterialGpu) -> Self {
-        if m.surface != 0 {
-            return Self::MATERIAL;
-        }
+        let linked = m.surface != 0;
         let thin = m.flags & f::THIN_WALLED != 0;
         let scatters =
             m.transmission_depth > 0.0 && m.transmission_scatter.iter().any(|&c| c > 0.0);
         let bounds = m.flags & (f::DIELECTRIC | f::THIN_WALLED) == f::DIELECTRIC;
-        let walks =
-            !thin && (m.subsurface_weight > 0.0 || (m.transmission_weight > 0.0 && scatters));
+        let walks = linked
+            || (!thin && (m.subsurface_weight > 0.0 || (m.transmission_weight > 0.0 && scatters)));
         let disperses =
             m.transmission_dispersion_scale > 0.0 && m.transmission_dispersion_abbe_number > 0.0;
         let mut out = Self::NONE;
@@ -92,17 +76,17 @@ impl SceneFeatures {
             (bounds, Self::INTERIORS),
             (bounds && scatters, Self::SCATTERING_INTERIORS),
             (disperses, Self::DISPERSIVE),
-            (m.coat_weight > 0.0, Self::COAT),
-            (m.fuzz_weight > 0.0, Self::FUZZ),
-            (m.thin_film_weight > 0.0, Self::THIN_FILM),
-            (m.subsurface_weight > 0.0, Self::SUBSURFACE),
+            (linked || m.coat_weight > 0.0, Self::COAT),
+            (linked || m.fuzz_weight > 0.0, Self::FUZZ),
+            (linked || m.thin_film_weight > 0.0, Self::THIN_FILM),
+            (linked || m.subsurface_weight > 0.0, Self::SUBSURFACE),
             (m.flags & (f::DIELECTRIC | f::PRESENCE) != 0, Self::LAYERS),
             (
                 m.flags & (f::ALPHA_TESTED | f::PRESENCE) != 0
                     || m.flags & (f::DIELECTRIC | f::THIN_WALLED) == f::DIELECTRIC | f::THIN_WALLED,
                 Self::COVERAGE,
             ),
-            (m.emission_luminance != 0.0, Self::EMISSIVE),
+            (linked || m.emission_luminance != 0.0, Self::EMISSIVE),
         ] {
             if on {
                 out |= bit;
