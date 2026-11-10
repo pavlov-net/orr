@@ -11,8 +11,8 @@ use orr_scene::orr_gpu::{
     StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage,
 };
 use orr_scene::{
-    ArenaRequest, ArenaTexture, GBufferGpu, JobResult, Loading, MaterialId, RasterGpu, SceneRoot,
-    Span, ViewArena, ViewConstants, ViewDesc, ViewStep,
+    ArenaRequest, ArenaTexture, GBufferGpu, JobResult, Loading, MaterialId, RasterGpu,
+    SceneFeatures, SceneRoot, Span, ViewArena, ViewConstants, ViewDesc, ViewStep,
 };
 
 use crate::caustics::PhotonMap;
@@ -28,8 +28,8 @@ use crate::shaders::types::{
 };
 use crate::shaders::world_cache::update;
 use crate::staged::{
-    self, FEATURE_DISPERSION, FEATURE_WALK, Late, Source, StagePipeline, StagedKernels,
-    StagedMemory,
+    FEATURE_DISPERSION, FEATURE_WALK, Late, MAY_ALL, MAY_CAUSTICS, MAY_DISPERSION, MAY_STACK,
+    Source, Stage, StagedKernels, StagedMemory,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::{
@@ -87,6 +87,11 @@ pub struct ViewLighting {
     pub debug_view: LightingDebugView,
     /// Accumulation reference instead of the real-time path.
     pub reference: Option<ReferenceSettings>,
+    /// Whether the path kernels are compiled for what the scene and these settings may meet,
+    /// which changes no result. Each new mix of features compiles its own pipelines, for
+    /// seconds on a first run; `false` runs the pipelines that hold every feature, which a run
+    /// over many small scenes compiles once.
+    pub specialize: bool,
 }
 
 impl Default for ViewLighting {
@@ -107,6 +112,7 @@ impl Default for ViewLighting {
             guides: GuideSettings::default(),
             debug_view: LightingDebugView::None,
             reference: None,
+            specialize: true,
         }
     }
 }
@@ -888,19 +894,11 @@ pub struct ViewPass {
     /// [`LightingKernels::record_overlay_front`] resolves: set while output's
     /// transparency-aware circle of confusion and velocity are on. `false` frees it.
     pub overlay_front: bool,
-    /// [`orr_scene::RasterView::walking_materials`].
-    pub walking_materials: bool,
-    /// [`orr_scene::RasterView::interior_materials`].
-    pub interior_materials: bool,
-    /// [`orr_scene::RasterView::scattering_interiors`].
-    pub scattering_interiors: bool,
-    /// [`orr_scene::RasterView::medium_proxies`].
-    pub medium_proxies: bool,
+    /// [`orr_scene::RasterView::features`].
+    pub scene_features: SceneFeatures,
     /// Something reads the frame's [`LightingView::particle_lighting`], as a transparency hook
     /// that shades particles does; `false` leaves it null.
     pub particle_lighting: bool,
-    /// [`orr_scene::RasterView::dispersive_materials`].
-    pub dispersive_materials: bool,
 }
 
 /// What the background layer behind out-of-focus foreground reads in one frame. Each marked
@@ -1148,7 +1146,6 @@ const PHOTONS: PathKernel = path_kernel!(photon_paths, "caustic photons");
 const BACKGROUND: PathKernel = path_kernel!(background, "background paths");
 const UPDATE: PathKernel = path_kernel!(update, "world cache update paths");
 const SUPPORT: &str = "lighting compute kernels";
-const STAGED: &str = "staged path kernels";
 
 /// Queues `compile`, which writes the device's pipeline cache file when it finishes.
 pub(crate) fn compile_job<T: Send + 'static>(
@@ -1192,8 +1189,8 @@ enum CompilingPaths {
         background: JobResult<Result<PathPipeline, Error>>,
         update: JobResult<Result<PathPipeline, Error>>,
     },
-    /// One job per stage pipeline.
-    Staged(Vec<JobResult<Result<StagePipeline, Error>>>),
+    /// The staged loop's pipelines compile when paths first need them.
+    Staged,
 }
 
 /// [`LightingKernels`] compiling as jobs on the loading side, from
@@ -1211,10 +1208,11 @@ pub struct CompilingKernels {
 }
 
 impl CompilingKernels {
-    /// The most jobs [`LightingKernels::spawn`] queues: one per pipeline of the staged path loop
-    /// and of the kernels beside it. A consumer lends this many threads for them to compile at
-    /// once, and more to keep loading while they do.
-    pub const JOBS: usize = 34;
+    /// The jobs [`LightingKernels::spawn`] queues: one per pipeline of the kernels beside the
+    /// path kernels. The path kernels' pipelines compile as jobs of their own once a view's
+    /// first frame says what its paths may meet, at most ten at a time. A consumer lends this
+    /// many threads for them to compile at once, and more to keep loading while they do.
+    pub const JOBS: usize = 18;
 
     fn jobs(&self) -> Vec<&dyn JobState> {
         let mut out: Vec<&dyn JobState> = self.support.iter().map(|j| j as &dyn JobState).collect();
@@ -1225,7 +1223,7 @@ impl CompilingKernels {
                 background,
                 update,
             } => out.extend([paths as &dyn JobState, photons, background, update]),
-            CompilingPaths::Staged(jobs) => out.extend(jobs.iter().map(|j| j as &dyn JobState)),
+            CompilingPaths::Staged => {}
         }
         out
     }
@@ -1263,16 +1261,10 @@ impl CompilingKernels {
                 background: compiled(background, BACKGROUND.name)?,
                 update: compiled(update, UPDATE.name)?,
             },
-            CompilingPaths::Staged(jobs) => {
-                let mut out = Vec::new();
-                for job in jobs {
-                    out.push(compiled(job, STAGED)?);
-                }
-                PathKernels::Staged(Box::new(StagedPaths::new(
-                    StagedKernels::from_pipelines(out),
-                    self.rays,
-                )))
-            }
+            CompilingPaths::Staged => PathKernels::Staged(Box::new(StagedPaths::new(
+                StagedKernels::new(&self.device, self.kernels, self.rays),
+                self.rays,
+            ))),
         };
         let mut support = Vec::new();
         for job in &self.support {
@@ -1283,7 +1275,7 @@ impl CompilingKernels {
             support: SupportKernels::assemble(&self.device, self.kernels, support)?,
             _tables: self.tables.clone(),
         };
-        out.compile_tail(&self.device, self.kernels, &self.loading);
+        out.attach(&self.loading);
         Ok(out)
     }
 }
@@ -1329,6 +1321,51 @@ struct StagedPaths {
     rays: bool,
 }
 
+/// What each source's paths may meet in a frame (`specialize.slang`'s bits), from what the
+/// scene may hold and the view's settings.
+#[derive(Clone, Copy, Debug)]
+struct PathMay {
+    view: u32,
+    update: u32,
+    photons: u32,
+}
+
+impl PathMay {
+    /// `caustics`: the paths' root holds the caustics.
+    fn new(features: SceneFeatures, lighting: &ViewLighting, caustics: bool) -> Self {
+        if !lighting.specialize {
+            return Self {
+                view: MAY_ALL,
+                update: MAY_ALL,
+                photons: MAY_ALL,
+            };
+        }
+        let bit = |on: bool, bit: u32| if on { bit } else { 0 };
+        // A stack face bounds an interior, and a stack bends directional lights alone.
+        let stack = features.contains(SceneFeatures::INTERIORS)
+            && features.contains(SceneFeatures::DIRECTIONAL_LIGHTS);
+        let shared = bit(stack, MAY_STACK) | bit(caustics, MAY_CAUSTICS);
+        let dispersion = bit(disperses(features, lighting), MAY_DISPERSION);
+        Self {
+            view: shared | dispersion,
+            // Update paths do not split by wavelength.
+            update: shared,
+            photons: shared | dispersion,
+        }
+    }
+}
+
+/// Whether a view's paths may split by wavelength.
+fn disperses(features: SceneFeatures, lighting: &ViewLighting) -> bool {
+    lighting.dispersion && features.contains(SceneFeatures::DISPERSIVE)
+}
+
+/// Whether the paths of a view with `lighting` read `scene`'s caustics this frame, once the
+/// scene's pass has recorded them.
+fn gathers_caustics(scene: &SceneLighting, lighting: &ViewLighting) -> bool {
+    scene.caustics().photons() > 0 && lighting.reference.is_none_or(|r| r.photons > 0)
+}
+
 impl StagedPaths {
     fn new(stages: StagedKernels, rays: bool) -> Self {
         Self {
@@ -1359,7 +1396,7 @@ impl LightingKernels {
         let rays = runs_rays(device, entry);
         let paths = if runs_staged() {
             PathKernels::Staged(Box::new(StagedPaths::new(
-                StagedKernels::new(device, kernels, rays)?,
+                StagedKernels::new(device, kernels, rays),
                 rays,
             )))
         } else {
@@ -1393,11 +1430,7 @@ impl LightingKernels {
             compile_job(device, loading, move |d| (kernel.compile)(d, kernels, rays))
         };
         let paths = if runs_staged() {
-            CompilingPaths::Staged(
-                (0..staged::stage_count())
-                    .map(|i| staged::spawn_stage(device, kernels, loading, i, rays))
-                    .collect(),
-            )
+            CompilingPaths::Staged
         } else {
             CompilingPaths::Mega {
                 paths: path(VIEW),
@@ -1419,21 +1452,71 @@ impl LightingKernels {
         }
     }
 
-    /// Queues the compile of the staged path loop's tail stage on `loading`, unless it is ready
-    /// or queued: a job of minutes on a first run, which the kernels do not wait for. Until it
-    /// finishes, paths take every round of their stages, which costs time and changes no image.
-    /// [`CompilingKernels::finish`] queues it; kernels from [`Self::new`] need this call.
-    pub fn compile_tail(&self, device: &Device, kernels: &'static KernelSet, loading: &Loading) {
+    /// Compiles the path kernels' later pipelines as jobs on `loading` from here on, and queues
+    /// there the ones that take minutes on a first run and that paths do without until they
+    /// are ready: the staged loop's tail stage, and the single kernels of the update paths and
+    /// the photons. Until those finish the stages run every path to its end, which costs time
+    /// and changes no image. [`CompilingKernels::finish`] calls it; kernels from [`Self::new`]
+    /// compile their later pipelines on the calling thread until this call.
+    pub fn attach(&self, loading: &Arc<Loading>) {
         if let PathKernels::Staged(k) = &self.paths {
-            k.stages.compile_tail(device, kernels, loading);
+            k.stages.attach(loading);
             // The update paths' kernel is a compute kernel: nothing of theirs gains by reordering.
-            k.update.compile(device, loading, move |d| {
-                (UPDATE.compile)(d, kernels, false)
-            });
+            k.stages
+                .start_late(&k.update, |d, kernels| (UPDATE.compile)(d, kernels, false));
             let rays = k.rays;
-            k.photons.compile(device, loading, move |d| {
+            k.stages.start_late(&k.photons, move |d, kernels| {
                 (PHOTONS.compile)(d, kernels, rays)
             });
+        }
+    }
+
+    /// Asks for the path pipelines a view of a scene that may hold `features` needs under
+    /// `lighting`, with a background layer where `dof_background`, and says whether they are
+    /// ready. [`Self::record_paths`] waits for them otherwise, so a caller that would rather
+    /// show a frame without paths asks here first.
+    pub fn prepare_paths(
+        &self,
+        scene: &SceneLighting,
+        features: SceneFeatures,
+        lighting: &ViewLighting,
+        dof_background: bool,
+    ) -> bool {
+        let PathKernels::Staged(k) = &self.paths else {
+            return true;
+        };
+        let caustics = gathers_caustics(scene, lighting);
+        let may = PathMay::new(features, lighting, caustics);
+        let mut wanted = may.view;
+        let mut stages = Source::View.stages(features.contains(SceneFeatures::WALKING));
+        if dof_background {
+            stages.push(Stage::Background);
+        }
+        // The stages run the update paths and the photons until their own kernels are ready.
+        if lighting.reference.is_none() && k.update.get().is_none() {
+            wanted |= may.update;
+            stages.push(Stage::Update);
+        }
+        if caustics && k.photons.get().is_none() {
+            wanted |= may.photons;
+            stages.push(Stage::Photon);
+        }
+        k.stages.prepare(wanted, &stages)
+    }
+
+    /// How many path pipelines asked for are still compiling.
+    pub fn outstanding(&self) -> u32 {
+        match &self.paths {
+            PathKernels::Staged(k) => k.stages.outstanding(),
+            PathKernels::Mega { .. } => 0,
+        }
+    }
+
+    /// Waits for every path pipeline asked for, running queued loading jobs on this thread
+    /// meanwhile.
+    pub fn wait(&self) {
+        if let PathKernels::Staged(k) = &self.paths {
+            k.stages.wait();
         }
     }
 
@@ -1636,8 +1719,9 @@ impl LightingKernels {
                     0.0,
                 ),
             };
+        let walking = pass.scene_features.contains(SceneFeatures::WALKING);
         let walk_points = lighting.walk_compaction
-            && pass.walking_materials
+            && walking
             && matches!(
                 self.paths,
                 PathKernels::Mega {
@@ -1663,7 +1747,6 @@ impl LightingKernels {
         }
         if matches!(self.paths, PathKernels::Staged(_)) {
             let pixels = view.extent[0] * view.extent[1];
-            let walking = pass.walking_materials;
             if !view
                 .staged
                 .as_ref()
@@ -1731,21 +1814,35 @@ impl LightingKernels {
             stages: GpuPtr::NULL,
             slice_base: 0,
             slice_count: 0,
-            features: if pass.walking_materials {
-                FEATURE_WALK
-            } else {
-                0
-            } | if lighting.dispersion && pass.dispersive_materials {
-                FEATURE_DISPERSION
-            } else {
-                0
-            },
+            features: if walking { FEATURE_WALK } else { 0 }
+                | if disperses(pass.scene_features, lighting) {
+                    FEATURE_DISPERSION
+                } else {
+                    0
+                },
             round: 0,
         };
+        // Asked for together, the sources that run in the stages share their pipelines.
+        self.prepare_paths(
+            scene,
+            pass.scene_features,
+            lighting,
+            pass.dof_background.is_some(),
+        );
+        let may = PathMay::new(
+            pass.scene_features,
+            lighting,
+            gathers_caustics(scene, lighting),
+        );
         let path_root = PathRoot {
             caustics: self.record_photons(list, scene, view, pass, lighting, &path_root)?,
             ..path_root
         };
+        debug_assert_eq!(
+            path_root.caustics != GpuPtr::NULL,
+            gathers_caustics(scene, lighting),
+            "the paths' pipelines are chosen by whether they gather caustics"
+        );
         self.record_layers(list, view, pass, lighting, lens.is_some(), &path_root);
         if !reference {
             let update_root = PathRoot {
@@ -1773,6 +1870,7 @@ impl LightingKernels {
                     view.staged.as_ref().expect("made above"),
                     &update_root,
                     Source::Update,
+                    may.update,
                     blocks[0] * blocks[1],
                     path_rounds(&update_root),
                     1,
@@ -1789,6 +1887,7 @@ impl LightingKernels {
                 view.staged.as_ref().expect("made above"),
                 &path_root,
                 Source::View,
+                may.view,
                 pixels,
                 path_rounds(&path_root),
                 if pass.frosted_glass { 2 } else { 1 },
@@ -1813,6 +1912,7 @@ impl LightingKernels {
                         view.staged.as_ref().expect("made above"),
                         &background_root,
                         Source::Background,
+                        may.view,
                         pixels,
                         path_rounds(&background_root),
                         1,
@@ -1913,6 +2013,7 @@ impl LightingKernels {
                 view.staged.as_ref().expect("made by record_paths"),
                 &photon_root,
                 Source::Photon,
+                PathMay::new(pass.scene_features, lighting, true).photons,
                 photons,
                 path_rounds(&photon_root),
                 1,

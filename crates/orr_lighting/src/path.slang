@@ -133,19 +133,14 @@ public struct PathStages
     public uint4* walks;                // WALK_WORDS words per slot: a walk's entry; null where no material walks
 }
 
-// A queue of path slots in one round. Its stage has a variant without scene features' code,
-// which runs over `groups` workgroups, and one with all of it, which runs over `full_groups`:
-// whoever appends to the queue counts the workgroups of the variant the paths run.
+// A queue of path slots in one round: the workgroups its stage runs over, which whoever
+// appends to the queue counts, and the slots appended.
 public struct StageQueue
 {
     public uint groups;
     public uint groups_y;
     public uint groups_z;
-    public uint count;                  // slots appended
-    public uint full_groups;
-    public uint full_groups_y;
-    public uint full_groups_z;
-    public uint _pad0;
+    public uint count;
 }
 
 public struct PathRoot
@@ -214,7 +209,7 @@ public struct PathRoot
     public PathStages* stages;
     public uint slice_base;
     public uint slice_count;
-    public uint features;           // FEATURE_* (path/stages.slang) the scene and view may need beyond the light set's
+    public uint features;           // FEATURE_* (path/stages.slang)
     public uint round;              // the rounds this root runs: `round_now`, `round_pass`, `round_next` (path/stages.slang)
 }
 

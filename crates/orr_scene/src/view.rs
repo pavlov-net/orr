@@ -243,19 +243,8 @@ pub struct RasterView {
     /// Workgroups of one per cluster of `raster`'s smoke list, when the scene holds a smoke
     /// entry.
     pub smoke_args: Option<GpuPtr<DispatchArgs>>,
-    /// Whether paths through any material the scene holds may take a random walk.
-    pub walking_materials: bool,
-    /// Whether a surface of any material the scene holds bounds an interior: a dielectric that
-    /// is not thin-walled. Without one no point lies in an interior the view does not name.
-    pub interior_materials: bool,
-    /// Whether one of those interiors scatters, read without a surface point: its material's
-    /// transmission depth and scatter are above 0.
-    pub scattering_interiors: bool,
-    /// Whether the scene holds a medium proxy.
-    pub medium_proxies: bool,
-    /// Whether any material the scene holds disperses: its transmission has a dispersion scale
-    /// and an Abbe number above 0.
-    pub dispersive_materials: bool,
+    /// What the scene may hold this frame.
+    pub features: crate::SceneFeatures,
     /// The view history it rendered with.
     pub history: ViewHistoryId,
     /// The scene's sky statistics, which lighting's scene pass writes and exposure reads.

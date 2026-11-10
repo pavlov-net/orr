@@ -41,6 +41,7 @@ import orr_lighting.spectrum;
 import orr_lighting.caustics;
 import orr_lighting.guides;
 import orr_lighting.path;
+import orr_lighting.specialize;
 
 // `PathRoot.source`: which paths a root's stages run.
 public static const uint PATH_SOURCE_VIEW = 0;
@@ -55,30 +56,17 @@ public static const uint QUEUE_OTHER = 1;
 public static const uint QUEUE_WALK = 2;
 public static const uint QUEUE_TRACE = 3;
 public static const uint QUEUE_FINISH = 4;
-// No list: its first round's workgroup counts are those of the view's primary stage, over
-// every path of the slice.
-public static const uint QUEUE_START = 5;
-public static const uint STAGE_QUEUES = 6;
+public static const uint STAGE_QUEUES = 5;
 
 // Lanes per workgroup of the stages over a queue.
 public static const uint STAGE_GROUP = 32;
 
-// What a shade stage variant holds the code of (`F`). A variant without a feature runs only
-// where the scene and view lack it: `runs_lean` chooses by plane stacks and dispersion, and the
-// renderer chooses a variant with FEATURE_CAUSTICS wherever `PathRoot.caustics` is set, without
-// which no surface chains and no vertex gathers.
-public static const uint FEATURE_STACK = 1 << 1;       // plane stacks that bend directional lights
-public static const uint FEATURE_DISPERSION = 1 << 2;  // dispersive layers split paths by wavelength
-public static const uint FEATURE_CAUSTICS = 1 << 4;    // caustic photons: chain vertices and what vertices gather
-public static const uint FEATURES_ALL = FEATURE_STACK | FEATURE_DISPERSION | FEATURE_CAUSTICS;
-public static const uint FEATURES_LEAN = 0;
-// `PathRoot.features` beside FEATURE_DISPERSION: a material of the scene may walk, so the walk
-// stage runs; and the shade stages run their lean variants whatever the scene holds, which only
-// a scratch build that compiled no other asks for.
+// `PathRoot.features`: a material of the scene may walk, so the walk stage runs; paths may
+// split by wavelength; and the shade stages run as ray dispatches, which reorder their lanes by
+// coherence key: a workgroup of a shade queue is then a row of STAGE_GROUP rays, and the queue
+// counts rows.
 public static const uint FEATURE_WALK = 1 << 0;
-public static const uint FEATURE_FORCE_LEAN = 1u << 31;
-// And the shade stages run as ray dispatches, which reorder their lanes by coherence key: a
-// workgroup of a shade queue is then a row of STAGE_GROUP rays, and the queue counts rows.
+public static const uint FEATURE_DISPERSION = 1 << 2;
 public static const uint FEATURE_RAY_SHADES = 1 << 3;
 
 // `PathRoot.round`: the round a stage runs in, the first round of its pass, where every path of
@@ -91,19 +79,13 @@ uint round_next(PathRoot r) { return (r.round >> 20) & 0x3ff; }
 // light, the one light a stack bends. Without either no stack changes what a path gathers.
 bool stack_tracked(PathRoot r)
 {
-    return r.set.stack_entries != 0 && r.set.directional_count != 0;
+    return may(MAY_STACK) && r.set.stack_entries != 0 && r.set.directional_count != 0;
 }
 
 // Whether paths of `r` may split by wavelength.
 bool spectral_tracked(PathRoot r)
 {
-    return (r.features & FEATURE_DISPERSION) != 0;
-}
-
-// Whether the shade stages of `r` run their variants without feature code.
-bool runs_lean(PathRoot r)
-{
-    return (r.features & FEATURE_FORCE_LEAN) != 0 || (!spectral_tracked(r) && !stack_tracked(r));
+    return may(MAY_DISPERSION) && (r.features & FEATURE_DISPERSION) != 0;
 }
 
 // `PathLoop.flags`. The bits from LOOP_KEY_SHIFT up hold the coherence key of the pending vertex.
@@ -318,12 +300,6 @@ bool ray_queue(PathRoot r, uint queue)
     return (r.features & FEATURE_RAY_SHADES) != 0 && (queue == QUEUE_OPAQUE || queue == QUEUE_OTHER);
 }
 
-// Whether `queue`'s stage has one variant.
-bool one_variant(uint queue)
-{
-    return queue == QUEUE_TRACE || queue == QUEUE_WALK || queue == QUEUE_FINISH;
-}
-
 // Appends `slot` to `queue` of round `round`, and counts the workgroup it starts.
 void append(PathRoot r, uint queue, uint round, uint slot)
 {
@@ -334,18 +310,10 @@ void append(PathRoot r, uint queue, uint round, uint slot)
     st.lists[queue * st.capacity + at] = slot;
     if (at % STAGE_GROUP == 0)
     {
-        bool lean = one_variant(queue) || runs_lean(r);
         if (ray_queue(r, queue))
-        {
-            if (lean)
-                InterlockedAdd(q.groups_y, 1u);
-            else
-                InterlockedAdd(q.full_groups_y, 1u);
-        }
-        else if (lean)
-            InterlockedAdd(q.groups, 1u);
+            InterlockedAdd(q.groups_y, 1u);
         else
-            InterlockedAdd(q.full_groups, 1u);
+            InterlockedAdd(q.groups, 1u);
     }
 }
 
@@ -367,19 +335,11 @@ public void reset_queues(PathRoot r, uint lane)
     if (lane >= st.rounds * STAGE_QUEUES)
         return;
     // A compute stage's workgroups count along x; a ray stage's rows of STAGE_GROUP rays along y.
-    StageQueue q = { 0, 1, 1, 0, 0, 1, 1, 0 };
+    StageQueue q = { 0, 1, 1, 0 };
     if (ray_queue(r, lane % STAGE_QUEUES))
     {
-        StageQueue rows = { STAGE_GROUP, 0, 1, 0, STAGE_GROUP, 0, 1, 0 };
+        StageQueue rows = { STAGE_GROUP, 0, 1, 0 };
         q = rows;
-    }
-    if (lane == QUEUE_START)
-    {
-        uint groups = (r.slice_count + STAGE_GROUP - 1) / STAGE_GROUP;
-        if (runs_lean(r))
-            q.groups = groups;
-        else
-            q.full_groups = groups;
     }
     st.queues[lane] = q;
 }
@@ -712,10 +672,10 @@ void begin_path(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler rng
     append(r, camera ? QUEUE_TRACE : QUEUE_OPAQUE, round, slot);
 }
 
-// The view's primary stage with the code of features `F`: the path of the slice's `lane`th
+// The view's primary stage: the path of the slice's `lane`th
 // pixel as `view_body` starts it, its camera ray to the trace stage, or its first vertex on the
 // G-buffer's surface shaded here, from state no stage stored.
-public void primary_stage<S : ISurface, M : IMedium, let F : uint>(PathRoot r, uint lane)
+public void primary_stage<S : ISurface, M : IMedium>(PathRoot r, uint lane)
 {
     uint2 extent = r.gbuffer.extent;
     uint index = r.slice_base + lane;
@@ -758,7 +718,7 @@ public void primary_stage<S : ISurface, M : IMedium, let F : uint>(PathRoot r, u
     store_fixed(r.stages, lane, f);
     // The round's trace stage, which runs next, traces these paths' rays beside the camera
     // rays: a queue's list holds one round at a time.
-    shade_slot<S, M, QUEUE_OPAQUE, F>(r, lane, f, p, (PathPending)0, c, round_now(r));
+    shade_slot<S, M, QUEUE_OPAQUE>(r, lane, f, p, (PathPending)0, c, round_now(r));
 }
 
 // The background layer's path of the slice's `lane`th pixel, as `background_texel` starts it,
@@ -1275,7 +1235,7 @@ struct ShadeNee
 // of the iteration that traced the ray. A `start_vertex` is the G-buffer surface a path starts
 // on, which `trace_path` takes before its loop the same way, since its throughput is 1 and its
 // light counts wherever the G-buffer's emission does. False where the path ends.
-bool resolve_vertex<S : ISurface, let F : uint>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, PathPending pending, inout StagedRecord record, PathContext x, bool layer, bool start_vertex, inout Sampler rng, inout ShadeVertex sv)
+bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, PathPending pending, inout StagedRecord record, PathContext x, bool layer, bool start_vertex, inout Sampler rng, inout ShadeVertex sv)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
@@ -1308,7 +1268,7 @@ bool resolve_vertex<S : ISurface, let F : uint>(PathRoot r, PathFixed f, inout P
             return false;
         }
         sv.l = opaque_vertex(gx);
-        sv.l.chains = (F & FEATURE_CAUSTICS) != 0 && surface_chains(r, gx.surface);
+        sv.l.chains = may(MAY_CAUSTICS) && surface_chains(r, gx.surface);
         p.opaque++;
     }
     else
@@ -1334,19 +1294,19 @@ bool resolve_vertex<S : ISurface, let F : uint>(PathRoot r, PathFixed f, inout P
             }
             sv.l = layer_vertex(v, sh, ray.dir);
             StackFace face;
-            sv.l.stack = (F & FEATURE_STACK) != 0 && c.stack.valid && stack_face(s, h, x.disperse, face);
+            sv.l.stack = may(MAY_STACK) && c.stack.valid && stack_face(s, h, x.disperse, face);
         }
         else
         {
             sv.l = opaque_vertex(hit_vertex(v, sh, ray.dir));
             p.opaque++;
         }
-        sv.l.chains = (F & FEATURE_CAUSTICS) != 0 && surface_chains(r, sh.surface);
+        sv.l.chains = may(MAY_CAUSTICS) && surface_chains(r, sh.surface);
         swapped = sh.swapped;
     }
     if (first)
         p.cone.width = cone_width(p.cone, sv.l.x.camera_distance);
-    bool disperse = (F & FEATURE_DISPERSION) != 0 && x.disperse;
+    bool disperse = may(MAY_DISPERSION) && x.disperse;
     bool dispersive = layer && disperse && layer_disperses(s, sv.l, c.interior);
     set_flag(p.flags, LOOP_DISPERSIVE, dispersive);
     if (dispersive && !c.spectral.on)
@@ -1414,7 +1374,7 @@ bool resolve_vertex<S : ISurface, let F : uint>(PathRoot r, PathFixed f, inout P
 // (`trace_path`'s loop body up to its trace): next-event estimation, whose shadow ray `nee_mode` places; the caustic photons'
 // light; and the vertex's next direction, which leaves `c.ray` for the trace stage, or with
 // `walking` starts a walk along `wi`. False where the path ends.
-bool shade_vertex<S : ISurface, M : IMedium, let X : uint, let F : uint>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout StagedRecord record, PathContext x, uint kind, uint nee_mode, inout Sampler rng, ShadeVertex sv, out bool walking, out float3 wi, out ShadeNee nee)
+bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout StagedRecord record, PathContext x, uint kind, uint nee_mode, inout Sampler rng, ShadeVertex sv, out bool walking, out float3 wi, out ShadeNee nee)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
@@ -1427,11 +1387,11 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint, let F : uint>(PathRoo
     Bsdf b = sv.b;
     bool reference = x.reference;
     bool counted = has(p.flags, LOOP_COUNTED);
-    bool disperse = (F & FEATURE_DISPERSION) != 0 && x.disperse;
+    bool disperse = may(MAY_DISPERSION) && x.disperse;
     // A dispersive layer with live companions adds no direct light: its BSDF differs by
     // wavelength, and its rays reach lights at full weight.
     // A walk's exit follows an opaque vertex, which is no dispersive layer.
-    bool split = X != SHADE_EXIT && (F & FEATURE_DISPERSION) != 0 && has(p.flags, LOOP_DISPERSIVE) && c.spectral.companions();
+    bool split = X != SHADE_EXIT && may(MAY_DISPERSION) && has(p.flags, LOOP_DISPERSIVE) && c.spectral.companions();
     bool at_exit = X == SHADE_EXIT;
     LocalLights* local = nullptr;
     if (p.depth == 0)
@@ -1444,7 +1404,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint, let F : uint>(PathRoo
     // that next-event estimation takes through a plane stack is not deposited. No photon walks.
     if (X != SHADE_EXIT && x.photon)
     {
-        if (p.chains > 0 && !medium_vertex && !leaving && !((F & FEATURE_STACK) != 0 && stack_owns<S>(s, v, vertex_origin(l.x, -f.dir), -f.dir, c.stack, p.depth, disperse, x.feedback)))
+        if (p.chains > 0 && !medium_vertex && !leaving && !(may(MAY_STACK) && stack_owns<S>(s, v, vertex_origin(l.x, -f.dir), -f.dir, c.stack, p.depth, disperse, x.feedback)))
             record.deposit(r, l, b, c.spectral.color(p.throughput), rng);
         if (!l.chains)
             return false;
@@ -1497,7 +1457,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint, let F : uint>(PathRoo
     }
     // The caustic photons' light at the vertex's diffuse lobes, which is indirect.
     bool gathered = r.mode == PATH_DIRECT ? false : r.mode == PATH_INDIRECT ? true : counted;
-    if ((F & FEATURE_CAUSTICS) != 0 && x.caustics && gathered && !medium_vertex && !leaving)
+    if (may(MAY_CAUSTICS) && x.caustics && gathered && !medium_vertex && !leaving)
         p.radiance += c.spectral.color(p.throughput * caustic_gather<S>(r, l, b, at_exit, sv.exit_scatter, p.cone.width, rng));
     if (has(p.flags, LOOP_LAST))
         return false;
@@ -1552,7 +1512,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint, let F : uint>(PathRoo
         walking = record.walks() && alive && (bs.lobe & LOBE_VOLUME) != 0;
         crossed = on_layer && (bs.lobe & LOBE_TRANSMISSION) != 0 && crosses_interior(s, l.section);
         null_crossing = on_layer && delta && (bs.lobe & LOBE_TRANSMISSION) != 0 && thin_walled(l.x.surface);
-        stack_crossing = (F & FEATURE_STACK) != 0 && crossed && delta && c.stack.valid && c.stack.crossed < STACK_CROSSINGS && l.stack
+        stack_crossing = may(MAY_STACK) && crossed && delta && c.stack.valid && c.stack.crossed < STACK_CROSSINGS && l.stack
             && (c.stack.crossed == 0 || abs(dot(l.x.surface.normal, c.stack.normal)) >= STACK_PARALLEL);
         float3 chained = max(bs.weight - bs.diffuse, 0.0);
         if (null_crossing || walking)
@@ -1649,7 +1609,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint, let F : uint>(PathRoo
                 c.stack.valid = false;
             else
             {
-                c.stack.valid = (F & FEATURE_STACK) != 0 && c.ray.pdf > 0.0 && !x.one_technique && set.stack_entries != 0;
+                c.stack.valid = may(MAY_STACK) && c.ray.pdf > 0.0 && !x.one_technique && set.stack_entries != 0;
                 c.stack.crossed = 0;
                 c.stack.origin = c.ray.origin;
                 c.stack.dir = wi;
@@ -1667,7 +1627,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint, let F : uint>(PathRoo
 
 // Stores what a shade left of the path and hands it on: to the trace stage of round `next` with
 // a ray or a shadow ray to trace, else to the finish stage.
-void leave_shade<let F : uint>(PathRoot r, uint slot, PathFixed f, inout PathLoop p, ShadeState c, bool alive, bool shadow, uint next)
+void leave_shade(PathRoot r, uint slot, PathFixed f, inout PathLoop p, ShadeState c, bool alive, bool shadow, uint next)
 {
     PathStages* st = r.stages;
     set_flag(p.flags, LOOP_SHADOW, shadow);
@@ -1676,11 +1636,9 @@ void leave_shade<let F : uint>(PathRoot r, uint slot, PathFixed f, inout PathLoo
     {
         store_ray(st, slot, c.ray);
         store_interior(st, slot, c.interior);
-        if ((F & FEATURE_STACK) != 0)
-            store_stack(r, slot, c.stack);
+        store_stack(r, slot, c.stack);
     }
-    if ((F & FEATURE_DISPERSION) != 0)
-        store_spectral(r, slot, c.spectral);
+    store_spectral(r, slot, c.spectral);
     if (!alive && !shadow)
     {
         finish_path(r, slot, f, p);
@@ -1690,11 +1648,11 @@ void leave_shade<let F : uint>(PathRoot r, uint slot, PathFixed f, inout PathLoo
     append(r, QUEUE_TRACE, next, slot);
 }
 
-// The shade stage over `K` (QUEUE_OPAQUE or QUEUE_OTHER) with the code of features `F`: the
+// The shade stage over `K` (QUEUE_OPAQUE or QUEUE_OTHER): the
 // vertex the trace stage reached, the end of its iteration, and the next iteration up to its
 // ray, which the trace stage traces, or its walk, which the walk stage runs. `C` names its
 // coherence point, before anything of the vertex is loaded.
-public void shade_stage<C : ICoherence, S : ISurface, M : IMedium, let K : uint, let F : uint>(PathRoot r, uint lane)
+public void shade_stage<C : ICoherence, S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint lane)
 {
     PathStages* st = r.stages;
     uint slot;
@@ -1707,18 +1665,14 @@ public void shade_stage<C : ICoherence, S : ISurface, M : IMedium, let K : uint,
     ShadeState c;
     c.ray = load_ray(st, slot);
     c.interior = load_interior(st, slot);
-    c.stack = (PathStack)0;
-    if ((F & FEATURE_STACK) != 0)
-        c.stack = load_stack(r, slot);
-    c.spectral = Spectral();
-    if ((F & FEATURE_DISPERSION) != 0)
-        c.spectral = load_spectral(r, slot);
-    shade_slot<S, M, K, F>(r, slot, f, p, pending, c, round_now(r) + 1);
+    c.stack = load_stack(r, slot);
+    c.spectral = load_spectral(r, slot);
+    shade_slot<S, M, K>(r, slot, f, p, pending, c, round_now(r) + 1);
 }
 
 // A shade of `slot`'s path from the state `f`, `p`, `pending` and `c`, whose ray the trace stage
 // of round `next` traces.
-void shade_slot<S : ISurface, M : IMedium, let K : uint, let F : uint>(PathRoot r, uint slot, PathFixed f, PathLoop p, PathPending pending, ShadeState c, uint next)
+void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, PathFixed f, PathLoop p, PathPending pending, ShadeState c, uint next)
 {
     PathStages* st = r.stages;
     ViewConstants* v = r.view;
@@ -1749,20 +1703,20 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint, let F : uint>(PathRoot 
         set_flag(p.flags, LOOP_GBUFFER_START, false);
         if (!start_vertex)
             p.iteration++;
-        if (!resolve_vertex<S, F>(r, f, p, c, pending, record, x, K == QUEUE_OTHER, start_vertex, rng, sv) || !iteration_runs(r, p, kind, true))
+        if (!resolve_vertex<S>(r, f, p, c, pending, record, x, K == QUEUE_OTHER, start_vertex, rng, sv) || !iteration_runs(r, p, kind, true))
         {
             p.rng = rng;
-            leave_shade<F>(r, slot, f, p, c, false, false, next);
+            leave_shade(r, slot, f, p, c, false, false, next);
             return;
         }
         set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
     }
     // Through a plane stack the vertex's BSDF weighs the light again past its shadow ray.
-    uint nee_mode = (F & FEATURE_STACK) != 0 && stack_tracked(r) ? NEE_INLINE : NEE_DEFER;
+    uint nee_mode = stack_tracked(r) ? NEE_INLINE : NEE_DEFER;
     bool walking;
     float3 wi;
     ShadeNee nee;
-    bool alive = shade_vertex<S, M, SHADE_VERTEX, F>(r, f, p, c, record, x, kind, nee_mode, rng, sv, walking, wi, nee);
+    bool alive = shade_vertex<S, M, SHADE_VERTEX>(r, f, p, c, record, x, kind, nee_mode, rng, sv, walking, wi, nee);
     p.rng = rng;
     if (nee.traced)
         store_shadow(st, slot, nee.q);
@@ -1772,13 +1726,12 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint, let F : uint>(PathRoot 
         WalkEntry entry = { sv.l, wi };
         store_walk(st, slot, entry);
         set_flag(p.flags, LOOP_SHADOW, nee.traced);
-        if ((F & FEATURE_DISPERSION) != 0)
-            store_spectral(r, slot, c.spectral);
+        store_spectral(r, slot, c.spectral);
         store_loop(st, slot, p);
         append(r, QUEUE_WALK, round_now(r), slot);
         return;
     }
-    leave_shade<F>(r, slot, f, p, c, alive, nee.traced, next);
+    leave_shade(r, slot, f, p, c, alive, nee.traced, next);
 }
 
 // The walk stage: the subsurface walk an opaque vertex started, its exit vertex and that
@@ -1852,7 +1805,7 @@ public void walk_stage<S : ISurface, M : IMedium>(PathRoot r, uint lane)
         set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
         bool walking;
         float3 wi;
-        alive = shade_vertex<S, M, SHADE_EXIT, FEATURES_ALL>(r, f, p, c, record, x, VERTEX_OPAQUE, NEE_DEFER, rng, sv, walking, wi, nee);
+        alive = shade_vertex<S, M, SHADE_EXIT>(r, f, p, c, record, x, VERTEX_OPAQUE, NEE_DEFER, rng, sv, walking, wi, nee);
         traced[1] = nee.traced;
         rays[1] = nee.q;
     }
@@ -1876,7 +1829,7 @@ public void walk_stage<S : ISurface, M : IMedium>(PathRoot r, uint lane)
         shadow_add(q, e, scale, shadow_emitter<S>(r, q, vis), c.spectral, p, record);
     }
     p.rng = rng;
-    leave_shade<FEATURES_ALL>(r, slot, f, p, c, alive, false, round_now(r) + 1);
+    leave_shade(r, slot, f, p, c, alive, false, round_now(r) + 1);
 }
 
 // ---------------------------------------------------------------------------------------------

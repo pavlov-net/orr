@@ -20,6 +20,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::accel::{AccelKernels, AccelLimits, AccelShared};
 use crate::arena::{ArenaReport, ArenaRequest, ViewArena, ViewStep};
 use crate::decals::{self, build_bins};
+use crate::features::SceneFeatures;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
 use crate::medium_proxy::{ProxyBlas, VolumeRef};
@@ -2109,6 +2110,12 @@ impl<'a> Frame<'a> {
         self.raster_view_with(view, &[])
     }
 
+    /// What `scene` may hold now: [`RasterView::features`] before the view is rastered.
+    pub fn scene_features(&self, scene: SceneId) -> Result<SceneFeatures> {
+        let cpu = self.core.scene(scene)?.cpu.lock().unwrap();
+        Ok(self.core.materials.features() | cpu.features())
+    }
+
     /// [`Self::raster_view`], with `requests`, the transient targets of the passes that
     /// follow it, laid out in the view's arena beside the raster's.
     pub fn raster_view_with(
@@ -2138,10 +2145,10 @@ impl<'a> Frame<'a> {
                 core.cell_log2,
             )
             .to_array();
-        let (slots, smoke, medium_proxies) = {
+        let (slots, smoke, scene_features) = {
             let cpu = scene.cpu.lock().unwrap();
             let smoke = cpu.producers.iter().flatten().any(|p| p.smoke);
-            (cpu.ptlas.high_water, smoke, cpu.ptlas.has_medium_proxies())
+            (cpu.ptlas.high_water, smoke, cpu.features())
         };
         let producer_capacity = scene.desc.producer_capacity;
         let sizes = TargetSizes {
@@ -2216,11 +2223,7 @@ impl<'a> Frame<'a> {
             counts: targets.counts(),
             raster,
             smoke_args: smoke.then(|| targets.smoke_args()),
-            walking_materials: core.materials.any_walking(),
-            interior_materials: core.materials.any_interior(),
-            scattering_interiors: core.materials.any_scattering_interior(),
-            medium_proxies,
-            dispersive_materials: core.materials.any_dispersive(),
+            features: core.materials.features() | scene_features,
             history: view.history,
             sky_stats,
             focus,

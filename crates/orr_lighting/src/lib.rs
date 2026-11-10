@@ -127,6 +127,12 @@ pub enum Error {
         kernel: &'static str,
         message: String,
     },
+    /// A path pipeline compiled after the kernels were ready failed.
+    #[error("compiling {kernel}: {message}")]
+    LateCompile {
+        kernel: &'static str,
+        message: String,
+    },
     /// A replacement kernel does not match the module it replaces.
     #[error("kernel {kernel}: {reason}")]
     Kernel {

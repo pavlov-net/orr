@@ -13,6 +13,7 @@ use orr_gpu::{
 use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
 use orr_pack::mesh::SurfaceClass;
 
+use crate::features::{MaterialFeatures, SceneFeatures};
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::upload::Record;
 use crate::{Error, MaterialGpu, Result, TextureSamplerGpu, TextureStreamGpu};
@@ -298,14 +299,8 @@ pub(crate) struct MaterialTable {
     ids: Mutex<RangeAllocator>,
     /// Materials whose pixels may use the extended G-buffer targets.
     extended: Mutex<HashSet<u32>>,
-    /// Materials whose paths may take a random walk.
-    walking: Mutex<HashSet<u32>>,
-    /// Materials whose surfaces bound an interior.
-    interiors: Mutex<HashSet<u32>>,
-    /// Those of them whose interior scatters.
-    scattering_interiors: Mutex<HashSet<u32>>,
-    /// Materials whose transmission disperses.
-    dispersive: Mutex<HashSet<u32>>,
+    /// What each record may show a path.
+    features: Mutex<MaterialFeatures>,
     /// Materials whose displacement is a world length.
     world_lengths: Mutex<HashSet<u32>>,
 }
@@ -317,31 +312,6 @@ fn needs_extended(m: &MaterialGpu) -> bool {
     let thin_sss = m.flags & f::THIN_WALLED != 0 && m.subsurface_weight > 0.0;
     let lobes = f::SUBSURFACE | f::COAT | f::FUZZ | f::THIN_FILM | f::ANISOTROPY;
     thin_sss || m.flags & lobes != 0 || m.surface != 0
-}
-
-/// Whether paths through `m` may take a random walk: through its subsurface medium or its dense
-/// scattering interior. A linked surface may set any lobe.
-fn may_walk(m: &MaterialGpu) -> bool {
-    let thin = m.flags & material_flags::THIN_WALLED != 0;
-    let interior = m.transmission_weight > 0.0
-        && m.transmission_depth > 0.0
-        && m.transmission_scatter.iter().any(|&c| c > 0.0);
-    m.surface != 0 || (!thin && (m.subsurface_weight > 0.0 || interior))
-}
-
-/// Whether a surface of `m` bounds an interior (`crosses_interior`): a dielectric that is not
-/// thin-walled.
-fn bounds_interior(m: &MaterialGpu) -> bool {
-    use material_flags as f;
-    m.flags & (f::DIELECTRIC | f::THIN_WALLED) == f::DIELECTRIC
-}
-
-/// Whether the interior `m` bounds scatters by the material's own factors, as a list of
-/// interiors that holds no surface point reads it (`interior_medium`).
-fn interior_scatters(m: &MaterialGpu) -> bool {
-    bounds_interior(m)
-        && m.transmission_depth > 0.0
-        && m.transmission_scatter.iter().any(|&c| c > 0.0)
 }
 
 impl MaterialTable {
@@ -356,10 +326,7 @@ impl MaterialTable {
             )?,
             ids: Mutex::new(RangeAllocator::new(capacity)),
             extended: Mutex::new(HashSet::new()),
-            walking: Mutex::new(HashSet::new()),
-            interiors: Mutex::new(HashSet::new()),
-            scattering_interiors: Mutex::new(HashSet::new()),
-            dispersive: Mutex::new(HashSet::new()),
+            features: Mutex::new(MaterialFeatures::default()),
             world_lengths: Mutex::new(HashSet::new()),
         })
     }
@@ -383,13 +350,10 @@ impl MaterialTable {
             }
         };
         mark(&self.extended, needs_extended(m));
-        mark(&self.walking, may_walk(m));
-        mark(&self.interiors, bounds_interior(m));
-        mark(&self.scattering_interiors, interior_scatters(m));
-        mark(
-            &self.dispersive,
-            m.transmission_dispersion_scale > 0.0 && m.transmission_dispersion_abbe_number > 0.0,
-        );
+        self.features
+            .lock()
+            .unwrap()
+            .set(id.0, SceneFeatures::of_material(m));
         mark(
             &self.world_lengths,
             m.flags & material_flags::DISPLACEMENT_WORLD != 0,
@@ -401,24 +365,9 @@ impl MaterialTable {
         !self.extended.lock().unwrap().is_empty()
     }
 
-    /// Whether paths through any material may take a random walk.
-    pub(crate) fn any_walking(&self) -> bool {
-        !self.walking.lock().unwrap().is_empty()
-    }
-
-    /// Whether a surface of any material bounds an interior.
-    pub(crate) fn any_interior(&self) -> bool {
-        !self.interiors.lock().unwrap().is_empty()
-    }
-
-    /// Whether the interior any material bounds scatters.
-    pub(crate) fn any_scattering_interior(&self) -> bool {
-        !self.scattering_interiors.lock().unwrap().is_empty()
-    }
-
-    /// Whether any material's transmission disperses.
-    pub(crate) fn any_dispersive(&self) -> bool {
-        !self.dispersive.lock().unwrap().is_empty()
+    /// What any material may show a path.
+    pub(crate) fn features(&self) -> SceneFeatures {
+        self.features.lock().unwrap().any()
     }
 
     /// Whether any of `ids` displaces by a world length.
@@ -438,10 +387,7 @@ impl MaterialTable {
     /// Returns `id` for reuse; its record stays until a new material overwrites it.
     pub(crate) fn free(&self, id: MaterialId) {
         self.extended.lock().unwrap().remove(&id.0);
-        self.walking.lock().unwrap().remove(&id.0);
-        self.interiors.lock().unwrap().remove(&id.0);
-        self.scattering_interiors.lock().unwrap().remove(&id.0);
-        self.dispersive.lock().unwrap().remove(&id.0);
+        self.features.lock().unwrap().set(id.0, SceneFeatures::NONE);
         self.world_lengths.lock().unwrap().remove(&id.0);
         self.ids.lock().unwrap().free(id.0, 1);
     }

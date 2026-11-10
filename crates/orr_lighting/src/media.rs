@@ -1,12 +1,12 @@
 //! Per-view participating media: the froxel volume to the scene's `near_range`, the
 //! aerial-perspective LUT past it, and media apply.
 
-use orr_scene::MaterialId;
 use orr_scene::orr_gpu::{
     self, AddressMode, Allocation, CommandList, ComputePipeline, DEFAULT_MEDIUM, Device, Filter,
     Format, GpuPtr, Hazards, MemoryKind, SamplerDesc, SamplerIndex, Stages, StorageImageIndex,
     Texture, TextureDesc, TextureIndex, TextureKind, TextureMemory, TextureUsage,
 };
+use orr_scene::{MaterialId, SceneFeatures};
 
 use crate::scene::{FRAME_SLOTS, Ring};
 use crate::shaders::media::{aerial, apply, froxel, smoke};
@@ -440,7 +440,7 @@ impl MediaKernels {
     /// interior a view names counts as one that scatters.
     fn readers(&self, pass: &ViewPass, lighting: &ViewLighting) -> Readers {
         let scatters = self.linked_medium
-            || pass.medium_proxies
+            || pass.scene_features.contains(SceneFeatures::MEDIUM_PROXIES)
             || pass.smoke_args.is_some()
             || lighting.camera_medium.is_some()
             || matches!(
@@ -448,8 +448,12 @@ impl MediaKernels {
                 LightingDebugView::Media | LightingDebugView::Froxels
             );
         Readers {
-            fogged: scatters || pass.interior_materials,
-            lit: scatters || pass.scattering_interiors || pass.particle_lighting,
+            fogged: scatters || pass.scene_features.contains(SceneFeatures::INTERIORS),
+            lit: scatters
+                || pass
+                    .scene_features
+                    .contains(SceneFeatures::SCATTERING_INTERIORS)
+                || pass.particle_lighting,
         }
     }
 

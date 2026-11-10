@@ -325,6 +325,9 @@ struct Lighting {
     try_cached_paths: bool,
     /// Started by the first view history.
     paths: Paths,
+    /// [`Renderer::wait_paths`] was called: a view waits for the path pipelines its scene asks
+    /// for instead of rendering without them.
+    waits: bool,
     scenes: HashMap<SceneId, SceneLighting>,
     tables: BsdfTables,
 }
@@ -342,7 +345,7 @@ impl Lighting {
             if let Ok(kernels) =
                 LightingKernels::new(&cached, self.kernels, &self.tables, self.entry)
             {
-                kernels.compile_tail(gpu, self.kernels, loading);
+                kernels.attach(loading);
                 self.paths = Paths::Ready(Box::new(kernels));
                 return;
             }
@@ -588,6 +591,7 @@ impl Renderer {
                 entry: desc.path_entry,
                 try_cached_paths: desc.try_cached_paths,
                 paths: Paths::NotStarted,
+                waits: false,
                 scenes: HashMap::new(),
                 tables,
             },
@@ -707,20 +711,28 @@ impl Renderer {
     pub fn paths_outstanding(&self) -> u32 {
         match &self.lighting.paths {
             Paths::Compiling { jobs, .. } => jobs.outstanding(),
+            Paths::Ready(kernels) => kernels.outstanding(),
             _ => 0,
         }
     }
 
     /// Blocks until the path tracing kernels have compiled, running queued loading jobs on this
     /// thread so it needs no workers, and returns [`Error::PathKernels`] if they failed. For
-    /// tests and headless runs; returns at once when they are ready or never started.
+    /// tests and headless runs; returns at once when they are ready or never started. From
+    /// this call on [`Frame::render_view`] also waits for the path pipelines a view's scene and
+    /// settings first ask for, where it would otherwise hold the view black while they compile.
     pub fn wait_paths(&mut self) -> Result<()> {
+        self.lighting.waits = true;
         if let Paths::Compiling { jobs, .. } = &self.lighting.paths {
             jobs.wait(&self.scenes.loading());
         }
         self.lighting.paths.poll();
         match &self.lighting.paths {
             Paths::Failed(e) => Err(Error::PathKernels(Arc::clone(e))),
+            Paths::Ready(kernels) => {
+                kernels.wait();
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -1146,9 +1158,26 @@ impl<'a> Frame<'a> {
             return Err(Error::PathKernels(Arc::clone(e)));
         }
         let (extent, render) = self.resolve_view(view, lighting, output)?;
+        // The path pipelines compile for what the scene and the settings may meet: a view
+        // asks for its own here and stays black until they are ready, unless the caller waits.
+        let lit = match &self.lighting.paths {
+            Paths::Ready(kernels) => {
+                let features = self.scenes.scene_features(view.scene)?;
+                let scene = self
+                    .lighting
+                    .scenes
+                    .get(&view.scene)
+                    .ok_or(SceneError::UnknownScene(view.scene))?;
+                kernels.prepare_paths(scene, features, lighting, false) || self.lighting.waits
+            }
+            _ => false,
+        };
         let Paths::Ready(kernels) = &self.lighting.paths else {
             return self.render_view_black(view, output, hooks, extent, render);
         };
+        if !lit {
+            return self.render_view_black(view, output, hooks, extent, render);
+        }
         let id = self.scenes.id();
         let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);
         let frame = self.display.as_deref_mut().and_then(Display::frame);
@@ -1232,12 +1261,8 @@ impl<'a> Frame<'a> {
             dof_background: None,
             frosted_glass: reconstructed,
             overlay_front: blurs && view.lens.shutter > 0.0,
-            walking_materials: raster.walking_materials,
-            interior_materials: raster.interior_materials,
-            scattering_interiors: raster.scattering_interiors,
-            medium_proxies: raster.medium_proxies,
+            scene_features: raster.features,
             particle_lighting: hooks.transparency.is_some(),
-            dispersive_materials: raster.dispersive_materials,
         };
         paths.begin(scene, &desc, lighting);
         state.scene_resets = Some(scene_resets);

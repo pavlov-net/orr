@@ -1,14 +1,16 @@
-//! The staged path loop (`path/stages.slang`): its pipelines, each compiled apart, the memory a
-//! view's paths keep between stages, and the rounds of indirect dispatches that run a source's
-//! paths to their end.
+//! The staged path loop (`path/stages.slang`): its pipelines, each compiled apart and for what
+//! its paths may meet, the memory a view's paths keep between stages, and the rounds of
+//! indirect dispatches that run a source's paths to their end.
+
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, DispatchArgs, GpuPtr, Hazards, MemoryKind,
     RayDispatchPipeline, ShaderModule, ShaderStage, SpecData, Stages,
 };
-use std::sync::{Mutex, OnceLock};
-
 use orr_scene::{JobResult, Loading};
+use orr_shaders::abi::SpecEntry;
 
 use crate::shaders::path::staged::{
     primary, reset, shade_opaque, shade_other, sources, tail, trace, walk,
@@ -22,8 +24,7 @@ const QUEUE_OTHER: u64 = 1;
 const QUEUE_WALK: u64 = 2;
 const QUEUE_TRACE: u64 = 3;
 const QUEUE_FINISH: u64 = 4;
-const QUEUE_START: u64 = 5;
-const STAGE_QUEUES: u64 = 6;
+const STAGE_QUEUES: u64 = 5;
 /// Its words of 16 bytes per path slot: the state, a deferred shadow ray, the record and a
 /// walk's entry.
 const PATH_WORDS: u64 = 44;
@@ -55,13 +56,20 @@ pub(crate) const PATH_SOURCE_PHOTON: u32 = 3;
 /// `PathRoot.features`.
 pub(crate) const FEATURE_WALK: u32 = 1 << 0;
 pub(crate) const FEATURE_DISPERSION: u32 = 1 << 2;
-/// Runs the lean variants whatever the scene holds: only they compiled.
-const FEATURE_FORCE_LEAN: u32 = 1 << 31;
 /// The shade stages run as ray dispatches.
 const FEATURE_RAY_SHADES: u32 = 1 << 3;
 
+/// The id of `specialize.slang`'s `path_may`, and its bits: what the paths of a pipeline may
+/// meet.
+const PATH_MAY_ID: u32 = 110;
+pub(crate) const MAY_STACK: u32 = 1 << 0;
+pub(crate) const MAY_DISPERSION: u32 = 1 << 1;
+pub(crate) const MAY_CAUSTICS: u32 = 1 << 2;
+/// Everything: what a pipeline made without a value may meet.
+pub(crate) const MAY_ALL: u32 = u32::MAX;
+
 /// A path source's start stage.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Source {
     View,
     Background,
@@ -93,72 +101,74 @@ impl Source {
             Self::Update | Self::Photon => scratch("ORR_SCRATCH_FEW", FEW_ROUNDS),
         }
     }
+
+    fn start(self) -> Stage {
+        match self {
+            Self::View => Stage::Primary,
+            Self::Background => Stage::Background,
+            Self::Update => Stage::Update,
+            Self::Photon => Stage::Photon,
+        }
+    }
+
+    /// The stages its paths run, with the walk stage where `walks`.
+    pub(crate) fn stages(self, walks: bool) -> Vec<Stage> {
+        let mut out = vec![
+            Stage::Reset,
+            self.start(),
+            Stage::Trace,
+            Stage::Opaque,
+            Stage::Other,
+            Stage::Finish,
+        ];
+        if walks {
+            out.push(Stage::Walk);
+        }
+        out
+    }
 }
 
-/// The stage pipelines in compile order: module, entry point and name. The primary and shade
-/// stages come without feature code, with that of caustics, and past [`LEAN_STAGES`] with all
-/// of it; the shade stages ([`ray_stage`]) have a `_rays` entry beside each `_main` one.
-const STAGES: [(&ShaderModule, &str, &str); 16] = [
-    (
-        &sources::MODULE,
-        "background_main",
-        "staged background start",
-    ),
-    (&sources::MODULE, "update_main", "staged update start"),
-    (&sources::MODULE, "photon_main", "staged photon start"),
-    (&sources::MODULE, "finish_main", "staged finish"),
-    (&reset::MODULE, "main", "staged reset"),
-    (&trace::MODULE, "main", "staged trace"),
-    (&walk::MODULE, "main", "staged walk"),
-    (&primary::MODULE, "lean_main", "staged primary"),
-    (&primary::MODULE, "caustic_main", "staged primary, caustics"),
-    (&shade_opaque::MODULE, "lean_main", "staged opaque shade"),
-    (&shade_other::MODULE, "lean_main", "staged other shade"),
-    (
-        &shade_opaque::MODULE,
-        "caustic_main",
-        "staged opaque shade, caustics",
-    ),
-    (
-        &shade_other::MODULE,
-        "caustic_main",
-        "staged other shade, caustics",
-    ),
-    (
-        &primary::MODULE,
-        "full_main",
-        "staged primary, all features",
-    ),
-    (
-        &shade_opaque::MODULE,
-        "full_main",
-        "staged opaque shade, all features",
-    ),
-    (
-        &shade_other::MODULE,
-        "full_main",
-        "staged other shade, all features",
-    ),
-];
-const LEAN_STAGES: usize = 13;
-
-/// Whether stage `i` of [`STAGES`] is a shade stage, which may run as a ray dispatch.
-fn ray_stage(i: usize) -> bool {
-    matches!(i, 9..=12 | 14 | 15)
+/// A stage of the loop: one pipeline for each value of `path_may` it runs with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stage {
+    Reset,
+    Primary,
+    Background,
+    Update,
+    Photon,
+    Trace,
+    Opaque,
+    Other,
+    Walk,
+    Finish,
 }
 
-/// Scratch: with `ORR_SCRATCH_STAGED_LEAN` set only the shade variants without feature code
-/// compile, and every path runs them whatever the scene holds.
-pub(crate) fn lean_only() -> bool {
-    std::env::var_os("ORR_SCRATCH_STAGED_LEAN").is_some()
-}
+const STAGES: usize = 10;
 
-/// How many stage pipelines compile.
-pub(crate) fn stage_count() -> usize {
-    if lean_only() {
-        LEAN_STAGES
-    } else {
-        STAGES.len()
+impl Stage {
+    /// Its module, entry point and name.
+    fn source(self) -> (&'static ShaderModule, &'static str, &'static str) {
+        match self {
+            Self::Reset => (&reset::MODULE, "main", "staged reset"),
+            Self::Primary => (&primary::MODULE, "main", "staged primary"),
+            Self::Background => (
+                &sources::MODULE,
+                "background_main",
+                "staged background start",
+            ),
+            Self::Update => (&sources::MODULE, "update_main", "staged update start"),
+            Self::Photon => (&sources::MODULE, "photon_main", "staged photon start"),
+            Self::Trace => (&trace::MODULE, "main", "staged trace"),
+            Self::Opaque => (&shade_opaque::MODULE, "main", "staged opaque shade"),
+            Self::Other => (&shade_other::MODULE, "main", "staged other shade"),
+            Self::Walk => (&walk::MODULE, "main", "staged walk"),
+            Self::Finish => (&sources::MODULE, "finish_main", "staged finish"),
+        }
+    }
+
+    /// Whether it is a shade stage, which may run as a ray dispatch with a `rays` entry.
+    fn reorders(self) -> bool {
+        matches!(self, Self::Opaque | Self::Other)
     }
 }
 
@@ -170,7 +180,7 @@ pub(crate) enum StagePipeline {
 }
 
 impl StagePipeline {
-    fn compute(self) -> ComputePipeline {
+    fn compute(&self) -> &ComputePipeline {
         match self {
             Self::Compute(p) => p,
             Self::Rays(_) => unreachable!("only shade stages run as ray dispatches"),
@@ -186,53 +196,48 @@ impl StagePipeline {
     }
 }
 
-/// Compiles stage `i` of [`STAGES`], its shade stages as ray dispatches with `rays`.
+/// Compiles `stage` for paths that may meet `may`, a shade stage as a ray dispatch with `rays`.
 fn compile_stage(
     device: &Device,
     kernels: &KernelSet,
-    i: usize,
+    stage: Stage,
+    may: u32,
     rays: bool,
 ) -> Result<StagePipeline, Error> {
-    let (own, entry, name) = STAGES[i];
+    let (own, entry, name) = stage.source();
     let m = module(kernels, own)?;
-    if rays && ray_stage(i) {
-        let entry = entry.replace("_main", "_rays");
-        let stage = ShaderStage::new(m, &entry, SpecData::default())?;
-        return Ok(StagePipeline::Rays(
-            device.create_ray_dispatch_pipeline(&stage, name)?,
-        ));
-    }
-    let stage = ShaderStage::new(m, entry, SpecData::default())?;
-    Ok(StagePipeline::Compute(
-        device.create_compute_pipeline(&stage, name)?,
-    ))
+    let bytes = may.to_le_bytes();
+    let spec = SpecData {
+        entries: &[SpecEntry {
+            constant_id: PATH_MAY_ID,
+            offset: 0,
+            size: 4,
+        }],
+        bytes: &bytes,
+    };
+    let started = Instant::now();
+    let pipeline = if rays && stage.reorders() {
+        let stage = ShaderStage::new(m, "rays", spec)?;
+        StagePipeline::Rays(device.create_ray_dispatch_pipeline(&stage, name)?)
+    } else {
+        let stage = ShaderStage::new(m, entry, spec)?;
+        StagePipeline::Compute(device.create_compute_pipeline(&stage, name)?)
+    };
+    log::debug!(
+        "{name} for {may:#x} made in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(pipeline)
 }
 
-/// Compiles stage `i` of [`STAGES`] as a job on `loading`.
-pub(crate) fn spawn_stage(
-    device: &Device,
-    kernels: &'static KernelSet,
-    loading: &Loading,
-    i: usize,
-    rays: bool,
-) -> JobResult<Result<StagePipeline, Error>> {
-    crate::view::compile_job(device, loading, move |d| compile_stage(d, kernels, i, rays))
-}
-
-/// A shade stage's variants: without feature code, with that of caustics, and with all of it
-/// unless only the lean variants compiled.
-struct Variants {
-    lean: StagePipeline,
-    caustic: StagePipeline,
-    full: Option<StagePipeline>,
-}
-
-/// A pipeline that compiles for minutes, in a job of its own after the kernels are ready;
+/// A pipeline made after the kernels are ready, in a job of its own on the loading side;
 /// whoever asks for it does without until then.
 pub(crate) struct Late<T> {
     name: &'static str,
     job: Mutex<Option<JobResult<Result<T, Error>>>>,
     ready: OnceLock<T>,
+    /// How its compile failed.
+    failed: OnceLock<String>,
 }
 
 impl<T: Send + 'static> Late<T> {
@@ -241,6 +246,7 @@ impl<T: Send + 'static> Late<T> {
             name,
             job: Mutex::new(None),
             ready: OnceLock::new(),
+            failed: OnceLock::new(),
         }
     }
 
@@ -250,136 +256,255 @@ impl<T: Send + 'static> Late<T> {
             return Some(p);
         }
         let mut job = self.job.lock().unwrap();
-        match job.as_ref()?.take()? {
-            Ok(Ok(p)) => {
-                log::info!("{} ready", self.name);
-                // Only this path and `compile` set it, under the job's lock.
-                let _ = self.ready.set(p);
-            }
-            Ok(Err(e)) => log::warn!("{} failed to compile: {e}", self.name),
-            Err(message) => log::warn!("{}'s compile panicked: {message}", self.name),
-        }
+        let result = job.as_ref()?.take()?;
         *job = None;
+        self.settle(result.unwrap_or_else(|message| {
+            Err(Error::CompilePanicked {
+                kernel: self.name,
+                message,
+            })
+        }));
         self.ready.get()
     }
 
-    /// Queues `compile` on `loading` unless the pipeline is ready or queued.
-    pub(crate) fn compile(
+    /// Keeps what a compile gave. Only `get` and `start` call it, under the job's lock.
+    fn settle(&self, result: Result<T, Error>) {
+        match result {
+            Ok(p) => {
+                log::debug!("{} ready", self.name);
+                let _ = self.ready.set(p);
+            }
+            Err(e) => {
+                log::warn!("{} failed to compile: {e}", self.name);
+                let _ = self.failed.set(e.to_string());
+            }
+        }
+    }
+
+    /// Whether its compile has started, whatever came of it.
+    fn started(&self) -> bool {
+        self.get().is_some() || self.failed.get().is_some() || self.job.lock().unwrap().is_some()
+    }
+
+    /// Whether its job is queued or running.
+    fn pending(&self) -> bool {
+        self.get().is_none() && self.job.lock().unwrap().is_some()
+    }
+
+    /// Starts `compile` unless the pipeline is ready, compiling or failed: as a job on
+    /// `loading`, or without one here.
+    pub(crate) fn start(
         &self,
         device: &Device,
-        loading: &Loading,
+        loading: Option<&Loading>,
         compile: impl FnOnce(&Device) -> Result<T, Error> + Send + 'static,
     ) {
-        // Scratch: `ORR_SCRATCH_NO_TAIL` leaves the late pipelines out.
-        if std::env::var_os("ORR_SCRATCH_NO_TAIL").is_some() {
-            return;
-        }
         let mut job = self.job.lock().unwrap();
-        if self.ready.get().is_some() || job.is_some() {
+        if self.ready.get().is_some() || self.failed.get().is_some() || job.is_some() {
             return;
         }
-        // Scratch: `ORR_SCRATCH_TAIL_SYNC` compiles it here, so the first frame runs it.
-        if std::env::var_os("ORR_SCRATCH_TAIL_SYNC").is_some() {
-            match compile(device) {
-                Ok(p) => drop(self.ready.set(p)),
-                Err(e) => log::warn!("{} failed to compile: {e}", self.name),
-            }
-            return;
+        match loading {
+            Some(loading) => *job = Some(crate::view::compile_job(device, loading, compile)),
+            None => self.settle(compile(device)),
         }
-        *job = Some(crate::view::compile_job(device, loading, compile));
+    }
+
+    /// The pipeline, after waiting for its job and running queued jobs of `loading` on this
+    /// thread meanwhile; an error where its compile failed or never started.
+    fn wait(&self, loading: Option<&Loading>) -> Result<&T, Error> {
+        if let (Some(loading), Some(job)) = (loading, self.job.lock().unwrap().as_ref()) {
+            job.wait(loading);
+        }
+        self.get().ok_or_else(|| Error::LateCompile {
+            kernel: self.name,
+            message: self
+                .failed
+                .get()
+                .cloned()
+                .unwrap_or_else(|| "its compile never started".to_owned()),
+        })
+    }
+}
+
+/// The stage pipelines for one value of `path_may`, each made when a source first asks for it.
+struct StageSet {
+    may: u32,
+    stages: [Late<StagePipeline>; STAGES],
+}
+
+impl StageSet {
+    fn new(may: u32) -> Self {
+        let late = |stage: Stage| Late::new(stage.source().2);
+        Self {
+            may,
+            stages: [
+                late(Stage::Reset),
+                late(Stage::Primary),
+                late(Stage::Background),
+                late(Stage::Update),
+                late(Stage::Photon),
+                late(Stage::Trace),
+                late(Stage::Opaque),
+                late(Stage::Other),
+                late(Stage::Walk),
+                late(Stage::Finish),
+            ],
+        }
+    }
+
+    fn stage(&self, stage: Stage) -> &Late<StagePipeline> {
+        &self.stages[stage as usize]
+    }
+
+    /// Whether every one of `stages` is ready.
+    fn holds(&self, stages: &[Stage]) -> bool {
+        stages.iter().all(|&s| self.stage(s).get().is_some())
     }
 }
 
 /// The staged path loop's pipelines.
 pub(crate) struct StagedKernels {
+    device: Device,
+    kernels: KernelSet,
+    rays: bool,
+    /// Where pipelines compile once the kernels have one; on the calling thread before that.
+    loading: OnceLock<Arc<Loading>>,
     tail: Late<ComputePipeline>,
-    /// The view's start: its primary stage.
-    primary: Variants,
-    /// The background layer's, the update paths' and the photons' starts.
-    starts: [ComputePipeline; 3],
-    finish: ComputePipeline,
-    reset: ComputePipeline,
-    trace: ComputePipeline,
-    walk: ComputePipeline,
-    opaque: Variants,
-    other: Variants,
+    sets: Mutex<Vec<Arc<StageSet>>>,
 }
 
 impl StagedKernels {
-    /// Compiles the pipelines one after another on the calling thread, the shade stages as ray
-    /// dispatches with `rays`.
-    pub(crate) fn new(device: &Device, kernels: &KernelSet, rays: bool) -> Result<Self, Error> {
-        let mut out = Vec::new();
-        for i in 0..stage_count() {
-            out.push(compile_stage(device, kernels, i, rays)?);
-        }
-        Ok(Self::from_pipelines(out))
-    }
-
-    /// The pipelines of [`STAGES`] in order, the first [`stage_count`] of them.
-    pub(crate) fn from_pipelines(p: Vec<StagePipeline>) -> Self {
-        let mut p = p.into_iter();
-        let mut next = || p.next().expect("a pipeline per stage").compute();
-        let starts = [next(), next(), next()];
-        let finish = next();
-        let reset = next();
-        let trace = next();
-        let walk = next();
-        let mut stage = || p.next().expect("a pipeline per stage");
-        let primary = [stage(), stage()];
-        let lean = [stage(), stage()];
-        let mut caustic = [stage(), stage()].into_iter();
-        let mut full = [p.next(), p.next(), p.next()].into_iter();
-        let [primary_lean, primary_caustic] = primary;
-        let primary = Variants {
-            lean: primary_lean,
-            caustic: primary_caustic,
-            full: full.next().flatten(),
-        };
-        let [opaque, other] = lean.map(|lean| Variants {
-            lean,
-            caustic: caustic.next().expect("one per shade stage"),
-            full: full.next().flatten(),
-        });
+    /// The loop with no pipeline yet: each is made when paths first need it. The shade stages
+    /// run as ray dispatches with `rays`.
+    pub(crate) fn new(device: &Device, kernels: &KernelSet, rays: bool) -> Self {
         Self {
+            device: device.clone(),
+            kernels: *kernels,
+            rays,
+            loading: OnceLock::new(),
             tail: Late::new("staged tail kernel"),
-            primary,
-            starts,
-            finish,
-            reset,
-            trace,
-            walk,
-            opaque,
-            other,
+            sets: Mutex::new(Vec::new()),
         }
     }
 
-    /// Queues the tail stage's compile on `loading` unless it is ready or queued. It holds
-    /// `trace_path`'s whole loop, so it compiles for minutes; until it is ready a pass runs
-    /// every round.
-    pub(crate) fn compile_tail(
-        &self,
-        device: &Device,
-        kernels: &'static KernelSet,
-        loading: &Loading,
-    ) {
-        self.tail.compile(device, loading, move |d| {
+    /// Makes later pipelines as jobs on `loading`, and queues the tail stage's compile there.
+    /// The tail holds `trace_path`'s whole loop, so it compiles for minutes; until it is ready
+    /// a pass runs every round.
+    pub(crate) fn attach(&self, loading: &Arc<Loading>) {
+        let _ = self.loading.set(Arc::clone(loading));
+        self.start_late(&self.tail, |d, kernels| {
             let stage =
                 ShaderStage::new(module(kernels, &tail::MODULE)?, "main", SpecData::default())?;
             Ok(d.create_compute_pipeline(&stage, "staged tail")?)
         });
     }
 
-    /// Records `source`'s paths over `items` (pixels, update blocks or photons) with `root`, in
-    /// slices of `memory`'s slots. A slice starts in the source's start stage, the view's its
-    /// primary stage, which also shades the paths that start on the G-buffer's surface. It then
-    /// runs `passes` passes of `rounds` rounds, each round
-    /// the trace stage, the shade stages and, where a material walks, the walk stage, over
-    /// the workgroups their queues gathered; a pass ends in the finish stage. `rounds` is at
-    /// least one more than the traces a path of the source takes, and a view's pixels with a
+    /// Starts `compile` for a pipeline the paths do without until it is ready, as a job on the
+    /// loading side.
+    pub(crate) fn start_late<T: Send + 'static>(
+        &self,
+        late: &Late<T>,
+        compile: impl FnOnce(&Device, &KernelSet) -> Result<T, Error> + Send + 'static,
+    ) {
+        // Scratch: `ORR_SCRATCH_NO_TAIL` leaves these pipelines out, and
+        // `ORR_SCRATCH_TAIL_SYNC` compiles them here, so the first frame runs them.
+        if std::env::var_os("ORR_SCRATCH_NO_TAIL").is_some() {
+            return;
+        }
+        let sync = std::env::var_os("ORR_SCRATCH_TAIL_SYNC").is_some();
+        let kernels = self.kernels;
+        late.start(&self.device, self.loading().filter(|_| !sync), move |d| {
+            compile(d, &kernels)
+        });
+    }
+
+    fn loading(&self) -> Option<&Loading> {
+        self.loading.get().map(|l| &**l)
+    }
+
+    /// The set made for exactly `may`.
+    fn set(&self, may: u32) -> Arc<StageSet> {
+        let mut sets = self.sets.lock().unwrap();
+        if let Some(set) = sets.iter().find(|s| s.may == may) {
+            return Arc::clone(set);
+        }
+        let set = Arc::new(StageSet::new(may));
+        sets.push(Arc::clone(&set));
+        set
+    }
+
+    /// Starts the compiles of `stages` for exactly `may` that have not started.
+    fn request(&self, may: u32, stages: &[Stage]) -> Arc<StageSet> {
+        let set = self.set(may);
+        for &stage in stages {
+            let (kernels, rays) = (self.kernels, self.rays);
+            set.stage(stage)
+                .start(&self.device, self.loading(), move |d| {
+                    compile_stage(d, &kernels, stage, may, rays)
+                });
+        }
+        set
+    }
+
+    /// The ready set that holds `stages` for paths that may meet `may` with the least beyond
+    /// it.
+    fn covering(&self, may: u32, stages: &[Stage]) -> Option<Arc<StageSet>> {
+        let sets = self.sets.lock().unwrap();
+        sets.iter()
+            .filter(|s| s.may & may == may && s.holds(stages))
+            .min_by_key(|s| s.may.count_ones())
+            .cloned()
+    }
+
+    /// The set asked to hold `stages` for paths that may meet `may` with the least beyond it,
+    /// ready or not.
+    fn compiling(&self, may: u32, stages: &[Stage]) -> Option<Arc<StageSet>> {
+        let sets = self.sets.lock().unwrap();
+        sets.iter()
+            .filter(|s| s.may & may == may && stages.iter().all(|&st| s.stage(st).started()))
+            .min_by_key(|s| s.may.count_ones())
+            .cloned()
+    }
+
+    /// Asks for `stages` for paths that may meet `may`, and says whether pipelines that hold
+    /// them are ready.
+    pub(crate) fn prepare(&self, may: u32, stages: &[Stage]) -> bool {
+        self.request(may, stages);
+        self.covering(may, stages).is_some()
+    }
+
+    /// How many pipelines asked for are still compiling.
+    pub(crate) fn outstanding(&self) -> u32 {
+        let sets = self.sets.lock().unwrap();
+        sets.iter()
+            .flat_map(|s| s.stages.iter())
+            .filter(|l| l.pending())
+            .count() as u32
+    }
+
+    /// Waits for every pipeline asked for, running queued jobs on this thread meanwhile.
+    pub(crate) fn wait(&self) {
+        let sets: Vec<_> = self.sets.lock().unwrap().clone();
+        for late in sets.iter().flat_map(|s| s.stages.iter()) {
+            if late.pending() {
+                let _ = late.wait(self.loading());
+            }
+        }
+    }
+
+    /// Records `source`'s paths, which may meet `may`, over `items` (pixels, update blocks or
+    /// photons) with `root`, in slices of `memory`'s slots. A slice starts in the source's
+    /// start stage, the view's its primary stage, which also shades the paths that start on
+    /// the G-buffer's surface. It then runs `passes` passes of `rounds` rounds, each round the
+    /// trace stage, the shade stages and, where a material walks, the walk stage, over the
+    /// workgroups their queues gathered; a pass ends in the finish stage. `rounds` is at least
+    /// one more than the traces a path of the source takes, and a view's pixels with a
     /// frosted-glass path take a second pass. Once the tail stage has compiled, a pass runs
     /// [`Source::wide`] rounds and the tail stage takes its paths from there. Orders nothing
     /// after it.
+    ///
+    /// The pipelines are those ready that hold the least beyond `may`; with none ready it
+    /// waits for the ones made for `may`, as nothing else may run these paths.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record(
         &self,
@@ -387,6 +512,7 @@ impl StagedKernels {
         memory: &StagedMemory,
         root: &PathRoot,
         source: Source,
+        may: u32,
         items: u32,
         rounds: u32,
         passes: u32,
@@ -396,21 +522,29 @@ impl StagedKernels {
                 "the bounces and dielectric depth give paths more rounds than MAX_ROUNDS",
             ));
         }
-        let lean_only = self.opaque.full.is_none();
+        let walks = root.features & FEATURE_WALK != 0 && memory.walks.is_some();
+        let stages = source.stages(walks);
+        let set = match self.covering(may, &stages) {
+            Some(set) => set,
+            None => {
+                let set = self
+                    .compiling(may, &stages)
+                    .unwrap_or_else(|| self.request(may, &stages));
+                for &stage in &stages {
+                    set.stage(stage).wait(self.loading())?;
+                }
+                set
+            }
+        };
+        let pipeline = |stage: Stage| set.stage(stage).get().expect("the set holds the stage");
         let mut root = PathRoot {
             stages: memory.header.gpu(),
             source: source.id(),
-            features: if lean_only {
-                root.features | FEATURE_FORCE_LEAN
-            } else {
-                root.features
-            },
             ..*root
         };
-        if matches!(self.opaque.lean, StagePipeline::Rays(_)) {
+        if matches!(pipeline(Stage::Opaque), StagePipeline::Rays(_)) {
             root.features |= FEATURE_RAY_SHADES;
         }
-        let walks = root.features & FEATURE_WALK != 0 && memory.walks.is_some();
         if !walks {
             root.features &= !FEATURE_WALK;
         }
@@ -433,16 +567,17 @@ impl StagedKernels {
             );
             scratch_mark(list, source, 0);
             let queues = (MAX_ROUNDS + 1) * STAGE_QUEUES as u32;
-            list.dispatch_inline(&self.reset, &root, [queues.div_ceil(STAGE_GROUP), 1, 1]);
+            list.dispatch_inline(
+                pipeline(Stage::Reset).compute(),
+                &root,
+                [queues.div_ceil(STAGE_GROUP), 1, 1],
+            );
             barrier(list);
-            match source {
-                Source::View => self.variants(list, memory, &root, 0, &self.primary, QUEUE_START),
-                _ => list.dispatch_inline(
-                    &self.starts[source.id() as usize - 1],
-                    &root,
-                    [root.slice_count.div_ceil(STAGE_GROUP), 1, 1],
-                ),
-            }
+            list.dispatch_inline(
+                pipeline(source.start()).compute(),
+                &root,
+                [root.slice_count.div_ceil(STAGE_GROUP), 1, 1],
+            );
             for pass in 0..passes {
                 let first = pass * rounds;
                 for round in first..first + run {
@@ -450,19 +585,23 @@ impl StagedKernels {
                     barrier(list);
                     scratch_mark(list, source, 1);
                     list.dispatch_indirect_inline(
-                        &self.trace,
+                        pipeline(Stage::Trace).compute(),
                         &root,
                         memory.groups(round, QUEUE_TRACE),
                     );
                     barrier(list);
                     scratch_mark(list, source, 2);
-                    self.variants(list, memory, &root, round, &self.opaque, QUEUE_OPAQUE);
-                    self.variants(list, memory, &root, round, &self.other, QUEUE_OTHER);
+                    pipeline(Stage::Opaque).dispatch(
+                        list,
+                        &root,
+                        memory.groups(round, QUEUE_OPAQUE),
+                    );
+                    pipeline(Stage::Other).dispatch(list, &root, memory.groups(round, QUEUE_OTHER));
                     if walks {
                         barrier(list);
                         scratch_mark(list, source, 3);
                         list.dispatch_indirect_inline(
-                            &self.walk,
+                            pipeline(Stage::Walk).compute(),
                             &root,
                             memory.groups(round, QUEUE_WALK),
                         );
@@ -491,7 +630,7 @@ impl StagedKernels {
                 barrier(list);
                 scratch_mark(list, source, 5);
                 list.dispatch_indirect_inline(
-                    &self.finish,
+                    pipeline(Stage::Finish).compute(),
                     &root,
                     memory.groups(first, QUEUE_FINISH),
                 );
@@ -503,27 +642,6 @@ impl StagedKernels {
             Hazards::empty(),
         );
         Ok(())
-    }
-
-    fn variants(
-        &self,
-        list: &mut CommandList<'_>,
-        memory: &StagedMemory,
-        root: &PathRoot,
-        round: u32,
-        v: &Variants,
-        queue: u64,
-    ) {
-        // Without caustics no surface chains and no vertex gathers.
-        let lean = if root.caustics == GpuPtr::NULL {
-            &v.lean
-        } else {
-            &v.caustic
-        };
-        lean.dispatch(list, root, memory.groups(round, queue));
-        if let Some(full) = &v.full {
-            full.dispatch(list, root, memory.full_groups(round, queue));
-        }
     }
 }
 
@@ -652,19 +770,11 @@ impl StagedMemory {
         self.capacity == pixels.clamp(1, MAX_SLOTS) && (self.walks.is_some() || !walking)
     }
 
-    /// The workgroups of `queue` in `round`, for its stage's variant without feature code.
+    /// The workgroups of `queue` in `round`.
     fn groups(&self, round: u32, queue: u64) -> GpuPtr<DispatchArgs> {
         self.queues
             .gpu()
             .offset(u64::from(round) * STAGE_QUEUES + queue)
-            .cast()
-    }
-
-    /// Those for its variant with all of it.
-    fn full_groups(&self, round: u32, queue: u64) -> GpuPtr<DispatchArgs> {
-        self.groups(round, queue)
-            .cast::<[u32; 4]>()
-            .offset(1)
             .cast()
     }
 }

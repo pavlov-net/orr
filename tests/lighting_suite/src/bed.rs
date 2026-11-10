@@ -1514,12 +1514,8 @@ impl BedFrame<'_> {
             dof_background: None,
             frosted_glass: false,
             overlay_front: false,
-            walking_materials: self.view.walking_materials,
-            interior_materials: self.view.interior_materials,
-            scattering_interiors: self.view.scattering_interiors,
-            medium_proxies: self.view.medium_proxies,
+            scene_features: self.view.features,
             particle_lighting: self.particles,
-            dispersive_materials: self.view.dispersive_materials,
         }
     }
 
@@ -2545,6 +2541,8 @@ pub fn assert_within_noise(
 /// `settings`.
 pub struct Paths {
     kernels: &'static LightingKernels,
+    /// Where the kernels compile the path pipelines a frame first asks for.
+    loading: &'static orr_scene::Loading,
     pub settings: ViewLighting,
     /// The background layer request of every frame.
     pub dof_background: Option<DofBackgroundPass>,
@@ -2562,8 +2560,8 @@ impl Paths {
     /// stay: under the validation layer each compile takes minutes.
     pub fn new(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
         type Key = (Vec<usize>, PathEntry);
-        static COMPILED: Mutex<Vec<(Key, &'static OnceLock<LightingKernels>)>> =
-            Mutex::new(Vec::new());
+        type Compiled = (LightingKernels, Arc<orr_scene::Loading>);
+        static COMPILED: Mutex<Vec<(Key, &'static OnceLock<Compiled>)>> = Mutex::new(Vec::new());
         let key = (
             kernels
                 .modules
@@ -2582,7 +2580,7 @@ impl Paths {
             }
         };
         drop(compiled);
-        let kernels = slot.get_or_init(|| {
+        let (kernels, loading) = slot.get_or_init(|| {
             let tables = BsdfTables::new(device()).unwrap();
             let kernels: &'static KernelSet = Box::leak(Box::new(*kernels));
             let loading = Arc::new(orr_scene::testing::loading());
@@ -2593,11 +2591,16 @@ impl Paths {
                 }
                 jobs.wait(&loading);
             });
-            jobs.finish().unwrap()
+            (jobs.finish().unwrap(), loading)
         });
         Self {
             kernels,
-            settings,
+            loading,
+            // The beds' scenes are many and small: one set of pipelines runs them all.
+            settings: ViewLighting {
+                specialize: false,
+                ..settings
+            },
             dof_background: None,
             frost_guide: None,
             overlay_front: false,
@@ -2651,6 +2654,19 @@ impl Paths {
         };
         let (lighting, settings) = (f.lighting, &self.settings);
         target.begin(lighting, &f.desc, settings);
+        let background = pass.dof_background.is_some();
+        if !self
+            .kernels
+            .prepare_paths(lighting, pass.scene_features, settings, background)
+        {
+            // The pipelines these paths first ask for compile on threads of their own.
+            std::thread::scope(|threads| {
+                for _ in 1..CompilingKernels::JOBS {
+                    threads.spawn(|| while self.loading.run_one() {});
+                }
+                self.kernels.wait();
+            });
+        }
         self.kernels
             .record_media(list, lighting, target, pass, settings)
             .unwrap();

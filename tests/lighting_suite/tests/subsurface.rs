@@ -556,7 +556,11 @@ fn reordering_inside_walks_changes_no_path() {
             let mut bed = Bed::with(spec.clone());
             paths.settings.walk_compaction = true;
             let reordered = bed.accumulate(4, 5, &mut |list, f| {
-                assert!(f.pass().walking_materials);
+                assert!(
+                    f.pass()
+                        .scene_features
+                        .contains(orr_scene::SceneFeatures::WALKING)
+                );
                 paths.record(list, f);
             });
             paths.settings.walk_compaction = false;

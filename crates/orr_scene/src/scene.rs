@@ -649,6 +649,17 @@ impl SlotHold {
     }
 }
 
+impl SceneCpu {
+    /// What the scene itself may hold, beside what the material table's records may show.
+    pub(crate) fn features(&self) -> crate::SceneFeatures {
+        let mut out = self.lights.features();
+        if self.ptlas.has_medium_proxies() {
+            out |= crate::SceneFeatures::MEDIUM_PROXIES;
+        }
+        out
+    }
+}
+
 pub(crate) struct SceneCpu {
     pub(crate) slots: RangeAllocator,
     /// By slot.
@@ -686,6 +697,7 @@ pub(crate) struct SceneCpu {
     pub(crate) surface_data: u64,
     pub(crate) near_range: f32,
     pub(crate) ptlas: Ptlas,
+    pub(crate) lights: crate::lights::LightKinds,
     /// Made at the scene's first update.
     pub(crate) cuts: Option<Cuts>,
     /// Skinned-copy entries.
@@ -1175,6 +1187,7 @@ impl Scene {
                 surface_data: 0,
                 near_range: 256.0,
                 ptlas: Ptlas::new(device, desc)?,
+                lights: crate::lights::LightKinds::default(),
                 cuts: None,
                 skinned: RangeAllocator::new(desc.skinned_capacity),
                 skinned_high_water: 0,
@@ -2365,6 +2378,7 @@ impl<'f> SceneWriter<'f> {
         let origin = {
             let mut cpu = self.scene.cpu.lock().unwrap();
             cpu.ptlas.set_light(id.0, proxied);
+            cpu.lights.set(id.0, light);
             cpu.origin_cell
         };
         let record = light.map_or_else(LightGpu::zeroed, |l| light_gpu(l, origin, self.cell_log2));
