@@ -213,6 +213,45 @@ fn check_structure(d: &Dag) -> Vec<u64> {
     for (g, &n) in info.groups.iter().zip(&simplified) {
         assert_eq!(n > 0, g.error.is_finite(), "{g:?}");
     }
+    // A group's sphere holds the stored positions of its clusters and of the clusters
+    // simplified from it, and the spheres of the groups its clusters come from: the traversal
+    // tests it for both sides of the group's replacement.
+    let center = |s: &orr_pack::Sphere| s.center.map(f64::from);
+    let apart =
+        |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt();
+    let holds = |s: &orr_pack::Sphere, c: usize| {
+        d.clusters[c]
+            .tris
+            .iter()
+            .flatten()
+            .all(|p| apart(p.map(f64::from), center(s)) <= f64::from(s.radius))
+    };
+    for g in &info.groups {
+        for c in d.group_of(g) {
+            assert!(holds(&g.simplified, c), "{g:?} holds cluster {c}");
+            let from = d.clusters[c].record.from_group;
+            if from == Cluster::SOURCE {
+                continue;
+            }
+            let f = &info.groups[from as usize];
+            assert!(
+                holds(&f.simplified, c),
+                "{f:?} holds cluster {c} simplified from it"
+            );
+            let reach = apart(center(&f.simplified), center(&g.simplified))
+                + f64::from(f.simplified.radius);
+            assert!(reach <= f64::from(g.simplified.radius), "{g:?} holds {f:?}");
+        }
+    }
+    // A leaf's bounds are its group's, bit for bit, which the traversal's leaf and cluster
+    // tests both read.
+    for n in &d.nodes {
+        if let Ok(g) = usize::try_from(n.group) {
+            let g = &info.groups[g];
+            assert_eq!(n.sphere, g.simplified);
+            assert_eq!(n.max_error.to_bits(), g.error.to_bits());
+        }
+    }
     // A group names its leaf's node page, the top one for a group in a pinned page.
     for (i, n) in d.nodes.iter().enumerate() {
         let Ok(g) = usize::try_from(n.group) else {

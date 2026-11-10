@@ -573,9 +573,60 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
         remap: &input.remap,
         sections: &input.sections,
     };
-    super::clod::build(&config, mesh, &mut positions, |e| {
+    let mut groups = super::clod::build(&config, mesh, &mut positions, |e| {
         group_of(&e, &input.welded, &input.sections, snap, max_indices)
-    })
+    });
+    bound_groups(&mut groups, snap.step);
+    groups
+}
+
+/// Grows each group's sphere about its center to hold the stored positions of its clusters
+/// and of the clusters simplified from it, and the spheres of the groups its clusters come
+/// from. `clodBuild` gives a group the bounds of its clusters before its borders dilate and
+/// its simplification snaps to the grid, so the clusters made from it can reach past them,
+/// and the traversal's tests of a group's sphere stand for both sides of its replacement.
+/// Groups come before the groups their simplification feeds, so each sees the spheres it
+/// holds final.
+fn bound_groups(groups: &mut [DagGroup], step: f64) {
+    let at = |c: [i32; 3]| c.map(|v| f64::from(v) * step);
+    let distance = |a: [f64; 3], b: [f32; 3]| {
+        (0..3)
+            .map(|i| (a[i] - f64::from(b[i])).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    };
+    // Per group, the farthest stored position of the clusters simplified from it.
+    let mut reach = vec![0.0f64; groups.len()];
+    for g in groups.iter() {
+        for c in &g.clusters.list {
+            let Ok(from) = usize::try_from(c.refined) else {
+                continue;
+            };
+            let center = groups[from].sphere.center;
+            for &cell in &g.clusters.cells[c.verts.clone()] {
+                reach[from] = reach[from].max(distance(at(cell), center));
+            }
+        }
+    }
+    for i in 0..groups.len() {
+        let center = groups[i].sphere.center;
+        let mut radius = f64::from(groups[i].sphere.radius).max(reach[i]);
+        for &cell in &groups[i].clusters.cells {
+            radius = radius.max(distance(at(cell), center));
+        }
+        for c in &groups[i].clusters.list {
+            if let Ok(from) = usize::try_from(c.refined) {
+                let s = groups[from].sphere;
+                let center64 = s.center.map(f64::from);
+                radius = radius.max(distance(center64, center) + f64::from(s.radius));
+            }
+        }
+        let mut r = radius as f32;
+        if f64::from(r) < radius {
+            r = r.next_up();
+        }
+        groups[i].sphere.radius = r;
+    }
 }
 
 /// The partition target whose largest partitions (a third over the target) hold at most
