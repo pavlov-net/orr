@@ -12,6 +12,7 @@ __exported import orr_scene.gbuffer;
 __exported import orr_scene.material;
 __exported import orr_scene.tables;
 __exported import orr_scene.view;
+import orr_scene.scene_may;
 
 // `HitContext.kind`.
 public static const uint HIT_PRIMARY = 0;   // the material resolve and the dielectric camera ray's first hit
@@ -486,7 +487,7 @@ void surface_decals_each<V : IDecalVisit>(SurfaceInput i, inout V v)
 {
     SceneRoot* s = i.scene;
     uint globals = s.decal_globals;
-    if (globals == 0 && s.decal_bin_slots == 0)
+    if (!may2(MAY2_DECALS) || (globals == 0 && s.decal_bin_slots == 0))
         return;
     uint cell_log2 = uint(s.origin_cell.w);
     int3 bin = (i.cell << (cell_log2 - s.decal_bin_log2)) + int3(floor(i.offset * exp2(-float(s.decal_bin_log2))));
