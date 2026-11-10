@@ -26,11 +26,18 @@ const QUEUE_TRACE: u64 = 3;
 const QUEUE_FINISH: u64 = 4;
 const QUEUE_RICH: u64 = 5;
 const STAGE_QUEUES: u64 = 6;
-/// Its words of 16 bytes per path slot: the state, a deferred shadow ray, the record and a
+/// Its words of 16 bytes per path slot: the state every path keeps and the parts of paths that
+/// may lie in an interior, track plane stacks and may split by wavelength; a deferred shadow
+/// ray, and the interiors its vertex arrived with; the record, and an update path's; and a
 /// walk's entry.
-const PATH_WORDS: u64 = 44;
-const SHADOW_WORDS: u64 = 17;
-const RECORD_WORDS: u64 = 9;
+const BASE_WORDS: u64 = 19;
+const INTERIOR_PARTS: u64 = 11;
+const STACK_PART: u64 = 5;
+const SPECTRAL_PART: u64 = 5;
+const SHADOW_WORDS: u64 = 11;
+const SHADOW_ARRIVED_WORDS: u64 = 6;
+const RECORD_WORDS: u64 = 3;
+const UPDATE_RECORD_WORDS: u64 = 9;
 const WALK_WORDS: u64 = 22;
 /// Lanes per workgroup of its stages.
 const STAGE_GROUP: u32 = 32;
@@ -57,6 +64,9 @@ pub(crate) const PATH_SOURCE_PHOTON: u32 = 3;
 /// `PathRoot.features`.
 pub(crate) const FEATURE_WALK: u32 = 1 << 0;
 pub(crate) const FEATURE_DISPERSION: u32 = 1 << 2;
+/// Paths may lie in an interior, and may track a plane stack: their state holds those parts.
+pub(crate) const FEATURE_INTERIORS: u32 = 1 << 4;
+pub(crate) const FEATURE_STACK: u32 = 1 << 5;
 /// The shade stages run as ray dispatches.
 const FEATURE_RAY_SHADES: u32 = 1 << 3;
 
@@ -629,7 +639,11 @@ impl StagedKernels {
             ));
         }
         let may = may | source.may();
-        let walks = root.features & FEATURE_WALK != 0 && memory.walks.is_some();
+        assert!(
+            memory.parts.holds(StateParts::of(root.features)),
+            "the paths' memory lacks a part their root names"
+        );
+        let walks = root.features & FEATURE_WALK != 0;
         let stages = source.stages(walks);
         let set = self.wait(may, &stages)?;
         let pipeline = |stage: Stage| set.stage(stage).get().expect("the set holds the stage");
@@ -641,9 +655,6 @@ impl StagedKernels {
         if matches!(pipeline(Stage::Opaque), StagePipeline::Rays(_)) {
             root.features |= FEATURE_RAY_SHADES;
         }
-        if !walks {
-            root.features &= !FEATURE_WALK;
-        }
         let tail = self.tail.get().filter(|_| rounds > source.wide());
         let run = if tail.is_some() {
             source.wide()
@@ -653,7 +664,7 @@ impl StagedKernels {
         let mut base = 0;
         while base < items {
             root.slice_base = base;
-            root.slice_count = (items - base).min(memory.capacity);
+            root.slice_count = (items - base).min(memory.slice(source));
             root.round = round_word(0, 0, rounds);
             base += root.slice_count;
             list.barrier(
@@ -820,12 +831,63 @@ fn barrier(list: &mut CommandList<'_>) {
     list.barrier(stages, stages, Hazards::DRAW_ARGUMENTS);
 }
 
+/// The parts of a path's state that `PathRoot.features` names, beside those every path keeps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StateParts {
+    walks: bool,
+    interiors: bool,
+    stack: bool,
+    spectral: bool,
+}
+
+impl StateParts {
+    pub(crate) fn of(features: u32) -> Self {
+        Self {
+            walks: features & FEATURE_WALK != 0,
+            interiors: features & FEATURE_INTERIORS != 0,
+            stack: features & FEATURE_STACK != 0,
+            spectral: features & FEATURE_DISPERSION != 0,
+        }
+    }
+
+    fn holds(self, other: Self) -> bool {
+        (self.walks || !other.walks)
+            && (self.interiors || !other.interiors)
+            && (self.stack || !other.stack)
+            && (self.spectral || !other.spectral)
+    }
+
+    fn part(on: bool, words: u64) -> u64 {
+        if on { words } else { 0 }
+    }
+
+    fn state_words(self) -> u64 {
+        BASE_WORDS
+            + Self::part(self.interiors, INTERIOR_PARTS)
+            + Self::part(self.stack, STACK_PART)
+            + Self::part(self.spectral, SPECTRAL_PART)
+    }
+
+    fn shadow_words(self) -> u64 {
+        SHADOW_WORDS + Self::part(self.interiors, SHADOW_ARRIVED_WORDS)
+    }
+
+    /// Bytes a path slot takes.
+    fn bytes(self) -> u64 {
+        16 * (self.state_words()
+            + self.shadow_words()
+            + RECORD_WORDS
+            + Self::part(self.walks, WALK_WORDS))
+    }
+}
+
 /// The memory a view's staged paths keep between stages, for `capacity` paths at once.
 pub(crate) struct StagedMemory {
     capacity: u32,
+    parts: StateParts,
     header: Allocation<PathStages>,
     queues: Allocation<StageQueue>,
-    walks: Option<Allocation<[u32; 4]>>,
+    _walks: Option<Allocation<[u32; 4]>>,
     _lists: Allocation<u32>,
     _words: Allocation<[u32; 4]>,
     _shadows: Allocation<[u32; 4]>,
@@ -833,14 +895,13 @@ pub(crate) struct StagedMemory {
 }
 
 impl StagedMemory {
-    /// Slots for the paths of a view of `pixels` pixels, at most [`MAX_SLOTS`], with room for
-    /// walks' entries where `walking`.
-    pub(crate) fn new(device: &Device, pixels: u32, walking: bool) -> Result<Self, Error> {
+    /// Slots for the paths of a view of `pixels` pixels, at most [`MAX_SLOTS`], each with
+    /// `parts`.
+    pub(crate) fn new(device: &Device, pixels: u32, parts: StateParts) -> Result<Self, Error> {
         let capacity = pixels.clamp(1, MAX_SLOTS);
         let n = u64::from(capacity);
-        let words = |count: u64, name| {
-            device.gpu_malloc::<[u32; 4]>(MemoryKind::DeviceLocal, count * n, name)
-        };
+        let words =
+            |count: u64, name| device.gpu_malloc::<[u32; 4]>(MemoryKind::DeviceLocal, count, name);
         let queues = device.gpu_malloc::<StageQueue>(
             MemoryKind::DeviceLocal,
             u64::from(MAX_ROUNDS + 1) * STAGE_QUEUES,
@@ -851,14 +912,22 @@ impl StagedMemory {
             STAGE_QUEUES * n,
             "staged path lists",
         )?;
-        let state = words(PATH_WORDS, "staged path state")?;
-        let shadows = words(SHADOW_WORDS, "staged shadow rays")?;
-        let records = words(RECORD_WORDS, "staged path records")?;
-        let walks = if walking {
-            Some(words(WALK_WORDS, "staged walk entries")?)
+        let state = words(parts.state_words() * n, "staged path state")?;
+        let shadows = words(parts.shadow_words() * n, "staged shadow rays")?;
+        // A slice of update paths holds one record at least.
+        let records = words(
+            (RECORD_WORDS * n).max(UPDATE_RECORD_WORDS),
+            "staged path records",
+        )?;
+        let walks = if parts.walks {
+            Some(words(WALK_WORDS * n, "staged walk entries")?)
         } else {
             None
         };
+        log::debug!(
+            "staged paths: {capacity} slots of {} bytes ({parts:?})",
+            parts.bytes()
+        );
         let mut header = device.gpu_malloc::<PathStages>(MemoryKind::Upload, 1, "staged paths")?;
         header.as_mut_slice().expect("mapped")[0] = PathStages {
             capacity,
@@ -872,9 +941,10 @@ impl StagedMemory {
         };
         Ok(Self {
             capacity,
+            parts,
             header,
             queues,
-            walks,
+            _walks: walks,
             _lists: lists,
             _words: state,
             _shadows: shadows,
@@ -882,10 +952,20 @@ impl StagedMemory {
         })
     }
 
-    /// Whether it holds the slots a view of `pixels` pixels asks for, and walks' entries where
-    /// `walking`.
-    pub(crate) fn fits(&self, pixels: u32, walking: bool) -> bool {
-        self.capacity == pixels.clamp(1, MAX_SLOTS) && (self.walks.is_some() || !walking)
+    /// Whether it holds the slots a view of `pixels` pixels asks for, each with `parts`.
+    pub(crate) fn fits(&self, pixels: u32, parts: StateParts) -> bool {
+        self.capacity == pixels.clamp(1, MAX_SLOTS) && self.parts.holds(parts)
+    }
+
+    /// The paths of `source` a slice holds: an update path's record takes the words of
+    /// several slots'.
+    fn slice(&self, source: Source) -> u32 {
+        match source {
+            Source::Update => {
+                (u64::from(self.capacity) * RECORD_WORDS / UPDATE_RECORD_WORDS).max(1) as u32
+            }
+            _ => self.capacity,
+        }
     }
 
     /// The workgroups of `queue` in `round`.

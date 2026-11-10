@@ -28,11 +28,11 @@ use crate::shaders::types::{
 };
 use crate::shaders::world_cache::update;
 use crate::staged::{
-    FEATURE_DISPERSION, FEATURE_WALK, Late, MAY_ALL, MAY_CACHE, MAY_CAUSTICS, MAY_COAT,
-    MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION, MAY_EMISSIVE, MAY_FILM, MAY_FROST,
-    MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL, MAY_LOCAL_LIGHTS,
-    MAY_PARTICLES, MAY_REFERENCE, MAY_STACK, MAY_SUBSURFACE, MAY_WALK, Source, Stage,
-    StagedKernels, StagedMemory,
+    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_STACK, FEATURE_WALK, Late, MAY_ALL, MAY_CACHE,
+    MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION, MAY_EMISSIVE,
+    MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL,
+    MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_REFERENCE, MAY_STACK, MAY_SUBSURFACE, MAY_WALK, Source,
+    Stage, StagedKernels, StagedMemory, StateParts,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::{
@@ -1361,26 +1361,44 @@ fn bit(on: bool, bit: u32) -> u32 {
     if on { bit } else { 0 }
 }
 
-/// What the paths of a scene that may hold `features` may meet under `lighting`, beyond what
-/// their roots say.
-fn scene_may(features: SceneFeatures, lighting: &ViewLighting) -> u32 {
+/// `PathRoot.features` of a view's paths in a scene that may hold `features`: whether they
+/// walk and split by wavelength, and the parts their state holds.
+fn path_features(features: SceneFeatures, lighting: &ViewLighting) -> u32 {
+    let bounded = features.contains(SceneFeatures::INTERIORS);
+    // The eye's interior is one whatever the materials say.
+    let interiors = bounded || lighting.camera_medium.is_some();
     // A stack face bounds an interior, and a stack bends directional lights alone.
-    let stack = features.contains(SceneFeatures::INTERIORS)
-        && features.contains(SceneFeatures::DIRECTIONAL_LIGHTS);
-    bit(stack, MAY_STACK)
-        | bit(features.contains(SceneFeatures::COAT), MAY_COAT)
+    let stack = bounded && features.contains(SceneFeatures::DIRECTIONAL_LIGHTS);
+    bit(features.contains(SceneFeatures::WALKING), FEATURE_WALK)
+        | bit(disperses(features, lighting), FEATURE_DISPERSION)
+        | bit(interiors, FEATURE_INTERIORS)
+        | bit(stack, FEATURE_STACK)
+}
+
+/// The features an update path keeps of its view's: it does not walk, nor split by wavelength.
+const UPDATE_FEATURES: u32 = FEATURE_INTERIORS | FEATURE_STACK;
+
+/// What paths whose root has `features` may meet.
+fn features_may(features: u32) -> u32 {
+    bit(features & FEATURE_WALK != 0, MAY_WALK)
+        | bit(features & FEATURE_DISPERSION != 0, MAY_DISPERSION)
+        | bit(features & FEATURE_INTERIORS != 0, MAY_INTERIORS)
+        | bit(features & FEATURE_STACK != 0, MAY_STACK)
+}
+
+/// What the paths of a scene that may hold `features` may meet, beyond what their roots say.
+fn scene_may(features: SceneFeatures) -> u32 {
+    bit(features.contains(SceneFeatures::COAT), MAY_COAT)
         | bit(features.contains(SceneFeatures::FUZZ), MAY_FUZZ)
         | bit(features.contains(SceneFeatures::THIN_FILM), MAY_FILM)
         | bit(features.contains(SceneFeatures::SUBSURFACE), MAY_SUBSURFACE)
-        // The eye's interior is one whatever the materials say.
-        | bit(
-            features.contains(SceneFeatures::INTERIORS) || lighting.camera_medium.is_some(),
-            MAY_INTERIORS,
-        )
         | bit(features.contains(SceneFeatures::LAYERS), MAY_LAYERS)
         | bit(features.contains(SceneFeatures::COVERAGE), MAY_COVERAGE)
         | bit(features.contains(SceneFeatures::PARTICLES), MAY_PARTICLES)
-        | bit(features.contains(SceneFeatures::LOCAL_LIGHTS), MAY_LOCAL_LIGHTS)
+        | bit(
+            features.contains(SceneFeatures::LOCAL_LIGHTS),
+            MAY_LOCAL_LIGHTS,
+        )
         | bit(
             features.contains(SceneFeatures::DIRECTIONAL_LIGHTS),
             MAY_DIRECTIONAL,
@@ -1391,13 +1409,12 @@ fn scene_may(features: SceneFeatures, lighting: &ViewLighting) -> u32 {
 /// What `root` says its paths may meet: the bits of `specialize.slang` a root decides.
 fn root_may(root: &PathRoot) -> u32 {
     let flag = |f: u32| root.dielectric_flags & f != 0;
-    bit(root.features & FEATURE_DISPERSION != 0, MAY_DISPERSION)
+    features_may(root.features)
         | bit(root.caustics != GpuPtr::NULL, MAY_CAUSTICS)
         | bit(root.mode != 0 || flag(DIELECTRIC_DEBUG_LAYER), MAY_DEBUG)
         | bit(flag(DIELECTRIC_REFERENCE), MAY_REFERENCE)
         | bit(flag(DIELECTRIC_FROST), MAY_FROST)
         | bit(root.aperture_radius > 0.0, MAY_LENS)
-        | bit(root.features & FEATURE_WALK != 0, MAY_WALK)
         | bit(root.local != GpuPtr::NULL, MAY_LOCAL)
         | bit(root.froxels != GpuPtr::NULL, MAY_FROXELS)
         | bit(root.cache_flags & CACHE_TERMINATE != 0, MAY_CACHE)
@@ -1588,26 +1605,25 @@ impl LightingKernels {
             .and_then(|r| r.lens)
             .is_some_and(|l| l.aperture_radius > 0.0);
         let froxels = !reference && self.support.media.fogged(features, lighting);
-        let shared = scene_may(features, lighting)
+        let path = path_features(features, lighting);
+        let shared = scene_may(features)
             | bit(gathers_caustics(scene, lighting), MAY_CAUSTICS)
             | bit(lens, MAY_LENS)
             | bit(froxels, MAY_FROXELS);
-        let dispersion = bit(disperses(features, lighting), MAY_DISPERSION);
         let layer = lighting.debug_view == LightingDebugView::DielectricLayer;
         let background = shared
-            | dispersion
+            | features_may(path)
             | bit(layer, MAY_DEBUG)
             | bit(reference, MAY_REFERENCE)
             | bit(needs.frosted_glass, MAY_FROST)
-            | bit(features.contains(SceneFeatures::WALKING), MAY_WALK)
             | bit(local_share(lighting) > 0.0, MAY_LOCAL)
             | bit(!reference, MAY_CACHE);
         PathMay {
             view: background | bit(path_mode(lighting) != 0, MAY_DEBUG),
             background,
             // Update paths run outside the reference and end in the cache.
-            update: shared | MAY_CACHE,
-            photons: shared | dispersion | bit(reference, MAY_REFERENCE),
+            update: shared | features_may(path & UPDATE_FEATURES) | MAY_CACHE,
+            photons: shared | features_may(path & !FEATURE_WALK) | bit(reference, MAY_REFERENCE),
         }
     }
 
@@ -1897,15 +1913,13 @@ impl LightingKernels {
         if pass.frosted_glass {
             flags |= DIELECTRIC_FROST;
         }
+        let features = path_features(pass.scene_features, lighting);
         if matches!(self.paths, PathKernels::Staged(_)) {
             let pixels = view.extent[0] * view.extent[1];
-            if !view
-                .staged
-                .as_ref()
-                .is_some_and(|m| m.fits(pixels, walking))
-            {
+            let parts = StateParts::of(features);
+            if !view.staged.as_ref().is_some_and(|m| m.fits(pixels, parts)) {
                 view.staged = None;
-                view.staged = Some(StagedMemory::new(&view.device, pixels, walking)?);
+                view.staged = Some(StagedMemory::new(&view.device, pixels, parts)?);
             }
         }
         let path_root = PathRoot {
@@ -1966,12 +1980,7 @@ impl LightingKernels {
             stages: GpuPtr::NULL,
             slice_base: 0,
             slice_count: 0,
-            features: if walking { FEATURE_WALK } else { 0 }
-                | if disperses(pass.scene_features, lighting) {
-                    FEATURE_DISPERSION
-                } else {
-                    0
-                },
+            features,
             round: 0,
         };
         // Asked for together, the sources that run in the stages share their pipelines.
@@ -1987,7 +1996,7 @@ impl LightingKernels {
             if !lighting.specialize {
                 return MAY_ALL;
             }
-            let may = scene_may(pass.scene_features, lighting) | root_may(root);
+            let may = scene_may(pass.scene_features) | root_may(root);
             if may != predicted {
                 log::debug!("paths asked for {predicted:#x} may meet {may:#x}");
             }
@@ -2004,10 +2013,9 @@ impl LightingKernels {
                 local: GpuPtr::NULL,
                 light_flags: 0,
                 dof_background: StorageImageIndex::NONE,
-                // Update paths do not walk, nor split by wavelength.
                 sss_flags: path_root.sss_flags & !SSS_POINTS,
                 dielectric_flags: path_root.dielectric_flags & DIELECTRIC_DISPERSION,
-                features: 0,
+                features: path_root.features & UPDATE_FEATURES,
                 pixel_fraction: 1.0,
                 ..path_root
             };
@@ -2171,7 +2179,7 @@ impl LightingKernels {
                 &photon_root,
                 Source::Photon,
                 if lighting.specialize {
-                    scene_may(pass.scene_features, lighting) | root_may(&photon_root)
+                    scene_may(pass.scene_features) | root_may(&photon_root)
                 } else {
                     MAY_ALL
                 },
