@@ -934,9 +934,35 @@ fn run(options: &Options) -> Option<Capture> {
     let mut last: Option<(u64, TimelinePoint)> = None;
     let mut camera_cut = false;
     let mut streaming = Streaming::new(mounting, "the mount", ResidencyStats::default());
+    // `ZORAH_PRESSURE_GIB` GiB of device memory taken at frame `ZORAH_PRESSURE_FRAME` and held
+    // to the end, so the budgets shrink under the heap's pressure partway through a run.
+    let pressure = std::env::var("ZORAH_PRESSURE_GIB").ok().map(|g| {
+        let frame = std::env::var("ZORAH_PRESSURE_FRAME").map_or(1000, |f| {
+            f.parse::<u64>()
+                .expect("ZORAH_PRESSURE_FRAME is a frame count")
+        });
+        (
+            frame,
+            g.parse::<u64>()
+                .expect("ZORAH_PRESSURE_GIB is a count of GiB"),
+        )
+    });
+    let mut held = Vec::new();
     for i in 0.. {
         if frames.is_some_and(|n| i >= n) {
             break;
+        }
+        if let Some((at, gib)) = pressure
+            && i == at
+        {
+            log::info!("taking {gib} GiB of device memory at frame {i}");
+            for _ in 0..gib {
+                let kind = orr::orr_gpu::MemoryKind::DeviceLocal;
+                held.push(
+                    gpu.gpu_malloc::<u8>(kind, 1 << 30, "zorah pressure")
+                        .expect("pressure"),
+                );
+            }
         }
         // Headless runs step a fixed clock, so they repeat exactly.
         let t = if options.headless {
@@ -1052,6 +1078,7 @@ fn run(options: &Options) -> Option<Capture> {
     #[allow(clippy::drop_non_drop)]
     drop(overlay);
     drop(headless_target);
+    drop(held);
     drop(environment);
     end(gpu, display, renderer, window, workers, temp);
     captured
