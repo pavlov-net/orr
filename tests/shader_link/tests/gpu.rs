@@ -250,17 +250,12 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
             "media/froxel",
             "media/froxel_light",
             "media/particle_draw",
-            "path/background",
-            "path/photons",
             "path/staged/primary",
             "path/staged/shade_opaque",
             "path/staged/shade_other",
             "path/staged/sources",
-            "path/staged/tail",
             "path/staged/trace",
-            "path/staged/walk",
-            "path/view",
-            "world_cache/update"
+            "path/staged/walk"
         ]
     );
     if let Some(e) = renderer_error(&orr_linked::KERNELS) {
