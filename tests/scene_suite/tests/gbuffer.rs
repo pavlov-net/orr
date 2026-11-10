@@ -1441,16 +1441,18 @@ fn place(w: &mut World, copies: &[Item]) -> Placed {
 
 /// [`place`] with the group anchored at `anchor` and the copies traced within `rt_range`.
 fn place_at(w: &mut World, copies: &[Item], anchor: DVec3, rt_range: f32) -> Placed {
-    place_with(w, copies, anchor, rt_range, None)
+    place_with(w, copies, anchor, rt_range, None, None)
 }
 
-/// [`place_at`] with one-section copies drawn in `material`, in place of the section's.
+/// [`place_at`] with one-section copies drawn in `material`, in place of the section's, and
+/// held at `lod` from their first frame.
 fn place_with(
     w: &mut World,
     copies: &[Item],
     anchor: DVec3,
     rt_range: f32,
     material: Option<MaterialId>,
+    lod: Option<DebugLod>,
 ) -> Placed {
     let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
     let history = w.scenes.create_view_history().unwrap();
@@ -1493,6 +1495,9 @@ fn place_with(
                 user_tag: i as u32,
             })
             .unwrap();
+        if lod.is_some() {
+            s.debug_lod(range, lod);
+        }
         ranges.push(range);
     }
     drop(s);
@@ -3202,7 +3207,7 @@ fn a_replaced_material_turns_its_normal_map_with_its_own_uv_set() {
         (None, Vec3::new(x, y, z)),
         (Some(material), Vec3::new(y, -x, z)),
     ] {
-        let placed = place_with(&mut w, &[item], DVec3::ZERO, 100.0, over);
+        let placed = place_with(&mut w, &[item], DVec3::ZERO, 100.0, over, None);
         let mut shot = Shot::at(eye, DVec3::ZERO, 1);
         shot.jitter = Vec2::ZERO;
         let g = shoot(&mut w, &placed, &shot);
@@ -5898,7 +5903,94 @@ fn debug_lod_holds_a_dag_level_or_scales_the_error_in_raster_and_ray_tracing() {
     );
     let (back, _) = run(&mut w, None);
     assert_eq!(back, plain, "clearing the hold restores the cut");
+    drop(w);
+    debug_level_of_a_streaming_mesh(&items, eye, target, 1);
     assert_clean();
+}
+
+/// Frames of the streaming ground at debug level `level` until its loads settle: the cut is
+/// the level's with every page resident, and no page holding only groups finer than the
+/// level, which no cluster of the level comes from, is wanted, read or resident.
+fn debug_level_of_a_streaming_mesh(items: &[Item], eye: Vec3, target: Vec3, level: u8) {
+    let mut w = World::with(&RendererDesc {
+        rt_merge_pixels: 0.0,
+        budgets: Budgets {
+            mesh_resident_max: 0,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    });
+    let lod = Some(DebugLod::Level(level));
+    let placed = place_with(&mut w, items, DVec3::ZERO, 100.0, None, lod);
+    let model = w.model("dag ground");
+    let m = CpuMesh::of("dag ground");
+    let clusters = m.clusters();
+    let slot = placed.ranges[0].first;
+    let finer: Vec<usize> = (0..m.pages.len())
+        .filter(|&p| {
+            m.groups
+                .iter()
+                .filter(|g| g.page as usize == p)
+                .all(|g| g.depth < level && g.error.is_finite())
+        })
+        .collect();
+    assert!(!finer.is_empty(), "pages finer than level {level}");
+    let start = Instant::now();
+    let mut idle = 0;
+    for frame in 1.. {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the level's pages never settled"
+        );
+        let shot = Shot::at(eye.as_dvec3(), target.as_dvec3(), frame);
+        let g = shoot_with(&mut w, &placed, &shot, |s| {
+            s.debug_lod(placed.ranges[0], lod);
+        });
+        let (pages, _, nodes) = mesh_pages(&w, model);
+        let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
+        let cut: CutGpu = read_buffer(root.cut, 1)[0];
+        let words = u64::from(cut.feedback_words);
+        let (wanted, touched): (Vec<u32>, Vec<u32>) = (
+            read_buffer(cut.wanted, words),
+            read_buffer(cut.touched, words),
+        );
+        let (models, meshes, _) = orr_scene::testing::global_tables(&w.scenes);
+        let record: ModelGpu = read_buffer(models.offset(u64::from(model.0)), 1)[0];
+        let mesh: MeshGpu = read_buffer(meshes.offset(u64::from(record.mesh)), 1)[0];
+        for &p in &finer {
+            let e = mesh.feedback_pages as usize + p;
+            let bit = |words: &[u32]| words[e / 32] >> (e % 32) & 1 != 0;
+            assert!(
+                !bit(&wanted) && !bit(&touched) && pages[p] == 0,
+                "frame {frame}: page {p}, finer than level {level}, wanted {}, read {}, resident {}",
+                bit(&wanted),
+                bit(&touched),
+                pages[p] != 0
+            );
+        }
+        let r = *w.scenes.residency();
+        idle = if r.loads == 0 && r.class(orr_scene::ResidencyClass::MeshPages).loading_bytes == 0 {
+            idle + 1
+        } else {
+            0
+        };
+        if idle < 8 {
+            continue;
+        }
+        let resident = Resident {
+            pages: pages.iter().map(|&a| a != 0).collect(),
+            nodes: nodes.iter().map(|&a| a != 0).collect(),
+        };
+        let raster = read_cut(&g.view, placed.count).raster(&m, slot);
+        assert_eq!(raster, level_cut(&m, &clusters, level, &resident));
+        assert_eq!(
+            raster,
+            level_cut(&m, &clusters, level, &m.all_resident()),
+            "the level's pages and what they depend on are resident"
+        );
+        break;
+    }
+    assert_eq!(w.scenes.residency().failed, 0);
 }
 
 /// The page table, page bases and node page table of `model`'s mesh as the last frame left

@@ -744,6 +744,10 @@ void traverse(uint3 id: SV_DispatchThreadID)
     // An edit of the whole mesh takes only level 0, whose pages it holds.
     if (mesh.edit != nullptr && mesh.edit.whole != 0 && g.depth != 0)
         return;
+    // Under a debug level `rule` takes no cluster of a group finer than the level unless the
+    // group is terminal, so its page is neither wanted nor read.
+    if (l.level >= 0 && int(g.depth) < l.level && !isinf(g.error))
+        return;
     uint8_t* data = (uint8_t*)mesh.pages[g.page];
     if (data == nullptr)
     {
