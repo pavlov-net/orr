@@ -37,7 +37,10 @@ use orr_scene::{
 use orr_shaders::bytemuck::Zeroable;
 
 use crate::shaders::{accumulate, exposure, flat_color, guide_read, particle_quads};
-use crate::{TestTexture, Workers, device, linear_clamp, pipeline, read, render, texture, upload};
+use crate::{
+    ScenePermit, TestTexture, Workers, device, linear_clamp, pipeline, read, render, texture,
+    upload,
+};
 
 /// Render extent of every bed view.
 pub const EXTENT: [u32; 2] = [128, 96];
@@ -1797,6 +1800,7 @@ pub struct Bed {
     particle_group: TransformGroupId,
     particles: Option<Particles>,
     _workers: Workers,
+    _permit: ScenePermit,
 }
 
 impl Bed {
@@ -1848,6 +1852,7 @@ impl Bed {
     ) -> Self {
         let kernels = renderer.kernels;
         let d = device();
+        let permit = ScenePermit::take();
         let mut scenes = Scenes::new(d, renderer).unwrap();
         let workers = Workers::start(&scenes);
         let mut frame = 0;
@@ -2036,6 +2041,7 @@ impl Bed {
             particle_group,
             particles: None,
             _workers: workers,
+            _permit: permit,
         }
     }
 

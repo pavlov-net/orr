@@ -1,6 +1,8 @@
 //! Headless GPU tests of orr_lighting, on gpu_suite's device with validation on.
 
-use std::sync::{Arc, OnceLock};
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -167,6 +169,53 @@ impl Drop for Workers {
     }
 }
 
+/// Test threads that hold scenes at once. A scene's tables are made for a world, whatever a
+/// test puts in them, so each takes about 1 GB of the device's memory, and the render queue
+/// runs the threads' frames one after another whatever their number: more threads add memory,
+/// which the OS pages out between frames once several test processes pass what the device has.
+const SCENE_THREADS: u64 = 6;
+
+/// The threads holding scenes now.
+fn scene_threads() -> &'static (Mutex<u64>, Condvar) {
+    static THREADS: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+    &THREADS
+}
+
+thread_local! {
+    /// The scenes this thread holds.
+    static SCENES_HELD: Cell<u32> = const { Cell::new(0) };
+}
+
+/// A test thread's leave to hold scenes, taken with its first and given back with its last, so
+/// a thread that holds one never waits for another. Stays on its thread.
+pub(crate) struct ScenePermit(PhantomData<*const ()>);
+
+impl ScenePermit {
+    pub(crate) fn take() -> Self {
+        if SCENES_HELD.get() == 0 {
+            let (holding, freed) = scene_threads();
+            let mut holding = holding.lock().unwrap_or_else(PoisonError::into_inner);
+            while *holding >= SCENE_THREADS {
+                holding = freed.wait(holding).unwrap_or_else(PoisonError::into_inner);
+            }
+            *holding += 1;
+        }
+        SCENES_HELD.set(SCENES_HELD.get() + 1);
+        Self(PhantomData)
+    }
+}
+
+impl Drop for ScenePermit {
+    fn drop(&mut self) {
+        SCENES_HELD.set(SCENES_HELD.get() - 1);
+        if SCENES_HELD.get() == 0 {
+            let (holding, freed) = scene_threads();
+            *holding.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
+            freed.notify_one();
+        }
+    }
+}
+
 type LinkedData = Box<dyn FnOnce(&mut SceneWriter<'_>)>;
 
 /// One orr_scene scene on the suite's device, driven a frame at a time.
@@ -183,6 +232,7 @@ pub struct TestScene {
     pub frame: u64,
     /// Loads mounts, from the first [`Self::mount`].
     workers: Option<Workers>,
+    _permit: ScenePermit,
 }
 
 impl TestScene {
@@ -212,9 +262,11 @@ impl TestScene {
             kernels,
             ..RendererDesc::default()
         };
+        let permit = ScenePermit::take();
         let mut scenes = Scenes::new(device(), &renderer).unwrap();
         let id = scenes.create_scene(&desc).unwrap();
         Self {
+            _permit: permit,
             scenes,
             id,
             desc,
