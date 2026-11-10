@@ -28,9 +28,9 @@ use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
     Budgets, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
     InstanceFlags, InstancePageRef, Lens, Light, LightId, LitView, LoadState, PackSource,
-    PageNeeds, PoolSize, Projection, Renderer, RendererDesc, RequestSource, ResidencyClass,
-    ResidencyStats, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter, UiPass,
-    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    PageNeeds, Projection, Renderer, RendererDesc, RequestSource, ResidencyClass, ResidencyStats,
+    SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter, UiPass, ViewHooks,
+    ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, CookOptions, GltfLayout, GltfSettings, InputChannels, LodMode,
@@ -67,8 +67,6 @@ const RUN_SCALE: f32 = 8.0;
 const LOOK_SCALE: f32 = 0.0025;
 /// The `.cfg` camera's near plane; the sidecar view gives none.
 const NEAR: f32 = 0.02;
-/// Bytes of resident mesh pages, and of the CLAS and micromaps they build.
-const MESH_POOL: u64 = 6 << 30;
 /// Seconds each figure of the readout averages over.
 const READOUT_PERIOD: f64 = 0.5;
 
@@ -325,7 +323,6 @@ fn budgets(pack: &Path) -> Budgets {
     let fit = |n: u64, default: u32| u32::try_from(n).expect("a u32 count").max(default);
     Budgets {
         mesh_pages: fit(pages, defaults.mesh_pages),
-        mesh_page_pool: PoolSize::Bytes(MESH_POOL),
         ..defaults
     }
 }
@@ -396,6 +393,7 @@ impl Streaming {
     fn step(&mut self, renderer: &Renderer, camera: &str) {
         let r = renderer.residency();
         let cuts = renderer.stats().cuts;
+        let detail = renderer.stats().detail;
         let loading = r.classes.iter().any(|c| c.loading_bytes > 0);
         let dropped: u32 = r.dropped.iter().sum();
         let lost = cuts.requests_lost + r.texture_feedback_lost;
@@ -413,8 +411,12 @@ impl Streaming {
             let s = &self.start;
             let read = r.bytes_read - s.bytes_read;
             log::info!(
-                "{camera}: streaming settled {settled:.1} s after {}: {} loads landed, {:.0} MiB read at {:.0} MiB/s, {} CLAS retries, CLAS range full {} times, cluster ids full {} times, longest closure since the start {}",
+                "{camera}: streaming settled {settled:.1} s after {} at detail x{:.3} (gathers x{:.3}), mesh pages {:.0} of {:.0} MiB wanted: {} loads landed, {:.0} MiB read at {:.0} MiB/s, {} CLAS retries, CLAS range full {} times, cluster ids full {} times, longest closure since the start {}",
                 self.cause,
+                detail.memory_scale,
+                detail.rt_scale,
+                mib(detail.mesh_demand),
+                mib(detail.mesh_budget),
                 r.landed - s.landed,
                 mib(read),
                 mib(read) / settled,
@@ -455,6 +457,7 @@ impl Readout {
         }
         let r = renderer.residency();
         let cuts = renderer.stats().cuts;
+        let detail = renderer.stats().detail;
         let class = |c: ResidencyClass| {
             let s = r.class(c);
             format!(
@@ -468,9 +471,13 @@ impl Readout {
         let rate = |n: f64| n / self.seconds;
         let dropped = |source| r.dropped_from(source);
         self.text = format!(
-            "{:.1} fps  {:.2} ms\nmesh pages {}\ntextures {}\ninstance pages {}\nCLAS {:.0} / {:.0} MiB used, {:.0} retries/s, range full {} times, cluster ids full {} times\nread {:.0} MiB/s, {:.0} loads/s landed\n{} loads  {} evictions  {} failed  {} out of memory  {} pages over budget\ndropped: {} traversal, {} finer cuts, {} textures, {} instance pages, {} hints\n{} waiting  longest closure {}\nfeedback lost: {} requests, {} texture raises",
+            "{:.1} fps  {:.2} ms\ndetail x{:.3}, gathers x{:.3}, mesh pages {:.0} of {:.0} MiB wanted\nmesh pages {}\ntextures {}\ninstance pages {}\nCLAS {:.0} / {:.0} MiB used, {:.0} retries/s, range full {} times, cluster ids full {} times\nread {:.0} MiB/s, {:.0} loads/s landed\n{} loads  {} evictions  {} failed  {} out of memory  {} pages over budget\ndropped: {} traversal, {} finer cuts, {} textures, {} instance pages, {} hints\n{} waiting  longest closure {}\nfeedback lost: {} requests, {} texture raises",
             f64::from(self.frames) / self.seconds,
             self.seconds * 1000.0 / f64::from(self.frames),
+            detail.memory_scale,
+            detail.rt_scale,
+            mib(detail.mesh_demand),
+            mib(detail.mesh_budget),
             class(ResidencyClass::MeshPages),
             class(ResidencyClass::Textures),
             class(ResidencyClass::InstancePages),
