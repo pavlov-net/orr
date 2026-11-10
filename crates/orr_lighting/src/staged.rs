@@ -300,7 +300,7 @@ fn compile_stage(
 }
 
 /// A compile job and the urgency it was queued at.
-type Queued<T> = (Urgency, JobResult<Result<T, Error>>);
+type Queued<T> = Arc<(Urgency, JobResult<Result<T, Error>>)>;
 
 /// A pipeline made after the kernels are ready, in a job of its own on the loading side;
 /// whoever asks for it does without until then.
@@ -328,7 +328,7 @@ impl<T: Send + 'static> Late<T> {
             return Some(p);
         }
         let mut job = self.job.lock().unwrap();
-        if let Some(result) = job.as_ref().and_then(|(_, queued)| queued.take()) {
+        if let Some(result) = job.as_ref().and_then(|queued| queued.1.take()) {
             *job = None;
             self.settle(result.unwrap_or_else(|message| {
                 Err(Error::CompilePanicked {
@@ -389,7 +389,7 @@ impl<T: Send + 'static> Late<T> {
         match loading {
             Some((loading, urgency)) => {
                 let queued = crate::view::compile_job(device, loading, urgency, compile);
-                *job = Some((urgency, queued));
+                *job = Some(Arc::new((urgency, queued)));
             }
             None => self.settle(compile(device)),
         }
@@ -398,9 +398,10 @@ impl<T: Send + 'static> Late<T> {
     /// The pipeline, after waiting for its job and running queued jobs of `loading` on this
     /// thread meanwhile; an error where its compile failed or never started.
     fn wait(&self, loading: Option<&Loading>) -> Result<&T, Error> {
-        if let (Some(loading), Some((urgency, job))) = (loading, self.job.lock().unwrap().as_ref())
-        {
-            job.wait_at(loading, *urgency);
+        // The job is waited for without its lock, which whoever asks whether it is ready takes.
+        let queued = self.job.lock().unwrap().clone();
+        if let (Some(loading), Some(queued)) = (loading, queued) {
+            queued.1.wait_at(loading, queued.0);
         }
         self.get().ok_or_else(|| {
             self.failure().unwrap_or_else(|| Error::LateCompile {
