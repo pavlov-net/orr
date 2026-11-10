@@ -42,6 +42,7 @@ import orr_lighting.light_sampling;
 import orr_lighting.world_cache;
 import orr_lighting.shadow;
 import orr_lighting.interiors;
+import orr_lighting.specialize;
 
 // Separates the froxels' samples from the paths' of the same pixel.
 public static const uint FROXEL_STREAM = 0x85EBCA6B;
@@ -463,12 +464,46 @@ float3 limit_incident(float3 c)
     return !all(isfinite(c)) ? float3(0.0) : m > FROXEL_INCIDENT_MAX ? c * (FROXEL_INCIDENT_MAX / m) : c;
 }
 
-// Light reaching point `x` of froxel `f`'s tile from the scene's lights other than the
-// shadowed directional ones, as mean radiance over the sphere: FROXEL_TILE_CANDIDATES tile
-// samples and one unshadowed directional light by selection weight, resampled by luminance,
-// with one shadow ray for the winner. Counts the ray in `rays`.
-float3 froxel_local<S : ISurface, M : IMedium>(FroxelRoot r, uint3 f, float3 x, Interior around, inout Sampler rng, inout uint rays)
+// What reaches `origin` along unit `dir` over `t_max` m for the light pass's rays, which trace
+// SHADOW_UNBENT: with `bend`, a directional light's through the plane stack its probe finds where
+// one holds (`directional_visibility`), else `surface_visibility`'s, without the linked medium and
+// with the interiors' optical depth apart in `depth`. `stack` is the stack's, or a straight ray's.
+float3 froxel_shadow<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, bool bend, uint* overflows, out float3 depth, out StackLight stack)
 {
+    if (may(MAY_STACK) && bend && path_light<S, M>(s, v, origin, origin, dir, positive_infinity(), flags, context, false, inside, true, false, false, overflows, stack) != STACK_BROKEN)
+    {
+        depth = stack.depth;
+        return stack.transmittance;
+    }
+    stack = straight_light(dir);
+    return surface_visibility<S, M, SHADOW_UNBENT>(s, v, origin, dir, t_max, flags, context, environment, inside, overflows, depth);
+}
+
+// The winner of `froxel_local`'s resampling and what its shadow ray multiplies.
+struct FroxelLocal
+{
+    // The winner; `traced` false where no candidate had weight.
+    ResolvedLightSample chosen;
+    bool traced;
+    // Its radiance, and the resampling's weight sum over its target.
+    float3 radiance;
+    float scale;
+    float t_max;
+}
+
+// Light reaching point `x` of froxel `f`'s tile from the scene's lights other than the
+// shadowed directional ones, as mean radiance over the sphere once its shadow ray's visibility
+// multiplies it: FROXEL_TILE_CANDIDATES tile samples and one unshadowed directional light by
+// selection weight, resampled by luminance. The light pass traces the winner's shadow ray where
+// it traces the shadowed lights', so the shadow ray compiles once.
+FroxelLocal froxel_local(FroxelRoot r, uint3 f, float3 x, inout Sampler rng)
+{
+    FroxelLocal local;
+    local.chosen = no_candidate();
+    local.traced = false;
+    local.radiance = float3(0.0);
+    local.scale = 0.0;
+    local.t_max = 0.0;
     LightSetGpu* set = r.set;
     bool tiles = set.environment_probability > 0.0 || set.candidate_total > 0.0;
     uint tile = light_tile(uint2(column_pixel(r, float2(f.xy))), set.frame);
@@ -544,16 +579,13 @@ float3 froxel_local<S : ISurface, M : IMedium>(FroxelRoot r, uint3 f, float3 x, 
         }
     }
     if (!(sum > 0.0))
-        return float3(0.0);
-    float3 l = chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, chosen.light, chosen.dir) : chosen.radiance;
-    float t_max = isfinite(chosen.distance) ? chosen.distance * (1.0 - 1e-4) : chosen.distance;
-    RayCone cone = { 0.0, 0.0 };
-    rays++;
-    // The baked environment carries the medium, as next-event estimation takes it.
-    float3 vis = visibility<S, M, SHADOW_UNBENT>(r.scene, r.view, x, chosen.dir, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, around, set.shadow_overflows);
-    if (chosen.view && any(vis > 0.0))
-        vis *= emitter_view_layer<S>(set, chosen, interior_ior(r.scene, around.innermost()));
-    return l * vis * (sum / chosen_target) * INV_FOUR_PI;
+        return local;
+    local.chosen = chosen;
+    local.traced = true;
+    local.radiance = chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, chosen.light, chosen.dir) : chosen.radiance;
+    local.scale = sum / chosen_target;
+    local.t_max = isfinite(chosen.distance) ? chosen.distance * (1.0 - 1e-4) : chosen.distance;
+    return local;
 }
 
 // The light pass over column `column`. Froxels behind their tiles' surfaces carry their history
@@ -614,25 +646,52 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
                 if (lateral > 0.0)
                     surface_crossings<S>(r.scene, r.view, on_ray, (x - on_ray) / lateral, lateral, around);
             }
-            l += froxel_local<S, M>(r, f, x, around, rng, rays);
+            FroxelLocal local = froxel_local(r, f, x, rng);
             float a = held ? blend : 1.0;
             float a_vis = held && lights.changed == 0 ? blend : 1.0;
             bool inside = keep_depth && eye_holds(eye_column, k, r.slices, near_range);
             float vis[MAX_FROXEL_SHADOWED_LIGHTS];
             float4 depth_now = float4(0.0);
             for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
-            {
                 vis[j] = 1.0;
-                if (j >= lights.count)
+            // One trace site: ray 0 is the local winner's, the rest the shadowed lights'.
+            for (uint ray = 0; ray <= MAX_FROXEL_SHADOWED_LIGHTS; ray++)
+            {
+                bool winner = ray == 0;
+                uint j = ray - 1;
+                if (winner ? !local.traced : j >= lights.count)
                     continue;
-                float2 u = rng.next2();
-                float cone_pdf;
-                float3 to_light = directional_sample(r.scene.lights[lights.ids[j]], u, cone_pdf);
+                float3 to_light = local.chosen.dir;
+                float t_max = local.t_max;
+                // The baked environment carries the medium, as next-event estimation takes it.
+                bool environment = local.chosen.kind == LIGHT_SAMPLE_ENVIRONMENT;
+                if (!winner)
+                {
+                    float2 u = rng.next2();
+                    float cone_pdf;
+                    to_light = directional_sample(r.scene.lights[lights.ids[j]], u, cone_pdf);
+                    t_max = positive_infinity();
+                    environment = false;
+                }
                 RayCone cone = { 0.0, 0.0 };
                 rays++;
                 float3 tau;
                 StackLight stack;
-                float3 t = directional_visibility<S, M>(r.scene, r.view, x, to_light, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), around, r.set.stack_entries != 0, r.set.shadow_overflows, tau, stack);
+                float3 t = froxel_shadow<S, M>(r.scene, r.view, x, to_light, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), environment, around, !winner && r.set.stack_entries != 0, r.set.shadow_overflows, tau, stack);
+                if (winner)
+                {
+                    // `visibility` of the ray: the interiors' depth and the linked medium in it.
+                    if (!all(t == 0.0))
+                    {
+                        t *= exp(-tau);
+                        if (!environment)
+                            t *= medium_transmittance<M>(r.scene.medium, x, to_light, t_max);
+                    }
+                    if (local.chosen.view && any(t > 0.0))
+                        t *= emitter_view_layer<S>(r.set, local.chosen, interior_ior(r.scene, around.innermost()));
+                    l += local.radiance * t * local.scale * INV_FOUR_PI;
+                    continue;
+                }
                 t *= stack.jacobian;
                 if (inside && stack.jacobian != 1.0 && stacks[j].w == 0.0)
                     stacks[j] = float4(stack.normal, 1.0);
