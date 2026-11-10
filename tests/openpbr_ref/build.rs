@@ -23,6 +23,7 @@ fn main() {
                 .include_as("orr_lighting", &lighting)
                 .include(&openpbr)
                 .define("ORR_OPENPBR_ARRAY_LUTS", "1")
+                .define("ORR_UNSPECIALIZED", "1")
                 .compile("openpbr_slang")
         })
         .unwrap_or_else(|e| fail(e));

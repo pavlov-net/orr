@@ -1,6 +1,8 @@
 //! Queue kinds and pass measurements, alike on every backend.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use crate::{Error, Queue, TimelinePoint};
 
 /// Which queue. Each has one owner thread that submits it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -29,6 +31,33 @@ impl QueueKind {
     #[cfg_attr(target_vendor = "apple", expect(dead_code))]
     pub(crate) fn index(self) -> usize {
         self as usize
+    }
+}
+
+impl Queue {
+    /// Blocks until `point`, on this queue's timeline, has completed, for as long as the queue
+    /// goes on completing work: [`Error::Timeout`] once it has completed nothing for `stall`.
+    /// The submissions ahead of the point, any thread's, and other programs' work on the device
+    /// take as long as they take, where [`Queue::wait`] with one length for all of it times
+    /// out with the queue at work.
+    pub fn wait_while_completing(
+        &self,
+        point: TimelinePoint,
+        stall: Duration,
+    ) -> Result<(), Error> {
+        let mut completed = self.completed();
+        loop {
+            match self.wait(point, stall) {
+                Err(Error::Timeout) => {
+                    let now = self.completed();
+                    if now == completed {
+                        return Err(Error::Timeout);
+                    }
+                    completed = now;
+                }
+                done => return done,
+            }
+        }
     }
 }
 

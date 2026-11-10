@@ -649,6 +649,32 @@ impl SlotHold {
     }
 }
 
+impl SceneCpu {
+    /// What the scene itself may hold, beside what the material table's records may show.
+    pub(crate) fn features(&self) -> crate::SceneFeatures {
+        let mut out = self.lights.features();
+        if self.ptlas.has_medium_proxies() {
+            out |= crate::SceneFeatures::MEDIUM_PROXIES;
+        }
+        if self.producers.iter().flatten().any(|p| p.smoke) {
+            out |= crate::SceneFeatures::SMOKE;
+        }
+        // A replaced entry's geometry stays until its frame has completed.
+        let retired = self.retired.iter().map(|(_, p)| p);
+        for p in self.producers.iter().flatten().chain(retired) {
+            out |= p.features;
+        }
+        // The bins a frame's kernels read are remade from the list once it has changed.
+        if self.decals_changed || self.decal_globals > 0 || self.decal_bin_slots > 0 {
+            out |= crate::SceneFeatures::DECALS;
+        }
+        if self.hung || self.skinned_high_water > 0 {
+            out |= crate::SceneFeatures::SKINNING;
+        }
+        out
+    }
+}
+
 pub(crate) struct SceneCpu {
     pub(crate) slots: RangeAllocator,
     /// By slot.
@@ -686,12 +712,15 @@ pub(crate) struct SceneCpu {
     pub(crate) surface_data: u64,
     pub(crate) near_range: f32,
     pub(crate) ptlas: Ptlas,
+    pub(crate) lights: crate::lights::LightKinds,
     /// Made at the scene's first update.
     pub(crate) cuts: Option<Cuts>,
     /// Skinned-copy entries.
     pub(crate) skinned: RangeAllocator,
     /// One past the highest skinned-copy entry handed out.
     pub(crate) skinned_high_water: u32,
+    /// A group has hung from a palette's joint.
+    pub(crate) hung: bool,
     skins: Vec<SkinRange>,
     /// Entry ranges and vertex arrays of removed skinned copies, freed once that frame has
     /// completed.
@@ -756,6 +785,7 @@ impl SceneCpu {
 
     /// Puts `group` at an id of [`Self::free_group`].
     fn put_group(&mut self, id: usize, group: Group) {
+        self.hung |= group.frame.is_some();
         if id == self.groups.len() {
             self.groups.push(Some(group));
         } else {
@@ -1175,9 +1205,11 @@ impl Scene {
                 surface_data: 0,
                 near_range: 256.0,
                 ptlas: Ptlas::new(device, desc)?,
+                lights: crate::lights::LightKinds::default(),
                 cuts: None,
                 skinned: RangeAllocator::new(desc.skinned_capacity),
                 skinned_high_water: 0,
+                hung: false,
                 skins: Vec::new(),
                 skins_removed: Vec::new(),
                 skin_frame: None,
@@ -2365,6 +2397,7 @@ impl<'f> SceneWriter<'f> {
         let origin = {
             let mut cpu = self.scene.cpu.lock().unwrap();
             cpu.ptlas.set_light(id.0, proxied);
+            cpu.lights.set(id.0, light);
             cpu.origin_cell
         };
         let record = light.map_or_else(LightGpu::zeroed, |l| light_gpu(l, origin, self.cell_log2));

@@ -29,7 +29,11 @@ setup. It has no users yet.
 
 ## Tests
 
-- Run `cargo run -p xtask -- test [FILTER]`, with the narrowest filter that can catch the change.
+- Run the narrowest test that can catch the change, once, when it's finished:
+  `cargo run -p xtask -- test [FILTER]`.
+- Don't rerun what passed on the same code. Run the whole suite once before a push to main.
+- A failing test is yours. Check once whether `origin/main` fails too, then fix it or tell the
+  owner; don't rerun it.
 - Keep tests few and sharp. Add one only if it can catch a real bug: numerical code, encodings and
   layouts, invariants across modules, GPU results against a CPU reference, past regressions.
 - Don't add tests that only show the language works, check trivial getters or construction, or copy
@@ -43,6 +47,8 @@ setup. It has no users yet.
   it off for timings.
 - A test that deliberately loses or hangs the device is `#[ignore]` and calls
   `gpu_suite::fault_allowed()` first, so normal runs never fault on purpose.
+- Gate kernel code that not every scene uses with a direct `may()` or `may2()` test, and test
+  it with the bit forced clear.
 
 ## Commits and comments
 

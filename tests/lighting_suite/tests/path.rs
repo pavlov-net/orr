@@ -4,10 +4,11 @@
 //! as lights.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD, EXTENT, FLOOR,
-    FURNACE_RADIANCE, GLASS_SPHERE, GLOSSY_FLOOR, Item, MIRROR, NEAR, Particle, ParticleLook,
-    Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec, TROUGH, assert_close,
-    image_mean, luminance, mean_where, pixel_of, reference, surface_mean,
+    Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD,
+    EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, GLASS_SPHERE, GLOSSY_FLOOR, Item, MIRROR, NEAR,
+    Particle, ParticleLook, Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec,
+    StrandRow, TILED_FLOOR, TINTED_FLOOR, TROUGH, assert_close, image_mean, luminance, mean_where,
+    pixel_of, reference, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::assert_same_mean;
@@ -840,6 +841,236 @@ fn a_cooked_emitter_lights_the_floor_alike_by_next_event_and_bsdf_rays() {
         assert_same_mean(&format!("{emitter}: next-event against BSDF"), &nee, &bsdf);
         assert_same_mean(&format!("{emitter}: full against BSDF"), &full, &bsdf);
     }
+    assert_clean();
+}
+
+/// The floor seen in a mirror takes a cooked emitter's light alike by next-event estimation and
+/// by BSDF rays, under a coat and fuzz too: the floor is then the path's second vertex, which
+/// the plain opaque shade takes, and its next-event estimate passes the winner's light through
+/// the emitter's coat and fuzz as the BSDF ray that hits the emitter sees it.
+#[test]
+fn a_coated_emitter_lights_a_floor_seen_in_a_mirror_alike_by_next_event_and_bsdf_rays() {
+    let linear = Mat3::from_rotation_x(-0.6) * Mat3::from_diagonal(Vec3::new(1.6, 1.0, 0.7));
+    const MIRROR_Z: f32 = -1.5;
+    for emitter in [EMITTER, COATED_EMITTER] {
+        let spec = Spec {
+            copies: vec![
+                at(FLOOR, Mat3::IDENTITY, Vec3::ZERO),
+                at(emitter, linear, Vec3::new(0.0, 1.0, 0.0)),
+                at(MIRROR, Mat3::IDENTITY, Vec3::new(0.0, 1.0, MIRROR_Z)),
+            ],
+            lights: Vec::new(),
+            environment: None,
+            eye: Vec3::new(2.0, 1.6, 3.0),
+            target: Vec3::new(0.3, 0.5, MIRROR_Z),
+            fov_y: 0.8,
+            focus: None,
+        };
+        // The floor point the emitter lights, where the mirror shows it.
+        let lit = Vec3::new(0.0, 0.0, 0.6);
+        let patch = pixel_of(&spec, Vec3::new(lit.x, lit.y, 2.0 * MIRROR_Z - lit.z));
+        let mut bed = Bed::with(spec);
+        let nee = patch_means(
+            &mut bed,
+            &paths(debug(LightingDebugView::NeeOnly, 2)),
+            patch,
+            16,
+            8,
+            1,
+        );
+        let bsdf = patch_means(
+            &mut bed,
+            &paths(debug(LightingDebugView::BsdfOnly, 2)),
+            patch,
+            16,
+            32,
+            2,
+        );
+        let full = patch_means(&mut bed, &paths(reference(2)), patch, 16, 8, 3);
+        assert!(
+            nee.iter().sum::<f64>() > 0.0,
+            "{emitter}: next-event lit nothing"
+        );
+        assert_same_mean(&format!("{emitter}: next-event against BSDF"), &nee, &bsdf);
+        assert_same_mean(&format!("{emitter}: full against BSDF"), &full, &bsdf);
+    }
+    assert_clean();
+}
+
+/// Pipelines compiled for what a scene may hold read what its surfaces read at a hit: a floor
+/// whose vertex colors tint its base color, under a decal, seen in a mirror, so the path's
+/// second vertex is resolved from its hit and not from the G-buffer. The pipelines that hold
+/// everything show the tint and the decal there, and the scene's own render the same image.
+#[test]
+fn specialized_pipelines_read_vertex_colors_and_decals_at_a_hit() {
+    const MIRROR_Z: f32 = -1.5;
+    let spec = Spec {
+        copies: vec![
+            at(TINTED_FLOOR, Mat3::IDENTITY, Vec3::ZERO),
+            at(MIRROR, Mat3::IDENTITY, Vec3::new(0.0, 1.0, MIRROR_Z)),
+        ],
+        lights: Vec::new(),
+        environment: Some(FURNACE_RADIANCE),
+        eye: Vec3::new(2.0, 1.6, 3.0),
+        target: Vec3::new(0.3, 0.5, MIRROR_Z),
+        fov_y: 0.8,
+        focus: None,
+    };
+    // A black decal on the floor, and the floor points left of it the mirror shows.
+    let decal = FloorDecal {
+        material: BLACK_SPHERE,
+        center: Vec3::new(0.0, 0.0, 0.6),
+        half_extent: Vec3::new(0.8, 0.8, 0.5),
+    };
+    let seen = |x: f32| pixel_of(&spec, Vec3::new(x, 0.0, 2.0 * MIRROR_Z - decal.center.z));
+    let mut paths = paths(ViewLighting {
+        debug_view: LightingDebugView::BsdfOnly,
+        max_bounces: 2,
+        ..ViewLighting::default()
+    });
+    let mut render = |specialize| {
+        paths.specialize = specialize;
+        let mut bed = Bed::with_features(spec.clone(), &[decal]);
+        render_paths(&mut bed, &paths, 8, 1)
+    };
+    let general = render(false);
+    let [under, near, far] = [0.0, -1.4, -2.2].map(|x| general.around(seen(x), 2));
+    assert!(
+        under[1] < 0.1 * near[1],
+        "the decal: green {} under it, {} beside it",
+        under[1],
+        near[1]
+    );
+    // The floor's vertex colors go from red at -x to green at +x.
+    let (near, far) = (near[0] / near[1], far[0] / far[1]);
+    assert!(
+        far > 1.2 * near,
+        "the tint: red over green {far} at -2.2 m, {near} at -1.4 m"
+    );
+    let specialized = render(true);
+    assert!(
+        bits(&general) == bits(&specialized),
+        "the scene's own pipelines changed the image"
+    );
+    assert_clean();
+}
+
+/// The image as bits, for renders that must agree exactly.
+fn bits(a: &Accumulated) -> Vec<[u32; 4]> {
+    a.mean.iter().map(|p| p.map(f32::to_bits)).collect()
+}
+
+/// A floor at `floor_x` along x and the mirror standing over it at `mirror_z`, in a furnace,
+/// from an eye that sees the floor in front of the mirror reflected in it.
+fn mirrored_floor(floor: &'static str, floor_x: f32, mirror_z: f32) -> Spec {
+    Spec {
+        copies: vec![
+            at(floor, Mat3::IDENTITY, Vec3::new(floor_x, 0.0, 0.0)),
+            at(MIRROR, Mat3::IDENTITY, Vec3::new(0.0, 1.0, mirror_z)),
+        ],
+        lights: Vec::new(),
+        environment: Some(FURNACE_RADIANCE),
+        eye: Vec3::new(2.0, 1.6, 3.0),
+        target: Vec3::new(0.3, 0.5, mirror_z),
+        fov_y: 0.8,
+        focus: None,
+    }
+}
+
+/// Pipelines compiled for what a scene may hold read a tile set at a hit: a floor whose base
+/// color is two tiles, a dark one and a bright one, seen in a mirror, so the path's second
+/// vertex is resolved from its hit. The pipelines that hold everything show each tile where its
+/// square of uv lies, and the scene's own render the same image.
+#[test]
+fn specialized_pipelines_read_a_tile_set_at_a_hit() {
+    const MIRROR_Z: f32 = -1.5;
+    // The tiles meet under x = -1.
+    let spec = mirrored_floor(TILED_FLOOR, -1.0, MIRROR_Z);
+    let seen = |x: f32| pixel_of(&spec, Vec3::new(x, 0.0, 2.0 * MIRROR_Z - 0.6));
+    let mut paths = paths(ViewLighting {
+        debug_view: LightingDebugView::BsdfOnly,
+        max_bounces: 2,
+        ..ViewLighting::default()
+    });
+    let mut render = |specialize| {
+        paths.specialize = specialize;
+        let mut bed = Bed::with_features(spec.clone(), &[]);
+        render_paths(&mut bed, &paths, 8, 1)
+    };
+    let general = render(false);
+    let [dark, bright] = [-1.8, -0.3].map(|x| general.around(seen(x), 2)[1]);
+    assert!(
+        bright > 5.0 * dark,
+        "the tiles: green {dark} on the dark one, {bright} on the bright one"
+    );
+    let specialized = render(true);
+    assert!(
+        bits(&general) == bits(&specialized),
+        "the scene's own pipelines changed the image"
+    );
+    assert_clean();
+}
+
+/// Pipelines compiled for what a scene may hold shade a strand at a hit: a fence of dark
+/// strands on the floor, seen in a mirror, so the path's second vertex is resolved from its
+/// hit on a strand. The pipelines that hold everything show the fence darker than the floor
+/// beside it, and the scene's own render the same image.
+#[test]
+fn specialized_pipelines_shade_strands_at_a_hit() {
+    const MIRROR_Z: f32 = -1.5;
+    let spec = mirrored_floor(FLOOR, 0.0, MIRROR_Z);
+    // Strands that touch, from x = -0.5 to 0.1 in front of the mirror.
+    let row = StrandRow {
+        count: 16,
+        first: Vec3::new(-0.5, 0.0, 0.6),
+        step: Vec3::new(0.04, 0.0, 0.0),
+        height: 1.0,
+        radius: 0.03,
+        albedo: [0.05; 3],
+    };
+    let seen = |x: f32| pixel_of(&spec, Vec3::new(x, 0.5, 2.0 * MIRROR_Z - row.first.z));
+    let mut paths = paths(ViewLighting {
+        debug_view: LightingDebugView::BsdfOnly,
+        max_bounces: 2,
+        ..ViewLighting::default()
+    });
+    let mut render = |specialize| {
+        paths.specialize = specialize;
+        let mut bed = Bed::with(spec.clone());
+        bed.set_strands(row);
+        render_paths(&mut bed, &paths, 8, 1)
+    };
+    let general = render(false);
+    let [fence, beside] = [-0.2, -1.4].map(|x| general.around(seen(x), 2)[1]);
+    assert!(
+        fence < 0.5 * beside,
+        "the strands: green {fence} on them, {beside} beside them"
+    );
+    let specialized = render(true);
+    assert!(
+        bits(&general) == bits(&specialized),
+        "the scene's own pipelines changed the image"
+    );
+    assert_clean();
+}
+
+/// A view whose frames stop tracing photons keeps none of their pipelines among those its
+/// frames ran: the bed checks each frame on its scene's own pipelines against what it asked.
+#[test]
+fn a_view_that_stops_tracing_photons_runs_only_what_it_asks_for() {
+    let mut bed = Bed::new(Analytic::CornellBox);
+    let mut real_time = paths(ViewLighting::default());
+    real_time.specialize = true;
+    render_paths(&mut bed, &real_time, 2, 1);
+    let mut reference = paths(ViewLighting {
+        reference: Some(ReferenceSettings {
+            photons: 0,
+            ..ReferenceSettings::default()
+        }),
+        ..reference(2)
+    });
+    reference.specialize = true;
+    render_paths(&mut bed, &reference, 2, 1);
     assert_clean();
 }
 

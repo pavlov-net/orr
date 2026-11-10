@@ -22,11 +22,11 @@ use orr::orr_gpu::{
 use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    BoundTexture, ClusterTopology, CompilingKernels, DirectionalLight, DiscProfile, Display,
-    DisplayRequest, FrameDesc, FrameTime, GroupWriter, HookPass, InstanceFlags, InstancesDesc,
-    Lens, Light, LightId, LitView, MaterialGpu, PackSource, ProducerId, Projection, Renderer,
-    RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
-    TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    BoundTexture, ClusterTopology, DirectionalLight, DiscProfile, Display, DisplayRequest,
+    FrameDesc, FrameTime, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light,
+    LightId, LitView, MaterialGpu, PackSource, ProducerId, Projection, Renderer, RendererDesc,
+    SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc,
+    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source, TextureSettings, Usage,
@@ -110,7 +110,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .expect("display")
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
-    let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
+    let _workers = Workers::machine(renderer.loading());
     let (mount, mut frame) = mount_at(&mut renderer, PackSource::Memory(cook()), FIRST_FRAME);
 
     let scene = renderer
@@ -321,7 +321,8 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .expect("prepare view");
         f.update_scenes(&mut |c| pond.record(c, POND, slab_kernel, t as f32))
             .expect("update scenes");
-        let mut average = average.hook(&f, extent);
+        let lit = f.view_lit(&view, &lighting, false).expect("path pipelines");
+        let mut average = average.hook(&f, extent, lit);
         let mut hooks = ViewHooks {
             scene_referred: average_frames
                 .then_some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),

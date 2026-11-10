@@ -113,6 +113,17 @@ impl Opacity {
         }
     }
 
+    /// What geometry of this opacity may show a path.
+    fn features(self) -> crate::SceneFeatures {
+        use crate::SceneFeatures as F;
+        match self {
+            Self::Opaque => F::NONE,
+            Self::AlphaTested => F::COVERAGE,
+            Self::Dielectric | Self::Presence | Self::Sections => F::LAYERS | F::COVERAGE,
+            Self::Particle | Self::Smoke => F::PARTICLES,
+        }
+    }
+
     /// Every triangle opaque in traversal, its templates the opaque set.
     fn opaque(self) -> bool {
         matches!(self, Self::Opaque)
@@ -313,6 +324,8 @@ struct Accel {
 pub(crate) struct Producer {
     pub(crate) update: ProducerUpdate,
     pub(crate) smoke: bool,
+    /// What its geometry may show a path.
+    pub(crate) features: crate::SceneFeatures,
     max_clusters: u32,
     max_vertices: u32,
     max_segments: u32,
@@ -876,6 +889,13 @@ pub(crate) fn build(
         producer: Producer {
             update: desc.update,
             smoke: desc.opacity == Opacity::Smoke,
+            features: desc.opacity.features()
+                | crate::SceneFeatures::PRODUCERS
+                | if strands {
+                    crate::SceneFeatures::STRANDS
+                } else {
+                    crate::SceneFeatures::NONE
+                },
             max_clusters: desc.max_clusters,
             max_vertices: desc.max_vertices,
             max_segments: desc.max_segments,

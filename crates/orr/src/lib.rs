@@ -78,7 +78,9 @@ use orr_gpu::{
     CommandList, Device, Format, GpuPtr, Hazards, KernelSet, OutputFormat, ShaderModule, Stages,
     StorageImageIndex, TextureDesc, TextureIndex, TextureUsage, TimelinePoint,
 };
-use orr_lighting::{BsdfTables, LightingKernels, LightingView, SceneLighting, ScenePass, ViewPass};
+use orr_lighting::{
+    BsdfTables, LightingKernels, LightingView, PathNeeds, SceneLighting, ScenePass, ViewPass,
+};
 use orr_math::{DVec3, Quat, UVec2, Vec2};
 use orr_output::{
     CapturePass, ChainImages, ComposePass, ComposeRoot, ComposeSource, DisplayFrame, ExposurePass,
@@ -240,6 +242,10 @@ pub struct RenderedView {
     /// The path tracing kernels are still compiling: the view rendered its raster half, and
     /// `radiance`, `linear` and its target hold black.
     pub compiling: bool,
+    /// The view's paths ran pipelines that hold no more than its scene and settings ask for,
+    /// which is everything without [`ViewLighting::specialize`]; false while pipelines that
+    /// hold more run them until those have compiled, and while `compiling`.
+    pub exact_paths: bool,
     pub raster: RasterView,
     /// The extent the view rendered at.
     pub render_extent: [u32; 2],
@@ -325,23 +331,31 @@ struct Lighting {
     try_cached_paths: bool,
     /// Started by the first view history.
     paths: Paths,
+    /// [`Renderer::wait_paths`] was called: a view waits for the path pipelines its scene asks
+    /// for instead of rendering without them.
+    waits: bool,
+    /// When the kernels started, until a view first renders lit.
+    started: Option<Instant>,
     scenes: HashMap<SceneId, SceneLighting>,
     tables: BsdfTables,
 }
 
 impl Lighting {
-    /// Starts the path kernels unless they are ready or compiling: from the pipeline caches when
-    /// they hold every one and `try_cached_paths` allows looking, else as jobs on `loading`, which
-    /// report any failure.
-    fn start_paths(&mut self, gpu: &Device, loading: &Loading) {
+    /// Starts the lighting kernels unless they are ready or compiling: from the pipeline caches
+    /// when they hold every one and `try_cached_paths` allows looking, else as jobs on `loading`,
+    /// which report any failure. The path pipelines themselves start as jobs when a view first
+    /// asks for them.
+    fn start_paths(&mut self, gpu: &Device, loading: &Arc<Loading>) {
         if matches!(self.paths, Paths::Ready(_) | Paths::Compiling { .. }) {
             return;
         }
+        self.started = Some(Instant::now());
         if self.try_cached_paths {
             let cached = gpu.cached_pipelines_only();
             if let Ok(kernels) =
                 LightingKernels::new(&cached, self.kernels, &self.tables, self.entry)
             {
+                kernels.attach(gpu, loading);
                 self.paths = Paths::Ready(Box::new(kernels));
                 return;
             }
@@ -587,6 +601,8 @@ impl Renderer {
                 entry: desc.path_entry,
                 try_cached_paths: desc.try_cached_paths,
                 paths: Paths::NotStarted,
+                waits: false,
+                started: None,
                 scenes: HashMap::new(),
                 tables,
             },
@@ -661,15 +677,16 @@ impl Renderer {
     /// History for one persistent camera: its previous camera, exposure slots and the
     /// lighting and output state of its renders.
     ///
-    /// The first call, and the first after a failed compile, starts the path tracing pipelines
-    /// without compiling on this thread. If
-    /// the pipeline caches hold them all ([`RendererDesc::try_cached_paths`]), they are ready
-    /// when it returns, in tens of milliseconds. Otherwise they compile as jobs on
-    /// [`Renderer::loading`], [`CompilingKernels::JOBS`] of them, which take minutes on a first
-    /// run, holding their threads the whole time. Until then [`Frame::render_view`] renders black.
+    /// The first call, and the first after a failed compile, starts the lighting kernels
+    /// without compiling on this thread. If the pipeline caches hold those every view runs
+    /// ([`RendererDesc::try_cached_paths`]), they are ready when it returns. Otherwise they
+    /// compile as jobs on [`Renderer::loading`], one per pipeline, which take up to a minute
+    /// on a first run, holding their threads the whole time. The path pipelines are
+    /// compiled for what a view's scene and settings may meet, as jobs of their own when the
+    /// view first renders. Until both are ready [`Frame::render_view`] renders black.
     /// The jobs need threads: lend them with [`Loading::run_worker`] or
-    /// [`Loading::run_one`], at least [`CompilingKernels::JOBS`] to compile in parallel and more
-    /// to keep loading meanwhile, or block in [`Renderer::wait_paths`]. With neither, views stay
+    /// [`Loading::run_one`], as many as the machine has to spare so that they compile in
+    /// parallel while loading goes on, or block in [`Renderer::wait_paths`]. With neither, views stay
     /// black, and a warning is logged after a few seconds of frames.
     ///
     /// Each job writes the device's pipeline cache file when it finishes. Dropping the renderer
@@ -695,9 +712,10 @@ impl Renderer {
         Ok(id)
     }
 
-    /// Whether the path tracing kernels have compiled, so the next frame's views render lit. False
-    /// also before the first view history and after a failed compile.
-    pub fn paths_ready(&mut self) -> bool {
+    /// Whether the lighting kernels every view runs have compiled. False also before the first
+    /// view history and after a failed compile. A view's own path pipelines compile when it
+    /// first renders: [`Frame::view_lit`] says whether a view renders lit.
+    pub fn kernels_ready(&mut self) -> bool {
         self.lighting.paths.poll();
         matches!(self.lighting.paths, Paths::Ready(_))
     }
@@ -705,15 +723,19 @@ impl Renderer {
     /// How many of the path tracing kernels' compile jobs have not finished.
     pub fn paths_outstanding(&self) -> u32 {
         match &self.lighting.paths {
-            Paths::Compiling { jobs, .. } => jobs.outstanding(),
+            Paths::Compiling { jobs, .. } => jobs.outstanding() + jobs.paths_outstanding(),
+            Paths::Ready(kernels) => kernels.outstanding(),
             _ => 0,
         }
     }
 
     /// Blocks until the path tracing kernels have compiled, running queued loading jobs on this
     /// thread so it needs no workers, and returns [`Error::PathKernels`] if they failed. For
-    /// tests and headless runs; returns at once when they are ready or never started.
+    /// tests and headless runs; returns at once when they are ready or never started. From
+    /// this call on [`Frame::render_view`] also waits for the path pipelines a view's scene and
+    /// settings first ask for, where it would otherwise hold the view black while they compile.
     pub fn wait_paths(&mut self) -> Result<()> {
+        self.lighting.waits = true;
         if let Paths::Compiling { jobs, .. } = &self.lighting.paths {
             jobs.wait(&self.scenes.loading());
         }
@@ -944,15 +966,14 @@ pub struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
+    /// What `scene` may hold now, which the path pipelines of its views are made for.
+    pub fn scene_features(&self, scene: SceneId) -> Result<orr_scene::SceneFeatures> {
+        Ok(self.scenes.scene_features(scene)?)
+    }
+
     /// orr's frame id: strictly increasing from 1.
     pub fn id(&self) -> u64 {
         self.scenes.id()
-    }
-
-    /// Whether this frame's views render lit, or black because the path tracing kernels are still
-    /// compiling. The answer holds for the whole frame.
-    pub fn paths_ready(&self) -> bool {
-        matches!(self.lighting.paths, Paths::Ready(_))
     }
 
     /// The exposure telemetry of the view's newest completed render. Read it before the
@@ -1032,6 +1053,88 @@ impl<'a> Frame<'a> {
     pub fn raster_view(&mut self, view: &ViewDesc) -> Result<RasterView> {
         self.prepare_raster_view(view)?;
         Ok(self.scenes.raster_view(view)?)
+    }
+
+    /// Whether [`Frame::render_view`] renders `view` lit this frame under `lighting`, or black
+    /// because the kernels or the pipelines its scene and settings ask for are still compiling;
+    /// it asks for those pipelines. `transparency` is whether that render gets a
+    /// [`ViewHooks::transparency`] hook, whose particles the froxels' light pass lights. The
+    /// answer holds for the frame once [`Frame::update_scenes`] has run. A compile that failed
+    /// returns [`Error::PathKernels`].
+    pub fn view_lit(
+        &mut self,
+        view: &LitView<'_>,
+        lighting: &ViewLighting,
+        transparency: bool,
+    ) -> Result<bool> {
+        if let Paths::Failed(e) = &self.lighting.paths {
+            return Err(Error::PathKernels(Arc::clone(e)));
+        }
+        self.ask_paths(view, lighting, transparency, false)
+    }
+
+    /// Asks for the path pipelines `view` takes under `lighting` and says whether it renders
+    /// lit: they are ready, or the caller waits for them ([`Renderer::wait_paths`]), which
+    /// `wait` does here. While the kernels every view runs compile, the view's pipelines are
+    /// asked for all the same, so they compile beside those. A failed compile fails the
+    /// kernels.
+    fn ask_paths(
+        &mut self,
+        view: &LitView<'_>,
+        lighting: &ViewLighting,
+        particle_lighting: bool,
+        wait: bool,
+    ) -> Result<bool> {
+        if !matches!(
+            self.lighting.paths,
+            Paths::Ready(_) | Paths::Compiling { .. }
+        ) {
+            return Ok(false);
+        }
+        let scene = self
+            .lighting
+            .scenes
+            .get(&view.scene)
+            .ok_or(SceneError::UnknownScene(view.scene))?;
+        let needs = PathNeeds {
+            features: self.scenes.scene_features(view.scene)?,
+            frosted_glass: self
+                .output
+                .views
+                .get(&view.history)
+                .is_some_and(|state| state.reconstruction.is_some()),
+            dof_background: false,
+            particle_lighting,
+        };
+        let waits = self.lighting.waits;
+        let asked = match &self.lighting.paths {
+            Paths::Compiling { jobs, .. } => {
+                jobs.prepare_paths(scene, &needs, lighting).map(|()| false)
+            }
+            // The render of a caller that waits asks for them itself, once it has waited.
+            Paths::Ready(_) if waits && !wait => return Ok(true),
+            Paths::Ready(kernels) => {
+                // A caller that waits takes the pipelines made for exactly its view, so its
+                // frames do not depend on what else has compiled.
+                // Held until the pipelines are asked for below, which marks them as run now:
+                // the render records them in this same call.
+                let waited = if waits {
+                    kernels.wait_paths(scene, &needs, lighting).map(Some)
+                } else {
+                    Ok(None)
+                };
+                waited
+                    .and_then(|_held| kernels.prepare_paths(scene, &needs, lighting))
+                    .map(|ready| ready || waits)
+            }
+            Paths::NotStarted | Paths::Failed(_) => unreachable!("returned above"),
+        };
+        asked.map_err(|e| {
+            log::error!("{e}");
+            let e = Arc::new(e);
+            self.lighting.paths = Paths::Failed(Arc::clone(&e));
+            Error::PathKernels(e)
+        })
     }
 
     /// Step 2: works out the render extent [`Frame::render_view`] gives `view` with these
@@ -1125,7 +1228,7 @@ impl<'a> Frame<'a> {
     /// ([`orr_lighting::LightingView::depth_of_field_guide`] among them, with the blur rough
     /// glass gives what lies behind it).
     ///
-    /// While the path tracing kernels compile ([`Frame::paths_ready`] false) only the view's raster
+    /// While the kernels or the view's path pipelines compile ([`Frame::view_lit`] false) only the view's raster
     /// half runs, so streaming goes on while a loading thread is free, and everything after it
     /// holds black:
     /// [`RenderedView::compiling`] is set, ray reconstruction, exposure, motion blur, glare and
@@ -1133,7 +1236,8 @@ impl<'a> Frame<'a> {
     /// since no radiance exists for them to draw into or to keep. `display_linear` and `ui` run over
     /// the black image, so a consumer can draw its own message there. The first render after that
     /// starts every history as a view's first render does. A compile that failed returns
-    /// [`Error::PathKernels`].
+    /// [`Error::PathKernels`], from here where it is a path pipeline's, which compile when a view
+    /// first asks for them.
     pub fn render_view(
         &mut self,
         view: &LitView<'_>,
@@ -1145,9 +1249,19 @@ impl<'a> Frame<'a> {
             return Err(Error::PathKernels(Arc::clone(e)));
         }
         let (extent, render) = self.resolve_view(view, lighting, output)?;
+        let lit = self.ask_paths(view, lighting, hooks.transparency.is_some(), true)?;
         let Paths::Ready(kernels) = &self.lighting.paths else {
             return self.render_view_black(view, output, hooks, extent, render);
         };
+        if !lit {
+            return self.render_view_black(view, output, hooks, extent, render);
+        }
+        if let Some(started) = self.lighting.started.take() {
+            log::info!(
+                "first lit view {:.1} s after the path tracing kernels started",
+                started.elapsed().as_secs_f64()
+            );
+        }
         let id = self.scenes.id();
         let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);
         let frame = self.display.as_deref_mut().and_then(Display::frame);
@@ -1231,10 +1345,7 @@ impl<'a> Frame<'a> {
             dof_background: None,
             frosted_glass: reconstructed,
             overlay_front: blurs && view.lens.shutter > 0.0,
-            walking_materials: raster.walking_materials,
-            interior_materials: raster.interior_materials,
-            scattering_interiors: raster.scattering_interiors,
-            medium_proxies: raster.medium_proxies,
+            scene_features: raster.features,
             particle_lighting: hooks.transparency.is_some(),
         };
         paths.begin(scene, &desc, lighting);
@@ -1243,9 +1354,10 @@ impl<'a> Frame<'a> {
         list.barrier(Stages::ALL, traced, Hazards::empty());
         kernels.record_media(list, scene, paths, &pass, lighting)?;
         kernels.record_paths(list, scene, paths, &pass, lighting)?;
+        let exact_paths = paths.paths_ran().is_none_or(|ran| ran.exact());
         state.samples = state.samples.wrapping_add(1);
         list.barrier(traced, Stages::COMPUTE, Hazards::empty());
-        kernels.record_media_apply(list, scene, paths, &pass, lighting);
+        kernels.record_media_apply(list, scene, paths, &pass, lighting)?;
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         let mut overlay = None;
         if let Some(hook) = hooks.transparency.as_mut() {
@@ -1266,7 +1378,7 @@ impl<'a> Frame<'a> {
         }
         if reconstructed || matches!(lighting.debug_view, LightingDebugView::Guide(_)) {
             let list = self.scenes.list()?;
-            kernels.record_guides(list, paths, &pass, lighting);
+            kernels.record_guides(list, paths, &pass, lighting)?;
             if let Some(guide) = paths.depth_of_field_guide_storage() {
                 list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
                 kernels.record_frosted_glass(list, paths, &pass, guide);
@@ -1444,6 +1556,7 @@ impl<'a> Frame<'a> {
                 radiance: chain.rr_output,
                 linear: TextureIndex::NONE,
                 compiling: false,
+                exact_paths,
             });
         }
 
@@ -1493,6 +1606,7 @@ impl<'a> Frame<'a> {
             radiance: chain.rr_output,
             linear: chain.linear,
             compiling: false,
+            exact_paths,
         })
     }
 
@@ -1519,6 +1633,8 @@ impl<'a> Frame<'a> {
             .views
             .get_mut(&view.history)
             .ok_or(SceneError::UnknownViewHistory(view.history))?;
+        // The next lit render starts every history over, as a view's first does.
+        state.scene_resets = None;
         // The render size, jitter and bias the first lit render will use, so geometry and
         // streaming settle for it.
         let desc = state.raster_desc(view, extent, render);
@@ -1612,6 +1728,7 @@ impl<'a> Frame<'a> {
         }
         Ok(RenderedView {
             compiling: true,
+            exact_paths: false,
             raster,
             render_extent: render,
             reconstructed: false,

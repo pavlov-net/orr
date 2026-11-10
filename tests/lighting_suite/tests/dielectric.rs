@@ -383,7 +383,9 @@ fn a_glass_sphere_in_a_furnace_keeps_its_energy() {
 
 /// A white diffuse sphere beside a clear glass one in a uniform environment returns the
 /// environment on its side that faces the glass, in real time and in the reference: the light
-/// it takes through the glass, where shadow rays end, comes in full by BSDF rays.
+/// it takes through the glass, where shadow rays end, comes in full by BSDF rays. The window's
+/// pixels read at most four light tiles between them in a frame, so its mean settles slowly:
+/// the frames are as many as put the 1% several times past its spread.
 #[test]
 fn a_diffuse_sphere_beside_glass_in_a_furnace_returns_the_environment() {
     let white = Vec3::new(-1.1, 0.0, 0.0);
@@ -410,7 +412,7 @@ fn a_diffuse_sphere_beside_glass_in_a_furnace_returns_the_environment() {
         ..reference(8)
     };
     for (what, settings) in [("real time", real_time), ("reference", truth)] {
-        let image = render_paths(&mut bed, &paths(settings), 32);
+        let image = render_paths(&mut bed, &paths(settings), 512);
         let got = image.around(facing, 4);
         assert_close(what, got, FURNACE_RADIANCE.map(f64::from), 0.01);
     }
@@ -887,7 +889,9 @@ fn through_prism(o: DVec3, d: DVec3, ior: f64) -> Option<(DVec3, DVec3, f64)> {
 /// spectrum. Each pixel's ray, refracted at each wavelength's IOR, reaches the line over a
 /// band of wavelengths; the CPU model adds their colors per pixel. The distance between the
 /// blue and red channels' centroids along the rows, which the spread between 486 and 656 nm
-/// sets, matches the model's within 2%, and each channel's light within 3%.
+/// sets, matches the model's within 2%, and each channel's light within 3%. Both are taken
+/// over every row: a pixel's light comes from the few frames whose hero wavelength reaches the
+/// line and whose Fresnel draws pass both faces, too few in a band of rows for those bounds.
 #[test]
 fn a_white_line_seen_through_a_prism_splits_by_the_abbe_number() {
     let ior = f64::from(PRISM_IOR);
@@ -925,32 +929,50 @@ fn a_white_line_seen_through_a_prism_splits_by_the_abbe_number() {
     let lateral = DVec3::Y.cross(facing);
     let color = spectral_colors();
     let luminance = f64::from(EMITTER_LUMINANCE);
-    let mut model = vec![DVec3::ZERO; w as usize];
     let mut rendered = vec![DVec3::ZERO; w as usize];
-    for y in h / 2 - 8..h / 2 + 8 {
-        for x in 0..w {
-            let p = image.mean[(y * w + x) as usize];
-            rendered[x as usize] += DVec3::new(p[0].into(), p[1].into(), p[2].into());
-            let sx = (2.0 * (f64::from(x) + 0.5) / wf - 1.0) * tan * wf / hf;
-            let sy = (1.0 - 2.0 * (f64::from(y) + 0.5) / hf) * tan;
-            let d = (forward + right * sx + up * sy).normalize();
-            for nm in wavelengths() {
-                let Some((o, d, t)) = through_prism(eye, d, prism_ior(nm)) else {
-                    continue;
-                };
-                let toward = d.dot(-facing);
-                if toward <= 0.0 {
-                    continue;
-                }
-                let off = o + d * ((line_at - o).dot(-facing) / toward) - line_at;
-                if off.dot(lateral).abs() < f64::from(LINE_HALF_WIDTH)
-                    && off.y.abs() < f64::from(LINE_HALF_HEIGHT)
-                {
-                    model[x as usize] += color(nm) * (t * luminance * STEP_NM);
+    for (i, p) in image.mean.iter().enumerate() {
+        rendered[i % w as usize] += DVec3::new(p[0].into(), p[1].into(), p[2].into());
+    }
+    // What the model adds to each column in row `y`.
+    let model_row = |y: u32| -> Vec<DVec3> {
+        let sy = (1.0 - 2.0 * (f64::from(y) + 0.5) / hf) * tan;
+        (0..w)
+            .map(|x| {
+                let sx = (2.0 * (f64::from(x) + 0.5) / wf - 1.0) * tan * wf / hf;
+                let d = (forward + right * sx + up * sy).normalize();
+                wavelengths()
+                    .filter_map(|nm| {
+                        let (o, d, t) = through_prism(eye, d, prism_ior(nm))?;
+                        let toward = d.dot(-facing);
+                        if toward <= 0.0 {
+                            return None;
+                        }
+                        let off = o + d * ((line_at - o).dot(-facing) / toward) - line_at;
+                        let on = off.dot(lateral).abs() < f64::from(LINE_HALF_WIDTH)
+                            && off.y.abs() < f64::from(LINE_HALF_HEIGHT);
+                        on.then(|| color(nm) * (t * luminance * STEP_NM))
+                    })
+                    .sum::<DVec3>()
+            })
+            .collect()
+    };
+    // Every row, in bands of rows on a thread each, added in row order.
+    let rows: Vec<u32> = (0..h).collect();
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    let mut model = vec![DVec3::ZERO; w as usize];
+    std::thread::scope(|scope| {
+        let bands: Vec<_> = rows
+            .chunks(rows.len().div_ceil(threads))
+            .map(|band| scope.spawn(|| band.iter().map(|&y| model_row(y)).collect::<Vec<_>>()))
+            .collect();
+        for band in bands {
+            for row in band.join().expect("a model thread panicked") {
+                for (sum, c) in model.iter_mut().zip(row) {
+                    *sum += c;
                 }
             }
         }
-    }
+    });
     // The columns the model's spectrum spans. Light that reaches the line by other routes,
     // such as a reflection off the base between the two refractions, which undoes the
     // dispersion, lands elsewhere and is left out.

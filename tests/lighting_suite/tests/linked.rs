@@ -206,11 +206,19 @@ fn linked_coverage_casts_the_shadow_of_the_equivalent_alpha_texture() {
         debug_view: LightingDebugView::DirectOnly,
         ..ViewLighting::default()
     });
-    let leaf = render_paths(&mut linked_bed(quad_scene(BARE_LEAF)), &paths, 32, 1);
-    let noise = render_paths(&mut linked_bed(quad_scene(BARE_LEAF)), &paths, 32, 2);
-    let rings = render_paths(&mut linked_bed(quad_scene(RINGS_LEAF)), &paths, 32, 1);
-    // The two differ on pixels at the ring edges, which holds FLIP at about the seed-to-seed
-    // value: up to 1.04 of it over 48 seeds.
+    let render = |model, seed| {
+        let mut bed = linked_bed(quad_scene(model));
+        // At a pre-exposure of 1 the sunlit ground passes the HDR ceiling, which would clip the
+        // samples that draw the sun.
+        bed.set_pre_exposure(1.0 / 64.0);
+        render_paths(&mut bed, &paths, 32, seed)
+    };
+    let leaf = render(BARE_LEAF, 1);
+    let noise = render(BARE_LEAF, 2);
+    let rings = render(RINGS_LEAF, 1);
+    // The linked coverage is the texture's alpha test, so the two differ as two seeds do. The
+    // sampler's fixed-point bilinear weights still move a pixel whose center reads within a
+    // weight step of the cutoff to the other side.
     assert_within_noise(
         "linked coverage against the texture",
         &rings,

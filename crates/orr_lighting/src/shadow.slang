@@ -27,6 +27,7 @@ import orr_scene.hit;
 import orr_scene.gbuffer;
 import orr_lighting.bsdf;
 import orr_lighting.media;
+import orr_lighting.specialize;
 __exported import orr_lighting.interiors;
 
 // The mask shadow rays trace.
@@ -179,36 +180,42 @@ public struct ShadowCandidates<S : ISurface, M : IMedium, let MODE : uint> : ICa
         }
         if (c.cluster_id < 0)
             return float3(1.0);
-        bool layer = c.class_id == CLASS_PRESENCE || c.class_id == CLASS_PARTICLE;
-        float present = resolve_presence<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context, !layer);
+        bool layer = (may(MAY_LAYERS) && c.class_id == CLASS_PRESENCE) || (may(MAY_PARTICLES) && c.class_id == CLASS_PARTICLE);
+        uint section;
+        float present = resolve_presence_section<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context, !layer, section);
         if (layer)
         {
             counted = true;
             return float3(1.0 - saturate(present));
         }
-        if (c.class_id != CLASS_DIELECTRIC)
+        if (!may(MAY_LAYERS) || c.class_id != CLASS_DIELECTRIC)
             return present > 0.0 ? float3(0.0) : float3(1.0);
         if (!(present > 0.0))
             return float3(1.0);
         counted = true;
-        return dielectric(c);
+        return dielectric(c, section);
     }
 
+    // A dielectric candidate of section material `section` that is present.
     [mutating]
-    float3 dielectric(Candidate c)
+    float3 dielectric(Candidate c, uint section)
     {
         if (MODE == SHADOW_PHOTON)
             return float3(0.0);
+        bool thin = may2(MAY2_THIN_DIELECTRICS) && !crosses_interior(scene, section);
+        // Solid glass ends a path's shadow ray whatever its surface is.
+        if (MODE == SHADOW_PATH && !thin)
+        {
+            solid_t = c.t;
+            return float3(0.0);
+        }
         SurfaceHit sh = resolve_hit<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, c.object_positions, false, context);
         if (!sh.valid)
             return float3(1.0);
         float3 n = sh.surface.geometric_normal;
-        bool thin = !crosses_interior(scene, sh.section);
         if (MODE == SHADOW_PATH)
         {
-            if (!thin)
-                solid_t = c.t;
-            if (!thin || !bsdf_thin_mirror(sh.surface.bsdf, exterior_ior))
+            if (!bsdf_thin_mirror(sh.surface.bsdf, exterior_ior))
                 return float3(0.0);
             return bsdf_straight_transmission(sh.surface.bsdf, n, dir, exterior_ior, environment);
         }
@@ -772,20 +779,4 @@ public uint path_light<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v
         o = ray_origin(face.position, face.position, face.geometric_normal, d, ORIGIN_DEFAULT, face.error, 0.0);
     }
     return STACK_BROKEN;
-}
-
-// What reaches `origin`, inside the interiors of `inside`, from a directional light along unit
-// `dir` for the passes that trace SHADOW_UNBENT: with `bend`, through the plane stack its probe
-// finds where one holds, else unbent; as `surface_visibility` gives it, without the linked medium
-// and with the interiors' optical depth apart in `depth`. `stack` holds the stack's bent direction
-// and densities, `stack.bent` `dir` for a straight ray.
-public float3 directional_visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, uint flags, HitContext context, Interior inside, bool bend, uint* overflows, out float3 depth, out StackLight stack)
-{
-    if (bend && path_light<S, M>(s, v, origin, origin, dir, positive_infinity(), flags, context, false, inside, true, false, false, overflows, stack) != STACK_BROKEN)
-    {
-        depth = stack.depth;
-        return stack.transmittance;
-    }
-    stack = straight_light(dir);
-    return surface_visibility<S, M, SHADOW_UNBENT>(s, v, origin, dir, positive_infinity(), flags, context, false, inside, overflows, depth);
 }

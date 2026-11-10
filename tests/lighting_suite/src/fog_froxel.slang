@@ -43,15 +43,6 @@ void inject(uint3 id: SV_DispatchThreadID)
 }
 
 [shader("compute")]
-[numthreads(FROXEL_LIGHT_GROUP, 1, 1)]
-void light(uint3 id: SV_DispatchThreadID)
-{
-    ORR_OMM(light);
-    if (all(id.xy < uint2(root.columns, root.rows)))
-        froxel_light<StandardSurface, StockFog>(root, id.xy);
-}
-
-[shader("compute")]
 [numthreads(8, 8, 1)]
 void integrate(uint3 id: SV_DispatchThreadID)
 {

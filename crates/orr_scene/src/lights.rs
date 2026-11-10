@@ -148,3 +148,35 @@ pub(crate) fn light_gpu(light: &Light, origin_cell: IVec3, cell_log2: u32) -> Li
     }
     g
 }
+
+/// The lights a scene holds by kind, from what was last set for each id.
+#[derive(Default)]
+pub(crate) struct LightKinds {
+    /// By id: whether the light is directional.
+    set: std::collections::HashMap<u32, bool>,
+    directional: u32,
+}
+
+impl LightKinds {
+    /// Records what light `id` now is.
+    pub(crate) fn set(&mut self, id: u32, light: Option<&Light>) {
+        let directional = light.map(|l| matches!(l, Light::Directional(_)));
+        let was = match directional {
+            Some(d) => self.set.insert(id, d),
+            None => self.set.remove(&id),
+        };
+        self.directional =
+            self.directional + u32::from(directional == Some(true)) - u32::from(was == Some(true));
+    }
+
+    pub(crate) fn features(&self) -> crate::SceneFeatures {
+        let mut out = crate::SceneFeatures::NONE;
+        if self.directional > 0 {
+            out |= crate::SceneFeatures::DIRECTIONAL_LIGHTS;
+        }
+        if self.set.len() as u32 > self.directional {
+            out |= crate::SceneFeatures::LOCAL_LIGHTS;
+        }
+        out
+    }
+}

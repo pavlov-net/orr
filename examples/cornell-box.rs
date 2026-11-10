@@ -24,11 +24,11 @@ use std::time::{Duration, Instant};
 use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    CausticSettings, CompilingKernels, Display, DisplayRequest, ExposureTelemetry, FrameDesc,
-    FrameStats, FrameTime, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, LitView,
-    PackSource, Projection, ReferenceSettings, Renderer, RendererDesc, ResolvedDisplay, SceneDesc,
-    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, UiPass, ViewHooks,
-    ViewLighting, ViewOutput, ViewTarget,
+    CausticSettings, Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameStats, FrameTime,
+    GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, LitView, PackSource, Projection,
+    ReferenceSettings, Renderer, RendererDesc, ResolvedDisplay, SceneDesc, SceneLightingSettings,
+    ScreenshotRequest, TextureFilter, TransformGroupDesc, UiPass, ViewHooks, ViewLighting,
+    ViewOutput, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, Manifest, MeshSettings, Source, TextureSettings, Usage,
@@ -387,7 +387,7 @@ fn run(options: &Options) -> Option<Capture> {
     if !options.headless && !reference {
         enable_dlss(&mut renderer);
     }
-    let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
+    let _workers = Workers::machine(renderer.loading());
     let (mount, mut frame) = mount_at(
         &mut renderer,
         PackSource::Memory(cook(gltf, studio)),
@@ -584,15 +584,23 @@ fn run(options: &Options) -> Option<Capture> {
         f.prepare_view(&view, &lighting, &output)
             .expect("prepare view");
         f.update_scenes(&mut |_| {}).expect("update scenes");
-        let mut average = average.hook(&f, extent);
+        let lit = f.view_lit(&view, &lighting, false).expect("path pipelines");
+        let mut average = average.hook(&f, extent, lit);
         let mut ui = |pass: &mut UiPass<'_, '_>| overlay.paint(pass, id);
         let mut hooks = ViewHooks {
             scene_referred: Some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),
             ui: Some(&mut ui),
             ..ViewHooks::default()
         };
-        f.render_view(&view, &lighting, &output, &mut hooks)
+        let rendered = f
+            .render_view(&view, &lighting, &output, &mut hooks)
             .expect("render view");
+        // A headless run waits for its path pipelines, so each frame runs the ones made for
+        // exactly what its scene and settings ask for.
+        assert!(
+            !options.headless || rendered.exact_paths,
+            "a frame ran path pipelines that hold more than its view asked for"
+        );
         camera_cut = false;
         last = Some((id, f.end().expect("end frame")));
     }

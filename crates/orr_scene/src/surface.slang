@@ -12,6 +12,7 @@ __exported import orr_scene.gbuffer;
 __exported import orr_scene.material;
 __exported import orr_scene.tables;
 __exported import orr_scene.view;
+import orr_scene.scene_may;
 
 // `HitContext.kind`.
 public static const uint HIT_PRIMARY = 0;   // the material resolve and the dielectric camera ray's first hit
@@ -150,7 +151,7 @@ public float material_opacity(SurfaceInput i)
 // xyz, or the complement of that for a slot that reads one, and 1 for a slot that reads none.
 public float3 surface_vertex(SurfaceInput i, MaterialGpu* m, uint slot)
 {
-    if ((m.flags & MATERIAL_VERTEX) == 0)
+    if (!may2(MAY2_VERTEX_COLORS) || (m.flags & MATERIAL_VERTEX) == 0)
         return float3(1.0);
     uint modes = m.samplers[slot].modes;
     uint first = (modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK;
@@ -177,7 +178,7 @@ float3 surface_color(SurfaceInput i, MaterialGpu* m, uint slot, float3 factor)
 // `surface_color` tints by the slot's texel.
 float3 surface_color_factor(SurfaceInput i, MaterialGpu* m, uint slot, float3 factor)
 {
-    if ((m.flags & MATERIAL_VERTEX) != 0 && ((m.samplers[slot].modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK) != 0)
+    if (may2(MAY2_VERTEX_COLORS) && (m.flags & MATERIAL_VERTEX) != 0 && ((m.samplers[slot].modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK) != 0)
         return mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, factor) * surface_vertex(i, m, slot));
     return factor;
 }
@@ -185,7 +186,7 @@ float3 surface_color_factor(SurfaceInput i, MaterialGpu* m, uint slot, float3 fa
 // `material_more_color` of `slot`, with `surface_color`'s vertex color.
 float3 surface_more_color(SurfaceInput i, MaterialGpu* m, uint slot, float3 factor)
 {
-    if ((m.flags & (MATERIAL_MORE_TEXTURES | MATERIAL_VERTEX)) == 0)
+    if ((m.flags & (MATERIAL_MORE_TEXTURES | (may2(MAY2_VERTEX_COLORS) ? MATERIAL_VERTEX : 0u))) == 0)
         return factor;
     return surface_color(i, m, slot, factor);
 }
@@ -486,7 +487,7 @@ void surface_decals_each<V : IDecalVisit>(SurfaceInput i, inout V v)
 {
     SceneRoot* s = i.scene;
     uint globals = s.decal_globals;
-    if (globals == 0 && s.decal_bin_slots == 0)
+    if (!may2(MAY2_DECALS) || (globals == 0 && s.decal_bin_slots == 0))
         return;
     uint cell_log2 = uint(s.origin_cell.w);
     int3 bin = (i.cell << (cell_log2 - s.decal_bin_log2)) + int3(floor(i.offset * exp2(-float(s.decal_bin_log2))));
@@ -658,7 +659,7 @@ public struct FeedbackSurface<S : ISurface> : ISurface
 {
     public static GSurface surface(SurfaceInput i, out float depth_offset)
     {
-        if (i.context.feedback)
+        if (may2(MAY2_STREAMS) && i.context.feedback)
             S.feedback(i);
         return S.surface(i, depth_offset);
     }
@@ -697,7 +698,7 @@ public struct CoverageFeedback<S : ISurface> : ISurface
 
     public override static float coverage(SurfaceInput i)
     {
-        if (i.context.feedback)
+        if (may2(MAY2_STREAMS) && i.context.feedback)
             S.coverage_feedback(i);
         return S.coverage(i);
     }
@@ -714,7 +715,7 @@ public struct CoverageFeedback<S : ISurface> : ISurface
 
     public override static float presence(SurfaceInput i)
     {
-        if (i.context.feedback)
+        if (may2(MAY2_STREAMS) && i.context.feedback)
             material_opacity_feedback(i);
         return S.presence(i);
     }

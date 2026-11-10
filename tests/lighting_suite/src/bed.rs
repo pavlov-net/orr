@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 pub use openpbr_ref::walk::fresnel;
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, GridInput, GridVoxels, LodMode, Manifest, MeshInput,
-    MeshSettings, Source, TextureSettings, Usage, VolumeGrids, VolumeInput, VolumeSettings,
+    MeshSettings, Source, TextureRules, TextureSettings, Usage, VolumeGrids, VolumeInput,
+    VolumeSettings,
 };
 use orr_gpu::{
     Allocation, CommandList, ComputePipeline, Format, GpuPtr, Hazards, KernelSet, MemoryKind,
@@ -18,26 +19,29 @@ use orr_gpu::{
     TextureUsage,
 };
 use orr_lighting::{
-    BsdfTables, CompilingKernels, DirectionalLight, DiscProfile, DofBackgroundPass,
-    EnvironmentMapGpu, Light, LightId, LightingKernels, LightingView, ParticleDraw, PathEntry,
-    ReferenceSettings, SceneLighting, SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
+    BsdfTables, DirectionalLight, DiscProfile, DofBackgroundPass, EnvironmentMapGpu, Light,
+    LightId, LightingKernels, LightingView, ParticleDraw, PathEntry, PathNeeds, ReferenceSettings,
+    SceneLighting, SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
 };
 use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::{AssetId, Span, Target};
 use orr_scene::testing::{FlipError, Image, Pixels, flip};
 use orr_scene::{
-    ClusterTopology, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
-    LoadState, MaterialGpu, MaterialId, MediumProxy, MediumProxyId, MountId, Opacity, PackSource,
-    ProducerDesc, ProducerId, ProducerUpdate, Projection, RasterView, RendererDesc, SceneCompute,
-    SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, TextureFilter,
-    TransformGroupDesc, TransformGroupId, ViewArena, ViewDesc, ViewHistoryId, VolumeRef,
-    material_flags,
+    ClusterTopology, Decal, DecalChannels, DecalId, FrameDesc, FrameTime, GroupWriter,
+    InstanceFlags, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, MediumProxy,
+    MediumProxyId, MountId, Opacity, PackSource, ProducerDesc, ProducerId, ProducerUpdate,
+    Projection, RasterView, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter,
+    Scenes, SkinStateGpu, SkinnedDesc, TextureFilter, TransformGroupDesc, TransformGroupId,
+    Urgency, ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 
-use crate::shaders::{accumulate, exposure, flat_color, guide_read, particle_quads};
-use crate::{TestTexture, Workers, device, linear_clamp, pipeline, read, render, texture, upload};
+use crate::shaders::{accumulate, exposure, flat_color, guide_read, particle_quads, strands};
+use crate::{
+    ScenePermit, TestTexture, Workers, device, linear_clamp, pipeline, read, render, texture,
+    upload,
+};
 
 /// Render extent of every bed view.
 pub const EXTENT: [u32; 2] = [128, 96];
@@ -236,7 +240,22 @@ struct Particles {
     anisotropy: f32,
 }
 
-/// The producer entry of the bed's particles.
+/// A row of upright strands, the bed's producer entry in place of particles: strand i stands
+/// `height` m tall on the foot `first + i * step`, a tube of `radius` m showing `albedo`.
+#[derive(Clone, Copy, Debug)]
+pub struct StrandRow {
+    pub count: u32,
+    pub first: Vec3,
+    pub step: Vec3,
+    pub height: f32,
+    pub radius: f32,
+    pub albedo: [f32; 3],
+}
+
+/// Segments of each of a [`StrandRow`]'s strands.
+const STRAND_SEGMENTS: u32 = 4;
+
+/// The producer entry of the bed's particles, or of its strands.
 const PARTICLES: ProducerId = ProducerId(0);
 
 /// `SceneDesc::producer_capacity` of every bed scene.
@@ -285,7 +304,7 @@ pub const BARE_LEAF: &str = "bare leaf";
 /// a small opaque quad 2 m below it.
 pub const MASKED_PANE: &str = "masked pane";
 /// [`LEAF`] without its opacity texture, its material naming linked surface 2, whose
-/// coverage works the rings out from the uv.
+/// coverage works the texture's alpha test out from the uv.
 pub const RINGS_LEAF: &str = "rings leaf";
 /// [`LEAF`] without its opacity texture, its material naming linked surface 3, whose
 /// coverage is a quarter everywhere.
@@ -346,9 +365,10 @@ pub const PRISM_IOR: f32 = 1.6;
 pub const PRISM_ABBE: f32 = 20.0;
 pub const PRISM_HALF_HEIGHT: f32 = 1.0;
 /// A white emitter of [`EMITTER_LUMINANCE`] facing +z: a strip 2 [`LINE_HALF_WIDTH`] wide
-/// and 2 [`LINE_HALF_HEIGHT`] tall.
+/// and 2 [`LINE_HALF_HEIGHT`] tall, both on the cook's 2^-11 m position grid, so the cooked
+/// strip has the size a CPU model takes from them.
 pub const LINE: &str = "line";
-pub const LINE_HALF_WIDTH: f32 = 0.01;
+pub const LINE_HALF_WIDTH: f32 = 20.0 / 2048.0;
 pub const LINE_HALF_HEIGHT: f32 = 2.0;
 
 /// The corners of [`PRISM`]'s cross section in the xz plane: an equilateral triangle of
@@ -1454,6 +1474,118 @@ fn pack() -> &'static Arc<[u8]> {
     PACK.get_or_init(cook)
 }
 
+/// [`FLOOR`]'s square with a color at each vertex, red at -x to green at +x, that its material's
+/// base color reads; a model of the feature pack ([`Bed::with_features`]).
+pub const TINTED_FLOOR: &str = "tinted floor";
+
+/// [`FLOOR`]'s square with a set of two tiles for its base color, which [`Bed::with_features`]
+/// binds in place of its own material: a dark tile under the half at -x and a bright one under
+/// the half at +x. A model of the feature pack.
+pub const TILED_FLOOR: &str = "tiled floor";
+
+/// The material of the feature pack that [`TILED_FLOOR`] shows.
+const TILED: &str = "tiled";
+
+/// [`TILED`]'s document beside its base color's two tiles, one file per unit square of uv.
+fn tiled_mtlx() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("orr_lighting_bed_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (tile, level) in [(1001, 32u8), (1002, 224)] {
+        let path = dir.join(format!("tiled.{tile}.png"));
+        let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 4, 4);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        let texels: Vec<u8> = (0..16u8).flat_map(|i| [level + 8 * (i % 2); 3]).collect();
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&texels)
+            .unwrap();
+    }
+    let path = dir.join("tiled.mtlx");
+    let doc = r#"<?xml version="1.0"?>
+<materialx version="1.39">
+  <image name="i" type="color3">
+    <input name="file" type="filename" value="tiled.&lt;UDIM&gt;.png" colorspace="srgb_texture"/>
+  </image>
+  <open_pbr_surface name="S" type="surfaceshader">
+    <input name="base_color" type="color3" nodename="i"/>
+    <input name="specular_weight" type="float" value="0"/>
+  </open_pbr_surface>
+  <surfacematerial name="M" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="S"/>
+  </surfacematerial>
+</materialx>
+"#;
+    std::fs::write(&path, doc).unwrap();
+    path
+}
+
+/// A pack of what the bed's own leaves out, which [`Bed::with_features`] alone mounts beside
+/// it: a scene may hold what any material of a mounted pack shows, so these stay out of every
+/// other bed's scenes and their pipelines.
+fn feature_pack() -> &'static Arc<[u8]> {
+    static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
+    PACK.get_or_init(|| {
+        let mut tinted = mesh(|b| b.quad(0, square(5.0, 0.0), Vec3::Y, 8));
+        let colors = tinted.positions.iter().map(|p| {
+            let t = (p.x + 5.0) / 10.0;
+            orr_math::Vec4::new(1.0 - t, t, 0.1, 1.0)
+        });
+        tinted.colors = Some(colors.collect());
+        let mut material = diffuse([0.8; 3]);
+        material.textures[slot::BASE_COLOR].vertex = 1;
+        // Across x the tiled floor's uv runs over two unit squares, inside both.
+        let mut tiled = mesh(|b| b.quad(0, square(5.0, 0.0), Vec3::Y, 8));
+        for uv in tiled.uvs.iter_mut().flatten() {
+            *uv = Vec2::new(0.05 + 1.9 * uv.x, 0.05 + 0.9 * uv.y);
+        }
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::Memory,
+                vec![
+                    AssetSpec {
+                        name: TINTED_FLOOR.into(),
+                        source: Source::Mesh {
+                            mesh: tinted,
+                            materials: vec![material],
+                            settings: MeshSettings::default(),
+                        },
+                    },
+                    AssetSpec {
+                        name: TILED_FLOOR.into(),
+                        source: Source::Mesh {
+                            mesh: tiled,
+                            materials: vec![diffuse([0.8; 3])],
+                            settings: MeshSettings::default(),
+                        },
+                    },
+                    AssetSpec {
+                        name: TILED.into(),
+                        source: Source::MaterialX {
+                            path: tiled_mtlx(),
+                            material: "M".into(),
+                            textures: TextureRules::default(),
+                        },
+                    },
+                ],
+            )],
+        };
+        orr_cook::cook(&manifest, &Default::default())
+            .unwrap()
+            .memory
+            .remove(0)
+    })
+}
+
+/// A decal of a bed scene: the base color of model `material`'s material, projected down
+/// onto the surfaces within `half_extent` of `center` that face up.
+#[derive(Clone, Copy, Debug)]
+pub struct FloorDecal {
+    pub material: &'static str,
+    pub center: Vec3,
+    pub half_extent: Vec3,
+}
+
 fn time(frame: u64) -> FrameTime {
     FrameTime {
         absolute: frame as f64 / 60.0,
@@ -1514,10 +1646,7 @@ impl BedFrame<'_> {
             dof_background: None,
             frosted_glass: false,
             overlay_front: false,
-            walking_materials: self.view.walking_materials,
-            interior_materials: self.view.interior_materials,
-            scattering_interiors: self.view.scattering_interiors,
-            medium_proxies: self.view.medium_proxies,
+            scene_features: self.view.features,
             particle_lighting: self.particles,
         }
     }
@@ -1753,6 +1882,7 @@ pub struct Bed {
     particle_group: TransformGroupId,
     particles: Option<Particles>,
     _workers: Workers,
+    _permit: ScenePermit,
 }
 
 impl Bed {
@@ -1779,29 +1909,58 @@ impl Bed {
         rt_range: f32,
         linked: impl FnOnce(&mut SceneWriter<'_>),
     ) -> Self {
+        Self::build(spec, renderer, rt_range, None, linked)
+    }
+
+    /// As [`Self::with`], with the feature pack mounted beside the bed's, whose models `spec`
+    /// may place too, and `decals` on the scene.
+    pub fn with_features(spec: Spec, decals: &[FloorDecal]) -> Self {
+        Self::build(
+            spec,
+            &RendererDesc::default(),
+            RT_RANGE,
+            Some(decals),
+            |_| {},
+        )
+    }
+
+    /// The bed of [`Self::with_linked`]; with `features`, of [`Self::with_features`].
+    fn build(
+        spec: Spec,
+        renderer: &RendererDesc,
+        rt_range: f32,
+        features: Option<&[FloorDecal]>,
+        linked: impl FnOnce(&mut SceneWriter<'_>),
+    ) -> Self {
         let kernels = renderer.kernels;
         let d = device();
+        let permit = ScenePermit::take();
         let mut scenes = Scenes::new(d, renderer).unwrap();
         let workers = Workers::start(&scenes);
-        let mount = scenes.mount(PackSource::Memory(Arc::clone(pack())));
-        let start = Instant::now();
         let mut frame = 0;
-        while matches!(scenes.mount_state(mount), LoadState::Pending) {
-            frame += 1;
-            let f = scenes
-                .begin_frame(&FrameDesc {
-                    time: time(frame),
-                    scenes: &[],
-                    low_latency: None,
-                })
-                .unwrap();
-            f.end(&[]).unwrap();
-            assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        if let LoadState::Failed(e) = scenes.mount_state(mount) {
-            panic!("mount failed: {e}");
-        }
+        let mut mounted = |scenes: &mut Scenes, pack: &Arc<[u8]>| {
+            let mount = scenes.mount(PackSource::Memory(Arc::clone(pack)));
+            let start = Instant::now();
+            while matches!(scenes.mount_state(mount), LoadState::Pending) {
+                frame += 1;
+                let f = scenes
+                    .begin_frame(&FrameDesc {
+                        time: time(frame),
+                        scenes: &[],
+                        low_latency: None,
+                    })
+                    .unwrap();
+                f.end(&[]).unwrap();
+                assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if let LoadState::Failed(e) = scenes.mount_state(mount) {
+                panic!("mount failed: {e}");
+            }
+            mount
+        };
+        let mount = mounted(&mut scenes, pack());
+        let feature_mount = features.map(|_| mounted(&mut scenes, feature_pack()));
 
         let desc = SceneDesc {
             light_capacity: spec.lights.len().max(8) as u32,
@@ -1828,11 +1987,43 @@ impl Bed {
             .copies
             .iter()
             .map(|c| {
-                scenes
-                    .model(mount, AssetId::from_name(c.model))
-                    .unwrap_or_else(|e| panic!("model {}: {e}", c.model))
+                let id = AssetId::from_name(c.model);
+                let found = scenes.model(mount, id);
+                let found = match (found, feature_mount) {
+                    (Err(_), Some(features)) => scenes.model(features, id),
+                    (found, _) => found,
+                };
+                found.unwrap_or_else(|e| panic!("model {}: {e}", c.model))
             })
             .collect();
+        let decals: Vec<Decal> = features
+            .unwrap_or_default()
+            .iter()
+            .map(|decal| Decal {
+                center: decal.center.as_dvec3(),
+                // The box projects along its -z: down.
+                rotation: Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+                half_extent: decal.half_extent,
+                material: scenes
+                    .material(
+                        mount,
+                        AssetId::from_name(&format!("{}/material/0", decal.material)),
+                    )
+                    .unwrap_or_else(|e| panic!("material {}: {e}", decal.material)),
+                channels: DecalChannels::BASE_COLOR,
+                opacity: 1.0,
+                fade_angles: [1.0, 1.4],
+                depth_fade: 0.0,
+            })
+            .collect();
+        // The tiled floor shows the feature pack's tiled material, as material set 0.
+        let tiled = feature_mount
+            .filter(|_| spec.copies.iter().any(|c| c.model == TILED_FLOOR))
+            .map(|features| {
+                scenes
+                    .material(features, AssetId::from_name(TILED))
+                    .unwrap_or_else(|e| panic!("material {TILED}: {e}"))
+            });
         frame += 1;
         let list = [scene];
         let f = scenes
@@ -1843,6 +2034,9 @@ impl Bed {
             })
             .unwrap();
         let mut w = f.scene(scene).unwrap();
+        if let Some(material) = tiled {
+            w.material_sets(0, 1).unwrap()[0] = material;
+        }
         let group = w
             .create_transform_group(&TransformGroupDesc {
                 count: spec.copies.len() as u32,
@@ -1859,7 +2053,7 @@ impl Bed {
                 transforms: group,
                 first: i as u32,
                 pose: None,
-                material_set: None,
+                material_set: (c.model == TILED_FLOOR && tiled.is_some()).then_some(0),
                 flags: InstanceFlags::RASTER | InstanceFlags::RAY,
                 rt_range,
                 animation_range: 0.0,
@@ -1882,13 +2076,18 @@ impl Bed {
             w.set_environment(data.gpu());
         }
         linked(&mut w);
+        for (i, decal) in decals.iter().enumerate() {
+            w.set_decal(DecalId(i as u32), Some(decal)).unwrap();
+        }
         if let Some((at, pixels_per_radian)) = spec.focus {
             w.set_focus(at.as_dvec3());
             f.request_detail(scene, pixels_per_radian).unwrap();
         }
         drop(w);
         let point = f.end(&[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
 
         let lighting =
             SceneLighting::new(d, kernels, &desc, &SceneLightingSettings::default()).unwrap();
@@ -1899,7 +2098,9 @@ impl Bed {
             .layout(&LightingView::requests(EXTENT, false), &mut list)
             .unwrap();
         let point = render().submit(vec![list], &[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
         Self {
             spec,
             lighting,
@@ -1933,6 +2134,7 @@ impl Bed {
             particle_group,
             particles: None,
             _workers: workers,
+            _permit: permit,
         }
     }
 
@@ -1986,7 +2188,9 @@ impl Bed {
             .unwrap();
         }
         let point = f.end(&[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
     }
 
     /// The state the last frame left skinned entry `entry` in, the bed's skinned copies taking
@@ -2084,7 +2288,9 @@ impl Bed {
             .unwrap();
         }
         let point = f.end(&[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
         let mut list = device()
             .gpu_malloc::<[f32; 4]>(MemoryKind::Upload, u64::from(count.max(1)), "bed particles")
             .unwrap();
@@ -2098,6 +2304,61 @@ impl Bed {
             draw: ParticleDraw::new(device(), self.kernels).unwrap(),
             anisotropy,
         });
+    }
+
+    /// Makes the bed's producer entry `row`'s strands, opaque, which each frame's scene compute
+    /// emits; in place of particles and of a hook of [`Self::set_scene_compute`].
+    pub fn set_strands(&mut self, row: StrandRow) {
+        self.frame += 1;
+        let list = [self.scene];
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let mut m = MaterialGpu::zeroed();
+        m.base_color = row.albedo;
+        m.base_weight = 1.0;
+        let material = f.materials().create(&m).unwrap();
+        {
+            let mut w = f.scene(self.scene).unwrap();
+            w.transforms(self.particle_group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+            w.set_producer(
+                PARTICLES,
+                Some(&ProducerDesc {
+                    max_vertices: row.count * (STRAND_SEGMENTS + 1),
+                    max_segments: row.count * STRAND_SEGMENTS,
+                    update: ProducerUpdate::EveryFrame,
+                    materials: &[material],
+                    transform: (self.particle_group, 0),
+                    ..ProducerDesc::default()
+                }),
+            )
+            .unwrap();
+        }
+        let point = f.end(&[]).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
+        let emit = pipeline(&strands::MODULE, "main");
+        self.scene_compute = Some(Box::new(move |c| {
+            let root = c
+                .put_root(&strands::Root {
+                    scene: c.root,
+                    producer: PARTICLES.0,
+                    count: row.count,
+                    first: [row.first.x, row.first.y, row.first.z, row.height],
+                    step: [row.step.x, row.step.y, row.step.z, row.radius],
+                    segments: STRAND_SEGMENTS,
+                    base: 0,
+                    _pad: 0,
+                })
+                .unwrap();
+            c.cmd.dispatch(&emit, root, [row.count.div_ceil(64), 1, 1]);
+        }));
     }
 
     /// Runs `frames` frames of the scene, each recording `kernel` after the scene pass and
@@ -2396,7 +2657,9 @@ impl Bed {
             list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
         }
         let point = f.end(&[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
         let stats = self.lighting.stats(id).unwrap();
         assert_eq!(
             stats.photon_overflows, 0,
@@ -2544,7 +2807,17 @@ pub fn assert_within_noise(
 /// `settings`.
 pub struct Paths {
     kernels: &'static LightingKernels,
+    /// Where the kernels compile the path pipelines a frame first asks for.
+    loading: &'static orr_scene::Loading,
     pub settings: ViewLighting,
+    /// Frames run the pipelines made for each scene, as a view's default is, in place of
+    /// `settings.specialize`: set from `ORR_TEST_SPECIALIZED`. The beds' scenes are many and
+    /// small, so one set of pipelines runs them all without it.
+    pub specialize: bool,
+    /// Frames that run the pipelines made for their scene wait for its rest stage too, which
+    /// compiles behind everything else and would not be ready within a test: set from
+    /// `ORR_TEST_REST`.
+    pub rest: bool,
     /// The background layer request of every frame.
     pub dof_background: Option<DofBackgroundPass>,
     /// The depth-of-field guide every frame adds the frosted-glass term into.
@@ -2556,13 +2829,18 @@ pub struct Paths {
     pub every_tile: bool,
 }
 
+/// Threads that compile a bed's pipelines at once: the machine's.
+fn compile_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, std::num::NonZero::get)
+}
+
 impl Paths {
     /// The kernels of a set and entry compile once per process, on threads of their own, and
     /// stay: under the validation layer each compile takes minutes.
     pub fn new(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
         type Key = (Vec<usize>, PathEntry);
-        static COMPILED: Mutex<Vec<(Key, &'static OnceLock<LightingKernels>)>> =
-            Mutex::new(Vec::new());
+        type Compiled = (LightingKernels, Arc<orr_scene::Loading>);
+        static COMPILED: Mutex<Vec<(Key, &'static OnceLock<Compiled>)>> = Mutex::new(Vec::new());
         let key = (
             kernels
                 .modules
@@ -2581,22 +2859,34 @@ impl Paths {
             }
         };
         drop(compiled);
-        let kernels = slot.get_or_init(|| {
+        let (kernels, loading) = slot.get_or_init(|| {
             let tables = BsdfTables::new(device()).unwrap();
             let kernels: &'static KernelSet = Box::leak(Box::new(*kernels));
-            let loading = orr_scene::testing::loading();
+            let loading = Arc::new(orr_scene::testing::loading());
             let jobs = LightingKernels::spawn(device(), kernels, &tables, entry, &loading);
             std::thread::scope(|threads| {
-                for _ in 1..CompilingKernels::JOBS {
+                for _ in 1..compile_threads() {
                     threads.spawn(|| while loading.run_one() {});
                 }
                 jobs.wait(&loading);
             });
-            jobs.finish().unwrap()
+            let kernels = jobs.finish().unwrap();
+            // Every path pipeline compiles here, before any frame, so the beds' frames run
+            // the stages and kernels a view runs once its compiles have finished.
+            kernels.compile_rest();
+            std::thread::scope(|threads| {
+                for _ in 0..compile_threads() {
+                    threads.spawn(|| while loading.run_one() {});
+                }
+            });
+            (kernels, loading)
         });
         Self {
             kernels,
+            loading,
             settings,
+            specialize: std::env::var_os("ORR_TEST_SPECIALIZED").is_some(),
+            rest: std::env::var_os("ORR_TEST_REST").is_some(),
             dof_background: None,
             frost_guide: None,
             overlay_front: false,
@@ -2648,20 +2938,58 @@ impl Paths {
             Some(t) => t,
             None => &mut *f.target,
         };
-        let (lighting, settings) = (f.lighting, &self.settings);
+        let settings = &ViewLighting {
+            specialize: self.specialize,
+            ..self.settings
+        };
+        let lighting = f.lighting;
         target.begin(lighting, &f.desc, settings);
+        let needs = PathNeeds {
+            features: pass.scene_features,
+            frosted_glass: pass.frosted_glass,
+            dof_background: pass.dof_background.is_some(),
+            particle_lighting: pass.particle_lighting,
+        };
+        // A bed that runs specialized takes the pipelines made for exactly its scene.
+        let waits = settings.specialize
+            || !self
+                .kernels
+                .prepare_paths(lighting, &needs, settings)
+                .unwrap();
+        // The pipelines these paths first ask for compile on threads of their own, which go on
+        // with the compiles other beds wait for after this one's are ready: the frame records
+        // once they return, with its own pipelines held for it until then. They leave what is
+        // queued behind those, a rest stage's compile, to the frame that waits for it.
+        let waited = waits.then(|| {
+            std::thread::scope(|threads| {
+                for _ in 1..compile_threads() {
+                    threads.spawn(|| while self.loading.run_one_at(Urgency::Useful) {});
+                }
+                self.kernels.wait_paths(lighting, &needs, settings).unwrap()
+            })
+        });
+        if let Some(waited) = waited.as_ref().filter(|_| self.rest) {
+            self.kernels.wait_rest(waited).unwrap();
+        }
         self.kernels
             .record_media(list, lighting, target, pass, settings)
             .unwrap();
         self.kernels
             .record_paths(list, lighting, target, pass, settings)
             .unwrap();
+        // A frame that waited for its pipelines runs the ones made for exactly what it asked.
+        if let Some(ran) = target.paths_ran().filter(|_| settings.specialize) {
+            assert!(ran.exact(), "paths ran pipelines that hold more: {ran:x?}");
+        }
         let paths = Stages::COMPUTE | Stages::RAY;
         list.barrier(paths, Stages::COMPUTE, Hazards::empty());
         self.kernels
-            .record_media_apply(list, lighting, target, pass, settings);
+            .record_media_apply(list, lighting, target, pass, settings)
+            .unwrap();
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        self.kernels.record_guides(list, target, pass, settings);
+        self.kernels
+            .record_guides(list, target, pass, settings)
+            .unwrap();
         if let Some(g) = &self.frost_guide {
             g.fill(list);
             self.kernels
@@ -2747,7 +3075,9 @@ impl SpareView {
             .layout(&LightingView::requests(EXTENT, false), &mut list)
             .unwrap();
         let point = render().submit(vec![list], &[]).unwrap();
-        render().wait(point, Duration::from_secs(10)).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
         Self {
             view: LightingView::new(d, &arena).unwrap(),
             _arena: arena,

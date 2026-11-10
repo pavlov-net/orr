@@ -447,9 +447,3 @@ fn mount(bytes: &[u8]) -> BlobIn<'_> {
         ..BlobIn::new(bytes)
     }
 }
-
-/// The cook version of a class. It changes whenever the cook writes different bytes for the
-/// same inputs, and it enters every cook key of the class.
-pub fn cook_version(class: u16) -> u32 {
-    key::version(class)
-}
