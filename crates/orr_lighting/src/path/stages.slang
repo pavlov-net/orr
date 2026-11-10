@@ -1819,21 +1819,44 @@ struct ShadeState
 static const uint SHADE_VERTEX = 0;
 static const uint SHADE_EXIT = 1;
 
-// How a shade's next-event estimation traces its shadow ray.
-static const uint NEE_DEFER = 0;    // it leaves the ray: the trace stage or the walk stage does
-static const uint NEE_INLINE = 1;   // itself, through plane stacks; never a walk's exit, whose stage traces its ray
-
 // The shadow ray a vertex's next-event estimation left, and what weighs its light again where
 // the ray meets a plane stack.
 struct ShadeNee
 {
     bool traced;
+    // The vertex's stage traces the ray: through a plane stack the vertex's scatter weighs the
+    // light again, and an emitter's coat and fuzz pass its light on only where the ray reaches
+    // it, neither of which the trace stage keeps a light sample for.
+    bool here;
     PathShadowRay q;
     NeeDraw d;
     float run;
     bool weight_one;
     float3 throughput;              // the path's at the vertex
     float exterior_ior;             // of the medium the vertex lies in
+    VertexScatter scatter;          // the vertex's, with what a chain keeps of it
+    float3 keep;
+    bool chain;
+    Spectral spectral;              // the path's at the vertex
+}
+
+// No shadow ray, at a vertex that scatters by `scatter` on a path with `spectral`.
+ShadeNee no_nee(VertexScatter scatter, Spectral spectral)
+{
+    ShadeNee nee;
+    nee.traced = false;
+    nee.here = false;
+    nee.q = (PathShadowRay)0;
+    nee.d = (NeeDraw)0;
+    nee.run = 0.0;
+    nee.weight_one = false;
+    nee.throughput = float3(0.0);
+    nee.exterior_ior = 0.0;
+    nee.scatter = scatter;
+    nee.keep = float3(0.0);
+    nee.chain = false;
+    nee.spectral = spectral;
+    return nee;
 }
 
 // Resolves the vertex the trace stage's ray reached (a layer for `layer`), and takes its
@@ -1977,10 +2000,11 @@ bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, ino
 }
 
 // One iteration of the path from vertex `sv` of kind `kind`, with `X` a walk's exit
-// (`trace_path`'s loop body up to its trace): next-event estimation, whose shadow ray `nee_mode` places; the caustic photons'
-// light; and the vertex's next direction, which leaves `c.ray` for the trace stage, or with
-// `walking` starts a walk along `wi`. False where the path ends.
-bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout StagedRecord record, PathContext x, uint kind, uint nee_mode, inout Sampler rng, ShadeVertex sv, out bool walking, out float3 wi, out ShadeNee nee)
+// (`trace_path`'s loop body up to its trace): next-event estimation, whose shadow ray `nee`
+// holds for the vertex's stage or the trace stage; the caustic photons' light; and the vertex's
+// next direction, which leaves `c.ray` for the trace stage, or with `walking` starts a walk
+// along `wi`. False where the path ends.
+bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout StagedRecord record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv, out bool walking, out float3 wi, out ShadeNee nee)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
@@ -1988,7 +2012,6 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
     uint2 pixel = f.pixel;
     walking = false;
     wi = float3(0.0);
-    nee = (ShadeNee)0;
     LayerVertex l = sv.l;
     Bsdf b = sv.b;
     bool reference = x.reference;
@@ -2006,6 +2029,8 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
     bool leaving = kind == VERTEX_LEAVE;
     bool on_layer = kind == VERTEX_LAYER;
     bool alive = true;
+    VertexScatter vertex_scatter = { b, medium_vertex, -l.x.view, l.anisotropy, at_exit, sv.exit_scatter, leaving, sv.leave_scatter };
+    nee = no_nee(vertex_scatter, c.spectral);
     // A photon deposits where it meets a surface after a chain, and goes on only as one. Light
     // that next-event estimation takes through a plane stack is not deposited. No photon walks.
     if (X != SHADE_EXIT && x.photon)
@@ -2036,44 +2061,23 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
         bool chain = l.chains && !x.one_technique;
         bool no_environment = leaving && x.count_bsdf;
         float exterior = interior_ior(s, c.interior.innermost());
-        if (X != SHADE_EXIT && nee_mode == NEE_INLINE)
+        NeeDraw d = nee_draw<S>(r, at, scatter, pixel, local, candidates, keep, chain, rng, no_environment);
+        if (d.traced)
         {
-            uint light;
-            float3 e = shade_vertex_nee<S>(r, at, scatter, shadow, run, pixel, local, p.depth, candidates, weight_one, exterior, keep, chain, x.feedback, rng, p.rays, light, no_environment);
-            float3 added = c.spectral.color(p.throughput * e);
-            if (counted)
-                p.radiance += added;
-            if (light != NO_LIGHT)
-                record.light(light, luminance_rec2020(added));
-        }
-        else
-        {
-            NeeDraw d = nee_draw<S>(r, at, scatter, pixel, local, candidates, keep, chain, rng, no_environment);
-            if (d.traced)
-            {
-                count_ray(p);
-                float mis = weight_one ? 1.0 : mis_balance(run * d.chosen.pdf, d.scatter_pdf);
-                PathShadowRay q = shadow_ray<CoverageFeedback<S>, M>(d, d.W * mis / run, shadow, l.x.surface.position, p.throughput, p.depth, x.feedback, counted);
-                // An emitter's coat and fuzz pass its light on only where the ray reaches it, and
-                // the trace stage keeps no light sample to ask them with: a ray to such an emitter
-                // is traced here. A walk's exit traces its own.
-                if (X != SHADE_EXIT && may(MAY_EMISSIVE) && may_any(MAY_COAT | MAY_FUZZ) && d.chosen.view)
-                {
-                    StackLight stack;
-                    float3 vis = emitter_view<CoverageFeedback<S>>(r, d.chosen, exterior, shadow_trace<S, M>(r, q, stack));
-                    shadow_add(q, c.spectral.color(q.contribution * vis), p, record);
-                }
-                else
-                {
-                    nee.traced = true;
-                    nee.q = q;
-                    nee.d = d;
-                    nee.run = run;
-                    nee.weight_one = weight_one;
-                    nee.throughput = p.throughput;
-                    nee.exterior_ior = exterior;
-                }
-            }
+            count_ray(p);
+            float mis = weight_one ? 1.0 : mis_balance(run * d.chosen.pdf, d.scatter_pdf);
+            nee.traced = true;
+            nee.here = X != SHADE_EXIT && (stack_tracked(r) || (may(MAY_EMISSIVE) && may_any(MAY_COAT | MAY_FUZZ) && d.chosen.view));
+            nee.q = shadow_ray<CoverageFeedback<S>, M>(d, d.W * mis / run, shadow, l.x.surface.position, p.throughput, p.depth, x.feedback, counted);
+            nee.d = d;
+            nee.run = run;
+            nee.weight_one = weight_one;
+            nee.throughput = p.throughput;
+            nee.exterior_ior = exterior;
+            nee.scatter = scatter;
+            nee.keep = keep;
+            nee.chain = chain;
+            nee.spectral = c.spectral;
         }
     }
     // The caustic photons' light at the vertex's diffuse lobes, which is indirect.
@@ -2201,7 +2205,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
         if (crossed)
         {
             past.cross(l.section, l.front, l.x.surface.medium_point);
-            if (nee.traced)
+            if (nee.traced && !nee.here)
                 p.flags |= LOOP_CROSS | (l.front ? LOOP_CROSS_FRONT : 0);
             else
                 c.interior = past;
@@ -2346,25 +2350,30 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, 
         }
         set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
     }
-    // Through a plane stack the vertex's BSDF weighs the light again past its shadow ray.
-    uint nee_mode = stack_tracked(r) ? NEE_INLINE : NEE_DEFER;
     bool walking;
     float3 wi;
     ShadeNee nee;
-    bool alive = shade_vertex<S, M, SHADE_VERTEX>(r, f, p, c, record, x, kind, nee_mode, rng, sv, walking, wi, nee);
+    bool alive = shade_vertex<S, M, SHADE_VERTEX>(r, f, p, c, record, x, kind, rng, sv, walking, wi, nee);
     p.rng = rng;
     // Only a vertex with a subsurface lobe, on a path that may walk, starts a walk: a pipeline
     // made for neither holds none of what follows.
-    if (K != QUEUE_OTHER && may(MAY_WALK) && may(MAY_SUBSURFACE) && alive && walking)
+    bool walks = K != QUEUE_OTHER && may(MAY_WALK) && may(MAY_SUBSURFACE) && alive && walking;
+    // A walk takes the place of the vertex's ray, and its stage resolves the vertex again from
+    // the hit the span holds: the vertex's shadow ray, which would take the span, is traced
+    // here, as one that `ShadeNee.here` names is.
+    if (nee.traced && (nee.here || walks))
     {
-        // The walk takes the place of the vertex's ray, and its stage resolves the vertex again
-        // from the hit the span holds: the vertex's shadow ray, which would take the span, is
-        // traced here.
-        if (nee.traced)
-        {
-            StackLight stack;
-            shadow_add(nee.q, c.spectral.color(nee.q.contribution * shadow_trace<S, M>(r, nee.q, stack)), p, record);
-        }
+        StackLight stack;
+        float3 vis = shadow_trace<S, M>(r, nee.q, stack);
+        float scatter_pdf;
+        float3 e = nee_bent(nee.d, nee.scatter, vis, stack, nee.keep, nee.chain, scatter_pdf);
+        float mis = nee.weight_one ? 1.0 : mis_balance(nee.run * nee.d.chosen.pdf, scatter_pdf);
+        float3 added = nee.throughput * (e * emitter_view<CoverageFeedback<S>>(r, nee.d.chosen, nee.exterior_ior, vis) * (nee.d.W * mis / nee.run));
+        shadow_add(nee.q, nee.spectral.color(added), p, record);
+        nee.traced = false;
+    }
+    if (walks)
+    {
         reached.wi = wi;
         store_walk(r, slot, reached);
         // The walk stage goes on from the interiors and stack the path holds here, which no stage
@@ -2423,7 +2432,8 @@ public void walk_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         SurfaceHit sh = resolve_hit<S>(s, v, dir, pending.hit.instance_index, uint(pending.hit.cluster_id), pending.hit.primitive_index, pending.hit.barycentrics, pending.positions, false, context);
         sv.l = opaque_vertex(hit_vertex(v, sh, dir));
     }
-    ShadeNee nee = (ShadeNee)0;
+    VertexScatter no_scatter = { sv.b, false, float3(0.0), 0.0, true, sv.exit_scatter, false, sv.leave_scatter };
+    ShadeNee nee = no_nee(no_scatter, c.spectral);
 
     Walk walk = walk_from(sv.l.x, vertex_params(sv.l, p.opaque > 1 && !x.reference), entry.wi, rng);
     for (uint k = 0; k <= walk_points(r) && walk.kind == WALK_RUNNING; k++)
@@ -2463,7 +2473,7 @@ public void walk_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
         bool walking;
         float3 wi;
-        alive = shade_vertex<S, M, SHADE_EXIT>(r, f, p, c, record, x, VERTEX_OPAQUE, NEE_DEFER, rng, sv, walking, wi, nee);
+        alive = shade_vertex<S, M, SHADE_EXIT>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, walking, wi, nee);
     }
     if (nee.traced)
     {
