@@ -670,9 +670,20 @@ fn run(options: &Options) -> Option<Capture> {
 
     let gpu = device();
     let mut window = (!options.headless).then(|| Window::new(&title(&camera), 1920, 1080));
+    let pixels = |name: &str, default: f32| {
+        std::env::var(name).map_or(default, |n| n.parse().expect("an error in pixels"))
+    };
+    let defaults = RendererDesc::default();
     let desc = RendererDesc {
         budgets: budgets(&pack),
-        ..RendererDesc::default()
+        raster_error_pixels: pixels("ZORAH_RASTER_PIXELS", defaults.raster_error_pixels),
+        rt_error_pixels: pixels("ZORAH_RT_PIXELS", defaults.rt_error_pixels),
+        rt_merge_pixels: pixels("ZORAH_RT_MERGE_PIXELS", defaults.rt_merge_pixels),
+        software_raster_pixels: pixels(
+            "ZORAH_SOFTWARE_RASTER_PIXELS",
+            defaults.software_raster_pixels,
+        ),
+        ..defaults
     };
     let mut display = window.as_ref().map(|w| {
         Display::new(
@@ -802,8 +813,22 @@ fn run(options: &Options) -> Option<Capture> {
         )
         .expect("headless target")
     });
+    use orr::LightingDebugView;
+    use orr::orr_lighting::GuideKind;
+    let debug_view = match std::env::var("ZORAH_DEBUG_VIEW").as_deref() {
+        Err(_) => LightingDebugView::None,
+        Ok("dielectric") => LightingDebugView::DielectricLayer,
+        Ok("bias") => LightingDebugView::RayOriginBias,
+        Ok("direct") => LightingDebugView::DirectOnly,
+        Ok("albedo") => LightingDebugView::Guide(GuideKind::DiffuseAlbedo),
+        Ok("specular") => LightingDebugView::Guide(GuideKind::SpecularAlbedo),
+        Ok("normal") => LightingDebugView::Guide(GuideKind::Normal),
+        Ok("roughness") => LightingDebugView::Guide(GuideKind::Roughness),
+        Ok(other) => panic!("ZORAH_DEBUG_VIEW {other}"),
+    };
     let lighting = ViewLighting {
         max_bounces: MAX_BOUNCES,
+        debug_view,
         ..ViewLighting::default()
     };
     let capture = options.headless || options.out.is_some();
