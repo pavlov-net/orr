@@ -29,6 +29,8 @@ struct App {
     looking: bool,
     /// Pointer motion while looking, in device units, since the last take.
     look: [f64; 2],
+    /// The pointer in the client area, in physical pixels; none outside it.
+    cursor: Option<[f64; 2]>,
 }
 
 impl ApplicationHandler for App {
@@ -60,6 +62,10 @@ impl ApplicationHandler for App {
                 button: MouseButton::Right,
                 ..
             } => self.looking = state == ElementState::Pressed,
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = Some([position.x, position.y]);
+            }
+            WindowEvent::CursorLeft { .. } => self.cursor = None,
             // Keys and buttons released elsewhere send no event here.
             WindowEvent::Focused(false) => {
                 self.held.clear();
@@ -121,6 +127,7 @@ impl Window {
                 held: HashSet::new(),
                 looking: false,
                 look: [0.0; 2],
+                cursor: None,
             },
             event_loop,
             title: title.to_owned(),
@@ -171,6 +178,13 @@ impl Window {
     /// call.
     pub fn take_look(&mut self) -> [f64; 2] {
         std::mem::take(&mut self.app.look)
+    }
+
+    /// The pixel under the pointer, in physical pixels of the client area; none while the
+    /// pointer is outside it.
+    pub fn cursor(&self) -> Option<[u32; 2]> {
+        let [x, y] = self.app.cursor?;
+        (x >= 0.0 && y >= 0.0).then_some([x as u32, y as u32])
     }
 
     /// [`Window::pump`], saying in the title how many path tracing kernels are still compiling

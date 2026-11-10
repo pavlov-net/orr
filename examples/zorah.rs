@@ -12,9 +12,12 @@
 //! and a later run with the same `FILE` cooks only what changed. `--cook-only` exits once the
 //! archive is written. Keys 1 and 2 jump to the export's two cameras: the RTX MG SDK view in
 //! `.scene.json` and the vk_lod_clusters view in `.cfg`. WASD moves, Q and E sink and rise,
-//! shift moves faster and dragging with the right mouse button looks around. Headless runs
+//! shift moves faster and dragging with the right mouse button looks around. C logs the view as a
+//! `--view` value and appends it to `zorah-views.txt` beside the executable; P probes the pixel
+//! under the pointer and logs the report, appending it to `zorah-probes.txt` there. Headless runs
 //! render 960 x 540 from the first camera, for 600 frames without `--frames`, and write the
-//! last frame as a PNG; a windowed run needs `--frames` to write one.
+//! last frame as a PNG; a windowed run needs `--frames` to write one. `--probe x,y` probes that
+//! output pixel on the last frame and logs the report likewise.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -176,6 +179,36 @@ fn note_view(camera: &Camera) {
         Ok(()) => {}
         Err(e) => log::warn!("{}: {e}", path.display()),
     }
+}
+
+/// Logs a pixel probe and appends it to `zorah-probes.txt` beside the executable.
+fn note_probe(camera: &Camera, probe: &orr::PixelProbe) {
+    use std::io::Write as _;
+    let report = format!("--view {}\n{probe}", camera.view());
+    log::info!("pixel probe\n{report}");
+    let path = std::env::current_exe()
+        .expect("executable path")
+        .with_file_name("zorah-probes.txt");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path);
+    match file.and_then(|mut f| writeln!(f, "{report}")) {
+        Ok(()) => {}
+        Err(e) => log::warn!("{}: {e}", path.display()),
+    }
+}
+
+/// `--probe`'s value: `x,y` in output pixels.
+fn parse_probe(value: &str) -> [u32; 2] {
+    let v: Vec<u32> = value
+        .split(',')
+        .map(|x| x.trim().parse().expect("a --probe pixel"))
+        .collect();
+    let [x, y] = v[..] else {
+        panic!("--probe takes x,y");
+    };
+    [x, y]
 }
 
 /// What the export's files say beyond the glTF.
@@ -967,6 +1000,9 @@ fn run(options: &Options) -> Option<Capture> {
             mib("ZORAH_CUT_TEXTURE_MIB"),
         )
     });
+    // The output pixel `--probe` probes on the last frame, and the one `P` asked for.
+    let probe_at = options.value("--probe").map(parse_probe);
+    let mut probe = None;
     for i in 0.. {
         if frames.is_some_and(|n| i >= n) {
             break;
@@ -1021,6 +1057,9 @@ fn run(options: &Options) -> Option<Capture> {
                 }
                 if key == KeyCode::KeyC {
                     note_view(&camera);
+                }
+                if key == KeyCode::KeyP {
+                    probe = w.cursor();
                 }
             }
             fly(w, &mut camera, dt as f32);
@@ -1080,6 +1119,12 @@ fn run(options: &Options) -> Option<Capture> {
             target,
         };
         let output = ViewOutput::default();
+        if final_frame && let Some(at) = probe_at {
+            probe = Some(at);
+        }
+        if let Some(at) = probe.take() {
+            f.probe(history, at);
+        }
         f.prepare_view(&view, &lighting, &output)
             .expect("prepare view");
         f.update_scenes(&mut |_| {}).expect("update scenes");
@@ -1093,6 +1138,10 @@ fn run(options: &Options) -> Option<Capture> {
         camera_cut = false;
         last = Some((id, f.end().expect("end frame")));
         streaming.step(&renderer, camera.name);
+        let completed = renderer.stats().frame;
+        for p in renderer.probes(history, completed) {
+            note_probe(&camera, &p);
+        }
     }
 
     if let Some(d) = display.as_ref() {
@@ -1103,6 +1152,23 @@ fn run(options: &Options) -> Option<Capture> {
             .expect("render queue")
             .wait(point, Duration::from_secs(10))
             .expect("wait");
+    }
+    if let Some((id, _)) = last.filter(|_| probe_at.is_some()) {
+        // A frame of no scene takes the probed frame's feedback to the loading side's plan, which
+        // the probe reports.
+        frame += 1;
+        renderer
+            .begin_frame(FrameDesc {
+                time: fixed_time(frame),
+                scenes: &[],
+                display: None,
+            })
+            .expect("begin frame")
+            .end()
+            .expect("end frame");
+        for p in renderer.probes(history, id) {
+            note_probe(&camera, &p);
+        }
     }
     let captured = last
         .filter(|_| capture)
