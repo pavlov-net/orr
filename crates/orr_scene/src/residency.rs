@@ -784,7 +784,8 @@ impl Residency {
         // that moment. Evicting gets memory back only where it empties whole blocks, so the cut
         // a period later asks for the excess still there times the share of its bytes the last
         // one got back: a cut that got nothing back is not repeated, and the budgets hold where
-        // they are until the heap has room again.
+        // they are until the heap has room again. Back under the mark the record goes, so the
+        // next time the heap passes it starts with a whole cut.
         for (h, &(usage, budget)) in heaps.iter().enumerate() {
             let on: Vec<usize> = (0..CLASSES)
                 .filter(|&c| self.limits.heaps[c] & (1 << h) != 0)
@@ -797,6 +798,7 @@ impl Residency {
             }
             let mark = budget / 10 * MARK_TENTHS;
             if usage <= mark {
+                self.cut[h] = None;
                 for &c in &on {
                     budgets[c] = budgets[c].min(self.used[c].saturating_add(mark - usage));
                 }
@@ -2462,6 +2464,34 @@ mod tests {
         // At 85% of the heap's budget a class far over its floor gets room the next step.
         r.react(third + period + 1, &heap(850));
         assert_eq!(budgets(&r), (350, 150));
+        check(&r);
+    }
+
+    /// A cut whose share came back short scales the next cut of its pass over the mark, but
+    /// once the heap is under its mark the next pass starts with a whole cut.
+    #[test]
+    fn a_pass_over_the_mark_after_the_heap_was_under_it_cuts_the_whole_excess() {
+        let period = response_period(2);
+        let mut r = Residency::new(limits(400));
+        let units: Vec<UnitDesc> = (0..4).map(|_| unit(100, &[], Start::Absent)).collect();
+        r.register(M, &units).unwrap();
+        let loaded = [0, 1, 2, 3];
+        step(&mut r, &loaded, 1);
+        // Locked, nothing can go, so the budget stays under what the units use.
+        for k in loaded {
+            r.lock(key(k));
+        }
+        r.react(1, &heap(1200));
+        assert_eq!(class(&r).budget, 100);
+        // 250 of the 300 asked came back, and the 300 the budget leaves in use are asked again.
+        let second = 1 + period;
+        r.react(second, &heap(950));
+        assert_eq!(class(&r).budget, 100);
+        r.react(second + 1, &heap(880));
+        assert_eq!(class(&r).budget, 400, "the room under the mark");
+        // The pass before got back 70 of 300; this one asks for all 400 over the mark.
+        r.react(second + period + 1, &heap(1300));
+        assert_eq!(class(&r).budget, 50, "the floor");
         check(&r);
     }
 
