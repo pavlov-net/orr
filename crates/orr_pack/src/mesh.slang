@@ -121,7 +121,7 @@ public struct Node
     public int group;              // -1 for an internal node
 }
 
-// 32 B. A DAG group: clusters `first_cluster..first_cluster + cluster_count` of page `page`,
+// 36 B. A DAG group: clusters `first_cluster..first_cluster + cluster_count` of page `page`,
 // each with `simplified` and `error` as its parent bounds.
 public struct Group
 {
@@ -131,8 +131,8 @@ public struct Group
     public uint16_t first_cluster;
     public uint16_t cluster_count;
     public uint8_t depth;          // simplification steps from the stage's source geometry
-    public uint8_t _pad;
-    public uint16_t node_page;     // the node page holding its leaf; 0 in a resident hierarchy
+    public uint8_t _pad[3];
+    public uint node_page;         // the node page holding its leaf; 0 in a resident hierarchy
 }
 
 // 16 B. Nodes `first_node..first_node + node_count` of a paged hierarchy.

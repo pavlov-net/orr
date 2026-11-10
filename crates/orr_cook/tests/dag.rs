@@ -224,7 +224,7 @@ fn check_structure(d: &Dag) -> Vec<u64> {
             .position(|p| (p.first_node..p.first_node + p.node_count).contains(&(i as u32)))
             .unwrap_or(0);
         let g = &info.groups[g];
-        assert_eq!(usize::from(g.node_page), page);
+        assert_eq!(g.node_page as usize, page);
         assert!(g.page as usize >= pinned || page == 0, "{g:?}");
     }
     d.part_triangles_per_depth()

@@ -1088,7 +1088,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         .collect();
     let mut leaf_pages = vec![Vec::new(); info.pages.len()];
     for g in groups.iter().filter(|g| g.node_page != 0) {
-        leaf_pages[g.page as usize].push(u32::from(g.node_page));
+        leaf_pages[g.page as usize].push(g.node_page);
     }
     let page_units = info
         .pages

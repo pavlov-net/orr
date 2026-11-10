@@ -1149,7 +1149,7 @@ fn check_dome(scenes: &Scenes, gpu: &Gpu<'_>, models: &[ModelId], info: &MeshInf
         let (nodes, pages) = tables(scenes, gpu, m);
         for g in &info.groups {
             assert!(
-                pages[g.page as usize] == 0 || nodes[usize::from(g.node_page)] != 0,
+                pages[g.page as usize] == 0 || nodes[g.node_page as usize] != 0,
                 "page {} is resident without node page {}",
                 g.page,
                 g.node_page

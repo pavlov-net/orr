@@ -35,7 +35,7 @@ pub use omm::*;
 use crate::blob::{put_table, put_table_aligned, read, table};
 use crate::{Aabb, Error, Result, Span, Sphere};
 
-pub const SCHEMA: u16 = 7;
+pub const SCHEMA: u16 = 8;
 
 /// Largest streamed hierarchy node page. The top page holds what the pinned pages need,
 /// whatever its size.
@@ -280,10 +280,10 @@ pub struct Group {
     pub cluster_count: u16,
     /// Simplification steps from the stage's source geometry.
     pub depth: u8,
-    pub _pad: u8,
+    pub _pad: [u8; 3],
     /// The node page holding the group's leaf; 0, the top page, where the hierarchy is
     /// resident and for every group in a pinned page.
-    pub node_page: u16,
+    pub node_page: u32,
 }
 
 /// A page of hierarchy nodes: a contiguous node range whose parents all sit in one page.
@@ -303,7 +303,7 @@ impl NodePage {
 }
 
 const _: () = assert!(size_of::<Node>() == 32);
-const _: () = assert!(size_of::<Group>() == 32);
+const _: () = assert!(size_of::<Group>() == 36);
 
 /// Header of a resident page.
 #[repr(C)]
@@ -614,8 +614,7 @@ impl MeshInfo {
                 return Err(Error::Malformed("group outside its page"));
             }
             let pages = self.node_pages.len().max(1);
-            if usize::from(g.node_page) >= pages || ((g.page as usize) < pinned && g.node_page != 0)
-            {
+            if g.node_page as usize >= pages || ((g.page as usize) < pinned && g.node_page != 0) {
                 return Err(Error::Malformed("group node page"));
             }
         }

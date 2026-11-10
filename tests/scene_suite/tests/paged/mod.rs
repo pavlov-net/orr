@@ -63,7 +63,7 @@ pub(crate) fn split_hierarchy(pack: &Arc<[u8]>, mesh: AssetId) -> Arc<[u8]> {
         assert!(floor < nodes.len(), "nodes lie below the top page");
         for (i, n) in nodes.iter().enumerate() {
             if let Ok(g) = usize::try_from(n.group) {
-                info.groups[g].node_page = u16::from(i >= floor);
+                info.groups[g].node_page = u32::from(i >= floor);
             }
         }
         let first_blob = 1 + info.pages.len() as u32;

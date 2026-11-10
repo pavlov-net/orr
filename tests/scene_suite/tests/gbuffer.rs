@@ -5428,7 +5428,7 @@ impl CpuMesh {
     /// holds its leaf are.
     fn drawable(&self, g: u32, r: &Resident) -> bool {
         let g = &self.groups[g as usize];
-        r.pages[g.page as usize] && r.nodes[usize::from(g.node_page)]
+        r.pages[g.page as usize] && r.nodes[g.node_page as usize]
     }
 
     /// Whether `c` stands in for the clusters of the group it was simplified from: that group
@@ -6014,7 +6014,7 @@ fn stand_in(bytes: &Arc<[u8]>, paged: bool) {
         }
         for g in &m.groups {
             assert!(
-                !resident.pages[g.page as usize] || resident.nodes[usize::from(g.node_page)],
+                !resident.pages[g.page as usize] || resident.nodes[g.node_page as usize],
                 "frame {frame}: page {} is resident without node page {}",
                 g.page,
                 g.node_page

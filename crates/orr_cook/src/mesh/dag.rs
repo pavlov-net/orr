@@ -986,7 +986,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
                     first_cluster,
                     cluster_count: g.clusters.len() as u16,
                     depth: u8::try_from(g.depth).map_err(|_| format!("DAG depth {}", g.depth))?,
-                    _pad: 0,
+                    _pad: [0; 3],
                     node_page: 0,
                 };
                 first_cluster += g.clusters.len() as u16;
@@ -1095,16 +1095,9 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
     } else {
         let per_page = NODE_PAGE_MAX / size_of::<Node>();
         let (table, blobs, page_of) = node_pages(&nodes, floor, pages.len() as u32 + 1, per_page);
-        if table.len() > 1 << 16 {
-            return Err(format!(
-                "{} hierarchy node pages, over the {} a group names",
-                table.len(),
-                1 << 16
-            ));
-        }
         for (n, &page) in nodes.iter().zip(&page_of) {
             if let Ok(g) = usize::try_from(n.group) {
-                group_table[g].node_page = page as u16;
+                group_table[g].node_page = page;
             }
         }
         (Vec::new(), table, blobs)
