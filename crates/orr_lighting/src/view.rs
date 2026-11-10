@@ -1541,6 +1541,15 @@ impl LightingKernels {
         }
     }
 
+    /// Queues every path pipeline no view has asked for yet: what [`Self::prepare_paths`] queues
+    /// once a view's own are ready. A caller that compiles ahead of its first frame calls this
+    /// and runs the loading side's jobs.
+    pub fn compile_rest(&self) {
+        if let PathKernels::Staged(k) = &self.paths {
+            Self::start_background(k, true);
+        }
+    }
+
     /// Queues, behind the pipelines a view asked for, the ones that take minutes on a first run
     /// and that paths do without until they are ready: the staged loop's tail stage, the single
     /// kernels of the update paths and the photons, and with `specialize` the stages that may

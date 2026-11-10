@@ -2592,7 +2592,16 @@ impl Paths {
                 }
                 jobs.wait(&loading);
             });
-            (jobs.finish().unwrap(), loading)
+            let kernels = jobs.finish().unwrap();
+            // Every path pipeline compiles here, before any frame, so the beds' frames run
+            // the stages and kernels a view runs once its compiles have finished.
+            kernels.compile_rest();
+            std::thread::scope(|threads| {
+                for _ in 0..CompilingKernels::JOBS {
+                    threads.spawn(|| while loading.run_one() {});
+                }
+            });
+            (kernels, loading)
         });
         Self {
             kernels,
