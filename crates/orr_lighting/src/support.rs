@@ -130,11 +130,12 @@ impl Runs {
     }
 }
 
-/// The masked kernels and the mask a frame runs them with.
+/// The masked kernels, the mask a frame runs them with and which of them it runs.
 #[derive(Clone, Copy)]
 pub(crate) struct MaskedFrame<'a> {
     pub(crate) kernels: &'a MaskedSupport,
     pub(crate) may: u64,
+    pub(crate) runs: Runs,
 }
 
 impl MaskedFrame<'_> {

@@ -663,7 +663,7 @@ impl MediaKernels {
         }
         // The light pass's pipeline is made for what the scene may hold; a view that did not ask
         // for it ahead waits for it here.
-        let light = if readers.lit {
+        let light = if masked.runs.froxel_light {
             Some(masked.take(Masked::FroxelLight)?)
         } else {
             None
@@ -822,7 +822,8 @@ impl MediaKernels {
         let particles = self.particle_lighting(media, readers, scene, pass, lighting, guides);
         let particles = media.particles.write(slot, particles);
         let mode = apply_mode(lighting);
-        if !readers.fogged || mode == MEDIA_OFF {
+        // Where the frame's froxel passes ran for a reader of the fog and the view shows it.
+        if !readers.fogged || !masked.runs.media_apply {
             return Ok(());
         }
         let set = masked.take(Masked::MediaApply)?;

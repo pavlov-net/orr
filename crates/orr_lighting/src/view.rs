@@ -1419,10 +1419,7 @@ fn support_may(
         | MAY_LOCAL
         | MAY_CACHE;
     let reference = lighting.reference.is_some();
-    let lens = lighting
-        .reference
-        .and_then(|r| r.lens)
-        .is_some_and(|l| l.aperture_radius > 0.0);
+    let lens = traces_lens(lighting);
     let froxels = !reference && fogged(linked_medium, features, lighting);
     // The scene decides the whole high word.
     (u64::from(u32::MAX) & !DECIDED)
@@ -1437,20 +1434,27 @@ fn support_may(
         | bit(!reference, MAY_CACHE)
 }
 
+/// Whether `lighting`'s reference traces its camera rays through a lens: one with no aperture
+/// is the pinhole the G-buffer was rastered through.
+fn traces_lens(lighting: &ViewLighting) -> bool {
+    lighting
+        .reference
+        .and_then(|r| r.lens)
+        .is_some_and(|l| l.aperture_radius > 0.0)
+}
+
 /// Which masked support kernels a frame of a scene that may hold `features` runs under
-/// `lighting`, with [`ViewPass::particle_lighting`] as `particle_lighting`. The layer guides run
-/// where a tile can be listed: the scene may hold a layer, or the view names the eye's interior
-/// or has a lens, which list every tile.
+/// `lighting`, with [`ViewPass::particle_lighting`] as `particle_lighting`: what a view asks for
+/// ahead and what its frame's records take. The layer guides run where a tile can be listed:
+/// the scene may hold a layer, or the view names the eye's interior or traces a lens, which list
+/// every tile.
 fn support_runs(
     masked: &MaskedSupport,
     features: SceneFeatures,
     particle_lighting: bool,
     lighting: &ViewLighting,
 ) -> Runs {
-    let lens = lighting
-        .reference
-        .and_then(|r| r.lens)
-        .is_some_and(|l| l.aperture_radius > 0.0);
+    let lens = traces_lens(lighting);
     let readers = readers(
         masked.linked_medium(),
         features,
@@ -1515,10 +1519,7 @@ impl StagedPaths {
         }
         let features = needs.features;
         let reference = lighting.reference.is_some();
-        let lens = lighting
-            .reference
-            .and_then(|r| r.lens)
-            .is_some_and(|l| l.aperture_radius > 0.0);
+        let lens = traces_lens(lighting);
         let froxels = !reference && fogged(self.linked_medium, features, lighting);
         let path = path_features(features, lighting);
         let shared = scene_may(features)
@@ -1667,7 +1668,8 @@ impl LightingKernels {
         self.support.masked.start_general();
     }
 
-    /// The masked support kernels with the mask of `pass`'s frame under `lighting`.
+    /// The masked support kernels with the mask of `pass`'s frame under `lighting`, and
+    /// which of them the frame runs.
     fn masked_frame(&self, pass: &ViewPass, lighting: &ViewLighting) -> MaskedFrame<'_> {
         let kernels = &*self.support.masked;
         MaskedFrame {
@@ -1676,6 +1678,12 @@ impl LightingKernels {
                 kernels.linked_medium(),
                 pass.scene_features,
                 pass.frosted_glass,
+                lighting,
+            ),
+            runs: support_runs(
+                kernels,
+                pass.scene_features,
+                pass.particle_lighting,
                 lighting,
             ),
         }
@@ -2069,7 +2077,7 @@ impl LightingKernels {
                 .record_photons(list, scene, view, pass, lighting, &path_root, photons)?,
             ..path_root
         };
-        self.record_layers(list, view, pass, lighting, lens.is_some(), &path_root)?;
+        self.record_layers(list, view, pass, lighting, &path_root)?;
         let update_root = (!reference).then_some(PathRoot {
             mode: 0,
             local: GpuPtr::NULL,
@@ -2297,7 +2305,6 @@ impl LightingKernels {
         view: &mut LightingView,
         pass: &ViewPass,
         lighting: &ViewLighting,
-        lens: bool,
         path: &PathRoot,
     ) -> Result<(), Error> {
         let masked = self.masked_frame(pass, lighting);
@@ -2308,17 +2315,14 @@ impl LightingKernels {
             "the layer guides' root asks for {asks:#x}, beyond the {may:#x} their pipeline holds"
         );
         // No tile is listed where the scene holds no layer and the view lists none itself.
-        let listed = pass.scene_features.contains(SceneFeatures::LAYERS)
-            || lighting.camera_medium.is_some()
-            || lens;
-        let guides = if listed {
+        let guides = if masked.runs.layer_guides {
             Some(masked.take(Masked::LayerGuides)?)
         } else {
             None
         };
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         let mut tile_flags = 0;
-        if lighting.camera_medium.is_some() || lens {
+        if lighting.camera_medium.is_some() || traces_lens(lighting) {
             tile_flags |= LAYER_TILES_EVERYWHERE;
         }
         let tiles_root = view.layer_tile_roots.write(
