@@ -436,19 +436,31 @@ impl MediaKernels {
         })
     }
 
-    /// What reads the froxels of `pass`. A debug view of them reads all of them, and the
-    /// interior a view names counts as one that scatters.
-    fn readers(&self, pass: &ViewPass, lighting: &ViewLighting) -> Readers {
-        let scatters = self.linked_medium
-            || pass.scene_features.contains(SceneFeatures::MEDIUM_PROXIES)
-            || pass.smoke_args.is_some()
+    /// Whether a medium that scatters may lie on a camera segment of a scene that may hold
+    /// `features`.
+    fn scatters(&self, features: SceneFeatures, lighting: &ViewLighting) -> bool {
+        self.linked_medium
+            || features.contains(SceneFeatures::MEDIUM_PROXIES)
+            || features.contains(SceneFeatures::SMOKE)
             || lighting.camera_medium.is_some()
             || matches!(
                 lighting.debug_view,
                 LightingDebugView::Media | LightingDebugView::Froxels
-            );
+            )
+    }
+
+    /// Whether a camera segment of a scene that may hold `features` can hold a medium: then a
+    /// frame's froxels hold it, and its paths read them.
+    pub(crate) fn fogged(&self, features: SceneFeatures, lighting: &ViewLighting) -> bool {
+        self.scatters(features, lighting) || features.contains(SceneFeatures::INTERIORS)
+    }
+
+    /// What reads the froxels of `pass`. A debug view of them reads all of them, and the
+    /// interior a view names counts as one that scatters.
+    fn readers(&self, pass: &ViewPass, lighting: &ViewLighting) -> Readers {
+        let scatters = self.scatters(pass.scene_features, lighting);
         Readers {
-            fogged: scatters || pass.scene_features.contains(SceneFeatures::INTERIORS),
+            fogged: self.fogged(pass.scene_features, lighting),
             lit: scatters
                 || pass
                     .scene_features

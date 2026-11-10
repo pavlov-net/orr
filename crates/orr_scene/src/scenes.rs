@@ -2147,8 +2147,9 @@ impl<'a> Frame<'a> {
             .to_array();
         let (slots, smoke, scene_features) = {
             let cpu = scene.cpu.lock().unwrap();
-            let smoke = cpu.producers.iter().flatten().any(|p| p.smoke);
-            (cpu.ptlas.high_water, smoke, cpu.features())
+            let features = cpu.features();
+            let smoke = features.contains(SceneFeatures::SMOKE);
+            (cpu.ptlas.high_water, smoke, features)
         };
         let producer_capacity = scene.desc.producer_capacity;
         let sizes = TargetSizes {

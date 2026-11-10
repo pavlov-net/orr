@@ -78,7 +78,9 @@ use orr_gpu::{
     CommandList, Device, Format, GpuPtr, Hazards, KernelSet, OutputFormat, ShaderModule, Stages,
     StorageImageIndex, TextureDesc, TextureIndex, TextureUsage, TimelinePoint,
 };
-use orr_lighting::{BsdfTables, LightingKernels, LightingView, SceneLighting, ScenePass, ViewPass};
+use orr_lighting::{
+    BsdfTables, LightingKernels, LightingView, PathNeeds, SceneLighting, ScenePass, ViewPass,
+};
 use orr_math::{DVec3, Quat, UVec2, Vec2};
 use orr_output::{
     CapturePass, ChainImages, ComposePass, ComposeRoot, ComposeSource, DisplayFrame, ExposurePass,
@@ -1168,7 +1170,16 @@ impl<'a> Frame<'a> {
                     .scenes
                     .get(&view.scene)
                     .ok_or(SceneError::UnknownScene(view.scene))?;
-                kernels.prepare_paths(scene, features, lighting, false) || self.lighting.waits
+                let needs = PathNeeds {
+                    features,
+                    frosted_glass: self
+                        .output
+                        .views
+                        .get(&view.history)
+                        .is_some_and(|state| state.reconstruction.is_some()),
+                    dof_background: false,
+                };
+                kernels.prepare_paths(scene, &needs, lighting) || self.lighting.waits
             }
             _ => false,
         };

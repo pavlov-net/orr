@@ -85,8 +85,8 @@ pub use shaders::types::{
 pub use subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 pub use view::{
     CameraJump, CompilingKernels, DofBackgroundPass, GuideKind, GuideSettings, LightingDebugView,
-    LightingKernels, LightingView, MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION, ReferenceSettings,
-    ThinLens, ViewLighting, ViewPass,
+    LightingKernels, LightingView, MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION, PathNeeds,
+    ReferenceSettings, ThinLens, ViewLighting, ViewPass,
 };
 pub use world_cache::{MAX_CAPACITY_LOG2, WorldCacheStats};
 

@@ -23,6 +23,23 @@ public static const uint MAY_VIEW = 1 << 3;
 public static const uint MAY_BACKGROUND = 1 << 4;
 public static const uint MAY_UPDATE = 1 << 5;
 public static const uint MAY_PHOTON = 1 << 6;
+// What the paths' root may say, each bit clear only where the root says otherwise:
+// a debug view (`PathRoot.mode` is not PATH_FULL, or DIELECTRIC_DEBUG_LAYER is set);
+public static const uint MAY_DEBUG = 1 << 7;
+// the accumulation reference (DIELECTRIC_REFERENCE);
+public static const uint MAY_REFERENCE = 1 << 8;
+// a second pass for the frosted-glass term (DIELECTRIC_FROST);
+public static const uint MAY_FROST = 1 << 9;
+// a thin lens (`aperture_radius` above 0);
+public static const uint MAY_LENS = 1 << 10;
+// walks (FEATURE_WALK);
+public static const uint MAY_WALK = 1 << 11;
+// the view's local light samplers (`local` is set);
+public static const uint MAY_LOCAL = 1 << 12;
+// the view's froxels (`froxels` is set);
+public static const uint MAY_FROXELS = 1 << 13;
+// paths that end in the world cache (CACHE_TERMINATE).
+public static const uint MAY_CACHE = 1 << 14;
 
 public bool may(uint bit)
 {

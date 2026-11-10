@@ -69,6 +69,14 @@ const MAY_VIEW: u32 = 1 << 3;
 const MAY_BACKGROUND: u32 = 1 << 4;
 const MAY_UPDATE: u32 = 1 << 5;
 const MAY_PHOTON: u32 = 1 << 6;
+pub(crate) const MAY_DEBUG: u32 = 1 << 7;
+pub(crate) const MAY_REFERENCE: u32 = 1 << 8;
+pub(crate) const MAY_FROST: u32 = 1 << 9;
+pub(crate) const MAY_LENS: u32 = 1 << 10;
+pub(crate) const MAY_WALK: u32 = 1 << 11;
+pub(crate) const MAY_LOCAL: u32 = 1 << 12;
+pub(crate) const MAY_FROXELS: u32 = 1 << 13;
+pub(crate) const MAY_CACHE: u32 = 1 << 14;
 /// Everything: what a pipeline made without a value may meet.
 pub(crate) const MAY_ALL: u32 = u32::MAX;
 

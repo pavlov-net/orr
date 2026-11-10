@@ -28,8 +28,9 @@ use crate::shaders::types::{
 };
 use crate::shaders::world_cache::update;
 use crate::staged::{
-    FEATURE_DISPERSION, FEATURE_WALK, Late, MAY_ALL, MAY_CAUSTICS, MAY_DISPERSION, MAY_STACK,
-    Source, Stage, StagedKernels, StagedMemory,
+    FEATURE_DISPERSION, FEATURE_WALK, Late, MAY_ALL, MAY_CACHE, MAY_CAUSTICS, MAY_DEBUG,
+    MAY_DISPERSION, MAY_FROST, MAY_FROXELS, MAY_LENS, MAY_LOCAL, MAY_REFERENCE, MAY_STACK,
+    MAY_WALK, Source, Stage, StagedKernels, StagedMemory,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::{
@@ -1321,37 +1322,90 @@ struct StagedPaths {
     rays: bool,
 }
 
-/// What each source's paths may meet in a frame (`specialize.slang`'s bits), from what the
-/// scene may hold and the view's settings.
+/// What decides the path pipelines of a view's frame, known before the view is rastered.
 #[derive(Clone, Copy, Debug)]
+pub struct PathNeeds {
+    /// [`orr_scene::Scenes::scene_features`]: [`ViewPass::scene_features`] to be.
+    pub features: SceneFeatures,
+    /// [`ViewPass::frosted_glass`] to be.
+    pub frosted_glass: bool,
+    /// Whether [`ViewPass::dof_background`] will be set.
+    pub dof_background: bool,
+}
+
+/// What each source's paths may meet in a frame (`specialize.slang`'s bits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PathMay {
     view: u32,
+    background: u32,
     update: u32,
     photons: u32,
 }
 
 impl PathMay {
-    /// `caustics`: the paths' root holds the caustics.
-    fn new(features: SceneFeatures, lighting: &ViewLighting, caustics: bool) -> Self {
-        if !lighting.specialize {
-            return Self {
-                view: MAY_ALL,
-                update: MAY_ALL,
-                photons: MAY_ALL,
-            };
-        }
-        let bit = |on: bool, bit: u32| if on { bit } else { 0 };
-        // A stack face bounds an interior, and a stack bends directional lights alone.
-        let stack = features.contains(SceneFeatures::INTERIORS)
-            && features.contains(SceneFeatures::DIRECTIONAL_LIGHTS);
-        let shared = bit(stack, MAY_STACK) | bit(caustics, MAY_CAUSTICS);
-        let dispersion = bit(disperses(features, lighting), MAY_DISPERSION);
-        Self {
-            view: shared | dispersion,
-            // Update paths do not split by wavelength.
-            update: shared,
-            photons: shared | dispersion,
-        }
+    const ALL: Self = Self {
+        view: MAY_ALL,
+        background: MAY_ALL,
+        update: MAY_ALL,
+        photons: MAY_ALL,
+    };
+}
+
+fn bit(on: bool, bit: u32) -> u32 {
+    if on { bit } else { 0 }
+}
+
+/// What the paths of a scene that may hold `features` may meet, beyond what their roots say.
+fn scene_may(features: SceneFeatures) -> u32 {
+    // A stack face bounds an interior, and a stack bends directional lights alone.
+    let stack = features.contains(SceneFeatures::INTERIORS)
+        && features.contains(SceneFeatures::DIRECTIONAL_LIGHTS);
+    bit(stack, MAY_STACK)
+}
+
+/// What `root` says its paths may meet: the bits of `specialize.slang` a root decides.
+fn root_may(root: &PathRoot) -> u32 {
+    let flag = |f: u32| root.dielectric_flags & f != 0;
+    bit(root.features & FEATURE_DISPERSION != 0, MAY_DISPERSION)
+        | bit(root.caustics != GpuPtr::NULL, MAY_CAUSTICS)
+        | bit(root.mode != 0 || flag(DIELECTRIC_DEBUG_LAYER), MAY_DEBUG)
+        | bit(flag(DIELECTRIC_REFERENCE), MAY_REFERENCE)
+        | bit(flag(DIELECTRIC_FROST), MAY_FROST)
+        | bit(root.aperture_radius > 0.0, MAY_LENS)
+        | bit(root.features & FEATURE_WALK != 0, MAY_WALK)
+        | bit(root.local != GpuPtr::NULL, MAY_LOCAL)
+        | bit(root.froxels != GpuPtr::NULL, MAY_FROXELS)
+        | bit(root.cache_flags & CACHE_TERMINATE != 0, MAY_CACHE)
+}
+
+/// `PathRoot.mode` of a view under `lighting`.
+fn path_mode(lighting: &ViewLighting) -> u32 {
+    match lighting.debug_view {
+        LightingDebugView::None
+        | LightingDebugView::Guide(_)
+        | LightingDebugView::DielectricLayer
+        | LightingDebugView::Media
+        | LightingDebugView::Froxels => 0,
+        LightingDebugView::DirectOnly => 1,
+        LightingDebugView::IndirectOnly => 2,
+        LightingDebugView::NeeOnly => 3,
+        LightingDebugView::BsdfOnly => 4,
+        LightingDebugView::RaysPerPixel => 5,
+        LightingDebugView::RayOriginBias => 6,
+        LightingDebugView::WorldCache => 7,
+        LightingDebugView::WorldCacheLod => 8,
+        LightingDebugView::Subsurface => 9,
+        LightingDebugView::Caustics => 10,
+    }
+}
+
+/// The share of a view's first-vertex candidates its local light samplers draw: 0 under the
+/// reference, which has none.
+fn local_share(lighting: &ViewLighting) -> f32 {
+    if lighting.reference.is_some() {
+        0.0
+    } else {
+        lighting.local_light_share.clamp(0.0, MAX_LOCAL_LIGHT_SHARE)
     }
 }
 
@@ -1472,26 +1526,65 @@ impl LightingKernels {
         }
     }
 
-    /// Asks for the path pipelines a view of a scene that may hold `features` needs under
-    /// `lighting`, with a background layer where `dof_background`, and says whether they are
-    /// ready. [`Self::record_paths`] waits for them otherwise, so a caller that would rather
-    /// show a frame without paths asks here first.
+    /// What the paths of a frame with `needs` under `lighting` may meet, as
+    /// [`Self::record_paths`] will read it from the roots it writes.
+    fn predict(
+        &self,
+        scene: &SceneLighting,
+        needs: &PathNeeds,
+        lighting: &ViewLighting,
+    ) -> PathMay {
+        if !lighting.specialize {
+            return PathMay::ALL;
+        }
+        let features = needs.features;
+        let reference = lighting.reference.is_some();
+        let lens = lighting
+            .reference
+            .and_then(|r| r.lens)
+            .is_some_and(|l| l.aperture_radius > 0.0);
+        let froxels = !reference && self.support.media.fogged(features, lighting);
+        let shared = scene_may(features)
+            | bit(gathers_caustics(scene, lighting), MAY_CAUSTICS)
+            | bit(lens, MAY_LENS)
+            | bit(froxels, MAY_FROXELS);
+        let dispersion = bit(disperses(features, lighting), MAY_DISPERSION);
+        let layer = lighting.debug_view == LightingDebugView::DielectricLayer;
+        let background = shared
+            | dispersion
+            | bit(layer, MAY_DEBUG)
+            | bit(reference, MAY_REFERENCE)
+            | bit(needs.frosted_glass, MAY_FROST)
+            | bit(features.contains(SceneFeatures::WALKING), MAY_WALK)
+            | bit(local_share(lighting) > 0.0, MAY_LOCAL)
+            | bit(!reference, MAY_CACHE);
+        PathMay {
+            view: background | bit(path_mode(lighting) != 0, MAY_DEBUG),
+            background,
+            // Update paths run outside the reference and end in the cache.
+            update: shared | MAY_CACHE,
+            photons: shared | dispersion | bit(reference, MAY_REFERENCE),
+        }
+    }
+
+    /// Asks for the path pipelines a view's frame with `needs` takes under `lighting`, and says
+    /// whether they are ready. [`Self::record_paths`] waits for them otherwise, so a caller
+    /// that would rather show a frame without paths asks here first.
     pub fn prepare_paths(
         &self,
         scene: &SceneLighting,
-        features: SceneFeatures,
+        needs: &PathNeeds,
         lighting: &ViewLighting,
-        dof_background: bool,
     ) -> bool {
         let PathKernels::Staged(k) = &self.paths else {
             return true;
         };
         let caustics = gathers_caustics(scene, lighting);
-        let may = PathMay::new(features, lighting, caustics);
+        let may = self.predict(scene, needs, lighting);
         let mut wanted = may.view | Source::View.may();
-        let mut stages = Source::View.stages(features.contains(SceneFeatures::WALKING));
-        if dof_background {
-            wanted |= Source::Background.may();
+        let mut stages = Source::View.stages(needs.features.contains(SceneFeatures::WALKING));
+        if needs.dof_background {
+            wanted |= may.background | Source::Background.may();
             stages.push(Stage::Background);
         }
         // The stages run the update paths and the photons until their own kernels are ready.
@@ -1617,29 +1710,13 @@ impl LightingKernels {
             Some(r) => (REFERENCE_ROULETTE_DEPTH, r.lens),
             None => (ROULETTE_DEPTH, None),
         };
-        let mode = match lighting.debug_view {
-            LightingDebugView::None
-            | LightingDebugView::Guide(_)
-            | LightingDebugView::DielectricLayer
-            | LightingDebugView::Media
-            | LightingDebugView::Froxels => 0,
-            LightingDebugView::DirectOnly => 1,
-            LightingDebugView::IndirectOnly => 2,
-            LightingDebugView::NeeOnly => 3,
-            LightingDebugView::BsdfOnly => 4,
-            LightingDebugView::RaysPerPixel => 5,
-            LightingDebugView::RayOriginBias => 6,
-            LightingDebugView::WorldCache => 7,
-            LightingDebugView::WorldCacheLod => 8,
-            LightingDebugView::Subsurface => 9,
-            LightingDebugView::Caustics => 10,
-        };
+        let mode = path_mode(lighting);
         let reference = lighting.reference.is_some();
         let first = !reference && scene.first_view(pass.frame);
         let block = scene.world_cache_settings().update_block * if first { 1 } else { 2 };
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
-        let local_share = lighting.local_light_share.clamp(0.0, MAX_LOCAL_LIGHT_SHARE);
-        let local = !reference && local_share > 0.0;
+        let local_share = local_share(lighting);
+        let local = local_share > 0.0;
         let written = view.feedback_index;
         view.feedback_index = 1 - written;
         if local {
@@ -1825,26 +1902,28 @@ impl LightingKernels {
             round: 0,
         };
         // Asked for together, the sources that run in the stages share their pipelines.
-        self.prepare_paths(
-            scene,
-            pass.scene_features,
-            lighting,
-            pass.dof_background.is_some(),
-        );
-        let may = PathMay::new(
-            pass.scene_features,
-            lighting,
-            gathers_caustics(scene, lighting),
-        );
+        let needs = PathNeeds {
+            features: pass.scene_features,
+            frosted_glass: pass.frosted_glass,
+            dof_background: pass.dof_background.is_some(),
+        };
+        self.prepare_paths(scene, &needs, lighting);
+        let predicted = self.predict(scene, &needs, lighting);
+        // What a root's paths may meet, read from the root itself.
+        let may = |root: &PathRoot, predicted: u32| {
+            if !lighting.specialize {
+                return MAY_ALL;
+            }
+            let may = scene_may(pass.scene_features) | root_may(root);
+            if may != predicted {
+                log::debug!("paths asked for {predicted:#x} may meet {may:#x}");
+            }
+            may
+        };
         let path_root = PathRoot {
             caustics: self.record_photons(list, scene, view, pass, lighting, &path_root)?,
             ..path_root
         };
-        debug_assert_eq!(
-            path_root.caustics != GpuPtr::NULL,
-            gathers_caustics(scene, lighting),
-            "the paths' pipelines are chosen by whether they gather caustics"
-        );
         self.record_layers(list, view, pass, lighting, lens.is_some(), &path_root);
         if !reference {
             let update_root = PathRoot {
@@ -1872,7 +1951,7 @@ impl LightingKernels {
                     view.staged.as_ref().expect("made above"),
                     &update_root,
                     Source::Update,
-                    may.update,
+                    may(&update_root, predicted.update),
                     blocks[0] * blocks[1],
                     path_rounds(&update_root),
                     1,
@@ -1889,7 +1968,7 @@ impl LightingKernels {
                 view.staged.as_ref().expect("made above"),
                 &path_root,
                 Source::View,
-                may.view,
+                may(&path_root, predicted.view),
                 pixels,
                 path_rounds(&path_root),
                 if pass.frosted_glass { 2 } else { 1 },
@@ -1914,7 +1993,7 @@ impl LightingKernels {
                         view.staged.as_ref().expect("made above"),
                         &background_root,
                         Source::Background,
-                        may.view,
+                        may(&background_root, predicted.background),
                         pixels,
                         path_rounds(&background_root),
                         1,
@@ -2015,7 +2094,11 @@ impl LightingKernels {
                 view.staged.as_ref().expect("made by record_paths"),
                 &photon_root,
                 Source::Photon,
-                PathMay::new(pass.scene_features, lighting, true).photons,
+                if lighting.specialize {
+                    scene_may(pass.scene_features) | root_may(&photon_root)
+                } else {
+                    MAY_ALL
+                },
                 photons,
                 path_rounds(&photon_root),
                 1,

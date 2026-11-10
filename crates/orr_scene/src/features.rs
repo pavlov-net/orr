@@ -31,6 +31,9 @@ impl SceneFeatures {
     pub const DIRECTIONAL_LIGHTS: Self = Self(1 << 5);
     /// The scene holds a sphere or rect light.
     pub const LOCAL_LIGHTS: Self = Self(1 << 6);
+    /// The scene holds a smoke entry: a view's [`RasterView::smoke_args`](crate::RasterView)
+    /// is then set.
+    pub const SMOKE: Self = Self(1 << 7);
     /// Every bit a material record sets.
     const MATERIAL: Self = Self(
         Self::WALKING.0 | Self::INTERIORS.0 | Self::SCATTERING_INTERIORS.0 | Self::DISPERSIVE.0,

@@ -656,6 +656,9 @@ impl SceneCpu {
         if self.ptlas.has_medium_proxies() {
             out |= crate::SceneFeatures::MEDIUM_PROXIES;
         }
+        if self.producers.iter().flatten().any(|p| p.smoke) {
+            out |= crate::SceneFeatures::SMOKE;
+        }
         out
     }
 }

@@ -20,7 +20,8 @@ use orr_gpu::{
 use orr_lighting::{
     BsdfTables, CompilingKernels, DirectionalLight, DiscProfile, DofBackgroundPass,
     EnvironmentMapGpu, Light, LightId, LightingKernels, LightingView, ParticleDraw, PathEntry,
-    ReferenceSettings, SceneLighting, SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
+    PathNeeds, ReferenceSettings, SceneLighting, SceneLightingSettings, ScenePass, ViewLighting,
+    ViewPass,
 };
 use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
@@ -2654,11 +2655,12 @@ impl Paths {
         };
         let (lighting, settings) = (f.lighting, &self.settings);
         target.begin(lighting, &f.desc, settings);
-        let background = pass.dof_background.is_some();
-        if !self
-            .kernels
-            .prepare_paths(lighting, pass.scene_features, settings, background)
-        {
+        let needs = PathNeeds {
+            features: pass.scene_features,
+            frosted_glass: pass.frosted_glass,
+            dof_background: pass.dof_background.is_some(),
+        };
+        if !self.kernels.prepare_paths(lighting, &needs, settings) {
             // The pipelines these paths first ask for compile on threads of their own.
             std::thread::scope(|threads| {
                 for _ in 1..CompilingKernels::JOBS {

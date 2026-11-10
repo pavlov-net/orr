@@ -110,7 +110,37 @@ PathRoot specialized(PathRoot r)
         r.source = PATH_SOURCE_UPDATE;
     if (!view && !background && !update && photon)
         r.source = PATH_SOURCE_PHOTON;
+    if (!may(MAY_DEBUG))
+    {
+        r.mode = PATH_FULL;
+        r.dielectric_flags &= ~DIELECTRIC_DEBUG_LAYER;
+    }
+    if (!may(MAY_REFERENCE))
+        r.dielectric_flags &= ~DIELECTRIC_REFERENCE;
+    if (!may(MAY_FROST))
+        r.dielectric_flags &= ~DIELECTRIC_FROST;
+    if (!may(MAY_DISPERSION))
+        r.features &= ~FEATURE_DISPERSION;
+    if (!may(MAY_CAUSTICS))
+        r.caustics = nullptr;
+    if (!may(MAY_LENS))
+        r.aperture_radius = 0.0;
+    if (!may(MAY_WALK))
+        r.features &= ~FEATURE_WALK;
+    if (!may(MAY_LOCAL))
+        r.local = nullptr;
+    if (!may(MAY_FROXELS))
+        r.froxels = nullptr;
+    if (!may(MAY_CACHE))
+        r.cache_flags &= ~CACHE_TERMINATE;
     return r;
+}
+
+// Counts a ray of the path, which only the debug view of rays per pixel reads.
+void count_ray(inout PathLoop p)
+{
+    if (may(MAY_DEBUG))
+        p.rays++;
 }
 
 // `PathLoop.flags`. The bits from LOOP_KEY_SHIFT up hold the coherence key of the pending vertex.
@@ -1020,7 +1050,8 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
         uint mask = camera ? f.mask : MASK_OPAQUE | MASK_DIELECTRIC;
         HitContext context = hit_context(camera ? HIT_PRIMARY : HIT_SECONDARY, camera ? 0 : p.depth + 1, p.cone, 0.0, float2(-1.0), x.feedback);
         LayerAccept<CoverageFeedback<S>> a = { s, v, ray.dir, context, camera ? x.seed : pcg(x.seed ^ (p.depth + 1)), PRESENCE_DRAWN };
-        p.rays += camera ? 0 : 1;
+        if (!camera)
+            count_ray(p);
         RayDesc rd = path_ray(ray.origin, ray.dir, camera ? f.t_max : positive_infinity());
         h = trace_closest(s.tlas, rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
         // Rays leaving a layer or a scatter, and the first vertex's, see particles, and every
@@ -1482,7 +1513,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
             NeeDraw d = nee_draw<S>(r, at, scatter, pixel, local, candidates, keep, chain, rng, no_environment);
             if (d.traced)
             {
-                p.rays++;
+                count_ray(p);
                 float mis = weight_one ? 1.0 : mis_balance(run * d.chosen.pdf, d.scatter_pdf);
                 nee.traced = true;
                 nee.q = shadow_ray<CoverageFeedback<S>, M>(d, d.W * mis / run, shadow, l.x.surface.position, p.throughput, p.depth, x.feedback, counted, exterior);
