@@ -25,6 +25,7 @@ use serde::Deserialize;
 use color::{BELOW_ZERO, Decode, ImageColor, Read};
 use ctt::Quality;
 pub(crate) use encode::{Encoding, encode as encode_chains};
+pub(crate) use env::working_set as environment_working_set;
 use load::{Blocks, Source};
 pub(crate) use load::{decode_blocks, decode_channel, file_header};
 use mips::{MipSpec, Toksvig};

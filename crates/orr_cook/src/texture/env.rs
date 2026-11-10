@@ -19,6 +19,39 @@ use super::{Encoding, Img, MipFilter, Plan, Primaries, TextureSettings, Wrap};
 
 const SUB: u32 = 4;
 
+/// Bytes a source texel takes while it decodes: the decoder's image (at most an f32 RGBA), that
+/// image's f32 RGBA conversion and the source's f32 RGBA made from it.
+const DECODE_BYTES_PER_TEXEL: u64 = 16 + 16 + 16;
+
+/// Bytes a source takes decoded per byte of a file whose header `image` does not read (KTX2 or
+/// DDS), as other textures estimate it.
+const DECODE_BYTES_PER_FILE_BYTE: u64 = 64;
+
+/// Bytes a texel of the map's mip chain takes while it encodes: the chain's f32 RGBA, the
+/// encoder's f32 RGBA copy of it, and inside ctt an f32 RGBA load of that beside its f16 RGBA
+/// conversion, which outweighs the f16 copy and BC6H byte that follow.
+const CHAIN_BYTES_PER_TEXEL: u64 = 16 + 16 + 16 + 8;
+
+/// Texels a side of the octahedral map of an environment under `max_size`.
+fn map_side(max_size: Option<u32>) -> u32 {
+    let n = max_size.unwrap_or(1024).max(4);
+    1 << (31 - n.leading_zeros())
+}
+
+/// Estimated peak bytes of cooking an environment source of `file` bytes and `texels` texels,
+/// if its header gives them, under `max_size`: the file, and the larger of the source's decode
+/// and the map's encode. The resample between them, the source beside the map, stays under the
+/// larger.
+pub(crate) fn working_set(file: u64, texels: Option<u64>, max_size: Option<u32>) -> u64 {
+    let n = u64::from(map_side(max_size));
+    // A full chain of an n by n square, n a power of two.
+    let chain = (4 * n * n - 1) / 3;
+    let decode = texels.map_or(file * DECODE_BYTES_PER_FILE_BYTE, |t| {
+        t * DECODE_BYTES_PER_TEXEL
+    });
+    file + decode.max(chain * CHAIN_BYTES_PER_TEXEL)
+}
+
 pub(super) fn cook(
     mut src: Source,
     s: &TextureSettings,
@@ -35,8 +68,7 @@ pub(super) fn cook(
             *v = settled(*v, lo, hi);
         }
     }
-    let n = s.max_size.unwrap_or(1024).max(4);
-    let n = 1 << (31 - n.leading_zeros());
+    let n = map_side(s.max_size);
     let input = if src.cube {
         Input::Cube(&src.layers)
     } else {

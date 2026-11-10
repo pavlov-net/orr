@@ -634,7 +634,7 @@ impl<'m, 's> Run<'m, 's> {
                     name,
                     Class::Texture as u16,
                     key,
-                    texture_file_working_set(path, header.map(|h| h.0)),
+                    texture_file_working_set(path, header.map(|h| h.0), settings),
                     Work::TextureFile(path.clone(), hash, settings.clone()),
                 );
                 self.add_units(a, index, vec![unit]);
@@ -2030,12 +2030,22 @@ fn subd_facts(a: &Archive, e: &orr_pack::Entry) -> Option<(Aabb, ModelFacts)> {
     ))
 }
 
-/// Estimated peak of a texture cook: 64 B per source texel when the header gives the size.
-fn texture_file_working_set(path: &Path, size: Option<[u32; 2]>) -> u64 {
-    size.map_or_else(
-        || std::fs::metadata(path).map_or(0, |m| m.len() * 64),
-        |[w, h]| u64::from(w) * u64::from(h) * 64,
-    )
+/// Estimated peak of a texture cook: an environment's from its source and map
+/// ([`texture::environment_working_set`]), others 64 B per source texel when the header gives
+/// the size, else per file byte.
+fn texture_file_working_set(
+    path: &Path,
+    size: Option<[u32; 2]>,
+    settings: &TextureSettings,
+) -> u64 {
+    let file = || std::fs::metadata(path).map_or(0, |m| m.len());
+    let texels = size.map(|[w, h]| u64::from(w) * u64::from(h));
+    match settings.usage {
+        crate::Usage::Environment { .. } => {
+            texture::environment_working_set(file(), texels, settings.max_size)
+        }
+        _ => texels.unwrap_or_else(file) * 64,
+    }
 }
 
 /// Imports a scene or material document and plans its units.
