@@ -1845,6 +1845,11 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, 
         // The walk takes the place of the vertex's ray.
         WalkEntry entry = { sv.l, wi };
         store_walk(st, slot, entry);
+        // The walk stage goes on from the ray, interiors and stack the path holds here, which no
+        // stage has stored for a vertex the primary stage shades.
+        store_ray(st, slot, c.ray);
+        store_interior(st, slot, c.interior);
+        store_stack(r, slot, c.stack);
         set_flag(p.flags, LOOP_SHADOW, nee.traced);
         store_spectral(r, slot, c.spectral);
         store_loop(st, slot, p);
