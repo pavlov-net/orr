@@ -210,8 +210,8 @@ pub(crate) struct TexResidency {
     /// Residency unit of tile 0; tile `t` is unit `first_unit + t`.
     pub(crate) first_unit: u32,
     pub(crate) resident: Vec<bool>,
-    /// Finest resident mip per mip 0 tile, per layer.
-    pub(crate) finest: Vec<u32>,
+    /// The latest frame whose feedback asked for each tile, by tile index.
+    pub(crate) heard: Vec<u64>,
     pub(crate) first_cell: u32,
     pub(crate) dirty: bool,
 }
@@ -224,13 +224,10 @@ impl TexResidency {
         }
         self.dirty = false;
         let g = &self.stream.grid;
-        let cells = g.cells();
-        let mut map = Vec::with_capacity(self.finest.len());
-        self.finest.clear();
+        let [cx, cy] = g.cells();
+        let mut map = Vec::with_capacity((cx * cy * g.layers) as usize);
         for layer in 0..g.layers {
-            let finest = g.finest(&self.resident, layer);
-            map.extend(dilate(&finest, cells));
-            self.finest.extend(finest);
+            map.extend(dilate(&g.finest(&self.resident, layer), [cx, cy]));
         }
         w.put(self.stream.map, &map)
     }

@@ -60,7 +60,7 @@ use crate::residency::{
 };
 use crate::scenes::PoolBytes;
 use crate::shaders::page_decode::PageDecodeRoot;
-use crate::tiles::{TexResidency, TexStream, TextureFeedback, compaction_move};
+use crate::tiles::{TexResidency, TexStream, TextureFeedback, Tile, compaction_move};
 use crate::{Budgets, ClusterRef, Error, LoadState, MountId, Result, RtCutGpu, TextureStreamGpu};
 
 /// Tiles one step moves beside their texture's others, at most.
@@ -669,7 +669,7 @@ impl Streaming {
             };
             textures.push(TexResidency {
                 resident: vec![false; g.tile_count() as usize],
-                finest: vec![g.tail_mip(); cells as usize],
+                heard: vec![u64::MAX; g.tile_count() as usize],
                 first_unit,
                 first_cell,
                 dirty: false,
@@ -1359,45 +1359,64 @@ impl Streaming {
         }));
     }
 
-    /// Hands the texture feedback of `frame`, read back in slot `slot`, to the next step:
-    /// a wanted mip finer than the resident one requests the tile that would serve it, with
-    /// the mips it would add as its error; one already resident is touched. Both go for the
-    /// cell's eight neighbors too: the residency map holds a cell at the coarsest of them, so
-    /// without them it would never reach the mip it wants.
+    /// Hands the texture feedback of `frame`, read back in slot `slot`, to the next step. The
+    /// residency map holds a cell at the coarsest of itself and its eight neighbors, so a
+    /// wanted mip asks for the tiles of that mip over the cell and its neighbors, each once a
+    /// frame: a resident one is touched; an absent one is requested, with the mips it would add
+    /// below the finest resident tile over it as its error, and that tile, which the cells read
+    /// meanwhile, is touched.
     pub(crate) fn texture_feedback(&mut self, slot: usize, frame: u64) {
         let (wanted, lost) = self.feedback.read(slot);
         self.residency.note_texture_feedback_lost(lost);
         for ((mount, texture), cell, mip) in wanted {
             let Some(t) = self
                 .mounts
-                .get(&mount)
-                .and_then(|m| m.textures.get(texture as usize))
+                .get_mut(&mount)
+                .and_then(|m| m.textures.get_mut(texture as usize))
             else {
                 continue;
             };
             let g = &t.stream.grid;
             let [cx, cy] = g.cells();
+            let [gx, gy] = g.grids[mip as usize];
             let (layer, c) = (cell / (cx * cy), cell % (cx * cy));
-            if mip >= g.tail_mip() || layer >= g.layers {
-                continue;
-            }
             let (x, y) = (c % cx, c / cx);
-            for ny in y.saturating_sub(1)..(y + 2).min(cy) {
-                for nx in x.saturating_sub(1)..(x + 2).min(cx) {
-                    let tile = g.index_of(g.covering(layer, mip, [nx, ny]));
-                    let k = Key {
+            let span = |at: u32, cells: u32, tiles: u32| {
+                let tile = |n: u32| (n >> mip).min(tiles - 1);
+                tile(at.saturating_sub(1))..=tile((at + 1).min(cells - 1))
+            };
+            for ty in span(y, cy, gy) {
+                for tx in span(x, cx, gx) {
+                    let xy = [tx, ty];
+                    let tile = g.index_of(Tile { mip, layer, xy });
+                    if t.heard[tile as usize] == frame {
+                        continue;
+                    }
+                    t.heard[tile as usize] = frame;
+                    let key = |tile: u32| Key {
                         mount,
                         unit: t.first_unit + tile,
                     };
-                    let finest = t.finest[(layer * cx * cy + ny * cx + nx) as usize];
-                    if mip < finest {
-                        let p = Priority {
-                            error: (finest - mip) as f32,
-                            cell_distance: 0,
-                        };
-                        self.residency.request(k, p, RequestSource::Textures);
-                    } else {
-                        self.residency.touch(k, frame);
+                    if t.resident[tile as usize] {
+                        self.residency.touch(key(tile), frame);
+                        continue;
+                    }
+                    let cell = [tx << mip, ty << mip];
+                    let mut above = mip + 1;
+                    while above < g.tail_mip()
+                        && !t.resident[g.index_of(g.covering(layer, above, cell)) as usize]
+                    {
+                        above += 1;
+                    }
+                    let p = Priority {
+                        error: (above - mip) as f32,
+                        cell_distance: 0,
+                    };
+                    self.residency
+                        .request(key(tile), p, RequestSource::Textures);
+                    if above < g.tail_mip() {
+                        let over = g.index_of(g.covering(layer, above, cell));
+                        self.residency.touch(key(over), frame);
                     }
                 }
             }
