@@ -136,7 +136,9 @@ pub fn device_with(diagnostics: Diagnostics<'static>) -> &'static Device {
 pub fn run(list: CommandList<'_>) -> TimelinePoint {
     let queue = device().queue(QueueKind::Render).unwrap();
     let point = queue.submit(vec![list], &[]).expect("submit");
-    queue.wait(point, Duration::from_secs(10)).expect("wait");
+    queue
+        .wait_while_completing(point, Duration::from_secs(10))
+        .expect("wait");
     point
 }
 

@@ -274,7 +274,12 @@ fn a_masked_glass_pane_shadows_by_fresnel_where_its_alpha_test_keeps_it() {
     assert_clean();
 }
 
-fn direct(bed: &mut Bed, paths: &Paths, seed: u32) -> Accumulated {
+/// The alpha quad scene's direct light with `model` for its quad.
+fn direct(model: &'static str, paths: &Paths, seed: u32) -> Accumulated {
+    let mut bed = Bed::with(quad_scene(model));
+    // At a pre-exposure of 1 the sunlit ground passes the HDR ceiling, which would clip the
+    // samples that draw the sun.
+    bed.set_pre_exposure(1.0 / 64.0);
     bed.accumulate(32, seed, &mut |list, f| paths.record(list, f))
 }
 
@@ -294,9 +299,9 @@ fn direct_paths() -> Paths {
 #[test]
 fn an_alpha_quad_casts_the_same_shadow_with_and_without_micromaps() {
     let paths = direct_paths();
-    let bare = direct(&mut Bed::with(quad_scene(BARE_LEAF)), &paths, 1);
-    let noise = direct(&mut Bed::with(quad_scene(BARE_LEAF)), &paths, 2);
-    let leaf = direct(&mut Bed::with(quad_scene(LEAF)), &paths, 1);
+    let bare = direct(BARE_LEAF, &paths, 1);
+    let noise = direct(BARE_LEAF, &paths, 2);
+    let leaf = direct(LEAF, &paths, 1);
     assert_within_noise("with against without micromaps", &leaf, &bare, &noise, 1.0);
     assert_clean();
 }

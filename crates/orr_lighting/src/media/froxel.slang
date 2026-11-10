@@ -1,6 +1,6 @@
-// A view's froxel passes: `order` picks the shadowed directional lights, `eye_column` and
-// `eye_reach` find what the interior at the near plane holds of each column, `inject` writes the
-// linked medium per froxel, `light` the light reaching it, `integrate` each column's
+// A view's froxel passes beside the light pass (`froxel_light.slang`): `order` picks the shadowed
+// directional lights, `eye_column` and `eye_reach` find what the interior at the near plane holds
+// of each column, `inject` writes the linked medium per froxel, `integrate` each column's
 // in-scatter and transmittance.
 #include "orr_root.h"
 import orr_lighting.media;
@@ -45,15 +45,6 @@ void inject(uint3 id: SV_DispatchThreadID)
     ORR_OMM(inject);
     if (all(id < uint3(root.columns, root.rows, root.slices)))
         froxel_inject<Medium>(root, id);
-}
-
-[shader("compute")]
-[numthreads(FROXEL_LIGHT_GROUP, 1, 1)]
-void light(uint3 id: SV_DispatchThreadID)
-{
-    ORR_OMM(light);
-    if (all(id.xy < uint2(root.columns, root.rows)))
-        froxel_light<Surface, Medium>(root, id.xy);
 }
 
 [shader("compute")]

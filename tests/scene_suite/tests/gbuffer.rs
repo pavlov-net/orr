@@ -3311,6 +3311,7 @@ fn a_decal_on_a_wall_matches_between_the_gbuffer_and_a_mirror_reflection() {
     let mut shot = Shot::at(eye.as_dvec3(), target, 1);
     shot.jitter = Vec2::ZERO;
     let g = shoot_with(&mut w, &mirrored, &shot, decals);
+    assert!(g.view.features.contains(orr_scene::SceneFeatures::DECALS));
     let module = linked::KERNELS.module(&trace::MODULE).unwrap();
     let r = rays(&g.view, module, "cones", 0);
     let direct = place(&mut w, &[wall]);
@@ -6784,6 +6785,8 @@ fn camera_rays_hit_skinned_copies_where_the_raster_drew_them() {
         let worms = place_worms(&mut w, name, &copies, false);
         for (frame, t) in [(1, 0.4), (2, 1.3)] {
             let g = shoot_worms(&mut w, &worms, &worm_shot(frame), t, 0.45);
+            assert!(g.view.features.contains(orr_scene::SceneFeatures::SKINNING));
+            assert!(!g.view.features.contains(orr_scene::SceneFeatures::DECALS));
             let r = rays(&g.view, &trace::MODULE, "pixels", 0);
             let (matched, covered) = parity(&g, &r, 1e-4);
             let total = r.traced.len();

@@ -437,6 +437,11 @@ fn grass_changes_cluster_count_every_frame_and_draws_and_traces_only_this_frames
                 base: FIELD_WORD,
             };
             let view = field.frame(&[emit], None);
+            let (entries, strands) = (
+                orr_scene::SceneFeatures::PRODUCERS,
+                orr_scene::SceneFeatures::STRANDS,
+            );
+            assert!(view.features.contains(entries) && !view.features.contains(strands));
             let what = format!("software {software}, frame {n}, {count} blades");
             let seen = rays(&view, 0, MASK_OPAQUE);
             let want: Vec<Option<[f32; 4]>> = seen
@@ -3362,6 +3367,10 @@ fn strand_raster_depth_matches_swept_sphere_and_tube_traces() {
         let what = if swept { "swept spheres" } else { "tubes" };
         let mut s = Strands::new(d);
         let view = s.frame();
+        assert!(
+            view.features
+                .contains(orr_scene::SceneFeatures::PRODUCERS | orr_scene::SceneFeatures::STRANDS)
+        );
         let seen = s.rays(&view, 0, EXTENT);
         let raster = seen.iter().filter(|o| o.raster_t > 0.0).count();
         let traced = seen.iter().filter(|o| o.traced_t > 0.0).count();

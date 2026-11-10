@@ -11,6 +11,7 @@ __exported import orr_scene.medium_proxy;
 import orr_scene.material;
 import orr_scene.lights;
 import orr_scene.producer;
+import orr_scene.scene_may;
 import orr_scene.view;
 
 // `InstanceGpu.flags`.
@@ -537,7 +538,7 @@ public bool traced_row(SceneRoot* s, uint slot, InstanceGpu inst, MeshGpu* mesh,
     gathered = false;
     if ((st.rt_flags & RT_WRITTEN) == 0 || ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) != chain_near(st))
         return false;
-    if ((inst.flags & INSTANCE_SKINNED) != 0)
+    if (may2(MAY2_SKINNING) && (inst.flags & INSTANCE_SKINNED) != 0)
     {
         if (inst.pose_index >= s.skinned_capacity || mesh.skin == nullptr)
             return false;
@@ -671,7 +672,7 @@ public float3x4 group_entry(GroupGpu* group, bool previous, uint index)
 {
     float3x4 m = stored_entry(group, previous ? group.previous : group.current, index);
     GroupGpu* palette = (GroupGpu*)group.frame;
-    if (palette == nullptr || palette_unset(m))
+    if (!may2(MAY2_SKINNING) || palette == nullptr || palette_unset(m))
         return m;
     uint8_t* joints = previous ? palette.previous : palette.current;
     float3x4 zero = float3x4(float4(0.0), float4(0.0), float4(0.0));

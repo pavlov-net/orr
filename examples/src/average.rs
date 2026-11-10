@@ -61,6 +61,7 @@ impl Average {
         &'s mut self,
         f: &Frame<'a>,
         extent: [u32; 2],
+        lit: bool,
     ) -> impl FnMut(&mut HookPass<'_, '_>) + use<'s, 'a> {
         if self.sum.as_ref().is_none_or(|(_, e)| *e != extent) {
             let texels = u64::from(extent[0]) * u64::from(extent[1]);
@@ -72,7 +73,7 @@ impl Average {
             self.frames = 0;
         }
         let in_sum = self.frames;
-        if f.paths_ready() {
+        if lit {
             if self.skip > 0 {
                 self.skip -= 1;
             } else {

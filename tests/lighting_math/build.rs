@@ -24,6 +24,7 @@ fn main() {
                 .include_as("openpbr_ref", &inputs)
                 .include_as("lighting_math", manifest.join("gpu"))
                 .define("ORR_OPENPBR_ARRAY_LUTS", "1")
+                .define("ORR_UNSPECIALIZED", "1")
                 .compile("lighting_bsdf")
         })
         .and_then(|()| Build::new())

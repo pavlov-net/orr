@@ -18,9 +18,9 @@ use orr::orr_gpu::{
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    CompilingKernels, DirectionalLight, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter,
-    HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource, Projection,
-    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
+    DirectionalLight, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, HookPass,
+    InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource, Projection, Renderer,
+    RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
     TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_atmosphere::presets::{LUNAR_ANGULAR_RADIUS, lunar_albedo, lunar_disc, solar_disc};
@@ -151,7 +151,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .expect("display")
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
-    let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
+    let _workers = Workers::machine(renderer.loading());
     let (mount, mut frame) = mount_at(&mut renderer, PackSource::Memory(cook()), FIRST_FRAME);
 
     let atmosphere = Atmosphere {
@@ -327,7 +327,10 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .expect("prepare view");
         f.update_scenes(&mut |c| sky.record(c, &[]).expect("sky passes"))
             .expect("update scenes");
-        let mut average = average.hook(&f, extent);
+        let lit = f
+            .view_lit(&view, &ViewLighting::default(), false)
+            .expect("path pipelines");
+        let mut average = average.hook(&f, extent, lit);
         let mut hooks = ViewHooks {
             scene_referred: still.then_some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),
             ..ViewHooks::default()

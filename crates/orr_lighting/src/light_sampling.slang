@@ -22,6 +22,7 @@ import orr_scene.view;
 import orr_lighting.bsdf;
 import orr_lighting.media;
 import orr_lighting.environment;
+import orr_lighting.specialize;
 
 // Presampled light tiles: `TILE_COUNT` tiles of `TILE_SIZE` samples, redrawn every frame.
 public static const uint TILE_COUNT = 128;
@@ -867,7 +868,7 @@ LightSample emissive_sample<S : ISurface>(LightSetGpu* set, uint entry, uint fir
     r.triangle = triangle;
     if ((section.flags & (MATERIAL_DOUBLE_SIDED | MATERIAL_HAS_BACK)) == MATERIAL_DOUBLE_SIDED)
         r.bits |= LIGHT_SAMPLE_TWO_SIDED;
-    if ((shown.flags & (MATERIAL_COAT | MATERIAL_FUZZ)) != 0)
+    if (may2(MAY2_COATED_EMITTERS) && (shown.flags & (MATERIAL_COAT | MATERIAL_FUZZ)) != 0)
         r.bits |= LIGHT_SAMPLE_VIEW;
     return r;
 }
@@ -878,6 +879,9 @@ LightSample emissive_sample<S : ISurface>(LightSetGpu* set, uint entry, uint fir
 // from, to rounding.
 public float3 emitter_view_layer<S : ISurface>(LightSetGpu* set, ResolvedLightSample c, float exterior_ior)
 {
+    // No sample is drawn with LIGHT_SAMPLE_VIEW where no emitter has a coat or fuzz.
+    if (!may2(MAY2_COATED_EMITTERS))
+        return float3(1.0);
     SceneRoot* s = set.scene;
     uint entry = c.light - s.light_capacity;
     uint instance_index, cluster_id, triangles, alpha_first;
@@ -903,7 +907,7 @@ public float3 emitter_view_layer<S : ISurface>(LightSetGpu* set, ResolvedLightSa
     SurfaceInput i = emitter_input(s, t, c.triangle, bary, c.dir);
     float offset;
     GSurface g = S.surface(i, offset);
-    return bsdf_prepare(g.bsdf, g.normal, -c.dir, exterior_ior).emission_layer();
+    return bsdf_emission_layer(g.bsdf, g.normal, -c.dir, exterior_ior);
 }
 
 // What a ray finds of the emissive list on the side of a traced triangle it hit: the entry's
@@ -1061,8 +1065,14 @@ LightSample tile_light_sample<S : ISurface>(LightSetGpu* set, uint id, uint firs
     }
     uint lights = set.scene.light_capacity;
     if (id < lights)
-        return local_sample(set, id, u.xy, probability);
-    return emissive_sample<S>(set, id - lights, first, count, bits, u.xy, probability);
+    {
+        if (may(MAY_LOCAL_LIGHTS))
+            return local_sample(set, id, u.xy, probability);
+    }
+    else if (may(MAY_EMISSIVE))
+        return emissive_sample<S>(set, id - lights, first, count, bits, u.xy, probability);
+    LightSample none = {};
+    return none;
 }
 
 // Tile sample `index` of `frame`, drawn from the light set's selection.

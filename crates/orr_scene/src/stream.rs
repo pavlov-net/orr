@@ -435,6 +435,8 @@ pub(crate) struct Streaming {
     fragmented: BTreeMap<(MountId, u32), u64>,
     /// Heap indices whose stream table entry the next step writes null.
     nulls: Vec<u32>,
+    /// A texture has streamed: a record with a residency map has been written.
+    streamed: bool,
     /// The memory kinds on a device-local heap, whose pressure the residency budgets follow.
     governed: Vec<MemoryKind>,
     /// Instance pages that landed (their records' address) or left (0) since the last take.
@@ -446,6 +448,11 @@ pub(crate) struct Streaming {
 }
 
 impl Streaming {
+    /// Whether a texture has streamed since the renderer was made.
+    pub(crate) fn streamed(&self) -> bool {
+        self.streamed
+    }
+
     pub(crate) fn new(
         device: &Device,
         b: &Budgets,
@@ -534,6 +541,7 @@ impl Streaming {
             moving: HashMap::new(),
             fragmented: BTreeMap::new(),
             nulls: Vec::new(),
+            streamed: false,
             page_events: Vec::new(),
             window_events: Vec::new(),
             blobs: Vec::new(),
@@ -660,6 +668,7 @@ impl Streaming {
             };
             w.put(s.record, &[record])?;
             w.put(self.streams.offset(u64::from(s.index.0)), &[s.record])?;
+            self.streamed = true;
         }
         for init in units.fine {
             let slots = init.cuts.iter().map(|_| FineState::Empty(0)).collect();

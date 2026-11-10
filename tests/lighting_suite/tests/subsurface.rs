@@ -521,12 +521,10 @@ fn capped_interior_walks_keep_the_table_share() {
     assert_clean();
 }
 
-/// Reordering lanes inside walks moves lanes between hardware threads, so a walk must pick up where
-/// it stopped: with a coherence point after every 8 steps, at caps with one and with seven of them,
-/// a subsurface sphere and a dense interior trace the same paths as without, and still match the
-/// CPU walk. The images compare BSDF rays alone: next-event estimates differ between any two runs.
+/// The shade stages' ray entries reorder their lanes before a vertex loads: a subsurface sphere
+/// and a dense interior still match the CPU walk under them.
 #[test]
-fn reordering_inside_walks_changes_no_path() {
+fn the_ray_entries_walk_as_the_cpu_walk_does() {
     let caps = device().caps();
     if !require(caps.ray_dispatch && caps.reorder, "no reordering") {
         return;
@@ -534,9 +532,26 @@ fn reordering_inside_walks_changes_no_path() {
     let mut paths = Paths::new(
         &KernelSet::default(),
         PathEntry::RayDispatch,
+        settings(LightingDebugView::Subsurface),
+    );
+    paths.settings.max_bounces = 2;
+    a_lit_sphere_matches_the_cpu_walk(&paths);
+    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 1.0, &[Lighting::Uniform], 0.02);
+    assert_clean();
+}
+
+/// Pipelines compiled for what a scene and its settings may meet hold the code its paths run:
+/// a subsurface sphere and a dense interior trace the same paths through them as through the
+/// pipelines that hold everything. The images compare BSDF rays alone, as above.
+#[test]
+fn specialized_pipelines_trace_the_paths_the_general_ones_do() {
+    let mut paths = Paths::new(
+        &KernelSet::default(),
+        PathEntry::Compute,
         real_time(LightingDebugView::BsdfOnly),
     );
     paths.settings.max_bounces = 2;
+    paths.settings.sss_max_steps = 16;
     for model in [WALK_SPHERE, MILK_SPHERE] {
         let spec = Spec {
             copies: vec![Item {
@@ -551,33 +566,21 @@ fn reordering_inside_walks_changes_no_path() {
             fov_y: 0.6,
             focus: None,
         };
-        for sss_max_steps in [16, 64] {
-            paths.settings.sss_max_steps = sss_max_steps;
-            let mut bed = Bed::with(spec.clone());
-            paths.settings.walk_compaction = true;
-            let reordered = bed.accumulate(4, 5, &mut |list, f| {
-                assert!(f.pass().walking_materials);
-                paths.record(list, f);
-            });
-            paths.settings.walk_compaction = false;
-            let plain = render_spec(&paths, spec.clone(), 4);
-            let bits = |a: &Accumulated| {
-                a.mean
-                    .iter()
-                    .map(|p| p.map(f32::to_bits))
-                    .collect::<Vec<_>>()
-            };
-            assert!(
-                bits(&reordered) == bits(&plain),
-                "{model}, cap {sss_max_steps}: reordering inside walks changed the image"
-            );
-        }
+        let bits = |a: &Accumulated| {
+            a.mean
+                .iter()
+                .map(|p| p.map(f32::to_bits))
+                .collect::<Vec<_>>()
+        };
+        paths.specialize = false;
+        let general = render_spec(&paths, spec.clone(), 4);
+        paths.specialize = true;
+        let specialized = render_spec(&paths, spec, 4);
+        assert!(
+            bits(&general) == bits(&specialized),
+            "{model}: the specialized pipelines changed the image"
+        );
     }
-    paths.settings = settings(LightingDebugView::Subsurface);
-    paths.settings.max_bounces = 2;
-    paths.settings.walk_compaction = true;
-    a_lit_sphere_matches_the_cpu_walk(&paths);
-    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 1.0, &[Lighting::Uniform], 0.02);
     assert_clean();
 }
 

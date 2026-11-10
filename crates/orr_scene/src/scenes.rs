@@ -20,6 +20,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::accel::{AccelKernels, AccelLimits, AccelShared};
 use crate::arena::{ArenaReport, ArenaRequest, ViewArena, ViewStep};
 use crate::decals::{self, build_bins};
+use crate::features::SceneFeatures;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
 use crate::medium_proxy::{ProxyBlas, VolumeRef};
@@ -188,10 +189,10 @@ pub struct RendererDesc {
     pub kernels: &'static KernelSet,
     /// Which entry of the path tracing kernels views run.
     pub path_entry: PathEntry,
-    /// The first view history looks for the path tracing kernels in the pipeline caches on the
-    /// calling thread, which takes tens of milliseconds and lights a warm start's first frame.
-    /// Off, the calling thread never touches the driver for them: they always start as jobs, so
-    /// even a warm start renders black until a thread has run them.
+    /// The first view history looks in the pipeline caches for the lighting kernels that every
+    /// view runs, on the calling thread, so a warm start waits only for the path pipelines its
+    /// first view asks for, which come from the caches as jobs. Off, the calling thread never
+    /// touches the driver for them: they always start as jobs too.
     pub try_cached_paths: bool,
     /// World cells are 2^cell_log2 m on a side.
     pub cell_log2: u32,
@@ -360,6 +361,9 @@ struct Core {
     cages: Vec<Option<ModelCage>>,
     /// The farther models of every model with a representation chain.
     chains: HashMap<ModelId, Vec<ModelId>>,
+    /// A model has had a chain: a copy that fades between two steps is written with every
+    /// triangle a candidate, and stays so until its instance is next written.
+    chained: bool,
     /// Records outside any scene: materials, view-history initialization.
     global: Mutex<Vec<Record>>,
     scenes: Vec<Option<Scene>>,
@@ -520,6 +524,7 @@ impl Scenes {
                 model_cpu: Vec::new(),
                 cages: Vec::new(),
                 chains: HashMap::new(),
+                chained: false,
                 global: Mutex::new(global),
                 scenes: Vec::new(),
                 histories: Vec::new(),
@@ -761,6 +766,7 @@ impl Scenes {
         } else {
             core.chains
                 .insert(model, chain.iter().map(|&(m, _)| m).collect());
+            core.chained = true;
         }
         core.write_chain(model, chain);
         Ok(())
@@ -986,10 +992,11 @@ impl Scenes {
         &self.core.stats
     }
 
-    /// Step 1: waits until frame N - frames_in_flight has completed, sleeps on the low
-    /// latency handle when one is given, recycles the upload window and the slots freed
-    /// before it, swaps in hot-reloaded pipelines, and opens frame N. Raises a panic of the
-    /// loading thread.
+    /// Step 1: waits until frame N - frames_in_flight has completed, for as long as the render
+    /// queue goes on completing work (an error once it completes nothing for 10 s), sleeps on
+    /// the low latency handle when one is given, recycles the upload window and the slots
+    /// freed before it, swaps in hot-reloaded pipelines, and opens frame N. Raises a panic of
+    /// the loading thread.
     pub fn begin_frame(&mut self, desc: &FrameDesc<'_>) -> Result<Frame<'_>> {
         let started = Instant::now();
         // The loading thread ends only at `Msg::Stop`, so one that has ended panicked, and
@@ -1017,7 +1024,7 @@ impl Scenes {
             if !due && !self.device.is_complete(last) {
                 break;
             }
-            render.wait(last, Duration::from_secs(10))?;
+            render.wait_while_completing(last, Duration::from_secs(10))?;
             let mut f = core.in_flight.pop_front().unwrap();
             f.stats.gpu = f
                 .points
@@ -1190,6 +1197,23 @@ impl Scenes {
 impl Core {
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// What any scene may hold by the tables every scene shares: what a material may show,
+    /// candidates on every triangle of a copy fading between the steps of a chain, and textures
+    /// that have streamed.
+    fn features(&self) -> SceneFeatures {
+        let fades = if self.chained {
+            SceneFeatures::COVERAGE
+        } else {
+            SceneFeatures::NONE
+        };
+        let streams = if self.mounts.streaming.streamed() {
+            SceneFeatures::STREAMED_TEXTURES
+        } else {
+            SceneFeatures::NONE
+        };
+        self.materials.features() | fades | streams
     }
 
     /// Writes `model`'s chain into its `ModelGpu` with the next frame's records.
@@ -2108,6 +2132,12 @@ impl<'a> Frame<'a> {
         self.raster_view_with(view, &[])
     }
 
+    /// What `scene` may hold now: [`RasterView::features`] before the view is rastered.
+    pub fn scene_features(&self, scene: SceneId) -> Result<SceneFeatures> {
+        let cpu = self.core.scene(scene)?.cpu.lock().unwrap();
+        Ok(self.core.features() | cpu.features())
+    }
+
     /// [`Self::raster_view`], with `requests`, the transient targets of the passes that
     /// follow it, laid out in the view's arena beside the raster's.
     pub fn raster_view_with(
@@ -2137,10 +2167,11 @@ impl<'a> Frame<'a> {
                 core.cell_log2,
             )
             .to_array();
-        let (slots, smoke, medium_proxies) = {
+        let (slots, smoke, scene_features) = {
             let cpu = scene.cpu.lock().unwrap();
-            let smoke = cpu.producers.iter().flatten().any(|p| p.smoke);
-            (cpu.ptlas.high_water, smoke, cpu.ptlas.has_medium_proxies())
+            let features = cpu.features();
+            let smoke = features.contains(SceneFeatures::SMOKE);
+            (cpu.ptlas.high_water, smoke, features)
         };
         let producer_capacity = scene.desc.producer_capacity;
         let sizes = TargetSizes {
@@ -2215,10 +2246,7 @@ impl<'a> Frame<'a> {
             counts: targets.counts(),
             raster,
             smoke_args: smoke.then(|| targets.smoke_args()),
-            walking_materials: core.materials.any_walking(),
-            interior_materials: core.materials.any_interior(),
-            scattering_interiors: core.materials.any_scattering_interior(),
-            medium_proxies,
+            features: core.features() | scene_features,
             history: view.history,
             sky_stats,
             focus,

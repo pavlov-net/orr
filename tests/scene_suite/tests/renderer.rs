@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use orr::{
-    ArenaReport, Budgets, CompilingKernels, DirectionalLight, DiscProfile, Exposure, FrameDesc,
-    FrameTime, Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens,
-    Light, LightId, LitView, LoadState, MountId, OutputDebug, PackSource, PathEntry, PipelineId,
-    PostQuality, Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId,
-    TextureFilter, TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting,
-    ViewOutput, ViewTarget,
+    ArenaReport, Budgets, DirectionalLight, DiscProfile, Exposure, FrameDesc, FrameTime, Glare,
+    GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId,
+    LitView, LoadState, MountId, OutputDebug, PackSource, PathEntry, PipelineId, PostQuality,
+    Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter,
+    TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting, ViewOutput,
+    ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
 use orr_gpu::{
@@ -574,9 +574,10 @@ fn frames_around_the_compile(
             &Default::default(),
         )
         .unwrap();
-    assert!(!r.paths_ready());
+    assert!(!r.kernels_ready());
     let history = r.create_view_history().unwrap();
-    assert_eq!(r.paths_outstanding() as usize, CompilingKernels::JOBS);
+    let kernels = r.paths_outstanding();
+    assert!(kernels > 0);
     let [w, h] = [320, 240];
     let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
     let image = d
@@ -590,9 +591,13 @@ fn frames_around_the_compile(
     let (mut before, mut after) = (Vec::new(), Vec::new());
     for i in 0..waiting + lit {
         if i == waiting {
+            // A view that rendered black asked for its own path pipelines beside the kernels,
+            // which the wait for the kernels leaves to the view's first lit render.
+            let asked = black && waiting > 0;
+            assert_eq!(r.paths_outstanding() > kernels, asked);
             r.wait_paths().unwrap();
-            assert!(r.paths_ready());
-            assert_eq!(r.paths_outstanding(), 0);
+            assert!(r.kernels_ready());
+            assert_eq!(r.paths_outstanding() > 0, asked);
         }
         frame += 1;
         let mut f = r
@@ -602,7 +607,6 @@ fn frames_around_the_compile(
                 display: None,
             })
             .unwrap();
-        assert_eq!(f.paths_ready(), i >= waiting);
         if i == 0 {
             place_floor_and_box(&f, scene, models);
         }
@@ -631,9 +635,18 @@ fn frames_around_the_compile(
             } else {
                 DVec3::new(0.2 * f64::from(i - waiting), 2.0, 4.0)
             };
+            let view = view_of(scene, history, eye, &image);
+            let lit = f
+                .view_lit(
+                    &view,
+                    &ViewLighting::default(),
+                    hooks.transparency.is_some(),
+                )
+                .unwrap();
+            assert_eq!(lit, !waited);
             let rendered = f
                 .render_view(
-                    &view_of(scene, history, eye, &image),
+                    &view,
                     &ViewLighting::default(),
                     &ViewOutput::default(),
                     &mut hooks,
@@ -682,9 +695,190 @@ fn a_view_is_black_while_the_path_kernels_compile_and_then_renders_as_if_it_neve
     assert_clean();
 }
 
-/// A path kernel that cannot compile: the device has no ray dispatch and the renderer asks for it.
+/// A copy fading between two steps of its chain is written with every triangle a candidate of
+/// the rays that meet it. A scene of opaque materials says so from the moment a model has a
+/// chain, which keeps candidate handling in the path pipelines made for it.
 #[test]
-fn a_failed_path_compile_comes_back_from_wait_paths_and_render_view() {
+fn a_chain_marks_its_scenes_for_ray_candidates() {
+    let d = device();
+    let mut r = Renderer::new(d, RendererDesc::default()).unwrap();
+    let loading = r.loading();
+    let worker = {
+        let l = Arc::clone(&loading);
+        std::thread::spawn(move || l.run_worker())
+    };
+    let mut frame = 0;
+    let mount = mount_pack(&mut r, &floor_and_box(), &mut frame);
+    let models = ["floor", "box"].map(|name| r.model(mount, AssetId::from_name(name)).unwrap());
+    loading.stop_workers();
+    worker.join().unwrap();
+    let scene = r
+        .create_scene(
+            &SceneDesc {
+                light_capacity: 1,
+                ..SceneDesc::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    let listed = [scene];
+    let coverage = orr_scene::SceneFeatures::COVERAGE;
+    let mut features = |r: &mut Renderer, place: bool| {
+        frame += 1;
+        let mut f = r
+            .begin_frame(FrameDesc {
+                time: time(frame),
+                scenes: &listed,
+                display: None,
+            })
+            .unwrap();
+        if place {
+            place_floor_and_box(&f, scene, models);
+        }
+        f.update_scenes(&mut |_| {}).unwrap();
+        let features = f.scene_features(scene).unwrap();
+        wait(f.end().unwrap());
+        features
+    };
+    assert!(!features(&mut r, true).contains(coverage));
+    r.set_chain(models[1], &[(models[0], 10.0)]).unwrap();
+    assert!(features(&mut r, false).contains(coverage));
+    assert_clean();
+}
+
+/// A copy fading between two steps of its chain is written with every triangle a candidate of
+/// the rays that meet it. Path pipelines made for a scene of plain materials take them too: a
+/// view on them renders each frame of the box's fade as a view of the same frames on the
+/// pipelines that hold everything does, and runs the pipelines it asked for.
+#[test]
+fn a_fading_copy_stops_rays_under_the_pipelines_made_for_its_scene() {
+    let pack = floor_and_box();
+    let d = device();
+    let desc = RendererDesc {
+        path_entry: PathEntry::Compute,
+        ..RendererDesc::default()
+    };
+    let mut r = Renderer::new(d, desc).unwrap();
+    let loading = r.loading();
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let l = Arc::clone(&loading);
+            std::thread::spawn(move || l.run_worker())
+        })
+        .collect();
+    let mut frame = 0;
+    let mount = mount_pack(&mut r, &pack, &mut frame);
+    let models = ["floor", "box"].map(|name| r.model(mount, AssetId::from_name(name)).unwrap());
+    // A copy takes its step at once when it is first seen, so the box has its chain from the
+    // start and is seen near before the focus moves away.
+    r.set_chain(models[1], &[(models[0], 10.0)]).unwrap();
+    let scene = r
+        .create_scene(
+            &SceneDesc {
+                light_capacity: 1,
+                ..SceneDesc::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    // One view on the pipelines that hold everything and one on those made for the scene.
+    let views = [false, true].map(|specialize| {
+        let history = r.create_view_history().unwrap();
+        let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+        let image = d
+            .create_texture(
+                &TextureDesc::d2(Format::Rgba16Float, 160, 120, usage),
+                TextureMemory::Dedicated,
+                "view image",
+            )
+            .unwrap();
+        let lighting = ViewLighting {
+            specialize,
+            ..ViewLighting::default()
+        };
+        (history, image, lighting)
+    });
+    r.wait_paths().unwrap();
+    let listed = [scene];
+    let mut frames = Vec::new();
+    for i in 0..14 {
+        frame += 1;
+        let mut f = r
+            .begin_frame(FrameDesc {
+                time: time(frame),
+                scenes: &listed,
+                display: None,
+            })
+            .unwrap();
+        if i == 0 {
+            place_floor_and_box(&f, scene, models);
+        }
+        if i >= 2 {
+            f.scene(scene)
+                .unwrap()
+                .set_focus(DVec3::new(0.0, 0.0, 100.0));
+        }
+        f.update_scenes(&mut |_| {}).unwrap();
+        let eye = DVec3::new(0.0, 2.0, 4.0);
+        for (history, image, lighting) in &views {
+            let rendered = f
+                .render_view(
+                    &view_of(scene, *history, eye, image),
+                    lighting,
+                    &ViewOutput::default(),
+                    &mut ViewHooks::default(),
+                )
+                .unwrap();
+            assert!(
+                rendered.exact_paths,
+                "frame {i} ran path pipelines that hold more than its view asked for"
+            );
+        }
+        wait(f.end().unwrap());
+        frames.push(
+            views.each_ref().map(|(_, image, _)| {
+                read_texture(image, &TextureRegion::whole_mip(image.desc(), 0))
+            }),
+        );
+    }
+    drop(r);
+    loading.stop_workers();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    // Half floats of the red channel.
+    let red = |image: &[u8]| -> Vec<f32> {
+        image
+            .chunks(8)
+            .map(|t| half::f16::from_le_bytes([t[0], t[1]]).to_f32())
+            .collect()
+    };
+    let apart = |a: &[u8], b: &[u8]| -> f64 {
+        let (a, b) = (red(a), red(b));
+        let sum: f64 = a.iter().map(|&v| f64::from(v)).sum();
+        let diff: f64 = a
+            .iter()
+            .zip(&b)
+            .map(|(&x, &y)| f64::from((x - y).abs()))
+            .sum();
+        diff / sum
+    };
+    assert!(
+        apart(&frames[1][0], &frames[13][0]) > 0.02,
+        "the box took no farther step"
+    );
+    for (i, [general, exact]) in frames.iter().enumerate() {
+        let d = apart(general, exact);
+        assert!(d < 0.005, "frame {i} differs by {d} of its light");
+    }
+    assert_clean();
+}
+
+/// A path pipeline that cannot compile: the device has no ray dispatch and the renderer asks for
+/// it. The pipelines compile when a view first asks for them, so the view's render reports it,
+/// and every wait and render after it.
+#[test]
+fn a_failed_path_compile_comes_back_from_render_view_and_wait_paths() {
     let d = orr_gpu::Device::new(&orr_gpu::DeviceDesc {
         name: "no ray dispatch",
         skip_extensions: &[c"VK_KHR_ray_tracing_pipeline"],
@@ -702,15 +896,15 @@ fn a_failed_path_compile_comes_back_from_wait_paths_and_render_view() {
     let history = r.create_view_history().unwrap();
     let failed = |e: orr::Error| match e {
         orr::Error::PathKernels(e) => assert!(
-            matches!(&*e, orr::LightingError::Compile { kernel, .. } if *kernel == "view paths"),
+            matches!(
+                &*e,
+                orr::LightingError::LateCompile { kernel, .. } if *kernel == "staged opaque shade"
+            ),
             "{e}"
         ),
         e => panic!("{e}"),
     };
-    failed(r.wait_paths().unwrap_err());
-    assert!(!r.paths_ready());
-    assert_eq!(r.paths_outstanding(), 0);
-    failed(r.wait_paths().unwrap_err());
+    r.wait_paths().unwrap();
     let image = d
         .create_texture(
             &TextureDesc::d2(
@@ -731,7 +925,6 @@ fn a_failed_path_compile_comes_back_from_wait_paths_and_render_view() {
             display: None,
         })
         .unwrap();
-    assert!(!f.paths_ready());
     let eye = DVec3::new(0.0, 2.0, 4.0);
     let error = f
         .render_view(
@@ -741,10 +934,13 @@ fn a_failed_path_compile_comes_back_from_wait_paths_and_render_view() {
             &mut ViewHooks::default(),
         )
         .err()
-        .expect("render_view with no kernels");
+        .expect("render_view with a pipeline that failed");
     failed(error);
     f.end().unwrap();
     d.wait_submitted(Duration::from_secs(10)).unwrap();
+    failed(r.wait_paths().unwrap_err());
+    assert!(!r.kernels_ready());
+    assert_eq!(r.paths_outstanding(), 0);
 }
 
 #[test]

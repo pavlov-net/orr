@@ -24,6 +24,7 @@ import orr_lighting.path;
 import orr_lighting.shadow;
 import orr_lighting.froxels;
 import orr_lighting.particle_lighting;
+import orr_lighting.specialize;
 
 // Separates media apply's samples from the paths' of the same pixel.
 static const uint MEDIA_STREAM = 0xC2B2AE35;
@@ -202,7 +203,7 @@ ProxySpans camera_spans(FroxelRoot f, float3 dir, float t_max)
 {
     ProxySpans s = (ProxySpans)0;
     s.t_max = t_max;
-    if (f.lights.proxies == 0 || !(t_max > 0.0))
+    if (!may(MAY_PROXIES) || f.lights.proxies == 0 || !(t_max > 0.0))
         return s;
     trace_camera(f, dir, MASK_MEDIUM, 0.0, t_max, s);
     return s;
@@ -597,9 +598,9 @@ struct FarSmoke : ICandidate
 // any. Sky pixels (`t` infinite) take the froxels alone; the environment carries the rest.
 Fog camera_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 dir, float t, ProxySpans spans)
 {
-    if (r.reference != 0)
+    if (may(MAY_REFERENCE) && r.reference != 0)
         return reference_fog<S, M>(r, f, pixel, dir, t, spans);
-    if (spans.count != 0 && t > 0.0)
+    if (may(MAY_PROXIES) && spans.count != 0 && t > 0.0)
         return proxy_fog<S, M>(r, f, pixel, dir, t, spans);
     return linked_fog<M>(r, f, pixel, dir, isinf(t) ? f.scene.near_range : t);
 }
@@ -613,9 +614,9 @@ Fog smoky_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 p
 {
     float near_range = f.scene.near_range;
     FarSmoke smoke = { f.scene };
-    if (r.reference == 0 && f.lights.far_smoke != 0 && t > near_range)
+    if (may(MAY_SMOKE) && r.reference == 0 && f.lights.far_smoke != 0 && t > near_range)
         trace_camera(f, dir, MASK_PARTICLE, near_range, t, smoke);
-    bool layer = smoke.weight > 0.0;
+    bool layer = may(MAY_SMOKE) && smoke.weight > 0.0;
     float smoke_t = layer ? smoke.distance / smoke.weight : t;
     Fog front = (Fog)0;
     Fog fog = (Fog)0;

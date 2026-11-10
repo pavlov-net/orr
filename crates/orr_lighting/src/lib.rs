@@ -60,8 +60,10 @@ mod media;
 pub mod openpbr;
 mod particles;
 mod scene;
+mod staged;
 mod subsurface;
 mod subsurface_table;
+mod support;
 mod view;
 mod world_cache;
 
@@ -84,8 +86,8 @@ pub use shaders::types::{
 pub use subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 pub use view::{
     CameraJump, CompilingKernels, DofBackgroundPass, GuideKind, GuideSettings, LightingDebugView,
-    LightingKernels, LightingView, MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION, ReferenceSettings,
-    ThinLens, ViewLighting, ViewPass,
+    LightingKernels, LightingView, MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION, PathNeeds, PathsRan,
+    ReferenceSettings, ThinLens, ViewLighting, ViewPass, WaitedPaths,
 };
 pub use world_cache::{MAX_CAPACITY_LOG2, WorldCacheStats};
 
@@ -126,6 +128,12 @@ pub enum Error {
         kernel: &'static str,
         message: String,
     },
+    /// A path pipeline compiled after the kernels were ready failed.
+    #[error("compiling {kernel}: {message}")]
+    LateCompile {
+        kernel: &'static str,
+        message: String,
+    },
     /// A replacement kernel does not match the module it replaces.
     #[error("kernel {kernel}: {reason}")]
     Kernel {
@@ -160,6 +168,9 @@ fn module(kernels: &KernelSet, own: &'static ShaderModule) -> Result<&'static Sh
     }
     Ok(m)
 }
+
+/// How one compute pipeline compiles.
+type CompilePipeline = fn(&Device, &KernelSet) -> Result<ComputePipeline, Error>;
 
 fn pipeline(
     device: &Device,

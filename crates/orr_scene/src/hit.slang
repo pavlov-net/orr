@@ -10,6 +10,7 @@ import orr_shaders.packing;
 import orr_shaders.random;
 import orr_pack.mesh;
 import orr_scene.producer;
+import orr_scene.scene_may;
 __exported import orr_scene.surface;
 
 // An instance's transform as hits and the raster use it: mesh space to a frame centered
@@ -102,7 +103,7 @@ public bool cluster_placement(SceneRoot* s, uint copy, InstanceGpu inst, Cluster
 public bool hit_producer(SceneRoot* s, uint index, out uint entry)
 {
     entry = index - s.producer_base;
-    return index >= s.producer_base && entry < s.producer_capacity;
+    return may2(MAY2_PRODUCERS) && index >= s.producer_base && entry < s.producer_capacity;
 }
 
 // The transform of producer entry `p`, current or previous, relative to the point at
@@ -427,7 +428,7 @@ public bool crosses_interior(SceneRoot* s, uint material)
 public bool copy_skin(SceneRoot* s, InstanceGpu inst, out SkinnedGpu k)
 {
     k = (SkinnedGpu)0;
-    if ((inst.flags & INSTANCE_SKINNED) == 0 || inst.pose_index >= s.skinned_capacity)
+    if (!may2(MAY2_SKINNING) || (inst.flags & INSTANCE_SKINNED) == 0 || inst.pose_index >= s.skinned_capacity)
         return false;
     k = s.skinned[inst.pose_index];
     return k.positions != nullptr;
@@ -633,7 +634,7 @@ public uint traced_material(SceneRoot* s, uint instance_index, uint cluster_id)
     if (hit_producer(s, instance_index, entry))
     {
         ProducerGpu p = s.producers[entry];
-        if (p.strands != 0)
+        if (may2(MAY2_STRANDS) && p.strands != 0)
             return strand_material(p);
         ProducerBatch b = s.batches[entry];
         if (cluster_id >= emitted_clusters(b))
@@ -691,7 +692,7 @@ public bool traced_triangle(SceneRoot* s, uint instance_index, uint cluster_id, 
     {
         ProducerGpu p = s.producers[entry];
         ProducerBatch b = s.batches[entry];
-        if (p.strands != 0 || cluster_id >= emitted_clusters(b))
+        if ((may2(MAY2_STRANDS) && p.strands != 0) || cluster_id >= emitted_clusters(b))
             return false;
         ProducerClusterGpu k = b.clusters[cluster_id];
         if (!producer_placement(s, p, previous, s.origin_cell.xyz, float3(0.0), cell_log2, t.placement))
@@ -828,7 +829,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
 {
     h = (HitInput)0;
     uint entry;
-    if (hit_producer(s, instance_index, entry) && s.producers[entry].strands != 0)
+    if (may2(MAY2_STRANDS) && hit_producer(s, instance_index, entry) && s.producers[entry].strands != 0)
     {
         // Strands are opaque, so only closest hits with their hit point reach here.
         uint cell_log2 = uint(s.origin_cell.w);
@@ -953,12 +954,22 @@ bool fade_present(SceneRoot* s, float3 d, uint instance_index)
 // reconstruction.
 public float resolve_presence<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, bool alpha)
 {
+    uint section;
+    return resolve_presence_section<S>(s, v, d, instance_index, cluster_id, primitive, bary, context, alpha, section);
+}
+
+// `resolve_presence`, and in `section` the material of the triangle's section, MATERIAL_NONE
+// where nothing is present.
+public float resolve_presence_section<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, bool alpha, out uint section)
+{
+    section = MATERIAL_NONE;
     if (!fade_present(s, d, instance_index))
         return 0.0;
     Corners t = (Corners)0;
     HitInput h;
     if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, false, context, h))
         return 0.0;
+    section = h.section;
     uint flags = s.materials[h.input.material].flags;
     // A fading copy's triangles of materials without an alpha test are candidates only for
     // the fade.

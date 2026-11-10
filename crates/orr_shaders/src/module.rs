@@ -67,12 +67,12 @@ pub enum Stage {
 /// Which entry point runs of a kernel with a raygen and a compute entry over one body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum PathEntry {
-    /// The raygen entry, which reorders at coherence points, where the device reorders in
-    /// hardware; the compute entry otherwise.
+    /// The entry that renders a frame in the least time: the compute entry.
     #[default]
     Fastest,
     Compute,
-    /// Fails on devices without ray-dispatch pipelines.
+    /// The raygen entry, which reorders at coherence points. Fails on devices without
+    /// ray-dispatch pipelines.
     RayDispatch,
 }
 

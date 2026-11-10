@@ -8,6 +8,7 @@ import orr_lighting.camera_media;
 
 extern struct Surface : ISurface = StandardSurface;
 extern struct Medium : IMedium = NoMedium;
+export static const bool PATH_SPECIALIZES = true;
 
 ORR_ROOT(MediaApplyRoot);
 

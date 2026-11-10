@@ -491,6 +491,14 @@ pub struct Workers {
 }
 
 impl Workers {
+    /// A thread per hardware thread but the one that renders, and two at least, for an example
+    /// whose views compile path pipelines while it loads: the jobs then run as wide as the
+    /// machine allows.
+    pub fn machine(loading: Arc<Loading>) -> Self {
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        Self::new(loading, threads.saturating_sub(1).max(2))
+    }
+
     pub fn new(loading: Arc<Loading>, count: usize) -> Self {
         let (running, ended) = mpsc::channel();
         let threads = (0..count)

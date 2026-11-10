@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
 use orr::{
-    CompilingKernels, Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameTime, HookPass,
-    Lens, LitView, Projection, Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest,
-    TextureFilter, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameTime, HookPass, Lens, LitView,
+    Projection, Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest, TextureFilter,
+    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_examples::average::Average;
 use orr_examples::linked::KERNELS;
@@ -68,7 +68,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     if !options.headless {
         enable_dlss(&mut renderer);
     }
-    let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
+    let _workers = Workers::machine(renderer.loading());
     let mut showcase = Showcase::load(&mut renderer, gpu);
     let scene = showcase.scene;
     let history = renderer.create_view_history().expect("view history");
@@ -171,18 +171,20 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             target,
         };
         let output = ViewOutput::default();
-        f.prepare_view(&view, &ViewLighting::default(), &output)
+        let lighting = ViewLighting::default();
+        f.prepare_view(&view, &lighting, &output)
             .expect("prepare view");
         f.update_scenes(&mut |c| showcase.sky.record(c, &[]).expect("sky passes"))
             .expect("update scenes");
-        let mut average = average.hook(&f, extent);
+        let lit = f.view_lit(&view, &lighting, false).expect("path pipelines");
+        let mut average = average.hook(&f, extent, lit);
         let mut ui = |pass: &mut orr::UiPass<'_, '_>| overlay.paint(pass, id);
         let mut hooks = ViewHooks {
             scene_referred: still.then_some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),
             ui: Some(&mut ui),
             ..ViewHooks::default()
         };
-        f.render_view(&view, &ViewLighting::default(), &output, &mut hooks)
+        f.render_view(&view, &lighting, &output, &mut hooks)
             .expect("render view");
         last = Some((id, f.end().expect("end frame")));
     }

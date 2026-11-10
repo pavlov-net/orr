@@ -6,6 +6,7 @@ import orr_shaders.abi;
 import orr_shaders.trace;
 import orr_color.primaries;
 __exported import orr_scene.neural_texture;
+import orr_scene.scene_may;
 
 // `MaterialGpu.flags`.
 public static const uint MATERIAL_ALPHA_TESTED = 1 << 0;
@@ -267,7 +268,7 @@ TextureStreamGpu* texture_record(TextureStreamGpu** streams, TextureIndex t)
 public TextureStreamGpu* texture_stream(TextureStreamGpu** streams, TextureIndex t)
 {
     TextureStreamGpu* s = texture_record(streams, t);
-    if (s != nullptr && s.map == nullptr)
+    if (!may2(MAY2_STREAMS) || (s != nullptr && s.map == nullptr))
         return nullptr;
     return s;
 }
@@ -662,6 +663,8 @@ float texture_wanted_lod(uint modes, UvFootprint f, float2 size)
 // that passes true carries no size query or level arithmetic.
 public void texture_feedback(TextureIndex t, TextureSamplerGpu s, UvFootprint f, TextureStreamGpu** streams, bool point = false)
 {
+    if (!may2(MAY2_STREAMS))
+        return;
     TextureStreamGpu* stream = texture_stream(streams, t);
     if (stream == nullptr)
         return;
@@ -695,13 +698,14 @@ public float4 texture_footprint(TextureIndex t, TextureSamplerGpu s, UvFootprint
     Texture2D<float4> texture = t.get<Texture2D<float4>>();
     bool one_mip = (s.modes & TEXTURE_ONE_MIP) != 0;
     float min_lod = 0.0;
-    if (f.tap.x >= 0.0 || stream != nullptr || one_mip)
+    bool streamed = may2(MAY2_STREAMS) && stream != nullptr;
+    if (f.tap.x >= 0.0 || streamed || one_mip)
     {
         uint width;
         uint height;
         texture.GetDimensions(width, height);
         float2 size = float2(width, height);
-        if (stream != nullptr)
+        if (streamed)
         {
             float lod = TEXTURE_FEEDBACK ? texture_wanted_lod(s.modes, f, size) : 0.0;
             min_lod = texture_stream_clamp(stream, texture_place(f.uv, s.modes), s.modes, 0, lod);
@@ -773,7 +777,7 @@ public uint material_uv_set(MaterialGpu* m, uint slot)
 // `t` to the tile there and `f` into it.
 bool material_reads(MaterialGpu* m, uint slot, uint modes, inout TextureIndex t, inout UvFootprint f)
 {
-    if ((modes & TEXTURE_TILED) == 0)
+    if (!may2(MAY2_TILES) || (modes & TEXTURE_TILED) == 0)
         return !texture_outside(f.uv, modes);
     t = texture_tile(m.tiles[slot], f.uv, f.inward);
     return t.index != IMAGE_NONE;
