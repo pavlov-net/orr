@@ -103,6 +103,7 @@ impl Drop for TempDir {
 }
 
 /// A camera of the export.
+#[derive(Clone, Copy)]
 struct Camera {
     name: &'static str,
     position: Vec3,
@@ -186,8 +187,9 @@ fn read_export(dir: &Path) -> Export {
     let gltf = dir.join(json["models"][0].as_str().expect("the scene's model"));
     let settings = &json["settings"];
     let sky = dir.join(settings["envmap"].as_str().expect("envmap"));
-    let sky_rotation = settings["envmap rotation"].as_f64().unwrap_or(0.0) as f32;
-    let elevation = settings["envmap elevation"].as_f64().unwrap_or(0.0);
+    let number = |key: &str| settings[key].as_f64().unwrap_or_else(|| panic!("{key}"));
+    let sky_rotation = number("envmap rotation") as f32;
+    let elevation = number("envmap elevation");
     assert!(elevation == 0.0, "envmap elevation {elevation} is not read");
     let view = &json["view"];
     let mut cameras = vec![Camera::looking(
@@ -355,7 +357,7 @@ fn fly(window: &mut Window, camera: &mut Camera, dt: f32) {
     let walk = r * Vec3::NEG_Z * axis(KeyCode::KeyW, KeyCode::KeyS)
         + r * Vec3::X * axis(KeyCode::KeyD, KeyCode::KeyA)
         + Vec3::Y * axis(KeyCode::KeyE, KeyCode::KeyQ);
-    let speed = if window.held(KeyCode::ShiftLeft) {
+    let speed = if window.held(KeyCode::ShiftLeft) || window.held(KeyCode::ShiftRight) {
         WALK_SPEED * RUN_SCALE
     } else {
         WALK_SPEED
@@ -524,13 +526,13 @@ fn run(options: &Options) -> Option<Capture> {
     if options.has("--cook-only") {
         return None;
     }
-    let mut cameras = export.cameras;
-    let mut current = 0;
+    let cameras = export.cameras;
+    // The view: the export's camera last jumped to, as flown since.
+    let mut camera = cameras[0];
     let title = |camera: &Camera| format!("orr zorah: {}", camera.name);
 
     let gpu = device();
-    let mut window =
-        (!options.headless).then(|| Window::new(&title(&cameras[current]), 1920, 1080));
+    let mut window = (!options.headless).then(|| Window::new(&title(&camera), 1920, 1080));
     let desc = RendererDesc {
         budgets: budgets(&pack),
         ..RendererDesc::default()
@@ -697,16 +699,15 @@ fn run(options: &Options) -> Option<Capture> {
             for key in w.take_keys() {
                 let keys = [KeyCode::Digit1, KeyCode::Digit2];
                 let picked = keys.iter().position(|&k| k == key);
-                if let Some(picked) = picked.filter(|&p| p < cameras.len()) {
-                    current = picked;
+                if let Some(&picked) = picked.and_then(|p| cameras.get(p)) {
+                    camera = picked;
                     camera_cut = true;
                     streaming = Streaming::new(Instant::now(), "the cut", *renderer.residency());
-                    w.set_title(&title(&cameras[current]));
+                    w.set_title(&title(&camera));
                 }
             }
-            fly(w, &mut cameras[current], dt as f32);
+            fly(w, &mut camera, dt as f32);
         }
-        let camera = &cameras[current];
         let final_frame = frames.is_some_and(|n| i + 1 == n);
         let time = FrameTime {
             absolute: fixed_time(frame + 1).absolute + t,
