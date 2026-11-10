@@ -1798,6 +1798,8 @@ fn a_texture_without_a_mip_tail_places_whole() {
     assert_clean();
 }
 
+/// The taps raise more cells than the first texture feedback records hold, and still load
+/// every tile they want.
 #[test]
 fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_want() {
     use orr_scene::orr_gpu::{AddressMode, Filter, MemoryKind, SamplerDesc};
@@ -1805,7 +1807,14 @@ fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_wan
     use scene_suite::shaders::texture_filter::{self, Footprint, Root};
     let _serial = serial();
     let dev = device();
-    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
+    let desc = RendererDesc {
+        budgets: Budgets {
+            initial_texture_feedback_records: 1,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    };
+    let mut scenes = Scenes::new(dev, &desc).unwrap();
     let _workers = Workers::start(&scenes, 2);
     let m = scenes.mount(PackSource::Memory(Arc::clone(tiled_pack())));
     ready(&mut scenes, m);
@@ -1894,13 +1903,23 @@ fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_wan
     );
     let start = Instant::now();
     let finest = nearest(0);
-    while tap_frame(&mut scenes) != finest {
+    let mut lost = Vec::new();
+    loop {
+        let taps = tap_frame(&mut scenes);
+        lost.push(scenes.residency().texture_feedback_lost);
+        if taps == finest && lost.last() == Some(&0) {
+            break;
+        }
         assert!(
             start.elapsed() < Duration::from_secs(30),
-            "the taps' tiles never arrived"
+            "the taps' tiles never arrived; raises lost by frame: {lost:?}"
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+    assert!(
+        lost.iter().any(|&n| n > 0),
+        "the first records hold fewer raises than the taps make"
+    );
     let tiles = orr_pack::texture::TILE_BYTES as u64 * 21;
     let (_, tails) = tiled_layout(dev, 0);
     let pool = *scenes.residency().class(ResidencyClass::Textures);

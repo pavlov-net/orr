@@ -165,10 +165,10 @@ pub struct Budgets {
     pub instance_page_pool: u64,
     /// Bytes of requested blobs loading or landed and not released.
     pub user_blob_pool: u64,
-    /// Feedback cells of streamed textures: one per mip 0 tile of each layer.
-    pub texture_feedback_cells: u32,
-    /// Texture feedback records a frame keeps; taps past it report nothing that frame.
-    pub texture_feedback_records: u32,
+    /// Records of raises of a texture feedback cell's wanted mip a frame keeps at first; the
+    /// list grows like the visible clusters. While a frame raises more, each frame keeps a
+    /// different run of its raises, so every cell is heard within a few frames.
+    pub initial_texture_feedback_records: u32,
     /// Bytes loading at once: of streamed units and requested blobs from the step that starts
     /// their reads to the one their GPU work lands in, which hold staging and read buffers that
     /// long, and mounts' reads: their stored bytes, and the decoded bytes of those that stage
@@ -211,8 +211,7 @@ impl Default for Budgets {
             texture_pool: PoolSize::HeapPercent(30),
             instance_page_pool: 256 << 20,
             user_blob_pool: 256 << 20,
-            texture_feedback_cells: 1 << 20,
-            texture_feedback_records: 1 << 14,
+            initial_texture_feedback_records: 1 << 14,
             in_flight_bytes: 256 << 20,
             stream_block: 16 << 20,
         }
@@ -554,10 +553,7 @@ impl Scenes {
             reloader.watch(r.module);
         }
         let streams = materials.streams.gpu().address().0;
-        let global = vec![
-            Record::fill(0, streams, 2 * device.image_slots(), 0),
-            mounts.streaming.init(),
-        ];
+        let global = vec![Record::fill(0, streams, 2 * device.image_slots(), 0)];
         // Last, so no failure after it leaves the threads running with no one to stop them.
         let in_flight = Arc::clone(mounts.streaming.in_flight());
         let loading = Arc::new(Loading::new(

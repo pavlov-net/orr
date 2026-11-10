@@ -61,7 +61,6 @@ use crate::residency::{
 use crate::scenes::PoolBytes;
 use crate::shaders::page_decode::PageDecodeRoot;
 use crate::tiles::{TexResidency, TexStream, TextureFeedback, compaction_move};
-use crate::upload::Record;
 use crate::{Budgets, ClusterRef, Error, LoadState, MountId, Result, RtCutGpu, TextureStreamGpu};
 
 /// Tiles one step moves beside their texture's others, at most.
@@ -579,12 +578,7 @@ impl Streaming {
             unbinds: Vec::new(),
             carried: Vec::new(),
             unbinding: FxHashSet::default(),
-            feedback: TextureFeedback::new(
-                device,
-                b.texture_feedback_cells,
-                b.texture_feedback_records,
-                fif,
-            )?,
+            feedback: TextureFeedback::new(device, b.initial_texture_feedback_records, fif)?,
             retired_cells: Vec::new(),
             streams,
             moving: HashMap::new(),
@@ -597,11 +591,6 @@ impl Streaming {
             queued: VecDeque::new(),
             fif: fif.max(1),
         })
-    }
-
-    /// What the first frame's scatter clears.
-    pub(crate) fn init(&self) -> Record {
-        self.feedback.init()
     }
 
     pub(crate) fn stats(&self) -> &ResidencyStats {
@@ -669,14 +658,14 @@ impl Streaming {
             let g = &stream.grid;
             let [cx, cy] = g.cells();
             let cells = cx * cy * g.layers;
-            let Some(first_cell) = self.feedback.alloc((mount, k as u32), cells) else {
-                for t in &textures {
-                    self.feedback.free(t.first_cell);
+            let first_cell = match self.feedback.alloc((mount, k as u32), cells, w) {
+                Ok(first) => first,
+                Err(e) => {
+                    for t in &textures {
+                        self.feedback.free(t.first_cell);
+                    }
+                    return Err(e);
                 }
-                return Err(Error::Capacity {
-                    what: "texture feedback cells",
-                    capacity: self.feedback.cell_capacity,
-                });
             };
             textures.push(TexResidency {
                 resident: vec![false; g.tile_count() as usize],
@@ -1376,7 +1365,7 @@ impl Streaming {
     /// cell's eight neighbors too: the residency map holds a cell at the coarsest of them, so
     /// without them it would never reach the mip it wants.
     pub(crate) fn texture_feedback(&mut self, slot: usize, frame: u64) {
-        let (wanted, lost) = self.feedback.read(slot, frame);
+        let (wanted, lost) = self.feedback.read(slot);
         self.residency.note_texture_feedback_lost(lost);
         for ((mount, texture), cell, mip) in wanted {
             let Some(t) = self
@@ -1568,7 +1557,10 @@ impl Streaming {
             }
         }
         let slot = (frame % u64::from(self.fif)) as usize;
-        self.feedback.begin(frame, slot, w)?;
+        let period = response_period(self.fif);
+        if let Some(e) = self.feedback.begin(frame, slot, period, w)? {
+            self.residency.out_of_memory(governs(&self.governed, &e));
+        }
         for index in std::mem::take(&mut self.nulls) {
             w.put(self.streams.offset(u64::from(index)), &[GpuPtr::NULL])?;
         }

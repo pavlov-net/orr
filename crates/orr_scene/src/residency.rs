@@ -210,8 +210,9 @@ pub struct ResidencyStats {
     /// want of a run of free entries in the resident cluster table; each loads again on
     /// request.
     pub cluster_ids_full: u32,
-    /// Raises of a texture cell's wanted mip in the latest texture feedback past its record
-    /// capacity: their requests are lost for that frame.
+    /// Raises of a texture cell's wanted mip in the latest texture feedback that kept no
+    /// record, while the record list is shorter than the frames' raises: their requests and
+    /// touches are lost for that frame, and a later frame keeps them.
     pub texture_feedback_lost: u32,
     /// Texture tiles moved beside their texture's other tiles since the start.
     pub tiles_moved: u32,

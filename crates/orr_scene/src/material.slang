@@ -138,17 +138,18 @@ public static const uint TEXTURE_TILES_HEADER = 16;
 public static const uint MATERIAL_NONE = 0xffffffff;
 
 // Where a frame's texture feedback goes. A cell holds `frame << 8 | 255 - mip` for the
-// finest mip a tap wanted in it during `frame`; each raise appends a record of the cell and
-// its new value.
+// finest mip a tap wanted in it during `frame`. Each raise counts in the frame's count, and
+// raise `first` and the `capacity - 1` after it each leave a record of the cell and its new
+// value.
 public struct TextureFeedbackGpu
 {
     public uint* cells;
-    public uint2* records;                  // `capacity` per frame in flight
+    public uint2* records;                  // the frame's
     public uint* counts;                    // per frame in flight
     public uint capacity;
+    public uint first;
     public uint frame;                      // the frame index's low 24 bits
-    public uint slot;                       // the frame's slot in records and counts
-    public uint _pad;
+    public uint slot;                       // the frame's slot in counts
 }
 
 // A streamed texture's residency. Per tile of mip 0 in each layer, `map` holds the finest
@@ -349,8 +350,8 @@ uint texture_stream_across(uint cell, uint n, uint mode)
 }
 
 // Reports to the frame's feedback that a read wants level `lod` of cell `at` of streamed texture
-// `s`: a mip above its tail finer than any wanted there this frame raises the cell and appends a
-// record.
+// `s`: a mip above its tail finer than any wanted there this frame raises the cell, which
+// counts, and records the raise where it falls in the frame's run of records.
 void texture_stream_report(TextureStreamGpu* s, uint at, float lod)
 {
     uint wanted = uint(clamp(floor(lod), 0.0, float(s.tail_mip)));
@@ -367,8 +368,10 @@ void texture_stream_report(TextureStreamGpu* s, uint at, float lod)
         {
             uint n;
             InterlockedAdd(fb.counts[fb.slot], 1, n);
-            if (n < fb.capacity)
-                fb.records[fb.slot * fb.capacity + n] = uint2(cell_at, v);
+            // Raises before `first` wrap past the capacity.
+            uint i = n - fb.first;
+            if (i < fb.capacity)
+                fb.records[i] = uint2(cell_at, v);
         }
     }
 }

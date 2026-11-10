@@ -18,10 +18,10 @@ use orr_gpu::{
     TextureIndex,
 };
 
+use crate::capacity::Capacity;
 use crate::memory::{PoolSlot, RangeAllocator};
 use crate::mount::Apply;
-use crate::upload::Record;
-use crate::{MountId, NeuralTextureGpu, Result, TextureFeedbackGpu, TextureStreamGpu};
+use crate::{Error, MountId, NeuralTextureGpu, Result, TextureFeedbackGpu, TextureStreamGpu};
 
 /// How a streamed texture's tiles are numbered: by layer, then mip finest first, then row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -236,71 +236,130 @@ impl TexResidency {
     }
 }
 
-/// Words of one frame's feedback readback: the record count, then the records.
-fn readback_words(capacity: u32) -> usize {
-    1 + 2 * capacity as usize
+/// `hit.slang` `FEEDBACK_PERIOD`: frames between two reports of one square of pixels.
+const FEEDBACK_PERIOD: u64 = 8;
+
+/// The first raise frame `frame` keeps a record of, in the order its taps raise cells, with
+/// `capacity` records where the latest completed frame counted `raised` raises. While the list
+/// is shorter than a frame's raises, each square of pixels keeps the next run of its frame's
+/// raises at each of its reports, so every run is kept within `raised / capacity` reports. The
+/// frames of one period report other squares, which raise other cells: the runs advance once a
+/// period.
+fn kept_from(frame: u64, raised: u32, capacity: u32) -> u32 {
+    let runs = raised.div_ceil(capacity).max(1);
+    let run = (frame / FEEDBACK_PERIOD) % u64::from(runs);
+    (run * u64::from(capacity)).min(u64::from(raised.saturating_sub(capacity))) as u32
 }
 
 /// A mip a frame wants: its texture's mount and index among the mount's streamed textures,
 /// the cell's offset in the texture's cells, and the mip.
 pub(crate) type WantedMip = ((MountId, u32), u32, u32);
 
-/// Feedback the frame's texture taps write: per-cell wanted mips and the records of their
-/// raises, copied back per frame in flight.
-pub(crate) struct TextureFeedback {
-    cells: Allocation<u32>,
+/// One frame in flight's raise records and their readback: the raise count, then the records.
+struct SlotRecords {
     records: Allocation<[u32; 2]>,
-    counts: Allocation<u32>,
-    pub(crate) gpu: Allocation<TextureFeedbackGpu>,
     readback: Allocation<u32>,
     capacity: u32,
+    /// The raise the frame's first record holds ([`kept_from`]).
+    first: u32,
+}
+
+impl SlotRecords {
+    fn new(device: &Device, capacity: u32) -> Result<Self> {
+        let n = u64::from(capacity);
+        Ok(Self {
+            records: device.gpu_malloc(MemoryKind::DeviceLocal, n, "texture feedback records")?,
+            readback: device.gpu_malloc(
+                MemoryKind::Readback,
+                1 + 2 * n,
+                "texture feedback readback",
+            )?,
+            capacity,
+            first: 0,
+        })
+    }
+}
+
+/// Feedback the frame's texture taps write: per-cell wanted mips and the records of their
+/// raises, copied back per frame in flight.
+///
+/// The cells grow as mounts add streamed textures. The record list follows the raises the
+/// completed frames counted ([`Capacity`]); each slot takes the size at its next frame.
+pub(crate) struct TextureFeedback {
+    /// None until a mount adds a streamed texture.
+    cells: Option<Allocation<u32>>,
     cell_ranges: RangeAllocator,
-    pub(crate) cell_capacity: u32,
+    cell_capacity: u32,
     /// The texture each cell range belongs to, by first cell: its mount, index among the
     /// mount's streamed textures and cell count.
     owners: BTreeMap<u32, (MountId, u32, u32)>,
+    counts: Allocation<u32>,
+    pub(crate) gpu: Allocation<TextureFeedbackGpu>,
+    slots: Vec<SlotRecords>,
+    records: Capacity,
+    /// Raises the latest completed frame counted.
+    raised: u32,
+    /// The frame from which a growth that found no memory may be tried again.
+    retry: u64,
 }
 
 impl TextureFeedback {
-    pub(crate) fn new(device: &Device, cells: u32, records: u32, fif: u32) -> Result<Self> {
+    pub(crate) fn new(device: &Device, records: u32, fif: u32) -> Result<Self> {
         let dl = MemoryKind::DeviceLocal;
-        let fif = u64::from(fif.max(1));
+        let records = records.max(1);
         Ok(Self {
-            cells: device.gpu_malloc(dl, u64::from(cells.max(1)), "texture feedback cells")?,
-            records: device.gpu_malloc(
-                dl,
-                u64::from(records.max(1)) * fif,
-                "texture feedback records",
-            )?,
-            counts: device.gpu_malloc(dl, fif, "texture feedback counts")?,
-            gpu: device.gpu_malloc(dl, 1, "texture feedback")?,
-            readback: device.gpu_malloc(
-                MemoryKind::Readback,
-                readback_words(records.max(1)) as u64 * fif,
-                "texture feedback readback",
-            )?,
-            capacity: records.max(1),
-            cell_ranges: RangeAllocator::new(cells),
-            cell_capacity: cells,
+            cells: None,
+            cell_ranges: RangeAllocator::new(0),
+            cell_capacity: 0,
             owners: BTreeMap::new(),
+            counts: device.gpu_malloc(dl, u64::from(fif.max(1)), "texture feedback counts")?,
+            gpu: device.gpu_malloc(dl, 1, "texture feedback")?,
+            slots: (0..fif.max(1))
+                .map(|_| SlotRecords::new(device, records))
+                .collect::<Result<_>>()?,
+            records: Capacity::new(records, u32::MAX),
+            raised: 0,
+            retry: 0,
         })
     }
 
-    /// The records that clear the cells, for the first frame.
-    pub(crate) fn init(&self) -> Record {
-        Record::fill(
-            0,
-            self.cells.gpu().address().0,
-            self.cell_capacity.max(1),
-            0,
-        )
-    }
-
-    /// Cells for `count` cells of a texture.
-    pub(crate) fn alloc(&mut self, owner: (MountId, u32), count: u32) -> Option<u32> {
-        let first = self.cell_ranges.alloc(count)?;
+    /// Cells for `count` cells of a texture. Without a free run that long the cells grow: the
+    /// frames in flight keep the old ones, and every cell of the new ones starts unraised, as
+    /// a frame's first tap of a cell raises it whatever it held.
+    pub(crate) fn alloc(
+        &mut self,
+        owner: (MountId, u32),
+        count: u32,
+        w: &mut Apply<'_>,
+    ) -> Result<u32> {
+        let first = match self.cell_ranges.alloc(count) {
+            Some(first) => first,
+            None => {
+                let grown = self
+                    .cell_capacity
+                    .checked_add(count)
+                    .ok_or(Error::Capacity {
+                        what: "texture feedback cells",
+                        capacity: u32::MAX,
+                    })?
+                    .max(self.cell_capacity.saturating_mul(2));
+                let cells = w.device.gpu_malloc(
+                    MemoryKind::DeviceLocal,
+                    u64::from(grown),
+                    "texture feedback cells",
+                )?;
+                w.fill(cells.gpu(), grown, 0);
+                self.cells = Some(cells);
+                self.cell_ranges
+                    .free(self.cell_capacity, grown - self.cell_capacity);
+                self.cell_capacity = grown;
+                self.cell_ranges
+                    .alloc(count)
+                    .expect("the grown cells end in a free run of `count`")
+            }
+        };
         self.owners.insert(first, (owner.0, owner.1, count));
-        Some(first)
+        Ok(first)
     }
 
     pub(crate) fn free(&mut self, first: u32) {
@@ -309,58 +368,79 @@ impl TextureFeedback {
         }
     }
 
-    /// Starts `frame` in readback slot `slot`: its taps stamp the frame, its record count
-    /// starts at 0, and the cells clear when the 24-bit frame stamp wraps.
-    pub(crate) fn begin(&self, frame: u64, slot: usize, w: &mut Apply<'_>) -> Result<()> {
+    /// Starts `frame` in readback slot `slot`: the slot's records take the size the completed
+    /// frames want, its taps stamp the frame, its raise count starts at 0, and the cells clear
+    /// when the 24-bit frame stamp wraps. Without device memory for new records the slot keeps
+    /// its own, the frame starts with them and the allocation's error comes back, and no resize
+    /// is tried before `period` frames have passed.
+    pub(crate) fn begin(
+        &mut self,
+        frame: u64,
+        slot: usize,
+        period: u64,
+        w: &mut Apply<'_>,
+    ) -> Result<Option<Error>> {
+        let mut short = None;
+        let wanted = self.records.wanted();
+        if self.slots[slot].capacity != wanted && frame >= self.retry {
+            match SlotRecords::new(w.device, wanted) {
+                Ok(s) => {
+                    self.slots[slot] = s;
+                    self.records.set(wanted);
+                }
+                Err(e) if e.is_out_of_memory() => {
+                    self.retry = frame + period;
+                    short = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let s = &mut self.slots[slot];
+        s.first = kept_from(frame, self.raised, s.capacity);
         let stamp = (frame & 0xff_ffff) as u32;
-        if stamp == 0 {
-            w.fill(self.cells.gpu(), self.cell_capacity.max(1), 0);
+        let cells = self.cells.as_ref().map_or(GpuPtr::NULL, Allocation::gpu);
+        if stamp == 0 && self.cell_capacity > 0 {
+            w.fill(cells, self.cell_capacity, 0);
         }
         let record = TextureFeedbackGpu {
-            cells: self.cells.gpu(),
-            records: self.records.gpu(),
+            cells,
+            records: s.records.gpu(),
             counts: self.counts.gpu(),
-            capacity: self.capacity,
+            capacity: s.capacity,
+            first: s.first,
             frame: stamp,
             slot: slot as u32,
-            _pad: 0,
         };
         w.put(self.gpu.gpu(), &[record])?;
-        w.put(self.counts.gpu().offset(slot as u64), &[0])
+        w.put(self.counts.gpu().offset(slot as u64), &[0])?;
+        Ok(short)
     }
 
-    /// Copies slot `slot`'s count and records into its readback, after every tap of the
+    /// Copies slot `slot`'s raise count and records into its readback, after every tap of the
     /// frame on `list`.
     pub(crate) fn record_end(&self, list: &mut CommandList<'_>, slot: usize) {
-        let words = readback_words(self.capacity);
-        let dst = self.readback.gpu().offset((slot * words) as u64);
+        let s = &self.slots[slot];
+        let dst = s.readback.gpu();
         list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
         list.copy(dst.cast(), self.counts.gpu().offset(slot as u64).cast(), 4);
         list.copy(
             dst.offset(1).cast(),
-            self.records
-                .gpu()
-                .offset(slot as u64 * u64::from(self.capacity))
-                .cast(),
-            8 * u64::from(self.capacity),
+            s.records.gpu().cast(),
+            8 * u64::from(s.capacity),
         );
         list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     }
 
-    /// The wanted mips frame `frame` reported from readback slot `slot`, and the raises past
-    /// the record capacity, which the frame lost.
-    pub(crate) fn read(&self, slot: usize, frame: u64) -> (Vec<WantedMip>, u32) {
-        let words = readback_words(self.capacity);
-        let data = &self.readback.as_slice().expect("readback is mapped")[slot * words..][..words];
-        let n = data[0].min(self.capacity) as usize;
-        let lost = data[0] - n as u32;
-        let stamp = (frame & 0xff_ffff) as u32;
-        let mut out = Vec::with_capacity(n);
-        for r in data[1..1 + 2 * n].as_chunks::<2>().0 {
+    /// The wanted mips the completed frame of readback slot `slot` reported, and its raises
+    /// that kept no record; takes its raise count for the record list's size.
+    pub(crate) fn read(&mut self, slot: usize) -> (Vec<WantedMip>, u32) {
+        let s = &self.slots[slot];
+        let data = s.readback.as_slice().expect("readback is mapped");
+        let raised = data[0];
+        let kept = raised.saturating_sub(s.first).min(s.capacity);
+        let mut out = Vec::with_capacity(kept as usize);
+        for r in data[1..][..2 * kept as usize].as_chunks::<2>().0 {
             let (cell, value) = (r[0], r[1]);
-            if value >> 8 != stamp {
-                continue;
-            }
             let Some((&first, &(mount, texture, count))) = self.owners.range(..=cell).next_back()
             else {
                 continue;
@@ -369,13 +449,35 @@ impl TextureFeedback {
                 out.push(((mount, texture), cell - first, 255 - (value & 255)));
             }
         }
-        (out, lost)
+        self.records.observe(raised);
+        self.raised = raised;
+        (out, raised - kept)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_square_keeps_every_run_of_raises_within_as_many_reports() {
+        for (raised, capacity) in [(0u32, 4), (3, 4), (8, 4), (9, 4), (62_000, 16_384)] {
+            let runs = u64::from(raised.div_ceil(capacity).max(1));
+            for start in 0..2 * FEEDBACK_PERIOD {
+                let mut heard = vec![false; raised as usize];
+                for report in 0..runs {
+                    let first = kept_from(start + report * FEEDBACK_PERIOD, raised, capacity);
+                    assert!(first == 0 || first + capacity <= raised, "a full run");
+                    let end = (first + capacity).min(raised);
+                    heard[first as usize..end as usize].fill(true);
+                }
+                assert!(
+                    heard.iter().all(|&h| h),
+                    "{raised} raises in records of {capacity}, from frame {start}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn compaction_moves_the_smallest_runs_tiles_to_the_end_of_the_largest() {
