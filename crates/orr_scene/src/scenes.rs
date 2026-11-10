@@ -20,6 +20,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::accel::{AccelKernels, AccelLimits, AccelShared};
 use crate::arena::{ArenaReport, ArenaRequest, ViewArena, ViewStep};
 use crate::decals::{self, build_bins};
+use crate::detail::{Detail, Sample};
 use crate::features::SceneFeatures;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
@@ -54,6 +55,42 @@ use crate::{
     SceneRoot, TextureStreamGpu,
 };
 
+/// The size of a pool: bytes, or a share of the device-local heap its memory is on, which
+/// [`Scenes::new`] resolves once from the heap's size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolSize {
+    Bytes(u64),
+    /// Percent of the heap.
+    HeapPercent(u32),
+}
+
+impl PoolSize {
+    /// Its bytes on a heap of `heap` bytes.
+    pub fn bytes(self, heap: u64) -> u64 {
+        match self {
+            Self::Bytes(b) => b,
+            Self::HeapPercent(p) => (u128::from(heap) * u128::from(p) / 100) as u64,
+        }
+    }
+}
+
+/// The bytes of the pools [`PoolSize`] gives, on the device.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PoolBytes {
+    pub(crate) mesh: u64,
+    pub(crate) textures: u64,
+}
+
+impl PoolBytes {
+    fn new(device: &Device, b: &Budgets) -> Self {
+        let heap = device.memory_report().heap_of(MemoryKind::DeviceLocal).size;
+        Self {
+            mesh: b.mesh_page_pool.bytes(heap),
+            textures: b.texture_pool.bytes(heap),
+        }
+    }
+}
+
 /// Pool sizes and per-frame limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budgets {
@@ -87,7 +124,8 @@ pub struct Budgets {
     /// for a later frame.
     pub traversal_requests: u32,
     /// Clusters of the ray-tracing cuts a scene's traversal gathers in a frame, and CLAS
-    /// that frame's cluster BLAS take; copies past it trace a cached cut.
+    /// that frame's cluster BLAS take. A scene's gathered cuts coarsen evenly while the
+    /// frames want more; until they have, copies past it trace a cached cut. Above 0.
     pub rt_cut_clusters: u32,
     /// Cluster BLAS a scene builds in a frame for the cuts of copies near the focus; copies
     /// past it trace a cached cut.
@@ -104,12 +142,14 @@ pub struct Budgets {
     /// Per-frame PTLAS work beyond mandatory work, in rebuilt instances: the full instance
     /// count of every partition a write touches plus one per update.
     pub ptlas_rebuilt: u32,
-    /// Bytes of resident mesh pages, of the CLAS and micromaps streamed pages build, which
-    /// count at an estimate from their triangles until a page's first load has built them,
-    /// and of resident hierarchy pages, which a streamed page's groups need beside it.
-    /// The CLAS pool's address range is as large, up to the 512 GiB its 32-bit unit indices
-    /// name, and bound in pages as they need.
-    pub mesh_page_pool: u64,
+    /// Resident mesh pages, the CLAS and micromaps streamed pages build, which count at an
+    /// estimate from their triangles until a page's first load has built them, and resident
+    /// hierarchy pages, which a streamed page's groups need beside it. The CLAS pool's address
+    /// range is as large, up to the 512 GiB its 32-bit unit indices name, and bound in pages
+    /// as they need. While the frames want more than the pool's budget holds, the error
+    /// thresholds geometry is chosen by coarsen evenly until they want what it holds
+    /// ([`DetailStats`]).
+    pub mesh_page_pool: PoolSize,
     /// Bytes of `mesh_page_pool` per entry of the resident cluster table, which holds the
     /// clusters of resident mesh pages and of edits' own pages, 24 B each. A mount whose
     /// pinned pages' clusters find no room fails, and a streamed page that finds none loads
@@ -119,8 +159,8 @@ pub struct Budgets {
     /// Bytes of pages a DAG mesh keeps resident from mount; the pages of a larger one past
     /// its pinned coarsest pages stream on the traversal's requests.
     pub mesh_resident_max: u64,
-    /// Bytes of resident textures: whole textures, streamed textures' mip tails and tiles.
-    pub texture_pool: u64,
+    /// Resident textures: whole textures, streamed textures' mip tails and tiles.
+    pub texture_pool: PoolSize,
     /// Bytes of resident instance pages.
     pub instance_page_pool: u64,
     /// Bytes of requested blobs loading or landed and not released.
@@ -165,10 +205,10 @@ impl Default for Budgets {
             stream_clas_triangles: 1 << 18,
             micromap_pages: 64,
             ptlas_rebuilt: 250_000,
-            mesh_page_pool: 3 << 30,
+            mesh_page_pool: PoolSize::HeapPercent(40),
             resident_cluster_bytes: 1024,
             mesh_resident_max: 1 << 20,
-            texture_pool: 4 << 30,
+            texture_pool: PoolSize::HeapPercent(30),
             instance_page_pool: 256 << 20,
             user_blob_pool: 256 << 20,
             texture_feedback_cells: 1 << 20,
@@ -201,9 +241,12 @@ pub struct RendererDesc {
     /// Archive reads are positioned reads on workers even where the system's completion
     /// ring (IoRing, io_uring) is available.
     pub positioned_reads: bool,
-    /// Raster LOD: the largest cluster error drawn, in render pixels at the scene focus.
+    /// Raster LOD: the largest cluster error drawn, in render pixels at the scene focus, times
+    /// [`DetailStats::memory_scale`].
     pub raster_error_pixels: f32,
-    /// Ray-tracing LOD: the largest cluster error traced, in render pixels at the scene focus.
+    /// Ray-tracing LOD: the largest cluster error traced, in render pixels at the scene focus,
+    /// times [`DetailStats::memory_scale`] and, in a gathered cut, its scene's
+    /// [`DetailStats::rt_scale`].
     pub rt_error_pixels: f32,
     /// Copies no view drew last frame trace at this many times `rt_error_pixels`.
     pub culled_error_scale: f32,
@@ -298,6 +341,26 @@ pub struct FrameStats {
     pub skin: SkinStats,
     /// The tessellated producer entries of the frame's scenes.
     pub tessellation: TessellationStats,
+    pub detail: DetailStats,
+}
+
+/// The detail a frame ran at: the scales of the error thresholds geometry is chosen by
+/// ([`RendererDesc::raster_error_pixels`], [`RendererDesc::rt_error_pixels`]) that keep what
+/// the frames want within the mesh page pool and the gathers' capacity.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DetailStats {
+    /// The scale of both thresholds, from the mesh page pool's demand; 1 at the configured
+    /// detail.
+    pub memory_scale: f32,
+    /// The largest further scale of the ray-tracing threshold of gathered cuts in its scenes,
+    /// from the clusters they wanted against [`Budgets::rt_cut_clusters`].
+    pub rt_scale: f32,
+    /// What the mesh page pool was asked for at the frame's detail: its pinned, locked and
+    /// loading pages, and those the frame read or requested with what they depend on, whether
+    /// or not the budget took them; and the pool's budget then. 0 when the frame updated no
+    /// scene.
+    pub mesh_demand: u64,
+    pub mesh_budget: u64,
 }
 
 /// Scene compute: a listed scene's turn in `update_scenes`, after its uploads have landed.
@@ -351,6 +414,8 @@ struct Core {
     raster_error_pixels: f32,
     rt_error_pixels: f32,
     culled_error_scale: f32,
+    /// The scale of both thresholds for the mesh page pool ([`DetailStats::memory_scale`]).
+    memory: Detail,
     rt_merge_pixels: f32,
     software_raster_pixels: f32,
     alias_view_targets: bool,
@@ -440,9 +505,10 @@ impl Scenes {
             b.resident_cluster_bytes > 0,
             "resident_cluster_bytes is above 0"
         );
+        assert!(b.rt_cut_clusters > 0, "rt_cut_clusters is above 0");
+        let pools = PoolBytes::new(device, b);
         // Cluster ids are 32 bits.
-        let clusters =
-            u32::try_from(b.mesh_page_pool / b.resident_cluster_bytes).unwrap_or(u32::MAX);
+        let clusters = u32::try_from(pools.mesh / b.resident_cluster_bytes).unwrap_or(u32::MAX);
         let accel = Arc::new(AccelShared {
             kernels: AccelKernels::new(device, desc.kernels)?,
             limits: AccelLimits {
@@ -463,6 +529,7 @@ impl Scenes {
                 page_table: b.mesh_pages,
             },
             b,
+            pools,
             &accel,
             materials.streams.gpu(),
             desc.frames_in_flight,
@@ -517,6 +584,7 @@ impl Scenes {
                 raster_error_pixels: desc.raster_error_pixels,
                 rt_error_pixels: desc.rt_error_pixels,
                 culled_error_scale: desc.culled_error_scale,
+                memory: Detail::new(),
                 rt_merge_pixels: desc.rt_merge_pixels,
                 software_raster_pixels: desc.software_raster_pixels,
                 alias_view_targets: desc.alias_view_targets,
@@ -1059,6 +1127,8 @@ impl Scenes {
                     cuts.figures(slot, &mut f.stats.cuts);
                     cuts.feedback(slot, &mut feedback);
                     cuts.observe(slot);
+                    let rt = &mut f.stats.detail.rt_scale;
+                    *rt = rt.max(cuts.rt_scale(slot));
                 }
                 if let Some(skin) = &cpu.skin_frame {
                     f.stats.skin.add(&skin.figures(slot));
@@ -1070,8 +1140,24 @@ impl Scenes {
                     h.visible.observe(wanted);
                 }
             }
+            // A frame that updated no scene read nothing, so it says nothing of what one wants.
+            let sampled = !f.updated.is_empty();
+            if sampled {
+                core.mounts.streaming.begin_sample();
+            }
             core.mounts.page_feedback(&feedback, frame);
             core.mounts.streaming.texture_feedback(slot, f.id);
+            if sampled {
+                let mesh = core.mounts.streaming.end_sample();
+                core.memory.step(Sample {
+                    scale: f.stats.detail.memory_scale,
+                    demand: mesh.bytes,
+                    capacity: mesh.budget,
+                    sheddable: mesh.streamed > 0,
+                });
+                f.stats.detail.mesh_demand = mesh.bytes;
+                f.stats.detail.mesh_budget = mesh.budget;
+            }
             core.completed_frame = f.id;
             core.stats = f.stats;
         }
@@ -1161,6 +1247,7 @@ impl Scenes {
         loading_points.extend(core.mounts.streaming.step(
             frame,
             settled,
+            core.memory.scale() > 1.0,
             &self.loading,
             &mut apply,
         )?);
@@ -1966,7 +2053,7 @@ impl<'a> Frame<'a> {
                 &core.skin,
                 root,
                 focus,
-                core.raster_error_pixels,
+                core.raster_error_pixels * core.memory.scale(),
                 cpu.skinned_high_water,
                 (self.id % u64::from(core.fif)) as usize,
             )?;
@@ -1979,11 +2066,13 @@ impl<'a> Frame<'a> {
                 let w = WorldPos::new(f, core.cell_log2);
                 (w.cell.extend(1).to_array(), w.offset.extend(ppr).to_array())
             });
+            let memory_scale = core.memory.scale();
             let inputs = CutInputs {
                 scene: root,
                 focus,
-                raster_pixels: core.raster_error_pixels,
-                rt_pixels: core.rt_error_pixels,
+                raster_pixels: core.raster_error_pixels * memory_scale,
+                rt_pixels: core.rt_error_pixels * memory_scale,
+                memory_scale,
                 culled_scale: core.culled_error_scale,
                 merge_pixels: core.rt_merge_pixels,
                 slots: cpu.ptlas.high_water,
@@ -2524,6 +2613,12 @@ impl<'a> Frame<'a> {
             cuts: CutStats::default(),
             skin: SkinStats::default(),
             tessellation: TessellationStats::default(),
+            // `begin_frame` alone steps the scale, so it is the one this frame recorded at.
+            detail: DetailStats {
+                memory_scale: self.core.memory.scale(),
+                rt_scale: 1.0,
+                ..DetailStats::default()
+            },
         };
         self.core.in_flight.push_back(InFlight {
             id: self.id,

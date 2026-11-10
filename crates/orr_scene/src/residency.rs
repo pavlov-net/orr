@@ -43,6 +43,12 @@
 //! consumer's memory and keep their configured budget. A failed allocation shrinks every
 //! budget by a step, and a class whose units' shared address range runs out shrinks alone;
 //! each grows back a step after a response period without.
+//!
+//! A sample ([`Residency::begin_sample`]) measures what one completed frame wants of each
+//! class: every unit pinned, locked or loading, and every unit the frame's feedback reads or
+//! requests with the units it depends on, each unit once and a requested one whether or not
+//! its budget takes it. What a frame's detail asks for beyond the budget shows there, which the
+//! requests a plan turns down do not.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -226,6 +232,17 @@ impl ResidencyStats {
     }
 }
 
+/// What one sample found a class's units want ([`Residency::end_sample`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Demand {
+    /// Bytes of the units the sample counts.
+    pub(crate) bytes: u64,
+    /// Of them, those neither pinned nor locked: all a coarser detail can shed.
+    pub(crate) streamed: u64,
+    /// The class's budget at the sample.
+    pub(crate) budget: u64,
+}
+
 /// A request's priority among its source's: the larger projected error first, then the nearer
 /// cell.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -301,6 +318,8 @@ struct Unit {
     listed: u64,
     /// While it loads, the lane whose request started it.
     lane: usize,
+    /// The last sample that counted it among the units a frame read or requested.
+    sampled: u64,
 }
 
 impl Unit {
@@ -312,6 +331,11 @@ impl Unit {
     /// Whether an eviction may take it once it is past its hold.
     fn evictable(&self) -> bool {
         self.state == State::Resident && !self.pinned && self.locks == 0 && self.dependents == 0
+    }
+
+    /// Whether it is resident and pinned or locked.
+    fn fixed(&self) -> bool {
+        self.state == State::Resident && (self.pinned || self.locks > 0)
     }
 }
 
@@ -540,6 +564,16 @@ pub(crate) struct Residency {
     /// Resident plus loading bytes per class.
     used: [u64; CLASSES],
     loading_bytes: [u64; CLASSES],
+    /// Bytes of resident pinned or locked units per class.
+    fixed: [u64; CLASSES],
+    /// The number of the latest sample, 0 before the first, and whether it is being taken.
+    sample: u64,
+    sampling: bool,
+    /// Per class, the bytes of the units the sample has counted that are neither pinned,
+    /// locked nor loading.
+    tally: [u64; CLASSES],
+    /// The units [Residency::count_from] has yet to visit.
+    stack: Vec<u32>,
     resident_units: [u32; CLASSES],
     /// Bytes of the streamed lanes' loads in flight, in all and by lane.
     in_flight: u64,
@@ -566,6 +600,11 @@ impl Residency {
             evictable: Default::default(),
             used: [0; CLASSES],
             loading_bytes: [0; CLASSES],
+            fixed: [0; CLASSES],
+            sample: 0,
+            sampling: false,
+            tally: [0; CLASSES],
+            stack: Vec::new(),
             resident_units: [0; CLASSES],
             in_flight: 0,
             lane_in_flight: [0; LANES],
@@ -745,6 +784,7 @@ impl Residency {
                 touched: 0,
                 listed: 0,
                 lane: 0,
+                sampled: 0,
             })
             .collect();
         for i in 0..list.len() {
@@ -755,6 +795,7 @@ impl Residency {
             u.state = State::Resident;
             let c = u.class as usize;
             self.used[c] += u.held();
+            self.fixed[c] += u.held();
             self.resident_units[c] += 1;
             for d in list[i].deps.clone() {
                 list[d as usize].dependents += 1;
@@ -776,6 +817,9 @@ impl Residency {
                 State::Resident => {
                     self.used[c] -= u.held();
                     self.resident_units[c] -= 1;
+                    if u.fixed() {
+                        self.fixed[c] -= u.held();
+                    }
                     if u.evictable() {
                         let k = Key {
                             mount,
@@ -809,6 +853,20 @@ impl Residency {
         if self.unit(k).is_none() {
             return;
         }
+        if self.sampling
+            && let Some(wanted) = self.wanted(k, |_, u| u.sampled == self.sample)
+        {
+            for q in wanted {
+                let adds = self.adds(q);
+                let u = self
+                    .mounts
+                    .get_mut(&q.mount)
+                    .and_then(|m| m.get_mut(q.unit as usize))
+                    .expect("a unit of a mount");
+                u.sampled = self.sample;
+                self.tally[u.class as usize] += adds;
+            }
+        }
         self.requests
             .entry(k)
             .and_modify(|q| {
@@ -835,7 +893,115 @@ impl Residency {
                 list.unlist(k, u);
                 list.list(k, u);
             }
+            if self.sampling {
+                self.count_from(k);
+            }
         }
+    }
+
+    /// Counts resident `k` in the sample being taken, with the units it depends on: the
+    /// resident ones neither pinned nor locked that the sample has not counted.
+    fn count_from(&mut self, k: Key) {
+        let units = self.mounts.get_mut(&k.mount).expect("a unit of a mount");
+        let mut stack = std::mem::take(&mut self.stack);
+        stack.push(k.unit);
+        while let Some(i) = stack.pop() {
+            let u = &mut units[i as usize];
+            if u.sampled == self.sample || u.fixed() {
+                continue;
+            }
+            debug_assert_eq!(
+                u.state,
+                State::Resident,
+                "a resident unit's dependencies are"
+            );
+            u.sampled = self.sample;
+            self.tally[u.class as usize] += u.held();
+            stack.extend_from_slice(&u.deps);
+        }
+        self.stack = stack;
+    }
+
+    /// Starts a sample of what one completed frame wants: until [`Residency::end_sample`],
+    /// what [`Residency::touch`] and [`Residency::request`] see counts.
+    pub(crate) fn begin_sample(&mut self) {
+        self.sample += 1;
+        self.sampling = true;
+        self.tally = [0; CLASSES];
+    }
+
+    /// Ends the sample [`Residency::begin_sample`] started; returns each class's demand by
+    /// [`ResidencyClass::ALL`] order.
+    pub(crate) fn end_sample(&mut self) -> [Demand; CLASSES] {
+        self.sampling = false;
+        std::array::from_fn(|c| {
+            let bytes = self.fixed[c] + self.loading_bytes[c] + self.tally[c];
+            Demand {
+                bytes,
+                streamed: bytes - self.fixed[c],
+                budget: self.budgets[c],
+            }
+        })
+    }
+
+    /// The units `k` needs held to be resident that `counted` passes over: `k` and the units
+    /// it depends on, but for the pinned and locked ones; none when one of them failed, as
+    /// `k` never loads. Loading ones are among them, which hold their bytes already.
+    fn wanted(&self, k: Key, counted: impl Fn(Key, &Unit) -> bool) -> Option<Vec<Key>> {
+        let units = self.mounts.get(&k.mount)?;
+        let mut out = Vec::new();
+        let mut stack = vec![k.unit];
+        while let Some(unit) = stack.pop() {
+            let k = Key {
+                mount: k.mount,
+                unit,
+            };
+            let u = &units[unit as usize];
+            if u.fixed() || out.contains(&k) || counted(k, u) {
+                continue;
+            }
+            if u.state == State::Failed {
+                return None;
+            }
+            out.push(k);
+            stack.extend_from_slice(&u.deps);
+        }
+        Some(out)
+    }
+
+    /// The bytes [`Residency::wanted`] adds for `k`, which loading units hold already.
+    fn adds(&self, k: Key) -> u64 {
+        let u = self.unit(k).expect("a unit of a mount");
+        if u.state == State::Loading {
+            0
+        } else {
+            u.held()
+        }
+    }
+
+    /// Bytes that `keys`, resident, would add to the latest sample's demand: what they need
+    /// held and the sample left out, leaving the units in `seen`, each unit once; the units
+    /// counted go into `mine`. None when one of them never loads.
+    pub(crate) fn unsampled(
+        &self,
+        keys: impl IntoIterator<Item = Key>,
+        seen: &FxHashSet<Key>,
+        mine: &mut FxHashSet<Key>,
+    ) -> Option<u64> {
+        let mut bytes = 0;
+        for k in keys {
+            let counted = |k: Key, u: &Unit| {
+                u.sampled == self.sample
+                    || u.state == State::Loading
+                    || seen.contains(&k)
+                    || mine.contains(&k)
+            };
+            for q in self.wanted(k, counted)? {
+                mine.insert(q);
+                bytes += self.held(q);
+            }
+        }
+        Some(bytes)
     }
 
     /// Keeps resident `k` from being evicted until as many [`Residency::unlock`]s: a cached
@@ -847,8 +1013,12 @@ impl Residency {
             .and_then(|m| m.get_mut(k.unit as usize))
             .expect("a unit of a mount");
         debug_assert_eq!(u.state, State::Resident);
+        let c = u.class as usize;
         if u.evictable() {
-            self.evictable[u.class as usize].unlist(k, u);
+            self.evictable[c].unlist(k, u);
+        }
+        if !u.fixed() {
+            self.fixed[c] += u.held();
         }
         u.locks += 1;
     }
@@ -859,9 +1029,13 @@ impl Residency {
             .get_mut(&k.mount)
             .and_then(|m| m.get_mut(k.unit as usize))
         {
+            let c = u.class as usize;
             u.locks -= 1;
+            if !u.fixed() {
+                self.fixed[c] -= u.held();
+            }
             if u.evictable() {
-                self.evictable[u.class as usize].list(k, u);
+                self.evictable[c].list(k, u);
             }
         }
     }
@@ -1482,14 +1656,21 @@ mod tests {
         plan
     }
 
-    /// Checks each class's evictable units and their aged bytes against its units.
+    /// Checks each class's evictable units and their aged bytes, and its pinned and locked
+    /// bytes, against its units.
     fn check(r: &Residency) {
         for (c, list) in r.evictable.iter().enumerate() {
             let mut lru = BTreeSet::new();
-            let mut aged = 0;
+            let (mut aged, mut fixed) = (0, 0);
             for (&mount, units) in &r.mounts {
                 for (i, u) in units.iter().enumerate() {
-                    if u.class as usize != c || !u.evictable() {
+                    if u.class as usize != c {
+                        continue;
+                    }
+                    if u.fixed() {
+                        fixed += u.held();
+                    }
+                    if !u.evictable() {
                         continue;
                     }
                     let unit = i as u32;
@@ -1500,7 +1681,11 @@ mod tests {
                     }
                 }
             }
-            assert_eq!((&list.lru, list.aged), (&lru, aged), "class {c}");
+            assert_eq!(
+                (&list.lru, list.aged, r.fixed[c]),
+                (&lru, aged, fixed),
+                "class {c}"
+            );
         }
     }
 
@@ -2012,6 +2197,82 @@ mod tests {
             (&plan.loads[..], plan.blobs),
             (&[key(0), key(1), key(2)][..], 1)
         );
+    }
+
+    #[test]
+    fn a_sample_counts_what_cannot_go_and_what_the_frame_wants_each_unit_once() {
+        let mut r = Residency::new(limits(10_000));
+        let deps: [&[u32]; 11] = [
+            &[],
+            &[0],
+            &[0],
+            &[2],
+            &[0],
+            &[0],
+            &[0],
+            &[8],
+            &[5],
+            &[10],
+            &[0],
+        ];
+        let bytes = [100, 10, 20, 30, 40, 50, 60, 70, 80, 90, 15];
+        let units: Vec<UnitDesc> = (0..11)
+            .map(|u| {
+                let start = if u == 0 { Start::Pinned } else { Start::Absent };
+                unit(bytes[u], deps[u], start)
+            })
+            .collect();
+        r.register(M, &units).unwrap();
+        // 2 under 3, 1 locked, 10 failed, 6 loading.
+        assert_eq!(step(&mut r, &[1, 3, 4, 5], 1).loads.len(), 5);
+        r.request(key(10), P, S);
+        assert_eq!(r.plan(2, []).loads, [key(10)]);
+        r.landed(key(10), false, 2);
+        r.lock(key(1));
+        r.request(key(6), P, S);
+        assert_eq!(r.plan(3, []).loads, [key(6)]);
+        check(&r);
+
+        let demand = |r: &mut Residency, frame: u64, f: &dyn Fn(&mut Residency)| {
+            r.begin_sample();
+            f(r);
+            r.touch(key(4), frame);
+            r.end_sample()[ResidencyClass::InstancePages as usize]
+        };
+        // Pinned, locked and loading: 0, 1 and 6, 170. Wanted: 3 read with 2 under it, 4, and
+        // 7 with 8 and the resident 5 that 8 needs; 9 never loads over 10, and 2 and 6 count
+        // once.
+        let d = demand(&mut r, 4, &|r| {
+            r.touch(key(3), 4);
+            r.touch(key(2), 4);
+            for u in [4, 7, 7, 9, 6] {
+                r.request(key(u), P, S);
+            }
+        });
+        assert_eq!(
+            d,
+            Demand {
+                bytes: 170 + 30 + 20 + 40 + 70 + 80 + 50,
+                streamed: 460 - 110,
+                budget: 10_000,
+            }
+        );
+        // A touch outside a sample counts in none, and the untouched 2, 3, 5 in this one.
+        r.touch(key(3), 4);
+        assert_eq!(demand(&mut r, 5, &|_| {}).bytes, 170 + 40);
+
+        // What 7, 3 and 4 resident would add to the latest sample, in which only 4 was read.
+        let mut seen = FxHashSet::default();
+        let mut mine = FxHashSet::default();
+        let keys = [key(7), key(3), key(4)];
+        assert_eq!(
+            r.unsampled(keys, &seen, &mut mine),
+            Some(70 + 80 + 50 + 30 + 20)
+        );
+        seen.insert(key(5));
+        let mut mine = FxHashSet::default();
+        assert_eq!(r.unsampled([key(7)], &seen, &mut mine), Some(150));
+        assert_eq!(r.unsampled([key(9)], &seen, &mut mine), None);
     }
 
     #[test]

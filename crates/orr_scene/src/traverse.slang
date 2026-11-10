@@ -55,13 +55,16 @@ public struct TraverseRoot
     public int4 focus_cell;
     public float4 focus_offset;    // w: pixels per radian
     public float raster_pixels;
-    public float rt_pixels;
+    public float rt_pixels;        // the cached cuts copies trace, and times `gather_scale` the gathered ones
     public float culled_scale;     // RT error threshold scale of slots no view drew last frame
     public float merge_pixels;     // slots of a smaller projected radius trace a merged cut
     public uint slots;
     public uint pass;
     public uint flags;             // TRAVERSE_*
     public uint models;
+    public float gather_scale;     // RT error threshold scale of gathered cuts, so that they fit
+    public uint _pad0;
+    public uint64_t _pad1;
 }
 ORR_ROOT(TraverseRoot);
 
@@ -82,11 +85,14 @@ float focus_error(Placement p, float4 sphere, float error)
 }
 
 // Adds the cluster of cluster id `id`, mesh cluster `mesh_cluster`, to the ray-tracing cut of
-// slot `c`, `work` its entry's slot. The cut's hash is over mesh clusters, as a cached cut's.
-void gather_cluster(CutGpu* cut, SlotCutGpu* c, uint work, uint id, uint mesh_cluster)
+// slot `c`, `work` its entry's slot; `fixed` when no coarser threshold would leave it out. The
+// cut's hash is over mesh clusters, as a cached cut's.
+void gather_cluster(CutGpu* cut, SlotCutGpu* c, uint work, uint id, uint mesh_cluster, bool fixed)
 {
     uint e;
     InterlockedAdd(cut.counters[CUT_ENTRIES], 1, e);
+    if (fixed)
+        InterlockedAdd(cut.counters[CUT_ENTRIES_FIXED], 1);
     if (e >= cut.entry_capacity)
     {
         InterlockedAdd(cut.counters[CUT_ENTRIES_DROPPED], 1);
@@ -132,7 +138,8 @@ float cut_error(MeshGpu* mesh, Placement p, float4 sphere, float error)
 // What scales a slot's errors and thresholds this frame.
 struct Lod
 {
-    float threshold[2];   // raster, ray tracing: pixels
+    float threshold[2];   // raster, gathered ray tracing: pixels
+    float cached;         // the ray-tracing threshold of the cached cuts it traces or wants
     float scale;          // the error scale debug_lod sets
     int level;            // DAG level held by debug_lod, -1 none
 }
@@ -149,7 +156,8 @@ Lod slot_lod(SceneRoot* s, InstanceGpu inst, uint slot)
         debug = 1.0 / f16tof32(d);
     bool seen = s.slot_state[slot].last_visible_frame + 1 >= s.frame_index && s.slot_state[slot].last_visible_frame != 0;
     l.threshold[0] = root.raster_pixels;
-    l.threshold[1] = root.rt_pixels * (seen ? 1.0 : root.culled_scale);
+    l.cached = root.rt_pixels * (seen ? 1.0 : root.culled_scale);
+    l.threshold[1] = l.cached * root.gather_scale;
     l.scale = debug;
     return l;
 }
@@ -388,7 +396,7 @@ void init(uint3 id: SV_DispatchThreadID)
     float range = float(inst.rt_range) * ((st.rt_flags & RT_IN_RANGE) != 0 ? RT_HYSTERESIS : 1.0);
     bool ray = (inst.flags & INSTANCE_RAY) != 0 && mesh.rt_cut_count > 0 && (!has_focus() || distance <= range);
     if (ray)
-        c.rt_cut = cached_cut(mesh, st, p.scale * l.scale, distance, l.threshold[1], lowest_cut(mesh, inst));
+        c.rt_cut = cached_cut(mesh, st, p.scale * l.scale, distance, l.cached, lowest_cut(mesh, inst));
     // The BLAS of a finer cut stay while a slot's PTLAS instance or this frame's cut names them.
     bool holds = (st.rt_flags & RT_WRITTEN) != 0 && ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) == near;
     if (holds)
@@ -406,10 +414,10 @@ void init(uint3 id: SV_DispatchThreadID)
         float far_distance = has_focus() ? max(length(place(p, far_sphere.xyz)) - far_sphere.w * p.scale, 0.0) : 0.0;
         if (ray && far_mesh.rt_cut_count > 0)
         {
-            c.far_cut = coarsest_cut(far_mesh, p.scale * l.scale, far_distance, l.threshold[1], 0);
+            c.far_cut = coarsest_cut(far_mesh, p.scale * l.scale, far_distance, l.cached, 0);
             touch_cut(cut, far_mesh, c.far_cut);
             touch_cut(cut, far_mesh, (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff);
-            want_cut(cut, far_mesh, p.scale * l.scale, far_distance, l.threshold[1], 0);
+            want_cut(cut, far_mesh, p.scale * l.scale, far_distance, l.cached, 0);
         }
         if (raster)
             raster_roots(s, cut, slot | COPY_FAR, far_mesh, p, far_sphere, l);
@@ -438,7 +446,7 @@ void init(uint3 id: SV_DispatchThreadID)
             for (uint i = 0; i < held.cluster_count; i++)
             {
                 if (!section_hidden(inst, load_cluster(data, held.first_cluster + i).section))
-                    gather_cluster(cut, cut.slots + slot, slot, id_first + i, mesh_first + i);
+                    gather_cluster(cut, cut.slots + slot, slot, id_first + i, mesh_first + i, true);
             }
         }
         return;
@@ -458,7 +466,7 @@ void init(uint3 id: SV_DispatchThreadID)
         InterlockedMin(cut.model_cut[inst.model], c.rt_cut);
     }
     if (ray && !gather)
-        want_cut(cut, mesh, p.scale * l.scale, distance, l.threshold[1], lowest_cut(mesh, inst));
+        want_cut(cut, mesh, p.scale * l.scale, distance, l.cached, lowest_cut(mesh, inst));
     if (gather)
         c.flags |= CUT_TRAVERSED | (gathers_parts(mesh, inst, st) ? CUT_PARTS : 0);
     if (raster)
@@ -780,7 +788,11 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             if (raster == RULE_IN)
                 raster_mask |= 1u << (i - run);
             if (ray == RULE_IN)
-                gather_cluster(cut, c, slot, id_first + i, mesh_first + i);
+            {
+                // A cluster whose parent no threshold takes, or one a debug level holds.
+                bool fixed = l.level >= 0 || isinf(cut_error(mesh, p, cl.parent_sphere, cl.parent_error * l.scale));
+                gather_cluster(cut, c, slot, id_first + i, mesh_first + i, fixed);
+            }
         }
         if (raster_mask != 0)
         {

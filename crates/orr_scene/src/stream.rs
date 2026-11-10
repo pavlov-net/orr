@@ -24,9 +24,10 @@
 //! render thread, which takes batches in the order their tasks were sent and drops the pages
 //! whose decode failed.
 //!
-//! The step also builds a streaming mesh's finer cached cuts once their pages are resident,
-//! holding those pages locked until no copy uses the cut, and moves tiles of a texture that
-//! lost one back beside its others.
+//! The step also builds a streaming mesh's finer cached cuts that copies want once their pages
+//! are resident, admitting each whole when the mesh page pool has room for it, holding its pages
+//! locked until no copy uses the cut, and moves tiles of a texture that lost one back beside its
+//! others.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,6 +46,7 @@ use crate::accel::{
     self, AccelShared, Animated, ClusterInfo, Cut, CutMember, CutRow, FineCut, PageMicromap,
 };
 use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch, PoolMicromap, Shortfall};
+use crate::detail::LOW;
 use crate::edit::Mirror;
 use crate::loading::{
     BlobSource, Loading, Msg, Queue, Resumable, landed, read_into, reads_straight,
@@ -53,9 +55,10 @@ use crate::memory::{Block, Pool, PoolSlot};
 use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
 use crate::residency::{
-    HOLD_FRAMES, Held, InFlight, Key, Limits, Plan, Priority, RequestSource, Residency,
+    Demand, HOLD_FRAMES, Held, InFlight, Key, Limits, Plan, Priority, RequestSource, Residency,
     ResidencyClass, ResidencyStats, UnitDesc, response_period,
 };
+use crate::scenes::PoolBytes;
 use crate::shaders::page_decode::PageDecodeRoot;
 use crate::tiles::{TexResidency, TexStream, TextureFeedback, compaction_move};
 use crate::upload::Record;
@@ -165,8 +168,13 @@ struct Locks {
 }
 
 enum FineState {
-    /// Not built; asked for at this frame, if ever.
-    Empty(u64),
+    /// Not built: last wanted at frame `wanted` (0 never) to refine `error` pixels, and while
+    /// `admitted` loading its pages to be built.
+    Empty {
+        wanted: u64,
+        error: f32,
+        admitted: bool,
+    },
     /// Being built, holding `locks`.
     Building { locks: Locks },
     /// Built, last reported in use at `touched`, referencing `locks`.
@@ -175,8 +183,16 @@ enum FineState {
         touched: u64,
         locks: Locks,
     },
-    /// Its build failed; not built again while mounted.
+    /// Its build failed, or a page of it failed to load; not built again while mounted.
     Failed,
+}
+
+impl FineState {
+    const EMPTY: Self = Self::Empty {
+        wanted: 0,
+        error: 0.0,
+        admitted: false,
+    };
 }
 
 /// A streaming mesh's finer cached cuts on the render thread.
@@ -409,11 +425,12 @@ pub(crate) struct Streaming {
     units: Arc<Mutex<Pool>>,
     staging: Arc<Mutex<Pool>>,
     tiles: Arc<Mutex<Pool>>,
-    /// Finer cached cuts by mount and mesh; their builds take the half of the mesh page
-    /// budget they may lock in this order.
+    /// Finer cached cuts by mount and mesh.
     fine: BTreeMap<(MountId, u32), MeshFine>,
     /// Bytes of mesh pages they hold locked.
     fine_locked: u64,
+    /// What the latest sample since the last step found each class wants.
+    demand: Option<[Demand; ResidencyClass::ALL.len()]>,
     /// Finer cuts freed once the frame has completed.
     retired_cuts: Vec<(u64, FineCut)>,
     mounts: FxHashMap<MountId, MountStreams>,
@@ -466,13 +483,14 @@ impl Streaming {
     pub(crate) fn new(
         device: &Device,
         b: &Budgets,
+        pools: PoolBytes,
         accel: &Arc<AccelShared>,
         streams: GpuPtr<GpuPtr<TextureStreamGpu>>,
         fif: u32,
     ) -> Result<Self> {
         let mut budgets = [0; ResidencyClass::ALL.len()];
-        budgets[ResidencyClass::MeshPages as usize] = b.mesh_page_pool;
-        budgets[ResidencyClass::Textures as usize] = b.texture_pool;
+        budgets[ResidencyClass::MeshPages as usize] = pools.mesh;
+        budgets[ResidencyClass::Textures as usize] = pools.textures;
         budgets[ResidencyClass::InstancePages as usize] = b.instance_page_pool;
         budgets[ResidencyClass::UserBlobs as usize] = b.user_blob_pool;
         let caps = device.caps();
@@ -502,7 +520,7 @@ impl Streaming {
             "stream pool",
         )));
         let clas = if caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0 {
-            let pool = ClasPool::new(device, b.mesh_page_pool, b.stream_block)?;
+            let pool = ClasPool::new(device, pools.mesh, b.stream_block)?;
             Some(Arc::new(pool))
         } else {
             None
@@ -544,6 +562,7 @@ impl Streaming {
             ))),
             fine: BTreeMap::new(),
             fine_locked: 0,
+            demand: None,
             governed: {
                 let report = device.memory_report();
                 MemoryKind::ALL
@@ -701,7 +720,7 @@ impl Streaming {
             self.streamed = true;
         }
         for init in units.fine {
-            let slots = init.cuts.iter().map(|_| FineState::Empty(0)).collect();
+            let slots = init.cuts.iter().map(|_| FineState::EMPTY).collect();
             self.fine
                 .insert((mount, init.mesh), MeshFine { init, slots });
         }
@@ -764,7 +783,7 @@ impl Streaming {
             let f = self.fine.remove(&k).expect("listed");
             for state in f.slots {
                 let locks = match state {
-                    FineState::Empty(_) => continue,
+                    FineState::Empty { .. } => continue,
                     FineState::Failed => {
                         failed += 1;
                         continue;
@@ -1017,26 +1036,60 @@ impl Streaming {
         }
     }
 
-    /// Finer cut `k` of mesh `mesh` of `mount`: wanted, or reported in use in `frame`.
-    pub(crate) fn fine_cut(&mut self, mount: MountId, mesh: u32, k: u32, wanted: bool, frame: u64) {
+    /// Finer cut `k` of mesh `mesh` of `mount`: wanted by copies whose cached cut leaves
+    /// `request` pixels of error, or reported in use, in `frame`.
+    pub(crate) fn fine_cut(
+        &mut self,
+        mount: MountId,
+        mesh: u32,
+        k: u32,
+        request: Option<f32>,
+        frame: u64,
+    ) {
         let Some(f) = self.fine.get_mut(&(mount, mesh)) else {
             return;
         };
-        match f.slots.get_mut(k as usize) {
-            Some(FineState::Empty(at)) if wanted => *at = frame,
-            Some(FineState::Built { touched, .. }) => *touched = frame,
+        match (f.slots.get_mut(k as usize), request) {
+            (Some(FineState::Empty { wanted, error, .. }), Some(e)) => {
+                // The completed frames a step reads report at that step's frame.
+                *error = if *wanted == frame { error.max(e) } else { e };
+                *wanted = frame;
+            }
+            (Some(FineState::Built { touched, .. }), _) => *touched = frame,
             _ => {}
         }
     }
 
+    /// Starts the sample of a completed frame's feedback ([`Residency::begin_sample`]).
+    pub(crate) fn begin_sample(&mut self) {
+        self.residency.begin_sample();
+    }
+
+    /// Ends the sample [`Self::begin_sample`] started, which the next step's finer cuts admit
+    /// by; returns the mesh page pool's demand.
+    pub(crate) fn end_sample(&mut self) -> Demand {
+        let demand = self.residency.end_sample();
+        self.demand = Some(demand);
+        demand[ResidencyClass::MeshPages as usize]
+    }
+
     /// Lands built finer cuts, retires those unused past their hold (only once `settled`, the
     /// last frame by which every scene has reported what it holds, has passed their last
-    /// touch), asks for the pages of wanted ones and sends those whose pages are resident to
-    /// be built.
+    /// touch), admits wanted ones, loads the pages of admitted ones and sends those whose
+    /// pages are resident to be built.
+    ///
+    /// A cut is admitted whole, the larger error it would remove first, while the pages it
+    /// would lock fit half the mesh page budget beside those of the cuts built and admitted,
+    /// and what its loads add to the latest sample's demand keeps it, beside what those of the
+    /// cuts admitted add, under [`LOW`] of the budget. None is admitted under `pressure`, while
+    /// the detail is coarsened for the pool: the traversal's cut comes first. An admitted cut
+    /// asks for its pages and keeps them in their hold until it builds; it leaves admission when
+    /// no copy has wanted it for a hold, or under pressure.
     fn fine_step(
         &mut self,
         frame: u64,
         settled: u64,
+        pressure: bool,
         loading: &Arc<Loading>,
         w: &mut Apply<'_>,
     ) -> Result<Vec<TimelinePoint>> {
@@ -1049,7 +1102,7 @@ impl Streaming {
             let slot = batch.slot as usize;
             let at = f.init.table.offset(u64::from(batch.slot));
             let FineState::Building { locks } =
-                std::mem::replace(&mut f.slots[slot], FineState::Empty(0))
+                std::mem::replace(&mut f.slots[slot], FineState::EMPTY)
             else {
                 unreachable!("a slot has one build at a time")
             };
@@ -1093,6 +1146,9 @@ impl Streaming {
             .stats()
             .class(ResidencyClass::MeshPages)
             .budget;
+        // Cuts by mount, mesh and slot: admitted ones, and those wanted with their error.
+        let mut admitted_cuts = Vec::new();
+        let mut wanted_cuts = Vec::new();
         for (&(mount, mesh), f) in &mut self.fine {
             let m = &self.mounts[&mount];
             let unit = |p: u32| Key {
@@ -1101,12 +1157,12 @@ impl Streaming {
             };
             for k in 0..f.slots.len() {
                 let CutRow { threshold: t, row } = f.init.cuts[k];
-                match &f.slots[k] {
+                match &mut f.slots[k] {
                     FineState::Built { touched, .. }
-                        if touched + HOLD_FRAMES < frame && *touched < settled =>
+                        if *touched + HOLD_FRAMES < frame && *touched < settled =>
                     {
                         let FineState::Built { cut, locks, .. } =
-                            std::mem::replace(&mut f.slots[k], FineState::Empty(0))
+                            std::mem::replace(&mut f.slots[k], FineState::EMPTY)
                         else {
                             unreachable!("matched above")
                         };
@@ -1122,79 +1178,196 @@ impl Streaming {
                         }
                         self.fine_locked -= locks.bytes;
                     }
-                    FineState::Empty(at) if *at + 2 >= frame && *at != 0 => {
-                        let absent: Vec<u32> = f.init.pages[k]
-                            .iter()
-                            .copied()
-                            .filter(|&p| !self.residency.resident(unit(p)))
-                            .collect();
-                        let p = Priority {
-                            error: 1.0,
-                            cell_distance: 0,
-                        };
-                        if !absent.is_empty() {
-                            for q in absent {
-                                self.residency.request(unit(q), p, RequestSource::FinerCuts);
-                            }
-                            continue;
+                    FineState::Empty {
+                        wanted: at,
+                        admitted,
+                        ..
+                    } if *admitted => {
+                        if pressure || *at + HOLD_FRAMES < frame {
+                            *admitted = false;
+                        } else {
+                            admitted_cuts.push((mount, mesh, k));
                         }
-                        // A page lists its clusters here in the step the residency takes it
-                        // as resident, and the cut's clusters sit in these pages.
-                        let stream = &f.init.stream;
-                        let (mut clusters, mut members) = (Vec::new(), Vec::new());
-                        let mut pages = Vec::new();
-                        let mut error = 0.0f32;
-                        let held = (0..stream.pinned).chain(f.init.pages[k].iter().copied());
-                        for q in held {
-                            let r = f.init.resident[q as usize]
-                                .as_ref()
-                                .expect("a resident page's clusters");
-                            let first = stream.pages[q as usize].first;
-                            let before = clusters.len();
-                            for ((c, &clas), i) in r.infos.iter().zip(&r.clas).zip(first..) {
-                                if c.in_cut(t, f.init.merge) {
-                                    clusters.push(i);
-                                    members.push(CutMember {
-                                        clas,
-                                        part: f.init.animated.index(c),
-                                    });
-                                    error = error.max(c.self_error);
-                                }
-                            }
-                            if q >= stream.pinned && clusters.len() > before {
-                                pages.push(q);
-                            }
-                        }
-                        let bytes = pages.iter().map(|&q| self.residency.held(unit(q))).sum();
-                        if clusters.is_empty() || self.fine_locked + bytes > budget / 2 {
-                            continue;
-                        }
-                        for &q in &pages {
-                            self.residency.lock(unit(q));
-                        }
-                        self.fine_locked += bytes;
-                        f.slots[k] = FineState::Building {
-                            locks: Locks { pages, bytes },
-                        };
-                        loading.send(Msg::Cut(CutTask {
-                            mount,
-                            mesh,
-                            slot: k as u32,
-                            accel: Arc::clone(&self.accel),
-                            cut: Cut {
-                                error,
-                                clusters,
-                                row,
-                            },
-                            members,
-                            parts: f.init.animated.count,
-                        }));
+                    }
+                    FineState::Empty {
+                        wanted: at, error, ..
+                    } if *at != 0 && *at + 2 >= frame && !pressure => {
+                        wanted_cuts.push((*error, mount, mesh, k));
                     }
                     _ => {}
                 }
             }
         }
+        // What the admitted cuts hold back of the lock share and add to the demand.
+        let (mut locking, mut adding) = (0, 0);
+        let mut seen = FxHashSet::default();
+        admitted_cuts.retain(|&(mount, mesh, k)| {
+            let (keys, bytes) = self.fine_pages(mount, mesh, k);
+            match self
+                .residency
+                .unsampled(keys, &FxHashSet::default(), &mut seen)
+            {
+                Some(more) => {
+                    locking += bytes;
+                    adding += more;
+                    true
+                }
+                None => {
+                    self.fail_cut(mount, mesh, k);
+                    false
+                }
+            }
+        });
+        if let Some(demand) = self.demand.take() {
+            let room = (budget as f64 * LOW) as u64;
+            let demand = demand[ResidencyClass::MeshPages as usize].bytes;
+            wanted_cuts.sort_by(|a, b| {
+                b.0.total_cmp(&a.0)
+                    .then((a.1, a.2, a.3).cmp(&(b.1, b.2, b.3)))
+            });
+            for (_, mount, mesh, k) in wanted_cuts {
+                let (keys, bytes) = self.fine_pages(mount, mesh, k);
+                let mut mine = FxHashSet::default();
+                let Some(more) = self.residency.unsampled(keys, &seen, &mut mine) else {
+                    self.fail_cut(mount, mesh, k);
+                    continue;
+                };
+                let locks = self.fine_locked + locking + bytes;
+                if locks > budget / 2 || demand + adding + more > room {
+                    continue;
+                }
+                locking += bytes;
+                adding += more;
+                seen.extend(mine);
+                let f = self.fine.get_mut(&(mount, mesh)).expect("listed");
+                if let FineState::Empty { admitted, .. } = &mut f.slots[k] {
+                    *admitted = true;
+                }
+                admitted_cuts.push((mount, mesh, k));
+            }
+        }
+        for (mount, mesh, k) in admitted_cuts {
+            self.build_admitted(mount, mesh, k, budget, frame, loading);
+        }
         Ok(points)
+    }
+
+    /// The keys of the pages finer cut `k` of mesh `mesh` of `mount` is built from, and the
+    /// bytes they hold.
+    fn fine_pages(&self, mount: MountId, mesh: u32, k: usize) -> (Vec<Key>, u64) {
+        let m = &self.mounts[&mount];
+        let keys: Vec<Key> = self.fine[&(mount, mesh)].init.pages[k]
+            .iter()
+            .map(|&p| Key {
+                mount,
+                unit: m.mesh_pages[mesh as usize][p as usize],
+            })
+            .collect();
+        let bytes = keys.iter().map(|&k| self.residency.held(k)).sum();
+        (keys, bytes)
+    }
+
+    /// Finer cut `k` of mesh `mesh` of `mount` never builds: a page of it failed to load.
+    fn fail_cut(&mut self, mount: MountId, mesh: u32, k: usize) {
+        let f = self.fine.get_mut(&(mount, mesh)).expect("listed");
+        f.slots[k] = FineState::Failed;
+        self.residency.note_failed_cut();
+    }
+
+    /// Asks for the absent pages of admitted finer cut `k` of mesh `mesh` of `mount` and keeps
+    /// the resident ones in their hold at `frame`; once they are all resident, locks the ones
+    /// holding its clusters and sends it to be built, unless those no longer fit half of the
+    /// mesh page `budget` beside the locks of the other cuts, which takes back its admission.
+    fn build_admitted(
+        &mut self,
+        mount: MountId,
+        mesh: u32,
+        k: usize,
+        budget: u64,
+        frame: u64,
+        loading: &Arc<Loading>,
+    ) {
+        let m = &self.mounts[&mount];
+        let unit = |p: u32| Key {
+            mount,
+            unit: m.mesh_pages[mesh as usize][p as usize],
+        };
+        let f = self.fine.get_mut(&(mount, mesh)).expect("listed");
+        let FineState::Empty { error, .. } = f.slots[k] else {
+            unreachable!("an admitted cut is not built")
+        };
+        let mut absent = false;
+        for &q in &f.init.pages[k] {
+            if self.residency.resident(unit(q)) {
+                self.residency.touch(unit(q), frame);
+            } else {
+                absent = true;
+                let p = Priority {
+                    error,
+                    cell_distance: 0,
+                };
+                self.residency.request(unit(q), p, RequestSource::FinerCuts);
+            }
+        }
+        if absent {
+            return;
+        }
+        // A page lists its clusters here in the step the residency takes it as resident, and
+        // the cut's clusters sit in these pages.
+        let CutRow { threshold: t, row } = f.init.cuts[k];
+        let stream = &f.init.stream;
+        let (mut clusters, mut members) = (Vec::new(), Vec::new());
+        let mut pages = Vec::new();
+        let mut error = 0.0f32;
+        let held = (0..stream.pinned).chain(f.init.pages[k].iter().copied());
+        for q in held {
+            let r = f.init.resident[q as usize]
+                .as_ref()
+                .expect("a resident page's clusters");
+            let first = stream.pages[q as usize].first;
+            let before = clusters.len();
+            for ((c, &clas), i) in r.infos.iter().zip(&r.clas).zip(first..) {
+                if c.in_cut(t, f.init.merge) {
+                    clusters.push(i);
+                    members.push(CutMember {
+                        clas,
+                        part: f.init.animated.index(c),
+                    });
+                    error = error.max(c.self_error);
+                }
+            }
+            if q >= stream.pinned && clusters.len() > before {
+                pages.push(q);
+            }
+        }
+        if clusters.is_empty() {
+            return;
+        }
+        let bytes = pages.iter().map(|&q| self.residency.held(unit(q))).sum();
+        if self.fine_locked + bytes > budget / 2 {
+            f.slots[k] = FineState::EMPTY;
+            return;
+        }
+        for &q in &pages {
+            self.residency.lock(unit(q));
+        }
+        self.fine_locked += bytes;
+        f.slots[k] = FineState::Building {
+            locks: Locks { pages, bytes },
+        };
+        loading.send(Msg::Cut(CutTask {
+            mount,
+            mesh,
+            slot: k as u32,
+            accel: Arc::clone(&self.accel),
+            cut: Cut {
+                error,
+                clusters,
+                row,
+            },
+            members,
+            parts: f.init.animated.count,
+        }));
     }
 
     /// Hands the texture feedback of `frame`, read back in slot `slot`, to the next step:
@@ -1306,11 +1479,13 @@ impl Streaming {
     }
 
     /// Step 1 of frame `frame`: applies the landed batches, plans this step and sends its
-    /// loads. Returns the points the frame's submit waits.
+    /// loads. Under `pressure` the detail is coarsened for the mesh page pool. Returns the
+    /// points the frame's submit waits.
     pub(crate) fn step(
         &mut self,
         frame: u64,
         settled: u64,
+        pressure: bool,
         loading: &Arc<Loading>,
         w: &mut Apply<'_>,
     ) -> Result<Vec<TimelinePoint>> {
@@ -1397,7 +1572,7 @@ impl Streaming {
         for index in std::mem::take(&mut self.nulls) {
             w.put(self.streams.offset(u64::from(index)), &[GpuPtr::NULL])?;
         }
-        points.extend(self.fine_step(frame, settled, loading, w)?);
+        points.extend(self.fine_step(frame, settled, pressure, loading, w)?);
         let report = w.device.memory_report();
         let heaps: Vec<(u64, u64)> = report.heaps.iter().map(|h| (h.usage, h.budget)).collect();
         self.residency.react(frame, &heaps);

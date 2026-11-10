@@ -30,8 +30,8 @@ use orr_scene::testing::{
 use orr_scene::{
     BoundTexture, Budgets, EmissiveGpu, Error, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
     InstancesDesc, LoadState, MaterialGpu, MaterialId, MeshGpu, ModelGpu, ModelId, MountId,
-    NeuralTextures, PackSource, RendererDesc, ResidencyClass, SceneDesc, SceneId, SceneRoot,
-    SceneWriter, Scenes, TransformGroupDesc, material_flags,
+    NeuralTextures, PackSource, PoolSize, RendererDesc, ResidencyClass, SceneDesc, SceneId,
+    SceneRoot, SceneWriter, Scenes, TransformGroupDesc, material_flags,
 };
 use scene_suite::Workers;
 
@@ -1206,7 +1206,7 @@ fn hierarchy_pages_stream_with_the_pages_below_them_and_leave_after_them() {
             positioned_reads,
             budgets: Budgets {
                 mesh_resident_max: 0,
-                mesh_page_pool: budget,
+                mesh_page_pool: PoolSize::Bytes(budget),
                 ..Budgets::default()
             },
             ..RendererDesc::default()
@@ -1285,7 +1285,7 @@ fn the_traversal_requests_the_node_pages_it_needs_and_keeps_reading_them() {
     let desc = RendererDesc {
         budgets: Budgets {
             mesh_resident_max: 0,
-            mesh_page_pool: budget,
+            mesh_page_pool: PoolSize::Bytes(budget),
             ..Budgets::default()
         },
         ..RendererDesc::default()
@@ -1651,7 +1651,7 @@ fn streamed_texture_tiles_load_exact_and_evict_after_their_hold() {
         let desc = RendererDesc {
             positioned_reads,
             budgets: Budgets {
-                texture_pool: budget,
+                texture_pool: PoolSize::Bytes(budget),
                 ..Budgets::default()
             },
             ..RendererDesc::default()
@@ -3148,7 +3148,7 @@ fn stream_sheets(dev: &Device) {
     let desc = RendererDesc {
         budgets: Budgets {
             mesh_resident_max: 0,
-            mesh_page_pool: budget,
+            mesh_page_pool: PoolSize::Bytes(budget),
             ..Budgets::default()
         },
         ..RendererDesc::default()
@@ -3518,7 +3518,7 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
 fn the_traversal_requests_kept_are_those_of_the_largest_errors() {
     use orr_scene::orr_gpu::MemoryKind;
     // `cut.slang`: the counters, CUT_REQUESTS, CUT_FEEDBACK, FEEDBACK_BUCKETS and its shift.
-    const COUNTERS: u64 = 24;
+    const COUNTERS: u64 = 25;
     const REQUESTS: usize = 16;
     const KEPT: usize = 17;
     const BUCKETS: u64 = 4096;
@@ -3752,7 +3752,7 @@ fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
         &RendererDesc {
             budgets: Budgets {
                 mesh_resident_max: 0,
-                mesh_page_pool: sheet_budget(&info, dev),
+                mesh_page_pool: PoolSize::Bytes(sheet_budget(&info, dev)),
                 ..Budgets::default()
             },
             ..RendererDesc::default()
@@ -3901,7 +3901,7 @@ fn tiles_apart_from_their_textures_others_move_beside_them_and_stay_exact() {
     let budget = tails + (layouts[0].0 + 14) * tile;
     let desc = RendererDesc {
         budgets: Budgets {
-            texture_pool: budget,
+            texture_pool: PoolSize::Bytes(budget),
             ..Budgets::default()
         },
         ..RendererDesc::default()

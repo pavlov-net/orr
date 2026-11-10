@@ -2274,7 +2274,7 @@ impl EntryOwner {
             );
         } else {
             let k = local - self.pages - self.nodes;
-            s.fine_cut(self.mount, self.mesh, k, request.is_some(), frame);
+            s.fine_cut(self.mount, self.mesh, k, request, frame);
         }
     }
 }
@@ -2695,6 +2695,7 @@ impl Mounts {
         device: &Device,
         sizes: TableSizes,
         budgets: &crate::Budgets,
+        pools: crate::scenes::PoolBytes,
         accel: &Arc<AccelShared>,
         streams: GpuPtr<GpuPtr<TextureStreamGpu>>,
         fif: u32,
@@ -2727,7 +2728,7 @@ impl Mounts {
             page_keys: Vec::new(),
             page_generations: Vec::new(),
             retired: Vec::new(),
-            streaming: Streaming::new(device, budgets, accel, streams, fif)?,
+            streaming: Streaming::new(device, budgets, pools, accel, streams, fif)?,
             owners: FxHashMap::default(),
             entry_owners: BTreeMap::new(),
             masks: HashMap::new(),

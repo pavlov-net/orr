@@ -14,6 +14,11 @@
 //! Copies tracing a cached cut of a streaming mesh ask for the finer cut that would serve
 //! them; an edit's copies always gather, with what it touches held at level 0, split into a
 //! BLAS for the body and one per animated part while they take their pose.
+//!
+//! The gathered cuts' threshold takes a scale of its own, steered ([`Detail`]) from the
+//! clusters the gathers wanted against the frame's capacity, so that every copy that gathers
+//! fits at an evenly coarser cut rather than the ones past the capacity, in whatever order
+//! their clusters came, falling back to a cached cut.
 
 use orr_gpu::{
     Allocation, BlasLimits, ClusterVertexFormat, CommandList, Device, DispatchArgs, GpuAddress,
@@ -22,6 +27,7 @@ use orr_gpu::{
 };
 
 use crate::capacity::Capacity;
+use crate::detail::{Detail, Sample};
 use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::shaders::feedback::{self, FeedbackRoot};
@@ -32,7 +38,7 @@ use crate::{
 };
 
 /// `CutGpu.counters` entries (`cut.slang`), the BLAS build count after them.
-const COUNTERS: usize = 24;
+const COUNTERS: usize = 25;
 const CUT_CANDIDATES: usize = 2;
 const CUT_CANDIDATE_CLUSTERS: usize = 3;
 const CUT_ENTRIES: usize = 4;
@@ -49,7 +55,8 @@ const CUT_MERGED: usize = 15;
 const CUT_REQUESTS: usize = 16;
 const CUT_FEEDBACK: usize = 17;
 const CUT_QUEUE_PEAK: usize = 22;
-const CUT_BUILDS: u64 = 23;
+const CUT_ENTRIES_FIXED: usize = 23;
+const CUT_BUILDS: u64 = 24;
 /// `traverse.slang` args layout.
 const ARGS_PASSES: u32 = 64;
 const ARGS_GATHER: u64 = 3 * ARGS_PASSES as u64;
@@ -266,14 +273,22 @@ pub(crate) struct Cuts {
     /// Counters, touched entries, then kept requests, per frame in flight.
     readback: Allocation<u32>,
     updates: u64,
+    /// The scale of the gathered cuts' threshold over the configured one, which the memory
+    /// scale serves first; and per frame in flight the scale they ran at, and the part of it
+    /// past the memory scale.
+    gather: Detail,
+    ran: Vec<(f32, f32)>,
 }
 
 /// What one frame's traversal of a scene reads.
 pub(crate) struct CutInputs {
     pub(crate) scene: GpuPtr<SceneRoot>,
     pub(crate) focus: Option<([i32; 4], [f32; 4])>,
+    /// The thresholds, each with `memory_scale` in it.
     pub(crate) raster_pixels: f32,
     pub(crate) rt_pixels: f32,
+    /// The detail scale for the mesh page pool.
+    pub(crate) memory_scale: f32,
     pub(crate) culled_scale: f32,
     pub(crate) merge_pixels: f32,
     pub(crate) slots: u32,
@@ -385,6 +400,8 @@ impl Cuts {
                 "cut readback",
             )?,
             updates: 0,
+            gather: Detail::new(),
+            ran: vec![(1.0, 1.0); fif.max(1) as usize],
         })
     }
 
@@ -397,13 +414,26 @@ impl Cuts {
         self.gpu.candidate_capacity
     }
 
-    /// Takes what the frame that used readback slot `slot` wanted of the queues and the
-    /// candidate cut.
+    /// Takes what the frame that used readback slot `slot` wanted of the queues, the
+    /// candidate cut and the gathered cuts.
     pub(crate) fn observe(&mut self, slot: usize) {
         let data = self.readback(slot);
         let (queue, candidates) = (data[CUT_QUEUE_PEAK], data[CUT_CANDIDATES]);
+        let (entries, fixed) = (data[CUT_ENTRIES], data[CUT_ENTRIES_FIXED]);
         self.queue.observe(queue);
         self.candidates.observe(candidates);
+        self.gather.step(Sample {
+            scale: self.ran[slot].0,
+            demand: u64::from(entries),
+            capacity: u64::from(self.sizes.rt_clusters),
+            sheddable: entries > fixed,
+        });
+    }
+
+    /// The scale the gathered cuts of the frame that used readback slot `slot` ran at past its
+    /// memory scale.
+    pub(crate) fn rt_scale(&self, slot: usize) -> f32 {
+        self.ran[slot].1
     }
 
     /// Resizes the queues and the candidate cut to what the completed frames wanted, before
@@ -513,6 +543,8 @@ impl Cuts {
         if self.updates == 0 {
             flags |= TRAVERSE_ERRORS;
         }
+        let rt_scale = (self.gather.scale() / f.memory_scale).max(1.0);
+        self.ran[f.slot] = (f.memory_scale * rt_scale, rt_scale);
         let base = TraverseRoot {
             scene: f.scene,
             cut: self.record.gpu(),
@@ -526,6 +558,9 @@ impl Cuts {
             pass: 0,
             flags,
             models: self.sizes.models,
+            gather_scale: rt_scale,
+            _pad0: 0,
+            _pad1: 0,
         };
         let root = |pass: u32| window.put_root(device, &TraverseRoot { pass, ..base });
         let r0 = root(0)?;

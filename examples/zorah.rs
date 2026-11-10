@@ -28,9 +28,9 @@ use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
     Budgets, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
     InstanceFlags, InstancePageRef, Lens, Light, LightId, LitView, LoadState, PackSource,
-    PageNeeds, Projection, Renderer, RendererDesc, RequestSource, ResidencyClass, ResidencyStats,
-    SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter, UiPass, ViewHooks,
-    ViewLighting, ViewOutput, ViewTarget,
+    PageNeeds, PoolSize, Projection, Renderer, RendererDesc, RequestSource, ResidencyClass,
+    ResidencyStats, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter, UiPass,
+    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, CookOptions, GltfLayout, GltfSettings, InputChannels, LodMode,
@@ -325,7 +325,7 @@ fn budgets(pack: &Path) -> Budgets {
     let fit = |n: u64, default: u32| u32::try_from(n).expect("a u32 count").max(default);
     Budgets {
         mesh_pages: fit(pages, defaults.mesh_pages),
-        mesh_page_pool: MESH_POOL,
+        mesh_page_pool: PoolSize::Bytes(MESH_POOL),
         ..defaults
     }
 }

@@ -49,7 +49,7 @@ use orr_scene::{
     SkinnedGpu, SkinnedPageRef, SlotCutGpu, TextureFilter, TransformGroupDesc, TransformGroupId,
     ViewDesc, ViewHistoryId,
 };
-use orr_scene::{Budgets, InstancePageRef, PageId};
+use orr_scene::{Budgets, InstancePageRef, PageId, PoolSize, RequestSource};
 use scene_suite::shaders::{
     codec, fracture, grid, pose, skin_pose, surface_at, surface_params, trace, triangle_at,
 };
@@ -6284,6 +6284,157 @@ fn stand_in(bytes: &Arc<[u8]>, paged: bool) {
         }
     }
     assert_eq!(w.scenes.residency().failed, 0);
+}
+
+/// The streaming ground's view under an ample mesh page pool, then under one a third the
+/// size of the streamed pages the view wants: the first keeps the configured detail, the
+/// second settles at a coarser one whose raster and ray-tracing cuts are the cluster rule's
+/// at the scaled threshold with every page resident, over the whole ground, while what the
+/// view wants stays under the pool's budget and no request of the traversal is turned down.
+#[test]
+fn a_mesh_page_pool_short_of_what_the_view_wants_coarsens_the_whole_cut_evenly() {
+    let _serial = serial();
+    let (scale, demand, pinned) = settled_detail(Budgets::default().mesh_page_pool);
+    assert_eq!(scale, 1.0, "the configured detail fits an ample pool");
+    assert!(demand > pinned, "the view wants streamed pages");
+    let pool = pinned + (demand - pinned) * 2 / 5;
+    let (scale, _, _) = settled_detail(PoolSize::Bytes(pool));
+    assert!(scale > 1.0, "a pool of {pool} B for {demand} B coarsens");
+    assert_clean();
+}
+
+/// A pack of one DAG ground over a fine grid, whose many pages stream in steps small beside
+/// a pool of a few times their size.
+fn fine_ground_pack() -> &'static Arc<[u8]> {
+    static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
+    PACK.get_or_init(|| {
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::Memory,
+                vec![AssetSpec {
+                    name: "fine ground".into(),
+                    source: Source::Mesh {
+                        mesh: grid(320, 8.0, 2.0, |x, z| {
+                            0.15 * (x * 1.3).sin() * (z * 0.9).cos()
+                        }),
+                        materials: vec![Material::default()],
+                        settings: MeshSettings {
+                            lod: LodMode::Dag,
+                            ..MeshSettings::default()
+                        },
+                    },
+                }],
+            )],
+        };
+        orr_cook::cook(&manifest, &Default::default())
+            .unwrap()
+            .memory
+            .remove(0)
+    })
+}
+
+/// Frames of the streaming ground's view under a mesh page pool of `pool` until its loads
+/// and detail scale settle, then a run of frames that keep the scale, turn no traversal
+/// request down and draw the rule's cut at the scaled threshold with every page resident;
+/// returns the scale, what the mesh page pool was asked for, and what the mount pinned.
+fn settled_detail(pool: PoolSize) -> (f32, u64, u64) {
+    // Fine enough that the view wants most of the ground's pages, each small beside the pool.
+    const ERROR_PIXELS: f32 = 0.25;
+    let bytes = fine_ground_pack();
+    let mut w = World::with_pack(
+        &RendererDesc {
+            raster_error_pixels: ERROR_PIXELS,
+            rt_error_pixels: ERROR_PIXELS,
+            rt_merge_pixels: 0.0,
+            culled_error_scale: 1.0,
+            budgets: Budgets {
+                mesh_page_pool: pool,
+                ..Budgets::default()
+            },
+            ..RendererDesc::default()
+        },
+        bytes,
+    );
+    let mesh_pool = |w: &World| {
+        *w.scenes
+            .residency()
+            .class(orr_scene::ResidencyClass::MeshPages)
+    };
+    let pinned = mesh_pool(&w).resident_bytes;
+    let items = [Item {
+        model: "fine ground",
+        linear: Mat3::from_rotation_x(0.25) * Mat3::from_diagonal(Vec3::new(2.0, 1.0, 4.0)),
+        at: Vec3::new(0.0, -1.0, -12.0),
+    }];
+    let placed = place(&mut w, &items);
+    let model = w.model("fine ground");
+    let eye = Vec3::new(0.3, 1.2, 4.0);
+    let target = Vec3::new(0.0, 0.0, -10.0);
+    let m = CpuMesh::of_pack(bytes, "fine ground");
+    let clusters = m.clusters();
+    let p = Projector::new(&items[0], eye);
+    let slot = placed.ranges[0].first;
+    let mut frame = 1;
+    let mut shot = |w: &mut World| {
+        frame += 1;
+        let g = shoot(
+            w,
+            &placed,
+            &Shot::at(eye.as_dvec3(), target.as_dvec3(), frame),
+        );
+        (g, w.scenes.stats().detail)
+    };
+    let start = Instant::now();
+    let (mut still, mut scale) = (0, 0.0);
+    while still < 24 {
+        let (_, d) = shot(&mut w);
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "pool {pool:?}: the detail never settled, at {d:?}"
+        );
+        let idle = w.scenes.residency().loads == 0 && mesh_pool(&w).loading_bytes == 0;
+        still = if idle && d.memory_scale == scale {
+            still + 1
+        } else {
+            0
+        };
+        scale = d.memory_scale;
+    }
+    let mut demand = 0;
+    for _ in 0..30 {
+        let (g, d) = shot(&mut w);
+        let what = format!("pool {pool:?} at {d:?}");
+        assert_eq!(d.memory_scale, scale, "{what}: the scale moved");
+        assert!(
+            d.mesh_demand as f64 <= 0.92 * d.mesh_budget as f64,
+            "{what}: over the band"
+        );
+        let r = w.scenes.residency();
+        assert_eq!(r.dropped_from(RequestSource::Traversal), 0, "{what}");
+        demand = d.mesh_demand;
+        let (pages, bases, _) = mesh_pages(&w, model);
+        let cut = read_cut(&g.view, placed.count);
+        let raster = cut.raster(&m, slot);
+        assert_whole(&m, &clusters, &raster, &format!("{what}: raster"));
+        let ray = cut.ray(&m, slot, &pages, &bases);
+        let (want, near) = rule_cut(
+            &m,
+            &clusters,
+            &p,
+            ERROR_PIXELS * scale,
+            1.0,
+            &m.all_resident(),
+        );
+        for (got, kind) in [(&raster, "raster"), (&ray, "ray tracing")] {
+            let differ: Vec<u32> = want.symmetric_difference(got).copied().collect();
+            assert!(
+                differ.iter().all(|c| near.contains(c)),
+                "{what}: the {kind} cut differs from the rule at {differ:?}"
+            );
+        }
+    }
+    assert_eq!(w.scenes.residency().failed, 0);
+    (scale, demand, pinned)
 }
 
 // --- Skinned copies ------------------------------------------------------------------------

@@ -19,8 +19,10 @@
 //! below a mesh's top page stream on request ([`Scenes::prefetch`]) and on the traversal's
 //! requests, and the tiles of material textures stream on the texture feedback of the
 //! frames' taps ([`Scenes::prefetch_texture`]), all under the pool budgets of [`Budgets`];
-//! [`Scenes::residency`] reports what is resident. Consumers stream their own blobs into
-//! their own memory with [`Scenes::request_blob`].
+//! [`Scenes::residency`] reports what is resident. While the frames want more mesh pages
+//! than their budget holds, the error thresholds geometry is chosen by coarsen evenly until
+//! what they want fits ([`DetailStats`]). Consumers stream their own blobs into their own
+//! memory with [`Scenes::request_blob`].
 //!
 //! A cooked instance page is placed with [`SceneWriter::add_instance_page`]; its records
 //! stream as well, nearest a scene's focus first, and its copies are hidden while they are not
@@ -44,6 +46,7 @@ mod arena;
 mod capacity;
 mod clas_pool;
 mod decals;
+mod detail;
 mod edit;
 mod features;
 mod lights;
@@ -105,7 +108,8 @@ pub use scene::{
     SceneId, SceneWriter, SkinnedPageRef, TransformGroupDesc, TransformGroupId,
 };
 pub use scenes::{
-    Budgets, ConsumerMarker, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes,
+    Budgets, ConsumerMarker, DetailStats, Frame, FrameDesc, FrameStats, PoolSize, RendererDesc,
+    SceneCompute, Scenes,
 };
 pub(crate) use shaders::types::{
     BlasJob, CutKey, DecalBinGpu, EditGpu, FeedbackGpu, GroupGpu, MaskGpu, MediumProxyGpu,

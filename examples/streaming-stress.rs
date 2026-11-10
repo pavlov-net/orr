@@ -21,7 +21,7 @@ use orr::orr_pack::mesh::MeshInfo;
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
     Budgets, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
-    GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource,
+    GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource, PoolSize,
     Projection, Renderer, RendererDesc, ResidencyClass, SceneDesc, SceneLightingSettings,
     ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput,
     ViewTarget,
@@ -257,8 +257,8 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let budget = TEXTURES as u64 * (tail + (whole - tail) / 2);
     let desc = RendererDesc {
         budgets: Budgets {
-            texture_pool: budget,
-            mesh_page_pool: mesh_budget,
+            texture_pool: PoolSize::Bytes(budget),
+            mesh_page_pool: PoolSize::Bytes(mesh_budget),
             mesh_resident_max: 0,
             ..Budgets::default()
         },

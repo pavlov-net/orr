@@ -15,7 +15,7 @@ use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
     Budgets, ClusterRef, ClusterTopology, CopyVariant, EditDesc, EmissiveGpu, FrameDesc, FrameTime,
     GroupWriter, InstanceFlags, InstanceGpu, InstancePageRef, InstanceRange, InstancesDesc,
-    LoadState, MaterialGpu, MaterialId, MeshGpu, ModelGpu, ModelId, MountId, PackSource,
+    LoadState, MaterialGpu, MaterialId, MeshGpu, ModelGpu, ModelId, MountId, PackSource, PoolSize,
     ProducerDesc, ProducerId, ProducerUpdate, RendererDesc, RtCutGpu, SceneCompute, SceneDesc,
     SceneId, SceneRoot, Scenes, SlotStateGpu, TransformGroupDesc, TransformGroupId, material_flags,
 };
@@ -1230,20 +1230,23 @@ fn a_streaming_emissive_mesh_lists_only_resident_clusters() {
     let info = MeshInfo::parse(&read_blob(&archive, &archive.blobs(entry)[0])).unwrap();
     let pinned = info.header.pinned_pages as usize;
     assert!(pinned < info.pages.len(), "the lamp has streamed pages");
-    // Both mounts' pinned pages and one mount's streamed pages with their CLAS estimates.
+    // Three mounts' pinned pages and one mount's streamed pages with their CLAS estimates, and
+    // the room the detail keeps free beside what the view wants, under which a finer cut is
+    // admitted: the second and third mounts' streamed pages, as built, take more.
     let page = |p: &orr_pack::mesh::PageInfo| u64::from(p.resident_len).next_multiple_of(256);
     let clas = |p: &orr_pack::mesh::PageInfo| {
         (32 * u64::from(p.tri_count) + 256 * u64::from(p.cluster_count)).next_multiple_of(128)
     };
-    let budget = 2 * info.pages[..pinned].iter().map(page).sum::<u64>()
+    let wanted = 3 * info.pages[..pinned].iter().map(page).sum::<u64>()
         + info.pages[pinned..]
             .iter()
             .map(|p| page(p) + clas(p))
             .sum::<u64>();
+    let budget = wanted * 5 / 4;
     let desc = RendererDesc {
         budgets: Budgets {
             mesh_resident_max: 0,
-            mesh_page_pool: budget,
+            mesh_page_pool: PoolSize::Bytes(budget),
             ..Budgets::default()
         },
         ..RendererDesc::default()
@@ -1256,7 +1259,7 @@ fn a_streaming_emissive_mesh_lists_only_resident_clusters() {
             ..SceneDesc::default()
         })
         .unwrap();
-    let mut models = [ModelId(0); 2];
+    let mut models = [ModelId(0); 3];
     for model in &mut models {
         let m = scenes.mount(PackSource::Memory(Arc::clone(&bytes)));
         while matches!(scenes.mount_state(m), LoadState::Pending) {
@@ -1307,7 +1310,7 @@ fn a_streaming_emissive_mesh_lists_only_resident_clusters() {
         .unwrap();
     assert_eq!(g, TransformGroupId(1));
     w.transforms(g, 0, 2).unwrap().fill(at(0.0).into());
-    for (i, &model) in (0..).zip(&models) {
+    for (i, &model) in (0..).zip(&models[..2]) {
         w.add_instances(&InstancesDesc {
             model,
             copies: 1,
@@ -1343,11 +1346,12 @@ fn a_streaming_emissive_mesh_lists_only_resident_clusters() {
     let landed = resident(&root);
     assert!(!landed.is_empty(), "the near copy's pages landed");
 
-    // The far mount's pages move in near the focus and the first mount's give way.
+    // The far mount's pages move in near the focus beside a third mount's, and the first mount's give way.
     step(&mut scenes, &[(0, 800.0), (1, 0.0)]);
     let mut after = 0;
     for _ in 0..2000 {
         scenes.prefetch(models[1], 0);
+        scenes.prefetch(models[2], 0);
         let (_, root) = step(&mut scenes, &[]);
         let now = resident(&root);
         if after > 0 || landed.iter().any(|p| !now.contains(p)) {
