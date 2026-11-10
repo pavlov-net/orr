@@ -11,6 +11,10 @@
 //! loading unit depends on it. Loads outside any mount's units (user blobs) count against
 //! their class budget and the in-flight limit only.
 //!
+//! Each class lists the units that can be evicted, and no others, with the bytes of those
+//! past their hold: a request that its budget cannot take is turned down without a walk over
+//! the units that have to stay, however many they are.
+//!
 //! Loads start while fewer bytes than the limit are in flight, so the last one started may
 //! pass it. The limit is shared by lane: one per request source, one for user blobs and one
 //! for mounts' reads and the copies they stage. Each load goes to the lane with demand left
@@ -34,7 +38,6 @@
 //! budgets grow back. A class whose units' shared address range runs out shrinks alone.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 
@@ -137,14 +140,15 @@ pub struct ResidencyStats {
     pub loads: u32,
     pub evictions: u32,
     /// Requests the step could not serve, by [`RequestSource::ALL`] order: over budget with
-    /// too little evictable, or with the in-flight limit reached. Each is dropped; a unit still
-    /// wanted is requested again.
+    /// too little evictable, or with the in-flight limit reached, whatever their dependencies
+    /// are doing. Each is dropped; a unit still wanted is requested again.
     pub dropped: [u32; SOURCES],
     /// Requests the step held back for units still loading, theirs or a dependency's: from an
     /// earlier step, from this one when the in-flight limit cut their closure short, or a tile
     /// still unbinding. They are dropped too, and load once requested after those land.
     pub waiting: u32,
-    /// The most absent units one request needed loaded together since the start.
+    /// The most absent units a request that started loads needed loaded together since the
+    /// start.
     pub longest_closure: u32,
     /// Loads landed resident since the start, user blobs' among them.
     pub landed: u32,
@@ -269,7 +273,8 @@ struct Unit {
     /// Units in `Loading` or `Resident` that depend on this one.
     dependents: u32,
     touched: u64,
-    /// The touch its class's LRU holds it under, at most `touched`.
+    /// The touch its class's [`Evictable`] lists it under while it can be evicted, at most
+    /// `touched`.
     listed: u64,
     /// While it loads, the lane whose request started it.
     lane: usize,
@@ -279,6 +284,73 @@ impl Unit {
     /// The bytes its class's budget counts while it is loading or resident.
     fn held(&self) -> u64 {
         self.bytes + self.built
+    }
+
+    /// Whether an eviction may take it once it is past its hold.
+    fn evictable(&self) -> bool {
+        self.state == State::Resident && !self.pinned && self.locks == 0 && self.dependents == 0
+    }
+}
+
+/// The units of one class that can be evicted ([`Unit::evictable`]), least recently touched
+/// first.
+#[derive(Default)]
+struct Evictable {
+    /// Each under a touch no later than its last. A unit listed before `horizon` is listed
+    /// under its last touch; a touch of any other only marks the unit, which moves to its last
+    /// touch when the horizon reaches it.
+    lru: BTreeSet<(u64, Key)>,
+    /// The first touch still in its hold at the latest frame an eviction looked at
+    /// ([`Residency::age`]).
+    horizon: u64,
+    /// The bytes held by the units listed before `horizon`.
+    aged: u64,
+}
+
+impl Evictable {
+    /// Lists `u`, which is `k`, under its last touch.
+    fn list(&mut self, k: Key, u: &mut Unit) {
+        u.listed = u.touched;
+        self.lru.insert((u.listed, k));
+        if u.listed < self.horizon {
+            self.aged += u.held();
+        }
+    }
+
+    fn unlist(&mut self, k: Key, u: &Unit) {
+        self.lru.remove(&(u.listed, k));
+        if u.listed < self.horizon {
+            self.aged -= u.held();
+        }
+    }
+}
+
+/// Counts unit `unit` of `mount`, among its `units`, as a dependent of each unit it depends
+/// on when `hold`, and takes that back otherwise. A unit cannot be evicted while it has a
+/// dependent.
+fn hold_dependencies(
+    units: &mut [Unit],
+    evictable: &mut [Evictable; CLASSES],
+    mount: MountId,
+    unit: u32,
+    hold: bool,
+) {
+    for i in 0..units[unit as usize].deps.len() {
+        let d = units[unit as usize].deps[i];
+        let k = Key { mount, unit: d };
+        let u = &mut units[d as usize];
+        let list = &mut evictable[u.class as usize];
+        if hold {
+            if u.evictable() {
+                list.unlist(k, u);
+            }
+            u.dependents += 1;
+        } else {
+            u.dependents -= 1;
+            if u.evictable() {
+                list.list(k, u);
+            }
+        }
     }
 }
 
@@ -431,10 +503,7 @@ pub(crate) struct Residency {
     /// under.
     scale: [f64; CLASSES],
     mounts: FxHashMap<MountId, Vec<Unit>>,
-    /// Resident units that are not pinned, per class, by a touch no later than their last:
-    /// a touch only marks the unit, and the unit moves to its last touch once an eviction
-    /// reaches it.
-    lru: [BTreeSet<(u64, Key)>; CLASSES],
+    evictable: [Evictable; CLASSES],
     /// Resident plus loading bytes per class.
     used: [u64; CLASSES],
     loading_bytes: [u64; CLASSES],
@@ -458,7 +527,7 @@ impl Residency {
             limits,
             scale: [1.0; CLASSES],
             mounts: FxHashMap::default(),
-            lru: Default::default(),
+            evictable: Default::default(),
             used: [0; CLASSES],
             loading_bytes: [0; CLASSES],
             resident_units: [0; CLASSES],
@@ -598,15 +667,6 @@ impl Residency {
             let c = u.class as usize;
             self.used[c] += u.held();
             self.resident_units[c] += 1;
-            if !u.pinned {
-                self.lru[c].insert((
-                    0,
-                    Key {
-                        mount,
-                        unit: i as u32,
-                    },
-                ));
-            }
             for d in list[i].deps.clone() {
                 list[d as usize].dependents += 1;
             }
@@ -627,13 +687,13 @@ impl Residency {
                 State::Resident => {
                     self.used[c] -= u.held();
                     self.resident_units[c] -= 1;
-                    self.lru[c].remove(&(
-                        u.listed,
-                        Key {
+                    if u.evictable() {
+                        let k = Key {
                             mount,
                             unit: i as u32,
-                        },
-                    ));
+                        };
+                        self.evictable[c].unlist(k, u);
+                    }
                 }
                 State::Loading => {
                     self.used[c] -= u.held();
@@ -681,6 +741,11 @@ impl Residency {
         };
         if u.state == State::Resident {
             u.touched = u.touched.max(frame);
+            let list = &mut self.evictable[u.class as usize];
+            if u.evictable() && u.listed < list.horizon && u.listed != u.touched {
+                list.unlist(k, u);
+                list.list(k, u);
+            }
         }
     }
 
@@ -693,6 +758,9 @@ impl Residency {
             .and_then(|m| m.get_mut(k.unit as usize))
             .expect("a unit of a mount");
         debug_assert_eq!(u.state, State::Resident);
+        if u.evictable() {
+            self.evictable[u.class as usize].unlist(k, u);
+        }
         u.locks += 1;
     }
 
@@ -703,6 +771,9 @@ impl Residency {
             .and_then(|m| m.get_mut(k.unit as usize))
         {
             u.locks -= 1;
+            if u.evictable() {
+                self.evictable[u.class as usize].list(k, u);
+            }
         }
     }
 
@@ -808,9 +879,7 @@ impl Residency {
         self.loading_bytes[c] -= u.held();
         self.in_flight -= u.bytes;
         self.lane_in_flight[u.lane] -= u.bytes;
-        for d in u.deps.clone() {
-            units[d as usize].dependents -= 1;
-        }
+        hold_dependencies(units, &mut self.evictable, k.mount, k.unit, false);
         self.refresh();
     }
 
@@ -886,17 +955,16 @@ impl Residency {
         if ok {
             u.state = State::Resident;
             u.touched = frame;
-            u.listed = frame;
             self.resident_units[c] += 1;
             self.stats.landed += 1;
-            self.lru[c].insert((frame, k));
+            if u.evictable() {
+                self.evictable[c].list(k, u);
+            }
         } else {
             u.state = State::Failed;
             self.used[c] -= u.held();
             self.failed += 1;
-            for d in u.deps.clone() {
-                units[d as usize].dependents -= 1;
-            }
+            hold_dependencies(units, &mut self.evictable, k.mount, k.unit, false);
         }
         self.refresh();
         true
@@ -920,7 +988,7 @@ impl Residency {
         for class in ResidencyClass::ALL {
             let c = class as usize;
             let over = self.used[c].saturating_sub(self.budget(c));
-            for k in self.victims(c, over, frame, &[]).0 {
+            for k in self.victims(c, over, frame, &FxHashSet::default()).0 {
                 self.evict(k);
                 plan.evictions.push(k);
             }
@@ -975,6 +1043,11 @@ impl Residency {
                 }
                 _ => continue,
             }
+            // One request the limit holds back is enough to know the lane's demand.
+            if full && short[lane] {
+                dropped[lane] += 1;
+                continue;
+            }
             let chain = match self.closure(k, &started) {
                 Ok(chain) => chain,
                 Err(State::Loading) => {
@@ -984,15 +1057,7 @@ impl Residency {
                 // Like a failed unit itself, one over a failed dependency never loads.
                 Err(_) => continue,
             };
-            let longest = &mut self.stats.longest_closure;
-            *longest = (*longest).max(chain.len() as u32);
-            // One request the limit holds back is enough to know the lane's demand.
-            let admitted = if full && short[lane] {
-                Err(Short::InFlight)
-            } else {
-                self.admit(&chain, full, frame, &mut plan.evictions)
-            };
-            let admitted = match admitted {
+            let admitted = match self.admit(&chain, full, frame, &mut plan.evictions) {
                 Ok(n) => n,
                 Err(s) => {
                     short[lane] |= s == Short::InFlight;
@@ -1000,6 +1065,8 @@ impl Residency {
                     continue;
                 }
             };
+            let longest = &mut self.stats.longest_closure;
+            *longest = (*longest).max(chain.len() as u32);
             if admitted < chain.len() {
                 waiting += 1;
                 short[lane] = true;
@@ -1078,22 +1145,35 @@ impl Residency {
             in_flight += self.unit(k).expect("unit of a closure").bytes;
             admitted += 1;
         }
+        let first = &chain[..admitted.max(1)];
         let mut need = [0u64; CLASSES];
-        // Their resident dependencies, which must stay.
-        let mut held = Vec::new();
-        for &k in &chain[..admitted.max(1)] {
+        for &k in first {
             let u = self.unit(k).expect("unit of a closure");
             need[u.class as usize] += u.held();
-            held.extend(u.deps.iter().map(|&unit| Key {
-                mount: k.mount,
-                unit,
-            }));
         }
+        // Their resident dependencies, which must stay.
+        let mut held = None;
         let mut victims = Vec::new();
         for class in ResidencyClass::ALL {
             let c = class as usize;
             let over = (self.used[c] + need[c]).saturating_sub(self.budget(c));
-            let (v, short) = self.victims(c, over, frame, &held);
+            if over == 0 {
+                continue;
+            }
+            if over > self.age(c, frame) {
+                return Err(Short::Budget);
+            }
+            let held = held.get_or_insert_with(|| {
+                let deps = |&k: &Key| {
+                    let deps = &self.unit(k).expect("unit of a closure").deps;
+                    deps.iter().map(move |&unit| Key {
+                        mount: k.mount,
+                        unit,
+                    })
+                };
+                first.iter().flat_map(deps).collect::<FxHashSet<Key>>()
+            });
+            let (v, short) = self.victims(c, over, frame, held);
             if short > 0 {
                 return Err(Short::Budget);
             }
@@ -1109,22 +1189,25 @@ impl Residency {
         Ok(admitted)
     }
 
-    /// Units of class `c` past their hold, least recently touched first, whose eviction
-    /// frees `over` bytes, leaving `held` units and those with resident dependents; and the
-    /// bytes still over when no more can go. Moves each unit it reaches that was touched since
-    /// it was listed to its last touch.
-    fn victims(&mut self, c: usize, mut over: u64, frame: u64, held: &[Key]) -> (Vec<Key>, u64) {
-        let mut victims = Vec::new();
-        let mut after = None;
-        while over > 0 {
-            let next = match after {
-                None => self.lru[c].first(),
-                Some(a) => self.lru[c].range((Excluded(a), Unbounded)).next(),
-            };
-            let Some(&(listed, k)) = next else { break };
-            if listed + HOLD_FRAMES >= frame {
-                break;
-            }
+    /// Moves the horizon of class `c` to `frame`: lists each unit that left its hold since
+    /// the last move under its last touch. Returns the bytes held by the evictable units past
+    /// their hold.
+    fn age(&mut self, c: usize, frame: u64) -> u64 {
+        let list = &mut self.evictable[c];
+        let horizon = frame.saturating_sub(HOLD_FRAMES);
+        if horizon <= list.horizon {
+            return list.aged;
+        }
+        let first = Key {
+            mount: MountId(0),
+            unit: 0,
+        };
+        let reached: Vec<(u64, Key)> = list
+            .lru
+            .range((list.horizon, first)..(horizon, first))
+            .copied()
+            .collect();
+        for (listed, k) in reached {
             let u = self
                 .mounts
                 .get_mut(&k.mount)
@@ -1132,14 +1215,40 @@ impl Residency {
                 .expect("resident unit");
             if u.touched != listed {
                 u.listed = u.touched;
-                self.lru[c].remove(&(listed, k));
-                self.lru[c].insert((u.touched, k));
-                continue;
+                list.lru.remove(&(listed, k));
+                list.lru.insert((u.listed, k));
             }
-            after = Some((listed, k));
-            if u.locks == 0 && u.dependents == 0 && !held.contains(&k) {
+            if u.listed < horizon {
+                list.aged += u.held();
+            }
+        }
+        list.horizon = horizon;
+        list.aged
+    }
+
+    /// Units of class `c` past their hold at `frame`, least recently touched first, whose
+    /// eviction frees `over` bytes, leaving `held` units; and the bytes still over when no
+    /// more can go.
+    fn victims(
+        &mut self,
+        c: usize,
+        mut over: u64,
+        frame: u64,
+        held: &FxHashSet<Key>,
+    ) -> (Vec<Key>, u64) {
+        let mut victims = Vec::new();
+        if over == 0 {
+            return (victims, 0);
+        }
+        self.age(c, frame);
+        let list = &self.evictable[c];
+        for &(listed, k) in &list.lru {
+            if over == 0 || listed >= list.horizon {
+                break;
+            }
+            if !held.contains(&k) {
                 victims.push(k);
-                over = over.saturating_sub(u.held());
+                over = over.saturating_sub(self.unit(k).expect("resident unit").held());
             }
         }
         (victims, over)
@@ -1150,13 +1259,12 @@ impl Residency {
         let units = self.mounts.get_mut(&k.mount).expect("mounted");
         let u = &mut units[k.unit as usize];
         let c = u.class as usize;
-        self.lru[c].remove(&(u.listed, k));
+        debug_assert!(u.evictable());
+        self.evictable[c].unlist(k, u);
         u.state = State::Absent;
         self.used[c] -= u.held();
         self.resident_units[c] -= 1;
-        for d in u.deps.clone() {
-            units[d as usize].dependents -= 1;
-        }
+        hold_dependencies(units, &mut self.evictable, k.mount, k.unit, false);
     }
 
     fn start_load(&mut self, k: Key, lane: usize) {
@@ -1169,9 +1277,7 @@ impl Residency {
         self.loading_bytes[c] += u.held();
         self.in_flight += u.bytes;
         self.lane_in_flight[lane] += u.bytes;
-        for d in u.deps.clone() {
-            units[d as usize].dependents += 1;
-        }
+        hold_dependencies(units, &mut self.evictable, k.mount, k.unit, true);
     }
 
     fn refresh(&mut self) {
@@ -1234,7 +1340,30 @@ mod tests {
         }
         let plan = r.plan(frame, []);
         land_all(r, &plan, frame);
+        check(r);
         plan
+    }
+
+    /// Checks each class's evictable units and their aged bytes against its units.
+    fn check(r: &Residency) {
+        for (c, list) in r.evictable.iter().enumerate() {
+            let mut lru = BTreeSet::new();
+            let mut aged = 0;
+            for (&mount, units) in &r.mounts {
+                for (i, u) in units.iter().enumerate() {
+                    if u.class as usize != c || !u.evictable() {
+                        continue;
+                    }
+                    let unit = i as u32;
+                    lru.insert((u.listed, Key { mount, unit }));
+                    if u.listed < list.horizon {
+                        assert_eq!(u.listed, u.touched, "unit {unit} past the horizon");
+                        aged += u.held();
+                    }
+                }
+            }
+            assert_eq!((&list.lru, list.aged), (&lru, aged), "class {c}");
+        }
     }
 
     fn class(r: &Residency) -> ClassStats {
@@ -1278,6 +1407,50 @@ mod tests {
         let plan = step(&mut r, &[1], 2 + HOLD_FRAMES + 1);
         assert_eq!(plan.evictions, [key(2)], "0 is older but 1 needs it");
         assert_eq!(plan.loads, [key(1)]);
+    }
+
+    #[test]
+    fn units_that_must_stay_are_evicted_once_they_can_go_and_a_touch_keeps_them() {
+        let mut r = Residency::new(limits(300));
+        let units = [
+            unit(100, &[], Start::Absent),
+            unit(100, &[0], Start::Absent),
+            unit(100, &[], Start::Absent),
+            unit(100, &[], Start::Absent),
+            unit(100, &[], Start::Absent),
+        ];
+        r.register(M, &units).unwrap();
+        step(&mut r, &[1], 1);
+        step(&mut r, &[2], 2);
+        r.lock(key(2));
+        let late = 2 + HOLD_FRAMES + 1;
+        let plan = step(&mut r, &[3], late);
+        assert_eq!(plan.evictions, [key(1)], "1 depends on 0 and 2 is locked");
+        assert_eq!(plan.loads, [key(3)]);
+        assert_eq!(
+            step(&mut r, &[1], late).loads,
+            [],
+            "0 can go, but 1 needs it"
+        );
+        assert_eq!(r.stats().dropped_from(S), 1);
+        r.unlock(key(2));
+        let plan = step(&mut r, &[1], late);
+        assert_eq!((plan.evictions, plan.loads), (vec![key(2)], vec![key(1)]));
+
+        // A touch in its hold keeps 1, which the eviction finds listed before 3.
+        let later = late + HOLD_FRAMES + 1;
+        r.touch(key(1), later);
+        let plan = step(&mut r, &[4], later);
+        assert_eq!((plan.evictions, plan.loads), (vec![key(3)], vec![key(4)]));
+
+        // 0 is past its hold when 1 leaves it; a touch then keeps it.
+        let last = later + HOLD_FRAMES + 1;
+        let plan = step(&mut r, &[2], last);
+        assert_eq!((plan.evictions, plan.loads), (vec![key(1)], vec![key(2)]));
+        r.touch(key(0), last);
+        check(&r);
+        let plan = step(&mut r, &[3], last);
+        assert_eq!((plan.evictions, plan.loads), (vec![key(4)], vec![key(3)]));
     }
 
     #[test]
