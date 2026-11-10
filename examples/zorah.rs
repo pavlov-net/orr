@@ -812,6 +812,8 @@ fn run(options: &Options) -> Option<Capture> {
             "ZORAH_SOFTWARE_RASTER_PIXELS",
             defaults.software_raster_pixels,
         ),
+        culled_error_scale: pixels("ZORAH_CULLED_SCALE", defaults.culled_error_scale),
+        hidden_detail_lead: pixels("ZORAH_HIDDEN_LEAD", defaults.hidden_detail_lead),
         ..defaults
     };
     let mut display = window.as_ref().map(|w| {
