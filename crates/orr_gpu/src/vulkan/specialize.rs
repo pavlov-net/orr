@@ -6,8 +6,8 @@
 //! the blocks no path of the function reaches, with every other entry point's function. It
 //! changes nothing a reachable instruction computes.
 //!
-//! It reads tests in SSA form only: a value a branch loads back from a local variable stays
-//! unknown, and its branch stays.
+//! A test may reach its branch as a value or through a scalar local variable that only loads
+//! and stores touch: such a variable holds what its stores that run agree on.
 
 use std::collections::{HashMap, HashSet};
 
@@ -45,6 +45,10 @@ const OP_SPEC_CONSTANT_FALSE: u32 = 49;
 const OP_SPEC_CONSTANT: u32 = 50;
 const OP_FUNCTION: u32 = 54;
 const OP_FUNCTION_END: u32 = 56;
+const OP_VARIABLE: u32 = 59;
+const OP_LOAD: u32 = 61;
+const OP_STORE: u32 = 62;
+const STORAGE_FUNCTION: u32 = 7;
 const OP_DECORATE: u32 = 71;
 const OP_MEMBER_DECORATE: u32 = 72;
 const OP_COPY_OBJECT: u32 = 83;
@@ -146,6 +150,11 @@ struct Folder<'a> {
     code: &'a [u32],
     /// Ids of the boolean and 32-bit integer types.
     scalar: Vec<bool>,
+    /// Ids of the types of pointers to a function's variables of those types.
+    scalar_pointer: Vec<bool>,
+    /// Ids of the function's variables of those types that only loads and stores name. A
+    /// variable's value is what every store to it that runs wrote.
+    local: Vec<bool>,
     value: Vec<Value>,
 }
 
@@ -182,6 +191,12 @@ impl Folder<'_> {
             })
         };
         match op(inst) {
+            OP_LOAD => self
+                .local
+                .get(inst[3] as usize)
+                .copied()
+                .unwrap_or(false)
+                .then_some(a),
             OP_COPY_OBJECT => Some(a),
             OP_BITWISE_AND => both(|x, y| x & y, Some(0)),
             OP_BITWISE_OR => both(|x, y| x | y, Some(u32::MAX)),
@@ -311,6 +326,7 @@ pub(super) fn specialize(
     // The module's declarations: its entry points, scalar types and constants.
     let mut spec_ids: HashMap<u32, u32> = HashMap::new();
     let mut scalar = vec![false; bound];
+    let mut scalar_pointer = vec![false; bound];
     let mut value = vec![Value::Varying; bound];
     let mut frozen: HashMap<u32, u32> = HashMap::new();
     let mut kept_entry = None;
@@ -337,6 +353,10 @@ pub(super) fn specialize(
             }
             OP_TYPE_BOOL => scalar[id(1)? as usize] = true,
             OP_TYPE_INT => scalar[id(1)? as usize] = inst.get(2) == Some(&32),
+            OP_TYPE_POINTER => {
+                scalar_pointer[id(1)? as usize] =
+                    inst.get(2) == Some(&STORAGE_FUNCTION) && scalar[id(3)? as usize];
+            }
             OP_CONSTANT_TRUE => value[id(2)? as usize] = Value::Constant(1),
             OP_CONSTANT_FALSE => value[id(2)? as usize] = Value::Constant(0),
             OP_CONSTANT | OP_CONSTANT_NULL if scalar[id(1)? as usize] => {
@@ -378,6 +398,8 @@ pub(super) fn specialize(
     let mut folder = Folder {
         code,
         scalar,
+        scalar_pointer,
+        local: vec![false; bound],
         value,
     };
     let mut body: Vec<u32> = Vec::with_capacity(code.len() - functions_at);
@@ -483,6 +505,38 @@ fn fold_function(
     next_id: &mut u32,
 ) -> Option<()> {
     let code = folder.code;
+    // The scalar variables only loads and stores name. An id anywhere else, a literal of its
+    // value among them, leaves the variable out.
+    for item in instructions(&code[..end], at) {
+        let (_, inst) = item?;
+        if op(inst) == OP_VARIABLE
+            && inst.get(3) == Some(&STORAGE_FUNCTION)
+            && folder
+                .scalar_pointer
+                .get(inst[1] as usize)
+                .copied()
+                .unwrap_or(false)
+        {
+            let initial = inst.get(4).map_or(Value::Unreached, |&id| folder.known(id));
+            *folder.local.get_mut(inst[2] as usize)? = true;
+            folder.value[inst[2] as usize] = initial;
+        }
+    }
+    for item in instructions(&code[..end], at) {
+        let (_, inst) = item?;
+        for (place, &word) in inst.iter().enumerate().skip(1) {
+            let named = match op(inst) {
+                OP_VARIABLE => place == 2,
+                OP_LOAD => place == 3,
+                OP_STORE => place == 1,
+                _ => false,
+            };
+            if !named && folder.local.get(word as usize).copied().unwrap_or(false) {
+                folder.local[word as usize] = false;
+                folder.value[word as usize] = Value::Varying;
+            }
+        }
+    }
     // The blocks, and each instruction the pass reads marked as not reached yet.
     let mut blocks: Vec<Block> = Vec::new();
     let mut first_label = end;
@@ -558,6 +612,18 @@ fn fold_function(
             let b = &blocks[k];
             for item in instructions(&code[..b.end], b.start) {
                 let (_, inst) = item?;
+                if op(inst) == OP_STORE
+                    && inst.len() >= 3
+                    && folder.local.get(inst[1] as usize).copied().unwrap_or(false)
+                {
+                    let stored = folder.known(inst[2]);
+                    let slot = &mut folder.value[inst[1] as usize];
+                    let met = slot.meet(stored);
+                    if met != *slot {
+                        *slot = met;
+                        changed = true;
+                    }
+                }
                 if inst.len() < 4 {
                     continue;
                 }
@@ -881,6 +947,64 @@ mod tests {
             kept.windows(4)
                 .any(|w| w == inst(OP_BRANCH_CONDITIONAL, &[12, 13, 14]))
         );
+    }
+
+    /// A test stored to a scalar local in both arms of a folded branch reaches the branch
+    /// that loads it: only the store that runs counts. A variable something else names is not
+    /// followed.
+    #[test]
+    fn a_test_reaches_its_branch_through_a_local() {
+        let build = |escapes: bool| {
+            let mut parts = vec![
+                named(OP_ENTRY_POINT, &[5, 8], "keep"),
+                inst(OP_DECORATE, &[5, DECORATION_SPEC_ID, 7]),
+            ];
+            parts.extend(declarations(inst(OP_SPEC_CONSTANT, &[4, 5, 1])));
+            parts.extend([
+                inst(OP_TYPE_POINTER, &[9, STORAGE_FUNCTION, 3]),
+                inst(OP_CONSTANT_TRUE, &[3, 21]),
+                inst(OP_CONSTANT_FALSE, &[3, 22]),
+                inst(OP_FUNCTION, &[1, 8, 0, 2]),
+                inst(OP_LABEL, &[10]),
+                inst(OP_VARIABLE, &[9, 20, STORAGE_FUNCTION]),
+                inst(OP_BITWISE_AND, &[4, 11, 5, 6]),
+                inst(OP_I_NOT_EQUAL, &[3, 12, 11, 7]),
+                inst(OP_SELECTION_MERGE, &[14, 0]),
+                inst(OP_BRANCH_CONDITIONAL, &[12, 13, 15]),
+                inst(OP_LABEL, &[13]),
+                inst(OP_STORE, &[20, 21]),
+                inst(OP_BRANCH, &[14]),
+                inst(OP_LABEL, &[15]),
+                inst(OP_STORE, &[20, 22]),
+                inst(OP_BRANCH, &[14]),
+                inst(OP_LABEL, &[14]),
+            ]);
+            if escapes {
+                parts.push(inst(OP_COPY_OBJECT, &[9, 23, 20]));
+            }
+            parts.extend([
+                inst(OP_LOAD, &[3, 16, 20]),
+                inst(OP_SELECTION_MERGE, &[18, 0]),
+                inst(OP_BRANCH_CONDITIONAL, &[16, 17, 18]),
+                inst(OP_LABEL, &[17]),
+                inst(OP_BRANCH, &[18]),
+                inst(OP_LABEL, &[18]),
+                inst(OP_RETURN, &[]),
+                inst(OP_FUNCTION_END, &[]),
+            ]);
+            module(24, &parts)
+        };
+        let folded =
+            |escapes| specialize(&build(escapes), b"keep", &SPEC, &0u32.to_le_bytes()).unwrap();
+        let has = |code: &[u32], i: Vec<u32>| code.windows(i.len()).any(|w| w == i);
+        let through = folded(false);
+        assert!(!has(&through, inst(OP_LABEL, &[13])));
+        assert!(!has(&through, inst(OP_LABEL, &[17])));
+        assert!(has(&through, inst(OP_STORE, &[20, 22])));
+        assert!(!has(&through, inst(OP_BRANCH_CONDITIONAL, &[16, 17, 18])));
+        let kept = folded(true);
+        assert!(!has(&kept, inst(OP_LABEL, &[13])));
+        assert!(has(&kept, inst(OP_BRANCH_CONDITIONAL, &[16, 17, 18])));
     }
 
     /// A switch on a constant keeps its merge instruction and its one live target: a block
