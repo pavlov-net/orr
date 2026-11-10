@@ -501,10 +501,15 @@ impl Streaming {
     }
 }
 
+/// The passes of a scene's DAG traversal and ray-tracing cuts.
+const CUT_PASSES: [&str; 4] = ["traverse", "admit cuts", "fill cuts", "build cuts"];
+
 /// Frame rate and residency, averaged over each `READOUT_PERIOD`.
 struct Readout {
     frames: u32,
     seconds: f64,
+    /// GPU milliseconds of the scenes' passes named in `CUT_PASSES`, summed over the period.
+    cut_ms: [f64; 4],
     /// The residency figures at the start of the period.
     start: ResidencyStats,
     text: String,
@@ -515,6 +520,7 @@ impl Readout {
         Self {
             frames: 0,
             seconds: 0.0,
+            cut_ms: [0.0; 4],
             start: *renderer.residency(),
             text: String::new(),
         }
@@ -523,6 +529,11 @@ impl Readout {
     fn add(&mut self, delta: f64, renderer: &Renderer) {
         self.frames += 1;
         self.seconds += delta;
+        for p in &renderer.stats().gpu {
+            if let Some(i) = CUT_PASSES.iter().position(|&n| n == p.name) {
+                self.cut_ms[i] += p.gpu_ms;
+            }
+        }
         if self.seconds < READOUT_PERIOD {
             return;
         }
@@ -542,9 +553,13 @@ impl Readout {
         let rate = |n: f64| n / self.seconds;
         let dropped = |source| r.dropped_from(source);
         self.text = format!(
-            "{:.1} fps  {:.2} ms\ndetail x{:.3}, gathers x{:.3}, mesh pages {:.0} of {:.0} MiB wanted\nmesh pages {}\ntextures {}\ninstance pages {}\nCLAS {:.0} / {:.0} MiB used, {:.0} retries/s, range full {} times, cluster ids full {} times\nread {:.0} MiB/s, {:.0} loads/s landed\n{} loads  {} evictions  {} failed  {} out of memory  {} pages over budget\ndropped: {} traversal, {} finer cuts, {} textures, {} instance pages, {} hints\n{} waiting  longest closure {}\nfeedback lost: {} requests, {} texture raises\nray cuts: {} gathered ({} cached, {} shared, {} fell back, {} past a full queue, {} empty), {} merged, {} BLAS built of {} CLAS; wanted {} BLAS of {} CLAS, tables hold {} BLAS of {} CLAS in {:.1} MiB\nraster: {} candidate items, {} dropped, {} nodes dropped",
+            "{:.1} fps  {:.2} ms; GPU ms: traversal {:.2}, cut admission {:.2}, fill {:.2}, BLAS build {:.2}\ndetail x{:.3}, gathers x{:.3}, mesh pages {:.0} of {:.0} MiB wanted\nmesh pages {}\ntextures {}\ninstance pages {}\nCLAS {:.0} / {:.0} MiB used, {:.0} retries/s, range full {} times, cluster ids full {} times\nread {:.0} MiB/s, {:.0} loads/s landed\n{} loads  {} evictions  {} failed  {} out of memory  {} pages over budget\ndropped: {} traversal, {} finer cuts, {} textures, {} instance pages, {} hints\n{} waiting  longest closure {}\nfeedback lost: {} requests, {} texture raises\nray cuts: {} gathered ({} cached, {} shared, {} fell back, {} past a full queue, {} empty), {} merged, {} BLAS built of {} CLAS; wanted {} BLAS of {} CLAS, tables hold {} BLAS of {} CLAS in {:.1} MiB\nraster: {} candidate items, {} dropped, {} nodes dropped",
             f64::from(self.frames) / self.seconds,
             self.seconds * 1000.0 / f64::from(self.frames),
+            self.cut_ms[0] / f64::from(self.frames),
+            self.cut_ms[1] / f64::from(self.frames),
+            self.cut_ms[2] / f64::from(self.frames),
+            self.cut_ms[3] / f64::from(self.frames),
             detail.memory_scale,
             detail.rt_scale,
             mib(detail.mesh_demand),
@@ -597,6 +612,7 @@ impl Readout {
         self.start = *r;
         self.frames = 0;
         self.seconds = 0.0;
+        self.cut_ms = [0.0; 4];
     }
 }
 

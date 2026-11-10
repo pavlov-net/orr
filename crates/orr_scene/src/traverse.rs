@@ -870,6 +870,8 @@ impl Cuts {
             list.dispatch(p.get(k.finish), root(passes, false)?, [1, 1, 1]);
             step(list);
         }
+        list.end_pass();
+        list.begin_pass("admit cuts", false);
         for kernel in [k.assign, k.insert, k.rank, k.own] {
             list.dispatch(p.get(kernel), r0, groups(f.slots));
             step(list);
@@ -895,6 +897,8 @@ impl Cuts {
         step(list);
         list.dispatch(p.get(k.write), fb, words);
         step(list);
+        list.end_pass();
+        list.begin_pass("fill cuts", false);
         list.dispatch(p.get(k.fill_roots), root(0, true)?, groups(f.slots));
         step(list);
         if passes > 0 {
@@ -914,6 +918,8 @@ impl Cuts {
         list.dispatch_indirect(p.get(k.gather), r0, gather);
         let jobs = args.offset(ARGS_JOBS).cast::<DispatchArgs>();
         list.dispatch_indirect(p.get(k.jobs), r0, jobs);
+        list.end_pass();
+        list.begin_pass("build cuts", false);
         if let Some((arenas, scratch)) = &self.rt.arenas {
             let arena = &arenas[(self.updates % 2) as usize];
             let rt = &self.rt;
