@@ -335,9 +335,10 @@ struct Lighting {
 }
 
 impl Lighting {
-    /// Starts the path kernels unless they are ready or compiling: from the pipeline caches when
-    /// they hold every one and `try_cached_paths` allows looking, else as jobs on `loading`, which
-    /// report any failure.
+    /// Starts the lighting kernels unless they are ready or compiling: from the pipeline caches
+    /// when they hold every one and `try_cached_paths` allows looking, else as jobs on `loading`,
+    /// which report any failure. The path pipelines themselves start as jobs when a view first
+    /// asks for them.
     fn start_paths(&mut self, gpu: &Device, loading: &Arc<Loading>) {
         if matches!(self.paths, Paths::Ready(_) | Paths::Compiling { .. }) {
             return;
@@ -668,12 +669,13 @@ impl Renderer {
     /// History for one persistent camera: its previous camera, exposure slots and the
     /// lighting and output state of its renders.
     ///
-    /// The first call, and the first after a failed compile, starts the path tracing pipelines
-    /// without compiling on this thread. If
-    /// the pipeline caches hold them all ([`RendererDesc::try_cached_paths`]), they are ready
-    /// when it returns, in tens of milliseconds. Otherwise they compile as jobs on
-    /// [`Renderer::loading`], [`CompilingKernels::JOBS`] of them, which take minutes on a first
-    /// run, holding their threads the whole time. Until then [`Frame::render_view`] renders black.
+    /// The first call, and the first after a failed compile, starts the lighting kernels
+    /// without compiling on this thread. If the pipeline caches hold those every view runs
+    /// ([`RendererDesc::try_cached_paths`]), they are ready when it returns. Otherwise they
+    /// compile as jobs on [`Renderer::loading`], [`CompilingKernels::JOBS`] of them, which take
+    /// minutes on a first run, holding their threads the whole time. The path pipelines are
+    /// compiled for what a view's scene and settings may meet, as jobs of their own when the
+    /// view first renders. Until both are ready [`Frame::render_view`] renders black.
     /// The jobs need threads: lend them with [`Loading::run_worker`] or
     /// [`Loading::run_one`], at least [`CompilingKernels::JOBS`] to compile in parallel and more
     /// to keep loading meanwhile, or block in [`Renderer::wait_paths`]. With neither, views stay
@@ -731,10 +733,6 @@ impl Renderer {
         self.lighting.paths.poll();
         match &self.lighting.paths {
             Paths::Failed(e) => Err(Error::PathKernels(Arc::clone(e))),
-            Paths::Ready(kernels) => {
-                kernels.wait();
-                Ok(())
-            }
             _ => Ok(()),
         }
     }

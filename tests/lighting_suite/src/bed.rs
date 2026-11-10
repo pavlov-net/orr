@@ -2666,7 +2666,7 @@ impl Paths {
                 for _ in 1..CompilingKernels::JOBS {
                     threads.spawn(|| while self.loading.run_one() {});
                 }
-                self.kernels.wait();
+                self.kernels.wait_paths(lighting, &needs, settings).unwrap();
             });
         }
         self.kernels

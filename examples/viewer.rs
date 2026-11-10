@@ -171,7 +171,12 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             target,
         };
         let output = ViewOutput::default();
-        f.prepare_view(&view, &ViewLighting::default(), &output)
+        let lighting = ViewLighting {
+            // Scratch: `ORR_SCRATCH_STAGE_TIMES` times the staged path loop's stages apart.
+            stage_passes: std::env::var_os("ORR_SCRATCH_STAGE_TIMES").is_some(),
+            ..ViewLighting::default()
+        };
+        f.prepare_view(&view, &lighting, &output)
             .expect("prepare view");
         f.update_scenes(&mut |c| showcase.sky.record(c, &[]).expect("sky passes"))
             .expect("update scenes");
@@ -182,7 +187,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             ui: Some(&mut ui),
             ..ViewHooks::default()
         };
-        f.render_view(&view, &ViewLighting::default(), &output, &mut hooks)
+        f.render_view(&view, &lighting, &output, &mut hooks)
             .expect("render view");
         last = Some((id, f.end().expect("end frame")));
     }

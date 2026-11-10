@@ -385,7 +385,7 @@ impl<T: Send + 'static> Late<T> {
 }
 
 /// The stage pipelines for one value of `path_may`, each made when a source first asks for it.
-struct StageSet {
+pub(crate) struct StageSet {
     may: u32,
     stages: [Late<StagePipeline>; STAGES],
 }
@@ -471,17 +471,31 @@ impl StagedKernels {
         }
     }
 
-    /// Makes later pipelines on `device` as jobs on `loading`, and queues the tail stage's
-    /// compile there. The tail holds `trace_path`'s whole loop, so it compiles for minutes;
-    /// until it is ready a pass runs every round. `device` may compile what the device the
-    /// kernels were made on only looks up in its caches.
+    /// Makes later pipelines on `device` as jobs on `loading`. `device` may compile what the
+    /// device the kernels were made on only looks up in its caches.
     pub(crate) fn attach(&self, device: &Device, loading: &Arc<Loading>) {
         let _ = self.compiler.set((device.clone(), Arc::clone(loading)));
+    }
+
+    /// Queues what paths do without until it is ready, after the pipelines a view asked for:
+    /// the tail stage, which holds `trace_path`'s whole loop and so compiles for minutes
+    /// (until then a pass runs every round), and the pipelines of `stages` that may meet
+    /// everything, which run a scene that comes to hold more than its own were made for.
+    pub(crate) fn start_background(&self, stages: &[Stage]) {
         self.start_late(&self.tail, |d, kernels| {
             let stage =
                 ShaderStage::new(module(kernels, &tail::MODULE)?, "main", SpecData::default())?;
             Ok(d.create_compute_pipeline(&stage, "staged tail")?)
         });
+        if self.loading().is_some() && scratch_late() == Some(false) {
+            self.request(MAY_ALL, stages);
+        }
+    }
+
+    /// Scratch: whether the pipelines paths do without compile before a view's own, on the
+    /// calling thread (`ORR_SCRATCH_TAIL_SYNC`).
+    pub(crate) fn late_first(&self) -> bool {
+        scratch_late() == Some(true)
     }
 
     /// Starts `compile` for a pipeline the paths do without until it is ready, as a job on the
@@ -491,12 +505,9 @@ impl StagedKernels {
         late: &Late<T>,
         compile: impl FnOnce(&Device, &KernelSet) -> Result<T, Error> + Send + 'static,
     ) {
-        // Scratch: `ORR_SCRATCH_NO_TAIL` leaves these pipelines out, and
-        // `ORR_SCRATCH_TAIL_SYNC` compiles them here, so the first frame runs them.
-        if std::env::var_os("ORR_SCRATCH_NO_TAIL").is_some() {
+        let Some(sync) = scratch_late() else {
             return;
-        }
-        let sync = std::env::var_os("ORR_SCRATCH_TAIL_SYNC").is_some();
+        };
         let kernels = self.kernels;
         late.start(self.device(), self.loading().filter(|_| !sync), move |d| {
             compile(d, &kernels)
@@ -571,14 +582,19 @@ impl StagedKernels {
             .count() as u32
     }
 
-    /// Waits for every pipeline asked for, running queued jobs on this thread meanwhile.
-    pub(crate) fn wait(&self) {
-        let sets: Vec<_> = self.sets.lock().unwrap().clone();
-        for late in sets.iter().flat_map(|s| s.stages.iter()) {
-            if late.pending() {
-                let _ = late.wait(self.loading());
-            }
+    /// Waits for pipelines that hold `stages` for paths that may meet `may`, running queued
+    /// jobs on this thread meanwhile.
+    pub(crate) fn wait(&self, may: u32, stages: &[Stage]) -> Result<Arc<StageSet>, Error> {
+        if let Some(set) = self.covering(may, stages) {
+            return Ok(set);
         }
+        let set = self
+            .compiling(may, stages)
+            .unwrap_or_else(|| self.request(may, stages));
+        for stage in StageSet::runs(set.may, stages) {
+            set.stage(stage).wait(self.loading())?;
+        }
+        Ok(set)
     }
 
     /// Records `source`'s paths, which may meet `may`, over `items` (pixels, update blocks or
@@ -589,8 +605,8 @@ impl StagedKernels {
     /// workgroups their queues gathered; a pass ends in the finish stage. `rounds` is at least
     /// one more than the traces a path of the source takes, and a view's pixels with a
     /// frosted-glass path take a second pass. Once the tail stage has compiled, a pass runs
-    /// [`Source::wide`] rounds and the tail stage takes its paths from there. Orders nothing
-    /// after it.
+    /// [`Source::wide`] rounds and the tail stage takes its paths from there. With
+    /// `stage_passes` each stage records in a pass of its own. Orders nothing after it.
     ///
     /// The pipelines are those ready that hold the least beyond `may`; with none ready it
     /// waits for the ones made for `may`, as nothing else may run these paths.
@@ -605,6 +621,7 @@ impl StagedKernels {
         items: u32,
         rounds: u32,
         passes: u32,
+        stage_passes: bool,
     ) -> Result<(), Error> {
         if rounds * passes > MAX_ROUNDS {
             return Err(Error::Settings(
@@ -614,18 +631,7 @@ impl StagedKernels {
         let may = may | source.may();
         let walks = root.features & FEATURE_WALK != 0 && memory.walks.is_some();
         let stages = source.stages(walks);
-        let set = match self.covering(may, &stages) {
-            Some(set) => set,
-            None => {
-                let set = self
-                    .compiling(may, &stages)
-                    .unwrap_or_else(|| self.request(may, &stages));
-                for stage in StageSet::runs(set.may, &stages) {
-                    set.stage(stage).wait(self.loading())?;
-                }
-                set
-            }
-        };
+        let set = self.wait(may, &stages)?;
         let pipeline = |stage: Stage| set.stage(stage).get().expect("the set holds the stage");
         let mut root = PathRoot {
             stages: memory.header.gpu(),
@@ -655,7 +661,7 @@ impl StagedKernels {
                 Stages::COMPUTE | Stages::RAY,
                 Hazards::empty(),
             );
-            scratch_mark(list, source, 0);
+            stage_pass(list, stage_passes, source, 0);
             let queues = (MAX_ROUNDS + 1) * STAGE_QUEUES as u32;
             list.dispatch_inline(
                 pipeline(Stage::Reset).compute(),
@@ -673,14 +679,14 @@ impl StagedKernels {
                 for round in first..first + run {
                     root.round = round_word(round, first, first + rounds);
                     barrier(list);
-                    scratch_mark(list, source, 1);
+                    stage_pass(list, stage_passes, source, 1);
                     list.dispatch_indirect_inline(
                         pipeline(Stage::Trace).compute(),
                         &root,
                         memory.groups(round, QUEUE_TRACE),
                     );
                     barrier(list);
-                    scratch_mark(list, source, 2);
+                    stage_pass(list, stage_passes, source, 2);
                     pipeline(Stage::Opaque).dispatch(
                         list,
                         &root,
@@ -702,7 +708,7 @@ impl StagedKernels {
                     }
                     if walks {
                         barrier(list);
-                        scratch_mark(list, source, 3);
+                        stage_pass(list, stage_passes, source, 3);
                         list.dispatch_indirect_inline(
                             pipeline(Stage::Walk).compute(),
                             &root,
@@ -713,7 +719,7 @@ impl StagedKernels {
                 if let Some(tail) = tail {
                     root.round = round_word(first + run, first, first + rounds);
                     barrier(list);
-                    scratch_mark(list, source, 4);
+                    stage_pass(list, stage_passes, source, 4);
                     // Scratch: `ORR_SCRATCH_TAIL_DIRECT` runs it over every slot of the slice,
                     // whose lanes past the queue's count end at once.
                     if std::env::var_os("ORR_SCRATCH_TAIL_DIRECT").is_some() {
@@ -731,7 +737,7 @@ impl StagedKernels {
                     }
                 }
                 barrier(list);
-                scratch_mark(list, source, 5);
+                stage_pass(list, stage_passes, source, 5);
                 list.dispatch_indirect_inline(
                     pipeline(Stage::Finish).compute(),
                     &root,
@@ -748,10 +754,19 @@ impl StagedKernels {
     }
 }
 
-/// Scratch: with `ORR_SCRATCH_STAGE_TIMES`, ends the open pass and opens one named for
-/// `source`'s stage `stage` (start, trace, shade, walk, tail, finish), so the pass results time
-/// the stages apart.
-fn scratch_mark(list: &mut CommandList<'_>, source: Source, stage: usize) {
+/// Scratch: whether the pipelines paths do without compile on the calling thread, so the first
+/// frame runs them (`ORR_SCRATCH_TAIL_SYNC`); none with `ORR_SCRATCH_NO_TAIL`, which leaves
+/// them out.
+fn scratch_late() -> Option<bool> {
+    if std::env::var_os("ORR_SCRATCH_NO_TAIL").is_some() {
+        return None;
+    }
+    Some(std::env::var_os("ORR_SCRATCH_TAIL_SYNC").is_some())
+}
+
+/// With `on`, ends the open pass and opens one named for `source`'s stage `stage` (start,
+/// trace, shade, walk, tail, finish), so the pass results time the stages apart.
+fn stage_pass(list: &mut CommandList<'_>, on: bool, source: Source, stage: usize) {
     const NAMES: [[&str; 6]; 4] = [
         [
             "view start",
@@ -786,7 +801,7 @@ fn scratch_mark(list: &mut CommandList<'_>, source: Source, stage: usize) {
             "photon finish",
         ],
     ];
-    if std::env::var_os("ORR_SCRATCH_STAGE_TIMES").is_some() {
+    if on {
         list.end_pass();
         list.begin_pass(NAMES[source.id() as usize][stage], false);
     }

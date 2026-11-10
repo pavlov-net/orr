@@ -502,6 +502,8 @@ fn run(options: &Options) -> Option<Capture> {
             DIELECTRIC_DEPTH
         },
         reference: reference.then(ReferenceSettings::default),
+        // Scratch: `ORR_SCRATCH_STAGE_TIMES` times the staged path loop's stages apart.
+        stage_passes: std::env::var_os("ORR_SCRATCH_STAGE_TIMES").is_some(),
         ..ViewLighting::default()
     };
     let capture = options.headless || options.out.is_some();
