@@ -15,7 +15,7 @@ use orr_cook::{
 };
 use orr_math::{Affine3, DVec3, Quat, Vec2, Vec3};
 use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
-use orr_pack::mesh::{MeshHeader, MeshInfo, Node, NodePage, decode_page, in_cut};
+use orr_pack::mesh::{MeshInfo, decode_page, in_cut};
 use orr_pack::model::ModelInfo;
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, ArchiveWriter, AssetId, BlobIn, Class, Codec, Entry, Span, Target};
@@ -34,6 +34,8 @@ use orr_scene::{
     SceneWriter, Scenes, TransformGroupDesc, material_flags,
 };
 use scene_suite::Workers;
+
+mod paged;
 
 const ALBEDO: &str = "kit/albedo";
 
@@ -1081,118 +1083,135 @@ fn an_unmount_takes_copies_and_pages_of_its_models_from_a_scene_that_keeps_rende
 
 const DOME_MESH: &str = "kit/dome/mesh";
 
-/// [`pack`] with the dome's hierarchy split into a top page holding the roots and one
-/// streamed page holding every other node: the layout the cook writes for hierarchies over
-/// one node page, at a size a test can cook quickly.
+/// [`pack`] with the dome's hierarchy split into its top page and one streamed page.
 fn paged_hierarchy() -> &'static Arc<[u8]> {
     static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
-    PACK.get_or_init(|| {
-        let a = Archive::from_memory(Arc::clone(pack())).unwrap();
-        let mut w = ArchiveWriter::create(Target::Memory).unwrap();
-        for e in a.entries() {
-            if e.id != AssetId::from_name(DOME_MESH) {
-                w.copy_entry(&a, e).unwrap();
-                continue;
-            }
-            let mut info = MeshInfo::parse(&blob(&a, e, 0)).unwrap();
-            assert_eq!(info.node_pages.len(), 1);
-            let nodes = blob(&a, e, info.node_pages[0].blob as usize);
-            let count = info.node_pages[0].node_count;
-            let top = info
-                .roots
-                .iter()
-                .filter(|&&r| r != MeshHeader::NO_ROOT)
-                .max()
-                .unwrap()
-                + 1;
-            assert!(top < count, "the dome has nodes below its roots");
-            let first_node_blob = 1 + info.pages.len() as u32;
-            info.node_pages = vec![
-                NodePage {
-                    first_node: 0,
-                    node_count: top,
-                    blob: first_node_blob,
-                    parent_page: NodePage::TOP,
-                },
-                NodePage {
-                    first_node: top,
-                    node_count: count - top,
-                    blob: first_node_blob + 1,
-                    parent_page: 0,
-                },
-            ];
-            let blob0 = info.to_bytes();
-            let pages: Vec<Vec<u8>> = (1..first_node_blob as usize)
-                .map(|i| blob(&a, e, i))
-                .collect();
-            let (top_nodes, rest) = nodes.split_at(top as usize * size_of::<Node>());
-            let mount = |bytes| BlobIn {
-                mount: true,
-                ..BlobIn::new(bytes)
-            };
-            let mut blobs = vec![mount(&blob0)];
-            blobs.extend(pages.iter().map(|p| BlobIn::new(p)));
-            blobs.extend([mount(top_nodes), BlobIn::new(rest)]);
-            w.add(a.name(e), e.class, e.schema, e.cook_key, &blobs)
-                .unwrap();
-        }
-        w.finish().unwrap().unwrap()
-    })
+    PACK.get_or_init(|| paged::split_hierarchy(pack(), AssetId::from_name(DOME_MESH)))
 }
 
-/// The node page table of `model`'s mesh.
-fn node_table(scenes: &Scenes, gpu: &Gpu<'_>, model: ModelId) -> Vec<u64> {
-    let (models, meshes, _) = global_tables(scenes);
-    let model: ModelGpu = gpu.value(models.offset(u64::from(model.0)));
-    let mesh: MeshGpu = gpu.value(meshes.offset(u64::from(model.mesh)));
-    gpu.values(mesh.node_pages, mesh.node_page_count)
-}
-
-/// Runs frames, prefetching `model`, until its streamed node page is resident; returns the
-/// frames it took.
-fn stream_in(scenes: &mut Scenes, gpu: &Gpu<'_>, model: ModelId, budget: u64) -> u32 {
-    let start = Instant::now();
-    let mut frames = 0;
-    while node_table(scenes, gpu, model)[1] == 0 {
-        assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "the node page never streamed in"
-        );
-        scenes.prefetch(model, 0);
-        frame(scenes);
-        frames += 1;
-        let pool = *scenes.residency().class(ResidencyClass::HierarchyPages);
-        assert!(pool.resident_bytes + pool.loading_bytes <= budget);
-    }
-    frames
-}
-
-#[test]
-fn hierarchy_pages_stream_on_request_and_evict_after_their_hold() {
-    let _serial = serial();
-    let bytes = paged_hierarchy();
-    let a = Archive::from_memory(Arc::clone(bytes)).unwrap();
+/// The paged dome's blob 0 and the bytes of its two node pages.
+fn paged_dome() -> (MeshInfo, Vec<Vec<u8>>) {
+    let a = Archive::from_memory(Arc::clone(paged_hierarchy())).unwrap();
     let mesh = entry(&a, AssetId::from_name(DOME_MESH));
     let info = MeshInfo::parse(&blob(&a, mesh, 0)).unwrap();
-    let pages: Vec<Vec<u8>> = info
+    let nodes = info
         .node_pages
         .iter()
         .map(|p| blob(&a, mesh, p.blob as usize))
         .collect();
-    let path = write_pack("paged.orr", bytes);
-    let staged = staged_device();
-    // Room for both mounts' top pages and one streamed page.
-    let budget = 2 * pages[0].len() as u64 + pages[1].len() as u64;
-    let desc = |positioned_reads| RendererDesc {
-        positioned_reads,
+    (info, nodes)
+}
+
+/// A mesh page budget on `dev` for two mounts of [`paged_hierarchy`], whose dome is `info`
+/// with node pages `nodes`: what both mounts place, both streamed node pages, and the dome's
+/// streamed pages of one, with a CLAS pool their CLAS as [`sheet_budget`] counts them.
+fn dome_budget(info: &MeshInfo, nodes: &[Vec<u8>], dev: &Device) -> u64 {
+    let desc = RendererDesc {
         budgets: Budgets {
-            hierarchy_page_pool: budget,
+            mesh_resident_max: 0,
             ..Budgets::default()
         },
         ..RendererDesc::default()
     };
+    let mut scenes = Scenes::new(dev, &desc).unwrap();
+    let workers = Workers::start(&scenes, 2);
+    let m = scenes.mount(PackSource::Memory(Arc::clone(paged_hierarchy())));
+    ready(&mut scenes, m);
+    let placed = scenes
+        .residency()
+        .class(ResidencyClass::MeshPages)
+        .resident_bytes;
+    drop(workers);
+    let pinned = info.header.pinned_pages as usize;
+    let pinned_bytes: u64 = info.pages[..pinned]
+        .iter()
+        .map(|p| u64::from(p.resident_len).next_multiple_of(256))
+        .sum();
+    2 * (placed + nodes[1].len() as u64) + sheet_budget(info, dev) - 2 * pinned_bytes
+}
+
+/// The node page table and the mesh page table of `model`'s mesh.
+fn tables(scenes: &Scenes, gpu: &Gpu<'_>, model: ModelId) -> (Vec<u64>, Vec<u64>) {
+    let (models, meshes, _) = global_tables(scenes);
+    let model: ModelGpu = gpu.value(models.offset(u64::from(model.0)));
+    let mesh: MeshGpu = gpu.value(meshes.offset(u64::from(model.mesh)));
+    (
+        gpu.values(mesh.node_pages, mesh.node_page_count),
+        gpu.values(mesh.pages, mesh.page_count),
+    )
+}
+
+/// Panics unless the node page of every group of the paged dome `info` whose page is resident
+/// in `models`' tables is resident beside it, and the mesh page budget holds what is resident
+/// and loading.
+fn check_dome(scenes: &Scenes, gpu: &Gpu<'_>, models: &[ModelId], info: &MeshInfo, budget: u64) {
+    for &m in models {
+        let (nodes, pages) = tables(scenes, gpu, m);
+        for g in &info.groups {
+            assert!(
+                pages[g.page as usize] == 0 || nodes[usize::from(g.node_page)] != 0,
+                "page {} is resident without node page {}",
+                g.page,
+                g.node_page
+            );
+        }
+    }
+    let pool = *scenes.residency().class(ResidencyClass::MeshPages);
+    assert!(pool.resident_bytes + pool.loading_bytes <= budget);
+}
+
+/// Runs frames, prefetching `model`, until its streamed node page and pages are resident,
+/// checking `models` as [`check_dome`] does each frame; returns the frames it took.
+fn stream_in(
+    scenes: &mut Scenes,
+    gpu: &Gpu<'_>,
+    model: ModelId,
+    models: &[ModelId],
+    (info, budget): (&MeshInfo, u64),
+) -> u32 {
+    let start = Instant::now();
+    let mut frames = 0;
+    loop {
+        let (nodes, pages) = tables(scenes, gpu, model);
+        if !nodes.contains(&0) && !pages.contains(&0) {
+            return frames;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the dome's pages never streamed in"
+        );
+        scenes.prefetch(model, 0);
+        frame(scenes);
+        frames += 1;
+        check_dome(scenes, gpu, models, info, budget);
+    }
+}
+
+#[test]
+fn hierarchy_pages_stream_with_the_pages_below_them_and_leave_after_them() {
+    let _serial = serial();
+    let bytes = paged_hierarchy();
+    let (info, nodes) = paged_dome();
+    let pinned = info.header.pinned_pages as usize;
+    assert!(pinned < info.pages.len(), "the dome has streamed pages");
+    assert!(
+        info.groups.iter().any(|g| g.node_page == 1),
+        "groups below the top page"
+    );
+    let path = write_pack("paged.orr", bytes);
+    let staged = staged_device();
     for (dev, positioned_reads) in [(device(), false), (device(), true), (&staged, false)] {
-        let mut scenes = Scenes::new(dev, &desc(positioned_reads)).unwrap();
+        let budget = dome_budget(&info, &nodes, dev);
+        let desc = RendererDesc {
+            positioned_reads,
+            budgets: Budgets {
+                mesh_resident_max: 0,
+                mesh_page_pool: budget,
+                ..Budgets::default()
+            },
+            ..RendererDesc::default()
+        };
+        let mut scenes = Scenes::new(dev, &desc).unwrap();
         let _workers = Workers::start(&scenes, 2);
         let gpu = Gpu(dev);
         let mounts = [
@@ -1204,23 +1223,24 @@ fn hierarchy_pages_stream_on_request_and_evict_after_their_hold() {
             scenes.model(m, AssetId::from_name("kit/dome")).unwrap()
         });
         for &m in &models {
-            let table = node_table(&scenes, &gpu, m);
-            assert_eq!(gpu.bytes(table[0], pages[0].len()), pages[0]);
+            let (table, pages) = tables(&scenes, &gpu, m);
+            assert_eq!(gpu.bytes(table[0], nodes[0].len()), nodes[0]);
             assert_eq!(table[1], 0, "streamed pages wait for a request");
+            assert!(pages[pinned..].iter().all(|&p| p == 0));
         }
-        let pool = *scenes.residency().class(ResidencyClass::HierarchyPages);
-        assert_eq!(pool.resident_units, 2);
 
-        stream_in(&mut scenes, &gpu, models[0], budget);
-        let first = node_table(&scenes, &gpu, models[0]);
-        assert_eq!(gpu.bytes(first[1], pages[1].len()), pages[1]);
+        stream_in(&mut scenes, &gpu, models[0], &models, (&info, budget));
+        let first = tables(&scenes, &gpu, models[0]).0;
+        assert_eq!(gpu.bytes(first[1], nodes[1].len()), nodes[1]);
 
-        // The second mount's page fits only once the first one's 30-frame hold has passed.
-        let frames = stream_in(&mut scenes, &gpu, models[1], budget);
+        // The second mount's pages fit once the first one's have left after their hold, each
+        // node page after the pages below it.
+        let frames = stream_in(&mut scenes, &gpu, models[1], &models, (&info, budget));
         assert!(frames > 30, "evicted after {frames} frames");
-        assert_eq!(node_table(&scenes, &gpu, models[0])[1], 0, "evicted");
-        let second = node_table(&scenes, &gpu, models[1]);
-        assert_eq!(gpu.bytes(second[1], pages[1].len()), pages[1]);
+        let (_, pages) = tables(&scenes, &gpu, models[0]);
+        assert!(pages[pinned..].contains(&0), "the first mount's pages left");
+        let second = tables(&scenes, &gpu, models[1]).0;
+        assert_eq!(gpu.bytes(second[1], nodes[1].len()), nodes[1]);
         assert_eq!(scenes.residency().failed, 0);
     }
     assert_eq!(
@@ -1259,20 +1279,17 @@ fn traverse_frame(
 fn the_traversal_requests_the_node_pages_it_needs_and_keeps_reading_them() {
     let _serial = serial();
     let bytes = paged_hierarchy();
-    let a = Archive::from_memory(Arc::clone(bytes)).unwrap();
-    let mesh = entry(&a, AssetId::from_name(DOME_MESH));
-    let info = MeshInfo::parse(&blob(&a, mesh, 0)).unwrap();
-    let page_bytes = |p: usize| blob(&a, mesh, info.node_pages[p].blob as usize).len() as u64;
-    // Room for both mounts' top pages and one streamed page.
-    let budget = 2 * page_bytes(0) + page_bytes(1);
+    let (info, nodes) = paged_dome();
+    let dev = device();
+    let budget = dome_budget(&info, &nodes, dev);
     let desc = RendererDesc {
         budgets: Budgets {
-            hierarchy_page_pool: budget,
+            mesh_resident_max: 0,
+            mesh_page_pool: budget,
             ..Budgets::default()
         },
         ..RendererDesc::default()
     };
-    let dev = device();
     let mut scenes = Scenes::new(dev, &desc).unwrap();
     let _workers = Workers::start(&scenes, 2);
     let gpu = Gpu(dev);
@@ -1285,7 +1302,6 @@ fn the_traversal_requests_the_node_pages_it_needs_and_keeps_reading_them() {
         scenes.model(m, AssetId::from_name("kit/dome")).unwrap()
     });
     let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
-    let mut range = None;
     traverse_frame(&mut scenes, scene, |s| {
         let group = s
             .create_transform_group(&TransformGroupDesc {
@@ -1295,68 +1311,58 @@ fn the_traversal_requests_the_node_pages_it_needs_and_keeps_reading_them() {
             })
             .unwrap();
         s.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
-        range = Some(
-            s.add_instances(&InstancesDesc {
-                model: models[0],
-                copies: 1,
-                transforms: group,
-                first: 0,
-                pose: None,
-                material_set: None,
-                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
-                rt_range: 100.0,
-                animation_range: 0.0,
-                user_tag: 0,
-            })
-            .unwrap(),
-        );
+        s.add_instances(&InstancesDesc {
+            model: models[0],
+            copies: 1,
+            transforms: group,
+            first: 0,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 100.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
     });
-    let range = range.unwrap();
 
-    // Below its roots the copy's cut waits for the page, which the traversal requests.
+    // While the traversal requests the node page the copy draws the groups of the pinned
+    // pages, then the finer groups below it as their pages land.
     let start = Instant::now();
-    let (mut requests, mut before) = (0, Vec::new());
-    while node_table(&scenes, &gpu, models[0])[1] == 0 {
+    let (mut requests, mut drawn) = (0, Vec::new());
+    while tables(&scenes, &gpu, models[0]).0[1] == 0 {
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "the node page never streamed in"
         );
         let c = traverse_frame(&mut scenes, scene, |_| {});
         requests += c.page_requests;
-        before.push(c.candidate_clusters);
+        drawn.push(c.candidate_clusters);
+        check_dome(&scenes, &gpu, &models, &info, budget);
     }
     assert!(requests > 0, "the traversal requested the page");
     assert!(
-        before.iter().all(|&n| n == 0),
-        "nothing drawn before the page: {before:?}"
+        drawn.iter().skip(2).all(|&n| n > 0),
+        "drawn before the page: {drawn:?}"
     );
-    let mut drawn = 0;
-    for _ in 0..3 {
-        drawn = traverse_frame(&mut scenes, scene, |_| {}).candidate_clusters;
+    let before = drawn.len();
+    for _ in 0..8 {
+        drawn.push(traverse_frame(&mut scenes, scene, |_| {}).candidate_clusters);
+        check_dome(&scenes, &gpu, &models, &info, budget);
     }
-    assert!(drawn > 0, "the copy draws once the page is resident");
+    assert!(
+        drawn[before..].iter().max() > drawn[..before].iter().max(),
+        "finer once resident: {drawn:?}"
+    );
 
-    // Read every frame, the page outlives its hold: the other mount's page never finds room.
+    // Read every frame, the node page outlives its hold beside the other mount's prefetch.
     for _ in 0..60 {
         scenes.prefetch(models[1], 0);
         traverse_frame(&mut scenes, scene, |_| {});
+        check_dome(&scenes, &gpu, &models, &info, budget);
     }
-    assert_ne!(
-        node_table(&scenes, &gpu, models[0])[1],
-        0,
-        "the page stayed"
-    );
-    assert_eq!(
-        node_table(&scenes, &gpu, models[1])[1],
-        0,
-        "no room for the other page"
-    );
-
-    // Once no traversal reads it, it gives way after its hold.
-    traverse_frame(&mut scenes, scene, |s| s.remove(range));
-    let frames = stream_in(&mut scenes, &gpu, models[1], budget);
-    assert!(frames > 30, "evicted after {frames} frames");
-    assert_eq!(node_table(&scenes, &gpu, models[0])[1], 0, "evicted");
+    assert_ne!(tables(&scenes, &gpu, models[0]).0[1], 0, "the page stayed");
+    assert_eq!(scenes.residency().failed, 0);
     assert_clean();
 }
 
@@ -3512,9 +3518,9 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
 fn the_traversal_requests_kept_are_those_of_the_largest_errors() {
     use orr_scene::orr_gpu::MemoryKind;
     // `cut.slang`: the counters, CUT_REQUESTS, CUT_FEEDBACK, FEEDBACK_BUCKETS and its shift.
-    const COUNTERS: u64 = 24;
+    const COUNTERS: u64 = 23;
     const REQUESTS: usize = 16;
-    const KEPT: usize = 18;
+    const KEPT: usize = 17;
     const BUCKETS: u64 = 4096;
     let bucket = |error: u32| error >> 19;
     let dev = device();

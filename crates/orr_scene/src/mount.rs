@@ -44,7 +44,6 @@ use crate::material::{BoundTexture, MaterialId, MaterialTable, binding_sampler};
 use crate::medium_proxy::VolumeRef;
 use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::neural::{self, NeuralLink, Precision};
-use crate::refine::{FINER_NONE, FinerPages};
 use crate::residency::{RequestSource, ResidencyClass, Start, UnitDesc};
 use crate::scene::{ModelCpu, ModelId, SkinShape};
 use crate::shaders::types::SubdCageGpu;
@@ -136,8 +135,9 @@ struct PlacedMesh {
     info: u64,
     pages: Vec<u64>,
     node_pages: Vec<u64>,
-    /// Per page, its resident bytes and the pages it depends on.
-    page_units: Vec<(u64, Vec<u32>)>,
+    /// Per page, its resident bytes, the pages it depends on and the node pages past the top
+    /// one that hold its groups' leaves.
+    page_units: Vec<(u64, Vec<u32>, Vec<u32>)>,
     /// Per node page, its blob, bytes and parent page.
     node_units: Vec<(u32, u32, u32)>,
     /// First mesh cluster per page, then the cluster count, in the mesh's block.
@@ -168,15 +168,11 @@ struct PlacedMesh {
     /// What edits of the mesh read: its groups, and every page's blob, bytes and clusters.
     groups: Arc<[Group]>,
     all_pages: Vec<StreamedPage>,
-    /// Where its pages stream: what finds each cluster's `ClusterRef.finer`, and the address
-    /// of `MeshGpu.finer_runs` or 0.
-    finer: Option<Arc<FinerPages>>,
-    finer_runs: u64,
     /// Its finer cached cuts where its pages stream.
     fine: Vec<CutRow>,
 }
 
-/// The levels of a hierarchy whose nodes are numbered breadth first from `roots`.
+/// The levels of a hierarchy from `roots`, whose nodes follow their parents.
 fn hierarchy_depth(nodes: &[orr_pack::mesh::Node], roots: &[u32]) -> u32 {
     let mut depth = vec![0u32; nodes.len()];
     let mut levels = 0;
@@ -1053,7 +1049,8 @@ fn place_clip(t: &Arc<MountTask>, entry: usize, id: AssetId, head: &[u8]) -> Res
 }
 
 /// Blob 0, then every page and the top node page of a mesh, into one block. The other node
-/// pages stream.
+/// pages stream where the mesh pages do and join the block otherwise: a resident page's groups
+/// are drawn, so their leaves are resident too.
 fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Result<()> {
     let mut info = MeshInfo::parse(blob0)?;
     let header = info.header;
@@ -1072,10 +1069,6 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     };
     let page_clusters_at = place(4 * (info.pages.len() as u64 + 1));
     let groups: Arc<[Group]> = std::mem::take(&mut info.groups).into();
-    let finer =
-        streams.then(|| Arc::new(FinerPages::new(Arc::clone(&groups), header.pinned_pages)));
-    let runs = finer.as_ref().map_or(&[][..], |f| f.runs());
-    let runs_at = (!runs.is_empty()).then(|| place(4 * runs.len() as u64));
     let (fine, cached) = if info.levels.is_empty() {
         accel::cut_rows(&info.cut_rows, streams, t.traced)
     } else {
@@ -1088,18 +1081,27 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     let node_at: Vec<Option<u64>> = info
         .node_pages
         .iter()
-        .map(|p| (p.parent_page == NodePage::TOP).then(|| place(u64::from(node_bytes(p)))))
+        .map(|p| {
+            (!streams || p.parent_page == NodePage::TOP).then(|| place(u64::from(node_bytes(p))))
+        })
         .collect();
+    let mut leaf_pages = vec![Vec::new(); info.pages.len()];
+    for g in groups.iter().filter(|g| g.node_page != 0) {
+        leaf_pages[g.page as usize].push(u32::from(g.node_page));
+    }
     let page_units = info
         .pages
         .iter()
-        .map(|p| {
+        .zip(leaf_pages)
+        .map(|(p, mut leaves)| {
             let deps = p.deps.first as usize..(p.deps.first + p.deps.count) as usize;
             let deps = info
                 .page_deps
                 .get(deps)
                 .ok_or(orr_pack::Error::Malformed("page dependencies"))?;
-            Ok((u64::from(p.resident_len), deps.to_vec()))
+            leaves.sort_unstable();
+            leaves.dedup();
+            Ok((u64::from(p.resident_len), deps.to_vec(), leaves))
         })
         .collect::<Result<Vec<_>>>()?;
     let node_units = info
@@ -1109,9 +1111,6 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         .collect();
     let block = t.block(size, "mesh")?;
     t.write(block, 0, blob0)?;
-    if let Some(at) = runs_at {
-        t.write(block, at, bytemuck::cast_slice(runs))?;
-    }
     let depth = info
         .node_pages
         .is_empty()
@@ -1177,9 +1176,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             depth,
             streamed: streams.then(|| all_pages.clone()),
             cached,
-            groups,
-            finer: finer.clone(),
-            finer_runs: runs_at.map_or(0, |at| block.gpu() + at),
+            groups: Arc::clone(&groups),
             all_pages,
             fine,
         });
@@ -1187,7 +1184,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     };
     for (p, page) in info.pages[..pinned].iter().enumerate() {
         let (at, first, len) = (page_at[p], firsts[p], page.resident_len as usize);
-        let finer = finer.clone();
+        let groups = Arc::clone(&groups);
         fetch(t, entry, page.blob as usize, t.staged, move |t, stored| {
             PAGE.with_borrow_mut(|resident| {
                 resident.resize(len, 0);
@@ -1198,7 +1195,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
                     bytemuck::pod_read_unaligned(&resident[..size_of::<PageHeader>()]);
                 let records: Vec<Cluster> =
                     (0..view.cluster_count()).map(|i| view.cluster(i)).collect();
-                let (infos, micromap) = page_infos(&h, &records, p as u32, finer.as_deref())?;
+                let (infos, micromap) = page_infos(&h, &records, p as u32, &groups)?;
                 let clusters: Vec<(u32, ClusterInfo)> = (first..).zip(infos).collect();
                 let mut placed = t.placed.lock().unwrap();
                 let m = &mut placed.meshes[mesh];
@@ -1242,20 +1239,34 @@ fn streams_pages(info: &MeshInfo, resident_max: u64) -> bool {
 }
 
 /// A page's clusters as the loading side keeps them, and its micromap region, from its
-/// header and cluster records; `finer` is the index of a mesh whose pages stream.
+/// header and cluster records. Each cluster of a group at depth 0 of the mesh's `groups` is a
+/// source cluster and every other one names a group, which the traversal reads.
 pub(crate) fn page_infos(
     h: &PageHeader,
     clusters: &[Cluster],
     page: u32,
-    finer: Option<&FinerPages>,
+    groups: &[Group],
 ) -> Result<(Vec<ClusterInfo>, Option<PageMicromap>)> {
-    let pages = match finer {
-        Some(f) => f.of_page(page, clusters)?,
-        None => vec![FINER_NONE; clusters.len()],
-    };
+    let first = groups.partition_point(|g| g.page < page);
+    for g in groups[first..].iter().take_while(|g| g.page == page) {
+        let at = usize::from(g.first_cluster)..;
+        let Some(members) = clusters
+            .get(at)
+            .and_then(|c| c.get(..usize::from(g.cluster_count)))
+        else {
+            return Err(orr_pack::Error::Malformed("group outside its page").into());
+        };
+        let named = |c: &Cluster| match g.depth {
+            0 => c.from_group == Cluster::SOURCE,
+            _ => (c.from_group as usize) < groups.len(),
+        };
+        if !members.iter().all(named) {
+            return Err(orr_pack::Error::Malformed("cluster group").into());
+        }
+    }
     let clusters = (0..)
-        .zip(clusters.iter().zip(pages))
-        .map(|(i, (c, finer))| ClusterInfo::new(page, i, c, finer))
+        .zip(clusters)
+        .map(|(i, c)| ClusterInfo::new(page, i, c))
         .collect();
     let micromap =
         (h.omm_offset < h.len && h.omm_usage.iter().any(|&n| n > 0)).then_some(PageMicromap {
@@ -1572,7 +1583,7 @@ impl Batch {
 struct ResolvedMesh {
     id: AssetId,
     entry: u32,
-    page_units: Vec<(u64, Vec<u32>)>,
+    page_units: Vec<(u64, Vec<u32>, Vec<u32>)>,
     node_units: Vec<(u32, u32, u32)>,
     gpu: MeshGpu,
     page_addresses: Vec<u64>,
@@ -1598,8 +1609,6 @@ struct ResolvedMesh {
     all_pages: Vec<StreamedPage>,
     fine: Vec<CutRow>,
     animated: accel::Animated,
-    /// Where its pages stream: what finds each cluster's `ClusterRef.finer`.
-    finer: Option<Arc<FinerPages>>,
 }
 
 struct ResolvedModel {
@@ -1739,8 +1748,8 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 entry: m.entry,
                 page_units: m.page_units,
                 node_units: m.node_units,
-                // SAFETY: blob 0 of the mesh, its page cluster table and its runs of finer
-                // pages, resident in the mount's block; 0 for no runs is null.
+                // SAFETY: blob 0 of the mesh and its page cluster table, resident in the
+                // mount's block.
                 gpu: unsafe {
                     MeshGpu {
                         info: GpuPtr::from_address(orr_gpu::GpuAddress(m.info)),
@@ -1769,7 +1778,6 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                         nodes: table(m.header.nodes),
                         node_table: table(m.header.node_pages),
                         groups: table(m.header.groups),
-                        finer_runs: GpuPtr::from_address(orr_gpu::GpuAddress(m.finer_runs)),
                         roots: table(m.header.roots).cast(),
                         root_count: m.header.roots.count,
                         pinned_pages: if m.streamed.is_some() {
@@ -1808,7 +1816,6 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 all_pages: m.all_pages,
                 fine: m.fine,
                 animated: accel::Animated::default(),
-                finer: m.finer,
             }
         })
         .collect();
@@ -2345,9 +2352,6 @@ fn record_page_copies(
 pub(crate) struct Hierarchy {
     /// Levels of the deepest hierarchy; paged ones count as `PAGED_DEPTH`.
     pub(crate) depth: u32,
-    /// Some resident mesh pages its hierarchy, so a cut can stop at a node page that is not
-    /// resident.
-    pub(crate) paged: bool,
     /// Clusters of the largest resident mesh.
     pub(crate) max_clusters: u32,
 }
@@ -2460,9 +2464,11 @@ type ResolvedTables = (
 );
 
 /// A mount's residency units. Mesh pages are pinned up to `pinned_pages`; past it they
-/// stream, each after the pages it depends on, in a mesh whose pages stream, and are locked
-/// otherwise (the mount's acceleration structures reference every cluster). A mesh's top
-/// node page is pinned and its other node pages stream, each after its parent page.
+/// stream, each after the pages it depends on and the node pages holding its groups' leaves,
+/// in a mesh whose pages stream, and are locked otherwise (the mount's acceleration
+/// structures reference every cluster). A mesh's top node page is pinned and its other node
+/// pages stream, each after its parent page, where its mesh pages do, and are pinned
+/// otherwise.
 /// Whole textures and streamed textures' mip tails are pinned; a streamed texture's tiles
 /// stream, each after the coarser tile covering it, and instance pages' records stream.
 fn units(
@@ -2491,13 +2497,9 @@ fn units(
                 bases,
                 clusters,
                 non_opaque: m.non_opaque.clone(),
+                groups: Arc::clone(&m.groups),
                 mesh,
                 pinned: m.header.pinned_pages,
-                finer: Arc::clone(
-                    m.finer
-                        .as_ref()
-                        .expect("a streaming mesh finds finer pages"),
-                ),
                 mirrors: Mutex::new(Vec::new()),
             })
         });
@@ -2539,7 +2541,8 @@ fn units(
             });
         }
         let stream_index = mesh_streams.len() as u32;
-        for (p, (bytes, deps)) in m.page_units.iter().enumerate() {
+        let nodes = base + m.page_units.len() as u32;
+        for (p, (bytes, deps, leaves)) in m.page_units.iter().enumerate() {
             if deps.iter().any(|&d| d as usize >= p) {
                 return Err(malformed("a page depends on a later page"));
             }
@@ -2556,21 +2559,21 @@ fn units(
                 }
                 (None, false) => (Start::Locked, None),
             };
+            let leaves = leaves.iter().map(|n| nodes + n);
             let unit = UnitDesc {
                 class: ResidencyClass::MeshPages,
                 bytes: bytes.next_multiple_of(256),
                 built: 0,
-                deps: deps.iter().map(|d| base + d).collect(),
+                deps: deps.iter().map(|d| base + d).chain(leaves).collect(),
                 start,
             };
             units.push((unit, load));
         }
         mesh_streams.extend(stream);
-        mesh_pages.push((base..base + m.page_units.len() as u32).collect());
-        let nodes = units.len() as u32;
+        mesh_pages.push((base..nodes).collect());
         node_pages.push((nodes..nodes + m.node_units.len() as u32).collect());
         for (n, &(blob, bytes, parent)) in m.node_units.iter().enumerate() {
-            let (start, deps, stream) = if parent == NodePage::TOP {
+            let (start, deps, stream) = if parent == NodePage::TOP || m.streamed.is_none() {
                 (Start::Pinned, Vec::new(), None)
             } else {
                 if parent as usize >= n {
@@ -2586,7 +2589,7 @@ fn units(
                 (Start::Absent, vec![nodes + parent], Some(stream))
             };
             let unit = UnitDesc {
-                class: ResidencyClass::HierarchyPages,
+                class: ResidencyClass::MeshPages,
                 bytes: u64::from(bytes),
                 built: 0,
                 deps,
@@ -2937,18 +2940,16 @@ impl Mounts {
         let mut own = vec![false; page_count as usize];
         let mut own_bases = Vec::with_capacity(p.own.len());
         let mut refs: Vec<ClusterRef> = Vec::with_capacity(ids.clusters as usize);
-        for ((&q, &address), infos) in p.own.iter().zip(&loaded.addresses).zip(&loaded.clusters) {
+        for (&q, &address) in p.own.iter().zip(&loaded.addresses) {
             own[q as usize] = true;
             own_bases.push(base + refs.len() as u32);
             let info = stream.pages[q as usize];
-            refs.extend((0..info.clusters).zip(infos).map(|(local, c)| ClusterRef {
+            refs.extend((0..info.clusters).map(|local| ClusterRef {
                 // SAFETY: the page lives in the edit's block.
                 page: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(address)) },
                 local,
                 mesh_cluster: info.first + local,
                 clas: 0,
-                finer: c.finer,
-                _pad: 0,
             }));
         }
         let at_own = |q: u32| p.own.binary_search(&q).ok();
@@ -3368,7 +3369,6 @@ impl Mounts {
             let Entry::Ready(r) = e else { continue };
             for &(depth, clusters) in &r.hierarchy {
                 h.depth = h.depth.max(depth.unwrap_or(PAGED_DEPTH));
-                h.paged |= depth.is_none();
                 h.max_clusters = h.max_clusters.max(clusters);
             }
         }
@@ -3758,7 +3758,6 @@ impl Mounts {
                     entry: m.entry,
                     header: m.header,
                     groups: Arc::clone(&m.groups),
-                    finer: m.finer.clone(),
                     pages: m.all_pages.clone(),
                     non_opaque: m.non_opaque.clone(),
                     finest_level: m.levels.first().map(|&(_, first, count)| (first, count)),

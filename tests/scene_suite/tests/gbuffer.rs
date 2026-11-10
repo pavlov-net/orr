@@ -54,6 +54,8 @@ use scene_suite::shaders::{
 };
 use scene_suite::{Workers, linked, pipeline};
 
+mod paged;
+
 const EXTENT: [u32; 2] = [160, 96];
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -1372,9 +1374,14 @@ impl World {
     }
 
     fn with(desc: &RendererDesc) -> Self {
+        Self::with_pack(desc, pack())
+    }
+
+    /// A world that mounts `bytes` in place of [`pack`].
+    fn with_pack(desc: &RendererDesc, bytes: &Arc<[u8]>) -> Self {
         let mut scenes = Scenes::new(device(), desc).unwrap();
         let workers = Workers::start(&scenes, 2);
-        let mount = scenes.mount(PackSource::Memory(Arc::clone(pack())));
+        let mount = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
         let start = Instant::now();
         while matches!(scenes.mount_state(mount), LoadState::Pending) {
             let f = scenes
@@ -2753,6 +2760,8 @@ struct CpuMesh {
     groups: Vec<Group>,
     /// Per page, the pages it depends on.
     deps: Vec<Vec<u32>>,
+    /// Its node pages; one for a resident hierarchy.
+    node_pages: usize,
 }
 
 fn blob(a: &Archive, e: &Entry, i: usize) -> Vec<u8> {
@@ -2764,7 +2773,11 @@ fn blob(a: &Archive, e: &Entry, i: usize) -> Vec<u8> {
 
 impl CpuMesh {
     fn of(model: &str) -> Self {
-        let a = Archive::from_memory(Arc::clone(pack())).unwrap();
+        Self::of_pack(pack(), model)
+    }
+
+    fn of_pack(bytes: &Arc<[u8]>, model: &str) -> Self {
+        let a = Archive::from_memory(Arc::clone(bytes)).unwrap();
         let entry = a.find(AssetId::from_name(model)).unwrap();
         let info = ModelInfo::parse(&blob(&a, entry, 0)).unwrap();
         let me = a.find(info.header.mesh).unwrap();
@@ -2793,6 +2806,7 @@ impl CpuMesh {
             firsts,
             groups: mi.groups,
             deps,
+            node_pages: mi.node_pages.len().max(1),
         }
     }
 
@@ -5354,46 +5368,44 @@ fn a_texture_on_uv_set_1_reads_that_set_in_the_raster_and_at_ray_hits() {
 
 // --- The DAG traversal, two-pass occlusion and debug_lod --------------------------------------
 
-/// What a cut needs of one mesh cluster: its record, its page and, in DAG mode, its group, the
-/// group's depth and error, and the group it was simplified from.
+/// What a cut needs of one mesh cluster: its record and, in DAG mode, its group, the group's
+/// depth and error, and the group it was simplified from.
 struct CutCluster {
     cluster: Cluster,
-    page: u32,
     depth: u8,
     group_error: f32,
     group: u32,
     finer: Option<u32>,
 }
 
+/// Which pages and node pages of a mesh are resident.
+struct Resident {
+    pages: Vec<bool>,
+    nodes: Vec<bool>,
+}
+
 impl CpuMesh {
-    /// Every cluster by mesh cluster index. A cluster's own bounds and error are exactly those
-    /// its group of one step finer simplified into, which no other group of these meshes holds.
+    /// Every cluster by mesh cluster index.
     fn clusters(&self) -> Vec<CutCluster> {
-        let mut out: Vec<CutCluster> = (0u32..)
-            .zip(&self.pages)
-            .flat_map(|(p, page)| {
+        let mut out: Vec<CutCluster> = self
+            .pages
+            .iter()
+            .flat_map(|page| {
                 let view = PageView::new(page, &self.header).unwrap();
-                (0..view.cluster_count()).map(move |i| CutCluster {
-                    cluster: view.cluster(i),
-                    page: p,
-                    depth: 0,
-                    group_error: 0.0,
-                    group: 0,
-                    finer: None,
+                (0..view.cluster_count()).map(move |i| {
+                    let cluster = view.cluster(i);
+                    CutCluster {
+                        cluster,
+                        depth: 0,
+                        group_error: 0.0,
+                        group: 0,
+                        finer: (cluster.from_group != Cluster::SOURCE)
+                            .then_some(cluster.from_group),
+                    }
                 })
             })
             .collect();
-        type Key = (u8, [u32; 4], u32);
-        let key = |depth: u8, s: &orr_pack::Sphere, e: f32| -> Key {
-            let [x, y, z] = s.center.map(f32::to_bits);
-            (depth, [x, y, z, s.radius.to_bits()], e.to_bits())
-        };
-        let mut simplified: std::collections::HashMap<Key, Vec<u32>> = Default::default();
         for (gi, g) in (0u32..).zip(&self.groups) {
-            simplified
-                .entry(key(g.depth, &g.simplified, g.error))
-                .or_default()
-                .push(gi);
             for i in 0..u32::from(g.cluster_count) {
                 let c = &mut out
                     [(self.firsts[g.page as usize] + u32::from(g.first_cluster) + i) as usize];
@@ -5402,28 +5414,27 @@ impl CpuMesh {
                 c.group = gi;
             }
         }
-        for c in out.iter_mut().filter(|c| c.depth > 0) {
-            let k = &c.cluster;
-            let from = &simplified[&key(c.depth - 1, &k.self_sphere, k.self_error)];
-            assert_eq!(
-                from.len(),
-                1,
-                "one group simplifies into a cluster's bounds"
-            );
-            c.finer = Some(from[0]);
-        }
         out
     }
 
-    fn all_resident(&self) -> Vec<bool> {
-        vec![true; self.pages.len()]
+    fn all_resident(&self) -> Resident {
+        Resident {
+            pages: vec![true; self.pages.len()],
+            nodes: vec![true; self.node_pages],
+        }
     }
 
-    /// Whether `c` stands in for the clusters of its finer group: their page is not one of
-    /// those `resident` marks.
-    fn stands_in(&self, c: &CutCluster, resident: &[bool]) -> bool {
-        c.finer
-            .is_some_and(|f| !resident[self.groups[f as usize].page as usize])
+    /// Whether group `g` can be drawn while `r` is resident: its page and the node page that
+    /// holds its leaf are.
+    fn drawable(&self, g: u32, r: &Resident) -> bool {
+        let g = &self.groups[g as usize];
+        r.pages[g.page as usize] && r.nodes[usize::from(g.node_page)]
+    }
+
+    /// Whether `c` stands in for the clusters of the group it was simplified from: that group
+    /// cannot be drawn while `r` is resident.
+    fn stands_in(&self, c: &CutCluster, r: &Resident) -> bool {
+        c.finer.is_some_and(|f| !self.drawable(f, r))
     }
 }
 
@@ -5457,9 +5468,9 @@ impl Projector {
 }
 
 /// The mesh clusters the cluster rule takes at `threshold` pixels with errors scaled by
-/// `scale` while the pages `resident` marks are resident: of resident pages, with a parent
-/// error over the threshold, and an own error at or under it, a source cluster, or standing
-/// in for clusters of a page not resident. Also those whose own or parent error lies within
+/// `scale` while `resident` is: of groups that can be drawn, with a parent error over the
+/// threshold, and an own error at or under it, a source cluster, or standing in for the
+/// clusters of a group that cannot be drawn. Also those whose own or parent error lies within
 /// 1e-4 of the threshold, where f32 rounding may decide either way.
 fn rule_cut(
     m: &CpuMesh,
@@ -5467,7 +5478,7 @@ fn rule_cut(
     p: &Projector,
     threshold: f32,
     scale: f32,
-    resident: &[bool],
+    resident: &Resident,
 ) -> (BTreeSet<u32>, BTreeSet<u32>) {
     let (mut cut, mut near) = (BTreeSet::new(), BTreeSet::new());
     for (i, c) in clusters.iter().enumerate() {
@@ -5475,7 +5486,7 @@ fn rule_cut(
         let own = p.error(&k.self_sphere, k.self_error * scale);
         let parent = p.error(&k.parent_sphere, k.parent_error * scale);
         let fine = own <= threshold || c.depth == 0 || m.stands_in(c, resident);
-        if resident[c.page as usize] && fine && parent > threshold {
+        if m.drawable(c.group, resident) && fine && parent > threshold {
             cut.insert(i as u32);
         }
         let close = |e: f32| e.is_finite() && (e - threshold).abs() <= 1e-4 * threshold;
@@ -5486,16 +5497,21 @@ fn rule_cut(
     (cut, near)
 }
 
-/// The mesh clusters debug level `level` holds while the pages `resident` marks are resident:
-/// of resident pages, those at its depth, those of shallower terminal groups, and those of
-/// deeper groups standing in for clusters of a page not resident.
-fn level_cut(m: &CpuMesh, clusters: &[CutCluster], level: u8, resident: &[bool]) -> BTreeSet<u32> {
+/// The mesh clusters debug level `level` holds while `resident` is: of groups that can be
+/// drawn, those at its depth, those of shallower terminal groups, and those of deeper groups
+/// standing in for the clusters of a group that cannot be drawn.
+fn level_cut(
+    m: &CpuMesh,
+    clusters: &[CutCluster],
+    level: u8,
+    resident: &Resident,
+) -> BTreeSet<u32> {
     (0..clusters.len() as u32)
         .filter(|&i| {
             let c = &clusters[i as usize];
             let held = c.depth == level || (c.depth < level && c.group_error.is_infinite());
             let stands = c.depth > level && m.stands_in(c, resident);
-            resident[c.page as usize] && (held || stands)
+            m.drawable(c.group, resident) && (held || stands)
         })
         .collect()
 }
@@ -5540,7 +5556,7 @@ struct CutRead {
     counters: Vec<u32>,
     candidates: Vec<ClusterWork>,
     slots: Vec<SlotCutGpu>,
-    /// The gathered ray-tracing cut clusters: slot | WORK_RETRY, cluster id.
+    /// The gathered ray-tracing cut clusters: slot, cluster id.
     entries: Vec<[u32; 2]>,
 }
 
@@ -5558,19 +5574,14 @@ fn read_cut(view: &RasterView, slots: u32) -> CutRead {
     }
 }
 
-const WORK_RETRY: u32 = 0x8000_0000;
-const CUT_RETRY_RASTER: u32 = 8;
-const CUT_RETRY_RT: u32 = 16;
-
 impl CutRead {
     /// The mesh clusters of `slot`'s raster candidates.
     fn raster(&self, m: &CpuMesh, slot: u32) -> BTreeSet<u32> {
-        let retry = self.slots[slot as usize].flags & CUT_RETRY_RASTER != 0;
         self.candidates
             .iter()
-            .filter(|w| w.instance == slot && (w.first & WORK_RETRY != 0) == retry)
+            .filter(|w| w.instance == slot)
             .flat_map(|w| {
-                let first = m.firsts[w.page as usize] + (w.first & !WORK_RETRY);
+                let first = m.firsts[w.page as usize] + w.first;
                 (0..32)
                     .filter(move |b| w.mask >> b & 1 != 0)
                     .map(move |b| first + b)
@@ -5581,7 +5592,6 @@ impl CutRead {
     /// The mesh clusters of `slot`'s gathered ray-tracing cut, by the cluster ids of the
     /// mesh's resident `pages` from their `bases`.
     fn ray(&self, m: &CpuMesh, slot: u32, pages: &[u64], bases: &[u32]) -> BTreeSet<u32> {
-        let retry = self.slots[slot as usize].flags & CUT_RETRY_RT != 0;
         let count = |p: usize| {
             PageView::new(&m.pages[p], &m.header)
                 .unwrap()
@@ -5589,7 +5599,7 @@ impl CutRead {
         };
         self.entries
             .iter()
-            .filter(|e| e[0] & !WORK_RETRY == slot && (e[0] & WORK_RETRY != 0) == retry)
+            .filter(|e| e[0] == slot)
             .map(|e| {
                 let p = (0..pages.len())
                     .find(|&p| pages[p] != 0 && (bases[p]..bases[p] + count(p)).contains(&e[1]))
@@ -5891,34 +5901,66 @@ fn debug_lod_holds_a_dag_level_or_scales_the_error_in_raster_and_ray_tracing() {
     assert_clean();
 }
 
-/// The page table and page bases of `model`'s mesh as the last frame left them.
-fn mesh_pages(w: &World, model: ModelId) -> (Vec<u64>, Vec<u32>) {
+/// The page table, page bases and node page table of `model`'s mesh as the last frame left
+/// them.
+fn mesh_pages(w: &World, model: ModelId) -> (Vec<u64>, Vec<u32>, Vec<u64>) {
     let (models, meshes, _) = orr_scene::testing::global_tables(&w.scenes);
     let model: ModelGpu = read_buffer(models.offset(u64::from(model.0)), 1)[0];
     let mesh: MeshGpu = read_buffer(meshes.offset(u64::from(model.mesh)), 1)[0];
     let n = u64::from(mesh.page_count);
-    (read_buffer(mesh.pages, n), read_buffer(mesh.page_bases, n))
+    let nodes = match mesh.node_page_count {
+        0 => vec![1],
+        k => read_buffer(mesh.node_pages, u64::from(k)),
+    };
+    (
+        read_buffer(mesh.pages, n),
+        read_buffer(mesh.page_bases, n),
+        nodes,
+    )
+}
+
+/// [`pack`] with the DAG ground's hierarchy in a top page and one streamed node page.
+fn paged_pack() -> &'static Arc<[u8]> {
+    static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
+    PACK.get_or_init(|| {
+        let a = Archive::from_memory(Arc::clone(pack())).unwrap();
+        let model = a.find(AssetId::from_name("dag ground")).unwrap();
+        let mesh = ModelInfo::parse(&blob(&a, model, 0)).unwrap().header.mesh;
+        paged::split_hierarchy(pack(), mesh)
+    })
 }
 
 /// Frames of a streaming ground while its pages land a request a frame, from none of its
-/// streamed pages to all of them, every other frame at debug level 0: the raster and
-/// ray-tracing cuts follow the cluster rule with clusters standing in for the clusters of
-/// pages not resident, cover the ground once, and with every page resident are the plain
-/// rule's.
+/// streamed pages to all of them, every other frame at debug level 0, with its hierarchy
+/// resident and with it paged: the raster and ray-tracing cuts follow the cluster rule with
+/// clusters standing in for those of groups that cannot be drawn, whose page or whose leaf's
+/// node page is not resident, cover the ground once, and with every page resident are the
+/// plain rule's. A page is resident only with the pages it depends on and the node pages
+/// over its groups' leaves.
 #[test]
 fn clusters_stand_in_for_pages_not_resident_and_the_cut_covers_the_mesh_once() {
     let _serial = serial();
+    for (bytes, paged) in [(pack(), false), (paged_pack(), true)] {
+        stand_in(bytes, paged);
+    }
+    assert_clean();
+}
+
+fn stand_in(bytes: &Arc<[u8]>, paged: bool) {
     // Copies not yet drawn trace at the raster threshold too, so the first frame compares.
-    let mut w = World::with(&RendererDesc {
-        rt_merge_pixels: 0.0,
-        culled_error_scale: 1.0,
-        budgets: Budgets {
-            mesh_resident_max: 0,
-            traversal_requests: 1,
-            ..Budgets::default()
+    let mut w = World::with_pack(
+        &RendererDesc {
+            rt_merge_pixels: 0.0,
+            culled_error_scale: 1.0,
+            budgets: Budgets {
+                mesh_resident_max: 0,
+                traversal_requests: 1,
+                ..Budgets::default()
+            },
+            ..RendererDesc::default()
         },
-        ..RendererDesc::default()
-    });
+        bytes,
+    );
     let items = [Item {
         model: "dag ground",
         linear: Mat3::from_rotation_x(0.25) * Mat3::from_diagonal(Vec3::new(2.0, 1.0, 4.0)),
@@ -5928,47 +5970,64 @@ fn clusters_stand_in_for_pages_not_resident_and_the_cut_covers_the_mesh_once() {
     let model = w.model("dag ground");
     let eye = Vec3::new(0.3, 1.2, 4.0);
     let target = Vec3::new(0.0, 0.0, -10.0);
-    let m = CpuMesh::of("dag ground");
+    let m = CpuMesh::of_pack(bytes, "dag ground");
+    assert_eq!(m.node_pages, if paged { 2 } else { 1 });
     let clusters = m.clusters();
     let p = Projector::new(&items[0], eye);
     let slot = placed.ranges[0].first;
     let pinned = m.header.pinned_pages as usize;
     assert!(pinned < m.pages.len(), "the ground's pages stream");
-    // Per frame: whether at level 0, its resident streamed pages and the clusters standing in.
-    let mut frames: Vec<(bool, usize, usize)> = Vec::new();
+    // Per frame: whether at level 0, its resident streamed pages, the clusters standing in
+    // and whether its node pages are all resident.
+    let mut frames: Vec<(bool, usize, usize, bool)> = Vec::new();
     let start = Instant::now();
-    let done = |frames: &[(bool, usize, usize)]| {
+    let done = |frames: &[(bool, usize, usize, bool)]| {
         let streamed = m.pages.len() - pinned;
-        let some = |&&(_, n, s): &&(bool, usize, usize)| n > 0 && n < streamed && s > 0;
+        let some = |f: &&(bool, usize, usize, bool)| f.1 > 0 && f.1 < streamed && f.2 > 0;
         let error = frames.iter().filter(|f| !f.0);
         error.clone().any(|f| f.1 == 0)
             && error.clone().any(|f| some(&f))
             && error.clone().any(|f| f.1 == streamed)
             && frames.iter().filter(|f| f.0).any(|f| some(&f))
+            && frames.iter().any(|f| !f.3) == paged
     };
     for frame in 1.. {
         assert!(
             start.elapsed() < Duration::from_secs(60),
-            "frames (level, streamed pages, clusters standing in): {frames:?}"
+            "frames (level, streamed pages, clusters standing in, node pages): {frames:?}"
         );
         let level = frame % 2 == 0;
         let shot = Shot::at(eye.as_dvec3(), target.as_dvec3(), frame);
         let g = shoot_with(&mut w, &placed, &shot, |s| {
             s.debug_lod(placed.ranges[0], level.then_some(DebugLod::Level(0)));
         });
-        let (pages, bases) = mesh_pages(&w, model);
-        let resident: Vec<bool> = pages.iter().map(|&a| a != 0).collect();
+        let (pages, bases, nodes) = mesh_pages(&w, model);
+        let resident = Resident {
+            pages: pages.iter().map(|&a| a != 0).collect(),
+            nodes: nodes.iter().map(|&a| a != 0).collect(),
+        };
         for (q, deps) in m.deps.iter().enumerate() {
             assert!(
-                !resident[q] || deps.iter().all(|&d| resident[d as usize]),
+                !resident.pages[q] || deps.iter().all(|&d| resident.pages[d as usize]),
                 "frame {frame}: page {q} is resident without the pages it depends on"
             );
         }
-        let streamed = resident[pinned..].iter().filter(|&&r| r).count();
+        for g in &m.groups {
+            assert!(
+                !resident.pages[g.page as usize] || resident.nodes[usize::from(g.node_page)],
+                "frame {frame}: page {} is resident without node page {}",
+                g.page,
+                g.node_page
+            );
+        }
+        let streamed = resident.pages[pinned..].iter().filter(|&&r| r).count();
+        let hierarchy = resident.nodes.iter().all(|&r| r);
         let cut = read_cut(&g.view, placed.count);
         let raster = cut.raster(&m, slot);
         let ray = cut.ray(&m, slot, &pages, &bases);
-        let what = format!("frame {frame}, {streamed} streamed pages resident, level {level}");
+        let what = format!(
+            "paged {paged}, frame {frame}, {streamed} streamed pages and all node pages {hierarchy}, level {level}"
+        );
         assert_whole(&m, &clusters, &raster, &format!("{what}: raster"));
         assert_whole(&m, &clusters, &ray, &format!("{what}: ray tracing"));
         let standing = |want: &BTreeSet<u32>| {
@@ -5983,7 +6042,7 @@ fn clusters_stand_in_for_pages_not_resident_and_the_cut_covers_the_mesh_once() {
             let want = level_cut(&m, &clusters, 0, &resident);
             assert_eq!(raster, want, "{what}: raster");
             assert_eq!(ray, want, "{what}: ray tracing");
-            frames.push((true, streamed, standing(&want)));
+            frames.push((true, streamed, standing(&want), hierarchy));
         } else {
             let (want, near) = rule_cut(&m, &clusters, &p, 1.0, 1.0, &resident);
             for (got, kind) in [(&raster, "raster"), (&ray, "ray tracing")] {
@@ -5993,7 +6052,7 @@ fn clusters_stand_in_for_pages_not_resident_and_the_cut_covers_the_mesh_once() {
                     "{what}: {kind} cut differs from the rule at {differ:?}"
                 );
             }
-            frames.push((false, streamed, standing(&want)));
+            frames.push((false, streamed, standing(&want), hierarchy));
         }
         if done(&frames) {
             break;
@@ -6003,7 +6062,6 @@ fn clusters_stand_in_for_pages_not_resident_and_the_cut_covers_the_mesh_once() {
         }
     }
     assert_eq!(w.scenes.residency().failed, 0);
-    assert_clean();
 }
 
 // --- Skinned copies ------------------------------------------------------------------------

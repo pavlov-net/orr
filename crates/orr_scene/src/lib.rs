@@ -57,7 +57,6 @@ mod pipelines;
 mod producer;
 mod ptlas;
 mod raster;
-mod refine;
 #[cfg(feature = "hot-reload")]
 mod reload;
 mod residency;

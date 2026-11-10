@@ -275,12 +275,8 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         w = second ? r.work[index] : cut.candidates[index];
     uint copy = w.instance;
     uint slot = copy_slot(copy);
-    bool retry = (w.first & WORK_RETRY) != 0;
-    uint local = (w.first & ~WORK_RETRY) + thread;
+    uint local = w.first + thread;
     bool mine = index < n && ((w.mask >> thread) & 1) != 0;
-    // A second traversal's candidates replace the first's for the slot.
-    if (mine && !second)
-        mine = retry == ((cut.slots[slot].flags & CUT_RETRY_RASTER) != 0);
     uint state = mine ? r.slot_visibility[slot] : SLOT_CULLED;
     if (state == SLOT_OCCLUDED)
     {
@@ -366,7 +362,6 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         return;
     }
     ClusterWork out = w;
-    out.first = w.first & ~WORK_RETRY;
     out.mask = rejected;
     r.work[at] = out;
 }

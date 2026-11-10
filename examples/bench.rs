@@ -256,7 +256,6 @@ fn script_report(script: Script, samples: &[Sample]) -> Value {
             "rt_built_blas": fig(&|s| s.cuts.rt_built.into()),
             "rt_built_clas": fig(&|s| s.cuts.rt_built_clas.into()),
             "rt_merged": fig(&|s| s.cuts.rt_merged.into()),
-            "retries": fig(&|s| s.cuts.retries.into()),
             "page_requests": fig(&|s| s.cuts.page_requests.into()),
         },
         "lighting": {

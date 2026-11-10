@@ -104,12 +104,10 @@ pub(crate) struct ClusterInfo {
     parent_error: f32,
     /// m a skinned vertex may move from its rest position.
     pub(crate) deformation_bound: f32,
-    /// Its `ClusterRef.finer`.
-    pub(crate) finer: u32,
 }
 
 impl ClusterInfo {
-    pub(crate) fn new(page: u32, local: u32, c: &Cluster, finer: u32) -> Self {
+    pub(crate) fn new(page: u32, local: u32, c: &Cluster) -> Self {
         Self {
             page,
             local,
@@ -122,7 +120,6 @@ impl ClusterInfo {
             self_error: c.self_error,
             parent_error: c.parent_error,
             deformation_bound: half::f16::from_bits(c.deformation_bound).to_f32(),
-            finer,
         }
     }
 
@@ -312,8 +309,6 @@ pub(crate) fn cluster_refs(m: &MeshInput<'_>) -> Vec<ClusterRef> {
             local: c.local,
             mesh_cluster,
             clas: 0,
-            finer: c.finer,
-            _pad: 0,
         })
         .collect()
 }

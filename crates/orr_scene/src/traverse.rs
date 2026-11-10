@@ -5,10 +5,10 @@
 //! persistent threads), entering a node while its projected error exceeds a cut's threshold
 //! and applying the cluster rule at each leaf's group. While a group's streamed mesh page is
 //! not resident, the clusters simplified from it stand in for its clusters, so a missing page
-//! coarsens only what it holds, and the page is requested through the frame's feedback. A node
-//! in a non-resident hierarchy page stops the cut at its parent: the copy's errors for that cut
-//! scale down so the parent is not entered, a second traversal replaces the copy's output, and
-//! the page is requested likewise. Ray-tracing cuts of distant copies are their model's merged
+//! coarsens only what it holds, and the page is requested through the frame's feedback. A
+//! streamed mesh page is resident only with the node pages over its groups' leaves, so a node
+//! page that is not resident is requested likewise and leaves what lies below it to those
+//! stand-ins. Ray-tracing cuts of distant copies are their model's merged
 //! cut; the cuts of near copies are matched against their mesh's cached cuts, shared between
 //! copies with equal cuts, and otherwise built as cluster BLAS within the frame's budget.
 //! Copies tracing a cached cut of a streaming mesh ask for the finer cut that would serve
@@ -31,7 +31,7 @@ use crate::{
 };
 
 /// `CutGpu.counters` entries (`cut.slang`), the BLAS build count after them.
-const COUNTERS: usize = 24;
+const COUNTERS: usize = 23;
 const CUT_CANDIDATES: usize = 2;
 const CUT_CANDIDATE_CLUSTERS: usize = 3;
 const CUT_ENTRIES: usize = 4;
@@ -46,9 +46,8 @@ const CUT_SHARED: usize = 13;
 const CUT_FALLBACK: usize = 14;
 const CUT_MERGED: usize = 15;
 const CUT_REQUESTS: usize = 16;
-const CUT_RETRIES: usize = 17;
-const CUT_FEEDBACK: usize = 18;
-const CUT_BUILDS: u64 = 23;
+const CUT_FEEDBACK: usize = 17;
+const CUT_BUILDS: u64 = 22;
 /// `traverse.slang` args layout.
 const ARGS_PASSES: u32 = 64;
 const ARGS_GATHER: u64 = 3 * ARGS_PASSES as u64;
@@ -87,8 +86,7 @@ pub struct CutStats {
     pub rt_built_clas: u32,
     /// Distant copies tracing their model's merged cut.
     pub rt_merged: u32,
-    /// Copies a non-resident hierarchy page stopped, and the pages and finer cuts requested.
-    pub retries: u32,
+    /// Pages, node pages and finer cuts requested.
     pub page_requests: u32,
     /// Of those requests, the ones past [`crate::Budgets::traversal_requests`] in a scene,
     /// of the smallest errors, which the loading side does not see that frame.
@@ -110,7 +108,6 @@ impl CutStats {
         self.rt_built += c[CUT_BUILDS as usize];
         self.rt_built_clas += c[CUT_CLAS].min(c[CUT_ENTRIES]);
         self.rt_merged += c[CUT_MERGED];
-        self.retries += c[CUT_RETRIES];
         self.page_requests += c[CUT_REQUESTS];
     }
 }
@@ -130,7 +127,6 @@ pub(crate) struct CutPipelines {
     args: PipelineId,
     traverse: PipelineId,
     finish: PipelineId,
-    retry: PipelineId,
     assign: PipelineId,
     share: PipelineId,
     split: PipelineId,
@@ -154,7 +150,6 @@ impl CutPipelines {
             args: c(t, "args")?,
             traverse: c(t, "traverse")?,
             finish: c(t, "finish")?,
-            retry: c(t, "retry")?,
             assign: c(t, "assign")?,
             share: c(t, "share")?,
             split: c(t, "split")?,
@@ -242,11 +237,8 @@ pub(crate) struct CutInputs {
     pub(crate) culled_scale: f32,
     pub(crate) merge_pixels: f32,
     pub(crate) slots: u32,
-    /// Passes of one traversal: the deepest resident hierarchy's levels.
+    /// Passes of the traversal: the deepest resident hierarchy's levels.
     pub(crate) passes: u32,
-    /// A resident mesh pages its hierarchy: the second traversal runs for the cuts a node page
-    /// that is not resident stopped.
-    pub(crate) paged: bool,
     /// CLAS in the largest cut a mesh can trace.
     pub(crate) max_clas: u32,
     /// A copy of an edit may gather one BLAS per animated part.
@@ -471,9 +463,9 @@ impl Cuts {
         step(list);
         list.dispatch(p.get(k.init), r0, groups(f.slots));
         step(list);
-        let passes = f.passes.min(ARGS_PASSES / 2);
-        let run = |list: &mut CommandList<'_>, first: u32| -> Result<()> {
-            for pass in first..first + passes {
+        let passes = f.passes.min(ARGS_PASSES);
+        if passes > 0 {
+            for pass in 0..passes {
                 let r = root(pass)?;
                 list.dispatch(p.get(k.args), r, [1, 1, 1]);
                 list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
@@ -481,17 +473,8 @@ impl Cuts {
                 list.dispatch_indirect(p.get(k.traverse), r, grid);
                 step(list);
             }
-            list.dispatch(p.get(k.finish), root(first + passes)?, [1, 1, 1]);
+            list.dispatch(p.get(k.finish), root(passes)?, [1, 1, 1]);
             step(list);
-            Ok(())
-        };
-        if passes > 0 {
-            run(list, 0)?;
-            if f.paged {
-                list.dispatch(p.get(k.retry), root(passes)?, groups(f.slots));
-                step(list);
-                run(list, passes)?;
-            }
         }
         let fb = window.put_root(
             device,

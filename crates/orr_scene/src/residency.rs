@@ -3,13 +3,15 @@
 //!
 //! A unit is one residency step of a mounted pack: a mesh page (its DAG groups), a hierarchy
 //! page, a whole texture, a streamed texture's mip tails or one of its tiles, or an instance
-//! page. Units a mount places itself are pinned; units a cached acceleration structure
-//! references are locked. Every other resident unit can be evicted once it has gone
-//! [`HOLD_FRAMES`] frames without a request or touch, least recently touched first. A unit
-//! loads only with its dependencies (coarser pages, a hierarchy page's parent, a tile's
-//! coarser tile) resident or loading in the same plan, lands only once they have, and stays
-//! while a resident or loading unit depends on it. Loads outside any mount's units (user blobs) count against
-//! their class budget and the in-flight limit only.
+//! page. Hierarchy pages share the mesh pages' class: a streamed mesh page depends on the
+//! hierarchy pages over its groups, so they leave as the pages that need them do. Units a
+//! mount places itself are pinned; units a cached acceleration structure references are
+//! locked. Every other resident unit can be evicted once it has gone [`HOLD_FRAMES`] frames
+//! without a request or touch, least recently touched first. A unit loads only with its
+//! dependencies (coarser pages, the hierarchy pages over a mesh page's groups, a hierarchy
+//! page's parent, a tile's coarser tile) resident or loading in the same plan, lands only once
+//! they have, and stays while a resident or loading unit depends on it. Loads outside any
+//! mount's units (user blobs) count against their class budget and the in-flight limit only.
 //!
 //! Each class lists the units that can be evicted, and no others, with the bytes of those
 //! past their hold: a request that its budget cannot take is turned down without a walk over
@@ -58,7 +60,7 @@ const SCALE_STEP: f64 = 0.95;
 const MIN_SCALE: f64 = 0.125;
 
 /// Residency classes.
-const CLASSES: usize = 5;
+const CLASSES: usize = 4;
 /// Request sources.
 const SOURCES: usize = 5;
 /// Lanes sharing the in-flight limit: the request sources, then user blobs.
@@ -68,8 +70,8 @@ const BLOB_LANE: usize = SOURCES;
 /// A residency class: one pool and one byte budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResidencyClass {
+    /// Mesh pages and hierarchy pages.
     MeshPages,
-    HierarchyPages,
     /// Texture tiles and mip tails, and whole textures that do not stream.
     Textures,
     InstancePages,
@@ -80,7 +82,6 @@ pub enum ResidencyClass {
 impl ResidencyClass {
     pub const ALL: [Self; CLASSES] = [
         Self::MeshPages,
-        Self::HierarchyPages,
         Self::Textures,
         Self::InstancePages,
         Self::UserBlobs,
@@ -89,7 +90,6 @@ impl ResidencyClass {
     fn name(self) -> &'static str {
         match self {
             Self::MeshPages => "mesh page pool",
-            Self::HierarchyPages => "hierarchy page pool",
             Self::Textures => "texture pool",
             Self::InstancePages => "instance page pool",
             Self::UserBlobs => "user blob pool",
@@ -1326,7 +1326,7 @@ mod tests {
 
     fn unit(bytes: u64, deps: &[u32], start: Start) -> UnitDesc {
         UnitDesc {
-            class: ResidencyClass::HierarchyPages,
+            class: ResidencyClass::InstancePages,
             bytes,
             built: 0,
             deps: deps.to_vec(),
@@ -1336,7 +1336,7 @@ mod tests {
 
     fn limits(budget: u64) -> Limits {
         let mut budgets = [u64::MAX; CLASSES];
-        budgets[ResidencyClass::HierarchyPages as usize] = budget;
+        budgets[ResidencyClass::InstancePages as usize] = budget;
         Limits {
             budgets,
             in_flight: u64::MAX,
@@ -1389,7 +1389,7 @@ mod tests {
     }
 
     fn class(r: &Residency) -> ClassStats {
-        *r.stats().class(ResidencyClass::HierarchyPages)
+        *r.stats().class(ResidencyClass::InstancePages)
     }
 
     #[test]
@@ -1763,7 +1763,7 @@ mod tests {
         assert_eq!(class(&r).resident_bytes, 280);
 
         // A full range shrinks its class's budget alone.
-        r.range_full(ResidencyClass::HierarchyPages);
+        r.range_full(ResidencyClass::InstancePages);
         r.react(0.85);
         let texture = r.stats().class(ResidencyClass::Textures).budget;
         assert_eq!((class(&r).budget, texture), (285, u64::MAX));

@@ -26,7 +26,6 @@ use crate::loading::{BlobSource, Loading, Msg, Queue, decoded, landed, read_stor
 use crate::memory::{Block, UploadWindow};
 use crate::mount::{PAGE, StagedCopy, page_infos, submit_copies};
 use crate::producer::scratch_align;
-use crate::refine::FinerPages;
 use crate::scene::ModelId;
 use crate::shaders::accel::{AccelRoot, ClasJob};
 use crate::shaders::edit::{EditJob, EditRoot};
@@ -77,8 +76,6 @@ pub(crate) struct EditSource {
     pub(crate) entry: u32,
     pub(crate) header: MeshHeader,
     pub(crate) groups: Arc<[Group]>,
-    /// Where its pages stream: what finds each cluster's `ClusterRef.finer`.
-    pub(crate) finer: Option<Arc<FinerPages>>,
     pub(crate) pages: Vec<StreamedPage>,
     /// Sections whose every triangle is non-opaque.
     pub(crate) non_opaque: Vec<bool>,
@@ -307,8 +304,8 @@ pub(crate) fn start(task: &Arc<EditTask>) {
                             }
                             let records: Vec<Cluster> =
                                 (0..view.cluster_count()).map(|c| view.cluster(c)).collect();
-                            let finer = t.stream.finer.as_deref();
-                            let (clusters, region) = page_infos(&h, &records, page, finer)?;
+                            let (clusters, region) =
+                                page_infos(&h, &records, page, &t.stream.groups)?;
                             let mut done = t.done.lock().unwrap();
                             done.clusters[i] = clusters;
                             done.regions[i] = region;

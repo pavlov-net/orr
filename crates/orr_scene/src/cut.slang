@@ -9,10 +9,8 @@ import orr_shaders.abi;
 public static const uint CUT_RASTER = 1;        // the slot has raster candidates this frame
 public static const uint CUT_TRAVERSED = 2;     // the traversal gathered its ray-tracing cut
 public static const uint CUT_DISTANT = 4;       // it traces its model's merged cut
-public static const uint CUT_RETRY_RASTER = 8;  // a node page not resident stopped its raster cut
-public static const uint CUT_RETRY_RT = 16;     // a node page not resident stopped its ray-tracing cut
-public static const uint CUT_OWNER = 32;        // it builds the BLAS its equal cuts share
-public static const uint CUT_PARTS = 64;        // its gathered cut builds a body BLAS and one per animated part
+public static const uint CUT_OWNER = 8;         // it builds the BLAS its equal cuts share
+public static const uint CUT_PARTS = 16;        // its gathered cut builds a body BLAS and one per animated part
 
 // A copy keeps its ray-tracing range, and its cached cut, within this factor.
 public static const float RT_HYSTERESIS = 1.15;
@@ -20,16 +18,12 @@ public static const float RT_HYSTERESIS = 1.15;
 // `SlotCutGpu.rt_cut` of a slot tracing a BLAS built this frame.
 public static const uint RT_CUT_BUILT = 255;
 
-// `ClusterWork.first` and the traversal's `NodeItem.flags`: the second traversal's output,
-// which replaces the first's for the slots it runs on.
-public static const uint WORK_RETRY = 0x80000000;
-
 // Up to 32 clusters of one page of a slot's mesh: bit i of `mask` is cluster `first + i`.
 public struct ClusterWork
 {
     public uint instance;
     public uint page;          // mesh page index
-    public uint first;         // first cluster in the page, WORK_RETRY above it
+    public uint first;         // first cluster in the page
     public uint mask;
 }
 
@@ -50,13 +44,12 @@ public static const uint CUT_SHARED = 13;             // of them, sharing anothe
 public static const uint CUT_FALLBACK = 14;           // of them, past the BLAS budget: a cached cut
 public static const uint CUT_MERGED = 15;             // slots tracing their model's merged cut
 public static const uint CUT_REQUESTS = 16;           // pages and finer cuts wanted
-public static const uint CUT_RETRIES = 17;            // slots the second traversal ran on
-public static const uint CUT_FEEDBACK = 18;           // of the wanted, those kept in `feedback`
-public static const uint CUT_PART_LISTS = 19;         // entries of `part_lists` handed out
-public static const uint CUT_FEEDBACK_BUCKET = 20;    // the error bucket `feedback` fills up in
-public static const uint CUT_FEEDBACK_ROOM = 21;      // the requests of that bucket it keeps
-public static const uint CUT_FEEDBACK_TAKEN = 22;     // the requests of that bucket seen so far
-public static const uint CUT_COUNTERS = 23;
+public static const uint CUT_FEEDBACK = 17;           // of the wanted, those kept in `feedback`
+public static const uint CUT_PART_LISTS = 18;         // entries of `part_lists` handed out
+public static const uint CUT_FEEDBACK_BUCKET = 19;    // the error bucket `feedback` fills up in
+public static const uint CUT_FEEDBACK_ROOM = 20;      // the requests of that bucket it keeps
+public static const uint CUT_FEEDBACK_TAKEN = 21;     // the requests of that bucket seen so far
+public static const uint CUT_COUNTERS = 22;
 
 // One instance slot's cuts this frame.
 public struct SlotCutGpu
@@ -68,7 +61,6 @@ public struct SlotCutGpu
     public uint2 rt_hash;          // order-free hash of those clusters
     public uint rt_first;          // CUT_OWNER: its first CLAS address in `CutGpu.clas`
     public uint rt_fill;           // CUT_OWNER: addresses written so far
-    public uint coarsen[2];        // raster, ray tracing: the error scale (f32 bits) that keeps every node it needs resident
     public uint owner;             // the slot whose BLAS it traces
     public uint far_cut;           // while its copy fades: the cached cut of its far step
     public uint rt_parts;          // CUT_PARTS with RT_CUT_BUILT: its body's entry in `part_lists`, each animated part's after it
@@ -79,7 +71,7 @@ public struct NodeItem
 {
     public uint slot;
     public uint node;
-    public uint flags;             // cuts it is entered for (1 raster, 2 ray tracing), 0x10000 for a merged stage, WORK_RETRY
+    public uint flags;             // cuts it is entered for (1 raster, 2 ray tracing), 0x10000 for a merged stage
     public uint part;              // the stage's part; 0 in a merged stage
 }
 
@@ -128,7 +120,7 @@ public struct CutGpu
     public SlotCutGpu* slots;      // per instance slot
     public NodeItem* queue[2];
     public ClusterWork* candidates; // the raster candidate cut
-    public uint2* entries;         // ray-tracing cut clusters: slot | WORK_RETRY, cluster id
+    public uint2* entries;         // ray-tracing cut clusters: slot, cluster id
     public uint64_t* clas;         // CLAS addresses of the BLAS built this frame
     public BlasJob* jobs;
     public uint64_t* job_blas;     // the built BLAS addresses, by job

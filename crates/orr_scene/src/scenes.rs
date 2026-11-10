@@ -100,13 +100,14 @@ pub struct Budgets {
     /// Per-frame PTLAS work beyond mandatory work, in rebuilt instances: the full instance
     /// count of every partition a write touches plus one per update.
     pub ptlas_rebuilt: u32,
-    /// Bytes of resident mesh pages and of the CLAS and micromaps streamed pages build, which
-    /// count at an estimate from their triangles until a page's first load has built them.
+    /// Bytes of resident mesh pages, of the CLAS and micromaps streamed pages build, which
+    /// count at an estimate from their triangles until a page's first load has built them,
+    /// and of resident hierarchy pages, which a streamed page's groups need beside it.
     /// The CLAS pool's address range is as large, up to the 512 GiB its 32-bit unit indices
     /// name, and bound in pages as they need.
     pub mesh_page_pool: u64,
     /// Bytes of `mesh_page_pool` per entry of the resident cluster table, which holds the
-    /// clusters of resident mesh pages and of edits' own pages, 32 B each. A mount whose
+    /// clusters of resident mesh pages and of edits' own pages, 24 B each. A mount whose
     /// pinned pages' clusters find no room fails, and a streamed page that finds none loads
     /// later while the mesh page budget shrinks. A cooked scene of 101.8 M clusters holds
     /// 1,376 B of resident page per cluster, before a streamed page's CLAS. Above 0.
@@ -114,8 +115,6 @@ pub struct Budgets {
     /// Bytes of pages a DAG mesh keeps resident from mount; the pages of a larger one past
     /// its pinned coarsest pages stream on the traversal's requests.
     pub mesh_resident_max: u64,
-    /// Bytes of resident hierarchy pages.
-    pub hierarchy_page_pool: u64,
     /// Bytes of resident textures: whole textures, streamed textures' mip tails and tiles.
     pub texture_pool: u64,
     /// Bytes of resident instance pages.
@@ -165,7 +164,6 @@ impl Default for Budgets {
             mesh_page_pool: 3 << 30,
             resident_cluster_bytes: 1024,
             mesh_resident_max: 1 << 20,
-            hierarchy_page_pool: 256 << 20,
             texture_pool: 4 << 30,
             instance_page_pool: 256 << 20,
             user_blob_pool: 256 << 20,
@@ -1962,7 +1960,6 @@ impl<'a> Frame<'a> {
                 merge_pixels: core.rt_merge_pixels,
                 slots: cpu.ptlas.high_water,
                 passes: hierarchy.depth,
-                paged: hierarchy.paged,
                 max_clas: hierarchy.max_clusters,
                 parted_edits: core.mounts.has_parted_edit(),
                 slot: (self.id % u64::from(core.fif)) as usize,

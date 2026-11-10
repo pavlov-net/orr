@@ -8,14 +8,14 @@
 // writes raster candidate items and ray-tracing cut clusters. While the mesh page of a group
 // is not resident, the clusters simplified from it stand in for its clusters even where their
 // own error is over the threshold, and the page is requested: only what the page holds stays
-// coarser. A child in a non-resident node page stops the cut at its parent: the slot's errors
-// for that cut are scaled so the parent is not entered, the page is requested, and with
-// `retry` a second traversal replaces the slot's output for that cut. `assign`, `share` and
-// `link` then give each gathered ray-tracing cut a cached cut equal to it, the BLAS another
-// slot with an equal cut builds, a BLAS of its own within the frame's budget, or else its
-// cached cut; `gather` writes the CLAS addresses each built BLAS takes and `jobs` its build
-// record. A posed copy of an edit builds a BLAS for its body and one per animated part with
-// clusters in the cut: `split` counts them and `place` gives them their jobs and CLAS ranges.
+// coarser. A child in a non-resident node page is requested and not entered: a streamed mesh
+// page is resident only with the node pages over its groups' leaves, so the groups below it
+// are not resident either and their stand-ins cover them. `assign`, `share` and `link` then
+// give each gathered ray-tracing cut a cached cut equal to it, the BLAS another slot with an
+// equal cut builds, a BLAS of its own within the frame's budget, or else its cached cut;
+// `gather` writes the CLAS addresses each built BLAS takes and `jobs` its build record. A
+// posed copy of an edit builds a BLAS for its body and one per animated part with clusters in
+// the cut: `split` counts them and `place` gives them their jobs and CLAS ranges.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.atomic;
@@ -40,7 +40,7 @@ public static const uint ARGS_TOTAL = ARGS_JOBS + 3;
 public static const uint CUT_BUILDS = CUT_COUNTERS;
 
 // `SlotCutGpu.flags` of a slot whose gathered cut lost clusters past capacity.
-static const uint CUT_RT_LOST = 128;
+static const uint CUT_RT_LOST = 32;
 
 // Distances from the focus clamp here, so a sphere around the focus takes its finest
 // clusters.
@@ -132,11 +132,11 @@ float cut_error(MeshGpu* mesh, Placement p, float4 sphere, float error)
 struct Lod
 {
     float threshold[2];   // raster, ray tracing: pixels
-    float scale[2];       // error scales
+    float scale;          // the error scale debug_lod sets
     int level;            // DAG level held by debug_lod, -1 none
 }
 
-Lod slot_lod(SceneRoot* s, InstanceGpu inst, uint slot, SlotCutGpu c, bool retry)
+Lod slot_lod(SceneRoot* s, InstanceGpu inst, uint slot)
 {
     Lod l;
     float debug = 1.0;
@@ -149,8 +149,7 @@ Lod slot_lod(SceneRoot* s, InstanceGpu inst, uint slot, SlotCutGpu c, bool retry
     bool seen = s.slot_state[slot].last_visible_frame + 1 >= s.frame_index && s.slot_state[slot].last_visible_frame != 0;
     l.threshold[0] = root.raster_pixels;
     l.threshold[1] = root.rt_pixels * (seen ? 1.0 : root.culled_scale);
-    l.scale[0] = debug * (retry ? asfloat(c.coarsen[0]) : 1.0);
-    l.scale[1] = debug * (retry ? asfloat(c.coarsen[1]) : 1.0);
+    l.scale = debug;
     return l;
 }
 
@@ -262,7 +261,7 @@ void candidate(CutGpu* cut, ClusterWork w)
 
 // Writes the candidate items of mesh clusters `first..end` of slot copy `slot`, in runs of
 // up to 32 of one page.
-void candidates(CutGpu* cut, MeshGpu* mesh, uint slot, uint first, uint end, uint flags)
+void candidates(CutGpu* cut, MeshGpu* mesh, uint slot, uint first, uint end)
 {
     uint c = first;
     for (uint page = cluster_page(mesh, first); page < mesh.page_count && c < end; page++)
@@ -279,7 +278,7 @@ void candidates(CutGpu* cut, MeshGpu* mesh, uint slot, uint first, uint end, uin
             ClusterWork w;
             w.instance = slot;
             w.page = page;
-            w.first = (c - mesh.page_clusters[page]) | flags;
+            w.first = c - mesh.page_clusters[page];
             w.mask = n == 32 ? 0xffffffff : (1u << n) - 1;
             candidate(cut, w);
         }
@@ -351,8 +350,6 @@ void init(uint3 id: SV_DispatchThreadID)
     SceneRoot* s = root.scene;
     CutGpu* cut = root.cut;
     SlotCutGpu c = (SlotCutGpu)0;
-    c.coarsen[0] = asuint(1.0);
-    c.coarsen[1] = asuint(1.0);
     c.owner = slot;
     SlotStateGpu st = s.slot_state[slot];
     // The copy's nearer chain step; a step past the first traces a cached cut of its model.
@@ -370,7 +367,7 @@ void init(uint3 id: SV_DispatchThreadID)
     }
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
-    Lod l = slot_lod(s, inst, slot, c, false);
+    Lod l = slot_lod(s, inst, slot);
     // Dielectric and presence clusters raster into the layer tiles wherever camera rays may
     // meet them; the culling takes each cluster by its class.
     bool raster = (mesh_has_layers(mesh) && layer_traced(inst.flags)) || (mesh_has_opaque(mesh) && opaque_rastered(inst.flags));
@@ -390,7 +387,7 @@ void init(uint3 id: SV_DispatchThreadID)
     float range = float(inst.rt_range) * ((st.rt_flags & RT_IN_RANGE) != 0 ? RT_HYSTERESIS : 1.0);
     bool ray = (inst.flags & INSTANCE_RAY) != 0 && mesh.rt_cut_count > 0 && (!has_focus() || distance <= range);
     if (ray)
-        c.rt_cut = cached_cut(mesh, st, p.scale * l.scale[1], distance, l.threshold[1], lowest_cut(mesh, inst));
+        c.rt_cut = cached_cut(mesh, st, p.scale * l.scale, distance, l.threshold[1], lowest_cut(mesh, inst));
     // The BLAS of a finer cut stay while a slot's PTLAS instance or this frame's cut names them.
     bool holds = (st.rt_flags & RT_WRITTEN) != 0 && ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) == near;
     if (holds)
@@ -408,20 +405,20 @@ void init(uint3 id: SV_DispatchThreadID)
         float far_distance = has_focus() ? max(length(place(p, far_sphere.xyz)) - far_sphere.w * p.scale, 0.0) : 0.0;
         if (ray && far_mesh.rt_cut_count > 0)
         {
-            c.far_cut = coarsest_cut(far_mesh, p.scale * l.scale[1], far_distance, l.threshold[1], 0);
+            c.far_cut = coarsest_cut(far_mesh, p.scale * l.scale, far_distance, l.threshold[1], 0);
             touch_cut(cut, far_mesh, c.far_cut);
             touch_cut(cut, far_mesh, (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff);
-            want_cut(cut, far_mesh, p.scale * l.scale[1], far_distance, l.threshold[1], 0);
+            want_cut(cut, far_mesh, p.scale * l.scale, far_distance, l.threshold[1], 0);
         }
         if (raster)
-            raster_roots(s, cut, slot | COPY_FAR, far_mesh, p, far_sphere, l, 0);
+            raster_roots(s, cut, slot | COPY_FAR, far_mesh, p, far_sphere, l);
     }
 
     if (mesh.level_count > 0)
     {
         if (raster)
         {
-            raster_roots(s, cut, slot, mesh, p, sphere, l, 0);
+            raster_roots(s, cut, slot, mesh, p, sphere, l);
             c.flags |= CUT_RASTER;
         }
         if (ray && l.level >= 0)
@@ -460,7 +457,7 @@ void init(uint3 id: SV_DispatchThreadID)
         InterlockedMin(cut.model_cut[inst.model], c.rt_cut);
     }
     if (ray && !gather)
-        want_cut(cut, mesh, p.scale * l.scale[1], distance, l.threshold[1], lowest_cut(mesh, inst));
+        want_cut(cut, mesh, p.scale * l.scale, distance, l.threshold[1], lowest_cut(mesh, inst));
     if (gather)
         c.flags |= CUT_TRAVERSED | (gathers_parts(mesh, inst, st) ? CUT_PARTS : 0);
     if (raster)
@@ -468,16 +465,16 @@ void init(uint3 id: SV_DispatchThreadID)
     cut.slots[slot] = c;
     uint mask = (raster ? 1 : 0) | (gather ? 2 : 0);
     if (mask != 0)
-        push_roots(s, cut, slot, mesh, p, sphere, l, mask, 0);
+        push_roots(s, cut, slot, mesh, p, sphere, l, mask);
 }
 
 // The raster candidates of slot copy `copy` (record `inst`): a discrete mesh's coarsest
 // level whose error stays under the threshold at the nearest point, or a DAG's roots.
-void raster_roots(SceneRoot* s, CutGpu* cut, uint copy, MeshGpu* mesh, Placement p, float4 sphere, Lod l, uint flags)
+void raster_roots(SceneRoot* s, CutGpu* cut, uint copy, MeshGpu* mesh, Placement p, float4 sphere, Lod l)
 {
     if (mesh.level_count == 0)
     {
-        push_roots(s, cut, copy, mesh, p, sphere, l, 1, flags);
+        push_roots(s, cut, copy, mesh, p, sphere, l, 1);
         return;
     }
     uint level = 0;
@@ -489,20 +486,20 @@ void raster_roots(SceneRoot* s, CutGpu* cut, uint copy, MeshGpu* mesh, Placement
     {
         for (uint k = mesh.level_count; k > 0; k--)
         {
-            if (focus_error(p, sphere, mesh.levels[k - 1].error * l.scale[0]) <= l.threshold[0])
+            if (focus_error(p, sphere, mesh.levels[k - 1].error * l.scale) <= l.threshold[0])
             {
                 level = k - 1;
                 break;
             }
         }
     }
-    candidates(cut, mesh, copy, mesh.levels[level].first, mesh.levels[level].first + mesh.levels[level].count, flags);
+    candidates(cut, mesh, copy, mesh.levels[level].first, mesh.levels[level].first + mesh.levels[level].count);
 }
 
 // Pushes the roots of the stage each cut in `mask` takes, for pass `root.pass`: the merged
 // stage when its error stays under the cut's threshold at the copy's nearest point, else the
 // part stage.
-void push_roots(SceneRoot* s, CutGpu* cut, uint slot, MeshGpu* mesh, Placement p, float4 sphere, Lod l, uint mask, uint flags)
+void push_roots(SceneRoot* s, CutGpu* cut, uint slot, MeshGpu* mesh, Placement p, float4 sphere, Lod l, uint mask)
 {
     uint sections = mesh.section_count;
     uint part_roots = mesh.part_count * sections;
@@ -510,7 +507,7 @@ void push_roots(SceneRoot* s, CutGpu* cut, uint slot, MeshGpu* mesh, Placement p
     uint merged = 0;
     for (uint k = 0; k < 2; k++)
     {
-        bool take = has_merged && l.level < 0 && focus_error(p, sphere, mesh.merge_error * l.scale[k]) <= l.threshold[k];
+        bool take = has_merged && l.level < 0 && focus_error(p, sphere, mesh.merge_error * l.scale) <= l.threshold[k];
         merged |= take ? (1u << k) : 0;
     }
     // A root covers every section of its stage, so hidden sections are left to the
@@ -526,7 +523,7 @@ void push_roots(SceneRoot* s, CutGpu* cut, uint slot, MeshGpu* mesh, Placement p
         NodeItem item;
         item.slot = slot;
         item.node = node;
-        item.flags = m | (stage_merged ? 0x10000 : 0) | flags;
+        item.flags = m | (stage_merged ? 0x10000 : 0);
         item.part = part;
         push(cut, root.pass % 2, item);
     }
@@ -623,10 +620,11 @@ void want_cut(CutGpu* cut, MeshGpu* mesh, float scale, float distance, float lim
         report(cut, mesh.feedback_nodes + mesh.node_page_count + target, true, have);
 }
 
-// Node page `page`, unless it is pinned.
+// Node page `page`, unless it is pinned: the top page, and every node page of a mesh whose
+// pages do not stream.
 void report_node_page(CutGpu* cut, MeshGpu* mesh, uint page, bool wanted, float error)
 {
-    if (page == 0xffffffff || ((NodePage*)mesh.node_table)[page].parent_page == NODE_PAGE_TOP)
+    if (page == 0xffffffff || page == 0 || mesh.pinned_pages == mesh.page_count)
         return;
     report(cut, mesh.feedback_nodes + page, wanted, error);
 }
@@ -646,28 +644,7 @@ float largest_error(Placement p, Lod l, uint mask, float4 sphere, float error)
     for (uint k = 0; k < 2; k++)
     {
         if ((mask & (1u << k)) != 0)
-            worst = max(worst, focus_error(p, sphere, error * l.scale[k]));
-    }
-    return worst;
-}
-
-// Scales the slot's errors so that, in the cuts of `mask`, nothing of projected error
-// `error` over `sphere` is entered, and marks those cuts for retry. Returns the largest
-// projected error.
-float coarsen(SlotCutGpu* c, Placement p, Lod l, uint mask, float4 sphere, float error)
-{
-    float worst = 0.0;
-    for (uint k = 0; k < 2; k++)
-    {
-        if ((mask & (1u << k)) == 0)
-            continue;
-        float e = focus_error(p, sphere, error * l.scale[k]);
-        worst = max(worst, e);
-        if (isfinite(e) && e > 0.0)
-        {
-            InterlockedMin(c.coarsen[k], asuint(0.999 * l.threshold[k] / e));
-            InterlockedOr(c.flags, k == 0 ? CUT_RETRY_RASTER : CUT_RETRY_RT);
-        }
+            worst = max(worst, focus_error(p, sphere, error * l.scale));
     }
     return worst;
 }
@@ -675,7 +652,7 @@ float coarsen(SlotCutGpu* c, Placement p, Lod l, uint mask, float4 sphere, float
 // What `rule` says of a cluster in a cut.
 static const uint RULE_OUT = 0;
 static const uint RULE_IN = 1;
-// In while the group it was simplified from is not resident.
+// In while the group it was simplified from cannot be drawn.
 static const uint RULE_STANDS_IN = 2;
 
 // Where cluster `cl` of a group at `depth` with error `group_error` stands in cut `k`: in when
@@ -691,34 +668,25 @@ uint rule(MeshGpu* mesh, Placement p, Cluster cl, Lod l, uint k, uint depth, flo
             return RULE_IN;
         return int(depth) > l.level ? RULE_STANDS_IN : RULE_OUT;
     }
-    float parent_e = cut_error(mesh, p, cl.parent_sphere, cl.parent_error * l.scale[k]);
+    float parent_e = cut_error(mesh, p, cl.parent_sphere, cl.parent_error * l.scale);
     if (parent_e <= l.threshold[k])
         return RULE_OUT;
     if (depth == 0)
         return RULE_IN;
-    float self_e = cut_error(mesh, p, cl.self_sphere, cl.self_error * l.scale[k]);
+    float self_e = cut_error(mesh, p, cl.self_sphere, cl.self_error * l.scale);
     return self_e <= l.threshold[k] ? RULE_IN : RULE_STANDS_IN;
 }
 
-// Whether a page the `ClusterRef.finer` of cluster id `id` names is not resident: the cluster
-// then stands in for the clusters of the group it was simplified from. Only a mesh whose pages
-// stream names any, so no other mesh reads the entry.
-bool finer_absent(SceneRoot* s, MeshGpu* mesh, uint id)
+// Whether the group cluster `cl` was simplified from cannot be drawn: its mesh page is not
+// resident. A streamed page is resident only with the node pages over its groups' leaves, and
+// a node's bounds and error hold those of every group below it, so the cut reaches a group
+// whose page is resident wherever `cl` would stand in for it. Only the pages of a mesh whose
+// pages stream leave, so no other mesh reads the group.
+bool finer_absent(MeshGpu* mesh, Cluster cl)
 {
     if (mesh.pinned_pages == mesh.page_count)
         return false;
-    uint finer = s.clusters[id].finer;
-    if (finer == FINER_NONE)
-        return false;
-    if ((finer & FINER_RUN) == 0)
-        return mesh.pages[finer] == 0;
-    uint* run = mesh.finer_runs + (finer & ~FINER_RUN);
-    for (uint i = 1; i <= run[0]; i++)
-    {
-        if (mesh.pages[run[i]] == 0)
-            return true;
-    }
-    return false;
+    return mesh.pages[((Group*)mesh.groups)[cl.from_group].page] == 0;
 }
 
 // One thread per item of the pass.
@@ -735,7 +703,6 @@ void traverse(uint3 id: SV_DispatchThreadID)
     NodeItem item = cut.queue[pass % 2][id.x];
     uint copy = item.slot;
     uint slot = copy_slot(copy);
-    bool retry = (item.flags & WORK_RETRY) != 0;
     uint mask = item.flags & 3;
     uint part = item.part;
     bool merged = (item.flags & 0x10000) != 0;
@@ -743,7 +710,7 @@ void traverse(uint3 id: SV_DispatchThreadID)
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
     SlotCutGpu* c = cut.slots + slot;
-    Lod l = slot_lod(s, inst, slot, *c, retry);
+    Lod l = slot_lod(s, inst, slot);
     Placement placed;
     Placement p;
     if (!focus_placement(s, inst, placed) || !stage_placement(s, copy, inst, mesh, placed, part, merged, p))
@@ -761,11 +728,7 @@ void traverse(uint3 id: SV_DispatchThreadID)
         uint child_page;
         if (!node_at(mesh, node.child_first, children, child_page))
         {
-            // The cut stops here: the slot's errors scale so this node is not entered.
-            if (retry)
-                return;
-            float worst = coarsen(c, p, l, mask, node.sphere, node.max_error);
-            report_node_page(cut, mesh, child_page, true, worst);
+            report_node_page(cut, mesh, child_page, true, largest_error(p, l, mask, node.sphere, node.max_error));
             return;
         }
         report_node_page(cut, mesh, child_page, false, 0.0);
@@ -775,7 +738,7 @@ void traverse(uint3 id: SV_DispatchThreadID)
             uint m = 0;
             for (uint k = 0; k < 2; k++)
             {
-                bool enter = l.level >= 0 || cut_error(mesh, p, child.sphere, child.max_error * l.scale[k]) > l.threshold[k];
+                bool enter = l.level >= 0 || cut_error(mesh, p, child.sphere, child.max_error * l.scale) > l.threshold[k];
                 if ((mask & (1u << k)) != 0 && enter)
                     m |= 1u << k;
             }
@@ -797,8 +760,7 @@ void traverse(uint3 id: SV_DispatchThreadID)
     if (data == nullptr)
     {
         // The clusters this group simplifies into stand in for it.
-        if (!retry)
-            report_mesh_page(cut, mesh, g.page, true, largest_error(p, l, mask, g.simplified, g.error));
+        report_mesh_page(cut, mesh, g.page, true, largest_error(p, l, mask, g.simplified, g.error));
         return;
     }
     // An edit's copy of a page is no read of the source's page its entry reports.
@@ -818,29 +780,28 @@ void traverse(uint3 id: SV_DispatchThreadID)
             uint ray = traced ? rule(mesh, p, cl, l, 1, g.depth, g.error) : RULE_OUT;
             if (raster == RULE_STANDS_IN || ray == RULE_STANDS_IN)
             {
-                uint stands = finer_absent(s, mesh, id_first + i) ? RULE_IN : RULE_OUT;
+                uint stands = finer_absent(mesh, cl) ? RULE_IN : RULE_OUT;
                 raster = raster == RULE_STANDS_IN ? stands : raster;
                 ray = ray == RULE_STANDS_IN ? stands : ray;
             }
             if (raster == RULE_IN)
                 raster_mask |= 1u << (i - run);
             if (ray == RULE_IN)
-                gather_cluster(cut, c, slot | (retry ? WORK_RETRY : 0), id_first + i, mesh_first + i);
+                gather_cluster(cut, c, slot, id_first + i, mesh_first + i);
         }
         if (raster_mask != 0)
         {
             ClusterWork w;
             w.instance = copy;
             w.page = g.page;
-            w.first = (g.first_cluster + run) | (retry ? WORK_RETRY : 0);
+            w.first = g.first_cluster + run;
             w.mask = raster_mask;
             candidate(cut, w);
         }
     }
 }
 
-// Counts the items the last pass left as dropped and empties both queues for the second
-// traversal.
+// Counts the items the last pass left as dropped.
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void finish(uint3 id: SV_DispatchThreadID)
@@ -848,50 +809,6 @@ void finish(uint3 id: SV_DispatchThreadID)
     CutGpu* cut = root.cut;
     uint left = min(cut.counters[CUT_QUEUE + root.pass % 2], cut.queue_capacity);
     InterlockedAdd(cut.counters[CUT_NODES_DROPPED], left);
-    cut.counters[CUT_QUEUE] = 0;
-    cut.counters[CUT_QUEUE + 1] = 0;
-}
-
-// The second traversal's roots: every cut a node page not resident stopped, at its scaled
-// errors. Its raster candidates replace the first's for both steps of a fading copy.
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void retry(uint3 id: SV_DispatchThreadID)
-{
-    uint slot = id.x;
-    if (slot >= root.slots)
-        return;
-    SceneRoot* s = root.scene;
-    CutGpu* cut = root.cut;
-    SlotCutGpu c = cut.slots[slot];
-    uint mask = ((c.flags & CUT_RETRY_RASTER) != 0 ? 1 : 0) | ((c.flags & CUT_RETRY_RT) != 0 ? 2 : 0);
-    if (mask == 0)
-        return;
-    InterlockedAdd(cut.counters[CUT_RETRIES], 1);
-    if ((mask & 2) != 0)
-    {
-        c.rt_count = 0;
-        c.rt_hash = uint2(0);
-        c.flags &= ~CUT_RT_LOST;
-        cut.slots[slot] = c;
-    }
-    InstanceGpu inst = copy_record(s, slot);
-    Placement p;
-    if (!focus_placement(s, inst, p))
-        return;
-    ModelGpu* model = s.models + inst.model;
-    MeshGpu* mesh = s.meshes + model.mesh;
-    Lod l = slot_lod(s, inst, slot, c, true);
-    if (mesh.level_count == 0)
-        push_roots(s, cut, slot, mesh, p, model_sphere(model), l, mask, WORK_RETRY);
-    else if ((mask & 1) != 0)
-        raster_roots(s, cut, slot, mesh, p, model_sphere(model), l, WORK_RETRY);
-    if ((mask & 1) != 0 && copy_fading(s, slot))
-    {
-        InstanceGpu far = copy_record(s, slot | COPY_FAR);
-        ModelGpu* far_model = s.models + far.model;
-        raster_roots(s, cut, slot | COPY_FAR, s.meshes + far_model.mesh, p, model_sphere(far_model), l, WORK_RETRY);
-    }
 }
 
 // What a slot's cut is keyed by besides its clusters: its mesh, and whether it splits by part.
@@ -1061,13 +978,6 @@ uint part_list(SceneRoot* s, MeshGpu* mesh, uint id)
     return animated ? 1 + cl.part - mesh.first_animated : 0;
 }
 
-// Whether entry `e` of the frame's cut clusters counts for the slot's output: the second
-// traversal's replaces the first's.
-bool entry_current(uint2 e, SlotCutGpu c)
-{
-    return ((e.x & WORK_RETRY) != 0) == ((c.flags & CUT_RETRY_RT) != 0);
-}
-
 // One thread per gathered cluster: counts it in its CUT_PARTS slot's list.
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -1078,9 +988,9 @@ void split(uint3 id: SV_DispatchThreadID)
     if (id.x >= min(cut.counters[CUT_ENTRIES], cut.entry_capacity))
         return;
     uint2 e = cut.entries[id.x];
-    uint slot = e.x & ~WORK_RETRY;
+    uint slot = e.x;
     SlotCutGpu c = cut.slots[slot];
-    if ((c.flags & (CUT_OWNER | CUT_PARTS)) != (CUT_OWNER | CUT_PARTS) || !entry_current(e, c))
+    if ((c.flags & (CUT_OWNER | CUT_PARTS)) != (CUT_OWNER | CUT_PARTS))
         return;
     MeshGpu* mesh = s.meshes + s.models[s.instances[slot].model].mesh;
     InterlockedAdd(cut.part_lists[c.rt_parts + part_list(s, mesh, e.y)].count, 1);
@@ -1221,10 +1131,8 @@ void gather(uint3 id: SV_DispatchThreadID)
     if (id.x >= min(cut.counters[CUT_ENTRIES], cut.entry_capacity))
         return;
     uint2 e = cut.entries[id.x];
-    uint slot = e.x & ~WORK_RETRY;
+    uint slot = e.x;
     SlotCutGpu c = cut.slots[slot];
-    if (!entry_current(e, c))
-        return;
     InstanceGpu inst = s.instances[slot];
     MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
     if (c.rt_cut == RT_CUT_BUILT)

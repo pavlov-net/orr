@@ -37,7 +37,7 @@ use orr_gpu::{
     Texture, TextureRegion, TileBind, TimelinePoint,
 };
 use orr_io::{AlignedBuf, SECTOR};
-use orr_pack::mesh::{MeshHeader, StoredPage};
+use orr_pack::mesh::{Group, MeshHeader, StoredPage};
 use orr_pack::{Blob, Codec};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -52,7 +52,6 @@ use crate::loading::{
 use crate::memory::{Block, Pool, PoolSlot};
 use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
-use crate::refine::FinerPages;
 use crate::residency::{
     HOLD_FRAMES, Held, InFlight, Key, Limits, Plan, Priority, RequestSource, Residency,
     ResidencyClass, ResidencyStats, UnitDesc,
@@ -107,11 +106,11 @@ pub(crate) struct MeshStream {
     pub(crate) clusters: GpuPtr<ClusterRef>,
     /// Sections whose every triangle is non-opaque.
     pub(crate) non_opaque: Vec<bool>,
+    /// Its group table.
+    pub(crate) groups: Arc<[Group]>,
     /// Its index in its mount, and the first page that streams.
     pub(crate) mesh: u32,
     pub(crate) pinned: u32,
-    /// What finds each streamed cluster's `ClusterRef.finer`.
-    pub(crate) finer: Arc<FinerPages>,
     /// Edits of the mesh, whose tables follow its landings and evictions.
     pub(crate) mirrors: Mutex<Vec<Arc<Mirror>>>,
 }
@@ -465,7 +464,6 @@ impl Streaming {
     ) -> Result<Self> {
         let mut budgets = [0; ResidencyClass::ALL.len()];
         budgets[ResidencyClass::MeshPages as usize] = b.mesh_page_pool;
-        budgets[ResidencyClass::HierarchyPages as usize] = b.hierarchy_page_pool;
         budgets[ResidencyClass::Textures as usize] = b.texture_pool;
         budgets[ResidencyClass::InstancePages as usize] = b.instance_page_pool;
         budgets[ResidencyClass::UserBlobs as usize] = b.user_blob_pool;
@@ -1752,13 +1750,11 @@ impl Streaming {
             self.free_now(p);
             return Ok(());
         }
-        let infos = infos.expect("a page that loaded has its clusters");
         let (table, refs, count) = p.entries();
         let first = p.stream.pages[p.page as usize].first;
         let pool = self.clas.as_deref();
         let entries: Vec<ClusterRef> = (0..count)
-            .zip(&infos)
-            .map(|(i, c)| ClusterRef {
+            .map(|i| ClusterRef {
                 // SAFETY: the page is resident in its slot until it is evicted, which writes
                 // these entries null first.
                 page: unsafe { GpuPtr::from_address(GpuAddress(l.gpu)) },
@@ -1768,8 +1764,6 @@ impl Streaming {
                     (Some(pool), Some(&(u, _))) => pool.address(u),
                     _ => 0,
                 },
-                finer: c.finer,
-                _pad: 0,
             })
             .collect();
         w.put(table, &[l.gpu])?;
@@ -1782,7 +1776,7 @@ impl Streaming {
             }
         }
         p.address = l.gpu;
-        if let Some(f) = self.fine.get_mut(&(key.mount, p.stream.mesh)) {
+        if let (Some(f), Some(infos)) = (self.fine.get_mut(&(key.mount, p.stream.mesh)), infos) {
             f.init.resident[p.page as usize] = Some(Box::new(PageClusters {
                 infos,
                 clas: entries.iter().map(|e| e.clas).collect(),
@@ -2362,7 +2356,7 @@ fn stage_page(
     if u64::from(h.len) > to.1 {
         return Err(orr_pack::Error::Malformed("streamed page length").into());
     }
-    let (clusters, region) = page_infos(&h, &records, page, Some(&stream.finer))?;
+    let (clusters, region) = page_infos(&h, &records, page, &stream.groups)?;
     let record = StoredPage {
         stored: staged.gpu(),
         resident: to.0,
