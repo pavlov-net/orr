@@ -637,18 +637,6 @@ void report_mesh_page(CutGpu* cut, MeshGpu* mesh, uint page, bool wanted, float 
     report(cut, mesh.feedback_pages + page, wanted, error);
 }
 
-// The largest projected error of `error` over `sphere` in the cuts of `mask`.
-float largest_error(Placement p, Lod l, uint mask, float4 sphere, float error)
-{
-    float worst = 0.0;
-    for (uint k = 0; k < 2; k++)
-    {
-        if ((mask & (1u << k)) != 0)
-            worst = max(worst, focus_error(p, sphere, error * l.scale));
-    }
-    return worst;
-}
-
 // What `rule` says of a cluster in a cut.
 static const uint RULE_OUT = 0;
 static const uint RULE_IN = 1;
@@ -728,7 +716,7 @@ void traverse(uint3 id: SV_DispatchThreadID)
         uint child_page;
         if (!node_at(mesh, node.child_first, children, child_page))
         {
-            report_node_page(cut, mesh, child_page, true, largest_error(p, l, mask, node.sphere, node.max_error));
+            report_node_page(cut, mesh, child_page, true, focus_error(p, node.sphere, node.max_error * l.scale));
             return;
         }
         report_node_page(cut, mesh, child_page, false, 0.0);
@@ -760,7 +748,7 @@ void traverse(uint3 id: SV_DispatchThreadID)
     if (data == nullptr)
     {
         // The clusters this group simplifies into stand in for it.
-        report_mesh_page(cut, mesh, g.page, true, largest_error(p, l, mask, g.simplified, g.error));
+        report_mesh_page(cut, mesh, g.page, true, focus_error(p, g.simplified, g.error * l.scale));
         return;
     }
     // An edit's copy of a page is no read of the source's page its entry reports.

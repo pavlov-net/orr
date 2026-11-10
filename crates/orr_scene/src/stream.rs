@@ -843,15 +843,15 @@ impl Streaming {
             .iter()
             .flat_map(|&unit| self.residency.deps(Key { mount, unit }))
             .copied()
-            .filter(|d| !own.contains(d) && (coarser || !pages.contains(d)))
+            .filter(|d| !own.contains(d) && (coarser || pages.binary_search(d).is_err()))
             .collect();
         held.sort_unstable();
         held.dedup();
         held.into_iter().map(|unit| Key { mount, unit }).collect()
     }
 
-    /// Asks for those of `keys` that are not resident for the next step; returns whether
-    /// there were any.
+    /// Asks for `keys` for the next step, which keeps those already resident in their hold
+    /// while the rest load; returns whether any is not resident.
     pub(crate) fn want(&mut self, keys: &[Key]) -> bool {
         let p = Priority {
             error: 0.0,
@@ -859,16 +859,14 @@ impl Streaming {
         };
         let mut waiting = false;
         for &k in keys {
-            if !self.residency.resident(k) {
-                self.residency.request(k, p, RequestSource::Hints);
-                waiting = true;
-            }
+            self.residency.request(k, p, RequestSource::Hints);
+            waiting |= !self.residency.resident(k);
         }
         waiting
     }
 
-    /// Locks `keys` once they are all resident, and asks for them until then. A failed unit
-    /// never loads.
+    /// Locks `keys` once they are all resident, and asks for them until then. A unit that
+    /// failed, or that depends on one that did, never loads.
     pub(crate) fn hold(&mut self, keys: &[Key]) -> Hold {
         if keys.iter().any(|&k| self.residency.failed(k)) {
             return Hold::Failed;
@@ -1659,8 +1657,6 @@ impl Streaming {
         placed
     }
 
-    /// Tells the residency manager how the load of `key` ended: resident, released to load
-    /// again once memory frees, or failed. False when it isn't resident or its mount is gone.
     /// Whether `k` depends on one of `keys`.
     fn depends_on(&self, k: Key, keys: &FxHashSet<Key>) -> bool {
         self.residency.deps(k).iter().any(|&unit| {
@@ -1671,6 +1667,8 @@ impl Streaming {
         })
     }
 
+    /// Tells the residency manager how the load of `key` ended: resident, released to load
+    /// again once memory frees, or failed. False when it isn't resident or its mount is gone.
     fn unit_landed(&mut self, key: Key, result: &Result<(), Arc<Error>>, frame: u64) -> bool {
         match result {
             Ok(()) => self.residency.landed(key, true, frame),
@@ -1853,9 +1851,9 @@ impl Streaming {
             }
         }
         p.address = l.gpu;
-        if let (Some(f), Some(infos)) = (self.fine.get_mut(&(key.mount, p.stream.mesh)), infos) {
+        if let Some(f) = self.fine.get_mut(&(key.mount, p.stream.mesh)) {
             f.init.resident[p.page as usize] = Some(Box::new(PageClusters {
-                infos,
+                infos: infos.expect("a page that loaded has its clusters"),
                 clas: entries.iter().map(|e| e.clas).collect(),
             }));
         }

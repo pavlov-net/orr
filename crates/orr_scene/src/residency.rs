@@ -819,9 +819,25 @@ impl Residency {
         self.unit(k).is_some_and(|u| u.state == State::Resident)
     }
 
-    /// Whether `k`'s load failed, so that it never loads.
+    /// Whether the load of `k` or of a unit it depends on failed, so that `k` never loads.
     pub(crate) fn failed(&self, k: Key) -> bool {
-        self.unit(k).is_some_and(|u| u.state == State::Failed)
+        let Some(units) = self.mounts.get(&k.mount) else {
+            return false;
+        };
+        let mut seen = FxHashSet::default();
+        let mut stack = vec![k.unit];
+        while let Some(i) = stack.pop() {
+            let u = &units[i as usize];
+            match u.state {
+                State::Failed => return true,
+                // Its dependencies are resident too.
+                State::Resident => {}
+                State::Absent | State::Loading => {
+                    stack.extend(u.deps.iter().filter(|&&d| seen.insert(d)));
+                }
+            }
+        }
+        false
     }
 
     /// The units of `k`'s mount that `k` depends on; none once its mount is gone.
@@ -1718,19 +1734,23 @@ mod tests {
     #[test]
     fn failed_units_release_their_bytes_and_are_not_loaded_again() {
         let mut r = Residency::new(limits(100));
-        r.register(
-            M,
-            &[unit(50, &[], Start::Pinned), unit(50, &[0], Start::Absent)],
-        )
-        .unwrap();
+        let units = [
+            unit(50, &[], Start::Pinned),
+            unit(50, &[0], Start::Absent),
+            unit(50, &[1], Start::Absent),
+        ];
+        r.register(M, &units).unwrap();
         r.request(key(1), P, S);
         assert_eq!(r.plan(1, []).loads, [key(1)]);
         assert_eq!(class(&r).loading_bytes, 50);
+        assert!(!r.failed(key(2)));
         r.landed(key(1), false, 1);
         assert_eq!(r.stats().failed, 1);
         assert_eq!(class(&r).resident_bytes, 50);
         r.request(key(1), P, S);
+        r.request(key(2), P, S);
         assert_eq!(r.plan(2, []).loads, []);
+        assert!(r.failed(key(2)), "2 never loads over 1");
     }
 
     #[test]
