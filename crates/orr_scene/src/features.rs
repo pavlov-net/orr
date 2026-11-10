@@ -44,7 +44,8 @@ impl SceneFeatures {
     pub const LAYERS: Self = Self(1 << 12);
     /// Geometry may hold triangles that are not opaque in traversal, particles apart: a
     /// material that a mesh was built with tested alpha, was a presence layer or a thin
-    /// dielectric, or a producer entry is not opaque.
+    /// dielectric, a producer entry is not opaque, or a model has a chain, whose copies fade
+    /// between its steps with every triangle a candidate.
     pub const COVERAGE: Self = Self(1 << 13);
     /// The scene holds a particle or smoke entry.
     pub const PARTICLES: Self = Self(1 << 14);

@@ -684,6 +684,57 @@ fn a_view_is_black_while_the_path_kernels_compile_and_then_renders_as_if_it_neve
     assert_clean();
 }
 
+/// A copy fading between two steps of its chain is written with every triangle a candidate of
+/// the rays that meet it. A scene of opaque materials says so from the moment a model has a
+/// chain, which keeps candidate handling in the path pipelines made for it.
+#[test]
+fn a_chain_marks_its_scenes_for_ray_candidates() {
+    let d = device();
+    let mut r = Renderer::new(d, RendererDesc::default()).unwrap();
+    let loading = r.loading();
+    let worker = {
+        let l = Arc::clone(&loading);
+        std::thread::spawn(move || l.run_worker())
+    };
+    let mut frame = 0;
+    let mount = mount_pack(&mut r, &floor_and_box(), &mut frame);
+    let models = ["floor", "box"].map(|name| r.model(mount, AssetId::from_name(name)).unwrap());
+    loading.stop_workers();
+    worker.join().unwrap();
+    let scene = r
+        .create_scene(
+            &SceneDesc {
+                light_capacity: 1,
+                ..SceneDesc::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    let listed = [scene];
+    let coverage = orr_scene::SceneFeatures::COVERAGE;
+    let mut features = |r: &mut Renderer, place: bool| {
+        frame += 1;
+        let mut f = r
+            .begin_frame(FrameDesc {
+                time: time(frame),
+                scenes: &listed,
+                display: None,
+            })
+            .unwrap();
+        if place {
+            place_floor_and_box(&f, scene, models);
+        }
+        f.update_scenes(&mut |_| {}).unwrap();
+        let features = f.scene_features(scene).unwrap();
+        wait(f.end().unwrap());
+        features
+    };
+    assert!(!features(&mut r, true).contains(coverage));
+    r.set_chain(models[1], &[(models[0], 10.0)]).unwrap();
+    assert!(features(&mut r, false).contains(coverage));
+    assert_clean();
+}
+
 /// A path pipeline that cannot compile: the device has no ray dispatch and the renderer asks for
 /// it. The pipelines compile when a view first asks for them, so the view's render reports it,
 /// and every wait and render after it.

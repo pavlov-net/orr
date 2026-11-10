@@ -361,6 +361,9 @@ struct Core {
     cages: Vec<Option<ModelCage>>,
     /// The farther models of every model with a representation chain.
     chains: HashMap<ModelId, Vec<ModelId>>,
+    /// A model has had a chain: a copy that fades between two steps is written with every
+    /// triangle a candidate, and stays so until its instance is next written.
+    chained: bool,
     /// Records outside any scene: materials, view-history initialization.
     global: Mutex<Vec<Record>>,
     scenes: Vec<Option<Scene>>,
@@ -521,6 +524,7 @@ impl Scenes {
                 model_cpu: Vec::new(),
                 cages: Vec::new(),
                 chains: HashMap::new(),
+                chained: false,
                 global: Mutex::new(global),
                 scenes: Vec::new(),
                 histories: Vec::new(),
@@ -762,6 +766,7 @@ impl Scenes {
         } else {
             core.chains
                 .insert(model, chain.iter().map(|&(m, _)| m).collect());
+            core.chained = true;
         }
         core.write_chain(model, chain);
         Ok(())
@@ -1195,6 +1200,17 @@ impl Core {
     }
 
     /// Writes `model`'s chain into its `ModelGpu` with the next frame's records.
+    /// What any scene may hold by the tables every scene shares: what a material may show,
+    /// and candidates on every triangle of a copy fading between the steps of a chain.
+    fn features(&self) -> SceneFeatures {
+        let fades = if self.chained {
+            SceneFeatures::COVERAGE
+        } else {
+            SceneFeatures::NONE
+        };
+        self.materials.features() | fades
+    }
+
     fn write_chain(&mut self, model: ModelId, chain: &[(ModelId, f32)]) {
         let mut words = [0u32; 1 + 2 * MAX_CHAIN];
         words[0] = chain.len() as u32;
@@ -2113,7 +2129,7 @@ impl<'a> Frame<'a> {
     /// What `scene` may hold now: [`RasterView::features`] before the view is rastered.
     pub fn scene_features(&self, scene: SceneId) -> Result<SceneFeatures> {
         let cpu = self.core.scene(scene)?.cpu.lock().unwrap();
-        Ok(self.core.materials.features() | cpu.features())
+        Ok(self.core.features() | cpu.features())
     }
 
     /// [`Self::raster_view`], with `requests`, the transient targets of the passes that
@@ -2224,7 +2240,7 @@ impl<'a> Frame<'a> {
             counts: targets.counts(),
             raster,
             smoke_args: smoke.then(|| targets.smoke_args()),
-            features: core.materials.features() | scene_features,
+            features: core.features() | scene_features,
             history: view.history,
             sky_stats,
             focus,
