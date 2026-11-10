@@ -6,7 +6,14 @@
 // A test of the form `may(bit) && condition` keeps the condition's result wherever the bit is
 // set, and is exact with the bit clear only while the condition is false for every path of the
 // pipeline: that is what each bit's line below promises.
+//
+// Only a kernel that exports `PATH_SPECIALIZES` reads the constant. In every other kernel each
+// test is true at link time, so any module may test a bit without putting the constant into the
+// interface of kernels that are made without it.
 module specialize;
+
+// Whether the kernel's pipelines are made for a mask: the staged path kernels export true.
+public extern static const bool PATH_SPECIALIZES = false;
 
 #ifdef ORR_UNSPECIALIZED
 // A build whose target has no specialization constants (the CPU tests') holds everything.
@@ -70,10 +77,10 @@ public static const uint MAY_EMISSIVE = 1 << 25;
 // Whether any of `bits` may be met.
 public bool may_any(uint bits)
 {
-    return (path_may & bits) != 0;
+    return !PATH_SPECIALIZES || (path_may & bits) != 0;
 }
 
 public bool may(uint bit)
 {
-    return (path_may & bit) != 0;
+    return !PATH_SPECIALIZES || (path_may & bit) != 0;
 }

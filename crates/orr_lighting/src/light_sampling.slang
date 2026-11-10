@@ -22,6 +22,7 @@ import orr_scene.view;
 import orr_lighting.bsdf;
 import orr_lighting.media;
 import orr_lighting.environment;
+import orr_lighting.specialize;
 
 // Presampled light tiles: `TILE_COUNT` tiles of `TILE_SIZE` samples, redrawn every frame.
 public static const uint TILE_COUNT = 128;
@@ -1061,8 +1062,14 @@ LightSample tile_light_sample<S : ISurface>(LightSetGpu* set, uint id, uint firs
     }
     uint lights = set.scene.light_capacity;
     if (id < lights)
-        return local_sample(set, id, u.xy, probability);
-    return emissive_sample<S>(set, id - lights, first, count, bits, u.xy, probability);
+    {
+        if (may(MAY_LOCAL_LIGHTS))
+            return local_sample(set, id, u.xy, probability);
+    }
+    else if (may(MAY_EMISSIVE))
+        return emissive_sample<S>(set, id - lights, first, count, bits, u.xy, probability);
+    LightSample none = {};
+    return none;
 }
 
 // Tile sample `index` of `frame`, drawn from the light set's selection.

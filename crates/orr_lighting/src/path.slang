@@ -686,7 +686,7 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
     float3 vis = shadow.transmittance(x.surface.position, d.origin, d.toward, d.t_max, context, d.chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, d.chosen.kind == LIGHT_SAMPLE_DIRECTIONAL, stack);
     float scatter_pdf;
     float3 e = nee_bent(d, f, vis, stack, keep, chain, scatter_pdf);
-    if (d.chosen.view && any(vis > 0.0))
+    if (may(MAY_EMISSIVE) && d.chosen.view && any(vis > 0.0))
         vis *= emitter_view_layer<S>(r.set, d.chosen, exterior_ior);
     float mis = 1.0;
     // Every light the tiles hold is one BSDF rays reach too, along the same straight way:
@@ -928,7 +928,7 @@ public struct PathShadow<S : ISurface, M : IMedium> : IShadow
     {
         // Environment light reaches vertices without the medium's transmittance, as BSDF
         // misses see it: the baked map carries the medium.
-        if (path_light<S, M>(scene, view, start, origin, dir, t_max, RAY_FLAG_NONE, context, environment, inside(dir), directional && bend, dispersion, true, overflows, stack) == STACK_BROKEN)
+        if (path_light<S, M>(scene, view, start, origin, dir, t_max, RAY_FLAG_NONE, context, environment, inside(dir), may(MAY_STACK) && directional && bend, dispersion, true, overflows, stack) == STACK_BROKEN)
             return float3(0.0);
         return any(stack.transmittance > 0.0) ? stack.transmittance * exp(-stack.depth) : float3(0.0);
     }

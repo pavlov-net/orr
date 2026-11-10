@@ -86,14 +86,25 @@ uint round_next(PathRoot r) { return r.round_next; }
 // light, the one light a stack bends. Without either no stack changes what a path gathers.
 bool stack_tracked(PathRoot r)
 {
-    return (r.features & FEATURE_STACK) != 0 && r.set.stack_entries != 0 && r.set.directional_count != 0;
+    return may(MAY_STACK) && (r.features & FEATURE_STACK) != 0 && r.set.stack_entries != 0 && r.set.directional_count != 0;
 }
 
 // Whether paths of `r` may split by wavelength.
 bool spectral_tracked(PathRoot r)
 {
-    return (r.features & FEATURE_DISPERSION) != 0;
+    return may(MAY_DISPERSION) && (r.features & FEATURE_DISPERSION) != 0;
 }
+
+// `r.mode`, which is PATH_FULL in a pipeline that shows no debug view.
+uint path_mode(PathRoot r)
+{
+    return may(MAY_DEBUG) ? r.mode : PATH_FULL;
+}
+
+// Whether the view of `r` has a frosted-glass pass, a thin lens, froxels.
+bool frost_pass(PathRoot r) { return may(MAY_FROST) && (r.dielectric_flags & DIELECTRIC_FROST) != 0; }
+bool thin_lens(PathRoot r) { return may(MAY_LENS) && r.aperture_radius > 0.0; }
+bool has_froxels(PathRoot r) { return may(MAY_FROXELS) && r.froxels != nullptr; }
 
 // Whether the paths of `r` are of `source`, which the pipeline may not run at all.
 bool from_view(PathRoot r) { return may(MAY_VIEW) && r.source == PATH_SOURCE_VIEW; }
@@ -296,7 +307,7 @@ public static const uint UPDATE_RECORD_WORDS = 9;
 
 bool interiors_tracked(PathRoot r)
 {
-    return (r.features & FEATURE_INTERIORS) != 0;
+    return may(MAY_INTERIORS) && (r.features & FEATURE_INTERIORS) != 0;
 }
 
 uint stack_first(PathRoot r)
@@ -437,7 +448,7 @@ bool pixel_traced(PathRoot r, uint2 pixel)
 // Whether a view's `pixel` also runs a path for the frosted-glass term, in a second pass.
 bool two_passes(PathRoot r, uint2 pixel)
 {
-    if ((r.dielectric_flags & DIELECTRIC_FROST) == 0 || !pixel_traced(r, pixel))
+    if (!frost_pass(r) || !pixel_traced(r, pixel))
         return false;
     return r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].frost != 0;
 }
@@ -467,7 +478,7 @@ PathStart camera_start(PathRoot r, uint2 pixel)
         Sampler rng = Sampler(pixel, r.frame, r.seed ^ DOF_STREAM);
         return lens_start(r, pixel, r.dof_aperture, *r.dof_focus, near / mask, MASK_OPAQUE | MASK_DIELECTRIC, rng);
     }
-    if (r.aperture_radius > 0.0)
+    if (thin_lens(r))
     {
         Sampler rng = Sampler(pixel, r.frame, r.seed);
         return lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_OPAQUE | MASK_DIELECTRIC, rng);
@@ -1058,13 +1069,14 @@ PathContext path_context(PathRoot r, StagedRecord record, uint2 pixel)
 {
     PathContext c;
     c.photon = record.photon();
-    c.count_nee = r.mode != PATH_BSDF_ONLY && !c.photon;
-    c.count_bsdf = r.mode != PATH_NEE_ONLY && !c.photon;
-    c.one_technique = r.mode == PATH_NEE_ONLY || r.mode == PATH_BSDF_ONLY;
-    c.reference = (r.dielectric_flags & DIELECTRIC_REFERENCE) != 0;
-    c.cache = (r.cache_flags & CACHE_TERMINATE) != 0 && !c.one_technique && r.mode != PATH_DIRECT;
-    c.disperse = record.spectral() && (r.dielectric_flags & DIELECTRIC_DISPERSION) != 0;
-    c.caustics = r.caustics != nullptr && !c.one_technique && !c.photon && caustics_hold_light(r.caustics);
+    uint mode = path_mode(r);
+    c.count_nee = mode != PATH_BSDF_ONLY && !c.photon;
+    c.count_bsdf = mode != PATH_NEE_ONLY && !c.photon;
+    c.one_technique = mode == PATH_NEE_ONLY || mode == PATH_BSDF_ONLY;
+    c.reference = may(MAY_REFERENCE) && (r.dielectric_flags & DIELECTRIC_REFERENCE) != 0;
+    c.cache = may(MAY_CACHE) && (r.cache_flags & CACHE_TERMINATE) != 0 && !c.one_technique && mode != PATH_DIRECT;
+    c.disperse = may(MAY_DISPERSION) && record.spectral() && (r.dielectric_flags & DIELECTRIC_DISPERSION) != 0;
+    c.caustics = may(MAY_CAUSTICS) && r.caustics != nullptr && !c.one_technique && !c.photon && caustics_hold_light(r.caustics);
     c.seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
     c.feedback = !c.photon && texture_feedback_drawn(pixel, r.frame);
     return c;
@@ -1083,8 +1095,8 @@ void set_flag(inout uint flags, uint bit, bool on)
 // Whether the iteration's light counts toward the root's mode, from the state at its top.
 bool iteration_counted(PathRoot r, PathLoop p)
 {
-    return r.mode == PATH_DIRECT ? p.depth == 0 : r.mode == PATH_INDIRECT ? p.depth > 0
-        : r.mode == PATH_SUBSURFACE ? has(p.flags, LOOP_WALKED) : true;
+    return path_mode(r) == PATH_DIRECT ? p.depth == 0 : path_mode(r) == PATH_INDIRECT ? p.depth > 0
+        : path_mode(r) == PATH_SUBSURFACE ? has(p.flags, LOOP_WALKED) : true;
 }
 
 // The top of an iteration: whether the path goes on into it from vertex kind `kind`.
@@ -1117,9 +1129,9 @@ void view_outputs(PathRoot r, PathFixed f, PathLoop p, StoredView pixel_path, fl
     bool arrived = pixel_path.first_distance > 0.0;
     bool first_layer = view_first_layer(pixel_path);
     float4 out = float4(apply_hdr_ceiling(pixel_radiance), arrived ? 1.0 : 0.0);
-    if (r.mode == PATH_RAYS)
+    if (path_mode(r) == PATH_RAYS)
         out = float4(float(p.rays), all(isfinite(pixel_radiance)) ? 0.0 : 1.0, 0.0, out.a);
-    else if ((r.dielectric_flags & DIELECTRIC_DEBUG_LAYER) != 0 && first_layer)
+    else if (may(MAY_DEBUG) && (r.dielectric_flags & DIELECTRIC_DEBUG_LAYER) != 0 && first_layer)
     {
         float sum = max(pixel_path.own.x + pixel_path.own.y, 1e-6);
         out = float4(pixel_path.own.x / sum, pixel_path.own.y / sum, float(p.layers) / float(max(r.dielectric_depth, 1u)), 1.0);
@@ -1131,7 +1143,7 @@ void view_outputs(PathRoot r, PathFixed f, PathLoop p, StoredView pixel_path, fl
     r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(feedback, asuint(pixel_path.first_distance));
     if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && feedback != NO_LIGHT)
         count_feedback(r.set, feedback);
-    if ((r.dielectric_flags & DIELECTRIC_FROST) != 0)
+    if (frost_pass(r))
         r.layers[index].background = guide_luminance(pixel_radiance);
 }
 
@@ -1163,7 +1175,7 @@ void start_state(PathRoot r, uint2 pixel, PathStart start, Sampler rng, bool pho
     // The first vertex resolves as the camera's, traced or on the G-buffer's surface.
     set_flag(p.flags, LOOP_CAMERA, true);
     // The froxels hold a camera segment through an interior where this frame has them.
-    set_flag(p.flags, LOOP_CARRIED, start.interior.count > 0 && r.froxels == nullptr);
+    set_flag(p.flags, LOOP_CARRIED, start.interior.count > 0 && !has_froxels(r));
     // A path without a camera ray starts on the G-buffer's surface as its first vertex.
     set_flag(p.flags, LOOP_GBUFFER_START, !camera);
     set_flag(p.flags, LOOP_GBUFFER_HIT, !camera);
@@ -1229,13 +1241,13 @@ public void primary_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     ViewConstants* v = r.view;
     Sampler rng = Sampler(pixel, r.frame, r.seed);
     bool traced = traced_tiles(r.layers, extent)[layer_tile(extent, pixel)] != 0;
-    if (r.mode == PATH_CACHE || r.mode == PATH_CACHE_LOD || r.mode == PATH_ORIGIN_BIAS || r.mode == PATH_CAUSTICS)
+    if (path_mode(r) == PATH_CACHE || path_mode(r) == PATH_CACHE_LOD || path_mode(r) == PATH_ORIGIN_BIAS || path_mode(r) == PATH_CAUSTICS)
     {
         first_vertex_view<S>(r, pixel, rng);
         return;
     }
     PathStart start;
-    if (r.aperture_radius > 0.0)
+    if (thin_lens(r))
     {
         start = lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_OPAQUE | MASK_DIELECTRIC, rng);
         start.interior = lens_interior<S>(r, start.origin);
@@ -1340,7 +1352,7 @@ public void photon_start_stage<S : ISurface, M : IMedium>(PathRoot root, uint la
 // a vertex in a medium of IOR `exterior_ior`.
 float3 emitter_view<S : ISurface>(PathRoot r, ResolvedLightSample chosen, float exterior_ior, float3 vis)
 {
-    if (chosen.view && any(vis > 0.0))
+    if (may(MAY_EMISSIVE) && chosen.view && any(vis > 0.0))
         vis *= emitter_view_layer<S>(r.set, chosen, exterior_ior);
     return vis;
 }
@@ -1601,7 +1613,7 @@ public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     if (!camera)
         p.depth++;
     t = h.hit ? h.t : camera ? camera_ray.t_max : positive_infinity();
-    if (!camera || has(p.flags, LOOP_CARRIED))
+    if (interiors_tracked(r) && (!camera || has(p.flags, LOOP_CARRIED)))
         medium = interior.innermost();
     if (medium != MATERIAL_NONE)
     {
@@ -1908,7 +1920,7 @@ bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, ino
     // Coat, fuzz and film collapse once the path has scattered, outside the reference.
     uint before = layer ? p.opaque : p.opaque - 1;
     bool collapse = before > 0 && !x.reference;
-    bool walks = (r.features & FEATURE_WALK) != 0 && record.walks() && !layer && may_walk(r, sv.l.x.surface, before, has(p.flags, LOOP_WALKED), p.cone.width);
+    bool walks = may(MAY_WALK) && (r.features & FEATURE_WALK) != 0 && record.walks() && !layer && may_walk(r, sv.l.x.surface, before, has(p.flags, LOOP_WALKED), p.cone.width);
     sv.b = prepare_vertex(s, sv.l, c.interior, collapse, walks, record.adjoint(), c.spectral.hero());
     if (first)
         record.arrive(r, sv.l.x, sv.b, start_vertex ? 0.0 : gbuffer ? length(sv.l.x.surface.position - v.eye_render.xyz) : t, layer);
@@ -1937,7 +1949,7 @@ bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, ino
     }
     if (layer)
         return (sv.l.x.surface.flags & GBUFFER_UNLIT) == 0;
-    bool alive = (sv.l.x.surface.flags & GBUFFER_UNLIT) == 0 && (first || r.mode != PATH_DIRECT);
+    bool alive = (sv.l.x.surface.flags & GBUFFER_UNLIT) == 0 && (first || path_mode(r) != PATH_DIRECT);
     // The first vertex of a pixel with no layer runs on the view's share of pixels.
     if (first && c.interior.count == 0)
     {
@@ -2065,7 +2077,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
         }
     }
     // The caustic photons' light at the vertex's diffuse lobes, which is indirect.
-    bool gathered = r.mode == PATH_DIRECT ? false : r.mode == PATH_INDIRECT ? true : counted;
+    bool gathered = path_mode(r) == PATH_DIRECT ? false : path_mode(r) == PATH_INDIRECT ? true : counted;
     if (may(MAY_CAUSTICS) && x.caustics && gathered && !medium_vertex && !leaving)
         p.radiance += c.spectral.color(p.throughput * caustic_gather<S>(r, l, b, at_exit, sv.exit_scatter, p.cone.width, rng));
     if (has(p.flags, LOOP_LAST))
@@ -2572,7 +2584,7 @@ void view_finish<S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint s
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
     StoredView record = load_record<StoredView>(st, slot);
     float3 pixel_radiance = view_exposed(record) + pre_exposure * p.radiance;
-    bool sky = any(p.sky > 0.0) && r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE;
+    bool sky = any(p.sky > 0.0) && path_mode(r) != PATH_INDIRECT && path_mode(r) != PATH_SUBSURFACE;
     bool two = two_passes(r, pixel);
     bool second = second_pass(r);
     // The camera ray the pixel started with, where what is left to do reads it.
@@ -2586,12 +2598,12 @@ void view_finish<S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint s
     else
     {
         // The pixel's rays count both passes.
-        if (r.mode == PATH_RAYS)
+        if (path_mode(r) == PATH_RAYS)
         {
             float4 out = r.radiance.get<RWTexture2D<float4>>()[pixel];
             r.radiance.get<RWTexture2D<float4>>()[pixel] = float4(float(p.rays), out.yzw);
         }
-        if ((r.dielectric_flags & DIELECTRIC_FROST) != 0)
+        if (frost_pass(r))
             r.layers[index].background = guide_luminance(pixel_radiance);
     }
     if (!two || second)
@@ -2599,7 +2611,7 @@ void view_finish<S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint s
     // The background's path starts on the G-buffer's surface, inside what holds it, with the
     // sampler, rays and record the first pass left.
     PathStart start;
-    if (r.aperture_radius > 0.0)
+    if (thin_lens(r))
     {
         start = (PathStart)0;
         start.interior = lens_interior<S>(r, camera_ray.origin);

@@ -12,6 +12,7 @@ import orr_lighting.path.stages;
 extern struct Surface : ISurface = StandardSurface;
 extern struct Environment : IEnvironment = EnvironmentMap;
 extern struct Medium : IMedium = NoMedium;
+export static const bool PATH_SPECIALIZES = true;
 
 ORR_ROOT_INLINE(PathRoot);
 

@@ -27,6 +27,7 @@ import orr_scene.hit;
 import orr_scene.gbuffer;
 import orr_lighting.bsdf;
 import orr_lighting.media;
+import orr_lighting.specialize;
 __exported import orr_lighting.interiors;
 
 // The mask shadow rays trace.
@@ -179,14 +180,14 @@ public struct ShadowCandidates<S : ISurface, M : IMedium, let MODE : uint> : ICa
         }
         if (c.cluster_id < 0)
             return float3(1.0);
-        bool layer = c.class_id == CLASS_PRESENCE || c.class_id == CLASS_PARTICLE;
+        bool layer = (may(MAY_LAYERS) && c.class_id == CLASS_PRESENCE) || (may(MAY_PARTICLES) && c.class_id == CLASS_PARTICLE);
         float present = resolve_presence<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context, !layer);
         if (layer)
         {
             counted = true;
             return float3(1.0 - saturate(present));
         }
-        if (c.class_id != CLASS_DIELECTRIC)
+        if (!may(MAY_LAYERS) || c.class_id != CLASS_DIELECTRIC)
             return present > 0.0 ? float3(0.0) : float3(1.0);
         if (!(present > 0.0))
             return float3(1.0);
