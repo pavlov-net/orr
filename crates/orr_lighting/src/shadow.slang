@@ -780,19 +780,3 @@ public uint path_light<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v
     }
     return STACK_BROKEN;
 }
-
-// What reaches `origin`, inside the interiors of `inside`, from a directional light along unit
-// `dir` for the passes that trace SHADOW_UNBENT: with `bend`, through the plane stack its probe
-// finds where one holds, else unbent; as `surface_visibility` gives it, without the linked medium
-// and with the interiors' optical depth apart in `depth`. `stack` holds the stack's bent direction
-// and densities, `stack.bent` `dir` for a straight ray.
-public float3 directional_visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, uint flags, HitContext context, Interior inside, bool bend, uint* overflows, out float3 depth, out StackLight stack)
-{
-    if (bend && path_light<S, M>(s, v, origin, origin, dir, positive_infinity(), flags, context, false, inside, true, false, false, overflows, stack) != STACK_BROKEN)
-    {
-        depth = stack.depth;
-        return stack.transmittance;
-    }
-    stack = straight_light(dir);
-    return surface_visibility<S, M, SHADOW_UNBENT>(s, v, origin, dir, positive_infinity(), flags, context, false, inside, overflows, depth);
-}

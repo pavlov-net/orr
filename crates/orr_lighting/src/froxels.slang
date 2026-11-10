@@ -466,8 +466,9 @@ float3 limit_incident(float3 c)
 
 // What reaches `origin` along unit `dir` over `t_max` m for the light pass's rays, which trace
 // SHADOW_UNBENT: with `bend`, a directional light's through the plane stack its probe finds where
-// one holds (`directional_visibility`), else `surface_visibility`'s, without the linked medium and
-// with the interiors' optical depth apart in `depth`. `stack` is the stack's, or a straight ray's.
+// one holds, else `surface_visibility`'s, without the linked medium and with the interiors'
+// optical depth apart in `depth`. `stack` holds the stack's bent direction and densities, or a
+// straight ray's.
 float3 froxel_shadow<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, bool bend, uint* overflows, out float3 depth, out StackLight stack)
 {
     if (may(MAY_STACK) && bend && path_light<S, M>(s, v, origin, origin, dir, positive_infinity(), flags, context, false, inside, true, false, false, overflows, stack) != STACK_BROKEN)
