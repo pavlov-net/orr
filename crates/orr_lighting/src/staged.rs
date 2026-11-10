@@ -65,6 +65,10 @@ const PATH_MAY_ID: u32 = 110;
 pub(crate) const MAY_STACK: u32 = 1 << 0;
 pub(crate) const MAY_DISPERSION: u32 = 1 << 1;
 pub(crate) const MAY_CAUSTICS: u32 = 1 << 2;
+const MAY_VIEW: u32 = 1 << 3;
+const MAY_BACKGROUND: u32 = 1 << 4;
+const MAY_UPDATE: u32 = 1 << 5;
+const MAY_PHOTON: u32 = 1 << 6;
 /// Everything: what a pipeline made without a value may meet.
 pub(crate) const MAY_ALL: u32 = u32::MAX;
 
@@ -99,6 +103,16 @@ impl Source {
         match self {
             Self::View | Self::Background => scratch("ORR_SCRATCH_WIDE", WIDE_ROUNDS),
             Self::Update | Self::Photon => scratch("ORR_SCRATCH_FEW", FEW_ROUNDS),
+        }
+    }
+
+    /// `specialize.slang`'s bit of a pipeline that may run its paths.
+    pub(crate) fn may(self) -> u32 {
+        match self {
+            Self::View => MAY_VIEW,
+            Self::Background => MAY_BACKGROUND,
+            Self::Update => MAY_UPDATE,
+            Self::Photon => MAY_PHOTON,
         }
     }
 
@@ -367,8 +381,9 @@ pub(crate) struct StagedKernels {
     device: Device,
     kernels: KernelSet,
     rays: bool,
-    /// Where pipelines compile once the kernels have one; on the calling thread before that.
-    loading: OnceLock<Arc<Loading>>,
+    /// The device and loading side pipelines compile on once [`Self::attach`] names them; on
+    /// `device` and the calling thread before that.
+    compiler: OnceLock<(Device, Arc<Loading>)>,
     tail: Late<ComputePipeline>,
     sets: Mutex<Vec<Arc<StageSet>>>,
 }
@@ -381,17 +396,18 @@ impl StagedKernels {
             device: device.clone(),
             kernels: *kernels,
             rays,
-            loading: OnceLock::new(),
+            compiler: OnceLock::new(),
             tail: Late::new("staged tail kernel"),
             sets: Mutex::new(Vec::new()),
         }
     }
 
-    /// Makes later pipelines as jobs on `loading`, and queues the tail stage's compile there.
-    /// The tail holds `trace_path`'s whole loop, so it compiles for minutes; until it is ready
-    /// a pass runs every round.
-    pub(crate) fn attach(&self, loading: &Arc<Loading>) {
-        let _ = self.loading.set(Arc::clone(loading));
+    /// Makes later pipelines on `device` as jobs on `loading`, and queues the tail stage's
+    /// compile there. The tail holds `trace_path`'s whole loop, so it compiles for minutes;
+    /// until it is ready a pass runs every round. `device` may compile what the device the
+    /// kernels were made on only looks up in its caches.
+    pub(crate) fn attach(&self, device: &Device, loading: &Arc<Loading>) {
+        let _ = self.compiler.set((device.clone(), Arc::clone(loading)));
         self.start_late(&self.tail, |d, kernels| {
             let stage =
                 ShaderStage::new(module(kernels, &tail::MODULE)?, "main", SpecData::default())?;
@@ -413,13 +429,17 @@ impl StagedKernels {
         }
         let sync = std::env::var_os("ORR_SCRATCH_TAIL_SYNC").is_some();
         let kernels = self.kernels;
-        late.start(&self.device, self.loading().filter(|_| !sync), move |d| {
+        late.start(self.device(), self.loading().filter(|_| !sync), move |d| {
             compile(d, &kernels)
         });
     }
 
     fn loading(&self) -> Option<&Loading> {
-        self.loading.get().map(|l| &**l)
+        self.compiler.get().map(|(_, l)| &**l)
+    }
+
+    fn device(&self) -> &Device {
+        self.compiler.get().map_or(&self.device, |(d, _)| d)
     }
 
     /// The set made for exactly `may`.
@@ -439,7 +459,7 @@ impl StagedKernels {
         for &stage in stages {
             let (kernels, rays) = (self.kernels, self.rays);
             set.stage(stage)
-                .start(&self.device, self.loading(), move |d| {
+                .start(self.device(), self.loading(), move |d| {
                     compile_stage(d, &kernels, stage, may, rays)
                 });
         }
@@ -522,6 +542,7 @@ impl StagedKernels {
                 "the bounces and dielectric depth give paths more rounds than MAX_ROUNDS",
             ));
         }
+        let may = may | source.may();
         let walks = root.features & FEATURE_WALK != 0 && memory.walks.is_some();
         let stages = source.stages(walks);
         let set = match self.covering(may, &stages) {

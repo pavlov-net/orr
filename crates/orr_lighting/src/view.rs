@@ -1275,7 +1275,7 @@ impl CompilingKernels {
             support: SupportKernels::assemble(&self.device, self.kernels, support)?,
             _tables: self.tables.clone(),
         };
-        out.attach(&self.loading);
+        out.attach(&self.device, &self.loading);
         Ok(out)
     }
 }
@@ -1452,15 +1452,16 @@ impl LightingKernels {
         }
     }
 
-    /// Compiles the path kernels' later pipelines as jobs on `loading` from here on, and queues
+    /// Compiles the path kernels' later pipelines on `device` as jobs on `loading` from here on,
+    /// whatever device the kernels were made on (one that only reads its caches, say), and queues
     /// there the ones that take minutes on a first run and that paths do without until they
     /// are ready: the staged loop's tail stage, and the single kernels of the update paths and
     /// the photons. Until those finish the stages run every path to its end, which costs time
     /// and changes no image. [`CompilingKernels::finish`] calls it; kernels from [`Self::new`]
     /// compile their later pipelines on the calling thread until this call.
-    pub fn attach(&self, loading: &Arc<Loading>) {
+    pub fn attach(&self, device: &Device, loading: &Arc<Loading>) {
         if let PathKernels::Staged(k) = &self.paths {
-            k.stages.attach(loading);
+            k.stages.attach(device, loading);
             // The update paths' kernel is a compute kernel: nothing of theirs gains by reordering.
             k.stages
                 .start_late(&k.update, |d, kernels| (UPDATE.compile)(d, kernels, false));
@@ -1487,18 +1488,19 @@ impl LightingKernels {
         };
         let caustics = gathers_caustics(scene, lighting);
         let may = PathMay::new(features, lighting, caustics);
-        let mut wanted = may.view;
+        let mut wanted = may.view | Source::View.may();
         let mut stages = Source::View.stages(features.contains(SceneFeatures::WALKING));
         if dof_background {
+            wanted |= Source::Background.may();
             stages.push(Stage::Background);
         }
         // The stages run the update paths and the photons until their own kernels are ready.
         if lighting.reference.is_none() && k.update.get().is_none() {
-            wanted |= may.update;
+            wanted |= may.update | Source::Update.may();
             stages.push(Stage::Update);
         }
         if caustics && k.photons.get().is_none() {
-            wanted |= may.photons;
+            wanted |= may.photons | Source::Photon.may();
             stages.push(Stage::Photon);
         }
         k.stages.prepare(wanted, &stages)

@@ -17,6 +17,12 @@ public static const uint MAY_STACK = 1 << 0;
 public static const uint MAY_DISPERSION = 1 << 1;
 // `PathRoot.caustics` may be set: surfaces chain, vertices gather the photons' light.
 public static const uint MAY_CAUSTICS = 1 << 2;
+// The paths may be a view's, its background layer's, the world cache's update paths or caustic
+// photons (`PathRoot.source`): a pipeline holds the record of each source it may run.
+public static const uint MAY_VIEW = 1 << 3;
+public static const uint MAY_BACKGROUND = 1 << 4;
+public static const uint MAY_UPDATE = 1 << 5;
+public static const uint MAY_PHOTON = 1 << 6;
 
 public bool may(uint bit)
 {

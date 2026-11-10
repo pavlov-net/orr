@@ -345,7 +345,7 @@ impl Lighting {
             if let Ok(kernels) =
                 LightingKernels::new(&cached, self.kernels, &self.tables, self.entry)
             {
-                kernels.attach(loading);
+                kernels.attach(gpu, loading);
                 self.paths = Paths::Ready(Box::new(kernels));
                 return;
             }

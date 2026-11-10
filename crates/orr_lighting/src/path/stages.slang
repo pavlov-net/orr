@@ -88,6 +88,31 @@ bool spectral_tracked(PathRoot r)
     return may(MAY_DISPERSION) && (r.features & FEATURE_DISPERSION) != 0;
 }
 
+// Whether the paths of `r` are of `source`, which the pipeline may not run at all.
+bool from_view(PathRoot r) { return may(MAY_VIEW) && r.source == PATH_SOURCE_VIEW; }
+bool from_background(PathRoot r) { return may(MAY_BACKGROUND) && r.source == PATH_SOURCE_BACKGROUND; }
+bool from_update(PathRoot r) { return may(MAY_UPDATE) && r.source == PATH_SOURCE_UPDATE; }
+bool from_photon(PathRoot r) { return may(MAY_PHOTON) && r.source == PATH_SOURCE_PHOTON; }
+
+// `r` with what the pipeline's paths cannot meet (`may`) written into it, which changes no
+// value and lets the compiler see it: a pipeline that runs one source knows its source.
+PathRoot specialized(PathRoot r)
+{
+    bool view = may(MAY_VIEW);
+    bool background = may(MAY_BACKGROUND);
+    bool update = may(MAY_UPDATE);
+    bool photon = may(MAY_PHOTON);
+    if (view && !background && !update && !photon)
+        r.source = PATH_SOURCE_VIEW;
+    if (!view && background && !update && !photon)
+        r.source = PATH_SOURCE_BACKGROUND;
+    if (!view && !background && update && !photon)
+        r.source = PATH_SOURCE_UPDATE;
+    if (!view && !background && !update && photon)
+        r.source = PATH_SOURCE_PHOTON;
+    return r;
+}
+
 // `PathLoop.flags`. The bits from LOOP_KEY_SHIFT up hold the coherence key of the pending vertex.
 static const uint LOOP_KEY_SHIFT = 16;
 static const uint LOOP_CAMERA = 1 << 0;        // the path has no vertex yet: its ray is the camera ray
@@ -369,7 +394,11 @@ void store_record<T>(PathStages* st, uint slot, T value)
 // The record of a staged path, in its slot of `PathStages.records`, by the root's source.
 public struct StagedRecord : IPathRecord
 {
-    public uint source;
+    // What the root's source is among those the pipeline may run.
+    public bool view;
+    public bool background;
+    public bool update;
+    public bool caustic;
     public PathStages* st;
     public uint slot;
     // The tail stage's: the finish stage sees the path's end, which leaves its layer count here.
@@ -378,14 +407,14 @@ public struct StagedRecord : IPathRecord
 
     bool view_record()
     {
-        return source == PATH_SOURCE_VIEW || source == PATH_SOURCE_BACKGROUND;
+        return view || background;
     }
 
     public bool may_end(uint scattered, bool diffuse, bool wide, bool last)
     {
-        if (source == PATH_SOURCE_UPDATE)
+        if (update)
             return scattered >= 2;
-        if (source == PATH_SOURCE_PHOTON)
+        if (caustic)
             return false;
         return scattered >= 1 && (diffuse || wide || last);
     }
@@ -397,22 +426,22 @@ public struct StagedRecord : IPathRecord
 
     public bool adjoint()
     {
-        return source == PATH_SOURCE_PHOTON;
+        return caustic;
     }
 
     public bool photon()
     {
-        return source == PATH_SOURCE_PHOTON;
+        return caustic;
     }
 
     public bool spectral()
     {
-        return source != PATH_SOURCE_UPDATE;
+        return !update;
     }
 
     public bool particles()
     {
-        return source != PATH_SOURCE_UPDATE;
+        return !update;
     }
 
     [mutating]
@@ -428,7 +457,7 @@ public struct StagedRecord : IPathRecord
     [mutating]
     public void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng)
     {
-        if (source != PATH_SOURCE_UPDATE)
+        if (!update)
             return;
         CacheUpdate u = load_record<CacheUpdate>(st, slot);
         u.vertex(r, x, b, throughput, radiance, rng);
@@ -438,7 +467,7 @@ public struct StagedRecord : IPathRecord
     [mutating]
     public void deposit(PathRoot r, LayerVertex l, Bsdf b, float3 flux, inout Sampler rng)
     {
-        if (source != PATH_SOURCE_PHOTON)
+        if (!caustic)
             return;
         CausticPhoton c = load_record<CausticPhoton>(st, slot);
         c.deposit(r, l, b, flux, rng);
@@ -469,12 +498,12 @@ public struct StagedRecord : IPathRecord
             p.finish(r, radiance, count);
             store_record(st, slot, p);
         }
-        else if (source == PATH_SOURCE_UPDATE)
+        else if (update)
         {
             CacheUpdate u = load_record<CacheUpdate>(st, slot);
             u.finish(r, radiance, count);
         }
-        else
+        else if (caustic)
         {
             CausticPhoton c = load_record<CausticPhoton>(st, slot);
             c.finish(r, radiance, count);
@@ -485,7 +514,10 @@ public struct StagedRecord : IPathRecord
 StagedRecord staged_record(PathRoot r, uint slot)
 {
     StagedRecord record;
-    record.source = r.source;
+    record.view = from_view(r);
+    record.background = from_background(r);
+    record.update = from_update(r);
+    record.caustic = from_photon(r);
     record.st = r.stages;
     record.slot = slot;
     record.tail = false;
@@ -553,7 +585,7 @@ bool iteration_runs(PathRoot r, PathLoop p, uint kind, bool alive)
 // any other goes to the pass's finish stage.
 void finish_path(PathRoot r, uint slot, PathFixed f, PathLoop p)
 {
-    if (r.source == PATH_SOURCE_VIEW && !any(p.sky > 0.0) && !has(f.flags, FIXED_TWO_PASSES))
+    if (from_view(r) && !any(p.sky > 0.0) && !has(f.flags, FIXED_TWO_PASSES))
     {
         float pre_exposure = r.view.exposure[r.view.exposure_slot].pre_exposure;
         view_outputs(r, slot, f, p, p.exposed + pre_exposure * p.radiance);
@@ -675,8 +707,9 @@ void begin_path(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler rng
 // The view's primary stage: the path of the slice's `lane`th
 // pixel as `view_body` starts it, its camera ray to the trace stage, or its first vertex on the
 // G-buffer's surface shaded here, from state no stage stored.
-public void primary_stage<S : ISurface, M : IMedium>(PathRoot r, uint lane)
+public void primary_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
 {
+    PathRoot r = specialized(root);
     uint2 extent = r.gbuffer.extent;
     uint index = r.slice_base + lane;
     if (lane >= r.slice_count || index >= extent.x * extent.y)
@@ -723,8 +756,9 @@ public void primary_stage<S : ISurface, M : IMedium>(PathRoot r, uint lane)
 
 // The background layer's path of the slice's `lane`th pixel, as `background_texel` starts it,
 // or its texel where the pixel is not marked.
-public void background_start(PathRoot r, uint lane)
+public void background_start(PathRoot root, uint lane)
 {
+    PathRoot r = specialized(root);
     uint2 extent = r.gbuffer.extent;
     uint index = r.slice_base + lane;
     if (lane >= r.slice_count || index >= extent.x * extent.y)
@@ -745,8 +779,9 @@ public void background_start(PathRoot r, uint lane)
 }
 
 // The update path of the slice's `lane`th block, as `update_body` starts it.
-public void update_start<S : ISurface>(PathRoot r, uint lane)
+public void update_start<S : ISurface>(PathRoot root, uint lane)
 {
+    PathRoot r = specialized(root);
     uint n = r.update_block;
     uint2 extent = r.gbuffer.extent;
     uint2 blocks = (extent + n - 1) / n;
@@ -766,8 +801,9 @@ public void update_start<S : ISurface>(PathRoot r, uint lane)
 }
 
 // Caustic photon `r.slice_base + lane`, as `photon_body` starts it.
-public void photon_start_stage<S : ISurface, M : IMedium>(PathRoot r, uint lane)
+public void photon_start_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
 {
+    PathRoot r = specialized(root);
     uint index = r.slice_base + lane;
     if (lane >= r.slice_count || index >= r.caustics.photon_count || !(r.caustics.source.total > 0.0))
         return;
@@ -924,8 +960,9 @@ void medium_vertex(PathRoot r, uint slot, PathFixed f, inout PathLoop p, PathPen
 // the last shade stage started, its emission in front of its hit, the interior or medium
 // segment it crosses and an interior's walk, and what a miss finds; then the path goes to the
 // stage of the vertex the ray reached.
-public void trace_stage<S : ISurface, M : IMedium>(PathRoot r, uint lane)
+public void trace_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
 {
+    PathRoot r = specialized(root);
     PathStages* st = r.stages;
     uint slot;
     if (!queued_slot(r, QUEUE_TRACE, round_now(r), lane, slot))
@@ -1652,8 +1689,9 @@ void leave_shade(PathRoot r, uint slot, PathFixed f, inout PathLoop p, ShadeStat
 // vertex the trace stage reached, the end of its iteration, and the next iteration up to its
 // ray, which the trace stage traces, or its walk, which the walk stage runs. `C` names its
 // coherence point, before anything of the vertex is loaded.
-public void shade_stage<C : ICoherence, S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint lane)
+public void shade_stage<C : ICoherence, S : ISurface, M : IMedium, let K : uint>(PathRoot root, uint lane)
 {
+    PathRoot r = specialized(root);
     PathStages* st = r.stages;
     uint slot;
     if (!queued_slot(r, K, round_now(r), lane, slot))
@@ -1736,8 +1774,9 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, 
 
 // The walk stage: the subsurface walk an opaque vertex started, its exit vertex and that
 // vertex's iteration up to its ray, with the shadow rays of both vertices.
-public void walk_stage<S : ISurface, M : IMedium>(PathRoot r, uint lane)
+public void walk_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
 {
+    PathRoot r = specialized(root);
     PathStages* st = r.stages;
     uint slot;
     if (!queued_slot(r, QUEUE_WALK, round_now(r), lane, slot))
@@ -1838,8 +1877,9 @@ public void walk_stage<S : ISurface, M : IMedium>(PathRoot r, uint lane)
 // The tail stage: each path the trace queue of the root's round still holds, to its end in
 // `trace_path`'s loop from the trace it waits for, past the shadow ray its last vertex left;
 // then the pass's finish queue.
-public void tail_stage<S : ISurface, M : IMedium>(PathRoot r, uint lane)
+public void tail_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
 {
+    PathRoot r = specialized(root);
     PathStages* st = r.stages;
     uint slot;
     if (!queued_slot(r, QUEUE_TRACE, round_now(r), lane, slot))
@@ -1896,8 +1936,9 @@ public void tail_stage<S : ISurface, M : IMedium>(PathRoot r, uint lane)
 
 // The finish stage: the record of each path of the pass sees its end, and its source takes its
 // radiance.
-public void finish_stage<S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint lane)
+public void finish_stage<S : ISurface, E : IEnvironment, M : IMedium>(PathRoot root, uint lane)
 {
+    PathRoot r = specialized(root);
     PathStages* st = r.stages;
     uint slot;
     if (!queued_slot(r, QUEUE_FINISH, round_pass(r), lane, slot))
@@ -1906,9 +1947,9 @@ public void finish_stage<S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r
     PathLoop p = load_loop(st, slot);
     StagedRecord record = staged_record(r, slot);
     record.finish(r, p.radiance, p.layers);
-    if (r.source == PATH_SOURCE_VIEW)
+    if (from_view(r))
         view_finish<S, E, M>(r, slot, f, p);
-    else if (r.source == PATH_SOURCE_BACKGROUND)
+    else if (from_background(r))
         background_finish<E, M>(r, slot, f, p);
 }
 
