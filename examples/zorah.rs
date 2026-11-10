@@ -606,6 +606,29 @@ impl Readout {
             cuts.candidates_dropped,
             cuts.nodes_dropped,
         );
+        let memory = device().memory_report();
+        let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
+        for h in memory.heaps.iter().filter(|h| h.device_local) {
+            self.text += &format!(
+                "
+device memory: {:.2} GiB used of {:.2} budget ({:.2} heap), {:.2} in blocks",
+                gib(h.usage),
+                gib(h.budget),
+                gib(h.size),
+                gib(h.block_bytes)
+            );
+        }
+        let kinds: Vec<String> = orr::orr_gpu::MemoryKind::ALL
+            .iter()
+            .zip(&memory.kinds)
+            .filter(|(_, u)| u.bytes > 0)
+            .map(|(k, u)| format!("{k:?} {:.2} GiB in {}", gib(u.bytes), u.allocations))
+            .collect();
+        self.text += &format!(
+            "
+allocated: {}",
+            kinds.join(", ")
+        );
         if std::env::var_os("ZORAH_LOG_READOUT").is_some() {
             log::info!("readout\n{}", self.text);
         }
