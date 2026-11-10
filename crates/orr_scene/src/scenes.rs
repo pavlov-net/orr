@@ -1208,7 +1208,12 @@ impl Core {
         } else {
             SceneFeatures::NONE
         };
-        self.materials.features() | fades
+        let streams = if self.mounts.streaming.streamed() {
+            SceneFeatures::STREAMED_TEXTURES
+        } else {
+            SceneFeatures::NONE
+        };
+        self.materials.features() | fades | streams
     }
 
     fn write_chain(&mut self, model: ModelId, chain: &[(ModelId, f32)]) {

@@ -659,7 +659,7 @@ public struct FeedbackSurface<S : ISurface> : ISurface
 {
     public static GSurface surface(SurfaceInput i, out float depth_offset)
     {
-        if (i.context.feedback)
+        if (may2(MAY2_STREAMS) && i.context.feedback)
             S.feedback(i);
         return S.surface(i, depth_offset);
     }
@@ -698,7 +698,7 @@ public struct CoverageFeedback<S : ISurface> : ISurface
 
     public override static float coverage(SurfaceInput i)
     {
-        if (i.context.feedback)
+        if (may2(MAY2_STREAMS) && i.context.feedback)
             S.coverage_feedback(i);
         return S.coverage(i);
     }
@@ -715,7 +715,7 @@ public struct CoverageFeedback<S : ISurface> : ISurface
 
     public override static float presence(SurfaceInput i)
     {
-        if (i.context.feedback)
+        if (may2(MAY2_STREAMS) && i.context.feedback)
             material_opacity_feedback(i);
         return S.presence(i);
     }

@@ -27,6 +27,8 @@ static const uint path_may2 = 0xffffffffu;
 public static const uint MAY2_VERTEX_COLORS = 1 << 0;
 // A material's texture slot may be tiled (TEXTURE_TILED).
 public static const uint MAY2_TILES = 1 << 1;
+// A texture may stream: its record holds a residency map.
+public static const uint MAY2_STREAMS = 1 << 2;
 // The scene may hold a decal.
 public static const uint MAY2_DECALS = 1 << 3;
 // The scene may hold a producer entry: geometry a hit reconstructs from a producer's buffers.
