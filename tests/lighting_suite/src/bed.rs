@@ -2610,9 +2610,11 @@ impl Paths {
         Self {
             kernels,
             loading,
-            // The beds' scenes are many and small: one set of pipelines runs them all.
+            // The beds' scenes are many and small: one set of pipelines runs them all, unless
+            // `ORR_TEST_SPECIALIZED` asks for the pipelines made for each scene, as a view's
+            // default is.
             settings: ViewLighting {
-                specialize: false,
+                specialize: std::env::var_os("ORR_TEST_SPECIALIZED").is_some(),
                 ..settings
             },
             dof_background: None,
