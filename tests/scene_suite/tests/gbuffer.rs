@@ -5565,16 +5565,20 @@ struct CutRead {
     counters: Vec<u32>,
     candidates: Vec<ClusterWork>,
     slots: Vec<SlotCutGpu>,
-    /// The gathered ray-tracing cut clusters: slot, cluster id.
+    /// The clusters of the ray-tracing cuts built this frame: the slot that built one,
+    /// cluster id.
     entries: Vec<[u32; 2]>,
 }
+
+/// `SlotCutGpu::rt_cut` of a slot tracing a cut built this frame.
+const RT_CUT_BUILT: u32 = 255;
 
 fn read_cut(view: &RasterView, slots: u32) -> CutRead {
     let root: SceneRoot = read_buffer(view.scene, 1)[0];
     let cut: CutGpu = read_buffer(root.cut, 1)[0];
-    let counters: Vec<u32> = read_buffer(cut.counters, 20);
+    let counters: Vec<u32> = read_buffer(cut.counters, 29);
     let n = counters[2].min(cut.candidate_capacity);
-    let e = counters[4].min(cut.entry_capacity);
+    let e = counters[5];
     CutRead {
         candidates: read_buffer(cut.candidates, u64::from(n.max(1)))[..n as usize].to_vec(),
         slots: read_buffer(cut.slots, u64::from(slots)),
@@ -5599,8 +5603,25 @@ impl CutRead {
     }
 
     /// The mesh clusters of `slot`'s gathered ray-tracing cut, by the cluster ids of the
-    /// mesh's resident `pages` from their `bases`.
-    fn ray(&self, m: &CpuMesh, slot: u32, pages: &[u64], bases: &[u32]) -> BTreeSet<u32> {
+    /// mesh's resident `pages` from their `bases`: the entries of the slot that built it, or
+    /// for a cut equal to a cached one, which builds nothing, `like`, which it must equal.
+    fn ray(
+        &self,
+        m: &CpuMesh,
+        slot: u32,
+        pages: &[u64],
+        bases: &[u32],
+        like: &BTreeSet<u32>,
+    ) -> BTreeSet<u32> {
+        let s = self.slots[slot as usize];
+        if s.rt_cut != RT_CUT_BUILT {
+            assert_eq!(
+                (s.rt_count, s.rt_hash),
+                (like.len() as u32, cut_hash(like)),
+                "slot {slot}'s gathered cut, which built nothing"
+            );
+            return like.clone();
+        }
         let count = |p: usize| {
             PageView::new(&m.pages[p], &m.header)
                 .unwrap()
@@ -5608,7 +5629,7 @@ impl CutRead {
         };
         self.entries
             .iter()
-            .filter(|e| e[0] == slot)
+            .filter(|e| e[0] == s.owner)
             .map(|e| {
                 let p = (0..pages.len())
                     .find(|&p| pages[p] != 0 && (bases[p]..bases[p] + count(p)).contains(&e[1]))
@@ -5830,6 +5851,14 @@ fn list_draws_cover_every_entry_once_past_a_row_and_a_draw() {
     assert_clean();
 }
 
+/// `CutGpu.counters` (`cut.slang`) of the gathered cuts that trace cached ones: past the
+/// admission, of a traversal that dropped nodes, holding no cluster.
+const CUT_FALLBACK: usize = 14;
+const CUT_LOST: usize = 26;
+const CUT_EMPTY: usize = 27;
+/// `SlotCutGpu::flags` of a slot that gathered its cut and traces its cached cut instead.
+const CUT_FELL_BACK: u32 = 32;
+
 #[test]
 fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_cluster_rule() {
     let _serial = serial();
@@ -5839,6 +5868,8 @@ fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_clust
             initial_traversal_nodes: 1,
             initial_candidate_items: 1,
             initial_visible_clusters: 1,
+            initial_rt_cut_clusters: 1,
+            initial_rt_cut_blas: 1,
             ..Budgets::default()
         },
         ..RendererDesc::default()
@@ -5847,7 +5878,8 @@ fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_clust
     let placed = place(&mut w, &items);
     let eye = Vec3::new(0.3, 1.2, 4.0);
     let target = Vec3::new(0.0, 0.0, -10.0);
-    // Per frame: nodes, candidate items, visible clusters and second-pass work dropped.
+    // Per frame: nodes, candidate items, visible clusters and second-pass work dropped, and
+    // gathered cuts tracing cached ones.
     let mut drops = Vec::new();
     let mut last = None;
     for frame in 1..=GROWTH_FRAMES + 3 {
@@ -5857,19 +5889,30 @@ fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_clust
             &Shot::at(eye.as_dvec3(), target.as_dvec3(), frame),
         );
         let c = read_cut(&g.view, placed.count).counters;
-        drops.push([c[8], c[9], g.counts[1], g.counts[2]]);
+        drops.push([
+            c[8],
+            c[9],
+            g.counts[1],
+            g.counts[2],
+            c[CUT_FALLBACK],
+            c[CUT_LOST],
+            c[CUT_EMPTY],
+        ]);
         last = Some(g);
     }
-    let clean = drops.iter().position(|d| *d == [0; 4]);
+    let clean = drops.iter().position(|d| *d == [0; 7]);
     assert!(
-        drops[0][..3].iter().all(|&d| d > 0) && clean.is_some_and(|f| f < GROWTH_FRAMES as usize),
+        drops[0][..3].iter().all(|&d| d > 0)
+            && clean
+                .is_some_and(|f| f < GROWTH_FRAMES as usize && drops[..f].iter().any(|d| d[4] > 0)),
         "drops by frame: {drops:?}"
     );
     assert!(
-        drops[clean.unwrap()..].iter().all(|d| *d == [0; 4]),
+        drops[clean.unwrap()..].iter().all(|d| *d == [0; 7]),
         "drops by frame: {drops:?}"
     );
     let cut = read_cut(&last.unwrap().view, placed.count);
+    let mut built = 0;
     for (slot, item) in items.iter().enumerate() {
         let slot = placed.ranges[slot].first;
         let m = CpuMesh::of(item.model);
@@ -5885,7 +5928,77 @@ fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_clust
             got.len(),
             want.len()
         );
+        // Ray tracing takes the raster's threshold, so the copy traces what it draws.
+        let (pages, bases, _) = mesh_pages(&w, w.model(item.model));
+        let ray = cut.ray(&m, slot, &pages, &bases, &got);
+        assert_eq!(ray, got, "{}: traced cut", item.model);
+        built += u32::from(cut.slots[slot as usize].rt_cut == RT_CUT_BUILT);
     }
+    assert!(built > 0, "no copy built its cut");
+    assert_clean();
+}
+
+/// Tilted grounds at growing distances, each cut over several levels, under tables of the
+/// built cuts that hold two BLAS and may not grow: the same copies build their cuts every
+/// frame of a still view, the nearest, and the farther ones trace cached cuts.
+#[test]
+fn past_tables_that_cannot_grow_the_farthest_copies_trace_cached_cuts_every_frame() {
+    let _serial = serial();
+    let mut w = World::with(&RendererDesc {
+        rt_merge_pixels: 0.0,
+        budgets: Budgets {
+            initial_rt_cut_blas: 2,
+            rt_cut_memory: PoolSize::Bytes(0),
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    });
+    let items: Vec<Item> = [-12.0f32, -20.0, -32.0, -48.0, -70.0]
+        .into_iter()
+        .enumerate()
+        .map(|(i, z)| Item {
+            model: "dag ground",
+            linear: Mat3::from_rotation_y(0.4 * i as f32)
+                * Mat3::from_rotation_x(0.25)
+                * Mat3::from_diagonal(Vec3::new(2.0, 1.0, 4.0)),
+            at: Vec3::new(3.0 * i as f32 - 6.0, -1.0, z),
+        })
+        .collect();
+    let placed = place(&mut w, &items);
+    let eye = DVec3::new(0.3, 1.2, 4.0);
+    let target = DVec3::new(0.0, 0.0, -10.0);
+    let mut sets = Vec::new();
+    for frame in 1..=8 {
+        let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+        if frame < 3 {
+            continue;
+        }
+        let cut = read_cut(&g.view, placed.count);
+        // Per copy that wanted a BLAS of its own: its distance and whether it built one.
+        let mut wanted: Vec<(f32, bool)> = placed
+            .ranges
+            .iter()
+            .map(|r| cut.slots[r.first as usize])
+            .filter(|s| s.rt_cut == RT_CUT_BUILT || s.flags & CUT_FELL_BACK != 0)
+            .map(|s| (s.rt_distance, s.rt_cut == RT_CUT_BUILT))
+            .collect();
+        wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let built = wanted.iter().filter(|c| c.1).count();
+        assert!(
+            built == 2 && wanted.len() > built,
+            "frame {frame}: copies by distance and whether they built: {wanted:?}"
+        );
+        assert!(
+            wanted[..built].iter().all(|c| c.1),
+            "frame {frame}: a farther copy built before a nearer one: {wanted:?}"
+        );
+        assert_eq!(cut.counters[CUT_FALLBACK] as usize, wanted.len() - built);
+        sets.push(wanted);
+    }
+    assert!(
+        sets.windows(2).all(|s| s[0] == s[1]),
+        "the copies that build change between frames: {sets:?}"
+    );
     assert_clean();
 }
 
@@ -6246,7 +6359,8 @@ fn stand_in(bytes: &Arc<[u8]>, paged: bool) {
         let hierarchy = resident.nodes.iter().all(|&r| r);
         let cut = read_cut(&g.view, placed.count);
         let raster = cut.raster(&m, slot);
-        let ray = cut.ray(&m, slot, &pages, &bases);
+        // Ray tracing takes the raster's threshold.
+        let ray = cut.ray(&m, slot, &pages, &bases, &raster);
         let what = format!(
             "paged {paged}, frame {frame}, {streamed} streamed pages and all node pages {hierarchy}, level {level}"
         );
@@ -6416,7 +6530,7 @@ fn settled_detail(pool: PoolSize) -> (f32, u64, u64) {
         let cut = read_cut(&g.view, placed.count);
         let raster = cut.raster(&m, slot);
         assert_whole(&m, &clusters, &raster, &format!("{what}: raster"));
-        let ray = cut.ray(&m, slot, &pages, &bases);
+        let ray = cut.ray(&m, slot, &pages, &bases, &raster);
         let (want, near) = rule_cut(
             &m,
             &clusters,

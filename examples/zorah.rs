@@ -385,8 +385,15 @@ fn budgets(pack: &Path) -> Budgets {
     Budgets {
         mesh_pages: fit(pages, defaults.mesh_pages),
         mesh_page_pool,
-        rt_cut_clusters: count("ZORAH_RT_CUT_CLUSTERS", defaults.rt_cut_clusters),
-        rt_cut_blas: count("ZORAH_RT_CUT_BLAS", defaults.rt_cut_blas),
+        initial_rt_cut_clusters: count("ZORAH_RT_CUT_CLUSTERS", defaults.initial_rt_cut_clusters),
+        initial_rt_cut_blas: count("ZORAH_RT_CUT_BLAS", defaults.initial_rt_cut_blas),
+        rt_cut_memory: std::env::var("ZORAH_RT_CUT_MIB").map_or(defaults.rt_cut_memory, |m| {
+            orr::PoolSize::Bytes(
+                m.parse::<u64>()
+                    .expect("ZORAH_RT_CUT_MIB is a count of MiB")
+                    << 20,
+            )
+        }),
         ..defaults
     }
 }
@@ -535,7 +542,7 @@ impl Readout {
         let rate = |n: f64| n / self.seconds;
         let dropped = |source| r.dropped_from(source);
         self.text = format!(
-            "{:.1} fps  {:.2} ms\ndetail x{:.3}, gathers x{:.3}, mesh pages {:.0} of {:.0} MiB wanted\nmesh pages {}\ntextures {}\ninstance pages {}\nCLAS {:.0} / {:.0} MiB used, {:.0} retries/s, range full {} times, cluster ids full {} times\nread {:.0} MiB/s, {:.0} loads/s landed\n{} loads  {} evictions  {} failed  {} out of memory  {} pages over budget\ndropped: {} traversal, {} finer cuts, {} textures, {} instance pages, {} hints\n{} waiting  longest closure {}\nfeedback lost: {} requests, {} texture raises\nray cuts: {} gathered ({} cached, {} shared, {} fell back), {} merged, {} BLAS built of {} CLAS, {} clusters dropped\nraster: {} candidate items, {} dropped, {} nodes dropped",
+            "{:.1} fps  {:.2} ms\ndetail x{:.3}, gathers x{:.3}, mesh pages {:.0} of {:.0} MiB wanted\nmesh pages {}\ntextures {}\ninstance pages {}\nCLAS {:.0} / {:.0} MiB used, {:.0} retries/s, range full {} times, cluster ids full {} times\nread {:.0} MiB/s, {:.0} loads/s landed\n{} loads  {} evictions  {} failed  {} out of memory  {} pages over budget\ndropped: {} traversal, {} finer cuts, {} textures, {} instance pages, {} hints\n{} waiting  longest closure {}\nfeedback lost: {} requests, {} texture raises\nray cuts: {} gathered ({} cached, {} shared, {} fell back, {} past a full queue, {} empty), {} merged, {} BLAS built of {} CLAS; wanted {} BLAS of {} CLAS, tables hold {} BLAS of {} CLAS in {:.1} MiB\nraster: {} candidate items, {} dropped, {} nodes dropped",
             f64::from(self.frames) / self.seconds,
             self.seconds * 1000.0 / f64::from(self.frames),
             detail.memory_scale,
@@ -570,10 +577,16 @@ impl Readout {
             cuts.rt_cached,
             cuts.rt_shared,
             cuts.rt_fallback,
+            cuts.rt_lost,
+            cuts.rt_empty,
             cuts.rt_merged,
             cuts.rt_built,
             cuts.rt_built_clas,
-            cuts.rt_clusters_dropped,
+            cuts.rt_wanted_blas,
+            cuts.rt_wanted_clas,
+            cuts.rt_blas_capacity,
+            cuts.rt_clas_capacity,
+            mib(cuts.rt_table_bytes),
             cuts.candidate_items,
             cuts.candidates_dropped,
             cuts.nodes_dropped,

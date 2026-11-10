@@ -58,6 +58,11 @@ impl Capacity {
         self.wanted
     }
 
+    /// What the list's memory holds.
+    pub(crate) fn held(&self) -> u32 {
+        self.held
+    }
+
     /// [`Self::wanted`], when it differs from what the memory holds.
     pub(crate) fn resize(&self) -> Option<u32> {
         (self.wanted != self.held).then_some(self.wanted)

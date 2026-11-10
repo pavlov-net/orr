@@ -123,13 +123,18 @@ pub struct Budgets {
     /// side for in a frame, at most: those of the largest projected errors. The others wait
     /// for a later frame.
     pub traversal_requests: u32,
-    /// Clusters of the ray-tracing cuts a scene's traversal gathers in a frame, and CLAS
-    /// that frame's cluster BLAS take. A scene's gathered cuts coarsen evenly while the
-    /// frames want more; until they have, copies past it trace a cached cut. Above 0.
-    pub rt_cut_clusters: u32,
-    /// Cluster BLAS a scene builds in a frame for the cuts of copies near the focus; copies
-    /// past it trace a cached cut.
-    pub rt_cut_blas: u32,
+    /// CLAS the cluster BLAS a scene builds in a frame for the ray-tracing cuts its traversal
+    /// gathers take at first, and those BLAS. Their tables and arenas grow to what completed
+    /// frames wanted within `rt_cut_memory`. While a frame wants more than they hold, the
+    /// copies nearest the focus build theirs and the farther ones trace cached cuts, the same
+    /// copies every frame of a still view. Above 0.
+    pub initial_rt_cut_clusters: u32,
+    pub initial_rt_cut_blas: u32,
+    /// Device memory a scene's tables of built ray-tracing cuts and their BLAS arenas grow
+    /// to at most; the first sizes take what they take. Past it the gathered cuts coarsen
+    /// evenly until their CLAS fit ([`DetailStats::rt_scale`]), and builds past what fits
+    /// leave the farthest copies their cached cuts.
+    pub rt_cut_memory: PoolSize,
     /// Triangles of edited clusters whose CLAS rebuild in one frame, at most; a first edit
     /// past it still rebuilds alone.
     pub edit_triangles: u32,
@@ -199,8 +204,9 @@ impl Default for Budgets {
             initial_candidate_items: 1 << 18,
             initial_traversal_nodes: 1 << 18,
             traversal_requests: 4096,
-            rt_cut_clusters: 1 << 18,
-            rt_cut_blas: 1024,
+            initial_rt_cut_clusters: 1 << 18,
+            initial_rt_cut_blas: 1024,
+            rt_cut_memory: PoolSize::HeapPercent(10),
             edit_triangles: 1 << 18,
             stream_clas_triangles: 1 << 18,
             micromap_pages: 64,
@@ -352,7 +358,8 @@ pub struct DetailStats {
     /// detail.
     pub memory_scale: f32,
     /// The largest further scale of the ray-tracing threshold of gathered cuts in its scenes,
-    /// from the clusters they wanted against [`Budgets::rt_cut_clusters`].
+    /// from the CLAS they wanted against what their tables hold once those can grow no
+    /// further ([`Budgets::rt_cut_memory`]).
     pub rt_scale: f32,
     /// What the mesh page pool was asked for at the frame's detail: its pinned, locked and
     /// loading pages, and those the frame read or requested with what they depend on, whether
@@ -504,7 +511,10 @@ impl Scenes {
             b.resident_cluster_bytes > 0,
             "resident_cluster_bytes is above 0"
         );
-        assert!(b.rt_cut_clusters > 0, "rt_cut_clusters is above 0");
+        assert!(
+            b.initial_rt_cut_clusters > 0 && b.initial_rt_cut_blas > 0,
+            "initial_rt_cut_clusters and initial_rt_cut_blas are above 0"
+        );
         let pools = PoolBytes::new(device, b);
         // Cluster ids are 32 bits.
         let clusters = u32::try_from(pools.mesh / b.resident_cluster_bytes).unwrap_or(u32::MAX);
@@ -1644,12 +1654,14 @@ impl<'a> Frame<'a> {
             let producers = cpu.producers.iter().any(Option::is_some);
             let tlas = cpu.ptlas.tlas(device, core.fif, producers)?;
             if cpu.cuts.is_none() {
+                let heap = device.memory_report().heap_of(MemoryKind::DeviceLocal).size;
                 let sizes = CutSizes {
                     slots: scene.desc.instance_capacity,
                     queue: core.budgets.initial_traversal_nodes,
                     candidates: core.budgets.initial_candidate_items,
-                    rt_clusters: core.budgets.rt_cut_clusters,
-                    rt_blas: core.budgets.rt_cut_blas,
+                    rt_clas: core.budgets.initial_rt_cut_clusters,
+                    rt_blas: core.budgets.initial_rt_cut_blas,
+                    rt_bytes: core.budgets.rt_cut_memory.bytes(heap),
                     models: core.budgets.models,
                     entries: core.budgets.mesh_pages,
                     requests: core.budgets.traversal_requests,
@@ -2073,7 +2085,6 @@ impl<'a> Frame<'a> {
                 merge_pixels: core.rt_merge_pixels,
                 slots: cpu.ptlas.high_water,
                 passes: hierarchy.depth,
-                max_clas: hierarchy.max_clusters,
                 parted_edits: core.mounts.has_parted_edit(),
                 slot: (self.id % u64::from(core.fif)) as usize,
             };

@@ -11,6 +11,10 @@ public static const uint CUT_TRAVERSED = 2;     // the traversal gathered its ra
 public static const uint CUT_DISTANT = 4;       // it traces its model's merged cut
 public static const uint CUT_OWNER = 8;         // it builds the BLAS its equal cuts share
 public static const uint CUT_PARTS = 16;        // its gathered cut builds a body BLAS and one per animated part
+public static const uint CUT_FELL_BACK = 32;    // it gathered a cut and traces its cached cut instead
+
+// `SlotCutGpu.rt_key` of a slot whose cut has no entry in the table of equal cuts.
+public static const uint NO_KEY = 0xffffffff;
 
 // A copy keeps its ray-tracing range, and its cached cut, within this factor.
 public static const float RT_HYSTERESIS = 1.15;
@@ -31,17 +35,17 @@ public struct ClusterWork
 public static const uint CUT_QUEUE = 0;               // two: items in each queue
 public static const uint CUT_CANDIDATES = 2;          // raster candidate items asked for, past capacity too
 public static const uint CUT_CANDIDATE_CLUSTERS = 3;  // clusters in them
-public static const uint CUT_ENTRIES = 4;             // ray-tracing cut clusters gathered, past capacity too
+public static const uint CUT_ENTRIES = 4;             // ray-tracing cut clusters gathered
 public static const uint CUT_CLAS = 5;                // CLAS addresses handed to BLAS builds
 public static const uint CUT_JOBS = 6;                // cluster BLAS built this frame
 public static const uint CUT_NODES = 7;               // hierarchy nodes visited
 public static const uint CUT_NODES_DROPPED = 8;       // nodes past the queue's capacity or the last pass
 public static const uint CUT_CANDIDATES_DROPPED = 9;  // candidate items past capacity
-public static const uint CUT_ENTRIES_DROPPED = 10;    // cut clusters past capacity
+public static const uint CUT_CLAS_WANTED = 10;        // CLAS the cuts the gathers would build take, admitted or not
 public static const uint CUT_TRAVERSED_SLOTS = 11;    // slots whose ray-tracing cut was gathered
 public static const uint CUT_CACHED = 12;             // of them, equal to a cached cut
 public static const uint CUT_SHARED = 13;             // of them, sharing another slot's BLAS
-public static const uint CUT_FALLBACK = 14;           // of them, past the BLAS budget: a cached cut
+public static const uint CUT_FALLBACK = 14;           // of them, past the admitted distance: a cached cut
 public static const uint CUT_MERGED = 15;             // slots tracing their model's merged cut
 public static const uint CUT_REQUESTS = 16;           // pages and finer cuts wanted
 public static const uint CUT_FEEDBACK = 17;           // of the wanted, those kept in `feedback`
@@ -51,7 +55,17 @@ public static const uint CUT_FEEDBACK_ROOM = 20;      // the requests of that bu
 public static const uint CUT_FEEDBACK_TAKEN = 21;     // the requests of that bucket seen so far
 public static const uint CUT_QUEUE_PEAK = 22;         // the most items a pass's queue was asked to hold, past capacity too
 public static const uint CUT_ENTRIES_FIXED = 23;      // of CUT_ENTRIES, those a coarser threshold keeps
-public static const uint CUT_COUNTERS = 24;
+public static const uint CUT_JOBS_WANTED = 24;        // BLAS builds those cuts take, admitted or not; a parted cut's at most
+public static const uint CUT_KEYS = 25;               // slots asking the table of equal cuts for an entry
+public static const uint CUT_LOST = 26;               // gathering slots of a traversal that dropped nodes: a cached cut
+public static const uint CUT_EMPTY = 27;              // gathering slots whose cut holds no cluster
+public static const uint CUT_ADMITTED = 28;           // the first distance bucket whose cuts are not built
+public static const uint CUT_COUNTERS = 29;
+
+// Distance buckets of the cuts' admission: the top bits of a distance's f32 bits, which order
+// like the distances they hold.
+public static const uint ADMIT_BUCKETS = 16384;
+public static const uint ADMIT_SHIFT = 17;
 
 // One instance slot's cuts this frame.
 public struct SlotCutGpu
@@ -61,11 +75,19 @@ public struct SlotCutGpu
     public uint rt_job;            // with RT_CUT_BUILT: the BLAS build it traces
     public uint rt_count;          // clusters in its gathered ray-tracing cut
     public uint2 rt_hash;          // order-free hash of those clusters
-    public uint rt_first;          // CUT_OWNER: its first CLAS address in `CutGpu.clas`
-    public uint rt_fill;           // CUT_OWNER: addresses written so far
+    public uint rt_first;          // CUT_OWNER: its first entry in `CutGpu.entries` and CLAS address in `clas`
+    public uint rt_fill;           // CUT_OWNER: entries written so far
     public uint owner;             // the slot whose BLAS it traces
     public uint far_cut;           // while its copy fades: the cached cut of its far step
     public uint rt_parts;          // CUT_PARTS with RT_CUT_BUILT: its body's entry in `part_lists`, each animated part's after it
+    // A gathering slot's: its cut's first entry in `keys` or NO_KEY; how far its model's bounds
+    // lie from the focus, which orders admission; and the error scale and cached-cut
+    // threshold `want_cut` takes should it trace a cached cut.
+    public uint rt_key;
+    public float rt_distance;
+    public float rt_scale;
+    public float rt_limit;
+    public uint _pad;
 }
 
 // A hierarchy node one traversal pass visits for a slot.
@@ -78,6 +100,7 @@ public struct NodeItem
 }
 
 // One cluster BLAS built this frame: `count` CLAS addresses at `first` in `CutGpu.clas`.
+// `first` also starts the cut's entries in `CutGpu.entries`, unless it builds by part.
 public struct BlasJob
 {
     public uint first;
@@ -94,14 +117,17 @@ public struct PartListGpu
     public uint job;
 }
 
-// A slot's gathered ray-tracing cut in the frame's table of equal cuts.
+// A gathered ray-tracing cut in the frame's table of equal cuts, which every slot with its
+// digest takes: the cut of the slot that took it first, which builds it.
 public struct CutKey
 {
     public uint2 hash;
     public uint count;
     public uint mesh;
-    public uint owner;             // slot + 1; 0 empty
-    public uint _pad;
+    public uint digest;            // a mix of the cut's key; 0 empty
+    public uint owner;             // the slot that took the entry first
+    public uint rank;              // f32 bits of the least `SlotCutGpu.rt_distance` of the cut's slots
+    public uint collided;          // nonzero when a slot of another cut has the digest
 }
 
 // Error buckets of the requests `feedback` keeps: the top bits of an error's f32 bits, which
@@ -122,8 +148,8 @@ public struct CutGpu
     public SlotCutGpu* slots;      // per instance slot
     public NodeItem* queue[2];
     public ClusterWork* candidates; // the raster candidate cut
-    public uint2* entries;         // ray-tracing cut clusters: slot, cluster id
-    public uint64_t* clas;         // CLAS addresses of the BLAS built this frame
+    public uint2* entries;         // clusters of the cuts built this frame, `clas_capacity`: slot, cluster id
+    public uint64_t* clas;         // CLAS addresses of the BLAS built this frame, `clas_capacity`
     public BlasJob* jobs;
     public uint64_t* job_blas;     // the built BLAS addresses, by job
     public CutKey* keys;           // `key_mask + 1` entries
@@ -142,14 +168,13 @@ public struct CutGpu
     public uint* wanted_errors;    // 32 per word of `wanted`
     public uint* histogram;        // FEEDBACK_BUCKETS: the wanted entries by error bucket
     public FeedbackGpu* feedback;
+    public uint* admit;            // ADMIT_BUCKETS pairs: the CLAS and BLAS builds the cuts take by distance bucket
     public uint queue_capacity;
     public uint candidate_capacity;
-    public uint entry_capacity;
     public uint clas_capacity;
-    public uint job_capacity;
+    public uint job_capacity;      // also of `part_lists`
     public uint key_mask;
     public uint model_capacity;
     public uint feedback_capacity;
-    public uint part_list_capacity;
     public uint feedback_words;    // of `touched` and `wanted`
 }

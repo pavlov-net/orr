@@ -2212,8 +2212,8 @@ pub(crate) struct Resident {
     meshes: Vec<u32>,
     /// Per mesh of `meshes`: what its section-mask BLAS build from.
     rt: Vec<MeshRt>,
-    /// Per mesh of `meshes`: the levels of its hierarchy (None when paged), and its clusters.
-    hierarchy: Vec<(Option<u32>, u32)>,
+    /// Per mesh of `meshes`: the levels of its hierarchy, None when paged.
+    hierarchy: Vec<Option<u32>>,
     /// Per mesh of `meshes`: what an edit starts from.
     edit_sources: Vec<EditMesh>,
     /// The record of each model.
@@ -2359,8 +2359,6 @@ fn record_page_copies(
 pub(crate) struct Hierarchy {
     /// Levels of the deepest hierarchy; paged ones count as `PAGED_DEPTH`.
     pub(crate) depth: u32,
-    /// Clusters of the largest resident mesh.
-    pub(crate) max_clusters: u32,
 }
 
 /// Capacities of the global model and mesh tables.
@@ -3416,9 +3414,8 @@ impl Mounts {
         let mut h = Hierarchy::default();
         for e in self.entries.iter().flatten() {
             let Entry::Ready(r) = e else { continue };
-            for &(depth, clusters) in &r.hierarchy {
+            for &depth in &r.hierarchy {
                 h.depth = h.depth.max(depth.unwrap_or(PAGED_DEPTH));
-                h.max_clusters = h.max_clusters.max(clusters);
             }
         }
         h
@@ -3798,7 +3795,7 @@ impl Mounts {
                 &m.refs,
             )?;
             res.rt.push(m.rt.clone());
-            res.hierarchy.push((m.depth, m.gpu.cluster_count));
+            res.hierarchy.push(m.depth);
             res.edit_sources.push(EditMesh {
                 gpu,
                 addresses: m.page_addresses.clone(),
