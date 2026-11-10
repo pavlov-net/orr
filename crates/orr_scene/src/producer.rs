@@ -889,7 +889,13 @@ pub(crate) fn build(
         producer: Producer {
             update: desc.update,
             smoke: desc.opacity == Opacity::Smoke,
-            features: desc.opacity.features(),
+            features: desc.opacity.features()
+                | crate::SceneFeatures::PRODUCERS
+                | if strands {
+                    crate::SceneFeatures::STRANDS
+                } else {
+                    crate::SceneFeatures::NONE
+                },
             max_clusters: desc.max_clusters,
             max_vertices: desc.max_vertices,
             max_segments: desc.max_segments,

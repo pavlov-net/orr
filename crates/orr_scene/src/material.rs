@@ -66,7 +66,7 @@ pub mod material_flags {
 }
 
 /// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
-const TILED: u32 = 1 << 10;
+pub(crate) const TILED: u32 = 1 << 10;
 /// `TEXTURE_UV_SET`, `TEXTURE_CHANNEL_SHIFT` and `TEXTURE_PRIMARIES_SHIFT`.
 const UV_SET: u32 = 1 << 11;
 const CHANNEL_SHIFT: u32 = 12;
@@ -387,7 +387,7 @@ impl MaterialTable {
     /// Returns `id` for reuse; its record stays until a new material overwrites it.
     pub(crate) fn free(&self, id: MaterialId) {
         self.extended.lock().unwrap().remove(&id.0);
-        self.features.lock().unwrap().set(id.0, SceneFeatures::NONE);
+        self.features.lock().unwrap().free(id.0);
         self.world_lengths.lock().unwrap().remove(&id.0);
         self.ids.lock().unwrap().free(id.0, 1);
     }

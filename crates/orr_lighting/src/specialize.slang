@@ -12,8 +12,9 @@
 // interface of kernels that are made without it.
 module specialize;
 
-// Whether the kernel's pipelines are made for a mask: the staged path kernels export true.
-public extern static const bool PATH_SPECIALIZES = false;
+// `PATH_SPECIALIZES`, which a kernel made for a mask exports, and the second word,
+// `path_may2`, for what orr_scene's surface and hit code may meet.
+__exported import orr_scene.scene_may;
 
 #ifdef ORR_UNSPECIALIZED
 // A build whose target has no specialization constants (the CPU tests') holds everything.

@@ -664,6 +664,13 @@ impl SceneCpu {
         for p in self.producers.iter().flatten().chain(retired) {
             out |= p.features;
         }
+        // The bins a frame's kernels read are remade from the list once it has changed.
+        if self.decals_changed || self.decal_globals > 0 || self.decal_bin_slots > 0 {
+            out |= crate::SceneFeatures::DECALS;
+        }
+        if self.hung || self.skinned_high_water > 0 {
+            out |= crate::SceneFeatures::SKINNING;
+        }
         out
     }
 }
@@ -712,6 +719,8 @@ pub(crate) struct SceneCpu {
     pub(crate) skinned: RangeAllocator,
     /// One past the highest skinned-copy entry handed out.
     pub(crate) skinned_high_water: u32,
+    /// A group has hung from a palette's joint.
+    pub(crate) hung: bool,
     skins: Vec<SkinRange>,
     /// Entry ranges and vertex arrays of removed skinned copies, freed once that frame has
     /// completed.
@@ -776,6 +785,7 @@ impl SceneCpu {
 
     /// Puts `group` at an id of [`Self::free_group`].
     fn put_group(&mut self, id: usize, group: Group) {
+        self.hung |= group.frame.is_some();
         if id == self.groups.len() {
             self.groups.push(Some(group));
         } else {
@@ -1199,6 +1209,7 @@ impl Scene {
                 cuts: None,
                 skinned: RangeAllocator::new(desc.skinned_capacity),
                 skinned_high_water: 0,
+                hung: false,
                 skins: Vec::new(),
                 skins_removed: Vec::new(),
                 skin_frame: None,
