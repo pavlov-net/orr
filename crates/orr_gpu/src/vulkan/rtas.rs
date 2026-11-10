@@ -228,7 +228,8 @@ impl Shared {
 
 impl Device {
     /// The memory `d` needs at most: the implicit result (or the PTLAS) and scratch. One
-    /// query sizes a whole batch.
+    /// query sizes a whole batch; for an [`RtasMode::Explicit`] build of CLAS or templates,
+    /// `result_max` is the most one of its results takes.
     pub fn rtas_sizes(&self, d: &RtasOpDesc) -> RtasSizes {
         let shared = &self.shared;
         shared.check_desc(d);

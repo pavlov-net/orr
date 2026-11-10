@@ -1247,7 +1247,7 @@ impl Streaming {
                     }
                     // The range is as large as the mesh page budget, but beside the CLAS that
                     // budget counts it holds those of evicted pages until their frees apply
-                    // and the scaled estimates of batches in flight: that budget alone shrinks.
+                    // and the pages reserved for batches: that budget alone shrinks.
                     Some(Shortfall::Range) => {
                         self.residency.range_full(ResidencyClass::MeshPages);
                     }
@@ -1286,8 +1286,8 @@ impl Streaming {
         points.extend(self.fine_step(frame, settled, loading, w)?);
         self.residency.react(w.device.memory_report().pressure());
         if let Some(c) = &self.clas {
-            let (bound, range_full) = c.report();
-            self.residency.note_clas_pool(bound, range_full);
+            let (bound, used, range_full) = c.end_step();
+            self.residency.note_clas_pool(bound, used, range_full);
         }
         self.moving.retain(|_, m| m.1 >= frame);
         let waiting: Vec<Key> = self.moving.keys().copied().collect();

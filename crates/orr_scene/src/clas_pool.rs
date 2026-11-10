@@ -12,11 +12,35 @@
 //! taken for unbinding by the kernel itself, only while wholly free, so an allocation the
 //! render thread has not seen yet never lands in a page it unbinds.
 //!
+//! Each batch reserves wholly free pages, and the pool binds and keeps pages by those
+//! reservations:
+//!
+//! - Placement. A run holds at most a page's units and takes the lowest free range that holds
+//!   it, so it starts at the start of a wholly free page or in a page that is not wholly free,
+//!   and leaves at most one wholly free page partly used: the lowest, and only when it does
+//!   not fit behind the units its batch placed in the one before. A batch whose runs leave at
+//!   most P wholly free pages partly used ([`most_pages`] of its builds' largest sizes) places
+//!   all its CLAS while P pages are wholly free as its allocations start. Before its builds it
+//!   reserves P wholly free bound pages beyond those of the batches before it that have not
+//!   been replayed, leaving out the pages asked to be taken, and binds unbound pages for what
+//!   is missing. Each of those batches leaves at most its own reservation partly used, and
+//!   frees and binds only add, so the P pages are there when its turn comes. A CLAS gets no
+//!   unit only when its batch's pool came up short ([`Shortfall`]) or [`ClasOrder::place`]
+//!   cannot place it.
+//! - Reuse. A replay, an abandon and the end of each render step ask to take the wholly free
+//!   pages, highest first, beyond the reservations in flight plus the most they came to in any
+//!   of the last [`RESERVE_STEPS`] steps. Streaming that keeps its pace finds its pages bound,
+//!   and a pool left idle, or with many CLAS freed, gives back its surplus within those steps.
+//! - Accounting. A page asked to be taken is not free for reservations, and a take the kernel
+//!   refuses, as a batch placed CLAS in the page meanwhile, returns it to the bound pages. A
+//!   reservation ends when its batch is replayed or abandoned.
+//!
 //! The render thread and the loading side share the pool's bookkeeping under a lock held only
 //! while one of them changes it. Page memory and binds, micromap storage and the build scratch
 //! are the loading side's: a batch holds them from its start to its submit, so batches take
 //! their ops in the order the loading queue runs them, the order they land and replay in.
 
+use std::collections::BTreeSet;
 use std::sync::{Mutex, MutexGuard};
 
 use orr_gpu::{
@@ -41,13 +65,14 @@ pub(crate) const UNIT: u64 = 128;
 const POOL_INIT: u32 = 1;
 const POOL_THREADS: usize = 256;
 pub(crate) const NO_UNIT: u32 = u32::MAX;
-/// Wholly free pages the pool keeps bound instead of unbinding.
-const RESERVE_PAGES: usize = 2;
+/// Render steps the pool keeps pages bound for the most its reservations came to in one: a
+/// burst of streaming that recurs within them binds no page again.
+const RESERVE_STEPS: usize = 64;
 /// Alignment of every region carved from the build scratch.
 const ALIGN: u64 = 256;
 
 /// Units the CLAS of `clusters` clusters of `triangles` triangles in all are taken to need
-/// before they are built, before the pool's scale.
+/// before they are built: a streamed mesh page's share of its budget before its first load.
 pub(crate) fn estimate(triangles: u32, clusters: u32) -> u64 {
     (u64::from(triangles) * 32 + u64::from(clusters) * 256).div_ceil(UNIT)
 }
@@ -55,6 +80,26 @@ pub(crate) fn estimate(triangles: u32, clusters: u32) -> u64 {
 /// The units a CLAS of `bytes` built bytes takes.
 fn units(bytes: u32) -> u32 {
     u64::from(bytes).div_ceil(UNIT) as u32
+}
+
+/// The most wholly free pages of `n` units that [`ClasOrder::place`] leaves partly used as it
+/// places `clas` CLAS in `groups` groups, when they take at most `units` units in all and
+/// `largest` each.
+fn most_pages(n: u32, groups: u32, clas: u32, units: u64, largest: u64) -> u32 {
+    // A run other than its group's last closes on a CLAS of at most `largest` units that it
+    // cannot hold, so it holds more than `n - largest` units, and with the run after it more
+    // than `n`. Per group, then, such runs number at most its units over `n - largest + 1`,
+    // and at most twice its units over `n + 1`. Sums of those quotients stay below the
+    // quotients of the sums, and each run holds a CLAS.
+    let (n, largest) = (u64::from(n), largest.min(u64::from(n)));
+    let pairs = units / (n + 1);
+    let closed = (units / (n - largest + 1)).min(2 * pairs);
+    let runs = (u64::from(groups) + closed).min(u64::from(clas));
+    // A run leaves at most one such page partly used, the lowest, and only when it does not fit
+    // behind the units the batch placed in the page before: those units and the run come to
+    // more than `n`. Taken two at a time, the pages account for more than `n` units a pair,
+    // with at most one page left over.
+    runs.min(2 * pairs + 1) as u32
 }
 
 /// The order the `allocate` kernel places a batch's CLAS in, by results index: per streamed
@@ -161,12 +206,13 @@ struct PoolOps {
     bound: Vec<u32>,
     frees: Vec<(u32, u32)>,
     takes: Vec<u32>,
-    estimate: u64,
-    /// Why the pool grew by fewer pages than the estimate needs.
+    /// The wholly free pages reserved for the batch's runs.
+    reserved: u32,
+    /// Why the pool holds fewer wholly free pages than the reservation needs.
     shortfall: Option<Shortfall>,
 }
 
-/// Why a batch's pool grew by fewer pages than its estimate needs.
+/// Why a batch's pool holds fewer wholly free pages than its reservation needs.
 #[derive(Debug)]
 pub(crate) enum Shortfall {
     /// The pages' memory ran out, with the allocation's error.
@@ -182,10 +228,6 @@ struct Started {
     binds: Vec<TimelinePoint>,
     /// Pages taken earlier, unbound with the batch's binds by [`ClasPool::grow`].
     unbinds: Vec<u32>,
-    /// Unbound pages the batch binds for its estimate.
-    grow: Vec<u32>,
-    /// Whether the estimate needs more pages than `grow` holds.
-    range_short: bool,
 }
 
 pub(crate) struct ClasPool {
@@ -200,18 +242,23 @@ pub(crate) struct ClasPool {
 
 /// The pool's bookkeeping, which the render thread changes as batches land and CLAS free.
 struct PoolState {
-    pages: Vec<(PageState, Option<PoolSlot>)>,
+    pages: Vec<PageState>,
     /// Pages with memory bound.
     bound: u32,
     /// Units in use per page, as of the last replayed batch.
     used: Vec<u32>,
+    /// Units in use in all, as of the last replayed batch.
+    used_units: u64,
+    /// The bound pages holding no CLAS and not asked to be taken, as of the last replayed
+    /// batch: the pages free for reservations.
+    whole: BTreeSet<u32>,
     reference: RangeAllocator,
-    /// Free units once every sent batch lands, less what their builds are taken to need.
-    room: i64,
-    /// What estimates are multiplied by: at least 1, raised when a landed batch built more
-    /// than its estimate, as a backend with larger CLAS does. An estimate below the built
-    /// sizes would bind too few pages for builds that retry until they fit.
-    scale: f64,
+    /// Pages reserved by batches not yet replayed or abandoned.
+    reserved: u32,
+    /// The most `reserved` came to in each of the last [`RESERVE_STEPS`] render steps, the
+    /// current step's at `step`.
+    peaks: [u32; RESERVE_STEPS],
+    step: usize,
     frees: Vec<(u32, u32)>,
     takes: Vec<u32>,
     unbinds: Vec<u32>,
@@ -230,6 +277,8 @@ struct PoolState {
 pub(crate) struct LoadingSide {
     /// Memory of the bound pages.
     backing: Pool,
+    /// Per pool page, its memory while bound.
+    slots: Vec<Option<PoolSlot>>,
     /// Storage of streamed pages' micromaps.
     micromaps: Pool,
     scratch: Option<Allocation<u8>>,
@@ -260,8 +309,6 @@ impl ClasPool {
         let pages = range.pages().min(named / range.page_size) as u32;
         let words = u64::from(pages) * u64::from(page_units / 32);
         let dl = MemoryKind::DeviceLocal;
-        let mut reference = RangeAllocator::new(pages * page_units);
-        reference.take(0, pages * page_units);
         Ok(Self {
             bits: device.gpu_malloc::<u32>(dl, words.max(1), "CLAS pool bits")?,
             summary: device.gpu_malloc::<[u32; 2]>(
@@ -269,24 +316,10 @@ impl ClasPool {
                 u64::from(pages.max(1)),
                 "CLAS pool runs",
             )?,
-            state: Mutex::new(PoolState {
-                pages: vec![(PageState::Unbound, None); pages as usize],
-                bound: 0,
-                used: vec![0; pages as usize],
-                reference,
-                room: 0,
-                scale: 1.0,
-                frees: Vec::new(),
-                takes: Vec::new(),
-                unbinds: Vec::new(),
-                unreported: Vec::new(),
-                unreported_binds: Vec::new(),
-                range_full: 0,
-                initialized: false,
-                micromap_frees: Vec::new(),
-            }),
+            state: Mutex::new(PoolState::new(pages, page_units)),
             side: Mutex::new(LoadingSide {
                 backing: Pool::new(dl, range.page_size, block, "CLAS pool pages"),
+                slots: vec![None; pages as usize],
                 micromaps: Pool::new(dl, 256, block, "streamed micromaps"),
                 scratch: None,
             }),
@@ -320,76 +353,53 @@ impl ClasPool {
     /// Whether a batch should run for the pool alone: frees, takes, unbinds or unreported
     /// pages wait.
     pub(crate) fn pending(&self) -> bool {
-        let s = self.state.lock().unwrap();
-        !s.frees.is_empty()
-            || !s.takes.is_empty()
-            || !s.unbinds.is_empty()
-            || !s.unreported.is_empty()
-            || !s.micromap_frees.is_empty()
+        self.state.lock().unwrap().pending()
     }
 
-    /// Bytes of the bound pages, and batches since the pool's start that needed more pages
-    /// than its range had unbound.
-    pub(crate) fn report(&self) -> (u64, u32) {
-        let s = self.state.lock().unwrap();
-        (u64::from(s.bound) * self.range.page_size, s.range_full)
-    }
-
-    /// Starts a batch whose builds are taken to need `estimate` units before the scale:
-    /// takes the frees, takes and pages to unbind queued since the last batch, and picks the
-    /// unbound pages it binds until the estimate fits. Frees the micromaps' storage queued.
-    fn start(&self, side: &mut LoadingSide, estimate: u64) -> Started {
-        let n = i64::from(self.page_units);
+    /// Ends the render thread's step: asks to take the wholly free pages the reservations no
+    /// longer keep. Returns the bytes of the bound pages and of the units holding CLAS, and
+    /// the batches since the pool's start that needed more pages than its range had unbound.
+    pub(crate) fn end_step(&self) -> (u64, u64, u32) {
         let mut s = self.state.lock().unwrap();
-        let estimate = (estimate as f64 * s.scale).ceil() as u64;
-        let frees: i64 = s.frees.iter().map(|&(_, c)| i64::from(c)).sum();
-        s.room += frees - n * s.takes.len() as i64 - estimate as i64;
-        let short = if s.room < 0 {
-            s.room.unsigned_abs().div_ceil(n as u64) as usize
-        } else {
-            0
-        };
-        let grow: Vec<u32> = (0..s.pages.len() as u32)
-            .filter(|&p| s.pages[p as usize].0 == PageState::Unbound)
-            .take(short)
-            .collect();
-        let mut ops = PoolOps {
-            init: !s.initialized,
-            bound: std::mem::take(&mut s.unreported),
-            frees: std::mem::take(&mut s.frees),
-            takes: std::mem::take(&mut s.takes),
-            estimate,
-            shortfall: None,
-        };
-        // Ascending, so each allocator thread finds those in its pages.
-        ops.takes.sort_unstable();
-        s.initialized = true;
-        let binds = std::mem::take(&mut s.unreported_binds);
-        let unbinds = std::mem::take(&mut s.unbinds);
+        s.end_step();
+        (
+            u64::from(s.bound) * self.range.page_size,
+            s.used_units * UNIT,
+            s.range_full,
+        )
+    }
+
+    /// Starts a batch: takes the frees, takes and pages to unbind queued since the last
+    /// batch, and frees the micromaps' storage queued.
+    fn start(&self, side: &mut LoadingSide) -> Started {
+        let mut s = self.state.lock().unwrap();
+        let started = s.start();
         let micromaps = std::mem::take(&mut s.micromap_frees);
         drop(s);
         for slot in micromaps {
             side.micromaps.free(slot);
         }
-        Started {
-            range_short: grow.len() < short,
-            ops,
-            binds,
-            unbinds,
-            grow,
-        }
+        started
     }
 
-    /// Binds the started batch's pages, as many as their memory allows, and unbinds the pages
-    /// taken earlier. On an error nothing is bound or unbound.
-    fn grow(&self, device: &Device, side: &mut LoadingSide, started: &mut Started) -> Result<()> {
+    /// Reserves `need` wholly free pages for the started batch, binds the unbound pages that
+    /// are missing, as many as their memory allows, and unbinds the pages taken earlier. On
+    /// an error nothing is bound or unbound, and [`ClasPool::abandon`] ends the reservation.
+    fn grow(
+        &self,
+        device: &Device,
+        side: &mut LoadingSide,
+        started: &mut Started,
+        need: u32,
+    ) -> Result<()> {
+        let (pages, range_short) = self.state.lock().unwrap().reserve(&mut started.ops, need);
         let mut slots: Vec<(u32, PoolSlot)> = Vec::new();
         let mut previous = None;
-        let mut shortfall = started.range_short.then_some(Shortfall::Range);
+        let mut shortfall = range_short.then_some(Shortfall::Range);
         // Short of pages or of memory for them, the batch goes on with what it got: its
         // unbinds and frees give memory back, and builds that find no room retry.
         let mut grown = Ok(());
-        for &page in &started.grow {
+        for &page in &pages {
             match side.backing.alloc(device, self.range.page_size, previous) {
                 Ok((slot, _)) => {
                     previous = Some(slot);
@@ -414,43 +424,29 @@ impl ClasPool {
                 return Err(e);
             }
         };
+        let bound: Vec<u32> = slots.iter().map(|&(p, _)| p).collect();
         let mut s = self.state.lock().unwrap();
-        let mut unbound = Vec::with_capacity(started.unbinds.len());
-        for p in started.unbinds.drain(..) {
-            let (_, slot) = std::mem::replace(&mut s.pages[p as usize], (PageState::Unbound, None));
-            unbound.extend(slot);
-        }
-        for &(page, slot) in &slots {
-            s.pages[page as usize] = (PageState::Bound, Some(slot));
-            s.used[page as usize] = 0;
-        }
-        s.bound = s.bound + slots.len() as u32 - unbound.len() as u32;
-        s.room += i64::from(self.page_units) * slots.len() as i64;
+        s.bind(&bound, &started.unbinds);
         s.range_full += u32::from(matches!(shortfall, Some(Shortfall::Range)));
         drop(s);
-        for slot in unbound {
+        for p in started.unbinds.drain(..) {
+            let slot = side.slots[p as usize]
+                .take()
+                .expect("a bound page's memory");
             side.backing.free(slot);
         }
-        started.ops.bound.extend(slots.iter().map(|&(p, _)| p));
+        for &(page, slot) in &slots {
+            side.slots[page as usize] = Some(slot);
+        }
+        started.ops.bound.extend(bound);
         started.binds.extend(point);
         started.ops.shortfall = shortfall;
         Ok(())
     }
 
-    /// Takes back a batch that was never submitted: its frees, takes and pages to unbind go
-    /// to the next batch, as do the pages it bound with their `binds`, and its estimate
-    /// returns to the room.
+    /// Takes back a batch that was never submitted: see [`PoolState::abandon`].
     fn abandon(&self, ops: PoolOps, binds: Vec<TimelinePoint>, unbinds: Vec<u32>) {
-        let n = i64::from(self.page_units);
-        let frees: i64 = ops.frees.iter().map(|&(_, c)| i64::from(c)).sum();
-        let mut s = self.state.lock().unwrap();
-        s.room += n * ops.takes.len() as i64 + ops.estimate as i64 - frees;
-        s.initialized &= !ops.init;
-        s.unreported.splice(0..0, ops.bound);
-        s.unreported_binds.splice(0..0, binds);
-        s.frees.splice(0..0, ops.frees);
-        s.takes.splice(0..0, ops.takes);
-        s.unbinds.splice(0..0, unbinds);
+        self.state.lock().unwrap().abandon(ops, binds, unbinds);
     }
 
     /// Unbinds `unbinds` and binds `slots`' pages to their slots.
@@ -577,19 +573,23 @@ impl ClasPool {
     }
 
     /// Replays a landed batch on the reference: its frees, takes and allocations, given
-    /// each CLAS's built size and the unit the kernel gave it, and each take's outcome.
-    /// Pages left wholly free beyond the reserve are asked to be taken by the next batch.
-    /// Returns each CLAS's first unit (or [`NO_UNIT`]) and unit count, and the staging slots
-    /// the batch held.
+    /// each CLAS's built size and the unit the kernel gave it, and each take's outcome, and
+    /// ends its reservation. Returns each CLAS's first unit (or [`NO_UNIT`]) and unit count,
+    /// and the staging slots the batch held.
     pub(crate) fn replay(&self, batch: PoolBatch) -> (Vec<(u32, u32)>, [PoolSlot; 2]) {
         let PoolBatch {
             ops,
             order,
             count,
+            largest,
             upload,
             results: (results_slot, results),
         } = batch;
         let [sizes, placed, taken] = read_results(&results, count, ops.takes.len());
+        debug_assert!(
+            sizes.iter().all(|&b| u64::from(units(b)) <= largest),
+            "a CLAS built past the {largest} units its reservation counts on"
+        );
         let mut s = self.state.lock().unwrap();
         s.apply(self.page_units, ops, &order, &sizes, &placed, &taken);
         drop(s);
@@ -603,6 +603,120 @@ impl ClasPool {
 }
 
 impl PoolState {
+    /// The bookkeeping of a pool of `pages` unbound pages of `n` units.
+    fn new(pages: u32, n: u32) -> Self {
+        let mut reference = RangeAllocator::new(pages * n);
+        reference.take(0, pages * n);
+        Self {
+            pages: vec![PageState::Unbound; pages as usize],
+            bound: 0,
+            used: vec![0; pages as usize],
+            used_units: 0,
+            whole: BTreeSet::new(),
+            reference,
+            reserved: 0,
+            peaks: [0; RESERVE_STEPS],
+            step: 0,
+            frees: Vec::new(),
+            takes: Vec::new(),
+            unbinds: Vec::new(),
+            unreported: Vec::new(),
+            unreported_binds: Vec::new(),
+            range_full: 0,
+            initialized: false,
+            micromap_frees: Vec::new(),
+        }
+    }
+
+    fn pending(&self) -> bool {
+        !self.frees.is_empty()
+            || !self.takes.is_empty()
+            || !self.unbinds.is_empty()
+            || !self.unreported.is_empty()
+            || !self.micromap_frees.is_empty()
+    }
+
+    /// A new batch's ops and the binds they wait for: the frees, takes, pages to unbind and
+    /// unreported pages queued since the last batch.
+    fn start(&mut self) -> Started {
+        let mut ops = PoolOps {
+            init: !self.initialized,
+            bound: std::mem::take(&mut self.unreported),
+            frees: std::mem::take(&mut self.frees),
+            takes: std::mem::take(&mut self.takes),
+            reserved: 0,
+            shortfall: None,
+        };
+        // Ascending, so each allocator thread finds those in its pages.
+        ops.takes.sort_unstable();
+        self.initialized = true;
+        Started {
+            ops,
+            binds: std::mem::take(&mut self.unreported_binds),
+            unbinds: std::mem::take(&mut self.unbinds),
+        }
+    }
+
+    /// Reserves `need` wholly free pages for the batch of `ops`. Returns the unbound pages to
+    /// bind for those the earlier reservations leave missing, and whether the range had fewer.
+    fn reserve(&mut self, ops: &mut PoolOps, need: u32) -> (Vec<u32>, bool) {
+        // The pages no batch has yet asked the kernel for stay bound before any page binds. One
+        // a batch placed CLAS in since it was asked for is bound, but not free.
+        let want = (self.reserved + need) as usize;
+        let mut queued = std::mem::take(&mut self.takes);
+        for takes in [&mut ops.takes, &mut queued] {
+            let mut kept = 0;
+            while kept < takes.len() && self.whole.len() < want {
+                self.set(takes[kept], PageState::Bound);
+                kept += 1;
+            }
+            takes.drain(..kept);
+        }
+        self.takes = queued;
+        // A batch reserves the pages earlier batches miss after a shortfall too, as they may
+        // place in any wholly free page. Pages bound now come too late for those batches, so a
+        // batch that places nothing binds none.
+        let short = if need == 0 {
+            0
+        } else {
+            want.saturating_sub(self.whole.len())
+        };
+        let pages: Vec<u32> = (0..self.pages.len() as u32)
+            .filter(|&p| self.pages[p as usize] == PageState::Unbound)
+            .take(short)
+            .collect();
+        ops.reserved = need;
+        self.reserved += need;
+        self.peaks[self.step] = self.peaks[self.step].max(self.reserved);
+        let range_short = pages.len() < short;
+        (pages, range_short)
+    }
+
+    /// Marks `bound` bound, as they hold no CLAS, and `unbound`, pages taken earlier, unbound.
+    fn bind(&mut self, bound: &[u32], unbound: &[u32]) {
+        for &p in unbound {
+            self.set(p, PageState::Unbound);
+        }
+        for &p in bound {
+            self.set(p, PageState::Bound);
+        }
+        self.bound = self.bound + bound.len() as u32 - unbound.len() as u32;
+    }
+
+    /// Takes back a batch that was never submitted: its frees, takes and pages to unbind go
+    /// to the next batch, as do the pages it bound with their `binds`, and its reservation
+    /// ends.
+    fn abandon(&mut self, ops: PoolOps, binds: Vec<TimelinePoint>, unbinds: Vec<u32>) {
+        self.reserved -= ops.reserved;
+        self.initialized &= !ops.init;
+        self.unreported.splice(0..0, ops.bound);
+        self.unreported_binds.splice(0..0, binds);
+        self.frees.splice(0..0, ops.frees);
+        self.takes.splice(0..0, ops.takes);
+        self.unbinds.splice(0..0, unbinds);
+        self.trim();
+    }
+
     fn apply(
         &mut self,
         n: u32,
@@ -626,16 +740,11 @@ impl PoolState {
                     ok,
                     "the kernel took page {p}, which the reference holds in use"
                 );
-                self.pages[p as usize].0 = PageState::Unbinding;
+                self.set(p, PageState::Unbinding);
                 self.unbinds.push(p);
             } else {
-                self.pages[p as usize].0 = PageState::Bound;
-                self.room += i64::from(n);
+                self.set(p, PageState::Bound);
             }
-        }
-        let built: u64 = sizes.iter().map(|&b| u64::from(units(b))).sum();
-        if ops.estimate > 0 && built > ops.estimate {
-            self.scale *= built as f64 / ops.estimate as f64;
         }
         let expected = order.place(&mut self.reference, n, sizes);
         let apart = expected.iter().zip(placed).position(|(e, u)| e != u);
@@ -644,24 +753,51 @@ impl PoolState {
             "the kernel and the reference place CLAS {apart:?} of {:?} bytes apart",
             apart.map(|i| sizes[i])
         );
-        let mut allocated = 0u64;
         for (&bytes, &unit) in sizes.iter().zip(placed) {
             if unit != NO_UNIT {
                 self.count(n, unit, units(bytes), true);
-                allocated += u64::from(units(bytes));
             }
         }
-        self.room += ops.estimate as i64 - allocated as i64;
-        let free: Vec<usize> = (0..self.pages.len())
-            .filter(|&p| self.pages[p].0 == PageState::Bound && self.used[p] == 0)
-            .collect();
-        for &p in free.iter().skip(RESERVE_PAGES) {
-            self.pages[p].0 = PageState::Taking;
-            self.takes.push(p as u32);
+        self.reserved -= ops.reserved;
+        self.trim();
+    }
+
+    /// Ends a render step and starts the next one's peak at the reservations in flight.
+    fn end_step(&mut self) {
+        self.step = (self.step + 1) % RESERVE_STEPS;
+        self.peaks[self.step] = self.reserved;
+        self.trim();
+    }
+
+    /// Asks to take the wholly free pages, highest first, beyond the reservations in flight
+    /// and the most they came to in a recent step.
+    fn trim(&mut self) {
+        let peak = self.peaks.iter().fold(0, |a, &b| a.max(b));
+        let keep = (self.reserved + peak) as usize;
+        let excess = self.whole.len().saturating_sub(keep);
+        let taking: Vec<u32> = self.whole.iter().rev().take(excess).copied().collect();
+        for p in taking {
+            self.set(p, PageState::Taking);
+            self.takes.push(p);
         }
     }
 
-    /// Adds or removes units `first..first + count` from the per-page counts of pages of `n`
+    fn set(&mut self, page: u32, state: PageState) {
+        self.pages[page as usize] = state;
+        self.refile(page);
+    }
+
+    /// Files `page` in or out of the wholly free pages.
+    fn refile(&mut self, page: u32) {
+        let p = page as usize;
+        if self.pages[p] == PageState::Bound && self.used[p] == 0 {
+            self.whole.insert(page);
+        } else {
+            self.whole.remove(&page);
+        }
+    }
+
+    /// Adds or removes units `first..first + count` from the counts in use, on pages of `n`
     /// units.
     fn count(&mut self, n: u32, first: u32, count: u32, add: bool) {
         let end = first + count;
@@ -669,8 +805,14 @@ impl PoolState {
         while u < end {
             let page = u / n;
             let span = end.min((page + 1) * n) - u;
-            let used = &mut self.used[page as usize];
-            *used = if add { *used + span } else { *used - span };
+            if add {
+                self.used[page as usize] += span;
+                self.used_units += u64::from(span);
+            } else {
+                self.used[page as usize] -= span;
+                self.used_units -= u64::from(span);
+            }
+            self.refile(page);
             u += span;
         }
     }
@@ -763,12 +905,15 @@ pub(crate) struct PoolBatch {
     ops: PoolOps,
     order: ClasOrder,
     count: u32,
+    /// The most units the device says one of its CLAS takes.
+    largest: u64,
     upload: PoolSlot,
     results: (PoolSlot, Block),
 }
 
 impl PoolBatch {
-    /// Takes why the pool grew by fewer pages than the batch's estimate needs, if it did.
+    /// Takes why the pool held fewer wholly free pages than the batch's reservation needs, if
+    /// it did.
     pub(crate) fn take_shortfall(&mut self) -> Option<Shortfall> {
         self.ops.shortfall.take()
     }
@@ -872,13 +1017,7 @@ pub(crate) fn build_pages(
     }
     let n = members.len() as u64;
 
-    // Per cluster, as each CLAS takes whole units.
-    let estimate: u64 = pages
-        .iter()
-        .flat_map(|p| p.clusters)
-        .map(|c| estimate(c.tri_count, 1))
-        .sum();
-    let mut started = pool.start(side, estimate);
+    let mut started = pool.start(side);
     let mut micromaps: Vec<Option<PoolMicromap>> = Vec::with_capacity(pages.len());
     // What a failure before the submit gives back.
     let fail = |e: crate::Error,
@@ -890,36 +1029,6 @@ pub(crate) fn build_pages(
         give_back(side, micromaps, staging_pool, held);
         Err(e)
     };
-
-    // The op lists and outputs.
-    let frees = started.ops.bound.len() + started.grow.len() + started.ops.frees.len();
-    let takes = started.ops.takes.len();
-    let upload_bytes = n * size_of::<ClasJob>() as u64
-        + builds.len() as u64 * (size_of::<AccelRoot>() as u64 + 32)
-        + 8 * frees as u64
-        + 4 * takes as u64
-        + 4 * n
-        + 8 * order.groups().len() as u64
-        + size_of::<PoolRoot>() as u64
-        + 128;
-    let results_bytes = 8 * n + 4 * takes as u64 + 64;
-    let mut staging = staging_pool.lock().unwrap();
-    let upload = match staging.alloc(device, upload_bytes, None) {
-        Ok(u) => u,
-        Err(e) => {
-            drop(staging);
-            return fail(e, side, started, micromaps, &[]);
-        }
-    };
-    let results = match staging.alloc(device, results_bytes, None) {
-        Ok(r) => r,
-        Err(e) => {
-            drop(staging);
-            return fail(e, side, started, micromaps, &[upload.0]);
-        }
-    };
-    drop(staging);
-    let held = [upload.0, results.0];
 
     // A micromap per page with a micromap region, its storage living with the page.
     let mut micromap_builds = Vec::new();
@@ -943,14 +1052,14 @@ pub(crate) fn build_pages(
         let sizes = device.micromap_sizes(&micromap_desc(&usage, at));
         let slot = match side.micromaps.alloc(device, sizes.result_max, None) {
             Ok((slot, _)) => slot,
-            Err(e) => return fail(e, side, started, micromaps, &held),
+            Err(e) => return fail(e, side, started, micromaps, &[]),
         };
         let (block, offset) = side.micromaps.memory(slot);
         let micromap = match device.create_micromap(sizes.result_max, block, offset) {
             Ok(m) => m,
             Err(e) => {
                 side.micromaps.free(slot);
-                return fail(e.into(), side, started, micromaps, &held);
+                return fail(e.into(), side, started, micromaps, &[]);
             }
         };
         micromap_builds.push((pi, usage, at, sizes.scratch));
@@ -990,9 +1099,21 @@ pub(crate) fn build_pages(
     };
     let stride = u64::from(device.rtas_args_stride(RtasOp::BuildClas));
     let mut implicit_bytes = 0;
+    // The most units the CLAS take in all and each.
+    let (mut worst, mut largest) = (0u64, 0u64);
     let mut layout = Vec::with_capacity(batches.len());
     for b in &batches {
         let sizes = device.rtas_sizes(&b.desc);
+        let explicit = RtasOpDesc {
+            mode: RtasMode::Explicit,
+            ..b.desc
+        };
+        let each = device.rtas_sizes(&explicit).result_max.div_ceil(UNIT);
+        let count = b.jobs.len() as u64;
+        // The CLAS lie apart in the implicit results and each rounds up to whole units, so
+        // they take at most the results' units and one more per CLAS.
+        worst += ((sizes.result_max + (UNIT - 1) * count) / UNIT).min(each * count);
+        largest = largest.max(each);
         implicit_bytes += sizes.result_max;
         layout.push(BuildRegions {
             vertices: region(12 * u64::from(b.vertices)),
@@ -1016,11 +1137,42 @@ pub(crate) fn build_pages(
     );
     let base = match side.scratch(device, size) {
         Ok(b) => b,
-        Err(e) => return fail(e, side, started, micromaps, &held),
+        Err(e) => return fail(e, side, started, micromaps, &[]),
     };
-    if let Err(e) = pool.grow(device, side, &mut started) {
-        return fail(e, side, started, micromaps, &held);
+    let groups = order.groups().len() as u32;
+    let need = most_pages(pool.page_units, groups, n as u32, worst, largest);
+    if let Err(e) = pool.grow(device, side, &mut started, need) {
+        return fail(e, side, started, micromaps, &[]);
     }
+
+    // The op lists and outputs.
+    let frees = started.ops.bound.len() + started.ops.frees.len();
+    let takes = started.ops.takes.len();
+    let upload_bytes = n * size_of::<ClasJob>() as u64
+        + builds.len() as u64 * (size_of::<AccelRoot>() as u64 + 32)
+        + 8 * frees as u64
+        + 4 * takes as u64
+        + 4 * n
+        + 8 * u64::from(groups)
+        + size_of::<PoolRoot>() as u64
+        + 128;
+    let results_bytes = 8 * n + 4 * takes as u64 + 64;
+    let mut staging = staging_pool.lock().unwrap();
+    let upload = match staging.alloc(device, upload_bytes, None) {
+        Ok(u) => u,
+        Err(e) => {
+            drop(staging);
+            return fail(e, side, started, micromaps, &[]);
+        }
+    };
+    let results = match staging.alloc(device, results_bytes, None) {
+        Ok(r) => r,
+        Err(e) => {
+            drop(staging);
+            return fail(e, side, started, micromaps, &[upload.0]);
+        }
+    };
+    drop(staging);
 
     list.barrier(Stages::ALL, Stages::ALL, Hazards::ACCEL_STRUCT);
     for ((pi, usage, at, _), &s) in micromap_builds.iter().zip(&micromap_scratch) {
@@ -1088,6 +1240,7 @@ pub(crate) fn build_pages(
             ops: started.ops,
             order,
             count: n as u32,
+            largest,
             upload: upload.0,
             results,
         },
@@ -1165,5 +1318,162 @@ mod tests {
         let placed = order.place(&mut RangeAllocator::new(4 * page), page, &sizes);
         let x = NO_UNIT;
         assert_eq!(placed, [300, x, 0, x, 500, 600, 1000, 1512, x, 2024, x]);
+    }
+
+    /// Batches of CLAS built at or under their largest sizes, several in flight, some
+    /// abandoned, with frees of earlier CLAS and steps with nothing in flight, placed by a
+    /// reference standing in for the kernel: every CLAS places, a batch leaves at most its
+    /// reservation of wholly free pages partly used, the wholly free pages kept stay within
+    /// the reservations in flight and their recent peak, and once the CLAS stop coming, and
+    /// then free, the pool gives back every page they leave free.
+    #[test]
+    fn reserved_pages_place_every_clas_and_the_surplus_unbinds() {
+        const N: u32 = 512;
+        const PAGES: u32 = 8192;
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut rng = move |below: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(below)) as u32
+        };
+        let mut s = PoolState::new(PAGES, N);
+        let mut kernel = RangeAllocator::new(PAGES * N);
+        kernel.take(0, PAGES * N);
+        // Sent batches: their ops, order, built sizes, units and takes.
+        type Sent = (PoolOps, ClasOrder, Vec<u32>, Vec<u32>, Vec<u32>);
+        let mut sent: std::collections::VecDeque<Sent> = Default::default();
+        let mut live: Vec<(u32, u32)> = Vec::new();
+        // The reservations in flight and the most they came to in each recent step.
+        let mut reserved = 0;
+        let mut peaks = std::collections::VecDeque::from([0]);
+        let check = |s: &PoolState, reserved: u32, peaks: &std::collections::VecDeque<u32>| {
+            let bound = s.pages.iter().filter(|&&p| p != PageState::Unbound).count();
+            assert_eq!(s.bound as usize, bound);
+            let whole = (0..PAGES)
+                .filter(|&p| s.pages[p as usize] == PageState::Bound && s.used[p as usize] == 0);
+            assert!(whole.eq(s.whole.iter().copied()));
+            assert_eq!(s.reserved, reserved);
+            let peak = *peaks.iter().max().expect("a step");
+            let kept = s.whole.len() as u32;
+            assert!(kept <= reserved + peak, "{kept} free pages kept");
+        };
+
+        let streamed = 160;
+        let settled = streamed + RESERVE_STEPS as u32 + 30;
+        for step in 0..settled + RESERVE_STEPS as u32 + 30 {
+            if step == settled {
+                // Every page left bound holds CLAS.
+                assert!(sent.is_empty() && s.takes.is_empty() && s.unbinds.is_empty());
+                assert_eq!(s.bound, s.used.iter().filter(|&&u| u > 0).count() as u32);
+            }
+            let batches = if step < streamed { rng(4) } else { 0 };
+            // A step that sends no batch sends one for the pool alone when it has work.
+            for b in 0..batches.max(u32::from(s.pending())) {
+                let mut started = s.start();
+                if rng(24) == 0 {
+                    s.abandon(started.ops, started.binds, started.unbinds);
+                    check(&s, reserved, &peaks);
+                    continue;
+                }
+                let (mut order, mut sizes) = (ClasOrder::default(), Vec::new());
+                let (mut worst, mut largest) = (0u64, 0u64);
+                // Some batches build CLAS all of their largest size. Those of a third of a page
+                // and a unit go two to a run of over two thirds of a page, longer than most
+                // pages' remainders, so the wholly free pages they leave partly used come near
+                // their reservation. Those of a quarter of a page and a unit go two to a streamed
+                // page, a run of over half a page each, so the pages they leave partly used come
+                // near twice their units over a page, below the most runs their sizes cut into.
+                let kind = rng(5);
+                let streamed_pages = if kind == 4 { 1 + rng(64) } else { 1 + rng(4) };
+                for _ in 0..if b < batches { streamed_pages } else { 0 } {
+                    let first = sizes.len() as u32;
+                    let (most, uniform) = match kind {
+                        0 => ((N + 1) / 3, true),
+                        1 => (1 + rng(N / 2), true),
+                        4 => (N / 4 + 1, true),
+                        _ => (1 + rng(200), false),
+                    };
+                    for _ in 0..if kind == 4 { 2 } else { 1 + rng(300) } {
+                        let each = if uniform { most } else { 1 + rng(most) };
+                        let built = if uniform || rng(2) == 0 {
+                            each
+                        } else {
+                            1 + rng(each)
+                        };
+                        sizes.push(built * UNIT as u32 - rng(UNIT as u32));
+                        worst += u64::from(each);
+                        largest = largest.max(u64::from(each));
+                    }
+                    order.push_page(&(first..sizes.len() as u32).collect::<Vec<_>>());
+                }
+                let groups = order.groups().len() as u32;
+                let need = most_pages(N, groups, sizes.len() as u32, worst, largest);
+                let (pages, short) = s.reserve(&mut started.ops, need);
+                assert!(!short, "the range runs out");
+                reserved += need;
+                let back = peaks.back_mut().expect("a step");
+                *back = (*back).max(reserved);
+                s.bind(&pages, &started.unbinds);
+                started.ops.bound.extend(pages);
+                check(&s, reserved, &peaks);
+                if rng(24) == 0 {
+                    reserved -= need;
+                    s.abandon(started.ops, started.binds, Vec::new());
+                    check(&s, reserved, &peaks);
+                    continue;
+                }
+                let ops = started.ops;
+                for &p in &ops.bound {
+                    kernel.free(p * N, N);
+                }
+                for &(first, count) in &ops.frees {
+                    kernel.free(first, count);
+                }
+                let taken = ops.takes.iter().map(|&p| u32::from(kernel.take(p * N, N)));
+                let taken: Vec<u32> = taken.collect();
+                let whole =
+                    |k: &RangeAllocator| (0..PAGES).filter(|&p| k.is_free(p * N, N)).count();
+                let before = whole(&kernel);
+                let placed = order.place(&mut kernel, N, &sizes);
+                assert!(placed.iter().all(|&u| u != NO_UNIT), "step {step}");
+                let used = before - whole(&kernel);
+                assert!(used <= need as usize, "{used} free pages used for {need}");
+                sent.push_back((ops, order, sizes, placed, taken));
+            }
+            // Land the oldest batches, all of them in some steps.
+            let landing = if rng(6) == 0 {
+                sent.len()
+            } else {
+                rng(3) as usize
+            };
+            for (ops, order, sizes, placed, taken) in sent.drain(..landing.min(sent.len())) {
+                reserved -= ops.reserved;
+                s.apply(N, ops, &order, &sizes, &placed, &taken);
+                check(&s, reserved, &peaks);
+                live.extend(placed.iter().zip(&sizes).map(|(&u, &b)| (u, units(b))));
+            }
+            // Evictions free CLAS at random while batches come, then none until every CLAS
+            // frees at once.
+            let frees = if step < streamed {
+                rng(1 + live.len() as u32 / 4)
+            } else if step == settled {
+                live.len() as u32
+            } else {
+                0
+            };
+            for _ in 0..frees {
+                let clas = live.swap_remove(rng(live.len() as u32) as usize);
+                s.frees.push(clas);
+            }
+            s.end_step();
+            peaks.push_back(reserved);
+            if peaks.len() > RESERVE_STEPS {
+                peaks.pop_front();
+            }
+            check(&s, reserved, &peaks);
+        }
+        assert!(live.is_empty() && !s.pending());
+        assert_eq!((s.bound, s.used_units), (0, 0));
     }
 }

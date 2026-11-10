@@ -171,6 +171,10 @@ pub struct ResidencyStats {
     pub pages_over_budget: u32,
     /// Bytes bound in the CLAS pool that streamed mesh pages build into.
     pub clas_pool_bytes: u64,
+    /// Bytes of the CLAS pool's 128-byte units that hold CLAS, as of its latest landed batch.
+    /// The rest of [`Self::clas_pool_bytes`] is free: whole pages kept for the batches to
+    /// come, and gaps between CLAS.
+    pub clas_pool_used_bytes: u64,
     /// Streamed mesh page loads since the start that landed with a CLAS the pool found no
     /// room for; each loads again on request.
     pub clas_retries: u32,
@@ -571,9 +575,11 @@ impl Residency {
         self.stats.failed_cuts -= count;
     }
 
-    /// The CLAS pool's bound bytes, and its batches so far that found its range full.
-    pub(crate) fn note_clas_pool(&mut self, bytes: u64, range_full: u32) {
+    /// The CLAS pool's bound bytes and bytes holding CLAS, and its batches so far that found
+    /// its range full.
+    pub(crate) fn note_clas_pool(&mut self, bytes: u64, used: u64, range_full: u32) {
         self.stats.clas_pool_bytes = bytes;
+        self.stats.clas_pool_used_bytes = used;
         self.stats.clas_range_full = range_full;
     }
 

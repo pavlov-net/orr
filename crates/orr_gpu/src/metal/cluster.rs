@@ -518,11 +518,18 @@ fn header(kind: Kind, size: u64, id: u64, extra: &[u32]) -> [u32; 16] {
 }
 
 impl Device {
-    /// The memory `d` needs at most: the implicit result (or the PTLAS) and scratch.
+    /// The memory `d` needs at most: the implicit result (or the PTLAS) and scratch. One
+    /// query sizes a whole batch; for an [`RtasMode::Explicit`] build of CLAS or templates,
+    /// `result_max` is the most one of its results takes.
     pub fn rtas_sizes(&self, d: &RtasOpDesc) -> RtasSizes {
         let n = u64::from(max_args(d));
         let align = u64::from(ALIGN);
         let result_max = match d.limits {
+            RtasLimits::Cluster(l) if d.mode == RtasMode::Explicit => object_bytes(
+                d.op != RtasOp::BuildTemplates,
+                l.max_tris_per_cluster,
+                l.max_verts_per_cluster,
+            ),
             RtasLimits::Cluster(l) => {
                 let clas = d.op != RtasOp::BuildTemplates;
                 let verts = if clas {
