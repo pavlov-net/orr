@@ -333,7 +333,7 @@ impl Lighting {
     /// Starts the path kernels unless they are ready or compiling: from the pipeline caches when
     /// they hold every one and `try_cached_paths` allows looking, else as jobs on `loading`, which
     /// report any failure.
-    fn start_paths(&mut self, gpu: &Device, loading: &Loading) {
+    fn start_paths(&mut self, gpu: &Device, loading: &Arc<Loading>) {
         if matches!(self.paths, Paths::Ready(_) | Paths::Compiling { .. }) {
             return;
         }
@@ -342,6 +342,7 @@ impl Lighting {
             if let Ok(kernels) =
                 LightingKernels::new(&cached, self.kernels, &self.tables, self.entry)
             {
+                kernels.compile_tail(gpu, self.kernels, loading);
                 self.paths = Paths::Ready(Box::new(kernels));
                 return;
             }
@@ -1236,6 +1237,7 @@ impl<'a> Frame<'a> {
             scattering_interiors: raster.scattering_interiors,
             medium_proxies: raster.medium_proxies,
             particle_lighting: hooks.transparency.is_some(),
+            dispersive_materials: raster.dispersive_materials,
         };
         paths.begin(scene, &desc, lighting);
         state.scene_resets = Some(scene_resets);

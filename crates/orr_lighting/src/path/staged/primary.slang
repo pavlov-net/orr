@@ -1,0 +1,40 @@
+// The staged view paths' primary stage: each pixel's path starts, and where it starts on the
+// G-buffer's surface its first vertex is shaded, without feature code, with that of caustics,
+// and with all of it.
+#include "orr_root.h"
+import orr_shaders.coherence;
+import orr_lighting.environment;
+import orr_lighting.media;
+import orr_scene.surface;
+import orr_lighting.path;
+import orr_lighting.path.stages;
+
+extern struct Surface : ISurface = StandardSurface;
+extern struct Environment : IEnvironment = EnvironmentMap;
+extern struct Medium : IMedium = NoMedium;
+
+ORR_ROOT_INLINE(PathRoot);
+
+[shader("compute")]
+[numthreads(STAGE_GROUP, 1, 1)]
+void lean_main(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(lean_main);
+    primary_stage<Surface, Medium, FEATURES_LEAN>(root, id.x);
+}
+
+[shader("compute")]
+[numthreads(STAGE_GROUP, 1, 1)]
+void caustic_main(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(caustic_main);
+    primary_stage<Surface, Medium, FEATURE_CAUSTICS>(root, id.x);
+}
+
+[shader("compute")]
+[numthreads(STAGE_GROUP, 1, 1)]
+void full_main(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(full_main);
+    primary_stage<Surface, Medium, FEATURES_ALL>(root, id.x);
+}

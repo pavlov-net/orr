@@ -60,6 +60,7 @@ mod media;
 pub mod openpbr;
 mod particles;
 mod scene;
+mod staged;
 mod subsurface;
 mod subsurface_table;
 mod view;
@@ -160,6 +161,9 @@ fn module(kernels: &KernelSet, own: &'static ShaderModule) -> Result<&'static Sh
     }
     Ok(m)
 }
+
+/// How one compute pipeline compiles.
+type CompilePipeline = fn(&Device, &KernelSet) -> Result<ComputePipeline, Error>;
 
 fn pipeline(
     device: &Device,

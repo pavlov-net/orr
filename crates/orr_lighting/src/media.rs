@@ -15,7 +15,7 @@ use crate::shaders::types::{
     ParticleLighting,
 };
 use crate::view::{LightingDebugView, LightingView, NO_MATERIAL, ViewLighting, ViewPass};
-use crate::{Error, KernelSet, SceneLighting, pipeline};
+use crate::{CompilePipeline, Error, KernelSet, SceneLighting, pipeline};
 
 /// Pixels per side of a froxel column's tile (`media`'s `FROXEL_TILE`).
 const FROXEL_TILE: u32 = 8;
@@ -394,17 +394,37 @@ pub(crate) struct MediaKernels {
 }
 
 impl MediaKernels {
-    pub(crate) fn new(device: &Device, kernels: &KernelSet) -> Result<Self, Error> {
+    /// Its pipelines, in the order [`Self::new`] takes them.
+    pub(crate) const PIPELINES: [CompilePipeline; 9] = [
+        |d, k| pipeline(d, k, &froxel::MODULE, "order"),
+        |d, k| pipeline(d, k, &froxel::MODULE, "eye_column"),
+        |d, k| pipeline(d, k, &froxel::MODULE, "eye_reach"),
+        |d, k| pipeline(d, k, &froxel::MODULE, "inject"),
+        |d, k| pipeline(d, k, &smoke::MODULE, "main"),
+        |d, k| pipeline(d, k, &froxel::MODULE, "light"),
+        |d, k| pipeline(d, k, &froxel::MODULE, "integrate"),
+        |d, k| pipeline(d, k, &aerial::MODULE, "main"),
+        |d, k| pipeline(d, k, &apply::MODULE, "main"),
+    ];
+
+    /// The kernels over the next of `pipelines`, which [`Self::PIPELINES`] compiled from
+    /// `kernels`.
+    pub(crate) fn new(
+        device: &Device,
+        kernels: &KernelSet,
+        pipelines: &mut impl Iterator<Item = ComputePipeline>,
+    ) -> Result<Self, Error> {
+        let mut next = || pipelines.next().expect("a pipeline per entry");
         Ok(Self {
-            order: pipeline(device, kernels, &froxel::MODULE, "order")?,
-            eye_column: pipeline(device, kernels, &froxel::MODULE, "eye_column")?,
-            eye_reach: pipeline(device, kernels, &froxel::MODULE, "eye_reach")?,
-            inject: pipeline(device, kernels, &froxel::MODULE, "inject")?,
-            smoke: pipeline(device, kernels, &smoke::MODULE, "main")?,
-            light: pipeline(device, kernels, &froxel::MODULE, "light")?,
-            integrate: pipeline(device, kernels, &froxel::MODULE, "integrate")?,
-            aerial: pipeline(device, kernels, &aerial::MODULE, "main")?,
-            apply: pipeline(device, kernels, &apply::MODULE, "main")?,
+            order: next(),
+            eye_column: next(),
+            eye_reach: next(),
+            inject: next(),
+            smoke: next(),
+            light: next(),
+            integrate: next(),
+            aerial: next(),
+            apply: next(),
             sampler: device.sampler(&SamplerDesc {
                 mag: Filter::Linear,
                 min: Filter::Linear,

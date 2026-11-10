@@ -27,8 +27,14 @@ use crate::shaders::types::{
     ParticleLighting, PathRoot,
 };
 use crate::shaders::world_cache::update;
+use crate::staged::{
+    self, FEATURE_DISPERSION, FEATURE_WALK, Late, Source, StagePipeline, StagedKernels,
+    StagedMemory,
+};
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
-use crate::{BsdfTables, Error, KernelSet, PathEntry, SceneLighting, module, pipeline};
+use crate::{
+    BsdfTables, CompilePipeline, Error, KernelSet, PathEntry, SceneLighting, module, pipeline,
+};
 
 /// Lighting settings of one view, passed with every render of it.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -517,6 +523,8 @@ pub struct LightingView {
     overlay_front: Option<OverlayFront>,
     /// The reference's photon map, while the view traces one.
     photon_map: Option<PhotonMap>,
+    /// What the staged paths keep between stages, made at their first frame.
+    staged: Option<StagedMemory>,
 }
 
 impl LightingView {
@@ -613,6 +621,7 @@ impl LightingView {
             previous: None,
             scene_resets: 0,
             history_reset: true,
+            staged: None,
             media: MediaView::new(device)?,
             dof: None,
             overlay_front: None,
@@ -890,6 +899,8 @@ pub struct ViewPass {
     /// Something reads the frame's [`LightingView::particle_lighting`], as a transparency hook
     /// that shades particles does; `false` leaves it null.
     pub particle_lighting: bool,
+    /// [`orr_scene::RasterView::dispersive_materials`].
+    pub dispersive_materials: bool,
 }
 
 /// What the background layer behind out-of-focus foreground reads in one frame. Each marked
@@ -922,6 +933,7 @@ impl PathPipeline {
         rays: bool,
         name: &str,
     ) -> Result<Self, Error> {
+        let m = scratch_spv_override(m);
         Ok(if rays {
             let stage = ShaderStage::new(m, "raygen_main", spec)?;
             Self::Rays(device.create_ray_dispatch_pipeline(&stage, name)?)
@@ -944,7 +956,55 @@ impl PathPipeline {
     }
 }
 
-/// The kernels beside the path kernels, which compile as one job, and the small tables they use.
+/// Scratch: `value`, or the environment variable `name` parsed as a number when set.
+fn scratch_u32(name: &str, value: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(value)
+}
+
+/// Scratch: with `ORR_SCRATCH_SPV_DIR` set, a path kernel's SPIR-V is read from
+/// `<dir>/<module name with / as ->.spv` when that file exists, so SPIR-V-level variants run in
+/// the renderer without a rebuild. The entry points and root layout are taken from the built module.
+fn scratch_spv_override(m: &ShaderModule) -> &ShaderModule {
+    let Some(dir) = std::env::var_os("ORR_SCRATCH_SPV_DIR") else {
+        return m;
+    };
+    let path = std::path::Path::new(&dir).join(format!("{}.spv", m.name.replace('/', "-")));
+    let Ok(bytes) = std::fs::read(&path) else {
+        return m;
+    };
+    let n = bytes.len() / 4;
+    let mut words = vec![0u32; n];
+    bytemuck::cast_slice_mut::<u32, u8>(&mut words).copy_from_slice(&bytes[..n * 4]);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for w in &words {
+        hash = (hash ^ u64::from(*w)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    log::info!(
+        "scratch: {} replaced by {} ({} words)",
+        m.name,
+        path.display(),
+        n
+    );
+    Box::leak(Box::new(ShaderModule {
+        name: m.name,
+        kernel: m.kernel,
+        spirv: Box::leak(words.into_boxed_slice()),
+        metallib: m.metallib,
+        metallib_fragment: m.metallib_fragment,
+        omm: m.omm,
+        inline_root_bytes: m.inline_root_bytes,
+        debug_info: "",
+        hash,
+        manifest: m.manifest,
+        entry_points: m.entry_points,
+    }))
+}
+
+/// The kernels beside the path kernels, each compiled as a job of its own, and the small tables
+/// they use.
 struct SupportKernels {
     layer_tiles: ComputePipeline,
     layer_args: ComputePipeline,
@@ -962,43 +1022,97 @@ struct SupportKernels {
 }
 
 impl SupportKernels {
-    fn new(device: &Device, kernels: &KernelSet) -> Result<Self, Error> {
-        let bytes = resolve::Spec::default().bytes();
-        let spec = SpecData {
-            entries: resolve::Spec::ENTRIES,
-            bytes: &bytes,
-        };
-        let stage = ShaderStage::new(module(kernels, &resolve::MODULE)?, "main", spec)?;
-        let guides = device.create_compute_pipeline(&stage, "guide resolve")?;
-        let bytes = layer_guides::Spec::default().bytes();
-        let spec = SpecData {
-            entries: layer_guides::Spec::ENTRIES,
-            bytes: &bytes,
-        };
-        let stage = ShaderStage::new(module(kernels, &layer_guides::MODULE)?, "main", spec)?;
-        let first_layers = device.create_compute_pipeline(&stage, "layer guides")?;
+    /// Its own pipelines, in the order [`Self::assemble`] takes them; [`MediaKernels`]' follow.
+    const PIPELINES: [CompilePipeline; 9] = [
+        |d, k| pipeline(d, k, &tiles::MODULE, "tiles"),
+        |d, k| pipeline(d, k, &tiles::MODULE, "args"),
+        |d, k| {
+            let bytes = layer_guides::Spec::default().bytes();
+            let spec = SpecData {
+                entries: layer_guides::Spec::ENTRIES,
+                bytes: &bytes,
+            };
+            let stage = ShaderStage::new(module(k, &layer_guides::MODULE)?, "main", spec)?;
+            Ok(d.create_compute_pipeline(&stage, "layer guides")?)
+        },
+        |d, k| {
+            let bytes = resolve::Spec::default().bytes();
+            let spec = SpecData {
+                entries: resolve::Spec::ENTRIES,
+                bytes: &bytes,
+            };
+            let stage = ShaderStage::new(module(k, &resolve::MODULE)?, "main", spec)?;
+            Ok(d.create_compute_pipeline(&stage, "guide resolve")?)
+        },
+        |d, k| pipeline(d, k, &frost::MODULE, "main"),
+        |d, k| pipeline(d, k, &overlay_front::MODULE, "clear"),
+        |d, k| pipeline(d, k, &overlay_front::MODULE, "resolve"),
+        |d, k| pipeline(d, k, &local::MODULE, "main"),
+        |d, k| pipeline(d, k, &local::MODULE, "refine"),
+    ];
+
+    /// Every pipeline of the support kernels.
+    fn pipelines() -> impl Iterator<Item = CompilePipeline> {
+        Self::PIPELINES.into_iter().chain(MediaKernels::PIPELINES)
+    }
+
+    /// The kernels over `pipelines`, which [`Self::pipelines`] compiled from `kernels` in its
+    /// order.
+    fn assemble(
+        device: &Device,
+        kernels: &KernelSet,
+        pipelines: Vec<ComputePipeline>,
+    ) -> Result<Self, Error> {
+        let mut pipelines = pipelines.into_iter();
+        let mut next = || pipelines.next().expect("a pipeline per entry");
         let mut zero = device.gpu_malloc::<u32>(MemoryKind::Upload, 1, "zero")?;
         zero.as_mut_slice().expect("mapped")[0] = 0;
         Ok(Self {
-            layer_tiles: pipeline(device, kernels, &tiles::MODULE, "tiles")?,
-            layer_args: pipeline(device, kernels, &tiles::MODULE, "args")?,
-            layer_guides: first_layers,
+            layer_tiles: next(),
+            layer_args: next(),
+            layer_guides: next(),
             zero,
-            guides,
-            frost: pipeline(device, kernels, &frost::MODULE, "main")?,
-            overlay_clear: pipeline(device, kernels, &overlay_front::MODULE, "clear")?,
-            overlay_resolve: pipeline(device, kernels, &overlay_front::MODULE, "resolve")?,
-            local: pipeline(device, kernels, &local::MODULE, "main")?,
-            refine: pipeline(device, kernels, &local::MODULE, "refine")?,
-            media: MediaKernels::new(device, kernels)?,
+            guides: next(),
+            frost: next(),
+            overlay_clear: next(),
+            overlay_resolve: next(),
+            local: next(),
+            refine: next(),
+            media: MediaKernels::new(device, kernels, &mut pipelines)?,
             subsurface_table: SubsurfaceTable::new(device)?,
         })
     }
+
+    /// Compiles the pipelines one after another on the calling thread.
+    fn new(device: &Device, kernels: &KernelSet) -> Result<Self, Error> {
+        let pipelines = Self::pipelines()
+            .map(|compile| compile(device, kernels))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::assemble(device, kernels, pipelines)
+    }
+}
+
+/// The rounds of the staged loop a path under `root` may take: one per iteration of `trace_path`
+/// (`path_iterations`), which traces at most once, and one for the vertex its start leaves to
+/// shade.
+fn path_rounds(root: &PathRoot) -> u32 {
+    let walks = if root.dielectric_flags & DIELECTRIC_REFERENCE != 0 {
+        root.max_bounces + 1
+    } else {
+        1
+    };
+    root.max_bounces + 3 + walks + root.dielectric_depth + 1
 }
 
 /// Whether path kernels run as ray dispatches on `device`.
 fn runs_rays(device: &Device, entry: PathEntry) -> bool {
     let caps = device.caps();
+    // Scratch: `ORR_SCRATCH_ENTRY` overrides the renderer's choice in every example.
+    let entry = match std::env::var("ORR_SCRATCH_ENTRY").as_deref() {
+        Ok("compute") => PathEntry::Compute,
+        Ok("rays") => PathEntry::RayDispatch,
+        _ => entry,
+    };
     match entry {
         PathEntry::Fastest => caps.ray_dispatch && caps.reorder,
         PathEntry::Compute => false,
@@ -1034,9 +1148,10 @@ const PHOTONS: PathKernel = path_kernel!(photon_paths, "caustic photons");
 const BACKGROUND: PathKernel = path_kernel!(background, "background paths");
 const UPDATE: PathKernel = path_kernel!(update, "world cache update paths");
 const SUPPORT: &str = "lighting compute kernels";
+const STAGED: &str = "staged path kernels";
 
 /// Queues `compile`, which writes the device's pipeline cache file when it finishes.
-fn compile_job<T: Send + 'static>(
+pub(crate) fn compile_job<T: Send + 'static>(
     device: &Device,
     loading: &Loading,
     compile: impl FnOnce(&Device) -> Result<T, Error> + Send + 'static,
@@ -1063,72 +1178,171 @@ fn compiled<T>(job: &JobResult<Result<T, Error>>, kernel: &'static str) -> Resul
     }
 }
 
+/// Scratch: the path kernels run as the staged loop (`path/stages.slang`) unless
+/// `ORR_SCRATCH_PATHS` is `mega`, which runs `trace_path`'s single kernels.
+fn runs_staged() -> bool {
+    std::env::var("ORR_SCRATCH_PATHS").as_deref() != Ok("mega")
+}
+
+/// The path kernels' compile jobs.
+enum CompilingPaths {
+    Mega {
+        paths: JobResult<Result<PathPipeline, Error>>,
+        photons: JobResult<Result<PathPipeline, Error>>,
+        background: JobResult<Result<PathPipeline, Error>>,
+        update: JobResult<Result<PathPipeline, Error>>,
+    },
+    /// One job per stage pipeline.
+    Staged(Vec<JobResult<Result<StagePipeline, Error>>>),
+}
+
 /// [`LightingKernels`] compiling as jobs on the loading side, from
 /// [`LightingKernels::spawn`]. Dropping it cancels the jobs no thread has started; one
 /// already compiling finishes on its thread, since the driver cannot be interrupted.
 pub struct CompilingKernels {
-    paths: JobResult<Result<PathPipeline, Error>>,
-    photons: JobResult<Result<PathPipeline, Error>>,
-    background: JobResult<Result<PathPipeline, Error>>,
-    update: JobResult<Result<PathPipeline, Error>>,
-    support: JobResult<Result<SupportKernels, Error>>,
+    device: Device,
+    rays: bool,
+    kernels: &'static KernelSet,
+    loading: Arc<Loading>,
+    paths: CompilingPaths,
+    /// One job per support pipeline, in [`SupportKernels::pipelines`]' order.
+    support: Vec<JobResult<Result<ComputePipeline, Error>>>,
     tables: BsdfTables,
 }
 
 impl CompilingKernels {
-    /// The jobs [`LightingKernels::spawn`] queues: four path kernels (the view's, the caustic
-    /// photons', the background layer's and the world cache's update paths) and the kernels beside
-    /// them.
-    /// A consumer lends this many threads for them to compile at once, and more to keep loading
-    /// while they do: on a first run a path kernel holds its thread for a minute or more.
-    pub const JOBS: usize = 5;
+    /// The most jobs [`LightingKernels::spawn`] queues: one per pipeline of the staged path loop
+    /// and of the kernels beside it. A consumer lends this many threads for them to compile at
+    /// once, and more to keep loading while they do.
+    pub const JOBS: usize = 34;
+
+    fn jobs(&self) -> Vec<&dyn JobState> {
+        let mut out: Vec<&dyn JobState> = self.support.iter().map(|j| j as &dyn JobState).collect();
+        match &self.paths {
+            CompilingPaths::Mega {
+                paths,
+                photons,
+                background,
+                update,
+            } => out.extend([paths as &dyn JobState, photons, background, update]),
+            CompilingPaths::Staged(jobs) => out.extend(jobs.iter().map(|j| j as &dyn JobState)),
+        }
+        out
+    }
 
     /// How many jobs have not finished.
     pub fn outstanding(&self) -> u32 {
-        let paths = [&self.paths, &self.photons, &self.background, &self.update];
-        paths.iter().filter(|job| !job.finished()).count() as u32
-            + u32::from(!self.support.finished())
+        self.jobs().iter().filter(|job| !job.finished()).count() as u32
     }
 
     /// Whether a thread has started any job.
     pub fn started(&self) -> bool {
-        self.paths.started()
-            || self.photons.started()
-            || self.background.started()
-            || self.update.started()
-            || self.support.started()
+        self.jobs().iter().any(|job| job.started())
     }
 
     /// Blocks until every job has finished, running queued jobs on the calling thread meanwhile,
     /// so it finishes with no workers. `loading` is the side the jobs were queued on.
     pub fn wait(&self, loading: &Loading) {
-        self.paths.wait(loading);
-        self.photons.wait(loading);
-        self.background.wait(loading);
-        self.update.wait(loading);
-        self.support.wait(loading);
+        for job in self.jobs() {
+            job.wait(loading);
+        }
     }
 
     /// The kernels, or the first failure, once [`Self::outstanding`] is 0.
     pub fn finish(&self) -> Result<LightingKernels, Error> {
         assert_eq!(self.outstanding(), 0, "kernels are still compiling");
-        Ok(LightingKernels {
-            paths: compiled(&self.paths, VIEW.name)?,
-            photons: compiled(&self.photons, PHOTONS.name)?,
-            background: compiled(&self.background, BACKGROUND.name)?,
-            update: compiled(&self.update, UPDATE.name)?,
-            support: compiled(&self.support, SUPPORT)?,
+        let paths = match &self.paths {
+            CompilingPaths::Mega {
+                paths,
+                photons,
+                background,
+                update,
+            } => PathKernels::Mega {
+                paths: compiled(paths, VIEW.name)?,
+                photons: compiled(photons, PHOTONS.name)?,
+                background: compiled(background, BACKGROUND.name)?,
+                update: compiled(update, UPDATE.name)?,
+            },
+            CompilingPaths::Staged(jobs) => {
+                let mut out = Vec::new();
+                for job in jobs {
+                    out.push(compiled(job, STAGED)?);
+                }
+                PathKernels::Staged(Box::new(StagedPaths::new(
+                    StagedKernels::from_pipelines(out),
+                    self.rays,
+                )))
+            }
+        };
+        let mut support = Vec::new();
+        for job in &self.support {
+            support.push(compiled(job, SUPPORT)?);
+        }
+        let out = LightingKernels {
+            paths,
+            support: SupportKernels::assemble(&self.device, self.kernels, support)?,
             _tables: self.tables.clone(),
-        })
+        };
+        out.compile_tail(&self.device, self.kernels, &self.loading);
+        Ok(out)
+    }
+}
+
+/// A compile job, whatever it makes.
+trait JobState {
+    fn finished(&self) -> bool;
+    fn started(&self) -> bool;
+    fn wait(&self, loading: &Loading);
+}
+
+impl<T: Send + 'static> JobState for JobResult<T> {
+    fn finished(&self) -> bool {
+        JobResult::finished(self)
+    }
+    fn started(&self) -> bool {
+        JobResult::started(self)
+    }
+    fn wait(&self, loading: &Loading) {
+        JobResult::wait(self, loading);
+    }
+}
+
+/// The path kernels: `trace_path`'s single kernels, or the staged loop's pipelines.
+enum PathKernels {
+    Mega {
+        paths: PathPipeline,
+        photons: PathPipeline,
+        background: PathPipeline,
+        update: PathPipeline,
+    },
+    Staged(Box<StagedPaths>),
+}
+
+/// The staged loop's pipelines, and the single kernels of the update paths and the photons.
+/// Those sources' paths are few, so one kernel runs them in less time than the stages'
+/// dispatches cost; it compiles for minutes, after the kernels are ready, and the stages run
+/// its paths until then.
+struct StagedPaths {
+    stages: StagedKernels,
+    update: Late<PathPipeline>,
+    photons: Late<PathPipeline>,
+    rays: bool,
+}
+
+impl StagedPaths {
+    fn new(stages: StagedKernels, rays: bool) -> Self {
+        Self {
+            stages,
+            update: Late::new("update path kernel"),
+            photons: Late::new("photon path kernel"),
+            rays,
+        }
     }
 }
 
 /// The per-view lighting kernels of one device.
 pub struct LightingKernels {
-    paths: PathPipeline,
-    photons: PathPipeline,
-    background: PathPipeline,
-    update: PathPipeline,
+    paths: PathKernels,
     support: SupportKernels,
     _tables: BsdfTables,
 }
@@ -1143,38 +1357,83 @@ impl LightingKernels {
         entry: PathEntry,
     ) -> Result<Self, Error> {
         let rays = runs_rays(device, entry);
+        let paths = if runs_staged() {
+            PathKernels::Staged(Box::new(StagedPaths::new(
+                StagedKernels::new(device, kernels, rays)?,
+                rays,
+            )))
+        } else {
+            PathKernels::Mega {
+                paths: (VIEW.compile)(device, kernels, rays)?,
+                photons: (PHOTONS.compile)(device, kernels, rays)?,
+                background: (BACKGROUND.compile)(device, kernels, rays)?,
+                update: (UPDATE.compile)(device, kernels, rays)?,
+            }
+        };
         Ok(Self {
-            paths: (VIEW.compile)(device, kernels, rays)?,
-            photons: (PHOTONS.compile)(device, kernels, rays)?,
-            background: (BACKGROUND.compile)(device, kernels, rays)?,
-            update: (UPDATE.compile)(device, kernels, rays)?,
+            paths,
             support: SupportKernels::new(device, kernels)?,
             _tables: tables.clone(),
         })
     }
 
-    /// [`Self::new`] as jobs on `loading`, [`CompilingKernels::JOBS`] of them, each writing
-    /// the device's pipeline cache file when it finishes, so an interrupted first run keeps
-    /// what it compiled. Returns at once; a job that fails or panics reports it through
+    /// [`Self::new`] as jobs on `loading`, at most [`CompilingKernels::JOBS`] of them, each
+    /// writing the device's pipeline cache file when it finishes, so an interrupted first run
+    /// keeps what it compiled. Returns at once; a job that fails or panics reports it through
     /// [`CompilingKernels::finish`].
     pub fn spawn(
         device: &Device,
         kernels: &'static KernelSet,
         tables: &BsdfTables,
         entry: PathEntry,
-        loading: &Loading,
+        loading: &Arc<Loading>,
     ) -> CompilingKernels {
         let rays = runs_rays(device, entry);
         let path = |kernel: PathKernel| {
             compile_job(device, loading, move |d| (kernel.compile)(d, kernels, rays))
         };
+        let paths = if runs_staged() {
+            CompilingPaths::Staged(
+                (0..staged::stage_count())
+                    .map(|i| staged::spawn_stage(device, kernels, loading, i, rays))
+                    .collect(),
+            )
+        } else {
+            CompilingPaths::Mega {
+                paths: path(VIEW),
+                photons: path(PHOTONS),
+                background: path(BACKGROUND),
+                update: path(UPDATE),
+            }
+        };
         CompilingKernels {
-            paths: path(VIEW),
-            photons: path(PHOTONS),
-            background: path(BACKGROUND),
-            update: path(UPDATE),
-            support: compile_job(device, loading, move |d| SupportKernels::new(d, kernels)),
+            device: device.clone(),
+            rays,
+            kernels,
+            loading: Arc::clone(loading),
+            paths,
+            support: SupportKernels::pipelines()
+                .map(|compile| compile_job(device, loading, move |d| compile(d, kernels)))
+                .collect(),
             tables: tables.clone(),
+        }
+    }
+
+    /// Queues the compile of the staged path loop's tail stage on `loading`, unless it is ready
+    /// or queued: a job of minutes on a first run, which the kernels do not wait for. Until it
+    /// finishes, paths take every round of their stages, which costs time and changes no image.
+    /// [`CompilingKernels::finish`] queues it; kernels from [`Self::new`] need this call.
+    pub fn compile_tail(&self, device: &Device, kernels: &'static KernelSet, loading: &Loading) {
+        if let PathKernels::Staged(k) = &self.paths {
+            k.stages.compile_tail(device, kernels, loading);
+            // The update paths' kernel is a compute kernel: nothing of theirs gains by reordering.
+            k.update.compile(device, loading, move |d| {
+                (UPDATE.compile)(d, kernels, false)
+            });
+            let rays = k.rays;
+            k.photons.compile(device, loading, move |d| {
+                (PHOTONS.compile)(d, kernels, rays)
+            });
         }
     }
 
@@ -1379,7 +1638,13 @@ impl LightingKernels {
             };
         let walk_points = lighting.walk_compaction
             && pass.walking_materials
-            && matches!(self.paths, PathPipeline::Rays(_))
+            && matches!(
+                self.paths,
+                PathKernels::Mega {
+                    paths: PathPipeline::Rays(_),
+                    ..
+                }
+            )
             && view.device.caps().reorder;
         let mut flags = 0;
         let mut froxels = view.media.volume(pass.frame);
@@ -1396,6 +1661,18 @@ impl LightingKernels {
         if pass.frosted_glass {
             flags |= DIELECTRIC_FROST;
         }
+        if matches!(self.paths, PathKernels::Staged(_)) {
+            let pixels = view.extent[0] * view.extent[1];
+            let walking = pass.walking_materials;
+            if !view
+                .staged
+                .as_ref()
+                .is_some_and(|m| m.fits(pixels, walking))
+            {
+                view.staged = None;
+                view.staged = Some(StagedMemory::new(&view.device, pixels, walking)?);
+            }
+        }
         let path_root = PathRoot {
             scene: pass.scene,
             view: pass.view,
@@ -1408,9 +1685,12 @@ impl LightingKernels {
                 GpuPtr::NULL
             },
             radiance: view.targets.radiance.storage(0),
-            primary_candidates: lighting.primary_di_candidates,
-            bounce_candidates: lighting.bounce_di_candidates,
-            max_bounces: lighting.max_bounces,
+            primary_candidates: scratch_u32(
+                "ORR_SCRATCH_CANDIDATES",
+                lighting.primary_di_candidates,
+            ),
+            bounce_candidates: scratch_u32("ORR_SCRATCH_CANDIDATES", lighting.bounce_di_candidates),
+            max_bounces: scratch_u32("ORR_SCRATCH_BOUNCES", lighting.max_bounces),
             roulette_depth,
             mode,
             frame: pass.sample_index,
@@ -1445,10 +1725,22 @@ impl LightingKernels {
             dof_mask,
             dof_focus,
             dof_aperture,
-            _pad0: 0,
+            source: 0,
             overlay_front: view.overlay_front_words(pass.frame),
             caustics: GpuPtr::NULL,
-            _pad1: 0,
+            stages: GpuPtr::NULL,
+            slice_base: 0,
+            slice_count: 0,
+            features: if pass.walking_materials {
+                FEATURE_WALK
+            } else {
+                0
+            } | if lighting.dispersion && pass.dispersive_materials {
+                FEATURE_DISPERSION
+            } else {
+                0
+            },
+            round: 0,
         };
         let path_root = PathRoot {
             caustics: self.record_photons(list, scene, view, pass, lighting, &path_root)?,
@@ -1461,23 +1753,72 @@ impl LightingKernels {
                 local: GpuPtr::NULL,
                 light_flags: 0,
                 dof_background: StorageImageIndex::NONE,
-                // Update paths do not walk.
+                // Update paths do not walk, nor split by wavelength.
                 sss_flags: path_root.sss_flags & !SSS_POINTS,
                 dielectric_flags: path_root.dielectric_flags & DIELECTRIC_DISPERSION,
+                features: 0,
                 pixel_fraction: 1.0,
                 ..path_root
             };
             list.begin_pass("world cache update paths", false);
-            self.update
-                .record(list, &update_root, view.extent.map(|e| e.div_ceil(block)));
+            let blocks = view.extent.map(|e| e.div_ceil(block));
+            match &self.paths {
+                PathKernels::Mega { update, .. } => update.record(list, &update_root, blocks),
+                PathKernels::Staged(k) if k.update.get().is_some() => {
+                    let update = k.update.get().expect("checked above");
+                    update.record(list, &update_root, blocks);
+                }
+                PathKernels::Staged(k) => k.stages.record(
+                    list,
+                    view.staged.as_ref().expect("made above"),
+                    &update_root,
+                    Source::Update,
+                    blocks[0] * blocks[1],
+                    path_rounds(&update_root),
+                    1,
+                )?,
+            }
             list.end_pass();
         }
+        let pixels = view.extent[0] * view.extent[1];
         list.begin_pass("view paths", false);
-        self.paths.record(list, &path_root, view.extent);
+        match &self.paths {
+            PathKernels::Mega { paths, .. } => paths.record(list, &path_root, view.extent),
+            PathKernels::Staged(k) => k.stages.record(
+                list,
+                view.staged.as_ref().expect("made above"),
+                &path_root,
+                Source::View,
+                pixels,
+                path_rounds(&path_root),
+                if pass.frosted_glass { 2 } else { 1 },
+            )?,
+        }
         list.end_pass();
         if pass.dof_background.is_some() {
             list.begin_pass("background paths", false);
-            self.background.record(list, &path_root, view.extent);
+            match &self.paths {
+                PathKernels::Mega { background, .. } => {
+                    background.record(list, &path_root, view.extent);
+                }
+                PathKernels::Staged(k) => {
+                    // `background_texel` runs the full path at the view path's other settings.
+                    let background_root = PathRoot {
+                        mode: 0,
+                        pixel_fraction: 1.0,
+                        ..path_root
+                    };
+                    k.stages.record(
+                        list,
+                        view.staged.as_ref().expect("made above"),
+                        &background_root,
+                        Source::Background,
+                        pixels,
+                        path_rounds(&background_root),
+                        1,
+                    )?;
+                }
+            }
             list.end_pass();
         }
         Ok(())
@@ -1551,14 +1892,32 @@ impl LightingKernels {
             sss_flags: path.sss_flags & !SSS_POINTS,
             dielectric_flags: path.dielectric_flags
                 & (DIELECTRIC_DISPERSION | DIELECTRIC_REFERENCE),
+            // Photons do not walk.
+            features: path.features & !FEATURE_WALK,
             pixel_fraction: 1.0,
             caustics: root,
             ..*path
         };
         let rows = photons.div_ceil(PHOTON_ROW);
         list.begin_pass("caustic photons", false);
-        self.photons
-            .record(list, &photon_root, [photons.min(PHOTON_ROW), rows]);
+        match &self.paths {
+            PathKernels::Mega { photons: p, .. } => {
+                p.record(list, &photon_root, [photons.min(PHOTON_ROW), rows]);
+            }
+            PathKernels::Staged(k) if k.photons.get().is_some() => {
+                let p = k.photons.get().expect("checked above");
+                p.record(list, &photon_root, [photons.min(PHOTON_ROW), rows]);
+            }
+            PathKernels::Staged(k) => k.stages.record(
+                list,
+                view.staged.as_ref().expect("made by record_paths"),
+                &photon_root,
+                Source::Photon,
+                photons,
+                path_rounds(&photon_root),
+                1,
+            )?,
+        }
         if lighting.reference.is_none() {
             list.barrier(
                 Stages::COMPUTE | Stages::RAY,

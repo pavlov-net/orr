@@ -1231,7 +1231,19 @@ fn compile_one(
         source: &source,
         links: &job.links,
     };
+    let slang_started = Instant::now();
     let compiled = compile_kernel(&session, settings, &unit)?;
+    if env::var_os("ORR_SHADER_TIMINGS").is_some() {
+        #[allow(clippy::print_stdout)]
+        {
+            println!(
+                "cargo::warning=orr_shaders: {name} slang {:.2} s, {} words, {} links",
+                slang_started.elapsed().as_secs_f64(),
+                compiled.words.len(),
+                job.links.len()
+            );
+        }
+    }
     let debug_info = match &compiled.debug {
         Some(debug) => {
             let path = job.spv.with_extension("dbg.spv");

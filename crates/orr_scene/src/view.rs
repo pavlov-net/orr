@@ -253,6 +253,9 @@ pub struct RasterView {
     pub scattering_interiors: bool,
     /// Whether the scene holds a medium proxy.
     pub medium_proxies: bool,
+    /// Whether any material the scene holds disperses: its transmission has a dispersion scale
+    /// and an Abbe number above 0.
+    pub dispersive_materials: bool,
     /// The view history it rendered with.
     pub history: ViewHistoryId,
     /// The scene's sky statistics, which lighting's scene pass writes and exposure reads.

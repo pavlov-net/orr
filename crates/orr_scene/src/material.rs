@@ -304,6 +304,8 @@ pub(crate) struct MaterialTable {
     interiors: Mutex<HashSet<u32>>,
     /// Those of them whose interior scatters.
     scattering_interiors: Mutex<HashSet<u32>>,
+    /// Materials whose transmission disperses.
+    dispersive: Mutex<HashSet<u32>>,
     /// Materials whose displacement is a world length.
     world_lengths: Mutex<HashSet<u32>>,
 }
@@ -357,6 +359,7 @@ impl MaterialTable {
             walking: Mutex::new(HashSet::new()),
             interiors: Mutex::new(HashSet::new()),
             scattering_interiors: Mutex::new(HashSet::new()),
+            dispersive: Mutex::new(HashSet::new()),
             world_lengths: Mutex::new(HashSet::new()),
         })
     }
@@ -384,6 +387,10 @@ impl MaterialTable {
         mark(&self.interiors, bounds_interior(m));
         mark(&self.scattering_interiors, interior_scatters(m));
         mark(
+            &self.dispersive,
+            m.transmission_dispersion_scale > 0.0 && m.transmission_dispersion_abbe_number > 0.0,
+        );
+        mark(
             &self.world_lengths,
             m.flags & material_flags::DISPLACEMENT_WORLD != 0,
         );
@@ -409,6 +416,11 @@ impl MaterialTable {
         !self.scattering_interiors.lock().unwrap().is_empty()
     }
 
+    /// Whether any material's transmission disperses.
+    pub(crate) fn any_dispersive(&self) -> bool {
+        !self.dispersive.lock().unwrap().is_empty()
+    }
+
     /// Whether any of `ids` displaces by a world length.
     pub(crate) fn any_world_length(&self, ids: &[MaterialId]) -> bool {
         let set = self.world_lengths.lock().unwrap();
@@ -429,6 +441,7 @@ impl MaterialTable {
         self.walking.lock().unwrap().remove(&id.0);
         self.interiors.lock().unwrap().remove(&id.0);
         self.scattering_interiors.lock().unwrap().remove(&id.0);
+        self.dispersive.lock().unwrap().remove(&id.0);
         self.world_lengths.lock().unwrap().remove(&id.0);
         self.ids.lock().unwrap().free(id.0, 1);
     }

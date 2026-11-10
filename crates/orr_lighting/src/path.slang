@@ -118,6 +118,36 @@ public static const float INSCATTER_SEGMENT = 500.0;
 // `NEE_METAL_ROUGHNESS`; BSDF rays carry the rest.
 public static const float NEE_METAL_ROUGHNESS = 0.3;
 
+// The staged paths' memory (`path.stages`): per-path state in words of 16 bytes, each word
+// of every path together, and the queues of path slots between stages: a list per queue, and
+// its state for each round of stages.
+public struct PathStages
+{
+    public uint capacity;               // path slots
+    public uint rounds;                 // rounds of queue state
+    public StageQueue* queues;          // STAGE_QUEUES per round
+    public uint* lists;                 // a list of `capacity` slots per queue
+    public uint4* words;                // PATH_WORDS words per slot
+    public uint4* shadows;              // SHADOW_WORDS words per slot: a deferred shadow ray
+    public uint4* records;              // RECORD_WORDS words per slot, the path record's
+    public uint4* walks;                // WALK_WORDS words per slot: a walk's entry; null where no material walks
+}
+
+// A queue of path slots in one round. Its stage has a variant without scene features' code,
+// which runs over `groups` workgroups, and one with all of it, which runs over `full_groups`:
+// whoever appends to the queue counts the workgroups of the variant the paths run.
+public struct StageQueue
+{
+    public uint groups;
+    public uint groups_y;
+    public uint groups_z;
+    public uint count;                  // slots appended
+    public uint full_groups;
+    public uint full_groups_y;
+    public uint full_groups_z;
+    public uint _pad0;
+}
+
 public struct PathRoot
 {
     public SceneRoot* scene;
@@ -173,13 +203,19 @@ public struct PathRoot
     public TextureIndex dof_mask;
     public float* dof_focus;
     public float dof_aperture;
-    public uint _pad0;
+    public uint source;             // PATH_SOURCE_*: the staged paths this root runs
     // The view's overlay front words (`overlay_front_word`), null while off.
     public uint64_t* overlay_front;
     // The caustic photons paths gather and photons deposit in; null for none, which leaves
     // every caustic to BSDF rays.
     public CausticsGpu* caustics;
-    public uint64_t _pad1;
+    // The staged paths' state and queues, and the share of the source's paths this root runs:
+    // `slice_count` from `slice_base` on.
+    public PathStages* stages;
+    public uint slice_base;
+    public uint slice_count;
+    public uint features;           // FEATURE_* (path/stages.slang) the scene and view may need beyond the light set's
+    public uint round;              // the rounds this root runs: `round_now`, `round_pass`, `round_next` (path/stages.slang)
 }
 
 // A pixel's front layer over the G-buffer: the top 24 bits of the reverse-Z device depth, so
@@ -508,30 +544,41 @@ public interface IShadow
     float3 transmittance(float3 start, float3 origin, float3 dir, float t_max, HitContext context, bool environment, bool directional, out StackLight stack);
 }
 
-// Next-event estimation at `x` (a zero shading normal for a point in a medium), weighed by
-// `f`, with local sampler `local` (null for none). It draws the directional lights with the
-// vertex's directional share, taking one candidate; otherwise `candidates` draws from the rest
-// of the light set's mixture, resampled by unshadowed luminance. Splitting the two keeps an
-// occluded sun, whose unshadowed light outweighs every emitter, from winning nearly every
-// resampling. One shadow ray through `shadow` goes to the winner, aimed at its point on a
-// finite light, or for a directional light straight or through a plane stack; it is weighted
-// against BSDF sampling unless `weight_one`. `light` is the winner's feedback id, NO_LIGHT for a
-// directional winner or none. With `no_environment` the environment's candidates count for
-// nothing. An emitter's coat and fuzz pass its light into the vertex's medium, of IOR
-// `exterior_ior`. At a `chain` vertex, what a light other than the environment gives keeps
-// `keep` of the share outside the vertex's diffuse lobes, the caustic photons' to give. The
-// shadow ray reports texture feedback with `feedback` (`HitContext.feedback`). Draws one
-// sampler dimension and six per candidate, and counts the ray in `rays`. Where `f` is
-// `specular_only` no candidate has a value, so it takes the dimensions and draws none.
-public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot r, PathVertex x, F f, V shadow, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, float exterior_ior, float3 keep, bool chain, bool feedback, inout Sampler rng, inout uint rays, out uint light, bool no_environment = false)
+// What next-event estimation draws at a vertex before its shadow ray: the winner, what it gives
+// unshadowed along the straight way, and the ray toward it.
+public struct NeeDraw
+{
+    public bool traced;                 // a shadow ray goes to the winner
+    public ResolvedLightSample chosen;
+    public float3 e;                    // the vertex's BSDF x cos x the winner's radiance
+    public float3 l;                    // the winner's radiance
+    public float W;                     // its resampling weight
+    public float scatter_pdf;           // the vertex's own density of its direction
+    public float3 origin;               // the shadow ray's
+    public float3 toward;
+    public float t_max;
+}
+
+// The draws of next-event estimation at `x` (a zero shading normal for a point in a medium),
+// weighed by `f`, with local sampler `local` (null for none). It draws the directional lights
+// with the vertex's directional share, taking one candidate; otherwise `candidates` draws from
+// the rest of the light set's mixture, resampled by unshadowed luminance. Splitting the two
+// keeps an occluded sun, whose unshadowed light outweighs every emitter, from winning nearly
+// every resampling. The shadow ray goes to the winner, aimed at its point on a finite light, or
+// straight for a directional light. With `no_environment` the environment's candidates count
+// for nothing. At a `chain` vertex, what a light other than the environment gives keeps `keep`
+// of the share outside the vertex's diffuse lobes, the caustic photons' to give. Draws one
+// sampler dimension and six per candidate. Where `f` is `specular_only` no candidate has a value,
+// so it takes the dimensions and draws none.
+public NeeDraw nee_draw<S : ISurface, F : IScatter>(PathRoot r, PathVertex x, F f, uint2 pixel, LocalLights* local, uint candidates, float3 keep, bool chain, inout Sampler rng, bool no_environment)
 {
     LightSetGpu* set = r.set;
-    light = NO_LIGHT;
+    NeeDraw d = (NeeDraw)0;
     uint end = rng.dimension + 1 + 6 * candidates;
     if (f.specular_only())
     {
         rng.dimension = end;
-        return float3(0.0);
+        return d;
     }
     NeeVertex v = nee_vertex(set, x.surface.position, x.surface.normal, pixel, local);
     ResolvedLightSample chosen = no_candidate();
@@ -567,8 +614,7 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
     }
     rng.dimension = end;
     if (!(sum > 0.0))
-        return float3(0.0);
-    float W = sum / (float(drawn) * chosen_target);
+        return d;
     float3 dir = chosen.dir;
     float3 l = chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, chosen.light, dir) : chosen.radiance;
     float3 fe = chosen_f;
@@ -576,7 +622,7 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
         fe = chosen_diffuse + max(chosen_f - chosen_diffuse, 0.0) * keep;
     float3 e = fe * l;
     if (all(e == 0.0))
-        return float3(0.0);
+        return d;
     float3 origin = vertex_origin(x, dir);
     float t_max = chosen.distance;
     float3 toward = dir;
@@ -590,36 +636,66 @@ public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot
         float magnitude = max(abs(chosen.point.x), max(abs(chosen.point.y), abs(chosen.point.z)));
         t_max = max(0.0, length_to - max(1e-4 * length_to, magnitude * F32_PRECISION));
     }
+    d.traced = true;
+    d.chosen = chosen;
+    d.e = e;
+    d.l = l;
+    d.W = sum / (float(drawn) * chosen_target);
+    d.scatter_pdf = chosen_scatter_pdf;
+    d.origin = origin;
+    d.toward = toward;
+    d.t_max = t_max;
+    return d;
+}
+
+// What draw `d` gives where its shadow ray found `vis` through plane stack `stack`, before its
+// resampling weight: through a stack the light leaves the vertex along its bent direction,
+// which BSDF sampling draws at its density there. `scatter_pdf` is the vertex's density of the
+// way the light takes.
+public float3 nee_bent<F : IScatter>(NeeDraw d, F f, float3 vis, StackLight stack, float3 keep, bool chain, out float scatter_pdf)
+{
+    scatter_pdf = d.scatter_pdf;
+    if (!any(stack.bent != d.toward) || !any(vis > 0.0))
+        return d.e;
+    float3 db;
+    float3 fb = f.eval_and_pdf(stack.bent, scatter_pdf, db);
+    scatter_pdf *= stack.density;
+    float3 fe = fb;
+    if (chain)
+        fe = db + max(fb - db, 0.0) * keep;
+    return fe * d.l * stack.jacobian;
+}
+
+// Next-event estimation at `x`: `nee_draw`, then one shadow ray through `shadow`, for a
+// directional light straight or through a plane stack; it is weighted against BSDF sampling
+// unless `weight_one`. `light` is the winner's feedback id, NO_LIGHT for a directional winner
+// or none. An emitter's coat and fuzz pass its light into the vertex's medium, of IOR
+// `exterior_ior`. The shadow ray reports texture feedback with `feedback`
+// (`HitContext.feedback`), and counts in `rays`.
+public float3 shade_vertex_nee<S : ISurface, F : IScatter, V : IShadow>(PathRoot r, PathVertex x, F f, V shadow, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, float exterior_ior, float3 keep, bool chain, bool feedback, inout Sampler rng, inout uint rays, out uint light, bool no_environment = false)
+{
+    light = NO_LIGHT;
+    NeeDraw d = nee_draw<S>(r, x, f, pixel, local, candidates, keep, chain, rng, no_environment);
+    if (!d.traced)
+        return float3(0.0);
     RayCone cone = { 0.0, 0.0 };
     HitContext context = hit_context(HIT_SECONDARY, depth + 1, cone, 0.0, float2(-1.0), feedback);
     rays++;
     StackLight stack;
-    float3 vis = shadow.transmittance(x.surface.position, origin, toward, t_max, context, chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, chosen.kind == LIGHT_SAMPLE_DIRECTIONAL, stack);
-    {
-        // Through a plane stack the light leaves the vertex along its bent direction, which
-        // BSDF sampling draws at its density there.
-        if (any(stack.bent != toward) && any(vis > 0.0))
-        {
-            float3 db;
-            float3 fb = f.eval_and_pdf(stack.bent, chosen_scatter_pdf, db);
-            chosen_scatter_pdf *= stack.density;
-            fe = fb;
-            if (chain)
-                fe = db + max(fb - db, 0.0) * keep;
-            e = fe * l * stack.jacobian;
-        }
-    }
-    if (chosen.view && any(vis > 0.0))
-        vis *= emitter_view_layer<S>(set, chosen, exterior_ior);
+    float3 vis = shadow.transmittance(x.surface.position, d.origin, d.toward, d.t_max, context, d.chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, d.chosen.kind == LIGHT_SAMPLE_DIRECTIONAL, stack);
+    float scatter_pdf;
+    float3 e = nee_bent(d, f, vis, stack, keep, chain, scatter_pdf);
+    if (d.chosen.view && any(vis > 0.0))
+        vis *= emitter_view_layer<S>(r.set, d.chosen, exterior_ior);
     float mis = 1.0;
     // Every light the tiles hold is one BSDF rays reach too, along the same straight way:
     // emissive entries' surfaces, and sphere and rect lights through their proxies. A
     // directional light is, through a plane stack too.
     if (!weight_one)
-        mis = mis_balance(run * chosen.pdf, chosen_scatter_pdf);
-    if (chosen.kind != LIGHT_SAMPLE_DIRECTIONAL)
-        light = chosen.light;
-    return e * vis * (W * mis / run);
+        mis = mis_balance(run * d.chosen.pdf, scatter_pdf);
+    if (d.chosen.kind != LIGHT_SAMPLE_DIRECTIONAL)
+        light = d.chosen.light;
+    return e * vis * (d.W * mis / run);
 }
 
 // Whether a vertex on `s` at path depth `depth` walks its subsurface share, on a path that
@@ -1267,20 +1343,20 @@ public InteriorWalk<S> interior_tracer<S : ISurface>(PathRoot r, uint medium, fl
 }
 
 // What leaves a path's vertex.
-struct LayerRay
+public struct LayerRay
 {
-    float3 origin;
-    float3 dir;
-    float3 start;                   // the point `origin` is offset from, whose segment it is
-    float pdf;                      // 0 for an ideal-specular direction
-    float run;                      // the vertex's next-event probability
-    float3 normal;                  // the vertex's shading normal, zero in a medium
-    float3 from;                    // the vertex's position, from which light densities are taken
-    bool diffuse;
-    bool chain;                     // left a layer or a scatter
-    bool scatter;                   // may scatter in an interior
-    bool local;                     // left the first vertex, which reads its tile's local light sampler
-    bool lit;                       // the vertex's next-event estimation took its lights but the environment at weight 1
+    public float3 origin;
+    public float3 dir;
+    public float3 start;            // the point `origin` is offset from, whose segment it is
+    public float pdf;               // 0 for an ideal-specular direction
+    public float run;               // the vertex's next-event probability
+    public float3 normal;           // the vertex's shading normal, zero in a medium
+    public float3 from;             // the vertex's position, from which light densities are taken
+    public bool diffuse;
+    public bool chain;              // left a layer or a scatter
+    public bool scatter;            // may scatter in an interior
+    public bool local;              // left the first vertex, which reads its tile's local light sampler
+    public bool lit;                // the vertex's next-event estimation took its lights but the environment at weight 1
 }
 
 // What a path records about its vertices as it traces them.
@@ -1604,25 +1680,25 @@ public struct PathStart
 // The plane stack a path's ray crosses since the vertex that last scattered it, `x`, which
 // next-event estimation there reaches a directional light through; for a photon, since its
 // light.
-struct PathStack
+public struct PathStack
 {
-    bool valid;                     // every vertex since `x` is a stack face or a null crossing, in a scene with stack entries
-    uint crossed;                   // stack faces so far
-    float3 normal;                  // the first face's shading normal
-    float3 origin;                  // `x`'s ray origin
-    float3 dir;                     // the ray's direction there
-    float3 x_normal;                // `x`'s shading normal, zero in a medium
-    float pdf;                      // `x`'s density of `dir`
-    float run;                      // `x`'s next-event probability
-    float ior;                      // of the medium `dir` leaves `x` into
-    uint depth;                     // `x`'s
+    public bool valid;              // every vertex since `x` is a stack face or a null crossing, in a scene with stack entries
+    public uint crossed;            // stack faces so far
+    public float3 normal;           // the first face's shading normal
+    public float3 origin;           // `x`'s ray origin
+    public float3 dir;              // the ray's direction there
+    public float3 x_normal;         // `x`'s shading normal, zero in a medium
+    public float pdf;               // `x`'s density of `dir`
+    public float run;               // `x`'s next-event probability
+    public float ior;               // of the medium `dir` leaves `x` into
+    public uint depth;              // `x`'s
 }
 
 // Whether next-event estimation at a vertex of depth `depth` whose rays leave from `origin`
 // reaches a directional light along `dir` through the plane stack `stack` the path crossed: its
 // probe meets a face parallel to the stack's first. The probe's alpha tests report texture
 // feedback with `feedback` (`HitContext.feedback`).
-bool stack_owns<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, PathStack stack, uint depth, bool dispersion, bool feedback)
+public bool stack_owns<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, PathStack stack, uint depth, bool dispersion, bool feedback)
 {
     if (!stack.valid || stack.crossed == 0)
         return false;
@@ -1660,6 +1736,39 @@ public uint path_iterations(PathRoot r)
 // estimation at the vertex before the stack. A ray through a thin wall that is an ideal window
 // keeps what the vertex before it gave it: that light is straight, and shadow rays take it.
 public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRecord>(PathRoot r, PathStart start, uint2 pixel, inout Sampler rng, inout uint rays, inout R record, out float3 exposed, out float3 sky)
+{
+    PathResume none = (PathResume)0;
+    return resume_path<C, S, M>(r, start, none, pixel, rng, rays, record, exposed, sky);
+}
+
+// Where a path whose vertices another kernel shaded so far goes on in `trace_path`'s loop: at
+// the trace of iteration `iteration`, whose vertex left ray `ray`. The path's interiors and
+// throughput come in its `PathStart`; the rest of what the loop carries is here.
+public struct PathResume
+{
+    public bool on;
+    public uint iteration;
+    public uint depth;
+    public uint opaque;
+    public uint layers;
+    public uint chains;
+    public bool walked;
+    public bool dispersive;
+    public bool through;
+    public float3 radiance;
+    public float3 keep;
+    public RayCone cone;
+    public uint entered;
+    public float3 entered_at;
+    public float3 entered_normal;
+    public LayerRay ray;
+    public PathStack stack;
+    public Spectral spectral;
+}
+
+// `trace_path`, or with `resume.on` the rest of a path from where `resume` says: `start` then
+// gives only its interiors and throughput.
+public float3 resume_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRecord>(PathRoot r, PathStart start, PathResume resume, uint2 pixel, inout Sampler rng, inout uint rays, inout R record, out float3 exposed, out float3 sky)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
@@ -1725,12 +1834,31 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
     ray.start = start.origin;
     ray.dir = start.dir;
     uint points = walk_points(r);
+    if (resume.on)
+    {
+        depth = resume.depth;
+        opaque = resume.opaque;
+        layers = resume.layers;
+        chains = resume.chains;
+        walked = resume.walked;
+        dispersive = resume.dispersive;
+        through = resume.through;
+        radiance = resume.radiance;
+        keep = resume.keep;
+        cone = resume.cone;
+        entered = resume.entered;
+        entered_at = resume.entered_at;
+        entered_normal = resume.entered_normal;
+        ray = resume.ray;
+        stack = resume.stack;
+        spectral = resume.spectral;
+    }
     // Set for the first iteration, which traces the camera ray (or takes the hit it was given)
     // and leaves no vertex. Without one the path starts on the G-buffer's surface. Keeping that
     // out of the loop keeps the loop's coherence point out of a branch, which costs far more
     // than the second load.
-    bool camera = start.mask != 0;
-    if (!camera)
+    bool camera = !resume.on && start.mask != 0;
+    if (!camera && !resume.on)
     {
         PathVertex x;
         if (!gbuffer_vertex(s, v, r.gbuffer, pixel, x))
@@ -1760,9 +1888,11 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
 
     // A walk takes an iteration of its own, and its exit vertex the next one at the same
     // depth.
-    for (uint i = 0; i < path_iterations(r); i++)
+    for (uint i = resume.on ? resume.iteration : 0; i < path_iterations(r); i++)
     {
-        if (!alive || (!camera && l.kind != VERTEX_LAYER && opaque > r.max_bounces + 1))
+        // A resumed path's first iteration starts at its trace: its vertex is shaded.
+        bool resumed = resume.on && i == resume.iteration;
+        if (!resumed && (!alive || (!camera && l.kind != VERTEX_LAYER && opaque > r.max_bounces + 1)))
             break;
         bool counted = r.mode == PATH_DIRECT ? depth == 0 : r.mode == PATH_INDIRECT ? depth > 0
             : r.mode == PATH_SUBSURFACE ? walked : true;
@@ -1778,7 +1908,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
         LocalLights* local = nullptr;
         if (depth == 0)
             local = pixel_local_lights(r, pixel);
-        if (!camera)
+        if (!camera && !resumed)
         {
             bool medium_vertex = l.kind == VERTEX_SCATTER;
             bool leaving = l.kind == VERTEX_LEAVE;
@@ -2412,7 +2542,7 @@ public PathStart lens_start(PathRoot r, uint2 pixel, float aperture, float focus
 
 // The interiors at `origin`, a point of the lens: `camera_medium`, flipped at each surface between
 // the eye and it.
-Interior lens_interior<S : ISurface>(PathRoot r, float3 origin)
+public Interior lens_interior<S : ISurface>(PathRoot r, float3 origin)
 {
     ViewConstants* v = r.view;
     Interior interior = Interior();
@@ -2458,14 +2588,14 @@ public Interior gbuffer_interior<S : ISurface>(SceneRoot* s, ViewConstants* v, L
 }
 
 // Whether `pixel`'s path runs this frame, with probability `PathRoot.pixel_fraction`.
-bool runs_path(PathRoot r, uint2 pixel)
+public bool runs_path(PathRoot r, uint2 pixel)
 {
     Sampler subset = Sampler(pixel, r.frame, r.seed ^ SUBSET_STREAM);
     return r.pixel_fraction >= 1.0 || subset.next() < r.pixel_fraction;
 }
 
 // A debug view of `pixel`'s G-buffer surface alone.
-void first_vertex_view<S : ISurface>(PathRoot r, uint2 pixel, inout Sampler rng)
+public void first_vertex_view<S : ISurface>(PathRoot r, uint2 pixel, inout Sampler rng)
 {
     ViewConstants* v = r.view;
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;

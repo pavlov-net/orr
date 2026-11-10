@@ -1519,6 +1519,7 @@ impl BedFrame<'_> {
             scattering_interiors: self.view.scattering_interiors,
             medium_proxies: self.view.medium_proxies,
             particle_lighting: self.particles,
+            dispersive_materials: self.view.dispersive_materials,
         }
     }
 
@@ -2584,7 +2585,7 @@ impl Paths {
         let kernels = slot.get_or_init(|| {
             let tables = BsdfTables::new(device()).unwrap();
             let kernels: &'static KernelSet = Box::leak(Box::new(*kernels));
-            let loading = orr_scene::testing::loading();
+            let loading = Arc::new(orr_scene::testing::loading());
             let jobs = LightingKernels::spawn(device(), kernels, &tables, entry, &loading);
             std::thread::scope(|threads| {
                 for _ in 1..CompilingKernels::JOBS {
