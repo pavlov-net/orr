@@ -10,6 +10,7 @@ import orr_shaders.packing;
 import orr_shaders.random;
 import orr_pack.mesh;
 import orr_scene.producer;
+import orr_scene.scene_may;
 __exported import orr_scene.surface;
 
 // An instance's transform as hits and the raster use it: mesh space to a frame centered
@@ -102,7 +103,7 @@ public bool cluster_placement(SceneRoot* s, uint copy, InstanceGpu inst, Cluster
 public bool hit_producer(SceneRoot* s, uint index, out uint entry)
 {
     entry = index - s.producer_base;
-    return index >= s.producer_base && entry < s.producer_capacity;
+    return may2(MAY2_PRODUCERS) && index >= s.producer_base && entry < s.producer_capacity;
 }
 
 // The transform of producer entry `p`, current or previous, relative to the point at
@@ -633,7 +634,7 @@ public uint traced_material(SceneRoot* s, uint instance_index, uint cluster_id)
     if (hit_producer(s, instance_index, entry))
     {
         ProducerGpu p = s.producers[entry];
-        if (p.strands != 0)
+        if (may2(MAY2_STRANDS) && p.strands != 0)
             return strand_material(p);
         ProducerBatch b = s.batches[entry];
         if (cluster_id >= emitted_clusters(b))
@@ -691,7 +692,7 @@ public bool traced_triangle(SceneRoot* s, uint instance_index, uint cluster_id, 
     {
         ProducerGpu p = s.producers[entry];
         ProducerBatch b = s.batches[entry];
-        if (p.strands != 0 || cluster_id >= emitted_clusters(b))
+        if ((may2(MAY2_STRANDS) && p.strands != 0) || cluster_id >= emitted_clusters(b))
             return false;
         ProducerClusterGpu k = b.clusters[cluster_id];
         if (!producer_placement(s, p, previous, s.origin_cell.xyz, float3(0.0), cell_log2, t.placement))
@@ -828,7 +829,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
 {
     h = (HitInput)0;
     uint entry;
-    if (hit_producer(s, instance_index, entry) && s.producers[entry].strands != 0)
+    if (may2(MAY2_STRANDS) && hit_producer(s, instance_index, entry) && s.producers[entry].strands != 0)
     {
         // Strands are opaque, so only closest hits with their hit point reach here.
         uint cell_log2 = uint(s.origin_cell.w);
