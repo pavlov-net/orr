@@ -304,7 +304,7 @@ pub const BARE_LEAF: &str = "bare leaf";
 /// a small opaque quad 2 m below it.
 pub const MASKED_PANE: &str = "masked pane";
 /// [`LEAF`] without its opacity texture, its material naming linked surface 2, whose
-/// coverage works the rings out from the uv.
+/// coverage works the texture's alpha test out from the uv.
 pub const RINGS_LEAF: &str = "rings leaf";
 /// [`LEAF`] without its opacity texture, its material naming linked surface 3, whose
 /// coverage is a quarter everywhere.
