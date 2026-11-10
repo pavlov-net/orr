@@ -24,6 +24,8 @@ public static const uint CLUSTER_SOLID = 128;     // a dielectric with an interi
 
 // `Cluster.omm_first` of a cluster without micromaps.
 public static const uint CLUSTER_NO_OMM = 0xffffffff;
+// `Cluster.from_group` of a cluster simplified from no group.
+public static const uint CLUSTER_SOURCE = 0xffffffff;
 
 // Cluster `c`'s class, from orr_shaders.trace.
 public uint cluster_class(Cluster c)
@@ -49,7 +51,7 @@ public struct PageHeader
 // A `Cluster.cone` that culls nothing: cutoff 1 in its top byte.
 public static const uint CONE_NONE = 0x7f000000u;
 
-// 144 B. Spheres are (center, radius) in mesh space.
+// 148 B. Spheres are (center, radius) in mesh space.
 public struct Cluster
 {
     public float4 self_sphere;
@@ -77,6 +79,7 @@ public struct Cluster
     public float area;             // m^2
     public half min_thickness;     // m
     public uint16_t part;
+    public uint from_group;        // DAG mode: the group whose simplification made it, or CLUSTER_SOURCE
 }
 
 // A set tree leaf holds at most this many clusters; a set no larger has no tree.
@@ -128,7 +131,8 @@ public struct Group
     public uint16_t first_cluster;
     public uint16_t cluster_count;
     public uint8_t depth;          // simplification steps from the stage's source geometry
-    public uint8_t _pad[3];
+    public uint8_t _pad;
+    public uint16_t node_page;     // the node page holding its leaf; 0 in a resident hierarchy
 }
 
 // 16 B. Nodes `first_node..first_node + node_count` of a paged hierarchy.

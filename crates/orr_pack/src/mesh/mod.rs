@@ -8,7 +8,7 @@
 //! A page is stored in the codec form [`encode_page`] writes, and [`decode_page`] turns it
 //! into the resident layout the GPU reads:
 //!
-//! - [`PageHeader`], then `cluster_count` [`Cluster`] records of 144 B.
+//! - [`PageHeader`], then `cluster_count` [`Cluster`] records of 148 B.
 //! - Positions at `positions_offset`: u16x3 per vertex, the grid offset from the cluster's
 //!   anchor. Mesh-space position is `(anchor + local) x 2^position_exponent`.
 //! - Attributes at `attrs_offset`, `attr_stride` bytes per vertex: normal (octahedral, 2x16
@@ -35,9 +35,10 @@ pub use omm::*;
 use crate::blob::{put_table, put_table_aligned, read, table};
 use crate::{Aabb, Error, Result, Span, Sphere};
 
-pub const SCHEMA: u16 = 6;
+pub const SCHEMA: u16 = 7;
 
-/// Largest hierarchy node page.
+/// Largest streamed hierarchy node page. The top page holds what the pinned pages need,
+/// whatever its size.
 pub const NODE_PAGE_MAX: usize = 64 << 10;
 
 /// Largest resident page.
@@ -86,7 +87,8 @@ pub struct MeshHeader {
     /// DAG mode: [`Group`] per group, in page order.
     pub groups: Span,
     /// DAG mode: [`NodePage`] per node page when the hierarchy is paged; the first is the
-    /// top page.
+    /// top page, which holds the roots and every node above a leaf of a group in a pinned
+    /// page, so that what the pinned pages hold is reachable from mount.
     pub node_pages: Span,
     /// DAG mode: u32 root node per (part, section), part-major, then one per section for
     /// the merged stage. A stage may cover several sections: its root sits at its first
@@ -241,7 +243,8 @@ pub struct PageInfo {
     pub cluster_count: u16,
     pub _pad: u16,
     /// Range of [`MeshInfo::page_deps`]: the earlier pages holding the coarser clusters this
-    /// page's groups simplify into. Empty in discrete mode.
+    /// page's groups simplify into, those whose [`Cluster::from_group`] is one of its groups.
+    /// Empty in discrete mode.
     pub deps: Span,
 }
 
@@ -277,7 +280,10 @@ pub struct Group {
     pub cluster_count: u16,
     /// Simplification steps from the stage's source geometry.
     pub depth: u8,
-    pub _pad: [u8; 3],
+    pub _pad: u8,
+    /// The node page holding the group's leaf; 0, the top page, where the hierarchy is
+    /// resident and for every group in a pinned page.
+    pub node_page: u16,
 }
 
 /// A page of hierarchy nodes: a contiguous node range whose parents all sit in one page.
@@ -288,7 +294,7 @@ pub struct NodePage {
     pub node_count: u32,
     /// Blob index within the mesh entry; the blob holds `node_count` [`Node`] records.
     pub blob: u32,
-    /// The page holding these nodes' parents; [`Self::TOP`] for the top page.
+    /// The earlier page holding these nodes' parents; [`Self::TOP`] for the top page.
     pub parent_page: u32,
 }
 
@@ -362,6 +368,10 @@ pub struct Cluster {
     /// none hits); 0 elsewhere.
     pub min_thickness: u16,
     pub part: u16,
+    /// DAG mode: the group, in [`MeshInfo::groups`], whose simplification made the cluster,
+    /// whose `simplified` and `error` are the cluster's `self_sphere` and `self_error`; in
+    /// discrete mode, and for the source clusters of a stage, [`Self::SOURCE`].
+    pub from_group: u32,
 }
 
 impl Cluster {
@@ -373,6 +383,8 @@ impl Cluster {
     /// [`Section::SOLID`] of the cluster's section.
     pub const SOLID: u8 = Section::SOLID;
     pub const NO_OMM: u32 = !0;
+    /// [`Self::from_group`] of a cluster simplified from no group.
+    pub const SOURCE: u32 = !0;
 
     pub fn class(&self) -> Option<SurfaceClass> {
         SurfaceClass::from_flags(self.flags)
@@ -524,7 +536,7 @@ impl ClusterSets {
     }
 }
 
-const _: () = assert!(size_of::<Cluster>() == 144);
+const _: () = assert!(size_of::<Cluster>() == 148);
 const _: () = assert!(size_of::<PageHeader>() == 96);
 
 /// Blob 0 of a mesh: the header and its tables.
@@ -553,7 +565,7 @@ impl MeshInfo {
         if sections.iter().any(|s| s.class().is_none()) {
             return Err(Error::Malformed("section class"));
         }
-        Ok(Self {
+        let info = Self {
             sections,
             parts: table(blob, header.parts)?,
             part_levels: table(blob, header.part_levels)?,
@@ -568,7 +580,46 @@ impl MeshInfo {
             emissive: ClusterSets::parse(blob, header.emissive)?,
             casters: ClusterSets::parse(blob, header.casters)?,
             header,
-        })
+        };
+        info.check_dag()?;
+        Ok(info)
+    }
+
+    /// Checks what the runtime indexes by in the group and node page tables: groups are in
+    /// page order, each group's clusters lie in its page and its leaf in a node page, the top
+    /// one when its page is pinned, and the top page is the first node page and the only one
+    /// without a parent.
+    fn check_dag(&self) -> Result<()> {
+        let pinned = self.header.pinned_pages as usize;
+        if pinned > self.pages.len() {
+            return Err(Error::Malformed("pinned pages"));
+        }
+        if !self.groups.is_sorted_by_key(|g| g.page) {
+            return Err(Error::Malformed("group order"));
+        }
+        for (i, p) in self.node_pages.iter().enumerate() {
+            if (i == 0) != (p.parent_page == NodePage::TOP)
+                || (i > 0 && p.parent_page as usize >= i)
+            {
+                return Err(Error::Malformed("node page parents"));
+            }
+        }
+        for g in &self.groups {
+            let Some(page) = self.pages.get(g.page as usize) else {
+                return Err(Error::Malformed("group page"));
+            };
+            if u32::from(g.first_cluster) + u32::from(g.cluster_count)
+                > u32::from(page.cluster_count)
+            {
+                return Err(Error::Malformed("group outside its page"));
+            }
+            let pages = self.node_pages.len().max(1);
+            if usize::from(g.node_page) >= pages || ((g.page as usize) < pinned && g.node_page != 0)
+            {
+                return Err(Error::Malformed("group node page"));
+            }
+        }
+        Ok(())
     }
 
     /// Blob 0 bytes; the header's table spans are set from the tables.

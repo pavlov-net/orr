@@ -866,7 +866,10 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
                         let mut d = cx.cluster(c.section, st.part, st.merged, verts, cells, tris);
                         let r = &mut d.record;
                         (r.self_sphere, r.self_error) = match usize::try_from(c.refined) {
-                            Ok(from) => (st.groups[from].sphere, st.groups[from].error),
+                            Ok(from) => {
+                                r.from_group = table_index[first[si] + from];
+                                (st.groups[from].sphere, st.groups[from].error)
+                            }
                             Err(_) => (r.cull_sphere, st.base),
                         };
                         (r.parent_sphere, r.parent_error) = (g.sphere, g.error);
@@ -983,7 +986,8 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
                     first_cluster,
                     cluster_count: g.clusters.len() as u16,
                     depth: u8::try_from(g.depth).map_err(|_| format!("DAG depth {}", g.depth))?,
-                    _pad: [0; 3],
+                    _pad: 0,
+                    node_page: 0,
                 };
                 first_cluster += g.clusters.len() as u16;
                 for (c, &r) in g.clusters.iter().zip(&refined[gi]) {
@@ -1080,17 +1084,31 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
     if merge.is_some() {
         roots.extend((0..sections).map(|sec| stage_of(0, sec, true)));
     }
-    let (nodes, roots) = breadth_first(&nodes, &roots);
+    let pinned = |g: i32| group_table[g as usize].page < pinned_pages;
+    let (nodes, roots, floor) = breadth_first(&nodes, &roots, pinned);
     drop(_hierarchy);
     let _node_pages = crate::profile::zone!("dag.node_pages");
-    let (nodes, node_pages, node_blobs) =
-        if nodes.len() * size_of::<Node>() <= s.hierarchy_resident_max as usize {
-            (nodes, Vec::new(), Vec::new())
-        } else {
-            let per_page = NODE_PAGE_MAX / size_of::<Node>();
-            let (table, blobs) = node_pages(&nodes, &roots, pages.len() as u32 + 1, per_page);
-            (Vec::new(), table, blobs)
-        };
+    let (nodes, node_pages, node_blobs) = if nodes.len() * size_of::<Node>()
+        <= s.hierarchy_resident_max as usize
+    {
+        (nodes, Vec::new(), Vec::new())
+    } else {
+        let per_page = NODE_PAGE_MAX / size_of::<Node>();
+        let (table, blobs, page_of) = node_pages(&nodes, floor, pages.len() as u32 + 1, per_page);
+        if table.len() > 1 << 16 {
+            return Err(format!(
+                "{} hierarchy node pages, over the {} a group names",
+                table.len(),
+                1 << 16
+            ));
+        }
+        for (n, &page) in nodes.iter().zip(&page_of) {
+            if let Ok(g) = usize::try_from(n.group) {
+                group_table[g].node_page = page as u16;
+            }
+        }
+        (Vec::new(), table, blobs)
+    };
 
     let info = MeshInfo {
         header: MeshHeader {
@@ -1154,22 +1172,53 @@ fn fit(cx: &Ctx<'_>, clusters: &mut [ClusterData]) -> Result<(), String> {
 }
 
 /// The nodes renumbered breadth first from the roots, so each node's children are
-/// contiguous and the roots come first; the roots renumbered alike.
-fn breadth_first(nodes: &[Node], roots: &[u32]) -> (Vec<Node>, Vec<u32>) {
-    let mut order: Vec<u32> = roots
-        .iter()
-        .copied()
-        .filter(|&r| r != MeshHeader::NO_ROOT)
-        .collect();
-    let mut new_of = vec![u32::MAX; nodes.len()];
+/// contiguous and the roots come first; the roots renumbered alike; and the floor, the first
+/// nodes: the roots and the children of every node above a leaf whose group `pinned` takes,
+/// which the top node page holds. The rest follow breadth first.
+fn breadth_first(
+    nodes: &[Node],
+    roots: &[u32],
+    pinned: impl Fn(i32) -> bool,
+) -> (Vec<Node>, Vec<u32>, usize) {
+    let tops = || roots.iter().copied().filter(|&r| r != MeshHeader::NO_ROOT);
+    let children = |n: &Node| n.child_first..n.child_first + u32::from(n.child_count);
+    let mut order: Vec<u32> = tops().collect();
     let mut i = 0;
     while i < order.len() {
         let n = &nodes[order[i] as usize];
-        new_of[order[i] as usize] = i as u32;
         if n.group < 0 {
-            order.extend(n.child_first..n.child_first + u32::from(n.child_count));
+            order.extend(children(n));
         }
         i += 1;
+    }
+    // Whether a pinned group's leaf lies below each node: children follow their parent.
+    let mut above = vec![false; nodes.len()];
+    for &k in order.iter().rev() {
+        let n = &nodes[k as usize];
+        above[k as usize] = if n.group < 0 {
+            children(n).any(|c| above[c as usize])
+        } else {
+            pinned(n.group)
+        };
+    }
+    let expand = |order: &mut Vec<u32>, floor: bool| {
+        let mut i = 0;
+        while i < order.len() {
+            let k = order[i] as usize;
+            let n = &nodes[k];
+            if n.group < 0 && above[k] == floor {
+                order.extend(children(n));
+            }
+            i += 1;
+        }
+    };
+    let mut order: Vec<u32> = tops().collect();
+    expand(&mut order, true);
+    let floor = order.len();
+    expand(&mut order, false);
+    let mut new_of = vec![u32::MAX; nodes.len()];
+    for (i, &old) in order.iter().enumerate() {
+        new_of[old as usize] = i as u32;
     }
     let out = order
         .iter()
@@ -1191,30 +1240,29 @@ fn breadth_first(nodes: &[Node], roots: &[u32]) -> (Vec<Node>, Vec<u32>) {
             }
         })
         .collect();
-    (out, roots)
+    (out, roots, floor)
 }
 
-/// Cuts breadth-first nodes into pages of at most `per_page` nodes: the roots open the top
-/// page, and each node's children join the current page when they fit and the page holds
-/// their parent or has their parent's page as its parent. Returns the page table, with
-/// blob indices from `first_blob`, and the page blobs.
+/// Cuts the nodes of [`breadth_first`] into pages: the top page holds the `floor` nodes,
+/// whatever their count, and each other node's children join the current page when they fit
+/// `per_page` nodes and the page holds their parent or has their parent's page as its parent.
+/// Returns the page table, with blob indices from `first_blob`, the page blobs and each
+/// node's page.
 fn node_pages(
     nodes: &[Node],
-    roots: &[u32],
+    floor: usize,
     first_blob: u32,
     per_page: usize,
-) -> (Vec<NodePage>, Vec<Vec<u8>>) {
-    let top = roots.iter().filter(|&&r| r != MeshHeader::NO_ROOT).count();
-    assert!(top <= per_page, "the roots fit the top page");
+) -> (Vec<NodePage>, Vec<Vec<u8>>, Vec<u32>) {
     let mut table = vec![NodePage {
         first_node: 0,
-        node_count: top as u32,
+        node_count: floor as u32,
         blob: first_blob,
         parent_page: NodePage::TOP,
     }];
     let mut page_of = vec![0u32; nodes.len()];
     for (i, n) in nodes.iter().enumerate() {
-        if n.group >= 0 {
+        if n.group >= 0 || (n.child_first as usize) < floor {
             continue;
         }
         let (first, count) = (n.child_first, u32::from(n.child_count));
@@ -1244,7 +1292,7 @@ fn node_pages(
             bytemuck::cast_slice(&nodes[r]).to_vec()
         })
         .collect();
-    (table, blobs)
+    (table, blobs, page_of)
 }
 
 #[cfg(test)]
@@ -1293,36 +1341,51 @@ mod tests {
         nodes
     }
 
+    /// Pages hold contiguous nodes with their siblings, under their parent's page, and the
+    /// top page holds every leaf of a pinned group with each node above it, however many.
     #[test]
-    fn node_pages_keep_siblings_and_parents_together() {
-        let (nodes, roots) = breadth_first(&tree(4, 4), &[0]);
-        for per_page in [5, 7, 16, 64] {
-            let (table, blobs) = node_pages(&nodes, &roots, 10, per_page);
-            assert!(table.len() > 1);
-            assert_eq!(table[0].parent_page, NodePage::TOP);
-            let mut next = 0;
-            for (i, p) in table.iter().enumerate() {
-                assert_eq!(p.first_node, next, "pages are contiguous");
-                assert!(p.node_count as usize <= per_page);
-                assert_eq!(p.blob, 10 + i as u32);
-                assert_eq!(blobs[i].len(), p.node_count as usize * size_of::<Node>());
-                next += p.node_count;
-            }
-            assert_eq!(next as usize, nodes.len());
-            let page_of = |n: u32| {
-                table
-                    .iter()
-                    .position(|p| (p.first_node..p.first_node + p.node_count).contains(&n))
-                    .unwrap()
-            };
-            for (i, n) in nodes.iter().enumerate() {
-                if n.group >= 0 {
-                    continue;
+    fn node_pages_keep_siblings_and_parents_together_and_pinned_leaves_on_top() {
+        let cases: [fn(i32) -> bool; 3] = [|_| false, |g| g % 37 == 5, |g| g < 40];
+        for pinned in cases {
+            let (nodes, roots, floor) = breadth_first(&tree(4, 4), &[0], pinned);
+            let mut parent = vec![None; nodes.len()];
+            for (i, n) in nodes.iter().enumerate().filter(|(_, n)| n.group < 0) {
+                for c in n.child_first..n.child_first + u32::from(n.child_count) {
+                    assert!(c as usize > i, "children follow their parent");
+                    parent[c as usize] = Some(i);
                 }
-                let first = page_of(n.child_first);
-                assert_eq!(first, page_of(n.child_first + u32::from(n.child_count) - 1));
-                let parent = page_of(i as u32);
-                assert!(parent == first || table[first].parent_page as usize == parent);
+            }
+            for per_page in [5, 7, 16, 64] {
+                let (table, blobs, page_of) = node_pages(&nodes, floor, 10, per_page);
+                assert!(table.len() > 1);
+                assert_eq!(table[0].parent_page, NodePage::TOP);
+                assert!(table[0].node_count as usize >= floor.max(roots.len()));
+                let mut next = 0;
+                for (i, p) in table.iter().enumerate() {
+                    assert_eq!(p.first_node, next, "pages are contiguous");
+                    assert!(i == 0 || p.node_count as usize <= per_page);
+                    assert_eq!(p.blob, 10 + i as u32);
+                    assert_eq!(blobs[i].len(), p.node_count as usize * size_of::<Node>());
+                    let r = p.first_node as usize..(p.first_node + p.node_count) as usize;
+                    assert!(page_of[r].iter().all(|&q| q as usize == i));
+                    next += p.node_count;
+                }
+                assert_eq!(next as usize, nodes.len());
+                for (i, n) in nodes.iter().enumerate() {
+                    if n.group >= 0 {
+                        let mut at = Some(i);
+                        while let Some(k) = at.filter(|_| pinned(n.group)) {
+                            assert_eq!(page_of[k], 0, "node {k} above pinned group {}", n.group);
+                            at = parent[k];
+                        }
+                        continue;
+                    }
+                    let first = page_of[n.child_first as usize] as usize;
+                    let last = n.child_first + u32::from(n.child_count) - 1;
+                    assert_eq!(first, page_of[last as usize] as usize);
+                    let parent = page_of[i] as usize;
+                    assert!(parent == first || table[first].parent_page as usize == parent);
+                }
             }
         }
     }

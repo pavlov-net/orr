@@ -72,7 +72,7 @@ pub(crate) fn load(a: &Archive, name: &str) -> Dag {
             assert_eq!(np.first_node as usize, nodes.len());
             let page = mesh::nodes(&read(a, b)).unwrap();
             assert_eq!(page.len(), np.node_count as usize);
-            assert!(page.len() * size_of::<Node>() <= NODE_PAGE_MAX);
+            assert!(i == 0 || page.len() * size_of::<Node>() <= NODE_PAGE_MAX);
             nodes.extend(page);
         }
         nodes

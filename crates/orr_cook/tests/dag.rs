@@ -190,6 +190,43 @@ fn check_structure(d: &Dag) -> Vec<u64> {
         }
     }
     assert!(leaves.iter().all(|&l| l == 1));
+    // A cluster names the group it was simplified from, one step finer, whose bounds and error
+    // are its own and whose page depends on its page; every group a cut can leave has some.
+    let mut simplified = vec![0; info.groups.len()];
+    for g in &info.groups {
+        for c in d.group_of(g) {
+            let r = &d.clusters[c].record;
+            if r.from_group == Cluster::SOURCE {
+                assert_eq!(g.depth, 0, "a source cluster");
+                continue;
+            }
+            let from = &info.groups[r.from_group as usize];
+            simplified[r.from_group as usize] += 1;
+            assert_eq!(from.depth + 1, g.depth);
+            assert_eq!(from.simplified, r.self_sphere);
+            assert_eq!(from.error.to_bits(), r.self_error.to_bits());
+            let deps = &info.pages[from.page as usize].deps;
+            let deps = &info.page_deps[deps.first as usize..][..deps.count as usize];
+            assert!(from.page == g.page || deps.contains(&g.page));
+        }
+    }
+    for (g, &n) in info.groups.iter().zip(&simplified) {
+        assert_eq!(n > 0, g.error.is_finite(), "{g:?}");
+    }
+    // A group names its leaf's node page, the top one for a group in a pinned page.
+    for (i, n) in d.nodes.iter().enumerate() {
+        let Ok(g) = usize::try_from(n.group) else {
+            continue;
+        };
+        let page = info
+            .node_pages
+            .iter()
+            .position(|p| (p.first_node..p.first_node + p.node_count).contains(&(i as u32)))
+            .unwrap_or(0);
+        let g = &info.groups[g];
+        assert_eq!(usize::from(g.node_page), page);
+        assert!(g.page as usize >= pinned || page == 0, "{g:?}");
+    }
     d.part_triangles_per_depth()
 }
 
@@ -501,6 +538,7 @@ fn paged_hierarchy_keeps_children_together() {
         ..dag()
     };
     let paged = load(&cook(wavy(128, true), &[0, 0], settings), "m/mesh");
+    check_structure(&paged);
     assert!(resident.info.node_pages.is_empty());
     assert_eq!(resident.nodes, paged.nodes, "paging keeps the node order");
     let info = &paged.info;

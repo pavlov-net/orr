@@ -131,7 +131,8 @@ mod tests {
             first_cluster: first,
             cluster_count: count,
             depth,
-            _pad: [0; 3],
+            _pad: 0,
+            node_page: 0,
         }
     }
 

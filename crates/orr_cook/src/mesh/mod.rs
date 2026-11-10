@@ -1775,6 +1775,7 @@ fn build_cluster(
         uv_scale: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.scale)),
         omm_first: Cluster::NO_OMM,
         area: area as f32,
+        from_group: Cluster::SOURCE,
         ..bytemuck::Zeroable::zeroed()
     };
     ClusterData {
