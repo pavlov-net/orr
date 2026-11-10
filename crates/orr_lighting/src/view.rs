@@ -1400,7 +1400,9 @@ fn features_may(features: u32) -> u32 {
 
 /// What the paths of a scene that may hold `features` may meet, beyond what their roots say.
 fn scene_may(features: SceneFeatures) -> u32 {
-    bit(features.contains(SceneFeatures::COAT), MAY_COAT)
+    // Scratch: `ORR_SCRATCH_MAY` adds bits to every mask.
+    scratch_u32("ORR_SCRATCH_MAY", 0)
+        | bit(features.contains(SceneFeatures::COAT), MAY_COAT)
         | bit(features.contains(SceneFeatures::FUZZ), MAY_FUZZ)
         | bit(features.contains(SceneFeatures::THIN_FILM), MAY_FILM)
         | bit(features.contains(SceneFeatures::SUBSURFACE), MAY_SUBSURFACE)

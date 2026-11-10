@@ -433,8 +433,11 @@ struct Wanted {
 /// that holds more runs its paths: a scene's mask moves as its materials arrive, and a compile
 /// takes several times this.
 const STABLE: Duration = Duration::from_secs(2);
-/// How long after a view's last frame its request stands, and a set no frame ran is kept.
+/// How long after a view's last frame its request for a mask stands.
 const IDLE: Duration = Duration::from_secs(1);
+/// How long a ready set no frame ran is kept once a newer one is ready: a view that pauses
+/// finds its pipelines again.
+const KEEP: Duration = Duration::from_secs(10);
 
 impl StageSet {
     fn new(may: u32) -> Self {
@@ -648,7 +651,7 @@ impl StagedKernels {
     }
 
     /// Lets go of the sets no view runs any more: one that never held what a view asked, once
-    /// no view asks for its mask, and one no frame has run for [`IDLE`] since another became
+    /// no view asks for its mask, and one no frame has run for [`KEEP`] since another became
     /// ready. The set that may meet everything stays: any view may need it. A set's pipelines
     /// go with its last holder, and its compiles that no thread has started are canceled.
     fn prune(&self, now: Instant) {
@@ -735,6 +738,12 @@ impl StagedKernels {
         let now = Instant::now();
         self.note(may, now);
         if let Some(set) = self.covering(may, stages, now) {
+            if set.may != may {
+                log::debug!(
+                    "paths that may meet {may:#x} run pipelines made for {:#x}",
+                    set.may
+                );
+            }
             return Ok(set);
         }
         let set = self
@@ -924,7 +933,7 @@ fn kept(sets: &[(u32, Option<Instant>, Instant)], wanted: &[u32], now: Instant) 
                 .iter()
                 .enumerate()
                 .any(|(other, (_, r, _))| other != own && r.is_some_and(|r| r > used));
-            !(superseded && now.duration_since(used) > IDLE)
+            !(superseded && now.duration_since(used) > KEEP)
         })
         .collect()
 }
@@ -1210,9 +1219,9 @@ mod tests {
         let sets = [
             // Ran until second 2; the set below became ready at 3.
             (0b0011, Some(at(0)), at(2)),
-            (0b0001, Some(at(3)), at(9)),
+            (0b0001, Some(at(3)), at(19)),
             // Still running, though older than the newest.
-            (0b0111, Some(at(1)), at(9)),
+            (0b0111, Some(at(1)), at(19)),
             // Compiling for a mask a view asks for, and for one none does.
             (0b0101, None, at(4)),
             (0b1001, None, at(4)),
@@ -1220,11 +1229,11 @@ mod tests {
             (MAY_ALL, Some(at(0)), at(0)),
         ];
         assert_eq!(
-            kept(&sets, &[0b0001, 0b0101], at(10)),
+            kept(&sets, &[0b0001, 0b0101], at(20)),
             [false, true, true, true, false, true]
         );
-        // Within IDLE of its last frame a superseded set still stays.
+        // Within KEEP of its last frame a superseded set still stays.
         let recent = [(0b0011, Some(at(0)), at(2)), (0b0001, Some(at(3)), at(3))];
-        assert_eq!(kept(&recent, &[0b0001], at(3)), [true, true]);
+        assert_eq!(kept(&recent, &[0b0001], at(11)), [true, true]);
     }
 }
