@@ -1080,14 +1080,16 @@ impl<'a> Frame<'a> {
             dof_background: false,
         };
         let waits = self.lighting.waits;
-        let asked = kernels
-            .prepare_paths(scene, &needs, lighting)
-            .and_then(|ready| {
-                if !ready && waits && wait {
-                    kernels.wait_paths(scene, &needs, lighting)?;
-                }
-                Ok(ready || waits)
-            });
+        // A caller that waits takes the pipelines made for exactly its view, so its frames do
+        // not depend on what else has compiled.
+        let waited = if waits && wait {
+            kernels.wait_paths(scene, &needs, lighting)
+        } else {
+            Ok(())
+        };
+        let asked = waited
+            .and_then(|()| kernels.prepare_paths(scene, &needs, lighting))
+            .map(|ready| ready || waits);
         asked.map_err(|e| {
             log::error!("{e}");
             let e = Arc::new(e);

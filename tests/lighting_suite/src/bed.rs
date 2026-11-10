@@ -2669,10 +2669,12 @@ impl Paths {
             frosted_glass: pass.frosted_glass,
             dof_background: pass.dof_background.is_some(),
         };
-        if !self
-            .kernels
-            .prepare_paths(lighting, &needs, settings)
-            .unwrap()
+        // A bed that runs specialized takes the pipelines made for exactly its scene.
+        if settings.specialize
+            || !self
+                .kernels
+                .prepare_paths(lighting, &needs, settings)
+                .unwrap()
         {
             // The pipelines these paths first ask for compile on threads of their own.
             std::thread::scope(|threads| {

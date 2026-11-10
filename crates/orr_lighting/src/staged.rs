@@ -3,7 +3,7 @@
 //! indirect dispatches that run a source's paths to their end.
 
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, DispatchArgs, GpuPtr, Hazards, MemoryKind,
@@ -412,13 +412,33 @@ impl<T: Send + 'static> Late<T> {
 pub(crate) struct StageSet {
     may: u32,
     stages: [Late<StagePipeline>; STAGES],
+    /// When a view last asked for it or a frame last ran it.
+    used: Mutex<Instant>,
+    /// When it first held what a view asked for.
+    ready: OnceLock<Instant>,
 }
+
+/// A mask a view asks pipelines for: since when without a break, and when last.
+struct Wanted {
+    may: u32,
+    since: Instant,
+    seen: Instant,
+}
+
+/// How long a view asks for a mask before pipelines compile for exactly it while a ready set
+/// that holds more runs its paths: a scene's mask moves as its materials arrive, and a compile
+/// takes several times this.
+const STABLE: Duration = Duration::from_secs(2);
+/// How long after a view's last frame its request stands, and a set no frame ran is kept.
+const IDLE: Duration = Duration::from_secs(1);
 
 impl StageSet {
     fn new(may: u32) -> Self {
         let late = |stage: Stage| Late::new(stage.source().2);
         Self {
             may,
+            used: Mutex::new(Instant::now()),
+            ready: OnceLock::new(),
             stages: [
                 late(Stage::Reset),
                 late(Stage::Primary),
@@ -479,6 +499,7 @@ pub(crate) struct StagedKernels {
     compiler: OnceLock<(Device, Arc<Loading>)>,
     tail: Late<ComputePipeline>,
     sets: Mutex<Vec<Arc<StageSet>>>,
+    wanted: Mutex<Vec<Wanted>>,
 }
 
 impl StagedKernels {
@@ -492,6 +513,7 @@ impl StagedKernels {
             compiler: OnceLock::new(),
             tail: Late::new("staged tail kernel"),
             sets: Mutex::new(Vec::new()),
+            wanted: Mutex::new(Vec::new()),
         }
     }
 
@@ -576,14 +598,38 @@ impl StagedKernels {
         set
     }
 
+    /// Notes that a view asks for `may` now, and says whether it has asked for it without a
+    /// break for [`STABLE`].
+    fn note(&self, may: u32, now: Instant) -> bool {
+        let mut wanted = self.wanted.lock().unwrap();
+        wanted.retain(|w| now.duration_since(w.seen) <= IDLE);
+        match wanted.iter_mut().find(|w| w.may == may) {
+            Some(w) => {
+                w.seen = now;
+                now.duration_since(w.since) >= STABLE
+            }
+            None => {
+                wanted.push(Wanted {
+                    may,
+                    since: now,
+                    seen: now,
+                });
+                false
+            }
+        }
+    }
+
     /// The ready set that holds `stages` for paths that may meet `may` with the least beyond
-    /// it.
-    fn covering(&self, may: u32, stages: &[Stage]) -> Option<Arc<StageSet>> {
+    /// it, which a view is about to run.
+    fn covering(&self, may: u32, stages: &[Stage], now: Instant) -> Option<Arc<StageSet>> {
         let sets = self.sets.lock().unwrap();
-        sets.iter()
+        let set = sets
+            .iter()
             .filter(|s| s.may & may == may && s.holds(stages))
-            .min_by_key(|s| s.may.count_ones())
-            .cloned()
+            .min_by_key(|s| s.may.count_ones())?;
+        set.ready.get_or_init(|| now);
+        *set.used.lock().unwrap() = now;
+        Some(Arc::clone(set))
     }
 
     /// The set asked to hold `stages` for paths that may meet `may` with the least beyond it,
@@ -596,17 +642,52 @@ impl StagedKernels {
             .cloned()
     }
 
-    /// Asks for `stages` for paths that may meet `may`, and says whether pipelines that hold
-    /// them are ready.
-    /// An error where one made for `may` failed to compile.
+    /// Lets go of the sets no view runs any more: one that never held what a view asked, once
+    /// no view asks for its mask, and one no frame has run for [`IDLE`] since another became
+    /// ready. The set that may meet everything stays: any view may need it. A set's pipelines
+    /// go with its last holder, and its compiles that no thread has started are canceled.
+    fn prune(&self, now: Instant) {
+        let wanted: Vec<u32> = self.wanted.lock().unwrap().iter().map(|w| w.may).collect();
+        let mut sets = self.sets.lock().unwrap();
+        let state: Vec<_> = sets
+            .iter()
+            .map(|s| (s.may, s.ready.get().copied(), *s.used.lock().unwrap()))
+            .collect();
+        let mut keep = kept(&state, &wanted, now).into_iter();
+        sets.retain(|_| keep.next().expect("one per set"));
+    }
+
+    /// Asks for pipelines that hold `stages` for paths that may meet `may`, and says whether
+    /// some are ready. With none ready, those for exactly `may` compile at once; with a ready
+    /// set that holds more, they compile behind everything else once the view has asked for
+    /// `may` for [`STABLE`]. An error where one made for `may` failed to compile.
     pub(crate) fn prepare(&self, may: u32, stages: &[Stage]) -> Result<bool, Error> {
-        let set = self.request(may, stages, Urgency::Needed);
-        for stage in StageSet::runs(may, stages) {
-            if let Some(e) = set.stage(stage).failure() {
-                return Err(e);
+        let now = Instant::now();
+        let stable = self.note(may, now);
+        let covering = self.covering(may, stages, now);
+        match &covering {
+            None => drop(self.request(may, stages, Urgency::Needed)),
+            Some(set) if set.may != may && stable => {
+                self.request(may, stages, Urgency::Idle);
+            }
+            Some(_) => {}
+        }
+        let exact = self
+            .sets
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.may == may)
+            .cloned();
+        if let Some(set) = exact {
+            for stage in StageSet::runs(may, stages) {
+                if let Some(e) = set.stage(stage).failure() {
+                    return Err(e);
+                }
             }
         }
-        Ok(self.covering(may, stages).is_some())
+        self.prune(now);
+        Ok(covering.is_some())
     }
 
     /// How many pipelines asked for are still compiling.
@@ -618,10 +699,37 @@ impl StagedKernels {
             .count() as u32
     }
 
-    /// Waits for pipelines that hold `stages` for paths that may meet `may`, running queued
-    /// jobs on this thread meanwhile.
-    pub(crate) fn wait(&self, may: u32, stages: &[Stage]) -> Result<Arc<StageSet>, Error> {
-        if let Some(set) = self.covering(may, stages) {
+    /// Waits for the pipelines made for exactly `may` that hold `stages`, running queued jobs
+    /// on this thread meanwhile: a caller that waits runs what its view asks for, whatever
+    /// else is ready.
+    pub(crate) fn wait_exact(&self, may: u32, stages: &[Stage]) -> Result<(), Error> {
+        self.note(may, Instant::now());
+        let set = self.request(may, stages, Urgency::Needed);
+        for stage in StageSet::runs(may, stages) {
+            set.stage(stage).wait(self.loading())?;
+        }
+        Ok(())
+    }
+
+    /// Waits for a pipeline the paths do without, as [`Self::start_late`] starts it.
+    pub(crate) fn wait_late<T: Send + 'static>(&self, late: &Late<T>) {
+        // A late pipeline that failed or was left out is done without.
+        let _ = late.wait(self.loading());
+    }
+
+    /// [`Self::wait_late`] for the tail stage.
+    pub(crate) fn wait_tail(&self) {
+        self.start_tail();
+        self.wait_late(&self.tail);
+    }
+
+    /// Pipelines that hold `stages` for paths that may meet `may`, which a frame runs now:
+    /// the ready ones with the least beyond `may`, or with none ready those made for it, after
+    /// waiting for them with queued jobs running on this thread meanwhile.
+    fn wait(&self, may: u32, stages: &[Stage]) -> Result<Arc<StageSet>, Error> {
+        let now = Instant::now();
+        self.note(may, now);
+        if let Some(set) = self.covering(may, stages, now) {
             return Ok(set);
         }
         let set = self
@@ -630,6 +738,8 @@ impl StagedKernels {
         for stage in StageSet::runs(set.may, stages) {
             set.stage(stage).wait(self.loading())?;
         }
+        set.ready.get_or_init(|| now);
+        *set.used.lock().unwrap() = now;
         Ok(set)
     }
 
@@ -672,6 +782,7 @@ impl StagedKernels {
         let walks = root.features & FEATURE_WALK != 0;
         let stages = source.stages(walks);
         let set = self.wait(may, &stages)?;
+        memory.hold(&set);
         let pipeline = |stage: Stage| set.stage(stage).get().expect("the set holds the stage");
         let mut root = PathRoot {
             stages: memory.header.gpu(),
@@ -789,6 +900,27 @@ impl StagedKernels {
         );
         Ok(())
     }
+}
+
+/// Which sets [`StagedKernels::prune`] keeps, of sets given by their mask, when they first held
+/// what a view asked and when they were last used, while views ask for `wanted`.
+fn kept(sets: &[(u32, Option<Instant>, Instant)], wanted: &[u32], now: Instant) -> Vec<bool> {
+    sets.iter()
+        .enumerate()
+        .map(|(own, &(may, ready, used))| {
+            if may == MAY_ALL {
+                return true;
+            }
+            if ready.is_none() {
+                return wanted.contains(&may);
+            }
+            let superseded = sets
+                .iter()
+                .enumerate()
+                .any(|(other, (_, r, _))| other != own && r.is_some_and(|r| r > used));
+            !(superseded && now.duration_since(used) > IDLE)
+        })
+        .collect()
 }
 
 /// Scratch: whether the pipelines paths do without compile on the calling thread, so the first
@@ -911,6 +1043,9 @@ impl StateParts {
 pub(crate) struct StagedMemory {
     capacity: u32,
     parts: StateParts,
+    /// The pipelines the view's last frame recorded, kept until its next: a set let go
+    /// meanwhile outlives the commands that run it.
+    held: Mutex<Vec<Arc<StageSet>>>,
     header: Allocation<PathStages>,
     queues: Allocation<StageQueue>,
     _walks: Option<Allocation<[u32; 4]>>,
@@ -968,6 +1103,7 @@ impl StagedMemory {
         Ok(Self {
             capacity,
             parts,
+            held: Mutex::new(Vec::new()),
             header,
             queues,
             _walks: walks,
@@ -976,6 +1112,15 @@ impl StagedMemory {
             _shadows: shadows,
             _records: records,
         })
+    }
+
+    /// Starts a frame of the view: the last one's commands have been submitted.
+    pub(crate) fn begin_frame(&self) {
+        self.held.lock().unwrap().clear();
+    }
+
+    fn hold(&self, set: &Arc<StageSet>) {
+        self.held.lock().unwrap().push(Arc::clone(set));
     }
 
     /// Whether it holds the slots a view of `pixels` pixels asks for, each with `parts`.
@@ -1000,5 +1145,37 @@ impl StagedMemory {
             .gpu()
             .offset(u64::from(round) * STAGE_QUEUES + queue)
             .cast()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A set goes once no frame has run it since a newer one became ready, a compiling one once
+    /// no view asks for its mask, and the set that may meet everything never.
+    #[test]
+    fn sets_stay_while_frames_run_them_or_views_ask_for_them() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let sets = [
+            // Ran until second 2; the set below became ready at 3.
+            (0b0011, Some(at(0)), at(2)),
+            (0b0001, Some(at(3)), at(9)),
+            // Still running, though older than the newest.
+            (0b0111, Some(at(1)), at(9)),
+            // Compiling for a mask a view asks for, and for one none does.
+            (0b0101, None, at(4)),
+            (0b1001, None, at(4)),
+            // Unused since the start.
+            (MAY_ALL, Some(at(0)), at(0)),
+        ];
+        assert_eq!(
+            kept(&sets, &[0b0001, 0b0101], at(10)),
+            [false, true, true, true, false, true]
+        );
+        // Within IDLE of its last frame a superseded set still stays.
+        let recent = [(0b0011, Some(at(0)), at(2)), (0b0001, Some(at(3)), at(3))];
+        assert_eq!(kept(&recent, &[0b0001], at(3)), [true, true]);
     }
 }

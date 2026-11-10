@@ -1702,8 +1702,10 @@ impl LightingKernels {
         Ok(ready)
     }
 
-    /// Waits for the pipelines [`Self::prepare_paths`] asked for with the same arguments,
-    /// running queued loading jobs on this thread meanwhile.
+    /// Waits for the kernels paths do without until they are ready and then for the pipelines
+    /// made for exactly what a view's frame with `needs` takes under `lighting`, running queued
+    /// loading jobs on this thread meanwhile: the frame then runs what it would once every
+    /// compile had finished, whatever else is ready.
     pub fn wait_paths(
         &self,
         scene: &SceneLighting,
@@ -1711,8 +1713,14 @@ impl LightingKernels {
         lighting: &ViewLighting,
     ) -> Result<(), Error> {
         if let PathKernels::Staged(k) = &self.paths {
+            // A caller that waits runs from its first frame what a view runs once every
+            // compile has finished.
+            Self::start_late(k);
+            k.stages.wait_tail();
+            k.stages.wait_late(&k.update);
+            k.stages.wait_late(&k.photons);
             let (wanted, stages) = self.wanted(k, scene, needs, lighting);
-            k.stages.wait(wanted, &stages)?;
+            k.stages.wait_exact(wanted, &stages)?;
         }
         Ok(())
     }
@@ -1942,6 +1950,7 @@ impl LightingKernels {
                 view.staged = None;
                 view.staged = Some(StagedMemory::new(&view.device, pixels, parts)?);
             }
+            view.staged.as_ref().expect("made above").begin_frame();
         }
         let path_root = PathRoot {
             scene: pass.scene,
