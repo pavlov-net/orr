@@ -868,7 +868,7 @@ LightSample emissive_sample<S : ISurface>(LightSetGpu* set, uint entry, uint fir
     r.triangle = triangle;
     if ((section.flags & (MATERIAL_DOUBLE_SIDED | MATERIAL_HAS_BACK)) == MATERIAL_DOUBLE_SIDED)
         r.bits |= LIGHT_SAMPLE_TWO_SIDED;
-    if ((shown.flags & (MATERIAL_COAT | MATERIAL_FUZZ)) != 0)
+    if (may2(MAY2_COATED_EMITTERS) && (shown.flags & (MATERIAL_COAT | MATERIAL_FUZZ)) != 0)
         r.bits |= LIGHT_SAMPLE_VIEW;
     return r;
 }
@@ -879,6 +879,9 @@ LightSample emissive_sample<S : ISurface>(LightSetGpu* set, uint entry, uint fir
 // from, to rounding.
 public float3 emitter_view_layer<S : ISurface>(LightSetGpu* set, ResolvedLightSample c, float exterior_ior)
 {
+    // No sample is drawn with LIGHT_SAMPLE_VIEW where no emitter has a coat or fuzz.
+    if (!may2(MAY2_COATED_EMITTERS))
+        return float3(1.0);
     SceneRoot* s = set.scene;
     uint entry = c.light - s.light_capacity;
     uint instance_index, cluster_id, triangles, alpha_first;
