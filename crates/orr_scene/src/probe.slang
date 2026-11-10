@@ -144,7 +144,7 @@ public struct ProbeGpu
     public uint texture_capacity;
     public uint texture_first;
     public uint frame;
-    public uint _pad;
+    public float built_error;       // m, mesh space: the largest self error of the built cut it traces
     public ProbeTexture textures[TEXTURE_SLOTS];
 }
 
@@ -292,6 +292,7 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
 
     // The ray-tracing side: this frame's choice and what the slot's PTLAS instance holds.
     o.cut = cut.slots[slot];
+    o.built_error = asfloat(cut.slots[o.cut.owner].rt_error);
     o.model_cut = cut.model_cut[inst.model];
     o.rt_cut_count = mesh.rt_cut_count;
     o.fine_cuts = mesh.fine_cuts;

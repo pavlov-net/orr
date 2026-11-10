@@ -772,14 +772,15 @@ impl PixelProbe {
             } else {
                 ""
             };
+            let error = format!("largest error {:.6} m", g.built_error);
             if c.flags & CUT_OWNER != 0 {
                 format!(
-                    "its own gathered cut of {} clusters, built this frame (job {}){parts}",
+                    "its own gathered cut of {} clusters, {error}, built this frame (job {}){parts}",
                     c.rt_count, c.rt_job
                 )
             } else {
                 format!(
-                    "a gathered cut of {} clusters shared with slot {}'s BLAS (job {}){parts}",
+                    "a gathered cut of {} clusters, {error}, shared with slot {}'s BLAS (job {}){parts}",
                     c.rt_count, c.owner, c.rt_job
                 )
             }

@@ -376,7 +376,18 @@ public float traced_error(SceneRoot* s, uint copy)
     if (mesh.rt_cut_count == 0)
         return 0.0;
     uint cut = far ? (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff : uint(st.rt_lod);
-    float error = mesh.rt_cuts[min(cut, mesh.rt_cut_count - 1)].error;
+    float error = 0.0;
+    if (cut != RT_CUT_BUILT)
+        error = mesh.rt_cuts[min(cut, mesh.rt_cut_count - 1)].error;
+    else if (may2(MAY2_SKINNING) && (inst.flags & INSTANCE_SKINNED) != 0)
+    {
+        // A skinned copy traces the BLAS its skinning built over the cut it took, as
+        // `traced_row` reads it; SKIN_NO_CUT before it has taken one.
+        uint k = s.skin_state[inst.pose_index].cut;
+        error = mesh.skin != nullptr && k < mesh.skin.cut_count ? mesh.skin.cut_error[k] : 0.0;
+    }
+    else
+        error = asfloat(s.cut.slots[s.cut.slots[slot].owner].rt_error);
     Placement pl;
     GroupGpu* g = s.groups + inst.group;
     if (!placement(g, false, inst.group_index, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))

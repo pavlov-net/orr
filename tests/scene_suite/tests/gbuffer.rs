@@ -5975,6 +5975,115 @@ fn traced_dag_cuts_hit_what_the_raster_drew_and_close_without_cracks() {
     assert_clean();
 }
 
+/// The first path vertex on the ground, a copy tracing a cut it gathered and built, offsets its
+/// rays by that cut's largest cluster error times the copy's scale, as the pixel probes read
+/// it: the cut's clusters read back from the frame's built entries, far finer than the
+/// coarsest cached cut.
+#[test]
+fn a_copy_tracing_its_built_cut_offsets_its_rays_by_that_cuts_largest_error() {
+    use orr::orr_lighting::OriginProbes;
+    let _serial = serial();
+    let mut w = traversed_world();
+    let items = dag_items();
+    let placed = place(&mut w, &items);
+    let eye = DVec3::new(0.3, 1.2, 4.0);
+    let target = DVec3::new(0.0, 0.0, -10.0);
+    shoot(&mut w, &placed, &Shot::at(eye, target, 1));
+    let model = w.model("dag ground");
+    let m = CpuMesh::of("dag ground");
+    let slot = placed.ranges[0].first;
+    let pixel = [EXTENT[0] / 2, EXTENT[1] * 3 / 4];
+    let mut origins = OriginProbes::default();
+    let list = [placed.scene];
+    let shot = Shot::at(eye, target, 2);
+    let mut f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(shot.frame),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    f.scene(placed.scene).unwrap().set_focus(eye);
+    f.request_detail(placed.scene, PIXELS_PER_RADIAN).unwrap();
+    f.update_scenes(&mut |_| {}).unwrap();
+    let view = f
+        .raster_view(&ViewDesc {
+            scene: placed.scene,
+            history: placed.history,
+            position: eye,
+            rotation: look(Vec3::ZERO, (target - eye).as_vec3()),
+            projection: Projection {
+                fov_y: 0.9,
+                near: 0.1,
+            },
+            lens: Lens::default(),
+            render_extent: UVec2::from(EXTENT),
+            output_extent: UVec2::from(EXTENT),
+            jitter: Vec2::ZERO,
+            camera_cut: false,
+            mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
+        })
+        .unwrap();
+    f.probe(&view, pixel).unwrap();
+    let id = f.id();
+    origins
+        .record(
+            device(),
+            &KernelSet::NONE,
+            f.list().unwrap(),
+            id,
+            view.scene,
+            view.view,
+            view.gbuffer,
+            pixel,
+        )
+        .unwrap();
+    wait(f.end(&[]).unwrap());
+    let probe = w.scenes.probes(placed.history, id).remove(0);
+    let origin = origins.take(id).remove(0).gpu;
+    assert_eq!(probe.gpu.copy, slot, "the probe shows the ground:\n{probe}");
+    let cut = read_cut(&view, placed.count);
+    let s = cut.slots[slot as usize];
+    assert_eq!(
+        s.rt_cut, RT_CUT_BUILT,
+        "the ground traces its built cut:\n{probe}"
+    );
+    let (pages, bases, _) = mesh_pages(&w, model);
+    let clusters = m.clusters();
+    let raster = cut.raster(&m, slot);
+    let largest = cut
+        .ray(&m, slot, &pages, &bases, &raster)
+        .iter()
+        .map(|&c| clusters[c as usize].cluster.self_error)
+        .fold(0.0, f32::max);
+    let scale = Projector::new(&items[0], Vec3::ZERO).scale;
+    let want = largest * scale;
+    let coarsest = probe.gpu.rt_cut_count - 1;
+    let (_, meshes, _) = orr_scene::testing::global_tables(&w.scenes);
+    let mesh: MeshGpu = read_buffer(meshes.offset(u64::from(probe.gpu.mesh)), 1)[0];
+    let cached: orr_scene::RtCutGpu = read_buffer(mesh.rt_cuts.offset(u64::from(coarsest)), 1)[0];
+    assert!(
+        want > 0.0 && want < cached.error * scale,
+        "{want} m against {}",
+        cached.error
+    );
+    let close = |a: f32, b: f32| (a - b).abs() <= 1e-4 * b;
+    assert!(close(probe.gpu.built_error, largest), "{probe}");
+    assert!(
+        close(origin.traced_error, want),
+        "traced {} m, want {want} m",
+        origin.traced_error
+    );
+    assert!(
+        close(origin.origin_error, origin.raster_error.max(want)),
+        "origin error {} m, want {want} m",
+        origin.origin_error
+    );
+    assert_clean();
+}
+
 /// `CutGpu.counters` of the hidden test: spheres tested, clusters it decided.
 const CUT_HIDDEN_TESTS: usize = 29;
 const CUT_HIDDEN_RULES: usize = 31;

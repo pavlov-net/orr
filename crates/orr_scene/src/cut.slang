@@ -90,7 +90,7 @@ public struct SlotCutGpu
     public float rt_distance;
     public float rt_scale;
     public float rt_limit;
-    public uint _pad;
+    public uint rt_error;          // CUT_OWNER with RT_CUT_BUILT: f32 bits of the largest self_error among its cut's clusters, m, mesh space
 }
 
 // A hierarchy node one traversal pass visits for a slot.

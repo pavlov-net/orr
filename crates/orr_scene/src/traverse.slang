@@ -120,10 +120,10 @@ void gather_cluster(CutGpu* cut, SlotCutGpu* c, uint mesh_cluster, bool fixed)
     atomic_add_at(c.rt_hash, 1, h.y);
 }
 
-// In the fill passes: the cluster of cluster id `id`, of section `section`, in the cut of slot
-// `slot`, which traces a BLAS built this frame. An owner's walk writes as many entries as
+// In the fill passes: the cluster of cluster id `id`, of section `section` and self error
+// `error`, in the cut of slot `slot`, which traces a BLAS built this frame. An owner's walk writes as many entries as
 // the count pass counted: both walk the same tables at the same thresholds.
-void fill_cluster(SceneRoot* s, CutGpu* cut, uint slot, uint id, uint section)
+void fill_cluster(SceneRoot* s, CutGpu* cut, uint slot, uint id, uint section, float error)
 {
     SlotCutGpu* c = cut.slots + slot;
     if ((c.flags & CUT_OWNER) != 0)
@@ -131,6 +131,8 @@ void fill_cluster(SceneRoot* s, CutGpu* cut, uint slot, uint id, uint section)
         uint k;
         InterlockedAdd(c.rt_fill, 1, k);
         cut.entries[c.rt_first + k] = uint2(slot, id);
+        // Errors are at least 0, whose f32 bits order like the errors.
+        InterlockedMax(c.rt_error, asuint(error));
     }
     InstanceGpu inst = s.instances[slot];
     gather_emissive(s, inst, s.meshes + s.models[inst.model].mesh, id, section);
@@ -602,11 +604,12 @@ void edit_clusters(SceneRoot* s, CutGpu* cut, uint slot, MeshGpu* mesh, Instance
         uint id_first = mesh.page_bases[held.page] + held.first_cluster;
         for (uint i = 0; i < held.cluster_count; i++)
         {
-            uint section = load_cluster(data, held.first_cluster + i).section;
+            Cluster cl = load_cluster(data, held.first_cluster + i);
+            uint section = cl.section;
             if (section_hidden(inst, section))
                 continue;
             if (filling())
-                fill_cluster(s, cut, slot, id_first + i, section);
+                fill_cluster(s, cut, slot, id_first + i, section, cl.self_error);
             else
                 gather_cluster(cut, cut.slots + slot, mesh_first + i, true);
         }
@@ -986,7 +989,7 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
                 raster_mask |= 1u << (i - run);
             if (ray == RULE_IN && filling())
             {
-                fill_cluster(s, cut, slot, id_first + i, cl.section);
+                fill_cluster(s, cut, slot, id_first + i, cl.section, cl.self_error);
             }
             else if (ray == RULE_IN)
             {
