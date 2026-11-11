@@ -1076,6 +1076,8 @@ impl Scenes {
     }
 
     /// A new scene with empty tables.
+    ///
+    /// Panics if `desc.part_capacity` is past 2^24.
     pub fn create_scene(&mut self, desc: &SceneDesc) -> Result<SceneId> {
         let scene = Scene::new(&self.device, desc)?;
         Ok(SceneId(insert(&mut self.core.scenes, scene)))

@@ -65,7 +65,7 @@ pub struct SceneDesc {
     /// the chain step of its model that has the most of them.
     pub emissive_capacity: u32,
     /// PTLAS instances for the animated parts of copies inside their animation range, and
-    /// one for each copy fading between two chain steps.
+    /// one for each copy fading between two chain steps. At most 2^24.
     pub part_capacity: u32,
     /// PTLAS cell partitions.
     pub ptlas_partitions: u32,
@@ -1126,6 +1126,12 @@ impl Scene {
     }
 
     pub(crate) fn new(device: &Device, desc: &SceneDesc) -> Result<Self> {
+        // A released part run packs its first part instance into 24 bits (ptlas.slang).
+        assert!(
+            desc.part_capacity <= 1 << 24,
+            "part_capacity {} is past 2^24",
+            desc.part_capacity
+        );
         let n = |c: u32| u64::from(c.max(1));
         let dl = MemoryKind::DeviceLocal;
         let (decal_slots, decal_refs) = table_sizes(desc.decal_capacity);
