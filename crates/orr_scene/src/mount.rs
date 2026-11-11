@@ -2270,6 +2270,8 @@ enum Entry {
 pub(crate) struct Resident {
     pub(crate) models: HashMap<AssetId, ModelId>,
     pub(crate) textures: HashMap<AssetId, TextureIndex>,
+    /// The `TextureHeader::primaries` of each of `textures`.
+    pub(crate) texture_primaries: HashMap<AssetId, u8>,
     pub(crate) materials: HashMap<AssetId, MaterialId>,
     pub(crate) pages: HashMap<AssetId, PageId>,
     pub(crate) skeletons: HashMap<AssetId, SkeletonRef>,
@@ -3832,6 +3834,7 @@ impl Mounts {
         let mut res = Resident {
             models: HashMap::new(),
             textures: r.textures.iter().map(|t| (t.id, t.slot.index)).collect(),
+            texture_primaries: r.textures.iter().map(|t| (t.id, t.primaries)).collect(),
             materials: HashMap::new(),
             pages: HashMap::new(),
             skeletons: r.skeletons.into_iter().collect(),

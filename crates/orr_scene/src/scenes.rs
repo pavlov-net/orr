@@ -985,6 +985,13 @@ impl Scenes {
         self.core.mounts.lookup(m, id, |r| &r.textures)
     }
 
+    /// The primaries the cooked texture `id` of mount `m` holds its colors in, as an
+    /// `orr_color::Primaries` id: what its header states, which a kernel converting its texels
+    /// to render primaries reads.
+    pub fn texture_primaries(&self, m: MountId, id: AssetId) -> Result<u8> {
+        self.core.mounts.lookup(m, id, |r| &r.texture_primaries)
+    }
+
     /// The cooked material `id` of mount `m`, for consumer data and [`MaterialWriter`] edits.
     pub fn material(&self, m: MountId, id: AssetId) -> Result<MaterialId> {
         self.core.mounts.lookup(m, id, |r| &r.materials)

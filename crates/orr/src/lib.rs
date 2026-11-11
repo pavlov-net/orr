@@ -918,6 +918,12 @@ impl Renderer {
         Ok(self.scenes.texture(m, id)?)
     }
 
+    /// The `orr_color::Primaries` id the cooked texture `id` holds its colors in
+    /// ([`orr_scene::Scenes::texture_primaries`]).
+    pub fn texture_primaries(&self, m: MountId, id: orr_pack::AssetId) -> Result<u8> {
+        Ok(self.scenes.texture_primaries(m, id)?)
+    }
+
     pub fn material(&self, m: MountId, id: orr_pack::AssetId) -> Result<MaterialId> {
         Ok(self.scenes.material(m, id)?)
     }

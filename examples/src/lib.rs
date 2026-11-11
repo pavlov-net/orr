@@ -453,8 +453,9 @@ pub fn mount_all_at(
     (mounts, frame)
 }
 
-/// The environment record of the Rec.709 map `name` cooked into `mount`, for
-/// `SceneWriter::set_environment`. `from_world` takes world directions into map space.
+/// The environment record of the map `name` cooked into `mount`, in the primaries the cook
+/// stored it in, for `SceneWriter::set_environment`. `from_world` takes world directions into
+/// map space.
 pub fn environment_map(
     renderer: &Renderer,
     gpu: &Device,
@@ -462,13 +463,12 @@ pub fn environment_map(
     name: &str,
     from_world: orr_math::Affine3,
 ) -> Allocation<EnvironmentMapGpu> {
+    let id = AssetId::from_name(name);
     let mut environment = gpu
         .gpu_malloc::<EnvironmentMapGpu>(MemoryKind::Upload, 1, "environment")
         .expect("environment");
     environment.as_mut_slice().expect("environment")[0] = EnvironmentMapGpu {
-        map: renderer
-            .texture(mount, AssetId::from_name(name))
-            .expect("environment texture"),
+        map: renderer.texture(mount, id).expect("environment texture"),
         sampler: gpu
             .sampler(&SamplerDesc {
                 mag: Filter::Linear,
@@ -479,7 +479,10 @@ pub fn environment_map(
             })
             .expect("environment sampler"),
         intensity: 1.0,
-        primaries: orr_color::Primaries::Rec709.id().into(),
+        primaries: renderer
+            .texture_primaries(mount, id)
+            .expect("environment texture")
+            .into(),
         from_world: from_world.into(),
     };
     environment
