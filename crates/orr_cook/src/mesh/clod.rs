@@ -830,6 +830,9 @@ pub(super) fn build<G: Send>(
             for (k, u) in opposed {
                 let v = simplified[k];
                 simplified[k] = if vx.remap[u as usize] == vx.remap[v as usize] {
+                    // Dilation moves only the vertices `simplified` holds, which `u` may not be.
+                    let v = 3 * v as usize;
+                    vx.positions.copy_within(v..v + 3, 3 * u as usize);
                     u
                 } else {
                     *made.entry((v, u)).or_insert_with(|| vx.wedge(v, u))
