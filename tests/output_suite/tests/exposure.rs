@@ -40,6 +40,61 @@ fn a_cut_shows_a_uniform_field_at_mid_gray_on_its_own_frame() {
     assert_clean();
 }
 
+/// A view sets its exposure once and then adapts. Through a history that keeps the cut's
+/// frame as it was lit, at the reference, the frames after a cut meter many stops off; the
+/// exposure moves from the cut's no faster than the adaptation speeds.
+#[test]
+fn after_a_cut_the_exposure_only_adapts() {
+    let mut h = Harness::new(SIDE, SIDE);
+    let output = ViewOutput::default();
+    let auto = AutoExposure::default();
+    let fastest = auto.speed_brighten.max(auto.speed_darken) * h.dt;
+    h.history = 0.9;
+    // Twelve stops brighter and ten darker than the reference keys.
+    for nits in [1e4f32, 1e-3] {
+        h.set_image(&vec![nits; h.pixels()]);
+        h.cut_next();
+        let cut = h.frame(1.0, &output, None);
+        let off = stops_from_mid_gray(nits, &cut);
+        assert!(off.abs() < 0.01, "{nits} cd/m2: {off} stops from mid gray");
+        let mut last = cut.adapted_ev100;
+        for f in 1..=30 {
+            let t = h.frame(1.0, &output, None);
+            let step = (t.adapted_ev100 - last).abs();
+            assert!(
+                step <= 1.001 * fastest,
+                "{nits} cd/m2, frame {f} after the cut: {step} EV in one frame"
+            );
+            last = t.adapted_ev100;
+        }
+    }
+    assert_clean();
+}
+
+/// An adapting view whose scene falls under RGBA16F at its pre-exposure holds its exposure on
+/// the black frame and meters the light on the next, lit eight stops higher.
+#[test]
+fn an_adapting_view_finds_light_that_underflowed() {
+    let mut h = Harness::new(SIDE, SIDE);
+    let nits = 1e4f32;
+    h.set_image(&vec![nits; h.pixels()]);
+    let output = ViewOutput::default();
+    let settled = settle(&mut h, 1.0, &output);
+    let scale = (-26.0f32).exp2();
+    let black = h.frame(scale, &output, None);
+    assert_eq!(black.metered_ev100, None);
+    assert_eq!(black.adapted_ev100, settled.adapted_ev100);
+    let found = h.frame(scale, &output, None);
+    let metered = found
+        .metered_ev100
+        .expect("light at the raised pre-exposure");
+    // The light sits a dozen steps above zero in RGBA16F.
+    let off = metered - ev100_from_luminance(nits * scale);
+    assert!(off.abs() < 0.1, "metered {off} EV from the scene");
+    assert!(found.adapted_ev100 < settled.adapted_ev100);
+    assert_clean();
+}
+
 #[test]
 fn bright_and_dark_scenes_fit_rgba16f() {
     let mut h = Harness::new(SIDE, SIDE);
