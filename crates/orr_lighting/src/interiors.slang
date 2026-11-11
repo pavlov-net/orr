@@ -219,7 +219,8 @@ public struct LayerAccept<S : ISurface> : IAnyHit
 
 // The nearest surface on a ray from `origin` along `dir` within `t_max`: its distance, whether the
 // ray meets its front, and its material where it is a dielectric's with an interior, else
-// MATERIAL_NONE. False for none.
+// MATERIAL_NONE. Only a dielectric keeps its front; any other surface faces the ray. False for
+// none.
 public bool next_surface<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, out float t, out uint material, out bool front)
 {
     t = 0.0;

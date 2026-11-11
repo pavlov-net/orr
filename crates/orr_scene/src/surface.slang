@@ -51,7 +51,7 @@ public struct SurfaceInput
     public uint material;
     public uint surface;            // linked surface id; 0 = StandardSurface
     public UvFootprint uv[2];       // per uv set; producer and patch geometry give both its one uv, but for a subdivision copy holding uv set 1
-    public float3 geometric_normal; // the triangle's front face
+    public float3 geometric_normal; // the triangle's, turned toward the ray on a back face but for a dielectric's
     public bool back_face;          // the ray met the triangle's back
     public bool swapped;            // `material` is the section material's back
     public float3 normal;           // interpolated vertex normal, unit
