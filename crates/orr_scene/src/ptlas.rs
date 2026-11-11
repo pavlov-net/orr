@@ -747,18 +747,22 @@ impl Ptlas {
         let layout = self.wanted()?;
         let limits = self.limits(layout, self.partitions.len() as u32);
         if self.storage.as_ref().is_none_or(|s| s.limits != limits) {
-            // A storage no build has filled leaves nothing to rewrite, and its pool nothing to
-            // carry: the first build starts the counters and the pool at 0.
-            let built = self.storage.as_ref().is_some_and(|s| s.built);
+            // A build has filled a storage, this one or one it replaced that no build has
+            // since: the counters and the pool hold its state, which the next build rewrites
+            // and carries. Before any build there is nothing to carry: the first build starts
+            // them at 0.
+            let filled = self.storage.as_ref().is_some_and(|s| s.built) || self.rebuild;
             if layout.parts > self.kept.parts {
                 let kept = Kept::new(device, layout.parts)?;
                 let old = std::mem::replace(&mut self.kept, kept);
-                if built && self.carried.is_none() {
+                // A pool already waiting to be carried is the one builds wrote; `old` then took
+                // no build.
+                if filled && self.carried.is_none() {
                     self.carried = Some(old);
                 }
             }
             let storage = self.create(device, limits)?;
-            self.rebuild = built || self.rebuild;
+            self.rebuild = filled;
             self.storage = Some(storage);
             self.layout = layout;
         }
