@@ -1141,6 +1141,54 @@ fn scalar_factors_stay_in_their_fields() {
     }
 }
 
+/// Roughness beside a normal map folds its factor only where Toksvig adds variance to it: where
+/// the texture keeps its source's mips it takes none, so its blocks pass and the field keeps the
+/// factor. Where mips are remade the factor folds and the field reads 1.
+#[test]
+fn roughness_folds_its_factor_only_under_toksvig() {
+    let d = dir("toksvig-factor");
+    let n = 64u32;
+    let (rough, rough_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |_, x, y| {
+        [
+            (128.0 + 100.0 * ((x * 3 + y * 5) as f32 * 0.21).sin()) as u8,
+            0,
+            0,
+            255,
+        ]
+    });
+    let normal = png(n, n, |x, _| [118 + (x % 2 * 20) as u8, 128, 255, 255]);
+    let path = d.join("toksvig.glb");
+    write_glb(
+        &path,
+        &[r#"{"pbrMetallicRoughness":{"roughnessFactor":0.1,"metallicRoughnessTexture":{"index":0}},
+            "normalTexture":{"index":1}}"#
+            .into()],
+        &[rough, normal],
+    );
+    let (a, m) = cook_glb_at(&path, GltfSettings::default(), Quality::Fast);
+    assert_eq!(m.specular_roughness, 0.1);
+    let t = m.textures[slot::ROUGHNESS].texture;
+    let (info, levels) = mips(&a, a.name(a.find(t).unwrap()));
+    assert_eq!(info.header.vk_format, vk::BC4_UNORM);
+    // A BC5 block is the red BC4 block, then the green one.
+    let red = |level: &[u8]| -> Vec<u8> {
+        level
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .flat_map(|b| b[..8].to_vec())
+            .collect()
+    };
+    let want: Vec<Vec<u8>> = rough_blocks.iter().map(|l| red(l)).collect();
+    assert_eq!(levels[0], want);
+
+    let (_, m) = cook_glb_at(&path, GltfSettings::default(), Quality::Slow);
+    assert_eq!(
+        m.specular_roughness, 1.0,
+        "Toksvig roughness holds its factor"
+    );
+}
+
 /// A scatter anisotropy stores itself, so 0 is a code: unsigned where it reads no negatives,
 /// with twice the codes over 0..1, snorm where it does.
 #[test]

@@ -1663,10 +1663,10 @@ impl<'a> Packer<'a> {
                 _ => None,
             };
             // A texel holds its source's value and the field its factor, so an 8-bit source keeps
-            // every level. Toksvig roughness is no multiple of its source, so a paired roughness
-            // holds its factor and the field reads 1.
-            let folds = |slot: usize| paired.is_some() && slot == slot::ROUGHNESS;
-            let id = self.make_each(suffix, &refs[0], |s, cell| {
+            // every level. Toksvig roughness is no multiple of its source, so roughness that takes
+            // it holds its factor and the field reads 1.
+            let build = |s: &Self, cell: Option<Cell>, toksvig: bool| {
+                let folds = |slot: usize| toksvig && slot == slot::ROUGHNESS;
                 let channel = |&(slot, r, v): &(usize, Option<TexRef>, f32)| {
                     let v = if folds(slot) { v } else { 1.0 };
                     match r {
@@ -1679,7 +1679,7 @@ impl<'a> Packer<'a> {
                 };
                 let mut channels: Vec<Channel> = rm.iter().map(channel).collect();
                 channels.resize(4, Channel::constant(0.0));
-                let toksvig = paired.map(|(r, scale)| {
+                let toksvig = paired.filter(|_| toksvig).map(|(r, scale)| {
                     let (r, source) = s.normal_source(&s.at(&r, cell));
                     (0, r, scale, source)
                 });
@@ -1694,11 +1694,21 @@ impl<'a> Packer<'a> {
                     shrink: false,
                     tile: None,
                 }
-            })?;
+            };
+            // Toksvig runs where a texture makes its mips. The tiles of a set share one field, so
+            // it runs on all of them where it runs on any.
+            let cells = self
+                .cells(&refs[0])
+                .map_or_else(|| vec![None], |c| c.into_iter().map(Some).collect());
+            let toksvig = paired.is_some()
+                && cells
+                    .into_iter()
+                    .any(|cell| !self.keeps_source_mips(&build(self, cell, false)));
+            let id = self.make_each(suffix, &refs[0], |s, cell| build(s, cell, toksvig))?;
             for (i, &(s, _, v)) in rm.iter().enumerate() {
                 bind(m, s, id, i, &refs[0]);
                 match s {
-                    slot::ROUGHNESS if folds(s) => m.specular_roughness = 1.0,
+                    slot::ROUGHNESS if toksvig => m.specular_roughness = 1.0,
                     slot::ROUGHNESS => m.specular_roughness = v,
                     _ => m.metalness = v,
                 }
@@ -2418,8 +2428,8 @@ impl<'a> Packer<'a> {
         ))
     }
 
-    /// Plans one pack, or returns the one an identical pack planned before.
-    fn make(&mut self, suffix: &str, mut p: Pack) -> Result<Made> {
+    /// The source images the channels of `p` read, sorted.
+    fn pack_images(p: &Pack) -> Vec<usize> {
         let mut images: Vec<usize> = p
             .channels
             .iter()
@@ -2430,18 +2440,30 @@ impl<'a> Packer<'a> {
             .collect();
         images.sort_unstable();
         images.dedup();
-        // Unless mips are remade, channels whose images all hold every mip as blocks at one
-        // size keep those mips, without Toksvig roughness or alpha coverage.
+        images
+    }
+
+    /// Whether pack `p` keeps its source images' own mips, without Toksvig roughness or alpha
+    /// coverage: unless mips are remade, when the images its channels read all hold every mip as
+    /// blocks at one size.
+    fn keeps_source_mips(&self, p: &Pack) -> bool {
+        let images = Self::pack_images(p);
         let kept = |i: usize| {
             let f = self.image(i);
             f.blocks.is_some_and(|b| b.1).then_some((f.w, f.h))
         };
         let kept_size = images.first().and_then(|&i| kept(i));
-        let source_mips = !crate::quality::remakes_mips(self.quality)
+        !crate::quality::remakes_mips(self.quality)
             && !p.shrink
             && kept_size.is_some()
             && images.iter().all(|&i| kept(i) == kept_size)
-            && self.overridden(&images, |o| o.atlas_grid).is_none();
+            && self.overridden(&images, |o| o.atlas_grid).is_none()
+    }
+
+    /// Plans one pack, or returns the one an identical pack planned before.
+    fn make(&mut self, suffix: &str, mut p: Pack) -> Result<Made> {
+        let mut images = Self::pack_images(&p);
+        let source_mips = self.keeps_source_mips(&p);
         if source_mips {
             p.toksvig = None;
         }
