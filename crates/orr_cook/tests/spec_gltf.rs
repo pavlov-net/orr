@@ -2573,3 +2573,49 @@ fn skin_weights_hold_byte_and_short_weights_exactly() {
     }
     assert_eq!(seen, 9);
 }
+
+/// L1145: a node whose global transform mirrors winds its triangles the other way. Under a static
+/// mirroring node, a rig's triangles take the mirror as a static mesh does, turning their
+/// winding, and its palettes keep their handedness: the root and the inverse binds both hold the
+/// mirror, so it cancels in every skinning matrix, at rest and posed.
+#[test]
+fn a_rig_under_a_mirror_winds_as_a_static_mesh_and_poses_unmirrored() {
+    let path = dir("mirrored-rig").join("scene.glb");
+    let mut g = Glb::default();
+    let pa = g.floats(&TRIANGLE, "VEC3");
+    let ta = g.floats(&[[0.0f32], [1.0]], "SCALAR");
+    let turn = g.floats(
+        &[[0.0f32, 0.0, 0.0, 1.0], [0.0, 0.0, 0.5, 0.866_025_4]],
+        "VEC4",
+    );
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],
+"nodes":[{{"name":"mirror","translation":[5,0,0],"scale":[-1,1,1],"children":[1]}},
+{{"name":"arm","translation":[0,1,0],"mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}}}}]}}],
+"animations":[{{"name":"go","samplers":[{{"input":{ta},"output":{turn}}}],
+"channels":[{{"sampler":0,"target":{{"node":1,"path":"rotation"}}}}]}}]"#
+        ),
+    );
+    let (a, _) = cooked(&path);
+    let sk = skeleton(&a);
+    let clip = clip_of(&a, "g", "go");
+    for posed in [palette(&sk, &sk.rest), posed_at(&sk, &clip, 1.0)] {
+        for p in &posed {
+            assert!(
+                p.matrix3.determinant() > 0.0,
+                "a palette entry mirrors: {p}"
+            );
+        }
+    }
+    // The source's front, +z, through the mirror's normal matrix is +z still.
+    let (_, corners) = part_corners(&a, "g/mesh");
+    let [p0, p1, p2] = [0, 1, 2].map(|i| corners[i].1);
+    let front = (p1 - p0).cross(p2 - p0).normalize();
+    assert!(
+        front.abs_diff_eq(Vec3::Z, 1e-5),
+        "the triangle faces {front}"
+    );
+}
