@@ -332,13 +332,19 @@ fn a_moving_pre_exposure_never_shows() {
     let nits = natural_image(h.pixels(), 6.0, 1.0);
     h.set_image(&nits);
     let display = DisplayRequest::default().resolve(&[OutputFormat::Hdr10Pq], None, false);
+    // The scene moves six stops down at 3 stops/s and back; adapting as fast both ways, the
+    // exposure follows it nearly all the way.
     let output = ViewOutput {
+        exposure: Exposure::Auto(AutoExposure {
+            speed_brighten: 3.0,
+            speed_darken: 3.0,
+            ..AutoExposure::default()
+        }),
         debug: OutputDebug::Linear,
         ..ViewOutput::default()
     };
     let mut prev = settle(&mut h, 1.0, &output);
     let (mut lowest, mut highest) = (prev.adapted_ev100, prev.adapted_ev100);
-    // Six stops down at 3 stops/s and back, at the default adaptation rates.
     for f in 0..240 {
         let scale = down_and_up(f, 60, 6.0);
         let t = h.frame(scale, &output, Some(&display));
@@ -354,7 +360,7 @@ fn a_moving_pre_exposure_never_shows() {
         highest = highest.max(t.adapted_ev100);
         prev = t;
     }
-    assert!(highest - lowest > 4.0, "exposure moved {lowest}..{highest}");
+    assert!(highest - lowest > 5.0, "exposure moved {lowest}..{highest}");
     assert_clean();
 }
 
