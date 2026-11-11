@@ -940,12 +940,17 @@ fn directional_share_matches_the_lights_weights() {
             w * f64::from(n.dot(l).max(0.0))
         }
     };
+    // The weight is the focus illuminance's luminance: the light's own, or the textured disc's
+    // integral where it has none, through the medium.
     for (k, &id) in ids.iter().enumerate() {
-        let expected = y2020(states[id as usize].focus_illuminance);
+        let s = &states[id as usize];
+        let color = table[id as usize].color;
+        let e = if color == [0.0; 3] { s.integral } else { color };
+        let expected = y2020([0, 1, 2].map(|c| e[c] * s.transmittance[c]));
         assert!(
-            (f64::from(states[id as usize].weight) / expected - 1.0).abs() < 1e-5,
+            (f64::from(s.weight) / expected - 1.0).abs() < 1e-5,
             "light {k}: weight {} against {expected}",
-            states[id as usize].weight
+            s.weight
         );
     }
 

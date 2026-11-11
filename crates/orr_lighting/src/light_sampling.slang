@@ -69,19 +69,17 @@ public static const uint LIGHT_SAMPLE_VIEW = 8;
 // What lighting's scene pass derives per directional light each frame.
 public struct DirectionalState
 {
-    // Illuminance at the scene focus after the medium.
-    public float3 focus_illuminance;
-    // Luminance of `focus_illuminance`: the light's selection weight before n.l.
-    public float weight;
     // Multiplies the disc profile's shape to give its radiance.
     public float3 radiance_scale;
-    public float _pad0;
+    // Luminance of the illuminance at the scene focus after the medium: the light's selection
+    // weight before n.l.
+    public float weight;
     // `DISC_TEXTURED`: `textured_disc_integral`; 0 otherwise.
     public float3 integral;
-    public float _pad1;
+    public float _pad0;
     // The medium's transmittance from the focus toward the light.
     public float3 transmittance;
-    public float _pad2;
+    public float _pad1;
 }
 
 // Selection state of one emissive list entry: its list of clusters, in the order of its
@@ -170,7 +168,8 @@ public struct LightSetGpu
     public float candidate_total;
     // Probability that a tile sample comes from the environment.
     public float environment_probability;
-    // rgb: the summed `focus_illuminance` of every directional light.
+    // rgb: the summed illuminance at the scene focus, after the medium, of every directional
+    // light.
     public float4 directional_illuminance;
     public uint frame;
     // Sphere and rect lights with non-zero power: paths' BSDF rays look for their proxies.
@@ -457,15 +456,15 @@ float3 emitted_illuminance(LightGpu l, float3 integral)
 }
 
 // The state of directional light `index` at the focus, with `transmittance` the medium's
-// toward it.
-public DirectionalState directional_state(SceneRoot* scene, uint index, float3 transmittance)
+// toward it, and in `focus_illuminance` its illuminance there.
+public DirectionalState directional_state(SceneRoot* scene, uint index, float3 transmittance, out float3 focus_illuminance)
 {
     LightGpu l = scene.lights[index];
     DirectionalState s = {};
     s.integral = l.disc == DISC_TEXTURED ? textured_disc_integral(scene, index) : float3(0.0);
     s.radiance_scale = radiance_scale(l, s.integral);
-    s.focus_illuminance = emitted_illuminance(l, s.integral) * transmittance;
-    s.weight = luminance_rec2020(s.focus_illuminance);
+    focus_illuminance = emitted_illuminance(l, s.integral) * transmittance;
+    s.weight = luminance_rec2020(focus_illuminance);
     s.transmittance = transmittance;
     return s;
 }
@@ -488,9 +487,9 @@ public void directional_pass<M : IMedium>(DirectionalRoot r, uint lane)
         {
             float3 dir = s.lights[i].direction;
             float3 t = medium_transmittance<M>(s.medium, r.focus.xyz, dir, positive_infinity());
-            DirectionalState st = directional_state(s, i, t);
-            r.states[i] = st;
-            sum += st.focus_illuminance;
+            float3 e;
+            r.states[i] = directional_state(s, i, t, e);
+            sum += e;
         }
         directional_flags[lane] = directional ? 1 : 0;
         GroupMemoryBarrierWithGroupSync();
