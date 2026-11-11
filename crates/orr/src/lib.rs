@@ -1393,6 +1393,7 @@ impl<'a> Frame<'a> {
         if desc.camera_cut {
             self.scenes
                 .restart_exposure(view.history, output.exposure.start())?;
+            state.output.exposure_restarted(id);
         }
         let raster = self.scenes.raster_view_with(&desc, &requests)?;
         let gpu = self.output.device.clone();
@@ -1511,7 +1512,7 @@ impl<'a> Frame<'a> {
             });
         let delta = self.scenes.time().delta;
         let completed = self.scenes.completed();
-        let stepped = state.output.pre_exposure_steps();
+        let stepped = state.output.pre_exposure_steps(completed);
         let (list, arena) = self.scenes.output_list_and_arena(view.history)?;
         let (rr_output, rr_output_store) = match state.reconstruction.as_mut() {
             Some(r) => {
@@ -1629,7 +1630,6 @@ impl<'a> Frame<'a> {
                 extent,
                 view: raster.view,
                 sky: raster.sky_stats,
-                restarted: desc.camera_cut,
                 frame: id,
                 completed,
                 output,

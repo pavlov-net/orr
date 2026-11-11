@@ -67,6 +67,9 @@ pub struct Harness {
     frame: u64,
     /// Seconds per frame.
     pub dt: f32,
+    /// Frames the exposure passes read their telemetry back late: 1, the frame before's, by
+    /// default.
+    pub readback_lag: u64,
     /// Linear Rec.2020 color the luminance multiplies; gray by default.
     pub color: [f32; 3],
     /// The share of its last image the radiance keeps as it stands, whatever the pre-exposure
@@ -145,6 +148,7 @@ impl Harness {
             extent: [width, height],
             frame: 0,
             dt: 1.0 / 30.0,
+            readback_lag: 1,
             color: [1.0; 3],
             history: 0.0,
             glare: None,
@@ -228,6 +232,7 @@ impl Harness {
         self.frame += 1;
         let screenshot = self.screenshot_next.take();
         let cut = std::mem::take(&mut self.cut_next);
+        let completed = self.frame.saturating_sub(self.readback_lag);
         let mut constants: ViewConstants = bytemuck::Zeroable::zeroed();
         constants.exposure = self.exposure.gpu();
         constants.exposure_slot = (self.frame % 2) as u32;
@@ -252,7 +257,7 @@ impl Harness {
             r,
             g,
             b,
-            history: if cut || self.output.pre_exposure_steps() {
+            history: if cut || self.output.pre_exposure_steps(completed) {
                 0.0
             } else {
                 self.history
@@ -264,6 +269,7 @@ impl Harness {
         let queue = gpu.queue(QueueKind::Render).unwrap();
         let mut list = queue.command_list().unwrap();
         if cut {
+            self.output.exposure_restarted(self.frame);
             self.exposure_start
                 .as_mut_slice()
                 .unwrap()
@@ -304,9 +310,8 @@ impl Harness {
                     extent: self.extent,
                     view,
                     sky: self.sky.gpu(),
-                    restarted: cut,
                     frame: self.frame,
-                    completed: self.frame - 1,
+                    completed,
                     output,
                 },
             )

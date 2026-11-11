@@ -48,10 +48,22 @@ pub struct OutputKernels {
     scene_referred: ComputePipeline,
 }
 
-/// `ExposureState::initialized` (`adapt.slang`): the exposure set with the pre-exposure waiting
-/// where the view started, and adapting with the pre-exposure following.
+/// `ExposureState::initialized` (`adapt.slang`): no exposure set, the exposure set with the
+/// pre-exposure waiting where the view started, and adapting with the pre-exposure following.
+const STATE_UNSET: u32 = 0;
 const STATE_SET: u32 = 1;
 const STATE_ADAPTING: u32 = 2;
+
+/// Whether a view's pre-exposure steps, from the one it started with to its exposure, on the
+/// frame after an exposure pass.
+#[derive(Clone, Copy)]
+enum Step {
+    No,
+    Yes,
+    /// It does if this frame, which let the step through as the view started over under
+    /// auto exposure, had light to meter.
+    IfMetered(u64),
+}
 
 /// Words of the meter's histogram (`exposure.slang`).
 const HISTOGRAM_WORDS: u64 = HISTOGRAM_WORDS_PER_BIN * HISTOGRAM_BINS as u64;
@@ -150,11 +162,12 @@ pub struct OutputView {
     glare: Option<ViewGlare>,
     local: Option<LocalTargets>,
     /// The frame the view's exposure state last started over.
-    exposure_started: u64,
-    /// The view's pre-exposure has been let step since, or its telemetry showed it following.
+    exposure_started: Option<u64>,
+    /// The view's pre-exposure follows its exposure, as far as the passes since then know:
+    /// one let it step, or ran under manual exposure, or read back that it does.
     exposure_follows: bool,
-    /// The view's last exposure pass let its pre-exposure step.
-    pre_exposure_steps: bool,
+    /// What the view's last exposure pass left for the frame after it.
+    pre_exposure_step: Step,
     device: Device,
 }
 
@@ -176,28 +189,54 @@ impl OutputView {
             dof: None,
             glare: None,
             local: None,
-            exposure_started: 0,
+            exposure_started: None,
             exposure_follows: false,
-            pre_exposure_steps: false,
+            pre_exposure_step: Step::No,
             device: gpu.clone(),
         })
     }
 
-    /// Whether this frame may be lit with a step in pre-exposure: the view's last exposure
-    /// pass let its pre-exposure go from the one it started with to its first exposure. A
-    /// history in pre-exposed units that cannot rescale, ray reconstruction's, starts over on
-    /// such a frame. The pass lets the step through on the frame the state starts over, which
-    /// takes it when that frame has light to meter, and otherwise once on the first frame
-    /// that has read back that the view set its exposure. Read it before the frame's
-    /// exposure pass.
-    pub fn pre_exposure_steps(&self) -> bool {
-        self.pre_exposure_steps
+    /// Tells the view that its exposure state starts over on `frame`: the caller writes the
+    /// [`Exposure::start`] of the frame's [`ViewOutput::exposure`] into its slots before the
+    /// frame is lit, as at a camera cut. Call it where the write is recorded, whether or not
+    /// the frame goes on to its exposure pass.
+    pub fn exposure_restarted(&mut self, frame: u64) {
+        self.exposure_started = Some(frame);
+        self.exposure_follows = false;
+        self.pre_exposure_step = Step::No;
+    }
+
+    /// Whether this frame is lit with a step in pre-exposure, from the one the view started
+    /// with to its exposure, as far as the frames up to `completed`, whose work has completed
+    /// on the GPU, tell. A history in pre-exposed units that cannot rescale, ray
+    /// reconstruction's, starts over on such a frame. Read it before the frame's exposure
+    /// pass.
+    ///
+    /// The pre-exposure steps on the frame after the one that lets it. Under auto exposure
+    /// that is the frame the state starts over, which takes the step when it has light to
+    /// meter, and otherwise the first frame that has read back that the view set its
+    /// exposure. The frame after a start with no light is told as a step until that frame's
+    /// telemetry is read back. Under manual exposure a view starts at its exposure, and
+    /// steps only when manual exposure takes over a view whose pre-exposure still waits.
+    pub fn pre_exposure_steps(&self, completed: u64) -> bool {
+        match self.pre_exposure_step {
+            Step::No => false,
+            Step::Yes => true,
+            Step::IfMetered(frame) => {
+                let state = self
+                    .frames
+                    .iter()
+                    .find(|r| r.telemetry_frame == Some(frame) && frame <= completed)
+                    .map(|r| r.telemetry.as_slice().expect("readback memory")[0].state);
+                state != Some(STATE_UNSET)
+            }
+        }
     }
 
     /// `ExposureState::initialized` as the newest frame at or before `completed` left it,
     /// among the frames since the view's exposure state started over.
     fn exposure_state(&self, completed: u64) -> Option<u32> {
-        let frames = self.exposure_started..=completed;
+        let frames = self.exposure_started.unwrap_or(0)..=completed;
         self.frames
             .iter()
             .filter(|r| r.telemetry_frame.is_some_and(|f| frames.contains(&f)))
@@ -357,8 +396,6 @@ pub struct ExposurePass<'a> {
     /// The scene's sky statistics, for multi-reference metering and telemetry; null without
     /// a scene.
     pub sky: GpuPtr<SkyStats>,
-    /// The view's exposure state started over this frame, as at a camera cut.
-    pub restarted: bool,
     /// orr's frame id, which the telemetry carries.
     pub frame: u64,
     /// A frame whose work has completed on the GPU, the newest known: the pass reads the
@@ -654,17 +691,26 @@ impl OutputKernels {
         pass: &ExposurePass<'_>,
     ) -> Result<()> {
         let output = pass.output;
-        if pass.restarted {
-            view.exposure_started = pass.frame;
-            view.exposure_follows = false;
-        }
-        let mut step = pass.restarted;
-        if !step && !view.exposure_follows {
+        let restarted = view.exposure_started == Some(pass.frame);
+        // Adapt's `step`, for a view whose pre-exposure waits where it started.
+        let mut step = false;
+        view.pre_exposure_step = if matches!(output.exposure, Exposure::Manual { .. }) {
+            // A manual frame leaves the pre-exposure at the manual exposure, where a view
+            // that starts over under it already is.
+            let steps = !restarted && !view.exposure_follows;
+            view.exposure_follows = true;
+            if steps { Step::Yes } else { Step::No }
+        } else if restarted {
+            step = true;
+            Step::IfMetered(pass.frame)
+        } else if !view.exposure_follows {
             let state = view.exposure_state(pass.completed);
-            step = state == Some(STATE_SET);
             view.exposure_follows = matches!(state, Some(STATE_SET | STATE_ADAPTING));
-        }
-        view.pre_exposure_steps = step;
+            step = state == Some(STATE_SET);
+            if step { Step::Yes } else { Step::No }
+        } else {
+            Step::No
+        };
         let n = view.frames.len() as u64;
         let roots = &mut view.frames[(pass.frame % n) as usize];
         if !roots.histogram_cleared {
