@@ -231,7 +231,7 @@ public float3 material_normal(SurfaceInput i, MaterialGpu* m, uint slot = TEXTUR
 {
     if (!material_bound(m, slot))
         return i.normal;
-    return material_texel_normal(i, m, slot, material_texture(m, slot, i.uv, float4(0.5, 0.5, 1.0, 1.0)));
+    return material_texel_normal(i, m, slot, material_texture(m, slot, i.uv, float4(0.0, 0.0, 1.0, 1.0)));
 }
 
 // `material_normal` of bound normal slot `slot` from its texel `texel`.
@@ -241,7 +241,7 @@ public float3 material_texel_normal(SurfaceInput i, MaterialGpu* m, uint slot, f
     {
         float3x3 c = normal_matrix(i.object_to_render);
         float side = dot(mul(c, i.object_normal), i.normal) < 0.0 ? -1.0 : 1.0;
-        float3 v = 2.0 * texel.xyz - 1.0;
+        float3 v = object_normal_decode(texel.xyz);
         float3x3 frame = float3x3(m.object_frame[0], m.object_frame[1], m.object_frame[2], m.object_frame[3], m.object_frame[4], m.object_frame[5], m.object_frame[6], m.object_frame[7], m.object_frame[8]);
         float3 baked = v + mul(frame, v);
         return safe_normalize(mul(c, baked) * side, i.normal);
@@ -409,7 +409,7 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
             if ((m.flags & MATERIAL_OBJECT_NORMAL) != 0)
             {
                 // A decal has no mesh: its box stands for the space the map states.
-                float3 v = 2.0 * texel.xyz - 1.0;
+                float3 v = object_normal_decode(texel.xyz);
                 normal = axis_x * v.x + axis_y * v.y + d.axis_z * v.z;
             }
             else
@@ -741,7 +741,7 @@ public struct StandardSurface : ISurface
         float fuzz_roughness = 1.0, thin_film_weight = 1.0, thin_film_thickness = 1.0;
         float thin_film_ior = 1.0, emission_luminance = 1.0, specular_anisotropy = 1.0;
         float3 subsurface_radius_scale = float3(1.0);
-        float subsurface_anisotropy = 0.5 * m.subsurface_scatter_anisotropy + 0.5;
+        float subsurface_anisotropy = 1.0;
         float3 base_color = surface_color_factor(i, m, TEXTURE_BASE_COLOR, m.base_color);
         float3 specular_color = surface_color_factor(i, m, TEXTURE_SPECULAR_COLOR, m.specular_color);
         float3 transmission_color = surface_color_factor(i, m, TEXTURE_TRANSMISSION_COLOR, m.transmission_color);
@@ -855,13 +855,10 @@ public struct StandardSurface : ISurface
         p.transmission_color = thin || depth == 0.0 ? transmission_color : float3(1.0);
         p.subsurface_weight = m.subsurface_weight * (subsurface_weight * surface_vertex(i, m, TEXTURE_SUBSURFACE_WEIGHT).x);
         p.subsurface_color = subsurface_color;
-        p.subsurface_anisotropy = m.subsurface_scatter_anisotropy;
+        p.subsurface_anisotropy = m.subsurface_scatter_anisotropy * subsurface_anisotropy;
         p.subsurface_radius = m.subsurface_radius * (subsurface_radius * surface_vertex(i, m, TEXTURE_SUBSURFACE_RADIUS).x) * m.subsurface_radius_scale;
         if (more)
-        {
             p.subsurface_radius *= subsurface_radius_scale;
-            p.subsurface_anisotropy = 2.0 * subsurface_anisotropy - 1.0;
-        }
         p.coat_weight = m.coat_weight * coat * surface_vertex(i, m, TEXTURE_COAT).x;
         p.coat_color = coat_color;
         p.coat_roughness = m.coat_roughness * (coat_roughness * surface_vertex(i, m, TEXTURE_COAT_ROUGHNESS).x);

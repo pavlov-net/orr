@@ -37,7 +37,7 @@ public static const uint MATERIAL_METAL_FLAT = 1 << 20;
 public static const uint MATERIAL_F0_STATED = 1 << 21;
 // A slot reads the vertex color stream.
 public static const uint MATERIAL_VERTEX = 1 << 24;
-// The normal map, or the coat's, holds mesh space directions at `0.5 v + 0.5`.
+// The normal map, or the coat's, holds mesh space directions (`object_normal_decode`).
 public static const uint MATERIAL_OBJECT_NORMAL = 1 << 25;
 public static const uint MATERIAL_OBJECT_COAT_NORMAL = 1 << 26;
 // Displacement fields are world lengths along the world normal, not mesh space lengths.
@@ -838,13 +838,13 @@ public float material_direction(MaterialGpu* m, uint slot, UvFootprint uv[2])
 {
     if ((m.flags & MATERIAL_MORE_TEXTURES) == 0 || !material_bound(m, slot))
         return 0.0;
-    return material_texel_direction(m, slot, material_texture(m, slot, uv, float4(1.0, 0.5, 0.0, 1.0)).xy);
+    return material_texel_direction(m, slot, material_texture(m, slot, uv, float4(1.0, 0.0, 0.0, 1.0)).xy);
 }
 
-// `material_direction` of bound slot `slot` from its texel's first two channels `texel`.
-public float material_texel_direction(MaterialGpu* m, uint slot, float2 texel)
+// `material_direction` of bound slot `slot` from its texel's first two channels `v`, the
+// direction's components.
+public float material_texel_direction(MaterialGpu* m, uint slot, float2 v)
 {
-    float2 v = texel * 2.0 - 1.0;
     float3 d = material_normal_frame(m, slot, float3(v, 0.0));
     return dot(d.xy, d.xy) > 0.0 ? atan2(d.y, d.x) : 0.0;
 }
@@ -900,7 +900,7 @@ public MediumParams material_medium(MaterialGpu* m, float4 point)
     // The six slots through one texture read, as `StandardSurface` reads its slots; an unbound
     // slot keeps the fallback `material_texture` gives it.
     float depth = 1.0;
-    float anisotropy = 0.5 * p.anisotropy + 0.5;
+    float anisotropy = 1.0;
     float scale = 1.0;
     float abbe = 1.0;
     // The transmission color, then TEXTURE_TRANSMISSION_DEPTH to TEXTURE_DISPERSION_ABBE.
@@ -922,7 +922,7 @@ public MediumParams material_medium(MaterialGpu* m, float4 point)
         }
     }
     p.depth *= depth;
-    p.anisotropy = 2.0 * anisotropy - 1.0;
+    p.anisotropy *= anisotropy;
     p.dispersion_scale *= scale;
     p.dispersion_abbe *= abbe;
     return p;

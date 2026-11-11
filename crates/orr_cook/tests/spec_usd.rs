@@ -2377,12 +2377,14 @@ fn normal_x(a: &Archive, m: &Material) -> f32 {
     let bytes = info
         .mip_texels(&read(a, &blobs[h.mip_blob(0)]), 0, 0)
         .unwrap();
+    assert_eq!(h.vk_format, orr_pack::texture::vk::BC5_SNORM);
     let mut px = [0u8; 32];
-    bcdec_rs::bc5(&bytes[..16], &mut px, 8, false);
+    bcdec_rs::bc5(&bytes[..16], &mut px, 8, true);
     let xy = px.as_chunks::<2>().0;
+    let snorm = |v: u8| (f32::from(v.cast_signed()) / 127.0).max(-1.0);
     let sum: f32 = xy
         .iter()
-        .map(|t| orr_pack::texture::normal::decode(t.map(|v| f32::from(v) / 255.0))[0])
+        .map(|t| orr_pack::texture::normal::decode(t.map(snorm))[0])
         .sum();
     sum / xy.len() as f32
 }

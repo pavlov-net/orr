@@ -1773,7 +1773,7 @@ impl Mapper<'_, '_> {
             .is_some_and(|node| matches!(self.node(node).kind.as_str(), "image" | "tiledimage"));
         match texture.then(|| self.value(n, name)).transpose()?.flatten() {
             Some(Value::Texture(t)) if t.channels == Channels::Rgb => {
-                self.textures.more.insert(s, Some(t.tex_ref()));
+                self.textures.more.insert(s, Some(t.remapped([0, 1, 2])));
             }
             _ => {
                 let warning = format!(

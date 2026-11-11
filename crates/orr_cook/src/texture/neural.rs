@@ -6,8 +6,9 @@
 //!   among them, while their channels fit LibNTC's 16. BC6H textures and uncompressed ones
 //!   other than displacement stay BC only.
 //! - Input: the same mip chains the BC encoders get (alpha coverage and Toksvig roughness
-//!   included). Color textures are stored as sRGB, normal maps as x and y at `0.5 v + 0.5`
-//!   (as BC5 holds them), the rest linear.
+//!   included). Color textures are stored as sRGB, signed ones (normal maps, directions,
+//!   anisotropies) at `0.5 v + 0.5`, which the decoder's output layer maps back to `v`
+//!   ([`NeuralTexture::SIGNED`]), the rest linear.
 //! - LibNTC's adaptive search looks for [`NeuralSettings::target_psnr`] over all channels at
 //!   no more bits per texel than the members' BC textures. A member enters the set's texture
 //!   table only when every one of its channels reaches [`NeuralSettings::min_psnr`] at mip 0,
@@ -19,7 +20,7 @@
 use std::sync::Mutex;
 
 use orr_pack::neural::{NeuralHeader, NeuralInfo, NeuralTexture, NeuralWeights};
-use orr_pack::texture::{FormatInfo, mip_size, normal, vk};
+use orr_pack::texture::{FormatInfo, mip_size, vk};
 use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
 use serde::Deserialize;
 
@@ -94,10 +95,11 @@ fn channels(job: &TextureJob) -> Option<(u8, u8)> {
     match job.encoding() {
         Encoding::Bc7Srgb => Some((3, NeuralTexture::SRGB)),
         Encoding::Bc7 => Some((4, NeuralTexture::LINEAR)),
-        Encoding::Bc5 if job.is_normal() => Some((2, NeuralTexture::NORMAL)),
         Encoding::Bc5 => Some((2, NeuralTexture::LINEAR)),
+        Encoding::Bc5Snorm => Some((2, NeuralTexture::SIGNED)),
         Encoding::Bc4 | Encoding::Raw(super::DataFormat::R16) => Some((1, NeuralTexture::LINEAR)),
-        Encoding::Bc4Snorm | Encoding::Bc5Snorm | Encoding::Bc6h | Encoding::Raw(_) => None,
+        Encoding::Bc4Snorm => Some((1, NeuralTexture::SIGNED)),
+        Encoding::Bc6h | Encoding::Raw(_) => None,
     }
 }
 
@@ -238,7 +240,7 @@ impl NeuralJob {
         if chains.iter().any(|c| c.len() != mips) {
             return Err(self.fail("neural set members differ in mip count".into()));
         }
-        // Per mip, the members' channels interleaved, linear; normals at 0.5 v + 0.5.
+        // Per mip, the members' channels interleaved, linear; signed ones at 0.5 v + 0.5.
         let data: Vec<Vec<f32>> = (0..mips)
             .map(|mip| {
                 let texels = chains[0][mip].px.len();
@@ -247,8 +249,8 @@ impl NeuralJob {
                     for (c, &(_, n, stored)) in chains.iter().zip(&layout) {
                         let px = c[mip].px[t];
                         for v in &px[..usize::from(n)] {
-                            out.push(if stored == NeuralTexture::NORMAL {
-                                normal::encode(*v)
+                            out.push(if stored == NeuralTexture::SIGNED {
+                                0.5 * v.clamp(-1.0, 1.0) + 0.5
                             } else {
                                 v.clamp(0.0, 1.0)
                             });

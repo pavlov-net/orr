@@ -641,10 +641,13 @@ fn ktx2(
             alpha: ctt::AlphaMode::Straight,
         },
     };
-    let encoder = if srgb {
-        ctt::encoders::Encoder::Bc7enc(Default::default())
-    } else {
-        ctt::encoders::Encoder::Intel(Default::default())
+    let encoder = match format {
+        _ if srgb => ctt::encoders::Encoder::Bc7enc(Default::default()),
+        // The only encoder of the signed forms.
+        ctt::Format::BC4_SNORM_BLOCK | ctt::Format::BC5_SNORM_BLOCK => {
+            ctt::encoders::Encoder::Amd(Default::default())
+        }
+        _ => ctt::encoders::Encoder::Intel(Default::default()),
     };
     let ctt::PipelineOutput::Encoded(bytes) = ctt::convert(
         image,
@@ -666,19 +669,23 @@ fn ktx2(
     (bytes, blocks)
 }
 
-/// A map of mesh space directions stores what a linear BC7 file holds: `0.5 v + 0.5` as it stands.
+/// A map of mesh space directions stores each component on the codes where 0 and both ends are
+/// exact: a file's flat texels, at 128 or 127 read as `2v - 1`, store as code 128 and read back
+/// as 0.
 #[test]
-fn object_normal_maps_keep_bc7_blocks() {
-    let d = dir("object-normal-pass");
+fn object_normal_maps_hold_zero_components_on_a_code() {
+    let d = dir("object-normal-codes");
     let n = 64;
-    let (file, blocks) = ktx2(n, n, ctt::Format::BC7_UNORM_BLOCK, |_, x, y| {
-        [(4 * x) as u8, (4 * y) as u8, (2 * (x + y)) as u8, 255]
+    let tilted = [200u8, 90, 220];
+    let file = png(n, n, |x, _| {
+        let [r, g, b] = if x < n / 2 { [128, 127, 255] } else { tilted };
+        [r, g, b, 255]
     });
-    std::fs::write(d.join("o.ktx2"), file).unwrap();
+    std::fs::write(d.join("o.png"), file).unwrap();
     let doc = d.join("m.mtlx");
     let body = r#"<?xml version="1.0"?>
 <materialx version="1.38">
-  <image name="i" type="vector3"><input name="file" type="filename" value="o.ktx2"/></image>
+  <image name="i" type="vector3"><input name="file" type="filename" value="o.png"/></image>
   <normalmap name="n" type="vector3">
     <input name="in" type="vector3" nodename="i"/>
     <input name="space" type="string" value="object"/>
@@ -708,7 +715,17 @@ fn object_normal_maps_keep_bc7_blocks() {
     let t = m.textures[slot::NORMAL].texture;
     let (info, levels) = mips(&a, a.name(a.find(t).unwrap()));
     assert_eq!(info.header.vk_format, vk::BC7_UNORM);
-    assert_eq!(levels[0], blocks);
+    let texels = decode(vk::BC7_UNORM, n, n, &levels[0][0]);
+    let v = |t: [f32; 4]| [0, 1, 2].map(|c| orr_pack::texture::object_normal::decode(t[c]));
+    for row in 0..n {
+        let [x, y, z] = v(texels[(row * n + 4) as usize]);
+        assert_eq!((x, y), (0.0, 0.0), "flat texel reads {x} {y} {z}");
+        assert!((z - 1.0).abs() < 1e-6, "{z}");
+    }
+    // A tilted texel reads its own normal within the encoder's error.
+    let want = Vec3::from(tilted.map(|c| 2.0 * f32::from(c) / 255.0 - 1.0)).normalize();
+    let got = Vec3::from(v(texels[(8 * n + 48) as usize]));
+    assert!(got.angle_between(want) < 0.02, "{got} against {want}");
 }
 
 /// BCn images that already hold what the material wants keep their blocks: every mip, or
@@ -728,7 +745,8 @@ fn bcn_material_textures_keep_their_blocks() {
         let a = if m == 0 { (2 * (x + y)) as u8 } else { 200 };
         [wave(x, y, 1), wave(x, y, 2), wave(x, y, 3), a]
     });
-    let (normal, normal_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |_, x, y| {
+    // A normal map's blocks pass where they hold x and y as they are.
+    let (normal, normal_blocks) = ktx2(n, n, ctt::Format::BC5_SNORM_BLOCK, |_, x, y| {
         [wave(x, y, 5), wave(y, x, 4), 255, 255]
     });
     let (rm, rm_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |_, x, y| {
@@ -962,9 +980,13 @@ fn two_channel_normals_rebuild_z_when_they_are_reencoded() {
         let stored = if x << m < n / 2 { 1.0 } else { -1.0 } * tilt * 0.5 + 0.5;
         [(stored * 255.0).round() as u8, 128, 0, 255]
     });
+    // Green 128 reads 1/255 at `2v - 1`, which stores as exactly 0.
     let x_of = |a: &Archive, name: &str| {
-        let (_, levels) = mips(a, name);
-        2.0 * decode(vk::BC5_UNORM, n, n, &levels[0][0])[8 * n as usize + 8][0] - 1.0
+        let (info, levels) = mips(a, name);
+        assert_eq!(info.header.vk_format, vk::BC5_SNORM);
+        let [x, y, ..] = decode(vk::BC5_SNORM, n, n, &levels[0][0])[8 * n as usize + 8];
+        assert_eq!(y, 0.0, "{name}");
+        x
     };
 
     // A normal scale stops the blocks passing through, whichever path remakes them.
@@ -993,6 +1015,135 @@ fn two_channel_normals_rebuild_z_when_they_are_reencoded() {
     assert!((x - tilt).abs() < 0.02, "{x}, not {tilt}");
 }
 
+/// An 8-bit unsigned normal map read as `2c/255 - 1` stores code `c` at snorm code `c - 128`
+/// from 128 up and `c - 127` below: both codes tools write for flat read exactly flat. Each
+/// block holds one code per channel, which BC5 keeps.
+#[test]
+fn unsigned_normal_codes_store_on_the_snorm_codes_around_them() {
+    let d = dir("normal-codes");
+    let n = 64u32;
+    let code = |x: u32, y: u32| (x / 4 + 16 * (y / 4), 127 + (y / 4) % 2);
+    let format = ctt::TargetFormat::Uncompressed(ctt::Format::R8G8_UNORM);
+    let bytes = float_ktx2(n, n, format, false, |x, y| {
+        let (cx, cy) = code(x, y);
+        [cx as f32 / 255.0, cy as f32 / 255.0, 0.0, 1.0]
+    });
+    let check = |a: &Archive, name: &str| {
+        let (info, levels) = mips(a, name);
+        assert_eq!(info.header.vk_format, vk::BC5_SNORM);
+        let texels = decode(vk::BC5_SNORM, n, n, &levels[0][0]);
+        for (i, t) in texels.iter().enumerate() {
+            let (cx, _) = code(i as u32 % n, i as u32 / n);
+            let want = if cx >= 128 {
+                cx as i32 - 128
+            } else {
+                cx as i32 - 127
+            };
+            assert_eq!((t[0] * 127.0).round() as i32, want, "{name}: code {cx}");
+            assert_eq!(t[1], 0.0, "{name}: code {cx}");
+        }
+    };
+    let path = d.join("codes.ktx2");
+    std::fs::write(&path, &bytes).unwrap();
+    let settings = TextureSettings {
+        usage: Usage::Normal,
+        ..TextureSettings::default()
+    };
+    check(&cook(vec![texture(&path, "n", settings)]), "n");
+    let glb = d.join("codes.glb");
+    write_glb(&glb, &[r#"{"normalTexture":{"index":0}}"#.into()], &[bytes]);
+    let (a, m) = cook_glb(&glb, GltfSettings::default());
+    check(
+        &a,
+        a.name(a.find(m.textures[slot::NORMAL].texture).unwrap()),
+    );
+}
+
+/// A direction in the tangent plane stores its components themselves, so one along u reads 0
+/// across: glTF's anisotropy texture holds them at `0.5 v + 0.5`, where 128 reads 1/255.
+#[test]
+fn anisotropy_directions_hold_zero_components_on_a_code() {
+    let d = dir("direction-codes");
+    let n = 32u32;
+    let image = png(n, n, |x, _| {
+        if x < n / 2 {
+            [255, 128, 255, 255]
+        } else {
+            [128, 255, 128, 255]
+        }
+    });
+    let path = d.join("aniso.glb");
+    write_glb(
+        &path,
+        &[
+            r#"{"extensions":{"KHR_materials_anisotropy":{"anisotropyStrength":0.5,
+            "anisotropyTexture":{"index":0}}}}"#
+                .into(),
+        ],
+        &[image],
+    );
+    let (a, m) = cook_glb(&path, GltfSettings::default());
+    let t = m.textures[slot::TANGENT].texture;
+    let (info, levels) = mips(&a, a.name(a.find(t).unwrap()));
+    assert_eq!(info.header.vk_format, vk::BC5_SNORM);
+    let texels = decode(vk::BC5_SNORM, n, n, &levels[0][0]);
+    assert_eq!(texels[(8 * n + 4) as usize][..2], [1.0, 0.0]);
+    assert_eq!(texels[(8 * n + 28) as usize][..2], [0.0, 1.0]);
+}
+
+/// A scatter anisotropy stores itself, so 0 is a code: unsigned where it reads no negatives,
+/// with twice the codes over 0..1, snorm where it does.
+#[test]
+fn scatter_anisotropies_hold_zero_on_a_code() {
+    let d = dir("anisotropy-codes");
+    let n = 32u32;
+    let unsigned = png(n, n, |x, _| [if x < n / 2 { 0 } else { 153 }, 0, 0, 255]);
+    let format = ctt::TargetFormat::Uncompressed(ctt::Format::R8_SNORM);
+    let signed = float_ktx2(n, n, format, false, |x, _| {
+        [if x < n / 2 { 0.0 } else { -0.5 }, 0.0, 0.0, 1.0]
+    });
+    for (file, bytes, format, tilted) in [
+        ("g.png", unsigned, vk::BC4_UNORM, 0.6),
+        ("g.ktx2", signed, vk::BC4_SNORM, -0.5),
+    ] {
+        std::fs::write(d.join(file), bytes).unwrap();
+        let doc = d.join("m.mtlx");
+        let body = format!(
+            r#"<?xml version="1.0"?>
+<materialx version="1.38">
+  <image name="i" type="float"><input name="file" type="filename" value="{file}"/></image>
+  <open_pbr_surface name="S" type="surfaceshader">
+    <input name="subsurface_weight" type="float" value="1"/>
+    <input name="subsurface_scatter_anisotropy" type="float" nodename="i"/>
+  </open_pbr_surface>
+  <surfacematerial name="M" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="S"/>
+  </surfacematerial>
+</materialx>
+"#
+        );
+        std::fs::write(&doc, body).unwrap();
+        let a = cook(vec![AssetSpec {
+            name: "u".into(),
+            source: Source::MaterialX {
+                path: doc,
+                material: "M".into(),
+                textures: TextureRules::default(),
+            },
+        }]);
+        let e = a.find(AssetId::from_name("u")).unwrap();
+        let m = Material::from_bytes(&read_blob(&a, e, 0)).unwrap();
+        assert_eq!(m.subsurface_scatter_anisotropy, 1.0, "{file}");
+        let t = m.textures[slot::SUBSURFACE_ANISOTROPY].texture;
+        let (info, levels) = mips(&a, a.name(a.find(t).unwrap()));
+        assert_eq!(info.header.vk_format, format, "{file}");
+        let texels = decode(format, n, n, &levels[0][0]);
+        assert_eq!(texels[(8 * n + 4) as usize][0], 0.0, "{file}");
+        let got = texels[(8 * n + 28) as usize][0];
+        assert!((got - tilted).abs() < 0.01, "{file}: {got}");
+    }
+}
+
 #[test]
 fn signed_two_channel_normals_read_their_own_values() {
     let d = dir("snorm-normal");
@@ -1006,11 +1157,11 @@ fn signed_two_channel_normals_read_their_own_values() {
     std::fs::write(&path, &bytes).unwrap();
     let check = |a: &Archive, name: &str| {
         let (_, levels) = mips(a, name);
-        let texels = decode(vk::BC5_UNORM, n, n, &levels[0][0]);
+        let texels = decode(vk::BC5_SNORM, n, n, &levels[0][0]);
         for (x, want) in [(8, tilt), (56, -tilt)] {
-            let got = texels[8 * n as usize + x].map(|c| 2.0 * c - 1.0);
+            let got = texels[8 * n as usize + x];
             assert!((got[0] - want).abs() < 0.02, "{got:?}, not {want}");
-            assert!(got[1].abs() < 0.02, "{got:?}");
+            assert_eq!(got[1], 0.0, "{got:?}");
         }
     };
     let settings = TextureSettings {
@@ -1470,9 +1621,9 @@ fn float_normals_read_the_way_that_gives_unit_vectors() {
     ];
     let check = |a: &Archive, name: &str, file: usize| {
         let (_, levels) = mips(a, name);
-        let texels = decode(vk::BC5_UNORM, n, n, &levels[0][0]);
+        let texels = decode(vk::BC5_SNORM, n, n, &levels[0][0]);
         for (px, want) in [(8usize, x), (24, -x)] {
-            let got = 2.0 * texels[24 * n as usize + px][0] - 1.0;
+            let got = texels[24 * n as usize + px][0];
             assert!((got - want).abs() < 0.03, "file {file}: {got}, not {want}");
         }
     };
@@ -1671,7 +1822,7 @@ fn gltf_materials_cook_their_canonical_channel_set() {
         TextureInfo::parse(&read_blob(&a, e, 0)).unwrap().header
     };
     assert_eq!(format(slot::BASE_COLOR).vk_format, vk::BC7_SRGB);
-    assert_eq!(format(slot::NORMAL).vk_format, vk::BC5_UNORM);
+    assert_eq!(format(slot::NORMAL).vk_format, vk::BC5_SNORM);
     assert_eq!(format(slot::ROUGHNESS).vk_format, vk::BC4_UNORM);
     let opacity = format(slot::OPACITY);
     assert_eq!(

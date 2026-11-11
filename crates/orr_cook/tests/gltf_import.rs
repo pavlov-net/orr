@@ -2131,17 +2131,18 @@ fn tangents_are_derived_unless_a_seam_turns_the_shading() {
         0
     );
 
-    // BC5 holds x at 0.5 v + 0.5: every texel tilts toward -x, by 0.3 to 0.5.
+    // BC5 snorm holds x as it is: every texel tilts toward -x, by 0.3 to 0.5.
     let e = a.find(AssetId::from_name("g/texture/0/normal")).unwrap();
     let blobs = a.blobs(e);
     let info = TextureInfo::parse(&read(&a, &blobs[0])).unwrap();
-    assert_eq!(info.header.vk_format, orr_pack::texture::vk::BC5_UNORM);
+    assert_eq!(info.header.vk_format, orr_pack::texture::vk::BC5_SNORM);
     let bytes = info.mip_texels(&read(&a, &blobs[1]), 0, 0).unwrap();
     for block in bytes.as_chunks::<16>().0 {
         let mut px = [0u8; 32];
-        bcdec_rs::bc5(block, &mut px, 8, false);
+        bcdec_rs::bc5(block, &mut px, 8, true);
         for xy in px.as_chunks::<2>().0 {
-            let [x, _, _] = orr_pack::texture::normal::decode(xy.map(|v| f32::from(v) / 255.0));
+            let snorm = |v: u8| (f32::from(v.cast_signed()) / 127.0).max(-1.0);
+            let [x, _, _] = orr_pack::texture::normal::decode(xy.map(snorm));
             assert!((-0.53..=-0.27).contains(&x), "{x}");
         }
     }

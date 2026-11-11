@@ -92,10 +92,10 @@ pub enum Usage {
     Color,
     /// sRGB color with linear alpha to BC7 sRGB.
     ColorAlpha,
-    /// Tangent-space normal (RGB, or x and y alone from a two-channel source) to BC5 holding x
-    /// and y; z is reconstructed. Unsigned sources store components at `0.5 v + 0.5` and signed
-    /// ones as they are. No format says which a float source that can hold negatives does, so
-    /// its vectors decide.
+    /// Tangent-space normal (RGB, or x and y alone from a two-channel source) to BC5 snorm
+    /// holding x and y; z is reconstructed. Unsigned sources store components at `0.5 v + 0.5`
+    /// and signed ones as they are. No format says which a float source that can hold negatives
+    /// does, so its vectors decide.
     Normal,
     /// One linear channel (R) to BC4, or BC4 snorm from a signed source without `alpha_cutoff`.
     Linear1,
@@ -485,13 +485,7 @@ fn stores_normals(layers: &[Img], rg: bool) -> bool {
 }
 
 /// Encoding and layout for the mip chains of `layers` (values linear, normals unit).
-fn finish(mut chains: Vec<Vec<Img>>, plan: &Plan) -> Result<Built, String> {
-    if plan.mips.normal {
-        for p in chains.iter_mut().flatten().flat_map(|m| &mut m.px) {
-            p[0] = normal::encode(p[0]);
-            p[1] = normal::encode(p[1]);
-        }
-    }
+fn finish(chains: Vec<Vec<Img>>, plan: &Plan) -> Result<Built, String> {
     let [w, h] = [chains[0][0].w, chains[0][0].h];
     let encoded = encode::encode(plan.encoding, plan.quality, &chains)?;
     let alpha_cutoff = plan.mips.coverage.map_or(f32::NAN, |(_, c)| c);

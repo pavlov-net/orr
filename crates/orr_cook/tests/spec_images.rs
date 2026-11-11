@@ -614,7 +614,8 @@ fn few_channel_containers_read_as_their_importer_says() {
                 float4 inputs:bias = (-1, -1, -1, 0)"#;
     let (a, m, _) = usd(&d, "n.ktx2", "normal3f inputs:normal", "rgb", pair);
     let (_, texels) = stored(&a, &m, slot::NORMAL, 8);
-    assert!((texels[0][1] - 0.5).abs() < 0.02, "{:?}", texels[0]);
+    assert!((texels[0][0] - 0.6).abs() < 0.02, "{:?}", texels[0]);
+    assert_eq!(texels[0][1], 0.0, "{:?}", texels[0]);
 }
 
 /// KTX 2.0 "Desired component mapping for a texture can be indicated with the key `KTXswizzle`".

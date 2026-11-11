@@ -5451,7 +5451,7 @@ fn neural_pack() -> &'static Arc<[u8]> {
                     texture: AssetId::from_name(NEURAL_NORMAL),
                     first_channel: 3,
                     channel_count: 2,
-                    stored: NeuralTexture::NORMAL,
+                    stored: NeuralTexture::SIGNED,
                     _pad: 0,
                     psnr: 40.0,
                 },
@@ -5533,7 +5533,8 @@ fn to_f16(x: f32) -> f32 {
 }
 
 /// The set's decoder on the CPU, as the kernels run it: FP16 vectors, the hidden layers'
-/// inputs converted to E4M3 with `fp8`, the output layer's scale folded into FP16 weights.
+/// inputs converted to E4M3 with `fp8`, the output layer's scale, and a signed channel's
+/// `2 o - 1`, folded into FP16 weights and biases.
 struct NeuralCpu {
     net: orr_pack::neural::Fp8Network,
     constants: orr_pack::neural::Constants,
@@ -5652,11 +5653,17 @@ impl NeuralCpu {
             if r >= OUTPUTS {
                 return 0.0;
             }
-            let s = n.scale[r];
+            // The normal map's channels are signed: the layer gives `2 o - 1` of them.
+            let (gain, shift) = if (3..5).contains(&r) {
+                (2.0, -1.0)
+            } else {
+                (1.0, 0.0)
+            };
+            let s = n.scale[r] * gain;
             let sum: f32 = (0..cols)
                 .map(|c| to_f16(f32::from(n.output[r * cols + c]) * s) * q[c])
                 .sum();
-            let v = to_f16(sum + to_f16(n.bias[r] as f32 * s));
+            let v = to_f16(sum + to_f16(n.bias[r] as f32 * s + shift));
             if r < 3 {
                 orr_color::srgb_decode(f64::from(v.clamp(0.0, 1.0))) as f32
             } else {

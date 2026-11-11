@@ -62,8 +62,8 @@ pub struct NeuralTexture {
     pub first_channel: u8,
     pub channel_count: u8,
     /// How output values map to the BC texture's: [`Self::LINEAR`], [`Self::SRGB`] (color
-    /// channels as stored by a BC7 sRGB texture) or [`Self::NORMAL`] (x and y as
-    /// `0.5 v + 0.5`, z reconstructed, as BC5 normal maps store them).
+    /// channels as stored by a BC7 sRGB texture) or [`Self::SIGNED`] (values `v` of a snorm
+    /// texture, which the network holds as `0.5 v + 0.5`).
     pub stored: u8,
     pub _pad: u8,
     /// Lowest PSNR over the texture's channels at mip 0 against the cook's input, dB.
@@ -73,7 +73,7 @@ pub struct NeuralTexture {
 impl NeuralTexture {
     pub const LINEAR: u8 = 0;
     pub const SRGB: u8 = 1;
-    pub const NORMAL: u8 = 2;
+    pub const SIGNED: u8 = 2;
 }
 
 /// Network weights of one LibNTC weight type.
@@ -123,7 +123,7 @@ impl NeuralInfo {
         let textures: Vec<NeuralTexture> = table(blob, h.textures)?;
         if textures.iter().any(|t| {
             t.channel_count == 0
-                || t.stored > NeuralTexture::NORMAL
+                || t.stored > NeuralTexture::SIGNED
                 || u32::from(t.first_channel) + u32::from(t.channel_count)
                     > u32::from(h.channel_count)
         }) {
@@ -340,7 +340,7 @@ mod tests {
                 texture: AssetId::from_name("m/texture/0/normal"),
                 first_channel: 3,
                 channel_count: 2,
-                stored: NeuralTexture::NORMAL,
+                stored: NeuralTexture::SIGNED,
                 _pad: 0,
                 psnr: 41.5,
             }],

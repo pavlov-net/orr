@@ -19,8 +19,8 @@ pub(crate) enum Encoding {
     /// RGB as sRGB, alpha linear.
     Bc7Srgb,
     Bc7,
-    /// Normal maps store x and y as `orr_pack::texture::normal` encodes them.
     Bc5,
+    /// Tangent-space normal maps store x and y as `orr_pack::texture::normal` says.
     Bc5Snorm,
     Bc4,
     Bc4Snorm,
@@ -33,8 +33,9 @@ impl Encoding {
     pub(super) fn of(usage: Usage, signed: bool, float: bool) -> Self {
         match usage {
             Usage::Color | Usage::ColorAlpha => Self::Bc7Srgb,
+            Usage::Normal => Self::Bc5Snorm,
             Usage::Linear2 if signed => Self::Bc5Snorm,
-            Usage::Normal | Usage::Linear2 => Self::Bc5,
+            Usage::Linear2 => Self::Bc5,
             Usage::Linear1 if signed => Self::Bc4Snorm,
             Usage::Linear1 => Self::Bc4,
             Usage::Linear4 => Self::Bc7,

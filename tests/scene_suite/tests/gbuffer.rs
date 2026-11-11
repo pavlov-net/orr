@@ -968,6 +968,24 @@ fn cook() -> Arc<[u8]> {
         TILT.map(|c| ((c * 0.5 + 0.5) * 255.0).round() as u8)
             .to_vec()
     });
+    // As a map of mesh space directions stores them, which the cook would write.
+    let object = |n: [f32; 3]| n.map(|c| ((127.0 * c).round() + 128.0) as u8).to_vec();
+    let tilt_object = png("tilt object.png", 16, 16, png::ColorType::Rgb, |_, _| {
+        object(TILT)
+    });
+    // Flat on the left three quarters, whole blocks of it, and tilted on the right.
+    let half_flat = |x: u32| x < 12;
+    let flat_tangent = png("flat.png", 16, 16, png::ColorType::Rgb, |x, _| {
+        if half_flat(x) {
+            vec![128, 128, 255]
+        } else {
+            TILT.map(|c| ((c * 0.5 + 0.5) * 255.0).round() as u8)
+                .to_vec()
+        }
+    });
+    let flat_object = png("flat object.png", 16, 16, png::ColorType::Rgb, |x, _| {
+        object(if half_flat(x) { [0.0, 0.0, 1.0] } else { TILT })
+    });
     let holes = png("holes.png", 128, 128, png::ColorType::Grayscale, |x, y| {
         let (u, v) = (x as f32 / 128.0 - 0.5, y as f32 / 128.0 - 0.5);
         let ring = ((u * u + v * v).sqrt() * 10.0).fract();
@@ -997,6 +1015,10 @@ fn cook() -> Arc<[u8]> {
         ..Material::default()
     };
     tilted_object.textures[slot::NORMAL].texture = id("tex/tilt object");
+    let mut flat = tilted;
+    flat.textures[slot::NORMAL].texture = id("tex/flat");
+    let mut flat_object_material = tilted_object;
+    flat_object_material.textures[slot::NORMAL].texture = id("tex/flat object");
     let mut tilted_uv1 = tilted;
     tilted_uv1.textures[slot::NORMAL].uv_set = 1;
     let mut tilted_keeping_uv1 = tilted;
@@ -1220,9 +1242,13 @@ fn cook() -> Arc<[u8]> {
                 texture("tex/normal", bumps, Usage::Normal),
                 texture("tex/holes", holes, Usage::Linear1),
                 texture("tex/sticker", sticker, Usage::Color),
-                texture("tex/tilt object", tilt.clone(), Usage::Linear4),
+                texture("tex/tilt object", tilt_object, Usage::Linear4),
                 texture("tex/tilt", tilt, Usage::Normal),
+                texture("tex/flat", flat_tangent, Usage::Normal),
+                texture("tex/flat object", flat_object, Usage::Linear4),
                 model("tilted", quad(unit), vec![tilted], one()),
+                model("flat", quad(unit), vec![flat], one()),
+                model("flat object", quad(unit), vec![flat_object_material], one()),
                 model("tilted object", quad(unit), vec![tilted_object], one()),
                 AssetSpec {
                     name: "tilted skew".into(),
@@ -3520,6 +3546,44 @@ fn tilted_pixels(g: &Frame, want: Vec3, pick: impl Fn(Vec3) -> bool) -> usize {
         }
     }
     seen
+}
+
+/// The flat part of a normal map that is not flat everywhere reads the vertex normal exactly,
+/// in tangent space and in mesh space: its components of 0 are codes. The G-buffer's normal
+/// holds 12 bits per axis, under 0.03 degrees, where a 0 a code off would tilt it 0.32.
+#[test]
+fn flat_texels_of_normal_maps_read_the_vertex_normal() {
+    let _serial = serial();
+    let mut w = World::new(&linked::KERNELS);
+    for model in ["flat", "flat object"] {
+        let item = Item {
+            model,
+            linear: Mat3::IDENTITY,
+            at: Vec3::ZERO,
+        };
+        let placed = place(&mut w, &[item]);
+        let mut shot = Shot::at(DVec3::new(0.0, 0.0, 2.0), DVec3::ZERO, 1);
+        shot.jitter = Vec2::ZERO;
+        let g = shoot(&mut w, &placed, &shot);
+        let (mut flat, mut tilted) = (0, 0);
+        for i in 0..g.ids.len() {
+            if g.ids[i] == 0 {
+                continue;
+            }
+            let n = decode_core(g.a[i], g.b[i]).normal;
+            let off = n.cross(Vec3::Z).length();
+            if off < 0.035 {
+                assert!(off < 5e-4, "{model} pixel {i}: {n} is {off} rad off +z");
+                flat += 1;
+            } else {
+                tilted += 1;
+            }
+        }
+        assert!(
+            flat > 1000 && tilted > 100,
+            "{model}: {flat} flat, {tilted} tilted"
+        );
+    }
 }
 
 /// A copy's material can read a normal map on the uv set the mesh's tangents don't follow, which
@@ -13112,6 +13176,7 @@ fn every_slot_reaches_its_parameter() {
         specular_anisotropy: 0.5,
         subsurface_weight: 0.5,
         subsurface_radius: 1.0,
+        subsurface_scatter_anisotropy: 0.5,
         emission_luminance: 2.0,
         ..Material::default()
     };
@@ -13122,10 +13187,8 @@ fn every_slot_reaches_its_parameter() {
     };
     // Per slot, the parameter, its factor and what it reads with the texture.
     let scalar = |f: f32| f * v[0];
-    let turned = {
-        let [x, y] = [2.0 * v[0] - 1.0, 2.0 * v[1] - 1.0];
-        y.atan2(x)
-    };
+    // A direction's texel holds its components.
+    let turned = v[1].atan2(v[0]);
     type Read = fn(&P) -> f32;
     let rows: Vec<(usize, Read, f32)> = vec![
         (
@@ -13143,7 +13206,7 @@ fn every_slot_reaches_its_parameter() {
         (
             slot::SUBSURFACE_ANISOTROPY,
             |p| p.subsurface_anisotropy,
-            2.0 * v[0] - 1.0,
+            scalar(0.5),
         ),
         (slot::FUZZ_WEIGHT, |p| p.fuzz_weight, scalar(0.5)),
         (
@@ -13338,7 +13401,7 @@ fn every_slot_reaches_its_parameter() {
     close(medium(1).medium_depth, 2.0 * v[0], slot::TRANSMISSION_DEPTH);
     close(
         medium(3).medium_anisotropy,
-        2.0 * v[0] - 1.0,
+        0.25 * v[0],
         slot::TRANSMISSION_SCATTER_ANISOTROPY,
     );
     close(
@@ -13358,7 +13421,7 @@ fn every_slot_reaches_its_parameter() {
         slot::DISPERSION_SCALE,
     );
     // A mesh space direction turns with the placement, a quarter turn about z.
-    let [x, y, z] = [v[0], v[1], v[2]].map(|c| 2.0 * c - 1.0);
+    let [x, y, z] = [v[0], v[1], v[2]].map(orr_pack::texture::object_normal::decode);
     let want = Vec3::new(-y, x, z).normalize();
     let n = Vec3::from(out[out.len() - 2].coat_normal);
     assert!(

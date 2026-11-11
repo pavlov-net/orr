@@ -85,6 +85,15 @@ fn srgb_channels(info: &NeuralInfo) -> u32 {
         .fold(0, |a, b| a | b)
 }
 
+/// Bit per output channel that `info`'s textures hold as [`NeuralTexture::SIGNED`].
+fn signed_channels(info: &NeuralInfo) -> u32 {
+    info.textures
+        .iter()
+        .filter(|t| t.stored == NeuralTexture::SIGNED)
+        .map(|t| ((1u32 << t.channel_count) - 1) << t.first_channel)
+        .fold(0, |a, b| a | b)
+}
+
 /// A set's decoder weights as the device multiplies them, and the set's record without its
 /// weights' address, latents and sampler.
 pub(crate) struct DeviceWeights {
@@ -128,7 +137,8 @@ fn padded(m: &[u8], rows: usize, cols: usize, bytes: usize) -> Vec<u8> {
 
 /// Converts `net` into the device's inference layout, each layer padded to [`WIDTH`]
 /// square: the hidden layers' matrices E4M3 or FP16 by `p`, the output layer's FP16 with
-/// each row's scale folded into its weights and bias, then the FP16 biases. Offsets in the
+/// each row's scale folded into its weights and bias, and a signed channel's `2 o - 1` too,
+/// then the FP16 biases. Offsets in the
 /// record are from the start of `bytes`, which must land at a multiple of [`MATRIX_ALIGN`].
 pub(crate) fn device_weights(
     device: &Device,
@@ -138,8 +148,21 @@ pub(crate) fn device_weights(
     p: Precision,
 ) -> Result<DeviceWeights> {
     let (rows3, cols3) = LAYERS[3];
+    // The network holds a signed value `v` as `0.5 v + 0.5`. The output layer is affine, so its
+    // row doubled, less 1, gives `v` as the BC texture holds it.
+    let signed = signed_channels(info);
+    let affine = |r: usize| {
+        if signed >> r & 1 != 0 {
+            (2.0, -1.0)
+        } else {
+            (1.0, 0.0)
+        }
+    };
     let output: Vec<f16> = (0..rows3 * cols3)
-        .map(|i| f16::from_f32(f32::from(net.output[i]) * net.scale[i / cols3]))
+        .map(|i| {
+            let r = i / cols3;
+            f16::from_f32(f32::from(net.output[i]) * net.scale[r] * affine(r).0)
+        })
         .collect();
     let mut sources: Vec<(ComponentType, Vec<u8>)> = net
         .hidden
@@ -184,7 +207,10 @@ pub(crate) fn device_weights(
         device.convert_matrix(&c, src, &mut out[matrices[l] as usize..])?;
     }
     let output_bias: Vec<f16> = (0..rows3)
-        .map(|r| f16::from_f32(net.bias[r] as f32 * net.scale[r]))
+        .map(|r| {
+            let (gain, shift) = affine(r);
+            f16::from_f32(net.bias[r] as f32 * net.scale[r] * gain + shift)
+        })
         .collect();
     for (l, b) in net
         .hidden

@@ -133,8 +133,9 @@ pub struct Material {
     /// Whose model the parameters state: [`Self::MODEL_OPENPBR`] by default.
     pub model: u8,
     /// Which normal maps hold mesh space directions, through [`Self::object_frame`]:
-    /// [`Self::OBJECT_NORMAL`] and [`Self::OBJECT_COAT_NORMAL`]. Such a map stores a direction at
-    /// `0.5 v + 0.5` in its first three channels, and the mesh's tangents have no part in it.
+    /// [`Self::OBJECT_NORMAL`] and [`Self::OBJECT_COAT_NORMAL`]. Such a map stores a direction in
+    /// its first three channels as `texture::object_normal` says, and the mesh's tangents have
+    /// no part in it.
     pub object_normals: u8,
     /// Nonzero: the displacement fields are world lengths along the world normal, whatever scale
     /// places the mesh, not mesh space lengths that scale with it.
@@ -233,13 +234,13 @@ impl Material {
 
 /// Texture slots. All but `NORMAL`, `COAT_NORMAL`, `EMISSION`, `EMISSION_LUMINANCE`,
 /// `SPECULAR_WEIGHT`, `SPECULAR_IOR`, `COAT_IOR`, `THIN_FILM_IOR`, `THIN_FILM_THICKNESS`,
-/// `SUBSURFACE_RADIUS`, `TRANSMISSION_DEPTH`, `DISPERSION_ABBE` and the three of displacement read
-/// values of 0..1. Nothing clamps what they sample: a signed texture bound to one is the caller's
-/// responsibility. A value multiplies its field, with three exceptions: `TANGENT` and
-/// `COAT_TANGENT` hold a direction in the tangent plane in their first two channels at
-/// `0.5 v + 0.5`, on top of the field's rotation, and
-/// `SUBSURFACE_ANISOTROPY` and `TRANSMISSION_SCATTER_ANISOTROPY` hold the anisotropy at
-/// `0.5 g + 0.5`, in place of the field. What describes an interior medium, these slots and
+/// `SUBSURFACE_RADIUS`, `TRANSMISSION_DEPTH`, `DISPERSION_ABBE`, the three of displacement and
+/// the tangents and anisotropies below read values of 0..1. Nothing clamps what they sample: a signed texture bound to
+/// one is the caller's responsibility. A value multiplies its field, with two exceptions:
+/// `TANGENT` and `COAT_TANGENT` hold the components of a direction in the tangent plane in their
+/// first two channels, on top of the field's rotation. `SUBSURFACE_ANISOTROPY` and
+/// `TRANSMISSION_SCATTER_ANISOTROPY` read anisotropies of -1..1, which multiply theirs. What
+/// describes an interior medium, these slots and
 /// `TRANSMISSION_COLOR` under a depth above 0, reads where a path enters the medium: it is
 /// homogeneous, and each entry point states its own.
 pub mod slot {

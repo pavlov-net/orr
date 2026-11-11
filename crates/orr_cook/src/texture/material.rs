@@ -4,7 +4,7 @@
 //! - Base color: BC7 sRGB (RGB). Under `MASK` and `BLEND`, base alpha times the opacity
 //!   factor becomes a BC4 opacity texture, with alpha-coverage mips at the cutoff under
 //!   `MASK` unless it keeps its source's mips.
-//! - Normal: BC5, with the glTF normal scale applied.
+//! - Normal: BC5 snorm, with the glTF normal scale applied.
 //! - Roughness and metalness share a BC5 (BC4 when only one varies). Factors are folded into
 //!   these texels and the material's factors set to 1.
 //! - Roughness takes the normal map's variance per mip (Toksvig), so a material with a normal
@@ -45,8 +45,9 @@
 //!
 //! - The slots from [`slot::MORE`] on take their inputs from [`MaterialTextures::more`]: a weight
 //!   as a coat weight is, a value that can read past 1 as a specular weight is, a color as
-//!   subsurface color is, the coat normal as the normal is but for Toksvig roughness, and a
-//!   direction as BC5 of its first two channels.
+//!   subsurface color is, the coat normal as the normal is but for Toksvig roughness, a
+//!   direction as BC5 snorm of the components its first two channels read, and an anisotropy
+//!   as BC4 holding it, snorm where it can read below 0.
 //!
 //! A bound texture's value multiplies the matching factor; normal and opacity textures have no
 //! factor.
@@ -65,7 +66,7 @@ use ctt::Quality;
 use orr_color::RgbPrimaries;
 use orr_math::{DMat3, DVec3};
 use orr_pack::material::{Material, TextureBinding, slot};
-use orr_pack::texture::{full_mip_count, mip_size, normal};
+use orr_pack::texture::{full_mip_count, mip_size, normal, object_normal};
 use orr_pack::tiles::{TextureTiles, Tile};
 use orr_pack::{AssetId, Class, Hash32};
 use serde::Deserialize;
@@ -311,7 +312,7 @@ enum More {
     Weight(&'static str),
     /// A value from 0 up, with its role, which multiplies the field.
     Ranged(&'static str),
-    /// A value of -1..1, with its role, stored at `0.5 v + 0.5` in the field's place.
+    /// A value of -1..1, with its role, which multiplies the field.
     Signed(&'static str),
     Color,
     /// The first two channels of a direction, with its role.
@@ -954,7 +955,7 @@ enum Texels {
         b: f32,
     },
     /// The z of a two-channel normal image, which holds none, rebuilt from its x and y.
-    /// With `encoded`, at `0.5 z + 0.5`.
+    /// With `encoded`, as a map of mesh space directions stores it.
     NormalZ {
         encoded: bool,
         image: usize,
@@ -990,13 +991,13 @@ pub(crate) struct TextureJob {
 }
 
 impl Pack {
-    /// Where a source value stops. Apart from normals, BC4 and BC5 hold weights, and a float
+    /// Where a source value stops. Unsigned BC4 and BC5 hold weights, and a float
     /// weight has no upper limit: a source texel clamps before its factor, as a constant does. A
     /// float weight's remap can reach below 0 where no format of 0..1 would store it, and a
     /// negative weight has no IOR.
     fn limit(&self) -> Option<f32> {
         match self.encoding {
-            Encoding::Bc4 | Encoding::Bc5 if !self.normal => Some(1.0),
+            Encoding::Bc4 | Encoding::Bc5 => Some(1.0),
             Encoding::Raw(DataFormat::R16f) => Some(f32::INFINITY),
             _ => None,
         }
@@ -1013,7 +1014,7 @@ impl Pack {
         }
         if self.normal {
             let [x, y, ..] = normalized(v);
-            return [normal::encode(x), normal::encode(y), 0.0, 0.0];
+            return [x, y, 0.0, 0.0];
         }
         let (lo, hi) = self.encoding.range();
         v.map(|c| settled(c, lo, hi))
@@ -1328,11 +1329,25 @@ impl<'a> Packer<'a> {
         self.constant_input(r).filter(|_| one_side)
     }
 
-    /// Normal map `r` with the remap it reads through, and its layout: what its material states
-    /// where the image can hold that. A signed image holds the vectors themselves, so a pair that
-    /// centers 0..1 at 0 doesn't apply to it, and one with no negatives can't, so reading it as it
-    /// stands doesn't either.
+    /// Normal map `r` with the remap it reads through ([`Self::vector_source`]), and its layout.
     fn normal_source(&self, r: &TexRef) -> (TexRef, NormalSource) {
+        let f = self.image(r.image);
+        let r = self.vector_source(r);
+        let source = NormalSource {
+            rg: f.rg,
+            signed: f.stored_normals,
+            y: self.read(&r, 1).unwrap_or(1),
+            z: self.read(&r, 2).unwrap_or(2),
+            decode: self.decode(&r),
+        };
+        (r, source)
+    }
+
+    /// Vector input `r`, a normal map or a direction, with the remap that reads its components:
+    /// what its material states where the image can hold that. A signed image holds the vectors
+    /// themselves, so a pair that centers 0..1 at 0 doesn't apply to it, and one with no
+    /// negatives can't, so reading it as it stands doesn't either.
+    fn vector_source(&self, r: &TexRef) -> TexRef {
         const ENCODED: [[f32; 2]; 3] = [[-1.0, 2.0]; 3];
         let f = self.image(r.image);
         let m = match r.remap {
@@ -1354,14 +1369,25 @@ impl<'a> Packer<'a> {
             Ok(_) => m[c],
             Err(v) => [m[c][0] + m[c][1] * v, 0.0],
         }));
-        let source = NormalSource {
-            rg: f.rg,
-            signed: f.stored_normals,
-            y: self.read(&r, 1).unwrap_or(1),
-            z: self.read(&r, 2).unwrap_or(2),
-            decode: self.decode(&r),
-        };
-        (TexRef { remap, ..r }, source)
+        TexRef { remap, ..r }
+    }
+
+    /// Whether scalar input `r` can read below 0, through its remap: of the values its images'
+    /// formats hold, a float image's as measured, and of what it reads past its texels.
+    fn reads_below_zero(&self, r: &TexRef) -> bool {
+        let outside = self.bounded(r) && r.read(0, r.outside[usize::from(r.channel)]) < 0.0;
+        outside
+            || self.each(r).iter().any(|t| {
+                let f = self.image(t.image);
+                let (lo, hi) = if f.float {
+                    self.range(t, usize::from(t.channel))
+                } else if f.negatives {
+                    (-1.0, 1.0)
+                } else {
+                    (0.0, 1.0)
+                };
+                t.read(0, lo).min(t.read(0, hi)) < 0.0
+            })
     }
 
     /// `r` reading the channels a two-channel file holds, not what USD's outputs make of them:
@@ -1779,7 +1805,7 @@ impl<'a> Packer<'a> {
             let channel = |c: usize, scale: f32| this.source(&r, c, c, 0.0, scale);
             Pack {
                 role,
-                encoding: Encoding::Bc5,
+                encoding: Encoding::Bc5Snorm,
                 channels: vec![
                     channel(0, scale[0]),
                     channel(1, scale[1]),
@@ -1813,8 +1839,8 @@ impl<'a> Packer<'a> {
     }
 
     /// A normal map of mesh space directions. Unlike the tangent plane's they reach every side, so
-    /// each holds three channels at `0.5 v + 0.5`, and none is flat. Roughness takes no variance
-    /// from it.
+    /// each holds three channels as `orr_pack::texture::object_normal` says, and none is flat.
+    /// Roughness takes no variance from it.
     fn object_normal_map(
         &mut self,
         suffix: &str,
@@ -1829,7 +1855,8 @@ impl<'a> Packer<'a> {
         let shrink = (0..held).all(|c| self.constant(&r, c).is_some());
         let id = self.make_each(suffix, &r, |this, cell| {
             let (r, source) = this.normal_source(&this.at(raw, cell));
-            let channel = |c: usize| this.source(&r, c, c, 0.5, 0.5);
+            let (a, b) = (object_normal::OFFSET, object_normal::SCALE);
+            let channel = |c: usize| this.source(&r, c, c, a, b);
             Pack {
                 role,
                 encoding: Encoding::Bc7,
@@ -1844,7 +1871,7 @@ impl<'a> Packer<'a> {
                                 image: r.image,
                                 source,
                             },
-                            outside: Outside::of(0.5 * z + 0.5),
+                            outside: Outside::of(a + b * z),
                         }
                     } else {
                         channel(2)
@@ -1978,18 +2005,23 @@ impl<'a> Packer<'a> {
                 Ok(())
             }
             More::Signed(role) => {
-                let factor = *scalar_field(m, s);
                 let channel = usize::from(r.channel);
                 match self.constant(r, channel).filter(|_| !self.bounded(r)) {
-                    Some(v) => *scalar_field(m, s) = factor * r.read(0, v),
+                    Some(v) => *scalar_field(m, s) *= r.read(0, v),
                     None => {
+                        // Unsigned codes step twice as finely over 0..1.
+                        let encoding = if self.reads_below_zero(r) {
+                            Encoding::Bc4Snorm
+                        } else {
+                            Encoding::Bc4
+                        };
                         let id = self.make_each(suffix, r, |this, cell| {
                             let r = this.at(r, cell);
                             let channel = usize::from(r.channel);
                             Pack {
                                 role,
-                                encoding: Encoding::Bc4,
-                                channels: vec![this.source(&r, 0, channel, 0.5, 0.5 * factor)],
+                                encoding,
+                                channels: vec![this.source(&r, 0, channel, 0.0, 1.0)],
                                 refs: vec![r],
                                 coverage: None,
                                 toksvig: None,
@@ -2005,7 +2037,7 @@ impl<'a> Packer<'a> {
             }
             More::Direction(role) => {
                 let id = self.make_each(suffix, r, |this, cell| {
-                    let r = this.at(r, cell);
+                    let r = this.vector_source(&this.at(r, cell));
                     let channels = vec![
                         this.source(&r, 0, 0, 0.0, 1.0),
                         this.source(&r, 1, 1, 0.0, 1.0),
@@ -2014,7 +2046,7 @@ impl<'a> Packer<'a> {
                     ];
                     Pack {
                         role,
-                        encoding: Encoding::Bc5,
+                        encoding: Encoding::Bc5Snorm,
                         channels,
                         refs: vec![r],
                         coverage: None,
@@ -2285,8 +2317,8 @@ impl<'a> Packer<'a> {
         let count = match p.encoding {
             Encoding::Bc7Srgb | Encoding::Bc7 => 4,
             Encoding::Bc6h => 3,
-            Encoding::Bc5 => 2,
-            Encoding::Bc4 => 1,
+            Encoding::Bc5 | Encoding::Bc5Snorm => 2,
+            Encoding::Bc4 | Encoding::Bc4Snorm => 1,
             _ => return None,
         };
         if p.shrink || grid.is_some() {
@@ -2303,11 +2335,7 @@ impl<'a> Packer<'a> {
                     a,
                     b,
                 } => {
-                    let identity = if p.normal {
-                        (*a, *b) == (-1.0, 2.0)
-                    } else {
-                        (*a, *b) == (0.0, 1.0)
-                    };
+                    let identity = (*a, *b) == (0.0, 1.0);
                     // Color channels keep their sRGB encoding; alpha and data are linear.
                     let stored = if p.encoding == Encoding::Bc7Srgb && c < 3 {
                         Decode::SRGB
@@ -2351,12 +2379,12 @@ impl<'a> Packer<'a> {
         // Slots read color and normal channels together from their first one on.
         let in_order = match p.encoding {
             Encoding::Bc7Srgb | Encoding::Bc7 | Encoding::Bc6h => channels[..3] == [0, 1, 2],
-            Encoding::Bc5 if p.normal => channels[..2] == [0, 1],
+            Encoding::Bc5Snorm if p.normal => channels[..2] == [0, 1],
             _ => true,
         };
         let held = match format {
-            vk::BC4_UNORM => 1,
-            vk::BC5_UNORM => 2,
+            vk::BC4_UNORM | vk::BC4_SNORM => 1,
+            vk::BC5_UNORM | vk::BC5_SNORM => 2,
             _ => 4,
         };
         let derived = p.toksvig.is_some() || p.coverage.is_some() && !source_mips;
@@ -2699,11 +2727,6 @@ impl TextureJob {
         self.pack.encoding
     }
 
-    /// Whether the texture holds a tangent-space normal map.
-    pub(super) fn is_normal(&self) -> bool {
-        self.pack.normal
-    }
-
     fn fail(&self, message: String) -> Error {
         Error::Texture {
             asset: self.asset.clone(),
@@ -2820,7 +2843,11 @@ impl TextureJob {
                     source,
                 } => {
                     let r = self.pack.refs[0];
-                    let (a, b) = if encoded { (0.5, 0.5) } else { (0.0, 1.0) };
+                    let (a, b) = if encoded {
+                        (object_normal::OFFSET, object_normal::SCALE)
+                    } else {
+                        (0.0, 1.0)
+                    };
                     img.px
                         .par_iter_mut()
                         .zip(&decoded[&image].px)

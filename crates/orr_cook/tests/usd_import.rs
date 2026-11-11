@@ -1269,7 +1269,8 @@ fn assert_same_materials(ga: &Archive, g: &Material, ua: &Archive, u: &Material)
 }
 
 /// `UsdUVTexture` scale and bias state how a normal map is encoded, for any image: the same
-/// vectors cook to the same texture from values as stored, at `0.5 v + 0.5`, or flipped.
+/// vectors cook to the same texture from values as stored, at `0.5 v + 0.5`, or flipped. They
+/// repeat: black past the edges reads as a different vector under each.
 #[test]
 fn usd_normals_decode_by_their_scale_and_bias() {
     let d = dir("usd-normal-decode");
@@ -1330,6 +1331,8 @@ def Xform "World"
                 float2 inputs:st.connect = </World/Looks/M/St.outputs:result>
                 float4 inputs:scale = {scale}
                 float4 inputs:bias = {bias}
+                token inputs:wrapS = "repeat"
+                token inputs:wrapT = "repeat"
                 float3 outputs:rgb
             }}
             def Shader "St"

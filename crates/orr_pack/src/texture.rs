@@ -296,14 +296,10 @@ pub fn untile(f: FormatInfo, w: u32, h: u32, tiles: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Tangent-space normal maps: two unorm channels hold x and y at `0.5 v + 0.5`, and z is
-/// rebuilt as `sqrt(1 - x^2 - y^2)`. The Slang `orr_pack.normal_map` module decodes alike.
+/// Tangent-space normal maps: two snorm channels hold x and y as they are, so a flat normal's 0
+/// is a code, and z is rebuilt as `sqrt(1 - x^2 - y^2)`. The Slang `orr_pack.normal_map`
+/// module decodes alike.
 pub mod normal {
-    /// The stored value of component `v` in [-1, 1].
-    pub fn encode(v: f32) -> f32 {
-        0.5 * v + 0.5
-    }
-
     /// The z of a normal with components `x` and `y`.
     pub fn z(x: f32, y: f32) -> f32 {
         (1.0 - x * x - y * y).clamp(0.0, 1.0).sqrt()
@@ -311,11 +307,23 @@ pub mod normal {
 
     /// The tangent-space normal of stored x and y.
     pub fn decode([x, y]: [f32; 2]) -> [f32; 3] {
-        let (x, y) = (2.0 * x - 1.0, 2.0 * y - 1.0);
         [x, y, z(x, y)]
     }
 }
 
+/// Normal maps of mesh space directions: three unorm channels hold `(127 v + 128) / 255` of
+/// each component `v`, so -1, 0 and 1 are codes 1, 128 and 255 and every axis is exact. The
+/// Slang `orr_pack.normal_map` module decodes alike.
+pub mod object_normal {
+    /// The stored value of component `v` is `OFFSET + SCALE * v`.
+    pub const OFFSET: f32 = 128.0 / 255.0;
+    pub const SCALE: f32 = 127.0 / 255.0;
+
+    /// The component of stored value `t`.
+    pub fn decode(t: f32) -> f32 {
+        (t * 255.0 - 128.0) / 127.0
+    }
+}
 /// The equal-area octahedral sphere mapping of environment maps (Clarberg 2008).
 ///
 /// Map coordinates `(s, t)` cover `[0, 1]^2`; `t` grows with the texel row. The center of
