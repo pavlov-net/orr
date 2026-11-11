@@ -107,14 +107,11 @@ impl<T: Pod> Column<T> {
         self.state.lock().unwrap().capacity
     }
 
-    /// The most entries the table can hold: one scatter record zeroes the entries a grow adds,
-    /// and counts their words in 32 bits.
+    /// The most entries the table can hold: the scatter counts the words of a record, such as
+    /// the one that zeroes the entries a grow adds, and offsets the words of one that writes a
+    /// field of each entry, in 32 bits.
     pub(crate) fn limit(&self) -> u32 {
-        if self.zeroed {
-            u32::MAX / entry_words::<T>()
-        } else {
-            u32::MAX
-        }
+        u32::MAX / entry_words::<T>()
     }
 
     /// The memory [`Self::grow`] takes for a table of `capacity` entries, at most

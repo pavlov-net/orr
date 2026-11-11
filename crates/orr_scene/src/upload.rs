@@ -23,6 +23,9 @@ const SCATTER_MASKED: u32 = 2;
 const GROUP: u32 = 64;
 /// Most workgroups one scatter dispatches; threads loop over the rest.
 const MAX_GROUPS: u32 = 65_535;
+/// Most words one scatter dispatch writes: a thread steps from its word by the threads
+/// dispatched until it passes the last, in 32 bits.
+const MAX_WORDS: u32 = u32::MAX - MAX_GROUPS * GROUP;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
@@ -214,6 +217,28 @@ fn trim(mut records: Vec<Record>) -> [Vec<Record>; 3] {
     passes
 }
 
+/// Splits a pass into the runs of records one dispatch each applies, no run past
+/// [`MAX_WORDS`]: a record that would pass it goes on in the next.
+fn dispatches(pass: &[Record]) -> Vec<Vec<Record>> {
+    let mut out: Vec<Vec<Record>> = Vec::new();
+    let mut words = 0;
+    for r in pass {
+        let mut from = 0;
+        while from < r.count {
+            if out.is_empty() || words == MAX_WORDS {
+                out.push(Vec::new());
+                words = 0;
+            }
+            let to = from + (r.count - from).min(MAX_WORDS - words);
+            let run = out.last_mut().expect("pushed above");
+            run.push(r.part(u64::from(from), u64::from(to)));
+            words += to - from;
+            from = to;
+        }
+    }
+    out
+}
+
 /// Totals of one scatter.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ScatterTotals {
@@ -275,7 +300,7 @@ fn dispatch_pass(
     Ok(())
 }
 
-/// Records the scatter of `records`: one dispatch per non-empty pass of [`trim`].
+/// Records the scatter of `records`: the dispatches of each pass of [`trim`] in turn.
 pub(crate) fn scatter(
     device: &Device,
     window: &UploadWindow,
@@ -284,11 +309,14 @@ pub(crate) fn scatter(
     records: Vec<Record>,
 ) -> Result<ScatterTotals> {
     let mut totals = ScatterTotals::default();
-    for pass in trim(records).iter().filter(|p| !p.is_empty()) {
-        if totals.dispatches > 0 {
-            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+    for pass in &trim(records) {
+        for (i, run) in dispatches(pass).iter().enumerate() {
+            // A pass's records write no word twice; a later pass writes over an earlier one.
+            if i == 0 && totals.dispatches > 0 {
+                list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            }
+            dispatch_pass(device, window, list, pipeline, run, &mut totals)?;
         }
-        dispatch_pass(device, window, list, pipeline, pass, &mut totals)?;
     }
     Ok(totals)
 }
@@ -309,6 +337,37 @@ mod tests {
                 };
             }
         }
+    }
+
+    #[test]
+    fn a_pass_past_one_dispatch_splits_into_runs_that_write_the_same_words() {
+        let fill = |dst: u64, count: u32, stride: u32| Record {
+            seq: 1,
+            dst,
+            count,
+            stride,
+            op: Op::Fill(7),
+        };
+        let copy = Record::copy(2, 1 << 40, 1 << 50, u32::MAX);
+        let pass = [fill(0, 100, 1), copy, fill(1 << 36, u32::MAX, 14), copy];
+        let runs = dispatches(&pass);
+        assert_eq!(runs.len(), 4);
+        let mut at = 0;
+        let mut done = 0u64;
+        for run in &runs {
+            let words: u64 = run.iter().map(|r| u64::from(r.count)).sum();
+            assert!(words <= u64::from(MAX_WORDS));
+            for r in run {
+                let whole = &pass[at];
+                assert_eq!(*r, whole.part(done, done + u64::from(r.count)));
+                done += u64::from(r.count);
+                if done == u64::from(whole.count) {
+                    at += 1;
+                    done = 0;
+                }
+            }
+        }
+        assert_eq!((at, done), (pass.len(), 0));
     }
 
     fn rng(state: &mut u64) -> u64 {
