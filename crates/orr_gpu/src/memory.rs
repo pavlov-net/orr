@@ -102,6 +102,11 @@ pub struct HeapReport {
     pub budget: u64,
     /// What this process uses, as the OS counts it.
     pub usage: u64,
+    /// Bytes of freed device memory blocks of `block_bytes` that go back to the system once
+    /// the GPU is done with them and [`Device::collect_garbage`] reaches them.
+    ///
+    /// [`Device::collect_garbage`]: crate::Device::collect_garbage
+    pub freeing: u64,
 }
 
 impl HeapReport {

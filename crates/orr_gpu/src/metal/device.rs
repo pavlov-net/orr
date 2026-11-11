@@ -61,6 +61,8 @@ pub(super) struct Shared {
     pub(super) own_textures: Mutex<MemoryUsage>,
     /// Heaps the pools have created so far.
     pub(super) device_allocations: AtomicU64,
+    /// Bytes of freed buffers' heaps of their own whose release waits for the GPU.
+    pub(super) freeing: AtomicU64,
     /// Pass results by the point of their submit, oldest first.
     pub(super) results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
     pub(super) timestamps: TimestampRing,
@@ -221,6 +223,7 @@ impl Device {
             ledger: crate::memory::Ledger::default(),
             own_textures: Mutex::default(),
             device_allocations: AtomicU64::new(0),
+            freeing: AtomicU64::new(0),
             results: Mutex::default(),
             timestamps,
             objects: Mutex::default(),

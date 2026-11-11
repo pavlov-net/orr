@@ -554,6 +554,7 @@ impl Shared {
 
     fn heap_reports(&self, budgets: &[orr_memory::HeapBudget]) -> Vec<HeapReport> {
         let p = &self.memory.properties;
+        let garbage = self.garbage.lock().unwrap();
         budgets
             .iter()
             .enumerate()
@@ -565,6 +566,7 @@ impl Shared {
                 block_bytes: b.block_bytes,
                 budget: b.budget,
                 usage: b.usage,
+                freeing: garbage.own_bytes(i),
             })
             .collect()
     }

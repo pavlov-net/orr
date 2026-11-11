@@ -264,14 +264,17 @@ fn labels_add_up_to_the_pools_allocations() {
     assert_eq!((own.dedicated, own.dedicated_bytes), (1, own.bytes));
     let before = b.heaps[heap].block_bytes;
     drop(block);
-    assert_eq!(
-        d.memory_breakdown().heaps[heap].block_bytes,
-        before,
-        "freed early"
-    );
+    let freed = d.memory_breakdown().heaps[heap];
+    assert_eq!(freed.block_bytes, before, "freed early");
+    assert_eq!(freed.freeing, own.bytes, "the block is on its way back");
     settle();
-    let after = check("after the block").heaps[heap].block_bytes;
-    assert_eq!(before - after, own.bytes, "the block's memory went back");
+    let after = check("after the block").heaps[heap];
+    assert_eq!(
+        before - after.block_bytes,
+        own.bytes,
+        "the block's memory went back"
+    );
+    assert_eq!(after.freeing, 0);
     assert_eq!(d.validation_messages(), 0);
 }
 

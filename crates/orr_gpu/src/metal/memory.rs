@@ -159,17 +159,31 @@ impl<T> Drop for Allocation<T> {
     fn drop(&mut self) {
         // SAFETY: taken once, here, and never used again.
         let raw = unsafe { ManuallyDrop::take(&mut self.raw) };
-        let shared = Arc::clone(&self.shared);
         let start = self.gpu.address().0;
-        self.shared
-            .defer(Box::new(move || release_buffer(&shared, start, raw)));
+        self.shared.defer(release(&self.shared, start, raw));
     }
+}
+
+/// The release of a freed buffer, whose heap of its own counts as freeing until it runs.
+fn release(shared: &Arc<Shared>, start: u64, raw: RawBuffer) -> Box<dyn FnOnce() + Send> {
+    if raw.memory.own_heap() {
+        shared
+            .freeing
+            .fetch_add(raw.memory.size(), Ordering::Relaxed);
+    }
+    let shared = Arc::clone(shared);
+    Box::new(move || release_buffer(&shared, start, raw))
 }
 
 /// Takes a freed buffer out of the address map, then gives its range back to its pool and
 /// a heap the pool releases out of the residency set.
 fn release_buffer(shared: &Shared, start: u64, raw: RawBuffer) {
     lock(&shared.buffers).remove(start);
+    if raw.memory.own_heap() {
+        shared
+            .freeing
+            .fetch_sub(raw.memory.size(), Ordering::Relaxed);
+    }
     let RawBuffer {
         kind,
         buffer,
@@ -230,12 +244,7 @@ impl Device {
         // dropped once, here.
         let (raw, shared) = unsafe { (ManuallyDrop::take(&mut a.raw), std::ptr::read(&a.shared)) };
         let start = a.gpu.address().0;
-        let s = Arc::clone(&shared);
-        shared.defer_until(
-            after.timeline,
-            after.value,
-            Box::new(move || release_buffer(&s, start, raw)),
-        );
+        shared.defer_until(after.timeline, after.value, release(&shared, start, raw));
     }
 
     /// Memory use: live `gpu_malloc` memory per kind, and memory as one heap, unified, with
@@ -255,6 +264,7 @@ impl Device {
                     + lock(&s.own_textures).bytes,
                 budget,
                 usage: s.device.currentAllocatedSize() as u64,
+                freeing: s.freeing.load(Ordering::Relaxed),
             }],
             kind_heaps: [0; MemoryKind::ALL.len()],
             device_allocations: s.device_allocations.load(Ordering::Relaxed),
@@ -580,11 +590,7 @@ impl Ring {
 impl Drop for Ring {
     fn drop(&mut self) {
         for b in self.blocks.drain(..) {
-            let shared = Arc::clone(&self.shared);
-            let start = b.address;
-            let raw = b.raw;
-            self.shared
-                .defer(Box::new(move || release_buffer(&shared, start, raw)));
+            self.shared.defer(release(&self.shared, b.address, b.raw));
         }
     }
 }
