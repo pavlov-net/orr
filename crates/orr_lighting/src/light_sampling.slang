@@ -149,8 +149,6 @@ public struct LightSetGpu
     public float* light_probability;
     // By emissive list entry.
     public EmissiveSelection* emissive;
-    // The producer entries' lists' CDFs.
-    public uint* cluster_cdf;
     public LightSample* tiles;
     // Per feedback id, the pixels whose feedback named it this frame; the next scene pass
     // reads and clears them.

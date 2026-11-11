@@ -378,7 +378,6 @@ void select(uint lane: SV_GroupIndex)
     set.cdf = root.cdf;
     set.light_probability = root.light_probability;
     set.emissive = root.emissive;
-    set.cluster_cdf = root.cluster_cdf;
     set.tiles = root.tiles;
     set.feedback_counts = root.feedback_counts;
     set.shadow_overflows = root.shadow_overflows;
