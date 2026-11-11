@@ -424,20 +424,34 @@ impl Queue {
         }
     }
 
+    /// Whether the queue takes sparse binds.
+    pub fn binds_sparse(&self) -> bool {
+        self.sparse
+    }
+
     /// Queues sparse binds after everything submitted to this queue so far; its next submit
-    /// waits for them. The returned point completes once they are bound.
+    /// waits for them. The returned point completes once they are bound. Without `wait` it
+    /// queues nothing and returns no point while another thread is binding.
     pub(super) fn bind_sparse(
         &self,
         buffers: &[vk::SparseBufferMemoryBindInfo<'_>],
         opaque: &[vk::SparseImageOpaqueMemoryBindInfo<'_>],
         images: &[vk::SparseImageMemoryBindInfo<'_>],
-    ) -> Result<TimelinePoint, Error> {
+        wait: bool,
+    ) -> Result<Option<TimelinePoint>, Error> {
         assert!(
             self.sparse,
             "the {:?} queue cannot bind sparse memory",
             self.kind
         );
         let timeline = self.timeline();
+        // Vulkan has each bound buffer and image used by one thread at a time, whichever
+        // queue binds.
+        let _binding = match self.shared.sparse_binding.try_lock() {
+            Ok(binding) => binding,
+            Err(std::sync::TryLockError::WouldBlock) if !wait => return Ok(None),
+            Err(_) => self.shared.sparse_binding.lock().unwrap(),
+        };
         let mut after_bind = self.submit_lock.lock().unwrap();
         let value = timeline.submitted.load(Ordering::Acquire) + 1;
         let wait_values = [value - 1];
@@ -463,7 +477,7 @@ impl Queue {
         .map_err(|e| self.shared.vk_error("vkQueueBindSparse", e))?;
         timeline.submitted.store(value, Ordering::Release);
         *after_bind = true;
-        Ok(self.point(value))
+        Ok(Some(self.point(value)))
     }
 
     /// Ends a frame for capture tools: an empty submit carrying `VkFrameBoundaryEXT` when

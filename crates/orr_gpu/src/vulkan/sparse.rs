@@ -246,6 +246,48 @@ impl Device {
     /// submitted to that queue so far. That queue's next submit waits for them; other queues
     /// wait for the returned point. Bound memory must outlive its binding.
     pub fn bind_sparse(&self, binds: &SparseBinds<'_>) -> Result<TimelinePoint, Error> {
+        let kind = match self.queue(QueueKind::Loading) {
+            Some(_) => QueueKind::Loading,
+            None => QueueKind::Render,
+        };
+        self.bind_sparse_on(kind, binds)
+    }
+
+    /// Whether the queue of `kind` exists and takes sparse binds.
+    pub fn binds_sparse_on(&self, kind: QueueKind) -> bool {
+        self.queue(kind).is_some_and(super::Queue::binds_sparse)
+    }
+
+    /// As [`Device::bind_sparse`], on the queue of `kind`, which takes sparse binds
+    /// ([`Device::binds_sparse_on`]): the binds take effect between the work submitted to
+    /// that queue before and after them, so a bind that changes the memory of pages or tiles
+    /// in use goes on the queue whose work reads them.
+    pub fn bind_sparse_on(
+        &self,
+        kind: QueueKind,
+        binds: &SparseBinds<'_>,
+    ) -> Result<TimelinePoint, Error> {
+        let bound = self.queue_binds(kind, binds, true)?;
+        Ok(bound.expect("a bind that waits its turn"))
+    }
+
+    /// As [`Device::bind_sparse_on`], unless another thread is binding sparse memory: then it
+    /// queues nothing and returns `None`, for a thread that must not wait behind another's
+    /// binds.
+    pub fn try_bind_sparse_on(
+        &self,
+        kind: QueueKind,
+        binds: &SparseBinds<'_>,
+    ) -> Result<Option<TimelinePoint>, Error> {
+        self.queue_binds(kind, binds, false)
+    }
+
+    fn queue_binds(
+        &self,
+        kind: QueueKind,
+        binds: &SparseBinds<'_>,
+        wait: bool,
+    ) -> Result<Option<TimelinePoint>, Error> {
         let buffers: Vec<_> = binds
             .buffers
             .iter()
@@ -269,11 +311,8 @@ impl Device {
             .iter()
             .map(|(i, v)| vk::SparseImageMemoryBindInfo::default().image(*i).binds(v))
             .collect();
-        let queue = self
-            .queue(QueueKind::Loading)
-            .or_else(|| self.queue(QueueKind::Render))
-            .expect("the render queue always exists");
-        queue.bind_sparse(&buffers, &opaque, &images)
+        let queue = self.queue(kind).expect("a queue that binds sparse memory");
+        queue.bind_sparse(&buffers, &opaque, &images, wait)
     }
 
     /// [`Device::bind_sparse`] of runs of pages of one range.

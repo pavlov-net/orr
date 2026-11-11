@@ -103,6 +103,8 @@ pub(crate) struct Shared {
     /// Usage of every `gpu_malloc` buffer.
     pub(super) buffer_usage: vk::BufferUsageFlags,
     pub(super) garbage: Mutex<Garbage>,
+    /// Held while a queue takes sparse binds.
+    pub(super) sparse_binding: Mutex<()>,
     pub(super) results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
     /// With `Caps::perf_counters`.
     pub(super) perf: Option<Perf>,
@@ -721,6 +723,7 @@ impl Device {
             ledger: crate::memory::Ledger::default(),
             buffer_usage: usage,
             garbage: Mutex::default(),
+            sparse_binding: Mutex::default(),
             results: Mutex::default(),
             perf,
             calibration: Mutex::default(),

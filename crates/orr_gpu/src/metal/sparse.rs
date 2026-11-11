@@ -314,10 +314,37 @@ impl Device {
     /// submitted to that queue so far. That queue's next submit waits for them; other queues
     /// wait for the returned point. Bound memory must outlive its binding.
     pub fn bind_sparse(&self, binds: &SparseBinds<'_>) -> Result<TimelinePoint, Error> {
-        let queue = self
-            .queue(QueueKind::Loading)
-            .or_else(|| self.queue(QueueKind::Render))
-            .expect("the render queue always exists");
+        let kind = match self.queue(QueueKind::Loading) {
+            Some(_) => QueueKind::Loading,
+            None => QueueKind::Render,
+        };
+        self.bind_sparse_on(kind, binds)
+    }
+
+    /// Whether the queue of `kind` exists; every queue takes sparse binds.
+    pub fn binds_sparse_on(&self, kind: QueueKind) -> bool {
+        self.queue(kind).is_some()
+    }
+
+    /// As [`Device::bind_sparse_on`]; no thread waits behind another's binds here, so it
+    /// always binds.
+    pub fn try_bind_sparse_on(
+        &self,
+        kind: QueueKind,
+        binds: &SparseBinds<'_>,
+    ) -> Result<Option<TimelinePoint>, Error> {
+        self.bind_sparse_on(kind, binds).map(Some)
+    }
+
+    /// As [`Device::bind_sparse`], on the queue of `kind`: the binds take effect between the
+    /// work submitted to that queue before and after them, so a bind that changes the memory
+    /// of pages or tiles in use goes on the queue whose work reads them.
+    pub fn bind_sparse_on(
+        &self,
+        kind: QueueKind,
+        binds: &SparseBinds<'_>,
+    ) -> Result<TimelinePoint, Error> {
+        let queue = self.queue(kind).expect("a queue of that kind");
         // Owned, since the queue may apply them after a submit still on its step thread.
         let updates = binds.updates.clone();
         Ok(queue.update_mappings(move |raw| {
