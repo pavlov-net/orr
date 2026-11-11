@@ -975,8 +975,9 @@ mod depth_of_field {
     /// The stabilized image and the accumulated background layer rescale their histories by
     /// the change of pre-exposure, and highlights are picked and weighted at their exposed
     /// luminance: on a still scene at one adapted exposure, a pre-exposure that moves every
-    /// frame shows what a fixed one does. The highlights' falls, which takes them under the
-    /// scatter threshold where that is read in pre-exposed units.
+    /// frame shows what a fixed one does. The highlights scene's pre-exposure falls, which
+    /// takes its highlights under the scatter threshold where that is read in pre-exposed
+    /// units.
     #[test]
     fn a_moving_pre_exposure_shows_what_a_fixed_one_does() {
         for (scene, dof, stops) in [

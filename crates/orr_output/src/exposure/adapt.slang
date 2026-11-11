@@ -297,10 +297,11 @@ void main()
 
     // Pre-exposure follows the adapted exposure every frame. Ray reconstruction neither
     // rescales its history nor takes the pre-exposure, so a step in it shows as a flash
-    // through a full history. The one step a view takes, from where it started to its first
-    // exposure, comes a frame after it started: at a camera cut, a frame after ray
-    // reconstruction's reset. The histories orr keeps rescale by
-    // `pre_exposure / prev_pre_exposure`.
+    // through a full history. The one step a view takes, from the pre-exposure it started
+    // with to its first exposure, comes on the frame after the one that set the exposure:
+    // the frame after ray reconstruction's reset when a camera cut's frame has light to
+    // meter, and later, with no reset near it, when the view waits for light. The histories
+    // orr keeps rescale by `pre_exposure / prev_pre_exposure`.
     if (!hold)
         next.pre_exposure = exposure_from_ev100(next.adapted_ev100);
 
