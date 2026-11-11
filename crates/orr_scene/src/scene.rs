@@ -290,7 +290,10 @@ pub struct CopyVariant {
 pub struct InstancesDesc {
     pub model: ModelId,
     pub copies: u32,
-    /// One anchor-relative transform per copy, from `first` on.
+    /// One anchor-relative transform per copy, from `first` on. It places the model's mesh
+    /// space, which for a model with a skeleton is the skeleton's: a copy at `T` stands where
+    /// `T x translation(origin)` would put the model as it was cooked
+    /// ([`SkeletonRef::origin`](crate::SkeletonRef::origin)).
     pub transforms: TransformGroupId,
     pub first: u32,
     /// None: no animated parts.
