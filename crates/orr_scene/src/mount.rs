@@ -3262,6 +3262,11 @@ impl Mounts {
                 let mut mask = 0u16;
                 let mut sets = None;
                 let base = &r.model_materials[&model];
+                if overrides.len() > base.len() {
+                    return Err(Error::Pack(orr_pack::Error::Malformed(
+                        "prototype overrides past its model's sections",
+                    )));
+                }
                 for (s, o) in overrides.iter().enumerate() {
                     if o.hidden != 0 && s < 16 {
                         mask |= 1 << s;
@@ -3274,13 +3279,7 @@ impl Mounts {
                                 mount: page.mount,
                                 asset: o.material,
                             })?;
-                        let set = sets.get_or_insert_with(|| base.clone());
-                        if s >= set.len() {
-                            return Err(Error::Pack(orr_pack::Error::Malformed(
-                                "prototype overrides past its model's sections",
-                            )));
-                        }
-                        set[s] = *m;
+                        sets.get_or_insert_with(|| base.clone())[s] = *m;
                     }
                 }
                 let pose = u8::try_from(p.pose).map_err(|_| {

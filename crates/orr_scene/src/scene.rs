@@ -1970,7 +1970,7 @@ impl<'f> SceneWriter<'f> {
             0 => r.flags,
             f => InstanceFlags(f as u8 & r.flags.0),
         };
-        let placed = self.place_skinned(&SkinnedDesc {
+        let desc = SkinnedDesc {
             model: proto.model,
             copies,
             transforms: motion.unwrap_or(id),
@@ -1981,7 +1981,8 @@ impl<'f> SceneWriter<'f> {
             flags,
             rt_range: r.rt_range,
             user_tag: r.user_tag,
-        });
+        };
+        let placed = self.place_skinned(&desc, proto.mask);
         let range = match placed {
             Ok(range) => range,
             Err(e) => {
@@ -1999,13 +2000,6 @@ impl<'f> SceneWriter<'f> {
             sets,
         };
         self.scene.cpu.lock().unwrap().skinned_pages.push(placement);
-        if proto.mask != 0 {
-            let variant = CopyVariant {
-                section_mask: proto.mask,
-                ..CopyVariant::default()
-            };
-            self.copy_variants(range, 0, &vec![variant; copies as usize])?;
-        }
         Ok((range, id))
     }
 
@@ -2052,11 +2046,12 @@ impl<'f> SceneWriter<'f> {
         if let Some(base) = desc.material_set {
             self.check_material_set(desc.model, base, 0);
         }
-        self.place_skinned(desc)
+        self.place_skinned(desc, 0)
     }
 
-    /// [`Self::add_skinned`] for a base that may lie in the page part of the material-set table.
-    fn place_skinned(&mut self, desc: &SkinnedDesc) -> Result<InstanceRange> {
+    /// [`Self::add_skinned`] for a base that may lie in the page part of the material-set table,
+    /// with every copy hiding the sections of `section_mask`.
+    fn place_skinned(&mut self, desc: &SkinnedDesc, section_mask: u16) -> Result<InstanceRange> {
         self.has_mesh(desc.model)?;
         let model = self
             .model_cpu
@@ -2105,6 +2100,9 @@ impl<'f> SceneWriter<'f> {
                     material_base: desc.material_set.unwrap_or(NO_MATERIAL_SET),
                 };
             }
+            if section_mask != 0 {
+                cpu.masks.insert((desc.model, section_mask));
+            }
             cpu.ptlas.place_skinned(first, desc.copies);
             (first, entry, emissive)
         };
@@ -2141,7 +2139,7 @@ impl<'f> SceneWriter<'f> {
                 pose_stride: 0,
                 debug_lod: 0,
                 user_tag: desc.user_tag,
-                variant: 0,
+                variant: u32::from(section_mask) << 16,
             };
         }
         let skinned = self.upload(
