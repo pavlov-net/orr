@@ -45,7 +45,7 @@ public static const uint CUT_CLAS_WANTED = 10;        // CLAS the cuts the gathe
 public static const uint CUT_TRAVERSED_SLOTS = 11;    // slots whose ray-tracing cut was gathered
 public static const uint CUT_CACHED = 12;             // of them, equal to a cached cut
 public static const uint CUT_SHARED = 13;             // of them, sharing another slot's BLAS
-public static const uint CUT_FALLBACK = 14;           // of them, past the admitted distance: a cached cut
+public static const uint CUT_FALLBACK = 14;           // of them, past the first cut the tables do not hold: a cached cut
 public static const uint CUT_MERGED = 15;             // slots tracing their model's merged cut
 public static const uint CUT_REQUESTS = 16;           // pages and finer cuts wanted
 public static const uint CUT_FEEDBACK = 17;           // of the wanted, those kept in `feedback`
@@ -130,7 +130,7 @@ public struct PartListGpu
 }
 
 // A gathered ray-tracing cut in the frame's table of equal cuts, which every slot with its
-// digest takes: the cut of the slot that took it first, which builds it.
+// digest takes: the cut of the slot that took it first, which the first of its slots builds.
 public struct CutKey
 {
     public uint2 hash;

@@ -24,8 +24,9 @@
 // digit of the key a pass, `select` finding the bucket of that digit the capacity runs out in
 // and `refine` counting that bucket's cuts by the next digit. Which cuts are built is so a
 // function of the scene and not of the order threads ran in; `admit` and `link` give the
-// others their cached cuts, each asking for the finer cached cut that would serve it. `fill_roots` and the fill passes walk the built cuts
-// again and write their clusters, `gather` their CLAS addresses and `jobs` their build
+// others their cached cuts, each asking for the finer cached cut that would serve it.
+// `fill_roots` and the fill passes walk the built cuts again and write their clusters,
+// `gather` their CLAS addresses and `jobs` their build
 // records. A posed copy of an edit builds a BLAS for its body and one per animated part with
 // clusters in the cut: `split` counts them and `place_lists` gives them their jobs and CLAS
 // ranges.
@@ -1058,25 +1059,39 @@ uint cut_rank(CutGpu* cut, SlotCutGpu c)
     return c.rt_key != NO_KEY ? cut.keys[c.rt_key].rank : asuint(c.rt_distance);
 }
 
-// Digits of ADMIT_BITS bits in an admission key: the 31 bits of a distance, then the bits
-// that tell the scene's slots apart. `traverse.rs` records a pass per digit.
+// Bits of an admission key: the 31 of a distance, then those that tell the scene's slots
+// apart.
+uint admit_bits()
+{
+    return 31 + (root.slots > 1 ? firstbithigh(root.slots - 1) + 1 : 0);
+}
+
+// Digits of ADMIT_BITS bits in an admission key. `traverse.rs` records a pass per digit.
 uint admit_levels()
 {
-    uint slot_bits = root.slots > 1 ? firstbithigh(root.slots - 1) + 1 : 0;
-    return (31 + slot_bits + ADMIT_BITS - 1) / ADMIT_BITS;
+    return (admit_bits() + ADMIT_BITS - 1) / ADMIT_BITS;
 }
 
 // The key that orders the admission of the cut owner slot `slot` builds: the distance `rank`,
 // then the slot, which no other cut has.
-uint64_t admit_key(uint rank, uint slot, uint levels)
+uint64_t admit_key(uint rank, uint slot)
 {
-    return (uint64_t(rank) << (ADMIT_BITS * levels - 31)) | slot;
+    return (uint64_t(rank) << (admit_bits() - 31)) | slot;
 }
 
-// Digit `level` of `key`, the most significant first: its bucket in that digit's pass.
-uint admit_digit(uint64_t key, uint levels, uint level)
+// Digit `level` of `key`, the most significant first: its bucket in that digit's pass. The
+// digits count from the key's top bit, so the first is `rank >> ADMIT_SHIFT` and the last
+// holds the bits left over at its top: a key padded to whole digits can pass 64 bits.
+uint admit_digit(uint64_t key, uint level)
 {
-    return uint(key >> (ADMIT_BITS * (levels - 1 - level))) & (ADMIT_BUCKETS - 1);
+    uint bits = admit_bits();
+    uint end = ADMIT_BITS * (level + 1);
+    uint64_t digit;
+    if (end > bits)
+        digit = key << (end - bits);
+    else
+        digit = key >> (bits - end);
+    return uint(digit) & (ADMIT_BUCKETS - 1);
 }
 
 // The bucket of digit `level` the capacity runs out in, among the cuts in that bucket of every
@@ -1343,25 +1358,25 @@ void refine(uint3 id: SV_DispatchThreadID)
     SlotCutGpu c = cut.slots[slot];
     if ((c.flags & CUT_OWNER) == 0)
         return;
-    uint levels = admit_levels();
-    uint64_t key = admit_key(cut_rank(cut, c), slot, levels);
+    uint64_t key = admit_key(cut_rank(cut, c), slot);
     for (uint i = 0; i < root.pass; i++)
     {
-        if (admit_digit(key, levels, i) != admit_stop(cut, i))
+        if (admit_digit(key, i) != admit_stop(cut, i))
             return;
     }
-    uint b = admit_digit(key, levels, root.pass);
+    uint b = admit_digit(key, root.pass);
     InterlockedAdd(cut.admit[2 * b], c.rt_count);
     InterlockedAdd(cut.admit[2 * b + 1], cut_jobs(root.scene, slot, c));
 }
 
 // Whether the admission builds the cut of `key`: it comes before the first cut the capacity
 // does not hold, the one in the bucket the capacity ran out in at every digit.
-bool admit_builds(CutGpu* cut, uint64_t key, uint levels)
+bool admit_builds(CutGpu* cut, uint64_t key)
 {
+    uint levels = admit_levels();
     for (uint i = 0; i < levels; i++)
     {
-        uint digit = admit_digit(key, levels, i);
+        uint digit = admit_digit(key, i);
         uint stop = admit_stop(cut, i);
         if (digit != stop)
             return digit < stop;
@@ -1384,8 +1399,7 @@ void admit(uint3 id: SV_DispatchThreadID)
     SlotCutGpu c = cut.slots[slot];
     if ((c.flags & CUT_OWNER) == 0)
         return;
-    uint levels = admit_levels();
-    if (!admit_builds(cut, admit_key(cut_rank(cut, c), slot, levels), levels))
+    if (!admit_builds(cut, admit_key(cut_rank(cut, c), slot)))
     {
         fall_back(s, cut, slot, CUT_FALLBACK);
         return;
