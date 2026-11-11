@@ -284,6 +284,22 @@ pub(crate) struct Demand {
     pub(crate) held: u64,
 }
 
+/// Something that locks units while it is used ([`Residency::lock_while_used`]): those units
+/// and the bytes they hold.
+pub(crate) struct Holder<'a> {
+    pub(crate) units: &'a [Key],
+    pub(crate) bytes: u64,
+}
+
+/// While-used locks taken back in thought ([`Residency::shed`]): per unit, the locks taken
+/// and the holders over it that no longer hold it, and the units that leaves kept by nothing.
+#[derive(Default)]
+struct Release {
+    locks: FxHashMap<Key, u32>,
+    used: FxHashMap<Key, u32>,
+    free: FxHashSet<Key>,
+}
+
 /// A request's priority among its source's: the larger projected error first, then the nearer
 /// cell.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1208,36 +1224,100 @@ impl Residency {
         self.while_used[c] - self.sampled_while_used[c]
     }
 
-    /// Of the cached cuts that lock `built` bytes of `class` each while they are used, the ones
-    /// to shed, in order, while what the latest sample's frame wanted, `sampled`, does not fit
+    /// Of the cached cuts `built`, which lock units of `class` while they are used, the ones to
+    /// shed, in order, while what the latest sample's frame wanted, `sampled`, does not fit
     /// `budget` beside the units held while used that it did not count, or the cuts' locks,
-    /// `locked`, take more than half of it. Of those, `going` bytes are locked by cuts shed
-    /// earlier, which go once no frame uses them.
+    /// `locked` in all, take more than half of it. The `leaving` cuts were shed earlier and go,
+    /// with their locks, once no frame uses them. A cut ranks by the bytes of the units it
+    /// locks that the sample did not count, and what shedding it returns is what that leaves
+    /// kept by nothing: a unit the frame reads stays, as does one a cut left unshed holds.
     pub(crate) fn shed(
         &self,
         class: ResidencyClass,
         sampled: u64,
         budget: u64,
-        going: u64,
-        built: &[u64],
+        leaving: &[Holder<'_>],
+        built: &[Holder<'_>],
         locked: u64,
     ) -> Vec<usize> {
-        // A page two cuts hold counts in both cuts' bytes, so the cuts already shed can count
-        // for more than the pages they hold.
-        let mut over = (sampled + self.unsampled_held(class)).saturating_sub(going);
-        let mut locked = locked - going;
-        let mut order: Vec<usize> = (0..built.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(built[i]));
+        let mut release = Release::default();
+        let mut over = sampled + self.unsampled_held(class);
+        let mut locked = locked;
+        for h in leaving {
+            over -= self.release(&mut release, class, h.units);
+            locked -= h.bytes;
+        }
+        let unread = |h: &Holder<'_>| -> u64 {
+            let u = h
+                .units
+                .iter()
+                .map(|&k| self.unit(k).expect("a unit of a mount"));
+            u.filter(|u| u.sampled != self.sample && u.kept() == Kept::WhileUsed)
+                .map(Unit::held)
+                .sum()
+        };
+        let mut order: Vec<(u64, usize)> = built.iter().map(unread).zip(0..).collect();
+        order.sort_by(|a, b| {
+            (b.0.cmp(&a.0))
+                .then(built[b.1].bytes.cmp(&built[a.1].bytes))
+                .then(a.1.cmp(&b.1))
+        });
         let mut out = Vec::new();
-        for i in order {
-            if over <= budget && locked <= budget / 2 {
+        for (unread, i) in order {
+            let locks_fit = locked <= budget / 2;
+            if over <= budget && locks_fit {
                 break;
             }
-            over = over.saturating_sub(built[i]);
-            locked -= built[i];
+            // Shed for room alone, a cut whose units the frame reads returns nothing.
+            if unread == 0 && locks_fit {
+                continue;
+            }
+            over -= self.release(&mut release, class, built[i].units);
+            locked -= built[i].bytes;
             out.push(i);
         }
         out
+    }
+
+    /// Takes back one while-used lock on each of `units` in `r`, as their holder would going;
+    /// returns the bytes of `class` that leaves kept by nothing the latest sample did not
+    /// count, which are what the holder's going returns.
+    fn release(&self, r: &mut Release, class: ResidencyClass, units: &[Key]) -> u64 {
+        let mut changed = Vec::new();
+        for &k in units {
+            let u = self.unit(k).expect("a unit of a mount");
+            let taken = r.locks.entry(k).or_default();
+            *taken += 1;
+            // Its last lock gone, it stops holding what it depends on, as `hold_under` counts.
+            if u.holds() == Kept::WhileUsed && *taken == u.locks {
+                let units = &self.mounts[&k.mount];
+                let mut stack = u.deps.clone();
+                let mut seen = FxHashSet::default();
+                while let Some(d) = stack.pop() {
+                    if seen.insert(d) {
+                        let q = Key {
+                            mount: k.mount,
+                            unit: d,
+                        };
+                        *r.used.entry(q).or_default() += 1;
+                        changed.push(q);
+                        stack.extend_from_slice(&units[d as usize].deps);
+                    }
+                }
+            }
+            changed.push(k);
+        }
+        let mut bytes = 0;
+        for k in changed {
+            let u = self.unit(k).expect("a unit of a mount");
+            let unlocked = u.holds() != Kept::WhileUsed || r.locks.get(&k) == Some(&u.locks);
+            let unused = r.used.get(&k).copied().unwrap_or(0) == u.used_by;
+            let kept = u.class == class && u.sampled != self.sample && u.kept() == Kept::WhileUsed;
+            if kept && unlocked && unused && r.free.insert(k) {
+                bytes += u.held();
+            }
+        }
+        bytes
     }
 
     /// The units `k` needs held to be resident that `counted` passes over: `k` and the units
@@ -2790,11 +2870,14 @@ mod tests {
         r.touch(key(0), 2);
         let d = r.end_sample()[class as usize];
         assert_eq!((d.bytes, d.held), (80, 30));
-        let cuts = [5; 6];
-        let shed = r.shed(class, d.bytes, 100, 0, &cuts, 30);
-        assert_eq!(shed.len(), 2, "110 against 100: two cuts");
+        let keys: Vec<[Key; 1]> = (1..7).map(|u| [key(u)]).collect();
+        let cuts: Vec<Holder> = (keys.iter())
+            .map(|k| Holder { units: k, bytes: 5 })
+            .collect();
+        let shed = r.shed(class, d.bytes, 100, &[], &cuts, 30);
+        assert_eq!(shed, [0, 1], "110 against 100: two cuts");
         assert_eq!(
-            r.shed(class, d.bytes, 100, 10, &cuts[2..], 30),
+            r.shed(class, d.bytes, 100, &cuts[..2], &cuts[2..], 30),
             Vec::<usize>::new()
         );
         for &i in &shed {
@@ -2804,9 +2887,59 @@ mod tests {
         check(&r);
         assert_eq!(r.unsampled_held(class), 20);
         assert_eq!(
-            r.shed(class, d.bytes, 100, 0, &cuts[2..], 20),
+            r.shed(class, d.bytes, 100, &[], &cuts[2..], 20),
             Vec::<usize>::new()
         );
+    }
+
+    /// Cuts are shed by what shedding them returns: the units they lock and those under them
+    /// that the sample did not count and that no cut left unshed holds.
+    #[test]
+    fn cuts_are_shed_by_the_units_shedding_them_returns() {
+        let class = ResidencyClass::InstancePages;
+        let mut r = Residency::new(limits(10_000));
+        // 0 and 1 read, 1 locked by cut A; 2 locked by B, 3 by C and D, 5 by D over 4.
+        let units = [
+            unit(30, &[], Start::Absent),
+            unit(40, &[], Start::Absent),
+            unit(35, &[], Start::Absent),
+            unit(20, &[], Start::Absent),
+            unit(15, &[], Start::Absent),
+            unit(10, &[4], Start::Absent),
+        ];
+        r.register(M, &units).unwrap();
+        step(&mut r, &[0, 1, 2, 3, 5], 1);
+        for u in [1, 2, 3, 3, 5] {
+            r.lock_while_used(key(u));
+        }
+        r.begin_sample();
+        r.touch(key(0), 2);
+        r.touch(key(1), 2);
+        let d = r.end_sample()[class as usize];
+        assert_eq!((d.bytes, d.held), (70, 35 + 20 + 15 + 10));
+        let one = [[key(1)], [key(2)], [key(3)]];
+        let two = [key(3), key(5)];
+        let [a, b, c] = one.each_ref().map(|units| Holder {
+            units,
+            bytes: r.held(units[0]),
+        });
+        let d = Holder {
+            units: &two,
+            bytes: 30,
+        };
+        let locked = 40 + 35 + 20 + 30;
+        // 150 against 120 and locks of 125 against 60: B returns 35, then D 25 with the 4
+        // under 5, but not 3, which C holds.
+        let all = [a, b, c, d];
+        assert_eq!(r.shed(class, 70, 120, &[], &all, locked), [1, 3]);
+        let [a, b, c, d] = all;
+        let (leaving, built) = ([b, d], [a, c]);
+        assert_eq!(
+            r.shed(class, 70, 120, &leaving, &built, locked),
+            Vec::<usize>::new()
+        );
+        // Locks of 60 against 50: C, whose 3 returns now, not A, whose 1 the frame reads.
+        assert_eq!(r.shed(class, 70, 100, &leaving, &built, locked), [1]);
     }
 
     /// What a cut's pages would add to a sample leaves out the pages another cut holds while

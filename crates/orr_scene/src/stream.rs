@@ -75,7 +75,7 @@ use crate::memory::{Block, Pool, PoolSlot, SceneMemory};
 use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
 use crate::residency::{
-    Demand, HOLD_FRAMES, HeapUse, Held, InFlight, Key, Limits, MARK_TENTHS, Plan, Priority,
+    Demand, HOLD_FRAMES, HeapUse, Held, Holder, InFlight, Key, Limits, MARK_TENTHS, Plan, Priority,
     RequestSource, Residency, ResidencyClass, ResidencyStats, UnitDesc, response_period,
 };
 use crate::scenes::PoolBytes;
@@ -1396,7 +1396,7 @@ impl Streaming {
         });
         let demand = self.demand.take();
         let shed = match demand {
-            Some(d) => self.shed_cuts(d[ResidencyClass::MeshPages as usize], budget, w)?,
+            Some(d) => self.shed_cuts(d[ResidencyClass::MeshPages as usize], budget, frame, w)?,
             None => false,
         };
         if let Some(demand) = demand.filter(|_| !shed) {
@@ -1438,35 +1438,74 @@ impl Streaming {
 
     /// Sheds built cuts while what the sample's frame wanted, `demand`, does not fit the mesh
     /// page `budget` beside the pages the cuts hold, or the cuts hold more than their half of
-    /// it: the traversal's pages come first. The cuts holding the most go first. A shed cut's
-    /// table entry is emptied, so copies trace a coarser cut, and the cut goes with its locks
-    /// once no frame has used it for its hold. Returns whether any was shed.
-    fn shed_cuts(&mut self, demand: Demand, budget: u64, w: &mut Apply<'_>) -> Result<bool> {
+    /// it: the traversal's pages come first. The cuts holding the most pages the frame did not
+    /// read go first ([`Residency::shed`]). A shed cut's table entry is emptied, so copies
+    /// trace a coarser cut, and the cut goes with its locks once no frame has used it for its
+    /// hold. Returns whether any was shed.
+    fn shed_cuts(
+        &mut self,
+        demand: Demand,
+        budget: u64,
+        frame: u64,
+        w: &mut Apply<'_>,
+    ) -> Result<bool> {
         let class = ResidencyClass::MeshPages;
         if demand.bytes + self.residency.unsampled_held(class) <= budget
             && self.fine_locked <= budget / 2
         {
             return Ok(false);
         }
-        // The bytes each built cut locks, and where it is; the shed ones' in all.
-        let (mut going, mut built) = (0, Vec::new());
+        // Each built cut's locked pages and where it is, the shed ones apart. One past its hold
+        // stays while a scene not updated since it was used may trace it, so neither shedding
+        // it nor its having been shed returns anything until that scene reports again.
+        let (mut leaving, mut built, mut at) = (Vec::new(), Vec::new(), Vec::new());
         for (&(mount, mesh), f) in &self.fine {
+            let pages = &self.mounts[&mount].mesh_pages[mesh as usize];
             for (k, slot) in f.slots.iter().enumerate() {
-                match slot {
-                    FineState::Built {
-                        locks, shed: true, ..
-                    } => going += locks.bytes,
-                    FineState::Built { locks, .. } => built.push((locks.bytes, mount, mesh, k)),
-                    _ => {}
+                let FineState::Built {
+                    locks,
+                    shed,
+                    touched,
+                    ..
+                } = slot
+                else {
+                    continue;
+                };
+                if touched + HOLD_FRAMES < frame {
+                    continue;
+                }
+                let keys: Vec<Key> = (locks.pages.iter())
+                    .map(|&p| Key {
+                        mount,
+                        unit: pages[p as usize],
+                    })
+                    .collect();
+                if *shed {
+                    leaving.push((keys, locks.bytes));
+                } else {
+                    built.push((keys, locks.bytes));
+                    at.push((mount, mesh, k));
                 }
             }
         }
-        let bytes: Vec<u64> = built.iter().map(|c| c.0).collect();
-        let order =
-            self.residency
-                .shed(class, demand.bytes, budget, going, &bytes, self.fine_locked);
+        fn holders(cuts: &[(Vec<Key>, u64)]) -> Vec<Holder<'_>> {
+            (cuts.iter())
+                .map(|(units, bytes)| Holder {
+                    units,
+                    bytes: *bytes,
+                })
+                .collect()
+        }
+        let order = self.residency.shed(
+            class,
+            demand.bytes,
+            budget,
+            &holders(&leaving),
+            &holders(&built),
+            self.fine_locked,
+        );
         for &i in &order {
-            let (_, mount, mesh, k) = built[i];
+            let (mount, mesh, k) = at[i];
             let f = self.fine.get_mut(&(mount, mesh)).expect("listed");
             let CutRow { threshold, row } = f.init.cuts[k];
             let empty = RtCutGpu {
