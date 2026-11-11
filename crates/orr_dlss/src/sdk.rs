@@ -276,8 +276,9 @@ impl RayReconstruction {
         .map(Self)
     }
 
-    /// [`new`](Self::new) at `render`, with the mode nearest it. NVIDIA documents only the
-    /// render sizes of the modes for ray reconstruction, so NGX may refuse others.
+    /// [`new`](Self::new) at `render`, with the upscaling mode nearest it, never DLAA. NVIDIA
+    /// documents only the render sizes of the modes for ray reconstruction, so NGX may refuse
+    /// others.
     pub fn with_render_size(
         sdk: &DlssSdk,
         render: [u32; 2],

@@ -639,13 +639,19 @@ fn render_view_runs_ray_reconstruction() {
             [43, 21],
             Some(ReconstructionMode::Upscale(UpscaleMode::Quality)),
         ),
-        #[cfg(dlss)]
         (hd, Reconstruction::Dlaa, hd, Some(ReconstructionMode::Dlaa)),
         (
             hd,
             Reconstruction::RenderExtent([1100, 619]),
             [1100, 619],
             Some(ReconstructionMode::Upscale(UpscaleMode::Balanced)),
+        ),
+        // Nearer DLAA's scale than Quality's, but only a DLAA request runs DLAA.
+        (
+            hd,
+            Reconstruction::RenderExtent([1800, 1012]),
+            [1800, 1012],
+            Some(ReconstructionMode::Upscale(UpscaleMode::Quality)),
         ),
         (hd, Reconstruction::Off, hd, None),
     ] {

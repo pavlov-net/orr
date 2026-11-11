@@ -63,7 +63,8 @@ impl Quality {
     }
 }
 
-/// Ratio of output to render resolution, as NGX takes it. `Dlaa` renders at output resolution.
+/// Ratio of output to render resolution, as NGX takes it. `Dlaa` renders at output resolution and
+/// is the most expensive mode, so only a caller that names it gets it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mode {
     Dlaa,
@@ -85,11 +86,10 @@ impl Mode {
         }
     }
 
-    /// The mode whose nominal scale is closest to rendering at `render` for `output`.
+    /// The upscaling mode whose nominal scale is closest to rendering at `render` for `output`.
     fn for_render_size(render: [u32; 2], output: [u32; 2]) -> Self {
         let scale = f64::from(render[0]) / f64::from(output[0]);
         [
-            Self::Dlaa,
             Self::Quality,
             Self::Balanced,
             Self::Performance,
@@ -153,7 +153,7 @@ mod tests {
     fn a_render_size_picks_the_nearest_mode() {
         let output = [3840, 2160];
         for (render, mode) in [
-            ([3840, 2160], Mode::Dlaa),
+            ([3840, 2160], Mode::Quality),
             ([2560, 1440], Mode::Quality),
             ([2227, 1253], Mode::Balanced),
             ([1920, 1080], Mode::Performance),
