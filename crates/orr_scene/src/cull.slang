@@ -184,7 +184,7 @@ void cluster_box(MeshGpu* mesh, Cluster c, out float3 lo, out float3 hi)
 {
     float reach = displacement_reach(c);
     lo = grid_position(c.anchor, uint3(0), mesh.position_step) - reach;
-    hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), mesh.position_step) + reach;
+    hi = grid_position(c.anchor, c.local_max, mesh.position_step) + reach;
 }
 
 // Whether the skinned box `lo..hi` of a cluster of `inst` survives frustum and section
@@ -333,7 +333,7 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             if (!skinned)
             {
                 lo = grid_position(c.anchor, uint3(0), mesh.position_step);
-                hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), mesh.position_step);
+                hi = grid_position(c.anchor, c.local_max, mesh.position_step);
             }
             draw(s, v, r, copy, inst, mesh, page, w.page, local, c, p, lo, hi, material, s.materials + material);
         }

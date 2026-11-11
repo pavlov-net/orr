@@ -8,9 +8,12 @@
 //! A page is stored in the codec form [`encode_page`] writes, and [`decode_page`] turns it
 //! into the resident layout the GPU reads:
 //!
-//! - [`PageHeader`], then `cluster_count` [`Cluster`] records of 148 B.
-//! - Positions at `positions_offset`: u16x3 per vertex, the grid offset from the cluster's
-//!   anchor. Mesh-space position is `(anchor + local) x 2^position_exponent`.
+//! - [`PageHeader`], then `cluster_count` [`Cluster`] records of 156 B.
+//! - Positions at `positions_offset`: u16x3 per vertex, the low 16 bits of the grid offset
+//!   `local` from the cluster's anchor. A page holding a cluster that spans more than 16 bits
+//!   ([`Cluster::local_max`]) has the high 16 bits of every vertex's offset at
+//!   `highs_offset`, u16x3 per vertex alike, so `local = low | high << 16`; on other pages
+//!   that region is empty. Mesh-space position is `(anchor + local) x 2^position_exponent`.
 //! - Attributes at `attrs_offset`, `attr_stride` bytes per vertex: normal (octahedral, 2x16
 //!   snorm, [`oct_encode`]), tangent when the mesh has [`MeshHeader::TANGENT`] (octahedral, x
 //!   16-bit and y 15-bit snorm with the bitangent sign between them, [`oct_encode_tangent`]),
@@ -19,8 +22,8 @@
 //!   floats, and with
 //!   [`MeshHeader::SKIN`] joints u8x4 and weights unorm16x4 ([`unorm16`]) whose codes sum to
 //!   65535.
-//! - Vertex `i` of a cluster sits at index `vertex_first + i` in both the position and the
-//!   attribute array. `vertex_first` is even, so every cluster's positions start 4-aligned.
+//! - Vertex `i` of a cluster sits at index `vertex_first + i` in the position, high half and
+//!   attribute arrays. `vertex_first` is even, so every cluster's positions start 4-aligned.
 //! - Triangles at `tris_offset + tri_first`: u8x3 cluster-local corners, opaque triangles
 //!   first and alpha-tested ones from `alpha_first`, 4-aligned per cluster.
 //! - Opacity micromaps from `omm_offset` to the end of the page ([`Micromaps`]).
@@ -37,7 +40,7 @@ pub use omm::*;
 use crate::blob::{put_table, put_table_aligned, read, table};
 use crate::{Aabb, Error, Result, Span, Sphere};
 
-pub const SCHEMA: u16 = 11;
+pub const SCHEMA: u16 = 12;
 
 /// Largest streamed hierarchy node page. The top page holds what the pinned pages need,
 /// whatever its size.
@@ -328,15 +331,23 @@ pub struct PageHeader {
     pub cluster_count: u32,
     pub attr_stride: u32,
     pub positions_offset: u32,
+    /// The high halves run from here to `attrs_offset`: empty, or as long as the positions.
+    pub highs_offset: u32,
     pub attrs_offset: u32,
     pub tris_offset: u32,
     pub omm_offset: u32,
     /// Resident length of the page.
     pub len: u32,
-    pub _pad: u32,
     /// 4-state micromaps per subdivision level, for the micromap build.
     pub omm_usage: [u32; 13],
     pub _pad2: [u32; 3],
+}
+
+impl PageHeader {
+    /// Whether the page holds high halves of its grid offsets.
+    pub fn has_highs(&self) -> bool {
+        self.highs_offset != self.attrs_offset
+    }
 }
 
 /// One cluster record in a resident page.
@@ -366,12 +377,14 @@ pub struct Cluster {
     /// normal. 0 elsewhere.
     pub flat_triangles: u8,
     pub flags: u8,
-    /// Rest AABB is `(anchor, anchor + local_max) x 2^k`.
-    pub local_max: [u16; 3],
+    /// Rest AABB is `(anchor, anchor + local_max) x 2^k`. Past [`LOCAL_LOW_MAX`] on an axis,
+    /// the cluster's page holds high halves.
+    pub local_max: [u32; 3],
     /// f16 bits, meters.
     pub deformation_bound: u16,
     pub displacement_min: u16,
     pub displacement_max: u16,
+    pub _pad: u16,
     /// Per uv set, the grid its 2x16 values `q` count on: a uv is `uv_offset + q x uv_step`,
     /// with `uv_step` a power of two and `uv_offset` a multiple of it, so every uv is exact.
     pub uv_offset: [[f32; 2]; 2],
@@ -406,7 +419,15 @@ impl Cluster {
     pub fn class(&self) -> Option<SurfaceClass> {
         SurfaceClass::from_flags(self.flags)
     }
+
+    /// Whether the cluster's grid offsets need more than their low halves.
+    pub fn wide(&self) -> bool {
+        self.local_max.iter().any(|&m| m > LOCAL_LOW_MAX)
+    }
 }
+
+/// The largest grid offset the low halves hold.
+pub const LOCAL_LOW_MAX: u32 = 0xFFFF;
 
 /// How far a flat triangle's vertex normals lie from its face normal, as the length of their
 /// difference.
@@ -553,7 +574,7 @@ impl ClusterSets {
     }
 }
 
-const _: () = assert!(size_of::<Cluster>() == 148);
+const _: () = assert!(size_of::<Cluster>() == 156);
 const _: () = assert!(size_of::<PageHeader>() == 96);
 
 /// Blob 0 of a mesh: the header and its tables.
@@ -683,10 +704,15 @@ pub fn attr_stride(attributes: u8) -> u32 {
 }
 
 /// Bytes a cluster of `vertices` and `triangles` takes in a resident page, its record
-/// included and its micromaps not.
-pub fn cluster_resident_len(vertices: usize, triangles: usize, attr_stride: usize) -> usize {
+/// included and its micromaps not, on a page with high halves when `highs`.
+pub fn cluster_resident_len(
+    vertices: usize,
+    triangles: usize,
+    attr_stride: usize,
+    highs: bool,
+) -> usize {
     size_of::<Cluster>()
-        + vertices.next_multiple_of(2) * (6 + attr_stride)
+        + vertices.next_multiple_of(2) * (if highs { 12 } else { 6 } + attr_stride)
         + (triangles * 3).next_multiple_of(4)
 }
 
@@ -711,6 +737,7 @@ pub struct StoredPage {
 pub struct PageLayout {
     pub cluster_count: u32,
     pub positions_offset: u32,
+    pub highs_offset: u32,
     pub attrs_offset: u32,
     pub attr_stride: u32,
     pub tris_offset: u32,
@@ -723,6 +750,7 @@ impl PageLayout {
         Self {
             cluster_count: h.cluster_count,
             positions_offset: h.positions_offset,
+            highs_offset: h.highs_offset,
             attrs_offset: h.attrs_offset,
             attr_stride: h.attr_stride,
             tris_offset: h.tris_offset,
@@ -739,19 +767,24 @@ fn layout(h: &PageHeader) -> Result<(usize, usize)> {
     let n = h.cluster_count as usize;
     let regions_ordered = h.positions_offset as usize
         == size_of::<PageHeader>() + n * size_of::<Cluster>()
-        && h.attrs_offset >= h.positions_offset
+        && h.highs_offset >= h.positions_offset
+        && h.attrs_offset >= h.highs_offset
         && h.tris_offset >= h.attrs_offset
         && h.omm_offset >= h.tris_offset
         && h.len >= h.omm_offset
         && h.len as usize <= PAGE_MAX;
     let aligned = h.attr_stride.is_multiple_of(4)
+        && h.highs_offset.is_multiple_of(4)
         && h.attrs_offset.is_multiple_of(4)
         && h.omm_offset.is_multiple_of(4);
     if !regions_ordered || h.attr_stride < 8 || !aligned {
         return bad("page regions");
     }
-    let slots = (h.attrs_offset - h.positions_offset) as usize / 6;
-    if slots * 6 != (h.attrs_offset - h.positions_offset) as usize
+    let positions = (h.highs_offset - h.positions_offset) as usize;
+    let highs = (h.attrs_offset - h.highs_offset) as usize;
+    let slots = positions / 6;
+    if slots * 6 != positions
+        || (highs != 0 && highs != positions)
         || slots * h.attr_stride as usize != (h.tris_offset - h.attrs_offset) as usize
     {
         return bad("page vertex arrays");
@@ -844,10 +877,22 @@ impl<'a> PageView<'a> {
         .unwrap()
     }
 
-    /// Grid position of a vertex: `anchor + local`.
+    /// Grid offset of a vertex from its cluster's anchor.
+    pub fn local(&self, c: &Cluster, v: u32) -> [u32; 3] {
+        let h = &self.header;
+        let low: [u16; 3] = self.vertex(h.positions_offset, 6, c, v);
+        let high: [u16; 3] = if h.has_highs() {
+            self.vertex(h.highs_offset, 6, c, v)
+        } else {
+            [0; 3]
+        };
+        [0, 1, 2].map(|a| u32::from(low[a]) | u32::from(high[a]) << 16)
+    }
+
+    /// Grid position of a vertex: `anchor + local`, wrapping as the GPU's does.
     pub fn grid(&self, c: &Cluster, v: u32) -> [i32; 3] {
-        let local: [u16; 3] = self.vertex(self.header.positions_offset, 6, c, v);
-        [0, 1, 2].map(|a| c.anchor[a] + i32::from(local[a]))
+        let local = self.local(c, v);
+        [0, 1, 2].map(|a| c.anchor[a].wrapping_add_unsigned(local[a]))
     }
 
     /// Mesh-space position of a vertex; exact, since grid values fit 24 bits.

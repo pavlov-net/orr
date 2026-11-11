@@ -95,7 +95,7 @@ void clas(uint group: SV_GroupID, uint t: SV_GroupThreadID)
         float bound = float(c.deformation_bound);
         float* box = root.bounds + 8 * group;
         float3 lo = grid_position(c.anchor, uint3(0), job.step) - bound;
-        float3 hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), job.step) + bound;
+        float3 hi = grid_position(c.anchor, c.local_max, job.step) + bound;
         for (uint i = 0; i < 3; i++)
         {
             box[i] = lo[i];

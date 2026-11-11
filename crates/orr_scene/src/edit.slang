@@ -40,7 +40,7 @@ void bounds(uint3 id: SV_DispatchThreadID)
     PageHeader h = load_page_header(job.page);
     Cluster* at = cluster_at(job.page, job.local);
     // Every box of a cluster starts at its anchor, so the anchor returns to the lowest vertex.
-    uint3 lowest = uint3(65535);
+    uint3 lowest = uint3(0xFFFFFFFF);
     for (uint i = 0; i < at.vertex_count; i++)
         lowest = min(lowest, load_local(job.page, h, *at, i));
     if (any(lowest != 0))
@@ -75,9 +75,7 @@ void bounds(uint3 id: SV_DispatchThreadID)
     at.cone = CONE_NONE;
     at.area = area;
     at.flat_triangles = uint8_t(0);
-    at.local_max[0] = uint16_t(top.x);
-    at.local_max[1] = uint16_t(top.y);
-    at.local_max[2] = uint16_t(top.z);
+    at.local_max = top;
 }
 
 [shader("compute")]

@@ -33,9 +33,9 @@ use orr_math::{DVec3, Vec2, Vec3};
 use orr_pack::instance::MAX_HIDDEN_SECTION;
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{
-    Cluster, ClusterSets, FLAT_NORMAL, Level, MAX_SECTIONS, MeshHeader, MeshInfo, OMM_ALIGN,
-    PAGE_MAX, PageHeader, PageInfo, Part, PartLevel, Section, SurfaceClass, oct_encode,
-    oct_encode_tangent,
+    Cluster, ClusterSets, FLAT_NORMAL, LOCAL_LOW_MAX, Level, MAX_SECTIONS, MeshHeader, MeshInfo,
+    OMM_ALIGN, PAGE_MAX, PageHeader, PageInfo, Part, PartLevel, Section, SurfaceClass,
+    cluster_resident_len, oct_encode, oct_encode_tangent,
 };
 use orr_pack::{Aabb, AssetId, EncodedBlob, GDeflate, Hash32, Span, Sphere};
 use serde::Deserialize;
@@ -1657,6 +1657,9 @@ struct Grid {
     k: i8,
     truncate_bits: u8,
     cells: Vec<[i32; 3]>,
+    /// The least and greatest cell per axis; both 0 without positions.
+    lo: [i32; 3],
+    hi: [i32; 3],
     floats: Vec<[f32; 3]>,
     /// Per vertex: the first vertex at its grid position, the id of that position.
     reps: Vec<u32>,
@@ -1674,9 +1677,20 @@ impl Grid {
             .light()
             .map(|p| p.map(|x| snap.cell(x)))
             .collect();
-        let largest = |g: &[i32; 3]| g.iter().fold(0, |m, v| m.max(v.unsigned_abs()));
-        let max_abs = cells.par_iter().light().map(largest).max().unwrap_or(0);
+        // The box's corners hold the extreme cells.
+        let (lo, hi) = if positions.is_empty() {
+            ([0; 3], [0; 3])
+        } else {
+            (b.min.map(|x| snap.cell(x)), b.max.map(|x| snap.cell(x)))
+        };
+        let max_abs = lo
+            .into_iter()
+            .chain(hi)
+            .map(i32::unsigned_abs)
+            .max()
+            .unwrap_or(0);
         if max_abs >= 1 << 23 {
+            let largest = |g: &[i32; 3]| g.iter().fold(0, |m, v| m.max(v.unsigned_abs()));
             let i = cells
                 .par_iter()
                 .light()
@@ -1707,6 +1721,8 @@ impl Grid {
             k,
             truncate_bits: (24 - (32 - max_abs.leading_zeros())) as u8,
             cells,
+            lo,
+            hi,
             floats,
             reps,
         })
@@ -1715,11 +1731,16 @@ impl Grid {
     fn step(&self) -> f64 {
         2f64.powi(i32::from(self.k))
     }
+
+    /// Whether a cluster may span more than the low halves of its grid offsets hold.
+    fn may_be_wide(&self) -> bool {
+        (0..3).any(|a| self.hi[a].abs_diff(self.lo[a]) > LOCAL_LOW_MAX)
+    }
 }
 
 struct ClusterData {
     record: Cluster,
-    local: Vec<[u16; 3]>,
+    local: Vec<[u32; 3]>,
     attrs: Vec<u32>,
     tris: Vec<u8>,
     /// Vertex uvs as the page stores them, until the micromaps are made.
@@ -1748,12 +1769,6 @@ impl ClusterData {
         }
     }
 
-    /// Bytes the cluster adds to a resident page, its micromaps included.
-    fn cost(&self, stride: usize) -> usize {
-        orr_pack::mesh::cluster_resident_len(self.local.len(), self.tris.len() / 3, stride)
-            + self.omm.as_ref().map_or(0, ClusterOmm::bytes)
-    }
-
     /// Adds the cluster to its part's record in `parts`: its rest AABB unless it is merged, and
     /// its section when it is of an animated part.
     fn add_to(&self, parts: &mut [Part], grid: &Grid) {
@@ -1769,7 +1784,7 @@ impl ClusterData {
 
     /// Extends `b` by the cluster's rest AABB.
     fn extend(&self, b: &mut Aabb, grid: &Grid) {
-        let corner = |l: [u16; 3]| {
+        let corner = |l: [u32; 3]| {
             [0, 1, 2].map(|a| {
                 ((f64::from(self.record.anchor[a]) + f64::from(l[a])) * grid.step()) as f32
             })
@@ -1789,9 +1804,9 @@ fn build_cluster(
     uv: &[ClusterUvs],
 ) -> ClusterData {
     let anchor = [0, 1, 2].map(|a| cells.iter().map(|g| g[a]).min().unwrap());
-    let local: Vec<[u16; 3]> = cells
+    let local: Vec<[u32; 3]> = cells
         .iter()
-        .map(|g| [0, 1, 2].map(|a| u16::try_from(g[a] - anchor[a]).expect("cluster spans 16 bits")))
+        .map(|g| [0, 1, 2].map(|a| g[a].abs_diff(anchor[a])))
         .collect();
     let local_max = [0, 1, 2].map(|a| local.iter().map(|l| l[a]).max().unwrap());
     let step = grid.step();
@@ -1886,25 +1901,62 @@ fn build_cluster(
     }
 }
 
+/// A resident page as clusters join it in order: no shorter than [`write_page`] writes it.
+#[derive(Copy, Clone)]
+struct PageFill {
+    /// The header, then per cluster its record, low halves, attributes, triangles and
+    /// micromaps.
+    bytes: usize,
+    slots: usize,
+    highs: bool,
+    omm: bool,
+}
+
+impl PageFill {
+    const EMPTY: Self = Self {
+        bytes: size_of::<PageHeader>(),
+        slots: 0,
+        highs: false,
+        omm: false,
+    };
+
+    fn add(self, c: &ClusterData, stride: usize) -> Self {
+        let resident = cluster_resident_len(c.local.len(), c.tris.len() / 3, stride, false);
+        Self {
+            bytes: self.bytes + resident + c.omm.as_ref().map_or(0, ClusterOmm::bytes),
+            slots: self.slots + c.slots(),
+            highs: self.highs || c.record.wide(),
+            omm: self.omm || c.omm.is_some(),
+        }
+    }
+
+    fn with<'a>(self, clusters: impl IntoIterator<Item = &'a ClusterData>, stride: usize) -> Self {
+        clusters.into_iter().fold(self, |f, c| f.add(c, stride))
+    }
+
+    /// Its bytes, with the high halves of every slot once a cluster needs them and room to
+    /// align the micromap region.
+    fn len(&self) -> usize {
+        self.bytes
+            + if self.highs { 6 * self.slots } else { 0 }
+            + if self.omm { OMM_ALIGN as usize - 1 } else { 0 }
+    }
+}
+
 /// Packs clusters in order into resident pages of at most [`PAGE_MAX`] bytes; returns each
 /// page and its cluster count.
 fn paginate(clusters: &[ClusterData], stride: usize) -> Vec<(Vec<u8>, usize, u32)> {
     let mut pages = Vec::new();
     let mut first = 0;
     while first < clusters.len() {
-        let mut size = size_of::<PageHeader>();
+        let mut fill = PageFill::EMPTY;
         let mut end = first;
-        let mut aligned = false;
         while end < clusters.len() {
-            let c = &clusters[end];
-            // Room to align the micromap region, once per page.
-            let align = c.omm.is_some() && !aligned;
-            let add = c.cost(stride) + if align { OMM_ALIGN as usize - 1 } else { 0 };
-            if size + add > PAGE_MAX {
+            let next = fill.add(&clusters[end], stride);
+            if next.len() > PAGE_MAX {
                 break;
             }
-            size += add;
-            aligned |= align;
+            fill = next;
             end += 1;
         }
         let page: Vec<&ClusterData> = clusters[first..end].iter().collect();
@@ -1930,7 +1982,12 @@ fn write_page(clusters: &[&ClusterData], stride: usize) -> Vec<u8> {
         .map(|c| c.tris.len().next_multiple_of(4))
         .sum();
     let positions = size_of::<PageHeader>() + clusters.len() * size_of::<Cluster>();
-    let attrs = positions + slots * 6;
+    let highs = positions + slots * 6;
+    let attrs = if clusters.iter().any(|c| c.record.wide()) {
+        highs + slots * 6
+    } else {
+        highs
+    };
     let tris = attrs + slots * stride;
     let micromaps: Vec<Option<&ClusterOmm>> = clusters.iter().map(|c| c.omm.as_ref()).collect();
     let region = omm::page_region(&micromaps);
@@ -1944,6 +2001,7 @@ fn write_page(clusters: &[&ClusterData], stride: usize) -> Vec<u8> {
         cluster_count: clusters.len() as u32,
         attr_stride: stride as u32,
         positions_offset: positions as u32,
+        highs_offset: highs as u32,
         attrs_offset: attrs as u32,
         tris_offset: tris as u32,
         omm_offset: omm as u32,
@@ -1962,8 +2020,16 @@ fn write_page(clusters: &[&ClusterData], stride: usize) -> Vec<u8> {
         r.omm_first = region.omm_first[i].unwrap_or(Cluster::NO_OMM);
         let at = size_of::<PageHeader>() + i * size_of::<Cluster>();
         page[at..at + size_of::<Cluster>()].copy_from_slice(bytemuck::bytes_of(&r));
-        let p = positions + vertex_first * 6;
-        page[p..p + c.local.len() * 6].copy_from_slice(bytemuck::cast_slice(&c.local));
+        for (v, l) in c.local.iter().enumerate() {
+            let p = positions + (vertex_first + v) * 6;
+            let low = l.map(|x| x as u16);
+            page[p..p + 6].copy_from_slice(bytemuck::cast_slice(&low));
+            if attrs != highs {
+                let h = highs + (vertex_first + v) * 6;
+                let high = l.map(|x| (x >> 16) as u16);
+                page[h..h + 6].copy_from_slice(bytemuck::cast_slice(&high));
+            }
+        }
         let a = attrs + vertex_first * stride;
         page[a..a + c.attrs.len() * 4].copy_from_slice(bytemuck::cast_slice(&c.attrs));
         let t = tris + tri_first;

@@ -1,6 +1,6 @@
 //! The resident cluster table: one entry per cluster id, in an address range reserved once, so
 //! the addresses mounts, stream units, edits and their records hold never move. It names as many
-//! ids as the mesh page pool holds cluster records, each 148 bytes of its resident page: the
+//! ids as the mesh page pool holds cluster records, each 156 bytes of its resident page: the
 //! most clusters resident pages within the pool's budget hold, as the CLAS pool's range is the
 //! pool's bytes. Taking ids takes memory for the range's pages they lie in, which the next
 //! render step binds, and a page none of whose ids is taken unbinds once it has stayed so for

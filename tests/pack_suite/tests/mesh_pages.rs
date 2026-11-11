@@ -1,8 +1,8 @@
 //! `orr_pack.mesh` on the GPU reads what `orr_pack::mesh::PageView` reads from the same
 //! `decode_page` output, and `orr_pack.page_codec` on the loading queue writes what
 //! `decode_page` writes and rejects what it rejects: synthetic pages at every attribute
-//! layout with micromap indices, every page of a cooked mesh, damaged pages, and with
-//! `ORR_COOKED_SET` every page of a set of cooked archives.
+//! layout with micromap indices and high halves, every page of a cooked mesh, damaged pages,
+//! and with `ORR_COOKED_SET` every page of a set of cooked archives.
 
 use std::path::PathBuf;
 
@@ -104,9 +104,7 @@ fn check(page: &[u8], mesh: &MeshHeader, spread: &mut Spread) {
                 position.map(f32::to_bits),
                 "{at}"
             );
-            let grid = view.grid(&c, v);
-            let local = [0, 1, 2].map(|a| (grid[a] - c.anchor[a]) as u32);
-            assert_eq!(g.local[..3], local, "{at}");
+            assert_eq!(g.local[..3], view.local(&c, v), "{at}");
             Spread::add(&mut spread.unit, &g.normal[..3], &view.normal(&c, v), 1.0);
             let t = view.tangent(&c, v).unwrap_or([1.0, 0.0, 0.0, 1.0]);
             Spread::add(&mut spread.unit, &g.tangent[..3], &t[..3], 1.0);
@@ -159,17 +157,40 @@ impl Rng {
     }
 }
 
-/// A resident page of `clusters` clusters with random contents: anchors over the whole
-/// 24-bit grid, any attribute bits, and on some clusters with alpha-tested triangles
-/// micromap indices, special ones included, into a micromap region of `entries` entries.
-fn synthetic(rng: &mut Rng, clusters: usize, attr_stride: usize, entries: u32) -> Vec<u8> {
-    let counts: Vec<(usize, usize)> = (0..clusters)
+/// A resident page of up to `clusters` clusters, as many as leave room in a page for the
+/// micromaps, with random contents: anchors over the whole 24-bit grid, any attribute bits,
+/// and on some clusters with alpha-tested triangles micromap indices, special ones included,
+/// into a micromap region of `entries` entries. With `highs`, grid offsets span 24 bits from
+/// anchors at or below 0, so every position stays within 24 bits.
+fn synthetic(
+    rng: &mut Rng,
+    clusters: usize,
+    attr_stride: usize,
+    highs: bool,
+    entries: u32,
+) -> Vec<u8> {
+    let mut counts: Vec<(usize, usize)> = (0..clusters)
         .map(|_| (3 + rng.below(SLOTS - 2), 1 + rng.below(255)))
         .collect();
+    let vertex = 6 + if highs { 6 } else { 0 } + attr_stride;
+    let len = |counts: &[(usize, usize)]| {
+        let per = |&(vn, tn): &(usize, usize)| {
+            size_of::<Cluster>() + vn.next_multiple_of(2) * vertex + (tn * 3).next_multiple_of(4)
+        };
+        size_of::<PageHeader>() + counts.iter().map(per).sum::<usize>()
+    };
+    // The micromap region takes at most 8 bytes and 16 of states per entry, and two bytes per
+    // triangle.
+    let omm_max = 256 + entries as usize * 24 + counts.len() * 2 * 256;
+    while len(&counts) + omm_max > mesh::PAGE_MAX {
+        counts.pop();
+    }
+    let clusters = counts.len();
     let slots: usize = counts.iter().map(|c| c.0.next_multiple_of(2)).sum();
     let tris: usize = counts.iter().map(|c| (c.1 * 3).next_multiple_of(4)).sum();
     let positions = size_of::<PageHeader>() + clusters * size_of::<Cluster>();
-    let attrs = positions + slots * 6;
+    let highs_offset = positions + slots * 6;
+    let attrs = highs_offset + if highs { slots * 6 } else { 0 };
     let tris_offset = attrs + slots * attr_stride;
     let omm_offset = (tris_offset + tris).next_multiple_of(256);
     let mut p = vec![0u8; omm_offset];
@@ -190,6 +211,13 @@ fn synthetic(rng: &mut Rng, clusters: usize, attr_stride: usize, entries: u32) -
             Cluster::NO_OMM
         };
         let reach = (1 << 23) - 65536;
+        let anchor = [0; 3].map(|_| {
+            if highs {
+                -(rng.below(1 << 23) as i32)
+            } else {
+                rng.below(2 * reach) as i32 - reach as i32
+            }
+        });
         let steps = [0; 2].map(|_| [0; 2].map(|_| 2f32.powi(rng.below(24) as i32 - 20)));
         let c = Cluster {
             vertex_first: v0 as u32,
@@ -197,7 +225,7 @@ fn synthetic(rng: &mut Rng, clusters: usize, attr_stride: usize, entries: u32) -
             vertex_count: vn as u16,
             tri_count: tn as u8,
             alpha_first: alpha_first as u8,
-            anchor: [0; 3].map(|_| rng.below(2 * reach) as i32 - reach as i32),
+            anchor,
             uv_step: steps,
             uv_offset: [0, 1]
                 .map(|s| steps[s].map(|step| (rng.below(1 << 20) as f32 - 524288.0) * step)),
@@ -212,6 +240,12 @@ fn synthetic(rng: &mut Rng, clusters: usize, attr_stride: usize, entries: u32) -
             let at = positions + (v0 + v) * 6;
             for b in &mut p[at..at + 6] {
                 *b = rng.next() as u8;
+            }
+            if highs {
+                let at = highs_offset + (v0 + v) * 6;
+                for a in 0..3 {
+                    p[at + 2 * a] = rng.next() as u8;
+                }
             }
             let at = attrs + (v0 + v) * attr_stride;
             for b in &mut p[at..at + attr_stride] {
@@ -242,6 +276,7 @@ fn synthetic(rng: &mut Rng, clusters: usize, attr_stride: usize, entries: u32) -
         cluster_count: clusters as u32,
         attr_stride: attr_stride as u32,
         positions_offset: positions as u32,
+        highs_offset: highs_offset as u32,
         attrs_offset: attrs as u32,
         tris_offset: tris_offset as u32,
         omm_offset: omm_offset as u32,
@@ -270,13 +305,8 @@ fn synthetic_pages_load_alike_at_every_attribute_layout() {
             mesh.attributes = attributes;
             mesh.position_exponent = exponent;
             let entries = if exponent < 0 { 37 } else { 0 };
-            // The widest vertices fill a page in fewer clusters.
-            let clusters = if attributes & MeshHeader::COLOR != 0 {
-                16
-            } else {
-                24
-            };
-            let p = synthetic(&mut rng, clusters, mesh.attr_stride() as usize, entries);
+            let stride = mesh.attr_stride() as usize;
+            let p = synthetic(&mut rng, 24, stride, exponent < 0, entries);
             let mut resident = vec![0; p.len()];
             mesh::decode_page(&mesh::encode_page(&p).unwrap(), &mut resident).unwrap();
             check(&resident, &mesh, &mut spread);
@@ -439,13 +469,7 @@ fn synthetic_pages_decode_alike_on_the_gpu() {
     ] {
         for entries in [0, 23] {
             let stride = mesh::attr_stride(attributes) as usize;
-            // The widest vertices fill a page in fewer clusters.
-            let clusters = if attributes & MeshHeader::COLOR != 0 {
-                16
-            } else {
-                24
-            };
-            let p = synthetic(&mut rng, clusters, stride, entries);
+            let p = synthetic(&mut rng, 24, stride, entries == 0, entries);
             stored.push(mesh::encode_page(&p).unwrap());
         }
     }
@@ -468,7 +492,7 @@ fn damaged_pages_are_rejected_alike_on_the_gpu() {
     let mut stored = Vec::new();
     for attributes in [0, MeshHeader::TANGENT | MeshHeader::UV1 | MeshHeader::SKIN] {
         let stride = mesh::attr_stride(attributes) as usize;
-        let p = synthetic(&mut rng, 6, stride, 5);
+        let p = synthetic(&mut rng, 6, stride, attributes != 0, 5);
         let good = mesh::encode_page(&p).unwrap();
         let h: PageHeader = bytemuck::pod_read_unaligned(&good[..size_of::<PageHeader>()]);
         let streams = h.positions_offset as usize;

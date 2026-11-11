@@ -209,7 +209,7 @@ void skin_limits(Cluster c, float step, out float3 lo, out float3 hi)
 {
     float bound = float(c.deformation_bound);
     lo = bound > 0.0 ? grid_position(c.anchor, uint3(0), step) - bound : float3(-1e30);
-    hi = bound > 0.0 ? grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), step) + bound : float3(1e30);
+    hi = bound > 0.0 ? grid_position(c.anchor, c.local_max, step) + bound : float3(1e30);
 }
 
 [shader("compute")]

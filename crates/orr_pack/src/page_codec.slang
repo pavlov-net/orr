@@ -2,8 +2,8 @@
 // the resident layout on the GPU, byte for byte what orr_pack::mesh::decode_page writes.
 //
 // A batch of pages takes two passes with a barrier between them. `page_copy`, one thread
-// per resident dword, copies the header, the cluster records and the micromap region and
-// zeroes the vertex and triangle regions. `page_decode_cluster`, one workgroup of
+// per resident dword, copies the header, the cluster records, the high halves and the
+// micromap region and zeroes the vertex and triangle regions. `page_decode_cluster`, one workgroup of
 // PAGE_CODEC_THREADS threads per cluster, decodes the cluster's vertex stream
 // (meshoptimizer's vertex codec, version 1) and its triangle stream (the meshlet
 // codec) into its slots. Both return 0 or PAGE_CODEC_* bits; a page that sets any bit in
@@ -36,7 +36,7 @@ public struct StoredPage
 }
 
 static const uint HEADER_BYTES = 96;
-static const uint CLUSTER_BYTES = 148;
+static const uint CLUSTER_BYTES = 156;
 static const uint MAX_VERTICES = 256;
 static const uint MAX_VERTEX_BYTES = 8 + 36;
 static const uint MAX_CHANNELS = MAX_VERTEX_BYTES / 4;
@@ -113,15 +113,17 @@ PageCheck check_page(StoredPage p)
         return k;
     uint n = h.cluster_count;
     bool regions = h.positions_offset == HEADER_BYTES + n * CLUSTER_BYTES
-        && h.attrs_offset >= h.positions_offset && h.tris_offset >= h.attrs_offset
+        && h.highs_offset >= h.positions_offset && h.attrs_offset >= h.highs_offset
+        && h.tris_offset >= h.attrs_offset
         && h.omm_offset >= h.tris_offset && h.len >= h.omm_offset && h.len <= PAGE_MAX
-        && h.attr_stride >= 8 && h.attr_stride % 4 == 0 && h.attrs_offset % 4 == 0
-        && h.omm_offset % 4 == 0;
+        && h.attr_stride >= 8 && h.attr_stride % 4 == 0 && h.highs_offset % 4 == 0
+        && h.attrs_offset % 4 == 0 && h.omm_offset % 4 == 0;
     if (!regions)
         return k;
-    uint vertex_bytes = h.attrs_offset - h.positions_offset;
+    uint vertex_bytes = h.highs_offset - h.positions_offset;
+    uint highs = h.attrs_offset - h.highs_offset;
     uint slots = vertex_bytes / 6;
-    if (slots * 6 != vertex_bytes
+    if (slots * 6 != vertex_bytes || (highs != 0 && highs != vertex_bytes)
         || uint64_t(slots) * uint64_t(h.attr_stride) != uint64_t(h.tris_offset - h.attrs_offset))
         return k;
     if (h.len > p.resident_capacity)
@@ -132,7 +134,7 @@ PageCheck check_page(StoredPage p)
     uint* table = (uint*)(p.stored + h.positions_offset);
     uint streams_end = table[2 * n];
     if (table[0] != table_end || streams_end > p.stored_len
-        || p.stored_len - streams_end != h.len - h.omm_offset)
+        || p.stored_len - streams_end != highs + h.len - h.omm_offset)
         return k;
     k.status = 0;
     k.slots = slots;
@@ -141,8 +143,8 @@ PageCheck check_page(StoredPage p)
     return k;
 }
 
-// Writes resident dword `dword` of the page: records and micromaps copied, the regions
-// between them zeroed. Threads past the page's length return 0.
+// Writes resident dword `dword` of the page: records, high halves and micromaps copied, the
+// regions between them zeroed. Threads past the page's length return 0.
 public uint page_copy(StoredPage p, uint dword)
 {
     PageCheck k = check_page(p);
@@ -155,9 +157,11 @@ public uint page_copy(StoredPage p, uint dword)
     uint v = 0;
     if (at < h.positions_offset)
         v = ((uint*)p.stored)[dword];
+    else if (at >= h.highs_offset && at < h.attrs_offset)
+        v = load_u32(p.stored, k.streams_end + at - h.highs_offset);
     else if (at >= h.omm_offset)
     {
-        uint from = k.streams_end + at - h.omm_offset;
+        uint from = k.streams_end + h.attrs_offset - h.highs_offset + at - h.omm_offset;
         for (uint j = 0; j < 4 && at + j < h.len; j++)
             v |= uint(p.stored[from + j]) << (8 * j);
     }

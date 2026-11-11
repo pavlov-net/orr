@@ -29,8 +29,8 @@ use std::os::raw::c_int;
 use crate::par::prelude::*;
 use meshopt::{SimplifyVertex, ffi};
 use orr_pack::mesh::{
-    ClusterSets, Group, MeshHeader, MeshInfo, NODE_PAGE_MAX, Node, NodePage, OMM_ALIGN, PAGE_MAX,
-    PageHeader, PageInfo, Section, SurfaceClass, cluster_resident_len,
+    ClusterSets, Group, MeshHeader, MeshInfo, NODE_PAGE_MAX, Node, NodePage, PAGE_MAX, PageHeader,
+    PageInfo, Section, SurfaceClass, cluster_resident_len,
 };
 use orr_pack::{EncodedBlob, Span, Sphere};
 use rustc_hash::FxHashMap;
@@ -38,7 +38,7 @@ use rustc_hash::FxHashMap;
 use super::lod::{self, Parts, Welded};
 use super::{
     Built, ClusterData, Ctx, Grid, MAX_CLUSTER_CORNERS, MAX_CLUSTER_VERTICES, MeshSettings,
-    page_triangles, store_page, write_page,
+    PageFill, page_triangles, store_page, write_page,
 };
 
 /// Sections that share a stage: the cluster vertex limit, and the section itself when its
@@ -185,8 +185,8 @@ fn stages(
     let _z = crate::profile::zone!("dag.stages");
     let snap = Snap {
         step: grid.step(),
-        min: [0, 1, 2].map(|a| grid.cells.iter().map(|c| c[a]).min().unwrap_or(0)),
-        max: [0, 1, 2].map(|a| grid.cells.iter().map(|c| c[a]).max().unwrap_or(0)),
+        min: grid.lo,
+        max: grid.hi,
     };
     let options = |section: u16| Options {
         limits: limits(section),
@@ -837,8 +837,12 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
     let header = size_of::<PageHeader>();
     let limits = |section: u16| {
         let maxv = cx.max_vertices(flags[usize::from(section)]);
-        let cluster_max =
-            cluster_resident_len(usize::from(maxv), usize::from(s.max_triangles), cx.stride);
+        let cluster_max = cluster_resident_len(
+            usize::from(maxv),
+            usize::from(s.max_triangles),
+            cx.stride,
+            cx.grid.may_be_wide(),
+        );
         Limits {
             max_vertices: maxv,
             max_triangles: s.max_triangles,
@@ -891,7 +895,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
     let mut page_groups: Vec<Vec<usize>> = Vec::new();
     let mut page_of = vec![0u32; at.len()];
     let mut pinned_pages = 0;
-    let (mut size, mut aligned) = (header, false);
+    let mut fill = PageFill::EMPTY;
     let mut pages = Vec::new();
     let mut page_info: Vec<PageInfo> = Vec::new();
     let mut group_table: Vec<Group> = vec![bytemuck::Zeroable::zeroed(); at.len()];
@@ -988,25 +992,16 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         let _z = crate::profile::zone!("dag.pages");
         for (k, &gi) in order.iter().enumerate().take(end).skip(next) {
             let g = cooked[gi].as_ref().expect("cooked in this batch");
-            let omm = g.clusters.iter().any(|c| c.omm.is_some());
-            let bytes = |aligned: bool| {
-                g.clusters.iter().map(|c| c.cost(cx.stride)).sum::<usize>()
-                    + if omm && !aligned {
-                        OMM_ALIGN as usize - 1
-                    } else {
-                        0
-                    }
-            };
             let block_end = k > 0 && terminal(stages, order[k - 1]) && !terminal(stages, gi);
             if block_end {
                 pinned_pages = page_groups.len() as u32;
             }
-            if page_groups.is_empty() || block_end || size + bytes(aligned) > PAGE_MAX {
+            let mut next = fill.with(&g.clusters, cx.stride);
+            if page_groups.is_empty() || block_end || next.len() > PAGE_MAX {
                 page_groups.push(Vec::new());
-                (size, aligned) = (header, false);
+                next = PageFill::EMPTY.with(&g.clusters, cx.stride);
             }
-            size += bytes(aligned);
-            aligned |= omm;
+            fill = next;
             page_of[gi] = page_groups.len() as u32 - 1;
             page_groups.last_mut().expect("a page").push(gi);
         }
@@ -1214,14 +1209,12 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
 fn fit(cx: &Ctx<'_>, clusters: &mut [ClusterData]) -> Result<(), String> {
     let mut cap = cx.s.omm.as_ref().map_or(0, |o| o.cluster_bytes_max);
     loop {
-        let omm = clusters.iter().any(|c| c.omm.is_some());
-        let bytes = size_of::<PageHeader>()
-            + clusters.iter().map(|c| c.cost(cx.stride)).sum::<usize>()
-            + if omm { OMM_ALIGN as usize - 1 } else { 0 };
+        let fill = PageFill::EMPTY.with(&*clusters, cx.stride);
+        let bytes = fill.len();
         if bytes <= PAGE_MAX {
             break;
         }
-        if !omm {
+        if !fill.omm {
             return Err(format!(
                 "a group of {} clusters takes {bytes} bytes, over a {PAGE_MAX}-byte page",
                 clusters.len()

@@ -542,6 +542,10 @@ fn dag_lines(a: &Archive, e: &Entry, info: &MeshInfo, out: &mut impl Write) -> R
         let b = &blobs[p.blob as usize];
         let mut page = vec![0; b.raw_len as usize];
         a.read(b, &mut page)?;
+        let header: PageHeader = bytemuck::pod_read_unaligned(
+            page.get(..size_of::<PageHeader>())
+                .ok_or("page header is short")?,
+        );
         let at = |i: usize| size_of::<PageHeader>() + i * size_of::<Cluster>();
         let clusters: Vec<Cluster> = (0..usize::from(p.cluster_count))
             .map(|i| {
@@ -550,27 +554,31 @@ fn dag_lines(a: &Archive, e: &Entry, info: &MeshInfo, out: &mut impl Write) -> R
                     .ok_or("cluster record is short")
             })
             .collect::<std::result::Result<_, _>>()?;
-        records.push(clusters);
+        records.push((header.has_highs(), clusters));
     }
     // A page's bytes are shared among the depths it holds by their clusters' resident sizes.
     let stride = h.attr_stride() as usize;
-    let size = |c: &Cluster| {
+    let size = |highs: bool, c: &Cluster| {
         cluster_resident_len(
             usize::from(c.vertex_count),
             usize::from(c.tri_count),
             stride,
+            highs,
         ) as f64
     };
-    let totals: Vec<f64> = records.iter().map(|r| r.iter().map(size).sum()).collect();
+    let totals: Vec<f64> = records
+        .iter()
+        .map(|(highs, r)| r.iter().map(|c| size(*highs, c)).sum())
+        .collect();
     let mut counted = std::collections::HashSet::new();
     for g in &info.groups {
-        let clusters = &records[g.page as usize];
+        let (highs, clusters) = &records[g.page as usize];
         let first = usize::from(g.first_cluster);
         let group = &clusters[first..first + usize::from(g.cluster_count)];
         let merged = group.iter().any(|c| c.flags & Cluster::MERGED != 0);
         let r = rows.entry((merged, g.depth)).or_default();
         let p = &info.pages[g.page as usize];
-        let share = group.iter().map(size).sum::<f64>() / totals[g.page as usize];
+        let share = group.iter().map(|c| size(*highs, c)).sum::<f64>() / totals[g.page as usize];
         for c in group {
             r.error = r.error.max(c.self_error);
             r.clusters += 1;

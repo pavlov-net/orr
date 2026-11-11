@@ -1079,7 +1079,7 @@ fn displacement_bounds_hold_every_mip() {
                     assert!(lo <= disp && disp <= hi, "{disp} outside {lo}..{hi}");
                     // Displaced along +y, the vertex stays in the rest AABB grown by the bound.
                     let y = p[1] + disp;
-                    let top = aabb_lo[1] + f32::from(c.local_max[1]) * step;
+                    let top = aabb_lo[1] + c.local_max[1] as f32 * step;
                     assert!(aabb_lo[1] - lo.abs().max(hi.abs()) <= y);
                     assert!(y <= top + lo.abs().max(hi.abs()));
                     checked += 1;

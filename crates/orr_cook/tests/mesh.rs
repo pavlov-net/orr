@@ -359,7 +359,7 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
                     assert_eq!(bits >> truncate << truncate, bits);
                 }
             }
-            assert_eq!(local_max, c.local_max.map(i32::from));
+            assert_eq!(local_max, c.local_max.map(|m| m as i32));
             cluster_area[s] += f64::from(c.area);
 
             for t in 0..u32::from(c.tri_count) {

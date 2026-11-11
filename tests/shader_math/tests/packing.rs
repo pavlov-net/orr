@@ -83,6 +83,7 @@ fn page(clusters: &[TestCluster]) -> Vec<u8> {
         cluster_count: n as u32,
         attr_stride: 8,
         positions_offset: positions as u32,
+        highs_offset: attrs as u32,
         attrs_offset: attrs as u32,
         tris_offset: len as u32,
         omm_offset: len as u32,

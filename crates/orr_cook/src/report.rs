@@ -365,6 +365,7 @@ fn mesh_report(
                 usize::from(c.vertex_count),
                 usize::from(c.tri_count),
                 layout.attr_stride as usize,
+                layout.highs_offset != layout.attrs_offset,
             );
             shares.push((merged, level, resident as f64));
             vertices += usize::from(c.vertex_count).next_multiple_of(2) as u64;

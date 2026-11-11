@@ -1,6 +1,6 @@
 //! Stored form of a mesh page: the resident header and cluster records as they are, then
 //! each cluster's vertices through meshoptimizer's vertex codec and its triangles through
-//! the meshlet codec, then the micromap region as it is.
+//! the meshlet codec, then the high halves and the micromap region as they are.
 //!
 //! ```text
 //! PageHeader, Cluster[n]            as resident
@@ -8,11 +8,14 @@
 //!                                   offsets[2i + 1]: its triangle stream,
 //!                                   offsets[2n]: the end of the streams (from the page start)
 //! streams                           in cluster order
+//! high halves                       highs_offset..attrs_offset of the resident page
 //! micromap region                   omm_offset..len of the resident page
 //! ```
 //!
-//! A vertex stream holds `vertex_count` vertices of `8 + attr_stride` bytes: the three u16
-//! grid offsets, a zero u16, then the vertex's attributes. The vertex codec is version 1,
+//! A vertex stream holds `vertex_count` vertices of `8 + attr_stride` bytes: the low halves
+//! of the three grid offsets, a zero u16, then the vertex's attributes. The high halves stay
+//! out of the streams, so the GPU decoder's shared memory needs no room for them; the
+//! archive's compression takes their small values. The vertex codec is version 1,
 //! encoded at level 2: level 3 adds a search over channel rotations and a third channel mode
 //! that the zstd pass after it all but cancels, for more encoding time. A triangle stream is
 //! the meshlet codec over triangles only.
@@ -103,6 +106,7 @@ pub fn encode_page(page: &[u8]) -> Result<Vec<u8>> {
         }
     }
     put_offset(&mut out, table, 2 * n);
+    out.extend_from_slice(&page[h.highs_offset as usize..h.attrs_offset as usize]);
     out.extend_from_slice(&page[h.omm_offset as usize..h.len as usize]);
     Ok(out)
 }
@@ -131,9 +135,10 @@ fn check_stored(stored: &[u8]) -> Result<Stored> {
     let Some(streams_end) = offset(2 * n) else {
         return bad("page stream table");
     };
+    let tail = (h.attrs_offset - h.highs_offset + h.len - h.omm_offset) as usize;
     if offset(0) != Some(table + (2 * n + 1) * 4)
         || streams_end > stored.len()
-        || stored.len() - streams_end != (h.len - h.omm_offset) as usize
+        || stored.len() - streams_end != tail
     {
         return bad("page stream table");
     }
@@ -192,10 +197,13 @@ pub fn decode_page(stored: &[u8], dst: &mut [u8]) -> Result<PageLayout> {
         });
     }
     let records_end = h.positions_offset as usize;
+    let highs = h.highs_offset as usize..h.attrs_offset as usize;
+    let omm_from = streams_end + highs.len();
     let dst = &mut dst[..len];
     dst[..records_end].copy_from_slice(&stored[..records_end]);
     dst[records_end..h.omm_offset as usize].fill(0);
-    dst[h.omm_offset as usize..].copy_from_slice(&stored[streams_end..]);
+    dst[highs].copy_from_slice(&stored[streams_end..omm_from]);
+    dst[h.omm_offset as usize..].copy_from_slice(&stored[omm_from..]);
 
     let stride = 8 + h.attr_stride as usize;
     let attr_stride = h.attr_stride as usize;

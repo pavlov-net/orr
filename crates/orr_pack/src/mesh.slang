@@ -39,11 +39,11 @@ public struct PageHeader
     public uint cluster_count;
     public uint attr_stride;
     public uint positions_offset;
+    public uint highs_offset;      // to attrs_offset: empty, or high halves as long as the positions
     public uint attrs_offset;
     public uint tris_offset;
     public uint omm_offset;
     public uint len;
-    public uint _pad;
     public uint omm_usage[13];
     public uint _pad2[3];
 }
@@ -51,7 +51,7 @@ public struct PageHeader
 // A `Cluster.cone` that culls nothing: cutoff 1 in its top byte.
 public static const uint CONE_NONE = 0x7f000000u;
 
-// 148 B. Spheres are (center, radius) in mesh space.
+// 156 B. Spheres are (center, radius) in mesh space.
 public struct Cluster
 {
     public float4 self_sphere;
@@ -69,10 +69,11 @@ public struct Cluster
     public uint16_t section;
     public uint8_t flat_triangles; // triangles from 0 whose vertex normals equal the face normal
     public uint8_t flags;
-    public uint16_t local_max[3];
+    public uint3 local_max;        // past 0xFFFF on an axis, the page holds high halves
     public half deformation_bound; // m
     public half displacement_min;  // m
     public half displacement_max;  // m
+    public uint16_t _pad;
     public float2 uv_offset[2];    // per uv set: a uv is uv_offset + q x uv_step, exactly
     public float2 uv_step[2];      // powers of two
     public uint omm_first;         // bytes from omm_offset
@@ -174,11 +175,31 @@ public Cluster load_cluster(uint8_t* page, uint cluster)
     return *cluster_at(page, cluster);
 }
 
+// Whether the page holds high halves of its grid offsets.
+public bool has_highs(PageHeader h)
+{
+    return h.highs_offset != h.attrs_offset;
+}
+
+// The largest grid offset a vertex of the page holds: 16 bits, or with high halves the 24 bits
+// an f32 position holds exactly.
+public uint local_limit(PageHeader h)
+{
+    return has_highs(h) ? 0xFFFFFF : 0xFFFF;
+}
+
 // Grid offsets of a vertex from the cluster's anchor.
 public uint3 load_local(uint8_t* page, PageHeader h, Cluster c, uint i)
 {
-    uint16_t* p = (uint16_t*)(page + h.positions_offset) + (c.vertex_first + i) * 3;
-    return uint3(p[0], p[1], p[2]);
+    uint at = (c.vertex_first + i) * 3;
+    uint16_t* low = (uint16_t*)(page + h.positions_offset) + at;
+    uint3 local = uint3(low[0], low[1], low[2]);
+    if (has_highs(h))
+    {
+        uint16_t* high = (uint16_t*)(page + h.highs_offset) + at;
+        local |= uint3(high[0], high[1], high[2]) << 16;
+    }
+    return local;
 }
 
 // Mesh-space position: (anchor + local) x step, step = 2^k (`grid_step`). Bit for bit
@@ -250,13 +271,21 @@ public void store_triangle(uint8_t* page, PageHeader h, Cluster c, uint t, uint3
     p[2] = uint8_t(corners.z);
 }
 
-// Writes a vertex's grid offsets from the cluster's anchor.
+// Writes a vertex's grid offsets from the cluster's anchor, each at most `local_limit`.
 public void store_local(uint8_t* page, PageHeader h, Cluster c, uint i, uint3 local)
 {
-    uint16_t* p = (uint16_t*)(page + h.positions_offset) + (c.vertex_first + i) * 3;
-    p[0] = uint16_t(local.x);
-    p[1] = uint16_t(local.y);
-    p[2] = uint16_t(local.z);
+    uint at = (c.vertex_first + i) * 3;
+    uint16_t* low = (uint16_t*)(page + h.positions_offset) + at;
+    low[0] = uint16_t(local.x);
+    low[1] = uint16_t(local.y);
+    low[2] = uint16_t(local.z);
+    if (has_highs(h))
+    {
+        uint16_t* high = (uint16_t*)(page + h.highs_offset) + at;
+        high[0] = uint16_t(local.x >> 16);
+        high[1] = uint16_t(local.y >> 16);
+        high[2] = uint16_t(local.z >> 16);
+    }
 }
 
 // Moves cluster `cluster`'s anchor, its vertices staying where they are. A kernel lowers it to
@@ -267,14 +296,15 @@ public void store_anchor(uint8_t* page, PageHeader h, uint cluster, int3 anchor)
     Cluster c = *at;
     int3 shift = c.anchor - anchor;
     for (uint i = 0; i < c.vertex_count; i++)
-        store_local(page, h, c, i, uint3(clamp(int3(load_local(page, h, c, i)) + shift, int3(0), int3(65535))));
+        store_local(page, h, c, i, uint3(clamp(int3(load_local(page, h, c, i)) + shift, int3(0), int3(local_limit(h)))));
     at.anchor = anchor;
 }
 
-// Moves a vertex to the grid point nearest mesh-space `position`, within the 65,536 grid steps
-// above the cluster's anchor (see `store_anchor`). A move farther than that stops at their edge.
+// Moves a vertex to the grid point nearest mesh-space `position`, within `local_limit` grid
+// steps above the cluster's anchor (see `store_anchor`): 65,535, or 2^24 - 1 on a page with
+// high halves. A move farther than that stops at their edge.
 public void store_position(uint8_t* page, PageHeader h, Cluster c, uint i, float3 position, float step)
 {
     int3 at = int3(round(position / step)) - c.anchor;
-    store_local(page, h, c, i, uint3(clamp(at, int3(0), int3(65535))));
+    store_local(page, h, c, i, uint3(clamp(at, int3(0), int3(local_limit(h)))));
 }

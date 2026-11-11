@@ -172,7 +172,7 @@ pub struct Budgets {
     /// estimate from their triangles until a page's first load has built them, and resident
     /// hierarchy pages, which a streamed page's groups need beside it. The CLAS pool's address
     /// range is as large, up to the 512 GiB its 32-bit unit indices name, and bound in pages
-    /// as they need. The resident cluster table names an id for each 148-byte cluster record
+    /// as they need. The resident cluster table names an id for each 156-byte cluster record
     /// the pool can hold, 24 B each, bound as ids are taken. While the frames want more than
     /// the pool's budget holds, the error thresholds geometry is chosen by coarsen evenly until
     /// they want what it holds ([`DetailStats`]).

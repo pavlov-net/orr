@@ -11,16 +11,17 @@ impl Rng {
     }
 }
 
-/// A resident page of `clusters` random clusters with `attr_stride`-byte attributes and an
-/// OMM region of `omm` bytes.
-fn page(rng: &mut Rng, clusters: usize, attr_stride: usize, omm: usize) -> Vec<u8> {
+/// A resident page of `clusters` random clusters with `attr_stride`-byte attributes, high
+/// halves when `highs`, and an OMM region of `omm` bytes.
+fn page(rng: &mut Rng, clusters: usize, attr_stride: usize, highs: bool, omm: usize) -> Vec<u8> {
     let counts: Vec<(usize, usize)> = (0..clusters)
         .map(|_| (3 + rng.next() as usize % 254, 1 + rng.next() as usize % 128))
         .collect();
     let slots: usize = counts.iter().map(|c| c.0.next_multiple_of(2)).sum();
     let tris: usize = counts.iter().map(|c| (c.1 * 3).next_multiple_of(4)).sum();
     let positions = size_of::<PageHeader>() + clusters * size_of::<Cluster>();
-    let attrs = positions + slots * 6;
+    let highs_offset = positions + slots * 6;
+    let attrs = highs_offset + if highs { slots * 6 } else { 0 };
     let tris_offset = attrs + slots * attr_stride;
     let omm_offset = tris_offset + tris;
     let len = omm_offset + omm;
@@ -29,6 +30,7 @@ fn page(rng: &mut Rng, clusters: usize, attr_stride: usize, omm: usize) -> Vec<u
         cluster_count: clusters as u32,
         attr_stride: attr_stride as u32,
         positions_offset: positions as u32,
+        highs_offset: highs_offset as u32,
         attrs_offset: attrs as u32,
         tris_offset: tris_offset as u32,
         omm_offset: omm_offset as u32,
@@ -57,6 +59,12 @@ fn page(rng: &mut Rng, clusters: usize, attr_stride: usize, omm: usize) -> Vec<u
                 let x = (v * (a + 3) * 97 + rng.next() as usize % 64) as u16;
                 p[at + 2 * a..at + 2 * a + 2].copy_from_slice(&x.to_le_bytes());
             }
+            if highs {
+                let at = highs_offset + (v0 + v) * 6;
+                for b in (0..6).step_by(2) {
+                    p[at + b] = rng.next() as u8;
+                }
+            }
             let at = attrs + (v0 + v) * attr_stride;
             for b in &mut p[at..at + attr_stride] {
                 *b = rng.next() as u8;
@@ -84,8 +92,14 @@ fn rotations_equal(a: &[u8], b: &[u8]) -> bool {
 #[test]
 fn stored_pages_decode_to_the_resident_page() {
     let mut rng = Rng(0x9E3779B97F4A7C15);
-    for (clusters, stride, omm) in [(1, 8, 0), (5, 12, 40), (9, 16, 0), (12, 20, 7), (30, 8, 0)] {
-        let p = page(&mut rng, clusters, stride, omm);
+    for (clusters, stride, highs, omm) in [
+        (1, 8, false, 0),
+        (5, 12, true, 40),
+        (9, 16, false, 0),
+        (12, 20, true, 7),
+        (30, 8, true, 0),
+    ] {
+        let p = page(&mut rng, clusters, stride, highs, omm);
         let stored = mesh::encode_page(&p).unwrap();
         let mut out = vec![0xAB; p.len() + 3];
         let layout = mesh::decode_page(&stored, &mut out).unwrap();
@@ -115,7 +129,7 @@ fn stored_pages_decode_to_the_resident_page() {
 #[test]
 fn damaged_stored_pages_are_rejected() {
     let mut rng = Rng(7);
-    let p = page(&mut rng, 6, 12, 16);
+    let p = page(&mut rng, 6, 12, true, 16);
     let stored = mesh::encode_page(&p).unwrap();
     let mut out = vec![0; p.len()];
     assert!(mesh::decode_page(&stored[..stored.len() - 1], &mut out).is_err());
