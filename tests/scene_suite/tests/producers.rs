@@ -1147,7 +1147,7 @@ fn vertex_weights(g: &Generated, mesh: &PatchMesh) -> Vec<Weighted> {
         let corners = tri.map(|c| g.patch_positions[at(c)]);
         let previous = (!g.patch_previous.is_empty()).then(|| tri.map(|c| g.patch_previous[at(c)]));
         let uvs = tri.map(|c| mesh.uvs[(cpu[0] + u32::from(c)) as usize]);
-        let pattern = tessellation::pattern(r.pattern);
+        let pattern = tessellation::pattern(u32::from(k.topology));
         let w = pattern.place(tessellation::unpack_factors(r.factors), r.corners, r.zeros);
         assert_eq!(w.len(), usize::from(k.vertex_count));
         for (i, &w) in w.iter().enumerate() {
@@ -1213,7 +1213,7 @@ fn tessellated_patches_dice_at_mixed_rates_with_bit_identical_shared_edges() {
         0,
         "{stats:?}"
     );
-    let patterns: HashSet<u32> = g.records.iter().map(|r| r.pattern).collect();
+    let patterns: HashSet<u16> = g.clusters.iter().map(|k| k.topology).collect();
     assert!(patterns.len() > 10, "{} patterns", patterns.len());
 
     // Every vertex lies where the CPU interpolates its weights, exactly, and last frame's
@@ -1331,7 +1331,7 @@ fn a_displaced_plane_with_a_uv_seam_closes_in_raster_and_rays_with_normals_of_it
         0,
         "{stats:?}"
     );
-    let patterns: HashSet<u32> = g.records.iter().map(|r| r.pattern).collect();
+    let patterns: HashSet<u16> = g.clusters.iter().map(|k| k.topology).collect();
     assert!(patterns.len() > 10, "{} patterns", patterns.len());
 
     // Seam vertices took one displaced position: the two sides of every patch edge put
@@ -1616,9 +1616,9 @@ fn rate_sweep(steps: u32) -> (f32, [HashSet<[u32; 3]>; 2]) {
     plane.frame(None, eye, target, focus(0));
     let counts = |view: &RasterView| -> HashSet<[u32; 3]> {
         generated(view, PLANE)
-            .records
+            .clusters
             .iter()
-            .map(|r| tessellation::pattern(r.pattern).counts)
+            .map(|k| tessellation::pattern(u32::from(k.topology)).counts)
             .collect()
     };
     let view = plane.frame(None, eye, target, focus(0));
@@ -2417,8 +2417,8 @@ fn assert_closed(g: &Generated) -> usize {
     };
     let mut directed: HashMap<([u32; 3], [u32; 3]), Vec<f64>> = HashMap::new();
     let mut triangles = 0;
-    for (k, r) in g.clusters.iter().zip(&g.records) {
-        let pattern = tessellation::pattern(r.pattern);
+    for k in &g.clusters {
+        let pattern = tessellation::pattern(u32::from(k.topology));
         for t in &pattern.triangles {
             let v = t.map(|c| k.first_vertex + u32::from(c));
             if (0..3).any(|e| bits(v[e]) == bits(v[(e + 1) % 3])) {
@@ -2788,7 +2788,7 @@ fn subdivision_cages_dice_closed_at_mixed_rates_on_their_limit_surface_in_raster
     );
     assert!(stats.subpatches > stats.patches, "{stats:?}");
     assert!(stats.welded > 0, "{stats:?}");
-    let patterns: HashSet<u32> = smooth.records.iter().map(|r| r.pattern).collect();
+    let patterns: HashSet<u16> = smooth.clusters.iter().map(|k| k.topology).collect();
     assert!(patterns.len() > 20, "{} patterns", patterns.len());
 
     // Both copies close: every edge shared by patches, faces, transition edges and creases

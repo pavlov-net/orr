@@ -483,7 +483,6 @@ void dice(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             {
                 GeneratedClusterGpu g;
                 g.patch = item.patch;
-                g.pattern = g_pattern;
                 g.corners = item.corners;
                 pack_factors(q, g.factors);
                 g.zeros = item.zeros;

@@ -142,7 +142,8 @@ pub use view::{
 };
 pub use world::WorldPos;
 
-/// The tessellation pattern table that `GeneratedClusterGpu::pattern` indexes.
+/// The tessellation pattern table that a generated cluster's `ProducerClusterGpu::topology`
+/// indexes.
 pub mod tessellation {
     pub use crate::tessellate::{BARY_ONE, Pattern, pattern, unpack_factors};
 }

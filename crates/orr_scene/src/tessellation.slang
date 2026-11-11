@@ -146,12 +146,11 @@ public uint3 pattern_weights(uint key, uint3 q)
     return uint3(BARY_ONE - w1 - w2, w1, w2);
 }
 
-// A generated cluster: the patch triangle it dices, the subpatch's corners in that
-// triangle's barycentrics and the pattern that dices it.
+// A generated cluster: the patch triangle it dices and the subpatch's corners in that
+// triangle's barycentrics. Its cluster's `topology` is the pattern that dices it.
 public struct GeneratedClusterGpu
 {
     public uint patch;           // patch cluster << 7 | triangle, in the entry's patch batch
-    public uint pattern;
     public uint corners[6];      // w1, w2 per subpatch corner
     public uint factors[2];      // its fixed-point edge factors, `pack_factors`
     public uint zeros;           // its corners' zero weights, as PATCH_ZEROS
