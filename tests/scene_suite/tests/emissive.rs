@@ -1,5 +1,6 @@
 //! The emissive list: instance entries and producer entries, their power summed on the GPU.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use orr_cook::{
@@ -345,6 +346,76 @@ fn instance_entries_follow_scale_material_sets_hidden_sections_and_removal() {
         live.push((again.first + copy as u32, copy, 1, Some(blue)));
     }
     check(&entries(&root), &live);
+    assert_clean();
+}
+
+#[test]
+fn material_sets_copies_name_end_within_the_consumer_table() {
+    let d = device();
+    let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    // Two sets of a model of two sections.
+    let s = scenes
+        .create_scene(&SceneDesc {
+            material_set_capacity: 4,
+            ..SceneDesc::default()
+        })
+        .unwrap();
+    let m = scenes.mount(PackSource::Memory(pack()));
+    while matches!(scenes.mount_state(m), LoadState::Pending) {
+        let f = scenes.begin_frame(&frame(&[])).unwrap();
+        f.end(&[]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let plain = scenes.model(m, AssetId::from_name("plain")).unwrap();
+    let list = [s];
+    let mut f = scenes.begin_frame(&frame(&list)).unwrap();
+    let mut w = f.scene(s).unwrap();
+    let g = w
+        .create_transform_group(&TransformGroupDesc {
+            count: 3,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    let desc = |first, material_set| InstancesDesc {
+        model: plain,
+        copies: 1,
+        transforms: g,
+        first,
+        pose: None,
+        material_set,
+        flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+        rt_range: 100.0,
+        animation_range: 0.0,
+        user_tag: 0,
+    };
+    let set = |material_set| {
+        [CopyVariant {
+            pose: 0,
+            material_set,
+            section_mask: 0,
+        }]
+    };
+    w.add_instances(&desc(0, Some(2))).unwrap();
+    let low = w.add_instances(&desc(1, Some(0))).unwrap();
+    w.copy_variants(low, 0, &set(1)).unwrap();
+    let refused = |r: std::thread::Result<()>| {
+        let message = r.expect_err("refused");
+        let message = message
+            .downcast_ref::<String>()
+            .expect("a formatted message");
+        assert!(message.contains("ends past"), "{message}");
+    };
+    refused(catch_unwind(AssertUnwindSafe(|| {
+        let _ = w.add_instances(&desc(2, Some(3)));
+    })));
+    refused(catch_unwind(AssertUnwindSafe(|| {
+        let _ = w.copy_variants(low, 0, &set(2));
+    })));
+    drop(w);
+    f.update_scenes(&mut |_| {}).unwrap();
+    wait(f.end(&[]).unwrap());
     assert_clean();
 }
 

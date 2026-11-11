@@ -37,6 +37,9 @@ use crate::{
 /// `SlotHold::model` of a slot no model placed by hand holds.
 const NO_MODEL: u32 = u32::MAX;
 
+/// `tables.slang` `NO_MATERIAL_SET`.
+const NO_MATERIAL_SET: u32 = u32::MAX;
+
 /// Seconds of an animated page's rows wanted ahead of its clock.
 const MOTION_AHEAD: f32 = 1.0;
 
@@ -308,7 +311,10 @@ pub struct SkinnedPageRef {
     pub user_tag: u32,
 }
 
-/// Per-copy variety: pose variant, material set and hidden sections (bit set = hidden).
+/// Per-copy variety: pose variant, material set and hidden sections (bit set = hidden). Set `k`
+/// of a copy whose base is `b` and whose model has `n` sections is entries
+/// `b + k * n..b + (k + 1) * n` of the scene's material-set table; a cooked page's base holds set
+/// 0 only.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct CopyVariant {
@@ -635,6 +641,8 @@ struct SlotHold {
     /// copies' entries.
     first_entry: u32,
     entries: u32,
+    /// Its copy's `InstanceGpu::material_base`.
+    material_base: u32,
 }
 
 impl SlotHold {
@@ -646,6 +654,7 @@ impl SlotHold {
             model,
             first_entry: 0,
             entries: 0,
+            material_base: NO_MATERIAL_SET,
         }
     }
 }
@@ -999,6 +1008,7 @@ impl Scene {
                 model,
                 first_entry: first,
                 entries: stride,
+                material_base: hold.material_base,
             };
             cpu.entry_jobs.push([slot, first, stride, 0]);
         }
@@ -1429,8 +1439,13 @@ impl<'f> SceneWriter<'f> {
     /// does not change it): dielectric and presence sections are traced by rays that look for
     /// them and never rasterized into the visibility buffer, and one model may mix them with
     /// opaque sections.
+    ///
+    /// Panics if `desc.material_set`'s set 0 ends past `material_set_capacity`.
     pub fn add_instances(&mut self, desc: &InstancesDesc) -> Result<InstanceRange> {
         self.has_mesh(desc.model)?;
+        if let Some(base) = desc.material_set {
+            self.check_material_set(desc.model, base, 0);
+        }
         let ranks = self
             .model_cpu
             .get(desc.model.0 as usize)
@@ -1469,6 +1484,7 @@ impl<'f> SceneWriter<'f> {
                     model: desc.model.0,
                     first_entry: entry + copy * ranks,
                     entries: ranks,
+                    material_base: desc.material_set.unwrap_or(NO_MATERIAL_SET),
                 };
             }
             let partitions = cpu.ptlas.place(first, desc.copies, cell, cost);
@@ -1503,7 +1519,7 @@ impl<'f> SceneWriter<'f> {
                 group: desc.transforms.0,
                 group_index: desc.first + copy as u32,
                 model: desc.model.0,
-                material_base: desc.material_set.unwrap_or(u32::MAX),
+                material_base: desc.material_set.unwrap_or(NO_MATERIAL_SET),
                 pose_group: pose.group.0,
                 pose_index: pose.index,
                 first_part: u32::MAX,
@@ -1548,19 +1564,28 @@ impl<'f> SceneWriter<'f> {
     /// range stays valid as the page leaves and returns. Its slots take their records from the
     /// page's prototypes the first time the records land, so their variants, flags and other
     /// per-copy settings come from the page.
+    ///
+    /// Panics if set 0 of a base in `r.material_sets` ends past `material_set_capacity` on its
+    /// prototype's model.
     pub fn add_instance_page(&mut self, r: &InstancePageRef<'_>) -> Result<InstanceRange> {
+        let page = page_needs(self.mounts, self.model_cpu, r.page)?;
+        for &(index, base) in r.material_sets {
+            if let Some(p) = page.2.get(usize::from(index)) {
+                self.check_material_set(p.model, base, 0);
+            }
+        }
         let motion = self.motion_group(r.page, r.frame)?;
-        let placed = self.place_instance_page(r, motion);
+        let placed = self.place_instance_page(r, page, motion);
         self.settle_motion(r.page, motion, placed)
     }
 
     fn place_instance_page(
         &self,
         r: &InstancePageRef<'_>,
+        (needs, entries, protos): (PageNeeds, Vec<PrototypeEntries>, Vec<PagePrototype>),
         motion: Option<TransformGroupId>,
     ) -> Result<(InstanceRange, TransformGroupId)> {
         let page = self.mounts.page(r.page).ok_or(Error::UnknownPage(r.page))?;
-        let (needs, entries, protos) = page_needs(self.mounts, self.model_cpu, r.page)?;
         if let Some(p) = protos.iter().find(|p| self.is_skinned(p.model)) {
             return Err(Error::SkinnedPage(p.model));
         }
@@ -1640,7 +1665,7 @@ impl<'f> SceneWriter<'f> {
                     at_set += values.len() as u32;
                     at_set - values.len() as u32
                 }
-                None => u32::MAX,
+                None => NO_MATERIAL_SET,
             };
             let base = r
                 .material_sets
@@ -1849,22 +1874,28 @@ impl<'f> SceneWriter<'f> {
     /// They take the page's flags, section mask and materials as [`Self::add_instance_page`]'s
     /// do, unless `r` names a material set. A page of anything else fails with
     /// [`Error::NotSkinnedPage`].
+    ///
+    /// Panics if set 0 of `r.material_set` ends past `material_set_capacity` on the page's model.
     pub fn add_skinned_page(&mut self, r: &SkinnedPageRef) -> Result<InstanceRange> {
+        let protos = self.mounts.page_prototypes(r.page)?;
+        let [proto] = protos.as_slice() else {
+            return Err(Error::NotSkinnedPage(r.page));
+        };
+        if let Some(base) = r.material_set {
+            self.check_material_set(proto.model, base, 0);
+        }
         let motion = self.motion_group(r.page, r.frame)?;
-        let placed = self.place_skinned_page(r, motion);
+        let placed = self.place_skinned_page(r, proto, motion);
         self.settle_motion(r.page, motion, placed)
     }
 
     fn place_skinned_page(
         &mut self,
         r: &SkinnedPageRef,
+        proto: &PagePrototype,
         motion: Option<TransformGroupId>,
     ) -> Result<(InstanceRange, TransformGroupId)> {
         let page = self.mounts.page(r.page).ok_or(Error::UnknownPage(r.page))?;
-        let protos = self.mounts.page_prototypes(r.page)?;
-        let [proto] = protos.as_slice() else {
-            return Err(Error::NotSkinnedPage(r.page));
-        };
         let posable = |m: &ModelCpu| m.skin.is_some() && m.joints > 0;
         if !self
             .model_cpu
@@ -1929,7 +1960,7 @@ impl<'f> SceneWriter<'f> {
             0 => r.flags,
             f => InstanceFlags(f as u8 & r.flags.0),
         };
-        let placed = self.add_skinned(&SkinnedDesc {
+        let placed = self.place_skinned(&SkinnedDesc {
             model: proto.model,
             copies,
             transforms: motion.unwrap_or(id),
@@ -2006,8 +2037,16 @@ impl<'f> SceneWriter<'f> {
     /// templates, in the PTLAS global partition. Copies skin whether or not a view shows
     /// them, and take the candidate class of the model's own materials as in
     /// [`Self::add_instances`]. Panics if the model's mesh has no skin or the model no
-    /// skeleton.
+    /// skeleton, or if `desc.material_set`'s set 0 ends past `material_set_capacity`.
     pub fn add_skinned(&mut self, desc: &SkinnedDesc) -> Result<InstanceRange> {
+        if let Some(base) = desc.material_set {
+            self.check_material_set(desc.model, base, 0);
+        }
+        self.place_skinned(desc)
+    }
+
+    /// [`Self::add_skinned`] for a base that may lie in the page part of the material-set table.
+    fn place_skinned(&mut self, desc: &SkinnedDesc) -> Result<InstanceRange> {
         self.has_mesh(desc.model)?;
         let model = self
             .model_cpu
@@ -2053,6 +2092,7 @@ impl<'f> SceneWriter<'f> {
                     model: desc.model.0,
                     first_entry: emissive + copy * ranks,
                     entries: ranks,
+                    material_base: desc.material_set.unwrap_or(NO_MATERIAL_SET),
                 };
             }
             cpu.ptlas.place_skinned(first, desc.copies);
@@ -2079,7 +2119,7 @@ impl<'f> SceneWriter<'f> {
                 group: desc.transforms.0,
                 group_index: desc.first + copy,
                 model: desc.model.0,
-                material_base: desc.material_set.unwrap_or(u32::MAX),
+                material_base: desc.material_set.unwrap_or(NO_MATERIAL_SET),
                 pose_group: desc.palette.0,
                 pose_index: entry + copy,
                 first_part: u32::MAX,
@@ -2130,6 +2170,22 @@ impl<'f> SceneWriter<'f> {
         Ok(range)
     }
 
+    /// Panics unless material set `set` from consumer base `base`, one entry per section of
+    /// `model`, ends within the consumer's part of the material-set table.
+    fn check_material_set(&self, model: ModelId, base: u32, set: u8) {
+        let sections = self
+            .model_cpu
+            .get(model.0 as usize)
+            .map_or(0, |m| m.sections);
+        let capacity = self.scene.desc.material_set_capacity;
+        let end = u64::from(base) + (u64::from(set) + 1) * u64::from(sections);
+        assert!(
+            end <= u64::from(capacity),
+            "material set {set} from base {base} of {model:?}'s {sections} sections ends past \
+             the {capacity} entries of material_set_capacity"
+        );
+    }
+
     fn has_mesh(&self, model: ModelId) -> Result<()> {
         match self.model_cpu.get(model.0 as usize) {
             Some(m) if m.cage_only => Err(Error::NoMesh(model)),
@@ -2174,6 +2230,10 @@ impl<'f> SceneWriter<'f> {
     /// masked sections through BLAS built per (model, cut, mask) the first frame a copy
     /// names the mask; a mask hides an animated part's instance only when it covers every
     /// section of the part.
+    ///
+    /// Panics if a variant's material set ends past `material_set_capacity` on its copy's base,
+    /// names a set other than 0 on a cooked page's base, or lands on a copy of a cooked
+    /// instance page.
     pub fn copy_variants(
         &mut self,
         range: InstanceRange,
@@ -2185,15 +2245,36 @@ impl<'f> SceneWriter<'f> {
             first + count <= range.count,
             "variants {first}+{count} outside {range:?}"
         );
+        let slot = range.first + first;
+        let (on_page, holds) = {
+            let cpu = self.scene.cpu.lock().unwrap();
+            let on_page = cpu
+                .pages
+                .iter()
+                .any(|p| p.range.first < slot + count && slot < p.range.first + p.range.count);
+            let holds = cpu.slot_holds[slot as usize..(slot + count) as usize].to_vec();
+            (on_page, holds)
+        };
+        assert!(
+            !on_page,
+            "copies of a cooked page take their variants from the page"
+        );
+        let capacity = self.scene.desc.material_set_capacity;
+        for (v, hold) in variants.iter().zip(&holds) {
+            match hold.material_base {
+                NO_MATERIAL_SET => {}
+                b if b >= capacity => assert!(
+                    v.material_set == 0,
+                    "material set {} of a cooked page's base, which holds one",
+                    v.material_set
+                ),
+                b => self.check_material_set(ModelId(hold.model), b, v.material_set),
+            }
+        }
         let (src, out) = self.window.slice::<CopyVariant>(self.device, count)?;
         out.copy_from_slice(variants);
         let cpu = &mut *self.scene.cpu.lock().unwrap();
-        let slot = (range.first + first) as usize;
-        assert!(
-            !cpu.pages.iter().any(|p| p.range.first == range.first),
-            "copies of a cooked page take their variants from the page"
-        );
-        for (v, hold) in variants.iter().zip(&cpu.slot_holds[slot..]) {
+        for (v, hold) in variants.iter().zip(&holds) {
             let sections = self
                 .model_cpu
                 .get(hold.model as usize)
