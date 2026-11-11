@@ -828,14 +828,14 @@ impl PixelProbe {
                     c.rt_distance.to_bits() >> ADMIT_SHIFT,
                     g.admitted
                 )
-            } else if c.rt_distance.to_bits() >> ADMIT_SHIFT == g.admitted {
+            } else {
+                // A cut is admitted by its nearest slot's distance, so no slot of a cut left
+                // out lies in a bucket before the one the room ran out in.
                 format!(
                     "the frame's admission ran out of room in its distance bucket {}, at \
                      its cut or one before it",
                     g.admitted
                 )
-            } else {
-                "its owner's cut was not admitted".to_owned()
             };
             format!("cached cut {} after gathering: fell back, {why}", c.rt_cut)
         } else if c.flags & CUT_TRAVERSED == 0 && c.rt_count > 0 {
