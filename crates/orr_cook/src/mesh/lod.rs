@@ -150,7 +150,10 @@ pub(super) fn opposed_corners(
         [t[k], t[(k + 1) % 3], t[(k + 2) % 3]]
     };
     let mut kept: Option<FxHashSet<[u32; 3]>> = None;
-    let mut candidates: Option<Vec<u32>> = None;
+    // The input's vertices by their coordinate on the axis their box is longest on, so a
+    // search stops once that coordinate alone is farther than the nearest found: a piece can
+    // hold a whole section.
+    let mut candidates: Option<(usize, Vec<(f64, u32)>)> = None;
     let mut out = Vec::new();
     for (t, tri) in simplified.as_chunks::<3>().0.iter().enumerate() {
         let p = tri.map(&at);
@@ -162,23 +165,54 @@ pub(super) fn opposed_corners(
         if kept.contains(&key(tri)) && !tri.iter().any(|&v| moved(v)) {
             continue;
         }
-        let candidates = candidates.get_or_insert_with(|| {
+        let (axis, sorted) = &*candidates.get_or_insert_with(|| {
             let mut c = input.to_vec();
             c.sort_unstable();
             c.dedup();
-            c
+            let (lo, hi) = c
+                .iter()
+                .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(lo, hi), &u| {
+                    (lo.min(at(u)), hi.max(at(u)))
+                });
+            let size = hi - lo;
+            let axis = (0..3)
+                .max_by(|&a, &b| size[a].total_cmp(&size[b]))
+                .expect("three axes");
+            let mut sorted: Vec<(f64, u32)> = c.into_iter().map(|u| (at(u)[axis], u)).collect();
+            sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            (axis, sorted)
         });
         for (k, &v) in tri.iter().enumerate() {
             if normal(v).dot(face) >= 0.0 {
                 continue;
             }
-            let s = section(v);
-            let nearest = candidates
-                .iter()
-                .copied()
-                .filter(|&u| section(u) == s && normal(u).dot(face) > 0.0)
-                .map(|u| (at(u).distance_squared(p[k]), u))
-                .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let (s, x) = (section(v), p[k][*axis]);
+            let mut nearest: Option<(f64, u32)> = None;
+            // Whether `u`, at `c` on the axis, and every vertex past it are farther than the
+            // nearest; else takes `u` if it is nearer.
+            let mut past = |c: f64, u: u32| {
+                if nearest.is_some_and(|(d, _)| (c - x) * (c - x) > d) {
+                    return true;
+                }
+                if section(u) == s && normal(u).dot(face) > 0.0 {
+                    let d = at(u).distance_squared(p[k]);
+                    if nearest.is_none_or(|(e, w)| d < e || (d == e && u < w)) {
+                        nearest = Some((d, u));
+                    }
+                }
+                false
+            };
+            let mid = sorted.partition_point(|&(c, _)| c < x);
+            for &(c, u) in &sorted[mid..] {
+                if past(c, u) {
+                    break;
+                }
+            }
+            for &(c, u) in sorted[..mid].iter().rev() {
+                if past(c, u) {
+                    break;
+                }
+            }
             if let Some((_, u)) = nearest {
                 out.push((3 * t + k, u));
             }
