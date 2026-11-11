@@ -723,6 +723,11 @@ impl Pool {
         self.places.plan(tight) * self.places.unit
     }
 
+    /// Bytes of the blocks chosen to empty that have not emptied or taken ranges again.
+    pub(crate) fn draining_bytes(&self) -> u64 {
+        self.places.draining_units * self.places.unit
+    }
+
     /// The blocks chosen to empty, the one with the fewest live units first.
     pub(crate) fn draining(&self) -> &[u32] {
         &self.places.draining

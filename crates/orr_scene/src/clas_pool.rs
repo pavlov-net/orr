@@ -355,10 +355,11 @@ struct PoolState {
     /// Whether the heap of the pages' memory is over its mark, so its pool empties every block
     /// the others have room for.
     tight: bool,
-    /// Bytes of the blocks of the pages' memory chosen to empty, as of the last plan.
+    /// Bytes of the blocks of the pages' memory chosen to empty and not yet emptied, as of the
+    /// last batch.
     draining: u64,
-    /// Slots of the pages' memory have returned since the last plan, which may now find
-    /// blocks to empty: the next batch plans again.
+    /// Slots of the pages' memory have returned, or `tight` has changed, since the last plan,
+    /// which may now find blocks to empty: the next batch plans again.
     replan: bool,
 }
 
@@ -473,8 +474,9 @@ impl ClasPool {
         )
     }
 
-    /// Bytes of the blocks of the pages' memory the last plan chose to empty, which go back to
-    /// the system once the pages bound in them have moved or unbound.
+    /// Bytes of the blocks of the pages' memory chosen to empty and not yet emptied, as of the
+    /// last batch, which go back to the system once the pages bound in them have moved or
+    /// unbound.
     pub(crate) fn draining(&self) -> u64 {
         self.state.lock().unwrap().draining
     }
@@ -608,6 +610,7 @@ impl ClasPool {
             !done
         });
         s.replan |= moves_memory && freed;
+        s.draining = side.backing.draining_bytes();
         drop(s);
         for slot in micromaps {
             side.micromaps.free(slot);
@@ -698,12 +701,8 @@ impl ClasPool {
             }
         };
         let bound: Vec<u32> = slots.iter().map(|&(p, _)| p).collect();
-        let mut s = self.state.lock().unwrap();
-        s.bind(&bound, &started.unbinds);
-        s.range_full += u32::from(matches!(shortfall, Some(Shortfall::Range)));
-        s.replan |= self.moves_memory && !started.unbinds.is_empty();
-        drop(s);
-        for p in started.unbinds.drain(..) {
+        let unbound = std::mem::take(&mut started.unbinds);
+        for &p in &unbound {
             let slot = side.slots[p as usize].expect("a bound page's memory");
             side.set_slot(p, None);
             side.backing.free(slot);
@@ -711,6 +710,12 @@ impl ClasPool {
         for &(page, slot) in &slots {
             side.set_slot(page, Some(slot));
         }
+        let mut s = self.state.lock().unwrap();
+        s.bind(&bound, &unbound);
+        s.range_full += u32::from(matches!(shortfall, Some(Shortfall::Range)));
+        s.replan |= self.moves_memory && !unbound.is_empty();
+        s.draining = side.backing.draining_bytes();
+        drop(s);
         started.ops.bound.extend(bound);
         started.binds.extend(point);
         started.ops.shortfall = shortfall;
