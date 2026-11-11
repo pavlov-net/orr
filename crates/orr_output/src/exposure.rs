@@ -87,16 +87,23 @@ impl Exposure {
 /// Exposures are EV100 as [`ev100_from_exposure`] gives them. A scene metered at EV100 `m`
 /// with no compensation is exposed at `keyed_ev100(m, 0.0)`, about `m - 0.79`.
 ///
-/// A view's first render, and a camera cut's frame, are lit at `reference_ev100`. The first
-/// frame from there with light to meter takes the target as its exposure, and every later
-/// frame adapts. A frame with nothing to meter (all black, or masked out) holds the exposure,
-/// so a view waiting for its first frame with light stays lit and shown at the reference.
+/// A view's first render, and a camera cut's frame, are lit and shown at `reference_ev100`.
+/// The first frame from there with light to meter takes the target as its exposure and is
+/// shown at it, and every later frame adapts. A frame with nothing to meter (all black, or
+/// masked out) holds the exposure, so a view waiting for its first frame with light stays lit
+/// and shown at the reference.
+///
+/// The view is lit at the reference up to and including the frame that lets its pre-exposure
+/// step, and at its exposure from the next. The frame the view starts over lets it, and takes
+/// the step when it has light to meter; otherwise the first frame whose exposure pass has
+/// read back that an earlier frame set the exposure does
+/// ([`OutputView::pre_exposure_steps`](crate::OutputView::pre_exposure_steps)).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutoExposure {
-    /// The exposure a view is lit with until it has metered a frame. Lit at exposure `s`,
-    /// RGBA16F holds luminance from `2^-24 / s` to the HDR ceiling's `16384 / s`: at the
-    /// default, scene EV100 from about -18 to 20. Light above that meters as the top, and
-    /// light below it is black.
+    /// The exposure a view is lit with from its start until its pre-exposure steps to the
+    /// exposure it set. Lit at exposure `s`, RGBA16F holds luminance from `2^-24 / s` to the
+    /// HDR ceiling's `16384 / s`: at the default, scene EV100 from about -18 to 20. Light
+    /// above that meters as the top, and light below it is black.
     pub reference_ev100: f32,
     /// The histogram's range of scene EV100; luminance outside it counts in the end bins.
     pub range_ev100: RangeInclusive<f32>,

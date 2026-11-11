@@ -215,11 +215,16 @@ pub struct LitView<'a> {
     /// A camera cut: the previous camera is taken to be this one; motion blur shows nothing,
     /// frame generation, ray reconstruction and lighting drop their history, and exposure and
     /// white balance start over: the frame is lit as [`Exposure::start`] gives and shown at the
-    /// exposure and white point it meters. Ray reconstruction drops its history once more, on
-    /// the frame first lit with that exposure: the next one when the cut's frame has light to
-    /// meter, else a frame or two after the first that has. A view's first render, its first
-    /// on another scene and its first after [`SceneWriter::reset_lighting_history`] are cuts
-    /// without it.
+    /// exposure and white point it meters. Ray reconstruction drops its history again on the
+    /// frame first lit at the exposure the view sets. Under auto exposure that is the frame
+    /// after the cut's when the cut's frame has light to meter. Otherwise the view stays lit
+    /// at the reference through its first frame with light, up to and including the first
+    /// frame whose exposure pass has read back that the exposure is set, and the frame after
+    /// that one drops the history. The frame after the cut's drops it too, unless the cut
+    /// frame's telemetry is read back by then and shows no exposure set. Under manual exposure
+    /// the view starts at its exposure and only the cut's frame drops the history. A view's
+    /// first render, its first on another scene and its first after
+    /// [`SceneWriter::reset_lighting_history`] are cuts without it.
     pub camera_cut: bool,
     /// Menus and loading screens: frame generation is told the frame shows no scene.
     pub not_rendering_scene: bool,
