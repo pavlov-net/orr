@@ -428,8 +428,7 @@ void want(uint3 id: SV_DispatchThreadID)
         float distance = has_focus ? max(length(center) - radius, 0.0) : 0.0;
         float range = float(inst.rt_range) * ((st.rt_flags & RT_IN_RANGE) != 0 ? RT_HYSTERESIS : 1.0);
         in_range = !has_focus || distance <= range;
-        uint cut = s.cut.slots[slot].rt_cut;
-        op.cut = cut == RT_CUT_BUILT ? cut : min(cut, mesh.rt_cut_count - 1);
+        op.cut = s.cut.slots[slot].rt_cut;
         cut_blas(s, slot, mesh, model, inst, op.cut, op.rest, body);
         parted_built = op.cut == RT_CUT_BUILT && (s.cut.slots[slot].flags & CUT_PARTS) != 0;
         active = op.rest != 0 || parted_built;
@@ -537,7 +536,7 @@ void want(uint3 id: SV_DispatchThreadID)
     {
         MeshGpu* far_mesh = s.meshes + s.models[step_record(s, base, far_step).model].mesh;
         far = far_mesh.rt_cut_count > 0;
-        op.far_cut = far ? min(s.cut.slots[slot].far_cut, far_mesh.rt_cut_count - 1) : 0;
+        op.far_cut = far ? s.cut.slots[slot].far_cut : 0;
     }
     bool far_held = st.far_part != 0;
     // A fade can turn to another far step before it ends while the near one stays.
