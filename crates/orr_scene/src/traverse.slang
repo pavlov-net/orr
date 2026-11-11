@@ -51,11 +51,13 @@ static const uint TRAVERSE_FOCUS = 1;   // the scene has a focus
 static const uint TRAVERSE_ERRORS = 2;  // `clear` zeroes `CutGpu.wanted_errors`: the first frame
 static const uint TRAVERSE_FILL = 4;    // the passes write the clusters of the cuts built this frame
 
-// `CutGpu.args` grids after the passes': gather, then jobs.
+// `CutGpu.args` grids after the passes': gather, then jobs, then per digit of the admission
+// keys past the first its `refine` and its `select`.
 public static const uint ARGS_PASSES = 64;
 public static const uint ARGS_GATHER = 3 * ARGS_PASSES;
 public static const uint ARGS_JOBS = ARGS_GATHER + 3;
-public static const uint ARGS_TOTAL = ARGS_JOBS + 3;
+public static const uint ARGS_ADMIT = ARGS_JOBS + 3;
+public static const uint ARGS_TOTAL = ARGS_ADMIT + 6 * (ADMIT_LEVELS - 1);
 // `CutGpu.counters` past CUT_COUNTERS: the BLAS build count.
 public static const uint CUT_BUILDS = CUT_COUNTERS;
 
@@ -1328,6 +1330,11 @@ groupshared uint g_first;
 // of the CLAS's and the builds'. It leaves what the cuts before that bucket take for the next
 // digit, and the buckets empty for `refine`. With room for all, no bucket is found. The first
 // digit's pass also leaves what all the cuts take in the counters, at most what they count.
+//
+// The passes of the digits after the first run by grids this kernel sizes. The first digit's
+// pass leaves them empty, with stops that build nothing of a stop bucket, and each pass gives
+// the next digit's theirs only where that digit has cuts to order: a bucket found, of more
+// than the one build that is one cut, which is then the first without room.
 [shader("compute")]
 [numthreads(SELECT_THREADS, 1, 1)]
 void select(uint3 id: SV_GroupThreadID)
@@ -1349,6 +1356,13 @@ void select(uint3 id: SV_GroupThreadID)
     g_jobs[t] = jobs;
     if (t == 0)
         g_first = ADMIT_BUCKETS;
+    if (t == 0 && level == 0)
+    {
+        for (uint k = 0; k < ADMIT_LEVELS - 1; k++)
+            cut.admit[ADMIT_STOPS + k] = 0;
+        for (uint k = ARGS_ADMIT; k < ARGS_TOTAL; k++)
+            cut.args[k] = 0;
+    }
     GroupMemoryBarrierWithGroupSync();
     for (uint d = 1; d < SELECT_THREADS; d *= 2)
     {
@@ -1386,6 +1400,13 @@ void select(uint3 id: SV_GroupThreadID)
         {
             admit_store(cut, ADMIT_TAKEN, above_clas);
             admit_store(cut, ADMIT_TAKEN + 2, above_jobs);
+            if (level + 1 < admit_levels() && admit_sum(cut, 4 * (first + i) + 2) != 1)
+            {
+                uint* grids = cut.args + ARGS_ADMIT + 6 * level;
+                grids[0] = (root.slots + 63) / 64;
+                for (uint k = 1; k < 6; k++)
+                    grids[k] = 1;
+            }
         }
         above_clas += admit_sum(cut, 4 * (first + i));
         above_jobs += admit_sum(cut, 4 * (first + i) + 2);
@@ -1411,7 +1432,7 @@ void refine(uint3 id: SV_DispatchThreadID)
 {
     uint slot = id.x;
     CutGpu* cut = root.cut;
-    if (slot >= root.slots || cut.counters[CUT_ADMITTED] == ADMIT_BUCKETS)
+    if (slot >= root.slots)
         return;
     SlotCutGpu c = cut.slots[slot];
     if ((c.flags & CUT_OWNER) == 0)

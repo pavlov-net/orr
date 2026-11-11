@@ -74,12 +74,15 @@ const CUT_BUILDS: u64 = 31;
 const ARGS_PASSES: u32 = 64;
 const ARGS_GATHER: u64 = 3 * ARGS_PASSES as u64;
 const ARGS_JOBS: u64 = ARGS_GATHER + 3;
-const ARGS_TOTAL: u64 = ARGS_JOBS + 3;
+const ARGS_ADMIT: u64 = ARGS_JOBS + 3;
+const ARGS_TOTAL: u64 = ARGS_ADMIT + 6 * (ADMIT_LEVELS - 1);
 const TRAVERSE_FOCUS: u32 = 1;
 const TRAVERSE_ERRORS: u32 = 2;
 const TRAVERSE_FILL: u32 = 4;
-/// `cut.slang` `FEEDBACK_BUCKETS`, `ADMIT_BITS`, `ADMIT_BUCKETS` and `ADMIT_WORDS`.
+/// `cut.slang` `FEEDBACK_BUCKETS`, `ADMIT_LEVELS`, `ADMIT_BITS`, `ADMIT_BUCKETS` and
+/// `ADMIT_WORDS`.
 const FEEDBACK_BUCKETS: u32 = 4096;
+const ADMIT_LEVELS: u64 = 5;
 const ADMIT_BITS: u32 = 14;
 const ADMIT_BUCKETS: u32 = 1 << ADMIT_BITS;
 const ADMIT_WORDS: u32 = 4 * ADMIT_BUCKETS + 8;
@@ -917,13 +920,16 @@ impl Cuts {
             step(list);
         }
         list.dispatch(p.get(k.select), r0, [1, 1, 1]);
-        step(list);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
+        // The later digits' passes run by grids `select` sizes: empty unless the digit before
+        // left them cuts to order.
         for level in 1..admit_levels(f.slots) {
             let r = root(level, false)?;
-            list.dispatch(p.get(k.refine), r, groups(f.slots));
+            let grids = args.offset(ARGS_ADMIT + 6 * u64::from(level - 1));
+            list.dispatch_indirect(p.get(k.refine), r, grids.cast());
             step(list);
-            list.dispatch(p.get(k.select), r, [1, 1, 1]);
-            step(list);
+            list.dispatch_indirect(p.get(k.select), r, grids.offset(3).cast());
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
         }
         for kernel in [k.admit, k.link] {
             list.dispatch(p.get(kernel), r0, groups(f.slots));
