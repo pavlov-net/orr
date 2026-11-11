@@ -768,6 +768,62 @@ fn breakdown(renderer: &Renderer) -> String {
     s
 }
 
+/// One line of what frame `frame` holds: per device-local heap its use against its budget and
+/// what is waiting to be freed, per scene pool the bytes used, retired and draining against its
+/// blocks' bytes, the CLAS pool's bound pages, each class's resident bytes against its budget,
+/// and the heaps' excess and shortfall, in MiB.
+fn memory_line(frame: u64, renderer: &Renderer) -> String {
+    let report = device().memory_report();
+    let scene = renderer.scene_memory();
+    let r = renderer.residency();
+    let detail = renderer.stats().detail;
+    let mut s = format!("memory at frame {frame}:");
+    for h in report.heaps.iter().filter(|h| h.device_local) {
+        s += &format!(
+            " heap {:.0}/{:.0} freeing {:.0}",
+            mib(h.usage),
+            mib(h.budget),
+            mib(h.freeing)
+        );
+    }
+    for p in &scene.pools {
+        s += &format!(
+            "; {} {:.0}/{:.0} in {} (retired {:.0}, draining {:.0})",
+            p.name,
+            mib(p.used),
+            mib(p.bytes),
+            p.blocks,
+            mib(p.retired),
+            mib(p.draining)
+        );
+    }
+    if let Some(c) = scene.clas {
+        s += &format!(
+            "; CLAS pages {} bound {} free, {:.0} used",
+            c.bound,
+            c.wholly_free,
+            mib(c.used)
+        );
+    }
+    for class in [ResidencyClass::MeshPages, ResidencyClass::Textures] {
+        let c = r.class(class);
+        s += &format!(
+            "; {class:?} {:.0}/{:.0}",
+            mib(c.resident_bytes),
+            mib(c.budget)
+        );
+    }
+    s += &format!(
+        "; excess {:.0} short {:.0}; detail x{:.3}; {} loads {} evictions",
+        mib(r.heap_excess),
+        mib(r.heap_shortfall),
+        detail.memory_scale,
+        r.loads,
+        r.evictions
+    );
+    s
+}
+
 /// Runs the example; headless runs and windowed runs with `--out` and `--frames` return their
 /// last frame.
 fn run(options: &Options) -> Option<Capture> {
@@ -1017,6 +1073,10 @@ fn run(options: &Options) -> Option<Capture> {
             mib("ZORAH_CUT_TEXTURE_MIB"),
         )
     });
+    // Every `ZORAH_LOG_MEMORY` frames the run logs what its memory holds.
+    let memory_every = std::env::var("ZORAH_LOG_MEMORY")
+        .ok()
+        .map(|n| n.parse::<u64>().expect("ZORAH_LOG_MEMORY is a frame count"));
     // The output pixel `--probe` probes on the last frame, and the one `P` asked for.
     let probe_at = options.value("--probe").map(parse_probe);
     let mut probe = None;
@@ -1155,6 +1215,9 @@ fn run(options: &Options) -> Option<Capture> {
         camera_cut = false;
         last = Some((id, f.end().expect("end frame")));
         streaming.step(&renderer, camera.name);
+        if memory_every.is_some_and(|n| i.is_multiple_of(n)) {
+            log::info!("{}", memory_line(i, &renderer));
+        }
         let completed = renderer.stats().frame;
         for p in renderer.probes(history, completed) {
             note_probe(&camera, &p);
