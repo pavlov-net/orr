@@ -9,7 +9,7 @@ use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, KernelSet, MemoryKind, Mem
 use orr_math::{DVec3, IVec3};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::decals::{Decal, DecalId, Listing, decal_gpu, listing, table_sizes};
+use crate::decals::{Bins, Decal, DecalId, Listing, decal_gpu, listing};
 use crate::lights::{
     EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, GATHERED_CLUSTERS, Light, LightId, NO_EMISSIVE, NO_SET,
     light_gpu,
@@ -86,8 +86,6 @@ pub struct SceneDesc {
     pub skinned_capacity: u32,
     /// Clusters all skinned copies skin and instantiate in one frame, at most.
     pub skinned_clusters: u32,
-    /// Decals: every `DecalId` is below it.
-    pub decal_capacity: u32,
     /// Medium proxies: every `MediumProxyId` is below it. They trace from the PTLAS global
     /// partition.
     pub medium_proxy_capacity: u32,
@@ -103,7 +101,6 @@ impl Default for SceneDesc {
             global_instances: 4096,
             skinned_capacity: 256,
             skinned_clusters: 8192,
-            decal_capacity: 1024,
             medium_proxy_capacity: 64,
         }
     }
@@ -360,9 +357,8 @@ pub(crate) struct Tables {
     pub(crate) sky_stats: Allocation<SkyStats>,
     pub(crate) skinned: Allocation<SkinnedGpu>,
     pub(crate) skin_state: Allocation<SkinStateGpu>,
-    pub(crate) decals: Allocation<DecalGpu>,
-    pub(crate) decal_bins: Allocation<DecalBinGpu>,
-    pub(crate) decal_refs: Allocation<u32>,
+    /// By `DecalId`: an entry for every id set.
+    pub(crate) decals: Column<DecalGpu>,
     pub(crate) proxies: Allocation<MediumProxyGpu>,
 }
 
@@ -769,6 +765,11 @@ pub(crate) struct SceneCpu {
     pub(crate) seen_by: Vec<LastView>,
     /// Where each decal is listed, by `DecalId`.
     pub(crate) decals: Vec<Option<Listing>>,
+    /// The bin table and run list the frame's kernels read, each written whole when a decal
+    /// has changed, and the slots and words they hold room for.
+    pub(crate) decal_bins: Allocation<DecalBinGpu>,
+    pub(crate) decal_refs: Allocation<u32>,
+    decal_room: (u32, u32),
     /// Set when a decal changed since the bin table was last written.
     pub(crate) decals_changed: bool,
     pub(crate) decal_bin_slots: u32,
@@ -859,6 +860,33 @@ impl SceneCpu {
         (1..self.groups.len())
             .find(|&i| self.groups[i].is_none())
             .unwrap_or(self.groups.len())
+    }
+
+    /// Gives the bin table and run list room for `bins`, each twice what it held at least
+    /// when it holds too little, before the frame records anything that reads them. Fails
+    /// without device memory, leaving both as they were.
+    pub(crate) fn fit_decal_bins(&mut self, device: &Device, bins: &Bins) -> Result<()> {
+        let dl = MemoryKind::DeviceLocal;
+        let (slots, refs) = (bins.slots.len() as u32, bins.refs.len() as u32);
+        let (held_slots, held_refs) = self.decal_room;
+        let room = |held: u32, needed: u32| needed.max(held.saturating_mul(2));
+        let new_slots = (slots > held_slots).then(|| room(held_slots, slots));
+        let new_refs = (refs > held_refs).then(|| room(held_refs, refs));
+        let bin_table = new_slots
+            .map(|n| device.gpu_malloc(dl, u64::from(n), "decal bins"))
+            .transpose()?;
+        let run_list = new_refs
+            .map(|n| device.gpu_malloc(dl, u64::from(n), "decal runs"))
+            .transpose()?;
+        if let (Some(table), Some(n)) = (bin_table, new_slots) {
+            self.decal_bins = table;
+            self.decal_room.0 = n;
+        }
+        if let (Some(list), Some(n)) = (run_list, new_refs) {
+            self.decal_refs = list;
+            self.decal_room.1 = n;
+        }
+        Ok(())
     }
 
     /// Instance slots the scene's tables hold room for.
@@ -988,6 +1016,7 @@ impl Scene {
         self.tables.groups.land(frame, copies, records);
         self.tables.material_sets.land(frame, copies, records);
         self.tables.page_sets.land(frame, copies, records);
+        self.tables.decals.land(frame, copies, records);
     }
 
     /// Frees the tables moved from in frames at or before `completed`.
@@ -998,6 +1027,7 @@ impl Scene {
         self.tables.groups.retire(completed);
         self.tables.material_sets.retire(completed);
         self.tables.page_sets.retire(completed);
+        self.tables.decals.retire(completed);
     }
 
     /// Instance entry `entry` of the emissive list.
@@ -1342,7 +1372,6 @@ impl Scene {
     pub(crate) fn new(device: &Device, desc: &SceneDesc) -> Result<Self> {
         let n = |c: u32| u64::from(c.max(1));
         let dl = MemoryKind::DeviceLocal;
-        let (decal_slots, decal_refs) = table_sizes(desc.decal_capacity);
         let tables = Tables {
             root: device.gpu_malloc(dl, 1, "scene root")?,
             instances: Column::new(device, MemoryPriority::Normal, "instances", true)?,
@@ -1370,9 +1399,7 @@ impl Scene {
             sky_stats: device.gpu_malloc(dl, 1, "sky stats")?,
             skinned: device.gpu_malloc(dl, n(desc.skinned_capacity), "skinned copies")?,
             skin_state: device.gpu_malloc(dl, n(desc.skinned_capacity), "skin state")?,
-            decals: device.gpu_malloc(dl, n(desc.decal_capacity), "decals")?,
-            decal_bins: device.gpu_malloc(dl, n(decal_slots), "decal bins")?,
-            decal_refs: device.gpu_malloc(dl, n(decal_refs), "decal runs")?,
+            decals: Column::new(device, MemoryPriority::Normal, "decals", true)?,
             proxies: device.gpu_malloc(dl, n(desc.medium_proxy_capacity), "medium proxies")?,
         };
         // The null group.
@@ -1397,7 +1424,6 @@ impl Scene {
             zero(tables.sky_stats.gpu().address(), tables.sky_stats.size()),
             zero(tables.skinned.gpu().address(), tables.skinned.size()),
             zero(tables.skin_state.gpu().address(), tables.skin_state.size()),
-            zero(tables.decals.gpu().address(), tables.decals.size()),
             zero(tables.proxies.gpu().address(), tables.proxies.size()),
         ];
         Ok(Self {
@@ -1436,7 +1462,10 @@ impl Scene {
                 skins_removed: Vec::new(),
                 skin_frame: None,
                 seen_by: Vec::new(),
-                decals: vec![None; desc.decal_capacity as usize],
+                decals: Vec::new(),
+                decal_bins: device.gpu_malloc(dl, 1, "decal bins")?,
+                decal_refs: device.gpu_malloc(dl, 1, "decal runs")?,
+                decal_room: (0, 0),
                 decals_changed: false,
                 decal_bin_slots: 0,
                 decal_globals: 0,
@@ -2810,19 +2839,29 @@ impl<'f> SceneWriter<'f> {
         Ok(())
     }
 
-    /// Sets or clears decal `id`, from this frame on.
+    /// Sets or clears decal `id`, from this frame on. The decal table grows to hold the
+    /// highest id set.
     pub fn set_decal(&mut self, id: DecalId, decal: Option<&Decal>) -> Result<()> {
-        assert!(
-            id.0 < self.scene.desc.decal_capacity,
-            "{id:?} outside the decal table"
-        );
+        let table = &self.scene.tables.decals;
+        let held = table.capacity();
+        // An id past the table holds no decal to clear.
+        if id.0 >= held {
+            if decal.is_none() {
+                return Ok(());
+            }
+            table.reserve(
+                self.device,
+                grown("decals", held, id.0 - held + 1, table.limit())?,
+            )?;
+        }
         let record = decal.map_or_else(DecalGpu::zeroed, |d| decal_gpu(d, self.cell_log2));
-        let copy = self.staged(
-            self.scene.tables.decals.gpu().offset(u64::from(id.0)),
-            &record,
-        )?;
+        let copy = self.staged(table.entry(id.0), &record)?;
         let cpu = &mut *self.scene.cpu.lock().unwrap();
-        cpu.decals[id.0 as usize] = decal.map(|d| listing(d, self.cell_log2));
+        let at = id.0 as usize;
+        if at >= cpu.decals.len() {
+            cpu.decals.resize(at + 1, None);
+        }
+        cpu.decals[at] = decal.map(|d| listing(d, self.cell_log2));
         cpu.decals_changed = true;
         cpu.records.push(copy);
         Ok(())

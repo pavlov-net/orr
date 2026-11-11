@@ -1861,10 +1861,11 @@ impl<'a> Frame<'a> {
             let t = &scene.tables;
             if std::mem::take(&mut cpu.decals_changed) {
                 let bins = build_bins(&cpu.decals);
+                cpu.fit_decal_bins(device, &bins)?;
                 let slots: &[u32] = bytemuck::cast_slice(&bins.slots);
                 for (dst, words) in [
-                    (t.decal_bins.gpu().cast::<u32>(), slots),
-                    (t.decal_refs.gpu(), &bins.refs),
+                    (cpu.decal_bins.gpu().cast::<u32>(), slots),
+                    (cpu.decal_refs.gpu(), &bins.refs),
                 ] {
                     if !words.is_empty() {
                         let n = words.len() as u32;
@@ -1915,8 +1916,8 @@ impl<'a> Frame<'a> {
                 skin_state: t.skin_state.gpu(),
                 skin_work: skin_work.unwrap_or(GpuPtr::NULL).cast(),
                 decals: t.decals.gpu(),
-                decal_bins: t.decal_bins.gpu(),
-                decal_refs: t.decal_refs.gpu(),
+                decal_bins: cpu.decal_bins.gpu(),
+                decal_refs: cpu.decal_refs.gpu(),
                 decal_globals: cpu.decal_globals,
                 decal_bin_slots: cpu.decal_bin_slots,
                 decal_bin_log2: decals::bin_log2(core.cell_log2),

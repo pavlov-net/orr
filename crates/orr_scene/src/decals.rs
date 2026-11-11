@@ -7,7 +7,7 @@ use crate::material::MaterialId;
 use crate::world::WorldPos;
 use crate::{DecalBinGpu, DecalGpu};
 
-/// A slot in a scene's decal table, below `SceneDesc::decal_capacity`. Where decals overlap,
+/// A slot in a scene's decal table, which holds every id set. Where decals overlap,
 /// higher ids are written over lower ones.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DecalId(pub u32);
@@ -112,13 +112,6 @@ pub(crate) fn listing(decal: &Decal, cell_log2: u32) -> Listing {
     } else {
         Listing::Bins { lo, hi }
     }
-}
-
-/// Slots of the bin table and words of the run list for `capacity` decals.
-pub(crate) fn table_sizes(capacity: u32) -> (u32, u32) {
-    let refs = capacity * MAX_BINS as u32;
-    let slots = (2 * refs).max(1).next_power_of_two();
-    (slots, capacity + 2 * refs)
 }
 
 /// The bin table's starting slot for `bin`, as `decal_bin_hash` finds it.
@@ -256,8 +249,6 @@ mod tests {
         let listings: Vec<Option<Listing>> = decals.iter().map(|d| Some(listing(d, 8))).collect();
         assert!(listings.contains(&Some(Listing::Global)));
         let bins = build_bins(&listings);
-        let (slots, refs) = table_sizes(decals.len() as u32);
-        assert!(bins.slots.len() as u32 <= slots && bins.refs.len() as u32 <= refs);
         for (id, d) in decals.iter().enumerate() {
             let r = Mat3::from_quat(d.rotation).as_dmat3();
             for _ in 0..20 {
