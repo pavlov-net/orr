@@ -205,10 +205,15 @@ fn hierarchy_depth(nodes: &[orr_pack::mesh::Node], roots: &[u32]) -> u32 {
 
 /// A resident skeleton: its blob (`orr_pack::skeleton`), which pose kernels read in place
 /// through `orr_pack.skeleton`, valid until its pack is unmounted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SkeletonRef {
     pub blob: GpuPtr<u8>,
     pub joint_count: u32,
+    /// Where the skeleton's space, which its model's mesh and its palettes stand in, stands in
+    /// the space the model was cooked in (`SkeletonInfo::origin`): a copy placed by `T` stands
+    /// where `T x translation(origin)` would put the model as cooked, and a palette group that
+    /// cooked pages hang from takes the origin, placed as the pages are, as its anchor.
+    pub origin: DVec3,
 }
 
 /// A resident clip (`orr_pack::clip`): its header and samples, which pose kernels read in
@@ -1018,6 +1023,7 @@ fn place_skeleton(t: &Arc<MountTask>, id: AssetId, blob: &[u8]) -> Result<()> {
         // SAFETY: the blob is resident in the mount's block.
         blob: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu())) },
         joint_count: info.joint_count() as u32,
+        origin: info.origin,
     };
     t.placed.lock().unwrap().skeletons.push((id, r));
     Ok(())

@@ -430,18 +430,31 @@ fn clip_error(
         clip.sample(t, &mut locals);
         skel.model_pose(&locals, &mut pose);
         let world = src.world(&src.pose(channels, start + t));
+        let model = |j: usize| to_model(skel) * Mat4::from(pose[j]);
         for &(j, q) in points {
             let Some(node) = nodes[j] else { continue };
-            let apart = Mat4::from(pose[j]).transform_point3(q) - world[node].transform_point3(q);
+            let apart = model(j).transform_point3(q) - world[node].transform_point3(q);
             far = far.max(f64::from(apart.length()) * 1000.0);
         }
         for (j, node) in nodes.iter().enumerate() {
             if let Some(node) = *node {
-                angle = angle.max(rotation_error(&Mat4::from(pose[j]), &world[node]));
+                angle = angle.max(rotation_error(&model(j), &world[node]));
             }
         }
     }
     (far, angle)
+}
+
+/// Model space from the space of `skel`, which its palettes and its mesh stand in.
+fn to_model(skel: &SkeletonInfo) -> Mat4 {
+    Mat4::from_translation(skel.origin.as_vec3())
+}
+
+/// The inverse bind of each joint of `skel` from model space.
+fn model_binds(skel: &SkeletonInfo) -> Vec<Mat4> {
+    let from_model = to_model(skel).inverse();
+    let ib = skel.inverse_binds.iter();
+    ib.map(|&a| Mat4::from(a) * from_model).collect()
 }
 
 /// Whether `clip` stopped doubling its rate at [`ClipSettings::max_rate`].
@@ -471,7 +484,7 @@ fn check(path: &Path, name: &str, settings: GltfSettings) -> (Cooked, Errors) {
     assert_ne!(info.header.attributes & MeshHeader::SKIN, 0);
 
     // Inverse binds: the source skins', the cooked ones for joints no skin names.
-    let mut ibm: Vec<Mat4> = skel.inverse_binds.iter().map(|&a| a.into()).collect();
+    let mut ibm = model_binds(&skel);
     for skin in src.doc.skins() {
         if let Some(m) = skin.reader(src.buf()).read_inverse_bind_matrices() {
             for (joint, m) in skin.joints().zip(m) {
@@ -492,9 +505,10 @@ fn check(path: &Path, name: &str, settings: GltfSettings) -> (Cooked, Errors) {
     let points = moved_points(&src, &nodes, &ibm, &vertices);
     let (skinned, rigid) = vertices;
     let step = f64::from(info.header.step());
+    let origin = skel.origin;
     let cell = |p: Vec3| {
-        p.to_array()
-            .map(|x| (f64::from(x) / step + 0.5).floor() as i32)
+        let p = p.as_dvec3() - origin;
+        p.to_array().map(|x| (x / step + 0.5).floor() as i32)
     };
     let mut by_cell: HashMap<[i32; 3], Vec<usize>> = HashMap::new();
     for (i, v) in skinned.iter().enumerate() {
@@ -597,10 +611,14 @@ fn check(path: &Path, name: &str, settings: GltfSettings) -> (Cooked, Errors) {
                 for c in (0..view.cluster_count()).map(|i| view.cluster(i)) {
                     let mut out = vec![[0.0; 3]; usize::from(c.vertex_count)];
                     mesh::skin(view, &c, &palette, &mut out);
-                    for (v, got) in (0..).zip(out.into_iter().map(Vec3::from)) {
+                    let placed = to_model(&skel);
+                    let out = out
+                        .into_iter()
+                        .map(|o| placed.transform_point3(Vec3::from(o)));
+                    for (v, got) in (0..).zip(out) {
                         let joints = view.joints(&c, v).unwrap();
                         let weights = view.weights(&c, v).unwrap();
-                        let decoded = Vec3::from(view.position(&c, v));
+                        let decoded = placed.transform_point3(Vec3::from(view.position(&c, v)));
                         let infl = (0..4).map(|k| (usize::from(joints[k]), weights[k]));
                         let want = lbs(&reference, infl, decoded);
                         err.skin_mm = err.skin_mm.max(f64::from(want.distance(got)) * 1000.0);
@@ -747,7 +765,7 @@ fn arm_error(name: &str) -> (f32, f64, bool) {
     let skel = cooked.skeleton();
     let nodes = joint_nodes(&src, &skel);
     let vertices = source_vertices(&src, &nodes);
-    let ibm: Vec<Mat4> = skel.inverse_binds.iter().map(|&a| a.into()).collect();
+    let ibm = model_binds(&skel);
     let points = moved_points(&src, &nodes, &ibm, &vertices);
     let (_, clip) = cooked.clips().pop().unwrap();
     let anim = src.doc.animations().next().unwrap();
@@ -819,4 +837,140 @@ fn a_swing_is_held_at_the_reach_of_its_geometry() {
         .pop()
         .unwrap();
     assert_eq!(clip.header.sample_rate, rate);
+}
+
+/// Local transforms of [`far_rig`]'s nodes `far`, `a` and `b`, and the turns `a` and `b` end at.
+struct FarRig {
+    far: (Vec3, Quat),
+    a: Vec3,
+    b: (Vec3, Quat),
+    a_end: Quat,
+    b_end: Quat,
+}
+
+impl FarRig {
+    fn at(d: f32) -> Self {
+        let turn = |axis: Vec3, deg: f32| Quat::from_axis_angle(axis.normalize(), deg.to_radians());
+        Self {
+            far: (Vec3::new(d, 3.0, -0.6 * d), turn(Vec3::Y, 37.0)),
+            a: Vec3::new(0.3, 1.2, 0.1),
+            b: (
+                Vec3::new(0.4, 0.8, -0.2),
+                turn(Vec3::new(1.0, 2.0, 3.0), 20.0),
+            ),
+            a_end: turn(Vec3::new(0.0, 1.0, 1.0), 50.0),
+            b_end: turn(Vec3::X, -35.0),
+        }
+    }
+
+    /// Model space from joint `a`'s and `b`'s, in f64, at the rest pose or the end of the clip.
+    fn world(&self, end: bool) -> [orr_math::DMat4; 2] {
+        use orr_math::{DMat4, DQuat};
+        let m = |t: Vec3, q: Quat| {
+            let q = DQuat::from_array(q.to_array().map(f64::from)).normalize();
+            DMat4::from_rotation_translation(q, t.as_dvec3())
+        };
+        let (a, b) = match end {
+            true => (self.a_end, self.b_end),
+            false => (Quat::IDENTITY, self.b.1),
+        };
+        let a = m(self.far.0, self.far.1) * m(self.a, a);
+        [a, a * m(self.b.0, b)]
+    }
+}
+
+/// A static node `d` m from the model's origin, turned 37 degrees, over two animated nodes, `a`
+/// and `b` below it, each holding a triangle: a rig of rigid parts whose clip turns both.
+fn far_rig(name: &str, d: f32) -> PathBuf {
+    let r = FarRig::at(d);
+    let mut g = Glb::default();
+    let pos = g.floats(&[[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.5, 0.2]], "VEC3");
+    let idx = g.indices(&[0, 1, 2]);
+    let input = g.floats(&[[0.0], [1.0]], "SCALAR");
+    let a_keys = g.floats(&[Quat::IDENTITY.to_array(), r.a_end.to_array()], "VEC4");
+    let b_keys = g.floats(&[r.b.1.to_array(), r.b_end.to_array()], "VEC4");
+    let rest = format!(
+        r#""scene":0,"scenes":[{{"nodes":[0]}}],
+"nodes":[{{"name":"far","translation":{:?},"rotation":{:?},"children":[1]}},
+{{"name":"a","translation":{:?},"mesh":0,"children":[2]}},
+{{"name":"b","translation":{:?},"rotation":{:?},"mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pos}}},"indices":{idx}}}]}}],
+"animations":[{{"name":"go","samplers":[{{"input":{input},"output":{a_keys}}},{{"input":{input},"output":{b_keys}}}],
+"channels":[{{"sampler":0,"target":{{"node":1,"path":"rotation"}}}},{{"sampler":1,"target":{{"node":2,"path":"rotation"}}}}]}}]"#,
+        r.far.0.to_array(),
+        r.far.1.to_array(),
+        r.a.to_array(),
+        r.b.0.to_array(),
+        r.b.1.to_array(),
+    );
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.glb"));
+    g.write(&path, &rest);
+    path
+}
+
+/// A rig 1 km and 4 km from its model's origin poses in a space of its own: its rest palette is
+/// the identity, and a posed vertex lands where the same pose in f64 puts it, both to within the
+/// rounding of the rig's own size, not of its distance.
+#[test]
+fn a_far_rig_poses_to_the_rounding_of_its_own_size() {
+    // Rounding of f32 at a few meters, across a chain of three transforms.
+    const NEAR: f64 = 4e-6;
+    for d in [1000.0, 4000.0] {
+        let name = format!("far-rig-{d}");
+        let path = far_rig(&name, d);
+        let cooked = cook(&path, &name, GltfSettings::default());
+        let skel = cooked.skeleton();
+        assert_eq!(skel.names, ["", "a", "b"]);
+        let origin = skel.origin;
+        let mesh_e = cooked.entry("/mesh");
+        let info = MeshInfo::parse(&cooked.blob(mesh_e, 0)).unwrap();
+        // Each vertex in mesh space with its joint.
+        let mut vertices: Vec<(Vec3, usize)> = Vec::new();
+        for p in &info.pages {
+            let mut page = vec![0; p.resident_len as usize];
+            mesh::decode_page(&cooked.blob(mesh_e, p.blob as usize), &mut page).unwrap();
+            let view = PageView::new(&page, &info.header).unwrap();
+            for c in (0..view.cluster_count()).map(|i| view.cluster(i)) {
+                let joint = usize::from(info.parts[usize::from(c.part)].joint);
+                for v in 0..u32::from(c.vertex_count) {
+                    vertices.push((Vec3::from(view.position(&c, v)), joint));
+                }
+            }
+        }
+        assert!(vertices.iter().any(|v| v.1 == 2), "{d} m: no vertex on b");
+
+        let n = skel.joint_count();
+        let palette = |locals: &[Trs]| {
+            let (mut model, mut out) = (vec![Affine3::IDENTITY; n], vec![Affine3::IDENTITY; n]);
+            skel.model_pose(locals, &mut model);
+            skel.palette(&model, &mut out);
+            out
+        };
+        let rest = palette(&skel.rest);
+        let still = vertices
+            .iter()
+            .map(|&(x, j)| f64::from(rest[j].transform_point3(x).distance(x)))
+            .fold(0.0, f64::max);
+        assert!(
+            still <= NEAR,
+            "{d} m: the rest pose moves a vertex {still} m"
+        );
+
+        let (_, clip) = cooked.clips().pop().unwrap();
+        let mut locals = vec![Trs::IDENTITY; n];
+        clip.sample(clip.header.duration, &mut locals);
+        let posed = palette(&locals);
+        let r = FarRig::at(d);
+        let (from, to) = (r.world(false), r.world(true));
+        let apart = vertices
+            .iter()
+            .map(|&(x, j)| {
+                let at = x.as_dvec3() + origin;
+                let want = to[j - 1] * from[j - 1].inverse();
+                let got = posed[j].transform_point3(x).as_dvec3() + origin;
+                got.distance(want.transform_point3(at))
+            })
+            .fold(0.0, f64::max);
+        assert!(apart <= NEAR, "{d} m: a posed vertex lands {apart} m off");
+    }
 }

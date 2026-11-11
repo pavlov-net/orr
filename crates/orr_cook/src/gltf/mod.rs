@@ -17,8 +17,9 @@
 //!
 //! What moves does not stay in those models. A mesh moves if it has a skin, or a joint of a skin
 //! or a node an animation targets stands at or above it. Each [`Rig`] of them is a model of its
-//! own in scene space, named after its first joint (`node<i>` where that is empty or taken),
-//! with its skeleton and clips under that name; a scene that is all one rig stays the
+//! own in scene space, its mesh and skeleton in the skeleton's space at its origin
+//! ([`crate::skin::RigSpace`]), named after its first joint (`node<i>` where that is empty or
+//! taken), with its skeleton and clips under that name; a scene that is all one rig stays the
 //! whole-scene model. A selected model keeps what moves in it, with one skeleton: it holds what
 //! its meshes need of the scene below its node, and a node above or at it that moves it is the
 //! placement's to follow. Such a model's mesh is in bind space: a skinned primitive's vertices
@@ -78,7 +79,7 @@ use std::sync::Arc;
 use crate::par::prelude::*;
 use gltf::image::Source as ImageSource;
 use gltf::mesh::{Mode, Semantic};
-use orr_math::{DMat3, DMat4, Mat3, Quat, Vec3};
+use orr_math::{DMat3, DMat4, DVec3, Mat3, Quat, Vec3};
 use orr_pack::Hash32;
 use orr_pack::material::slot;
 use serde::Deserialize;
@@ -1705,7 +1706,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
                 None,
             ),
             (Some(sk), Some(s)) => (
-                DMat4::IDENTITY,
+                sk.space.to_skeleton(),
                 Some(Binding::Skin(sk.skin_joints(s.index()))),
             ),
             (Some(sk), None) => {
@@ -1814,13 +1815,14 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
             },
         ));
     }
-    join(&mut out, graph, &settings.joined).map_err(fail)?;
+    join(&mut out, graph, &b.skeletons, &settings.joined).map_err(fail)?;
     b.models.extend(out.into_iter().map(|m| m.1));
     // Hung copies stand in the bind space of the joint that moves them, so that its skinning
-    // matrix takes them from the rest pose to the pose.
+    // matrix takes them from the rest pose to the pose, placed in model space as the rig is.
     for (n, m) in hung {
         let sk = skeletons[m].as_ref().expect("a rig has a skeleton");
         let (joint, to_bind) = sk.attach(n, graph).map_err(fail)?;
+        let to_bind = sk.space.to_model() * to_bind;
         let locals = instance_locals(&inst, n).map_err(fail)?;
         let transforms: Vec<DMat4> = locals.into_iter().map(|l| to_bind * l).collect();
         let at = node(n);
@@ -1950,6 +1952,7 @@ fn select_models(
 fn join(
     models: &mut [(Option<usize>, SceneModel)],
     graph: &Graph,
+    skeletons: &[SceneSkeleton],
     patterns: &[String],
 ) -> Result<(), String> {
     if patterns.is_empty() {
@@ -1984,7 +1987,10 @@ fn join(
     for &i in &joined {
         let (node, m) = &mut models[i];
         let name = m.node.clone().unwrap_or_default();
-        let world = graph.world[node.expect("selected models have nodes")];
+        // A model with a skeleton stands at its origin.
+        let origin = m.skeleton.map_or(DVec3::ZERO, |s| skeletons[s].info.origin);
+        let world = graph.world[node.expect("selected models have nodes")]
+            * DMat4::from_translation(origin);
         // In f32, the precision of glTF's numbers: a chain of decimal translations that meets
         // the grid sums just off it in f64.
         let cols = world.as_mat4().to_cols_array_2d();
@@ -2105,7 +2111,7 @@ mod tests {
         let doc = data::open(json.as_bytes(), Path::new(""), false).unwrap();
         let data = Data::load(&doc, 0..views.len(), "t").unwrap();
         let mesh = doc.doc.meshes().next().unwrap();
-        let mirror = DMat4::from_scale(orr_math::DVec3::new(-1.0, 1.0, 1.0));
+        let mirror = DMat4::from_scale(DVec3::new(-1.0, 1.0, 1.0));
         let prims: Vec<_> = mesh
             .primitives()
             .zip([DMat4::IDENTITY, mirror])

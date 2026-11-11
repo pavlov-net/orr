@@ -1365,14 +1365,14 @@ fn cook() -> Arc<[u8]> {
                 AssetSpec {
                     name: "leaning worm".into(),
                     source: Source::Gltf {
-                        path: worm_glb_of("lean.glb", &[], true),
+                        path: worm_glb_of("lean.glb", &[], true, Vec3::ZERO),
                         settings: GltfSettings::default(),
                     },
                 },
                 AssetSpec {
                     name: "crowd".into(),
                     source: Source::Gltf {
-                        path: worm_glb_of("crowd.glb", &CROWD, false),
+                        path: worm_glb_of("crowd.glb", &CROWD, false, Vec3::ZERO),
                         settings: GltfSettings {
                             mesh: MeshSettings {
                                 deformation_bound: 1.0,
@@ -1394,6 +1394,13 @@ fn cook() -> Arc<[u8]> {
                     name: "unbounded worm".into(),
                     source: Source::Gltf {
                         path: worm_glb(),
+                        settings: GltfSettings::default(),
+                    },
+                },
+                AssetSpec {
+                    name: FAR_WORM.into(),
+                    source: Source::Gltf {
+                        path: worm_glb_of("far.glb", &[], false, FAR),
                         settings: GltfSettings::default(),
                     },
                 },
@@ -9543,19 +9550,23 @@ const WORM_HEIGHT: f32 = 1.6;
 /// blending from joint to joint with height, and a `bend` clip that sways the upper two
 /// joints about z over 2 s.
 fn worm_glb() -> PathBuf {
-    worm_glb_of("worm.glb", &[], false)
+    worm_glb_of("worm.glb", &[], false, Vec3::ZERO)
 }
 
-/// [`worm_glb`] at `name`, with `EXT_mesh_gpu_instancing` placing it at `copies`, and with `lean`
-/// a shear in the rest pose of its middle joint.
-fn worm_glb_of(name: &str, copies: &[[f32; 3]], lean: bool) -> PathBuf {
+/// Where [`FAR_WORM`] stands in its scene.
+const FAR: Vec3 = Vec3::new(1500.0, 0.0, -900.0);
+
+/// [`worm_glb`] at `name`, with `EXT_mesh_gpu_instancing` placing it at `copies`, with `lean`
+/// a shear in the rest pose of its middle joint, and standing at `stand` in its scene, bound
+/// there.
+fn worm_glb_of(name: &str, copies: &[[f32; 3]], lean: bool, stand: Vec3) -> PathBuf {
     let (rings, sides, radius) = (24u32, 16u32, 0.2f32);
     let mut positions: Vec<f32> = Vec::new();
     let mut normals: Vec<f32> = Vec::new();
     let mut joints: Vec<u8> = Vec::new();
     let mut weights: Vec<f32> = Vec::new();
     let mut vertex = |p: Vec3, n: Vec3| {
-        positions.extend(p.to_array());
+        positions.extend((p + stand).to_array());
         normals.extend(n.to_array());
         let y = p.y.clamp(0.0, WORM_HEIGHT);
         let (a, b) = (WORM_JOINTS[1], WORM_JOINTS[2]);
@@ -9597,9 +9608,8 @@ fn worm_glb_of(name: &str, copies: &[[f32; 3]], lean: bool) -> PathBuf {
     let inverse_binds: Vec<f32> = WORM_JOINTS
         .iter()
         .flat_map(|&y| {
-            [
-                1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., -y, 0., 1.,
-            ]
+            let [x, y, z] = (-stand - Vec3::Y * y).to_array();
+            [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., x, y, z, 1.]
         })
         .collect();
     let times = [0.0f32, 0.5, 1.0, 1.5, 2.0];
@@ -9650,7 +9660,7 @@ fn worm_glb_of(name: &str, copies: &[[f32; 3]], lean: bool) -> PathBuf {
     };
     let json = format!(
         r#"{{"asset":{{"version":"2.0"}},{used}"scene":0,"scenes":[{{"nodes":[0,3]}}],
-"nodes":[{{"name":"root","children":[1]}},
+"nodes":[{{"name":"root","translation":{root:?},"children":[1]}},
 {{"name":"mid",{middle},"children":[2]}},
 {{"name":"top","translation":[0,{t},0]}},
 {{"name":"body","mesh":0,"skin":0{body}}}],
@@ -9659,7 +9669,7 @@ fn worm_glb_of(name: &str, copies: &[[f32; 3]], lean: bool) -> PathBuf {
 "animations":[{{"name":"bend","samplers":[{{"input":6,"output":7,"interpolation":"LINEAR"}}],
 "channels":[{{"sampler":0,"target":{{"node":1,"path":"rotation"}}}},{{"sampler":0,"target":{{"node":2,"path":"rotation"}}}}]}}],
 "accessors":[
-{{"bufferView":{v_pos},"componentType":5126,"count":{vertices},"type":"VEC3","min":[{lo},0,{lo}],"max":[{hi},{h},{hi}]}},
+{{"bufferView":{v_pos},"componentType":5126,"count":{vertices},"type":"VEC3","min":[{x_lo},{y_lo},{z_lo}],"max":[{x_hi},{y_hi},{z_hi}]}},
 {{"bufferView":{v_nrm},"componentType":5126,"count":{vertices},"type":"VEC3"}},
 {{"bufferView":{v_jnt},"componentType":5121,"count":{vertices},"type":"VEC4"}},
 {{"bufferView":{v_wgt},"componentType":5126,"count":{vertices},"type":"VEC4"}},
@@ -9670,9 +9680,13 @@ fn worm_glb_of(name: &str, copies: &[[f32; 3]], lean: bool) -> PathBuf {
 "bufferViews":[{views}],
 "buffers":[{{"byteLength":{len}}}]}}"#,
         t = WORM_JOINTS[2] - WORM_JOINTS[1],
-        lo = -radius,
-        hi = radius,
-        h = WORM_HEIGHT,
+        root = stand.to_array(),
+        x_lo = stand.x - radius,
+        x_hi = stand.x + radius,
+        y_lo = stand.y,
+        y_hi = stand.y + WORM_HEIGHT,
+        z_lo = stand.z - radius,
+        z_hi = stand.z + radius,
         n_idx = indices.len(),
         views = views.join(","),
         len = bin.len(),
@@ -10118,6 +10132,109 @@ fn skin_error(mesh: &CpuMesh, positions: &[Vec3], clusters: &[u32], palette: &[A
         }
     }
     worst
+}
+
+/// The worm of [`worm_glb`] bound and standing [`FAR`] from its scene's origin.
+const FAR_WORM: &str = "far worm";
+
+/// `t` as an f64 transform, as [`Trs::to_affine`] builds it.
+fn trs_f64(t: &Trs) -> DMat4 {
+    use orr_math::{DMat3, DQuat};
+    let ([sx, sy, sz], [xy, xz, yz]) = (t.scale.map(f64::from), t.shear.map(f64::from));
+    let stretch = DMat3::from_cols(
+        DVec3::new(sx, 0.0, 0.0),
+        DVec3::new(xy, sy, 0.0),
+        DVec3::new(xz, yz, sz),
+    );
+    let rotation = DMat3::from_quat(DQuat::from_array(t.rotation.map(f64::from)));
+    let linear = DMat4::from_mat3(rotation * stretch);
+    DMat4::from_translation(Vec3::from(t.translation).as_dvec3()) * linear
+}
+
+/// A worm 1.5 km from its scene's origin skins where the same pose in f64 puts it: its skeleton
+/// and mesh stand in a space of their own, so the kernel's f32 keeps the rounding of the worm's
+/// size, not of how far it stands.
+#[test]
+fn a_far_worm_skins_where_f64_puts_it() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let (sk, clip) = rig_of(FAR_WORM, "bend");
+    let origin = sk.origin;
+    assert!(origin.distance(FAR.as_dvec3()) < 1.0, "origin {origin}");
+    let model = w.model(FAR_WORM);
+    let worms = place_worms_of(&mut w, model, &[(Mat3::IDENTITY, origin.as_vec3())], false);
+    let palette = palette_of(FAR_WORM, "bend", 0.7);
+    let shot = Shot::at(
+        origin + DVec3::new(0.2, 0.9, 3.2),
+        origin + DVec3::new(0.0, 0.8, 0.0),
+        1,
+    );
+    let g = shoot_with(&mut w, &worms.placed, &shot, |s| {
+        let out = s.transforms(worms.palette, 0, worms.joints).unwrap();
+        for (o, &p) in out.iter_mut().zip(&palette) {
+            *o = p.into();
+        }
+    });
+    let (k, st, clusters) = skinned_entry(&g.view, 0);
+    assert!(!clusters.is_empty(), "the copy skinned nothing");
+
+    // The same pose and skin in f64.
+    let n = sk.joint_count();
+    let mut locals = vec![Trs::IDENTITY; n];
+    clip.sample(0.7, &mut locals);
+    let mut model_pose: Vec<DMat4> = Vec::with_capacity(n);
+    for (j, &p) in sk.parents.iter().enumerate() {
+        let parent = match p {
+            orr_pack::skeleton::NO_PARENT => orr_math::Mat4::from(sk.root).as_dmat4(),
+            p => model_pose[usize::from(p)],
+        };
+        model_pose.push(parent * trs_f64(&locals[j]));
+    }
+    let skinning: Vec<DMat4> = (0..n)
+        .map(|j| model_pose[j] * orr_math::Mat4::from(sk.inverse_binds[j]).as_dmat4())
+        .collect();
+    let mesh = CpuMesh::of(FAR_WORM);
+    let total: u32 = (0..mesh.pages.len())
+        .map(|p| {
+            let v = PageView::new(&mesh.pages[p], &mesh.header).unwrap();
+            (0..v.cluster_count())
+                .map(|i| u32::from(v.cluster(i).vertex_count))
+                .sum::<u32>()
+        })
+        .sum();
+    let positions: Vec<Vec3> = read_buffer(k.positions.cast::<[f32; 3]>(), u64::from(total))
+        .into_iter()
+        .map(Vec3::from)
+        .collect();
+    let mut first = Vec::new();
+    let mut at = 0u32;
+    for page in &mesh.pages {
+        let view = PageView::new(page, &mesh.header).unwrap();
+        for i in 0..view.cluster_count() {
+            first.push(at);
+            at += u32::from(view.cluster(i).vertex_count);
+        }
+    }
+    let mut worst = 0.0f64;
+    for &c in &clusters {
+        let p = mesh.firsts.partition_point(|&f| f <= c) - 1;
+        let view = PageView::new(&mesh.pages[p], &mesh.header).unwrap();
+        let cl = view.cluster(c - mesh.firsts[p]);
+        for v in 0..u32::from(cl.vertex_count) {
+            let x = Vec3::from(view.position(&cl, v)).as_dvec3();
+            let (joints, weights) = (view.joints(&cl, v).unwrap(), view.weights(&cl, v).unwrap());
+            let want: DVec3 = (0..4)
+                .map(|i| {
+                    f64::from(weights[i]) * skinning[usize::from(joints[i])].transform_point3(x)
+                })
+                .sum();
+            let got = positions[(first[c as usize] + v) as usize].as_dvec3();
+            worst = worst.max((got + origin).distance(want + origin));
+        }
+    }
+    assert_eq!(st.clusters as usize, clusters.len());
+    assert!(worst < 1e-5, "skinned vertices {worst} m from the f64 skin");
+    assert_clean();
 }
 
 #[test]

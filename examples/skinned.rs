@@ -130,6 +130,8 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         })
         .expect("palette group");
     let transforms = w.transforms(group, 0, copies + 1).expect("transforms");
+    // The creature's mesh and palettes stand in its skeleton's space.
+    let origin = Affine3::from_translation(skeleton.origin.as_vec3());
     for (i, t) in transforms.iter_mut().take(copies as usize).enumerate() {
         let (x, z) = ((i as u32 % SIDE) as f32, (i as u32 / SIDE) as f32);
         let h = (i as u32).wrapping_mul(2_654_435_761);
@@ -140,8 +142,9 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             (z - (SIDE - 1) as f32 * 0.5 + 0.6 * jitter(8)) * SPACING,
         );
         let scale = 0.8 + 0.4 * (jitter(24) + 0.5);
-        *t = Affine3::from_mat3_translation(Mat3::from_rotation_y(jitter(16) * 6.0) * scale, at)
-            .into();
+        let place =
+            Affine3::from_mat3_translation(Mat3::from_rotation_y(jitter(16) * 6.0) * scale, at);
+        *t = (place * origin).into();
     }
     transforms[copies as usize] = Affine3::IDENTITY.into();
     w.add_skinned(&SkinnedDesc {

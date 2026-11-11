@@ -233,7 +233,10 @@ pub struct InstancePageRef<'a> {
     pub page: PageId,
     /// The palette group and entry of the joint the page hangs from, for a page that names one
     /// (`InstancePageHeader::frame_skeleton`): the entry takes its records from the joint's bind
-    /// space to its pose. None places them as stored.
+    /// space to its pose. The palette's space is the skeleton's, which stands at the palette
+    /// group's anchor: for a skeleton cooked with the page, at its origin
+    /// ([`SkeletonRef::origin`](crate::SkeletonRef::origin)) as the page is placed. None places
+    /// them as stored.
     pub frame: Option<(TransformGroupId, u32)>,
     /// Where copies of each model take their part poses; the copy's index in its pose block
     /// is its record index. Models not listed take none.

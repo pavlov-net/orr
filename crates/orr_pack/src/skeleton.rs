@@ -1,19 +1,24 @@
 //! Skeleton class: one mount blob holding a [`SkeletonHeader`] and its tables ([`SkeletonInfo`]).
 //!
-//! Joints are ordered parents first. A joint's model-space transform is its parent's times
-//! its local transform ([`Trs`]); a root joint's parent is [`SkeletonInfo::root`], which unlike
-//! a joint may shear or collapse an axis. The skinning matrix of
+//! Joints are ordered parents first. A joint's transform in skeleton space is its parent's
+//! times its local transform ([`Trs`]); a root joint's parent is [`SkeletonInfo::root`], which
+//! unlike a joint may shear or collapse an axis. The skinning matrix of
 //! joint `j`, the palette entry that [`crate::mesh::skin`] and GPU skinning read, is
 //! `model[j] x inverse_binds[j]`: it moves a mesh vertex from the bind pose into the pose.
 //! Mesh joint indices index this skeleton.
+//!
+//! Skeleton space is its model's mesh space: the space its palettes, its mesh's vertices and
+//! its model's bounds stand in. Its origin lies within the rig, so they hold small numbers
+//! wherever the rig stands, and [`SkeletonInfo::origin`] places it in the space the model was
+//! cooked in: a copy of the model placed by `T` stands where `T x translation(origin)` puts it.
 
 use bytemuck::{Pod, Zeroable};
-use orr_math::{Affine3, Mat3, Quat, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, Quat, Vec3};
 
 use crate::blob::{put_table, read, table};
 use crate::{AffineRows, Error, Result, Span};
 
-pub const SCHEMA: u16 = 1;
+pub const SCHEMA: u16 = 2;
 
 /// Parent of a root joint.
 pub const NO_PARENT: u16 = u16::MAX;
@@ -35,14 +40,16 @@ pub struct SkeletonHeader {
     pub parents: Span,
     /// Rest [`Trs`] per joint, relative to its parent.
     pub rest: Span,
-    /// [`AffineRows`] per joint: model space to the joint's bind space.
+    /// [`AffineRows`] per joint: skeleton space to the joint's bind space.
     pub inverse_binds: Span,
     /// u64 [`name_hash`] per joint.
     pub name_hashes: Span,
     /// [`Span`] per joint: byte offset and length of its UTF-8 name in the blob.
     pub names: Span,
-    /// Model space from the space of the root joints.
+    /// Skeleton space from the space of the root joints.
     pub root: AffineRows,
+    /// [`SkeletonInfo::origin`].
+    pub origin: [f64; 3],
 }
 
 /// A local transform: scale and shear, then rotation, then translation, so any 3x4 matrix has
@@ -117,8 +124,11 @@ pub fn name_hash(name: &str) -> u64 {
 /// A skeleton blob: the header and its tables.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SkeletonInfo {
-    /// Model space from the space of the root joints.
+    /// Skeleton space from the space of the root joints.
     pub root: Affine3,
+    /// Where skeleton space's origin stands in the space its model was cooked in, whose axes
+    /// it keeps.
+    pub origin: DVec3,
     pub parents: Vec<u16>,
     pub rest: Vec<Trs>,
     pub inverse_binds: Vec<Affine3>,
@@ -158,6 +168,7 @@ impl SkeletonInfo {
             .collect::<Result<_>>()?;
         Ok(Self {
             root: h.root.into(),
+            origin: DVec3::from_array(h.origin),
             parents,
             rest: table(blob, h.rest)?,
             inverse_binds: table::<AffineRows>(blob, h.inverse_binds)?
@@ -205,6 +216,7 @@ impl SkeletonInfo {
             name_hashes,
             names,
             root: self.root.into(),
+            origin: self.origin.to_array(),
         };
         out[..size_of::<SkeletonHeader>()].copy_from_slice(bytemuck::bytes_of(&h));
         out
@@ -219,7 +231,7 @@ impl SkeletonInfo {
         self.names.iter().position(|n| n == name)
     }
 
-    /// Model-space transform of every joint from local transforms (a clip sample or
+    /// Skeleton-space transform of every joint from local transforms (a clip sample or
     /// [`Self::rest`]).
     pub fn model_pose(&self, locals: &[Trs], out: &mut [Affine3]) {
         assert!(locals.len() >= self.joint_count() && out.len() >= self.joint_count());
@@ -232,7 +244,7 @@ impl SkeletonInfo {
         }
     }
 
-    /// Skinning matrices from model-space joint transforms: `model[j] x inverse_binds[j]`.
+    /// Skinning matrices from skeleton-space joint transforms: `model[j] x inverse_binds[j]`.
     pub fn palette(&self, model: &[Affine3], out: &mut [Affine3]) {
         for (j, ib) in self.inverse_binds.iter().enumerate() {
             out[j] = model[j] * *ib;

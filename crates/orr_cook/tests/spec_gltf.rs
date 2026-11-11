@@ -21,6 +21,7 @@ use orr_math::{Affine3, Mat4, Vec3};
 use orr_pack::clip::Clip;
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{self, MeshHeader, MeshInfo, PageView};
+use orr_pack::model::ModelInfo;
 use orr_pack::skeleton::{SkeletonInfo, Trs};
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, AssetId, Class, Target};
@@ -112,12 +113,14 @@ fn posed_at(sk: &SkeletonInfo, clip: &Clip, t: f32) -> Vec<Affine3> {
     palette(sk, &pose)
 }
 
-/// The mesh of `name` as its header and each triangle's corners with their cluster's part.
+/// The mesh of `name` as its header and each triangle's corners in model space with their
+/// cluster's part.
 fn part_corners(a: &Archive, name: &str) -> (MeshInfo, Vec<(u16, Vec3)>) {
     let e = a.find(AssetId::from_name(name)).unwrap();
     let info = MeshInfo::parse(&read(a, &a.blobs(e)[0])).unwrap();
+    let origin = mesh_origin(a, name);
     let tris = per_triangle(a, name, |view, c, t| {
-        t.map(|v| (c.part, Vec3::from(view.position(c, v))))
+        t.map(|v| (c.part, Vec3::from(view.position(c, v)) + origin))
     });
     (info, tris.into_iter().flatten().collect())
 }
@@ -1467,7 +1470,28 @@ fn palette(sk: &SkeletonInfo, pose: &[Trs]) -> Vec<Affine3> {
     let (mut model, mut palette) = (vec![Affine3::IDENTITY; n], vec![Affine3::IDENTITY; n]);
     sk.model_pose(pose, &mut model);
     sk.palette(&model, &mut palette);
-    palette
+    // In model space, as the mesh helpers give vertices.
+    let to_model = Affine3::from_translation(sk.origin.as_vec3());
+    let from_model = Affine3::from_translation(-sk.origin.as_vec3());
+    palette.iter().map(|&p| to_model * p * from_model).collect()
+}
+
+/// Where the mesh space of mesh entry `name`'s model stands in model space: its skeleton's
+/// origin.
+fn mesh_origin(a: &Archive, name: &str) -> Vec3 {
+    let model = name.strip_suffix("/mesh").expect("a mesh entry");
+    let e = a.find(AssetId::from_name(model)).unwrap();
+    let skeleton = ModelInfo::parse(&read(a, &a.blobs(e)[0]))
+        .unwrap()
+        .header
+        .skeleton;
+    match a.find(skeleton) {
+        Some(e) => SkeletonInfo::parse(&read(a, &a.blobs(e)[0]))
+            .unwrap()
+            .origin
+            .as_vec3(),
+        None => Vec3::ZERO,
+    }
 }
 
 /// Each triangle corner of `g/mesh` and its one joint.
@@ -1477,10 +1501,11 @@ fn skinned_corners(a: &Archive) -> Vec<(Vec3, usize)> {
 
 /// Each triangle corner of mesh `name` and its one joint.
 fn skinned_corners_of(a: &Archive, name: &str) -> Vec<(Vec3, usize)> {
+    let origin = mesh_origin(a, name);
     let tris = per_triangle(a, name, |view, c, t| {
         t.map(|v| {
             let joint = view.joints(c, v).unwrap()[0];
-            (Vec3::from(view.position(c, v)), usize::from(joint))
+            (Vec3::from(view.position(c, v)) + origin, usize::from(joint))
         })
     });
     tris.into_iter().flatten().collect()
@@ -1508,8 +1533,9 @@ fn inverse_binds_past_the_joints_are_unused() {
         ),
     );
     let (a, _) = cooked(&path);
-    let bind = skeleton(&a).inverse_binds[0].translation;
-    assert!(near(bind, Vec3::NEG_Y), "{bind}");
+    let sk = skeleton(&a);
+    let bind = sk.inverse_binds[0] * Affine3::from_translation(-sk.origin.as_vec3());
+    assert!(near(bind.translation, Vec3::NEG_Y), "{bind}");
 }
 
 /// L1580, L1584: "Any node **MAY** contain one mesh", and "The mesh **MAY** be skinned", so a
@@ -2027,7 +2053,8 @@ fn a_joint_holds_any_matrix() {
     let want = Mat4::from_cols_array(&[
         -1.0, 0.0, 0.0, 0.0, 2.0, 1.0, 0.0, 0.0, 0.5, 0.0, 3.0, 0.0, 1.0, 2.0, 3.0, 1.0,
     ]);
-    let got = Mat4::from(sk.rest[0].to_affine());
+    let to_model = Affine3::from_translation(sk.origin.as_vec3());
+    let got = Mat4::from(to_model * sk.root * sk.rest[0].to_affine());
     assert!(got.abs_diff_eq(want, 1e-5), "{got}");
 }
 

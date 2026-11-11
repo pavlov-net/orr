@@ -33,7 +33,10 @@ const SKIN_COUNTERS: u64 = 8;
 /// `copies` skinned copies of `model`, one instance slot each. Copy `i` is placed by
 /// transform `first + i` of `transforms` and posed by palette entries
 /// `palette_first + i x joints..` of `palette`, one skinning matrix per skeleton joint
-/// (`orr_pack::skeleton`), which a consumer's pose kernel or the CPU writes.
+/// (`orr_pack::skeleton`), which a consumer's pose kernel or the CPU writes. The palettes and the
+/// mesh stand in the skeleton's space, which the transform places: a copy at `T` stands where
+/// `T x translation(origin)` would put the model as it was cooked
+/// ([`SkeletonRef::origin`](crate::SkeletonRef::origin)).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SkinnedDesc {
     pub model: ModelId,

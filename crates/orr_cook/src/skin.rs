@@ -3,9 +3,10 @@
 //!
 //! A [`Rig`] is what one skeleton holds: the joints of the skins its meshes use, the nodes that
 //! animate what it moves, and every node between those. A node that animates nothing cooked is no
-//! joint. Static nodes above them fold into [`SkeletonInfo::root`], which keeps model space the
-//! scene's (or the frame's, in a framed model) and spends no joints; rigs that share no joint and
-//! no skin are separate rigs. Joints are ordered parents first (scene order, depth first); mesh
+//! joint. Static nodes above them fold into [`SkeletonInfo::root`] and spend no joints; rigs that
+//! share no joint and no skin are separate rigs. Model space is the scene's (or the frame's, in a
+//! framed model), and the skeleton, its palettes and its meshes stand in a space of their own
+//! within the rig ([`RigSpace`]). Joints are ordered parents first (scene order, depth first); mesh
 //! joint indices are remapped to that order. A joint no skin names gets the inverse of its rest
 //! transform as inverse bind, or identity when that collapses an axis. A node that skins bind
 //! differently has one joint per inverse bind, neighbors with the same parent and pose. A rigid
@@ -32,7 +33,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4, Mat4, Quat, Vec4};
+use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4, Mat4, Quat, Vec3, Vec4};
 use orr_pack::AssetId;
 use orr_pack::clip::{Clip, ClipHeader};
 use orr_pack::skeleton::{MAX_JOINTS, MAX_SKINNED_JOINTS, NO_PARENT, SkeletonInfo, Trs, slerp};
@@ -363,6 +364,116 @@ impl Rig {
     }
 }
 
+/// Where a skeleton's space stands in its model's: shifted, never turned, to an origin within the
+/// rig. In model space a rig far from the origin would pose with the differences of large
+/// numbers, in palettes and in the vertices they move; here they stay the size of the rig.
+///
+/// The root joints but the still joint give the box center of their rest translations, in whole
+/// units, `shift`, to the root, and the origin is the whole meters nearest where the root puts
+/// that point, so a mesh grid of a step up to a meter holds the same vertices shifted. Every
+/// palette entry `P` becomes `T(-origin) P T(origin)` and every mesh vertex `v` becomes
+/// `v - origin`: the same surface, posed alike, where a copy's placement takes the origin back.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RigSpace {
+    /// Skeleton space's origin in model space.
+    pub(crate) origin: DVec3,
+    /// What the root joints' translations give up, in the space they hang from.
+    shift: DVec3,
+    /// The still joint, which keeps its rest.
+    still: Option<u16>,
+}
+
+impl RigSpace {
+    /// Settles `info`, whose root (`root`) and inverse binds (`inverse_binds`) are given in model
+    /// space and in f64, in a space of its own: its root, the root joints' rest translations,
+    /// its inverse binds, which `inverse_binds` takes too, and its origin.
+    pub(crate) fn settle(
+        info: &mut SkeletonInfo,
+        root: DMat4,
+        inverse_binds: &mut [DMat4],
+        still: Option<u16>,
+    ) -> Self {
+        let roots: Vec<usize> = (0..info.joint_count())
+            .filter(|&j| info.parents[j] == NO_PARENT && still != Some(j as u16))
+            .collect();
+        let at = |j: usize| Vec3::from(info.rest[j].translation).as_dvec3();
+        let (lo, hi) = roots
+            .iter()
+            .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(lo, hi), &j| {
+                (lo.min(at(j)), hi.max(at(j)))
+            });
+        let shift = if roots.is_empty() {
+            DVec3::ZERO
+        } else {
+            ((lo + hi) / 2.0).round()
+        };
+        let origin = root.transform_point3(shift).round();
+        let space = Self {
+            origin,
+            shift,
+            still,
+        };
+        let settled = space.to_skeleton() * root * DMat4::from_translation(shift);
+        info.root = Affine3::from_mat4(settled.as_mat4());
+        info.origin = origin;
+        for &j in &roots {
+            info.rest[j].translation = space.translation(info, j, info.rest[j].translation);
+        }
+        let to_model = space.to_model();
+        for (j, ib) in inverse_binds.iter_mut().enumerate() {
+            // The still joint keeps the root's shift, which its inverse bind undoes.
+            let before = match still == Some(j as u16) {
+                true => DMat4::from_translation(-shift),
+                false => DMat4::IDENTITY,
+            };
+            *ib = before * *ib * to_model;
+        }
+        info.inverse_binds = inverse_binds
+            .iter()
+            .map(|ib| Affine3::from_mat4(ib.as_mat4()))
+            .collect();
+        space
+    }
+
+    /// Skeleton space from model space.
+    pub(crate) fn to_skeleton(self) -> DMat4 {
+        DMat4::from_translation(-self.origin)
+    }
+
+    /// Model space from skeleton space.
+    pub(crate) fn to_model(self) -> DMat4 {
+        DMat4::from_translation(self.origin)
+    }
+
+    /// The translation of joint `j` of skeleton `info` in skeleton space, from model space's
+    /// `t`: a root joint's gives up the shift.
+    pub(crate) fn translation(&self, info: &SkeletonInfo, j: usize, t: [f32; 3]) -> [f32; 3] {
+        if info.parents[j] != NO_PARENT || self.still == Some(j as u16) {
+            return t;
+        }
+        (Vec3::from(t).as_dvec3() - self.shift).as_vec3().to_array()
+    }
+
+    /// `channels` of skeleton `info`, keyed in model space, keyed in skeleton space.
+    pub(crate) fn channels(&self, info: &SkeletonInfo, channels: &mut [Channel]) {
+        for c in channels
+            .iter_mut()
+            .filter(|c| c.property == Property::Translation)
+        {
+            // A cubic spline's tangents are rates, which a shift leaves alone.
+            let step = match c.interpolation {
+                Interpolation::CubicSpline => 3,
+                _ => 1,
+            };
+            let first = step / 2;
+            for v in c.values.iter_mut().skip(first).step_by(step) {
+                let t = self.translation(info, c.joint, [v[0], v[1], v[2]]);
+                [v[0], v[1], v[2]] = t;
+            }
+        }
+    }
+}
+
 /// The inverse bind of a joint no skin binds: its rest pose's, or the identity where that
 /// collapses an axis.
 fn rest_bind(rest: DMat4) -> DMat4 {
@@ -389,11 +500,13 @@ pub(crate) struct Skeleton {
     joint_of: HashMap<usize, u16>,
     /// Per glTF skin: the skeleton joint of each of its joints.
     skins: HashMap<usize, Vec<u16>>,
+    /// In skeleton space.
     inverse_binds: Vec<DMat4>,
     /// The frame of its model.
     frame: Option<usize>,
     /// The joint of meshes with no joint above them.
     still: Option<u16>,
+    pub(crate) space: RigSpace,
 }
 
 impl Skeleton {
@@ -493,11 +606,13 @@ impl Skeleton {
             }
         }
         let root = rig.root(graph)?;
+        // `RigSpace::settle` sets the root, the inverse binds and the origin.
         let mut info = SkeletonInfo {
-            root: Affine3::from_mat4((after * root).as_mat4()),
+            root: Affine3::IDENTITY,
+            origin: DVec3::ZERO,
             parents: Vec::with_capacity(nodes.len()),
             rest: Vec::with_capacity(nodes.len()),
-            inverse_binds: Vec::with_capacity(nodes.len()),
+            inverse_binds: Vec::new(),
             names: Vec::with_capacity(nodes.len()),
         };
         let mut inverse_binds = Vec::with_capacity(nodes.len());
@@ -511,7 +626,6 @@ impl Skeleton {
                 info.parents.push(NO_PARENT);
                 info.rest.push(Trs::IDENTITY);
                 inverse_binds.push(ib);
-                info.inverse_binds.push(Affine3::from_mat4(ib.as_mat4()));
                 info.names.push(String::new());
                 continue;
             };
@@ -532,9 +646,9 @@ impl Skeleton {
                 None => rest_bind(rest_pose),
             };
             inverse_binds.push(ib);
-            info.inverse_binds.push(Affine3::from_mat4(ib.as_mat4()));
             info.names.push(node.name().unwrap_or_default().to_string());
         }
+        let space = RigSpace::settle(&mut info, after * root, &mut inverse_binds, still);
         let skins = bound
             .into_iter()
             .map(|(s, joints)| {
@@ -550,6 +664,7 @@ impl Skeleton {
             inverse_binds,
             frame: rig.frame,
             still,
+            space,
         })
     }
 
@@ -585,8 +700,9 @@ impl Skeleton {
 
     /// For a mesh node without a skin: the joint it follows rigidly (itself or its nearest
     /// skeleton ancestor in the model, else the still joint) and the transform from its local
-    /// space to bind space, so the joint's skinning matrix moves it with the joint. The joints of
-    /// one node pose alike, so it takes one whose bind has an inverse, keeping shape if one does.
+    /// space to bind space in skeleton space, so the joint's skinning matrix moves it with the
+    /// joint. The joints of one node pose alike, so it takes one whose bind has an inverse,
+    /// keeping shape if one does.
     pub(crate) fn attach(&self, node: usize, graph: &Graph) -> Result<(u16, DMat4), String> {
         for n in graph.chain(node, self.frame) {
             if let Some(&first) = self.joint_of.get(&n) {
@@ -601,7 +717,10 @@ impl Skeleton {
         let still = self
             .still
             .expect("`Rig::find` saw every mesh without a joint");
-        Ok((still, graph.in_model(self.frame, node)?))
+        Ok((
+            still,
+            self.space.to_skeleton() * graph.in_model(self.frame, node)?,
+        ))
     }
 
     /// Clips of every animation that moves the skeleton, with their names, for [`resample`].
@@ -660,10 +779,11 @@ impl Skeleton {
             if channels.is_empty() {
                 continue;
             }
-            let clip = ClipSource {
+            let mut clip = ClipSource {
                 channels,
                 span: spans[anim.index()],
             };
+            self.space.channels(&self.info, &mut clip.channels);
             clips.push((anim.index(), anim.name().unwrap_or_default(), clip));
         }
         let mut count: HashMap<&str, usize> = HashMap::new();
@@ -1249,6 +1369,7 @@ mod tests {
     fn one_joint(channels: Vec<Channel>, length: f64) -> (SkeletonInfo, ClipSource) {
         let info = SkeletonInfo {
             root: Affine3::IDENTITY,
+            origin: DVec3::ZERO,
             parents: vec![NO_PARENT],
             rest: vec![Trs::IDENTITY],
             inverse_binds: vec![Affine3::IDENTITY],

@@ -97,9 +97,46 @@ fn has(a: &Archive, name: &str) -> bool {
     a.find(AssetId::from_name(name)).is_some()
 }
 
-/// Position, normal and uv of every corner of a mesh entry.
+/// Where model `model`'s mesh space stands in model space: its skeleton's origin. A model the
+/// archive lacks has none.
+fn model_origin(a: &Archive, model: &str) -> Vec3 {
+    if !has(a, model) {
+        return Vec3::ZERO;
+    }
+    let skeleton = ModelInfo::parse(&blob(a, model, 0))
+        .unwrap()
+        .header
+        .skeleton;
+    match a.find(skeleton) {
+        Some(e) => SkeletonInfo::parse(&read(a, &a.blobs(e)[0]))
+            .unwrap()
+            .origin
+            .as_vec3(),
+        None => Vec3::ZERO,
+    }
+}
+
+/// [`model_origin`] of the model of mesh entry `name`.
+fn mesh_origin(a: &Archive, name: &str) -> Vec3 {
+    model_origin(a, name.strip_suffix("/mesh").expect("a mesh entry"))
+}
+
+/// The skinning matrices of `sk` posed by `pose`, in model space as the mesh helpers give
+/// vertices.
+fn palette_of(sk: &SkeletonInfo, pose: &[Trs]) -> Vec<Affine3> {
+    let n = sk.joint_count();
+    let (mut model, mut palette) = (vec![Affine3::IDENTITY; n], vec![Affine3::IDENTITY; n]);
+    sk.model_pose(pose, &mut model);
+    sk.palette(&model, &mut palette);
+    let to_model = Affine3::from_translation(sk.origin.as_vec3());
+    let from_model = Affine3::from_translation(-sk.origin.as_vec3());
+    palette.iter().map(|&p| to_model * p * from_model).collect()
+}
+
+/// Position in model space, normal and uv of every corner of a mesh entry.
 fn corners(a: &Archive, name: &str) -> Vec<(Vec3, Vec3, [f32; 2])> {
     let info = MeshInfo::parse(&blob(a, name, 0)).unwrap();
+    let origin = mesh_origin(a, name);
     let mut out = Vec::new();
     for p in &info.pages {
         let mut page = vec![0; p.resident_len as usize];
@@ -110,7 +147,7 @@ fn corners(a: &Archive, name: &str) -> Vec<(Vec3, Vec3, [f32; 2])> {
             for t in 0..u32::from(c.tri_count) {
                 for v in view.triangle(&c, t).map(u32::from) {
                     out.push((
-                        Vec3::from(view.position(&c, v)),
+                        Vec3::from(view.position(&c, v)) + origin,
                         Vec3::from(view.normal(&c, v)),
                         view.uv(&c, v, 0),
                     ));
@@ -121,9 +158,10 @@ fn corners(a: &Archive, name: &str) -> Vec<(Vec3, Vec3, [f32; 2])> {
     out
 }
 
-/// The transforms that place model `model`, in scene space.
+/// The transforms that place model `model`'s space, in scene space.
 fn copies(a: &Archive, model: &str) -> Vec<Mat4> {
     let want = AssetId::from_name(model);
+    let from_model = Mat4::from_translation(-model_origin(a, model));
     let mut out = Vec::new();
     for e in a
         .entries()
@@ -137,7 +175,7 @@ fn copies(a: &Archive, model: &str) -> Vec<Mat4> {
         for (p, mut m) in records {
             if info.prototypes[usize::from(p)].model == want {
                 m.translation += Vec3::from(cell.map(|c| c as f32)) * 256.0;
-                out.push(Mat4::from(m));
+                out.push(Mat4::from(m) * from_model);
             }
         }
     }
@@ -1914,9 +1952,10 @@ def Material "M"
     corner_tangents(&a, "u/mesh")
 }
 
-/// Position and tangent of every corner of a mesh entry.
+/// Position in model space and tangent of every corner of a mesh entry.
 fn corner_tangents(a: &Archive, name: &str) -> Vec<(Vec3, [f32; 4])> {
     let info = MeshInfo::parse(&blob(a, name, 0)).unwrap();
+    let origin = mesh_origin(a, name);
     let mut out = Vec::new();
     for p in &info.pages {
         let mut page = vec![0; p.resident_len as usize];
@@ -1925,7 +1964,7 @@ fn corner_tangents(a: &Archive, name: &str) -> Vec<(Vec3, [f32; 4])> {
         for i in 0..view.cluster_count() {
             let c = view.cluster(i);
             for v in 0..u32::from(c.vertex_count) {
-                let at = Vec3::from(view.position(&c, v));
+                let at = Vec3::from(view.position(&c, v)) + origin;
                 out.push((at, view.tangent(&c, v).expect("tangents")));
             }
         }
@@ -3665,9 +3704,10 @@ fn raw_takes_nothing_from_the_file() {
     }
 }
 
-/// Each corner of mesh entry `name` with its cluster's part.
+/// Each corner of mesh entry `name`, in model space, with its cluster's part.
 fn part_corners(a: &Archive, name: &str) -> Vec<(u16, Vec3)> {
     let info = MeshInfo::parse(&blob(a, name, 0)).unwrap();
+    let origin = mesh_origin(a, name);
     let mut out = Vec::new();
     for p in &info.pages {
         let mut page = vec![0; p.resident_len as usize];
@@ -3677,7 +3717,7 @@ fn part_corners(a: &Archive, name: &str) -> Vec<(u16, Vec3)> {
             let c = view.cluster(i);
             for t in 0..u32::from(c.tri_count) {
                 for v in view.triangle(&c, t).map(u32::from) {
-                    out.push((c.part, Vec3::from(view.position(&c, v))));
+                    out.push((c.part, Vec3::from(view.position(&c, v)) + origin));
                 }
             }
         }
@@ -3692,11 +3732,7 @@ fn posed(a: &Archive, model: &str, clip: &str, t: f32) -> (Clip, Vec<Affine3>) {
     let clip = Clip::parse(&blob(a, &name, 0), &blob(a, &name, 1)).unwrap();
     let mut pose = sk.rest.clone();
     clip.sample(t, &mut pose);
-    let n = sk.joint_count();
-    let (mut model, mut palette) = (vec![Affine3::IDENTITY; n], vec![Affine3::IDENTITY; n]);
-    sk.model_pose(&pose, &mut model);
-    sk.palette(&model, &mut palette);
-    (clip, palette)
+    (clip, palette_of(&sk, &pose))
 }
 
 /// `xformOp.h`: time samples of an op interpolate as the op's own value, so a full turn between
@@ -4078,9 +4114,7 @@ fn a_thin_turned_bind_keeps_the_points_off_its_plane() {
             ),
         );
         let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
-        let (mut model, mut palette) = (vec![Affine3::IDENTITY; 1], vec![Affine3::IDENTITY; 1]);
-        sk.model_pose(&sk.rest, &mut model);
-        sk.palette(&model, &mut palette);
+        let palette = palette_of(&sk, &sk.rest);
         let worst = corners(&a, "u/Hero/mesh")
             .iter()
             .map(|c| palette[0].transform_point3(c.0).distance(c.0))
@@ -4131,9 +4165,7 @@ fn a_skinned_prototype_is_a_model_placed_per_copy() {
     assert_eq!(copies(&a, "u/Hero").len(), 2);
     let model = ModelInfo::parse(&blob(&a, "u/Hero", 0)).unwrap();
     assert_eq!(model.header.skeleton, AssetId::from_name("u/Hero/skeleton"));
-    let (mut pose, mut palette) = (vec![Affine3::IDENTITY; 3], vec![Affine3::IDENTITY; 3]);
-    sk.model_pose(&sk.rest, &mut pose);
-    sk.palette(&pose, &mut palette);
+    let palette = palette_of(&sk, &sk.rest);
     let mesh = corners(&a, "u/Hero/mesh");
     assert_eq!(mesh.len(), 6);
     let joints = joints_of(&a, "u/Hero/mesh");
@@ -4301,9 +4333,7 @@ fn what_moves_in_a_skinned_prototype_moves() {
     );
     let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
     let n = sk.joint_count();
-    let (mut pose, mut palette) = (vec![Affine3::IDENTITY; n], vec![Affine3::IDENTITY; n]);
-    sk.model_pose(&sk.rest, &mut pose);
-    sk.palette(&pose, &mut palette);
+    let palette = palette_of(&sk, &sk.rest);
     let prop = Vec3::new(5.0, 3.0, 0.0);
     let held = palette[n - 1].transform_point3(prop);
     assert!(held.abs_diff_eq(prop, 1e-5), "{held}");
@@ -4484,9 +4514,7 @@ fn a_skeleton_outside_a_prototype_is_seen_from_its_first_copy() {
         ),
     );
     let sk = SkeletonInfo::parse(&blob(&a, "u/Proto/skeleton", 0)).unwrap();
-    let (mut pose, mut palette) = (vec![Affine3::IDENTITY; 2], vec![Affine3::IDENTITY; 2]);
-    sk.model_pose(&sk.rest, &mut pose);
-    sk.palette(&pose, &mut palette);
+    let palette = palette_of(&sk, &sk.rest);
     let joint = usize::from(joints_of(&a, "u/Proto/mesh")[0]);
     // The copy stands at x = 1, so the model holds the skeleton's pose 1 m the other way.
     let source = [Vec3::ZERO, Vec3::X, Vec3::Y].map(|p| p - Vec3::X);

@@ -25,7 +25,7 @@ use std::thread::Scope;
 use std::time::Instant;
 
 use ctt::Quality;
-use orr_math::{Vec2, Vec3, Vec4};
+use orr_math::{DVec3, Vec2, Vec3, Vec4};
 
 use orr_pack::material::{Material, slot};
 use orr_pack::model::{ModelHeader, ModelInfo};
@@ -202,6 +202,8 @@ struct Unit<'m> {
     /// For a done mesh or subdivision cage: its bounds and what its model's instance pages
     /// need.
     mesh: Option<(Aabb, ModelFacts)>,
+    /// For a done skeleton: its origin, which its model's instance pages place it by.
+    origin: Option<DVec3>,
     /// For a done texture: its header, which the estimates of the meshes reading it count.
     texture: Option<orr_pack::texture::TextureHeader>,
 }
@@ -224,8 +226,8 @@ enum Work<'m> {
     Model(Vec<AssetId>, AssetId),
     /// The same key as `deps[0]`, whose result it shares.
     Same,
-    /// The placements, the cell size, the catalog without models, and the mesh unit of
-    /// each prototype's model.
+    /// The placements, the cell size, the catalog without models, and the mesh and skeleton
+    /// units of each prototype's model.
     Instances(Cow<'m, Instances>, u8, Catalog, Vec<(String, usize)>),
     Raster(raster::Plan),
     Volume(volume::Plan<'m>),
@@ -837,6 +839,7 @@ impl<'m, 's> Run<'m, 's> {
                 triangles: 0,
                 state: State::Waiting,
                 mesh: None,
+                origin: None,
                 texture: None,
             });
             self.done(u, from, Some(entries), outcome, 0.0)?;
@@ -894,7 +897,7 @@ impl<'m, 's> Run<'m, 's> {
         let a = self.units[u].archive;
         let class = self.units[u].class;
         let name = self.units[u].name.clone();
-        let (entries, mesh, texture) = self.with_archive(a, &from, |arc| {
+        let (entries, mesh, origin, texture) = self.with_archive(a, &from, |arc| {
             let mut entries = entries.unwrap_or_else(|| (0..arc.entries().len()).collect());
             if class == Class::InstancePage as u16 {
                 entries.sort_by_key(|&e| instances::page_order(&name, arc.name(&arc.entries()[e])));
@@ -905,11 +908,13 @@ impl<'m, 's> Run<'m, 's> {
                 Some(Class::Subd) => subd_facts(arc, e),
                 _ => None,
             };
+            let origin = (class == Class::Skeleton as u16).then(|| skeleton_origin(arc, e));
             // Its head is a mount blob, in the index already read.
             let texture = (class == Class::Texture as u16)
                 .then(|| texture_head(arc, e.id).map(|(_, info)| info.header))
                 .transpose();
-            texture.map(|t| (entries, mesh, t))
+            let origin = origin.transpose()?;
+            texture.map(|t| (entries, mesh, origin, t))
         })??;
         let memory = match &from {
             From::Memory(arc) => arc.header().file_len,
@@ -928,6 +933,7 @@ impl<'m, 's> Run<'m, 's> {
             memory,
         });
         self.units[u].mesh = mesh;
+        self.units[u].origin = origin;
         self.units[u].texture = texture;
         let dependents = self.dependents.get_mut(u).map(std::mem::take);
         for d in dependents.into_iter().flatten() {
@@ -1061,6 +1067,7 @@ impl<'m, 's> Run<'m, 's> {
                 triangles: nu.triangles,
                 state: State::Waiting,
                 mesh: None,
+                origin: None,
                 texture: None,
             });
         }
@@ -1293,6 +1300,9 @@ impl<'m, 's> Run<'m, 's> {
                 for part in self.parts_of(model, &by_id)? {
                     meshes.push((p.model.clone(), part));
                 }
+                if let Some(skeleton) = self.skeleton_of(model, &by_id)? {
+                    meshes.push((p.model.clone(), skeleton));
+                }
                 for s in &p.sections {
                     if let Some(m) = &s.material {
                         let u = self
@@ -1333,6 +1343,7 @@ impl<'m, 's> Run<'m, 's> {
                 triangles: 0,
                 state: State::Waiting,
                 mesh: None,
+                origin: None,
                 texture: None,
             });
         }
@@ -1371,6 +1382,40 @@ impl<'m, 's> Run<'m, 's> {
                     })
             })
             .collect()
+    }
+
+    /// The skeleton unit of a model unit, if it has a skeleton.
+    fn skeleton_of(
+        &self,
+        model: usize,
+        by_id: &HashMap<(usize, AssetId), usize>,
+    ) -> Result<Option<usize>> {
+        let u = &self.units[model];
+        let id = match &u.work {
+            Some(Work::Model(_, skeleton)) => *skeleton,
+            _ => {
+                let State::Done(d) = &u.state else {
+                    unreachable!("a model unit without work is linked");
+                };
+                self.with_archive(u.archive, &d.from, |arc| {
+                    let e = &arc.entries()[d.entries[0]];
+                    let mut head = vec![0; arc.blobs(e)[0].raw_len as usize];
+                    arc.read(&arc.blobs(e)[0], &mut head)?;
+                    Ok::<_, Error>(ModelInfo::parse(&head)?.header.skeleton)
+                })??
+            }
+        };
+        if id == AssetId::NONE {
+            return Ok(None);
+        }
+        let skeleton = by_id
+            .get(&(u.archive, id))
+            .copied()
+            .ok_or_else(|| Error::UnknownModel {
+                asset: u.name.clone(),
+                model: format!("skeleton {id}"),
+            })?;
+        Ok(Some(skeleton))
     }
 
     /// Links every unit whose key is in the replaced archive or the cache; the others wait
@@ -1674,13 +1719,19 @@ impl<'m, 's> Run<'m, 's> {
         's: 't,
     {
         let mut work = self.units[u].work.take().expect("waiting units have work");
-        if let Work::Instances(_, _, catalog, meshes) = &mut work {
-            for (model, mesh) in meshes.drain(..) {
-                if let Some((_, facts)) = self.units[mesh].mesh {
+        if let Work::Instances(_, _, catalog, parts) = &mut work {
+            for (model, part) in parts.iter() {
+                if let Some((_, facts)) = self.units[*part].mesh {
                     catalog
-                        .entry(model)
+                        .entry(model.clone())
                         .and_modify(|f| *f = f.join(facts))
                         .or_insert(facts);
+                }
+            }
+            for (model, part) in parts.drain(..) {
+                if let (Some(origin), Some(f)) = (self.units[part].origin, catalog.get_mut(&model))
+                {
+                    f.origin = origin;
                 }
             }
         }
@@ -2012,8 +2063,17 @@ fn mesh_facts(a: &Archive, e: &orr_pack::Entry) -> Option<(Aabb, ModelFacts)> {
             position_exponent: info.header.position_exponent,
             finest_exponent: info.header.position_exponent,
             bounds: info.header.bounds,
+            origin: DVec3::ZERO,
         },
     ))
+}
+
+/// The origin of skeleton entry `e`, whose head is a mount blob.
+fn skeleton_origin(a: &Archive, e: &orr_pack::Entry) -> Result<DVec3> {
+    let b = &a.blobs(e)[0];
+    let mut head = vec![0; b.raw_len as usize];
+    a.read(b, &mut head)?;
+    Ok(orr_pack::skeleton::SkeletonInfo::parse(&head)?.origin)
 }
 
 fn subd_facts(a: &Archive, e: &orr_pack::Entry) -> Option<(Aabb, ModelFacts)> {
@@ -2029,6 +2089,7 @@ fn subd_facts(a: &Archive, e: &orr_pack::Entry) -> Option<(Aabb, ModelFacts)> {
             position_exponent: i8::MIN,
             finest_exponent: i8::MIN,
             bounds: info.header.bounds,
+            origin: DVec3::ZERO,
         },
     ))
 }

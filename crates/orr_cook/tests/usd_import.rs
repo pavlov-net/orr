@@ -760,9 +760,10 @@ fn bound_vertices_land_where_the_stage_puts_them() {
         let (mut model, mut palette) = (vec![Affine3::IDENTITY; 2], vec![Affine3::IDENTITY; 2]);
         sk.model_pose(&sk.rest, &mut model);
         sk.palette(&model, &mut palette);
+        // The mesh and its palettes stand in the skeleton's space, at its origin.
         let posed = triangles(&a, "u/Hero/mesh").1[0]
             .0
-            .map(|p| palette[1].transform_point3(p.into()));
+            .map(|p| palette[1].transform_point3(p.into()) + sk.origin.as_vec3());
         for p in [Vec3::ZERO, Vec3::X, Vec3::new(0.0, 1.0, 1.0)] {
             let w = want.transform_point3(p);
             assert!(

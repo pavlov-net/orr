@@ -13,7 +13,8 @@
 //! Imageable prim at or above it that authors one.
 //! Instanceable prims are expanded.
 //!
-//! Models, every one in scene units and axes:
+//! Models, every one in scene units and axes; a model with a skeleton stands in the skeleton's
+//! space, at its origin in the model's ([`crate::skin::RigSpace`]), and its copies take it:
 //! - Each `SkelRoot` is a model named after it, in scene space (bind space), of the skinned
 //!   meshes under it (those with joint influences and a bound skeleton), cooked as
 //!   `<asset>/<root>/skeleton` with clips `<asset>/<root>/clip/<animation>`. `schemas.dox` makes
@@ -131,7 +132,7 @@ use crate::instances::InstanceMotion;
 use crate::mesh::{MeshData, MeshSettings, MeshSource, PartData, Pivots, SectionData, Skin};
 use crate::patch::{self, MaterialPatch, MeshPatch};
 use crate::shading;
-use crate::skin::{self, Channel, ClipSettings, ClipSource, Rig, Rigging};
+use crate::skin::{self, Channel, ClipSettings, ClipSource, Rig, RigSpace, Rigging};
 use crate::subd::SubdSettings;
 use crate::texture::material::{ImageData, ImageFile, ImageTile, TextureRules};
 use crate::texture::tiles::{UDIM, udim_cell};
@@ -1030,8 +1031,9 @@ impl<'s> Importer<'s> {
             )?;
         }
         // One skeleton per model that skins, from what its meshes bind: its prim path, the
-        // skeleton, the root's node, the prims that bind it and the name its entries go under.
-        let mut skels: Vec<(String, skel::Skel, usize, Vec<usize>, String)> = Vec::new();
+        // skeleton and its space, the root's node, the prims that bind it and the name its
+        // entries go under.
+        let mut skels: Vec<(String, skel::Skel, RigSpace, usize, Vec<usize>, String)> = Vec::new();
         for m in 0..models.len() {
             if !models[m].skinned || models[m].rig_skeleton.is_some() {
                 continue;
@@ -1062,12 +1064,11 @@ impl<'s> Importer<'s> {
                     built.add_still()?;
                 }
                 // A baked copy keeps its bind pose: the skeleton takes the transform.
-                let after = Affine3::from_mat4(linear.as_mat4());
-                built.info.root = after * built.info.root;
+                let space = built.settle(linear);
                 let root = models[h].root.expect("skeletal roots have prims");
                 let prefix = models[h].name.clone().unwrap_or_default();
                 let path = path.as_str().to_string();
-                skels.push((path, built, root, sites.clone(), prefix));
+                skels.push((path, built, space, root, sites.clone(), prefix));
                 models[h].skinned = true;
                 models[h].skeleton = Some(skels.len() - 1);
             }
@@ -1188,6 +1189,16 @@ impl<'s> Importer<'s> {
                 }
             }
             let skeleton = models[o].skeleton.and_then(|k| skels.get(k)).map(|s| &s.1);
+            // Each holder's skeleton stands in a space of its own, which its vertices take.
+            let origin = |m: usize| match models[m].skeleton {
+                Some(k) if k < skels.len() => skels[k].1.info.origin,
+                Some(k) => rig_skeletons[k - skels.len()].info.origin,
+                None => DVec3::ZERO,
+            };
+            let from_model: Vec<DMat4> = holders[o]
+                .iter()
+                .map(|&(m, _)| DMat4::from_translation(-origin(m)))
+                .collect();
             let rig = rigs.get(&o);
             let (skin, transform, part) = match (bound.get(&i), skeleton, rig) {
                 (Some(b), Some(sk), _) => {
@@ -1292,13 +1303,14 @@ impl<'s> Importer<'s> {
                     }
                 }
             }
-            for (&(m, linear), turned) in holders[o].iter().zip(&turned) {
+            let placed = holders[o].iter().zip(&turned).zip(&from_model);
+            for ((&(m, linear), turned), from_model) in placed {
                 let turned_material = |f: usize| {
                     let m = face_material(f);
                     turned.get(&m).copied().unwrap_or(m)
                 };
                 let placing = Placing {
-                    transform: applied(linear),
+                    transform: *from_model * applied(linear),
                     face_material: &turned_material,
                     skin: skin.as_deref(),
                     part,
@@ -1364,8 +1376,8 @@ impl<'s> Importer<'s> {
             return Err("the stage has no triangles".into());
         }
         let mut skeletons = Vec::with_capacity(skels.len());
-        for (path, sk, root, sites, prefix) in skels {
-            let clips = self.clips(&path, &sk, root, &sites)?;
+        for (path, sk, space, root, sites, prefix) in skels {
+            let clips = self.clips(&path, (&sk, &space), root, &sites)?;
             skeletons.push(SceneSkeleton {
                 prefix,
                 info: sk.info,
@@ -1563,14 +1575,17 @@ impl<'s> Importer<'s> {
                 models[h].skinned = !rig.rigid;
                 let joints = 0..built.info.joint_count();
                 models[h].pivots = rig.rigid.then(|| {
-                    let at = |j: usize| built.binds[j].w_axis.truncate().as_vec3().to_array();
-                    joints.map(at).collect()
+                    let at = |j: usize| built.binds[j].w_axis.truncate() - built.info.origin;
+                    joints.map(|j| at(j).as_vec3().to_array()).collect()
                 });
                 models[h].rig_skeleton = Some(skeletons.len());
                 if k == 0 {
                     channels = self.xform_channels(&built.prims)?;
                 }
-                let clip = self.xform_clip(&channels);
+                let mut clip = self.xform_clip(&channels);
+                if let Some(c) = &mut clip {
+                    built.space.channels(&built.info, &mut c.channels);
+                }
                 skeletons.push(SceneSkeleton {
                     prefix: models[h].name.clone().unwrap_or_default(),
                     info: built.info.clone(),
@@ -1626,19 +1641,22 @@ impl<'s> Importer<'s> {
             .enumerate()
             .map(|(k, &n)| (n, k as u16 + first))
             .collect();
+        // `RigSpace::settle` sets the root, the inverse binds and the origin.
         let mut info = SkeletonInfo {
-            root: Affine3::from_mat4((after * root).as_mat4()),
+            root: Affine3::IDENTITY,
+            origin: DVec3::ZERO,
             parents: Vec::with_capacity(count),
             rest: Vec::with_capacity(count),
-            inverse_binds: Vec::with_capacity(count),
+            inverse_binds: Vec::new(),
             names: Vec::with_capacity(count),
         };
+        let mut inverse_binds = Vec::with_capacity(count);
         let mut binds = Vec::with_capacity(count);
         if rig.still {
             let ib = inverse_bind(root);
             info.parents.push(NO_PARENT);
             info.rest.push(Trs::IDENTITY);
-            info.inverse_binds.push(Affine3::from_mat4(ib.as_mat4()));
+            inverse_binds.push(ib);
             info.names.push(String::new());
             binds.push(inverse_bind(ib));
         }
@@ -1651,16 +1669,19 @@ impl<'s> Importer<'s> {
             info.parents.push(parent.unwrap_or(NO_PARENT));
             info.rest.push(skel::prim_trs(path, node.local)?);
             let ib = inverse_bind(rest);
-            info.inverse_binds.push(Affine3::from_mat4(ib.as_mat4()));
+            inverse_binds.push(ib);
             info.names.push(node.name.clone());
             binds.push(inverse_bind(ib));
         }
+        let still = rig.still.then_some(0);
+        let space = RigSpace::settle(&mut info, after * root, &mut inverse_binds, still);
         Ok(skel::PrimRig {
             info,
+            space,
             prims: nodes.iter().map(|&n| (n, joint_of[&n])).collect(),
             joint_of,
             binds,
-            still: rig.still.then_some(0),
+            still,
             rigid: rig.rigid,
         })
     }
@@ -2689,7 +2710,7 @@ impl<'s> Importer<'s> {
     fn clips(
         &self,
         path: &str,
-        sk: &skel::Skel,
+        (sk, space): (&skel::Skel, &RigSpace),
         root: usize,
         sites: &[usize],
     ) -> Result<Vec<(String, ClipSource)>, String> {
@@ -2703,11 +2724,12 @@ impl<'s> Importer<'s> {
         }));
         sources.sort_unstable();
         sources.dedup();
-        let xforms = self.xform_channels(&sk.prims)?;
+        let mut xforms = self.xform_channels(&sk.prims)?;
+        space.channels(&sk.info, &mut xforms);
         let mut clips = Vec::new();
         for i in sources {
             let node = &self.nodes[i];
-            if let Some(c) = sk.clip(&node.prim, &self.timeline, &xforms)? {
+            if let Some(c) = sk.clip(&node.prim, &self.timeline, &xforms, space)? {
                 clips.push((node.name.clone(), c));
             }
         }

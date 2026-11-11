@@ -3,9 +3,10 @@
 //!
 //! Joints keep the skeleton's order, which must list parents first; a joint's parent is its
 //! nearest ancestor path among them, a joint without one being a root. Model space is the
-//! stage's (Y up, meters): [`SkeletonInfo::root`] is the skeleton prim's world transform,
-//! inverse binds are those of the bind transforms in model space, and rest transforms come
-//! from `restTransforms` (from the bind transforms without them). A bind transform with no
+//! stage's (Y up, meters): the root is the skeleton prim's world transform, inverse binds are
+//! those of the bind transforms in model space, and rest transforms come from `restTransforms`
+//! (from the bind transforms without them); [`Skel::settle`] then moves them into a space of
+//! their own within the rig ([`RigSpace`]). A bind transform with no
 //! inverse takes its pseudo-inverse, so the points bound to it land on the surface it flattens
 //! to. Skinned points are `geomBindTransform` (unset if it is not a matrix) times
 //! the authored points in the skeleton's model space, or its own space in scene units and axes
@@ -39,7 +40,7 @@ use super::Timeline;
 use super::mesh::Influence;
 use super::read::{PrimReader, matrix, quat};
 use crate::import::{collapses, singular};
-use crate::skin::{self, Channel, ClipSource, Interpolation, Property};
+use crate::skin::{self, Channel, ClipSource, Interpolation, Property, RigSpace};
 
 /// The attributes of a `SkelAnimation` that pose its joints.
 pub(super) const ANIMATED: [&str; 3] = ["translations", "rotations", "scales"];
@@ -60,6 +61,9 @@ pub(super) struct Skel {
     to_bind: DMat4,
     /// Model space from the space of its root joints.
     root: DMat4,
+    /// Per joint, the joint's bind space from model space, which [`Self::settle`] puts in
+    /// `info`.
+    inverse_binds: Vec<DMat4>,
 }
 
 /// The prims a mesh's skinning attributes come from: its own, or the nearest ancestor's up to
@@ -79,10 +83,11 @@ fn above(joint: &str) -> Option<&str> {
 /// A skeleton of prims.
 pub(super) struct PrimRig {
     pub(super) info: SkeletonInfo,
+    pub(super) space: RigSpace,
     /// The prim of each joint that has one, with its joint.
     pub(super) prims: Vec<(usize, u16)>,
     pub(super) joint_of: HashMap<usize, u16>,
-    /// Per joint, bind space from its space.
+    /// Per joint, bind space from its space, in model space.
     pub(super) binds: Vec<DMat4>,
     pub(super) still: Option<u16>,
     /// One rigid part per joint, where the model's cages take no parts.
@@ -226,22 +231,23 @@ impl Skel {
             to_model
         };
         let from_bind = bind_inverse(to_bind);
+        // `Self::settle` sets the root, the inverse binds and the origin.
         let mut info = SkeletonInfo {
-            root: Affine3::from_mat4(to_model.as_mat4()),
+            root: Affine3::IDENTITY,
+            origin: DVec3::ZERO,
             parents,
             rest: Vec::with_capacity(joints.len()),
-            inverse_binds: Vec::with_capacity(joints.len()),
+            inverse_binds: Vec::new(),
             names: joints
                 .iter()
                 .map(|j| j.rsplit('/').next().unwrap_or(j).to_string())
                 .collect(),
         };
+        let mut inverse_binds = Vec::with_capacity(joints.len());
         for i in 0..joints.len() {
             info.rest
                 .push(prim_trs(&format!("{path} joint {}", joints[i]), rest[i])?);
-            info.inverse_binds.push(Affine3::from_mat4(
-                (bind_inverse(binds[i]) * from_bind).as_mat4(),
-            ));
+            inverse_binds.push(bind_inverse(binds[i]) * from_bind);
         }
         Ok(Self {
             info,
@@ -252,6 +258,7 @@ impl Skel {
             still: None,
             to_bind,
             root: to_model,
+            inverse_binds,
         })
     }
 
@@ -265,9 +272,7 @@ impl Skel {
         }
         self.info.parents.push(NO_PARENT);
         self.info.rest.push(Trs::IDENTITY);
-        self.info
-            .inverse_binds
-            .push(Affine3::from_mat4(bind_inverse(self.root).as_mat4()));
+        self.inverse_binds.push(bind_inverse(self.root));
         self.info.names.push(String::new());
         self.still = Some(joint as u16);
         Ok(())
@@ -298,7 +303,6 @@ impl Skel {
         self.info.parents = parents.chain(own).collect();
         self.by_name.values_mut().for_each(|j| *j += by);
         self.first = by;
-        self.info.root = Affine3::from_mat4(root.as_mat4());
         self.root = root;
         let mut rest = Vec::with_capacity(added);
         let mut binds = Vec::with_capacity(added);
@@ -306,13 +310,20 @@ impl Skel {
         for (k, (node, name, local, ib)) in prims.into_iter().enumerate() {
             self.prims.push((node, k as u16));
             rest.push(local);
-            binds.push(Affine3::from_mat4(ib.as_mat4()));
+            binds.push(ib);
             names.push(name);
         }
         self.info.rest.splice(0..0, rest);
-        self.info.inverse_binds.splice(0..0, binds);
+        self.inverse_binds.splice(0..0, binds);
         self.info.names.splice(0..0, names);
         Ok(())
+    }
+
+    /// Settles the skeleton in a space of its own, with `after` applied to model space after its
+    /// root, once its joints are all there.
+    pub(super) fn settle(&mut self, after: DMat4) -> RigSpace {
+        let root = after * self.root;
+        RigSpace::settle(&mut self.info, root, &mut self.inverse_binds, self.still)
     }
 
     /// Skin influences per point of a bound mesh `path`, and bind space from its points.
@@ -414,12 +425,13 @@ impl Skel {
 
     /// The clip of one animation prim beside the channels `xforms` of the prims above, over the
     /// stage's `timeline`, or `None` when it names none of the joints, has no time samples or is
-    /// not valid at any of them.
+    /// not valid at any of them. The skeleton is settled in `space`, and `xforms` with it.
     pub(super) fn clip(
         &self,
         anim: &usd::Prim,
         timeline: &Timeline,
         xforms: &[Channel],
+        space: &RigSpace,
     ) -> Result<Option<ClipSource>, String> {
         let path = anim.path().as_str().to_string();
         let names = PrimReader {
@@ -470,7 +482,7 @@ impl Skel {
                 locals.push(match &trs {
                     (Some(tr), Some(ro), Some(sc)) => Trs {
                         rotation: quat(&ro[4 * i..]).normalize().as_quat().to_array(),
-                        translation: three(tr),
+                        translation: space.translation(&self.info, usize::from(j), three(tr)),
                         scale: three(sc),
                         shear: [0.0; 3],
                     },

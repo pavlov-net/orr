@@ -58,12 +58,12 @@ pub(crate) struct Scene {
 
 impl Scene {
     /// Per skeleton, each joint's reach: the farthest, in the joint's own space (its inverse
-    /// bind of model space), from its origin of anything it moves. That is the vertices and cage
-    /// points weighted to it and the parts it poses, in their bind pose, and the copies that
+    /// bind of skeleton space), from its origin of anything it moves. That is the vertices and
+    /// cage points weighted to it and the parts it poses, in their bind pose, and the copies that
     /// hang from it: their model's points as placed, or as their rows move them while the
-    /// skeleton's clips run. Each point stands off by as much as its model's displacement can
-    /// move it, which the joint may carry along or which may follow the posed normal
-    /// ([`Reach`]).
+    /// skeleton's clips run, in model space, where the skeleton's origin places its space. Each
+    /// point stands off by as much as its model's displacement can move it, which the joint may
+    /// carry along or which may follow the posed normal ([`Reach`]).
     pub(crate) fn reaches(&self) -> Vec<Vec<Reach>> {
         let mut out: Vec<Vec<Reach>> = self
             .skeletons
@@ -129,7 +129,12 @@ impl Scene {
                 .iter()
                 .find(|m| m.node.as_ref() == Some(&copies.model));
             let model = model.expect("copies place a model of the scene");
-            let ib = binds[s][usize::from(joint)];
+            let origin = self.skeletons[s].info.origin;
+            let ib = binds[s][usize::from(joint)] * DMat4::from_translation(-origin);
+            // A model with a skeleton stands at its origin.
+            let own = model
+                .skeleton
+                .map_or(DVec3::ZERO, |k| self.skeletons[k].info.origin);
             let reach = &mut out[s][usize::from(joint)];
             let points: Vec<DVec3> = model.points().collect();
             let lift = self.lift(model);
@@ -138,7 +143,7 @@ impl Scene {
             match &copies.motion {
                 None => {
                     let (center, radius) = sphere(&points);
-                    let radius = radius + lift;
+                    let (center, radius) = (center + own, radius + lift);
                     for p in &copies.placed {
                         let linear = DMat3::from_mat4(ib) * p.linear.as_dmat3();
                         let at = ib.transform_point3(p.position + p.linear.as_dmat3() * center);
@@ -150,9 +155,10 @@ impl Scene {
                     let (lo, hi) = spans.fold((f64::MAX, f64::MIN), |(lo, hi), (start, length)| {
                         (lo.min(start), hi.max(start + length))
                     });
-                    let right = points.iter().map(|&p| motion.right.transform_point3(p));
-                    let radius = right.map(DVec3::length).fold(0.0, f64::max);
-                    let radius = radius + spectral_norm(DMat3::from_mat4(motion.right)) * lift;
+                    let right = motion.right * DMat4::from_translation(own);
+                    let placed = points.iter().map(|&p| right.transform_point3(p));
+                    let radius = placed.map(DVec3::length).fold(0.0, f64::max);
+                    let radius = radius + spectral_norm(DMat3::from_mat4(right)) * lift;
                     *carried = carried.max(moving_reach(ib, motion, (lo, hi), radius));
                 }
             }
@@ -239,7 +245,8 @@ impl SceneModel {
 /// The placements of one model that share pages.
 pub(crate) struct PlacedModel {
     pub(crate) model: String,
-    /// In scene space, or the bind space of `frame`'s joint.
+    /// Of the model's space, which pages take its skeleton's origin into: in scene space, or the
+    /// bind space of `frame`'s joint where its skeleton's origin places it in model space.
     pub(crate) placed: Vec<Placed>,
     /// Index into [`Scene::skeletons`] and the joint the placements hang from.
     pub(crate) frame: Option<(usize, u16)>,

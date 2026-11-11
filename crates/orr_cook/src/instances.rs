@@ -146,7 +146,8 @@ impl Form {
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrototypeSpec {
-    /// Asset name of a model cooked by the same manifest.
+    /// Asset name of a model cooked by the same manifest. A record places the model as it was
+    /// cooked, and its page takes the origin of its skeleton's space, which its mesh stands in.
     pub model: String,
     /// Instance flags, stored as given.
     pub flags: u32,
@@ -180,6 +181,9 @@ pub(crate) struct ModelFacts {
     pub(crate) finest_exponent: i8,
     /// Rest-pose bounds, model space.
     pub(crate) bounds: Aabb,
+    /// Where the model's mesh space stands in the space its records place: its skeleton's
+    /// origin, which every record takes.
+    pub(crate) origin: DVec3,
 }
 
 impl ModelFacts {
@@ -193,6 +197,7 @@ impl ModelFacts {
             position_exponent: self.position_exponent.max(o.position_exponent),
             finest_exponent: self.finest_exponent.min(o.finest_exponent),
             bounds,
+            origin: self.origin,
         }
     }
 }
@@ -225,21 +230,41 @@ pub(crate) fn cook(
     let mut cells: BTreeMap<[i32; 3], Vec<usize>> = BTreeMap::new();
     let mut rel = Vec::with_capacity(src.records.len());
     for (i, p) in src.records.iter().enumerate() {
-        let c = (p.position() / edge).floor();
+        let origin = prototypes[usize::from(p.prototype)].facts.origin;
+        let position = p.position() + p.linear() * origin;
+        let c = (position / edge).floor();
         if c.abs().max_element() > f64::from(i32::MAX) {
             return Err(fail(
                 name,
                 format!("placement {i} is outside the cell range"),
             ));
         }
-        rel.push(p.position() - c * edge);
+        rel.push(position - c * edge);
         cells.entry(c.as_ivec3().to_array()).or_default().push(i);
     }
 
     let mut cells: Vec<_> = cells.into_iter().collect();
     cells.sort_by_key(|(c, _)| morton(*c));
     for (cell, records) in &cells {
-        let pages = split_cell(&rel, records, edge);
+        // A moving page has one `motion_right`, which takes its model's origin, so models of
+        // other origins move on pages of their own.
+        let mut by_origin: Vec<(DVec3, Vec<usize>)> = Vec::new();
+        for &i in records {
+            let origin = prototypes[usize::from(src.records[i].prototype)]
+                .facts
+                .origin;
+            match by_origin
+                .iter_mut()
+                .find(|o| src.motion.is_none() || o.0 == origin)
+            {
+                Some(o) => o.1.push(i),
+                None => by_origin.push((origin, vec![i])),
+            }
+        }
+        let mut pages = Vec::new();
+        for (_, records) in &by_origin {
+            pages.extend(split_cell(&rel, records, edge));
+        }
         for (page, members) in pages.into_iter().enumerate() {
             let built = build_page(name, src, &prototypes, *cell, &rel, &members, edge)?;
             let info = built.info.to_bytes();
@@ -768,7 +793,10 @@ fn build_page(
         let corner = DVec3::from_array(cell.map(f64::from)) * edge;
         let left = DMat4::from_translation(-corner) * m.left * DMat4::from_translation(origin);
         header.motion_left = AffineRows::from(Affine3::from_mat4(left.as_mat4()));
-        header.motion_right = AffineRows::from(Affine3::from_mat4(m.right.as_mat4()));
+        // The page's models share an origin.
+        let model = &prototypes[usize::from(src.records[members[0]].prototype)].facts;
+        let right = m.right * DMat4::from_translation(model.origin);
+        header.motion_right = AffineRows::from(Affine3::from_mat4(right.as_mat4()));
         header.motion_start = m.start;
         let interval = members.len() * size_of::<MotionRow>();
         header.motion_window = (instance::MOTION_WINDOW_BYTES / interval) as u32;

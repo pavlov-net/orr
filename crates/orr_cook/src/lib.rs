@@ -17,7 +17,9 @@
 //! - `N/<rig>` and `N/<rig>/mesh` for each set of meshes that moves together, in scene space,
 //!   named after its first joint and out of the models above: a skin's meshes, and the meshes
 //!   under a node an animation targets, the latter as rigid parts, one per joint with part 0 on
-//!   a still joint; a scene that is all one such set keeps the names `N` and `N/mesh`,
+//!   a still joint; a scene that is all one such set keeps the names `N` and `N/mesh`. Its mesh
+//!   and palettes stand in its skeleton's space, at the skeleton's origin in scene space
+//!   (`SkeletonInfo::origin`), which a copy of it takes and its pages hold already,
 //! - `N/<model>/skeleton` for a model that moves: the joints of its skins, the nodes animated
 //!   above its meshes and the nodes between them,
 //! - `N/<model>/clip/<animation>`: each animation that moves the skeleton, resampled at
