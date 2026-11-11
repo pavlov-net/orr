@@ -39,8 +39,14 @@ impl VolumeRef {
         self.grids.iter().position(|g| g == name).map(|i| i as u32)
     }
 
-    /// Grid `grid` as a proxy's density over the volume's bounds.
+    /// Grid `grid` as a proxy's density over the volume's bounds. Panics if the volume has no
+    /// grid `grid`.
     pub fn density(&self, grid: u32) -> ProxyDensity {
+        assert!(
+            (grid as usize) < self.grids.len(),
+            "grid {grid} of a volume of {} grids",
+            self.grids.len()
+        );
         ProxyDensity::Grid {
             volume: self.volume,
             grid,
