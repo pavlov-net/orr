@@ -800,10 +800,12 @@ fn memory_line(frame: u64, renderer: &Renderer) -> String {
     }
     if let Some(c) = scene.clas {
         s += &format!(
-            "; CLAS pages {} bound {} free, {:.0} used",
+            "; CLAS pages {} bound {} free {} held, {:.0} used, {} moved",
             c.bound,
             c.wholly_free,
-            mib(c.used)
+            c.held,
+            mib(c.used),
+            r.clas_pages_moved
         );
     }
     for class in [ResidencyClass::MeshPages, ResidencyClass::Textures] {
