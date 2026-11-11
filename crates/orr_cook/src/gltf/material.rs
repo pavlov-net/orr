@@ -203,7 +203,7 @@ fn uv_transform(info: &Value) -> ([f32; 6], u32) {
     };
     let [ox, oy] = pair("offset", [0.0, 0.0]);
     let [sx, sy] = pair("scale", [1.0, 1.0]);
-    // In f32 a quarter turn's cosine is -4.4e-8, a shear that a large scale makes visible.
+    // An f32 sine or cosine misses a quarter turn's zero, a shear that a large scale shows.
     let rotation = t.get("rotation").and_then(Value::as_f64).unwrap_or(0.0);
     let (sin, cos) = rotation.sin_cos();
     let uv = [cos * sx - 1.0, sin * sy, ox, -sin * sx, cos * sy - 1.0, oy];
