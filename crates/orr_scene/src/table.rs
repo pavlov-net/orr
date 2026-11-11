@@ -117,25 +117,26 @@ impl<T: Pod> Column<T> {
         }
     }
 
-    /// Gives the table room for `capacity` entries when it holds less. Fails past
-    /// [`Self::limit`] or without device memory, leaving the table as it was.
-    pub(crate) fn reserve(&self, device: &Device, capacity: u32) -> Result<()> {
-        let s = &mut *self.state.lock().unwrap();
-        if capacity <= s.capacity {
-            return Ok(());
+    /// The memory [`Self::grow`] takes for a table of `capacity` entries, at most
+    /// [`Self::limit`]: none when the table holds as many. Fails without device memory.
+    pub(crate) fn room(&self, device: &Device, capacity: u32) -> Result<Option<Allocation<T>>> {
+        if capacity <= self.capacity() {
+            return Ok(None);
         }
-        if capacity > self.limit() {
-            return Err(Error::Capacity {
-                what: self.name,
-                capacity: self.limit(),
-            });
-        }
-        let next = device.gpu_malloc_with_priority(
+        Ok(Some(device.gpu_malloc_with_priority(
             MemoryKind::DeviceLocal,
             self.priority,
             u64::from(capacity),
             self.name,
-        )?;
+        )?))
+    }
+
+    /// Makes `room`, from [`Self::room`] for `capacity` entries, the table.
+    pub(crate) fn grow(&self, room: Option<Allocation<T>>, capacity: u32) {
+        let Some(next) = room else {
+            return;
+        };
+        let s = &mut *self.state.lock().unwrap();
         let old = std::mem::replace(&mut s.current, next);
         if s.held.is_none() {
             s.held = Some((old, s.capacity));
@@ -143,6 +144,13 @@ impl<T: Pod> Column<T> {
             s.passed.push((old, s.capacity));
         }
         s.capacity = capacity;
+    }
+
+    /// Gives the table room for `capacity` entries, at most [`Self::limit`], when it holds
+    /// less. Fails without device memory, leaving the table as it was.
+    pub(crate) fn reserve(&self, device: &Device, capacity: u32) -> Result<()> {
+        let room = self.room(device, capacity)?;
+        self.grow(room, capacity);
         Ok(())
     }
 

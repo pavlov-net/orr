@@ -1808,9 +1808,8 @@ impl<'a> Frame<'a> {
                 };
                 cpu.cuts = Some(Cuts::new(device, sizes, core.fif)?);
             }
-            let slots = cpu.slot_capacity();
             let cuts = cpu.cuts.as_mut().expect("made above");
-            cuts.follow(device, core.mounts.models.capacity(), slots)?;
+            cuts.follow_models(device, core.mounts.models.capacity())?;
             match cuts.fit(device, self.id, response_period(core.fif)) {
                 Err(e) if e.is_out_of_memory() => short.push(e),
                 r => r?,

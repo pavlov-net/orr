@@ -716,10 +716,20 @@ impl Cuts {
         self.ran[slot].rt_scale
     }
 
-    /// Gives the merged cuts an entry for each of `models` entries of the model table and the
-    /// slots' cuts one for each of the scene's `slots` instance slots, before the frame records
-    /// anything that reads them.
-    pub(crate) fn follow(&mut self, device: &Device, models: u32, slots: u32) -> Result<()> {
+    /// Gives the merged cuts an entry for each of `models` entries of the model table, before
+    /// the frame records anything that reads them.
+    pub(crate) fn follow_models(&mut self, device: &Device, models: u32) -> Result<()> {
+        self.follow(device, models, self.sizes.slots)
+    }
+
+    /// Gives the slots' cuts an entry for each of the scene's `slots` instance slots, before
+    /// the frame records anything that reads them. Fails without device memory, changing
+    /// nothing.
+    pub(crate) fn follow_slots(&mut self, device: &Device, slots: u32) -> Result<()> {
+        self.follow(device, self.sizes.models, slots)
+    }
+
+    fn follow(&mut self, device: &Device, models: u32, slots: u32) -> Result<()> {
         if models <= self.sizes.models && slots <= self.sizes.slots {
             return Ok(());
         }

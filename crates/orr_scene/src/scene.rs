@@ -887,7 +887,7 @@ impl SceneCpu {
 impl Scene {
     /// The first of `count` consecutive free slots. Without a free run that long the slot
     /// tables grow as [`grown`] says. Fails past [`MAX_SLOTS`] or what a slot table can hold,
-    /// or without device memory for the grown tables, with no slot taken.
+    /// or without device memory for the grown tables, leaving them as they were.
     fn take_slots(&self, cpu: &mut SceneCpu, device: &Device, count: u32) -> Result<u32> {
         // A run of no slots takes none, and its start names no slot.
         if count == 0 {
@@ -900,9 +900,16 @@ impl Scene {
         let t = &self.tables;
         let limit = MAX_SLOTS.min(t.instances.limit()).min(t.slot_state.limit());
         let slots = grown("instance slots", held, count, limit)?;
-        self.tables.instances.reserve(device, slots)?;
-        self.tables.slot_state.reserve(device, slots)?;
-        cpu.ptlas.reserve_slots(device, slots)?;
+        let instances = t.instances.room(device, slots)?;
+        let slot_state = t.slot_state.room(device, slots)?;
+        let partitions = cpu.ptlas.slot_table.room(device, slots)?;
+        // No frame has recorded a read of the slots' cuts while the scene is written.
+        if let Some(cuts) = &mut cpu.cuts {
+            cuts.follow_slots(device, slots)?;
+        }
+        t.instances.grow(instances, slots);
+        t.slot_state.grow(slot_state, slots);
+        cpu.ptlas.grow_slots(partitions, slots);
         cpu.slot_holds.resize(slots as usize, SlotHold::FREE);
         cpu.slot_runs.resize(slots as usize, (NO_MODEL, None));
         cpu.slots.grow(held, slots);

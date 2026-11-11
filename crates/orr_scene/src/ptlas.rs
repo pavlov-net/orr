@@ -433,13 +433,12 @@ impl Ptlas {
         }
     }
 
-    /// Gives the slot table and the slots' partitions room for `slots` slots. Fails without
-    /// device memory for the table, changing nothing.
-    pub(crate) fn reserve_slots(&mut self, device: &Device, slots: u32) -> Result<()> {
-        self.slot_table.reserve(device, slots)?;
+    /// Takes `room`, from the slot table's [`Column::room`] for `slots` slots, and gives the
+    /// slots' partitions as many.
+    pub(crate) fn grow_slots(&mut self, room: Option<Allocation<u32>>, slots: u32) {
+        self.slot_table.grow(room, slots);
         self.slot_partition.resize(slots as usize, PARTITION_NONE);
         self.slot_cost.resize(slots as usize, 0);
-        Ok(())
     }
 
     /// The layout of the frame's build, once [`Self::tlas`] has sized it.
