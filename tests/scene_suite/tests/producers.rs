@@ -1779,7 +1779,9 @@ fn textured_heights(linear: Mat3, flags: u32, share: f32) {
 /// plane of one uv everywhere unless `uvs`.
 fn moved_patches(linear: Mat3, flags: u32, share: f32, across: [f32; 2], uvs: bool) {
     let d = device();
-    let mut plane = Plane::new(4.0);
+    // Halves an exact shift of uv apart, so the directions their uvs give agree to the bit.
+    let seam = Vec2::new(0.375, 0.125);
+    let mut plane = Plane::build(4.0, RendererDesc::default().software_raster_pixels, seam);
     plane.linear = linear;
     if !uvs {
         let attrs = plane.gpu[1].as_mut_slice().unwrap();
@@ -1831,7 +1833,8 @@ fn moved_patches(linear: Mat3, flags: u32, share: f32, across: [f32; 2], uvs: bo
     let view = plane.frame(None, eye, target, eye);
     let g = generated(&view, entry(&plane.scenes, plane.scene, PLANE));
     let stats = plane.stats();
-    // The same texel on both sides of the seam: nothing for the weld to move.
+    // The same texel and the same directions on both sides of the seam: nothing for the weld
+    // to move.
     assert_eq!(stats.welded, 0, "{stats:?}");
     let want = share * (0.2 * f32::from(texel) / 65535.0 - 0.1);
     assert!(!g.positions.is_empty());
