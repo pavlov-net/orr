@@ -215,6 +215,11 @@ impl Ptlas {
         let n = |c: u32| u64::from(c.max(1));
         let dl = MemoryKind::DeviceLocal;
         let partitions = desc.ptlas_partitions;
+        // A copy fading between two chain steps holds a far instance in its partition on top
+        // of what placement counts for it, taken from the part pool: a partition, and the
+        // global one, hold up to one instance more for every copy in them that the pool has.
+        let fading = |copies: u32| copies.min(desc.part_capacity);
+        let global_copies = desc.global_instances + desc.skinned_capacity;
         Ok(Self {
             limits: PtlasLimits {
                 instances: desc.instance_capacity
@@ -223,10 +228,10 @@ impl Ptlas {
                     + desc.medium_proxy_capacity
                     + desc.light_capacity,
                 partitions,
-                max_per_partition: desc.partition_instances,
-                global_instances: desc.global_instances
+                max_per_partition: desc.partition_instances + fading(desc.partition_instances),
+                global_instances: global_copies
+                    + fading(global_copies)
                     + desc.producer_capacity
-                    + desc.skinned_capacity
                     + desc.medium_proxy_capacity
                     + desc.light_capacity,
                 max_ops: 3,

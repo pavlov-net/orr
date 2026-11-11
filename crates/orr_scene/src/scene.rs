@@ -66,7 +66,8 @@ pub struct SceneDesc {
     pub part_capacity: u32,
     /// PTLAS cell partitions.
     pub ptlas_partitions: u32,
-    /// Instances one PTLAS partition holds, at most.
+    /// Instances the copies of one PTLAS partition count, at most: their bodies and part runs.
+    /// A copy fading between two chain steps holds one more.
     pub partition_instances: u32,
     /// Instances the PTLAS global partition holds, at most: movers beyond it stay in their
     /// cell partitions.
