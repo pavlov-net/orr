@@ -68,15 +68,28 @@ pub struct VolumeHeader {
     pub bricks: [u32; 3],
     /// Majorant cells per axis: `bricks` / 4 rounded up.
     pub majorant_cells: [u32; 3],
-    pub _pad: u32,
-    /// Every sample outside reads the background of each grid, in m.
-    pub bounds: Aabb,
     /// [`VolumeGrid`] table.
     pub grids: Span,
     /// Grid names, UTF-8, each grid's `name` a range of these bytes.
     pub names: Span,
     /// [`VolumeBrick`] table of every grid, each grid's `bricks` a range of it.
     pub brick_table: Span,
+}
+
+impl VolumeHeader {
+    /// Every sample outside reads the background of each grid, in m: from one voxel before the
+    /// brick grid's first voxel to one past its last, the reach of their trilinear taps.
+    pub fn bounds(&self) -> Aabb {
+        let corner =
+            |idx: [i64; 3]| [0, 1, 2].map(|a| self.origin[a] + idx[a] as f32 * self.voxel_size[a]);
+        let min = self.brick_min.map(|m| i64::from(m) - 1);
+        let max =
+            [0, 1, 2].map(|a| i64::from(self.brick_min[a]) + i64::from(self.bricks[a] * BRICK));
+        Aabb {
+            min: corner(min),
+            max: corner(max),
+        }
+    }
 }
 
 #[repr(C)]
@@ -597,7 +610,7 @@ impl<'a> GridSampler<'a> {
 }
 
 const _: () = {
-    assert!(size_of::<VolumeHeader>() == 112);
+    assert!(size_of::<VolumeHeader>() == 84);
     assert!(size_of::<VolumeGrid>() == 56);
     assert!(size_of::<VolumeBrick>() == 8);
     assert!(size_of::<VolumeGpu>() == 88);

@@ -189,7 +189,7 @@ fn upload<T: bytemuck::Pod>(values: &[T], name: &str) -> Allocation<T> {
 
 /// A point inside `info`'s bounds grown by `margin` m.
 fn point(info: &VolumeInfo, rng: &mut Rng, margin: f32) -> [f32; 4] {
-    let b = info.header.bounds;
+    let b = info.header.bounds();
     let p = [0, 1, 2].map(|a| {
         let (lo, hi) = (b.min[a] - margin, b.max[a] + margin);
         lo + (hi - lo) * rng.unit()
@@ -275,7 +275,7 @@ fn majorant_cells_along_a_ray_bound_every_sample() {
     let info = &c.info;
     let cells = info.header.majorant_cells;
     assert!(cells.iter().product::<u32>() >= 8, "{cells:?} cells");
-    let b = info.header.bounds;
+    let b = info.header.bounds();
     let diagonal = (0..3)
         .map(|a| (b.max[a] - b.min[a]).powi(2))
         .sum::<f32>()

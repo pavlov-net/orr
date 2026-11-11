@@ -15,7 +15,7 @@ use orr_pack::volume::{
     self, BRICK, BRICK_TEXEL_COUNT, BRICK_TEXELS, MAJORANT_CELL, VolumeBrick, VolumeGrid,
     VolumeHeader, VolumeInfo,
 };
-use orr_pack::{Aabb, ArchiveWriter, BlobIn, Class, Hash32, Span};
+use orr_pack::{ArchiveWriter, BlobIn, Class, Hash32, Span};
 use serde::{Deserialize, Serialize};
 
 use crate::key::Key;
@@ -426,12 +426,6 @@ pub(crate) fn cook(
     let cells = bricks.map(|b| b.div_ceil(MAJORANT_CELL));
     let cell_count = cells.iter().product::<u32>() as usize;
     let brick_min = lo.map(|l| l * BRICK as i32);
-    let corner =
-        |idx: [i64; 3]| [0, 1, 2].map(|a| src.origin[a] + idx[a] as f32 * src.voxel_size[a]);
-    let bounds = Aabb {
-        min: corner(brick_min.map(|m| i64::from(m) - 1)),
-        max: corner([0, 1, 2].map(|a| i64::from(brick_min[a]) + i64::from(bricks[a] * BRICK))),
-    };
 
     let mut grids = Vec::new();
     let mut table = Vec::new();
@@ -501,8 +495,6 @@ pub(crate) fn cook(
             brick_min,
             bricks,
             majorant_cells: cells,
-            _pad: 0,
-            bounds,
             grids: Span::default(),
             names: Span::default(),
             brick_table: Span::default(),

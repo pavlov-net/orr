@@ -919,7 +919,7 @@ fn place_volume(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> 
     let r = VolumeRef {
         // SAFETY: the record is resident at the start of the mount's block.
         volume: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu())) },
-        bounds: info.header.bounds,
+        bounds: info.header.bounds(),
         grids: info.names.clone().into(),
     };
     t.placed.lock().unwrap().volumes.push((id, r));

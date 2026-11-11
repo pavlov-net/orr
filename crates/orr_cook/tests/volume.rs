@@ -126,7 +126,7 @@ fn check_grid(c: &Cooked, gi: usize, reference: &dyn Fn([i32; 3]) -> f32) {
 
     // Trilinear samples over the bounds and a margin, all eight taps from one brick.
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ gi as u64);
-    let b = h.bounds;
+    let b = h.bounds();
     for _ in 0..20_000 {
         let p = [0, 1, 2].map(|a| {
             let pad = 2.0 * h.voxel_size[a];
