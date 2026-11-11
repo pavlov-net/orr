@@ -291,7 +291,9 @@ impl View {
                     extent: OUT,
                     view,
                     sky: self.sky.gpu(),
+                    restarted: false,
                     frame: self.frame,
+                    completed: self.frame - 1,
                     output: &output,
                 },
             )

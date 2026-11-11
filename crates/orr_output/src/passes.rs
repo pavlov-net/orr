@@ -48,6 +48,11 @@ pub struct OutputKernels {
     scene_referred: ComputePipeline,
 }
 
+/// `ExposureState::initialized` (`adapt.slang`): the exposure set with the pre-exposure waiting
+/// where the view started, and adapting with the pre-exposure following.
+const STATE_SET: u32 = 1;
+const STATE_ADAPTING: u32 = 2;
+
 /// Words of the meter's histogram (`exposure.slang`).
 const HISTOGRAM_WORDS: u64 = HISTOGRAM_WORDS_PER_BIN * HISTOGRAM_BINS as u64;
 
@@ -144,6 +149,12 @@ pub struct OutputView {
     dof: Option<DofTargets>,
     glare: Option<ViewGlare>,
     local: Option<LocalTargets>,
+    /// The frame the view's exposure state last started over.
+    exposure_started: u64,
+    /// The view's pre-exposure has been let step since, or its telemetry showed it following.
+    exposure_follows: bool,
+    /// The view's last exposure pass let its pre-exposure step.
+    pre_exposure_steps: bool,
     device: Device,
 }
 
@@ -165,8 +176,33 @@ impl OutputView {
             dof: None,
             glare: None,
             local: None,
+            exposure_started: 0,
+            exposure_follows: false,
+            pre_exposure_steps: false,
             device: gpu.clone(),
         })
+    }
+
+    /// Whether this frame may be lit with a step in pre-exposure: the view's last exposure
+    /// pass let its pre-exposure go from the one it started with to its first exposure. A
+    /// history in pre-exposed units that cannot rescale, ray reconstruction's, starts over on
+    /// such a frame. The pass lets the step through on the frame the state starts over, which
+    /// takes it when that frame has light to meter, and otherwise once on the first frame
+    /// that has read back that the view set its exposure. Read it before the frame's
+    /// exposure pass.
+    pub fn pre_exposure_steps(&self) -> bool {
+        self.pre_exposure_steps
+    }
+
+    /// `ExposureState::initialized` as the newest frame at or before `completed` left it,
+    /// among the frames since the view's exposure state started over.
+    fn exposure_state(&self, completed: u64) -> Option<u32> {
+        let frames = self.exposure_started..=completed;
+        self.frames
+            .iter()
+            .filter(|r| r.telemetry_frame.is_some_and(|f| frames.contains(&f)))
+            .max_by_key(|r| r.telemetry_frame)
+            .map(|r| r.telemetry.as_slice().expect("readback memory")[0].state)
     }
 
     /// Bytes of the motion blur tiles held for the view: 0 unless its last frame had the
@@ -321,8 +357,13 @@ pub struct ExposurePass<'a> {
     /// The scene's sky statistics, for multi-reference metering and telemetry; null without
     /// a scene.
     pub sky: GpuPtr<SkyStats>,
+    /// The view's exposure state started over this frame, as at a camera cut.
+    pub restarted: bool,
     /// orr's frame id, which the telemetry carries.
     pub frame: u64,
+    /// A frame whose work has completed on the GPU, the newest known: the pass reads the
+    /// view's telemetry up to it.
+    pub completed: u64,
     pub output: &'a ViewOutput,
 }
 
@@ -613,6 +654,17 @@ impl OutputKernels {
         pass: &ExposurePass<'_>,
     ) -> Result<()> {
         let output = pass.output;
+        if pass.restarted {
+            view.exposure_started = pass.frame;
+            view.exposure_follows = false;
+        }
+        let mut step = pass.restarted;
+        if !step && !view.exposure_follows {
+            let state = view.exposure_state(pass.completed);
+            step = state == Some(STATE_SET);
+            view.exposure_follows = matches!(state, Some(STATE_SET | STATE_ADAPTING));
+        }
+        view.pre_exposure_steps = step;
         let n = view.frames.len() as u64;
         let roots = &mut view.frames[(pass.frame % n) as usize];
         if !roots.histogram_cleared {
@@ -665,6 +717,7 @@ impl OutputKernels {
                 (adapt_params(auto), Some(auto))
             }
         };
+        params.step = u32::from(step);
         if let Some(white) = &output.white_balance {
             let weights = white.references.unwrap_or(HISTOGRAM_ONLY);
             params.white_balance = 1;

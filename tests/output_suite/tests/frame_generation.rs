@@ -565,7 +565,9 @@ mod lens_distortion {
                         extent: OUT,
                         view: self.constants.gpu(),
                         sky: self.sky.gpu(),
+                        restarted: false,
                         frame: self.frame,
+                        completed: self.frame - 1,
                         output: &output,
                     },
                 )

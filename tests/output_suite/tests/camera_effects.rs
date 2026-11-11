@@ -474,7 +474,6 @@ mod depth_of_field {
                 pre_exposure: 1.0,
                 prev_pre_exposure: 1.0,
                 adapted_ev100: ev100_from_exposure(1.0),
-                initialized: 1,
                 ..ExposureState::default()
             });
             let mut c: ViewConstants = bytemuck::Zeroable::zeroed();
@@ -2061,7 +2060,9 @@ mod lens_distortion {
                         extent: OUT,
                         view: self.constants.gpu(),
                         sky: self.sky.gpu(),
+                        restarted: false,
                         frame: self.frame,
+                        completed: self.frame - 1,
                         output: &output,
                     },
                 )

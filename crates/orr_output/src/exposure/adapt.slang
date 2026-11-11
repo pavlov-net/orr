@@ -14,12 +14,15 @@ import orr_output.exposure;
 static const uint MODE_MANUAL = 0;
 static const uint MODE_AUTO = 1;
 
-// ExposureState::initialized: 0 until a frame sets the exposure, which a view's first frame
-// with something to meter does by taking the target, then 1. A camera cut starts the state
-// over before the frame is lit. An unset state holds the exposure the view is lit with as
-// its adapted exposure, so the view is shown at its pre-exposure.
+// ExposureState::initialized. A camera cut starts the state over, unset, before the frame is
+// lit. An unset state holds the exposure the view is lit with as its adapted exposure, so
+// the view is shown at its pre-exposure. A view's first frame with something to meter sets
+// the exposure by taking the target, and from then on it adapts. Its pre-exposure stays
+// where it started until a frame with `AdaptParams::step`, then follows the adapted
+// exposure: STATE_SET waits for that frame, STATE_ADAPTING has had it.
 static const uint STATE_UNSET = 0;
-static const uint STATE_ADAPTING = 1;
+static const uint STATE_SET = 1;
+static const uint STATE_ADAPTING = 2;
 // An adapting view's frame with nothing to meter may hide light that underflowed RGBA16F.
 // Pre-exposure does not show on a black frame, so it rises by this many stops a frame to
 // find it.
@@ -34,6 +37,10 @@ public struct AdaptParams
     public uint mode;
     public float manual_ev100;
     public uint physiological;
+    // 1 on a frame whose next one drops the histories that cannot rescale by the change of
+    // pre-exposure, ray reconstruction's: a view whose pre-exposure waits where it started
+    // may step it to its exposure.
+    public uint step;
     // Histogram range: EV100 at the bottom of bin 0 and EV per bin.
     public float ev_min;
     public float bin_ev;
@@ -65,7 +72,6 @@ public struct AdaptParams
     public float white_directional;
     public uint _pad0;
     public uint _pad1;
-    public uint _pad2;
 }
 
 // What adapt read and wrote for one render, read back by the CPU.
@@ -81,6 +87,9 @@ public struct ExposureTelemetryGpu
     // The next render's pre-exposure.
     public float pre_exposure;
     public uint metered;
+    // `ExposureState::initialized` as this render left it.
+    public uint state;
+    public uint _pad0;
     public SkyStats sky;
 }
 
@@ -279,30 +288,29 @@ void main()
         next.adapted_ev100 = clamp(adapted, p.clamp_min, p.clamp_max);
         next.target_ev100 = clamp(target, p.clamp_min, p.clamp_max);
         next.long_term_ev100 = long_term;
-        next.initialized = STATE_ADAPTING;
+        next.initialized = cur.initialized == STATE_ADAPTING || p.step != 0 ? STATE_ADAPTING : STATE_SET;
     }
     else
     {
-        // Nothing to meter: hold the exposure. A view that has set none stays at the
-        // pre-exposure it started with, so its first metered frame is lit there; an adapting
-        // one searches upward, no further than the exposure that keys the bottom of the
-        // histogram.
+        // Nothing to meter: hold the exposure.
         hold = true;
-        if (!snap)
-        {
-            float highest = exposure_from_ev100(keyed(p, p.ev_min));
-            next.pre_exposure = max(cur.pre_exposure, min(cur.pre_exposure * exp2(SEARCH_STOPS), highest));
-        }
+        if (cur.initialized == STATE_SET && p.step != 0)
+            next.initialized = STATE_ADAPTING;
     }
 
-    // Pre-exposure follows the adapted exposure every frame. Ray reconstruction neither
-    // rescales its history nor takes the pre-exposure, so a step in it shows as a flash
-    // through a full history. The one step a view takes, from the pre-exposure it started
-    // with to its first exposure, comes on the frame after the one that set the exposure:
-    // the frame after ray reconstruction's reset when a camera cut's frame has light to
-    // meter, and later, with no reset near it, when the view waits for light. The histories
-    // orr keeps rescale by `pre_exposure / prev_pre_exposure`.
-    if (!hold)
+    // Once a view adapts, pre-exposure follows the adapted exposure every frame. Ray
+    // reconstruction neither rescales its history nor takes the pre-exposure, so a step in
+    // it shows as a flash through that history: the one step a view takes, from the
+    // pre-exposure it started with to its first exposure, waits for a frame whose next one
+    // drops it. The histories orr keeps rescale by `pre_exposure / prev_pre_exposure`.
+    if (hold && cur.initialized == STATE_ADAPTING)
+    {
+        // An adapting view searches upward, no further than the exposure that keys the
+        // bottom of the histogram.
+        float highest = exposure_from_ev100(keyed(p, p.ev_min));
+        next.pre_exposure = max(cur.pre_exposure, min(cur.pre_exposure * exp2(SEARCH_STOPS), highest));
+    }
+    else if (next.initialized == STATE_ADAPTING)
         next.pre_exposure = exposure_from_ev100(next.adapted_ev100);
 
     // White point: (0, 0) is unset and snaps at the next frame with light.
@@ -334,6 +342,8 @@ void main()
     t.white_target_xy = white_target_xy;
     t.pre_exposure = next.pre_exposure;
     t.metered = metered ? 1 : 0;
+    t.state = next.initialized;
+    t._pad0 = 0;
     t.sky = sky;
     *root.telemetry = t;
     for (uint w = 0; w < HISTOGRAM_BINS * HISTOGRAM_WORDS; w++)

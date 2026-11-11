@@ -996,7 +996,8 @@ fn place_lamp(f: &orr::Frame<'_>, scene: SceneId, lamp: orr::ModelId) {
 }
 
 /// A view starts, and starts over at a camera cut, lit and shown at its exposure's reference,
-/// and holds that until a frame has light to meter.
+/// and holds that until a frame has light to meter. Its pre-exposure then waits at the
+/// reference for the frame that has read that back.
 #[test]
 fn a_camera_cut_starts_exposure_over_at_its_reference() {
     let d = device();
@@ -1101,13 +1102,14 @@ fn a_camera_cut_starts_exposure_over_at_its_reference() {
     let lit = render(true, false, 6.0);
     assert!(lit.metered_ev100.is_some());
     assert!(lit.adapted_ev100 > 10.0, "the lamp exposes at {lit:?}");
-    let follows = lit.pre_exposure / exposure(lit.adapted_ev100) - 1.0;
+    assert_eq!(lit.pre_exposure, exposure(6.0));
+    let held = render(false, false, 9.0);
+    assert_eq!(held.adapted_ev100, lit.adapted_ev100);
+    let follows = held.pre_exposure / exposure(held.adapted_ev100) - 1.0;
     assert!(
         follows.abs() < 1e-5,
         "pre-exposure {follows} from the exposure"
     );
-    let held = render(false, false, 9.0);
-    assert_eq!(held.adapted_ev100, lit.adapted_ev100);
     let cut = render(false, true, 9.0);
     assert_eq!(cut.metered_ev100, None);
     assert_eq!((cut.adapted_ev100, cut.pre_exposure), (9.0, exposure(9.0)));

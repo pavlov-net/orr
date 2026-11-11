@@ -215,8 +215,11 @@ pub struct LitView<'a> {
     /// A camera cut: the previous camera is taken to be this one; motion blur shows nothing,
     /// frame generation, ray reconstruction and lighting drop their history, and exposure and
     /// white balance start over: the frame is lit as [`Exposure::start`] gives and shown at the
-    /// exposure and white point it meters. A view's first render, its first on another scene
-    /// and its first after [`SceneWriter::reset_lighting_history`] are cuts without it.
+    /// exposure and white point it meters. Ray reconstruction drops its history once more, on
+    /// the frame first lit with that exposure: the next one when the cut's frame has light to
+    /// meter, else a frame or two after the first that has. A view's first render, its first
+    /// on another scene and its first after [`SceneWriter::reset_lighting_history`] are cuts
+    /// without it.
     pub camera_cut: bool,
     /// Menus and loading screens: frame generation is told the frame shows no scene.
     pub not_rendering_scene: bool,
@@ -1507,6 +1510,8 @@ impl<'a> Frame<'a> {
                 weight,
             });
         let delta = self.scenes.time().delta;
+        let completed = self.scenes.completed();
+        let stepped = state.output.pre_exposure_steps();
         let (list, arena) = self.scenes.output_list_and_arena(view.history)?;
         let (rr_output, rr_output_store) = match state.reconstruction.as_mut() {
             Some(r) => {
@@ -1532,7 +1537,7 @@ impl<'a> Frame<'a> {
                         reactive_mask: None,
                         exposure: None,
                         output: target.texture(),
-                        reset: std::mem::take(&mut r.fresh) || paths.history_reset(),
+                        reset: std::mem::take(&mut r.fresh) || paths.history_reset() || stepped,
                         view: &desc,
                     },
                 );
@@ -1624,7 +1629,9 @@ impl<'a> Frame<'a> {
                 extent,
                 view: raster.view,
                 sky: raster.sky_stats,
+                restarted: desc.camera_cut,
                 frame: id,
+                completed,
                 output,
             },
         )?;

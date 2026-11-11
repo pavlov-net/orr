@@ -70,8 +70,9 @@ pub struct Harness {
     /// Linear Rec.2020 color the luminance multiplies; gray by default.
     pub color: [f32; 3],
     /// The share of its last image the radiance keeps as it stands, whatever the pre-exposure
-    /// it was lit with, as ray reconstruction's history does; 0 by default. A camera cut
-    /// drops it.
+    /// it was lit with, as ray reconstruction's history does; 0 by default. It is dropped on
+    /// the frames a renderer resets ray reconstruction on: a camera cut and a frame
+    /// [`OutputView::pre_exposure_steps`] tells.
     pub history: f32,
     /// The lens's glare, run before tonemap; off by default.
     pub glare: Option<Glare>,
@@ -251,7 +252,11 @@ impl Harness {
             r,
             g,
             b,
-            history: if cut { 0.0 } else { self.history },
+            history: if cut || self.output.pre_exposure_steps() {
+                0.0
+            } else {
+                self.history
+            },
             _pad1: 0,
             _pad2: 0,
         };
@@ -299,7 +304,9 @@ impl Harness {
                     extent: self.extent,
                     view,
                     sky: self.sky.gpu(),
+                    restarted: cut,
                     frame: self.frame,
+                    completed: self.frame - 1,
                     output,
                 },
             )
