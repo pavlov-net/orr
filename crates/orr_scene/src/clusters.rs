@@ -167,16 +167,11 @@ impl ClusterTable {
                 continue;
             }
             s.live.remove(&p);
+            // A page not yet bound still binds: a placement that failed after its records
+            // were queued frees its ids within the frame that writes them.
             let page = s.pages.get_mut(&p).expect("memory for a taken page");
-            if page.bound {
-                page.idle = Some(step);
-                s.idle.push_back((step, p));
-            } else {
-                // Never bound, so no GPU work has used its memory.
-                let slot = page.slot;
-                s.pages.remove(&p);
-                s.backing.free(slot);
-            }
+            page.idle = Some(step);
+            s.idle.push_back((step, p));
         }
     }
 
