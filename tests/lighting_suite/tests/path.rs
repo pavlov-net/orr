@@ -12,14 +12,14 @@ use lighting_suite::bed::{
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::assert_same_mean;
-use lighting_suite::{assert_clean, pipeline, readback, render, run, texture, upload};
+use lighting_suite::{assert_clean, device, pipeline, readback, render, run, texture, upload};
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
-    DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightingDebugView, PathEntry,
-    ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting,
+    DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightingDebugView,
+    OriginProbes, PathEntry, ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting,
 };
 use orr_math::{Affine3, DVec3, Mat3, Vec2, Vec3};
-use orr_scene::{Opacity, RendererDesc};
+use orr_scene::{Opacity, Projection, RendererDesc};
 
 fn paths(settings: ViewLighting) -> Paths {
     Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
@@ -351,6 +351,8 @@ fn rays_leave_surfaces_from_the_origin_to_30_km() {
 fn a_coarser_traced_cut_casts_no_self_shadow_speckle() {
     let angle = 5f32.to_radians();
     let eye = Vec3::new(0.0, 3.0, -6.0);
+    let fov_y = 0.8;
+    // The view sees only the valley: the trough's near end lies below the frame.
     let spec = Spec {
         copies: vec![at(TROUGH, Mat3::IDENTITY, Vec3::ZERO)],
         lights: vec![directional(
@@ -361,12 +363,17 @@ fn a_coarser_traced_cut_casts_no_self_shadow_speckle() {
         environment: None,
         eye,
         target: Vec3::new(0.0, 0.3, 0.0),
-        fov_y: 0.8,
-        focus: Some((eye, 0.05)),
+        fov_y,
+        focus: Some((
+            eye,
+            Projection { fov_y, near: NEAR }.pixels_per_radian(EXTENT[1]),
+        )),
     };
-    // The raster draws the finest level; ray tracing holds the coarsest.
+    // The raster draws the finest level; ray tracing holds the coarsest, whose error
+    // projects to a few pixels.
     let renderer = RendererDesc {
         raster_error_pixels: 0.01,
+        rt_error_pixels: 16.0,
         ..RendererDesc::default()
     };
     let mut bed = Bed::with_renderer(spec, &renderer);
@@ -389,17 +396,35 @@ fn a_coarser_traced_cut_casts_no_self_shadow_speckle() {
         "{speckle} of {} pixels shadow themselves",
         lit.len()
     );
-    let bias = render_paths(
-        &mut bed,
-        &paths(debug(LightingDebugView::RayOriginBias, 0)),
-        1,
-        1,
-    );
-    let bias = surface_mean(&bias)[0];
+    let bias_paths = paths(debug(LightingDebugView::RayOriginBias, 0));
+    let mut probes = OriginProbes::default();
+    let center = EXTENT.map(|e| e / 2);
+    let bias = bed.accumulate(1, 1, &mut |list, f| {
+        bias_paths.record(list, f);
+        let v = f.view;
+        probes
+            .record(
+                device(),
+                &KernelSet::default(),
+                list,
+                f.frame,
+                v.scene,
+                v.view,
+                v.gbuffer,
+                center,
+            )
+            .unwrap();
+    });
+    let probe = probes.take(bed.last_frame()).pop().unwrap();
     let floor = 1e-3 * (1.0 + 6.0);
     assert!(
+        probe.gpu.raster_error == 0.0 && f64::from(probe.gpu.traced_error) > 2.0 * floor,
+        "the traced cut is not coarser than the raster at the center pixel:\n{probe}"
+    );
+    let bias = surface_mean(&bias)[0];
+    assert!(
         bias > 2.0 * floor,
-        "x1 offsets {bias} m on average: the traced cut is not coarser than the raster"
+        "x1 offsets {bias} m on average: the paths do not offset by the traced cut's error"
     );
     assert_clean();
 }

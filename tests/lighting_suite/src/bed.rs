@@ -326,8 +326,9 @@ pub const GLOSSY_ROUGHNESS: f32 = 0.25;
 pub const EMITTER_FIELD: &str = "emitter field";
 /// An upright 1 m square facing +z whose material names linked surface 1.
 pub const PANEL: &str = "panel";
-/// A valley 3 m across and 8 m long along z, y = 0.5 x^2, finely tessellated, with
-/// discrete levels of 1 cm and 3 cm error.
+/// A solid 3 m across, from z = -5 to 4, from y = -0.5 up to a valley y = 0.5 x^2, finely
+/// tessellated, with discrete levels of 1 cm and 3 cm error. It is closed, so its levels
+/// coarsen the valley's profile, which an open border along it would keep.
 pub const TROUGH: &str = "trough";
 /// A 2 m square facing +y, emitting [`EMITTER_LUMINANCE`] nits, nothing else.
 pub const LIGHT_FLOOR: &str = "light floor";
@@ -617,6 +618,33 @@ impl MeshBuilder {
         let w = n + 1;
         for j in 0..n {
             for i in 0..n {
+                let c = first + j * w + i;
+                self.triangle(section, [c, c + 1, c + w + 1]);
+                self.triangle(section, [c, c + w + 1, c + w]);
+            }
+        }
+    }
+
+    /// A sheet of `cells[0]` x `cells[1]` cells whose vertex `(i, j)` is at `position(i, j)`
+    /// with `normal(i, j)` and uv `(i, j) / cells`.
+    fn sheet(
+        &mut self,
+        section: usize,
+        cells: [u32; 2],
+        position: impl Fn(u32, u32) -> Vec3,
+        normal: impl Fn(u32, u32) -> Vec3,
+    ) {
+        let [nu, nv] = cells;
+        let first = self.positions.len() as u32;
+        for j in 0..=nv {
+            for i in 0..=nu {
+                let uv = Vec2::new(i as f32 / nu as f32, j as f32 / nv as f32);
+                self.vertex(position(i, j), normal(i, j), uv);
+            }
+        }
+        let w = nu + 1;
+        for j in 0..nv {
+            for i in 0..nu {
                 let c = first + j * w + i;
                 self.triangle(section, [c, c + 1, c + w + 1]);
                 self.triangle(section, [c, c + w + 1, c + w]);
@@ -980,27 +1008,35 @@ fn cook() -> Arc<[u8]> {
         ..Material::default()
     };
     let trough = mesh(|b| {
-        let (nx, nz) = (48u32, 16u32);
-        let first = b.positions.len() as u32;
-        for j in 0..=nz {
-            for i in 0..=nx {
-                let x = -1.5 + 3.0 * i as f32 / nx as f32;
-                let z = -4.0 + 8.0 * j as f32 / nz as f32;
-                let n = Vec3::new(-x, 1.0, 0.0).normalize();
-                b.vertex(
-                    Vec3::new(x, 0.5 * x * x, z),
-                    n,
-                    Vec2::new(i as f32 / nx as f32, j as f32 / nz as f32),
-                );
-            }
+        let (nx, nz) = (48u32, 18u32);
+        let x = |i: u32| -1.5 + 3.0 * i as f32 / nx as f32;
+        let z = |j: u32| -5.0 + 9.0 * j as f32 / nz as f32;
+        let top = |i: u32| 0.5 * x(i) * x(i);
+        let bottom = -0.5;
+        b.sheet(
+            0,
+            [nx, nz],
+            |i, j| Vec3::new(x(i), top(i), z(j)),
+            |i, _| Vec3::new(-x(i), 1.0, 0.0).normalize(),
+        );
+        b.sheet(
+            0,
+            [nx, nz],
+            |i, j| Vec3::new(x(i), bottom, z(j)),
+            |_, _| -Vec3::Y,
+        );
+        for (i, side) in [(0, -Vec3::X), (nx, Vec3::X)] {
+            let y = |k: u32| if k == 0 { bottom } else { top(i) };
+            b.sheet(0, [1, nz], |k, j| Vec3::new(x(i), y(k), z(j)), |_, _| side);
         }
-        let w = nx + 1;
-        for j in 0..nz {
-            for i in 0..nx {
-                let c = first + j * w + i;
-                b.triangle(0, [c, c + 1, c + w + 1]);
-                b.triangle(0, [c, c + w + 1, c + w]);
-            }
+        for (j, end) in [(0, -Vec3::Z), (nz, Vec3::Z)] {
+            let y = |i: u32, k: u32| if k == 0 { bottom } else { top(i) };
+            b.sheet(
+                0,
+                [nx, 1],
+                |i, k| Vec3::new(x(i), y(i, k), z(j)),
+                |_, _| end,
+            );
         }
     });
     let (x, y, z) = (Vec3::X, Vec3::Y, Vec3::Z);
