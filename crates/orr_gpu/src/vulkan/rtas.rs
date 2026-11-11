@@ -205,8 +205,11 @@ impl Shared {
                 "cluster limits {l:?} beyond the device's {c:?}"
             ),
             RtasLimits::Ptlas(l) => assert!(
-                l.partitions <= c.max_partitions && l.max_ops <= 3,
-                "PTLAS limits {l:?}: at most {} partitions and 3 commands",
+                u64::from(l.partitions) + u64::from(l.global_instances)
+                    <= u64::from(c.max_partitions)
+                    && l.max_ops <= 3,
+                "PTLAS limits {l:?}: partitions and global instances at most {} together, and 3 \
+                 commands",
                 c.max_partitions
             ),
             _ => {}
