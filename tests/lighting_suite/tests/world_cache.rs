@@ -686,9 +686,10 @@ fn a_moving_pre_exposure_leaves_the_cache_where_a_fixed_one_does() {
         ));
         render_paths(&mut bed, &run, 0, 120);
         let pre_exposure = |i: u32| (stops_per_frame * i as f32).exp2();
+        // No frame is a camera cut, which would drop the view's history.
         for i in 1..=30 {
             bed.move_pre_exposure(pre_exposure(i));
-            render_paths(&mut bed, &run, 120 + i, 1);
+            bed.accumulate_on(120 + i, 1, 1, &mut |list, f| run.record(list, f));
         }
         luminance(cache_view(&mut bed, &view, 151)) / f64::from(pre_exposure(30))
     };
