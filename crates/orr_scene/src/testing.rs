@@ -113,7 +113,6 @@ pub fn read_buffer_on<T: Pod>(d: &Device, src: GpuPtr<T>, count: u64) -> Vec<T> 
     out.as_slice().unwrap().to_vec()
 }
 
-/// Copies `region` of `t` back to the CPU, tightly packed, after all work submitted so far.
 /// The visible clusters `view`'s culling wrote. Its count holds those past the list's capacity
 /// too.
 pub fn visible_clusters(view: &crate::RasterView) -> Vec<crate::VisibleCluster> {
@@ -125,6 +124,7 @@ pub fn visible_clusters(view: &crate::RasterView) -> Vec<crate::VisibleCluster> 
     clusters
 }
 
+/// Copies `region` of `t` back to the CPU, tightly packed, after all work submitted so far.
 pub fn read_texture(t: &Texture, region: &TextureRegion) -> Vec<u8> {
     read_texture_on(device(), t, region)
 }
