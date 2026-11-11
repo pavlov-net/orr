@@ -270,6 +270,16 @@ struct PartDemand {
 }
 
 impl PartDemand {
+    /// Counts the part runs `n` copies may hold.
+    fn hold(&mut self, runs: CopyRuns, n: u32) {
+        if let Some(c) = runs.body {
+            self.held[c as usize] += n;
+        }
+        if runs.far {
+            self.held[0] += n;
+        }
+    }
+
     /// Part instances the pool needs for what it has counted so far.
     fn parts(&self) -> u64 {
         (0..PART_CLASSES as usize)
@@ -434,12 +444,23 @@ impl Ptlas {
 
     /// Counts the part runs `n` copies may hold.
     pub(crate) fn hold_runs(&mut self, runs: CopyRuns, n: u32) {
-        if let Some(c) = runs.body {
-            self.demand.held[c as usize] += n;
+        self.demand.hold(runs, n);
+    }
+
+    /// Fails, counting nothing, unless the part pool can also hold the part runs of `n` copies
+    /// for each `(runs, n)`: a released run names its start in 24 bits.
+    pub(crate) fn check_runs(&self, more: impl IntoIterator<Item = (CopyRuns, u32)>) -> Result<()> {
+        let mut demand = self.demand;
+        for (runs, n) in more {
+            demand.hold(runs, n);
         }
-        if runs.far {
-            self.demand.held[0] += n;
+        if demand.parts() > u64::from(MAX_PARTS) {
+            return Err(Error::Capacity {
+                what: "part instances",
+                capacity: MAX_PARTS,
+            });
         }
+        Ok(())
     }
 
     /// Counts the part runs of `n` removed copies as leaving: the build that sees them gone
@@ -457,16 +478,39 @@ impl Ptlas {
         }
     }
 
+    /// Cell partitions the device's PTLAS takes beside the most the global partition can
+    /// hold; unbounded on a device without one, which builds none.
+    fn partition_room(&self, device: &Device) -> u32 {
+        let max = device.caps().cluster.max_partitions;
+        if max == 0 {
+            return u32::MAX;
+        }
+        let most = Layout {
+            slots: 0,
+            parts: MAX_PARTS,
+        };
+        max.saturating_sub(self.limits(most, 0).global_instances)
+    }
+
     /// Makes `n` cell partitions free. Short of them, the partitions grow to twice as many, or
-    /// to as many as that takes: geometric growth keeps the builds that grow them few. The next
-    /// update writes the new table whole; the frames before read the old.
+    /// to as many as that takes, within what the device's PTLAS holds: geometric growth keeps
+    /// the builds that grow them few. The next update writes the new table whole; the frames
+    /// before read the old.
     fn free_partitions(&mut self, device: &Device, n: u32) -> Result<()> {
         let free = self.free.len() as u32;
         if free >= n {
             return Ok(());
         }
         let had = self.partitions.len() as u32;
-        let grown = (had + n - free).max(2 * had);
+        let room = self.partition_room(device);
+        let needed = u64::from(had) + u64::from(n - free);
+        if needed > u64::from(room) {
+            return Err(Error::Capacity {
+                what: "PTLAS cell partitions",
+                capacity: room,
+            });
+        }
+        let grown = (needed as u32).max(had.saturating_mul(2).min(room));
         self.partition_table =
             device.gpu_malloc(MemoryKind::DeviceLocal, u64::from(grown), "partitions")?;
         self.changed.extend(0..had);

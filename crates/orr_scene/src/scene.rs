@@ -40,6 +40,12 @@ const NO_MODEL: u32 = u32::MAX;
 /// `tables.slang` `NO_MATERIAL_SET`.
 const NO_MATERIAL_SET: u32 = u32::MAX;
 
+/// The far instance a copy of a chained model may hold.
+const FAR_RUN: CopyRuns = CopyRuns {
+    body: None,
+    far: true,
+};
+
 /// Seconds of an animated page's rows wanted ahead of its clock.
 const MOTION_AHEAD: f32 = 1.0;
 
@@ -982,14 +988,30 @@ impl Scene {
         })
     }
 
+    /// Fails, changing nothing, unless the part pool can count a far instance for every copy
+    /// of `model` that holds none, as [`Self::chain_far`] does.
+    pub(crate) fn check_chain_far(&self, model: u32) -> Result<()> {
+        let cpu = self.cpu.lock().unwrap();
+        let hand = cpu
+            .slot_holds
+            .iter()
+            .zip(&cpu.slot_runs)
+            .filter(|(hold, runs)| hold.model == model && !runs.far)
+            .count() as u32;
+        let paged: u32 = cpu
+            .pages
+            .iter()
+            .flat_map(|p| &p.runs)
+            .filter(|&&(m, _, runs)| m == model && !runs.far)
+            .map(|&(_, records, _)| records)
+            .sum();
+        cpu.ptlas.check_runs([(FAR_RUN, hand + paged)])
+    }
+
     /// Counts a far instance for every copy of `model` that holds none: the model has gained a
     /// chain, so its copies may fade.
     pub(crate) fn chain_far(&self, model: u32) {
         let cpu = &mut *self.cpu.lock().unwrap();
-        let far = CopyRuns {
-            body: None,
-            far: true,
-        };
         let mut gained = 0;
         for (hold, runs) in cpu.slot_holds.iter().zip(&mut cpu.slot_runs) {
             if hold.model == model && !runs.far {
@@ -1005,7 +1027,7 @@ impl Scene {
                 }
             }
         }
-        cpu.ptlas.hold_runs(far, gained);
+        cpu.ptlas.hold_runs(FAR_RUN, gained);
     }
 
     /// Frees the ranges of a growth that is not applied.
@@ -1549,6 +1571,8 @@ impl<'f> SceneWriter<'f> {
                 .get(desc.transforms.0 as usize)
                 .and_then(Option::as_ref)
                 .map_or(IVec3::ZERO, |g| g.anchor.cell);
+            let runs = model.runs(desc.pose.is_some());
+            cpu.ptlas.check_runs([(runs, desc.copies)])?;
             cpu.ptlas
                 .reserve_place(self.device, desc.copies, cell, cost)?;
             let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
@@ -1567,7 +1591,6 @@ impl<'f> SceneWriter<'f> {
                     capacity: self.scene.desc.emissive_capacity,
                 });
             };
-            let runs = model.runs(desc.pose.is_some());
             let slots = first as usize..(first + desc.copies) as usize;
             cpu.slot_runs[slots.clone()].fill(runs);
             cpu.ptlas.hold_runs(runs, desc.copies);
@@ -1733,6 +1756,16 @@ impl<'f> SceneWriter<'f> {
         if runs.is_empty() && count > 0 {
             runs.push(count);
         }
+        let part_runs: Vec<(u32, u32, CopyRuns)> = protos
+            .iter()
+            .map(|p| {
+                let posed = r.poses.iter().any(|(m, _)| *m == p.model);
+                let runs = self.model_cpu[p.model.0 as usize].runs(posed);
+                (p.model.0, p.records, runs)
+            })
+            .collect();
+        cpu.ptlas
+            .check_runs(part_runs.iter().map(|&(_, records, runs)| (runs, records)))?;
         cpu.ptlas.reserve_runs(self.device, &runs)?;
         let first = cpu.slots.alloc(count).ok_or(Error::Capacity {
             what: "instances",
@@ -1830,15 +1863,9 @@ impl<'f> SceneWriter<'f> {
         let out = table.as_mut_slice().expect("upload is mapped");
         out[..copy_bytes as usize].copy_from_slice(bytemuck::cast_slice(&copies));
         let partitions = cpu.ptlas.place_runs(first, &runs, cell);
-        let part_runs: Vec<(u32, u32, CopyRuns)> = protos
-            .iter()
-            .map(|p| {
-                let posed = r.poses.iter().any(|(m, _)| *m == p.model);
-                let runs = self.model_cpu[p.model.0 as usize].runs(posed);
-                cpu.ptlas.hold_runs(runs, p.records);
-                (p.model.0, p.records, runs)
-            })
-            .collect();
+        for &(_, records, runs) in &part_runs {
+            cpu.ptlas.hold_runs(runs, records);
+        }
         let mut group = Group::of_page(r.page, page, self.frame);
         group.frame = frame;
         let record = group.record();
@@ -2187,8 +2214,10 @@ impl<'f> SceneWriter<'f> {
         let (states_src, states) = self
             .window
             .slice::<SkinStateGpu>(self.device, desc.copies)?;
+        let runs = model.runs(true);
         let (first, entry, emissive) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
+            cpu.ptlas.check_runs([(runs, desc.copies)])?;
             let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
                 what: "instances",
                 capacity: self.scene.desc.instance_capacity,
@@ -2227,7 +2256,6 @@ impl<'f> SceneWriter<'f> {
                 cpu.masks.insert((desc.model, section_mask));
             }
             cpu.ptlas.place_skinned(first, desc.copies);
-            let runs = model.runs(true);
             cpu.slot_runs[first as usize..(first + desc.copies) as usize].fill(runs);
             cpu.ptlas.hold_runs(runs, desc.copies);
             (first, entry, emissive)

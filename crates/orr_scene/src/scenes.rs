@@ -782,7 +782,8 @@ impl Scenes {
     /// when a pack holding one of its models is unmounted. Each copy holds an emissive list
     /// entry per emissive section of its chain's most emissive model; a chain that needs more
     /// gives every copy of the model in every scene more, on pages too, and fails with
-    /// [`Error::Capacity`], changing nothing, where a scene's list has no room.
+    /// [`Error::Capacity`], changing nothing, where a scene's list has no room or its PTLAS
+    /// part pool no room for the far instances of the model's copies.
     pub fn set_chain(&mut self, model: ModelId, chain: &[(ModelId, f32)]) -> Result<()> {
         let invalid = |reason| Err(Error::InvalidChain { model, reason });
         if !self.core.mounts.is_live(model) {
@@ -818,6 +819,14 @@ impl Scenes {
             last = distance;
         }
         let core = &mut self.core;
+        // Copies placed while the model has a chain count their far instances as they are
+        // placed; the others count them when it gains one.
+        let gains_far = !chain.is_empty() && !core.model_cpu[model.0 as usize].chained;
+        if gains_far {
+            for scene in core.scenes.iter().flatten() {
+                scene.check_chain_far(model.0)?;
+            }
+        }
         // Every copy holds an emissive list entry per section rank of its most emissive step.
         let ranks = |m: ModelId| {
             core.model_cpu
@@ -868,6 +877,8 @@ impl Scenes {
             core.chains
                 .insert(model, chain.iter().map(|&(m, _)| m).collect());
             core.chained = true;
+        }
+        if gains_far {
             for scene in core.scenes.iter().flatten() {
                 scene.chain_far(model.0);
             }
