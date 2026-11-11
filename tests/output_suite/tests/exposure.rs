@@ -263,8 +263,20 @@ fn manual_exposure_shows_from_the_step_frame() {
     assert_clean();
 }
 
+/// The scene's scale on frame `f` of a ramp: `stops` down over `frames`, held as long, then
+/// back up over `frames` and held again.
+fn down_and_up(f: u32, frames: u32, stops: f32) -> f32 {
+    let at = match f / frames {
+        0 => f as f32 / frames as f32,
+        1 => 1.0,
+        2 => 1.0 - (f - 2 * frames) as f32 / frames as f32,
+        _ => 0.0,
+    };
+    (-stops * at).exp2()
+}
+
 #[test]
-fn pre_exposure_moves_in_whole_stops_and_never_shows() {
+fn pre_exposure_follows_the_adapted_exposure_and_never_shows() {
     let mut h = Harness::new(SIDE, SIDE);
     let nits = natural_image(h.pixels(), 6.0, 1.0);
     h.set_image(&nits);
@@ -274,26 +286,71 @@ fn pre_exposure_moves_in_whole_stops_and_never_shows() {
         ..ViewOutput::default()
     };
     let mut prev = settle(&mut h, 1.0, &output);
-    let mut steps = 0;
-    // 3 stops/s up for 3 s, then down.
-    for f in (0..=90).chain((0..90).rev()) {
-        let scale = (3.0 * f as f32 * h.dt).exp2();
+    let (mut lowest, mut highest) = (prev.adapted_ev100, prev.adapted_ev100);
+    // Six stops down at 3 stops/s and back, at the default adaptation rates.
+    for f in 0..240 {
+        let scale = down_and_up(f, 60, 6.0);
         let t = h.frame(scale, &output, Some(&display));
-        let stops = (t.pre_exposure / prev.pre_exposure).log2();
-        assert_eq!(stops.fract(), 0.0, "pre-exposure moved {stops} stops");
-        steps += u32::from(stops != 0.0);
+        // The next frame is lit at the exposure this one adapted to.
         let s = exposure_from_ev100(t.adapted_ev100);
-        assert!((s / t.pre_exposure).log2().abs() <= 1.0 + 1e-4);
-        // The image shows the adapted exposure whatever the pre-exposure.
+        assert!(
+            (t.pre_exposure / s - 1.0).abs() < 1e-5,
+            "frame {f}: pre-exposure {} against {s}",
+            t.pre_exposure
+        );
+        // This frame, lit at the last one's, shows its own adapted exposure.
         let shown = h.display_linear()[0][1];
         let expected = nits[0] * scale * s;
         assert!(
             (shown / expected - 1.0).abs() < 2e-3,
-            "{shown} against {expected}"
+            "frame {f}: {shown} against {expected}, lit at {}",
+            prev.pre_exposure
         );
+        lowest = lowest.min(t.adapted_ev100);
+        highest = highest.max(t.adapted_ev100);
         prev = t;
     }
-    assert!(steps >= 4, "{steps} pre-exposure steps");
+    assert!(highest - lowest > 4.0, "exposure moved {lowest}..{highest}");
+    assert_clean();
+}
+
+/// Through a history that keeps its last image whatever its pre-exposure, as ray
+/// reconstruction's does, the image changes from frame to frame by no more than the scene
+/// and the adaptation rate move it. A step in pre-exposure would show as a flash.
+#[test]
+fn a_history_unaware_of_pre_exposure_shows_no_flash() {
+    const MARGIN_EV: f32 = 0.05;
+    let mut h = Harness::new(SIDE, SIDE);
+    let nits = 50.0;
+    h.set_image(&vec![nits; h.pixels()]);
+    let display = DisplayRequest::default().resolve(&[OutputFormat::Hdr10Pq], None, false);
+    let output = ViewOutput {
+        debug: OutputDebug::Linear,
+        ..ViewOutput::default()
+    };
+    let auto = AutoExposure::default();
+    let fastest = auto.speed_brighten.max(auto.speed_darken) * h.dt;
+    // The history starts once the cut's snaps have settled.
+    settle(&mut h, 1.0, &output);
+    h.history = 0.9;
+    h.frame(1.0, &output, Some(&display));
+    let (mut scene, mut shown) = (1.0f32, h.display_linear()[0][1]);
+    let mut worst = 0.0f32;
+    // Four stops down at 2 stops/s and back.
+    for f in 0..240 {
+        let next = down_and_up(f, 60, 4.0);
+        h.frame(next, &output, Some(&display));
+        let now = h.display_linear()[0][1];
+        let change = (now / shown).log2().abs();
+        let allowed = (next / scene).log2().abs() + fastest + MARGIN_EV;
+        assert!(
+            change <= allowed,
+            "frame {f}: the image moved {change} EV, {allowed} allowed"
+        );
+        worst = worst.max(change - allowed + MARGIN_EV);
+        (scene, shown) = (next, now);
+    }
+    log::info!("largest change past the scene's and the adaptation's: {worst} EV");
     assert_clean();
 }
 

@@ -1013,7 +1013,7 @@ mod glare {
 
     use pyramid::Plane;
 
-    /// An emitter's exposed value: within the HDR ceiling at any whole-stop pre-exposure.
+    /// An emitter's exposed value, under the HDR ceiling.
     const EXPOSED: f32 = 8000.0;
 
     /// The EV100 at which the lens is at table F-number `i` at the reference pitch.

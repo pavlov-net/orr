@@ -1,6 +1,7 @@
 // Lights a test image as lighting would: radiance = color * luminance * scale, pre-exposed
 // with the view's current exposure slot and capped at the HDR ceiling. The color is per
-// pixel when `colors` is set.
+// pixel when `colors` is set. With `history`, the target keeps that share of its last image
+// as it stands, as ray reconstruction keeps its history across a change of pre-exposure.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_scene.view;
@@ -19,7 +20,7 @@ struct Root
     float r;
     float g;
     float b;
-    uint _pad0;
+    float history;
     uint _pad1;
     uint _pad2;
 }
@@ -38,5 +39,8 @@ void main(uint3 id: SV_DispatchThreadID)
     if (root.colors != nullptr)
         color = float3(*(root.colors + 3 * i), *(root.colors + 3 * i + 1), *(root.colors + 3 * i + 2));
     float3 c = apply_hdr_ceiling(color * l * cur.pre_exposure);
-    root.target.get<RWTexture2D<float4>>()[id.xy] = float4(c, 1.0);
+    RWTexture2D<float4> target = root.target.get<RWTexture2D<float4>>();
+    if (root.history > 0.0)
+        c = lerp(c, target[id.xy].rgb, root.history);
+    target[id.xy] = float4(c, 1.0);
 }

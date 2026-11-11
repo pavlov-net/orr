@@ -66,6 +66,10 @@ pub struct Harness {
     pub dt: f32,
     /// Linear Rec.2020 color the luminance multiplies; gray by default.
     pub color: [f32; 3],
+    /// The share of its last image the radiance keeps as it stands, whatever the pre-exposure
+    /// it was lit with, as ray reconstruction's history does; 0 by default. A camera cut
+    /// drops it.
+    pub history: f32,
     /// The lens's glare, run before tonemap; off by default.
     pub glare: Option<Glare>,
     pub sensor_height_mm: f32,
@@ -143,6 +147,7 @@ impl Harness {
             frame: 0,
             dt: 1.0 / 30.0,
             color: [1.0; 3],
+            history: 0.0,
             glare: None,
             sensor_height_mm: orr_scene::Lens::default().sensor_height_mm,
             composite: None,
@@ -198,6 +203,7 @@ impl Harness {
         let gpu = device();
         self.frame += 1;
         let screenshot = self.screenshot_next.take();
+        let cut = std::mem::take(&mut self.cut_next);
         let mut constants: ViewConstants = bytemuck::Zeroable::zeroed();
         constants.exposure = self.exposure.gpu();
         constants.exposure_slot = (self.frame % 2) as u32;
@@ -222,7 +228,7 @@ impl Harness {
             r,
             g,
             b,
-            _pad0: 0,
+            history: if cut { 0.0 } else { self.history },
             _pad1: 0,
             _pad2: 0,
         };
@@ -259,7 +265,7 @@ impl Harness {
                     extent: self.extent,
                     view,
                     sky: self.sky.gpu(),
-                    camera_cut: std::mem::take(&mut self.cut_next),
+                    camera_cut: cut,
                     frame: self.frame,
                     output,
                 },

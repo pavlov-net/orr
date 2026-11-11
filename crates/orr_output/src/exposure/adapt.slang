@@ -298,15 +298,11 @@ void main()
         next.pre_exposure = max(cur.pre_exposure, min(cur.pre_exposure * exp2(SEARCH_STOPS), highest));
     }
 
+    // Pre-exposure follows the adapted exposure every frame. Ray reconstruction neither
+    // rescales its history nor takes the pre-exposure, so a step in it shows as a flash;
+    // the histories orr keeps rescale by `pre_exposure / prev_pre_exposure`.
     if (!hold)
-    {
-        float s = exposure_from_ev100(next.adapted_ev100);
-        float stops = log2(s / cur.pre_exposure);
-        if (snap || !(abs(stops) < 64.0))
-            next.pre_exposure = s;
-        else if (abs(stops) > 1.0)
-            next.pre_exposure = cur.pre_exposure * exp2(round(stops));
-    }
+        next.pre_exposure = exposure_from_ev100(next.adapted_ev100);
 
     // White point: (0, 0) is unset and snaps at the next frame with light.
     bool white_set = cur.white_point_xy.y > 0.0;
