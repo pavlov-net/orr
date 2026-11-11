@@ -131,6 +131,7 @@ public struct ProbeGpu
     public float depth;
     public float distance;          // m along the pixel ray
     public float4 relative;         // the hit, eye-relative render space
+    public float4 placement[3];     // rows [L | t] of the drawn placement, t eye-relative
     public float4 base_color;       // w: specular roughness
     public float4 specular_color;   // w: specular weight
     public float4 emission;         // w: metalness
@@ -404,6 +405,9 @@ void probe(uint3 id: SV_DispatchThreadID)
     o.material = hit.input.material;
     o.distance = hit.distance;
     o.relative = float4(hit.relative, 0.0);
+    Placement pl = hit.placement;
+    for (uint k = 0; k < 3; k++)
+        o.placement[k] = float4(pl.linear[k], pl.translation[k]);
     o.depth = r.depth[index];
     MaterialGpu* m = s.materials + hit.input.material;
     o.material_flags = m.flags;

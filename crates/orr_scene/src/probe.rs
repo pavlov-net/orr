@@ -490,6 +490,24 @@ impl fmt::Display for PixelProbe {
         )?;
         let at = v.position + Vec3::new(g.relative[0], g.relative[1], g.relative[2]).as_dvec3();
         writeln!(f, "hit at world ({:.3}, {:.3}, {:.3})", at.x, at.y, at.z)?;
+        let p = &g.placement;
+        let origin = v.position + Vec3::new(p[0][3], p[1][3], p[2][3]).as_dvec3();
+        writeln!(
+            f,
+            "placed by rows ({:.6}, {:.6}, {:.6}) ({:.6}, {:.6}, {:.6}) ({:.6}, {:.6}, {:.6}) at world ({:.4}, {:.4}, {:.4})",
+            p[0][0],
+            p[0][1],
+            p[0][2],
+            p[1][0],
+            p[1][1],
+            p[1][2],
+            p[2][0],
+            p[2][1],
+            p[2][2],
+            origin.x,
+            origin.y,
+            origin.z
+        )?;
         let lists = [
             (LIST_OPAQUE, "mesh-shader opaque"),
             (LIST_ALPHA, "mesh-shader alpha"),
