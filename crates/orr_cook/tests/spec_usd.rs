@@ -4843,7 +4843,7 @@ fn instancing(attributes: &str) -> String {
 }
 
 /// The cells of the animated pages of `model` and how they place its copies `t` seconds in.
-fn placed_at(a: &Archive, model: &str, t: f32) -> Vec<([i32; 3], Affine3)> {
+fn placed_at(a: &Archive, model: &str, t: f64) -> Vec<([i32; 3], Affine3)> {
     let want = AssetId::from_name(model);
     let mut out = Vec::new();
     for e in a
@@ -4871,7 +4871,7 @@ fn placed_at(a: &Archive, model: &str, t: f32) -> Vec<([i32; 3], Affine3)> {
 }
 
 /// How the animated pages of `model` place its copies `t` seconds in, in scene space, sorted.
-fn transforms_at(a: &Archive, model: &str, t: f32) -> Vec<Mat4> {
+fn transforms_at(a: &Archive, model: &str, t: f64) -> Vec<Mat4> {
     let in_scene = |(cell, mut m): ([i32; 3], Affine3)| {
         m.translation += Vec3::from(cell.map(|c| c as f32)) * 256.0;
         Mat4::from(m)
@@ -4883,7 +4883,7 @@ fn transforms_at(a: &Archive, model: &str, t: f32) -> Vec<Mat4> {
 }
 
 /// The lowest corner of each copy of the triangle in `model`, `t` seconds in.
-fn copies_at(a: &Archive, model: &str, t: f32) -> Vec<Vec3> {
+fn copies_at(a: &Archive, model: &str, t: f64) -> Vec<Vec3> {
     let lowest = |m: &Mat4| {
         [Vec3::ZERO, Vec3::X, Vec3::Y]
             .map(|c| m.transform_point3(c))
@@ -4897,7 +4897,7 @@ fn copies_at(a: &Archive, model: &str, t: f32) -> Vec<Vec3> {
 }
 
 #[track_caller]
-fn assert_copies(a: &Archive, t: f32, want: &[[f32; 3]]) {
+fn assert_copies(a: &Archive, t: f64, want: &[[f32; 3]]) {
     let got = copies_at(a, "u/Proto", t);
     assert_eq!(got.len(), want.len(), "at {t} s: {got:?}");
     for (g, w) in got.iter().zip(want) {
@@ -5042,7 +5042,7 @@ fn a_rate_runs_through_samples_and_holds_the_rest() {
     float3[] scales.timeSamples = { 0: [(1, 1, 1)], 4: [(2, 2, 2)], 10: [(3, 3, 3)] }"#,
         ),
     );
-    let at = |t: f32| transforms_at(&a, "u/Proto", t)[0];
+    let at = |t: f32| transforms_at(&a, "u/Proto", f64::from(t))[0];
     for t in [0.2f32, 0.39, 0.4, 0.75] {
         let x = at(t).transform_point3(Vec3::ZERO).x;
         let want = t + t * t;

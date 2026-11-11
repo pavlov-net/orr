@@ -56,7 +56,7 @@ const FAR_RUN: CopyRuns = CopyRuns {
 };
 
 /// Seconds of an animated page's rows wanted ahead of its clock.
-const MOTION_AHEAD: f32 = 1.0;
+const MOTION_AHEAD: f64 = 1.0;
 
 /// `tables.slang` `GROUP_QUANTIZED_PAGE`.
 const GROUP_QUANTIZED_PAGE: u32 = 1;
@@ -376,17 +376,17 @@ pub(crate) struct PageMotion {
     pub(crate) records: TransformGroupId,
     /// The transforms its copies read.
     pub(crate) group: TransformGroupId,
-    pub(crate) times: Vec<f32>,
+    pub(crate) times: Vec<f64>,
     pub(crate) left: [[f32; 4]; 3],
     pub(crate) right: [[f32; 4]; 3],
     pub(crate) count: u32,
     /// s of the page's clock, from [`SceneWriter::set_page_time`].
-    pub(crate) time: f32,
+    pub(crate) time: f64,
     /// Whether the clock last ran forward, the way its windows stream ahead.
     pub(crate) forward: bool,
     /// The interval and seconds into it last posed, where copies hold while the window of the
     /// clock is on its way.
-    pub(crate) held: Option<(u32, f32)>,
+    pub(crate) held: Option<(u32, f64)>,
 }
 
 impl PageMotion {
@@ -395,7 +395,7 @@ impl PageMotion {
     /// with room for one window gives it to the clock's, or copies would hold for good.
     pub(crate) fn windows(&self, per_window: u32) -> Vec<(u32, f64)> {
         let window =
-            |t: f32| orr_pack::instance::motion_interval(&self.times, t).0 as u32 / per_window;
+            |t: f64| orr_pack::instance::motion_interval(&self.times, t).0 as u32 / per_window;
         let now = window(self.time);
         let last = (self.times.len() as u32 - 1) / per_window;
         let (first, end) = if self.forward {
@@ -2389,7 +2389,7 @@ impl<'f> SceneWriter<'f> {
     /// Sets the clock of the animated page placed at `range`, in seconds, on the timeline of its
     /// skeleton clips. Copies of a page that holds still ignore it. A clock that wraps reads as a
     /// seek: the page can't know it loops, so its copies hold until the rows of the new time land.
-    pub fn set_page_time(&mut self, range: InstanceRange, seconds: f32) {
+    pub fn set_page_time(&mut self, range: InstanceRange, seconds: f64) {
         let cpu = &mut *self.scene.cpu.lock().unwrap();
         if let Some(m) = cpu.page_motions.iter_mut().find(|m| m.range == range) {
             if seconds != m.time {

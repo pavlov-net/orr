@@ -30,7 +30,7 @@ fn angle_deg(q: [f64; 4], d: [f32; 4]) -> f64 {
 
 #[test]
 fn layouts_match_the_gpu_structs() {
-    assert_eq!(size_of::<InstancePageHeader>(), 208);
+    assert_eq!(size_of::<InstancePageHeader>(), 216);
     assert_eq!(size_of::<MotionRow>(), 88);
     assert_eq!(size_of::<Prototype>(), 32);
     assert_eq!(size_of::<SectionOverride>(), 20);
@@ -38,6 +38,7 @@ fn layouts_match_the_gpu_structs() {
     assert_eq!(size_of::<AffineRows>(), 48);
     assert_eq!(std::mem::offset_of!(InstancePageHeader, user_stride), 64);
     assert_eq!(std::mem::offset_of!(InstancePageHeader, partitions), 68);
+    assert_eq!(std::mem::offset_of!(InstancePageHeader, motion_start), 200);
     assert_eq!(std::mem::offset_of!(InstanceRecord, rot), 8);
     assert_eq!(std::mem::offset_of!(InstanceRecord, fine), 18);
 }
@@ -99,6 +100,29 @@ fn a_table_that_does_not_match_its_records_is_malformed() {
     assert!(instance::decode(&head, &blob[..blob.len() - 48]).is_err());
     // Fewer bytes than the header's records.
     assert!(instance::decode(&head, &blob[..16]).is_err());
+}
+
+/// A page's clock and interval starts are f64: an hour in, the seconds into an interval come
+/// back from the stored page to within an f32 of themselves, not of the clock.
+#[test]
+fn an_hour_in_the_seconds_into_an_interval_keep_their_digits() {
+    let (mut info, _) = sheared_page();
+    let start = |k: u32| 3599.0 + f64::from(k) / 24.0;
+    info.motion_times = (0..=48).map(start).collect();
+    info.header.motion_window = 8;
+    info.header.motion_start = start(24) + 0.01;
+    let stored = InstancePageInfo::parse(&info.to_bytes()).unwrap();
+    assert_eq!(stored.header.motion_start, info.header.motion_start);
+    for k in 1..48 {
+        for into in [1e-3, 0.0123, 0.04] {
+            let (got, dt) = instance::motion_interval(&stored.motion_times, start(k) + into);
+            assert_eq!(got as u32, k);
+            assert!(
+                (dt - into).abs() <= into * 2f64.powi(-24),
+                "{k}: {dt} s, not {into}"
+            );
+        }
+    }
 }
 
 #[test]

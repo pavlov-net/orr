@@ -5709,7 +5709,7 @@ fn an_animated_page_follows_its_clock_and_its_joint() {
         let placed = place_page(&mut w, asset, 0.0);
         let range = placed.ranges[0];
         let mut frame = base;
-        let mut from = |w: &mut World, before: f32, t: f32, joint: Option<f32>| {
+        let mut from = |w: &mut World, before: f64, t: f64, joint: Option<f32>| {
             frame += 4;
             let mut g = None;
             for n in 0..4 {
@@ -5781,7 +5781,7 @@ fn an_animated_page_past_its_pool_streams_by_its_clock() {
     let placed = place_page(&mut w, "long walk", 0.0);
     let mut frame = 0;
     let rest = walk_rest(&mut w, &placed, &mut frame);
-    let times = (1..40).map(|i| i as f32 * 0.5).chain([0.0]);
+    let times = (1..40).map(|i| f64::from(i) * 0.5).chain([0.0]);
     for t in times {
         let want = walk_px(t);
         let start = Instant::now();
@@ -9798,7 +9798,7 @@ fn long_walk() -> Instances {
             ..PrototypeSpec::default()
         }],
         motion: Some(Arc::new(InstanceMotion {
-            times: (0..WALK_INTERVALS).map(|k| k as f32 * 0.1).collect(),
+            times: (0..WALK_INTERVALS).map(|k| k as f64 * 0.1).collect(),
             rows: rows.collect(),
             anchors: vec![[0.0; 3]; WALK_RECORDS],
             left: DMat4::IDENTITY,
@@ -9823,7 +9823,7 @@ fn walk_world(pool: u64) -> World {
 }
 
 /// A shot of [`long_walk`] at `t` s of its clock.
-fn walk_shot(w: &mut World, placed: &Placed, frame: &mut u32, t: f32) -> Frame {
+fn walk_shot(w: &mut World, placed: &Placed, frame: &mut u32, t: f64) -> Frame {
     *frame += 1;
     let (eye, target) = (DVec3::new(0.9, 0.0, 2.5), DVec3::new(0.9, 0.0, 0.0));
     let mut shot = Shot::at(eye, target, *frame);
@@ -9842,8 +9842,8 @@ fn walk_middle(g: &Frame) -> Option<f64> {
 }
 
 /// Pixels the copy of [`long_walk`] in view has moved by `t` s.
-fn walk_px(t: f32) -> f64 {
-    let interval = f64::from((t / 0.1 + 1e-3).floor());
+fn walk_px(t: f64) -> f64 {
+    let interval = (t / 0.1 + 1e-3).floor();
     let f = 1.0 / (0.45f64).tan();
     let aspect = f64::from(EXTENT[0]) / f64::from(EXTENT[1]);
     0.5 * f64::from(WALK_STEP) * interval / 2.5 * f / aspect * f64::from(EXTENT[0])

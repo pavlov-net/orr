@@ -2124,8 +2124,8 @@ impl<'s> Importer<'s> {
             ..
         } = at;
         let right = self.root.inverse();
-        let seconds = |t: &f64| self.timeline.seconds(*t) as f32;
-        let times: Vec<f32> = motion.times.iter().map(seconds).collect();
+        let seconds = |t: &f64| self.timeline.seconds(*t);
+        let times: Vec<f64> = motion.times.iter().map(seconds).collect();
         for (proto, entry) in instancer.protos.iter().enumerate() {
             let Some((_, p)) = entry else { continue };
             let held = |&k: &usize| motion.slots[k].0 == proto;

@@ -17,7 +17,7 @@ const VERSIONS: &[(Class, u32)] = &[
     (Class::Texture, 7),
     (Class::Material, 11),
     (Class::Model, 3),
-    (Class::InstancePage, 8),
+    (Class::InstancePage, 9),
     (Class::RasterSet, 3),
     (Class::Skeleton, 2),
     (Class::Clip, 4),

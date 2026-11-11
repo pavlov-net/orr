@@ -42,7 +42,7 @@ pub struct Instances {
 #[derive(Clone, Debug, PartialEq)]
 pub struct InstanceMotion {
     /// Seconds each interval starts at.
-    pub times: Vec<f32>,
+    pub times: Vec<f64>,
     /// Per interval a row per record, interval-major, each position from its record's anchor.
     pub rows: Vec<MotionRow>,
     /// Per record a point between `left` and `right`, in f64: rows stay small, and a page brings
@@ -52,7 +52,7 @@ pub struct InstanceMotion {
     pub left: DMat4,
     pub right: DMat4,
     /// Seconds of `times` the stage was read at, where the copies stand until set.
-    pub start: f32,
+    pub start: f64,
 }
 
 /// A joint of a skeleton entry.
@@ -567,6 +567,7 @@ fn build_page(
         motion_right: AffineRows::from(Affine3::IDENTITY),
         motion_start: 0.0,
         motion_window: 1,
+        _pad: 0,
     };
     let mut forms: Vec<Form> = members
         .iter()

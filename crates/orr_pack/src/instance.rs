@@ -31,7 +31,8 @@
 //! must be resident at one time does not grow with the length of the animation.
 //! [`motion_interval`] finds the interval of a time, and [`motion_transform`] is the reference for
 //! the kernel that evaluates a row. The first interval runs back from the second without end, and
-//! the last on.
+//! the last on. The clock and the interval starts are f64, so the seconds into an interval keep
+//! their precision however late the clock; the kernel takes them as [`motion_dt`].
 //! An instance needs a transform that inverts, so a scale of 0 on an axis stands at
 //! [`MOTION_FLAT`], which draws the same, and one of 0 on all three hides the instance.
 
@@ -41,7 +42,7 @@ use orr_math::{Affine3, BVec3, DAffine3, DMat3, DQuat, DVec3, DVec4, Mat3, Quat,
 use crate::blob::{put_table, read, table};
 use crate::{Aabb, AffineRows, AssetId, Error, Result, Span};
 
-pub const SCHEMA: u16 = 2;
+pub const SCHEMA: u16 = 3;
 
 /// Records per page.
 pub const MAX_RECORDS: usize = 16_384;
@@ -62,7 +63,7 @@ pub const MOTION_FLAT: f32 = 1.0 / (1u64 << 60) as f32;
 pub const MOTION_WINDOW_BYTES: usize = 2 << 20;
 const _: () = assert!(MAX_RECORDS * size_of::<MotionRow>() <= MOTION_WINDOW_BYTES);
 
-/// Blob 0 header, 208 B.
+/// Blob 0 header, 216 B.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct InstancePageHeader {
@@ -91,16 +92,17 @@ pub struct InstancePageHeader {
     /// the bind space of joint `frame_joint`, and its skinning matrix (a palette entry) poses them.
     pub frame_skeleton: AssetId,
     pub frame_joint: u32,
-    /// f32 seconds each interval of an animated page starts at; empty on a page that holds still.
+    /// f64 seconds each interval of an animated page starts at; empty on a page that holds still.
     pub motion_times: Span,
     /// A row's transform stands between these, relative to the page's cell:
     /// `motion_left * row * motion_right`.
     pub motion_left: AffineRows,
     pub motion_right: AffineRows,
     /// s of the clock of [`Self::motion_times`] that a page stands at until something sets it.
-    pub motion_start: f32,
+    pub motion_start: f64,
     /// Intervals in a window of rows, the last window up to the end.
     pub motion_window: u32,
+    pub _pad: u32,
 }
 
 impl InstancePageHeader {
@@ -141,6 +143,9 @@ impl InstancePageHeader {
 /// position `p + dt (v + a dt / 2)`, the rotation by `spin` degrees a second about its direction,
 /// and scale `s + g dt`. Linear interpolation is a velocity, and spherical a spin, so every way an
 /// instance can move is this one formula. An instance not there has a rotation of all zeros.
+/// Position and scale take `dt` in f32, as their own rounding is relative; the turn, which only
+/// matters modulo a full turn, is `|spin| dt` with neither rounded, reduced before it is turned
+/// into a rotation.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct MotionRow {
@@ -157,19 +162,25 @@ pub struct MotionRow {
 impl MotionRow {
     /// Scale, rotation and translation `dt` seconds on, `None` where the instance is not there or
     /// has no size.
-    pub fn at(&self, dt: f32) -> Option<(Vec3, Quat, Vec3)> {
+    pub fn at(&self, dt: f64) -> Option<(Vec3, Quat, Vec3)> {
         if self.rotation == [0.0; 4] {
             return None;
         }
         let (p, v) = (Vec3::from(self.position), Vec3::from(self.velocity));
         let a = Vec3::from(self.acceleration);
-        let spin = Vec3::from(self.spin);
+        let spin = DVec3::from_array(self.spin.map(f64::from));
         let q = Quat::from_array(self.rotation);
-        let turn = (spin.length() * dt).to_radians();
-        let turned = match spin.try_normalize() {
-            Some(axis) => Quat::from_axis_angle(axis, turn) * q,
-            None => q,
+        let rate = spin.length();
+        let turned = match rate > 0.0 {
+            true => {
+                // `%` is exact, so the turn keeps the product's digits however far it runs.
+                let turn = (rate * dt) % 360.0;
+                let by = DQuat::from_axis_angle(spin / rate, turn.to_radians());
+                (by * q.as_dquat()).as_quat()
+            }
+            false => q,
         };
+        let dt = dt as f32;
         let s = Vec3::from(self.scale) + Vec3::from(self.growth) * dt;
         if s.abs().max_element() < MOTION_FLAT {
             return None;
@@ -180,14 +191,21 @@ impl MotionRow {
 }
 
 /// The interval of `times` that `t` falls in, and the seconds since it started.
-pub fn motion_interval(times: &[f32], t: f32) -> (usize, f32) {
+pub fn motion_interval(times: &[f64], t: f64) -> (usize, f64) {
     let k = times[1..].partition_point(|&x| x <= t);
     (k, t - times[k])
 }
 
+/// Seconds into an interval as the kernel takes them: the f32 nearest, then the f32 nearest what
+/// that leaves, which together keep an f64's digits to well past the f32's.
+pub fn motion_dt(dt: f64) -> [f32; 2] {
+    let hi = dt as f32;
+    [hi, (dt - f64::from(hi)) as f32]
+}
+
 /// The cell-relative transform of `row` `dt` seconds into its interval, `None` where the instance
 /// is not there.
-pub fn motion_transform(h: &InstancePageHeader, row: &MotionRow, dt: f32) -> Option<Affine3> {
+pub fn motion_transform(h: &InstancePageHeader, row: &MotionRow, dt: f64) -> Option<Affine3> {
     let (s, q, p) = row.at(dt)?;
     let trs = Affine3::from_scale_rotation_translation(s, q, p);
     Some(Affine3::from(h.motion_left) * trs * Affine3::from(h.motion_right))
@@ -297,7 +315,7 @@ pub struct InstancePageInfo {
     pub sections: Vec<SectionOverride>,
     pub partitions: Vec<u16>,
     /// [`InstancePageHeader::motion_times`].
-    pub motion_times: Vec<f32>,
+    pub motion_times: Vec<f64>,
 }
 
 impl InstancePageInfo {

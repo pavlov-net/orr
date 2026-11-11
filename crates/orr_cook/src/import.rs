@@ -153,10 +153,9 @@ fn moving_reach(ib: DMat4, motion: &InstanceMotion, clock: (f64, f64), radius: f
     let records = motion.anchors.len();
     let mut reach: f64 = 0.0;
     for (k, &start) in motion.times.iter().enumerate() {
-        let start = f64::from(start);
         // The first interval runs back without end, and the last on.
         let from = if k == 0 { f64::MIN } else { start };
-        let to_time = motion.times.get(k + 1).map_or(f64::MAX, |&t| f64::from(t));
+        let to_time = motion.times.get(k + 1).copied().unwrap_or(f64::MAX);
         let (a, b) = (from.max(clock.0), to_time.min(clock.1));
         if a > b {
             continue;

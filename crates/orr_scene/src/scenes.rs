@@ -2259,6 +2259,7 @@ impl<'a> Frame<'a> {
                     Some((at, dt)) => (unsafe { GpuPtr::from_address(GpuAddress(at)) }, dt),
                     None => (GpuPtr::NULL, 0.0),
                 };
+                let dt = orr_pack::instance::motion_dt(dt);
                 motions.push(page_motion::PageMotionRoot {
                     scene: scene.tables.root.gpu(),
                     rows,
@@ -2270,8 +2271,8 @@ impl<'a> Frame<'a> {
                     right2: m.right[2],
                     group: m.group.0,
                     count: m.count,
-                    dt,
-                    _pad: 0,
+                    dt: dt[0],
+                    dt_lo: dt[1],
                 });
             }
         }
