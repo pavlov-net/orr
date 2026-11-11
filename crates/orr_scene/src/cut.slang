@@ -73,9 +73,9 @@ public static const uint ADMIT_BUCKETS = 1 << ADMIT_BITS;
 public static const uint ADMIT_SHIFT = 31 - ADMIT_BITS;
 // The most digits a key has: 31 bits of distance and 32 of slot.
 public static const uint ADMIT_LEVELS = 5;
-// `CutGpu.admit` past the buckets, four words each: per digit past the first, the bucket the
-// capacity ran out in, then the CLAS and BLAS builds of the cuts before that bucket of the
-// last digit taken, two words each.
+// `CutGpu.admit` past the buckets, which take four words each: per digit past the first, the
+// bucket the capacity ran out in, then the CLAS and BLAS builds of the cuts before that
+// bucket of the last digit taken, two words each.
 public static const uint ADMIT_STOPS = 4 * ADMIT_BUCKETS;
 public static const uint ADMIT_TAKEN = ADMIT_STOPS + ADMIT_LEVELS - 1;
 public static const uint ADMIT_WORDS = ADMIT_TAKEN + 4;
