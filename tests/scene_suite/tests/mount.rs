@@ -4683,6 +4683,36 @@ fn moving_tiles_evicted_while_their_bind_waits_leave_their_move() {
     assert_clean();
 }
 
+/// The scratch memory of tile moves runs out as a block drains: the frames go on with every
+/// tile exact and the budgets hear of it, and the block empties once memory returns.
+#[test]
+fn tile_moves_without_scratch_memory_wait_and_leave_the_frames_exact() {
+    let _serial = serial();
+    let dev = device();
+    if !dev.binds_sparse_on(QueueKind::Render) {
+        return;
+    }
+    let mut c = Tiled::new(dev, &[CUBE]);
+    let failures = c.scenes.residency().out_of_memory;
+    c.scenes.fail_tile_scratch(true);
+    c.keep_coarse();
+    c.until_moving();
+    for _ in 0..4 {
+        c.frame(&[0]);
+        assert_tiled(&c.scenes, dev, c.mounts[0], CUBE, 1..9);
+    }
+    assert!(c.scenes.residency().out_of_memory > failures);
+    c.scenes.fail_tile_scratch(false);
+    c.drain(dev, &[0]);
+    assert_eq!(c.scenes.residency().failed, 0);
+    assert_eq!(
+        dev.validation_messages(),
+        0,
+        "validation messages (see the log)"
+    );
+    assert_clean();
+}
+
 /// The neural pack's set: color mip 0 size, the latents' mip 0 size and layers.
 const NEURAL_SIZE: [u32; 2] = [1024, 512];
 const LATENT_SIZE: [u32; 2] = [512, 256];

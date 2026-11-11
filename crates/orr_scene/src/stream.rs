@@ -554,6 +554,9 @@ pub(crate) struct Streaming {
     /// A test holds the binds of moving tiles back, as a busy loading thread does.
     #[cfg(feature = "test-hooks")]
     tile_binds_held: bool,
+    /// A test fails the scratch allocations of tile moves, as a device out of memory does.
+    #[cfg(feature = "test-hooks")]
+    tile_scratch_fails: bool,
     /// Whether the render queue takes the sparse binds that move tiles.
     moves_tiles: bool,
     /// The slots moved tiles left and the scratch their texels crossed, freed once the frame
@@ -706,6 +709,8 @@ impl Streaming {
             tile_finished: FxHashSet::default(),
             #[cfg(feature = "test-hooks")]
             tile_binds_held: false,
+            #[cfg(feature = "test-hooks")]
+            tile_scratch_fails: false,
             moves_tiles: device.binds_sparse_on(QueueKind::Render),
             retired_tile_slots: Vec::new(),
             retired_scratch: Vec::new(),
@@ -2266,7 +2271,17 @@ impl Streaming {
             return Ok(());
         }
         let bytes = tiles.len() as u64 * tile_bytes;
-        let scratch = match device.gpu_malloc::<u8>(MemoryKind::DeviceLocal, bytes, "tile moves") {
+        let scratch = device.gpu_malloc::<u8>(MemoryKind::DeviceLocal, bytes, "tile moves");
+        #[cfg(feature = "test-hooks")]
+        let scratch = scratch.and_then(|s| match self.tile_scratch_fails {
+            true => Err(orr_gpu::Error::OutOfMemory {
+                call: "tile moves",
+                device: true,
+                kind: Some(MemoryKind::DeviceLocal),
+            }),
+            false => Ok(s),
+        });
+        let scratch = match scratch {
             Ok(s) => s,
             Err(e) => {
                 for t in tiles {
@@ -2424,6 +2439,11 @@ impl Streaming {
     #[cfg(feature = "test-hooks")]
     pub(crate) fn hold_tile_binds(&mut self, hold: bool) {
         self.tile_binds_held = hold;
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn fail_tile_scratch(&mut self, fail: bool) {
+        self.tile_scratch_fails = fail;
     }
 
     /// The copies of the units and tiles the steps moved that no submitted list has carried,

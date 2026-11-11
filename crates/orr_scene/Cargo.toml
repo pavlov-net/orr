@@ -13,7 +13,8 @@ links = "orr_scene"
 testing = ["dep:image", "dep:nv-flip"]
 # Recompiles kernels whose sources change and swaps their pipelines at step 1, for dev builds.
 hot-reload = ["orr_shaders/hot-reload"]
-# Switches only the test suite turns: holding back the binds that finish tile moves.
+# Switches only the test suite turns: holding back the binds that finish tile moves, and
+# failing the scratch allocations of tile moves.
 test-hooks = []
 
 [dependencies]

@@ -1029,6 +1029,13 @@ impl Scenes {
         self.core.mounts.streaming.hold_tile_binds(hold);
     }
 
+    /// Fails the scratch allocations of tile moves as a device out of memory does, or lets
+    /// them be.
+    #[cfg(feature = "test-hooks")]
+    pub fn fail_tile_scratch(&mut self, fail: bool) {
+        self.core.mounts.streaming.fail_tile_scratch(fail);
+    }
+
     #[cfg(feature = "testing")]
     pub(crate) fn texture_object(&self, m: MountId, id: AssetId) -> Option<Arc<orr_gpu::Texture>> {
         self.core.mounts.texture_object(m, id)
