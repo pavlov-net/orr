@@ -703,26 +703,21 @@ impl Ptlas {
     }
 
     /// The layout the copies placed so far take: room for every slot handed out and for the
-    /// part runs their copies may hold at once. A layout that grows takes twice what it held,
-    /// or what it must, so the builds that grow it stay few; slots stop at the scene's, and part
-    /// instances at the 2^24 a released run names its start in.
-    fn wanted(&self) -> Result<Layout> {
+    /// part runs their copies may hold at once, which [`Self::check_runs`] keeps within the
+    /// 2^24 part instances a released run names its start in. A layout that grows takes twice
+    /// what it held, or what it must, so the builds that grow it stay few; slots stop at the
+    /// scene's, and part instances at 2^24.
+    fn wanted(&self) -> Layout {
         let mut layout = self.layout;
         let slots = self.slot_partition.len() as u32;
         if self.high_water > layout.slots {
             layout.slots = (2 * layout.slots).min(slots).max(self.high_water);
         }
-        let parts = self.demand.parts();
-        if parts > u64::from(MAX_PARTS) {
-            return Err(Error::Capacity {
-                what: "part instances",
-                capacity: MAX_PARTS,
-            });
+        let parts = self.demand.parts() as u32;
+        if parts > layout.parts {
+            layout.parts = (2 * layout.parts).min(MAX_PARTS).max(parts);
         }
-        if parts > u64::from(layout.parts) {
-            layout.parts = (2 * layout.parts).min(MAX_PARTS).max(parts as u32);
-        }
-        Ok(layout)
+        layout
     }
 
     /// The scene's TLAS for the frame about to record. Its storage is made the first time a
@@ -744,7 +739,7 @@ impl Ptlas {
         {
             return Ok(None);
         }
-        let layout = self.wanted()?;
+        let layout = self.wanted();
         let limits = self.limits(layout, self.partitions.len() as u32);
         if self.storage.as_ref().is_none_or(|s| s.limits != limits) {
             // A build has filled a storage, this one or one it replaced that no build has
