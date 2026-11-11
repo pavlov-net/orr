@@ -274,8 +274,7 @@ fn instance_entries_follow_scale_material_sets_hidden_sections_and_removal() {
     let det23 = |m: Mat3| f64::from(m.determinant().abs()).powf(2.0 / 3.0);
     // (slot, copy, rank, emission), None when the entry emits nothing.
     let check = |all: &[EmissiveGpu], live: &[(u32, usize, u32, Option<DVec3>)]| {
-        let instances: Vec<InstanceGpu> =
-            read_buffer(root.instances, u64::from(root.instance_capacity));
+        let instances: Vec<InstanceGpu> = read_buffer(root.instances, u64::from(root.part_base));
         let mut seen = 0;
         for (at, e) in all.iter().enumerate().skip(PRODUCERS as usize) {
             if e.kind == 0 {

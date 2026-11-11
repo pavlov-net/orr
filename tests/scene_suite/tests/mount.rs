@@ -1027,8 +1027,7 @@ fn an_unmount_takes_copies_and_pages_of_its_models_from_a_scene_that_keeps_rende
     let gpu = Gpu(device());
     let root: SceneRoot = gpu.value(root);
     let state = |gpu: &Gpu<'_>| -> (Vec<u8>, usize) {
-        let instances: Vec<orr_scene::InstanceGpu> =
-            gpu.values(root.instances, root.instance_capacity);
+        let instances: Vec<orr_scene::InstanceGpu> = gpu.values(root.instances, root.part_base);
         let entries: Vec<EmissiveGpu> = gpu.values(
             root.emissive,
             root.producer_capacity + root.emissive_capacity,
@@ -1192,8 +1191,7 @@ fn copies_at_one_position_past_a_partition_take_one_partition_a_run() {
         written += rt.writes;
         assert_eq!((rt.unplaced, rt.dropped), (0, 0));
         assert_eq!(rt.partitions, 3, "a partition per run");
-        let instances: Vec<orr_scene::InstanceGpu> =
-            gpu.values(root.instances, root.instance_capacity);
+        let instances: Vec<orr_scene::InstanceGpu> = gpu.values(root.instances, root.part_base);
         let placed = instances.iter().filter(|i| i.flags != 0).count();
         if placed == COPIES as usize && written >= COPIES && rt.deferred == 0 {
             break;

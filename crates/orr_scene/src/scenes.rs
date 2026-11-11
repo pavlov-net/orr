@@ -1898,7 +1898,7 @@ impl<'a> Frame<'a> {
                 origin_cell: cpu.origin_cell.extend(core.cell_log2 as i32).to_array(),
                 delta_time: self.time.delta,
                 frame_index: self.id as u32,
-                instance_capacity: scene.desc.instance_capacity,
+                skinned_capacity: scene.desc.skinned_capacity,
                 group_capacity: scene.desc.group_capacity,
                 light_capacity: scene.desc.light_capacity,
                 material_set_capacity: scene.desc.material_set_capacity
@@ -1913,8 +1913,6 @@ impl<'a> Frame<'a> {
                 skinned: t.skinned.gpu(),
                 skin_state: t.skin_state.gpu(),
                 skin_work: skin_work.unwrap_or(GpuPtr::NULL).cast(),
-                skinned_capacity: scene.desc.skinned_capacity,
-                decal_capacity: scene.desc.decal_capacity,
                 decals: t.decals.gpu(),
                 decal_bins: t.decal_bins.gpu(),
                 decal_refs: t.decal_refs.gpu(),

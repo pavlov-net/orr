@@ -439,22 +439,20 @@ public struct SceneRoot
     public int4 origin_cell;         // render origin cell, w = cell_log2
     public float delta_time;
     public uint frame_index;
-    public uint instance_capacity;
+    public uint skinned_capacity;
     public uint group_capacity;
     public uint light_capacity;
     public uint material_set_capacity;
     public uint producer_capacity;
     public uint emissive_capacity;   // instance entries, after the producer entries
     public float near_range;         // m
-    public uint part_base;           // PTLAS index of part instance 0
+    public uint part_base;           // PTLAS index of part instance 0; the instance slots come first, so also their count
     public uint part_capacity;
     public uint producer_base;       // PTLAS index of producer entry 0; also how `SurfaceInput`, `GSurface` and `VisibleCluster` name producer entries
     public CutGpu* cut;              // the frame's cuts
     public SkinnedGpu* skinned;      // skinned copies, `skinned_capacity` entries
     public SkinStateGpu* skin_state; // per skinned copy, written by the GPU
     public uint2* skin_work;         // this frame's skinning work items: skinned copy, mesh cluster
-    public uint skinned_capacity;
-    public uint decal_capacity;
     public DecalGpu* decals;         // by DecalId
     public DecalBinGpu* decal_bins;  // `decal_bin_slots` entries
     public uint* decal_refs;         // the global decals' ids, then each bin's run
