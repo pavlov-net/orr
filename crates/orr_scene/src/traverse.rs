@@ -443,7 +443,6 @@ impl RtTables {
     }
 }
 
-/// The record of the cut tables `gpu` names.
 /// The merged cuts of `models` models, which every frame's traversal clears before it writes.
 fn merged_cuts(device: &Device, models: u32) -> Result<Allocation<u32>> {
     Ok(device.gpu_malloc(
@@ -453,6 +452,7 @@ fn merged_cuts(device: &Device, models: u32) -> Result<Allocation<u32>> {
     )?)
 }
 
+/// The record of the cut tables `gpu` names.
 fn cut_record(device: &Device, gpu: CutGpu) -> Result<Allocation<CutGpu>> {
     let mut record = device.gpu_malloc::<CutGpu>(MemoryKind::Upload, 1, "cut tables")?;
     record.as_mut_slice().expect("upload is mapped")[0] = gpu;
