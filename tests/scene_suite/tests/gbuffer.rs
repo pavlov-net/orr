@@ -8821,7 +8821,7 @@ fn an_unmount_takes_a_skinned_page_and_its_motion_from_the_scene() {
     let state = || {
         let copies = read_buffer(root.instances, u64::from(root.part_base));
         let skins = read_buffer(root.skinned, u64::from(root.skinned_capacity));
-        let groups = read_buffer(root.groups, u64::from(root.group_capacity));
+        let groups = read_buffer(root.groups, u64::from(SceneDesc::default().group_capacity));
         [
             copies.iter().filter(|c| c.flags != 0).count(),
             skins.iter().filter(|k| k.positions != GpuPtr::NULL).count(),

@@ -30,8 +30,7 @@ bool palette_shown(SubdCopyGpu* c)
     if (c.joint_count == 0)
         return true;
     GroupGpu* palette = root.scene.groups + c.palette_group;
-    if (c.palette_group >= root.scene.group_capacity || palette.current == nullptr
-        || c.palette_first + c.joint_count > palette.count)
+    if (palette.current == nullptr || c.palette_first + c.joint_count > palette.count)
         return false;
     return palette_set(palette, c.palette_first, c.joint_count);
 }

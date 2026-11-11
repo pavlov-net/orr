@@ -1473,8 +1473,11 @@ impl<'f> SceneWriter<'f> {
     /// opaque sections. Fails with [`Error::NotResident`] for a model no ready mount or live
     /// edit holds.
     ///
-    /// Panics if `desc.material_set`'s set 0 ends past `material_set_capacity`.
+    /// Panics if `desc.material_set`'s set 0 ends past `material_set_capacity`, or if
+    /// `desc.transforms` or the pose's group is neither the null group nor one from
+    /// `create_transform_group`.
     pub fn add_instances(&mut self, desc: &InstancesDesc) -> Result<InstanceRange> {
+        self.check_groups(std::iter::once(desc.transforms).chain(desc.pose.map(|p| p.group)));
         self.placeable(desc.model)?;
         if let Some(base) = desc.material_set {
             self.check_material_set(desc.model, base, 0);
@@ -1597,8 +1600,10 @@ impl<'f> SceneWriter<'f> {
     /// per-copy settings come from the page.
     ///
     /// Panics if set 0 of a base in `r.material_sets` ends past `material_set_capacity` on its
-    /// prototype's model.
+    /// prototype's model, or if a group in `r.poses` is neither the null group nor one from
+    /// `create_transform_group`.
     pub fn add_instance_page(&mut self, r: &InstancePageRef<'_>) -> Result<InstanceRange> {
+        self.check_groups(r.poses.iter().map(|(_, pose)| pose.group));
         let page = page_needs(self.mounts, self.model_cpu, r.page)?;
         for &(index, base) in r.material_sets {
             if let Some(p) = page.2.get(usize::from(index)) {
@@ -1923,8 +1928,10 @@ impl<'f> SceneWriter<'f> {
     /// do, unless `r` names a material set. A page of anything else fails with
     /// [`Error::NotSkinnedPage`].
     ///
-    /// Panics if set 0 of `r.material_set` ends past `material_set_capacity` on the page's model.
+    /// Panics if set 0 of `r.material_set` ends past `material_set_capacity` on the page's model,
+    /// or if `r.palette` is neither the null group nor one from `create_transform_group`.
     pub fn add_skinned_page(&mut self, r: &SkinnedPageRef) -> Result<InstanceRange> {
+        self.check_groups([r.palette]);
         let protos = self.mounts.page_prototypes(r.page)?;
         let [proto] = protos.as_slice() else {
             return Err(Error::NotSkinnedPage(r.page));
@@ -2080,9 +2087,11 @@ impl<'f> SceneWriter<'f> {
     /// templates, in the PTLAS global partition. Copies skin whether or not a view shows
     /// them, and take the candidate class of the model's own materials as in
     /// [`Self::add_instances`]. Fails with [`Error::NotResident`] as that does. Panics if the
-    /// model's mesh has no skin or the model no skeleton, or if `desc.material_set`'s set 0
-    /// ends past `material_set_capacity`.
+    /// model's mesh has no skin or the model no skeleton, if `desc.material_set`'s set 0 ends
+    /// past `material_set_capacity`, or if `desc.transforms` or `desc.palette` is neither the
+    /// null group nor one from `create_transform_group`.
     pub fn add_skinned(&mut self, desc: &SkinnedDesc) -> Result<InstanceRange> {
+        self.check_groups([desc.transforms, desc.palette]);
         self.placeable(desc.model)?;
         if let Some(base) = desc.material_set {
             self.check_material_set(desc.model, base, 0);
@@ -2250,6 +2259,27 @@ impl<'f> SceneWriter<'f> {
         );
     }
 
+    /// Panics unless each group is the null group or one the consumer made. Kernels index the
+    /// group table by it unbounded, and a group created later can take an id no group holds. A
+    /// page's group is orr's, and holds records where a pose or palette reads matrices.
+    fn check_groups(&self, groups: impl IntoIterator<Item = TransformGroupId>) {
+        // Found under the lock and raised after it, so a refused call leaves the scene usable.
+        let refused = {
+            let cpu = self.scene.cpu.lock().unwrap();
+            groups.into_iter().find(|group| {
+                group.0 != 0
+                    && !cpu
+                        .groups
+                        .get(group.0 as usize)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|g| g.page.is_none())
+            })
+        };
+        if let Some(group) = refused {
+            panic!("{group:?} is not a group the consumer made");
+        }
+    }
+
     /// Refuses a model without a mesh and one no ready mount or live edit holds: the model
     /// table holds no record for it, or that of an unmounted pack's model.
     fn placeable(&self, model: ModelId) -> Result<()> {
@@ -2399,7 +2429,8 @@ impl<'f> SceneWriter<'f> {
 
     /// Sets or clears producer entry `id`. Setting allocates the entry's batch and build
     /// memory and resets its counts; its templates build this frame. The previous entry's
-    /// memory, if any, is freed once this frame has completed.
+    /// memory, if any, is freed once this frame has completed. Panics if `desc`'s transform
+    /// group is neither the null group nor one from `create_transform_group`.
     pub fn set_producer(&mut self, id: ProducerId, desc: Option<&ProducerDesc<'_>>) -> Result<()> {
         self.set_entry(id, desc, None)
     }
@@ -2412,12 +2443,14 @@ impl<'f> SceneWriter<'f> {
     /// extraordinary vertices and creases were refined to the cage's isolation level when
     /// it cooked; each patch dices like any other. Each diced cluster takes the class and alpha
     /// test of the material it binds. The copy ends with its model's pack or edit, and `id` stays
-    /// the consumer's. Panics with materials for another section count, or a palette for a cage
-    /// without skin or a model without a skeleton.
+    /// the consumer's. Panics with materials for another section count, a palette for a cage
+    /// without skin or a model without a skeleton, or a transform or palette group that is
+    /// neither the null group nor one from `create_transform_group`.
     pub fn set_subd(&mut self, id: ProducerId, desc: Option<&SubdDesc<'_>>) -> Result<()> {
         let Some(d) = desc else {
             return self.set_entry(id, None, None);
         };
+        self.check_groups(d.palette.map(|(palette, _)| palette));
         let cage = self.cages.get(d.model.0 as usize).and_then(Option::as_ref);
         let joints = self
             .model_cpu
@@ -2476,6 +2509,7 @@ impl<'f> SceneWriter<'f> {
             id.0 < self.scene.desc.producer_capacity,
             "{id:?} outside the producer table"
         );
+        self.check_groups(desc.map(|d| d.transform.0));
         let t = &self.scene.tables;
         let i = u64::from(id.0);
         let counts = t.producer_counts.gpu().offset(i);
