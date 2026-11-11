@@ -378,7 +378,8 @@ impl Rig {
 /// The root joints but the still joint give the box center of their rest translations, in whole
 /// units, `shift`, to the root; `bind_origin` is the whole meters nearest where the root puts
 /// that point, so a mesh grid of a step up to a meter holds the same vertices shifted, and
-/// [`Self::snap`] moves it onto a coarser grid. `origin` is where `after` puts it.
+/// [`Self::shift`] moves it onto a coarser grid ([`Self::snapped`]). `origin` is where `after`
+/// puts it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RigSpace {
     /// Skeleton space's origin, in `after` of model space.
@@ -452,15 +453,16 @@ impl RigSpace {
         space
     }
 
-    /// Moves bind space onto the mesh grid of step `2^k` m of the meshes it holds, and skeleton
-    /// space with it, in `info`: what its vertices give up, which is zero on a grid of a meter or
-    /// finer.
-    pub(crate) fn snap(&mut self, info: &mut SkeletonInfo, k: i8) -> DVec3 {
+    /// The point of the mesh grid of step `2^k` m nearest bind space origin `bind_origin`.
+    pub(crate) fn snapped(bind_origin: DVec3, k: i8) -> DVec3 {
         let step = 2f64.powi(i32::from(k));
-        let delta = (self.bind_origin / step).round() * step - self.bind_origin;
-        if delta == DVec3::ZERO {
-            return delta;
-        }
+        (bind_origin / step).round() * step
+    }
+
+    /// Moves bind space by `delta`, which [`Self::snapped`] puts on the mesh grid of the meshes it
+    /// holds, and skeleton space with it, in `info`. `delta` is what its vertices give up, which is
+    /// zero on a grid of a meter or finer.
+    pub(crate) fn shift(&mut self, info: &mut SkeletonInfo, delta: DVec3) {
         self.bind_origin += delta;
         self.origin += self.after * delta;
         info.origin = self.origin;
@@ -470,7 +472,6 @@ impl RigSpace {
             let moved = Mat4::from(*ib).as_dmat4() * DMat4::from_translation(delta);
             *ib = Affine3::from_mat4(moved.as_mat4());
         }
-        delta
     }
 
     /// Bind space from model space.

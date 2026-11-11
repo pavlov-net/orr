@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use orr_math::{DMat3, DMat4, DQuat, DVec3, Mat3, Mat4, Vec3};
+use orr_pack::Aabb;
 use orr_pack::instance::MotionRow;
 use orr_pack::material::{Material, slot};
 use orr_pack::skeleton::SkeletonInfo;
@@ -170,52 +171,57 @@ impl Scene {
     /// them sit on it: a joined model's grid holds every placement of it.
     pub(crate) fn snap_rigs(&mut self) {
         for s in 0..self.skeletons.len() {
+            let grids: Vec<(Aabb, i8, i8)> = self
+                .models
+                .iter()
+                .filter(|m| m.skeleton == Some(s))
+                .filter_map(|m| match &m.mesh {
+                    MeshSource::Data(d) if !d.positions.is_empty() => Some((
+                        mesh::position_bounds(&d.positions),
+                        m.settings.position_step_log2,
+                        d.min_exponent.unwrap_or(i8::MIN),
+                    )),
+                    _ => None,
+                })
+                .collect();
             // A mesh's grid follows the size of its coordinates, which a move can raise: snap
-            // again until the grid of the moved meshes holds the origin.
-            while let Some(k) = self.rig_exponent(s) {
-                let sk = &mut self.skeletons[s];
-                let delta = sk.space.snap(&mut sk.info, k);
-                if delta == DVec3::ZERO {
+            // the origin again until the grid of the moved meshes holds it, then move them once,
+            // so each coordinate rounds once.
+            let from = self.skeletons[s].space.bind_origin;
+            let mut to = from;
+            while let Some(k) = rig_exponent(&grids, to - from) {
+                let next = RigSpace::snapped(to, k);
+                if next == to {
                     break;
                 }
-                let moved = |p: &mut [f32; 3]| {
-                    *p = (Vec3::from(*p).as_dvec3() - delta).as_vec3().to_array();
-                };
-                for m in self.models.iter_mut().filter(|m| m.skeleton == Some(s)) {
-                    if let MeshSource::Data(d) = &mut m.mesh {
-                        d.positions.iter_mut().for_each(moved);
-                        if let Some(parts) = &mut d.parts {
-                            match &mut parts.pivots {
-                                mesh::Pivots::PerValue(p) | mesh::Pivots::PerVertex(p) => {
-                                    p.iter_mut().for_each(moved);
-                                }
-                                mesh::Pivots::Origin => {}
+                to = next;
+            }
+            let delta = to - from;
+            if delta == DVec3::ZERO {
+                continue;
+            }
+            let sk = &mut self.skeletons[s];
+            sk.space.shift(&mut sk.info, delta);
+            let moved = |p: &mut [f32; 3]| *p = moved_by(*p, delta);
+            for m in self.models.iter_mut().filter(|m| m.skeleton == Some(s)) {
+                if let MeshSource::Data(d) = &mut m.mesh {
+                    d.positions.iter_mut().for_each(moved);
+                    if let Some(parts) = &mut d.parts {
+                        match &mut parts.pivots {
+                            mesh::Pivots::PerValue(p) | mesh::Pivots::PerVertex(p) => {
+                                p.iter_mut().for_each(moved);
                             }
+                            mesh::Pivots::Origin => {}
                         }
                     }
-                    if let Some(cage) = &mut m.subd {
-                        for p in &mut cage.cage.cage.positions {
-                            *p = (p.as_dvec3() - delta).as_vec3();
-                        }
+                }
+                if let Some(cage) = &mut m.subd {
+                    for p in &mut cage.cage.cage.positions {
+                        *p = Vec3::from(moved_by(p.to_array(), delta));
                     }
                 }
             }
         }
-    }
-
-    /// The exponent of the coarsest grid of the meshes skeleton `s` holds, if it holds any.
-    fn rig_exponent(&self, s: usize) -> Option<i8> {
-        self.models
-            .iter()
-            .filter(|m| m.skeleton == Some(s))
-            .filter_map(|m| match &m.mesh {
-                MeshSource::Data(d) if !d.positions.is_empty() => {
-                    let own = mesh::grid_exponent(&d.positions, m.settings.position_step_log2);
-                    Some(own.max(d.min_exponent.unwrap_or(i8::MIN)))
-                }
-                _ => None,
-            })
-            .max()
     }
 
     /// The farthest displacement can move a point of model `m`, in its space: the most any of
@@ -227,6 +233,28 @@ impl Scene {
         let reach = materials.map(|&i| self.materials[i].material.displacement_reach());
         reach.map(f64::from).fold(0.0, f64::max)
     }
+}
+
+/// Point `p` of a rig's bind space once the space moves by `delta`.
+fn moved_by(p: [f32; 3], delta: DVec3) -> [f32; 3] {
+    (Vec3::from(p).as_dvec3() - delta).as_vec3().to_array()
+}
+
+/// The exponent of the coarsest grid of a rig's meshes, each its box of positions, the step it
+/// asks for and the least exponent it takes, once bind space moves by `delta`; `None` for a rig
+/// of no meshes. [`moved_by`] rises with each coordinate, so it moves a box to the box of the
+/// moved positions.
+fn rig_exponent(grids: &[(Aabb, i8, i8)], delta: DVec3) -> Option<i8> {
+    grids
+        .iter()
+        .map(|&(b, step_log2, least)| {
+            let moved = Aabb {
+                min: moved_by(b.min, delta),
+                max: moved_by(b.max, delta),
+            };
+            mesh::bounds_exponent(&moved, step_log2).max(least)
+        })
+        .max()
 }
 
 /// The farthest a copy of `motion`'s rows comes from the origin of the space `ib` takes theirs

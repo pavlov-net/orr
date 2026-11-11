@@ -1581,7 +1581,7 @@ pub(crate) fn grid_exponent(positions: &[[f32; 3]], step_log2: i8) -> i8 {
 }
 
 /// The box of `positions`, found in parallel.
-fn position_bounds(positions: &[[f32; 3]]) -> Aabb {
+pub(crate) fn position_bounds(positions: &[[f32; 3]]) -> Aabb {
     positions
         .par_chunks(1 << 16)
         .map(|c| {
@@ -1619,7 +1619,7 @@ fn mesh_exponent(b: &Aabb, step_log2: i8, min: Option<i8>) -> i8 {
 
 /// [`grid_exponent`] of positions with box `b`. [`Snap::cell`] rises with the coordinate, so
 /// the box's corners hold the extreme cells.
-fn bounds_exponent(b: &Aabb, step_log2: i8) -> i8 {
+pub(crate) fn bounds_exponent(b: &Aabb, step_log2: i8) -> i8 {
     let holds = |snap: Snap| {
         let fits = |x: f32| snap.cell(x).unsigned_abs() < 1 << 23;
         b.min.into_iter().chain(b.max).all(fits)
