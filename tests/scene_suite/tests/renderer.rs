@@ -1,6 +1,7 @@
 //! The frame through `orr::Renderer`: frames with no scene and no view, a scene frame with
 //! a view, a consumer pipeline that hot reload replaces, views whose transient targets share
-//! memory, the glare a view's lens asks for, and views while the path kernels compile.
+//! memory, the glare a view's lens asks for, exposure across a camera cut, and views while the
+//! path kernels compile.
 
 use std::cell::Cell;
 use std::fs;
@@ -9,12 +10,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use orr::{
-    ArenaReport, Budgets, DirectionalLight, DiscProfile, Exposure, FrameDesc, FrameTime, Glare,
-    GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId,
-    LitView, LoadState, MountId, OutputDebug, PackSource, PathEntry, PipelineId, PostQuality,
-    Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter,
-    TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting, ViewOutput,
-    ViewTarget,
+    ArenaReport, AutoExposure, Budgets, DirectionalLight, DiscProfile, Exposure, FrameDesc,
+    FrameTime, Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens,
+    Light, LightId, LitView, LoadState, MountId, OutputDebug, PackSource, PathEntry, PipelineId,
+    PostQuality, Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId,
+    TextureFilter, TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting,
+    ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
 use orr_gpu::{
@@ -965,6 +966,156 @@ fn aliased_view_targets_render_the_same_images_in_less_memory() {
     assert_clean();
 }
 
+/// Places `pack`'s lamp at the origin of `scene`, alone, with the focus on it.
+fn place_lamp(f: &orr::Frame<'_>, scene: SceneId, lamp: orr::ModelId) {
+    let mut s = f.scene(scene).unwrap();
+    let group = s
+        .create_transform_group(&TransformGroupDesc {
+            count: 1,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    s.transforms(group, 0, 1)
+        .unwrap()
+        .copy_from_slice(&[Affine3::IDENTITY.into()]);
+    s.add_instances(&InstancesDesc {
+        model: lamp,
+        copies: 1,
+        transforms: group,
+        first: 0,
+        pose: None,
+        material_set: None,
+        flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+        rt_range: 1000.0,
+        animation_range: 0.0,
+        user_tag: 0,
+    })
+    .unwrap();
+    s.set_focus(DVec3::ZERO);
+}
+
+/// A view starts, and starts over at a camera cut, lit and shown at its exposure's reference,
+/// and holds that until a frame has light to meter.
+#[test]
+fn a_camera_cut_starts_exposure_over_at_its_reference() {
+    let d = device();
+    let desc = RendererDesc {
+        path_entry: PathEntry::Compute,
+        ..RendererDesc::default()
+    };
+    let mut r = Renderer::new(d, desc).unwrap();
+    let loading = r.loading();
+    let worker = {
+        let l = Arc::clone(&loading);
+        std::thread::spawn(move || l.run_worker())
+    };
+    let mut frame = 0;
+    let mount = mount_pack(&mut r, &lamp(), &mut frame);
+    let lamp = r.model(mount, AssetId::from_name("lamp")).unwrap();
+    let scene = r
+        .create_scene(&SceneDesc::default(), &Default::default())
+        .unwrap();
+    let history = r.create_view_history().unwrap();
+    r.wait_paths().unwrap();
+    let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+    let image = d
+        .create_texture(
+            &TextureDesc::d2(Format::Rgba16Float, 320, 240, usage),
+            TextureMemory::Dedicated,
+            "view image",
+        )
+        .unwrap();
+    frame += 1;
+    let listed = [scene];
+    let mut f = r
+        .begin_frame(FrameDesc {
+            time: time(frame),
+            scenes: &listed,
+            display: None,
+        })
+        .unwrap();
+    place_lamp(&f, scene, lamp);
+    f.update_scenes(&mut |_| {}).unwrap();
+    wait(f.end().unwrap());
+
+    // One frame of the view from 30 m, facing the lamp or away from it into the black, and
+    // the telemetry it leaves.
+    let mut render = |facing: bool, camera_cut: bool, reference_ev100: f32| {
+        frame += 1;
+        let mut f = r
+            .begin_frame(FrameDesc {
+                time: time(frame),
+                scenes: &listed,
+                display: None,
+            })
+            .unwrap();
+        f.update_scenes(&mut |_| {}).unwrap();
+        let eye = DVec3::new(0.0, 0.0, 30.0);
+        let toward = if facing {
+            Vec3::ZERO
+        } else {
+            2.0 * eye.as_vec3()
+        };
+        f.render_view(
+            &LitView {
+                rotation: orr_math::camera::rh::view::look_at_quat(eye.as_vec3(), toward, Vec3::Y)
+                    .inverse(),
+                camera_cut,
+                ..view_of(scene, history, eye, &image)
+            },
+            &ViewLighting::default(),
+            &ViewOutput {
+                exposure: Exposure::Auto(AutoExposure {
+                    reference_ev100,
+                    ..AutoExposure::default()
+                }),
+                ..ViewOutput::default()
+            },
+            &mut ViewHooks::default(),
+        )
+        .unwrap();
+        wait(f.end().unwrap());
+        frame += 1;
+        let f = r
+            .begin_frame(FrameDesc {
+                time: time(frame),
+                scenes: &[],
+                display: None,
+            })
+            .unwrap();
+        let telemetry = f
+            .exposure_telemetry(history)
+            .expect("the frame's telemetry");
+        wait(f.end().unwrap());
+        telemetry
+    };
+    let exposure = orr::orr_output::exposure_from_ev100;
+    // The view's first render, with nothing to meter.
+    let unset = render(false, false, 6.0);
+    assert_eq!(unset.metered_ev100, None);
+    assert_eq!(
+        (unset.adapted_ev100, unset.pre_exposure),
+        (6.0, exposure(6.0))
+    );
+    let lit = render(true, false, 6.0);
+    assert!(lit.metered_ev100.is_some());
+    assert!(lit.adapted_ev100 > 10.0, "the lamp exposes at {lit:?}");
+    let follows = lit.pre_exposure / exposure(lit.adapted_ev100) - 1.0;
+    assert!(
+        follows.abs() < 1e-5,
+        "pre-exposure {follows} from the exposure"
+    );
+    let held = render(false, false, 9.0);
+    assert_eq!(held.adapted_ev100, lit.adapted_ev100);
+    let cut = render(false, true, 9.0);
+    assert_eq!(cut.metered_ev100, None);
+    assert_eq!((cut.adapted_ev100, cut.pre_exposure), (9.0, exposure(9.0)));
+    loading.stop_workers();
+    worker.join().unwrap();
+    assert_clean();
+}
+
 #[test]
 fn render_view_runs_the_glare_its_lens_asks_for() {
     let d = device();
@@ -1005,32 +1156,7 @@ fn render_view_runs_the_glare_its_lens_asks_for() {
             display: None,
         })
         .unwrap();
-    let mut s = f.scene(scene).unwrap();
-    let group = s
-        .create_transform_group(&TransformGroupDesc {
-            count: 1,
-            writer: GroupWriter::Cpu,
-            anchor: DVec3::ZERO,
-        })
-        .unwrap();
-    s.transforms(group, 0, 1)
-        .unwrap()
-        .copy_from_slice(&[Affine3::IDENTITY.into()]);
-    s.add_instances(&InstancesDesc {
-        model: lamp,
-        copies: 1,
-        transforms: group,
-        first: 0,
-        pose: None,
-        material_set: None,
-        flags: InstanceFlags::RASTER | InstanceFlags::RAY,
-        rt_range: 1000.0,
-        animation_range: 0.0,
-        user_tag: 0,
-    })
-    .unwrap();
-    s.set_focus(DVec3::ZERO);
-    drop(s);
+    place_lamp(&f, scene, lamp);
     f.update_scenes(&mut |_| {}).unwrap();
     wait(f.end().unwrap());
 
