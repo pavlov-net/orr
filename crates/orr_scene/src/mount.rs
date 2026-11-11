@@ -1956,10 +1956,10 @@ async fn build_accel(
     }
     for m in &mut r.meshes {
         let n = m.clusters.len() as u32;
-        let base = shared.clusters.alloc(n).ok_or(Error::Capacity {
-            what: "resident cluster ids",
-            capacity: u32::MAX,
-        })?;
+        let base = shared
+            .clusters
+            .alloc(n)
+            .ok_or_else(|| capacity("resident cluster ids", shared.clusters.ids()))?;
         r.cluster_ranges.push((base, n));
         m.cluster_base = base;
     }
@@ -2876,7 +2876,7 @@ impl Mounts {
             .accel
             .clusters
             .alloc(clusters)
-            .ok_or_else(|| capacity("resident cluster ids", u32::MAX))?;
+            .ok_or_else(|| capacity("resident cluster ids", self.accel.clusters.ids()))?;
         let mut ids = EditIds::none(cluster_base, clusters, page_count);
         let placed = self
             .take_edit_ids(&mut ids, w.device)

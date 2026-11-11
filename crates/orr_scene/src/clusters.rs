@@ -1,8 +1,10 @@
-//! The resident cluster table: one entry per cluster id, in an address range reserved for every
-//! id a `u32` names short of `u32::MAX`, so the addresses mounts, stream units, edits and their
-//! records hold never move. Memory is bound to the range's pages as ids are taken in them, and
-//! a page none of whose ids is taken unbinds once it has stayed so for as many render steps as
-//! the CLAS pool keeps its reservations.
+//! The resident cluster table: one entry per cluster id, in an address range reserved once, so
+//! the addresses mounts, stream units, edits and their records hold never move. It names as many
+//! ids as the mesh page pool holds cluster records, each 148 bytes of its resident page: the
+//! most clusters resident pages within the pool's budget hold, as the CLAS pool's range is the
+//! pool's bytes. Memory is bound to the range's pages as ids are taken in them, and a page none
+//! of whose ids is taken unbinds once it has stayed so for as many render steps as the CLAS pool
+//! keeps its reservations.
 
 use std::sync::Mutex;
 
@@ -16,11 +18,9 @@ use crate::Result;
 use crate::clas_pool::RESERVE_STEPS;
 use crate::memory::{BestFit, Pool, PoolFill, PoolSlot};
 
-/// Cluster ids the table names: every `u32` short of `u32::MAX`.
-const IDS: u32 = u32::MAX;
-
 pub(crate) struct ClusterTable {
     range: SparseAllocation<ClusterRef>,
+    ids: u32,
     state: Mutex<State>,
 }
 
@@ -35,20 +35,29 @@ struct State {
 }
 
 impl ClusterTable {
-    /// The table's range, bound in DeviceLocal blocks of `block` bytes.
-    pub(crate) fn new(device: &Device, block: u64) -> Result<Self> {
-        let range = device.gpu_malloc_sparse::<ClusterRef>(u64::from(IDS), "resident clusters")?;
+    /// The table for a mesh page pool of `pool` bytes, bound in DeviceLocal blocks of `block`
+    /// bytes. Its ids stop short of `u32::MAX`.
+    pub(crate) fn new(device: &Device, pool: u64, block: u64) -> Result<Self> {
+        let record = size_of::<orr_pack::mesh::Cluster>() as u64;
+        let ids = (pool / record).clamp(1, u64::from(u32::MAX - 1)) as u32;
+        let range = device.gpu_malloc_sparse::<ClusterRef>(u64::from(ids), "resident clusters")?;
         let page = range.page_size;
         Ok(Self {
             range,
+            ids,
             state: Mutex::new(State {
-                ids: BestFit::new(IDS),
+                ids: BestFit::new(ids),
                 live: FxHashMap::default(),
                 bound: FxHashMap::default(),
                 backing: Pool::new(MemoryKind::DeviceLocal, page, block, "resident clusters"),
                 step: 0,
             }),
         })
+    }
+
+    /// Ids the table names.
+    pub(crate) fn ids(&self) -> u32 {
+        self.ids
     }
 
     /// Entry 0 of the table.

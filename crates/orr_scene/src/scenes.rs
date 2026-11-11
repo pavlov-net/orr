@@ -538,7 +538,7 @@ impl Scenes {
                 micromaps: b.micromap_pages,
                 mesh_resident_max: b.mesh_resident_max,
             },
-            clusters: ClusterTable::new(device, b.stream_block)?,
+            clusters: ClusterTable::new(device, pools.mesh, b.stream_block)?,
         });
         let materials = MaterialTable::new(device)?;
         let mounts = Mounts::new(
