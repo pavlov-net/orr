@@ -45,7 +45,9 @@ pub struct EditDesc<'a> {
     /// with discrete levels has no groups to choose from and a skinned mesh's copies take one
     /// cut: their edits hold all of level 0 and their copies draw nothing coarser.
     pub touched: Option<&'a [[f32; 4]]>,
-    /// A box (mesh space) the edited triangles stay inside; `None`: the model's bounds.
+    /// A box (mesh space) the edit's triangles, edited or not, stay inside; `None`: the
+    /// model's bounds. It culls the edit's copies, and its CLAS keep the position bits every
+    /// grid point in it needs.
     pub bounds: Option<Aabb>,
 }
 
@@ -405,6 +407,8 @@ pub(crate) struct ClasInputs<'a> {
     pub(crate) cluster_bases: Vec<u32>,
     pub(crate) firsts: Vec<u32>,
     pub(crate) header: &'a MeshHeader,
+    /// The box its positions stay inside.
+    pub(crate) bounds: Aabb,
     pub(crate) non_opaque: &'a [bool],
     /// Clusters of coarser levels are built once only when the cut may take them.
     pub(crate) whole: bool,
@@ -420,11 +424,12 @@ impl EditClas {
         let template = i.templates.is_some();
         let omm = !template && caps.omm && caps.cluster.omm_in_clusters;
         let step = i.header.step();
-        // Skinned positions are off the position grid, so templates keep every bit.
+        // Skinned positions are off the position grid, so templates keep every bit; the rest
+        // keep every bit a position inside the edit's bounds needs.
         let truncate_bits = if template {
             0
         } else {
-            u32::from(i.header.clas_truncate_bits)
+            u32::from(i.header.clas_truncate_bits_within(&i.bounds))
         };
         let mut bytes = 0u64;
         let mut lists = [Vec::new(), Vec::new()];

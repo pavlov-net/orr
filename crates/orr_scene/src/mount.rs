@@ -3142,6 +3142,7 @@ impl Mounts {
                     .map(|&q| stream.pages[q as usize].first)
                     .collect(),
                 header: &stream.header,
+                bounds,
                 non_opaque: &stream.non_opaque,
                 whole: p.spheres.is_none(),
                 clas_triangles: self.accel.limits.clas_triangles,

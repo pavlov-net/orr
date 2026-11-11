@@ -136,6 +136,20 @@ impl MeshHeader {
     pub fn step(&self) -> f32 {
         exp2(self.position_exponent)
     }
+
+    /// Low mantissa bits a CLAS build may truncate without moving any grid position inside
+    /// `b` (mesh space): [`Self::clas_truncate_bits`] for the box of the stored positions.
+    pub fn clas_truncate_bits_within(&self, b: &Aabb) -> u8 {
+        // The largest cell magnitude any rounding of a coordinate in the box can reach.
+        let inverse = 1.0 / f64::from(self.step());
+        let largest = b
+            .min
+            .iter()
+            .chain(&b.max)
+            .map(|&x| (f64::from(x).abs() * inverse + 0.5).floor() as u32)
+            .fold(0, u32::max);
+        24u32.saturating_sub(32 - largest.leading_zeros()) as u8
+    }
 }
 
 /// One material slot of the mesh.

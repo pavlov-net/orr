@@ -156,3 +156,29 @@ fn damaged_stored_pages_are_rejected() {
         }
     }
 }
+
+#[test]
+fn clas_truncation_keeps_every_cell_of_a_box() {
+    let mut h: mesh::MeshHeader = bytemuck::Zeroable::zeroed();
+    h.position_exponent = -11;
+    let step = f64::from(h.step());
+    // Past a 1 m mesh at the origin, to an odd cell at the far corner.
+    let b = orr_pack::Aabb {
+        min: [-1.0, -0.25, 0.0],
+        max: [16.0004, 0.5, 1.0],
+    };
+    let t = u32::from(h.clas_truncate_bits_within(&b));
+    let kept = |cell: i64, bits: u32| {
+        let x = (cell as f64 * step) as f32;
+        x.to_bits() >> bits << bits == x.to_bits()
+    };
+    for &x in b.min.iter().chain(&b.max) {
+        let far = (f64::from(x) / step).round() as i64;
+        let inward = -far.signum();
+        for cell in (0..512).map(|i| far + inward * i) {
+            assert!(kept(cell, t), "cell {cell} with {t} bits truncated");
+        }
+    }
+    let far = (f64::from(b.max[0]) / step).round() as i64;
+    assert!(!kept(far, t + 1), "{t} bits is not the most the box allows");
+}

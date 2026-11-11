@@ -305,6 +305,11 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
         u32::from(h.clas_truncate_bits),
         24 - (64 - max_cell.leading_zeros())
     );
+    // An edit without bounds of its own keeps the bits of the model's box.
+    assert_eq!(
+        h.clas_truncate_bits_within(&model.header.bounds),
+        h.clas_truncate_bits
+    );
 
     // Source triangles on the grid, with their corner vertices.
     let mut expected: HashMap<TriKey, (usize, [u32; 3])> = HashMap::new();
