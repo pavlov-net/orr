@@ -41,7 +41,6 @@ public struct PatternTable
     public PatternGpu* patterns;
     public uint* vertices;
     public uint8_t* triangles;
-    public uint64_t* templates;  // per pattern: its CLAS template, opaque ones then the others; 0 without cluster acceleration structures
 }
 
 // The odd segment count of fixed-point factor `q`, at least FACTOR_ONE.

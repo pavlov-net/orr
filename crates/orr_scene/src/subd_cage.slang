@@ -53,7 +53,6 @@ public struct SubdCageGpu
 {
     public SubdPatchGpu* patches;
     public uint* cvs;               // page point per patch point
-    public float3* points;          // rest page points
     public SubdVertexGpu* vertices; // per base vertex
     public SubdTriangleGpu* triangles;
     public uint4* clusters;         // first vertex, vertex count, first triangle, triangle count | material << 8

@@ -493,7 +493,6 @@ impl CageTables {
         let record = SubdCageGpu {
             patches: at(0).cast(),
             cvs: at(1).cast(),
-            points: at(2).cast(),
             vertices: at(3).cast(),
             triangles: at(4).cast(),
             clusters: at(5).cast(),

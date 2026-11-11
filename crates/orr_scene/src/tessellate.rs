@@ -76,6 +76,7 @@ pub(crate) struct Patterns {
     _memory: Allocation<u8>,
     table: GpuPtr<PatternTable>,
     pub(crate) topologies: GpuPtr<TopologyGpu>,
+    /// Per pattern and opacity, its CLAS template: the opaque ones, then the others.
     pub(crate) templates: GpuPtr<u64>,
     _templates: Allocation<u64>,
     curve: GpuPtr<[f32; 3]>,
@@ -119,7 +120,6 @@ impl Patterns {
             patterns: at(table_at).cast::<PatternGpu>(),
             vertices: at(table_at + vertices_at).cast(),
             triangles: at(table_at + triangles_at),
-            templates: templates.gpu(),
         };
         {
             let bytes = memory.as_mut_slice().expect("upload memory is mapped");
