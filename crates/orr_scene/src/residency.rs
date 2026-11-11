@@ -1277,8 +1277,9 @@ impl Residency {
     }
 
     /// Bytes that `keys`, resident, would add to the latest sample's demand: what they need
-    /// held and the sample left out, leaving the units in `seen`, each unit once; the units
-    /// counted go into `mine`. None when one of them never loads.
+    /// held and the sample left out, leaving the units in `seen` and those held while used,
+    /// which it holds apart ([`Demand::held`]), each unit once; the units counted go into
+    /// `mine`. None when one of them never loads.
     pub(crate) fn unsampled(
         &self,
         keys: impl IntoIterator<Item = Key>,
@@ -1289,6 +1290,7 @@ impl Residency {
         for k in keys {
             let counted = |k: Key, u: &Unit| {
                 u.sampled == self.sample
+                    || u.kept() == Kept::WhileUsed
                     || u.state == State::Loading
                     || seen.contains(&k)
                     || mine.contains(&k)
@@ -2804,6 +2806,31 @@ mod tests {
         assert_eq!(
             r.shed(class, d.bytes, 100, 0, &cuts[2..], 20),
             Vec::<usize>::new()
+        );
+    }
+
+    /// What a cut's pages would add to a sample leaves out the pages another cut holds while
+    /// used, which the sample holds apart already.
+    #[test]
+    fn units_held_while_used_add_nothing_to_what_a_sample_left_out() {
+        let mut r = Residency::new(limits(10_000));
+        // 1 under 0, locked by a cut the frame does not read; 2 under 1 wanted by another.
+        let units = [
+            unit(100, &[], Start::Absent),
+            unit(50, &[0], Start::Absent),
+            unit(10, &[1], Start::Absent),
+        ];
+        r.register(M, &units).unwrap();
+        step(&mut r, &[2], 1);
+        r.lock_while_used(key(1));
+        r.begin_sample();
+        let d = r.end_sample()[ResidencyClass::InstancePages as usize];
+        assert_eq!((d.bytes, d.held), (0, 150));
+        let mut mine = FxHashSet::default();
+        let keys = [key(1), key(2)];
+        assert_eq!(
+            r.unsampled(keys, &FxHashSet::default(), &mut mine),
+            Some(10)
         );
     }
 
