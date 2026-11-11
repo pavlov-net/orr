@@ -2012,13 +2012,15 @@ impl Streaming {
             }
         });
         self.loading_ids.extend(taken);
-        match failed {
+        // The loads kept go out as tasks before another error returns, so none stays loading
+        // without one.
+        let failed = match failed {
             Some(e) if e.is_out_of_memory() => {
                 self.residency.out_of_memory(governs(&self.governed, &e));
+                None
             }
-            Some(e) => return Err(e),
-            None => {}
-        }
+            failed => failed,
+        };
         for u in &self.unbinds {
             self.unbinding.remove(&u.key);
         }
@@ -2092,7 +2094,7 @@ impl Streaming {
         }
         // Landings and the plan may have made room for mount reads.
         loading.wake_mounts();
-        Ok(points)
+        failed.map_or(Ok(points), Err)
     }
 
     /// Gives a stream pool unit's target its address, 0 when the unit leaves.
