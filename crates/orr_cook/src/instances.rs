@@ -239,7 +239,7 @@ pub(crate) fn cook(
     let mut cells: Vec<_> = cells.into_iter().collect();
     cells.sort_by_key(|(c, _)| morton(*c));
     for (cell, records) in &cells {
-        let pages = split_cell(&rel, records, edge).ok_or_else(|| crowded(name, *cell))?;
+        let pages = split_cell(&rel, records, edge);
         for (page, members) in pages.into_iter().enumerate() {
             let built = build_page(name, src, &prototypes, *cell, &rel, &members, edge)?;
             let info = built.info.to_bytes();
@@ -273,15 +273,6 @@ fn fail(asset: &str, message: String) -> Error {
         asset: asset.into(),
         message,
     }
-}
-
-fn crowded(asset: &str, cell: [i32; 3]) -> Error {
-    fail(
-        asset,
-        format!(
-            "copies at one position in cell {cell:?} need more than {PARTITION_INSTANCES} PTLAS instances"
-        ),
-    )
 }
 
 /// A prototype with its model's facts and its overrides resolved to ids.
@@ -463,20 +454,23 @@ pub(crate) fn page_order(source: &str, page: &str) -> Option<(u128, u32)> {
 }
 
 /// The records of one cell in pages of at most [`MAX_RECORDS`]: Morton-prefix cells of the
-/// cell's own grid, consecutive ones packed into a page while they fit. `None` when more
-/// than a page of records share one grid position.
-fn split_cell(rel: &[DVec3], records: &[usize], edge: f64) -> Option<Vec<Vec<usize>>> {
+/// cell's own grid, consecutive ones packed into a page while they fit, and more than a page
+/// of records at one grid position cut in source order.
+fn split_cell(rel: &[DVec3], records: &[usize], edge: f64) -> Vec<Vec<usize>> {
     if records.len() <= MAX_RECORDS {
-        return Some(vec![records.to_vec()]);
+        return vec![records.to_vec()];
     }
-    let q = |v: f64| (v / edge * 65536.0).floor().clamp(0.0, 65535.0) as u16;
+    // A position a hair below a cell's corner is in the cell before it, and `edge` from that
+    // cell's corner once the difference rounds.
+    let last = f64::from((1u32 << POSITION_BITS) - 1);
+    let q = |v: f64| (v / edge * (last + 1.0)).floor().min(last) as u32;
     let mut order: Vec<(u64, usize)> = records
         .iter()
         .map(|&i| (instance::morton(rel[i].to_array().map(q)), i))
         .collect();
     order.sort_unstable();
     let codes: Vec<u64> = order.iter().map(|o| o.0).collect();
-    let starts = instance::partitions(&codes, &vec![1; codes.len()], MAX_RECORDS as u32)?;
+    let starts = instance::partitions(&codes, &vec![1; codes.len()], MAX_RECORDS as u32);
     let mut pages: Vec<Vec<usize>> = vec![Vec::new()];
     for (k, &s) in starts.iter().enumerate() {
         let end = starts.get(k + 1).map_or(codes.len(), |&e| e as usize);
@@ -492,7 +486,7 @@ fn split_cell(rel: &[DVec3], records: &[usize], edge: f64) -> Option<Vec<Vec<usi
             .expect("one page")
             .extend(run.iter().map(|o| o.1));
     }
-    Some(pages)
+    pages
 }
 
 struct BuiltPage {
@@ -515,6 +509,21 @@ fn build_page(
     let mut used: Vec<u16> = members.iter().map(|&i| src.records[i].prototype).collect();
     used.sort_unstable();
     used.dedup();
+    // A copy's body and part instances share one partition, so a copy with more of them than a
+    // partition holds has none to trace in.
+    if let Some(&g) = used
+        .iter()
+        .find(|&&g| prototypes[usize::from(g)].facts.instances > PARTITION_INSTANCES)
+    {
+        return Err(fail(
+            name,
+            format!(
+                "a copy of {} needs {} PTLAS instances; a partition holds {PARTITION_INSTANCES}",
+                src.prototypes[usize::from(g)].model,
+                prototypes[usize::from(g)].facts.instances
+            ),
+        ));
+    }
     let local: HashMap<u16, u16> = used
         .iter()
         .enumerate()
@@ -704,7 +713,7 @@ fn build_page(
 
     // Morton order, ties in source order.
     let mut order: Vec<usize> = (0..records.len()).collect();
-    order.sort_by_key(|&n| (instance::morton(records[n].pos), n));
+    order.sort_by_key(|&n| (instance::morton(positions[n]), n));
     let mut records: Vec<InstanceRecord> = order.iter().map(|&n| records[n]).collect();
     for r in &mut records {
         let p = &mut page_prototypes[usize::from(r.prototype)];
@@ -721,7 +730,10 @@ fn build_page(
         .copied()
         .collect();
 
-    let codes: Vec<u64> = records.iter().map(|r| instance::morton(r.pos)).collect();
+    let codes: Vec<u64> = order
+        .iter()
+        .map(|&n| instance::morton(positions[n]))
+        .collect();
     let costs: Vec<u32> = records
         .iter()
         .map(|r| {
@@ -731,7 +743,6 @@ fn build_page(
         })
         .collect();
     let partitions = instance::partitions(&codes, &costs, PARTITION_INSTANCES)
-        .ok_or_else(|| crowded(name, cell))?
         .into_iter()
         .map(|p| p as u16)
         .collect();

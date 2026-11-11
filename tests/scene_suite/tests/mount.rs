@@ -14,6 +14,7 @@ use orr_cook::{
     MeshSettings, Placement, PrototypeSpec, Source, TextureSettings, Usage,
 };
 use orr_math::{Affine3, DVec3, Quat, Vec2, Vec3};
+use orr_pack::instance::InstancePageInfo;
 use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
 use orr_pack::mesh::{MeshInfo, decode_page, in_cut};
 use orr_pack::model::ModelInfo;
@@ -1078,6 +1079,131 @@ fn an_unmount_takes_copies_and_pages_of_its_models_from_a_scene_that_keeps_rende
     });
     frame_with(&mut scenes, &mut |_| {});
     assert_eq!(state(&gpu).1, 2);
+    assert_clean();
+}
+
+/// More copies at one position than a PTLAS partition holds cook into runs of records in
+/// order, no run past a partition, and a scene traces every copy from a partition per run.
+#[test]
+fn copies_at_one_position_past_a_partition_take_one_partition_a_run() {
+    const COPIES: u32 = 2500;
+    let _serial = serial();
+    let panel = AssetSpec {
+        name: "kit/panel".into(),
+        source: Source::Mesh {
+            mesh: grid(8),
+            materials: vec![Material::default(); 2],
+            settings: MeshSettings::default(),
+        },
+    };
+    let scatter = AssetSpec {
+        name: "scatter".into(),
+        source: Source::Instances(Instances {
+            records: (0..COPIES)
+                .map(|_| Placement {
+                    position: [3.0, 0.0, 3.0],
+                    linear: Linear::Scaled {
+                        rotation: Quat::IDENTITY.to_array(),
+                        scale: [1.0; 3],
+                    },
+                    prototype: 0,
+                })
+                .collect(),
+            prototypes: vec![PrototypeSpec {
+                model: "kit/panel".into(),
+                ..PrototypeSpec::default()
+            }],
+            ..Instances::default()
+        }),
+    };
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(Target::Memory, vec![panel, scatter])],
+    };
+    let bytes = orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory
+        .remove(0);
+    let archive = Archive::from_memory(Arc::clone(&bytes)).unwrap();
+    let entry = archive
+        .entries()
+        .iter()
+        .find(|e| e.class == Class::InstancePage as u16)
+        .unwrap();
+    let head = &archive.blobs(entry)[0];
+    let mut blob = vec![0; head.raw_len as usize];
+    archive.read(head, &mut blob).unwrap();
+    let info = InstancePageInfo::parse(&blob).unwrap();
+    assert_eq!(u32::from(info.header.record_count), COPIES);
+    assert_eq!(info.partitions, [0, 1000, 2000]);
+
+    let mut scenes = Scenes::new(device(), &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let s = scenes.create_scene(&SceneDesc::default()).unwrap();
+    let m = scenes.mount(PackSource::Memory(bytes));
+    ready(&mut scenes, m);
+    let page = scenes.instance_page(m, entry.id).unwrap();
+    // One frame of the scene, then one that takes in its figures.
+    let frame_with = |scenes: &mut Scenes, write: &mut dyn FnMut(&mut SceneWriter<'_>)| {
+        let mut f = scenes
+            .begin_frame(&FrameDesc {
+                time: FrameTime::default(),
+                scenes: &[s],
+                low_latency: None,
+            })
+            .unwrap();
+        {
+            let mut w = f.scene(s).unwrap();
+            w.set_focus(DVec3::new(3.0, 3.0, 3.0));
+            write(&mut w);
+        }
+        let mut root = GpuPtr::NULL;
+        f.update_scenes(&mut |c| root = c.root).unwrap();
+        orr_scene::testing::wait(f.end(&[]).unwrap());
+        let f = scenes
+            .begin_frame(&FrameDesc {
+                time: FrameTime::default(),
+                scenes: &[],
+                low_latency: None,
+            })
+            .unwrap();
+        orr_scene::testing::wait(f.end(&[]).unwrap());
+        (root, scenes.stats().rt)
+    };
+    let (root, added) = frame_with(&mut scenes, &mut |w| {
+        w.add_instance_page(&orr_scene::InstancePageRef {
+            page,
+            frame: None,
+            poses: &[],
+            material_sets: &[],
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 100.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    });
+    let gpu = Gpu(device());
+    let root: SceneRoot = gpu.value(root);
+    // Every record takes a slot once the page's records land, and then a PTLAS write.
+    let start = Instant::now();
+    let mut written = added.writes;
+    loop {
+        let (_, rt) = frame_with(&mut scenes, &mut |_| {});
+        written += rt.writes;
+        assert_eq!((rt.unplaced, rt.dropped), (0, 0));
+        assert_eq!(rt.partitions, 3, "a partition per run");
+        let instances: Vec<orr_scene::InstanceGpu> =
+            gpu.values(root.instances, root.instance_capacity);
+        let placed = instances.iter().filter(|i| i.flags != 0).count();
+        if placed == COPIES as usize && written >= COPIES && rt.deferred == 0 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{placed} copies placed, {written} PTLAS writes, {} deferred",
+            rt.deferred
+        );
+    }
     assert_clean();
 }
 

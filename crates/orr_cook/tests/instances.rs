@@ -240,7 +240,10 @@ fn fixture_page_decodes_within_its_error_bounds() {
     let (got_cell, decoded) = instance::decode(&head, &recs).unwrap();
     assert_eq!(got_cell, cell);
     let (raw, table) = instance::records(&h, &recs).unwrap();
-    let codes: Vec<u64> = raw.iter().map(|r| instance::morton(r.pos)).collect();
+    let codes: Vec<u64> = raw
+        .iter()
+        .map(|r| instance::morton(instance::grid_position(r)))
+        .collect();
     assert!(codes.is_sorted(), "records are not in Morton order");
     // Each prototype's records rank from 0 in record order, up to its count.
     let mut ranks = vec![0u16; info.prototypes.len()];
@@ -281,7 +284,7 @@ fn fixture_page_decodes_within_its_error_bounds() {
     let starts: Vec<u32> = info.partitions.iter().map(|&s| u32::from(s)).collect();
     assert!(starts.len() >= n / 1000);
     assert_eq!(
-        Some(starts),
+        starts,
         instance::partitions(&codes, &vec![1; n], instance::PARTITION_INSTANCES)
     );
 }

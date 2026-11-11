@@ -241,9 +241,9 @@ fn exact_axis_rotations_are_the_24_signed_permutations() {
 fn morton_interleaves_bits() {
     let mut rng = Rng(77);
     for _ in 0..10_000 {
-        let p = [0; 3].map(|_: u8| rng.next() as u16);
+        let p = [0; 3].map(|_: u8| rng.next() as u32 >> 11);
         let mut want = 0u64;
-        for b in 0..16 {
+        for b in 0..21 {
             for (a, v) in p.iter().enumerate() {
                 want |= u64::from(v >> b & 1) << (3 * b + a);
             }
@@ -256,7 +256,7 @@ fn morton_interleaves_bits() {
 /// Morton-prefix cell and the largest such cell that fits.
 fn check_partitions(codes: &[u64], costs: &[u32], starts: &[u32], max: u32) {
     assert_eq!(starts.first(), Some(&0));
-    let prefix = |c: u64, level: u32| c >> (3 * (16 - level));
+    let prefix = |c: u64, level: u32| c >> (3 * (21 - level));
     let cost = |r: std::ops::Range<usize>| costs[r].iter().map(|&c| u64::from(c)).sum::<u64>();
     // Records whose code shares `level` levels with record `i`.
     let cell = |i: usize, level: u32| {
@@ -272,7 +272,7 @@ fn check_partitions(codes: &[u64], costs: &[u32], starts: &[u32], max: u32) {
         );
         assert!(a < b);
         assert!(cost(a..b) <= u64::from(max), "partition {k} over {max}");
-        let level = (0..=16)
+        let level = (0..=21)
             .find(|&l| cell(a, l) == (a..b))
             .unwrap_or_else(|| panic!("partition {k} is not a Morton-prefix cell"));
         if level > 0 {
@@ -285,19 +285,19 @@ fn check_partitions(codes: &[u64], costs: &[u32], starts: &[u32], max: u32) {
 }
 
 #[test]
-fn partitions_are_the_largest_fitting_morton_cells() {
+fn partitions_are_the_largest_fitting_morton_cells_and_cut_one_position_in_order() {
     let mut rng = Rng(12345);
     for round in 0..40 {
         let n = 1 + (rng.next() % 16_384) as usize;
         // Clustered positions so cells split at many levels.
-        let centers: Vec<[u16; 3]> = (0..1 + rng.next() % 8)
-            .map(|_| [0; 3].map(|_: u8| rng.next() as u16))
+        let centers: Vec<[u32; 3]> = (0..1 + rng.next() % 8)
+            .map(|_| [0; 3].map(|_: u8| rng.next() as u32 >> 11))
             .collect();
         let mut codes: Vec<u64> = (0..n)
             .map(|_| {
                 let c = centers[(rng.next() % centers.len() as u64) as usize];
-                let spread = 1u64 << (10 + rng.next() % 7);
-                instance::morton(c.map(|v| v.wrapping_add((rng.next() % spread) as u16)))
+                let spread = 1u64 << (10 + rng.next() % 12);
+                instance::morton(c.map(|v| (v + (rng.next() % spread) as u32) & 0x1f_ffff))
             })
             .collect();
         codes.sort_unstable();
@@ -308,10 +308,15 @@ fn partitions_are_the_largest_fitting_morton_cells() {
                 _ => [1, 1, 1, 241][(rng.next() % 4) as usize],
             })
             .collect();
-        let starts = instance::partitions(&codes, &costs, 1000).unwrap();
+        let starts = instance::partitions(&codes, &costs, 1000);
         check_partitions(&codes, &costs, &starts, 1000);
     }
-    // Copies at one position over the limit cannot be cut into cells.
-    assert_eq!(instance::partitions(&[5; 3], &[400; 3], 1000), None);
-    assert_eq!(instance::partitions(&[], &[], 1000), Some(vec![]));
+    // Copies at one position past the limit have no cell left to cut: runs in record order,
+    // each as full as the limit lets it be, a copy past the limit alone in its own.
+    assert_eq!(instance::partitions(&[5; 3], &[400; 3], 1000), [0, 2]);
+    assert_eq!(
+        instance::partitions(&[1, 5, 5, 5, 5, 9], &[1, 400, 400, 1200, 400, 1], 1000),
+        [0, 1, 3, 4, 5]
+    );
+    assert_eq!(instance::partitions(&[], &[], 1000), [0u32; 0]);
 }

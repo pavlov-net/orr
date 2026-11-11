@@ -3,9 +3,9 @@
 //! - Blob 0 (mount): an [`InstancePageHeader`], then its [`Prototype`] table, the
 //!   [`SectionOverride`] table the prototypes point into, and the partition table (u16 first
 //!   record per partition). Spans are byte offsets in blob 0 and record counts.
-//! - Blob 1: [`InstancePageHeader::record_count`] [`InstanceRecord`]s in Morton order of
-//!   [`InstanceRecord::pos`], at most [`MAX_RECORDS`], then the page's exact table of
-//!   [`AffineRows`], so both stream and stay resident together. The records of a prototype rank
+//! - Blob 1: [`InstancePageHeader::record_count`] [`InstanceRecord`]s in Morton order of their
+//!   [`grid_position`]s, at most [`MAX_RECORDS`], then the page's exact table of [`AffineRows`],
+//!   so both stream and stay resident together. The records of a prototype rank
 //!   `0..`[`Prototype::records`] in that order ([`InstanceRecord::rank`]).
 //! - Blob 2, when `user_stride` is not 0: `user_stride` bytes of consumer data per record,
 //!   in record order.
@@ -224,7 +224,7 @@ pub struct SectionOverride {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct InstanceRecord {
-    /// The high 16 bits of each axis of the [`grid_position`]: their Morton order is the page's.
+    /// The high 16 bits of each axis of the [`grid_position`].
     pub pos: [u16; 3],
     pub prototype: u16,
     /// [`encode_rotation`] code, or with [`Self::INDEXED`] an index: below [`AXIS_ROTATIONS`]
@@ -279,7 +279,8 @@ pub const POSITION_BITS: u32 = 16 + FINE_BITS;
 pub const FINE_BITS: u32 = 5;
 const FINE_MASK: u32 = (1 << FINE_BITS) - 1;
 
-/// A record's position on its page's grid.
+/// A record's position on its page's grid; of a record that names a row, the grid point
+/// nearest the row's translation, which orders it.
 pub fn grid_position(r: &InstanceRecord) -> [u32; 3] {
     let fine = u32::from(r.fine);
     [0, 1, 2].map(|a: usize| {
@@ -544,9 +545,10 @@ pub fn instance_rotation(rot: u32, exact_axis: bool) -> Mat3 {
     }
 }
 
-/// Morton code of a quantized position: bit `3 * b + a` holds bit `b` of axis `a`.
-pub fn morton(pos: [u16; 3]) -> u64 {
-    fn spread(v: u16) -> u64 {
+/// Morton code of a quantized position, each axis below `1 << POSITION_BITS`: bit `3 * b + a`
+/// holds bit `b` of axis `a`.
+pub fn morton<T: Into<u32>>(pos: [T; 3]) -> u64 {
+    fn spread(v: u32) -> u64 {
         let mut x = u64::from(v);
         x = (x | (x << 32)) & 0x001f_0000_0000_ffff;
         x = (x | (x << 16)) & 0x001f_0000_ff00_00ff;
@@ -555,31 +557,35 @@ pub fn morton(pos: [u16; 3]) -> u64 {
         x = (x | (x << 2)) & 0x1249_2492_4924_9249;
         x
     }
-    spread(pos[0]) | spread(pos[1]) << 1 | spread(pos[2]) << 2
+    let [x, y, z]: [u32; 3] = pos.map(Into::into);
+    spread(x) | spread(y) << 1 | spread(z) << 2
 }
 
-/// Levels of a Morton code: 16 levels of 3 bits each.
-const MORTON_LEVELS: u32 = 16;
+/// Levels of the Morton code of a grid position, 3 bits each.
+const MORTON_LEVELS: u32 = POSITION_BITS;
 
-/// Splits records sorted by Morton `codes` into the largest Morton-prefix cells whose summed
-/// `costs` fit in `max`, returning each cell's first record. `None` when the records of one
-/// position alone cost more than `max`.
-pub fn partitions(codes: &[u64], costs: &[u32], max: u32) -> Option<Vec<u32>> {
-    fn split(
-        codes: &[u64],
-        costs: &[u32],
-        first: usize,
-        level: u32,
-        max: u32,
-        out: &mut Vec<u32>,
-    ) -> Option<()> {
+/// Splits records sorted by the Morton `codes` of [`POSITION_BITS`]-bit positions into runs
+/// whose summed `costs` fit in `max`, and returns each run's first record. A run is the largest
+/// Morton-prefix cell that fits. Records at one position that do not fit together are cut in
+/// record order instead: a run is a range of records to its reader, wherever they are. A record
+/// that alone costs more than `max` is a run of its own.
+pub fn partitions(codes: &[u64], costs: &[u32], max: u32) -> Vec<u32> {
+    fn split(codes: &[u64], costs: &[u32], first: usize, level: u32, max: u32, out: &mut Vec<u32>) {
         let cost: u64 = costs.iter().map(|&c| u64::from(c)).sum();
         if cost <= u64::from(max) {
             out.push(first as u32);
-            return Some(());
+            return;
         }
         if level == MORTON_LEVELS {
-            return None;
+            let mut held = 0;
+            for (i, &c) in costs.iter().enumerate() {
+                if i == 0 || held + u64::from(c) > u64::from(max) {
+                    out.push((first + i) as u32);
+                    held = 0;
+                }
+                held += u64::from(c);
+            }
+            return;
         }
         let shift = 3 * (MORTON_LEVELS - 1 - level);
         let mut at = 0;
@@ -593,14 +599,13 @@ pub fn partitions(codes: &[u64], costs: &[u32], max: u32) -> Option<Vec<u32>> {
                 level + 1,
                 max,
                 out,
-            )?;
+            );
             at = end;
         }
-        Some(())
     }
     let mut out = Vec::new();
     if !codes.is_empty() {
-        split(codes, costs, 0, 0, max, &mut out)?;
+        split(codes, costs, 0, 0, max, &mut out);
     }
-    Some(out)
+    out
 }
