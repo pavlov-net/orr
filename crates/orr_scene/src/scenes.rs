@@ -1348,7 +1348,7 @@ impl Scenes {
         let mut list = render.command_list()?;
         // Work from earlier frames on this queue finishes before this frame's writes.
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
-        for (i, moves) in core.mounts.streaming.moves(frame).iter().enumerate() {
+        for (i, moves) in core.mounts.streaming.moves().iter().enumerate() {
             // A later step's copies may read what an earlier step's wrote.
             if i > 0 {
                 list.barrier(Stages::TRANSFER, Stages::TRANSFER, Hazards::empty());
@@ -2745,7 +2745,7 @@ impl<'a> Frame<'a> {
         waits.extend(self.after_output);
         let mut points = std::mem::take(&mut self.submits);
         points.push(render.submit(vec![list], &waits)?);
-        self.core.mounts.streaming.submitted(self.id);
+        self.core.mounts.streaming.submitted();
         if let Some(output) = self.output.take() {
             let compute = self
                 .device

@@ -544,9 +544,8 @@ pub(crate) struct Streaming {
     unit_blocks: BlockUnits,
     tile_blocks: BlockUnits,
     /// The copies of the units and tiles the steps moved, a step's after those of the steps
-    /// before, until a frame whose list carries them is submitted; and the frame carrying them.
+    /// before, until a frame whose list carries them is submitted.
     moves: Vec<Moves>,
-    moves_frame: Option<u64>,
     /// The tiles a step started moving and no step has bound yet.
     tile_moves: Option<TileMoves>,
     /// The tiles bound to new slots whose copy back is in `moves`.
@@ -702,7 +701,6 @@ impl Streaming {
             unit_blocks: BlockUnits::default(),
             tile_blocks: BlockUnits::default(),
             moves: Vec::new(),
-            moves_frame: None,
             tile_moves: None,
             tile_finished: FxHashSet::default(),
             #[cfg(feature = "testing")]
@@ -2430,19 +2428,15 @@ impl Streaming {
     }
 
     /// The copies of the units and tiles the steps moved that no submitted list has carried,
-    /// oldest step first, for frame `frame` to run before anything reads the scenes' tables or
-    /// samples a texture.
-    pub(crate) fn moves(&mut self, frame: u64) -> &[Moves] {
-        self.moves_frame = Some(frame);
+    /// oldest step first, for the frame being begun to run before anything reads the scenes'
+    /// tables or samples a texture.
+    pub(crate) fn moves(&self) -> &[Moves] {
         &self.moves
     }
 
-    /// Frame `frame` was submitted: the copies its list carried have their place in the
-    /// render queue's order.
-    pub(crate) fn submitted(&mut self, frame: u64) {
-        if self.moves_frame.take() != Some(frame) {
-            return;
-        }
+    /// The frame that carried [`Self::moves`] was submitted: the copies have their place in
+    /// the render queue's order.
+    pub(crate) fn submitted(&mut self) {
         self.moves.clear();
         self.tile_finished.clear();
         if let Some(moves) = &mut self.tile_moves {
