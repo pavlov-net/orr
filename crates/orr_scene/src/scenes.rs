@@ -2450,21 +2450,24 @@ impl<'a> Frame<'a> {
             visible_clusters: history.visible.wanted(),
             work,
         };
-        let held = history.lists.as_ref().map(|l| l.sizes);
         let mut short = None;
-        if held != Some(want) && (held.is_none() || self.id >= history.lists_retry) {
-            match ViewLists::new(device, want) {
-                Ok(lists) => {
-                    history.visible.set(want.visible_clusters);
-                    history.lists = Some(lists);
+        match &mut history.lists {
+            None => history.lists = Some(ViewLists::new(device, want)?),
+            Some(lists) if lists.sizes() != want && self.id >= history.lists_retry => {
+                match lists.resize(device, want) {
+                    Ok(()) => {}
+                    // The view keeps the lists it has while the streaming budgets make room.
+                    Err(e) if e.is_out_of_memory() => {
+                        history.lists_retry = self.id + response_period(core.fif);
+                        short = Some(e);
+                    }
+                    Err(e) => return Err(e),
                 }
-                // The view keeps the lists it has while the streaming budgets make room.
-                Err(e) if e.is_out_of_memory() && held.is_some() => {
-                    history.lists_retry = self.id + response_period(core.fif);
-                    short = Some(e);
-                }
-                Err(e) => return Err(e),
             }
+            Some(_) => {}
+        }
+        if let Some(lists) = &history.lists {
+            history.visible.set(lists.sizes().visible_clusters);
         }
         history.arena.enter(ViewStep::Raster, list);
         match &mut history.targets {

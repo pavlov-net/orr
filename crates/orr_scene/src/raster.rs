@@ -248,14 +248,21 @@ pub(crate) struct ListSizes {
 pub(crate) const VISIBLE_CLUSTER_LIMIT: u32 = 1 << 25;
 
 /// A view's cluster lists, each in memory of its own, so that a change of capacity leaves the
-/// view's other targets as they are.
+/// view's other targets as they are. The lists a frame's visible clusters size and the work
+/// list are sized apart: a change of one keeps the other's memory.
 pub(crate) struct ViewLists {
-    pub(crate) sizes: ListSizes,
+    visible: VisibleLists,
+    work: Allocation<ClusterWork>,
+    work_capacity: u32,
+}
+
+/// The lists that hold an entry per visible cluster, and the draws over them.
+struct VisibleLists {
+    capacity: u32,
     /// Mesh draws over each list they take, and the entries one covers at most.
     draws: u32,
     draw_groups: u32,
     clusters: Allocation<VisibleCluster>,
-    work: Allocation<ClusterWork>,
     opaque: Allocation<u32>,
     alpha: Allocation<u32>,
     software: Allocation<u32>,
@@ -266,22 +273,22 @@ pub(crate) struct ViewLists {
     draw_args: Allocation<MeshArgs>,
 }
 
-impl ViewLists {
-    pub(crate) fn new(device: &Device, sizes: ListSizes) -> Result<Self> {
-        let (dl, high) = (MemoryKind::DeviceLocal, MemoryPriority::High);
-        let n = |c: u32| u64::from(c.max(1));
-        let visible = n(sizes.visible_clusters);
+const LIST_MEMORY: (MemoryKind, MemoryPriority) = (MemoryKind::DeviceLocal, MemoryPriority::High);
+
+impl VisibleLists {
+    fn new(device: &Device, capacity: u32) -> Result<Self> {
+        let (dl, high) = LIST_MEMORY;
+        let visible = u64::from(capacity.max(1));
         let list = |name| device.gpu_malloc_with_priority::<u32>(dl, high, visible, name);
         // A grid fills whole rows, so a draw covers whole rows within the device's limit.
         let rows = device.caps().limits.max_mesh_draw_groups / GRID_X;
         let draw_groups = rows * GRID_X;
-        let draws = sizes.visible_clusters.div_ceil(draw_groups).max(1);
+        let draws = capacity.div_ceil(draw_groups).max(1);
         Ok(Self {
-            sizes,
+            capacity,
             draws,
             draw_groups,
             clusters: device.gpu_malloc_with_priority(dl, high, visible, "visible clusters")?,
-            work: device.gpu_malloc_with_priority(dl, high, n(sizes.work), "cluster work")?,
             opaque: list("opaque clusters")?,
             alpha: list("alpha clusters")?,
             software: list("software clusters")?,
@@ -296,12 +303,48 @@ impl ViewLists {
             )?,
         })
     }
+}
+
+fn work_list(device: &Device, capacity: u32) -> Result<Allocation<ClusterWork>> {
+    let (dl, high) = LIST_MEMORY;
+    let n = u64::from(capacity.max(1));
+    Ok(device.gpu_malloc_with_priority(dl, high, n, "cluster work")?)
+}
+
+impl ViewLists {
+    pub(crate) fn new(device: &Device, sizes: ListSizes) -> Result<Self> {
+        Ok(Self {
+            visible: VisibleLists::new(device, sizes.visible_clusters)?,
+            work: work_list(device, sizes.work)?,
+            work_capacity: sizes.work,
+        })
+    }
+
+    pub(crate) fn sizes(&self) -> ListSizes {
+        ListSizes {
+            visible_clusters: self.visible.capacity,
+            work: self.work_capacity,
+        }
+    }
+
+    /// Takes the capacities of `sizes`, replacing only the lists whose capacity changes; the
+    /// frames in flight keep the replaced ones. A list that finds no memory stays as it is,
+    /// with the error, beside the lists that took theirs.
+    pub(crate) fn resize(&mut self, device: &Device, sizes: ListSizes) -> Result<()> {
+        if sizes.work != self.work_capacity {
+            self.work = work_list(device, sizes.work)?;
+            self.work_capacity = sizes.work;
+        }
+        if sizes.visible_clusters != self.visible.capacity {
+            self.visible = VisibleLists::new(device, sizes.visible_clusters)?;
+        }
+        Ok(())
+    }
 
     /// The workgroups of draw `i` over list `list` (`DRAW_*`).
     fn draw_args(&self, list: u32, i: u32) -> GpuPtr<MeshArgs> {
-        self.draw_args
-            .gpu()
-            .offset(u64::from(list * self.draws + i))
+        let v = &self.visible;
+        v.draw_args.gpu().offset(u64::from(list * v.draws + i))
     }
 }
 
@@ -495,7 +538,7 @@ impl ViewTargets {
         let t = &self.transient;
         GBufferGpu {
             visibility: t.visibility.gpu(),
-            clusters: lists.clusters.gpu(),
+            clusters: lists.visible.clusters.gpu(),
             depth: self.depth.sampled,
             a: t.a.sampled(),
             b: t.b.sampled(),
@@ -541,13 +584,13 @@ impl ViewTargets {
             gbuffer: self.gbuffer(lists),
             work: lists.work.gpu(),
             args: self.args.gpu(),
-            draw_args: lists.draw_args.gpu().cast(),
-            opaque: lists.opaque.gpu(),
-            alpha: lists.alpha.gpu(),
-            software: lists.software.gpu(),
-            particles: lists.particles.gpu(),
-            coverage: lists.coverage.gpu(),
-            smoke: lists.smoke.gpu(),
+            draw_args: lists.visible.draw_args.gpu().cast(),
+            opaque: lists.visible.opaque.gpu(),
+            alpha: lists.visible.alpha.gpu(),
+            software: lists.visible.software.gpu(),
+            particles: lists.visible.particles.gpu(),
+            coverage: lists.visible.coverage.gpu(),
+            smoke: lists.visible.smoke.gpu(),
             counts: self.counts(),
             slot_visibility: self.slot_visibility.gpu(),
             bin_args: t.bin_args.gpu(),
@@ -567,15 +610,15 @@ impl ViewTargets {
             hzb,
             tiles_x: tx,
             tile_capacity: tx * ty,
-            work_capacity: lists.sizes.work,
-            visible_capacity: lists.sizes.visible_clusters,
+            work_capacity: lists.work_capacity,
+            visible_capacity: lists.visible.capacity,
             bins: self.sizes.bins,
             software_pixels,
             flags: if occlusion { RASTER_OCCLUSION } else { 0 },
             slots,
             hzb_mips: self.hzb.storage.len() as u32,
-            draws: lists.draws,
-            draw_groups: lists.draw_groups,
+            draws: lists.visible.draws,
+            draw_groups: lists.visible.draw_groups,
             draw_first: 0,
             _pad: 0,
         }
@@ -605,7 +648,7 @@ impl ViewTargets {
         lists: &ViewLists,
         draws: &[GpuPtr<RasterGpu>],
     ) -> Vec<ParticleDraws> {
-        (0..lists.draws)
+        (0..lists.visible.draws)
             .zip(draws)
             .map(|(i, &raster)| ParticleDraws {
                 raster,
@@ -688,10 +731,10 @@ pub(crate) fn record(
     record[0] = targets.record(lists, software_pixels, occlusion, slots, roots);
     let first = record[0];
     let mut draws = vec![raster];
-    for i in 1..lists.draws {
+    for i in 1..lists.visible.draws {
         let (at, r) = window.slice::<RasterGpu>(device, 1)?;
         r[0] = RasterGpu {
-            draw_first: i * lists.draw_groups,
+            draw_first: i * lists.visible.draw_groups,
             ..first
         };
         draws.push(at);
