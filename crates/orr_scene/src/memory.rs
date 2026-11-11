@@ -519,6 +519,19 @@ impl Placement {
         true
     }
 
+    /// A range of `units` units for a range moving out of block `from`, in a block that is not
+    /// draining ([`Pool::alloc_moved`]).
+    fn moved(&mut self, units: u32, from: u32) -> Option<PoolSlot> {
+        if !self.draining.contains(&from) {
+            return None;
+        }
+        let slot = self.find(units, 1, None);
+        if slot.is_none() {
+            self.stuck(from);
+        }
+        slot
+    }
+
     /// A move out of draining block `block` found no room: the block takes ranges again, and
     /// is not chosen to empty until another range is freed.
     fn stuck(&mut self, block: u32) {
@@ -719,14 +732,7 @@ impl Pool {
     /// freed.
     pub(crate) fn alloc_moved(&mut self, bytes: u64, from: u32) -> Option<(PoolSlot, Block)> {
         let unit = self.places.unit;
-        let units = bytes.div_ceil(unit) as u32;
-        if !self.places.draining.contains(&from) {
-            return None;
-        }
-        let Some(slot) = self.places.find(units, 1, None) else {
-            self.places.stuck(from);
-            return None;
-        };
+        let slot = self.places.moved(bytes.div_ceil(unit) as u32, from)?;
         let memory = Block::of(
             self.memory[slot.block as usize]
                 .as_ref()
@@ -1173,5 +1179,26 @@ mod tests {
         assert_eq!(p.plan(true), 8, "a free lets it drain again");
         assert_eq!(p.draining, [narrow.block]);
         assert_eq!(p.find(2, 1, None).map(|s| s.block), Some(first.block));
+    }
+
+    /// A load that finds no room elsewhere takes a draining block's: the block drains no
+    /// longer, and a move out of it, planned while it drained, finds no range, in it or
+    /// elsewhere, and leaves it free to drain again.
+    #[test]
+    fn a_draining_block_a_load_resumed_takes_no_move_out_of_it() {
+        let mut p = Placement::new(64, 8 * 64);
+        p.add(8, 6, 1);
+        let thin = p.add(8, 2, 1);
+        assert_eq!(p.plan(true), 8);
+        assert_eq!(p.draining, [thin.block]);
+        assert_eq!(p.find(4, 1, None), None, "no room but the draining block's");
+        assert!(p.resume());
+        let load = p.find(4, 1, None).expect("the resumed block's room");
+        assert_eq!(load.block, thin.block);
+        assert_eq!(p.moved(1, thin.block), None);
+        assert_ne!(
+            p.blocks[thin.block as usize].as_ref().unwrap().stuck,
+            Some(p.frees)
+        );
     }
 }
