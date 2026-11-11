@@ -29,6 +29,7 @@ use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::scene::SceneDesc;
 use crate::shaders::ptlas::{PartitionGpu, PendingGpu, PtlasGpu, PtlasRoot, TranslateJob};
+use crate::table::Column;
 use crate::upload::Record;
 use crate::{Error, Result};
 
@@ -360,7 +361,8 @@ pub(crate) struct Ptlas {
     pub(crate) high_water: u32,
     demand: PartDemand,
     partition_table: Allocation<PartitionGpu>,
-    pub(crate) slot_table: Allocation<u32>,
+    /// Per slot, its cell partition as the PTLAS kernels read it.
+    pub(crate) slot_table: Column<u32>,
     kept: Kept,
     /// What the builds before kept, until the next build has carried it into `kept`.
     carried: Option<Kept>,
@@ -378,7 +380,6 @@ pub(crate) struct Ptlas {
 impl Ptlas {
     pub(crate) fn new(device: &Device, desc: &SceneDesc) -> Result<Self> {
         let dl = MemoryKind::DeviceLocal;
-        let n = |c: u32| u64::from(c.max(1));
         Ok(Self {
             layout: Layout { slots: 0, parts: 0 },
             max_per_partition: desc.partition_instances,
@@ -395,8 +396,8 @@ impl Ptlas {
             partitions: Vec::new(),
             free: Vec::new(),
             open: FxHashMap::default(),
-            slot_partition: vec![PARTITION_NONE; desc.instance_capacity as usize],
-            slot_cost: vec![0; desc.instance_capacity as usize],
+            slot_partition: Vec::new(),
+            slot_cost: Vec::new(),
             changed: BTreeSet::new(),
             assigned: BTreeSet::new(),
             emptied: Vec::new(),
@@ -404,7 +405,7 @@ impl Ptlas {
             high_water: 0,
             demand: PartDemand::default(),
             partition_table: device.gpu_malloc(dl, 1, "partitions")?,
-            slot_table: device.gpu_malloc(dl, n(desc.instance_capacity), "slot partitions")?,
+            slot_table: Column::new(device, MemoryPriority::Normal, "slot partitions", false)?,
             kept: Kept::new(device, 0)?,
             carried: None,
             readback: None,
@@ -430,6 +431,15 @@ impl Ptlas {
             max_ops: 3,
             translation: true,
         }
+    }
+
+    /// Gives the slot table and the slots' partitions room for `slots` slots. Fails without
+    /// device memory for the table, changing nothing.
+    pub(crate) fn reserve_slots(&mut self, device: &Device, slots: u32) -> Result<()> {
+        self.slot_table.reserve(device, slots)?;
+        self.slot_partition.resize(slots as usize, PARTITION_NONE);
+        self.slot_cost.resize(slots as usize, 0);
+        Ok(())
     }
 
     /// The layout of the frame's build, once [`Self::tlas`] has sized it.
@@ -705,8 +715,8 @@ impl Ptlas {
     /// The layout the copies placed so far take: room for every slot handed out and for the
     /// part runs their copies may hold at once, which [`Self::check_runs`] keeps within the
     /// 2^24 part instances a released run names its start in. A layout that grows takes twice
-    /// what it held, or what it must, so the builds that grow it stay few; slots stop at the
-    /// scene's, and part instances at 2^24.
+    /// what it held, or what it must, so the builds that grow it stay few; slots stop at what
+    /// the scene's slot tables hold, and part instances at 2^24.
     fn wanted(&self) -> Layout {
         let mut layout = self.layout;
         let slots = self.slot_partition.len() as u32;
@@ -887,7 +897,8 @@ impl Ptlas {
     pub(crate) fn figures(&self, slot: usize) -> Option<PtlasFigures> {
         let s = self.storage.as_ref()?;
         let c = self.readback.as_ref()?.as_slice()?.get(slot)?;
-        let tables = self.partition_table.size() + self.slot_table.size() + self.kept.bytes();
+        let slots = 4 * u64::from(self.slot_table.capacity());
+        let tables = self.partition_table.size() + slots + self.kept.bytes();
         Some(PtlasFigures {
             counters: *c,
             unplaced: self.unplaced,

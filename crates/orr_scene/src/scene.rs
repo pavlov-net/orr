@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
-use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, KernelSet, MemoryKind};
+use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, KernelSet, MemoryKind, MemoryPriority};
 use orr_math::{DVec3, IVec3};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -23,6 +23,7 @@ use crate::ptlas::{CopyRuns, Ptlas, run_class};
 use crate::shaders::instance_page::{PageEntriesGpu, PagePrototypeGpu};
 use crate::skin::{CopyArrays, SkinFrame, SkinnedDesc};
 use crate::subd::{self, ModelCage, SubdBuild, SubdDesc};
+use crate::table::{Column, TableCopy, grown};
 use crate::tessellate::Patterns;
 use crate::traverse::Cuts;
 use crate::upload::{Op, Record};
@@ -40,6 +41,10 @@ const NO_MODEL: u32 = u32::MAX;
 /// `tables.slang` `NO_MATERIAL_SET`.
 const NO_MATERIAL_SET: u32 = u32::MAX;
 
+/// Instance slots a scene holds at most: `tables.slang` `COPY_FAR` is the bit above a copy's
+/// slot.
+const MAX_SLOTS: u32 = 1 << 31;
+
 /// The far instance a copy of a chained model may hold.
 const FAR_RUN: CopyRuns = CopyRuns {
     body: None,
@@ -56,10 +61,10 @@ const GROUP_QUANTIZED_PAGE: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SceneId(pub u32);
 
-/// Table sizes of a scene, fixed at creation.
+/// Table sizes of a scene, fixed at creation. Its instance slots take what the copies placed
+/// need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SceneDesc {
-    pub instance_capacity: u32,
     /// Transform groups, the null group included.
     pub group_capacity: u32,
     pub light_capacity: u32,
@@ -95,7 +100,6 @@ pub struct SceneDesc {
 impl Default for SceneDesc {
     fn default() -> Self {
         Self {
-            instance_capacity: 65_536,
             group_capacity: 1024,
             light_capacity: 256,
             material_set_capacity: 4096,
@@ -118,8 +122,6 @@ pub use orr_pack::AffineRows;
 /// its models have now.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PageNeeds {
-    /// Of `instance_capacity`: one per record.
-    pub instances: u32,
     /// Of `page_material_sets`: the sets of the prototypes that override materials. A placement
     /// takes none for a prototype whose set `InstancePageRef::material_sets` replaces, so this
     /// is the most it takes.
@@ -149,8 +151,6 @@ pub(crate) fn page_needs(
     model_cpu: &[ModelCpu],
     id: PageId,
 ) -> Result<(PageNeeds, Vec<PrototypeEntries>, Vec<PagePrototype>)> {
-    let page = mounts.page(id).ok_or(Error::UnknownPage(id))?;
-    let instances = u32::from(page.info.header.record_count);
     let protos = mounts.page_prototypes(id)?;
     let material_sets = protos
         .iter()
@@ -166,7 +166,6 @@ pub(crate) fn page_needs(
         })
         .collect();
     let needs = PageNeeds {
-        instances,
         material_sets,
         emissive: page_entries(&entries),
     };
@@ -353,8 +352,9 @@ pub struct InstancesDesc {
 
 pub(crate) struct Tables {
     pub(crate) root: Allocation<SceneRoot>,
-    pub(crate) instances: Allocation<InstanceGpu>,
-    pub(crate) slot_state: Allocation<SlotStateGpu>,
+    /// By slot, like `slot_state` and the PTLAS slot table: the three grow together.
+    pub(crate) instances: Column<InstanceGpu>,
+    pub(crate) slot_state: Column<SlotStateGpu>,
     pub(crate) groups: Allocation<GroupGpu>,
     pub(crate) material_sets: Allocation<MaterialId>,
     pub(crate) lights: Allocation<LightGpu>,
@@ -873,6 +873,11 @@ impl SceneCpu {
         }
     }
 
+    /// Instance slots the scene's tables hold room for.
+    pub(crate) fn slot_capacity(&self) -> u32 {
+        self.slot_holds.len() as u32
+    }
+
     /// The focus and the pixels per radian of the scene's per-frame work.
     pub(crate) fn focus_detail(&self) -> Option<(DVec3, f32)> {
         self.focus.map(|f| (f, self.pixels_per_radian))
@@ -880,6 +885,53 @@ impl SceneCpu {
 }
 
 impl Scene {
+    /// The first of `count` consecutive free slots. Without a free run that long the slot
+    /// tables grow as [`grown`] says. Fails past [`MAX_SLOTS`] or what a slot table can hold,
+    /// or without device memory for the grown tables, with no slot taken.
+    fn take_slots(&self, cpu: &mut SceneCpu, device: &Device, count: u32) -> Result<u32> {
+        // A run of no slots takes none, and its start names no slot.
+        if count == 0 {
+            return Ok(0);
+        }
+        if let Some(first) = cpu.slots.alloc(count) {
+            return Ok(first);
+        }
+        let held = cpu.slot_holds.len() as u32;
+        let t = &self.tables;
+        let limit = MAX_SLOTS.min(t.instances.limit()).min(t.slot_state.limit());
+        let slots = grown("instance slots", held, count, limit)?;
+        self.tables.instances.reserve(device, slots)?;
+        self.tables.slot_state.reserve(device, slots)?;
+        cpu.ptlas.reserve_slots(device, slots)?;
+        cpu.slot_holds.resize(slots as usize, SlotHold::FREE);
+        cpu.slot_runs.resize(slots as usize, (NO_MODEL, None));
+        cpu.slots.grow(held, slots);
+        Ok(cpu
+            .slots
+            .alloc(count)
+            .expect("the grown tables have a free run of `count`"))
+    }
+
+    /// Moves the scene's tables that grew since its last update: see [`Column::land`].
+    pub(crate) fn land(
+        &self,
+        cpu: &SceneCpu,
+        frame: u64,
+        copies: &mut Vec<TableCopy>,
+        records: &mut Vec<Record>,
+    ) {
+        self.tables.instances.land(frame, copies, records);
+        self.tables.slot_state.land(frame, copies, records);
+        cpu.ptlas.slot_table.land(frame, copies, records);
+    }
+
+    /// Frees the tables moved from in frames at or before `completed`.
+    pub(crate) fn retire(&self, cpu: &SceneCpu, completed: u64) {
+        self.tables.instances.retire(completed);
+        self.tables.slot_state.retire(completed);
+        cpu.ptlas.slot_table.retire(completed);
+    }
+
     /// Instance entry `entry` of the emissive list.
     fn emissive_entry(&self, entry: u32) -> GpuPtr<EmissiveGpu> {
         self.tables
@@ -1225,8 +1277,8 @@ impl Scene {
         let (decal_slots, decal_refs) = table_sizes(desc.decal_capacity);
         let tables = Tables {
             root: device.gpu_malloc(dl, 1, "scene root")?,
-            instances: device.gpu_malloc(dl, n(desc.instance_capacity), "instances")?,
-            slot_state: device.gpu_malloc(dl, n(desc.instance_capacity), "slot state")?,
+            instances: Column::new(device, MemoryPriority::Normal, "instances", true)?,
+            slot_state: Column::new(device, MemoryPriority::Normal, "slot state", true)?,
             groups: device.gpu_malloc(dl, n(desc.group_capacity), "transform groups")?,
             material_sets: device.gpu_malloc(
                 dl,
@@ -1258,12 +1310,10 @@ impl Scene {
             decal_refs: device.gpu_malloc(dl, n(decal_refs), "decal runs")?,
             proxies: device.gpu_malloc(dl, n(desc.medium_proxy_capacity), "medium proxies")?,
         };
-        // Tables start zeroed: empty slots, the null group, no lights. These apply before
-        // any write (sequence 0).
+        // Tables start zeroed: the null group, no lights. These apply before any write
+        // (sequence 0).
         let zero = |a: GpuAddress, bytes: u64| Record::fill(0, a.0, words(bytes as usize), 0);
         let records = vec![
-            zero(tables.instances.gpu().address(), tables.instances.size()),
-            zero(tables.slot_state.gpu().address(), tables.slot_state.size()),
             zero(tables.groups.gpu().address(), tables.groups.size()),
             zero(
                 tables.material_sets.gpu().address(),
@@ -1293,9 +1343,9 @@ impl Scene {
             desc: *desc,
             tables,
             cpu: Mutex::new(SceneCpu {
-                slots: RangeAllocator::new(desc.instance_capacity),
-                slot_holds: vec![SlotHold::FREE; desc.instance_capacity as usize],
-                slot_runs: vec![(NO_MODEL, None); desc.instance_capacity as usize],
+                slots: RangeAllocator::new(0),
+                slot_holds: Vec::new(),
+                slot_runs: Vec::new(),
                 copies: FxHashMap::default(),
                 masks: HashSet::new(),
                 removed: Vec::new(),
@@ -1608,10 +1658,7 @@ impl<'f> SceneWriter<'f> {
             cpu.ptlas.check_runs([(runs, desc.copies)])?;
             cpu.ptlas
                 .reserve_place(self.device, desc.copies, cell, cost)?;
-            let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
-                what: "instances",
-                capacity: self.scene.desc.instance_capacity,
-            })?;
+            let first = self.scene.take_slots(cpu, self.device, desc.copies)?;
             let entry = if ranks > 0 {
                 cpu.emissive.alloc(desc.copies * ranks)
             } else {
@@ -1744,11 +1791,8 @@ impl<'f> SceneWriter<'f> {
         }
         let header = page.info.header;
         let exact_rows = header.exact_rows(page.bytes as usize)? as u32;
-        let PageNeeds {
-            instances: count,
-            emissive,
-            ..
-        } = needs;
+        let count = u32::from(header.record_count);
+        let emissive = needs.emissive;
         let set_entries = protos
             .iter()
             .zip(named)
@@ -1804,10 +1848,7 @@ impl<'f> SceneWriter<'f> {
                 .map(|&(m, records, body)| (cpu.copy_runs(m, chained(m), body), records)),
         )?;
         cpu.ptlas.reserve_runs(self.device, &runs)?;
-        let first = cpu.slots.alloc(count).ok_or(Error::Capacity {
-            what: "instances",
-            capacity: self.scene.desc.instance_capacity,
-        })?;
+        let first = self.scene.take_slots(cpu, self.device, count)?;
         let Some(set_base) = cpu.page_sets.alloc(set_entries) else {
             cpu.slots.free(first, count);
             return Err(Error::Capacity {
@@ -2256,10 +2297,7 @@ impl<'f> SceneWriter<'f> {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let runs = cpu.copy_runs(desc.model.0, model.chained, body);
             cpu.ptlas.check_runs([(runs, desc.copies)])?;
-            let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
-                what: "instances",
-                capacity: self.scene.desc.instance_capacity,
-            })?;
+            let first = self.scene.take_slots(cpu, self.device, desc.copies)?;
             let Some(entry) = cpu.skinned.alloc(desc.copies) else {
                 cpu.slots.free(first, desc.copies);
                 return Err(Error::Capacity {

@@ -51,7 +51,6 @@ impl Showcase {
         let scene = renderer
             .create_scene(
                 &SceneDesc {
-                    instance_capacity: 16,
                     group_capacity: 4,
                     light_capacity: 2,
                     material_set_capacity: 16,

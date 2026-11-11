@@ -1011,7 +1011,6 @@ impl DenseVegetation {
         let scene = renderer
             .create_scene(
                 &SceneDesc {
-                    instance_capacity: tree_count + 64,
                     group_capacity: groups,
                     light_capacity: (lights + textured).max(1),
                     producer_capacity: 8,

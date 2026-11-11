@@ -926,7 +926,6 @@ fn run(options: &Options) -> Option<Capture> {
     let needs = pages.iter().fold(PageNeeds::default(), |n, &p| {
         let p = renderer.page_needs(p).expect("page needs");
         PageNeeds {
-            instances: n.instances + p.instances,
             material_sets: n.material_sets + p.material_sets,
             emissive: n.emissive + p.emissive,
         }
@@ -936,7 +935,6 @@ fn run(options: &Options) -> Option<Capture> {
     let scene = renderer
         .create_scene(
             &SceneDesc {
-                instance_capacity: needs.instances,
                 // Each page takes a group, and group 0 is the null group.
                 group_capacity: pages.len() as u32 + 1,
                 light_capacity: 1,

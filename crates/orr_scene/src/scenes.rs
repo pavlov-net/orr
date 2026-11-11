@@ -1307,6 +1307,7 @@ impl Scenes {
                 !done
             });
             cpu.ptlas.retire(completed);
+            scene.retire(cpu, completed);
         }
         core.mounts.retire(completed, &core.materials);
         core.materials.table.retire(completed);
@@ -1795,7 +1796,7 @@ impl<'a> Frame<'a> {
             if cpu.cuts.is_none() {
                 let heap = device.memory_report().heap_of(MemoryKind::DeviceLocal).size;
                 let sizes = CutSizes {
-                    slots: scene.desc.instance_capacity,
+                    slots: cpu.slot_capacity(),
                     queue: core.budgets.initial_traversal_nodes,
                     candidates: core.budgets.initial_candidate_items,
                     rt_clas: core.budgets.initial_rt_cut_clusters,
@@ -1807,8 +1808,9 @@ impl<'a> Frame<'a> {
                 };
                 cpu.cuts = Some(Cuts::new(device, sizes, core.fif)?);
             }
+            let slots = cpu.slot_capacity();
             let cuts = cpu.cuts.as_mut().expect("made above");
-            cuts.follow_models(device, core.mounts.models.capacity())?;
+            cuts.follow(device, core.mounts.models.capacity(), slots)?;
             match cuts.fit(device, self.id, response_period(core.fif)) {
                 Err(e) if e.is_out_of_memory() => short.push(e),
                 r => r?,
@@ -1962,6 +1964,11 @@ impl<'a> Frame<'a> {
         let mut moves = Vec::new();
         core.materials.table.land(self.id, &mut moves, &mut records);
         core.mounts.land(self.id, &mut moves, &mut records);
+        for &id in &self.listed {
+            let scene = core.scene(id)?;
+            let cpu = scene.cpu.lock().unwrap();
+            scene.land(&cpu, self.id, &mut moves, &mut records);
+        }
         if !moves.is_empty() {
             list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
         }
@@ -2469,13 +2476,14 @@ impl<'a> Frame<'a> {
                 core.cell_log2,
             )
             .to_array();
-        let (slots, smoke, scene_features, work) = {
+        let (slots, slot_capacity, smoke, scene_features, work) = {
             let cpu = scene.cpu.lock().unwrap();
             let features = cpu.features();
             let smoke = features.contains(SceneFeatures::SMOKE);
             let cuts = cpu.cuts.as_ref().expect("an updated scene has cut tables");
             (
                 cpu.ptlas.high_water,
+                cpu.slot_capacity(),
                 smoke,
                 features,
                 cuts.candidate_capacity(),
@@ -2483,7 +2491,6 @@ impl<'a> Frame<'a> {
         };
         let features = core.features() | scene_features;
         let producer_capacity = scene.desc.producer_capacity;
-        let slot_capacity = scene.desc.instance_capacity;
         let sizes = TargetSizes {
             extent: view.render_extent.to_array(),
             extended: core.materials.any_extended(),

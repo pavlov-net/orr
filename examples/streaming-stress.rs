@@ -281,7 +281,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let scene = renderer
         .create_scene(
             &SceneDesc {
-                instance_capacity: 2 * PANELS as u32 + 1,
                 group_capacity: 4,
                 light_capacity: 1,
                 material_set_capacity: 16,

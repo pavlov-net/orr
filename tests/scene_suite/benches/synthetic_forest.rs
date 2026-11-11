@@ -701,15 +701,8 @@ impl Forest {
             .map(|n| r.model(m, AssetId::from_name(n)).unwrap())
             .collect();
         let copies = copies(args);
-        let capacity = (copies.len() as u32 + 1024).next_power_of_two();
         let scene = r
-            .create_scene(
-                &SceneDesc {
-                    instance_capacity: capacity,
-                    ..SceneDesc::default()
-                },
-                &Default::default(),
-            )
+            .create_scene(&SceneDesc::default(), &Default::default())
             .unwrap();
         let history = r.create_raster_view_history().unwrap();
         let list = [scene];

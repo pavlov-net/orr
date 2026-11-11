@@ -1104,8 +1104,9 @@ fn an_unmount_takes_copies_and_pages_of_its_models_from_a_scene_that_keeps_rende
     });
     let (copies, placed, group) = (copies.unwrap(), placed.unwrap(), group.unwrap());
     let gpu = Gpu(device());
-    let root: SceneRoot = gpu.value(root);
     let state = |gpu: &Gpu<'_>| -> (Vec<u8>, usize) {
+        // The slot tables move when the scene takes more slots than they hold.
+        let root: SceneRoot = gpu.value(root);
         let instances: Vec<orr_scene::InstanceGpu> = gpu.values(root.instances, root.part_base);
         let entries: Vec<EmissiveGpu> = gpu.values(
             root.emissive,

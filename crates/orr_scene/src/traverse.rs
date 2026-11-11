@@ -246,6 +246,7 @@ impl CutPipelines {
 /// Capacities of a scene's cut tables.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CutSizes {
+    /// The scene's instance slots, which the slots' cuts follow as they grow.
     pub(crate) slots: u32,
     /// The first sizes of each traversal queue and of the candidate cut, which grow.
     pub(crate) queue: u32,
@@ -443,6 +444,15 @@ impl RtTables {
     }
 }
 
+/// The cuts of `slots` instance slots, which every frame's traversal writes before it reads.
+fn slot_cuts(device: &Device, slots: u32) -> Result<Allocation<SlotCutGpu>> {
+    Ok(device.gpu_malloc(
+        MemoryKind::DeviceLocal,
+        u64::from(slots.max(1)),
+        "slot cuts",
+    )?)
+}
+
 /// The merged cuts of `models` models, which every frame's traversal clears before it writes.
 fn merged_cuts(device: &Device, models: u32) -> Result<Allocation<u32>> {
     Ok(device.gpu_malloc(
@@ -501,6 +511,8 @@ pub(crate) struct Cuts {
     traced: bool,
     /// Per model, the merged cut its copies trace this frame.
     model_cut: Allocation<u32>,
+    /// Per instance slot, its cut this frame.
+    slot_cut: Allocation<SlotCutGpu>,
     _blocks: Vec<Allocation<u8>>,
     counters: GpuPtr<u32>,
     args: GpuPtr<u32>,
@@ -561,8 +573,7 @@ impl Cuts {
             blocks.push(a);
             Ok(gpu)
         };
-        let n = |c: u32| u64::from(c.max(1));
-        let slots = block(n(sizes.slots) * size_of::<SlotCutGpu>() as u64, "slot cuts")?;
+        let slot_cut = slot_cuts(device, sizes.slots)?;
         let lists = Lists::new(device, sizes.queue, sizes.candidates)?;
         let keys = 4 * sizes.rt_blas.max(1);
         let traced = device.caps().cluster.max_partitions > 0;
@@ -590,7 +601,7 @@ impl Cuts {
         )?
         .cast();
         let gpu = rt.name(CutGpu {
-            slots: slots.cast(),
+            slots: slot_cut.gpu(),
             queue: lists.queue.each_ref().map(Allocation::gpu),
             candidates: lists.candidates.gpu(),
             entries: GpuPtr::NULL,
@@ -640,6 +651,7 @@ impl Cuts {
             clas_short: false,
             traced,
             model_cut,
+            slot_cut,
             _blocks: blocks,
             counters,
             args,
@@ -704,21 +716,34 @@ impl Cuts {
         self.ran[slot].rt_scale
     }
 
-    /// Gives the merged cuts an entry for each of `models` entries of the model table, before
-    /// the frame records anything that reads them.
-    pub(crate) fn follow_models(&mut self, device: &Device, models: u32) -> Result<()> {
-        if models <= self.sizes.models {
+    /// Gives the merged cuts an entry for each of `models` entries of the model table and the
+    /// slots' cuts one for each of the scene's `slots` instance slots, before the frame records
+    /// anything that reads them.
+    pub(crate) fn follow(&mut self, device: &Device, models: u32, slots: u32) -> Result<()> {
+        if models <= self.sizes.models && slots <= self.sizes.slots {
             return Ok(());
         }
-        let model_cut = merged_cuts(device, models)?;
+        let model_cut = (models > self.sizes.models)
+            .then(|| merged_cuts(device, models))
+            .transpose()?;
+        let slot_cut = (slots > self.sizes.slots)
+            .then(|| slot_cuts(device, slots))
+            .transpose()?;
         let gpu = CutGpu {
-            model_cut: model_cut.gpu(),
+            model_cut: model_cut.as_ref().unwrap_or(&self.model_cut).gpu(),
+            slots: slot_cut.as_ref().unwrap_or(&self.slot_cut).gpu(),
             ..self.gpu
         };
         self.record = cut_record(device, gpu)?;
         self.gpu = gpu;
-        self.model_cut = model_cut;
-        self.sizes.models = models;
+        if let Some(model_cut) = model_cut {
+            self.model_cut = model_cut;
+            self.sizes.models = models;
+        }
+        if let Some(slot_cut) = slot_cut {
+            self.slot_cut = slot_cut;
+            self.sizes.slots = slots;
+        }
         Ok(())
     }
 
