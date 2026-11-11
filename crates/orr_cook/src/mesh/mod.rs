@@ -661,7 +661,11 @@ pub(crate) fn cook(
     // Baked displacement moves the geometry the derived tangents would follow.
     let bakes = s.displace_static.is_some() && maps.iter().any(SectionMaps::bakes);
     let tangent_check = match (&m.tangents, s.tangent_error_max) {
-        (Some(t), Some(max)) if !bakes => tangents::check(&m, t, &maps, max),
+        (Some(t), Some(max)) if !bakes => {
+            let b = referenced_bounds(&m.positions, &m.indices);
+            let k = mesh_exponent(&b, s.position_step_log2, m.min_exponent);
+            tangents::check(&m, t, &maps, max, Snap::new(k))
+        }
         _ => TangentCheck::KEPT,
     };
     for sm in &mut maps {
@@ -1576,13 +1580,32 @@ fn position_bounds(positions: &[[f32; 3]]) -> Aabb {
             c.iter().for_each(|&p| b.extend(p));
             b
         })
-        .reduce(
-            || Aabb::EMPTY,
-            |a, b| Aabb {
-                min: [0, 1, 2].map(|i| a.min[i].min(b.min[i])),
-                max: [0, 1, 2].map(|i| a.max[i].max(b.max[i])),
-            },
-        )
+        .reduce(|| Aabb::EMPTY, union)
+}
+
+/// The box of the positions `indices` name: those welding keeps.
+fn referenced_bounds(positions: &[[f32; 3]], indices: &[u32]) -> Aabb {
+    indices
+        .par_chunks(1 << 16)
+        .map(|c| {
+            let mut b = Aabb::EMPTY;
+            c.iter().for_each(|&i| b.extend(positions[i as usize]));
+            b
+        })
+        .reduce(|| Aabb::EMPTY, union)
+}
+
+fn union(a: Aabb, b: Aabb) -> Aabb {
+    Aabb {
+        min: [0, 1, 2].map(|i| a.min[i].min(b.min[i])),
+        max: [0, 1, 2].map(|i| a.max[i].max(b.max[i])),
+    }
+}
+
+/// The exponent of the grid a mesh whose positions have box `b` is stored on: its own
+/// [`bounds_exponent`], no finer than `2^min`.
+fn mesh_exponent(b: &Aabb, step_log2: i8, min: Option<i8>) -> i8 {
+    bounds_exponent(b, step_log2).max(min.unwrap_or(i8::MIN))
 }
 
 /// [`grid_exponent`] of positions with box `b`.
@@ -1595,6 +1618,38 @@ fn bounds_exponent(b: &Aabb, step_log2: i8) -> i8 {
         k += 1;
     }
     k as i8
+}
+
+/// The grid of step `2^k` m: where it puts a coordinate.
+#[derive(Copy, Clone)]
+pub(crate) struct Snap {
+    step: f64,
+    inverse: f64,
+}
+
+impl Snap {
+    fn new(k: i8) -> Self {
+        let k = i32::from(k);
+        // Dividing by a power of two is multiplying by its exact inverse.
+        Self {
+            step: 2f64.powi(k),
+            inverse: 2f64.powi(-k),
+        }
+    }
+
+    /// The cell of coordinate `x`. `as` saturates, so a cell past 2^23 stays past it.
+    fn cell(&self, x: f32) -> i32 {
+        (f64::from(x) * self.inverse + 0.5).floor() as i32
+    }
+
+    fn coordinate(&self, cell: i32) -> f32 {
+        (f64::from(cell) * self.step) as f32
+    }
+
+    /// Position `p` on the grid.
+    pub(crate) fn position(&self, p: [f32; 3]) -> [f32; 3] {
+        p.map(|x| self.coordinate(self.cell(x)))
+    }
 }
 
 /// The mesh grid: every position as an integer multiple of `2^k` meters.
@@ -1612,15 +1667,12 @@ impl Grid {
         let _z = crate::profile::zone!("mesh.grid");
         let b = position_bounds(positions);
         let own = bounds_exponent(&b, step_log2);
-        let k = i32::from(own.max(min.unwrap_or(i8::MIN)));
-        let step = 2f64.powi(k);
-        // Dividing by a power of two is multiplying by its exact inverse.
-        let inverse = 2f64.powi(-k);
-        // `as` saturates, so a cell past 2^23 stays past it.
+        let k = mesh_exponent(&b, step_log2, min);
+        let snap = Snap::new(k);
         let cells: Vec<[i32; 3]> = positions
             .par_iter()
             .light()
-            .map(|p| p.map(|x| (f64::from(x) * inverse + 0.5).floor() as i32))
+            .map(|p| p.map(|x| snap.cell(x)))
             .collect();
         let largest = |g: &[i32; 3]| g.iter().fold(0, |m, v| m.max(v.unsigned_abs()));
         let max_abs = cells.par_iter().light().map(largest).max().unwrap_or(0);
@@ -1638,7 +1690,7 @@ impl Grid {
         let floats: Vec<[f32; 3]> = cells
             .par_iter()
             .light()
-            .map(|g| g.map(|v| (f64::from(v) * step) as f32))
+            .map(|g| g.map(|v| snap.coordinate(v)))
             .collect();
         let m = meshopt::compute_position_exponent(b.min, b.max, step_log2.into(), 16);
         let own = i32::from(own);
@@ -1652,7 +1704,7 @@ impl Grid {
                 .expect("positions are 12-byte vertices"),
         );
         Ok(Self {
-            k: k as i8,
+            k,
             truncate_bits: (24 - (32 - max_abs.leading_zeros())) as u8,
             cells,
             floats,

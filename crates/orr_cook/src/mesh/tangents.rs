@@ -4,7 +4,10 @@
 //!
 //! Over every texel center of each normal map that a triangle covers, the check builds the
 //! shading normal `material_normal` gives from the stored tangent and from the derived one,
-//! and takes the 99th percentile of the angle between them. A tile set counts each tile's texels,
+//! and takes the 99th percentile of the angle between them. It derives tangents as the runtime
+//! does from positions on the grid the mesh is stored on, and from the source uvs: the stored
+//! ones follow the clusters, which follow the check, and lie within half a cluster's uv step of
+//! them. A tile set counts each tile's texels,
 //! and the cells it has no tile in at the density of its largest. A mesh whose triangles cover
 //! more than [`SAMPLES`] texels, as uvs that repeat a map many times do, samples a lattice of
 //! texel centers at a whole-texel stride instead, offset by a hash of each triangle, so every
@@ -17,7 +20,7 @@ use orr_pack::texture::normal;
 use rustc_hash::FxHashMap;
 
 use super::maps::{Map, Raster};
-use super::{MeshData, NormalSpec, SectionMaps};
+use super::{MeshData, NormalSpec, SectionMaps, Snap};
 
 /// Histogram bin width, degrees.
 const BIN: f32 = 0.01;
@@ -151,14 +154,16 @@ impl TangentCheck {
     };
 }
 
-/// Compares the shading of `m`'s stored tangents with derived ones on its normal maps;
-/// derives when the 99th-percentile angle is within `max_deg`. A section whose material
-/// reads the tangent beyond a readable normal map keeps the stored tangents.
+/// Compares the shading of `m`'s stored tangents on its normal maps with that of tangents
+/// derived from its positions on the mesh grid `snap`; derives when the 99th-percentile angle
+/// is within `max_deg`. A section whose material reads the tangent beyond a readable normal map
+/// keeps the stored tangents.
 pub(super) fn check(
     m: &MeshData,
     tangents: &[[f32; 4]],
     maps: &[SectionMaps],
     max_deg: f32,
+    snap: Snap,
 ) -> TangentCheck {
     let _z = crate::profile::zone!("mesh.tangent_check");
     let mut checked = Vec::new();
@@ -223,7 +228,8 @@ pub(super) fn check(
                 || (vec![0.0f64; BINS], 0u64),
                 |(mut h, mut n), (k, chunk)| {
                     for (j, t) in chunk.as_chunks::<3>().0.iter().enumerate() {
-                        let tri = Triangle::new(m, [set, frame], tangents, t.map(|i| i as usize));
+                        let v = t.map(|i| i as usize);
+                        let tri = Triangle::new(m, snap, [set, frame], tangents, v);
                         let lattice = stride.map(|s| (s, phase((first + k * CHUNK + j) as u64)));
                         map.parts(tri.uv, |p| {
                             let [x, ..] = p.read;
@@ -282,7 +288,7 @@ pub(super) fn check(
     }
 }
 
-/// One source triangle in object space.
+/// One source triangle in object space, on the mesh grid.
 struct Triangle {
     uv: [[f32; 2]; 3],
     normals: [Vec3; 3],
@@ -296,10 +302,16 @@ struct Triangle {
 }
 
 impl Triangle {
-    /// The triangle with corners `v`, its map read on uv set `read` and its derived tangent
-    /// from uv set `frame`.
-    fn new(m: &MeshData, [read, frame]: [usize; 2], tangents: &[[f32; 4]], v: [usize; 3]) -> Self {
-        let p = v.map(|i| Vec3::from(m.positions[i]));
+    /// The triangle with corners `v` on grid `snap`, its map read on uv set `read` and its
+    /// derived tangent from uv set `frame`.
+    fn new(
+        m: &MeshData,
+        snap: Snap,
+        [read, frame]: [usize; 2],
+        tangents: &[[f32; 4]],
+        v: [usize; 3],
+    ) -> Self {
+        let p = v.map(|i| Vec3::from(snap.position(m.positions[i])));
         let uv = v.map(|i| m.uvs[read][i]);
         let f = v.map(|i| m.uvs[frame][i]);
         let (e1, e2) = (p[1] - p[0], p[2] - p[0]);

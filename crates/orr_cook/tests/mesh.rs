@@ -8,7 +8,7 @@ use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, Manifest, MeshInput, MeshSettings, Source,
     TextureSettings, Usage,
 };
-use orr_math::{Mat4, Vec3};
+use orr_math::{Mat4, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{self, MeshInfo, PageView, Section};
 use orr_pack::model::ModelInfo;
@@ -449,12 +449,30 @@ fn corrupt_pages_are_rejected() {
 /// The normal texture a library mesh's materials bind, and the model `input` cooked keeping
 /// its tangents with `materials`, and the cook's warnings.
 fn library_cook(name: &str, input: MeshInput, materials: Vec<Material>) -> (Archive, Vec<String>) {
-    let path = dir(name).join("normal.png");
-    image::RgbaImage::from_fn(16, 16, |x, y| {
+    let normals = image::RgbaImage::from_fn(16, 16, |x, y| {
         image::Rgba([96 + (x * 4) as u8, 160 - (y * 4) as u8, 255, 255])
-    })
-    .save(&path)
-    .unwrap();
+    });
+    let settings = MeshSettings {
+        tangent_error_max: None,
+        ..MeshSettings::default()
+    };
+    let (a, report) = library_cook_with(name, input, materials, settings, normals);
+    let warnings = report.assets.iter().flat_map(|a| &a.entries);
+    let warnings = warnings.flat_map(|e| e.warnings.clone()).collect();
+    (a, warnings)
+}
+
+/// `input` cooked with `materials` and `settings` beside the normal texture `normals` they bind,
+/// and the cook's report.
+fn library_cook_with(
+    name: &str,
+    input: MeshInput,
+    materials: Vec<Material>,
+    settings: MeshSettings,
+    normals: image::RgbaImage,
+) -> (Archive, orr_cook::CookReport) {
+    let path = dir(name).join("normal.png");
+    normals.save(&path).unwrap();
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
@@ -474,10 +492,7 @@ fn library_cook(name: &str, input: MeshInput, materials: Vec<Material>) -> (Arch
                     source: Source::Mesh {
                         mesh: input,
                         materials,
-                        settings: MeshSettings {
-                            tangent_error_max: None,
-                            ..MeshSettings::default()
-                        },
+                        settings,
                     },
                 },
             ],
@@ -485,9 +500,7 @@ fn library_cook(name: &str, input: MeshInput, materials: Vec<Material>) -> (Arch
     };
     let mut cooked = orr_cook::cook(&manifest, &Default::default()).unwrap();
     let a = Archive::from_memory(cooked.memory.remove(0)).unwrap();
-    let warnings = cooked.report.assets.iter().flat_map(|a| &a.entries);
-    let warnings = warnings.flat_map(|e| e.warnings.clone()).collect();
-    (a, warnings)
+    (a, cooked.report)
 }
 
 /// Section, position and tangent of every vertex of the library model.
@@ -780,4 +793,141 @@ fn whole_uvs_inside_a_cluster_are_exact() {
         clusters > 1 && whole >= 12,
         "{clusters} clusters, {whole} whole uvs"
     );
+}
+
+/// The 99th percentile over the normal map's texel centers, `texels` a side, of the degrees
+/// between `tangent` and the tangent the runtime derives from each triangle's grid positions and
+/// stored uvs (`orr_scene.hit`'s `triangle_tangent` without `MESH_TANGENT`).
+fn derived_angle_p99(a: &Archive, tangent: Vec3, texels: u32) -> f32 {
+    let blobs = a.blobs(a.find(AssetId::from_name("m/mesh")).unwrap());
+    let info = MeshInfo::parse(&read_blob(a, &blobs[0])).unwrap();
+    let mut angles = Vec::new();
+    for page in &info.pages {
+        let mut resident = vec![0; page.resident_len as usize];
+        mesh::decode_page(&read_blob(a, &blobs[page.blob as usize]), &mut resident).unwrap();
+        let view = PageView::new(&resident, &info.header).unwrap();
+        for ci in 0..view.cluster_count() {
+            let c = view.cluster(ci);
+            for t in 0..u32::from(c.tri_count) {
+                let k = view.triangle(&c, t).map(u32::from);
+                let p = k.map(|v| Vec3::from(view.position(&c, v)));
+                let uv = k.map(|v| Vec2::from(view.uv(&c, v, 0)));
+                let n = k
+                    .iter()
+                    .map(|&v| Vec3::from(view.normal(&c, v)))
+                    .sum::<Vec3>()
+                    .normalize();
+                let (e1, e2, uv1, uv2) = (p[1] - p[0], p[2] - p[0], uv[1] - uv[0], uv[2] - uv[0]);
+                let r = uv1.x * uv2.y - uv2.x * uv1.y;
+                let along = (e1 * uv2.y - e2 * uv1.y) / r;
+                let derived = (along - n * n.dot(along)).normalize();
+                let degrees = derived.dot(tangent).clamp(-1.0, 1.0).acos().to_degrees();
+                angles.push((degrees, texel_centers(uv, texels)));
+            }
+        }
+    }
+    angles.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total: u32 = angles.iter().map(|a| a.1).sum();
+    let mut sum = 0;
+    angles
+        .iter()
+        .find(|a| {
+            sum += a.1;
+            f64::from(sum) >= 0.99 * f64::from(total)
+        })
+        .unwrap()
+        .0
+}
+
+/// Texel centers of a map `texels` a side inside the uv triangle `uv`.
+fn texel_centers(uv: [Vec2; 3], texels: u32) -> u32 {
+    let p = uv.map(|c| c * texels as f32);
+    let cross = |a: Vec2, b: Vec2, q: Vec2| (b - a).perp_dot(q - a);
+    let s = cross(p[0], p[1], p[2]).signum();
+    let lo = p[0].min(p[1]).min(p[2]).floor().as_ivec2();
+    let hi = p[0].max(p[1]).max(p[2]).ceil().as_ivec2();
+    let mut n = 0;
+    for y in lo.y..hi.y {
+        for x in lo.x..hi.x {
+            let q = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+            if (0..3).all(|i| s * cross(p[i], p[(i + 1) % 3], q) >= 0.0) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// A mesh drops its tangents only where those the runtime derives from the stored grid
+/// positions and uvs shade its normal map within the budget, as the check measures them. A
+/// flat grid turned off the grid's axes, whose stored tangents are its uvs' own, its vertices
+/// 3.3, 26.4 and 211 grid steps apart: the grid turns the tangents its triangles derive by
+/// degrees at the coarsest step.
+#[test]
+fn the_tangent_check_measures_the_tangents_the_runtime_derives() {
+    const QUADS: u32 = 31;
+    const TEXELS: u32 = 256;
+    let spacing = 3.3 * 2f32.powi(-8);
+    let (along, across) = (Vec3::new(0.8, 0.6, 0.0), Vec3::new(-0.6, 0.8, 0.0));
+    let mut input = MeshInput::default();
+    let mut uvs = Vec::new();
+    for j in 0..=QUADS {
+        for i in 0..=QUADS {
+            let at = [i, j].map(|k| spacing * k as f32);
+            input.positions.push(along * at[0] + across * at[1]);
+            input.normals.push(Vec3::Z);
+            // 8 x 8 texels a quad, a quarter texel off the texel grid along u, so that no texel
+            // center lies on an edge.
+            let texel = [8.0 * i as f32 + 0.25, 8.0 * j as f32];
+            uvs.push(Vec2::from(texel.map(|t| t / TEXELS as f32)));
+        }
+    }
+    input.uvs = Some(uvs);
+    // v runs along `across`, which with v down the image is a bitangent sign of -1.
+    input.tangents = Some(vec![along.extend(-1.0); input.positions.len()]);
+    let w = QUADS + 1;
+    for j in 0..QUADS {
+        for i in 0..QUADS {
+            let c = j * w + i;
+            input
+                .indices
+                .extend([c, c + 1, c + w, c + 1, c + w + 1, c + w]);
+        }
+    }
+    input.sections = vec![Span {
+        first: 0,
+        count: input.indices.len() as u32,
+    }];
+    // Tilted all the way to the tangent, so a shading normal turns as far as its tangent.
+    let normals = image::RgbaImage::from_pixel(TEXELS, TEXELS, image::Rgba([255, 128, 128, 255]));
+    let budget = 1.0;
+    let (mut kept, mut dropped) = (false, false);
+    for step_log2 in [-8, -11, -14] {
+        let settings = MeshSettings {
+            position_step_log2: step_log2,
+            tangent_error_max: Some(budget),
+            ..MeshSettings::default()
+        };
+        let name = format!("tangent-check-{}", -step_log2);
+        let materials = vec![normal_mapped(0)];
+        let (a, report) =
+            library_cook_with(&name, input.clone(), materials, settings, normals.clone());
+        let mut entries = report.assets.iter().flat_map(|a| &a.entries);
+        let check = entries
+            .find_map(|e| e.mesh.as_ref()?.tangents.clone())
+            .unwrap();
+        let measured = check.angle_p99.unwrap();
+        let runtime = derived_angle_p99(&a, along, TEXELS);
+        // The check reports the upper edge of its 0.01 degree bin.
+        assert!(
+            (measured - 0.01 - 0.02..=measured + 0.02).contains(&runtime),
+            "step 2^{step_log2}: the check measures {measured} deg, the runtime derives {runtime}"
+        );
+        if check.derived {
+            assert!(runtime <= budget, "step 2^{step_log2}: {runtime} deg");
+        }
+        kept |= !check.derived;
+        dropped |= check.derived;
+    }
+    assert!(kept && dropped, "kept {kept}, dropped {dropped}");
 }
