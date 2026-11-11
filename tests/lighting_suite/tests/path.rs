@@ -369,8 +369,8 @@ fn a_coarser_traced_cut_casts_no_self_shadow_speckle() {
             Projection { fov_y, near: NEAR }.pixels_per_radian(EXTENT[1]),
         )),
     };
-    // The raster draws the finest level; ray tracing holds the coarsest, whose error
-    // projects to a few pixels.
+    // The raster draws the finest level; ray tracing holds the coarsest, whose error stays
+    // under its threshold even at the trough's nearest point to the eye.
     let renderer = RendererDesc {
         raster_error_pixels: 0.01,
         rt_error_pixels: 16.0,
@@ -416,12 +416,13 @@ fn a_coarser_traced_cut_casts_no_self_shadow_speckle() {
             .unwrap();
     });
     let probe = probes.take(bed.last_frame()).pop().unwrap();
-    let floor = 1e-3 * (1.0 + 6.0);
+    let g = probe.gpu;
     assert!(
-        probe.gpu.raster_error == 0.0 && f64::from(probe.gpu.traced_error) > 2.0 * floor,
+        g.raster_error == 0.0 && g.traced_error > 2.0 * g.floor,
         "the traced cut is not coarser than the raster at the center pixel:\n{probe}"
     );
     let bias = surface_mean(&bias)[0];
+    let floor = 1e-3 * (1.0 + 6.0);
     assert!(
         bias > 2.0 * floor,
         "x1 offsets {bias} m on average: the paths do not offset by the traced cut's error"
