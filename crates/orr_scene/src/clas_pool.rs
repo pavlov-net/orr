@@ -763,38 +763,7 @@ impl ClasPool {
         unbinds: &[u32],
         slots: &[(u32, PoolSlot)],
     ) -> Vec<PageBind<'a>> {
-        let mut runs: Vec<PageBind<'a>> = Vec::new();
-        for &p in unbinds {
-            match runs.last_mut() {
-                Some(r) if r.memory.is_none() && r.first_page + r.count == u64::from(p) => {
-                    r.count += 1;
-                }
-                _ => runs.push(PageBind {
-                    first_page: u64::from(p),
-                    count: 1,
-                    memory: None,
-                }),
-            }
-        }
-        for &(page, slot) in slots {
-            let (memory, offset) = side.backing.memory(slot);
-            let extends = runs.last().is_some_and(|r| {
-                r.first_page + r.count == u64::from(page)
-                    && r.memory.is_some_and(|(m, o)| {
-                        std::ptr::eq(m, memory) && o + r.count * self.range.page_size == offset
-                    })
-            });
-            if extends {
-                runs.last_mut().expect("a run").count += 1;
-            } else {
-                runs.push(PageBind {
-                    first_page: u64::from(page),
-                    count: 1,
-                    memory: Some((memory, offset)),
-                });
-            }
-        }
-        runs
+        side.backing.page_runs(self.range.page_size, unbinds, slots)
     }
 
     /// Records the `allocate` kernel over the built CLAS in `order`, then their moves. `up`

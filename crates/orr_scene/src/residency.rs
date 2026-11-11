@@ -517,7 +517,8 @@ fn hold_dependencies(
 /// Why a step takes back a load its plan started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Held {
-    /// It waits for a tile's unbind, or on a dependency taken back.
+    /// It waits for a tile's unbind, for memory for the resident cluster table's pages its
+    /// ids lie in, or on a dependency taken back.
     Waiting,
     /// A streamed mesh page whose clusters find no run of free resident cluster ids.
     ClusterIds,

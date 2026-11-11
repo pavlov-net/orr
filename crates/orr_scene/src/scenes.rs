@@ -43,6 +43,7 @@ use crate::scene::{GroupWriter, ModelCpu, ModelId, Scene, SceneDesc, SceneId, Sc
 use crate::shaders::transparency::CompositeRoot;
 use crate::shaders::{animation, emissive, instance_page, page_motion, world as world_kernel};
 use crate::skin::{SkinFrame, SkinKernels, SkinStats};
+use crate::stream::pool_block;
 use crate::subd::ModelCage;
 use crate::tessellate::{self, Patterns, TessKernels, TessellationStats};
 use crate::time::FrameTime;
@@ -149,9 +150,10 @@ pub struct Budgets {
     /// estimate from their triangles until a page's first load has built them, and resident
     /// hierarchy pages, which a streamed page's groups need beside it. The CLAS pool's address
     /// range is as large, up to the 512 GiB its 32-bit unit indices name, and bound in pages
-    /// as they need. While the frames want more than the pool's budget holds, the error
-    /// thresholds geometry is chosen by coarsen evenly until they want what it holds
-    /// ([`DetailStats`]).
+    /// as they need. The resident cluster table names an id for each 148-byte cluster record
+    /// the pool can hold, 24 B each, bound as ids are taken. While the frames want more than
+    /// the pool's budget holds, the error thresholds geometry is chosen by coarsen evenly until
+    /// they want what it holds ([`DetailStats`]).
     pub mesh_page_pool: PoolSize,
     /// Bytes of pages a DAG mesh keeps resident from mount; the pages of a larger one past
     /// its pinned coarsest pages stream on the traversal's requests.
@@ -179,10 +181,11 @@ pub struct Budgets {
     /// staging and as much again of the stored bytes archive reads take. Reads and staging that
     /// find no room take memory of their own. Above 0.
     pub in_flight_bytes: u64,
-    /// Bytes per block of the streamed pools, each block device memory of its own that goes
-    /// back to the system once eviction empties it. Where the pools at their full budgets would
-    /// take more than a quarter of the device's `Limits::max_memory_allocations` in blocks this
-    /// large, they take blocks of the next power of two that keeps them within it.
+    /// Bytes per block of the streamed pools and the resident cluster table, each block device
+    /// memory of its own that goes back to the system once eviction empties it. Where the pools
+    /// and the table at their full budgets would take more than a quarter of the device's
+    /// `Limits::max_memory_allocations` in blocks this large, they take blocks of the next
+    /// power of two that keeps them within it.
     pub stream_block: u64,
 }
 
@@ -538,7 +541,7 @@ impl Scenes {
                 micromaps: b.micromap_pages,
                 mesh_resident_max: b.mesh_resident_max,
             },
-            clusters: ClusterTable::new(device, pools.mesh, b.stream_block)?,
+            clusters: ClusterTable::new(device, pools.mesh, pool_block(device, b, pools))?,
         });
         let materials = MaterialTable::new(device)?;
         let mounts = Mounts::new(

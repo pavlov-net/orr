@@ -2,14 +2,16 @@
 //! the addresses mounts, stream units, edits and their records hold never move. It names as many
 //! ids as the mesh page pool holds cluster records, each 148 bytes of its resident page: the
 //! most clusters resident pages within the pool's budget hold, as the CLAS pool's range is the
-//! pool's bytes. Memory is bound to the range's pages as ids are taken in them, and a page none
-//! of whose ids is taken unbinds once it has stayed so for as many render steps as the CLAS pool
-//! keeps its reservations.
+//! pool's bytes. Taking ids takes memory for the range's pages they lie in, which the next
+//! render step binds, and a page none of whose ids is taken unbinds once it has stayed so for
+//! as many render steps as the CLAS pool keeps its reservations.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use orr_gpu::{
-    Device, GpuPtr, MemoryKind, PageBind, QueueKind, SparseAllocation, SparseBinds, TimelinePoint,
+    Device, GpuPtr, MemoryKind, MemoryPriority, QueueKind, SparseAllocation, SparseBinds,
+    TimelinePoint,
 };
 use rustc_hash::FxHashMap;
 
@@ -28,31 +30,56 @@ struct State {
     ids: BestFit,
     /// By page of the range, the ids taken whose entry lies at least partly in it.
     live: FxHashMap<u32, u32>,
-    /// By page, its memory while bound, and the render step from which it has held no id.
-    bound: FxHashMap<u32, (PoolSlot, Option<u64>)>,
+    /// By page, the memory taken for it while it holds an id or stays bound.
+    pages: FxHashMap<u32, Page>,
+    /// Pages whose memory is taken and not yet bound; some may have given it back since.
+    unbound: Vec<u32>,
+    /// Bound pages by the step from which they held no id, in step order; some may have taken
+    /// ids again since.
+    idle: VecDeque<(u64, u32)>,
     backing: Pool,
     step: u64,
+}
+
+struct Page {
+    slot: PoolSlot,
+    bound: bool,
+    /// The render step from which it has held no id.
+    idle: Option<u64>,
 }
 
 impl ClusterTable {
     /// The table for a mesh page pool of `pool` bytes, bound in DeviceLocal blocks of `block`
     /// bytes. Its ids stop short of `u32::MAX`.
     pub(crate) fn new(device: &Device, pool: u64, block: u64) -> Result<Self> {
-        let record = size_of::<orr_pack::mesh::Cluster>() as u64;
-        let ids = (pool / record).clamp(1, u64::from(u32::MAX - 1)) as u32;
+        let ids = Self::ids_for(pool);
         let range = device.gpu_malloc_sparse::<ClusterRef>(u64::from(ids), "resident clusters")?;
         let page = range.page_size;
+        let backing = Pool::new(MemoryKind::DeviceLocal, page, block, "resident clusters")
+            .priority(MemoryPriority::High);
         Ok(Self {
             range,
             ids,
             state: Mutex::new(State {
                 ids: BestFit::new(ids),
                 live: FxHashMap::default(),
-                bound: FxHashMap::default(),
-                backing: Pool::new(MemoryKind::DeviceLocal, page, block, "resident clusters"),
+                pages: FxHashMap::default(),
+                unbound: Vec::new(),
+                idle: VecDeque::new(),
+                backing,
                 step: 0,
             }),
         })
+    }
+
+    fn ids_for(pool: u64) -> u32 {
+        let record = size_of::<orr_pack::mesh::Cluster>() as u64;
+        (pool / record).clamp(1, u64::from(u32::MAX - 1)) as u32
+    }
+
+    /// Bytes of memory the table for a mesh page pool of `pool` bytes holds at most.
+    pub(crate) fn max_bytes(pool: u64) -> u64 {
+        u64::from(Self::ids_for(pool)) * size_of::<ClusterRef>() as u64
     }
 
     /// Ids the table names.
@@ -80,19 +107,49 @@ impl ClusterTable {
         })
     }
 
-    /// The first of `count` consecutive free ids, or `None` when no free run is that long.
-    pub(crate) fn alloc(&self, count: u32) -> Option<u32> {
+    /// The first of `count` consecutive free ids, with memory taken for the pages their
+    /// entries lie in, or `None` when no free run is that long. Fails without that memory,
+    /// taking nothing.
+    pub(crate) fn alloc(&self, device: &Device, count: u32) -> Result<Option<u32>> {
         let s = &mut *self.state.lock().unwrap();
-        let first = s.ids.alloc(count)?;
-        if count > 0 {
-            for (p, n) in self.pages(first, count) {
-                *s.live.entry(p).or_insert(0) += n;
-                if let Some((_, free)) = s.bound.get_mut(&p) {
-                    *free = None;
+        let Some(first) = s.ids.alloc(count) else {
+            return Ok(None);
+        };
+        if count == 0 {
+            return Ok(Some(first));
+        }
+        let page = self.range.page_size;
+        let mut taken: Vec<(u32, PoolSlot)> = Vec::new();
+        for (p, _) in self.pages(first, count) {
+            if s.pages.contains_key(&p) {
+                continue;
+            }
+            let previous = taken.last().map(|&(_, slot)| slot);
+            match s.backing.alloc(device, page, previous) {
+                Ok((slot, _)) => taken.push((p, slot)),
+                Err(e) => {
+                    for (_, slot) in taken {
+                        s.backing.free(slot);
+                    }
+                    s.ids.free(first, count);
+                    return Err(e);
                 }
             }
         }
-        Some(first)
+        for (p, slot) in taken {
+            let page = Page {
+                slot,
+                bound: false,
+                idle: None,
+            };
+            s.pages.insert(p, page);
+            s.unbound.push(p);
+        }
+        for (p, n) in self.pages(first, count) {
+            *s.live.entry(p).or_insert(0) += n;
+            s.pages.get_mut(&p).expect("memory for a taken page").idle = None;
+        }
+        Ok(Some(first))
     }
 
     /// Returns ids `first..first + count`; call only once no frame reads their entries.
@@ -106,106 +163,82 @@ impl ClusterTable {
         for (p, n) in self.pages(first, count) {
             let live = s.live.get_mut(&p).expect("a page of taken ids");
             *live -= n;
-            if *live == 0 {
-                s.live.remove(&p);
-                if let Some((_, free)) = s.bound.get_mut(&p) {
-                    *free = Some(step);
-                }
+            if *live > 0 {
+                continue;
+            }
+            s.live.remove(&p);
+            let page = s.pages.get_mut(&p).expect("memory for a taken page");
+            if page.bound {
+                page.idle = Some(step);
+                s.idle.push_back((step, p));
+            } else {
+                // Never bound, so no GPU work has used its memory.
+                let slot = page.slot;
+                s.pages.remove(&p);
+                s.backing.free(slot);
             }
         }
     }
 
-    /// Binds memory to the pages that hold taken ids and none, and unbinds the pages that
-    /// have held none for [`RESERVE_STEPS`] steps, once a step: the frame begun, which writes
-    /// the entries of the ids taken, waits for the returned point. No frame in flight reads an
-    /// unbound page: its ids were freed once no frame read them, that many steps ago.
+    /// Binds the pages whose memory ids took, and unbinds the pages that have held none for
+    /// [`RESERVE_STEPS`] steps, once a step: the frame begun, which writes the entries of the
+    /// ids taken, waits for the returned point. No frame in flight reads an unbound page: its
+    /// ids were freed once no frame read them, that many steps ago.
     pub(crate) fn bind(&self, device: &Device) -> Result<Option<TimelinePoint>> {
         let s = &mut *self.state.lock().unwrap();
         s.step += 1;
         let step = s.step;
-        let mut wanted: Vec<u32> = s
-            .live
-            .keys()
-            .copied()
-            .filter(|p| !s.bound.contains_key(p))
-            .collect();
+        let mut wanted = std::mem::take(&mut s.unbound);
         wanted.sort_unstable();
-        let mut gone: Vec<u32> = s
-            .bound
-            .iter()
-            .filter(|(_, (_, free))| free.is_some_and(|f| step - f >= RESERVE_STEPS as u64))
-            .map(|(&p, _)| p)
-            .collect();
-        gone.sort_unstable();
+        wanted.dedup();
+        wanted.retain(|p| s.pages.get(p).is_some_and(|q| !q.bound));
+        let mut gone: Vec<(u64, u32)> = Vec::new();
+        while let Some(&(from, p)) = s.idle.front() {
+            if step - from < RESERVE_STEPS as u64 {
+                break;
+            }
+            s.idle.pop_front();
+            if s.pages.get(&p).is_some_and(|q| q.idle == Some(from)) {
+                gone.push((from, p));
+            }
+        }
         if wanted.is_empty() && gone.is_empty() {
             return Ok(None);
         }
-        let page = self.range.page_size;
-        let mut slots: Vec<(u32, PoolSlot)> = Vec::with_capacity(wanted.len());
-        let mut previous = None;
-        for &p in &wanted {
-            match s.backing.alloc(device, page, previous) {
-                Ok((slot, _)) => {
-                    previous = Some(slot);
-                    slots.push((p, slot));
-                }
-                Err(e) => {
-                    for (_, slot) in slots {
-                        s.backing.free(slot);
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        let mut runs: Vec<PageBind<'_>> = Vec::new();
-        for &p in &gone {
-            match runs.last_mut() {
-                Some(r) if r.memory.is_none() && r.first_page + r.count == u64::from(p) => {
-                    r.count += 1;
-                }
-                _ => runs.push(PageBind {
-                    first_page: u64::from(p),
-                    count: 1,
-                    memory: None,
-                }),
-            }
-        }
-        for &(p, slot) in &slots {
-            let (memory, offset) = s.backing.memory(slot);
-            let extends = runs.last().is_some_and(|r| {
-                r.first_page + r.count == u64::from(p)
-                    && r.memory.is_some_and(|(m, o)| {
-                        std::ptr::eq(m, memory) && o + r.count * page == offset
-                    })
-            });
-            if extends {
-                runs.last_mut().expect("a run").count += 1;
-            } else {
-                runs.push(PageBind {
-                    first_page: u64::from(p),
-                    count: 1,
-                    memory: Some((memory, offset)),
-                });
-            }
-        }
+        let mut unbinds: Vec<u32> = gone.iter().map(|&(_, p)| p).collect();
+        unbinds.sort_unstable();
+        unbinds.dedup();
+        let slots: Vec<(u32, PoolSlot)> = wanted.iter().map(|&p| (p, s.pages[&p].slot)).collect();
+        let runs = s.backing.page_runs(self.range.page_size, &unbinds, &slots);
         let mut binds = SparseBinds::new();
-        binds.pages(&self.range, &runs)?;
         // On the render queue where it binds, ahead of the frame's work: the loading queue may
         // be behind a long build the frame does not wait for.
-        let point = if device.binds_sparse_on(QueueKind::Render) {
-            device.bind_sparse_on(QueueKind::Render, &binds)?
-        } else {
-            device.bind_sparse(&binds)?
-        };
+        let bound = binds.pages(&self.range, &runs).and_then(|binds| {
+            if device.binds_sparse_on(QueueKind::Render) {
+                device.bind_sparse_on(QueueKind::Render, binds)
+            } else {
+                device.bind_sparse(binds)
+            }
+        });
         drop(runs);
-        for p in gone {
-            let (slot, _) = s.bound.remove(&p).expect("a bound page");
+        let point = match bound {
+            Ok(point) => point,
+            Err(e) => {
+                s.unbound = wanted;
+                for &g in gone.iter().rev() {
+                    s.idle.push_front(g);
+                }
+                return Err(e.into());
+            }
+        };
+        for p in unbinds {
+            let page = s.pages.remove(&p).expect("a bound page");
             // The unbind is queued ahead of any bind that takes the memory again, and a block
             // the pool gives back is freed after the work submitted so far.
-            s.backing.free(slot);
+            s.backing.free(page.slot);
         }
-        for (p, slot) in slots {
-            s.bound.insert(p, (slot, None));
+        for p in wanted {
+            s.pages.get_mut(&p).expect("memory for a taken page").bound = true;
         }
         Ok(Some(point))
     }

@@ -66,6 +66,7 @@ use crate::accel::{
     self, AccelShared, Animated, ClusterInfo, Cut, CutMember, CutRow, FineCut, PageMicromap,
 };
 use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch, PoolMicromap, Shortfall};
+use crate::clusters::ClusterTable;
 use crate::detail::LOW;
 use crate::edit::Mirror;
 use crate::loading::{
@@ -649,8 +650,7 @@ impl Streaming {
         heaps[ResidencyClass::MeshPages as usize] = heap(&[MemoryKind::DeviceLocal, units_kind]);
         heaps[ResidencyClass::Textures as usize] = heap(&[units_kind, MemoryKind::DeviceLocal]);
         heaps[ResidencyClass::InstancePages as usize] = heap(&[units_kind]);
-        let full = pools.mesh + pools.textures + b.instance_page_pool + 2 * b.in_flight_bytes;
-        let block = block_bytes(b.stream_block, full, caps.limits.max_memory_allocations);
+        let block = pool_block(device, b, pools);
         let pool = Arc::new(Mutex::new(Pool::new(
             MemoryKind::DeviceLocal,
             256,
@@ -1987,8 +1987,9 @@ impl Streaming {
                 t.write_map(w)?;
             }
         }
-        let ids = &self.accel.clusters;
+        let (ids, device) = (&self.accel.clusters, w.device);
         let mut taken = FxHashMap::default();
+        let mut failed = None;
         let loads = self.residency.cancel_held(loads, |k| {
             if self.unbinding.contains(&k) {
                 return Some(Held::Waiting);
@@ -1998,15 +1999,26 @@ impl Streaming {
                 return None;
             };
             let n = m.mesh_streams[mesh as usize].pages[page as usize].clusters;
-            match ids.alloc(n) {
-                Some(first) => {
+            match ids.alloc(device, n) {
+                Ok(Some(first)) => {
                     taken.insert(k, (first, n));
                     None
                 }
-                None => Some(Held::ClusterIds),
+                Ok(None) => Some(Held::ClusterIds),
+                Err(e) => {
+                    failed.get_or_insert(e);
+                    Some(Held::Waiting)
+                }
             }
         });
         self.loading_ids.extend(taken);
+        match failed {
+            Some(e) if e.is_out_of_memory() => {
+                self.residency.out_of_memory(governs(&self.governed, &e));
+            }
+            Some(e) => return Err(e),
+            None => {}
+        }
         for u in &self.unbinds {
             self.unbinding.remove(&u.key);
         }
@@ -3414,9 +3426,22 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<StreamTask>)
     });
 }
 
+/// Bytes of a block of the streamed pools and the resident cluster table on `device`: see
+/// [`block_bytes`].
+pub(crate) fn pool_block(device: &Device, b: &Budgets, pools: PoolBytes) -> u64 {
+    let full = pools.mesh
+        + pools.textures
+        + b.instance_page_pool
+        + 2 * b.in_flight_bytes
+        + ClusterTable::max_bytes(pools.mesh);
+    let max = device.caps().limits.max_memory_allocations;
+    block_bytes(b.stream_block, full, max)
+}
+
 /// Bytes of a block of the streamed pools: `stream_block`, or the next power of two past it
-/// that keeps `full` bytes, the pools at their full budgets with staging, within a quarter of
-/// the device's `max_allocations`, as each block is device memory of its own.
+/// that keeps `full` bytes, the pools at their full budgets with staging and the resident
+/// cluster table, within a quarter of the device's `max_allocations`, as each block is device
+/// memory of its own.
 fn block_bytes(stream_block: u64, full: u64, max_allocations: u32) -> u64 {
     let least = full.div_ceil(u64::from(max_allocations / 4));
     if least <= stream_block {

@@ -1958,7 +1958,7 @@ async fn build_accel(
         let n = m.clusters.len() as u32;
         let base = shared
             .clusters
-            .alloc(n)
+            .alloc(device, n)?
             .ok_or_else(|| capacity("resident cluster ids", shared.clusters.ids()))?;
         r.cluster_ranges.push((base, n));
         m.cluster_base = base;
@@ -2875,7 +2875,7 @@ impl Mounts {
         let cluster_base = self
             .accel
             .clusters
-            .alloc(clusters)
+            .alloc(w.device, clusters)?
             .ok_or_else(|| capacity("resident cluster ids", self.accel.clusters.ids()))?;
         let mut ids = EditIds::none(cluster_base, clusters, page_count);
         let placed = self

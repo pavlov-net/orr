@@ -9,8 +9,8 @@ use std::sync::Mutex;
 
 use bytemuck::Pod;
 use orr_gpu::{
-    Allocation, Device, DeviceArenas, GpuAddress, GpuPtr, MemoryKind, MemoryPriority, ROOT_ALIGN,
-    TimelinePoint,
+    Allocation, Device, DeviceArenas, GpuAddress, GpuPtr, MemoryKind, MemoryPriority, PageBind,
+    ROOT_ALIGN, TimelinePoint,
 };
 
 use crate::Result;
@@ -256,6 +256,7 @@ pub struct SceneMemory {
 pub(crate) struct Pool {
     kind: MemoryKind,
     name: &'static str,
+    priority: MemoryPriority,
     places: Placement,
     memory: Vec<Option<Allocation<u8>>>,
     /// With `keep_spare`, the last block of the standard size that emptied, which the next
@@ -567,6 +568,7 @@ impl Pool {
         Self {
             kind,
             name,
+            priority: MemoryPriority::Low,
             places: Placement::new(unit, block_bytes),
             memory: Vec::new(),
             spare: None,
@@ -645,8 +647,8 @@ impl Pool {
                 let memory = match self.spare.take_if(|s| s.size() == size) {
                     Some(s) => s,
                     None => {
-                        let low = MemoryPriority::Low;
-                        let m = device.gpu_malloc_block::<u8>(self.kind, low, size, self.name)?;
+                        let (kind, priority) = (self.kind, self.priority);
+                        let m = device.gpu_malloc_block::<u8>(kind, priority, size, self.name)?;
                         self.made += 1;
                         m
                     }
@@ -692,6 +694,48 @@ impl Pool {
             .as_ref()
             .expect("slot of a live block");
         (m, u64::from(slot.first) * self.places.unit)
+    }
+
+    /// The runs of a sparse range's `page_size`-byte pages that unbind `unbinds` and bind
+    /// `slots`' pages to their slots, both by ascending page.
+    pub(crate) fn page_runs(
+        &self,
+        page_size: u64,
+        unbinds: &[u32],
+        slots: &[(u32, PoolSlot)],
+    ) -> Vec<PageBind<'_>> {
+        let mut runs: Vec<PageBind<'_>> = Vec::new();
+        for &p in unbinds {
+            match runs.last_mut() {
+                Some(r) if r.memory.is_none() && r.first_page + r.count == u64::from(p) => {
+                    r.count += 1;
+                }
+                _ => runs.push(PageBind {
+                    first_page: u64::from(p),
+                    count: 1,
+                    memory: None,
+                }),
+            }
+        }
+        for &(page, slot) in slots {
+            let (memory, offset) = self.memory(slot);
+            let extends = runs.last().is_some_and(|r| {
+                r.first_page + r.count == u64::from(page)
+                    && r.memory.is_some_and(|(m, o)| {
+                        std::ptr::eq(m, memory) && o + r.count * page_size == offset
+                    })
+            });
+            if extends {
+                runs.last_mut().expect("a run").count += 1;
+            } else {
+                runs.push(PageBind {
+                    first_page: u64::from(page),
+                    count: 1,
+                    memory: Some((memory, offset)),
+                });
+            }
+        }
+        runs
     }
 
     /// Returns `slot`; call only once the GPU no longer reads it.
@@ -756,6 +800,12 @@ impl Pool {
     /// whose blocks empty and fill again as loads come and go.
     pub(crate) fn keep_spare(mut self) -> Self {
         self.keep_spare = true;
+        self
+    }
+
+    /// Takes its blocks at `priority` rather than low: for memory every frame reads.
+    pub(crate) fn priority(mut self, priority: MemoryPriority) -> Self {
+        self.priority = priority;
         self
     }
 
