@@ -541,6 +541,10 @@ impl Placement {
             .as_mut()
             .expect("a draining block");
         b.stuck = Some(self.frees);
+        b.draining = false;
+        self.by_fill.insert((Reverse(b.live()), block));
+        self.draining_units -= u64::from(b.units);
+        self.draining.retain(|&i| i != block);
         self.changed = true;
     }
 
@@ -587,7 +591,7 @@ impl Pool {
             used: used * unit,
             half_empty,
             retired: self.places.retired * unit,
-            draining: self.places.draining_units * unit,
+            draining: self.draining_bytes(),
             made: self.made,
             spare: self.spare.as_ref().map_or(0, Allocation::size),
         }
@@ -1177,11 +1181,12 @@ mod tests {
         assert_eq!(p.draining, [narrow.block]);
         assert_eq!(p.find(2, 1, None), None);
         p.stuck(narrow.block);
-        assert_eq!(p.plan(true), 0);
         assert!(
             p.by_fill.iter().any(|&(_, b)| b == narrow.block),
             "the block takes ranges again"
         );
+        assert_eq!(p.draining_units, 0);
+        assert_eq!(p.plan(true), 0);
         p.free(rest[1], false);
         assert_eq!(p.plan(true), 8, "a free lets it drain again");
         assert_eq!(p.draining, [narrow.block]);

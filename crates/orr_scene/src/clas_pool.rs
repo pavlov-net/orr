@@ -628,7 +628,7 @@ impl ClasPool {
         }
         let page_bytes = self.range.page_size;
         s.replan = false;
-        s.draining = side.backing.plan_drain(s.tight);
+        side.backing.plan_drain(s.tight);
         let most = (DRAIN_BYTES / page_bytes).max(1) as usize;
         let mut moves: Vec<PageMove> = Vec::new();
         'blocks: for block in side.backing.draining().to_vec() {
@@ -650,6 +650,7 @@ impl ClasPool {
                 moves.push(PageMove { page, from, to });
             }
         }
+        s.draining = side.backing.draining_bytes();
         if moves.is_empty() {
             return;
         }
@@ -731,10 +732,11 @@ impl ClasPool {
         binds: Vec<TimelinePoint>,
         unbinds: Vec<u32>,
     ) {
-        let moves = self.state.lock().unwrap().abandon(ops, binds, unbinds);
-        for m in moves {
+        let mut s = self.state.lock().unwrap();
+        for m in s.abandon(ops, binds, unbinds) {
             side.backing.free(m.to);
         }
+        s.draining = side.backing.draining_bytes();
     }
 
     /// Unbinds `unbinds` and binds `slots`' pages to their slots.
