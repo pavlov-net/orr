@@ -51,8 +51,8 @@ pub use orr_output::{
     FrameGenerationMode, GlareMethod, Grade, Gt7Params, HookPass, InterpolationCheck,
     LocalExposure, MeterWeights, OutputDebug, Physiological, PostQuality, Presented, Primaries,
     Reconstruction, ReconstructionBackend, ReconstructionFeature, ReconstructionInputs,
-    ReconstructionSupport, ResolvedDisplay, Screenshot, ScreenshotRequest, SkyTelemetry, UiPass,
-    UpscaleMode, UpscaleQuality, ViewOutput,
+    ReconstructionMode, ReconstructionSupport, ResolvedDisplay, Screenshot, ScreenshotRequest,
+    SkyTelemetry, UiPass, UpscaleMode, UpscaleQuality, ViewOutput,
 };
 #[cfg(dlss)]
 pub use orr_output::{DlssSdk, DlssSupport};
@@ -267,10 +267,8 @@ pub struct RenderedView {
     pub raster: RasterView,
     /// The extent the view rendered at.
     pub render_extent: [u32; 2],
-    /// Ray reconstruction ran.
-    pub reconstructed: bool,
-    /// The named mode it ran in, from a backend that has them.
-    pub upscale_mode: Option<UpscaleMode>,
+    /// What ray reconstruction ran as; `None` when it didn't run.
+    pub reconstruction: Option<ReconstructionMode>,
     /// RGBA16F linear Rec.2020 pre-exposed radiance at the output extent, as ray
     /// reconstruction, or lighting without it, `hooks.scene_referred` and motion blur left it.
     /// With a `display_linear` hook it holds that hook's source instead.
@@ -462,6 +460,7 @@ impl ViewState {
         };
         let feature = match request {
             Reconstruction::Off => return Ok(()),
+            Reconstruction::Dlaa => backend.dlaa(output),
             Reconstruction::Upscale(quality) => backend.feature(output, quality),
             Reconstruction::RenderExtent(render) => {
                 let wide = u64::from(render[0]) * u64::from(output[1]);
@@ -823,8 +822,7 @@ impl Renderer {
                     // A view only rasterized was asked for a render pixel.
                     output_pixel: at.map_or(s.pixel, |p| p.output),
                     output_extent: at.map_or(s.view.render_extent, |p| p.output_extent),
-                    reconstructed: at.is_some_and(|p| p.reconstructed),
-                    upscale_mode: at.and_then(|p| p.upscale_mode),
+                    reconstruction: at.and_then(|p| p.reconstruction),
                     lighting: l.map(|i| lighting.swap_remove(i)),
                     scene: s,
                 }
@@ -1364,8 +1362,8 @@ impl<'a> Frame<'a> {
             .views
             .get_mut(&view.history)
             .ok_or(SceneError::UnknownViewHistory(view.history))?;
-        let reconstructed = state.reconstruction.is_some();
-        let upscale_mode = state.reconstruction.as_ref().and_then(|r| r.feature.mode());
+        let reconstruction = state.reconstruction.as_ref().map(|r| r.feature.mode());
+        let reconstructed = reconstruction.is_some();
         let mut desc = state.raster_desc(view, extent, render);
         let jitter = desc.jitter.to_array();
         let scene = self
@@ -1407,8 +1405,7 @@ impl<'a> Frame<'a> {
                 frame: id,
                 output: at,
                 output_extent: extent,
-                upscale_mode,
-                reconstructed,
+                reconstruction,
             };
             record_probe(
                 &mut self.scenes,
@@ -1677,8 +1674,7 @@ impl<'a> Frame<'a> {
             return Ok(RenderedView {
                 raster,
                 render_extent: render,
-                reconstructed,
-                upscale_mode,
+                reconstruction,
                 radiance: chain.rr_output,
                 linear: TextureIndex::NONE,
                 compiling: false,
@@ -1727,8 +1723,7 @@ impl<'a> Frame<'a> {
         Ok(RenderedView {
             raster,
             render_extent: render,
-            reconstructed,
-            upscale_mode,
+            reconstruction,
             radiance: chain.rr_output,
             linear: chain.linear,
             compiling: false,
@@ -1781,8 +1776,7 @@ impl<'a> Frame<'a> {
                 frame: id,
                 output: at,
                 output_extent: extent,
-                upscale_mode: None,
-                reconstructed: false,
+                reconstruction: None,
             };
             let gpu = self.output.device.clone();
             record_probe(
@@ -1875,8 +1869,7 @@ impl<'a> Frame<'a> {
             exact_paths: false,
             raster,
             render_extent: render,
-            reconstructed: false,
-            upscale_mode: None,
+            reconstruction: None,
             radiance: chain.rr_output,
             linear: if tonemapped {
                 chain.linear

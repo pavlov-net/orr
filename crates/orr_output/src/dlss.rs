@@ -10,13 +10,16 @@ use orr_scene::orr_gpu::{CommandList, Device, Texture};
 use crate::{
     Error, FrameGenerationBackend, FrameGenerationCamera, FrameGenerationFeature,
     FrameGenerationInputs, InterpolationCheck, ReconstructionBackend, ReconstructionFeature,
-    ReconstructionInputs, ReconstructionSupport, Result, UpscaleMode, UpscaleQuality,
+    ReconstructionInputs, ReconstructionMode, ReconstructionSupport, Result, UpscaleMode,
+    UpscaleQuality,
 };
 
 impl ReconstructionBackend for DlssSdk {
     fn support(&self) -> ReconstructionSupport {
+        let rr = DlssSdk::support(self).rr;
         ReconstructionSupport {
-            available: DlssSdk::support(self).rr,
+            available: rr,
+            dlaa: rr,
             min_output: MIN_OUTPUT,
             scale: None,
         }
@@ -29,11 +32,12 @@ impl ReconstructionBackend for DlssSdk {
     ) -> Result<Box<dyn ReconstructionFeature>> {
         let quality = match quality {
             UpscaleQuality::Auto => Quality::Auto,
-            UpscaleQuality::Dlaa => Quality::Dlaa,
-            UpscaleQuality::Quality => Quality::Quality,
-            UpscaleQuality::Balanced => Quality::Balanced,
-            UpscaleQuality::Performance => Quality::Performance,
-            UpscaleQuality::UltraPerformance => Quality::UltraPerformance,
+            UpscaleQuality::Fixed(mode) => Quality::Fixed(match mode {
+                UpscaleMode::Quality => Mode::Quality,
+                UpscaleMode::Balanced => Mode::Balanced,
+                UpscaleMode::Performance => Mode::Performance,
+                UpscaleMode::UltraPerformance => Mode::UltraPerformance,
+            }),
         };
         Ok(Box::new(RayReconstruction::new(
             self, output, quality, None,
@@ -49,17 +53,26 @@ impl ReconstructionBackend for DlssSdk {
             self, render, output, None,
         )?))
     }
+
+    fn dlaa(&self, output: [u32; 2]) -> Result<Box<dyn ReconstructionFeature>> {
+        Ok(Box::new(RayReconstruction::new(
+            self,
+            output,
+            Quality::Fixed(Mode::Dlaa),
+            None,
+        )?))
+    }
 }
 
 impl ReconstructionFeature for RayReconstruction {
-    fn mode(&self) -> Option<UpscaleMode> {
-        Some(match RayReconstruction::mode(self) {
-            Mode::Dlaa => UpscaleMode::Dlaa,
-            Mode::Quality => UpscaleMode::Quality,
-            Mode::Balanced => UpscaleMode::Balanced,
-            Mode::Performance => UpscaleMode::Performance,
-            Mode::UltraPerformance => UpscaleMode::UltraPerformance,
-        })
+    fn mode(&self) -> ReconstructionMode {
+        match RayReconstruction::mode(self) {
+            Mode::Dlaa => ReconstructionMode::Dlaa,
+            Mode::Quality => ReconstructionMode::Upscale(UpscaleMode::Quality),
+            Mode::Balanced => ReconstructionMode::Upscale(UpscaleMode::Balanced),
+            Mode::Performance => ReconstructionMode::Upscale(UpscaleMode::Performance),
+            Mode::UltraPerformance => ReconstructionMode::Upscale(UpscaleMode::UltraPerformance),
+        }
     }
 
     fn render_size(&self) -> [u32; 2] {

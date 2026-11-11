@@ -4,7 +4,7 @@
 use orr_scene::ViewDesc;
 use orr_scene::orr_gpu::{CommandList, Texture};
 
-use crate::Result;
+use crate::{Error, Result};
 
 /// How a lit view goes through ray reconstruction when the renderer has it. Without it, or under
 /// a lighting debug view or the accumulation reference, the view renders one noisy path per
@@ -13,6 +13,9 @@ use crate::Result;
 pub enum Reconstruction {
     /// No ray reconstruction: the view renders at the output extent.
     Off,
+    /// Deep Learning Anti-Aliasing: DLSS's best and most expensive mode, which renders at the
+    /// output extent. Only this request runs it, and a backend without it refuses it.
+    Dlaa,
     /// At the render size the backend gives this quality for the output extent.
     Upscale(UpscaleQuality),
     /// At this render size, which keeps the output's aspect ratio. A backend may refuse sizes it
@@ -26,37 +29,40 @@ impl Default for Reconstruction {
     }
 }
 
-/// How far below its output a view renders: a named ratio of output to render resolution, which
-/// the backend turns into a render size, or the one that suits the output resolution.
+/// How far below its output a view renders: a named mode, or the one that suits the output
+/// resolution.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum UpscaleQuality {
     /// The backend's choice for the output resolution.
     #[default]
     Auto,
-    /// Deep Learning Anti-Aliasing: DLSS with no upscaling.
-    #[cfg(dlss)]
-    Dlaa,
+    Fixed(UpscaleMode),
+}
+
+/// A named ratio of output to render resolution, which the backend turns into a render size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UpscaleMode {
     Quality,
     Balanced,
     Performance,
     UltraPerformance,
 }
 
-/// The named mode a feature runs in, for a backend that has them.
+/// What a view's ray reconstruction runs as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum UpscaleMode {
-    #[cfg(dlss)]
+pub enum ReconstructionMode {
     Dlaa,
-    Quality,
-    Balanced,
-    Performance,
-    UltraPerformance,
+    Upscale(UpscaleMode),
+    /// From a backend without named modes, at the view's render extent.
+    RenderExtent,
 }
 
 /// What a backend offers on its device.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReconstructionSupport {
     pub available: bool,
+    /// It runs [`Reconstruction::Dlaa`].
+    pub dlaa: bool,
     /// The smallest output width and height it takes. A smaller view renders without it.
     pub min_output: [u32; 2],
     /// The smallest and largest output over render resolution it takes, where it reports them.
@@ -82,13 +88,20 @@ pub trait ReconstructionBackend: Send {
         render: [u32; 2],
         output: [u32; 2],
     ) -> Result<Box<dyn ReconstructionFeature>>;
+
+    /// [`feature`](Self::feature) for [`Reconstruction::Dlaa`], from a backend whose
+    /// [`support`](Self::support) has `dlaa`.
+    fn dlaa(&self, _output: [u32; 2]) -> Result<Box<dyn ReconstructionFeature>> {
+        Err(Error::DlaaUnavailable)
+    }
 }
 
 /// One view's ray reconstruction at a fixed render and output size. Dropping it releases its
 /// resources once everything submitted before the drop has completed.
 pub trait ReconstructionFeature: Send {
-    /// The named mode it runs in; `None` from a backend without them.
-    fn mode(&self) -> Option<UpscaleMode>;
+    /// What it runs as. A backend with named modes reports the one it runs in, which for a
+    /// render size given to [`ReconstructionBackend::feature_at`] may be the nearest.
+    fn mode(&self) -> ReconstructionMode;
 
     /// Render resolution, fixed for the feature's lifetime.
     fn render_size(&self) -> [u32; 2];

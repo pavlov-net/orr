@@ -50,11 +50,7 @@ pub enum Quality {
     /// Performance above.
     #[default]
     Auto,
-    Dlaa,
-    Quality,
-    Balanced,
-    Performance,
-    UltraPerformance,
+    Fixed(Mode),
 }
 
 impl Quality {
@@ -62,11 +58,7 @@ impl Quality {
     pub fn resolve(self, output: [u32; 2]) -> Mode {
         match self {
             Self::Auto => Mode::for_output(output),
-            Self::Dlaa => Mode::Dlaa,
-            Self::Quality => Mode::Quality,
-            Self::Balanced => Mode::Balanced,
-            Self::Performance => Mode::Performance,
-            Self::UltraPerformance => Mode::UltraPerformance,
+            Self::Fixed(mode) => mode,
         }
     }
 }
@@ -82,9 +74,9 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// The mode for an output of this many pixels: Quality up to 2560 x 1440, Performance up to
-    /// 3840 x 2160, Ultra Performance above. From 1920 x 1080 up these are the defaults of the
-    /// RTX UI Developer Guidelines' table.
+    /// The mode DLSS Auto picks for an output of this many pixels: Quality up to 2560 x 1440,
+    /// Performance up to 3840 x 2160, Ultra Performance above. The RTX UI Developer Guidelines'
+    /// table turns super resolution off below 1920 x 1080, which ray reconstruction can't be.
     fn for_output([width, height]: [u32; 2]) -> Self {
         match u64::from(width) * u64::from(height) {
             p if p <= 2560 * 1440 => Self::Quality,

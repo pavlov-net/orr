@@ -59,7 +59,7 @@ pub use passes::{
 pub use present::{Display, DisplayFrame, Presented, UI_PASS};
 pub use reconstruction::{
     Reconstruction, ReconstructionBackend, ReconstructionFeature, ReconstructionInputs,
-    ReconstructionSupport, UpscaleMode, UpscaleQuality,
+    ReconstructionMode, ReconstructionSupport, UpscaleMode, UpscaleQuality,
 };
 pub use screenshot::{Screenshot, ScreenshotRequest};
 pub use ui::{UiLayer, UiPass};
@@ -81,6 +81,8 @@ pub enum Error {
     FrameGenerationUnavailable(&'static str),
     #[error("frame generation mode {0:?} is out of range for this device")]
     FrameGenerationMode(FrameGenerationMode),
+    #[error("DLAA needs DLSS ray reconstruction")]
+    DlaaUnavailable,
     #[error(transparent)]
     Window(#[from] orr_window::Error),
 }

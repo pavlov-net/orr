@@ -5,8 +5,8 @@ mod harness;
 
 use ash::vk;
 use harness::{Gpu, f16_bytes, f16_values};
-use orr_dlss::Quality;
 use orr_dlss::raw::{Ngx, RayReconstruction, RrInputs};
+use orr_dlss::{Mode, Quality};
 
 #[test]
 fn mock_rr_upscales_color_bilinearly() {
@@ -18,9 +18,16 @@ fn mock_rr_upscales_color_bilinearly() {
     let output = [512, 256];
     gpu.begin();
     // SAFETY: recording on the device; dropped after the queue is idle.
-    let mut rr =
-        unsafe { RayReconstruction::new(&ngx, gpu.cmd, output, Quality::Performance, None) }
-            .unwrap();
+    let mut rr = unsafe {
+        RayReconstruction::new(
+            &ngx,
+            gpu.cmd,
+            output,
+            Quality::Fixed(Mode::Performance),
+            None,
+        )
+    }
+    .unwrap();
     gpu.submit_wait();
     let render = rr.render_size();
     assert_eq!(render, [256, 128]);

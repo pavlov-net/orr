@@ -4,7 +4,7 @@
 use std::fmt;
 
 use orr_lighting::OriginProbe;
-use orr_output::UpscaleMode;
+use orr_output::ReconstructionMode;
 use orr_scene::orr_gpu::{Device, KernelSet};
 use orr_scene::{RasterView, ViewHistoryId};
 
@@ -16,9 +16,8 @@ pub struct PixelProbe {
     /// The output pixel asked for, and the output extent.
     pub output_pixel: [u32; 2],
     pub output_extent: [u32; 2],
-    /// Ray reconstruction ran, and the named mode it ran in.
-    pub reconstructed: bool,
-    pub upscale_mode: Option<UpscaleMode>,
+    /// What ray reconstruction ran as; `None` when it didn't run.
+    pub reconstruction: Option<ReconstructionMode>,
     /// What the raster drew at the render pixel under it and why.
     pub scene: orr_scene::PixelProbe,
     /// The first vertex of its paths; `None` for a view only rasterized.
@@ -30,8 +29,7 @@ pub(crate) struct ProbeAt {
     pub(crate) frame: u64,
     pub(crate) output: [u32; 2],
     pub(crate) output_extent: [u32; 2],
-    pub(crate) upscale_mode: Option<UpscaleMode>,
-    pub(crate) reconstructed: bool,
+    pub(crate) reconstruction: Option<ReconstructionMode>,
 }
 
 /// The output pixel `probes` asks of `history`'s render, taken from it.
@@ -87,10 +85,9 @@ impl fmt::Display for PixelProbe {
             self.output_pixel[1],
             self.output_extent[0],
             self.output_extent[1],
-            match (self.reconstructed, self.upscale_mode) {
-                (false, _) => "no ray reconstruction".to_owned(),
-                (true, Some(m)) => format!("ray reconstruction, upscale mode {m:?}"),
-                (true, None) => "ray reconstruction at an explicit render extent".to_owned(),
+            match self.reconstruction {
+                None => "no ray reconstruction".to_owned(),
+                Some(m) => format!("ray reconstruction as {m:?}"),
             }
         )?;
         write!(f, "{}", self.scene)?;

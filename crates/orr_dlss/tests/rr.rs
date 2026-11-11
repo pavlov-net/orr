@@ -7,7 +7,7 @@ mod harness;
 use ash::vk;
 use harness::{Gpu, f16_bytes, f16_values};
 use orr_dlss::raw::{ClassicBind, Image, Ngx, RayReconstruction, RrInputs};
-use orr_dlss::{DlssSdk, Quality};
+use orr_dlss::{DlssSdk, Mode, Quality};
 use orr_gpu::{
     Allocation, CommandList, Device, Format, Hazards, MemoryKind, QueueKind, Stages, Texture,
     TextureDesc, TextureMemory, TextureRegion, TextureUsage,
@@ -305,7 +305,7 @@ fn rr_performance_and_dlaa_overwrite_every_pixel_after_heap_binds() {
     let uhd = outputs(&mut gpu, [3840, 2160], 1);
     let hd = outputs(&mut gpu, [1920, 1080], 1);
     Ngx::take_log();
-    let rr = create(&gpu, &ngx, [3840, 2160], Quality::Performance);
+    let rr = create(&gpu, &ngx, [3840, 2160], Quality::Fixed(Mode::Performance));
     assert_eq!(rr.render_size(), [1920, 1080]);
     let preset = rr.applied_preset(&Ngx::take_log());
     let (t, staging) = targets(&mut gpu, rr.render_size(), None);
@@ -313,7 +313,7 @@ fn rr_performance_and_dlaa_overwrite_every_pixel_after_heap_binds() {
     check_output(&out[0], [1920, 1080]);
     eprintln!("applied preset {preset:?}, vram {}", ngx.vram_bytes());
 
-    let dlaa = create(&gpu, &ngx, [1920, 1080], Quality::Dlaa);
+    let dlaa = create(&gpu, &ngx, [1920, 1080], Quality::Fixed(Mode::Dlaa));
     assert_eq!(dlaa.render_size(), [1920, 1080]);
     let out = run(&mut gpu, &mut [(dlaa, false)], &t, staging, 8, &hd);
     check_output(&out[0], [1920, 1080]);
@@ -327,8 +327,8 @@ fn transparency_layer_is_composited_after_denoising() {
     let ngx = unsafe { Ngx::new(gpu.raw(), harness::PROJECT_ID) }.expect("NGX init");
     let output = [1920, 1080];
     let images = outputs(&mut gpu, output, 2);
-    let plain = create(&gpu, &ngx, output, Quality::Performance);
-    let layered = create(&gpu, &ngx, output, Quality::Performance);
+    let plain = create(&gpu, &ngx, output, Quality::Fixed(Mode::Performance));
+    let layered = create(&gpu, &ngx, output, Quality::Fixed(Mode::Performance));
     let render = plain.render_size();
     assert_eq!(render, [960, 540]);
     // Premultiplied color, coverage 0.5.
@@ -496,7 +496,7 @@ fn rr_on_an_orr_device_matches_the_raw_harness() {
     // SAFETY: the device has NGX's extensions and outlives `ngx`.
     let ngx = unsafe { Ngx::new(gpu.raw(), harness::PROJECT_ID) }.expect("NGX init");
     let images = outputs(&mut gpu, output, 1);
-    let rr = create(&gpu, &ngx, output, Quality::Performance);
+    let rr = create(&gpu, &ngx, output, Quality::Fixed(Mode::Performance));
     let (t, staging) = targets(&mut gpu, rr.render_size(), None);
     let reference = run(&mut gpu, &mut [(rr, false)], &t, staging, frames, &images).remove(0);
 
@@ -504,7 +504,14 @@ fn rr_on_an_orr_device_matches_the_raw_harness() {
     let sdk = DlssSdk::new(&device, harness::PROJECT_ID).expect("NGX init on an orr device");
     assert!(sdk.support().rr, "ray reconstruction unavailable");
     for kind in [QueueKind::Render, QueueKind::Compute] {
-        let out = run_on_orr(&device, &sdk, kind, output, Quality::Performance, frames);
+        let out = run_on_orr(
+            &device,
+            &sdk,
+            kind,
+            output,
+            Quality::Fixed(Mode::Performance),
+            frames,
+        );
         check_output(&out, [960, 540]);
         // RR is bit-deterministic for identical inputs.
         let differ = out.iter().zip(&reference).filter(|(a, b)| a != b).count();
@@ -526,7 +533,7 @@ fn rr_on_an_orr_device_matches_the_raw_harness() {
 fn an_sdk_keeps_working_through_the_release_of_an_older_feature() {
     let _turn = harness::ngx_turn();
     let device = harness::orr_device("orr_dlss tests");
-    let create = |sdk: &DlssSdk| create_on_orr(sdk, [256, 256], Quality::Performance);
+    let create = |sdk: &DlssSdk| create_on_orr(sdk, [256, 256], Quality::Fixed(Mode::Performance));
     let old = DlssSdk::new(&device, harness::PROJECT_ID).expect("NGX init");
     drop(create(&old));
     drop(old);

@@ -15,9 +15,9 @@
 //! scene at the mode that suits the output size.
 //!
 //! With the window focused, for comparing live: `F` steps frame generation through off, 2x, 3x,
-//! 4x and the recommended mode, `R` steps ray reconstruction through off and each quality, `H`
-//! switches between SDR and HDR, `G` switches glare and `B` switches motion blur. `F` and `H` end
-//! `--cycle`.
+//! 4x and the recommended mode, `R` steps ray reconstruction through off, DLAA and each quality,
+//! `H` switches between SDR and HDR, `G` switches glare and `B` switches motion blur. `F` and `H`
+//! end `--cycle`.
 //!
 //! `dlss --sr [--auto | --dlaa | --quality | --balanced | --performance | --ultra-performance]
 //! [--native] [--clusters] [--headless] [--frames N] [--out file.png]` shows DLSS super
@@ -34,11 +34,11 @@ use orr::orr_gpu::{
 };
 use orr::orr_output::Image;
 use orr::orr_output::orr_dlss::raw::Ngx;
-use orr::orr_output::orr_dlss::{Quality, SrInputs, SuperResolution};
+use orr::orr_output::orr_dlss::{Mode, Quality, SrInputs, SuperResolution};
 use orr::{
     Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime, Lens, LitView,
-    Projection, Reconstruction, Renderer, RendererDesc, TextureFilter, UpscaleQuality, ViewDesc,
-    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Projection, Reconstruction, Renderer, RendererDesc, TextureFilter, UpscaleMode, UpscaleQuality,
+    ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_examples::linked::KERNELS;
 use orr_examples::overlay::Overlay;
@@ -79,12 +79,12 @@ pub(crate) fn main() {
 /// What `R` steps through.
 const RECONSTRUCTIONS: [Reconstruction; 7] = [
     Reconstruction::Off,
+    Reconstruction::Dlaa,
     Reconstruction::Upscale(UpscaleQuality::Auto),
-    Reconstruction::Upscale(UpscaleQuality::Dlaa),
-    Reconstruction::Upscale(UpscaleQuality::Quality),
-    Reconstruction::Upscale(UpscaleQuality::Balanced),
-    Reconstruction::Upscale(UpscaleQuality::Performance),
-    Reconstruction::Upscale(UpscaleQuality::UltraPerformance),
+    Reconstruction::Upscale(UpscaleQuality::Fixed(UpscaleMode::Quality)),
+    Reconstruction::Upscale(UpscaleQuality::Fixed(UpscaleMode::Balanced)),
+    Reconstruction::Upscale(UpscaleQuality::Fixed(UpscaleMode::Performance)),
+    Reconstruction::Upscale(UpscaleQuality::Fixed(UpscaleMode::UltraPerformance)),
 ];
 
 /// The entry after `current` in `list`, wrapping; the first if `current` is not in it.
@@ -303,7 +303,7 @@ fn run(options: &Options) {
         reconstructed = f
             .render_view(&view, &ViewLighting::default(), &output, &mut hooks)
             .expect("render view")
-            .upscale_mode;
+            .reconstruction;
         last = Some(f.end().expect("end frame"));
     }
 
@@ -344,15 +344,15 @@ pub(crate) struct SrRun {
 /// The SR quality the flags name; the default without one.
 fn sr_quality(options: &Options) -> Quality {
     [
-        ("--dlaa", Quality::Dlaa),
-        ("--quality", Quality::Quality),
-        ("--balanced", Quality::Balanced),
-        ("--performance", Quality::Performance),
-        ("--ultra-performance", Quality::UltraPerformance),
+        ("--dlaa", Mode::Dlaa),
+        ("--quality", Mode::Quality),
+        ("--balanced", Mode::Balanced),
+        ("--performance", Mode::Performance),
+        ("--ultra-performance", Mode::UltraPerformance),
     ]
     .into_iter()
     .find(|(flag, _)| options.has(flag))
-    .map_or_else(Quality::default, |(_, q)| q)
+    .map_or_else(Quality::default, |(_, m)| Quality::Fixed(m))
 }
 
 /// `image`, remade at `extent` when it holds none or one of another size; true when made.

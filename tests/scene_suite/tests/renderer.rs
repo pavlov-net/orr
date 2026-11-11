@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use orr::orr_output::{
-    ReconstructionBackend, ReconstructionFeature, ReconstructionInputs, ReconstructionSupport,
-    UpscaleMode, UpscaleQuality,
+    ReconstructionBackend, ReconstructionFeature, ReconstructionInputs, ReconstructionMode,
+    ReconstructionSupport, UpscaleQuality,
 };
 use orr::{
     ArenaReport, AutoExposure, Budgets, DirectionalLight, DiscProfile, Exposure, FrameDesc,
@@ -1141,6 +1141,7 @@ impl ReconstructionBackend for Passthrough {
     fn support(&self) -> ReconstructionSupport {
         ReconstructionSupport {
             available: true,
+            dlaa: false,
             min_output: [1, 1],
             scale: None,
         }
@@ -1169,8 +1170,8 @@ impl ReconstructionBackend for Passthrough {
 }
 
 impl ReconstructionFeature for PassthroughFeature {
-    fn mode(&self) -> Option<UpscaleMode> {
-        None
+    fn mode(&self) -> ReconstructionMode {
+        ReconstructionMode::RenderExtent
     }
 
     fn render_size(&self) -> [u32; 2] {

@@ -46,10 +46,10 @@ use orr::orr_pack::{AssetId, Target};
 use orr::{
     Exposure, FrameDesc, Glare, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens,
     LensDistortion, LightingDebugView, LitView, OutputDebug, PackSource, PathEntry, Projection,
-    Reconstruction, ReferenceSettings, Renderer, RendererDesc, SceneDesc, SceneId, Screenshot,
-    ScreenshotRequest, TextureFilter, ThinLens, TransformGroupDesc, TransformGroupId,
-    TransparencyPass, UpscaleMode, UpscaleQuality, ViewHistoryId, ViewHooks, ViewLighting,
-    ViewOutput, ViewTarget,
+    Reconstruction, ReconstructionMode, ReferenceSettings, Renderer, RendererDesc, SceneDesc,
+    SceneId, Screenshot, ScreenshotRequest, TextureFilter, ThinLens, TransformGroupDesc,
+    TransformGroupId, TransparencyPass, UpscaleMode, UpscaleQuality, ViewHistoryId, ViewHooks,
+    ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
 use orr_examples::average::Average;
@@ -245,7 +245,7 @@ const ORBIT_STEP: f64 = 0.01;
 struct StillRun {
     capture: Capture,
     render_extent: [u32; 2],
-    mode: Option<UpscaleMode>,
+    mode: Option<ReconstructionMode>,
 }
 
 /// How [`StillShowcase::run`] renders.
@@ -416,7 +416,7 @@ impl StillShowcase {
                 .render_view(&view, &lighting, &output, &mut hooks)
                 .expect("render view");
             render_extent = rendered.render_extent;
-            mode = rendered.upscale_mode;
+            mode = rendered.reconstruction;
             last = Some((id, f.end().expect("end frame")));
         }
         let shot = last_screenshot(&mut self.renderer, self.history, last);
@@ -585,7 +585,10 @@ fn scene_detail_follows_the_render_size_of_its_sharpest_view() {
     assert_eq!(still.detail(&both, true), native);
     assert_eq!(still.detail(&both, false), native);
     if enable_dlss(&mut still.renderer) {
-        let upscaled = [([960, 540], Reconstruction::Upscale(UpscaleQuality::Quality))];
+        let upscaled = [(
+            [960, 540],
+            Reconstruction::Upscale(UpscaleQuality::Fixed(UpscaleMode::Quality)),
+        )];
         assert_eq!(still.detail(&upscaled, false), native);
         assert_eq!(still.detail(&upscaled, true), native);
     } else {
@@ -622,32 +625,27 @@ fn render_view_runs_ray_reconstruction() {
             hd,
             Reconstruction::default(),
             [1280, 720],
-            Some(UpscaleMode::Quality),
+            Some(ReconstructionMode::Upscale(UpscaleMode::Quality)),
         ),
         (
             [1280, 720],
             Reconstruction::default(),
             [853, 480],
-            Some(UpscaleMode::Quality),
+            Some(ReconstructionMode::Upscale(UpscaleMode::Quality)),
         ),
         (
             [64, 32],
             Reconstruction::default(),
             [43, 21],
-            Some(UpscaleMode::Quality),
+            Some(ReconstructionMode::Upscale(UpscaleMode::Quality)),
         ),
         #[cfg(dlss)]
-        (
-            hd,
-            Reconstruction::Upscale(UpscaleQuality::Dlaa),
-            hd,
-            Some(UpscaleMode::Dlaa),
-        ),
+        (hd, Reconstruction::Dlaa, hd, Some(ReconstructionMode::Dlaa)),
         (
             hd,
             Reconstruction::RenderExtent([1100, 619]),
             [1100, 619],
-            Some(UpscaleMode::Balanced),
+            Some(ReconstructionMode::Upscale(UpscaleMode::Balanced)),
         ),
         (hd, Reconstruction::Off, hd, None),
     ] {
@@ -675,7 +673,7 @@ fn render_view_runs_ray_reconstruction() {
     let error = |run: &StillRun| flip(&truth, &image(run.capture.clone()));
     let noisy = error(&still.run(extent, 8, off));
     let half = StillSettings {
-        reconstruction: Reconstruction::Upscale(UpscaleQuality::Performance),
+        reconstruction: Reconstruction::Upscale(UpscaleQuality::Fixed(UpscaleMode::Performance)),
         ..off
     };
     let denoised = still.run(extent, 48, half);
@@ -1076,7 +1074,7 @@ fn check_blur_under_ray_reconstruction(lamp: &mut Lamp, moving: LampSettings) {
     let extent = [640, 360];
     let frames = 16;
     let moving = LampSettings {
-        reconstruction: Reconstruction::Upscale(UpscaleQuality::Performance),
+        reconstruction: Reconstruction::Upscale(UpscaleQuality::Fixed(UpscaleMode::Performance)),
         ..moving
     };
     let sharp = lamp.run(extent, frames, moving.closed());
