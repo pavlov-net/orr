@@ -119,7 +119,9 @@ pub use orr_pack::AffineRows;
 pub struct PageNeeds {
     /// Of `instance_capacity`: one per record.
     pub instances: u32,
-    /// Of `page_material_sets`: the sets of the prototypes that override materials.
+    /// Of `page_material_sets`: the sets of the prototypes that override materials. A placement
+    /// takes none for a prototype whose set `InstancePageRef::material_sets` replaces, so this
+    /// is the most it takes.
     pub material_sets: u32,
     /// Of `emissive_capacity`: every copy takes room for the emissive and caster sections of
     /// the most emissive step of its model's chain.
@@ -1593,9 +1595,21 @@ impl<'f> SceneWriter<'f> {
         let exact_rows = header.exact_rows(page.bytes as usize)? as u32;
         let PageNeeds {
             instances: count,
-            material_sets: set_entries,
             emissive,
+            ..
         } = needs;
+        let named: Vec<Option<u32>> = (0..protos.len())
+            .map(|i| {
+                let named = r.material_sets.iter().find(|(q, _)| usize::from(*q) == i);
+                named.map(|&(_, base)| base)
+            })
+            .collect();
+        let set_entries = protos
+            .iter()
+            .zip(&named)
+            .filter(|(_, base)| base.is_none())
+            .map(|(p, _)| p.sets.as_ref().map_or(0, |s| s.len() as u32))
+            .sum();
         let copy_bytes = (protos.len() * size_of::<PagePrototypeGpu>()) as u64;
         let mut table = self.device.gpu_malloc::<u8>(
             MemoryKind::Upload,
@@ -1649,9 +1663,10 @@ impl<'f> SceneWriter<'f> {
 
         let mut copies = Vec::with_capacity(protos.len());
         let mut at_set = self.scene.desc.material_set_capacity + set_base;
-        for (index, p) in protos.iter().enumerate() {
-            let cooked_base = match &p.sets {
-                Some(set) => {
+        for (p, &named) in protos.iter().zip(&named) {
+            let base = match (named, &p.sets) {
+                (Some(base), _) => base,
+                (None, Some(set)) => {
                     let values: Vec<u32> = set.iter().map(|m| m.0).collect();
                     let (src, out) = self.window.slice::<u32>(self.device, values.len() as u32)?;
                     out.copy_from_slice(&values);
@@ -1665,13 +1680,8 @@ impl<'f> SceneWriter<'f> {
                     at_set += values.len() as u32;
                     at_set - values.len() as u32
                 }
-                None => NO_MATERIAL_SET,
+                (None, None) => NO_MATERIAL_SET,
             };
-            let base = r
-                .material_sets
-                .iter()
-                .find(|(q, _)| usize::from(*q) == index)
-                .map_or(cooked_base, |&(_, b)| b);
             let pose = r.poses.iter().find(|(m, _)| *m == p.model).map(|&(_, q)| q);
             let flags = if p.flags == 0 {
                 r.flags.0
