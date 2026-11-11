@@ -12,22 +12,47 @@ use std::sync::Mutex;
 use bytemuck::Pod;
 use orr_gpu::{Allocation, Device, GpuPtr, MemoryKind, MemoryPriority};
 
-use crate::Result;
 use crate::memory::RangeAllocator;
 use crate::upload::Record;
+use crate::{Error, Result};
 
 /// A copy the frame's upload makes before its scatter: destination, source and bytes.
 pub(crate) type TableCopy = (GpuPtr<u8>, GpuPtr<u8>, u64);
 
-/// A device table of `T` indexed by the ids it hands out.
-pub(crate) struct Table<T: 'static> {
+/// The entries a table of `capacity` grows to for `count` more: twice what it holds at least,
+/// so the entries it copies across its grows stay within twice what it ends up holding, and
+/// `limit` at most. Fails when `limit` holds no `count` more.
+pub(crate) fn grown(what: &'static str, capacity: u32, count: u32, limit: u32) -> Result<u32> {
+    let wanted = capacity
+        .checked_add(count)
+        .filter(|&n| n <= limit)
+        .ok_or(Error::Capacity {
+            what,
+            capacity: limit,
+        })?;
+    Ok(wanted.max(capacity.saturating_mul(2).min(limit)))
+}
+
+/// 32-bit words of one `T`.
+fn entry_words<T>() -> u32 {
+    (size_of::<T>() / 4) as u32
+}
+
+/// Bytes of `n` entries of `T`.
+fn bytes<T>(n: u32) -> u64 {
+    u64::from(n) * size_of::<T>() as u64
+}
+
+/// The device memory of a table of `T`, whose owner names the entries.
+pub(crate) struct Column<T: 'static> {
     name: &'static str,
     priority: MemoryPriority,
+    /// The entries a grow adds read as zero until a record writes them.
+    zeroed: bool,
     state: Mutex<State<T>>,
 }
 
 struct State<T: 'static> {
-    ids: RangeAllocator,
     /// Where records write entries from now on.
     current: Allocation<T>,
     capacity: u32,
@@ -40,23 +65,19 @@ struct State<T: 'static> {
     retired: Vec<(u64, Allocation<T>)>,
 }
 
-/// Bytes of `n` entries of `T`.
-fn bytes<T>(n: u32) -> u64 {
-    u64::from(n) * size_of::<T>() as u64
-}
-
-impl<T: Pod> Table<T> {
+impl<T: Pod> Column<T> {
     /// An empty table: an allocation of one entry for the root to name until it grows.
     pub(crate) fn new(
         device: &Device,
         priority: MemoryPriority,
         name: &'static str,
+        zeroed: bool,
     ) -> Result<Self> {
         Ok(Self {
             name,
             priority,
+            zeroed,
             state: Mutex::new(State {
-                ids: RangeAllocator::new(0),
                 current: device.gpu_malloc_with_priority(
                     MemoryKind::DeviceLocal,
                     priority,
@@ -86,31 +107,33 @@ impl<T: Pod> Table<T> {
         self.state.lock().unwrap().capacity
     }
 
-    /// The first of `count` consecutive free ids. Without a free run that long the table grows
-    /// to hold one past its entries, and to twice its capacity at least, so the entries a run
-    /// copies across its grows stay within twice what it ends up holding. Fails only without
-    /// device memory for the grown table, leaving the table as it was.
-    pub(crate) fn alloc(&self, device: &Device, count: u32) -> Result<u32> {
-        // A run of no ids takes none, and its start names no entry.
-        if count == 0 {
-            return Ok(0);
+    /// The most entries the table can hold: one scatter record zeroes the entries a grow adds,
+    /// and counts their words in 32 bits.
+    pub(crate) fn limit(&self) -> u32 {
+        if self.zeroed {
+            u32::MAX / entry_words::<T>()
+        } else {
+            u32::MAX
         }
+    }
+
+    /// Gives the table room for `capacity` entries when it holds less. Fails past
+    /// [`Self::limit`] or without device memory, leaving the table as it was.
+    pub(crate) fn reserve(&self, device: &Device, capacity: u32) -> Result<()> {
         let s = &mut *self.state.lock().unwrap();
-        if let Some(id) = s.ids.alloc(count) {
-            return Ok(id);
+        if capacity <= s.capacity {
+            return Ok(());
         }
-        let wanted = s
-            .capacity
-            .checked_add(count)
-            .ok_or(crate::Error::Capacity {
+        if capacity > self.limit() {
+            return Err(Error::Capacity {
                 what: self.name,
-                capacity: u32::MAX,
-            })?;
-        let grown = wanted.max(s.capacity.saturating_mul(2));
+                capacity: self.limit(),
+            });
+        }
         let next = device.gpu_malloc_with_priority(
             MemoryKind::DeviceLocal,
             self.priority,
-            u64::from(grown),
+            u64::from(capacity),
             self.name,
         )?;
         let old = std::mem::replace(&mut s.current, next);
@@ -119,22 +142,14 @@ impl<T: Pod> Table<T> {
         } else {
             s.passed.push((old, s.capacity));
         }
-        s.ids.grow(s.capacity, grown);
-        s.capacity = grown;
-        Ok(s.ids
-            .alloc(count)
-            .expect("the grown table has a free run of `count`"))
-    }
-
-    /// Returns `count` ids from `start` for reuse.
-    pub(crate) fn free(&self, start: u32, count: u32) {
-        self.state.lock().unwrap().ids.free(start, count);
+        s.capacity = capacity;
+        Ok(())
     }
 
     /// Moves the table in `frame`'s upload when it has grown since the last: the copy of the
     /// entries the GPU holds goes to `copies`, and `records` that write into an allocation
     /// grown past write the same entries of the current one.
-    pub(crate) fn land(&self, frame: u64, copies: &mut Vec<TableCopy>, records: &mut [Record]) {
+    pub(crate) fn land(&self, frame: u64, copies: &mut Vec<TableCopy>, records: &mut Vec<Record>) {
         let s = &mut *self.state.lock().unwrap();
         let Some((held, entries)) = s.held.take() else {
             return;
@@ -159,6 +174,15 @@ impl<T: Pod> Table<T> {
                 r.dst = to + (r.dst - start);
             }
         }
+        if self.zeroed {
+            // Sequence 0 applies before every write.
+            records.push(Record::fill(
+                0,
+                to + bytes::<T>(entries),
+                (s.capacity - entries) * entry_words::<T>(),
+                0,
+            ));
+        }
         s.retired.push((frame, held));
         let passed = std::mem::take(&mut s.passed);
         s.retired
@@ -172,5 +196,96 @@ impl<T: Pod> Table<T> {
             .unwrap()
             .retired
             .retain(|&(frame, _)| frame > completed);
+    }
+}
+
+/// A device table of `T` indexed by the ids it hands out.
+pub(crate) struct Table<T: 'static> {
+    name: &'static str,
+    ids: Mutex<RangeAllocator>,
+    column: Column<T>,
+}
+
+impl<T: Pod> Table<T> {
+    pub(crate) fn new(
+        device: &Device,
+        priority: MemoryPriority,
+        name: &'static str,
+    ) -> Result<Self> {
+        Ok(Self {
+            name,
+            ids: Mutex::new(RangeAllocator::new(0)),
+            column: Column::new(device, priority, name, false)?,
+        })
+    }
+
+    /// Where entry 0 is written and read from the next upload on.
+    pub(crate) fn gpu(&self) -> GpuPtr<T> {
+        self.column.gpu()
+    }
+
+    /// Where entry `id` is written from now on.
+    pub(crate) fn entry(&self, id: u32) -> GpuPtr<T> {
+        self.column.entry(id)
+    }
+
+    /// Entries the table holds room for.
+    pub(crate) fn capacity(&self) -> u32 {
+        self.column.capacity()
+    }
+
+    /// The first of `count` consecutive free ids. Without a free run that long the table grows
+    /// as [`grown`] says. Fails only without device memory for the grown table, leaving the
+    /// table as it was.
+    pub(crate) fn alloc(&self, device: &Device, count: u32) -> Result<u32> {
+        // A run of no ids takes none, and its start names no entry.
+        if count == 0 {
+            return Ok(0);
+        }
+        let ids = &mut *self.ids.lock().unwrap();
+        if let Some(id) = ids.alloc(count) {
+            return Ok(id);
+        }
+        let capacity = self.column.capacity();
+        let grown = grown(self.name, capacity, count, self.column.limit())?;
+        self.column.reserve(device, grown)?;
+        ids.grow(capacity, grown);
+        Ok(ids
+            .alloc(count)
+            .expect("the grown table has a free run of `count`"))
+    }
+
+    /// Returns `count` ids from `start` for reuse.
+    pub(crate) fn free(&self, start: u32, count: u32) {
+        self.ids.lock().unwrap().free(start, count);
+    }
+
+    /// As [`Column::land`].
+    pub(crate) fn land(&self, frame: u64, copies: &mut Vec<TableCopy>, records: &mut Vec<Record>) {
+        self.column.land(frame, copies, records);
+    }
+
+    /// As [`Column::retire`].
+    pub(crate) fn retire(&self, completed: u64) {
+        self.column.retire(completed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_table_grows_to_twice_its_entries_or_what_it_needs_within_its_limit() {
+        let g = |capacity, count, limit| grown("entries", capacity, count, limit).ok();
+        assert_eq!(g(0, 3, u32::MAX), Some(3));
+        assert_eq!(g(4, 1, u32::MAX), Some(8));
+        assert_eq!(g(4, 10, u32::MAX), Some(14));
+        // Twice the entries would pass the limit, which holds what is needed.
+        assert_eq!(g(6, 1, 10), Some(10));
+        assert_eq!(g(6, 4, 10), Some(10));
+        assert_eq!(g(6, 5, 10), None);
+        assert_eq!(g(u32::MAX - 1, 1, u32::MAX), Some(u32::MAX));
+        assert_eq!(g(u32::MAX - 1, 2, u32::MAX), None);
     }
 }

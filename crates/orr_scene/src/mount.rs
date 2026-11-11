@@ -3594,7 +3594,7 @@ impl Mounts {
         &self,
         frame: u64,
         copies: &mut Vec<crate::table::TableCopy>,
-        records: &mut [Record],
+        records: &mut Vec<Record>,
     ) {
         self.models.land(frame, copies, records);
         self.meshes.land(frame, copies, records);
