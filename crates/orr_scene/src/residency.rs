@@ -49,9 +49,9 @@
 //! each grows back a step after a response period without.
 //!
 //! A sample ([`Residency::begin_sample`]) measures what one completed frame wants of each
-//! class: every unit pinned, locked or loading, and every unit the frame's feedback reads or
-//! requests with the units it depends on, each unit once and a requested one whether or not
-//! its budget takes it. What a frame's detail asks for beyond the budget shows there, which the
+//! class: every unit pinned, locked or loading, every unit a pinned or locked one depends on,
+//! and every unit the frame's feedback reads or requests with the units it depends on, each
+//! unit once and a requested one whether or not its budget takes it. What a frame's detail asks for beyond the budget shows there, which the
 //! requests a plan turns down do not.
 
 use std::collections::{BTreeSet, VecDeque};
@@ -267,7 +267,8 @@ impl ResidencyStats {
 pub(crate) struct Demand {
     /// Bytes of the units the sample counts.
     pub(crate) bytes: u64,
-    /// Of them, those neither pinned nor locked: all a coarser detail can shed.
+    /// Of them, those neither pinned nor locked nor under a unit that is: all a coarser detail
+    /// can shed.
     pub(crate) streamed: u64,
     /// Of them, those not resident yet: asked for or loading. While there are some, the
     /// units under them are not known, so a finer detail may want more than the sample shows.
@@ -345,6 +346,8 @@ struct Unit {
     locks: u32,
     /// Units in `Loading` or `Resident` that depend on this one.
     dependents: u32,
+    /// Resident pinned or locked units that depend on this one, directly or through others.
+    held_by: u32,
     touched: u64,
     /// The touch its class's [`Evictable`] lists it under while it can be evicted, at most
     /// `touched`.
@@ -599,6 +602,9 @@ pub(crate) struct Residency {
     loading_bytes: [u64; CLASSES],
     /// Bytes of resident pinned or locked units per class.
     fixed: [u64; CLASSES],
+    /// Bytes per class of the units that a pinned or locked unit depends on and that are
+    /// neither themselves: they stay as long as it does.
+    under: [u64; CLASSES],
     /// The number of the latest sample, 0 before the first, and whether it is being taken.
     sample: u64,
     sampling: bool,
@@ -639,6 +645,7 @@ impl Residency {
             used: [0; CLASSES],
             loading_bytes: [0; CLASSES],
             fixed: [0; CLASSES],
+            under: [0; CLASSES],
             sample: 0,
             sampling: false,
             tally: [0; CLASSES],
@@ -883,6 +890,7 @@ impl Residency {
                 pinned: u.start == Start::Pinned,
                 locks: u32::from(u.start == Start::Locked),
                 dependents: 0,
+                held_by: 0,
                 touched: 0,
                 listed: 0,
                 lane: 0,
@@ -904,8 +912,45 @@ impl Residency {
             }
         }
         self.mounts.insert(mount, list);
+        for (unit, u) in (0..).zip(units) {
+            if u.start != Start::Absent {
+                self.hold_under(Key { mount, unit }, true);
+            }
+        }
         self.refresh();
         Ok(())
+    }
+
+    /// Counts pinned or locked `k` on every unit it depends on, directly or through others,
+    /// when `hold`, and takes that back otherwise.
+    fn hold_under(&mut self, k: Key, hold: bool) {
+        let units = self.mounts.get_mut(&k.mount).expect("a unit of a mount");
+        let mut stack = units[k.unit as usize].deps.clone();
+        let mut seen = FxHashSet::default();
+        while let Some(d) = stack.pop() {
+            if !seen.insert(d) {
+                continue;
+            }
+            let u = &mut units[d as usize];
+            debug_assert_eq!(
+                u.state,
+                State::Resident,
+                "a resident unit's dependencies are"
+            );
+            let under = &mut self.under[u.class as usize];
+            if hold {
+                u.held_by += 1;
+                if u.held_by == 1 && !u.fixed() {
+                    *under += u.held();
+                }
+            } else {
+                u.held_by -= 1;
+                if u.held_by == 0 && !u.fixed() {
+                    *under -= u.held();
+                }
+            }
+            stack.extend_from_slice(&u.deps);
+        }
     }
 
     /// Drops a mount's units; their memory is the caller's to free.
@@ -921,6 +966,8 @@ impl Residency {
                     self.resident_units[c] -= 1;
                     if u.fixed() {
                         self.fixed[c] -= u.held();
+                    } else if u.held_by > 0 {
+                        self.under[c] -= u.held();
                     }
                     if u.evictable() {
                         let k = Key {
@@ -1005,14 +1052,15 @@ impl Residency {
     }
 
     /// Counts resident `k` in the sample being taken, with the units it depends on: the
-    /// resident ones neither pinned nor locked that the sample has not counted.
+    /// resident ones that the sample has not counted and that are neither pinned, locked nor
+    /// under a unit that is, as every sample counts those.
     fn count_from(&mut self, k: Key) {
         let units = self.mounts.get_mut(&k.mount).expect("a unit of a mount");
         let mut stack = std::mem::take(&mut self.stack);
         stack.push(k.unit);
         while let Some(i) = stack.pop() {
             let u = &mut units[i as usize];
-            if u.sampled == self.sample || u.fixed() {
+            if u.sampled == self.sample || u.fixed() || u.held_by > 0 {
                 continue;
             }
             debug_assert_eq!(
@@ -1041,10 +1089,11 @@ impl Residency {
     pub(crate) fn end_sample(&mut self) -> [Demand; CLASSES] {
         self.sampling = false;
         std::array::from_fn(|c| {
-            let bytes = self.fixed[c] + self.loading_bytes[c] + self.tally[c];
+            let kept = self.fixed[c] + self.under[c];
+            let bytes = kept + self.loading_bytes[c] + self.tally[c];
             Demand {
                 bytes,
-                streamed: bytes - self.fixed[c],
+                streamed: bytes - kept,
                 absent: self.loading_bytes[c] + self.absent[c],
                 budget: self.budgets[c],
             }
@@ -1052,8 +1101,9 @@ impl Residency {
     }
 
     /// The units `k` needs held to be resident that `counted` passes over: `k` and the units
-    /// it depends on, but for the pinned and locked ones; none when one of them failed, as
-    /// `k` never loads. Loading ones are among them, which hold their bytes already.
+    /// it depends on, but for the pinned and locked ones and those under them; none when one
+    /// of them failed, as `k` never loads. Loading ones are among them, which hold their bytes
+    /// already.
     fn wanted(&self, k: Key, counted: impl Fn(Key, &Unit) -> bool) -> Option<Vec<Key>> {
         let units = self.mounts.get(&k.mount)?;
         let mut out = Vec::new();
@@ -1064,7 +1114,7 @@ impl Residency {
                 unit,
             };
             let u = &units[unit as usize];
-            if u.fixed() || out.contains(&k) || counted(k, u) {
+            if u.fixed() || u.held_by > 0 || out.contains(&k) || counted(k, u) {
                 continue;
             }
             if u.state == State::Failed {
@@ -1124,10 +1174,17 @@ impl Residency {
         if u.evictable() {
             self.evictable[c].unlist(k, u);
         }
-        if !u.fixed() {
+        let fixes = !u.fixed();
+        if fixes {
             self.fixed[c] += u.held();
+            if u.held_by > 0 {
+                self.under[c] -= u.held();
+            }
         }
         u.locks += 1;
+        if fixes {
+            self.hold_under(k, true);
+        }
     }
 
     pub(crate) fn unlock(&mut self, k: Key) {
@@ -1138,11 +1195,18 @@ impl Residency {
         {
             let c = u.class as usize;
             u.locks -= 1;
-            if !u.fixed() {
+            let frees = !u.fixed();
+            if frees {
                 self.fixed[c] -= u.held();
+                if u.held_by > 0 {
+                    self.under[c] += u.held();
+                }
             }
             if u.evictable() {
                 self.evictable[c].list(k, u);
+            }
+            if frees {
+                self.hold_under(k, false);
             }
         }
     }
@@ -1822,6 +1886,28 @@ mod tests {
                 "class {c}"
             );
         }
+        // The units under a pinned or locked one, each once.
+        let mut held = [0; CLASSES];
+        for units in r.mounts.values() {
+            let mut under = FxHashSet::default();
+            let mut stack: Vec<u32> = units
+                .iter()
+                .filter(|u| u.fixed())
+                .flat_map(|u| u.deps.iter().copied())
+                .collect();
+            while let Some(d) = stack.pop() {
+                if under.insert(d) {
+                    stack.extend_from_slice(&units[d as usize].deps);
+                }
+            }
+            for (i, u) in units.iter().enumerate() {
+                assert_eq!(u.held_by > 0, under.contains(&(i as u32)), "unit {i}");
+                if u.held_by > 0 && !u.fixed() {
+                    held[u.class as usize] += u.held();
+                }
+            }
+        }
+        assert_eq!(r.under, held);
     }
 
     fn class(r: &Residency) -> ClassStats {
@@ -2417,6 +2503,47 @@ mod tests {
         assert_eq!(r.unsampled([key(9)], &seen, &mut mine), None);
     }
 
+    /// The units under a locked unit stay as long as it does: every sample counts them, read
+    /// or not, each once, and not among what a coarser detail sheds.
+    #[test]
+    fn a_sample_counts_the_units_a_locked_unit_depends_on() {
+        let mut r = Residency::new(limits(10_000));
+        // 1 under 0, 2 under 1, 3 under 0.
+        let units = [
+            unit(100, &[], Start::Absent),
+            unit(50, &[0], Start::Absent),
+            unit(20, &[1], Start::Absent),
+            unit(7, &[0], Start::Absent),
+        ];
+        r.register(M, &units).unwrap();
+        step(&mut r, &[2, 3], 1);
+        let sample = |r: &mut Residency, read: &[u32]| {
+            r.begin_sample();
+            for &u in read {
+                r.touch(key(u), 2);
+            }
+            let d = r.end_sample()[ResidencyClass::InstancePages as usize];
+            (d.bytes, d.streamed)
+        };
+        assert_eq!(sample(&mut r, &[]), (0, 0));
+        r.lock(key(2));
+        check(&r);
+        // 2 with 1 and 0 under it; a read of 3 adds 3 alone, and one of 1 nothing.
+        assert_eq!(sample(&mut r, &[3, 1]), (20 + 50 + 100 + 7, 7));
+        r.lock(key(1));
+        check(&r);
+        assert_eq!(sample(&mut r, &[]), (170, 0));
+        r.unlock(key(2));
+        check(&r);
+        assert_eq!(sample(&mut r, &[]), (150, 0), "1 locked over 0");
+        r.unlock(key(1));
+        check(&r);
+        assert_eq!(
+            sample(&mut r, &[2]),
+            (170, 170),
+            "nothing kept: what the frame reads"
+        );
+    }
     #[test]
     fn budgets_give_back_the_excess_once_a_period_and_take_the_room_under_the_mark() {
         let period = response_period(2);
