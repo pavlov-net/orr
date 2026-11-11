@@ -234,15 +234,15 @@ impl Material {
 
 /// Texture slots. All but `NORMAL`, `COAT_NORMAL`, `EMISSION`, `EMISSION_LUMINANCE`,
 /// `SPECULAR_WEIGHT`, `SPECULAR_IOR`, `COAT_IOR`, `THIN_FILM_IOR`, `THIN_FILM_THICKNESS`,
-/// `SUBSURFACE_RADIUS`, `TRANSMISSION_DEPTH`, `DISPERSION_ABBE`, the three of displacement and
-/// the tangents and anisotropies below read values of 0..1. Nothing clamps what they sample: a signed texture bound to
-/// one is the caller's responsibility. A value multiplies its field, with two exceptions:
-/// `TANGENT` and `COAT_TANGENT` hold the components of a direction in the tangent plane in their
-/// first two channels, on top of the field's rotation. `SUBSURFACE_ANISOTROPY` and
-/// `TRANSMISSION_SCATTER_ANISOTROPY` read anisotropies of -1..1, which multiply theirs. What
-/// describes an interior medium, these slots and
-/// `TRANSMISSION_COLOR` under a depth above 0, reads where a path enters the medium: it is
-/// homogeneous, and each entry point states its own.
+/// `SUBSURFACE_RADIUS`, `TRANSMISSION_DEPTH`, `DISPERSION_ABBE`, the three of displacement,
+/// `TANGENT`, `COAT_TANGENT`, `SUBSURFACE_ANISOTROPY` and `TRANSMISSION_SCATTER_ANISOTROPY` read
+/// values of 0..1. Nothing clamps what they sample: a signed texture bound to one is the caller's
+/// responsibility. A value multiplies its field, but for `TANGENT` and `COAT_TANGENT`, which hold
+/// the components of a direction in the tangent plane in their first two channels, on top of the
+/// field's rotation. `SUBSURFACE_ANISOTROPY` and `TRANSMISSION_SCATTER_ANISOTROPY` read
+/// anisotropies of -1..1. What describes an interior medium, these slots and `TRANSMISSION_COLOR`
+/// under a depth above 0, reads where a path enters the medium: it is homogeneous, and each entry
+/// point states its own.
 pub mod slot {
     pub const BASE_COLOR: usize = 0;
     pub const OPACITY: usize = 1;
