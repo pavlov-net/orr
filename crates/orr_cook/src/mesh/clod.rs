@@ -490,7 +490,8 @@ fn simplify_fallback(
 #[allow(clippy::too_many_arguments)]
 fn simplify(
     c: &ffi::clodConfig,
-    mesh: &Mesh<'_>,
+    weights: &[f32],
+    keep_borders: bool,
     normals: &[f32],
     remap: &[u32],
     positions: &[f32],
@@ -518,8 +519,8 @@ fn simplify(
                 12,
                 normals.as_ptr(),
                 12,
-                mesh.weights.as_ptr(),
-                mesh.weights.len(),
+                weights.as_ptr(),
+                weights.len(),
                 locks.as_ptr(),
                 target,
                 f32::MAX,
@@ -535,7 +536,7 @@ fn simplify(
         lod = run(options | SimplifyOptions::Permissive, error);
     }
     if lod.len() > target && c.simplify_fallback_sloppy {
-        let keep = mesh.keep_borders.then_some(remap);
+        let keep = keep_borders.then_some(remap);
         lod = simplify_fallback(positions, indices, locks, keep, target, error);
         *error *= c.simplify_error_factor_sloppy;
     }
@@ -687,7 +688,7 @@ type Simplified = (Vec<u32>, Bounds, Vec<(usize, u32)>);
 /// index fixed by emission order, and returns the emitted values in that order.
 pub(super) fn build<G: Send>(
     c: &ffi::clodConfig,
-    mut mesh: Mesh<'_>,
+    mesh: Mesh<'_>,
     positions: Vec<f32>,
     emit: impl Fn(Emitted<'_>) -> G + Sync,
 ) -> Vec<G> {
@@ -695,17 +696,26 @@ pub(super) fn build<G: Send>(
         !c.optimize_clusters && !c.optimize_bounds && c.simplify_error_edge_limit == 0.0,
         "clusterlod options the port leaves out"
     );
+    let Mesh {
+        indices,
+        normals,
+        weights,
+        lock,
+        remap,
+        sections,
+        keep_borders,
+    } = mesh;
     let vertex_count = positions.len() / 3;
     assert_eq!(
-        mesh.remap.len(),
+        remap.len(),
         vertex_count,
         "a position remap entry per vertex"
     );
     let mut vx = Vertices {
         positions,
-        normals: std::mem::take(&mut mesh.normals),
-        lock: std::mem::take(&mut mesh.lock),
-        remap: mesh.remap.to_vec(),
+        normals,
+        lock,
+        remap: remap.to_vec(),
         source: (0..vertex_count as u32).collect(),
     };
     let (mut locks, mut marks) = (Vec::new(), Vec::new());
@@ -713,15 +723,10 @@ pub(super) fn build<G: Send>(
 
     // Level 0 clusters each section apart, unless the triangles make one cluster: that one is
     // the root, as in clodBuild.
-    let (mut clusters, mut cluster_indices) = clusterize(
-        c,
-        &vx.positions,
-        mesh.indices.into(),
-        Some(mesh.sections),
-        -1,
-    );
-    if clusters.len() > 1 && mesh.indices.len() <= c.max_triangles * 3 {
-        let one = clusterize(c, &vx.positions, mesh.indices.into(), None, -1);
+    let (mut clusters, mut cluster_indices) =
+        clusterize(c, &vx.positions, indices.into(), Some(sections), -1);
+    if clusters.len() > 1 && indices.len() <= c.max_triangles * 3 {
+        let one = clusterize(c, &vx.positions, indices.into(), None, -1);
         if one.0.len() == 1 {
             (clusters, cluster_indices) = one;
         }
@@ -767,7 +772,8 @@ pub(super) fn build<G: Send>(
                 let mut error = 0.0f32;
                 let simplified = simplify(
                     c,
-                    &mesh,
+                    weights,
+                    keep_borders,
                     normals,
                     remap,
                     positions.read(),
@@ -806,7 +812,7 @@ pub(super) fn build<G: Send>(
                     |v| moved.contains(&remap[v as usize]),
                     |v| Vec3::from(positions.get(v as usize)).as_dvec3(),
                     |v| Vec3::from_slice(&normals[3 * v as usize..]).as_dvec3(),
-                    |v| mesh.sections[source[v as usize] as usize],
+                    |v| sections[source[v as usize] as usize],
                 );
                 (g, Some((simplified, bounds, opposed)))
             })
