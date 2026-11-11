@@ -665,6 +665,41 @@ fn a_sunset_leaves_no_daylight_in_the_cache() {
     assert_clean();
 }
 
+/// The cache holds absolute radiance: a pre-exposure that moves every frame leaves what it
+/// gives the view, over that pre-exposure, where a fixed one leaves it.
+#[test]
+fn a_moving_pre_exposure_leaves_the_cache_where_a_fixed_one_does() {
+    let run = paths(realtime());
+    let view = paths(ViewLighting {
+        debug_view: LightingDebugView::WorldCache,
+        ..realtime()
+    });
+    let room = |stops_per_frame: f32| {
+        let copies = vec![
+            at(CORNELL, Vec3::ZERO),
+            at(EMITTER, Vec3::new(0.0, 1.98, 0.0)),
+        ];
+        let mut bed = Bed::with(day_spec(
+            copies,
+            Vec3::new(0.0, 1.0, 0.9),
+            Vec3::new(0.0, 1.0, -1.0),
+        ));
+        render_paths(&mut bed, &run, 0, 120);
+        let pre_exposure = |i: u32| (stops_per_frame * i as f32).exp2();
+        for i in 1..=30 {
+            bed.move_pre_exposure(pre_exposure(i));
+            render_paths(&mut bed, &run, 120 + i, 1);
+        }
+        luminance(cache_view(&mut bed, &view, 151)) / f64::from(pre_exposure(30))
+    };
+    let (fixed, moving) = (room(0.0), room(-0.15));
+    assert!(
+        (moving / fixed - 1.0).abs() < 0.01,
+        "{moving} with pre-exposure moving, {fixed} with it fixed"
+    );
+    assert_clean();
+}
+
 /// A closed room lit only by its emitter, its opening turned away from the sun: the sunset
 /// dims its cells, which return within 5% of a room whose sun stayed up within one second.
 #[test]

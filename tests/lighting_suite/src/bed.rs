@@ -2494,6 +2494,12 @@ impl Bed {
         self.run_frame(0, 0, true, true, false, &mut |_, _| {});
     }
 
+    /// Renders the frames after the next at pre-exposure `p`, with no frame of its own, as the
+    /// output's adapt moves it.
+    pub fn move_pre_exposure(&mut self, p: f32) {
+        self.pre_exposure = p;
+    }
+
     /// Reads the guide targets of the last frame.
     pub fn guides(&self) -> GuideImages {
         let capture = Capture::new(&self.target);

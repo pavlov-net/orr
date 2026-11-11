@@ -336,7 +336,7 @@ mod depth_of_field {
         FlipError, Image, Pixels, assert_clean, device, flip, flip_mean_where, read_buffer,
         read_texture, wait,
     };
-    use orr_scene::{DepthOfField, Focus, Lens, Projection, ViewConstants};
+    use orr_scene::{DepthOfField, ExposureState, Focus, Lens, Projection, ViewConstants};
     use output_suite::shaders::dof_scene;
 
     use super::{groups, read_rgba16f};
@@ -404,6 +404,10 @@ mod depth_of_field {
         reference: ComputePipeline,
         root: Allocation<dof_scene::Root>,
         constants: Allocation<ViewConstants>,
+        /// The one exposure slot the view reads.
+        exposure: Allocation<ExposureState>,
+        /// The pre-exposure the next frame is lit with.
+        pre_exposure: f32,
         rr_output: Texture,
         linear: Texture,
         depth: TextureIndex,
@@ -459,7 +463,16 @@ mod depth_of_field {
                 gpu.create_compute_pipeline(&stage, name).unwrap()
             };
             let mut constants = gpu.gpu_malloc(MemoryKind::Upload, 1, "view").unwrap();
+            let mut exposure = gpu
+                .gpu_malloc::<ExposureState>(MemoryKind::Upload, 1, "exposure")
+                .unwrap();
+            exposure.as_mut_slice().unwrap()[0] = ExposureState {
+                pre_exposure: 1.0,
+                prev_pre_exposure: 1.0,
+                ..ExposureState::default()
+            };
             let mut c: ViewConstants = bytemuck::Zeroable::zeroed();
+            c.exposure = exposure.gpu();
             c.clip_from_view[0][0] = 1.0 / TAN_X;
             c.clip_from_view[1][1] = -1.0 / tan_y();
             c.clip_from_view[3][2] = -1.0;
@@ -499,6 +512,8 @@ mod depth_of_field {
                 reference: pipeline("reference", "dof reference"),
                 root: gpu.gpu_malloc(MemoryKind::Upload, 1, "scene root").unwrap(),
                 constants,
+                exposure,
+                pre_exposure: 1.0,
                 depth: gpu.write_sampled(slot(), &depth, &view),
                 depth_store: gpu.write_storage(slot(), &depth, &view),
                 motion: gpu.write_sampled(slot(), &motion, &view),
@@ -562,7 +577,7 @@ mod depth_of_field {
                 layer_focus: GpuPtr::NULL,
                 layer_radius: 0.0,
                 sample: 0,
-                _pad0: 0,
+                pre_exposure: self.pre_exposure,
                 _pad1: 0,
             };
         }
@@ -578,6 +593,9 @@ mod depth_of_field {
         ) -> (Vec<[f32; 4]>, Vec<&'static str>, Option<Vec<f32>>) {
             let gpu = device();
             self.frame += 1;
+            let e = &mut self.exposure.as_mut_slice().unwrap()[0];
+            e.prev_pre_exposure = e.pre_exposure;
+            e.pre_exposure = self.pre_exposure;
             self.put_root(scene, &dof.unwrap_or_else(|| lens(0, 1.4)));
             let queue = gpu.queue(QueueKind::Render).unwrap();
             let mut list = queue.command_list().unwrap();
@@ -945,6 +963,37 @@ mod depth_of_field {
         let (_, names, _) = b.render(Scene::Highlights, None, DofPath::AfterRr);
         assert!(names.is_empty(), "{names:?}");
         assert_eq!(b.output.depth_of_field_bytes(), 0);
+        assert_clean();
+    }
+
+    /// The stabilized image and the accumulated background layer rescale their histories by
+    /// the change of pre-exposure: on a still scene, a pre-exposure that moves every frame shows
+    /// what a fixed one does.
+    #[test]
+    fn histories_follow_a_moving_pre_exposure() {
+        let dof = Some(lens(0, 1.4));
+        let run = |stops_per_frame: f32| {
+            let mut b = Bed::new();
+            b.holes = true;
+            let mut image = Vec::new();
+            for f in 0..24 {
+                b.pre_exposure = (stops_per_frame * f as f32).exp2();
+                let (shown, _, _) = b.render(Scene::Fence, dof, DofPath::AfterRr);
+                image = shown
+                    .iter()
+                    .map(|p| p.map(|c| c / b.pre_exposure))
+                    .collect();
+            }
+            image
+        };
+        let (fixed, moving) = (run(0.0), run(0.15));
+        let worst = fixed
+            .iter()
+            .zip(&moving)
+            .flat_map(|(a, b)| (0..3).map(|c| (a[c] - b[c]).abs() / a[c].abs().max(0.05)))
+            .fold(0.0, f32::max);
+        log::info!("largest change from the fixed pre-exposure's image: {worst}");
+        assert!(worst < 1e-2, "{worst}");
         assert_clean();
     }
 

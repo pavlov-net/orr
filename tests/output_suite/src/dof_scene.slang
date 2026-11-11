@@ -51,7 +51,8 @@ struct Root
     float* layer_focus;
     float layer_radius;
     uint sample;
-    uint _pad0;
+    // What `frame` and `background_layer` multiply radiance by, as lighting pre-exposes it.
+    float pre_exposure;
     uint _pad1;
 }
 ORR_ROOT(Root);
@@ -290,7 +291,7 @@ void frame(uint3 id: SV_DispatchThreadID)
     if (any(id.xy >= uint2(root.width, root.height)))
         return;
     Trace t = trace(0.0, focal_point(id.xy) / root.focus, 0.0);
-    root.radiance.get<RWTexture2D<float4>>()[id.xy] = float4(t.color, 1.0);
+    root.radiance.get<RWTexture2D<float4>>()[id.xy] = float4(t.color * root.pre_exposure, 1.0);
     float depth = root.layered != 0 ? t.dominant : t.depth;
     root.depth.get<RWTexture2D<float>>()[id.xy] = depth > 0.0 ? root.near / depth : 0.0;
     root.motion.get<RWTexture2D<float2>>()[id.xy] = 0.0;
@@ -362,5 +363,5 @@ void background_layer(uint3 id: SV_DispatchThreadID)
     float3 o = float3(root.layer_radius * r * float2(cos(angle), sin(angle)), 0.0);
     // The ray parameter is the view depth, so the ray starts at the mask's.
     Trace t = trace(o, (f - o) / focus, root.near / mask);
-    layer[id.xy] = float4(t.color, t.depth > 0.0 ? root.near / t.depth : 0.0);
+    layer[id.xy] = float4(t.color * root.pre_exposure, t.depth > 0.0 ? root.near / t.depth : 0.0);
 }
