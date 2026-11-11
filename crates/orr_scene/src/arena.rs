@@ -67,11 +67,11 @@ impl Span {
     }
 
     #[cfg(debug_assertions)]
-    fn contains(&self, step: ViewStep) -> bool {
+    fn contains(self, step: ViewStep) -> bool {
         self.first <= step && step <= self.last
     }
 
-    fn overlaps(&self, other: &Span) -> bool {
+    fn overlaps(self, other: Span) -> bool {
         self.first <= other.last && other.first <= self.last
     }
 }
@@ -527,7 +527,7 @@ fn place(requests: &[ArenaRequest], sizes: &[(u64, u64)]) -> Vec<u64> {
         let align = align.max(PLACEMENT);
         let mut busy: Vec<(u64, u64)> = placed
             .iter()
-            .filter(|&&j| requests[j].span.overlaps(&requests[i].span))
+            .filter(|&&j| requests[j].span.overlaps(requests[i].span))
             .map(|&j| (offsets[j], offsets[j] + sizes[j].0))
             .collect();
         busy.sort_unstable();
@@ -573,7 +573,7 @@ mod tests {
             for j in 0..i {
                 let disjoint =
                     offsets[i] + sizes[i].0 <= offsets[j] || offsets[j] + sizes[j].0 <= offsets[i];
-                if requests[i].span.overlaps(&requests[j].span) {
+                if requests[i].span.overlaps(requests[j].span) {
                     assert!(
                         disjoint,
                         "{} and {} overlap",

@@ -1142,7 +1142,7 @@ impl CompilingKernels {
     pub fn prepare_paths(
         &self,
         scene: &SceneLighting,
-        needs: &PathNeeds,
+        needs: PathNeeds,
         lighting: &ViewLighting,
     ) -> Result<(), Error> {
         let (wanted, stages) = self.paths.wanted(scene, needs, lighting);
@@ -1485,7 +1485,7 @@ fn support_runs(
 /// says whether they are ready.
 fn ask_support(
     masked: &MaskedSupport,
-    needs: &PathNeeds,
+    needs: PathNeeds,
     lighting: &ViewLighting,
 ) -> Result<bool, Error> {
     let may = support_may(
@@ -1519,12 +1519,7 @@ impl StagedPaths {
 
     /// What the paths of a frame with `needs` under `lighting` may meet: what a view asks
     /// pipelines for, and what [`LightingKernels::record_paths`] runs each of its sources with.
-    fn predict(
-        &self,
-        scene: &SceneLighting,
-        needs: &PathNeeds,
-        lighting: &ViewLighting,
-    ) -> PathMay {
+    fn predict(&self, scene: &SceneLighting, needs: PathNeeds, lighting: &ViewLighting) -> PathMay {
         if !lighting.specialize {
             return PathMay::ALL;
         }
@@ -1559,7 +1554,7 @@ impl StagedPaths {
     fn wanted(
         &self,
         scene: &SceneLighting,
-        needs: &PathNeeds,
+        needs: PathNeeds,
         lighting: &ViewLighting,
     ) -> (u64, Vec<Stage>) {
         let caustics = gathers_caustics(scene, lighting);
@@ -1707,7 +1702,7 @@ impl LightingKernels {
     pub fn prepare_paths(
         &self,
         scene: &SceneLighting,
-        needs: &PathNeeds,
+        needs: PathNeeds,
         lighting: &ViewLighting,
     ) -> Result<bool, Error> {
         let support = ask_support(&self.support.masked, needs, lighting)?;
@@ -1724,7 +1719,7 @@ impl LightingKernels {
     pub fn wait_paths(
         &self,
         scene: &SceneLighting,
-        needs: &PathNeeds,
+        needs: PathNeeds,
         lighting: &ViewLighting,
     ) -> Result<WaitedPaths, Error> {
         // The masked support kernels compile beside the path pipelines waited for first.
@@ -1968,7 +1963,7 @@ impl LightingKernels {
             particle_lighting: pass.particle_lighting,
         };
         let k = &self.paths;
-        let predicted = k.predict(scene, &needs, lighting);
+        let predicted = k.predict(scene, needs, lighting);
         let pixels = view.extent[0] * view.extent[1];
         let parts = StateParts::of(features);
         // The queues' rounds: a view's passes or a photon's bounces, and one more that the
@@ -2002,7 +1997,7 @@ impl LightingKernels {
                 update,
             )?);
         }
-        let (wanted, stages) = k.wanted(scene, &needs, lighting);
+        let (wanted, stages) = k.wanted(scene, needs, lighting);
         k.ask(wanted, &stages, lighting)?;
         view.staged
             .as_ref()

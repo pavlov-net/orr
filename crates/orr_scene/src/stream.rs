@@ -791,7 +791,7 @@ impl Streaming {
     }
 
     /// Keeps `mirror` in step with mesh `mesh` of `mount` when its pages stream.
-    pub(crate) fn add_mirror(&mut self, mount: MountId, mesh: u32, mirror: &Arc<Mirror>) {
+    pub(crate) fn add_mirror(&self, mount: MountId, mesh: u32, mirror: &Arc<Mirror>) {
         let Some(m) = self.mounts.get(&mount) else {
             return;
         };
@@ -800,7 +800,7 @@ impl Streaming {
         }
     }
 
-    pub(crate) fn remove_mirror(&mut self, mount: MountId, mesh: u32, mirror: &Arc<Mirror>) {
+    pub(crate) fn remove_mirror(&self, mount: MountId, mesh: u32, mirror: &Arc<Mirror>) {
         let Some(m) = self.mounts.get(&mount) else {
             return;
         };
@@ -2460,14 +2460,14 @@ impl Streaming {
     }
 
     #[cfg(feature = "test-hooks")]
-    pub(crate) fn hold_clas_binds(&mut self, hold: bool) {
+    pub(crate) fn hold_clas_binds(&self, hold: bool) {
         if let Some(c) = &self.clas {
             c.hold_binds(hold);
         }
     }
 
     #[cfg(feature = "test-hooks")]
-    pub(crate) fn plan_clas_memory_tight(&mut self, tight: bool) {
+    pub(crate) fn plan_clas_memory_tight(&self, tight: bool) {
         if let Some(c) = &self.clas {
             c.plan_tight(tight);
         }
@@ -2547,7 +2547,7 @@ impl Streaming {
 
     /// Replays a landed batch's CLAS work on the pool's reference; returns the unit and the
     /// unit count of each of its CLAS.
-    fn replay(&mut self, batch: PoolBatch) -> Vec<(u32, u32)> {
+    fn replay(&self, batch: PoolBatch) -> Vec<(u32, u32)> {
         let pool = self.clas.as_ref().expect("a CLAS batch has its pool");
         let (placed, held) = pool.replay(batch);
         let mut staging = self.staging.lock().unwrap();
@@ -2766,13 +2766,13 @@ impl Streaming {
     }
 
     /// Frees a mesh page no frame has read.
-    fn free_now(&mut self, p: MeshPlaced) {
+    fn free_now(&self, p: MeshPlaced) {
         let (slot, free) = p.free();
         self.pool.lock().unwrap().free(slot);
         self.free_page(free);
     }
 
-    fn free_page(&mut self, f: PageFree) {
+    fn free_page(&self, f: PageFree) {
         if let Some(pool) = &self.clas {
             pool.free(&f.clas, f.micromap);
         }

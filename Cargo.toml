@@ -105,6 +105,7 @@ if_let_mutex = "deny"
 or_fun_call = "warn"
 large_enum_variant = "warn"
 redundant_clone = "warn"
+trivially_copy_pass_by_ref = "warn"
 todo = "warn"
 
 [profile.dev.package."*"]

@@ -142,7 +142,7 @@ impl FftGlareKernels {
         &self,
         targets: &FftGlareTargets,
         pass: &GlarePass<'_>,
-        glare: &Glare,
+        glare: Glare,
         fresh: bool,
     ) -> Root {
         let (pitch_ratio, hdr_shift) = lens_terms(pass);

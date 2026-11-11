@@ -165,7 +165,7 @@ impl Section {
     /// [`Cluster::flags`].
     pub const SOLID: u8 = 128;
 
-    pub fn class(&self) -> Option<SurfaceClass> {
+    pub fn class(self) -> Option<SurfaceClass> {
         SurfaceClass::from_flags(self.flags)
     }
 }

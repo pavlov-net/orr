@@ -1197,7 +1197,7 @@ impl<'a> Frame<'a> {
         let waits = self.lighting.waits;
         let asked = match &self.lighting.paths {
             Paths::Compiling { jobs, .. } => {
-                jobs.prepare_paths(scene, &needs, lighting).map(|()| false)
+                jobs.prepare_paths(scene, needs, lighting).map(|()| false)
             }
             // The render of a caller that waits asks for them itself, once it has waited.
             Paths::Ready(_) if waits && !wait => return Ok(true),
@@ -1207,12 +1207,12 @@ impl<'a> Frame<'a> {
                 // Held until the pipelines are asked for below, which marks them as run now:
                 // the render records them in this same call.
                 let waited = if waits {
-                    kernels.wait_paths(scene, &needs, lighting).map(Some)
+                    kernels.wait_paths(scene, needs, lighting).map(Some)
                 } else {
                     Ok(None)
                 };
                 waited
-                    .and_then(|_held| kernels.prepare_paths(scene, &needs, lighting))
+                    .and_then(|_held| kernels.prepare_paths(scene, needs, lighting))
                     .map(|ready| ready || waits)
             }
             Paths::NotStarted | Paths::Failed(_) => unreachable!("returned above"),

@@ -467,7 +467,7 @@ impl DofTargets {
     pub(crate) fn hole_mask(
         &self,
         lens: &Lens,
-        projection: &Projection,
+        projection: Projection,
         extent: [u32; 2],
         output_extent: [u32; 2],
     ) -> Option<DofHoleMask> {

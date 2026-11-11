@@ -1307,7 +1307,7 @@ impl<'f> SceneWriter<'f> {
     }
 
     fn create_group(
-        &mut self,
+        &self,
         desc: &TransformGroupDesc,
         frame: Option<GroupFrame>,
     ) -> Result<TransformGroupId> {
@@ -1376,7 +1376,7 @@ impl<'f> SceneWriter<'f> {
     }
 
     fn write_transforms(
-        &mut self,
+        &self,
         group: TransformGroupId,
         first: u32,
         count: u32,
@@ -1555,7 +1555,7 @@ impl<'f> SceneWriter<'f> {
     }
 
     fn place_instance_page(
-        &mut self,
+        &self,
         r: &InstancePageRef<'_>,
         motion: Option<TransformGroupId>,
     ) -> Result<(InstanceRange, TransformGroupId)> {
@@ -1764,7 +1764,7 @@ impl<'f> SceneWriter<'f> {
     /// The group an animated page's copies read, hung as the page is; `None` for a page that
     /// holds still. A kernel writes it every frame, from [`Self::set_page_time`].
     fn motion_group(
-        &mut self,
+        &self,
         page: PageId,
         frame: Option<(TransformGroupId, u32)>,
     ) -> Result<Option<TransformGroupId>> {
@@ -2311,7 +2311,7 @@ impl<'f> SceneWriter<'f> {
     }
 
     fn set_entry(
-        &mut self,
+        &self,
         id: ProducerId,
         desc: Option<&ProducerDesc<'_>>,
         subd: Option<&SubdBuild>,

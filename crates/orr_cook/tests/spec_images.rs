@@ -1274,7 +1274,7 @@ fn stored_mips_below_zero_convert_to_rec2020() {
     let negative = bc6h_block([-40, 40, 0]);
     let data = [positive, negative, negative].concat();
     const DXGI_BC6H_SF16: u32 = 96;
-    let mut file = dds(b"DX10", Some((DXGI_BC6H_SF16, 0)), [4, 4], &data);
+    let mut file = dds(*b"DX10", Some((DXGI_BC6H_SF16, 0)), [4, 4], &data);
     file[8..12].copy_from_slice(&(0x1007u32 | 0x20000).to_le_bytes());
     file[28..32].copy_from_slice(&3u32.to_le_bytes());
     assert_eq!(read_back(&d, &file).0, 2, "as a file");
@@ -1289,7 +1289,7 @@ fn stored_mips_below_zero_convert_to_rec2020() {
         |color: u16| [color.to_le_bytes(), color.to_le_bytes(), [0; 2], [0; 2]].concat();
     let data = [bc1_block(0xffff), bc1_block(0), bc1_block(0)].concat();
     const DXGI_BC1_UNORM: u32 = 71;
-    let mut file = dds(b"DX10", Some((DXGI_BC1_UNORM, 0)), [4, 4], &data);
+    let mut file = dds(*b"DX10", Some((DXGI_BC1_UNORM, 0)), [4, 4], &data);
     file[8..12].copy_from_slice(&(0x1007u32 | 0x20000).to_le_bytes());
     file[28..32].copy_from_slice(&3u32.to_le_bytes());
     std::fs::write(d.join("remapped.dds"), &file).unwrap();
@@ -1417,7 +1417,7 @@ fn ktx2_blocks_state_primaries_to_importers_that_read_them() {
 
 /// A DDS of `w` x `h` `data`: legacy FourCC `four_cc`, or with `dx10` the DXGI format and alpha
 /// mode of a `DDS_HEADER_DXT10`.
-fn dds(four_cc: &[u8; 4], dx10: Option<(u32, u32)>, [w, h]: [u32; 2], data: &[u8]) -> Vec<u8> {
+fn dds(four_cc: [u8; 4], dx10: Option<(u32, u32)>, [w, h]: [u32; 2], data: &[u8]) -> Vec<u8> {
     let mut f = vec![0u8; 128];
     let mut put = |at: usize, v: u32| f[at..at + 4].copy_from_slice(&v.to_le_bytes());
     put(4, 124);
@@ -1428,7 +1428,7 @@ fn dds(four_cc: &[u8; 4], dx10: Option<(u32, u32)>, [w, h]: [u32; 2], data: &[u8
     put(80, 4);
     put(108, 0x1000);
     f[..4].copy_from_slice(b"DDS ");
-    f[84..88].copy_from_slice(four_cc);
+    f[84..88].copy_from_slice(&four_cc);
     if let Some((format, alpha)) = dx10 {
         for v in [format, 3, 0, 1, alpha] {
             f.extend_from_slice(&v.to_le_bytes());
@@ -1492,10 +1492,10 @@ fn premultiplied_files_read_straight() {
         .flat_map(|i| if i % 8 < 4 { rgba } else { zero })
         .collect();
     let straight = [128.0 / 128.0, 64.0 / 128.0, 32.0 / 128.0];
-    let (_, [t, none]) = read_back(&d, &dds(b"DX10", Some((28, 2)), [8, 8], &data));
+    let (_, [t, none]) = read_back(&d, &dds(*b"DX10", Some((28, 2)), [8, 8], &data));
     assert_rgb(t, straight, "DDS alpha mode");
     assert_rgb(none, [a, 0.0, 0.0], "DDS at alpha 0");
-    let (_, [t, _]) = read_back(&d, &dds(b"DX10", Some((28, 1)), [8, 8], &data));
+    let (_, [t, _]) = read_back(&d, &dds(*b"DX10", Some((28, 1)), [8, 8], &data));
     assert_rgb(
         t,
         [a, 64.0 / 255.0, 32.0 / 255.0],
@@ -1511,7 +1511,7 @@ fn premultiplied_files_read_straight() {
     let want = [16.0 / 31.0, 32.0 / 63.0, 8.0 / 31.0]
         .map(|c: f64| orr_color::srgb_decode(c) as f32 / (136.0 / 255.0));
     for (name, block) in [(b"DXT2", dxt2), (b"DXT4", dxt4)] {
-        let (_, [t, _]) = read_back(&d, &dds(name, None, [4, 4], &block));
+        let (_, [t, _]) = read_back(&d, &dds(*name, None, [4, 4], &block));
         assert_rgb(t, want, "legacy block format");
     }
 

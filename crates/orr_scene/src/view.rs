@@ -94,12 +94,12 @@ pub struct Projection {
 impl Projection {
     /// Clip from view for an output image of `extent`, unjittered: Vulkan clip space with y
     /// down. Only its aspect ratio matters.
-    pub fn clip_from_view(&self, extent: UVec2) -> Mat4 {
+    pub fn clip_from_view(self, extent: UVec2) -> Mat4 {
         clip_from_view(self, extent)
     }
 
     /// Pixels per radian at the center of an image `height` pixels tall.
-    pub fn pixels_per_radian(&self, height: u32) -> f32 {
+    pub fn pixels_per_radian(self, height: u32) -> f32 {
         0.5 * height as f32 / (0.5 * self.fov_y).tan()
     }
 }
@@ -305,7 +305,7 @@ impl ViewHistory {
 }
 
 /// `clip_from_view` for Vulkan clip space: reverse Z, infinite far, y down.
-fn clip_from_view(p: &Projection, extent: UVec2) -> Mat4 {
+fn clip_from_view(p: Projection, extent: UVec2) -> Mat4 {
     let aspect = extent.x as f32 / extent.y.max(1) as f32;
     vulkan::perspective_infinite_reverse(p.fov_y, aspect, p.near)
 }
@@ -328,7 +328,7 @@ pub(crate) fn view_constants(
     frame: u64,
     delta_time: f32,
 ) -> ViewConstants {
-    let clip = clip_from_view(&desc.projection, desc.output_extent);
+    let clip = clip_from_view(desc.projection, desc.output_extent);
     let clip_jittered = jittered(clip, desc.jitter, desc.render_extent);
     let previous = match history.previous {
         Some(p) if p.scene == desc.scene && !desc.camera_cut => p,
@@ -349,7 +349,7 @@ pub(crate) fn view_constants(
         clip_from_view: rows(clip),
         clip_from_view_jittered: rows(clip_jittered),
         view_from_clip: rows(clip_jittered.inverse()),
-        prev_clip_from_view: rows(clip_from_view(&previous.projection, desc.output_extent)),
+        prev_clip_from_view: rows(clip_from_view(previous.projection, desc.output_extent)),
         view_from_world_rotation: rotation_rows(desc.rotation),
         prev_view_from_world_rotation: rotation_rows(previous.rotation),
         eye_render: eye.relative_to(origin, cell_log2).extend(0.0).to_array(),

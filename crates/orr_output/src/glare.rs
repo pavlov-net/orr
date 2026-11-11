@@ -142,7 +142,7 @@ impl GlareKernels {
         &self,
         targets: &GlareTargets,
         pass: &GlarePass<'_>,
-        glare: &Glare,
+        glare: Glare,
     ) -> Vec<Root> {
         let mips = targets.sizes.len() as u32;
         let (pitch_ratio, hdr_shift) = lens_terms(pass);

@@ -288,7 +288,7 @@ impl OutputView {
     pub fn dof_hole_mask(
         &self,
         lens: &Lens,
-        projection: &Projection,
+        projection: Projection,
         render_extent: [u32; 2],
         output_extent: [u32; 2],
     ) -> Option<DofHoleMask> {
@@ -987,7 +987,7 @@ impl OutputKernels {
                 if std::mem::take(&mut targets.fresh) {
                     list.discard(targets.texture());
                 }
-                let roots = self.glare.roots(targets, pass, &glare);
+                let roots = self.glare.roots(targets, pass, glare);
                 let frame = &mut view.frames[(pass.frame % n) as usize];
                 let at: Vec<_> = roots
                     .iter()
@@ -1014,7 +1014,7 @@ impl OutputKernels {
                 if fresh {
                     list.discard(targets.texture());
                 }
-                let root = self.fft_glare.root(targets, pass, &glare, fresh);
+                let root = self.fft_glare.root(targets, pass, glare, fresh);
                 let frame = &mut view.frames[(pass.frame % n) as usize];
                 let at = frame.put(GLARE_ROOTS, &root);
                 self.fft_glare.record(list, targets, at);

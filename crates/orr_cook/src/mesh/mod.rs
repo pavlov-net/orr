@@ -707,7 +707,7 @@ pub(crate) fn cook(
         }
     }
     let mut baked = vec![false; sections.len()];
-    let mut grid = match &s.displace_static {
+    let mut grid = match s.displace_static {
         Some(d) => {
             baked = displace::bake(&mut w, &mut parts, maps, d);
             if baked.iter().any(|&b| b) {

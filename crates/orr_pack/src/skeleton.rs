@@ -67,7 +67,7 @@ impl Trs {
         shear: [0.0; 3],
     };
 
-    pub fn to_affine(&self) -> Affine3 {
+    pub fn to_affine(self) -> Affine3 {
         let ([sx, sy, sz], [xy, xz, yz]) = (self.scale, self.shear);
         let stretch = Mat3::from_cols(
             Vec3::new(sx, 0.0, 0.0),

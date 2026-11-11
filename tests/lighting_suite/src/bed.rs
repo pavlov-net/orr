@@ -2993,7 +2993,7 @@ impl Paths {
         let waits = settings.specialize
             || !self
                 .kernels
-                .prepare_paths(lighting, &needs, settings)
+                .prepare_paths(lighting, needs, settings)
                 .unwrap();
         // The pipelines these paths first ask for compile on threads of their own, which go on
         // with the compiles other beds wait for after this one's are ready: the frame records
@@ -3004,7 +3004,7 @@ impl Paths {
                 for _ in 1..compile_threads() {
                     threads.spawn(|| while self.loading.run_one_at(Urgency::Useful) {});
                 }
-                self.kernels.wait_paths(lighting, &needs, settings).unwrap()
+                self.kernels.wait_paths(lighting, needs, settings).unwrap()
             })
         });
         if let Some(waited) = waited.as_ref().filter(|_| self.rest) {

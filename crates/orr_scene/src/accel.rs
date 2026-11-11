@@ -216,7 +216,7 @@ impl Animated {
         }
     }
 
-    pub(crate) fn index(&self, c: &ClusterInfo) -> Option<u32> {
+    pub(crate) fn index(self, c: &ClusterInfo) -> Option<u32> {
         let animated = c.flags & Cluster::ANIMATED_PART != 0 && u32::from(c.part) >= self.first;
         animated.then(|| u32::from(c.part) - self.first)
     }

@@ -80,7 +80,7 @@ impl HeapShare {
 
     /// Sets what this manager holds and is giving back per heap index, `[held, coming]`;
     /// returns the sums over the device's managers.
-    pub(crate) fn post(&mut self, mine: &[[u64; 2]]) -> Vec<[u64; 2]> {
+    pub(crate) fn post(&self, mine: &[[u64; 2]]) -> Vec<[u64; 2]> {
         self.all.posts.lock().unwrap().post(self.id, mine)
     }
 }

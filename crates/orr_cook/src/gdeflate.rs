@@ -224,7 +224,7 @@ mod tests {
             .collect()
     }
 
-    fn round_trip(g: &Libdeflate, page: &[u8]) -> usize {
+    fn round_trip(g: Libdeflate, page: &[u8]) -> usize {
         let mut out = vec![7];
         g.compress(page, &mut out).unwrap();
         let stored = &out[1..];
@@ -254,13 +254,13 @@ mod tests {
         for level in 1..=12 {
             let g = Libdeflate::new(level).unwrap();
             for seed in 0..4 {
-                let stored = round_trip(&g, &random(seed + 1, full));
+                let stored = round_trip(g, &random(seed + 1, full));
                 assert!(stored > full, "random page compressed to {stored} bytes");
             }
-            assert!(round_trip(&g, &vec![0; full]) < 1024);
-            assert!(round_trip(&g, &text) < full / 8);
-            round_trip(&g, &random(99, 4099));
-            round_trip(&g, &text[..1]);
+            assert!(round_trip(g, &vec![0; full]) < 1024);
+            assert!(round_trip(g, &text) < full / 8);
+            round_trip(g, &random(99, 4099));
+            round_trip(g, &text[..1]);
         }
     }
 

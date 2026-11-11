@@ -327,7 +327,7 @@ pub(crate) struct Priority {
 }
 
 impl Priority {
-    fn rank(&self, other: &Self) -> std::cmp::Ordering {
+    fn rank(self, other: Self) -> std::cmp::Ordering {
         other
             .error
             .total_cmp(&self.error)
@@ -1153,7 +1153,7 @@ impl Residency {
         self.requests
             .entry(k)
             .and_modify(|q| {
-                if p.rank(&q.0).is_lt() {
+                if p.rank(q.0).is_lt() {
                     *q = (p, source);
                 }
             })
@@ -1187,7 +1187,7 @@ impl Residency {
     /// under a unit that is, as every sample counts those.
     fn count_from(&mut self, k: Key) {
         let units = self.mounts.get_mut(&k.mount).expect("a unit of a mount");
-        let mut stack = std::mem::take(&mut self.stack);
+        let stack = &mut self.stack;
         stack.push(k.unit);
         while let Some(i) = stack.pop() {
             let u = &mut units[i as usize];
@@ -1207,7 +1207,6 @@ impl Residency {
             self.tally[u.class as usize] += u.held();
             stack.extend_from_slice(&u.deps);
         }
-        self.stack = stack;
     }
 
     /// Starts a sample of what one completed frame wants: until [`Residency::end_sample`],
@@ -1736,7 +1735,7 @@ impl Residency {
             lanes[source as usize].push((k, p));
         }
         for lane in &mut lanes {
-            lane.sort_by(|a, b| a.1.rank(&b.1).then(a.0.cmp(&b.0)));
+            lane.sort_by(|a, b| a.1.rank(b.1).then(a.0.cmp(&b.0)));
             for &(k, _) in lane.iter() {
                 self.touch(k, frame);
             }

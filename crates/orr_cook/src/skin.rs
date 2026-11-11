@@ -250,7 +250,7 @@ impl Rig {
             Some(chain[near])
         };
         // A skin may name the frame itself, which poses it like any joint.
-        for j in (0..count).filter(|&j| pinned[j]).collect::<Vec<_>>() {
+        for j in (0..count).filter(|&j| pinned[j]) {
             mark(j, frame.filter(|&f| f != j), &mut sets);
         }
         // Per mesh, a joint of the rig that moves it.

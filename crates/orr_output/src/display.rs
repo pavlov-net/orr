@@ -202,8 +202,8 @@ pub struct PatternLevels {
 
 impl CalibrationPattern {
     /// The pattern's levels on `display`. On SDR, levels above paper white clip.
-    pub fn levels(&self, display: &ResolvedDisplay) -> PatternLevels {
-        let (patch, surround) = match *self {
+    pub fn levels(self, display: &ResolvedDisplay) -> PatternLevels {
+        let (patch, surround) = match self {
             Self::Peak { nits } => (nits, MAX_NITS),
             Self::PaperWhite { nits } => (nits, 0.18 * nits),
             Self::Black { nits } => (nits, 0.0),

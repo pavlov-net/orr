@@ -21,7 +21,7 @@ pub(super) fn bake(
     w: &mut Welded,
     parts: &mut Parts,
     maps: &[SectionMaps],
-    d: &StaticDisplacement,
+    d: StaticDisplacement,
 ) -> Vec<bool> {
     let _z = crate::profile::zone!("mesh.displace");
     let baked: Vec<bool> = maps.iter().map(SectionMaps::bakes).collect();
