@@ -56,7 +56,8 @@ pub enum ProxyDensity {
     /// volume space.
     Uniform { half_extent: Vec3 },
     /// Grid `grid` of the resident volume at `volume`, over the box `bounds` of its space:
-    /// a cooked volume ([`VolumeRef::density`]) or a consumer's own in the same layout.
+    /// a cooked volume ([`VolumeRef::density`]) or a consumer's own in the same layout. A grid
+    /// at or past the record's `grid_count` reads as density 0, an empty box.
     Grid {
         volume: GpuPtr<VolumeGpu>,
         grid: u32,

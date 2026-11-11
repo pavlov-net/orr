@@ -329,3 +329,69 @@ fn majorant_cells_along_a_ray_bound_every_sample() {
     }
     assert!(empty > n * SAMPLES / 4, "{empty} samples in empty cells");
 }
+
+/// A record over `grids()` that holds only its first grid, as a consumer's record may: every
+/// read of the second grid gives 0, though that grid's record and bricks are still there, with
+/// values near 280.
+#[test]
+fn a_grid_past_the_records_grid_count_reads_0() {
+    const SAMPLES: usize = 64;
+    let c = cook(grids(), VolumeFormat::R8);
+    let (mut memory, volume) = resident(&c);
+    let at = std::mem::offset_of!(VolumeGpu, grid_count);
+    memory.as_mut_slice().unwrap()[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
+    let info = &c.info;
+    let h = info.header;
+    let mut rng = Rng(0x6a09_e667_f3bc_c909);
+    let n = 1024usize;
+    let points: Vec<[f32; 4]> = (0..n).map(|_| point(info, &mut rng, 0.6)).collect();
+    let voxels: Vec<[i32; 4]> = (0..n)
+        .map(|_| {
+            let v = [0, 1, 2].map(|a| {
+                let span = (h.bricks[a] * 8 + 4) as f32;
+                h.brick_min[a] - 2 + (span * rng.unit()) as i32
+            });
+            [v[0], v[1], v[2], 0]
+        })
+        .collect();
+    let dirs: Vec<[f32; 4]> = (0..n)
+        .map(|_| {
+            let z = 2.0 * rng.unit() - 1.0;
+            let phi = std::f32::consts::TAU * rng.unit();
+            let r = (1.0 - z * z).sqrt();
+            [r * phi.cos(), r * phi.sin(), z, 10.0]
+        })
+        .collect();
+    let pts = upload(&points, "points");
+    let vox = upload(&voxels, "voxels");
+    let dir = upload(&dirs, "directions");
+    let out = device()
+        .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, n as u64, "volume reads")
+        .unwrap();
+    let spans = device()
+        .gpu_malloc::<f32>(MemoryKind::Readback, (n * SAMPLES) as u64, "spans")
+        .unwrap();
+    let root = upload(
+        &[Root {
+            volume,
+            points: pts.gpu(),
+            voxels: vox.gpu(),
+            out: out.gpu(),
+            dirs: dir.gpu(),
+            spans: spans.gpu(),
+            count: n as u32,
+            grid: 1,
+            _pad: 0,
+        }],
+        "root",
+    );
+    let groups = n.div_ceil(64) as u32;
+    dispatch(&MODULE, root.gpu(), groups);
+    dispatch_entry(&MODULE, "spans", root.gpu(), groups);
+    assert_clean();
+    for (r, p) in out.as_slice().unwrap().iter().zip(&points) {
+        assert_eq!(r[..3], [0.0; 3], "sample, majorant and voxel at {p:?}");
+    }
+    let spans = spans.as_slice().unwrap();
+    assert!(spans.iter().all(|&m| m == 0.0), "span majorants");
+}

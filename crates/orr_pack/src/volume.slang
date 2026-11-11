@@ -72,9 +72,14 @@ float volume_texel(VolumeGridGpu g, uint8_t* brick, int3 t)
     return texel * g.scale + g.offset;
 }
 
+// The samplers take any grid index, since the record can be a consumer's, and read a grid at or
+// past `grid_count` as 0 everywhere: it has no record, so no background either.
+
 // The value of voxel `i` of grid `grid`, read from the brick that holds it.
 public float volume_voxel(VolumeGpu* v, uint grid, int3 i)
 {
+    if (grid >= v.grid_count)
+        return 0.0;
     VolumeGridGpu g = v.grids[grid];
     int3 rel = i - v.brick_min;
     int3 b = (rel - select(rel < 0, int3(VOLUME_BRICK - 1), int3(0))) / int(VOLUME_BRICK);
@@ -104,6 +109,8 @@ bool sample_brick(VolumeGpu* v, float3 u, out int3 brick, out int3 t0, out float
 // The trilinear value of grid `grid` at `p` in the volume's space.
 public float volume_sample(VolumeGpu* v, uint grid, float3 p)
 {
+    if (grid >= v.grid_count)
+        return 0.0;
     VolumeGridGpu g = v.grids[grid];
     int3 b;
     int3 t0;
@@ -129,12 +136,14 @@ public float volume_sample(VolumeGpu* v, uint grid, float3 p)
 // not).
 public float volume_majorant_span(VolumeGpu* v, uint grid, float3 u0, float3 du, float t, out float t_exit)
 {
+    t_exit = asfloat(0x7f800000u);
+    if (grid >= v.grid_count)
+        return 0.0;
     VolumeGridGpu g = v.grids[grid];
     float3 rel = floor(u0 + du * t) - float3(v.brick_min);
     float3 size = float3(v.bricks * VOLUME_BRICK);
     float cell = float(VOLUME_BRICK * VOLUME_MAJORANT_CELL);
     bool inside = true;
-    t_exit = asfloat(0x7f800000u);
     for (uint a = 0; a < 3; a++)
     {
         // The stretch's bounds on this axis, in voxels from brick_min: a sample at `rel`
@@ -174,6 +183,8 @@ public float volume_majorant_span(VolumeGpu* v, uint grid, float3 u0, float3 du,
 // At least every value `volume_sample` returns for points that read the same brick as `p`.
 public float volume_majorant(VolumeGpu* v, uint grid, float3 p)
 {
+    if (grid >= v.grid_count)
+        return 0.0;
     VolumeGridGpu g = v.grids[grid];
     int3 b;
     int3 t0;

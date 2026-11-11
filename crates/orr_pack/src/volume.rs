@@ -114,6 +114,8 @@ pub struct VolumeBrick {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct VolumeGpu {
     pub origin: [f32; 3],
+    /// Records at `grids`. `orr_pack.volume`'s samplers read a grid at or past it as 0
+    /// everywhere.
     pub grid_count: u32,
     pub inv_voxel_size: [f32; 3],
     pub _pad0: u32,
