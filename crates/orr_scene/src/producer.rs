@@ -450,8 +450,8 @@ impl BatchAt {
             clusters: take(size_of::<ProducerClusterGpu>() as u64 * u64::from(clusters)),
             positions: take(12 * (vertices + u64::from(extra))),
             previous: desc.previous_positions.then(|| take(12 * vertices)),
-            attrs: take(8 * vertices),
-            uv1: uv1.then(|| take(4 * vertices)),
+            attrs: take(12 * vertices),
+            uv1: uv1.then(|| take(8 * vertices)),
             colors: colored.then(|| take(8 * vertices)),
             vertex_user: desc.vertex_user.then(|| take(4 * vertices)),
         }

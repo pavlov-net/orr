@@ -9,7 +9,7 @@ struct Root
 {
     SceneRoot* scene;
     float3* positions;
-    uint2* attrs;
+    uint3* attrs;
     uint8_t* triangles;  // u8x3, cluster-local
     uint4* clusters;     // first vertex, vertex count, first triangle, triangle count
     uint producer;

@@ -848,14 +848,14 @@ impl Plane {
             .unwrap();
         let history = scenes.create_view_history().unwrap();
         let mesh = PatchMesh::new(seam);
-        let attrs: Vec<[u32; 2]> = mesh
+        let attrs: Vec<[u32; 3]> = mesh
             .uvs
             .iter()
             .map(|uv| {
-                let h = |f: f32| u32::from(half::f16::from_f32(f).to_bits());
                 [
                     orr_pack::mesh::oct_encode([0.0, 1.0, 0.0]),
-                    h(uv.x) | h(uv.y) << 16,
+                    uv.x.to_bits(),
+                    uv.y.to_bits(),
                 ]
             })
             .collect();
@@ -1043,7 +1043,7 @@ struct Generated {
     positions: Vec<Vec3>,
     /// Empty where the entry keeps no previous positions.
     previous: Vec<Vec3>,
-    attrs: Vec<[u32; 2]>,
+    attrs: Vec<[u32; 3]>,
     /// Uv set 1; empty where the entry keeps none.
     uv1: Vec<[f32; 2]>,
     /// The vertex color stream; empty where the entry keeps none.
@@ -1085,8 +1085,7 @@ fn generated(view: &RasterView, entry: ProducerId) -> Generated {
     let uv1 = if b.uv1.address().0 == 0 {
         Vec::new()
     } else {
-        let words: Vec<[half::f16; 2]> = read_buffer(b.uv1.cast(), vertices);
-        words.iter().map(|c| c.map(half::f16::to_f32)).collect()
+        read_buffer(b.uv1.cast(), vertices)
     };
     Generated {
         uv1,
@@ -1109,6 +1108,12 @@ fn interpolate(p: [Vec3; 3], w: [u32; 3]) -> Vec3 {
     p[0] * f[0] + p[1] * f[1] + p[2] * f[2]
 }
 
+/// The uv at weights `w` of corner uvs `uv`, as the tessellator interpolates it.
+fn interpolate_uv(uv: [Vec2; 3], w: [u32; 3]) -> Vec2 {
+    let f = w.map(|x| x as f32 * (1.0 / tessellation::BARY_ONE as f32));
+    uv[0] * f[0] + uv[1] * f[1] + uv[2] * f[2]
+}
+
 /// One generated vertex: its index, its patch triangle (cluster, triangle), its weights in
 /// that triangle and the triangle's corners.
 struct Weighted {
@@ -1118,10 +1123,12 @@ struct Weighted {
     corners: [Vec3; 3],
     /// Last frame's corners, where the batch keeps them.
     previous: Option<[Vec3; 3]>,
+    /// The corners' uvs.
+    uvs: [Vec2; 3],
 }
 
-fn vertex_weights(g: &Generated) -> Vec<Weighted> {
-    let mesh = PatchMesh::new(SEAM_UV);
+/// The generated vertices of `g`, diced from the patches of `mesh`.
+fn vertex_weights(g: &Generated, mesh: &PatchMesh) -> Vec<Weighted> {
     let mut out = Vec::new();
     for (k, r) in g.clusters.iter().zip(&g.records) {
         let patch = &g.patch_clusters[(r.patch >> 7) as usize];
@@ -1130,6 +1137,7 @@ fn vertex_weights(g: &Generated) -> Vec<Weighted> {
         let at = |c: u8| (patch.first_vertex + u32::from(c)) as usize;
         let corners = tri.map(|c| g.patch_positions[at(c)]);
         let previous = (!g.patch_previous.is_empty()).then(|| tri.map(|c| g.patch_previous[at(c)]));
+        let uvs = tri.map(|c| mesh.uvs[(cpu[0] + u32::from(c)) as usize]);
         let pattern = tessellation::pattern(r.pattern);
         let w = pattern.place(tessellation::unpack_factors(r.factors), r.corners, r.zeros);
         assert_eq!(w.len(), usize::from(k.vertex_count));
@@ -1140,6 +1148,7 @@ fn vertex_weights(g: &Generated) -> Vec<Weighted> {
                 w,
                 corners,
                 previous,
+                uvs,
             });
         }
     }
@@ -1174,7 +1183,10 @@ fn edge_points(weights: &[Weighted], point: impl Fn(&Weighted) -> Vec3) -> EdgeP
 
 #[test]
 fn tessellated_patches_dice_at_mixed_rates_with_bit_identical_shared_edges() {
-    let mut plane = Plane::new(4.0);
+    // The right half's uvs start at a repeat and a UDIM tile far from 0, where a half float's
+    // steps are texels wide.
+    let far = Vec2::new(37.3, 9.4871);
+    let mut plane = Plane::build(4.0, RendererDesc::default().software_raster_pixels, far);
     let materials = [plane.material];
     let desc = ProducerDesc {
         previous_positions: true,
@@ -1196,13 +1208,20 @@ fn tessellated_patches_dice_at_mixed_rates_with_bit_identical_shared_edges() {
     assert!(patterns.len() > 10, "{} patterns", patterns.len());
 
     // Every vertex lies where the CPU interpolates its weights, exactly, and last frame's
-    // position interpolates last frame's corners at the same weights.
-    let weights = vertex_weights(&g);
+    // position interpolates last frame's corners at the same weights. Its stored uv is the one
+    // its displacement read, the patch corners' uvs interpolated, exactly.
+    let weights = vertex_weights(&g, &plane.mesh);
     for v in &weights {
         assert_eq!(
             g.positions[v.vertex].to_array(),
             interpolate(v.corners, v.w).to_array(),
             "vertex {}",
+            v.vertex
+        );
+        assert_eq!(
+            attr_uv(g.attrs[v.vertex]).to_array(),
+            interpolate_uv(v.uvs, v.w).to_array(),
+            "uv of vertex {}",
             v.vertex
         );
         let previous = v.previous.expect("previous corners");
@@ -1226,6 +1245,11 @@ fn tessellated_patches_dice_at_mixed_rates_with_bit_identical_shared_edges() {
         }
     }
     assert_eq!(shared, 62, "shared edges");
+    // The right half's corner at the origin keeps its uv through the patch batch and the dice.
+    assert!(
+        g.attrs.iter().any(|&a| attr_uv(a) == far),
+        "no vertex holds the uv {far}"
+    );
     assert_clean();
 }
 
@@ -1303,7 +1327,7 @@ fn a_displaced_plane_with_a_uv_seam_closes_in_raster_and_rays_with_normals_of_it
 
     // Seam vertices took one displaced position: the two sides of every patch edge put
     // their vertices at the same displaced points.
-    let weights = vertex_weights(&g);
+    let weights = vertex_weights(&g, &plane.mesh);
     let edges = edge_points(&weights, |v| g.positions[v.vertex]);
     for (ends, sides) in &edges {
         if sides.len() == 2 {
@@ -1461,9 +1485,9 @@ fn moved_patches(linear: Mat3, flags: u32, share: f32, across: [f32; 2], uvs: bo
     plane.linear = linear;
     if !uvs {
         let attrs = plane.gpu[1].as_mut_slice().unwrap();
-        bytemuck::cast_slice_mut::<u8, [u32; 2]>(attrs)
+        bytemuck::cast_slice_mut::<u8, [u32; 3]>(attrs)
             .iter_mut()
-            .for_each(|a| a[1] = 0);
+            .for_each(|a| [a[1], a[2]] = [0; 2]);
     }
     // Every texel of a 4 x 4 R16 displacement texture at 0.75.
     let texel = (0.75f32 * 65535.0).round() as u16;
@@ -2831,13 +2855,15 @@ fn seen_colors(view: &RasterView) -> Vec<cage_colors::Seen> {
 }
 
 /// Uv set 0 of an attribute word.
-fn attr_uv(a: [u32; 2]) -> Vec2 {
-    let half = |bits: u32| half::f16::from_bits(bits as u16).to_f32();
-    Vec2::new(half(a[1] & 0xffff), half(a[1] >> 16))
+fn attr_uv(a: [u32; 3]) -> Vec2 {
+    Vec2::new(f32::from_bits(a[1]), f32::from_bits(a[2]))
 }
 
 /// Half floats near the painted colors round by up to this, with room for the f32 evaluation.
 const COLOR_TOLERANCE: f32 = 1e-3;
+/// Uvs, f32 throughout, against the CPU limit at the point its search finds: under the steps of
+/// a half float near the painted uvs.
+const UV_TOLERANCE: f32 = 5e-5;
 
 /// The largest difference between two colors' channels.
 fn color_error(a: [f32; 4], b: [f32; 4]) -> f32 {
@@ -2937,7 +2963,7 @@ fn a_cage_carries_its_colors_across_a_crease_and_a_seam_to_what_the_raster_shows
         *green = (green.0.min(color[1]), green.1.max(color[1]));
     }
     assert!(worst < COLOR_TOLERANCE, "{worst} from the CPU limit");
-    assert!(worst_uv < COLOR_TOLERANCE, "uvs {worst_uv} from the CPU");
+    assert!(worst_uv < UV_TOLERANCE, "uvs {worst_uv} from the CPU");
     assert!(
         worst_red < COLOR_TOLERANCE,
         "red {worst_red} from the height"
@@ -2967,8 +2993,9 @@ fn a_cage_carries_its_colors_across_a_crease_and_a_seam_to_what_the_raster_shows
         let [u, v] = s.barycentrics;
         let color = a * (1.0 - u - v) + b * u + c * v;
         worst_shown = worst_shown.max(color_error(color.to_array(), s.color));
+        // As the hit interpolates them, along the triangle's edges from its first corner.
         let [a, b, c] = s.corners.map(|v| Vec2::from(g.uv1[v as usize]));
-        let uv1 = a * (1.0 - u - v) + b * u + c * v;
+        let uv1 = a + (b - a) * u + (c - a) * v;
         worst_shown = worst_shown.max((uv1 - Vec2::from(s.uv[1])).abs().max_element());
     }
     assert!(shown > EXTENT[0] * EXTENT[1] / 8, "{shown} pixels shown");

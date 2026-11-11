@@ -505,7 +505,7 @@ void dice(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     d.positions[v] = x;
     d.attrs[v] = producer_attributes(nd, base.uv[0]);
     if (d.uv1 != nullptr)
-        d.uv1[v] = producer_uv_word(base.uv[1]);
+        d.uv1[v] = base.uv[1];
     if (d.colors != nullptr)
         d.colors[v] = producer_color_word(subd_limit_color(root.tess.subd.cage, pt.base.patch, patch_st(pt, w)));
     if (d.previous != nullptr)
@@ -579,8 +579,8 @@ bool weld_slot(uint v, float3 u, bool claim, out uint slot)
 }
 
 // One thread per generated vertex on a patch triangle's edge: its slot keeps, of the
-// vertices at its undisplaced point, the one with the lowest uv and then the lowest index,
-// so the choice does not depend on the order vertices were written in.
+// vertices at its undisplaced point, the one with the lowest hash of its uv and then the lowest
+// index, so the choice does not depend on the order vertices were written in.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void weld(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
@@ -598,7 +598,7 @@ void weld(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         InterlockedAdd(t.counters[TESS_WELD_DROPPED], 1);
         return;
     }
-    uint uv = drawn().attrs[v].y;
+    uint uv = weld_hash(float3(producer_uv(drawn().attrs[v]), 0.0));
     atomic_max_u64(t.weld_owner + slot, (uint64_t(~uv) << 32) | uint64_t(~v));
 }
 

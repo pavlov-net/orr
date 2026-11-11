@@ -51,8 +51,8 @@ public struct ProducerBatch
     public ProducerClusterGpu* clusters;
     public float3* positions;    // relative to the entry's transform
     public float3* previous;     // each vertex's position last frame; null unless ProducerDesc::previous_positions
-    public uint2* attrs;         // normal oct 2x16 unorm, uv 2x f16 (uv set 1 too where `uv1` is null)
-    public uint* uv1;            // uv set 1, 2x f16; null but on a subdivision copy that carries it
+    public uint3* attrs;         // normal oct 2x16 unorm, then uv 2x f32 (uv set 1 too where `uv1` is null)
+    public float2* uv1;          // uv set 1; null but on a subdivision copy that carries it
     public uint2* colors;        // the vertex color stream, 4x f16; null where it reads 1: only a colored subdivision copy's generated vertices hold it
     public uint* vertex_user;    // null unless ProducerDesc::vertex_user
     public uint* cluster_count;
@@ -132,32 +132,28 @@ public uint alloc_vertices(ProducerBatch b, uint count)
     return first + count <= b.max_vertices ? first : NO_ROOM;
 }
 
-// The attribute word of a vertex with unit `normal` and `uv`, for `ProducerBatch.attrs`.
-public uint2 producer_attributes(float3 normal, float2 uv)
+// The attribute words of a vertex with unit `normal` and `uv`, for `ProducerBatch.attrs`. Uvs
+// stay f32: vertices come from many threads with no range known to quantize over, and the
+// tessellator displaces each vertex at the f32 uv it stores.
+public uint3 producer_attributes(float3 normal, float2 uv)
 {
-    return uint2(oct_encode_unorm16(normal), pack_half2x16(uv));
+    return uint3(oct_encode_unorm16(normal), asuint(uv));
 }
 
-public float3 producer_normal(uint2 attrs)
+public float3 producer_normal(uint3 attrs)
 {
     return oct_decode_unorm16(attrs.x);
 }
 
-public float2 producer_uv(uint2 attrs)
+public float2 producer_uv(uint3 attrs)
 {
-    return unpack_half2x16(attrs.y);
-}
-
-// The word of a vertex with uv set 1 `uv`, for `ProducerBatch.uv1`.
-public uint producer_uv_word(float2 uv)
-{
-    return pack_half2x16(uv);
+    return asfloat(attrs.yz);
 }
 
 // Uv set 1 of vertex `v`, whose uv set 0 is `uv`.
 public float2 producer_uv1(ProducerBatch b, uint v, float2 uv)
 {
-    return b.uv1 != nullptr ? unpack_half2x16(b.uv1[v]) : uv;
+    return b.uv1 != nullptr ? b.uv1[v] : uv;
 }
 
 // The word of a vertex with vertex color stream `color`, for `ProducerBatch.colors`.
