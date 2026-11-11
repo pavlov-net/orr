@@ -195,19 +195,22 @@ fn uv_transform(info: &Value) -> ([f32; 6], u32) {
     let Some(t) = info["extensions"].get("KHR_texture_transform") else {
         return ([0.0; 6], coord(info).unwrap_or(0));
     };
-    let pair = |k: &str, d: [f32; 2]| {
+    let pair = |k: &str, d: [f64; 2]| {
         t.get(k)
             .and_then(Value::as_array)
             .filter(|a| a.len() == 2)
-            .map_or(d, |a| {
-                std::array::from_fn(|i| a[i].as_f64().unwrap_or(0.0) as f32)
-            })
+            .map_or(d, |a| std::array::from_fn(|i| a[i].as_f64().unwrap_or(0.0)))
     };
     let [ox, oy] = pair("offset", [0.0, 0.0]);
     let [sx, sy] = pair("scale", [1.0, 1.0]);
-    let (sin, cos) = num(t, "rotation", 0.0).sin_cos();
+    // In f32 a quarter turn's cosine is -4.4e-8, a shear that a large scale makes visible.
+    let rotation = t.get("rotation").and_then(Value::as_f64).unwrap_or(0.0);
+    let (sin, cos) = rotation.sin_cos();
     let uv = [cos * sx - 1.0, sin * sy, ox, -sin * sx, cos * sy - 1.0, oy];
-    (uv, coord(t).or_else(|| coord(info)).unwrap_or(0))
+    (
+        uv.map(|v| v as f32),
+        coord(t).or_else(|| coord(info)).unwrap_or(0),
+    )
 }
 
 pub(super) fn textures(

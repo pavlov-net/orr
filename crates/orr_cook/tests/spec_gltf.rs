@@ -363,6 +363,39 @@ fn texture_transforms_turn_the_uvs() {
     }
 }
 
+/// A quarter and a half turn store the transform of the stated angle: at a scale of 1000 an f32
+/// sine or cosine of it would shear the uvs by 4e-5 per unit.
+#[test]
+fn texture_transform_turns_store_their_own_sine_and_cosine() {
+    let d = dir("turns");
+    for (i, rotation) in [std::f64::consts::FRAC_PI_2, std::f64::consts::PI]
+        .into_iter()
+        .enumerate()
+    {
+        let path = d.join(format!("{i}.glb"));
+        textured_quad(
+            &path,
+            &gradient(),
+            &format!(
+                r#"{{"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0,"extensions":{{"KHR_texture_transform":{{"rotation":{rotation:?},"scale":[1000,1000]}}}}}}}}}}"#
+            ),
+            r#""extensionsUsed":["KHR_texture_transform"],"#,
+        );
+        let (a, _) = cooked(&path);
+        let t = material(&a, "g/material/0").uv_transforms[slot::BASE_COLOR];
+        if i == 0 {
+            assert_eq!(t, [-1.0, 1000.0, 0.0, -1000.0, -1.0, 0.0], "a quarter turn");
+        } else {
+            // The stated angle falls short of pi by 1.2e-16, whose sine the scale multiplies.
+            assert_eq!([t[0], t[2], t[4], t[5]], [-1001.0, 0.0, -1001.0, 0.0]);
+            assert!(
+                t[1].abs() < 2e-13 && t[3].abs() < 2e-13,
+                "a half turn: {t:?}"
+            );
+        }
+    }
+}
+
 /// L1790-1802: a strip's `P_i = { v_i, v_{i+(1+i%2)}, v_{i+(2-i%2)} }` and a fan's
 /// `P_i = { v_{i+1}, v_{i+2}, v_0 }`, winding included, in both layouts.
 #[test]

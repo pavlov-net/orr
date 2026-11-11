@@ -81,7 +81,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 
-use orr_math::{Affine2, Vec2};
+use orr_math::{DAffine2, DVec2};
 use orr_pack::material::{Material, filter, slot};
 
 use crate::texture::Wrap;
@@ -422,15 +422,15 @@ struct Tex {
     filter: u8,
     outside: [f32; 4],
     missing: [f32; 4],
-    uv: Affine2,
+    uv: DAffine2,
     scale: [f32; 4],
     bias: [f32; 4],
     unit: Unit,
 }
 
-fn point2(v: &[f32]) -> Vec2 {
+fn point2(v: &[f32]) -> DVec2 {
     let at = |i: usize| v.get(i).copied().unwrap_or(0.0);
-    Vec2::new(at(0), at(1))
+    DVec2::new(f64::from(at(0)), f64::from(at(1)))
 }
 
 impl Tex {
@@ -536,18 +536,18 @@ fn input_slot(input: &str) -> Option<usize> {
 }
 
 /// The coordinate `at`, wherever on the mesh it is read.
-fn fixed(at: Vec2) -> Affine2 {
-    Affine2::from_cols(Vec2::ZERO, Vec2::ZERO, at)
+fn fixed(at: DVec2) -> DAffine2 {
+    DAffine2::from_cols(DVec2::ZERO, DVec2::ZERO, at)
 }
 
 /// `t`, between MaterialX coordinates, in `Material::uv_transforms` form, between uvs with the
 /// cook's top-left origin.
-fn slot_transform(t: Affine2) -> [f32; 6] {
-    let flip = Affine2::from_cols(Vec2::X, -Vec2::Y, Vec2::Y);
+fn slot_transform(t: DAffine2) -> [f32; 6] {
+    let flip = DAffine2::from_cols(DVec2::X, -DVec2::Y, DVec2::Y);
     let t = flip * t * flip;
     let [a, d, b, e] = t.matrix2.to_cols_array();
     // Adding 0 turns -0 into 0, so equal transforms store equal bytes.
-    [a - 1.0, b, t.translation.x, d, e - 1.0, t.translation.y].map(|x| x + 0.0)
+    [a - 1.0, b, t.translation.x, d, e - 1.0, t.translation.y].map(|x| x as f32 + 0.0)
 }
 
 /// Fails on a connection cycle among the nodes `roots` reach. Every later walk of the
@@ -797,11 +797,11 @@ impl Mapper<'_, '_> {
     }
 
     /// A constant size input, 1 when unauthored, checked as [`Self::degrees`] is.
-    fn size(&self, n: usize, name: &str) -> Result<Vec2, String> {
+    fn size(&self, n: usize, name: &str) -> Result<DVec2, String> {
         if let Some((_, unit)) = self.measure(n, name)? {
             self.meters(n, name, unit)?;
         }
-        self.vec2(n, name, Vec2::ONE)
+        self.vec2(n, name, DVec2::ONE)
     }
 
     fn text<'n>(&'n self, n: usize, name: &str) -> Option<&'n str> {
@@ -815,9 +815,10 @@ impl Mapper<'_, '_> {
         Ok(self.number(n, name)?.map_or(default, |v| v[0]))
     }
 
-    fn vec2(&self, n: usize, name: &str, default: Vec2) -> Result<Vec2, String> {
+    fn vec2(&self, n: usize, name: &str, default: DVec2) -> Result<DVec2, String> {
         Ok(self.number(n, name)?.map_or(default, |v| {
-            Vec2::new(v[0], v.get(1).copied().unwrap_or(v[0]))
+            let [x, y] = [v[0], v.get(1).copied().unwrap_or(v[0])];
+            DVec2::new(f64::from(x), f64::from(y))
         }))
     }
 
@@ -1175,15 +1176,15 @@ impl Mapper<'_, '_> {
             Some("closest") => filter::MAG_NEAREST | filter::MIN_NEAREST | filter::MIP_NEAREST,
             _ => 0,
         };
-        let (uv_set, mut uv) = self.texcoord(n, "texcoord", (0, Affine2::IDENTITY))?;
+        let (uv_set, mut uv) = self.texcoord(n, "texcoord", (0, DAffine2::IDENTITY))?;
         if node.kind == "tiledimage" {
-            let tiling = self.vec2(n, "uvtiling", Vec2::ONE)?;
-            let offset = self.vec2(n, "uvoffset", Vec2::ZERO)?;
+            let tiling = self.vec2(n, "uvtiling", DVec2::ONE)?;
+            let offset = self.vec2(n, "uvoffset", DVec2::ZERO)?;
             let image = self.size(n, "realworldimagesize")?;
             let tile = self.size(n, "realworldtilesize")?;
-            uv = Affine2::from_scale(tile / image)
-                * Affine2::from_translation(-offset)
-                * Affine2::from_scale(tiling)
+            uv = DAffine2::from_scale(tile / image)
+                * DAffine2::from_translation(-offset)
+                * DAffine2::from_scale(tiling)
                 * uv;
         }
         Ok(Tex {
@@ -1245,7 +1246,7 @@ impl Mapper<'_, '_> {
             self.number(n, "fallback").unwrap_or_default(),
             [0.0, 0.0, 0.0, 1.0],
         );
-        let (uv_set, uv) = self.texcoord(n, "st", (0, fixed(Vec2::ZERO)))?;
+        let (uv_set, uv) = self.texcoord(n, "st", (0, fixed(DVec2::ZERO)))?;
         Ok(Tex {
             image,
             rules: ImageRules::Usd,
@@ -1283,7 +1284,7 @@ impl Mapper<'_, '_> {
             filter: 0,
             outside: [0.0; 4],
             missing: [0.0; 4],
-            uv: Affine2::IDENTITY,
+            uv: DAffine2::IDENTITY,
             scale: [1.0; 4],
             bias: [0.0; 4],
             unit: Unit::Unstated,
@@ -1295,19 +1296,19 @@ impl Mapper<'_, '_> {
         &self,
         n: usize,
         name: &str,
-        unset: (u8, Affine2),
-    ) -> Result<(u8, Affine2), String> {
+        unset: (u8, DAffine2),
+    ) -> Result<(u8, DAffine2), String> {
         match self.source(n, name) {
             None => Ok(unset),
             Some(Input::Connect { node, .. }) => self.coordinates(*node),
-            Some(_) => Ok((0, fixed(self.vec2(n, name, Vec2::ZERO)?))),
+            Some(_) => Ok((0, fixed(self.vec2(n, name, DVec2::ZERO)?))),
         }
     }
 
     /// The uv set and transform a texture-coordinate node gives.
-    fn coordinates(&self, mut n: usize) -> Result<(u8, Affine2), String> {
+    fn coordinates(&self, mut n: usize) -> Result<(u8, DAffine2), String> {
         // The transforms walked so far, of the coordinates the next node gives.
-        let mut outer = Affine2::IDENTITY;
+        let mut outer = DAffine2::IDENTITY;
         loop {
             let node = self.node(n);
             let (transform, input, unset) = match node.kind.as_str() {
@@ -1334,7 +1335,7 @@ impl Mapper<'_, '_> {
                         .filter(|s| *s < 2);
                     match set {
                         Some(s) => return Ok((s, outer)),
-                        None => (Affine2::IDENTITY, "default", (0, fixed(Vec2::ZERO))),
+                        None => (DAffine2::IDENTITY, "default", (0, fixed(DVec2::ZERO))),
                     }
                 }
                 "UsdPrimvarReader_float2" => {
@@ -1342,7 +1343,7 @@ impl Mapper<'_, '_> {
                         Primvar::Uv(set) => Ok((set, outer)),
                         Primvar::Constant(v) => Ok((0, outer * fixed(point2(&v)))),
                         Primvar::Missing => {
-                            let fallback = self.vec2(n, "fallback", Vec2::ZERO)?;
+                            let fallback = self.vec2(n, "fallback", DVec2::ZERO)?;
                             Ok((0, outer * fixed(fallback)))
                         }
                         Primvar::Varying { .. } => Err(format!(
@@ -1354,29 +1355,30 @@ impl Mapper<'_, '_> {
                     };
                 }
                 "place2d" => {
-                    let pivot = self.vec2(n, "pivot", Vec2::ZERO)?;
-                    let scale = self.vec2(n, "scale", Vec2::ONE)?;
-                    let offset = self.vec2(n, "offset", Vec2::ZERO)?;
+                    let pivot = self.vec2(n, "pivot", DVec2::ZERO)?;
+                    let scale = self.vec2(n, "scale", DVec2::ONE)?;
+                    let offset = self.vec2(n, "offset", DVec2::ZERO)?;
                     // MaterialX rotate2d turns clockwise by its angle in degrees.
-                    let rotate = Affine2::from_angle(-self.degrees(n, "rotate")?.to_radians());
+                    let rotate =
+                        DAffine2::from_angle(-f64::from(self.degrees(n, "rotate")?).to_radians());
                     let srt = self.float(n, "operationorder", 0.0)? == 0.0;
-                    let to = Affine2::from_translation(-pivot);
-                    let back = Affine2::from_translation(pivot);
-                    let s = Affine2::from_scale(scale.recip());
-                    let t = Affine2::from_translation(-offset);
+                    let to = DAffine2::from_translation(-pivot);
+                    let back = DAffine2::from_translation(pivot);
+                    let s = DAffine2::from_scale(scale.recip());
+                    let t = DAffine2::from_translation(-offset);
                     let place = if srt {
                         back * t * rotate * s * to
                     } else {
                         back * s * rotate * t * to
                     };
-                    (place, "texcoord", (0, fixed(Vec2::ZERO)))
+                    (place, "texcoord", (0, fixed(DVec2::ZERO)))
                 }
                 "UsdTransform2d" => {
-                    let scale = self.vec2(n, "scale", Vec2::ONE)?;
-                    let rotation = self.degrees(n, "rotation")?.to_radians();
-                    let translation = self.vec2(n, "translation", Vec2::ZERO)?;
-                    let t = Affine2::from_scale_angle_translation(scale, rotation, translation);
-                    (t, "in", (0, fixed(Vec2::ZERO)))
+                    let scale = self.vec2(n, "scale", DVec2::ONE)?;
+                    let rotation = f64::from(self.degrees(n, "rotation")?).to_radians();
+                    let translation = self.vec2(n, "translation", DVec2::ZERO)?;
+                    let t = DAffine2::from_scale_angle_translation(scale, rotation, translation);
+                    (t, "in", (0, fixed(DVec2::ZERO)))
                 }
                 k => {
                     return Err(format!(
@@ -1728,14 +1730,14 @@ impl Mapper<'_, '_> {
                 let map = *node;
                 let scale = if self.text(map, "space") == Some("object") {
                     self.material.object_normals |= object;
-                    Vec2::ONE
+                    DVec2::ONE
                 } else {
                     self.normal_frame(map, frame)?;
-                    self.vec2(map, "scale", Vec2::ONE)?
+                    self.vec2(map, "scale", DVec2::ONE)?
                 };
                 match self.value(map, "in")? {
                     Some(Value::Texture(t)) if t.channels == Channels::Rgb => {
-                        Ok(Some((t.normalmap_ref(), scale.to_array())))
+                        Ok(Some((t.normalmap_ref(), scale.as_vec2().to_array())))
                     }
                     _ => Err(format!("{}: in must read an image", self.node(map).name)),
                 }

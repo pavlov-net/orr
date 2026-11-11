@@ -3455,6 +3455,11 @@ fn texture_coordinates_are_per_reader() {
     near(sampled(&m, slot::BASE_COLOR, any), any);
     // st (0.3, 0.3) scales to (0.6, 0.6), turns to (-0.6, 0.6) and moves to (-0.35, 1.1).
     near(sampled(&m, slot::ROUGHNESS, any), [-0.35, -0.1]);
+    // The quarter turn's cosine is 0, where an f32 one shears the doubled axes.
+    assert_eq!(
+        m.uv_transforms[slot::ROUGHNESS],
+        [-1.0, 2.0, -1.75, -2.0, -1.0, 0.5]
+    );
     for c in corners(&a, "u/mesh") {
         assert!(
             [[0.0, 1.0], [1.0, 1.0], [0.0, 0.0]].contains(&c.2),
