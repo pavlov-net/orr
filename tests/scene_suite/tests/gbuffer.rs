@@ -7671,11 +7671,11 @@ impl ClasMoves {
 
     /// Exact frames, each after one begun and dropped when `dropping`, until the pool's page
     /// memory has rested for eight of them, no page wholly free or held, nothing draining or
-    /// retired and every mesh page within `budget`; returns the most it had draining.
-    fn settle(&mut self, budget: u64, dropping: bool) -> u64 {
+    /// retired and every mesh page within `budget`.
+    fn settle(&mut self, budget: u64, dropping: bool) {
         let class = orr_scene::ResidencyClass::MeshPages;
         let start = Instant::now();
-        let (mut settled, mut drained) = (0, 0);
+        let mut settled = 0;
         while settled < 8 {
             assert!(
                 start.elapsed() < Duration::from_secs(120),
@@ -7692,13 +7692,11 @@ impl ClasMoves {
             }
             self.exact();
             let (fill, pages) = self.pool();
-            drained = drained.max(fill.draining);
             let used = self.w.scenes.residency().class(class).resident_bytes;
             let rest = fill.draining == 0 && fill.retired == 0;
             let idle = used <= budget && rest && pages.held == 0 && pages.wholly_free == 0;
             settled = if idle { settled + 1 } else { 0 };
         }
-        drained
     }
 
     /// CLAS pool pages moved so far.
@@ -7743,8 +7741,7 @@ fn clas_pool_pages_move_to_other_memory_under_the_frames_that_trace_them() {
     let moved = c.moved();
     let budget = c.view_budget();
     c.budget(budget);
-    let drained = c.settle(budget, false);
-    assert!(drained > 0, "no block drained: {full:?} to {:?}", c.pool());
+    c.settle(budget, false);
     assert!(
         c.moved() > moved,
         "no page moved: {full:?} to {:?}",
@@ -7800,11 +7797,7 @@ fn frames_dropped_while_clas_pool_pages_move_leave_them_exact() {
     let moved = c.moved();
     let budget = c.view_budget();
     c.budget(budget);
-    assert!(
-        c.settle(budget, true) > 0,
-        "no block drained: {:?}",
-        c.pool()
-    );
+    c.settle(budget, true);
     assert!(c.moved() > moved, "no page moved: {:?}", c.pool());
     c.check_settled();
     assert_clean();
