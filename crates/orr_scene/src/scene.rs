@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use bytemuck::{Pod, Zeroable};
 use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, KernelSet, MemoryKind};
 use orr_math::{DVec3, IVec3};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::decals::{Decal, DecalId, Listing, decal_gpu, listing, table_sizes};
 use crate::lights::{
@@ -563,13 +563,18 @@ pub(crate) struct ModelCpu {
 }
 
 impl ModelCpu {
-    /// The part runs a copy may hold, posed or not.
-    pub(crate) fn runs(&self, posed: bool) -> CopyRuns {
-        CopyRuns {
-            body: (posed && self.animated_parts > 0).then(|| run_class(self.animated_parts)),
-            far: self.chained,
-        }
+    /// The class of the body run a copy may hold, posed or not.
+    pub(crate) fn body_run(&self, posed: bool) -> Option<u8> {
+        (posed && self.animated_parts > 0).then(|| run_class(self.animated_parts))
     }
+}
+
+/// A scene's copies of one model, placed by hand and on pages, and whether the PTLAS counts a
+/// far instance for each: the model had a chain while it had copies here.
+#[derive(Clone, Copy)]
+struct Copies {
+    count: u32,
+    far: bool,
 }
 
 /// A cooked page placed in a scene: its prototypes until its records first land, which write
@@ -591,8 +596,8 @@ pub(crate) struct PagePlacement {
     pub(crate) entries_stale: bool,
     /// Its prototypes' entries of the page part of the material-set table.
     pub(crate) sets: (u32, u32),
-    /// Per prototype, its model, its records and the part runs each copy may hold.
-    pub(crate) runs: Vec<(u32, u32, CopyRuns)>,
+    /// Per prototype, its model, its records and the class of the body run each copy may hold.
+    pub(crate) runs: Vec<(u32, u32, Option<u8>)>,
 }
 
 impl PagePlacement {
@@ -709,7 +714,9 @@ pub(crate) struct SceneCpu {
     slot_holds: Vec<SlotHold>,
     /// By slot placed by hand, the part runs its copy may hold, which the PTLAS counts until the
     /// slot is removed.
-    slot_runs: Vec<CopyRuns>,
+    slot_runs: Vec<(u32, Option<u8>)>,
+    /// By model.
+    copies: FxHashMap<u32, Copies>,
     /// Section masks copies name since the last frame: their BLAS build if missing.
     pub(crate) masks: HashSet<(ModelId, u16)>,
     /// Ranges removed in a frame, freed once that frame has completed.
@@ -808,6 +815,40 @@ fn words(bytes: usize) -> u32 {
 }
 
 impl SceneCpu {
+    /// The part runs a copy of `model` may hold, with a body run of class `body`: a far
+    /// instance as the scene counts them for the model's copies, or while it is `chained`.
+    fn copy_runs(&self, model: u32, chained: bool, body: Option<u8>) -> CopyRuns {
+        CopyRuns {
+            body,
+            far: self.copies.get(&model).map_or(chained, |c| c.far),
+        }
+    }
+
+    /// Counts `n` new copies of `model` and the part runs they may hold.
+    fn hold_copies(&mut self, model: u32, chained: bool, body: Option<u8>, n: u32) {
+        let c = self.copies.entry(model).or_insert(Copies {
+            count: 0,
+            far: chained,
+        });
+        c.count += n;
+        let runs = CopyRuns { body, far: c.far };
+        self.ptlas.hold_runs(runs, n);
+    }
+
+    /// Counts `n` copies of `model` removed, whose part runs leave the pool.
+    fn leave_copies(&mut self, model: u32, body: Option<u8>, n: u32) {
+        let c = self
+            .copies
+            .get_mut(&model)
+            .expect("copies of a model counted");
+        let far = c.far;
+        c.count -= n;
+        if c.count == 0 {
+            self.copies.remove(&model);
+        }
+        self.ptlas.leave_runs(CopyRuns { body, far }, n);
+    }
+
     /// The lowest id no group holds; 0 means none.
     fn free_group(&self) -> usize {
         (1..self.groups.len())
@@ -860,8 +901,8 @@ impl Scene {
         let mut entries: Vec<(u32, u32)> = Vec::new();
         if let Some(i) = cpu.pages.iter().position(|p| p.range == range) {
             let p = cpu.pages.swap_remove(i);
-            for &(_, records, runs) in &p.runs {
-                cpu.ptlas.leave_runs(runs, records);
+            for &(model, records, body) in &p.runs {
+                cpu.leave_copies(model, body, records);
             }
             self.clear_group(cpu, frame, p.group, seq);
             let n = page_entries(&p.entries);
@@ -992,42 +1033,27 @@ impl Scene {
     /// of `model` that holds none, as [`Self::chain_far`] does.
     pub(crate) fn check_chain_far(&self, model: u32) -> Result<()> {
         let cpu = self.cpu.lock().unwrap();
-        let hand = cpu
-            .slot_holds
-            .iter()
-            .zip(&cpu.slot_runs)
-            .filter(|(hold, runs)| hold.model == model && !runs.far)
-            .count() as u32;
-        let paged: u32 = cpu
-            .pages
-            .iter()
-            .flat_map(|p| &p.runs)
-            .filter(|&&(m, _, runs)| m == model && !runs.far)
-            .map(|&(_, records, _)| records)
-            .sum();
-        cpu.ptlas.check_runs([(FAR_RUN, hand + paged)])
+        let n = cpu
+            .copies
+            .get(&model)
+            .filter(|c| !c.far)
+            .map_or(0, |c| c.count);
+        cpu.ptlas.check_runs([(FAR_RUN, n)])
     }
 
-    /// Counts a far instance for every copy of `model` that holds none: the model has gained a
-    /// chain, so its copies may fade.
+    /// Counts a far instance for every copy of `model` that holds none, and for the copies
+    /// placed from now on: the model has gained a chain, so its copies may fade.
     pub(crate) fn chain_far(&self, model: u32) {
         let cpu = &mut *self.cpu.lock().unwrap();
-        let mut gained = 0;
-        for (hold, runs) in cpu.slot_holds.iter().zip(&mut cpu.slot_runs) {
-            if hold.model == model && !runs.far {
-                runs.far = true;
-                gained += 1;
-            }
+        let c = cpu.copies.entry(model).or_insert(Copies {
+            count: 0,
+            far: false,
+        });
+        if !c.far {
+            c.far = true;
+            let n = c.count;
+            cpu.ptlas.hold_runs(FAR_RUN, n);
         }
-        for p in &mut cpu.pages {
-            for (m, records, runs) in &mut p.runs {
-                if *m == model && !runs.far {
-                    runs.far = true;
-                    gained += *records;
-                }
-            }
-        }
-        cpu.ptlas.hold_runs(FAR_RUN, gained);
     }
 
     /// Frees the ranges of a growth that is not applied.
@@ -1264,7 +1290,8 @@ impl Scene {
             cpu: Mutex::new(SceneCpu {
                 slots: RangeAllocator::new(desc.instance_capacity),
                 slot_holds: vec![SlotHold::FREE; desc.instance_capacity as usize],
-                slot_runs: vec![CopyRuns::default(); desc.instance_capacity as usize],
+                slot_runs: vec![(NO_MODEL, None); desc.instance_capacity as usize],
+                copies: FxHashMap::default(),
                 masks: HashSet::new(),
                 removed: Vec::new(),
                 emissive: RangeAllocator::new(desc.emissive_capacity),
@@ -1571,7 +1598,8 @@ impl<'f> SceneWriter<'f> {
                 .get(desc.transforms.0 as usize)
                 .and_then(Option::as_ref)
                 .map_or(IVec3::ZERO, |g| g.anchor.cell);
-            let runs = model.runs(desc.pose.is_some());
+            let body = model.body_run(desc.pose.is_some());
+            let runs = cpu.copy_runs(desc.model.0, model.chained, body);
             cpu.ptlas.check_runs([(runs, desc.copies)])?;
             cpu.ptlas
                 .reserve_place(self.device, desc.copies, cell, cost)?;
@@ -1592,8 +1620,8 @@ impl<'f> SceneWriter<'f> {
                 });
             };
             let slots = first as usize..(first + desc.copies) as usize;
-            cpu.slot_runs[slots.clone()].fill(runs);
-            cpu.ptlas.hold_runs(runs, desc.copies);
+            cpu.slot_runs[slots.clone()].fill((desc.model.0, body));
+            cpu.hold_copies(desc.model.0, model.chained, body, desc.copies);
             let holds = &mut cpu.slot_holds[slots];
             for (hold, copy) in holds.iter_mut().zip(0..) {
                 *hold = SlotHold {
@@ -1756,16 +1784,20 @@ impl<'f> SceneWriter<'f> {
         if runs.is_empty() && count > 0 {
             runs.push(count);
         }
-        let part_runs: Vec<(u32, u32, CopyRuns)> = protos
+        let part_runs: Vec<(u32, u32, Option<u8>)> = protos
             .iter()
             .map(|p| {
                 let posed = r.poses.iter().any(|(m, _)| *m == p.model);
-                let runs = self.model_cpu[p.model.0 as usize].runs(posed);
-                (p.model.0, p.records, runs)
+                let body = self.model_cpu[p.model.0 as usize].body_run(posed);
+                (p.model.0, p.records, body)
             })
             .collect();
-        cpu.ptlas
-            .check_runs(part_runs.iter().map(|&(_, records, runs)| (runs, records)))?;
+        let chained = |m: u32| self.model_cpu[m as usize].chained;
+        cpu.ptlas.check_runs(
+            part_runs
+                .iter()
+                .map(|&(m, records, body)| (cpu.copy_runs(m, chained(m), body), records)),
+        )?;
         cpu.ptlas.reserve_runs(self.device, &runs)?;
         let first = cpu.slots.alloc(count).ok_or(Error::Capacity {
             what: "instances",
@@ -1863,8 +1895,8 @@ impl<'f> SceneWriter<'f> {
         let out = table.as_mut_slice().expect("upload is mapped");
         out[..copy_bytes as usize].copy_from_slice(bytemuck::cast_slice(&copies));
         let partitions = cpu.ptlas.place_runs(first, &runs, cell);
-        for &(_, records, runs) in &part_runs {
-            cpu.ptlas.hold_runs(runs, records);
+        for &(m, records, body) in &part_runs {
+            cpu.hold_copies(m, chained(m), body, records);
         }
         let mut group = Group::of_page(r.page, page, self.frame);
         group.frame = frame;
@@ -2214,9 +2246,10 @@ impl<'f> SceneWriter<'f> {
         let (states_src, states) = self
             .window
             .slice::<SkinStateGpu>(self.device, desc.copies)?;
-        let runs = model.runs(true);
+        let body = model.body_run(true);
         let (first, entry, emissive) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
+            let runs = cpu.copy_runs(desc.model.0, model.chained, body);
             cpu.ptlas.check_runs([(runs, desc.copies)])?;
             let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
                 what: "instances",
@@ -2256,8 +2289,9 @@ impl<'f> SceneWriter<'f> {
                 cpu.masks.insert((desc.model, section_mask));
             }
             cpu.ptlas.place_skinned(first, desc.copies);
-            cpu.slot_runs[first as usize..(first + desc.copies) as usize].fill(runs);
-            cpu.ptlas.hold_runs(runs, desc.copies);
+            cpu.slot_runs[first as usize..(first + desc.copies) as usize]
+                .fill((desc.model.0, body));
+            cpu.hold_copies(desc.model.0, model.chained, body, desc.copies);
             (first, entry, emissive)
         };
         if let Some(room) = entries {
@@ -2520,8 +2554,11 @@ impl<'f> SceneWriter<'f> {
         let seq = self.next_seq();
         let cpu = &mut *self.scene.cpu.lock().unwrap();
         let slots = range.first as usize..(range.first + range.count) as usize;
-        for runs in &mut cpu.slot_runs[slots] {
-            cpu.ptlas.leave_runs(std::mem::take(runs), 1);
+        for slot in slots {
+            let (model, body) = std::mem::replace(&mut cpu.slot_runs[slot], (NO_MODEL, None));
+            if model != NO_MODEL {
+                cpu.leave_copies(model, body, 1);
+            }
         }
         self.scene.empty_slots(cpu, range, self.frame, seq);
         cpu.removed.push((self.frame, range));
