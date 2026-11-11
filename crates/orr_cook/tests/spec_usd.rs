@@ -3755,6 +3755,29 @@ def Xform "Held"
     );
 }
 
+/// Clip settings are checked before anything reads them: an endless top rate is the settings'
+/// error, not keys between every two samples without end.
+#[test]
+fn clip_settings_are_checked_before_xforms_are_keyed() {
+    let mut settings = UsdSettings::default();
+    settings.clips.max_rate = f32::INFINITY;
+    let body = format!(
+        r#"def Xform "Spin"
+{{
+    double xformOp:rotateY.timeSamples = {{ 0: 0, 10: 90 }}
+    uniform token[] xformOpOrder = ["xformOp:rotateY"]
+    def Mesh "M"
+    {{
+        {TRIANGLE}
+    }}
+}}"#
+    );
+    let Err(e) = cook_at(&dir("clip-settings"), &body, settings) else {
+        panic!("cooked with an endless clip rate");
+    };
+    assert!(e.to_string().contains("clip rates"), "{e}");
+}
+
 /// The stage holds one timeline, so a rig whose samples start late keeps its place on it, and
 /// two rigs of one name part: a top-level prim's path is that name too.
 #[test]

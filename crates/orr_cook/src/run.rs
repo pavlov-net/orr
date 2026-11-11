@@ -2054,9 +2054,22 @@ fn texture_file_working_set(
 /// Imports a scene or material document and plans its units.
 fn import(name: &str, path: &Path, kind: ImportKind<'_>, shared: &Shared) -> Result<Imported> {
     let memo = &shared.memo;
+    // Before the importer, which reads them as it goes.
+    let check = |clips: &crate::ClipSettings| {
+        clips.check().map_err(|message| Error::Import {
+            asset: name.into(),
+            message,
+        })
+    };
     let (scene, rules) = match kind {
-        ImportKind::Gltf(s) => (crate::gltf::import(name, path, memo, s)?, &s.textures),
-        ImportKind::Usd(s) => (crate::usd::import(name, path, s)?, &s.textures),
+        ImportKind::Gltf(s) => {
+            check(&s.clips)?;
+            (crate::gltf::import(name, path, memo, s)?, &s.textures)
+        }
+        ImportKind::Usd(s) => {
+            check(&s.clips)?;
+            (crate::usd::import(name, path, s)?, &s.textures)
+        }
         ImportKind::MaterialX { material, textures } => (
             crate::materialx::import(name, path, memo, material)?,
             textures,
@@ -2086,12 +2099,6 @@ fn plan_scene(
     let mut units = Vec::new();
     let mut skeletons = Vec::with_capacity(src.skeletons.len());
     let mut skeleton_names = Vec::with_capacity(src.skeletons.len());
-    if !src.skeletons.is_empty() {
-        src.clips.check().map_err(|message| Error::Import {
-            asset: name.into(),
-            message,
-        })?;
-    }
     let reaches = src.reaches();
     for (sk, reach) in std::mem::take(&mut src.skeletons).into_iter().zip(reaches) {
         let prefix = match sk.prefix.as_str() {
