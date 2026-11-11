@@ -22,6 +22,7 @@ import orr_shaders.math;
 import orr_color.luminance;
 import orr_shaders.random;
 import orr_scene.view;
+import orr_output.exposure;
 import orr_output.overlay_front;
 
 // Half-resolution pixels across a CoC tile.
@@ -32,7 +33,7 @@ static const uint SPRITE_GROUP = 32;
 // foreground layer.
 static const float FOREGROUND_MIN = 1.0;
 // A highlight scatters when its half-resolution radius is at least this, its luminance is
-// SCATTER_RATIO times its neighborhood's and it exceeds it by SCATTER_EXCESS.
+// SCATTER_RATIO times its neighborhood's and it exceeds it by SCATTER_EXCESS, exposed.
 static const float SCATTER_MIN_RADIUS = 4.0;
 static const float SCATTER_RATIO = 4.0;
 static const float SCATTER_EXCESS = 1.0;
@@ -151,8 +152,11 @@ struct Root
     float round_at_f_number;
     // Diameter as a fraction of the width.
     float max_coc;
+    // 1 when the frame's exposure pass ran before this one, so the view's next exposure slot
+    // holds the frame's adapted exposure; 0 when the current slot's, last frame's, is the
+    // newest.
+    uint after_exposure;
     uint _pad0;
-    uint _pad1;
 }
 ORR_ROOT(Root);
 
@@ -334,6 +338,17 @@ float exposure_change()
     return e.prev_pre_exposure > 0.0 ? e.pre_exposure / e.prev_pre_exposure : 1.0;
 }
 
+// The factor from the source's pre-exposed radiance to exposed values, 1.0 paper white: the
+// newest adapted exposure over the pre-exposure. A view that has set no exposure shows its
+// pre-exposure.
+float exposed_scale()
+{
+    ViewConstants* view = root.view;
+    ExposureState* cur = view.exposure + view.exposure_slot;
+    ExposureState* newest = view.exposure + (view.exposure_slot ^ root.after_exposure);
+    return newest.initialized != 0 ? exposure_from_ev100(newest.adapted_ev100) / cur.pre_exposure : 1.0;
+}
+
 // The background layer's texels with data among the render texels under half-resolution
 // pixel `q` (at most 2x2): their mean, RGB radiance and A reverse-Z depth, and their count.
 float4 ray_background(int2 q, out float count)
@@ -468,8 +483,9 @@ void select(uint3 id: SV_DispatchThreadID, uint3 local: SV_GroupThreadID, uint3 
         }
         mean /= 16.0;
         float3 kept = c.rgb;
-        float l = guide_luminance(c.rgb);
-        float lm = guide_luminance(mean);
+        float exposed = exposed_scale();
+        float l = exposed * guide_luminance(c.rgb);
+        float lm = exposed * guide_luminance(mean);
         if (abs(c.a) >= SCATTER_MIN_RADIUS && l > SCATTER_RATIO * lm && l - lm > SCATTER_EXCESS)
         {
             uint slot;
@@ -503,9 +519,10 @@ void select(uint3 id: SV_DispatchThreadID, uint3 local: SV_GroupThreadID, uint3 
 
 static groupshared float4 reduced[16][16];
 
-float karis(float3 c)
+// `exposed` is `exposed_scale()`.
+float karis(float3 c, float exposed)
 {
-    return 1.0 / (1.0 + guide_luminance(c));
+    return 1.0 / (1.0 + exposed * guide_luminance(c));
 }
 
 // Mips 1-4 of 32x32 texels of mip 0 per group.
@@ -522,13 +539,14 @@ void reduce(uint3 id: SV_DispatchThreadID, uint3 local: SV_GroupThreadID)
     }
     Texture2D<float4> chain = root.chain.get<Texture2D<float4>>();
     int2 last = int2(half_extent()) - 1;
+    float exposed = exposed_scale();
     float4 sum = 0.0;
     float weights = 0.0;
     for (uint k = 0; k < 4; k++)
     {
         int2 p = min(2 * int2(id.xy) + int2(k & 1, k >> 1), last);
         float4 c = chain.Load(int3(p, 0));
-        float w = karis(c.rgb);
+        float w = karis(c.rgb, exposed);
         sum += w * c;
         weights += w;
     }
@@ -551,7 +569,7 @@ void reduce(uint3 id: SV_DispatchThreadID, uint3 local: SV_GroupThreadID)
             for (uint k = 0; k < 4; k++)
             {
                 float4 c = reduced[local.y + half_step * (k >> 1)][local.x + half_step * (k & 1)];
-                float w = karis(c.rgb);
+                float w = karis(c.rgb, exposed);
                 s += w * c;
                 ws += w;
             }

@@ -771,8 +771,9 @@ impl OutputKernels {
     /// Records the `depth_of_field` pass when the lens has depth of field on the after-RR
     /// path: it blurs `chain.rr_output` into `chain.linear` and swaps `chain`; returns whether
     /// it recorded. Allocates the view's images on the first such frame and frees them on the
-    /// first with depth of field off. Order the writes of lighting's targets and of the
-    /// source before it with a barrier; it ends with a barrier, so tonemap may follow
+    /// first with depth of field off. Record it after the frame's exposure pass, whose adapted
+    /// exposure its highlights are measured at. Order the writes of lighting's targets and of
+    /// the source before it with a barrier; it ends with a barrier, so tonemap may follow
     /// directly.
     pub fn depth_of_field(
         &self,
@@ -798,8 +799,10 @@ impl OutputKernels {
 
     /// Records the `depth_of_field_guide` pass when the lens has depth of field on the guide
     /// path: it blurs `radiance` (lighting's, at the render extent) into the images
-    /// [`OutputView::depth_of_field_guide`] returns for RR; returns whether it recorded.
-    /// Allocation and ordering are as for [`OutputKernels::depth_of_field`].
+    /// [`OutputView::depth_of_field_guide`] returns for RR; returns whether it recorded. It
+    /// runs before the frame's exposure pass and measures its highlights at the last frame's
+    /// adapted exposure. Allocation and barriers are as for
+    /// [`OutputKernels::depth_of_field`].
     pub fn depth_of_field_guide(
         &self,
         list: &mut CommandList<'_>,

@@ -231,8 +231,8 @@ impl DofKernels {
             blades: dof.blades,
             round_at_f_number: dof.round_at_f_number,
             max_coc: dof.max_coc,
+            after_exposure: u32::from(targets.guide.is_none()),
             _pad0: 0,
-            _pad1: 0,
         };
         if let Some(h) = targets.holes.as_mut() {
             let hole_reset = reset || std::mem::take(&mut h.fresh);

@@ -325,7 +325,8 @@ fn closed_shutter_and_a_cut_record_nothing() {
 mod depth_of_field {
     use orr_color::srgb_encode;
     use orr_output::{
-        ChainImages, DepthOfFieldPass, DofPath, OutputKernels, OutputView, OverlayFront, ViewOutput,
+        ChainImages, DepthOfFieldPass, DofPath, OutputKernels, OutputView, OverlayFront,
+        ViewOutput, ev100_from_exposure,
     };
     use orr_scene::orr_gpu::{
         Allocation, ComputePipeline, Format, GpuPtr, Hazards, MemoryKind, QueueKind, ShaderStage,
@@ -404,9 +405,11 @@ mod depth_of_field {
         reference: ComputePipeline,
         root: Allocation<dof_scene::Root>,
         constants: Allocation<ViewConstants>,
-        /// The one exposure slot the view reads.
+        /// The view's exposure slots, both holding the frame's state: the pass reads the
+        /// adapted exposure from either, by its path.
         exposure: Allocation<ExposureState>,
-        /// The pre-exposure the next frame is lit with.
+        /// The pre-exposure the next frame is lit with. The scenes are in exposed units: the
+        /// adapted exposure stays 1.
         pre_exposure: f32,
         rr_output: Texture,
         linear: Texture,
@@ -464,13 +467,15 @@ mod depth_of_field {
             };
             let mut constants = gpu.gpu_malloc(MemoryKind::Upload, 1, "view").unwrap();
             let mut exposure = gpu
-                .gpu_malloc::<ExposureState>(MemoryKind::Upload, 1, "exposure")
+                .gpu_malloc::<ExposureState>(MemoryKind::Upload, 2, "exposure")
                 .unwrap();
-            exposure.as_mut_slice().unwrap()[0] = ExposureState {
+            exposure.as_mut_slice().unwrap().fill(ExposureState {
                 pre_exposure: 1.0,
                 prev_pre_exposure: 1.0,
+                adapted_ev100: ev100_from_exposure(1.0),
+                initialized: 1,
                 ..ExposureState::default()
-            };
+            });
             let mut c: ViewConstants = bytemuck::Zeroable::zeroed();
             c.exposure = exposure.gpu();
             c.clip_from_view[0][0] = 1.0 / TAN_X;
@@ -593,9 +598,10 @@ mod depth_of_field {
         ) -> (Vec<[f32; 4]>, Vec<&'static str>, Option<Vec<f32>>) {
             let gpu = device();
             self.frame += 1;
-            let e = &mut self.exposure.as_mut_slice().unwrap()[0];
-            e.prev_pre_exposure = e.pre_exposure;
-            e.pre_exposure = self.pre_exposure;
+            for e in self.exposure.as_mut_slice().unwrap() {
+                e.prev_pre_exposure = e.pre_exposure;
+                e.pre_exposure = self.pre_exposure;
+            }
             self.put_root(scene, &dof.unwrap_or_else(|| lens(0, 1.4)));
             let queue = gpu.queue(QueueKind::Render).unwrap();
             let mut list = queue.command_list().unwrap();
@@ -967,33 +973,39 @@ mod depth_of_field {
     }
 
     /// The stabilized image and the accumulated background layer rescale their histories by
-    /// the change of pre-exposure: on a still scene, a pre-exposure that moves every frame shows
-    /// what a fixed one does.
+    /// the change of pre-exposure, and highlights are picked and weighted at their exposed
+    /// luminance: on a still scene at one adapted exposure, a pre-exposure that moves every
+    /// frame shows what a fixed one does. The highlights' falls, which takes them under the
+    /// scatter threshold where that is read in pre-exposed units.
     #[test]
-    fn histories_follow_a_moving_pre_exposure() {
-        let dof = Some(lens(0, 1.4));
-        let run = |stops_per_frame: f32| {
-            let mut b = Bed::new();
-            b.holes = true;
-            let mut image = Vec::new();
-            for f in 0..24 {
-                b.pre_exposure = (stops_per_frame * f as f32).exp2();
-                let (shown, _, _) = b.render(Scene::Fence, dof, DofPath::AfterRr);
-                image = shown
-                    .iter()
-                    .map(|p| p.map(|c| c / b.pre_exposure))
-                    .collect();
-            }
-            image
-        };
-        let (fixed, moving) = (run(0.0), run(0.15));
-        let worst = fixed
-            .iter()
-            .zip(&moving)
-            .flat_map(|(a, b)| (0..3).map(|c| (a[c] - b[c]).abs() / a[c].abs().max(0.05)))
-            .fold(0.0, f32::max);
-        log::info!("largest change from the fixed pre-exposure's image: {worst}");
-        assert!(worst < 1e-2, "{worst}");
+    fn a_moving_pre_exposure_shows_what_a_fixed_one_does() {
+        for (scene, dof, stops) in [
+            (Scene::Fence, lens(0, 1.4), 0.15),
+            (Scene::Highlights, lens(6, 1.0), -0.15),
+        ] {
+            let run = |stops_per_frame: f32| {
+                let mut b = Bed::new();
+                b.holes = true;
+                let mut image = Vec::new();
+                for f in 0..24 {
+                    b.pre_exposure = (stops_per_frame * f as f32).exp2();
+                    let (shown, _, _) = b.render(scene, Some(dof), DofPath::AfterRr);
+                    image = shown
+                        .iter()
+                        .map(|p| p.map(|c| c / b.pre_exposure))
+                        .collect();
+                }
+                image
+            };
+            let (fixed, moving) = (run(0.0), run(stops));
+            let worst = fixed
+                .iter()
+                .zip(&moving)
+                .flat_map(|(a, b)| (0..3).map(|c| (a[c] - b[c]).abs() / a[c].abs().max(0.05)))
+                .fold(0.0, f32::max);
+            log::info!("{scene:?}: largest change from the fixed pre-exposure's image: {worst}");
+            assert!(worst < 1e-2, "{scene:?}: {worst}");
+        }
         assert_clean();
     }
 
