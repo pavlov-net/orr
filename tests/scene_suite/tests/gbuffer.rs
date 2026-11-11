@@ -5639,6 +5639,54 @@ fn shoot_rigs_later(
     (rays_later(&view, &trace::MODULE, "pixels", 0), scene)
 }
 
+/// `count` more posed rigs in a group of their own behind the camera of the rig views, in their
+/// animation range.
+fn rigs_behind(
+    s: &mut SceneWriter<'_>,
+    model: ModelId,
+    pose: TransformGroupId,
+    count: u32,
+) -> InstanceRange {
+    let group = s
+        .create_transform_group(&TransformGroupDesc {
+            count,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    for (i, t) in s
+        .transforms(group, 0, count)
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        *t = Affine3::from_translation(Vec3::new(
+            2.4 * (i % 8) as f32,
+            0.0,
+            20.0 + 2.4 * (i / 8) as f32,
+        ))
+        .into();
+    }
+    s.add_instances(&InstancesDesc {
+        model,
+        copies: count,
+        transforms: group,
+        first: 0,
+        pose: Some(Pose {
+            group: pose,
+            index: 0,
+            variants: RIG_VARIANTS,
+            stride: 0,
+        }),
+        material_set: None,
+        flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+        rt_range: 10_000.0,
+        animation_range: 100.0,
+        user_tag: 0,
+    })
+    .unwrap()
+}
+
 /// The PTLAS of a scene grows under frames in flight. Two posed rigs hold part runs, and runs
 /// of two more rigs, placed and removed, wait on the pool's free list. Then 64 more posed rigs
 /// behind the camera, in their animation range, take more slots, cell partitions and part
@@ -5652,46 +5700,7 @@ fn the_ptlas_grows_past_its_layout_under_frames_in_flight_and_its_part_runs_hold
     let rigs = place_rigs(&mut w, 2, 2, 2.4, 0, 100.0);
     let model = w.model("rig");
     let (eye, target) = (DVec3::new(0.0, 2.5, 3.5), DVec3::ZERO);
-    let behind = |s: &mut SceneWriter<'_>, count: u32| {
-        let group = s
-            .create_transform_group(&TransformGroupDesc {
-                count,
-                writer: GroupWriter::Cpu,
-                anchor: DVec3::ZERO,
-            })
-            .unwrap();
-        for (i, t) in s
-            .transforms(group, 0, count)
-            .unwrap()
-            .iter_mut()
-            .enumerate()
-        {
-            *t = Affine3::from_translation(Vec3::new(
-                2.4 * (i % 8) as f32,
-                0.0,
-                20.0 + 2.4 * (i / 8) as f32,
-            ))
-            .into();
-        }
-        s.add_instances(&InstancesDesc {
-            model,
-            copies: count,
-            transforms: group,
-            first: 0,
-            pose: Some(Pose {
-                group: rigs.pose,
-                index: 0,
-                variants: RIG_VARIANTS,
-                stride: 0,
-            }),
-            material_set: None,
-            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
-            rt_range: 10_000.0,
-            animation_range: 100.0,
-            user_tag: 0,
-        })
-        .unwrap()
-    };
+    let behind = |s: &mut SceneWriter<'_>, count: u32| rigs_behind(s, model, rigs.pose, count);
     let mut frame = 0;
     let mut next = |w: &mut World, write: &mut dyn FnMut(&mut SceneWriter<'_>)| {
         frame += 1;
@@ -5761,6 +5770,102 @@ fn the_ptlas_grows_past_its_layout_under_frames_in_flight_and_its_part_runs_hold
     assert_eq!(
         (rt.parts, rt.parts_refused, rt.unplaced),
         (66 * (RIG_PARTS - 1), 0, 0)
+    );
+    assert_clean();
+}
+
+/// The tables a scene keeps by instance slot grow under frames in flight. One frame hides the
+/// first of two posed rigs, a write into the tables as they are, and then places rigs behind
+/// the camera that take more slots than the tables hold; the two frames after place more, so
+/// each move copies what the frame before it wrote. Every frame from the first on traces what
+/// the settled frames after do: nothing of the first rig, and the second posed as before on the
+/// part run it held.
+#[test]
+fn slot_tables_grow_under_frames_in_flight_and_writes_before_a_grow_land_in_them() {
+    fn bytes(traced: &[trace::Traced]) -> &[u8] {
+        bytemuck::cast_slice(traced)
+    }
+    let _serial = serial();
+    let mut w = finest_world();
+    let rigs = place_rigs(&mut w, 2, 2, 2.4, 0, 100.0);
+    let model = w.model("rig");
+    let (eye, target) = (DVec3::new(0.0, 2.5, 3.5), DVec3::ZERO);
+    let mut frame = 0;
+    let mut next = |w: &mut World, write: &mut dyn FnMut(&mut SceneWriter<'_>)| {
+        frame += 1;
+        shoot_rigs_later(w, &rigs, &Shot::at(eye, target, frame), write)
+    };
+    // Frames, each read while the next is in flight, until two trace the same; returns them
+    // and the frame still in flight.
+    let settle = |w: &mut World, next: &mut dyn FnMut(&mut World) -> RaysLater| {
+        let start = Instant::now();
+        let mut flight = next(w);
+        let mut last: Option<Vec<trace::Traced>> = None;
+        loop {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the rigs never settled"
+            );
+            let following = next(w);
+            wait(flight.point);
+            let now = flight.read().traced;
+            flight = following;
+            if last.as_ref().is_some_and(|l| bytes(l) == bytes(&now)) {
+                return (now, flight);
+            }
+            last = Some(now);
+        }
+    };
+    let (shown, flight) = settle(&mut w, &mut |w| next(w, &mut |_| {}).0);
+    wait(flight.point);
+    let held: SceneRoot = read_buffer(flight.scene, 1)[0];
+    let [first, second] = [0, 1].map(|i| rigs.range.first + i);
+    let hits = |traced: &[trace::Traced], slot: u32| {
+        traced.iter().filter(|t| t.instance == slot + 1).count()
+    };
+    assert!(hits(&shown, first) > 500 && hits(&shown, second) > 500);
+
+    let mut later = Vec::new();
+    for (i, count) in [2, 8, 54].into_iter().enumerate() {
+        let write = &mut |s: &mut SceneWriter<'_>| {
+            if i == 0 {
+                let hidden = InstanceRange { first, count: 1 };
+                s.set_instance_flags(hidden, InstanceFlags(0));
+            }
+            rigs_behind(s, model, rigs.pose, count);
+        };
+        later.push(next(&mut w, write).0);
+    }
+    let (hidden, flight) = settle(&mut w, &mut |w| next(w, &mut |_| {}).0);
+    wait(flight.point);
+    let grown: SceneRoot = read_buffer(flight.scene, 1)[0];
+    assert!(
+        grown.instances != held.instances && grown.slot_state != held.slot_state,
+        "the slot tables never grew"
+    );
+    assert!(grown.part_base >= 66, "{} slots", grown.part_base);
+    for (i, l) in later.iter().enumerate() {
+        let traced = l.read().traced;
+        assert!(
+            bytes(&traced) == bytes(&hidden),
+            "frame {} of the growth traced other hits at {} pixels",
+            i + 1,
+            differing(bytes(&traced), bytes(&hidden)),
+        );
+    }
+    assert_eq!(hits(&hidden, first), 0, "the first rig is hidden");
+    for (a, b) in shown.iter().zip(&hidden) {
+        if a.instance == second + 1 {
+            assert!(
+                bytemuck::bytes_of(a) == bytemuck::bytes_of(b),
+                "the second rig's {a:?} became {b:?}"
+            );
+        }
+    }
+    let rt = last_rt(&mut w, 2000);
+    assert_eq!(
+        (rt.parts, rt.parts_refused, rt.unplaced),
+        (65 * (RIG_PARTS - 1), 0, 0)
     );
     assert_clean();
 }
@@ -8578,6 +8683,99 @@ fn global_tables_grow_under_frames_in_flight_and_every_frame_stays_exact() {
         );
     }
     assert!(hits > old.len() / 4, "the view traces the copies");
+    assert_clean();
+}
+
+/// A scene holds the copies placed, however many. Copies in the null group take more slots than
+/// 16 bits name, and the showcase placed again after them draws and traces from its new slots
+/// what it did from the first ones.
+#[test]
+fn copies_past_65536_slots_draw_and_trace_as_the_first_ones_do() {
+    let _serial = serial();
+    let mut w = World::new(&KernelSet::NONE);
+    let items = showcase();
+    let placed = place(&mut w, &items);
+    let (eye, target) = (DVec3::new(0.3, 2.6, 5.5), DVec3::new(0.0, 0.6, 0.0));
+    let mut frame = 0;
+    let (first, flight) = settled_hits(&mut w, &placed, (eye, target), &mut frame);
+    wait(flight.point);
+
+    let models: Vec<ModelId> = items.iter().map(|c| w.model(c.model)).collect();
+    let leaf = w.model("leaf");
+    let copy =
+        |model: ModelId, copies: u32, transforms: TransformGroupId, first: u32| InstancesDesc {
+            model,
+            copies,
+            transforms,
+            first,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 100.0,
+            animation_range: 0.0,
+            user_tag: first,
+        };
+    let list = [placed.scene];
+    frame += 1;
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(frame),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    let mut s = f.scene(placed.scene).unwrap();
+    s.add_instances(&copy(leaf, 70_000, TransformGroupId(0), 0))
+        .unwrap();
+    let mut ranges = Vec::new();
+    for (i, (&range, &model)) in placed.ranges.iter().zip(&models).enumerate() {
+        s.remove(range);
+        ranges.push(
+            s.add_instances(&copy(model, 1, placed.group, i as u32))
+                .unwrap(),
+        );
+    }
+    drop(s);
+    wait(f.end(&[]).unwrap());
+    assert!(ranges.iter().all(|r| r.first >= 1 << 16), "{ranges:?}");
+    let moved = Placed {
+        ranges: ranges.clone(),
+        ..placed
+    };
+    let (last, flight) = settled_hits(&mut w, &moved, (eye, target), &mut frame);
+    wait(flight.point);
+    let old: &[trace::Traced] = bytemuck::cast_slice(&first);
+    let new: &[trace::Traced] = bytemuck::cast_slice(&last);
+    let mut hits = 0;
+    for (a, b) in old.iter().zip(new) {
+        if a.instance == 0 {
+            assert_eq!(b.instance, 0);
+            continue;
+        }
+        hits += 1;
+        let item = placed
+            .ranges
+            .iter()
+            .position(|r| r.first == a.instance - 1)
+            .unwrap();
+        assert_eq!(b.instance, ranges[item].first + 1);
+        let same = trace::Traced {
+            instance: a.instance,
+            ..*b
+        };
+        assert!(
+            bytemuck::bytes_of(&same) == bytemuck::bytes_of(a),
+            "{a:?} became {b:?}"
+        );
+    }
+    assert!(hits > old.len() / 4, "the view traces the copies");
+    let g = shoot(&mut w, &moved, &Shot::at(eye, target, frame + 1));
+    let drawn = g.ids.iter().filter(|&&id| id != 0);
+    assert!(drawn.clone().count() > g.ids.len() / 4);
+    for &id in drawn {
+        assert!(ranges.iter().any(|r| r.first == id - 1), "slot {}", id - 1);
+    }
     assert_clean();
 }
 
