@@ -77,6 +77,13 @@ impl Reach {
             d.abs() * size(0) + (1.0 + e).abs() * size(1) + f.abs(),
         )
         .max(1.0);
+        // A cluster stores its uvs on a grid no coarser than the box's own, and a stored uv lies
+        // within half its step of the source one, so outside the box by up to that.
+        let step = [0, 1].map(|a| f64::from(super::uv_grid(lo[a], hi[a]).1));
+        let stored = [
+            0.5 * ((1.0 + a).abs() * step[0] + b.abs() * step[1]),
+            0.5 * (d.abs() * step[0] + (1.0 + e).abs() * step[1]),
+        ];
         let corners = [lo, [hi[0], lo[1]], [lo[0], hi[1]], hi].map(|c| mapped(uv, c));
         let side = |a: usize, pick: fn(f64, f64) -> f64| {
             corners
@@ -91,8 +98,8 @@ impl Reach {
         );
         let slack = 16.0 * f64::from(f32::EPSILON) * largest;
         Self {
-            lo: lo.map(|c| c - slack),
-            hi: hi.map(|c| c + slack),
+            lo: [0, 1].map(|i| lo[i] - slack - stored[i]),
+            hi: [0, 1].map(|i| hi[i] + slack + stored[i]),
         }
     }
 
@@ -1413,6 +1420,15 @@ mod tests {
             ),
             [[0, 0], [1, 0]],
             "rounding at the size of the uvs, not of what they map to"
+        );
+        // A cluster of these uvs stores the last at 45875 x 2^-16, which maps past u = 1.
+        assert_eq!(
+            cells(
+                [0.0, 0.0, 0.30000505, 0.0, 0.0, 0.0],
+                &[[0.0, 0.5], [0.699_990_9, 0.5]]
+            ),
+            [[0, 0], [1, 0]],
+            "a stored uv within half its grid step of the source one"
         );
         assert!(cells(none, &[]).is_empty(), "a section of no triangles");
     }
