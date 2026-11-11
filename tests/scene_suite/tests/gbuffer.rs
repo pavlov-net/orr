@@ -6496,7 +6496,8 @@ fn past_tables_that_cannot_grow_the_farthest_copies_trace_cached_cuts_every_fram
         ..RendererDesc::default()
     });
     // Each copy's bounds lie farther from the focus than the last's: copies whose bounds hold
-    // the focus are equally near, and build together or not at all.
+    // the focus are equally near, and build by their slots, not by how far they are. The
+    // farthest takes the first slot, so the order of the slots is not that of the distances.
     let items: Vec<Item> = [-18.2f32, -19.8, -21.5, -24.4, -30.1]
         .into_iter()
         .enumerate()
@@ -6507,6 +6508,7 @@ fn past_tables_that_cannot_grow_the_farthest_copies_trace_cached_cuts_every_fram
                 * Mat3::from_diagonal(Vec3::new(2.0, 1.0, 4.0)),
             at: Vec3::new(3.0 * i as f32 - 6.0, -1.0, z),
         })
+        .rev()
         .collect();
     let placed = place(&mut w, &items);
     let eye = DVec3::new(0.3, 1.2, 4.0);
