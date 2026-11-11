@@ -395,7 +395,35 @@ fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<
                 let me = entry(a, info.header.mesh);
                 let blob0 = blob(a, me, 0);
                 let mi = MeshInfo::parse(&blob0).unwrap();
-                assert_eq!(gpu.bytes(mesh.info.address().0, blob0.len()), blob0);
+                let h = &mi.header;
+                let sets = [(&mesh.emissive, &h.emissive), (&mesh.casters, &h.casters)];
+                let tables = [
+                    (mesh.levels.address().0, h.levels),
+                    (mesh.nodes.address().0, h.nodes),
+                    (mesh.node_table.address().0, h.node_pages),
+                    (mesh.groups.address().0, h.groups),
+                    (mesh.roots.address().0, h.roots),
+                ]
+                .into_iter()
+                .chain(sets.into_iter().flat_map(|(t, s)| {
+                    [
+                        (t.sets.address().0, s.sets),
+                        (t.ranks.address().0, s.ranks),
+                        (t.clusters.address().0, s.clusters),
+                        (t.cdf.address().0, s.cdf),
+                        (t.index.address().0, s.index),
+                        (t.nodes.address().0, s.nodes),
+                    ]
+                }));
+                let mut bases: Vec<u64> = tables
+                    .filter(|(_, s)| s.count != 0)
+                    .map(|(address, s)| address - u64::from(s.first))
+                    .collect();
+                bases.dedup();
+                let [base] = bases[..] else {
+                    panic!("tables of {} off one blob 0: {bases:x?}", a.name(me));
+                };
+                assert_eq!(gpu.bytes(base, blob0.len()), blob0);
                 assert_eq!(mesh.page_count as usize, mi.pages.len());
                 assert_eq!(mesh.node_page_count as usize, mi.node_pages.len());
                 let pages = gpu.values(mesh.pages, mesh.page_count);

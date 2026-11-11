@@ -302,7 +302,6 @@ public struct SetTablesGpu
 // are 0 while their data is not resident.
 public struct MeshGpu
 {
-    public uint8_t* info;          // blob 0: MeshHeader and its tables (orr_pack.mesh)
     public uint64_t* pages;        // resident page per MeshHeader page
     public uint64_t* node_pages;   // node page per MeshHeader node page
     public uint* page_clusters;    // first mesh cluster index per page, then the cluster count

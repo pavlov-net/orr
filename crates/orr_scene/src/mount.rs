@@ -135,7 +135,8 @@ pub(crate) struct PlacedTexture {
 struct PlacedMesh {
     id: AssetId,
     entry: u32,
-    info: u64,
+    /// Blob 0, which holds the header's tables, in the mesh's block.
+    blob0: u64,
     pages: Vec<u64>,
     node_pages: Vec<u64>,
     /// Per page, its resident bytes, the pages it depends on and the node pages past the top
@@ -1157,7 +1158,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         placed.meshes.push(PlacedMesh {
             id,
             entry: entry as u32,
-            info: block.gpu(),
+            blob0: block.gpu(),
             pages: vec![0; info.pages.len()],
             node_pages: vec![0; info.node_pages.len()],
             page_units,
@@ -1734,7 +1735,9 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                     return GpuPtr::NULL;
                 }
                 // SAFETY: a table of blob 0, resident in the mount's block.
-                unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(m.info + u64::from(span.first))) }
+                unsafe {
+                    GpuPtr::from_address(orr_gpu::GpuAddress(m.blob0 + u64::from(span.first)))
+                }
             };
             let sets = |s: orr_pack::mesh::SetSpans, count: u32, cached: bool| SetTablesGpu {
                 sets: table(s.sets).cast(),
@@ -1755,7 +1758,6 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 // mount's block.
                 gpu: unsafe {
                     MeshGpu {
-                        info: GpuPtr::from_address(orr_gpu::GpuAddress(m.info)),
                         pages: GpuPtr::NULL,
                         node_pages: GpuPtr::NULL,
                         page_clusters: GpuPtr::from_address(orr_gpu::GpuAddress(m.page_clusters)),
