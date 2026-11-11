@@ -3594,6 +3594,7 @@ const CHAIN_HYSTERESIS: f32 = 1.15;
 const CHAIN_FADE_FRAMES: u8 = 16;
 const CHAIN_SEEN: u8 = 0x80;
 const COPY_FAR: u32 = 0x8000_0000;
+const RT_WRITTEN: u32 = 1;
 const RT_FADING: u32 = 64;
 const RT_STEP_SHIFT: u32 = 8;
 
@@ -3867,6 +3868,118 @@ fn each_chain_step_traces_what_the_raster_draws_and_a_fade_shows_both() {
         let on = |m: u32| both.iter().any(|b| b.contains(&m));
         assert!(materials[i] == u32::MAX || on(materials[i]));
         assert!(t.instance == 0 || on(t.material));
+    }
+    assert_clean();
+}
+
+#[test]
+fn a_chain_copy_hidden_past_the_ptlas_budget_stops_tracing_its_step_at_once() {
+    let _serial = serial();
+    let mut w = World::with(&RendererDesc {
+        raster_error_pixels: 1e-3,
+        rt_error_pixels: 1e-3,
+        budgets: Budgets {
+            ptlas_rebuilt: 0,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    });
+    let models = CHAIN.map(|name| w.model(name));
+    set_chain(&mut w, &models);
+    // The chain's copies in the cell next to the focus's, at step 2 from the focus.
+    let placed = place_at(&mut w, &chain_copies(), DVec3::new(300.0, 0.0, 0.0), 1e4);
+    let focus = DVec3::new(250.0, 1.0, 30.0);
+    let eye = DVec3::new(300.0, 2.0, 6.0);
+    let target = DVec3::new(300.0, 1.0, 0.0);
+    // A copy in the focus's cell. Moved, its write is the nearest work past the mandatory and
+    // takes the frame's one admission a budget of 0 leaves.
+    let ball = w.model("ball");
+    let decoy = {
+        let list = [placed.scene];
+        let f = w
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(0),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let mut s = f.scene(placed.scene).unwrap();
+        let group = s
+            .create_transform_group(&TransformGroupDesc {
+                count: 1,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::new(240.0, 0.0, 0.0),
+            })
+            .unwrap();
+        s.transforms(group, 0, 1).unwrap()[0] = Affine3::from_translation(Vec3::Y).into();
+        s.add_instances(&InstancesDesc {
+            model: ball,
+            copies: 1,
+            transforms: group,
+            first: 0,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 1e4,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+        drop(s);
+        wait(f.end(&[]).unwrap());
+        group
+    };
+    let slots: Vec<u32> = placed.ranges.iter().map(|r| r.first).collect();
+    let shot = |frame: u32| {
+        let mut shot = Shot::at(eye, target, frame);
+        shot.focus = Some(focus);
+        shot
+    };
+    // Placed without a focus, the copies fade from step 0 to step 2.
+    let settled = u32::from(CHAIN_FADE_FRAMES) + 4;
+    let mut g = shoot(&mut w, &placed, &shot(1));
+    for frame in 2..=settled {
+        g = shoot(&mut w, &placed, &shot(frame));
+    }
+    let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
+    let state = read_buffer(root.slot_state, u64::from(placed.count) + 1);
+    for &slot in &slots {
+        let s = state[slot as usize];
+        assert_eq!((s.chain_step, s.fade), (2 | CHAIN_SEEN, 0), "slot {slot}");
+        assert_eq!(
+            s.rt_flags & (RT_WRITTEN | 3 << RT_STEP_SHIFT),
+            RT_WRITTEN | 2 << RT_STEP_SHIFT,
+            "slot {slot}"
+        );
+    }
+    // Hiding a copy takes it to step 0 at once. Its null write is not the nearest work, but
+    // its instance holds step 2, whose hits would resolve through step 0.
+    let hidden = 1;
+    let mut hide = shot(settled + 1);
+    hide.moved = vec![(hidden, Affine3::ZERO)];
+    let g = shoot_with(&mut w, &placed, &hide, |s| {
+        s.transforms(decoy, 0, 1).unwrap()[0] =
+            Affine3::from_translation(Vec3::new(0.5, 1.0, 0.0)).into();
+    });
+    let state = read_buffer(root.slot_state, u64::from(placed.count) + 1);
+    for &slot in &slots {
+        let s = state[slot as usize];
+        let near = u32::from(s.chain_step) & 3;
+        assert!(
+            s.rt_flags & RT_WRITTEN == 0 || (s.rt_flags >> RT_STEP_SHIFT) & 3 == near,
+            "slot {slot} traces step {} of step {near}",
+            (s.rt_flags >> RT_STEP_SHIFT) & 3
+        );
+    }
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let hits = |slot: u32| r.traced.iter().filter(|t| t.instance == slot + 1).count();
+    assert_eq!(hits(slots[hidden as usize]), 0, "the hidden copy is traced");
+    for (k, &slot) in slots.iter().enumerate() {
+        assert!(
+            k == hidden as usize || hits(slot) > 20,
+            "copy {k} is not traced"
+        );
     }
     assert_clean();
 }

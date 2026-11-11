@@ -380,7 +380,8 @@ void want(uint3 id: SV_DispatchThreadID)
     bool seen = (st.rt_flags & RT_SEEN) != 0;
     bool written = (st.rt_flags & RT_WRITTEN) != 0;
     // The instance holds another chain step or fade state than the copy shows.
-    bool restep = written && (((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) != near || ((st.rt_flags & RT_FADING) != 0) != fading);
+    bool stepped = written && ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) != near;
+    bool restep = stepped || (written && ((st.rt_flags & RT_FADING) != 0) != fading);
     bool has_focus = root.focus_cell.w != 0;
     uint cell_log2 = uint(s.origin_cell.w);
 
@@ -454,8 +455,9 @@ void want(uint3 id: SV_DispatchThreadID)
 
     if (!active || !in_range)
     {
-        // A removed slot's instances go now: its slot may be handed out again.
-        bool mandatory = inst.flags == 0 || held_built || st.far_part != 0;
+        // A removed slot's instances go now: its slot may be handed out again. So does one
+        // holding another chain step than the copy's, whose hits resolve through the copy's.
+        bool mandatory = inst.flags == 0 || held_built || stepped || st.far_part != 0;
         if (written)
             op.op = OP_WRITE | OP_NULL;
         if (release)
