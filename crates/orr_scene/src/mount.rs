@@ -1956,15 +1956,10 @@ async fn build_accel(
     }
     for m in &mut r.meshes {
         let n = m.clusters.len() as u32;
-        let base = shared
-            .cluster_ids
-            .lock()
-            .unwrap()
-            .alloc(n)
-            .ok_or(Error::Capacity {
-                what: "resident clusters",
-                capacity: shared.cluster_capacity,
-            })?;
+        let base = shared.clusters.alloc(n).ok_or(Error::Capacity {
+            what: "resident cluster ids",
+            capacity: u32::MAX,
+        })?;
         r.cluster_ranges.push((base, n));
         m.cluster_base = base;
     }
@@ -2161,9 +2156,8 @@ async fn finish_mount(loading: &Loading, device: &Device, task: &MountTask) {
     let (point, result) = match result {
         Ok((point, r)) => (point, Ok(r)),
         Err(e) => {
-            let mut ids = task.accel.cluster_ids.lock().unwrap();
             for (first, count) in ranges {
-                ids.free(first, count);
+                task.accel.clusters.free(first, count);
             }
             (None, Err(Arc::new(e)))
         }
@@ -2385,8 +2379,6 @@ pub(crate) struct Mounts {
     entries: Vec<Option<Entry>>,
     pub(crate) models: Table<ModelGpu>,
     pub(crate) meshes: Table<MeshGpu>,
-    /// The resident cluster table, by cluster id.
-    pub(crate) clusters: Allocation<ClusterRef>,
     accel: Arc<AccelShared>,
     /// The section materials of every model, a run of them per model.
     pub(crate) model_materials: Table<u32>,
@@ -2711,12 +2703,6 @@ impl Mounts {
         let m = MemoryKind::DeviceLocal;
         Ok(Self {
             entries: Vec::new(),
-            clusters: device.gpu_malloc_with_priority(
-                m,
-                MemoryPriority::High,
-                u64::from(accel.cluster_capacity.max(1)),
-                "resident clusters",
-            )?,
             accel: Arc::clone(accel),
             models: Table::new(device, MemoryPriority::Normal, "models")?,
             meshes: Table::new(device, MemoryPriority::Normal, "meshes")?,
@@ -2890,11 +2876,9 @@ impl Mounts {
         let clusters: u32 = p.own.iter().map(|&q| pages[q as usize].clusters).sum();
         let cluster_base = self
             .accel
-            .cluster_ids
-            .lock()
-            .unwrap()
+            .clusters
             .alloc(clusters)
-            .ok_or_else(|| capacity("resident clusters", self.accel.cluster_capacity))?;
+            .ok_or_else(|| capacity("resident cluster ids", u32::MAX))?;
         let mut ids = EditIds::none(cluster_base, clusters, page_count);
         let placed = self
             .take_edit_ids(&mut ids, w.device)
@@ -2921,11 +2905,7 @@ impl Mounts {
     }
 
     fn free_edit_ids(&mut self, ids: &EditIds) {
-        self.accel
-            .cluster_ids
-            .lock()
-            .unwrap()
-            .free(ids.cluster_base, ids.clusters);
+        self.accel.clusters.free(ids.cluster_base, ids.clusters);
         if let Some(mesh) = ids.mesh {
             self.meshes.free(mesh, 1);
         }
@@ -3024,7 +3004,7 @@ impl Mounts {
         }
         w.put(table, &page_table)?;
         w.put(bases, &page_bases)?;
-        w.put(self.clusters.gpu().offset(u64::from(base)), &refs)?;
+        w.put(self.accel.clusters.gpu().offset(u64::from(base)), &refs)?;
 
         let micromap = |k: usize| {
             loaded.micromaps[k]
@@ -3215,7 +3195,7 @@ impl Mounts {
             device,
             window,
             kernels: &self.accel.kernels,
-            clusters: self.clusters.gpu(),
+            clusters: self.accel.clusters.gpu(),
         };
         list.begin_pass("edits", false);
         recorder.record(list, &mut todo, &mut self.edit_scratch)?;
@@ -3609,6 +3589,11 @@ impl Mounts {
         }
     }
 
+    /// The resident cluster table.
+    pub(crate) fn clusters(&self) -> &crate::clusters::ClusterTable {
+        &self.accel.clusters
+    }
+
     /// Moves the model, mesh and section-material tables that grew since the last upload:
     /// see [`Table::land`].
     pub(crate) fn land(
@@ -3702,9 +3687,8 @@ impl Mounts {
             materials.free(*id);
         }
         self.free_pages(&mut r);
-        let mut ids = self.accel.cluster_ids.lock().unwrap();
         for &(first, count) in &r.cluster_ranges {
-            ids.free(first, count);
+            self.accel.clusters.free(first, count);
         }
     }
 
@@ -3714,9 +3698,8 @@ impl Mounts {
         let i = batch.mount.0 as usize;
         if !matches!(self.entries.get(i), Some(Some(Entry::Pending(_)))) {
             if let Ok(r) = batch.result {
-                let mut ids = self.accel.cluster_ids.lock().unwrap();
                 for &(first, count) in &r.cluster_ranges {
-                    ids.free(first, count);
+                    self.accel.clusters.free(first, count);
                 }
             }
             if let Some(slot) = self.entries.get_mut(i) {
@@ -3838,7 +3821,7 @@ impl Mounts {
             };
             w.put(self.meshes.entry(id), &[gpu])?;
             w.put(
-                self.clusters.gpu().offset(u64::from(m.cluster_base)),
+                self.accel.clusters.gpu().offset(u64::from(m.cluster_base)),
                 &m.refs,
             )?;
             res.rt.push(m.rt.clone());
@@ -3963,7 +3946,7 @@ impl Mounts {
         let units = units(
             &meshes,
             &tables,
-            self.clusters.gpu(),
+            self.accel.clusters.gpu(),
             &res.placed_textures,
             &page_entries,
         )?;

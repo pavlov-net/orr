@@ -1987,7 +1987,7 @@ impl Streaming {
                 t.write_map(w)?;
             }
         }
-        let mut ids = self.accel.cluster_ids.lock().unwrap();
+        let ids = &self.accel.clusters;
         let mut taken = FxHashMap::default();
         let loads = self.residency.cancel_held(loads, |k| {
             if self.unbinding.contains(&k) {
@@ -2006,7 +2006,6 @@ impl Streaming {
                 None => Some(Held::ClusterIds),
             }
         });
-        drop(ids);
         self.loading_ids.extend(taken);
         for u in &self.unbinds {
             self.unbinding.remove(&u.key);
@@ -2630,7 +2629,7 @@ impl Streaming {
             && let Some((first, n)) = self.loading_ids.remove(&key)
             && !matches!(l.placed, Some(Placed::MeshPage(_)))
         {
-            self.accel.cluster_ids.lock().unwrap().free(first, n);
+            self.accel.clusters.free(first, n);
         }
         if let (What::Unit(key), Some(Placed::MeshPage(_))) = (l.what, &l.placed) {
             return self.mesh_landed(key, l, clas, frame, w);
@@ -2776,11 +2775,7 @@ impl Streaming {
         if let Some(pool) = &self.clas {
             pool.free(&f.clas, f.micromap);
         }
-        self.accel
-            .cluster_ids
-            .lock()
-            .unwrap()
-            .free(f.ids.0, f.ids.1);
+        self.accel.clusters.free(f.ids.0, f.ids.1);
     }
 
     /// Copies frame `frame`'s texture feedback back after every tap of the frame on `list`.

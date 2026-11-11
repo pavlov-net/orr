@@ -19,13 +19,14 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::accel::{AccelKernels, AccelLimits, AccelShared};
 use crate::arena::{ArenaReport, ArenaRequest, ViewArena, ViewStep};
+use crate::clusters::ClusterTable;
 use crate::decals::{self, build_bins};
 use crate::detail::{Detail, Sample};
 use crate::features::SceneFeatures;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
 use crate::medium_proxy::{ProxyBlas, VolumeRef};
-use crate::memory::{BestFit, PreprocessArenas, SceneMemory, UploadWindow};
+use crate::memory::{PreprocessArenas, SceneMemory, UploadWindow};
 use crate::mount::{
     Apply, ClipRef, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId,
     SkeletonRef, TableSizes,
@@ -152,12 +153,6 @@ pub struct Budgets {
     /// thresholds geometry is chosen by coarsen evenly until they want what it holds
     /// ([`DetailStats`]).
     pub mesh_page_pool: PoolSize,
-    /// Bytes of `mesh_page_pool` per entry of the resident cluster table, which holds the
-    /// clusters of resident mesh pages and of edits' own pages, 24 B each. A mount whose
-    /// pinned pages' clusters find no room fails, and a streamed page that finds none loads
-    /// later while the mesh page budget shrinks. A cooked scene of 101.8 M clusters holds
-    /// 1,376 B of resident page per cluster, before a streamed page's CLAS. Above 0.
-    pub resident_cluster_bytes: u64,
     /// Bytes of pages a DAG mesh keeps resident from mount; the pages of a larger one past
     /// its pinned coarsest pages stream on the traversal's requests.
     pub mesh_resident_max: u64,
@@ -208,7 +203,6 @@ impl Default for Budgets {
             micromap_pages: 64,
             ptlas_rebuilt: 250_000,
             mesh_page_pool: PoolSize::HeapPercent(40),
-            resident_cluster_bytes: 1024,
             mesh_resident_max: 1 << 20,
             texture_pool: PoolSize::HeapPercent(30),
             instance_page_pool: 256 << 20,
@@ -529,10 +523,6 @@ impl Scenes {
         let b = &desc.budgets;
         assert!(b.in_flight_bytes > 0, "in_flight_bytes is above 0");
         assert!(
-            b.resident_cluster_bytes > 0,
-            "resident_cluster_bytes is above 0"
-        );
-        assert!(
             b.initial_rt_cut_clusters > 0 && b.initial_rt_cut_blas > 0,
             "initial_rt_cut_clusters and initial_rt_cut_blas are above 0"
         );
@@ -541,8 +531,6 @@ impl Scenes {
             "culled_error_scale and hidden_detail_lead are at least 1"
         );
         let pools = PoolBytes::new(device, b);
-        // Cluster ids are 32 bits.
-        let clusters = u32::try_from(pools.mesh / b.resident_cluster_bytes).unwrap_or(u32::MAX);
         let accel = Arc::new(AccelShared {
             kernels: AccelKernels::new(device, desc.kernels)?,
             limits: AccelLimits {
@@ -550,8 +538,7 @@ impl Scenes {
                 micromaps: b.micromap_pages,
                 mesh_resident_max: b.mesh_resident_max,
             },
-            cluster_ids: Mutex::new(BestFit::new(clusters)),
-            cluster_capacity: clusters,
+            clusters: ClusterTable::new(device, b.stream_block)?,
         });
         let materials = MaterialTable::new(device)?;
         let mounts = Mounts::new(
@@ -1010,6 +997,7 @@ impl Scenes {
             ..SceneMemory::default()
         };
         self.core.mounts.streaming.memory(&mut out);
+        out.pools.push(self.core.mounts.clusters().fill());
         out
     }
 
@@ -1357,6 +1345,7 @@ impl Scenes {
             &self.loading,
             &mut apply,
         )?);
+        loading_points.extend(core.mounts.clusters().bind(&self.device)?);
         core.mounts.begin_edits(core.budgets.edit_triangles);
         let events = core.mounts.streaming.take_page_events();
         for (page, records) in events {
@@ -1885,7 +1874,7 @@ impl<'a> Frame<'a> {
                 models: core.mounts.models.gpu(),
                 meshes: core.mounts.meshes.gpu(),
                 materials: core.materials.table.gpu(),
-                clusters: core.mounts.clusters.gpu(),
+                clusters: core.mounts.clusters().gpu(),
                 material_sets: t.material_sets.gpu().cast(),
                 lights: t.lights.gpu(),
                 emissive: t.emissive.gpu(),

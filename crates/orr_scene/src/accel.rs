@@ -13,7 +13,7 @@
 //! submit whose sizes they read back has run, so the thread goes on with reads and stream
 //! tasks meanwhile and stays the one that submits the loading queue.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use orr_gpu::{
     Allocation, BlasLimits, ClusterLimits, ClusterVertexFormat, CommandList, ComputePipeline,
@@ -25,8 +25,9 @@ use orr_gpu::{
 use orr_pack::mesh::{Cluster, MeshHeader, Part, in_cut};
 
 use crate::clas_pool::ClasPool;
+use crate::clusters::ClusterTable;
 use crate::loading::completion;
-use crate::memory::{BestFit, UploadWindow};
+use crate::memory::UploadWindow;
 use crate::shaders::accel::{self, AccelRoot, AddressJob, ClasJob};
 use crate::{ClusterRef, PartGpu, Result, RtCutGpu};
 
@@ -289,14 +290,13 @@ pub(crate) struct MountAccel {
 }
 
 /// What mounts on the loading side share with the render thread: the kernels, the batch
-/// limits and the resident cluster ids. A mount takes its pinned pages' ids on the loading
+/// limits and the resident cluster table. A mount takes its pinned pages' ids on the loading
 /// side and the render thread frees them with the mount; the render thread takes a streamed
 /// page's when its load starts and frees them once it is evicted, and an edit's own pages'.
 pub(crate) struct AccelShared {
     pub(crate) kernels: AccelKernels,
     pub(crate) limits: AccelLimits,
-    pub(crate) cluster_ids: Mutex<BestFit>,
-    pub(crate) cluster_capacity: u32,
+    pub(crate) clusters: ClusterTable,
 }
 
 /// The resident cluster table entries of a mesh's clusters; their CLAS once built.

@@ -85,7 +85,7 @@ const POOL_THREADS: usize = 256;
 pub(crate) const NO_UNIT: u32 = u32::MAX;
 /// Render steps the pool keeps pages bound for the most its reservations came to in one: a
 /// burst of streaming that recurs within them binds no page again.
-const RESERVE_STEPS: usize = 64;
+pub(crate) const RESERVE_STEPS: usize = 64;
 /// Alignment of every region carved from the build scratch.
 const ALIGN: u64 = 256;
 /// Bytes of pool pages one batch moves out of the draining blocks of their memory, at most:

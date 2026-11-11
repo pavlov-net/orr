@@ -787,6 +787,41 @@ fn upload_bytes() -> u64 {
     device().memory_report().kinds[0].bytes
 }
 
+/// The resident cluster table holds no memory with nothing mounted, binds memory for a
+/// mount's clusters, and gives it all back some frames after the mount has gone.
+#[test]
+fn the_resident_cluster_table_binds_what_mounts_hold_and_unbinds_it_after_they_go() {
+    let _serial = serial();
+    let mut scenes = Scenes::new(device(), &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let table = |s: &Scenes| {
+        let pools = s.memory().pools;
+        *pools
+            .iter()
+            .find(|p| p.name == "resident clusters")
+            .expect("the resident cluster table's memory")
+    };
+    frame(&mut scenes);
+    assert_eq!((table(&scenes).bytes, table(&scenes).used), (0, 0));
+    let m = scenes.mount(PackSource::Memory(Arc::clone(pack())));
+    ready(&mut scenes, m);
+    frame(&mut scenes);
+    let held = table(&scenes);
+    assert!(held.used > 0, "{held:?}");
+    scenes.unmount(m);
+    let start = Instant::now();
+    while table(&scenes).bytes > 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the table kept {:?} after the mount went",
+            table(&scenes)
+        );
+        frame(&mut scenes);
+    }
+    assert_eq!(table(&scenes).used, 0);
+    assert_clean();
+}
+
 #[test]
 fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
     let _serial = serial();

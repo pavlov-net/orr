@@ -45,6 +45,7 @@ mod accel;
 mod arena;
 mod capacity;
 mod clas_pool;
+mod clusters;
 mod decals;
 mod detail;
 mod edit;
