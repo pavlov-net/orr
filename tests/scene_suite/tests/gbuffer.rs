@@ -7546,6 +7546,77 @@ fn mesh_pages_move_out_of_draining_blocks_under_the_frames_that_draw_them() {
     assert_clean();
 }
 
+/// The streaming ground settles at the configured detail under an ample mesh page pool, its
+/// finer cuts built over the pages they hold. The pool's budget then falls to the pinned pages
+/// and two fifths of the streamed ones the view wants: the detail scale rises to one that
+/// fits and stays there, never above where it settles, while the pages the finer cuts held
+/// leave with the cuts the coarser frames stop using.
+#[test]
+fn a_mesh_page_budget_cut_moves_the_detail_scale_to_what_fits_and_no_further() {
+    let _serial = serial();
+    let mesh_pages_class = orr_scene::ResidencyClass::MeshPages;
+    // Every page streams, every copy traces a finer cut, and no cut merges.
+    let mut w = World::with(&RendererDesc {
+        budgets: Budgets {
+            mesh_resident_max: 0,
+            ..Budgets::default()
+        },
+        rt_merge_pixels: 1e9,
+        raster_error_pixels: 1e-3,
+        rt_error_pixels: 1e-3,
+        ..RendererDesc::default()
+    });
+    let pinned = w.scenes.residency().class(mesh_pages_class).resident_bytes;
+    let items = dag_items();
+    let placed = place(&mut w, &items);
+    let eye = DVec3::new(0.3, 1.2, 4.0);
+    let target = DVec3::new(0.0, 0.0, -10.0);
+    let mut frame = 1;
+    // Frames until the loads are idle and the scale has held for `still` of them; returns
+    // every frame's detail.
+    let mut settle = |w: &mut World, still: u32| {
+        let start = Instant::now();
+        let mut details: Vec<orr_scene::DetailStats> = Vec::new();
+        let mut held = 0;
+        while held < still {
+            frame += 1;
+            shoot(w, &placed, &Shot::at(eye, target, frame));
+            let d = w.scenes.stats().detail;
+            assert!(
+                start.elapsed() < Duration::from_secs(120),
+                "the detail never settled, at {d:?}"
+            );
+            let r = w.scenes.residency();
+            let idle = r.loads == 0 && r.class(mesh_pages_class).loading_bytes == 0;
+            let same = details
+                .last()
+                .is_some_and(|l| l.memory_scale == d.memory_scale);
+            held = if idle && same { held + 1 } else { 0 };
+            details.push(d);
+        }
+        details
+    };
+    let ample = *settle(&mut w, 48).last().unwrap();
+    assert_eq!(ample.memory_scale, 1.0, "{ample:?}");
+    let budget = pinned + (ample.mesh_demand - pinned) * 2 / 5;
+    w.scenes.lower_budget(mesh_pages_class, budget);
+    let cut = settle(&mut w, 96);
+    let last = *cut.last().unwrap();
+    assert!(last.memory_scale > 1.0, "{last:?}");
+    assert!(
+        last.mesh_demand as f64 <= 0.92 * last.mesh_budget as f64 && last.mesh_shortfall == 0,
+        "{last:?}"
+    );
+    let scales: Vec<f32> = cut.iter().map(|d| d.memory_scale).collect();
+    let most = scales.iter().copied().fold(0.0, f32::max);
+    assert_eq!(
+        most, last.memory_scale,
+        "the scale passed where it settles: {scales:?}"
+    );
+    assert_eq!(w.scenes.residency().failed, 0);
+    assert_clean();
+}
+
 /// The streaming ground, a wall before most of it, which the camera sees from in front, and a
 /// second ground standing upright wholly behind the wall.
 fn walled_fine_ground() -> [Item; 3] {

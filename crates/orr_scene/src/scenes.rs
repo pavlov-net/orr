@@ -384,11 +384,15 @@ pub struct DetailStats {
     /// further ([`Budgets::rt_cut_memory`]).
     pub rt_scale: f32,
     /// What the mesh page pool was asked for at the frame's detail: its pinned, locked and
-    /// loading pages, and those the frame read or requested with what they depend on, whether
-    /// or not the budget took them; and the pool's budget then. 0 when the frame updated no
-    /// scene.
+    /// loading pages, the pages of the finer cuts the frame used, and those the frame read or
+    /// requested with what they depend on, whether or not the budget took them; and the pool's
+    /// budget then. 0 when the frame updated no scene.
     pub mesh_demand: u64,
     pub mesh_budget: u64,
+    /// The bytes of `mesh_demand` no detail sheds (pinned and locked pages and what they
+    /// depend on) past `mesh_budget`. While it is above 0 the scales rise only until the frames
+    /// want nothing else, and the pool stays over its budget by this much.
+    pub mesh_shortfall: u64,
 }
 
 /// Scene compute: a listed scene's turn in `update_scenes`, after its uploads have landed.
@@ -1014,6 +1018,13 @@ impl Scenes {
         crate::scene::page_needs(&self.core.mounts, &self.core.model_cpu, id).map(|(n, ..)| n)
     }
 
+    /// Holds back the binds that finish tile moves, as a loading thread busy binding does, or
+    /// lets them go.
+    #[cfg(feature = "testing")]
+    pub fn hold_tile_binds(&mut self, hold: bool) {
+        self.core.mounts.streaming.hold_tile_binds(hold);
+    }
+
     #[cfg(feature = "testing")]
     pub(crate) fn texture_object(&self, m: MountId, id: AssetId) -> Option<Arc<orr_gpu::Texture>> {
         self.core.mounts.texture_object(m, id)
@@ -1221,6 +1232,8 @@ impl Scenes {
                 });
                 f.stats.detail.mesh_demand = mesh.bytes;
                 f.stats.detail.mesh_budget = mesh.budget;
+                f.stats.detail.mesh_shortfall =
+                    (mesh.bytes - mesh.streamed).saturating_sub(mesh.budget);
             }
             core.completed_frame = f.id;
             core.stats = f.stats;
@@ -1312,6 +1325,7 @@ impl Scenes {
             frame,
             settled,
             core.memory.scale() > 1.0,
+            core.output,
             &self.loading,
             &mut apply,
         )?);
@@ -1334,33 +1348,37 @@ impl Scenes {
         let mut list = render.command_list()?;
         // Work from earlier frames on this queue finishes before this frame's writes.
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
-        let moves = core.mounts.streaming.take_moves();
-        for m in &moves.units {
-            // SAFETY: both slots are the streamed pools', held until this frame has completed.
-            let (dst, src) = unsafe {
-                (
-                    GpuPtr::from_address(GpuAddress(m.dst)),
-                    GpuPtr::from_address(GpuAddress(m.src)),
-                )
-            };
-            list.copy(dst, src, m.bytes);
-        }
-        for t in &moves.tiles {
-            let s = &t.stream;
-            let tile = s.grid.tile(t.tile);
-            let region = s
-                .layout
-                .tile_region(s.texture.desc(), tile.mip, tile.layer, tile.xy);
-            // SAFETY: the tile's place in the scratch its move holds until this frame has
-            // completed.
-            let at = unsafe { GpuPtr::from_address(GpuAddress(t.at)) };
-            if t.out {
-                list.copy_from_texture(at, &s.texture, &region);
-            } else {
-                list.copy_to_texture(&s.texture, &region, at);
+        for (i, moves) in core.mounts.streaming.moves(frame).iter().enumerate() {
+            // A later step's copies may read what an earlier step's wrote.
+            if i > 0 {
+                list.barrier(Stages::TRANSFER, Stages::TRANSFER, Hazards::empty());
             }
-        }
-        if !moves.units.is_empty() || !moves.tiles.is_empty() {
+            for m in &moves.units {
+                // SAFETY: both slots are the streamed pools', held until this frame has
+                // completed.
+                let (dst, src) = unsafe {
+                    (
+                        GpuPtr::from_address(GpuAddress(m.dst)),
+                        GpuPtr::from_address(GpuAddress(m.src)),
+                    )
+                };
+                list.copy(dst, src, m.bytes);
+            }
+            for t in &moves.tiles {
+                let s = &t.stream;
+                let tile = s.grid.tile(t.tile);
+                let region = s
+                    .layout
+                    .tile_region(s.texture.desc(), tile.mip, tile.layer, tile.xy);
+                // SAFETY: the tile's place in the scratch its move holds until this frame has
+                // completed.
+                let at = unsafe { GpuPtr::from_address(GpuAddress(t.at)) };
+                if t.out {
+                    list.copy_from_texture(at, &s.texture, &region);
+                } else {
+                    list.copy_to_texture(&s.texture, &region, at);
+                }
+            }
             list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
         }
         let now = Instant::now();
@@ -2727,6 +2745,7 @@ impl<'a> Frame<'a> {
         waits.extend(self.after_output);
         let mut points = std::mem::take(&mut self.submits);
         points.push(render.submit(vec![list], &waits)?);
+        self.core.mounts.streaming.submitted(self.id);
         if let Some(output) = self.output.take() {
             let compute = self
                 .device

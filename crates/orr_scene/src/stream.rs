@@ -42,6 +42,12 @@
 //! to scratch memory; the next binds the tile to its new slot on the render queue, between that
 //! frame's work and its own, and has its frame copy the texels back in before anything samples.
 //! Where the render queue takes no sparse binds, tiles stay where they are.
+//!
+//! A step's copies stay queued until a frame whose list carries them is submitted
+//! ([`Streaming::submitted`]), so a frame that is dropped leaves them to the next, and a tile is
+//! bound to its new slot only once the copy of its texels out has been submitted. A moving
+//! tile that is evicted, or whose mount goes, leaves its move: it stays bound where it was, as
+//! its eviction expects, and the slot it would have taken returns unused.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -109,7 +115,7 @@ pub(crate) struct TileCopy {
     pub(crate) out: bool,
 }
 
-/// What a step hands its frame to copy first.
+/// What one step has a frame copy first; a later step's copies may read what these wrote.
 #[derive(Default)]
 pub(crate) struct Moves {
     pub(crate) units: Vec<UnitMove>,
@@ -120,11 +126,20 @@ pub(crate) struct Moves {
 /// Tiles of one texture and the slots they move to.
 type TileSlots = Vec<(u32, PoolSlot)>;
 
-/// Tiles a step started moving: the frame of that step copies each one's texels to its place
-/// in `scratch`, and the next step binds it to `to`.
+/// A tile on its way to slot `to`, its texels at `at` in its batch's scratch.
+struct TileMove {
+    key: Key,
+    to: PoolSlot,
+    at: u64,
+}
+
+/// The tiles a step started moving. Its copies take each one's texels to the scratch; once a
+/// frame carrying them is submitted (`copied`), a later step binds the tiles to their new
+/// slots.
 struct TileMoves {
     scratch: Allocation<u8>,
-    tiles: Vec<(Key, PoolSlot)>,
+    tiles: Vec<TileMove>,
+    copied: bool,
 }
 
 /// The resident units in each block of a pool.
@@ -260,11 +275,13 @@ enum FineState {
     },
     /// Being built, holding `locks`.
     Building { locks: Locks },
-    /// Built, last reported in use at `touched`, referencing `locks`.
+    /// Built, last reported in use at `touched`, referencing `locks`. Once `shed` its table
+    /// entry is empty, so no copy takes it up, and it goes like any cut no frame uses.
     Built {
         cut: FineCut,
         touched: u64,
         locks: Locks,
+        shed: bool,
     },
     /// Its build failed, or a page of it failed to load; not built again while mounted.
     Failed,
@@ -515,6 +532,8 @@ pub(crate) struct Streaming {
     fine: BTreeMap<(MountId, u32), MeshFine>,
     /// Bytes of mesh pages they hold locked.
     fine_locked: u64,
+    /// Of `fine_locked`, the bytes of the built cuts shed for room that have yet to go.
+    fine_shed: u64,
     /// What the latest sample since the last step found each class wants.
     demand: Option<[Demand; ResidencyClass::ALL.len()]>,
     /// Finer cuts freed once the frame has completed.
@@ -526,10 +545,17 @@ pub(crate) struct Streaming {
     page_blocks: BlockUnits,
     unit_blocks: BlockUnits,
     tile_blocks: BlockUnits,
-    /// The copies of the units and tiles this step moved, until the frame takes them.
-    moves: Moves,
-    /// The tiles the last step started moving.
+    /// The copies of the units and tiles the steps moved, a step's after those of the steps
+    /// before, until a frame whose list carries them is submitted; and the frame carrying them.
+    moves: Vec<Moves>,
+    moves_frame: Option<u64>,
+    /// The tiles a step started moving and no step has bound yet.
     tile_moves: Option<TileMoves>,
+    /// The tiles bound to new slots whose copy back is in `moves`.
+    tile_finished: FxHashSet<Key>,
+    /// A test holds the binds of moving tiles back, as a busy loading thread does.
+    #[cfg(feature = "testing")]
+    tile_binds_held: bool,
     /// Whether the render queue takes the sparse binds that move tiles.
     moves_tiles: bool,
     /// The slots moved tiles left and the scratch their texels crossed, freed once the frame
@@ -663,6 +689,7 @@ impl Streaming {
             ))),
             fine: BTreeMap::new(),
             fine_locked: 0,
+            fine_shed: 0,
             demand: None,
             governed: {
                 let report = device.memory_report();
@@ -677,8 +704,12 @@ impl Streaming {
             page_blocks: BlockUnits::default(),
             unit_blocks: BlockUnits::default(),
             tile_blocks: BlockUnits::default(),
-            moves: Moves::default(),
+            moves: Vec::new(),
+            moves_frame: None,
             tile_moves: None,
+            tile_finished: FxHashSet::default(),
+            #[cfg(feature = "testing")]
+            tile_binds_held: false,
             moves_tiles: device.binds_sparse_on(QueueKind::Render),
             retired_tile_slots: Vec::new(),
             retired_scratch: Vec::new(),
@@ -914,8 +945,13 @@ impl Streaming {
                         continue;
                     }
                     FineState::Building { locks } => locks,
-                    FineState::Built { cut, locks, .. } => {
+                    FineState::Built {
+                        cut, locks, shed, ..
+                    } => {
                         self.retired_cuts.push((frame, cut));
+                        if shed {
+                            self.fine_shed -= locks.bytes;
+                        }
                         locks
                     }
                 };
@@ -923,6 +959,7 @@ impl Streaming {
             }
         }
         self.residency.forget_failed_cuts(failed);
+
         let gone: Vec<Key> = self
             .resident
             .keys()
@@ -955,13 +992,14 @@ impl Streaming {
         // above cover, and the slots they would have taken return unused.
         if let Some(moves) = &mut self.tile_moves {
             let mut tiles = self.tiles.lock().unwrap();
-            moves.tiles.retain(|&(k, to)| {
-                if k.mount == mount {
-                    tiles.free(to);
+            moves.tiles.retain(|t| {
+                if t.key.mount == mount {
+                    tiles.free(t.to);
                 }
-                k.mount != mount
+                t.key.mount != mount
             });
         }
+        self.tile_finished.retain(|k| k.mount != mount);
         self.unbinding.retain(|k| k.mount != mount);
         self.moving.retain(|k, _| k.mount != mount);
         self.fragmented.retain(|k, _| k.0 != mount);
@@ -1193,7 +1231,10 @@ impl Streaming {
                 *error = if *wanted == frame { error.max(e) } else { e };
                 *wanted = frame;
             }
-            (Some(FineState::Built { touched, .. }), _) => *touched = frame,
+            // A shed cut stays while an instance still traces it, not for being wanted.
+            (Some(FineState::Built { touched, shed, .. }), _) if !*shed || request.is_none() => {
+                *touched = frame;
+            }
             _ => {}
         }
     }
@@ -1241,6 +1282,7 @@ impl Streaming {
                 continue;
             };
             let slot = batch.slot as usize;
+
             let at = f.init.table.offset(u64::from(batch.slot));
             let FineState::Building { locks } =
                 std::mem::replace(&mut f.slots[slot], FineState::EMPTY)
@@ -1266,7 +1308,7 @@ impl Streaming {
                     let m = &self.mounts[&batch.mount];
                     for &p in &locks.pages {
                         let unit = m.mesh_pages[batch.mesh as usize][p as usize];
-                        self.residency.unlock(Key {
+                        self.residency.unlock_while_used(Key {
                             mount: batch.mount,
                             unit,
                         });
@@ -1280,6 +1322,7 @@ impl Streaming {
                 cut,
                 touched: frame,
                 locks,
+                shed: false,
             };
         }
         let budget = self
@@ -1302,11 +1345,15 @@ impl Streaming {
                     FineState::Built { touched, .. }
                         if *touched + HOLD_FRAMES < frame && *touched < settled =>
                     {
-                        let FineState::Built { cut, locks, .. } =
-                            std::mem::replace(&mut f.slots[k], FineState::EMPTY)
+                        let FineState::Built {
+                            cut, locks, shed, ..
+                        } = std::mem::replace(&mut f.slots[k], FineState::EMPTY)
                         else {
                             unreachable!("matched above")
                         };
+                        if shed {
+                            self.fine_shed -= locks.bytes;
+                        }
                         let empty = RtCutGpu {
                             error: t,
                             row,
@@ -1315,7 +1362,7 @@ impl Streaming {
                         w.put(f.init.table.offset(k as u64), &[empty])?;
                         self.retired_cuts.push((frame - 1, cut));
                         for &p in &locks.pages {
-                            self.residency.unlock(unit(p));
+                            self.residency.unlock_while_used(unit(p));
                         }
                         self.fine_locked -= locks.bytes;
                     }
@@ -1359,9 +1406,16 @@ impl Streaming {
                 }
             }
         });
-        if let Some(demand) = self.demand.take() {
+        let demand = self.demand.take();
+        let shed = match demand {
+            Some(d) => self.shed_cuts(d[ResidencyClass::MeshPages as usize], budget, w)?,
+            None => false,
+        };
+        if let Some(demand) = demand.filter(|_| !shed) {
             let room = (budget as f64 * LOW) as u64;
-            let demand = demand[ResidencyClass::MeshPages as usize].bytes;
+            // What the frame wants with the pages the built cuts hold beside it.
+            let demand = &demand[ResidencyClass::MeshPages as usize];
+            let demand = demand.bytes + demand.held;
             wanted_cuts.sort_by(|a, b| {
                 b.0.total_cmp(&a.0)
                     .then((a.1, a.2, a.3).cmp(&(b.1, b.2, b.3)))
@@ -1392,6 +1446,53 @@ impl Streaming {
             self.build_admitted(mount, mesh, k, budget, frame, loading);
         }
         Ok(points)
+    }
+
+    /// Sheds built cuts while what the sample's frame wanted, `demand`, does not fit the mesh
+    /// page `budget` beside the pages the cuts hold, or the cuts hold more than their half of
+    /// it: the traversal's pages come first. The cuts holding the most go first. A shed cut's
+    /// table entry is emptied, so copies trace a coarser cut, and the cut goes with its locks
+    /// once no frame has used it for its hold. Returns whether any was shed.
+    fn shed_cuts(&mut self, demand: Demand, budget: u64, w: &mut Apply<'_>) -> Result<bool> {
+        // A page two cuts hold counts in both cuts' bytes, so the cuts already shed can count
+        // for more than the pages they hold.
+        let over = (demand.bytes + demand.held).saturating_sub(self.fine_shed);
+        let locked = self.fine_locked - self.fine_shed;
+        if over <= budget && locked <= budget / 2 {
+            return Ok(false);
+        }
+        let mut built: Vec<(u64, MountId, u32, usize)> = Vec::new();
+        for (&(mount, mesh), f) in &self.fine {
+            for (k, slot) in f.slots.iter().enumerate() {
+                if let FineState::Built {
+                    shed: false, locks, ..
+                } = slot
+                {
+                    built.push((locks.bytes, mount, mesh, k));
+                }
+            }
+        }
+        built.sort_unstable_by(|a, b| b.0.cmp(&a.0).then((a.1, a.2, a.3).cmp(&(b.1, b.2, b.3))));
+        let mut gone = 0;
+        for &(bytes, mount, mesh, k) in &built {
+            if over.saturating_sub(gone) <= budget && locked - gone <= budget / 2 {
+                break;
+            }
+            let f = self.fine.get_mut(&(mount, mesh)).expect("listed");
+            let CutRow { threshold, row } = f.init.cuts[k];
+            let empty = RtCutGpu {
+                error: threshold,
+                row,
+                ..bytemuck::Zeroable::zeroed()
+            };
+            w.put(f.init.table.offset(k as u64), &[empty])?;
+            if let FineState::Built { shed, .. } = &mut f.slots[k] {
+                *shed = true;
+            }
+            gone += bytes;
+        }
+        self.fine_shed += gone;
+        Ok(gone > 0)
     }
 
     /// The keys of the pages finer cut `k` of mesh `mesh` of `mount` is built from, and the
@@ -1506,9 +1607,10 @@ impl Streaming {
             return;
         }
         for &q in &pages {
-            self.residency.lock(unit(q));
+            self.residency.lock_while_used(unit(q));
         }
         self.fine_locked += bytes;
+
         f.slots[k] = FineState::Building {
             locks: Locks { pages, bytes },
         };
@@ -1662,11 +1764,11 @@ impl Streaming {
         frame: u64,
         settled: u64,
         pressure: bool,
+        output: Option<TimelinePoint>,
         loading: &Arc<Loading>,
         w: &mut Apply<'_>,
     ) -> Result<Vec<TimelinePoint>> {
-        let mut points = Vec::new();
-        points.extend(self.finish_tile_moves(frame, w.device)?);
+        let mut points = self.finish_tile_moves(frame, output, w.device)?;
         for mut batch in loading.take_streams(w.device) {
             points.extend(batch.points);
             self.carried.append(&mut batch.unbinds);
@@ -1992,40 +2094,63 @@ impl Streaming {
                 };
                 self.unbinding.insert(k);
                 self.tile_blocks.remove(slot.block, k);
-                self.tiles.lock().unwrap().retire(slot);
-                self.retired_tiles.push((frame - 1, free));
+                let mut pool = self.tiles.lock().unwrap();
+                pool.retire(slot);
+                // A tile leaving mid-move stays bound to `slot`.
+                if let Some(moves) = &mut self.tile_moves
+                    && let Some(i) = moves.tiles.iter().position(|t| t.key == k)
+                {
+                    pool.free(moves.tiles.swap_remove(i).to);
+                }
+                // This frame's list may still copy the texels of a tile just bound back in.
+                let last_use = if self.tile_finished.contains(&k) {
+                    frame
+                } else {
+                    frame - 1
+                };
+                self.retired_tiles.push((last_use, free));
             }
         }
         Ok(())
     }
 
-    /// Binds the tiles the last step started moving to their new slots, on the render queue
-    /// after that step's frame, whose list copied their texels out, and has this frame copy
-    /// them back in. Their old slots return once this frame has completed. While the loading
-    /// thread is binding, the moves wait for the next step. Returns the bind's point.
-    fn finish_tile_moves(&mut self, frame: u64, device: &Device) -> Result<Option<TimelinePoint>> {
-        let Some(moves) = &self.tile_moves else {
-            return Ok(None);
+    /// Binds the tiles a step started moving to their new slots, on the render queue after the
+    /// submitted frame whose list copied their texels out and after `output`, the work of
+    /// that frame on another queue, and queues the copies of their texels back in. Their old
+    /// slots return once this frame has completed. The moves wait for a later step while no
+    /// submitted list has copied them out, or while the loading thread is binding. Returns the
+    /// points this frame's work waits for.
+    fn finish_tile_moves(
+        &mut self,
+        frame: u64,
+        output: Option<TimelinePoint>,
+        device: &Device,
+    ) -> Result<Vec<TimelinePoint>> {
+        let mut points = Vec::new();
+        #[cfg(feature = "testing")]
+        if self.tile_binds_held {
+            return Ok(points);
+        }
+        let Some(moves) = self.tile_moves.as_ref().filter(|m| m.copied) else {
+            return Ok(points);
         };
         let mut per_texture: Vec<(Arc<TexStream>, TileSlots)> = Vec::new();
-        for &(k, to) in &moves.tiles {
+        for t in &moves.tiles {
             let m = self
                 .mounts
-                .get_mut(&k.mount)
+                .get_mut(&t.key.mount)
                 .expect("a moving tile's mount");
-            let (t, tile) = m.tile(k.unit);
+            let (texture, tile) = m.tile(t.key.unit);
             match per_texture
                 .iter_mut()
-                .find(|(s, _)| Arc::ptr_eq(s, &t.stream))
+                .find(|(s, _)| Arc::ptr_eq(s, &texture.stream))
             {
-                Some((_, list)) => list.push((tile, to)),
-                None => per_texture.push((Arc::clone(&t.stream), vec![(tile, to)])),
+                Some((_, list)) => list.push((tile, t.to)),
+                None => per_texture.push((Arc::clone(&texture.stream), vec![(tile, t.to)])),
             }
         }
         let mut pool = self.tiles.lock().unwrap();
-        let point = if per_texture.is_empty() {
-            None
-        } else {
+        if !per_texture.is_empty() {
             let lists: Vec<(&TexStream, Vec<TileBind<'_>>)> = per_texture
                 .iter()
                 .map(|(s, list)| {
@@ -2048,96 +2173,115 @@ impl Streaming {
             for (s, list) in &lists {
                 binds.tiles(&s.texture, list)?;
             }
+            let render = device.queue(QueueKind::Render).expect("render queue");
+            // A bind follows the work submitted to its queue before it and nothing else, so
+            // the other queue's work goes ahead of it through a list that waits for it.
+            if let Some(output) = output.filter(|&p| !device.is_complete(p)) {
+                points.push(render.submit(vec![render.command_list()?], &[output])?);
+            }
             let Some(point) = device.try_bind_sparse_on(QueueKind::Render, &binds)? else {
-                return Ok(None);
+                return Ok(points);
             };
-            Some(point)
-        };
-        let TileMoves { scratch, tiles } = self.tile_moves.take().expect("checked above");
+            points.push(point);
+        }
+        let TileMoves { scratch, tiles, .. } = self.tile_moves.take().expect("checked above");
         let base = scratch.gpu().address().0;
         self.retired_scratch.push((frame, scratch));
-        for (i, &(k, to)) in tiles.iter().enumerate() {
+        let mut copies = Moves::default();
+        for t in tiles {
             let m = self
                 .mounts
-                .get_mut(&k.mount)
+                .get_mut(&t.key.mount)
                 .expect("a moving tile's mount");
-            let (t, tile) = m.tile(k.unit);
-            self.moves.tiles.push(TileCopy {
-                stream: Arc::clone(&t.stream),
+            let (texture, tile) = m.tile(t.key.unit);
+            copies.tiles.push(TileCopy {
+                stream: Arc::clone(&texture.stream),
                 tile,
-                at: base + i as u64 * orr_pack::texture::TILE_BYTES as u64,
+                at: base + t.at,
                 out: false,
             });
-            let Some(Placed::Tile(from)) = self.resident.insert(k, Placed::Tile(to)) else {
-                unreachable!("a moving tile is resident")
+            let Some(Placed::Tile(from)) = self.resident.insert(t.key, Placed::Tile(t.to)) else {
+                unreachable!("an evicted tile leaves its move")
             };
-            self.tile_blocks.remove(from.block, k);
-            self.tile_blocks.insert(to.block, k);
+            self.tile_blocks.remove(from.block, t.key);
+            self.tile_blocks.insert(t.to.block, t.key);
+            self.tile_finished.insert(t.key);
             pool.retire(from);
             self.retired_tile_slots.push((frame, from));
         }
-        Ok(point)
+        self.moves.push(copies);
+        Ok(points)
     }
+
     /// Starts moving resident tiles out of the tile pool's draining blocks, [`DRAIN_TILES`] at
-    /// most: each takes a slot in a block that is not draining, and this frame copies its
-    /// texels to scratch memory. The next step's [`Self::finish_tile_moves`] binds them there.
+    /// most: each takes a slot in a block that is not draining, and a frame copies its texels
+    /// to scratch memory. [`Self::finish_tile_moves`] binds them there. Without memory for
+    /// the scratch no tile moves, and the budgets hear of it.
     fn start_tile_moves(&mut self, device: &Device) -> Result<()> {
         if self.tile_moves.is_some() {
             return Ok(());
         }
         let tile_bytes = orr_pack::texture::TILE_BYTES as u64;
         let mut pool = self.tiles.lock().unwrap();
-        let mut tiles: Vec<(Key, PoolSlot)> = Vec::new();
+        let mut tiles: Vec<TileMove> = Vec::new();
         'blocks: for &block in pool.draining().to_vec().iter() {
             let Some(keys) = self.tile_blocks.0.get(block as usize) else {
                 continue;
             };
-            for &k in keys {
+            // A tile whose copy back is still queued moves again once that has run.
+            for &key in keys.iter().filter(|k| !self.tile_finished.contains(k)) {
                 if tiles.len() == DRAIN_TILES {
                     break 'blocks;
                 }
-                match pool.alloc_moved(tile_bytes, block) {
-                    Some((to, _)) => tiles.push((k, to)),
-                    None => continue 'blocks,
-                }
+                let Some((to, _)) = pool.alloc_moved(tile_bytes, block) else {
+                    continue 'blocks;
+                };
+                let at = tiles.len() as u64 * tile_bytes;
+                tiles.push(TileMove { key, to, at });
             }
         }
-        drop(pool);
         if tiles.is_empty() {
             return Ok(());
         }
-        let scratch = match device.gpu_malloc::<u8>(
-            MemoryKind::DeviceLocal,
-            tiles.len() as u64 * tile_bytes,
-            "tile moves",
-        ) {
+        let bytes = tiles.len() as u64 * tile_bytes;
+        let scratch = match device.gpu_malloc::<u8>(MemoryKind::DeviceLocal, bytes, "tile moves") {
             Ok(s) => s,
             Err(e) => {
-                let mut pool = self.tiles.lock().unwrap();
-                for (_, to) in tiles {
-                    pool.free(to);
+                for t in tiles {
+                    pool.free(t.to);
                 }
-                return Err(e.into());
+                let e = Error::from(e);
+                if !e.is_out_of_memory() {
+                    return Err(e);
+                }
+                self.residency.out_of_memory(governs(&self.governed, &e));
+                return Ok(());
             }
         };
+        drop(pool);
         let base = scratch.gpu().address().0;
-        for (i, &(k, _)) in tiles.iter().enumerate() {
+        let mut copies = Moves::default();
+        for t in &tiles {
             let m = self
                 .mounts
-                .get_mut(&k.mount)
+                .get_mut(&t.key.mount)
                 .expect("a resident tile's mount");
-            let (t, tile) = m.tile(k.unit);
-            self.moves.tiles.push(TileCopy {
-                stream: Arc::clone(&t.stream),
+            let (texture, tile) = m.tile(t.key.unit);
+            copies.tiles.push(TileCopy {
+                stream: Arc::clone(&texture.stream),
                 tile,
-                at: base + i as u64 * tile_bytes,
+                at: base + t.at,
                 out: true,
             });
         }
-        self.tile_moves = Some(TileMoves { scratch, tiles });
+        self.moves.push(copies);
+        self.tile_moves = Some(TileMoves {
+            scratch,
+            tiles,
+            copied: false,
+        });
         Ok(())
     }
-
     /// Takes mesh page `k` out of stream pool slot `slot`, which returns once `frame` has
     /// completed.
     fn retire_page(&mut self, k: Key, slot: PoolSlot, frame: u64) {
@@ -2160,6 +2304,7 @@ impl Streaming {
     /// its old slot returns once this frame, whose copy reads it, has completed. A block one of
     /// whose units finds no room stops draining.
     fn drain(&mut self, frame: u64, w: &mut Apply<'_>) -> Result<()> {
+        let mut units = Vec::new();
         for pages in [true, false] {
             let pool = Arc::clone(if pages { &self.pool } else { &self.units });
             let blocks = pool.lock().unwrap().draining().to_vec();
@@ -2186,14 +2331,19 @@ impl Streaming {
                     };
                     let Some((to, at)) = to else { break };
                     moved += bytes;
-                    self.move_unit(k, to, at.gpu(), bytes, frame, w)?;
+                    units.push(self.move_unit(k, to, at.gpu(), bytes, frame, w)?);
                 }
             }
+        }
+        if !units.is_empty() {
+            let tiles = Vec::new();
+            self.moves.push(Moves { units, tiles });
         }
         Ok(())
     }
 
-    /// Moves resident mesh page or pool unit `k` to slot `to` at address `at`.
+    /// Moves resident mesh page or pool unit `k` to slot `to` at address `at`; returns the
+    /// copy that takes it there.
     fn move_unit(
         &mut self,
         k: Key,
@@ -2202,26 +2352,18 @@ impl Streaming {
         bytes: u64,
         frame: u64,
         w: &mut Apply<'_>,
-    ) -> Result<()> {
-        match self.resident.remove(&k).expect("a resident unit") {
+    ) -> Result<UnitMove> {
+        let src = match self.resident.remove(&k).expect("a resident unit") {
             Placed::Pool(slot, target) => {
                 let from = self.units.lock().unwrap().address(slot);
-                self.moves.units.push(UnitMove {
-                    dst: at,
-                    src: from,
-                    bytes,
-                });
                 self.point_target(target, at, w)?;
                 self.retire_unit(k, slot, frame);
                 self.unit_blocks.insert(to.block, k);
                 self.resident.insert(k, Placed::Pool(to, target));
+                from
             }
             Placed::MeshPage(mut p) => {
-                self.moves.units.push(UnitMove {
-                    dst: at,
-                    src: p.address,
-                    bytes,
-                });
+                let from = p.address;
                 let (table, refs, count) = p.entries();
                 w.put(table, &[at])?;
                 // Each cluster's entry names the page first; the rest of it stays.
@@ -2245,16 +2387,41 @@ impl Streaming {
                 p.address = at;
                 self.page_blocks.insert(to.block, k);
                 self.resident.insert(k, Placed::MeshPage(p));
+                from
             }
             Placed::Tile(_) => unreachable!("tiles are in their own pool"),
-        }
-        Ok(())
+        };
+        Ok(UnitMove {
+            dst: at,
+            src,
+            bytes,
+        })
     }
 
-    /// The copies of the units and tiles this step moved, which the frame runs before
-    /// anything reads the scenes' tables or samples a texture.
-    pub(crate) fn take_moves(&mut self) -> Moves {
-        std::mem::take(&mut self.moves)
+    #[cfg(feature = "testing")]
+    pub(crate) fn hold_tile_binds(&mut self, hold: bool) {
+        self.tile_binds_held = hold;
+    }
+
+    /// The copies of the units and tiles the steps moved that no submitted list has carried,
+    /// oldest step first, for frame `frame` to run before anything reads the scenes' tables or
+    /// samples a texture.
+    pub(crate) fn moves(&mut self, frame: u64) -> &[Moves] {
+        self.moves_frame = Some(frame);
+        &self.moves
+    }
+
+    /// Frame `frame` was submitted: the copies its list carried have their place in the
+    /// render queue's order.
+    pub(crate) fn submitted(&mut self, frame: u64) {
+        if self.moves_frame.take() != Some(frame) {
+            return;
+        }
+        self.moves.clear();
+        self.tile_finished.clear();
+        if let Some(moves) = &mut self.tile_moves {
+            moves.copied = true;
+        }
     }
 
     /// Moves the tiles of the textures that lost one and sit apart from the rest beside them:

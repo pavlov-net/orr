@@ -1313,6 +1313,102 @@ fn stream_in(
     }
 }
 
+/// Twelve mounts of the paged dome stream their node pages into three blocks of four. The
+/// mesh page budget then falls to three domes' worth while one dome of each block is asked
+/// for: the others' pages go, and the unit pool empties a block by moving its node page. A
+/// moved page's table entry names its new slot, which holds the cooked page.
+#[test]
+fn node_pages_move_out_of_draining_blocks_and_their_tables_follow() {
+    let _serial = serial();
+    let dev = device();
+    let gpu = Gpu(dev);
+    let bytes = paged_hierarchy();
+    let (info, nodes) = paged_dome();
+    let slot = (nodes[1].len() as u64).next_multiple_of(256);
+    let desc = RendererDesc {
+        budgets: Budgets {
+            mesh_resident_max: 0,
+            mesh_page_pool: PoolSize::Bytes(12 * dome_budget(&info, &nodes, dev)),
+            texture_pool: PoolSize::Bytes(64 << 20),
+            instance_page_pool: 1 << 20,
+            in_flight_bytes: 1 << 20,
+            stream_block: 4 * slot,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    };
+    let mut scenes = Scenes::new(dev, &desc).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let class = |scenes: &Scenes| *scenes.residency().class(ResidencyClass::MeshPages);
+    let models: Vec<ModelId> = (0..12)
+        .map(|_| {
+            let m = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
+            ready(&mut scenes, m);
+            scenes.model(m, AssetId::from_name("kit/dome")).unwrap()
+        })
+        .collect();
+    let pinned = class(&scenes).resident_bytes;
+    for &m in &models {
+        stream_in(&mut scenes, &gpu, m, &models, (&info, u64::MAX));
+    }
+    let unit_pool = |scenes: &Scenes| {
+        let memory = scenes.memory();
+        *memory
+            .pools
+            .iter()
+            .find(|p| p.name == "stream units")
+            .expect("the unit pool")
+    };
+    let full = unit_pool(&scenes);
+    // A device that allows few memory allocations takes larger blocks.
+    if (full.blocks, full.bytes) != (3, 12 * slot) {
+        return;
+    }
+    let before: Vec<u64> = models
+        .iter()
+        .map(|&m| tables(&scenes, &gpu, m).0[1])
+        .collect();
+    let streamed = (class(&scenes).resident_bytes - pinned) / 12;
+    let budget = pinned + 3 * streamed + streamed / 2;
+    scenes.lower_budget(ResidencyClass::MeshPages, budget);
+    let kept = [models[0], models[4], models[8]];
+    let start = Instant::now();
+    let (mut settled, mut drained) = (0, 0);
+    while settled < 8 {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the unit pool never settled: {:?}",
+            unit_pool(&scenes)
+        );
+        for &m in &kept {
+            scenes.prefetch(m, 0);
+        }
+        frame(&mut scenes);
+        for &m in &kept {
+            let (table, pages) = tables(&scenes, &gpu, m);
+            assert!(!pages.contains(&0), "a page that was asked for left");
+            assert_eq!(gpu.bytes(table[1], nodes[1].len()), nodes[1]);
+        }
+        let fill = unit_pool(&scenes);
+        drained = drained.max(fill.draining);
+        let idle = class(&scenes).resident_bytes <= budget && fill.draining == 0;
+        settled = if idle && fill.retired == 0 {
+            settled + 1
+        } else {
+            0
+        };
+    }
+    let fill = unit_pool(&scenes);
+    assert!(drained > 0, "no block drained: {fill:?}");
+    assert!(fill.blocks < 3, "{fill:?}");
+    let moved = [0, 4, 8]
+        .iter()
+        .filter(|&&i| tables(&scenes, &gpu, models[i]).0[1] != before[i])
+        .count();
+    assert!(moved > 0, "no node page moved");
+    assert_eq!(scenes.residency().failed, 0);
+    assert_clean();
+}
 #[test]
 fn hierarchy_pages_stream_with_the_pages_below_them_and_leave_after_them() {
     let _serial = serial();
@@ -4297,92 +4393,168 @@ fn tiles_apart_from_their_textures_others_move_beside_them_and_stay_exact() {
     assert_clean();
 }
 
-/// The cube's tiles load a coarse tile then the four fine ones under it, layer after layer, in
-/// blocks of four. The texture budget then falls to the coarse tiles: the fine ones go and leave
-/// each block one tile, and the pool empties half of the blocks into the others. The moved
-/// tiles are bound to their new slots between frames: they never leave the residency map,
-/// nothing is read again, and every frame's texels are the cooked ones.
-#[test]
-fn tiles_move_out_of_draining_blocks_bound_and_exact_at_every_frame() {
-    let _serial = serial();
-    const CUBE: usize = 2;
-    let bytes = tiled_pack();
-    let dev = device();
-    if !dev.binds_sparse_on(QueueKind::Render) {
-        return;
+const CUBE: usize = 2;
+/// Tiles of the coarser streamed mip of the flat texture and of the cube.
+const COARSE_TILES: u64 = 6;
+
+/// Scenes over one mount of the tiled pack per entry of `kinds`, each with its `TILED` texture
+/// of that index loaded whole, a coarse tile then the fine ones under it, in blocks of four
+/// tiles.
+struct Tiled {
+    scenes: Scenes,
+    _workers: Workers,
+    mounts: Vec<MountId>,
+    kinds: Vec<usize>,
+    textures: Vec<TextureIndex>,
+    /// Bytes of a tile, and of one mount's mip tails.
+    tile: u64,
+    tails: u64,
+}
+
+impl Tiled {
+    fn new(dev: &Device, kinds: &[usize]) -> Self {
+        let bytes = tiled_pack();
+        let tile = orr_pack::texture::TILE_BYTES as u64;
+        let layouts: Vec<(u64, u64)> = (0..TILED.len()).map(|t| tiled_layout(dev, t)).collect();
+        let tails = layouts.iter().map(|l| l.1).sum::<u64>();
+        let tiles: u64 = kinds.iter().map(|&k| layouts[k].0).sum();
+        let desc = RendererDesc {
+            budgets: Budgets {
+                texture_pool: PoolSize::Bytes(kinds.len() as u64 * tails + tiles * tile),
+                mesh_page_pool: PoolSize::Bytes(16 << 20),
+                instance_page_pool: 16 << 20,
+                in_flight_bytes: 16 << 20,
+                stream_block: 4 * tile,
+                ..Budgets::default()
+            },
+            ..RendererDesc::default()
+        };
+        let mut scenes = Scenes::new(dev, &desc).unwrap();
+        let workers = Workers::start(&scenes, 2);
+        let mut mounts = Vec::new();
+        let mut textures = Vec::new();
+        for &kind in kinds {
+            let m = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
+            ready(&mut scenes, m);
+            stream_tiles(&mut scenes, m, &[kind], u64::MAX);
+            assert_tiled(&scenes, dev, m, kind, 0..9);
+            let name = AssetId::from_name(TILED[kind].0);
+            textures.push(scenes.texture(m, name).unwrap());
+            mounts.push(m);
+        }
+        Self {
+            scenes,
+            _workers: workers,
+            mounts,
+            kinds: kinds.to_vec(),
+            textures,
+            tile,
+            tails,
+        }
     }
-    let gpu = Gpu(dev);
-    let tile = orr_pack::texture::TILE_BYTES as u64;
-    let layouts: Vec<(u64, u64)> = (0..TILED.len()).map(|t| tiled_layout(dev, t)).collect();
-    let tails: u64 = layouts.iter().map(|l| l.1).sum();
-    let layers = u64::from(TILED[CUBE].3);
-    assert_eq!(
-        layouts[CUBE].0,
-        5 * layers,
-        "four fine tiles under a coarse one"
-    );
-    let desc = RendererDesc {
-        budgets: Budgets {
-            texture_pool: PoolSize::Bytes(tails + layouts[CUBE].0 * tile),
-            mesh_page_pool: PoolSize::Bytes(16 << 20),
-            instance_page_pool: 16 << 20,
-            in_flight_bytes: 16 << 20,
-            stream_block: 4 * tile,
-            ..Budgets::default()
-        },
-        ..RendererDesc::default()
-    };
-    let mut scenes = Scenes::new(dev, &desc).unwrap();
-    let _workers = Workers::start(&scenes, 2);
-    let m = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
-    ready(&mut scenes, m);
-    let cube = scenes
-        .texture(m, AssetId::from_name(TILED[CUBE].0))
-        .unwrap();
-    let tile_pool = |scenes: &Scenes| {
-        let memory = scenes.memory();
+    fn pool(&self) -> orr_scene::PoolFill {
+        let memory = self.scenes.memory();
         *memory
             .pools
             .iter()
             .find(|p| p.name == "texture tile pool")
             .expect("the tile pool")
-    };
-    stream_tiles(&mut scenes, m, &[CUBE], u64::MAX);
-    assert_tiled(&scenes, dev, m, CUBE, 0..9);
-    let full = tile_pool(&scenes);
-    assert_eq!((full.used, full.bytes), (30 * tile, 32 * tile), "{full:?}");
-    let read = scenes.residency().bytes_read;
-
-    scenes.lower_budget(ResidencyClass::Textures, tails + layers * tile);
-    let start = Instant::now();
-    let (mut settled, mut drained) = (0, 0);
-    while settled < 8 {
-        assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "the tile pool never settled: {:?}",
-            tile_pool(&scenes)
-        );
-        scenes.prefetch_texture(m, cube, 1);
-        frame(&mut scenes);
-        assert_tiled(&scenes, dev, m, CUBE, 1..9);
-        let map = residency_map(&scenes, &gpu, cube);
-        assert!(
-            map.iter().all(|&mip| mip <= 1),
-            "a coarse tile left: {map:?}"
-        );
-        let fill = tile_pool(&scenes);
-        drained = drained.max(fill.draining);
-        let idle = fill.used == layers * tile && fill.draining == 0 && fill.retired == 0;
-        settled = if idle { settled + 1 } else { 0 };
     }
-    let fill = tile_pool(&scenes);
-    assert!(drained > 0, "no block drained: {fill:?}");
+
+    /// Lowers the texture budget to the mounts' coarse tiles: the fine ones go once they leave
+    /// their hold, and leave each block a tile.
+    fn keep_coarse(&mut self) {
+        let mounts = self.mounts.len() as u64;
+        let coarse = mounts * COARSE_TILES * self.tile;
+        self.scenes
+            .lower_budget(ResidencyClass::Textures, mounts * self.tails + coarse);
+    }
+
+    /// A frame that asks for the coarse tiles of the cubes of `mounts`.
+    fn frame(&mut self, mounts: &[usize]) {
+        for &i in mounts {
+            self.scenes
+                .prefetch_texture(self.mounts[i], self.textures[i], 1);
+        }
+        frame(&mut self.scenes);
+    }
+
+    /// Frames of `mounts`' coarse tiles, each checked exact, until the pool has drained and
+    /// rested for eight of them; returns the most it had draining.
+    fn drain(&mut self, dev: &Device, mounts: &[usize]) -> u64 {
+        let start = Instant::now();
+        let (mut settled, mut drained) = (0, 0);
+        while settled < 8 {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the tile pool never settled: {:?}",
+                self.pool()
+            );
+            self.frame(mounts);
+            for &i in mounts {
+                assert_tiled(&self.scenes, dev, self.mounts[i], self.kinds[i], 1..9);
+            }
+            let fill = self.pool();
+            drained = drained.max(fill.draining);
+            let coarse = mounts.len() as u64 * COARSE_TILES * self.tile;
+            let idle = fill.used == coarse && fill.draining == 0 && fill.retired == 0;
+            settled = if idle { settled + 1 } else { 0 };
+        }
+        drained
+    }
+
+    /// Frames of every cube's coarse tiles until a step has started moving tiles.
+    fn until_moving(&mut self) {
+        let all: Vec<usize> = (0..self.mounts.len()).collect();
+        let start = Instant::now();
+        while self.pool().draining == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "no block drained"
+            );
+            self.frame(&all);
+        }
+    }
+}
+
+/// The texture budget falls to the cube's coarse tiles: the fine ones go and leave each block
+/// one tile, and the pool empties half of the blocks into the others. The moved tiles are
+/// bound to their new slots between frames: they never leave the residency map, nothing is
+/// read again, and every frame's texels are the cooked ones.
+#[test]
+fn tiles_move_out_of_draining_blocks_bound_and_exact_at_every_frame() {
+    let _serial = serial();
+    let dev = device();
+    if !dev.binds_sparse_on(QueueKind::Render) {
+        return;
+    }
+    let gpu = Gpu(dev);
+    let mut c = Tiled::new(dev, &[CUBE]);
+    let full = c.pool();
+    assert_eq!(
+        (full.used, full.bytes),
+        (30 * c.tile, 32 * c.tile),
+        "{full:?}"
+    );
+    let read = c.scenes.residency().bytes_read;
+    c.keep_coarse();
+    assert!(c.drain(dev, &[0]) > 0, "no block drained");
+    let map = residency_map(&c.scenes, &gpu, c.textures[0]);
     assert!(
-        fill.bytes <= 12 * tile,
+        map.iter().all(|&mip| mip == 1),
+        "a coarse tile left: {map:?}"
+    );
+    let fill = c.pool();
+    assert!(
+        fill.bytes <= 12 * c.tile,
         "at most a block past what six tiles need: {fill:?}"
     );
-    assert_eq!(scenes.residency().bytes_read, read, "a tile was read again");
-    assert_eq!(scenes.residency().failed, 0);
+    assert_eq!(
+        c.scenes.residency().bytes_read,
+        read,
+        "a tile was read again"
+    );
+    assert_eq!(c.scenes.residency().failed, 0);
     assert_eq!(
         dev.validation_messages(),
         0,
@@ -4391,6 +4563,123 @@ fn tiles_move_out_of_draining_blocks_bound_and_exact_at_every_frame() {
     assert_clean();
 }
 
+/// Three packs' fine tiles go in one step, and the blocks of the first two drain into the
+/// third's. The first pack is unmounted while its tiles and the second's move in one batch:
+/// the second's take the texels copied out of them, not those of the tiles that left.
+#[test]
+fn a_pack_unmounted_while_tiles_move_leaves_the_other_packs_texels() {
+    let _serial = serial();
+    let dev = device();
+    if !dev.binds_sparse_on(QueueKind::Render) {
+        return;
+    }
+    let mut c = Tiled::new(dev, &[0, CUBE, CUBE]);
+    // Every tile leaves its hold at one frame.
+    for i in 0..3 {
+        c.scenes.prefetch_texture(c.mounts[i], c.textures[i], 0);
+    }
+    frame(&mut c.scenes);
+    c.keep_coarse();
+    c.until_moving();
+    c.scenes.unmount(c.mounts[0]);
+    let kept = 2 * (c.tails + COARSE_TILES * c.tile);
+    c.scenes.lower_budget(ResidencyClass::Textures, kept);
+    c.drain(dev, &[1, 2]);
+    assert_eq!(c.scenes.residency().failed, 0);
+    assert_eq!(
+        dev.validation_messages(),
+        0,
+        "validation messages (see the log)"
+    );
+    assert_clean();
+}
+
+/// Frames begun and never submitted while tiles move: the copies their lists would have run
+/// wait for the next frame that is, and the tiles keep the cooked texels.
+#[test]
+fn frames_dropped_while_tiles_move_leave_their_copies_to_the_next() {
+    let _serial = serial();
+    let dev = device();
+    if !dev.binds_sparse_on(QueueKind::Render) {
+        return;
+    }
+    let mut c = Tiled::new(dev, &[CUBE]);
+    c.keep_coarse();
+    c.until_moving();
+    for _ in 0..3 {
+        c.scenes.prefetch_texture(c.mounts[0], c.textures[0], 1);
+        let dropped = c
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: FrameTime::default(),
+                scenes: &[],
+                low_latency: None,
+            })
+            .unwrap();
+        drop(dropped);
+        c.frame(&[0]);
+        assert_tiled(&c.scenes, dev, c.mounts[0], CUBE, 1..9);
+    }
+    c.drain(dev, &[0]);
+    assert_eq!(c.scenes.residency().failed, 0);
+    assert_eq!(
+        dev.validation_messages(),
+        0,
+        "validation messages (see the log)"
+    );
+    assert_clean();
+}
+
+/// Moving tiles are evicted while their bind waits: they leave their move, stay bound where
+/// they were until their eviction unbinds them, and the slots they would have taken return.
+#[test]
+fn moving_tiles_evicted_while_their_bind_waits_leave_their_move() {
+    let _serial = serial();
+    let dev = device();
+    if !dev.binds_sparse_on(QueueKind::Render) {
+        return;
+    }
+    let mut c = Tiled::new(dev, &[CUBE]);
+    c.keep_coarse();
+    c.until_moving();
+    c.scenes.hold_tile_binds(true);
+    c.scenes.lower_budget(ResidencyClass::Textures, c.tails);
+    let start = Instant::now();
+    while c
+        .scenes
+        .residency()
+        .class(ResidencyClass::Textures)
+        .resident_bytes
+        > c.tails
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the tiles stayed"
+        );
+        frame(&mut c.scenes);
+    }
+    c.scenes.hold_tile_binds(false);
+    let start = Instant::now();
+    loop {
+        frame(&mut c.scenes);
+        let fill = c.pool();
+        if fill.blocks == 0 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "slots stayed taken: {fill:?}"
+        );
+    }
+    assert_tiled(&c.scenes, dev, c.mounts[0], CUBE, 2..9);
+    assert_eq!(c.scenes.residency().failed, 0);
+    assert_eq!(
+        dev.validation_messages(),
+        0,
+        "validation messages (see the log)"
+    );
+    assert_clean();
+}
 /// The neural pack's set: color mip 0 size, the latents' mip 0 size and layers.
 const NEURAL_SIZE: [u32; 2] = [1024, 512];
 const LATENT_SIZE: [u32; 2] = [512, 256];

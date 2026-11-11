@@ -68,6 +68,10 @@ impl Detail {
     }
 
     pub(crate) fn step(&mut self, s: Sample) {
+        // A pool of no bytes holds nothing at any scale, so its samples steer none.
+        if s.capacity == 0 {
+            return;
+        }
         if self.held > 0 {
             self.held -= 1;
         } else {
@@ -294,6 +298,49 @@ mod tests {
         assert_eq!(d.scale(), 1.0);
     }
 
+    /// A pool cut to a third under pages that finer cuts hold: a sample counts those pages
+    /// while its frame used the cuts, under scale 3 here, however long they then take to leave
+    /// the pool. Each step is its own sample's, so the scale rises to what fits, by the first
+    /// sample's step at most, and does not come back down.
+    #[test]
+    fn a_capacity_cut_under_pages_held_while_used_moves_the_scale_to_what_fits() {
+        let c = CAPACITY as f64;
+        for late in [1, 3, 6] {
+            let p = Plant {
+                fixed: 0.3 * c,
+                streamed: 6.0 * c,
+                exponent: 2.0,
+                cliff: (3.0, 2.0 * c),
+                late,
+                whole: false,
+            };
+            let mut d = Detail::new();
+            let frames = run(&mut d, &p, 400, &mut Vec::new());
+            assert_eq!(turns(&frames), 0, "late {late}");
+            let (scale, load) = *frames.last().unwrap();
+            assert!((LOW..=HIGH).contains(&load), "late {late}: load {load}");
+            let fits = (6.0 / (TARGET - 0.3)).sqrt() as f32;
+            let first = (8.3 / TARGET).sqrt() as f32;
+            assert!(scale <= fits.max(first), "late {late}: {scale}");
+            assert_eq!(frames[frames.len() - 100].0, scale, "late {late}: settled");
+        }
+    }
+
+    /// A pool of no bytes: its samples leave the scale where it is.
+    #[test]
+    fn samples_of_a_pool_of_no_bytes_leave_the_scale() {
+        let mut d = Detail::new();
+        for demand in [0, 1 << 20] {
+            d.step(Sample {
+                scale: 1.0,
+                demand,
+                capacity: 0,
+                sheddable: true,
+                whole: true,
+            });
+            assert_eq!(d.scale(), 1.0);
+        }
+    }
     #[test]
     fn a_step_of_demand_wider_than_the_band_is_found_and_held_above() {
         let c = CAPACITY as f64;
