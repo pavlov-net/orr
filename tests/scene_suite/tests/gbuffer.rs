@@ -28,7 +28,7 @@ use orr_gpu::{
     ComputePipeline, GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, ShaderModule, Stages,
     Texture, TextureRegion,
 };
-use orr_math::{Affine3, DMat4, DVec2, DVec3, DVec4, Mat3, Quat, UVec2, Vec2, Vec3, Vec4};
+use orr_math::{Affine3, DMat4, DQuat, DVec2, DVec3, DVec4, Mat3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_pack::clip::Clip;
 use orr_pack::instance::{InstanceRecord, MOTION_WINDOW_BYTES, MotionRow};
 use orr_pack::material::{Material, slot};
@@ -52,6 +52,7 @@ use orr_scene::{
 use orr_scene::{Budgets, InstancePageRef, PageId, PixelProbe, PoolSize, RequestSource};
 use scene_suite::shaders::{
     codec, fracture, grid, pose, skin_pose, surface_at, surface_params, trace, triangle_at,
+    triangle_point,
 };
 use scene_suite::{Workers, linked, pipeline};
 
@@ -11213,6 +11214,104 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         assert_eq!(material[0], shown as f32, "{size}");
         assert_eq!(material[1], f32::from(u8::from(first == 2)), "{size}");
     }
+    assert_clean();
+}
+
+/// The distance from `p` to the line from the origin along unit `d`.
+fn off_line(p: DVec3, d: DVec3) -> f64 {
+    (p - d * p.dot(d)).length()
+}
+
+/// A pixel ray that passes a needle the raster drew it for shows the needle's point nearest it,
+/// at weights inside the triangle where the plane's lie far outside it, so no attribute leaves
+/// its corners' range. A ray along a triangle's plane shows a point of the triangle where the
+/// plane gives none, and a ray that meets a triangle keeps the plane's point.
+#[test]
+fn a_pixel_ray_passing_its_triangle_shows_the_triangles_nearest_point() {
+    let _guard = serial();
+    let d = device();
+    let p = pipeline(&triangle_point::MODULE, "main");
+    let render = d.queue(QueueKind::Render).unwrap();
+    let run = |toward: DVec3, corner: DVec3, edges: [DVec3; 2]| {
+        let out = d
+            .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, 3, "out")
+            .unwrap();
+        let row = |v: DVec3| v.as_vec3().extend(0.0).to_array();
+        let record = triangle_point::Root {
+            out: out.gpu().cast(),
+            pad0: 0,
+            pad1: 0,
+            direction: row(toward.normalize()),
+            corner: row(corner),
+            edge1: row(edges[0]),
+            edge2: row(edges[1]),
+        };
+        let bytes = bytemuck::bytes_of(&record);
+        let mut root = d
+            .gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, "root")
+            .unwrap();
+        root.as_mut_slice().unwrap().copy_from_slice(bytes);
+        let mut list = render.command_list().unwrap();
+        list.dispatch(&p, root.gpu().cast::<triangle_point::Root>(), [1, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+        wait(render.submit(vec![list], &[]).unwrap());
+        let rows = out.as_slice().unwrap();
+        let v = |i: usize| Vec3::from_slice(&rows[i][..3]).as_dvec3();
+        (v(0), v(1), v(2))
+    };
+    // What the kernel reads, as it reads it.
+    let single = |v: DVec3| v.as_vec3().as_dvec3();
+    // The least distance from the line along `toward` to the triangle's edges.
+    let nearest = |toward: DVec3, corner: DVec3, edges: [DVec3; 2]| {
+        let d = single(toward.normalize());
+        let (q, [e1, e2]) = (single(corner), edges.map(single));
+        let sides = [(q, e1), (q, e2), (q + e1, e2 - e1)];
+        let steps = 200_000;
+        let along = (0..=steps).map(|i| f64::from(i) / f64::from(steps));
+        along
+            .flat_map(|u| sides.map(|(a, e)| off_line(a + e * u, d)))
+            .fold(f64::INFINITY, f64::min)
+    };
+    let turn = DQuat::from_axis_angle(DVec3::new(0.3, 0.5, 0.8).normalize(), 0.7);
+
+    // A needle 2 cm long and 0.3 um tall, 3 m away, and a ray 10 um under it.
+    let corner = turn * DVec3::new(-0.01, 0.0, -3.0);
+    let edges = [DVec3::new(0.02, 0.0, 0.0), DVec3::new(0.01, 3e-7, 0.0)].map(|e| turn * e);
+    let toward = turn * DVec3::new(0.002, -1e-5, -3.0);
+    let (b, at, plane) = run(toward, corner, edges);
+    assert!(plane.y < -10.0, "the plane's weights {plane:?}");
+    let weights = [1.0 - b.x - b.y, b.x, b.y];
+    assert!(
+        weights.iter().all(|w| (-1e-6..=1.0 + 1e-6).contains(w)),
+        "weights {weights:?}"
+    );
+    let [e1, e2] = edges.map(single);
+    let on_triangle = single(corner) + e1 * b.x + e2 * b.y;
+    assert!(at.distance(on_triangle) < 2e-6, "{at:?} for {b:?}");
+    let ray = single(toward.normalize());
+    let (off, least) = (off_line(at, ray), nearest(toward, corner, edges));
+    assert!(
+        off < least + 2e-6,
+        "{off:e} m off the ray, the nearest {least:e}"
+    );
+    assert!((b.z - at.dot(ray)).abs() < 1e-5, "distance {} m", b.z);
+
+    // A triangle seen along its plane, which holds the eye.
+    let corner = DVec3::new(-0.01, 0.0, -3.0);
+    let edges = [DVec3::new(0.02, 0.0, 0.0), DVec3::new(0.01, 0.0, -0.5)];
+    let (b, at, _) = run(DVec3::new(0.002, 0.0, -3.0), corner, edges);
+    assert!(b.truncate().distance(DVec2::new(0.6, 0.0)) < 1e-4, "{b:?}");
+    assert!(at.distance(DVec3::new(0.002, 0.0, -3.0)) < 1e-5, "{at:?}");
+    assert!((b.z - at.length()).abs() < 1e-5, "distance {} m", b.z);
+
+    // A ray that meets a triangle.
+    let corner = turn * DVec3::new(-1.0, -1.0, -3.0);
+    let edges = [DVec3::new(2.0, 0.0, 0.0), DVec3::new(0.0, 2.0, 0.5)].map(|e| turn * e);
+    let toward = turn * DVec3::new(-0.5, -0.2, -2.8);
+    let (b, at, plane) = run(toward, corner, edges);
+    assert_eq!(b, plane);
+    assert_eq!(at.as_vec3(), toward.normalize().as_vec3() * plane.z as f32);
+    assert!(b.truncate().distance(DVec2::new(0.25, 0.4)) < 1e-5, "{b:?}");
     assert_clean();
 }
 

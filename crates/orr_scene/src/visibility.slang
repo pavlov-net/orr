@@ -424,8 +424,9 @@ public float3 render_direction(ViewConstants* v, float3 d)
 }
 
 // Where the ray along `d` from the eye meets the plane of the triangle with eye-relative
-// corners `q`: the weights of corners 1 and 2 in xy, the distance along `d` in z.
-float3 ray_barycentrics(float3 d, float3 q0, float3 e1, float3 e2)
+// corner `q0` and edges `e1` and `e2`: the weights of corners 1 and 2 in xy, the distance along
+// `d` in z. Zeros, with `crosses` false, where the ray runs along the plane.
+float3 ray_barycentrics(float3 d, float3 q0, float3 e1, float3 e2, out bool crosses)
 {
     // At unit size, since the determinant multiplies two edge lengths.
     float size = unit_factor(max(abs(e1), abs(e2)));
@@ -433,17 +434,64 @@ float3 ray_barycentrics(float3 d, float3 q0, float3 e1, float3 e2)
     e2 *= size;
     float3 pv = cross(d, e2);
     float det = dot(e1, pv);
-    float inv = abs(det) > 1e-30 ? 1.0 / det : 0.0;
+    crosses = abs(det) > 1e-30;
+    float inv = crosses ? 1.0 / det : 0.0;
     float3 tv = -q0;
     float3 qv = cross(tv, e1);
     return float3(dot(tv, pv) * size, dot(d, qv) * size, dot(e2, qv)) * inv;
+}
+
+// The weights of corners 1 and 2 at the point of that triangle nearest the line from the eye
+// along unit `d`, a line that passes outside it: a point of one of its edges.
+float2 nearest_barycentrics(float3 d, float3 q0, float3 e1, float3 e2)
+{
+    // At unit size, since an edge's squared length divides.
+    float size = unit_factor(max(abs(e1), abs(e2)));
+    float3 from[3] = { q0, q0, q0 + e1 };
+    float3 along[3] = { e1 * size, e2 * size, (e2 - e1) * size };
+    float nearest = 0.0;
+    float2 b = float2(0.0);
+    for (uint k = 0; k < 3; k++)
+    {
+        // Across the line: a vector less its part along `d`.
+        float3 p = from[k] - d * dot(from[k], d);
+        float3 s = along[k] - d * dot(along[k], d);
+        float l = dot(s, s);
+        float u = l > 0.0 ? saturate(-dot(p, s) / l * size) : 0.0;
+        float3 across = p + s * (u / size);
+        float distance = dot(across, across);
+        if (k == 0 || distance < nearest)
+        {
+            nearest = distance;
+            b = k == 0 ? float2(u, 0.0) : k == 1 ? float2(0.0, u) : float2(1.0 - u, u);
+        }
+    }
+    return b;
+}
+
+// The point of the triangle with eye-relative corner `q0` and edges `e1` and `e2` that the ray
+// from the eye along unit `d` shows: the weights of corners 1 and 2 in xy and its distance along
+// `d` in z, the point in `at`, and in `plane` what `ray_barycentrics` gives. The raster draws
+// the pixels whose centers its snapped corners hold, so the ray through one can pass outside
+// the triangle, far outside in weights where the triangle is thin; it shows the triangle's
+// point nearest it.
+public float3 triangle_point(float3 d, float3 q0, float3 e1, float3 e2, out float3 at, out float3 plane)
+{
+    bool crosses;
+    plane = ray_barycentrics(d, q0, e1, e2, crosses);
+    at = plane.z * d;
+    if (crosses && all(float3(1.0 - plane.x - plane.y, plane.xy) >= 0.0))
+        return plane;
+    float2 b = nearest_barycentrics(d, q0, e1, e2);
+    at = q0 + b.x * e1 + b.y * e2;
+    return float3(b, dot(at, d));
 }
 
 // The pixel ray's hit on a visible triangle, and the surface input at it.
 public struct PrimaryHit
 {
     public SurfaceInput input;
-    public float3 relative;    // eye-relative render-space position
+    public float3 relative;    // eye-relative render-space position; beside the pixel ray where that misses the triangle
     public float3 direction;   // unit pixel ray, render space
     public float distance;     // m along the ray
     public Placement placement;
@@ -535,6 +583,7 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
         uint segment = ribbon_segment(vc.cluster, triangle);
         float t = strand_ray(b, pl, d, segment);
         hit.distance = t;
+        hit.relative = t * d;
         hit.object = mul(linear_inverse(pl.linear), t * d - pl.translation);
         strand_geometry(i, b, segment, hit.object, pl, false, t * spread * bias);
         i.user_tag = s.producers[entry].user_tag;
@@ -573,9 +622,11 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
         float3 e2 = mul(pl.linear, c.position[2] - c.position[0]);
         float3 dx = render_direction(v, view_direction(v, (pixel_center + float2(1, 0)) / extent));
         float3 dy = render_direction(v, view_direction(v, (pixel_center + float2(0, 1)) / extent));
-        float3 b = ray_barycentrics(d, q0, e1, e2);
-        float2 bx = ray_barycentrics(dx, q0, e1, e2).xy - b.xy;
-        float2 by = ray_barycentrics(dy, q0, e1, e2).xy - b.xy;
+        float3 plane;
+        float3 b = triangle_point(d, q0, e1, e2, hit.relative, plane);
+        bool crosses;
+        float2 bx = ray_barycentrics(dx, q0, e1, e2, crosses).xy - plane.xy;
+        float2 by = ray_barycentrics(dy, q0, e1, e2, crosses).xy - plane.xy;
         triangle_geometry(i, c, attributes, s, vc.material, pl, b.xy, bx, by, d, bias);
         hit.distance = b.z;
         hit.object = (1.0 - b.x - b.y) * c.position[0] + b.x * c.position[1] + b.y * c.position[2];
@@ -583,7 +634,6 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
         i.primitive = triangle;
         i.barycentrics = b.xy;
     }
-    hit.relative = hit.distance * d;
     hit.direction = d;
     i.context.kind = HIT_PRIMARY;
     i.context.depth = 0;
