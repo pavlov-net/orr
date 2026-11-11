@@ -146,8 +146,6 @@ struct PlacedMesh {
     node_units: Vec<(u32, u32, u32)>,
     /// First mesh cluster per page, then the cluster count, in the mesh's block.
     page_clusters: u64,
-    /// The discrete levels' table in blob 0, and their count.
-    levels: (u64, u32),
     cluster_count: u32,
     sections: u32,
     header: MeshHeader,
@@ -1164,10 +1162,6 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             page_units,
             node_units,
             page_clusters: block.gpu() + page_clusters_at,
-            levels: (
-                block.gpu() + u64::from(header.levels.first),
-                header.levels.count,
-            ),
             cluster_count: first,
             sections: info.sections.len() as u32,
             header,
@@ -1762,11 +1756,11 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                         node_pages: GpuPtr::NULL,
                         page_clusters: GpuPtr::from_address(orr_gpu::GpuAddress(m.page_clusters)),
                         page_bases: GpuPtr::NULL,
-                        levels: GpuPtr::from_address(orr_gpu::GpuAddress(m.levels.0)),
+                        levels: table(m.header.levels).cast(),
                         page_count: pages,
                         node_page_count: node_pages,
                         cluster_count: m.cluster_count,
-                        level_count: m.levels.1,
+                        level_count: m.header.levels.count,
                         position_step: m.header.step(),
                         attributes: u32::from(m.header.attributes),
                         merge_error: m.header.merge_error,
