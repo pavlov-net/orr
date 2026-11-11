@@ -1460,7 +1460,7 @@ impl Streaming {
         // Each built cut's locked pages and where it is, the shed ones apart. One past its hold
         // stays while a scene not updated since it was used may trace it, so neither shedding
         // it nor its having been shed returns anything until that scene reports again.
-        let (mut leaving, mut built, mut at) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut keys, mut cuts, mut at) = (Vec::new(), Vec::new(), Vec::new());
         for (&(mount, mesh), f) in &self.fine {
             let pages = &self.mounts[&mount].mesh_pages[mesh as usize];
             for (k, slot) in f.slots.iter().enumerate() {
@@ -1476,34 +1476,32 @@ impl Streaming {
                 if touched + HOLD_FRAMES < frame {
                     continue;
                 }
-                let keys: Vec<Key> = (locks.pages.iter())
-                    .map(|&p| Key {
-                        mount,
-                        unit: pages[p as usize],
-                    })
-                    .collect();
-                if *shed {
-                    leaving.push((keys, locks.bytes));
-                } else {
-                    built.push((keys, locks.bytes));
+                let first = keys.len();
+                keys.extend(locks.pages.iter().map(|&p| Key {
+                    mount,
+                    unit: pages[p as usize],
+                }));
+                cuts.push((*shed, first..keys.len(), locks.bytes));
+                if !*shed {
                     at.push((mount, mesh, k));
                 }
             }
         }
-        fn holders(cuts: &[(Vec<Key>, u64)]) -> Vec<Holder<'_>> {
+        let holders = |shed: bool| -> Vec<Holder<'_>> {
             (cuts.iter())
-                .map(|(units, bytes)| Holder {
-                    units,
+                .filter(|c| c.0 == shed)
+                .map(|(_, units, bytes)| Holder {
+                    units: &keys[units.clone()],
                     bytes: *bytes,
                 })
                 .collect()
-        }
+        };
         let order = self.residency.shed(
             class,
             demand.bytes,
             budget,
-            &holders(&leaving),
-            &holders(&built),
+            &holders(true),
+            &holders(false),
             self.fine_locked,
         );
         for &i in &order {
