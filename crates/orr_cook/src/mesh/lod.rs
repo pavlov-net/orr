@@ -3,9 +3,10 @@
 use std::collections::BTreeMap;
 
 use meshopt::{SimplifyOptions, SimplifyVertex, VertexDataAdapter, VertexStream};
+use orr_math::{DVec3, Vec3};
 use orr_pack::Aabb;
 use orr_pack::mesh::Part;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::par::prelude::*;
 
@@ -105,6 +106,85 @@ impl Welded {
         let r = self.sections[s].clone();
         self.indices[r].as_chunks::<3>().0.iter().copied()
     }
+
+    /// Adds a vertex at `at`'s position with every other stream of `from`; returns it.
+    pub(super) fn wedge(&mut self, at: u32, from: u32) -> u32 {
+        fn copy<T: Copy>(v: &mut Vec<T>, i: u32) {
+            v.push(v[i as usize]);
+        }
+        let new = self.positions.len() as u32;
+        copy(&mut self.positions, at);
+        copy(&mut self.normals, from);
+        self.tangents.iter_mut().for_each(|t| copy(t, from));
+        self.uvs.iter_mut().for_each(|u| copy(u, from));
+        self.colors.iter_mut().for_each(|c| copy(c, from));
+        self.moves.iter_mut().for_each(|m| copy(m, from));
+        if let Some(k) = &mut self.skin {
+            copy(&mut k.joints, from);
+            copy(&mut k.weights, from);
+        }
+        self.values.iter_mut().for_each(|v| copy(v, from));
+        self.pivots.iter_mut().for_each(|p| copy(p, from));
+        new
+    }
+}
+
+/// The corners of the triangles `simplified` whose vertex normal opposes their face, each with
+/// the vertex of `input` in its vertex's section nearest it whose normal faces the triangle's
+/// way, when there is one. A triangle `input` holds as it is, with no vertex `moved`, keeps its
+/// corners as the input has them. Simplification joins vertices across thin features: one
+/// coarse vertex can stand for both sides of a sheet while it carries one side's normal, and
+/// the other side's triangles then take the attributes of a vertex from their own side. Vertex
+/// `v` is at `at(v)` with normal `normal(v)` in section `section(v)`.
+pub(super) fn opposed_corners(
+    simplified: &[u32],
+    input: &[u32],
+    moved: impl Fn(u32) -> bool,
+    at: impl Fn(u32) -> DVec3,
+    normal: impl Fn(u32) -> DVec3,
+    section: impl Fn(u32) -> u16,
+) -> Vec<(usize, u32)> {
+    // A triangle by its corners from the least, which keeps its winding.
+    let key = |t: &[u32; 3]| {
+        let k = (0..3).min_by_key(|&k| t[k]).expect("three corners");
+        [t[k], t[(k + 1) % 3], t[(k + 2) % 3]]
+    };
+    let mut kept: Option<FxHashSet<[u32; 3]>> = None;
+    let mut candidates: Option<Vec<u32>> = None;
+    let mut out = Vec::new();
+    for (t, tri) in simplified.as_chunks::<3>().0.iter().enumerate() {
+        let p = tri.map(&at);
+        let face = (p[1] - p[0]).cross(p[2] - p[0]);
+        if tri.iter().all(|&v| normal(v).dot(face) >= 0.0) {
+            continue;
+        }
+        let kept = kept.get_or_insert_with(|| input.as_chunks::<3>().0.iter().map(key).collect());
+        if kept.contains(&key(tri)) && !tri.iter().any(|&v| moved(v)) {
+            continue;
+        }
+        let candidates = candidates.get_or_insert_with(|| {
+            let mut c = input.to_vec();
+            c.sort_unstable();
+            c.dedup();
+            c
+        });
+        for (k, &v) in tri.iter().enumerate() {
+            if normal(v).dot(face) >= 0.0 {
+                continue;
+            }
+            let s = section(v);
+            let nearest = candidates
+                .iter()
+                .copied()
+                .filter(|&u| section(u) == s && normal(u).dot(face) > 0.0)
+                .map(|u| (at(u).distance_squared(p[k]), u))
+                .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            if let Some((_, u)) = nearest {
+                out.push((3 * t + k, u));
+            }
+        }
+    }
+    out
 }
 
 /// Parts of a mesh: [`Cluster::part`](orr_pack::mesh::Cluster::part) names them in a u16.
@@ -228,8 +308,8 @@ pub(crate) struct LevelGeometry {
 /// The levels of the mesh at `errors`, past level 0; `keep_borders` per section says whether its
 /// open borders stay ([`simplify`]).
 pub(crate) fn levels(
-    w: &Welded,
-    grid: &Grid,
+    w: &mut Welded,
+    grid: &mut Grid,
     parts: &Parts,
     s: &MeshSettings,
     errors: &[f32],
@@ -443,7 +523,7 @@ pub(super) fn open_borders(
         .filter(|&p| !flat(p))
         .collect();
     let edge = |p: &[u32; 3], e: usize| (p[e], p[(e + 1) % 3]);
-    let mut edges: rustc_hash::FxHashSet<(u32, u32)> = Default::default();
+    let mut edges: FxHashSet<(u32, u32)> = Default::default();
     edges.reserve(3 * tris.len());
     for t in &tris {
         for e in 0..3 {
@@ -556,11 +636,13 @@ pub(super) struct Simplify {
     pub(super) keep_borders: bool,
 }
 
-/// Simplifies one piece as `how` says; returns its indices and the error reached.
+/// Simplifies one piece as `how` says; returns its indices and the error reached. A corner
+/// whose vertex normal comes to oppose its face takes a vertex added to `w` and `grid`
+/// ([`opposed_corners`]).
 pub(super) fn simplify(
     indices: &[u32],
-    w: &Welded,
-    grid: &Grid,
+    w: &mut Welded,
+    grid: &mut Grid,
     shared: &[bool],
     seams: &[bool],
     how: Simplify,
@@ -646,7 +728,28 @@ pub(super) fn simplify(
             error += sloppy_error * scale;
         }
     }
-    (out.into_iter().map(|v| global[v as usize]).collect(), error)
+    let wedges = opposed_corners(
+        &out,
+        &local,
+        |_| false,
+        |v| Vec3::from(positions[v as usize]).as_dvec3(),
+        |v| Vec3::from_slice(&normals[3 * v as usize..]).as_dvec3(),
+        |_| 0,
+    );
+    let mut out: Vec<u32> = out.into_iter().map(|v| global[v as usize]).collect();
+    let mut made: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+    for (k, u) in wedges {
+        let (v, u) = (out[k], global[u as usize]);
+        out[k] = if grid.reps[u as usize] == grid.reps[v as usize] {
+            u
+        } else {
+            *made.entry((v, u)).or_insert_with(|| {
+                grid.wedge(v);
+                w.wedge(v, u)
+            })
+        };
+    }
+    (out, error)
 }
 
 /// Warnings for vertices on a uv seam or a tile's edge of section `s` whose triangles read

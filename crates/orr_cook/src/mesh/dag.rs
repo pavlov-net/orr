@@ -549,7 +549,7 @@ struct Options {
 /// The DAG groups of one stage, in emission order.
 fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
     let attributes = crate::profile::zone!("dag.attributes");
-    let mut positions: Vec<f32> = input
+    let positions: Vec<f32> = input
         .cells
         .iter()
         .flat_map(|c| c.map(|v| (f64::from(v) * snap.step) as f32))
@@ -578,14 +578,14 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
     };
     let mesh = super::clod::Mesh {
         indices: &input.indices,
-        attributes: &normals,
+        normals,
         weights: &weights,
-        lock: &lock,
+        lock: lock.into_owned(),
         remap: &input.remap,
         sections: &input.sections,
         keep_borders: !o.dilate,
     };
-    let mut groups = super::clod::build(&config, mesh, &mut positions, |e| {
+    let mut groups = super::clod::build(&config, mesh, positions, |e| {
         group_of(&e, &input.welded, &input.sections, snap, max_indices)
     });
     bound_groups(&mut groups, snap.step);
@@ -701,13 +701,14 @@ fn group_of(
     snap: &Snap,
     max_indices: usize,
 ) -> DagGroup {
-    let positions = e.positions;
+    let (positions, source) = (e.positions, e.source);
     let mut local_vertices = [0u32; MAX_CLUSTER_CORNERS];
     let mut local_triangles = [0u8; MAX_CLUSTER_CORNERS];
     let mut out = Clusters::default();
     let push = |out: &mut Clusters, section: u16, refined: i32, used: &[u32], tris: &[u8]| {
         let (v, t) = (out.verts.len(), out.tris.len());
-        out.verts.extend(used.iter().map(|&v| welded[v as usize]));
+        out.verts
+            .extend(used.iter().map(|&v| welded[source[v as usize] as usize]));
         out.cells.extend(used.iter().map(|&v| {
             let p = &positions[v as usize * 3..v as usize * 3 + 3];
             snap.cell([p[0], p[1], p[2]])
@@ -737,7 +738,7 @@ fn group_of(
         };
         let local = &local_vertices[..n];
         let tris = &local_triangles[..indices.len()];
-        let section_of = |t: &[u8]| sections[local[usize::from(t[0])] as usize];
+        let section_of = |t: &[u8]| sections[source[local[usize::from(t[0])] as usize] as usize];
         // One cluster per section: a triangle's corners all lie in one section.
         let triangles = tris.as_chunks::<3>().0;
         if triangles.iter().all(|t| section_of(t) == section_of(tris)) {

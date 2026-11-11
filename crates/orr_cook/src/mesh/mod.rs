@@ -726,12 +726,12 @@ pub(crate) fn cook(
             baked = displace::bake(&mut w, &mut parts, maps, d);
             if baked.iter().any(|&b| b) {
                 drop(source_grid);
-                let grid = Grid::new(&w.positions, s.position_step_log2, min_exponent);
+                let mut grid = Grid::new(&w.positions, s.position_step_log2, min_exponent);
                 let keep: Vec<bool> = sections
                     .iter()
                     .map(|sec| !dag::dilates(s, sec.flags))
                     .collect();
-                displace::simplify(&mut w, &mut parts, &grid, &baked, &keep, d.target_error);
+                displace::simplify(&mut w, &mut parts, &mut grid, &baked, &keep, d.target_error);
                 grid
             } else {
                 source_grid
@@ -753,9 +753,19 @@ pub(crate) fn cook(
     );
     drop(bounds_zone);
     // Only discrete levels read the float positions past here.
-    if s.lod == LodMode::Dag {
-        grid.floats = Vec::new();
-    }
+    let levels = match &s.lod {
+        LodMode::Discrete { errors } => {
+            let keep: Vec<bool> = sections
+                .iter()
+                .map(|sec| !dag::dilates(s, sec.flags))
+                .collect();
+            Some(lod::levels(&mut w, &mut grid, &parts, s, errors, &keep))
+        }
+        LodMode::Dag => {
+            grid.floats = Vec::new();
+            None
+        }
+    };
     let mut omm_alpha = Vec::with_capacity(maps.len());
     for (si, (sm, sec)) in maps.iter().zip(&sections).enumerate() {
         let alpha = match (&s.omm, &sm.opacity) {
@@ -811,9 +821,9 @@ pub(crate) fn cook(
         .into_par_iter()
         .map(|i| lod::closed(&w, &grid, i))
         .collect();
-    let mut built = match &s.lod {
-        LodMode::Discrete { errors } => discrete(&cx, errors)?,
-        LodMode::Dag => dag::cook(&cx).map_err(fail)?,
+    let mut built = match levels {
+        Some(levels) => discrete(&cx, &levels)?,
+        None => dag::cook(&cx).map_err(fail)?,
     };
 
     built.info.header = MeshHeader {
@@ -1058,13 +1068,7 @@ impl Ctx<'_> {
 }
 
 /// Discrete levels: pages of whole clusters of one level, coarsest level first.
-fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
-    let keep: Vec<bool> = cx
-        .sections
-        .iter()
-        .map(|sec| !dag::dilates(cx.s, sec.flags))
-        .collect();
-    let levels = lod::levels(cx.w, cx.grid, cx.parts, cx.s, errors, &keep);
+fn discrete(cx: &Ctx<'_>, levels: &[lod::LevelGeometry]) -> Result<Built> {
     let level_count = levels.len();
     let part_count = cx.parts.table.len();
     let adapter = VertexDataAdapter::new(bytemuck::cast_slice(&cx.grid.floats), 12, 0)
@@ -1723,6 +1727,14 @@ impl Grid {
 
     fn step(&self) -> f64 {
         2f64.powi(i32::from(self.k))
+    }
+
+    /// Adds a vertex at `at`'s position, as [`lod::Welded::wedge`] does.
+    fn wedge(&mut self, at: u32) {
+        let at = at as usize;
+        self.cells.push(self.cells[at]);
+        self.floats.push(self.floats[at]);
+        self.reps.push(self.reps[at]);
     }
 
     /// Whether a cluster may span more than the low halves of its grid offsets hold.

@@ -256,7 +256,7 @@ fn smooth_normals(w: &mut Welded, baked: &[bool]) {
 pub(super) fn simplify(
     w: &mut Welded,
     parts: &mut Parts,
-    grid: &Grid,
+    grid: &mut Grid,
     baked: &[bool],
     keep_borders: &[bool],
     target: f32,

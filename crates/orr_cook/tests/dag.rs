@@ -800,6 +800,93 @@ fn double_sided_foliage_keeps_its_coverage() {
     assert!(levels > 2);
 }
 
+/// Overlapping thin plates, as a tiled roof lays them: `rows` x `cols` plates of 6 x 4 quads,
+/// 30 cm long and 4 mm thick at the middle, each a top and an underside that meet at its rim,
+/// where each side has its own normal and uvs. Rows step up the slope by half a plate and lie
+/// on the row below.
+fn plates(rows: u32, cols: u32) -> MeshInput {
+    let (nu, nv) = (6u32, 4u32);
+    let mut m = MeshInput::default();
+    let mut uvs = Vec::new();
+    let slope = Vec3::new(0.0, 0.3, 1.0).normalize();
+    let across = Vec3::X;
+    let up = across.cross(slope).normalize();
+    for r in 0..rows {
+        for c in 0..cols {
+            let origin = across * (0.22 * c as f32 + 0.11 * (r % 2) as f32)
+                + slope * (0.15 * r as f32)
+                + up * (0.004 * r as f32);
+            for side in [1.0f32, -1.0] {
+                let base = m.positions.len() as u32;
+                for j in 0..=nv {
+                    for i in 0..=nu {
+                        let (u, v) = (i as f32 / nu as f32, j as f32 / nv as f32);
+                        let swell = 4.0 * u * (1.0 - u) * 4.0 * v * (1.0 - v);
+                        let p = origin
+                            + across * (0.2 * u)
+                            + slope * (0.3 * v)
+                            + up * side * swell * 0.002;
+                        m.positions.push(p);
+                        m.normals.push(up * side);
+                        uvs.push(Vec2::new(if side > 0.0 { u } else { 1.0 - u }, v));
+                    }
+                }
+                let w = nu + 1;
+                for j in 0..nv {
+                    for i in 0..nu {
+                        let k = base + j * w + i;
+                        let quad = [k, k + 1, k + w, k + 1, k + w + 1, k + w];
+                        if side > 0.0 {
+                            m.indices.extend(quad);
+                        } else {
+                            m.indices
+                                .extend(quad.chunks(3).flat_map(|t| [t[0], t[2], t[1]]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    m.uvs = Some(uvs);
+    m.sections = vec![Span {
+        first: 0,
+        count: m.indices.len() as u32,
+    }];
+    m
+}
+
+#[test]
+fn thin_plates_keep_their_normals_on_their_faces() {
+    let discrete = MeshSettings {
+        lod: LodMode::Discrete {
+            errors: vec![0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64],
+        },
+        ..MeshSettings::default()
+    };
+    for settings in [dag(), discrete] {
+        let lod = settings.lod.clone();
+        let d = load(&cook(plates(16, 16), &[0], settings), "m/mesh");
+        if lod == LodMode::Dag {
+            let per_depth = check_structure(&d);
+            assert!(per_depth.len() >= 5, "{per_depth:?}");
+        }
+        // Every cluster stands in some cut. A normal opposes its face past what the
+        // octahedral encoding moves one.
+        let mut opposed = 0;
+        for c in &d.clusters {
+            for (t, n) in c.tris.iter().zip(&c.normals) {
+                let p = t.map(Vec3::from);
+                let face = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+                opposed += n
+                    .iter()
+                    .filter(|&&n| Vec3::from(n).dot(face) < -1e-3)
+                    .count();
+            }
+        }
+        assert_eq!(opposed, 0, "{lod:?}");
+    }
+}
+
 /// Half of a curved 4 m sheet: x from 0 to 2 m on the `side` of x = 0, the cut both halves
 /// share and that bends in y, so neither half keeps it straight. With `bridged`, a triangle
 /// with two corners at one end of each edge of the cut closes it, as exports have them.

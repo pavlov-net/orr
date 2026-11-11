@@ -2,13 +2,16 @@
 //! simplify in parallel. Groups of one level share only locked vertices, so each reads the
 //! positions it needs and moves only its own vertices when it dilates borders; groups come
 //! out in the order the original emits them, with the same numbering. Unlike the original,
-//! level 0 clusters each section apart, unless the triangles make one cluster, and the
-//! sloppy fallback can keep open borders ([`Mesh::keep_borders`]).
+//! level 0 clusters each section apart, unless the triangles make one cluster, the sloppy
+//! fallback can keep open borders ([`Mesh::keep_borders`]), and a simplified corner whose
+//! normal opposes its face takes a wedge with a normal from its triangle's side
+//! ([`lod::opposed_corners`]).
 
 use std::borrow::Cow;
 
 use meshopt::{SimplifyOptions, SimplifyVertex, ffi};
 
+use super::lod;
 use crate::par::prelude::*;
 use orr_math::Vec3;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -37,19 +40,47 @@ impl Cluster {
     }
 }
 
-/// The mesh `build` reads besides its positions: 3 floats of attributes per vertex, per
-/// vertex the first vertex at its position, as `meshopt_generatePositionRemap` gives it, and
-/// per vertex its section, which a triangle takes from its first corner.
+/// The mesh `build` reads besides its positions: per vertex its normal, 3 floats the
+/// simplifier weighs by `weights`, its lock bits, the first vertex at its position, as
+/// `meshopt_generatePositionRemap` gives it, and its section, which a triangle takes from its
+/// first corner.
 pub(super) struct Mesh<'a> {
     pub(super) indices: &'a [u32],
-    pub(super) attributes: &'a [f32],
+    pub(super) normals: Vec<f32>,
     pub(crate) weights: &'a [f32],
-    pub(super) lock: &'a [u8],
+    pub(super) lock: Vec<u8>,
     pub(super) remap: &'a [u32],
     pub(super) sections: &'a [u16],
     /// The open borders stay where `lock` leaves them: the sloppy fallback, which does not
     /// keep to border loops, locks every vertex on one.
     pub(super) keep_borders: bool,
+}
+
+/// What `build` keeps per vertex: the mesh's vertices, then the wedges it adds, each at a
+/// vertex's position with another's normal and attributes ([`lod::opposed_corners`]).
+struct Vertices {
+    positions: Vec<f32>,
+    normals: Vec<f32>,
+    /// The mesh's lock bits.
+    lock: Vec<u8>,
+    remap: Vec<u32>,
+    /// The mesh vertex whose attributes it carries.
+    source: Vec<u32>,
+}
+
+impl Vertices {
+    /// Adds a vertex at `at`'s position, with its lock bits, and `from`'s normal and
+    /// attributes; returns it.
+    fn wedge(&mut self, at: u32, from: u32) -> u32 {
+        let (at, from) = (at as usize, from as usize);
+        let new = self.remap.len() as u32;
+        self.positions.extend_from_within(3 * at..3 * at + 3);
+        self.normals.extend_from_within(3 * from..3 * from + 3);
+        self.lock.push(self.lock[at]);
+        self.remap.push(self.remap[at]);
+        self.source.push(self.source[from]);
+        new
+    }
 }
 
 /// Positions that groups of one level write at disjoint unlocked vertices.
@@ -456,9 +487,12 @@ fn simplify_fallback(
     lod.iter().map(|&i| indices[i as usize]).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn simplify(
     c: &ffi::clodConfig,
     mesh: &Mesh<'_>,
+    normals: &[f32],
+    remap: &[u32],
     positions: &[f32],
     indices: &[u32],
     locks: &[u8],
@@ -482,7 +516,7 @@ fn simplify(
                 positions.as_ptr(),
                 positions.len() / 3,
                 12,
-                mesh.attributes.as_ptr(),
+                normals.as_ptr(),
                 12,
                 mesh.weights.as_ptr(),
                 mesh.weights.len(),
@@ -501,7 +535,7 @@ fn simplify(
         lod = run(options | SimplifyOptions::Permissive, error);
     }
     if lod.len() > target && c.simplify_fallback_sloppy {
-        let keep = mesh.keep_borders.then_some(mesh.remap);
+        let keep = mesh.keep_borders.then_some(remap);
         lod = simplify_fallback(positions, indices, locks, keep, target, error);
         *error *= c.simplify_error_factor_sloppy;
     }
@@ -550,7 +584,7 @@ fn boundary_area(
 }
 
 /// Pushes the open, unlocked borders of `simplified` out so it keeps `merged`'s border
-/// area, writing the group's own vertices.
+/// area, writing the group's own vertices; returns the positions it moves.
 fn dilate_borders(
     positions: &Positions,
     merged: &[u32],
@@ -558,16 +592,17 @@ fn dilate_borders(
     locks: &[u8],
     remap: &[u32],
     bounds: &mut Bounds,
-) {
+) -> FxHashSet<u32> {
     let _z = crate::profile::zone!("clod.dilate");
+    let mut moved = FxHashSet::default();
     let mut edges = FxHashSet::default();
     let old_area = boundary_area(positions.read(), merged, locks, remap, &mut edges);
     if old_area == 0.0 {
-        return;
+        return moved;
     }
     let new_area = boundary_area(positions.read(), simplified, locks, remap, &mut edges);
     if new_area >= old_area || new_area < old_area / 4.0 {
-        return;
+        return moved;
     }
     let mut offsets: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
     let mut perimeter = 0.0f32;
@@ -622,30 +657,38 @@ fn dilate_borders(
             *n = [0.0; 4];
             // SAFETY: `r` is unlocked, so the group's own.
             unsafe { positions.write(r as usize, vr) };
+            moved.insert(r);
             let d = Vec3::from(vr).distance(Vec3::from(bounds.center));
             bounds.radius = bounds.radius.max(d);
         }
         // SAFETY: `i` shares `r`'s position, so it is unlocked and the group's own too.
         unsafe { positions.write(i as usize, vr) };
     }
+    moved
 }
 
-/// What a group's emission gets: its depth and bounds, its clusters, their corners and
-/// the positions as they are when it is emitted.
+/// What a group's emission gets: its depth and bounds, its clusters, their corners, the
+/// positions as they are when it is emitted, and per vertex the mesh vertex whose attributes
+/// it carries.
 pub(super) struct Emitted<'a> {
     pub(super) depth: u32,
     pub(crate) bounds: Bounds,
     pub(crate) clusters: &'a [Cluster],
     pub(super) indices: &'a [u32],
     pub(super) positions: &'a [f32],
+    pub(super) source: &'a [u32],
 }
 
-/// Builds the DAG of `mesh` under `c`, calling `emit` once per group with its index fixed
-/// by emission order, and returns the emitted values in that order.
+/// A group simplified and emitted: its triangles, their bounds, and the corners whose
+/// vertex normal opposes their face with the vertex whose attributes they take.
+type Simplified = (Vec<u32>, Bounds, Vec<(usize, u32)>);
+
+/// Builds the DAG of `mesh` at `positions` under `c`, calling `emit` once per group with its
+/// index fixed by emission order, and returns the emitted values in that order.
 pub(super) fn build<G: Send>(
     c: &ffi::clodConfig,
-    mesh: Mesh<'_>,
-    positions: &mut [f32],
+    mut mesh: Mesh<'_>,
+    positions: Vec<f32>,
     emit: impl Fn(Emitted<'_>) -> G + Sync,
 ) -> Vec<G> {
     debug_assert!(
@@ -653,28 +696,32 @@ pub(super) fn build<G: Send>(
         "clusterlod options the port leaves out"
     );
     let vertex_count = positions.len() / 3;
-    let remap = mesh.remap;
     assert_eq!(
-        remap.len(),
+        mesh.remap.len(),
         vertex_count,
         "a position remap entry per vertex"
     );
-    let mut locks = vec![0u8; vertex_count];
-    let mut marks = vec![0u8; vertex_count];
-    let positions = Positions(positions.as_mut_ptr(), positions.len());
+    let mut vx = Vertices {
+        positions,
+        normals: std::mem::take(&mut mesh.normals),
+        lock: std::mem::take(&mut mesh.lock),
+        remap: mesh.remap.to_vec(),
+        source: (0..vertex_count as u32).collect(),
+    };
+    let (mut locks, mut marks) = (Vec::new(), Vec::new());
     let mut out = Vec::new();
 
     // Level 0 clusters each section apart, unless the triangles make one cluster: that one is
     // the root, as in clodBuild.
     let (mut clusters, mut cluster_indices) = clusterize(
         c,
-        positions.read(),
+        &vx.positions,
         mesh.indices.into(),
         Some(mesh.sections),
         -1,
     );
     if clusters.len() > 1 && mesh.indices.len() <= c.max_triangles * 3 {
-        let one = clusterize(c, positions.read(), mesh.indices.into(), None, -1);
+        let one = clusterize(c, &vx.positions, mesh.indices.into(), None, -1);
         if one.0.len() == 1 {
             (clusters, cluster_indices) = one;
         }
@@ -682,30 +729,33 @@ pub(super) fn build<G: Send>(
     {
         let _z = crate::profile::zone!("clod.bounds");
         clusters.par_iter_mut().for_each(|k| {
-            k.bounds = bounds_compute(positions.read(), k.corners(&cluster_indices), 0.0);
+            k.bounds = bounds_compute(&vx.positions, k.corners(&cluster_indices), 0.0);
         });
     }
 
     let mut depth = 0u32;
     while clusters.len() > 1 {
         let _z = crate::profile::zone!("clod.level");
-        let offsets = partition(&mut clusters, c, positions.read(), &cluster_indices, remap);
+        let offsets = partition(&mut clusters, c, &vx.positions, &cluster_indices, &vx.remap);
         let lock = crate::profile::zone!("clod.lock");
+        locks.resize(vx.remap.len(), 0);
+        marks.resize(vx.remap.len(), 0);
         lock_boundary(
             &mut locks,
             &mut marks,
             &clusters,
             &offsets,
             &cluster_indices,
-            remap,
-            mesh.lock,
+            &vx.remap,
+            &vx.lock,
         );
         drop(lock);
         let base = out.len() as i32;
-        let groups: Vec<(G, Vec<Cluster>, Vec<u32>)> = offsets
+        let positions = Positions(vx.positions.as_mut_ptr(), vx.positions.len());
+        let (normals, remap, source) = (&vx.normals, &vx.remap, &vx.source);
+        let groups: Vec<(G, Option<Simplified>)> = offsets
             .par_windows(2)
-            .enumerate()
-            .map(|(gi, w)| {
+            .map(|w| {
                 let group = &clusters[w[0] as usize..w[1] as usize];
                 let merged: Vec<u32> = group
                     .iter()
@@ -718,6 +768,8 @@ pub(super) fn build<G: Send>(
                 let simplified = simplify(
                     c,
                     &mesh,
+                    normals,
+                    remap,
                     positions.read(),
                     &merged,
                     &locks,
@@ -732,35 +784,68 @@ pub(super) fn build<G: Send>(
                         clusters: group,
                         indices: &cluster_indices,
                         positions: positions.read(),
+                        source,
                     })
                 };
                 if simplified.len() as f32 > merged.len() as f32 * c.simplify_threshold {
                     bounds.error = f32::MAX;
-                    return (emitted(bounds), Vec::new(), Vec::new());
+                    return (emitted(bounds), None);
                 }
                 bounds.error = (bounds.error * c.simplify_error_merge_previous).max(error)
                     + error * c.simplify_error_merge_additive;
                 let g = emitted(bounds);
-                if c.simplify_dilate_borders {
-                    dilate_borders(&positions, &merged, &simplified, &locks, remap, &mut bounds);
-                }
-                let (mut next, next_indices) = clusterize(
-                    c,
-                    positions.read(),
-                    simplified.into(),
-                    None,
-                    base + gi as i32,
+                let moved = if c.simplify_dilate_borders {
+                    dilate_borders(&positions, &merged, &simplified, &locks, remap, &mut bounds)
+                } else {
+                    FxHashSet::default()
+                };
+                let _z = crate::profile::zone!("clod.opposed");
+                let opposed = lod::opposed_corners(
+                    &simplified,
+                    &merged,
+                    |v| moved.contains(&remap[v as usize]),
+                    |v| Vec3::from(positions.get(v as usize)).as_dvec3(),
+                    |v| Vec3::from_slice(&normals[3 * v as usize..]).as_dvec3(),
+                    |v| mesh.sections[source[v as usize] as usize],
                 );
+                (g, Some((simplified, bounds, opposed)))
+            })
+            .collect();
+        let wedges = crate::profile::zone!("clod.wedges");
+        // Each corner that takes another vertex's attributes takes that vertex where it shares
+        // the corner's position, else a wedge, one per vertex and attribute source.
+        let mut made: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+        let mut next = Vec::new();
+        for (gi, (g, simplified)) in groups.into_iter().enumerate() {
+            out.push(g);
+            let Some((mut simplified, bounds, opposed)) = simplified else {
+                continue;
+            };
+            for (k, u) in opposed {
+                let v = simplified[k];
+                simplified[k] = if vx.remap[u as usize] == vx.remap[v as usize] {
+                    u
+                } else {
+                    *made.entry((v, u)).or_insert_with(|| vx.wedge(v, u))
+                };
+            }
+            next.push((base + gi as i32, simplified, bounds));
+        }
+        drop(wedges);
+        let next: Vec<(Vec<Cluster>, Vec<u32>)> = next
+            .into_par_iter()
+            .map(|(refined, simplified, bounds)| {
+                let (mut next, next_indices) =
+                    clusterize(c, &vx.positions, simplified.into(), None, refined);
                 for k in &mut next {
                     k.bounds = bounds;
                 }
-                (g, next, next_indices)
+                (next, next_indices)
             })
             .collect();
         let _gather = crate::profile::zone!("clod.gather");
         let (mut pending, mut pending_indices) = (Vec::new(), Vec::new());
-        for (g, next, next_indices) in groups {
-            out.push(g);
+        for (next, next_indices) in next {
             let shift = pending_indices.len();
             pending.extend(next.into_iter().map(|mut k| {
                 k.index_offset += shift;
@@ -780,7 +865,8 @@ pub(super) fn build<G: Send>(
             bounds,
             clusters: &clusters,
             indices: &cluster_indices,
-            positions: positions.read(),
+            positions: &vx.positions,
+            source: &vx.source,
         }));
     }
     out
