@@ -532,8 +532,6 @@ pub(crate) struct Streaming {
     fine: BTreeMap<(MountId, u32), MeshFine>,
     /// Bytes of mesh pages they hold locked.
     fine_locked: u64,
-    /// Of `fine_locked`, the bytes of the built cuts shed for room that have yet to go.
-    fine_shed: u64,
     /// What the latest sample since the last step found each class wants.
     demand: Option<[Demand; ResidencyClass::ALL.len()]>,
     /// Finer cuts freed once the frame has completed.
@@ -689,7 +687,6 @@ impl Streaming {
             ))),
             fine: BTreeMap::new(),
             fine_locked: 0,
-            fine_shed: 0,
             demand: None,
             governed: {
                 let report = device.memory_report();
@@ -945,13 +942,8 @@ impl Streaming {
                         continue;
                     }
                     FineState::Building { locks } => locks,
-                    FineState::Built {
-                        cut, locks, shed, ..
-                    } => {
+                    FineState::Built { cut, locks, .. } => {
                         self.retired_cuts.push((frame, cut));
-                        if shed {
-                            self.fine_shed -= locks.bytes;
-                        }
                         locks
                     }
                 };
@@ -1345,15 +1337,11 @@ impl Streaming {
                     FineState::Built { touched, .. }
                         if *touched + HOLD_FRAMES < frame && *touched < settled =>
                     {
-                        let FineState::Built {
-                            cut, locks, shed, ..
-                        } = std::mem::replace(&mut f.slots[k], FineState::EMPTY)
+                        let FineState::Built { cut, locks, .. } =
+                            std::mem::replace(&mut f.slots[k], FineState::EMPTY)
                         else {
                             unreachable!("matched above")
                         };
-                        if shed {
-                            self.fine_shed -= locks.bytes;
-                        }
                         let empty = RtCutGpu {
                             error: t,
                             row,
@@ -1414,8 +1402,8 @@ impl Streaming {
         if let Some(demand) = demand.filter(|_| !shed) {
             let room = (budget as f64 * LOW) as u64;
             // What the frame wants with the pages the built cuts hold beside it.
-            let demand = &demand[ResidencyClass::MeshPages as usize];
-            let demand = demand.bytes + demand.held;
+            let demand = demand[ResidencyClass::MeshPages as usize].bytes
+                + self.residency.unsampled_held(ResidencyClass::MeshPages);
             wanted_cuts.sort_by(|a, b| {
                 b.0.total_cmp(&a.0)
                     .then((a.1, a.2, a.3).cmp(&(b.1, b.2, b.3)))
@@ -1454,30 +1442,31 @@ impl Streaming {
     /// table entry is emptied, so copies trace a coarser cut, and the cut goes with its locks
     /// once no frame has used it for its hold. Returns whether any was shed.
     fn shed_cuts(&mut self, demand: Demand, budget: u64, w: &mut Apply<'_>) -> Result<bool> {
-        // A page two cuts hold counts in both cuts' bytes, so the cuts already shed can count
-        // for more than the pages they hold.
-        let over = (demand.bytes + demand.held).saturating_sub(self.fine_shed);
-        let locked = self.fine_locked - self.fine_shed;
-        if over <= budget && locked <= budget / 2 {
+        let class = ResidencyClass::MeshPages;
+        if demand.bytes + self.residency.unsampled_held(class) <= budget
+            && self.fine_locked <= budget / 2
+        {
             return Ok(false);
         }
-        let mut built: Vec<(u64, MountId, u32, usize)> = Vec::new();
+        // The bytes each built cut locks, and where it is; the shed ones' in all.
+        let (mut going, mut built) = (0, Vec::new());
         for (&(mount, mesh), f) in &self.fine {
             for (k, slot) in f.slots.iter().enumerate() {
-                if let FineState::Built {
-                    shed: false, locks, ..
-                } = slot
-                {
-                    built.push((locks.bytes, mount, mesh, k));
+                match slot {
+                    FineState::Built {
+                        locks, shed: true, ..
+                    } => going += locks.bytes,
+                    FineState::Built { locks, .. } => built.push((locks.bytes, mount, mesh, k)),
+                    _ => {}
                 }
             }
         }
-        built.sort_unstable_by(|a, b| b.0.cmp(&a.0).then((a.1, a.2, a.3).cmp(&(b.1, b.2, b.3))));
-        let mut gone = 0;
-        for &(bytes, mount, mesh, k) in &built {
-            if over.saturating_sub(gone) <= budget && locked - gone <= budget / 2 {
-                break;
-            }
+        let bytes: Vec<u64> = built.iter().map(|c| c.0).collect();
+        let order =
+            self.residency
+                .shed(class, demand.bytes, budget, going, &bytes, self.fine_locked);
+        for &i in &order {
+            let (_, mount, mesh, k) = built[i];
             let f = self.fine.get_mut(&(mount, mesh)).expect("listed");
             let CutRow { threshold, row } = f.init.cuts[k];
             let empty = RtCutGpu {
@@ -1489,10 +1478,8 @@ impl Streaming {
             if let FineState::Built { shed, .. } = &mut f.slots[k] {
                 *shed = true;
             }
-            gone += bytes;
         }
-        self.fine_shed += gone;
-        Ok(gone > 0)
+        Ok(!order.is_empty())
     }
 
     /// The keys of the pages finer cut `k` of mesh `mesh` of `mount` is built from, and the

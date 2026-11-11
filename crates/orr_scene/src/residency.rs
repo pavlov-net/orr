@@ -654,8 +654,9 @@ pub(crate) struct Residency {
     /// Bytes per class of the other units locked while their holders are used, and of what
     /// those depend on.
     while_used: [u64; CLASSES],
-    /// Of `while_used`, the bytes the sample being taken has counted.
-    tally_while_used: [u64; CLASSES],
+    /// Of `while_used`, the bytes of the units the latest sample counted, kept with it as
+    /// locks change after the sample.
+    sampled_while_used: [u64; CLASSES],
     /// The number of the latest sample, 0 before the first, and whether it is being taken.
     sample: u64,
     sampling: bool,
@@ -698,7 +699,7 @@ impl Residency {
             fixed: [0; CLASSES],
             under: [0; CLASSES],
             while_used: [0; CLASSES],
-            tally_while_used: [0; CLASSES],
+            sampled_while_used: [0; CLASSES],
             sample: 0,
             sampling: false,
             tally: [0; CLASSES],
@@ -985,17 +986,25 @@ impl Residency {
         change(u);
         let after = u.kept();
         let bytes = u.held();
+        let sampled = u.sampled == self.sample;
         for (kept, add) in [(before, false), (after, true)] {
-            let total = match kept {
-                Kept::No => continue,
-                Kept::WhileUsed => &mut self.while_used[c],
-                Kept::Under => &mut self.under[c],
-                Kept::Fixed => &mut self.fixed[c],
+            let apply = |total: &mut u64| {
+                if add {
+                    *total += bytes;
+                } else {
+                    *total -= bytes;
+                }
             };
-            if add {
-                *total += bytes;
-            } else {
-                *total -= bytes;
+            match kept {
+                Kept::No => {}
+                Kept::WhileUsed => {
+                    apply(&mut self.while_used[c]);
+                    if sampled {
+                        apply(&mut self.sampled_while_used[c]);
+                    }
+                }
+                Kept::Under => apply(&mut self.under[c]),
+                Kept::Fixed => apply(&mut self.fixed[c]),
             }
         }
     }
@@ -1043,7 +1052,12 @@ impl Residency {
                     self.resident_units[c] -= 1;
                     match u.kept() {
                         Kept::No => {}
-                        Kept::WhileUsed => self.while_used[c] -= u.held(),
+                        Kept::WhileUsed => {
+                            self.while_used[c] -= u.held();
+                            if u.sampled == self.sample {
+                                self.sampled_while_used[c] -= u.held();
+                            }
+                        }
                         Kept::Under => self.under[c] -= u.held(),
                         Kept::Fixed => self.fixed[c] -= u.held(),
                     }
@@ -1093,7 +1107,7 @@ impl Residency {
                 u.sampled = self.sample;
                 self.tally[u.class as usize] += adds;
                 if u.kept() == Kept::WhileUsed {
-                    self.tally_while_used[u.class as usize] += adds;
+                    self.sampled_while_used[u.class as usize] += adds;
                 }
                 if u.state != State::Resident {
                     self.absent[u.class as usize] += adds;
@@ -1146,7 +1160,7 @@ impl Residency {
                 continue;
             }
             if kept == Kept::WhileUsed {
-                self.tally_while_used[u.class as usize] += u.held();
+                self.sampled_while_used[u.class as usize] += u.held();
             }
             debug_assert_eq!(
                 u.state,
@@ -1166,7 +1180,7 @@ impl Residency {
         self.sample += 1;
         self.sampling = true;
         self.tally = [0; CLASSES];
-        self.tally_while_used = [0; CLASSES];
+        self.sampled_while_used = [0; CLASSES];
         self.absent = [0; CLASSES];
     }
 
@@ -1182,9 +1196,48 @@ impl Residency {
                 streamed: bytes - kept,
                 absent: self.loading_bytes[c] + self.absent[c],
                 budget: self.budgets[c],
-                held: self.while_used[c] - self.tally_while_used[c],
+                held: self.while_used[c] - self.sampled_while_used[c],
             }
         })
+    }
+
+    /// The bytes of the units of `class` locked while their holders are used, or under one
+    /// that is, that the latest sample did not count, as the locks stand now.
+    pub(crate) fn unsampled_held(&self, class: ResidencyClass) -> u64 {
+        let c = class as usize;
+        self.while_used[c] - self.sampled_while_used[c]
+    }
+
+    /// Of the cached cuts that lock `built` bytes of `class` each while they are used, the ones
+    /// to shed, in order, while what the latest sample's frame wanted, `sampled`, does not fit
+    /// `budget` beside the units held while used that it did not count, or the cuts' locks,
+    /// `locked`, take more than half of it. Of those, `going` bytes are locked by cuts shed
+    /// earlier, which go once no frame uses them.
+    pub(crate) fn shed(
+        &self,
+        class: ResidencyClass,
+        sampled: u64,
+        budget: u64,
+        going: u64,
+        built: &[u64],
+        locked: u64,
+    ) -> Vec<usize> {
+        // A page two cuts hold counts in both cuts' bytes, so the cuts already shed can count
+        // for more than the pages they hold.
+        let mut over = (sampled + self.unsampled_held(class)).saturating_sub(going);
+        let mut locked = locked - going;
+        let mut order: Vec<usize> = (0..built.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(built[i]));
+        let mut out = Vec::new();
+        for i in order {
+            if over <= budget && locked <= budget / 2 {
+                break;
+            }
+            over = over.saturating_sub(built[i]);
+            locked -= built[i];
+            out.push(i);
+        }
+        out
     }
 
     /// The units `k` needs held to be resident that `counted` passes over: `k` and the units
@@ -1996,6 +2049,7 @@ mod tests {
         }
         // What keeps each unit, from the units over it.
         let (mut under, mut while_used) = ([0; CLASSES], [0; CLASSES]);
+        let mut sampled = [0; CLASSES];
         for units in r.mounts.values() {
             let below = |how: Kept| {
                 let mut found = FxHashSet::default();
@@ -2020,12 +2074,18 @@ mod tests {
                 );
                 match u.kept() {
                     Kept::Under => under[u.class as usize] += u.held(),
-                    Kept::WhileUsed => while_used[u.class as usize] += u.held(),
+                    Kept::WhileUsed => {
+                        while_used[u.class as usize] += u.held();
+                        if u.sampled == r.sample {
+                            sampled[u.class as usize] += u.held();
+                        }
+                    }
                     Kept::Fixed | Kept::No => {}
                 }
             }
         }
         assert_eq!((r.under, r.while_used), (under, while_used));
+        assert_eq!(r.sampled_while_used, sampled);
     }
 
     fn class(r: &Residency) -> ClassStats {
@@ -2709,6 +2769,44 @@ mod tests {
             [key(1)]
         );
     }
+
+    /// The units the cuts shed for room lock leave what a sample held as the cuts go, so the
+    /// step that retires them, before the next sample, sheds no more cuts.
+    #[test]
+    fn cuts_that_go_after_a_sample_take_their_units_out_of_what_it_held() {
+        let class = ResidencyClass::InstancePages;
+        let mut r = Residency::new(limits(10_000));
+        // 0 locked by a cut the frame reads; 1 to 6 each by a cut no frame reads.
+        let mut units = vec![unit(80, &[], Start::Absent)];
+        units.extend((0..6).map(|_| unit(5, &[], Start::Absent)));
+        r.register(M, &units).unwrap();
+        step(&mut r, &[0, 1, 2, 3, 4, 5, 6], 1);
+        for u in 0..7 {
+            r.lock_while_used(key(u));
+        }
+        r.begin_sample();
+        r.touch(key(0), 2);
+        let d = r.end_sample()[class as usize];
+        assert_eq!((d.bytes, d.held), (80, 30));
+        let cuts = [5; 6];
+        let shed = r.shed(class, d.bytes, 100, 0, &cuts, 30);
+        assert_eq!(shed.len(), 2, "110 against 100: two cuts");
+        assert_eq!(
+            r.shed(class, d.bytes, 100, 10, &cuts[2..], 30),
+            Vec::<usize>::new()
+        );
+        for &i in &shed {
+            r.unlock_while_used(key(i as u32 + 1));
+        }
+        r.unlock_while_used(key(0));
+        check(&r);
+        assert_eq!(r.unsampled_held(class), 20);
+        assert_eq!(
+            r.shed(class, d.bytes, 100, 0, &cuts[2..], 20),
+            Vec::<usize>::new()
+        );
+    }
+
     #[test]
     fn budgets_give_back_the_excess_once_a_period_and_take_the_room_under_the_mark() {
         let period = response_period(2);
