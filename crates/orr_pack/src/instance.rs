@@ -105,6 +105,8 @@ pub struct InstancePageHeader {
     pub _pad: u32,
 }
 
+const _: () = assert!(size_of::<InstancePageHeader>() == 216);
+
 impl InstancePageHeader {
     /// Blobs of [`MotionRow`]s.
     pub fn motion_windows(&self) -> u32 {
