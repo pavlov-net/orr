@@ -2759,6 +2759,37 @@ struct Rays {
 
 /// Runs `entry` of `module` (a `trace` build) over every pixel of `view`.
 fn rays(view: &RasterView, module: &'static ShaderModule, entry: &str, mode: u32) -> Rays {
+    let later = rays_later(view, module, entry, mode);
+    wait(later.point);
+    later.read()
+}
+
+/// [`rays`] submitted after the work submitted so far, read once `point` has completed.
+struct RaysLater {
+    traced: orr_gpu::Allocation<trace::Traced>,
+    seen: orr_gpu::Allocation<trace::Seen>,
+    cones: orr_gpu::Allocation<trace::Cone>,
+    _root: orr_gpu::Allocation<trace::Root>,
+    point: orr_gpu::TimelinePoint,
+}
+
+impl RaysLater {
+    fn read(&self) -> Rays {
+        Rays {
+            traced: self.traced.as_slice().unwrap().to_vec(),
+            seen: self.seen.as_slice().unwrap().to_vec(),
+            cones: self.cones.as_slice().unwrap().to_vec(),
+        }
+    }
+}
+
+/// [`rays`] without waiting for them.
+fn rays_later(
+    view: &RasterView,
+    module: &'static ShaderModule,
+    entry: &str,
+    mode: u32,
+) -> RaysLater {
     let d = device();
     let n = u64::from(EXTENT[0] * EXTENT[1]);
     let traced = d
@@ -2790,11 +2821,13 @@ fn rays(view: &RasterView, module: &'static ShaderModule, entry: &str, mode: u32
     list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::ACCEL_STRUCT);
     list.dispatch(&p, root.gpu(), [n.div_ceil(64) as u32, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
-    wait(render.submit(vec![list], &[]).unwrap());
-    Rays {
-        traced: traced.as_slice().unwrap().to_vec(),
-        seen: seen.as_slice().unwrap().to_vec(),
-        cones: cones.as_slice().unwrap().to_vec(),
+    let point = render.submit(vec![list], &[]).unwrap();
+    RaysLater {
+        traced,
+        seen,
+        cones,
+        _root: root,
+        point,
     }
 }
 
@@ -8134,6 +8167,215 @@ fn traced_hits(g: &Frame) -> Vec<u8> {
     bytemuck::cast_slice(&r.traced).to_vec()
 }
 
+/// A frame of `placed` from `shot` whose camera rays are traced after it, neither waited for.
+fn shoot_later(w: &mut World, placed: &Placed, shot: &Shot) -> RaysLater {
+    let list = [placed.scene];
+    let mut f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(shot.frame),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    f.scene(placed.scene).unwrap().set_focus(shot.eye);
+    f.request_detail(placed.scene, PIXELS_PER_RADIAN).unwrap();
+    f.update_scenes(&mut |_| {}).unwrap();
+    let view = f
+        .raster_view(&ViewDesc {
+            scene: placed.scene,
+            history: placed.history,
+            position: shot.eye,
+            rotation: look(Vec3::ZERO, (shot.target - shot.eye).as_vec3()),
+            projection: Projection {
+                fov_y: 0.9,
+                near: 0.1,
+            },
+            lens: Lens::default(),
+            render_extent: UVec2::from(EXTENT),
+            output_extent: UVec2::from(EXTENT),
+            jitter: shot.jitter,
+            camera_cut: shot.reset,
+            mip_bias: shot.mip_bias,
+            texture_filter: TextureFilter::Hardware,
+        })
+        .unwrap();
+    f.end(&[]).unwrap();
+    rays_later(&view, &trace::MODULE, "pixels", 0)
+}
+
+/// Frames of `placed`, each read while the next is in flight, until two in a row trace the
+/// same; returns what their camera rays hit and the frame still in flight.
+fn settled_hits(
+    w: &mut World,
+    placed: &Placed,
+    (eye, target): (DVec3, DVec3),
+    frame: &mut u32,
+) -> (Vec<u8>, RaysLater) {
+    let start = Instant::now();
+    let mut last = None;
+    *frame += 1;
+    let mut flight = shoot_later(w, placed, &Shot::at(eye, target, *frame));
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the view never settled"
+        );
+        *frame += 1;
+        let next = shoot_later(w, placed, &Shot::at(eye, target, *frame));
+        wait(flight.point);
+        let now = bytemuck::cast_slice(&flight.read().traced).to_vec();
+        flight = next;
+        if last.as_ref() == Some(&now) {
+            return (now, flight);
+        }
+        last = Some(now);
+    }
+}
+
+/// How many pixels of `a` and `b` differ.
+fn differing(a: &[u8], b: &[u8]) -> usize {
+    let n = size_of::<trace::Traced>();
+    a.chunks(n).zip(b.chunks(n)).filter(|(x, y)| x != y).count()
+}
+
+/// The global material, model, mesh and section-material tables grow while frames are in
+/// flight: two more mounts of the pack land between frames nothing waits for, and the tables
+/// move. Every frame meanwhile traces what the frames before did, and copies of the last mount's
+/// models then show the same surfaces through its own entries of the moved tables.
+#[test]
+fn global_tables_grow_under_frames_in_flight_and_every_frame_stays_exact() {
+    let _serial = serial();
+    let mut w = World::new(&KernelSet::NONE);
+    let items = showcase();
+    let placed = place(&mut w, &items);
+    let (eye, target) = (DVec3::new(0.5, 2.5, 6.5), DVec3::new(0.0, 0.5, -0.5));
+    let mut frame = 0;
+    let (settled, flight) = settled_hits(&mut w, &placed, (eye, target), &mut frame);
+    let tables = orr_scene::testing::global_tables(&w.scenes);
+    let ball = w.model("ball");
+    let (models, _, _) = tables;
+    let list =
+        |models: GpuPtr<ModelGpu>| read_buffer(models.offset(u64::from(ball.0)), 1)[0].materials;
+    let ball_list = list(models);
+
+    let more = [0, 1].map(|_| w.scenes.mount(PackSource::Memory(Arc::clone(pack()))));
+    let mut later = vec![flight];
+    let mut after = 0;
+    let start = Instant::now();
+    while after < 3 {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "the mounts never landed"
+        );
+        frame += 1;
+        later.push(shoot_later(&mut w, &placed, &Shot::at(eye, target, frame)));
+        let ready = more
+            .iter()
+            .all(|&m| matches!(w.scenes.mount_state(m), LoadState::Ready));
+        after += u32::from(ready);
+    }
+    wait(later.last().unwrap().point);
+    let moved = orr_scene::testing::global_tables(&w.scenes);
+    assert!(
+        moved.0 != tables.0 && moved.1 != tables.1 && moved.2 != tables.2,
+        "the model, mesh and material tables never grew: {tables:?} to {moved:?}"
+    );
+    assert_ne!(
+        list(moved.0),
+        ball_list,
+        "the section-material table never grew"
+    );
+    for (i, l) in later.iter().enumerate() {
+        let traced: Vec<u8> = bytemuck::cast_slice(&l.read().traced).to_vec();
+        assert!(
+            traced == settled,
+            "frame {} of the {} under the mounts hit other surfaces at {} pixels",
+            i + 1,
+            later.len(),
+            differing(&traced, &settled),
+        );
+    }
+
+    // Copies of the last mount's models in place of the first's.
+    let last = World {
+        mount: more[1],
+        ..w
+    };
+    let mut w = last;
+    let models: Vec<ModelId> = items.iter().map(|c| w.model(c.model)).collect();
+    // The last mount's ball names its own materials, whose records match the first's.
+    let (models_now, _, materials) = orr_scene::testing::global_tables(&w.scenes);
+    let sections = |model: ModelId| {
+        let m: ModelGpu = read_buffer(models_now.offset(u64::from(model.0)), 1)[0];
+        read_buffer(m.materials, u64::from(m.section_count))
+    };
+    let record = |id: u32| -> MaterialGpu { read_buffer(materials.offset(u64::from(id)), 1)[0] };
+    let (first, last) = (sections(ball), sections(w.model("ball")));
+    assert_eq!(first.len(), last.len());
+    for (&a, &b) in first.iter().zip(&last) {
+        assert_ne!(a, b, "the last mount's ball names the first's material");
+        assert!(bytemuck::bytes_of(&record(a)) == bytemuck::bytes_of(&record(b)));
+    }
+    let list = [placed.scene];
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(frame + 1),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    let mut s = f.scene(placed.scene).unwrap();
+    let mut ranges = Vec::new();
+    for (i, (&range, model)) in placed.ranges.iter().zip(models).enumerate() {
+        s.remove(range);
+        ranges.push(
+            s.add_instances(&InstancesDesc {
+                model,
+                copies: 1,
+                transforms: placed.group,
+                first: i as u32,
+                pose: None,
+                material_set: None,
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 100.0,
+                animation_range: 0.0,
+                user_tag: i as u32,
+            })
+            .unwrap(),
+        );
+    }
+    drop(s);
+    wait(f.end(&[]).unwrap());
+    frame += 1;
+    let placed = Placed { ranges, ..placed };
+    let (traced, flight) = settled_hits(&mut w, &placed, (eye, target), &mut frame);
+    wait(flight.point);
+    let old: &[trace::Traced] = bytemuck::cast_slice(&settled);
+    let new: &[trace::Traced] = bytemuck::cast_slice(&traced);
+    let mut hits = 0;
+    for (a, b) in old.iter().zip(new) {
+        assert_eq!(a.valid, b.valid);
+        if a.instance == 0 {
+            assert_eq!(b.instance, 0);
+            continue;
+        }
+        hits += 1;
+        let same = trace::Traced {
+            instance: a.instance,
+            material: a.material,
+            ..*b
+        };
+        assert!(
+            bytemuck::bytes_of(&same) == bytemuck::bytes_of(a),
+            "{a:?} became {b:?}"
+        );
+    }
+    assert!(hits > old.len() / 4, "the view traces the copies");
+    assert_clean();
+}
+
 /// The mesh page budget falls to what the view wants: the hidden ground's pages go, the CLAS
 /// pool's pages they leave wholly free unbind, and its page memory empties the blocks they
 /// leave partly used by binding the pages the view traces to other memory, their CLAS in place.
@@ -10346,15 +10588,15 @@ fn dispatch_fractures(
     for (e, r) in edits.iter().zip(refs) {
         let root = c
             .put_root(&fracture::Root {
-                mesh: r.mesh,
+                scene: c.root,
                 groups: r.groups,
+                mesh: r.mesh,
                 piece: e.1,
                 pieces: e.2,
                 min_x: -4.0,
                 size_x: 8.0,
                 lift: e.3,
                 _pad: 0,
-                _pad2: 0,
             })
             .unwrap();
         c.cmd.dispatch(&p, root, [r.group_count, 1, 1]);

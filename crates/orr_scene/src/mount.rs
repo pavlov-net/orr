@@ -53,6 +53,7 @@ use crate::stream::{
     Streaming,
 };
 use crate::subd::{CageShape, CageTables, ModelCage};
+use crate::table::Table;
 use crate::tiles::{TexStream, TileGrid};
 use crate::traverse::{PAGED_DEPTH, PageFeedback};
 use crate::upload::Record;
@@ -2289,6 +2290,19 @@ struct EditIds {
     model: Option<u32>,
 }
 
+impl EditIds {
+    fn none(cluster_base: u32, clusters: u32, page_count: u32) -> Self {
+        Self {
+            cluster_base,
+            clusters,
+            mesh: None,
+            pages_at: None,
+            page_count,
+            model: None,
+        }
+    }
+}
+
 /// What an edit's landing still needs: its copies, and the source's units they depend on.
 struct EditPending {
     model: ModelId,
@@ -2308,7 +2322,8 @@ struct EditPending {
 /// A landed edit.
 struct EditLive {
     model: ModelId,
-    mesh_gpu: GpuPtr<MeshGpu>,
+    /// Its mesh's index in the mesh table.
+    mesh: u32,
     mount: MountId,
     source_mesh: u32,
     ids: EditIds,
@@ -2359,27 +2374,24 @@ pub(crate) struct Hierarchy {
     pub(crate) depth: u32,
 }
 
-/// Capacities of the global model and mesh tables.
+/// Capacities of the global tables that do not grow.
 #[derive(Clone, Copy)]
 pub(crate) struct TableSizes {
-    pub(crate) models: u32,
-    pub(crate) meshes: u32,
-    pub(crate) model_materials: u32,
     pub(crate) page_table: u32,
 }
 
 /// The render thread's mounts and the global model and mesh tables they fill.
 pub(crate) struct Mounts {
     entries: Vec<Option<Entry>>,
-    pub(crate) models: Allocation<ModelGpu>,
-    model_ids: RangeAllocator,
-    pub(crate) meshes: Allocation<MeshGpu>,
-    mesh_ids: RangeAllocator,
+    pub(crate) models: Table<ModelGpu>,
+    pub(crate) meshes: Table<MeshGpu>,
     /// The resident cluster table, by cluster id.
     pub(crate) clusters: Allocation<ClusterRef>,
     accel: Arc<AccelShared>,
-    model_materials: Allocation<u32>,
-    model_material_ranges: RangeAllocator,
+    /// The section materials of every model, a run of them per model.
+    pub(crate) model_materials: Table<u32>,
+    /// The first entry of `model_materials` each model's record points at, mounted or an edit.
+    lists: FxHashMap<ModelId, u32>,
     page_table: Allocation<u64>,
     /// Beside each page's entry of the page table, the cluster id of its first cluster.
     page_bases: Allocation<u32>,
@@ -2706,16 +2718,10 @@ impl Mounts {
                 "resident clusters",
             )?,
             accel: Arc::clone(accel),
-            models: device.gpu_malloc(m, u64::from(sizes.models), "models")?,
-            model_ids: RangeAllocator::new(sizes.models),
-            meshes: device.gpu_malloc(m, u64::from(sizes.meshes), "meshes")?,
-            mesh_ids: RangeAllocator::new(sizes.meshes),
-            model_materials: device.gpu_malloc(
-                m,
-                u64::from(sizes.model_materials),
-                "model materials",
-            )?,
-            model_material_ranges: RangeAllocator::new(sizes.model_materials),
+            models: Table::new(device, MemoryPriority::Normal, "models")?,
+            meshes: Table::new(device, MemoryPriority::Normal, "meshes")?,
+            model_materials: Table::new(device, MemoryPriority::Normal, "model materials")?,
+            lists: FxHashMap::default(),
             page_table: device.gpu_malloc(m, u64::from(sizes.page_table), "mesh page table")?,
             page_bases: device.gpu_malloc(m, u64::from(sizes.page_table), "mesh page bases")?,
             page_ranges: RangeAllocator::new(sizes.page_table),
@@ -2814,7 +2820,7 @@ impl Mounts {
         match self.edits.get(id.0 as usize).and_then(Option::as_ref) {
             Some(EditEntry::Live(e)) if e.clas.built => Ok(EditRef {
                 model: e.model,
-                mesh: e.mesh_gpu,
+                mesh: e.mesh,
                 groups: e.tables.groups,
                 group_count: e.group_count,
             }),
@@ -2882,30 +2888,36 @@ impl Mounts {
         let page_count = source.gpu.page_count;
         let pages = &source.source.pages;
         let clusters: u32 = p.own.iter().map(|&q| pages[q as usize].clusters).sum();
-        let ids = EditIds {
-            cluster_base: self
-                .accel
-                .cluster_ids
-                .lock()
-                .unwrap()
-                .alloc(clusters)
-                .ok_or_else(|| capacity("resident clusters", self.accel.cluster_capacity))?,
-            clusters,
-            mesh: self.mesh_ids.alloc(1),
-            pages_at: self.page_ranges.alloc(page_count),
-            page_count,
-            model: self.model_ids.alloc(1),
-        };
-        let placed = match (ids.mesh, ids.pages_at, ids.model) {
-            (Some(mesh), Some(start), Some(model)) => {
+        let cluster_base = self
+            .accel
+            .cluster_ids
+            .lock()
+            .unwrap()
+            .alloc(clusters)
+            .ok_or_else(|| capacity("resident clusters", self.accel.cluster_capacity))?;
+        let mut ids = EditIds::none(cluster_base, clusters, page_count);
+        let placed = self
+            .take_edit_ids(&mut ids, w.device)
+            .and_then(|(mesh, start, model)| {
                 self.write_edit(&p, loaded, &ids, (mesh, start, model), w)
-            }
-            _ => Err(capacity("meshes, mesh pages or models", self.sizes.meshes)),
-        };
+            });
         if placed.is_err() {
             self.free_edit_ids(&ids);
         }
         placed
+    }
+
+    /// Takes an edit's mesh, mesh page range and model into `ids`; what it took stays there on
+    /// an error, for [`Self::free_edit_ids`].
+    fn take_edit_ids(&mut self, ids: &mut EditIds, device: &Device) -> Result<(u32, u32, u32)> {
+        let mesh = *ids.mesh.insert(self.meshes.alloc(device, 1)?);
+        let start = *ids.pages_at.insert(
+            self.page_ranges
+                .alloc(ids.page_count)
+                .ok_or_else(|| capacity("mesh page table", self.sizes.page_table))?,
+        );
+        let model = *ids.model.insert(self.models.alloc(device, 1)?);
+        Ok((mesh, start, model))
     }
 
     fn free_edit_ids(&mut self, ids: &EditIds) {
@@ -2915,13 +2927,14 @@ impl Mounts {
             .unwrap()
             .free(ids.cluster_base, ids.clusters);
         if let Some(mesh) = ids.mesh {
-            self.mesh_ids.free(mesh, 1);
+            self.meshes.free(mesh, 1);
         }
         if let Some(start) = ids.pages_at {
             self.page_ranges.free(start, ids.page_count);
         }
         if let Some(model) = ids.model {
-            self.model_ids.free(model, 1);
+            self.models.free(model, 1);
+            self.lists.remove(&ModelId(model));
         }
     }
 
@@ -3058,17 +3071,19 @@ impl Mounts {
             fine_cuts: 0,
             ..src_gpu
         };
-        let mesh_gpu = self.meshes.gpu().offset(u64::from(mesh));
-        w.put(mesh_gpu, &[gpu])?;
+        w.put(self.meshes.entry(mesh), &[gpu])?;
+        let list = self.lists[&p.model];
         let record = ModelGpu {
             mesh,
+            materials: self.model_materials.entry(list),
             bounds_min: bounds.min,
             bounds_max: bounds.max,
             chain_count: 0,
             ..src_model
         };
-        w.put(self.models.gpu().offset(u64::from(model)), &[record])?;
+        w.put(self.models.entry(model), &[record])?;
         let id = ModelId(model);
+        self.lists.insert(id, list);
         let i = id.0 as usize;
         if w.model_cpu.len() <= i {
             w.model_cpu.resize(i + 1, ModelCpu::default());
@@ -3095,7 +3110,7 @@ impl Mounts {
         self.streaming.add_mirror(p.mount, p.mesh, &mirror);
         Ok(EditLive {
             model: id,
-            mesh_gpu,
+            mesh,
             mount: p.mount,
             source_mesh: p.mesh,
             ids: ids.clone(),
@@ -3594,7 +3609,24 @@ impl Mounts {
     }
 
     /// Frees the mounts unmounted at or before `completed`.
+    /// Moves the model, mesh and section-material tables that grew since the last upload:
+    /// see [`Table::land`].
+    pub(crate) fn land(
+        &self,
+        frame: u64,
+        copies: &mut Vec<crate::table::TableCopy>,
+        records: &mut [Record],
+    ) -> bool {
+        let models = self.models.land(frame, copies, records);
+        let meshes = self.meshes.land(frame, copies, records);
+        let lists = self.model_materials.land(frame, copies, records);
+        models || meshes || lists
+    }
+
     pub(crate) fn retire(&mut self, completed: u64, materials: &MaterialTable) {
+        self.models.retire(completed);
+        self.meshes.retire(completed);
+        self.model_materials.retire(completed);
         let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired)
             .into_iter()
             .partition(|(f, _)| *f <= completed);
@@ -3626,13 +3658,29 @@ impl Mounts {
         }
     }
 
+    /// A run of `n` entries of the section materials. When the table moves to take it, the
+    /// record of every model with a run points at its run in the new table.
+    fn alloc_list(&mut self, n: u32, w: &mut Apply<'_>) -> Result<u32> {
+        let before = self.model_materials.gpu();
+        let start = self.model_materials.alloc(w.device, n)?;
+        if self.model_materials.gpu() != before {
+            let field = std::mem::offset_of!(ModelGpu, materials) as u64;
+            for (&id, &first) in &self.lists {
+                let at = self.models.entry(id.0).cast::<u8>().offset(field).cast();
+                w.put(at, &[self.model_materials.entry(first)])?;
+            }
+        }
+        Ok(start)
+    }
+
     fn release(&mut self, mut r: Resident, materials: &MaterialTable) {
         for id in r.models.values() {
             self.owners.remove(id);
-            self.model_ids.free(id.0, 1);
+            self.lists.remove(id);
+            self.models.free(id.0, 1);
         }
         for &id in &r.meshes {
-            self.mesh_ids.free(id, 1);
+            self.meshes.free(id, 1);
             self.masks.remove(&id);
         }
         for &(s, n) in &r.page_ranges {
@@ -3640,7 +3688,7 @@ impl Mounts {
             self.page_ranges.free(s, n);
         }
         for &(s, n) in &r.material_ranges {
-            self.model_material_ranges.free(s, n);
+            self.model_materials.free(s, n);
         }
         for id in r.materials.values() {
             materials.free(*id);
@@ -3740,7 +3788,7 @@ impl Mounts {
     ) -> Result<()> {
         let mut material_ids = Vec::with_capacity(materials.len());
         for (id, ..) in &materials {
-            let mid = w.materials.alloc()?;
+            let mid = w.materials.alloc(w.device)?;
             res.materials.insert(*id, mid);
             material_ids.push(mid);
         }
@@ -3752,18 +3800,12 @@ impl Mounts {
         }
         for (m, &mid) in records.iter().zip(&material_ids) {
             w.materials.note(mid, m);
-            w.put(
-                w.materials.table.gpu().offset(u64::from(mid.0)),
-                &[w.materials.record(m)],
-            )?;
+            w.put(w.materials.table.entry(mid.0), &[w.materials.record(m)])?;
         }
         let mut mesh_ids = Vec::with_capacity(meshes.len());
         let mut tables = Vec::with_capacity(meshes.len());
         for m in &meshes {
-            let id = self
-                .mesh_ids
-                .alloc(1)
-                .ok_or_else(|| capacity("meshes", self.sizes.meshes))?;
+            let id = self.meshes.alloc(w.device, 1)?;
             res.meshes.push(id);
             let n = m.page_addresses.len() as u32 + m.gpu.fine_cuts;
             let start = self
@@ -3786,7 +3828,7 @@ impl Mounts {
                 feedback_nodes: start + m.gpu.page_count,
                 ..m.gpu
             };
-            w.put(self.meshes.gpu().offset(u64::from(id)), &[gpu])?;
+            w.put(self.meshes.entry(id), &[gpu])?;
             w.put(
                 self.clusters.gpu().offset(u64::from(m.cluster_base)),
                 &m.refs,
@@ -3819,21 +3861,15 @@ impl Mounts {
             mesh_ids.push(id);
         }
         for m in &models {
-            let id = ModelId(
-                self.model_ids
-                    .alloc(1)
-                    .ok_or_else(|| capacity("models", self.sizes.models))?,
-            );
+            let id = ModelId(self.models.alloc(w.device, 1)?);
             res.models.insert(m.id, id);
             let n = m.materials.len() as u32;
-            let start = self
-                .model_material_ranges
-                .alloc(n)
-                .ok_or_else(|| capacity("model materials", self.sizes.model_materials))?;
+            let start = self.alloc_list(n, w)?;
             res.material_ranges.push((start, n));
+            self.lists.insert(id, start);
             let section_materials: Vec<MaterialId> =
                 m.materials.iter().map(|&i| material_ids[i]).collect();
-            let list = self.model_materials.gpu().offset(u64::from(start));
+            let list = self.model_materials.entry(start);
             let raw: Vec<u32> = section_materials.iter().map(|id| id.0).collect();
             w.put(list, &raw)?;
             let gpu = ModelGpu {
@@ -3844,7 +3880,7 @@ impl Mounts {
                 bounds_max: m.bounds.max,
                 ..bytemuck::Zeroable::zeroed()
             };
-            w.put(self.models.gpu().offset(u64::from(id.0)), &[gpu])?;
+            w.put(self.models.entry(id.0), &[gpu])?;
             res.model_gpus.insert(id, gpu);
             res.model_materials.insert(id, section_materials.clone());
             let i = id.0 as usize;

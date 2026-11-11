@@ -6,15 +6,15 @@ import orr_scene.tables;
 
 struct Root
 {
-    MeshGpu* mesh;
+    SceneRoot* scene;
     EditGroupGpu* groups;
+    uint mesh;                    // the edit's mesh, in `scene.meshes`
     uint piece;
     uint pieces;
     float min_x;
     float size_x;
     float lift;
-    uint _pad;
-    uint64_t _pad2;
+    uint64_t _pad;
 }
 ORR_ROOT(Root);
 
@@ -22,7 +22,7 @@ ORR_ROOT(Root);
 [numthreads(1, 1, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
-    MeshGpu* mesh = root.mesh;
+    MeshGpu* mesh = root.scene.meshes + root.mesh;
     EditGroupGpu g = root.groups[id.x];
     uint8_t* page = (uint8_t*)mesh.pages[g.page];
     PageHeader h = load_page_header(page);

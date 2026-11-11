@@ -30,7 +30,7 @@ use crate::scene::ModelId;
 use crate::shaders::accel::{AccelRoot, ClasJob};
 use crate::shaders::edit::{EditJob, EditRoot};
 use crate::stream::StreamedPage;
-use crate::{ClusterRef, EditGpu, EditGroupGpu, Error, MeshGpu, PartGpu, Result, SkinMeshGpu};
+use crate::{ClusterRef, EditGpu, EditGroupGpu, Error, PartGpu, Result, SkinMeshGpu};
 
 /// Spheres an edit tests its groups against one by one; more pin the whole mesh.
 pub(crate) const EDIT_SPHERES: usize = 64;
@@ -61,11 +61,12 @@ pub struct EditRef {
     /// the source's, with [`crate::SceneWriter::add_instances`] and its poses, or with
     /// [`crate::SceneWriter::add_skinned`] for a skinned mesh.
     pub model: ModelId,
-    /// The edit's mesh record. `pages[group.page]` is the page a kernel writes through
-    /// `orr_pack.mesh`'s `store_triangle` and `store_position`, after `store_anchor` when a
-    /// vertex goes below its cluster's anchor. Vertices it moves have motion from where they
-    /// were the frame before.
-    pub mesh: GpuPtr<MeshGpu>,
+    /// The edit's mesh: its record is `SceneRoot::meshes[mesh]`, read through the root of the
+    /// frame, since the mesh table moves as it grows. `pages[group.page]` of the record is the
+    /// page a kernel writes through `orr_pack.mesh`'s `store_triangle` and `store_position`,
+    /// after `store_anchor` when a vertex goes below its cluster's anchor. Vertices it moves have
+    /// motion from where they were the frame before.
+    pub mesh: u32,
     /// The groups held at level 0.
     pub groups: GpuPtr<EditGroupGpu>,
     pub group_count: u32,

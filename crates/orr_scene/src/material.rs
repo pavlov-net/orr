@@ -7,16 +7,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytemuck::{Pod, Zeroable};
 use orr_color::{Primaries, rec709_to_rec2020};
 use orr_gpu::{
-    AddressMode, Allocation, Device, Filter, GpuPtr, MemoryKind, SamplerDesc, SamplerIndex,
-    TextureIndex,
+    AddressMode, Allocation, Device, Filter, GpuPtr, MemoryKind, MemoryPriority, SamplerDesc,
+    SamplerIndex, TextureIndex,
 };
 use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
 use orr_pack::mesh::SurfaceClass;
 
 use crate::features::{MaterialFeatures, SceneFeatures};
-use crate::memory::{RangeAllocator, UploadWindow};
+use crate::memory::UploadWindow;
+use crate::table::Table;
 use crate::upload::Record;
-use crate::{Error, MaterialGpu, Result, TextureSamplerGpu, TextureStreamGpu};
+use crate::{MaterialGpu, Result, TextureSamplerGpu, TextureStreamGpu};
 
 /// An index in the global material table.
 #[repr(transparent)]
@@ -289,12 +290,10 @@ impl MaterialGpu {
 }
 
 pub(crate) struct MaterialTable {
-    pub(crate) table: Allocation<MaterialGpu>,
-    capacity: u32,
+    pub(crate) table: Table<MaterialGpu>,
     /// `TextureStreamGpu` addresses by heap index, 0 for textures that do not stream; every
     /// record written points `MaterialGpu::texture_streams` at it.
     pub(crate) streams: Allocation<GpuPtr<TextureStreamGpu>>,
-    ids: Mutex<RangeAllocator>,
     /// Materials whose pixels may use the extended G-buffer targets.
     extended: Mutex<HashSet<u32>>,
     /// What each record may show a path.
@@ -313,16 +312,14 @@ fn needs_extended(m: &MaterialGpu) -> bool {
 }
 
 impl MaterialTable {
-    pub(crate) fn new(device: &Device, capacity: u32) -> Result<Self> {
+    pub(crate) fn new(device: &Device) -> Result<Self> {
         Ok(Self {
-            table: device.gpu_malloc(MemoryKind::DeviceLocal, u64::from(capacity), "materials")?,
-            capacity,
+            table: Table::new(device, MemoryPriority::Normal, "materials")?,
             streams: device.gpu_malloc(
                 MemoryKind::DeviceLocal,
                 u64::from(device.image_slots()),
                 "texture streams",
             )?,
-            ids: Mutex::new(RangeAllocator::new(capacity)),
             extended: Mutex::new(HashSet::new()),
             features: Mutex::new(MaterialFeatures::default()),
             world_lengths: Mutex::new(HashSet::new()),
@@ -374,12 +371,8 @@ impl MaterialTable {
         ids.iter().any(|id| set.contains(&id.0))
     }
 
-    pub(crate) fn alloc(&self) -> Result<MaterialId> {
-        let id = self.ids.lock().unwrap().alloc(1);
-        id.map(MaterialId).ok_or(Error::Capacity {
-            what: "materials",
-            capacity: self.capacity,
-        })
+    pub(crate) fn alloc(&self, device: &Device) -> Result<MaterialId> {
+        self.table.alloc(device, 1).map(MaterialId)
     }
 
     /// Returns `id` for reuse; its record stays until a new material overwrites it.
@@ -387,7 +380,7 @@ impl MaterialTable {
         self.extended.lock().unwrap().remove(&id.0);
         self.features.lock().unwrap().free(id.0);
         self.world_lengths.lock().unwrap().remove(&id.0);
-        self.ids.lock().unwrap().free(id.0, 1);
+        self.table.free(id.0, 1);
     }
 }
 
@@ -403,7 +396,7 @@ pub struct MaterialWriter<'f> {
 impl MaterialWriter<'_> {
     /// A new material holding `m`.
     pub fn create(&mut self, m: &MaterialGpu) -> Result<MaterialId> {
-        let id = self.table.alloc()?;
+        let id = self.table.alloc(self.device)?;
         self.update(id, m)?;
         Ok(id)
     }
@@ -415,12 +408,12 @@ impl MaterialWriter<'_> {
     /// entry's `displacement_reach` must cover what its materials displace as updated.
     pub fn update(&mut self, id: MaterialId, m: &MaterialGpu) -> Result<()> {
         assert!(
-            id.0 < self.table.capacity,
+            id.0 < self.table.table.capacity(),
             "{id:?} is outside the material table"
         );
         let src = self.window.put(self.device, &self.table.record(m))?;
         self.table.note(id, m);
-        let dst = self.table.table.gpu().offset(u64::from(id.0));
+        let dst = self.table.table.entry(id.0);
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         self.records
             .lock()

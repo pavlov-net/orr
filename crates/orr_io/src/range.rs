@@ -85,6 +85,12 @@ impl RangeAllocator {
         runs
     }
 
+    /// Adds `from..to` to the free list: the indices a capacity of `from` grown to `to` gains.
+    pub fn grow(&mut self, from: u32, to: u32) {
+        assert!(from <= to, "a capacity of {from} cannot grow to {to}");
+        self.free(from, to - from);
+    }
+
     /// Returns `start..start + count` to the free list.
     pub fn free(&mut self, start: u32, count: u32) {
         if count == 0 {

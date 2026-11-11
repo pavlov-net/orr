@@ -71,6 +71,7 @@ mod shares;
 mod skin;
 mod stream;
 mod subd;
+mod table;
 mod tessellate;
 #[cfg(feature = "testing")]
 pub mod testing;

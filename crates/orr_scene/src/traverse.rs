@@ -255,6 +255,7 @@ pub(crate) struct CutSizes {
     pub(crate) rt_clas: u32,
     pub(crate) rt_blas: u32,
     pub(crate) rt_bytes: u64,
+    /// Entries of the model table, which the merged cuts follow as it grows.
     pub(crate) models: u32,
     /// Entries of the mesh page table, by which the feedback reports.
     pub(crate) entries: u32,
@@ -443,6 +444,15 @@ impl RtTables {
 }
 
 /// The record of the cut tables `gpu` names.
+/// The merged cuts of `models` models, which every frame's traversal clears before it writes.
+fn merged_cuts(device: &Device, models: u32) -> Result<Allocation<u32>> {
+    Ok(device.gpu_malloc(
+        MemoryKind::DeviceLocal,
+        u64::from(models.max(1)),
+        "merged cuts",
+    )?)
+}
+
 fn cut_record(device: &Device, gpu: CutGpu) -> Result<Allocation<CutGpu>> {
     let mut record = device.gpu_malloc::<CutGpu>(MemoryKind::Upload, 1, "cut tables")?;
     record.as_mut_slice().expect("upload is mapped")[0] = gpu;
@@ -489,6 +499,8 @@ pub(crate) struct Cuts {
     rt_retry: u64,
     clas_short: bool,
     traced: bool,
+    /// Per model, the merged cut its copies trace this frame.
+    model_cut: Allocation<u32>,
     _blocks: Vec<Allocation<u8>>,
     counters: GpuPtr<u32>,
     args: GpuPtr<u32>,
@@ -563,7 +575,7 @@ impl Cuts {
             },
             traced,
         )?;
-        let model_cut = block(4 * n(sizes.models), "merged cuts")?;
+        let model_cut = merged_cuts(device, sizes.models)?;
         let counters = block(4 * COUNTERS as u64, "cut counters")?.cast();
         let args = block(4 * ARGS_TOTAL, "cut args")?.cast();
         let words = u64::from(sizes.feedback_words());
@@ -586,7 +598,7 @@ impl Cuts {
             jobs: GpuPtr::NULL,
             job_blas: GpuPtr::NULL,
             keys: GpuPtr::NULL,
-            model_cut: model_cut.cast(),
+            model_cut: model_cut.gpu(),
             counters,
             args,
             records: GpuPtr::NULL,
@@ -627,6 +639,7 @@ impl Cuts {
             rt_retry: 0,
             clas_short: false,
             traced,
+            model_cut,
             _blocks: blocks,
             counters,
             args,
@@ -689,6 +702,24 @@ impl Cuts {
     /// memory scale.
     pub(crate) fn rt_scale(&self, slot: usize) -> f32 {
         self.ran[slot].rt_scale
+    }
+
+    /// Gives the merged cuts an entry for each of `models` entries of the model table, before
+    /// the frame records anything that reads them.
+    pub(crate) fn follow_models(&mut self, device: &Device, models: u32) -> Result<()> {
+        if models <= self.sizes.models {
+            return Ok(());
+        }
+        let model_cut = merged_cuts(device, models)?;
+        let gpu = CutGpu {
+            model_cut: model_cut.gpu(),
+            ..self.gpu
+        };
+        self.record = cut_record(device, gpu)?;
+        self.gpu = gpu;
+        self.model_cut = model_cut;
+        self.sizes.models = models;
+        Ok(())
     }
 
     /// Resizes the queues, the candidate cut and the tables of the built cuts to what the

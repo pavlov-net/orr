@@ -98,14 +98,6 @@ impl PoolBytes {
 pub struct Budgets {
     /// Bytes per upload block; a window that outgrows its blocks takes another.
     pub upload_block: u64,
-    /// Entries in the global material table.
-    pub materials: u32,
-    /// Entries in the global model table: [`ModelId`]s of mounted packs.
-    pub models: u32,
-    /// Entries in the global mesh table.
-    pub meshes: u32,
-    /// Section materials of every resident model.
-    pub model_materials: u32,
     /// Entries of the mesh page table: per mounted mesh one per page and node page, which
     /// hold their addresses, and one per finer cached cut of a streaming mesh, and per edit one
     /// per page. A scene's traversal reports what it reads and wants by entry, a bit each.
@@ -203,10 +195,6 @@ impl Default for Budgets {
     fn default() -> Self {
         Self {
             upload_block: 16 << 20,
-            materials: 65_536,
-            models: 65_536,
-            meshes: 65_536,
-            model_materials: 262_144,
             mesh_pages: 1 << 20,
             initial_visible_clusters: 1 << 20,
             initial_candidate_items: 1 << 18,
@@ -565,13 +553,10 @@ impl Scenes {
             cluster_ids: Mutex::new(BestFit::new(clusters)),
             cluster_capacity: clusters,
         });
-        let materials = MaterialTable::new(device, b.materials)?;
+        let materials = MaterialTable::new(device)?;
         let mounts = Mounts::new(
             device,
             TableSizes {
-                models: b.models,
-                meshes: b.meshes,
-                model_materials: b.model_materials,
                 page_table: b.mesh_pages,
             },
             b,
@@ -1314,6 +1299,7 @@ impl Scenes {
             cpu.ptlas.retire(completed);
         }
         core.mounts.retire(completed, &core.materials);
+        core.materials.table.retire(completed);
         core.mounts.streaming.retire(completed);
         self.device.collect_garbage();
         let slot = (frame % u64::from(core.fif)) as usize;
@@ -1803,13 +1789,14 @@ impl<'a> Frame<'a> {
                     rt_clas: core.budgets.initial_rt_cut_clusters,
                     rt_blas: core.budgets.initial_rt_cut_blas,
                     rt_bytes: core.budgets.rt_cut_memory.bytes(heap),
-                    models: core.budgets.models,
+                    models: core.mounts.models.capacity(),
                     entries: core.budgets.mesh_pages,
                     requests: core.budgets.traversal_requests,
                 };
                 cpu.cuts = Some(Cuts::new(device, sizes, core.fif)?);
             }
             let cuts = cpu.cuts.as_mut().expect("made above");
+            cuts.follow_models(device, core.mounts.models.capacity())?;
             match cuts.fit(device, self.id, response_period(core.fif)) {
                 Err(e) if e.is_out_of_memory() => short.push(e),
                 r => r?,
@@ -1960,10 +1947,22 @@ impl<'a> Frame<'a> {
             list.end_pass();
         }
         list.begin_pass("upload", true);
+        // Tables that grew move before the records that write them.
+        let mut moves = Vec::new();
+        let moved = [
+            core.materials.table.land(self.id, &mut moves, &mut records),
+            core.mounts.land(self.id, &mut moves, &mut records),
+        ];
+        if moved.contains(&true) {
+            list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+        }
+        for &(dst, src, bytes) in &moves {
+            list.copy(dst, src, bytes);
+        }
         for &(dst, src, bytes) in &copies {
             list.copy(dst, src, bytes);
         }
-        if !copies.is_empty() {
+        if !copies.is_empty() || !moves.is_empty() {
             list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
         }
         let own = &self.pipelines.own;
