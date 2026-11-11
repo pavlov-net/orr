@@ -1875,7 +1875,7 @@ fn build_cluster(
             attrs.push(h[2] | h[3] << 16);
         }
         if let Some(skin) = &w.skin {
-            let p = vertices.placing.get(k).map_or(shading, |&p| p) as usize;
+            let p = vertices.placing.get(k).copied().unwrap_or(shading) as usize;
             let w = skin.weights[p].map(u32::from);
             attrs.push(u32::from_le_bytes(skin.joints[p]));
             attrs.push(w[0] | w[1] << 16);
