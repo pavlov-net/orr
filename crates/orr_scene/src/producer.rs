@@ -570,13 +570,15 @@ pub(crate) fn build(
     // Topologies the drawn batch's clusters instantiate: the entry's, or every pattern.
     let built_topologies = if tessellated { PATTERNS as u64 } else { n_topo };
     let only = |yes: bool, bytes: u64| if yes { bytes } else { 0 };
+    // An untessellated entry builds its own topologies' templates.
+    let own_templates = traced && !tessellated && n_topo > 0;
     let clusters = u64::from(built_clusters);
     let segments = u64::from(desc.max_segments);
     let triangles_at = take(triangles.len() as u64);
     let topologies_at = take(size_of::<TopologyGpu>() as u64 * n_topo);
     let materials_at = take(4 * desc.materials.len() as u64);
-    let curve_at = take(12 * CURVE as u64);
-    let build_at = take(size_of::<ProducerBuildGpu>() as u64);
+    let curve_at = take(only(own_templates, 12 * CURVE as u64));
+    let build_at = take(only(traced, size_of::<ProducerBuildGpu>() as u64));
     let tess_at = take(only(tessellated, size_of::<TessGpu>() as u64));
     let copy_at = take(only(subd.is_some(), size_of::<SubdCopyGpu>() as u64));
     let tube_batch_at = tubes.then(|| take(size_of::<ProducerBatch>() as u64));
@@ -621,17 +623,20 @@ pub(crate) fn build(
     let radii_at = take(4 * only(strands, u64::from(desc.max_vertices + sentinels)));
     let swept_indices_at = take(4 * only(swept, segments));
     let tube_positions_at = take(only(tubes, 12 * u64::from(TUBE_VERTICES) * clusters));
-    let refs_at = take(4 * clusters);
-    let counts_at = take(4 * BUILD_COUNTS);
-    let template_records_at = take(only(!tessellated, stride(RtasOp::BuildTemplates) * n_topo));
-    let instantiate_records_at = take(stride(RtasOp::InstantiateTemplates) * clusters);
-    let direct_records_at = take(stride(RtasOp::BuildClas) * clusters);
-    let blas_record_at = take(stride(RtasOp::BuildClusterBlas));
-    let templates_at = take(only(!tessellated, 8 * n_topo));
-    let instantiated_at = take(8 * clusters);
-    let direct_at = take(8 * clusters);
-    let clas_at = take(8 * clusters);
-    let blas_at = take(8);
+    let refs_at = take(only(traced, 4 * clusters));
+    let counts_at = take(only(traced, 4 * BUILD_COUNTS));
+    let template_records_at = take(only(own_templates, stride(RtasOp::BuildTemplates) * n_topo));
+    let instantiate_records_at = take(only(
+        traced,
+        stride(RtasOp::InstantiateTemplates) * clusters,
+    ));
+    let direct_records_at = take(only(traced, stride(RtasOp::BuildClas) * clusters));
+    let blas_record_at = take(only(traced, stride(RtasOp::BuildClusterBlas)));
+    let templates_at = take(only(own_templates, 8 * n_topo));
+    let instantiated_at = take(only(traced, 8 * clusters));
+    let direct_at = take(only(traced, 8 * clusters));
+    let clas_at = take(only(traced, 8 * clusters));
+    let blas_at = take(only(traced, 8));
     let len = take(0);
 
     let memory = device.gpu_malloc::<u8>(MemoryKind::DeviceLocal, len.max(16), "producer")?;
@@ -662,7 +667,7 @@ pub(crate) fn build(
         },
     };
     let swept = swept.then(|| Swept::new(device, swept_desc)).transpose()?;
-    let build_record = ProducerBuildGpu {
+    let build_record = traced.then(|| ProducerBuildGpu {
         template_records: at(template_records_at),
         instantiate_records: at(instantiate_records_at),
         direct_records: at(direct_records_at),
@@ -697,7 +702,7 @@ pub(crate) fn build(
             0
         },
         _pad: 0,
-    };
+    });
     let copy = subd.map(|s| {
         let (group, first, joints) = s.palette.unwrap_or((0, 0, 0));
         let [posed, points, previous] = match posed {
@@ -730,8 +735,12 @@ pub(crate) fn build(
     put(triangles_at, &triangles);
     put(topologies_at, bytemuck::cast_slice(&topologies));
     put(materials_at, bytemuck::cast_slice(desc.materials));
-    put(curve_at, bytemuck::cast_slice(&curve(CURVE)));
-    put(build_at, bytemuck::bytes_of(&build_record));
+    if own_templates {
+        put(curve_at, bytemuck::cast_slice(&curve(CURVE)));
+    }
+    if let Some(r) = &build_record {
+        put(build_at, bytemuck::bytes_of(r));
+    }
     if let Some(r) = &tess_record {
         put(tess_at, bytemuck::bytes_of(r));
     }
@@ -780,7 +789,7 @@ pub(crate) fn build(
         Some(Accel {
             record: at(build_at).cast(),
             strands,
-            templates: (n_topo > 0 && !tessellated)
+            templates: own_templates
                 .then(|| {
                     op(
                         topology_op(RtasOp::BuildTemplates, n_topo as u32),

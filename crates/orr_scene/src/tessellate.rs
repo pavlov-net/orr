@@ -72,13 +72,16 @@ fn largest() -> (u32, u32) {
 /// device has cluster acceleration structures, one CLAS template per pattern and opacity,
 /// built on first use.
 pub(crate) struct Patterns {
-    /// Table, topologies, the `PatternTable` record and template positions, written once.
+    /// Table, topologies, the `PatternTable` record and, with cluster acceleration
+    /// structures, template positions, written once.
     _memory: Allocation<u8>,
     table: GpuPtr<PatternTable>,
     pub(crate) topologies: GpuPtr<TopologyGpu>,
-    /// Per pattern and opacity, its CLAS template: the opaque ones, then the others.
+    /// Per pattern and opacity, its CLAS template: the opaque ones, then the others. Null
+    /// without cluster acceleration structures.
     pub(crate) templates: GpuPtr<u64>,
-    _templates: Allocation<u64>,
+    _templates: Option<Allocation<u64>>,
+    /// Template positions; null without cluster acceleration structures.
     curve: GpuPtr<[f32; 3]>,
     /// The template build; none without cluster acceleration structures.
     desc: Option<RtasOpDesc>,
@@ -97,16 +100,27 @@ impl Patterns {
         let topologies_at = (TABLE.len() as u64).next_multiple_of(16);
         let record_at = topologies_at + n * size_of::<TopologyGpu>() as u64;
         let curve_at = (record_at + size_of::<PatternTable>() as u64).next_multiple_of(16);
-        let len = curve_at + 12 * u64::from(max_vertices);
+        let caps = device.caps().cluster;
+        let traced = caps.max_tris > 0 && caps.max_partitions > 0;
+        let curve_len = if traced {
+            12 * u64::from(max_vertices)
+        } else {
+            0
+        };
+        let len = curve_at + curve_len;
         let mut memory =
             device.gpu_malloc::<u8>(MemoryKind::Upload, len, "tessellation patterns")?;
         let base = memory.gpu();
         let at = |o: u64| base.offset(o);
-        let templates = device.gpu_malloc::<u64>(
-            MemoryKind::DeviceLocal,
-            2 * n,
-            "tessellation template addresses",
-        )?;
+        let templates = traced
+            .then(|| {
+                device.gpu_malloc::<u64>(
+                    MemoryKind::DeviceLocal,
+                    2 * n,
+                    "tessellation template addresses",
+                )
+            })
+            .transpose()?;
         let vertices_at = 16 * PATTERNS as u64;
         let triangles_at = vertices_at + 4 * vertex_count() as u64;
         let topologies: Vec<TopologyGpu> = heads()
@@ -128,12 +142,12 @@ impl Patterns {
             bytes[topologies_at as usize..][..t.len()].copy_from_slice(t);
             let r = bytemuck::bytes_of(&record);
             bytes[record_at as usize..][..r.len()].copy_from_slice(r);
-            let c = curve(max_vertices as usize);
-            let c = bytemuck::cast_slice(&c);
-            bytes[curve_at as usize..][..c.len()].copy_from_slice(c);
+            if traced {
+                let c = curve(max_vertices as usize);
+                let c = bytemuck::cast_slice(&c);
+                bytes[curve_at as usize..][..c.len()].copy_from_slice(c);
+            }
         }
-        let caps = device.caps().cluster;
-        let traced = caps.max_tris > 0 && caps.max_partitions > 0;
         let desc = traced.then(|| {
             let total_tris: u32 = heads().map(|h| h[3]).sum();
             let total_verts: u32 = heads().map(|h| h[2]).sum();
@@ -155,12 +169,16 @@ impl Patterns {
             }
         });
         let table = at(record_at).cast();
-        let curve = at(curve_at).cast();
+        let curve = if traced {
+            at(curve_at).cast()
+        } else {
+            GpuPtr::NULL
+        };
         Ok(Self {
             _memory: memory,
             table,
             topologies: at(topologies_at).cast(),
-            templates: templates.gpu(),
+            templates: templates.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             _templates: templates,
             curve,
             desc,
