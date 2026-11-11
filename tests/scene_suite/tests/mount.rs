@@ -1409,6 +1409,7 @@ fn node_pages_move_out_of_draining_blocks_and_their_tables_follow() {
     assert_eq!(scenes.residency().failed, 0);
     assert_clean();
 }
+
 #[test]
 fn hierarchy_pages_stream_with_the_pages_below_them_and_leave_after_them() {
     let _serial = serial();
@@ -4452,6 +4453,7 @@ impl Tiled {
             tails,
         }
     }
+
     fn pool(&self) -> orr_scene::PoolFill {
         let memory = self.scenes.memory();
         *memory
@@ -4680,6 +4682,7 @@ fn moving_tiles_evicted_while_their_bind_waits_leave_their_move() {
     );
     assert_clean();
 }
+
 /// The neural pack's set: color mip 0 size, the latents' mip 0 size and layers.
 const NEURAL_SIZE: [u32; 2] = [1024, 512];
 const LATENT_SIZE: [u32; 2] = [512, 256];

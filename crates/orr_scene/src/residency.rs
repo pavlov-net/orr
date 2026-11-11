@@ -86,6 +86,7 @@ const SCALE_STEP: f64 = 0.95;
 pub(crate) fn response_period(fif: u32) -> u64 {
     HOLD_FRAMES + 1 + 3 * u64::from(fif)
 }
+
 /// The least share of its configured budget a class keeps.
 const MIN_SCALE: f64 = 0.125;
 
@@ -1055,6 +1056,7 @@ impl Residency {
             });
         }
     }
+
     /// Drops a mount's units; their memory is the caller's to free.
     pub(crate) fn unregister(&mut self, mount: MountId) {
         let Some(units) = self.mounts.remove(&mount) else {
@@ -1454,6 +1456,7 @@ impl Residency {
             }
         }
     }
+
     pub(crate) fn note_tile_move(&mut self) {
         self.stats.tiles_moved += 1;
     }
@@ -2805,6 +2808,7 @@ mod tests {
             "nothing kept: what the frame reads"
         );
     }
+
     /// A unit locked while its holder is used stays whatever the budget, with what it depends
     /// on. A sample counts those units only as its frame reads them, and reports the rest
     /// apart.
@@ -3119,6 +3123,7 @@ mod tests {
             (200, 200)
         );
     }
+
     #[test]
     fn failures_step_budgets_down_until_a_quiet_period_and_leave_user_blobs_alone() {
         let period = response_period(2);

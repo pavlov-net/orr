@@ -164,6 +164,7 @@ impl BlockUnits {
         self.0.get(block as usize)?.first().copied()
     }
 }
+
 /// Frames a tile goes unused before it may move: its map coarsens until it lands again.
 const MOVE_COLD_FRAMES: u64 = 8;
 
@@ -949,7 +950,6 @@ impl Streaming {
             }
         }
         self.residency.forget_failed_cuts(failed);
-
         let gone: Vec<Key> = self
             .resident
             .keys()
@@ -1272,7 +1272,6 @@ impl Streaming {
                 continue;
             };
             let slot = batch.slot as usize;
-
             let at = f.init.table.offset(u64::from(batch.slot));
             let FineState::Building { locks } =
                 std::mem::replace(&mut f.slots[slot], FineState::EMPTY)
@@ -1634,7 +1633,6 @@ impl Streaming {
             self.residency.lock_while_used(unit(q));
         }
         self.fine_locked += bytes;
-
         f.slots[k] = FineState::Building {
             locks: Locks { pages, bytes },
         };
@@ -2306,6 +2304,7 @@ impl Streaming {
         });
         Ok(())
     }
+
     /// Takes mesh page `k` out of stream pool slot `slot`, which returns once `frame` has
     /// completed.
     fn retire_page(&mut self, k: Key, slot: PoolSlot, frame: u64) {

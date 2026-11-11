@@ -341,6 +341,7 @@ mod tests {
             assert_eq!(d.scale(), 1.0);
         }
     }
+
     #[test]
     fn a_step_of_demand_wider_than_the_band_is_found_and_held_above() {
         let c = CAPACITY as f64;
