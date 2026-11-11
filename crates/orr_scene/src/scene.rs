@@ -136,19 +136,6 @@ pub(crate) struct PrototypeEntries {
     pub(crate) stride: u32,
 }
 
-/// The emissive list entries of the copies from slot `first`, `stride` each.
-fn fill_entries(entries: &mut [EmissiveGpu], first: u32, stride: u32) {
-    for (e, i) in entries.iter_mut().zip(0..) {
-        *e = EmissiveGpu {
-            kind: EMISSIVE_INSTANCE,
-            source: first + i / stride,
-            rank: i % stride,
-            set: NO_SET,
-            ..Zeroable::zeroed()
-        };
-    }
-}
-
 /// The emissive list entries of a page whose prototypes take `entries`.
 fn page_entries(entries: &[PrototypeEntries]) -> u32 {
     entries.iter().map(|e| e.records * e.stride).sum()
@@ -1318,9 +1305,37 @@ impl<'f> SceneWriter<'f> {
         self.scene.cpu.lock().unwrap().records.push(r);
     }
 
-    fn write<T: Pod>(&self, dst: GpuPtr<T>, value: T) -> Result<()> {
-        self.upload::<T>(dst, 1)?[0] = value;
-        Ok(())
+    /// `value` in the window and its copy to `dst`, for the caller to push once nothing it
+    /// does after can fail.
+    fn staged<T: Pod>(&self, dst: GpuPtr<T>, value: &T) -> Result<Record> {
+        let src = self.window.put(self.device, value)?;
+        Ok(Record::values(self.next_seq(), dst, src, 1))
+    }
+
+    /// Fills window room `out` at `src` with the emissive list entries of the copies from slot
+    /// `first`, `stride` each, recorded as a copy to instance entry `entry`.
+    fn put_entries(
+        &self,
+        (src, out): (GpuPtr<EmissiveGpu>, &mut [EmissiveGpu]),
+        first: u32,
+        entry: u32,
+        stride: u32,
+    ) {
+        for (e, i) in out.iter_mut().zip(0..) {
+            *e = EmissiveGpu {
+                kind: EMISSIVE_INSTANCE,
+                source: first + i / stride,
+                rank: i % stride,
+                set: NO_SET,
+                ..Zeroable::zeroed()
+            };
+        }
+        self.push(Record::values(
+            self.next_seq(),
+            self.scene.emissive_entry(entry),
+            src,
+            out.len() as u32,
+        ));
     }
 
     /// A new transform group; its transforms start all-zero (hidden).
@@ -1354,28 +1369,30 @@ impl<'f> SceneWriter<'f> {
             page: None,
             frame,
         };
-        let record = group.record();
+        let record = self.window.put(self.device, &group.record())?;
         let zero = Record::fill(
             self.next_seq(),
             group.buffers[0].gpu().address().0,
             words(bytes as usize),
             0,
         );
-        let id = {
-            let mut cpu = self.scene.cpu.lock().unwrap();
-            let id = cpu.free_group();
-            if id as u32 >= self.scene.desc.group_capacity {
-                return Err(Error::Capacity {
-                    what: "transform groups",
-                    capacity: self.scene.desc.group_capacity,
-                });
-            }
-            cpu.put_group(id, group);
-            cpu.records.push(zero);
-            id as u32
-        };
-        self.write(self.scene.tables.groups.gpu().offset(u64::from(id)), record)?;
-        Ok(TransformGroupId(id))
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        let id = cpu.free_group();
+        if id as u32 >= self.scene.desc.group_capacity {
+            return Err(Error::Capacity {
+                what: "transform groups",
+                capacity: self.scene.desc.group_capacity,
+            });
+        }
+        cpu.put_group(id, group);
+        cpu.records.push(zero);
+        cpu.records.push(Record::values(
+            self.next_seq(),
+            self.scene.tables.groups.gpu().offset(id as u64),
+            record,
+            1,
+        ));
+        Ok(TransformGroupId(id as u32))
     }
 
     /// Transforms `first..first + count` of a CPU-written group, relative to its anchor.
@@ -1407,6 +1424,7 @@ impl<'f> SceneWriter<'f> {
         count: u32,
         without_motion: bool,
     ) -> Result<&'f mut [AffineRows]> {
+        let (src, out) = self.window.slice::<AffineRows>(self.device, count)?;
         let (current, previous) = {
             let mut cpu = self.scene.cpu.lock().unwrap();
             let g = cpu
@@ -1428,7 +1446,6 @@ impl<'f> SceneWriter<'f> {
             let at = |b: &Allocation<u8>| b.gpu().cast::<AffineRows>().offset(u64::from(first));
             (at(&g.buffers[g.current]), at(&g.buffers[1 - g.current]))
         };
-        let (src, out) = self.window.slice::<AffineRows>(self.device, count)?;
         self.push(Record::values(self.next_seq(), current, src, count));
         // The current-to-previous copy runs before the scatter, so this lands on top of it.
         if without_motion {
@@ -1522,14 +1539,8 @@ impl<'f> SceneWriter<'f> {
             partitions_src,
             desc.copies,
         ));
-        if let Some((src, out)) = entries {
-            fill_entries(out, first, ranks);
-            self.push(Record::values(
-                self.next_seq(),
-                self.scene.emissive_entry(entry),
-                src,
-                desc.copies * ranks,
-            ));
+        if let Some(room) = entries {
+            self.put_entries(room, first, entry, ranks);
         }
         let first_entry = self.scene.desc.producer_capacity + entry;
         let range = InstanceRange {
@@ -2147,14 +2158,8 @@ impl<'f> SceneWriter<'f> {
             cpu.ptlas.place_skinned(first, desc.copies);
             (first, entry, emissive)
         };
-        if let Some((src, out)) = entries {
-            fill_entries(out, first, ranks);
-            self.push(Record::values(
-                self.next_seq(),
-                self.scene.emissive_entry(emissive),
-                src,
-                desc.copies * ranks,
-            ));
+        if let Some(room) = entries {
+            self.put_entries(room, first, emissive, ranks);
         }
         let first_emissive = self.scene.desc.producer_capacity + emissive;
         let range = InstanceRange {
@@ -2468,6 +2473,8 @@ impl<'f> SceneWriter<'f> {
         let t = &self.scene.tables;
         let i = u64::from(id.0);
         let counts = t.producer_counts.gpu().offset(i);
+        // Window room comes first, so nothing is recorded unless all of it is.
+        let mut copies = Vec::with_capacity(6);
         let (record, batch, patches, entry, producer) = match desc {
             None => (
                 ProducerGpu::zeroed(),
@@ -2485,8 +2492,10 @@ impl<'f> SceneWriter<'f> {
                     self.patterns,
                     subd,
                 )?;
-                let words = self.upload(b.static_at, (b.static_bytes.len() / 4) as u32)?;
+                let n = (b.static_bytes.len() / 4) as u32;
+                let (src, words) = self.window.slice::<u32>(self.device, n)?;
                 bytemuck::cast_slice_mut(words).copy_from_slice(&b.static_bytes);
+                copies.push(Record::values(self.next_seq(), b.static_at, src, n));
                 let entry = EmissiveGpu {
                     kind: EMISSIVE_PRODUCER,
                     source: id.0,
@@ -2495,33 +2504,36 @@ impl<'f> SceneWriter<'f> {
                 (b.record, b.batch, b.patches, entry, Some(b.producer))
             }
         };
+        copies.push(self.staged(t.producers.gpu().offset(i), &record)?);
+        copies.push(self.staged(t.batches.gpu().offset(i), &batch)?);
+        copies.push(self.staged(t.patches.gpu().offset(i), &patches)?);
+        copies.push(self.staged(t.tess_state.gpu().offset(i), &TessStateGpu::zeroed())?);
+        copies.push(self.staged(t.emissive.gpu().offset(i), &entry)?);
         let emit_counts = producer.as_ref().map_or(counts, |p| p.emit_counts);
-        self.write(t.producers.gpu().offset(i), record)?;
-        self.write(t.batches.gpu().offset(i), batch)?;
-        self.write(t.patches.gpu().offset(i), patches)?;
-        self.write(t.tess_state.gpu().offset(i), TessStateGpu::zeroed())?;
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        cpu.records.append(&mut copies);
         if emit_counts != counts {
-            self.push(Record::fill(self.next_seq(), emit_counts.address().0, 4, 0));
+            cpu.records
+                .push(Record::fill(self.next_seq(), emit_counts.address().0, 4, 0));
         }
-        self.write(t.emissive.gpu().offset(i), entry)?;
-        self.push(Record::fill(self.next_seq(), counts.address().0, 4, 0));
+        cpu.records
+            .push(Record::fill(self.next_seq(), counts.address().0, 4, 0));
         // The new entry has built nothing; its PTLAS instance follows from the record.
         let state = t.producer_state.gpu().offset(i);
         let blas = std::mem::offset_of!(ProducerStateGpu, blas) as u64;
-        self.push(Record::fill(
+        cpu.records.push(Record::fill(
             self.next_seq(),
             state.address().0 + blas,
             2,
             0,
         ));
         let clusters = std::mem::offset_of!(ProducerStateGpu, clusters) as u64;
-        self.push(Record::fill(
+        cpu.records.push(Record::fill(
             self.next_seq(),
             state.address().0 + clusters,
             1,
             0,
         ));
-        let cpu = &mut *self.scene.cpu.lock().unwrap();
         if let Some(old) = std::mem::replace(&mut cpu.producers[id.0 as usize], producer) {
             cpu.retired.push((self.frame, old));
         }
@@ -2541,17 +2553,19 @@ impl<'f> SceneWriter<'f> {
             light,
             Some(Light::Sphere { radius, .. }) if *radius > 0.0
         ) || matches!(light, Some(Light::Rect { .. }));
-        let origin = {
-            let mut cpu = self.scene.cpu.lock().unwrap();
-            cpu.ptlas.set_light(id.0, proxied);
-            cpu.lights.set(id.0, light);
-            cpu.origin_cell
-        };
-        let record = light.map_or_else(LightGpu::zeroed, |l| light_gpu(l, origin, self.cell_log2));
-        self.write(
+        let (src, out) = self.window.slice::<LightGpu>(self.device, 1)?;
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        cpu.ptlas.set_light(id.0, proxied);
+        cpu.lights.set(id.0, light);
+        let origin = cpu.origin_cell;
+        out[0] = light.map_or_else(LightGpu::zeroed, |l| light_gpu(l, origin, self.cell_log2));
+        cpu.records.push(Record::values(
+            self.next_seq(),
             self.scene.tables.lights.gpu().offset(u64::from(id.0)),
-            record,
-        )
+            src,
+            1,
+        ));
+        Ok(())
     }
 
     /// Sets or clears decal `id`, from this frame on.
@@ -2561,15 +2575,15 @@ impl<'f> SceneWriter<'f> {
             "{id:?} outside the decal table"
         );
         let record = decal.map_or_else(DecalGpu::zeroed, |d| decal_gpu(d, self.cell_log2));
-        {
-            let mut cpu = self.scene.cpu.lock().unwrap();
-            cpu.decals[id.0 as usize] = decal.map(|d| listing(d, self.cell_log2));
-            cpu.decals_changed = true;
-        }
-        self.write(
+        let copy = self.staged(
             self.scene.tables.decals.gpu().offset(u64::from(id.0)),
-            record,
-        )
+            &record,
+        )?;
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        cpu.decals[id.0 as usize] = decal.map(|d| listing(d, self.cell_log2));
+        cpu.decals_changed = true;
+        cpu.records.push(copy);
+        Ok(())
     }
 
     /// Sets or clears medium proxy `id`, from this frame on.
@@ -2583,16 +2597,14 @@ impl<'f> SceneWriter<'f> {
             "{id:?} outside the medium proxy table"
         );
         let record = proxy.map_or_else(MediumProxyGpu::zeroed, |p| proxy_gpu(p, self.cell_log2));
-        self.scene
-            .cpu
-            .lock()
-            .unwrap()
-            .ptlas
-            .set_proxy(id.0, proxy.is_some());
-        self.write(
+        let copy = self.staged(
             self.scene.tables.proxies.gpu().offset(u64::from(id.0)),
-            record,
-        )
+            &record,
+        )?;
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        cpu.ptlas.set_proxy(id.0, proxy.is_some());
+        cpu.records.push(copy);
+        Ok(())
     }
 
     /// Consumer data for the linked environment, which kernels that link one need before the
