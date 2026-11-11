@@ -11,6 +11,7 @@ use orr_scene::{GBufferGpu, SceneRoot, ViewConstants};
 
 use crate::Error;
 use crate::TracedKind;
+use crate::scene::{FRAME_SLOTS, Ring};
 use crate::shaders::probe::{MODULE, OriginProbeGpu, OriginProbeRoot};
 use crate::shaders::traced::{self, TracedRoot};
 use crate::shaders::types::TracedHit;
@@ -182,23 +183,23 @@ impl fmt::Display for OriginProbe {
     }
 }
 
-/// A view's [`crate::LightingDebugView::Traced`] pass: its pipeline, made at its first frame,
-/// and the root of its last frame.
+/// A view's [`crate::LightingDebugView::Traced`] pass: its pipeline and its roots, one per
+/// frame slot, made at its first frame.
 #[derive(Default)]
 pub struct TracedViews {
-    pipeline: Option<ComputePipeline>,
-    root: Option<Allocation<TracedRoot>>,
+    pass: Option<(ComputePipeline, Ring<TracedRoot>)>,
 }
 
 impl TracedViews {
     /// Records the traced view `kind` of the G-buffer `gbuffer` over `radiance`, a storage
-    /// image of `extent`, into `list`, after the paths wrote it.
+    /// image of `extent`, into `list` for frame `frame`, after the paths wrote it.
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
         device: &Device,
         kernels: &KernelSet,
         list: &mut CommandList<'_>,
+        frame: u64,
         kind: TracedKind,
         scene: GpuPtr<SceneRoot>,
         view: GpuPtr<ViewConstants>,
@@ -206,11 +207,13 @@ impl TracedViews {
         radiance: StorageImageIndex,
         extent: [u32; 2],
     ) -> Result<(), Error> {
-        if self.pipeline.is_none() {
-            self.pipeline = Some(crate::pipeline(device, kernels, &traced::MODULE, "traced")?);
+        if self.pass.is_none() {
+            self.pass = Some((
+                crate::pipeline(device, kernels, &traced::MODULE, "traced")?,
+                Ring::new(device, "traced view roots")?,
+            ));
         }
-        let mut root =
-            device.gpu_malloc::<TracedRoot>(MemoryKind::Upload, 1, "traced view root")?;
+        let (pipeline, roots) = self.pass.as_mut().expect("made above");
         // `TRACED_*` in `traced.slang`.
         let mode = match kind {
             TracedKind::Distance => 0,
@@ -218,27 +221,28 @@ impl TracedViews {
             TracedKind::Disagreement => 2,
             TracedKind::Sun => 3,
         };
-        root.as_mut_slice().expect("upload memory")[0] = TracedRoot {
-            scene,
-            view,
-            gbuffer,
-            radiance,
-            mode,
-            width: extent[0],
-            height: extent[1],
-            _pad: 0,
-        };
+        let root = roots.write(
+            (frame % FRAME_SLOTS as u64) as usize,
+            TracedRoot {
+                scene,
+                view,
+                gbuffer,
+                radiance,
+                mode,
+                width: extent[0],
+                height: extent[1],
+                _pad: 0,
+            },
+        );
         list.begin_pass("traced view", false);
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         list.dispatch(
-            self.pipeline.as_ref().expect("made above"),
-            root.gpu(),
+            pipeline,
+            root,
             [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
         );
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         list.end_pass();
-        // The last frame's root is freed once its work has completed.
-        self.root = Some(root);
         Ok(())
     }
 }

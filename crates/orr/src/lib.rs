@@ -1474,6 +1474,7 @@ impl<'a> Frame<'a> {
                 &gpu,
                 self.lighting.kernels,
                 list,
+                id,
                 kind,
                 pass.scene,
                 pass.view,
