@@ -1,0 +1,2 @@
+# orr has no downstream crates, so lints also judge public API.
+avoid-breaking-exported-api = false

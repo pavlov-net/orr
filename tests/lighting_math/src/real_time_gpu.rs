@@ -140,7 +140,7 @@ impl BsdfCaseResult {
 
 impl CaseSample {
     /// `None` when the density is 0.
-    pub fn to_sample(&self) -> Option<Sample> {
+    pub fn to_sample(self) -> Option<Sample> {
         (self.pdf > 0.0).then_some(Sample {
             wi: self.wi,
             weight: self.weight,
