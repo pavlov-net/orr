@@ -1004,45 +1004,57 @@ impl Residency {
         let after = u.kept();
         let bytes = u.held();
         let sampled = u.sampled == self.sample;
-        for (kept, add) in [(before, false), (after, true)] {
-            let apply = |total: &mut u64| {
-                if add {
-                    *total += bytes;
-                } else {
-                    *total -= bytes;
+        self.account(c, before, sampled, bytes, false);
+        self.account(c, after, sampled, bytes, true);
+    }
+
+    /// Adds `bytes` of class `c` to the total of what keeps them, `kept`, or takes them out
+    /// of it when not `add`; `sampled` when the latest sample counted them.
+    fn account(&mut self, c: usize, kept: Kept, sampled: bool, bytes: u64, add: bool) {
+        let apply = |total: &mut u64| {
+            if add {
+                *total += bytes;
+            } else {
+                *total -= bytes;
+            }
+        };
+        match kept {
+            Kept::No => {}
+            Kept::WhileUsed => {
+                apply(&mut self.while_used[c]);
+                if sampled {
+                    apply(&mut self.sampled_while_used[c]);
                 }
-            };
-            match kept {
-                Kept::No => {}
-                Kept::WhileUsed => {
-                    apply(&mut self.while_used[c]);
-                    if sampled {
-                        apply(&mut self.sampled_while_used[c]);
-                    }
-                }
-                Kept::Under => apply(&mut self.under[c]),
-                Kept::Fixed => apply(&mut self.fixed[c]),
+            }
+            Kept::Under => apply(&mut self.under[c]),
+            Kept::Fixed => apply(&mut self.fixed[c]),
+        }
+    }
+
+    /// The units `k` depends on, directly or through others, each once.
+    fn under(&self, k: Key) -> Vec<u32> {
+        let units = &self.mounts[&k.mount];
+        let mut stack = units[k.unit as usize].deps.clone();
+        let mut seen = FxHashSet::default();
+        let mut out = Vec::new();
+        while let Some(d) = stack.pop() {
+            if seen.insert(d) {
+                out.push(d);
+                stack.extend_from_slice(&units[d as usize].deps);
             }
         }
+        out
     }
 
     /// Counts `k`, which holds what it depends on as `how`, on every unit it depends on,
     /// directly or through others, when `hold`, and takes that back otherwise.
     fn hold_under(&mut self, k: Key, how: Kept, hold: bool) {
-        let units = &self.mounts[&k.mount];
-        let mut stack = units[k.unit as usize].deps.clone();
-        let mut seen = FxHashSet::default();
-        while let Some(d) = stack.pop() {
-            if !seen.insert(d) {
-                continue;
-            }
-            let u = &self.mounts[&k.mount][d as usize];
+        for d in self.under(k) {
             debug_assert_eq!(
-                u.state,
+                self.mounts[&k.mount][d as usize].state,
                 State::Resident,
                 "a resident unit's dependencies are"
             );
-            stack.extend_from_slice(&u.deps);
             self.rekeep(k.mount, d, |u| {
                 let count = match how {
                     Kept::Fixed => &mut u.held_by,
@@ -1068,17 +1080,8 @@ impl Residency {
                 State::Resident => {
                     self.used[c] -= u.held();
                     self.resident_units[c] -= 1;
-                    match u.kept() {
-                        Kept::No => {}
-                        Kept::WhileUsed => {
-                            self.while_used[c] -= u.held();
-                            if u.sampled == self.sample {
-                                self.sampled_while_used[c] -= u.held();
-                            }
-                        }
-                        Kept::Under => self.under[c] -= u.held(),
-                        Kept::Fixed => self.fixed[c] -= u.held(),
-                    }
+                    let sampled = u.sampled == self.sample;
+                    self.account(c, u.kept(), sampled, u.held(), false);
                     if u.evictable() {
                         let k = Key {
                             mount,
@@ -1292,19 +1295,13 @@ impl Residency {
             *taken += 1;
             // Its last lock gone, it stops holding what it depends on, as `hold_under` counts.
             if u.holds() == Kept::WhileUsed && *taken == u.locks {
-                let units = &self.mounts[&k.mount];
-                let mut stack = u.deps.clone();
-                let mut seen = FxHashSet::default();
-                while let Some(d) = stack.pop() {
-                    if seen.insert(d) {
-                        let q = Key {
-                            mount: k.mount,
-                            unit: d,
-                        };
-                        *r.used.entry(q).or_default() += 1;
-                        changed.push(q);
-                        stack.extend_from_slice(&units[d as usize].deps);
-                    }
+                for d in self.under(k) {
+                    let q = Key {
+                        mount: k.mount,
+                        unit: d,
+                    };
+                    *r.used.entry(q).or_default() += 1;
+                    changed.push(q);
                 }
             }
             changed.push(k);
