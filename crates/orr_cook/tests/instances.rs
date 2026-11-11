@@ -435,6 +435,48 @@ fn joined_pages_decode_exactly() {
     ])));
 }
 
+/// Joined placements a meter apart over 199 m of a cell, more than 65535 steps of the block's
+/// mesh grid, decode exactly.
+#[test]
+fn joined_pages_span_a_cell_on_a_step_their_placements_share() {
+    let records: Vec<Placement> = (0..200)
+        .map(|i| Placement {
+            position: [10.0 + f64::from(i), 3.0, -20.0 - f64::from(i % 3)],
+            linear: Linear::Scaled {
+                rotation: Quat::IDENTITY.to_array(),
+                scale: [1.0; 3],
+            },
+            prototype: 0,
+        })
+        .collect();
+    let a = cook_instances(Instances {
+        records: records.clone(),
+        prototypes: vec![proto(0)],
+        joined: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let e = pages(&a)[0];
+    let (cell, decoded) = instance::decode(&read(&a, e, 0), &read(&a, e, 1)).unwrap();
+    assert_eq!(cell, [0, 0, -1]);
+    let corner = DVec3::new(0.0, 0.0, -256.0);
+    let mut got: Vec<[u32; 3]> = decoded
+        .map(|(_, m)| m.translation.to_array().map(f32::to_bits))
+        .collect();
+    let mut want: Vec<[u32; 3]> = records
+        .iter()
+        .map(|p| {
+            (DVec3::from(p.position) - corner)
+                .as_vec3()
+                .to_array()
+                .map(f32::to_bits)
+        })
+        .collect();
+    got.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(got, want);
+}
+
 /// A sheared copy keeps its transform bit for bit in the page's exact table, a row per distinct
 /// transform, and leaves the scale grid to the compact records; a transform a compact record
 /// holds exactly stays compact.
