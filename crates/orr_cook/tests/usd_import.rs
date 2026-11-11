@@ -440,7 +440,7 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
         let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
         assert_eq!(info.prototypes[0].model, AssetId::from_name("u/Tree"));
         let h = info.header;
-        let half_step = DVec3::from(h.extent.map(|e| f64::from(e) / 65535.0 / 2.0));
+        let half_step = DVec3::from(h.step.map(|s| f64::from(s) / 2.0));
         let (cell, records) = orr_pack::instance::decode(&head, &bytes).unwrap();
         for (_, m) in records {
             let p = m.translation.as_dvec3() + DVec3::from(cell.map(f64::from)) * 256.0;
