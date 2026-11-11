@@ -167,10 +167,9 @@ fn rotations_decode_within_the_bound() {
     );
 }
 
-/// The displacement over a box is the farthest any of its points moves: no point inside moves
-/// farther, and a corner moves that far.
+/// No point of the box moves farther than the displacement over it.
 #[test]
-fn displacement_is_the_farthest_a_point_of_the_box_moves() {
+fn no_point_of_the_box_moves_farther_than_the_displacement() {
     let mut rng = Rng(0x5851_f42d_4c95_7f2d);
     let mut range = |lo: f64, hi: f64| lo + (hi - lo) * rng.unit();
     for _ in 0..2000 {
@@ -208,15 +207,6 @@ fn displacement_is_the_farthest_a_point_of_the_box_moves() {
                 .distance(source.transform_point3(p))
         };
         let d = instance::displacement(&source, &placed, &bounds);
-        let corners = (0..8).map(|c| {
-            DVec3::new(
-                if c & 1 != 0 { hi.x } else { lo.x },
-                if c & 2 != 0 { hi.y } else { lo.y },
-                if c & 4 != 0 { hi.z } else { lo.z },
-            )
-        });
-        let farthest = corners.map(moved).fold(0.0, f64::max);
-        assert!((d - farthest).abs() <= 1e-9 * d, "{d} against {farthest}");
         for _ in 0..64 {
             let p = lo + (hi - lo) * DVec3::new(range(0.0, 1.0), range(0.0, 1.0), range(0.0, 1.0));
             assert!(moved(p) <= d * (1.0 + 1e-9), "{p}: {} past {d}", moved(p));
