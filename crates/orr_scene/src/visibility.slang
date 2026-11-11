@@ -266,12 +266,13 @@ public bool mesh_has_merged_stage(MeshGpu* mesh)
     return mesh.root_count > mesh.part_count * mesh.section_count;
 }
 
-// `error` (m, mesh space) over `sphere` placed by `p` relative to the focus, in pixels at
-// `pixels_per_radian`: the projection the traversal tests its thresholds with.
-public float focus_pixels(Placement p, float4 sphere, float error, float pixels_per_radian)
+// `error` (m, mesh space) over `sphere` placed by `p` relative to the focus, the sphere taken
+// `slack` m nearer, in pixels at `pixels_per_radian`: the projection the traversal tests its
+// thresholds with.
+public float focus_pixels(Placement p, float4 sphere, float error, float pixels_per_radian, float slack = 0.0)
 {
     float3 c = exact_place(p, sphere.xyz);
-    precise float gap = exact_length(c) - sphere.w * p.scale;
+    precise float gap = exact_length(c) - sphere.w * p.scale - slack;
     float d = max(gap, FOCUS_NEAR);
     precise float e = error * p.scale / d * pixels_per_radian;
     return e;

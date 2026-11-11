@@ -645,12 +645,41 @@ fn bound_groups(groups: &mut [DagGroup], step: f64) {
                 radius = radius.max(distance(center64, center) + f64::from(s.radius));
             }
         }
-        let mut r = radius as f32;
-        if f64::from(r) < radius {
-            r = r.next_up();
-        }
-        groups[i].sphere.radius = r;
+        groups[i].sphere.radius = round_up(radius);
     }
+}
+
+/// The least f32 at or above `radius`.
+fn round_up(radius: f64) -> f32 {
+    let r = radius as f32;
+    if f64::from(r) < radius {
+        r.next_up()
+    } else {
+        r
+    }
+}
+
+/// Grows the sphere of each internal node at and under `at` about its center to hold its
+/// children's spheres. `clodBuildHierarchy` merges them in f32 and leaves some children
+/// reaching past their node, and the traversal enters a node by its sphere for every group
+/// under it.
+fn bound_nodes(nodes: &mut [ffi::clodNode], at: usize) {
+    let n = nodes[at];
+    if n.group >= 0 {
+        return;
+    }
+    let center = n.bounds.center.map(f64::from);
+    let mut radius = f64::from(n.bounds.radius);
+    for c in n.child_offset as usize..(n.child_offset + n.child_count) as usize {
+        bound_nodes(nodes, c);
+        let s = nodes[c].bounds;
+        let apart = (0..3)
+            .map(|i| (center[i] - f64::from(s.center[i])).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        radius = radius.max(apart + f64::from(s.radius));
+    }
+    nodes[at].bounds.radius = round_up(radius);
 }
 
 /// The partition target whose largest partitions (a third over the target) hold at most
@@ -810,6 +839,7 @@ fn hierarchy(groups: &[DagGroup]) -> (Vec<ffi::clodNode>, usize) {
         });
     }
     let root = if levels > 1 { nodes.len() - 1 } else { 0 };
+    bound_nodes(&mut nodes, root);
     (nodes, root)
 }
 

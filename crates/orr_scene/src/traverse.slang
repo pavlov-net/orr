@@ -97,13 +97,34 @@ bool has_focus()
     return (root.flags & TRAVERSE_FOCUS) != 0;
 }
 
-// `error` (m, mesh space) over `sphere` placed by `p`, in pixels at the focus. Without a
-// focus every error above 0 projects to infinity. The arithmetic is exact (`exact_place`).
-float focus_error(Placement p, float4 sphere, float error)
+// The share by which an internal node's tests reach past its sphere: 64 units of f32
+// roundoff u = 2^-24. The cook's node spheres hold their children's and a node's error is
+// the largest under it, so computed exactly a node is no farther from the focus and no less
+// pinned than any group under it, and its error no smaller: entering nodes by their error
+// reaches every group a cut takes. As `focus_error` computes it, a placed center is off by
+// up to 4 u a component of scale |center| + |translation|, its length by 11 u more (Vulkan
+// lets a square root err 9 u), the scaled radius and the difference by u each, and
+// `largest_scale` may fall 17 u short of what the linear part stretches. The distances of a
+// node and of a group under it are so off by under 41 u of (|center| + radius) scale +
+// |translation| of the node together, which `node_slack` takes off the node's. The quotient
+// may err 5 u on either side and the products around it u each, and each side of the pin
+// test 4 u: the same share on the node's error and on its pin reach covers them.
+static const float NODE_SLACK = 1.0 / 262144.0;
+
+// What an internal node's distance from the focus gives up to rounding, in m.
+float node_slack(Placement p, float4 sphere)
+{
+    return NODE_SLACK * ((length(sphere.xyz) + sphere.w) * p.scale + length(p.translation));
+}
+
+// `error` (m, mesh space) over `sphere` placed by `p`, in pixels at the focus, the sphere
+// taken `slack` m nearer. Without a focus every error above 0 projects to infinity. The
+// arithmetic is exact (`exact_place`).
+float focus_error(Placement p, float4 sphere, float error, float slack = 0.0)
 {
     if (!has_focus())
         return error > 0.0 ? asfloat(0x7f800000u) : 0.0;
-    return focus_pixels(p, sphere, error, root.focus_offset.w);
+    return focus_pixels(p, sphere, error, root.focus_offset.w, slack);
 }
 
 bool filling()
@@ -142,8 +163,9 @@ void fill_cluster(SceneRoot* s, CutGpu* cut, uint slot, uint id, uint section, f
     gather_emissive(s, inst, s.meshes + s.models[inst.model].mesh, id, section);
 }
 
-// Whether `mesh` is an edit that holds what `sphere` covers at level 0.
-bool edit_pins(MeshGpu* mesh, float4 sphere)
+// Whether `mesh` is an edit that holds what `sphere`, reaching `grow` times as far, covers at
+// level 0.
+bool edit_pins(MeshGpu* mesh, float4 sphere, float grow)
 {
     EditGpu* e = mesh.edit;
     if (e == nullptr)
@@ -155,7 +177,7 @@ bool edit_pins(MeshGpu* mesh, float4 sphere)
         float4 t = e.spheres[i];
         precise float3 d = sphere.xyz - t.xyz;
         precise float apart = d.x * d.x + d.y * d.y + d.z * d.z;
-        precise float r = sphere.w + t.w;
+        precise float r = (sphere.w + t.w) * grow;
         precise float reach = r * r;
         if (apart <= reach)
             return true;
@@ -166,11 +188,13 @@ bool edit_pins(MeshGpu* mesh, float4 sphere)
 // `focus_error`, infinite where an edit pins the sphere so that coarser clusters are never
 // taken there. A group's entry and the clusters simplified from it read one sphere, so the
 // cut stays watertight around what is pinned.
-float cut_error(MeshGpu* mesh, Placement p, float4 sphere, float error)
+// An internal node's sphere takes `node_slack` as `slack` and 1 + NODE_SLACK as `grow`; a
+// group's takes 0 and 1, which change no bit.
+float cut_error(MeshGpu* mesh, Placement p, float4 sphere, float error, float slack, float grow)
 {
-    if (error > 0.0 && edit_pins(mesh, sphere))
+    if (error > 0.0 && edit_pins(mesh, sphere, grow))
         return asfloat(0x7f800000u);
-    return focus_error(p, sphere, error);
+    return focus_error(p, sphere, error, slack);
 }
 
 // What scales a slot's errors and thresholds this frame.
@@ -974,16 +998,17 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         bool endless = false;
         if (want != 0)
         {
-            float e = cut_error(mesh, p, sphere, error * l.scale);
+            float grow = several ? 1.0 + NODE_SLACK : 1.0;
+            float e = cut_error(mesh, p, sphere, error * l.scale, several ? node_slack(p, sphere) : 0.0, grow);
             endless = isinf(e);
             for (uint k = 0; k < 2; k++)
             {
                 if ((want & (1u << k)) == 0)
                     continue;
-                // A merged sphere of several groups takes the visible threshold, which enters
-                // it wherever a group below it may be wanted.
+                // A merged sphere of several groups takes the visible threshold, which with
+                // its slack enters it wherever a cut takes a group below it.
                 bool decided = false;
-                bool is_over = several ? e > l.threshold[k] : over(st, l, k, e, sphere, known, tests, decided);
+                bool is_over = several ? e * grow > l.threshold[k] : over(st, l, k, e, sphere, known, tests, decided);
                 finer |= is_over ? 1u << k : 0;
                 held |= decided ? 1u << k : 0;
             }

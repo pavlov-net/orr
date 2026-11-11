@@ -252,6 +252,16 @@ fn check_structure(d: &Dag) -> Vec<u64> {
             assert_eq!(n.max_error.to_bits(), g.error.to_bits());
         }
     }
+    // An internal node's sphere holds its children's and its error is at least theirs, so
+    // the traversal's test of a node stands for every group under it.
+    for n in d.nodes.iter().filter(|n| n.group < 0) {
+        let children = &d.nodes[n.child_first as usize..][..usize::from(n.child_count)];
+        for c in children {
+            let reach = apart(center(&c.sphere), center(&n.sphere)) + f64::from(c.sphere.radius);
+            assert!(reach <= f64::from(n.sphere.radius), "{n:?} holds {c:?}");
+            assert!(c.max_error <= n.max_error, "{n:?} over {c:?}");
+        }
+    }
     // A group names its leaf's node page, the top one for a group in a pinned page.
     for (i, n) in d.nodes.iter().enumerate() {
         let Ok(g) = usize::try_from(n.group) else {
