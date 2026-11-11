@@ -235,6 +235,34 @@ public float exact_length(float3 x)
     return sqrt(q);
 }
 
+// Distances from the focus clamp here, so a sphere around the focus takes its finest
+// clusters.
+public static const float FOCUS_NEAR = 0.01;
+
+// The sphere around the model's bounds, in mesh space.
+public float4 model_sphere(ModelGpu* model)
+{
+    return float4(0.5 * (model.bounds_min + model.bounds_max), 0.5 * length(model.bounds_max - model.bounds_min));
+}
+
+// Whether the DAG mesh has a merged stage: roots past the part stage's, one per part and
+// section.
+public bool mesh_has_merged_stage(MeshGpu* mesh)
+{
+    return mesh.root_count > mesh.part_count * mesh.section_count;
+}
+
+// `error` (m, mesh space) over `sphere` placed by `p` relative to the focus, in pixels at
+// `pixels_per_radian`: the projection the traversal tests its thresholds with.
+public float focus_pixels(Placement p, float4 sphere, float error, float pixels_per_radian)
+{
+    float3 c = exact_place(p, sphere.xyz);
+    precise float gap = exact_length(c) - sphere.w * p.scale;
+    float d = max(gap, FOCUS_NEAR);
+    precise float e = error * p.scale / d * pixels_per_radian;
+    return e;
+}
+
 // `pixel_from_clip(v, clip)`.
 public float2 exact_pixel(ViewConstants* v, float4 clip)
 {

@@ -42,7 +42,6 @@ static const float UNSEEN_RATE = 1.0 / 15.0;
 static const float RATE_STEP = 0.9;
 static const float STEP_DOWN = 0.85;
 static const float STEP_UP = 0.6;
-static const float FOCUS_NEAR = 0.01;
 static const uint WELD_PROBES = 32;
 
 // `TessRoot.flags`.

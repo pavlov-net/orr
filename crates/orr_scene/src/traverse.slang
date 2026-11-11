@@ -61,10 +61,6 @@ public static const uint ARGS_TOTAL = ARGS_ADMIT + 6 * (ADMIT_LEVELS - 1);
 // `CutGpu.counters` past CUT_COUNTERS: the BLAS build count.
 public static const uint CUT_BUILDS = CUT_COUNTERS;
 
-// Distances from the focus clamp here, so a sphere around the focus takes its finest
-// clusters.
-static const float FOCUS_NEAR = 0.01;
-
 static const uint SELECT_THREADS = 256;
 static const uint SELECT_SPAN = ADMIT_BUCKETS / SELECT_THREADS;
 
@@ -107,11 +103,7 @@ float focus_error(Placement p, float4 sphere, float error)
 {
     if (!has_focus())
         return error > 0.0 ? asfloat(0x7f800000u) : 0.0;
-    float3 c = exact_place(p, sphere.xyz);
-    precise float gap = exact_length(c) - sphere.w * p.scale;
-    float d = max(gap, FOCUS_NEAR);
-    precise float e = error * p.scale / d * root.focus_offset.w;
-    return e;
+    return focus_pixels(p, sphere, error, root.focus_offset.w);
 }
 
 bool filling()
@@ -286,12 +278,6 @@ bool over(Stage st, Lod l, uint k, float e, float4 sphere, inout int known, inou
     }
     decided = decided || known != 0;
     return known == 0;
-}
-
-// The sphere around the model's bounds, in mesh space.
-float4 model_sphere(ModelGpu* model)
-{
-    return float4(0.5 * (model.bounds_min + model.bounds_max), 0.5 * length(model.bounds_max - model.bounds_min));
 }
 
 // The copy's placement relative to the focus; false when its group hides it.
@@ -664,7 +650,7 @@ void raster_roots(SceneRoot* s, CutGpu* cut, uint copy, MeshGpu* mesh, Placement
 // the copy's nearest point. The others take the part stage.
 uint merged_cuts(MeshGpu* mesh, Placement p, float4 sphere, Lod l)
 {
-    if (mesh.root_count <= mesh.part_count * mesh.section_count || l.level >= 0)
+    if (!mesh_has_merged_stage(mesh) || l.level >= 0)
         return 0;
     float e = focus_error(p, sphere, mesh.merge_error * l.scale);
     return (e <= l.threshold[0] ? 1 : 0) | (e <= l.threshold[1] ? 2 : 0);

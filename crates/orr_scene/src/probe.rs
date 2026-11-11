@@ -24,6 +24,8 @@ const EDIT: u32 = 16;
 const DAG: u32 = 32;
 const FROM_GROUP: u32 = 64;
 const FADING: u32 = 128;
+const MERGED_STAGE: u32 = 256;
+const MERGED_RASTER: u32 = 512;
 const LIST_OPAQUE: u32 = 1;
 const LIST_ALPHA: u32 = 2;
 const LIST_SOFTWARE: u32 = 4;
@@ -43,6 +45,7 @@ const CUT_DISTANT: u32 = 4;
 const CUT_OWNER: u32 = 8;
 const CUT_PARTS: u32 = 16;
 const CUT_FELL_BACK: u32 = 32;
+const CUT_STAGE_MERGED: u32 = 64;
 const RT_CUT_BUILT: u32 = 255;
 const ADMIT_SHIFT: u32 = 17;
 /// `tables.slang`.
@@ -51,6 +54,7 @@ const RT_WRITTEN: u32 = 1;
 const RT_IN_RANGE: u32 = 4;
 const RT_ANIMATED: u32 = 16;
 const INSTANCE_RAY: u32 = 2;
+const INSTANCE_SKINNED: u32 = 8;
 /// `visibility.slang` `SLOT_*`.
 const SLOT_NAMES: [&str; 4] = [
     "culled",
@@ -650,6 +654,7 @@ impl PixelProbe {
             );
         }
         let t = g.raster_threshold;
+        let skinned = g.instance.flags & INSTANCE_SKINNED as u8 != 0;
         let depth = self.group.map_or_else(
             || "unknown (no group holds it)".to_owned(),
             |(i, gr)| format!("{} (group {i})", gr.depth),
@@ -673,13 +678,22 @@ impl PixelProbe {
         } else {
             let source = self.group.is_some_and(|(_, gr)| gr.depth == 0);
             let finer_absent = g.flags & FROM_GROUP != 0 && g.from_address == 0;
-            let why = if g.debug_level >= 0 {
+            let merged = g.cluster_flags & CLUSTER_MERGED != 0;
+            let why = if skinned {
+                "a skinned copy draws the clusters its skinning took, not the traversal's rule"
+                    .to_owned()
+            } else if g.debug_level >= 0 {
                 format!("held at debug level {}", g.debug_level)
             } else if g.flags & FOCUS == 0 {
                 "no focus".to_owned()
+            } else if merged != (g.flags & MERGED_RASTER != 0) {
+                format!(
+                    "the stage rule leaves it out: the cluster is of the {} stage and the raster cut takes the other; drawn from another frame's cut",
+                    if merged { "merged" } else { "part" }
+                )
             } else if g.parent_pixels <= t {
                 format!(
-                    "the rule leaves it out: parent {:.3} px <= {t:.3}; drawn from another frame's cut or a stage the probe does not model",
+                    "the rule leaves it out: parent {:.3} px <= {t:.3}; drawn from another frame's cut",
                     g.parent_pixels
                 )
             } else if source {
@@ -707,6 +721,39 @@ impl PixelProbe {
                 f,
                 "  at the focus (placement scale {:.4}): parent {:.3} px, self {:.3} px, threshold {t:.3} px: {why}",
                 g.placement_scale, g.parent_pixels, g.self_pixels
+            )?;
+        }
+        if g.flags & MERGED_STAGE == 0 {
+            writeln!(f, "  stage: the mesh has no merged stage")?;
+        } else if skinned {
+            writeln!(
+                f,
+                "  stage: merge error {:.6} m; a skinned copy takes no stage: its skinning's cut",
+                g.merge_error
+            )?;
+        } else if g.flags & PLACED == 0 {
+            writeln!(f, "  stage: merge error {:.6} m", g.merge_error)?;
+        } else if g.flags & FOCUS == 0 {
+            writeln!(
+                f,
+                "  stage: merge error {:.6} m, no focus: the raster cut takes the part stage",
+                g.merge_error
+            )?;
+        } else {
+            let taken = if g.flags & MERGED_RASTER != 0 {
+                "merged"
+            } else {
+                "part"
+            };
+            let held = if g.debug_level >= 0 {
+                format!(", held at debug level {}", g.debug_level)
+            } else {
+                String::new()
+            };
+            writeln!(
+                f,
+                "  stage: merge error {:.6} m = {:.3} px at the focus, threshold {t:.3} px{held}: the raster cut takes the {taken} stage",
+                g.merge_error, g.merged_pixels
             )?;
         }
         let bits = |b: u32| {
@@ -801,15 +848,22 @@ impl PixelProbe {
             } else {
                 ""
             };
+            let stage = if g.flags & MERGED_STAGE == 0 {
+                ""
+            } else if c.flags & CUT_STAGE_MERGED != 0 {
+                " of the merged stage"
+            } else {
+                " of the part stage"
+            };
             let error = format!("largest error {:.6} m", g.built_error);
             if c.flags & CUT_OWNER != 0 {
                 format!(
-                    "its own gathered cut of {} clusters, {error}, built this frame (job {}){parts}",
+                    "its own gathered cut{stage} of {} clusters, {error}, built this frame (job {}){parts}",
                     c.rt_count, c.rt_job
                 )
             } else {
                 format!(
-                    "a gathered cut of {} clusters, {error}, shared with slot {}'s BLAS (job {}){parts}",
+                    "a gathered cut{stage} of {} clusters, {error}, shared with slot {}'s BLAS (job {}){parts}",
                     c.rt_count, c.owner, c.rt_job
                 )
             }

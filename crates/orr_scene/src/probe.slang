@@ -21,6 +21,8 @@ public static const uint PROBE_EDIT = 16;      // the copy's mesh is an edit
 public static const uint PROBE_DAG = 32;       // the mesh is a cluster DAG, not discrete levels
 public static const uint PROBE_FROM_GROUP = 64; // the cluster was simplified from a group
 public static const uint PROBE_FADING = 128;   // the copy fades between chain steps
+public static const uint PROBE_MERGED_STAGE = 256;  // the mesh has a merged stage
+public static const uint PROBE_MERGED_RASTER = 512; // the raster cut takes it: `merged_cuts`
 
 // `ProbeGpu.lists`: the raster lists holding the visible cluster, first pass in the low bits
 // and second pass shifted by PROBE_LIST_SECOND.
@@ -88,7 +90,7 @@ public struct ProbeGpu
     public float parent_error;
     public float self_pixels;       // at the focus, debug scale in
     public float parent_pixels;
-    public uint _pad0;
+    public float merged_pixels;     // the merged stage's error over the model sphere, likewise
     public float placement_scale;
     public float debug_scale;
     public int debug_level;         // -1 none
@@ -168,9 +170,6 @@ public struct ProbeRoot
 }
 ORR_ROOT(ProbeRoot);
 
-// Distances from the focus clamp here, as the traversal's do.
-static const float FOCUS_NEAR = 0.01;
-
 bool has_focus()
 {
     return root.focus_cell.w != 0;
@@ -182,9 +181,7 @@ float focus_error(Placement p, float4 sphere, float error)
 {
     if (!has_focus())
         return error > 0.0 ? asfloat(0x7f800000u) : 0.0;
-    float3 c = place(p, sphere.xyz);
-    float d = max(length(c) - sphere.w * p.scale, FOCUS_NEAR);
-    return error * p.scale / d * root.focus_offset.w;
+    return focus_pixels(p, sphere, error, root.focus_offset.w);
 }
 
 uint page_bits(CutGpu* cut, uint entry, bool streams)
@@ -223,6 +220,9 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
     o.pinned_pages = mesh.pinned_pages;
     o.level_count = mesh.level_count;
     o.merge_error = mesh.merge_error;
+    bool staged = mesh_has_merged_stage(mesh);
+    if (staged)
+        o.flags |= PROBE_MERGED_STAGE;
     if (mesh.edit != nullptr)
         o.flags |= PROBE_EDIT;
     if (mesh.level_count == 0)
@@ -263,7 +263,10 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
         o.placement_scale = p.scale;
         o.self_pixels = focus_error(p, cl.self_sphere, cl.self_error * o.debug_scale);
         o.parent_pixels = focus_error(p, cl.parent_sphere, cl.parent_error * o.debug_scale);
-        float4 sphere = float4(0.5 * (model.bounds_min + model.bounds_max), 0.5 * length(model.bounds_max - model.bounds_min));
+        float4 sphere = model_sphere(model);
+        o.merged_pixels = focus_error(placed, sphere, mesh.merge_error * o.debug_scale);
+        if (staged && o.debug_level < 0 && o.merged_pixels <= o.raster_threshold)
+            o.flags |= PROBE_MERGED_RASTER;
         float distance = max(length(place(placed, sphere.xyz)) - sphere.w * placed.scale, FOCUS_NEAR);
         o.model_pixels = has_focus() ? sphere.w * placed.scale * root.focus_offset.w / distance : asfloat(0x7f800000u);
     }
