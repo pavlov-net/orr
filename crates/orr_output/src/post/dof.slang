@@ -339,14 +339,13 @@ float exposure_change()
 }
 
 // The factor from the source's pre-exposed radiance to exposed values, 1.0 paper white: the
-// newest adapted exposure over the pre-exposure. A view that has set no exposure shows its
-// pre-exposure.
+// newest adapted exposure over the pre-exposure.
 float exposed_scale()
 {
     ViewConstants* view = root.view;
     ExposureState* cur = view.exposure + view.exposure_slot;
     ExposureState* newest = view.exposure + (view.exposure_slot ^ root.after_exposure);
-    return newest.initialized != 0 ? exposure_from_ev100(newest.adapted_ev100) / cur.pre_exposure : 1.0;
+    return exposure_from_ev100(newest.adapted_ev100) / cur.pre_exposure;
 }
 
 // The background layer's texels with data among the render texels under half-resolution

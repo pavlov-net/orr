@@ -58,6 +58,7 @@ pub struct Harness {
     sky: Allocation<SkyStats>,
     radiance: Texture,
     linear: Texture,
+    masks: Vec<Texture>,
     radiance_store: StorageImageIndex,
     radiance_index: TextureIndex,
     linear_store: StorageImageIndex,
@@ -135,6 +136,7 @@ impl Harness {
             sky,
             radiance,
             linear,
+            masks: Vec::new(),
             radiance_store,
             radiance_index,
             linear_store,
@@ -177,8 +179,32 @@ impl Harness {
         self.sky.as_mut_slice().unwrap()[0] = sky;
     }
 
-    /// Makes the next [`Self::frame`] a camera cut: its exposure state starts over at the
-    /// output's reference pre-exposure, as a renderer starts it.
+    /// A metering mask that weighs every pixel `weight`.
+    pub fn uniform_mask(&mut self, weight: f32) -> TextureIndex {
+        let gpu = device();
+        let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+        let desc = TextureDesc::d2(Format::Rgba16Float, 1, 1, usage);
+        let mask = gpu
+            .create_texture(&desc, TextureMemory::Dedicated, "metering mask")
+            .unwrap();
+        let mut texel = gpu
+            .gpu_malloc::<[f16; 4]>(MemoryKind::Upload, 1, "metering mask texel")
+            .unwrap();
+        texel.as_mut_slice().unwrap()[0] = [f16::from_f32(weight); 4];
+        let queue = gpu.queue(QueueKind::Render).unwrap();
+        let mut list = queue.command_list().unwrap();
+        list.discard(&mask);
+        let whole = TextureRegion::whole_mip(mask.desc(), 0);
+        list.copy_to_texture(&mask, &whole, texel.gpu().cast());
+        list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
+        wait(queue.submit(vec![list], &[]).unwrap());
+        let index = gpu.write_sampled(gpu.alloc_image_slot().unwrap(), &mask, &ViewDesc::default());
+        self.masks.push(mask);
+        index
+    }
+
+    /// Makes the next [`Self::frame`] a camera cut: its exposure state starts over as the
+    /// output's exposure starts, as a renderer starts it.
     pub fn cut_next(&mut self) {
         self.cut_next = true;
     }
@@ -233,15 +259,10 @@ impl Harness {
         let queue = gpu.queue(QueueKind::Render).unwrap();
         let mut list = queue.command_list().unwrap();
         if cut {
-            let pre_exposure = output.exposure.reference();
             self.exposure_start
                 .as_mut_slice()
                 .unwrap()
-                .fill(ExposureState {
-                    pre_exposure,
-                    prev_pre_exposure: pre_exposure,
-                    ..ExposureState::default()
-                });
+                .fill(output.exposure.start());
             list.copy(
                 self.exposure.gpu().cast(),
                 self.exposure_start.gpu().cast(),

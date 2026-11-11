@@ -16,7 +16,8 @@ static const uint MODE_AUTO = 1;
 
 // ExposureState::initialized: 0 until a frame sets the exposure, which a view's first frame
 // with something to meter does by taking the target, then 1. A camera cut starts the state
-// over before the frame is lit.
+// over before the frame is lit. An unset state holds the exposure the view is lit with as
+// its adapted exposure, so the view is shown at its pre-exposure.
 static const uint STATE_UNSET = 0;
 static const uint STATE_ADAPTING = 1;
 // An adapting view's frame with nothing to meter may hide light that underflowed RGBA16F.

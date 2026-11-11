@@ -2321,10 +2321,11 @@ impl<'a> Frame<'a> {
         self.output.is_some()
     }
 
-    /// Starts the exposure state of view `history` over, as a new history's is but lit with
-    /// `pre_exposure`: nothing metered, nothing adapted. Call it before the view's
-    /// [`Self::raster_view`] of this frame, which then reads it.
-    pub fn restart_exposure(&mut self, history: ViewHistoryId, pre_exposure: f32) -> Result<()> {
+    /// Starts the exposure state of view `history` over at `start`, in both slots. Call it
+    /// before the view's [`Self::raster_view`] of this frame, which then reads it. `start`
+    /// replaces `prev_pre_exposure` too, so a history in pre-exposed units cannot rescale
+    /// across the restart and has to start over on the same frame.
+    pub fn restart_exposure(&mut self, history: ViewHistoryId, start: ExposureState) -> Result<()> {
         self.ensure_updated()?;
         let history = self
             .core
@@ -2332,13 +2333,8 @@ impl<'a> Frame<'a> {
             .get(history.0 as usize)
             .and_then(Option::as_ref)
             .ok_or(Error::UnknownViewHistory(history))?;
-        let state = ExposureState {
-            pre_exposure,
-            prev_pre_exposure: pre_exposure,
-            ..ExposureState::default()
-        };
         let window = &self.core.windows[self.window];
-        let source = window.put(self.device, &[state; 2])?;
+        let source = window.put(self.device, &[start; 2])?;
         let list = self.list.as_mut().expect("frame list");
         list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
         list.copy(

@@ -214,7 +214,7 @@ pub struct LitView<'a> {
     pub lens: Lens,
     /// A camera cut: the previous camera is taken to be this one; motion blur shows nothing,
     /// frame generation, ray reconstruction and lighting drop their history, and exposure and
-    /// white balance start over: the frame is lit at [`Exposure::reference`] and shown at the
+    /// white balance start over: the frame is lit as [`Exposure::start`] gives and shown at the
     /// exposure and white point it meters. A view's first render, its first on another scene
     /// and its first after [`SceneWriter::reset_lighting_history`] are cuts without it.
     pub camera_cut: bool,
@@ -1389,7 +1389,7 @@ impl<'a> Frame<'a> {
         }
         if desc.camera_cut {
             self.scenes
-                .restart_exposure(view.history, output.exposure.reference())?;
+                .restart_exposure(view.history, output.exposure.start())?;
         }
         let raster = self.scenes.raster_view_with(&desc, &requests)?;
         let gpu = self.output.device.clone();

@@ -122,16 +122,54 @@ fn black_first_frames_do_not_initialize() {
     let nits = 50.0;
     h.set_image(&vec![nits; h.pixels()]);
     let auto = ViewOutput::default();
+    let reference = AutoExposure::default().reference_ev100;
     for _ in 0..2 {
         let t = h.frame(0.0, &auto, None);
         assert_eq!(t.metered_ev100, None);
-        assert_eq!(t.adapted_ev100, 0.0);
+        assert_eq!(
+            [t.adapted_ev100, t.target_ev100, t.long_term_ev100],
+            [reference; 3]
+        );
+        assert_eq!(t.pre_exposure, exposure_from_ev100(reference));
     }
     // The first frame with light, lit at the reference the black frames kept, takes its
     // target.
     let t = h.frame(1.0, &auto, None);
     let off = stops_from_mid_gray(nits, &t);
     assert!(off.abs() < 0.01, "{off} stops from mid gray");
+    assert_clean();
+}
+
+/// A view that has set no exposure is shown at the exposure it is lit with: under a metering
+/// mask that weighs every pixel zero, a lit frame leaves the view unset and shows at the
+/// reference.
+#[test]
+fn an_unset_view_shows_at_its_pre_exposure() {
+    let mut h = Harness::new(SIDE, SIDE);
+    let nits = 10.0f32;
+    h.set_image(&vec![nits; h.pixels()]);
+    let display = DisplayRequest::default().resolve(&[OutputFormat::Hdr10Pq], None, false);
+    let auto = AutoExposure {
+        metering_mask: Some(h.uniform_mask(0.0)),
+        ..AutoExposure::default()
+    };
+    let reference = auto.reference_ev100;
+    let output = ViewOutput {
+        exposure: Exposure::Auto(auto),
+        debug: OutputDebug::Linear,
+        ..ViewOutput::default()
+    };
+    for frame in 0..2 {
+        let t = h.frame(1.0, &output, Some(&display));
+        assert_eq!(t.metered_ev100, None);
+        assert_eq!(t.adapted_ev100, reference);
+        let shown = h.display_linear()[0][1];
+        let expected = nits * exposure_from_ev100(reference);
+        assert!(
+            (shown / expected - 1.0).abs() < 2e-3,
+            "frame {frame}: {shown} against {expected}"
+        );
+    }
     assert_clean();
 }
 

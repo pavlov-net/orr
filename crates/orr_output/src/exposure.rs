@@ -4,6 +4,7 @@
 
 use std::ops::RangeInclusive;
 
+use orr_scene::ExposureState;
 use orr_scene::orr_gpu::TextureIndex;
 
 /// The exposed value auto exposure aims the metered average at, before compensation.
@@ -57,13 +58,25 @@ impl Default for Exposure {
 }
 
 impl Exposure {
-    /// The pre-exposure a view is lit with before it has adapted: on its first render and on
-    /// a camera cut's frame.
-    pub fn reference(&self) -> f32 {
-        exposure_from_ev100(match self {
+    /// The exposure state a view starts with, on its first render and on a camera cut's
+    /// frame: no exposure set, and the view lit and shown at the manual exposure or at
+    /// [`AutoExposure::reference_ev100`], which is also its target and long-term exposure
+    /// until a frame sets them. Its `prev_pre_exposure` is its `pre_exposure`: a history in
+    /// pre-exposed units starts over on the frame the state does.
+    pub fn start(&self) -> ExposureState {
+        let ev100 = match self {
             Self::Manual { ev100 } => *ev100,
             Self::Auto(auto) => auto.reference_ev100,
-        })
+        };
+        let pre_exposure = exposure_from_ev100(ev100);
+        ExposureState {
+            pre_exposure,
+            prev_pre_exposure: pre_exposure,
+            adapted_ev100: ev100,
+            target_ev100: ev100,
+            long_term_ev100: ev100,
+            ..ExposureState::default()
+        }
     }
 }
 
@@ -74,10 +87,10 @@ impl Exposure {
 /// Exposures are EV100 as [`ev100_from_exposure`] gives them. A scene metered at EV100 `m`
 /// with no compensation is exposed at `keyed_ev100(m, 0.0)`, about `m - 0.79`.
 ///
-/// A view's first render, and a camera cut's frame, are lit at `reference_ev100`; the first
-/// of them with light to meter takes the target as its exposure, and every later frame
-/// adapts. A frame with nothing to meter (all black) holds the exposure, so a black first
-/// frame leaves the view waiting for one with light.
+/// A view's first render, and a camera cut's frame, are lit at `reference_ev100`. The first
+/// frame from there with light to meter takes the target as its exposure, and every later
+/// frame adapts. A frame with nothing to meter (all black, or masked out) holds the exposure,
+/// so a view waiting for its first frame with light stays lit and shown at the reference.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutoExposure {
     /// The exposure a view is lit with until it has metered a frame. Lit at exposure `s`,
@@ -231,7 +244,9 @@ impl Default for Grade {
     }
 }
 
-/// A view's exposure as adapt left it, read back 1-3 frames late.
+/// A view's exposure as adapt left it, read back 1-3 frames late. A view that has set no
+/// exposure reports the one it started with ([`Exposure::start`]) as its adapted, target and
+/// long-term exposure.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExposureTelemetry {
     /// The frame it belongs to.
