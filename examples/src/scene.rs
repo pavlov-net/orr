@@ -52,7 +52,6 @@ impl Showcase {
             .create_scene(
                 &SceneDesc {
                     light_capacity: 2,
-                    material_set_capacity: 16,
                     emissive_capacity: 16,
                     global_instances: 16,
                     ..SceneDesc::default()

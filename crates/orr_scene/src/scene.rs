@@ -41,6 +41,9 @@ const NO_MODEL: u32 = u32::MAX;
 /// `tables.slang` `NO_MATERIAL_SET`.
 const NO_MATERIAL_SET: u32 = u32::MAX;
 
+/// `tables.slang` `PAGE_MATERIAL_SET`: the bit above a base in either table of material sets.
+const PAGE_MATERIAL_SET: u32 = 1 << 31;
+
 /// Instance slots a scene holds at most: `tables.slang` `COPY_FAR` is the bit above a copy's
 /// slot.
 const MAX_SLOTS: u32 = 1 << 31;
@@ -66,8 +69,6 @@ pub struct SceneId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SceneDesc {
     pub light_capacity: u32,
-    /// `MaterialId` entries in the scene's material-set table.
-    pub material_set_capacity: u32,
     /// Producer entries: every `ProducerId` is below it.
     pub producer_capacity: u32,
     /// Emissive list entries for instances: one per copy per emissive and per caster section of
@@ -90,16 +91,12 @@ pub struct SceneDesc {
     /// Medium proxies: every `MediumProxyId` is below it. They trace from the PTLAS global
     /// partition.
     pub medium_proxy_capacity: u32,
-    /// `MaterialId` entries for the sets of cooked page prototypes that override materials,
-    /// after the material-set table's `material_set_capacity` entries.
-    pub page_material_sets: u32,
 }
 
 impl Default for SceneDesc {
     fn default() -> Self {
         Self {
             light_capacity: 256,
-            material_set_capacity: 4096,
             producer_capacity: 256,
             emissive_capacity: 16_384,
             partition_instances: 1000,
@@ -108,7 +105,6 @@ impl Default for SceneDesc {
             skinned_clusters: 8192,
             decal_capacity: 1024,
             medium_proxy_capacity: 64,
-            page_material_sets: 4096,
         }
     }
 }
@@ -119,10 +115,6 @@ pub use orr_pack::AffineRows;
 /// its models have now.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PageNeeds {
-    /// Of `page_material_sets`: the sets of the prototypes that override materials. A placement
-    /// takes none for a prototype whose set `InstancePageRef::material_sets` replaces, so this
-    /// is the most it takes.
-    pub material_sets: u32,
     /// Of `emissive_capacity`: every copy takes room for the emissive and caster sections of
     /// the most emissive step of its model's chain.
     pub emissive: u32,
@@ -149,10 +141,6 @@ pub(crate) fn page_needs(
     id: PageId,
 ) -> Result<(PageNeeds, Vec<PrototypeEntries>, Vec<PagePrototype>)> {
     let protos = mounts.page_prototypes(id)?;
-    let material_sets = protos
-        .iter()
-        .map(|p| p.sets.as_ref().map_or(0, |s| s.len() as u32))
-        .sum();
     let entries: Vec<PrototypeEntries> = protos
         .iter()
         .map(|p| PrototypeEntries {
@@ -163,7 +151,6 @@ pub(crate) fn page_needs(
         })
         .collect();
     let needs = PageNeeds {
-        material_sets,
         emissive: page_entries(&entries),
     };
     Ok((needs, entries, protos))
@@ -353,7 +340,10 @@ pub(crate) struct Tables {
     pub(crate) instances: Column<InstanceGpu>,
     pub(crate) slot_state: Column<SlotStateGpu>,
     pub(crate) groups: Column<GroupGpu>,
-    pub(crate) material_sets: Allocation<MaterialId>,
+    /// The consumer's material sets, which hold every entry a write or a copy has named.
+    pub(crate) material_sets: Column<MaterialId>,
+    /// The material sets of placed pages' prototypes.
+    pub(crate) page_sets: Column<MaterialId>,
     pub(crate) lights: Allocation<LightGpu>,
     /// Producer entries first, then instance entries.
     pub(crate) emissive: Allocation<EmissiveGpu>,
@@ -594,7 +584,7 @@ pub(crate) struct PagePlacement {
     /// Its slots hold no entries since its range moved, and take their new ones the next time
     /// its records are resident.
     pub(crate) entries_stale: bool,
-    /// Its prototypes' entries of the page part of the material-set table.
+    /// Its prototypes' entries of the pages' material sets.
     pub(crate) sets: (u32, u32),
     /// Per prototype, its model, its records and the class of the body run each copy may hold.
     pub(crate) runs: Vec<(u32, u32, Option<u8>)>,
@@ -623,7 +613,7 @@ pub(crate) struct SkinnedPage {
     pub(crate) range: InstanceRange,
     pub(crate) group: TransformGroupId,
     pub(crate) page: PageId,
-    /// Its prototype's entries of the page part of the material-set table.
+    /// Its prototype's entries of the pages' material sets.
     pub(crate) sets: (u32, u32),
 }
 
@@ -797,7 +787,7 @@ pub(crate) struct SceneCpu {
     /// Entries of skinned pages' material sets by the frames that removed them, freed once
     /// those have completed.
     pub(crate) skinned_sets_removed: Vec<(u64, (u32, u32))>,
-    /// Entries of the page part of the material-set table, from `material_set_capacity`.
+    /// Entries of the pages' material sets.
     pub(crate) page_sets: RangeAllocator,
 }
 
@@ -948,6 +938,42 @@ impl Scene {
         }
     }
 
+    /// Gives the consumer's material sets every entry below `end`, growing the table as
+    /// [`grown`] says. Fails for an entry past the 2^31 a base names, or without device memory.
+    fn reserve_material_sets(&self, device: &Device, end: u64) -> Result<()> {
+        let sets = &self.tables.material_sets;
+        let held = sets.capacity();
+        if end <= u64::from(held) {
+            return Ok(());
+        }
+        let limit = PAGE_MATERIAL_SET;
+        let more = u32::try_from(end - u64::from(held)).unwrap_or(u32::MAX);
+        sets.reserve(device, grown("material sets", held, more, limit)?)
+    }
+
+    /// The first of `count` consecutive free entries of the pages' material sets, as the
+    /// base of a copy's record names it. Without a free run that long the table grows as
+    /// [`grown`] says. Fails past the 2^31 a base names or without device memory, with no
+    /// entry taken.
+    fn take_page_sets(&self, cpu: &mut SceneCpu, device: &Device, count: u32) -> Result<u32> {
+        // A run of no entries takes none, and its start names no entry.
+        if count == 0 {
+            return Ok(0);
+        }
+        if let Some(first) = cpu.page_sets.alloc(count) {
+            return Ok(first);
+        }
+        let sets = &self.tables.page_sets;
+        let held = sets.capacity();
+        let entries = grown("page material sets", held, count, PAGE_MATERIAL_SET)?;
+        sets.reserve(device, entries)?;
+        cpu.page_sets.grow(held, entries);
+        Ok(cpu
+            .page_sets
+            .alloc(count)
+            .expect("the grown table has a free run of `count`"))
+    }
+
     /// Moves the scene's tables that grew since its last update: see [`Column::land`].
     pub(crate) fn land(
         &self,
@@ -960,6 +986,8 @@ impl Scene {
         self.tables.slot_state.land(frame, copies, records);
         cpu.ptlas.slot_table.land(frame, copies, records);
         self.tables.groups.land(frame, copies, records);
+        self.tables.material_sets.land(frame, copies, records);
+        self.tables.page_sets.land(frame, copies, records);
     }
 
     /// Frees the tables moved from in frames at or before `completed`.
@@ -968,6 +996,8 @@ impl Scene {
         self.tables.slot_state.retire(completed);
         cpu.ptlas.slot_table.retire(completed);
         self.tables.groups.retire(completed);
+        self.tables.material_sets.retire(completed);
+        self.tables.page_sets.retire(completed);
     }
 
     /// Instance entry `entry` of the emissive list.
@@ -1318,11 +1348,8 @@ impl Scene {
             instances: Column::new(device, MemoryPriority::Normal, "instances", true)?,
             slot_state: Column::new(device, MemoryPriority::Normal, "slot state", true)?,
             groups: Column::new(device, MemoryPriority::Normal, "transform groups", true)?,
-            material_sets: device.gpu_malloc(
-                dl,
-                n(desc.material_set_capacity + desc.page_material_sets),
-                "material sets",
-            )?,
+            material_sets: Column::new(device, MemoryPriority::Normal, "material sets", true)?,
+            page_sets: Column::new(device, MemoryPriority::Normal, "page material sets", false)?,
             lights: device.gpu_malloc(dl, n(desc.light_capacity), "lights")?,
             emissive: device.gpu_malloc(
                 dl,
@@ -1353,10 +1380,6 @@ impl Scene {
         // Tables start zeroed: no lights. These apply before any write (sequence 0).
         let zero = |a: GpuAddress, bytes: u64| Record::fill(0, a.0, words(bytes as usize), 0);
         let records = vec![
-            zero(
-                tables.material_sets.gpu().address(),
-                tables.material_sets.size(),
-            ),
             zero(tables.lights.gpu().address(), tables.lights.size()),
             zero(tables.emissive.gpu().address(), tables.emissive.size()),
             zero(tables.producers.gpu().address(), tables.producers.size()),
@@ -1424,7 +1447,7 @@ impl Scene {
                 page_motions: Vec::new(),
                 groups_removed: Vec::new(),
                 skinned_sets_removed: Vec::new(),
-                page_sets: RangeAllocator::new(desc.page_material_sets),
+                page_sets: RangeAllocator::new(0),
             }),
             writing: AtomicBool::new(false),
         })
@@ -1654,14 +1677,13 @@ impl<'f> SceneWriter<'f> {
     /// opaque sections. Fails with [`Error::NotResident`] for a model no ready mount or live
     /// edit holds.
     ///
-    /// Panics if `desc.material_set`'s set 0 ends past `material_set_capacity`, or if
-    /// `desc.transforms` or the pose's group is neither the null group nor one from
+    /// Panics if `desc.transforms` or the pose's group is neither the null group nor one from
     /// `create_transform_group`.
     pub fn add_instances(&mut self, desc: &InstancesDesc) -> Result<InstanceRange> {
         self.check_groups(std::iter::once(desc.transforms).chain(desc.pose.map(|p| p.group)));
         self.placeable(desc.model)?;
         if let Some(base) = desc.material_set {
-            self.check_material_set(desc.model, base, 0);
+            self.hold_material_set(desc.model, base, 0)?;
         }
         let model = self.model_cpu[desc.model.0 as usize];
         let ranks = model.emissive_stride;
@@ -1785,9 +1807,8 @@ impl<'f> SceneWriter<'f> {
     /// page's prototypes the first time the records land, so their variants, flags and other
     /// per-copy settings come from the page.
     ///
-    /// Panics if `r.material_sets` names a prototype the page lacks or one prototype twice, if
-    /// set 0 of a base there ends past `material_set_capacity` on its prototype's model, or if
-    /// a group in `r.poses` is neither the null group nor one from `create_transform_group`.
+    /// Panics if `r.material_sets` names a prototype the page lacks or one prototype twice, or
+    /// if a group in `r.poses` is neither the null group nor one from `create_transform_group`.
     pub fn add_instance_page(&mut self, r: &InstancePageRef<'_>) -> Result<InstanceRange> {
         self.check_groups(r.poses.iter().map(|(_, pose)| pose.group));
         let page = page_needs(self.mounts, self.model_cpu, r.page)?;
@@ -1804,7 +1825,7 @@ impl<'f> SceneWriter<'f> {
                 named[i].is_none(),
                 "two material sets for prototype {index}"
             );
-            self.check_material_set(protos[i].model, base, 0);
+            self.hold_material_set(protos[i].model, base, 0)?;
             named[i] = Some(base);
         }
         let motion = self.motion_group(r.page, r.frame)?;
@@ -1878,12 +1899,12 @@ impl<'f> SceneWriter<'f> {
         )?;
         cpu.ptlas.reserve_runs(self.device, &runs)?;
         let first = self.scene.take_slots(cpu, self.device, count)?;
-        let Some(set_base) = cpu.page_sets.alloc(set_entries) else {
-            cpu.slots.free(first, count);
-            return Err(Error::Capacity {
-                what: "page material sets",
-                capacity: self.scene.desc.page_material_sets,
-            });
+        let set_base = match self.scene.take_page_sets(cpu, self.device, set_entries) {
+            Ok(base) => base,
+            Err(e) => {
+                cpu.slots.free(first, count);
+                return Err(e);
+            }
         };
         let entry = if emissive > 0 {
             cpu.emissive.alloc(emissive)
@@ -1906,7 +1927,7 @@ impl<'f> SceneWriter<'f> {
         cpu.slot_holds[first as usize..(first + count) as usize].fill(SlotHold::FREE);
 
         let mut copies = Vec::with_capacity(protos.len());
-        let first_set = self.scene.desc.material_set_capacity + set_base;
+        let first_set = PAGE_MATERIAL_SET | set_base;
         let mut at = 0;
         for (p, &named) in protos.iter().zip(named) {
             let base = match (named, &p.sets) {
@@ -1957,12 +1978,7 @@ impl<'f> SceneWriter<'f> {
         if set_entries > 0 {
             cpu.records.push(Record::values(
                 self.next_seq(),
-                self.scene
-                    .tables
-                    .material_sets
-                    .gpu()
-                    .offset(u64::from(first_set))
-                    .cast::<u32>(),
+                self.scene.tables.page_sets.entry(set_base).cast::<u32>(),
                 sets_src,
                 set_entries,
             ));
@@ -2128,8 +2144,7 @@ impl<'f> SceneWriter<'f> {
     /// do, unless `r` names a material set. A page of anything else fails with
     /// [`Error::NotSkinnedPage`].
     ///
-    /// Panics if set 0 of `r.material_set` ends past `material_set_capacity` on the page's model,
-    /// or if `r.palette` is neither the null group nor one from `create_transform_group`.
+    /// Panics if `r.palette` is neither the null group nor one from `create_transform_group`.
     pub fn add_skinned_page(&mut self, r: &SkinnedPageRef) -> Result<InstanceRange> {
         self.check_groups([r.palette]);
         let protos = self.mounts.page_prototypes(r.page)?;
@@ -2137,7 +2152,7 @@ impl<'f> SceneWriter<'f> {
             return Err(Error::NotSkinnedPage(r.page));
         };
         if let Some(base) = r.material_set {
-            self.check_material_set(proto.model, base, 0);
+            self.hold_material_set(proto.model, base, 0)?;
         }
         let motion = self.motion_group(r.page, r.frame)?;
         let placed = self.place_skinned_page(r, proto, motion);
@@ -2176,21 +2191,14 @@ impl<'f> SceneWriter<'f> {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let room = self.scene.group_room(cpu, self.device)?;
             let id = room.id;
-            let Some(set_base) = cpu.page_sets.alloc(set_entries) else {
-                return Err(Error::Capacity {
-                    what: "page material sets",
-                    capacity: self.scene.desc.page_material_sets,
-                });
-            };
+            let set_base = self.scene.take_page_sets(cpu, self.device, set_entries)?;
             if let Some(set) = cooked {
                 for (o, m) in sets_out.iter_mut().zip(set) {
                     *o = m.0;
                 }
-                let at = self.scene.desc.material_set_capacity + set_base;
-                let table = self.scene.tables.material_sets.gpu();
                 cpu.records.push(Record::values(
                     self.next_seq(),
-                    table.offset(u64::from(at)).cast::<u32>(),
+                    self.scene.tables.page_sets.entry(set_base).cast::<u32>(),
                     sets_src,
                     set_entries,
                 ));
@@ -2205,7 +2213,7 @@ impl<'f> SceneWriter<'f> {
             ));
             (TransformGroupId(id), (set_base, set_entries))
         };
-        let cooked_set = cooked.map(|_| self.scene.desc.material_set_capacity + sets.0);
+        let cooked_set = cooked.map(|_| PAGE_MATERIAL_SET | sets.0);
         let flags = match proto.flags {
             0 => r.flags,
             f => InstanceFlags(f as u8 & r.flags.0),
@@ -2281,20 +2289,19 @@ impl<'f> SceneWriter<'f> {
     /// templates, in the PTLAS global partition. Copies skin whether or not a view shows
     /// them, and take the candidate class of the model's own materials as in
     /// [`Self::add_instances`]. Fails with [`Error::NotResident`] as that does. Panics if the
-    /// model's mesh has no skin or the model no skeleton, if `desc.material_set`'s set 0 ends
-    /// past `material_set_capacity`, or if `desc.transforms` or `desc.palette` is neither the
-    /// null group nor one from `create_transform_group`.
+    /// model's mesh has no skin or the model no skeleton, or if `desc.transforms` or
+    /// `desc.palette` is neither the null group nor one from `create_transform_group`.
     pub fn add_skinned(&mut self, desc: &SkinnedDesc) -> Result<InstanceRange> {
         self.check_groups([desc.transforms, desc.palette]);
         self.placeable(desc.model)?;
         if let Some(base) = desc.material_set {
-            self.check_material_set(desc.model, base, 0);
+            self.hold_material_set(desc.model, base, 0)?;
         }
         self.place_skinned(desc, 0)
     }
 
-    /// [`Self::add_skinned`] for a base that may lie in the page part of the material-set table,
-    /// with every copy hiding the sections of `section_mask`.
+    /// [`Self::add_skinned`] for a base that may name the pages' material sets, with every copy
+    /// hiding the sections of `section_mask`.
     fn place_skinned(&mut self, desc: &SkinnedDesc, section_mask: u16) -> Result<InstanceRange> {
         let model = self.model_cpu[desc.model.0 as usize];
         let shape = model
@@ -2440,20 +2447,15 @@ impl<'f> SceneWriter<'f> {
         Ok(range)
     }
 
-    /// Panics unless material set `set` from consumer base `base`, one entry per section of
-    /// `model`, ends within the consumer's part of the material-set table.
-    fn check_material_set(&self, model: ModelId, base: u32, set: u8) {
+    /// Gives the consumer's material sets the entries of set `set` from base `base`, one per
+    /// section of `model`, as [`Scene::reserve_material_sets`] does.
+    fn hold_material_set(&self, model: ModelId, base: u32, set: u8) -> Result<()> {
         let sections = self
             .model_cpu
             .get(model.0 as usize)
             .map_or(0, |m| m.sections);
-        let capacity = self.scene.desc.material_set_capacity;
         let end = u64::from(base) + (u64::from(set) + 1) * u64::from(sections);
-        assert!(
-            end <= u64::from(capacity),
-            "material set {set} from base {base} of {model:?}'s {sections} sections ends past \
-             the {capacity} entries of material_set_capacity"
-        );
+        self.scene.reserve_material_sets(self.device, end)
     }
 
     /// Panics unless each group is the null group or one the consumer made. Kernels index the
@@ -2532,9 +2534,8 @@ impl<'f> SceneWriter<'f> {
     /// names the mask; a mask hides an animated part's instance only when it covers every
     /// section of the part.
     ///
-    /// Panics if a variant's material set ends past `material_set_capacity` on its copy's base,
-    /// names a set other than 0 on a cooked page's base, or lands on a copy of a cooked
-    /// instance page.
+    /// Panics if a variant names a set other than 0 on a cooked page's base, or lands on a copy
+    /// of a cooked instance page.
     pub fn copy_variants(
         &mut self,
         range: InstanceRange,
@@ -2560,16 +2561,15 @@ impl<'f> SceneWriter<'f> {
             !on_page,
             "copies of a cooked page take their variants from the page"
         );
-        let capacity = self.scene.desc.material_set_capacity;
         for (v, hold) in variants.iter().zip(&holds) {
             match hold.material_base {
                 NO_MATERIAL_SET => {}
-                b if b >= capacity => assert!(
+                b if b & PAGE_MATERIAL_SET != 0 => assert!(
                     v.material_set == 0,
                     "material set {} of a cooked page's base, which holds one",
                     v.material_set
                 ),
-                b => self.check_material_set(ModelId(hold.model), b, v.material_set),
+                b => self.hold_material_set(ModelId(hold.model), b, v.material_set)?,
             }
         }
         let (src, out) = self.window.slice::<CopyVariant>(self.device, count)?;
@@ -2598,20 +2598,12 @@ impl<'f> SceneWriter<'f> {
         Ok(())
     }
 
-    /// Entries `first..first + count` of the scene's material-set table.
+    /// Entries `first..first + count` of the scene's material sets, which hold every entry a
+    /// write or a copy names; the others read as `MaterialId(0)`.
     pub fn material_sets(&mut self, first: u32, count: u32) -> Result<&'f mut [MaterialId]> {
-        assert!(
-            u64::from(first) + u64::from(count) <= u64::from(self.scene.desc.material_set_capacity),
-            "material sets {first}+{count} outside the table"
-        );
-        self.upload(
-            self.scene
-                .tables
-                .material_sets
-                .gpu()
-                .offset(u64::from(first)),
-            count,
-        )
+        let end = u64::from(first) + u64::from(count);
+        self.scene.reserve_material_sets(self.device, end)?;
+        self.upload(self.scene.tables.material_sets.entry(first), count)
     }
 
     /// Empties the slots of `range` and their emissive list entries; they are reused once

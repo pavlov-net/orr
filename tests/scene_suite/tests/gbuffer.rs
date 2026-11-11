@@ -1126,6 +1126,40 @@ fn cook() -> Arc<[u8]> {
             ..Instances::default()
         }),
     });
+    // Two pages of balls whose second prototype wears the plain model's material on its first
+    // section: one at the origin, one far along z.
+    for (name, z) in [("dressed", 0.0), ("dressed away", 500.0)] {
+        tinted.push(AssetSpec {
+            name: name.into(),
+            source: Source::Instances(Instances {
+                records: (0..4)
+                    .map(|i| Placement {
+                        position: [-3.0 + 2.0 * f64::from(i), 1.0, z],
+                        linear: Linear::Scaled {
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                            scale: [1.0; 3],
+                        },
+                        prototype: (i % 2) as u16,
+                    })
+                    .collect(),
+                prototypes: vec![
+                    PrototypeSpec {
+                        model: "ball".into(),
+                        ..PrototypeSpec::default()
+                    },
+                    PrototypeSpec {
+                        model: "ball".into(),
+                        sections: vec![SectionSpec {
+                            material: Some("plain/material/0".into()),
+                            hidden: false,
+                        }],
+                        ..PrototypeSpec::default()
+                    },
+                ],
+                ..Instances::default()
+            }),
+        });
+    }
     // A representation chain: a DAG ball, then three coarser balls, each its own color.
     for (step, (rings, color)) in CHAIN_SHAPES.into_iter().enumerate() {
         let m = Material {
@@ -5250,7 +5284,7 @@ fn the_group_table_grows_under_frames_in_flight_and_a_hung_page_keeps_its_joint(
     for count in [3, 9, 30] {
         frame += 1;
         let shot = Shot::at(view.0, view.1, frame);
-        later.push(shoot_later_with(&mut w, &placed, &shot, |s| {
+        later.push(shoot_later_with(&mut w, &placed, &shot, 0, |s| {
             for _ in 0..count {
                 s.create_transform_group(&TransformGroupDesc {
                     count: 1,
@@ -5269,6 +5303,122 @@ fn the_group_table_grows_under_frames_in_flight_and_a_hung_page_keeps_its_joint(
     wait(later.last().unwrap().point);
     let grown: SceneRoot = read_buffer(flight.scene, 1)[0];
     assert!(grown.groups != held.groups, "the group table never grew");
+    for (i, l) in later.iter().enumerate() {
+        let traced: Vec<u8> = bytemuck::cast_slice(&l.read().traced).to_vec();
+        assert!(
+            traced == settled,
+            "frame {} of the growth traced other hits at {} pixels",
+            i + 1,
+            differing(&traced, &settled),
+        );
+    }
+    assert_clean();
+}
+
+/// The page of `asset` in the pack.
+fn page_named(w: &World, asset: &str) -> PageId {
+    let a = Archive::from_memory(Arc::clone(pack())).unwrap();
+    let prefix = format!("{asset}/");
+    let is_page = |e: &&Entry| {
+        e.class == orr_pack::Class::InstancePage as u16 && a.name(e).starts_with(&prefix)
+    };
+    let entry = a.entries().iter().find(is_page).expect("the page");
+    w.scenes.instance_page(w.mount, entry.id).unwrap()
+}
+
+/// A page whose second prototype wears another model's material on its first section shows it
+/// on that prototype's copies alone, from the pages' material sets. Both tables of material sets
+/// then grow under frames in flight: the consumer's by writes far past its entries, the pages' by
+/// placements of a page of the same prototypes behind the camera. Every frame traces the hits of
+/// the settled ones.
+#[test]
+fn a_page_s_cooked_material_set_reaches_its_copies_while_the_material_set_tables_grow() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let view = (DVec3::new(0.0, 1.5, 7.0), DVec3::new(0.0, 1.0, 0.0));
+    let placed = place_page(&mut w, "dressed", 0.0);
+    let away = page_named(&w, "dressed away");
+    let material = |name: &str| {
+        let id = AssetId::from_name(name);
+        w.scenes.material(w.mount, id).unwrap()
+    };
+    let (coat, lamp) = (material("ball/material/0"), material("ball/material/1"));
+    let worn = material("plain/material/0");
+    let mut frame = 0;
+    let mut next = |w: &mut World, write: &mut dyn FnMut(&mut SceneWriter<'_>)| {
+        frame += 1;
+        let shot = Shot::at(view.0, view.1, frame);
+        shoot_later_with(w, &placed, &shot, 1, write)
+    };
+    // Frames with their hits' surfaces resolved, each read while the next is in flight, until
+    // two in a row are the same and the page's records have landed.
+    let start = Instant::now();
+    let mut flight = next(&mut w, &mut |_| {});
+    let mut last: Option<Vec<u8>> = None;
+    let settled = loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the page never settled"
+        );
+        let following = next(&mut w, &mut |_| {});
+        wait(flight.point);
+        let now: Vec<u8> = bytemuck::cast_slice(&flight.read().traced).to_vec();
+        flight = following;
+        let traced: &[trace::Traced] = bytemuck::cast_slice(&now);
+        let landed = traced.iter().filter(|t| t.instance != 0).count() > 100;
+        if landed && last.as_ref() == Some(&now) {
+            break now;
+        }
+        last = Some(now);
+    };
+    wait(flight.point);
+    let first = placed.ranges[0].first;
+    let mut shown = [0; 2];
+    for t in bytemuck::cast_slice::<u8, trace::Traced>(&settled) {
+        if t.instance == 0 {
+            continue;
+        }
+        let dressed = (t.instance - 1 - first) % 2 == 1;
+        let section_0 = if dressed { worn } else { coat };
+        assert!(
+            t.material == section_0.0 || t.material == lamp.0,
+            "a copy with dressed {dressed} shows material {}",
+            t.material
+        );
+        shown[usize::from(dressed)] += u32::from(t.material == section_0.0);
+    }
+    assert!(shown[0] > 100 && shown[1] > 100, "{shown:?} hits");
+    let held: SceneRoot = read_buffer(flight.scene, 1)[0];
+
+    let mut later = vec![flight];
+    for (i, at) in [16, 300, 5000].into_iter().enumerate() {
+        later.push(next(&mut w, &mut |s| {
+            s.material_sets(at, 2).unwrap().fill(coat);
+            for _ in 0..1 << i {
+                s.add_instance_page(&InstancePageRef {
+                    page: away,
+                    frame: None,
+                    poses: &[],
+                    material_sets: &[],
+                    flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                    rt_range: 1000.0,
+                    animation_range: 0.0,
+                    user_tag: 0,
+                })
+                .unwrap();
+            }
+        }));
+    }
+    for _ in 0..3 {
+        later.push(next(&mut w, &mut |_| {}));
+    }
+    wait(later.last().unwrap().point);
+    let grown: SceneRoot = read_buffer(later[0].scene, 1)[0];
+    assert!(
+        grown.material_sets != held.material_sets
+            && grown.page_material_sets != held.page_material_sets,
+        "the tables of material sets never grew"
+    );
     for (i, l) in later.iter().enumerate() {
         let traced: Vec<u8> = bytemuck::cast_slice(&l.read().traced).to_vec();
         assert!(
@@ -8533,14 +8683,16 @@ fn traced_hits(g: &Frame) -> Vec<u8> {
 
 /// A frame of `placed` from `shot` whose camera rays are traced after it, neither waited for.
 fn shoot_later(w: &mut World, placed: &Placed, shot: &Shot) -> RaysLater {
-    shoot_later_with(w, placed, shot, |_| {})
+    shoot_later_with(w, placed, shot, 0, |_| {})
 }
 
-/// [`shoot_later`] with `write` run on the scene's writer.
+/// [`shoot_later`] with `write` run on the scene's writer, its rays traced in `mode` of the
+/// trace kernel: 1 resolves each hit's surface.
 fn shoot_later_with(
     w: &mut World,
     placed: &Placed,
     shot: &Shot,
+    mode: u32,
     write: impl FnOnce(&mut SceneWriter<'_>),
 ) -> RaysLater {
     let list = [placed.scene];
@@ -8579,7 +8731,7 @@ fn shoot_later_with(
         })
         .unwrap();
     f.end(&[]).unwrap();
-    rays_later(&view, &trace::MODULE, "pixels", 0)
+    rays_later(&view, &trace::MODULE, "pixels", mode)
 }
 
 /// Frames of `placed`, each read while the next is in flight, until two in a row trace the

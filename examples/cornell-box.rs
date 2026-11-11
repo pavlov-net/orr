@@ -399,7 +399,6 @@ fn run(options: &Options) -> Option<Capture> {
         .create_scene(
             &SceneDesc {
                 light_capacity: 1,
-                material_set_capacity: 1,
                 global_instances: 1,
                 ..SceneDesc::default()
             },

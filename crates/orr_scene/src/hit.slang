@@ -245,8 +245,10 @@ public uint section_material(SceneRoot* s, InstanceGpu inst, ModelGpu* model, ui
         return MATERIAL_NONE;
     if (inst.material_base == NO_MATERIAL_SET)
         return s.model_materials[model.materials + section];
-    uint set = (inst.variant >> 8) & 0xff;
-    return s.material_sets[inst.material_base + set * model.section_count + section];
+    uint at = ((inst.variant >> 8) & 0xff) * model.section_count + section;
+    if ((inst.material_base & PAGE_MATERIAL_SET) != 0)
+        return s.page_material_sets[(inst.material_base & ~PAGE_MATERIAL_SET) + at];
+    return s.material_sets[inst.material_base + at];
 }
 
 // Separates the chain fade's draws from a pixel's or ray's other draws.

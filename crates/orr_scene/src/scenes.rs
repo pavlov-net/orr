@@ -1886,6 +1886,7 @@ impl<'a> Frame<'a> {
                 clusters: core.mounts.clusters().gpu(),
                 model_materials: core.mounts.model_materials.gpu(),
                 material_sets: t.material_sets.gpu().cast(),
+                page_material_sets: t.page_sets.gpu().cast(),
                 lights: t.lights.gpu(),
                 emissive: t.emissive.gpu(),
                 producers: t.producers.gpu(),

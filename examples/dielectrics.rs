@@ -117,7 +117,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .create_scene(
             &SceneDesc {
                 light_capacity: 1,
-                material_set_capacity: 4,
                 emissive_capacity: 4,
                 producer_capacity: 1,
                 global_instances: 8,

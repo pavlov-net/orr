@@ -50,6 +50,8 @@ public bool class_rastered(uint c, uint flags)
 
 // `InstanceGpu.material_base` when the copy uses its model's section materials.
 public static const uint NO_MATERIAL_SET = 0xffffffff;
+// Set in an `InstanceGpu.material_base` that counts from `SceneRoot.page_material_sets`.
+public static const uint PAGE_MATERIAL_SET = 0x80000000;
 // `InstanceGpu.first_part` when the copy holds no part run.
 public static const uint NO_PART_RUN = 0xffffffff;
 // `InstanceGpu.first_emissive` of a copy with no emissive list entries.
@@ -65,7 +67,7 @@ public struct InstanceGpu
     public uint group;         // transform group; 0 is the null group
     public uint group_index;   // the copy's transform in its group
     public uint model;
-    public uint material_base; // in the scene's material-set table, or NO_MATERIAL_SET
+    public uint material_base; // in the scene's material sets, with PAGE_MATERIAL_SET its page's, or NO_MATERIAL_SET
     public uint pose_group;    // 0: no animated parts
     public uint pose_index;
     public uint first_part;    // the copy's part run, or NO_PART_RUN
@@ -425,7 +427,8 @@ public struct SceneRoot
     public MaterialGpu* materials;   // global
     public ClusterRef* clusters;     // global, by cluster id
     public uint* model_materials;    // global, each model's section materials from ModelGpu.materials
-    public uint* material_sets;      // MaterialId per model section per set
+    public uint* material_sets;      // the consumer's: MaterialId per model section per set
+    public uint* page_material_sets; // the placed pages': MaterialId per model section
     public LightGpu* lights;
     public EmissiveGpu* emissive;    // producer_capacity + emissive_capacity entries
     public ProducerGpu* producers;   // by ProducerId

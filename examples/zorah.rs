@@ -926,7 +926,6 @@ fn run(options: &Options) -> Option<Capture> {
     let needs = pages.iter().fold(PageNeeds::default(), |n, &p| {
         let p = renderer.page_needs(p).expect("page needs");
         PageNeeds {
-            material_sets: n.material_sets + p.material_sets,
             emissive: n.emissive + p.emissive,
         }
     });
@@ -936,7 +935,6 @@ fn run(options: &Options) -> Option<Capture> {
         .create_scene(
             &SceneDesc {
                 light_capacity: 1,
-                page_material_sets: needs.material_sets.max(defaults.page_material_sets),
                 emissive_capacity: needs.emissive.max(defaults.emissive_capacity),
                 ..defaults
             },

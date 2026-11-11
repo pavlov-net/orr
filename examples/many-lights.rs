@@ -200,7 +200,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .create_scene(
             &SceneDesc {
                 light_capacity: (local.len() + directional.len()) as u32,
-                material_set_capacity: 4,
                 emissive_capacity: 16,
                 global_instances: 4,
                 ..SceneDesc::default()
