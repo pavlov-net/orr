@@ -20,7 +20,9 @@
 //! - Displacement: R16 unorm from red, never collapsed; displacement is
 //!   `displacement_scale x texel + displacement_offset`. A height `h` stores across the
 //!   range `lo..hi` the image measures, as `(h - lo) / (hi - lo)`, with the scale and offset
-//!   compensated; a range past 0..1 widens the declared one. Heights along u and v cook alike,
+//!   compensated; a range past 0..1 widens the declared one. A range holding the height that
+//!   displaces by 0 widens by under a code so that it falls on one, and the offset reads it as
+//!   exactly 0. Heights along u and v cook alike,
 //!   each from its own channel, into [`Material::displacement_tangent`].
 //! - An image whose texels all lie within 1/255 of one value collapses into the material's
 //!   factor, clamped to the input's range as a texture stores it; a constant normal image, which
@@ -1047,6 +1049,28 @@ fn widest(ranges: impl Iterator<Item = (f32, f32)>) -> (f32, f32) {
     })
 }
 
+/// `lo..hi` widened as little as it takes for `zero`, strictly inside it, to store as a code of
+/// R16_UNORM across it, and that code.
+fn zero_on_code(lo: f32, hi: f32, zero: f32) -> (f32, f32, u16) {
+    const CODES: f64 = 65535.0;
+    let (below, above) = (
+        f64::from(zero) - f64::from(lo),
+        f64::from(hi) - f64::from(zero),
+    );
+    let at = below / (below + above);
+    let code = (at * CODES).round().clamp(1.0, CODES - 1.0);
+    let k = code / CODES;
+    // The side whose share the code shortens grows; widening only keeps every height inside.
+    let (below, above) = if k >= at {
+        (above * k / (1.0 - k), above)
+    } else {
+        (below, below * (1.0 - k) / k)
+    };
+    let lo = (f64::from(zero) - below) as f32;
+    let hi = (f64::from(zero) + above) as f32;
+    (lo, hi, code as u16)
+}
+
 /// Binds slot `s` to packed channel `channel` of `t`, sampled as `r` is.
 fn bind(m: &mut Material, s: usize, t: Made, channel: usize, r: &TexRef) {
     let mut outside = [0.0; 4];
@@ -1860,6 +1884,15 @@ impl<'a> Packer<'a> {
         } else {
             (lo, hi)
         };
+        // The source height that displaces by 0 lands on a code, so surfaces of different ranges
+        // that meet at no displacement decode the same there.
+        let zero = -h[1] / h[0];
+        let (lo, hi, code) = if lo < zero && zero < hi {
+            let (lo, hi, code) = zero_on_code(lo, hi, zero);
+            (lo, hi, Some(code))
+        } else {
+            (lo, hi, None)
+        };
         let span = hi - lo;
         // A constant image stores 0, and the offset holds its height.
         let b = if span.recip().is_finite() {
@@ -1886,6 +1919,10 @@ impl<'a> Packer<'a> {
         bind(m, s, id, 0, r);
         h[1] += h[0] * lo;
         h[0] *= span;
+        if let Some(code) = code {
+            // `scale * texel + offset` with the product rounded, as unfused, is exactly 0 there.
+            h[1] = -(h[0] * (f32::from(code) / 65535.0));
+        }
         // Importers declare the span of a 0..1 texel. A height past it widens that, and any
         // range a patch declared, which otherwise stands for the mesh cook to check.
         if lo < 0.0 || hi > 1.0 {

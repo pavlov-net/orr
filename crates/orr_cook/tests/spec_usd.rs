@@ -2534,10 +2534,12 @@ fn displacement_reads_in_the_stage_metric() {
         ST,
     );
     let m = material(&cook_centimeters("stage-displacement", &body, &gradient));
-    assert!(near(m.displacement_scale, 0.4), "{m:?}");
-    assert!(near(m.displacement_offset, -0.1), "{m:?}");
+    // The range widens by under a code so that a height of 0 falls on one.
+    let code = |a: f32, b: f32| (a - b).abs() <= 0.4 / 65535.0;
+    assert!(code(m.displacement_scale, 0.4), "{m:?}");
+    assert!(code(m.displacement_offset, -0.1), "{m:?}");
     assert!(
-        near(m.displacement_min, -0.1) && near(m.displacement_max, 0.3),
+        code(m.displacement_min, -0.1) && code(m.displacement_max, 0.3),
         "{m:?}"
     );
 

@@ -1122,8 +1122,10 @@ fn material_heights_read_back_through_compensated_factors() {
         write_glb(&path, &[height_material(factor, offset)], &[image]);
         let (a, m) = cook_glb(&path, GltfSettings::default());
         let stored = stored_heights(&a, &m);
-        assert_eq!(stored.iter().copied().fold(f32::MAX, f32::min), 0.0);
-        assert_eq!(stored.iter().copied().fold(f32::MIN, f32::max), 1.0);
+        // The range widens by under a code where that puts zero displacement on one.
+        let code = 1.0 / 65535.0;
+        assert!(stored.iter().copied().fold(f32::MAX, f32::min) <= code);
+        assert!(stored.iter().copied().fold(f32::MIN, f32::max) >= 1.0 - code);
         for (i, u) in stored.iter().enumerate() {
             let got = m.displacement_scale * u + m.displacement_offset;
             let want = factor * heights[i % n as usize] + offset;
@@ -1147,7 +1149,39 @@ fn material_heights_read_back_through_compensated_factors() {
         },
     );
     assert_eq!(m.displacement_max, 1.0);
-    assert!((m.displacement_min + 0.15).abs() < 1e-6);
+    assert!((m.displacement_min + 0.15).abs() <= 0.4 / 65535.0);
+}
+
+/// The source height that displaces by nothing stores on a code, so it reads back as exactly 0
+/// through `scale * texel + offset` with the product rounded, wherever the range around it ends.
+#[test]
+fn material_heights_hold_zero_displacement_on_a_code() {
+    let path = dir("height-zero").join("heights.glb");
+    let n = 16u32;
+    for (factor, offset) in [(0.2f32, 0.0f32), (0.2, 0.05)] {
+        let raw = ctt::TargetFormat::Uncompressed(ctt::Format::R32G32B32A32_SFLOAT);
+        let zero = -offset / factor;
+        // Neither end puts the zero on a code by itself.
+        let height = |x: u32| match x {
+            0 => -0.7,
+            1 => 1.9,
+            _ if x.is_multiple_of(2) => zero,
+            _ => 0.37 * x as f32 / n as f32,
+        };
+        let image = float_ktx2(n, n, raw, false, |x, _| [height(x), 0.0, 0.0, 1.0]);
+        write_glb(&path, &[height_material(factor, offset)], &[image]);
+        let (a, m) = cook_glb(&path, GltfSettings::default());
+        for (i, u) in stored_heights(&a, &m).into_iter().enumerate() {
+            let x = i as u32 % n;
+            let got = m.displacement_scale * u + m.displacement_offset;
+            if x.is_multiple_of(2) && x > 0 {
+                assert_eq!(got, 0.0, "{offset}: texel {i} reads {got}");
+            } else {
+                let want = factor * height(x) + offset;
+                assert!((got - want).abs() < 1e-5, "texel {i}: {got}, not {want}");
+            }
+        }
+    }
 }
 
 /// A constant height has no span to store across: the offset holds it.
