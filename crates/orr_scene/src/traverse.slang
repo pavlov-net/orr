@@ -1363,7 +1363,8 @@ void select(uint3 id: SV_GroupThreadID)
         for (uint k = ARGS_ADMIT; k < ARGS_TOTAL; k++)
             cut.args[k] = 0;
     }
-    GroupMemoryBarrierWithGroupSync();
+    // Over device memory too: the stop's thread sizes grids this thread has emptied.
+    AllMemoryBarrierWithGroupSync();
     for (uint d = 1; d < SELECT_THREADS; d *= 2)
     {
         uint64_t add_clas = t >= d ? g_clas[t - d] : 0;
