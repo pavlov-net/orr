@@ -1007,11 +1007,9 @@ impl DenseVegetation {
             per_model[s.model] += s.at.len() as u32;
         }
         let (lights, textured) = settings.directional_lights;
-        let groups = stands.len() as u32 + trees.len() as u32 + 4;
         let scene = renderer
             .create_scene(
                 &SceneDesc {
-                    group_capacity: groups,
                     light_capacity: (lights + textured).max(1),
                     producer_capacity: 8,
                     ..SceneDesc::default()

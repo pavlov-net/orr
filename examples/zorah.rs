@@ -935,8 +935,6 @@ fn run(options: &Options) -> Option<Capture> {
     let scene = renderer
         .create_scene(
             &SceneDesc {
-                // Each page takes a group, and group 0 is the null group.
-                group_capacity: pages.len() as u32 + 1,
                 light_capacity: 1,
                 page_material_sets: needs.material_sets.max(defaults.page_material_sets),
                 emissive_capacity: needs.emissive.max(defaults.emissive_capacity),

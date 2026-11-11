@@ -5219,6 +5219,68 @@ fn a_page_hung_from_a_joint_follows_its_palette_entry() {
     assert_clean();
 }
 
+/// The group table grows under frames in flight while a page hangs from a joint of a palette
+/// group: three frames running make more groups than the table holds. Every frame traces the
+/// page where the joint poses it, as the settled frames did: the page's group names the palette
+/// by the entries between them, which the move keeps.
+#[test]
+fn the_group_table_grows_under_frames_in_flight_and_a_hung_page_keeps_its_joint() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let view = (DVec3::new(0.5, 0.0, 2.5), DVec3::new(0.5, 0.0, 0.0));
+    let placed = place_hung(&mut w, 0.4);
+    let mut frame = 0;
+    // Settled once the page's records have landed.
+    let start = Instant::now();
+    let (settled, flight) = loop {
+        let (settled, flight) = settled_hits(&mut w, &placed, view, &mut frame);
+        wait(flight.point);
+        let traced: &[trace::Traced] = bytemuck::cast_slice(&settled);
+        if traced.iter().filter(|t| t.instance != 0).count() > 100 {
+            break (settled, flight);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the page never landed"
+        );
+    };
+    let held: SceneRoot = read_buffer(flight.scene, 1)[0];
+
+    let mut later = Vec::new();
+    for count in [3, 9, 30] {
+        frame += 1;
+        let shot = Shot::at(view.0, view.1, frame);
+        later.push(shoot_later_with(&mut w, &placed, &shot, |s| {
+            for _ in 0..count {
+                s.create_transform_group(&TransformGroupDesc {
+                    count: 1,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::ZERO,
+                })
+                .unwrap();
+            }
+        }));
+    }
+    for _ in 0..3 {
+        frame += 1;
+        let shot = Shot::at(view.0, view.1, frame);
+        later.push(shoot_later(&mut w, &placed, &shot));
+    }
+    wait(later.last().unwrap().point);
+    let grown: SceneRoot = read_buffer(flight.scene, 1)[0];
+    assert!(grown.groups != held.groups, "the group table never grew");
+    for (i, l) in later.iter().enumerate() {
+        let traced: Vec<u8> = bytemuck::cast_slice(&l.read().traced).to_vec();
+        assert!(
+            traced == settled,
+            "frame {} of the growth traced other hits at {} pixels",
+            i + 1,
+            differing(&traced, &settled),
+        );
+    }
+    assert_clean();
+}
+
 /// A copy placed by hand goes with its pack too: the next pack to take its model's id holds
 /// another model, which draws nothing of the old placement.
 #[test]
@@ -8471,6 +8533,16 @@ fn traced_hits(g: &Frame) -> Vec<u8> {
 
 /// A frame of `placed` from `shot` whose camera rays are traced after it, neither waited for.
 fn shoot_later(w: &mut World, placed: &Placed, shot: &Shot) -> RaysLater {
+    shoot_later_with(w, placed, shot, |_| {})
+}
+
+/// [`shoot_later`] with `write` run on the scene's writer.
+fn shoot_later_with(
+    w: &mut World,
+    placed: &Placed,
+    shot: &Shot,
+    write: impl FnOnce(&mut SceneWriter<'_>),
+) -> RaysLater {
     let list = [placed.scene];
     let mut f = w
         .scenes
@@ -8480,7 +8552,11 @@ fn shoot_later(w: &mut World, placed: &Placed, shot: &Shot) -> RaysLater {
             low_latency: None,
         })
         .unwrap();
-    f.scene(placed.scene).unwrap().set_focus(shot.eye);
+    {
+        let mut s = f.scene(placed.scene).unwrap();
+        s.set_focus(shot.eye);
+        write(&mut s);
+    }
     f.request_detail(placed.scene, PIXELS_PER_RADIAN).unwrap();
     f.update_scenes(&mut |_| {}).unwrap();
     let view = f
@@ -9872,7 +9948,8 @@ fn an_unmount_takes_a_skinned_page_and_its_motion_from_the_scene() {
     let state = || {
         let copies = read_buffer(root.instances, u64::from(root.part_base));
         let skins = read_buffer(root.skinned, u64::from(root.skinned_capacity));
-        let groups = read_buffer(root.groups, u64::from(SceneDesc::default().group_capacity));
+        // The null group and the three the scene made.
+        let groups = read_buffer(root.groups, 4);
         [
             copies.iter().filter(|c| c.flags != 0).count(),
             skins.iter().filter(|k| k.positions != GpuPtr::NULL).count(),

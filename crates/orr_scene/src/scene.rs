@@ -65,8 +65,6 @@ pub struct SceneId(pub u32);
 /// need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SceneDesc {
-    /// Transform groups, the null group included.
-    pub group_capacity: u32,
     pub light_capacity: u32,
     /// `MaterialId` entries in the scene's material-set table.
     pub material_set_capacity: u32,
@@ -100,7 +98,6 @@ pub struct SceneDesc {
 impl Default for SceneDesc {
     fn default() -> Self {
         Self {
-            group_capacity: 1024,
             light_capacity: 256,
             material_set_capacity: 4096,
             producer_capacity: 256,
@@ -355,7 +352,7 @@ pub(crate) struct Tables {
     /// By slot, like `slot_state` and the PTLAS slot table: the three grow together.
     pub(crate) instances: Column<InstanceGpu>,
     pub(crate) slot_state: Column<SlotStateGpu>,
-    pub(crate) groups: Allocation<GroupGpu>,
+    pub(crate) groups: Column<GroupGpu>,
     pub(crate) material_sets: Allocation<MaterialId>,
     pub(crate) lights: Allocation<LightGpu>,
     /// Producer entries first, then instance entries.
@@ -396,10 +393,10 @@ pub(crate) struct Group {
     pub(crate) frame: Option<GroupFrame>,
 }
 
-/// [`GroupGpu::frame`], `frame_index` and `frame_origin`.
+/// The palette group [`GroupGpu::frame`] leads to, `frame_index` and `frame_origin`.
 #[derive(Clone, Copy)]
 pub(crate) struct GroupFrame {
-    palette: GpuPtr<GroupGpu>,
+    palette: TransformGroupId,
     index: u32,
     origin: [f32; 3],
 }
@@ -492,20 +489,23 @@ impl Group {
         }
     }
 
-    pub(crate) fn record(&self) -> GroupGpu {
-        let frame = self.frame.unwrap_or(GroupFrame {
-            palette: GpuPtr::NULL,
-            index: 0,
-            origin: [0.0; 3],
-        });
+    /// The record of the group as entry `id` of the group table.
+    pub(crate) fn record(&self, id: u32) -> GroupGpu {
+        let (frame, frame_index, frame_origin) = match self.frame {
+            Some(f) => {
+                let entries = i64::from(f.palette.0) - i64::from(id);
+                (entries * size_of::<GroupGpu>() as i64, f.index, f.origin)
+            }
+            None => (0, 0, [0.0; 3]),
+        };
         if let Some(p) = &self.page {
             // SAFETY: the records stay resident while this record names them: their eviction
             // and their pack's unmount write it null first.
             let records = unsafe { GpuPtr::from_address(GpuAddress(p.records)) };
             return GroupGpu {
-                frame: frame.palette.cast(),
-                frame_index: frame.index,
-                frame_origin: frame.origin,
+                frame,
+                frame_index,
+                frame_origin,
                 current: records,
                 previous: records,
                 count: self.count,
@@ -531,9 +531,9 @@ impl Group {
             format: 0,
             anchor_cell: self.anchor.cell.to_array(),
             anchor_offset: self.anchor.offset.to_array(),
-            frame: frame.palette.cast(),
-            frame_index: frame.index,
-            frame_origin: frame.origin,
+            frame,
+            frame_index,
+            frame_origin,
             ..Zeroable::zeroed()
         }
     }
@@ -654,6 +654,14 @@ pub(crate) struct EntryGrowth {
     slots: Vec<u32>,
     pages: Vec<(usize, Vec<PrototypeEntries>)>,
     taken: Vec<(u32, u32)>,
+}
+
+/// The id a new group takes, with the memory of a group table that holds its entry where the
+/// table does not, and the entries of that table.
+struct GroupRoom {
+    id: u32,
+    table: Option<Allocation<GroupGpu>>,
+    capacity: u32,
 }
 
 /// What a slot holds.
@@ -863,16 +871,6 @@ impl SceneCpu {
             .unwrap_or(self.groups.len())
     }
 
-    /// Puts `group` at an id of [`Self::free_group`].
-    fn put_group(&mut self, id: usize, group: Group) {
-        self.hung |= group.frame.is_some();
-        if id == self.groups.len() {
-            self.groups.push(Some(group));
-        } else {
-            self.groups[id] = Some(group);
-        }
-    }
-
     /// Instance slots the scene's tables hold room for.
     pub(crate) fn slot_capacity(&self) -> u32 {
         self.slot_holds.len() as u32
@@ -919,6 +917,37 @@ impl Scene {
             .expect("the grown tables have a free run of `count`"))
     }
 
+    /// The id a new group takes and, where the group table holds no entry for it, the
+    /// memory of a table that does, grown as [`grown`] says. Fails past what the table can hold
+    /// or without device memory, changing nothing.
+    fn group_room(&self, cpu: &SceneCpu, device: &Device) -> Result<GroupRoom> {
+        let id = cpu.free_group() as u32;
+        let groups = &self.tables.groups;
+        let held = groups.capacity();
+        let capacity = if id < held {
+            held
+        } else {
+            grown("transform groups", held, 1, groups.limit())?
+        };
+        Ok(GroupRoom {
+            id,
+            table: groups.room(device, capacity)?,
+            capacity,
+        })
+    }
+
+    /// Puts `group` at the id of `room`.
+    fn put_group(&self, cpu: &mut SceneCpu, room: GroupRoom, group: Group) {
+        self.tables.groups.grow(room.table, room.capacity);
+        cpu.hung |= group.frame.is_some();
+        let id = room.id as usize;
+        if id == cpu.groups.len() {
+            cpu.groups.push(Some(group));
+        } else {
+            cpu.groups[id] = Some(group);
+        }
+    }
+
     /// Moves the scene's tables that grew since its last update: see [`Column::land`].
     pub(crate) fn land(
         &self,
@@ -930,6 +959,7 @@ impl Scene {
         self.tables.instances.land(frame, copies, records);
         self.tables.slot_state.land(frame, copies, records);
         cpu.ptlas.slot_table.land(frame, copies, records);
+        self.tables.groups.land(frame, copies, records);
     }
 
     /// Frees the tables moved from in frames at or before `completed`.
@@ -937,6 +967,7 @@ impl Scene {
         self.tables.instances.retire(completed);
         self.tables.slot_state.retire(completed);
         cpu.ptlas.slot_table.retire(completed);
+        self.tables.groups.retire(completed);
     }
 
     /// Instance entry `entry` of the emissive list.
@@ -1286,7 +1317,7 @@ impl Scene {
             root: device.gpu_malloc(dl, 1, "scene root")?,
             instances: Column::new(device, MemoryPriority::Normal, "instances", true)?,
             slot_state: Column::new(device, MemoryPriority::Normal, "slot state", true)?,
-            groups: device.gpu_malloc(dl, n(desc.group_capacity), "transform groups")?,
+            groups: Column::new(device, MemoryPriority::Normal, "transform groups", true)?,
             material_sets: device.gpu_malloc(
                 dl,
                 n(desc.material_set_capacity + desc.page_material_sets),
@@ -1317,11 +1348,11 @@ impl Scene {
             decal_refs: device.gpu_malloc(dl, n(decal_refs), "decal runs")?,
             proxies: device.gpu_malloc(dl, n(desc.medium_proxy_capacity), "medium proxies")?,
         };
-        // Tables start zeroed: the null group, no lights. These apply before any write
-        // (sequence 0).
+        // The null group.
+        tables.groups.reserve(device, 1)?;
+        // Tables start zeroed: no lights. These apply before any write (sequence 0).
         let zero = |a: GpuAddress, bytes: u64| Record::fill(0, a.0, words(bytes as usize), 0);
         let records = vec![
-            zero(tables.groups.gpu().address(), tables.groups.size()),
             zero(
                 tables.material_sets.gpu().address(),
                 tables.material_sets.size(),
@@ -1523,7 +1554,7 @@ impl<'f> SceneWriter<'f> {
             page: None,
             frame,
         };
-        let record = self.window.put(self.device, &group.record())?;
+        let (record_src, record) = self.window.slice::<GroupGpu>(self.device, 1)?;
         let zero = Record::fill(
             self.next_seq(),
             group.buffers[0].gpu().address().0,
@@ -1531,22 +1562,18 @@ impl<'f> SceneWriter<'f> {
             0,
         );
         let cpu = &mut *self.scene.cpu.lock().unwrap();
-        let id = cpu.free_group();
-        if id as u32 >= self.scene.desc.group_capacity {
-            return Err(Error::Capacity {
-                what: "transform groups",
-                capacity: self.scene.desc.group_capacity,
-            });
-        }
-        cpu.put_group(id, group);
+        let room = self.scene.group_room(cpu, self.device)?;
+        let id = room.id;
+        record[0] = group.record(id);
+        self.scene.put_group(cpu, room, group);
         cpu.records.push(zero);
         cpu.records.push(Record::values(
             self.next_seq(),
-            self.scene.tables.groups.gpu().offset(id as u64),
-            record,
+            self.scene.tables.groups.entry(id),
+            record_src,
             1,
         ));
-        Ok(TransformGroupId(id as u32))
+        Ok(TransformGroupId(id))
     }
 
     /// Transforms `first..first + count` of a CPU-written group, relative to its anchor.
@@ -1823,13 +1850,8 @@ impl<'f> SceneWriter<'f> {
             .frame
             .map(|f| self.group_frame(cpu, f, cell))
             .transpose()?;
-        let group_id = cpu.free_group() as u32;
-        if group_id >= self.scene.desc.group_capacity {
-            return Err(Error::Capacity {
-                what: "transform groups",
-                capacity: self.scene.desc.group_capacity,
-            });
-        }
+        let group_room = self.scene.group_room(cpu, self.device)?;
+        let group_id = group_room.id;
         let mut ends: Vec<u32> = page.info.partitions.iter().map(|&p| u32::from(p)).collect();
         ends.push(count);
         let mut runs: Vec<u32> = ends
@@ -1953,8 +1975,8 @@ impl<'f> SceneWriter<'f> {
         }
         let mut group = Group::of_page(r.page, page, self.frame);
         group.frame = frame;
-        let record = group.record();
-        cpu.put_group(group_id as usize, group);
+        let record = group.record(group_id);
+        self.scene.put_group(cpu, group_room, group);
         let range = InstanceRange { first, count };
         let seq = self.next_seq();
         let n = count * words(size_of::<InstanceGpu>());
@@ -1985,7 +2007,7 @@ impl<'f> SceneWriter<'f> {
         group_out[0] = record;
         cpu.records.push(Record::values(
             self.next_seq(),
-            self.scene.tables.groups.gpu().offset(u64::from(group_id)),
+            self.scene.tables.groups.entry(group_id),
             group_src,
             1,
         ));
@@ -2011,7 +2033,7 @@ impl<'f> SceneWriter<'f> {
         let edge = 2f64.powi(self.cell_log2 as i32);
         let cells = (cell - anchor.cell).as_dvec3() * edge - anchor.offset.as_dvec3();
         Ok(GroupFrame {
-            palette: self.scene.tables.groups.gpu().offset(u64::from(palette.0)),
+            palette,
             index,
             origin: cells.as_vec3().to_array(),
         })
@@ -2146,20 +2168,14 @@ impl<'f> SceneWriter<'f> {
                 .transpose()?
         };
         let copies = group.count;
-        let record = group.record();
         let cooked = proto.sets.as_ref().filter(|_| r.material_set.is_none());
         let set_entries = cooked.map_or(0, |s| s.len() as u32);
         let (sets_src, sets_out) = self.window.slice::<u32>(self.device, set_entries)?;
         let (group_src, group_out) = self.window.slice::<GroupGpu>(self.device, 1)?;
         let (id, sets) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
-            let id = cpu.free_group();
-            if id as u32 >= self.scene.desc.group_capacity {
-                return Err(Error::Capacity {
-                    what: "transform groups",
-                    capacity: self.scene.desc.group_capacity,
-                });
-            }
+            let room = self.scene.group_room(cpu, self.device)?;
+            let id = room.id;
             let Some(set_base) = cpu.page_sets.alloc(set_entries) else {
                 return Err(Error::Capacity {
                     what: "page material sets",
@@ -2179,15 +2195,15 @@ impl<'f> SceneWriter<'f> {
                     set_entries,
                 ));
             }
-            cpu.put_group(id, group);
-            group_out[0] = record;
+            group_out[0] = group.record(id);
+            self.scene.put_group(cpu, room, group);
             cpu.records.push(Record::values(
                 self.next_seq(),
-                self.scene.tables.groups.gpu().offset(id as u64),
+                self.scene.tables.groups.entry(id),
                 group_src,
                 1,
             ));
-            (TransformGroupId(id as u32), (set_base, set_entries))
+            (TransformGroupId(id), (set_base, set_entries))
         };
         let cooked_set = cooked.map(|_| self.scene.desc.material_set_capacity + sets.0);
         let flags = match proto.flags {

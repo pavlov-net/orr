@@ -1827,7 +1827,7 @@ impl<'a> Frame<'a> {
             records.append(&mut cpu.ptlas.partition_records(device, window, &core.seq)?);
             for (index, g) in cpu.groups.iter_mut().enumerate() {
                 let Some(g) = g else { continue };
-                let before = g.record();
+                let before = g.record(index as u32);
                 let fresh = g.created_frame == self.id;
                 match g.writer {
                     GroupWriter::Cpu => {
@@ -1847,14 +1847,14 @@ impl<'a> Frame<'a> {
                     GroupWriter::Page | GroupWriter::Gpu => {}
                 }
                 g.written = false;
-                let after = g.record();
+                let after = g.record(index as u32);
                 let landed = g
                     .page
                     .as_mut()
                     .is_some_and(|p| std::mem::take(&mut p.changed));
                 if landed || bytemuck::bytes_of(&before) != bytemuck::bytes_of(&after) {
                     let src = window.put(device, &after)?;
-                    let dst = scene.tables.groups.gpu().offset(index as u64);
+                    let dst = scene.tables.groups.entry(index as u32);
                     records.push(Record::values(core.next_seq(), dst, src, 1));
                 }
             }

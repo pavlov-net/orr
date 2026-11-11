@@ -398,7 +398,6 @@ fn run(options: &Options) -> Option<Capture> {
     let scene = renderer
         .create_scene(
             &SceneDesc {
-                group_capacity: 2,
                 light_capacity: 1,
                 material_set_capacity: 1,
                 global_instances: 1,

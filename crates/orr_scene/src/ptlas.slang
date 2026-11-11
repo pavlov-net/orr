@@ -237,7 +237,7 @@ uint2 instance_key(GroupGpu* g, InstanceGpu inst)
 
 bool moved(GroupGpu* g, uint index)
 {
-    if (g.frame == nullptr && g.previous == g.current)
+    if (g.frame == 0 && g.previous == g.current)
         return false;
     float3x4 a = group_transform(g, index);
     float3x4 b = previous_group_transform(g, index);
