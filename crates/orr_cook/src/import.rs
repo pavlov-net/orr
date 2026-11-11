@@ -165,6 +165,53 @@ impl Scene {
         out
     }
 
+    /// Puts each skeleton's bind space on the grid of the meshes it holds, which may be coarser
+    /// than the meter its origin stands on, so that their vertices and the copies that place
+    /// them sit on it: a joined model's grid holds every placement of it.
+    pub(crate) fn snap_rigs(&mut self) {
+        let mut steps: Vec<Option<i8>> = vec![None; self.skeletons.len()];
+        for m in &self.models {
+            let Some(s) = m.skeleton else { continue };
+            let MeshSource::Data(d) = &m.mesh else {
+                continue;
+            };
+            if d.positions.is_empty() {
+                continue;
+            }
+            let own = mesh::grid_exponent(&d.positions, m.settings.position_step_log2);
+            let k = own.max(d.min_exponent.unwrap_or(i8::MIN));
+            steps[s] = Some(steps[s].map_or(k, |j| j.max(k)));
+        }
+        for (s, k) in steps.into_iter().enumerate() {
+            let Some(k) = k else { continue };
+            let sk = &mut self.skeletons[s];
+            let delta = sk.space.snap(&mut sk.info, k);
+            if delta == DVec3::ZERO {
+                continue;
+            }
+            let moved =
+                |p: &mut [f32; 3]| *p = (Vec3::from(*p).as_dvec3() - delta).as_vec3().to_array();
+            for m in self.models.iter_mut().filter(|m| m.skeleton == Some(s)) {
+                if let MeshSource::Data(d) = &mut m.mesh {
+                    d.positions.iter_mut().for_each(moved);
+                    if let Some(parts) = &mut d.parts {
+                        match &mut parts.pivots {
+                            mesh::Pivots::PerValue(p) | mesh::Pivots::PerVertex(p) => {
+                                p.iter_mut().for_each(moved);
+                            }
+                            mesh::Pivots::Origin => {}
+                        }
+                    }
+                }
+                if let Some(cage) = &mut m.subd {
+                    for p in &mut cage.cage.cage.positions {
+                        *p = (p.as_dvec3() - delta).as_vec3();
+                    }
+                }
+            }
+        }
+    }
+
     /// The farthest displacement can move a point of model `m`, in its space: the most any of
     /// its mesh's and cage's materials declares. A world length counts as a length of the model,
     /// as it is under a placement of unit scale, the scale every bound here takes.

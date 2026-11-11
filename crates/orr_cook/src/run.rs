@@ -2160,6 +2160,7 @@ fn plan_scene(
     let mut units = Vec::new();
     let mut skeletons = Vec::with_capacity(src.skeletons.len());
     let mut skeleton_names = Vec::with_capacity(src.skeletons.len());
+    src.snap_rigs();
     let reaches = src.reaches();
     for (sk, reach) in std::mem::take(&mut src.skeletons).into_iter().zip(reaches) {
         let prefix = match sk.prefix.as_str() {

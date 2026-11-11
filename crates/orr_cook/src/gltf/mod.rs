@@ -1988,10 +1988,7 @@ fn join(
     for &i in &joined {
         let (node, m) = &mut models[i];
         let name = m.node.clone().unwrap_or_default();
-        // A model with a skeleton stands at its origin.
-        let origin = m.skeleton.map_or(DVec3::ZERO, |s| skeletons[s].info.origin);
-        let world = graph.world[node.expect("selected models have nodes")]
-            * DMat4::from_translation(origin);
+        let world = graph.world[node.expect("selected models have nodes")];
         // In f32, the precision of glTF's numbers: a chain of decimal translations that meets
         // the grid sums just off it in f64.
         let cols = world.as_mat4().to_cols_array_2d();
@@ -2022,11 +2019,16 @@ fn join(
         let MeshSource::Data(mesh) = &mut m.mesh else {
             unreachable!("selected models are built in memory");
         };
+        // A model with a skeleton holds its vertices in bind space, which the planner puts on
+        // the grid ([`crate::import::Scene::snap_rigs`]).
+        let origin = m
+            .skeleton
+            .map_or(DVec3::ZERO, |s| skeletons[s].space.bind_origin);
         let local = mesh
             .positions
             .iter()
-            .flatten()
-            .map(|&x| (f64::from(x) / step + 0.5).floor().abs())
+            .flat_map(|&p| (Vec3::from(p).as_dvec3() + origin).to_array())
+            .map(|x| (x / step + 0.5).floor().abs())
             .fold(0.0, f64::max);
         if placed + local >= f64::from(1 << 23) {
             return Err(format!(

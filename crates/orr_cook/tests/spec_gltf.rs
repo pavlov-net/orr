@@ -2619,3 +2619,58 @@ fn a_rig_under_a_mirror_winds_as_a_static_mesh_and_poses_unmirrored() {
         "the triangle faces {front}"
     );
 }
+
+/// A joined model on a 2 m grid holding a rig whose joint stands an odd number of meters in:
+/// its skeleton's space stands on that grid, so it joins as it would in model space and its
+/// vertices keep to the grid there.
+#[test]
+fn a_joined_rig_keeps_to_a_grid_coarser_than_a_meter() {
+    let path = dir("joined-rig").join("scene.glb");
+    let mut g = Glb::default();
+    let pa = g.floats(
+        &[[0.0f32, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+        "VEC3",
+    );
+    let ta = g.floats(&[[0.0f32], [1.0]], "SCALAR");
+    let turn = g.floats(
+        &[[0.0f32, 0.0, 0.0, 1.0], [0.0, 0.0, 0.5, 0.866_025_4]],
+        "VEC4",
+    );
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],
+"nodes":[{{"name":"tile","children":[1]}},
+{{"name":"arm","translation":[3,0,0],"mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}}}}]}}],
+"animations":[{{"name":"go","samplers":[{{"input":{ta},"output":{turn}}}],
+"channels":[{{"sampler":0,"target":{{"node":1,"path":"rotation"}}}}]}}]"#
+        ),
+    );
+    let settings = GltfSettings {
+        models: vec![NodeSelect {
+            node: "tile".into(),
+        }],
+        joined: vec!["tile".into()],
+        mesh: orr_cook::MeshSettings {
+            position_step_log2: 1,
+            ..Default::default()
+        },
+        ..GltfSettings::default()
+    };
+    let (a, _) = cook(&path, settings).unwrap();
+    let sk = skeleton_of(&a, "g/tile");
+    let on_grid = |x: f32| x / 2.0 == (x / 2.0).round();
+    assert!(
+        sk.origin.to_array().iter().all(|&x| on_grid(x as f32)),
+        "{}",
+        sk.origin
+    );
+    let (_, corners) = part_corners(&a, "g/tile/mesh");
+    for (_, p) in corners {
+        assert!(
+            p.to_array().into_iter().all(on_grid),
+            "a vertex off the grid: {p}"
+        );
+    }
+}

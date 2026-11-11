@@ -377,14 +377,16 @@ impl Rig {
 ///
 /// The root joints but the still joint give the box center of their rest translations, in whole
 /// units, `shift`, to the root; `bind_origin` is the whole meters nearest where the root puts
-/// that point, so a mesh grid of a step up to a meter holds the same vertices shifted. `origin`
-/// is where `after` puts it.
+/// that point, so a mesh grid of a step up to a meter holds the same vertices shifted, and
+/// [`Self::snap`] moves it onto a coarser grid. `origin` is where `after` puts it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RigSpace {
     /// Skeleton space's origin, in `after` of model space.
     pub(crate) origin: DVec3,
     /// Bind space's origin, in model space.
     pub(crate) bind_origin: DVec3,
+    /// The linear part of what the skeleton applies after model space.
+    after: DMat3,
     /// What the root joints' translations give up, in the space they hang from.
     shift: DVec3,
     /// The still joint, which keeps its rest.
@@ -421,6 +423,7 @@ impl RigSpace {
         let space = Self {
             origin: after * bind_origin,
             bind_origin,
+            after,
             shift,
             still,
         };
@@ -447,6 +450,27 @@ impl RigSpace {
             .map(|ib| Affine3::from_mat4(ib.as_mat4()))
             .collect();
         space
+    }
+
+    /// Moves bind space onto the mesh grid of step `2^k` m of the meshes it holds, and skeleton
+    /// space with it, in `info`: what its vertices give up, which is zero on a grid of a meter or
+    /// finer.
+    pub(crate) fn snap(&mut self, info: &mut SkeletonInfo, k: i8) -> DVec3 {
+        let step = 2f64.powi(i32::from(k));
+        let delta = (self.bind_origin / step).round() * step - self.bind_origin;
+        if delta == DVec3::ZERO {
+            return delta;
+        }
+        self.bind_origin += delta;
+        self.origin += self.after * delta;
+        info.origin = self.origin;
+        let root = DMat4::from_translation(-self.after * delta) * Mat4::from(info.root).as_dmat4();
+        info.root = Affine3::from_mat4(root.as_mat4());
+        for ib in &mut info.inverse_binds {
+            let moved = Mat4::from(*ib).as_dmat4() * DMat4::from_translation(delta);
+            *ib = Affine3::from_mat4(moved.as_mat4());
+        }
+        delta
     }
 
     /// Bind space from model space.
