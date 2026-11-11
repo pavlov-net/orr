@@ -107,24 +107,25 @@ impl Welded {
         self.indices[r].as_chunks::<3>().0.iter().copied()
     }
 
-    /// Adds a vertex at `at`'s position with every other stream of `from`; returns it.
+    /// Adds a vertex placed as `at` is, by its position, moves, skin, part value and pivot,
+    /// and shaded as `from` is, by its normal, tangent, uvs and colors; returns it.
     pub(super) fn wedge(&mut self, at: u32, from: u32) -> u32 {
         fn copy<T: Copy>(v: &mut Vec<T>, i: u32) {
             v.push(v[i as usize]);
         }
         let new = self.positions.len() as u32;
         copy(&mut self.positions, at);
+        self.moves.iter_mut().for_each(|m| copy(m, at));
+        if let Some(k) = &mut self.skin {
+            copy(&mut k.joints, at);
+            copy(&mut k.weights, at);
+        }
+        self.values.iter_mut().for_each(|v| copy(v, at));
+        self.pivots.iter_mut().for_each(|p| copy(p, at));
         copy(&mut self.normals, from);
         self.tangents.iter_mut().for_each(|t| copy(t, from));
         self.uvs.iter_mut().for_each(|u| copy(u, from));
         self.colors.iter_mut().for_each(|c| copy(c, from));
-        self.moves.iter_mut().for_each(|m| copy(m, from));
-        if let Some(k) = &mut self.skin {
-            copy(&mut k.joints, from);
-            copy(&mut k.weights, from);
-        }
-        self.values.iter_mut().for_each(|v| copy(v, from));
-        self.pivots.iter_mut().for_each(|p| copy(p, from));
         new
     }
 }
