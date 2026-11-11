@@ -77,7 +77,7 @@ pub use media::{
 use orr_scene::orr_gpu::KernelSet;
 pub use orr_scene::{DirectionalLight, DiscProfile, Light, LightId, PathEntry};
 pub use particles::ParticleDraw;
-pub use probe::{OriginProbe, OriginProbes};
+pub use probe::{OriginProbe, OriginProbes, TracedViews};
 pub use scene::{
     LIGHT_TILE_SIZE, LIGHT_TILES, LightingStats, SceneLighting, SceneLightingSettings, ScenePass,
     WorldCacheSettings,
@@ -90,7 +90,7 @@ pub use subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 pub use view::{
     CameraJump, CompilingKernels, DofBackgroundPass, GuideKind, GuideSettings, LightingDebugView,
     LightingKernels, LightingView, MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION, PathNeeds, PathsRan,
-    ReferenceSettings, ThinLens, ViewLighting, ViewPass, WaitedPaths,
+    ReferenceSettings, ThinLens, TracedKind, ViewLighting, ViewPass, WaitedPaths,
 };
 pub use world_cache::{MAX_CAPACITY_LOG2, WorldCacheStats};
 

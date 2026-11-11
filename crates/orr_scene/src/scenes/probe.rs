@@ -62,6 +62,7 @@ impl Frame<'_> {
             pixel,
             view: ProbeView {
                 position: desc.position,
+                rotation: desc.rotation,
                 fov_y: desc.projection.fov_y,
                 render_extent: desc.render_extent.to_array(),
                 output_extent: desc.output_extent.to_array(),

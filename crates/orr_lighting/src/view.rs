@@ -211,6 +211,33 @@ pub enum LightingDebugView {
     /// What the first vertex gathers of the caustic photons' light, from the scene's grid or a
     /// reference view's map.
     Caustics,
+    /// Each pixel's camera ray traced against the scene's acceleration structure as the path
+    /// rays meet it, in place of the radiance; the paths run as without a debug view.
+    Traced(TracedKind),
+}
+
+/// What a [`LightingDebugView::Traced`] view shows of each pixel's traced camera ray, which
+/// meets opaque, alpha-tested and dielectric geometry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TracedKind {
+    /// Gray falling with the hit's distance, blue where the ray leaves the scene.
+    Distance,
+    /// The hit's geometric normal, `0.5 n + 0.5`.
+    Normal,
+    /// Red where the traced hit lies nearer than the drawn surface by more than the first
+    /// vertex's ray origin offset, green where it lies farther, magenta where the ray leaves
+    /// where the raster drew, cyan where it hits where the raster drew nothing; dark gray where
+    /// they agree.
+    Disagreement,
+    /// The drawn first vertex's ray toward the scene's first directional light, from the origin
+    /// the paths give it, against opaque and alpha-tested geometry: white by the cosine where it
+    /// leaves the scene, dark red where something blocks it, dark blue on faces turned away.
+    Sun,
+}
+
+/// Whether the paths run a debug view of their own.
+fn path_debug(view: LightingDebugView) -> bool {
+    !matches!(view, LightingDebugView::None | LightingDebugView::Traced(_))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1330,7 +1357,8 @@ fn path_mode(lighting: &ViewLighting) -> u32 {
         | LightingDebugView::Guide(_)
         | LightingDebugView::DielectricLayer
         | LightingDebugView::Media
-        | LightingDebugView::Froxels => 0,
+        | LightingDebugView::Froxels
+        | LightingDebugView::Traced(_) => 0,
         LightingDebugView::DirectOnly => 1,
         LightingDebugView::IndirectOnly => 2,
         LightingDebugView::NeeOnly => 3,
@@ -1410,7 +1438,7 @@ fn support_may(
         | features_may(path_features(features, lighting))
         | bit(lens, MAY_LENS)
         | bit(froxels, MAY_FROXELS)
-        | bit(lighting.debug_view != LightingDebugView::None, MAY_DEBUG)
+        | bit(path_debug(lighting.debug_view), MAY_DEBUG)
         | bit(reference, MAY_REFERENCE)
         | bit(frosted_glass, MAY_FROST)
         | bit(local_share(lighting) > 0.0, MAY_LOCAL)

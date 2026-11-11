@@ -6081,6 +6081,16 @@ fn a_copy_tracing_its_built_cut_offsets_its_rays_by_that_cuts_largest_error() {
         "origin error {} m, want {want} m",
         origin.origin_error
     );
+    // The pixel's traced camera ray meets the copy it drew, within that error of the drawn point.
+    let traced = origin.traced;
+    assert!(traced.hit != 0 && traced.copy == slot, "traced {traced:?}");
+    let at = |v: [f32; 4]| Vec3::new(v[0], v[1], v[2]);
+    let met = at(origin.camera_origin) + traced.t * at(origin.camera_direction);
+    let apart = met.distance(at(origin.position));
+    assert!(
+        apart <= origin.origin_error,
+        "the traced hit lies {apart} m from the drawn one"
+    );
     assert_clean();
 }
 

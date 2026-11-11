@@ -93,7 +93,7 @@ use orr_scene::{ArenaRequest, Scenes};
 mod probe;
 
 pub use orr_lighting::OriginProbe;
-use orr_lighting::OriginProbes;
+use orr_lighting::{OriginProbes, TracedViews};
 pub use orr_scene::{PlanOutcome, ProbeTap, ProbeTile, UnitState, UnitStatus};
 pub use probe::PixelProbe;
 use probe::{ProbeAt, record_probe, take_probe};
@@ -394,6 +394,8 @@ struct ViewState {
     reconstruction: Option<ViewReconstruction>,
     /// The lighting side of the view's pixel probes, and what each probe's render was.
     origin_probes: OriginProbes,
+    /// The view's traced-scene debug pass, while its lighting asks for one.
+    traced: TracedViews,
     probes: Vec<ProbeAt>,
 }
 
@@ -719,6 +721,7 @@ impl Renderer {
             scene_resets: None,
             reconstruction: None,
             origin_probes: OriginProbes::default(),
+            traced: TracedViews::default(),
             probes: Vec::new(),
         };
         let id = self.scenes.create_view_history()?;
@@ -1459,6 +1462,19 @@ impl<'a> Frame<'a> {
         list.barrier(traced, Stages::COMPUTE, Hazards::empty());
         kernels.record_media_apply(list, scene, paths, &pass, lighting)?;
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        if let LightingDebugView::Traced(kind) = lighting.debug_view {
+            state.traced.record(
+                &gpu,
+                self.lighting.kernels,
+                list,
+                kind,
+                pass.scene,
+                pass.view,
+                pass.gbuffer,
+                paths.radiance_storage(),
+                paths.extent(),
+            )?;
+        }
         let mut overlay = None;
         if let Some(hook) = hooks.transparency.as_mut() {
             let particles = paths.particle_lighting(id);

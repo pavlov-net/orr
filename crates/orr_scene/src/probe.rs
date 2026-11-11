@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use orr_math::DVec3;
+use orr_math::{DVec3, Quat, Vec3};
 use orr_pack::mesh::Group;
 
 use crate::material::material_flags as mf;
@@ -196,6 +196,8 @@ pub struct ProbeSettings {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProbeView {
     pub position: DVec3,
+    /// World from view.
+    pub rotation: Quat,
     pub fov_y: f32,
     pub render_extent: [u32; 2],
     pub output_extent: [u32; 2],
@@ -420,12 +422,15 @@ impl fmt::Display for PixelProbe {
             v.output_extent[0],
             v.output_extent[1]
         )?;
+        let forward = v.rotation * Vec3::NEG_Z;
         writeln!(
             f,
-            "view at ({:.3}, {:.3}, {:.3}), vertical fov {:.2} deg, jitter ({:.3}, {:.3}), mip bias {:.3}",
+            "view at ({:.3}, {:.3}, {:.3}), yaw {:.2} deg (about +y, 0 down -z), pitch {:.2} deg, vertical fov {:.2} deg, jitter ({:.3}, {:.3}), mip bias {:.3}",
             v.position.x,
             v.position.y,
             v.position.z,
+            (-forward.x).atan2(-forward.z).to_degrees(),
+            forward.y.asin().to_degrees(),
             v.fov_y.to_degrees(),
             v.jitter[0],
             v.jitter[1],
@@ -483,6 +488,8 @@ impl fmt::Display for PixelProbe {
             "visibility word {:#018x}: visible cluster {}, triangle {}, depth {:.6}, {:.3} m along the ray",
             g.word, g.visible, g.triangle, g.depth, g.distance
         )?;
+        let at = v.position + Vec3::new(g.relative[0], g.relative[1], g.relative[2]).as_dvec3();
+        writeln!(f, "hit at world ({:.3}, {:.3}, {:.3})", at.x, at.y, at.z)?;
         let lists = [
             (LIST_OPAQUE, "mesh-shader opaque"),
             (LIST_ALPHA, "mesh-shader alpha"),
