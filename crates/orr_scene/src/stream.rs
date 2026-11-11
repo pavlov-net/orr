@@ -1459,8 +1459,10 @@ impl Streaming {
         }
         // Each built cut's locked pages and where it is, the shed ones apart. One past its hold
         // stays while a scene not updated since it was used may trace it, so neither shedding
-        // it nor its having been shed returns anything until that scene reports again.
+        // it nor its having been shed returns anything until that scene reports again, and its
+        // locks, which go then, are not for shedding other cuts to make up for.
         let (mut keys, mut cuts, mut at) = (Vec::new(), Vec::new(), Vec::new());
+        let mut kept = 0;
         for (&(mount, mesh), f) in &self.fine {
             let pages = &self.mounts[&mount].mesh_pages[mesh as usize];
             for (k, slot) in f.slots.iter().enumerate() {
@@ -1474,6 +1476,7 @@ impl Streaming {
                     continue;
                 };
                 if touched + HOLD_FRAMES < frame {
+                    kept += locks.bytes;
                     continue;
                 }
                 let first = keys.len();
@@ -1502,7 +1505,7 @@ impl Streaming {
             budget,
             &holders(true),
             &holders(false),
-            self.fine_locked,
+            self.fine_locked - kept,
         );
         for &i in &order {
             let (mount, mesh, k) = at[i];
