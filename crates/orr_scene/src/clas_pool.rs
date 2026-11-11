@@ -35,6 +35,24 @@
 //!   refuses, as a batch placed CLAS in the page meanwhile, returns it to the bound pages. A
 //!   reservation ends when its batch is replayed or abandoned.
 //!
+//! The pool's pages are bound to slots of a [`Pool`] of DeviceLocal blocks, and evictions leave
+//! those blocks partly used. A batch chooses the blocks to empty ([`Pool::plan_drain`]) and
+//! moves up to [`DRAIN_BYTES`] of the pages bound in them to slots of the other blocks, each
+//! page's CLAS staying at their addresses:
+//!
+//! - Hold. The batch's kernel marks every free unit of each page used before its allocations,
+//!   so no batch places a CLAS in the page while it moves. Frees of CLAS in a held page wait
+//!   for the end of its hold, and its replay takes the units the hold marked.
+//! - Copy. After its allocations the batch copies each page's bytes, the CLAS that every batch
+//!   before it placed there, from the page's slot to its new one through the blocks' own
+//!   buffers.
+//! - Bind. Once the batch has landed, the render thread binds the pages to their new slots on
+//!   the render queue, after the frames submitted so far and their output, and after every
+//!   build on the loading queue that read CLAS ([`ClasPool::read`]); the frames after it, and
+//!   the builds that read CLAS or the batches that place them, follow it.
+//! - Release. The pages' held units and the frees that waited go to the next batch, which waits
+//!   for the bind, and their old slots return once the bind has completed.
+//!
 //! The render thread and the loading side share the pool's bookkeeping under a lock held only
 //! while one of them changes it. Page memory and binds, micromap storage and the build scratch
 //! are the loading side's: a batch holds them from its start to its submit, so batches take
@@ -46,8 +64,8 @@ use std::sync::{Mutex, MutexGuard};
 use orr_gpu::{
     Allocation, ClusterVertexFormat, CommandList, Device, GpuAddress, GpuPtr, Hazards, MemoryKind,
     Micromap, MicromapDesc, MicromapTriangle, MicromapUsage, MoveKind, MoveLimits, OmmFormat,
-    PageBind, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, SparseAllocation,
-    SparseBinds, Stages, TimelinePoint,
+    PageBind, QueueKind, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc,
+    SparseAllocation, SparseBinds, Stages, TimelinePoint,
 };
 
 use crate::Result;
@@ -70,6 +88,9 @@ pub(crate) const NO_UNIT: u32 = u32::MAX;
 const RESERVE_STEPS: usize = 64;
 /// Alignment of every region carved from the build scratch.
 const ALIGN: u64 = 256;
+/// Bytes of pool pages one batch moves out of the draining blocks of their memory, at most:
+/// each takes a copy and a bind.
+const DRAIN_BYTES: u64 = 16 << 20;
 
 /// Units the CLAS of `clusters` clusters of `triangles` triangles in all are taken to need
 /// before they are built: a streamed mesh page's share of its budget before its first load.
@@ -197,6 +218,34 @@ enum PageState {
     Taking,
     /// Taken; unbinds with the next batch.
     Unbinding,
+    /// Held while its memory moves: no batch places a CLAS in it.
+    Held,
+}
+
+/// A bound page whose memory moves from slot `from` to slot `to`.
+#[derive(Clone, Copy, Debug)]
+struct PageMove {
+    page: u32,
+    from: PoolSlot,
+    to: PoolSlot,
+}
+
+/// The pages one batch holds while their memory moves, until the render thread binds them to
+/// their new slots.
+#[derive(Debug)]
+struct Moving {
+    /// Ascending by page.
+    pages: Vec<PageMove>,
+    /// The units the hold marked used, once the batch holding the pages is replayed.
+    held: Option<Vec<(u32, u32)>>,
+    /// Frees of CLAS in the pages queued after their hold.
+    deferred: Vec<(u32, u32)>,
+}
+
+impl Moving {
+    fn holds(&self, page: u32) -> bool {
+        self.pages.binary_search_by_key(&page, |m| m.page).is_ok()
+    }
 }
 
 /// What one batch does to the pool before its allocations, replayed once it has landed.
@@ -206,6 +255,11 @@ struct PoolOps {
     bound: Vec<u32>,
     frees: Vec<(u32, u32)>,
     takes: Vec<u32>,
+    /// Pages whose every unit the kernel marks used, ascending, after the frees and takes.
+    holds: Vec<u32>,
+    /// Units a hold marked used that free again, which the kernel frees with `frees` and
+    /// which hold no CLAS.
+    releases: Vec<(u32, u32)>,
     /// The wholly free pages reserved for the batch's runs.
     reserved: u32,
     /// Why the pool holds fewer wholly free pages than the reservation needs.
@@ -228,6 +282,8 @@ struct Started {
     binds: Vec<TimelinePoint>,
     /// Pages taken earlier, unbound with the batch's binds by [`ClasPool::grow`].
     unbinds: Vec<u32>,
+    /// The pages it holds, whose memory it copies to their new slots.
+    moves: Vec<PageMove>,
 }
 
 pub(crate) struct ClasPool {
@@ -236,8 +292,27 @@ pub(crate) struct ClasPool {
     page_count: u32,
     bits: Allocation<u32>,
     summary: Allocation<[u32; 2]>,
+    /// Whether the render queue takes the binds that move pages' memory.
+    moves_memory: bool,
     state: Mutex<PoolState>,
     side: Mutex<LoadingSide>,
+    readers: Mutex<Readers>,
+    /// A test holds back the binds of pages whose memory moves.
+    #[cfg(feature = "test-hooks")]
+    binds_held: std::sync::atomic::AtomicBool,
+    /// A test has the pages' memory planned as if its heap were over its mark.
+    #[cfg(feature = "test-hooks")]
+    tight: std::sync::atomic::AtomicBool,
+}
+
+/// The builds on the loading queue that read CLAS of the pool, and the binds that move pages'
+/// memory, which may not overlap.
+#[derive(Default)]
+struct Readers {
+    /// The point of the last such build submitted.
+    last: Option<TimelinePoint>,
+    /// The point of the last bind.
+    bind: Option<TimelinePoint>,
 }
 
 /// The pool's bookkeeping, which the render thread changes as batches land and CLAS free.
@@ -271,6 +346,20 @@ struct PoolState {
     initialized: bool,
     /// Storage of micromaps no frame reads any more, which the next batch frees.
     micromap_frees: Vec<PoolSlot>,
+    /// The pages a batch holds while their memory moves.
+    moving: Option<Moving>,
+    /// Units held pages kept marked used, which the next batch frees.
+    releases: Vec<(u32, u32)>,
+    /// The slots moved pages left, which return once the bind that moved them has completed.
+    retiring: Vec<(TimelinePoint, PoolSlot)>,
+    /// Whether the heap of the pages' memory is over its mark, so its pool empties every block
+    /// the others have room for.
+    tight: bool,
+    /// Bytes of the blocks of the pages' memory chosen to empty, as of the last plan.
+    draining: u64,
+    /// Slots of the pages' memory have returned since the last plan, which may now find
+    /// blocks to empty: the next batch plans again.
+    replan: bool,
 }
 
 /// What only the loading side uses, held by one batch at a time.
@@ -279,6 +368,8 @@ pub(crate) struct LoadingSide {
     backing: Pool,
     /// Per pool page, its memory while bound.
     slots: Vec<Option<PoolSlot>>,
+    /// By block of `backing`, the pages bound to its slots.
+    pages_of: Vec<BTreeSet<u32>>,
     /// Storage of streamed pages' micromaps.
     micromaps: Pool,
     scratch: Option<Allocation<u8>>,
@@ -316,13 +407,20 @@ impl ClasPool {
                 u64::from(pages.max(1)),
                 "CLAS pool runs",
             )?,
+            moves_memory: device.binds_sparse_on(QueueKind::Render),
             state: Mutex::new(PoolState::new(pages, page_units)),
             side: Mutex::new(LoadingSide {
                 backing: Pool::new(dl, range.page_size, block, "CLAS pool pages"),
                 slots: vec![None; pages as usize],
+                pages_of: Vec::new(),
                 micromaps: Pool::new(dl, 256, block, "streamed micromaps"),
                 scratch: None,
             }),
+            readers: Mutex::new(Readers::default()),
+            #[cfg(feature = "test-hooks")]
+            binds_held: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            tight: std::sync::atomic::AtomicBool::new(false),
             page_units,
             page_count: pages,
             range,
@@ -357,16 +455,115 @@ impl ClasPool {
     }
 
     /// Ends the render thread's step: asks to take the wholly free pages the reservations no
-    /// longer keep. Returns the bytes of the bound pages and of the units holding CLAS, and
-    /// the batches since the pool's start that needed more pages than its range had unbound.
-    pub(crate) fn end_step(&self) -> (u64, u64, u32) {
+    /// longer keep, and has the next plan of the pages' memory empty every block it can when
+    /// `tight`. Returns the bytes of the bound pages and of the units holding CLAS, and the
+    /// batches since the pool's start that needed more pages than its range had unbound.
+    pub(crate) fn end_step(&self, tight: bool) -> (u64, u64, u32) {
+        #[cfg(feature = "test-hooks")]
+        let tight = tight || self.tight.load(std::sync::atomic::Ordering::Relaxed);
         let mut s = self.state.lock().unwrap();
         s.end_step();
+        s.tight = tight;
         (
             u64::from(s.bound) * self.range.page_size,
             s.used_units * UNIT,
             s.range_full,
         )
+    }
+
+    /// Bytes of the blocks of the pages' memory the last plan chose to empty, which go back to
+    /// the system once the pages bound in them have moved or unbound.
+    pub(crate) fn draining(&self) -> u64 {
+        self.state.lock().unwrap().draining
+    }
+
+    /// Submits a build on the loading queue that reads CLAS of the pool: `submit` is given the
+    /// last bind of pages' memory to wait for, if it has not completed, and returns the
+    /// build's point, which the next bind follows.
+    pub(crate) fn read(
+        &self,
+        device: &Device,
+        submit: impl FnOnce(Option<TimelinePoint>) -> Result<TimelinePoint>,
+    ) -> Result<TimelinePoint> {
+        let mut r = self.readers.lock().unwrap();
+        let point = submit(r.bind.filter(|&p| !device.is_complete(p)))?;
+        r.last = Some(point);
+        Ok(point)
+    }
+
+    /// Binds the pages a landed batch held to the slots their memory was copied to, on the
+    /// render queue after the frames submitted so far, `output`, the work of the last of them
+    /// on another queue, and the last build on the loading queue that read CLAS. Their held
+    /// units and the frees that waited go to the next batch, which waits for the bind, and
+    /// their old slots return once it has completed. The pages wait for a later step while the
+    /// loading side holds its part or another thread is binding. Returns the pages bound and
+    /// the points this frame's work waits for.
+    pub(crate) fn finish_moves(
+        &self,
+        device: &Device,
+        output: Option<TimelinePoint>,
+    ) -> Result<(u64, Vec<TimelinePoint>)> {
+        let mut points = Vec::new();
+        #[cfg(feature = "test-hooks")]
+        if self.binds_held.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok((0, points));
+        }
+        let replayed = |s: &PoolState| s.moving.as_ref().is_some_and(|m| m.held.is_some());
+        if !replayed(&self.state.lock().unwrap()) {
+            return Ok((0, points));
+        }
+        let Ok(mut side) = self.side.try_lock() else {
+            return Ok((0, points));
+        };
+        // Only a batch holding the loading side ends a hold before its bind, by abandoning it.
+        let moves = match &self.state.lock().unwrap().moving {
+            Some(m) => m.pages.clone(),
+            None => unreachable!("a replayed hold ends at its bind"),
+        };
+        let mut readers = self.readers.lock().unwrap();
+        let to: Vec<(u32, PoolSlot)> = moves.iter().map(|m| (m.page, m.to)).collect();
+        let runs = self.runs(&side, &[], &to);
+        let mut binds = SparseBinds::new();
+        binds.pages(&self.range, &runs)?;
+        let render = device.queue(QueueKind::Render).expect("render queue");
+        // A bind follows the work submitted to its queue before it and nothing else, so the
+        // other queues' work goes ahead of it through a list that waits for it.
+        let before: Vec<TimelinePoint> = [output, readers.last]
+            .into_iter()
+            .flatten()
+            .filter(|&p| !device.is_complete(p))
+            .collect();
+        if !before.is_empty() {
+            points.push(render.submit(vec![render.command_list()?], &before)?);
+        }
+        let Some(point) = device.try_bind_sparse_on(QueueKind::Render, &binds)? else {
+            return Ok((0, points));
+        };
+        drop(runs);
+        points.push(point);
+        readers.bind = Some(point);
+        drop(readers);
+        for m in &moves {
+            side.set_slot(m.page, Some(m.to));
+            side.backing.retire(m.from);
+        }
+        let mut s = self.state.lock().unwrap();
+        s.release();
+        s.retiring.extend(moves.iter().map(|m| (point, m.from)));
+        s.unreported_binds.push(point);
+        Ok((moves.len() as u64, points))
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn hold_binds(&self, hold: bool) {
+        self.binds_held
+            .store(hold, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn plan_tight(&self, tight: bool) {
+        self.tight
+            .store(tight, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The pages as of the last replayed batch, and the pools of the page memory and the
@@ -383,6 +580,7 @@ impl ClasPool {
             bound: s.bound,
             wholly_free: wholly_free.count() as u32,
             reserved: s.reserved,
+            held: s.moving.as_ref().map_or(0, |m| m.pages.len() as u32),
             used: s.used_units * UNIT,
         };
         drop(s);
@@ -391,16 +589,68 @@ impl ClasPool {
     }
 
     /// Starts a batch: takes the frees, takes and pages to unbind queued since the last
-    /// batch, and frees the micromaps' storage queued.
-    fn start(&self, side: &mut LoadingSide) -> Started {
+    /// batch, frees the micromaps' storage queued and the slots moved pages left once their
+    /// bind has completed.
+    fn start(&self, device: &Device, side: &mut LoadingSide) -> Started {
         let mut s = self.state.lock().unwrap();
-        let started = s.start();
+        let started = s.start(self.page_units);
         let micromaps = std::mem::take(&mut s.micromap_frees);
+        let moves_memory = self.moves_memory;
+        let mut freed = false;
+        s.retiring.retain(|&(point, slot)| {
+            let done = device.is_complete(point);
+            if done {
+                side.backing.free_retired(slot);
+                freed = true;
+            }
+            !done
+        });
+        s.replan |= moves_memory && freed;
         drop(s);
         for slot in micromaps {
             side.micromaps.free(slot);
         }
         started
+    }
+
+    /// Holds, for the started batch, up to [`DRAIN_BYTES`] of the bound pages whose memory
+    /// lies in the blocks chosen to empty, each with a slot in another block to move to,
+    /// while no batch holds pages. A page asked to be taken unbinds instead.
+    fn plan_moves(&self, side: &mut LoadingSide, started: &mut Started) {
+        let mut s = self.state.lock().unwrap();
+        if !self.moves_memory || s.moving.is_some() {
+            return;
+        }
+        let page_bytes = self.range.page_size;
+        s.replan = false;
+        s.draining = side.backing.plan_drain(s.tight);
+        let most = (DRAIN_BYTES / page_bytes).max(1) as usize;
+        let mut moves: Vec<PageMove> = Vec::new();
+        'blocks: for block in side.backing.draining().to_vec() {
+            let pages: Vec<u32> = match side.pages_of.get(block as usize) {
+                Some(pages) => pages.iter().copied().collect(),
+                None => continue,
+            };
+            for page in pages {
+                if moves.len() == most {
+                    break 'blocks;
+                }
+                if s.pages[page as usize] != PageState::Bound {
+                    continue;
+                }
+                let Some((to, _)) = side.backing.alloc_moved(page_bytes, block) else {
+                    continue 'blocks;
+                };
+                let from = side.slots[page as usize].expect("a bound page's memory");
+                moves.push(PageMove { page, from, to });
+            }
+        }
+        if moves.is_empty() {
+            return;
+        }
+        moves.sort_unstable_by_key(|m| m.page);
+        s.hold(&mut started.ops, moves.clone());
+        started.moves = moves;
     }
 
     /// Reserves `need` wholly free pages for the started batch, binds the unbound pages that
@@ -449,15 +699,15 @@ impl ClasPool {
         let mut s = self.state.lock().unwrap();
         s.bind(&bound, &started.unbinds);
         s.range_full += u32::from(matches!(shortfall, Some(Shortfall::Range)));
+        s.replan |= self.moves_memory && !started.unbinds.is_empty();
         drop(s);
         for p in started.unbinds.drain(..) {
-            let slot = side.slots[p as usize]
-                .take()
-                .expect("a bound page's memory");
+            let slot = side.slots[p as usize].expect("a bound page's memory");
+            side.set_slot(p, None);
             side.backing.free(slot);
         }
         for &(page, slot) in &slots {
-            side.slots[page as usize] = Some(slot);
+            side.set_slot(page, Some(slot));
         }
         started.ops.bound.extend(bound);
         started.binds.extend(point);
@@ -465,9 +715,19 @@ impl ClasPool {
         Ok(())
     }
 
-    /// Takes back a batch that was never submitted: see [`PoolState::abandon`].
-    fn abandon(&self, ops: PoolOps, binds: Vec<TimelinePoint>, unbinds: Vec<u32>) {
-        self.state.lock().unwrap().abandon(ops, binds, unbinds);
+    /// Takes back a batch that was never submitted: see [`PoolState::abandon`]. The slots the
+    /// pages it held would have moved to return.
+    fn abandon(
+        &self,
+        side: &mut LoadingSide,
+        ops: PoolOps,
+        binds: Vec<TimelinePoint>,
+        unbinds: Vec<u32>,
+    ) {
+        let moves = self.state.lock().unwrap().abandon(ops, binds, unbinds);
+        for m in moves {
+            side.backing.free(m.to);
+        }
     }
 
     /// Unbinds `unbinds` and binds `slots`' pages to their slots.
@@ -478,7 +738,23 @@ impl ClasPool {
         unbinds: &[u32],
         slots: &[(u32, PoolSlot)],
     ) -> Result<Option<TimelinePoint>> {
-        let mut runs: Vec<PageBind<'_>> = Vec::new();
+        let runs = self.runs(side, unbinds, slots);
+        if runs.is_empty() {
+            return Ok(None);
+        }
+        let mut binds = SparseBinds::new();
+        binds.pages(&self.range, &runs)?;
+        Ok(Some(device.bind_sparse(&binds)?))
+    }
+
+    /// The runs of pages that unbind `unbinds` and bind `slots`' pages to their slots.
+    fn runs<'a>(
+        &self,
+        side: &'a LoadingSide,
+        unbinds: &[u32],
+        slots: &[(u32, PoolSlot)],
+    ) -> Vec<PageBind<'a>> {
+        let mut runs: Vec<PageBind<'a>> = Vec::new();
         for &p in unbinds {
             match runs.last_mut() {
                 Some(r) if r.memory.is_none() && r.first_page + r.count == u64::from(p) => {
@@ -509,12 +785,7 @@ impl ClasPool {
                 });
             }
         }
-        if runs.is_empty() {
-            return Ok(None);
-        }
-        let mut binds = SparseBinds::new();
-        binds.pages(&self.range, &runs)?;
-        Ok(Some(device.bind_sparse(&binds)?))
+        runs
     }
 
     /// Records the `allocate` kernel over the built CLAS in `order`, then their moves. `up`
@@ -539,11 +810,12 @@ impl ClasPool {
             .bound
             .iter()
             .map(|&p| [p * n, n])
-            .chain(ops.frees.iter().map(|&(f, c)| [f, c]))
+            .chain(ops.frees.iter().chain(&ops.releases).map(|&(f, c)| [f, c]))
             .collect();
         frees.sort_unstable_by_key(|f| f[0]);
         let frees_at = up.put(&frees);
         let takes_at = up.put(&ops.takes);
+        let holds_at = up.put(&ops.holds);
         let order_at = up.put(order.order());
         let groups_at = up.put(order.groups());
         let root_at = up.take(size_of::<PoolRoot>() as u64);
@@ -557,6 +829,7 @@ impl ClasPool {
             frees: ptr(frees_at),
             takes: ptr(takes_at),
             taken: ptr(taken),
+            holds: ptr(holds_at),
             order: ptr(order_at),
             groups: ptr(groups_at),
             sizes: built.sizes,
@@ -570,9 +843,11 @@ impl ClasPool {
             words: n / 32,
             free_count: frees.len() as u32,
             take_count: ops.takes.len() as u32,
+            hold_count: ops.holds.len() as u32,
             group_count: order.groups().len() as u32,
             flags: if ops.init { POOL_INIT } else { 0 },
-            _pad: 0,
+            _pad0: 0,
+            _pad1: 0,
         };
         up.write(root_at, bytemuck::bytes_of(&root));
         list.barrier(Stages::AS_BUILD, Stages::COMPUTE, Hazards::empty());
@@ -646,6 +921,12 @@ impl PoolState {
             range_full: 0,
             initialized: false,
             micromap_frees: Vec::new(),
+            moving: None,
+            releases: Vec::new(),
+            retiring: Vec::new(),
+            tight: false,
+            draining: 0,
+            replan: false,
         }
     }
 
@@ -655,16 +936,23 @@ impl PoolState {
             || !self.unbinds.is_empty()
             || !self.unreported.is_empty()
             || !self.micromap_frees.is_empty()
+            || !self.releases.is_empty()
+            || !self.retiring.is_empty()
+            || (self.replan && self.moving.is_none())
     }
 
-    /// A new batch's ops and the binds they wait for: the frees, takes, pages to unbind and
-    /// unreported pages queued since the last batch.
-    fn start(&mut self) -> Started {
+    /// A new batch's ops and the binds they wait for: the frees, takes, pages to unbind,
+    /// unreported pages and held units to free queued since the last batch. The frees of CLAS
+    /// in held pages of `n` units wait for the end of their hold.
+    fn start(&mut self, n: u32) -> Started {
+        let frees = std::mem::take(&mut self.frees);
         let mut ops = PoolOps {
             init: !self.initialized,
             bound: std::mem::take(&mut self.unreported),
-            frees: std::mem::take(&mut self.frees),
+            frees: self.defer(n, frees),
             takes: std::mem::take(&mut self.takes),
+            holds: Vec::new(),
+            releases: std::mem::take(&mut self.releases),
             reserved: 0,
             shortfall: None,
         };
@@ -675,7 +963,61 @@ impl PoolState {
             ops,
             binds: std::mem::take(&mut self.unreported_binds),
             unbinds: std::mem::take(&mut self.unbinds),
+            moves: Vec::new(),
         }
+    }
+
+    /// `frees` but their parts in held pages of `n` units, which wait with the hold. A free's
+    /// units may reach across pages.
+    fn defer(&mut self, n: u32, frees: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+        let Some(m) = &mut self.moving else {
+            return frees;
+        };
+        let mut kept = Vec::with_capacity(frees.len());
+        for (first, count) in frees {
+            let end = first + count;
+            let mut u = first;
+            while u < end {
+                let page = u / n;
+                let span = end.min((page + 1) * n) - u;
+                if m.holds(page) {
+                    m.deferred.push((u, span));
+                } else {
+                    match kept.last_mut() {
+                        Some((f, c)) if *f + *c == u => *c += span,
+                        _ => kept.push((u, span)),
+                    }
+                }
+                u += span;
+            }
+        }
+        kept
+    }
+
+    /// Holds the pages of `moves`, ascending, in the batch of `ops`: no batch places a CLAS in
+    /// them until [`PoolState::release`].
+    fn hold(&mut self, ops: &mut PoolOps, moves: Vec<PageMove>) {
+        for m in &moves {
+            self.set(m.page, PageState::Held);
+        }
+        ops.holds = moves.iter().map(|m| m.page).collect();
+        self.moving = Some(Moving {
+            pages: moves,
+            held: None,
+            deferred: Vec::new(),
+        });
+    }
+
+    /// Ends the hold of a replayed batch's pages, bound to their new memory: the next batch
+    /// frees the units the hold marked used and the CLAS freed since.
+    fn release(&mut self) {
+        let m = self.moving.take().expect("held pages");
+        self.releases.extend(m.held.expect("a replayed hold"));
+        self.frees.extend(m.deferred);
+        for p in &m.pages {
+            self.set(p.page, PageState::Bound);
+        }
+        self.trim();
     }
 
     /// Reserves `need` wholly free pages for the batch of `ops`. Returns the unbound pages to
@@ -724,18 +1066,34 @@ impl PoolState {
         self.bound = self.bound + bound.len() as u32 - unbound.len() as u32;
     }
 
-    /// Takes back a batch that was never submitted: its frees, takes and pages to unbind go
-    /// to the next batch, as do the pages it bound with their `binds`, and its reservation
-    /// ends.
-    fn abandon(&mut self, ops: PoolOps, binds: Vec<TimelinePoint>, unbinds: Vec<u32>) {
+    /// Takes back a batch that was never submitted: its frees, takes, held units to free and
+    /// pages to unbind go to the next batch, as do the pages it bound with their `binds`, its
+    /// reservation ends and the pages it held are bound as they were. Returns their moves.
+    fn abandon(
+        &mut self,
+        ops: PoolOps,
+        binds: Vec<TimelinePoint>,
+        unbinds: Vec<u32>,
+    ) -> Vec<PageMove> {
         self.reserved -= ops.reserved;
         self.initialized &= !ops.init;
         self.unreported.splice(0..0, ops.bound);
         self.unreported_binds.splice(0..0, binds);
         self.frees.splice(0..0, ops.frees);
         self.takes.splice(0..0, ops.takes);
+        self.releases.splice(0..0, ops.releases);
         self.unbinds.splice(0..0, unbinds);
+        let mut moves = Vec::new();
+        if !ops.holds.is_empty() {
+            // A batch holds pages only while no other does, and no batch starts before it ends.
+            let m = self.moving.take().expect("the batch's held pages");
+            for p in &m.pages {
+                self.set(p.page, PageState::Bound);
+            }
+            moves = m.pages;
+        }
         self.trim();
+        moves
     }
 
     fn apply(
@@ -754,6 +1112,9 @@ impl PoolState {
             self.reference.free(first, count);
             self.count(n, first, count, false);
         }
+        for &(first, count) in &ops.releases {
+            self.reference.free(first, count);
+        }
         for (&p, &t) in ops.takes.iter().zip(taken) {
             if t != 0 {
                 let ok = self.reference.take(p * n, n);
@@ -766,6 +1127,15 @@ impl PoolState {
             } else {
                 self.set(p, PageState::Bound);
             }
+        }
+        if !ops.holds.is_empty() {
+            let held = ops
+                .holds
+                .iter()
+                .flat_map(|&p| self.reference.take_within(p * n, n))
+                .collect();
+            let m = self.moving.as_mut().expect("the batch's held pages");
+            m.held = Some(held);
         }
         let expected = order.place(&mut self.reference, n, sizes);
         let apart = expected.iter().zip(placed).position(|(e, u)| e != u);
@@ -840,6 +1210,20 @@ impl PoolState {
 }
 
 impl LoadingSide {
+    /// Binds `page` to `slot` of `backing`, or to nothing.
+    fn set_slot(&mut self, page: u32, slot: Option<PoolSlot>) {
+        if let Some(old) = std::mem::replace(&mut self.slots[page as usize], slot) {
+            self.pages_of[old.block as usize].remove(&page);
+        }
+        if let Some(new) = slot {
+            let b = new.block as usize;
+            if b >= self.pages_of.len() {
+                self.pages_of.resize_with(b + 1, BTreeSet::new);
+            }
+            self.pages_of[b].insert(page);
+        }
+    }
+
     /// The build scratch, grown to at least `bytes`; reused by every batch on the loading
     /// queue, whose lists start with a full barrier.
     fn scratch(&mut self, device: &Device, bytes: u64) -> Result<u64> {
@@ -961,7 +1345,7 @@ impl BuildOut {
             results,
             ..
         } = self.batch;
-        pool.abandon(ops, self.binds, Vec::new());
+        pool.abandon(side, ops, self.binds, Vec::new());
         give_back(side, self.micromaps, staging, &[upload, results.0]);
     }
 }
@@ -1038,7 +1422,9 @@ pub(crate) fn build_pages(
     }
     let n = members.len() as u64;
 
-    let mut started = pool.start(side);
+    let mut started = pool.start(device, side);
+    // Before the reservation, which counts the wholly free pages left.
+    pool.plan_moves(side, &mut started);
     let mut micromaps: Vec<Option<PoolMicromap>> = Vec::with_capacity(pages.len());
     // What a failure before the submit gives back.
     let fail = |e: crate::Error,
@@ -1046,7 +1432,7 @@ pub(crate) fn build_pages(
                 started: Started,
                 micromaps: Vec<Option<PoolMicromap>>,
                 held: &[PoolSlot]| {
-        pool.abandon(started.ops, started.binds, started.unbinds);
+        pool.abandon(side, started.ops, started.binds, started.unbinds);
         give_back(side, micromaps, staging_pool, held);
         Err(e)
     };
@@ -1168,11 +1554,14 @@ pub(crate) fn build_pages(
 
     // The op lists and outputs.
     let frees = started.ops.bound.len() + started.ops.frees.len();
+    let frees = frees + started.ops.releases.len();
     let takes = started.ops.takes.len();
     let upload_bytes = n * size_of::<ClasJob>() as u64
         + builds.len() as u64 * (size_of::<AccelRoot>() as u64 + 32)
         + 8 * frees as u64
         + 4 * takes as u64
+        + 4 * started.ops.holds.len() as u64
+        + 16
         + 4 * n
         + 8 * u64::from(groups)
         + size_of::<PoolRoot>() as u64
@@ -1256,6 +1645,12 @@ pub(crate) fn build_pages(
             scratch: base + move_scratch,
         },
     );
+    // The held pages hold every CLAS a batch before this one placed in them, and this one's
+    // allocations placed none.
+    for m in &started.moves {
+        let (from, to) = (side.backing.address(m.from), side.backing.address(m.to));
+        list.copy(ptr(to), ptr(from), pool.range.page_size);
+    }
     Ok(BuildOut {
         batch: PoolBatch {
             ops: started.ops,
@@ -1342,11 +1737,12 @@ mod tests {
     }
 
     /// Batches of CLAS built at or under their largest sizes, several in flight, some
-    /// abandoned, with frees of earlier CLAS and steps with nothing in flight, placed by a
-    /// reference standing in for the kernel: every CLAS places, a batch leaves at most its
-    /// reservation of wholly free pages partly used, the wholly free pages kept stay within
-    /// the reservations in flight and their recent peak, and once the CLAS stop coming, and
-    /// then free, the pool gives back every page they leave free.
+    /// abandoned, some holding pages whose memory moves, with frees of earlier CLAS and steps
+    /// with nothing in flight, placed by a reference standing in for the kernel: every CLAS
+    /// places, none in a held page, a batch leaves at most its reservation of wholly free
+    /// pages partly used, the wholly free pages kept stay within the reservations in flight
+    /// and their recent peak, and once the CLAS stop coming, and then free, the pool gives
+    /// back every page they leave free.
     #[test]
     fn reserved_pages_place_every_clas_and_the_surplus_unbinds() {
         const N: u32 = 512;
@@ -1391,11 +1787,37 @@ mod tests {
             let batches = if step < streamed { rng(4) } else { 0 };
             // A step that sends no batch sends one for the pool alone when it has work.
             for b in 0..batches.max(u32::from(s.pending())) {
-                let mut started = s.start();
+                let mut started = s.start(N);
                 if rng(24) == 0 {
                     s.abandon(started.ops, started.binds, started.unbinds);
                     check(&s, reserved, &peaks);
                     continue;
+                }
+                // Before the reservation, which counts the wholly free pages left.
+                // Pages of live CLAS, whose frees then come while they are held, and wholly free
+                // pages.
+                if step < streamed && s.moving.is_none() && !live.is_empty() && rng(3) == 0 {
+                    let slot = PoolSlot {
+                        block: 0,
+                        first: 0,
+                        units: 1,
+                    };
+                    let whole: Vec<u32> = s.whole.iter().take(2).copied().collect();
+                    let mut held: Vec<u32> = (0..8)
+                        .map(|_| live[rng(live.len() as u32) as usize].0 / N)
+                        .chain(whole)
+                        .filter(|&p| s.pages[p as usize] == PageState::Bound)
+                        .collect();
+                    held.sort_unstable();
+                    held.dedup();
+                    let moves = held.iter().map(|&page| PageMove {
+                        page,
+                        from: slot,
+                        to: slot,
+                    });
+                    if !held.is_empty() {
+                        s.hold(&mut started.ops, moves.collect());
+                    }
                 }
                 let (mut order, mut sizes) = (ClasOrder::default(), Vec::new());
                 let (mut worst, mut largest) = (0u64, 0u64);
@@ -1448,16 +1870,28 @@ mod tests {
                 for &p in &ops.bound {
                     kernel.free(p * N, N);
                 }
-                for &(first, count) in &ops.frees {
+                for &(first, count) in ops.frees.iter().chain(&ops.releases) {
                     kernel.free(first, count);
                 }
                 let taken = ops.takes.iter().map(|&p| u32::from(kernel.take(p * N, N)));
                 let taken: Vec<u32> = taken.collect();
+                for &p in &ops.holds {
+                    kernel.take_within(p * N, N);
+                }
                 let whole =
                     |k: &RangeAllocator| (0..PAGES).filter(|&p| k.is_free(p * N, N)).count();
                 let before = whole(&kernel);
                 let placed = order.place(&mut kernel, N, &sizes);
                 assert!(placed.iter().all(|&u| u != NO_UNIT), "step {step}");
+                if let Some(m) = &s.moving {
+                    for (&u, &b) in placed.iter().zip(&sizes) {
+                        let (first, last) = (u / N, (u + units(b) - 1) / N);
+                        assert!(
+                            !m.holds(first) && !m.holds(last),
+                            "step {step}: a CLAS placed in a held page"
+                        );
+                    }
+                }
                 let used = before - whole(&kernel);
                 assert!(used <= need as usize, "{used} free pages used for {need}");
                 sent.push_back((ops, order, sizes, placed, taken));
@@ -1473,6 +1907,12 @@ mod tests {
                 s.apply(N, ops, &order, &sizes, &placed, &taken);
                 check(&s, reserved, &peaks);
                 live.extend(placed.iter().zip(&sizes).map(|(&u, &b)| (u, units(b))));
+            }
+            // The render thread binds a landed batch's held pages in this step or a later one.
+            let replayed = s.moving.as_ref().is_some_and(|m| m.held.is_some());
+            if replayed && (step >= streamed || rng(3) == 0) {
+                s.release();
+                check(&s, reserved, &peaks);
             }
             // Evictions free CLAS at random while batches come, then none until every CLAS
             // frees at once.

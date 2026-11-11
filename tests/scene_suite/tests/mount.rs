@@ -3679,7 +3679,8 @@ fn the_clas_pool_allocator_places_like_a_first_fit_reference() {
 
 /// `rounds` batches of `clas_count` CLAS in streamed pages of up to 400 into a pool of
 /// `page_count` pages, each against [`orr_scene::ClasOrder::place`]. A few CLAS have no bytes
-/// or more than a page, and a streamed page's CLAS free together.
+/// or more than a page, a streamed page's CLAS free together, and some pages are held, their
+/// free units marked used, for a round.
 fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
     use orr_scene::ClasOrder;
     use orr_scene::memory::RangeAllocator;
@@ -3711,6 +3712,9 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
         .unwrap();
     let taken = dev
         .gpu_malloc::<u32>(up, u64::from(page_count), "taken")
+        .unwrap();
+    let mut holds = dev
+        .gpu_malloc::<u32>(up, u64::from(page_count), "holds")
         .unwrap();
     let mut order = dev
         .gpu_malloc::<u32>(up, clas_count as u64, "order")
@@ -3759,9 +3763,12 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
         }
     };
     let render = dev.queue(QueueKind::Render).unwrap();
+    // The units the last round's holds marked used.
+    let mut held: Vec<(u32, u32)> = Vec::new();
     for round in 0..rounds {
-        // Bind some pages, free some CLAS, ask to take some pages, then allocate.
-        let mut free_list: Vec<[u32; 2]> = Vec::new();
+        // Bind some pages, free some CLAS and what the last holds marked, ask to take some
+        // pages, hold some, then allocate.
+        let mut free_list: Vec<[u32; 2]> = held.drain(..).map(|(f, n)| [f, n]).collect();
         for p in 0..page_count {
             if !bound[p as usize] && rand() % 4 == 0 {
                 bound[p as usize] = true;
@@ -3778,6 +3785,9 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
         free_list.sort_unstable_by_key(|f| f[0]);
         let take_list: Vec<u32> = (0..page_count)
             .filter(|&p| bound[p as usize] && rand() % 5 == 0)
+            .collect();
+        let hold_list: Vec<u32> = (0..page_count)
+            .filter(|&p| bound[p as usize] && rand() % 7 == 0)
             .collect();
         let size_list: Vec<u32> = (0..clas_count)
             .map(|_| match rand() % 1000 {
@@ -3814,6 +3824,9 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
                 u32::from(t)
             })
             .collect();
+        for &p in &hold_list {
+            held.extend(reference.take_within(p * UNITS, UNITS));
+        }
         let expect_units = pages.place(&mut reference, UNITS, &size_list);
         let placed: Vec<u32> = pages
             .order()
@@ -3841,6 +3854,7 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
 
         frees.as_mut_slice().unwrap()[..free_list.len()].copy_from_slice(&free_list);
         takes.as_mut_slice().unwrap()[..take_list.len()].copy_from_slice(&take_list);
+        holds.as_mut_slice().unwrap()[..hold_list.len()].copy_from_slice(&hold_list);
         order.as_mut_slice().unwrap().copy_from_slice(pages.order());
         groups.as_mut_slice().unwrap()[..pages.groups().len()].copy_from_slice(pages.groups());
         sizes.as_mut_slice().unwrap().copy_from_slice(&size_list);
@@ -3850,6 +3864,7 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
             frees: frees.gpu().cast(),
             takes: takes.gpu(),
             taken: taken.gpu(),
+            holds: holds.gpu(),
             order: order.gpu(),
             groups: groups.gpu().cast(),
             sizes: sizes.gpu(),
@@ -3863,9 +3878,11 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
             words: WORDS,
             free_count: free_list.len() as u32,
             take_count: take_list.len() as u32,
+            hold_count: hold_list.len() as u32,
             group_count: pages.groups().len() as u32,
             flags: u32::from(round == 0),
-            _pad: 0,
+            _pad0: 0,
+            _pad1: 0,
         };
         let mut list = render.command_list().unwrap();
         list.dispatch(&pipeline, root.gpu(), [1, 1, 1]);

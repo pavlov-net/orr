@@ -1036,6 +1036,20 @@ impl Scenes {
         self.core.mounts.streaming.fail_tile_scratch(fail);
     }
 
+    /// Holds back the binds that move CLAS pool pages to other memory, as a loading side
+    /// holding the pool does, or lets them go.
+    #[cfg(feature = "test-hooks")]
+    pub fn hold_clas_binds(&mut self, hold: bool) {
+        self.core.mounts.streaming.hold_clas_binds(hold);
+    }
+
+    /// Has the memory of the CLAS pool's pages empty every block the others have room for,
+    /// as it does while its heap is over its mark, or lets the heap decide.
+    #[cfg(feature = "test-hooks")]
+    pub fn plan_clas_memory_tight(&mut self, tight: bool) {
+        self.core.mounts.streaming.plan_clas_memory_tight(tight);
+    }
+
     #[cfg(feature = "testing")]
     pub(crate) fn texture_object(&self, m: MountId, id: AssetId) -> Option<Arc<orr_gpu::Texture>> {
         self.core.mounts.texture_object(m, id)

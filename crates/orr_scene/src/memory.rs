@@ -223,6 +223,8 @@ pub struct ClasPages {
     pub wholly_free: u32,
     /// Wholly free pages that batches in flight reserve.
     pub reserved: u32,
+    /// Bound pages held while their memory moves to other blocks.
+    pub held: u32,
     /// Bytes of the units holding CLAS.
     pub used: u64,
 }

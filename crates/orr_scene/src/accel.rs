@@ -24,6 +24,7 @@ use orr_gpu::{
 };
 use orr_pack::mesh::{Cluster, MeshHeader, Part, in_cut};
 
+use crate::clas_pool::ClasPool;
 use crate::loading::completion;
 use crate::memory::{BestFit, UploadWindow};
 use crate::shaders::accel::{self, AccelRoot, AddressJob, ClasJob};
@@ -492,6 +493,8 @@ pub(crate) fn page_micromaps(
 struct Step<'d> {
     device: &'d Device,
     kind: QueueKind,
+    /// The CLAS pool whose CLAS its lists read.
+    reads: Option<&'d ClasPool>,
     list: Option<CommandList<'d>>,
     keep: Vec<Allocation<u8>>,
     /// The last submitted list's memory, which the next list may still read (a move reads
@@ -505,6 +508,7 @@ impl<'d> Step<'d> {
         Self {
             device,
             kind,
+            reads: None,
             list: None,
             keep: Vec::new(),
             previous: Vec::new(),
@@ -558,7 +562,14 @@ impl<'d> Step<'d> {
     fn submit(&mut self) -> Result<TimelinePoint> {
         let list = self.list.take().expect("open list");
         let queue = self.device.queue(self.kind).expect("loading queue");
-        let point = queue.submit(vec![list], &std::mem::take(&mut self.wait))?;
+        let mut wait = std::mem::take(&mut self.wait);
+        let point = match self.reads {
+            Some(pool) => pool.read(self.device, |bind| {
+                wait.extend(bind);
+                Ok(queue.submit(vec![list], &wait)?)
+            })?,
+            None => queue.submit(vec![list], &wait)?,
+        };
         self.previous = std::mem::take(&mut self.keep);
         Ok(point)
     }
@@ -1074,17 +1085,19 @@ pub(crate) struct FineCut {
     _parts: Option<Allocation<u64>>,
 }
 
-/// Builds the BLAS of finer cut `cut`, whose clusters are `members`, of a mesh with `parts`
-/// animated parts on the loading queue. Returns its table record, its memory and the point
-/// the build signals.
+/// Builds the BLAS of finer cut `cut`, whose clusters are `members`, some of them CLAS of
+/// `clas`, of a mesh with `parts` animated parts on the loading queue. Returns its table
+/// record, its memory and the point the build signals.
 pub(crate) async fn build_fine_cut(
     device: &Device,
     k: &AccelKernels,
+    clas: Option<&ClasPool>,
     cut: Cut,
     members: &[CutMember],
     parts: u32,
 ) -> Result<(RtCutGpu, FineCut, TimelinePoint)> {
     let mut step = Step::new(device, build_queue(device), None);
+    step.reads = clas;
     let mut jobs = BlasJobs::default();
     let p = jobs.plan_cut(cut, members, parts);
     let mut blocks = Vec::new();

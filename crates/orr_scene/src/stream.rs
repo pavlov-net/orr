@@ -311,6 +311,8 @@ pub(crate) struct CutTask {
     mesh: u32,
     slot: u32,
     accel: Arc<AccelShared>,
+    /// The pool of the CLAS its build reads.
+    clas: Option<Arc<ClasPool>>,
     cut: Cut,
     members: Vec<CutMember>,
     /// The mesh's animated parts.
@@ -337,7 +339,8 @@ impl CutBatch {
 pub(crate) fn build_cut<'a>(loading: &'a Loading, device: &'a Device, t: CutTask) -> Resumable<'a> {
     Box::pin(async move {
         let k = &t.accel.kernels;
-        let built = accel::build_fine_cut(device, k, t.cut, &t.members, t.parts).await;
+        let clas = t.clas.as_deref();
+        let built = accel::build_fine_cut(device, k, clas, t.cut, &t.members, t.parts).await;
         let (cut, point) = match built {
             Ok((r, c, p)) => (Ok((r, c)), Some(p)),
             Err(e) => (Err(e), None),
@@ -1647,6 +1650,7 @@ impl Streaming {
             mesh,
             slot: k as u32,
             accel: Arc::clone(&self.accel),
+            clas: self.clas.clone(),
             cut: Cut {
                 error,
                 clusters,
@@ -1858,6 +1862,11 @@ impl Streaming {
                 loads = later;
             }
         }
+        if let Some(c) = &self.clas {
+            let (moved, bound) = c.finish_moves(w.device, output)?;
+            points.extend(bound);
+            self.residency.note_clas_pages_moved(moved);
+        }
         // A carried unbind's key left `unbinding` when its failed task was sent, so a later
         // task may have loaded the tile again, binding it over the old slot, or a later
         // eviction may have queued its own unbind: then only the slot returns. While such a
@@ -1893,6 +1902,9 @@ impl Streaming {
         for (pool, &heap) in [&self.pool, &self.units].into_iter().zip(&self.pool_heaps) {
             mine[heap][1] += pool.lock().unwrap().plan_drain(over(heap));
         }
+        if let Some(c) = &self.clas {
+            mine[self.pool_heaps[0]][1] += c.draining();
+        }
         if self.moves_tiles {
             let heap = self.pool_heaps[0];
             mine[heap][1] += self.tiles.lock().unwrap().plan_drain(over(heap));
@@ -1914,7 +1926,7 @@ impl Streaming {
             self.staging.lock().unwrap().release_spare();
         }
         if let Some(c) = &self.clas {
-            let (bound, used, range_full) = c.end_step();
+            let (bound, used, range_full) = c.end_step(over(self.pool_heaps[0]));
             self.residency.note_clas_pool(bound, used, range_full);
         }
         self.moving.retain(|_, m| m.1 >= frame);
@@ -2445,6 +2457,20 @@ impl Streaming {
     #[cfg(feature = "test-hooks")]
     pub(crate) fn fail_tile_scratch(&mut self, fail: bool) {
         self.tile_scratch_fails = fail;
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn hold_clas_binds(&mut self, hold: bool) {
+        if let Some(c) = &self.clas {
+            c.hold_binds(hold);
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn plan_clas_memory_tight(&mut self, tight: bool) {
+        if let Some(c) = &self.clas {
+            c.plan_tight(tight);
+        }
     }
 
     /// The copies of the units and tiles the steps moved that no submitted list has carried,

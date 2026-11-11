@@ -1,5 +1,5 @@
-// The CLAS pool's allocator: one workgroup applies a batch's frees and page takes to the
-// pool's free bitmap, then places the batch's CLAS and writes their moves. The CLAS come in
+// The CLAS pool's allocator: one workgroup applies a batch's frees, page takes and page holds
+// to the pool's free bitmap, then places the batch's CLAS and writes their moves. The CLAS come in
 // groups of at most `POOL_THREADS`, each of one streamed page. A group is cut into runs, each
 // as many of its next CLAS as fit in one pool page; a run takes the lowest run of free 128 B
 // units that holds it, and its CLAS follow one another from there by a prefix sum of their
@@ -28,6 +28,7 @@ public struct PoolRoot
     public uint2* frees;           // unit ranges (first, count) made free first, apart and ascending
     public uint* takes;            // pages taken next when wholly free, ascending
     public uint* taken;            // per take: 1 when taken
+    public uint* holds;            // pages whose every unit is marked used next, ascending
     public uint* order;            // the CLAS in placement order
     public uint2* groups;          // per group: x = its end in `order`, y = its streamed page
     public uint* sizes;            // built bytes per CLAS
@@ -41,9 +42,11 @@ public struct PoolRoot
     public uint words;             // per page
     public uint free_count;
     public uint take_count;
+    public uint hold_count;
     public uint group_count;
     public uint flags;             // POOL_*
-    public uint64_t _pad;
+    public uint _pad0;
+    public uint64_t _pad1;
 }
 ORR_ROOT(PoolRoot);
 
@@ -310,6 +313,17 @@ void allocate(uint t: SV_GroupThreadID)
             apply(page * n, n, false, lo, hi);
         root.taken[k] = whole ? 1 : 0;
     }
+    uint h = 0;
+    for (uint top = root.hold_count; h < top;)
+    {
+        uint mid = (h + top) / 2;
+        if (root.holds[mid] < lo)
+            h = mid + 1;
+        else
+            top = mid;
+    }
+    for (; h < root.hold_count && root.holds[h] < hi; h++)
+        apply(root.holds[h] * n, n, false, lo, hi);
     g_head[t] = lo < hi ? root.summary[lo].x & 0xffff : 0;
     // Pages before `room` are full, `bound` is at least every sub-block's bound, and `tail`
     // is the run at the end of the block's last page. Allocations only fill pages, so each

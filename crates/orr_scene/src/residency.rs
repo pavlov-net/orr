@@ -242,6 +242,8 @@ pub struct ResidencyStats {
     pub texture_feedback_lost: u32,
     /// Texture tiles moved beside their texture's other tiles since the start.
     pub tiles_moved: u32,
+    /// CLAS pool pages bound to other memory since the start, their CLAS in place.
+    pub clas_pages_moved: u64,
     /// Bytes the device-local heaps use over the mark the budgets keep them under, less what
     /// is already on its way back to the system; 0 with every heap under its mark.
     pub heap_excess: u64,
@@ -1486,6 +1488,10 @@ impl Residency {
 
     pub(crate) fn note_tile_move(&mut self) {
         self.stats.tiles_moved += 1;
+    }
+
+    pub(crate) fn note_clas_pages_moved(&mut self, pages: u64) {
+        self.stats.clas_pages_moved += pages;
     }
 
     /// Whether resident `k` can leave now, unused for `cold` frames with nothing depending on
