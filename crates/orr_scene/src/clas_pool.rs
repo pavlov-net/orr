@@ -464,6 +464,7 @@ impl ClasPool {
         let tight = tight || self.tight.load(std::sync::atomic::Ordering::Relaxed);
         let mut s = self.state.lock().unwrap();
         s.end_step();
+        s.replan |= self.moves_memory && s.tight != tight;
         s.tight = tight;
         (
             u64::from(s.bound) * self.range.page_size,
