@@ -5,8 +5,10 @@
 //!   factor becomes a BC4 opacity texture, with alpha-coverage mips at the cutoff under
 //!   `MASK` unless it keeps its source's mips.
 //! - Normal: BC5 snorm, with the glTF normal scale applied.
-//! - Roughness and metalness share a BC5 (BC4 when only one varies). Factors are folded into
-//!   these texels and the material's factors set to 1.
+//! - Roughness and metalness share a BC5 (BC4 when only one varies). The texels hold the
+//!   source's values and the factors stay in the material, but for roughness that takes
+//!   Toksvig variance: that is no multiple of its source, so it holds its factor and the
+//!   material's reads 1.
 //! - Roughness takes the normal map's variance per mip (Toksvig), so a material with a normal
 //!   map gets a roughness texture even when its roughness is constant. At the quality levels
 //!   that keep source mips, roughness that keeps them, and roughness beside a normal map
@@ -14,9 +16,8 @@
 //! - Emission and subsurface color: BC7 sRGB. Emission that can read past 1 is BC6H, as
 //!   [`Packer::past_one`] says.
 //! - Specular weight (the specular texture's alpha), coat and transmission weights (red):
-//!   BC4 each. Coat and transmission factors are folded into their texels and set to 1;
-//!   the specular weight texture multiplies `specular_weight`. A specular weight that can read
-//!   past 1 is R16_SFLOAT.
+//!   BC4 each, each multiplying its factor. A specular weight that can read past 1 is
+//!   R16_SFLOAT.
 //! - Displacement: R16 unorm from red, never collapsed; displacement is
 //!   `displacement_scale x texel + displacement_offset`. A height `h` stores across the
 //!   range `lo..hi` the image measures, as `(h - lo) / (hi - lo)`, with the scale and offset
@@ -308,7 +309,7 @@ impl MaterialTextures {
 /// How the input of a slot from [`slot::MORE`] on packs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum More {
-    /// A value of 0..1, with its role, whose factor folds into the texels.
+    /// A value of 0..1, with its role, which multiplies the field.
     Weight(&'static str),
     /// A value from 0 up, with its role, which multiplies the field.
     Ranged(&'static str),
@@ -1661,13 +1662,20 @@ impl<'a> Packer<'a> {
                 (Some((r, s)), true) if self.alike(&refs[0], r) => Some((*r, *s)),
                 _ => None,
             };
+            // A texel holds its source's value and the field its factor, so an 8-bit source keeps
+            // every level. Toksvig roughness is no multiple of its source, so a paired roughness
+            // holds its factor and the field reads 1.
+            let folds = |slot: usize| paired.is_some() && slot == slot::ROUGHNESS;
             let id = self.make_each(suffix, &refs[0], |s, cell| {
-                let channel = |(_, r, v): &(usize, Option<TexRef>, f32)| match r {
-                    Some(r) => {
-                        let r = s.at(r, cell);
-                        s.source(&r, 0, usize::from(r.channel), 0.0, *v)
+                let channel = |&(slot, r, v): &(usize, Option<TexRef>, f32)| {
+                    let v = if folds(slot) { v } else { 1.0 };
+                    match r {
+                        Some(r) => {
+                            let r = s.at(&r, cell);
+                            s.source(&r, 0, usize::from(r.channel), 0.0, v)
+                        }
+                        None => Channel::constant(v),
                     }
-                    None => Channel::constant(*v),
                 };
                 let mut channels: Vec<Channel> = rm.iter().map(channel).collect();
                 channels.resize(4, Channel::constant(0.0));
@@ -1687,12 +1695,12 @@ impl<'a> Packer<'a> {
                     tile: None,
                 }
             })?;
-            for (i, (s, ..)) in rm.iter().enumerate() {
-                bind(m, *s, id, i, &refs[0]);
-                if *s == slot::ROUGHNESS {
-                    m.specular_roughness = 1.0;
-                } else {
-                    m.metalness = 1.0;
+            for (i, &(s, _, v)) in rm.iter().enumerate() {
+                bind(m, s, id, i, &refs[0]);
+                match s {
+                    slot::ROUGHNESS if folds(s) => m.specular_roughness = 1.0,
+                    slot::ROUGHNESS => m.specular_roughness = v,
+                    _ => m.metalness = v,
                 }
             }
         }
@@ -1733,15 +1741,13 @@ impl<'a> Packer<'a> {
         ];
         for (r, role, s, weight) in weights {
             let Some(r) = r else { continue };
-            let factor = *weight(m);
-            *weight(m) = match self.constant_input(r) {
-                Some(v) => factor * v,
+            match self.constant_input(r) {
+                Some(v) => *weight(m) *= v,
                 None => {
-                    let id = self.single(suffix, r, factor, role, Encoding::Bc4)?;
+                    let id = self.single(suffix, r, 1.0, role, Encoding::Bc4)?;
                     bind(m, s, id, 0, r);
-                    1.0
                 }
-            };
+            }
         }
         if let Some(r) = &t.displacement {
             let mut h = [
@@ -1971,15 +1977,13 @@ impl<'a> Packer<'a> {
                 Ok(())
             }
             More::Weight(role) => {
-                let factor = *scalar_field(m, s);
-                *scalar_field(m, s) = match self.constant_input(r) {
-                    Some(v) => factor * v,
+                match self.constant_input(r) {
+                    Some(v) => *scalar_field(m, s) *= v,
                     None => {
-                        let id = self.single(suffix, r, factor, role, Encoding::Bc4)?;
+                        let id = self.single(suffix, r, 1.0, role, Encoding::Bc4)?;
                         bind(m, s, id, 0, r);
-                        1.0
                     }
-                };
+                }
                 Ok(())
             }
             More::Ranged(role) => {

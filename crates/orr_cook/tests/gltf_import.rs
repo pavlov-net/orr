@@ -1164,10 +1164,10 @@ fn material_textures_bind_their_slots() {
             "{role}"
         );
     }
-    // Weight factors are folded into their textures.
-    assert_eq!((m.coat_weight, m.transmission_weight), (1.0, 1.0));
+    // Weight factors stay in their fields, which the textures' values multiply.
+    assert_eq!((m.coat_weight, m.transmission_weight), (0.5, 0.8));
     let coat = texture_mip(&a, "g/texture/0/coat", 0);
-    assert!(coat.texels.iter().all(|&t| t <= 0.5 + 1.0 / 255.0));
+    assert!(coat.texels.iter().any(|&t| t > 0.5 + 1.0 / 255.0));
 }
 
 #[test]

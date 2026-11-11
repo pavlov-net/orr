@@ -1091,6 +1091,56 @@ fn anisotropy_directions_hold_zero_components_on_a_code() {
     assert_eq!(texels[(8 * n + 28) as usize][..2], [0.0, 1.0]);
 }
 
+/// A texture holds its source's values and the material's field its factor, so a small factor
+/// keeps every 8-bit level: roughness 0.1 times 256 levels would store as 26 codes. Each block
+/// holds one value per channel, which BC4 and BC5 keep.
+#[test]
+fn scalar_factors_stay_in_their_fields() {
+    let d = dir("scalar-factors");
+    let n = 64u32;
+    let level = |x: u32, y: u32| x / 4 + 16 * (y / 4);
+    let image = png(n, n, |x, y| {
+        let k = level(x, y) as u8;
+        [k, k, 255 - k, 255]
+    });
+    let path = d.join("factors.glb");
+    write_glb(
+        &path,
+        &[
+            r#"{"pbrMetallicRoughness":{"roughnessFactor":0.1,"metallicFactor":0.3,
+                "metallicRoughnessTexture":{"index":0}},
+            "extensions":{"KHR_materials_clearcoat":{"clearcoatFactor":0.2,
+                "clearcoatTexture":{"index":0}}}}"#
+                .into(),
+        ],
+        &[image],
+    );
+    let (a, m) = cook_glb(&path, GltfSettings::default());
+    assert_eq!(
+        (m.specular_roughness, m.metalness, m.coat_weight),
+        (0.1, 0.3, 0.2)
+    );
+    let codes = |s: usize| {
+        let b = m.textures[s];
+        let (info, levels) = mips(&a, a.name(a.find(b.texture).unwrap()));
+        let texels = decode(info.header.vk_format, n, n, &levels[0][0]);
+        let c = usize::from(b.channels);
+        texels
+            .iter()
+            .map(|t| (t[c] * 255.0).round() as u32)
+            .collect::<Vec<_>>()
+    };
+    let (rough, metal, coat) = (
+        codes(slot::ROUGHNESS),
+        codes(slot::METALNESS),
+        codes(slot::COAT),
+    );
+    for (i, ((r, m), c)) in rough.iter().zip(&metal).zip(&coat).enumerate() {
+        let k = level(i as u32 % n, i as u32 / n);
+        assert_eq!([*r, *m, *c], [k, 255 - k, k], "texel {i}");
+    }
+}
+
 /// A scatter anisotropy stores itself, so 0 is a code: unsigned where it reads no negatives,
 /// with twice the codes over 0..1, snorm where it does.
 #[test]
@@ -1592,7 +1642,9 @@ fn weight_texels_clamp_before_their_factor() {
     let texture = a.find(m.textures[slot::COAT].texture).unwrap();
     let (info, levels) = mips(&a, a.name(texture));
     let texels = decode(info.header.vk_format, 8, 8, &levels[0][0]);
-    assert!((texels[0][0] - 0.5).abs() < 0.01, "{:?}", texels[0]);
+    // The texel holds the clamped source and the field the factor.
+    assert_eq!(m.coat_weight, 0.5);
+    assert!((texels[0][0] - 1.0).abs() < 0.01, "{:?}", texels[0]);
 }
 
 /// No format says how float texels hold normals, so their vectors decide, on both paths: unit
