@@ -1166,7 +1166,7 @@ uint cut_jobs(SceneRoot* s, uint slot, SlotCutGpu c)
 // an entry. A gathered cut that holds no cluster traces its cached cut, as does every one in
 // a frame whose traversal dropped nodes: which items a full queue drops hangs on the order
 // threads ran in, while whether the first full pass dropped any does not. Distant slots take
-// their model's merged cut.
+// their model's merged cut, a copy with a section mask none finer than its mask's first cut.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void assign(uint3 id: SV_DispatchThreadID)
@@ -1178,9 +1178,10 @@ void assign(uint3 id: SV_DispatchThreadID)
     CutGpu* cut = root.cut;
     SlotCutGpu c = cut.slots[slot];
     InstanceGpu inst = s.instances[slot];
+    MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
     if ((c.flags & CUT_DISTANT) != 0)
     {
-        cut.slots[slot].rt_cut = cut.model_cut[inst.model];
+        cut.slots[slot].rt_cut = max(cut.model_cut[inst.model], lowest_cut(mesh, inst));
         InterlockedAdd(cut.counters[CUT_MERGED], 1);
         return;
     }
@@ -1197,7 +1198,6 @@ void assign(uint3 id: SV_DispatchThreadID)
         fall_back(s, cut, slot, CUT_EMPTY);
         return;
     }
-    MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
     if ((inst.variant >> 16) == 0)
     {
         for (uint k = 0; k < mesh.rt_cut_count; k++)

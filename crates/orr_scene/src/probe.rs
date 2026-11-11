@@ -904,9 +904,17 @@ impl PixelProbe {
                 )
             }
         } else if c.flags & CUT_DISTANT != 0 {
+            let merged = if c.rt_cut == g.model_cut {
+                format!("its model's merged cut {}", g.model_cut)
+            } else {
+                format!(
+                    "cached cut {}, its section mask's first, for its model's merged cut {}",
+                    c.rt_cut, g.model_cut
+                )
+            };
             format!(
-                "its model's merged cut {} (model radius {:.2} px < merge {:.1} px)",
-                g.model_cut, g.model_pixels, g.merge_pixels
+                "{merged} (model radius {:.2} px < merge {:.1} px)",
+                g.model_pixels, g.merge_pixels
             )
         } else if c.flags & CUT_FELL_BACK != 0 {
             let why = if c.rt_count == 0 {
