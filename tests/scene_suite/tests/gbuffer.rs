@@ -6485,6 +6485,9 @@ fn past_tables_that_cannot_grow_the_farthest_copies_trace_cached_cuts_every_fram
     let _serial = serial();
     let mut w = World::with(&RendererDesc {
         rt_merge_pixels: 0.0,
+        // Fine enough that each copy's cut mixes the levels several groups make up: a cut that
+        // is one whole level may equal a cached cut, which builds nothing.
+        rt_error_pixels: 1.0 / 32.0,
         budgets: Budgets {
             initial_rt_cut_blas: 2,
             rt_cut_memory: PoolSize::Bytes(0),
@@ -6492,7 +6495,9 @@ fn past_tables_that_cannot_grow_the_farthest_copies_trace_cached_cuts_every_fram
         },
         ..RendererDesc::default()
     });
-    let items: Vec<Item> = [-12.0f32, -20.0, -32.0, -48.0, -70.0]
+    // Each copy's bounds lie farther from the focus than the last's: copies whose bounds hold
+    // the focus are equally near, and build together or not at all.
+    let items: Vec<Item> = [-18.2f32, -19.8, -21.5, -24.4, -30.1]
         .into_iter()
         .enumerate()
         .map(|(i, z)| Item {
