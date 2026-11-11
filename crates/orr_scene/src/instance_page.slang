@@ -31,7 +31,7 @@ public struct PageExpandRoot
     public uint count;
     public uint prototype_count;
     public uint first_entry;       // the page's first instance entry of the emissive list
-    public uint linear_rows;       // rows of the page's linear table
+    public uint exact_rows;        // rows of the page's exact table
     public uint entries_only;      // 1: the slots are written, and take new entries alone
     public uint _pad0;
     public uint _pad1;
@@ -49,7 +49,7 @@ void expand(uint3 id: SV_DispatchThreadID)
     uint prototype = r.prototype;
     if (prototype >= root.prototype_count)
         return;
-    if ((r.scale & INDEXED) != 0 && r.rot >= AXIS_ROTATIONS + root.linear_rows)
+    if ((r.scale & INDEXED) != 0 && r.rot >= AXIS_ROTATIONS + root.exact_rows)
         return;
     PagePrototypeGpu p = root.prototypes[prototype];
     if (r.rank >= p.records)

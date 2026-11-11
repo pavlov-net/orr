@@ -228,7 +228,7 @@ pub struct ClipRef {
 #[derive(Debug)]
 pub struct InstancePage {
     pub info: InstancePageInfo,
-    /// Null while the records are not resident. The page's linear table follows them.
+    /// Null while the records are not resident. The page's exact table follows them.
     pub records: GpuPtr<InstanceRecord>,
     /// Per window of an animated page's rows, its address, 0 while it is not resident.
     pub windows: Vec<u64>,
@@ -1553,7 +1553,7 @@ fn place_page(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     let blobs = a.blobs(&a.entries()[entry]);
     let bytes = blobs.get(1).map_or(0, |b| b.raw_len);
     let h = &info.header;
-    h.linear_rows(bytes as usize)?;
+    h.exact_rows(bytes as usize)?;
     for w in 0..h.motion_windows() {
         let held = blobs.get(h.motion_blob(w) as usize).map(|b| b.raw_len);
         if held != Some(h.motion_window_bytes(w)) {
@@ -3329,7 +3329,7 @@ impl Mounts {
         ))
     }
 
-    /// The bytes page `id`'s records and linear table take in the instance page pool.
+    /// The bytes page `id`'s records and exact table take in the instance page pool.
     pub(crate) fn page_bytes(&self, id: PageId) -> u64 {
         self.page(id)
             .map_or(0, |p| u64::from(p.bytes).next_multiple_of(256))

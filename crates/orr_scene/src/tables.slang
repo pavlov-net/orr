@@ -145,10 +145,10 @@ public struct GroupGpu
     public uint format;        // GROUP_*
     public int3 anchor_cell;
     public float3 anchor_offset;
-    public float3 origin;      // GROUP_QUANTIZED_PAGE: cell-relative page box
-    public float3 extent;
+    public float3 origin;      // GROUP_QUANTIZED_PAGE: cell-relative position grid
+    public float3 step;
     public float log2_scale_min;
-    public float log2_scale_max;
+    public float log2_scale_step;
     // A group hung from a joint: the palette group holding the joint and its entry there, which
     // takes every entry from its bind space to its pose. Null for none.
     public uint8_t* frame;  // a GroupGpu*, which Metal cannot emit inside GroupGpu itself
@@ -654,14 +654,14 @@ public uint mesh_cluster_id(MeshGpu* mesh, uint cluster)
 }
 
 // Entry `index` of the transforms in `transforms` as a row-major [L | t] relative to the group's
-// anchor. A page's linear table follows its records.
+// anchor. A page's exact table follows its records.
 float3x4 stored_entry(GroupGpu* group, uint8_t* transforms, uint index)
 {
     if (group.format == GROUP_QUANTIZED_PAGE)
     {
         InstanceRecord* records = (InstanceRecord*)transforms;
-        LinearRows* table = (LinearRows*)(records + group.count);
-        return decode_record(group.origin, group.extent, group.log2_scale_min, group.log2_scale_max, table, records[index]);
+        ExactRow* table = (ExactRow*)(records + group.count);
+        return decode_record(group.origin, group.step, group.log2_scale_min, group.log2_scale_step, table, records[index]);
     }
     return ((float3x4*)transforms)[index];
 }

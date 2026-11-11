@@ -4,21 +4,24 @@
 //!   [`SectionOverride`] table the prototypes point into, and the partition table (u16 first
 //!   record per partition). Spans are byte offsets in blob 0 and record counts.
 //! - Blob 1: [`InstancePageHeader::record_count`] [`InstanceRecord`]s in Morton order of
-//!   [`InstanceRecord::pos`], at most [`MAX_RECORDS`], then the page's [`LinearRows`] table, so
-//!   both stream and stay resident together. The records of a prototype rank
+//!   [`InstanceRecord::pos`], at most [`MAX_RECORDS`], then the page's exact table of
+//!   [`AffineRows`], so both stream and stay resident together. The records of a prototype rank
 //!   `0..`[`Prototype::records`] in that order ([`InstanceRecord::rank`]).
 //! - Blob 2, when `user_stride` is not 0: `user_stride` bytes of consumer data per record,
 //!   in record order.
 //! - Then on an animated page a blob per window of its [`MotionRow`]s
 //!   ([`InstancePageHeader::motion_blob`]), which stream by the page's clock.
 //!
-//! A record decodes to a transform relative to the page cell (edge `2^cell_log2` m):
-//! translation `origin + pos * (extent / 65535)`, and a linear part. A compact record holds a
-//! rotation in `rot` and per-axis scale `2^(lerp(log2_scale_min, log2_scale_max, code / 1023))`
-//! applied before it, its x negated on a mirrored record ([`InstanceRecord::MIRROR`]). A
-//! transform no rotation and scale hold, a sheared one or one scaled far from the page's other
-//! records, is a row of the table instead, stored exactly and shared by every record with the same
-//! linear part.
+//! A record decodes to a transform relative to the page cell (edge `2^cell_log2` m). A compact
+//! record holds its translation on the page's grid, `origin + q * step` per axis, `q` the
+//! [`POSITION_BITS`]-bit [`grid_position`] and `step` a power of two, so every grid point is an
+//! exact f32. Its linear part is a rotation in `rot` and per-axis scale
+//! `2^(log2_scale_min + code * log2_scale_step)` applied before it, its x negated on a mirrored
+//! record ([`InstanceRecord::MIRROR`]); the scale step is a power of two too, so a log2 scale
+//! on its grid, 0 among them, decodes exactly. The cook gives a copy a compact record only when
+//! that record puts every point of the model's bounds within its tolerance of where the source
+//! placement puts it ([`displacement`]); any other copy's whole transform is a row of the exact
+//! table, in f32 as the renderer uses it, shared by records with the same transform.
 //! [`decode`] is the reference both for the GPU decode and for consumers' CPU queries.
 //!
 //! An animated page moves its records over time: [`InstancePageHeader::motion_times`] starts one
@@ -33,12 +36,12 @@
 //! [`MOTION_FLAT`], which draws the same, and one of 0 on all three hides the instance.
 
 use bytemuck::{Pod, Zeroable};
-use orr_math::{Affine3, DMat3, DQuat, DVec4, Mat3, Quat, Vec3};
+use orr_math::{Affine3, BVec3, DAffine3, DMat3, DQuat, DVec3, DVec4, Mat3, Quat, Vec3};
 
 use crate::blob::{put_table, read, table};
-use crate::{AffineRows, AssetId, Error, Result, Span};
+use crate::{Aabb, AffineRows, AssetId, Error, Result, Span};
 
-pub const SCHEMA: u16 = 1;
+pub const SCHEMA: u16 = 2;
 
 /// Records per page.
 pub const MAX_RECORDS: usize = 16_384;
@@ -59,22 +62,27 @@ pub const MOTION_FLAT: f32 = 1.0 / (1u64 << 60) as f32;
 pub const MOTION_WINDOW_BYTES: usize = 2 << 20;
 const _: () = assert!(MAX_RECORDS * size_of::<MotionRow>() <= MOTION_WINDOW_BYTES);
 
-/// Blob 0 header, 196 B.
+/// Blob 0 header, 208 B.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct InstancePageHeader {
     /// World cell of the page.
     pub cell: [i32; 3],
-    /// Cell-relative box the positions quantize over.
+    /// Cell-relative box of the records' translations, `origin` its low corner.
     pub origin: [f32; 3],
     pub extent: [f32; 3],
+    /// The step of the grid of the compact records' translations, from `origin`, per axis: a
+    /// power of two that `origin` is a multiple of.
+    pub step: [f32; 3],
+    /// Log2 scale of scale code 0 and the step between codes, a power of two that
+    /// `log2_scale_min` is a multiple of.
     pub log2_scale_min: f32,
-    pub log2_scale_max: f32,
+    pub log2_scale_step: f32,
     /// [`Prototype`] table; records name an entry by index.
     pub prototypes: Span,
     /// Bytes per record in blob 2; 0 when the page has no user stream.
     pub user_stride: u16,
-    /// Records in blob 1, at most [`MAX_RECORDS`]; the rest of the blob is the linear table.
+    /// Records in blob 1, at most [`MAX_RECORDS`]; the rest of the blob is the exact table.
     pub record_count: u16,
     /// u16 first record of each PTLAS partition, ascending, the first 0. Partition `p`
     /// covers records `[first[p], first[p + 1])`, the last up to the record count.
@@ -116,15 +124,15 @@ impl InstancePageHeader {
         intervals * u32::from(self.record_count) * size_of::<MotionRow>() as u32
     }
 
-    /// Rows of the linear table in a blob 1 of `len` bytes.
-    pub fn linear_rows(&self, len: usize) -> Result<usize> {
+    /// Rows of the exact table in a blob 1 of `len` bytes.
+    pub fn exact_rows(&self, len: usize) -> Result<usize> {
         let records = usize::from(self.record_count) * size_of::<InstanceRecord>();
         len.checked_sub(records)
             .filter(|table| {
                 usize::from(self.record_count) <= MAX_RECORDS
-                    && table.is_multiple_of(size_of::<LinearRows>())
+                    && table.is_multiple_of(size_of::<AffineRows>())
             })
-            .map(|table| table / size_of::<LinearRows>())
+            .map(|table| table / size_of::<AffineRows>())
             .ok_or(Error::Malformed("instance records"))
     }
 }
@@ -216,18 +224,20 @@ pub struct SectionOverride {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct InstanceRecord {
-    /// Position on the page's 65535-step grid over `origin..origin + extent`.
+    /// The high 16 bits of each axis of the [`grid_position`]: their Morton order is the page's.
     pub pos: [u16; 3],
     pub prototype: u16,
     /// [`encode_rotation`] code, or with [`Self::INDEXED`] an index: below [`AXIS_ROTATIONS`]
-    /// an [`axis_rotation`], from there on a row of the page's linear table.
+    /// an [`axis_rotation`], from there on a row of the page's exact table.
     pub rot: u32,
     /// Bits 0-9, 10-19 and 20-29: x, y and z scale codes; bit 30 [`Self::INDEXED`], bit 31
-    /// [`Self::MIRROR`]. A table row replaces the scale and mirror along with the rotation.
+    /// [`Self::MIRROR`]. A table row replaces the whole transform.
     pub scale: u32,
     /// The records before it that name its prototype.
     pub rank: u16,
-    pub _pad: u16,
+    /// The low [`FINE_BITS`] bits of each axis of the [`grid_position`]: x in bits 0-4, y in
+    /// 5-9, z in 10-14.
+    pub fine: u16,
 }
 
 impl InstanceRecord {
@@ -240,8 +250,8 @@ impl InstanceRecord {
         self.scale & Self::INDEXED != 0 && self.rot < AXIS_ROTATIONS
     }
 
-    /// The row of the page's linear table that holds this record's linear part.
-    pub fn linear_row(&self) -> Option<usize> {
+    /// The row of the page's exact table that holds this record's transform.
+    pub fn exact_row(&self) -> Option<usize> {
         (self.scale & Self::INDEXED != 0)
             .then(|| self.rot.checked_sub(AXIS_ROTATIONS))
             .flatten()
@@ -255,27 +265,26 @@ impl InstanceRecord {
     fn scale_codes(&self) -> [u32; 3] {
         [0, 10, 20].map(|s| (self.scale >> s) & 1023)
     }
-}
 
-/// A row of a page's linear table: a 3 x 3 linear transform, row-major, 36 B.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
-pub struct LinearRows {
-    pub rows: [[f32; 3]; 3],
-}
-
-impl From<Mat3> for LinearRows {
-    fn from(m: Mat3) -> Self {
-        Self {
-            rows: m.transpose().to_cols_array_2d(),
-        }
+    /// The `pos` and `fine` of grid position `q`, each axis below `1 << POSITION_BITS`.
+    pub fn split_position(q: [u32; 3]) -> ([u16; 3], u16) {
+        let fine = (0..3).fold(0, |f, a| f | (q[a] & FINE_MASK) << (FINE_BITS * a as u32));
+        (q.map(|v| (v >> FINE_BITS) as u16), fine as u16)
     }
 }
 
-impl From<LinearRows> for Mat3 {
-    fn from(l: LinearRows) -> Self {
-        Mat3::from_cols_array_2d(&l.rows).transpose()
-    }
+/// Bits per axis of a compact record's grid position.
+pub const POSITION_BITS: u32 = 16 + FINE_BITS;
+/// Of those, the low bits [`InstanceRecord::fine`] holds.
+pub const FINE_BITS: u32 = 5;
+const FINE_MASK: u32 = (1 << FINE_BITS) - 1;
+
+/// A record's position on its page's grid.
+pub fn grid_position(r: &InstanceRecord) -> [u32; 3] {
+    let fine = u32::from(r.fine);
+    [0, 1, 2].map(|a: usize| {
+        u32::from(r.pos[a]) << FINE_BITS | (fine >> (FINE_BITS * a as u32)) & FINE_MASK
+    })
 }
 
 /// Blob 0 of a page: the header and its tables.
@@ -357,20 +366,20 @@ impl InstancePageInfo {
     }
 }
 
-/// Blob 1 of a page: its records and its linear table.
+/// Blob 1 of a page: its records and its exact table.
 pub fn records(
     h: &InstancePageHeader,
     blob: &[u8],
-) -> Result<(Vec<InstanceRecord>, Vec<LinearRows>)> {
-    h.linear_rows(blob.len())?;
+) -> Result<(Vec<InstanceRecord>, Vec<AffineRows>)> {
+    h.exact_rows(blob.len())?;
     let (records, table) = blob.split_at(usize::from(h.record_count) * size_of::<InstanceRecord>());
     let records: Vec<InstanceRecord> = bytemuck::pod_collect_to_vec(records);
-    let table: Vec<LinearRows> = bytemuck::pod_collect_to_vec(table);
+    let table: Vec<AffineRows> = bytemuck::pod_collect_to_vec(table);
     if records
         .iter()
-        .any(|r| r.linear_row().is_some_and(|row| row >= table.len()))
+        .any(|r| r.exact_row().is_some_and(|row| row >= table.len()))
     {
-        return Err(Error::Malformed("instance linear row"));
+        return Err(Error::Malformed("instance exact row"));
     }
     Ok((records, table))
 }
@@ -396,14 +405,13 @@ pub fn motion_rows(blob: &[u8]) -> Vec<MotionRow> {
     bytemuck::pod_collect_to_vec(blob)
 }
 
-/// Cell-relative transform of one record of a page with linear table `table`: its table row,
-/// or `R * diag(scale)` with the x scale negative on a mirrored record, and the translation.
-pub fn decode_record(h: &InstancePageHeader, table: &[LinearRows], r: &InstanceRecord) -> Affine3 {
-    let t = Vec3::from(decode_position(h, r.pos));
-    if let Some(row) = r.linear_row() {
-        let m = Mat3::from(table[row]);
-        return Affine3::from_cols(m.x_axis, m.y_axis, m.z_axis, t);
+/// Cell-relative transform of one record of a page with exact table `table`: its table row, or
+/// `R * diag(scale)` with the x scale negative on a mirrored record and its grid translation.
+pub fn decode_record(h: &InstancePageHeader, table: &[AffineRows], r: &InstanceRecord) -> Affine3 {
+    if let Some(row) = r.exact_row() {
+        return Affine3::from(table[row]);
     }
+    let t = Vec3::from(decode_position(h, grid_position(r)));
     let mut s = r.scale_codes().map(|c| decode_scale(h, c));
     if r.mirror() {
         s[0] = -s[0];
@@ -412,24 +420,43 @@ pub fn decode_record(h: &InstancePageHeader, table: &[LinearRows], r: &InstanceR
     Affine3::from_cols(m.x_axis * s[0], m.y_axis * s[1], m.z_axis * s[2], t)
 }
 
-pub fn decode_position(h: &InstancePageHeader, pos: [u16; 3]) -> [f32; 3] {
-    [0, 1, 2].map(|a| h.origin[a] + f32::from(pos[a]) * (h.extent[a] / 65535.0))
+/// The farthest a point of `bounds` lands from where `source` puts it when `placed` puts it
+/// instead. The distance is convex in the point, so a corner of the box attains it.
+pub fn displacement(source: &DAffine3, placed: &DAffine3, bounds: &Aabb) -> f64 {
+    let lo = DVec3::from(bounds.min.map(f64::from));
+    let hi = DVec3::from(bounds.max.map(f64::from));
+    let m = placed.matrix3 - source.matrix3;
+    let t = placed.translation - source.translation;
+    (0..8)
+        .map(|c| {
+            let p = DVec3::select(BVec3::new(c & 1 != 0, c & 2 != 0, c & 4 != 0), hi, lo);
+            (m * p + t).length()
+        })
+        .fold(0.0, f64::max)
 }
 
+/// The translation of grid position `q`. The cook keeps every point of the grid an f32, so this
+/// is exact on any hardware: the product is a whole multiple of a power of two, and the sum a
+/// point of the grid.
+pub fn decode_position(h: &InstancePageHeader, q: [u32; 3]) -> [f32; 3] {
+    [0, 1, 2].map(|a| h.origin[a] + q[a] as f32 * h.step[a])
+}
+
+/// The scale of a scale code. Its log2 is exact as the position is, so a code whose log2 is a
+/// whole number decodes to that power of two.
 pub fn decode_scale(h: &InstancePageHeader, code: u32) -> f32 {
-    let (lo, hi) = (h.log2_scale_min, h.log2_scale_max);
-    (lo + (hi - lo) * (code as f32 / 1023.0)).exp2()
+    (h.log2_scale_min + code as f32 * h.log2_scale_step).exp2()
 }
 
-/// 1/sqrt(2): the largest magnitude a smallest-three component can have.
-const ROTATION_RANGE: f32 = std::f32::consts::FRAC_1_SQRT_2;
+/// The step between smallest-three component codes, the f32 nearest 1/sqrt(2) / 511: codes
+/// 0..=1022 cover the components' range +-1/sqrt(2), and code 511 is 0.
+pub const ROTATION_STEP: f32 = std::f32::consts::FRAC_1_SQRT_2 / 511.0;
 
 /// The unit quaternion (x, y, z, w) of a smallest-three code. Bits 30-31 name the
 /// component of largest magnitude, stored non-negative and dropped; the other three, in
-/// x, y, z, w order, sit in bits 0-9, 10-19 and 20-29 as `round((c / (1 / sqrt(2)) x 0.5 +
-/// 0.5) x 1023)`.
+/// x, y, z, w order, sit in bits 0-9, 10-19 and 20-29 as `c / ROTATION_STEP + 511`.
 pub fn decode_rotation(r: u32) -> [f32; 4] {
-    let c = [0, 10, 20].map(|s| (((r >> s) & 1023) as f32 / 1023.0 * 2.0 - 1.0) * ROTATION_RANGE);
+    let c = [0, 10, 20].map(|s| (((r >> s) & 1023) as f32 - 511.0) * ROTATION_STEP);
     let w = (1.0 - c[0] * c[0] - c[1] * c[1] - c[2] * c[2])
         .max(0.0)
         .sqrt();
@@ -453,8 +480,8 @@ pub fn encode_rotation(q: [f32; 4]) -> u32 {
     let sign = if q[largest] < 0.0 { -1.0 } else { 1.0 };
     let mut lo = [0u32; 3];
     for (slot, i) in (0..4).filter(|&i| i != largest).enumerate() {
-        let v = (q[i] * sign / f64::from(ROTATION_RANGE) * 0.5 + 0.5) * 1023.0;
-        lo[slot] = v.floor().clamp(0.0, 1022.0) as u32;
+        let v = q[i] * sign / f64::from(ROTATION_STEP) + 511.0;
+        lo[slot] = v.floor().clamp(0.0, 1021.0) as u32;
     }
     let mut best = (f64::NEG_INFINITY, 0);
     for corner in 0..8u32 {

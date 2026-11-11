@@ -5,12 +5,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use bytemuck::Zeroable;
-use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, Mat3, Quat, Vec3};
+use orr_math::{Affine3, DAffine3, DMat3, DMat4, DQuat, DVec3, Mat3, Quat, Vec3};
 use orr_pack::instance::{
-    self, InstancePageHeader, InstancePageInfo, InstanceRecord, LinearRows, MAX_HIDDEN_SECTION,
-    MAX_POSE, MAX_RECORDS, MotionRow, PARTITION_INSTANCES, Prototype, SectionOverride,
+    self, InstancePageHeader, InstancePageInfo, InstanceRecord, MAX_HIDDEN_SECTION, MAX_POSE,
+    MAX_RECORDS, MotionRow, PARTITION_INSTANCES, POSITION_BITS, Prototype, SectionOverride,
 };
-use orr_pack::{AffineRows, ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
+use orr_pack::{Aabb, AffineRows, ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
 use serde::Deserialize;
 
 use crate::import::{collapses, column_lengths, largest};
@@ -107,30 +107,30 @@ impl Placement {
     }
 }
 
-/// Largest entry of `l diag(1 / s) - R` a compact record drops: each column of `l` keeps its
-/// direction to within this, which is below the record's own rotation error.
-const SHEAR_MAX: f64 = 1e-3;
-
-/// The widest log2 scale range of a page's compact records, a factor of 64: half a 10-bit code
-/// of it is 0.2% of a scale. One scale past it would coarsen every other record on the page, so
-/// it takes a table row.
+/// The widest log2 scale range of a page's compact records, a factor of 64. One scale past it
+/// would coarsen every other record on the page, so it takes a table row.
 const SCALE_RANGE: f32 = 6.0;
 
 /// How a record holds the linear transform of a placement.
 enum Form {
-    /// `R diag(s)`: a rotation and per-axis scale, the x scale negative on a mirrored copy.
+    /// `R diag(s)`: a rotation and per-axis scale, the x scale negative on a mirrored copy,
+    /// which a compact record holds if its decode stays within the copy's [`tolerance`].
     Compact(Quat, Vec3),
-    /// A row of the page's linear table.
-    Table(LinearRows),
+    /// The whole transform in a row of the page's exact table.
+    Exact,
 }
 
 impl Form {
-    /// The form of `l`, which [`collapses`] passes: compact when `R diag(s)` fits it within
-    /// [`SHEAR_MAX`] and `s` fits a float, otherwise a table row.
+    /// The form of `l`, which [`collapses`] passes: `R diag(s)` with `R` the rotation nearest
+    /// `l diag(1 / s)`, unless `s` is past the range of a float. What `R diag(s)` leaves out of
+    /// `l`, a shear, counts in the record's error.
     fn of(l: DMat3) -> Self {
         let mut s = column_lengths(l);
         if l.determinant() < 0.0 {
             s.x = -s.x;
+        }
+        if !s.as_vec3().is_finite() {
+            return Self::Exact;
         }
         let unit = l * DMat3::from_diagonal(s.recip());
         // The rotation nearest `unit`, by polar iteration.
@@ -138,11 +138,7 @@ impl Form {
         for _ in 0..16 {
             r = (r + r.inverse().transpose()) * 0.5;
         }
-        if largest(unit - r) <= SHEAR_MAX && s.as_vec3().is_finite() {
-            Self::Compact(DQuat::from_mat3(&r).normalize().as_quat(), s.as_vec3())
-        } else {
-            Self::Table(l.as_mat3().into())
-        }
+        Self::Compact(DQuat::from_mat3(&r).normalize().as_quat(), s.as_vec3())
     }
 }
 
@@ -176,19 +172,38 @@ pub(crate) struct ModelFacts {
     /// PTLAS instances one copy costs: its body plus one per animated part.
     pub(crate) instances: u32,
     pub(crate) sections: u32,
-    /// Grid step 2^k of the model's mesh; `i8::MIN` for a subdivision cage.
+    /// Grid step 2^k of the model's mesh, the coarsest when it has several; `i8::MIN` for a
+    /// subdivision cage.
     pub(crate) position_exponent: i8,
+    /// Grid step 2^k of the finest of its meshes; `i8::MIN` with a subdivision cage, whose
+    /// points are on no grid.
+    pub(crate) finest_exponent: i8,
+    /// Rest-pose bounds, model space.
+    pub(crate) bounds: Aabb,
 }
 
 impl ModelFacts {
     /// The facts of a model holding the geometry of both: one body, the sections of both.
     pub(crate) fn join(self, o: Self) -> Self {
+        let mut bounds = self.bounds;
+        bounds.extend(o.bounds.min);
+        bounds.extend(o.bounds.max);
         Self {
             instances: self.instances.max(o.instances),
             sections: self.sections + o.sections,
             position_exponent: self.position_exponent.max(o.position_exponent),
+            finest_exponent: self.finest_exponent.min(o.finest_exponent),
+            bounds,
         }
     }
+}
+
+/// How far a compact record of a copy of `facts` scaled by `s` may put a point of the model from
+/// where its placement does: half the step of the model's finest grid as the copy scales it.
+/// The cook snaps each vertex up to half a step from its source, so two copies that meet then
+/// meet within one step, the error that snapping alone allows two vertices that coincide.
+fn tolerance(facts: &ModelFacts, s: Vec3) -> f64 {
+    0.5 * 2f64.powi(i32::from(facts.finest_exponent)) * f64::from(s.abs().min_element())
 }
 
 /// Facts of the models an instance source names, by asset name.
@@ -231,7 +246,7 @@ pub(crate) fn cook(
             let info = built.info.to_bytes();
             let records = [
                 bytemuck::cast_slice(&built.records),
-                bytemuck::cast_slice(&built.linear),
+                bytemuck::cast_slice(&built.exact),
             ]
             .concat();
             let mut blobs = vec![mount(&info), BlobIn::new(&records)];
@@ -484,7 +499,7 @@ fn split_cell(rel: &[DVec3], records: &[usize], edge: f64) -> Option<Vec<Vec<usi
 struct BuiltPage {
     info: InstancePageInfo,
     records: Vec<InstanceRecord>,
-    linear: Vec<LinearRows>,
+    exact: Vec<AffineRows>,
     motion: Vec<MotionRow>,
     user: Vec<u8>,
 }
@@ -527,8 +542,9 @@ fn build_page(
         cell,
         origin: [0.0; 3],
         extent: [0.0; 3],
+        step: [0.0; 3],
         log2_scale_min: 0.0,
-        log2_scale_max: 0.0,
+        log2_scale_step: 0.0,
         prototypes: Span::default(),
         user_stride: src.user_stride,
         record_count: members.len() as u16,
@@ -548,28 +564,92 @@ fn build_page(
         .iter()
         .map(|&i| Form::of(src.records[i].linear()))
         .collect();
-    let positions: Vec<[u16; 3]> = if src.joined {
+    let facts = |n: usize| &prototypes[usize::from(src.records[members[n]].prototype)].facts;
+    let targets: Vec<DVec3> = if src.joined {
         let k = used
             .iter()
             .map(|&g| prototypes[usize::from(g)].facts.position_exponent)
             .max()
             .unwrap_or(0);
-        joined_positions(name, &mut header, f64::from(k).exp2(), rel, members)?
+        joined_targets(name, f64::from(k).exp2(), rel, members)?
     } else {
-        keep_scale_range(&mut forms, |n| src.records[members[n]].linear());
-        set_scale_range(
+        members.iter().map(|&i| rel[i]).collect()
+    };
+    let positions = grid_positions(&mut header, &targets);
+    // Where the source puts each copy, against which its record's decode is measured.
+    let source: Vec<DAffine3> = members
+        .iter()
+        .map(|&i| DAffine3::from_mat3_translation(src.records[i].linear(), rel[i]))
+        .collect();
+    let rotations: Vec<Option<(u32, Option<u32>)>> = forms
+        .iter()
+        .map(|f| match f {
+            Form::Compact(q, _) => {
+                let q = q.to_array();
+                let exact = instance::exact_axis_index(q);
+                Some((exact.unwrap_or_else(|| instance::encode_rotation(q)), exact))
+            }
+            Form::Exact => None,
+        })
+        .collect();
+    let compact = |n: usize, rotation: (u32, Option<u32>), s: Vec3| {
+        let (rot, exact) = rotation;
+        let mut scale = if exact.is_some() {
+            InstanceRecord::INDEXED
+        } else {
+            0
+        };
+        if s.x < 0.0 {
+            scale |= InstanceRecord::MIRROR;
+        }
+        let (pos, fine) = InstanceRecord::split_position(positions[n]);
+        InstanceRecord {
+            pos,
+            prototype: local[&src.records[members[n]].prototype],
+            rot,
+            scale,
+            rank: 0,
+            fine,
+        }
+    };
+    let error = |n: usize, placed: Affine3| {
+        let placed = DAffine3::from_mat3_translation(
+            placed.matrix3.as_dmat3(),
+            placed.translation.as_dvec3(),
+        );
+        instance::displacement(&source[n], &placed, &facts(n).bounds)
+    };
+    if !src.joined {
+        // Rotation and translation alone, at the source's scale: a copy they move too far takes
+        // a row, and its scale stays out of the page's range.
+        for (n, form) in forms.iter_mut().enumerate() {
+            if let (Form::Compact(_, s), Some((rot, axis))) = (&*form, rotations[n]) {
+                let m = instance::instance_rotation(rot, axis.is_some());
+                let t = instance::decode_position(&header, positions[n]);
+                let placed = Affine3::from_cols(
+                    m.x_axis * s.x,
+                    m.y_axis * s.y,
+                    m.z_axis * s.z,
+                    Vec3::from(t),
+                );
+                if error(n, placed) > tolerance(facts(n), *s) {
+                    *form = Form::Exact;
+                }
+            }
+        }
+        keep_scale_range(&mut forms);
+        set_scale_grid(
             &mut header,
             forms.iter().filter_map(|f| match f {
                 Form::Compact(_, s) => Some(s.abs()),
-                Form::Table(_) => None,
+                Form::Exact => None,
             }),
         );
-        quantize_positions(&mut header, rel, members)
-    };
+    }
 
     let mut records = Vec::with_capacity(members.len());
-    let mut linear = Vec::new();
-    let mut rows: HashMap<[u32; 9], u32> = HashMap::new();
+    let mut exact = Vec::new();
+    let mut rows: HashMap<[u32; 12], u32> = HashMap::new();
     let unjoined = |i: usize| {
         fail(
             name,
@@ -579,49 +659,48 @@ fn build_page(
             ),
         )
     };
-    for (n, (&i, form)) in members.iter().zip(&forms).enumerate() {
+    for (n, &i) in members.iter().enumerate() {
         let p = &src.records[i];
-        let (rot, scale) = match form {
-            Form::Table(_) if src.joined => return Err(unjoined(i)),
-            Form::Table(l) => {
-                let row = *rows.entry(bytemuck::cast(*l)).or_insert_with(|| {
-                    linear.push(*l);
-                    linear.len() as u32 - 1
-                });
-                (instance::AXIS_ROTATIONS + row, InstanceRecord::INDEXED)
-            }
-            Form::Compact(rotation, s) => {
-                let q = rotation.to_array();
-                let exact = instance::exact_axis_index(q);
-                let (rot, mut scale) = match exact {
-                    Some(index) => (index, InstanceRecord::INDEXED),
-                    None => (instance::encode_rotation(q), 0),
-                };
-                if s.x < 0.0 {
-                    scale |= InstanceRecord::MIRROR;
-                }
+        let record = match (&forms[n], rotations[n]) {
+            (Form::Compact(_, s), Some(rotation)) => {
+                let mut r = compact(n, rotation, *s);
                 if src.joined {
                     // Against the placement itself: a compact form drops a small shear.
-                    let turned = exact.map(|e| instance::axis_rotation(e).as_dmat3());
+                    let turned = rotation.1.map(|e| instance::axis_rotation(e).as_dmat3());
                     if !turned.is_some_and(|m| largest(p.linear() - m) <= 1e-6) {
                         return Err(unjoined(i));
                     }
+                    check_joined(name, &header, &r, targets[n], i)?;
+                    Some(r)
                 } else {
                     for (a, v) in s.abs().to_array().into_iter().enumerate() {
-                        scale |= scale_code(&header, v) << (10 * a);
+                        r.scale |= scale_code(&header, v) << (10 * a);
                     }
+                    let placed = instance::decode_record(&header, &[], &r);
+                    (error(n, placed) <= tolerance(facts(n), *s)).then_some(r)
                 }
-                (rot, scale)
             }
+            _ if src.joined => return Err(unjoined(i)),
+            _ => None,
         };
-        records.push(InstanceRecord {
-            pos: positions[n],
-            prototype: local[&p.prototype],
-            rot,
-            scale,
-            rank: 0,
-            _pad: 0,
+        let record = record.unwrap_or_else(|| {
+            let placed = Affine3::from_mat3_translation(p.linear().as_mat3(), rel[i].as_vec3());
+            let row = AffineRows::from(placed);
+            let index = *rows.entry(bytemuck::cast(row)).or_insert_with(|| {
+                exact.push(row);
+                exact.len() as u32 - 1
+            });
+            let (pos, fine) = InstanceRecord::split_position(positions[n]);
+            InstanceRecord {
+                pos,
+                prototype: local[&p.prototype],
+                rot: instance::AXIS_ROTATIONS + index,
+                scale: InstanceRecord::INDEXED,
+                rank: 0,
+                fine,
+            }
         });
+        records.push(record);
     }
 
     // Morton order, ties in source order.
@@ -658,9 +737,6 @@ fn build_page(
         .map(|p| p as u16)
         .collect();
 
-    if src.joined {
-        check_joined(name, &header, &records, rel, &order, members)?;
-    }
     // Rows follow their records, by interval, from a point of the page.
     let mut motion = Vec::new();
     let mut motion_times = Vec::new();
@@ -695,61 +771,56 @@ fn build_page(
             motion_times,
         },
         records,
-        linear,
+        exact,
         motion,
         user,
     })
 }
 
-fn bounds(rel: &[DVec3], members: &[usize]) -> (DVec3, DVec3) {
-    members
+/// Sets the header's box and grid from `targets` and returns each one's grid position, the
+/// nearest grid point.
+fn grid_positions(h: &mut InstancePageHeader, targets: &[DVec3]) -> Vec<[u32; 3]> {
+    let (lo, hi) = targets
         .iter()
-        .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(lo, hi), &i| {
-            (lo.min(rel[i]), hi.max(rel[i]))
-        })
-}
-
-/// Sets the header's box from the members' bounds and returns each member's grid position,
-/// the nearest of the decoded candidates.
-fn quantize_positions(
-    h: &mut InstancePageHeader,
-    rel: &[DVec3],
-    members: &[usize],
-) -> Vec<[u16; 3]> {
-    let (lo, hi) = bounds(rel, members);
+        .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(lo, hi), &t| {
+            (lo.min(t), hi.max(t))
+        });
+    let last = (1u32 << POSITION_BITS) - 1;
     for a in 0..3 {
-        let (lo, hi) = (lo[a], hi[a]);
-        let mut o = lo as f32;
-        if f64::from(o) > lo {
-            o = o.next_down();
-        }
-        let mut e = (hi - f64::from(o)) as f32;
-        while f64::from(o) + f64::from(e) < hi {
+        let (origin, step) = grid(lo[a], hi[a], last);
+        let mut e = (hi[a] - f64::from(origin)) as f32;
+        while f64::from(origin) + f64::from(e) < hi[a] {
             e = e.next_up();
         }
-        h.origin[a] = o;
+        h.origin[a] = origin;
+        h.step[a] = step;
         h.extent[a] = e;
     }
-    members
+    targets
         .iter()
-        .map(|&i| {
-            let target = rel[i].to_array();
-            let mut q = [0u16; 3];
-            for a in 0..3 {
-                let step = h.extent[a] / 65535.0;
-                if step == 0.0 {
-                    continue;
-                }
-                let guess = ((target[a] - f64::from(h.origin[a])) / f64::from(step)).round();
-                q[a] = nearest_code(guess, 65535, |c| {
-                    let mut pos = [0; 3];
-                    pos[a] = c as u16;
-                    (f64::from(instance::decode_position(h, pos)[a]) - target[a]).abs()
-                }) as u16;
-            }
-            q
+        .map(|t| {
+            [0, 1, 2].map(|a| {
+                let q = (t[a] - f64::from(h.origin[a])) / f64::from(h.step[a]);
+                q.round().clamp(0.0, f64::from(last)) as u32
+            })
         })
         .collect()
+}
+
+/// The first point and step of a grid of `last + 1` points from at or below `lo` to at or above
+/// `hi`, with the finest power-of-two step whose points are all exact f32s, a normal float's at
+/// the least.
+fn grid(lo: f64, hi: f64, last: u32) -> (f32, f32) {
+    let mut e = f32::MIN_EXP - 1;
+    loop {
+        let step = 2f64.powi(e);
+        let origin = (lo / step).floor() * step;
+        let end = origin + f64::from(last) * step;
+        if end >= hi && origin.abs().max(end.abs()) < 2f64.powi(e + f32::MANTISSA_DIGITS as i32) {
+            return (origin as f32, step as f32);
+        }
+        e += 1;
+    }
 }
 
 /// Of `guess` and its two neighbors, clamped to `0..=max`, the code with the least `err`.
@@ -761,8 +832,8 @@ fn nearest_code(guess: f64, max: u32, err: impl Fn(u32) -> f64) -> u32 {
 }
 
 /// Gives a table row to every compact form outside the [`SCALE_RANGE`] that holds the most of
-/// them, the first such range from the smallest scales up. `linear` is form `n`'s transform.
-fn keep_scale_range(forms: &mut [Form], linear: impl Fn(usize) -> DMat3) {
+/// them, the first such range from the smallest scales up.
+fn keep_scale_range(forms: &mut [Form]) {
     // Where a range may start and still hold each form's three scales.
     let starts: Vec<Option<(f32, f32)>> = forms
         .iter()
@@ -772,7 +843,7 @@ fn keep_scale_range(forms: &mut [Form], linear: impl Fn(usize) -> DMat3) {
                 let (lo, hi) = (l[0].min(l[1]).min(l[2]), l[0].max(l[1]).max(l[2]));
                 Some((hi - SCALE_RANGE, lo)).filter(|(first, last)| first <= last)
             }
-            Form::Table(_) => None,
+            Form::Exact => None,
         })
         .collect();
     let mut edges: Vec<(f32, i32)> = starts
@@ -791,114 +862,71 @@ fn keep_scale_range(forms: &mut [Form], linear: impl Fn(usize) -> DMat3) {
     for (n, f) in forms.iter_mut().enumerate() {
         let held = starts[n].is_some_and(|(first, last)| first <= start && start <= last);
         if matches!(f, Form::Compact(..)) && !held {
-            *f = Form::Table(linear(n).as_mat3().into());
+            *f = Form::Exact;
         }
     }
 }
 
-fn set_scale_range(h: &mut InstancePageHeader, scales: impl Iterator<Item = Vec3>) {
-    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+/// Sets the header's log2 scale grid to cover `scales`.
+fn set_scale_grid(h: &mut InstancePageHeader, scales: impl Iterator<Item = Vec3>) {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for s in scales {
         for v in s.to_array() {
-            let l = v.log2();
+            let l = f64::from(v).log2();
             lo = lo.min(l);
             hi = hi.max(l);
         }
     }
     if lo <= hi {
-        h.log2_scale_min = lo;
-        h.log2_scale_max = hi;
+        (h.log2_scale_min, h.log2_scale_step) = grid(lo, hi, 1023);
     }
 }
 
 fn scale_code(h: &InstancePageHeader, s: f32) -> u32 {
-    let range = h.log2_scale_max - h.log2_scale_min;
-    if range == 0.0 {
-        return 0;
-    }
-    let guess = f64::from((s.log2() - h.log2_scale_min) / range * 1023.0).round();
-    nearest_code(guess, 1023, |c| {
+    let guess = (f64::from(s).log2() - f64::from(h.log2_scale_min)) / f64::from(h.log2_scale_step);
+    nearest_code(guess.round(), 1023, |c| {
         (f64::from(instance::decode_scale(h, c)) / f64::from(s) - 1.0).abs()
     })
 }
 
-/// Joined pages quantize on the coarsest mesh step: the box starts on that grid and spans
-/// 65535 steps.
-fn joined_positions(
-    name: &str,
-    h: &mut InstancePageHeader,
-    step: f64,
-    rel: &[DVec3],
-    members: &[usize],
-) -> Result<Vec<[u16; 3]>> {
-    let (lo, hi) = bounds(rel, members);
-    for a in 0..3 {
-        let (lo, hi) = (lo[a], hi[a]);
-        let origin = (lo / step + 1e-3).floor() * step;
-        if ((hi - origin) / step).round() > 65535.0 {
-            return Err(fail(
-                name,
-                format!(
-                    "joined placements span more than 65535 steps of {step} m in cell {:?}",
-                    h.cell
-                ),
-            ));
-        }
-        h.origin[a] = origin as f32;
-        h.extent[a] = (step * 65535.0) as f32;
-        if f64::from(h.origin[a]) != origin {
-            return Err(fail(
-                name,
-                format!("joined page origin {origin} m is not exact in f32"),
-            ));
-        }
-    }
+/// The members' positions snapped to the coarsest mesh step of a joined page, which each must
+/// already be on.
+fn joined_targets(name: &str, step: f64, rel: &[DVec3], members: &[usize]) -> Result<Vec<DVec3>> {
     members
         .iter()
         .map(|&i| {
-            let mut q = [0u16; 3];
-            for a in 0..3 {
-                let v = (rel[i][a] - f64::from(h.origin[a])) / step;
-                if (v - v.round()).abs() > 1e-3 {
-                    return Err(fail(
-                        name,
-                        format!("joined placement {i} is off the {step} m grid"),
-                    ));
-                }
-                q[a] = v.round() as u16;
+            let v = rel[i] / step;
+            if (v - v.round()).abs().max_element() > 1e-3 {
+                return Err(fail(
+                    name,
+                    format!("joined placement {i} is off the {step} m grid"),
+                ));
             }
-            Ok(q)
+            Ok(v.round() * step)
         })
         .collect()
 }
 
-/// Decodes every joined record with the reference decode: translations on the step grid at
-/// the placement, unit scale and a linear part of 0 and +-1 entries.
+/// Decodes joined record `r` of placement `i` with the reference decode: its translation is
+/// `target` exactly and its linear part has entries of 0 and +-1 alone.
 fn check_joined(
     name: &str,
     h: &InstancePageHeader,
-    records: &[InstanceRecord],
-    rel: &[DVec3],
-    order: &[usize],
-    members: &[usize],
+    r: &InstanceRecord,
+    target: DVec3,
+    i: usize,
 ) -> Result<()> {
-    let step = f64::from(h.extent[0]) / 65535.0;
-    for (r, &n) in records.iter().zip(order) {
-        let i = members[n];
-        let m = instance::decode_record(h, &[], r);
-        let linear = m
-            .matrix3
-            .to_cols_array()
-            .iter()
-            .all(|&v| v == 0.0 || v.abs() == 1.0);
-        let t = m.translation.as_dvec3();
-        let exact = t / step == (t / step).round() && t.abs_diff_eq(rel[i], step * 1e-3);
-        if !exact || !linear {
-            return Err(fail(
-                name,
-                format!("joined placement {i} does not decode exactly onto the grid"),
-            ));
-        }
+    let m = instance::decode_record(h, &[], r);
+    let linear = m
+        .matrix3
+        .to_cols_array()
+        .iter()
+        .all(|&v| v == 0.0 || v.abs() == 1.0);
+    if m.translation.as_dvec3() != target || !linear {
+        return Err(fail(
+            name,
+            format!("joined placement {i} does not decode exactly onto the grid"),
+        ));
     }
     Ok(())
 }

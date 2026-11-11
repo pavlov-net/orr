@@ -316,23 +316,23 @@ fn neural_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-/// Cell, records, linear table rows, prototypes, partitions and the scale range of an instance
-/// page.
+/// Cell, records, exact table rows, prototypes, partitions, and the position and log2 scale
+/// grids of an instance page.
 fn instance_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
     let head = mount_blob(a, e)?;
     let info = InstancePageInfo::parse(&head)?;
     let h = info.header;
     writeln!(
         out,
-        "    cell {:?}, {} records, {} linear rows, {} prototypes, {} partitions, step {:?} m, scale {:.3}..{:.3}, user stride {}",
+        "    cell {:?}, {} records, {} exact rows, {} prototypes, {} partitions, step {:?} m, log2 scale from {} by {}, user stride {}",
         h.cell,
         h.record_count,
-        h.linear_rows(a.blobs(e)[1].raw_len as usize)?,
+        h.exact_rows(a.blobs(e)[1].raw_len as usize)?,
         info.prototypes.len(),
         info.partitions.len(),
-        h.extent.map(|x| x / 65535.0),
-        h.log2_scale_min.exp2(),
-        h.log2_scale_max.exp2(),
+        h.step,
+        h.log2_scale_min,
+        h.log2_scale_step,
         h.user_stride
     )?;
     Ok(())

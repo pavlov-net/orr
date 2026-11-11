@@ -203,14 +203,15 @@ public float3 grid_position(int3 anchor, uint3 local, float step)
 //
 // Smallest three: bits 30-31 name the quaternion component of largest magnitude (x, y, z,
 // w), stored non-negative and dropped; the other three in x, y, z, w order sit in bits
-// 0-9, 10-19 and 20-29, each as round((c / ROTATION_RANGE x 0.5 + 0.5) x 1023).
+// 0-9, 10-19 and 20-29, each as c / ROTATION_STEP + 511, so code 511 is 0.
 //
 // Exact axis rotations (the record's INDEXED flag) store an index 0-23 instead:
 // index = permutation x 4 + signs. Row i of the matrix has its one non-zero entry in column
 // AXIS_PERMUTATIONS[permutation][i]; bit 0 of `signs` negates row 0, bit 1 row 1, and row
 // 2's sign makes the determinant +1. Index 0 is the identity.
 
-public static const float ROTATION_RANGE = 0.70710678118654752; // 1 / sqrt(2)
+// orr_pack::instance::ROTATION_STEP, the f32 nearest 1/sqrt(2) / 511.
+public static const float ROTATION_STEP = 0.0013837706064805388;
 
 static const uint3 AXIS_PERMUTATIONS[6] = {
     uint3(0, 1, 2), uint3(0, 2, 1), uint3(1, 0, 2), uint3(1, 2, 0), uint3(2, 0, 1), uint3(2, 1, 0)
@@ -220,7 +221,7 @@ static const float AXIS_PARITY[6] = { 1.0, -1.0, -1.0, 1.0, 1.0, -1.0 };
 // The unit quaternion of a smallest-three code.
 public float4 decode_rotation(uint r)
 {
-    float3 c = (float3(uint3(r, r >> 10, r >> 20) & 1023) / 1023.0 * 2.0 - 1.0) * ROTATION_RANGE;
+    float3 c = (float3(uint3(r, r >> 10, r >> 20) & 1023) - 511.0) * ROTATION_STEP;
     float w = sqrt(max(0.0, 1.0 - c.x * c.x - c.y * c.y - c.z * c.z));
     switch (r >> 30)
     {

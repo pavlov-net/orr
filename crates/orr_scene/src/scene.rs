@@ -447,9 +447,9 @@ pub(crate) struct PageGroup {
     /// `records` changed since the group record was last written.
     pub(crate) changed: bool,
     origin: [f32; 3],
-    extent: [f32; 3],
+    step: [f32; 3],
     log2_scale_min: f32,
-    log2_scale_max: f32,
+    log2_scale_step: f32,
 }
 
 impl Group {
@@ -474,9 +474,9 @@ impl Group {
                 records: page.records.address().0,
                 changed: false,
                 origin: header.origin,
-                extent: header.extent,
+                step: header.step,
                 log2_scale_min: header.log2_scale_min,
-                log2_scale_max: header.log2_scale_max,
+                log2_scale_step: header.log2_scale_step,
             }),
         }
     }
@@ -502,9 +502,9 @@ impl Group {
                 anchor_cell: self.anchor.cell.to_array(),
                 anchor_offset: self.anchor.offset.to_array(),
                 origin: p.origin,
-                extent: p.extent,
+                step: p.step,
                 log2_scale_min: p.log2_scale_min,
-                log2_scale_max: p.log2_scale_max,
+                log2_scale_step: p.log2_scale_step,
             };
         }
         let current = self.buffers[self.current].gpu();
@@ -560,7 +560,7 @@ pub(crate) struct PagePlacement {
     pub(crate) prototypes: Allocation<u8>,
     pub(crate) prototype_count: u32,
     pub(crate) first_entry: u32,
-    pub(crate) linear_rows: u32,
+    pub(crate) exact_rows: u32,
     pub(crate) entries: Vec<PrototypeEntries>,
     pub(crate) expanded: bool,
     /// Its slots hold no entries since its range moved, and take their new ones the next time
@@ -1564,7 +1564,7 @@ impl<'f> SceneWriter<'f> {
             return Err(Error::SkinnedPage(p.model));
         }
         let header = page.info.header;
-        let linear_rows = header.linear_rows(page.bytes as usize)? as u32;
+        let exact_rows = header.exact_rows(page.bytes as usize)? as u32;
         let PageNeeds {
             instances: count,
             material_sets: set_entries,
@@ -1710,7 +1710,7 @@ impl<'f> SceneWriter<'f> {
             prototypes: table,
             prototype_count: copies.len() as u32,
             first_entry: entry,
-            linear_rows,
+            exact_rows,
             entries,
             expanded: false,
             entries_stale: false,

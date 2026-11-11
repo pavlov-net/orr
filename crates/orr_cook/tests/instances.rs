@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 
 use orr_cook::{
     ArchiveSpec, AssemblySettings, AssetSpec, Error, GltfSettings, Instances, Linear, Manifest,
-    Placement, PrototypeSpec, SectionSpec, Source,
+    MeshInput, Placement, PrototypeSpec, SectionSpec, Source,
 };
-use orr_math::{DVec3, Mat3, Quat, Vec3};
+use orr_math::{Affine3, DAffine3, DMat3, DQuat, DVec3, Mat3, Quat, Vec2, Vec3};
 use orr_pack::instance::{self, InstancePageInfo, InstanceRecord};
-use orr_pack::{AffineRows, Archive, AssetId, Class, Entry, Target};
+use orr_pack::material::Material;
+use orr_pack::{Aabb, AffineRows, Archive, AssetId, Class, Entry, Span, Target};
 
 struct Rng(u64);
 impl Rng {
@@ -98,20 +99,52 @@ fn rotation(rng: &mut Rng) -> Quat {
     if rng.next().is_multiple_of(2) { -q } else { q }
 }
 
-/// Angle between a rotation and the rotation of a decoded linear part, its columns
-/// normalized to take out the scale.
-fn angle_deg(a: Quat, linear: Mat3) -> f64 {
-    let col = |c: usize| linear.col(c).as_dvec3().normalize();
-    let m = orr_math::DMat3::from_cols(col(0), col(1), col(2));
-    a.as_dquat()
-        .normalize()
-        .angle_between(orr_math::DQuat::from_mat3(&m))
-        .to_degrees()
+/// The grid step of the fixture models' meshes, 2^-11 m.
+const GRID_STEP: f64 = 1.0 / 2048.0;
+
+/// The bounds of the block fixture.
+const BLOCK: Aabb = Aabb {
+    min: [0.0; 3],
+    max: [1.0; 3],
+};
+
+/// Where a placement puts its model, relative to the corner of cell `cell`.
+fn source(p: &Placement, cell: [i32; 3]) -> DAffine3 {
+    let corner = DVec3::from(cell.map(f64::from)) * 256.0;
+    let linear = match p.linear {
+        Linear::Scaled { rotation, scale } => {
+            DMat3::from_quat(DQuat::from_array(rotation.map(f64::from)).normalize())
+                * DMat3::from_diagonal(Vec3::from(scale).as_dvec3())
+        }
+        Linear::Matrix(columns) => Mat3::from_cols_array_2d(&columns).as_dmat3(),
+    };
+    DAffine3::from_mat3_translation(linear, DVec3::from(p.position) - corner)
 }
 
-/// Spacing of f32 values at `v`: the decode's own rounding adds up to this to the half step.
-fn ulp(v: f32) -> f32 {
-    v.abs().next_up() - v.abs()
+fn dvec(m: Affine3) -> DAffine3 {
+    DAffine3::from_mat3_translation(m.matrix3.as_dmat3(), m.translation.as_dvec3())
+}
+
+/// A copy's compact record keeps every point of the model within half a grid step of the
+/// copy's scale; a row holds the f32 transform, whose rounding moves points far less.
+fn assert_placed(r: &InstanceRecord, p: &Placement, cell: [i32; 3], m: Affine3, bounds: &Aabb) {
+    let want = source(p, cell);
+    let error = instance::displacement(&want, &dvec(m), bounds);
+    let l = want.matrix3;
+    let s = [l.x_axis.length(), l.y_axis.length(), l.z_axis.length()];
+    let bound = if r.exact_row().is_some() {
+        let reach = Vec3::from(bounds.min)
+            .abs()
+            .max(Vec3::from(bounds.max).abs())
+            .length();
+        1e-6 * (1.0 + want.translation.length() + s[0].max(s[1]).max(s[2]) * f64::from(reach))
+    } else {
+        0.5 * GRID_STEP * s[0].min(s[1]).min(s[2])
+    };
+    assert!(
+        error <= bound,
+        "{r:?} moves the model {error} m, past {bound}"
+    );
 }
 
 #[test]
@@ -131,7 +164,9 @@ fn fixture_page_decodes_within_its_error_bounds() {
             .to_array(),
             linear: Linear::Scaled {
                 rotation: rotation(&mut rng).to_array(),
-                scale: (if i % 3 == 0 {
+                scale: (if i % 4 == 0 {
+                    Vec3::ONE
+                } else if i % 3 == 0 {
                     Vec3::splat(rng.range(0.5, 2.0) as f32)
                 } else {
                     Vec3::new(
@@ -204,7 +239,7 @@ fn fixture_page_decodes_within_its_error_bounds() {
 
     let (got_cell, decoded) = instance::decode(&head, &recs).unwrap();
     assert_eq!(got_cell, cell);
-    let raw: Vec<InstanceRecord> = bytemuck::pod_collect_to_vec(&recs);
+    let (raw, table) = instance::records(&h, &recs).unwrap();
     let codes: Vec<u64> = raw.iter().map(|r| instance::morton(r.pos)).collect();
     assert!(codes.is_sorted(), "records are not in Morton order");
     // Each prototype's records rank from 0 in record order, up to its count.
@@ -221,39 +256,27 @@ fn fixture_page_decodes_within_its_error_bounds() {
     let counts: Vec<u16> = info.prototypes.iter().map(|p| p.records).collect();
     assert_eq!(counts, ranks);
 
-    let step = h.extent.map(|e| f64::from(e) / 65535.0);
-    let scale_half_step = f64::from(h.log2_scale_max - h.log2_scale_min) / 1023.0 / 2.0;
     let mut seen = vec![false; n];
+    let mut turned = 0;
     for (k, (prototype, m)) in decoded.enumerate() {
         let src_index = u32::from_le_bytes(user[k * 4..k * 4 + 4].try_into().unwrap()) as usize;
         assert!(!std::mem::replace(&mut seen[src_index], true));
         let p = &records[src_index];
         assert_eq!(prototype, p.prototype);
-        for a in 0..3 {
-            let want = p.position[a] - corner[a];
-            let got = m.translation[a];
-            let err = (f64::from(got) - want).abs();
-            assert!(
-                err <= step[a] * 0.5 + f64::from(ulp(got)),
-                "axis {a}: {err} m"
-            );
+        assert_placed(&raw[k], p, cell, m, &BLOCK);
+        if let Some(row) = raw[k].exact_row() {
+            assert_eq!(table[row], AffineRows::from(m));
         }
-        let Linear::Scaled { rotation, scale } = p.linear else {
-            panic!("scaled");
-        };
-        let decoded_scale = Vec3::from_array([0, 1, 2].map(|c| m.matrix3.col(c).length()));
-        for a in 0..3 {
-            let rel = (f64::from(decoded_scale[a]) / f64::from(scale[a]) - 1.0).abs();
-            assert!(rel <= scale_half_step.exp2() - 1.0 + 1e-5, "scale {rel}");
-            assert!(rel <= 0.002, "scale {rel}");
-        }
-        let err = angle_deg(Quat::from_array(rotation), m.matrix3);
-        assert!(err <= 0.17, "rotation {err} deg");
-        if raw[k].exact_axis() {
-            assert!(err < 1e-4);
+        // Axis turns at scale 1 hold exactly but for the translation's grid.
+        if let Linear::Scaled { rotation, scale } = p.linear
+            && instance::exact_axis_index(rotation).is_some()
+            && scale == [1.0; 3]
+        {
+            assert!(raw[k].exact_axis(), "{p:?}");
+            turned += 1;
         }
     }
-    assert!(raw.iter().any(InstanceRecord::exact_axis));
+    assert!(turned > n / 100);
     // One part per model, so a record costs one PTLAS instance.
     let starts: Vec<u32> = info.partitions.iter().map(|&s| u32::from(s)).collect();
     assert!(starts.len() >= n / 1000);
@@ -409,9 +432,9 @@ fn joined_pages_decode_exactly() {
     ])));
 }
 
-/// A sheared copy keeps its matrix bit for bit in the page's linear table, a row per distinct
-/// matrix, and leaves the scale range to the compact records; a transform a rotation and scale
-/// hold stays compact.
+/// A sheared copy keeps its transform bit for bit in the page's exact table, a row per distinct
+/// transform, and leaves the scale grid to the compact records; a transform a compact record
+/// holds exactly stays compact.
 #[test]
 fn sheared_placements_take_table_rows_and_the_rest_stay_compact() {
     let shear = Mat3::from_cols(
@@ -446,14 +469,16 @@ fn sheared_placements_take_table_rows_and_the_rest_stay_compact() {
         .map(|(i, &m)| matrix(i, m))
         .collect();
     records.push(matrix(6, nearly));
-    records.push(Placement {
-        position: [8.0, 1.0, 2.0],
+    let scaled = |x: f64, rotation: Quat, scale| Placement {
+        position: [x, 1.0, 2.0],
         linear: Linear::Scaled {
-            rotation: Quat::from_rotation_x(0.3).to_array(),
-            scale: [2.0, 4.0, 4.0],
+            rotation: rotation.to_array(),
+            scale,
         },
         prototype: 0,
-    });
+    };
+    records.push(scaled(8.0, Quat::from_rotation_x(0.31), [2.0, 4.0, 4.0]));
+    records.push(scaled(9.0, Quat::IDENTITY, [2.0; 3]));
     let a = cook_instances(Instances {
         records,
         prototypes: vec![proto(0)],
@@ -464,19 +489,23 @@ fn sheared_placements_take_table_rows_and_the_rest_stay_compact() {
     let (head, blob) = (read(&a, e, 0), read(&a, e, 1));
     let h = InstancePageInfo::parse(&head).unwrap().header;
     let (records, table) = instance::records(&h, &blob).unwrap();
-    assert_eq!(table.len(), 5);
+    assert_eq!(table.len(), 8);
     assert_eq!(
-        records.iter().filter(|r| r.linear_row().is_some()).count(),
-        6
+        records.iter().filter(|r| r.exact_row().is_some()).count(),
+        8
     );
-    assert_eq!((h.log2_scale_min, h.log2_scale_max), (1.0, 2.0));
+    assert_eq!(h.log2_scale_min, 1.0);
     let (_, decoded) = instance::decode(&head, &blob).unwrap();
     for (_, m) in decoded {
         let x = m.translation.x.round() as usize - 1;
+        let t = Vec3::new(x as f32 + 1.0, 1.0, 2.0);
         match tables.get(x) {
-            Some(want) => assert_eq!(m.matrix3, *want),
-            None if x == 6 => {
-                assert!(m.matrix3.abs_diff_eq(nearly, 0.02), "{m:?}");
+            Some(want) => assert_eq!((m.matrix3, m.translation), (*want, t)),
+            None if x == 6 => assert_eq!(m.matrix3, nearly),
+            None if x == 8 => {
+                let want =
+                    Affine3::from_scale_rotation_translation(Vec3::splat(2.0), Quat::IDENTITY, t);
+                assert_eq!(m, want);
             }
             None => assert_eq!(x, 7),
         }
@@ -484,25 +513,26 @@ fn sheared_placements_take_table_rows_and_the_rest_stay_compact() {
 }
 
 /// A scale far from the rest takes a table row, so that it costs the rest no precision: a range
-/// of 80 octaves would leave every compact scale 2.7% out.
+/// of 80 octaves would leave no compact scale within the copies' tolerance. Scales on the grid,
+/// 1 and other powers of two, decode exactly.
 #[test]
 fn an_outlying_scale_leaves_the_range_to_the_rest() {
-    let turned = Quat::from_rotation_y(0.7);
     let scaled = |x: usize, scale: [f32; 3]| Placement {
         position: [1.0 + x as f64, 1.0, 2.0],
         linear: Linear::Scaled {
-            rotation: turned.to_array(),
+            rotation: Quat::from_rotation_y(90f32.to_radians()).to_array(),
             scale,
         },
         prototype: 0,
     };
     let scales = [
-        [1.0, 1.1, 1.3],
+        [1.0, 2.0, 0.5],
         [1e-12, 1e-12, 1e-12],
-        [0.7, 0.7, 0.9],
+        [0.5, 0.5, 4.0],
         [1.0, 1000.0, 1.0],
-        [1.7, 1.2, 1.0],
+        [1.0, 1.1, 1.3],
         [1e12, 1e12, 1e12],
+        [1.0; 3],
     ];
     let records: Vec<Placement> = scales
         .iter()
@@ -510,7 +540,7 @@ fn an_outlying_scale_leaves_the_range_to_the_rest() {
         .map(|(i, &s)| scaled(i, s))
         .collect();
     let a = cook_instances(Instances {
-        records,
+        records: records.clone(),
         prototypes: vec![proto(0)],
         ..Default::default()
     })
@@ -518,20 +548,19 @@ fn an_outlying_scale_leaves_the_range_to_the_rest() {
     let e = pages(&a)[0];
     let (head, blob) = (read(&a, e, 0), read(&a, e, 1));
     let h = InstancePageInfo::parse(&head).unwrap().header;
-    assert!(h.log2_scale_max - h.log2_scale_min <= 6.0, "{h:?}");
-    let (records, table) = instance::records(&h, &blob).unwrap();
-    assert_eq!(table.len(), 3);
-    let (_, decoded) = instance::decode(&head, &blob).unwrap();
-    for (r, m) in records.iter().zip(decoded.map(|d| d.1)) {
+    // The finest power-of-two step over the rest's three octaves.
+    assert_eq!((h.log2_scale_min, h.log2_scale_step), (-1.0, 2f32.powi(-8)));
+    let (raw, table) = instance::records(&h, &blob).unwrap();
+    assert_eq!(table.len(), 4);
+    let (cell, decoded) = instance::decode(&head, &blob).unwrap();
+    for (r, m) in raw.iter().zip(decoded.map(|d| d.1)) {
         let i = m.translation.x.round() as usize - 1;
-        for (axis, want) in scales[i].into_iter().enumerate() {
-            let error = m.matrix3.col(axis).length() / want - 1.0;
-            let bound = if r.linear_row().is_some() {
-                1e-6
-            } else {
-                0.002
-            };
-            assert!(error.abs() <= bound, "copy {i} axis {axis}: {error}");
+        assert_placed(r, &records[i], cell, m, &BLOCK);
+        let on_grid = [0, 2, 6].contains(&i);
+        assert_eq!(r.exact_row().is_none(), on_grid, "copy {i}");
+        if on_grid {
+            let col = |c: usize| m.matrix3.col(c).length();
+            assert_eq!([col(0), col(1), col(2)], scales[i], "copy {i}");
         }
     }
 }
@@ -832,7 +861,7 @@ fn assemblies_place_their_units_through_instance_sources() {
     };
     let r = cook_with_report(vec![assembly_model(&path), paint.clone(), scatter(joined)]);
     assert!(matches!(r, Err(Error::Instances { .. })), "{:?}", r.err());
-    // Uneven scale over a unit copy's rotation shears it, which a table row holds.
+    // Uneven scale over a unit copy's rotation shears it, which an exact row holds.
     let mut uneven = src;
     uneven.records[0].linear = Linear::Scaled {
         rotation: Quat::from_rotation_y(0.4).to_array(),
@@ -841,6 +870,229 @@ fn assemblies_place_their_units_through_instance_sources() {
     let (a, _) = cook_with_report(vec![assembly_model(&path), paint, scatter(uneven)]).unwrap();
     assert!(pages(&a).iter().any(|e| {
         let h = InstancePageInfo::parse(&read(&a, e, 0)).unwrap().header;
-        h.linear_rows(a.blobs(e)[1].raw_len as usize).unwrap() > 0
+        h.exact_rows(a.blobs(e)[1].raw_len as usize).unwrap() > 0
     }));
+}
+
+/// A flat annular wedge from 0 to `degrees` about y, radii 19.5 to 20.5 m, its points less
+/// `center`. Turning it by `degrees` about y puts the edge at 0 where the edge at `degrees` was.
+fn wedge(degrees: f32, center: Vec3) -> (MeshInput, [Vec3; 4]) {
+    let at = |deg: f32, r: f32, h: f32| {
+        let a = deg.to_radians();
+        Vec3::new(r * a.cos(), h, -r * a.sin()) - center
+    };
+    let positions = vec![
+        at(0.0, 19.5, 0.0),
+        at(0.0, 20.5, 0.0),
+        at(degrees, 19.5, 0.0),
+        at(degrees, 20.5, 0.0),
+        at(0.0, 19.5, 1.0),
+        at(0.0, 20.5, 1.0),
+        at(degrees, 19.5, 1.0),
+        at(degrees, 20.5, 1.0),
+    ];
+    let mesh = MeshInput {
+        positions: positions.clone(),
+        normals: vec![Vec3::Y; 8],
+        uvs: Some(vec![Vec2::ZERO; 8]),
+        indices: vec![0, 1, 2, 2, 1, 3, 4, 6, 5, 6, 7, 5],
+        sections: vec![Span {
+            first: 0,
+            count: 12,
+        }],
+        ..Default::default()
+    };
+    let start = [positions[0], positions[1], positions[4], positions[5]];
+    (mesh, start)
+}
+
+fn mesh_asset(name: &str, mesh: MeshInput) -> AssetSpec {
+    AssetSpec {
+        name: name.into(),
+        source: Source::Mesh {
+            mesh,
+            materials: vec![Material::default()],
+            settings: Default::default(),
+        },
+    }
+}
+
+/// Every record of the archive's pages: its prototype's model, its record and its world
+/// transform.
+fn world_records(a: &Archive) -> Vec<(AssetId, InstanceRecord, DAffine3)> {
+    let mut out = Vec::new();
+    for e in pages(a) {
+        let head = read(a, e, 0);
+        let info = InstancePageInfo::parse(&head).unwrap();
+        let blob = read(a, e, 1);
+        let (raw, _) = instance::records(&info.header, &blob).unwrap();
+        let (cell, decoded) = instance::decode(&head, &blob).unwrap();
+        let corner = DVec3::from(cell.map(f64::from)) * 256.0;
+        for (r, (p, m)) in raw.into_iter().zip(decoded) {
+            let mut m = dvec(m);
+            m.translation += corner;
+            out.push((info.prototypes[usize::from(p)].model, r, m));
+        }
+    }
+    out
+}
+
+/// A ring of 16 wedges at 22.5 degree steps, 20 m from their pivots: half turned about the
+/// ring's center as one model, half as a model centered on its own wedge, so their pivots fall in
+/// two cells and pages. Every wedge's end meets the next one's start within a grid step.
+#[test]
+fn a_ring_of_wedges_meets_across_pages() {
+    let step = 22.5f32;
+    let (ring, start) = wedge(step, Vec3::ZERO);
+    let center = Vec3::from_array(
+        start
+            .iter()
+            .fold([0.0; 3], |c, p| [0, 1, 2].map(|a| c[a] + p[a] * 0.25)),
+    );
+    let (centered, _) = wedge(step, center);
+    let pivot = DVec3::new(259.0, 3.0, 100.0);
+    let turn = |k: usize| Quat::from_rotation_y((step * k as f32).to_radians());
+    let records: Vec<Placement> = (0..16)
+        .map(|k| {
+            let (position, prototype) = if k < 8 {
+                (pivot, 0)
+            } else {
+                (pivot + (turn(k) * center).as_dvec3(), 1)
+            };
+            Placement {
+                position: position.to_array(),
+                linear: Linear::Scaled {
+                    rotation: turn(k).to_array(),
+                    scale: [1.0; 3],
+                },
+                prototype,
+            }
+        })
+        .collect();
+    let a = cook(vec![
+        mesh_asset("kit/wedge", ring),
+        mesh_asset("kit/wedge-centered", centered),
+        AssetSpec {
+            name: "ring".into(),
+            source: Source::Instances(Instances {
+                records,
+                prototypes: ["kit/wedge", "kit/wedge-centered"]
+                    .map(|model| PrototypeSpec {
+                        model: model.into(),
+                        ..Default::default()
+                    })
+                    .to_vec(),
+                ..Default::default()
+            }),
+        },
+    ])
+    .unwrap();
+    assert_eq!(pages(&a).len(), 2);
+    // Each copy as placed, sorted by its turn: the x axis of turn k points at -22.5 k degrees.
+    let mut placed = world_records(&a);
+    placed.sort_by_key(|(_, _, m)| {
+        let x = m.matrix3.x_axis;
+        (((-x.z).atan2(x.x).to_degrees() / 22.5).round() as i64).rem_euclid(16)
+    });
+    assert_eq!(placed.len(), 16);
+    let end = |k: usize, i: usize| {
+        let (model, _, m) = &placed[k];
+        let lift = if *model == AssetId::from_name("kit/wedge") {
+            Vec3::ZERO
+        } else {
+            center
+        };
+        // The end edge is the start edge turned by one step.
+        m.transform_point3((turn(1) * start[i] - lift).as_dvec3())
+    };
+    let begin = |k: usize, i: usize| {
+        let (model, _, m) = &placed[k];
+        let lift = if *model == AssetId::from_name("kit/wedge") {
+            Vec3::ZERO
+        } else {
+            center
+        };
+        m.transform_point3((start[i] - lift).as_dvec3())
+    };
+    for k in 0..16 {
+        for i in 0..4 {
+            let gap = end(k, i).distance(begin((k + 1) % 16, i));
+            assert!(
+                gap <= GRID_STEP,
+                "wedges {k} and {}: {gap} m apart",
+                (k + 1) % 16
+            );
+        }
+    }
+    // Turns of 90 degrees hold exactly in a compact record; the others move points 20 m out
+    // too far and take rows.
+    let compact = placed.iter().filter(|p| p.1.exact_row().is_none()).count();
+    assert_eq!(compact, 4);
+}
+
+/// Small copies turned any way and scaled a little keep compact records over a whole cell.
+#[test]
+fn a_field_of_small_copies_stays_compact() {
+    // On the mesh grid, so the cooked bounds are these.
+    const EDGE: f32 = 31.0 / 2048.0;
+    const HEIGHT: f32 = 8.0 / 2048.0;
+    let mut rng = Rng(0xa076_1d64_78bd_642f);
+    let pebble = MeshInput {
+        positions: vec![
+            Vec3::ZERO,
+            Vec3::new(EDGE, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, EDGE),
+            Vec3::new(EDGE, HEIGHT, EDGE),
+        ],
+        normals: vec![Vec3::Y; 4],
+        uvs: Some(vec![Vec2::ZERO; 4]),
+        indices: vec![0, 2, 1, 1, 2, 3],
+        sections: vec![Span { first: 0, count: 6 }],
+        ..Default::default()
+    };
+    let records: Vec<Placement> = (0..5000)
+        .map(|_| Placement {
+            position: [
+                rng.range(0.0, 256.0),
+                rng.range(0.0, 30.0),
+                rng.range(0.0, 256.0),
+            ],
+            linear: Linear::Scaled {
+                rotation: rotation(&mut rng).to_array(),
+                scale: [rng.range(0.9, 1.1) as f32; 3],
+            },
+            prototype: 0,
+        })
+        .collect();
+    let a = cook(vec![
+        mesh_asset("kit/pebble", pebble),
+        AssetSpec {
+            name: "field".into(),
+            source: Source::Instances(Instances {
+                records: records.clone(),
+                prototypes: vec![PrototypeSpec {
+                    model: "kit/pebble".into(),
+                    ..Default::default()
+                }],
+                user: (0..5000u32).flat_map(u32::to_le_bytes).collect(),
+                user_stride: 4,
+                ..Default::default()
+            }),
+        },
+    ])
+    .unwrap();
+    let e = pages(&a)[0];
+    let (head, blob, user) = (read(&a, e, 0), read(&a, e, 1), read(&a, e, 2));
+    let h = InstancePageInfo::parse(&head).unwrap().header;
+    let (raw, table) = instance::records(&h, &blob).unwrap();
+    assert!(table.is_empty());
+    let bounds = Aabb {
+        min: [0.0; 3],
+        max: [EDGE, HEIGHT, EDGE],
+    };
+    let (cell, decoded) = instance::decode(&head, &blob).unwrap();
+    for (k, (r, (_, m))) in raw.iter().zip(decoded).enumerate() {
+        let i = u32::from_le_bytes(user[4 * k..4 * k + 4].try_into().unwrap()) as usize;
+        assert_placed(r, &records[i], cell, m, &bounds);
+    }
 }

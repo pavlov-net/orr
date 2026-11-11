@@ -1,8 +1,8 @@
 {
   "Cluster": "::orr_pack::mesh::Cluster",
+  "ExactRow": "::orr_pack::AffineRows",
   "InstancePageHeader": "::orr_pack::instance::InstancePageHeader",
   "InstanceRecord": "::orr_pack::instance::InstanceRecord",
-  "LinearRows": "::orr_pack::instance::LinearRows",
   "PageHeader": "::orr_pack::mesh::PageHeader",
   "StoredPage": "::orr_pack::mesh::StoredPage",
   "VolumeGpu": "::orr_pack::volume::VolumeGpu",

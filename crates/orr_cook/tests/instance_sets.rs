@@ -6,9 +6,8 @@
 //! `ORR_SCATTER_SET=<dir>`: every `chunk_*.bin` in `dir`, each a varint record count, then
 //! per record an id, a prototype and a layer as varints and ten f32 (position, rotation
 //! x y z w, scale). Prototypes all place one fixture model. Cooks one archive at cell_log2 8
-//! and checks every record's position, rotation and scale error against the format's bounds:
-//! half a step plus the f32 spacing, 0.17 degrees, and half a step of the page's log2 scale
-//! range.
+//! and checks that every compact record puts the fixture within half its grid step, at the
+//! copy's scale, of where its placement does, and counts the records that take exact rows.
 //!
 //! `cargo test --release -p orr_cook --test instance_sets -- --ignored --nocapture`
 
@@ -20,9 +19,9 @@ use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, Instances, Linear, Manifest, Placement, PrototypeSpec,
     Source,
 };
-use orr_math::{DQuat, DVec3, Quat, Vec3};
+use orr_math::{DAffine3, DQuat, DVec3, Quat, Vec3};
 use orr_pack::instance::{self, InstancePageInfo};
-use orr_pack::{Archive, Class, Target};
+use orr_pack::{Aabb, Archive, Class, Target};
 
 fn varint(d: &[u8], p: &mut usize) -> u64 {
     let mut v = 0;
@@ -60,11 +59,6 @@ fn read_chunk(d: &[u8]) -> Vec<Record> {
         .collect();
     assert_eq!(p, d.len(), "trailing bytes");
     records
-}
-
-/// Spacing of f32 values at `v`: the decode's own rounding adds up to this to the half step.
-fn ulp(v: f32) -> f32 {
-    v.abs().next_up() - v.abs()
 }
 
 #[test]
@@ -146,9 +140,12 @@ fn scatter_set_cooks_within_its_error_bounds() {
         .enumerate()
         .map(|(i, f)| (f.file_stem().unwrap().to_string_lossy().into_owned(), i))
         .collect();
-    let (mut pages, mut records, mut split) = (0, 0, 0);
-    let (mut pos_err, mut pos_abs, mut rot_err, mut scale_err) = (0f64, 0f64, 0f64, 0f64);
-    let (mut wide, mut widest) = (0, 0f32);
+    let (mut pages, mut records, mut split, mut rows) = (0, 0, 0, 0);
+    let (mut worst, mut worst_row) = (0f64, 0f64);
+    let block = Aabb {
+        min: [0.0; 3],
+        max: [1.0; 3],
+    };
     for e in a
         .entries()
         .iter()
@@ -166,43 +163,29 @@ fn scatter_set_cooks_within_its_error_bounds() {
         };
         let (head, recs, user) = (read(0), read(1), read(2));
         let h = InstancePageInfo::parse(&head).unwrap().header;
-        let range = h.log2_scale_max - h.log2_scale_min;
-        widest = widest.max(range);
-        wide += usize::from(range > 2046.0 * 1.002f32.log2());
-        // Half a 10-bit step of the page's log2 range, plus f32 rounding.
-        let scale_bound = (f64::from(range) / 2046.0).exp2() - 1.0 + 1e-5;
+        let (raw, _) = instance::records(&h, &recs).unwrap();
         let corner = DVec3::from(h.cell.map(f64::from)) * 256.0;
-        let half = h.extent.map(|e| f64::from(e) / 65535.0 / 2.0);
         let (_, decoded) = instance::decode(&head, &recs).unwrap();
-        for (k, (_, m)) in decoded.enumerate() {
+        for (k, (record, (_, m))) in raw.iter().zip(decoded).enumerate() {
             let r =
                 &recs_src[u32::from_le_bytes(user[4 * k..4 * k + 4].try_into().unwrap()) as usize];
-            for ax in 0..3 {
-                let want = f64::from(r.f[ax]) - corner[ax];
-                let got = m.translation[ax];
-                let err = (f64::from(got) - want).abs();
-                assert!(
-                    err <= half[ax] + f64::from(ulp(got)),
-                    "{name}: axis {ax} error {err}, want {want} got {} origin {:?} extent {:?}",
-                    got,
-                    h.origin,
-                    h.extent
-                );
-                pos_err = pos_err.max(err / (half[ax] + f64::from(ulp(got))));
-                pos_abs = pos_abs.max(err);
-            }
-            let mut cols = [0, 1, 2].map(|c| m.matrix3.col(c).as_dvec3());
-            for (c, v) in cols.iter_mut().enumerate() {
-                let s = v.length();
-                let err = (s / f64::from(r.f[7 + c]) - 1.0).abs();
-                assert!(err <= scale_bound, "{name}: scale error {err}");
-                scale_err = scale_err.max(err);
-                *v /= s;
-            }
             let q = DQuat::from_xyzw(r.f[3].into(), r.f[4].into(), r.f[5].into(), r.f[6].into())
                 .normalize();
-            let d = DQuat::from_mat3(&orr_math::DMat3::from_cols(cols[0], cols[1], cols[2]));
-            rot_err = rot_err.max(q.angle_between(d).to_degrees());
+            let s = Vec3::new(r.f[7], r.f[8], r.f[9]).as_dvec3();
+            let at = DVec3::new(r.f[0].into(), r.f[1].into(), r.f[2].into()) - corner;
+            let want = DAffine3::from_scale_rotation_translation(s, q, at);
+            let placed =
+                DAffine3::from_mat3_translation(m.matrix3.as_dmat3(), m.translation.as_dvec3());
+            let error = instance::displacement(&want, &placed, &block);
+            if record.exact_row().is_some() {
+                rows += 1;
+                worst_row = worst_row.max(error);
+            } else {
+                // Half the block's grid step at the copy's scale.
+                let bound = 0.5 / 2048.0 * s.abs().min_element();
+                assert!(error <= bound, "{name}: a compact record moves {error} m");
+                worst = worst.max(error / bound);
+            }
         }
         pages += 1;
         records += usize::from(h.record_count);
@@ -215,13 +198,7 @@ fn scatter_set_cooks_within_its_error_bounds() {
         std::fs::metadata(&out).unwrap().len()
     );
     println!(
-        "max position error {pos_abs:.6} m, {pos_err:.4} of (half step + f32 spacing); rotation {rot_err:.4} deg; scale {:.4}%",
-        scale_err * 100.0
-    );
-    println!(
-        "pages whose scale range puts a half step over 0.2%: {wide}; widest range {:.3}x",
-        widest.exp2()
+        "{rows} records in exact rows; compact records at {worst:.4} of their tolerance, rows moving points up to {worst_row:.2e} m"
     );
     assert_eq!(split, 0, "a page split");
-    assert!(rot_err <= 0.17);
 }

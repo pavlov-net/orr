@@ -30,7 +30,7 @@ use orr_gpu::{
 };
 use orr_math::{Affine3, DMat4, DVec2, DVec3, DVec4, Mat3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_pack::clip::Clip;
-use orr_pack::instance::{InstanceRecord, LinearRows, MOTION_WINDOW_BYTES, MotionRow};
+use orr_pack::instance::{InstanceRecord, MOTION_WINDOW_BYTES, MotionRow};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{Cluster, Group, MeshInfo, PageView, decode_page};
 use orr_pack::model::ModelInfo;
@@ -10197,7 +10197,7 @@ fn row_pages(
     PageId,
     orr_pack::instance::InstancePageInfo,
     Vec<InstanceRecord>,
-    Vec<LinearRows>,
+    Vec<AffineRows>,
 )> {
     let a = Archive::from_memory(Arc::clone(pack())).unwrap();
     let mut out = Vec::new();
@@ -10267,7 +10267,9 @@ fn a_cooked_page_draws_and_traces_like_its_placements() {
     let mut w = finest_world();
     let pages = row_pages(&w);
     let (near, near_info, near_records, near_table) = &pages[0];
-    assert_eq!(near_table.len(), 4);
+    // The sheared balls and those turned off the axes hold rows; the unturned one is compact.
+    assert!(near_table.len() >= 4);
+    assert!(near_records.iter().any(|r| r.exact_row().is_none()));
     let far = pages.last().unwrap().0;
     assert_ne!(*near, far, "the pack has a page per cell");
     let eye = DVec3::new(9.0, 6.0, 26.0);

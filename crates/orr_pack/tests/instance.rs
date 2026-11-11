@@ -1,9 +1,10 @@
-use orr_math::{DVec4, Mat3, Quat, Vec3, Vec4};
+use orr_math::{Affine3, DAffine3, DMat3, DQuat, DVec3, DVec4, Mat3, Quat, Vec3, Vec4};
 use orr_pack::instance::{
-    self, AXIS_ROTATIONS, InstancePageHeader, InstancePageInfo, InstanceRecord, LinearRows,
-    MotionRow, Prototype, SectionOverride, axis_rotation, decode_rotation, encode_rotation,
-    exact_axis_index, instance_rotation,
+    self, AXIS_ROTATIONS, InstancePageHeader, InstancePageInfo, InstanceRecord, MotionRow,
+    Prototype, SectionOverride, axis_rotation, decode_rotation, encode_rotation, exact_axis_index,
+    instance_rotation,
 };
+use orr_pack::{Aabb, AffineRows};
 
 struct Rng(u64);
 impl Rng {
@@ -29,18 +30,19 @@ fn angle_deg(q: [f64; 4], d: [f32; 4]) -> f64 {
 
 #[test]
 fn layouts_match_the_gpu_structs() {
-    assert_eq!(size_of::<InstancePageHeader>(), 196);
+    assert_eq!(size_of::<InstancePageHeader>(), 208);
     assert_eq!(size_of::<MotionRow>(), 88);
     assert_eq!(size_of::<Prototype>(), 32);
     assert_eq!(size_of::<SectionOverride>(), 20);
     assert_eq!(size_of::<InstanceRecord>(), 20);
-    assert_eq!(size_of::<LinearRows>(), 36);
-    assert_eq!(std::mem::offset_of!(InstancePageHeader, user_stride), 52);
-    assert_eq!(std::mem::offset_of!(InstancePageHeader, partitions), 56);
+    assert_eq!(size_of::<AffineRows>(), 48);
+    assert_eq!(std::mem::offset_of!(InstancePageHeader, user_stride), 64);
+    assert_eq!(std::mem::offset_of!(InstancePageHeader, partitions), 68);
     assert_eq!(std::mem::offset_of!(InstanceRecord, rot), 8);
+    assert_eq!(std::mem::offset_of!(InstanceRecord, fine), 18);
 }
 
-/// A page of a compact record and two table rows, one of which holds a mirrored shear.
+/// A page of a compact record and two exact rows, one of which holds a mirrored shear.
 fn sheared_page() -> (InstancePageInfo, Vec<u8>) {
     let shear = Mat3::from_cols(
         Vec3::new(1.0, 0.25, -0.5),
@@ -54,17 +56,20 @@ fn sheared_page() -> (InstancePageInfo, Vec<u8>) {
         rot,
         scale: InstanceRecord::INDEXED,
         rank,
-        _pad: 0,
+        fine: 0,
     };
     let records = [
         record([0, 0, 0], 0, 0),
         record([65535, 0, 0], AXIS_ROTATIONS, 1),
         record([0, 65535, 0], AXIS_ROTATIONS + 1, 2),
     ];
-    let table = [LinearRows::from(shear), LinearRows::from(mirrored)];
+    let row =
+        |m: Mat3| AffineRows::from(Affine3::from_mat3_translation(m, Vec3::new(1.0, 2.0, 3.0)));
+    let table = [row(shear), row(mirrored)];
     let info = InstancePageInfo {
         header: InstancePageHeader {
             extent: [8.0; 3],
+            step: [2f32.powi(-18); 3],
             record_count: records.len() as u16,
             ..bytemuck::Zeroable::zeroed()
         },
@@ -91,7 +96,7 @@ fn a_table_that_does_not_match_its_records_is_malformed() {
     assert!(instance::decode(&head, &blob).is_ok());
     // A row short, and one of the two rows gone with a record still naming it.
     assert!(instance::decode(&head, &blob[..blob.len() - 4]).is_err());
-    assert!(instance::decode(&head, &blob[..blob.len() - 36]).is_err());
+    assert!(instance::decode(&head, &blob[..blob.len() - 48]).is_err());
     // Fewer bytes than the header's records.
     assert!(instance::decode(&head, &blob[..16]).is_err());
 }
@@ -114,8 +119,8 @@ fn rotations_decode_within_the_bound() {
         cases.push(q.map(|c| -c));
     }
     let h = std::f64::consts::FRAC_1_SQRT_2;
-    // Two or four components tie for the largest, components at +-1/sqrt(2), zeros (not on
-    // the grid), single axes and turns about one axis.
+    // Two or four components tie for the largest, components at +-1/sqrt(2), zeros, single
+    // axes and turns about one axis.
     cases.extend([
         [h, 0.0, 0.0, h],
         [-h, 0.0, 0.0, h],
@@ -131,6 +136,15 @@ fn rotations_decode_within_the_bound() {
         cases.push([0.0, a.sin(), 0.0, a.cos()]);
         cases.push([a.sin(), 0.0, 0.0, a.cos()]);
     }
+    // Every axis, both senses, in steps of a tenth of a degree.
+    for axis in 0..3 {
+        for i in -1800..=1800 {
+            let a = f64::from(i).to_radians() * 0.05;
+            let mut q = [0.0; 4];
+            (q[axis], q[3]) = (a.sin(), a.cos());
+            cases.push(q);
+        }
+    }
     let mut worst = 0f64;
     for q in &cases {
         let code = encode_rotation(q.map(|c| c as f32));
@@ -140,11 +154,74 @@ fn rotations_decode_within_the_bound() {
         let e = angle_deg(*q, d);
         assert!(e <= ROTATION_BOUND_DEG, "{q:?} -> {d:?}: {e} deg");
         worst = worst.max(e);
+        // A component that is 0 stays 0, so a turn about one axis stays about it.
+        for i in 0..4 {
+            if q[i] == 0.0 {
+                assert_eq!(d[i], 0.0, "{q:?} -> {d:?}");
+            }
+        }
     }
     assert!(
         worst > 0.1,
         "worst {worst} deg: the cases miss the coarse corners of the grid"
     );
+}
+
+/// The displacement over a box is the farthest any of its points moves: no point inside moves
+/// farther, and a corner moves that far.
+#[test]
+fn displacement_is_the_farthest_a_point_of_the_box_moves() {
+    let mut rng = Rng(0x5851_f42d_4c95_7f2d);
+    let mut range = |lo: f64, hi: f64| lo + (hi - lo) * rng.unit();
+    for _ in 0..2000 {
+        let turn = DQuat::from_xyzw(
+            range(-1.0, 1.0),
+            range(-1.0, 1.0),
+            range(-1.0, 1.0),
+            range(-1.0, 1.0),
+        )
+        .normalize();
+        let scale = DVec3::new(range(0.1, 3.0), range(0.1, 3.0), range(-3.0, 3.0));
+        let t = DVec3::new(
+            range(-300.0, 300.0),
+            range(-300.0, 300.0),
+            range(-300.0, 300.0),
+        );
+        let source = DAffine3::from_scale_rotation_translation(scale, turn, t);
+        let nudge = DMat3::from_cols_array(&[0; 9].map(|_: u8| range(-1e-3, 1e-3)));
+        let shift = DVec3::new(range(-1e-3, 1e-3), range(-1e-3, 1e-3), range(-1e-3, 1e-3));
+        let placed =
+            DAffine3::from_mat3_translation(source.matrix3 + nudge, source.translation + shift);
+        let lo = DVec3::new(range(-30.0, 30.0), range(-30.0, 30.0), range(-30.0, 30.0));
+        let hi = lo + DVec3::new(range(0.0, 40.0), range(0.0, 40.0), range(0.0, 40.0));
+        let bounds = Aabb {
+            min: lo.as_vec3().to_array(),
+            max: hi.as_vec3().to_array(),
+        };
+        let (lo, hi) = (
+            Vec3::from(bounds.min).as_dvec3(),
+            Vec3::from(bounds.max).as_dvec3(),
+        );
+        let moved = |p: DVec3| {
+            placed
+                .transform_point3(p)
+                .distance(source.transform_point3(p))
+        };
+        let d = instance::displacement(&source, &placed, &bounds);
+        let corners = (0..8).map(|c| {
+            DVec3::new(
+                if c & 1 != 0 { hi.x } else { lo.x },
+                if c & 2 != 0 { hi.y } else { lo.y },
+                if c & 4 != 0 { hi.z } else { lo.z },
+            )
+        });
+        let farthest = corners.map(moved).fold(0.0, f64::max);
+        assert!((d - farthest).abs() <= 1e-9 * d, "{d} against {farthest}");
+        for _ in 0..64 {
+            let p = lo + (hi - lo) * DVec3::new(range(0.0, 1.0), range(0.0, 1.0), range(0.0, 1.0));
+            assert!(moved(p) <= d * (1.0 + 1e-9), "{p}: {} past {d}", moved(p));
+        }
+    }
 }
 
 #[test]

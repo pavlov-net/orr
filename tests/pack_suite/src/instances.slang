@@ -6,7 +6,7 @@ struct Root
 {
     InstancePageHeader* header;
     InstanceRecord* records;
-    LinearRows* table;
+    ExactRow* table;
     float4* out; // three rows per record
     uint count;
     uint _pad0;

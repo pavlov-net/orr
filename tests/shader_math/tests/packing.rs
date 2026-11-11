@@ -343,8 +343,14 @@ fn rotations_decode_like_orr_pack() {
         let d = decode_rotation(code);
         let reference = orr_pack::instance::decode_rotation(code);
         for i in 0..4 {
+            // The stored components are exact on both; the dropped one is a square root.
+            let bound = if i == (code >> 30) as usize {
+                1e-7
+            } else {
+                0.0
+            };
             assert!(
-                (d[i] - reference[i]).abs() <= 1e-7,
+                (d[i] - reference[i]).abs() <= bound,
                 "{code:#x}: {d:?} {reference:?}"
             );
         }

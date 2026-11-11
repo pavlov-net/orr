@@ -1956,7 +1956,7 @@ impl<'a> Frame<'a> {
                     count: p.range.count,
                     prototype_count: p.prototype_count,
                     first_entry: p.first_entry,
-                    linear_rows: p.linear_rows,
+                    exact_rows: p.exact_rows,
                     entries_only: u32::from(entries_only),
                     _pad0: 0,
                     _pad1: 0,

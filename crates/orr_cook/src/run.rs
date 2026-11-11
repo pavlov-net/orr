@@ -2011,6 +2011,8 @@ fn mesh_facts(a: &Archive, e: &orr_pack::Entry) -> Option<(Aabb, ModelFacts)> {
             instances: (info.parts.len() as u32).max(1),
             sections: info.sections.len() as u32,
             position_exponent: info.header.position_exponent,
+            finest_exponent: info.header.position_exponent,
+            bounds: info.header.bounds,
         },
     ))
 }
@@ -2026,6 +2028,8 @@ fn subd_facts(a: &Archive, e: &orr_pack::Entry) -> Option<(Aabb, ModelFacts)> {
             instances: 1,
             sections: info.sections.len() as u32,
             position_exponent: i8::MIN,
+            finest_exponent: i8::MIN,
+            bounds: info.header.bounds,
         },
     ))
 }

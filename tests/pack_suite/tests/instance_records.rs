@@ -1,5 +1,6 @@
 //! `orr_pack.instance`'s `decode_instance` on the GPU against `orr_pack::instance::
-//! decode_record`: bit for bit on joined pages, within the GPU's rounding elsewhere.
+//! decode_record`: bit for bit on joined pages, exact rows and compact translations, within the
+//! GPU's rounding for compact linear parts.
 
 use orr_cook::{
     ArchiveSpec, AssetSpec, Instances, Linear, Manifest, MeshInput, Placement, PrototypeSpec,
@@ -8,7 +9,7 @@ use orr_cook::{
 use orr_gpu::MemoryKind;
 use orr_math::{DVec3, Mat3, Quat, Vec2, Vec3};
 use orr_pack::instance::{
-    self, AXIS_ROTATIONS, InstancePageHeader, InstancePageInfo, InstanceRecord, LinearRows,
+    self, AXIS_ROTATIONS, InstancePageHeader, InstancePageInfo, InstanceRecord,
 };
 use orr_pack::material::Material;
 use orr_pack::{AffineRows, Archive, Class, Span, Target};
@@ -20,7 +21,7 @@ use pack_suite::{dispatch, read};
 fn decode_on_gpu(
     header: &InstancePageHeader,
     records: &[InstanceRecord],
-    table: &[LinearRows],
+    table: &[AffineRows],
 ) -> Vec<AffineRows> {
     let d = device();
     let mut h = d
@@ -32,7 +33,7 @@ fn decode_on_gpu(
         .unwrap();
     r.as_mut_slice().unwrap().copy_from_slice(records);
     let mut t = d
-        .gpu_malloc::<LinearRows>(MemoryKind::Upload, table.len().max(1) as u64, "table")
+        .gpu_malloc::<AffineRows>(MemoryKind::Upload, table.len().max(1) as u64, "table")
         .unwrap();
     t.as_mut_slice().unwrap()[..table.len()].copy_from_slice(table);
     let out = d
@@ -65,59 +66,49 @@ fn decode_on_gpu(
         .collect()
 }
 
-/// Largest differences between GPU and CPU decodes over a set of records.
+/// Largest difference between GPU and CPU decodes of compact linear parts, relative to the
+/// record's largest scale.
 #[derive(Debug, Default)]
-struct Spread {
-    /// Linear part, relative to the record's largest scale.
-    linear: f32,
-    /// Translation, relative to the largest `|origin| + extent` axis of the page.
-    translation: f32,
-}
+struct Spread(f32);
 
 impl Spread {
-    fn add(&mut self, header: &InstancePageHeader, gpu: &AffineRows, cpu: &AffineRows) {
-        let scale = (0..3)
-            .flat_map(|r| (0..3).map(move |c| cpu.rows[r][c].abs()))
-            .fold(f32::MIN_POSITIVE, f32::max);
-        let reach = (0..3)
-            .map(|a| header.origin[a].abs() + header.extent[a])
-            .fold(f32::MIN_POSITIVE, f32::max);
-        for (g, c) in gpu.rows.iter().zip(&cpu.rows) {
-            for k in 0..3 {
-                self.linear = self.linear.max((g[k] - c[k]).abs() / scale);
-            }
-            self.translation = self.translation.max((g[3] - c[3]).abs() / reach);
-        }
-    }
-
-    /// The GPU's `exp2` is not correctly rounded (Vulkan allows 3 + 2|x| ulp) and it may
-    /// fuse the decode's multiply-adds; on 621.01 the linear part differs by up to
-    /// 3 ulp at 1.0 and translations by 1 ulp of the page's reach.
+    /// The GPU's `exp2`, `sqrt` and the quaternion's products are not correctly rounded (Vulkan
+    /// allows `exp2` 3 + 2|x| ulp) and it may fuse multiply-adds; on 621.01 the linear part
+    /// differs by up to 3 ulp at 1.0.
     fn assert_within(&self) {
-        let bounds = Spread {
-            linear: 2f32.powi(-20),
-            translation: 2f32.powi(-22),
-        };
-        assert!(
-            self.linear <= bounds.linear && self.translation <= bounds.translation,
-            "{self:?} against {bounds:?}"
-        );
+        let bound = 2f32.powi(-20);
+        assert!(self.0 <= bound, "{} against {bound}", self.0);
     }
 }
 
+/// Exact rows decode as stored and compact translations exactly, the same on both; compact
+/// linear parts add to `spread`.
 fn check_page(
     header: &InstancePageHeader,
     records: &[InstanceRecord],
-    table: &[LinearRows],
+    table: &[AffineRows],
     spread: &mut Spread,
 ) {
     let gpu = decode_on_gpu(header, records, table);
+    let bits = |m: &AffineRows| bytemuck::cast::<_, [u32; 12]>(m.rows);
     for (g, r) in gpu.iter().zip(records) {
         let cpu = AffineRows::from(instance::decode_record(header, table, r));
-        spread.add(header, g, &cpu);
-        if r.linear_row().is_some() {
-            let linear = |m: &AffineRows| m.rows.map(|row| [row[0], row[1], row[2]]);
-            assert_eq!(linear(g), linear(&cpu), "a table row decodes as stored");
+        if r.exact_row().is_some() {
+            assert_eq!(bits(g), bits(&cpu), "an exact row decodes as stored");
+            continue;
+        }
+        let scale = (0..3)
+            .flat_map(|r| (0..3).map(move |c| cpu.rows[r][c].abs()))
+            .fold(f32::MIN_POSITIVE, f32::max);
+        for (g, c) in g.rows.iter().zip(&cpu.rows) {
+            assert_eq!(
+                g[3].to_bits(),
+                c[3].to_bits(),
+                "{r:?}: GPU {g:?}, CPU {c:?}"
+            );
+            for k in 0..3 {
+                spread.0 = spread.0.max((g[k] - c[k]).abs() / scale);
+            }
         }
     }
 }
@@ -172,7 +163,9 @@ fn scattered(rng: &mut Rng) -> Vec<Placement> {
                 .normalize();
                 if i % 2 == 0 { -q } else { q }
             };
-            let scale = if i % 3 == 0 {
+            let scale = if i % 4 == 1 {
+                Vec3::ONE
+            } else if i % 3 == 0 {
                 Vec3::splat(rng.range(0.25, 4.0) as f32)
             } else {
                 Vec3::new(
@@ -274,7 +267,7 @@ fn cooked_pages_decode_alike() {
         .remove(0);
     let a = Archive::from_memory(bytes).unwrap();
     let mut spread = Spread::default();
-    let (mut scattered_pages, mut joined_pages, mut rows) = (0, 0, 0);
+    let (mut scattered_pages, mut joined_pages, mut rows, mut compact) = (0, 0, 0, 0);
     for e in a.entries() {
         if e.class != Class::InstancePage as u16 {
             continue;
@@ -298,10 +291,11 @@ fn cooked_pages_decode_alike() {
         } else {
             scattered_pages += 1;
             rows += table.len();
+            compact += records.iter().filter(|r| r.exact_row().is_none()).count();
             check_page(&header, &records, &table, &mut spread);
         }
     }
-    assert!(scattered_pages >= 3 && joined_pages >= 1 && rows >= 1000);
+    assert!(scattered_pages >= 3 && joined_pages >= 1 && rows >= 1000 && compact >= 50);
     spread.assert_within();
 }
 
@@ -338,8 +332,9 @@ fn edge_codes_decode_alike() {
         cell: [-2, 0, 5],
         origin: [-3.25, 17.0, 0.125],
         extent: [250.5, 40.0, 255.875],
+        step: [2f32.powi(-13), 2f32.powi(-15), 2f32.powi(-13)],
         log2_scale_min: -2.0,
-        log2_scale_max: 3.5,
+        log2_scale_step: 2f32.powi(-8),
         ..bytemuck::Zeroable::zeroed()
     };
     let rotations = edge_rotations()
@@ -357,16 +352,24 @@ fn edge_codes_decode_alike() {
                 rot,
                 scale: s[0] | s[1] << 10 | s[2] << 20 | flags,
                 rank: n as u16,
-                _pad: 0,
+                fine: (n * 4099) as u16 & 0x7fff,
             }
         })
         .collect();
     let table = [
-        LinearRows {
-            rows: [[1.0, 0.5, -0.25], [0.0, 2.0, 0.75], [-0.5, 0.0, 3.0]],
+        AffineRows {
+            rows: [
+                [1.0, 0.5, -0.25, 3.0e-3],
+                [0.0, 2.0, 0.75, 17.5],
+                [-0.5, 0.0, 3.0, -1.0e-7],
+            ],
         },
-        LinearRows {
-            rows: [[-1.0, 0.125, 0.0], [0.375, 1.0, 0.0], [0.0, 0.625, 0.5]],
+        AffineRows {
+            rows: [
+                [-1.0, 0.125, 0.0, 255.9],
+                [0.375, 1.0, 0.0, 0.0],
+                [0.0, 0.625, 0.5, 64.25],
+            ],
         },
     ];
     let mut spread = Spread::default();
