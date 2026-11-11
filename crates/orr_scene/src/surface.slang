@@ -52,7 +52,7 @@ public struct SurfaceInput
     public uint surface;            // linked surface id; 0 = StandardSurface
     public UvFootprint uv[2];       // per uv set; producer and patch geometry give both its one uv, but for a subdivision copy holding uv set 1
     public float3 geometric_normal; // the triangle's front face
-    public bool back_face;          // the ray met the back of a double-sided material
+    public bool back_face;          // the ray met the triangle's back
     public bool swapped;            // `material` is the section material's back
     public float3 normal;           // interpolated vertex normal, unit
     public float3 frame_normal;     // `normal` before normalizing, not always unit
@@ -226,7 +226,7 @@ public void material_opacity_feedback(SurfaceInput i)
 // MikkTSpace's bakers invert this transform: the interpolated normal and tangent as they stand,
 // neither unit nor perpendicular. A map of mesh space directions takes the material's
 // `object_frame`, then the placement's normal transform, and the side `i.normal` faces where a
-// double-sided back face turned it.
+// back face turned it.
 public float3 material_normal(SurfaceInput i, MaterialGpu* m, uint slot = TEXTURE_NORMAL)
 {
     if (!material_bound(m, slot))

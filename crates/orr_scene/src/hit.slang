@@ -338,8 +338,8 @@ float4 triangle_tangent(Corners t, uint attributes, uint set, float3 w, float3x3
 
 // The geometry of `i` at barycentrics `b` of triangle `t` placed by `pl`, with `attributes`
 // the mesh's MESH_* flags: both uv sets and their footprints from the barycentric steps `bx` and `by` of one footprint width, normals and
-// tangent frame in render space (back faces of double-sided materials turned toward the
-// ray `d`, but for a dielectric's, which stay on its front so a ray knows the way it crosses),
+// tangent frame in render space (back faces turned toward the ray `d`, but for a dielectric's,
+// which stay on its front so a ray knows the way it crosses),
 // and the object-space position and normal. `material` is the section's, and the frame follows
 // the material of the side `d` meets. Without mesh tangents on the uvs that frame follows, as
 // where a copy's material replaces the section's, the tangent follows the triangle's uv in
@@ -378,7 +378,7 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
     for (uint c = 0; c < 3; c++)
         frame += w[c] * unit_direction(mul(normals, t.attributes[c].normal), ng);
     float3 n = safe_normalize(frame, ng);
-    i.back_face = dot(ng, d) > 0.0 && (scene.materials[material].flags & MATERIAL_DOUBLE_SIDED) != 0;
+    i.back_face = dot(ng, d) > 0.0;
     MaterialGpu* side = scene.materials + side_material(scene, material, i);
     float3 coat_frame = frame;
     float4 tangent = triangle_tangent(t, attributes, side.tangent_set, w, unit, mirror, e1, e2, n, frame);
@@ -606,7 +606,6 @@ public struct SurfaceHit
     public uint3 vertex_user;     // per corner
     public float geometric_error; // m: the hit cluster's LOD error times the instance scale
     public float depth_offset;    // m, along the ray
-    public bool back_face;        // on a double-sided material's back
     public bool swapped;          // `surface.material` is the section material's back
     public uint section;          // the section's material, which owns the surface's interior
     public bool valid;            // false for hits on entries this module does not resolve
@@ -918,6 +917,9 @@ public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     float offset;
     GSurface g = S.surface(h.input, offset);
     offset = max(offset, 0.0);
+    // The back of a single-sided material emits nothing.
+    if (h.input.back_face && (s.materials[h.section].flags & MATERIAL_DOUBLE_SIDED) == 0)
+        g.bsdf.emission = float3(0.0);
     MaterialGpu* m = s.materials + h.input.material;
     g.position = h.input.position + d * offset;
     g.raster_error = 0.0;
@@ -935,7 +937,6 @@ public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     hit.cluster_user = h.input.cluster_user;
     hit.vertex_user = h.input.vertex_user;
     hit.depth_offset = offset;
-    hit.back_face = h.input.back_face;
     hit.swapped = h.input.swapped;
     hit.section = h.section;
     hit.valid = true;

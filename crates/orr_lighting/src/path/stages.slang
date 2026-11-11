@@ -12,7 +12,7 @@
 // shades and never stores.
 //
 // A path runs from its start through the kernel's linked surface and medium, and its record
-// sees its vertices. With `CACHE_TERMINATE`, a front-face hit that the record allows, reached by
+// sees its vertices. With `CACHE_TERMINATE`, an opaque hit that the record allows, reached by
 // a ray longer than `CACHE_MIN_RAY_CELLS` edges of its cell, ends in its resolved cell unless
 // light leaves it as a caustic. A path's radiance is unexposed; the G-buffer's emission is
 // already pre-exposed, and a camera ray that met nothing leaves its throughput for the sky.
@@ -1966,7 +1966,6 @@ bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, ino
     LocalLights* ray_local = nullptr;
     if (ray.local)
         ray_local = pixel_local_lights(r, pixel);
-    bool front = true;
     EmitterHit emitter = (EmitterHit)0;
     bool swapped = false;
     if (gbuffer)
@@ -1989,9 +1988,6 @@ bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, ino
             return false;
         if (!first)
             p.cone = cone_after_hit(p.cone, t, 0.0);
-        // Back faces of single-sided surfaces never emit; double-sided hits face the ray.
-        float cos_light = dot(sh.surface.geometric_normal, ray.dir);
-        front = sh.back_face || cos_light < 0.0;
         if (layer)
         {
             p.layers++;
@@ -2027,15 +2023,15 @@ bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, ino
     sv.b = prepare_vertex(s, sv.l, c.interior, collapse, walks, record.adjoint(), c.spectral.hero());
     if (first)
         record.arrive(r, sv.l.x, sv.b, start_vertex ? 0.0 : gbuffer ? length(sv.l.x.surface.position - v.eye_render.xyz) : t, layer);
-    // Emission seen from the side that emits, weighed against the light set's sampling of the
-    // point, which takes its density from the vertex the ray left; a point the light set never
-    // draws takes weight 1, and as no photon leaves it, the whole of its light.
+    // Emission, which the hit gives only on a side that emits, weighed against the light set's
+    // sampling of the point, which takes its density from the vertex the ray left; a point the
+    // light set never draws takes weight 1, and as no photon leaves it, the whole of its light.
     if (gbuffer)
     {
         if (counted)
             record.expose(p.throughput * sv.b.emission());
     }
-    else if (may(MAY_EMISSIVE) && (x.count_bsdf || (first && !x.photon)) && counted && front && any(sv.b.emission() > 0.0))
+    else if (may(MAY_EMISSIVE) && (x.count_bsdf || (first && !x.photon)) && counted && any(sv.b.emission() > 0.0))
     {
         if (!first && (weigh || any(own != 1.0)))
             emitter = emitter_hit(set, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, swapped);
@@ -2061,7 +2057,7 @@ bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, ino
     }
     // The cache holds a vertex's light by its albedo, which a caustic through it would count
     // again in the photons a vertex before it gathers.
-    if (alive && x.cache && front && !first && !sv.l.chains)
+    if (alive && x.cache && !first && !sv.l.chains)
     {
         CacheCell cell = cache_cell(r.cache, s, sv.l.x.surface.position, sv.l.x.surface.geometric_normal, rng.next4().xyz, true);
         float3 cached;

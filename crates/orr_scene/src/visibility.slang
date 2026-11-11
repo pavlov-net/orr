@@ -561,8 +561,8 @@ float strand_ray(ProducerBatch b, Placement pl, float3 d, inout uint segment)
 // The surface input where the ray through `pixel_center` (render pixels) meets triangle
 // `triangle` of `vc`: barycentrics and their screen gradients from the ray and its
 // one-pixel neighbors, uv footprint with the view's mip bias and texture tap, normals and
-// tangent frame in render space (back faces of double-sided materials turned to the
-// viewer), and the world cell. Without mesh tangents the tangent follows the triangle's uv.
+// tangent frame in render space (back faces turned to the viewer, as `triangle_geometry`
+// turns them), and the world cell. Without mesh tangents the tangent follows the triangle's uv.
 // On a strand entry's ribbon the ray meets the strand's swept spheres instead
 // (`strand_ray`); the input is a strand hit's (`strand_geometry`).
 public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc, uint triangle, float2 pixel_center)

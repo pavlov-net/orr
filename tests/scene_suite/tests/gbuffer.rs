@@ -11342,9 +11342,9 @@ fn models_state_their_specular_and_tint() {
 
 /// A hit's vertex color weighs each corner by its barycentric, and its normals stay on the side
 /// a mirrored placement puts them, at sizes whose determinant is outside a float's range and on
-/// triangles whose area is. A ray from behind a double-sided material meets the whole frame
-/// reversed toward it, the tangent and bitangent with the normals, but for a dielectric's, and
-/// the material of the back.
+/// triangles whose area is. A ray from behind meets the whole frame reversed toward it, the
+/// tangent and bitangent with the normals, on a single-sided material as on a double-sided one,
+/// but for a dielectric's; it meets a double-sided material's back.
 #[test]
 fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
     use orr_pack::material::slot;
@@ -11375,6 +11375,9 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         m.flags |= orr_scene::material_flags::THIN_WALLED;
         m
     };
+    let single = MaterialGpu::new(&Material::default(), &[BoundTexture::NONE; slot::COUNT]);
+    let mut single_glass = single;
+    single_glass.flags |= orr_scene::material_flags::DIELECTRIC;
     // The section material's walls decide the interior: a thin back on a solid front leaves it,
     // and a solid back on a thin front has none.
     let records = [
@@ -11384,6 +11387,8 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         thin(glass(back, 2)),
         thin(glass(front, 4)),
         glass(back, 4),
+        single,
+        single_glass,
     ];
     let materials = upload(bytemuck::cast_slice(&records), "materials");
     let scene = upload(
@@ -11412,6 +11417,11 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         (1.0, 1.0, -1.0, 2),
         (1.0, 1.0, 1.0, 4),
         (1.0, 1.0, -1.0, 4),
+        (1.0, 1.0, 1.0, 6),
+        (1.0, 1.0, -1.0, 6),
+        (1e-16, 1.0, -1.0, 6),
+        (1.0, 1.0, 1.0, 7),
+        (1.0, 1.0, -1.0, 7),
     ] {
         let out = d
             .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, 6, "out")
@@ -11437,10 +11447,11 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
             panic!("six rows");
         };
         assert_eq!(color, [0.25, 0.25, 0.5, 0.6875], "{size}");
-        let turned = if first == 0 { side } else { 1.0 };
+        let dielectric = matches!(first, 2 | 4 | 7);
+        let turned = if dielectric { 1.0 } else { side };
         let up = |n: [f32; 4]| Vec4::from(n).abs_diff_eq(Vec4::Z * turned, 1e-5);
-        assert!(up(geometric), "{size}: {geometric:?}");
-        assert!(up(normal), "{size}: {normal:?}");
+        assert!(up(geometric), "{size} {first}: {geometric:?}");
+        assert!(up(normal), "{size} {first}: {normal:?}");
         // The triangle's u grows along -x and its v shrinks along -y.
         for t in [tangent, coat] {
             let along = Vec3::from_slice(&t[..3]);
@@ -11454,9 +11465,17 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
                 "{size} {first}: bitangent {across}"
             );
         }
-        let shown = first + u32::from(side < 0.0);
-        assert_eq!(material[0], shown as f32, "{size}");
-        assert_eq!(material[1], f32::from(u8::from(first == 2)), "{size}");
+        let shown = if first >= 6 {
+            first
+        } else {
+            first + u32::from(side < 0.0)
+        };
+        assert_eq!(material[0], shown as f32, "{size} {first}");
+        assert_eq!(
+            material[1],
+            f32::from(u8::from(first == 2 || first == 7)),
+            "{size} {first}"
+        );
     }
     assert_clean();
 }

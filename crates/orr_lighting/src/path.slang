@@ -353,8 +353,9 @@ public bool sides_agree(float3 n, float3 ng, float3 wi)
     return dot(wi, n) * dot(wi, ng) > 0.0;
 }
 
-// The vertex of a resolved hit of a ray along `dir`: the shading normal leaned toward the
-// ray's origin and the geometric normal facing it.
+// The vertex of a resolved hit of a ray along `dir`, whose frame the hit turned toward the ray
+// on a back face: the shading normal leaned toward the ray's origin where a normal map tilts it
+// away, and the geometric normal facing it.
 public PathVertex hit_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
 {
     PathVertex x;
@@ -1360,7 +1361,7 @@ public struct LayerRay
 // What a path records about its vertices as it traces them.
 public interface IPathRecord
 {
-    // Whether a front-face hit past `scattered` opaque vertices and scatters (x1 is the first)
+    // Whether an opaque hit past `scattered` opaque vertices and scatters (x1 is the first)
     // may end the path in the cache, given that the ray reaching it left a diffuse lobe, that
     // its cone is wider than the hit's cell, and that it is the last bounce's.
     bool may_end(uint scattered, bool diffuse, bool wide, bool last);

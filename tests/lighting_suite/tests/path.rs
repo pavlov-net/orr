@@ -890,6 +890,110 @@ fn a_normal_map_takes_no_light_through_its_surface() {
     assert_clean();
 }
 
+/// The single-sided floor turned over, so the sun lights its back, shows in a mirror as its
+/// front does there: a ray that reaches a single-sided surface's back shades it as the front.
+#[test]
+fn a_single_sided_floor_shows_its_back_in_a_mirror_lit_as_its_front() {
+    const MIRROR_Z: f32 = -1.5;
+    let spec = |floor: Mat3| Spec {
+        copies: vec![
+            at(FLOOR, floor, Vec3::ZERO),
+            at(MIRROR, Mat3::IDENTITY, Vec3::new(0.0, 1.0, MIRROR_Z)),
+        ],
+        lights: vec![Light::Directional(SUN)],
+        environment: None,
+        eye: Vec3::new(2.0, 1.6, 3.0),
+        target: Vec3::new(0.3, 0.5, MIRROR_Z),
+        fov_y: 0.8,
+        focus: None,
+    };
+    let upright = spec(Mat3::IDENTITY);
+    let patch = pixel_of(&upright, Vec3::new(0.0, 0.0, 2.0 * MIRROR_Z - 0.6));
+    let p = paths(reference(2));
+    let lit = |spec: Spec| {
+        let mut bed = Bed::with(spec);
+        bed.set_pre_exposure(1.0 / 64.0);
+        render_paths(&mut bed, &p, 16, 1).around(patch, 4)
+    };
+    let front = lit(upright);
+    let back = lit(spec(Mat3::from_diagonal(Vec3::new(1.0, -1.0, -1.0))));
+    assert!(front[1] > 0.0, "the front in the mirror: {front:?}");
+    assert_close("the back in the mirror", back, front, 0.03);
+    assert_clean();
+}
+
+/// A floor whose normal map tilts texels away from a grazing view keeps every texel sunlit where
+/// a mirror shows it, so its vertex is resolved from a hit: the shading normal leans toward the
+/// ray on the triangle's front, and only a ray behind the triangle's plane turns the frame. The
+/// sun alone lights it, since a texel turned below the floor would still see a sky.
+#[test]
+fn a_grazing_normal_mapped_floor_in_a_mirror_has_no_black_texels() {
+    const MIRROR_Z: f32 = -1.5;
+    let spec = Spec {
+        copies: vec![
+            at(BUMPY_FLOOR, Mat3::IDENTITY, Vec3::ZERO),
+            at(MIRROR, Mat3::IDENTITY, Vec3::new(0.0, 1.0, MIRROR_Z)),
+        ],
+        eye: Vec3::new(0.0, 0.3, 1.0),
+        target: Vec3::new(0.0, 0.12, MIRROR_Z),
+        fov_y: 0.3,
+        ..sphere_on_ground(vec![Light::Directional(SUN)], None)
+    };
+    // The mirror's rows that show the floor about 3 to 8 m from the eye's image, 2 to 6 degrees
+    // under its view.
+    let rows = [0.2, 0.03].map(|y| pixel_of(&spec, Vec3::new(0.0, y, MIRROR_Z)).y.round() as u32);
+    let mut bed = Bed::with(spec);
+    bed.set_pre_exposure(1.0 / 64.0);
+    let image = render_paths(&mut bed, &paths(ViewLighting::default()), 16, 1);
+    let width = EXTENT[0] as usize;
+    let mut lit: Vec<f64> = image.mean[rows[0] as usize * width..rows[1] as usize * width]
+        .iter()
+        .map(luminance)
+        .collect();
+    lit.sort_by(f64::total_cmp);
+    let median = lit[lit.len() / 2];
+    let black = lit.iter().filter(|&&l| l <= 1e-3 * median).count();
+    assert_eq!(black, 0, "{black} of {} texels are black", lit.len());
+    assert_clean();
+}
+
+/// A single-sided sheet over the floor casts the sun's shadow whichever side faces the sun: rays
+/// meet a single-sided surface's back.
+#[test]
+fn a_single_sided_sheet_shadows_from_either_side() {
+    let sheet = Mat3::from_diagonal(Vec3::splat(0.1));
+    let spec = |linear: Mat3| {
+        over_floor(
+            FLOOR,
+            at(FLOOR, linear, Vec3::Y),
+            vec![Light::Directional(SUN)],
+        )
+    };
+    let to_sun = SUN.direction_to_light;
+    let under = spec(sheet);
+    let shadowed = pixel_of(&under, Vec3::Y - to_sun / to_sun.y);
+    let open = pixel_of(&under, Vec3::new(1.5, 0.0, 1.0));
+    let p = paths(debug(LightingDebugView::NeeOnly, 1));
+    for (side, linear) in [
+        ("front", sheet),
+        (
+            "back",
+            Mat3::from_diagonal(Vec3::new(1.0, -1.0, -1.0)) * sheet,
+        ),
+    ] {
+        let mut bed = Bed::with(spec(linear));
+        bed.set_pre_exposure(1.0 / 64.0);
+        let a = render_paths(&mut bed, &p, 4, 1);
+        let [dark, lit] = [shadowed, open].map(|at| a.around(at, 2)[1]);
+        assert!(lit > 0.0, "{side} to the sun: the open floor {lit}");
+        assert!(
+            dark <= 1e-3 * lit,
+            "{side} to the sun: green {dark} in the shadow, {lit} beside it"
+        );
+    }
+    assert_clean();
+}
+
 /// The floor seen in a mirror takes a cooked emitter's light alike by next-event estimation and
 /// by BSDF rays, under a coat and fuzz too: the floor is then the path's second vertex, which
 /// the plain opaque shade takes, and its next-event estimate passes the winner's light through
