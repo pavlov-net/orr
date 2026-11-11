@@ -1335,7 +1335,7 @@ impl Scenes {
         // Work from earlier frames on this queue finishes before this frame's writes.
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         let moves = core.mounts.streaming.take_moves();
-        for m in &moves {
+        for m in &moves.units {
             // SAFETY: both slots are the streamed pools', held until this frame has completed.
             let (dst, src) = unsafe {
                 (
@@ -1345,7 +1345,22 @@ impl Scenes {
             };
             list.copy(dst, src, m.bytes);
         }
-        if !moves.is_empty() {
+        for t in &moves.tiles {
+            let s = &t.stream;
+            let tile = s.grid.tile(t.tile);
+            let region = s
+                .layout
+                .tile_region(s.texture.desc(), tile.mip, tile.layer, tile.xy);
+            // SAFETY: the tile's place in the scratch its move holds until this frame has
+            // completed.
+            let at = unsafe { GpuPtr::from_address(GpuAddress(t.at)) };
+            if t.out {
+                list.copy_from_texture(at, &s.texture, &region);
+            } else {
+                list.copy_to_texture(&s.texture, &region, at);
+            }
+        }
+        if !moves.units.is_empty() || !moves.tiles.is_empty() {
             list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
         }
         let now = Instant::now();

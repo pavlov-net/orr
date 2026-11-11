@@ -401,7 +401,7 @@ impl Placement {
         self.blocks
             .get(slot.block as usize)
             .and_then(Option::as_ref)
-            .is_some_and(|b| b.ranges.is_free(slot.first + slot.units, slot.units))
+            .is_some_and(|b| !b.draining && b.ranges.is_free(slot.first + slot.units, slot.units))
     }
 
     /// Counts `slot` as retired: its units stay taken until [`Placement::free`], but no longer
@@ -498,6 +498,20 @@ impl Placement {
         self.draining_units
     }
 
+    /// Takes the draining block with the most live units out of the drain, so that it takes
+    /// ranges again; false when no block is draining.
+    fn resume(&mut self) -> bool {
+        let Some(i) = self.draining.pop() else {
+            return false;
+        };
+        let b = self.blocks[i as usize].as_mut().expect("a draining block");
+        b.draining = false;
+        self.by_fill.insert((Reverse(b.used), i));
+        self.draining_units -= u64::from(b.units);
+        self.changed = true;
+        true
+    }
+
     /// A move out of draining block `block` found no room: the block takes ranges again, and
     /// is not chosen to empty until another range is freed.
     fn stuck(&mut self, block: u32) {
@@ -590,7 +604,14 @@ impl Pool {
     ) -> Result<(PoolSlot, Block)> {
         let unit = self.places.unit;
         let units = bytes.max(1).div_ceil(unit) as u32;
-        let slot = match self.places.find(units, align, after) {
+        // A draining block's room is taken before a new block is made.
+        let found = loop {
+            match self.places.find(units, align, after) {
+                None if self.places.resume() => {}
+                found => break found,
+            }
+        };
+        let slot = match found {
             Some(s) => s,
             None => {
                 let block_units = self.places.block_for(units);
@@ -622,7 +643,8 @@ impl Pool {
         Ok((slot, memory.sub(at, bytes)))
     }
 
-    /// Whether the units right after `slot`, as many as it holds, are free.
+    /// Whether the units right after `slot`, as many as it holds, are free to take: free, in a
+    /// block that is not draining.
     pub(crate) fn free_after(&self, slot: PoolSlot) -> bool {
         self.places.free_after(slot)
     }

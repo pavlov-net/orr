@@ -36,14 +36,20 @@
 //! a new slot, the frame copies it there on the GPU before anything else, and the step's writes
 //! point its table entries at the new slot, so the frame reads the copy and the frames before
 //! it the old slot, which returns once this frame has completed.
+//!
+//! A tile is bound to its slot, and frames sample it at every step, so a tile moves over two
+//! steps without leaving its residency map: the first has its frame copy the tile's texels out
+//! to scratch memory; the next binds the tile to its new slot on the render queue, between that
+//! frame's work and its own, and has its frame copy the texels back in before anything samples.
+//! Where the render queue takes no sparse binds, tiles stay where they are.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use orr_gpu::{
-    CommandList, Device, GpuAddress, GpuPtr, Hazards, MemoryKind, QueueKind, SparseBinds, Stages,
-    Texture, TextureRegion, TileBind, TimelinePoint,
+    Allocation, CommandList, Device, GpuAddress, GpuPtr, Hazards, MemoryKind, QueueKind,
+    SparseBinds, Stages, Texture, TextureRegion, TileBind, TimelinePoint,
 };
 use orr_io::{AlignedBuf, SECTOR};
 use orr_pack::mesh::{Group, MeshHeader, StoredPage};
@@ -81,6 +87,10 @@ const MOVES_PER_STEP: usize = 8;
 /// unit: each takes a GPU copy and the writes of its table entries.
 const DRAIN_BYTES: u64 = 8 << 20;
 
+/// Tiles one step starts moving out of the tile pool's draining blocks, at most: each takes a
+/// sparse bind and two copies of its texels.
+const DRAIN_TILES: usize = 64;
+
 /// A unit a step moved: the frame copies `bytes` bytes from `src` to `dst` before anything
 /// reads either.
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +98,33 @@ pub(crate) struct UnitMove {
     pub(crate) dst: u64,
     pub(crate) src: u64,
     pub(crate) bytes: u64,
+}
+
+/// A tile's texels on their way between the tile and scratch memory at `at`: out of the tile
+/// when `out`, else back into it, before anything of the frame samples it.
+pub(crate) struct TileCopy {
+    pub(crate) stream: Arc<TexStream>,
+    pub(crate) tile: u32,
+    pub(crate) at: u64,
+    pub(crate) out: bool,
+}
+
+/// What a step hands its frame to copy first.
+#[derive(Default)]
+pub(crate) struct Moves {
+    pub(crate) units: Vec<UnitMove>,
+    /// The tiles copied back in, then those copied out.
+    pub(crate) tiles: Vec<TileCopy>,
+}
+
+/// Tiles of one texture and the slots they move to.
+type TileSlots = Vec<(u32, PoolSlot)>;
+
+/// Tiles a step started moving: the frame of that step copies each one's texels to its place
+/// in `scratch`, and the next step binds it to `to`.
+struct TileMoves {
+    scratch: Allocation<u8>,
+    tiles: Vec<(Key, PoolSlot)>,
 }
 
 /// The resident units in each block of a pool.
@@ -484,15 +521,25 @@ pub(crate) struct Streaming {
     retired_cuts: Vec<(u64, FineCut)>,
     mounts: FxHashMap<MountId, MountStreams>,
     resident: FxHashMap<Key, Placed>,
-    /// The resident mesh pages by block of the stream pool, and the other pool units by block
-    /// of theirs.
+    /// The resident mesh pages by block of the stream pool, the other pool units by block of
+    /// theirs, and the resident tiles by block of the tile pool.
     page_blocks: BlockUnits,
     unit_blocks: BlockUnits,
-    /// The copies of the units this step moved, until the frame takes them.
-    moves: Vec<UnitMove>,
+    tile_blocks: BlockUnits,
+    /// The copies of the units and tiles this step moved, until the frame takes them.
+    moves: Moves,
+    /// The tiles the last step started moving.
+    tile_moves: Option<TileMoves>,
+    /// Whether the render queue takes the sparse binds that move tiles.
+    moves_tiles: bool,
+    /// The slots moved tiles left and the scratch their texels crossed, freed once the frame
+    /// has completed.
+    retired_tile_slots: Vec<(u64, PoolSlot)>,
+    retired_scratch: Vec<(u64, Allocation<u8>)>,
     /// This manager's part of what the device's residency managers hold on its heaps.
     share: HeapShare,
-    /// The heap index of the stream pool's memory, and of the other pool units'.
+    /// The heap index of the stream pool's and the tile pool's memory, and of the other pool
+    /// units'.
     pool_heaps: [usize; 2],
     /// Pool slots freed once the frame has completed.
     retired: Vec<(u64, PoolSlot)>,
@@ -629,7 +676,12 @@ impl Streaming {
             resident: FxHashMap::default(),
             page_blocks: BlockUnits::default(),
             unit_blocks: BlockUnits::default(),
-            moves: Vec::new(),
+            tile_blocks: BlockUnits::default(),
+            moves: Moves::default(),
+            tile_moves: None,
+            moves_tiles: device.binds_sparse_on(QueueKind::Render),
+            retired_tile_slots: Vec::new(),
+            retired_scratch: Vec::new(),
             share: HeapShare::new(device),
             pool_heaps: {
                 let heap = |kind: MemoryKind| {
@@ -893,10 +945,22 @@ impl Streaming {
                         tile,
                         slot,
                     };
+                    self.tile_blocks.remove(slot.block, k);
                     self.tiles.lock().unwrap().retire(slot);
                     self.retired_tiles.push((frame, free));
                 }
             }
+        }
+        // Its tiles on their way to new slots stay bound where they were, which the frees
+        // above cover, and the slots they would have taken return unused.
+        if let Some(moves) = &mut self.tile_moves {
+            let mut tiles = self.tiles.lock().unwrap();
+            moves.tiles.retain(|&(k, to)| {
+                if k.mount == mount {
+                    tiles.free(to);
+                }
+                k.mount != mount
+            });
         }
         self.unbinding.retain(|k| k.mount != mount);
         self.moving.retain(|k, _| k.mount != mount);
@@ -1602,6 +1666,7 @@ impl Streaming {
         w: &mut Apply<'_>,
     ) -> Result<Vec<TimelinePoint>> {
         let mut points = Vec::new();
+        points.extend(self.finish_tile_moves(frame, w.device)?);
         for mut batch in loading.take_streams(w.device) {
             points.extend(batch.points);
             self.carried.append(&mut batch.unbinds);
@@ -1698,6 +1763,10 @@ impl Streaming {
         for (pool, &heap) in [&self.pool, &self.units].into_iter().zip(&self.pool_heaps) {
             mine[heap][1] += pool.lock().unwrap().plan_drain(over(heap));
         }
+        if self.moves_tiles {
+            let heap = self.pool_heaps[0];
+            mine[heap][1] += self.tiles.lock().unwrap().plan_drain(over(heap));
+        }
         let heaps: Vec<HeapUse> = report
             .heaps
             .iter()
@@ -1770,6 +1839,7 @@ impl Streaming {
         }
         self.compact(frame, w)?;
         self.drain(frame, w)?;
+        self.start_tile_moves(w.device)?;
         for m in self.mounts.values_mut() {
             for t in &mut m.textures {
                 t.write_map(w)?;
@@ -1921,10 +1991,150 @@ impl Streaming {
                     slot,
                 };
                 self.unbinding.insert(k);
+                self.tile_blocks.remove(slot.block, k);
                 self.tiles.lock().unwrap().retire(slot);
                 self.retired_tiles.push((frame - 1, free));
             }
         }
+        Ok(())
+    }
+
+    /// Binds the tiles the last step started moving to their new slots, on the render queue
+    /// after that step's frame, whose list copied their texels out, and has this frame copy
+    /// them back in. Their old slots return once this frame has completed. While the loading
+    /// thread is binding, the moves wait for the next step. Returns the bind's point.
+    fn finish_tile_moves(&mut self, frame: u64, device: &Device) -> Result<Option<TimelinePoint>> {
+        let Some(moves) = &self.tile_moves else {
+            return Ok(None);
+        };
+        let mut per_texture: Vec<(Arc<TexStream>, TileSlots)> = Vec::new();
+        for &(k, to) in &moves.tiles {
+            let m = self
+                .mounts
+                .get_mut(&k.mount)
+                .expect("a moving tile's mount");
+            let (t, tile) = m.tile(k.unit);
+            match per_texture
+                .iter_mut()
+                .find(|(s, _)| Arc::ptr_eq(s, &t.stream))
+            {
+                Some((_, list)) => list.push((tile, to)),
+                None => per_texture.push((Arc::clone(&t.stream), vec![(tile, to)])),
+            }
+        }
+        let mut pool = self.tiles.lock().unwrap();
+        let point = if per_texture.is_empty() {
+            None
+        } else {
+            let lists: Vec<(&TexStream, Vec<TileBind<'_>>)> = per_texture
+                .iter()
+                .map(|(s, list)| {
+                    let binds = list
+                        .iter()
+                        .map(|&(t, to)| {
+                            let tile = s.grid.tile(t);
+                            TileBind {
+                                mip: tile.mip,
+                                layer: tile.layer,
+                                tile: tile.xy,
+                                memory: Some(pool.memory(to)),
+                            }
+                        })
+                        .collect();
+                    (&**s, binds)
+                })
+                .collect();
+            let mut binds = SparseBinds::new();
+            for (s, list) in &lists {
+                binds.tiles(&s.texture, list)?;
+            }
+            let Some(point) = device.try_bind_sparse_on(QueueKind::Render, &binds)? else {
+                return Ok(None);
+            };
+            Some(point)
+        };
+        let TileMoves { scratch, tiles } = self.tile_moves.take().expect("checked above");
+        let base = scratch.gpu().address().0;
+        self.retired_scratch.push((frame, scratch));
+        for (i, &(k, to)) in tiles.iter().enumerate() {
+            let m = self
+                .mounts
+                .get_mut(&k.mount)
+                .expect("a moving tile's mount");
+            let (t, tile) = m.tile(k.unit);
+            self.moves.tiles.push(TileCopy {
+                stream: Arc::clone(&t.stream),
+                tile,
+                at: base + i as u64 * orr_pack::texture::TILE_BYTES as u64,
+                out: false,
+            });
+            let Some(Placed::Tile(from)) = self.resident.insert(k, Placed::Tile(to)) else {
+                unreachable!("a moving tile is resident")
+            };
+            self.tile_blocks.remove(from.block, k);
+            self.tile_blocks.insert(to.block, k);
+            pool.retire(from);
+            self.retired_tile_slots.push((frame, from));
+        }
+        Ok(point)
+    }
+    /// Starts moving resident tiles out of the tile pool's draining blocks, [`DRAIN_TILES`] at
+    /// most: each takes a slot in a block that is not draining, and this frame copies its
+    /// texels to scratch memory. The next step's [`Self::finish_tile_moves`] binds them there.
+    fn start_tile_moves(&mut self, device: &Device) -> Result<()> {
+        if self.tile_moves.is_some() {
+            return Ok(());
+        }
+        let tile_bytes = orr_pack::texture::TILE_BYTES as u64;
+        let mut pool = self.tiles.lock().unwrap();
+        let mut tiles: Vec<(Key, PoolSlot)> = Vec::new();
+        'blocks: for &block in pool.draining().to_vec().iter() {
+            let Some(keys) = self.tile_blocks.0.get(block as usize) else {
+                continue;
+            };
+            for &k in keys {
+                if tiles.len() == DRAIN_TILES {
+                    break 'blocks;
+                }
+                match pool.alloc_moved(tile_bytes, block) {
+                    Some((to, _)) => tiles.push((k, to)),
+                    None => continue 'blocks,
+                }
+            }
+        }
+        drop(pool);
+        if tiles.is_empty() {
+            return Ok(());
+        }
+        let scratch = match device.gpu_malloc::<u8>(
+            MemoryKind::DeviceLocal,
+            tiles.len() as u64 * tile_bytes,
+            "tile moves",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let mut pool = self.tiles.lock().unwrap();
+                for (_, to) in tiles {
+                    pool.free(to);
+                }
+                return Err(e.into());
+            }
+        };
+        let base = scratch.gpu().address().0;
+        for (i, &(k, _)) in tiles.iter().enumerate() {
+            let m = self
+                .mounts
+                .get_mut(&k.mount)
+                .expect("a resident tile's mount");
+            let (t, tile) = m.tile(k.unit);
+            self.moves.tiles.push(TileCopy {
+                stream: Arc::clone(&t.stream),
+                tile,
+                at: base + i as u64 * tile_bytes,
+                out: true,
+            });
+        }
+        self.tile_moves = Some(TileMoves { scratch, tiles });
         Ok(())
     }
 
@@ -1996,7 +2206,7 @@ impl Streaming {
         match self.resident.remove(&k).expect("a resident unit") {
             Placed::Pool(slot, target) => {
                 let from = self.units.lock().unwrap().address(slot);
-                self.moves.push(UnitMove {
+                self.moves.units.push(UnitMove {
                     dst: at,
                     src: from,
                     bytes,
@@ -2007,7 +2217,7 @@ impl Streaming {
                 self.resident.insert(k, Placed::Pool(to, target));
             }
             Placed::MeshPage(mut p) => {
-                self.moves.push(UnitMove {
+                self.moves.units.push(UnitMove {
                     dst: at,
                     src: p.address,
                     bytes,
@@ -2041,9 +2251,9 @@ impl Streaming {
         Ok(())
     }
 
-    /// The copies of the units this step moved, which the frame runs before anything reads
-    /// the scenes' tables.
-    pub(crate) fn take_moves(&mut self) -> Vec<UnitMove> {
+    /// The copies of the units and tiles this step moved, which the frame runs before
+    /// anything reads the scenes' tables or samples a texture.
+    pub(crate) fn take_moves(&mut self) -> Moves {
         std::mem::take(&mut self.moves)
     }
 
@@ -2206,6 +2416,7 @@ impl Streaming {
                         let (t, tile) = m.tile(key.unit);
                         t.resident[tile as usize] = true;
                         t.dirty = true;
+                        self.tile_blocks.insert(slot.block, key);
                         self.resident.insert(key, Placed::Tile(slot));
                     }
                     (_, Some(Placed::Pool(slot, _))) => self.units.lock().unwrap().free(slot),
@@ -2355,6 +2566,16 @@ impl Streaming {
     /// the next task.
     pub(crate) fn retire(&mut self, completed: u64) {
         self.retired_cuts.retain(|(frame, _)| *frame > completed);
+        self.retired_scratch.retain(|(frame, _)| *frame > completed);
+        let mut tiles = self.tiles.lock().unwrap();
+        self.retired_tile_slots.retain(|&(frame, slot)| {
+            let done = frame <= completed;
+            if done {
+                tiles.free_retired(slot);
+            }
+            !done
+        });
+        drop(tiles);
         let mut pool = self.pool.lock().unwrap();
         self.retired.retain(|&(frame, slot)| {
             let done = frame <= completed;
