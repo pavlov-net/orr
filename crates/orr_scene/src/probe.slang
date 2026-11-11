@@ -66,7 +66,6 @@ public struct ProbeGpu
     public uint triangle;
     public uint copy;               // VisibleCluster.instance: slot, COPY_FAR on a far step
     public uint64_t word;           // the visibility buffer word
-    public uint64_t page;           // VisibleCluster.page
     public uint cluster;            // mesh cluster index, or a producer's cluster
     public uint local;
     public uint section_material;   // VisibleCluster.material
@@ -84,12 +83,12 @@ public struct ProbeGpu
     public uint64_t page_address;   // mesh.pages[mesh_page] this frame
     public uint page_count;
     public uint pinned_pages;
-    public uint node_page_count;
     public uint level_count;
     public float self_error;        // m, mesh space
     public float parent_error;
     public float self_pixels;       // at the focus, debug scale in
     public float parent_pixels;
+    public uint _pad0;
     public float placement_scale;
     public float debug_scale;
     public int debug_level;         // -1 none
@@ -222,7 +221,6 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
     o.mesh = model.mesh;
     o.page_count = mesh.page_count;
     o.pinned_pages = mesh.pinned_pages;
-    o.node_page_count = mesh.node_page_count;
     o.level_count = mesh.level_count;
     o.merge_error = mesh.merge_error;
     if (mesh.edit != nullptr)
@@ -387,7 +385,6 @@ void probe(uint3 id: SV_DispatchThreadID)
     o.visible = visibility_cluster(w);
     o.triangle = visibility_triangle(w);
     VisibleCluster vc = r.gbuffer.clusters[o.visible];
-    o.page = (uint64_t)vc.page;
     o.copy = vc.instance;
     o.cluster = vc.cluster;
     o.local = vc.local;
