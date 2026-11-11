@@ -1,14 +1,19 @@
 //! The frame through `orr::Renderer`: frames with no scene and no view, a scene frame with
 //! a view, a consumer pipeline that hot reload replaces, views whose transient targets share
-//! memory, the glare a view's lens asks for, exposure across a camera cut, and views while the
-//! path kernels compile.
+//! memory, the glare a view's lens asks for, exposure and ray reconstruction's resets across a
+//! camera cut, and views while the path kernels compile.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use orr::orr_output::{
+    ReconstructionBackend, ReconstructionFeature, ReconstructionInputs, ReconstructionSupport,
+    UpscaleMode, UpscaleQuality,
+};
 use orr::{
     ArenaReport, AutoExposure, Budgets, DirectionalLight, DiscProfile, Exposure, FrameDesc,
     FrameTime, Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens,
@@ -19,7 +24,8 @@ use orr::{
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
 use orr_gpu::{
-    Format, GpuPtr, MemoryKind, SpecData, TextureDesc, TextureMemory, TextureRegion, TextureUsage,
+    Allocation, CommandList, Format, GpuPtr, Hazards, MemoryKind, SpecData, Stages, TextureDesc,
+    TextureMemory, TextureRegion, TextureUsage,
 };
 use orr_math::{Affine3, DVec3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::Material;
@@ -404,15 +410,18 @@ fn place_floor_and_box(f: &orr::Frame<'_>, scene: SceneId, models: [orr::ModelId
         })
         .unwrap();
     }
-    let sun = DirectionalLight {
+    s.set_light(LightId(0), Some(&sun())).unwrap();
+    s.set_focus(DVec3::ZERO);
+}
+
+/// The light of [`place_floor_and_box`], the scene's only one.
+fn sun() -> Light {
+    Light::Directional(DirectionalLight {
         direction_to_light: Vec3::new(0.3, 0.8, 0.5).normalize(),
         illuminance: Vec3::splat(50_000.0),
         angular_radius: 4.65e-3,
         disc: DiscProfile::Uniform,
-    };
-    s.set_light(LightId(0), Some(&Light::Directional(sun)))
-        .unwrap();
-    s.set_focus(DVec3::ZERO);
+    })
 }
 
 /// The view of `scene` from `eye`, looking at the origin, rendered into `image`.
@@ -1113,6 +1122,318 @@ fn a_camera_cut_starts_exposure_over_at_its_reference() {
     let cut = render(false, true, 9.0);
     assert_eq!(cut.metered_ev100, None);
     assert_eq!((cut.adapted_ev100, cut.pre_exposure), (9.0, exposure(9.0)));
+    loading.stop_workers();
+    worker.join().unwrap();
+    assert_clean();
+}
+
+/// Ray reconstruction's stand-in at the output size: it passes the radiance through and
+/// notes each evaluation's reset.
+struct Passthrough(Arc<Mutex<Vec<bool>>>);
+
+struct PassthroughFeature {
+    size: [u32; 2],
+    texels: Allocation<[u16; 4]>,
+    resets: Arc<Mutex<Vec<bool>>>,
+}
+
+impl ReconstructionBackend for Passthrough {
+    fn support(&self) -> ReconstructionSupport {
+        ReconstructionSupport {
+            available: true,
+            min_output: [1, 1],
+            scale: None,
+        }
+    }
+
+    fn feature(
+        &self,
+        output: [u32; 2],
+        _: UpscaleQuality,
+    ) -> orr::orr_output::Result<Box<dyn ReconstructionFeature>> {
+        self.feature_at(output, output)
+    }
+
+    fn feature_at(
+        &self,
+        _: [u32; 2],
+        output: [u32; 2],
+    ) -> orr::orr_output::Result<Box<dyn ReconstructionFeature>> {
+        let texels = u64::from(output[0] * output[1]);
+        Ok(Box::new(PassthroughFeature {
+            size: output,
+            texels: device().gpu_malloc(MemoryKind::DeviceLocal, texels, "passthrough")?,
+            resets: Arc::clone(&self.0),
+        }))
+    }
+}
+
+impl ReconstructionFeature for PassthroughFeature {
+    fn mode(&self) -> Option<UpscaleMode> {
+        None
+    }
+
+    fn render_size(&self) -> [u32; 2] {
+        self.size
+    }
+
+    fn output_size(&self) -> [u32; 2] {
+        self.size
+    }
+
+    fn jitter(&self, _: u64) -> [f32; 2] {
+        [0.0; 2]
+    }
+
+    fn mip_bias(&self) -> f32 {
+        0.0
+    }
+
+    fn record(
+        &mut self,
+        list: &mut CommandList<'_>,
+        inputs: &ReconstructionInputs<'_>,
+    ) -> orr::orr_output::Result<()> {
+        self.resets.lock().unwrap().push(inputs.reset);
+        let whole = TextureRegion::whole_mip(inputs.color.desc(), 0);
+        list.copy_from_texture(self.texels.gpu().cast(), inputs.color, &whole);
+        list.barrier(Stages::TRANSFER, Stages::TRANSFER, Hazards::empty());
+        list.copy_to_texture(inputs.output, &whole, self.texels.gpu().cast());
+        Ok(())
+    }
+}
+
+/// One frame of a sequence: whether the scene's light is on, whether the frame is a camera
+/// cut, and the manual exposure in place of auto exposure.
+#[derive(Clone, Copy)]
+struct Shot {
+    lit: bool,
+    cut: bool,
+    manual: Option<f32>,
+}
+
+/// Ray reconstruction drops its history on a camera cut's frame and on the frame lit with
+/// the step from the reference to the exposure the view sets, and on no other, with every
+/// frame waited on and with frames left in flight. Each case gives its frames, then per
+/// frame whether ray reconstruction resets (`?`: either, the frame after a cut whose
+/// telemetry may not be back; `a`: on exactly one of them, by when the readback lands), then
+/// the frames lit with a step when each frame's telemetry is back before the next.
+#[test]
+fn ray_reconstruction_resets_on_the_frame_pre_exposure_steps() {
+    const MANUAL_EV100: f32 = 10.0;
+    let auto = |lit| Shot {
+        lit,
+        cut: false,
+        manual: None,
+    };
+    let manual = Shot {
+        lit: true,
+        cut: false,
+        manual: Some(MANUAL_EV100),
+    };
+    let cut = |shot: Shot| Shot { cut: true, ..shot };
+    let cases: [(&str, Vec<Shot>, &str, &str); 6] = [
+        (
+            "a cut with light",
+            vec![cut(auto(true)), auto(true), auto(true), auto(true)],
+            "TTFF",
+            "FTFF",
+        ),
+        (
+            "a cut into black, then light",
+            vec![
+                cut(auto(false)),
+                auto(false),
+                auto(true),
+                auto(true),
+                auto(true),
+                auto(true),
+                auto(true),
+            ],
+            "T?FFaaF",
+            "FFFFTFF",
+        ),
+        (
+            "a manual cut",
+            vec![cut(manual), manual, manual],
+            "TFF",
+            "FFF",
+        ),
+        (
+            "manual exposure over an unset view",
+            vec![cut(auto(false)), manual, manual, manual],
+            "T?TF",
+            "FFTF",
+        ),
+        (
+            "manual exposure over a view whose pre-exposure waits",
+            vec![cut(auto(false)), auto(true), manual, manual, manual],
+            "T?FTF",
+            "FFFTF",
+        ),
+        // The step to the manual exposure is no cut's: nothing resets on it.
+        (
+            "manual exposure over an adapting view",
+            vec![
+                cut(auto(true)),
+                auto(true),
+                auto(true),
+                auto(true),
+                manual,
+                manual,
+            ],
+            "TTFFFF",
+            "FTFFFT",
+        ),
+    ];
+
+    let d = device();
+    let desc = RendererDesc {
+        path_entry: PathEntry::Compute,
+        ..RendererDesc::default()
+    };
+    let mut r = Renderer::new(d, desc).unwrap();
+    let resets = Arc::new(Mutex::new(Vec::new()));
+    assert!(r.set_reconstruction(Passthrough(Arc::clone(&resets))));
+    let loading = r.loading();
+    let worker = {
+        let l = Arc::clone(&loading);
+        std::thread::spawn(move || l.run_worker())
+    };
+    let mut frame = 0;
+    let mount = mount_pack(&mut r, &floor_and_box(), &mut frame);
+    let models = ["floor", "box"].map(|name| r.model(mount, AssetId::from_name(name)).unwrap());
+    let scene = r
+        .create_scene(
+            &SceneDesc {
+                light_capacity: 1,
+                ..SceneDesc::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    let history = r.create_view_history().unwrap();
+    r.wait_paths().unwrap();
+    let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+    let image = d
+        .create_texture(
+            &TextureDesc::d2(Format::Rgba16Float, 320, 240, usage),
+            TextureMemory::Dedicated,
+            "view image",
+        )
+        .unwrap();
+    frame += 1;
+    let listed = [scene];
+    let f = r
+        .begin_frame(FrameDesc {
+            time: time(frame),
+            scenes: &listed,
+            display: None,
+        })
+        .unwrap();
+    place_floor_and_box(&f, scene, models);
+    wait(f.end().unwrap());
+
+    let exposure = |shot: &Shot| match shot.manual {
+        Some(ev100) => Exposure::Manual { ev100 },
+        None => Exposure::default(),
+    };
+    let mut last = None;
+    for waited in [true, false] {
+        for (name, shots, reset, stepped) in &cases {
+            resets.lock().unwrap().clear();
+            // Each frame's id, and by frame id the pre-exposure its telemetry leaves for the
+            // next.
+            let mut ids = Vec::new();
+            let mut next_pre_exposure = HashMap::new();
+            for shot in shots {
+                frame += 1;
+                let mut f = r
+                    .begin_frame(FrameDesc {
+                        time: time(frame),
+                        scenes: &listed,
+                        display: None,
+                    })
+                    .unwrap();
+                if let Some(t) = f.exposure_telemetry(history) {
+                    next_pre_exposure.insert(t.frame, t.pre_exposure);
+                }
+                ids.push(f.id());
+                let light = shot.lit.then(sun);
+                f.scene(scene)
+                    .unwrap()
+                    .set_light(LightId(0), light.as_ref())
+                    .unwrap();
+                f.update_scenes(&mut |_| {}).unwrap();
+                f.render_view(
+                    &LitView {
+                        camera_cut: shot.cut,
+                        ..view_of(scene, history, DVec3::new(3.0, 2.5, 5.0), &image)
+                    },
+                    &ViewLighting::default(),
+                    &ViewOutput {
+                        exposure: exposure(shot),
+                        ..ViewOutput::default()
+                    },
+                    &mut ViewHooks::default(),
+                )
+                .unwrap();
+                let point = f.end().unwrap();
+                if waited {
+                    wait(point);
+                }
+                last = Some(point);
+            }
+            let got: String = resets
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|&r| if r { 'T' } else { 'F' })
+                .collect();
+            let either = got
+                .chars()
+                .zip(reset.chars())
+                .filter(|(_, want)| *want == 'a')
+                .filter(|(got, _)| *got == 'T')
+                .count();
+            let fits = got.len() == reset.len()
+                && got
+                    .chars()
+                    .zip(reset.chars())
+                    .all(|(got, want)| matches!(want, '?' | 'a') || got == want)
+                && either == usize::from(reset.contains('a'));
+            assert!(
+                fits,
+                "{name}, waited {waited}: resets {got} against {reset}"
+            );
+            if !waited {
+                continue;
+            }
+            // Waited on, a frame's telemetry is back before the next, which is lit with it;
+            // a cut's frame is lit as its exposure starts.
+            let lit: Vec<f32> = (0..shots.len())
+                .map(|i| match shots[i].cut {
+                    true => exposure(&shots[i]).start().pre_exposure,
+                    false => next_pre_exposure[&ids[i - 1]],
+                })
+                .collect();
+            let steps: String = (0..shots.len())
+                .map(|i| i > 0 && (lit[i] / lit[i - 1]).log2().abs() > 0.5)
+                .map(|step| if step { 'T' } else { 'F' })
+                .collect();
+            assert_eq!(steps, *stepped, "{name}: steps");
+            // Every reset but a cut's lands on a step, the reads of `?` and `a` included.
+            for (i, shot) in shots.iter().enumerate() {
+                let reset = got.as_bytes()[i] == b'T';
+                let step = steps.as_bytes()[i] == b'T';
+                assert!(
+                    !reset || shot.cut || step,
+                    "{name}: frame {i} resets with no step"
+                );
+            }
+        }
+    }
+    wait(last.expect("a frame"));
     loading.stop_workers();
     worker.join().unwrap();
     assert_clean();

@@ -78,10 +78,18 @@ fn the_frame_after_the_one_that_sets_the_exposure_only_adapts() {
 /// reference to its first exposure, so every frame shows the scene at its exposure through
 /// it. After a cut with light to meter that is the next frame. After a cut into black the
 /// pre-exposure waits at the reference until a frame has read back that the view found
-/// light, and steps on the one after.
+/// light, and steps on the one after, whether the readback is a frame late or two.
 #[test]
 fn a_history_starts_over_on_the_frame_pre_exposure_steps() {
+    for lag in [1, 2] {
+        history_starts_over_where_pre_exposure_steps(lag);
+    }
+    assert_clean();
+}
+
+fn history_starts_over_where_pre_exposure_steps(lag: u64) {
     let mut h = Harness::new(SIDE, SIDE);
+    h.readback_lag = lag;
     let display = DisplayRequest::default().resolve(&[OutputFormat::Hdr10Pq], None, false);
     let output = ViewOutput {
         debug: OutputDebug::Linear,
@@ -102,7 +110,7 @@ fn a_history_starts_over_on_the_frame_pre_exposure_steps() {
             let off = shown(&h, &t) - 1.0;
             assert!(
                 off.abs() < 2e-3,
-                "{nits} cd/m2, frame {f} from a cut with light: shown {off} off"
+                "{nits} cd/m2, lag {lag}, frame {f} from a cut with light: shown {off} off"
             );
         }
 
@@ -115,6 +123,10 @@ fn a_history_starts_over_on_the_frame_pre_exposure_steps() {
         let found = h.frame(1.0, &output, Some(&display));
         assert_eq!(found.pre_exposure, reference);
         h.history = 0.9;
+        for _ in 1..lag {
+            let waits = h.frame(1.0, &output, Some(&display));
+            assert_eq!(waits.pre_exposure, reference);
+        }
         let told = h.frame(1.0, &output, Some(&display));
         let follows = told.pre_exposure / exposure_from_ev100(told.adapted_ev100) - 1.0;
         assert!(
@@ -126,11 +138,10 @@ fn a_history_starts_over_on_the_frame_pre_exposure_steps() {
             let off = shown(&h, &t) - 1.0;
             assert!(
                 off.abs() < 2e-3,
-                "{nits} cd/m2, frame {f} from the step after a black cut: shown {off} off"
+                "{nits} cd/m2, lag {lag}, frame {f} from the step after a black cut: shown {off} off"
             );
         }
     }
-    assert_clean();
 }
 
 /// An adapting view whose scene falls under RGBA16F at its pre-exposure holds its exposure on
