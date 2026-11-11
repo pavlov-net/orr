@@ -795,32 +795,25 @@ impl Renderer {
     /// residency states in them are what the renderer holds when they are taken.
     pub fn probes(&mut self, history: ViewHistoryId, completed: u64) -> Vec<PixelProbe> {
         let scene = self.scenes.probes(history, completed);
-        let Some(state) = self.output.views.get_mut(&history) else {
-            return scene
-                .into_iter()
-                .map(|s| PixelProbe {
-                    output_pixel: s.pixel,
-                    output_extent: s.view.render_extent,
-                    reconstructed: false,
-                    upscale_mode: None,
-                    scene: s,
-                    lighting: None,
-                })
-                .collect();
+        let (mut lighting, done) = match self.output.views.get_mut(&history) {
+            Some(state) => {
+                let (done, pending): (Vec<ProbeAt>, _) = std::mem::take(&mut state.probes)
+                    .into_iter()
+                    .partition(|p| p.frame <= completed);
+                state.probes = pending;
+                (state.origin_probes.take(completed), done)
+            }
+            None => (Vec::new(), Vec::new()),
         };
-        let mut lighting = state.origin_probes.take(completed);
-        let (done, pending): (Vec<ProbeAt>, _) = std::mem::take(&mut state.probes)
-            .into_iter()
-            .partition(|p| p.frame <= completed);
-        state.probes = pending;
         scene
             .into_iter()
             .map(|s| {
                 let at = done.iter().find(|p| p.frame == s.frame);
                 let l = lighting.iter().position(|l| l.frame == s.frame);
                 PixelProbe {
+                    // A view only rasterized was asked for a render pixel.
                     output_pixel: at.map_or(s.pixel, |p| p.output),
-                    output_extent: at.map_or(s.view.output_extent, |p| p.output_extent),
+                    output_extent: at.map_or(s.view.render_extent, |p| p.output_extent),
                     reconstructed: at.is_some_and(|p| p.reconstructed),
                     upscale_mode: at.and_then(|p| p.upscale_mode),
                     lighting: l.map(|i| lighting.swap_remove(i)),
