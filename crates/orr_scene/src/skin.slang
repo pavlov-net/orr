@@ -29,7 +29,6 @@ public static const uint SKIN_COUNTERS = 8;
 // The frame's skinning memory.
 public struct SkinFrameGpu
 {
-    public uint2* work;             // per work item: skinned copy, mesh cluster
     public uint8_t* instantiate;    // per work item: its template instantiation
     public uint8_t* blas_records;   // per job: a cluster BLAS over its copy's CLAS
     public uint64_t* clas;          // per work item: its instantiated CLAS

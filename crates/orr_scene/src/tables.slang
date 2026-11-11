@@ -363,9 +363,7 @@ public struct SkinMeshGpu
     public float* cut_error;       // per cut: the largest error of its clusters, m, mesh space
     public uint* cut_row;          // per cut: its row of the mesh's cooked sets
     public uint cut_count;
-    public uint vertex_count;
     public float bound;            // the largest deformation bound of its clusters, m; 0: unbounded
-    public uint _pad;
 }
 
 // A skinned copy (`add_skinned`): its vertex arrays, rewritten every frame its scene is

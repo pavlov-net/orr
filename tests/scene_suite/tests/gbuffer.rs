@@ -10704,7 +10704,7 @@ fn skinned_array(g: &Frame, array: GpuPtr<[f32; 3]>) -> Vec<[f32; 3]> {
     let mesh = read_buffer(root.meshes.offset(u64::from(model.mesh)), 1)[0];
     let skin = read_buffer(mesh.skin, 1)[0];
     let first: Vec<u32> = read_buffer(skin.vertex_first, u64::from(mesh.cluster_count) + 1);
-    let all: Vec<[f32; 3]> = read_buffer(array, u64::from(skin.vertex_count));
+    let all: Vec<[f32; 3]> = read_buffer(array, u64::from(*first.last().unwrap()));
     clusters
         .iter()
         .flat_map(|&c| all[first[c as usize] as usize..first[c as usize + 1] as usize].to_vec())

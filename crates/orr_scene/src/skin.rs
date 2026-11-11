@@ -105,13 +105,11 @@ pub(crate) fn mesh_table(
         cut_error: base.offset(at[4]).cast(),
         cut_row: base.offset(at[5]).cast(),
         cut_count: cuts.len() as u32,
-        vertex_count: total,
         bound: m
             .clusters
             .iter()
             .map(|c| c.deformation_bound)
             .fold(0.0, f32::max),
-        _pad: 0,
     };
     bytes[..size_of::<SkinMeshGpu>()].copy_from_slice(bytemuck::bytes_of(&record));
     block.as_mut_slice().expect("upload is mapped")[..bytes.len()].copy_from_slice(&bytes);
@@ -259,7 +257,6 @@ impl SkinFrame {
         let at = |o: u64| memory.gpu().offset(o);
         let mut record = device.gpu_malloc::<SkinFrameGpu>(MemoryKind::Upload, 1, "skin frame")?;
         record.as_mut_slice().expect("upload is mapped")[0] = SkinFrameGpu {
-            work: at(work_at).cast(),
             instantiate: at(instantiate_at),
             blas_records: at(blas_records_at),
             clas: at(clas_at).cast(),
