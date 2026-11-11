@@ -32,10 +32,10 @@ struct State {
     live: FxHashMap<u32, u32>,
     /// By page, the memory taken for it while it holds an id or stays bound.
     pages: FxHashMap<u32, Page>,
-    /// Pages whose memory is taken and not yet bound; some may have given it back since.
+    /// Pages whose memory is taken and not yet bound.
     unbound: Vec<u32>,
-    /// Bound pages by the step from which they held no id, in step order; some may have taken
-    /// ids again since.
+    /// Pages by the step from which they held no id, in step order; some may have taken ids
+    /// again since.
     idle: VecDeque<(u64, u32)>,
     backing: Pool,
     step: u64,
@@ -43,7 +43,6 @@ struct State {
 
 struct Page {
     slot: PoolSlot,
-    bound: bool,
     /// The render step from which it has held no id.
     idle: Option<u64>,
 }
@@ -137,11 +136,7 @@ impl ClusterTable {
             }
         }
         for (p, slot) in taken {
-            let page = Page {
-                slot,
-                bound: false,
-                idle: None,
-            };
+            let page = Page { slot, idle: None };
             s.pages.insert(p, page);
             s.unbound.push(p);
         }
@@ -186,16 +181,25 @@ impl ClusterTable {
         let mut wanted = std::mem::take(&mut s.unbound);
         wanted.sort_unstable();
         wanted.dedup();
-        wanted.retain(|p| s.pages.get(p).is_some_and(|q| !q.bound));
         let mut gone: Vec<(u64, u32)> = Vec::new();
+        // A page whose first bind failed every step since it idled binds before it unbinds.
+        let mut later: Vec<(u64, u32)> = Vec::new();
         while let Some(&(from, p)) = s.idle.front() {
             if step - from < RESERVE_STEPS as u64 {
                 break;
             }
             s.idle.pop_front();
-            if s.pages.get(&p).is_some_and(|q| q.idle == Some(from)) {
+            if !s.pages.get(&p).is_some_and(|q| q.idle == Some(from)) {
+                continue;
+            }
+            if wanted.binary_search(&p).is_ok() {
+                later.push((from, p));
+            } else {
                 gone.push((from, p));
             }
+        }
+        for &l in later.iter().rev() {
+            s.idle.push_front(l);
         }
         if wanted.is_empty() && gone.is_empty() {
             return Ok(None);
@@ -231,9 +235,6 @@ impl ClusterTable {
             // The unbind is queued ahead of any bind that takes the memory again, and a block
             // the pool gives back is freed after the work submitted so far.
             s.backing.free(page.slot);
-        }
-        for p in wanted {
-            s.pages.get_mut(&p).expect("memory for a taken page").bound = true;
         }
         Ok(Some(point))
     }

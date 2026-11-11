@@ -712,8 +712,8 @@ pub(crate) struct SceneCpu {
     pub(crate) slots: RangeAllocator,
     /// By slot.
     slot_holds: Vec<SlotHold>,
-    /// By slot placed by hand, the part runs its copy may hold, which the PTLAS counts until the
-    /// slot is removed.
+    /// By slot placed by hand, its copy's model and the class of the body run it may hold, which
+    /// `copies` counts until the slot is removed.
     slot_runs: Vec<(u32, Option<u8>)>,
     /// By model.
     copies: FxHashMap<u32, Copies>,
@@ -826,6 +826,10 @@ impl SceneCpu {
 
     /// Counts `n` new copies of `model` and the part runs they may hold.
     fn hold_copies(&mut self, model: u32, chained: bool, body: Option<u8>, n: u32) {
+        // An entry with no copies would keep its far flag after the model's chain ends.
+        if n == 0 {
+            return;
+        }
         let c = self.copies.entry(model).or_insert(Copies {
             count: 0,
             far: chained,
@@ -837,6 +841,9 @@ impl SceneCpu {
 
     /// Counts `n` copies of `model` removed, whose part runs leave the pool.
     fn leave_copies(&mut self, model: u32, body: Option<u8>, n: u32) {
+        if n == 0 {
+            return;
+        }
         let c = self
             .copies
             .get_mut(&model)
@@ -1045,14 +1052,12 @@ impl Scene {
     /// placed from now on: the model has gained a chain, so its copies may fade.
     pub(crate) fn chain_far(&self, model: u32) {
         let cpu = &mut *self.cpu.lock().unwrap();
-        let c = cpu.copies.entry(model).or_insert(Copies {
-            count: 0,
-            far: false,
-        });
-        if !c.far {
+        // A scene holding no copies counts those it places from the model's chain.
+        if let Some(c) = cpu.copies.get_mut(&model)
+            && !c.far
+        {
             c.far = true;
-            let n = c.count;
-            cpu.ptlas.hold_runs(FAR_RUN, n);
+            cpu.ptlas.hold_runs(FAR_RUN, c.count);
         }
     }
 
@@ -2553,12 +2558,18 @@ impl<'f> SceneWriter<'f> {
     pub fn remove(&mut self, range: InstanceRange) {
         let seq = self.next_seq();
         let cpu = &mut *self.scene.cpu.lock().unwrap();
-        let slots = range.first as usize..(range.first + range.count) as usize;
-        for slot in slots {
-            let (model, body) = std::mem::replace(&mut cpu.slot_runs[slot], (NO_MODEL, None));
-            if model != NO_MODEL {
-                cpu.leave_copies(model, body, 1);
+        let (mut at, end) = (range.first as usize, (range.first + range.count) as usize);
+        while at < end {
+            let held = cpu.slot_runs[at];
+            let n = cpu.slot_runs[at..end]
+                .iter()
+                .take_while(|&&h| h == held)
+                .count();
+            cpu.slot_runs[at..at + n].fill((NO_MODEL, None));
+            if held.0 != NO_MODEL {
+                cpu.leave_copies(held.0, held.1, n as u32);
             }
+            at += n;
         }
         self.scene.empty_slots(cpu, range, self.frame, seq);
         cpu.removed.push((self.frame, range));

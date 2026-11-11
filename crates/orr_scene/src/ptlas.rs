@@ -308,7 +308,7 @@ pub(crate) fn run_class(n: u32) -> u8 {
 
 /// The part runs a copy may hold: the class of its body run while posed, and a far instance
 /// while its model has a chain.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CopyRuns {
     pub(crate) body: Option<u8>,
     pub(crate) far: bool,
