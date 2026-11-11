@@ -231,8 +231,9 @@ pub struct PixelProbe {
     /// In render pixels.
     pub pixel: [u32; 2],
     pub view: ProbeView,
-    /// The detail scales in force: `memory_scale` and `rt_scale` the frame's traversal ran at,
-    /// `mesh_demand` and `mesh_budget` of the last frame completed before it.
+    /// The detail scales in force: `memory_scale`, its `visible_scale` and `hidden_scale` parts
+    /// and `rt_scale` the frame's traversal ran at, `mesh_demand` and `mesh_budget` of the last
+    /// frame completed before it.
     pub detail: DetailStats,
     /// The residency figures of the probed frame's step 1.
     pub residency: ResidencyStats,
@@ -448,16 +449,18 @@ impl fmt::Display for PixelProbe {
         }
         writeln!(
             f,
-            "detail: memory scale x{:.4}, gathered cuts x{:.4}; thresholds raster {:.3} px, ray tracing {:.3} px (configured {} and {} px), merge below {} px, culled copies x{}, software raster up to {} px",
+            "detail: memory scale x{:.4} (visible x{:.4}, hidden x{:.4}), gathered cuts x{:.4}; thresholds raster {:.3} px, ray tracing {:.3} px (configured {} and {} px), merge below {} px, culled copies x{}, software raster up to {} px",
             d.memory_scale,
+            d.visible_scale,
+            d.hidden_scale,
             d.rt_scale,
             g.raster_threshold
-                .max(s.raster_error_pixels * d.memory_scale),
-            s.rt_error_pixels * d.memory_scale,
+                .max(s.raster_error_pixels * d.visible_scale),
+            s.rt_error_pixels * d.visible_scale,
             s.raster_error_pixels,
             s.rt_error_pixels,
             s.rt_merge_pixels,
-            s.culled_error_scale,
+            s.culled_error_scale * d.hidden_scale,
             s.software_raster_pixels
         )?;
         let r = &self.residency;

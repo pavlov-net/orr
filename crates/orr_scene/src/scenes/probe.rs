@@ -52,6 +52,7 @@ impl Frame<'_> {
             (focus, cpu.cuts.as_ref().map_or(1.0, |c| c.rt_scale(slot)))
         };
         let memory_scale = core.memory.scale();
+        let (visible_scale, hidden_scale) = core.detail_scales();
         let (focus_cell, focus_offset) = focus.map_or(([0; 4], [0.0; 4]), |(f, ppr)| {
             let w = WorldPos::new(f, core.cell_log2);
             (w.cell.extend(1).to_array(), w.offset.extend(ppr).to_array())
@@ -71,6 +72,8 @@ impl Frame<'_> {
             },
             detail: DetailStats {
                 memory_scale,
+                visible_scale,
+                hidden_scale,
                 rt_scale,
                 ..core.stats.detail
             },
@@ -98,9 +101,10 @@ impl Frame<'_> {
                 focus_offset,
                 pixel_x: pixel[0],
                 pixel_y: pixel[1],
-                raster_pixels: core.raster_error_pixels * memory_scale,
-                rt_pixels: core.rt_error_pixels * memory_scale,
-                culled_scale: core.culled_error_scale,
+                // The thresholds the frame's traversal takes (`CutInputs`).
+                raster_pixels: core.raster_error_pixels * visible_scale,
+                rt_pixels: core.rt_error_pixels * visible_scale,
+                culled_scale: core.culled_error_scale * hidden_scale,
                 gather_scale: rt_scale,
                 merge_pixels: core.rt_merge_pixels,
                 _pad: 0,
