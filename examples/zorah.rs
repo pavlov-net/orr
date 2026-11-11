@@ -942,8 +942,6 @@ fn run(options: &Options) -> Option<Capture> {
                 light_capacity: 1,
                 page_material_sets: needs.material_sets.max(defaults.page_material_sets),
                 emissive_capacity: needs.emissive.max(defaults.emissive_capacity),
-                // Without chains and with an animation range of 0, no copy takes a part
-                // instance.
                 ..defaults
             },
             &SceneLightingSettings::default(),
