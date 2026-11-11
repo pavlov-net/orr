@@ -155,7 +155,7 @@ public struct VertexAttributes
     public float2 uv[2];           // per uv set; set 1 is zero without MESH_UV1
     public float4 color;           // 1 without MESH_COLOR
     public uint4 joints;           // MESH_SKIN only
-    public float4 weights;         // MESH_SKIN only; sum to 1
+    public float4 weights;         // MESH_SKIN only; unorm16 codes that sum to 65535
 }
 
 public PageHeader load_page_header(uint8_t* page)
@@ -218,9 +218,8 @@ public VertexAttributes load_attributes(uint8_t* page, PageHeader h, Cluster c, 
     if ((attributes & MESH_SKIN) != 0)
     {
         uint j = a[at];
-        uint w = a[at + 1];
         v.joints = uint4(j, j >> 8, j >> 16, j >> 24) & 0xFF;
-        v.weights = unpack_unorm4x8(w);
+        v.weights = unpack_unorm4x16(uint2(a[at + 1], a[at + 2]));
     }
     return v;
 }

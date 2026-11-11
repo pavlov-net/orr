@@ -298,10 +298,10 @@ impl MeshSource {
     }
 }
 
-/// Per vertex: four skeleton joints and their unorm8 weights, summing to 255.
+/// Per vertex: four skeleton joints and their unorm16 weights, summing to 65535.
 pub(crate) struct Skin {
     pub(crate) joints: Vec<[u8; 4]>,
-    pub(crate) weights: Vec<[u8; 4]>,
+    pub(crate) weights: Vec<[u16; 4]>,
 }
 
 /// Rigid parts from a per-vertex value.
@@ -1831,8 +1831,10 @@ fn build_cluster(
             attrs.push(h[2] | h[3] << 16);
         }
         if let Some(k) = &w.skin {
+            let w = k.weights[v].map(u32::from);
             attrs.push(u32::from_le_bytes(k.joints[v]));
-            attrs.push(u32::from_le_bytes(k.weights[v]));
+            attrs.push(w[0] | w[1] << 16);
+            attrs.push(w[2] | w[3] << 16);
         }
     }
 

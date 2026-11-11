@@ -93,6 +93,14 @@ public float2 unpack_unorm2x16(uint p)
     return float2(uint2(p & 0xFFFF, p >> 16)) / 65535.0;
 }
 
+// Four unorm16 values, the first in the low half of `p.x`, each `q x (1 / 65535)`: a product,
+// which rounds alike on every device where a division need not, and takes 65535 to exactly 1.
+// Bit for bit `orr_pack::mesh::unorm16` on the CPU.
+public float4 unpack_unorm4x16(uint2 p)
+{
+    return float4(p.x & 0xFFFF, p.x >> 16, p.y & 0xFFFF, p.y >> 16) * (1.0 / 65535.0);
+}
+
 public uint pack_snorm2x16(float2 v)
 {
     int2 q = int2(round(clamp(v, -1.0, 1.0) * 32767.0));

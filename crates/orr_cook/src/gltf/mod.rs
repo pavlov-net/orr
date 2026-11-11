@@ -449,7 +449,7 @@ struct Part {
     moves: Option<Vec<[[f32; 3]; 2]>>,
     /// Empty without a binding.
     joints: Vec<[u8; 4]>,
-    weights: Vec<[u8; 4]>,
+    weights: Vec<[u16; 4]>,
     /// Empty without parts from an attribute or a skin.
     values: Vec<u16>,
     /// Empty without pivots from an attribute.
@@ -626,9 +626,9 @@ fn read_primitive(
             }
             colors
         });
-    let skin: Vec<([u16; 4], [u8; 4])> = match binding {
+    let skin: Vec<([u16; 4], [u16; 4])> = match binding {
         None => Vec::new(),
-        Some(Binding::Rigid(j)) => vec![([*j; 4], [255, 0, 0, 0]); n],
+        Some(Binding::Rigid(j)) => vec![([*j; 4], [65535, 0, 0, 0]); n],
         Some(Binding::Skin(map)) => {
             let mut sets = Vec::new();
             for set in 0.. {
@@ -696,7 +696,7 @@ fn read_primitive(
             (values, pivots)
         }
     };
-    let (joints, weights): (Vec<[u8; 4]>, Vec<[u8; 4]>) =
+    let (joints, weights): (Vec<[u8; 4]>, Vec<[u16; 4]>) =
         skin.iter().map(|s| (s.0.map(|j| j as u8), s.1)).unzip();
     let material = material_index(prim);
     let Some(normals) = normals else {

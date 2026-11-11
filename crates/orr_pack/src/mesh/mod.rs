@@ -17,7 +17,8 @@
 //!   uv set 0 (2x16 steps of the cluster's `uv_step[0]` from its `uv_offset[0]`), uv set 1
 //!   likewise when the mesh has [`MeshHeader::UV1`], with [`MeshHeader::COLOR`] four half
 //!   floats, and with
-//!   [`MeshHeader::SKIN`] joints u8x4 and weights unorm8x4.
+//!   [`MeshHeader::SKIN`] joints u8x4 and weights unorm16x4 ([`unorm16`]) whose codes sum to
+//!   65535.
 //! - Vertex `i` of a cluster sits at index `vertex_first + i` in both the position and the
 //!   attribute array. `vertex_first` is even, so every cluster's positions start 4-aligned.
 //! - Triangles at `tris_offset + tri_first`: u8x3 cluster-local corners, opaque triangles
@@ -36,7 +37,7 @@ pub use omm::*;
 use crate::blob::{put_table, put_table_aligned, read, table};
 use crate::{Aabb, Error, Result, Span, Sphere};
 
-pub const SCHEMA: u16 = 10;
+pub const SCHEMA: u16 = 11;
 
 /// Largest streamed hierarchy node page. The top page holds what the pinned pages need,
 /// whatever its size.
@@ -678,7 +679,7 @@ pub fn attr_stride(attributes: u8) -> u32 {
     8 + 4 * has(MeshHeader::TANGENT)
         + 4 * has(MeshHeader::UV1)
         + 8 * has(MeshHeader::COLOR)
-        + 8 * has(MeshHeader::SKIN)
+        + 12 * has(MeshHeader::SKIN)
 }
 
 /// Bytes a cluster of `vertices` and `triangles` takes in a resident page, its record
@@ -893,11 +894,12 @@ impl<'a> PageView<'a> {
             .then(|| self.attr(c, v, self.skin_at()).to_le_bytes())
     }
 
-    /// Weights of [`Self::joints`], summing to 1.
+    /// Weights of [`Self::joints`], whose codes sum to 65535.
     pub fn weights(&self, c: &Cluster, v: u32) -> Option<[f32; 4]> {
         self.has(MeshHeader::SKIN).then(|| {
-            let w = self.attr(c, v, self.skin_at() + 4).to_le_bytes();
-            w.map(|q| f32::from(q) / 255.0)
+            let at = self.skin_at();
+            let [a, b] = [self.attr(c, v, at + 4), self.attr(c, v, at + 8)];
+            [a, a >> 16, b, b >> 16].map(|q| unorm16(q as u16))
         })
     }
 
@@ -964,6 +966,13 @@ pub fn skin(view: &PageView<'_>, c: &Cluster, palette: &[Affine3], out: &mut [[f
         }
         *o = sum.to_array();
     }
+}
+
+/// The value of unorm16 code `q`, `q x (1 / 65535)`: a product, which rounds alike on every
+/// device where a division need not, and takes 65535 to exactly 1. `orr_shaders.packing`'s
+/// `unpack_unorm4x16`.
+pub fn unorm16(q: u16) -> f32 {
+    f32::from(q) * (1.0 / 65535.0)
 }
 
 /// Octahedral encoding of a unit vector as 2x16 snorm in one u32, x low: `orr_shaders.packing`'s

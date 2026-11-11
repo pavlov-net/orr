@@ -227,7 +227,7 @@ pub(crate) struct CageTables {
     stencil_points: Vec<u32>,
     stencil_weights: Vec<f32>,
     cage_points: Vec<[f32; 3]>,
-    skin: Vec<[u32; 2]>,
+    skin: Vec<[u32; 3]>,
     parts: Vec<SubdPartGpu>,
     part_cvs: Vec<u32>,
     value_points: Vec<[f32; 4]>,
@@ -273,7 +273,14 @@ impl CageTables {
             skin: info
                 .skin
                 .iter()
-                .map(|s| [u32::from_le_bytes(s.joints), u32::from_le_bytes(s.weights)])
+                .map(|s| {
+                    let w = s.weights.map(u32::from);
+                    [
+                        u32::from_le_bytes(s.joints),
+                        w[0] | w[1] << 16,
+                        w[2] | w[3] << 16,
+                    ]
+                })
                 .collect(),
             parts: Vec::new(),
             part_cvs: Vec::new(),

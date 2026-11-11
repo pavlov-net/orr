@@ -20,28 +20,20 @@ use pack_suite::{UNWRITTEN, cooked_set_pages, decode_stored, dispatch, read, sto
 const SLOTS: usize = 256;
 
 /// Largest differences between the GPU and CPU float decodes. Integer values (positions,
-/// grid offsets, joints, corners, micromap indices, records) and uvs, which are exact sums of
-/// exact products, must match exactly; unit vectors and weights go through divisions and a
-/// square root, which the GPU rounds differently.
+/// grid offsets, joints, corners, micromap indices, records), uvs, which are exact sums of
+/// exact products, and weights, which are products, must match exactly; unit vectors go
+/// through divisions and a square root, which the GPU rounds differently.
 #[derive(Debug, Default)]
 struct Spread {
     unit: f32,
-    weight: f32,
 }
 
 impl Spread {
     /// Vulkan allows 2.5 ulp on a division and inherits the square root from
-    /// `inversesqrt`; on 621.01 unit vectors differ by up to 2.5 ulp at 1.0 and weights by half
-    /// an ulp.
+    /// `inversesqrt`; on 621.01 unit vectors differ by up to 2.5 ulp at 1.0.
     fn assert_within(&self) {
-        let bounds = Spread {
-            unit: 2f32.powi(-21),
-            weight: 2f32.powi(-23),
-        };
-        assert!(
-            self.unit <= bounds.unit && self.weight <= bounds.weight,
-            "{self:?} against {bounds:?}"
-        );
+        let bound = 2f32.powi(-21);
+        assert!(self.unit <= bound, "{self:?} against {bound}");
     }
 
     fn add(max: &mut f32, gpu: &[f32], cpu: &[f32], scale: f32) {
@@ -127,7 +119,7 @@ fn check(page: &[u8], mesh: &MeshHeader, spread: &mut Spread) {
             let joints = view.joints(&c, v).unwrap_or_default().map(u32::from);
             assert_eq!(g.joints, joints, "{at}");
             let w = view.weights(&c, v).unwrap_or_default();
-            Spread::add(&mut spread.weight, &g.weights, &w, 1.0);
+            assert_eq!(g.weights.map(f32::to_bits), w.map(f32::to_bits), "{at}");
             // Random words hold NaNs, whose payloads the GPU's conversion needn't keep.
             let color = view.color(&c, v);
             let same =

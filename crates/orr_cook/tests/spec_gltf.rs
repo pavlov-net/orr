@@ -2456,3 +2456,93 @@ fn image_color_metadata_is_ignored() {
         material(&plain, "g/material/0").base_color
     );
 }
+
+/// `WEIGHTS_n` holds floats, or unsigned bytes or shorts normalized. The cooked unorm16 weights,
+/// whose codes sum to 65535, hold a byte weight `k / 255` exactly as `257 k` and a short one as
+/// itself, a float one within a step by largest remainder, and a lone weight as exactly 1.
+#[test]
+fn skin_weights_hold_byte_and_short_weights_exactly() {
+    let path = dir("weights").join("skin.glb");
+    let mut g = Glb::default();
+    let jv = g.view(bytemuck::cast_slice(&[[0u8, 1, 2, 3]; 3]), None);
+    let ja = g.accessor(jv, 5121, 3, "VEC4", "");
+    let floats = [[0.5f32, 0.5, 0.0, 0.0], [0.25; 4], [1.0, 0.0, 0.0, 0.0]];
+    let bytes = [[1u8, 254, 0, 0], [100, 155, 0, 0], [128, 64, 63, 0]];
+    let shorts = [
+        [12345u16, 65535 - 12345, 0, 0],
+        [1, 65534, 0, 0],
+        [65535, 0, 0, 0],
+    ];
+    let normalized = r#","normalized":true"#;
+    let weights = [
+        g.floats(&floats, "VEC4"),
+        {
+            let v = g.view(bytemuck::cast_slice(&bytes), None);
+            g.accessor(v, 5121, 3, "VEC4", normalized)
+        },
+        {
+            let v = g.view(bytemuck::cast_slice(&shorts), None);
+            g.accessor(v, 5123, 3, "VEC4", normalized)
+        },
+    ];
+    // Per primitive, its corners' codes.
+    let codes: [[[u32; 4]; 3]; 3] = [
+        [
+            [32768, 32767, 0, 0],
+            [16384, 16384, 16384, 16383],
+            [65535, 0, 0, 0],
+        ],
+        bytes.map(|w| w.map(|k| 257 * u32::from(k))),
+        shorts.map(|w| w.map(u32::from)),
+    ];
+    let primitives: Vec<String> = weights
+        .iter()
+        .enumerate()
+        .map(|(p, wa)| {
+            let at = TRIANGLE.map(|c| [c[0] + 2.0 * p as f32, c[1], c[2]]);
+            let pa = g.floats(&at, "VEC3");
+            format!(r#"{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}}}}"#)
+        })
+        .collect();
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1,2,3,4]}}],
+"nodes":[{{"name":"a"}},{{"name":"b"}},{{"name":"c"}},{{"name":"d"}},{{"mesh":0,"skin":0}}],
+"skins":[{{"joints":[0,1,2,3]}}],"meshes":[{{"primitives":[{}]}}]"#,
+            primitives.join(",")
+        ),
+    );
+    let corners = per_triangle(&cooked(&path).0, "g/mesh", |view, c, t| {
+        t.map(|v| (view.position(c, v), view.weights(c, v).unwrap()))
+    });
+    let mut seen = 0;
+    for (at, weights) in corners.into_iter().flatten() {
+        let p = (at[0] / 2.0).floor() as usize;
+        let corner = TRIANGLE
+            .iter()
+            .position(|c| {
+                (c[0] + 2.0 * p as f32 - at[0]).abs() < 1e-3 && (c[1] - at[1]).abs() < 1e-3
+            })
+            .unwrap();
+        let mut got = weights.map(|w| {
+            let q = (w * 65535.0).round() as u32;
+            assert_eq!(
+                w.to_bits(),
+                mesh::unorm16(q as u16).to_bits(),
+                "{w} is a code's value"
+            );
+            q
+        });
+        let mut want = codes[p][corner];
+        got.sort_by(|a, b| b.cmp(a));
+        want.sort_by(|a, b| b.cmp(a));
+        assert_eq!(got, want, "primitive {p} corner {corner}");
+        assert_eq!(got.iter().sum::<u32>(), 65535);
+        if got[0] == 65535 {
+            assert_eq!(weights.iter().copied().fold(0.0, f32::max), 1.0);
+        }
+        seen += 1;
+    }
+    assert_eq!(seen, 9);
+}

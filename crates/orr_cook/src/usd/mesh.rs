@@ -391,8 +391,8 @@ pub(super) fn corner_tangents<'a>(
     Ok(out)
 }
 
-/// Per-vertex skin influences: four joints and unorm8 weights.
-pub(super) type Influence = ([u8; 4], [u8; 4]);
+/// Per-vertex skin influences: four joints and unorm16 weights.
+pub(super) type Influence = ([u8; 4], [u16; 4]);
 
 /// One model's welded vertices and its triangles per scene material.
 #[derive(Default)]
@@ -411,11 +411,11 @@ pub(super) struct Welder {
     pub(super) joints: Vec<[u8; 4]>,
     /// Per vertex, its rigid part.
     pub(super) parts: Vec<u16>,
-    pub(crate) weights: Vec<[u8; 4]>,
+    pub(crate) weights: Vec<[u16; 4]>,
     pub(super) groups: BTreeMap<usize, Vec<u32>>,
     /// Scene materials drawn on a mesh without the uv set 1 primvar.
     pub(super) missing_uv1: BTreeSet<usize>,
-    seen: HashMap<[u32; 20], u32>,
+    seen: HashMap<[u32; 22], u32>,
 }
 
 /// How a mesh's faces land in a model.
@@ -522,14 +522,17 @@ impl Welder {
         color: [f32; 4],
         (skin, part): (Influence, u16),
     ) -> u32 {
-        let mut key = [0u32; 20];
+        let mut key = [0u32; 22];
         let values = p.iter().chain(&n).chain(&t).chain(uv.as_flattened());
         for (k, v) in key.iter_mut().zip(values) {
             *k = v.to_bits();
         }
-        key[14] = u32::from_le_bytes(skin.0) ^ u32::from(part) << 16;
-        key[15] = u32::from_le_bytes(skin.1);
-        key[16..].copy_from_slice(&color.map(f32::to_bits));
+        let w = skin.1.map(u32::from);
+        key[14] = u32::from_le_bytes(skin.0);
+        key[15] = u32::from(part);
+        key[16] = w[0] | w[1] << 16;
+        key[17] = w[2] | w[3] << 16;
+        key[18..].copy_from_slice(&color.map(f32::to_bits));
         if let Some(&i) = self.seen.get(&key) {
             return i;
         }

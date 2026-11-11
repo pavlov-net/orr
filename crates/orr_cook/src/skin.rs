@@ -1093,13 +1093,14 @@ fn close(a: &Mat4, b: &Mat4) -> bool {
 pub(crate) type InfluenceSet = (Vec<[u16; 4]>, Vec<[f32; 4]>);
 
 /// Up to four influences of a vertex from every `JOINTS_n`/`WEIGHTS_n` pair, mapped to
-/// skeleton joints: the largest weights, renormalized and quantized to unorm8 summing to
-/// 255. Slots without weight repeat the first joint.
+/// skeleton joints: the largest weights, renormalized and quantized to unorm16 summing to
+/// 65535 by largest remainder. Unorm8 and unorm16 sources stay exact, as `257 k` and `k`, and
+/// other weights come within a step. Slots without weight repeat the first joint.
 pub(crate) fn influences(
     sets: &[InfluenceSet],
     map: &[u16],
     v: usize,
-) -> Result<([u16; 4], [u8; 4]), String> {
+) -> Result<([u16; 4], [u16; 4]), String> {
     let mut list: Vec<(u16, f32)> = Vec::with_capacity(4 * sets.len());
     for (joints, weights) in sets {
         for (&j, &w) in joints[v].iter().zip(&weights[v]) {
@@ -1124,10 +1125,13 @@ pub(crate) fn influences(
     }
     list.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     list.truncate(4);
-    let kept: f32 = list.iter().map(|(_, w)| w).sum();
-    let scaled: Vec<f32> = list.iter().map(|(_, w)| w / kept * 255.0).collect();
-    let mut q: Vec<u8> = scaled.iter().map(|s| s.floor() as u8).collect();
-    let short = 255 - q.iter().map(|&x| u32::from(x)).sum::<u32>();
+    let kept: f64 = list.iter().map(|&(_, w)| f64::from(w)).sum();
+    let scaled: Vec<f64> = list
+        .iter()
+        .map(|&(_, w)| f64::from(w) / kept * 65535.0)
+        .collect();
+    let mut q: Vec<u16> = scaled.iter().map(|s| s.floor() as u16).collect();
+    let short = 65535 - q.iter().map(|&x| u32::from(x)).sum::<u32>();
     let mut by_frac: Vec<usize> = (0..q.len()).collect();
     by_frac.sort_by(|&a, &b| {
         (scaled[b] - scaled[b].floor()).total_cmp(&(scaled[a] - scaled[a].floor()))

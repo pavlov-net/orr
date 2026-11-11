@@ -12,18 +12,18 @@ public static const uint SUBD_GREGORY = 1;
 public static const uint SUBD_LINEAR = 2;
 public static const uint SUBD_NONE = 0xff;
 
-// `Influence`: four joints (u8) and their weights (unorm8).
+// `Influence`: four joints (u8) and their weights (unorm16).
 public struct SubdInfluence
 {
     public uint4 joints;
     public float4 weights;
 }
 
-public SubdInfluence decode_influence(uint2 packed)
+public SubdInfluence decode_influence(uint3 packed)
 {
     SubdInfluence i;
     i.joints = uint4(packed.x, packed.x >> 8, packed.x >> 16, packed.x >> 24) & 0xff;
-    i.weights = unpack_unorm4x8(packed.y);
+    i.weights = unpack_unorm4x16(packed.yz);
     return i;
 }
 

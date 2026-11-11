@@ -13,7 +13,7 @@ pub(crate) const GDEFLATE_LEVEL: i32 = 12;
 
 /// Cook version per class, part of every key: raising one recooks that class.
 const VERSIONS: &[(Class, u32)] = &[
-    (Class::Mesh, 26),
+    (Class::Mesh, 27),
     (Class::Texture, 7),
     (Class::Material, 11),
     (Class::Model, 3),
@@ -22,7 +22,7 @@ const VERSIONS: &[(Class, u32)] = &[
     (Class::Skeleton, 2),
     (Class::Clip, 2),
     (Class::NeuralTextureSet, 3),
-    (Class::Subd, 4),
+    (Class::Subd, 5),
     (Class::Volume, 2),
     (Class::TextureTiles, 1),
 ];

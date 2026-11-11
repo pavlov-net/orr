@@ -298,9 +298,9 @@ struct Errors {
     /// weights as decoded) with the glTF sampler's joint matrices.
     skin_mm: f64,
     /// `mesh::skin` against reference skinning of the source vertex: adds the grid and the
-    /// unorm8 weights.
+    /// unorm16 weights.
     source_mm: f64,
-    /// Cooked weights against the source, in unorm8 steps.
+    /// Cooked weights against the source, in unorm16 steps.
     weight_steps: f64,
     clips: usize,
     rates: (f32, f32),
@@ -457,7 +457,7 @@ fn check(path: &Path, name: &str, settings: GltfSettings) -> (Cooked, Errors) {
                                     .filter(|i| i.0 == j)
                                     .map(|i| i.1)
                                     .sum();
-                                f64::from((cooked - source).abs()) * 255.0
+                                f64::from((cooked - source).abs()) * 65535.0
                             })
                             .fold(0.0, f64::max)
                     })

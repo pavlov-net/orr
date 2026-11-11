@@ -61,7 +61,7 @@ public struct SubdCageGpu
     public uint* stencil_points;    // cage point per term
     public float* stencil_weights;
     public float3* cage_points;     // rest
-    public uint2* skin;             // per cage point: joints u8x4, weights unorm8x4
+    public uint3* skin;             // per cage point: joints u8x4, weights unorm16x4
     public SubdPartGpu* parts;
     public uint* part_cvs;          // value point per part point
     public float4* value_points;    // a color, or a uv in its first two

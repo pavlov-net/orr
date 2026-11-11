@@ -23,7 +23,7 @@ use crate::blob::{put_table, read, table};
 use crate::mesh::Section;
 use crate::{Aabb, Error, Result, Span};
 
-pub const SCHEMA: u16 = 4;
+pub const SCHEMA: u16 = 5;
 
 /// Largest page.
 pub const PAGE_MAX: usize = 128 << 10;
@@ -89,12 +89,13 @@ impl SubdHeader {
     pub const UV_LINEAR_ALL: u8 = 5;
 }
 
-/// A cage point's skin: four skeleton joints and unorm8 weights that sum to 255.
+/// A cage point's skin: four skeleton joints and unorm16 weights ([`crate::mesh::unorm16`])
+/// that sum to 65535.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct Influence {
     pub joints: [u8; 4],
-    pub weights: [u8; 4],
+    pub weights: [u16; 4],
 }
 
 /// One page: the blob that holds it, its size and what it covers.
@@ -200,7 +201,7 @@ impl SubdInfo {
                 let mut out = Vec3::ZERO;
                 for (&j, &w) in s.joints.iter().zip(&s.weights) {
                     let q = palette[usize::from(j)].transform_point3(p);
-                    out += f32::from(w) / 255.0 * q;
+                    out += crate::mesh::unorm16(w) * q;
                 }
                 out.to_array()
             })

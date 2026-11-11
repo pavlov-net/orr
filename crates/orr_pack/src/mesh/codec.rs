@@ -32,7 +32,7 @@ const VERTEX_CODEC_LEVEL: i32 = 2;
 /// rejected.
 const VERTEX_CODEC_HEADER: u8 = 0xA0 | VERTEX_CODEC_VERSION as u8;
 const MAX_VERTICES: usize = 256;
-const MAX_VERTEX_BYTES: usize = 8 + 32;
+const MAX_VERTEX_BYTES: usize = 8 + 36;
 
 /// Stored form of a resident page. The meshlet codec may rotate a triangle's corners
 /// (order and winding kept), so [`decode_page`] of the result can differ from `page` in

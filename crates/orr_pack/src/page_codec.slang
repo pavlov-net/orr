@@ -9,7 +9,7 @@
 // codec) into its slots. Both return 0 or PAGE_CODEC_* bits; a page that sets any bit in
 // either pass is malformed, and the thread or workgroup that found it writes nothing.
 //
-// The decode keeps its working set in groupshared memory (32444 bytes, under Apple GPUs'
+// The decode keeps its working set in groupshared memory (32248 bytes, under Apple GPUs'
 // 32768) declared here, so a kernel that calls `page_decode_cluster` holds it; the module
 // has no bindings.
 module page_codec;
@@ -38,7 +38,7 @@ public struct StoredPage
 static const uint HEADER_BYTES = 96;
 static const uint CLUSTER_BYTES = 148;
 static const uint MAX_VERTICES = 256;
-static const uint MAX_VERTEX_BYTES = 8 + 32;
+static const uint MAX_VERTEX_BYTES = 8 + 36;
 static const uint MAX_CHANNELS = MAX_VERTEX_BYTES / 4;
 static const uint MAX_GROUPS = MAX_VERTICES / 16;
 static const uint COLUMN_GROUP_WORDS = MAX_GROUPS / 2;
@@ -46,10 +46,12 @@ static const uint COLUMN_GROUP_WORDS = MAX_GROUPS / 2;
 static const uint MAX_BLOCKS = 2;
 
 // The longest stream either decoder accepts: the widest vertices with every byte column as
-// 16 groups of 4-bit values that all escape, two blocks' control and group headers and the
-// tail, or every triangle with three extra corners, the odd count's pad included.
+// 16 groups of 4-bit values that all escape, two blocks' control and group headers (a byte per
+// four groups of each block, which splitting the groups adds one to) and the tail, or every
+// triangle with three extra corners, the odd count's pad included.
 static const uint VERTEX_STREAM_MAX = 1 + MAX_BLOCKS * MAX_CHANNELS
-    + MAX_VERTEX_BYTES * (4 + MAX_GROUPS * 24) + MAX_VERTEX_BYTES + MAX_CHANNELS;
+    + MAX_VERTEX_BYTES * (MAX_GROUPS / 4 + MAX_BLOCKS - 1 + MAX_GROUPS * 24) + MAX_VERTEX_BYTES
+    + MAX_CHANNELS;
 static const uint TRIANGLE_STREAM_MAX = 256 * 3 + 128 + 16;
 static const uint VERTEX_STREAM_WORDS = (VERTEX_STREAM_MAX + 3) / 4;
 static const uint TRIANGLE_STREAM_WORDS = (TRIANGLE_STREAM_MAX + 3) / 4;
@@ -61,10 +63,14 @@ static const uint COLUMN_GROUPS = 2;
 
 // Triangle corner slots: a corner value, or SLOT_POINTER | the slot it repeats.
 static const uint SLOT_POINTER = 0x80000000;
+// Where the slots start in codec_vstream.
+static const uint SLOTS = 0;
 
 // First byte of a vertex stream: the codec's 0xA0 and version 1.
 static const uint VERTEX_CODEC_HEADER = 0xA1;
 
+// The vertex stream, until the channels are built and its modes and tail kept in codec_tail; then
+// from SLOTS the triangle corner slots, 3 * MAX_VERTICES words.
 groupshared uint codec_vstream[VERTEX_STREAM_WORDS];
 groupshared uint codec_tstream[TRIANGLE_STREAM_WORDS];
 groupshared uint codec_columns[MAX_BLOCKS * MAX_VERTEX_BYTES];  // kind << 16 | stream offset
@@ -75,7 +81,7 @@ groupshared uint codec_groups[MAX_VERTEX_BYTES * COLUMN_GROUP_WORDS];
 // The byte columns (MAX_VERTEX_BYTES * MAX_VERTICES / 4 words), then the channels built from them.
 groupshared uint codec_channels[MAX_CHANNELS * MAX_VERTICES];
 groupshared uint codec_prefix[MAX_VERTICES];                     // extra | next << 16
-groupshared uint codec_slots[3 * MAX_VERTICES];
+groupshared uint codec_tail[2 * MAX_CHANNELS];                  // per channel its mode, then the last vertex's word
 groupshared uint codec_status;
 
 struct PageCheck
@@ -501,6 +507,12 @@ public uint page_decode_cluster(StoredPage p, uint cluster, uint lane)
         }
         built[ch] = x;
     }
+    // Vertex values continue from the last vertex, which the tail holds.
+    if (lane < channels)
+    {
+        codec_tail[lane] = channel_mode(vlen, stride, lane);
+        codec_tail[MAX_CHANNELS + lane] = vword(vlen - (stride + stride / 4) + lane * 4);
+    }
     GroupMemoryBarrierWithGroupSync();
     for (uint ch = 0; ch < channels; ch++)
         codec_channels[ch * MAX_VERTICES + lane] = built[ch];
@@ -549,15 +561,15 @@ public uint page_decode_cluster(StoredPage p, uint cluster, uint lane)
             next += 1 - fb;
             sc = fc != 0 ? tbyte(x) : next & 0xFF;
         }
-        codec_slots[3 * t] = sa;
-        codec_slots[3 * t + 1] = sb;
-        codec_slots[3 * t + 2] = sc;
+        codec_vstream[SLOTS + 3 * t] = sa;
+        codec_vstream[SLOTS + 3 * t + 1] = sb;
+        codec_vstream[SLOTS + 3 * t + 2] = sc;
     }
     GroupMemoryBarrierWithGroupSync();
 
     uint modes[MAX_CHANNELS];
     for (uint ch = 0; ch < channels; ch++)
-        modes[ch] = channel_mode(vlen, stride, ch);
+        modes[ch] = codec_tail[ch];
     for (uint d = 1; d < 512; d *= 2)
     {
         uint scan[MAX_CHANNELS];
@@ -571,9 +583,9 @@ public uint page_decode_cluster(StoredPage p, uint cluster, uint lane)
         uint slot[3];
         for (uint s = 0; s < 3; s++)
         {
-            uint v = lane < tn ? codec_slots[3 * lane + s] : 0;
+            uint v = lane < tn ? codec_vstream[SLOTS + 3 * lane + s] : 0;
             if ((v & SLOT_POINTER) != 0)
-                v = codec_slots[v & ~SLOT_POINTER];
+                v = codec_vstream[SLOTS + (v & ~SLOT_POINTER)];
             slot[s] = v;
         }
         GroupMemoryBarrierWithGroupSync();
@@ -582,23 +594,21 @@ public uint page_decode_cluster(StoredPage p, uint cluster, uint lane)
         if (lane < tn)
         {
             for (uint s = 0; s < 3; s++)
-                codec_slots[3 * lane + s] = slot[s];
+                codec_vstream[SLOTS + 3 * lane + s] = slot[s];
         }
         GroupMemoryBarrierWithGroupSync();
     }
 
-    // Vertex values continue from the last vertex, which the tail holds.
-    uint tail = vlen - (stride + stride / 4);
     for (uint ch = 0; ch < channels; ch++)
     {
         uint i = ch * MAX_VERTICES + lane;
-        codec_channels[i] = channel_combine(modes[ch], vword(tail + ch * 4), codec_channels[i]);
+        codec_channels[i] = channel_combine(modes[ch], codec_tail[MAX_CHANNELS + ch], codec_channels[i]);
     }
     if (lane < tn)
     {
         for (uint s = 0; s < 3; s++)
         {
-            if (codec_slots[3 * lane + s] >= vn)
+            if (codec_vstream[SLOTS + 3 * lane + s] >= vn)
                 InterlockedOr(codec_status, PAGE_CODEC_BAD_TRIANGLES);
         }
     }
@@ -635,7 +645,7 @@ public uint page_decode_cluster(StoredPage p, uint cluster, uint lane)
     {
         uint v = 0;
         for (uint j = 0; j < 4 && d * 4 + j < tn * 3; j++)
-            v |= codec_slots[d * 4 + j] << (8 * j);
+            v |= codec_vstream[SLOTS + d * 4 + j] << (8 * j);
         tris[d] = v;
     }
     return 0;
