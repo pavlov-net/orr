@@ -225,8 +225,6 @@ public struct MaterialGpu
     public uint flags;                      // MATERIAL_*
     public float displacement_scale;        // m
     public float displacement_offset;
-    public float displacement_min;
-    public float displacement_max;
     public float object_frame[9];           // rows, from the identity: mesh space from an object space map's
     public float displacement_tangent[4];   // scale and offset along u, then along v, as above
     public TextureIndex textures[TEXTURE_SLOTS];

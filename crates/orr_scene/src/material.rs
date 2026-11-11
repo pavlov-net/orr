@@ -261,8 +261,6 @@ impl MaterialGpu {
             flags,
             displacement_scale: m.displacement_scale,
             displacement_offset: m.displacement_offset,
-            displacement_min: m.displacement_min,
-            displacement_max: m.displacement_max,
             object_frame: m.object_frame.concat().try_into().expect("nine entries"),
             displacement_tangent: [
                 m.displacement_tangent[0][0],
