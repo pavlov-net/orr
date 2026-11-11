@@ -92,6 +92,22 @@ impl OriginProbes {
 const NONE: u32 = u32::MAX;
 /// `RT_CUT_BUILT` in `cut.slang`.
 const RT_CUT_BUILT: u32 = 255;
+/// `COPY_FAR` in `tables.slang`.
+const COPY_FAR: u32 = 0x8000_0000;
+/// `ORIGIN_PROBE_*` in `probe.slang`.
+const ORIGIN_PROBE_SKY: u32 = 0;
+const ORIGIN_PROBE_PRODUCER: u32 = 2;
+
+/// Copy `copy` without its far-step bit, and how the far step reads.
+fn copy_name(copy: u32) -> (u32, &'static str) {
+    let far = if copy & COPY_FAR != 0 {
+        " (far step)"
+    } else {
+        ""
+    };
+    (copy & !COPY_FAR, far)
+}
+
 /// `CLASS_*` in `orr_shaders.trace`.
 const CLASSES: [&str; 6] = [
     "opaque",
@@ -125,15 +141,10 @@ impl fmt::Display for TracedHit {
             k => format!("cached cut {k}"),
         };
         let n = self.normal;
+        let (copy, far) = copy_name(self.copy);
         write!(
             f,
-            ": copy {}{}, model {}, mesh {}, mesh cluster {} (cluster id {}), triangle {}; its instance holds {cut}; geometric normal ({:.3}, {:.3}, {:.3})",
-            self.copy & 0x7fff_ffff,
-            if self.copy & 0x8000_0000 != 0 {
-                " (far step)"
-            } else {
-                ""
-            },
+            ": copy {copy}{far}, model {}, mesh {}, mesh cluster {} (cluster id {}), triangle {}; its instance holds {cut}; geometric normal ({:.3}, {:.3}, {:.3})",
             self.model,
             self.mesh,
             self.mesh_cluster,
@@ -156,27 +167,49 @@ impl fmt::Display for OriginProbe {
             "traced camera ray from render ({:.3}, {:.3}, {:.3}) along ({:.4}, {:.4}, {:.4}) meets {}",
             o[0], o[1], o[2], d[0], d[1], d[2], g.traced
         )?;
-        if g.hit == 0 {
+        if g.hit == ORIGIN_PROBE_SKY {
             return writeln!(f, "lighting: no first vertex (sky)");
         }
         let policy = ["default", "surface", "triangle", "?"][g.policy.min(3) as usize];
+        let p = g.position;
+        let n = g.normal;
+        let of = if g.hit == ORIGIN_PROBE_PRODUCER {
+            format!("producer entry {}", g.instance)
+        } else {
+            let (copy, far) = copy_name(g.instance);
+            format!("copy {copy}{far}")
+        };
         writeln!(
             f,
-            "lighting: first vertex {:.3} m from the eye; origin error max(raster {:.6}, traced {:.6}) = {:.6} m, policy {policy}, floor {:.6} m: its rays leave {:.6} m off the surface",
-            g.camera_distance, g.raster_error, g.traced_error, g.origin_error, g.floor, g.offset
+            "lighting: first vertex of {of}, material {}, at render ({:.3}, {:.3}, {:.3}), {:.3} m from the eye, shading normal ({:.3}, {:.3}, {:.3}); origin error max(raster {:.6}, traced {:.6}) = {:.6} m, policy {policy}, floor {:.6} m: its rays leave {:.6} m off the surface",
+            g.material,
+            p[0],
+            p[1],
+            p[2],
+            g.camera_distance,
+            n[0],
+            n[1],
+            n[2],
+            g.raster_error,
+            g.traced_error,
+            g.origin_error,
+            g.floor,
+            g.offset
         )?;
         if g.sun == 0 {
             return writeln!(f, "sun: the scene has no directional light");
         }
         let s = g.sun_direction;
-        let n = g.geometric_normal;
+        let ng = g.geometric_normal;
+        let cosine = |n: [f32; 4]| s[0] * n[0] + s[1] * n[1] + s[2] * n[2];
         writeln!(
             f,
-            "sun ray along ({:.4}, {:.4}, {:.4}), cosine {:.4} with the geometric normal, from {:.6} m off the surface, meets {}",
+            "sun ray along ({:.4}, {:.4}, {:.4}), cosine {:.4} with the shading normal and {:.4} with the geometric normal, from {:.6} m off the surface, meets {}",
             s[0],
             s[1],
             s[2],
-            s[0] * n[0] + s[1] * n[1] + s[2] * n[2],
+            cosine(n),
+            cosine(ng),
             g.sun_offset,
             g.blocker
         )

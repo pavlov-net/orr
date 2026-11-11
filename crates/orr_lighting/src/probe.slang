@@ -6,6 +6,7 @@
 import orr_shaders.abi;
 import orr_shaders.trace;
 import orr_scene.gbuffer;
+import orr_scene.hit;
 import orr_scene.surface;
 import orr_scene.visibility;
 import orr_lighting.media;
@@ -15,11 +16,16 @@ import orr_lighting.traced_debug;
 
 extern struct Surface : ISurface = StandardSurface;
 
+// `OriginProbeGpu.hit`.
+public static const uint ORIGIN_PROBE_SKY = 0;
+public static const uint ORIGIN_PROBE_COPY = 1;     // `instance` is a slot copy
+public static const uint ORIGIN_PROBE_PRODUCER = 2; // `instance` is a producer entry
+
 public struct OriginProbeGpu
 {
-    public uint hit;               // 0 on the sky
+    public uint hit;               // ORIGIN_PROBE_*
     public uint policy;            // ORIGIN_*
-    public uint instance;          // GSurface.instance
+    public uint instance;          // GSurface.instance, or its producer entry
     public uint material;
     public float raster_error;     // m: the G-buffer's bound
     public float traced_error;     // m: what the copy's traced cut holds
@@ -72,9 +78,11 @@ void probe(uint3 id: SV_DispatchThreadID)
     if (gbuffer_vertex(s, v, root.gbuffer, pixel, x))
     {
         GSurface g = x.surface;
-        o.hit = 1;
+        uint entry;
+        bool producer = hit_producer(s, g.instance, entry);
+        o.hit = producer ? ORIGIN_PROBE_PRODUCER : ORIGIN_PROBE_COPY;
         o.policy = gsurface_origin(g);
-        o.instance = g.instance;
+        o.instance = producer ? entry : g.instance;
         o.material = g.material;
         o.raster_error = g.raster_error;
         o.traced_error = traced_error(s, g.instance);
