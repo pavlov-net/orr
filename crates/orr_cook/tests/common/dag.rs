@@ -13,11 +13,12 @@ pub(crate) fn read(a: &Archive, b: &orr_pack::Blob) -> Vec<u8> {
     v
 }
 
-/// A cooked cluster: its record, page and triangle positions.
+/// A cooked cluster: its record, page, and triangle positions and vertex normals.
 pub(crate) struct C {
     pub(crate) record: Cluster,
     pub(crate) page: usize,
     pub(crate) tris: Vec<[[f32; 3]; 3]>,
+    pub(crate) normals: Vec<[[f32; 3]; 3]>,
 }
 
 pub(crate) struct Dag {
@@ -46,17 +47,19 @@ pub(crate) fn load(a: &Archive, name: &str) -> Dag {
         assert_eq!(tris.sum::<u32>(), p.tri_count, "page {pi}");
         for i in 0..view.cluster_count() {
             let c = view.cluster(i);
-            let tris = (0..u32::from(c.tri_count))
-                .map(|t| {
-                    view.triangle(&c, t)
-                        .map(|v| view.position(&c, u32::from(v)))
-                })
-                .collect();
+            let corners = |at: &dyn Fn(u32) -> [f32; 3]| {
+                (0..u32::from(c.tri_count))
+                    .map(|t| view.triangle(&c, t).map(|v| at(u32::from(v))))
+                    .collect()
+            };
+            let tris = corners(&|v| view.position(&c, v));
+            let normals = corners(&|v| view.normal(&c, v));
             here.push(clusters.len());
             clusters.push(C {
                 record: c,
                 page: pi,
                 tris,
+                normals,
             });
         }
         by_page.push(here);
