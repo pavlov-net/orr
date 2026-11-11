@@ -187,7 +187,7 @@ public struct CutGpu
     public uint clas_capacity;
     public uint job_capacity;      // also of `part_lists`
     public uint key_mask;
-    public uint model_capacity;
     public uint feedback_capacity;
     public uint feedback_words;    // of `touched` and `wanted`
+    public uint _pad;
 }

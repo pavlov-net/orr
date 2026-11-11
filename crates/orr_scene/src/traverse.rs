@@ -602,9 +602,9 @@ impl Cuts {
             clas_capacity: 0,
             job_capacity: 0,
             key_mask: 0,
-            model_capacity: sizes.models,
             feedback_capacity: sizes.requests,
             feedback_words: sizes.feedback_words(),
+            _pad: 0,
         });
         let ran = Ran {
             scale: 1.0,
