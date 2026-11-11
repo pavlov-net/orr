@@ -230,14 +230,42 @@ fn meshlets(
     refined: i32,
 ) -> Vec<Cluster> {
     // meshoptimizer sizes scratch by the vertex count, so it sees only the vertices from
-    // the first `corners` uses to the last.
+    // the first `corners` uses to the last, or, where those span more vertices than there are
+    // corners, as wedges past the mesh's vertices make them, only the vertices it uses, in
+    // order.
     let (Some(&first), Some(&last)) = (corners.iter().min(), corners.iter().max()) else {
         return Vec::new();
     };
-    for v in corners.iter_mut() {
-        *v -= first;
-    }
-    let positions = &positions[first as usize * 3..last as usize * 3 + 3];
+    let used: Option<Vec<u32>> = ((last - first) as usize >= corners.len()).then(|| {
+        let mut used = corners.to_vec();
+        used.sort_unstable();
+        used.dedup();
+        used
+    });
+    let compact: Vec<f32>;
+    let positions = match &used {
+        Some(used) => {
+            for v in corners.iter_mut() {
+                *v = used.binary_search(v).expect("a used vertex") as u32;
+            }
+            compact = used
+                .iter()
+                .flat_map(|&v| {
+                    positions[3 * v as usize..3 * v as usize + 3]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            &compact[..]
+        }
+        None => {
+            for v in corners.iter_mut() {
+                *v -= first;
+            }
+            &positions[first as usize * 3..last as usize * 3 + 3]
+        }
+    };
+    let vertex = |v: u32| used.as_ref().map_or(first + v, |used| used[v as usize]);
     let indices = &*corners;
     // SAFETY: plain bound query.
     let max =
@@ -304,7 +332,7 @@ fn meshlets(
             },
         });
         for (o, &t) in corners[at..at + n].iter_mut().zip(&triangles[to..to + n]) {
-            *o = first + vertices[vo + usize::from(t)];
+            *o = vertex(vertices[vo + usize::from(t)]);
         }
         at += n;
     }
