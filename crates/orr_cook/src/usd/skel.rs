@@ -26,21 +26,20 @@
 //! [`PrimRig`]s: what moves is a [`Rig`](crate::skin::Rig) of prims, and a `Skeleton` under such a
 //! prim takes it and every prim between them as joints above its own ([`Skel::hang`]). An xform
 //! joint's clip keys come from the prim's transform at its samples and between them, every
-//! [`ClipSettings::max_rate`], so an op that turns past half a circle between two samples keeps
-//! its turn.
+//! [`ClipSettings::max_rate`](crate::skin::ClipSettings::max_rate), so an op that turns past half
+//! a circle between two samples keeps its turn.
 
 use std::collections::HashMap;
 
 use openusd::usd;
 use orr_math::{Affine3, DMat3, DMat4, DVec3, DVec4};
-use orr_pack::clip::Clip;
 use orr_pack::skeleton::{MAX_SKINNED_JOINTS, NO_PARENT, SkeletonInfo, Trs};
 
 use super::Timeline;
 use super::mesh::Influence;
 use super::read::{PrimReader, matrix, quat};
 use crate::import::{collapses, singular};
-use crate::skin::{self, Channel, ClipSettings, Interpolation, Property};
+use crate::skin::{self, Channel, ClipSource, Interpolation, Property};
 
 /// The attributes of a `SkelAnimation` that pose its joints.
 pub(super) const ANIMATED: [&str; 3] = ["translations", "rotations", "scales"];
@@ -421,8 +420,7 @@ impl Skel {
         anim: &usd::Prim,
         timeline: &Timeline,
         xforms: &[Channel],
-        settings: &ClipSettings,
-    ) -> Result<Option<Clip>, String> {
+    ) -> Result<Option<ClipSource>, String> {
         let path = anim.path().as_str().to_string();
         let names = PrimReader {
             prim: anim,
@@ -495,12 +493,10 @@ impl Skel {
                     .map_err(|e| format!("{path} joint {}: {e}", names[i]))?,
             );
         }
-        Ok(Some(skin::resample(
-            &self.info,
-            &channels,
-            timeline.span(),
-            settings,
-        )))
+        Ok(Some(ClipSource {
+            channels,
+            span: timeline.span(),
+        }))
     }
 }
 

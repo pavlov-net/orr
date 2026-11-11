@@ -3838,6 +3838,66 @@ fn clips_and_pages_run_on_the_stage_timeline() {
     assert_copies(&a, 1.75, &[[3.0, 0.0, 0.0]]);
 }
 
+/// The copies a moving instancer places under a turning prim hang from the prim's joint, so the
+/// joint's clip holds them as it holds a mesh as far out: a turn that bends by a few degrees,
+/// between frames, moves both by millimeters 20 m away.
+#[test]
+fn moving_copies_reach_as_far_as_a_mesh_from_the_joint_they_hang_from() {
+    let turn = |name: &str, inside: &str| {
+        let body = format!(
+            r#"def Xform "Turn"
+{{
+    double xformOp:rotateY.timeSamples = {{ 0: 0, 3.7: 2, 10: 0 }}
+    uniform token[] xformOpOrder = ["xformOp:rotateY"]
+    {inside}
+}}
+def Mesh "Held"
+{{
+    {TRIANGLE}
+}}"#
+        );
+        let a = cook(name, &body);
+        let clip = a
+            .entries()
+            .iter()
+            .find(|e| e.class == Class::Clip as u16 && a.name(e).ends_with("/clip/xform"))
+            .unwrap();
+        let clip = Clip::parse(&read(&a, &a.blobs(clip)[0]), &read(&a, &a.blobs(clip)[1]));
+        clip.unwrap().header.sample_rate
+    };
+    let mesh = turn(
+        "reach-mesh",
+        &format!(
+            r#"def Mesh "M"
+    {{
+        double3 xformOp:translate = (20, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        {TRIANGLE}
+    }}"#
+        ),
+    );
+    let copies = turn(
+        "reach-copies",
+        &format!(
+            r#"def PointInstancer "Crowd"
+    {{
+        rel prototypes = [</Turn/Crowd/Proto>]
+        int[] protoIndices = [0]
+        point3f[] positions.timeSamples = {{ 0: [(20, 0, 0)], 10: [(20, 0, 0.5)] }}
+        def Xform "Proto"
+        {{
+            def Mesh "M"
+            {{
+                {TRIANGLE}
+            }}
+        }}
+    }}"#
+        ),
+    );
+    assert!(mesh > 30.0, "{mesh} fps");
+    assert_eq!(copies, mesh);
+}
+
 /// `schemas.dox` poses a skeleton in its prim's space, so a prim above it moves the skin: it
 /// takes that prim as a joint, and every prim down to the skeleton.
 #[test]

@@ -22,7 +22,8 @@
 //! whatever they target, so the clips one animation leaves on several skeletons keep time. It is
 //! resampled at the frame rate nearest the setting that fits a whole number of frame intervals,
 //! so both ends are frames, and the rate doubles until the clip's sampler holds every joint
-//! within [`ClipSettings`]' bounds of the source. Channels follow glTF sampling (`STEP`,
+//! within [`ClipSettings`]' bounds of the source, measured where the joint's geometry is.
+//! Channels follow glTF sampling (`STEP`,
 //! `LINEAR` with slerp on the shorter arc, `CUBICSPLINE`; values clamp outside their keys);
 //! morph weight channels and channels on other nodes are ignored. A clip is named after its
 //! animation, or by the animation's index when the name is empty, all digits or shared with
@@ -31,7 +32,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4, Mat3, Mat4, Quat, Vec4};
+use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4, Mat4, Quat, Vec4};
 use orr_pack::AssetId;
 use orr_pack::clip::{Clip, ClipHeader};
 use orr_pack::skeleton::{MAX_JOINTS, MAX_SKINNED_JOINTS, NO_PARENT, SkeletonInfo, Trs, slerp};
@@ -39,6 +40,7 @@ use serde::Deserialize;
 
 use crate::gltf::data::Data;
 use crate::import::collapses;
+use crate::par::prelude::*;
 
 /// A node's local transform.
 fn local(node: &gltf::Node<'_>) -> DMat4 {
@@ -602,15 +604,13 @@ impl Skeleton {
         Ok((still, graph.in_model(self.frame, node)?))
     }
 
-    /// Clips of every animation that moves the skeleton, with their names. `spans` is
-    /// [`animation_spans`].
+    /// Clips of every animation that moves the skeleton, with their names, for [`resample`].
+    /// `spans` is [`animation_spans`].
     pub(crate) fn clips(
         &self,
         data: &Data<'_>,
         spans: &[(f64, f64)],
-        settings: &ClipSettings,
-    ) -> Result<Vec<(String, Clip)>, String> {
-        settings.check()?;
+    ) -> Result<Vec<(String, ClipSource)>, String> {
         let mut clips = Vec::new();
         for anim in data.doc.doc.animations() {
             let what = || format!("animation {}", anim.index());
@@ -660,7 +660,10 @@ impl Skeleton {
             if channels.is_empty() {
                 continue;
             }
-            let clip = resample(&self.info, &channels, spans[anim.index()], settings);
+            let clip = ClipSource {
+                channels,
+                span: spans[anim.index()],
+            };
             clips.push((anim.index(), anim.name().unwrap_or_default(), clip));
         }
         let mut count: HashMap<&str, usize> = HashMap::new();
@@ -696,28 +699,42 @@ pub(crate) fn animation_spans(data: &Data<'_>) -> Result<Vec<(f64, f64)>, String
     Ok(spans)
 }
 
-/// The clip of `channels` (checked) over `span` (the start and length, in seconds), resampled at
-/// the rate nearest `settings.rate` that fits a whole number of frame intervals, doubling until
-/// the clip's sampler holds every joint within the settings' bounds or the rate reaches
-/// `max_rate`.
+/// A clip before it is resampled: its channels (checked) and the span, start and length in
+/// seconds, it runs over.
+pub(crate) struct ClipSource {
+    pub(crate) channels: Vec<Channel>,
+    pub(crate) span: (f64, f64),
+}
+
+/// The clip of `source` resampled at the rate nearest `settings.rate` that fits a whole number of
+/// frame intervals, doubling until the clip's sampler holds every joint within the settings'
+/// bounds of the source or the rate reaches `max_rate`. `reach` is each joint's
+/// ([`crate::import::Scene::reaches`]).
 pub(crate) fn resample(
     info: &SkeletonInfo,
-    channels: &[Channel],
-    span: (f64, f64),
+    source: &ClipSource,
+    reach: &[f64],
     settings: &ClipSettings,
 ) -> Clip {
     let mut rate = settings.rate;
     loop {
-        let clip = sample(info, channels, span, rate);
-        let (position, rotation) = error(info, channels, span, &clip);
-        if (position <= settings.position_error && rotation <= settings.rotation_error)
-            || rate * 2.0 > settings.max_rate
+        let clip = sample(info, &source.channels, source.span, rate);
+        if rate * 2.0 > settings.max_rate {
+            return clip;
+        }
+        let (position, rotation) = error(info, source, &clip, reach, CHECKS);
+        if position <= f64::from(settings.position_error)
+            && rotation <= f64::from(settings.rotation_error)
         {
             return clip;
         }
         rate *= 2.0;
     }
 }
+
+/// Times [`error`] takes in each interval between consecutive frame and key times, from its
+/// start: enough that the largest error it finds is the largest of a far denser search.
+const CHECKS: usize = 4;
 
 /// Local transforms at time `t`: the rest pose with the channels applied.
 fn pose(info: &SkeletonInfo, channels: &[Channel], t: f64) -> Vec<Trs> {
@@ -776,37 +793,54 @@ fn sample(info: &SkeletonInfo, channels: &[Channel], span: (f64, f64), rate: f32
     }
 }
 
-/// Largest model-space joint error of `clip` against the channels, in meters and
-/// degrees, over every key time and the middle of every frame interval.
-fn error(info: &SkeletonInfo, channels: &[Channel], span: (f64, f64), clip: &Clip) -> (f32, f32) {
-    let (start, duration) = span;
+/// Largest error of `clip` against the source over every joint, at `per_interval` evenly spaced
+/// times in each interval between consecutive frame and key times: in meters, the farthest a
+/// point within the joint's `reach` of its origin lands from where the source puts it, and in
+/// degrees, the angle between the joint's frames.
+fn error(
+    info: &SkeletonInfo,
+    source: &ClipSource,
+    clip: &Clip,
+    reach: &[f64],
+    per_interval: usize,
+) -> (f64, f64) {
+    let (start, duration) = source.span;
     let h = &clip.header;
-    let mut times: Vec<f64> = channels
-        .iter()
-        .flat_map(|c| c.times.iter().map(|&t| f64::from(t) - start))
-        .collect();
-    times.extend((0..h.frame_count - 1).map(|f| (f64::from(f) + 0.5) / f64::from(h.sample_rate)));
-    times.sort_by(f64::total_cmp);
-    times.dedup();
-    let n = info.joint_count();
-    let (mut sampled, mut model, mut want) = (
-        vec![Trs::IDENTITY; n],
-        vec![Affine3::IDENTITY; n],
-        vec![Affine3::IDENTITY; n],
-    );
-    let (mut position, mut rotation) = (0.0f32, 0.0f32);
-    for t in times {
-        let t = t.clamp(0.0, duration);
-        clip.sample(t as f32, &mut sampled);
-        info.model_pose(&sampled, &mut model);
-        info.model_pose(&pose(info, channels, start + t), &mut want);
-        for (a, b) in model.iter().zip(&want) {
-            let (p, r) = pose_error(a, b);
-            position = position.max(p);
-            rotation = rotation.max(r);
-        }
+    let inside = |t: &f64| 0.0 < *t && *t < duration;
+    let keys = source.channels.iter().flat_map(|c| &c.times);
+    let mut ends: Vec<f64> = keys.map(|&t| f64::from(t) - start).filter(inside).collect();
+    let frames = (0..h.frame_count).map(|f| f64::from(f) / f64::from(h.sample_rate));
+    ends.extend(frames.filter(inside));
+    ends.extend([0.0, duration]);
+    ends.sort_by(f64::total_cmp);
+    ends.dedup();
+    let mut times = Vec::with_capacity(ends.len() * per_interval);
+    for w in ends.windows(2) {
+        let at = |i: usize| w[0] + (w[1] - w[0]) * i as f64 / per_interval as f64;
+        times.extend((0..per_interval).map(at));
     }
-    (position, rotation)
+    times.extend(ends.last());
+    let n = info.joint_count();
+    let worst = |chunk: &[f64]| {
+        let (mut sampled, mut model, mut want) = (
+            vec![Trs::IDENTITY; n],
+            vec![Affine3::IDENTITY; n],
+            vec![Affine3::IDENTITY; n],
+        );
+        let mut out = (0.0f64, 0.0f64);
+        for &t in chunk {
+            clip.sample(t as f32, &mut sampled);
+            info.model_pose(&sampled, &mut model);
+            info.model_pose(&pose(info, &source.channels, start + t), &mut want);
+            for ((a, b), &r) in model.iter().zip(&want).zip(reach) {
+                let (p, angle) = pose_error(a, b, r);
+                out = (out.0.max(p), out.1.max(angle));
+            }
+        }
+        out
+    };
+    let max = |a: (f64, f64), b: (f64, f64)| (a.0.max(b.0), a.1.max(b.1));
+    times.par_chunks(256).map(worst).reduce(|| (0.0, 0.0), max)
 }
 
 /// How clips are resampled.
@@ -816,8 +850,11 @@ pub struct ClipSettings {
     /// Frames per second a clip starts from. Each clip takes the nearest rate that fits a
     /// whole number of frame intervals.
     pub rate: f32,
-    /// While some joint's model-space pose is further than these (m, degrees) from the glTF
-    /// sampler, at a key time or between two frames, the rate doubles.
+    /// While, at some time, a point that a joint moves lands further than `position_error`
+    /// meters from where the source puts it, or the joint's frame turns further than
+    /// `rotation_error` degrees from the source's, the rate doubles. The points are those
+    /// within the joint's reach, the farthest of what it moves from its origin in its own
+    /// space; the distance is in model space and units, without the scale of any placement.
     pub position_error: f32,
     pub rotation_error: f32,
     /// The rate stops doubling here; a clip that still misses the bounds (a `STEP` channel
@@ -852,29 +889,49 @@ impl ClipSettings {
     }
 }
 
-/// Translation distance (m) and rotation angle (degrees) between two transforms: the larger of
-/// the angle between the frames of their linear parts, which a collapsed axis still completes,
-/// and the angle between any axis and its counterpart, which shows a shear the frames don't.
-fn pose_error(a: &Affine3, b: &Affine3) -> (f32, f32) {
-    let rot = |m: &Affine3| {
-        let l = DMat3::from_cols_array(&m.matrix3.to_cols_array().map(f64::from));
-        Mat3::from_quat(stretch_rotation(l).1.normalize().as_quat())
-    };
-    let d = rot(a).transpose() * rot(b);
+/// How far apart two joint transforms put the points within `reach` of the joint's origin, at
+/// most (m), and the rotation angle between them (degrees). A point `x` of the joint's space
+/// lands `|(a - b) x|` apart, which is at most the distance of the origins and the most the
+/// difference of the linear parts stretches a vector of length `reach`: that covers turns,
+/// scales and shears alike. The angle is the larger of the angle between the frames of their
+/// linear parts, which a collapsed axis still completes, and the angle between any axis and its
+/// counterpart, which shows a shear the frames don't.
+fn pose_error(a: &Affine3, b: &Affine3, reach: f64) -> (f64, f64) {
+    let linear = |m: &Affine3| DMat3::from_cols_array(&m.matrix3.to_cols_array().map(f64::from));
+    let origin = |m: &Affine3| DVec3::from_array(m.translation.to_array().map(f64::from));
+    let (la, lb) = (linear(a), linear(b));
+    let apart = origin(a).distance(origin(b)) + spectral_norm(la - lb) * reach;
+    let rot = |l: DMat3| DMat3::from_quat(stretch_rotation(l).1.normalize());
+    let d = rot(la).transpose() * rot(lb);
+    // Rounding can take the trace of a rotation past 3.
     let cos = ((d.x_axis.x + d.y_axis.y + d.z_axis.z - 1.0) / 2.0).clamp(-1.0, 1.0);
-    let (p, q) = (&a.matrix3, &b.matrix3);
     let lean = [
-        (p.x_axis, q.x_axis),
-        (p.y_axis, q.y_axis),
-        (p.z_axis, q.z_axis),
+        (la.x_axis, lb.x_axis),
+        (la.y_axis, lb.y_axis),
+        (la.z_axis, lb.z_axis),
     ]
     .map(|(u, v)| u.cross(v).length().atan2(u.dot(v)))
     .into_iter()
-    .fold(0.0, f32::max);
-    (
-        a.translation.distance(b.translation),
-        cos.acos().max(lean).to_degrees(),
-    )
+    .fold(0.0, f64::max);
+    (apart, cos.acos().max(lean).to_degrees())
+}
+
+/// The largest singular value of `m`, the most it stretches a vector: the root of the largest
+/// eigenvalue of `m^T m`, from the closed form of a symmetric 3 x 3 matrix's (Smith, 1961).
+pub(crate) fn spectral_norm(m: DMat3) -> f64 {
+    let s = m.transpose() * m;
+    let diagonal = DVec3::new(s.x_axis.x, s.y_axis.y, s.z_axis.z);
+    let q = diagonal.element_sum() / 3.0;
+    let off = s.y_axis.x.powi(2) + s.z_axis.x.powi(2) + s.z_axis.y.powi(2);
+    let p2 = (diagonal - q).length_squared() + 2.0 * off;
+    if p2 == 0.0 {
+        return q.sqrt();
+    }
+    let p = (p2 / 6.0).sqrt();
+    let b = (s - DMat3::from_diagonal(DVec3::splat(q))) * p.recip();
+    // Rounding can take the half determinant past 1 where eigenvalues meet.
+    let r = (b.determinant() / 2.0).clamp(-1.0, 1.0);
+    (q + 2.0 * p * (r.acos() / 3.0).cos()).sqrt()
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -1139,4 +1196,159 @@ pub(crate) fn influences(
         }
     }
     Ok((joints, weights))
+}
+
+#[cfg(test)]
+mod tests {
+    use orr_math::Vec3;
+
+    use super::*;
+
+    /// One joint at the origin, keyed by `channels` over `length` seconds.
+    fn one_joint(channels: Vec<Channel>, length: f64) -> (SkeletonInfo, ClipSource) {
+        let info = SkeletonInfo {
+            root: Affine3::IDENTITY,
+            parents: vec![NO_PARENT],
+            rest: vec![Trs::IDENTITY],
+            inverse_binds: vec![Affine3::IDENTITY],
+            names: vec!["j".into()],
+        };
+        (
+            info,
+            ClipSource {
+                channels,
+                span: (0.0, length),
+            },
+        )
+    }
+
+    /// A turn about z of `amplitude` degrees, `sin(2 pi t / period)`, keyed `rate` times a
+    /// second for `length` seconds and slerped between keys.
+    fn swing(rate: f64, amplitude: f64, period: f64, length: f64) -> (SkeletonInfo, ClipSource) {
+        let keys = (length * rate).round() as usize;
+        let times: Vec<f32> = (0..=keys).map(|k| (k as f64 / rate) as f32).collect();
+        let values = times
+            .iter()
+            .map(|&t| {
+                let a =
+                    amplitude.to_radians() * (std::f64::consts::TAU * f64::from(t) / period).sin();
+                DQuat::from_rotation_z(a).as_quat().to_array()
+            })
+            .collect();
+        let ch = Channel {
+            joint: 0,
+            property: Property::Rotation,
+            interpolation: Interpolation::Linear,
+            times,
+            values,
+        };
+        one_joint(vec![ch], length)
+    }
+
+    /// A scale from 0 to 1 over `length` seconds, a cubic spline with flat ends.
+    fn pop(length: f64) -> (SkeletonInfo, ClipSource) {
+        let flat = [0.0; 4];
+        let ch = Channel {
+            joint: 0,
+            property: Property::Scale,
+            interpolation: Interpolation::CubicSpline,
+            times: vec![0.0, length as f32],
+            values: vec![
+                flat,
+                [0.0, 0.0, 0.0, 0.0],
+                flat,
+                flat,
+                [1.0, 1.0, 1.0, 0.0],
+                flat,
+            ],
+        };
+        one_joint(vec![ch], length)
+    }
+
+    /// Two joints, the child 1 m out along x: the parent turns about z, keyed at uneven
+    /// times, and the child moves along a cubic spline with tangents.
+    fn chain() -> (SkeletonInfo, ClipSource) {
+        let times = vec![0.0, 0.3, 0.45, 1.1, 1.5];
+        let turn = |a: f64| DQuat::from_rotation_z(a.to_radians()).as_quat().to_array();
+        let parent = Channel {
+            joint: 0,
+            property: Property::Rotation,
+            interpolation: Interpolation::Linear,
+            values: [0.0, 40.0, -10.0, 70.0, 0.0].map(turn).to_vec(),
+            times: times.clone(),
+        };
+        let point = |x: f32, y: f32| [x, y, 0.0, 0.0];
+        let child = Channel {
+            joint: 1,
+            property: Property::Translation,
+            interpolation: Interpolation::CubicSpline,
+            values: [
+                [point(0.0, 0.0), point(1.0, 0.0), point(0.0, 2.0)],
+                [point(-1.0, 0.0), point(1.0, 0.5), point(3.0, -1.0)],
+                [point(0.0, 4.0), point(1.5, 0.0), point(0.0, -4.0)],
+                [point(2.0, 0.0), point(1.0, -0.5), point(-2.0, 1.0)],
+                [point(0.0, 0.0), point(1.0, 0.0), point(0.0, 0.0)],
+            ]
+            .concat(),
+            times,
+        };
+        let (mut info, mut source) = one_joint(vec![parent, child], 1.5);
+        info.parents.push(0);
+        info.rest.push(Trs {
+            translation: [1.0, 0.0, 0.0],
+            ..Trs::IDENTITY
+        });
+        info.inverse_binds.push(Affine3::from_translation(-Vec3::X));
+        info.names.push("child".into());
+        source.span = (0.0, 1.5);
+        (info, source)
+    }
+
+    /// The largest error [`error`] finds, against that of a search 128 times as dense, over the
+    /// cases that show the most between the frames and keys it starts from: slow and fast swings,
+    /// scale pops, and a chain of uneven keys and cubic splines.
+    #[test]
+    fn checks_find_the_largest_error_of_a_dense_search() {
+        let cases = [
+            (swing(24.0, 45.0, 10.0, 10.0), [20.0, 0.0]),
+            (swing(24.0, 90.0, 4.0, 8.0), [20.0, 0.0]),
+            (swing(24.0, 90.0, 2.0, 4.0), [20.0, 0.0]),
+            (swing(24.0, 30.0, 1.0, 4.0), [20.0, 0.0]),
+            (swing(25.0, 90.0, 3.0, 6.0), [20.0, 0.0]),
+            (pop(0.25), [1.0, 0.0]),
+            (pop(0.5), [1.0, 0.0]),
+            (pop(1.0), [1.0, 0.0]),
+            (chain(), [0.0, 3.0]),
+        ];
+        for ((info, source), reach) in &cases {
+            for rate in [30.0, 60.0, 120.0] {
+                let clip = sample(info, &source.channels, source.span, rate);
+                let reach = &reach[..info.joint_count()];
+                let dense = error(info, source, &clip, reach, 128 * CHECKS);
+                let got = error(info, source, &clip, reach, CHECKS);
+                // Short of the rounding of f32 poses, which has no shape to search.
+                let rounding = 1e-6 * reach.iter().fold(1.0, |a, &b| f64::max(a, b));
+                let found = got.0 >= 0.999 * dense.0 - rounding && got.1 >= 0.999 * dense.1 - 1e-4;
+                assert!(found, "{rate} fps: {got:?} of {dense:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn spectral_norm_is_the_largest_singular_value() {
+        let turn = |a: f64, b: f64| {
+            DMat3::from_quat(DQuat::from_axis_angle(DVec3::new(a, b, 1.0).normalize(), a))
+        };
+        for (s, want) in [
+            (DVec3::new(3.0, 1.0, 0.5), 3.0),
+            (DVec3::new(0.25, -2.0, 2.0), 2.0),
+            (DVec3::new(1e-9, 0.0, 0.0), 1e-9),
+            (DVec3::ZERO, 0.0),
+        ] {
+            let m = turn(0.3, 2.0) * DMat3::from_diagonal(s) * turn(1.1, -0.4);
+            let got = spectral_norm(m);
+            // The closed form keeps half its digits where singular values meet.
+            assert!((got - want).abs() <= 1e-7 * want, "{s}: {got}");
+        }
+    }
 }

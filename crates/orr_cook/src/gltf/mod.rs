@@ -933,6 +933,7 @@ pub(crate) fn import(
         materials: materials.into_values().collect(),
         images,
         skeletons,
+        clips: settings.clips.clone(),
         instances,
         files,
         warnings,
@@ -1101,8 +1102,9 @@ impl Imported<'_> {
     ) -> Result<()> {
         let (direct, baked) =
             placements(transforms, false).map_err(|m| self.fail(format!("model {name}: {m}")))?;
+        let hung = frame.is_some();
         if !direct.is_empty() {
-            self.lazy_model(name, mesh, weights, DMat4::IDENTITY)?;
+            self.lazy_model(name, mesh, weights, DMat4::IDENTITY, hung)?;
             self.instances.push(PlacedModel {
                 model: name.to_string(),
                 placed: direct,
@@ -1113,7 +1115,7 @@ impl Imported<'_> {
         }
         for (k, (linear, placed)) in baked.into_iter().enumerate() {
             let name = format!("{name}/baked/{k}");
-            self.lazy_model(&name, mesh, weights, linear)?;
+            self.lazy_model(&name, mesh, weights, linear, hung)?;
             self.instances.push(PlacedModel {
                 model: name,
                 placed,
@@ -1126,13 +1128,14 @@ impl Imported<'_> {
     }
 
     /// Model `name`: glTF mesh `mesh` at morph `weights` with `linear` applied, read when
-    /// it cooks.
+    /// it cooks, or now when it is `hung` from a joint, whose reach it sets.
     fn lazy_model(
         &mut self,
         name: &str,
         mesh: usize,
         weights: &[f32],
         linear: DMat4,
+        hung: bool,
     ) -> Result<()> {
         self.name(name)?;
         let src = Arc::clone(self.src);
@@ -1277,7 +1280,7 @@ impl Imported<'_> {
         };
         let settings = self.mesh_settings(name);
         // Assemblies split the mesh when it is planned, so such a model is read now.
-        let mesh = if settings.assemblies.is_some() {
+        let mesh = if settings.assemblies.is_some() || hung {
             MeshSource::Data(Box::new(
                 MeshSource::Lazy(lazy).read(self.asset, self.memo)?,
             ))
@@ -1744,7 +1747,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
                 b.skeletons.push(SceneSkeleton {
                     prefix: slot.name.clone().unwrap_or_default(),
                     info: sk.info.clone(),
-                    clips: sk.clips(&data, &spans, &settings.clips).map_err(fail)?,
+                    clips: sk.clips(&data, &spans).map_err(fail)?,
                 });
                 Some(b.skeletons.len() - 1)
             }

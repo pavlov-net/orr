@@ -2086,7 +2086,14 @@ fn plan_scene(
     let mut units = Vec::new();
     let mut skeletons = Vec::with_capacity(src.skeletons.len());
     let mut skeleton_names = Vec::with_capacity(src.skeletons.len());
-    for sk in std::mem::take(&mut src.skeletons) {
+    if !src.skeletons.is_empty() {
+        src.clips.check().map_err(|message| Error::Import {
+            asset: name.into(),
+            message,
+        })?;
+    }
+    let reaches = src.reaches();
+    for (sk, reach) in std::mem::take(&mut src.skeletons).into_iter().zip(reaches) {
         let prefix = match sk.prefix.as_str() {
             "" => name.to_string(),
             p => format!("{name}/{p}"),
@@ -2106,7 +2113,8 @@ fn plan_scene(
         };
         let class = Class::Skeleton as u16;
         units.push(NewUnit::leaf(&skeleton_name, class, key, working_set, work));
-        for (clip_name, mut clip) in sk.clips {
+        for (clip_name, source) in sk.clips {
+            let mut clip = crate::skin::resample(&sk.info, &source, &reach, &src.clips);
             clip.header.skeleton = skeleton.0;
             let clip_name = format!("{prefix}/clip/{clip_name}");
             let (head, samples) = clip.to_bytes();

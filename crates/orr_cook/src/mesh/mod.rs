@@ -273,6 +273,15 @@ impl MeshSource {
         }
     }
 
+    /// The mesh of a source read at import, as importers read every mesh that a skeleton moves
+    /// or a joint carries.
+    pub(crate) fn data(&self) -> &MeshData {
+        match self {
+            Self::Data(m) => m,
+            Self::Lazy(_) => panic!("a mesh a skeleton moves is read at import"),
+        }
+    }
+
     /// The mesh, read now if it is lazy. A lazy mesh whose triangles no longer match its sections
     /// fails as changed.
     pub(crate) fn read(self, asset: &str, memo: &Memo) -> Result<MeshData> {

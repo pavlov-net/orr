@@ -11,13 +11,19 @@
 
 #[path = "common/skinned.rs"]
 mod common_skinned;
+#[allow(dead_code)]
+#[path = "common/glb.rs"]
+mod glb;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use glb::Glb;
 use gltf::animation::util::ReadOutputs;
 use gltf::animation::{Interpolation, Property};
-use orr_cook::{ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshSettings, Source};
+use orr_cook::{
+    ArchiveSpec, AssetSpec, ClipSettings, GltfSettings, LodMode, Manifest, MeshSettings, Source,
+};
 use orr_math::{Affine3, Mat3, Mat4, Quat, Vec3, Vec4};
 use orr_pack::clip::Clip;
 use orr_pack::mesh::{self, Cluster, MeshHeader, MeshInfo, PageView};
@@ -194,8 +200,8 @@ fn sample(times: &[f32], values: &[Vec4], interp: Interpolation, rot: bool, t: f
     }
 }
 
-/// Translation distance in mm and rotation angle in degrees between two transforms.
-fn pose_error(a: &Mat4, b: &Mat4) -> (f64, f64) {
+/// Rotation angle in degrees between two transforms.
+fn rotation_error(a: &Mat4, b: &Mat4) -> f64 {
     let rot = |m: &Mat4| {
         let m3 = Mat3::from_mat4(*m);
         Mat3::from_cols(
@@ -206,10 +212,7 @@ fn pose_error(a: &Mat4, b: &Mat4) -> (f64, f64) {
     };
     let d = rot(a).transpose() * rot(b);
     let c = ((d.x_axis.x + d.y_axis.y + d.z_axis.z - 1.0) / 2.0).clamp(-1.0, 1.0);
-    (
-        f64::from(a.w_axis.truncate().distance(b.w_axis.truncate())) * 1000.0,
-        f64::from(c.acos()).to_degrees(),
-    )
+    f64::from(c.acos()).to_degrees()
 }
 
 /// The cooked entries of one glTF source.
@@ -291,8 +294,11 @@ fn cook(path: &Path, name: &str, settings: GltfSettings) -> Cooked {
 /// Worst errors over one source.
 #[derive(Default, Debug)]
 struct Errors {
-    /// Joint poses from the cooked clips against the glTF sampler at 1 kHz.
+    /// Points the skeleton moves, posed by the cooked clips against the glTF sampler at 4 kHz:
+    /// the joints' origins, and every source vertex in the space of each joint that moves it.
+    /// Over the clips short of [`ClipSettings::max_rate`], which hold the bound.
     position_mm: f64,
+    /// Joint frames, at the same times.
     rotation_deg: f64,
     /// `mesh::skin` against reference skinning of the cooked vertex (position, joints and
     /// weights as decoded) with the glTF sampler's joint matrices.
@@ -307,11 +313,14 @@ struct Errors {
     clip_bytes: u64,
 }
 
-/// glTF node of each skeleton joint, by name.
-fn joint_nodes(src: &Doc, skel: &SkeletonInfo) -> Vec<usize> {
+/// glTF node of each skeleton joint, by name; the unnamed still joint has none.
+fn joint_nodes(src: &Doc, skel: &SkeletonInfo) -> Vec<Option<usize>> {
     skel.names
         .iter()
         .map(|n| {
+            if n.is_empty() {
+                return None;
+            }
             let found: Vec<usize> = src
                 .doc
                 .nodes()
@@ -319,7 +328,7 @@ fn joint_nodes(src: &Doc, skel: &SkeletonInfo) -> Vec<usize> {
                 .map(|x| x.index())
                 .collect();
             assert_eq!(found.len(), 1, "joint name {n:?} is not unique");
-            found[0]
+            Some(found[0])
         })
         .collect()
 }
@@ -331,8 +340,8 @@ struct Skinned {
 }
 
 /// Skinned vertices, and the vertices of meshes without a skin as (node, local position).
-fn source_vertices(src: &Doc, nodes: &[usize]) -> (Vec<Skinned>, Vec<(usize, Vec3)>) {
-    let joint_of: HashMap<usize, usize> = nodes.iter().enumerate().map(|(j, &n)| (n, j)).collect();
+fn source_vertices(src: &Doc, nodes: &[Option<usize>]) -> (Vec<Skinned>, Vec<(usize, Vec3)>) {
+    let joint_of = joint_of(nodes);
     let (mut skinned, mut rigid) = (Vec::new(), Vec::new());
     for node in src.doc.nodes() {
         let Some(mesh) = node.mesh() else { continue };
@@ -369,6 +378,77 @@ fn source_vertices(src: &Doc, nodes: &[usize]) -> (Vec<Skinned>, Vec<(usize, Vec
     (skinned, rigid)
 }
 
+/// Skeleton joint of each glTF node that is one.
+fn joint_of(nodes: &[Option<usize>]) -> HashMap<usize, usize> {
+    let joints = nodes.iter().enumerate();
+    joints.filter_map(|(j, n)| Some(((*n)?, j))).collect()
+}
+
+/// What the skeleton moves, as (joint, point in its space): every joint's origin, each skinned
+/// vertex in the space of every joint that weighs on it (through the source's inverse binds
+/// `ibm`), and each vertex of a mesh without a skin in the space of its nearest joint.
+fn moved_points(
+    src: &Doc,
+    nodes: &[Option<usize>],
+    ibm: &[Mat4],
+    vertices: &(Vec<Skinned>, Vec<(usize, Vec3)>),
+) -> Vec<(usize, Vec3)> {
+    let mut out: Vec<(usize, Vec3)> = (0..nodes.len()).map(|j| (j, Vec3::ZERO)).collect();
+    for v in &vertices.0 {
+        let inf = v.influences.iter().filter(|i| i.1 > 0.0);
+        out.extend(inf.map(|&(j, _)| (j, ibm[j].transform_point3(v.position))));
+    }
+    let joint_of = joint_of(nodes);
+    let parents = src.parents();
+    let world = src.world(&src.rest());
+    for &(node, p) in &vertices.1 {
+        let mut above = std::iter::successors(Some(node), |&n| parents[n]);
+        let held = above.find(|n| joint_of.contains_key(n)).unwrap();
+        let q = world[held].inverse() * world[node];
+        out.push((joint_of[&held], q.transform_point3(p)));
+    }
+    out
+}
+
+/// The farthest the clip's poses put a point of `points` from where the source's put it, in mm,
+/// and the largest angle between a joint's frames, in degrees, at 4 kHz.
+fn clip_error(
+    src: &Doc,
+    channels: &[Channel],
+    start: f32,
+    clip: &Clip,
+    (skel, nodes): (&SkeletonInfo, &[Option<usize>]),
+    points: &[(usize, Vec3)],
+) -> (f64, f64) {
+    let n = skel.joint_count();
+    let mut locals = vec![Trs::IDENTITY; n];
+    let mut pose = vec![Affine3::IDENTITY; n];
+    let (mut far, mut angle) = (0.0f64, 0.0f64);
+    let end = clip.header.duration;
+    for i in 0..=(end * 4000.0).ceil() as u32 {
+        let t = (i as f32 / 4000.0).min(end);
+        clip.sample(t, &mut locals);
+        skel.model_pose(&locals, &mut pose);
+        let world = src.world(&src.pose(channels, start + t));
+        for &(j, q) in points {
+            let Some(node) = nodes[j] else { continue };
+            let apart = Mat4::from(pose[j]).transform_point3(q) - world[node].transform_point3(q);
+            far = far.max(f64::from(apart.length()) * 1000.0);
+        }
+        for (j, node) in nodes.iter().enumerate() {
+            if let Some(node) = *node {
+                angle = angle.max(rotation_error(&Mat4::from(pose[j]), &world[node]));
+            }
+        }
+    }
+    (far, angle)
+}
+
+/// Whether `clip` stopped doubling its rate at [`ClipSettings::max_rate`].
+fn at_max_rate(clip: &Clip) -> bool {
+    clip.header.sample_rate > 0.75 * ClipSettings::default().max_rate
+}
+
 fn lbs(reference: &[Mat4], influences: impl Iterator<Item = (usize, f32)>, p: Vec3) -> Vec3 {
     influences
         .map(|(j, w)| w * reference[j].transform_point3(p))
@@ -395,7 +475,10 @@ fn check(path: &Path, name: &str, settings: GltfSettings) -> (Cooked, Errors) {
     for skin in src.doc.skins() {
         if let Some(m) = skin.reader(src.buf()).read_inverse_bind_matrices() {
             for (joint, m) in skin.joints().zip(m) {
-                let j = nodes.iter().position(|&n| n == joint.index()).unwrap();
+                let j = nodes
+                    .iter()
+                    .position(|&n| n == Some(joint.index()))
+                    .unwrap();
                 let m = Mat4::from_cols_array_2d(&m);
                 let tol = 1e-5 * m.to_cols_array().iter().fold(1.0f32, |a, b| a.max(b.abs()));
                 assert!(ibm[j].abs_diff_eq(m, tol), "joint {j}: inverse bind");
@@ -405,7 +488,9 @@ fn check(path: &Path, name: &str, settings: GltfSettings) -> (Cooked, Errors) {
     }
 
     // Source vertices by grid cell, to pair them with cooked vertices.
-    let (skinned, rigid) = source_vertices(&src, &nodes);
+    let vertices = source_vertices(&src, &nodes);
+    let points = moved_points(&src, &nodes, &ibm, &vertices);
+    let (skinned, rigid) = vertices;
     let step = f64::from(info.header.step());
     let cell = |p: Vec3| {
         p.to_array()
@@ -493,24 +578,21 @@ fn check(path: &Path, name: &str, settings: GltfSettings) -> (Cooked, Errors) {
             err.rates.1.max(clip.header.sample_rate),
         );
         err.clip_bytes += (clip.samples.len() * size_of::<Trs>()) as u64;
-        for i in 0..=((end - start) * 1000.0).ceil() as u32 {
-            let t = (i as f32 / 1000.0).min(end - start);
-            clip.sample(t, &mut locals);
-            skel.model_pose(&locals, &mut pose);
-            let world = src.world(&src.pose(&channels, start + t));
-            for (j, &node) in nodes.iter().enumerate() {
-                let (p, r) = pose_error(&Mat4::from(pose[j]), &world[node]);
-                err.position_mm = err.position_mm.max(p);
-                err.rotation_deg = err.rotation_deg.max(r);
-            }
+        let (p, r) = clip_error(&src, &channels, start, &clip, (&skel, &nodes), &points);
+        if !at_max_rate(&clip) {
+            err.position_mm = err.position_mm.max(p);
         }
+        err.rotation_deg = err.rotation_deg.max(r);
         for i in 0..10 {
             let t = clip.header.duration * i as f32 / 9.0;
             clip.sample(t, &mut locals);
             skel.model_pose(&locals, &mut pose);
             skel.palette(&pose, &mut palette);
             let world = src.world(&src.pose(&channels, start + t));
-            let reference: Vec<Mat4> = (0..n).map(|j| world[nodes[j]] * ibm[j]).collect();
+            // A still joint's palette entry is the identity.
+            let reference: Vec<Mat4> = (0..n)
+                .map(|j| nodes[j].map_or(Mat4::IDENTITY, |node| world[node] * ibm[j]))
+                .collect();
             for view in &views {
                 for c in (0..view.cluster_count()).map(|i| view.cluster(i)) {
                     let mut out = vec![[0.0; 3]; usize::from(c.vertex_count)];
@@ -612,4 +694,129 @@ fn skinned_set_matches_gltf() {
         }
     }
     assert!(failed.is_empty(), "over the bounds: {failed:?}");
+}
+
+/// A node `arm` holding a triangle `reach` m out along x, or with `instanced` one copy of it
+/// placed there by `EXT_mesh_gpu_instancing`, with one animation `move` of its `path`, keyed at
+/// `times` by `values` (three per key for a cubic spline).
+fn arm_glb(
+    name: &str,
+    (reach, instanced): (f32, bool),
+    path: &str,
+    times: &[f32],
+    values: &[[f32; 4]],
+    cubic: bool,
+) {
+    let mut g = Glb::default();
+    let x = if instanced { 0.0 } else { reach };
+    let corners = [[x, 0.0, 0.0], [x, 0.01, 0.0], [x, 0.0, 0.01]];
+    let pos = g.floats(&corners, "VEC3");
+    let placed = g.floats(&[[reach, 0.0, 0.0]], "VEC3");
+    let copies = match instanced {
+        true => format!(
+            r#","extensions":{{"EXT_mesh_gpu_instancing":{{"attributes":{{"TRANSLATION":{placed}}}}}}}"#
+        ),
+        false => String::new(),
+    };
+    let idx = g.indices(&[0, 1, 2]);
+    let input = g.floats(&times.iter().map(|&t| [t]).collect::<Vec<_>>(), "SCALAR");
+    let output = match path {
+        "rotation" => g.floats(values, "VEC4"),
+        _ => {
+            let three: Vec<[f32; 3]> = values.iter().map(|v| [v[0], v[1], v[2]]).collect();
+            g.floats(&three, "VEC3")
+        }
+    };
+    let interpolation = if cubic { "CUBICSPLINE" } else { "LINEAR" };
+    let rest = format!(
+        r#""extensionsUsed":["EXT_mesh_gpu_instancing"],"scene":0,"scenes":[{{"nodes":[0]}}],
+"nodes":[{{"name":"arm","mesh":0{copies}}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pos}}},"indices":{idx}}}]}}],
+"animations":[{{"name":"move","samplers":[{{"input":{input},"output":{output},"interpolation":"{interpolation}"}}],"channels":[{{"sampler":0,"target":{{"node":0,"path":"{path}"}}}}]}}]"#
+    );
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.glb"));
+    g.write(&path, &rest);
+}
+
+/// The cooked clip of [`arm_glb`] `name`: its rate, and the farthest it puts the triangle from
+/// where the source does, in mm, at 4 kHz.
+fn arm_error(name: &str) -> (f32, f64, bool) {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.glb"));
+    let src = load(&path);
+    let cooked = cook(&path, name, GltfSettings::default());
+    let skel = cooked.skeleton();
+    let nodes = joint_nodes(&src, &skel);
+    let vertices = source_vertices(&src, &nodes);
+    let ibm: Vec<Mat4> = skel.inverse_binds.iter().map(|&a| a.into()).collect();
+    let points = moved_points(&src, &nodes, &ibm, &vertices);
+    let (_, clip) = cooked.clips().pop().unwrap();
+    let anim = src.doc.animations().next().unwrap();
+    let channels = src.channels(&anim);
+    let start = time_range(&channels).0;
+    let (far, _) = clip_error(&src, &channels, start, &clip, (&skel, &nodes), &points);
+    (clip.header.sample_rate, far, at_max_rate(&clip))
+}
+
+/// A scale that pops from 0 to 1 over a quarter of a second, a cubic spline with flat ends,
+/// moves nothing at the joint's origin and turns no axis, but carries the triangle a tenth of a
+/// meter out: the clip holds it within the bound there.
+#[test]
+fn a_scale_pop_is_held_where_its_geometry_is() {
+    let zero = [0.0; 4];
+    let values = [zero, zero, zero, zero, [1.0, 1.0, 1.0, 0.0], zero];
+    arm_glb(
+        "arm-pop",
+        (0.1, false),
+        "scale",
+        &[0.0, 0.25],
+        &values,
+        true,
+    );
+    let (rate, far, capped) = arm_error("arm-pop");
+    assert!(
+        far <= POSITION_MM || capped,
+        "{far} mm at {rate} fps, past {POSITION_MM} mm"
+    );
+}
+
+/// A swing of 90 degrees each way over 4 s, keyed at 24 fps, turns a triangle 20 m out by
+/// arcs a joint's angle bound alone lets through: the clip holds it within the bound there.
+#[test]
+fn a_swing_is_held_at_the_reach_of_its_geometry() {
+    let times: Vec<f32> = (0..=8 * 24).map(|k| k as f32 / 24.0).collect();
+    let values: Vec<[f32; 4]> = times
+        .iter()
+        .map(|&t| {
+            let a = 90f32.to_radians() * (std::f32::consts::TAU * t / 4.0).sin();
+            Quat::from_rotation_z(a).to_array()
+        })
+        .collect();
+    arm_glb(
+        "arm-swing",
+        (20.0, false),
+        "rotation",
+        &times,
+        &values,
+        false,
+    );
+    let (rate, far, capped) = arm_error("arm-swing");
+    assert!(
+        far <= POSITION_MM || capped,
+        "{far} mm at {rate} fps, past {POSITION_MM} mm"
+    );
+    // A copy that hangs from the joint there is as far from it.
+    arm_glb(
+        "arm-swing-copy",
+        (20.0, true),
+        "rotation",
+        &times,
+        &values,
+        false,
+    );
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("arm-swing-copy.glb");
+    let (_, clip) = cook(&path, "arm-swing-copy", GltfSettings::default())
+        .clips()
+        .pop()
+        .unwrap();
+    assert_eq!(clip.header.sample_rate, rate);
 }

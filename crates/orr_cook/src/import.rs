@@ -5,8 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use orr_math::{DMat3, DMat4, DQuat, DVec3, Mat3};
-use orr_pack::clip::Clip;
+use orr_math::{DMat3, DMat4, DQuat, DVec3, Mat3, Mat4, Vec3};
 use orr_pack::instance::MotionRow;
 use orr_pack::material::{Material, slot};
 use orr_pack::skeleton::SkeletonInfo;
@@ -14,6 +13,7 @@ use serde::Deserialize;
 
 use crate::instances::InstanceMotion;
 use crate::mesh::{self, MeshSettings, MeshSource};
+use crate::skin::{ClipSettings, ClipSource, spectral_norm};
 use crate::state::Input;
 use crate::subd::{CageData, SubdSettings};
 use crate::texture::material::{ImageFile, MaterialTextures};
@@ -48,10 +48,165 @@ pub(crate) struct Scene {
     pub(crate) materials: Vec<SceneMaterial>,
     pub(crate) images: Vec<ImageFile>,
     pub(crate) skeletons: Vec<SceneSkeleton>,
+    /// How the skeletons' clips are resampled.
+    pub(crate) clips: ClipSettings,
     pub(crate) instances: Vec<PlacedModel>,
     /// Every file read.
     pub(crate) files: Vec<Input>,
     pub(crate) warnings: Vec<String>,
+}
+
+impl Scene {
+    /// Per skeleton, each joint's reach: the farthest, in the joint's own space (its inverse
+    /// bind of model space), from its origin of anything it moves. That is the vertices and cage
+    /// points weighted to it and the parts it poses, in their bind pose, and the copies that
+    /// hang from it: their model's points as placed, or as their rows move them while the
+    /// skeleton's clips run.
+    pub(crate) fn reaches(&self) -> Vec<Vec<f64>> {
+        let mut out: Vec<Vec<f64>> = self
+            .skeletons
+            .iter()
+            .map(|s| vec![0.0; s.info.joint_count()])
+            .collect();
+        let binds: Vec<Vec<DMat4>> = self
+            .skeletons
+            .iter()
+            .map(|s| {
+                let ib = s.info.inverse_binds.iter();
+                ib.map(|&b| Mat4::from(b).as_dmat4()).collect()
+            })
+            .collect();
+        for m in &self.models {
+            let Some(s) = m.skeleton else { continue };
+            let (reach, binds) = (&mut out[s], &binds[s]);
+            let mut moves = |j: usize, p: DVec3| {
+                reach[j] = reach[j].max(binds[j].transform_point3(p).length());
+            };
+            let mesh = m.mesh.data();
+            for (i, &p) in mesh.positions.iter().enumerate() {
+                let p = Vec3::from(p).as_dvec3();
+                if let Some(skin) = &mesh.skin {
+                    for k in (0..4).filter(|&k| skin.weights[i][k] > 0) {
+                        moves(usize::from(skin.joints[i][k]), p);
+                    }
+                }
+                // A part's joint poses it.
+                if let Some(parts) = &mesh.parts {
+                    let v = parts.values[i];
+                    let j = parts.joints.as_ref().map_or(v, |j| j[usize::from(v)]);
+                    moves(usize::from(j), p);
+                }
+            }
+            if let Some(cage) = &m.subd
+                && let Some(skin) = &cage.cage.skin
+            {
+                for (p, influence) in cage.cage.cage.positions.iter().zip(skin) {
+                    for k in (0..4).filter(|&k| influence.weights[k] > 0) {
+                        moves(usize::from(influence.joints[k]), p.as_dvec3());
+                    }
+                }
+            }
+        }
+        for copies in &self.instances {
+            let Some((s, joint)) = copies.frame else {
+                continue;
+            };
+            let model = self
+                .models
+                .iter()
+                .find(|m| m.node.as_ref() == Some(&copies.model));
+            let model = model.expect("copies place a model of the scene");
+            let ib = binds[s][usize::from(joint)];
+            let reach = &mut out[s][usize::from(joint)];
+            let points: Vec<DVec3> = model.points().collect();
+            match &copies.motion {
+                None => {
+                    let (center, radius) = sphere(&points);
+                    for p in &copies.placed {
+                        let linear = DMat3::from_mat4(ib) * p.linear.as_dmat3();
+                        let at = ib.transform_point3(p.position + p.linear.as_dmat3() * center);
+                        *reach = reach.max(at.length() + spectral_norm(linear) * radius);
+                    }
+                }
+                Some(motion) => {
+                    let spans = self.skeletons[s].clips.iter().map(|c| c.1.span);
+                    let (lo, hi) = spans.fold((f64::MAX, f64::MIN), |(lo, hi), (start, length)| {
+                        (lo.min(start), hi.max(start + length))
+                    });
+                    let right = points.iter().map(|&p| motion.right.transform_point3(p));
+                    let radius = right.map(DVec3::length).fold(0.0, f64::max);
+                    *reach = reach.max(moving_reach(ib, motion, (lo, hi), radius));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The farthest a copy of `motion`'s rows comes from the origin of the space `ib` takes theirs
+/// to, while the clock runs over `clock` (s), for a model whose points `right` takes within
+/// `radius` of its origin. A row at `dt` into its interval stands at `p + dt (v + a dt / 2)`
+/// from its anchor, turned, and scaled by at most the largest of `s + g dt` on an axis.
+fn moving_reach(ib: DMat4, motion: &InstanceMotion, clock: (f64, f64), radius: f64) -> f64 {
+    let to = ib * motion.left;
+    let stretch = spectral_norm(DMat3::from_mat4(to));
+    let records = motion.anchors.len();
+    let mut reach: f64 = 0.0;
+    for (k, &start) in motion.times.iter().enumerate() {
+        let start = f64::from(start);
+        // The first interval runs back without end, and the last on.
+        let from = if k == 0 { f64::MIN } else { start };
+        let to_time = motion.times.get(k + 1).map_or(f64::MAX, |&t| f64::from(t));
+        let (a, b) = (from.max(clock.0), to_time.min(clock.1));
+        if a > b {
+            continue;
+        }
+        let (da, db) = (a - start, b - start);
+        let far = da.abs().max(db.abs());
+        for (i, anchor) in motion.anchors.iter().enumerate() {
+            let row = &motion.rows[k * records + i];
+            if row.rotation == [0.0; 4] {
+                continue;
+            }
+            let v = |x: [f32; 3]| Vec3::from(x).as_dvec3();
+            let at = DVec3::from_array(*anchor) + v(row.position);
+            let path =
+                v(row.velocity).length() * far + v(row.acceleration).length() * far * far / 2.0;
+            let scale = |dt: f64| (v(row.scale) + v(row.growth) * dt).abs().max_element();
+            let size = scale(da).max(scale(db)) * radius;
+            reach = reach.max(to.transform_point3(at).length() + stretch * (path + size));
+        }
+    }
+    reach
+}
+
+/// A sphere around `points`: the center of their box, and the farthest of them from it.
+fn sphere(points: &[DVec3]) -> (DVec3, f64) {
+    let (lo, hi) = points
+        .iter()
+        .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(lo, hi), &p| {
+            (lo.min(p), hi.max(p))
+        });
+    let center = (lo + hi) / 2.0;
+    let radius = points
+        .iter()
+        .map(|&p| p.distance(center))
+        .fold(0.0, f64::max);
+    (center, radius)
+}
+
+impl SceneModel {
+    /// The points of its mesh and cage, in its space.
+    fn points(&self) -> impl Iterator<Item = DVec3> {
+        let mesh = self
+            .mesh
+            .data()
+            .positions
+            .iter()
+            .map(|&p| Vec3::from(p).as_dvec3());
+        let cage = self.subd.iter().flat_map(|c| &c.cage.cage.positions);
+        mesh.chain(cage.map(|p| p.as_dvec3()))
+    }
 }
 
 /// The placements of one model that share pages.
@@ -80,8 +235,8 @@ pub(crate) struct SceneSkeleton {
     /// prefix leaves its part out.
     pub(crate) prefix: String,
     pub(crate) info: SkeletonInfo,
-    /// Clips by name; their skeleton id is left for the planner to set.
-    pub(crate) clips: Vec<(String, Clip)>,
+    /// Clips by name, which the planner resamples once it knows what each joint moves.
+    pub(crate) clips: Vec<(String, ClipSource)>,
 }
 
 pub(crate) struct SceneModel {

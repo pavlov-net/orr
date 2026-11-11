@@ -131,7 +131,7 @@ use crate::instances::InstanceMotion;
 use crate::mesh::{MeshData, MeshSettings, MeshSource, PartData, Pivots, SectionData, Skin};
 use crate::patch::{self, MaterialPatch, MeshPatch};
 use crate::shading;
-use crate::skin::{self, Channel, ClipSettings, Rig, Rigging};
+use crate::skin::{self, Channel, ClipSettings, ClipSource, Rig, Rigging};
 use crate::subd::SubdSettings;
 use crate::texture::material::{ImageData, ImageFile, ImageTile, TextureRules};
 use crate::texture::tiles::{UDIM, udim_cell};
@@ -1378,6 +1378,7 @@ impl<'s> Importer<'s> {
             materials: std::mem::take(&mut self.materials),
             images: std::mem::take(&mut self.images),
             skeletons,
+            clips: self.settings.clips.clone(),
             instances: instance_out,
             files: self.reads.borrow().inputs(),
             warnings: std::mem::take(&mut self.warnings),
@@ -1569,7 +1570,7 @@ impl<'s> Importer<'s> {
                 if k == 0 {
                     channels = self.xform_channels(&built.prims)?;
                 }
-                let clip = self.xform_clip(&built.info, &channels)?;
+                let clip = self.xform_clip(&channels);
                 skeletons.push(SceneSkeleton {
                     prefix: models[h].name.clone().unwrap_or_default(),
                     info: built.info.clone(),
@@ -1742,15 +1743,11 @@ impl<'s> Importer<'s> {
 
     /// The clip of `channels`, what xforms make up alone, or `None` without any. It runs over
     /// the stage's timeline, so the clips of separate skeletons keep time.
-    fn xform_clip(
-        &self,
-        info: &SkeletonInfo,
-        channels: &[Channel],
-    ) -> Result<Option<orr_pack::clip::Clip>, String> {
-        self.settings.clips.check()?;
-        let span = self.timeline.span();
-        let clips = &self.settings.clips;
-        Ok((!channels.is_empty()).then(|| skin::resample(info, channels, span, clips)))
+    fn xform_clip(&self, channels: &[Channel]) -> Option<ClipSource> {
+        (!channels.is_empty()).then(|| ClipSource {
+            channels: channels.to_vec(),
+            span: self.timeline.span(),
+        })
     }
 
     /// Hangs skeleton `sk` of prim `node` in model `b` from the prims that move it, if any do:
@@ -2695,8 +2692,7 @@ impl<'s> Importer<'s> {
         sk: &skel::Skel,
         root: usize,
         sites: &[usize],
-    ) -> Result<Vec<(String, orr_pack::clip::Clip)>, String> {
-        self.settings.clips.check()?;
+    ) -> Result<Vec<(String, ClipSource)>, String> {
         let mut sources: Vec<usize> = Vec::new();
         for &n in sites.iter().chain(self.by_path.get(path)) {
             sources.extend(self.animation_source(n)?);
@@ -2711,12 +2707,12 @@ impl<'s> Importer<'s> {
         let mut clips = Vec::new();
         for i in sources {
             let node = &self.nodes[i];
-            if let Some(c) = sk.clip(&node.prim, &self.timeline, &xforms, &self.settings.clips)? {
+            if let Some(c) = sk.clip(&node.prim, &self.timeline, &xforms)? {
                 clips.push((node.name.clone(), c));
             }
         }
         if clips.is_empty()
-            && let Some(c) = self.xform_clip(&sk.info, &xforms)?
+            && let Some(c) = self.xform_clip(&xforms)
         {
             clips.push((XFORM_CLIP.to_string(), c));
         }
