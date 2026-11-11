@@ -2293,6 +2293,7 @@ impl<'f> SceneWriter<'f> {
             // A world length is another entry space length once the placement's scale changes.
             previous_positions: d.palette.is_some() || self.materials.any_world_length(materials),
             vertex_user: false,
+            generated_records: false,
             flags: d.flags,
             user_tag: d.user_tag,
         };

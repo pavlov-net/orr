@@ -58,7 +58,7 @@ public struct ProducerBatch
     public uint* cluster_count;
     public uint* vertex_count;
     public TopologyGpu* topologies;
-    public GeneratedClusterGpu* generated; // per cluster of a tessellated entry's batch; null elsewhere
+    public GeneratedClusterGpu* generated; // per cluster of a tessellated entry's batch; null unless ProducerDesc::generated_records
     public uint* segments;       // per segment: its first vertex, from which it runs to the next; null outside strand entries
     public uint* segment_user;   // per segment: the producer's word
     public float* radii;         // per vertex of a strand entry: the strand's radius, m, relative to the entry's transform

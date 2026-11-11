@@ -479,7 +479,7 @@ void dice(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         if (g_first != NO_ROOM)
         {
             uint c = emit_template_cluster(d, g_pattern, g_first, pt.cluster.material, pt.cluster.user);
-            if (c != NO_ROOM)
+            if (c != NO_ROOM && d.generated != nullptr)
             {
                 GeneratedClusterGpu g;
                 g.patch = item.patch;

@@ -198,6 +198,9 @@ pub struct ProducerDesc<'a> {
     pub previous_positions: bool,
     /// The batch has one u32 user word per vertex.
     pub vertex_user: bool,
+    /// A tessellated entry's batch keeps a `GeneratedClusterGpu` per generated cluster: the
+    /// subpatch the tessellator diced into it, for the CPU to read back. No kernel reads it.
+    pub generated_records: bool,
     pub flags: InstanceFlags,
     /// Read by linked surfaces and hit shading through `SurfaceInput`, never by orr.
     pub user_tag: u32,
@@ -222,6 +225,7 @@ impl Default for ProducerDesc<'_> {
             origin: OriginPolicy::Default,
             previous_positions: false,
             vertex_user: false,
+            generated_records: false,
             flags: InstanceFlags::RASTER | InstanceFlags::RAY,
             user_tag: 0,
         }
@@ -594,10 +598,8 @@ pub(crate) fn build(
         subd.is_some_and(|s| s.shape.colored),
         &mut take,
     );
-    let generated_at = take(only(
-        tessellated,
-        size_of::<GeneratedClusterGpu>() as u64 * clusters,
-    ));
+    let generated_at = (tessellated && desc.generated_records)
+        .then(|| take(size_of::<GeneratedClusterGpu>() as u64 * clusters));
     let patch = tessellated.then(|| {
         let at = BatchAt::new(
             desc,
@@ -863,7 +865,7 @@ pub(crate) fn build(
         Some((b, counts_at)) => {
             drawn_batch.topologies = patterns.topologies;
             drawn_batch.topology_count = PATTERNS as u32;
-            drawn_batch.generated = at(generated_at).cast();
+            drawn_batch.generated = generated_at.map_or(GpuPtr::NULL, |o| at(o).cast());
             let c = at(*counts_at).cast::<u32>();
             let patches = batch_gpu(b, c, desc.max_patch_clusters, desc.max_patch_vertices);
             (patches, c.cast())

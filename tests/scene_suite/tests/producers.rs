@@ -23,7 +23,7 @@ use orr_cook::{
 };
 use orr_gpu::{
     Blend, ClearColor, ColorAttachment, ColorLoad, ColorMask, ColorTarget, ComputePipeline, Device,
-    DeviceDesc, Format, Hazards, MemoryKind, MeshPipelineDesc, QueueKind, QueueRequest,
+    DeviceDesc, Format, GpuPtr, Hazards, MemoryKind, MeshPipelineDesc, QueueKind, QueueRequest,
     RasterState, Rendering, SamplerDesc, ShaderStage, SpecData, Stages, StorageImageIndex, Texture,
     TextureDesc, TextureIndex, TextureMemory, TextureRegion, TextureUsage,
 };
@@ -932,6 +932,7 @@ impl Plane {
             displacement_reach: 0.05,
             materials,
             transform: (self.group, 0),
+            generated_records: true,
             ..ProducerDesc::default()
         }
     }
@@ -1048,6 +1049,7 @@ impl Plane {
 /// its frame.
 struct Generated {
     clusters: Vec<ProducerClusterGpu>,
+    /// Empty where the entry keeps no dicing records.
     records: Vec<GeneratedClusterGpu>,
     positions: Vec<Vec3>,
     /// Empty where the entry keeps no previous positions.
@@ -1078,29 +1080,13 @@ fn generated(view: &RasterView, entry: ProducerId) -> Generated {
     let (clusters, vertices) = count(&b);
     let (patch_clusters, patch_vertices) = count(&p);
     let v3 = |p: Vec<[f32; 3]>| p.into_iter().map(Vec3::from).collect();
-    let previous = |b: &ProducerBatch, n| {
-        if b.previous.address().0 == 0 {
-            Vec::new()
-        } else {
-            v3(read_buffer(b.previous.cast(), n))
-        }
-    };
-    let colors = if b.colors.address().0 == 0 {
-        Vec::new()
-    } else {
-        let words: Vec<[half::f16; 4]> = read_buffer(b.colors.cast(), vertices);
-        words.iter().map(|c| c.map(half::f16::to_f32)).collect()
-    };
-    let uv1 = if b.uv1.address().0 == 0 {
-        Vec::new()
-    } else {
-        read_buffer(b.uv1.cast(), vertices)
-    };
+    let previous = |b: &ProducerBatch, n| v3(optional(b.previous.cast(), n));
+    let words: Vec<[half::f16; 4]> = optional(b.colors.cast(), vertices);
     Generated {
-        uv1,
-        colors,
+        uv1: optional(b.uv1.cast(), vertices),
+        colors: words.iter().map(|c| c.map(half::f16::to_f32)).collect(),
         clusters: read_buffer(b.clusters, clusters),
-        records: read_buffer(b.generated, clusters),
+        records: optional(b.generated, clusters),
         positions: v3(read_buffer(b.positions.cast(), vertices)),
         previous: previous(&b, vertices),
         attrs: read_buffer(b.attrs.cast(), vertices),
@@ -1108,6 +1094,15 @@ fn generated(view: &RasterView, entry: ProducerId) -> Generated {
         patch_positions: v3(read_buffer(p.positions.cast(), patch_vertices)),
         patch_previous: previous(&p, patch_vertices),
         state: read_buffer(root.producer_state.offset(i), 1)[0],
+    }
+}
+
+/// `n` elements at `p`; empty where `p` is null.
+fn optional<T: bytemuck::Pod>(p: GpuPtr<T>, n: u64) -> Vec<T> {
+    if p.address().0 == 0 {
+        Vec::new()
+    } else {
+        read_buffer(p, n)
     }
 }
 
@@ -1138,6 +1133,7 @@ struct Weighted {
 
 /// The generated vertices of `g`, diced from the patches of `mesh`.
 fn vertex_weights(g: &Generated, mesh: &PatchMesh) -> Vec<Weighted> {
+    assert_eq!(g.records.len(), g.clusters.len(), "dicing records");
     let mut out = Vec::new();
     for (k, r) in g.clusters.iter().zip(&g.records) {
         let patch = &g.patch_clusters[(r.patch >> 7) as usize];
