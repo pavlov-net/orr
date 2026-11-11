@@ -40,32 +40,35 @@ fn a_cut_shows_a_uniform_field_at_mid_gray_on_its_own_frame() {
     assert_clean();
 }
 
-/// A view sets its exposure once and then adapts. Through a history that keeps the cut's
-/// frame as it was lit, at the reference, the frames after a cut meter many stops off; the
-/// exposure moves from the cut's no faster than the adaptation speeds.
+/// A view sets its exposure once. On the frame after the one that set it, a scene four stops
+/// brighter or darker moves the exposure by the adaptation step and no further, whether the
+/// frame that set it was a cut's or the first with light after a cut into black, whose
+/// pre-exposure still waits at the reference.
 #[test]
-fn after_a_cut_the_exposure_only_adapts() {
+fn the_frame_after_the_one_that_sets_the_exposure_only_adapts() {
     let mut h = Harness::new(SIDE, SIDE);
     let output = ViewOutput::default();
     let auto = AutoExposure::default();
-    let fastest = auto.speed_brighten.max(auto.speed_darken) * h.dt;
-    h.history = 0.9;
-    // Twelve stops brighter and ten darker than the reference keys.
-    for nits in [1e4f32, 1e-3] {
-        h.set_image(&vec![nits; h.pixels()]);
-        h.cut_next();
-        let cut = h.frame(1.0, &output, None);
-        let off = stops_from_mid_gray(nits, &cut);
-        assert!(off.abs() < 0.01, "{nits} cd/m2: {off} stops from mid gray");
-        let mut last = cut.adapted_ev100;
-        for f in 1..=30 {
-            let t = h.frame(1.0, &output, None);
-            let step = (t.adapted_ev100 - last).abs();
+    let nits = 100.0f32;
+    h.set_image(&vec![nits; h.pixels()]);
+    for black in [0, 2] {
+        for (scale, speed) in [
+            (16.0f32, auto.speed_brighten),
+            (1.0 / 16.0, -auto.speed_darken),
+        ] {
+            h.cut_next();
+            for _ in 0..black {
+                h.frame(0.0, &output, None);
+            }
+            let set = h.frame(1.0, &output, None);
+            let off = stops_from_mid_gray(nits, &set);
+            assert!(off.abs() < 0.01, "{off} stops from mid gray");
+            let next = h.frame(scale, &output, None);
+            let (step, expected) = (next.adapted_ev100 - set.adapted_ev100, speed * h.dt);
             assert!(
-                step <= 1.001 * fastest,
-                "{nits} cd/m2, frame {f} after the cut: {step} EV in one frame"
+                (step - expected).abs() <= 0.02 * expected.abs() + 2e-5,
+                "{black} black frames, scene times {scale}: {step} EV against {expected}"
             );
-            last = t.adapted_ev100;
         }
     }
     assert_clean();
