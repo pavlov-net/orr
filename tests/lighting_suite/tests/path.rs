@@ -890,6 +890,29 @@ fn a_normal_map_takes_no_light_through_its_surface() {
     assert_clean();
 }
 
+/// The floor under a single-sided emitter is lit by next-event estimation and by BSDF rays where
+/// the emitter faces it, and stays dark to both where its back does: a back emits nothing.
+#[test]
+fn a_single_sided_emitters_back_lights_nothing() {
+    for (down, linear) in [
+        (true, Mat3::IDENTITY),
+        (false, Mat3::from_diagonal(Vec3::new(1.0, -1.0, -1.0))),
+    ] {
+        let spec = over_floor(FLOOR, at(EMITTER, linear, Vec3::Y), Vec::new());
+        let patch = pixel_of(&spec, Vec3::new(0.0, 0.0, 0.6));
+        let mut bed = Bed::with(spec);
+        for view in [LightingDebugView::NeeOnly, LightingDebugView::BsdfOnly] {
+            let green = render_paths(&mut bed, &paths(debug(view, 1)), 16, 1).around(patch, 4)[1];
+            assert_eq!(
+                green > 0.0,
+                down,
+                "{view:?}, facing down {down}: green {green}"
+            );
+        }
+    }
+    assert_clean();
+}
+
 /// The single-sided floor turned over, so the sun lights its back, shows in a mirror as its
 /// front does there: a ray that reaches a single-sided surface's back shades it as the front.
 #[test]
