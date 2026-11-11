@@ -256,16 +256,18 @@ float angle_from_code(uint c)
     return float(c & 255) / 256.0 * PI;
 }
 
-// 12 bits per axis of `n` in octahedral form. 0 stays free to say there is no such normal.
+// 12 bits per axis of `n` in octahedral form, codes 1 to 4095 for -1 to 1 with 0 on 2048, so
+// every axis direction is exact. No axis takes code 0, which leaves 0 to say there is no
+// such normal.
 uint oct_code(float3 n)
 {
-    uint2 q = uint2(round((oct_wrap(n) * 0.5 + 0.5) * 4095.0));
-    return max(q.x | (q.y << 12), 1);
+    uint2 q = uint2(int2(round(oct_wrap(n) * 2047.0)) + 2048);
+    return q.x | (q.y << 12);
 }
 
 float3 oct_from_code(uint c)
 {
-    return oct_unwrap(float2(c & 4095, (c >> 12) & 4095) / 4095.0 * 2.0 - 1.0);
+    return oct_unwrap((float2(c & 4095, (c >> 12) & 4095) - 2048.0) / 2047.0);
 }
 
 // Whether `s` holds a coat, fuzz or thin film.

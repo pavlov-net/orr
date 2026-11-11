@@ -198,6 +198,16 @@ const BSDF_METAL_FLAT: u32 = 256;
 
 // --- Packing ------------------------------------------------------------------------------
 
+/// Directions the coat normal's code holds exactly.
+const AXES: [[f32; 3]; 6] = [
+    [1.0, 0.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, -1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 0.0, -1.0],
+];
+
 struct Lcg(u64);
 
 impl Lcg {
@@ -289,6 +299,9 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 c.coat_anisotropy = rng.next();
                 c.coat_tangent_angle = rng.next() * std::f32::consts::PI;
                 c.coat_normal = arr(rng.unit());
+                if let Some(&axis) = AXES.get(i / 4) {
+                    c.coat_normal = axis;
+                }
                 c.bsdf_flags |= BSDF_COAT_FRAME;
             }
             if kind == 3 || i % 16 == 1 {
@@ -575,10 +588,17 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                     "coat anisotropy",
                     i,
                 );
+                // Half a 12-bit step at the square's most stretched point.
                 assert!(
-                    angle(g.coat_normal, c.coat_normal) < 2e-3,
+                    angle(g.coat_normal, c.coat_normal) < 1.04e-3,
                     "case {i} coat normal"
                 );
+                if AXES.contains(&c.coat_normal) {
+                    assert_eq!(
+                        g.coat_normal, c.coat_normal,
+                        "case {i} coat normal on an axis"
+                    );
+                }
                 assert_ne!(g.bsdf_flags & BSDF_COAT_FRAME, 0, "case {i} coat frame");
             }
             close(
