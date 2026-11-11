@@ -127,9 +127,12 @@ pub struct Budgets {
     pub traversal_requests: u32,
     /// CLAS the cluster BLAS a scene builds in a frame for the ray-tracing cuts its traversal
     /// gathers take at first, and those BLAS. Their tables and arenas grow to what completed
-    /// frames wanted within `rt_cut_memory`. While a frame wants more than they hold, the
-    /// copies nearest the focus build theirs and the farther ones trace cached cuts, the same
-    /// copies every frame of a still view. Above 0.
+    /// frames wanted within `rt_cut_memory`. While a frame wants more than they hold, its cuts
+    /// build nearest the focus first, up to the first whose CLAS or BLAS find no room left:
+    /// the copies of that cut and of the cuts after it trace cached cuts. A copy is as far as
+    /// its model's bounds, so every copy whose bounds hold the focus is at distance 0; cuts
+    /// equally far go in the order of their first copies' instance slots. The same copies
+    /// build every frame of a still view. Above 0.
     pub initial_rt_cut_clusters: u32,
     pub initial_rt_cut_blas: u32,
     /// Device memory a scene's tables of built ray-tracing cuts and their BLAS arenas grow

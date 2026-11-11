@@ -14,12 +14,12 @@
 //! page that is not resident is requested likewise and leaves what lies below it to those
 //! stand-ins. Ray-tracing cuts of distant copies are their model's merged
 //! cut; the cuts of near copies are counted and hashed, matched against their mesh's cached
-//! cuts, shared between copies with equal cuts, and otherwise built as cluster BLAS: those of
-//! the copies nearest the focus that the frame's capacity holds, which a second walk of the
-//! built cuts fills in. Copies tracing a cached cut of a streaming mesh, those past the
-//! capacity among them, ask for the finer cut that would serve them; an edit's copies always
-//! gather, with what it touches held at level 0, split into a BLAS for the body and one per
-//! animated part while they take their pose.
+//! cuts, shared between copies with equal cuts, and otherwise built as cluster BLAS: those the
+//! frame's capacity holds, taken nearest the focus first and among equally near ones by
+//! instance slot, which a second walk of the built cuts fills in. Copies tracing a cached cut
+//! of a streaming mesh, those past the capacity among them, ask for the finer cut that would
+//! serve them; an edit's copies always gather, with what it touches held at level 0, split
+//! into a BLAS for the body and one per animated part while they take their pose.
 //!
 //! The tables of the built cuts and the arenas their BLAS build into grow to what completed
 //! frames wanted, within [`crate::Budgets::rt_cut_memory`] and the device memory there is.
@@ -79,9 +79,18 @@ const ARGS_TOTAL: u64 = ARGS_JOBS + 3;
 const TRAVERSE_FOCUS: u32 = 1;
 const TRAVERSE_ERRORS: u32 = 2;
 const TRAVERSE_FILL: u32 = 4;
-/// `cut.slang` `FEEDBACK_BUCKETS` and `ADMIT_BUCKETS`.
+/// `cut.slang` `FEEDBACK_BUCKETS`, `ADMIT_BITS`, `ADMIT_BUCKETS` and `ADMIT_WORDS`.
 const FEEDBACK_BUCKETS: u32 = 4096;
-const ADMIT_BUCKETS: u32 = 16384;
+const ADMIT_BITS: u32 = 14;
+const ADMIT_BUCKETS: u32 = 1 << ADMIT_BITS;
+const ADMIT_WORDS: u32 = 2 * ADMIT_BUCKETS + 6;
+
+/// Digits of an admission key in a scene of `slots` instance slots (`traverse.slang`
+/// `admit_levels`): the admission takes a pass per digit.
+fn admit_levels(slots: u32) -> u32 {
+    let slot_bits = u32::BITS - slots.saturating_sub(1).leading_zeros();
+    (31 + slot_bits).div_ceil(ADMIT_BITS)
+}
 /// Passes of one traversal over a hierarchy whose depth is not known at mount.
 pub(crate) const PAGED_DEPTH: u32 = 32;
 
@@ -105,9 +114,9 @@ pub struct CutStats {
     pub rt_gathered: u32,
     pub rt_cached: u32,
     pub rt_shared: u32,
-    /// Of the gathering copies, those tracing a cached cut: past the distance from the focus
-    /// within which the frame's built cuts fit their tables; all of them in a frame whose
-    /// traversal dropped nodes; and those whose cut holds no cluster.
+    /// Of the gathering copies, those tracing a cached cut: past the cuts nearest the focus
+    /// that fit the tables of the frame's built cuts; all of them in a frame whose traversal
+    /// dropped nodes; and those whose cut holds no cluster.
     pub rt_fallback: u32,
     pub rt_lost: u32,
     pub rt_empty: u32,
@@ -187,6 +196,7 @@ pub(crate) struct CutPipelines {
     rank: PipelineId,
     own: PipelineId,
     select: PipelineId,
+    refine: PipelineId,
     admit: PipelineId,
     link: PipelineId,
     fill_roots: PipelineId,
@@ -215,6 +225,7 @@ impl CutPipelines {
             rank: c(t, "rank")?,
             own: c(t, "own")?,
             select: c(t, "select")?,
+            refine: c(t, "refine")?,
             admit: c(t, "admit")?,
             link: c(t, "link")?,
             fill_roots: c(t, "fill_roots")?,
@@ -558,7 +569,7 @@ impl Cuts {
         let wanted = block(4 * words, "wanted page entries")?.cast();
         let wanted_errors = block(4 * 32 * words, "wanted page errors")?.cast();
         let histogram = block(4 * u64::from(FEEDBACK_BUCKETS), "wanted page buckets")?.cast();
-        let admit = block(8 * u64::from(ADMIT_BUCKETS), "cut admission buckets")?.cast();
+        let admit = block(4 * u64::from(ADMIT_WORDS), "cut admission buckets")?.cast();
         let feedback = block(
             u64::from(sizes.requests) * size_of::<FeedbackGpu>() as u64,
             "page requests",
@@ -908,6 +919,13 @@ impl Cuts {
         }
         list.dispatch(p.get(k.select), r0, [1, 1, 1]);
         step(list);
+        for level in 1..admit_levels(f.slots) {
+            let r = root(level, false)?;
+            list.dispatch(p.get(k.refine), r, groups(f.slots));
+            step(list);
+            list.dispatch(p.get(k.select), r, [1, 1, 1]);
+            step(list);
+        }
         for kernel in [k.admit, k.link] {
             list.dispatch(p.get(kernel), r0, groups(f.slots));
             step(list);

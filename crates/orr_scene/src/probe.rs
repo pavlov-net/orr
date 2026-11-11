@@ -822,10 +822,16 @@ impl PixelProbe {
                 "its gathered cut holds no cluster".to_owned()
             } else if g.nodes_dropped != 0 {
                 format!("the traversal dropped {} nodes", g.nodes_dropped)
-            } else if c.rt_distance.to_bits() >> ADMIT_SHIFT >= g.admitted {
+            } else if c.rt_distance.to_bits() >> ADMIT_SHIFT > g.admitted {
                 format!(
-                    "past the frame's admission (distance bucket {} >= {})",
+                    "past the frame's admission (distance bucket {} > {})",
                     c.rt_distance.to_bits() >> ADMIT_SHIFT,
+                    g.admitted
+                )
+            } else if c.rt_distance.to_bits() >> ADMIT_SHIFT == g.admitted {
+                format!(
+                    "the frame's admission ran out of room in its distance bucket {}, at \
+                     its cut or one before it",
                     g.admitted
                 )
             } else {

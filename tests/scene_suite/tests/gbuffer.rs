@@ -6546,6 +6546,151 @@ fn past_tables_that_cannot_grow_the_farthest_copies_trace_cached_cuts_every_fram
     assert_clean();
 }
 
+/// `CutGpu.counters` (`cut.slang`): the CLAS handed to the frame's BLAS builds, and the builds.
+const CUT_CLAS: usize = 5;
+const CUT_JOBS: usize = 6;
+
+/// Tilted grounds whose bounds all hold the focus, so their distance tells none apart, under
+/// tables of the built cuts that may not grow: they hold two BLAS, or fewer CLAS than the cuts
+/// take until those have coarsened to fit. Every frame the cuts build in the order of their
+/// first slots up to the first that finds no room, under two BLAS the same two every frame,
+/// and every copy has a BLAS to trace. The last world puts enough slots before the grounds'
+/// that the admission's keys take a digit more.
+#[test]
+fn equally_near_cuts_fill_tables_that_cannot_grow_in_slot_order() {
+    let _serial = serial();
+    for (blas, clas, before) in [(2u32, 1u32 << 18, 0), (1024, 300, 0), (2, 1 << 18, 2100)] {
+        let mut w = World::with(&RendererDesc {
+            rt_merge_pixels: 0.0,
+            budgets: Budgets {
+                initial_rt_cut_clusters: clas,
+                initial_rt_cut_blas: blas,
+                rt_cut_memory: PoolSize::Bytes(0),
+                ..Budgets::default()
+            },
+            ..RendererDesc::default()
+        });
+        let what = format!("{blas} BLAS, {clas} CLAS, {before} slots before");
+        // Out of ray-tracing range behind the camera.
+        let far = Item {
+            model: "plain",
+            linear: Mat3::IDENTITY,
+            at: Vec3::new(0.0, 0.0, 500.0),
+        };
+        let grounds = [-4.0f32, -6.0, -8.0, -10.0, -12.0]
+            .into_iter()
+            .enumerate()
+            .map(|(i, z)| Item {
+                model: "dag ground",
+                linear: Mat3::from_rotation_y(0.4 * i as f32)
+                    * Mat3::from_rotation_x(0.25)
+                    * Mat3::from_diagonal(Vec3::new(2.0, 1.0, 4.0)),
+                at: Vec3::new(3.0 * i as f32 - 6.0, -1.0, z),
+            });
+        let items: Vec<Item> = std::iter::repeat_n(far, before).chain(grounds).collect();
+        let placed = place(&mut w, &items);
+        let (models, meshes, _) = orr_scene::testing::global_tables(&w.scenes);
+        let model = u64::from(w.model("dag ground").0);
+        let model: ModelGpu = read_buffer(models.offset(model), 1)[0];
+        let mesh: MeshGpu = read_buffer(meshes.offset(u64::from(model.mesh)), 1)[0];
+        let cached: Vec<orr_scene::RtCutGpu> =
+            read_buffer(mesh.rt_cuts, u64::from(mesh.rt_cut_count));
+        let eye = DVec3::new(0.3, 1.2, 4.0);
+        let target = DVec3::new(0.0, 0.0, -10.0);
+        // Per frame: which copies built, and whether the CLAS ran out before the BLAS.
+        let mut sets = Vec::new();
+        let mut clas_short = false;
+        for frame in 1..=8 {
+            let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+            let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
+            let tables: CutGpu = read_buffer(root.cut, 1)[0];
+            let cut = read_cut(&g.view, placed.count);
+            assert_eq!(
+                (cut.counters[CUT_LOST], cut.counters[CUT_EMPTY]),
+                (0, 0),
+                "{what}, frame {frame}"
+            );
+            let slots: Vec<(u32, SlotCutGpu)> = placed.ranges[before..]
+                .iter()
+                .map(|r| (r.first, cut.slots[r.first as usize]))
+                .collect();
+            let wants = |s: &SlotCutGpu| s.rt_cut == RT_CUT_BUILT || s.flags & CUT_FELL_BACK != 0;
+            // The cuts that want a BLAS, by their clusters: nearest distance, then first slot.
+            let mut cuts = std::collections::BTreeMap::new();
+            for (slot, s) in slots.iter().filter(|(_, s)| wants(s)) {
+                let c = cuts
+                    .entry((s.rt_hash, s.rt_count))
+                    .or_insert((u32::MAX, u32::MAX));
+                *c = (c.0.min(s.rt_distance.to_bits()), c.1.min(*slot));
+            }
+            let mut order: Vec<_> = cuts.iter().map(|(cut, key)| (*key, *cut)).collect();
+            order.sort_unstable();
+            let (mut used, mut fit) = (0, BTreeSet::new());
+            for (n, &(_, cut)) in order.iter().enumerate() {
+                let no_clas = used + cut.1 > tables.clas_capacity;
+                if n as u32 == tables.job_capacity || no_clas {
+                    clas_short |= no_clas && n > 0;
+                    break;
+                }
+                used += cut.1;
+                fit.insert(cut);
+            }
+            let jobs: Vec<u64> = read_buffer(tables.job_blas, u64::from(tables.job_capacity));
+            for (slot, s) in &slots {
+                let built = s.rt_cut == RT_CUT_BUILT;
+                if wants(s) {
+                    assert_eq!(
+                        built,
+                        fit.contains(&(s.rt_hash, s.rt_count)),
+                        "{what}, frame {frame}: slot {slot} of cuts in order {order:?}"
+                    );
+                }
+                let blas = if built {
+                    jobs[s.rt_job as usize]
+                } else {
+                    cached[s.rt_cut as usize].blas
+                };
+                assert!(blas != 0, "{what}, frame {frame}: slot {slot} has no BLAS");
+            }
+            assert_eq!(
+                (cut.counters[CUT_JOBS] as usize, cut.counters[CUT_CLAS]),
+                (fit.len(), used),
+                "{what}, frame {frame}: the builds and their CLAS"
+            );
+            if frame < 3 {
+                continue;
+            }
+            if blas == 2 {
+                assert!(
+                    order.len() > 2 && order.iter().all(|c| c.0.0 == 0) && fit.len() == 2,
+                    "frame {frame}: {} of the cuts {order:?} fit",
+                    fit.len()
+                );
+            }
+            sets.push(slots.iter().map(|(_, s)| s.rt_cut).collect::<Vec<_>>());
+            if frame == 8 {
+                // Camera rays reach every copy the raster drew, built or not.
+                let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+                let hit: BTreeSet<u32> = r.traced.iter().map(|t| t.instance).collect();
+                let drawn: BTreeSet<u32> = g.ids.iter().copied().filter(|&id| id != 0).collect();
+                assert!(
+                    drawn.len() > 2 && drawn.is_subset(&hit),
+                    "{what}: drawn {drawn:?}, traced {hit:?}"
+                );
+            }
+        }
+        if blas == 2 {
+            assert!(
+                sets.windows(2).all(|s| s[0] == s[1]),
+                "the cuts the copies trace change between frames: {sets:?}"
+            );
+        } else {
+            assert!(clas_short, "the CLAS never ran out before the BLAS");
+        }
+    }
+    assert_clean();
+}
+
 #[test]
 fn occluded_copies_wait_for_the_second_pass_and_the_image_holds() {
     let _serial = serial();

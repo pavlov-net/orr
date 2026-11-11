@@ -18,11 +18,13 @@
 //
 // `assign` then gives each gathered cut equal to a cached cut that cut, and `insert`, `rank`
 // and `own` put the others in a table of equal cuts, one entry a cut, whose first slot builds
-// the BLAS the others share, at the distance of the cut's nearest slot. `select` admits the
-// cuts nearest the focus whose CLAS and BLAS builds fit the frame's capacity, a distance
-// bucket at a time, so which cuts are built is a function of the scene and not of the order
-// threads ran in; `admit` and `link` give the others their cached cuts, each asking for the
-// finer cached cut that would serve it. `fill_roots` and the fill passes walk the built cuts
+// the BLAS the others share, at the distance of the cut's nearest slot. `select` and `refine`
+// admit the cuts whose CLAS and BLAS builds fit the frame's capacity in the order of their
+// keys, the distance and then the cut's first slot, up to the first that does not fit: a
+// digit of the key a pass, `select` finding the bucket of that digit the capacity runs out in
+// and `refine` counting that bucket's cuts by the next digit. Which cuts are built is so a
+// function of the scene and not of the order threads ran in; `admit` and `link` give the
+// others their cached cuts, each asking for the finer cached cut that would serve it. `fill_roots` and the fill passes walk the built cuts
 // again and write their clusters, `gather` their CLAS addresses and `jobs` their build
 // records. A posed copy of an edit builds a BLAS for its body and one per animated part with
 // clusters in the cut: `split` counts them and `place_lists` gives them their jobs and CLAS
@@ -1056,6 +1058,42 @@ uint cut_rank(CutGpu* cut, SlotCutGpu c)
     return c.rt_key != NO_KEY ? cut.keys[c.rt_key].rank : asuint(c.rt_distance);
 }
 
+// Digits of ADMIT_BITS bits in an admission key: the 31 bits of a distance, then the bits
+// that tell the scene's slots apart. `traverse.rs` records a pass per digit.
+uint admit_levels()
+{
+    uint slot_bits = root.slots > 1 ? firstbithigh(root.slots - 1) + 1 : 0;
+    return (31 + slot_bits + ADMIT_BITS - 1) / ADMIT_BITS;
+}
+
+// The key that orders the admission of the cut owner slot `slot` builds: the distance `rank`,
+// then the slot, which no other cut has.
+uint64_t admit_key(uint rank, uint slot, uint levels)
+{
+    return (uint64_t(rank) << (ADMIT_BITS * levels - 31)) | slot;
+}
+
+// Digit `level` of `key`, the most significant first: its bucket in that digit's pass.
+uint admit_digit(uint64_t key, uint levels, uint level)
+{
+    return uint(key >> (ADMIT_BITS * (levels - 1 - level))) & (ADMIT_BUCKETS - 1);
+}
+
+// The bucket of digit `level` the capacity runs out in, among the cuts in that bucket of every
+// digit before it; ADMIT_BUCKETS when it holds them all.
+uint admit_stop(CutGpu* cut, uint level)
+{
+    return level == 0 ? cut.counters[CUT_ADMITTED] : cut.admit[ADMIT_STOPS + level - 1];
+}
+
+// The BLAS builds the cut of owner slot `slot` takes.
+uint cut_jobs(SceneRoot* s, uint slot, SlotCutGpu c)
+{
+    if ((c.flags & CUT_PARTS) == 0)
+        return 1;
+    return 1 + s.meshes[s.models[s.instances[slot].model].mesh].animated_parts;
+}
+
 // A gathered cut equal to a cached cut traces it; the others ask the table of equal cuts for
 // an entry. A gathered cut that holds no cluster traces its cached cut, as does every one in
 // a frame whose traversal dropped nodes: which items a full queue drops hangs on the order
@@ -1148,8 +1186,9 @@ void insert(uint3 id: SV_DispatchThreadID)
     }
 }
 
-// A slot whose cut is its entry's lowers the entry's rank to its distance; one of another cut
-// with the same digest marks the entry, which then serves no slot.
+// A slot whose cut is its entry's lowers the entry's rank to its distance and its owner to
+// itself, so the cut's first slot owns it whichever took the entry; one of another cut with
+// the same digest marks the entry, which then serves no slot.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void rank(uint3 id: SV_DispatchThreadID)
@@ -1165,13 +1204,17 @@ void rank(uint3 id: SV_DispatchThreadID)
     uint key = key_mesh(c, s.models[s.instances[slot].model].mesh);
     CutKey k = cut.keys[c.rt_key];
     if (k.count == c.rt_count && k.mesh == key && all(k.hash == c.rt_hash))
+    {
         InterlockedMin(cut.keys[c.rt_key].rank, asuint(c.rt_distance));
+        InterlockedMin(cut.keys[c.rt_key].owner, slot);
+    }
     else
         InterlockedOr(cut.keys[c.rt_key].collided, 1);
 }
 
-// The slot that took a cut's entry owns the cut, as does a slot whose cut has none: it counts
-// the cut's CLAS and BLAS builds into the distance bucket of the cut's nearest slot.
+// The first slot of a cut's entry owns the cut, as does a slot whose cut has none: it counts
+// the cut's CLAS and BLAS builds into the bucket of its key's first digit, the distance bucket
+// of the cut's nearest slot.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void own(uint3 id: SV_DispatchThreadID)
@@ -1195,8 +1238,7 @@ void own(uint3 id: SV_DispatchThreadID)
         cut.slots[slot].owner = owner;
         return;
     }
-    MeshGpu* mesh = s.meshes + s.models[s.instances[slot].model].mesh;
-    uint jobs = (c.flags & CUT_PARTS) != 0 ? 1 + mesh.animated_parts : 1;
+    uint jobs = cut_jobs(s, slot, c);
     cut.slots[slot].flags = c.flags | CUT_OWNER;
     uint b = cut_rank(cut, c) >> ADMIT_SHIFT;
     InterlockedAdd(cut.admit[2 * b], c.rt_count);
@@ -1209,16 +1251,21 @@ groupshared uint g_clas[SELECT_THREADS];
 groupshared uint g_jobs[SELECT_THREADS];
 groupshared uint g_first;
 
-// One group. Thread t sums `SELECT_SPAN` buckets, thread 0 the nearest; the thread whose
-// buckets a running sum passes its capacity in finds the first bucket not admitted, and the
-// nearer of the CLAS's and the builds' stands. With room for all, every bucket is admitted.
+// One group, for digit `root.pass` of the keys. Thread t sums `SELECT_SPAN` buckets, thread 0
+// the first, on top of what the cuts before the digit's buckets take; the thread whose buckets
+// a running sum passes its capacity in finds the bucket the capacity runs out in, the earlier
+// of the CLAS's and the builds'. It leaves what the cuts before that bucket take for the next
+// digit, and the buckets empty for `refine`. With room for all, no bucket is found.
 [shader("compute")]
 [numthreads(SELECT_THREADS, 1, 1)]
 void select(uint3 id: SV_GroupThreadID)
 {
     CutGpu* cut = root.cut;
+    uint level = root.pass;
     uint t = id.x;
     uint first = SELECT_SPAN * t;
+    uint taken_clas = level > 0 ? cut.admit[ADMIT_TAKEN] : 0;
+    uint taken_jobs = level > 0 ? cut.admit[ADMIT_TAKEN + 1] : 0;
     uint clas = 0;
     uint jobs = 0;
     for (uint i = 0; i < SELECT_SPAN; i++)
@@ -1240,17 +1287,19 @@ void select(uint3 id: SV_GroupThreadID)
         g_jobs[t] += add_jobs;
         GroupMemoryBarrierWithGroupSync();
     }
-    uint above_clas = t > 0 ? g_clas[t - 1] : 0;
-    uint above_jobs = t > 0 ? g_jobs[t - 1] : 0;
-    bool clas_here = above_clas <= cut.clas_capacity && g_clas[t] > cut.clas_capacity;
-    bool jobs_here = above_jobs <= cut.job_capacity && g_jobs[t] > cut.job_capacity;
+    uint above_clas = taken_clas + (t > 0 ? g_clas[t - 1] : 0);
+    uint above_jobs = taken_jobs + (t > 0 ? g_jobs[t - 1] : 0);
+    bool clas_here = above_clas <= cut.clas_capacity && taken_clas + g_clas[t] > cut.clas_capacity;
+    bool jobs_here = above_jobs <= cut.job_capacity && taken_jobs + g_jobs[t] > cut.job_capacity;
     if (clas_here || jobs_here)
     {
+        uint to_clas = above_clas;
+        uint to_jobs = above_jobs;
         for (uint i = 0; i < SELECT_SPAN; i++)
         {
-            above_clas += cut.admit[2 * (first + i)];
-            above_jobs += cut.admit[2 * (first + i) + 1];
-            if (above_clas > cut.clas_capacity || above_jobs > cut.job_capacity)
+            to_clas += cut.admit[2 * (first + i)];
+            to_jobs += cut.admit[2 * (first + i) + 1];
+            if (to_clas > cut.clas_capacity || to_jobs > cut.job_capacity)
             {
                 InterlockedMin(g_first, first + i);
                 break;
@@ -1258,11 +1307,69 @@ void select(uint3 id: SV_GroupThreadID)
         }
     }
     GroupMemoryBarrierWithGroupSync();
+    uint stop = g_first;
+    for (uint i = 0; i < SELECT_SPAN; i++)
+    {
+        if (first + i == stop)
+        {
+            cut.admit[ADMIT_TAKEN] = above_clas;
+            cut.admit[ADMIT_TAKEN + 1] = above_jobs;
+        }
+        above_clas += cut.admit[2 * (first + i)];
+        above_jobs += cut.admit[2 * (first + i) + 1];
+        cut.admit[2 * (first + i)] = 0;
+        cut.admit[2 * (first + i) + 1] = 0;
+    }
     if (t == 0)
-        cut.counters[CUT_ADMITTED] = g_first;
+    {
+        if (level == 0)
+            cut.counters[CUT_ADMITTED] = stop;
+        else
+            cut.admit[ADMIT_STOPS + level - 1] = stop;
+    }
 }
 
-// Owners of the admitted buckets take their CLAS ranges and build jobs, or for a cut built by
+// For digit `root.pass` of the keys, past the first: the owners in the bucket the capacity ran
+// out in at every digit before count their cuts' CLAS and BLAS builds into the digit's
+// buckets.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void refine(uint3 id: SV_DispatchThreadID)
+{
+    uint slot = id.x;
+    CutGpu* cut = root.cut;
+    if (slot >= root.slots || cut.counters[CUT_ADMITTED] == ADMIT_BUCKETS)
+        return;
+    SlotCutGpu c = cut.slots[slot];
+    if ((c.flags & CUT_OWNER) == 0)
+        return;
+    uint levels = admit_levels();
+    uint64_t key = admit_key(cut_rank(cut, c), slot, levels);
+    for (uint i = 0; i < root.pass; i++)
+    {
+        if (admit_digit(key, levels, i) != admit_stop(cut, i))
+            return;
+    }
+    uint b = admit_digit(key, levels, root.pass);
+    InterlockedAdd(cut.admit[2 * b], c.rt_count);
+    InterlockedAdd(cut.admit[2 * b + 1], cut_jobs(root.scene, slot, c));
+}
+
+// Whether the admission builds the cut of `key`: it comes before the first cut the capacity
+// does not hold, the one in the bucket the capacity ran out in at every digit.
+bool admit_builds(CutGpu* cut, uint64_t key, uint levels)
+{
+    for (uint i = 0; i < levels; i++)
+    {
+        uint digit = admit_digit(key, levels, i);
+        uint stop = admit_stop(cut, i);
+        if (digit != stop)
+            return digit < stop;
+    }
+    return false;
+}
+
+// Owners of the admitted cuts take their CLAS ranges and build jobs, or for a cut built by
 // part its lists, whose jobs `place_lists` hands out; the others trace their cached cuts. The
 // admission keeps both within capacity.
 [shader("compute")]
@@ -1277,7 +1384,8 @@ void admit(uint3 id: SV_DispatchThreadID)
     SlotCutGpu c = cut.slots[slot];
     if ((c.flags & CUT_OWNER) == 0)
         return;
-    if ((cut_rank(cut, c) >> ADMIT_SHIFT) >= cut.counters[CUT_ADMITTED])
+    uint levels = admit_levels();
+    if (!admit_builds(cut, admit_key(cut_rank(cut, c), slot, levels), levels))
     {
         fall_back(s, cut, slot, CUT_FALLBACK);
         return;

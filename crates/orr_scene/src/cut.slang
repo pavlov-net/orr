@@ -59,16 +59,25 @@ public static const uint CUT_JOBS_WANTED = 24;        // BLAS builds those cuts 
 public static const uint CUT_KEYS = 25;               // slots asking the table of equal cuts for an entry
 public static const uint CUT_LOST = 26;               // gathering slots of a traversal that dropped nodes: a cached cut
 public static const uint CUT_EMPTY = 27;              // gathering slots whose cut holds no cluster
-public static const uint CUT_ADMITTED = 28;           // the first distance bucket whose cuts are not built
+public static const uint CUT_ADMITTED = 28;           // the first distance bucket whose cuts are not all built
 public static const uint CUT_HIDDEN_TESTS = 29;       // group spheres tested against the views
 public static const uint CUT_HIDDEN_LEAVES = 30;      // leaves the hidden threshold left out of a cut
 public static const uint CUT_HIDDEN_RULES = 31;       // clusters the hidden threshold decided in a cut
 public static const uint CUT_COUNTERS = 32;
 
-// Distance buckets of the cuts' admission: the top bits of a distance's f32 bits, which order
+// The cuts' admission takes their keys a digit of ADMIT_BITS bits at a time, each digit's
+// values its buckets. The first digit is the top bits of a distance's f32 bits, which order
 // like the distances they hold.
-public static const uint ADMIT_BUCKETS = 16384;
-public static const uint ADMIT_SHIFT = 17;
+public static const uint ADMIT_BITS = 14;
+public static const uint ADMIT_BUCKETS = 1 << ADMIT_BITS;
+public static const uint ADMIT_SHIFT = 31 - ADMIT_BITS;
+// The most digits a key has: 31 bits of distance and 32 of slot.
+public static const uint ADMIT_LEVELS = 5;
+// `CutGpu.admit` past the buckets: per digit past the first, the bucket the capacity ran out
+// in, then the CLAS and BLAS builds of the cuts before that bucket of the last digit taken.
+public static const uint ADMIT_STOPS = 2 * ADMIT_BUCKETS;
+public static const uint ADMIT_TAKEN = ADMIT_STOPS + ADMIT_LEVELS - 1;
+public static const uint ADMIT_WORDS = ADMIT_TAKEN + 2;
 
 // One instance slot's cuts this frame.
 public struct SlotCutGpu
@@ -128,7 +137,7 @@ public struct CutKey
     public uint count;
     public uint mesh;
     public uint digest;            // a mix of the cut's key; 0 empty
-    public uint owner;             // the slot that took the entry first
+    public uint owner;             // the first of the cut's slots
     public uint rank;              // f32 bits of the least `SlotCutGpu.rt_distance` of the cut's slots
     public uint collided;          // nonzero when a slot of another cut has the digest
 }
@@ -171,7 +180,7 @@ public struct CutGpu
     public uint* wanted_errors;    // 32 per word of `wanted`
     public uint* histogram;        // FEEDBACK_BUCKETS: the wanted entries by error bucket
     public FeedbackGpu* feedback;
-    public uint* admit;            // ADMIT_BUCKETS pairs: the CLAS and BLAS builds the cuts take by distance bucket
+    public uint* admit;            // ADMIT_WORDS: per bucket of the key digit being taken, the CLAS and BLAS builds its cuts take; then ADMIT_STOPS and ADMIT_TAKEN
     public uint queue_capacity;
     public uint candidate_capacity;
     public uint clas_capacity;
