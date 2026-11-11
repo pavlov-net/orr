@@ -643,6 +643,7 @@ impl CommandList<'_> {
             MemoryKind::Readback,
             bytes,
             "rtas records",
+            false,
         )
         .expect("rtas readback");
         let at = memory.gpu().address().0;
@@ -710,7 +711,7 @@ impl CommandList<'_> {
 
     /// Memory this list keeps until its submit completes.
     fn scratch_memory(&mut self, kind: MemoryKind, bytes: u64, name: &str) -> Allocation<u8> {
-        malloc::<u8>(&self.queue.shared, kind, bytes.max(16), name).expect(name)
+        malloc::<u8>(&self.queue.shared, kind, bytes.max(16), name, false).expect(name)
     }
 
     /// Writes the results' addresses and sizes where the caller asked for them.

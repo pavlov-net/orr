@@ -221,6 +221,7 @@ impl<'q> CommandList<'q> {
                 MemoryKind::Upload,
                 INLINE_BLOCK,
                 "inline roots",
+                false,
             )
             .expect("inline root block");
             self.inline.push(block);

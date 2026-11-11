@@ -292,6 +292,7 @@ impl CommandList<'_> {
             MemoryKind::DeviceLocal,
             TRIANGLE_DATA_BYTES * u64::from(count.max(1)),
             "triangle data",
+            false,
         )
         .expect("triangle data");
         let address = dst.gpu().address().0;
@@ -326,6 +327,7 @@ impl CommandList<'_> {
             MemoryKind::DeviceLocal,
             METAL_INSTANCE_BYTES * u64::from(capacity.max(1)),
             "metal instances",
+            false,
         )
         .expect("instance descriptors");
         let address = dst.gpu().address().0;
