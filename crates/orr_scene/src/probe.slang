@@ -376,9 +376,9 @@ void probe(uint3 id: SV_DispatchThreadID)
     uint2 pixel = uint2(root.pixel_x, root.pixel_y);
     o.frame = s.frame_index;
     uint index = pixel.y * r.gbuffer.extent.x + pixel.x;
-    uint64_t w = r.gbuffer.visibility[index];
+    uint64_t w = all(pixel < r.gbuffer.extent) ? r.gbuffer.visibility[index] : 0;
     o.word = w;
-    if (w == 0 || any(pixel >= r.gbuffer.extent))
+    if (w == 0)
     {
         *root.out = o;
         return;
