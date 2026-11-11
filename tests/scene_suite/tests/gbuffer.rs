@@ -10284,6 +10284,54 @@ fn skinned_vertices_match_the_cpu_skin_by_this_and_the_last_palette() {
     assert_clean();
 }
 
+/// A palette entry of zero, as a pose writes for a joint it scales to nothing at the origin,
+/// collapses what that joint carries: the rest of the copy skins, this frame and as last frame's
+/// palette for its motion.
+#[test]
+fn a_zero_palette_entry_collapses_its_joint_and_the_rest_skins() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let worms = place_worms(&mut w, "worm", &[(Mat3::IDENTITY, Vec3::ZERO)], false);
+    let mesh = CpuMesh::of("worm");
+    let mut zeroed = worm_palette(0.3);
+    zeroed[0] = Affine3::from_cols_array(&[0.0; 12]);
+    let write = |s: &mut SceneWriter<'_>, palette: &[Affine3]| {
+        let out = s.transforms(worms.palette, 0, worms.joints).unwrap();
+        for (o, &p) in out.iter_mut().zip(palette) {
+            *o = p.into();
+        }
+    };
+    let g = shoot_with(&mut w, &worms.placed, &worm_shot(1), |s| write(s, &zeroed));
+    let (_, _, clusters) = skinned_entry(&g.view, 0);
+    assert!(!clusters.is_empty(), "a zero entry hid the copy");
+    let g = shoot_with(&mut w, &worms.placed, &worm_shot(2), |s| {
+        write(s, &worm_palette(0.7));
+    });
+    let (k, _, clusters) = skinned_entry(&g.view, 0);
+    let vertices: u32 = mesh
+        .pages
+        .iter()
+        .map(|p| {
+            let v = PageView::new(p, &mesh.header).unwrap();
+            (0..v.cluster_count())
+                .map(|i| u32::from(v.cluster(i).vertex_count))
+                .sum::<u32>()
+        })
+        .sum();
+    let read = |p: GpuPtr<[f32; 3]>| -> Vec<Vec3> {
+        read_buffer(p, u64::from(vertices))
+            .into_iter()
+            .map(Vec3::from)
+            .collect()
+    };
+    let before = skin_error(&mesh, &read(k.previous.cast()), &clusters, &zeroed);
+    assert!(
+        before < 1e-5,
+        "previous positions {before} m from the zeroed skin"
+    );
+    assert_clean();
+}
+
 /// Unmounting the pack of a skinned page's model takes the page from the scene whole: its copies,
 /// their skinned entries, and the groups of its records and its motion.
 #[test]

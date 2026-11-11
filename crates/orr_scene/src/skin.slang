@@ -106,8 +106,9 @@ void select(uint3 id: SV_DispatchThreadID)
     bool shown = (inst.flags & (INSTANCE_RASTER | INSTANCE_RAY)) != 0 && sm != nullptr && sm.cut_count > 0
         && palette.current != nullptr && k.palette_first + k.joint_count <= palette.count
         && placement(g, false, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), p);
-    if (!shown || !palette_set(palette, k.palette_first, k.joint_count))
+    if (!shown || !palette_written(palette.current, k.palette_first, k.joint_count))
         return;
+    st.previous = palette_written(palette.previous, k.palette_first, k.joint_count) ? 1 : 0;
 
     bool focus = root.focus_cell.w != 0;
     float3 center = place(p, 0.5 * (model.bounds_min + model.bounds_max));
@@ -230,6 +231,8 @@ void skin(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     uint local = c - mesh.page_clusters[page];
     Cluster cl = load_cluster(data, local);
     GroupGpu* palette = s.groups + k.palette_group;
+    // A palette last frame did not write takes this frame's for its motion.
+    bool before_written = s.skin_state[item.x].previous != 0;
     uint base = sm.vertex_first[c];
     if (t < 3)
     {
@@ -255,7 +258,7 @@ void skin(uint group: SV_GroupID, uint t: SV_GroupThreadID)
         float3 q = clamp(transform_point(m, x), limit_lo, limit_hi);
         k.positions[base + i] = q;
         float3 x_was = before != data ? load_position(before, was_header, was, i, mesh.position_step) : x;
-        k.previous[base + i] = clamp(transform_point(blend(palette, k, a, true), x_was), was_lo, was_hi);
+        k.previous[base + i] = clamp(transform_point(blend(palette, k, a, before_written), x_was), was_lo, was_hi);
         k.normals[base + i] = oct_encode_snorm16(transform_normal(m, a.normal));
         if (tangents)
         {

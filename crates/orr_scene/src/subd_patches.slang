@@ -24,7 +24,7 @@ public struct SubdRoot
 }
 ORR_ROOT(SubdRoot);
 
-// Whether every palette entry of the copy is set: an unset one hides the copy.
+// Whether the copy's palette is written (`palette_written`): an unwritten one hides the copy.
 bool palette_shown(SubdCopyGpu* c)
 {
     if (c.joint_count == 0)
@@ -32,7 +32,7 @@ bool palette_shown(SubdCopyGpu* c)
     GroupGpu* palette = root.scene.groups + c.palette_group;
     if (palette.current == nullptr || c.palette_first + c.joint_count > palette.count)
         return false;
-    return palette_set(palette, c.palette_first, c.joint_count);
+    return palette_written(palette.current, c.palette_first, c.joint_count);
 }
 
 // One thread per cage point.
@@ -48,9 +48,11 @@ void pose(uint3 id: SV_DispatchThreadID)
     GroupGpu* palette = root.scene.groups + c.palette_group;
     float3 p = cage.cage_points[i];
     SubdInfluence s = decode_influence(cage.skin[i]);
+    // A palette last frame did not write takes this frame's for its motion.
+    bool before_written = palette_written(palette.previous, c.palette_first, c.joint_count);
     for (uint k = 0; k < 2; k++)
     {
-        float3x4 m = palette_blend(palette, c.palette_first, c.joint_count, s.joints, s.weights, k == 1);
+        float3x4 m = palette_blend(palette, c.palette_first, c.joint_count, s.joints, s.weights, k == 1 && before_written);
         c.posed[k * cage.cage_point_count + i] = transform_point(m, p);
     }
 }
