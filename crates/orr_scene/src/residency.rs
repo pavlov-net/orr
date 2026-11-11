@@ -301,6 +301,19 @@ struct Release {
     free: FxHashSet<Key>,
 }
 
+impl Release {
+    /// Takes the releases of `d`, made over these, as its own.
+    fn merge(&mut self, d: Release) {
+        for (k, n) in d.locks {
+            *self.locks.entry(k).or_default() += n;
+        }
+        for (k, n) in d.used {
+            *self.used.entry(k).or_default() += n;
+        }
+        self.free.extend(d.free);
+    }
+}
+
 /// A request's priority among its source's: the larger projected error first, then the nearer
 /// cell.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1233,9 +1246,10 @@ impl Residency {
     /// shed, in order, while what the latest sample's frame wanted, `sampled`, does not fit
     /// `budget` beside the units held while used that it did not count, or the cuts' locks,
     /// `locked` in all, take more than half of it. The `leaving` cuts were shed earlier and go,
-    /// with their locks, once no frame uses them. A cut ranks by the bytes of the units it
-    /// locks that the sample did not count, and what shedding it returns is what that leaves
-    /// kept by nothing: a unit the frame reads stays, as does one a cut left unshed holds.
+    /// with their locks, once no frame uses them. What shedding a cut returns is what that
+    /// leaves kept by nothing: a unit the frame reads stays, as does one a cut left unshed
+    /// holds. A cut ranks by what it returns alone, then by the bytes of the units it locks that
+    /// the sample did not count, which it returns with the cuts that share them.
     pub(crate) fn shed(
         &self,
         class: ResidencyClass,
@@ -1249,8 +1263,13 @@ impl Residency {
         let mut over = sampled + self.unsampled_held(class);
         let mut locked = locked;
         for h in leaving {
-            over -= self.release(&mut release, class, h.units);
+            let mut d = Release::default();
+            over -= self.release(&release, &mut d, class, h.units);
+            release.merge(d);
             locked -= h.bytes;
+        }
+        if over <= budget && locked <= budget / 2 {
+            return Vec::new();
         }
         let unread = |h: &Holder<'_>| -> u64 {
             let u = h
@@ -1261,14 +1280,21 @@ impl Residency {
                 .map(Unit::held)
                 .sum()
         };
-        let mut order: Vec<(u64, usize)> = built.iter().map(unread).zip(0..).collect();
+        // What each returns alone first, then what it would with the cuts that share its units.
+        let mut order: Vec<(u64, u64, usize)> = (built.iter().enumerate())
+            .map(|(i, h)| {
+                let alone = self.release(&release, &mut Release::default(), class, h.units);
+                (alone, unread(h), i)
+            })
+            .collect();
         order.sort_by(|a, b| {
             (b.0.cmp(&a.0))
-                .then(built[b.1].bytes.cmp(&built[a.1].bytes))
-                .then(a.1.cmp(&b.1))
+                .then(b.1.cmp(&a.1))
+                .then(built[b.2].bytes.cmp(&built[a.2].bytes))
+                .then(a.2.cmp(&b.2))
         });
         let mut out = Vec::new();
-        for (unread, i) in order {
+        for (_, unread, i) in order {
             let locks_fit = locked <= budget / 2;
             if over <= budget && locks_fit {
                 break;
@@ -1277,30 +1303,33 @@ impl Residency {
             if unread == 0 && locks_fit {
                 continue;
             }
-            over -= self.release(&mut release, class, built[i].units);
+            let mut d = Release::default();
+            over -= self.release(&release, &mut d, class, built[i].units);
+            release.merge(d);
             locked -= built[i].bytes;
             out.push(i);
         }
         out
     }
 
-    /// Takes back one while-used lock on each of `units` in `r`, as their holder would going;
-    /// returns the bytes of `class` that leaves kept by nothing the latest sample did not
-    /// count, which are what the holder's going returns.
-    fn release(&self, r: &mut Release, class: ResidencyClass, units: &[Key]) -> u64 {
+    /// Takes back one while-used lock on each of `units` into `d`, after those of `r`, as
+    /// their holder would going; returns the bytes of `class` that leaves kept by nothing the
+    /// latest sample did not count, which are what the holder's going returns.
+    fn release(&self, r: &Release, d: &mut Release, class: ResidencyClass, units: &[Key]) -> u64 {
+        let count = |of: &FxHashMap<Key, u32>, k: &Key| of.get(k).copied().unwrap_or(0);
         let mut changed = Vec::new();
         for &k in units {
             let u = self.unit(k).expect("a unit of a mount");
-            let taken = r.locks.entry(k).or_default();
+            let taken = d.locks.entry(k).or_default();
             *taken += 1;
             // Its last lock gone, it stops holding what it depends on, as `hold_under` counts.
-            if u.holds() == Kept::WhileUsed && *taken == u.locks {
-                for d in self.under(k) {
+            if u.holds() == Kept::WhileUsed && count(&r.locks, &k) + *taken == u.locks {
+                for q in self.under(k) {
                     let q = Key {
                         mount: k.mount,
-                        unit: d,
+                        unit: q,
                     };
-                    *r.used.entry(q).or_default() += 1;
+                    *d.used.entry(q).or_default() += 1;
                     changed.push(q);
                 }
             }
@@ -1309,10 +1338,11 @@ impl Residency {
         let mut bytes = 0;
         for k in changed {
             let u = self.unit(k).expect("a unit of a mount");
-            let unlocked = u.holds() != Kept::WhileUsed || r.locks.get(&k) == Some(&u.locks);
-            let unused = r.used.get(&k).copied().unwrap_or(0) == u.used_by;
+            let taken = count(&r.locks, &k) + count(&d.locks, &k);
+            let unlocked = u.holds() != Kept::WhileUsed || taken == u.locks;
+            let unused = count(&r.used, &k) + count(&d.used, &k) == u.used_by;
             let kept = u.class == class && u.sampled != self.sample && u.kept() == Kept::WhileUsed;
-            if kept && unlocked && unused && r.free.insert(k) {
+            if kept && unlocked && unused && !r.free.contains(&k) && d.free.insert(k) {
                 bytes += u.held();
             }
         }
@@ -2941,6 +2971,35 @@ mod tests {
         );
         // Locks of 60 against 50: C, whose 3 returns now, not A, whose 1 the frame reads.
         assert_eq!(r.shed(class, 70, 100, &leaving, &built, locked), [1]);
+    }
+
+    /// A cut whose units return alone is shed before two that share theirs, either of which
+    /// returns nothing without the other.
+    #[test]
+    fn a_cut_that_returns_units_alone_is_shed_before_cuts_that_share_theirs() {
+        let class = ResidencyClass::InstancePages;
+        let mut r = Residency::new(limits(10_000));
+        // 0 read; 1 locked by X and Y, 2 by Z.
+        let units = [
+            unit(230, &[], Start::Absent),
+            unit(50, &[], Start::Absent),
+            unit(40, &[], Start::Absent),
+        ];
+        r.register(M, &units).unwrap();
+        step(&mut r, &[0, 1, 2], 1);
+        for u in [1, 1, 2] {
+            r.lock_while_used(key(u));
+        }
+        r.begin_sample();
+        r.touch(key(0), 2);
+        let d = r.end_sample()[class as usize];
+        let (shared, own) = ([key(1)], [key(2)]);
+        let cuts = [(&shared, 50), (&shared, 50), (&own, 40)].map(|(units, bytes)| Holder {
+            units: &units[..],
+            bytes,
+        });
+        // 320 against 280.
+        assert_eq!(r.shed(class, d.bytes, 280, &[], &cuts, 140), [2]);
     }
 
     /// What a cut's pages would add to a sample leaves out the pages another cut holds while
