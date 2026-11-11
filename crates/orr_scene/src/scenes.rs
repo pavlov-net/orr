@@ -735,6 +735,7 @@ impl Scenes {
                 // New copies take entries for the model alone; live ones keep theirs.
                 let m = &mut core.model_cpu[model.0 as usize];
                 m.emissive_stride = m.emissive_sections;
+                m.chained = false;
             }
         }
     }
@@ -867,7 +868,11 @@ impl Scenes {
             core.chains
                 .insert(model, chain.iter().map(|&(m, _)| m).collect());
             core.chained = true;
+            for scene in core.scenes.iter().flatten() {
+                scene.chain_far(model.0);
+            }
         }
+        core.model_cpu[model.0 as usize].chained = !chain.is_empty();
         core.write_chain(model, chain);
         Ok(())
     }
@@ -1061,8 +1066,6 @@ impl Scenes {
     }
 
     /// A new scene with empty tables.
-    ///
-    /// Panics if `desc.part_capacity` is past 2^24.
     pub fn create_scene(&mut self, desc: &SceneDesc) -> Result<SceneId> {
         let scene = Scene::new(&self.device, desc)?;
         Ok(SceneId(insert(&mut self.core.scenes, scene)))
@@ -1780,6 +1783,7 @@ impl<'a> Frame<'a> {
             }
             let producers = cpu.producers.iter().any(Option::is_some);
             let tlas = cpu.ptlas.tlas(device, core.fif, producers)?;
+            let layout = cpu.ptlas.layout();
             if cpu.cuts.is_none() {
                 let heap = device.memory_report().heap_of(MemoryKind::DeviceLocal).size;
                 let sizes = CutSizes {
@@ -1883,7 +1887,7 @@ impl<'a> Frame<'a> {
                 medium: cpu.medium.unwrap_or(0),
                 surface_data: cpu.surface_data,
                 tlas: tlas.unwrap_or_else(|| device.empty_tlas()),
-                part_slots: cpu.ptlas.part_slots.gpu(),
+                part_slots: cpu.ptlas.part_slots(),
                 origin_cell: cpu.origin_cell.extend(core.cell_log2 as i32).to_array(),
                 delta_time: self.time.delta,
                 frame_index: self.id as u32,
@@ -1892,9 +1896,9 @@ impl<'a> Frame<'a> {
                 producer_capacity: scene.desc.producer_capacity,
                 emissive_capacity: scene.desc.emissive_capacity,
                 near_range: cpu.near_range,
-                part_base: scene.desc.instance_capacity,
-                part_capacity: scene.desc.part_capacity,
-                producer_base: scene.desc.instance_capacity + scene.desc.part_capacity,
+                part_base: layout.slots,
+                part_capacity: layout.parts,
+                producer_base: layout.slots + layout.parts,
                 cut,
                 skinned: t.skinned.gpu(),
                 skin_state: t.skin_state.gpu(),
@@ -1905,13 +1909,11 @@ impl<'a> Frame<'a> {
                 decal_globals: cpu.decal_globals,
                 decal_bin_slots: cpu.decal_bin_slots,
                 decal_bin_log2: decals::bin_log2(core.cell_log2),
-                proxy_base: scene.desc.instance_capacity
-                    + scene.desc.part_capacity
-                    + scene.desc.producer_capacity,
+                proxy_base: layout.slots + layout.parts + scene.desc.producer_capacity,
                 proxies: t.proxies.gpu(),
                 proxy_capacity: scene.desc.medium_proxy_capacity,
-                light_base: scene.desc.instance_capacity
-                    + scene.desc.part_capacity
+                light_base: layout.slots
+                    + layout.parts
                     + scene.desc.producer_capacity
                     + scene.desc.medium_proxy_capacity,
                 emissive_lists: t.emissive_lists.gpu(),
@@ -2290,6 +2292,7 @@ impl<'a> Frame<'a> {
                     budget: core.budgets.ptlas_rebuilt,
                     proxy_blas,
                     slot: (self.id % u64::from(core.fif)) as usize,
+                    frame: self.id,
                 };
                 let kernels = &core.ptlas;
                 cpu.ptlas.record(

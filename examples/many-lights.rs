@@ -204,8 +204,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 light_capacity: (local.len() + directional.len()) as u32,
                 material_set_capacity: 4,
                 emissive_capacity: 16,
-                part_capacity: 0,
-                ptlas_partitions: 4,
                 global_instances: 4,
                 ..SceneDesc::default()
             },

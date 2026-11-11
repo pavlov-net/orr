@@ -8,8 +8,8 @@
 
 use lighting_suite::bed::{
     Bed, DEPTH_TEXTURED_SHEET, DEPTH_TEXTURED_SLAB, FLOOR, Item, PLUME, PRESENCE_VEIL,
-    PRESENCE_VEIL_OPACITY, PRODUCER_CAPACITY, Particle, ParticleLook, SHEET_DEPTH, SHEET_THICKNESS,
-    SLAB_THICKNESS, SUN, Spec, TINTED_SLAB, WATER_BOX, fresnel, plume_volume, water_transmission,
+    PRESENCE_VEIL_OPACITY, Particle, ParticleLook, SHEET_DEPTH, SHEET_THICKNESS, SLAB_THICKNESS,
+    SUN, Spec, TINTED_SLAB, WATER_BOX, fresnel, plume_volume, water_transmission,
 };
 use lighting_suite::shaders::{proxy_rays, shadow_probe};
 use lighting_suite::{assert_clean, pipeline, readback, upload};
@@ -17,7 +17,7 @@ use orr_gpu::{Allocation, Hazards, Stages};
 use orr_lighting::Light;
 use orr_math::{DVec3, Mat3, Quat, Vec3};
 use orr_pack::volume::GridSampler;
-use orr_scene::{MediumProxy, MediumProxyId, Opacity, ProxyDensity, SceneDesc};
+use orr_scene::{MediumProxy, MediumProxyId, Opacity, ProxyDensity};
 
 fn at(model: &'static str, at: Vec3) -> Item {
     Item {
@@ -505,8 +505,6 @@ fn only_rays_with_the_medium_mask_see_medium_proxies() {
     };
     let id = MediumProxyId(3);
     bed.set_medium_proxy(id, Some(proxy));
-    let d = SceneDesc::default();
-    let proxy_base = d.instance_capacity + d.part_capacity + PRODUCER_CAPACITY;
     let origins: Vec<Vec3> = (0..256)
         .map(|k| {
             Vec3::new(
@@ -556,7 +554,7 @@ fn only_rays_with_the_medium_mask_see_medium_proxies() {
             }
             inside += usize::from(mask == medium);
             assert_eq!(s.count, 1, "mask {mask:#x}, ray at {p}");
-            assert_eq!(s.instance - proxy_base, id.0);
+            assert_eq!(s.proxy, id.0);
             assert_eq!((s.class_id, s.proxy_flags), (4, 1));
             let entry = Vec3::new(s.entry[0], s.entry[1], s.entry[2]);
             let wanted = Vec3::new(x.x, 1.0, x.z);

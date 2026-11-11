@@ -944,7 +944,6 @@ fn run(options: &Options) -> Option<Capture> {
                 emissive_capacity: needs.emissive.max(defaults.emissive_capacity),
                 // Without chains and with an animation range of 0, no copy takes a part
                 // instance.
-                part_capacity: 0,
                 ..defaults
             },
             &SceneLightingSettings::default(),

@@ -1088,9 +1088,8 @@ fn ptlas_sweep(device: &'static Device, pack: &Arc<[u8]>, args: &Args) {
         pass_ms(&forest.placed, "ptlas")
     );
     println!(
-        "partitions: {} filled of {} at {} instances each, {} unplaced; {} with {}% room",
+        "partitions: {} filled at {} instances each, {} unplaced; {} with {}% room",
         rt.partitions,
-        SceneDesc::default().ptlas_partitions,
         SceneDesc::default().partition_instances,
         rt.unplaced,
         (rt.partitions as f32 * PARTITION_ROOM).ceil(),

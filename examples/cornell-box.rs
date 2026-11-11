@@ -402,8 +402,6 @@ fn run(options: &Options) -> Option<Capture> {
                 group_capacity: 2,
                 light_capacity: 1,
                 material_set_capacity: 1,
-                part_capacity: 0,
-                ptlas_partitions: 4,
                 global_instances: 1,
                 ..SceneDesc::default()
             },

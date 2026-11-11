@@ -1006,13 +1006,6 @@ impl DenseVegetation {
         for s in &stands {
             per_model[s.model] += s.at.len() as u32;
         }
-        let max_parts = trees.iter().map(|t| t.parts).max().unwrap_or(1);
-        // Copies inside the animation range (with its hysteresis and a crown's reach) around
-        // a focus, half again for room; a copy's run holds its part count rounded up to a
-        // power of two.
-        let density = settings.trees as f32 / (TILE * TILE);
-        let reach = settings.animation_range * 1.15 + 10.0;
-        let near = (density * std::f32::consts::PI * reach * reach * 1.5).ceil() as u32;
         let (lights, textured) = settings.directional_lights;
         let groups = stands.len() as u32 + trees.len() as u32 + 4;
         let scene = renderer
@@ -1022,7 +1015,6 @@ impl DenseVegetation {
                     group_capacity: groups,
                     light_capacity: (lights + textured).max(1),
                     producer_capacity: 8,
-                    part_capacity: (near * max_parts.next_power_of_two()).max(4096),
                     ..SceneDesc::default()
                 },
                 &SceneLightingSettings::default(),

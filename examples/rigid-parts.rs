@@ -116,8 +116,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 light_capacity: 1,
                 material_set_capacity: 16,
                 emissive_capacity: 16,
-                part_capacity: copies * 16,
-                ptlas_partitions: 64,
                 global_instances: 16,
                 ..SceneDesc::default()
             },

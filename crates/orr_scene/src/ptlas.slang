@@ -70,6 +70,9 @@ public static const uint COUNTERS = 17;
 // `PtlasRoot.flags`.
 public static const uint PTLAS_REBASE = 1;        // the render origin moved: mandatory work only
 public static const uint PTLAS_FIRST = 2;         // the first build: the persistent state starts at 0
+// A new PTLAS of a larger layout replaces the last: every instance is written anew, as
+// mandatory work, into the new instance indices; the part pool and its counter carry over.
+public static const uint PTLAS_REBUILD = 4;
 
 // `PtlasGpu.part_state`.
 public static const uint PART_BUMP = 0;           // part instances handed out from the pool
@@ -300,6 +303,7 @@ bool pose_moved(SceneRoot* s, InstanceGpu inst, MeshGpu* mesh)
 void charge_write(uint p, bool mandatory)
 {
     PtlasGpu* t = root.ptlas;
+    mandatory = mandatory || (root.flags & PTLAS_REBUILD) != 0;
     uint prev;
     InterlockedOr(t.partition_state[p], PS_TOUCHED | (mandatory ? PS_MANDATORY : 0), prev);
     if ((prev & PS_TOUCHED) != 0)
@@ -322,6 +326,9 @@ void clear(uint3 id: SV_DispatchThreadID)
     if (id.x < DISTANCE_BUCKETS)
         t.buckets[id.x] = 0;
     if (id.x < (first ? COUNTERS : COUNTERS_CLEARED))
+        t.counters[id.x] = 0;
+    // A rebuild writes every global and producer instance anew; held part runs stay.
+    if ((root.flags & PTLAS_REBUILD) != 0 && (id.x == COUNTER_GLOBAL || id.x == COUNTER_PRODUCERS))
         t.counters[id.x] = 0;
     if (first && id.x < PART_STATE)
         t.part_state[id.x] = 0;
@@ -375,6 +382,12 @@ void want(uint3 id: SV_DispatchThreadID)
     PtlasGpu* t = root.ptlas;
     InstanceGpu base = s.instances[slot];
     SlotStateGpu* st = s.slot_state + slot;
+    // A rebuild's PTLAS holds none of what the slot wrote before.
+    if ((root.flags & PTLAS_REBUILD) != 0)
+    {
+        st.rt_flags &= ~(RT_WRITTEN | RT_GLOBAL);
+        st.rt_blas = 0;
+    }
     uint near = chain_near(*st);
     bool fading = st.fade != 0;
     InstanceGpu inst = step_record(s, base, near);
@@ -967,6 +980,8 @@ void producer_want(uint3 id: SV_DispatchThreadID)
     ProducerGpu p = s.producers[e];
     ProducerStateGpu* st = s.producer_state + e;
     uint flags = st.rt_flags & ~(PRODUCER_RT_WRITE | PRODUCER_RT_NULL);
+    if ((root.flags & PTLAS_REBUILD) != 0)
+        flags &= ~PRODUCER_RT_WRITTEN;
     bool written = (flags & PRODUCER_RT_WRITTEN) != 0;
     Placement pl;
     float3 lo, hi;

@@ -19,7 +19,7 @@ use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::mount::{InstancePage, Mounts, PageId, PagePrototype};
 use crate::producer::{self, Opacity, Producer, ProducerDesc, ProducerId, ProducerUpdate};
-use crate::ptlas::Ptlas;
+use crate::ptlas::{CopyRuns, Ptlas, run_class};
 use crate::shaders::instance_page::{PageEntriesGpu, PagePrototypeGpu};
 use crate::skin::{CopyArrays, SkinFrame, SkinnedDesc};
 use crate::subd::{self, ModelCage, SubdBuild, SubdDesc};
@@ -64,13 +64,10 @@ pub struct SceneDesc {
     /// Emissive list entries for instances: one per copy per emissive and per caster section of
     /// the chain step of its model that has the most of them.
     pub emissive_capacity: u32,
-    /// PTLAS instances for the animated parts of copies inside their animation range, and
-    /// one for each copy fading between two chain steps. At most 2^24.
-    pub part_capacity: u32,
-    /// PTLAS cell partitions.
-    pub ptlas_partitions: u32,
     /// Instances the copies of one PTLAS partition count, at most: their bodies and part runs.
-    /// A copy fading between two chain steps holds one more.
+    /// A copy fading between two chain steps holds one more. A write rebuilds its partition,
+    /// so this sets how much a frame rebuilds for one copy that changes; the PTLAS holds as
+    /// many partitions as the copies placed fill.
     pub partition_instances: u32,
     /// Instances the PTLAS global partition holds, at most: movers beyond it stay in their
     /// cell partitions.
@@ -98,8 +95,6 @@ impl Default for SceneDesc {
             material_set_capacity: 4096,
             producer_capacity: 256,
             emissive_capacity: 16_384,
-            part_capacity: 524_288,
-            ptlas_partitions: 2048,
             partition_instances: 1000,
             global_instances: 4096,
             skinned_capacity: 256,
@@ -557,6 +552,18 @@ pub(crate) struct ModelCpu {
     pub(crate) cage_only: bool,
     /// It is an edit of another model's mesh.
     pub(crate) edit: bool,
+    /// It has a representation chain, so its copies may fade between two steps.
+    pub(crate) chained: bool,
+}
+
+impl ModelCpu {
+    /// The part runs a copy may hold, posed or not.
+    pub(crate) fn runs(&self, posed: bool) -> CopyRuns {
+        CopyRuns {
+            body: (posed && self.animated_parts > 0).then(|| run_class(self.animated_parts)),
+            far: self.chained,
+        }
+    }
 }
 
 /// A cooked page placed in a scene: its prototypes until its records first land, which write
@@ -578,6 +585,8 @@ pub(crate) struct PagePlacement {
     pub(crate) entries_stale: bool,
     /// Its prototypes' entries of the page part of the material-set table.
     pub(crate) sets: (u32, u32),
+    /// Per prototype, its model, its records and the part runs each copy may hold.
+    pub(crate) runs: Vec<(u32, u32, CopyRuns)>,
 }
 
 impl PagePlacement {
@@ -692,6 +701,9 @@ pub(crate) struct SceneCpu {
     pub(crate) slots: RangeAllocator,
     /// By slot.
     slot_holds: Vec<SlotHold>,
+    /// By slot placed by hand, the part runs its copy may hold, which the PTLAS counts until the
+    /// slot is removed.
+    slot_runs: Vec<CopyRuns>,
     /// Section masks copies name since the last frame: their BLAS build if missing.
     pub(crate) masks: HashSet<(ModelId, u16)>,
     /// Ranges removed in a frame, freed once that frame has completed.
@@ -842,6 +854,9 @@ impl Scene {
         let mut entries: Vec<(u32, u32)> = Vec::new();
         if let Some(i) = cpu.pages.iter().position(|p| p.range == range) {
             let p = cpu.pages.swap_remove(i);
+            for &(_, records, runs) in &p.runs {
+                cpu.ptlas.leave_runs(runs, records);
+            }
             self.clear_group(cpu, frame, p.group, seq);
             let n = page_entries(&p.entries);
             if n > 0 {
@@ -965,6 +980,32 @@ impl Scene {
             pages,
             taken,
         })
+    }
+
+    /// Counts a far instance for every copy of `model` that holds none: the model has gained a
+    /// chain, so its copies may fade.
+    pub(crate) fn chain_far(&self, model: u32) {
+        let cpu = &mut *self.cpu.lock().unwrap();
+        let far = CopyRuns {
+            body: None,
+            far: true,
+        };
+        let mut gained = 0;
+        for (hold, runs) in cpu.slot_holds.iter().zip(&mut cpu.slot_runs) {
+            if hold.model == model && !runs.far {
+                runs.far = true;
+                gained += 1;
+            }
+        }
+        for p in &mut cpu.pages {
+            for (m, records, runs) in &mut p.runs {
+                if *m == model && !runs.far {
+                    runs.far = true;
+                    gained += *records;
+                }
+            }
+        }
+        cpu.ptlas.hold_runs(far, gained);
     }
 
     /// Frees the ranges of a growth that is not applied.
@@ -1126,12 +1167,6 @@ impl Scene {
     }
 
     pub(crate) fn new(device: &Device, desc: &SceneDesc) -> Result<Self> {
-        // A released part run packs its first part instance into 24 bits (ptlas.slang).
-        assert!(
-            desc.part_capacity <= 1 << 24,
-            "part_capacity {} is past 2^24",
-            desc.part_capacity
-        );
         let n = |c: u32| u64::from(c.max(1));
         let dl = MemoryKind::DeviceLocal;
         let (decal_slots, decal_refs) = table_sizes(desc.decal_capacity);
@@ -1207,6 +1242,7 @@ impl Scene {
             cpu: Mutex::new(SceneCpu {
                 slots: RangeAllocator::new(desc.instance_capacity),
                 slot_holds: vec![SlotHold::FREE; desc.instance_capacity as usize],
+                slot_runs: vec![CopyRuns::default(); desc.instance_capacity as usize],
                 masks: HashSet::new(),
                 removed: Vec::new(),
                 emissive: RangeAllocator::new(desc.emissive_capacity),
@@ -1501,17 +1537,24 @@ impl<'f> SceneWriter<'f> {
             })
             .transpose()?;
         let (records_src, records) = self.window.slice::<InstanceGpu>(self.device, desc.copies)?;
+        let cost = 1 + if desc.pose.is_some() {
+            model.animated_parts
+        } else {
+            0
+        };
         let (first, entry, partitions, table) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
-            let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
-                what: "instances",
-                capacity: self.scene.desc.instance_capacity,
-            })?;
             let cell = cpu
                 .groups
                 .get(desc.transforms.0 as usize)
                 .and_then(Option::as_ref)
                 .map_or(IVec3::ZERO, |g| g.anchor.cell);
+            cpu.ptlas
+                .reserve_place(self.device, desc.copies, cell, cost)?;
+            let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
+                what: "instances",
+                capacity: self.scene.desc.instance_capacity,
+            })?;
             let entry = if ranks > 0 {
                 cpu.emissive.alloc(desc.copies * ranks)
             } else {
@@ -1524,12 +1567,11 @@ impl<'f> SceneWriter<'f> {
                     capacity: self.scene.desc.emissive_capacity,
                 });
             };
-            let cost = 1 + if desc.pose.is_some() {
-                model.animated_parts
-            } else {
-                0
-            };
-            let holds = &mut cpu.slot_holds[first as usize..(first + desc.copies) as usize];
+            let runs = model.runs(desc.pose.is_some());
+            let slots = first as usize..(first + desc.copies) as usize;
+            cpu.slot_runs[slots.clone()].fill(runs);
+            cpu.ptlas.hold_runs(runs, desc.copies);
+            let holds = &mut cpu.slot_holds[slots];
             for (hold, copy) in holds.iter_mut().zip(0..) {
                 *hold = SlotHold {
                     model: desc.model.0,
@@ -1681,6 +1723,17 @@ impl<'f> SceneWriter<'f> {
                 capacity: self.scene.desc.group_capacity,
             });
         }
+        let mut ends: Vec<u32> = page.info.partitions.iter().map(|&p| u32::from(p)).collect();
+        ends.push(count);
+        let mut runs: Vec<u32> = ends
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .filter(|&n| n > 0)
+            .collect();
+        if runs.is_empty() && count > 0 {
+            runs.push(count);
+        }
+        cpu.ptlas.reserve_runs(self.device, &runs)?;
         let first = cpu.slots.alloc(count).ok_or(Error::Capacity {
             what: "instances",
             capacity: self.scene.desc.instance_capacity,
@@ -1776,17 +1829,16 @@ impl<'f> SceneWriter<'f> {
         }
         let out = table.as_mut_slice().expect("upload is mapped");
         out[..copy_bytes as usize].copy_from_slice(bytemuck::cast_slice(&copies));
-        let mut ends: Vec<u32> = page.info.partitions.iter().map(|&p| u32::from(p)).collect();
-        ends.push(count);
-        let mut runs: Vec<u32> = ends
-            .windows(2)
-            .map(|w| w[1] - w[0])
-            .filter(|&n| n > 0)
-            .collect();
-        if runs.is_empty() && count > 0 {
-            runs.push(count);
-        }
         let partitions = cpu.ptlas.place_runs(first, &runs, cell);
+        let part_runs: Vec<(u32, u32, CopyRuns)> = protos
+            .iter()
+            .map(|p| {
+                let posed = r.poses.iter().any(|(m, _)| *m == p.model);
+                let runs = self.model_cpu[p.model.0 as usize].runs(posed);
+                cpu.ptlas.hold_runs(runs, p.records);
+                (p.model.0, p.records, runs)
+            })
+            .collect();
         let mut group = Group::of_page(r.page, page, self.frame);
         group.frame = frame;
         let record = group.record();
@@ -1809,6 +1861,7 @@ impl<'f> SceneWriter<'f> {
             expanded: false,
             entries_stale: false,
             sets: (set_base, set_entries),
+            runs: part_runs,
         });
         slots_out.copy_from_slice(&partitions);
         cpu.records.push(Record::values(
@@ -2174,6 +2227,9 @@ impl<'f> SceneWriter<'f> {
                 cpu.masks.insert((desc.model, section_mask));
             }
             cpu.ptlas.place_skinned(first, desc.copies);
+            let runs = model.runs(true);
+            cpu.slot_runs[first as usize..(first + desc.copies) as usize].fill(runs);
+            cpu.ptlas.hold_runs(runs, desc.copies);
             (first, entry, emissive)
         };
         if let Some(room) = entries {
@@ -2435,6 +2491,10 @@ impl<'f> SceneWriter<'f> {
     pub fn remove(&mut self, range: InstanceRange) {
         let seq = self.next_seq();
         let cpu = &mut *self.scene.cpu.lock().unwrap();
+        let slots = range.first as usize..(range.first + range.count) as usize;
+        for runs in &mut cpu.slot_runs[slots] {
+            cpu.ptlas.leave_runs(std::mem::take(runs), 1);
+        }
         self.scene.empty_slots(cpu, range, self.frame, seq);
         cpu.removed.push((self.frame, range));
         cpu.ptlas.remove(range.first, range.count, self.frame);

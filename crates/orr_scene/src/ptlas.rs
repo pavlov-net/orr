@@ -7,6 +7,12 @@
 //! the frame's budget of rebuilt instances from the focus outward, mandatory work first.
 //! Producer entries and medium proxies (from `proxy_base`) sit in the global partition and
 //! their writes are mandatory.
+//!
+//! The PTLAS holds what the copies placed take: a slot for each handed out, the part
+//! instances their runs may hold at once, and the cell partitions they fill. When a placement
+//! takes more, the next update makes a PTLAS of the larger layout, whose first build writes
+//! every instance anew as mandatory work; the counters and the part pool carry over, so held
+//! runs keep their part instances.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,12 +25,12 @@ use orr_gpu::{
 use orr_math::IVec3;
 use rustc_hash::FxHashMap;
 
-use crate::Result;
 use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::scene::SceneDesc;
 use crate::shaders::ptlas::{PartitionGpu, PendingGpu, PtlasGpu, PtlasRoot, TranslateJob};
 use crate::upload::Record;
+use crate::{Error, Result};
 
 /// `ptlas.slang` constants.
 const PARTITION_NONE: u32 = u32::MAX;
@@ -34,6 +40,9 @@ const DISTANCE_BUCKETS: u32 = 64;
 const COUNTERS: usize = 17;
 const PTLAS_REBASE: u32 = 1;
 const PTLAS_FIRST: u32 = 2;
+const PTLAS_REBUILD: u32 = 4;
+/// Part instances a scene holds at most: a released run packs its first into 24 bits.
+const MAX_PARTS: u32 = 1 << 24;
 /// `ptlas.slang` `LIGHT_JOB`: a proxy job naming a light.
 const LIGHT_JOB: u32 = 0x8000_0000;
 const PART_STATE: u32 = 19;
@@ -156,8 +165,10 @@ struct PartitionCpu {
     count: u32,
 }
 
-/// The PTLAS and the arrays its builds read, made at the scene's first traced frame.
+/// The PTLAS and the arrays its builds read for one layout of the instance indices, made at
+/// the scene's first traced frame and again when the layout grows.
 struct Storage {
+    limits: PtlasLimits,
     tlas: Allocation<u8>,
     record: Allocation<PtlasGpu>,
     _blocks: Vec<Allocation<u8>>,
@@ -166,20 +177,153 @@ struct Storage {
     bytes: u64,
     commands: GpuPtr<u8>,
     command_count: GpuPtr<u32>,
-    counters: GpuPtr<u32>,
-    /// One counter block per frame in flight.
-    readback: Allocation<[u32; COUNTERS]>,
     built: bool,
+}
+
+/// What the PTLAS kernels keep from frame to frame beside the PTLAS: the counters and the
+/// part pool, sized for `parts` part instances.
+struct Kept {
+    parts: u32,
+    counters: Allocation<u32>,
+    part_state: Allocation<u32>,
+    part_free: Allocation<u32>,
+    part_released: Allocation<u32>,
+    part_slots: Allocation<u32>,
+}
+
+/// Entries of the part pool's free lists for `parts` part instances: per run class `c`,
+/// `parts >> c` run starts.
+fn part_stacks(parts: u32) -> u64 {
+    (0..PART_CLASSES).map(|c| u64::from(parts >> c)).sum()
+}
+
+/// The first entry of class `c`'s free list, as `ptlas.slang` `part_stack`.
+fn part_stack(parts: u32, c: u32) -> u64 {
+    (0..c).map(|k| u64::from(parts >> k)).sum()
+}
+
+impl Kept {
+    fn new(device: &Device, parts: u32) -> Result<Self> {
+        let dl = MemoryKind::DeviceLocal;
+        let n = |c: u64| c.max(1);
+        Ok(Self {
+            parts,
+            counters: device.gpu_malloc(dl, COUNTERS as u64, "PTLAS counters")?,
+            part_state: device.gpu_malloc(dl, u64::from(PART_STATE), "part state")?,
+            part_free: device.gpu_malloc(dl, n(part_stacks(parts)), "part free lists")?,
+            part_released: device.gpu_malloc(dl, n(u64::from(parts)), "released part runs")?,
+            part_slots: device.gpu_malloc(dl, n(u64::from(parts)), "part slots")?,
+        })
+    }
+
+    /// Records on `list` the copies that carry `old`'s counters and part pool into this one,
+    /// each free list to where its class starts here.
+    fn carry(&self, list: &mut CommandList<'_>, old: &Kept) {
+        let mut copy = |to: GpuPtr<u32>, from: GpuPtr<u32>, words: u64| {
+            list.copy(to.cast(), from.cast(), 4 * words);
+        };
+        copy(self.counters.gpu(), old.counters.gpu(), COUNTERS as u64);
+        copy(
+            self.part_state.gpu(),
+            old.part_state.gpu(),
+            u64::from(PART_STATE),
+        );
+        let parts = u64::from(old.parts);
+        if parts > 0 {
+            copy(self.part_released.gpu(), old.part_released.gpu(), parts);
+            copy(self.part_slots.gpu(), old.part_slots.gpu(), parts);
+        }
+        for c in 0..PART_CLASSES {
+            let n = u64::from(old.parts >> c);
+            if n > 0 {
+                let to = self.part_free.gpu().offset(part_stack(self.parts, c));
+                let from = old.part_free.gpu().offset(part_stack(old.parts, c));
+                copy(to, from, n);
+            }
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        [
+            self.counters.size(),
+            self.part_state.size(),
+            self.part_free.size(),
+            self.part_released.size(),
+            self.part_slots.size(),
+        ]
+        .into_iter()
+        .sum()
+    }
+}
+
+/// What the part pool may be asked for at once, per run class of `2^c` part instances: the
+/// copies that may hold a run of the class, with the far instances of fading copies in class 0.
+/// A run released in a frame returns to its class's free list in the next, so copies removed
+/// since the last build still count. The pool's bump allocator takes a run only when its
+/// class's free list is empty, so it never takes more than the most each class has counted at
+/// once, times the class's run size.
+#[derive(Clone, Copy, Default)]
+struct PartDemand {
+    held: [u32; PART_CLASSES as usize],
+    leaving: [u32; PART_CLASSES as usize],
+    most: [u32; PART_CLASSES as usize],
+}
+
+impl PartDemand {
+    /// Part instances the pool needs for what it has counted so far.
+    fn parts(&self) -> u64 {
+        (0..PART_CLASSES as usize)
+            .map(|c| u64::from(self.most[c].max(self.held[c] + self.leaving[c])) << c)
+            .sum()
+    }
+
+    /// Takes the counts of a build: what it may ask for at once joins the most, and the runs
+    /// it releases are free from the next.
+    fn built(&mut self) {
+        for c in 0..PART_CLASSES as usize {
+            self.most[c] = self.most[c].max(self.held[c] + self.leaving[c]);
+            self.leaving[c] = 0;
+        }
+    }
+}
+
+/// The class of a run of `n` part instances, as `ptlas.slang` `run_class`.
+pub(crate) fn run_class(n: u32) -> u8 {
+    if n <= 1 {
+        0
+    } else {
+        (32 - (n - 1).leading_zeros()) as u8
+    }
+}
+
+/// The part runs a copy may hold: the class of its body run while posed, and a far instance
+/// while its model has a chain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CopyRuns {
+    pub(crate) body: Option<u8>,
+    pub(crate) far: bool,
+}
+
+/// How the instance indices of the scene's PTLAS lie: its slots, then its part instances, then
+/// its producer entries, medium proxies and light proxies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Layout {
+    pub(crate) slots: u32,
+    pub(crate) parts: u32,
 }
 
 /// One scene's PTLAS state.
 pub(crate) struct Ptlas {
-    limits: PtlasLimits,
+    /// The layout of the next build.
+    layout: Layout,
     max_per_partition: u32,
-    part_capacity: u32,
     producer_capacity: u32,
+    proxy_capacity: u32,
+    light_capacity: u32,
     /// Copies the global partition takes; producer entries and medium proxies come on top.
     global_copies: u32,
+    /// Copies of skinned meshes, which sit in the global partition.
+    skinned_capacity: u32,
     /// Per medium proxy, whether it is set.
     proxy_live: Vec<bool>,
     proxies_live: u32,
@@ -204,55 +348,42 @@ pub(crate) struct Ptlas {
     unplaced: u32,
     /// Slots below it have been handed out at some time.
     pub(crate) high_water: u32,
+    demand: PartDemand,
     partition_table: Allocation<PartitionGpu>,
     pub(crate) slot_table: Allocation<u32>,
-    pub(crate) part_slots: Allocation<u32>,
+    kept: Kept,
+    /// What the builds before kept, until the next build has carried it into `kept`.
+    carried: Option<Kept>,
+    /// Counters copied back, one block per frame in flight; made with the first storage.
+    readback: Option<Allocation<[u32; COUNTERS]>>,
     storage: Option<Storage>,
+    /// The next build replaces the storage of a build before: it writes every instance anew,
+    /// as mandatory work.
+    rebuild: bool,
+    /// Part pools carried into a larger one, by the frame that carried them, freed once that
+    /// frame has completed.
+    retired: Vec<(u64, Kept)>,
 }
 
 impl Ptlas {
     pub(crate) fn new(device: &Device, desc: &SceneDesc) -> Result<Self> {
-        let n = |c: u32| u64::from(c.max(1));
         let dl = MemoryKind::DeviceLocal;
-        let partitions = desc.ptlas_partitions;
-        // A copy fading between two chain steps holds a far instance in its partition on top
-        // of what placement counts for it, taken from the part pool: a partition, and the
-        // global one, hold up to one instance more for every copy in them that the pool has.
-        let fading = |copies: u32| copies.min(desc.part_capacity);
-        let global_copies = desc.global_instances + desc.skinned_capacity;
+        let n = |c: u32| u64::from(c.max(1));
         Ok(Self {
-            limits: PtlasLimits {
-                instances: desc.instance_capacity
-                    + desc.part_capacity
-                    + desc.producer_capacity
-                    + desc.medium_proxy_capacity
-                    + desc.light_capacity,
-                partitions,
-                max_per_partition: desc.partition_instances + fading(desc.partition_instances),
-                global_instances: global_copies
-                    + fading(global_copies)
-                    + desc.producer_capacity
-                    + desc.medium_proxy_capacity
-                    + desc.light_capacity,
-                max_ops: 3,
-                translation: true,
-            },
+            layout: Layout { slots: 0, parts: 0 },
             max_per_partition: desc.partition_instances,
-            part_capacity: desc.part_capacity,
             producer_capacity: desc.producer_capacity,
+            proxy_capacity: desc.medium_proxy_capacity,
+            light_capacity: desc.light_capacity,
             global_copies: desc.global_instances,
+            skinned_capacity: desc.skinned_capacity,
             proxy_live: vec![false; desc.medium_proxy_capacity as usize],
             proxies_live: 0,
             proxy_dirty: BTreeSet::new(),
             light_live: vec![false; desc.light_capacity as usize],
             lights_live: 0,
-            partitions: (0..partitions)
-                .map(|_| PartitionCpu {
-                    cell: IVec3::ZERO,
-                    count: 0,
-                })
-                .collect(),
-            free: (0..partitions).rev().collect(),
+            partitions: Vec::new(),
+            free: Vec::new(),
             open: FxHashMap::default(),
             slot_partition: vec![PARTITION_NONE; desc.instance_capacity as usize],
             slot_cost: vec![0; desc.instance_capacity as usize],
@@ -261,11 +392,120 @@ impl Ptlas {
             emptied: Vec::new(),
             unplaced: 0,
             high_water: 0,
-            partition_table: device.gpu_malloc(dl, n(partitions), "partitions")?,
+            demand: PartDemand::default(),
+            partition_table: device.gpu_malloc(dl, 1, "partitions")?,
             slot_table: device.gpu_malloc(dl, n(desc.instance_capacity), "slot partitions")?,
-            part_slots: device.gpu_malloc(dl, n(desc.part_capacity), "part slots")?,
+            kept: Kept::new(device, 0)?,
+            carried: None,
+            readback: None,
             storage: None,
+            rebuild: false,
+            retired: Vec::new(),
         })
+    }
+
+    /// The PTLAS limits of `layout` with `partitions` cell partitions.
+    fn limits(&self, layout: Layout, partitions: u32) -> PtlasLimits {
+        // A copy fading between two chain steps holds a far instance in its partition on top
+        // of what placement counts for it, taken from the part pool: a partition, and the
+        // global one, hold up to one instance more for every copy in them that the pool has.
+        let fading = |copies: u32| copies.min(layout.parts);
+        let global_copies = self.global_copies + self.skinned_capacity;
+        let entries = self.producer_capacity + self.proxy_capacity + self.light_capacity;
+        PtlasLimits {
+            instances: layout.slots + layout.parts + entries,
+            partitions,
+            max_per_partition: self.max_per_partition + fading(self.max_per_partition),
+            global_instances: global_copies + fading(global_copies) + entries,
+            max_ops: 3,
+            translation: true,
+        }
+    }
+
+    /// The layout of the frame's build, once [`Self::tlas`] has sized it.
+    pub(crate) fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    /// Where the part pool names the copy each part instance holds.
+    pub(crate) fn part_slots(&self) -> GpuPtr<u32> {
+        self.kept.part_slots.gpu()
+    }
+
+    /// Counts the part runs `n` copies may hold.
+    pub(crate) fn hold_runs(&mut self, runs: CopyRuns, n: u32) {
+        if let Some(c) = runs.body {
+            self.demand.held[c as usize] += n;
+        }
+        if runs.far {
+            self.demand.held[0] += n;
+        }
+    }
+
+    /// Counts the part runs of `n` removed copies as leaving: the build that sees them gone
+    /// releases them, and the pool takes them back in the build after.
+    pub(crate) fn leave_runs(&mut self, runs: CopyRuns, n: u32) {
+        let mut leave = |c: usize| {
+            self.demand.held[c] -= n;
+            self.demand.leaving[c] += n;
+        };
+        if let Some(c) = runs.body {
+            leave(c as usize);
+        }
+        if runs.far {
+            leave(0);
+        }
+    }
+
+    /// Makes `n` cell partitions free. Short of them, the partitions grow to twice as many, or
+    /// to as many as that takes: geometric growth keeps the builds that grow them few. The next
+    /// update writes the new table whole; the frames before read the old.
+    fn free_partitions(&mut self, device: &Device, n: u32) -> Result<()> {
+        let free = self.free.len() as u32;
+        if free >= n {
+            return Ok(());
+        }
+        let had = self.partitions.len() as u32;
+        let grown = (had + n - free).max(2 * had);
+        self.partition_table =
+            device.gpu_malloc(MemoryKind::DeviceLocal, u64::from(grown), "partitions")?;
+        self.changed.extend(0..had);
+        self.partitions.extend((had..grown).map(|_| PartitionCpu {
+            cell: IVec3::ZERO,
+            count: 0,
+        }));
+        // Taken lowest first, as the partitions were.
+        let mut added: Vec<u32> = (had..grown).rev().collect();
+        added.append(&mut self.free);
+        self.free = added;
+        Ok(())
+    }
+
+    /// Makes room for [`Self::place`] of `count` copies in `cell`, each counting `cost`
+    /// instances, so it cannot fail.
+    pub(crate) fn reserve_place(
+        &mut self,
+        device: &Device,
+        count: u32,
+        cell: IVec3,
+        cost: u32,
+    ) -> Result<()> {
+        if cost > self.max_per_partition {
+            return Ok(());
+        }
+        let per = self.max_per_partition / cost;
+        let open = self.open.get(&cell).map_or(0, |&p| {
+            (self.max_per_partition - self.partitions[p as usize].count) / cost
+        });
+        let rest = count.saturating_sub(open);
+        self.free_partitions(device, rest.div_ceil(per))
+    }
+
+    /// Makes room for [`Self::place_runs`] of `runs`, so it cannot fail.
+    pub(crate) fn reserve_runs(&mut self, device: &Device, runs: &[u32]) -> Result<()> {
+        let per = self.max_per_partition.max(1);
+        let n = runs.iter().map(|r| r.div_ceil(per)).sum();
+        self.free_partitions(device, n)
     }
 
     /// Puts `count` copies from slot `first`, each counting `cost` instances, into
@@ -279,7 +519,12 @@ impl Ptlas {
                     self.partitions[p as usize].count + cost <= self.max_per_partition
                 });
                 let fits = cost <= self.max_per_partition;
-                let Some(p) = open.or_else(|| fits.then(|| self.free.pop()).flatten()) else {
+                let free = || {
+                    self.free
+                        .pop()
+                        .expect("reserve_place made the partitions free")
+                };
+                let Some(p) = open.or_else(|| fits.then(free)) else {
                     self.unplaced += 1;
                     self.slot_partition[slot as usize] = PARTITION_NONE;
                     return PARTITION_NONE;
@@ -311,22 +556,19 @@ impl Ptlas {
             while left > 0 {
                 let n = left.min(self.max_per_partition.max(1));
                 left -= n;
-                let p = self.free.pop();
-                if let Some(p) = p {
-                    let part = &mut self.partitions[p as usize];
-                    part.cell = cell;
-                    part.count = n;
-                    self.assigned.insert(p);
-                    self.changed.insert(p);
-                }
+                let p = self
+                    .free
+                    .pop()
+                    .expect("reserve_runs made the partitions free");
+                let part = &mut self.partitions[p as usize];
+                part.cell = cell;
+                part.count = n;
+                self.assigned.insert(p);
+                self.changed.insert(p);
                 for s in slot..slot + n {
                     self.slot_cost[s as usize] = 1;
-                    let at = p.unwrap_or(PARTITION_NONE);
-                    self.slot_partition[s as usize] = at;
-                    out.push(at);
-                }
-                if p.is_none() {
-                    self.unplaced += n;
+                    self.slot_partition[s as usize] = p;
+                    out.push(p);
                 }
                 slot += n;
             }
@@ -400,7 +642,8 @@ impl Ptlas {
         self.proxies_live > 0 || self.lights_live > 0 || !self.proxy_dirty.is_empty()
     }
 
-    /// Frees the partitions emptied in frames at or before `completed`.
+    /// Frees the partitions emptied in frames at or before `completed`, and the part pools
+    /// carried out of then.
     pub(crate) fn retire(&mut self, completed: u64) {
         let partitions = &self.partitions;
         let free = &mut self.free;
@@ -412,10 +655,36 @@ impl Ptlas {
             }
             !done
         });
+        self.retired.retain(|&(frame, _)| frame > completed);
     }
 
-    /// The scene's TLAS for the frame about to record, after making the PTLAS storage the
-    /// first time a slot has been handed out or a producer entry or medium proxy is set.
+    /// The layout the copies placed so far take: room for every slot handed out and for the
+    /// part runs their copies may hold at once. A layout that grows takes twice what it held,
+    /// or what it must, so the builds that grow it stay few; slots stop at the scene's, and part
+    /// instances at the 2^24 a released run names its start in.
+    fn wanted(&self) -> Result<Layout> {
+        let mut layout = self.layout;
+        let slots = self.slot_partition.len() as u32;
+        if self.high_water > layout.slots {
+            layout.slots = (2 * layout.slots).min(slots).max(self.high_water);
+        }
+        let parts = self.demand.parts();
+        if parts > u64::from(MAX_PARTS) {
+            return Err(Error::Capacity {
+                what: "part instances",
+                capacity: MAX_PARTS,
+            });
+        }
+        if parts > u64::from(layout.parts) {
+            layout.parts = (2 * layout.parts).min(MAX_PARTS).max(parts as u32);
+        }
+        Ok(layout)
+    }
+
+    /// The scene's TLAS for the frame about to record. Its storage is made the first time a
+    /// slot has been handed out or a producer entry or medium proxy is set, and made again,
+    /// for the frame's build to fill anew, when the copies placed have grown past its layout
+    /// or its cell partitions.
     pub(crate) fn tlas(
         &mut self,
         device: &Device,
@@ -431,15 +700,35 @@ impl Ptlas {
         {
             return Ok(None);
         }
-        if self.storage.is_none() {
-            self.storage = Some(self.create(device, fif)?);
+        let layout = self.wanted()?;
+        let limits = self.limits(layout, self.partitions.len() as u32);
+        if self.storage.as_ref().is_none_or(|s| s.limits != limits) {
+            if layout.parts > self.kept.parts {
+                let kept = Kept::new(device, layout.parts)?;
+                let old = std::mem::replace(&mut self.kept, kept);
+                // A pool no build has used yet holds nothing to carry.
+                if self.storage.is_some() && self.carried.is_none() {
+                    self.carried = Some(old);
+                }
+            }
+            let storage = self.create(device, limits)?;
+            self.rebuild = self.storage.is_some() || self.rebuild;
+            self.storage = Some(storage);
+            self.layout = layout;
+        }
+        if self.readback.is_none() {
+            self.readback = Some(device.gpu_malloc(
+                MemoryKind::Readback,
+                u64::from(fif.max(1)),
+                "PTLAS stats",
+            )?);
         }
         let s = self.storage.as_ref().expect("made above");
         Ok(Some(Tlas(s.tlas.gpu().address().0)))
     }
 
-    fn create(&self, device: &Device, fif: u32) -> Result<Storage> {
-        let desc = desc(self.limits);
+    fn create(&self, device: &Device, limits: PtlasLimits) -> Result<Storage> {
+        let desc = desc(limits);
         let sizes = device.rtas_sizes(&desc);
         let dl = MemoryKind::DeviceLocal;
         let mut blocks = Vec::new();
@@ -449,12 +738,12 @@ impl Ptlas {
             blocks.push(a);
             Ok(gpu)
         };
-        let instances = u64::from(self.limits.instances);
-        let partitions = u64::from(self.limits.partitions);
+        let instances = u64::from(limits.instances);
+        let partitions = u64::from(limits.partitions);
         let stride = |a| u64::from(device.ptlas_args_stride(a));
         let pending = device.gpu_malloc::<PendingGpu>(
             dl,
-            u64::from(self.limits.instances.max(1)),
+            u64::from(limits.instances.max(1)),
             "PTLAS pending",
         )?;
         let writes = block(stride(PtlasArgs::Write) * instances, "PTLAS writes")?;
@@ -470,30 +759,25 @@ impl Ptlas {
         let command_count = block(4, "PTLAS command count")?.cast();
         let state = block(4 * (partitions + 1), "partition state")?.cast();
         let buckets = block(4 * u64::from(DISTANCE_BUCKETS), "PTLAS buckets")?.cast();
-        let counters = block(4 * COUNTERS as u64, "PTLAS counters")?.cast();
-        let parts = u64::from(self.part_capacity);
-        let part_state = block(4 * u64::from(PART_STATE), "part state")?.cast();
-        let stacks: u64 = (0..PART_CLASSES).map(|c| parts >> c).sum();
-        let part_free = block(4 * stacks, "part free lists")?.cast();
-        let part_released = block(4 * parts, "released part runs")?.cast();
+        let k = &self.kept;
         let record = PtlasGpu {
             partitions: self.partition_table.gpu(),
             slot_partition: self.slot_table.gpu(),
             pending: pending.gpu(),
             partition_state: state,
             buckets,
-            counters,
+            counters: k.counters.gpu(),
             writes,
             updates,
             translates,
             commands,
             command_count,
-            part_state,
-            part_free,
-            part_released,
-            partition_count: self.limits.partitions,
-            write_capacity: self.limits.instances,
-            update_capacity: self.limits.instances,
+            part_state: k.part_state.gpu(),
+            part_free: k.part_free.gpu(),
+            part_released: k.part_released.gpu(),
+            partition_count: limits.partitions,
+            write_capacity: limits.instances,
+            update_capacity: limits.instances,
             global_capacity: self.global_copies,
         };
         let mut gpu = device.gpu_malloc::<PtlasGpu>(MemoryKind::Upload, 1, "PTLAS tables")?;
@@ -504,17 +788,12 @@ impl Ptlas {
             sizes.result_max,
             "PTLAS",
         )?;
-        let bytes = [
-            tlas.size(),
-            pending.size(),
-            self.partition_table.size(),
-            self.slot_table.size(),
-            self.part_slots.size(),
-        ]
-        .into_iter()
-        .chain(blocks.iter().map(Allocation::size))
-        .sum();
+        let bytes = [tlas.size(), pending.size()]
+            .into_iter()
+            .chain(blocks.iter().map(Allocation::size))
+            .sum();
         Ok(Storage {
+            limits,
             tlas,
             bytes,
             record: gpu,
@@ -522,19 +801,15 @@ impl Ptlas {
             _pending: pending,
             commands,
             command_count,
-            counters,
-            readback: device.gpu_malloc(
-                MemoryKind::Readback,
-                u64::from(fif.max(1)),
-                "PTLAS stats",
-            )?,
             built: false,
         })
     }
 
-    /// Scratch bytes a build of this PTLAS needs.
+    /// Scratch bytes a build of the frame's PTLAS needs.
     pub(crate) fn scratch_bytes(&self, device: &Device) -> u64 {
-        device.rtas_sizes(&desc(self.limits)).scratch
+        self.storage
+            .as_ref()
+            .map_or(0, |s| device.rtas_sizes(&desc(s.limits)).scratch)
     }
 
     /// Scatter records of the partitions changed since the last frame.
@@ -567,12 +842,13 @@ impl Ptlas {
     /// The figures of the frame that used readback slot `slot`.
     pub(crate) fn figures(&self, slot: usize) -> Option<PtlasFigures> {
         let s = self.storage.as_ref()?;
-        let c = s.readback.as_slice()?.get(slot)?;
+        let c = self.readback.as_ref()?.as_slice()?.get(slot)?;
+        let tables = self.partition_table.size() + self.slot_table.size() + self.kept.bytes();
         Some(PtlasFigures {
             counters: *c,
             unplaced: self.unplaced,
             partitions: (self.partitions.len() - self.free.len()) as u32,
-            bytes: s.bytes,
+            bytes: s.bytes + tables,
         })
     }
 
@@ -588,11 +864,16 @@ impl Ptlas {
         f: &FrameInputs,
         scratch: GpuAddress,
     ) -> Result<()> {
-        let Some(s) = self.storage.as_mut() else {
+        let Some(s) = self.storage.as_ref() else {
             return Ok(());
         };
-        let jobs: Vec<TranslateJob> = if f.rebased || !s.built {
-            (0..self.limits.partitions)
+        let (limits, built, ptlas, tlas) = (s.limits, s.built, s.record.gpu(), s.tlas.gpu());
+        let (commands, command_count) = (s.commands, s.command_count);
+        // A new storage takes every partition's translation and every set proxy, as a rebase
+        // does.
+        let anew = f.rebased || !built;
+        let jobs: Vec<TranslateJob> = if anew {
+            (0..limits.partitions)
                 .filter(|&i| self.partitions[i as usize].count > 0)
                 .collect::<Vec<_>>()
         } else {
@@ -616,9 +897,8 @@ impl Ptlas {
             out.copy_from_slice(&jobs);
             src
         };
-        // Set proxies are rewritten into the new render space on a rebase.
         let mut proxies = std::mem::take(&mut self.proxy_dirty);
-        if f.rebased {
+        if anew {
             proxies
                 .extend((0..self.proxy_live.len() as u32).filter(|&i| self.proxy_live[i as usize]));
             proxies.extend(
@@ -635,14 +915,20 @@ impl Ptlas {
             out.copy_from_slice(&proxies);
             src
         };
+        let flags = if f.rebased { PTLAS_REBASE } else { 0 }
+            | match (built, self.rebuild) {
+                (true, _) => 0,
+                (false, false) => PTLAS_FIRST,
+                (false, true) => PTLAS_REBUILD,
+            };
         let root = PtlasRoot {
             scene: f.scene,
-            ptlas: s.record.gpu(),
+            ptlas,
             focus_cell: f.focus_cell,
             focus_offset: f.focus_offset,
             slots: self.high_water,
             budget: f.budget,
-            flags: if f.rebased { PTLAS_REBASE } else { 0 } | if s.built { 0 } else { PTLAS_FIRST },
+            flags,
             proxies: self.proxies_live + self.lights_live,
             translate_jobs,
             translate_count: jobs.len() as u32,
@@ -655,8 +941,15 @@ impl Ptlas {
         let step = |list: &mut CommandList<'_>| {
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         };
-        let partitions = self.limits.partitions + 1;
+        let partitions = limits.partitions + 1;
         list.begin_pass("ptlas", false);
+        if let Some(old) = self.carried.take() {
+            // The builds before wrote the old pool; this one reads the new.
+            list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+            self.kept.carry(list, &old);
+            list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+            self.retired.push((f.frame, old));
+        }
         list.dispatch(
             p.get(k.clear),
             root,
@@ -690,23 +983,32 @@ impl Ptlas {
             Stages::AS_BUILD | Stages::TRANSFER,
             Hazards::empty(),
         );
-        let tlas = s.tlas.gpu().address();
+        let tlas = tlas.address();
         list.rtas_execute(
-            &desc(self.limits),
+            &desc(limits),
             &RtasIo {
-                args: s.commands.address(),
-                count: s.command_count,
+                args: commands.address(),
+                count: command_count,
                 dst_implicit: tlas,
                 dst_addresses: GpuPtr::NULL,
                 dst_sizes: GpuPtr::NULL,
                 scratch,
-                src: if s.built { tlas } else { GpuAddress(0) },
+                src: if built { tlas } else { GpuAddress(0) },
             },
         );
-        let at = s.readback.gpu().offset(f.slot as u64);
-        list.copy(at.cast(), s.counters.cast(), 4 * COUNTERS as u64);
+        let readback = self.readback.as_ref().expect("made with the storage");
+        let at = readback.gpu().offset(f.slot as u64);
+        list.copy(
+            at.cast(),
+            self.kept.counters.gpu().cast(),
+            4 * COUNTERS as u64,
+        );
         list.end_pass();
-        s.built = true;
+        if let Some(s) = self.storage.as_mut() {
+            s.built = true;
+        }
+        self.rebuild = false;
+        self.demand.built();
         Ok(())
     }
 }
@@ -724,6 +1026,7 @@ pub(crate) struct FrameInputs {
     pub(crate) proxy_blas: GpuAddress,
     /// The frame's readback slot.
     pub(crate) slot: usize,
+    pub(crate) frame: u64,
 }
 
 fn desc(limits: PtlasLimits) -> RtasOpDesc {

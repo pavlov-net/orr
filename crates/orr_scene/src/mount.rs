@@ -3093,6 +3093,7 @@ impl Mounts {
         }
         w.model_cpu[i] = ModelCpu {
             edit: true,
+            chained: false,
             ..w.model_cpu[p.model.0 as usize]
         };
         w.cages[i] = None;
@@ -3924,6 +3925,7 @@ impl Mounts {
                 emissive_stride: mesh.gpu.emissive.count + mesh.gpu.casters.count,
                 cage_only: false,
                 edit: false,
+                chained: false,
             };
         }
         let mut page_entries = Vec::with_capacity(pages.len());

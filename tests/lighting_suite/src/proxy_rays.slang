@@ -1,5 +1,5 @@
 // Rays traced with one mask through the scene's PTLAS: per ray the procedural candidates it
-// met, the last one's instance and class, and the object-space point where that ray enters
+// met, the last one's medium proxy and class, and the object-space point where that ray enters
 // the candidate's cube [-1, 1]^3.
 #include "orr_root.h"
 import orr_shaders.trace;
@@ -8,7 +8,7 @@ import orr_scene.hit;
 struct Seen
 {
     uint count;
-    uint instance;
+    uint proxy;         // its PTLAS index past the scene's `proxy_base`
     uint class_id;
     uint proxy_flags;   // `MediumProxyGpu.flags` of the proxy the instance names
     float4 entry;       // w: 1 when the ray enters the cube
@@ -42,7 +42,7 @@ struct Count : ICandidate
         if (c.triangle)
             return float3(1.0);
         seen.count++;
-        seen.instance = c.instance_index;
+        seen.proxy = c.instance_index - scene.proxy_base;
         seen.class_id = c.custom_index;
         seen.proxy_flags = scene_proxy(scene, c.instance_index).flags;
         float3 inv = select(c.object_direction != 0.0, 1.0 / c.object_direction, float3(1e30));
