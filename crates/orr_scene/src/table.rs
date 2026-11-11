@@ -133,16 +133,11 @@ impl<T: Pod> Table<T> {
 
     /// Moves the table in `frame`'s upload when it has grown since the last: the copy of the
     /// entries the GPU holds goes to `copies`, and `records` that write into an allocation
-    /// grown past write the same entries of the current one. Returns whether it moved.
-    pub(crate) fn land(
-        &self,
-        frame: u64,
-        copies: &mut Vec<TableCopy>,
-        records: &mut [Record],
-    ) -> bool {
+    /// grown past write the same entries of the current one.
+    pub(crate) fn land(&self, frame: u64, copies: &mut Vec<TableCopy>, records: &mut [Record]) {
         let s = &mut *self.state.lock().unwrap();
         let Some((held, entries)) = s.held.take() else {
-            return false;
+            return;
         };
         let to = s.current.gpu().address().0;
         if entries > 0 {
@@ -168,7 +163,6 @@ impl<T: Pod> Table<T> {
         let passed = std::mem::take(&mut s.passed);
         s.retired
             .extend(passed.into_iter().map(|(a, _)| (frame, a)));
-        true
     }
 
     /// Frees the allocations moved from in frames at or before `completed`.

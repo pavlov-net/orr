@@ -3595,11 +3595,10 @@ impl Mounts {
         frame: u64,
         copies: &mut Vec<crate::table::TableCopy>,
         records: &mut [Record],
-    ) -> bool {
-        let models = self.models.land(frame, copies, records);
-        let meshes = self.meshes.land(frame, copies, records);
-        let lists = self.model_materials.land(frame, copies, records);
-        models || meshes || lists
+    ) {
+        self.models.land(frame, copies, records);
+        self.meshes.land(frame, copies, records);
+        self.model_materials.land(frame, copies, records);
     }
 
     /// Frees the mounts unmounted at or before `completed`.

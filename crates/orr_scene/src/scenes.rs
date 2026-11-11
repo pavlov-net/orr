@@ -1960,11 +1960,9 @@ impl<'a> Frame<'a> {
         list.begin_pass("upload", true);
         // Tables that grew move before the records that write them.
         let mut moves = Vec::new();
-        let moved = [
-            core.materials.table.land(self.id, &mut moves, &mut records),
-            core.mounts.land(self.id, &mut moves, &mut records),
-        ];
-        if moved.contains(&true) {
+        core.materials.table.land(self.id, &mut moves, &mut records);
+        core.mounts.land(self.id, &mut moves, &mut records);
+        if !moves.is_empty() {
             list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
         }
         for &(dst, src, bytes) in &moves {
