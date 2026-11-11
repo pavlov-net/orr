@@ -898,6 +898,17 @@ fn run(options: &Options) -> Option<Capture> {
     let from_world = Mat3::from_rotation_y(-(export.sky_rotation + 90.0).to_radians());
     let environment = environment_map(&renderer, gpu, mount, SKY, Affine3::from_mat3(from_world));
     let sun = sun(&pack, from_world);
+    if let Some(s) = &sun {
+        let d = s.direction_to_light;
+        log::info!(
+            "sun toward ({:.4}, {:.4}, {:.4}): yaw {:.2}, pitch {:.2} deg",
+            d.x,
+            d.y,
+            d.z,
+            (-d.x).atan2(-d.z).to_degrees(),
+            d.y.asin().to_degrees()
+        );
+    }
 
     frame += 1;
     let listed = [scene];
@@ -945,7 +956,7 @@ fn run(options: &Options) -> Option<Capture> {
         .expect("headless target")
     });
     use orr::LightingDebugView;
-    use orr::orr_lighting::GuideKind;
+    use orr::orr_lighting::{GuideKind, TracedKind};
     let debug_view = match std::env::var("ZORAH_DEBUG_VIEW").as_deref() {
         Err(_) => LightingDebugView::None,
         Ok("dielectric") => LightingDebugView::DielectricLayer,
@@ -955,6 +966,10 @@ fn run(options: &Options) -> Option<Capture> {
         Ok("specular") => LightingDebugView::Guide(GuideKind::SpecularAlbedo),
         Ok("normal") => LightingDebugView::Guide(GuideKind::Normal),
         Ok("roughness") => LightingDebugView::Guide(GuideKind::Roughness),
+        Ok("traced") => LightingDebugView::Traced(TracedKind::Distance),
+        Ok("traced-normal") => LightingDebugView::Traced(TracedKind::Normal),
+        Ok("traced-disagree") => LightingDebugView::Traced(TracedKind::Disagreement),
+        Ok("traced-sun") => LightingDebugView::Traced(TracedKind::Sun),
         Ok(other) => panic!("ZORAH_DEBUG_VIEW {other}"),
     };
     let lighting = ViewLighting {
