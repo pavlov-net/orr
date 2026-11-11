@@ -11342,8 +11342,9 @@ fn models_state_their_specular_and_tint() {
 
 /// A hit's vertex color weighs each corner by its barycentric, and its normals stay on the side
 /// a mirrored placement puts them, at sizes whose determinant is outside a float's range and on
-/// triangles whose area is. A ray from behind a double-sided material meets the normals turned
-/// toward it, but for a dielectric's, and the material of the back.
+/// triangles whose area is. A ray from behind a double-sided material meets the whole frame
+/// reversed toward it, the tangent and bitangent with the normals, but for a dielectric's, and
+/// the material of the back.
 #[test]
 fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
     use orr_pack::material::slot;
@@ -11431,7 +11432,8 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         list.dispatch(&p, root.gpu().cast::<triangle_at::Root>(), [1, 1, 1]);
         list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
         wait(render.submit(vec![list], &[]).unwrap());
-        let [color, geometric, normal, material, ..] = out.as_slice().unwrap()[..] else {
+        let [color, geometric, normal, material, tangent, coat] = out.as_slice().unwrap()[..]
+        else {
             panic!("six rows");
         };
         assert_eq!(color, [0.25, 0.25, 0.5, 0.6875], "{size}");
@@ -11439,6 +11441,19 @@ fn triangle_geometry_interpolates_colors_and_keeps_a_mirror_at_any_size() {
         let up = |n: [f32; 4]| Vec4::from(n).abs_diff_eq(Vec4::Z * turned, 1e-5);
         assert!(up(geometric), "{size}: {geometric:?}");
         assert!(up(normal), "{size}: {normal:?}");
+        // The triangle's u grows along -x and its v shrinks along -y.
+        for t in [tangent, coat] {
+            let along = Vec3::from_slice(&t[..3]);
+            let across = Vec3::from_slice(&normal[..3]).cross(along) * t[3];
+            assert!(
+                along.abs_diff_eq(Vec3::NEG_X * turned, 1e-5),
+                "{size} {first}: tangent {t:?}"
+            );
+            assert!(
+                across.abs_diff_eq(Vec3::NEG_Y * turned, 1e-5),
+                "{size} {first}: bitangent {across}"
+            );
+        }
         let shown = first + u32::from(side < 0.0);
         assert_eq!(material[0], shown as f32, "{size}");
         assert_eq!(material[1], f32::from(u8::from(first == 2)), "{size}");

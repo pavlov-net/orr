@@ -387,14 +387,16 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
         coat_tangent = triangle_tangent(t, attributes, side.coat_tangent_set, w, unit, mirror, e1, e2, n, coat_frame);
     else
         coat_frame = frame;
+    // A back is the same sheet seen from its other side, so the whole frame reverses: a normal
+    // map then turns the back's normal opposite the front's, as an object-space map does.
     if (i.back_face && (side.flags & MATERIAL_DIELECTRIC) == 0)
     {
         ng = -ng;
         n = -n;
         frame = -frame;
         coat_frame = -coat_frame;
-        tangent.w = -tangent.w;
-        coat_tangent.w = -coat_tangent.w;
+        tangent = -tangent;
+        coat_tangent = -coat_tangent;
     }
     i.geometric_normal = ng;
     i.normal = n;
