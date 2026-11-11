@@ -136,6 +136,19 @@ pub(crate) struct PrototypeEntries {
     pub(crate) stride: u32,
 }
 
+/// The emissive list entries of the copies from slot `first`, `stride` each.
+fn fill_entries(entries: &mut [EmissiveGpu], first: u32, stride: u32) {
+    for (e, i) in entries.iter_mut().zip(0..) {
+        *e = EmissiveGpu {
+            kind: EMISSIVE_INSTANCE,
+            source: first + i / stride,
+            rank: i % stride,
+            set: NO_SET,
+            ..Zeroable::zeroed()
+        };
+    }
+}
+
 /// The emissive list entries of a page whose prototypes take `entries`.
 fn page_entries(entries: &[PrototypeEntries]) -> u32 {
     entries.iter().map(|e| e.records * e.stride).sum()
@@ -1452,6 +1465,16 @@ impl<'f> SceneWriter<'f> {
             .model_cpu
             .get(desc.model.0 as usize)
             .map_or(0, |m| m.emissive_stride);
+        // Window room comes first, so nothing fails once the copies hold slots.
+        let (partitions_src, partitions_out) =
+            self.window.slice::<u32>(self.device, desc.copies)?;
+        let entries = (ranks > 0)
+            .then(|| {
+                self.window
+                    .slice::<EmissiveGpu>(self.device, desc.copies * ranks)
+            })
+            .transpose()?;
+        let (records_src, records) = self.window.slice::<InstanceGpu>(self.device, desc.copies)?;
         let (first, entry, partitions, table) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
@@ -1492,9 +1515,22 @@ impl<'f> SceneWriter<'f> {
             let partitions = cpu.ptlas.place(first, desc.copies, cell, cost);
             (first, entry, partitions, cpu.ptlas.slot_table.gpu())
         };
-        self.upload(table.offset(u64::from(first)), desc.copies)?
-            .copy_from_slice(&partitions);
-        self.write_entries(first, desc.copies, entry, ranks)?;
+        partitions_out.copy_from_slice(&partitions);
+        self.push(Record::values(
+            self.next_seq(),
+            table.offset(u64::from(first)),
+            partitions_src,
+            desc.copies,
+        ));
+        if let Some((src, out)) = entries {
+            fill_entries(out, first, ranks);
+            self.push(Record::values(
+                self.next_seq(),
+                self.scene.emissive_entry(entry),
+                src,
+                desc.copies * ranks,
+            ));
+        }
         let first_entry = self.scene.desc.producer_capacity + entry;
         let range = InstanceRange {
             first,
@@ -1506,10 +1542,12 @@ impl<'f> SceneWriter<'f> {
             variants: 0,
             stride: 0,
         });
-        let records = self.upload(
+        self.push(Record::values(
+            self.next_seq(),
             self.scene.tables.instances.gpu().offset(u64::from(first)),
+            records_src,
             desc.copies,
-        )?;
+        ));
         for (copy, r) in records.iter_mut().enumerate() {
             *r = InstanceGpu {
                 first_emissive: if ranks > 0 {
@@ -1538,25 +1576,6 @@ impl<'f> SceneWriter<'f> {
         }
         self.reset_slot_state(range);
         Ok(range)
-    }
-
-    /// Writes the emissive list entries of `copies` slots from `first`, `stride` each from
-    /// instance entry `entry`.
-    fn write_entries(&self, first: u32, copies: u32, entry: u32, stride: u32) -> Result<()> {
-        if stride == 0 {
-            return Ok(());
-        }
-        let entries = self.upload(self.scene.emissive_entry(entry), copies * stride)?;
-        for (e, i) in entries.iter_mut().zip(0..) {
-            *e = EmissiveGpu {
-                kind: EMISSIVE_INSTANCE,
-                source: first + i / stride,
-                rank: i % stride,
-                set: NO_SET,
-                ..Zeroable::zeroed()
-            };
-        }
-        Ok(())
     }
 
     /// One slot per record of a cooked instance page, partitioned as the cook laid them out,
@@ -1610,6 +1629,10 @@ impl<'f> SceneWriter<'f> {
             .filter(|(_, base)| base.is_none())
             .map(|(p, _)| p.sets.as_ref().map_or(0, |s| s.len() as u32))
             .sum();
+        // Window room comes first, so nothing fails once the page holds slots.
+        let (sets_src, sets_out) = self.window.slice::<u32>(self.device, set_entries)?;
+        let (slots_src, slots_out) = self.window.slice::<u32>(self.device, count)?;
+        let (group_src, group_out) = self.window.slice::<GroupGpu>(self.device, 1)?;
         let copy_bytes = (protos.len() * size_of::<PagePrototypeGpu>()) as u64;
         let mut table = self.device.gpu_malloc::<u8>(
             MemoryKind::Upload,
@@ -1662,23 +1685,17 @@ impl<'f> SceneWriter<'f> {
         cpu.slot_holds[first as usize..(first + count) as usize].fill(SlotHold::FREE);
 
         let mut copies = Vec::with_capacity(protos.len());
-        let mut at_set = self.scene.desc.material_set_capacity + set_base;
+        let first_set = self.scene.desc.material_set_capacity + set_base;
+        let mut at = 0;
         for (p, &named) in protos.iter().zip(&named) {
             let base = match (named, &p.sets) {
                 (Some(base), _) => base,
                 (None, Some(set)) => {
-                    let values: Vec<u32> = set.iter().map(|m| m.0).collect();
-                    let (src, out) = self.window.slice::<u32>(self.device, values.len() as u32)?;
-                    out.copy_from_slice(&values);
-                    let dst = self.scene.tables.material_sets.gpu();
-                    cpu.records.push(Record::values(
-                        self.next_seq(),
-                        dst.offset(u64::from(at_set)).cast::<u32>(),
-                        src,
-                        values.len() as u32,
-                    ));
-                    at_set += values.len() as u32;
-                    at_set - values.len() as u32
+                    for (o, m) in sets_out[at..at + set.len()].iter_mut().zip(set) {
+                        *o = m.0;
+                    }
+                    at += set.len();
+                    first_set + (at - set.len()) as u32
                 }
                 (None, None) => NO_MATERIAL_SET,
             };
@@ -1716,6 +1733,19 @@ impl<'f> SceneWriter<'f> {
                 _pad: [0; 3],
             });
         }
+        if set_entries > 0 {
+            cpu.records.push(Record::values(
+                self.next_seq(),
+                self.scene
+                    .tables
+                    .material_sets
+                    .gpu()
+                    .offset(u64::from(first_set))
+                    .cast::<u32>(),
+                sets_src,
+                set_entries,
+            ));
+        }
         let out = table.as_mut_slice().expect("upload is mapped");
         out[..copy_bytes as usize].copy_from_slice(bytemuck::cast_slice(&copies));
         let mut ends: Vec<u32> = page.info.partitions.iter().map(|&p| u32::from(p)).collect();
@@ -1752,20 +1782,18 @@ impl<'f> SceneWriter<'f> {
             entries_stale: false,
             sets: (set_base, set_entries),
         });
-        let (src, out) = self.window.slice::<u32>(self.device, count)?;
-        out.copy_from_slice(&partitions);
+        slots_out.copy_from_slice(&partitions);
         cpu.records.push(Record::values(
             self.next_seq(),
             slot_table.offset(u64::from(first)),
-            src,
+            slots_src,
             count,
         ));
-        let (src, out) = self.window.slice::<GroupGpu>(self.device, 1)?;
-        out[0] = record;
+        group_out[0] = record;
         cpu.records.push(Record::values(
             self.next_seq(),
             self.scene.tables.groups.gpu().offset(u64::from(group_id)),
-            src,
+            group_src,
             1,
         ));
         Self::reset_slot_state_with(&self.scene.tables, self.next_seq(), range, &mut cpu.records);
@@ -1926,6 +1954,8 @@ impl<'f> SceneWriter<'f> {
         let record = group.record();
         let cooked = proto.sets.as_ref().filter(|_| r.material_set.is_none());
         let set_entries = cooked.map_or(0, |s| s.len() as u32);
+        let (sets_src, sets_out) = self.window.slice::<u32>(self.device, set_entries)?;
+        let (group_src, group_out) = self.window.slice::<GroupGpu>(self.device, 1)?;
         let (id, sets) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let id = cpu.free_group();
@@ -1942,25 +1972,24 @@ impl<'f> SceneWriter<'f> {
                 });
             };
             if let Some(set) = cooked {
-                let values: Vec<u32> = set.iter().map(|m| m.0).collect();
-                let (src, out) = self.window.slice::<u32>(self.device, set_entries)?;
-                out.copy_from_slice(&values);
+                for (o, m) in sets_out.iter_mut().zip(set) {
+                    *o = m.0;
+                }
                 let at = self.scene.desc.material_set_capacity + set_base;
                 let table = self.scene.tables.material_sets.gpu();
                 cpu.records.push(Record::values(
                     self.next_seq(),
                     table.offset(u64::from(at)).cast::<u32>(),
-                    src,
+                    sets_src,
                     set_entries,
                 ));
             }
             cpu.put_group(id, group);
-            let (src, out) = self.window.slice::<GroupGpu>(self.device, 1)?;
-            out[0] = record;
+            group_out[0] = record;
             cpu.records.push(Record::values(
                 self.next_seq(),
                 self.scene.tables.groups.gpu().offset(id as u64),
-                src,
+                group_src,
                 1,
             ));
             (TransformGroupId(id as u32), (set_base, set_entries))
@@ -2064,6 +2093,18 @@ impl<'f> SceneWriter<'f> {
         assert!(model.joints > 0, "{:?} has no skeleton", desc.model);
         let arrays = CopyArrays::new(self.device, desc.copies, shape.vertices, shape.clusters)?;
         let ranks = model.emissive_stride;
+        // Window room comes first, so nothing fails once the copies hold slots.
+        let entries = (ranks > 0)
+            .then(|| {
+                self.window
+                    .slice::<EmissiveGpu>(self.device, desc.copies * ranks)
+            })
+            .transpose()?;
+        let (records_src, records) = self.window.slice::<InstanceGpu>(self.device, desc.copies)?;
+        let (skinned_src, skinned) = self.window.slice::<SkinnedGpu>(self.device, desc.copies)?;
+        let (states_src, states) = self
+            .window
+            .slice::<SkinStateGpu>(self.device, desc.copies)?;
         let (first, entry, emissive) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
@@ -2106,16 +2147,26 @@ impl<'f> SceneWriter<'f> {
             cpu.ptlas.place_skinned(first, desc.copies);
             (first, entry, emissive)
         };
-        self.write_entries(first, desc.copies, emissive, ranks)?;
+        if let Some((src, out)) = entries {
+            fill_entries(out, first, ranks);
+            self.push(Record::values(
+                self.next_seq(),
+                self.scene.emissive_entry(emissive),
+                src,
+                desc.copies * ranks,
+            ));
+        }
         let first_emissive = self.scene.desc.producer_capacity + emissive;
         let range = InstanceRange {
             first,
             count: desc.copies,
         };
-        let records = self.upload(
+        self.push(Record::values(
+            self.next_seq(),
             self.scene.tables.instances.gpu().offset(u64::from(first)),
+            records_src,
             desc.copies,
-        )?;
+        ));
         for (copy, r) in (0..).zip(records.iter_mut()) {
             *r = InstanceGpu {
                 first_emissive: if ranks > 0 {
@@ -2142,10 +2193,12 @@ impl<'f> SceneWriter<'f> {
                 variant: u32::from(section_mask) << 16,
             };
         }
-        let skinned = self.upload(
+        self.push(Record::values(
+            self.next_seq(),
             self.scene.tables.skinned.gpu().offset(u64::from(entry)),
+            skinned_src,
             desc.copies,
-        )?;
+        ));
         for (copy, k) in (0..).zip(skinned.iter_mut()) {
             let [positions, previous, normals, tangents, boxes] = arrays.of(copy);
             *k = SkinnedGpu {
@@ -2160,10 +2213,12 @@ impl<'f> SceneWriter<'f> {
                 joint_count: model.joints,
             };
         }
-        let states = self.upload(
+        self.push(Record::values(
+            self.next_seq(),
             self.scene.tables.skin_state.gpu().offset(u64::from(entry)),
+            states_src,
             desc.copies,
-        )?;
+        ));
         states.fill(SkinStateGpu {
             cut: u32::MAX,
             ..Zeroable::zeroed()
