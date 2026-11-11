@@ -439,13 +439,13 @@ public struct SceneRoot
     public uint skinned_capacity;
     public uint group_capacity;
     public uint light_capacity;
-    public uint material_set_capacity;
     public uint producer_capacity;
     public uint emissive_capacity;   // instance entries, after the producer entries
     public float near_range;         // m
     public uint part_base;           // PTLAS index of part instance 0; the instance slots come first, so also their count
     public uint part_capacity;
     public uint producer_base;       // PTLAS index of producer entry 0; also how `SurfaceInput`, `GSurface` and `VisibleCluster` name producer entries
+    public uint _pad;
     public CutGpu* cut;              // the frame's cuts
     public SkinnedGpu* skinned;      // skinned copies, `skinned_capacity` entries
     public SkinStateGpu* skin_state; // per skinned copy, written by the GPU
