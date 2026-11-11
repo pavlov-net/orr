@@ -1,8 +1,9 @@
 //! `orr_pack.mesh` on the GPU reads what `orr_pack::mesh::PageView` reads from the same
 //! `decode_page` output, and `orr_pack.page_codec` on the loading queue writes what
 //! `decode_page` writes and rejects what it rejects: synthetic pages at every attribute
-//! layout with micromap indices and high halves, every page of a cooked mesh, damaged pages,
-//! and with `ORR_COOKED_SET` every page of a set of cooked archives.
+//! layout with micromap indices and high halves, every page of a cooked mesh and of a large
+//! one whose coarse clusters span more than 16 bits, damaged pages, and with `ORR_COOKED_SET`
+//! every page of a set of cooked archives.
 
 use std::path::PathBuf;
 
@@ -403,6 +404,61 @@ fn cooked_wavy() -> Archive {
         .memory
         .remove(0);
     Archive::from_memory(bytes).unwrap()
+}
+
+/// The wavy grid without parts scaled to 400 m and cooked as a DAG, as mesh "m": its coarse
+/// clusters span more than 16 bits of the 2^-11 m grid.
+fn cooked_large() -> Archive {
+    let mut input = wavy(64);
+    input.parts = None;
+    for p in &mut input.positions {
+        *p *= 100.0;
+    }
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            vec![AssetSpec {
+                name: "m".into(),
+                source: orr_cook::Source::Mesh {
+                    materials: vec![Material::default(); input.sections.len()],
+                    mesh: input,
+                    settings: MeshSettings {
+                        lod: LodMode::Dag,
+                        tangent_error_max: None,
+                        ..Default::default()
+                    },
+                },
+            }],
+        )],
+    };
+    let bytes = orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory
+        .remove(0);
+    Archive::from_memory(bytes).unwrap()
+}
+
+/// Every page of the large mesh loads alike and decodes alike on the GPU, those with high
+/// halves among them.
+#[test]
+fn large_mesh_pages_load_and_decode_alike() {
+    let a = cooked_large();
+    let e = a.find(AssetId::from_name("m/mesh")).unwrap();
+    let blobs = a.blobs(e);
+    let info = MeshInfo::parse(&read(&a, &blobs[0])).unwrap();
+    assert_eq!(info.header.position_exponent, -11);
+    let mut spread = Spread::default();
+    let mut wide = 0;
+    for p in &info.pages {
+        let mut page = vec![0; p.resident_len as usize];
+        let layout = mesh::decode_page(&read(&a, &blobs[p.blob as usize]), &mut page).unwrap();
+        wide += usize::from(layout.highs_offset != layout.attrs_offset);
+        check(&page, &info.header, &mut spread);
+    }
+    assert!(wide > 0, "no page holds high halves");
+    spread.assert_within();
+    let stored = stored_pages(&a, e);
+    assert_eq!(check_decode(&stored), stored.len());
 }
 
 #[test]

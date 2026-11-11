@@ -343,6 +343,94 @@ fn cuts_cover_the_surface_once() {
     );
 }
 
+/// A `size` m square of `n` x `n` quads over hills, every point moved off the coarser grids
+/// by under a millimeter, the rim kept on its square.
+fn hills(n: u32, size: f32) -> MeshInput {
+    let mut m = wavy(n, false);
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut jitter = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 40) as f32 / (1u64 << 24) as f32 * 0.0008 - 0.0004
+    };
+    let half = size / 2.0;
+    for p in &mut m.positions {
+        let (x, z) = (p.x * size / 4.0, p.z * size / 4.0);
+        let rim = x.abs() == half || z.abs() == half;
+        let y = 0.05 * size * (x / size * 7.0).sin() * (z / size * 5.0).cos();
+        *p = if rim {
+            Vec3::new(x, y + jitter(), z)
+        } else {
+            Vec3::new(x + jitter(), y + jitter(), z + jitter())
+        };
+    }
+    m
+}
+
+/// A 200 m DAG mesh stays on the 2^-11 m grid: its finest clusters are the source triangles
+/// on it, every point of every level is a source point on it, the coarse clusters span more
+/// than 16 bits of it, and its cuts cover the surface once with no open edge inside.
+#[test]
+fn a_large_mesh_keeps_the_finest_step_at_every_level() {
+    let input = hills(96, 200.0);
+    let a = cook(input.clone(), &[0], dag());
+    let d = load(&a, "m/mesh");
+    assert_eq!(d.info.header.position_exponent, -11);
+    let per_depth = check_structure(&d);
+    assert_eq!(per_depth[0], input.indices.len() as u64 / 3);
+    let snap = |p: Vec3| {
+        p.to_array()
+            .map(|x| ((f64::from(x) * 2048.0 + 0.5).floor() / 2048.0) as f32)
+            .map(f32::to_bits)
+    };
+    let source: HashSet<[u32; 3]> = input.positions.iter().map(|&p| snap(p)).collect();
+    for c in &d.clusters {
+        let points = c.tris.iter().flatten();
+        assert!(
+            points
+                .map(|p| p.map(f32::to_bits))
+                .all(|p| source.contains(&p))
+        );
+    }
+    assert!(d.clusters.iter().any(|c| c.record.wide()));
+    let rotate = |t: [[u32; 3]; 3]| {
+        let r = (0..3).min_by_key(|&i| t[i]).unwrap();
+        [t[r], t[(r + 1) % 3], t[(r + 2) % 3]]
+    };
+    let mut expected: Vec<[[u32; 3]; 3]> = input
+        .indices
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|t| rotate(t.map(|i| snap(input.positions[i as usize]))))
+        .collect();
+    let mut finest: Vec<[[u32; 3]; 3]> = d
+        .select(Cut::Uniform(0.0), |_| true)
+        .iter()
+        .flat_map(|&c| &d.clusters[c].tris)
+        .map(|t| rotate(t.map(|p| p.map(f32::to_bits))))
+        .collect();
+    expected.sort_unstable();
+    finest.sort_unstable();
+    assert_eq!(finest, expected);
+
+    let mut cuts: Vec<Cut> = d.thresholds(2.0).into_iter().map(Cut::Uniform).collect();
+    for eye in eyes() {
+        for t in [0.0005, 0.002, 0.01] {
+            cuts.push(Cut::View(eye * 50.0, t));
+        }
+    }
+    for cut in cuts {
+        let flat = d.select(cut, |_| true);
+        assert_eq!(d.traverse(cut, &d.info.roots), flat, "{cut:?}");
+        let wrong = covers_once(&d, &flat, Vec2::splat(-99.0), 198.0, |_| true);
+        assert_eq!(wrong, 0, "{cut:?}");
+        let rim = |p: [f32; 3]| p[0].abs() == 100.0 || p[2].abs() == 100.0;
+        assert_eq!(unmatched_edges(&d, &flat, rim), 0, "{cut:?}");
+    }
+}
+
 #[test]
 fn parts_merge_past_the_merge_error() {
     let mut input = wavy(64, true);

@@ -519,11 +519,11 @@ fn material_extensions_map_to_openpbr() {
     assert!(warnings[0].contains("section 3") && warnings[0].contains("border edges"));
 }
 
-/// Two models from one scene: a 1 m box and a 40 m slab, with their nodes' transforms.
+/// Two models from one scene: a 1 m box and a 5 km slab, with their nodes' transforms.
 fn rocks(path: &Path, a: &str, b: &str) {
     let mut g = Glb::default();
     let mut meshes = Vec::new();
-    for size in [1.0f32, 40.0] {
+    for size in [1.0f32, 5000.0] {
         let pos = [
             [0.0, 0.0, 0.0],
             [size, 0.0, 0.0],

@@ -63,9 +63,10 @@ pub struct MeshHeader {
     /// Rest-pose bounds of the positions as stored on the grid.
     pub bounds: Aabb,
     pub sphere: Sphere,
-    /// The finest grid step the mesh was cooked with, log2 of meters.
+    /// The grid step the mesh was cooked asking for, log2 of meters.
     pub position_step_log2: i8,
-    /// The grid step `k`: positions are integers times `2^k` meters.
+    /// The grid step `k`: positions are integers times `2^k` meters. Coarser than
+    /// `position_step_log2` only where a position needs it to fit 24 bits.
     pub position_exponent: i8,
     /// Low mantissa bits a CLAS build may truncate without moving any position.
     pub clas_truncate_bits: u8,

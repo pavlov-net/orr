@@ -210,10 +210,11 @@ fn key(section: u16, p: [[f32; 3]; 3]) -> (TriKey, usize) {
     )
 }
 
-/// Cooks the fixture at a scale and checks the grid, clusters, attributes and materials
-/// against values computed here from the source.
-fn check_fixture(scale: f32, translation: [f32; 3]) {
-    let d = dir(&format!("mesh-{scale}"));
+/// Cooks the fixture at a scale and checks the grid, which is `2^k` m, clusters, attributes
+/// and materials against values computed here from the source; returns how many clusters
+/// span more than 16 bits.
+fn check_fixture(scale: f32, translation: [f32; 3], k: i32) -> usize {
+    let d = dir(&format!("mesh-{scale}-{}", translation[0]));
     let path = d.join("fixture.glb");
     let prims = [torus(scale), sheet(scale)];
     write_glb(&path, &[&prims[0], &prims[1]], translation);
@@ -272,7 +273,8 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
         ]
     );
 
-    // The grid, from the plan's formula over the transformed source positions.
+    // The grid: the finest step on which every transformed source position's cell is
+    // within 2^23 of the origin.
     let world = Mat4::from_translation(Vec3::from(translation));
     let src: Vec<Vec<[f32; 3]>> = prims
         .iter()
@@ -283,24 +285,20 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
                 .collect()
         })
         .collect();
-    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-    for v in src.iter().flatten() {
-        lo = [0, 1, 2].map(|a| lo[a].min(v[a]));
-        hi = [0, 1, 2].map(|a| hi[a].max(v[a]));
-    }
-    let extent = (0..3).map(|a| f64::from(hi[a] - lo[a])).fold(0.0, f64::max);
-    let k = (-11).max((extent / 65535.0).log2().ceil() as i32);
+    let cell = |x: f32, k: i32| (f64::from(x) / 2f64.powi(k) + 0.5).floor() as i64;
+    let max_cell = |k: i32| {
+        src.iter()
+            .flatten()
+            .flatten()
+            .map(|&x| cell(x, k).abs())
+            .max()
+            .unwrap()
+    };
+    assert_eq!((-11..).find(|&k| max_cell(k) < 1 << 23), Some(k));
     assert_eq!(i32::from(h.position_exponent), k);
     let step = 2f64.powi(k);
-    let cell = |x: f32| (f64::from(x) / step + 0.5).floor() as i64;
-    let snap = |v: [f32; 3]| v.map(|x| (cell(x) as f64 * step) as f32);
-    let max_cell = src
-        .iter()
-        .flatten()
-        .flatten()
-        .map(|&x| cell(x).abs())
-        .max()
-        .unwrap();
+    let snap = |v: [f32; 3]| v.map(|x| (cell(x, k) as f64 * step) as f32);
+    let max_cell = max_cell(k);
     assert_eq!(
         u32::from(h.clas_truncate_bits),
         24 - (64 - max_cell.leading_zeros())
@@ -326,7 +324,7 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
     }
 
     let mut cluster_area = [0f64; 2];
-    let mut clusters = 0;
+    let (mut clusters, mut wide) = (0, 0);
     let truncate = u32::from(h.clas_truncate_bits);
     for (pi, page) in info.pages.iter().enumerate() {
         let b = &blobs[page.blob as usize];
@@ -360,6 +358,7 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
                 }
             }
             assert_eq!(local_max, c.local_max.map(|m| m as i32));
+            wide += usize::from(c.wide());
             cluster_area[s] += f64::from(c.area);
 
             for t in 0..u32::from(c.tri_count) {
@@ -394,27 +393,117 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
     for s in 0..2 {
         assert!((cluster_area[s] - area[s]).abs() <= 1e-5 * area[s]);
     }
+    wide
 }
 
 #[test]
 fn fixture_on_the_finest_grid() {
-    check_fixture(1.0, [1000.25, -3.0, 40.0]);
+    assert_eq!(check_fixture(1.0, [1000.25, -3.0, 40.0], -11), 0);
 }
 
+/// A 400 m fixture keeps the finest step, its clusters spanning more than 16 bits of it.
 #[test]
-fn fixture_on_a_coarser_grid() {
-    check_fixture(150.0, [-2000.0, 10.0, 0.5]);
+fn large_fixture_on_the_finest_grid() {
+    assert!(check_fixture(150.0, [-2000.0, 10.0, 0.5], -11) > 0);
 }
 
+/// 2^23 steps of 2^-11 m is 4096 m: past it the step coarsens to keep every position in 24
+/// bits.
 #[test]
-fn positions_past_24_bits_fail() {
-    let d = dir("mesh-far");
-    let path = d.join("far.glb");
-    let prims = [torus(1.0), sheet(1.0)];
-    // 2^23 steps of 2^-11 m is 4096 m.
-    write_glb(&path, &[&prims[0], &prims[1]], [5000.0, 0.0, 0.0]);
-    let err = cook_memory(&path).err().unwrap();
-    assert!(matches!(err, orr_cook::Error::Mesh { .. }), "{err}");
+fn fixture_past_24_bits_on_a_coarser_grid() {
+    assert_eq!(check_fixture(1.0, [5000.0, 0.0, 0.0], -10), 0);
+}
+
+/// A strip of `n` columns of quads from `x0` to `x1`, its rows from z = 0.03 to 5.03 rising
+/// in y with z alone, so two strips that meet in x share their edge's points.
+fn strip(x0: f32, x1: f32, n: u32) -> MeshInput {
+    let mut m = MeshInput::default();
+    let mut uvs = Vec::new();
+    for j in 0..=20 {
+        for i in 0..=n {
+            let x = if i == n {
+                x1
+            } else {
+                x0 + (x1 - x0) * i as f32 / n as f32
+            };
+            let z = 0.03 + 0.25 * j as f32;
+            m.positions.push(Vec3::new(x, 0.017 * z, z));
+            m.normals.push(Vec3::Y);
+            uvs.push(Vec2::new(i as f32 / n as f32, j as f32 / 20.0));
+        }
+    }
+    m.uvs = Some(uvs);
+    let w = n + 1;
+    for j in 0..20 {
+        for i in 0..n {
+            let c = j * w + i;
+            m.indices.extend([c, c + w, c + 1, c + 1, c + w, c + w + 1]);
+        }
+    }
+    m.sections = vec![Span {
+        first: 0,
+        count: m.indices.len() as u32,
+    }];
+    m
+}
+
+/// A 1 km strip and a 10 m one that meet at x = 0.1 m, cooked as they are: the points of
+/// their shared edge read back bit for bit alike from both meshes.
+#[test]
+fn meshes_of_any_extent_store_a_shared_edge_alike() {
+    let meshes = [
+        ("large", strip(0.1 - 1000.0, 0.1, 20)),
+        ("small", strip(0.1, 10.1, 20)),
+    ];
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            meshes
+                .into_iter()
+                .map(|(name, mesh)| AssetSpec {
+                    name: name.into(),
+                    source: Source::Mesh {
+                        mesh,
+                        materials: vec![Material::default()],
+                        settings: MeshSettings::default(),
+                    },
+                })
+                .collect(),
+        )],
+    };
+    let bytes = orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory
+        .remove(0);
+    let a = Archive::from_memory(bytes).unwrap();
+    // The points of a mesh at its least (`side` -1) or greatest (1) x, as bits.
+    let edge = |name: &str, side: f32| {
+        let e = a.find(AssetId::from_name(&format!("{name}/mesh"))).unwrap();
+        let blobs = a.blobs(e);
+        let info = MeshInfo::parse(&read_blob(&a, &blobs[0])).unwrap();
+        let mut points = Vec::new();
+        for page in &info.pages {
+            let mut resident = vec![0; page.resident_len as usize];
+            mesh::decode_page(&read_blob(&a, &blobs[page.blob as usize]), &mut resident).unwrap();
+            let view = PageView::new(&resident, &info.header).unwrap();
+            for i in 0..view.cluster_count() {
+                let c = view.cluster(i);
+                points.extend((0..u32::from(c.vertex_count)).map(|v| view.position(&c, v)));
+            }
+        }
+        let x = points.iter().map(|p| side * p[0]).fold(f32::MIN, f32::max);
+        let mut edge: Vec<[u32; 3]> = points
+            .iter()
+            .filter(|p| side * p[0] == x)
+            .map(|p| p.map(f32::to_bits))
+            .collect();
+        edge.sort_unstable();
+        edge.dedup();
+        edge
+    };
+    let large = edge("large", 1.0);
+    assert_eq!(large.len(), 21);
+    assert_eq!(large, edge("small", -1.0));
 }
 
 #[test]

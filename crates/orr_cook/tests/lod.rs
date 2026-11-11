@@ -365,17 +365,25 @@ fn parts_follow_the_majority_then_the_lowest_value() {
     ));
 }
 
+/// The step stays 2^-11 m while every cell of a point is within 2^23 of the origin, 4096 m,
+/// whatever the mesh's extent; a point at or past it coarsens the step.
 #[test]
-fn grid_steps_follow_the_extent() {
-    for (extent, k) in [(1.0f32, -11), (32.0, -10), (31.0, -11), (1000.0, -6)] {
+fn grid_steps_follow_the_24_bit_limit() {
+    for (x, k) in [
+        (1.0f32, -11),
+        (1000.0, -11),
+        (4095.0, -11),
+        (-4095.0, -11),
+        (4096.0, -10),
+        (-4096.0, -10),
+        (1e5, -6),
+    ] {
         let mut input = triangles(&[[0, 0, 0]], 1);
         input.parts = None;
-        input.positions[1] = Vec3::new(extent, 0.0, 0.0);
+        input.positions[1] = Vec3::new(x, 0.0, 0.0);
         let a = cook(input, MeshSettings::default()).unwrap();
         let (info, _) = clusters(&a);
-        let expected = (-11).max((f64::from(extent) / 65535.0).log2().ceil() as i32);
-        assert_eq!(i32::from(info.header.position_exponent), expected);
-        assert_eq!(expected, k);
+        assert_eq!(i32::from(info.header.position_exponent), k, "x = {x}");
     }
 }
 

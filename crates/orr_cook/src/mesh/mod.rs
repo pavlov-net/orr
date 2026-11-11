@@ -62,8 +62,8 @@ pub struct MeshSettings {
     pub max_vertices_foliage: u16,
     /// Cluster triangle limit, a multiple of 16 up to 128; clusters aim for at least a quarter.
     pub max_triangles: u16,
-    /// Finest grid step, log2 of meters. A mesh too large to span 16 bits per axis at this
-    /// step gets the smallest coarser step that does.
+    /// Grid step, log2 of meters. A mesh with a position past 2^23 steps from its origin gets
+    /// the smallest coarser step that holds every position in 24 bits.
     pub position_step_log2: i8,
     /// Meters a skinned vertex may move from its rest position, for every cluster of a
     /// skinned mesh outside animated parts (the bound GPU skinning builds cluster templates
@@ -687,7 +687,7 @@ pub(crate) fn cook(
     drop(stretch_zone);
     let mut w = lod::Welded::new(&m, !tangent_check.derive, bakes);
     let min_exponent = m.min_exponent;
-    let source_grid = Grid::new(&w.positions, s.position_step_log2, min_exponent).map_err(fail)?;
+    let source_grid = Grid::new(&w.positions, s.position_step_log2, min_exponent);
     let mut parts = lod::Parts::new(&w, &m, &source_grid).map_err(fail)?;
     let (skinned, stored_tangents) = (m.skin.is_some(), m.tangents.is_some());
     let sections = std::mem::take(&mut m.sections);
@@ -717,8 +717,7 @@ pub(crate) fn cook(
             baked = displace::bake(&mut w, &mut parts, maps, d);
             if baked.iter().any(|&b| b) {
                 drop(source_grid);
-                let grid =
-                    Grid::new(&w.positions, s.position_step_log2, min_exponent).map_err(fail)?;
+                let grid = Grid::new(&w.positions, s.position_step_log2, min_exponent);
                 let keep: Vec<bool> = sections
                     .iter()
                     .map(|sec| !dag::dilates(s, sec.flags))
@@ -1565,8 +1564,9 @@ fn f16_next(h: half::f16, up: bool) -> u16 {
     }
 }
 
-/// The grid exponent `k` of positions: `max(step_log2, ceil(log2(extent / 65535)))`,
-/// computed without log2 rounding.
+/// The grid exponent `k` of positions: the smallest `k` at or over `step_log2` on whose grid
+/// every position's cell is within 2^23 of the origin, so that it and every offset between two
+/// of them is exact in an f32.
 pub(crate) fn grid_exponent(positions: &[[f32; 3]], step_log2: i8) -> i8 {
     bounds_exponent(&position_bounds(positions), step_log2)
 }
@@ -1608,16 +1608,19 @@ fn mesh_exponent(b: &Aabb, step_log2: i8, min: Option<i8>) -> i8 {
     bounds_exponent(b, step_log2).max(min.unwrap_or(i8::MIN))
 }
 
-/// [`grid_exponent`] of positions with box `b`.
+/// [`grid_exponent`] of positions with box `b`. [`Snap::cell`] rises with the coordinate, so
+/// the box's corners hold the extreme cells.
 fn bounds_exponent(b: &Aabb, step_log2: i8) -> i8 {
-    let extent = (0..3)
-        .map(|a| f64::from(b.max[a]) - f64::from(b.min[a]))
-        .fold(0.0, f64::max);
-    let mut k = i32::from(step_log2);
-    while extent > 65535.0 * 2f64.powi(k) {
+    let holds = |snap: Snap| {
+        let fits = |x: f32| snap.cell(x).unsigned_abs() < 1 << 23;
+        b.min.into_iter().chain(b.max).all(fits)
+    };
+    let mut k = step_log2;
+    // The empty box of no positions has no cell to hold.
+    while b.min[0] <= b.max[0] && !holds(Snap::new(k)) {
         k += 1;
     }
-    k as i8
+    k
 }
 
 /// The grid of step `2^k` m: where it puts a coordinate.
@@ -1666,10 +1669,9 @@ struct Grid {
 }
 
 impl Grid {
-    fn new(positions: &[[f32; 3]], step_log2: i8, min: Option<i8>) -> Result<Self, String> {
+    fn new(positions: &[[f32; 3]], step_log2: i8, min: Option<i8>) -> Self {
         let _z = crate::profile::zone!("mesh.grid");
         let b = position_bounds(positions);
-        let own = bounds_exponent(&b, step_log2);
         let k = mesh_exponent(&b, step_log2, min);
         let snap = Snap::new(k);
         let cells: Vec<[i32; 3]> = positions
@@ -1677,7 +1679,7 @@ impl Grid {
             .light()
             .map(|p| p.map(|x| snap.cell(x)))
             .collect();
-        // The box's corners hold the extreme cells.
+        // The box's corners hold the extreme cells, which `k` keeps within 2^23.
         let (lo, hi) = if positions.is_empty() {
             ([0; 3], [0; 3])
         } else {
@@ -1689,35 +1691,17 @@ impl Grid {
             .map(i32::unsigned_abs)
             .max()
             .unwrap_or(0);
-        if max_abs >= 1 << 23 {
-            let largest = |g: &[i32; 3]| g.iter().fold(0, |m, v| m.max(v.unsigned_abs()));
-            let i = cells
-                .par_iter()
-                .light()
-                .position_first(|g| largest(g) >= 1 << 23)
-                .expect("a cell past 2^23");
-            let p = positions[i];
-            return Err(format!(
-                "position {p:?} m needs more than 24 bits on the 2^{k} m grid"
-            ));
-        }
         let floats: Vec<[f32; 3]> = cells
             .par_iter()
             .light()
             .map(|g| g.map(|v| snap.coordinate(v)))
             .collect();
-        let m = meshopt::compute_position_exponent(b.min, b.max, step_log2.into(), 16);
-        let own = i32::from(own);
-        assert!(
-            m == own || m == own + 1,
-            "grid exponent {own}, meshoptimizer {m}"
-        );
         // Grid positions are exact floats, so equal floats are equal cells.
         let reps = meshopt::generate_position_remap(
             &VertexDataAdapter::new(bytemuck::cast_slice(&floats), 12, 0)
                 .expect("positions are 12-byte vertices"),
         );
-        Ok(Self {
+        Self {
             k,
             truncate_bits: (24 - (32 - max_abs.leading_zeros())) as u8,
             cells,
@@ -1725,7 +1709,7 @@ impl Grid {
             hi,
             floats,
             reps,
-        })
+        }
     }
 
     fn step(&self) -> f64 {
