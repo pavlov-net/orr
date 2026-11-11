@@ -411,7 +411,8 @@ impl MaterialWriter<'_> {
     /// Replaces material `id` from this frame on. Its triangles stay as opaque or
     /// micromapped in traversal as their mount cooked them: coverage that changes at run time
     /// goes through a linked surface's `coverage`. A subdivision copy keeps last frame's positions
-    /// by whether its materials displaced by a world length when it was set.
+    /// by whether its materials displaced by a world length when it was set. A tessellated
+    /// entry's `displacement_reach` must cover what its materials displace as updated.
     pub fn update(&mut self, id: MaterialId, m: &MaterialGpu) -> Result<()> {
         assert!(
             id.0 < self.table.capacity,

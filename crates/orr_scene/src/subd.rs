@@ -43,7 +43,9 @@ pub struct SubdDesc<'a> {
     /// material's displacement texture.
     pub displacement: u8,
     /// The most the displacement moves a point, in m of the copy's space. A material's world
-    /// length counts here over the placement's smallest scale.
+    /// length counts here over the smallest scale the placement takes. It must cover what the
+    /// copy's materials displace as [`MaterialWriter::update`](crate::MaterialWriter::update)
+    /// changes them.
     pub displacement_reach: f32,
     pub origin: OriginPolicy,
     pub flags: InstanceFlags,
