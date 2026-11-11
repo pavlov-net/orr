@@ -710,7 +710,7 @@ impl Streaming {
             moves_tiles: device.binds_sparse_on(QueueKind::Render),
             retired_tile_slots: Vec::new(),
             retired_scratch: Vec::new(),
-            share: HeapShare::new(device),
+            share: HeapShare::new(device, response_period(fif)),
             pool_heaps: {
                 let heap = |kind: MemoryKind| {
                     let k = MemoryKind::ALL.iter().position(|&a| a == kind);

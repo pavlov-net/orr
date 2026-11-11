@@ -5,8 +5,10 @@
 //! the bytes its classes use and the bytes its pools are giving back, and reads the sums over
 //! all of them. What a manager holds stays in the sums until it drops. What it is giving back
 //! comes only as it steps, so another manager counts those bytes only while it has posted
-//! since that manager's post before.
+//! within the reader's last response period of posts, the horizon over which the reader's
+//! budget cuts wait for returning memory.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Weak};
 
 use orr_gpu::Device;
@@ -28,9 +30,13 @@ struct Posts {
 /// What one manager last posted.
 struct Posted {
     id: u64,
-    /// `Posts::count` at its last post and at the one before.
+    /// `Posts::count` at its last post.
     at: u64,
-    before: u64,
+    /// `Posts::count` at its posts before the last, at most its response period of them, the
+    /// latest last.
+    before: VecDeque<u64>,
+    /// Its response period, in its posts.
+    period: usize,
     /// Per heap index: bytes held and bytes coming back.
     heaps: Vec<[u64; 2]>,
 }
@@ -45,8 +51,9 @@ pub(crate) struct HeapShare {
 }
 
 impl HeapShare {
-    /// A part of the posts of `device`, holding nothing.
-    pub(crate) fn new(device: &Device) -> Self {
+    /// A part of the posts of `device`, holding nothing, for a manager that posts once a step
+    /// and waits `period` steps for what its budget cuts return ([`crate::residency`]).
+    pub(crate) fn new(device: &Device, period: u64) -> Self {
         let mut devices = DEVICES.lock().unwrap();
         devices.retain(|d| d.strong_count() > 0);
         let found = devices
@@ -65,12 +72,7 @@ impl HeapShare {
             let mut posts = all.posts.lock().unwrap();
             posts.next_id += 1;
             let id = posts.next_id;
-            posts.managers.push(Posted {
-                id,
-                at: 0,
-                before: 0,
-                heaps: Vec::new(),
-            });
+            posts.managers.push(Posted::new(id, period));
             id
         };
         Self { all, id }
@@ -83,6 +85,19 @@ impl HeapShare {
     }
 }
 
+impl Posted {
+    fn new(id: u64, period: u64) -> Self {
+        let period = usize::try_from(period).expect("a period of frames");
+        Self {
+            id,
+            at: 0,
+            before: VecDeque::with_capacity(period),
+            period,
+            heaps: Vec::new(),
+        }
+    }
+}
+
 impl Posts {
     fn post(&mut self, id: u64, mine: &[[u64; 2]]) -> Vec<[u64; 2]> {
         self.count += 1;
@@ -92,12 +107,16 @@ impl Posts {
             .iter_mut()
             .find(|m| m.id == id)
             .expect("a live share");
-        (me.before, me.at) = (me.at, count);
+        if me.before.len() == me.period {
+            me.before.pop_front();
+        }
+        me.before.push_back(me.at);
+        me.at = count;
         me.heaps = mine.to_vec();
-        let since = me.before;
+        let since = me.before[0];
         let mut sums = vec![[0; 2]; mine.len()];
         for m in &self.managers {
-            // A manager that has not stepped since this one's post before gives nothing back
+            // A manager that has not stepped within this one's period gives nothing back
             // meanwhile.
             let stepping = m.id == id || m.at > since;
             for (sum, heap) in sums.iter_mut().zip(&m.heaps) {
@@ -122,24 +141,23 @@ impl Drop for HeapShare {
 mod tests {
     use super::*;
 
-    /// Two managers on a device read each other's bytes while both post; one that stops keeps
-    /// what it holds in the other's sums and loses what it was giving back.
+    /// Two managers on a device read each other's bytes while both post, one less often than
+    /// the other; one that stops keeps what it holds in the other's sums and loses what it was
+    /// giving back once the other has posted a period without it.
     #[test]
     fn a_manager_that_stops_posting_keeps_its_held_bytes_and_loses_its_coming() {
         let mut posts = Posts::default();
-        for id in [1, 2] {
-            posts.managers.push(Posted {
-                id,
-                at: 0,
-                before: 0,
-                heaps: Vec::new(),
-            });
-        }
+        posts
+            .managers
+            .extend([Posted::new(1, 3), Posted::new(2, 3)]);
         assert_eq!(posts.post(1, &[[100, 10]]), [[100, 10]]);
-        assert_eq!(posts.post(2, &[[300, 30]]), [[400, 40]]);
-        assert_eq!(posts.post(1, &[[100, 10]]), [[400, 40]]);
-        assert_eq!(posts.post(2, &[[300, 30]]), [[400, 40]]);
-        // 2 stops: 1's next post still follows a post of 2, the one after it does not.
+        // 2 posts once for every two posts of 1.
+        for _ in 0..3 {
+            assert_eq!(posts.post(2, &[[300, 30]]), [[400, 40]]);
+            assert_eq!(posts.post(1, &[[100, 10]]), [[400, 40]]);
+            assert_eq!(posts.post(1, &[[100, 10]]), [[400, 40]]);
+        }
+        // 2 stops: 1 counts what 2 gives back for its period.
         assert_eq!(posts.post(1, &[[100, 10]]), [[400, 40]]);
         assert_eq!(posts.post(1, &[[100, 10]]), [[400, 10]]);
         assert_eq!(posts.post(2, &[[300, 30]]), [[400, 40]]);
