@@ -605,7 +605,8 @@ bool weld_slot(uint v, float3 u, bool claim, out uint slot)
 
 // One thread per generated vertex on a patch triangle's edge: its slot keeps, of the
 // vertices at its undisplaced point, the one with the lowest hash of its uv and then the lowest
-// index, so the choice does not depend on the order vertices were written in.
+// index, whose displaced position they all take. Indices follow the order the dice allocated
+// vertices in, so where hashes tie the owner can change from frame to frame.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void weld(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)

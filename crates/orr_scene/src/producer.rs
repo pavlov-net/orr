@@ -171,7 +171,10 @@ pub struct ProducerDesc<'a> {
     /// `max_patch_clusters` clusters over `max_patch_vertices` vertices, and orr's
     /// tessellator dices their triangles once per frame into the clusters raster and ray
     /// tracing draw: `max_clusters` and `max_vertices` bound those. Patch topologies index
-    /// the patch batch; they build no templates.
+    /// the patch batch; they build no templates. Patch triangles that share an edge, in one
+    /// cluster or two, give its end points the same position bits, and the same `previous`
+    /// bits where the batch keeps them: each edge's factor reads both, and ends that differ
+    /// give its two sides different factors and crack it.
     pub tessellated: bool,
     pub max_patch_clusters: u32,
     pub max_patch_vertices: u32,
@@ -190,7 +193,8 @@ pub struct ProducerDesc<'a> {
     pub origin: OriginPolicy,
     /// The batch has a buffer for last frame's positions, which the kernel writes beside
     /// `positions` (vertex i last frame at `previous[i]`); without it motion comes from the
-    /// transform alone.
+    /// transform alone. In a tessellated entry's patch batch, copies of one vertex in
+    /// different clusters hold the same `previous` bits, as they hold the same positions.
     pub previous_positions: bool,
     /// The batch has one u32 user word per vertex.
     pub vertex_user: bool,
