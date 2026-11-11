@@ -18,7 +18,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::blob::{put_table, read, table};
 use crate::{Error, Result, Span};
 
-pub const SCHEMA: u16 = 1;
+pub const SCHEMA: u16 = 2;
 
 /// Bytes per tile.
 pub const TILE_BYTES: usize = 64 << 10;

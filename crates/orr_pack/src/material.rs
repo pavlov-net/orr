@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::mesh::SurfaceClass;
 use crate::{AssetId, Error, Result};
 
-pub const SCHEMA: u16 = 2;
+pub const SCHEMA: u16 = 3;
 
 /// Roughness below which a lobe carries light on as a caustic instead of scattering it.
 pub const CHAIN_ROUGHNESS: f32 = 0.1;
