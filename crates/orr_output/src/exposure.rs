@@ -56,6 +56,17 @@ impl Default for Exposure {
     }
 }
 
+impl Exposure {
+    /// The pre-exposure a view is lit with before it has adapted: on its first render and on
+    /// a camera cut's frame.
+    pub fn reference(&self) -> f32 {
+        exposure_from_ev100(match self {
+            Self::Manual { ev100 } => *ev100,
+            Self::Auto(auto) => auto.reference_ev100,
+        })
+    }
+}
+
 /// Auto exposure: a histogram of the view's luminance in EV100, optionally mixed with the
 /// scene's sky statistics, keyed to [`MID_GRAY`] through the compensation curve and adapted
 /// over real time.
@@ -63,12 +74,17 @@ impl Default for Exposure {
 /// Exposures are EV100 as [`ev100_from_exposure`] gives them. A scene metered at EV100 `m`
 /// with no compensation is exposed at `keyed_ev100(m, 0.0)`, about `m - 0.79`.
 ///
-/// A view's first metered frames, and the frames after a camera cut, snap to
-/// the target until two snaps agree within half a stop. A frame with nothing to meter (all
-/// black) holds the exposure, so a black first frame leaves the view waiting for one with
-/// light.
+/// A view's first render, and a camera cut's frame, are lit at `reference_ev100`; the first
+/// of them with light to meter takes the target as its exposure, and every later frame
+/// adapts. A frame with nothing to meter (all black) holds the exposure, so a black first
+/// frame leaves the view waiting for one with light.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutoExposure {
+    /// The exposure a view is lit with until it has metered a frame. Lit at exposure `s`,
+    /// RGBA16F holds luminance from `2^-24 / s` to the HDR ceiling's `16384 / s`: at the
+    /// default, scene EV100 from about -18 to 20. Light above that meters as the top, and
+    /// light below it is black.
+    pub reference_ev100: f32,
     /// The histogram's range of scene EV100; luminance outside it counts in the end bins.
     pub range_ev100: RangeInclusive<f32>,
     /// The exposure window: the target and the adapted exposure stay inside it every frame.
@@ -95,6 +111,7 @@ pub struct AutoExposure {
 impl Default for AutoExposure {
     fn default() -> Self {
         Self {
+            reference_ev100: 3.0,
             range_ev100: -12.0..=20.0,
             clamp_ev100: -12.0..=20.0,
             filter: 0.10..=0.90,

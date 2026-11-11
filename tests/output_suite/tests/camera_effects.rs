@@ -2007,7 +2007,6 @@ mod lens_distortion {
                         extent: OUT,
                         view: self.constants.gpu(),
                         sky: self.sky.gpu(),
-                        camera_cut: false,
                         frame: self.frame,
                         output: &output,
                     },

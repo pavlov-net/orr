@@ -19,8 +19,8 @@ pub const WHITE_BALANCE_DUV: f32 = 0.05;
 /// `virtual_light_nits` that is not weighted, so dim scenes stay near D65. The white point
 /// is held within [`WHITE_BALANCE_CCT`] and [`WHITE_BALANCE_DUV`] of the locus, and moves
 /// toward that target in CIE 1960 uv, closing `1 - exp(-speed * dt)` of the distance a
-/// frame. Cuts, the view's first frame with light, and frames on which auto exposure snaps
-/// snap the white point too. Frames with nothing to meter hold it.
+/// frame. The view's first frame with light, and a camera cut's, take the target as the white
+/// point. Frames with nothing to meter hold it.
 ///
 /// With [`crate::Exposure::Manual`], the meter still runs for the chromaticity, over
 /// [`crate::AutoExposure::default`]'s range and filter.

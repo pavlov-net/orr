@@ -42,12 +42,14 @@ pub fn offers_hdr(display: &orr_output::Display) -> bool {
 /// One view rendered frame by frame: its exposure slots and view constants, a radiance
 /// image lit from per-pixel luminance with the current pre-exposure (`synth.slang`), the
 /// exposure passes and, on request, glare, tonemap into an RGBA16F display-linear image and
-/// the view's screenshot, recorded where a renderer records them. Every frame is waited on.
+/// the view's screenshot, recorded where a renderer records them. Its first frame is a
+/// camera cut. Every frame is waited on.
 pub struct Harness {
     kernels: OutputKernels,
     synth: ComputePipeline,
     output: OutputView,
     exposure: Allocation<ExposureState>,
+    exposure_start: Allocation<ExposureState>,
     constants: Allocation<ViewConstants>,
     synth_root: Allocation<synth::Root>,
     luminance: Allocation<f32>,
@@ -99,17 +101,8 @@ impl Harness {
         let exposure = gpu
             .gpu_malloc::<ExposureState>(MemoryKind::DeviceLocal, 2, "exposure slots")
             .unwrap();
-        let mut init = gpu
-            .gpu_malloc::<ExposureState>(MemoryKind::Upload, 2, "exposure init")
-            .unwrap();
-        init.as_mut_slice().unwrap().fill(ExposureState {
-            pre_exposure: 1.0,
-            prev_pre_exposure: 1.0,
-            ..ExposureState::default()
-        });
         let queue = gpu.queue(QueueKind::Render).unwrap();
         let mut list = queue.command_list().unwrap();
-        list.copy(exposure.gpu().cast(), init.gpu().cast(), exposure.size());
         list.discard(&radiance);
         list.discard(&linear);
         wait(queue.submit(vec![list], &[]).unwrap());
@@ -125,6 +118,9 @@ impl Harness {
             synth: gpu.create_compute_pipeline(&stage, "synth").unwrap(),
             output: OutputView::new(gpu, 2).unwrap(),
             exposure,
+            exposure_start: gpu
+                .gpu_malloc(MemoryKind::Upload, 2, "exposure start")
+                .unwrap(),
             constants: gpu
                 .gpu_malloc(MemoryKind::Upload, 1, "view constants")
                 .unwrap(),
@@ -151,7 +147,7 @@ impl Harness {
             glare: None,
             sensor_height_mm: orr_scene::Lens::default().sensor_height_mm,
             composite: None,
-            cut_next: false,
+            cut_next: true,
             screenshot_next: None,
         }
     }
@@ -181,7 +177,8 @@ impl Harness {
         self.sky.as_mut_slice().unwrap()[0] = sky;
     }
 
-    /// Makes the next [`Self::frame`] a camera cut.
+    /// Makes the next [`Self::frame`] a camera cut: its exposure state starts over at the
+    /// output's reference pre-exposure, as a renderer starts it.
     pub fn cut_next(&mut self) {
         self.cut_next = true;
     }
@@ -235,6 +232,22 @@ impl Harness {
 
         let queue = gpu.queue(QueueKind::Render).unwrap();
         let mut list = queue.command_list().unwrap();
+        if cut {
+            let pre_exposure = output.exposure.reference();
+            self.exposure_start
+                .as_mut_slice()
+                .unwrap()
+                .fill(ExposureState {
+                    pre_exposure,
+                    prev_pre_exposure: pre_exposure,
+                    ..ExposureState::default()
+                });
+            list.copy(
+                self.exposure.gpu().cast(),
+                self.exposure_start.gpu().cast(),
+                self.exposure.size(),
+            );
+        }
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         let groups = [self.extent[0].div_ceil(8), self.extent[1].div_ceil(8), 1];
         list.dispatch(&self.synth, self.synth_root.gpu(), groups);
@@ -265,7 +278,6 @@ impl Harness {
                     extent: self.extent,
                     view,
                     sky: self.sky.gpu(),
-                    camera_cut: cut,
                     frame: self.frame,
                     output,
                 },

@@ -2321,6 +2321,35 @@ impl<'a> Frame<'a> {
         self.output.is_some()
     }
 
+    /// Starts the exposure state of view `history` over, as a new history's is but lit with
+    /// `pre_exposure`: nothing metered, nothing adapted. Call it before the view's
+    /// [`Self::raster_view`] of this frame, which then reads it.
+    pub fn restart_exposure(&mut self, history: ViewHistoryId, pre_exposure: f32) -> Result<()> {
+        self.ensure_updated()?;
+        let history = self
+            .core
+            .histories
+            .get(history.0 as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Error::UnknownViewHistory(history))?;
+        let state = ExposureState {
+            pre_exposure,
+            prev_pre_exposure: pre_exposure,
+            ..ExposureState::default()
+        };
+        let window = &self.core.windows[self.window];
+        let source = window.put(self.device, &[state; 2])?;
+        let list = self.list.as_mut().expect("frame list");
+        list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+        list.copy(
+            history.exposure.gpu().cast(),
+            source.cast(),
+            history.exposure.size(),
+        );
+        list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
+        Ok(())
+    }
+
     /// Step 4, the raster half of a view: writes its `ViewConstants`, culls and rasters the
     /// scene into the visibility buffer, resolves the G-buffer, depth, motion and HZB, and
     /// moves its history on. Lays out the view's arena with the raster's transient targets

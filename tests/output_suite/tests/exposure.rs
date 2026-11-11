@@ -13,15 +13,11 @@ use output_suite::{Harness, adapt_step, keyed, natural_image, window_mean_ev100}
 const SIDE: u32 = 128;
 const FILTER: (f64, f64) = (0.10, 0.90);
 
-/// A cut, then four frames: enough for the view to find light through underflow, snap until
-/// two snaps agree, and adapt.
+/// A cut, whose frame sets the exposure, and a frame lit with it.
 fn settle(h: &mut Harness, scale: f32, output: &ViewOutput) -> ExposureTelemetry {
     h.cut_next();
-    let mut t = h.frame(scale, output, None);
-    for _ in 0..4 {
-        t = h.frame(scale, output, None);
-    }
-    t
+    h.frame(scale, output, None);
+    h.frame(scale, output, None)
 }
 
 /// Exposed stops away from MID_GRAY of luminance `nits` at telemetry `t`.
@@ -30,13 +26,14 @@ fn stops_from_mid_gray(nits: f32, t: &ExposureTelemetry) -> f32 {
 }
 
 #[test]
-fn uniform_field_converges_to_mid_gray_after_a_cut() {
+fn a_cut_shows_a_uniform_field_at_mid_gray_on_its_own_frame() {
     let mut h = Harness::new(SIDE, SIDE);
-    // Alternating extremes, so a cut's first frame is lit with a pre-exposure many stops off:
-    // the bright scenes clip at the HDR ceiling and the dark ones underflow RGBA16F.
+    // Alternating extremes: lit with the exposure of the scene before it, a cut's frame would
+    // clip the bright scenes at the HDR ceiling and underflow RGBA16F on the dark ones.
     for nits in [1e-4f32, 1e5, 1e-2, 1e3, 1e-3, 1e4, 0.1, 100.0, 1.0, 10.0] {
         h.set_image(&vec![nits; h.pixels()]);
-        let t = settle(&mut h, 1.0, &ViewOutput::default());
+        h.cut_next();
+        let t = h.frame(1.0, &ViewOutput::default(), None);
         let off = stops_from_mid_gray(nits, &t);
         assert!(off.abs() < 0.01, "{nits} cd/m2: {off} stops from mid gray");
     }
@@ -75,10 +72,8 @@ fn black_first_frames_do_not_initialize() {
         assert_eq!(t.metered_ev100, None);
         assert_eq!(t.adapted_ev100, 0.0);
     }
-    // The first frame with light snaps to it, lit with the pre-exposure the black frames
-    // raised, and the next corrects that snap.
-    let t = h.frame(1.0, &auto, None);
-    assert_eq!(t.adapted_ev100, t.target_ev100);
+    // The first frame with light, lit at the reference the black frames kept, takes its
+    // target.
     let t = h.frame(1.0, &auto, None);
     let off = stops_from_mid_gray(nits, &t);
     assert!(off.abs() < 0.01, "{off} stops from mid gray");
@@ -190,7 +185,8 @@ fn references_match_the_cpu_mix() {
         }),
         ..ViewOutput::default()
     };
-    let t = settle(&mut h, 1.0, &two);
+    h.cut_next();
+    let t = h.frame(1.0, &two, None);
     let long_term = f64::from(t.long_term_ev100);
     assert!((long_term - expected).abs() < 0.05);
     // The histogram alone keys about 4.5 stops darker than the mix.
@@ -330,7 +326,7 @@ fn a_history_unaware_of_pre_exposure_shows_no_flash() {
     };
     let auto = AutoExposure::default();
     let fastest = auto.speed_brighten.max(auto.speed_darken) * h.dt;
-    // The history starts once the cut's snaps have settled.
+    // The history starts on frames lit with the exposure the cut set.
     settle(&mut h, 1.0, &output);
     h.history = 0.9;
     h.frame(1.0, &output, Some(&display));

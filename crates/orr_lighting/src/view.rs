@@ -685,7 +685,7 @@ impl LightingView {
     /// Starts the view's frame and settles its history reset. A camera cut (`desc.camera_cut`),
     /// a camera jump past `lighting.guides.camera_jump` since the view's last frame, a change of
     /// scene or output extent, the view's first frame and [`SceneLighting::reset_history`] since
-    /// the view's last frame each set it. A camera cut also snaps exposure, and ray
+    /// the view's last frame each set it. A camera cut also starts exposure over, and ray
     /// reconstruction's history is in pre-exposed units. Call once per frame, after the scene's
     /// [`SceneLighting::record`] and before the view's lighting records; returns
     /// [`Self::history_reset`].

@@ -213,9 +213,10 @@ pub struct LitView<'a> {
     pub projection: Projection,
     pub lens: Lens,
     /// A camera cut: the previous camera is taken to be this one; motion blur shows nothing,
-    /// frame generation, ray reconstruction and lighting drop their history, auto exposure and
-    /// white balance snap. A view's first render, its first on another scene and its first after
-    /// [`SceneWriter::reset_lighting_history`] are cuts without it.
+    /// frame generation, ray reconstruction and lighting drop their history, and exposure and
+    /// white balance start over: the frame is lit at [`Exposure::reference`] and shown at the
+    /// exposure and white point it meters. A view's first render, its first on another scene
+    /// and its first after [`SceneWriter::reset_lighting_history`] are cuts without it.
     pub camera_cut: bool,
     /// Menus and loading screens: frame generation is told the frame shows no scene.
     pub not_rendering_scene: bool,
@@ -1386,6 +1387,10 @@ impl<'a> Frame<'a> {
         if set.any() {
             requests.extend(orr_output::hook_requests(extent));
         }
+        if desc.camera_cut {
+            self.scenes
+                .restart_exposure(view.history, output.exposure.reference())?;
+        }
         let raster = self.scenes.raster_view_with(&desc, &requests)?;
         let gpu = self.output.device.clone();
         if let Some(at) = take_probe(&mut self.probes, view.history) {
@@ -1619,7 +1624,6 @@ impl<'a> Frame<'a> {
                 extent,
                 view: raster.view,
                 sky: raster.sky_stats,
-                camera_cut: desc.camera_cut,
                 frame: id,
                 output,
             },

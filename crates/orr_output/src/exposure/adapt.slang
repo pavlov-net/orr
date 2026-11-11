@@ -14,17 +14,15 @@ import orr_output.exposure;
 static const uint MODE_MANUAL = 0;
 static const uint MODE_AUTO = 1;
 
-// ExposureState::initialized: 0 before the first metered frame, 1 after a snap, 2 adapting.
-// After a snap the next metered frame, lit with the snapped pre-exposure, snaps again; the
-// view adapts once two snaps agree, so a snap metered through clipping or RGBA16F underflow
-// is corrected.
-static const float SNAPS_AGREE_EV = 0.5;
-// A frame with nothing to meter may hide light that underflowed RGBA16F. Pre-exposure does
-// not show on a black frame, so it rises by this many stops a frame to find it.
-static const float SEARCH_STOPS = 8.0;
+// ExposureState::initialized: 0 until a frame sets the exposure, which a view's first frame
+// with something to meter does by taking the target, then 1. A camera cut starts the state
+// over before the frame is lit.
 static const uint STATE_UNSET = 0;
-static const uint STATE_SNAPPED = 1;
-static const uint STATE_ADAPTING = 2;
+static const uint STATE_ADAPTING = 1;
+// An adapting view's frame with nothing to meter may hide light that underflowed RGBA16F.
+// Pre-exposure does not show on a black frame, so it rises by this many stops a frame to
+// find it.
+static const float SEARCH_STOPS = 8.0;
 // The white point's range: correlated color temperature and distance from the locus.
 static const float CCT_MIN = 2500.0;
 static const float CCT_MAX = 7000.0;
@@ -34,7 +32,6 @@ public struct AdaptParams
 {
     public uint mode;
     public float manual_ev100;
-    public uint cut;
     public uint physiological;
     // Histogram range: EV100 at the bottom of bin 0 and EV per bin.
     public float ev_min;
@@ -67,6 +64,7 @@ public struct AdaptParams
     public float white_directional;
     public uint _pad0;
     public uint _pad1;
+    public uint _pad2;
 }
 
 // What adapt read and wrote for one render, read back by the CPU.
@@ -238,7 +236,6 @@ void main()
     sky.directional = float4(0.0);
     if (root.sky != nullptr)
         sky = *root.sky;
-    bool cut = p.cut != 0;
 
     bool white = p.white_balance != 0;
     Metered m = { 0.0, 0.0, D65_XY };
@@ -252,14 +249,13 @@ void main()
 
     ExposureState next = cur;
     next.prev_pre_exposure = cur.pre_exposure;
-    bool snap = cut || cur.initialized != STATE_ADAPTING;
+    bool snap = cur.initialized == STATE_UNSET;
     bool hold = false;
     if (p.mode == MODE_MANUAL)
     {
         next.adapted_ev100 = p.manual_ev100;
         next.target_ev100 = p.manual_ev100;
         next.long_term_ev100 = p.manual_ev100;
-        snap = cut || cur.initialized == STATE_UNSET;
         next.initialized = STATE_ADAPTING;
     }
     else if (metered)
@@ -282,25 +278,28 @@ void main()
         next.adapted_ev100 = clamp(adapted, p.clamp_min, p.clamp_max);
         next.target_ev100 = clamp(target, p.clamp_min, p.clamp_max);
         next.long_term_ev100 = long_term;
-        bool agree = !cut && cur.initialized == STATE_SNAPPED
-            && abs(next.adapted_ev100 - cur.adapted_ev100) < SNAPS_AGREE_EV;
-        next.initialized = snap && !agree ? STATE_SNAPPED : STATE_ADAPTING;
+        next.initialized = STATE_ADAPTING;
     }
     else
     {
-        // Nothing to meter: hold the exposure, snap at the next metered frame after a cut,
-        // and search upward with the pre-exposure, no further than the exposure that keys
-        // the bottom of the histogram.
+        // Nothing to meter: hold the exposure. A view that has set none stays at the
+        // pre-exposure it started with, so its first metered frame is lit there; an adapting
+        // one searches upward, no further than the exposure that keys the bottom of the
+        // histogram.
         hold = true;
-        if (cut)
-            next.initialized = STATE_UNSET;
-        float highest = exposure_from_ev100(keyed(p, p.ev_min));
-        next.pre_exposure = max(cur.pre_exposure, min(cur.pre_exposure * exp2(SEARCH_STOPS), highest));
+        if (!snap)
+        {
+            float highest = exposure_from_ev100(keyed(p, p.ev_min));
+            next.pre_exposure = max(cur.pre_exposure, min(cur.pre_exposure * exp2(SEARCH_STOPS), highest));
+        }
     }
 
     // Pre-exposure follows the adapted exposure every frame. Ray reconstruction neither
-    // rescales its history nor takes the pre-exposure, so a step in it shows as a flash;
-    // the histories orr keeps rescale by `pre_exposure / prev_pre_exposure`.
+    // rescales its history nor takes the pre-exposure, so a step in it shows as a flash
+    // through a full history. The one step a view takes, from where it started to its first
+    // exposure, comes a frame after it started: at a camera cut, a frame after ray
+    // reconstruction's reset. The histories orr keeps rescale by
+    // `pre_exposure / prev_pre_exposure`.
     if (!hold)
         next.pre_exposure = exposure_from_ev100(next.adapted_ev100);
 
@@ -317,8 +316,6 @@ void main()
             : xy_from_uv_1960(lerp(uv_1960_from_xy(cur.white_point_xy), uv_1960_from_xy(white_target_xy),
                               1.0 - exp(-p.white_speed * dt)));
     }
-    else if (cut)
-        next.white_point_xy = float2(0.0);
     bool balanced = next.white_point_xy.y > 0.0;
     float3x3 balance = balanced ? cat16_rec2020(next.white_point_xy, D65_XY)
                                 : float3x3(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);

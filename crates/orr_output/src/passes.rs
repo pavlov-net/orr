@@ -314,14 +314,13 @@ pub struct ExposurePass<'a> {
     /// The view's pre-exposed radiance, linear Rec.2020.
     pub source: TextureIndex,
     pub extent: [u32; 2],
-    /// The render's view constants: the exposure slots and `delta_time`.
+    /// The render's view constants: the exposure slots and `delta_time`. A view whose
+    /// exposure state is unset, as a new one's and a camera cut's is, takes its targets for
+    /// its exposure, its long-term stage and its white point on its first frame with light.
     pub view: GpuPtr<ViewConstants>,
     /// The scene's sky statistics, for multi-reference metering and telemetry; null without
     /// a scene.
     pub sky: GpuPtr<SkyStats>,
-    /// A camera cut: auto exposure snaps to the target and resets its long-term stage, and auto
-    /// white balance snaps to its target.
-    pub camera_cut: bool,
     /// orr's frame id, which the telemetry carries.
     pub frame: u64,
     pub output: &'a ViewOutput,
@@ -648,7 +647,7 @@ impl OutputKernels {
                 let params = AdaptParams {
                     mode: 0,
                     manual_ev100: *ev100,
-                    ..adapt_params(&default_meter, pass.camera_cut)
+                    ..adapt_params(&default_meter)
                 };
                 let metered = output.white_balance.is_some() || local.is_some();
                 (params, metered.then_some(&default_meter))
@@ -663,7 +662,7 @@ impl OutputKernels {
                     roots.compensation =
                         Some((auto.compensation.clone(), auto.range_ev100.clone()));
                 }
-                (adapt_params(auto, pass.camera_cut), Some(auto))
+                (adapt_params(auto), Some(auto))
             }
         };
         if let Some(white) = &output.white_balance {
@@ -1118,14 +1117,13 @@ const HISTOGRAM_ONLY: MeterWeights = MeterWeights {
     directional: 0.0,
 };
 
-fn adapt_params(auto: &AutoExposure, cut: bool) -> AdaptParams {
+fn adapt_params(auto: &AutoExposure) -> AdaptParams {
     let range = &auto.range_ev100;
     let weights = auto.references.unwrap_or(HISTOGRAM_ONLY);
     let long = auto.physiological.unwrap_or_default();
     AdaptParams {
         mode: 1,
         manual_ev100: 0.0,
-        cut: u32::from(cut),
         physiological: u32::from(auto.physiological.is_some()),
         ev_min: *range.start(),
         bin_ev: (range.end() - range.start()) / HISTOGRAM_BINS as f32,
