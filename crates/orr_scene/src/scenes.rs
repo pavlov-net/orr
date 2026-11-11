@@ -1024,7 +1024,7 @@ impl Scenes {
 
     /// Holds back the binds that finish tile moves, as a loading thread busy binding does, or
     /// lets them go.
-    #[cfg(feature = "testing")]
+    #[cfg(feature = "test-hooks")]
     pub fn hold_tile_binds(&mut self, hold: bool) {
         self.core.mounts.streaming.hold_tile_binds(hold);
     }

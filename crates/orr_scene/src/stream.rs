@@ -551,7 +551,7 @@ pub(crate) struct Streaming {
     /// The tiles bound to new slots whose copy back is in `moves`.
     tile_finished: FxHashSet<Key>,
     /// A test holds the binds of moving tiles back, as a busy loading thread does.
-    #[cfg(feature = "testing")]
+    #[cfg(feature = "test-hooks")]
     tile_binds_held: bool,
     /// Whether the render queue takes the sparse binds that move tiles.
     moves_tiles: bool,
@@ -703,7 +703,7 @@ impl Streaming {
             moves: Vec::new(),
             tile_moves: None,
             tile_finished: FxHashSet::default(),
-            #[cfg(feature = "testing")]
+            #[cfg(feature = "test-hooks")]
             tile_binds_held: false,
             moves_tiles: device.binds_sparse_on(QueueKind::Render),
             retired_tile_slots: Vec::new(),
@@ -2151,7 +2151,7 @@ impl Streaming {
         device: &Device,
     ) -> Result<Vec<TimelinePoint>> {
         let mut points = Vec::new();
-        #[cfg(feature = "testing")]
+        #[cfg(feature = "test-hooks")]
         if self.tile_binds_held {
             return Ok(points);
         }
@@ -2422,7 +2422,7 @@ impl Streaming {
         })
     }
 
-    #[cfg(feature = "testing")]
+    #[cfg(feature = "test-hooks")]
     pub(crate) fn hold_tile_binds(&mut self, hold: bool) {
         self.tile_binds_held = hold;
     }

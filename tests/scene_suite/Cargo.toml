@@ -8,7 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-orr_scene = { workspace = true, features = ["testing"] }
+orr_scene = { workspace = true, features = ["testing", "test-hooks"] }
 orr_gpu.workspace = true
 orr_shaders.workspace = true
 orr_math.workspace = true
