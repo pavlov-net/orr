@@ -111,8 +111,8 @@ struct Clusters {
     list: Vec<DagCluster>,
     /// Welded vertex per cluster vertex, for the attributes.
     verts: Vec<u32>,
-    /// Welded vertex that places each cluster vertex, by its skin, where the mesh has skin;
-    /// empty otherwise.
+    /// Welded vertex that places each cluster vertex, by its skin; empty where each vertex's
+    /// is its own `verts` one.
     placing: Vec<u32>,
     /// Grid position per cluster vertex, as emitted.
     cells: Vec<[i32; 3]>,
@@ -812,6 +812,9 @@ fn group_of(
             }
             push(&mut out, run[0].0, refined, &used[..nv], &corners[..nc]);
         }
+    }
+    if out.placing == out.verts {
+        out.placing = Vec::new();
     }
     let b = e.bounds;
     DagGroup {
