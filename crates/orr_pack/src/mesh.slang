@@ -73,8 +73,8 @@ public struct Cluster
     public half deformation_bound; // m
     public half displacement_min;  // m
     public half displacement_max;  // m
-    public float2 uv_offset[2];    // per uv set
-    public float2 uv_scale[2];
+    public float2 uv_offset[2];    // per uv set: a uv is uv_offset + q x uv_step, exactly
+    public float2 uv_step[2];      // powers of two
     public uint omm_first;         // bytes from omm_offset
     public float area;             // m^2
     public half min_thickness;     // m
@@ -190,7 +190,7 @@ public float3 load_position(uint8_t* page, PageHeader h, Cluster c, uint i, floa
 
 float2 load_uv(uint q, Cluster c, uint set)
 {
-    return c.uv_offset[set] + unpack_unorm2x16(q) * c.uv_scale[set];
+    return c.uv_offset[set] + float2(q & 0xFFFF, q >> 16) * c.uv_step[set];
 }
 
 // `attributes` is the mesh's `MeshHeader.attributes`.

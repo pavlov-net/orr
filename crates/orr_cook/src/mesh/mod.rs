@@ -1450,17 +1450,22 @@ const IDENTITY: [u32; MAX_CLUSTER_VERTICES] = {
     a
 };
 
-/// A cluster's uvs of one set as the page stores them: unorm16 over the cluster's uv range.
+/// A cluster's uvs of one set as the page stores them: per axis the point `offset + q x step`
+/// nearest each uv, q a u16, `step` a power of two and `offset` a multiple of it. Every point
+/// is exact in f32, and the points of two clusters' grids nest.
 #[derive(Copy, Clone)]
 struct ClusterUvs {
     offset: [f32; 2],
-    scale: [f32; 2],
+    step: [f32; 2],
 }
+
+/// Log2 of the finest uv step: a finer one is a subnormal float, which a GPU may flush to zero.
+const UV_STEP_LOG2_MIN: i32 = -126;
 
 impl ClusterUvs {
     const ZERO: Self = Self {
         offset: [0.0; 2],
-        scale: [0.0; 2],
+        step: [0.0; 2],
     };
 
     fn new(uvs: &[[f32; 2]], verts: &[u32]) -> Self {
@@ -1470,29 +1475,57 @@ impl ClusterUvs {
                 let uv = Vec2::from(uvs[v as usize]);
                 (lo.min(uv), hi.max(uv))
             });
+        let axes = [0, 1].map(|a| uv_grid(lo[a], hi[a]));
         Self {
-            offset: lo.to_array(),
-            scale: (hi - lo).to_array(),
+            offset: axes.map(|g| g.0),
+            step: axes.map(|g| g.1),
         }
     }
 
     fn quantize(&self, uv: [f32; 2]) -> [u32; 2] {
         [0, 1].map(|a| {
-            if self.scale[a] > 0.0 {
-                ((uv[a] - self.offset[a]) / self.scale[a] * 65535.0)
-                    .round()
-                    .clamp(0.0, 65535.0) as u32
-            } else {
-                0
-            }
+            let step = f64::from(self.step[a]);
+            (nearest(f64::from(uv[a]), step) - f64::from(self.offset[a]) / step) as u32
         })
     }
 
     /// The uv a page reader decodes for `uv`.
     fn stored(&self, uv: [f32; 2]) -> [f32; 2] {
         let q = self.quantize(uv);
-        [0, 1].map(|a| self.offset[a] + q[a] as f32 / 65535.0 * self.scale[a])
+        [0, 1].map(|a| self.offset[a] + q[a] as f32 * self.step[a])
     }
+}
+
+/// The offset and step of the finest grid of power-of-two step, at least
+/// `2^`[`UV_STEP_LOG2_MIN`], on which `lo..=hi` rounded to the nearest point spans at most
+/// 65535 steps from the multiple of the step at or below `lo`.
+fn uv_grid(lo: f32, hi: f32) -> (f32, f32) {
+    let (lo, hi) = (f64::from(lo), f64::from(hi));
+    // A span under 2^(n + 1) needs a step of at least 2^(n - 16).
+    let mut k = if hi > lo {
+        ((hi - lo).log2().floor() as i32 - 17).max(UV_STEP_LOG2_MIN)
+    } else {
+        UV_STEP_LOG2_MIN
+    };
+    loop {
+        let step = 2f64.powi(k);
+        let first = (lo / step).floor().max(-largest(step));
+        if nearest(hi, step) - first <= 65535.0 {
+            return ((first * step) as f32, step as f32);
+        }
+        k += 1;
+    }
+}
+
+/// The multiple of `step`, a power of two, nearest `v` among those f32 holds, in steps: the
+/// nearest one of a value within half a step of the f32 range lies past it.
+fn nearest(v: f64, step: f64) -> f64 {
+    (v / step).round().clamp(-largest(step), largest(step))
+}
+
+/// The largest multiple of `step` f32 holds, in steps.
+fn largest(step: f64) -> f64 {
+    (f64::from(f32::MAX) / step).floor()
 }
 
 /// f16 bits of the smallest half at or above `v`.
@@ -1782,7 +1815,7 @@ fn build_cluster(
         flags: flags & (Section::CLASS_MASK | Section::SOLID),
         local_max,
         uv_offset: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.offset)),
-        uv_scale: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.scale)),
+        uv_step: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.step)),
         omm_first: Cluster::NO_OMM,
         area: area as f32,
         from_group: Cluster::SOURCE,

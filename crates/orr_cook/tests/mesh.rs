@@ -378,8 +378,8 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
                     assert!(Vec3::from_slice(&tan).dot(Vec3::from_slice(&st)) > 0.99999);
                     assert_eq!(tan[3], st[3]);
                     let uv = view.uv(&c, v, 0);
-                    for ((got, want), scale) in uv.iter().zip(p.uv[sv]).zip(c.uv_scale[0]) {
-                        assert!((got - want).abs() <= scale / 65535.0 * 0.5 + 1e-6);
+                    for ((got, want), step) in uv.iter().zip(p.uv[sv]).zip(c.uv_step[0]) {
+                        assert!((got - want).abs() <= 0.5 * step);
                     }
                 }
             }
@@ -693,4 +693,91 @@ fn a_uv_set_the_mesh_lacks_reads_zero() {
         "{warnings:?}"
     );
     assert!(!library_tangents(&a).is_empty());
+}
+
+/// Uvs on whole numbers stay on them, whatever clusters they fall in: a strip across u = 1 to
+/// u = 6, its other uvs off any power-of-two grid, read back each whole u exactly and every
+/// other uv within half its cluster's step.
+#[test]
+fn whole_uvs_inside_a_cluster_are_exact() {
+    let columns = 61;
+    let u = |i: u32| {
+        let u = 0.3 + 0.1 * f64::from(i);
+        (if (u - u.round()).abs() < 1e-9 {
+            u.round()
+        } else {
+            u
+        }) as f32
+    };
+    let v = [0.15f32, 0.85];
+    let mut input = MeshInput::default();
+    let mut uvs = Vec::new();
+    for i in 0..columns {
+        for (row, &v) in v.iter().enumerate() {
+            input.positions.push(Vec3::new(u(i), row as f32, 0.0));
+            input.normals.push(Vec3::Z);
+            uvs.push([u(i), v].into());
+        }
+    }
+    input.uvs = Some(uvs);
+    for i in 0..columns - 1 {
+        let c = 2 * i;
+        input.indices.extend([c, c + 2, c + 1, c + 1, c + 2, c + 3]);
+    }
+    input.sections = vec![Span {
+        first: 0,
+        count: input.indices.len() as u32,
+    }];
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            vec![AssetSpec {
+                name: "m".into(),
+                source: Source::Mesh {
+                    mesh: input,
+                    materials: vec![Material::default()],
+                    settings: MeshSettings {
+                        max_triangles: 16,
+                        ..MeshSettings::default()
+                    },
+                },
+            }],
+        )],
+    };
+    let mut cooked = orr_cook::cook(&manifest, &Default::default()).unwrap();
+    let a = Archive::from_memory(cooked.memory.remove(0)).unwrap();
+    let blobs = a.blobs(a.find(AssetId::from_name("m/mesh")).unwrap());
+    let info = MeshInfo::parse(&read_blob(&a, &blobs[0])).unwrap();
+    let (mut whole, mut clusters) = (0, 0);
+    for page in &info.pages {
+        let mut resident = vec![0; page.resident_len as usize];
+        mesh::decode_page(&read_blob(&a, &blobs[page.blob as usize]), &mut resident).unwrap();
+        let view = PageView::new(&resident, &info.header).unwrap();
+        for ci in 0..view.cluster_count() {
+            let c = view.cluster(ci);
+            clusters += 1;
+            for k in 0..u32::from(c.vertex_count) {
+                let [x, y, _] = view.position(&c, k);
+                let i = (0..columns).find(|&i| (u(i) - x).abs() < 1e-3).unwrap();
+                let want = [u(i), v[y.round() as usize]];
+                let got = view.uv(&c, k, 0);
+                if want[0] == want[0].round() {
+                    assert_eq!(got[0], want[0], "cluster {ci} vertex {k}");
+                    whole += 1;
+                }
+                for a in 0..2 {
+                    let step = c.uv_step[0][a];
+                    assert!(step.log2().fract() == 0.0, "{step}");
+                    assert!(
+                        (got[a] - want[a]).abs() <= 0.5 * step,
+                        "cluster {ci} vertex {k}: {got:?} for {want:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        clusters > 1 && whole >= 12,
+        "{clusters} clusters, {whole} whole uvs"
+    );
 }

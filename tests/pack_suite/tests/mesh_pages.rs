@@ -20,28 +20,26 @@ use pack_suite::{UNWRITTEN, cooked_set_pages, decode_stored, dispatch, read, sto
 const SLOTS: usize = 256;
 
 /// Largest differences between the GPU and CPU float decodes. Integer values (positions,
-/// grid offsets, joints, corners, micromap indices, records) must match exactly; unit
-/// vectors, uvs and weights go through divisions and a square root, which the GPU rounds
-/// differently. Uv differences are relative to the cluster's `|uv_offset| + |uv_scale|`.
+/// grid offsets, joints, corners, micromap indices, records) and uvs, which are exact sums of
+/// exact products, must match exactly; unit vectors and weights go through divisions and a
+/// square root, which the GPU rounds differently.
 #[derive(Debug, Default)]
 struct Spread {
     unit: f32,
-    uv: f32,
     weight: f32,
 }
 
 impl Spread {
     /// Vulkan allows 2.5 ulp on a division and inherits the square root from
-    /// `inversesqrt`; on 621.01 unit vectors differ by up to 2.5 ulp at 1.0, uvs by 1 ulp and
-    /// weights by half an ulp.
+    /// `inversesqrt`; on 621.01 unit vectors differ by up to 2.5 ulp at 1.0 and weights by half
+    /// an ulp.
     fn assert_within(&self) {
         let bounds = Spread {
             unit: 2f32.powi(-21),
-            uv: 2f32.powi(-22),
             weight: 2f32.powi(-23),
         };
         assert!(
-            self.unit <= bounds.unit && self.uv <= bounds.uv && self.weight <= bounds.weight,
+            self.unit <= bounds.unit && self.weight <= bounds.weight,
             "{self:?} against {bounds:?}"
         );
     }
@@ -105,11 +103,6 @@ fn check(page: &[u8], mesh: &MeshHeader, spread: &mut Spread) {
             bytemuck::bytes_of(&c),
             "cluster {ci}"
         );
-        let uv_scale = |set: usize| {
-            (0..2)
-                .map(|a| c.uv_offset[set][a].abs() + c.uv_scale[set][a].abs())
-                .fold(f32::MIN_POSITIVE, f32::max)
-        };
         for v in 0..u32::from(c.vertex_count) {
             let g = &vertices[ci * SLOTS + v as usize];
             let at = format!("cluster {ci} vertex {v}");
@@ -126,9 +119,10 @@ fn check(page: &[u8], mesh: &MeshHeader, spread: &mut Spread) {
             let t = view.tangent(&c, v).unwrap_or([1.0, 0.0, 0.0, 1.0]);
             Spread::add(&mut spread.unit, &g.tangent[..3], &t[..3], 1.0);
             assert_eq!(g.tangent[3], t[3], "{at}: bitangent sign");
-            Spread::add(&mut spread.uv, &g.uv[..2], &view.uv(&c, v, 0), uv_scale(0));
+            let uv = view.uv(&c, v, 0);
+            assert_eq!(g.uv[..2], uv, "{at}: uv set 0");
             if mesh.attributes & MeshHeader::UV1 != 0 {
-                Spread::add(&mut spread.uv, &g.uv[2..], &view.uv(&c, v, 1), uv_scale(1));
+                assert_eq!(g.uv[2..], view.uv(&c, v, 1), "{at}: uv set 1");
             }
             let joints = view.joints(&c, v).unwrap_or_default().map(u32::from);
             assert_eq!(g.joints, joints, "{at}");
@@ -204,6 +198,7 @@ fn synthetic(rng: &mut Rng, clusters: usize, attr_stride: usize, entries: u32) -
             Cluster::NO_OMM
         };
         let reach = (1 << 23) - 65536;
+        let steps = [0; 2].map(|_| [0; 2].map(|_| 2f32.powi(rng.below(24) as i32 - 20)));
         let c = Cluster {
             vertex_first: v0 as u32,
             tri_first: t0 as u32,
@@ -211,8 +206,9 @@ fn synthetic(rng: &mut Rng, clusters: usize, attr_stride: usize, entries: u32) -
             tri_count: tn as u8,
             alpha_first: alpha_first as u8,
             anchor: [0; 3].map(|_| rng.below(2 * reach) as i32 - reach as i32),
-            uv_offset: [0; 2].map(|_| [rng.float(-4.0, 4.0), rng.float(-4.0, 4.0)]),
-            uv_scale: [0; 2].map(|_| [rng.float(0.01, 8.0), rng.float(0.01, 8.0)]),
+            uv_step: steps,
+            uv_offset: [0, 1]
+                .map(|s| steps[s].map(|step| (rng.below(1 << 20) as f32 - 524288.0) * step)),
             omm_first,
             section: i as u16,
             area: rng.float(0.0, 10.0),

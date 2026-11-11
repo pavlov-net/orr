@@ -14,7 +14,7 @@
 //! - Attributes at `attrs_offset`, `attr_stride` bytes per vertex: normal (octahedral, 2x16
 //!   snorm, [`oct_encode`]), tangent when the mesh has [`MeshHeader::TANGENT`] (octahedral, x
 //!   16-bit and y 15-bit snorm with the bitangent sign between them, [`oct_encode_tangent`]),
-//!   uv set 0 (2x16 unorm over the cluster's `uv_offset[0]` and `uv_scale[0]`), uv set 1
+//!   uv set 0 (2x16 steps of the cluster's `uv_step[0]` from its `uv_offset[0]`), uv set 1
 //!   likewise when the mesh has [`MeshHeader::UV1`], with [`MeshHeader::COLOR`] four half
 //!   floats, and with
 //!   [`MeshHeader::SKIN`] joints u8x4 and weights unorm8x4.
@@ -36,7 +36,7 @@ pub use omm::*;
 use crate::blob::{put_table, put_table_aligned, read, table};
 use crate::{Aabb, Error, Result, Span, Sphere};
 
-pub const SCHEMA: u16 = 9;
+pub const SCHEMA: u16 = 10;
 
 /// Largest streamed hierarchy node page. The top page holds what the pinned pages need,
 /// whatever its size.
@@ -371,9 +371,10 @@ pub struct Cluster {
     pub deformation_bound: u16,
     pub displacement_min: u16,
     pub displacement_max: u16,
-    /// Per uv set, the range its 2x16 unorm values span: `offset + q / 65535 x scale`.
+    /// Per uv set, the grid its 2x16 values `q` count on: a uv is `uv_offset + q x uv_step`,
+    /// with `uv_step` a power of two and `uv_offset` a multiple of it, so every uv is exact.
     pub uv_offset: [[f32; 2]; 2],
-    pub uv_scale: [[f32; 2]; 2],
+    pub uv_step: [[f32; 2]; 2],
     /// Byte offset of the cluster's micromap block from `omm_offset`, or [`Self::NO_OMM`].
     pub omm_first: u32,
     /// Triangle area at the cluster's own level, model space, square meters.
@@ -883,7 +884,7 @@ impl<'a> PageView<'a> {
         let at = attr_stride(self.attributes & MeshHeader::TANGENT) - 4 + 4 * set as u32;
         let q = self.attr(c, v, at);
         let q = [q & 0xFFFF, q >> 16];
-        [0, 1].map(|a| c.uv_offset[set][a] + q[a] as f32 / 65535.0 * c.uv_scale[set][a])
+        [0, 1].map(|a| c.uv_offset[set][a] + q[a] as f32 * c.uv_step[set][a])
     }
 
     /// Skeleton joints of a vertex, when the mesh has [`MeshHeader::SKIN`].
