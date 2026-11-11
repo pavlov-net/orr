@@ -6200,7 +6200,7 @@ fn a_copy_tracing_its_built_cut_offsets_its_rays_by_that_cuts_largest_error() {
 
 /// `CutGpu.counters` of the hidden test: spheres tested, clusters it decided.
 const CUT_HIDDEN_TESTS: usize = 29;
-const CUT_HIDDEN_RULES: usize = 31;
+const CUT_HIDDEN_RULES: usize = 23;
 
 /// A still view of the streaming ground that a wall and the frustum hide in part, at a
 /// threshold fine enough that its cut spans many levels. The first frame, with no view yet,

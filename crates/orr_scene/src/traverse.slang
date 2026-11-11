@@ -122,9 +122,8 @@ bool filling()
 // cut's.
 void gather_cluster(CutGpu* cut, SlotCutGpu* c, uint mesh_cluster, bool fixed)
 {
-    InterlockedAdd(cut.counters[CUT_ENTRIES], 1);
-    if (fixed)
-        InterlockedAdd(cut.counters[CUT_ENTRIES_FIXED], 1);
+    if (!fixed)
+        InterlockedOr(cut.counters[CUT_SHEDDABLE], 1);
     uint2 h = cluster_hash(mesh_cluster);
     InterlockedAdd(c.rt_count, 1);
     atomic_add_at(c.rt_hash, 0, h.x);
@@ -467,7 +466,7 @@ void clear(uint3 id: SV_DispatchThreadID)
         cut.keys[id.x].rank = 0xffffffff;
         cut.keys[id.x].collided = 0;
     }
-    if (id.x < 2 * ADMIT_BUCKETS)
+    if (id.x < ADMIT_STOPS)
         cut.admit[id.x] = 0;
     if (id.x < root.models)
         cut.model_cut[id.x] = 0xffffffff;
@@ -1137,6 +1136,29 @@ uint admit_stop(CutGpu* cut, uint level)
     return level == 0 ? cut.counters[CUT_ADMITTED] : cut.admit[ADMIT_STOPS + level - 1];
 }
 
+// The sums of `CutGpu.admit` are 64 bits in two words, low first: a frame's gathered cuts
+// can hold more clusters than 32 bits count, and a sum that wrapped would pass for room.
+
+// Adds `v` to the sum at word `at`.
+void admit_add(CutGpu* cut, uint at, uint v)
+{
+    uint before;
+    InterlockedAdd(cut.admit[at], v, before);
+    if (before + v < before)
+        InterlockedAdd(cut.admit[at + 1], 1);
+}
+
+uint64_t admit_sum(CutGpu* cut, uint at)
+{
+    return uint64_t(cut.admit[at]) | (uint64_t(cut.admit[at + 1]) << 32);
+}
+
+void admit_store(CutGpu* cut, uint at, uint64_t v)
+{
+    cut.admit[at] = uint(v);
+    cut.admit[at + 1] = uint(v >> 32);
+}
+
 // The BLAS builds the cut of owner slot `slot` takes.
 uint cut_jobs(SceneRoot* s, uint slot, SlotCutGpu c)
 {
@@ -1292,21 +1314,20 @@ void own(uint3 id: SV_DispatchThreadID)
     uint jobs = cut_jobs(s, slot, c);
     cut.slots[slot].flags = c.flags | CUT_OWNER;
     uint b = cut_rank(cut, c) >> ADMIT_SHIFT;
-    InterlockedAdd(cut.admit[2 * b], c.rt_count);
-    InterlockedAdd(cut.admit[2 * b + 1], jobs);
-    InterlockedAdd(cut.counters[CUT_CLAS_WANTED], c.rt_count);
-    InterlockedAdd(cut.counters[CUT_JOBS_WANTED], jobs);
+    admit_add(cut, 4 * b, c.rt_count);
+    admit_add(cut, 4 * b + 2, jobs);
 }
 
-groupshared uint g_clas[SELECT_THREADS];
-groupshared uint g_jobs[SELECT_THREADS];
+groupshared uint64_t g_clas[SELECT_THREADS];
+groupshared uint64_t g_jobs[SELECT_THREADS];
 groupshared uint g_first;
 
 // One group, for digit `root.pass` of the keys. Thread t sums `SELECT_SPAN` buckets, thread 0
 // the first, on top of what the cuts before the digit's buckets take; the thread whose buckets
 // a running sum passes its capacity in finds the bucket the capacity runs out in, the earlier
 // of the CLAS's and the builds'. It leaves what the cuts before that bucket take for the next
-// digit, and the buckets empty for `refine`. With room for all, no bucket is found.
+// digit, and the buckets empty for `refine`. With room for all, no bucket is found. The first
+// digit's pass also leaves what all the cuts take in the counters, at most what they count.
 [shader("compute")]
 [numthreads(SELECT_THREADS, 1, 1)]
 void select(uint3 id: SV_GroupThreadID)
@@ -1315,14 +1336,14 @@ void select(uint3 id: SV_GroupThreadID)
     uint level = root.pass;
     uint t = id.x;
     uint first = SELECT_SPAN * t;
-    uint taken_clas = level > 0 ? cut.admit[ADMIT_TAKEN] : 0;
-    uint taken_jobs = level > 0 ? cut.admit[ADMIT_TAKEN + 1] : 0;
-    uint clas = 0;
-    uint jobs = 0;
+    uint64_t taken_clas = level > 0 ? admit_sum(cut, ADMIT_TAKEN) : 0;
+    uint64_t taken_jobs = level > 0 ? admit_sum(cut, ADMIT_TAKEN + 2) : 0;
+    uint64_t clas = 0;
+    uint64_t jobs = 0;
     for (uint i = 0; i < SELECT_SPAN; i++)
     {
-        clas += cut.admit[2 * (first + i)];
-        jobs += cut.admit[2 * (first + i) + 1];
+        clas += admit_sum(cut, 4 * (first + i));
+        jobs += admit_sum(cut, 4 * (first + i) + 2);
     }
     g_clas[t] = clas;
     g_jobs[t] = jobs;
@@ -1331,25 +1352,25 @@ void select(uint3 id: SV_GroupThreadID)
     GroupMemoryBarrierWithGroupSync();
     for (uint d = 1; d < SELECT_THREADS; d *= 2)
     {
-        uint add_clas = t >= d ? g_clas[t - d] : 0;
-        uint add_jobs = t >= d ? g_jobs[t - d] : 0;
+        uint64_t add_clas = t >= d ? g_clas[t - d] : 0;
+        uint64_t add_jobs = t >= d ? g_jobs[t - d] : 0;
         GroupMemoryBarrierWithGroupSync();
         g_clas[t] += add_clas;
         g_jobs[t] += add_jobs;
         GroupMemoryBarrierWithGroupSync();
     }
-    uint above_clas = taken_clas + (t > 0 ? g_clas[t - 1] : 0);
-    uint above_jobs = taken_jobs + (t > 0 ? g_jobs[t - 1] : 0);
+    uint64_t above_clas = taken_clas + (t > 0 ? g_clas[t - 1] : 0);
+    uint64_t above_jobs = taken_jobs + (t > 0 ? g_jobs[t - 1] : 0);
     bool clas_here = above_clas <= cut.clas_capacity && taken_clas + g_clas[t] > cut.clas_capacity;
     bool jobs_here = above_jobs <= cut.job_capacity && taken_jobs + g_jobs[t] > cut.job_capacity;
     if (clas_here || jobs_here)
     {
-        uint to_clas = above_clas;
-        uint to_jobs = above_jobs;
+        uint64_t to_clas = above_clas;
+        uint64_t to_jobs = above_jobs;
         for (uint i = 0; i < SELECT_SPAN; i++)
         {
-            to_clas += cut.admit[2 * (first + i)];
-            to_jobs += cut.admit[2 * (first + i) + 1];
+            to_clas += admit_sum(cut, 4 * (first + i));
+            to_jobs += admit_sum(cut, 4 * (first + i) + 2);
             if (to_clas > cut.clas_capacity || to_jobs > cut.job_capacity)
             {
                 InterlockedMin(g_first, first + i);
@@ -1363,21 +1384,22 @@ void select(uint3 id: SV_GroupThreadID)
     {
         if (first + i == stop)
         {
-            cut.admit[ADMIT_TAKEN] = above_clas;
-            cut.admit[ADMIT_TAKEN + 1] = above_jobs;
+            admit_store(cut, ADMIT_TAKEN, above_clas);
+            admit_store(cut, ADMIT_TAKEN + 2, above_jobs);
         }
-        above_clas += cut.admit[2 * (first + i)];
-        above_jobs += cut.admit[2 * (first + i) + 1];
-        cut.admit[2 * (first + i)] = 0;
-        cut.admit[2 * (first + i) + 1] = 0;
+        above_clas += admit_sum(cut, 4 * (first + i));
+        above_jobs += admit_sum(cut, 4 * (first + i) + 2);
+        admit_store(cut, 4 * (first + i), 0);
+        admit_store(cut, 4 * (first + i) + 2, 0);
     }
-    if (t == 0)
+    if (t == 0 && level == 0)
     {
-        if (level == 0)
-            cut.counters[CUT_ADMITTED] = stop;
-        else
-            cut.admit[ADMIT_STOPS + level - 1] = stop;
+        cut.counters[CUT_ADMITTED] = stop;
+        cut.counters[CUT_CLAS_WANTED] = uint(min(g_clas[SELECT_THREADS - 1], uint64_t(0xffffffffu)));
+        cut.counters[CUT_JOBS_WANTED] = uint(min(g_jobs[SELECT_THREADS - 1], uint64_t(0xffffffffu)));
     }
+    if (t == 0 && level > 0)
+        cut.admit[ADMIT_STOPS + level - 1] = stop;
 }
 
 // For digit `root.pass` of the keys, past the first: the owners in the bucket the capacity ran
@@ -1401,8 +1423,8 @@ void refine(uint3 id: SV_DispatchThreadID)
             return;
     }
     uint b = admit_digit(key, root.pass);
-    InterlockedAdd(cut.admit[2 * b], c.rt_count);
-    InterlockedAdd(cut.admit[2 * b + 1], cut_jobs(root.scene, slot, c));
+    admit_add(cut, 4 * b, c.rt_count);
+    admit_add(cut, 4 * b + 2, cut_jobs(root.scene, slot, c));
 }
 
 // Whether the admission builds the cut of `key`: it comes before the first cut the capacity

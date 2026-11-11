@@ -36,13 +36,13 @@ public struct ClusterWork
 public static const uint CUT_QUEUE = 0;               // two: items in each queue
 public static const uint CUT_CANDIDATES = 2;          // raster candidate items asked for, past capacity too
 public static const uint CUT_CANDIDATE_CLUSTERS = 3;  // clusters in them
-public static const uint CUT_ENTRIES = 4;             // ray-tracing cut clusters gathered
+public static const uint CUT_SHEDDABLE = 4;           // nonzero when a coarser threshold would leave a gathered cluster out
 public static const uint CUT_CLAS = 5;                // CLAS addresses handed to BLAS builds
 public static const uint CUT_JOBS = 6;                // cluster BLAS built this frame
 public static const uint CUT_NODES = 7;               // hierarchy nodes visited
 public static const uint CUT_NODES_DROPPED = 8;       // nodes past the queue's capacity or the last pass
 public static const uint CUT_CANDIDATES_DROPPED = 9;  // candidate items past capacity
-public static const uint CUT_CLAS_WANTED = 10;        // CLAS the cuts the gathers would build take, admitted or not
+public static const uint CUT_CLAS_WANTED = 10;        // CLAS the cuts the gathers would build take, admitted or not; at most 2^32 - 1
 public static const uint CUT_TRAVERSED_SLOTS = 11;    // slots whose ray-tracing cut was gathered
 public static const uint CUT_CACHED = 12;             // of them, equal to a cached cut
 public static const uint CUT_SHARED = 13;             // of them, sharing another slot's BLAS
@@ -55,7 +55,7 @@ public static const uint CUT_FEEDBACK_BUCKET = 19;    // the error bucket `feedb
 public static const uint CUT_FEEDBACK_ROOM = 20;      // the requests of that bucket it keeps
 public static const uint CUT_FEEDBACK_TAKEN = 21;     // the requests of that bucket seen so far
 public static const uint CUT_QUEUE_PEAK = 22;         // the most items a pass's queue was asked to hold, past capacity too
-public static const uint CUT_ENTRIES_FIXED = 23;      // of CUT_ENTRIES, those a coarser threshold keeps
+public static const uint CUT_HIDDEN_RULES = 23;       // clusters the hidden threshold decided in a cut
 public static const uint CUT_JOBS_WANTED = 24;        // BLAS builds those cuts take, admitted or not; a parted cut's at most
 public static const uint CUT_KEYS = 25;               // slots asking the table of equal cuts for an entry
 public static const uint CUT_LOST = 26;               // gathering slots of a traversal that dropped nodes: a cached cut
@@ -63,8 +63,7 @@ public static const uint CUT_EMPTY = 27;              // gathering slots whose c
 public static const uint CUT_ADMITTED = 28;           // the first distance bucket whose cuts are not all built
 public static const uint CUT_HIDDEN_TESTS = 29;       // group spheres tested against the views
 public static const uint CUT_HIDDEN_LEAVES = 30;      // leaves the hidden threshold left out of a cut
-public static const uint CUT_HIDDEN_RULES = 31;       // clusters the hidden threshold decided in a cut
-public static const uint CUT_COUNTERS = 32;
+public static const uint CUT_COUNTERS = 31;
 
 // The cuts' admission takes their keys a digit of ADMIT_BITS bits at a time, each digit's
 // values its buckets. The first digit is the top bits of a distance's f32 bits, which order
@@ -74,11 +73,12 @@ public static const uint ADMIT_BUCKETS = 1 << ADMIT_BITS;
 public static const uint ADMIT_SHIFT = 31 - ADMIT_BITS;
 // The most digits a key has: 31 bits of distance and 32 of slot.
 public static const uint ADMIT_LEVELS = 5;
-// `CutGpu.admit` past the buckets: per digit past the first, the bucket the capacity ran out
-// in, then the CLAS and BLAS builds of the cuts before that bucket of the last digit taken.
-public static const uint ADMIT_STOPS = 2 * ADMIT_BUCKETS;
+// `CutGpu.admit` past the buckets, four words each: per digit past the first, the bucket the
+// capacity ran out in, then the CLAS and BLAS builds of the cuts before that bucket of the
+// last digit taken, two words each.
+public static const uint ADMIT_STOPS = 4 * ADMIT_BUCKETS;
 public static const uint ADMIT_TAKEN = ADMIT_STOPS + ADMIT_LEVELS - 1;
-public static const uint ADMIT_WORDS = ADMIT_TAKEN + 2;
+public static const uint ADMIT_WORDS = ADMIT_TAKEN + 4;
 
 // One instance slot's cuts this frame.
 public struct SlotCutGpu
@@ -181,7 +181,7 @@ public struct CutGpu
     public uint* wanted_errors;    // 32 per word of `wanted`
     public uint* histogram;        // FEEDBACK_BUCKETS: the wanted entries by error bucket
     public FeedbackGpu* feedback;
-    public uint* admit;            // ADMIT_WORDS: per bucket of the key digit being taken, the CLAS and BLAS builds its cuts take; then ADMIT_STOPS and ADMIT_TAKEN
+    public uint* admit;            // ADMIT_WORDS: per bucket of the key digit being taken, the CLAS and BLAS builds its cuts take, 64 bits each, low word first; then ADMIT_STOPS and ADMIT_TAKEN
     public uint queue_capacity;
     public uint candidate_capacity;
     public uint clas_capacity;

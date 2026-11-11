@@ -45,10 +45,10 @@ use crate::{
 };
 
 /// `CutGpu.counters` entries (`cut.slang`), the BLAS build count after them.
-const COUNTERS: usize = 33;
+const COUNTERS: usize = 32;
 const CUT_CANDIDATES: usize = 2;
 const CUT_CANDIDATE_CLUSTERS: usize = 3;
-const CUT_ENTRIES: usize = 4;
+const CUT_SHEDDABLE: usize = 4;
 const CUT_CLAS: usize = 5;
 const CUT_NODES: usize = 7;
 const CUT_NODES_DROPPED: usize = 8;
@@ -62,15 +62,14 @@ const CUT_MERGED: usize = 15;
 const CUT_REQUESTS: usize = 16;
 const CUT_FEEDBACK: usize = 17;
 const CUT_QUEUE_PEAK: usize = 22;
-const CUT_ENTRIES_FIXED: usize = 23;
+const CUT_HIDDEN_RULES: usize = 23;
 const CUT_JOBS_WANTED: usize = 24;
 const CUT_KEYS: usize = 25;
 const CUT_LOST: usize = 26;
 const CUT_EMPTY: usize = 27;
 const CUT_HIDDEN_TESTS: usize = 29;
 const CUT_HIDDEN_LEAVES: usize = 30;
-const CUT_HIDDEN_RULES: usize = 31;
-const CUT_BUILDS: u64 = 32;
+const CUT_BUILDS: u64 = 31;
 /// `traverse.slang` args layout.
 const ARGS_PASSES: u32 = 64;
 const ARGS_GATHER: u64 = 3 * ARGS_PASSES as u64;
@@ -83,7 +82,7 @@ const TRAVERSE_FILL: u32 = 4;
 const FEEDBACK_BUCKETS: u32 = 4096;
 const ADMIT_BITS: u32 = 14;
 const ADMIT_BUCKETS: u32 = 1 << ADMIT_BITS;
-const ADMIT_WORDS: u32 = 2 * ADMIT_BUCKETS + 6;
+const ADMIT_WORDS: u32 = 4 * ADMIT_BUCKETS + 8;
 
 /// Digits of an admission key in a scene of `slots` instance slots (`traverse.slang`
 /// `admit_levels`): the admission takes a pass per digit.
@@ -124,7 +123,7 @@ pub struct CutStats {
     pub rt_built: u32,
     pub rt_built_clas: u32,
     /// The CLAS and BLAS builds every cut the gathers would build takes, the admitted and the
-    /// others; a cut that builds by part counts a BLAS per part.
+    /// others, each at most `u32::MAX`; a cut that builds by part counts a BLAS per part.
     pub rt_wanted_clas: u32,
     pub rt_wanted_blas: u32,
     /// The CLAS and BLAS builds the tables of the built cuts hold, and the device memory they
@@ -163,8 +162,8 @@ impl CutStats {
         self.rt_empty += c[CUT_EMPTY];
         self.rt_built += c[CUT_BUILDS as usize];
         self.rt_built_clas += c[CUT_CLAS];
-        self.rt_wanted_clas += c[CUT_CLAS_WANTED];
-        self.rt_wanted_blas += c[CUT_JOBS_WANTED];
+        self.rt_wanted_clas = self.rt_wanted_clas.saturating_add(c[CUT_CLAS_WANTED]);
+        self.rt_wanted_blas = self.rt_wanted_blas.saturating_add(c[CUT_JOBS_WANTED]);
         self.rt_clas_capacity += ran.clas;
         self.rt_blas_capacity += ran.jobs;
         self.rt_table_bytes += bytes;
@@ -655,7 +654,7 @@ impl Cuts {
     pub(crate) fn observe(&mut self, slot: usize) {
         let data = self.readback(slot);
         let (queue, candidates) = (data[CUT_QUEUE_PEAK], data[CUT_CANDIDATES]);
-        let (entries, fixed) = (data[CUT_ENTRIES], data[CUT_ENTRIES_FIXED]);
+        let sheddable = data[CUT_SHEDDABLE] != 0;
         let (clas, jobs, keys) = (data[CUT_CLAS_WANTED], data[CUT_JOBS_WANTED], data[CUT_KEYS]);
         self.queue.observe(queue);
         self.candidates.observe(candidates);
@@ -678,7 +677,7 @@ impl Cuts {
             scale: self.ran[slot].scale,
             demand: u64::from(clas),
             capacity,
-            sheddable: entries > fixed,
+            sheddable,
             whole: false,
         });
     }
@@ -888,7 +887,7 @@ impl Cuts {
             .max(self.sizes.feedback_words())
             .max(errors)
             .max(FEEDBACK_BUCKETS)
-            .max(2 * ADMIT_BUCKETS);
+            .max(4 * ADMIT_BUCKETS);
         list.dispatch(p.get(k.clear), r0, groups(cleared));
         step(list);
         list.dispatch(p.get(k.init), r0, groups(f.slots));
