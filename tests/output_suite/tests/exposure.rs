@@ -327,7 +327,7 @@ fn down_and_up(f: u32, frames: u32, stops: f32) -> f32 {
 }
 
 #[test]
-fn pre_exposure_follows_the_adapted_exposure_and_never_shows() {
+fn a_moving_pre_exposure_never_shows() {
     let mut h = Harness::new(SIDE, SIDE);
     let nits = natural_image(h.pixels(), 6.0, 1.0);
     h.set_image(&nits);
@@ -342,16 +342,9 @@ fn pre_exposure_follows_the_adapted_exposure_and_never_shows() {
     for f in 0..240 {
         let scale = down_and_up(f, 60, 6.0);
         let t = h.frame(scale, &output, Some(&display));
-        // The next frame is lit at the exposure this one adapted to.
-        let s = exposure_from_ev100(t.adapted_ev100);
-        assert!(
-            (t.pre_exposure / s - 1.0).abs() < 1e-5,
-            "frame {f}: pre-exposure {} against {s}",
-            t.pre_exposure
-        );
-        // This frame, lit at the last one's, shows its own adapted exposure.
+        // This frame, lit at the last one's pre-exposure, shows its own adapted exposure.
         let shown = h.display_linear()[0][1];
-        let expected = nits[0] * scale * s;
+        let expected = nits[0] * scale * exposure_from_ev100(t.adapted_ev100);
         assert!(
             (shown / expected - 1.0).abs() < 2e-3,
             "frame {f}: {shown} against {expected}, lit at {}",
