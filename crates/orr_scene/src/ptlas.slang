@@ -130,7 +130,6 @@ public struct PendingGpu
 public struct PtlasGpu
 {
     public PartitionGpu* partitions;
-    public uint* slot_partition;  // per slot: its cell partition, or PARTITION_NONE
     public PendingGpu* pending;   // per slot
     public uint* partition_state; // per partition, then the global partition
     public uint* buckets;         // DISTANCE_BUCKETS costs in rebuilt instances
@@ -163,7 +162,10 @@ public struct PtlasRoot
     public uint translate_count;
     public uint proxy_job_count;
     public uint* proxy_jobs;      // medium proxies whose instance this frame writes, and LIGHT_JOB | LightId
+    public uint* slot_partition;  // per slot: its cell partition, or PARTITION_NONE
     public uint64_t proxy_blas;   // the BLAS every medium and light proxy traces
+    public uint _pad0;
+    public uint _pad1;
 }
 ORR_ROOT(PtlasRoot);
 
@@ -415,7 +417,7 @@ void want(uint3 id: SV_DispatchThreadID)
     uint64_t skinned_blas = skinned && inst.pose_index < s.skinned_capacity ? s.skin_state[inst.pose_index].blas : 0;
     active = active && placement(g, false, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, cell_log2, pl);
     active = active && (skinned || mesh.rt_cut_count > 0);
-    uint cell = !active ? PARTITION_NONE : skinned ? global_partition() : t.slot_partition[slot];
+    uint cell = !active ? PARTITION_NONE : skinned ? global_partition() : root.slot_partition[slot];
     active = active && cell != PARTITION_NONE;
 
     uint stable = 255;

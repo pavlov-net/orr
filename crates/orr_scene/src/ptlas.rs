@@ -807,7 +807,6 @@ impl Ptlas {
         let k = &self.kept;
         let record = PtlasGpu {
             partitions: self.partition_table.gpu(),
-            slot_partition: self.slot_table.gpu(),
             pending: pending.gpu(),
             partition_state: state,
             buckets,
@@ -979,7 +978,10 @@ impl Ptlas {
             translate_count: jobs.len() as u32,
             proxy_job_count: proxies.len() as u32,
             proxy_jobs,
+            slot_partition: self.slot_table.gpu(),
             proxy_blas: f.proxy_blas.0,
+            _pad0: 0,
+            _pad1: 0,
         };
         let root = window.put_root(device, &root)?;
         let groups = |n: u32| [n.div_ceil(64).max(1), 1, 1];
