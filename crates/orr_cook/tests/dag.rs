@@ -887,6 +887,81 @@ fn thin_plates_keep_their_normals_on_their_faces() {
     }
 }
 
+#[test]
+fn skinned_thin_plates_keep_each_vertex_skin_with_its_position() {
+    // Two joints whose weights change through the plates' thickness as well as across them,
+    // so a vertex skinned as another of a different position poses apart from its neighbors.
+    let m = plates(16, 16);
+    let up = Vec3::X.cross(Vec3::new(0.0, 0.3, 1.0)).normalize();
+    let weights: Vec<[f32; 4]> = m
+        .positions
+        .iter()
+        .map(|&p| {
+            let w = 0.5 + 0.4 * (400.0 * p.dot(up) + 2.0 * p.x).sin();
+            [w, 1.0 - w, 0.0, 0.0]
+        })
+        .collect();
+    let mut g = Glb::default();
+    let pa = g.floats(
+        &m.positions.iter().map(Vec3::to_array).collect::<Vec<_>>(),
+        "VEC3",
+    );
+    let na = g.floats(
+        &m.normals.iter().map(Vec3::to_array).collect::<Vec<_>>(),
+        "VEC3",
+    );
+    let uvs = m.uvs.as_ref().unwrap();
+    let ta = g.floats(&uvs.iter().map(Vec2::to_array).collect::<Vec<_>>(), "VEC2");
+    let joints: Vec<[u16; 4]> = vec![[0, 1, 0, 0]; m.positions.len()];
+    let jv = g.view(bytemuck::cast_slice(&joints), None);
+    let ja = g.accessor(jv, glb::U16, joints.len(), "VEC4", "");
+    let wa = g.floats(&weights, "VEC4");
+    let ia = g.indices(&m.indices);
+    let path = tmp("dag-skinned-plates").join("plates.glb");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1]}}],
+"nodes":[{{"mesh":0,"skin":0}},{{"name":"a","children":[2]}},{{"name":"b"}}],
+"skins":[{{"joints":[1,2]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"NORMAL":{na},"TEXCOORD_0":{ta},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}},"indices":{ia}}}]}}]"#
+        ),
+    );
+    let settings = GltfSettings {
+        mesh: dag(),
+        ..Default::default()
+    };
+    let d = load(
+        &cook_archive("g", Source::Gltf { path, settings }),
+        "g/mesh",
+    );
+    let corners = |c: &dag_read::C| {
+        c.tris
+            .iter()
+            .zip(&c.skin)
+            .flat_map(|(t, s)| t.iter().zip(s))
+            .map(|(p, s)| {
+                let (j, w) = s.expect("a skinned mesh");
+                (p.map(f32::to_bits), (j, w.map(f32::to_bits)))
+            })
+            .collect::<Vec<_>>()
+    };
+    // The skins the source clusters hold at each position.
+    let mut source: HashMap<_, HashSet<_>> = HashMap::new();
+    for c in d.clusters.iter().filter(|c| c.record.self_error == 0.0) {
+        for (p, s) in corners(c) {
+            source.entry(p).or_default().insert(s);
+        }
+    }
+    let mut apart = 0;
+    for c in &d.clusters {
+        for (p, s) in corners(c) {
+            apart += usize::from(!source.get(&p).is_some_and(|k| k.contains(&s)));
+        }
+    }
+    assert_eq!(apart, 0);
+}
+
 /// Half of a curved 4 m sheet: x from 0 to 2 m on the `side` of x = 0, the cut both halves
 /// share and that bends in y, so neither half keeps it straight. With `bridged`, a triangle
 /// with two corners at one end of each edge of the cut closes it, as exports have them.

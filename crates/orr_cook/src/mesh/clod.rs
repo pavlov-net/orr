@@ -56,29 +56,50 @@ pub(super) struct Mesh<'a> {
     pub(super) keep_borders: bool,
 }
 
-/// What `build` keeps per vertex: the mesh's vertices, then the wedges it adds, each at a
-/// vertex's position with another's normal and attributes ([`lod::opposed_corners`]).
+/// The mesh vertices each vertex of `build` takes after: a mesh vertex itself, and a wedge
+/// the vertex that places it, by position and skin, and the one that shades it, by normal and
+/// the other attributes.
+pub(super) struct Sources {
+    mesh: u32,
+    /// Per wedge, its shading and placing mesh vertices.
+    wedges: Vec<[u32; 2]>,
+}
+
+impl Sources {
+    pub(super) fn shading(&self, v: u32) -> u32 {
+        v.checked_sub(self.mesh)
+            .map_or(v, |w| self.wedges[w as usize][0])
+    }
+
+    pub(super) fn placing(&self, v: u32) -> u32 {
+        v.checked_sub(self.mesh)
+            .map_or(v, |w| self.wedges[w as usize][1])
+    }
+}
+
+/// What `build` keeps per vertex: the mesh's vertices, then the wedges it adds, each placed as
+/// one vertex is and shaded as another ([`lod::opposed_corners`]).
 struct Vertices {
     positions: Vec<f32>,
     normals: Vec<f32>,
     /// The mesh's lock bits.
     lock: Vec<u8>,
     remap: Vec<u32>,
-    /// The mesh vertex whose attributes it carries.
-    source: Vec<u32>,
+    sources: Sources,
 }
 
 impl Vertices {
-    /// Adds a vertex at `at`'s position, with its lock bits, and `from`'s normal and
-    /// attributes; returns it.
+    /// Adds a vertex placed as `at` is, by its position and lock bits, and shaded as `from`
+    /// is; returns it.
     fn wedge(&mut self, at: u32, from: u32) -> u32 {
-        let (at, from) = (at as usize, from as usize);
         let new = self.remap.len() as u32;
+        let s = &mut self.sources;
+        s.wedges.push([s.shading(from), s.placing(at)]);
+        let (at, from) = (at as usize, from as usize);
         self.positions.extend_from_within(3 * at..3 * at + 3);
         self.normals.extend_from_within(3 * from..3 * from + 3);
         self.lock.push(self.lock[at]);
         self.remap.push(self.remap[at]);
-        self.source.push(self.source[from]);
         new
     }
 }
@@ -697,15 +718,14 @@ fn dilate_borders(
 }
 
 /// What a group's emission gets: its depth and bounds, its clusters, their corners, the
-/// positions as they are when it is emitted, and per vertex the mesh vertex whose attributes
-/// it carries.
+/// positions as they are when it is emitted, and the mesh vertices each vertex takes after.
 pub(super) struct Emitted<'a> {
     pub(super) depth: u32,
     pub(crate) bounds: Bounds,
     pub(crate) clusters: &'a [Cluster],
     pub(super) indices: &'a [u32],
     pub(super) positions: &'a [f32],
-    pub(super) source: &'a [u32],
+    pub(super) sources: &'a Sources,
 }
 
 /// A group simplified and emitted: its triangles, their bounds, and the corners whose
@@ -744,7 +764,10 @@ pub(super) fn build<G: Send>(
         normals,
         lock,
         remap: remap.to_vec(),
-        source: (0..vertex_count as u32).collect(),
+        sources: Sources {
+            mesh: vertex_count as u32,
+            wedges: Vec::new(),
+        },
     };
     let (mut locks, mut marks) = (Vec::new(), Vec::new());
     let mut out = Vec::new();
@@ -785,7 +808,7 @@ pub(super) fn build<G: Send>(
         drop(lock);
         let base = out.len() as i32;
         let positions = Positions(vx.positions.as_mut_ptr(), vx.positions.len());
-        let (normals, remap, source) = (&vx.normals, &vx.remap, &vx.source);
+        let (normals, remap, sources) = (&vx.normals, &vx.remap, &vx.sources);
         let groups: Vec<(G, Option<Simplified>)> = offsets
             .par_windows(2)
             .map(|w| {
@@ -818,7 +841,7 @@ pub(super) fn build<G: Send>(
                         clusters: group,
                         indices: &cluster_indices,
                         positions: positions.read(),
-                        source,
+                        sources,
                     })
                 };
                 if simplified.len() as f32 > merged.len() as f32 * c.simplify_threshold {
@@ -840,7 +863,7 @@ pub(super) fn build<G: Send>(
                     |v| moved.contains(&remap[v as usize]),
                     |v| Vec3::from(positions.get(v as usize)).as_dvec3(),
                     |v| Vec3::from_slice(&normals[3 * v as usize..]).as_dvec3(),
-                    |v| sections[source[v as usize] as usize],
+                    |v| sections[sources.shading(v) as usize],
                 );
                 (g, Some((simplified, bounds, opposed)))
             })
@@ -903,7 +926,7 @@ pub(super) fn build<G: Send>(
             clusters: &clusters,
             indices: &cluster_indices,
             positions: &vx.positions,
-            source: &vx.source,
+            sources: &vx.sources,
         }));
     }
     out

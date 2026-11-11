@@ -912,29 +912,34 @@ impl Ctx<'_> {
         }
     }
 
-    /// A cluster of section `section` and part `part` over welded vertices `verts` at grid
-    /// positions `cells`, with cluster-local corners `tris`. Its errors and spheres are the
-    /// caller's to set.
+    /// A cluster of section `section` and part `part` over vertices `v`, with cluster-local
+    /// corners `tris`. Its errors and spheres are the caller's to set.
     fn cluster(
         &self,
         section: u16,
         part: u16,
         merged: bool,
-        verts: &[u32],
-        cells: &[[i32; 3]],
+        v: ClusterVertices<'_>,
         mut tris: Vec<u8>,
     ) -> ClusterData {
         let _z = crate::profile::zone!("mesh.cluster");
         let w = self.w;
-        let n = verts.len();
+        let n = v.shading.len();
         let mut order = IDENTITY;
         meshopt::optimize_meshlet_level(&mut order[..n], &mut tris, 3);
-        let (mut by_order, mut cells_by_order) =
-            ([0; MAX_CLUSTER_VERTICES], [[0; 3]; MAX_CLUSTER_VERTICES]);
+        let (mut by_order, mut placing_by_order, mut cells_by_order) = (
+            [0; MAX_CLUSTER_VERTICES],
+            [0; MAX_CLUSTER_VERTICES],
+            [[0; 3]; MAX_CLUSTER_VERTICES],
+        );
         for (k, &i) in order[..n].iter().enumerate() {
-            by_order[k] = verts[i as usize];
-            cells_by_order[k] = cells[i as usize];
+            by_order[k] = v.shading[i as usize];
+            cells_by_order[k] = v.cells[i as usize];
+            if !v.placing.is_empty() {
+                placing_by_order[k] = v.placing[i as usize];
+            }
         }
+        let placing = &placing_by_order[..v.placing.len()];
         let (verts, cells) = (&by_order[..n], &cells_by_order[..n]);
         let sec = &self.sections[usize::from(section)];
         let section_maps = &self.maps[usize::from(section)];
@@ -969,7 +974,12 @@ impl Ctx<'_> {
             0
         };
         stored_corner_order(&mut tris);
-        let mut c = build_cluster(w, self.grid, verts, cells, tris, sec.flags, uv);
+        let ordered = ClusterVertices {
+            shading: verts,
+            placing,
+            cells,
+        };
+        let mut c = build_cluster(w, self.grid, ordered, tris, sec.flags, uv);
         if sec.flags & (Section::EMISSIVE | Section::CASTER) != 0 {
             let _z = if section_maps.emission.is_some() {
                 crate::profile::zone!("mesh.cluster.emission")
@@ -1095,8 +1105,12 @@ fn discrete(cx: &Ctx<'_>, levels: &[lod::LevelGeometry]) -> Result<Built> {
                 let cells: Vec<[i32; 3]> =
                     verts.iter().map(|&v| cx.grid.cells[v as usize]).collect();
                 let tris = ml.triangles[to..to + tc * 3].to_vec();
-                let mut c =
-                    cx.cluster(piece.section, piece.part, piece.merged, verts, &cells, tris);
+                let v = ClusterVertices {
+                    shading: verts,
+                    placing: &[],
+                    cells: &cells,
+                };
+                let mut c = cx.cluster(piece.section, piece.part, piece.merged, v, tris);
                 c.record.self_error = level.error;
                 c.record.parent_error = parent_error;
                 clusters.push(c);
@@ -1799,15 +1813,25 @@ impl ClusterData {
     }
 }
 
+/// A cluster's vertices: per vertex the welded vertex that shades it, the one that places it
+/// by its skin, and its grid position. `placing` is empty where each vertex's is the one that
+/// shades it.
+#[derive(Copy, Clone)]
+struct ClusterVertices<'a> {
+    shading: &'a [u32],
+    placing: &'a [u32],
+    cells: &'a [[i32; 3]],
+}
+
 fn build_cluster(
     w: &lod::Welded,
     grid: &Grid,
-    verts: &[u32],
-    cells: &[[i32; 3]],
+    vertices: ClusterVertices<'_>,
     tris: Vec<u8>,
     flags: u8,
     uv: &[ClusterUvs],
 ) -> ClusterData {
+    let (verts, cells) = (vertices.shading, vertices.cells);
     let anchor = [0, 1, 2].map(|a| cells.iter().map(|g| g[a]).min().unwrap());
     let local: Vec<[u32; 3]> = cells
         .iter()
@@ -1831,8 +1855,8 @@ fn build_cluster(
     );
 
     let mut attrs = Vec::with_capacity(verts.len() * 3);
-    for &v in verts {
-        let v = v as usize;
+    for (k, &shading) in verts.iter().enumerate() {
+        let v = shading as usize;
         attrs.push(oct_encode(
             Vec3::from(w.normals[v]).normalize_or(Vec3::Z).to_array(),
         ));
@@ -1850,9 +1874,10 @@ fn build_cluster(
             attrs.push(h[0] | h[1] << 16);
             attrs.push(h[2] | h[3] << 16);
         }
-        if let Some(k) = &w.skin {
-            let w = k.weights[v].map(u32::from);
-            attrs.push(u32::from_le_bytes(k.joints[v]));
+        if let Some(skin) = &w.skin {
+            let p = vertices.placing.get(k).map_or(shading, |&p| p) as usize;
+            let w = skin.weights[p].map(u32::from);
+            attrs.push(u32::from_le_bytes(skin.joints[p]));
             attrs.push(w[0] | w[1] << 16);
             attrs.push(w[2] | w[3] << 16);
         }

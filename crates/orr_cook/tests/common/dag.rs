@@ -13,12 +13,17 @@ pub(crate) fn read(a: &Archive, b: &orr_pack::Blob) -> Vec<u8> {
     v
 }
 
-/// A cooked cluster: its record, page, and triangle positions and vertex normals.
+/// A vertex's joints and weights.
+pub(crate) type Skin = ([u8; 4], [f32; 4]);
+
+/// A cooked cluster: its record, page, and triangle positions, vertex normals and, on a
+/// skinned mesh, vertex skins.
 pub(crate) struct C {
     pub(crate) record: Cluster,
     pub(crate) page: usize,
     pub(crate) tris: Vec<[[f32; 3]; 3]>,
     pub(crate) normals: Vec<[[f32; 3]; 3]>,
+    pub(crate) skin: Vec<[Option<Skin>; 3]>,
 }
 
 pub(crate) struct Dag {
@@ -54,12 +59,21 @@ pub(crate) fn load(a: &Archive, name: &str) -> Dag {
             };
             let tris = corners(&|v| view.position(&c, v));
             let normals = corners(&|v| view.normal(&c, v));
+            let skin = (0..u32::from(c.tri_count))
+                .map(|t| {
+                    view.triangle(&c, t).map(|v| {
+                        let v = u32::from(v);
+                        Some((view.joints(&c, v)?, view.weights(&c, v)?))
+                    })
+                })
+                .collect();
             here.push(clusters.len());
             clusters.push(C {
                 record: c,
                 page: pi,
                 tris,
                 normals,
+                skin,
             });
         }
         by_page.push(here);
