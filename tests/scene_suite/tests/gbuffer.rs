@@ -2530,6 +2530,110 @@ fn software_and_hardware_raster_draw_the_same_visibility_buffer() {
     assert_clean();
 }
 
+/// Frames whose clusters split between the two rasters cover the pixels the hardware raster
+/// alone covers: both paths draw a corner at one grid point, so no pixel opens along an edge a
+/// software cluster shares with a hardware one. The views are fine enough for clusters on both
+/// sides of the software limit, and among them are ones where the hardware's own snapping of
+/// the corners left such pixels open.
+#[test]
+fn software_and_hardware_clusters_share_edges_without_open_pixels() {
+    let _serial = serial();
+    const E: [u32; 2] = [1920, 1080];
+    const JITTERS: u32 = 10;
+    let detail = 4.0 * 0.5 * E[1] as f32 / 0.483_055_07;
+    let target = Vec3::new(0.0, -1.0, -12.0);
+    let eyes = [Vec3::new(2.0, 6.0, 20.0), Vec3::new(-4.0, 10.0, 40.0)];
+    // Per view: a bit per pixel it covered, and its counts.
+    let run = |software_raster_pixels: f32| -> Vec<(Vec<u64>, Vec<u32>)> {
+        let mut w = World::with(&RendererDesc {
+            software_raster_pixels,
+            ..RendererDesc::default()
+        });
+        let placed = place(&mut w, &dag_items());
+        let mut out = Vec::new();
+        let mut frame = 0;
+        for eye in eyes {
+            for j in 0..JITTERS {
+                let jitter = Vec2::new(
+                    (j as f32 * 0.754_877_7).fract() - 0.5,
+                    (j as f32 * 0.569_840_3).fract() - 0.5,
+                );
+                // The detail settles over the eye's first frames; the second frame of a jitter
+                // tests the first's depth.
+                let mut view = None;
+                for _ in 0..if j == 0 { 4 } else { 2 } {
+                    frame += 1;
+                    let list = [placed.scene];
+                    let mut f = w
+                        .scenes
+                        .begin_frame(&FrameDesc {
+                            time: time(frame),
+                            scenes: &list,
+                            low_latency: None,
+                        })
+                        .unwrap();
+                    f.scene(placed.scene).unwrap().set_focus(eye.as_dvec3());
+                    f.request_detail(placed.scene, detail).unwrap();
+                    view = Some(
+                        f.raster_view(&ViewDesc {
+                            scene: placed.scene,
+                            history: placed.history,
+                            position: eye.as_dvec3(),
+                            rotation: look(eye, target),
+                            projection: Projection {
+                                fov_y: 0.9,
+                                near: 0.1,
+                            },
+                            lens: Lens::default(),
+                            render_extent: UVec2::from(E),
+                            output_extent: UVec2::from(E),
+                            jitter,
+                            camera_cut: true,
+                            mip_bias: 0.0,
+                            texture_filter: TextureFilter::Hardware,
+                        })
+                        .unwrap(),
+                    );
+                    wait(f.end(&[]).unwrap());
+                }
+                let view = view.unwrap();
+                let words: Vec<u64> = read_buffer(view.targets.visibility, u64::from(E[0] * E[1]));
+                let mut covered = vec![0u64; words.len().div_ceil(64)];
+                for (p, _) in words.iter().enumerate().filter(|(_, w)| **w != 0) {
+                    covered[p / 64] |= 1 << (p % 64);
+                }
+                out.push((covered, read_buffer(view.counts, 8)));
+            }
+        }
+        out
+    };
+    let hardware = run(0.0);
+    let mixed = run(64.0);
+    let (mut software, mut visible) = (0, 0);
+    for (i, ((hw, hw_counts), (mx, counts))) in hardware.iter().zip(&mixed).enumerate() {
+        assert_eq!(
+            hw_counts[..3],
+            counts[..3],
+            "view {i}: the same clusters are visible"
+        );
+        assert_eq!((counts[1], counts[2]), (0, 0), "view {i}: nothing dropped");
+        software += counts[7];
+        visible += counts[0];
+        let open: u32 = hw.iter().zip(mx).map(|(h, m)| (h & !m).count_ones()).sum();
+        let more: u32 = hw.iter().zip(mx).map(|(h, m)| (m & !h).count_ones()).sum();
+        assert_eq!(
+            (open, more),
+            (0, 0),
+            "view {i}: pixels only the hardware frame covers, and only the mixed one"
+        );
+    }
+    assert!(
+        8 * software > visible && 8 * software < 7 * visible,
+        "{software} of {visible} clusters raster in software"
+    );
+    assert_clean();
+}
+
 // --- Ray tracing ------------------------------------------------------------------------------
 
 /// The focus's pixels per radian: render height over the vertical field of view.

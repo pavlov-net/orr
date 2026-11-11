@@ -235,6 +235,7 @@ void cluster_mesh(
         Vertex o = cluster_vertex(d, visible, i);
         if (d.by_size)
             pixels[i] = pixel_from_clip(root.view, o.position);
+        o.position = on_grid(root.view, o.position);
         vertices[i] = o;
     }
     GroupMemoryBarrierWithGroupSync();
@@ -358,6 +359,40 @@ static const int MICROPOLY_SPAN = 4;
 // 32 bits; only VISIBLE_BY_SIZE draws reach that far, and their triangles there are wider
 // than the software limit.
 static const float SOFT_REACH = float(1 << 21);
+
+// Where the viewport places clip-space `clip`, in pixels, by the same operations in both
+// paths' kernels.
+float2 raster_pixel(ViewConstants* v, float4 clip)
+{
+    precise float2 ndc = clip.xy / clip.w;
+    precise float2 unit = ndc * 0.5 + 0.5;
+    precise float2 xy = unit * float2(v.extent);
+    return xy;
+}
+
+// The grid point both paths draw a corner at pixel `xy` at, in 1/256 pixel.
+int2 grid_point(float2 xy)
+{
+    precise float2 g = clamp(xy, -SOFT_REACH, SOFT_REACH) * float(SUBPIXEL) + 0.5;
+    return int2(floor(g));
+}
+
+// `clip` moved onto its grid point, for the hardware to draw. The hardware snaps a corner by
+// arithmetic of its own, which takes some corners to a neighbor of the point `grid_point`
+// gives the software raster, and that opens pixels along an edge the two paths share; a
+// corner on a point it leaves there. A corner behind the eye or past the grid's reach stays:
+// the software raster draws none.
+float4 on_grid(ViewConstants* v, float4 clip)
+{
+    if (!(clip.w > 0.0))
+        return clip;
+    float2 xy = raster_pixel(v, clip);
+    if (!all(abs(xy) < SOFT_REACH))
+        return clip;
+    float2 at = float2(grid_point(xy)) / float(SUBPIXEL);
+    clip.xy = (at / float2(v.extent) * 2.0 - 1.0) * clip.w;
+    return clip;
+}
 
 // A triangle set up for the software raster. Corners are in 1/256 pixel from `origin`,
 // wound so that the edge functions are positive inside.
@@ -504,8 +539,7 @@ void software(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     for (uint i = thread; i < d.vertex_count; i += 128)
     {
         float4 clip = cluster_vertex(d, visible, i).position;
-        float2 xy = clamp(pixel_from_clip(v, clip), -SOFT_REACH, SOFT_REACH);
-        soft_xy[i] = int2(floor(xy * float(SUBPIXEL) + 0.5));
+        soft_xy[i] = grid_point(raster_pixel(v, clip));
         soft_z[i] = clip.z / clip.w;
     }
     GroupMemoryBarrierWithGroupSync();
