@@ -2336,6 +2336,7 @@ impl<'a> Frame<'a> {
         let render = self.device.queue(QueueKind::Render).expect("render queue");
         let list = self.list.take().expect("frame list");
         self.submits.push(render.submit(vec![list], &self.loading)?);
+        self.core.mounts.streaming.submitted();
         let mut list = render.command_list()?;
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         self.list = Some(list);

@@ -2453,7 +2453,7 @@ impl Streaming {
         &self.moves
     }
 
-    /// The frame that carried [`Self::moves`] was submitted: the copies have their place in
+    /// The list that carried [`Self::moves`] was submitted: the copies have their place in
     /// the render queue's order.
     pub(crate) fn submitted(&mut self) {
         self.moves.clear();
