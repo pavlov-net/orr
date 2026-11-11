@@ -330,10 +330,7 @@ void setup(uint3 id: SV_DispatchThreadID)
 // This frame's pre-exposure over last frame's.
 float exposure_change()
 {
-    ViewConstants* view = root.view;
-    if (view.exposure == nullptr)
-        return 1.0;
-    ExposureState e = view.exposure[view.exposure_slot];
+    ExposureState e = root.view.exposure[root.view.exposure_slot];
     return e.prev_pre_exposure > 0.0 ? e.pre_exposure / e.prev_pre_exposure : 1.0;
 }
 
