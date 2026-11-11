@@ -66,6 +66,25 @@ impl RangeAllocator {
         true
     }
 
+    /// Takes every free index of `at..at + count`; returns the runs it took, `(start, count)`
+    /// each in order.
+    pub fn take_within(&mut self, at: u32, count: u32) -> Vec<(u32, u32)> {
+        let end = at + count;
+        let first = self.free.range(..=at).next_back().map_or(at, |(&s, _)| s);
+        let runs: Vec<(u32, u32)> = self
+            .free
+            .range(first..end)
+            .filter_map(|(&s, &e)| {
+                let (s, e) = (s.max(at), e.min(end));
+                (s < e).then(|| (s, e - s))
+            })
+            .collect();
+        for &(s, n) in &runs {
+            assert!(self.take(s, n), "a free run holds the range");
+        }
+        runs
+    }
+
     /// Returns `start..start + count` to the free list.
     pub fn free(&mut self, start: u32, count: u32) {
         if count == 0 {
