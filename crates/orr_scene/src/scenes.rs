@@ -2545,7 +2545,10 @@ impl<'a> Frame<'a> {
         history.arena.enter(ViewStep::Raster, list);
         match &mut history.targets {
             Some(t) if t.sizes == sizes => t.bind(&history.arena),
-            t => *t = Some(ViewTargets::new(device, sizes, &history.arena, list)?),
+            t => {
+                let new = ViewTargets::new(device, sizes, slot_capacity, &history.arena, list)?;
+                *t = Some(new);
+            }
         }
         let lists = history.lists.as_ref().expect("lists made above");
         let targets = history.targets.as_mut().expect("view targets");

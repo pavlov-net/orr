@@ -489,11 +489,13 @@ impl ViewTargets {
         r
     }
 
-    /// New targets beside the transient ones of `arena`, which [`Self::requests`] laid out;
-    /// discarded into `list` so their first use sees `GENERAL`.
+    /// New targets beside the transient ones of `arena`, which [`Self::requests`] laid out,
+    /// with the visibility of `slots` instance slots; discarded into `list` so their first use
+    /// sees `GENERAL`.
     pub(crate) fn new(
         device: &Device,
         s: TargetSizes,
+        slots: u32,
         arena: &ViewArena,
         list: &mut CommandList<'_>,
     ) -> Result<Self> {
@@ -524,8 +526,8 @@ impl ViewTargets {
         )?;
         let t = Self {
             sizes: s,
-            slot_visibility: slot_visibility(device, 0)?,
-            slots: 0,
+            slot_visibility: slot_visibility(device, slots)?,
+            slots,
             replaced: Vec::new(),
             args: device.gpu_malloc(dl, ARGS + COUNTS, "raster args")?,
             depth,
