@@ -3,8 +3,9 @@
 //! tile table ([`RasterSetInfo`]); every later blob is one tile.
 //!
 //! - LOD 0 is the coarsest: one tile. LOD `l` has `2^l` tiles per axis, and its level is
-//!   `tile_size << l` texels per axis. Each coarser level was built from the next finer one
-//!   by the layer's reduction over 2x2 texel blocks.
+//!   `tile_size << l` texels per axis. Each coarser level was built by the layer's
+//!   reduction: over 2x2 blocks of the next finer level, or for an integer mean over the
+//!   finest texels under each texel.
 //! - A tile holds `tile_size + 2 * border` texels per axis: tile `(x, y)` covers level
 //!   texels `x * tile_size - border` to `(x + 1) * tile_size + border`, so border texels
 //!   repeat the neighbors' edge texels, and outside the level the nearest edge texel
