@@ -17,7 +17,10 @@
 //! when the name is shared): at each time any of its attributes is sampled, the authored
 //! joints' local transforms, sampled linearly between those times (rotations by slerp). At a
 //! time it does not hold translations, rotations and scales for all its joints it is not valid,
-//! and those joints hold their rest transforms; invalid at every time, it is no clip.
+//! and those joints hold their rest transforms; invalid at every time, it is no clip. Every clip
+//! runs over the stage's timeline ([`Timeline`]), holding its first pose before its first sample
+//! and its last after its last, so the clips of one stage keep time with each other and with
+//! its animated pages.
 //!
 //! Prims whose xforms are sampled over time move what stands under them by the same means, as
 //! [`PrimRig`]s: what moves is a [`Rig`](crate::skin::Rig) of prims, and a `Skeleton` under such a
@@ -33,10 +36,14 @@ use orr_math::{Affine3, DMat3, DMat4, DVec3, DVec4};
 use orr_pack::clip::Clip;
 use orr_pack::skeleton::{MAX_SKINNED_JOINTS, NO_PARENT, SkeletonInfo, Trs};
 
+use super::Timeline;
 use super::mesh::Influence;
 use super::read::{PrimReader, matrix, quat};
 use crate::import::{collapses, singular};
 use crate::skin::{self, Channel, ClipSettings, Interpolation, Property};
+
+/// The attributes of a `SkelAnimation` that pose its joints.
+pub(super) const ANIMATED: [&str; 3] = ["translations", "rotations", "scales"];
 
 pub(super) struct Skel {
     pub(super) info: SkeletonInfo,
@@ -406,12 +413,13 @@ impl Skel {
         Ok((influences, self.to_bind * geom_bind))
     }
 
-    /// The clip of one animation prim beside the channels `xforms` of the prims above, or `None`
-    /// when it names none of the joints, has no time samples or is not valid at any of them.
+    /// The clip of one animation prim beside the channels `xforms` of the prims above, over the
+    /// stage's `timeline`, or `None` when it names none of the joints, has no time samples or is
+    /// not valid at any of them.
     pub(super) fn clip(
         &self,
         anim: &usd::Prim,
-        per_second: f64,
+        timeline: &Timeline,
         xforms: &[Channel],
         settings: &ClipSettings,
     ) -> Result<Option<Clip>, String> {
@@ -425,9 +433,8 @@ impl Skel {
         if joints.iter().all(Option::is_none) {
             return Ok(None);
         }
-        let attrs = ["translations", "rotations", "scales"];
         let mut times: Vec<f64> = Vec::new();
-        for a in attrs {
+        for a in ANIMATED {
             times.extend(
                 anim.attribute(a)
                     .time_sample_times()
@@ -478,7 +485,7 @@ impl Skel {
         if !valid {
             return Ok(None);
         }
-        let seconds: Vec<f32> = times.iter().map(|t| (t / per_second) as f32).collect();
+        let seconds: Vec<f32> = times.iter().map(|&t| timeline.seconds(t) as f32).collect();
         let mut channels = xforms.to_vec();
         for (i, j) in joints.iter().enumerate() {
             let Some(j) = *j else { continue };
@@ -488,8 +495,12 @@ impl Skel {
                     .map_err(|e| format!("{path} joint {}: {e}", names[i]))?,
             );
         }
-        let span = skin::span(&channels);
-        Ok(Some(skin::resample(&self.info, &channels, span, settings)))
+        Ok(Some(skin::resample(
+            &self.info,
+            &channels,
+            timeline.span(),
+            settings,
+        )))
     }
 }
 

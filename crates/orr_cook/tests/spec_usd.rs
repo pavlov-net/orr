@@ -3792,6 +3792,52 @@ def Xform "Door"
     assert!(has(&a, "u/Door/skeleton"));
 }
 
+/// Every clip and animated page of a stage runs on its one timeline, from the first sample of
+/// anything that moves: an animation that starts late holds its first pose until its first
+/// sample, as USD holds a value, and a page's clock reads the same time as the clips.
+#[test]
+fn clips_and_pages_run_on_the_stage_timeline() {
+    let anim = |name: &str, samples: &str| {
+        format!(
+            "def SkelAnimation \"{name}\" {{\n uniform token[] joints = [\"Root\"]\n \
+             float3[] translations.timeSamples = {{ {samples} }}\n {ROTATIONS}\n {SCALES}\n}}"
+        )
+    };
+    let late = anim("Late", "5: [(0, 0, 0)], 10: [(1, 0, 0)]");
+    let early = anim("Early", "-10: [(0, 0, 0)], 0: [(2, 0, 0)]");
+    let body = format!(
+        "{}\n{}",
+        skinned("", &format!("{late}\n{early}")),
+        instancing(
+            "int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0)], 10: [(4, 0, 0)] }"
+        )
+    );
+    let a = cook("stage-timeline", &body);
+    // Time codes -10 to 10 at 10 a second.
+    let root_at = |clip: &str, t: f32| {
+        let name = format!("u/Hero/clip/{clip}");
+        let clip = Clip::parse(&blob(&a, &name, 0), &blob(&a, &name, 1)).unwrap();
+        assert!((clip.header.duration - 2.0).abs() < 1e-5, "{name}");
+        let mut pose = vec![Trs::IDENTITY; 2];
+        clip.sample(t, &mut pose);
+        pose[0].translation[0]
+    };
+    for (clip, t, want) in [
+        ("Late", 0.0, 0.0),
+        ("Late", 1.25, 0.0),
+        ("Late", 1.75, 0.5),
+        ("Late", 2.0, 1.0),
+        ("Early", 0.5, 1.0),
+        ("Early", 1.5, 2.0),
+    ] {
+        let x = root_at(clip, t);
+        assert!((x - want).abs() < 1e-3, "{clip} at {t} s: {x}, not {want}");
+    }
+    assert_copies(&a, 0.0, &[[0.0, 0.0, 0.0]]);
+    assert_copies(&a, 1.75, &[[3.0, 0.0, 0.0]]);
+}
+
 /// `schemas.dox` poses a skeleton in its prim's space, so a prim above it moves the skin: it
 /// takes that prim as a joint, and every prim down to the skeleton.
 #[test]

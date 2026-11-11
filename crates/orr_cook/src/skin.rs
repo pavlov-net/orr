@@ -852,16 +852,6 @@ impl ClipSettings {
     }
 }
 
-/// First key time and the time to the last, over every channel.
-pub(crate) fn span(channels: &[Channel]) -> (f64, f64) {
-    let start = channels.iter().map(|c| c.times[0]).fold(f32::MAX, f32::min);
-    let end = channels
-        .iter()
-        .map(|c| c.times[c.times.len() - 1])
-        .fold(f32::MIN, f32::max);
-    (f64::from(start), f64::from(end) - f64::from(start))
-}
-
 /// Translation distance (m) and rotation angle (degrees) between two transforms: the larger of
 /// the angle between the frames of their linear parts, which a collapsed axis still completes,
 /// and the angle between any axis and its counterpart, which shows a shear the frames don't.

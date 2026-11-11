@@ -34,8 +34,10 @@
 //!   another model has the name or it would be `mesh`), unless it is all the stage holds; a selected model or a prototype keeps its own, with one
 //!   skeleton. Prims become joints as glTF nodes do ([`crate::skin`]), and a rig cooks as rigid
 //!   parts, one per joint, part 0 on a still joint, unless a subdivision cage in it takes its
-//!   joints by skinning. Its one clip is `xform`, over the samples of every prim on the stage
-//!   so that such clips keep time. A `Skeleton` under
+//!   joints by skinning. Its one clip is `xform`. Every clip of the stage, this one and each
+//!   `SkelAnimation`'s, runs over the stage's one timeline, from the first sample of a moving
+//!   xform, moving instancer or `SkelAnimation` to the last, so that its clips keep time. A
+//!   `Skeleton` under
 //!   such a prim keeps its model, with the prims above it as joints, and each of its clips
 //!   holds them too, beside an `xform` clip without a `SkelAnimation`.
 //! - An instancer whose own attributes move its instances cooks to animated pages: per interval
@@ -213,6 +215,30 @@ pub enum Subdivision {
 
 /// The clip of a stage's xforms, which have no animation prim to name them.
 const XFORM_CLIP: &str = "xform";
+
+/// The stage's one timeline, from the first sample of what moves on it (a sampled xform, an
+/// instancer whose instances move, a `SkelAnimation`) to the last: every clip and animated page
+/// of the stage runs on it, from its start. USD holds a value before its first sample and after
+/// its last, so a source that starts late or ends early holds there.
+#[derive(Clone, Copy)]
+pub(super) struct Timeline {
+    /// Time codes of its ends.
+    first: f64,
+    last: f64,
+    per_second: f64,
+}
+
+impl Timeline {
+    /// Seconds from its start to time code `t`.
+    pub(super) fn seconds(&self, t: f64) -> f64 {
+        (t - self.first) / self.per_second
+    }
+
+    /// The span clips resample over, from its start: `(0, length)` in seconds.
+    pub(super) fn span(&self) -> (f64, f64) {
+        (0.0, self.seconds(self.last))
+    }
+}
 
 /// A joint's inverse bind from its bind pose: the identity where that collapses an axis, which
 /// leaves the joint's own space as bind space.
@@ -577,6 +603,7 @@ struct Importer<'s> {
     by_path: HashMap<String, usize>,
     /// By instancer node, those whose instances move.
     motions: HashMap<usize, Motion>,
+    timeline: Timeline,
     images: Vec<ImageFile>,
     image_of: HashMap<String, usize>,
     materials: Vec<SceneMaterial>,
@@ -631,6 +658,7 @@ impl<'s> Importer<'s> {
                 0.0
             }
         });
+        let per_second = stage.time_codes_per_second();
         Ok(Self {
             settings,
             stage,
@@ -640,6 +668,11 @@ impl<'s> Importer<'s> {
             nodes: Vec::new(),
             by_path: HashMap::new(),
             motions: HashMap::new(),
+            timeline: Timeline {
+                first: f64::MAX,
+                last: f64::MIN,
+                per_second,
+            },
             images: Vec::new(),
             image_of: HashMap::new(),
             materials: Vec::new(),
@@ -772,6 +805,7 @@ impl<'s> Importer<'s> {
     fn run(&mut self) -> Result<Scene, String> {
         self.traverse()?;
         self.find_motions()?;
+        self.find_timeline()?;
         let n = self.nodes.len();
         let mut models: Vec<Building> = Vec::new();
         let mut owner: Vec<Option<usize>> = vec![None; n];
@@ -1649,7 +1683,7 @@ impl<'s> Importer<'s> {
     }
 
     /// The channels of `prims`' xforms: keys at their samples and between them, every
-    /// [`ClipSettings::max_rate`].
+    /// [`ClipSettings::max_rate`], in seconds of the stage's timeline.
     fn xform_channels(&self, prims: &[(usize, u16)]) -> Result<Vec<Channel>, String> {
         let per_second = self.stage.time_codes_per_second();
         let rate = f64::from(self.settings.clips.max_rate);
@@ -1673,39 +1707,48 @@ impl<'s> Importer<'s> {
                 let local = r.at(t).local_transform()?.0;
                 keys.push(skel::prim_trs(&format!("{path} at {t}"), local)?);
             }
-            let seconds: Vec<f32> = times.iter().map(|t| (t / per_second) as f32).collect();
+            let timeline = &self.timeline;
+            let seconds: Vec<f32> = times.iter().map(|&t| timeline.seconds(t) as f32).collect();
             let keyed = skel::trs_channels(usize::from(joint), &seconds, &keys);
             channels.extend(keyed.map_err(|e| format!("{path}: {e}"))?);
         }
         Ok(channels)
     }
 
-    /// The start and length in seconds of every xform on the stage, as [`skin::span`] gives them.
-    fn xform_span(&self) -> (f64, f64) {
-        let per_second = self.stage.time_codes_per_second();
-        let seconds = |t: f64| f64::from((t / per_second) as f32);
+    /// Settles the stage's [`Timeline`], over the samples of every moving xform, every instancer
+    /// whose instances move and every `SkelAnimation`.
+    fn find_timeline(&mut self) -> Result<(), String> {
         let held = self.nodes.iter().filter(|d| !d.times.is_empty());
-        let ends = held.map(|d| (d.times[0], d.times[d.times.len() - 1]));
+        let mut ends: Vec<(f64, f64)> = held
+            .map(|d| (d.times[0], d.times[d.times.len() - 1]))
+            .collect();
         // An instancer's first interval runs back from its first sample.
-        let moved = self
-            .motions
-            .values()
-            .map(|m| (m.times[1], m.times[m.times.len() - 1]));
-        let (first, last) = ends
-            .chain(moved)
-            .fold((f64::MAX, f64::MIN), |(a, b), e| (a.min(e.0), b.max(e.1)));
-        (seconds(first), seconds(last) - seconds(first))
+        let moved = self.motions.values();
+        ends.extend(moved.map(|m| (m.times[1], m.times[m.times.len() - 1])));
+        for node in self.nodes.iter().filter(|d| d.ty == "SkelAnimation") {
+            let path = node.prim.path().as_str();
+            for a in skel::ANIMATED {
+                let times = node.prim.attribute(a).time_sample_times();
+                let times = times.map_err(|e| format!("{path} {a}: {e}"))?;
+                ends.extend(times.iter().map(|&t| (t, t)));
+            }
+        }
+        for (first, last) in ends {
+            self.timeline.first = self.timeline.first.min(first);
+            self.timeline.last = self.timeline.last.max(last);
+        }
+        Ok(())
     }
 
     /// The clip of `channels`, what xforms make up alone, or `None` without any. It runs over
-    /// every xform, so the clips of separate skeletons keep time.
+    /// the stage's timeline, so the clips of separate skeletons keep time.
     fn xform_clip(
         &self,
         info: &SkeletonInfo,
         channels: &[Channel],
     ) -> Result<Option<orr_pack::clip::Clip>, String> {
         self.settings.clips.check()?;
-        let span = self.xform_span();
+        let span = self.timeline.span();
         let clips = &self.settings.clips;
         Ok((!channels.is_empty()).then(|| skin::resample(info, channels, span, clips)))
     }
@@ -2084,9 +2127,7 @@ impl<'s> Importer<'s> {
             ..
         } = at;
         let right = self.root.inverse();
-        let start = self.xform_span().0;
-        let per_second = self.stage.time_codes_per_second();
-        let seconds = |t: &f64| (t / per_second - start) as f32;
+        let seconds = |t: &f64| self.timeline.seconds(*t) as f32;
         let times: Vec<f32> = motion.times.iter().map(seconds).collect();
         for (proto, entry) in instancer.protos.iter().enumerate() {
             let Some((_, p)) = entry else { continue };
@@ -2656,7 +2697,6 @@ impl<'s> Importer<'s> {
         sites: &[usize],
     ) -> Result<Vec<(String, orr_pack::clip::Clip)>, String> {
         self.settings.clips.check()?;
-        let per_second = self.stage.time_codes_per_second();
         let mut sources: Vec<usize> = Vec::new();
         for &n in sites.iter().chain(self.by_path.get(path)) {
             sources.extend(self.animation_source(n)?);
@@ -2671,7 +2711,7 @@ impl<'s> Importer<'s> {
         let mut clips = Vec::new();
         for i in sources {
             let node = &self.nodes[i];
-            if let Some(c) = sk.clip(&node.prim, per_second, &xforms, &self.settings.clips)? {
+            if let Some(c) = sk.clip(&node.prim, &self.timeline, &xforms, &self.settings.clips)? {
                 clips.push((node.name.clone(), c));
             }
         }

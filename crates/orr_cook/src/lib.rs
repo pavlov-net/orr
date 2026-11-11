@@ -33,8 +33,8 @@
 //! ([`UsdSettings`]): the whole-stage model holds the meshes no other model holds; each
 //! `SkelRoot` is a model `N/<root>` of its skinned meshes with skeleton `N/<root>/skeleton`
 //! and clips `N/<root>/clip/<animation>`; prims whose xforms are sampled over time move what
-//! is under them as glTF's animated nodes do, by a clip `<model>/clip/xform` that keeps time
-//! with the stage's other such clips; each `PointInstancer` prototype is a model
+//! is under them as glTF's animated nodes do, by a clip `<model>/clip/xform`; every clip and
+//! animated page of a stage runs on one timeline, so they keep time; each `PointInstancer` prototype is a model
 //! `N/<prototype>` placed by instance pages `N/instances/...`; materials are
 //! `N/material/<prim path>` (`<prim path>/double_sided` on double-sided meshes,
 //! `<prim path>/primvars/<k>` on meshes that differ in what its primvar readers fetch), their
