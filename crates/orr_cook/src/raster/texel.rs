@@ -4,7 +4,8 @@ use orr_pack::raster::RasterLayer;
 use orr_pack::texture::vk;
 use serde::Deserialize;
 
-use crate::texture::{Img, linear_to_srgb, srgb_to_linear};
+use crate::Result;
+use crate::texture::{Img, srgb_to_linear};
 
 /// Texel format of a raster input. RGB8 is stored as RGBA8 with alpha 255.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -153,8 +154,8 @@ impl Texel {
 #[serde(rename_all = "snake_case")]
 pub enum Reduction {
     /// f32: `(a + b + c + d) * 0.25` with `a` top-left, `b` right of it, `c` below it, `d`
-    /// diagonal. Integer channels: the rounded mean; sRGB color is averaged in linear
-    /// light.
+    /// diagonal. Integer channels: the mean of the finest texels under the texel, rounded
+    /// once to the nearest value with ties to even; sRGB color is averaged in linear light.
     #[default]
     Mean,
     /// Per channel; f32 NaN loses to any number.
@@ -175,15 +176,148 @@ impl Reduction {
     }
 }
 
-/// Reduces two rows of finer texels into one row of half the width.
-pub(super) fn reduce_rows(
+/// Builds the coarser levels of a raster from its finest rows as they arrive: level `k`
+/// (1 for half the finest size) takes a row from every `2^k` finest rows.
+pub(super) struct Cascade {
     t: Texel,
     r: Reduction,
-    srgb: bool,
-    top: &[u8],
-    bottom: &[u8],
-    out: &mut [u8],
-) {
+    /// Fixed-point linear light of each sRGB code, when color channels average in it.
+    lut: Option<Box<[u128; 256]>>,
+    /// By level, from the first coarser one: the upper row of the pair being formed.
+    pending: Vec<Option<Row>>,
+}
+
+/// A row of one level: stored texels, or the exact sums of the finest texel values under
+/// each of its texels' channels.
+enum Row {
+    Texels(Vec<u8>),
+    Sums(Vec<u128>),
+}
+
+/// Bits below the point of the fixed-point linear light that sRGB means sum.
+const LINEAR_BITS: i32 = 64;
+
+impl Cascade {
+    pub(super) fn new(t: Texel, r: Reduction, srgb: bool, coarser: usize) -> Self {
+        let lut = (srgb && r == Reduction::Mean && t == Texel::Rgba8).then(|| {
+            let scale = 2f64.powi(LINEAR_BITS);
+            Box::new(std::array::from_fn(|b| {
+                (orr_color::srgb_decode(b as f64 / 255.0) * scale).round() as u128
+            }))
+        });
+        Self {
+            t,
+            r,
+            lut,
+            pending: (0..coarser).map(|_| None).collect(),
+        }
+    }
+
+    /// Takes the next finest row; `emit(k, texels)` receives each row of level `k` it
+    /// completes, finer levels first.
+    pub(super) fn push(
+        &mut self,
+        finest: &[u8],
+        mut emit: impl FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let sums = self.t != Texel::R32f && self.r == Reduction::Mean;
+        let mut row = if sums {
+            Row::Sums(self.values(finest))
+        } else {
+            Row::Texels(finest.to_vec())
+        };
+        for k in 0..self.pending.len() {
+            let Some(top) = self.pending[k].take() else {
+                self.pending[k] = Some(row);
+                break;
+            };
+            row = match (top, row) {
+                (Row::Texels(top), Row::Texels(bottom)) => {
+                    let mut out = vec![0; bottom.len() / 2];
+                    reduce_rows(self.t, self.r, &top, &bottom, &mut out);
+                    emit(k + 1, &out)?;
+                    Row::Texels(out)
+                }
+                (Row::Sums(top), Row::Sums(bottom)) => {
+                    let out = sum_rows(self.channels(), &top, &bottom);
+                    emit(k + 1, &self.means(&out, k as u32 + 1))?;
+                    Row::Sums(out)
+                }
+                _ => unreachable!("a cascade's rows are all texels or all sums"),
+            };
+        }
+        Ok(())
+    }
+
+    fn channels(&self) -> usize {
+        match self.t {
+            Texel::R16 => 1,
+            t => t.bytes(),
+        }
+    }
+
+    /// The channel values of a row of stored texels, in linear light for sRGB color.
+    fn values(&self, texels: &[u8]) -> Vec<u128> {
+        match self.t {
+            Texel::R16 => texels
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u128::from(u16::from_le_bytes(*b)))
+                .collect(),
+            _ => texels
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| match &self.lut {
+                    Some(lut) if i % 4 < 3 => lut[usize::from(b)],
+                    _ => u128::from(b),
+                })
+                .collect(),
+        }
+    }
+
+    /// Stored texels of level `k` from its sums over `4^k` finest texels each.
+    fn means(&self, sums: &[u128], k: u32) -> Vec<u8> {
+        let shift = 2 * k;
+        let int = |s: u128| {
+            let (q, rest, half) = (s >> shift, s & ((1 << shift) - 1), 1 << (shift - 1));
+            q + u128::from(rest > half || (rest == half && q & 1 == 1))
+        };
+        match self.t {
+            Texel::R16 => sums
+                .iter()
+                .flat_map(|&s| (int(s) as u16).to_le_bytes())
+                .collect(),
+            _ => sums
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| match &self.lut {
+                    Some(_) if i % 4 < 3 => {
+                        let linear = s as f64 * 2f64.powi(-LINEAR_BITS - shift as i32);
+                        (orr_color::srgb_encode(linear) * 255.0).round_ties_even() as u8
+                    }
+                    _ => int(s) as u8,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The 2x2 sums of two rows of `channels`-channel sums: a row of half the width.
+fn sum_rows(channels: usize, top: &[u128], bottom: &[u128]) -> Vec<u128> {
+    let n = channels;
+    (0..top.len() / 2)
+        .map(|i| {
+            let (px, ch) = (i / n, i % n);
+            let at = 2 * px * n + ch;
+            top[at] + top[at + n] + bottom[at] + bottom[at + n]
+        })
+        .collect()
+}
+
+/// Reduces two rows of finer stored texels into one row of half the width, for every
+/// reduction but the integer mean.
+fn reduce_rows(t: Texel, r: Reduction, top: &[u8], bottom: &[u8], out: &mut [u8]) {
     let n = t.bytes();
     debug_assert_eq!(top.len(), out.len() * 2);
     if r == Reduction::Nearest {
@@ -220,18 +354,11 @@ pub(super) fn reduce_rows(
             }
         }
         Texel::R8 | Texel::Rg8 | Texel::Rgba8 => {
-            let lut = (srgb && r == Reduction::Mean && t == Texel::Rgba8).then(srgb_lut);
             for (i, o) in out.iter_mut().enumerate() {
                 let (px, ch) = (i / n, i % n);
                 let at = 2 * px * n + ch;
                 let v = [top[at], top[at + n], bottom[at], bottom[at + n]];
-                *o = match &lut {
-                    Some(lut) if ch < 3 => {
-                        let l = v.iter().map(|&b| lut[usize::from(b)]).sum::<f32>() * 0.25;
-                        (linear_to_srgb(l) * 255.0).round() as u8
-                    }
-                    _ => reduce_int(r, v.map(u32::from)) as u8,
-                };
+                *o = reduce_int(r, v.map(u32::from)) as u8;
             }
         }
     }
@@ -239,13 +366,108 @@ pub(super) fn reduce_rows(
 
 fn reduce_int(r: Reduction, v: [u32; 4]) -> u32 {
     match r {
-        Reduction::Mean => (v.iter().sum::<u32>() + 2) / 4,
+        Reduction::Mean => unreachable!("integer means reduce from sums"),
         Reduction::Min => v.into_iter().min().expect("four values"),
         Reduction::Max => v.into_iter().max().expect("four values"),
         Reduction::Nearest => v[0],
     }
 }
 
-fn srgb_lut() -> [f32; 256] {
-    std::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The coarser levels of the square `finest` (`size` texels a side) through the cascade,
+    /// from level 1.
+    fn cascade(t: Texel, srgb: bool, size: usize, coarser: usize, finest: &[u8]) -> Vec<Vec<u8>> {
+        let mut c = Cascade::new(t, Reduction::Mean, srgb, coarser);
+        let mut levels = vec![Vec::new(); coarser];
+        for row in finest.chunks_exact(finest.len() / size) {
+            c.push(row, |k, out| {
+                levels[k - 1].extend_from_slice(out);
+                Ok(())
+            })
+            .unwrap();
+        }
+        levels
+    }
+
+    /// The finest values of channel `ch` under texel `(x, y)` of level `k`.
+    fn block(
+        finest: &[u32],
+        size: usize,
+        channels: usize,
+        k: usize,
+        x: usize,
+        y: usize,
+        ch: usize,
+    ) -> impl Iterator<Item = u32> + '_ {
+        let n = 1 << k;
+        (0..n * n).map(move |i| finest[((y * n + i / n) * size + x * n + i % n) * channels + ch])
+    }
+
+    fn noise(len: usize, mut s: u64) -> impl Iterator<Item = u64> {
+        (0..len).map(move |_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        })
+    }
+
+    #[test]
+    fn integer_means_are_the_rounded_means_of_the_finest_texels() {
+        let (size, coarser) = (512, 9);
+        let finest: Vec<u32> = noise(size * size, 0x9E37_79B9_7F4A_7C15)
+            .map(|v| (v >> 48) as u32)
+            .collect();
+        let bytes: Vec<u8> = finest
+            .iter()
+            .flat_map(|&v| (v as u16).to_le_bytes())
+            .collect();
+        let levels = cascade(Texel::R16, false, size, coarser, &bytes);
+        for (k, level) in (1..).zip(&levels) {
+            let m = size >> k;
+            for (i, got) in level.as_chunks::<2>().0.iter().enumerate() {
+                let n = 1u64 << (2 * k);
+                let sum: u64 = block(&finest, size, 1, k, i % m, i / m, 0)
+                    .map(u64::from)
+                    .sum();
+                let (q, r) = (sum / n, sum % n);
+                let want = q + u64::from(2 * r > n || (2 * r == n && q % 2 == 1));
+                assert_eq!(
+                    u64::from(u16::from_le_bytes(*got)),
+                    want,
+                    "level {k} texel {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn srgb_means_average_the_finest_texels_in_linear_light() {
+        let (size, coarser) = (128, 7);
+        let finest: Vec<u32> = noise(size * size * 4, 0x2545_F491_4F6C_DD1D)
+            .map(|v| (v >> 56) as u32)
+            .collect();
+        let bytes: Vec<u8> = finest.iter().map(|&v| v as u8).collect();
+        let levels = cascade(Texel::Rgba8, true, size, coarser, &bytes);
+        for (k, level) in (1..).zip(&levels) {
+            let m = size >> k;
+            for (i, &got) in level.iter().enumerate() {
+                let (px, ch) = (i / 4, i % 4);
+                let values = block(&finest, size, 4, k, px % m, px / m, ch);
+                let n = (1u64 << (2 * k)) as f64;
+                let want = if ch < 3 {
+                    let linear: f64 = values
+                        .map(|v| orr_color::srgb_decode(f64::from(v) / 255.0))
+                        .sum();
+                    (orr_color::srgb_encode(linear / n) * 255.0).round_ties_even()
+                } else {
+                    (values.map(f64::from).sum::<f64>() / n).round_ties_even()
+                };
+                assert_eq!(f64::from(got), want, "level {k} texel {px} channel {ch}");
+            }
+        }
+    }
 }

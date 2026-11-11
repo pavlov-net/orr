@@ -1,10 +1,10 @@
 //! Raster set cook: whole rasters tiled into bordered LOD pyramids by the cook, or tiles a
 //! producer already cut, into one raster set entry (`orr_pack::raster`).
 //!
-//! A whole raster is read once in row bands; each coarser level is reduced from the finer
-//! one as rows arrive and written to a scratch file (in the cache directory, or the system
-//! temporary directory without a cache), so memory stays bounded by the band and the
-//! tiles in flight. Tiles are then cut from the level files in table order and encoded in
+//! A whole raster is read once in row bands; each coarser level is reduced as rows arrive
+//! (an integer mean from exact sums of the finest texels) and written to a scratch file (in
+//! the cache directory, or the system temporary directory without a cache), so memory stays
+//! bounded by the band, a row per level and the tiles in flight. Tiles are then cut from the level files in table order and encoded in
 //! parallel on the rayon pool.
 
 mod input;

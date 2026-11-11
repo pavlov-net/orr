@@ -11,7 +11,7 @@ use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
 use tiff::{ColorType, TiffError};
 
-use super::texel::{RasterFormat, Reduction, reduce_rows};
+use super::texel::{Cascade, RasterFormat, Reduction};
 use crate::state::hash_file;
 use crate::{Error, Result};
 
@@ -395,7 +395,7 @@ pub(crate) fn build_levels(
         let (file, path) = scratch.create()?;
         coarse.push((file, path, size >> (lod_count - 1 - l)));
     }
-    let mut pending: Vec<Option<Vec<u8>>> = vec![None; coarse.len()];
+    let mut cascade = Cascade::new(t, reduction, srgb, coarse.len());
     let mut writers: Vec<BufWriter<&File>> = coarse
         .iter()
         .map(|(f, ..)| BufWriter::with_capacity(1 << 20, f))
@@ -411,19 +411,11 @@ pub(crate) fn build_levels(
             w.write_all(&stored).map_err(|e| write_error(scratch, e))?;
         }
         for row in stored.chunks_exact(row_bytes) {
-            let mut row = row.to_vec();
-            for (k, p) in pending.iter_mut().enumerate() {
-                let Some(top) = p.take() else {
-                    *p = Some(row);
-                    break;
-                };
-                let mut out = vec![0; row.len() / 2];
-                reduce_rows(t, reduction, srgb, &top, &row, &mut out);
-                writers[k]
-                    .write_all(&out)
-                    .map_err(|e| write_error(scratch, e))?;
-                row = out;
-            }
+            cascade.push(row, |k, out| {
+                writers[k - 1]
+                    .write_all(out)
+                    .map_err(|e| write_error(scratch, e))
+            })?;
         }
     }
     for w in writers {

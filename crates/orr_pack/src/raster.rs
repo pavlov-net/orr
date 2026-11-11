@@ -62,8 +62,10 @@ pub struct RasterLayer {
 }
 
 impl RasterLayer {
-    /// Average of the 2x2 block; for f32, `(a + b + c + d) * 0.25` in that order with `a`
-    /// the top-left texel, `b` its right, `c` below, `d` diagonal.
+    /// For f32, the average of the 2x2 block, `(a + b + c + d) * 0.25` in that order with
+    /// `a` the top-left texel, `b` its right, `c` below, `d` diagonal; for integers, the mean
+    /// of the finest texels under the texel, rounded once with ties to even, and sRGB color
+    /// averaged in linear light.
     pub const MEAN: u8 = 0;
     pub const MIN: u8 = 1;
     pub const MAX: u8 = 2;
