@@ -405,12 +405,13 @@ mod depth_of_field {
         reference: ComputePipeline,
         root: Allocation<dof_scene::Root>,
         constants: Allocation<ViewConstants>,
-        /// The view's exposure slots, both holding the frame's state: the pass reads the
-        /// adapted exposure from either, by its path.
+        /// The view's exposure slots; the view reads slot 0 as its current one.
         exposure: Allocation<ExposureState>,
-        /// The pre-exposure the next frame is lit with. The scenes are in exposed units: the
-        /// adapted exposure stays 1.
+        /// The pre-exposure the next frame is lit with.
         pre_exposure: f32,
+        /// The adapted exposure each slot holds, of which the pass reads one by its path. The
+        /// scenes are in exposed units at 1.
+        adapted: [f32; 2],
         rr_output: Texture,
         linear: Texture,
         depth: TextureIndex,
@@ -519,6 +520,7 @@ mod depth_of_field {
                 constants,
                 exposure,
                 pre_exposure: 1.0,
+                adapted: [1.0; 2],
                 depth: gpu.write_sampled(slot(), &depth, &view),
                 depth_store: gpu.write_storage(slot(), &depth, &view),
                 motion: gpu.write_sampled(slot(), &motion, &view),
@@ -598,9 +600,16 @@ mod depth_of_field {
         ) -> (Vec<[f32; 4]>, Vec<&'static str>, Option<Vec<f32>>) {
             let gpu = device();
             self.frame += 1;
-            for e in self.exposure.as_mut_slice().unwrap() {
+            for (e, adapted) in self
+                .exposure
+                .as_mut_slice()
+                .unwrap()
+                .iter_mut()
+                .zip(self.adapted)
+            {
                 e.prev_pre_exposure = e.pre_exposure;
                 e.pre_exposure = self.pre_exposure;
+                e.adapted_ev100 = ev100_from_exposure(adapted);
             }
             self.put_root(scene, &dof.unwrap_or_else(|| lens(0, 1.4)));
             let queue = gpu.queue(QueueKind::Render).unwrap();
@@ -1006,6 +1015,38 @@ mod depth_of_field {
                 .fold(0.0, f32::max);
             log::info!("{scene:?}: largest change from the fixed pre-exposure's image: {worst}");
             assert!(worst < 1e-2, "{scene:?}: {worst}");
+        }
+        assert_clean();
+    }
+
+    /// Highlights are measured at the newest adapted exposure: after the exposure pass the
+    /// next slot's, on the guide path, which runs before it, the current slot's. A wrong
+    /// exposure in the other slot changes nothing; in both it changes the image.
+    #[test]
+    fn highlights_read_the_adapted_exposure_their_path_has() {
+        let dof = Some(lens(6, 1.0));
+        let apart = |a: &[[f32; 4]], b: &[[f32; 4]]| {
+            a.iter()
+                .zip(b)
+                .flat_map(|(a, b)| (0..3).map(|c| (a[c] - b[c]).abs() / a[c].abs().max(0.05)))
+                .fold(0.0, f32::max)
+        };
+        for (path, other) in [(DofPath::AfterRr, 0), (DofPath::Guide, 1)] {
+            let render = |adapted: [f32; 2]| {
+                let mut b = Bed::new();
+                b.adapted = adapted;
+                b.render(Scene::Highlights, dof, path).0
+            };
+            let expected = render([1.0; 2]);
+            let mut adapted = [1.0; 2];
+            adapted[other] = 1.0 / 16.0;
+            let unread = apart(&expected, &render(adapted));
+            let read = apart(&expected, &render([1.0 / 16.0; 2]));
+            assert!(
+                unread < 1e-2,
+                "{path:?}: {unread} with the other slot wrong"
+            );
+            assert!(read > 0.1, "{path:?}: {read} with both slots wrong");
         }
         assert_clean();
     }
