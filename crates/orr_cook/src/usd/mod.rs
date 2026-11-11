@@ -1165,14 +1165,14 @@ impl<'s> Importer<'s> {
                     let still = sk
                         .still
                         .expect("`add_still` saw every mesh without a binding");
-                    let one = ([still as u8; 4], [255, 0, 0, 0]);
+                    let one = ([still as u8; 4], [65535, 0, 0, 0]);
                     let to_model = self.to_model(&models[o], i)?;
                     (Some(vec![one; mesh.points.len()]), to_model, 0)
                 }
                 (_, _, Some(r)) => {
                     let (j, to_bind) = self.attach(r, &models[o], i)?;
                     let skin = (!r.rigid).then(|| {
-                        let one = ([j as u8; 4], [255, 0, 0, 0]);
+                        let one = ([j as u8; 4], [65535, 0, 0, 0]);
                         vec![one; mesh.points.len()]
                     });
                     (skin, to_bind, j)

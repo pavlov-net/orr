@@ -836,6 +836,8 @@ fn joints_of(a: &Archive, name: &str) -> Vec<u8> {
             for t in 0..u32::from(c.tri_count) {
                 for v in view.triangle(&c, t).map(u32::from) {
                     let (j, w) = (view.joints(&c, v).unwrap(), view.weights(&c, v).unwrap());
+                    let codes: u32 = w.iter().map(|w| (w * 65535.0).round() as u32).sum();
+                    assert_eq!(codes, 65535, "weights {w:?}");
                     let k = (0..4).max_by(|&a, &b| w[a].total_cmp(&w[b])).unwrap();
                     out.push(j[k]);
                 }
