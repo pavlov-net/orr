@@ -1,2 +1,4 @@
 target/
 /.tools
+/.claude/*
+!/.claude/skills/
