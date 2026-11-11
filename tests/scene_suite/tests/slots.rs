@@ -4,14 +4,15 @@
 use orr_gpu::GpuPtr;
 use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
-    FrameDesc, FrameTime, InstanceFlags, InstanceRange, InstancesDesc, ModelId, RendererDesc,
-    SceneDesc, SceneRoot, Scenes, TransformGroupId,
+    FrameDesc, FrameTime, InstanceFlags, InstanceRange, InstancesDesc, RendererDesc, SceneDesc,
+    SceneRoot, Scenes, TransformGroupId,
 };
 
 #[test]
 fn removed_slots_wait_for_their_frame() {
     let d = device();
     let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
+    let (_workers, model) = scene_suite::mount_quad(&mut scenes);
     let s = scenes.create_scene(&SceneDesc::default()).unwrap();
     let list = [s];
     let desc = FrameDesc {
@@ -21,7 +22,7 @@ fn removed_slots_wait_for_their_frame() {
     };
     let add = |w: &mut orr_scene::SceneWriter<'_>| {
         w.add_instances(&InstancesDesc {
-            model: ModelId(1),
+            model,
             copies: 100,
             transforms: TransformGroupId(0),
             first: 0,
@@ -75,7 +76,7 @@ fn removed_slots_wait_for_their_frame() {
     );
 
     let slots = read_buffer(root.instances, 300);
-    assert!(slots.iter().all(|i| i.flags == 1 && i.model == 1));
+    assert!(slots.iter().all(|i| i.flags == 1 && i.model == model.0));
     assert_clean();
 }
 

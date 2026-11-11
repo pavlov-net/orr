@@ -3495,7 +3495,7 @@ impl Mounts {
         }
     }
 
-    /// Whether `model` belongs to a ready mount.
+    /// Whether `model` with a mesh belongs to a ready mount or to a live edit of one.
     pub(crate) fn is_live(&self, model: ModelId) -> bool {
         self.owners
             .get(&model)

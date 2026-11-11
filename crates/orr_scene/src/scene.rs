@@ -1470,18 +1470,17 @@ impl<'f> SceneWriter<'f> {
     /// its part run. Each cluster takes the class its section cooked with (a `material_set`
     /// does not change it): dielectric and presence sections are traced by rays that look for
     /// them and never rasterized into the visibility buffer, and one model may mix them with
-    /// opaque sections.
+    /// opaque sections. Fails with [`Error::NotResident`] for a model no ready mount or live
+    /// edit holds.
     ///
     /// Panics if `desc.material_set`'s set 0 ends past `material_set_capacity`.
     pub fn add_instances(&mut self, desc: &InstancesDesc) -> Result<InstanceRange> {
-        self.has_mesh(desc.model)?;
+        self.placeable(desc.model)?;
         if let Some(base) = desc.material_set {
             self.check_material_set(desc.model, base, 0);
         }
-        let ranks = self
-            .model_cpu
-            .get(desc.model.0 as usize)
-            .map_or(0, |m| m.emissive_stride);
+        let model = self.model_cpu[desc.model.0 as usize];
+        let ranks = model.emissive_stride;
         // Window room comes first, so nothing fails once the copies hold slots.
         let (partitions_src, partitions_out) =
             self.window.slice::<u32>(self.device, desc.copies)?;
@@ -1515,11 +1514,11 @@ impl<'f> SceneWriter<'f> {
                     capacity: self.scene.desc.emissive_capacity,
                 });
             };
-            let parts = self
-                .model_cpu
-                .get(desc.model.0 as usize)
-                .map_or(0, |m| m.animated_parts);
-            let cost = 1 + if desc.pose.is_some() { parts } else { 0 };
+            let cost = 1 + if desc.pose.is_some() {
+                model.animated_parts
+            } else {
+                0
+            };
             let holds = &mut cpu.slot_holds[first as usize..(first + desc.copies) as usize];
             for (hold, copy) in holds.iter_mut().zip(0..) {
                 *hold = SlotHold {
@@ -2080,9 +2079,11 @@ impl<'f> SceneWriter<'f> {
     /// inside `rt_range`, traces it through a cluster BLAS built from the cut's cluster
     /// templates, in the PTLAS global partition. Copies skin whether or not a view shows
     /// them, and take the candidate class of the model's own materials as in
-    /// [`Self::add_instances`]. Panics if the model's mesh has no skin or the model no
-    /// skeleton, or if `desc.material_set`'s set 0 ends past `material_set_capacity`.
+    /// [`Self::add_instances`]. Fails with [`Error::NotResident`] as that does. Panics if the
+    /// model's mesh has no skin or the model no skeleton, or if `desc.material_set`'s set 0
+    /// ends past `material_set_capacity`.
     pub fn add_skinned(&mut self, desc: &SkinnedDesc) -> Result<InstanceRange> {
+        self.placeable(desc.model)?;
         if let Some(base) = desc.material_set {
             self.check_material_set(desc.model, base, 0);
         }
@@ -2092,12 +2093,7 @@ impl<'f> SceneWriter<'f> {
     /// [`Self::add_skinned`] for a base that may lie in the page part of the material-set table,
     /// with every copy hiding the sections of `section_mask`.
     fn place_skinned(&mut self, desc: &SkinnedDesc, section_mask: u16) -> Result<InstanceRange> {
-        self.has_mesh(desc.model)?;
-        let model = self
-            .model_cpu
-            .get(desc.model.0 as usize)
-            .copied()
-            .unwrap_or_default();
+        let model = self.model_cpu[desc.model.0 as usize];
         let shape = model
             .skin
             .unwrap_or_else(|| panic!("{:?} has no skinned mesh", desc.model));
@@ -2254,11 +2250,21 @@ impl<'f> SceneWriter<'f> {
         );
     }
 
-    fn has_mesh(&self, model: ModelId) -> Result<()> {
-        match self.model_cpu.get(model.0 as usize) {
-            Some(m) if m.cage_only => Err(Error::NoMesh(model)),
-            _ => Ok(()),
+    /// Refuses a model without a mesh and one no ready mount or live edit holds: the model
+    /// table holds no record for it, or that of an unmounted pack's model.
+    fn placeable(&self, model: ModelId) -> Result<()> {
+        if self.mounts.is_live(model) {
+            return Ok(());
         }
+        // A resident cage-only model keeps its cage; unmounting clears it.
+        let i = model.0 as usize;
+        let cage_only = self.model_cpu.get(i).is_some_and(|m| m.cage_only)
+            && self.cages.get(i).is_some_and(Option::is_some);
+        Err(if cage_only {
+            Error::NoMesh(model)
+        } else {
+            Error::NotResident(model)
+        })
     }
 
     /// Replaces the flags of every copy in `range`.

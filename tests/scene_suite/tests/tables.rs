@@ -5,12 +5,12 @@ use orr_math::{DQuat, DVec3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
     AffineRows, CopyVariant, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstanceGpu,
-    InstanceRange, InstancesDesc, Lens, Light, LightGpu, MaterialGpu, MaterialId, ModelId, Pose,
-    Projection, RendererDesc, SceneDesc, SceneId, SceneRoot, Scenes, SlotStateGpu, TextureFilter,
+    InstanceRange, InstancesDesc, Lens, Light, LightGpu, MaterialGpu, MaterialId, Pose, Projection,
+    RendererDesc, SceneDesc, SceneId, SceneRoot, Scenes, SlotStateGpu, TextureFilter,
     TransformGroupDesc, TransformGroupId, ViewConstants, ViewDesc, WorldPos,
 };
-use scene_suite::pipeline;
 use scene_suite::shaders::{placement, reconstruct};
+use scene_suite::{mount_quad, pipeline};
 
 fn frame<'a>(scenes: &'a [SceneId]) -> FrameDesc<'a> {
     FrameDesc {
@@ -53,6 +53,7 @@ fn run_frame(
 fn instance_and_material_tables_read_back_as_written() {
     let d = device();
     let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
+    let (_workers, model) = mount_quad(&mut scenes);
     let s = scenes.create_scene(&SceneDesc::default()).unwrap();
     let list = [s];
     let mut f = scenes.begin_frame(&frame(&list)).unwrap();
@@ -86,7 +87,7 @@ fn instance_and_material_tables_read_back_as_written() {
     }
     let a = w
         .add_instances(&InstancesDesc {
-            model: ModelId(5),
+            model,
             copies: 600,
             transforms: g,
             first: 0,
@@ -105,7 +106,7 @@ fn instance_and_material_tables_read_back_as_written() {
         .unwrap();
     let b = w
         .add_instances(&InstancesDesc {
-            model: ModelId(9),
+            model,
             copies: 400,
             transforms: g,
             first: 600,
@@ -158,7 +159,7 @@ fn instance_and_material_tables_read_back_as_written() {
             InstanceGpu {
                 group: g.0,
                 group_index: slot,
-                model: 5,
+                model: model.0,
                 material_base: 12,
                 pose_group: pose_group.0,
                 pose_index: 3,
@@ -179,7 +180,7 @@ fn instance_and_material_tables_read_back_as_written() {
             InstanceGpu {
                 group: g.0,
                 group_index: slot,
-                model: 9,
+                model: model.0,
                 material_base: u32::MAX,
                 pose_group: 0,
                 pose_index: 0,
@@ -203,8 +204,8 @@ fn instance_and_material_tables_read_back_as_written() {
             "slot {slot}: {inst:?}"
         );
     }
-    // Zeroed when handed out; then the PTLAS kernel marks each slot seen, and these copies'
-    // models are not resident, so it traces none of them.
+    // Zeroed when handed out; then the PTLAS kernel marks each slot seen, and traces none of
+    // the copies without the ray flag.
     let untraced = SlotStateGpu {
         stable_frames: 255,
         rt_flags: 8,
@@ -212,12 +213,14 @@ fn instance_and_material_tables_read_back_as_written() {
     };
     let state: Vec<SlotStateGpu> = read_buffer(root.slot_state, 1000);
     assert!(
-        state
+        state[600..]
             .iter()
             .all(|s| bytemuck::bytes_of(s) == bytemuck::bytes_of(&untraced))
     );
-    let table = read_buffer(root.materials, 3);
-    for ((id, m), got) in materials.iter().zip(&table) {
+    let last = materials.iter().map(|(id, _)| id.0).max().unwrap();
+    let table = read_buffer(root.materials, u64::from(last) + 1);
+    for (id, m) in &materials {
+        let got = &table[id.0 as usize];
         let stored = MaterialGpu {
             texture_streams: scenes.texture_streams(),
             ..*m
@@ -637,6 +640,7 @@ fn copies_are_placed_relative_to_the_eye_from_cells() {
     const N: u32 = 64;
     let d = device();
     let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
+    let (_workers, model) = mount_quad(&mut scenes);
     let s = scenes.create_scene(&SceneDesc::default()).unwrap();
     let history = scenes.create_view_history().unwrap();
     let anchor = DVec3::new(20_480.75, 12.0, -31_999.5);
@@ -656,7 +660,7 @@ fn copies_are_placed_relative_to_the_eye_from_cells() {
             *t = transform(i as u32, 0.125);
         }
         w.add_instances(&InstancesDesc {
-            model: ModelId(0),
+            model,
             copies: N,
             transforms: g,
             first: 0,

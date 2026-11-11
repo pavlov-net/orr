@@ -824,7 +824,7 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
         })
         .unwrap();
     w.transforms(g, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
-    w.add_instances(&InstancesDesc {
+    let copy = InstancesDesc {
         model: panel,
         copies: 1,
         transforms: g,
@@ -835,8 +835,8 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
         rt_range: 100.0,
         animation_range: 0.0,
         user_tag: 0,
-    })
-    .unwrap();
+    };
+    w.add_instances(&copy).unwrap();
     drop(w);
     let mut root = GpuPtr::NULL;
     f.update_scenes(&mut |c| root = c.root).unwrap();
@@ -908,6 +908,18 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
         );
         frame(&mut scenes);
     }
+    // The model table no longer holds the model's record.
+    let mut f = scenes
+        .begin_frame(&FrameDesc {
+            time: FrameTime::default(),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    let placed = f.scene(s).unwrap().add_instances(&copy);
+    assert!(matches!(placed, Err(Error::NotResident(id)) if id == panel));
+    f.update_scenes(&mut |_| {}).unwrap();
+    f.end(&[]).unwrap();
     let again = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
     ready(&mut scenes, again);
     assert_eq!(

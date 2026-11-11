@@ -212,6 +212,10 @@ pub enum Error {
     /// subdivision entries.
     #[error("{0:?} has no mesh")]
     NoMesh(ModelId),
+    /// No ready mount or live edit holds the model, so the model table holds no record of it,
+    /// or the stale one of an unmounted pack's model.
+    #[error("{0:?} is not resident")]
+    NotResident(ModelId),
     #[error("{0:?} has no subdivision cage")]
     NoCage(ModelId),
     #[error("{0:?} does not exist")]

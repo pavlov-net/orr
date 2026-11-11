@@ -12,14 +12,14 @@ orr_scene = { workspace = true, features = ["testing", "test-hooks"] }
 orr_gpu.workspace = true
 orr_shaders.workspace = true
 orr_math.workspace = true
+orr_cook = { workspace = true, features = ["subd"] }
+orr_pack.workspace = true
 
 [dev-dependencies]
 orr = { workspace = true, features = ["hot-reload"] }
 bytemuck.workspace = true
 half.workspace = true
 orr_color.workspace = true
-orr_cook = { workspace = true, features = ["subd"] }
-orr_pack.workspace = true
 png.workspace = true
 gpu_suite.workspace = true
 
