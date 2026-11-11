@@ -975,11 +975,7 @@ impl PoolState {
         };
         let mut kept = Vec::with_capacity(frees.len());
         for (first, count) in frees {
-            let end = first + count;
-            let mut u = first;
-            while u < end {
-                let page = u / n;
-                let span = end.min((page + 1) * n) - u;
+            for (page, u, span) in spans(n, first, count) {
                 if m.holds(page) {
                     m.deferred.push((u, span));
                 } else {
@@ -988,7 +984,6 @@ impl PoolState {
                         _ => kept.push((u, span)),
                     }
                 }
-                u += span;
             }
         }
         kept
@@ -1191,11 +1186,7 @@ impl PoolState {
     /// Adds or removes units `first..first + count` from the counts in use, on pages of `n`
     /// units.
     fn count(&mut self, n: u32, first: u32, count: u32, add: bool) {
-        let end = first + count;
-        let mut u = first;
-        while u < end {
-            let page = u / n;
-            let span = end.min((page + 1) * n) - u;
+        for (page, _, span) in spans(n, first, count) {
             if add {
                 self.used[page as usize] += span;
                 self.used_units += u64::from(span);
@@ -1204,9 +1195,24 @@ impl PoolState {
                 self.used_units -= u64::from(span);
             }
             self.refile(page);
-            u += span;
         }
     }
+}
+
+/// The parts of units `first..first + count` in each page of `n` units: `(page, first unit,
+/// units)` each, in order.
+fn spans(n: u32, first: u32, count: u32) -> impl Iterator<Item = (u32, u32, u32)> {
+    let end = first + count;
+    let mut u = first;
+    std::iter::from_fn(move || {
+        (u < end).then(|| {
+            let page = u / n;
+            let span = end.min((page + 1) * n) - u;
+            let part = (page, u, span);
+            u += span;
+            part
+        })
+    })
 }
 
 impl LoadingSide {
@@ -1553,8 +1559,8 @@ pub(crate) fn build_pages(
     }
 
     // The op lists and outputs.
-    let frees = started.ops.bound.len() + started.ops.frees.len();
-    let frees = frees + started.ops.releases.len();
+    let ops = &started.ops;
+    let frees = ops.bound.len() + ops.frees.len() + ops.releases.len();
     let takes = started.ops.takes.len();
     let upload_bytes = n * size_of::<ClasJob>() as u64
         + builds.len() as u64 * (size_of::<AccelRoot>() as u64 + 32)
