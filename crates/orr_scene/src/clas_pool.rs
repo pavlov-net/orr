@@ -449,9 +449,10 @@ impl ClasPool {
     }
 
     /// Whether a batch should run for the pool alone: frees, takes, unbinds or unreported
-    /// pages wait.
-    pub(crate) fn pending(&self) -> bool {
-        self.state.lock().unwrap().pending()
+    /// pages wait, or slots moved pages left can return.
+    pub(crate) fn pending(&self, device: &Device) -> bool {
+        let s = self.state.lock().unwrap();
+        s.pending() || s.retiring.iter().any(|&(p, _)| device.is_complete(p))
     }
 
     /// Ends the render thread's step: asks to take the wholly free pages the reservations no
@@ -937,7 +938,6 @@ impl PoolState {
             || !self.unreported.is_empty()
             || !self.micromap_frees.is_empty()
             || !self.releases.is_empty()
-            || !self.retiring.is_empty()
             || (self.replan && self.moving.is_none())
     }
 

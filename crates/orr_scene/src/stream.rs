@@ -2053,7 +2053,7 @@ impl Streaming {
             .collect();
         loads.extend(blob_loads);
         let mut tasks = split_tasks(loads, self.clas.is_some());
-        let clas_waits = self.clas.as_ref().is_some_and(|c| c.pending());
+        let clas_waits = self.clas.as_ref().is_some_and(|c| c.pending(w.device));
         if tasks.is_empty() && (!self.unbinds.is_empty() || clas_waits) {
             tasks.push(Vec::new());
         }
@@ -3575,7 +3575,7 @@ fn build_clas(
     let pages: Vec<usize> = (0..loads.len())
         .filter(|&i| loads[i].result.is_ok() && loads[i].mesh.is_some())
         .collect();
-    if pages.is_empty() && !pool.pending() {
+    if pages.is_empty() && !pool.pending(device) {
         return Ok(None);
     }
     let builds: Vec<PageBuild<'_>> = pages
