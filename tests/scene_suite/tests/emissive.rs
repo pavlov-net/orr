@@ -1226,6 +1226,61 @@ fn a_page_takes_entries_for_each_prototype_s_copies() {
     assert_clean();
 }
 
+/// A material set a page placement names for a prototype reaches that prototype's copies, and
+/// only theirs.
+#[test]
+fn a_page_s_material_set_reaches_its_prototype_s_copies() {
+    const BASE: u32 = 4;
+    let d = device();
+    if d.caps().cluster.max_tris == 0 || d.caps().cluster.max_partitions == 0 {
+        return;
+    }
+    let bytes = page_pack();
+    let archive = Archive::from_memory(Arc::clone(&bytes)).unwrap();
+    let page_id = archive
+        .entries()
+        .iter()
+        .find(|e| e.class == Class::InstancePage as u16)
+        .unwrap()
+        .id;
+    let (mut scenes, s, m, _workers) = mounted(bytes, 2 * 3);
+    let page = scenes.instance_page(m, page_id).unwrap();
+    let list = [s];
+    let mut f = scenes.begin_frame(&frame(&list)).unwrap();
+    let range = f
+        .scene(s)
+        .unwrap()
+        .add_instance_page(&InstancePageRef {
+            page,
+            frame: None,
+            poses: &[],
+            material_sets: &[(1, BASE)],
+            flags: InstanceFlags::RASTER,
+            rt_range: 0.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    f.update_scenes(&mut |_| {}).unwrap();
+    wait(f.end(&[]).unwrap());
+    let all = PAGE_PROTOTYPES.len() as u64;
+    for _ in 0..600 {
+        let root = run_frame(&mut scenes, s, None);
+        let slots: Vec<InstanceGpu> =
+            read_buffer(root.instances.offset(u64::from(range.first)), all);
+        if slots.iter().any(|i| i.flags == 0) {
+            continue;
+        }
+        for (i, (inst, &p)) in slots.iter().zip(&PAGE_PROTOTYPES).enumerate() {
+            let base = if p == 1 { BASE } else { u32::MAX };
+            assert_eq!(inst.material_base, base, "slot {i}");
+        }
+        assert_clean();
+        return;
+    }
+    panic!("the page's records never landed");
+}
+
 /// The clusters of streamed pages that `root`'s instance entries list this frame, after checking
 /// that every cluster an entry lists, by a cooked set of `sets` or a gathered list, is the cluster
 /// its id names, on a page resident this frame.

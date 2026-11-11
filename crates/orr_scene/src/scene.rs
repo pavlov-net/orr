@@ -282,7 +282,8 @@ pub struct InstancePageRef<'a> {
     /// Where copies of each model take their part poses; the copy's index in its pose block
     /// is its record index. Models not listed take none.
     pub poses: &'a [(ModelId, Pose)],
-    /// Replaces a prototype's material set by a base in the scene's material-set table.
+    /// Replaces a prototype's material set by a base in the scene's material-set table, the
+    /// prototype by its index in the page's prototypes, each at most once.
     pub material_sets: &'a [(u16, u32)],
     /// A copy's flags are its prototype's and these; a prototype's flags of 0 take these.
     pub flags: InstanceFlags,
@@ -1599,19 +1600,30 @@ impl<'f> SceneWriter<'f> {
     /// page's prototypes the first time the records land, so their variants, flags and other
     /// per-copy settings come from the page.
     ///
-    /// Panics if set 0 of a base in `r.material_sets` ends past `material_set_capacity` on its
-    /// prototype's model, or if a group in `r.poses` is neither the null group nor one from
-    /// `create_transform_group`.
+    /// Panics if `r.material_sets` names a prototype the page lacks or one prototype twice, if
+    /// set 0 of a base there ends past `material_set_capacity` on its prototype's model, or if
+    /// a group in `r.poses` is neither the null group nor one from `create_transform_group`.
     pub fn add_instance_page(&mut self, r: &InstancePageRef<'_>) -> Result<InstanceRange> {
         self.check_groups(r.poses.iter().map(|(_, pose)| pose.group));
         let page = page_needs(self.mounts, self.model_cpu, r.page)?;
+        let protos = &page.2;
+        let mut named = vec![None; protos.len()];
         for &(index, base) in r.material_sets {
-            if let Some(p) = page.2.get(usize::from(index)) {
-                self.check_material_set(p.model, base, 0);
-            }
+            let i = usize::from(index);
+            assert!(
+                i < protos.len(),
+                "material set for prototype {index} of a page of {} prototypes",
+                protos.len()
+            );
+            assert!(
+                named[i].is_none(),
+                "two material sets for prototype {index}"
+            );
+            self.check_material_set(protos[i].model, base, 0);
+            named[i] = Some(base);
         }
         let motion = self.motion_group(r.page, r.frame)?;
-        let placed = self.place_instance_page(r, page, motion);
+        let placed = self.place_instance_page(r, page, &named, motion);
         self.settle_motion(r.page, motion, placed)
     }
 
@@ -1619,6 +1631,7 @@ impl<'f> SceneWriter<'f> {
         &self,
         r: &InstancePageRef<'_>,
         (needs, entries, protos): (PageNeeds, Vec<PrototypeEntries>, Vec<PagePrototype>),
+        named: &[Option<u32>],
         motion: Option<TransformGroupId>,
     ) -> Result<(InstanceRange, TransformGroupId)> {
         let page = self.mounts.page(r.page).ok_or(Error::UnknownPage(r.page))?;
@@ -1632,15 +1645,9 @@ impl<'f> SceneWriter<'f> {
             emissive,
             ..
         } = needs;
-        let named: Vec<Option<u32>> = (0..protos.len())
-            .map(|i| {
-                let named = r.material_sets.iter().find(|(q, _)| usize::from(*q) == i);
-                named.map(|&(_, base)| base)
-            })
-            .collect();
         let set_entries = protos
             .iter()
-            .zip(&named)
+            .zip(named)
             .filter(|(_, base)| base.is_none())
             .map(|(p, _)| p.sets.as_ref().map_or(0, |s| s.len() as u32))
             .sum();
@@ -1702,7 +1709,7 @@ impl<'f> SceneWriter<'f> {
         let mut copies = Vec::with_capacity(protos.len());
         let first_set = self.scene.desc.material_set_capacity + set_base;
         let mut at = 0;
-        for (p, &named) in protos.iter().zip(&named) {
+        for (p, &named) in protos.iter().zip(named) {
             let base = match (named, &p.sets) {
                 (Some(base), _) => base,
                 (None, Some(set)) => {
