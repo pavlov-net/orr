@@ -344,6 +344,15 @@ public float3 vertex_origin(PathVertex x, float3 dir)
     return ray_origin(s.position, x.plane_point, s.geometric_normal, dir, gsurface_origin(s), x.origin_error, x.camera_distance);
 }
 
+// Whether a surface carries light along `wi`, with shading normal `n` and geometric normal `ng`
+// whose planes both have the path on one side: `wi` lies on one side of both. Between the two
+// planes the BSDF would reflect light that comes through the surface, or transmit light that
+// stays on its side.
+public bool sides_agree(float3 n, float3 ng, float3 wi)
+{
+    return dot(wi, n) * dot(wi, ng) > 0.0;
+}
+
 // The vertex of a resolved hit of a ray along `dir`: the shading normal leaned toward the
 // ray's origin and the geometric normal facing it.
 public PathVertex hit_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
@@ -969,6 +978,8 @@ public struct VertexScatter : IScatter
     public WalkExitScatter walk;
     public bool leave;              // a walk leaving an interior, which scatters as `way_out`
     public InteriorExitScatter way_out;
+    public float3 normal;           // a surface's shading normal
+    public float3 geometric_normal;
 
     public float3 eval_and_pdf(float3 wi, out float density, out float3 diffuse)
     {
@@ -977,6 +988,11 @@ public struct VertexScatter : IScatter
         {
             density = hg_phase(anisotropy, dot(travel, wi));
             return float3(density);
+        }
+        if (!sides_agree(normal, geometric_normal, wi))
+        {
+            density = 0.0;
+            return float3(0.0);
         }
         float3 none;
         if (leave)

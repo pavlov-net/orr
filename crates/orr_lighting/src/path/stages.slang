@@ -2109,7 +2109,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
     bool leaving = kind == VERTEX_LEAVE;
     bool on_layer = kind == VERTEX_LAYER;
     bool alive = true;
-    VertexScatter vertex_scatter = { b, medium_vertex, -l.x.view, l.anisotropy, at_exit, sv.exit_scatter, leaving, sv.leave_scatter };
+    VertexScatter vertex_scatter = { b, medium_vertex, -l.x.view, l.anisotropy, at_exit, sv.exit_scatter, leaving, sv.leave_scatter, l.x.surface.normal, l.x.surface.geometric_normal };
     nee = no_nee(vertex_scatter, c.spectral);
     // A photon deposits where it meets a surface after a chain, and goes on only as one. Light
     // that next-event estimation takes through a plane stack is not deposited. No photon walks.
@@ -2134,7 +2134,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
         PathVertex at = l.x;
         if (on_layer || medium_vertex)
             at.surface.normal = float3(0.0);
-        VertexScatter scatter = { b, medium_vertex, -l.x.view, l.anisotropy, at_exit, sv.exit_scatter, leaving, sv.leave_scatter };
+        VertexScatter scatter = { b, medium_vertex, -l.x.view, l.anisotropy, at_exit, sv.exit_scatter, leaving, sv.leave_scatter, l.x.surface.normal, l.x.surface.geometric_normal };
         // The rays of a walk's way out reach no light this estimate is weighed against.
         bool weight_one = x.one_technique || leaving;
         float3 keep = x.one_technique ? float3(1.0) : p.keep;
@@ -2204,7 +2204,7 @@ bool shade_vertex<S : ISurface, M : IMedium, let X : uint>(PathRoot r, PathFixed
             bs = walk_exit_sample(sv.exit_scatter, rng);
         else
             bs = b.sample(u.xyz);
-        alive = bs.pdf > 0.0;
+        alive = bs.pdf > 0.0 && sides_agree(l.x.surface.normal, l.x.surface.geometric_normal, bs.wi);
         wi = bs.wi;
         pdf = bs.pdf;
         component = bs.component;
@@ -2526,7 +2526,7 @@ void walk_slot<S : ISurface, M : IMedium>(PathRoot root, uint slot)
         SurfaceHit sh = resolve_hit<S>(s, v, dir, pending.hit.instance_index, uint(pending.hit.cluster_id), pending.hit.primitive_index, pending.hit.barycentrics, pending.positions, false, context);
         sv.l = opaque_vertex(hit_vertex(v, sh, dir));
     }
-    VertexScatter no_scatter = { sv.b, false, float3(0.0), 0.0, true, sv.exit_scatter, false, sv.leave_scatter };
+    VertexScatter no_scatter = { sv.b, false, float3(0.0), 0.0, true, sv.exit_scatter, false, sv.leave_scatter, float3(0.0), float3(0.0) };
     ShadeNee nee = no_nee(no_scatter, c.spectral);
 
     Walk walk = walk_from(sv.l.x, vertex_params(sv.l, p.opaque > 1 && !x.reference), entry.wi, rng);
@@ -2573,8 +2573,10 @@ void walk_slot<S : ISurface, M : IMedium>(PathRoot root, uint slot)
         StackLight stack;
         float3 vis = shadow_trace<S, M>(r, nee.q, stack);
         // Through a plane stack the exit's scatter weighs the light again.
-        float scatter_pdf;
-        float3 e = nee_bent(nee.d, sv.exit_scatter, vis, stack, float3(1.0), false, scatter_pdf);
+        float scatter_pdf = 0.0;
+        float3 e = float3(0.0);
+        if (sides_agree(sv.l.x.surface.normal, sv.l.x.surface.geometric_normal, stack.bent))
+            e = nee_bent(nee.d, sv.exit_scatter, vis, stack, float3(1.0), false, scatter_pdf);
         float mis = nee.weight_one ? 1.0 : mis_balance(nee.run * nee.d.chosen.pdf, scatter_pdf);
         float3 added = nee.throughput * (e * emitter_view<CoverageFeedback<S>>(r, nee.d.chosen, nee.exterior_ior, vis) * (nee.d.W * mis / nee.run));
         shadow_add(nee.q, c.spectral.color(added), p, record);

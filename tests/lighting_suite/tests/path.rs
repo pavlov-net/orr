@@ -844,6 +844,26 @@ fn a_cooked_emitter_lights_the_floor_alike_by_next_event_and_bsdf_rays() {
     assert_clean();
 }
 
+/// A floor over an emitter that faces its underside stays dark by next-event estimation and by
+/// BSDF rays, though its normal map turns texels toward directions below it: a surface takes
+/// light only from the side of its triangle the path is on.
+#[test]
+fn a_normal_map_takes_no_light_through_its_surface() {
+    let up = Mat3::from_rotation_x(std::f32::consts::PI) * Mat3::from_diagonal(Vec3::splat(6.0));
+    let spec = over_floor(
+        BUMPY_FLOOR,
+        at(EMITTER, up, Vec3::new(0.0, -0.5, 0.0)),
+        Vec::new(),
+    );
+    let mut bed = Bed::with(spec);
+    for view in [LightingDebugView::NeeOnly, LightingDebugView::BsdfOnly] {
+        let image = render_paths(&mut bed, &paths(debug(view, 1)), 16, 1);
+        let brightest = image.mean.iter().map(luminance).fold(0.0, f64::max);
+        assert_eq!(brightest, 0.0, "{view:?}: the brightest pixel");
+    }
+    assert_clean();
+}
+
 /// The floor seen in a mirror takes a cooked emitter's light alike by next-event estimation and
 /// by BSDF rays, under a coat and fuzz too: the floor is then the path's second vertex, which
 /// the plain opaque shade takes, and its next-event estimate passes the winner's light through
