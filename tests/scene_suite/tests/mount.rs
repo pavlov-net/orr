@@ -4108,7 +4108,9 @@ fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
         ready(&mut scenes, m);
         scenes.model(m, AssetId::from_name(SHEET)).unwrap()
     });
-    let touched = [[0.0f32, 0.0, 0.0, 0.05]];
+    // By an edge: the spheres of the coarser groups all reach the sheet's middle, so an edit
+    // there copies every page another depends on.
+    let touched = [[0.0f32, 0.0, 1.8, 0.05]];
     let edit = scenes
         .create_edit(&orr_scene::EditDesc {
             model: source,
