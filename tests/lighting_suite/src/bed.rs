@@ -605,23 +605,20 @@ impl MeshBuilder {
     /// A quad spanning `corners` in order around its edge, facing `normal`, split into
     /// `n` x `n` cells.
     fn quad(&mut self, section: usize, corners: [Vec3; 4], normal: Vec3, n: u32) {
-        let first = self.positions.len() as u32;
-        for j in 0..=n {
-            for i in 0..=n {
+        let first = self.uvs.len();
+        self.sheet(
+            section,
+            [n, n],
+            |i, j| {
                 let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
-                let p = corners[0]
+                corners[0]
                     .lerp(corners[1], u)
-                    .lerp(corners[3].lerp(corners[2], u), v);
-                self.vertex(p, normal, Vec2::new(u, 1.0 - v));
-            }
-        }
-        let w = n + 1;
-        for j in 0..n {
-            for i in 0..n {
-                let c = first + j * w + i;
-                self.triangle(section, [c, c + 1, c + w + 1]);
-                self.triangle(section, [c, c + w + 1, c + w]);
-            }
+                    .lerp(corners[3].lerp(corners[2], u), v)
+            },
+            |_, _| normal,
+        );
+        for uv in &mut self.uvs[first..] {
+            uv.y = 1.0 - uv.y;
         }
     }
 
