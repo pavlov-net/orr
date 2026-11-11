@@ -7546,6 +7546,270 @@ fn mesh_pages_move_out_of_draining_blocks_under_the_frames_that_draw_them() {
     assert_clean();
 }
 
+/// Bytes of a block of the streamed pools in [`ClasMoves`]: two CLAS pool pages of 64 KiB, so
+/// a page left alone leaves its block half used.
+const CLAS_BLOCK: u64 = 128 << 10;
+
+/// Both grounds loaded whole under a view that traces some of the fine ground, so the CLAS of
+/// the two lie mixed over the pages of the CLAS pool and the pages' memory over its blocks. The
+/// memory is planned as under pressure, so that it empties every block it can.
+struct ClasMoves {
+    w: World,
+    placed: Placed,
+    frame: u32,
+    /// What the view's camera rays hit with every page loaded and none moved.
+    traced: Vec<u8>,
+}
+
+impl ClasMoves {
+    const EYE: DVec3 = DVec3::new(0.3, 1.2, 4.0);
+    const TARGET: DVec3 = DVec3::new(0.0, 0.0, -10.0);
+
+    fn new() -> Self {
+        let mut w = World::with_pack(
+            &RendererDesc {
+                raster_error_pixels: 2.0,
+                rt_error_pixels: 2.0,
+                rt_merge_pixels: 0.0,
+                culled_error_scale: 1.0,
+                hidden_detail_lead: 1.0,
+                // Small enough that the blocks stay at `CLAS_BLOCK`.
+                budgets: Budgets {
+                    mesh_page_pool: PoolSize::Bytes(96 << 20),
+                    texture_pool: PoolSize::Bytes(4 << 20),
+                    instance_page_pool: 4 << 20,
+                    in_flight_bytes: 8 << 20,
+                    stream_block: CLAS_BLOCK,
+                    ..Budgets::default()
+                },
+                ..RendererDesc::default()
+            },
+            fine_ground_pack(),
+        );
+        let items = [Item {
+            model: "fine ground",
+            linear: Mat3::from_rotation_x(0.25) * Mat3::from_diagonal(Vec3::new(2.0, 1.0, 4.0)),
+            at: Vec3::new(0.0, -1.0, -12.0),
+        }];
+        let placed = place(&mut w, &items);
+        let models = ["fine ground", "hidden ground"].map(|name| w.model(name));
+        w.scenes.plan_clas_memory_tight(true);
+        let mut c = Self {
+            w,
+            placed,
+            frame: 1,
+            traced: Vec::new(),
+        };
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(120), "pages pending");
+            c.prefetch(&models);
+            c.shot();
+            if models.iter().all(|&m| !mesh_pages(&c.w, m).0.contains(&0)) {
+                break;
+            }
+        }
+        let (fill, _) = c.pool();
+        assert!(fill.blocks >= 8, "CLAS pages over many blocks: {fill:?}");
+        let g = c.shot();
+        let hits = rays(&g.view, &trace::MODULE, "pixels", 0).traced;
+        assert!(
+            hits.iter().filter(|t| t.instance != 0).count() > hits.len() / 4,
+            "the view traces the ground"
+        );
+        c.traced = bytemuck::cast_slice(&hits).to_vec();
+        for _ in 0..4 {
+            c.exact();
+        }
+        c
+    }
+
+    fn prefetch(&mut self, models: &[ModelId]) {
+        for &m in models {
+            self.w.scenes.prefetch(m, 0);
+        }
+    }
+
+    fn shot(&mut self) -> Frame {
+        self.frame += 1;
+        let shot = Shot::at(Self::EYE, Self::TARGET, self.frame);
+        shoot(&mut self.w, &self.placed, &shot)
+    }
+
+    /// A frame whose camera rays hit what they hit before anything moved.
+    fn exact(&mut self) {
+        let g = self.shot();
+        assert!(
+            traced_hits(&g) == self.traced,
+            "frame {} traced other hits",
+            self.frame
+        );
+        assert_eq!(self.w.scenes.stats().detail.memory_scale, 1.0);
+    }
+
+    /// The pool of the CLAS pool's page memory and the CLAS pool's pages.
+    fn pool(&self) -> (orr_scene::PoolFill, orr_scene::ClasPages) {
+        let memory = self.w.scenes.memory();
+        let fill = *memory
+            .pools
+            .iter()
+            .find(|p| p.name == "CLAS pool pages")
+            .expect("the CLAS pool's page memory");
+        (fill, memory.clas.expect("a CLAS pool"))
+    }
+
+    /// Lowers the mesh page budget to `bytes`.
+    fn budget(&mut self, bytes: u64) {
+        let class = orr_scene::ResidencyClass::MeshPages;
+        self.w.scenes.lower_budget(class, bytes);
+    }
+
+    /// The mesh page budget that keeps what the view wants.
+    fn view_budget(&self) -> u64 {
+        self.w.scenes.stats().detail.mesh_demand * 100 / 85
+    }
+
+    /// Exact frames, each after one begun and dropped when `dropping`, until the pool's page
+    /// memory has rested for eight of them, no page wholly free or held, nothing draining or
+    /// retired and every mesh page within `budget`; returns the most it had draining.
+    fn settle(&mut self, budget: u64, dropping: bool) -> u64 {
+        let class = orr_scene::ResidencyClass::MeshPages;
+        let start = Instant::now();
+        let (mut settled, mut drained) = (0, 0);
+        while settled < 8 {
+            assert!(
+                start.elapsed() < Duration::from_secs(120),
+                "the CLAS pool never settled: {:?}",
+                self.pool()
+            );
+            if dropping {
+                let desc = FrameDesc {
+                    time: time(self.frame),
+                    scenes: &[],
+                    low_latency: None,
+                };
+                drop(self.w.scenes.begin_frame(&desc).unwrap());
+            }
+            self.exact();
+            let (fill, pages) = self.pool();
+            drained = drained.max(fill.draining);
+            let used = self.w.scenes.residency().class(class).resident_bytes;
+            let rest = fill.draining == 0 && fill.retired == 0;
+            let idle = used <= budget && rest && pages.held == 0 && pages.wholly_free == 0;
+            settled = if idle { settled + 1 } else { 0 };
+        }
+        drained
+    }
+
+    /// CLAS pool pages moved so far.
+    fn moved(&self) -> u64 {
+        self.w.scenes.residency().clas_pages_moved
+    }
+
+    /// The pool's page memory holds what its bound pages take in the fewest blocks, and no load
+    /// failed.
+    fn check_settled(&self) {
+        let (fill, pages) = self.pool();
+        assert_eq!(
+            fill.used,
+            u64::from(pages.bound) * pages.page_bytes,
+            "{fill:?}"
+        );
+        assert_eq!(
+            fill.bytes,
+            fill.used.next_multiple_of(CLAS_BLOCK),
+            "{fill:?} for {pages:?}"
+        );
+        assert_eq!(self.w.scenes.residency().failed, 0);
+    }
+}
+
+/// What each pixel's camera ray hit, as bytes.
+fn traced_hits(g: &Frame) -> Vec<u8> {
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    bytemuck::cast_slice(&r.traced).to_vec()
+}
+
+/// The mesh page budget falls to what the view wants: the hidden ground's pages go, the CLAS
+/// pool's pages they leave wholly free unbind, and its page memory empties the blocks they
+/// leave partly used by binding the pages the view traces to other memory, their CLAS in place.
+/// Every frame meanwhile traces the hits of the frames before, and once settled the memory
+/// holds the fewest blocks the pages bound need.
+#[test]
+fn clas_pool_pages_move_to_other_memory_under_the_frames_that_trace_them() {
+    let _serial = serial();
+    let mut c = ClasMoves::new();
+    let (full, _) = c.pool();
+    let moved = c.moved();
+    let budget = c.view_budget();
+    c.budget(budget);
+    let drained = c.settle(budget, false);
+    assert!(drained > 0, "no block drained: {full:?} to {:?}", c.pool());
+    assert!(
+        c.moved() > moved,
+        "no page moved: {full:?} to {:?}",
+        c.pool()
+    );
+    assert!(
+        c.pool().0.bytes < full.bytes / 2,
+        "{full:?} to {:?}",
+        c.pool()
+    );
+    c.check_settled();
+    assert_clean();
+}
+
+/// The binds of pages whose memory moves wait for many frames, as a loading side holding the
+/// pool makes them, while the CLAS pool's other wholly free pages unbind: the held pages keep
+/// their CLAS where frames trace them, and once the binds go the pages move and every frame
+/// traces the same hits.
+#[test]
+fn clas_pool_pages_held_for_their_bind_trace_exact() {
+    let _serial = serial();
+    let mut c = ClasMoves::new();
+    let moved = c.moved();
+    c.w.scenes.hold_clas_binds(true);
+    let budget = c.view_budget();
+    c.budget(budget);
+    let mut held_frames = 0;
+    let start = Instant::now();
+    while held_frames < 16 {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "no page held: {:?}",
+            c.pool()
+        );
+        c.exact();
+        assert_eq!(c.moved(), moved, "a held bind went");
+        held_frames += u32::from(c.pool().1.held > 0);
+    }
+    c.w.scenes.hold_clas_binds(false);
+    c.settle(budget, false);
+    assert!(c.moved() > moved, "no page moved: {:?}", c.pool());
+    c.check_settled();
+    assert_clean();
+}
+
+/// A frame begun and never submitted before each frame while pages move: their binds go on the
+/// render queue at the step and their copies with the batches, not with the frames' lists, and
+/// every frame that is submitted traces the same hits.
+#[test]
+fn frames_dropped_while_clas_pool_pages_move_leave_them_exact() {
+    let _serial = serial();
+    let mut c = ClasMoves::new();
+    let moved = c.moved();
+    let budget = c.view_budget();
+    c.budget(budget);
+    assert!(
+        c.settle(budget, true) > 0,
+        "no block drained: {:?}",
+        c.pool()
+    );
+    assert!(c.moved() > moved, "no page moved: {:?}", c.pool());
+    c.check_settled();
+    assert_clean();
+}
+
 /// The streaming ground settles at the configured detail under an ample mesh page pool, its
 /// finer cuts built over the pages they hold. The pool's budget then falls to the pinned pages
 /// and two fifths of the streamed ones the view wants: the detail scale rises to one that
