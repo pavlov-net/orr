@@ -322,8 +322,14 @@ impl Skel {
     /// Settles the skeleton in a space of its own, with `after` applied to model space after its
     /// root, once its joints are all there.
     pub(super) fn settle(&mut self, after: DMat4) -> RigSpace {
-        let root = after * self.root;
-        RigSpace::settle(&mut self.info, root, &mut self.inverse_binds, self.still)
+        let after = DMat3::from_mat4(after);
+        RigSpace::settle(
+            &mut self.info,
+            self.root,
+            after,
+            &mut self.inverse_binds,
+            self.still,
+        )
     }
 
     /// Skin influences per point of a bound mesh `path`, and bind space from its points.

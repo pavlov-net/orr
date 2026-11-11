@@ -974,3 +974,98 @@ fn a_far_rig_poses_to_the_rounding_of_its_own_size() {
         assert!(apart <= NEAR, "{d} m: a posed vertex lands {apart} m off");
     }
 }
+
+/// A skinned node bound and standing 1 km out, whose `EXT_mesh_gpu_instancing` copy flattens it
+/// (scale 10, 10, 0): its baked model's skeleton takes the flattening after model space. Corners
+/// sit on the mesh grid, so the cooked vertices are the source's shifted.
+fn flattened_far_glb(name: &str) -> PathBuf {
+    let hip = [1000.0f32, 2.0, -600.0];
+    let corners = [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.5, 0.25]]
+        .map(|c: [f32; 3]| std::array::from_fn::<f32, 3, _>(|a| c[a] + hip[a]));
+    let mut g = Glb::default();
+    let pos = g.floats(&corners, "VEC3");
+    let jv = g.view(&[0u8; 12], None);
+    let joints = g.accessor(jv, 5121, 3, "VEC4", "");
+    let weights = g.floats(&[[1.0f32, 0.0, 0.0, 0.0]; 3], "VEC4");
+    let bind = Mat4::from_translation(-Vec3::from(hip)).to_cols_array();
+    let ibm = g.floats(&[bind], "MAT4");
+    let scale = g.floats(&[[10.0f32, 10.0, 0.0]], "VEC3");
+    let input = g.floats(&[[0.0], [1.0]], "SCALAR");
+    let turn = Quat::from_rotation_y(0.6).to_array();
+    let keys = g.floats(&[Quat::IDENTITY.to_array(), turn], "VEC4");
+    let idx = g.indices(&[0, 1, 2]);
+    let rest = format!(
+        r#""extensionsUsed":["EXT_mesh_gpu_instancing"],"scene":0,"scenes":[{{"nodes":[0,1]}}],
+"nodes":[{{"name":"hip","translation":{hip:?}}},
+{{"name":"body","mesh":0,"skin":0,"extensions":{{"EXT_mesh_gpu_instancing":{{"attributes":{{"SCALE":{scale}}}}}}}}}],
+"skins":[{{"joints":[0],"inverseBindMatrices":{ibm}}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pos},"JOINTS_0":{joints},"WEIGHTS_0":{weights}}},"indices":{idx}}}]}}],
+"animations":[{{"name":"go","samplers":[{{"input":{input},"output":{keys}}}],"channels":[{{"sampler":0,"target":{{"node":0,"path":"rotation"}}}}]}}]"#
+    );
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.glb"));
+    g.write(&path, &rest);
+    path
+}
+
+/// A skeleton that flattens after model space keeps its mesh in a bind space within the rig,
+/// apart from the skeleton space the flattening takes it to: the vertices stay the size of the
+/// rig, and the poses land where the same poses in f64 put the source's.
+#[test]
+fn a_far_rig_that_flattens_after_model_space_poses_to_its_own_rounding() {
+    use orr_math::{DMat4, DQuat, DVec3};
+    // [`a_far_rig_poses_to_the_rounding_of_its_own_size`]'s bound, at the copy's scale.
+    const NEAR: f64 = 4e-5;
+    let path = flattened_far_glb("far-flat");
+    let cooked = cook(&path, "far-flat", GltfSettings::default());
+    let model = "/body/baked/0";
+    let e = cooked.entry(&format!("{model}/skeleton"));
+    let skel = SkeletonInfo::parse(&cooked.blob(e, 0)).unwrap();
+    let mesh_e = cooked.entry(&format!("{model}/mesh"));
+    let info = MeshInfo::parse(&cooked.blob(mesh_e, 0)).unwrap();
+    let mut vertices: Vec<(Vec3, usize)> = Vec::new();
+    for p in &info.pages {
+        let mut page = vec![0; p.resident_len as usize];
+        mesh::decode_page(&cooked.blob(mesh_e, p.blob as usize), &mut page).unwrap();
+        let view = PageView::new(&page, &info.header).unwrap();
+        for c in (0..view.cluster_count()).map(|i| view.cluster(i)) {
+            for v in 0..u32::from(c.vertex_count) {
+                let j = usize::from(view.joints(&c, v).unwrap()[0]);
+                vertices.push((Vec3::from(view.position(&c, v)), j));
+            }
+        }
+    }
+    let far = vertices.iter().map(|v| v.0.length()).fold(0.0, f32::max);
+    assert!(far < 5.0, "a cooked vertex stands {far} m from its origin");
+
+    let src = load(&path);
+    let flat = DMat4::from_scale(DVec3::new(10.0, 10.0, 0.0));
+    let hip = DVec3::new(1000.0, 2.0, -600.0);
+    let source: Vec<DVec3> = source_vertices(&src, &[Some(0)])
+        .0
+        .iter()
+        .map(|v| v.position.as_dvec3())
+        .collect();
+    let e = cooked.entry(&format!("{model}/clip/go"));
+    let clip = Clip::parse(&cooked.blob(e, 0), &cooked.blob(e, 1)).unwrap();
+    let n = skel.joint_count();
+    let mut locals = vec![Trs::IDENTITY; n];
+    for (t, turn) in [(0.0, 0.0), (clip.header.duration, 0.6)] {
+        clip.sample(t, &mut locals);
+        let (mut pose, mut palette) = (vec![Affine3::IDENTITY; n], vec![Affine3::IDENTITY; n]);
+        skel.model_pose(&locals, &mut pose);
+        skel.palette(&pose, &mut palette);
+        let joint = DMat4::from_rotation_translation(DQuat::from_rotation_y(turn), hip);
+        let want: Vec<DVec3> = source
+            .iter()
+            .map(|&v| (flat * joint * DMat4::from_translation(-hip)).transform_point3(v))
+            .collect();
+        for &(x, j) in &vertices {
+            let got = palette[j].transform_point3(x).as_dvec3() + skel.origin;
+            let off = want
+                .iter()
+                .map(|w| w.distance(got))
+                .fold(f64::MAX, f64::min);
+            assert!(off <= NEAR, "at {t} s a posed vertex lands {off} m off");
+        }
+    }
+}

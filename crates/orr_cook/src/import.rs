@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::instances::InstanceMotion;
 use crate::mesh::{self, MeshSettings, MeshSource};
-use crate::skin::{ClipSettings, ClipSource, Reach, spectral_norm};
+use crate::skin::{ClipSettings, ClipSource, Reach, RigSpace, spectral_norm};
 use crate::state::Input;
 use crate::subd::{CageData, SubdSettings};
 use crate::texture::material::{ImageFile, MaterialTextures};
@@ -129,8 +129,7 @@ impl Scene {
                 .iter()
                 .find(|m| m.node.as_ref() == Some(&copies.model));
             let model = model.expect("copies place a model of the scene");
-            let origin = self.skeletons[s].info.origin;
-            let ib = binds[s][usize::from(joint)] * DMat4::from_translation(-origin);
+            let ib = binds[s][usize::from(joint)] * self.skeletons[s].space.to_bind_space();
             // A model with a skeleton stands at its origin.
             let own = model
                 .skeleton
@@ -269,6 +268,8 @@ pub(crate) struct SceneSkeleton {
     /// prefix leaves its part out.
     pub(crate) prefix: String,
     pub(crate) info: SkeletonInfo,
+    /// Where its spaces stand in its models'.
+    pub(crate) space: RigSpace,
     /// Clips by name, which the planner resamples once it knows what each joint moves.
     pub(crate) clips: Vec<(String, ClipSource)>,
 }

@@ -1706,7 +1706,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
                 None,
             ),
             (Some(sk), Some(s)) => (
-                sk.space.to_skeleton(),
+                sk.space.to_bind_space(),
                 Some(Binding::Skin(sk.skin_joints(s.index()))),
             ),
             (Some(sk), None) => {
@@ -1748,6 +1748,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
                 b.skeletons.push(SceneSkeleton {
                     prefix: slot.name.clone().unwrap_or_default(),
                     info: sk.info.clone(),
+                    space: sk.space,
                     clips: sk.clips(&data, &spans).map_err(fail)?,
                 });
                 Some(b.skeletons.len() - 1)
@@ -1822,7 +1823,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     for (n, m) in hung {
         let sk = skeletons[m].as_ref().expect("a rig has a skeleton");
         let (joint, to_bind) = sk.attach(n, graph).map_err(fail)?;
-        let to_bind = sk.space.to_model() * to_bind;
+        let to_bind = sk.space.to_model_space() * to_bind;
         let locals = instance_locals(&inst, n).map_err(fail)?;
         let transforms: Vec<DMat4> = locals.into_iter().map(|l| to_bind * l).collect();
         let at = node(n);

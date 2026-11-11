@@ -364,19 +364,27 @@ impl Rig {
     }
 }
 
-/// Where a skeleton's space stands in its model's: shifted, never turned, to an origin within the
+/// Where a skeleton's spaces stand in its model's: shifted, never turned, to origins within the
 /// rig. In model space a rig far from the origin would pose with the differences of large
 /// numbers, in palettes and in the vertices they move; here they stay the size of the rig.
 ///
+/// A skeleton may apply a linear transform after model space (`after`, which a mesh in its bind
+/// pose cannot hold), so a palette entry `P` takes a vertex of model space to `after` of it. The
+/// mesh and the inverse binds stand in bind space, at `bind_origin` in model space; the poses
+/// take them to skeleton space, at `origin` in `after` of model space, which copies place. Every
+/// palette entry becomes `T(-origin) P T(bind_origin)` and every mesh vertex `v` becomes
+/// `v - bind_origin`: the same surface, posed alike. Without `after` the two are one space.
+///
 /// The root joints but the still joint give the box center of their rest translations, in whole
-/// units, `shift`, to the root, and the origin is the whole meters nearest where the root puts
-/// that point, so a mesh grid of a step up to a meter holds the same vertices shifted. Every
-/// palette entry `P` becomes `T(-origin) P T(origin)` and every mesh vertex `v` becomes
-/// `v - origin`: the same surface, posed alike, where a copy's placement takes the origin back.
+/// units, `shift`, to the root; `bind_origin` is the whole meters nearest where the root puts
+/// that point, so a mesh grid of a step up to a meter holds the same vertices shifted. `origin`
+/// is where `after` puts it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RigSpace {
-    /// Skeleton space's origin in model space.
+    /// Skeleton space's origin, in `after` of model space.
     pub(crate) origin: DVec3,
+    /// Bind space's origin, in model space.
+    pub(crate) bind_origin: DVec3,
     /// What the root joints' translations give up, in the space they hang from.
     shift: DVec3,
     /// The still joint, which keeps its rest.
@@ -385,11 +393,13 @@ pub(crate) struct RigSpace {
 
 impl RigSpace {
     /// Settles `info`, whose root (`root`) and inverse binds (`inverse_binds`) are given in model
-    /// space and in f64, in a space of its own: its root, the root joints' rest translations,
-    /// its inverse binds, which `inverse_binds` takes too, and its origin.
+    /// space and in f64, in spaces of its own, with `after` applied after model space: its root,
+    /// the root joints' rest translations, its inverse binds, which `inverse_binds` takes too,
+    /// and its origin.
     pub(crate) fn settle(
         info: &mut SkeletonInfo,
         root: DMat4,
+        after: DMat3,
         inverse_binds: &mut [DMat4],
         still: Option<u16>,
     ) -> Self {
@@ -407,19 +417,23 @@ impl RigSpace {
         } else {
             ((lo + hi) / 2.0).round()
         };
-        let origin = root.transform_point3(shift).round();
+        let bind_origin = root.transform_point3(shift).round();
         let space = Self {
-            origin,
+            origin: after * bind_origin,
+            bind_origin,
             shift,
             still,
         };
-        let settled = space.to_skeleton() * root * DMat4::from_translation(shift);
+        let settled = DMat4::from_translation(-space.origin)
+            * DMat4::from_mat3(after)
+            * root
+            * DMat4::from_translation(shift);
         info.root = Affine3::from_mat4(settled.as_mat4());
-        info.origin = origin;
+        info.origin = space.origin;
         for &j in &roots {
             info.rest[j].translation = space.translation(info, j, info.rest[j].translation);
         }
-        let to_model = space.to_model();
+        let to_model = space.to_model_space();
         for (j, ib) in inverse_binds.iter_mut().enumerate() {
             // The still joint keeps the root's shift, which its inverse bind undoes.
             let before = match still == Some(j as u16) {
@@ -435,14 +449,14 @@ impl RigSpace {
         space
     }
 
-    /// Skeleton space from model space.
-    pub(crate) fn to_skeleton(self) -> DMat4 {
-        DMat4::from_translation(-self.origin)
+    /// Bind space from model space.
+    pub(crate) fn to_bind_space(self) -> DMat4 {
+        DMat4::from_translation(-self.bind_origin)
     }
 
-    /// Model space from skeleton space.
-    pub(crate) fn to_model(self) -> DMat4 {
-        DMat4::from_translation(self.origin)
+    /// Model space from bind space.
+    pub(crate) fn to_model_space(self) -> DMat4 {
+        DMat4::from_translation(self.bind_origin)
     }
 
     /// The translation of joint `j` of skeleton `info` in skeleton space, from model space's
@@ -648,7 +662,8 @@ impl Skeleton {
             inverse_binds.push(ib);
             info.names.push(node.name().unwrap_or_default().to_string());
         }
-        let space = RigSpace::settle(&mut info, after * root, &mut inverse_binds, still);
+        let after = DMat3::from_mat4(after);
+        let space = RigSpace::settle(&mut info, root, after, &mut inverse_binds, still);
         let skins = bound
             .into_iter()
             .map(|(s, joints)| {
@@ -719,7 +734,7 @@ impl Skeleton {
             .expect("`Rig::find` saw every mesh without a joint");
         Ok((
             still,
-            self.space.to_skeleton() * graph.in_model(self.frame, node)?,
+            self.space.to_bind_space() * graph.in_model(self.frame, node)?,
         ))
     }
 

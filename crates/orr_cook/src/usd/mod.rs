@@ -1189,16 +1189,13 @@ impl<'s> Importer<'s> {
                 }
             }
             let skeleton = models[o].skeleton.and_then(|k| skels.get(k)).map(|s| &s.1);
-            // Each holder's skeleton stands in a space of its own, which its vertices take.
-            let origin = |m: usize| match models[m].skeleton {
-                Some(k) if k < skels.len() => skels[k].1.info.origin,
-                Some(k) => rig_skeletons[k - skels.len()].info.origin,
-                None => DVec3::ZERO,
+            // Each holder's skeleton stands in spaces of its own, which its vertices take.
+            let space = |m: usize| match models[m].skeleton {
+                Some(k) if k < skels.len() => Some(skels[k].2),
+                Some(k) => Some(rig_skeletons[k - skels.len()].space),
+                None => None,
             };
-            let from_model: Vec<DMat4> = holders[o]
-                .iter()
-                .map(|&(m, _)| DMat4::from_translation(-origin(m)))
-                .collect();
+            let spaces: Vec<Option<RigSpace>> = holders[o].iter().map(|&(m, _)| space(m)).collect();
             let rig = rigs.get(&o);
             let (skin, transform, part) = match (bound.get(&i), skeleton, rig) {
                 (Some(b), Some(sk), _) => {
@@ -1250,13 +1247,14 @@ impl<'s> Importer<'s> {
                 }
                 _ => None,
             };
-            // A skeleton takes what a mesh in its bind pose cannot, but it poses no part 0.
-            let applied = |linear: DMat4| {
-                if skin.is_some() || rig.is_some_and(|r| part != 0 && r.rigid) {
-                    transform
-                } else {
-                    linear * transform
-                }
+            // A skeleton takes what a mesh in its bind pose cannot, but it poses no part 0, which
+            // stands where its poses would take it.
+            let posed = skin.is_some() || rig.is_some_and(|r| part != 0 && r.rigid);
+            let applied = |linear: DMat4| if posed { transform } else { linear * transform };
+            let from_model = |space: &Option<RigSpace>| match space {
+                Some(s) if posed => s.to_bind_space(),
+                Some(s) => DMat4::from_translation(-s.origin),
+                None => DMat4::IDENTITY,
             };
             if skin.is_some()
                 && (bound.contains_key(&i) || skeleton.is_none())
@@ -1303,14 +1301,14 @@ impl<'s> Importer<'s> {
                     }
                 }
             }
-            let placed = holders[o].iter().zip(&turned).zip(&from_model);
-            for ((&(m, linear), turned), from_model) in placed {
+            let placed = holders[o].iter().zip(&turned).zip(&spaces);
+            for ((&(m, linear), turned), space) in placed {
                 let turned_material = |f: usize| {
                     let m = face_material(f);
                     turned.get(&m).copied().unwrap_or(m)
                 };
                 let placing = Placing {
-                    transform: *from_model * applied(linear),
+                    transform: from_model(space) * applied(linear),
                     face_material: &turned_material,
                     skin: skin.as_deref(),
                     part,
@@ -1381,6 +1379,7 @@ impl<'s> Importer<'s> {
             skeletons.push(SceneSkeleton {
                 prefix,
                 info: sk.info,
+                space,
                 clips,
             });
         }
@@ -1575,7 +1574,7 @@ impl<'s> Importer<'s> {
                 models[h].skinned = !rig.rigid;
                 let joints = 0..built.info.joint_count();
                 models[h].pivots = rig.rigid.then(|| {
-                    let at = |j: usize| built.binds[j].w_axis.truncate() - built.info.origin;
+                    let at = |j: usize| built.binds[j].w_axis.truncate() - built.space.bind_origin;
                     joints.map(|j| at(j).as_vec3().to_array()).collect()
                 });
                 models[h].rig_skeleton = Some(skeletons.len());
@@ -1589,6 +1588,7 @@ impl<'s> Importer<'s> {
                 skeletons.push(SceneSkeleton {
                     prefix: models[h].name.clone().unwrap_or_default(),
                     info: built.info.clone(),
+                    space: built.space,
                     clips: clip
                         .map(|c| (XFORM_CLIP.to_string(), c))
                         .into_iter()
@@ -1674,7 +1674,8 @@ impl<'s> Importer<'s> {
             binds.push(inverse_bind(ib));
         }
         let still = rig.still.then_some(0);
-        let space = RigSpace::settle(&mut info, after * root, &mut inverse_binds, still);
+        let after = DMat3::from_mat4(after);
+        let space = RigSpace::settle(&mut info, root, after, &mut inverse_binds, still);
         Ok(skel::PrimRig {
             info,
             space,
