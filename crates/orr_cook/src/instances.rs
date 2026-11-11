@@ -788,21 +788,18 @@ fn grid_positions(h: &mut InstancePageHeader, targets: &[DVec3]) -> Vec<[u32; 3]
     let last = (1u32 << POSITION_BITS) - 1;
     for a in 0..3 {
         let (origin, step) = grid(lo[a], hi[a], last);
-        let mut e = (hi[a] - f64::from(origin)) as f32;
-        while f64::from(origin) + f64::from(e) < hi[a] {
-            e = e.next_up();
-        }
         h.origin[a] = origin;
         h.step[a] = step;
-        h.extent[a] = e;
+        // To the grid point at or above the highest target: a compact record rounds up to it,
+        // and it is an f32, so a row's f32 translation does not pass it either.
+        let steps = ((hi[a] - f64::from(origin)) / f64::from(step)).ceil();
+        h.extent[a] = (steps * f64::from(step)) as f32;
     }
     targets
         .iter()
         .map(|t| {
-            [0, 1, 2].map(|a| {
-                let q = (t[a] - f64::from(h.origin[a])) / f64::from(h.step[a]);
-                q.round().clamp(0.0, f64::from(last)) as u32
-            })
+            [0, 1, 2]
+                .map(|a| ((t[a] - f64::from(h.origin[a])) / f64::from(h.step[a])).round() as u32)
         })
         .collect()
 }

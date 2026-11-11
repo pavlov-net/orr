@@ -565,6 +565,35 @@ fn an_outlying_scale_leaves_the_range_to_the_rest() {
     }
 }
 
+/// The page's box holds every decoded translation: the highest copy here is two thirds of the
+/// 2^-13 m step past a grid point, so its compact record rounds up past where it was placed.
+#[test]
+fn the_page_box_holds_a_copy_its_record_rounds_up() {
+    let at = |x: f64| Placement {
+        position: [x, 1.0, 2.0],
+        linear: Linear::Scaled {
+            rotation: Quat::IDENTITY.to_array(),
+            scale: [1.0; 3],
+        },
+        prototype: 0,
+    };
+    let a = cook_instances(Instances {
+        records: vec![at(0.0), at(250.00008)],
+        prototypes: vec![proto(0)],
+        ..Default::default()
+    })
+    .unwrap();
+    let e = pages(&a)[0];
+    let (head, blob) = (read(&a, e, 0), read(&a, e, 1));
+    let h = InstancePageInfo::parse(&head).unwrap().header;
+    let (records, _) = instance::records(&h, &blob).unwrap();
+    assert!(records.iter().all(|r| r.exact_row().is_none()));
+    let (_, decoded) = instance::decode(&head, &blob).unwrap();
+    let top = decoded.map(|d| d.1.translation.x).fold(0.0, f32::max);
+    assert!(f64::from(top) > 250.00008);
+    assert!(top <= h.origin[0] + h.extent[0], "{top} past {h:?}");
+}
+
 /// One rule decides what may be an instance, whatever form the transform arrives in: it inverts
 /// in f32. Scale on either side does not stop that; a determinant lost to rounding does.
 #[test]
