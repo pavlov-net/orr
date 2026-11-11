@@ -3609,7 +3609,6 @@ impl Mounts {
         }
     }
 
-    /// Frees the mounts unmounted at or before `completed`.
     /// Moves the model, mesh and section-material tables that grew since the last upload:
     /// see [`Table::land`].
     pub(crate) fn land(
@@ -3624,6 +3623,7 @@ impl Mounts {
         models || meshes || lists
     }
 
+    /// Frees the mounts unmounted at or before `completed`.
     pub(crate) fn retire(&mut self, completed: u64, materials: &MaterialTable) {
         self.models.retire(completed);
         self.meshes.retire(completed);
@@ -3660,16 +3660,23 @@ impl Mounts {
     }
 
     /// A run of `n` entries of the section materials. When the table moves to take it, the
-    /// record of every model with a run points at its run in the new table.
+    /// record of every model with a run points at its run in the new table. The window room
+    /// for those records comes before the move, so a move leaves no record pointing at the
+    /// table it retires.
     fn alloc_list(&mut self, n: u32, w: &mut Apply<'_>) -> Result<u32> {
-        let before = self.model_materials.gpu();
+        if let Some(start) = self.model_materials.try_alloc(n) {
+            return Ok(start);
+        }
+        let (src, out) = w
+            .window
+            .slice::<GpuPtr<u32>>(w.device, self.lists.len() as u32)?;
         let start = self.model_materials.alloc(w.device, n)?;
-        if self.model_materials.gpu() != before {
-            let field = std::mem::offset_of!(ModelGpu, materials) as u64;
-            for (&id, &first) in &self.lists {
-                let at = self.models.entry(id.0).cast::<u8>().offset(field).cast();
-                w.put(at, &[self.model_materials.entry(first)])?;
-            }
+        let field = std::mem::offset_of!(ModelGpu, materials) as u64;
+        for ((&id, &first), (o, i)) in self.lists.iter().zip(out.iter_mut().zip(0..)) {
+            *o = self.model_materials.entry(first);
+            let at = self.models.entry(id.0).cast::<u8>().offset(field).cast();
+            let seq = w.seq.fetch_add(1, Ordering::Relaxed);
+            w.records.push(Record::values(seq, at, src.offset(i), 1));
         }
         Ok(start)
     }

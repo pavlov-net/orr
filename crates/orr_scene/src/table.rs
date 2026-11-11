@@ -86,6 +86,14 @@ impl<T: Pod> Table<T> {
         self.state.lock().unwrap().capacity
     }
 
+    /// The first of `count` consecutive free ids, without growing the table.
+    pub(crate) fn try_alloc(&self, count: u32) -> Option<u32> {
+        if count == 0 {
+            return Some(0);
+        }
+        self.state.lock().unwrap().ids.alloc(count)
+    }
+
     /// The first of `count` consecutive free ids. Without a free run that long the table grows
     /// to hold one past its entries, and to twice its capacity at least, so the entries a run
     /// copies across its grows stay within twice what it ends up holding. Fails only without
