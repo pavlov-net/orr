@@ -450,45 +450,44 @@ fn environment_map_resamples_back_to_the_source() {
     assert!(db > 45.0, "round trip PSNR {db:.1} dB");
 }
 
+/// Each light holds its disc's energy, points at it and takes its radius: at the zenith, off
+/// axis and on the horizon. The source's texel `a` and its bilinear read widen a disc of radius
+/// `r` to `sqrt(r^2 + a^2)`, under 0.5% at 11 texels; the bound leaves room for the texels at
+/// its rim that fall under the threshold.
 #[test]
-fn environment_lights_keep_energy_and_direction() {
+fn environment_lights_keep_energy_direction_and_size() {
     let d = dir("discs");
-    let (w, h) = (2048, 1024);
-    // Two discs: a small bright one and a larger dim one, over a dim sky.
+    let (w, h) = (4096, 2048);
+    let radius = 1.0f32.to_radians();
     let discs = [
-        (
-            [0.3f32, 0.8, -0.52],
-            0.6f32.to_radians(),
-            [9000.0f32, 8000.0, 7000.0],
-        ),
-        (
-            [-0.8, 0.35, 0.49],
-            2.5f32.to_radians(),
-            [300.0, 320.0, 360.0],
-        ),
+        ([0.0f32, 1.0, 0.0], [60000.0f32, 50000.0, 40000.0]),
+        ([0.3, 0.8, -0.52], [40000.0, 36000.0, 30000.0]),
+        ([-0.8, 0.0, 0.6], [20000.0, 18000.0, 15000.0]),
     ];
-    let discs = discs.map(|(c, r, v)| (Vec3::from(c).normalize(), r, v));
+    let discs = discs.map(|(c, v)| (Vec3::from(c).normalize(), v));
+    let sky = [0.4f32, 0.6, 1.0];
     let radiance = |dir: [f32; 3]| {
-        let mut v = [0.4, 0.6, 1.0];
-        for (c, r, e) in &discs {
-            let cos = Vec3::from(dir).dot(*c);
-            if cos >= r.cos() {
-                v = *e;
-            }
-        }
-        v
+        let lit = discs
+            .iter()
+            .find(|(c, _)| Vec3::from(dir).dot(*c) >= radius.cos());
+        lit.map_or(sky, |(_, e)| *e)
     };
     let path = d.join("discs.hdr");
+    // Texels near a disc average 8x8 samples, so the source holds the discs' energy closely.
+    let near = (radius + 4.0 * PI / h as f32).cos();
     let texel = |x: u32, y: u32| {
-        // 4x4 supersampled, so the source holds the discs' exact energy closely.
+        let at =
+            |i: f32, j: f32| equirect_dir((x as f32 + i) / w as f32, (y as f32 + j) / h as f32);
+        let center = Vec3::from(at(0.5, 0.5));
+        if discs.iter().all(|(c, _)| center.dot(*c) < near) {
+            return sky;
+        }
         let mut acc = [0.0f32; 3];
-        for j in 0..4 {
-            for i in 0..4 {
-                let u = (x as f32 + (i as f32 + 0.5) / 4.0) / w as f32;
-                let v = (y as f32 + (j as f32 + 0.5) / 4.0) / h as f32;
-                let r = radiance(equirect_dir(u, v));
+        for j in 0..8 {
+            for i in 0..8 {
+                let r = radiance(at((i as f32 + 0.5) / 8.0, (j as f32 + 0.5) / 8.0));
                 for c in 0..3 {
-                    acc[c] += r[c] / 16.0;
+                    acc[c] += r[c] / 64.0;
                 }
             }
         }
@@ -510,7 +509,7 @@ fn environment_lights_keep_energy_and_direction() {
         },
     )]);
     let (info, levels) = mips(&a, "discs");
-    assert_eq!(info.lights.len(), 2);
+    assert_eq!(info.lights.len(), 3);
     let map = decode(vk::BC6H_UFLOAT, n, n, &levels[0][0]);
 
     // Energy: the source's radiance integral against the map's plus the lights'.
@@ -551,9 +550,9 @@ fn environment_lights_keep_energy_and_direction() {
         );
     }
 
-    // Brightest first, each pointing at its disc within half a texel, with its energy.
+    // Brightest first, each pointing at its disc within half a texel, with its energy and size.
     let half_texel = 0.5 * (4.0 * PI / (n * n) as f32).sqrt();
-    for (l, (c, r, e)) in info.lights.iter().zip(&discs) {
+    for (l, (c, e)) in info.lights.iter().zip(&discs) {
         let d = l.direction_to_light;
         let cos = Vec3::from(d).dot(*c).min(1.0);
         assert!(
@@ -561,28 +560,25 @@ fn environment_lights_keep_energy_and_direction() {
             "light off its disc by {} rad",
             cos.acos()
         );
-        let solid = TAU * (1.0 - r.cos());
+        let solid = TAU * (1.0 - radius.cos());
         let want = e[1] * solid;
+        let size = l.angular_radius / radius;
         println!(
-            "light: {:.3} of its disc's energy, {:.3} texels off, radius {:.3} of the disc's",
+            "light at {c}: {:.4} of its disc's energy, {:.3} texels off, radius {size:.4} of the disc's",
             l.illuminance[1] / want,
             cos.acos() / (2.0 * half_texel),
-            l.angular_radius / r
         );
         assert!(
-            (l.illuminance[1] / want - 1.0).abs() < 0.1,
+            (l.illuminance[1] / want - 1.0).abs() < 0.02,
             "light {} against disc {want}",
             l.illuminance[1]
         );
-        let texel = 2.0 * half_texel;
         assert!(
-            (l.angular_radius - r).abs() < 1.5 * texel,
-            "angular radius {} against {r}",
-            l.angular_radius
+            (size - 1.0).abs() < 0.01,
+            "radius {size} of the disc's at {c}"
         );
     }
 }
-
 fn png(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
     let img = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(f(x, y)));
     let mut out = std::io::Cursor::new(Vec::new());

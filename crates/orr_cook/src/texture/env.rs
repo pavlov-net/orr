@@ -82,14 +82,14 @@ pub(super) fn cook(
         Input::Equirect(l)
     };
     let mut map = octahedral_map(&input, n);
-    drop(src);
     let lights = match light_threshold {
         Some(t) => {
             let weights = primaries.rgb().luminance_weights().as_vec3().to_array();
-            extract_lights(&mut map, t, max_lights, weights)
+            extract_lights(&mut map, &input, t, max_lights, weights)
         }
         None => Vec::new(),
     };
+    drop(src);
     let plan = Plan {
         encoding: Encoding::Bc6h,
         cube: false,
@@ -167,6 +167,15 @@ impl Input<'_> {
     }
 }
 
+/// Map point of sample `(i, j)` of the `SUB` x `SUB` that texel `(x, y)` of an `n` x `n` map
+/// averages.
+fn sample_point(n: u32, x: u32, y: u32, i: u32, j: u32) -> [f32; 2] {
+    [
+        (x as f32 + (i as f32 + 0.5) / SUB as f32) / n as f32,
+        (y as f32 + (j as f32 + 0.5) / SUB as f32) / n as f32,
+    ]
+}
+
 /// `n` x `n` equal-area octahedral map; each texel averages 4x4 stratified samples.
 fn octahedral_map(input: &Input, n: u32) -> Img {
     let mut map = Img::new(n, n);
@@ -178,10 +187,7 @@ fn octahedral_map(input: &Input, n: u32) -> Img {
                 let mut acc = [0.0f32; 4];
                 for j in 0..SUB {
                     for i in 0..SUB {
-                        let st = [
-                            (x as f32 + (i as f32 + 0.5) / SUB as f32) / n as f32,
-                            (y as f32 + (j as f32 + 0.5) / SUB as f32) / n as f32,
-                        ];
+                        let st = sample_point(n, x as u32, y as u32, i, j);
                         let v = input.sample(octahedral::to_dir(st));
                         for c in 0..4 {
                             acc[c] += v[c];
@@ -219,6 +225,7 @@ fn neighbors(n: u32, x: u32, y: u32) -> [(u32, u32); 4] {
 /// takes the rest of their energy.
 fn extract_lights(
     map: &mut Img,
+    input: &Input,
     threshold: f32,
     max_lights: u8,
     luma: [f32; 3],
@@ -290,6 +297,9 @@ fn extract_lights(
             }
             let fill = fill.map(|f| (f / f64::from(ring.max(1))) as f32);
             let mut e = [0.0f64; 3];
+            // The removed luminance and its sum of directions, at the samples the map averaged:
+            // a texel's center would widen the spread by the texel's own footprint.
+            let mut weight = 0.0f64;
             let mut centroid = [0.0f64; 3];
             for &t in texels {
                 let p = &mut map.px[t as usize];
@@ -298,14 +308,24 @@ fn extract_lights(
                     p[c] -= excess[c];
                     e[c] += f64::from(excess[c] * texel_sr);
                 }
-                let st = [
-                    ((t % n) as f32 + 0.5) / n as f32,
-                    ((t / n) as f32 + 0.5) / n as f32,
-                ];
-                let d = octahedral::to_dir(st);
-                let wgt = f64::from(y_of(&[excess[0], excess[1], excess[2], 0.0]));
-                for c in 0..3 {
-                    centroid[c] += wgt * f64::from(d[c]);
+                for j in 0..SUB {
+                    for i in 0..SUB {
+                        let st = sample_point(n, t % n, t / n, i, j);
+                        let v = input.sample(octahedral::to_dir(st));
+                        let above: [f32; 4] = std::array::from_fn(|c| {
+                            if c < 3 {
+                                (v[c] - fill[c]).max(0.0)
+                            } else {
+                                0.0
+                            }
+                        });
+                        let w = f64::from(y_of(&above));
+                        let d = octahedral::to_dir_f64(st.map(f64::from));
+                        weight += w;
+                        for c in 0..3 {
+                            centroid[c] += w * d[c];
+                        }
+                    }
                 }
             }
             let len = centroid
@@ -314,11 +334,15 @@ fn extract_lights(
                 .sum::<f64>()
                 .sqrt()
                 .max(1e-30);
-            let solid = texels.len() as f32 * texel_sr;
+            // Over a uniform cap of radius r about its axis the mean of `cos` is
+            // `(1 + cos r) / 2`, so the mean direction's length gives r for a disc of any size,
+            // and the disc of equal second moment for a blurred or darkened one. Rounding takes
+            // a region whose energy lies along one sample's direction just past 1.
+            let cos = (2.0 * len / weight - 1.0).min(1.0);
             ExtractedLight {
                 direction_to_light: centroid.map(|c| (c / len) as f32),
                 illuminance: e.map(|v| v as f32),
-                angular_radius: (1.0 - solid / TAU).clamp(-1.0, 1.0).acos(),
+                angular_radius: cos.acos() as f32,
                 _pad: 0.0,
             }
         })

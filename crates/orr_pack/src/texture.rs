@@ -78,7 +78,8 @@ pub struct ExtractedLight {
     pub direction_to_light: [f32; 3],
     /// Integral of the removed radiance over the region's solid angle: map units times sr.
     pub illuminance: [f32; 3],
-    /// Half angle of the cone whose solid angle equals the region's, in radians.
+    /// Radius of the uniform disc whose removed radiance spreads about its direction as the
+    /// region's does, in radians.
     pub angular_radius: f32,
     pub _pad: f32,
 }
@@ -322,10 +323,16 @@ pub mod normal {
 /// of an `n` x `n` map have equal solid angle `4 pi / n^2`. Across the map's edges, the
 /// neighbor of texel `(-1, y)` is `(0, n - 1 - y)`, and likewise on the other three edges.
 pub mod octahedral {
-    use std::f32::consts::{FRAC_PI_4, PI};
+    use std::f32::consts::PI;
+    use std::f64::consts::FRAC_PI_4;
 
     /// Direction of map point `[s, t]`.
-    pub fn to_dir([s, t]: [f32; 2]) -> [f32; 3] {
+    pub fn to_dir(st: [f32; 2]) -> [f32; 3] {
+        to_dir_f64(st.map(f64::from)).map(|c| c as f32)
+    }
+
+    /// [`to_dir`] in f64.
+    pub fn to_dir_f64([s, t]: [f64; 2]) -> [f64; 3] {
         let (u, v) = (2.0 * s - 1.0, 2.0 * t - 1.0);
         let (up, vp) = (u.abs(), v.abs());
         let signed = 1.0 - (up + vp);
