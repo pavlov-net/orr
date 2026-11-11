@@ -3984,6 +3984,57 @@ fn a_chain_copy_hidden_past_the_ptlas_budget_stops_tracing_its_step_at_once() {
     assert_clean();
 }
 
+#[test]
+fn a_fade_from_a_step_its_chain_loses_ends_at_once() {
+    let _serial = serial();
+    let (mut w, models) = chain_world();
+    let placed = place_at(&mut w, &chain_copies(), DVec3::ZERO, 1e4);
+    let slots: Vec<u32> = placed.ranges.iter().map(|r| r.first).collect();
+    let eye = DVec3::new(0.0, 2.0, 6.0);
+    let target = DVec3::new(0.0, 1.0, 0.0);
+    let mut frame = 0;
+    let mut shoot_at = |w: &mut World, z: f64| {
+        frame += 1;
+        let mut shot = Shot::at(eye, target, frame);
+        shot.focus = Some(DVec3::new(0.0, 1.0, z));
+        let g = shoot(w, &placed, &shot);
+        let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
+        let state = read_buffer(root.slot_state, u64::from(placed.count));
+        slots.iter().map(|&s| state[s as usize]).collect::<Vec<_>>()
+    };
+    // Far out the copies take step 3 once their chain is set, and in one frame to about 28 m
+    // they fade from step 3 to step 1.
+    shoot_at(&mut w, 120.0);
+    set_chain(&mut w, &models);
+    for (k, s) in shoot_at(&mut w, 120.0).into_iter().enumerate() {
+        assert_eq!((s.chain_step, s.fade), (3 | CHAIN_SEEN, 0), "copy {k}");
+    }
+    for (k, s) in shoot_at(&mut w, 30.0).into_iter().enumerate() {
+        assert_eq!(
+            (s.chain_step, s.fade),
+            (3 << 2 | 1 | CHAIN_SEEN, 1),
+            "copy {k}"
+        );
+    }
+    // The chain loses step 3 while the copies are about 42 m out, past step 2's start but
+    // inside its hysteresis: the fade ends on step 1, and no far instance stays.
+    let chain = [
+        (models[1], CHAIN_DISTANCES[0]),
+        (models[2], CHAIN_DISTANCES[1]),
+    ];
+    w.scenes.set_chain(models[0], &chain).unwrap();
+    for (k, s) in shoot_at(&mut w, 44.0).into_iter().enumerate() {
+        assert_eq!((s.chain_step, s.fade), (1 | CHAIN_SEEN, 0), "copy {k}");
+        assert_eq!(
+            s.rt_flags & (RT_WRITTEN | RT_FADING | 3 << RT_STEP_SHIFT),
+            RT_WRITTEN | 1 << RT_STEP_SHIFT,
+            "copy {k}"
+        );
+        assert_eq!(s.far_part, 0, "copy {k}: far instance");
+    }
+    assert_clean();
+}
+
 /// Traced normals as an image, for FLIP.
 fn traced_image(r: &Rays) -> Image {
     image(|i| {

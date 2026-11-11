@@ -5,7 +5,7 @@
 // 15% hysteresis: it moves farther past a switch distance x CHAIN_HYSTERESIS and nearer
 // inside the switch distance. A copy seen for the first time takes its step at once; a later
 // change cross-fades over CHAIN_FADE_FRAMES frames, and one back to the step it fades from
-// reverses the fade.
+// reverses the fade. A fade from a step its chain loses ends at once.
 //
 // A copy with animated parts inside its `animation_range` of the focus (15% hysteresis)
 // takes its pose, every such copy without a focus, skinned copies aside, and only while its
@@ -57,13 +57,18 @@ void decide_step(ModelGpu* model, float distance, inout uint step, inout uint fa
     bool seen = (step & CHAIN_SEEN) != 0;
     uint to = step & CHAIN_STEP_MASK;
     uint from = (step >> CHAIN_FROM_SHIFT) & CHAIN_STEP_MASK;
-    if (!seen || to > min(model.chain_count, CHAIN_STEPS - 1))
+    uint n = min(model.chain_count, CHAIN_STEPS - 1);
+    if (!seen || to > n)
     {
         // A copy seen for the first time, or whose chain lost its step, takes its step now.
         step = fresh_step(model, distance) | CHAIN_SEEN;
         fade = 0;
         return;
     }
+    // A fade from a step the chain lost ends on the step it fades to, which keeps its
+    // hysteresis. Outside a fade `from` is 0.
+    if (from > n)
+        fade = 0;
     if (fade != 0)
         fade = fade + 1 >= CHAIN_FADE_FRAMES ? 0 : fade + 1;
     uint next = chain_step_at(model, to, distance);
