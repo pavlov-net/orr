@@ -298,12 +298,12 @@ mod tests {
         assert_eq!(d.scale(), 1.0);
     }
 
-    /// A pool cut to a third under pages that finer cuts hold: a sample counts those pages
-    /// while its frame used the cuts, under scale 3 here, however long they then take to leave
-    /// the pool. Each step is its own sample's, so the scale rises to what fits, by the first
-    /// sample's step at most, and does not come back down.
+    /// A pool cut to a third under a demand with a cliff: below scale 3 the frames want two
+    /// capacities more, as a detail that reads finer pages does. Each step is its own sample's,
+    /// however late, so the scale rises to what fits, by the first sample's step at most, and
+    /// does not come back down.
     #[test]
-    fn a_capacity_cut_under_pages_held_while_used_moves_the_scale_to_what_fits() {
+    fn a_capacity_cut_over_a_cliff_in_the_demand_moves_the_scale_to_what_fits() {
         let c = CAPACITY as f64;
         for late in [1, 3, 6] {
             let p = Plant {

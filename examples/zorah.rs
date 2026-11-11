@@ -588,7 +588,7 @@ impl Readout {
         let rate = |n: f64| n / self.seconds;
         let dropped = |source| r.dropped_from(source);
         self.text = format!(
-            "{:.1} fps  {:.2} ms; GPU ms: traversal {:.2}, cut admission {:.2}, fill {:.2}, BLAS build {:.2}\ndetail x{:.3} (visible x{:.3}, hidden x{:.3}), gathers x{:.3}, mesh pages {:.0} of {:.0} MiB wanted\nmesh pages {}\ntextures {}\ninstance pages {}\nCLAS {:.0} / {:.0} MiB used, {:.0} retries/s, range full {} times, cluster ids full {} times\nread {:.0} MiB/s, {:.0} loads/s landed\n{} loads  {} evictions  {} failed  {} out of memory  {} pages over budget\ndropped: {} traversal, {} finer cuts, {} textures, {} instance pages, {} hints\n{} waiting  longest closure {}\nfeedback lost: {} requests, {} texture raises\nray cuts: {} gathered ({} cached, {} shared, {} fell back, {} past a full queue, {} empty), {} merged, {} BLAS built of {} CLAS; wanted {} BLAS of {} CLAS, tables hold {} BLAS of {} CLAS in {:.1} MiB\nraster: {} candidate items, {} dropped, {} nodes dropped\nhidden test: {} spheres, {} leaves and {} clusters taken by the hidden thresholds",
+            "{:.1} fps  {:.2} ms; GPU ms: traversal {:.2}, cut admission {:.2}, fill {:.2}, BLAS build {:.2}\ndetail x{:.3} (visible x{:.3}, hidden x{:.3}), gathers x{:.3}, mesh pages {:.0} of {:.0} MiB wanted, {:.0} MiB more held by ray cuts\nmesh pages {}\ntextures {}\ninstance pages {}\nCLAS {:.0} / {:.0} MiB used, {:.0} retries/s, range full {} times, cluster ids full {} times\nread {:.0} MiB/s, {:.0} loads/s landed\n{} loads  {} evictions  {} failed  {} out of memory  {} pages over budget\ndropped: {} traversal, {} finer cuts, {} textures, {} instance pages, {} hints\n{} waiting  longest closure {}\nfeedback lost: {} requests, {} texture raises\nray cuts: {} gathered ({} cached, {} shared, {} fell back, {} past a full queue, {} empty), {} merged, {} BLAS built of {} CLAS; wanted {} BLAS of {} CLAS, tables hold {} BLAS of {} CLAS in {:.1} MiB\nraster: {} candidate items, {} dropped, {} nodes dropped\nhidden test: {} spheres, {} leaves and {} clusters taken by the hidden thresholds",
             f64::from(self.frames) / self.seconds,
             self.seconds * 1000.0 / f64::from(self.frames),
             self.cut_ms[0] / f64::from(self.frames),
@@ -601,6 +601,7 @@ impl Readout {
             detail.rt_scale,
             mib(detail.mesh_demand),
             mib(detail.mesh_budget),
+            mib(detail.mesh_held),
             class(ResidencyClass::MeshPages),
             class(ResidencyClass::Textures),
             class(ResidencyClass::InstancePages),

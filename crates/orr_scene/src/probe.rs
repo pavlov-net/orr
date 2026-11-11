@@ -475,9 +475,10 @@ impl fmt::Display for PixelProbe {
         };
         writeln!(
             f,
-            "memory: mesh pages wanted {:.0} of {:.0} MiB; mesh pages {}; textures {}; pools {:.0} and {:.0} MiB",
+            "memory: mesh pages wanted {:.0} of {:.0} MiB, {:.0} MiB more held by ray cuts; mesh pages {}; textures {}; pools {:.0} and {:.0} MiB",
             mib(d.mesh_demand),
             mib(d.mesh_budget),
+            mib(d.mesh_held),
             class(crate::ResidencyClass::MeshPages),
             class(crate::ResidencyClass::Textures),
             mib(s.mesh_pool),

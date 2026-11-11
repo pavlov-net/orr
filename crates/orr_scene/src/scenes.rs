@@ -384,11 +384,15 @@ pub struct DetailStats {
     /// further ([`Budgets::rt_cut_memory`]).
     pub rt_scale: f32,
     /// What the mesh page pool was asked for at the frame's detail: its pinned, locked and
-    /// loading pages, the pages of the finer cuts the frame used, and those the frame read or
-    /// requested with what they depend on, whether or not the budget took them; and the pool's
-    /// budget then. 0 when the frame updated no scene.
+    /// loading pages, and those the frame read or requested with what they depend on, whether
+    /// or not the budget took them; and the pool's budget then. 0 when the frame updated no
+    /// scene.
     pub mesh_demand: u64,
     pub mesh_budget: u64,
+    /// The bytes beside `mesh_demand` of the resident pages that built ray-tracing cuts lock
+    /// and the frame did not read, with what they depend on: they stay while copies trace the
+    /// cuts, and leave the pool with the cuts.
+    pub mesh_held: u64,
     /// The bytes of `mesh_demand` no detail sheds (pinned and locked pages and what they
     /// depend on) past `mesh_budget`. While it is above 0 the scales rise only until the frames
     /// want nothing else, and the pool stays over its budget by this much.
@@ -1232,6 +1236,7 @@ impl Scenes {
                 });
                 f.stats.detail.mesh_demand = mesh.bytes;
                 f.stats.detail.mesh_budget = mesh.budget;
+                f.stats.detail.mesh_held = mesh.held;
                 f.stats.detail.mesh_shortfall =
                     (mesh.bytes - mesh.streamed).saturating_sub(mesh.budget);
             }
