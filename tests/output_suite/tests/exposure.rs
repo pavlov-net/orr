@@ -71,6 +71,65 @@ fn after_a_cut_the_exposure_only_adapts() {
     assert_clean();
 }
 
+/// A history that cannot rescale is dropped on the frame a view's pre-exposure steps from the
+/// reference to its first exposure, so every frame shows the scene at its exposure through
+/// it. After a cut with light to meter that is the next frame. After a cut into black the
+/// pre-exposure waits at the reference until a frame has read back that the view found
+/// light, and steps on the one after.
+#[test]
+fn a_history_starts_over_on_the_frame_pre_exposure_steps() {
+    let mut h = Harness::new(SIDE, SIDE);
+    let display = DisplayRequest::default().resolve(&[OutputFormat::Hdr10Pq], None, false);
+    let output = ViewOutput {
+        debug: OutputDebug::Linear,
+        ..ViewOutput::default()
+    };
+    let reference = exposure_from_ev100(AutoExposure::default().reference_ev100);
+    // Twelve stops brighter and ten darker than the reference keys.
+    for nits in [1e4f32, 1e-3] {
+        h.set_image(&vec![nits; h.pixels()]);
+        // What the frame shows over the scene at the frame's exposure.
+        let shown = |h: &Harness, t: &ExposureTelemetry| {
+            h.display_linear()[0][1] / (nits * exposure_from_ev100(t.adapted_ev100))
+        };
+        h.history = 0.9;
+        h.cut_next();
+        for f in 0..6 {
+            let t = h.frame(1.0, &output, Some(&display));
+            let off = shown(&h, &t) - 1.0;
+            assert!(
+                off.abs() < 2e-3,
+                "{nits} cd/m2, frame {f} from a cut with light: shown {off} off"
+            );
+        }
+
+        // The history starts with the first lit frame, so that frame meters the scene.
+        h.history = 0.0;
+        h.cut_next();
+        for _ in 0..3 {
+            h.frame(0.0, &output, Some(&display));
+        }
+        let found = h.frame(1.0, &output, Some(&display));
+        assert_eq!(found.pre_exposure, reference);
+        h.history = 0.9;
+        let told = h.frame(1.0, &output, Some(&display));
+        let follows = told.pre_exposure / exposure_from_ev100(told.adapted_ev100) - 1.0;
+        assert!(
+            follows.abs() < 1e-5,
+            "pre-exposure {follows} off the exposure"
+        );
+        for f in 0..6 {
+            let t = h.frame(1.0, &output, Some(&display));
+            let off = shown(&h, &t) - 1.0;
+            assert!(
+                off.abs() < 2e-3,
+                "{nits} cd/m2, frame {f} from the step after a black cut: shown {off} off"
+            );
+        }
+    }
+    assert_clean();
+}
+
 /// An adapting view whose scene falls under RGBA16F at its pre-exposure holds its exposure on
 /// the black frame and meters the light on the next, lit eight stops higher.
 #[test]
