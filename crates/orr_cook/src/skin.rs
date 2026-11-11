@@ -706,14 +706,24 @@ pub(crate) struct ClipSource {
     pub(crate) span: (f64, f64),
 }
 
+/// What a joint moves ([`crate::import::Scene::reaches`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub(crate) struct Reach {
+    /// The farthest from its origin, in its own space, of the points it carries, each as far off
+    /// as displacement can move it while the joint carries the offset along.
+    pub(crate) carried: f64,
+    /// The farthest displacement moves a point it poses, in model space: an offset that follows
+    /// the posed normal, not the joint, and so keeps its length while the normal turns.
+    pub(crate) lift: f64,
+}
+
 /// The clip of `source` resampled at the rate nearest `settings.rate` that fits a whole number of
 /// frame intervals, doubling until the clip's sampler holds every joint within the settings'
-/// bounds of the source or the rate reaches `max_rate`. `reach` is each joint's
-/// ([`crate::import::Scene::reaches`]).
+/// bounds of the source or the rate reaches `max_rate`. `reach` is each joint's.
 pub(crate) fn resample(
     info: &SkeletonInfo,
     source: &ClipSource,
-    reach: &[f64],
+    reach: &[Reach],
     settings: &ClipSettings,
 ) -> Clip {
     let mut rate = settings.rate;
@@ -795,13 +805,13 @@ fn sample(info: &SkeletonInfo, channels: &[Channel], span: (f64, f64), rate: f32
 
 /// Largest error of `clip` against the source over every joint, at `per_interval` evenly spaced
 /// times in each interval between consecutive frame and key times: in meters, the farthest a
-/// point within the joint's `reach` of its origin lands from where the source puts it, and in
-/// degrees, the angle between the joint's frames.
+/// point the joint moves (its `reach`) lands from where the source puts it, and in degrees, the
+/// angle between the joint's frames.
 fn error(
     info: &SkeletonInfo,
     source: &ClipSource,
     clip: &Clip,
-    reach: &[f64],
+    reach: &[Reach],
     per_interval: usize,
 ) -> (f64, f64) {
     let (start, duration) = source.span;
@@ -821,6 +831,7 @@ fn error(
     }
     times.extend(ends.last());
     let n = info.joint_count();
+    let binds: Vec<DMat3> = info.inverse_binds.iter().map(linear).collect();
     let worst = |chunk: &[f64]| {
         let (mut sampled, mut model, mut want) = (
             vec![Trs::IDENTITY; n],
@@ -832,8 +843,8 @@ fn error(
             clip.sample(t as f32, &mut sampled);
             info.model_pose(&sampled, &mut model);
             info.model_pose(&pose(info, &source.channels, start + t), &mut want);
-            for ((a, b), &r) in model.iter().zip(&want).zip(reach) {
-                let (p, angle) = pose_error(a, b, r);
+            for (((a, b), &r), ib) in model.iter().zip(&want).zip(reach).zip(&binds) {
+                let (p, angle) = pose_error(a, b, ib, r);
                 out = (out.0.max(p), out.1.max(angle));
             }
         }
@@ -889,18 +900,39 @@ impl ClipSettings {
     }
 }
 
-/// How far apart two joint transforms put the points within `reach` of the joint's origin, at
-/// most (m), and the rotation angle between them (degrees). A point `x` of the joint's space
-/// lands `|(a - b) x|` apart, which is at most the distance of the origins and the most the
-/// difference of the linear parts stretches a vector of length `reach`: that covers turns,
-/// scales and shears alike. The angle is the larger of the angle between the frames of their
-/// linear parts, which a collapsed axis still completes, and the angle between any axis and its
-/// counterpart, which shows a shear the frames don't.
-fn pose_error(a: &Affine3, b: &Affine3, reach: f64) -> (f64, f64) {
-    let linear = |m: &Affine3| DMat3::from_cols_array(&m.matrix3.to_cols_array().map(f64::from));
+/// The linear part of `m`.
+fn linear(m: &Affine3) -> DMat3 {
+    DMat3::from_cols_array(&m.matrix3.to_cols_array().map(f64::from))
+}
+
+/// How far apart two joint transforms put what the joint moves, at most (m), and the rotation
+/// angle between them (degrees); `ib` is the linear part of its inverse bind.
+///
+/// A point `x` of the joint's space lands `|(a - b) x|` apart, which is at most the distance of
+/// the origins and the most the difference of the linear parts stretches a vector of length
+/// `reach.carried`: that covers turns, scales and shears alike. An offset of `reach.lift` along
+/// the posed normal lands at most `lift |n_a - n_b|` apart. With `M` the skinning matrices'
+/// linear parts, `n` the unit of `M n0` or of `M^-T n0`, and `|u / |u| - v / |v|| <= 2 |u - v| /
+/// |v|`, that is at most `2 |M_a - M_b| / s` with `s` the smaller of their least singular values,
+/// and never past 2. Whatever stands between the skinning matrix and the normal, such as a copy's
+/// record, leaves that bound as it is.
+///
+/// The angle is the larger of the angle between the frames of their linear parts, which a
+/// collapsed axis still completes, and the angle between any axis and its counterpart, which shows
+/// a shear the frames miss.
+fn pose_error(a: &Affine3, b: &Affine3, ib: &DMat3, reach: Reach) -> (f64, f64) {
     let origin = |m: &Affine3| DVec3::from_array(m.translation.to_array().map(f64::from));
     let (la, lb) = (linear(a), linear(b));
-    let apart = origin(a).distance(origin(b)) + spectral_norm(la - lb) * reach;
+    let mut apart = origin(a).distance(origin(b)) + spectral_norm(la - lb) * reach.carried;
+    if reach.lift > 0.0 {
+        let (ma, mb) = (la * *ib, lb * *ib);
+        let least = singular_values(ma).0.min(singular_values(mb).0);
+        let turn = match spectral_norm(ma - mb) {
+            0.0 => 0.0,
+            d => (2.0 * d / least).min(2.0),
+        };
+        apart += reach.lift * turn;
+    }
     let rot = |l: DMat3| DMat3::from_quat(stretch_rotation(l).1.normalize());
     let d = rot(la).transpose() * rot(lb);
     // Rounding can take the trace of a rotation past 3.
@@ -916,22 +948,31 @@ fn pose_error(a: &Affine3, b: &Affine3, reach: f64) -> (f64, f64) {
     (apart, cos.acos().max(lean).to_degrees())
 }
 
-/// The largest singular value of `m`, the most it stretches a vector: the root of the largest
-/// eigenvalue of `m^T m`, from the closed form of a symmetric 3 x 3 matrix's (Smith, 1961).
+/// The largest singular value of `m`, the most it stretches a vector.
 pub(crate) fn spectral_norm(m: DMat3) -> f64 {
+    singular_values(m).1
+}
+
+/// The least and largest singular values of `m`: the roots of the least and largest eigenvalues
+/// of `m^T m`, from the closed form of a symmetric 3 x 3 matrix's (Smith, 1961). The least keeps
+/// its digits down to about 1e-8 of the largest.
+fn singular_values(m: DMat3) -> (f64, f64) {
     let s = m.transpose() * m;
     let diagonal = DVec3::new(s.x_axis.x, s.y_axis.y, s.z_axis.z);
     let q = diagonal.element_sum() / 3.0;
     let off = s.y_axis.x.powi(2) + s.z_axis.x.powi(2) + s.z_axis.y.powi(2);
     let p2 = (diagonal - q).length_squared() + 2.0 * off;
     if p2 == 0.0 {
-        return q.sqrt();
+        return (q.sqrt(), q.sqrt());
     }
     let p = (p2 / 6.0).sqrt();
     let b = (s - DMat3::from_diagonal(DVec3::splat(q))) * p.recip();
     // Rounding can take the half determinant past 1 where eigenvalues meet.
-    let r = (b.determinant() / 2.0).clamp(-1.0, 1.0);
-    (q + 2.0 * p * (r.acos() / 3.0).cos()).sqrt()
+    let phi = (b.determinant() / 2.0).clamp(-1.0, 1.0).acos() / 3.0;
+    let largest = q + 2.0 * p * phi.cos();
+    // Rounding can take the least eigenvalue of a singular `m` below 0.
+    let least = (q + 2.0 * p * (phi + std::f64::consts::TAU / 3.0).cos()).max(0.0);
+    (least.sqrt(), largest.sqrt())
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -1320,14 +1361,17 @@ mod tests {
             (pop(1.0), [1.0, 0.0]),
             (chain(), [0.0, 3.0]),
         ];
-        for ((info, source), reach) in &cases {
+        for ((info, source), carried) in &cases {
             for rate in [30.0, 60.0, 120.0] {
                 let clip = sample(info, &source.channels, source.span, rate);
-                let reach = &reach[..info.joint_count()];
-                let dense = error(info, source, &clip, reach, 128 * CHECKS);
-                let got = error(info, source, &clip, reach, CHECKS);
+                let reach: Vec<Reach> = carried[..info.joint_count()]
+                    .iter()
+                    .map(|&carried| Reach { carried, lift: 0.0 })
+                    .collect();
+                let dense = error(info, source, &clip, &reach, 128 * CHECKS);
+                let got = error(info, source, &clip, &reach, CHECKS);
                 // Short of the rounding of f32 poses, which has no shape to search.
-                let rounding = 1e-6 * reach.iter().fold(1.0, |a, &b| f64::max(a, b));
+                let rounding = 1e-6 * carried.iter().fold(1.0, |a, &b| f64::max(a, b));
                 let found = got.0 >= 0.999 * dense.0 - rounding && got.1 >= 0.999 * dense.1 - 1e-4;
                 assert!(found, "{rate} fps: {got:?} of {dense:?}");
             }
@@ -1335,20 +1379,24 @@ mod tests {
     }
 
     #[test]
-    fn spectral_norm_is_the_largest_singular_value() {
+    fn singular_values_are_the_least_and_largest() {
         let turn = |a: f64, b: f64| {
             DMat3::from_quat(DQuat::from_axis_angle(DVec3::new(a, b, 1.0).normalize(), a))
         };
         for (s, want) in [
-            (DVec3::new(3.0, 1.0, 0.5), 3.0),
-            (DVec3::new(0.25, -2.0, 2.0), 2.0),
-            (DVec3::new(1e-9, 0.0, 0.0), 1e-9),
-            (DVec3::ZERO, 0.0),
+            (DVec3::new(3.0, 1.0, 0.5), (0.5, 3.0)),
+            (DVec3::new(0.25, -2.0, 2.0), (0.25, 2.0)),
+            (DVec3::new(1.0, 1.0, 1.0), (1.0, 1.0)),
+            (DVec3::new(1e-9, 0.0, 0.0), (0.0, 1e-9)),
+            (DVec3::new(2.0, 1.0, 0.0), (0.0, 2.0)),
+            (DVec3::ZERO, (0.0, 0.0)),
         ] {
             let m = turn(0.3, 2.0) * DMat3::from_diagonal(s) * turn(1.1, -0.4);
-            let got = spectral_norm(m);
-            // The closed form keeps half its digits where singular values meet.
-            assert!((got - want).abs() <= 1e-7 * want, "{s}: {got}");
+            let got = singular_values(m);
+            // The closed form keeps half its digits where singular values meet, and the least
+            // its digits to about 1e-8 of the largest.
+            let near = |g: f64, w: f64| (g - w).abs() <= 1e-7 * want.1;
+            assert!(near(got.0, want.0) && near(got.1, want.1), "{s}: {got:?}");
         }
     }
 }

@@ -3862,10 +3862,11 @@ fn clips_and_pages_run_on_the_stage_timeline() {
 }
 
 /// The copies a moving instancer places under a turning prim hang from the prim's joint, so the
-/// joint's clip holds them as it holds a mesh as far out: a turn that bends by a few degrees,
-/// between frames, moves both by millimeters 20 m away.
+/// joint's clip holds them as it holds a mesh as far out, and so it holds a surface displaced as
+/// far: a turn that bends by a few degrees, between frames, moves all three by millimeters 20 m
+/// away.
 #[test]
-fn moving_copies_reach_as_far_as_a_mesh_from_the_joint_they_hang_from() {
+fn copies_and_displacement_reach_as_far_as_a_mesh_from_their_joint() {
     let turn = |name: &str, inside: &str| {
         let body = format!(
             r#"def Xform "Turn"
@@ -3917,8 +3918,30 @@ def Mesh "Held"
     }}"#
         ),
     );
+    // A triangle at the joint, whose surface stands 20 m off along its normal.
+    let displaced = turn(
+        "reach-displaced",
+        &format!(
+            r#"def Mesh "M"
+    {{
+        {TRIANGLE}
+        rel material:binding = </Turn/Lifted>
+    }}
+    def Material "Lifted"
+    {{
+        token outputs:surface.connect = </Turn/Lifted/S.outputs:surface>
+        def Shader "S"
+        {{
+            uniform token info:id = "UsdPreviewSurface"
+            float inputs:displacement = 20
+            token outputs:surface
+        }}
+    }}"#
+        ),
+    );
     assert!(mesh > 30.0, "{mesh} fps");
     assert_eq!(copies, mesh);
+    assert_eq!(displaced, mesh);
 }
 
 /// `schemas.dox` poses a skeleton in its prim's space, so a prim above it moves the skin: it

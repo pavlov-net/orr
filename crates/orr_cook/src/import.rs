@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::instances::InstanceMotion;
 use crate::mesh::{self, MeshSettings, MeshSource};
-use crate::skin::{ClipSettings, ClipSource, spectral_norm};
+use crate::skin::{ClipSettings, ClipSource, Reach, spectral_norm};
 use crate::state::Input;
 use crate::subd::{CageData, SubdSettings};
 use crate::texture::material::{ImageFile, MaterialTextures};
@@ -61,12 +61,14 @@ impl Scene {
     /// bind of model space), from its origin of anything it moves. That is the vertices and cage
     /// points weighted to it and the parts it poses, in their bind pose, and the copies that
     /// hang from it: their model's points as placed, or as their rows move them while the
-    /// skeleton's clips run.
-    pub(crate) fn reaches(&self) -> Vec<Vec<f64>> {
-        let mut out: Vec<Vec<f64>> = self
+    /// skeleton's clips run. Each point stands off by as much as its model's displacement can
+    /// move it, which the joint may carry along or which may follow the posed normal
+    /// ([`Reach`]).
+    pub(crate) fn reaches(&self) -> Vec<Vec<Reach>> {
+        let mut out: Vec<Vec<Reach>> = self
             .skeletons
             .iter()
-            .map(|s| vec![0.0; s.info.joint_count()])
+            .map(|s| vec![Reach::default(); s.info.joint_count()])
             .collect();
         let binds: Vec<Vec<DMat4>> = self
             .skeletons
@@ -76,11 +78,22 @@ impl Scene {
                 ib.map(|&b| Mat4::from(b).as_dmat4()).collect()
             })
             .collect();
+        let stretches: Vec<Vec<f64>> = binds
+            .iter()
+            .map(|b| {
+                b.iter()
+                    .map(|&ib| spectral_norm(DMat3::from_mat4(ib)))
+                    .collect()
+            })
+            .collect();
         for m in &self.models {
             let Some(s) = m.skeleton else { continue };
-            let (reach, binds) = (&mut out[s], &binds[s]);
+            let (reach, binds, stretches) = (&mut out[s], &binds[s], &stretches[s]);
+            let lift = self.lift(m);
             let mut moves = |j: usize, p: DVec3| {
-                reach[j] = reach[j].max(binds[j].transform_point3(p).length());
+                let far = binds[j].transform_point3(p).length() + stretches[j] * lift;
+                reach[j].carried = reach[j].carried.max(far);
+                reach[j].lift = reach[j].lift.max(lift);
             };
             let mesh = m.mesh.data();
             for (i, &p) in mesh.positions.iter().enumerate() {
@@ -119,13 +132,17 @@ impl Scene {
             let ib = binds[s][usize::from(joint)];
             let reach = &mut out[s][usize::from(joint)];
             let points: Vec<DVec3> = model.points().collect();
+            let lift = self.lift(model);
+            reach.lift = reach.lift.max(lift);
+            let carried = &mut reach.carried;
             match &copies.motion {
                 None => {
                     let (center, radius) = sphere(&points);
+                    let radius = radius + lift;
                     for p in &copies.placed {
                         let linear = DMat3::from_mat4(ib) * p.linear.as_dmat3();
                         let at = ib.transform_point3(p.position + p.linear.as_dmat3() * center);
-                        *reach = reach.max(at.length() + spectral_norm(linear) * radius);
+                        *carried = carried.max(at.length() + spectral_norm(linear) * radius);
                     }
                 }
                 Some(motion) => {
@@ -135,11 +152,22 @@ impl Scene {
                     });
                     let right = points.iter().map(|&p| motion.right.transform_point3(p));
                     let radius = right.map(DVec3::length).fold(0.0, f64::max);
-                    *reach = reach.max(moving_reach(ib, motion, (lo, hi), radius));
+                    let radius = radius + spectral_norm(DMat3::from_mat4(motion.right)) * lift;
+                    *carried = carried.max(moving_reach(ib, motion, (lo, hi), radius));
                 }
             }
         }
         out
+    }
+
+    /// The farthest displacement can move a point of model `m`, in its space: the most any of
+    /// its mesh's and cage's materials declares. A world length counts as a length of the model,
+    /// as it is under a placement of unit scale, the scale every bound here takes.
+    fn lift(&self, m: &SceneModel) -> f64 {
+        let cage = m.subd.iter().flat_map(|c| &c.materials);
+        let materials = m.materials.iter().chain(cage);
+        let reach = materials.map(|&i| self.materials[i].material.displacement_reach());
+        reach.map(f64::from).fold(0.0, f64::max)
     }
 }
 
