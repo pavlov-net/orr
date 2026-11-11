@@ -1334,6 +1334,20 @@ impl Scenes {
         let mut list = render.command_list()?;
         // Work from earlier frames on this queue finishes before this frame's writes.
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+        let moves = core.mounts.streaming.take_moves();
+        for m in &moves {
+            // SAFETY: both slots are the streamed pools', held until this frame has completed.
+            let (dst, src) = unsafe {
+                (
+                    GpuPtr::from_address(GpuAddress(m.dst)),
+                    GpuPtr::from_address(GpuAddress(m.src)),
+                )
+            };
+            list.copy(dst, src, m.bytes);
+        }
+        if !moves.is_empty() {
+            list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
+        }
         let now = Instant::now();
         Ok(Frame {
             device: &self.device,

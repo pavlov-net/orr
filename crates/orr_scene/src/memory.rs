@@ -202,6 +202,11 @@ pub struct PoolFill {
     pub used: u64,
     /// Blocks with at most half their units in use.
     pub half_empty: u32,
+    /// Of `used`, the bytes of units evicted or moved away that no frame has yet let go.
+    pub retired: u64,
+    /// Bytes of the blocks chosen to empty: they take nothing new, and what they hold moves
+    /// to the other blocks.
+    pub draining: u64,
     /// Device memory blocks it has allocated so far.
     pub made: u64,
     /// Bytes of the empty block it keeps for the next, outside `blocks`.
@@ -242,6 +247,10 @@ pub struct SceneMemory {
 /// A streamed class's memory: blocks of one kind, sub-allocated in units of a fixed size. A
 /// block is device memory of its own, allocated when no block has room and dropped once it is
 /// empty again, so what eviction empties goes back to the system.
+///
+/// Eviction leaves blocks partly used. [`Pool::plan_drain`] chooses the emptiest to empty, as
+/// many as the others have room for; a chosen block takes nothing new, and its owner moves what
+/// it holds into the others ([`Pool::alloc_moved`]), after which it goes like any emptied block.
 pub(crate) struct Pool {
     kind: MemoryKind,
     name: &'static str,
@@ -261,9 +270,18 @@ pub(crate) struct Placement {
     /// Units of a block made for ranges no longer than it.
     block_units: u32,
     blocks: Vec<Option<PlacedBlock>>,
-    /// Live blocks by units in use, the fullest first, then by index.
+    /// The live blocks that take new ranges, by units in use, the fullest first, then by index.
     by_fill: BTreeSet<(Reverse<u32>, u32)>,
     used: u64,
+    retired: u64,
+    /// Counts the frees, which make room a move may have lacked.
+    frees: u64,
+    /// The blocks chosen to empty, the one with the fewest live units first, and their units.
+    draining: Vec<u32>,
+    draining_units: u64,
+    /// Whether ranges came, went or retired since the last plan, and how tight that plan was.
+    changed: bool,
+    planned_tight: bool,
 }
 
 struct PlacedBlock {
@@ -271,6 +289,19 @@ struct PlacedBlock {
     units: u32,
     slots: u32,
     used: u32,
+    /// Of `used`, the units of ranges retired.
+    retired: u32,
+    draining: bool,
+    /// `frees` when a move out of it found no room: until another range is freed it is not
+    /// chosen to empty again.
+    stuck: Option<u64>,
+}
+
+impl PlacedBlock {
+    /// Units of the ranges that stay until they are evicted or moved.
+    fn live(&self) -> u32 {
+        self.used - self.retired
+    }
 }
 
 /// A range of a [`Pool`]: its block, first unit and unit count.
@@ -289,6 +320,12 @@ impl Placement {
             blocks: Vec::new(),
             by_fill: BTreeSet::new(),
             used: 0,
+            retired: 0,
+            frees: 0,
+            draining: Vec::new(),
+            draining_units: 0,
+            changed: false,
+            planned_tight: false,
         }
     }
 
@@ -299,12 +336,12 @@ impl Placement {
 
     /// A range of `units` units at a multiple of `align` units, right after `after` when those
     /// units are free, else in the fullest block with room, so that blocks with few units in
-    /// use drain and go. `None` when no block has room.
+    /// use drain and go. Blocks chosen to empty take none. `None` when no block has room.
     fn find(&mut self, units: u32, align: u32, after: Option<PoolSlot>) -> Option<PoolSlot> {
         let next = after.and_then(|a| {
             let first = a.first + a.units;
             let b = self.blocks.get_mut(a.block as usize)?.as_mut()?;
-            b.ranges.take(first, units).then_some((a.block, first))
+            (!b.draining && b.ranges.take(first, units)).then_some((a.block, first))
         });
         let (block, first) = next.or_else(|| {
             let blocks = &mut self.blocks;
@@ -323,6 +360,7 @@ impl Placement {
         b.used += units;
         self.by_fill.insert((Reverse(b.used), block));
         self.used += u64::from(units);
+        self.changed = true;
         PoolSlot {
             block,
             first,
@@ -342,6 +380,9 @@ impl Placement {
             units: block_units,
             slots: 0,
             used: 0,
+            retired: 0,
+            draining: false,
+            stuck: None,
         });
         let block = match self.blocks.iter().position(Option::is_none) {
             Some(i) => {
@@ -363,8 +404,20 @@ impl Placement {
             .is_some_and(|b| b.ranges.is_free(slot.first + slot.units, slot.units))
     }
 
-    /// Returns `slot`; true when its block is empty and gone.
-    fn free(&mut self, slot: PoolSlot) -> bool {
+    /// Counts `slot` as retired: its units stay taken until [`Placement::free`], but no longer
+    /// keep its block from being chosen to empty.
+    fn retire(&mut self, slot: PoolSlot) {
+        let b = self.blocks[slot.block as usize]
+            .as_mut()
+            .expect("slot of a live block");
+        b.retired += slot.units;
+        assert!(b.retired <= b.used, "a range retired twice");
+        self.retired += u64::from(slot.units);
+        self.changed = true;
+    }
+
+    /// Returns `slot`, which was retired when `retired`; true when its block is empty and gone.
+    fn free(&mut self, slot: PoolSlot, retired: bool) -> bool {
         let entry = &mut self.blocks[slot.block as usize];
         let b = entry.as_mut().expect("slot of a live block");
         b.ranges.free(slot.first, slot.units);
@@ -372,13 +425,87 @@ impl Placement {
         b.slots -= 1;
         b.used -= slot.units;
         self.used -= u64::from(slot.units);
+        if retired {
+            b.retired = b.retired.checked_sub(slot.units).expect("a retired range");
+            self.retired -= u64::from(slot.units);
+        }
+        assert!(b.retired <= b.used, "a retired range freed as a live one");
+        self.frees += 1;
+        self.changed = true;
         let empty = b.slots == 0;
         if empty {
+            if b.draining {
+                self.draining.retain(|&i| i != slot.block);
+                self.draining_units -= u64::from(b.units);
+            }
             *entry = None;
-        } else {
+        } else if !b.draining {
             self.by_fill.insert((Reverse(b.used), slot.block));
         }
         empty
+    }
+
+    /// Chooses the blocks to empty: of the blocks of the standard size, those with the fewest
+    /// live units, as many as the free units of the others hold the live ranges of, and
+    /// unless `tight` a block's units more, which new ranges take before another block is
+    /// made. A block whose ranges are all retired is chosen whatever its size, as it goes by
+    /// itself. Returns the units of the chosen blocks.
+    fn plan(&mut self, tight: bool) -> u64 {
+        if !self.changed && tight == self.planned_tight {
+            return self.draining_units;
+        }
+        self.changed = false;
+        self.planned_tight = tight;
+        let frees = self.frees;
+        let standard = self.block_units;
+        let mut order: Vec<(u32, u32)> = Vec::new();
+        let mut free = 0u64;
+        for (i, b) in (0u32..).zip(&self.blocks) {
+            let Some(b) = b else { continue };
+            free += u64::from(b.units - b.used);
+            let candidate = b.live() == 0 || (b.units == standard && b.stuck != Some(frees));
+            if candidate {
+                order.push((b.live(), i));
+            }
+        }
+        order.sort_unstable();
+        let spare = if tight { 0 } else { u64::from(standard) };
+        let mut chosen = Vec::new();
+        let mut live = 0u64;
+        for (l, i) in order {
+            let b = self.blocks[i as usize].as_ref().expect("a live block");
+            let room = free - u64::from(b.units - b.used);
+            if l > 0 && live + u64::from(l) + spare > room {
+                break;
+            }
+            live += u64::from(l);
+            free = room;
+            chosen.push(i);
+        }
+        for &i in &self.draining {
+            let b = self.blocks[i as usize].as_mut().expect("a draining block");
+            b.draining = false;
+            self.by_fill.insert((Reverse(b.used), i));
+        }
+        self.draining_units = 0;
+        for &i in &chosen {
+            let b = self.blocks[i as usize].as_mut().expect("a live block");
+            b.draining = true;
+            self.by_fill.remove(&(Reverse(b.used), i));
+            self.draining_units += u64::from(b.units);
+        }
+        self.draining = chosen;
+        self.draining_units
+    }
+
+    /// A move out of draining block `block` found no room: the block takes ranges again, and
+    /// is not chosen to empty until another range is freed.
+    fn stuck(&mut self, block: u32) {
+        let b = self.blocks[block as usize]
+            .as_mut()
+            .expect("a draining block");
+        b.stuck = Some(self.frees);
+        self.changed = true;
     }
 
     /// Live blocks, their units, units in use and blocks at most half in use.
@@ -423,6 +550,8 @@ impl Pool {
             bytes: units * unit,
             used: used * unit,
             half_empty,
+            retired: self.places.retired * unit,
+            draining: self.places.draining_units * unit,
             made: self.made,
             spare: self.spare.as_ref().map_or(0, Allocation::size),
         }
@@ -503,6 +632,12 @@ impl Pool {
         u64::from(slot.units) * self.places.unit
     }
 
+    /// The device address of `slot`.
+    pub(crate) fn address(&self, slot: PoolSlot) -> u64 {
+        let (m, at) = self.memory(slot);
+        m.gpu().address().0 + at
+    }
+
     /// The allocation `slot` lies in and its offset there, for sparse binds.
     pub(crate) fn memory(&self, slot: PoolSlot) -> (&Allocation<u8>, u64) {
         let m = self.memory[slot.block as usize]
@@ -513,13 +648,58 @@ impl Pool {
 
     /// Returns `slot`; call only once the GPU no longer reads it.
     pub(crate) fn free(&mut self, slot: PoolSlot) {
-        if self.places.free(slot) {
+        self.release(slot, false);
+    }
+
+    /// Counts `slot`, evicted or moved away, as retired until [`Pool::free_retired`]: frames
+    /// may still read it, but its block is as good as without it.
+    pub(crate) fn retire(&mut self, slot: PoolSlot) {
+        self.places.retire(slot);
+    }
+
+    /// Returns `slot`, which [`Pool::retire`] counted; call only once the GPU no longer reads
+    /// it.
+    pub(crate) fn free_retired(&mut self, slot: PoolSlot) {
+        self.release(slot, true);
+    }
+
+    fn release(&mut self, slot: PoolSlot, retired: bool) {
+        if self.places.free(slot, retired) {
             let memory = self.memory[slot.block as usize].take();
             let standard = u64::from(self.places.block_units) * self.places.unit;
             if self.keep_spare && self.spare.is_none() {
                 self.spare = memory.filter(|m| m.size() == standard);
             }
         }
+    }
+
+    /// Chooses the blocks to empty ([`Placement::plan`]) and returns their bytes, which go
+    /// back to the system once what they hold has moved or been freed.
+    pub(crate) fn plan_drain(&mut self, tight: bool) -> u64 {
+        self.places.plan(tight) * self.places.unit
+    }
+
+    /// The blocks chosen to empty, the one with the fewest live units first.
+    pub(crate) fn draining(&self) -> &[u32] {
+        &self.places.draining
+    }
+
+    /// `bytes` bytes for a range moving out of draining block `from`, in a block that is not
+    /// draining; never a new block. `None` when no block has room: `from` then stops draining
+    /// until a range is freed.
+    pub(crate) fn alloc_moved(&mut self, bytes: u64, from: u32) -> Option<(PoolSlot, Block)> {
+        let unit = self.places.unit;
+        let units = bytes.max(1).div_ceil(unit) as u32;
+        let Some(slot) = self.places.find(units, 1, None) else {
+            self.places.stuck(from);
+            return None;
+        };
+        let memory = Block::of(
+            self.memory[slot.block as usize]
+                .as_ref()
+                .expect("live block"),
+        );
+        Some((slot, memory.sub(u64::from(slot.first) * unit, bytes)))
     }
 
     /// Keeps the last block of the standard size that empties for the next block: for a pool
@@ -788,7 +968,7 @@ mod tests {
                 m[slot.first as usize..][..slot.units as usize].fill(false);
                 let last = !live.iter().any(|s| s.block == slot.block);
                 assert_eq!(
-                    p.free(slot),
+                    p.free(slot, false),
                     last,
                     "step {step}: a block went early or stayed"
                 );
@@ -854,5 +1034,111 @@ mod tests {
             range.fill(true);
             live.push(slot);
         }
+    }
+
+    /// Blocks left partly live by evictions, some of whose ranges are retired and not yet
+    /// freed, drain into the others: a plan chooses the blocks with the fewest live units, no
+    /// more than the rest has room for, nothing is placed in a chosen block, and once every
+    /// move is made and every retired range freed a tight plan leaves the fewest blocks that
+    /// hold what is live, and a loose one at most one more, with a block's units free.
+    #[test]
+    fn drains_empty_the_blocks_with_the_fewest_live_units_into_the_rest() {
+        const BLOCK: u32 = 32;
+        const BLOCKS: u32 = 24;
+        for (tight, keep) in [(true, 3), (false, 3), (true, 11), (false, 11)] {
+            let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+            let mut rng = move |below: u32| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % u64::from(below)) as u32
+            };
+            let mut p = Placement::new(64, u64::from(BLOCK) * 64);
+            let mut live: Vec<PoolSlot> = (0..BLOCK * BLOCKS)
+                .map(|_| match p.find(1, 1, None) {
+                    Some(s) => s,
+                    None => p.add(BLOCK, 1, 1),
+                })
+                .collect();
+            // Evictions keep `keep` ranges in 16; every third evicted range waits for its frame.
+            let mut retired = Vec::new();
+            live.retain(|&s| {
+                let stays = rng(16) < keep;
+                if !stays {
+                    p.retire(s);
+                    if rng(3) == 0 {
+                        retired.push(s);
+                    } else {
+                        p.free(s, true);
+                    }
+                }
+                stays
+            });
+            let live_in = |live: &[PoolSlot], b: u32| live.iter().filter(|s| s.block == b).count();
+            for round in 0.. {
+                let units = p.plan(tight);
+                let chosen = p.draining.clone();
+                let what = format!("tight {tight}, keep {keep}, round {round}");
+                assert_eq!(units, u64::from(BLOCK) * chosen.len() as u64, "{what}");
+                let counts: Vec<usize> = chosen.iter().map(|&b| live_in(&live, b)).collect();
+                assert!(counts.is_sorted(), "{what}: {counts:?}");
+                for s in live.iter_mut().filter(|s| chosen.contains(&s.block)) {
+                    let to = p.find(1, 1, None).expect("the room the plan counted");
+                    assert!(
+                        !chosen.contains(&to.block),
+                        "{what}: placed in a draining block"
+                    );
+                    p.retire(*s);
+                    retired.push(*s);
+                    *s = to;
+                }
+                for s in retired.drain(..) {
+                    p.free(s, true);
+                }
+                if chosen.is_empty() {
+                    break;
+                }
+            }
+            let (blocks, units, used, _) = p.fill();
+            assert_eq!(used, live.len() as u64);
+            let fewest = (live.len() as u32).div_ceil(BLOCK);
+            if tight {
+                assert_eq!(blocks, fewest, "keep {keep}");
+            } else {
+                assert!(blocks <= fewest + 1, "keep {keep}: {blocks} blocks");
+                assert!(
+                    units - used >= u64::from(BLOCK),
+                    "keep {keep}: room for loads"
+                );
+            }
+        }
+    }
+
+    /// A move that finds no room takes its block out of the drain until a range is freed.
+    #[test]
+    fn a_block_whose_move_finds_no_room_stops_draining_until_a_free() {
+        let mut p = Placement::new(64, 8 * 64);
+        let first = p.add(8, 2, 1);
+        let rest = [1, 2, 1, 2].map(|units| p.find(units, 1, None).expect("room in the block"));
+        let narrow = p.add(8, 2, 1);
+        let gone = p.find(1, 1, None).expect("room beside the narrow range");
+        assert_eq!(gone.block, narrow.block);
+        p.retire(gone);
+        p.free(rest[0], false);
+        p.free(rest[2], false);
+        // Two units live against two free units of the other block, in two runs of one.
+        assert_eq!(p.plan(true), 8);
+        assert_eq!(p.draining, [narrow.block]);
+        assert_eq!(p.find(2, 1, None), None);
+        p.stuck(narrow.block);
+        assert_eq!(p.plan(true), 0);
+        assert!(
+            p.by_fill.iter().any(|&(_, b)| b == narrow.block),
+            "the block takes ranges again"
+        );
+        p.free(rest[1], false);
+        assert_eq!(p.plan(true), 8, "a free lets it drain again");
+        assert_eq!(p.draining, [narrow.block]);
+        assert_eq!(p.find(2, 1, None).map(|s| s.block), Some(first.block));
     }
 }

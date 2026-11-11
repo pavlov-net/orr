@@ -7388,6 +7388,164 @@ fn settled_detail(pool: PoolSize) -> (f32, u64, u64) {
     (scale, demand, pinned)
 }
 
+/// Every page of both grounds loads, mixed over the stream pool's blocks, under a view that
+/// draws some of the fine ground's. The mesh page budget then falls to what the view wants: the
+/// other pages go, and the pool empties the blocks they leave partly used by moving the pages
+/// the view draws. Every frame meanwhile draws the pixels the frames before drew, and once the
+/// pool has settled its blocks hold little more than its pages, some of which moved, each
+/// cluster of a moved page naming the page's new slot with the rest of its entry as it was.
+#[test]
+fn mesh_pages_move_out_of_draining_blocks_under_the_frames_that_draw_them() {
+    let _serial = serial();
+    const ERROR_PIXELS: f32 = 2.0;
+    const BLOCK: u64 = 1 << 20;
+    let mesh_pages_class = orr_scene::ResidencyClass::MeshPages;
+    let bytes = fine_ground_pack();
+    let mut w = World::with_pack(
+        &RendererDesc {
+            raster_error_pixels: ERROR_PIXELS,
+            rt_error_pixels: ERROR_PIXELS,
+            rt_merge_pixels: 0.0,
+            culled_error_scale: 1.0,
+            hidden_detail_lead: 1.0,
+            budgets: Budgets {
+                mesh_page_pool: PoolSize::Bytes(128 << 20),
+                texture_pool: PoolSize::Bytes(16 << 20),
+                instance_page_pool: 16 << 20,
+                in_flight_bytes: 16 << 20,
+                stream_block: BLOCK,
+                ..Budgets::default()
+            },
+            ..RendererDesc::default()
+        },
+        bytes,
+    );
+    let items = [Item {
+        model: "fine ground",
+        linear: Mat3::from_rotation_x(0.25) * Mat3::from_diagonal(Vec3::new(2.0, 1.0, 4.0)),
+        at: Vec3::new(0.0, -1.0, -12.0),
+    }];
+    let placed = place(&mut w, &items);
+    let models = ["fine ground", "hidden ground"].map(|name| w.model(name));
+    let eye = DVec3::new(0.3, 1.2, 4.0);
+    let target = DVec3::new(0.0, 0.0, -10.0);
+    let mut frame = 1;
+    let mut shot = |w: &mut World| {
+        frame += 1;
+        shoot(w, &placed, &Shot::at(eye, target, frame))
+    };
+    let stream_pool = |w: &World| {
+        let memory = w.scenes.memory();
+        *memory
+            .pools
+            .iter()
+            .find(|p| p.name == "stream pool")
+            .expect("the stream pool")
+    };
+    let refs = |w: &World, g: &Frame| {
+        let (models_at, meshes, _) = orr_scene::testing::global_tables(&w.scenes);
+        let model: ModelGpu = read_buffer(models_at.offset(u64::from(models[0].0)), 1)[0];
+        let mesh: MeshGpu = read_buffer(meshes.offset(u64::from(model.mesh)), 1)[0];
+        let firsts: Vec<u32> = read_buffer(mesh.page_clusters, u64::from(mesh.page_count) + 1);
+        let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
+        let (pages, bases, _) = mesh_pages(w, models[0]);
+        let pinned = mesh.pinned_pages as usize;
+        let of_page: Vec<Vec<orr_scene::ClusterRef>> = (0..pages.len())
+            .map(|p| {
+                if p < pinned || pages[p] == 0 {
+                    return Vec::new();
+                }
+                let count = u64::from(firsts[p + 1] - firsts[p]);
+                read_buffer(root.clusters.offset(u64::from(bases[p])), count)
+            })
+            .collect();
+        (pages, of_page)
+    };
+
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(120), "pages pending");
+        for &m in &models {
+            w.scenes.prefetch(m, 0);
+        }
+        shot(&mut w);
+        if models.iter().all(|&m| !mesh_pages(&w, m).0.contains(&0)) {
+            break;
+        }
+    }
+    let full = stream_pool(&w);
+    assert!(full.blocks >= 8, "pages over many blocks: {full:?}");
+    // The prefetched pages leave their hold while the view's frames repeat.
+    let mut before = shot(&mut w);
+    for _ in 0..4 {
+        let g = shot(&mut w);
+        assert!(
+            g.clusters == before.clusters && g.a == before.a,
+            "a still view"
+        );
+        before = g;
+    }
+    let detail = w.scenes.stats().detail;
+    assert_eq!(detail.memory_scale, 1.0, "{detail:?}");
+    let (pages_before, refs_before) = refs(&w, &before);
+
+    let budget = detail.mesh_demand * 100 / 85;
+    w.scenes.lower_budget(mesh_pages_class, budget);
+    let start = Instant::now();
+    let (mut settled, mut drained) = (0, 0);
+    let mut last = before;
+    while settled < 8 {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "the pool never settled: {:?}",
+            stream_pool(&w)
+        );
+        let g = shot(&mut w);
+        assert!(
+            g.clusters == last.clusters && g.depth == last.depth && g.a == last.a && g.b == last.b,
+            "frame {frame} drew other pixels"
+        );
+        assert_eq!(w.scenes.stats().detail.memory_scale, 1.0);
+        last = g;
+        let fill = stream_pool(&w);
+        drained = drained.max(fill.draining);
+        let used = w.scenes.residency().class(mesh_pages_class).resident_bytes;
+        let idle = used <= budget && fill.draining == 0 && fill.retired == 0;
+        settled = if idle { settled + 1 } else { 0 };
+    }
+    let fill = stream_pool(&w);
+    assert!(drained > 0, "no block drained: {full:?} to {fill:?}");
+    assert!(
+        fill.used < full.used / 2 && fill.bytes <= fill.used + 3 * BLOCK,
+        "{full:?} to {fill:?}"
+    );
+    let (pages, refs) = refs(&w, &last);
+    let cpu = CpuMesh::of_pack(bytes, "fine ground");
+    let mut moved = 0;
+    for p in 0..pages.len() {
+        if pages[p] == 0 || refs[p].is_empty() || pages[p] == pages_before[p] {
+            continue;
+        }
+        moved += 1;
+        assert_eq!(refs[p].len(), refs_before[p].len(), "page {p}");
+        for (now, was) in refs[p].iter().zip(&refs_before[p]) {
+            assert_eq!(now.page.address().0, pages[p], "page {p}");
+            assert_eq!(
+                (now.local, now.mesh_cluster, now.clas),
+                (was.local, was.mesh_cluster, was.clas),
+                "page {p}"
+            );
+        }
+        // SAFETY: the page's resident slot.
+        let at = unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(pages[p])) };
+        let resident: Vec<u8> = read_buffer(at, cpu.pages[p].len() as u64);
+        assert!(resident == cpu.pages[p], "page {p} in its new slot");
+    }
+    assert!(moved > 0, "no page of the view moved: {full:?} to {fill:?}");
+    assert_eq!(w.scenes.residency().failed, 0);
+    assert_clean();
+}
+
 /// The streaming ground, a wall before most of it, which the camera sees from in front, and a
 /// second ground standing upright wholly behind the wall.
 fn walled_fine_ground() -> [Item; 3] {

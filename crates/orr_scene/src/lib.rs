@@ -67,6 +67,7 @@ mod reload;
 mod residency;
 mod scene;
 mod scenes;
+mod shares;
 mod skin;
 mod stream;
 mod subd;

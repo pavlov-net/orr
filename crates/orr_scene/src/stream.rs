@@ -28,8 +28,16 @@
 //! are resident, admitting each whole when the mesh page pool has room for it, holding its pages
 //! locked until no copy uses the cut, and moves tiles of a texture that lost one back beside its
 //! others.
+//!
+//! Evictions leave the pools' blocks partly used, and a block's memory goes back to the system
+//! only once it is empty. Each step the pools choose the blocks to empty ([`Pool::plan_drain`]),
+//! all that the others have room for while the heap is over its mark, and the step moves the
+//! mesh pages and the other pool units in them to other blocks, a few MiB a step: a unit takes
+//! a new slot, the frame copies it there on the GPU before anything else, and the step's writes
+//! point its table entries at the new slot, so the frame reads the copy and the frames before
+//! it the old slot, which returns once this frame has completed.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -55,18 +63,55 @@ use crate::memory::{Block, Pool, PoolSlot, SceneMemory};
 use crate::mount::{Apply, PageId, page_infos};
 use crate::neural::NeuralLink;
 use crate::residency::{
-    Demand, HOLD_FRAMES, Held, InFlight, Key, Limits, MARK_TENTHS, Plan, Priority, RequestSource,
-    Residency, ResidencyClass, ResidencyStats, UnitDesc, response_period,
+    Demand, HOLD_FRAMES, HeapUse, Held, InFlight, Key, Limits, MARK_TENTHS, Plan, Priority,
+    RequestSource, Residency, ResidencyClass, ResidencyStats, UnitDesc, response_period,
 };
 use crate::scenes::PoolBytes;
 use crate::shaders::page_decode::PageDecodeRoot;
+use crate::shares::HeapShare;
 use crate::tiles::{TexResidency, TexStream, TextureFeedback, Tile, compaction_move};
+use crate::upload::{Op, Record};
 use crate::{Budgets, ClusterRef, Error, LoadState, MountId, Result, RtCutGpu, TextureStreamGpu};
 
 mod probe;
 
 /// Tiles one step moves beside their texture's others, at most.
 const MOVES_PER_STEP: usize = 8;
+/// Bytes of a pool's units one step moves out of its draining blocks, at most, past the first
+/// unit: each takes a GPU copy and the writes of its table entries.
+const DRAIN_BYTES: u64 = 8 << 20;
+
+/// A unit a step moved: the frame copies `bytes` bytes from `src` to `dst` before anything
+/// reads either.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnitMove {
+    pub(crate) dst: u64,
+    pub(crate) src: u64,
+    pub(crate) bytes: u64,
+}
+
+/// The resident units in each block of a pool.
+#[derive(Default)]
+struct BlockUnits(Vec<BTreeSet<Key>>);
+
+impl BlockUnits {
+    fn insert(&mut self, block: u32, k: Key) {
+        let b = block as usize;
+        if b >= self.0.len() {
+            self.0.resize_with(b + 1, BTreeSet::new);
+        }
+        self.0[b].insert(k);
+    }
+
+    fn remove(&mut self, block: u32, k: Key) {
+        self.0[block as usize].remove(&k);
+    }
+
+    /// A unit of `block`, when it holds one.
+    fn any(&self, block: u32) -> Option<Key> {
+        self.0.get(block as usize)?.first().copied()
+    }
+}
 /// Frames a tile goes unused before it may move: its map coarsens until it lands again.
 const MOVE_COLD_FRAMES: u64 = 8;
 
@@ -386,7 +431,7 @@ struct PageFree {
     ids: (u32, u32),
 }
 
-/// A bound tile to unbind and free.
+/// A bound tile to unbind and free, whose slot is retired.
 #[derive(Clone)]
 struct TileFree {
     key: Key,
@@ -439,6 +484,16 @@ pub(crate) struct Streaming {
     retired_cuts: Vec<(u64, FineCut)>,
     mounts: FxHashMap<MountId, MountStreams>,
     resident: FxHashMap<Key, Placed>,
+    /// The resident mesh pages by block of the stream pool, and the other pool units by block
+    /// of theirs.
+    page_blocks: BlockUnits,
+    unit_blocks: BlockUnits,
+    /// The copies of the units this step moved, until the frame takes them.
+    moves: Vec<UnitMove>,
+    /// This manager's part of what the device's residency managers hold on its heaps.
+    share: HeapShare,
+    /// The heap index of the stream pool's memory, and of the other pool units'.
+    pool_heaps: [usize; 2],
     /// Pool slots freed once the frame has completed.
     retired: Vec<(u64, PoolSlot)>,
     /// `units` slots freed once the frame has completed.
@@ -572,6 +627,17 @@ impl Streaming {
             retired_cuts: Vec::new(),
             mounts: FxHashMap::default(),
             resident: FxHashMap::default(),
+            page_blocks: BlockUnits::default(),
+            unit_blocks: BlockUnits::default(),
+            moves: Vec::new(),
+            share: HeapShare::new(device),
+            pool_heaps: {
+                let heap = |kind: MemoryKind| {
+                    let k = MemoryKind::ALL.iter().position(|&a| a == kind);
+                    report.kind_heaps[k.expect("a kind")]
+                };
+                [heap(MemoryKind::DeviceLocal), heap(units_kind)]
+            },
             retired: Vec::new(),
             retired_units: Vec::new(),
             retired_tiles: Vec::new(),
@@ -813,10 +879,10 @@ impl Streaming {
             .collect();
         for k in gone {
             match self.resident.remove(&k).expect("resident") {
-                Placed::Pool(slot, _) => self.retired_units.push((frame, slot)),
+                Placed::Pool(slot, _) => self.retire_unit(k, slot, frame),
                 Placed::MeshPage(p) => {
                     let (slot, free) = p.free();
-                    self.retired.push((frame, slot));
+                    self.retire_page(k, slot, frame);
                     self.retired_pages.push((frame, free));
                 }
                 Placed::Tile(slot) => {
@@ -827,6 +893,7 @@ impl Streaming {
                         tile,
                         slot,
                     };
+                    self.tiles.lock().unwrap().retire(slot);
                     self.retired_tiles.push((frame, free));
                 }
             }
@@ -1605,7 +1672,7 @@ impl Streaming {
             if live && self.residency.loading(u.key) {
                 self.carried.push(u);
             } else if (live && self.residency.resident(u.key)) || self.unbinding.contains(&u.key) {
-                self.tiles.lock().unwrap().free(u.slot);
+                self.tiles.lock().unwrap().free_retired(u.slot);
             } else {
                 // A load of the tile waits for the task that unbinds it, as after an eviction.
                 self.unbinding.insert(u.key);
@@ -1622,7 +1689,26 @@ impl Streaming {
         }
         points.extend(self.fine_step(frame, settled, pressure, loading, w)?);
         let report = w.device.memory_report();
-        let heaps: Vec<(u64, u64)> = report.heaps.iter().map(|h| (h.usage, h.budget)).collect();
+        // Over its mark a heap's pools empty every block they can; under it they keep a
+        // block's room for loads.
+        let over = |h: usize| report.heaps[h].usage > report.heaps[h].budget / 10 * MARK_TENTHS;
+        let mut mine: Vec<[u64; 2]> = (0..report.heaps.len())
+            .map(|h| [self.residency.held_on(h), 0])
+            .collect();
+        for (pool, &heap) in [&self.pool, &self.units].into_iter().zip(&self.pool_heaps) {
+            mine[heap][1] += pool.lock().unwrap().plan_drain(over(heap));
+        }
+        let heaps: Vec<HeapUse> = report
+            .heaps
+            .iter()
+            .zip(self.share.post(&mine))
+            .map(|(h, [held, coming])| HeapUse {
+                usage: h.usage,
+                budget: h.budget,
+                coming: h.freeing + coming,
+                held,
+            })
+            .collect();
         self.residency.react(frame, &heaps);
         let staging = report.heap_of(MemoryKind::Staging);
         if staging.usage > staging.budget / 10 * MARK_TENTHS {
@@ -1683,6 +1769,7 @@ impl Streaming {
             self.evict_placed(k, frame, w)?;
         }
         self.compact(frame, w)?;
+        self.drain(frame, w)?;
         for m in self.mounts.values_mut() {
             for t in &mut m.textures {
                 t.write_map(w)?;
@@ -1803,7 +1890,7 @@ impl Streaming {
         match self.resident.remove(&k).expect("evicted unit is resident") {
             Placed::Pool(slot, target) => {
                 self.point_target(target, 0, w)?;
-                self.retired_units.push((frame - 1, slot));
+                self.retire_unit(k, slot, frame - 1);
             }
             Placed::MeshPage(p) => {
                 let (table, refs, count) = p.entries();
@@ -1819,7 +1906,7 @@ impl Streaming {
                     }
                 }
                 let (slot, free) = p.free();
-                self.retired.push((frame - 1, slot));
+                self.retire_page(k, slot, frame - 1);
                 self.retired_pages.push((frame - 1, free));
             }
             Placed::Tile(slot) => {
@@ -1834,10 +1921,130 @@ impl Streaming {
                     slot,
                 };
                 self.unbinding.insert(k);
+                self.tiles.lock().unwrap().retire(slot);
                 self.retired_tiles.push((frame - 1, free));
             }
         }
         Ok(())
+    }
+
+    /// Takes mesh page `k` out of stream pool slot `slot`, which returns once `frame` has
+    /// completed.
+    fn retire_page(&mut self, k: Key, slot: PoolSlot, frame: u64) {
+        self.page_blocks.remove(slot.block, k);
+        self.pool.lock().unwrap().retire(slot);
+        self.retired.push((frame, slot));
+    }
+
+    /// Takes pool unit `k` out of `units` slot `slot`, which returns once `frame` has
+    /// completed.
+    fn retire_unit(&mut self, k: Key, slot: PoolSlot, frame: u64) {
+        self.unit_blocks.remove(slot.block, k);
+        self.units.lock().unwrap().retire(slot);
+        self.retired_units.push((frame, slot));
+    }
+
+    /// Moves units out of the stream pool's and the unit pool's draining blocks, the block
+    /// with the fewest live units first, [`DRAIN_BYTES`] of each pool at most: each takes a slot
+    /// in a block that is not draining, its table entries point there from this frame on, and
+    /// its old slot returns once this frame, whose copy reads it, has completed. A block one of
+    /// whose units finds no room stops draining.
+    fn drain(&mut self, frame: u64, w: &mut Apply<'_>) -> Result<()> {
+        for pages in [true, false] {
+            let pool = Arc::clone(if pages { &self.pool } else { &self.units });
+            let blocks = pool.lock().unwrap().draining().to_vec();
+            let mut moved = 0;
+            'blocks: for block in blocks {
+                loop {
+                    let index = if pages {
+                        &self.page_blocks
+                    } else {
+                        &self.unit_blocks
+                    };
+                    let Some(k) = index.any(block) else { break };
+                    if moved >= DRAIN_BYTES {
+                        break 'blocks;
+                    }
+                    let (bytes, to) = {
+                        let mut pool = pool.lock().unwrap();
+                        let bytes = match &self.resident[&k] {
+                            Placed::MeshPage(p) => pool.bytes(p.slot),
+                            Placed::Pool(slot, _) => pool.bytes(*slot),
+                            Placed::Tile(_) => unreachable!("tiles are in their own pool"),
+                        };
+                        (bytes, pool.alloc_moved(bytes, block))
+                    };
+                    let Some((to, at)) = to else { break };
+                    moved += bytes;
+                    self.move_unit(k, to, at.gpu(), bytes, frame, w)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves resident mesh page or pool unit `k` to slot `to` at address `at`.
+    fn move_unit(
+        &mut self,
+        k: Key,
+        to: PoolSlot,
+        at: u64,
+        bytes: u64,
+        frame: u64,
+        w: &mut Apply<'_>,
+    ) -> Result<()> {
+        match self.resident.remove(&k).expect("a resident unit") {
+            Placed::Pool(slot, target) => {
+                let from = self.units.lock().unwrap().address(slot);
+                self.moves.push(UnitMove {
+                    dst: at,
+                    src: from,
+                    bytes,
+                });
+                self.point_target(target, at, w)?;
+                self.retire_unit(k, slot, frame);
+                self.unit_blocks.insert(to.block, k);
+                self.resident.insert(k, Placed::Pool(to, target));
+            }
+            Placed::MeshPage(mut p) => {
+                self.moves.push(UnitMove {
+                    dst: at,
+                    src: p.address,
+                    bytes,
+                });
+                let (table, refs, count) = p.entries();
+                w.put(table, &[at])?;
+                // Each cluster's entry names the page first; the rest of it stays.
+                let stride = (size_of::<ClusterRef>() / 4) as u32;
+                for (word, value) in [(0, at as u32), (4, (at >> 32) as u32)] {
+                    w.records.push(Record {
+                        seq: w.seq.fetch_add(1, Ordering::Relaxed),
+                        dst: refs.address().0 + word,
+                        count,
+                        stride,
+                        op: Op::Fill(value),
+                    });
+                }
+                for mirror in p.stream.mirrors.lock().unwrap().iter() {
+                    if !mirror.own[p.page as usize] {
+                        w.put(mirror.table.offset(u64::from(p.page)), &[at])?;
+                    }
+                }
+                self.retire_page(k, p.slot, frame);
+                p.slot = to;
+                p.address = at;
+                self.page_blocks.insert(to.block, k);
+                self.resident.insert(k, Placed::MeshPage(p));
+            }
+            Placed::Tile(_) => unreachable!("tiles are in their own pool"),
+        }
+        Ok(())
+    }
+
+    /// The copies of the units this step moved, which the frame runs before anything reads
+    /// the scenes' tables.
+    pub(crate) fn take_moves(&mut self) -> Vec<UnitMove> {
+        std::mem::take(&mut self.moves)
     }
 
     /// Moves the tiles of the textures that lost one and sit apart from the rest beside them:
@@ -1991,6 +2198,7 @@ impl Streaming {
                 match (live && ok, l.placed.take()) {
                     (true, Some(Placed::Pool(slot, target))) => {
                         self.point_target(target, l.gpu, w)?;
+                        self.unit_blocks.insert(slot.block, key);
                         self.resident.insert(key, Placed::Pool(slot, target));
                     }
                     (true, Some(Placed::Tile(slot))) => {
@@ -2005,6 +2213,7 @@ impl Streaming {
                     (_, Some(Placed::Tile(slot))) => {
                         let (stream, tile) = l.tile.expect("a tile load names its tile");
                         self.unbinding.insert(key);
+                        self.tiles.lock().unwrap().retire(slot);
                         self.unbinds.push(TileFree {
                             key,
                             stream,
@@ -2107,6 +2316,7 @@ impl Streaming {
                 clas: entries.iter().map(|e| e.clas).collect(),
             }));
         }
+        self.page_blocks.insert(p.slot.block, key);
         self.resident.insert(key, Placed::MeshPage(p));
         Ok(())
     }
@@ -2149,7 +2359,7 @@ impl Streaming {
         self.retired.retain(|&(frame, slot)| {
             let done = frame <= completed;
             if done {
-                pool.free(slot);
+                pool.free_retired(slot);
             }
             !done
         });
@@ -2158,7 +2368,7 @@ impl Streaming {
         self.retired_units.retain(|&(frame, slot)| {
             let done = frame <= completed;
             if done {
-                units.free(slot);
+                units.free_retired(slot);
             }
             !done
         });
@@ -2850,7 +3060,7 @@ fn submit(
     }
     *unbound = true;
     for u in &task.unbinds {
-        tiles.free(u.slot);
+        tiles.free_retired(u.slot);
     }
     drop(tiles);
     if !bound.is_empty() {

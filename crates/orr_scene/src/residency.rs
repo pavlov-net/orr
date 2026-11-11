@@ -35,13 +35,16 @@
 //! A unit's bytes are what its load places and what it builds beside them; the built bytes
 //! are an estimate until its first load reports them.
 //!
-//! Each step sets the budgets of the classes on a heap from its use against its OS budget.
-//! Under 90% of it, every class there may use the bytes free below that mark beside what it
-//! uses, up to its configured budget. Past the mark, at most once per response period
-//! ([`response_period`]), the classes give back the excess, each in proportion to what it
-//! uses, and units past their hold are evicted down to the budgets; a cut asks for no more of
-//! the excess than the share of its bytes the cut before got back from the heap. User blobs live in the
-//! consumer's memory and keep their configured budget. A failed allocation shrinks every
+//! Each step sets the budgets of the classes on a heap from its use against its OS budget
+//! ([`HeapUse`]). Under 90% of it, every class there may use the bytes free below that mark
+//! beside what it uses, up to its configured budget. Past the mark the heap's excess is what it
+//! uses over the mark less what is already on its way back to the system: blocks freed and
+//! waiting for the GPU, and blocks the pools are emptying. At most once per response period
+//! ([`response_period`]) the classes give that excess back, each in proportion to what it uses
+//! of all the classes of the device's residency managers use on the heap, down to a floor, and
+//! units past their hold are evicted down to the budgets. What a manager's share asks beyond
+//! its classes' floors is its shortfall ([`ResidencyStats::heap_shortfall`]). User blobs live in
+//! the consumer's memory and keep their configured budget. A failed allocation shrinks every
 //! budget by a step, and a class whose units' shared address range runs out shrinks alone;
 //! each grows back a step after a response period without.
 //!
@@ -90,15 +93,20 @@ const SOURCES: usize = 5;
 const LANES: usize = SOURCES + 1;
 const BLOB_LANE: usize = SOURCES;
 
-/// One cut of a heap's budgets past its mark.
-#[derive(Clone, Copy, Debug)]
-struct Cut {
-    frame: u64,
-    /// The heap's use when it was made, and the least since.
-    usage: u64,
-    low: u64,
-    /// The bytes it asked the classes to give up, above 0.
-    asked: u64,
+/// One heap as [`Residency::react`] takes it, by heap index
+/// ([`orr_gpu::MemoryReport::heaps`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeapUse {
+    /// What the process uses of the heap, as the OS counts it, and what the OS lets it use.
+    pub(crate) usage: u64,
+    pub(crate) budget: u64,
+    /// Bytes of `usage` on their way back to the system: device memory blocks freed that the
+    /// device has yet to free, and blocks the pools of every residency manager on the device
+    /// are emptying.
+    pub(crate) coming: u64,
+    /// Bytes the classes on the heap use, summed over every residency manager on the device,
+    /// this one among them.
+    pub(crate) held: u64,
 }
 
 /// A residency class: one pool and one byte budget.
@@ -229,6 +237,14 @@ pub struct ResidencyStats {
     pub texture_feedback_lost: u32,
     /// Texture tiles moved beside their texture's other tiles since the start.
     pub tiles_moved: u32,
+    /// Bytes the device-local heaps use over the mark the budgets keep them under, less what
+    /// is already on its way back to the system; 0 with every heap under its mark.
+    pub heap_excess: u64,
+    /// Of this manager's share of [`Self::heap_excess`], the bytes its budgets cannot give
+    /// back, as its classes would have to go under the least they keep; all of the excess
+    /// when no class uses anything on the heap. While it is above 0 the heap stays over its
+    /// mark, and the OS pages memory out, until something outside the budgets frees memory.
+    pub heap_shortfall: u64,
 }
 
 impl ResidencyStats {
@@ -574,8 +590,8 @@ pub(crate) struct Residency {
     quiet: [u64; CLASSES],
     /// Per class, the bytes loads and evictions plan under.
     budgets: [u64; CLASSES],
-    /// Per heap, its budgets' last cut.
-    cut: Vec<Option<Cut>>,
+    /// Per heap, the frame of its budgets' last cut since it was last under its mark.
+    cut: Vec<Option<u64>>,
     mounts: FxHashMap<MountId, Vec<Unit>>,
     evictable: [Evictable; CLASSES],
     /// Resident plus loading bytes per class.
@@ -754,10 +770,18 @@ impl Residency {
         self.stats.out_of_memory += 1;
     }
 
-    /// Takes, at `frame`, each heap's use and OS budget in bytes by heap index, and sets the
-    /// budgets the next plans use. Failed allocations shrink them one step, however many ran
-    /// out of memory since the last call.
-    pub(crate) fn react(&mut self, frame: u64, heaps: &[(u64, u64)]) {
+    /// The bytes the classes on heap `heap` use.
+    pub(crate) fn held_on(&self, heap: usize) -> u64 {
+        (0..CLASSES)
+            .filter(|&c| self.limits.heaps[c] & (1 << heap) != 0)
+            .map(|c| self.used[c])
+            .sum()
+    }
+
+    /// Takes, at `frame`, each heap's use by heap index, and sets the budgets the next plans
+    /// use. Failed allocations shrink them one step, however many ran out of memory since the
+    /// last call.
+    pub(crate) fn react(&mut self, frame: u64, heaps: &[HeapUse]) {
         let failed = std::mem::take(&mut self.out_of_memory);
         let full = std::mem::take(&mut self.range_full);
         let period = self.limits.period;
@@ -780,62 +804,54 @@ impl Residency {
             }
         });
         self.cut.resize(heaps.len(), None);
-        // A cut asks each class on the heap for its share of the excess out of what it uses at
-        // that moment. Evicting gets memory back only where it empties whole blocks, so the cut
-        // a period later asks for the excess still there times the share of its bytes the last
-        // one got back: a cut that got nothing back is not repeated, and the budgets hold where
-        // they are until the heap has room again. Back under the mark the record goes, so the
-        // next time the heap passes it starts with a whole cut.
-        for (h, &(usage, budget)) in heaps.iter().enumerate() {
+        let (mut excess_all, mut shortfall) = (0, 0);
+        for (h, heap) in heaps.iter().enumerate() {
             let on: Vec<usize> = (0..CLASSES)
                 .filter(|&c| self.limits.heaps[c] & (1 << h) != 0)
                 .collect();
             if on.is_empty() {
                 continue;
             }
-            if let Some(c) = &mut self.cut[h] {
-                c.low = c.low.min(usage);
-            }
-            let mark = budget / 10 * MARK_TENTHS;
-            if usage <= mark {
+            let mark = heap.budget / 10 * MARK_TENTHS;
+            if heap.usage <= mark {
                 self.cut[h] = None;
                 for &c in &on {
-                    budgets[c] = budgets[c].min(self.used[c].saturating_add(mark - usage));
+                    budgets[c] = budgets[c].min(self.used[c].saturating_add(mark - heap.usage));
                 }
-            } else if self.cut[h].is_none_or(|c| frame >= c.frame + period) {
-                let back = self.cut[h].map_or(1.0, |c| {
-                    ((c.usage - c.low) as f64 / c.asked as f64).min(1.0)
-                });
-                let excess = ((usage - mark) as f64 * back) as u128;
-                let total: u128 = on.iter().map(|&c| u128::from(self.used[c])).sum();
-                let mut asked = 0;
-                for &c in &on {
-                    let used = u128::from(self.used[c]);
-                    let kept = if excess >= total {
-                        0
-                    } else {
-                        (used * (total - excess) / total) as u64
-                    };
-                    let floor = (configured[c] as f64 * MIN_SCALE) as u64;
-                    let to = budgets[c].min(self.budgets[c]).min(kept.max(floor));
-                    asked += self.used[c].saturating_sub(to);
-                    budgets[c] = to;
-                }
-                self.cut[h] = Some(match self.cut[h] {
-                    Some(c) if asked == 0 => Cut { frame, ..c },
-                    _ => Cut {
-                        frame,
-                        usage,
-                        low: usage,
-                        asked,
-                    },
-                });
-            } else {
-                for &c in &on {
-                    budgets[c] = budgets[c].min(self.budgets[c]);
-                }
+                continue;
+            }
+            // Evictions take a period to show as memory on its way back, so the excess still
+            // there a period after a cut is what that cut did not reach.
+            let excess = (heap.usage - mark).saturating_sub(heap.coming);
+            let cuts = self.cut[h].is_none_or(|last| frame >= last + period);
+            let mut cut = false;
+            excess_all += excess;
+            if heap.held == 0 {
+                shortfall += excess;
+            }
+            for &c in &on {
+                let used = self.used[c];
+                let floor = (configured[c] as f64 * MIN_SCALE) as u64;
+                // `used` is part of `held`, so the share is at most `excess`.
+                let share = match heap.held {
+                    0 => 0,
+                    held => (u128::from(excess) * u128::from(used) / u128::from(held)) as u64,
+                };
+                shortfall += share.saturating_sub(used.saturating_sub(floor));
+                let held = budgets[c].min(self.budgets[c]);
+                budgets[c] = if cuts {
+                    held.min(used.saturating_sub(share).max(floor))
+                } else {
+                    held
+                };
+                cut |= budgets[c] < self.budgets[c].min(used);
+            }
+            if cut {
+                self.cut[h] = Some(frame);
             }
         }
+        self.stats.heap_excess = excess_all;
+        self.stats.heap_shortfall = shortfall;
         self.budgets = budgets;
         self.refresh();
     }
@@ -1737,9 +1753,19 @@ mod tests {
         }
     }
 
-    /// Heap 0 using `usage` of its OS budget of 1000, whose mark is 900.
-    fn heap(usage: u64) -> [(u64, u64); 1] {
-        [(usage, 1000)]
+    /// Heap 0 using `usage` of its OS budget of 1000, whose mark is 900, with `coming` on its
+    /// way back and `r`'s classes alone on it.
+    fn heap_with(r: &Residency, usage: u64, coming: u64) -> [HeapUse; 1] {
+        [HeapUse {
+            usage,
+            budget: 1000,
+            coming,
+            held: r.held_on(0),
+        }]
+    }
+
+    fn heap(r: &Residency, usage: u64) -> [HeapUse; 1] {
+        heap_with(r, usage, 0)
     }
 
     const P: Priority = Priority {
@@ -2179,7 +2205,13 @@ mod tests {
 
         // A full range shrinks its class's budget alone.
         r.range_full(ResidencyClass::InstancePages);
-        r.react(1, &[(0, 1 << 40)]);
+        r.react(
+            1,
+            &[HeapUse {
+                budget: 1 << 40,
+                ..HeapUse::default()
+            }],
+        );
         let texture = r.stats().class(ResidencyClass::Textures).budget;
         assert_eq!((class(&r).budget, texture), (285, 1000));
         assert_eq!(r.stats().out_of_memory, 1);
@@ -2407,7 +2439,7 @@ mod tests {
         for k in loaded {
             r.lock(key(k));
         }
-        r.react(1, &heap(600));
+        r.react(1, &heap(&r, 600));
         assert_eq!(
             budgets(&r),
             (400, 200),
@@ -2416,23 +2448,24 @@ mod tests {
         assert_eq!(class(&r).configured, 400);
 
         // 300 over the mark: half of the 600 the classes use, from each its half.
-        r.react(2, &heap(1200));
+        r.react(2, &heap(&r, 1200));
         assert_eq!(budgets(&r), (200, 100));
+        assert_eq!((r.stats().heap_excess, r.stats().heap_shortfall), (300, 0));
         for frame in 3..2 + period {
-            r.react(frame, &heap(1300));
+            r.react(frame, &heap(&r, 1300));
             assert_eq!(budgets(&r), (200, 100), "frame {frame}: one cut a period");
         }
         let second = 2 + period;
         assert_eq!(step(&mut r, &[], second).evictions, []);
-        r.react(second, &heap(1200));
+        r.react(second, &heap(&r, 1200));
         assert_eq!(
             budgets(&r),
             (200, 100),
-            "nothing came back: nothing more is asked"
+            "the same excess of the same use asks nothing more"
         );
 
-        // Evictions leave the heap 150 over, half of what the cut asked for back: the cut a
-        // period later asks for half of that.
+        // The evicted 300 are on their way back: nothing more is asked while they are, however
+        // long the heap's use takes to show it.
         for k in loaded {
             r.unlock(key(k));
         }
@@ -2440,61 +2473,102 @@ mod tests {
             step(&mut r, &[], second).evictions,
             [key(5), key(0), key(1)]
         );
-        r.react(second + 1, &heap(1050));
-        assert_eq!(budgets(&r), (200, 100));
-        let third = second + period;
-        r.react(third, &heap(1050));
-        assert_eq!(budgets(&r), (150, 75));
+        for frame in second + 1..second + 2 * period {
+            r.react(frame, &heap_with(&r, 1200, 300));
+            assert_eq!(budgets(&r), (200, 100), "frame {frame}");
+            assert_eq!(r.stats().heap_excess, 0);
+        }
+        // Half of them came back, and nothing else is coming: the 150 left are asked at once.
+        let third = second + 2 * period;
+        r.react(third, &heap(&r, 1050));
+        assert_eq!(budgets(&r), (100, 50));
 
         // Under the mark a budget is never below use, so nothing is evicted for it.
-        r.react(third + 1, &heap(880));
+        r.react(third + 1, &heap(&r, 880));
         assert_eq!(budgets(&r), (220, 120));
         assert_eq!(step(&mut r, &[], third + 1).evictions, []);
         // A load in flight counts as used.
-        r.react(third + 2, &heap(700));
+        r.react(third + 2, &heap(&r, 700));
         r.request(key(3), P, S);
         assert_eq!(r.plan(third + 2, []).loads, [key(3)]);
-        r.react(third + 3, &heap(800));
+        r.react(third + 3, &heap(&r, 800));
         assert_eq!(budgets(&r), (400, 200));
-        r.react(third + 4, &heap(850));
+        r.react(third + 4, &heap(&r, 850));
         assert_eq!(budgets(&r), (350, 150));
 
-        r.react(third + period, &heap(2000));
+        // The heap was under its mark, so this pass cuts at once: 1100 over, of which the
+        // classes can give 250 and 75 before the least they keep.
+        r.react(third + 5, &heap(&r, 2000));
         assert_eq!(budgets(&r), (50, 25), "the floor");
+        assert_eq!(
+            (r.stats().heap_excess, r.stats().heap_shortfall),
+            (1100, 1100 - 250 - 75)
+        );
         // At 85% of the heap's budget a class far over its floor gets room the next step.
-        r.react(third + period + 1, &heap(850));
+        r.react(third + 6, &heap(&r, 850));
         assert_eq!(budgets(&r), (350, 150));
+        assert_eq!((r.stats().heap_excess, r.stats().heap_shortfall), (0, 0));
         check(&r);
     }
 
-    /// A cut whose share came back short scales the next cut of its pass over the mark, but
-    /// once the heap is under its mark the next pass starts with a whole cut.
+    /// Evictions that return nothing to the heap do not stop the cuts: each period asks for
+    /// the excess still there, down to the least the class keeps, and what is left shows as
+    /// the shortfall.
     #[test]
-    fn a_pass_over_the_mark_after_the_heap_was_under_it_cuts_the_whole_excess() {
+    fn evictions_that_return_no_memory_are_followed_by_cuts_down_to_the_floor() {
         let period = response_period(2);
+        let mut r = Residency::new(limits(800));
+        let units: Vec<UnitDesc> = (0..8).map(|_| unit(100, &[], Start::Absent)).collect();
+        r.register(M, &units).unwrap();
+        step(&mut r, &[0, 1, 2, 3, 4, 5, 6, 7], 1);
+        r.react(1, &heap(&r, 1100));
+        assert_eq!(class(&r).budget, 600);
+        let second = 1 + period;
+        assert_eq!(step(&mut r, &[], second).evictions.len(), 2);
+        r.react(second, &heap(&r, 1100));
+        assert_eq!(class(&r).budget, 400, "200 more of the 600 in use");
+        let third = second + period;
+        assert_eq!(step(&mut r, &[], third).evictions.len(), 2);
+        r.react(third, &heap(&r, 1100));
+        assert_eq!(class(&r).budget, 200);
+        assert_eq!(step(&mut r, &[], third + period).evictions.len(), 2);
+        r.react(third + period, &heap(&r, 1100));
+        assert_eq!(class(&r).budget, 100, "the least the class keeps");
+        assert_eq!(
+            (r.stats().heap_excess, r.stats().heap_shortfall),
+            (200, 100)
+        );
+        check(&r);
+    }
+
+    /// Two residency managers on one device each give back the share of a heap's excess that
+    /// their classes use of what both use, and one with nothing on the heap reports the excess
+    /// as out of the budgets' reach.
+    #[test]
+    fn managers_on_one_device_share_a_heaps_excess_by_what_each_uses() {
         let mut r = Residency::new(limits(400));
         let units: Vec<UnitDesc> = (0..4).map(|_| unit(100, &[], Start::Absent)).collect();
         r.register(M, &units).unwrap();
-        let loaded = [0, 1, 2, 3];
-        step(&mut r, &loaded, 1);
-        // Locked, nothing can go, so the budget stays under what the units use.
-        for k in loaded {
-            r.lock(key(k));
-        }
-        r.react(1, &heap(1200));
-        assert_eq!(class(&r).budget, 100);
-        // 250 of the 300 asked came back, and the 300 the budget leaves in use are asked again.
-        let second = 1 + period;
-        r.react(second, &heap(950));
-        assert_eq!(class(&r).budget, 100);
-        r.react(second + 1, &heap(880));
-        assert_eq!(class(&r).budget, 400, "the room under the mark");
-        // The pass before got back 70 of 300; this one asks for all 400 over the mark.
-        r.react(second + period + 1, &heap(1300));
-        assert_eq!(class(&r).budget, 50, "the floor");
-        check(&r);
+        step(&mut r, &[0, 1, 2], 1);
+        let over = |held| {
+            [HeapUse {
+                usage: 1200,
+                budget: 1000,
+                coming: 100,
+                held,
+            }]
+        };
+        // 200 over once the 100 coming are back, of which this one uses 300 of 1200.
+        r.react(1, &over(1200));
+        assert_eq!(class(&r).budget, 250);
+        assert_eq!((r.stats().heap_excess, r.stats().heap_shortfall), (200, 0));
+        let mut idle = Residency::new(limits(400));
+        idle.react(1, &over(0));
+        assert_eq!(
+            (idle.stats().heap_excess, idle.stats().heap_shortfall),
+            (200, 200)
+        );
     }
-
     #[test]
     fn failures_step_budgets_down_until_a_quiet_period_and_leave_user_blobs_alone() {
         let period = response_period(2);
@@ -2512,13 +2586,13 @@ mod tests {
                 s.class(blobs).budget,
             )
         };
-        r.react(1, &heap(600));
+        r.react(1, &heap(&r, 600));
         assert_eq!(
             budgets(&r),
             (300, 300, 150),
             "an unbounded class starves none"
         );
-        r.react(2, &heap(2000));
+        r.react(2, &heap(&r, 2000));
         assert_eq!(budgets(&r).2, 150, "user blobs are not on the heap");
 
         // A failure every step steps down every step.
@@ -2526,20 +2600,20 @@ mod tests {
         for frame in 3..8 {
             r.out_of_memory(true);
             r.out_of_memory(true);
-            r.react(frame, &heap(0));
+            r.react(frame, &heap(&r, 0));
             scale *= SCALE_STEP;
             assert_eq!(budgets(&r).0, (400.0 * scale) as u64, "frame {frame}");
         }
         r.out_of_memory(false);
-        r.react(8, &heap(0));
+        r.react(8, &heap(&r, 0));
         assert_eq!(budgets(&r), ((400.0 * scale) as u64, 900, 150));
-        r.react(6 + period, &heap(0));
+        r.react(6 + period, &heap(&r, 0));
         assert_eq!(
             budgets(&r).0,
             (400.0 * scale) as u64,
             "a period has not passed"
         );
-        r.react(7 + period, &heap(0));
+        r.react(7 + period, &heap(&r, 0));
         assert_eq!(budgets(&r).0, (400.0 * (scale / SCALE_STEP)) as u64);
     }
 }
