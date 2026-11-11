@@ -106,6 +106,12 @@ impl Aabb {
         self.min = [0, 1, 2].map(|a| self.min[a].min(p[a]));
         self.max = [0, 1, 2].map(|a| self.max[a].max(p[a]));
     }
+
+    /// Grows the box to hold `o`, which adds nothing when it is [`Self::EMPTY`].
+    pub fn union(&mut self, o: &Self) {
+        self.min = [0, 1, 2].map(|a| self.min[a].min(o.min[a]));
+        self.max = [0, 1, 2].map(|a| self.max[a].max(o.max[a]));
+    }
 }
 
 /// An affine transform as three rows `[R | t]`, 48 B: the layout GPU tables and cooked data

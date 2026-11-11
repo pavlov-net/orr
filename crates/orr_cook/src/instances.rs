@@ -186,8 +186,7 @@ impl ModelFacts {
     /// The facts of a model holding the geometry of both: one body, the sections of both.
     pub(crate) fn join(self, o: Self) -> Self {
         let mut bounds = self.bounds;
-        bounds.extend(o.bounds.min);
-        bounds.extend(o.bounds.max);
+        bounds.union(&o.bounds);
         Self {
             instances: self.instances.max(o.instances),
             sections: self.sections + o.sections,

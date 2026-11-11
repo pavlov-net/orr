@@ -831,6 +831,16 @@ fn assemblies_place_their_units_through_instance_sources() {
         assert_eq!(info.materials, [AssetId::from_name("kit/rack/material/0")]);
         assert!(a.find(AssetId::from_name("kit/rack/unit/1")).is_none());
         assert!(a.find(AssetId::from_name("kit/rack/mesh")).is_some());
+        // A mesh whose triangles all went to units holds nothing, and neither does its model.
+        let rack = a
+            .expect(
+                AssetId::from_name("kit/rack"),
+                Class::Model as u16,
+                orr_pack::model::SCHEMA,
+            )
+            .unwrap();
+        let rack = orr_pack::model::ModelInfo::parse(&read(&a, rack, 0)).unwrap();
+        assert_eq!(rack.header.bounds == Aabb::EMPTY, !sheet);
 
         let mut body = 0;
         let mut found: Vec<Vec3> = Vec::new();

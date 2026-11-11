@@ -1742,8 +1742,7 @@ impl<'m, 's> Run<'m, 's> {
             let (b, _) = self.units[part]
                 .mesh
                 .ok_or(orr_pack::Error::Malformed("geometry header"))?;
-            bounds.extend(b.min);
-            bounds.extend(b.max);
+            bounds.union(&b);
             let id = AssetId::from_name(&self.units[part].name);
             if self.units[part].class == Class::Subd as u16 {
                 subd = id;
