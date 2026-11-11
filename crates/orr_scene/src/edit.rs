@@ -24,7 +24,7 @@ use crate::accel::{
 };
 use crate::loading::{BlobSource, Loading, Msg, Queue, decoded, landed, read_stored};
 use crate::memory::{Block, UploadWindow};
-use crate::mount::{PAGE, StagedCopy, page_infos, submit_copies};
+use crate::mount::{StagedCopy, page_infos, submit_copies};
 use crate::producer::scratch_align;
 use crate::scene::ModelId;
 use crate::shaders::accel::{AccelRoot, ClasJob};
@@ -279,34 +279,33 @@ pub(crate) fn start(task: &Arc<EditTask>) {
             Box::new(move |stored| {
                 let result = stored.and_then(|stored| {
                     decoded(&t.source.archive, &b, None, stored, |bytes| {
-                        PAGE.with_borrow_mut(|resident| {
-                            resident.resize(p.bytes as usize, 0);
-                            orr_pack::mesh::decode_page(bytes, resident)?;
-                            let view = orr_pack::mesh::PageView::new(resident, &t.stream.header)?;
-                            if view.cluster_count() != p.clusters {
-                                let e = orr_pack::Error::Malformed("edit page cluster count");
-                                return Err(e.into());
-                            }
-                            let records: Vec<Cluster> =
-                                (0..view.cluster_count()).map(|c| view.cluster(c)).collect();
-                            let h: PageHeader =
-                                bytemuck::pod_read_unaligned(&resident[..size_of::<PageHeader>()]);
-                            let out =
-                                if !h.has_highs() && records.iter().any(|c| stretches(c, &reach)) {
-                                    orr_pack::mesh::widen_page(resident)?
-                                } else {
-                                    resident.clone()
-                                };
-                            let h: PageHeader =
-                                bytemuck::pod_read_unaligned(&out[..size_of::<PageHeader>()]);
-                            let (clusters, region) =
-                                page_infos(&h, &records, page, &t.stream.groups)?;
-                            let mut done = t.done.lock().unwrap();
-                            done.pages[i] = out;
-                            done.clusters[i] = clusters;
-                            done.regions[i] = region;
-                            Ok(())
-                        })
+                        // The edit keeps the page until it stages them all, so it decodes into
+                        // a buffer of its own.
+                        let mut resident = vec![0; p.bytes as usize];
+                        orr_pack::mesh::decode_page(bytes, &mut resident)?;
+                        let view = orr_pack::mesh::PageView::new(&resident, &t.stream.header)?;
+                        if view.cluster_count() != p.clusters {
+                            let e = orr_pack::Error::Malformed("edit page cluster count");
+                            return Err(e.into());
+                        }
+                        let records: Vec<Cluster> =
+                            (0..view.cluster_count()).map(|c| view.cluster(c)).collect();
+                        let h: PageHeader =
+                            bytemuck::pod_read_unaligned(&resident[..size_of::<PageHeader>()]);
+                        let out = if !h.has_highs() && records.iter().any(|c| stretches(c, &reach))
+                        {
+                            orr_pack::mesh::widen_page(&resident)?
+                        } else {
+                            resident
+                        };
+                        let h: PageHeader =
+                            bytemuck::pod_read_unaligned(&out[..size_of::<PageHeader>()]);
+                        let (clusters, region) = page_infos(&h, &records, page, &t.stream.groups)?;
+                        let mut done = t.done.lock().unwrap();
+                        done.pages[i] = out;
+                        done.clusters[i] = clusters;
+                        done.regions[i] = region;
+                        Ok(())
                     })
                 });
                 if let Err(e) = result {
