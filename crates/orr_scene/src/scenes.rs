@@ -1045,6 +1045,11 @@ impl Scenes {
     }
 
     #[cfg(feature = "testing")]
+    pub(crate) fn model_materials(&self) -> GpuPtr<u32> {
+        self.core.mounts.model_materials.gpu()
+    }
+
+    #[cfg(feature = "testing")]
     pub(crate) fn tables(
         &self,
     ) -> (
@@ -1875,6 +1880,7 @@ impl<'a> Frame<'a> {
                 meshes: core.mounts.meshes.gpu(),
                 materials: core.materials.table.gpu(),
                 clusters: core.mounts.clusters().gpu(),
+                model_materials: core.mounts.model_materials.gpu(),
                 material_sets: t.material_sets.gpu().cast(),
                 lights: t.lights.gpu(),
                 emissive: t.emissive.gpu(),

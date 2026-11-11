@@ -3727,7 +3727,7 @@ fn model_materials(root: &SceneRoot, models: &[ModelId]) -> Vec<[u32; 2]> {
         .iter()
         .map(|m| {
             let gpu = read_buffer(root.models.offset(u64::from(m.0)), 1)[0];
-            let ids = read_buffer(gpu.materials, 2);
+            let ids = read_buffer(root.model_materials.offset(u64::from(gpu.materials)), 2);
             [ids[0], ids[1]]
         })
         .collect()
@@ -8457,11 +8457,8 @@ fn global_tables_grow_under_frames_in_flight_and_every_frame_stays_exact() {
         (items.len() as u32, 0)
     );
     let tables = orr_scene::testing::global_tables(&w.scenes);
+    let lists = orr_scene::testing::model_materials(&w.scenes);
     let ball = w.model("ball");
-    let (models, _, _) = tables;
-    let list =
-        |models: GpuPtr<ModelGpu>| read_buffer(models.offset(u64::from(ball.0)), 1)[0].materials;
-    let ball_list = list(models);
 
     let more = [0, 1].map(|_| w.scenes.mount(PackSource::Memory(Arc::clone(pack()))));
     let mut later = vec![flight];
@@ -8486,8 +8483,8 @@ fn global_tables_grow_under_frames_in_flight_and_every_frame_stays_exact() {
         "the model, mesh and material tables never grew: {tables:?} to {moved:?}"
     );
     assert_ne!(
-        list(moved.0),
-        ball_list,
+        orr_scene::testing::model_materials(&w.scenes),
+        lists,
         "the section-material table never grew"
     );
     for (i, l) in later.iter().enumerate() {
@@ -8510,9 +8507,13 @@ fn global_tables_grow_under_frames_in_flight_and_every_frame_stays_exact() {
     let models: Vec<ModelId> = items.iter().map(|c| w.model(c.model)).collect();
     // The last mount's ball names its own materials, whose records match the first's.
     let (models_now, _, materials) = orr_scene::testing::global_tables(&w.scenes);
+    let lists = orr_scene::testing::model_materials(&w.scenes);
     let sections = |model: ModelId| {
         let m: ModelGpu = read_buffer(models_now.offset(u64::from(model.0)), 1)[0];
-        read_buffer(m.materials, u64::from(m.section_count))
+        read_buffer(
+            lists.offset(u64::from(m.materials)),
+            u64::from(m.section_count),
+        )
     };
     let record = |id: u32| -> MaterialGpu { read_buffer(materials.offset(u64::from(id)), 1)[0] };
     let (first, last) = (sections(ball), sections(w.model("ball")));

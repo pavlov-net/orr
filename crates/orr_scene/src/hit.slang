@@ -244,7 +244,7 @@ public uint section_material(SceneRoot* s, InstanceGpu inst, ModelGpu* model, ui
     if (section >= model.section_count)
         return MATERIAL_NONE;
     if (inst.material_base == NO_MATERIAL_SET)
-        return model.materials[section];
+        return s.model_materials[model.materials + section];
     uint set = (inst.variant >> 8) & 0xff;
     return s.material_sets[inst.material_base + set * model.section_count + section];
 }

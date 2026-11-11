@@ -2380,10 +2380,9 @@ pub(crate) struct Mounts {
     pub(crate) models: Table<ModelGpu>,
     pub(crate) meshes: Table<MeshGpu>,
     accel: Arc<AccelShared>,
-    /// The section materials of every model, a run of them per model.
+    /// The section materials of every model, a run of them per model from its
+    /// `ModelGpu::materials`.
     pub(crate) model_materials: Table<u32>,
-    /// The first entry of `model_materials` each model's record points at, mounted or an edit.
-    lists: FxHashMap<ModelId, u32>,
     page_table: Allocation<u64>,
     /// Beside each page's entry of the page table, the cluster id of its first cluster.
     page_bases: Allocation<u32>,
@@ -2707,7 +2706,6 @@ impl Mounts {
             models: Table::new(device, MemoryPriority::Normal, "models")?,
             meshes: Table::new(device, MemoryPriority::Normal, "meshes")?,
             model_materials: Table::new(device, MemoryPriority::Normal, "model materials")?,
-            lists: FxHashMap::default(),
             page_table: device.gpu_malloc(m, u64::from(sizes.page_table), "mesh page table")?,
             page_bases: device.gpu_malloc(m, u64::from(sizes.page_table), "mesh page bases")?,
             page_ranges: RangeAllocator::new(sizes.page_table),
@@ -2914,7 +2912,6 @@ impl Mounts {
         }
         if let Some(model) = ids.model {
             self.models.free(model, 1);
-            self.lists.remove(&ModelId(model));
         }
     }
 
@@ -3052,10 +3049,8 @@ impl Mounts {
             ..src_gpu
         };
         w.put(self.meshes.entry(mesh), &[gpu])?;
-        let list = self.lists[&p.model];
         let record = ModelGpu {
             mesh,
-            materials: self.model_materials.entry(list),
             bounds_min: bounds.min,
             bounds_max: bounds.max,
             chain_count: 0,
@@ -3063,7 +3058,6 @@ impl Mounts {
         };
         w.put(self.models.entry(model), &[record])?;
         let id = ModelId(model);
-        self.lists.insert(id, list);
         let i = id.0 as usize;
         if w.model_cpu.len() <= i {
             w.model_cpu.resize(i + 1, ModelCpu::default());
@@ -3644,32 +3638,9 @@ impl Mounts {
         }
     }
 
-    /// A run of `n` entries of the section materials. When the table moves to take it, the
-    /// record of every model with a run points at its run in the new table. The window room
-    /// for those records comes before the move, so a move leaves no record pointing at the
-    /// table it retires.
-    fn alloc_list(&mut self, n: u32, w: &mut Apply<'_>) -> Result<u32> {
-        if let Some(start) = self.model_materials.try_alloc(n) {
-            return Ok(start);
-        }
-        let (src, out) = w
-            .window
-            .slice::<GpuPtr<u32>>(w.device, self.lists.len() as u32)?;
-        let start = self.model_materials.alloc(w.device, n)?;
-        let field = std::mem::offset_of!(ModelGpu, materials) as u64;
-        for ((&id, &first), (o, i)) in self.lists.iter().zip(out.iter_mut().zip(0..)) {
-            *o = self.model_materials.entry(first);
-            let at = self.models.entry(id.0).cast::<u8>().offset(field).cast();
-            let seq = w.seq.fetch_add(1, Ordering::Relaxed);
-            w.records.push(Record::values(seq, at, src.offset(i), 1));
-        }
-        Ok(start)
-    }
-
     fn release(&mut self, mut r: Resident, materials: &MaterialTable) {
         for id in r.models.values() {
             self.owners.remove(id);
-            self.lists.remove(id);
             self.models.free(id.0, 1);
         }
         for &id in &r.meshes {
@@ -3855,9 +3826,8 @@ impl Mounts {
             let id = ModelId(self.models.alloc(w.device, 1)?);
             res.models.insert(m.id, id);
             let n = m.materials.len() as u32;
-            let start = self.alloc_list(n, w)?;
+            let start = self.model_materials.alloc(w.device, n)?;
             res.material_ranges.push((start, n));
-            self.lists.insert(id, start);
             let section_materials: Vec<MaterialId> =
                 m.materials.iter().map(|&i| material_ids[i]).collect();
             let list = self.model_materials.entry(start);
@@ -3866,7 +3836,7 @@ impl Mounts {
             let gpu = ModelGpu {
                 mesh: m.mesh.map_or(u32::MAX, |i| mesh_ids[i]),
                 section_count: n,
-                materials: list,
+                materials: start,
                 bounds_min: m.bounds.min,
                 bounds_max: m.bounds.max,
                 ..bytemuck::Zeroable::zeroed()

@@ -404,7 +404,8 @@ public struct ModelGpu
 {
     public uint mesh;            // in SceneRoot.meshes
     public uint section_count;
-    public uint* materials;      // MaterialId per mesh section
+    public uint materials;       // first of its MaterialId per mesh section in SceneRoot.model_materials
+    public uint _pad0;
     public float3 bounds_min;
     public float3 bounds_max;
     public uint chain_count;     // farther models, below CHAIN_STEPS
@@ -422,6 +423,7 @@ public struct SceneRoot
     public MeshGpu* meshes;          // global
     public MaterialGpu* materials;   // global
     public ClusterRef* clusters;     // global, by cluster id
+    public uint* model_materials;    // global, each model's section materials from ModelGpu.materials
     public uint* material_sets;      // MaterialId per model section per set
     public LightGpu* lights;
     public EmissiveGpu* emissive;    // producer_capacity + emissive_capacity entries

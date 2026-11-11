@@ -352,6 +352,11 @@ pub fn global_tables(
     scenes.tables()
 }
 
+/// The global table of model section materials, which `ModelGpu::materials` indexes.
+pub fn model_materials(scenes: &crate::Scenes) -> GpuPtr<u32> {
+    scenes.model_materials()
+}
+
 /// The texture of cooked texture `id` in a ready mount.
 pub fn mounted_texture(
     scenes: &crate::Scenes,

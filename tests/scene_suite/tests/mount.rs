@@ -331,6 +331,7 @@ fn entry(a: &Archive, id: AssetId) -> &Entry {
 /// also across renderers.
 fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<u8>> {
     let (models, meshes, materials) = global_tables(scenes);
+    let lists = orr_scene::testing::model_materials(scenes);
     let class_of = |c: Class| move |e: &&Entry| e.class == c as u16;
     let textures: Vec<(AssetId, TextureIndex)> = a
         .entries()
@@ -386,7 +387,10 @@ fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<
                     (model.bounds_min, model.bounds_max),
                     (info.header.bounds.min, info.header.bounds.max)
                 );
-                let section_materials = gpu.values(model.materials, model.section_count);
+                let section_materials = gpu.values(
+                    lists.offset(u64::from(model.materials)),
+                    model.section_count,
+                );
                 for (&got, &asset) in section_materials.iter().zip(&info.materials) {
                     assert_eq!(got, scenes.material(m, asset).unwrap().0);
                     out.push(material(asset));
