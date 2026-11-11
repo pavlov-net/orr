@@ -3597,6 +3597,13 @@ const COPY_FAR: u32 = 0x8000_0000;
 const RT_WRITTEN: u32 = 1;
 const RT_FADING: u32 = 64;
 const RT_STEP_SHIFT: u32 = 8;
+const RT_FAR_STEP_SHIFT: u32 = 10;
+const RT_FAR_CUT_SHIFT: u32 = 16;
+
+/// Whether a traced or drawn id, a copy + 1, is a copy's far step.
+fn far_copy(id: u32) -> bool {
+    id != 0 && (id - 1) & COPY_FAR != 0
+}
 
 /// The reference for a copy's chain step: farther past a switch distance x 1.15,
 /// nearer inside it, at once for a copy seen first, else cross-fading over 16 frames; a
@@ -3808,7 +3815,6 @@ fn each_chain_step_traces_what_the_raster_draws_and_a_fade_shows_both() {
     let placed = place_at(&mut w, &chain_copies(), DVec3::ZERO, 1e4);
     let eye = DVec3::new(0.0, 2.0, 6.0);
     let target = DVec3::new(0.0, 1.0, 0.0);
-    let far = |id: u32| id != 0 && (id - 1) & COPY_FAR != 0;
     let mut frame = 0;
     let mut shoot_at = |w: &mut World, z: f64| {
         frame += 1;
@@ -3838,7 +3844,7 @@ fn each_chain_step_traces_what_the_raster_draws_and_a_fade_shows_both() {
         // Outside a fade every pixel shows the step's model and no far step.
         let materials = pixel_materials(&g.view);
         for (i, t) in r.traced.iter().enumerate() {
-            assert!(!far(g.ids[i]) && !far(t.instance));
+            assert!(!far_copy(g.ids[i]) && !far_copy(t.instance));
             assert!(materials[i] == u32::MAX || shown.contains(&materials[i]));
             assert!(t.instance == 0 || shown.contains(&t.material));
         }
@@ -3852,8 +3858,8 @@ fn each_chain_step_traces_what_the_raster_draws_and_a_fade_shows_both() {
     let both = model_materials(&root, &[models[0], models[3]]);
     let r = rays(&g.view, &trace::MODULE, "pixels", 1);
     let materials = pixel_materials(&g.view);
-    let drawn_far = g.ids.iter().filter(|&&id| far(id)).count();
-    let traced_far = r.traced.iter().filter(|t| far(t.instance)).count();
+    let drawn_far = g.ids.iter().filter(|&&id| far_copy(id)).count();
+    let traced_far = r.traced.iter().filter(|t| far_copy(t.instance)).count();
     let covered = g.ids.iter().filter(|&&id| id != 0).count();
     for (lo, hi, what) in [
         (drawn_far, covered, "drawn"),
@@ -4032,6 +4038,84 @@ fn a_fade_from_a_step_its_chain_loses_ends_at_once() {
         );
         assert_eq!(s.far_part, 0, "copy {k}: far instance");
     }
+    assert_clean();
+}
+
+#[test]
+fn a_fade_that_turns_to_another_far_step_traces_that_step() {
+    let _serial = serial();
+    let (mut w, models) = chain_world();
+    set_chain(&mut w, &models);
+    let placed = place_at(&mut w, &chain_copies(), DVec3::ZERO, 1e4);
+    let slots: Vec<u32> = placed.ranges.iter().map(|r| r.first).collect();
+    let eye = DVec3::new(0.0, 2.0, 6.0);
+    let target = DVec3::new(0.0, 1.0, 0.0);
+    let mut frame = 0;
+    let mut shoot_at = |w: &mut World, z: f64| {
+        frame += 1;
+        let mut shot = Shot::at(eye, target, frame);
+        shot.focus = Some(DVec3::new(0.0, 1.0, z));
+        shoot(w, &placed, &shot)
+    };
+    let state = |g: &Frame| {
+        let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
+        read_buffer(root.slot_state, u64::from(placed.count))
+    };
+    // Step 0, then three frames into a fade to step 1, which the far instances trace.
+    for _ in 0..=CHAIN_FADE_FRAMES {
+        shoot_at(&mut w, 3.0);
+    }
+    let mut g = shoot_at(&mut w, 30.0);
+    for _ in 0..2 {
+        g = shoot_at(&mut w, 30.0);
+    }
+    let before = state(&g);
+    // Farther, the fade turns to step 2 and restarts while step 0 stays the near one; the
+    // far instances keep the cut index they held.
+    for _ in 0..3 {
+        g = shoot_at(&mut w, 60.0);
+    }
+    let after = state(&g);
+    for &slot in &slots {
+        let (a, b) = (before[slot as usize], after[slot as usize]);
+        assert_eq!((a.chain_step, a.fade), (1 | CHAIN_SEEN, 3), "slot {slot}");
+        assert_eq!((b.chain_step, b.fade), (2 | CHAIN_SEEN, 3), "slot {slot}");
+        // The far instance is held across the turn, not taken again, so only its step
+        // differs from what it holds.
+        assert!(a.far_part != 0 && b.far_part == a.far_part, "slot {slot}");
+        let held = |s: u32| ((s >> RT_FAR_STEP_SHIFT) & 3, (s >> RT_FAR_CUT_SHIFT) & 0xff);
+        let (step, cut) = held(a.rt_flags);
+        assert_eq!(step, 1, "slot {slot}: far step");
+        assert_eq!(held(b.rt_flags), (2, cut), "slot {slot}: far step and cut");
+    }
+    let turned = rays(&g.view, &trace::MODULE, "pixels", 0);
+    // Settled at step 2, the copies trace it through their own instances.
+    for _ in 0..CHAIN_FADE_FRAMES {
+        g = shoot_at(&mut w, 60.0);
+    }
+    let settled = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let mut checked = 0;
+    let mut matched = 0;
+    for (t, s) in turned.traced.iter().zip(&settled.traced) {
+        if !far_copy(t.instance) {
+            continue;
+        }
+        checked += 1;
+        let same = (t.instance - 1) & !COPY_FAR == s.instance.wrapping_sub(1)
+            && t.cluster == s.cluster
+            && t.primitive == s.primitive
+            && (t.t - s.t).abs() <= 1e-5 * s.t;
+        matched += usize::from(same);
+    }
+    let covered = settled.traced.iter().filter(|t| t.instance != 0).count();
+    assert!(
+        checked > covered / 20,
+        "{checked} of {covered} pixels on the far step"
+    );
+    assert!(
+        matched as f64 >= 0.99 * checked as f64,
+        "{matched} of {checked} far pixels trace step 2"
+    );
     assert_clean();
 }
 
