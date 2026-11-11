@@ -404,17 +404,22 @@ fn simplify_fallback(
     let mut subset_locks: Vec<u8> = indices.iter().map(|&v| locks[v as usize]).collect();
     // `keep_borders` is the position remap when open borders stay: every corner at a position
     // on an open edge of the group locks, as sloppy simplification moves any vertex it does
-    // not lock.
+    // not lock. A triangle with two corners at one position has no area and closes no edge.
     if let Some(remap) = keep_borders {
-        let at = |v: u32| remap[v as usize];
-        let tris = indices.as_chunks::<3>().0;
-        let edge = |t: &[u32; 3], e: usize| (at(t[e]), at(t[(e + 1) % 3]));
+        let tris: Vec<[u32; 3]> = indices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|t| t.map(|v| remap[v as usize]))
+            .filter(|p| p[0] != p[1] && p[1] != p[2] && p[2] != p[0])
+            .collect();
+        let edge = |p: &[u32; 3], e: usize| (p[e], p[(e + 1) % 3]);
         let edges: FxHashSet<(u32, u32)> = tris
             .iter()
             .flat_map(|t| (0..3).map(move |e| edge(t, e)))
             .collect();
         let mut border = FxHashSet::default();
-        for t in tris {
+        for t in &tris {
             for e in 0..3 {
                 let (a, b) = edge(t, e);
                 if !edges.contains(&(b, a)) {
@@ -423,7 +428,7 @@ fn simplify_fallback(
             }
         }
         for (l, &v) in subset_locks.iter_mut().zip(indices) {
-            if border.contains(&at(v)) {
+            if border.contains(&remap[v as usize]) {
                 *l |= LOCK;
             }
         }

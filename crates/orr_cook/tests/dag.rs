@@ -703,8 +703,9 @@ fn double_sided_foliage_keeps_its_coverage() {
 }
 
 /// Half of a curved 4 m sheet: x from 0 to 2 m on the `side` of x = 0, the cut both halves
-/// share and that bends in y, so neither half keeps it straight.
-fn half_sheet(side: f32) -> MeshInput {
+/// share and that bends in y, so neither half keeps it straight. With `bridged`, a triangle
+/// with two corners at one end of each edge of the cut closes it, as exports have them.
+fn half_sheet(side: f32, bridged: bool) -> MeshInput {
     let (nx, nz) = (48u32, 96u32);
     let mut m = MeshInput::default();
     for j in 0..=nz {
@@ -728,6 +729,13 @@ fn half_sheet(side: f32) -> MeshInput {
                 m.indices.extend(quad);
             }
         }
+        if bridged {
+            // A second vertex at the edge's start, which a normal of its own keeps apart.
+            let twin = m.positions.len() as u32;
+            m.positions.push(m.positions[(j * w) as usize]);
+            m.normals.push(Vec3::X);
+            m.indices.extend([(j + 1) * w, j * w, twin]);
+        }
     }
     m.uvs = None;
     m.sections = vec![Span {
@@ -741,7 +749,14 @@ fn half_sheet(side: f32) -> MeshInput {
 fn abutting_meshes_stay_closed_at_every_cut() {
     // Each half cooks on its own, as two meshes that meet in a scene do: neither sees the
     // other, so each keeps its open border where it was, at every cut.
-    let halves = [-1.0, 1.0].map(|side| load(&cook(half_sheet(side), &[0], dag()), "m/mesh"));
+    for bridged in [false, true] {
+        let halves =
+            [-1.0, 1.0].map(|side| load(&cook(half_sheet(side, bridged), &[0], dag()), "m/mesh"));
+        halves_stay_closed(&halves);
+    }
+}
+
+fn halves_stay_closed(halves: &[Dag; 2]) {
     let step = 2f32.powi(-11);
     let rim = |p: [f32; 3]| p[0].abs() > 1.99 || p[2].abs() > 1.99;
     let cut = |d: &Dag, t: f32| -> Vec<[[f32; 3]; 3]> {
@@ -759,9 +774,13 @@ fn abutting_meshes_stay_closed_at_every_cut() {
         levels = levels.max(ta.len());
         for &t in &ta {
             let tris = cut(da, t);
-            // Open edges off the rim: the border the halves share.
+            // Open edges off the rim: the border the halves share. A triangle with two corners
+            // at one position has no area and closes no edge.
             let mut edges = HashSet::new();
-            for tri in &tris {
+            for tri in tris
+                .iter()
+                .filter(|t| t[0] != t[1] && t[1] != t[2] && t[2] != t[0])
+            {
                 for k in 0..3 {
                     edges.insert((tri[k].map(f32::to_bits), tri[(k + 1) % 3].map(f32::to_bits)));
                 }

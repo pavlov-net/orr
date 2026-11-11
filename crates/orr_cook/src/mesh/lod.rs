@@ -411,9 +411,11 @@ pub(super) const KEEP: u8 = 2;
 /// error does not bound how far a border recedes. Every border position is kept except the
 /// inner vertices of straight runs, within a grid cell of the segment between the run's kept
 /// ends: a border vertex collapses only along its border loop, so the border there stays on
-/// the run. Positions on more than two open edges, or with more than one vertex, are kept,
-/// as the simplifier may move those off the loop. Vertex `v` is at position `pos[v]`, itself
-/// a vertex, whose grid cell is `cell(pos[v])`.
+/// the run. Positions on more than two open edges, with more than one vertex, or on a
+/// triangle with two corners at one position are kept, as the simplifier may move those off
+/// the loop. Such a triangle has no area, so its edges close none: a source can join two
+/// borders with them across a slit the simplifier would otherwise widen. Vertex `v` is at
+/// position `pos[v]`, itself a vertex, whose grid cell is `cell(pos[v])`.
 pub(super) fn open_borders(
     indices: &[u32],
     pos: &[u32],
@@ -421,24 +423,41 @@ pub(super) fn open_borders(
 ) -> Vec<u8> {
     let _z = crate::profile::zone!("mesh.open_borders");
     const SEEN: u8 = 4;
-    let tris = indices.as_chunks::<3>().0;
-    let edge = |t: &[u32; 3], e: usize| (pos[t[e] as usize], pos[t[(e + 1) % 3] as usize]);
+    let n = pos.len();
+    let at = |t: &[u32; 3]| t.map(|v| pos[v as usize]);
+    let flat = |p: [u32; 3]| p[0] == p[1] || p[1] == p[2] || p[2] == p[0];
+    let mut degenerate = vec![false; n];
+    for t in indices.as_chunks::<3>().0 {
+        let p = at(t);
+        if flat(p) {
+            for q in p {
+                degenerate[q as usize] = true;
+            }
+        }
+    }
+    let tris: Vec<[u32; 3]> = indices
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(at)
+        .filter(|&p| !flat(p))
+        .collect();
+    let edge = |p: &[u32; 3], e: usize| (p[e], p[(e + 1) % 3]);
     let mut edges: rustc_hash::FxHashSet<(u32, u32)> = Default::default();
-    edges.reserve(indices.len());
-    for t in tris {
+    edges.reserve(3 * tris.len());
+    for t in &tris {
         for e in 0..3 {
             edges.insert(edge(t, e));
         }
     }
     // Per position: its open edges out and in, and an open edge out.
-    let n = pos.len();
     let (mut outs, mut ins) = (vec![0u8; n], vec![0u8; n]);
     let mut next = vec![u32::MAX; n];
     let mut open = Vec::new();
-    for t in tris {
+    for t in &tris {
         for e in 0..3 {
             let (a, b) = edge(t, e);
-            if a != b && !edges.contains(&(b, a)) {
+            if !edges.contains(&(b, a)) {
                 outs[a as usize] = outs[a as usize].saturating_add(1);
                 ins[b as usize] = ins[b as usize].saturating_add(1);
                 next[a as usize] = b;
@@ -455,7 +474,7 @@ pub(super) fn open_borders(
     for p in 0..n {
         if outs[p] > 0 || ins[p] > 0 {
             marks[p] = BORDER;
-            if outs[p] != 1 || ins[p] != 1 || vertices[p] != 1 {
+            if outs[p] != 1 || ins[p] != 1 || vertices[p] != 1 || degenerate[p] {
                 marks[p] |= KEEP;
             }
         }
