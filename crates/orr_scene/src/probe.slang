@@ -25,8 +25,6 @@ public static const uint PROBE_MERGED_STAGE = 256;  // the mesh has a merged sta
 public static const uint PROBE_MERGED_RASTER = 512; // the raster cut takes it: `merged_cuts`
 public static const uint PROBE_RT_MERGED_STAGE = 1024; // the mesh of the slot's nearer step has a merged stage
 public static const uint PROBE_RT_LEVELS = 2048;  // the mesh of the slot's nearer step has discrete levels
-public static const uint PROBE_HELD_STEP_GONE = 4096; // its PTLAS instance holds a step the chain no longer has
-public static const uint PROBE_FAR_HELD_GONE = 8192; // its far instance holds a step the chain no longer has
 
 // `ProbeGpu.lists`: the raster lists holding the visible cluster, first pass in the low bits
 // and second pass shifted by PROBE_LIST_SECOND.
@@ -124,6 +122,7 @@ public struct ProbeGpu
     public float rt_cut_pixels;     // px at the focus
     public float held_cut_error;    // the cut the PTLAS instance holds
     public uint64_t rt_cut_blas;
+    public uint64_t far_cut_blas;
     public float merge_error;       // m, mesh space
     public float model_pixels;      // px: the nearer step's model's bounding radius at the focus
     public float merge_pixels;      // px: below it a copy traces its model's merged cut
@@ -133,14 +132,10 @@ public struct ProbeGpu
     public uint rt_step;            // the nearer chain step
     public uint rt_model;           // its model
     public uint held_step;          // the step its PTLAS instance holds
-    public uint held_cut_count;     // the cached cuts of that step's mesh
     public uint far_step;
     public uint far_model;
     public uint far_cut_count;
     public uint far_held_cut;       // the cut its far part instance holds
-    public uint far_held_step;      // the step its far part instance holds
-    public uint far_held_cut_count; // the cached cuts of that step's mesh
-    public uint64_t far_cut_blas;
     public float far_cut_error;     // m, mesh space: this frame's far cut's
     public float far_cut_pixels;    // px at the focus
     public float far_held_error;
@@ -170,6 +165,7 @@ public struct ProbeGpu
     public uint frame;
     public float built_error;       // m, mesh space: the largest self error of the built cut it traces
     public ProbeTexture textures[TEXTURE_SLOTS];
+    public uint _pad;
 }
 
 public struct ProbeRoot
@@ -346,19 +342,11 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
         if (has_focus())
             o.rt_cut_pixels = c.error * o.cut.rt_scale / max(o.cut.rt_distance, 1e-3) * root.focus_offset.w;
     }
-    // An instance whose update waits (`rt_age`) can hold a step its chain has since lost, whose
-    // `chain` entry is cleared, or a cut of the model the chain had at that step before, past
-    // the cuts of the mesh it has now.
+    // An instance whose update waits (`rt_age`) can hold a step or a model the copy has since
+    // left.
     o.held_step = (st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK;
-    if (o.held_step > s.models[base.model].chain_count)
-        o.flags |= PROBE_HELD_STEP_GONE;
-    else
-    {
-        MeshGpu* held_mesh = s.meshes + s.models[step_record(s, base, o.held_step).model].mesh;
-        o.held_cut_count = held_mesh.rt_cut_count;
-        if (st.rt_lod != RT_CUT_BUILT && st.rt_lod < held_mesh.rt_cut_count)
-            o.held_cut_error = held_mesh.rt_cuts[st.rt_lod].error;
-    }
+    if ((st.rt_flags & RT_WRITTEN) != 0 && st.rt_lod != RT_CUT_BUILT)
+        o.held_cut_error = s.meshes[s.models[st.rt_model].mesh].rt_cuts[st.rt_lod].error;
     if (st.fade != 0)
     {
         o.far_step = chain_far(st);
@@ -381,18 +369,8 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
             if (has_focus())
                 o.far_cut_pixels = c.error * o.cut.rt_scale / max(o.far_distance, 1e-3) * root.focus_offset.w;
         }
-        // A far instance whose update waits can hold another far step than the fade has now,
-        // as the near one can.
-        o.far_held_step = (st.rt_flags >> RT_FAR_STEP_SHIFT) & CHAIN_STEP_MASK;
-        if (o.far_held_step > s.models[base.model].chain_count)
-            o.flags |= PROBE_FAR_HELD_GONE;
-        else
-        {
-            MeshGpu* held_mesh = s.meshes + s.models[step_record(s, base, o.far_held_step).model].mesh;
-            o.far_held_cut_count = held_mesh.rt_cut_count;
-            if (o.far_held_cut < held_mesh.rt_cut_count)
-                o.far_held_error = held_mesh.rt_cuts[o.far_held_cut].error;
-        }
+        if (st.far_part != 0)
+            o.far_held_error = s.meshes[s.models[st.far_model].mesh].rt_cuts[o.far_held_cut].error;
     }
 }
 

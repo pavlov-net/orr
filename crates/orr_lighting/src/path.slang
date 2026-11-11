@@ -381,16 +381,16 @@ public float traced_error(SceneRoot* s, uint copy)
     bool far = (copy & COPY_FAR) != 0;
     if (far ? st.far_part == 0 : (st.rt_flags & RT_WRITTEN) == 0)
         return 0.0;
-    // The far instance holds the step it was last written with, which the fade may have
-    // turned from.
-    InstanceGpu inst = far ? step_record(s, s.instances[slot], (st.rt_flags >> RT_FAR_STEP_SHIFT) & CHAIN_STEP_MASK) : copy_record(s, copy);
-    MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
+    // Each instance holds a cut of the model it was last written with, which the copy's step
+    // may have since left.
+    InstanceGpu inst = copy_record(s, copy);
+    MeshGpu* mesh = s.meshes + s.models[far ? st.far_model : st.rt_model].mesh;
     if (mesh.rt_cut_count == 0)
         return 0.0;
     uint cut = far ? (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff : uint(st.rt_lod);
     float error = 0.0;
     if (cut != RT_CUT_BUILT)
-        error = mesh.rt_cuts[min(cut, mesh.rt_cut_count - 1)].error;
+        error = mesh.rt_cuts[cut].error;
     else if (may2(MAY2_SKINNING) && (inst.flags & INSTANCE_SKINNED) != 0)
     {
         // A skinned copy traces the BLAS its skinning built over the cut it took, as

@@ -46,8 +46,8 @@ use orr_scene::{
     InstanceRange, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, MeshGpu, ModelGpu,
     ModelId, MountId, PackSource, Pose, Projection, RasterGpu, RasterView, RendererDesc,
     SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc,
-    SkinnedGpu, SkinnedPageRef, SlotCutGpu, TextureFilter, TransformGroupDesc, TransformGroupId,
-    ViewDesc, ViewHistoryId,
+    SkinnedGpu, SkinnedPageRef, SlotCutGpu, SlotStateGpu, TextureFilter, TransformGroupDesc,
+    TransformGroupId, ViewDesc, ViewHistoryId,
 };
 use orr_scene::{Budgets, InstancePageRef, PageId, PixelProbe, PoolSize, RequestSource};
 use scene_suite::shaders::{
@@ -3597,7 +3597,6 @@ const COPY_FAR: u32 = 0x8000_0000;
 const RT_WRITTEN: u32 = 1;
 const RT_FADING: u32 = 64;
 const RT_STEP_SHIFT: u32 = 8;
-const RT_FAR_STEP_SHIFT: u32 = 10;
 const RT_FAR_CUT_SHIFT: u32 = 16;
 
 /// Whether a traced or drawn id, a copy + 1, is a copy's far step.
@@ -3878,98 +3877,135 @@ fn each_chain_step_traces_what_the_raster_draws_and_a_fade_shows_both() {
     assert_clean();
 }
 
+/// The chain's copies settled at step 2 in the cell next to the focus's, in a world whose
+/// PTLAS budget is 0, and a decoy copy in the focus's cell. Moved, the decoy's write is the
+/// nearest work past the mandatory and takes the frame's one admission the budget leaves.
+struct Starved {
+    w: World,
+    models: [ModelId; 4],
+    placed: Placed,
+    decoy: TransformGroupId,
+    slots: Vec<u32>,
+    frame: u32,
+}
+
+impl Starved {
+    fn new() -> Self {
+        let mut w = World::with(&RendererDesc {
+            raster_error_pixels: 1e-3,
+            rt_error_pixels: 1e-3,
+            budgets: Budgets {
+                ptlas_rebuilt: 0,
+                ..Budgets::default()
+            },
+            ..RendererDesc::default()
+        });
+        let models = CHAIN.map(|name| w.model(name));
+        set_chain(&mut w, &models);
+        let placed = place_at(&mut w, &chain_copies(), DVec3::new(300.0, 0.0, 0.0), 1e4);
+        let ball = w.model("ball");
+        let decoy = {
+            let list = [placed.scene];
+            let f = w
+                .scenes
+                .begin_frame(&FrameDesc {
+                    time: time(0),
+                    scenes: &list,
+                    low_latency: None,
+                })
+                .unwrap();
+            let mut s = f.scene(placed.scene).unwrap();
+            let group = s
+                .create_transform_group(&TransformGroupDesc {
+                    count: 1,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::new(240.0, 0.0, 0.0),
+                })
+                .unwrap();
+            s.transforms(group, 0, 1).unwrap()[0] = Affine3::from_translation(Vec3::Y).into();
+            s.add_instances(&InstancesDesc {
+                model: ball,
+                copies: 1,
+                transforms: group,
+                first: 0,
+                pose: None,
+                material_set: None,
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 1e4,
+                animation_range: 0.0,
+                user_tag: 0,
+            })
+            .unwrap();
+            drop(s);
+            wait(f.end(&[]).unwrap());
+            group
+        };
+        let slots = placed.ranges.iter().map(|r| r.first).collect();
+        let mut starved = Self {
+            w,
+            models,
+            placed,
+            decoy,
+            slots,
+            frame: 0,
+        };
+        // Placed without a focus, the copies fade from step 0 to step 2.
+        let mut g = starved.shoot(Vec::new(), None);
+        for _ in 0..CHAIN_FADE_FRAMES + 3 {
+            g = starved.shoot(Vec::new(), None);
+        }
+        let state = starved.state(&g);
+        for &slot in &starved.slots {
+            let s = state[slot as usize];
+            assert_eq!((s.chain_step, s.fade), (2 | CHAIN_SEEN, 0), "slot {slot}");
+            assert_eq!(
+                s.rt_flags & (RT_WRITTEN | 3 << RT_STEP_SHIFT),
+                RT_WRITTEN | 2 << RT_STEP_SHIFT,
+                "slot {slot}"
+            );
+        }
+        starved
+    }
+
+    /// A frame with the focus 57 m from the copies and the camera before them; with a decoy
+    /// position, the decoy moves there.
+    fn shoot(&mut self, moved: Vec<(u32, Affine3)>, decoy: Option<Vec3>) -> Frame {
+        self.frame += 1;
+        let mut shot = Shot::at(
+            DVec3::new(300.0, 2.0, 6.0),
+            DVec3::new(300.0, 1.0, 0.0),
+            self.frame,
+        );
+        shot.focus = Some(DVec3::new(250.0, 1.0, 30.0));
+        shot.moved = moved;
+        let group = self.decoy;
+        shoot_with(&mut self.w, &self.placed, &shot, |s| {
+            if let Some(at) = decoy {
+                s.transforms(group, 0, 1).unwrap()[0] = Affine3::from_translation(at).into();
+            }
+        })
+    }
+
+    /// The slot state of the copies and the decoy.
+    fn state(&self, g: &Frame) -> Vec<SlotStateGpu> {
+        let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
+        read_buffer(root.slot_state, u64::from(self.placed.count) + 1)
+    }
+}
+
 #[test]
 fn a_chain_copy_hidden_past_the_ptlas_budget_stops_tracing_its_step_at_once() {
     let _serial = serial();
-    let mut w = World::with(&RendererDesc {
-        raster_error_pixels: 1e-3,
-        rt_error_pixels: 1e-3,
-        budgets: Budgets {
-            ptlas_rebuilt: 0,
-            ..Budgets::default()
-        },
-        ..RendererDesc::default()
-    });
-    let models = CHAIN.map(|name| w.model(name));
-    set_chain(&mut w, &models);
-    // The chain's copies in the cell next to the focus's, at step 2 from the focus.
-    let placed = place_at(&mut w, &chain_copies(), DVec3::new(300.0, 0.0, 0.0), 1e4);
-    let focus = DVec3::new(250.0, 1.0, 30.0);
-    let eye = DVec3::new(300.0, 2.0, 6.0);
-    let target = DVec3::new(300.0, 1.0, 0.0);
-    // A copy in the focus's cell. Moved, its write is the nearest work past the mandatory and
-    // takes the frame's one admission a budget of 0 leaves.
-    let ball = w.model("ball");
-    let decoy = {
-        let list = [placed.scene];
-        let f = w
-            .scenes
-            .begin_frame(&FrameDesc {
-                time: time(0),
-                scenes: &list,
-                low_latency: None,
-            })
-            .unwrap();
-        let mut s = f.scene(placed.scene).unwrap();
-        let group = s
-            .create_transform_group(&TransformGroupDesc {
-                count: 1,
-                writer: GroupWriter::Cpu,
-                anchor: DVec3::new(240.0, 0.0, 0.0),
-            })
-            .unwrap();
-        s.transforms(group, 0, 1).unwrap()[0] = Affine3::from_translation(Vec3::Y).into();
-        s.add_instances(&InstancesDesc {
-            model: ball,
-            copies: 1,
-            transforms: group,
-            first: 0,
-            pose: None,
-            material_set: None,
-            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
-            rt_range: 1e4,
-            animation_range: 0.0,
-            user_tag: 0,
-        })
-        .unwrap();
-        drop(s);
-        wait(f.end(&[]).unwrap());
-        group
-    };
-    let slots: Vec<u32> = placed.ranges.iter().map(|r| r.first).collect();
-    let shot = |frame: u32| {
-        let mut shot = Shot::at(eye, target, frame);
-        shot.focus = Some(focus);
-        shot
-    };
-    // Placed without a focus, the copies fade from step 0 to step 2.
-    let settled = u32::from(CHAIN_FADE_FRAMES) + 4;
-    let mut g = shoot(&mut w, &placed, &shot(1));
-    for frame in 2..=settled {
-        g = shoot(&mut w, &placed, &shot(frame));
-    }
-    let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
-    let state = read_buffer(root.slot_state, u64::from(placed.count) + 1);
-    for &slot in &slots {
-        let s = state[slot as usize];
-        assert_eq!((s.chain_step, s.fade), (2 | CHAIN_SEEN, 0), "slot {slot}");
-        assert_eq!(
-            s.rt_flags & (RT_WRITTEN | 3 << RT_STEP_SHIFT),
-            RT_WRITTEN | 2 << RT_STEP_SHIFT,
-            "slot {slot}"
-        );
-    }
+    let mut c = Starved::new();
     // Hiding a copy takes it to step 0 at once. Its null write is not the nearest work, but
     // its instance holds step 2, whose hits would resolve through step 0.
     let hidden = 1;
-    let mut hide = shot(settled + 1);
-    hide.moved = vec![(hidden, Affine3::ZERO)];
-    let g = shoot_with(&mut w, &placed, &hide, |s| {
-        s.transforms(decoy, 0, 1).unwrap()[0] =
-            Affine3::from_translation(Vec3::new(0.5, 1.0, 0.0)).into();
-    });
-    let state = read_buffer(root.slot_state, u64::from(placed.count) + 1);
-    for &slot in &slots {
+    let g = c.shoot(
+        vec![(hidden, Affine3::ZERO)],
+        Some(Vec3::new(0.5, 1.0, 0.0)),
+    );
+    let state = c.state(&g);
+    for &slot in &c.slots {
         let s = state[slot as usize];
         let near = u32::from(s.chain_step) & 3;
         assert!(
@@ -3980,13 +4016,48 @@ fn a_chain_copy_hidden_past_the_ptlas_budget_stops_tracing_its_step_at_once() {
     }
     let r = rays(&g.view, &trace::MODULE, "pixels", 0);
     let hits = |slot: u32| r.traced.iter().filter(|t| t.instance == slot + 1).count();
-    assert_eq!(hits(slots[hidden as usize]), 0, "the hidden copy is traced");
-    for (k, &slot) in slots.iter().enumerate() {
+    assert_eq!(
+        hits(c.slots[hidden as usize]),
+        0,
+        "the hidden copy is traced"
+    );
+    for (k, &slot) in c.slots.iter().enumerate() {
         assert!(
             k == hidden as usize || hits(slot) > 20,
             "copy {k} is not traced"
         );
     }
+    assert_clean();
+}
+
+#[test]
+fn a_chain_replacing_a_shown_step_model_past_the_ptlas_budget_traces_it_at_once() {
+    let _serial = serial();
+    let mut c = Starved::new();
+    // Step 2's model becomes step 3's. The copies' rewrite is not the nearest work, but their
+    // instances hold the old model, whose hits would resolve through the new one.
+    let m = c.models;
+    let chain = [
+        (m[1], CHAIN_DISTANCES[0]),
+        (m[3], CHAIN_DISTANCES[1]),
+        (m[2], CHAIN_DISTANCES[2]),
+    ];
+    c.w.scenes.set_chain(m[0], &chain).unwrap();
+    let g = c.shoot(Vec::new(), Some(Vec3::new(0.5, 1.0, 0.0)));
+    let state = c.state(&g);
+    for &slot in &c.slots {
+        let s = state[slot as usize];
+        assert_eq!((s.chain_step, s.fade), (2 | CHAIN_SEEN, 0), "slot {slot}");
+        assert_eq!(s.rt_model, m[3].0, "slot {slot}: traced model");
+    }
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let (matched, covered) = parity(&g, &r, 1e-4);
+    let total = r.traced.len();
+    assert!(covered > total / 20, "{covered} pixels covered");
+    assert!(
+        matched as f64 >= 0.999 * total as f64,
+        "{matched} of {total} pixels agree"
+    );
     assert_clean();
 }
 
@@ -4080,13 +4151,17 @@ fn a_fade_that_turns_to_another_far_step_traces_that_step() {
         let (a, b) = (before[slot as usize], after[slot as usize]);
         assert_eq!((a.chain_step, a.fade), (1 | CHAIN_SEEN, 3), "slot {slot}");
         assert_eq!((b.chain_step, b.fade), (2 | CHAIN_SEEN, 3), "slot {slot}");
-        // The far instance is held across the turn, not taken again, so only its step
+        // The far instance is held across the turn, not taken again, so only its model
         // differs from what it holds.
         assert!(a.far_part != 0 && b.far_part == a.far_part, "slot {slot}");
-        let held = |s: u32| ((s >> RT_FAR_STEP_SHIFT) & 3, (s >> RT_FAR_CUT_SHIFT) & 0xff);
-        let (step, cut) = held(a.rt_flags);
-        assert_eq!(step, 1, "slot {slot}: far step");
-        assert_eq!(held(b.rt_flags), (2, cut), "slot {slot}: far step and cut");
+        let held = |s: SlotStateGpu| (s.far_model, (s.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff);
+        let (model, cut) = held(a);
+        assert_eq!(model, models[1].0, "slot {slot}: far model");
+        assert_eq!(
+            held(b),
+            (models[2].0, cut),
+            "slot {slot}: far model and cut"
+        );
     }
     let turned = rays(&g.view, &trace::MODULE, "pixels", 0);
     // Settled at step 2, the copies trace it through their own instances.
@@ -4115,6 +4190,89 @@ fn a_fade_that_turns_to_another_far_step_traces_that_step() {
     assert!(
         matched as f64 >= 0.99 * checked as f64,
         "{matched} of {checked} far pixels trace step 2"
+    );
+    assert_clean();
+}
+
+#[test]
+fn a_chain_replacing_the_far_step_model_of_a_fading_copy_traces_the_new_model() {
+    let _serial = serial();
+    let (mut w, models) = chain_world();
+    set_chain(&mut w, &models);
+    let placed = place_at(&mut w, &chain_copies(), DVec3::ZERO, 1e4);
+    let slots: Vec<u32> = placed.ranges.iter().map(|r| r.first).collect();
+    let eye = DVec3::new(0.0, 2.0, 6.0);
+    let target = DVec3::new(0.0, 1.0, 0.0);
+    let mut frame = 0;
+    let mut shoot_at = |w: &mut World, z: f64| {
+        frame += 1;
+        let mut shot = Shot::at(eye, target, frame);
+        shot.focus = Some(DVec3::new(0.0, 1.0, z));
+        shoot(w, &placed, &shot)
+    };
+    let state = |g: &Frame| {
+        let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
+        read_buffer(root.slot_state, u64::from(placed.count))
+    };
+    // Settled at step 1, then two frames into a fade to step 2, which the far instances trace.
+    for _ in 0..=CHAIN_FADE_FRAMES {
+        shoot_at(&mut w, 30.0);
+    }
+    shoot_at(&mut w, 60.0);
+    let mut g = shoot_at(&mut w, 60.0);
+    let before = state(&g);
+    // Step 2's model becomes step 3's while the fade goes on; the far instances keep their
+    // step and the cut index they held.
+    let chain = [
+        (models[1], CHAIN_DISTANCES[0]),
+        (models[3], CHAIN_DISTANCES[1]),
+        (models[2], CHAIN_DISTANCES[2]),
+    ];
+    w.scenes.set_chain(models[0], &chain).unwrap();
+    g = shoot_at(&mut w, 60.0);
+    let after = state(&g);
+    for &slot in &slots {
+        let (a, b) = (before[slot as usize], after[slot as usize]);
+        let fading = 2 | 1 << 2 | CHAIN_SEEN;
+        assert_eq!((a.chain_step, a.fade), (fading, 2), "slot {slot}");
+        assert_eq!((b.chain_step, b.fade), (fading, 3), "slot {slot}");
+        assert!(a.far_part != 0 && b.far_part == a.far_part, "slot {slot}");
+        let held = |s: SlotStateGpu| (s.far_model, (s.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff);
+        let (model, cut) = held(a);
+        assert_eq!(model, models[2].0, "slot {slot}: far model");
+        assert_eq!(
+            held(b),
+            (models[3].0, cut),
+            "slot {slot}: far model and cut"
+        );
+    }
+    let turned = rays(&g.view, &trace::MODULE, "pixels", 0);
+    // Settled at step 2, the copies trace its new model through their own instances.
+    for _ in 0..CHAIN_FADE_FRAMES {
+        g = shoot_at(&mut w, 60.0);
+    }
+    let settled = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let mut checked = 0;
+    let mut matched = 0;
+    for (t, s) in turned.traced.iter().zip(&settled.traced) {
+        if !far_copy(t.instance) {
+            continue;
+        }
+        checked += 1;
+        let same = (t.instance - 1) & !COPY_FAR == s.instance.wrapping_sub(1)
+            && t.cluster == s.cluster
+            && t.primitive == s.primitive
+            && (t.t - s.t).abs() <= 1e-5 * s.t;
+        matched += usize::from(same);
+    }
+    let covered = settled.traced.iter().filter(|t| t.instance != 0).count();
+    assert!(
+        checked > covered / 20,
+        "{checked} of {covered} pixels on the far step"
+    );
+    assert!(
+        matched as f64 >= 0.99 * checked as f64,
+        "{matched} of {checked} far pixels trace the new model"
     );
     assert_clean();
 }

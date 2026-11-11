@@ -30,7 +30,8 @@
 // A slot's instance traces its copy's nearer chain step. While the copy fades between two
 // steps, a part instance of its own (a run of one, named in `part_slots` with COPY_FAR)
 // traces the farther step's cached cut, and both are written non-opaque so hits test the
-// fade. Chain work is mandatory, so ray tracing changes step in the frame the raster does.
+// fade. Chain work is mandatory, a chain replacing a step's model included, so ray tracing
+// changes step and model in the frame the raster does.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
@@ -379,8 +380,10 @@ void want(uint3 id: SV_DispatchThreadID)
     InstanceGpu inst = step_record(s, base, near);
     bool seen = (st.rt_flags & RT_SEEN) != 0;
     bool written = (st.rt_flags & RT_WRITTEN) != 0;
-    // The instance holds another chain step or fade state than the copy shows.
-    bool stepped = written && ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) != near;
+    // The instance holds another chain step, model or fade state than the copy shows: a
+    // chain can replace a step's model, and a model past step 0 shows other materials,
+    // sections and no pose.
+    bool stepped = written && (((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) != near || st.rt_model != inst.model);
     bool restep = stepped || (written && ((st.rt_flags & RT_FADING) != 0) != fading);
     bool has_focus = root.focus_cell.w != 0;
     uint cell_log2 = uint(s.origin_cell.w);
@@ -531,17 +534,19 @@ void want(uint3 id: SV_DispatchThreadID)
     // The far instance of a fading copy: taken when the fade starts, rewritten with the
     // slot's instance or a new cut, released when it ends.
     bool far = false;
-    uint far_step = chain_far(*st);
+    bool far_moved = false;
     if (fading)
     {
-        MeshGpu* far_mesh = s.meshes + s.models[step_record(s, base, far_step).model].mesh;
+        uint far_model = step_record(s, base, chain_far(*st)).model;
+        MeshGpu* far_mesh = s.meshes + s.models[far_model].mesh;
         far = far_mesh.rt_cut_count > 0;
         op.far_cut = far ? s.cut.slots[slot].far_cut : 0;
+        // A fade can turn to another far step, or its chain replace the far step's model,
+        // while the near one stays.
+        far_moved = (op.op & OP_WRITE) != 0 || op.far_cut != ((st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff)
+            || far_model != st.far_model || target != st.rt_partition;
     }
     bool far_held = st.far_part != 0;
-    // A fade can turn to another far step before it ends while the near one stays.
-    bool far_moved = (op.op & OP_WRITE) != 0 || op.far_cut != ((st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff)
-        || far_step != ((st.rt_flags >> RT_FAR_STEP_SHIFT) & CHAIN_STEP_MASK) || target != st.rt_partition;
     uint far_op = far && !far_held ? OP_FAR_TAKE : far && far_moved ? OP_FAR_WRITE : !far && far_held ? OP_FAR_RELEASE : 0;
     if (far_op != 0)
     {
@@ -754,14 +759,13 @@ void write_far(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu base, ui
     uint index;
     if (!reserve(COUNTER_WRITES, t.write_capacity, 1, index))
         return;
-    uint step = chain_far(*st);
-    InstanceGpu far = step_record(s, base, step);
+    InstanceGpu far = step_record(s, base, chain_far(*st));
     MeshGpu* mesh = s.meshes + s.models[far.model].mesh;
     PtlasWrite w = copy_write(s, t, s.part_base + st.far_part - 1, partition, far, mesh.rt_cuts[cut].blas);
     w.flags |= INSTANCE_FORCE_NO_OPAQUE;
     store((uint64_t)t.writes, index, w);
-    uint held = (0xffu << RT_FAR_CUT_SHIFT) | (CHAIN_STEP_MASK << RT_FAR_STEP_SHIFT);
-    st.rt_flags = (st.rt_flags & ~held) | (cut << RT_FAR_CUT_SHIFT) | (step << RT_FAR_STEP_SHIFT);
+    st.rt_flags = (st.rt_flags & ~(0xffu << RT_FAR_CUT_SHIFT)) | (cut << RT_FAR_CUT_SHIFT);
+    st.far_model = far.model;
 }
 
 // Writes every part instance of the slot's run: the cut's part BLAS posed by the copy's
@@ -894,6 +898,7 @@ void emit(uint3 id: SV_DispatchThreadID)
         st.rt_lod = uint8_t(op.cut);
         st.rt_partition = op.partition;
         st.rt_key = op.key;
+        st.rt_model = inst.model;
         uint chain = disable ? 0 : (near << RT_STEP_SHIFT) | (fading ? RT_FADING : 0);
         st.rt_flags = (st.rt_flags & ~(RT_WRITTEN | RT_GLOBAL | RT_FADING | (CHAIN_STEP_MASK << RT_STEP_SHIFT)))
             | (disable ? 0 : RT_WRITTEN) | (global ? RT_GLOBAL : 0) | chain;

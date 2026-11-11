@@ -95,7 +95,6 @@ public static const uint RT_ANIMATED = 16;  // inside animation_range: raster ta
 public static const uint RT_WAS_ANIMATED = 32; // RT_ANIMATED of the previous frame
 public static const uint RT_FADING = 64;    // its PTLAS instance was written for a chain fade
 public static const uint RT_STEP_SHIFT = 8; // 2 bits: the chain step its PTLAS instance holds
-public static const uint RT_FAR_STEP_SHIFT = 10; // 2 bits: the chain step its far instance holds
 public static const uint RT_FAR_CUT_SHIFT = 16; // 8 bits: the cut its far instance holds
 
 // `SlotStateGpu.chain_step`: the step a copy is at, or fades to, in bits 0-1; the step it
@@ -130,9 +129,11 @@ public struct SlotStateGpu
     public uint rt_flags;           // RT_*
     public uint2 rt_key;            // hash of the transform, model and shown sections it was written with
     public uint rt_age;             // frames its pending PTLAS work has waited
+    public uint rt_model;           // the model it holds while RT_WRITTEN
     public uint part_run;           // first part instance of the run it holds
     public uint part_count;         // part instances in the run; 0: none
     public uint far_part;           // 1 + the part instance tracing its far chain step; 0: none
+    public uint far_model;          // the model that part instance holds
 }
 
 // A transform group: `count` transforms relative to the group's anchor. A null `current`
@@ -524,13 +525,15 @@ public uint chain_far(SlotStateGpu st)
 // instance holds of `mesh`, its record `inst`'s mesh at its nearer step, or with `gathered`
 // the list its traversal gathered for the BLAS built this frame. A skinned copy's skinning cut
 // names its row, and an edit's copies gather level 0, which cut 0 stands for. False when the
-// instance holds nothing of that step.
+// instance holds another step or model: a chain can name its own model, whose record past
+// step 0 shows other sections and materials.
 public bool traced_row(SceneRoot* s, uint slot, InstanceGpu inst, MeshGpu* mesh, out uint row, out bool gathered)
 {
     SlotStateGpu st = s.slot_state[slot];
     row = 0;
     gathered = false;
-    if ((st.rt_flags & RT_WRITTEN) == 0 || ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) != chain_near(st))
+    if ((st.rt_flags & RT_WRITTEN) == 0 || ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) != chain_near(st)
+        || st.rt_model != inst.model)
         return false;
     if (may2(MAY2_SKINNING) && (inst.flags & INSTANCE_SKINNED) != 0)
     {
@@ -552,8 +555,6 @@ public bool traced_row(SceneRoot* s, uint slot, InstanceGpu inst, MeshGpu* mesh,
         gathered = true;
         return true;
     }
-    if (uint(st.rt_lod) >= mesh.rt_cut_count)
-        return false;
     row = mesh.rt_cuts[st.rt_lod].row;
     return true;
 }

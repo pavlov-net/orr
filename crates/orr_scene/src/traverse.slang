@@ -341,12 +341,11 @@ uint lowest_cut(MeshGpu* mesh, InstanceGpu inst)
 }
 
 // The cached cut a slot traces at `distance`, kept within 15% of its error from the one its
-// PTLAS instance holds when that instance holds the same chain step.
-uint cached_cut(MeshGpu* mesh, SlotStateGpu st, float scale, float distance, float limit, uint lowest)
+// PTLAS instance holds when that instance `holds` a cut of `mesh`.
+uint cached_cut(MeshGpu* mesh, SlotStateGpu st, bool holds, float scale, float distance, float limit, uint lowest)
 {
     uint fresh = coarsest_cut(mesh, scale, distance, limit, lowest);
-    bool written = (st.rt_flags & RT_WRITTEN) != 0 && ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) == chain_near(st);
-    if (!written || !has_focus() || st.rt_lod >= mesh.rt_cut_count || st.rt_lod < lowest || mesh.rt_cuts[st.rt_lod].blas == 0)
+    if (!holds || !has_focus() || st.rt_lod >= mesh.rt_cut_count || st.rt_lod < lowest || mesh.rt_cuts[st.rt_lod].blas == 0)
         return fresh;
     uint current = st.rt_lod;
     uint coarser = coarsest_cut(mesh, scale, distance, limit / RT_HYSTERESIS, lowest);
@@ -519,10 +518,10 @@ void init(uint3 id: SV_DispatchThreadID)
     c.rt_distance = distance;
     c.rt_scale = p.scale * l.scale;
     c.rt_limit = l.cached;
+    bool holds = (st.rt_flags & RT_WRITTEN) != 0 && st.rt_model == inst.model;
     if (ray)
-        c.rt_cut = cached_cut(mesh, st, c.rt_scale, distance, l.cached, lowest_cut(mesh, inst));
+        c.rt_cut = cached_cut(mesh, st, holds, c.rt_scale, distance, l.cached, lowest_cut(mesh, inst));
     // The BLAS of a finer cut stay while a slot's PTLAS instance or this frame's cut names them.
-    bool holds = (st.rt_flags & RT_WRITTEN) != 0 && ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) == near;
     if (holds)
         touch_cut(cut, mesh, st.rt_lod);
     if (ray)
@@ -542,14 +541,10 @@ void init(uint3 id: SV_DispatchThreadID)
             touch_cut(cut, far_mesh, c.far_cut);
             want_cut(cut, far_mesh, p.scale * l.scale, far_distance, l.cached, 0);
         }
-        // Its far instance holds a cut of the step it was last written with, which the fade
-        // may have turned from.
+        // Its far instance holds a cut of the model it was last written with, which the fade
+        // may have turned from or its chain replaced.
         if (st.far_part != 0)
-        {
-            uint held = (st.rt_flags >> RT_FAR_STEP_SHIFT) & CHAIN_STEP_MASK;
-            MeshGpu* held_mesh = s.meshes + s.models[step_record(s, s.instances[slot], held).model].mesh;
-            touch_cut(cut, held_mesh, (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff);
-        }
+            touch_cut(cut, s.meshes + s.models[st.far_model].mesh, (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff);
         if (raster)
             raster_roots(s, cut, slot | COPY_FAR, far_mesh, p, far_sphere, l);
     }
