@@ -270,7 +270,7 @@ pub(crate) struct Placement {
     /// Units of a block made for ranges no longer than it.
     block_units: u32,
     blocks: Vec<Option<PlacedBlock>>,
-    /// The live blocks that take new ranges, by units in use, the fullest first, then by index.
+    /// The live blocks that take new ranges, by live units, the fullest first, then by index.
     by_fill: BTreeSet<(Reverse<u32>, u32)>,
     used: u64,
     retired: u64,
@@ -355,10 +355,10 @@ impl Placement {
 
     fn took(&mut self, block: u32, first: u32, units: u32) -> PoolSlot {
         let b = self.blocks[block as usize].as_mut().expect("live block");
-        self.by_fill.remove(&(Reverse(b.used), block));
+        self.by_fill.remove(&(Reverse(b.live()), block));
         b.slots += 1;
         b.used += units;
-        self.by_fill.insert((Reverse(b.used), block));
+        self.by_fill.insert((Reverse(b.live()), block));
         self.used += u64::from(units);
         self.changed = true;
         PoolSlot {
@@ -410,8 +410,15 @@ impl Placement {
         let b = self.blocks[slot.block as usize]
             .as_mut()
             .expect("slot of a live block");
+        let draining = b.draining;
+        if !draining {
+            self.by_fill.remove(&(Reverse(b.live()), slot.block));
+        }
         b.retired += slot.units;
         assert!(b.retired <= b.used, "a range retired twice");
+        if !draining {
+            self.by_fill.insert((Reverse(b.live()), slot.block));
+        }
         self.retired += u64::from(slot.units);
         self.changed = true;
     }
@@ -421,7 +428,7 @@ impl Placement {
         let entry = &mut self.blocks[slot.block as usize];
         let b = entry.as_mut().expect("slot of a live block");
         b.ranges.free(slot.first, slot.units);
-        self.by_fill.remove(&(Reverse(b.used), slot.block));
+        self.by_fill.remove(&(Reverse(b.live()), slot.block));
         b.slots -= 1;
         b.used -= slot.units;
         self.used -= u64::from(slot.units);
@@ -440,7 +447,7 @@ impl Placement {
             }
             *entry = None;
         } else if !b.draining {
-            self.by_fill.insert((Reverse(b.used), slot.block));
+            self.by_fill.insert((Reverse(b.live()), slot.block));
         }
         empty
     }
@@ -485,13 +492,13 @@ impl Placement {
         for &i in &self.draining {
             let b = self.blocks[i as usize].as_mut().expect("a draining block");
             b.draining = false;
-            self.by_fill.insert((Reverse(b.used), i));
+            self.by_fill.insert((Reverse(b.live()), i));
         }
         self.draining_units = 0;
         for &i in &chosen {
             let b = self.blocks[i as usize].as_mut().expect("a live block");
             b.draining = true;
-            self.by_fill.remove(&(Reverse(b.used), i));
+            self.by_fill.remove(&(Reverse(b.live()), i));
             self.draining_units += u64::from(b.units);
         }
         self.draining = chosen;
@@ -506,7 +513,7 @@ impl Placement {
         };
         let b = self.blocks[i as usize].as_mut().expect("a draining block");
         b.draining = false;
-        self.by_fill.insert((Reverse(b.used), i));
+        self.by_fill.insert((Reverse(b.live()), i));
         self.draining_units -= u64::from(b.units);
         self.changed = true;
         true
@@ -706,12 +713,16 @@ impl Pool {
         &self.places.draining
     }
 
-    /// `bytes` bytes for a range moving out of draining block `from`, in a block that is not
-    /// draining; never a new block. `None` when no block has room: `from` then stops draining
-    /// until a range is freed.
+    /// `bytes` bytes for a range moving out of block `from`, in a block that is not draining;
+    /// never a new block. `None` when `from` drains no longer, as a load took its room
+    /// meanwhile, or when no block has room: `from` then stops draining until a range is
+    /// freed.
     pub(crate) fn alloc_moved(&mut self, bytes: u64, from: u32) -> Option<(PoolSlot, Block)> {
         let unit = self.places.unit;
-        let units = bytes.max(1).div_ceil(unit) as u32;
+        let units = bytes.div_ceil(unit) as u32;
+        if !self.places.draining.contains(&from) {
+            return None;
+        }
         let Some(slot) = self.places.find(units, 1, None) else {
             self.places.stuck(from);
             return None;

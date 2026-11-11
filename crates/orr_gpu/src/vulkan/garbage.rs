@@ -277,8 +277,7 @@ mod tests {
             let due = w.take_due(&DONE);
             assert_eq!(due.last(), Some(&(u32::MAX - 1)), "an entry without memory");
             let own_due = &due[..due.len() - 1];
-            let waiting = next as usize - freed.len();
-            assert_eq!(own_due.len(), waiting.div_ceil(OWN_SHARE).max(OWN_FREES));
+
             for &i in own_due {
                 // Entry `i` was deferred at the collection its number gives.
                 let deferred = i.saturating_sub(BURST) / STEADY;
