@@ -25,10 +25,10 @@ mod ffi {
         pub(crate) fn orr_largest_scale(m: *const f32) -> f32;
         pub(crate) fn orr_linear_inverse(m: *const f32, out: *mut f32);
 
-        pub(crate) fn orr_oct_encode_unorm16(n: *const f32) -> u32;
-        pub(crate) fn orr_oct_decode_unorm16(e: u32, out: *mut f32);
         pub(crate) fn orr_oct_encode_snorm16(n: *const f32) -> u32;
         pub(crate) fn orr_oct_decode_snorm16(e: u32, out: *mut f32);
+        pub(crate) fn orr_oct_encode_tangent(t: *const f32, sign: f32) -> u32;
+        pub(crate) fn orr_oct_decode_tangent(e: u32, out: *mut f32);
         pub(crate) fn orr_oct_encode_snorm8(n: *const f32) -> u32;
         pub(crate) fn orr_oct_decode_snorm8(e: u32, out: *mut f32);
         pub(crate) fn orr_unpack_unorm2x16(p: u32, out: *mut f32);
@@ -176,17 +176,17 @@ pub fn linear_inverse(m: [f32; 9]) -> [f32; 9] {
         o.as_mut_ptr()
     ))
 }
-pub fn oct_encode_unorm16(n: V3) -> u32 {
-    call!(ffi::orr_oct_encode_unorm16(n.as_ptr()))
-}
-pub fn oct_decode_unorm16(e: u32) -> V3 {
-    out!(V3, |o| ffi::orr_oct_decode_unorm16(e, o.as_mut_ptr()))
-}
 pub fn oct_encode_snorm16(n: V3) -> u32 {
     call!(ffi::orr_oct_encode_snorm16(n.as_ptr()))
 }
 pub fn oct_decode_snorm16(e: u32) -> V3 {
     out!(V3, |o| ffi::orr_oct_decode_snorm16(e, o.as_mut_ptr()))
+}
+pub fn oct_encode_tangent(t: V3, sign: f32) -> u32 {
+    call!(ffi::orr_oct_encode_tangent(t.as_ptr(), sign))
+}
+pub fn oct_decode_tangent(e: u32) -> V4 {
+    out!(V4, |o| ffi::orr_oct_decode_tangent(e, o.as_mut_ptr()))
 }
 pub fn oct_encode_snorm8(n: V3) -> u32 {
     call!(ffi::orr_oct_encode_snorm8(n.as_ptr()))

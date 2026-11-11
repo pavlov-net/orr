@@ -12,10 +12,11 @@
 //! - Positions at `positions_offset`: u16x3 per vertex, the grid offset from the cluster's
 //!   anchor. Mesh-space position is `(anchor + local) x 2^position_exponent`.
 //! - Attributes at `attrs_offset`, `attr_stride` bytes per vertex: normal (octahedral, 2x16
-//!   unorm), tangent when the mesh has [`MeshHeader::TANGENT`] (octahedral 2x16 unorm,
-//!   bitangent sign in the low bit of y: set means -1), uv set 0 (2x16 unorm over the
-//!   cluster's `uv_offset[0]` and `uv_scale[0]`), uv set 1 likewise when the mesh has
-//!   [`MeshHeader::UV1`], with [`MeshHeader::COLOR`] four half floats, and with
+//!   snorm, [`oct_encode`]), tangent when the mesh has [`MeshHeader::TANGENT`] (octahedral, x
+//!   16-bit and y 15-bit snorm with the bitangent sign between them, [`oct_encode_tangent`]),
+//!   uv set 0 (2x16 unorm over the cluster's `uv_offset[0]` and `uv_scale[0]`), uv set 1
+//!   likewise when the mesh has [`MeshHeader::UV1`], with [`MeshHeader::COLOR`] four half
+//!   floats, and with
 //!   [`MeshHeader::SKIN`] joints u8x4 and weights unorm8x4.
 //! - Vertex `i` of a cluster sits at index `vertex_first + i` in both the position and the
 //!   attribute array. `vertex_first` is even, so every cluster's positions start 4-aligned.
@@ -35,7 +36,7 @@ pub use omm::*;
 use crate::blob::{put_table, put_table_aligned, read, table};
 use crate::{Aabb, Error, Result, Span, Sphere};
 
-pub const SCHEMA: u16 = 8;
+pub const SCHEMA: u16 = 9;
 
 /// Largest streamed hierarchy node page. The top page holds what the pinned pages need,
 /// whatever its size.
@@ -469,7 +470,7 @@ pub struct SetNode {
     /// Bounds every vertex below the node, mesh space.
     pub center: [f32; 3],
     pub radius: f32,
-    /// Octahedral 2x16 unorm ([`oct_encode`]): the axis of the cone holding the front face
+    /// Octahedral 2x16 snorm ([`oct_encode`]): the axis of the cone holding the front face
     /// normals below the node.
     pub axis: u32,
     /// Cosine of the cone's half angle; -1 where faces of any direction may emit.
@@ -858,11 +859,8 @@ impl<'a> PageView<'a> {
 
     /// Tangent xyz and bitangent sign, when the mesh has tangents.
     pub fn tangent(&self, c: &Cluster, v: u32) -> Option<[f32; 4]> {
-        self.has(MeshHeader::TANGENT).then(|| {
-            let t = self.attr(c, v, 4);
-            let [x, y, z] = oct_decode(t);
-            [x, y, z, if t & 1 << 16 != 0 { -1.0 } else { 1.0 }]
-        })
+        self.has(MeshHeader::TANGENT)
+            .then(|| oct_decode_tangent(self.attr(c, v, 4)))
     }
 
     /// The color stream of a vertex, 1 without [`MeshHeader::COLOR`].
@@ -967,26 +965,58 @@ pub fn skin(view: &PageView<'_>, c: &Cluster, palette: &[Affine3], out: &mut [[f
     }
 }
 
-/// Octahedral encoding of a unit vector as 2x16 unorm in one u32 (x low).
+/// Octahedral encoding of a unit vector as 2x16 snorm in one u32, x low: `orr_shaders.packing`'s
+/// `oct_encode_snorm16`.
 pub fn oct_encode(n: [f32; 3]) -> u32 {
-    let l = n[0].abs() + n[1].abs() + n[2].abs();
-    let (mut x, mut y) = (n[0] / l, n[1] / l);
-    if n[2] < 0.0 {
-        (x, y) = ((1.0 - y.abs()) * sign(x), (1.0 - x.abs()) * sign(y));
-    }
-    let q = |v: f32| ((v * 0.5 + 0.5).clamp(0.0, 1.0) * 65535.0).round() as u32;
-    q(x) | q(y) << 16
+    let [x, y] = oct_wrap(n).map(|v| snorm(v, 32767.0));
+    (x & 0xFFFF) | y << 16
 }
 
 pub fn oct_decode(e: u32) -> [f32; 3] {
-    let f = |q: u32| (q & 0xFFFF) as f32 / 65535.0 * 2.0 - 1.0;
-    let (mut x, mut y) = (f(e), f(e >> 16));
+    let lane = |h: u32| (f32::from(h as u16 as i16) / 32767.0).max(-1.0);
+    oct_unwrap([lane(e), lane(e >> 16)])
+}
+
+/// Octahedral encoding of a unit tangent and its bitangent sign in one u32: x as 16-bit snorm in
+/// bits 0-15, the sign in bit 16 (set for -1), y as 15-bit snorm (to 16383) in bits 17-31.
+/// `orr_shaders.packing`'s `oct_encode_tangent`.
+pub fn oct_encode_tangent(t: [f32; 3], sign: f32) -> u32 {
+    let [x, y] = oct_wrap(t);
+    (snorm(x, 32767.0) & 0xFFFF) | u32::from(sign < 0.0) << 16 | snorm(y, 16383.0) << 17
+}
+
+/// Xyz and the bitangent sign of an [`oct_encode_tangent`] code.
+pub fn oct_decode_tangent(e: u32) -> [f32; 4] {
+    let x = (f32::from(e as u16 as i16) / 32767.0).max(-1.0);
+    let y = (((e as i32) >> 17) as f32 / 16383.0).max(-1.0);
+    let [tx, ty, tz] = oct_unwrap([x, y]);
+    [tx, ty, tz, if e & 1 << 16 != 0 { -1.0 } else { 1.0 }]
+}
+
+/// The point of the octahedral square for unit `n`.
+fn oct_wrap(n: [f32; 3]) -> [f32; 2] {
+    let l = n[0].abs() + n[1].abs() + n[2].abs();
+    let (x, y) = (n[0] / l, n[1] / l);
+    if n[2] < 0.0 {
+        [(1.0 - y.abs()) * sign(x), (1.0 - x.abs()) * sign(y)]
+    } else {
+        [x, y]
+    }
+}
+
+/// The unit vector of a point of the octahedral square.
+fn oct_unwrap([mut x, mut y]: [f32; 2]) -> [f32; 3] {
     let z = 1.0 - x.abs() - y.abs();
     if z < 0.0 {
         (x, y) = ((1.0 - y.abs()) * sign(x), (1.0 - x.abs()) * sign(y));
     }
     let l = (x * x + y * y + z * z).sqrt();
     [x / l, y / l, z / l]
+}
+
+/// `round(clamp(v, -1, 1) x max)` as two's complement bits.
+fn snorm(v: f32, max: f32) -> u32 {
+    ((v.clamp(-1.0, 1.0) * max).round() as i32).cast_unsigned()
 }
 
 fn sign(v: f32) -> f32 {

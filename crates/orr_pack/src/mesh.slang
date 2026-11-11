@@ -103,7 +103,7 @@ public struct SetNode
 {
     public float3 center;          // mesh space
     public float radius;
-    public uint axis;              // oct 2x16 unorm
+    public uint axis;              // oct 2x16 snorm
     public float cone_cos;         // -1: any direction
     public uint first;             // positions in the set
     public uint count;
@@ -198,14 +198,11 @@ public VertexAttributes load_attributes(uint8_t* page, PageHeader h, Cluster c, 
 {
     uint* a = (uint*)(page + h.attrs_offset + (c.vertex_first + i) * h.attr_stride);
     VertexAttributes v;
-    v.normal = oct_decode_unorm16(a[0]);
+    v.normal = oct_decode_snorm16(a[0]);
     uint at = 1;
     v.tangent = float4(1.0, 0.0, 0.0, 1.0);
     if ((attributes & MESH_TANGENT) != 0)
-    {
-        uint t = a[at++];
-        v.tangent = float4(oct_decode_unorm16(t), (t & (1u << 16)) != 0 ? -1.0 : 1.0);
-    }
+        v.tangent = oct_decode_tangent(a[at++]);
     v.uv[0] = load_uv(a[at++], c, 0);
     v.uv[1] = float2(0.0);
     if ((attributes & MESH_UV1) != 0)

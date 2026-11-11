@@ -11,8 +11,8 @@ import orr_shaders.math;
 // Octahedral normals.
 //
 // The unit sphere folds onto the square [-1, 1]^2: x and y are divided by |x| + |y| + |z|,
-// and the lower hemisphere (z < 0) is folded over the diagonals. The unorm form (orr_pack
-// vertex normals and tangents) and the snorm forms (G-buffer) quantize that square.
+// and the lower hemisphere (z < 0) is folded over the diagonals. The snorm forms quantize that
+// square, so 0 and +-1 are codes and the axes round-trip exactly.
 
 float oct_sign(float v)
 {
@@ -44,30 +44,33 @@ public float3 oct_unwrap(float2 e)
     return float3(x / l, y / l, z / l);
 }
 
-// 2x16 unorm, x in the low half. Bit for bit `orr_pack::mesh::oct_encode` on the CPU.
-public uint oct_encode_unorm16(float3 n)
-{
-    float2 e = oct_wrap(n);
-    uint2 q = uint2(round(clamp(e * 0.5 + 0.5, 0.0, 1.0) * 65535.0));
-    return q.x | (q.y << 16);
-}
-
-// Bit for bit `orr_pack::mesh::oct_decode` on the CPU. A tangent's bitangent sign bit
-// (y's low bit) is part of the code.
-public float3 oct_decode_unorm16(uint e)
-{
-    return oct_unwrap(float2(float(e & 0xFFFF) / 65535.0 * 2.0 - 1.0, float(e >> 16) / 65535.0 * 2.0 - 1.0));
-}
-
-// 2x16 snorm, x in the low half.
+// 2x16 snorm, x in the low half. Bit for bit `orr_pack::mesh::oct_encode` on the CPU.
 public uint oct_encode_snorm16(float3 n)
 {
     return pack_snorm2x16(oct_wrap(n));
 }
 
+// Bit for bit `orr_pack::mesh::oct_decode` on the CPU.
 public float3 oct_decode_snorm16(uint e)
 {
     return oct_unwrap(unpack_snorm2x16(e));
+}
+
+// A tangent and its bitangent sign: x snorm16 in bits 0-15, the sign in bit 16 (set for -1),
+// y snorm over 15 bits (max 16383) in bits 17-31. Bit for bit `orr_pack::mesh::oct_encode_tangent`
+// on the CPU.
+public uint oct_encode_tangent(float3 t, float sign)
+{
+    int2 q = int2(round(clamp(oct_wrap(t), -1.0, 1.0) * float2(32767.0, 16383.0)));
+    return (uint(q.x) & 0xFFFF) | (sign < 0.0 ? 1u << 16 : 0) | (uint(q.y) << 17);
+}
+
+// Xyz and the bitangent sign. Bit for bit `orr_pack::mesh::oct_decode_tangent` on the CPU.
+public float4 oct_decode_tangent(uint e)
+{
+    int2 q = int2(int(e << 16) >> 16, int(e) >> 17);
+    float3 t = oct_unwrap(max(float2(q) / float2(32767.0, 16383.0), -1.0));
+    return float4(t, (e & (1u << 16)) != 0 ? -1.0 : 1.0);
 }
 
 // 2x8 snorm in the low 16 bits, x in the low byte.

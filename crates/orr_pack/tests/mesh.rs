@@ -182,3 +182,16 @@ fn clas_truncation_keeps_every_cell_of_a_box() {
     let far = (f64::from(b.max[0]) / step).round() as i64;
     assert!(!kept(far, t + 1), "{t} bits is not the most the box allows");
 }
+
+#[test]
+fn axes_round_trip_exactly_through_the_normal_and_tangent_codes() {
+    for a in 0..6 {
+        let mut n = [0.0f32; 3];
+        n[a / 2] = if a % 2 == 0 { 1.0 } else { -1.0 };
+        assert_eq!(mesh::oct_decode(mesh::oct_encode(n)), n, "normal {n:?}");
+        for sign in [1.0, -1.0] {
+            let [x, y, z, s] = mesh::oct_decode_tangent(mesh::oct_encode_tangent(n, sign));
+            assert_eq!(([x, y, z], s), (n, sign), "tangent {n:?} sign {sign}");
+        }
+    }
+}

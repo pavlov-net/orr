@@ -27,9 +27,15 @@ fn normals(count: usize) -> Vec<[f32; 3]> {
 }
 
 #[test]
-fn oct_unorm16_matches_orr_pack_bit_for_bit() {
-    for n in normals(200_000) {
-        assert_eq!(oct_encode_unorm16(n), mesh::oct_encode(n), "{n:?}");
+fn oct_normal_and_tangent_codes_match_orr_pack_bit_for_bit() {
+    for (i, n) in normals(200_000).into_iter().enumerate() {
+        assert_eq!(oct_encode_snorm16(n), mesh::oct_encode(n), "{n:?}");
+        let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+        let (a, b) = (
+            oct_encode_tangent(n, sign),
+            mesh::oct_encode_tangent(n, sign),
+        );
+        assert_eq!(a, b, "{n:?} {sign}");
     }
     let mut rng = Rng::new(2);
     let corners = [
@@ -45,7 +51,13 @@ fn oct_unorm16_matches_orr_pack_bit_for_bit() {
         .into_iter()
         .chain((0..200_000).map(|_| rng.next_u32()))
     {
-        let (a, b) = (oct_decode_unorm16(e), mesh::oct_decode(e));
+        let (a, b) = (oct_decode_snorm16(e), mesh::oct_decode(e));
+        assert_eq!(
+            a.map(f32::to_bits),
+            b.map(f32::to_bits),
+            "{e:#010x}: {a:?} vs {b:?}"
+        );
+        let (a, b) = (oct_decode_tangent(e), mesh::oct_decode_tangent(e));
         assert_eq!(
             a.map(f32::to_bits),
             b.map(f32::to_bits),
@@ -134,7 +146,7 @@ fn mesh_page_decode_matches_orr_pack_bit_for_bit() {
                     theirs.map(f32::to_bits),
                     "cluster {i} vertex {v} k {k}"
                 );
-                let n = oct_decode_unorm16(vertices[v].1);
+                let n = oct_decode_snorm16(vertices[v].1);
                 assert_eq!(
                     n.map(f32::to_bits),
                     view.normal(&c, v as u32).map(f32::to_bits)
@@ -171,10 +183,10 @@ fn oct_unwrap(e: [f64; 2]) -> [f64; 3] {
 
 #[test]
 fn oct_forms_round_trip_within_their_step() {
-    let unorm16 = |c: u32| {
+    let tangent = |c: u32| {
         [
-            f64::from(c & 0xFFFF) / 65535.0 * 2.0 - 1.0,
-            f64::from(c >> 16) / 65535.0 * 2.0 - 1.0,
+            (f64::from(c as u16 as i16) / 32767.0).max(-1.0),
+            (f64::from(c.cast_signed() >> 17) / 16383.0).max(-1.0),
         ]
     };
     let snorm = |bits: u32, max: f64| {
@@ -193,29 +205,32 @@ fn oct_forms_round_trip_within_their_step() {
         fn([f32; 3]) -> u32,
         fn(u32) -> [f32; 3],
         &'a dyn Fn(u32) -> [f64; 2],
-        f64,
+        [f64; 2],
     );
     let forms: [Form; 3] = [
         (
-            "unorm16",
-            oct_encode_unorm16,
-            oct_decode_unorm16,
-            &unorm16,
-            1.0 / 65535.0,
+            "tangent",
+            |n| oct_encode_tangent(n, -1.0),
+            |c| {
+                let t = oct_decode_tangent(c);
+                [t[0], t[1], t[2]]
+            },
+            &tangent,
+            [0.5 / 32767.0, 0.5 / 16383.0],
         ),
         (
             "snorm16",
             oct_encode_snorm16,
             oct_decode_snorm16,
             &snorm16,
-            1.0 / 32767.0,
+            [0.5 / 32767.0; 2],
         ),
         (
             "snorm8",
             oct_encode_snorm8,
             oct_decode_snorm8,
             &snorm8,
-            1.0 / 127.0,
+            [0.5 / 127.0; 2],
         ),
     ];
     for (name, encode, decode, square, half_step) in forms {
@@ -225,7 +240,7 @@ fn oct_forms_round_trip_within_their_step() {
             for a in 0..2 {
                 // f32 evaluation adds up to a few ulps of the scaled value.
                 assert!(
-                    (want[a] - got[a]).abs() <= half_step + 3e-7,
+                    (want[a] - got[a]).abs() <= half_step[a] + 3e-7,
                     "{name} {n:?}: {want:?} coded as {got:?}"
                 );
             }

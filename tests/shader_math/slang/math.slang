@@ -33,10 +33,10 @@ export __extern_cpp void orr_linear_inverse(float* m, float* out) { store3x3(out
 
 // packing
 
-export __extern_cpp uint orr_oct_encode_unorm16(float* n) { return oct_encode_unorm16(load3(n)); }
-export __extern_cpp void orr_oct_decode_unorm16(uint e, float* out) { store3(out, oct_decode_unorm16(e)); }
 export __extern_cpp uint orr_oct_encode_snorm16(float* n) { return oct_encode_snorm16(load3(n)); }
 export __extern_cpp void orr_oct_decode_snorm16(uint e, float* out) { store3(out, oct_decode_snorm16(e)); }
+export __extern_cpp uint orr_oct_encode_tangent(float* t, float sign) { return oct_encode_tangent(load3(t), sign); }
+export __extern_cpp void orr_oct_decode_tangent(uint e, float* out) { store4(out, oct_decode_tangent(e)); }
 export __extern_cpp uint orr_oct_encode_snorm8(float* n) { return oct_encode_snorm8(load3(n)); }
 export __extern_cpp void orr_oct_decode_snorm8(uint e, float* out) { store3(out, oct_decode_snorm8(e)); }
 

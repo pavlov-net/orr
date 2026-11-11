@@ -51,7 +51,7 @@ public struct ProducerBatch
     public ProducerClusterGpu* clusters;
     public float3* positions;    // relative to the entry's transform
     public float3* previous;     // each vertex's position last frame; null unless ProducerDesc::previous_positions
-    public uint3* attrs;         // normal oct 2x16 unorm, then uv 2x f32 (uv set 1 too where `uv1` is null)
+    public uint3* attrs;         // normal oct 2x16 snorm, then uv 2x f32 (uv set 1 too where `uv1` is null)
     public float2* uv1;          // uv set 1; null but on a subdivision copy that carries it
     public uint2* colors;        // the vertex color stream, 4x f16; null where it reads 1: only a colored subdivision copy's generated vertices hold it
     public uint* vertex_user;    // null unless ProducerDesc::vertex_user
@@ -153,12 +153,12 @@ public uint alloc_vertices(ProducerBatch b, uint count)
 // tessellator displaces each vertex at the f32 uv it stores.
 public uint3 producer_attributes(float3 normal, float2 uv)
 {
-    return uint3(oct_encode_unorm16(normal), asuint(uv));
+    return uint3(oct_encode_snorm16(normal), asuint(uv));
 }
 
 public float3 producer_normal(uint3 attrs)
 {
-    return oct_decode_unorm16(attrs.x);
+    return oct_decode_snorm16(attrs.x);
 }
 
 public float2 producer_uv(uint3 attrs)

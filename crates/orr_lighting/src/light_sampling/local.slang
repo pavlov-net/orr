@@ -324,7 +324,7 @@ float importance(SceneRoot* s, uint entry, EmissiveSelection e, SetNode n, float
     float emitter = 1.0;
     if (uniform && n.cone_cos > -1.0)
     {
-        float3 axis = normalize(mul(pl.linear, oct_decode_unorm16(n.axis)));
+        float3 axis = normalize(mul(pl.linear, oct_decode_snorm16(n.axis)));
         emitter = max(cos_less(dot(axis, w), n.cone_cos, cos_receiver_size), 0.0);
     }
     float receiving = 1.0;

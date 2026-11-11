@@ -35,6 +35,7 @@ use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{
     Cluster, ClusterSets, FLAT_NORMAL, Level, MAX_SECTIONS, MeshHeader, MeshInfo, OMM_ALIGN,
     PAGE_MAX, PageHeader, PageInfo, Part, PartLevel, Section, SurfaceClass, oct_encode,
+    oct_encode_tangent,
 };
 use orr_pack::{Aabb, AssetId, EncodedBlob, GDeflate, Hash32, Span, Sphere};
 use serde::Deserialize;
@@ -1732,8 +1733,8 @@ fn build_cluster(
         ));
         if let Some(t) = &w.tangents {
             let [x, y, z, s] = t[v];
-            let e = oct_encode(Vec3::new(x, y, z).normalize_or(Vec3::X).to_array());
-            attrs.push(e & !(1 << 16) | u32::from(s < 0.0) << 16);
+            let t = Vec3::new(x, y, z).normalize_or(Vec3::X).to_array();
+            attrs.push(oct_encode_tangent(t, s));
         }
         for (u, r) in w.uvs.iter().zip(uv) {
             let q = r.quantize(u[v]);

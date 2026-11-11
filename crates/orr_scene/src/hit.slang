@@ -485,12 +485,9 @@ public void skinned_corners(SkinnedGpu k, MeshGpu* mesh, uint8_t* page, Cluster 
     for (uint j = 0; j < 3; j++)
     {
         t.position[j] = p[v[j]];
-        t.attributes[j].normal = oct_decode_unorm16(k.normals[v[j]]);
+        t.attributes[j].normal = oct_decode_snorm16(k.normals[v[j]]);
         if ((mesh.attributes & MESH_TANGENT) != 0)
-        {
-            uint w = k.tangents[v[j]];
-            t.attributes[j].tangent = float4(oct_decode_unorm16(w), (w & (1u << 16)) != 0 ? -1.0 : 1.0);
-        }
+            t.attributes[j].tangent = oct_decode_tangent(k.tangents[v[j]]);
     }
 }
 

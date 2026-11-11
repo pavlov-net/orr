@@ -256,11 +256,11 @@ void skin(uint group: SV_GroupID, uint t: SV_GroupThreadID)
         k.positions[base + i] = q;
         float3 x_was = before != data ? load_position(before, was_header, was, i, mesh.position_step) : x;
         k.previous[base + i] = clamp(transform_point(blend(palette, k, a, true), x_was), was_lo, was_hi);
-        k.normals[base + i] = oct_encode_unorm16(transform_normal(m, a.normal));
+        k.normals[base + i] = oct_encode_snorm16(transform_normal(m, a.normal));
         if (tangents)
         {
             float3 tt = safe_normalize(transform_vector(m, a.tangent.xyz), float3(1, 0, 0));
-            k.tangents[base + i] = (oct_encode_unorm16(tt) & ~(1u << 16)) | (a.tangent.w < 0.0 ? 1u << 16 : 0);
+            k.tangents[base + i] = oct_encode_tangent(tt, a.tangent.w);
         }
         for (uint j = 0; j < 3; j++)
         {

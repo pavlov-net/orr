@@ -32,7 +32,7 @@ void main(uint3 id: SV_DispatchThreadID)
         + transform_normal(m, b) + affine_translation(m) + mul(linear_inverse(affine_linear(m)), n)
         + max_component(n) + float(max_component(uint3(id))) + largest_scale(affine_linear(m));
 
-    float3 packed = oct_decode_unorm16(oct_encode_unorm16(n)) + oct_decode_snorm16(oct_encode_snorm16(n))
+    float3 packed = oct_decode_tangent(oct_encode_tangent(n, u.x - 0.5)).xyz + oct_decode_snorm16(oct_encode_snorm16(n))
         + oct_decode_snorm8(oct_encode_snorm8(n)) + unpack_rgb9e5(pack_rgb9e5(n))
         + float3(unpack_unorm2x16(id.x), 0.0) + float3(unpack_snorm2x16(pack_snorm2x16(u)), 0.0)
         + float3(unpack_half2x16(pack_half2x16(u)), 0.0) + unpack_unorm4x8(pack_unorm4x8(u4)).xyz

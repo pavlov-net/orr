@@ -373,8 +373,8 @@ public struct SkinnedGpu
 {
     public float3* positions;      // per vertex: skinned by this frame's palette, mesh space
     public float3* previous;       // per vertex: skinned by last frame's palette
-    public uint* normals;          // per vertex: unit normal, oct 2x16 unorm
-    public uint* tangents;         // per vertex: unit tangent, oct 2x16 unorm with the bitangent sign in bit 16
+    public uint* normals;          // per vertex: unit normal, oct_encode_snorm16
+    public uint* tangents;         // per vertex: unit tangent and bitangent sign, oct_encode_tangent
     public float* boxes;           // per mesh cluster: min xyz, max xyz of its skinned vertices
     public uint slot;
     public uint palette_group;
