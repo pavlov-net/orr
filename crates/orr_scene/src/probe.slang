@@ -68,7 +68,7 @@ public struct ProbeGpu
     public uint flags;              // PROBE_*
     public uint visible;            // the visible cluster index
     public uint triangle;
-    public uint copy;               // VisibleCluster.instance: slot, COPY_FAR on a far step
+    public uint copy;               // the slot of VisibleCluster.instance, COPY_FAR on a far step; a producer's entry
     public uint64_t word;           // the visibility buffer word
     public uint cluster;            // mesh cluster index, or a producer's cluster
     public uint local;
@@ -453,7 +453,11 @@ void probe(uint3 id: SV_DispatchThreadID)
     o.section_material = vc.material;
     uint entry;
     if (visible_producer(s, vc, entry))
+    {
+        // Its entry, not its index past `producer_base`, which moves as the PTLAS grows.
         o.flags |= PROBE_PRODUCER;
+        o.copy = entry;
+    }
     else
     {
         o.slot_visibility = r.slot_visibility[copy_slot(vc.instance)];
