@@ -43,10 +43,6 @@ public struct VolumeGpu
     public uint _pad2;
     public uint3 majorant_cells;   // per axis
     public uint _pad3;
-    public float3 bounds_min;      // every sample outside reads the background
-    public uint _pad4;
-    public float3 bounds_max;
-    public uint _pad5;
     public VolumeGridGpu* grids;
 }
 

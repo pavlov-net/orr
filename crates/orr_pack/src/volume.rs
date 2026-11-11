@@ -123,10 +123,6 @@ pub struct VolumeGpu {
     pub _pad2: u32,
     pub majorant_cells: [u32; 3],
     pub _pad3: u32,
-    pub bounds_min: [f32; 3],
-    pub _pad4: u32,
-    pub bounds_max: [f32; 3],
-    pub _pad5: u32,
     /// Address of `grid_count` [`VolumeGridGpu`] records.
     pub grids: u64,
 }
@@ -476,8 +472,6 @@ impl VolumeInfo {
             brick_min: h.brick_min,
             bricks: h.bricks,
             majorant_cells: h.majorant_cells,
-            bounds_min: h.bounds.min,
-            bounds_max: h.bounds.max,
             grids: base + layout.grids,
             ..Zeroable::zeroed()
         };
@@ -604,6 +598,6 @@ const _: () = {
     assert!(size_of::<VolumeHeader>() == 112);
     assert!(size_of::<VolumeGrid>() == 56);
     assert!(size_of::<VolumeBrick>() == 8);
-    assert!(size_of::<VolumeGpu>() == 120);
+    assert!(size_of::<VolumeGpu>() == 88);
     assert!(size_of::<VolumeGridGpu>() == 40);
 };
