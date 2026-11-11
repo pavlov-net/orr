@@ -23,6 +23,9 @@ public static const uint PROBE_FROM_GROUP = 64; // the cluster was simplified fr
 public static const uint PROBE_FADING = 128;   // the copy fades between chain steps
 public static const uint PROBE_MERGED_STAGE = 256;  // the mesh has a merged stage
 public static const uint PROBE_MERGED_RASTER = 512; // the raster cut takes it: `merged_cuts`
+public static const uint PROBE_RT_MERGED_STAGE = 1024; // the mesh of the slot's nearer step has a merged stage
+public static const uint PROBE_RT_LEVELS = 2048;  // the mesh of the slot's nearer step has discrete levels
+public static const uint PROBE_HELD_STEP_GONE = 4096; // its PTLAS instance holds a step the chain no longer has
 
 // `ProbeGpu.lists`: the raster lists holding the visible cluster, first pass in the low bits
 // and second pass shifted by PROBE_LIST_SECOND.
@@ -121,9 +124,24 @@ public struct ProbeGpu
     public float held_cut_error;    // the cut the PTLAS instance holds
     public uint64_t rt_cut_blas;
     public float merge_error;       // m, mesh space
-    public float model_pixels;      // px: the model's bounding radius at the focus
+    public float model_pixels;      // px: the nearer step's model's bounding radius at the focus
     public float merge_pixels;      // px: below it a copy traces its model's merged cut
     public float gather_scale;
+    // The ray-tracing fields from `cut` on describe the slot's nearer step, as the traversal
+    // does, and the far ones its farther step while it fades.
+    public uint rt_step;            // the nearer chain step
+    public uint rt_model;           // its model
+    public uint held_step;          // the step its PTLAS instance holds
+    public uint held_cut_count;     // the cached cuts of that step's mesh
+    public uint far_step;
+    public uint far_model;
+    public uint far_cut_count;
+    public uint far_held_cut;       // the cut its far part instance holds
+    public uint64_t far_cut_blas;
+    public float far_cut_error;     // m, mesh space: this frame's far cut's
+    public float far_cut_pixels;    // px at the focus
+    public float far_held_error;
+    public float far_distance;      // m from the focus to the far model's bounds
     // The G-buffer.
     public uint4 a;
     public uint4 x;
@@ -256,8 +274,9 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
     if (has_focus())
         o.flags |= PROBE_FOCUS;
     Placement p = (Placement)0;
-    if (placement(g, false, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), placed)
-        && cluster_placement(s, vc.instance, inst, cl, placed, false, p))
+    // Every chain step of a copy takes its transform.
+    bool at_focus = placement(g, false, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), placed);
+    if (at_focus && cluster_placement(s, vc.instance, inst, cl, placed, false, p))
     {
         o.flags |= PROBE_PLACED;
         o.placement_scale = p.scale;
@@ -267,8 +286,6 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
         o.merged_pixels = focus_error(placed, sphere, mesh.merge_error * o.debug_scale);
         if (staged && o.debug_level < 0 && o.merged_pixels <= o.raster_threshold)
             o.flags |= PROBE_MERGED_RASTER;
-        float distance = max(length(place(placed, sphere.xyz)) - sphere.w * placed.scale, FOCUS_NEAR);
-        o.model_pixels = has_focus() ? sphere.w * placed.scale * root.focus_offset.w / distance : asfloat(0x7f800000u);
     }
 
     CutGpu* cut = s.cut;
@@ -293,25 +310,76 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
     o.admitted = cut.counters[CUT_ADMITTED];
     o.nodes_dropped = cut.counters[CUT_NODES_DROPPED];
 
-    // The ray-tracing side: this frame's choice and what the slot's PTLAS instance holds.
+    // The ray-tracing side: this frame's choice for the slot's nearer step and what its PTLAS
+    // instance holds, and while it fades its farther step's.
+    InstanceGpu base = o.instance;
+    uint near = chain_near(st);
+    InstanceGpu rt = step_record(s, base, near);
+    ModelGpu* rt_model = s.models + rt.model;
+    MeshGpu* rt_mesh = s.meshes + rt_model.mesh;
+    o.rt_step = near;
+    o.rt_model = rt.model;
+    if (mesh_has_merged_stage(rt_mesh))
+        o.flags |= PROBE_RT_MERGED_STAGE;
+    if (rt_mesh.level_count > 0)
+        o.flags |= PROBE_RT_LEVELS;
     o.cut = cut.slots[slot];
     o.built_error = asfloat(cut.slots[o.cut.owner].rt_error);
-    o.model_cut = cut.model_cut[inst.model];
-    o.rt_cut_count = mesh.rt_cut_count;
-    o.fine_cuts = mesh.fine_cuts;
-    if (mesh.rt_cut_count > 0)
+    o.model_cut = cut.model_cut[rt.model];
+    o.rt_cut_count = rt_mesh.rt_cut_count;
+    o.fine_cuts = rt_mesh.fine_cuts;
+    o.model_pixels = asfloat(0x7f800000u);
+    if (at_focus && has_focus())
     {
-        uint k = o.cut.rt_cut;
-        if (k != RT_CUT_BUILT)
+        float4 sphere = model_sphere(rt_model);
+        float distance = max(length(place(placed, sphere.xyz)) - sphere.w * placed.scale, FOCUS_NEAR);
+        o.model_pixels = sphere.w * placed.scale * root.focus_offset.w / distance;
+    }
+    if (rt_mesh.rt_cut_count > 0 && o.cut.rt_cut != RT_CUT_BUILT)
+    {
+        RtCutGpu c = rt_mesh.rt_cuts[o.cut.rt_cut];
+        o.rt_cut_error = c.error;
+        o.rt_cut_blas = c.blas;
+        if (has_focus())
+            o.rt_cut_pixels = c.error * o.cut.rt_scale / max(o.cut.rt_distance, 1e-3) * root.focus_offset.w;
+    }
+    // An instance whose update waits (`rt_age`) can hold a step its chain has since lost, whose
+    // `chain` entry is cleared, or a cut of the model the chain had at that step before, past
+    // the cuts of the mesh it has now.
+    o.held_step = (st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK;
+    if (o.held_step > s.models[base.model].chain_count)
+        o.flags |= PROBE_HELD_STEP_GONE;
+    else
+    {
+        MeshGpu* held_mesh = s.meshes + s.models[step_record(s, base, o.held_step).model].mesh;
+        o.held_cut_count = held_mesh.rt_cut_count;
+        if (st.rt_lod != RT_CUT_BUILT && st.rt_lod < held_mesh.rt_cut_count)
+            o.held_cut_error = held_mesh.rt_cuts[st.rt_lod].error;
+    }
+    if (st.fade != 0)
+    {
+        o.far_step = chain_far(st);
+        InstanceGpu far = step_record(s, base, o.far_step);
+        ModelGpu* far_model = s.models + far.model;
+        MeshGpu* far_mesh = s.meshes + far_model.mesh;
+        o.far_model = far.model;
+        o.far_cut_count = far_mesh.rt_cut_count;
+        o.far_held_cut = (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff;
+        if (at_focus && has_focus())
         {
-            RtCutGpu c = mesh.rt_cuts[min(k, mesh.rt_cut_count - 1)];
-            o.rt_cut_error = c.error;
-            o.rt_cut_blas = c.blas;
-            if (has_focus())
-                o.rt_cut_pixels = c.error * o.cut.rt_scale / max(o.cut.rt_distance, 1e-3) * root.focus_offset.w;
+            float4 sphere = model_sphere(far_model);
+            o.far_distance = max(length(place(placed, sphere.xyz)) - sphere.w * placed.scale, 0.0);
         }
-        if (st.rt_lod != RT_CUT_BUILT)
-            o.held_cut_error = mesh.rt_cuts[min(uint(st.rt_lod), mesh.rt_cut_count - 1)].error;
+        if (far_mesh.rt_cut_count > 0)
+        {
+            RtCutGpu c = far_mesh.rt_cuts[o.cut.far_cut];
+            o.far_cut_error = c.error;
+            o.far_cut_blas = c.blas;
+            if (has_focus())
+                o.far_cut_pixels = c.error * o.cut.rt_scale / max(o.far_distance, 1e-3) * root.focus_offset.w;
+            if (o.far_held_cut < far_mesh.rt_cut_count)
+                o.far_held_error = far_mesh.rt_cuts[o.far_held_cut].error;
+        }
     }
 }
 

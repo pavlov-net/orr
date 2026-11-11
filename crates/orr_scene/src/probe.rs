@@ -26,6 +26,9 @@ const FROM_GROUP: u32 = 64;
 const FADING: u32 = 128;
 const MERGED_STAGE: u32 = 256;
 const MERGED_RASTER: u32 = 512;
+const RT_MERGED_STAGE: u32 = 1024;
+const RT_LEVELS: u32 = 2048;
+const HELD_STEP_GONE: u32 = 4096;
 const LIST_OPAQUE: u32 = 1;
 const LIST_ALPHA: u32 = 2;
 const LIST_SOFTWARE: u32 = 4;
@@ -248,6 +251,10 @@ pub struct PixelProbe {
     pub mount: Option<MountId>,
     pub model_name: Option<String>,
     pub mesh_name: Option<String>,
+    /// The pack name of the model of the slot's nearer chain step, which ray tracing traces.
+    pub rt_model_name: Option<String>,
+    /// While the slot fades, the pack name of the model of its farther chain step.
+    pub far_model_name: Option<String>,
     pub section_material_name: Option<String>,
     pub material_name: Option<String>,
     /// The DAG group holding the cluster and its index, and the group it was simplified from.
@@ -301,6 +308,8 @@ pub(crate) fn resolve(p: &PendingProbe, mounts: &Mounts, read_at: u64) -> PixelP
         mount: None,
         model_name: None,
         mesh_name: None,
+        rt_model_name: None,
+        far_model_name: None,
         section_material_name: None,
         material_name: None,
         group: None,
@@ -331,6 +340,15 @@ pub(crate) fn resolve(p: &PendingProbe, mounts: &Mounts, read_at: u64) -> PixelP
         .collect();
     if gpu.flags & PRODUCER != 0 {
         return out;
+    }
+    let model_name = |id: u32| {
+        mounts
+            .probe_model(crate::scene::ModelId(id))
+            .and_then(|m| m.model_name)
+    };
+    out.rt_model_name = model_name(gpu.rt_model);
+    if gpu.state.fade != 0 {
+        out.far_model_name = model_name(gpu.far_model);
     }
     let Some(m) = mounts.probe_model(crate::scene::ModelId(gpu.model)) else {
         return out;
@@ -818,14 +836,29 @@ impl PixelProbe {
         let c = &g.cut;
         let st = &g.state;
         let inst = &g.instance;
-        if inst.flags & INSTANCE_RAY as u8 == 0 || g.rt_cut_count == 0 {
+        let shown = if g.copy & COPY_FAR != 0 {
+            "the far step the pixel shows"
+        } else {
+            "the step the pixel shows"
+        };
+        let near = if st.fade == 0 {
+            format!("chain step {}, {shown}", g.rt_step)
+        } else if g.copy & COPY_FAR != 0 {
+            format!("the near chain step {}", g.rt_step)
+        } else {
+            format!("the near chain step {}, {shown}", g.rt_step)
+        };
+        let near = format!("{near}, model {}", named(g.rt_model, &self.rt_model_name));
+        // A skinned copy traces the BLAS its skinning builds, with or without cached cuts.
+        let skinned = inst.flags & INSTANCE_SKINNED as u8 != 0;
+        if inst.flags & INSTANCE_RAY as u8 == 0 || (!skinned && g.rt_cut_count == 0) {
             return writeln!(
                 f,
-                "ray tracing: the copy is not traced ({})",
-                if g.rt_cut_count == 0 {
-                    "its mesh has no cached cuts"
-                } else {
+                "ray tracing ({near}): the copy is not traced ({})",
+                if inst.flags & INSTANCE_RAY as u8 == 0 {
                     "no INSTANCE_RAY"
+                } else {
+                    "its mesh has no cached cuts"
                 }
             );
         }
@@ -836,7 +869,9 @@ impl PixelProbe {
                 } else {
                     1.0
                 };
-        let kind = if !in_range {
+        let kind = if skinned {
+            "the BLAS its skinning built this frame, if its skinning took it in range".to_owned()
+        } else if !in_range {
             format!(
                 "out of its rt range ({:.1} m from the focus, range {:.1} m)",
                 c.rt_distance,
@@ -848,7 +883,7 @@ impl PixelProbe {
             } else {
                 ""
             };
-            let stage = if g.flags & MERGED_STAGE == 0 {
+            let stage = if g.flags & RT_MERGED_STAGE == 0 {
                 ""
             } else if c.flags & CUT_STAGE_MERGED != 0 {
                 " of the merged stage"
@@ -896,16 +931,25 @@ impl PixelProbe {
         } else if c.flags & CUT_TRAVERSED == 0 && c.rt_count > 0 {
             format!("cached cut {}, which equals the cut it gathered", c.rt_cut)
         } else {
-            let why = if st.rt_flags & RT_ANIMATED != 0 {
-                "it takes its pose"
-            } else if g.step > 0 {
-                "a chain step past the first"
+            let why = if g.flags & RT_LEVELS != 0 {
+                if g.debug_level >= 0 {
+                    format!(
+                        "its mesh's discrete levels, held at debug level {}",
+                        g.debug_level
+                    )
+                } else {
+                    "its mesh's discrete levels".to_owned()
+                }
+            } else if st.rt_flags & RT_ANIMATED != 0 {
+                "it takes its pose".to_owned()
+            } else if g.rt_step > 0 {
+                "a chain step past the first".to_owned()
             } else {
-                "its mesh's emissive or caster sections need cached cuts"
+                "its mesh's emissive or caster sections need cached cuts".to_owned()
             };
             format!("cached cut {} ({why})", c.rt_cut)
         };
-        writeln!(f, "ray tracing: traces {kind}")?;
+        writeln!(f, "ray tracing ({near}): traces {kind}")?;
         writeln!(
             f,
             "  thresholds: cached {:.3} px{}, gathered {:.3} px (x{:.4}); {:.1} m from the focus, scale {:.4}",
@@ -920,11 +964,11 @@ impl PixelProbe {
             c.rt_distance,
             c.rt_scale
         )?;
-        if c.rt_cut != RT_CUT_BUILT {
+        if !skinned && in_range && c.rt_cut != RT_CUT_BUILT {
             writeln!(
                 f,
                 "  cut {}: error {:.6} m = {:.3} px at the focus, BLAS {:#x}{}",
-                c.rt_cut.min(g.rt_cut_count - 1),
+                c.rt_cut,
                 g.rt_cut_error,
                 g.rt_cut_pixels,
                 g.rt_cut_blas,
@@ -935,13 +979,33 @@ impl PixelProbe {
                 }
             )?;
         }
+        let held_step = if g.held_step == g.rt_step {
+            String::new()
+        } else {
+            format!(" of chain step {}", g.held_step)
+        };
         let held = if st.rt_flags & RT_WRITTEN == 0 {
             "nothing (not written)".to_owned()
+        } else if g.flags & HELD_STEP_GONE != 0 {
+            let cut = if u32::from(st.rt_lod) == RT_CUT_BUILT {
+                "a BLAS built that frame".to_owned()
+            } else {
+                format!("cut {}", st.rt_lod)
+            };
+            format!(
+                "{cut} of chain step {}, a step its model's chain no longer has (BLAS {:#x})",
+                g.held_step, st.rt_blas
+            )
         } else if u32::from(st.rt_lod) == RT_CUT_BUILT {
-            format!("a BLAS built that frame ({:#x})", st.rt_blas)
+            format!("a BLAS{held_step} built that frame ({:#x})", st.rt_blas)
+        } else if u32::from(st.rt_lod) >= g.held_cut_count {
+            format!(
+                "cut {}{held_step}, past the {} cuts its mesh has now (BLAS {:#x})",
+                st.rt_lod, g.held_cut_count, st.rt_blas
+            )
         } else {
             format!(
-                "cut {} (error {:.6} m, BLAS {:#x})",
+                "cut {}{held_step} (error {:.6} m, BLAS {:#x})",
                 st.rt_lod, g.held_cut_error, st.rt_blas
             )
         };
@@ -953,7 +1017,50 @@ impl PixelProbe {
             } else {
                 String::new()
             }
-        )
+        )?;
+        if st.fade == 0 {
+            return Ok(());
+        }
+        let far = format!(
+            "  fading to or from the far chain step {}{}, model {}",
+            g.far_step,
+            if g.copy & COPY_FAR != 0 {
+                ", the step the pixel shows"
+            } else {
+                ""
+            },
+            named(g.far_model, &self.far_model_name)
+        );
+        if g.far_cut_count == 0 {
+            return writeln!(f, "{far}: its mesh has no cached cuts");
+        }
+        if in_range {
+            writeln!(
+                f,
+                "{far}: cut {}, error {:.6} m = {:.3} px at {:.1} m from the focus, BLAS {:#x}",
+                c.far_cut, g.far_cut_error, g.far_cut_pixels, g.far_distance, g.far_cut_blas
+            )?;
+        } else {
+            writeln!(f, "{far}: not traced, as the copy is out of its rt range")?;
+        }
+        let far_held = if st.far_part == 0 {
+            "no part instance".to_owned()
+        } else if g.far_held_cut >= g.far_cut_count {
+            format!(
+                "part instance {} holding cut {}, past the {} cuts its mesh has now",
+                st.far_part - 1,
+                g.far_held_cut,
+                g.far_cut_count
+            )
+        } else {
+            format!(
+                "part instance {} holding cut {} (error {:.6} m)",
+                st.far_part - 1,
+                g.far_held_cut,
+                g.far_held_error
+            )
+        };
+        writeln!(f, "  the far step traces through {far_held}")
     }
 
     fn fmt_gbuffer(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
