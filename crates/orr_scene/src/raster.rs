@@ -43,7 +43,7 @@ const DRAW_COVERAGE: u32 = 2;
 const DRAW_PARTICLES: u32 = 3;
 const DRAW_LISTS: u32 = 4;
 /// Workgroups per row of a workgroup grid (`GRID_X` in `visibility.slang`).
-const GRID_X: u32 = 65535;
+pub(crate) const GRID_X: u32 = 65535;
 const MAX_HZB_MIPS: u32 = 16;
 /// Pixels per side of a resolve tile and of a layer tile (`LAYER_TILE` in `gbuffer.slang`).
 const TILE: u32 = 8;

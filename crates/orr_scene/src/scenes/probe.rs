@@ -4,13 +4,11 @@ use orr_gpu::{Hazards, MemoryKind, ShaderStage, SpecData, Stages};
 
 use super::{Core, Frame, PoolBytes, Scenes};
 use crate::probe::{self, PendingProbe, PixelProbe, ProbeContext, ProbeSettings, ProbeView};
+use crate::raster::GRID_X;
 use crate::shaders::probe::{MODULE, ProbeGpu, ProbeRoot};
 use crate::view::{RasterView, ViewHistoryId};
 use crate::world::WorldPos;
 use crate::{DetailStats, Error, Result};
-
-/// Workgroups per row of a workgroup grid (`GRID_X` in `visibility.slang`).
-const GRID_X: u32 = 65535;
 
 impl Core {
     /// The probe's two pipelines, made at the first probe.
