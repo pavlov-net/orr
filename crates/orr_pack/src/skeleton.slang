@@ -115,20 +115,21 @@ float3x4 load_affine(float* f)
     return float3x4(float4(f[0], f[1], f[2], f[3]), float4(f[4], f[5], f[6], f[7]), float4(f[8], f[9], f[10], f[11]));
 }
 
-// Model space to joint `j`'s bind space.
+// Skeleton space to joint `j`'s bind space.
 public float3x4 skeleton_inverse_bind(Skeleton k, uint j)
 {
     return load_affine((float*)(k.blob + table_at(k, 2)) + 12 * j);
 }
 
-// Model space from the space of the root joints: `SkeletonHeader.root`, after its table spans.
+// Skeleton space from the space of the root joints: `SkeletonHeader.root`, after its table
+// spans.
 public float3x4 skeleton_root(Skeleton k)
 {
     return load_affine((float*)(k.blob + 48));
 }
 
-// The skinning matrix (palette entry) of joint `j` from its model-space transform:
-// `model x inverse_bind`. A joint's model-space transform is its parent's times its local one
+// The skinning matrix (palette entry) of joint `j` from its skeleton-space transform:
+// `model x inverse_bind`. A joint's skeleton-space transform is its parent's times its local one
 // (`affine_mul(parent, trs_affine(local))`), a root's parent being `skeleton_root`.
 public float3x4 skeleton_palette(Skeleton k, uint j, float3x4 model)
 {
