@@ -179,18 +179,88 @@ public float projected_error(ViewConstants* v, float3 center, float radius, floa
     return error / d * pixels_per_radian(v);
 }
 
+// The `exact_` functions do arithmetic that two kernels, or two sites of one, must round
+// alike: each operation is a scalar instruction in a `precise` variable's own initializer,
+// which marks it as one a driver may not contract with another. The mark reaches neither the
+// arguments of a call nor `mul`, `dot` and `length`, which are one instruction each.
+
+// `place(p, x)`.
+public float3 exact_place(Placement p, float3 x)
+{
+    float3x3 l = p.linear;
+    float3 t = p.translation;
+    precise float a = l[0].x * x.x + l[0].y * x.y + l[0].z * x.z + t.x;
+    precise float b = l[1].x * x.x + l[1].y * x.y + l[1].z * x.z + t.y;
+    precise float c = l[2].x * x.x + l[2].y * x.y + l[2].z * x.z + t.z;
+    return float3(a, b, c);
+}
+
+// `mul(m, float4(x, 0.0))`: `view_from_relative` by `m`.
+public float3 exact_rotate(float3x4 m, float3 x)
+{
+    precise float a = m[0].x * x.x + m[0].y * x.y + m[0].z * x.z;
+    precise float b = m[1].x * x.x + m[1].y * x.y + m[1].z * x.z;
+    precise float c = m[2].x * x.x + m[2].y * x.y + m[2].z * x.z;
+    return float3(a, b, c);
+}
+
+// `placed_after(p, m)`.
+public Placement exact_placed_after(Placement p, float3x4 m)
+{
+    float3x4 l = affine(p.linear, float3(0.0));
+    float3 a = exact_rotate(l, float3(m[0].x, m[1].x, m[2].x));
+    float3 b = exact_rotate(l, float3(m[0].y, m[1].y, m[2].y));
+    float3 c = exact_rotate(l, float3(m[0].z, m[1].z, m[2].z));
+    Placement o;
+    o.linear = float3x3(float3(a.x, b.x, c.x), float3(a.y, b.y, c.y), float3(a.z, b.z, c.z));
+    o.translation = exact_place(p, affine_translation(m));
+    o.scale = largest_scale(o.linear);
+    return o;
+}
+
+// `mul(m, float4(x, 1.0))`.
+public float4 exact_project(float4x4 m, float3 x)
+{
+    precise float a = m[0].x * x.x + m[0].y * x.y + m[0].z * x.z + m[0].w;
+    precise float b = m[1].x * x.x + m[1].y * x.y + m[1].z * x.z + m[1].w;
+    precise float c = m[2].x * x.x + m[2].y * x.y + m[2].z * x.z + m[2].w;
+    precise float d = m[3].x * x.x + m[3].y * x.y + m[3].z * x.z + m[3].w;
+    return float4(a, b, c, d);
+}
+
+// `length(x)`.
+public float exact_length(float3 x)
+{
+    precise float q = x.x * x.x + x.y * x.y + x.z * x.z;
+    return sqrt(q);
+}
+
+// `pixel_from_clip(v, clip)`.
+public float2 exact_pixel(ViewConstants* v, float4 clip)
+{
+    precise float2 ndc = clip.xy / clip.w;
+    precise float2 unit = ndc * 0.5 + 0.5;
+    precise float2 xy = unit * float2(v.extent);
+    return xy;
+}
+
 // False when the sphere at eye-relative `center` lies wholly outside the view frustum.
 public bool sphere_visible(ViewConstants* v, float3 center, float radius)
 {
-    precise float3 c = view_from_relative(v, center);
+    float3 c = exact_rotate(v.view_from_world_rotation, center);
     float4x4 m = v.clip_from_view_jittered;
-    float4 p = float4(c, 1.0);
-    float4 planes[5] = { m[3] + m[0], m[3] - m[0], m[3] + m[1], m[3] - m[1], m[3] - m[2] };
+    precise float4 left = m[3] + m[0];
+    precise float4 right = m[3] - m[0];
+    precise float4 bottom = m[3] + m[1];
+    precise float4 top = m[3] - m[1];
+    precise float4 far = m[3] - m[2];
+    float4 planes[5] = { left, right, bottom, top, far };
     for (uint i = 0; i < 5; i++)
     {
-        precise float l = length(planes[i].xyz);
-        precise float d = dot(planes[i], p);
-        if (d < -radius * l)
+        float4 q = planes[i];
+        precise float d = q.x * c.x + q.y * c.y + q.z * c.z + q.w;
+        precise float reach = -radius * exact_length(q.xyz);
+        if (d < reach)
             return false;
     }
     return true;
@@ -202,9 +272,10 @@ public bool near_eye(ViewConstants* v, float3 center, float radius)
 {
     float4x4 m = v.clip_from_view;
     float near = m[2][3];
-    precise float corner = near * sqrt(1.0 + 1.0 / (m[0][0] * m[0][0]) + 1.0 / (m[1][1] * m[1][1]));
-    precise float gap = length(center) - radius;
-    return gap < 1.01 * corner;
+    precise float corner2 = 1.0 + 1.0 / (m[0][0] * m[0][0]) + 1.0 / (m[1][1] * m[1][1]);
+    precise float limit = 1.01 * near * sqrt(corner2);
+    precise float gap = exact_length(center) - radius;
+    return gap < limit;
 }
 
 // A view's last render of a scene, for kernels outside its raster that test what it saw: its
@@ -220,8 +291,8 @@ public struct SeenView
 // lies outside the frustum or, with `r` holding the render's HZB, its box lies behind the depth
 // the render drew. A sphere holding dielectric or presence clusters (`layer`) is seen wherever
 // it reaches between the eye and the near plane, as the culling's frustum test takes it. The
-// tests are precise and grow with the sphere, so a sphere inside another is unseen wherever
-// the other is.
+// tests grow with the sphere, so a sphere inside another is unseen wherever the other is, and
+// their arithmetic is exact (`exact_place`), so every site that tests a sphere finds the same.
 public bool sphere_unseen(ViewConstants* v, RasterGpu* r, bool layer, float3 center, float radius)
 {
     if (layer && near_eye(v, center, radius))
@@ -292,26 +363,30 @@ public bool box_occluded(ViewConstants* v, RasterGpu* r, Placement p, float3 lo,
     for (uint i = 0; i < 8; i++)
     {
         float3 corner = float3((i & 1) != 0 ? hi.x : lo.x, (i & 2) != 0 ? hi.y : lo.y, (i & 4) != 0 ? hi.z : lo.z);
-        precise float3 x = place(p, corner);
-        precise float3 view = previous ? mul(v.prev_view_from_world_rotation, float4(x + v.eye_motion.xyz, 0.0)) : view_from_relative(v, x);
-        precise float4 clip = mul(previous ? v.prev_clip_from_view : v.clip_from_view_jittered, float4(view, 1.0));
+        float3 x = exact_place(p, corner);
+        precise float3 moved = x + v.eye_motion.xyz;
+        float3 view = exact_rotate(previous ? v.prev_view_from_world_rotation : v.view_from_world_rotation, previous ? moved : x);
+        float4 clip = exact_project(previous ? v.prev_clip_from_view : v.clip_from_view_jittered, view);
         if (!(clip.w > 0.0 && clip.z < clip.w))
             return false;
-        precise float2 xy = pixel_from_clip(v, clip);
+        float2 xy = exact_pixel(v, clip);
         rect_min = min(rect_min, xy);
         rect_max = max(rect_max, xy);
         precise float depth = clip.z / clip.w;
         nearest = max(nearest, depth);
     }
     // A pixel more on each side covers the jitter between the frames.
-    float2 extent = float2(r.gbuffer.extent);
-    rect_min = max(rect_min - 1.0, 0.0);
-    rect_max = min(rect_max + 1.0, extent - 1.0);
+    precise float2 before = rect_min - 1.0;
+    precise float2 after = rect_max + 1.0;
+    precise float2 last = float2(r.gbuffer.extent) - 1.0;
+    rect_min = max(before, 0.0);
+    rect_max = min(after, last);
     if (any(rect_min > rect_max))
         return false;
     // A mip whose texels are half the rect's longer side: at most 3 x 3 texels cover it.
     precise float2 size = rect_max - rect_min;
-    uint mip = min(uint(max(ceil(log2(max(max(size.x, size.y), 1.0))) - 1.0, 0.0)), r.hzb_mips - 1);
+    precise float level = ceil(log2(max(max(size.x, size.y), 1.0))) - 1.0;
+    uint mip = min(uint(max(level, 0.0)), r.hzb_mips - 1);
     uint2 top = max(r.gbuffer.extent >> mip, 1) - 1;
     uint2 a = min(uint2(rect_min) >> mip, top);
     uint2 b = min(uint2(rect_max) >> mip, top);

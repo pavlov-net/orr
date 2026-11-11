@@ -12,6 +12,7 @@ public static const uint CUT_DISTANT = 4;       // it traces its model's merged 
 public static const uint CUT_OWNER = 8;         // it builds the BLAS its equal cuts share
 public static const uint CUT_PARTS = 16;        // its gathered cut builds a body BLAS and one per animated part
 public static const uint CUT_FELL_BACK = 32;    // it gathered a cut and traces its cached cut instead
+public static const uint CUT_STAGE_MERGED = 64; // its gathered cut walks its mesh's merged stage
 
 // `SlotCutGpu.rt_key` of a slot whose cut has no entry in the table of equal cuts.
 public static const uint NO_KEY = 0xffffffff;

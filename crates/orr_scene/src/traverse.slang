@@ -7,7 +7,11 @@
 // exceeds a cut's threshold, a leaf applies the cluster rule to its group's clusters and
 // writes raster candidate items and ray-tracing cut clusters. A group's own sphere, at its
 // leaf and in the cluster rule, takes the hidden threshold where no view's last render saw
-// it (`sphere_hidden`); merged spheres of several groups take the visible one. While the mesh
+// it (`sphere_hidden`); merged spheres of several groups take the visible one. A group's
+// sphere is tested where its leaf is entered and where the clusters simplified from it are
+// decided, and a cut is whole only if both find the same: the kernel holds one site of that
+// test, of `precise` arithmetic, and a leaf's clusters take the entry's answer for their own
+// group from the cuts their item names. While the mesh
 // page of a group is not resident, the clusters simplified from it stand in for its clusters
 // even where their own error is over the threshold, and the page is requested: only what the
 // page holds stays
@@ -83,10 +87,12 @@ public struct TraverseRoot
 ORR_ROOT(TraverseRoot);
 
 // `NodeItem.flags` past the cuts' bits: a merged stage, and of a leaf whether the parent's
-// pass tested its group's sphere and found it hidden.
+// pass tested its group's sphere and found it hidden, and whether its group's error projects
+// to infinity.
 static const uint ITEM_MERGED = 0x10000;
 static const uint ITEM_TESTED = 0x20000;
 static const uint ITEM_HIDDEN = 0x40000;
+static const uint ITEM_FIXED = 0x80000;
 
 bool has_focus()
 {
@@ -94,14 +100,16 @@ bool has_focus()
 }
 
 // `error` (m, mesh space) over `sphere` placed by `p`, in pixels at the focus. Without a
-// focus every error above 0 projects to infinity.
+// focus every error above 0 projects to infinity. The arithmetic is exact (`exact_place`).
 float focus_error(Placement p, float4 sphere, float error)
 {
     if (!has_focus())
         return error > 0.0 ? asfloat(0x7f800000u) : 0.0;
-    float3 c = place(p, sphere.xyz);
-    float d = max(length(c) - sphere.w * p.scale, FOCUS_NEAR);
-    return error * p.scale / d * root.focus_offset.w;
+    float3 c = exact_place(p, sphere.xyz);
+    precise float gap = exact_length(c) - sphere.w * p.scale;
+    float d = max(gap, FOCUS_NEAR);
+    precise float e = error * p.scale / d * root.focus_offset.w;
+    return e;
 }
 
 bool filling()
@@ -152,17 +160,19 @@ bool edit_pins(MeshGpu* mesh, float4 sphere)
     for (uint i = 0; i < e.sphere_count; i++)
     {
         float4 t = e.spheres[i];
-        float3 d = sphere.xyz - t.xyz;
-        float r = sphere.w + t.w;
-        if (dot(d, d) <= r * r)
+        precise float3 d = sphere.xyz - t.xyz;
+        precise float apart = d.x * d.x + d.y * d.y + d.z * d.z;
+        precise float r = sphere.w + t.w;
+        precise float reach = r * r;
+        if (apart <= reach)
             return true;
     }
     return false;
 }
 
 // `focus_error`, infinite where an edit pins the sphere so that coarser clusters are never
-// taken there. A cluster's parent test and its parent group's own test read one sphere, so
-// the cut stays watertight around what is pinned.
+// taken there. A group's entry and the clusters simplified from it read one sphere, so the
+// cut stays watertight around what is pinned.
 float cut_error(MeshGpu* mesh, Placement p, float4 sphere, float error)
 {
     if (error > 0.0 && edit_pins(mesh, sphere))
@@ -235,10 +245,9 @@ struct Stage
 // Whether no view saw group sphere `sphere` (mesh space) of stage `st`: the scene has a view,
 // and for every view, the sphere placed as the view's last render placed the copy lies
 // outside that render's frustum or behind its depth (`sphere_unseen`). Unknown is seen: a
-// copy or part with no previous placement, a box reaching the near plane. A pure function of
-// the copy, the part, the sphere and the frame's views, so the two sides of a replacement read
-// one answer; and since a group's sphere holds the spheres of the groups its clusters come
-// from and the test grows with the sphere, a hidden group's finer groups are hidden too.
+// copy or part with no previous placement, a box reaching the near plane. Since a group's
+// sphere holds the spheres of the groups its clusters come from and the test grows with the
+// sphere, a hidden group's finer groups are hidden too.
 bool sphere_hidden(Stage st, float4 sphere)
 {
     if (root.view_count == 0)
@@ -251,7 +260,7 @@ bool sphere_hidden(Stage st, float4 sphere)
         Placement p;
         if (!seen_placement(st.scene, st.copy, st.inst, st.mesh, st.part, st.merged, v, p))
             return false;
-        precise float3 center = place(p, sphere.xyz);
+        float3 center = exact_place(p, sphere.xyz);
         precise float radius = sphere.w * p.scale;
         if (!sphere_unseen(v, views[i].raster, layer, center, radius))
             return false;
@@ -589,10 +598,13 @@ void init(uint3 id: SV_DispatchThreadID)
         c.flags |= CUT_TRAVERSED | (gathers_parts(mesh, inst, st) ? CUT_PARTS : 0);
     if (raster)
         c.flags |= CUT_RASTER;
-    cut.slots[slot] = c;
     uint mask = (raster ? 1 : 0) | (gather ? 2 : 0);
+    uint merged = merged_cuts(mesh, p, sphere, l) & mask;
+    if ((merged & 2) != 0)
+        c.flags |= CUT_STAGE_MERGED;
+    cut.slots[slot] = c;
     if (mask != 0)
-        push_roots(s, cut, slot, mesh, p, sphere, l, mask);
+        push_roots(cut, slot, mesh, mask, merged);
 }
 
 // The clusters of an edit's held groups that copy `inst` of slot `slot` shows: counted into
@@ -625,7 +637,7 @@ void raster_roots(SceneRoot* s, CutGpu* cut, uint copy, MeshGpu* mesh, Placement
 {
     if (mesh.level_count == 0)
     {
-        push_roots(s, cut, copy, mesh, p, sphere, l, 1);
+        push_roots(cut, copy, mesh, 1, merged_cuts(mesh, p, sphere, l));
         return;
     }
     uint level = 0;
@@ -647,20 +659,22 @@ void raster_roots(SceneRoot* s, CutGpu* cut, uint copy, MeshGpu* mesh, Placement
     candidates(cut, mesh, copy, mesh.levels[level].first, mesh.levels[level].first + mesh.levels[level].count);
 }
 
+// The cuts that take the mesh's merged stage: those whose threshold its error stays under at
+// the copy's nearest point. The others take the part stage.
+uint merged_cuts(MeshGpu* mesh, Placement p, float4 sphere, Lod l)
+{
+    if (mesh.root_count <= mesh.part_count * mesh.section_count || l.level >= 0)
+        return 0;
+    float e = focus_error(p, sphere, mesh.merge_error * l.scale);
+    return (e <= l.threshold[0] ? 1 : 0) | (e <= l.threshold[1] ? 2 : 0);
+}
+
 // Pushes the roots of the stage each cut in `mask` takes, for pass `root.pass`: the merged
-// stage when its error stays under the cut's threshold at the copy's nearest point, else the
-// part stage.
-void push_roots(SceneRoot* s, CutGpu* cut, uint slot, MeshGpu* mesh, Placement p, float4 sphere, Lod l, uint mask)
+// stage for those in `merged`, else the part stage.
+void push_roots(CutGpu* cut, uint slot, MeshGpu* mesh, uint mask, uint merged)
 {
     uint sections = mesh.section_count;
     uint part_roots = mesh.part_count * sections;
-    bool has_merged = mesh.root_count > part_roots;
-    uint merged = 0;
-    for (uint k = 0; k < 2; k++)
-    {
-        bool take = has_merged && l.level < 0 && focus_error(p, sphere, mesh.merge_error * l.scale) <= l.threshold[k];
-        merged |= take ? (1u << k) : 0;
-    }
     // A root covers every section of its stage, so hidden sections are left to the
     // clusters' own test.
     for (uint i = 0; i < mesh.root_count; i++)
@@ -787,36 +801,6 @@ void report_mesh_page(CutGpu* cut, MeshGpu* mesh, uint page, bool wanted, float 
     report(cut, mesh.feedback_pages + page, wanted, error);
 }
 
-// What `rule` says of a cluster in a cut.
-static const uint RULE_OUT = 0;
-static const uint RULE_IN = 1;
-// In while the group it was simplified from cannot be drawn.
-static const uint RULE_STANDS_IN = 2;
-
-// Where cluster `cl` of a group at `depth` with error `group_error` stands in cut `k`: in when
-// its parent geometry is too coarse and its own is fine enough; with its own too coarse, it
-// stands in for finer geometry. A source cluster, at depth 0, has none finer and is in
-// whatever its own error. Each geometry's error goes against the threshold its group's sphere
-// takes (`over`): `parent` holds the test of the sphere of the cluster's group, `self` that
-// of the group it was simplified from. Under a debug level the groups at that level are in and
-// the coarser ones stand in.
-uint rule(Stage st, Placement p, Cluster cl, Lod l, uint k, uint depth, float group_error, inout int parent, inout int self, inout uint tests, inout bool decided)
-{
-    if (l.level >= 0)
-    {
-        if (int(depth) == l.level || (int(depth) < l.level && isinf(group_error)))
-            return RULE_IN;
-        return int(depth) > l.level ? RULE_STANDS_IN : RULE_OUT;
-    }
-    float parent_e = cut_error(st.mesh, p, cl.parent_sphere, cl.parent_error * l.scale);
-    if (!over(st, l, k, parent_e, cl.parent_sphere, parent, tests, decided))
-        return RULE_OUT;
-    if (depth == 0)
-        return RULE_IN;
-    float self_e = cut_error(st.mesh, p, cl.self_sphere, cl.self_error * l.scale);
-    return over(st, l, k, self_e, cl.self_sphere, self, tests, decided) ? RULE_STANDS_IN : RULE_IN;
-}
-
 // Whether the group cluster `cl` was simplified from cannot be drawn: its mesh page is not
 // resident. A streamed page is resident only with the node pages over its groups' leaves, and
 // a node's bounds and error hold those of every group below it, so the cut reaches a group
@@ -843,6 +827,14 @@ void tally(uint tests, uint decisions, uint decided)
 
 // One thread per item of the pass. The fill passes report nothing to the loading side: the
 // count passes reported what the same walk reads and wants.
+//
+// An internal node enters each child for the cuts its error is over, a leaf child by its
+// group's sphere (`over`). A leaf decides its group's clusters: the item names the cuts the
+// group's own error is over, and in each a cluster is in while the group it was simplified
+// from is not over, and otherwise stands in for that group's clusters where they cannot be
+// drawn. A source cluster, at depth 0, has none finer and is in. A root that is a leaf comes
+// with no entry test: its group is the only one of its stage, which nothing replaces. Under
+// a debug level the groups at that level are in and the coarser ones stand in.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
@@ -885,133 +877,177 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     uint tests = 0;
     uint decisions = 0;
 
-    if (node.group < 0)
+    bool internal = node.group < 0;
+    Node* children = nullptr;
+    Group g = (Group)0;
+    uint8_t* data = nullptr;
+    uint count = node.child_count;
+    uint mesh_first = 0;
+    uint id_first = 0;
+    if (internal)
     {
-        Node* children;
         uint child_page;
         bool resident = node_at(mesh, node.child_first, children, child_page);
         if (!filling())
             report_node_page(cut, mesh, child_page, !resident, resident ? 0.0 : focus_error(p, node.sphere, node.max_error * l.scale));
         if (!resident)
             return;
-        for (uint i = 0; i < node.child_count; i++)
+    }
+    else
+    {
+        g = ((Group*)mesh.groups)[node.group];
+        // An edit of the whole mesh takes only level 0, whose pages it holds.
+        if (mesh.edit != nullptr && mesh.edit.whole != 0 && g.depth != 0)
+            return;
+        // Under a debug level no cluster of a group finer than the level is taken unless the
+        // group is terminal, so its page is neither wanted nor read.
+        if (l.level >= 0 && int(g.depth) < l.level && !isinf(g.error))
+            return;
+        data = (uint8_t*)mesh.pages[g.page];
+        if (data == nullptr)
         {
-            Node child = children[i];
-            // A leaf's sphere is its group's, which the hidden threshold may take; a merged
-            // sphere of several groups takes the visible one, which enters it wherever a
-            // group below it may be wanted.
-            bool leaf = child.group >= 0;
-            float e = cut_error(mesh, p, child.sphere, child.max_error * l.scale);
-            int known = -1;
-            bool decided = false;
-            uint m = 0;
+            // The clusters this group simplifies into stand in for it. The request ranks by the
+            // error the cut compares: over a hidden sphere, the error over the hidden scale.
+            if (!filling())
+            {
+                float e = focus_error(p, g.simplified, g.error * l.scale);
+                if (root.view_count > 0 && l.level < 0)
+                {
+                    bool hidden = (item.flags & ITEM_HIDDEN) != 0;
+                    if ((item.flags & ITEM_TESTED) == 0)
+                    {
+                        hidden = sphere_hidden(st, g.simplified);
+                        tests++;
+                    }
+                    e /= hidden ? root.culled_scale : 1.0;
+                }
+                report_mesh_page(cut, mesh, g.page, true, e);
+                tally(tests, 0, CUT_HIDDEN_RULES);
+            }
+            return;
+        }
+        // An edit's copy of a page is no read of the source's page its entry reports.
+        if (!filling() && !edit_copy(mesh, data))
+            report_mesh_page(cut, mesh, g.page, false, 0.0);
+        count = g.cluster_count;
+        mesh_first = mesh.page_clusters[g.page] + g.first_cluster;
+        id_first = mesh.page_bases[g.page] + g.first_cluster;
+    }
+    // A cluster whose group no threshold takes, or one a debug level holds.
+    bool fixed = l.level >= 0 || (item.flags & ITEM_FIXED) != 0 || isinf(g.error);
+
+    // The sphere the entries are decided by, a child's or that of the group a cluster was
+    // simplified from, and per cut bit what its test found: the cuts it was tested for, those
+    // its error is over and those the hidden threshold kept it under.
+    uint from = CLUSTER_SOURCE;
+    uint tested = 0;
+    uint finer = 0;
+    uint held = 0;
+    int known = -1;
+    uint raster_mask = 0;
+    for (uint i = 0; i < count; i++)
+    {
+        Node child = (Node)0;
+        Cluster cl = (Cluster)0;
+        float4 sphere;
+        float error;
+        uint cuts = mask;
+        bool several = false;
+        if (internal)
+        {
+            child = children[i];
+            sphere = child.sphere;
+            error = child.max_error;
+            several = child.group < 0;
+            tested = 0;
+        }
+        else
+        {
+            cl = load_cluster(data, g.first_cluster + i);
+            sphere = cl.self_sphere;
+            error = cl.self_error;
+            if (cl.from_group != from)
+            {
+                from = cl.from_group;
+                tested = 0;
+            }
+            if (section_hidden(inst, cl.section))
+                cuts &= ~2u;
+        }
+        if (tested == 0)
+        {
+            finer = 0;
+            held = 0;
+            known = -1;
+        }
+        // A debug level decides without the spheres, and a source cluster has none finer.
+        uint want = l.level >= 0 || (!internal && g.depth == 0) ? 0 : cuts & ~tested;
+        bool endless = false;
+        if (want != 0)
+        {
+            float e = cut_error(mesh, p, sphere, error * l.scale);
+            endless = isinf(e);
             for (uint k = 0; k < 2; k++)
             {
-                if ((mask & (1u << k)) == 0)
+                if ((want & (1u << k)) == 0)
                     continue;
-                bool enter = l.level >= 0 || (leaf ? over(st, l, k, e, child.sphere, known, tests, decided) : e > l.threshold[k]);
-                if (enter)
-                    m |= 1u << k;
+                // A merged sphere of several groups takes the visible threshold, which enters
+                // it wherever a group below it may be wanted.
+                bool decided = false;
+                bool is_over = several ? e > l.threshold[k] : over(st, l, k, e, sphere, known, tests, decided);
+                finer |= is_over ? 1u << k : 0;
+                held |= decided ? 1u << k : 0;
             }
-            decisions += decided ? 1 : 0;
+            tested |= want;
+        }
+        if (internal)
+        {
+            decisions += held != 0 ? 1 : 0;
+            uint m = l.level >= 0 ? mask : finer;
             if (m == 0)
                 continue;
             NodeItem next = item;
             next.node = node.child_first + i;
-            next.flags = (item.flags & ~(3u | ITEM_TESTED | ITEM_HIDDEN)) | m | (known >= 0 ? ITEM_TESTED : 0) | (known > 0 ? ITEM_HIDDEN : 0);
+            next.flags = (item.flags & ~(3u | ITEM_TESTED | ITEM_HIDDEN | ITEM_FIXED)) | m | (known >= 0 ? ITEM_TESTED : 0)
+                | (known > 0 ? ITEM_HIDDEN : 0) | (endless ? ITEM_FIXED : 0);
             push(cut, (pass + 1) % 2, next);
+            continue;
         }
-        tally(tests, decisions, CUT_HIDDEN_LEAVES);
-        return;
-    }
-
-    Group g = ((Group*)mesh.groups)[node.group];
-    // An edit of the whole mesh takes only level 0, whose pages it holds.
-    if (mesh.edit != nullptr && mesh.edit.whole != 0 && g.depth != 0)
-        return;
-    // Under a debug level `rule` takes no cluster of a group finer than the level unless the
-    // group is terminal, so its page is neither wanted nor read.
-    if (l.level >= 0 && int(g.depth) < l.level && !isinf(g.error))
-        return;
-    // The test of the group's sphere, which is its leaf's: from the parent's pass when it ran.
-    int group_known = (item.flags & ITEM_TESTED) == 0 ? -1 : (item.flags & ITEM_HIDDEN) != 0 ? 1 : 0;
-    uint8_t* data = (uint8_t*)mesh.pages[g.page];
-    if (data == nullptr)
-    {
-        // The clusters this group simplifies into stand in for it. The request ranks by the
-        // error the cut compares: over a hidden sphere, the error over the hidden scale.
-        if (!filling())
+        // The cuts the cluster is in, and those it stands in for finer geometry in.
+        uint taken;
+        uint stands;
+        if (l.level >= 0)
         {
-            float e = focus_error(p, g.simplified, g.error * l.scale);
-            if (root.view_count > 0 && l.level < 0)
-            {
-                if (group_known < 0)
-                {
-                    group_known = sphere_hidden(st, g.simplified) ? 1 : 0;
-                    tests++;
-                }
-                e /= group_known != 0 ? root.culled_scale : 1.0;
-            }
-            report_mesh_page(cut, mesh, g.page, true, e);
-            tally(tests, 0, CUT_HIDDEN_RULES);
+            bool held_level = int(g.depth) == l.level || (int(g.depth) < l.level && isinf(g.error));
+            taken = held_level ? cuts : 0;
+            stands = int(g.depth) > l.level ? cuts : 0;
         }
-        return;
-    }
-    // An edit's copy of a page is no read of the source's page its entry reports.
-    if (!filling() && !edit_copy(mesh, data))
-        report_mesh_page(cut, mesh, g.page, false, 0.0);
-    uint mesh_first = mesh.page_clusters[g.page] + g.first_cluster;
-    uint id_first = mesh.page_bases[g.page] + g.first_cluster;
-    // The test of the sphere of the group the last cluster was simplified from.
-    uint from = CLUSTER_SOURCE;
-    int from_known = -1;
-    for (uint run = 0; run < g.cluster_count; run += 32)
-    {
-        uint raster_mask = 0;
-        uint end = min(run + 32, uint(g.cluster_count));
-        for (uint i = run; i < end; i++)
+        else
         {
-            Cluster cl = load_cluster(data, g.first_cluster + i);
-            if (cl.from_group != from)
-            {
-                from = cl.from_group;
-                from_known = -1;
-            }
-            bool decided = false;
-            uint raster = (mask & 1) != 0 ? rule(st, p, cl, l, 0, g.depth, g.error, group_known, from_known, tests, decided) : RULE_OUT;
-            bool traced = (mask & 2) != 0 && !section_hidden(inst, cl.section);
-            uint ray = traced ? rule(st, p, cl, l, 1, g.depth, g.error, group_known, from_known, tests, decided) : RULE_OUT;
-            decisions += decided ? 1 : 0;
-            if (raster == RULE_STANDS_IN || ray == RULE_STANDS_IN)
-            {
-                uint stands = finer_absent(mesh, cl) ? RULE_IN : RULE_OUT;
-                raster = raster == RULE_STANDS_IN ? stands : raster;
-                ray = ray == RULE_STANDS_IN ? stands : ray;
-            }
-            if (raster == RULE_IN)
-                raster_mask |= 1u << (i - run);
-            if (ray == RULE_IN && filling())
-            {
-                fill_cluster(s, cut, slot, id_first + i, cl.section, cl.self_error);
-            }
-            else if (ray == RULE_IN)
-            {
-                // A cluster whose parent no threshold takes, or one a debug level holds.
-                bool fixed = l.level >= 0 || isinf(cut_error(mesh, p, cl.parent_sphere, cl.parent_error * l.scale));
-                gather_cluster(cut, c, mesh_first + i, fixed);
-            }
+            taken = cuts & ~finer;
+            stands = cuts & finer;
+            decisions += (cuts & held) != 0 ? 1 : 0;
         }
-        if (raster_mask != 0)
+        if (stands != 0 && finer_absent(mesh, cl))
+            taken |= stands;
+        if ((taken & 1) != 0)
+            raster_mask |= 1u << (i % 32);
+        if ((taken & 2) != 0 && filling())
+            fill_cluster(s, cut, slot, id_first + i, cl.section, cl.self_error);
+        else if ((taken & 2) != 0)
+            gather_cluster(cut, c, mesh_first + i, fixed);
+        if (raster_mask != 0 && (i % 32 == 31 || i + 1 == count))
         {
             ClusterWork w;
             w.instance = copy;
             w.page = g.page;
-            w.first = g.first_cluster + run;
+            w.first = g.first_cluster + i - i % 32;
             w.mask = raster_mask;
             candidate(cut, w);
+            raster_mask = 0;
         }
     }
-    tally(tests, decisions, CUT_HIDDEN_RULES);
+    tally(tests, decisions, internal ? CUT_HIDDEN_LEAVES : CUT_HIDDEN_RULES);
 }
 
 // Counts the items the last count pass left as dropped and empties the queues for the fill
@@ -1463,7 +1499,8 @@ bool gathers_emissive(InstanceGpu inst, MeshGpu* mesh)
 
 // With TRAVERSE_FILL: pushes the ray-tracing roots of each slot whose cut is built this frame
 // and that writes its clusters, an owner its entries and any such slot its gathered emissive
-// lists, as `init` pushed them. An edit of discrete levels writes its held clusters here.
+// lists, of the stage `init` took for it. An edit of discrete levels writes its held clusters
+// here.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void fill_roots(uint3 id: SV_DispatchThreadID)
@@ -1486,9 +1523,7 @@ void fill_roots(uint3 id: SV_DispatchThreadID)
         edit_clusters(s, cut, slot, mesh, inst);
         return;
     }
-    Placement p;
-    focus_placement(s, inst, p);
-    push_roots(s, cut, slot, mesh, p, model_sphere(model), slot_lod(s, inst, slot), 2);
+    push_roots(cut, slot, mesh, 2, (c.flags & CUT_STAGE_MERGED) != 0 ? 2 : 0);
 }
 
 // Which of a CUT_PARTS slot's lists the cluster of cluster id `id` goes to: 0 the body, else

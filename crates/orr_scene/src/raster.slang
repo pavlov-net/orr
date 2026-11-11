@@ -37,6 +37,30 @@ struct Primitive
 groupshared float3 corners[256];
 groupshared float2 pixels[256];
 
+// `visible_placement` of this frame as both paths draw by it: a posed cluster's pose is
+// composed by exact operations, since each path's kernel places the corners by its own
+// copy of the result and a corner the paths share must land on one grid point.
+bool draw_placement(SceneRoot* s, ViewConstants* v, VisibleCluster vc, out Placement p)
+{
+    uint entry;
+    if (visible_producer(s, vc, entry))
+        return producer_placement(s, s.producers[entry], false, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), p);
+    InstanceGpu inst = copy_record(s, vc.instance);
+    p = (Placement)0;
+    Placement copy;
+    if (!placement(s.groups + inst.group, false, inst.group_index, v, copy))
+        return false;
+    p = copy;
+    Cluster c = load_cluster(vc.page, vc.local);
+    if (!cluster_posed(s, vc.instance, c, false))
+        return true;
+    float3x4 pose;
+    if (!part_pose(s, inst, s.meshes + s.models[inst.model].mesh, c.part, false, pose))
+        return false;
+    p = exact_placed_after(copy, pose);
+    return true;
+}
+
 // One cluster's draw: its vertices and triangles `first..first + count`, from a resident
 // page or a producer batch.
 struct ClusterDraw
@@ -107,7 +131,7 @@ ClusterDraw cluster_draw(uint visible, bool alpha)
     d.first = alpha ? d.split : 0;
     d.count = alpha ? d.tri_count - d.split : d.split;
     d.single_sided = !d.strands && (m.flags & MATERIAL_DOUBLE_SIDED) == 0;
-    visible_placement(s, root.view, d.vc, false, d.p);
+    draw_placement(s, root.view, d.vc, d.p);
     d.mirror = linear_mirror(d.p.linear);
     return d;
 }
@@ -162,11 +186,12 @@ Vertex cluster_vertex(ClusterDraw d, uint visible, uint i)
     {
         float3 x = d.producer ? d.b.positions[d.k.first_vertex + i]
             : d.skinned != nullptr ? d.skinned[i] : load_position(d.vc.page, d.h, d.c, i, d.step);
-        q = place(d.p, x);
+        q = exact_place(d.p, x);
     }
     corners[i] = q;
     Vertex o;
-    o.position = mul(v.clip_from_view_jittered, float4(view_from_relative(v, q), 1.0));
+    // Both paths take a corner to its grid point from here, by the same exact operations.
+    o.position = exact_project(v.clip_from_view_jittered, exact_rotate(v.view_from_world_rotation, q));
     o.visible = visible;
     return o;
 }
@@ -360,16 +385,6 @@ static const int MICROPOLY_SPAN = 4;
 // than the software limit.
 static const float SOFT_REACH = float(1 << 21);
 
-// Where the viewport places clip-space `clip`, in pixels, by the same operations in both
-// paths' kernels.
-float2 raster_pixel(ViewConstants* v, float4 clip)
-{
-    precise float2 ndc = clip.xy / clip.w;
-    precise float2 unit = ndc * 0.5 + 0.5;
-    precise float2 xy = unit * float2(v.extent);
-    return xy;
-}
-
 // The grid point both paths draw a corner at pixel `xy` at, in 1/256 pixel.
 int2 grid_point(float2 xy)
 {
@@ -386,7 +401,7 @@ float4 on_grid(ViewConstants* v, float4 clip)
 {
     if (!(clip.w > 0.0))
         return clip;
-    float2 xy = raster_pixel(v, clip);
+    float2 xy = exact_pixel(v, clip);
     if (!all(abs(xy) < SOFT_REACH))
         return clip;
     float2 at = float2(grid_point(xy)) / float(SUBPIXEL);
@@ -539,7 +554,7 @@ void software(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     for (uint i = thread; i < d.vertex_count; i += 128)
     {
         float4 clip = cluster_vertex(d, visible, i).position;
-        soft_xy[i] = grid_point(raster_pixel(v, clip));
+        soft_xy[i] = grid_point(exact_pixel(v, clip));
         soft_z[i] = clip.z / clip.w;
     }
     GroupMemoryBarrierWithGroupSync();
