@@ -230,8 +230,6 @@ pub(crate) struct TargetSizes {
     pub(crate) extent: [u32; 2],
     pub(crate) extended: bool,
     pub(crate) bins: u32,
-    /// The scene's instance slots.
-    pub(crate) slots: u32,
 }
 
 /// Capacities of a view's cluster lists, which follow what its frames want.
@@ -409,7 +407,11 @@ impl Transient {
 /// after the view's render or by its next frame, and the transient ones of its arena.
 pub(crate) struct ViewTargets {
     pub(crate) sizes: TargetSizes,
+    /// Per instance slot of the scene rendered, written by every render before it is read.
     slot_visibility: Allocation<u32>,
+    slots: u32,
+    /// The slot visibility a render of this frame may read, replaced by a larger one.
+    replaced: Vec<(u64, Allocation<u32>)>,
     /// Workgroup args (`ARGS`), then counts.
     args: Allocation<u32>,
     pub(crate) depth: Target,
@@ -426,6 +428,15 @@ fn tiles(extent: [u32; 2]) -> [u32; 2] {
 
 fn hzb_mips(extent: [u32; 2]) -> u32 {
     (32 - extent[0].max(extent[1]).max(1).leading_zeros()).min(MAX_HZB_MIPS)
+}
+
+/// The visibility of `slots` instance slots.
+fn slot_visibility(device: &Device, slots: u32) -> Result<Allocation<u32>> {
+    Ok(device.gpu_malloc(
+        MemoryKind::DeviceLocal,
+        u64::from(slots.max(1)),
+        "slot visibility",
+    )?)
 }
 
 impl ViewTargets {
@@ -513,7 +524,9 @@ impl ViewTargets {
         )?;
         let t = Self {
             sizes: s,
-            slot_visibility: device.gpu_malloc(dl, u64::from(s.slots.max(1)), "slot visibility")?,
+            slot_visibility: slot_visibility(device, 0)?,
+            slots: 0,
+            replaced: Vec::new(),
             args: device.gpu_malloc(dl, ARGS + COUNTS, "raster args")?,
             depth,
             motion: Target::d2(device, Format::Rg16Float, s.extent, "motion")?,
@@ -525,6 +538,19 @@ impl ViewTargets {
             list.discard(&target.texture);
         }
         Ok(t)
+    }
+
+    /// Gives the slot visibility room for the `slots` instance slots of the scene `frame`
+    /// renders next.
+    pub(crate) fn follow_slots(&mut self, device: &Device, slots: u32, frame: u64) -> Result<()> {
+        // The lists of the frames before are submitted, so their memory outlives them.
+        self.replaced.retain(|&(replaced, _)| replaced == frame);
+        if slots > self.slots {
+            let old = std::mem::replace(&mut self.slot_visibility, slot_visibility(device, slots)?);
+            self.replaced.push((frame, old));
+            self.slots = slots;
+        }
+        Ok(())
     }
 
     /// Takes the transient targets again after `arena` was laid out anew.

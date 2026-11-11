@@ -2483,11 +2483,11 @@ impl<'a> Frame<'a> {
         };
         let features = core.features() | scene_features;
         let producer_capacity = scene.desc.producer_capacity;
+        let slot_capacity = scene.desc.instance_capacity;
         let sizes = TargetSizes {
             extent: view.render_extent.to_array(),
             extended: core.materials.any_extended(),
             bins: core.raster.bins,
-            slots: scene.desc.instance_capacity,
         };
         let preprocess = match core.raster.preprocess_layout(self.pipelines) {
             Some(layout) => Some(core.preprocess.allocate(device, layout)?),
@@ -2542,6 +2542,7 @@ impl<'a> Frame<'a> {
         }
         let lists = history.lists.as_ref().expect("lists made above");
         let targets = history.targets.as_mut().expect("view targets");
+        targets.follow_slots(device, slot_capacity, self.id)?;
         let hzb_view = (view.scene, view.output_extent.to_array());
         let occlusion = targets.hzb_view.replace(hzb_view) == Some(hzb_view) && !view.camera_cut;
         let targets = &*targets;
