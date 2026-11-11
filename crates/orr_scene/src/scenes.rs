@@ -389,9 +389,9 @@ pub struct DetailStats {
     /// scene.
     pub mesh_demand: u64,
     pub mesh_budget: u64,
-    /// The bytes beside `mesh_demand` of the resident pages that built ray-tracing cuts lock
-    /// and the frame did not read, with what they depend on: they stay while copies trace the
-    /// cuts, and leave the pool with the cuts.
+    /// The bytes beside `mesh_demand` of the resident pages that ray-tracing cuts, built or
+    /// building, lock and the frame did not read, with what they depend on: they stay while
+    /// copies trace the cuts, and leave the pool with the cuts.
     pub mesh_held: u64,
     /// The bytes of `mesh_demand` no detail sheds (pinned and locked pages and what they
     /// depend on) past `mesh_budget`. While it is above 0 the scales rise only until the frames

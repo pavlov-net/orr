@@ -232,8 +232,8 @@ pub struct PixelProbe {
     pub pixel: [u32; 2],
     pub view: ProbeView,
     /// The detail scales in force: `memory_scale`, its `visible_scale` and `hidden_scale` parts
-    /// and `rt_scale` the frame's traversal ran at, `mesh_demand` and `mesh_budget` of the last
-    /// frame completed before it.
+    /// and `rt_scale` the frame's traversal ran at, `mesh_demand`, `mesh_budget` and
+    /// `mesh_held` of the last frame completed before it.
     pub detail: DetailStats,
     /// The residency figures of the probed frame's step 1.
     pub residency: ResidencyStats,
