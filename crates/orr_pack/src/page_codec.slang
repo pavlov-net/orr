@@ -115,9 +115,10 @@ PageCheck check_page(StoredPage p)
     bool regions = h.positions_offset == HEADER_BYTES + n * CLUSTER_BYTES
         && h.highs_offset >= h.positions_offset && h.attrs_offset >= h.highs_offset
         && h.tris_offset >= h.attrs_offset
-        && h.omm_offset >= h.tris_offset && h.len >= h.omm_offset && h.len <= PAGE_MAX
-        && h.attr_stride >= 8 && h.attr_stride % 4 == 0 && h.highs_offset % 4 == 0
-        && h.attrs_offset % 4 == 0 && h.omm_offset % 4 == 0;
+        && h.omm_offset >= h.tris_offset && h.len >= h.omm_offset
+        && h.len - (h.attrs_offset - h.highs_offset) <= PAGE_MAX && h.attr_stride >= 8
+        && h.attr_stride % 4 == 0 && h.highs_offset % 4 == 0 && h.attrs_offset % 4 == 0
+        && h.omm_offset % 4 == 0;
     if (!regions)
         return k;
     uint vertex_bytes = h.highs_offset - h.positions_offset;

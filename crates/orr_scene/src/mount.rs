@@ -2374,7 +2374,8 @@ struct EditPending {
     own: Vec<u32>,
     groups: Vec<EditGroupGpu>,
     spheres: Option<Vec<[f32; 4]>>,
-    bounds: Option<Aabb>,
+    /// The box the edit's positions stay inside, mesh space.
+    bounds: Aabb,
     cancel: Arc<AtomicBool>,
     /// What [`Streaming::edit_holds`] keeps resident for it.
     holds: Vec<Key>,
@@ -2855,7 +2856,6 @@ impl Mounts {
         &mut self,
         desc: &EditDesc<'_>,
         loading: &Arc<Loading>,
-        device: &Device,
     ) -> Result<EditId> {
         let model = desc.model;
         let refuse = |reason| Err(Error::NotEditable { model, reason });
@@ -2883,14 +2883,19 @@ impl Mounts {
         let holds = self
             .streaming
             .edit_holds(mount, mesh, &own, spheres.is_some());
+        let src_model = r.model_gpus[&model];
+        let bounds = desc.bounds.unwrap_or(Aabb {
+            min: src_model.bounds_min,
+            max: src_model.bounds_max,
+        });
         let cancel = Arc::new(AtomicBool::new(false));
         let task = EditTask {
             id: EditId(self.edits.len() as u32),
             loading: Arc::downgrade(loading),
-            device: device.clone(),
             source: Arc::clone(&r.source),
             stream: Arc::clone(&m.source),
             own: own.clone(),
+            bounds,
             cancel: Arc::clone(&cancel),
             micromaps_per_submit: self.accel.limits.micromaps,
             done: Mutex::new(EditDone::default()),
@@ -2904,7 +2909,7 @@ impl Mounts {
             own,
             groups,
             spheres: spheres.map(<[_]>::to_vec),
-            bounds: desc.bounds,
+            bounds,
             cancel,
             holds,
             loaded: None,
@@ -3055,10 +3060,7 @@ impl Mounts {
         let src_skin = source.skin;
         let page_count = ids.page_count;
         let base = ids.cluster_base;
-        let bounds = p.bounds.unwrap_or(Aabb {
-            min: src_model.bounds_min,
-            max: src_model.bounds_max,
-        });
+        let bounds = p.bounds;
         let parts = vec![
             PartGpu {
                 bounds_min: bounds.min,

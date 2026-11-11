@@ -6,7 +6,7 @@ module mesh;
 
 import orr_shaders.packing;
 
-// Largest resident page, bytes.
+// Largest resident page, bytes, its high halves aside (orr_pack::mesh::PAGE_MAX).
 public static const uint PAGE_MAX = 128 << 10;
 
 // `MeshHeader.attributes`.
@@ -181,8 +181,8 @@ public bool has_highs(PageHeader h)
     return h.highs_offset != h.attrs_offset;
 }
 
-// The largest grid offset a vertex of the page holds: 16 bits, or with high halves the 24 bits
-// an f32 position holds exactly.
+// The largest grid offset a vertex of the page holds: 16 bits, or with high halves 24 bits,
+// the span of grid positions within 2^23 of zero, where `anchor + local` is exact in an f32.
 public uint local_limit(PageHeader h)
 {
     return has_highs(h) ? 0xFFFFFF : 0xFFFF;

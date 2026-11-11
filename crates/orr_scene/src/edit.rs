@@ -17,7 +17,7 @@ use orr_gpu::{
 };
 use orr_math::Vec3;
 use orr_pack::Aabb;
-use orr_pack::mesh::{Cluster, Group, MeshHeader, PageHeader};
+use orr_pack::mesh::{Cluster, Group, LOCAL_LOW_MAX, MeshHeader, PageHeader};
 
 use crate::accel::{
     self, AccelKernels, ClasBatch, ClasSource, ClusterBuild, ClusterInfo, PageMicromap,
@@ -46,8 +46,9 @@ pub struct EditDesc<'a> {
     /// cut: their edits hold all of level 0 and their copies draw nothing coarser.
     pub touched: Option<&'a [[f32; 4]]>,
     /// A box (mesh space) the edit's triangles, edited or not, stay inside; `None`: the
-    /// model's bounds. It culls the edit's copies, and its CLAS keep the position bits every
-    /// grid point in it needs.
+    /// model's bounds. It culls the edit's copies, its CLAS keep the position bits every grid
+    /// point in it needs, and the edit's copy of a page holds high halves where the box reaches
+    /// past 16 bits from a cluster's anchor, so a kernel can move a vertex anywhere in it.
     pub bounds: Option<Aabb>,
 }
 
@@ -177,10 +178,11 @@ pub(crate) fn level0_clusters(
 pub(crate) struct EditTask {
     pub(crate) id: EditId,
     pub(crate) loading: std::sync::Weak<Loading>,
-    pub(crate) device: Device,
     pub(crate) source: Arc<BlobSource>,
     pub(crate) stream: Arc<EditSource>,
     pub(crate) own: Vec<u32>,
+    /// The box the edit's positions stay inside, mesh space.
+    pub(crate) bounds: Aabb,
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) micromaps_per_submit: u32,
     pub(crate) done: Mutex<EditDone>,
@@ -190,10 +192,8 @@ pub(crate) struct EditTask {
 /// What the jobs of an edit have made.
 #[derive(Default)]
 pub(crate) struct EditDone {
-    block: Option<(Allocation<u8>, Vec<u64>)>,
-    /// The pages decoded, laid out as `block`.
-    staging: Option<Allocation<u8>>,
-    /// By own page.
+    /// By own page: its resident bytes, with high halves where the edit may need them.
+    pages: Vec<Vec<u8>>,
     clusters: Vec<Vec<ClusterInfo>>,
     regions: Vec<Option<PageMicromap>>,
     error: Option<Error>,
@@ -233,43 +233,30 @@ impl EditTask {
     }
 }
 
+/// Whether cluster `c` may need more than the low halves of its grid offsets when a kernel
+/// moves its vertices anywhere in the cells `reach` of the edit's box: the kernel may lower its
+/// anchor to the lowest of them first.
+fn stretches(c: &Cluster, reach: &[[i64; 3]; 2]) -> bool {
+    (0..3).any(|a| {
+        let anchor = i64::from(c.anchor[a]);
+        let lo = anchor.min(reach[0][a]);
+        let hi = (anchor + i64::from(c.local_max[a])).max(reach[1][a]);
+        hi - lo > i64::from(LOCAL_LOW_MAX)
+    })
+}
+
 /// Starts an edit's page reads on the loading thread.
 pub(crate) fn start(task: &Arc<EditTask>) {
     let s = &task.stream;
-    let mut at = 0u64;
-    let places: Vec<u64> = task
-        .own
-        .iter()
-        .map(|&p| {
-            let here = at;
-            at += u64::from(s.pages[p as usize].bytes).next_multiple_of(256);
-            here
-        })
-        .collect();
-    let bytes = at.max(16);
-    let d = &task.device;
-    let blocks = d
-        .gpu_malloc::<u8>(MemoryKind::DeviceLocal, 2 * bytes, "mesh edit pages")
-        .and_then(|b| {
-            Ok((
-                b,
-                d.gpu_malloc::<u8>(MemoryKind::Upload, bytes, "mesh edit staging")?,
-            ))
-        });
-    let (block, staging) = match blocks {
-        Ok(b) => b,
-        Err(e) => {
-            task.done.lock().unwrap().error = Some(e.into());
-            task.end();
-            return;
-        }
-    };
-    let base = block.gpu().address().0;
-    let mapped = Block::of(&staging);
+    let step = f64::from(s.header.step());
+    let b = &task.bounds;
+    let reach = [
+        b.min.map(|x| (f64::from(x) / step).floor() as i64),
+        b.max.map(|x| (f64::from(x) / step).ceil() as i64),
+    ];
     {
         let mut done = task.done.lock().unwrap();
-        done.block = Some((block, places.iter().map(|o| base + o).collect()));
-        done.staging = Some(staging);
+        done.pages = vec![Vec::new(); task.own.len()];
         done.clusters = vec![Vec::new(); task.own.len()];
         done.regions = vec![None; task.own.len()];
     }
@@ -284,7 +271,6 @@ pub(crate) fn start(task: &Arc<EditTask>) {
         };
         task.outstanding.fetch_add(1, Ordering::AcqRel);
         let t = Arc::clone(task);
-        let at = places[i];
         read_stored(
             &task.source,
             b,
@@ -296,10 +282,6 @@ pub(crate) fn start(task: &Arc<EditTask>) {
                         PAGE.with_borrow_mut(|resident| {
                             resident.resize(p.bytes as usize, 0);
                             orr_pack::mesh::decode_page(bytes, resident)?;
-                            let wrote = mapped.write_mapped(at, resident);
-                            assert!(wrote, "staging is mapped");
-                            let h: PageHeader =
-                                bytemuck::pod_read_unaligned(&resident[..size_of::<PageHeader>()]);
                             let view = orr_pack::mesh::PageView::new(resident, &t.stream.header)?;
                             if view.cluster_count() != p.clusters {
                                 let e = orr_pack::Error::Malformed("edit page cluster count");
@@ -307,9 +289,20 @@ pub(crate) fn start(task: &Arc<EditTask>) {
                             }
                             let records: Vec<Cluster> =
                                 (0..view.cluster_count()).map(|c| view.cluster(c)).collect();
+                            let h: PageHeader =
+                                bytemuck::pod_read_unaligned(&resident[..size_of::<PageHeader>()]);
+                            let out =
+                                if !h.has_highs() && records.iter().any(|c| stretches(c, &reach)) {
+                                    orr_pack::mesh::widen_page(resident)?
+                                } else {
+                                    resident.clone()
+                                };
+                            let h: PageHeader =
+                                bytemuck::pod_read_unaligned(&out[..size_of::<PageHeader>()]);
                             let (clusters, region) =
                                 page_infos(&h, &records, page, &t.stream.groups)?;
                             let mut done = t.done.lock().unwrap();
+                            done.pages[i] = out;
                             done.clusters[i] = clusters;
                             done.regions[i] = region;
                             Ok(())
@@ -330,26 +323,25 @@ pub(crate) fn start(task: &Arc<EditTask>) {
 pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<EditTask>) {
     let done = std::mem::take(&mut *task.done.lock().unwrap());
     let EditDone {
-        block,
-        staging,
+        pages,
         clusters,
         regions,
         error,
     } = done;
     let canceled = task.cancel.load(Ordering::Relaxed);
-    let (result, point) = match (error, block) {
-        (Some(e), _) => (Err(Arc::new(e)), None),
-        (None, _) if canceled => (Err(Arc::new(Error::UnknownEdit(task.id))), None),
-        (None, None) => (Err(Arc::new(Error::UnknownEdit(task.id))), None),
-        (None, Some((block, addresses))) => {
+    let staged = match error {
+        Some(e) => Err(e),
+        None if canceled => Err(Error::UnknownEdit(task.id)),
+        None => stage(device, &pages),
+    };
+    let (result, point) = match staged {
+        Err(e) => (Err(Arc::new(e)), None),
+        Ok((block, staging, addresses)) => {
             let pages_bytes = block.size() / 2;
-            let copies: Vec<StagedCopy> = staging
-                .into_iter()
-                .map(|src| StagedCopy::Buffer {
-                    src,
-                    dst: block.gpu().address().0,
-                })
-                .collect();
+            let copies = [StagedCopy::Buffer {
+                src: staging,
+                dst: block.gpu().address().0,
+            }];
             let built = submit_copies(device, &copies, &[]).and_then(|copied| {
                 let pages: Vec<(u64, Option<PageMicromap>)> =
                     addresses.iter().copied().zip(regions).collect();
@@ -376,6 +368,30 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<EditTask>) {
         point,
         result,
     });
+}
+
+/// The edit's block, twice the bytes of `pages` laid out 256-aligned so that their state
+/// before a frame's kernels follows them, the staging holding them, and each page's address.
+fn stage(device: &Device, pages: &[Vec<u8>]) -> Result<(Allocation<u8>, Allocation<u8>, Vec<u64>)> {
+    let mut at = 0u64;
+    let places: Vec<u64> = pages
+        .iter()
+        .map(|p| {
+            let here = at;
+            at += (p.len() as u64).next_multiple_of(256);
+            here
+        })
+        .collect();
+    let bytes = at.max(16);
+    let block = device.gpu_malloc::<u8>(MemoryKind::DeviceLocal, 2 * bytes, "mesh edit pages")?;
+    let staging = device.gpu_malloc::<u8>(MemoryKind::Upload, bytes, "mesh edit staging")?;
+    let mapped = Block::of(&staging);
+    for (p, &o) in pages.iter().zip(&places) {
+        let wrote = mapped.write_mapped(o, p);
+        assert!(wrote, "staging is mapped");
+    }
+    let base = block.gpu().address().0;
+    Ok((block, staging, places.iter().map(|o| base + o).collect()))
 }
 
 /// One implicit CLAS build of an edit and where its results go.

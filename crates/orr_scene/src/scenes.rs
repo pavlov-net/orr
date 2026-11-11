@@ -802,9 +802,7 @@ impl Scenes {
     /// compute point (see [`EditRef`]). Its pages read on the loading side, and
     /// [`Scenes::edit`] succeeds once [`Scenes::edit_state`] is `Ready`.
     pub fn create_edit(&mut self, desc: &EditDesc<'_>) -> Result<EditId> {
-        self.core
-            .mounts
-            .create_edit(desc, &self.loading, &self.device)
+        self.core.mounts.create_edit(desc, &self.loading)
     }
 
     /// The progress of an edit; `Failed` with [`Error::UnknownEdit`] once destroyed.

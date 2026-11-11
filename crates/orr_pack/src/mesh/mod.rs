@@ -46,7 +46,8 @@ pub const SCHEMA: u16 = 12;
 /// whatever its size.
 pub const NODE_PAGE_MAX: usize = 64 << 10;
 
-/// Largest resident page.
+/// Largest resident page, its high halves aside: a cooked page holds them within it, and an
+/// edit's copy that [`widen_page`] gave them may take more.
 pub const PAGE_MAX: usize = 128 << 10;
 
 /// The most sections a mesh or a subdivision cage holds: [`Cluster::section`] and
@@ -717,6 +718,38 @@ pub fn cluster_resident_len(
         + (triangles * 3).next_multiple_of(4)
 }
 
+/// Resident page `page`, which holds no high halves, with zero high halves: every region after
+/// the positions moves by their length, and a micromap region keeps its [`OMM_ALIGN`]
+/// alignment. An edit's copy takes them when its kernel may move vertices past 16 bits from
+/// their anchors.
+pub fn widen_page(page: &[u8]) -> Result<Vec<u8>> {
+    let mut h = check_page(page)?;
+    assert!(!h.has_highs(), "the page holds high halves");
+    let highs = (h.highs_offset - h.positions_offset) as usize;
+    let (at, omm, len) = (
+        h.attrs_offset as usize,
+        h.omm_offset as usize,
+        h.len as usize,
+    );
+    let moved_omm = if omm < len {
+        (omm + highs).next_multiple_of(OMM_ALIGN as usize)
+    } else {
+        omm + highs
+    };
+    let mut out = Vec::with_capacity(moved_omm + len - omm);
+    out.extend_from_slice(&page[..at]);
+    out.resize(at + highs, 0);
+    out.extend_from_slice(&page[at..omm]);
+    out.resize(moved_omm, 0);
+    out.extend_from_slice(&page[omm..]);
+    h.attrs_offset += highs as u32;
+    h.tris_offset += highs as u32;
+    h.omm_offset = moved_omm as u32;
+    h.len = out.len() as u32;
+    out[..size_of::<PageHeader>()].copy_from_slice(bytemuck::bytes_of(&h));
+    Ok(out)
+}
+
 fn exp2(k: i8) -> f32 {
     f32::from_bits(((i32::from(k) + 127) as u32) << 23)
 }
@@ -773,7 +806,7 @@ fn layout(h: &PageHeader) -> Result<(usize, usize)> {
         && h.tris_offset >= h.attrs_offset
         && h.omm_offset >= h.tris_offset
         && h.len >= h.omm_offset
-        && h.len as usize <= PAGE_MAX;
+        && (h.len - (h.attrs_offset - h.highs_offset)) as usize <= PAGE_MAX;
     let aligned = h.attr_stride.is_multiple_of(4)
         && h.highs_offset.is_multiple_of(4)
         && h.attrs_offset.is_multiple_of(4)

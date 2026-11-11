@@ -51,8 +51,8 @@ use orr_scene::{
 };
 use orr_scene::{Budgets, InstancePageRef, PageId, PixelProbe, PoolSize, RequestSource};
 use scene_suite::shaders::{
-    codec, fracture, grid, pose, skin_pose, surface_at, surface_params, trace, triangle_at,
-    triangle_point,
+    codec, fracture, grid, pose, skin_pose, stretch, surface_at, surface_params, trace,
+    triangle_at, triangle_point,
 };
 use scene_suite::{Workers, linked, pipeline};
 
@@ -1412,6 +1412,12 @@ fn cook() -> Arc<[u8]> {
                     }),
                     vec![metal],
                     LodMode::Discrete { errors: vec![0.05] },
+                ),
+                model(
+                    "long ground",
+                    grid(120, 48.0, 1.0, |_, _| 0.0),
+                    vec![metal],
+                    one(),
                 ),
             ]
             .into_iter()
@@ -11504,8 +11510,24 @@ fn shoot_edits_with(
     motion: bool,
     write: impl FnOnce(&mut SceneWriter<'_>),
 ) -> Frame {
-    let list = [placed.scene];
     let refs: Vec<EditRef> = edits.iter().map(|e| w.scenes.edit(e.0).unwrap()).collect();
+    let dirty: Vec<EditId> = edits.iter().map(|e| e.0).collect();
+    shoot_dirty(w, placed, shot, &dirty, motion, write, |c| {
+        dispatch_fractures(c, edits, &refs);
+    })
+}
+
+/// A frame in which `dirty` change at the scene compute point, where `compute` runs.
+fn shoot_dirty(
+    w: &mut World,
+    placed: &Placed,
+    shot: &Shot,
+    dirty: &[EditId],
+    motion: bool,
+    write: impl FnOnce(&mut SceneWriter<'_>),
+    mut compute: impl FnMut(&mut SceneCompute<'_, '_>),
+) -> Frame {
+    let list = [placed.scene];
     let mut f = w
         .scenes
         .begin_frame(&FrameDesc {
@@ -11523,16 +11545,15 @@ fn shoot_edits_with(
         }
         write(&mut s);
     }
-    for e in edits {
+    for &e in dirty {
         let admitted = if motion {
-            f.edit_dirty(e.0)
+            f.edit_dirty(e)
         } else {
-            f.edit_dirty_without_motion(e.0)
+            f.edit_dirty_without_motion(e)
         };
         assert!(admitted, "the frame's rebuild budget takes the edit");
     }
-    f.update_scenes(&mut |c| dispatch_fractures(c, edits, &refs))
-        .unwrap();
+    f.update_scenes(&mut compute).unwrap();
     let view = f
         .raster_view(&ViewDesc {
             scene: placed.scene,
@@ -11633,6 +11654,125 @@ fn place_models(w: &mut World, models: &[ModelId]) -> Placed {
         history,
         count: models.len() as u32,
     }
+}
+
+/// `stretch.slang`'s `CLUSTERS`: slots per held group in its output.
+const STRETCH_CLUSTERS: u32 = 128;
+
+/// Edits of a 48 m ground on the 2^-11 m grid move vertices 40 m along x, inside the model's
+/// bounds and more than 65,535 steps from their clusters' anchors: through `store_position`
+/// alone, and after `store_anchor` lowers the anchors 40 m. The pages read back every vertex
+/// where it was put, and rays hit what the raster draws.
+#[test]
+fn an_edit_moves_vertices_anywhere_in_its_bounds() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let source = w.model("long ground");
+    let cpu = CpuMesh::of("long ground");
+    assert_eq!(cpu.header.position_exponent, -11);
+    let views: Vec<PageView<'_>> = cpu
+        .pages
+        .iter()
+        .map(|p| PageView::new(p, &cpu.header).unwrap())
+        .collect();
+    assert!(views.iter().all(|v| v.cluster_count() <= STRETCH_CLUSTERS));
+    // Its clusters span 16 bits, so its pages hold no high halves.
+    for p in &cpu.pages {
+        let h: orr_pack::mesh::PageHeader = bytemuck::pod_read_unaligned(&p[..96]);
+        assert!(!h.has_highs());
+    }
+    for (shift, from) in [(40.0f32, -16.0f32), (-40.0, 16.0)] {
+        let edit = w
+            .scenes
+            .create_edit(&EditDesc {
+                model: source,
+                touched: None,
+                bounds: None,
+            })
+            .unwrap();
+        settle_edits(&mut w, &[edit]);
+        let r = w.scenes.edit(edit).unwrap();
+        let placed = place_models(&mut w, &[source, r.model]);
+        let slots = u64::from(r.group_count) * u64::from(STRETCH_CLUSTERS) * 256;
+        let mut out = device()
+            .gpu_malloc::<stretch::Moved>(MemoryKind::Readback, slots, "moved")
+            .unwrap();
+        out.as_mut_slice()
+            .unwrap()
+            .fill(bytemuck::Zeroable::zeroed());
+        let p = pipeline(&stretch::MODULE, "main");
+        let run = |c: &mut SceneCompute<'_, '_>, shift: f32| {
+            let root = c
+                .put_root(&stretch::Root {
+                    scene: c.root,
+                    groups: r.groups,
+                    out: out.gpu(),
+                    mesh: r.mesh,
+                    shift,
+                    from,
+                    _pad: 0,
+                    _pad2: 0,
+                })
+                .unwrap();
+            c.cmd.dispatch(&p, root, [r.group_count, 1, 1]);
+        };
+        let mut shot = Shot::at(DVec3::new(0.0, 45.0, 30.0), DVec3::ZERO, 1);
+        shot.moved = vec![(0, Affine3::ZERO), (1, Affine3::IDENTITY)];
+        shoot_dirty(
+            &mut w,
+            &placed,
+            &shot,
+            &[edit],
+            true,
+            |_| {},
+            |c| run(c, shift),
+        );
+        // A frame later, past the rebuild that sets each anchor back at its lowest vertex.
+        shot.frame = 2;
+        let g = shoot_dirty(&mut w, &placed, &shot, &[], true, |_| {}, |c| run(c, 0.0));
+        let (mut checked, mut moved) = (0, 0);
+        for m in out.as_slice().unwrap().iter().filter(|m| m.at[3] == 1) {
+            let [page, cluster, v, _] = m.at;
+            let view = &views[page as usize];
+            let was = Vec3::from(view.position(&view.cluster(cluster), v));
+            let moves = if shift > 0.0 {
+                was.x < from
+            } else {
+                was.x > from
+            };
+            let want = if moves {
+                moved += 1;
+                was + Vec3::new(shift, 0.0, 0.0)
+            } else {
+                was
+            };
+            assert_eq!(
+                Vec3::from_slice(&m.position[..3])
+                    .to_array()
+                    .map(f32::to_bits),
+                want.to_array().map(f32::to_bits),
+                "shift {shift}: page {page} cluster {cluster} vertex {v} from {was}"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 1000 && moved > 100,
+            "{checked} vertices, {moved} moved"
+        );
+        let rays = rays(&g.view, &trace::MODULE, "pixels", 0);
+        let (matched, covered) = parity(&g, &rays, 1e-3);
+        let total = rays.traced.len();
+        assert!(
+            covered > total / 4,
+            "shift {shift}: {covered} of {total} covered"
+        );
+        assert!(
+            matched as f64 >= 0.995 * total as f64,
+            "shift {shift}: {matched} of {total} pixels agree"
+        );
+        w.scenes.destroy_edit(edit);
+    }
+    assert_clean();
 }
 
 #[test]

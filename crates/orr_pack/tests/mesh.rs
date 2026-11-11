@@ -126,6 +126,43 @@ fn stored_pages_decode_to_the_resident_page() {
     }
 }
 
+/// A widened page reads as the page did, every region past the positions moved.
+#[test]
+fn widened_pages_read_as_before() {
+    let mut rng = Rng(5);
+    let p = page(&mut rng, 7, 16, false, 40);
+    let wide = mesh::widen_page(&p).unwrap();
+    let h: PageHeader = bytemuck::pod_read_unaligned(&wide[..size_of::<PageHeader>()]);
+    assert!(h.has_highs());
+    assert_eq!(h.omm_offset % mesh::OMM_ALIGN, 0);
+    let header = mesh::MeshHeader {
+        attributes: mesh::MeshHeader::TANGENT | mesh::MeshHeader::UV1,
+        ..bytemuck::Zeroable::zeroed()
+    };
+    let (a, b) = (
+        mesh::PageView::new(&p, &header).unwrap(),
+        mesh::PageView::new(&wide, &header).unwrap(),
+    );
+    for i in 0..a.cluster_count() {
+        let c = a.cluster(i);
+        assert_eq!(bytemuck::bytes_of(&c), bytemuck::bytes_of(&b.cluster(i)));
+        for v in 0..u32::from(c.vertex_count) {
+            assert_eq!(a.grid(&c, v), b.grid(&c, v));
+            let words = |view: &mesh::PageView<'_>| {
+                let t = view.tangent(&c, v).unwrap().map(f32::to_bits);
+                (view.normal(&c, v).map(f32::to_bits), t)
+            };
+            assert_eq!(words(&a), words(&b));
+        }
+        for t in 0..u32::from(c.tri_count) {
+            assert_eq!(a.triangle(&c, t), b.triangle(&c, t));
+        }
+    }
+    let omm = |page: &[u8], h: &PageHeader| page[h.omm_offset as usize..].to_vec();
+    let ph: PageHeader = bytemuck::pod_read_unaligned(&p[..size_of::<PageHeader>()]);
+    assert_eq!(omm(&p, &ph), omm(&wide, &h));
+}
+
 #[test]
 fn damaged_stored_pages_are_rejected() {
     let mut rng = Rng(7);
