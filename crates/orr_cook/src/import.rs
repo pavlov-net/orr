@@ -176,11 +176,19 @@ impl Scene {
                 .iter()
                 .filter(|m| m.skeleton == Some(s))
                 .filter_map(|m| match &m.mesh {
-                    MeshSource::Data(d) if !d.positions.is_empty() => Some((
-                        mesh::position_bounds(&d.positions),
-                        m.settings.position_step_log2,
-                        d.min_exponent.unwrap_or(i8::MIN),
-                    )),
+                    MeshSource::Data(d) if !d.positions.is_empty() => {
+                        let mut b = mesh::position_bounds(&d.positions);
+                        // Static displacement baked into the mesh moves its points by up to
+                        // the lift, and the mesh's grid then holds the moved box.
+                        if m.settings.displace_static.is_some() {
+                            b = grown(&b, self.lift(m));
+                        }
+                        Some((
+                            b,
+                            m.settings.position_step_log2,
+                            d.min_exponent.unwrap_or(i8::MIN),
+                        ))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -235,15 +243,32 @@ impl Scene {
     }
 }
 
+/// Box `b` grown by `by` m on every side, its corners rounded outward.
+fn grown(b: &Aabb, by: f64) -> Aabb {
+    let out = |x: f32, by: f64| {
+        let want = f64::from(x) + by;
+        let y = want as f32;
+        match f64::from(y).partial_cmp(&want) {
+            Some(std::cmp::Ordering::Less) if by > 0.0 => y.next_up(),
+            Some(std::cmp::Ordering::Greater) if by < 0.0 => y.next_down(),
+            _ => y,
+        }
+    };
+    Aabb {
+        min: b.min.map(|x| out(x, -by)),
+        max: b.max.map(|x| out(x, by)),
+    }
+}
+
 /// Point `p` of a rig's bind space once the space moves by `delta`.
 fn moved_by(p: [f32; 3], delta: DVec3) -> [f32; 3] {
     (Vec3::from(p).as_dvec3() - delta).as_vec3().to_array()
 }
 
-/// The exponent of the coarsest grid of a rig's meshes, each its box of positions, the step it
-/// asks for and the least exponent it takes, once bind space moves by `delta`; `None` for a rig
-/// of no meshes. [`moved_by`] rises with each coordinate, so it moves a box to the box of the
-/// moved positions.
+/// The exponent of the coarsest grid of a rig's meshes, each the box its cooked positions stay
+/// in, the step it asks for and the least exponent it takes, once bind space moves by `delta`;
+/// `None` for a rig of no meshes. [`moved_by`] rises with each coordinate, so it moves a box to
+/// the box of the moved positions.
 fn rig_exponent(grids: &[(Aabb, i8, i8)], delta: DVec3) -> Option<i8> {
     grids
         .iter()
