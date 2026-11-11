@@ -95,6 +95,7 @@ public static const uint RT_ANIMATED = 16;  // inside animation_range: raster ta
 public static const uint RT_WAS_ANIMATED = 32; // RT_ANIMATED of the previous frame
 public static const uint RT_FADING = 64;    // its PTLAS instance was written for a chain fade
 public static const uint RT_STEP_SHIFT = 8; // 2 bits: the chain step its PTLAS instance holds
+public static const uint RT_FAR_STEP_SHIFT = 10; // 2 bits: the chain step its far instance holds
 public static const uint RT_FAR_CUT_SHIFT = 16; // 8 bits: the cut its far instance holds
 
 // `SlotStateGpu.chain_step`: the step a copy is at, or fades to, in bits 0-1; the step it

@@ -381,7 +381,9 @@ public float traced_error(SceneRoot* s, uint copy)
     bool far = (copy & COPY_FAR) != 0;
     if (far ? st.far_part == 0 : (st.rt_flags & RT_WRITTEN) == 0)
         return 0.0;
-    InstanceGpu inst = copy_record(s, copy);
+    // The far instance holds the step it was last written with, which the fade may have
+    // turned from.
+    InstanceGpu inst = far ? step_record(s, s.instances[slot], (st.rt_flags >> RT_FAR_STEP_SHIFT) & CHAIN_STEP_MASK) : copy_record(s, copy);
     MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
     if (mesh.rt_cut_count == 0)
         return 0.0;

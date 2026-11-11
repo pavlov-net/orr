@@ -530,14 +530,17 @@ void want(uint3 id: SV_DispatchThreadID)
     // The far instance of a fading copy: taken when the fade starts, rewritten with the
     // slot's instance or a new cut, released when it ends.
     bool far = false;
+    uint far_step = chain_far(*st);
     if (fading)
     {
-        MeshGpu* far_mesh = s.meshes + s.models[step_record(s, base, chain_far(*st)).model].mesh;
+        MeshGpu* far_mesh = s.meshes + s.models[step_record(s, base, far_step).model].mesh;
         far = far_mesh.rt_cut_count > 0;
         op.far_cut = far ? min(s.cut.slots[slot].far_cut, far_mesh.rt_cut_count - 1) : 0;
     }
     bool far_held = st.far_part != 0;
-    bool far_moved = (op.op & OP_WRITE) != 0 || op.far_cut != ((st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff) || target != st.rt_partition;
+    // A fade can turn to another far step before it ends while the near one stays.
+    bool far_moved = (op.op & OP_WRITE) != 0 || op.far_cut != ((st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff)
+        || far_step != ((st.rt_flags >> RT_FAR_STEP_SHIFT) & CHAIN_STEP_MASK) || target != st.rt_partition;
     uint far_op = far && !far_held ? OP_FAR_TAKE : far && far_moved ? OP_FAR_WRITE : !far && far_held ? OP_FAR_RELEASE : 0;
     if (far_op != 0)
     {
@@ -750,12 +753,14 @@ void write_far(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu base, ui
     uint index;
     if (!reserve(COUNTER_WRITES, t.write_capacity, 1, index))
         return;
-    InstanceGpu far = step_record(s, base, chain_far(*st));
+    uint step = chain_far(*st);
+    InstanceGpu far = step_record(s, base, step);
     MeshGpu* mesh = s.meshes + s.models[far.model].mesh;
     PtlasWrite w = copy_write(s, t, s.part_base + st.far_part - 1, partition, far, mesh.rt_cuts[cut].blas);
     w.flags |= INSTANCE_FORCE_NO_OPAQUE;
     store((uint64_t)t.writes, index, w);
-    st.rt_flags = (st.rt_flags & ~(0xffu << RT_FAR_CUT_SHIFT)) | (cut << RT_FAR_CUT_SHIFT);
+    uint held = (0xffu << RT_FAR_CUT_SHIFT) | (CHAIN_STEP_MASK << RT_FAR_STEP_SHIFT);
+    st.rt_flags = (st.rt_flags & ~held) | (cut << RT_FAR_CUT_SHIFT) | (step << RT_FAR_STEP_SHIFT);
 }
 
 // Writes every part instance of the slot's run: the cut's part BLAS posed by the copy's

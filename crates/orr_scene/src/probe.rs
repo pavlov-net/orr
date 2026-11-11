@@ -29,6 +29,7 @@ const MERGED_RASTER: u32 = 512;
 const RT_MERGED_STAGE: u32 = 1024;
 const RT_LEVELS: u32 = 2048;
 const HELD_STEP_GONE: u32 = 4096;
+const FAR_HELD_GONE: u32 = 8192;
 const LIST_OPAQUE: u32 = 1;
 const LIST_ALPHA: u32 = 2;
 const LIST_SOFTWARE: u32 = 4;
@@ -1043,18 +1044,30 @@ impl PixelProbe {
         } else {
             writeln!(f, "{far}: not traced, as the copy is out of its rt range")?;
         }
+        let far_held_step = if g.far_held_step == g.far_step {
+            String::new()
+        } else {
+            format!(" of chain step {}", g.far_held_step)
+        };
         let far_held = if st.far_part == 0 {
             "no part instance".to_owned()
-        } else if g.far_held_cut >= g.far_cut_count {
+        } else if g.flags & FAR_HELD_GONE != 0 {
             format!(
-                "part instance {} holding cut {}, past the {} cuts its mesh has now",
+                "part instance {} holding cut {} of chain step {}, a step its model's chain no longer has",
                 st.far_part - 1,
                 g.far_held_cut,
-                g.far_cut_count
+                g.far_held_step
+            )
+        } else if g.far_held_cut >= g.far_held_cut_count {
+            format!(
+                "part instance {} holding cut {}{far_held_step}, past the {} cuts its mesh has now",
+                st.far_part - 1,
+                g.far_held_cut,
+                g.far_held_cut_count
             )
         } else {
             format!(
-                "part instance {} holding cut {} (error {:.6} m)",
+                "part instance {} holding cut {}{far_held_step} (error {:.6} m)",
                 st.far_part - 1,
                 g.far_held_cut,
                 g.far_held_error

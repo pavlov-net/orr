@@ -540,8 +540,15 @@ void init(uint3 id: SV_DispatchThreadID)
         {
             c.far_cut = coarsest_cut(far_mesh, p.scale * l.scale, far_distance, l.cached, 0);
             touch_cut(cut, far_mesh, c.far_cut);
-            touch_cut(cut, far_mesh, (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff);
             want_cut(cut, far_mesh, p.scale * l.scale, far_distance, l.cached, 0);
+        }
+        // Its far instance holds a cut of the step it was last written with, which the fade
+        // may have turned from.
+        if (st.far_part != 0)
+        {
+            uint held = (st.rt_flags >> RT_FAR_STEP_SHIFT) & CHAIN_STEP_MASK;
+            MeshGpu* held_mesh = s.meshes + s.models[step_record(s, s.instances[slot], held).model].mesh;
+            touch_cut(cut, held_mesh, (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff);
         }
         if (raster)
             raster_roots(s, cut, slot | COPY_FAR, far_mesh, p, far_sphere, l);

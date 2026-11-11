@@ -26,6 +26,7 @@ public static const uint PROBE_MERGED_RASTER = 512; // the raster cut takes it: 
 public static const uint PROBE_RT_MERGED_STAGE = 1024; // the mesh of the slot's nearer step has a merged stage
 public static const uint PROBE_RT_LEVELS = 2048;  // the mesh of the slot's nearer step has discrete levels
 public static const uint PROBE_HELD_STEP_GONE = 4096; // its PTLAS instance holds a step the chain no longer has
+public static const uint PROBE_FAR_HELD_GONE = 8192; // its far instance holds a step the chain no longer has
 
 // `ProbeGpu.lists`: the raster lists holding the visible cluster, first pass in the low bits
 // and second pass shifted by PROBE_LIST_SECOND.
@@ -137,6 +138,8 @@ public struct ProbeGpu
     public uint far_model;
     public uint far_cut_count;
     public uint far_held_cut;       // the cut its far part instance holds
+    public uint far_held_step;      // the step its far part instance holds
+    public uint far_held_cut_count; // the cached cuts of that step's mesh
     public uint64_t far_cut_blas;
     public float far_cut_error;     // m, mesh space: this frame's far cut's
     public float far_cut_pixels;    // px at the focus
@@ -377,8 +380,18 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
             o.far_cut_blas = c.blas;
             if (has_focus())
                 o.far_cut_pixels = c.error * o.cut.rt_scale / max(o.far_distance, 1e-3) * root.focus_offset.w;
-            if (o.far_held_cut < far_mesh.rt_cut_count)
-                o.far_held_error = far_mesh.rt_cuts[o.far_held_cut].error;
+        }
+        // A far instance whose update waits can hold another far step than the fade has now,
+        // as the near one can.
+        o.far_held_step = (st.rt_flags >> RT_FAR_STEP_SHIFT) & CHAIN_STEP_MASK;
+        if (o.far_held_step > s.models[base.model].chain_count)
+            o.flags |= PROBE_FAR_HELD_GONE;
+        else
+        {
+            MeshGpu* held_mesh = s.meshes + s.models[step_record(s, base, o.far_held_step).model].mesh;
+            o.far_held_cut_count = held_mesh.rt_cut_count;
+            if (o.far_held_cut < held_mesh.rt_cut_count)
+                o.far_held_error = held_mesh.rt_cuts[o.far_held_cut].error;
         }
     }
 }
