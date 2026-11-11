@@ -405,9 +405,17 @@ fn run(options: &Options) -> Option<Capture> {
     let info = ModelInfo::parse(&head(&archive, AssetId::from_name(&name))).expect("model");
     let (joints, part_joints) = rig(&archive, &info, &hints);
     let parts = part_joints.len() as u32;
+    // A rig's mesh stands in its skeleton's space, which its origin places on the ground's.
+    let origin = match info.header.skeleton {
+        AssetId::NONE => Vec3::ZERO,
+        s => SkeletonInfo::parse(&head(&archive, s))
+            .expect("skeleton")
+            .origin
+            .as_vec3(),
+    };
     let (lo, hi) = (
-        Vec3::from(info.header.bounds.min),
-        Vec3::from(info.header.bounds.max),
+        Vec3::from(info.header.bounds.min) + origin,
+        Vec3::from(info.header.bounds.max) + origin,
     );
     let center = (lo + hi) * 0.5;
     let radius = (hi - lo).length() * 0.5;
@@ -484,9 +492,9 @@ fn run(options: &Options) -> Option<Capture> {
             anchor: DVec3::ZERO,
         })
         .expect("transform group");
-    w.transforms(group, 0, 2)
-        .expect("transforms")
-        .fill(Affine3::IDENTITY.into());
+    let transforms = w.transforms(group, 0, 2).expect("transforms");
+    transforms[0] = Affine3::from_translation(origin).into();
+    transforms[1] = Affine3::IDENTITY.into();
     let poses = w
         .create_transform_group(&TransformGroupDesc {
             count: parts,
