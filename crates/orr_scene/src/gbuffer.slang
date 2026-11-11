@@ -270,6 +270,19 @@ float3 oct_from_code(uint c)
     return oct_unwrap((float2(c & 4095, (c >> 12) & 4095) - 2048.0) / 2047.0);
 }
 
+// 8 bits of a GGX roughness's square root, so that steps in alpha = roughness^2 shrink with
+// it where the lobe is sharp.
+uint roughness_code(float r)
+{
+    return pack_unorm8(sqrt(saturate(r)));
+}
+
+float roughness_from_code(uint c)
+{
+    float s = unpack_unorm8(c);
+    return s * s;
+}
+
 // Whether `s` holds a coat, fuzz or thin film.
 bool gsurface_layered(GSurface s)
 {
@@ -306,7 +319,7 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
             flags |= GBUFFER_LAYERS;
     }
     GBufferWords w;
-    w.a.x = rgb8(p.base_color) | (pack_unorm8(p.specular_roughness) << 24);
+    w.a.x = rgb8(p.base_color) | (roughness_code(p.specular_roughness) << 24);
     w.a.y = oct_encode_snorm16(s.normal);
     w.a.z = pack_rgb9e5(max(p.emission, 0.0));
     uint exponent = weight_exponent(p.specular_weight);
@@ -330,7 +343,7 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
             tint *= (p.subsurface_anisotropy + 1.0) * 0.5;
         w.x.x = rgb8(tint) | (pack_snorm8(p.subsurface_anisotropy) << 24);
         w.x.y = pack_rgb9e5(max(p.subsurface_radius, 0.0));
-        w.x.z = pack_unorm8(p.coat_weight) | (pack_unorm8(p.coat_roughness) << 8) | (ior_code(p.coat_ior) << 16) | (pack_unorm8(p.fuzz_weight) << 24);
+        w.x.z = pack_unorm8(p.coat_weight) | (roughness_code(p.coat_roughness) << 8) | (ior_code(p.coat_ior) << 16) | (pack_unorm8(p.fuzz_weight) << 24);
         w.x.w = pack_unorm8(p.fuzz_roughness) | (pack_unorm8(p.specular_anisotropy) << 8) | (angle_code(p.tangent_angle) << 16) | (pack_unorm8(p.subsurface_weight) << 24);
     }
     if ((flags & GBUFFER_LAYERS) != 0)
@@ -354,7 +367,7 @@ public GSurface decode_gsurface(GBufferWords w)
     uint flags = w.a.w >> 24;
     s.flags = flags;
     p.base_color = from_rgb8(w.a.x);
-    p.specular_roughness = unpack_unorm8(w.a.x >> 24);
+    p.specular_roughness = roughness_from_code(w.a.x >> 24);
     s.normal = oct_decode_snorm16(w.a.y);
     p.emission = unpack_rgb9e5(w.a.z);
     p.metalness = unpack_unorm8(w.a.w);
@@ -400,7 +413,7 @@ public GSurface decode_gsurface(GBufferWords w)
     if ((flags & GBUFFER_EXTENDED) != 0)
     {
         p.coat_weight = unpack_unorm8(w.x.z);
-        p.coat_roughness = unpack_unorm8(w.x.z >> 8);
+        p.coat_roughness = roughness_from_code(w.x.z >> 8);
         p.coat_ior = ior_from_code(w.x.z >> 16);
         p.fuzz_weight = unpack_unorm8(w.x.z >> 24);
         p.fuzz_roughness = unpack_unorm8(w.x.w);

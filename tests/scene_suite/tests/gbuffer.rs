@@ -164,7 +164,7 @@ fn decode_core(a: [u32; 4], b: [u32; 2]) -> Core {
     let e = (b[0] >> 21) & 31;
     Core {
         base_color: rgb8(a[0]),
-        roughness: byte(a[0], 24),
+        roughness: byte(a[0], 24).powi(2),
         normal: oct16(a[1]),
         emission: rgb9e5(a[2]),
         metalness: byte(a[3], 0),
@@ -248,12 +248,19 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
     let d = device();
     const N: usize = 4096;
     let mut rng = Lcg(7);
+    // GGX roughness: both ends, the sharp lobes and the rest.
+    let ggx = |u: f32, k: usize| match k % 8 {
+        0 => 0.0,
+        1 => 1.0,
+        2..=4 => 0.02 + 0.08 * u,
+        _ => u,
+    };
     let cases: Vec<codec::Case> = (0..N)
         .map(|i| {
             let kind = i % 4; // plain, subsurface, thin subsurface, coat and fuzz
             let mut c: codec::Case = bytemuck::Zeroable::zeroed();
             c.base_color = arr(rng.rgb());
-            c.roughness = rng.next();
+            c.roughness = ggx(rng.next(), i);
             c.normal = arr(rng.unit());
             c.metalness = rng.next();
             c.emission = arr(rng.rgb() * 4000.0 * rng.next());
@@ -311,7 +318,7 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 c.coat_darkening = rng.next();
             }
             if kind != 0 {
-                c.coat_roughness = rng.next();
+                c.coat_roughness = ggx(rng.next(), i / 4);
                 c.coat_ior = 0.5 + 6.0 * rng.next();
                 c.fuzz_roughness = rng.next();
                 c.anisotropy = rng.next();
@@ -439,7 +446,17 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             "base color",
             i,
         );
-        close(g.roughness, c.roughness, step8, "roughness", i);
+        // A byte of the root: alpha's steps shrink with it.
+        close(
+            g.roughness.sqrt(),
+            c.roughness.sqrt(),
+            step8,
+            "roughness",
+            i,
+        );
+        if c.roughness == 0.0 || c.roughness == 1.0 {
+            assert_eq!(g.roughness, c.roughness, "case {i} roughness at an end");
+        }
         assert!(angle(g.normal, c.normal) < 7e-5, "case {i} normal");
         assert!(
             angle(g.geometric_normal, c.geometric_normal) < 0.02,
@@ -522,12 +539,18 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
         }
         close(g.coat_weight, c.coat_weight, step8, "coat weight", i);
         close(
-            g.coat_roughness,
-            c.coat_roughness,
+            g.coat_roughness.sqrt(),
+            c.coat_roughness.sqrt(),
             step8,
             "coat roughness",
             i,
         );
+        if c.coat_roughness == 0.0 || c.coat_roughness == 1.0 {
+            assert_eq!(
+                g.coat_roughness, c.coat_roughness,
+                "case {i} coat roughness"
+            );
+        }
         close(
             r(g.coat_ior),
             r(c.coat_ior),
@@ -1875,7 +1898,7 @@ fn each_gbuffer_channel_matches_its_reference() {
                 if (g.a[i][3] >> 24) & EXTENDED == 0 {
                     [0.0; 3]
                 } else {
-                    [byte(x[i][2], 0), byte(x[i][2], 8), byte(x[i][3], 8)]
+                    [byte(x[i][2], 0), byte(x[i][2], 8).powi(2), byte(x[i][3], 8)]
                 }
             }),
         ),
@@ -3676,8 +3699,9 @@ fn a_decal_on_a_wall_matches_between_the_gbuffer_and_a_mirror_reflection() {
         let got = Vec3::new(c.context[1][0], c.context[1][1], c.context[1][2]);
         reflected[i] = arr(got.map(srgb_encode));
         seen[i] = [byte(d.a[j][0], 0), byte(d.a[j][0], 8), byte(d.a[j][0], 16)];
-        reflected_roughness[i] = [c.context[1][3]; 3];
-        seen_roughness[i] = [core.roughness; 3];
+        // Both in the G-buffer's code, the root of the roughness.
+        reflected_roughness[i] = [c.context[1][3].sqrt(); 3];
+        seen_roughness[i] = [byte(d.a[j][0], 24); 3];
         for (k, rgb) in [reflected[i], seen[i]].into_iter().enumerate() {
             if rgb[2] > rgb[0] + 0.3 {
                 stickered[k] += 1;
