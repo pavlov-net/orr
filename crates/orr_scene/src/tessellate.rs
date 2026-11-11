@@ -538,8 +538,8 @@ pub struct TessellationStats {
     pub dice_dropped: u32,
     /// Vertices on patch edges past the weld table, left unwelded.
     pub weld_dropped: u32,
-    /// Edges last frame's view saw neither in its frustum nor in front of its HZB, diced
-    /// at the coarse rate.
+    /// Edges last frame's view saw, where they were then, neither in its frustum nor in front
+    /// of its HZB, diced at the coarse rate.
     pub unseen_edges: u32,
     /// Vertices on patch edges that took another's displaced position.
     pub welded: u32,

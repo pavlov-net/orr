@@ -814,6 +814,10 @@ struct Plane {
     group: TransformGroupId,
     /// The linear part of the entry's transform.
     linear: Mat3,
+    /// Its translation, which `frame` writes when it moves.
+    translation: Vec3,
+    /// The translation last written.
+    placed: Vec3,
     material: MaterialId,
     mesh: PatchMesh,
     /// Positions, attributes, triangles and cluster records of `mesh`, for `patches.slang`.
@@ -902,6 +906,8 @@ impl Plane {
             history,
             group,
             linear: Mat3::IDENTITY,
+            translation: Vec3::ZERO,
+            placed: Vec3::ZERO,
             material,
             mesh,
             gpu,
@@ -952,9 +958,12 @@ impl Plane {
         let fov_y = 0.9;
         {
             let mut w = f.scene(self.scene).unwrap();
-            if let Some(desc) = desc {
+            if desc.is_some() || self.translation != self.placed {
                 w.transforms(self.group, 0, 1).unwrap()[0] =
-                    Affine3::from_mat3_translation(self.linear, Vec3::ZERO).into();
+                    Affine3::from_mat3_translation(self.linear, self.translation).into();
+                self.placed = self.translation;
+            }
+            if let Some(desc) = desc {
                 w.set_producer(PLANE, Some(desc)).unwrap();
             }
             w.set_focus(focus.as_dvec3());
@@ -1445,6 +1454,37 @@ fn tessellation_steps_its_rate_down_near_capacity_and_back_up_with_room() {
         last = plane.stats().lowest_rate_scale;
     }
     assert_eq!(last, 1.0, "rate scale after recovering");
+    assert_clean();
+}
+
+/// Edges judged unseen in the frame the plane moves to `end`, after two frames at `start`, the
+/// camera high above it and the whole plane in view at both.
+fn unseen_after_move(start: Vec3, end: Vec3) -> u32 {
+    let mut plane = Plane::new(1.0);
+    let materials = [plane.material];
+    let desc = plane.desc(&materials, 0, 8192);
+    let (eye, target) = (Vec3::new(0.0, 5.0, 2.5), Vec3::new(0.0, -0.5, -3.0));
+    plane.translation = start;
+    plane.frame(Some(&desc), eye, target, eye);
+    plane.frame(None, eye, target, eye);
+    plane.translation = end;
+    plane.frame(None, eye, target, eye);
+    let stats = plane.stats();
+    assert!(stats.subpatches > 4 * stats.patches, "{stats:?}");
+    assert_eq!(stats.dice_dropped + stats.split_dropped, 0, "{stats:?}");
+    assert_eq!(stats.lowest_rate_scale, 1.0, "{stats:?}");
+    stats.unseen_edges
+}
+
+#[test]
+fn an_entry_moving_away_from_last_frames_view_keeps_the_rate_of_what_it_saw() {
+    // One meter down, deeper than any edge's test sphere, behind where last frame's depth holds
+    // the plane: its edges were seen there.
+    let end = Vec3::new(0.0, -1.0, 0.0);
+    let still = unseen_after_move(end, end);
+    assert_eq!(still, 0, "edges unseen on the still plane");
+    let receding = unseen_after_move(Vec3::ZERO, end);
+    assert_eq!(receding, still, "edges unseen on the receding plane");
     assert_clean();
 }
 

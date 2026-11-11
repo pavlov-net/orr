@@ -11,10 +11,11 @@
 // stream at each;
 // `weld_clear`, `weld` and `weld_apply` give vertices on patch triangle edges that share an
 // undisplaced point one displaced position, which closes uv seams; `finish` keeps the
-// figures. An edge's factor depends only on its endpoints, so patches on both sides of it
-// cut it alike: its undisplaced world length in pixels at the scene focus over the dice rate,
-// times the entry's rate scale, over 15 where last frame's first view of the scene saw
-// neither the edge in its frustum nor in front of its HZB.
+// figures. An edge's factor depends only on its endpoints, this frame's and last frame's, so
+// patches on both sides of it cut it alike: its undisplaced world length in pixels at the
+// scene focus over the dice rate, times the entry's rate scale, over 15 where last frame's
+// first view of the scene saw the edge, where it was then, neither in its frustum nor in front
+// of its HZB.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.atomic;
@@ -111,7 +112,8 @@ Patch load_patch(uint code)
     return p;
 }
 
-// What edge factors read: the entry placed at the focus and at last frame's view.
+// What edge factors read: the entry placed at the focus, and as last frame placed it at last
+// frame's view.
 struct Rates
 {
     Placement focus;
@@ -133,13 +135,19 @@ Rates rates()
     r.seen_test = false;
     if (root.view != nullptr)
     {
+        // Where its group hid it last frame, that view's depth holds nothing of it, and it is
+        // tested where it is now.
         ViewConstants* v = root.view;
-        r.seen_test = producer_placement(s, p, false, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), r.view);
+        int3 cell = v.eye_cell.xyz;
+        uint cell_log2 = uint(v.eye_cell.w);
+        r.seen_test = producer_placement(s, p, true, cell, v.eye_offset.xyz, cell_log2, r.view)
+            || producer_placement(s, p, false, cell, v.eye_offset.xyz, cell_log2, r.view);
     }
     return r;
 }
 
-// Whether last frame's view saw the sphere of `radius` m (entry space) around `center`.
+// Whether last frame's view saw the sphere of `radius` m (entry space) around `center`, both
+// where they were last frame.
 bool seen(Rates r, float3 center, float radius)
 {
     if (!r.seen_test)
@@ -147,16 +155,17 @@ bool seen(Rates r, float3 center, float radius)
     return !sphere_unseen(root.view, root.raster, false, place(r.view, center), radius * r.view.scale);
 }
 
-// Segments edge a-b asks for: the same from either end, bit for bit.
-float edge_factor(Rates r, float3 a, float3 b)
+// Segments edge a-b asks for, which ran from `a0` to `b0` last frame: the same from either
+// end, bit for bit.
+float edge_factor(Rates r, float3 a, float3 b, float3 a0, float3 b0)
 {
     if ((root.flags & TESS_FOCUS) == 0)
         return 1.0;
     precise float len = length(mul(r.focus.linear, a - b));
     precise float d = max(min(length(place(r.focus, a)), length(place(r.focus, b))), FOCUS_NEAR);
     precise float t = len / d * root.focus_offset.w / root.dice_pixels * r.scale;
-    float3 mid = 0.5 * (a + b);
-    if (!seen(r, mid, 0.5 * length(a - b) + r.reach))
+    float3 mid = 0.5 * (a0 + b0);
+    if (!seen(r, mid, 0.5 * length(a0 - b0) + r.reach))
     {
         InterlockedAdd(root.tess.counters[TESS_UNSEEN], 1);
         t *= UNSEEN_RATE;
@@ -175,12 +184,14 @@ void push_dice(PatchItem item)
         InterlockedAdd(t.counters[TESS_DICE_DROPPED], 1);
 }
 
-// Sends the subpatch with corners at `p` to the split queue of pass `level` or the dice
-// list; `item.rate` is set at level 0. A split cuts each edge by a fraction of its factor,
-// so subpatch corners move continuously with the factors as dice points do.
-void classify(Rates r, inout PatchItem item, float3 p[3], uint level)
+// Sends the subpatch with corners at `p`, at `p0` last frame, to the split queue of pass
+// `level` or the dice list; `item.rate` is set at level 0. A split cuts each edge by a
+// fraction of its factor, so subpatch corners move continuously with the factors as dice
+// points do.
+void classify(Rates r, inout PatchItem item, float3 p[3], float3 p0[3], uint level)
 {
-    float3 t = float3(edge_factor(r, p[0], p[1]), edge_factor(r, p[1], p[2]), edge_factor(r, p[2], p[0]));
+    float3 t = float3(edge_factor(r, p[0], p[1], p0[0], p0[1]), edge_factor(r, p[1], p[2], p0[1], p0[2]),
+                      edge_factor(r, p[2], p[0], p0[2], p0[0]));
     // Fixed point, at least one segment (NaN included) and at most what the splits reach.
     float3 f = round(t * float(FACTOR_ONE));
     uint3 q = select(f >= float(FACTOR_ONE), uint3(min(f, float(MAX_FACTOR))), uint3(FACTOR_ONE));
@@ -205,10 +216,22 @@ void classify(Rates r, inout PatchItem item, float3 p[3], uint level)
     push_dice(item);
 }
 
-float3 corner_point(Patch pt, uint3 corner)
+// The point of the patch triangle at `corner`, last frame's with `previous`.
+float3 corner_point(Patch pt, uint3 corner, bool previous)
 {
-    float3 c[3] = pt.current.corners.position;
+    ProducerTriangle tri = previous ? pt.previous : pt.current;
+    float3 c[3] = tri.corners.position;
     return interpolate(c, bary_weights(corner));
+}
+
+// The corners of triangle `i` of patch cluster `k`, last frame's with `previous` where the
+// batch keeps them, as `load_patch` reads them.
+void patch_corners(ProducerBatch b, ProducerClusterGpu k, uint i, bool previous, out float3 p[3])
+{
+    uint3 c = cluster_corners(k, i) + k.first_vertex;
+    float3* positions = previous && b.previous != nullptr ? b.previous : b.positions;
+    for (uint j = 0; j < 3; j++)
+        p[j] = positions[c[j]];
 }
 
 // Steps the rate from last frame's capacity asked for and resets this frame's counts.
@@ -245,8 +268,9 @@ void patches(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     if (!producer_cluster_valid(b, k) || thread >= k.tri_count)
         return;
     InterlockedAdd(root.tess.counters[TESS_PATCHES], 1);
-    float3 p[3];
-    cluster_triangle(b, k, thread, p[0], p[1], p[2]);
+    float3 p[3], p0[3];
+    patch_corners(b, k, thread, false, p);
+    patch_corners(b, k, thread, true, p0);
     PatchItem item;
     item.patch = (c << 7) | thread;
     set_corner(item.corners, 0, uint3(BARY_ONE, 0, 0));
@@ -254,7 +278,7 @@ void patches(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     set_corner(item.corners, 2, uint3(0, 0, BARY_ONE));
     item.rate = 1.0;
     item.zeros = PATCH_ZEROS;
-    classify(rates(), item, p, 0);
+    classify(rates(), item, p, p0, 0);
 }
 
 // Sizes the next split pass and empties the queue it pushes to; with `level` == SPLITS,
@@ -297,7 +321,7 @@ void split(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         uint8_t* tri = table.triangles + 3 * (pattern.tri_first + k);
         PatchItem child = item;
         child.zeros = 0;
-        float3 p[3];
+        float3 p[3], p0[3];
         for (uint j = 0; j < 3; j++)
         {
             uint key = table.vertices[pattern.vertex_first + uint(tri[j])];
@@ -305,9 +329,10 @@ void split(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             child.zeros |= zeros << (3 * j);
             uint3 c = place(pattern_weights(key, q), item.corners, zeros);
             set_corner(child.corners, j, c);
-            p[j] = corner_point(pt, c);
+            p[j] = corner_point(pt, c, false);
+            p0[j] = corner_point(pt, c, true);
         }
-        classify(r, child, p, level + 1);
+        classify(r, child, p, p0, level + 1);
     }
 }
 
