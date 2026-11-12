@@ -25,9 +25,9 @@ use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::scene::{InstanceFlags, ModelId, TransformGroupId};
 use crate::shaders::producer_build::{self, BuildRoot, ProducerBuildGpu};
+use crate::shaders::producer_figures::{self, FiguresRoot, ProducerFigures};
 use crate::shaders::types::{GeneratedClusterGpu, SubdCopyGpu, TessGpu, TessStateGpu};
 use crate::subd::{CageShape, SubdBuild};
-use crate::table::grown;
 use crate::tessellate::{EntryTess, Layout, PATTERNS, Patterns, TessellationStats};
 use crate::{ProducerBatch, ProducerClusterGpu, ProducerGpu, Result, SceneRoot, TopologyGpu};
 use bytemuck::Zeroable;
@@ -350,9 +350,6 @@ pub(crate) struct Producer {
     pub(crate) smoke: bool,
     /// What its geometry may show a path.
     pub(crate) features: crate::SceneFeatures,
-    max_clusters: u32,
-    max_vertices: u32,
-    max_segments: u32,
     /// The clusters the raster culls of it at most: none of a drawn entry, and a strand
     /// entry's ribbon clusters.
     pub(crate) raster_clusters: u32,
@@ -948,9 +945,6 @@ pub(crate) fn build(
                 } else {
                     crate::SceneFeatures::NONE
                 },
-            max_clusters: desc.max_clusters,
-            max_vertices: desc.max_vertices,
-            max_segments: desc.max_segments,
             raster_clusters: if desc.drawn != 0 {
                 0
             } else if strands {
@@ -985,6 +979,7 @@ pub(crate) struct ProducerKernels {
     records: PipelineId,
     gather: PipelineId,
     finish: PipelineId,
+    figures: PipelineId,
 }
 
 impl ProducerKernels {
@@ -1002,6 +997,13 @@ impl ProducerKernels {
             records: c("records")?,
             gather: c("gather")?,
             finish: c("finish")?,
+            figures: p.create(
+                device,
+                kernels,
+                &producer_figures::MODULE,
+                "sum",
+                Default::default(),
+            )?,
         })
     }
 }
@@ -1227,152 +1229,92 @@ impl ProducerStats {
     }
 }
 
-/// A scene's producer counts and states copied back each frame, one copy per frame in
-/// flight, with the capacities of the entries set when it was taken.
+/// A scene's producer figures, summed on the GPU each frame and copied back, one copy per
+/// frame in flight.
 pub(crate) struct Readback {
-    slots: Vec<ReadbackSlot>,
-}
-
-/// A scene's producer state tables, of `entries` entries each.
-pub(crate) struct StateTables {
-    pub(crate) state: GpuPtr<crate::ProducerStateGpu>,
-    pub(crate) tess: GpuPtr<TessStateGpu>,
-    pub(crate) entries: u32,
-}
-
-/// One frame's copy: the state tables whole, and the counts of each set entry in the order of
-/// `taken`.
-#[derive(Default)]
-struct ReadbackSlot {
-    /// Entries of the producer table the state copies hold room for.
-    entries: u32,
-    state: Option<Allocation<crate::ProducerStateGpu>>,
-    tess: Option<Allocation<TessStateGpu>>,
-    /// Set entries the counts hold room for.
-    rows: u32,
-    counts: Option<Allocation<[u32; 4]>>,
-    /// Each set entry, its capacities and whether it is tessellated.
-    taken: Vec<(u32, Capacity, bool)>,
-}
-
-/// An entry's batch capacities, as `FrameStats` reports them.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Capacity {
-    clusters: u32,
-    vertices: u32,
-    segments: u32,
-}
-
-impl Producer {
-    pub(crate) fn capacity(&self) -> Capacity {
-        Capacity {
-            clusters: self.max_clusters,
-            vertices: self.max_vertices,
-            segments: self.max_segments,
-        }
-    }
+    /// What `producer_figures.slang` `sum` writes.
+    sums: Allocation<ProducerFigures>,
+    slots: Allocation<ProducerFigures>,
+    /// Per slot, whether a frame has copied into it.
+    copied: Vec<bool>,
 }
 
 impl Readback {
-    pub(crate) fn new(fif: u32) -> Self {
-        Self {
-            slots: (0..fif.max(1)).map(|_| ReadbackSlot::default()).collect(),
-        }
+    pub(crate) fn new(device: &Device, fif: u32) -> Result<Self> {
+        let slots = u64::from(fif.max(1));
+        Ok(Self {
+            sums: device.gpu_malloc(MemoryKind::DeviceLocal, 1, "producer figures")?,
+            slots: device.gpu_malloc(MemoryKind::Readback, slots, "producer figures readback")?,
+            copied: vec![false; slots as usize],
+        })
     }
 
-    /// Records the copies of slot `slot`, whose frame before has completed: the scene's state
-    /// `tables`, and the counts of each entry of `set`, which gives its entry, where its counts
-    /// are, its capacities and whether it is tessellated. The slot's memory grows as [`grown`]
-    /// says when it holds too little. Fails without memory for that, recording nothing.
-    pub(crate) fn record(
-        &mut self,
+    /// Records the sum over the `entries` entries of the producer table of the scene at
+    /// `scene`, whose tessellation states are at `tess_state`, after the frame's builds.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sum(
+        &self,
         device: &Device,
+        window: &UploadWindow,
         list: &mut CommandList<'_>,
-        slot: usize,
-        tables: &StateTables,
-        set: &[(u32, GpuPtr<[u32; 4]>, Capacity, bool)],
+        p: &Pipelines,
+        k: &ProducerKernels,
+        (scene, tess_state): (GpuPtr<SceneRoot>, GpuPtr<TessStateGpu>),
+        entries: u32,
     ) -> Result<()> {
-        let s = &mut self.slots[slot];
-        let entries = tables.entries;
-        let kind = MemoryKind::Readback;
-        // Every allocation comes first, so a failure leaves the slot as its last frame read it.
-        let states = if entries > s.entries {
-            let n = grown(
-                "producer readback",
-                s.entries,
-                entries - s.entries,
-                u32::MAX,
-            )?;
-            let state = device.gpu_malloc(kind, u64::from(n), "producer state readback")?;
-            let tess = device.gpu_malloc(kind, u64::from(n), "tessellation state readback")?;
-            Some((n, state, tess))
-        } else {
-            None
-        };
-        let rows = set.len() as u32;
-        if rows > s.rows {
-            let n = grown("producer readback", s.rows, rows - s.rows, u32::MAX)?;
-            s.counts = Some(device.gpu_malloc(kind, u64::from(n), "producer counts readback")?);
-            s.rows = n;
-        }
-        if let Some((n, state, tess)) = states {
-            s.state = Some(state);
-            s.tess = Some(tess);
-            s.entries = n;
-        }
-        s.taken = set
-            .iter()
-            .map(|&(i, _, max, tess)| (i, max, tess))
-            .collect();
-        let n = u64::from(entries);
-        if let (Some(to), true) = (&s.state, n > 0) {
-            let bytes = n * size_of::<crate::ProducerStateGpu>() as u64;
-            list.copy(to.gpu().cast(), tables.state.cast(), bytes);
-        }
-        if let (Some(to), true) = (&s.tess, n > 0) {
-            let bytes = n * size_of::<TessStateGpu>() as u64;
-            list.copy(to.gpu().cast(), tables.tess.cast(), bytes);
-        }
-        if let Some(to) = &s.counts {
-            for (row, &(_, counts, ..)) in (0..).zip(set) {
-                list.copy(to.gpu().offset(row).cast(), counts.cast(), 16);
-            }
-        }
+        let root = window.put_root(
+            device,
+            &FiguresRoot {
+                scene,
+                figures: self.sums.gpu(),
+                tess_state,
+                entries,
+                _pad: 0,
+            },
+        )?;
+        list.dispatch(p.get(k.figures), root, [1, 1, 1]);
         Ok(())
     }
 
-    /// The figures of slot `slot`.
+    /// Records the copy of the sums into slot `slot`, whose frame before has completed.
+    pub(crate) fn copy(&mut self, list: &mut CommandList<'_>, slot: usize) {
+        let to = self.slots.gpu().offset(slot as u64);
+        let bytes = size_of::<ProducerFigures>() as u64;
+        list.copy(to.cast(), self.sums.gpu().cast(), bytes);
+        self.copied[slot] = true;
+    }
+
+    /// The figures of slot `slot`: none before a frame has copied into it.
     pub(crate) fn figures(&self, slot: usize) -> (ProducerStats, TessellationStats) {
-        let slot = &self.slots[slot];
-        let slices = (
-            slot.counts.as_ref().and_then(Allocation::as_slice),
-            slot.state.as_ref().and_then(Allocation::as_slice),
-            slot.tess.as_ref().and_then(Allocation::as_slice),
-        );
-        let (Some(counts), Some(state), Some(tess)) = slices else {
+        let Some(f) = self.slots.as_slice().filter(|_| self.copied[slot]) else {
             return Default::default();
         };
-        let mut s = ProducerStats::default();
-        let mut t = TessellationStats::default();
-        for (&(entry, max, tessellated), row) in slot.taken.iter().zip(counts) {
-            if tessellated {
-                t.add_entry(&tess[entry as usize]);
-            }
-            let [clusters, vertices, segments, _] = *row;
-            let st = &state[entry as usize];
-            s.entries += 1;
-            s.clusters += clusters.min(max.clusters);
-            s.cluster_capacity += max.clusters;
-            s.dropped_clusters += clusters.saturating_sub(max.clusters);
-            s.vertices += vertices.min(max.vertices);
-            s.vertex_capacity += max.vertices;
-            s.dropped_vertices += vertices.saturating_sub(max.vertices);
-            s.segments += segments.min(max.segments);
-            s.segment_capacity += max.segments;
-            s.dropped_segments += segments.saturating_sub(max.segments);
-            s.refused += st.refused;
-            s.built += st.clusters;
-        }
-        (s, t)
+        let f = f[slot];
+        let producers = ProducerStats {
+            entries: f.entries,
+            clusters: f.clusters,
+            cluster_capacity: f.cluster_capacity,
+            dropped_clusters: f.dropped_clusters,
+            vertices: f.vertices,
+            vertex_capacity: f.vertex_capacity,
+            dropped_vertices: f.dropped_vertices,
+            segments: f.segments,
+            segment_capacity: f.segment_capacity,
+            dropped_segments: f.dropped_segments,
+            refused: f.refused,
+            built: f.built,
+        };
+        let tessellation = TessellationStats {
+            entries: f.tessellated,
+            patches: f.patches,
+            subpatches: f.subpatches,
+            split_dropped: f.split_dropped,
+            dice_dropped: f.dice_dropped,
+            weld_dropped: f.weld_dropped,
+            unseen_edges: f.unseen_edges,
+            welded: f.welded,
+            lowest_rate_scale: f.lowest_rate_scale,
+        };
+        (producers, tessellation)
     }
 }

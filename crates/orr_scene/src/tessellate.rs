@@ -566,24 +566,6 @@ pub struct TessellationStats {
 }
 
 impl TessellationStats {
-    pub(crate) fn add_entry(&mut self, s: &TessStateGpu) {
-        self.add(&Self {
-            entries: 1,
-            patches: s.patches,
-            subpatches: s.subpatches,
-            split_dropped: s.split_dropped,
-            dice_dropped: s.dice_dropped,
-            weld_dropped: s.weld_dropped,
-            unseen_edges: s.unseen,
-            welded: s.welded,
-            lowest_rate_scale: if s.rate_scale > 0.0 {
-                s.rate_scale
-            } else {
-                1.0
-            },
-        });
-    }
-
     pub(crate) fn add(&mut self, o: &Self) {
         if o.entries == 0 {
             return;

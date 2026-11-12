@@ -37,7 +37,7 @@ use crate::mount::{
 use crate::neural::{NeuralTextures, Precision};
 use crate::pipelines::{MeshPipelineId, MeshStages, PipelineId, Pipelines, ReloadReport};
 use crate::producer::{
-    self, Job, ProducerId, ProducerKernels, ProducerStats, ProducerUpdate, Readback, StateTables,
+    self, Job, ProducerId, ProducerKernels, ProducerStats, ProducerUpdate, Readback,
 };
 use crate::ptlas::{FrameInputs, PtlasPipelines, RtStats};
 use crate::raster::{self, ListSizes, RasterPipelines, TargetSizes, ViewLists, ViewTargets};
@@ -2953,8 +2953,8 @@ impl<'a> Frame<'a> {
     }
 }
 
-/// Builds the producer entries of the listed scenes that build this frame, then copies each
-/// scene's producer counts and states back for [`FrameStats::producers`].
+/// Builds the producer entries of the listed scenes that build this frame, then sums each
+/// scene's producer figures and copies them back for [`FrameStats::producers`].
 fn record_producers(
     device: &Device,
     core: &Core,
@@ -3055,32 +3055,37 @@ fn record_producers(
         }
     }
     drop(jobs);
+    let mut summed = Vec::new();
     for (scene, cpu) in &mut scenes {
-        let capacity = scene.tables.producers.capacity();
-        if capacity == 0 {
+        let entries = scene.tables.producers.capacity();
+        if entries == 0 {
             continue;
         }
         for p in cpu.producers.iter_mut().flatten() {
             p.templates_built = true;
             p.built = true;
         }
-        let set: Vec<_> = cpu
-            .producers
-            .iter()
-            .enumerate()
-            .filter_map(|(i, p)| {
-                p.as_ref()
-                    .map(|p| (i as u32, p.counts, p.capacity(), p.tess.is_some()))
-            })
-            .collect();
-        let tables = StateTables {
-            state: scene.tables.producer_state.gpu(),
-            tess: scene.tables.tess_state.gpu(),
-            entries: capacity,
-        };
-        cpu.producer_readback
-            .get_or_insert_with(|| Readback::new(core.fif))
-            .record(device, list, slot, &tables, &set)?;
+        if cpu.producer_readback.is_none() {
+            cpu.producer_readback = Some(Readback::new(device, core.fif)?);
+        }
+        let readback = cpu.producer_readback.as_ref().expect("made above");
+        let tables = (scene.tables.root.gpu(), scene.tables.tess_state.gpu());
+        readback.sum(
+            device,
+            window,
+            list,
+            pipelines,
+            &core.producers,
+            tables,
+            entries,
+        )?;
+        summed.push(cpu);
+    }
+    list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
+    for cpu in summed {
+        if let Some(readback) = &mut cpu.producer_readback {
+            readback.copy(list, slot);
+        }
     }
     list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
     Ok(())
