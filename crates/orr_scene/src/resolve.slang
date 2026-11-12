@@ -2,8 +2,9 @@
 // and the HZB's finest mip, and lists the tile in every surface bin its pixels use. With
 // device-generated commands `sequences` then writes one sequence per bin with tiles.
 // `resolve` runs once per bin over the bin's tiles with the bin's surface id uniform: each
-// pixel's surface through the linked `Surface` switch, the depth offset applied to depth,
-// position and motion, and the G-buffer written.
+// pixel's surface through the linked `Surface` switch, a drawn pixel's triangle through the
+// linked `Drawn` switch, the depth offset applied to depth, position and motion, and the
+// G-buffer written.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_pack.mesh;
@@ -17,6 +18,7 @@ export static const bool TEXTURE_FEEDBACK = true;
 export static const bool NEURAL_TEXTURES = true;
 
 extern struct Surface : ISurface = StandardSurface;
+extern struct Drawn : IDrawn = NoDrawn;
 
 ORR_ROOT(RasterRoot);
 
@@ -129,7 +131,7 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     if (surface_bin(r, m.surface) != bin && back_bin(s, r, m) != bin)
         return;
 
-    PrimaryHit hit = primary_hit(s, v, vc, visibility_triangle(w), float2(pixel) + 0.5);
+    PrimaryHit hit = primary_hit<Drawn>(s, v, vc, visibility_triangle(w), float2(pixel) + 0.5);
     m = s.materials + hit.input.material;
     if (surface_bin(r, m.surface) != bin)
         return;

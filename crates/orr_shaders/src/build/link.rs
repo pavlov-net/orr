@@ -19,6 +19,8 @@ pub enum LinkPoint {
     Surface,
     /// `IDisplacement`: one switch on the displacement id, `TextureDisplacement` for id 0.
     Displacement,
+    /// `IDrawn`: one switch on the drawn id, `NoDrawn` for id 0.
+    Drawn,
     /// `IEnvironment`: at most one type per build.
     Environment,
     /// `IMedium`: at most one type per build.
@@ -89,10 +91,22 @@ const DISPLACEMENT: Switch = Switch {
     }],
 };
 
+const DRAWN: Switch = Switch {
+    id: "i.drawn",
+    default: "NoDrawn",
+    methods: &[Method {
+        decl: "DrawnTriangle triangle(DrawnInput i)",
+        name: "triangle",
+        args: "i",
+        optional: false,
+    }],
+};
+
 impl LinkPoint {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Surface,
         Self::Displacement,
+        Self::Drawn,
         Self::Environment,
         Self::Medium,
     ];
@@ -101,6 +115,7 @@ impl LinkPoint {
         match self {
             Self::Surface => "ISurface",
             Self::Displacement => "IDisplacement",
+            Self::Drawn => "IDrawn",
             Self::Environment => "IEnvironment",
             Self::Medium => "IMedium",
         }
@@ -111,6 +126,7 @@ impl LinkPoint {
         match self {
             Self::Surface => "orr_scene.surface",
             Self::Displacement => "orr_scene.displacement",
+            Self::Drawn => "orr_scene.drawn",
             Self::Environment => "orr_lighting.environment",
             Self::Medium => "orr_lighting.media",
         }
@@ -120,6 +136,7 @@ impl LinkPoint {
         match self {
             Self::Surface => Some(&SURFACE),
             Self::Displacement => Some(&DISPLACEMENT),
+            Self::Drawn => Some(&DRAWN),
             Self::Environment | Self::Medium => None,
         }
     }
@@ -128,6 +145,7 @@ impl LinkPoint {
         match self {
             Self::Surface => "surface",
             Self::Displacement => "displacement",
+            Self::Drawn => "drawn",
             Self::Environment => "environment",
             Self::Medium => "medium",
         }

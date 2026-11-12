@@ -185,6 +185,8 @@ public struct ProbeRoot
     public float merge_pixels;
     public uint _pad;
 }
+extern struct Drawn : IDrawn = NoDrawn;
+
 ORR_ROOT(ProbeRoot);
 
 bool has_focus()
@@ -464,7 +466,7 @@ void probe(uint3 id: SV_DispatchThreadID)
         probe_cluster(s, o, vc);
     }
 
-    PrimaryHit hit = primary_hit(s, v, vc, o.triangle, float2(pixel) + 0.5);
+    PrimaryHit hit = primary_hit<Drawn>(s, v, vc, o.triangle, float2(pixel) + 0.5);
     o.material = hit.input.material;
     o.distance = hit.distance;
     o.relative = float4(hit.relative, 0.0);

@@ -7,6 +7,7 @@ import orr_shaders.math;
 import orr_shaders.packing;
 import orr_pack.mesh;
 import orr_scene.producer;
+__exported import orr_scene.drawn;
 __exported import orr_scene.hit;
 
 // `RasterGpu.counts` entries.
@@ -124,6 +125,19 @@ public void write_draws(RasterGpu* r, uint list, uint n)
     }
 }
 
+// The index of a new visible cluster, or false past capacity.
+public bool add_visible(RasterGpu* r, VisibleCluster vc, out uint visible)
+{
+    InterlockedAdd(r.counts[COUNT_VISIBLE], 1, visible);
+    if (visible >= r.visible_capacity)
+    {
+        InterlockedAdd(r.counts[COUNT_VISIBLE_DROPPED], 1);
+        return false;
+    }
+    r.gbuffer.clusters[visible] = vc;
+    return true;
+}
+
 // Bytes between the bins' roots: the largest uniform buffer offset alignment Vulkan allows.
 public static const uint BIN_ROOT_STRIDE = 256;
 
@@ -133,7 +147,7 @@ public struct RasterRoot
     public SceneRoot* scene;
     public ViewConstants* view;
     public RasterGpu* raster;
-    public uint value;               // the dispatch's bin or HZB mip
+    public uint value;               // the dispatch's bin, HZB mip or producer entry
     public uint _pad;
 }
 
@@ -524,11 +538,13 @@ public struct PrimaryHit
     public float distance;     // m along the ray
     public Placement placement;
     public float3 object;      // the hit in mesh or entry space
-    public float error;        // m: the cluster's LOD error times the instance scale; 0 on producer clusters
+    public float error;        // m: the cluster's LOD error, or a drawn triangle's, times the instance scale; 0 on producer clusters
+    public float3 previous[3]; // a drawn triangle's corners last frame, in the entry's space
     public uint origin;        // a producer entry's origin policy, else ORIGIN_DEFAULT
 }
 
-// The producer entry a visible cluster names; false for cooked clusters.
+// The producer entry a visible cluster names, by a cluster of its batch or a drawn record;
+// false for cooked clusters.
 public bool visible_producer(SceneRoot* s, VisibleCluster vc, out uint entry)
 {
     entry = 0;
@@ -549,6 +565,42 @@ public bool visible_placement(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     if (!placement(g, previous, inst.group_index, v, copy))
         return false;
     return cluster_placement(s, vc.instance, inst, load_cluster(vc.page, vc.local), copy, previous, p);
+}
+
+// Triangle `triangle` of drawn record `vc` of entry `entry`, as the linked `D` derives it.
+DrawnTriangle drawn_triangle<D : IDrawn>(SceneRoot* s, ViewConstants* v, VisibleCluster vc, uint entry, uint triangle)
+{
+    ProducerGpu p = s.producers[entry];
+    MaterialGpu* m = s.materials + vc.material;
+    DrawnInput i;
+    i.drawn = p.drawn;
+    i.entry = entry;
+    i.user_tag = p.user_tag;
+    i.word = vc.cluster;
+    i.primitive = triangle;
+    i.scene = s;
+    i.view = v;
+    i.data = m.data != 0 ? m.data : s.surface_data;
+    return D.triangle(i);
+}
+
+// The corners of a drawn triangle as a producer cluster's: one uv set, no tangents or colors.
+Corners drawn_corners(DrawnTriangle t)
+{
+    Corners c;
+    c.tangent_set = 0;
+    for (uint j = 0; j < 3; j++)
+    {
+        c.position[j] = t.position[j];
+        VertexAttributes a = (VertexAttributes)0;
+        a.normal = t.normal[j];
+        a.uv[0] = t.uv[j];
+        a.uv[1] = t.uv[j];
+        a.tangent = float4(1.0, 0.0, 0.0, 1.0);
+        a.color = float4(1.0);
+        c.attributes[j] = a;
+    }
+    return c;
 }
 
 // The segment of a strand entry's raster cluster `cluster` that ribbon triangle `triangle`
@@ -592,8 +644,9 @@ float strand_ray(ProducerBatch b, Placement pl, float3 d, inout uint segment)
 // tangent frame in render space (back faces turned to the viewer, as `triangle_geometry`
 // turns them), and the world cell. Without mesh tangents the tangent follows the triangle's uv.
 // On a strand entry's ribbon the ray meets the strand's swept spheres instead
-// (`strand_ray`); the input is a strand hit's (`strand_geometry`).
-public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc, uint triangle, float2 pixel_center)
+// (`strand_ray`); the input is a strand hit's (`strand_geometry`). A drawn record's triangle is
+// the one `D` derives, and the hit's error and previous corners that triangle's.
+public PrimaryHit primary_hit<D : IDrawn>(SceneRoot* s, ViewConstants* v, VisibleCluster vc, uint triangle, float2 pixel_center)
 {
     PrimaryHit hit = (PrimaryHit)0;
     SurfaceInput i = (SurfaceInput)0;
@@ -621,7 +674,19 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     {
         Corners c;
         uint attributes = 0;
-        if (producer)
+        bool drawn = producer && visible_drawn(vc);
+        if (drawn)
+        {
+            DrawnTriangle t = drawn_triangle<D>(s, v, vc, entry, triangle);
+            c = drawn_corners(t);
+            hit.previous = t.previous;
+            i.user_tag = s.producers[entry].user_tag;
+            i.cluster_user = t.cluster_user;
+            i.vertex_user = t.vertex_user;
+            hit.origin = s.producers[entry].origin;
+            hit.error = t.error * pl.scale;
+        }
+        else if (producer)
         {
             ProducerBatch b = s.batches[entry];
             ProducerTriangle pt = producer_triangle(b, b.clusters[vc.cluster], triangle, false);
@@ -658,7 +723,7 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
         triangle_geometry(i, c, attributes, s, vc.material, pl, b.xy, bx, by, d, bias);
         hit.distance = b.z;
         hit.object = (1.0 - b.x - b.y) * c.position[0] + b.x * c.position[1] + b.y * c.position[2];
-        i.cluster = vc.cluster;
+        i.cluster = drawn ? NO_CLUSTER : vc.cluster;
         i.primitive = triangle;
         i.barycentrics = b.xy;
     }
@@ -686,11 +751,18 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     return hit;
 }
 
+// `primary_hit` of a cluster no drawn entry's record names.
+public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc, uint triangle, float2 pixel_center)
+{
+    return primary_hit<NoDrawn>(s, v, vc, triangle, pixel_center);
+}
+
 // Previous uv minus current uv, unjittered, of the point at eye-relative `relative` near `hit`
 // on triangle `triangle` of visible cluster `vc`: its previous position comes from the previous
 // transform of the same mesh-space point. A producer batch with previous positions, a skinned
 // copy skinned by last frame's palette, or an edit whose vertices a kernel moved, moves the
-// point by its vertices' motion too.
+// point by its vertices' motion too, as does a drawn triangle, by the corners `hit` holds of
+// last frame's draw.
 public float2 visible_motion(SceneRoot* s, ViewConstants* v, VisibleCluster vc, PrimaryHit hit, uint triangle, float3 relative)
 {
     float4 current = mul(v.clip_from_view, float4(view_from_relative(v, relative), 1.0));
@@ -707,6 +779,11 @@ public float2 visible_motion(SceneRoot* s, ViewConstants* v, VisibleCluster vc, 
     if (producer && s.producers[entry].strands != 0)
     {
         object += strand_motion(s.batches[entry], hit.input.cluster, hit.input.barycentrics.x);
+    }
+    else if (producer && visible_drawn(vc))
+    {
+        deformed = true;
+        c.position = hit.previous;
     }
     else if (producer)
     {

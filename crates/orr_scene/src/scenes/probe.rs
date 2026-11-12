@@ -5,21 +5,24 @@ use orr_gpu::{Hazards, MemoryKind, ShaderStage, SpecData, Stages};
 use super::{Core, Frame, PoolBytes, Scenes};
 use crate::probe::{self, PendingProbe, PixelProbe, ProbeContext, ProbeSettings, ProbeView};
 use crate::raster::GRID_X;
-use crate::shaders::probe::{MODULE, ProbeGpu, ProbeRoot};
+use crate::shaders::pixel_probe::{MODULE, ProbeGpu, ProbeRoot};
 use crate::view::{RasterView, ViewHistoryId};
 use crate::world::WorldPos;
 use crate::{DetailStats, Error, Result};
 
 impl Core {
-    /// The probe's two pipelines, made at the first probe.
+    /// The probe's two pipelines, made at the first probe from `kernels`' module of the
+    /// probe.
     fn probe_pipelines(
         &mut self,
         device: &orr_gpu::Device,
+        kernels: &orr_gpu::KernelSet,
     ) -> Result<&[orr_gpu::ComputePipeline; 2]> {
         if self.probe.is_none() {
+            let module = kernels.module(&MODULE)?;
             let make = |entry: &str| -> Result<orr_gpu::ComputePipeline> {
-                let stage = ShaderStage::new(&MODULE, entry, SpecData::default())?;
-                Ok(device.create_compute_pipeline(&stage, MODULE.name)?)
+                let stage = ShaderStage::new(module, entry, SpecData::default())?;
+                Ok(device.create_compute_pipeline(&stage, module.name)?)
             };
             self.probe = Some([make("probe")?, make("lists")?]);
         }
@@ -114,7 +117,7 @@ impl Frame<'_> {
             .and_then(Option::as_ref)
             .and_then(|h| h.lists.as_ref())
             .map_or(0, |l| l.sizes().visible_clusters);
-        let [probe, lists] = core.probe_pipelines(device)?;
+        let [probe, lists] = core.probe_pipelines(device, self.kernels)?;
         let list = self.list.as_mut().expect("frame list");
         list.begin_pass("pixel probe", false);
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());

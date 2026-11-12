@@ -65,14 +65,14 @@ pub use orr_scene::{
     EnvironmentData, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupWriter,
     InstanceFlags, InstancePage, InstancePageRef, InstanceRange, InstancesDesc, JobResult, Lens,
     LensDistortion, Light, LightId, LoadState, Loading, MaterialGpu, MaterialId, MaterialWriter,
-    MediumData, ModelId, MountId, NeuralTextures, Opacity, OriginPolicy, PackSource, PageId,
-    PageNeeds, PipelineId, PoolSize, Pose, ProducerBatch, ProducerDesc, ProducerId, ProducerStats,
-    ProducerUpdate, Projection, RasterGpu, ReloadReport, RendererDesc, RequestSource,
-    ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc, SceneId, SceneMemory,
-    SceneRoot, SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats, Span, TextureFilter,
-    TextureSamplerGpu, TextureStreamGpu, TransformGroupDesc, TransformGroupId, TransparencyPass,
-    ViewConstants, ViewDesc, ViewHistoryId, ViewStep, WorldPos, abi, binding_sampler,
-    material_flags, orr_gpu, orr_pack,
+    MediumData, MeshPipelineId, MeshStages, ModelId, MountId, NeuralTextures, Opacity, OpaqueHook,
+    OpaquePass, OriginPolicy, PackSource, PageId, PageNeeds, PipelineId, PoolSize, Pose,
+    ProducerBatch, ProducerDesc, ProducerId, ProducerStats, ProducerUpdate, Projection, RasterGpu,
+    ReloadReport, RendererDesc, RequestSource, ResidencyClass, ResidencyStats, RtStats,
+    SceneCompute, SceneDesc, SceneId, SceneMemory, SceneRoot, SkeletonRef, SkinStats, SkinnedDesc,
+    SkinnedPageRef, SkyStats, Span, TextureFilter, TextureSamplerGpu, TextureStreamGpu,
+    TransformGroupDesc, TransformGroupId, TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId,
+    ViewStep, WorldPos, abi, binding_sampler, material_flags, orr_gpu, orr_pack,
 };
 
 use orr_gpu::{
@@ -149,6 +149,11 @@ pub type TransparencyHook<'a> =
 /// The consumer passes a view runs, each once per `render_view` that sets it.
 #[derive(Default)]
 pub struct ViewHooks<'a> {
+    /// In each pass of the view's raster, into its visibility buffer: the draws of the scene's
+    /// drawn producer entries (`ProducerDesc::drawn`), through the consumer's task and mesh
+    /// pipelines. It runs once, or twice in a frame whose raster culls against the previous
+    /// frame's depth, and also while the path tracing kernels compile.
+    pub opaque: Option<&'a mut OpaqueHook<'a>>,
     /// Into the view's transparency overlay after its opaque and dielectric lighting and
     /// media apply, at the render extent, with the view's [`ParticleLighting`] for this
     /// frame, which [`ParticleDraw`] and a hook's own `particle_shade` light and fog
@@ -993,6 +998,17 @@ impl Renderer {
         Ok(self.scenes.compute_pipeline(module, entry, spec)?)
     }
 
+    /// A mesh pipeline of `module`'s `stages`, created on the calling thread. Hot reload
+    /// replaces it with the module's other pipelines, as it does a compute one; look it up
+    /// each frame with [`Frame::mesh_pipeline`].
+    pub fn mesh_pipeline(
+        &mut self,
+        module: &'static ShaderModule,
+        stages: &MeshStages<'_>,
+    ) -> Result<MeshPipelineId> {
+        Ok(self.scenes.mesh_pipeline(module, stages)?)
+    }
+
     /// Step 1: waits until the frame `frames_in_flight` back has completed, sleeps on the
     /// display's low latency handle, opens the next frame and the display's slot for it.
     pub fn begin_frame<'a>(&'a mut self, desc: FrameDesc<'a>) -> Result<Frame<'a>> {
@@ -1070,6 +1086,11 @@ impl<'a> Frame<'a> {
         self.scenes.pipeline(id)
     }
 
+    /// The current mesh pipeline of `id`.
+    pub fn mesh_pipeline(&self, id: MeshPipelineId) -> &'a orr_gpu::MeshPipeline {
+        self.scenes.mesh_pipeline(id)
+    }
+
     /// What hot reload applied at this frame's step 1.
     pub fn reloads(&self) -> &[ReloadReport] {
         self.scenes.reloads()
@@ -1123,8 +1144,18 @@ impl<'a> Frame<'a> {
     /// outputs, the G-buffer that kernels read through `load_gsurface` and the scene root
     /// whose TLAS they trace, for passes it records after it into [`Frame::list`].
     pub fn raster_view(&mut self, view: &ViewDesc) -> Result<RasterView> {
+        self.raster_view_with(view, None)
+    }
+
+    /// [`Frame::raster_view`], with `opaque` drawing the scene's drawn producer entries
+    /// (`ProducerDesc::drawn`) in each pass of the view's raster, as [`ViewHooks::opaque`] does.
+    pub fn raster_view_with(
+        &mut self,
+        view: &ViewDesc,
+        opaque: Option<&mut OpaqueHook<'_>>,
+    ) -> Result<RasterView> {
         self.prepare_raster_view(view)?;
-        let raster = self.scenes.raster_view(view)?;
+        let raster = self.scenes.raster_view_with(view, &[], opaque)?;
         if let Some(at) = take_probe(&mut self.probes, view.history) {
             self.scenes.probe(&raster, at)?;
         }
@@ -1398,7 +1429,9 @@ impl<'a> Frame<'a> {
                 .restart_exposure(view.history, output.exposure.start())?;
             state.output.exposure_restarted(id);
         }
-        let raster = self.scenes.raster_view_with(&desc, &requests)?;
+        let raster = self
+            .scenes
+            .raster_view_with(&desc, &requests, hooks.opaque.as_deref_mut())?;
         let gpu = self.output.device.clone();
         if let Some(at) = take_probe(&mut self.probes, view.history) {
             let probe = ProbeAt {
@@ -1770,7 +1803,9 @@ impl<'a> Frame<'a> {
         if set.any() {
             requests.extend(orr_output::hook_requests(extent));
         }
-        let raster = self.scenes.raster_view_with(&desc, &requests)?;
+        let raster = self
+            .scenes
+            .raster_view_with(&desc, &requests, hooks.opaque.as_deref_mut())?;
         if let Some(at) = take_probe(&mut self.probes, view.history) {
             let probe = ProbeAt {
                 frame: id,

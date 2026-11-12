@@ -1,8 +1,8 @@
 //! A view's raster half: instance and cluster culling over the scene's raster candidate
 //! cut, the mesh-shader and software raster into the visibility buffer, both in two passes
-//! around an HZB of the first, the dielectric and presence clusters into the layer tiles, the
-//! material resolve per surface bin into the G-buffer and motion, the final HZB, and the
-//! depth target.
+//! around an HZB of the first, the opaque hook's draws in each, the dielectric and presence
+//! clusters into the layer tiles, the material resolve per surface bin into the G-buffer and
+//! motion, the final HZB, and the depth target.
 
 use std::alloc::Layout;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use orr_gpu::{
 };
 
 use crate::arena::{ArenaBuffer, ArenaRequest, ArenaTexture, Span, ViewArena, ViewStep};
+use crate::drawn::{OpaqueHook, OpaquePass};
 use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::shaders::{cull, hzb, raster, resolve};
@@ -726,8 +727,10 @@ fn bin_root(roots: GpuPtr<RasterRoot>, bin: u32) -> GpuPtr<RasterRoot> {
 
 /// Records one view's raster half into `list`. With `occlusion` the first pass tests the
 /// previous frame's HZB, which the view's previous render left. `preprocess` is memory of
-/// [`RasterPipelines::preprocess_layout`], when it gives one. Returns the raster record of
-/// each mesh draw over a list, the first of which every other pass takes.
+/// [`RasterPipelines::preprocess_layout`], when it gives one. `producers` are the entries
+/// whose clusters the raster culls, each with the most it holds. `opaque` draws in each pass
+/// after the lists' draws. Returns the raster record of each mesh draw over a list, the
+/// first of which every other pass takes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record(
     device: &Device,
@@ -739,11 +742,12 @@ pub(crate) fn record(
     lists: &ViewLists,
     scene: GpuPtr<SceneRoot>,
     slots: u32,
-    producer_capacity: u32,
+    producers: &[(u32, u32)],
     view: GpuPtr<ViewConstants>,
     software_pixels: f32,
     occlusion: bool,
     preprocess: Option<GpuPtr<u8>>,
+    mut opaque: Option<&mut OpaqueHook<'_>>,
 ) -> Result<Vec<GpuPtr<RasterGpu>>> {
     let s = targets.sizes;
     let (raster, record) = window.slice::<RasterGpu>(device, 1)?;
@@ -795,7 +799,7 @@ pub(crate) fn record(
         depth: None,
     };
 
-    let raster_stages = Stages::MESH | Stages::PIXEL;
+    let raster_stages = Stages::TASK | Stages::MESH | Stages::PIXEL;
     let culled = |list: &mut CommandList<'_>, pass: GpuPtr<RasterRoot>| {
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         list.dispatch(pipelines.get(p.cap), pass, [1, 1, 1]);
@@ -809,9 +813,9 @@ pub(crate) fn record(
             Hazards::DRAW_ARGUMENTS,
         );
     };
-    // The software dispatch and the hardware draws share no barrier, so they overlap; both
+    // The software dispatch and the hardware draws share no barrier, so they overlap; all
     // write the visibility buffer by atomic max.
-    let draw = |list: &mut CommandList<'_>| {
+    let mut draw = |list: &mut CommandList<'_>, second: bool| {
         list.dispatch_indirect(pipelines.get(p.software), r0, grid(ARGS_SOFTWARE));
         list.begin_rendering(&rendering);
         for (i, [opaque, alpha]) in (0..).zip(&draw_roots) {
@@ -821,6 +825,18 @@ pub(crate) fn record(
             );
             list.draw_mesh_tasks_indirect_count(&p.opaque, *opaque, o, one, 1);
             list.draw_mesh_tasks_indirect_count(&p.alpha, *alpha, a, one, 1);
+        }
+        if let Some(hook) = opaque.as_mut() {
+            hook(&mut OpaquePass {
+                cmd: list,
+                extent: s.extent,
+                view,
+                scene,
+                raster,
+                second,
+                device,
+                window,
+            });
         }
         list.end_rendering();
         list.barrier(
@@ -839,14 +855,17 @@ pub(crate) fn record(
     list.dispatch(pipelines.get(p.clear), r0, [cleared.div_ceil(64), 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
     list.dispatch(pipelines.get(p.instances), r0, slot_groups);
-    if producer_capacity > 0 {
-        list.dispatch(pipelines.get(p.producers), r0, [producer_capacity, 1, 1]);
+    for &(entry, clusters) in producers {
+        // A grid of whole rows: its threads past the entry's clusters find none.
+        let groups = clusters.div_ceil(64);
+        let grid = [groups.min(GRID_X), groups.div_ceil(GRID_X), 1];
+        list.dispatch(pipelines.get(p.producers), root(entry)?, grid);
     }
     culled(list, r0);
     list.end_pass();
 
     list.begin_pass("raster", false);
-    draw(list);
+    draw(list, false);
     list.end_pass();
 
     // The second pass: what the first found occluded, against an HZB of what it drew.
@@ -855,7 +874,7 @@ pub(crate) fn record(
         reduce_hzb(list, pipelines, p, targets, &root, Some(r0))?;
         list.dispatch(pipelines.get(p.instances), r1, slot_groups);
         culled(list, r1);
-        draw(list);
+        draw(list, true);
         list.end_pass();
     }
 

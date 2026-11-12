@@ -1,8 +1,9 @@
 //! Producer entries in raster and ray tracing: a grass field whose cluster count changes
 //! every frame against a CPU caster of the same blades, the producer words a linked surface
 //! reads at primary and secondary hits, capacity and drops in `FrameStats`, particle
-//! entries, drawn only at the transparency point and traced under the particle mask, and
-//! tessellated entries: a plane of patches with a uv seam diced at mixed rates against a CPU
+//! entries, drawn only at the transparency point and traced under the particle mask, a
+//! drawn entry, whose blades an opaque hook's mesh stage draws and the resolve derives again,
+//! and tessellated entries: a plane of patches with a uv seam diced at mixed rates against a CPU
 //! reference of the pattern table, closed in raster and rays once displaced, with normals
 //! of its displaced field, displaced by a material texture, and a rate that steps down
 //! near capacity; and subdivision copies: closed cages with creases, a corner, n-gons and
@@ -37,22 +38,26 @@ use orr_scene::testing::{
 use orr_scene::{
     AffineRows, ClusterTopology, Frame, FrameDesc, FrameTime, GeneratedClusterGpu, GroupWriter,
     InstanceFlags, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, ModelId, MountId,
-    Opacity, PackSource, ProducerBatch, ProducerClusterGpu, ProducerDesc, ProducerId,
+    Opacity, OpaquePass, PackSource, ProducerBatch, ProducerClusterGpu, ProducerDesc, ProducerId,
     ProducerStateGpu, ProducerStats, ProducerUpdate, Projection, RasterView, RendererDesc,
     SceneDesc, SceneId, SceneWriter, Scenes, SubdDesc, TessellationStats, TextureFilter,
     TransformGroupDesc, TransformGroupId, TransparencyPass, ViewDesc, ViewHistoryId,
     material_flags, tessellation,
 };
 use orr_shaders::bytemuck::Zeroable;
+use scene_suite::shaders::types::BladeField;
 use scene_suite::shaders::{
-    blades, cage_colors, particle_draw, patches, producer_rays, strand_rays, strands, tess_rays,
+    blades, cage_colors, drawn_blades, particle_draw, patches, producer_rays, strand_rays, strands,
+    tess_rays,
 };
 use scene_suite::{Workers, linked, pipeline};
 
 const EXTENT: [u32; 2] = [160, 96];
 const FIELD: ProducerId = ProducerId(1);
+const STORED: ProducerId = ProducerId(3);
 const PARTICLES: ProducerId = ProducerId(2);
 const FIELD_WORD: u32 = 1000;
+const STORED_WORD: u32 = 5000;
 const PARTICLE_WORD: u32 = 100;
 const MAX_BLADES: u32 = 256;
 /// The words surface's id in the suite's linked kernels.
@@ -63,6 +68,16 @@ const MASK_PARTICLE: u32 = 2;
 const MASK_DIELECTRIC: u32 = 0x80;
 
 const BLADE: [[u8; 3]; 3] = [[0, 1, 2], [1, 3, 2], [2, 3, 4]];
+/// `blade_shape.slang`.
+const DRAWN_GROUP: u32 = 8;
+
+/// The field's camera.
+const EYE: Vec3 = Vec3::new(0.0, 0.3, 1.0);
+const TARGET: Vec3 = Vec3::new(-0.1, 0.1, -2.0);
+const PROJECTION: Projection = Projection {
+    fov_y: 0.9,
+    near: 0.05,
+};
 
 fn time(frame: u32) -> FrameTime {
     FrameTime {
@@ -132,6 +147,13 @@ struct Emit {
     time: f32,
     z: f32,
     base: u32,
+}
+
+/// The drawn blades of a frame: the scene's surface data, their count and their draw.
+struct Drawn<'a> {
+    field: GpuPtr<BladeField>,
+    count: u32,
+    pipeline: &'a orr_gpu::MeshPipeline,
 }
 
 /// A transparency hook and the radiance it composites over.
@@ -230,8 +252,19 @@ impl Field {
     /// Runs one frame emitting `emits` and rasters the camera's view; `hook` runs at the
     /// transparency point over `radiance`.
     fn frame(&mut self, emits: &[Emit], hook: Option<Hook<'_>>) -> RasterView {
+        self.frame_with(emits, None, hook)
+    }
+
+    /// [`Self::frame`], with the view's opaque hook drawing the blades of `drawn`.
+    fn frame_with(
+        &mut self,
+        emits: &[Emit],
+        drawn: Option<Drawn<'_>>,
+        hook: Option<Hook<'_>>,
+    ) -> RasterView {
         let p = pipeline(&blades::MODULE, "main");
         let list = [self.scene];
+        let desc = self.view();
         let mut f = self
             .scenes
             .begin_frame(&FrameDesc {
@@ -241,6 +274,11 @@ impl Field {
             })
             .unwrap();
         let triangles = self.triangles.gpu();
+        if let Some(d) = &drawn {
+            f.scene(self.scene)
+                .unwrap()
+                .set_surface_data(d.field.address());
+        }
         f.update_scenes(&mut |c| {
             for e in emits {
                 let r = c
@@ -261,32 +299,48 @@ impl Field {
             }
         })
         .unwrap();
-        let eye = Vec3::new(0.0, 0.3, 1.0);
-        let view = f
-            .raster_view(&ViewDesc {
-                scene: self.scene,
-                history: self.history,
-                position: eye.as_dvec3(),
-                rotation: look(eye, Vec3::new(-0.1, 0.1, -2.0)),
-                projection: Projection {
-                    fov_y: 0.9,
-                    near: 0.05,
-                },
-                lens: Lens::default(),
-                render_extent: UVec2::from(EXTENT),
-                output_extent: UVec2::from(EXTENT),
-                jitter: Vec2::ZERO,
-                camera_cut: self.frame <= 2,
-                mip_bias: 0.0,
-                texture_filter: TextureFilter::Hardware,
-            })
-            .unwrap();
+        let mut draw = |pass: &mut OpaquePass<'_, '_>| {
+            let d = drawn.as_ref().expect("a hook only with blades to draw");
+            let root = pass
+                .put_root(&drawn_blades::Root {
+                    scene: pass.scene,
+                    view: pass.view,
+                    raster: pass.raster,
+                    field: d.field,
+                })
+                .unwrap();
+            let groups = d.count.div_ceil(DRAWN_GROUP);
+            pass.cmd.draw_mesh_tasks(d.pipeline, root, [groups, 1, 1]);
+        };
+        let opaque: Option<&mut orr_scene::OpaqueHook<'_>> = match &drawn {
+            Some(_) => Some(&mut draw),
+            None => None,
+        };
+        let view = f.raster_view_with(&desc, &[], opaque).unwrap();
         if let Some((radiance, hook)) = hook {
             f.transparency(&view, radiance, hook).unwrap();
         }
         self.frame += 1;
         wait(f.end(&[]).unwrap());
         view
+    }
+
+    /// The camera's view this frame.
+    fn view(&self) -> ViewDesc {
+        ViewDesc {
+            scene: self.scene,
+            history: self.history,
+            position: EYE.as_dvec3(),
+            rotation: look(EYE, TARGET),
+            projection: PROJECTION,
+            lens: Lens::default(),
+            render_extent: UVec2::from(EXTENT),
+            output_extent: UVec2::from(EXTENT),
+            jitter: Vec2::ZERO,
+            camera_cut: self.frame <= 2,
+            mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
+        }
     }
 
     /// The producer stats of the last frame, which the next frame's start retires.
@@ -528,6 +582,167 @@ fn grass_changes_cluster_count_every_frame_and_draws_and_traces_only_this_frames
         assert_eq!(stats.entries, 1);
         assert_eq!(stats.cluster_capacity, MAX_BLADES);
     }
+    assert_clean();
+}
+
+/// The reverse-Z depth and the uv of `p` through the field's camera.
+fn project(p: Vec3) -> (f32, Vec2) {
+    let view = look(EYE, TARGET).inverse() * (p - EYE);
+    let clip = PROJECTION.clip_from_view(UVec2::from(EXTENT)) * view.extend(1.0);
+    (
+        clip.z / clip.w,
+        Vec2::new(clip.x, clip.y) / clip.w * 0.5 + 0.5,
+    )
+}
+
+#[test]
+fn a_drawn_entry_shows_its_hook_s_blades_among_stored_ones_with_their_words_depth_and_motion() {
+    let d = device();
+    let mut field = Field::new(0.0);
+    let materials = [field.material];
+    field.set(
+        FIELD,
+        &ProducerDesc {
+            materials: &materials,
+            transform: (field.group, 0),
+            flags: InstanceFlags::RASTER,
+            drawn: linked::drawn::BLADES,
+            user_tag: 77,
+            ..ProducerDesc::default()
+        },
+    );
+    let stage =
+        |entry| ShaderStage::new(&drawn_blades::MODULE, entry, SpecData::default()).unwrap();
+    let draw = d
+        .create_mesh_pipeline(
+            &MeshPipelineDesc {
+                pixel: Some(stage("pixel")),
+                ..MeshPipelineDesc::new(stage("mesh"))
+            },
+            "drawn blades",
+        )
+        .unwrap();
+    // Stored blades stand between the drawn rows, so each kind hides the other somewhere.
+    let topology = [ClusterTopology {
+        vertex_count: 5,
+        triangles: &BLADE,
+    }];
+    let raster_only = ProducerDesc {
+        flags: InstanceFlags::RASTER,
+        ..blade_desc(field.group, &topology, &materials)
+    };
+    field.set(STORED, &raster_only);
+    let stored = Emit {
+        id: STORED,
+        count: 32,
+        time: 0.4,
+        z: -1.6,
+        base: STORED_WORD,
+    };
+    let (count, t, before, z) = (200, 2.1, 1.9, -1.0);
+    let mut blades = d
+        .gpu_malloc::<BladeField>(MemoryKind::Upload, 1, "blade field")
+        .unwrap();
+    blades.as_mut_slice().unwrap()[0] = BladeField {
+        count,
+        time: t,
+        previous_time: before,
+        z,
+        base: FIELD_WORD,
+        producer: FIELD.0,
+        _pad0: 0,
+        _pad1: 0,
+    };
+    // The third frame's raster runs both passes, with the hook in each.
+    let mut frame = || {
+        let drawn = Drawn {
+            field: blades.gpu(),
+            count,
+            pipeline: &draw,
+        };
+        field.frame_with(&[stored], Some(drawn), None)
+    };
+    let mut view = frame();
+    for _ in 0..2 {
+        view = frame();
+    }
+    let seen = rays(&view, 0, MASK_OPAQUE);
+    // The nearer of the drawn and the stored blades on each pixel's ray, as its entry + 1, and
+    // the drawn hit where that is the nearer.
+    let (entry, stored_entry) = (FIELD.0 + 1, STORED.0 + 1);
+    let mut want = Vec::new();
+    let mut hits = Vec::new();
+    for s in &seen {
+        let ray = |set| cast(Vec3::from(s.origin), Vec3::from(s.direction), &[set]);
+        let (a, b) = (
+            ray((count, t, z)),
+            ray((stored.count, stored.time, stored.z)),
+        );
+        let front = match (a, b) {
+            (Some(a), Some(b)) => a.2 < b.2,
+            (a, _) => a.is_some(),
+        };
+        hits.push(a.filter(|_| front));
+        want.push(if front {
+            a.map(|(i, tri, _)| (entry, words(FIELD_WORD, i, tri)))
+        } else {
+            b.map(|(i, tri, _)| (stored_entry, words(STORED_WORD, i, tri)))
+        });
+    }
+    let got: Vec<_> = seen
+        .iter()
+        .map(|s| (s.raster_entry != 0).then(|| (s.raster_entry, raster_words(s))))
+        .collect();
+    for (name, e) in [("drawn", entry), ("stored", stored_entry)] {
+        let of = |x: &Option<(u32, [f32; 4])>| x.filter(|x| x.0 == e);
+        let covered = want.iter().filter(|w| of(w).is_some()).count();
+        let bad = want
+            .iter()
+            .zip(&got)
+            .filter(|(w, g)| of(w) != of(g))
+            .count();
+        assert!(covered > 100, "{name} blades cover {covered} pixels");
+        assert!(bad * 50 <= covered, "{name} words: {bad} of {covered}");
+    }
+
+    let whole = |t: &Texture| read_texture(t, &TextureRegion::whole_mip(t.desc(), 0));
+    let depth: Vec<f32> = bytemuck::pod_collect_to_vec(&whole(&view.depth));
+    let motion: Vec<[u16; 2]> = bytemuck::pod_collect_to_vec(&whole(&view.motion));
+    let mut checked = 0;
+    for (k, (s, hit)) in seen.iter().zip(&hits).enumerate() {
+        let Some((i, tri, distance)) = *hit else {
+            continue;
+        };
+        if s.raster_entry != entry || raster_words(s) != words(FIELD_WORD, i, tri) {
+            continue;
+        }
+        assert_eq!(s.raster_more[1], 77.0, "user tag");
+        let at = Vec3::from(s.origin) + Vec3::from(s.direction) * distance as f32;
+        let corner = |time: f32| BLADE[tri].map(|c| blade_vertex(i, usize::from(c), time, z));
+        let now = corner(t);
+        // The hit's weights of corners 1 and 2, which hold on the blade as it was.
+        let (e1, e2, r) = (now[1] - now[0], now[2] - now[0], at - now[0]);
+        let n = e1.cross(e2);
+        let (u, v) = (r.cross(e2).dot(n) / n.dot(n), e1.cross(r).dot(n) / n.dot(n));
+        let was = corner(before);
+        let last = was[0] + (was[1] - was[0]) * u + (was[2] - was[0]) * v;
+        let (want_depth, uv) = project(at);
+        let (_, last_uv) = project(last);
+        assert!(
+            (depth[k] - want_depth).abs() <= 1e-4 * want_depth,
+            "pixel {k}: depth {} for {want_depth}",
+            depth[k]
+        );
+        let got = Vec2::from(motion[k].map(|bits| half::f16::from_bits(bits).to_f32()));
+        assert!(
+            (got - (last_uv - uv)).abs().max_element() <= 2e-4,
+            "pixel {k}: motion {got} for {}",
+            last_uv - uv
+        );
+        checked += 1;
+    }
+    assert!(checked > 100, "{checked} pixels checked");
+    assert_eq!(field.stats().built, 0, "entries without rays build nothing");
     assert_clean();
 }
 

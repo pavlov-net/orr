@@ -51,6 +51,8 @@ const TUBE_SIDES: u32 = 6;
 const TUBE_SEGMENTS: u32 = 6;
 const TUBE_SEGMENT_VERTICES: u32 = 2 * TUBE_SIDES;
 const TUBE_VERTICES: u32 = TUBE_SEGMENT_VERTICES * TUBE_SEGMENTS;
+/// `producer.slang` `STRAND_GROUP`: segments per raster cluster of a strand entry.
+const STRAND_GROUP: u32 = 64;
 /// Swept-sphere builds read two NaN vertices past a strand batch's maximum.
 const SENTINELS: u32 = 2;
 
@@ -203,7 +205,15 @@ pub struct ProducerDesc<'a> {
     /// A tessellated entry's batch keeps a `GeneratedClusterGpu` per generated cluster: the
     /// subpatch the tessellator diced into it, for the CPU to read back. No kernel reads it.
     pub generated_records: bool,
+    /// Without `RAY` the entry builds no acceleration structures.
     pub flags: InstanceFlags,
+    /// The linked `IDrawn` id of a drawn entry; 0 for none. A drawn entry's opaque raster is not
+    /// its clusters: the consumer's task and mesh stages draw it from each view's opaque hook
+    /// (`drawn_raster.slang`), and the material resolve derives every visible triangle again
+    /// through the linked type, so nothing is stored per triangle. Rays trace the clusters its
+    /// kernel emits, which may be none and need not be the triangles it draws. It is `Opaque`
+    /// or `AlphaTested`, which is how its clusters trace, and neither strands nor tessellated.
+    pub drawn: u8,
     /// Read by linked surfaces and hit shading through `SurfaceInput`, never by orr.
     pub user_tag: u32,
 }
@@ -229,6 +239,7 @@ impl Default for ProducerDesc<'_> {
             vertex_user: false,
             generated_records: false,
             flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            drawn: 0,
             user_tag: 0,
         }
     }
@@ -318,8 +329,8 @@ impl Swept {
 }
 
 /// An entry's acceleration-structure builds; none where the device has no cluster
-/// acceleration structures. A swept-sphere entry has `swept` alone; a tube entry builds
-/// through its one template.
+/// acceleration structures and for an entry without `RAY`. A swept-sphere entry has `swept`
+/// alone; a tube entry builds through its one template.
 struct Accel {
     record: GpuPtr<ProducerBuildGpu>,
     strands: bool,
@@ -339,6 +350,9 @@ pub(crate) struct Producer {
     max_clusters: u32,
     max_vertices: u32,
     max_segments: u32,
+    /// The clusters the raster culls of it at most: none of a drawn entry, and a strand
+    /// entry's ribbon clusters.
+    pub(crate) raster_clusters: u32,
     /// Its templates have built.
     pub(crate) templates_built: bool,
     /// A `Static` entry has built.
@@ -507,8 +521,20 @@ pub(crate) fn build(
         assert_eq!(desc.materials.len(), 1, "a strand entry has one material");
         assert_eq!(desc.opacity, Opacity::Opaque, "a strand entry is opaque");
     }
+    if desc.drawn != 0 {
+        assert!(
+            !strands && !desc.tessellated,
+            "a drawn entry is neither strands nor tessellated"
+        );
+        assert!(
+            matches!(desc.opacity, Opacity::Opaque | Opacity::AlphaTested),
+            "a drawn entry is opaque or alpha-tested"
+        );
+    }
     let caps = device.caps();
-    let traced = caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0;
+    let traced = caps.cluster.max_tris > 0
+        && caps.cluster.max_partitions > 0
+        && desc.flags.0 & InstanceFlags::RAY.0 != 0;
     let swept = traced && strands && caps.lss;
     let tubes = traced && strands && !caps.lss;
     let tube_triangles = if tubes { tube_triangles() } else { Vec::new() };
@@ -897,7 +923,7 @@ pub(crate) fn build(
             displacement: u32::from(desc.displacement),
             tessellated: u32::from(tessellated),
             strands: u32::from(strands),
-            _pad: 0,
+            drawn: u32::from(desc.drawn),
         },
         batch: drawn_batch,
         patches,
@@ -916,6 +942,13 @@ pub(crate) fn build(
             max_clusters: desc.max_clusters,
             max_vertices: desc.max_vertices,
             max_segments: desc.max_segments,
+            raster_clusters: if desc.drawn != 0 {
+                0
+            } else if strands {
+                desc.max_segments.div_ceil(STRAND_GROUP)
+            } else {
+                desc.max_clusters
+            },
             templates_built: n_topo == 0 || tessellated,
             built: false,
             emit_counts,
@@ -1156,9 +1189,9 @@ pub struct ProducerStats {
     pub segment_capacity: u32,
     /// Segments emitted past `max_segments`, dropped.
     pub dropped_segments: u32,
-    /// Emitted clusters the build refused: more than 128 triangles or 256 vertices,
-    /// vertices outside the batch, or an unknown topology; and emitted segments with a
-    /// vertex outside the batch or a position or radius that is not finite or a negative
+    /// Emitted clusters the builds of traced entries refused: more than 128 triangles or 256
+    /// vertices, vertices outside the batch, or an unknown topology; and emitted segments with
+    /// a vertex outside the batch or a position or radius that is not finite or a negative
     /// radius. They are neither drawn nor traced.
     pub refused: u32,
     /// CLAS in the entries' BLAS, and segments of strand entries' BLAS.

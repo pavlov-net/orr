@@ -191,12 +191,13 @@ impl Build {
     /// kernel of the [`link_points`](Self::link_points) files that declares `point`.
     ///
     /// Each such kernel is compiled once more with a generated module that exports the
-    /// kernel's `extern struct`, and goes into `KERNELS` in `orr_kernels.rs`. Surfaces and
-    /// displacements become one `switch` on the input's id: ids run from 1 in call order,
-    /// id 0 and unknown ids call the default type, and `orr_kernels.rs` holds the ids as
-    /// `surface::<NAME>` and `displacement::<NAME>`. Environment and medium take one call
-    /// each at most. A `module` under a prefixed root is imported by its name there; any other
-    /// is imported by its file stem, and its directory joins the include path.
+    /// kernel's `extern struct`, and goes into `KERNELS` in `orr_kernels.rs`. Surfaces,
+    /// displacements and drawn geometry become one `switch` each on the input's id: ids run
+    /// from 1 in call order, id 0 and unknown ids call the default type, and `orr_kernels.rs`
+    /// holds the ids as `surface::<NAME>`, `displacement::<NAME>` and `drawn::<NAME>`.
+    /// Environment and medium take one call each at most. A `module` under a prefixed root is
+    /// imported by its name there; any other is imported by its file stem, and its directory
+    /// joins the include path.
     pub fn link(
         mut self,
         point: LinkPoint,

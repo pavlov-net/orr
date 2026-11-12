@@ -522,6 +522,7 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
                 scene_referred: Some(&mut scene_referred),
                 display_linear: Some(&mut display_linear),
                 ui: None,
+                opaque: None,
             }
         } else {
             ViewHooks::default()
@@ -636,6 +637,7 @@ fn frames_around_the_compile(
                     scene_referred: Some(&mut scene_referred),
                     display_linear: Some(&mut display_linear),
                     ui: None,
+                    opaque: None,
                 }
             } else {
                 ViewHooks::default()

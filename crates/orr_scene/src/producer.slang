@@ -84,7 +84,7 @@ public struct ProducerGpu
     public uint displacement;    // linked IDisplacement id; 0: the material's texture
     public uint tessellated;     // 1: clusters are base patches for the tessellator
     public uint strands;         // 1: a strand entry, which emits segments instead of clusters
-    public uint _pad;
+    public uint drawn;           // linked IDrawn id of a drawn entry, whose opaque raster the view's opaque hook draws; 0: its clusters raster
 }
 
 // `ProducerStateGpu.rt_flags`.

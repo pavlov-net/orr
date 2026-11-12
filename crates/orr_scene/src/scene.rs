@@ -223,7 +223,7 @@ pub struct InstanceFlags(pub u8);
 impl InstanceFlags {
     pub const RASTER: Self = Self(1);
     pub const RAY: Self = Self(2);
-    /// Traced for shadows only.
+    /// Its opaque clusters are traced and not rastered.
     pub const CAST_ONLY: Self = Self(4);
     /// The bits consumers set; orr keeps the others.
     const CONSUMER: u8 = 7;
@@ -2716,6 +2716,7 @@ impl<'f> SceneWriter<'f> {
             vertex_user: false,
             generated_records: false,
             flags: d.flags,
+            drawn: 0,
             user_tag: d.user_tag,
         };
         let build = SubdBuild {

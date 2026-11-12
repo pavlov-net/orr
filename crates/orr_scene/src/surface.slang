@@ -40,7 +40,7 @@ public struct SurfaceInput
 {
     public HitContext context;
     public uint instance;           // instance slot or producer entry
-    public uint cluster;            // mesh cluster index
+    public uint cluster;            // mesh cluster index; NO_CLUSTER on a drawn triangle
     public uint part;
     public uint primitive;          // triangle in the cluster
     public float2 barycentrics;     // weights of corners 1 and 2

@@ -1,8 +1,8 @@
 //! Builds the suite's kernels against orr_scene's shader root, `hot/` from a copy in
 //! `OUT_DIR` that the hot reload test edits, and orr_scene's and the suite's kernels with
 //! the surfaces of `surfaces/` linked: the parallax card as surface 1, the context probe as
-//! 2, the steady surface as 3, the producer words as 4, and the ripple and cliffs
-//! displacements as 1 and 2.
+//! 2, the steady surface as 3, the producer words as 4, the ripple and cliffs displacements
+//! as 1 and 2, and the drawn blades' geometry as drawn 1.
 
 use std::env;
 use std::fs;
@@ -60,6 +60,12 @@ fn main() {
                 "cliffs",
                 surface("cliffs"),
                 "Cliffs",
+            )
+            .link(
+                LinkPoint::Drawn,
+                "blades",
+                surface("drawn_blades"),
+                "DrawnBlades",
             )
             .compile()
     });

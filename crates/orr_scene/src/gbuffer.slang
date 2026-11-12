@@ -93,7 +93,7 @@ public struct GSurface
     public float raster_error;      // m: an upper bound on the raster LOD error; 0 = none
     public uint flags;              // GBUFFER_* and the origin policy
     public uint instance;           // the visible triangle: instance slot,
-    public uint cluster;            // mesh cluster index,
+    public uint cluster;            // mesh cluster index, NO_CLUSTER on a drawn triangle,
     public uint primitive;          // triangle in the cluster
     public uint material;
     public float4 medium_point;     // uv sets 0 and 1, where a medium entered here reads: `material_medium`
@@ -104,7 +104,7 @@ public struct VisibleCluster
 {
     public uint8_t* page;           // its resident page
     public uint instance;
-    public uint cluster;            // mesh cluster index
+    public uint cluster;            // mesh cluster index; a drawn record's word
     public uint local;              // index in the page; a producer cluster's VISIBLE_* flags
     public uint material;
 }
@@ -113,6 +113,17 @@ public struct VisibleCluster
 // software raster its triangles whose screen rect fits `software_limit` and the hardware
 // path the others.
 public static const uint VISIBLE_BY_SIZE = 1;
+// A drawn entry's record (`orr_scene.drawn_raster`): no cluster of its batch.
+public static const uint VISIBLE_DRAWN = 2;
+
+// `GSurface.cluster` of a drawn triangle, which no cluster holds.
+public static const uint NO_CLUSTER = 0xffffffffu;
+
+// Whether `vc` is a drawn entry's record.
+public bool visible_drawn(VisibleCluster vc)
+{
+    return vc.page == nullptr && (vc.local & VISIBLE_DRAWN) != 0;
+}
 
 // Visibility buffer words: reverse-Z f32 depth in the high word, then the visible cluster
 // (25 bits) and the triangle (7 bits). 0 = no geometry.
@@ -481,7 +492,7 @@ public GSurface load_gsurface(ViewConstants* view, GBufferGpu* g, uint2 pixel)
     s.position = render_from_view(view, view_position(view, uv, depth));
     s.normal = lean_normal(s.normal, normalize(view.eye_render.xyz - s.position));
     s.instance = c.instance;
-    s.cluster = c.cluster;
+    s.cluster = visible_drawn(c) ? NO_CLUSTER : c.cluster;
     s.primitive = visibility_triangle(vis);
     s.material = c.material;
     return s;

@@ -48,6 +48,7 @@ mod clas_pool;
 mod clusters;
 mod decals;
 mod detail;
+mod drawn;
 mod edit;
 mod features;
 mod lights;
@@ -92,6 +93,7 @@ pub use orr_shaders::{PathEntry, abi};
 
 pub use arena::{ArenaReport, ArenaRequest, ArenaTarget, ArenaTexture, Span, ViewArena, ViewStep};
 pub use decals::{Decal, DecalChannels, DecalId};
+pub use drawn::{OpaqueHook, OpaquePass};
 pub use edit::{EditDesc, EditId, EditRef};
 pub use features::SceneFeatures;
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
@@ -101,7 +103,7 @@ pub use medium_proxy::{MediumProxy, MediumProxyId, ProxyDensity, VolumeRef};
 pub use memory::{ClasPages, PoolFill, SceneMemory, WindowFill};
 pub use mount::{ClipRef, InstancePage, LoadState, MountId, PackSource, PageId, SkeletonRef};
 pub use neural::NeuralTextures;
-pub use pipelines::{PipelineId, ReloadReport};
+pub use pipelines::{MeshPipelineId, MeshStages, PipelineId, ReloadReport};
 pub use probe::{
     PixelProbe, PlanOutcome, ProbeSettings, ProbeTap, ProbeTile, ProbeView, UnitState, UnitStatus,
 };
@@ -119,7 +121,7 @@ pub use scenes::{
     Budgets, ConsumerMarker, DetailStats, Frame, FrameDesc, FrameStats, PoolSize, RendererDesc,
     SceneCompute, Scenes,
 };
-pub use shaders::probe::{ProbeGpu, ProbeTexture};
+pub use shaders::pixel_probe::{ProbeGpu, ProbeTexture};
 pub(crate) use shaders::types::{
     BlasJob, CutKey, DecalBinGpu, EditGpu, FeedbackGpu, GroupGpu, MaskGpu, MediumProxyGpu,
     NeuralMipGpu, NeuralSetGpu, NeuralTextureGpu, NodeItem, PartGpu, PartListGpu, ProducerGpu,

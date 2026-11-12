@@ -1,13 +1,14 @@
 // Per pixel, what the raster and a traced ray see of producer entries, through the linked
-// surface: mode 0 reads the visibility buffer at the pixel and traces the camera ray through
-// its center as a primary hit; mode 1 traces straight down from a grid over the field as a
-// secondary hit. Rays commit every candidate under `mask`.
+// surface and, for a drawn entry's pixels, geometry: mode 0 reads the visibility buffer at the
+// pixel and traces the camera ray through its center as a primary hit; mode 1 traces straight
+// down from a grid over the field as a secondary hit. Rays commit every candidate under `mask`.
 #include "orr_root.h"
 import orr_shaders.trace;
 import orr_scene.hit;
 import orr_scene.visibility;
 
 extern struct Surface : ISurface = StandardSurface;
+extern struct Drawn : IDrawn = NoDrawn;
 
 struct Seen
 {
@@ -70,7 +71,7 @@ void main(uint3 id: SV_DispatchThreadID)
             VisibleCluster vc = root.gbuffer.clusters[visibility_cluster(w)];
             if (visible_producer(s, vc, entry))
             {
-                PrimaryHit p = primary_hit(s, v, vc, visibility_triangle(w), float2(pixel) + 0.5);
+                PrimaryHit p = primary_hit<Drawn>(s, v, vc, visibility_triangle(w), float2(pixel) + 0.5);
                 float offset;
                 GSurface g = Surface.surface(p.input, offset);
                 o.raster_entry = entry + 1;

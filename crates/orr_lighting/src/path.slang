@@ -371,7 +371,8 @@ public PathVertex hit_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
 }
 
 // The error of the cut ray tracing holds for slot copy `copy`, in render space; 0 when the
-// copy is not traced and for producer entries, which trace what they raster.
+// copy is not traced and for producer entries, which trace the clusters they raster and
+// give a drawn triangle's error as its raster error.
 public float traced_error(SceneRoot* s, uint copy)
 {
     uint slot = copy_slot(copy);
@@ -1860,7 +1861,7 @@ public bool surface_chains(PathRoot r, GSurface g)
     uint entry;
     if (hit_producer(s, g.instance, entry))
     {
-        uint m = traced_material(s, g.instance, g.cluster);
+        uint m = g.cluster == NO_CLUSTER ? g.material : traced_material(s, g.instance, g.cluster);
         return m != MATERIAL_NONE && (s.materials[m].flags & MATERIAL_CASTER) != 0 && source.entries[entry].count > 0;
     }
     if ((g.instance & COPY_FAR) != 0)

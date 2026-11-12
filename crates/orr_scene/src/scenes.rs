@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use orr_gpu::{
     Allocation, ClearColor, ColorAttachment, ColorLoad, CommandList, ComputePipeline,
     DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM, Device, GpuAddress, GpuPtr, Hazards, KernelSet,
-    LatencyMarker, LowLatency, MemoryKind, PassResult, QueueKind, Rendering, SamplerDesc,
-    SamplerIndex, ShaderModule, SpecData, Stages, StorageImageIndex, TextureIndex, TimelinePoint,
+    LatencyMarker, LowLatency, MemoryKind, MeshPipeline, PassResult, QueueKind, Rendering,
+    SamplerDesc, SamplerIndex, ShaderModule, SpecData, Stages, StorageImageIndex, TextureIndex,
+    TimelinePoint,
 };
 use orr_math::{DVec3, Vec3};
 use orr_pack::AssetId;
@@ -22,6 +23,7 @@ use crate::arena::{ArenaReport, ArenaRequest, ViewArena, ViewStep};
 use crate::clusters::ClusterTable;
 use crate::decals::{self, build_bins};
 use crate::detail::{Detail, Sample};
+use crate::drawn::OpaqueHook;
 use crate::features::SceneFeatures;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
@@ -32,7 +34,7 @@ use crate::mount::{
     SkeletonRef, TableSizes,
 };
 use crate::neural::{NeuralTextures, Precision};
-use crate::pipelines::{PipelineId, Pipelines, ReloadReport};
+use crate::pipelines::{MeshPipelineId, MeshStages, PipelineId, Pipelines, ReloadReport};
 use crate::producer::{self, Job, ProducerKernels, ProducerStats, ProducerUpdate, Readback};
 use crate::ptlas::{FrameInputs, PtlasPipelines, RtStats};
 use crate::raster::{self, ListSizes, RasterPipelines, TargetSizes, ViewLists, ViewTargets};
@@ -658,6 +660,25 @@ impl Scenes {
         let id = self
             .pipelines
             .create(&self.device, self.kernels, module, entry, spec)?;
+        #[cfg(feature = "hot-reload")]
+        self.reloader
+            .watch(self.pipelines.recipes.last().expect("just created").module);
+        Ok(id)
+    }
+
+    /// A mesh pipeline of `module`'s `stages`, created on the calling thread, as
+    /// [`Self::compute_pipeline`] creates a compute one: hot reload replaces it with the
+    /// module's other pipelines, so the stages of a drawn entry's draw change in the frame
+    /// the resolve's linked geometry does. Look it up each frame with
+    /// [`Frame::mesh_pipeline`].
+    pub fn mesh_pipeline(
+        &mut self,
+        module: &'static ShaderModule,
+        stages: &MeshStages<'_>,
+    ) -> Result<MeshPipelineId> {
+        let id = self
+            .pipelines
+            .create_mesh(&self.device, self.kernels, module, stages)?;
         #[cfg(feature = "hot-reload")]
         self.reloader
             .watch(self.pipelines.recipes.last().expect("just created").module);
@@ -1638,6 +1659,11 @@ impl<'a> Frame<'a> {
         self.pipelines.get(id)
     }
 
+    /// The current mesh pipeline of `id`.
+    pub fn mesh_pipeline(&self, id: MeshPipelineId) -> &'a MeshPipeline {
+        self.pipelines.mesh(id)
+    }
+
     /// Tells orr that kernels change edit `id` at this frame's scene compute point, so its
     /// clusters' culling data and CLAS rebuild right after it. False, with nothing to
     /// rebuild: the frame's [`Budgets::edit_triangles`] is spent or the edit is not ready,
@@ -2441,7 +2467,7 @@ impl<'a> Frame<'a> {
     /// moves its history on. Lays out the view's arena with the raster's transient targets
     /// alone and enters [`ViewStep::Raster`].
     pub fn raster_view(&mut self, view: &ViewDesc) -> Result<RasterView> {
-        self.raster_view_with(view, &[])
+        self.raster_view_with(view, &[], None)
     }
 
     /// What `scene` may hold now: [`RasterView::features`] before the view is rastered.
@@ -2451,11 +2477,13 @@ impl<'a> Frame<'a> {
     }
 
     /// [`Self::raster_view`], with `requests`, the transient targets of the passes that
-    /// follow it, laid out in the view's arena beside the raster's.
+    /// follow it, laid out in the view's arena beside the raster's, and with `opaque`
+    /// drawing the scene's drawn producer entries in each pass of the raster.
     pub fn raster_view_with(
         &mut self,
         view: &ViewDesc,
         requests: &[ArenaRequest],
+        opaque: Option<&mut OpaqueHook<'_>>,
     ) -> Result<RasterView> {
         self.ensure_updated()?;
         if !self.listed.contains(&view.scene) {
@@ -2479,21 +2507,26 @@ impl<'a> Frame<'a> {
                 core.cell_log2,
             )
             .to_array();
-        let (slots, slot_capacity, smoke, scene_features, work) = {
+        let (slots, slot_capacity, smoke, scene_features, work, producers) = {
             let cpu = scene.cpu.lock().unwrap();
             let features = cpu.features();
             let smoke = features.contains(SceneFeatures::SMOKE);
             let cuts = cpu.cuts.as_ref().expect("an updated scene has cut tables");
+            let producers: Vec<(u32, u32)> = (0..)
+                .zip(&cpu.producers)
+                .filter_map(|(entry, p)| Some((entry, p.as_ref()?.raster_clusters)))
+                .filter(|&(_, clusters)| clusters > 0)
+                .collect();
             (
                 cpu.ptlas.high_water,
                 cpu.slot_capacity(),
                 smoke,
                 features,
                 cuts.candidate_capacity(),
+                producers,
             )
         };
         let features = core.features() | scene_features;
-        let producer_capacity = scene.desc.producer_capacity;
         let sizes = TargetSizes {
             extent: view.render_extent.to_array(),
             extended: core.materials.any_extended(),
@@ -2571,11 +2604,12 @@ impl<'a> Frame<'a> {
             lists,
             root,
             slots,
-            producer_capacity,
+            &producers,
             constants,
             core.software_raster_pixels,
             occlusion,
             preprocess,
+            opaque,
         )?;
         let raster = draws[0];
         let slot = (self.id % u64::from(core.fif)) as usize;

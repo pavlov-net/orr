@@ -12,10 +12,10 @@ use orr_pack::mesh::Group;
 
 use crate::material::material_flags as mf;
 use crate::mount::Mounts;
-use crate::shaders::probe::{ProbeGpu, ProbeTexture};
+use crate::shaders::pixel_probe::{ProbeGpu, ProbeTexture};
 use crate::{DetailStats, MountId, ResidencyStats};
 
-/// `PROBE_*` in `probe.slang`.
+/// `PROBE_*` in `pixel_probe.slang`.
 const GEOMETRY: u32 = 1;
 const PRODUCER: u32 = 2;
 const FOCUS: u32 = 4;

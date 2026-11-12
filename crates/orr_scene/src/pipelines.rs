@@ -1,12 +1,12 @@
-//! Compute pipelines created through `Scenes`, which hot reload replaces when their kernels
-//! change.
+//! Compute and mesh pipelines created through `Scenes`, which hot reload replaces when their
+//! kernels change.
 
 use std::ptr;
 use std::sync::Arc;
 
 use orr_gpu::{
-    ComputePipeline, Device, ExecutionSet, KernelSet, ShaderModule, ShaderStage, SpecData,
-    SpecEntry,
+    ColorTarget, ComputePipeline, DepthTarget, Device, ExecutionSet, KernelSet, MeshPipeline,
+    MeshPipelineDesc, RasterState, ShaderModule, ShaderStage, SpecData, SpecEntry,
 };
 
 use crate::Result;
@@ -17,6 +17,40 @@ use crate::shaders::{
 /// A compute pipeline of [`crate::Scenes::compute_pipeline`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct PipelineId(u32);
+
+/// A mesh pipeline of [`crate::Scenes::mesh_pipeline`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct MeshPipelineId(u32);
+
+/// A mesh pipeline of one module: its entry points and what it draws into.
+#[derive(Clone, Copy, Debug)]
+pub struct MeshStages<'a> {
+    pub task: Option<&'a str>,
+    pub mesh: &'a str,
+    /// `None`: no pixel stage; only depth is written.
+    pub pixel: Option<&'a str>,
+    /// Color targets in attachment order.
+    pub colors: &'a [ColorTarget],
+    pub depth: Option<DepthTarget>,
+    pub raster: RasterState,
+    /// Rasterization samples per pixel: 1, or more for pipelines with no targets.
+    pub samples: u32,
+}
+
+impl<'a> MeshStages<'a> {
+    /// A mesh stage alone: no targets, default raster state, one sample.
+    pub fn new(mesh: &'a str) -> Self {
+        Self {
+            task: None,
+            mesh,
+            pixel: None,
+            colors: &[],
+            depth: None,
+            raster: RasterState::default(),
+            samples: 1,
+        }
+    }
+}
 
 /// What hot reload did to a kernel, reported at the step 1 that applied it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -41,42 +75,98 @@ pub(crate) struct Code {
     pub(crate) metallib_fragment: Arc<[u8]>,
 }
 
-/// What a recipe makes: a pipeline, or an execution set holding the pipeline alone, which
-/// device-generated sequences run.
+/// What a recipe makes: a compute pipeline, an execution set holding the pipeline alone, which
+/// device-generated sequences run, or a mesh pipeline.
 pub(crate) enum Made {
     Pipeline(ComputePipeline),
     Set(ExecutionSet),
+    Mesh(MeshPipeline),
+}
+
+/// What a recipe makes of its module.
+enum Kind {
+    Compute {
+        entry: String,
+        spec_entries: Vec<SpecEntry>,
+        spec_bytes: Vec<u8>,
+        set: bool,
+    },
+    Mesh {
+        task: Option<String>,
+        mesh: String,
+        pixel: Option<String>,
+        colors: Vec<ColorTarget>,
+        depth: Option<DepthTarget>,
+        raster: RasterState,
+        samples: u32,
+    },
 }
 
 /// How a pipeline was made, so a reload can make it again from new SPIR-V.
 pub(crate) struct Recipe {
     pub(crate) module: &'static ShaderModule,
-    entry: String,
-    spec_entries: Vec<SpecEntry>,
-    spec_bytes: Vec<u8>,
-    set: bool,
+    kind: Kind,
 }
 
 impl Recipe {
     /// The pipeline or set, from `code` in place of the module's SPIR-V when given.
     pub(crate) fn create(&self, device: &Device, code: Option<&Code>) -> Result<Made> {
-        let spec = SpecData {
-            entries: &self.spec_entries,
-            bytes: &self.spec_bytes,
+        let stage = |entry: &str, spec| -> Result<ShaderStage<'_>> {
+            let mut stage = ShaderStage::new(self.module, entry, spec)?;
+            if let Some(code) = code {
+                stage.spirv = &code.spirv;
+                stage.metallib = &code.metallib;
+                stage.metallib_fragment = &code.metallib_fragment;
+                // The module's sidecar describes the build's SPIR-V; a reload embeds its own.
+                stage.debug_info = "";
+            }
+            Ok(stage)
         };
-        let mut stage = ShaderStage::new(self.module, &self.entry, spec)?;
-        if let Some(code) = code {
-            stage.spirv = &code.spirv;
-            stage.metallib = &code.metallib;
-            stage.metallib_fragment = &code.metallib_fragment;
-            // The module's sidecar describes the build's SPIR-V; a reload embeds its own.
-            stage.debug_info = "";
-        }
         let name = self.module.name;
-        Ok(if self.set {
-            Made::Set(device.create_compute_set(&[stage], name)?)
-        } else {
-            Made::Pipeline(device.create_compute_pipeline(&stage, name)?)
+        Ok(match &self.kind {
+            Kind::Compute {
+                entry,
+                spec_entries,
+                spec_bytes,
+                set,
+            } => {
+                let spec = SpecData {
+                    entries: spec_entries,
+                    bytes: spec_bytes,
+                };
+                let stage = stage(entry, spec)?;
+                if *set {
+                    Made::Set(device.create_compute_set(&[stage], name)?)
+                } else {
+                    Made::Pipeline(device.create_compute_pipeline(&stage, name)?)
+                }
+            }
+            Kind::Mesh {
+                task,
+                mesh,
+                pixel,
+                colors,
+                depth,
+                raster,
+                samples,
+            } => {
+                let optional = |entry: &Option<String>| {
+                    entry
+                        .as_deref()
+                        .map(|e| stage(e, SpecData::default()))
+                        .transpose()
+                };
+                let desc = MeshPipelineDesc {
+                    task: optional(task)?,
+                    mesh: stage(mesh, SpecData::default())?,
+                    pixel: optional(pixel)?,
+                    colors,
+                    depth: *depth,
+                    raster: *raster,
+                    samples: *samples,
+                };
+                Made::Mesh(device.create_mesh_pipeline(&desc, name)?)
+            }
         })
     }
 }
@@ -169,30 +259,72 @@ impl Pipelines {
         spec: SpecData<'_>,
         set: bool,
     ) -> Result<PipelineId> {
-        let recipe = Recipe {
-            module: kernels.module(own)?,
+        let kind = Kind::Compute {
             entry: entry.to_owned(),
             spec_entries: spec.entries.to_vec(),
             spec_bytes: spec.bytes.to_vec(),
             set,
         };
+        Ok(PipelineId(self.make(device, kernels, own, kind)?))
+    }
+
+    /// The mesh pipeline of `own`'s `stages`, from `kernels`' module of the same kernel file
+    /// when it holds one, and from the module's latest reload when it has reloaded.
+    pub(crate) fn create_mesh(
+        &mut self,
+        device: &Device,
+        kernels: &KernelSet,
+        own: &'static ShaderModule,
+        stages: &MeshStages<'_>,
+    ) -> Result<MeshPipelineId> {
+        let kind = Kind::Mesh {
+            task: stages.task.map(str::to_owned),
+            mesh: stages.mesh.to_owned(),
+            pixel: stages.pixel.map(str::to_owned),
+            colors: stages.colors.to_vec(),
+            depth: stages.depth,
+            raster: stages.raster,
+            samples: stages.samples,
+        };
+        Ok(MeshPipelineId(self.make(device, kernels, own, kind)?))
+    }
+
+    /// Makes `kind` of `own` and returns its place in the list.
+    fn make(
+        &mut self,
+        device: &Device,
+        kernels: &KernelSet,
+        own: &'static ShaderModule,
+        kind: Kind,
+    ) -> Result<u32> {
+        let recipe = Recipe {
+            module: kernels.module(own)?,
+            kind,
+        };
         let made = recipe.create(device, self.code_of(recipe.module))?;
         self.recipes.push(Arc::new(recipe));
         self.list.push(made);
-        Ok(PipelineId(self.list.len() as u32 - 1))
+        Ok(self.list.len() as u32 - 1)
     }
 
     pub(crate) fn get(&self, id: PipelineId) -> &ComputePipeline {
         match &self.list[id.0 as usize] {
             Made::Pipeline(p) => p,
-            Made::Set(_) => panic!("{id:?} is an execution set"),
+            _ => panic!("{id:?} is not a compute pipeline"),
         }
     }
 
     pub(crate) fn set(&self, id: PipelineId) -> &ExecutionSet {
         match &self.list[id.0 as usize] {
             Made::Set(s) => s,
-            Made::Pipeline(_) => panic!("{id:?} is a pipeline"),
+            _ => panic!("{id:?} is not an execution set"),
+        }
+    }
+
+    pub(crate) fn mesh(&self, id: MeshPipelineId) -> &MeshPipeline {
+        match &self.list[id.0 as usize] {
+            Made::Mesh(p) => p,
+            _ => panic!("{id:?} is not a mesh pipeline"),
         }
     }
 

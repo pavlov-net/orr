@@ -197,19 +197,6 @@ bool skinned_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement
     return cluster_frustum_visible(v, r, layer_class(class_id), place(p, 0.5 * (lo + hi)), 0.5 * length(hi - lo) * p.scale);
 }
 
-// The visible-cluster index of a new entry, or false past capacity.
-bool add_visible(RasterGpu* r, VisibleCluster vc, out uint visible)
-{
-    InterlockedAdd(r.counts[COUNT_VISIBLE], 1, visible);
-    if (visible >= r.visible_capacity)
-    {
-        InterlockedAdd(r.counts[COUNT_VISIBLE_DROPPED], 1);
-        return false;
-    }
-    r.gbuffer.clusters[visible] = vc;
-    return true;
-}
-
 void append(RasterGpu* r, uint count, uint* list, uint visible)
 {
     uint slot;
@@ -366,10 +353,11 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     r.work[at] = out;
 }
 
-// One workgroup per producer entry, its threads over the clusters it emitted. Opaque and
-// alpha-tested entries join the raster lists; particle entries the particle list;
-// dielectric and presence entries the coverage list. A strand entry's clusters are its
-// segments in groups of STRAND_GROUP, drawn as ribbons.
+// One dispatch per producer entry with clusters to cull, the root's value its id: a thread per
+// cluster it may emit, over a workgroup grid. Opaque and alpha-tested entries join the raster
+// lists; particle entries the particle list; dielectric and presence entries the coverage
+// list. A strand entry's clusters are its segments in groups of STRAND_GROUP, drawn as
+// ribbons. A drawn entry's clusters are only traced.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
@@ -377,15 +365,13 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     SceneRoot* s = root.scene;
     ViewConstants* v = root.view;
     RasterGpu* r = root.raster;
-    uint entry = group.x;
-    if (entry >= s.producer_capacity)
-        return;
+    uint entry = root.value;
     ProducerGpu p = s.producers[entry];
     bool particle = p.opacity == PRODUCER_PARTICLE;
     bool smoke = p.opacity == PRODUCER_SMOKE;
     bool sections = p.opacity == PRODUCER_SECTIONS;
     bool entry_layer = p.opacity == PRODUCER_DIELECTRIC || p.opacity == PRODUCER_PRESENCE;
-    if (!sections && !(entry_layer ? layer_traced(p.flags) : opaque_rastered(p.flags)))
+    if (p.drawn != 0 || (!sections && !(entry_layer ? layer_traced(p.flags) : opaque_rastered(p.flags))))
         return;
     Placement pl;
     if (!producer_placement(s, p, false, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), pl))
@@ -393,70 +379,69 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     ProducerBatch b = s.batches[entry];
     bool strands = p.strands != 0;
     uint n = strands ? (emitted_segments(b) + STRAND_GROUP - 1) / STRAND_GROUP : emitted_clusters(b);
-    uint strand = strands ? strand_material(p) : MATERIAL_NONE;
-    for (uint c = thread; c < n; c += 64)
+    uint c = 64 * grid_index(group) + thread;
+    if (c >= n)
+        return;
+    uint material = strands ? strand_material(p) : MATERIAL_NONE;
+    float3 lo, hi;
+    if (strands)
     {
-        uint material = strand;
-        float3 lo, hi;
-        if (strands)
-        {
-            if (!strand_cluster_box(b, c, lo, hi))
-                continue;
-        }
-        else
-        {
-            ProducerClusterGpu k = b.clusters[c];
-            if (!producer_cluster_valid(b, k))
-                continue;
-            material = producer_material(p, k);
-            producer_cluster_box(b, k, lo, hi);
-        }
-        if (material == MATERIAL_NONE)
-            continue;
-        bool layer = entry_layer;
-        if (sections)
-        {
-            uint class_id = material_class(s.materials + material);
-            layer = layer_class(class_id);
-            if (!class_rastered(class_id, p.flags))
-                continue;
-        }
-        float3 center = place(pl, 0.5 * (lo + hi));
-        float radius = 0.5 * length(hi - lo) * pl.scale;
-        if (!cluster_frustum_visible(v, r, layer, center, radius))
-            continue;
-        // Diced clusters that displacement stretches past the software raster's limit
-        // split their triangles between the two paths by size.
-        float size;
-        bool fits = r.software_pixels > 0.0 && !particle && !smoke && !layer && screen_size(v, pl, lo, hi, size);
-        bool software = fits && size <= software_limit(r);
-        bool by_size = fits && !software && p.tessellated != 0;
-        VisibleCluster vc;
-        vc.page = nullptr;
-        vc.instance = s.producer_base + entry;
-        vc.cluster = c;
-        vc.local = by_size ? VISIBLE_BY_SIZE : 0;
-        vc.material = material;
-        uint visible;
-        if (!add_visible(r, vc, visible))
-            continue;
-        if (smoke)
-        {
-            append(r, COUNT_SMOKE, r.smoke, visible);
-            continue;
-        }
-        if (particle || layer)
-        {
-            append(r, particle ? COUNT_PARTICLES : COUNT_COVERAGE, particle ? r.particles : r.coverage, visible);
-            continue;
-        }
-        if (software || by_size)
-            append(r, COUNT_SOFTWARE, r.software, visible);
-        if (software)
-            continue;
-        bool alpha = producer_tested(p, s.materials + material);
-        append(r, alpha ? COUNT_ALPHA : COUNT_OPAQUE, alpha ? r.alpha : r.opaque, visible);
+        if (!strand_cluster_box(b, c, lo, hi))
+            return;
     }
+    else
+    {
+        ProducerClusterGpu k = b.clusters[c];
+        if (!producer_cluster_valid(b, k))
+            return;
+        material = producer_material(p, k);
+        producer_cluster_box(b, k, lo, hi);
+    }
+    if (material == MATERIAL_NONE)
+        return;
+    bool layer = entry_layer;
+    if (sections)
+    {
+        uint class_id = material_class(s.materials + material);
+        layer = layer_class(class_id);
+        if (!class_rastered(class_id, p.flags))
+            return;
+    }
+    float3 center = place(pl, 0.5 * (lo + hi));
+    float radius = 0.5 * length(hi - lo) * pl.scale;
+    if (!cluster_frustum_visible(v, r, layer, center, radius))
+        return;
+    // Diced clusters that displacement stretches past the software raster's limit
+    // split their triangles between the two paths by size.
+    float size;
+    bool fits = r.software_pixels > 0.0 && !particle && !smoke && !layer && screen_size(v, pl, lo, hi, size);
+    bool software = fits && size <= software_limit(r);
+    bool by_size = fits && !software && p.tessellated != 0;
+    VisibleCluster vc;
+    vc.page = nullptr;
+    vc.instance = s.producer_base + entry;
+    vc.cluster = c;
+    vc.local = by_size ? VISIBLE_BY_SIZE : 0;
+    vc.material = material;
+    uint visible;
+    if (!add_visible(r, vc, visible))
+        return;
+    if (smoke)
+    {
+        append(r, COUNT_SMOKE, r.smoke, visible);
+        return;
+    }
+    if (particle || layer)
+    {
+        append(r, particle ? COUNT_PARTICLES : COUNT_COVERAGE, particle ? r.particles : r.coverage, visible);
+        return;
+    }
+    if (software || by_size)
+        append(r, COUNT_SOFTWARE, r.software, visible);
+    if (software)
+        return;
+    bool alpha = producer_tested(p, s.materials + material);
+    append(r, alpha ? COUNT_ALPHA : COUNT_OPAQUE, alpha ? r.alpha : r.opaque, visible);
 }
 
 // Sizes the hardware draws, the software dispatch and the particle draws to their lists
