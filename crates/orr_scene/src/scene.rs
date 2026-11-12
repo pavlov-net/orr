@@ -869,19 +869,21 @@ impl SceneCpu {
         self.work = None;
     }
 
-    /// The most the scene's copies ask of its work lists in a frame, summed over the models
-    /// that have copies when those or a chain have changed. A copy of a model with a chain
-    /// asks what two of its steps do.
+    /// The most the scene's copies ask of its work lists in a frame, summed over the `live`
+    /// models that have copies when those, a chain or what is mounted have changed: the copies
+    /// of an unmounted pack's model or of an ended edit draw nothing, and are counted until
+    /// their ranges are removed. A copy of a model with a chain asks what two of its steps do.
     pub(crate) fn work(
         &mut self,
         models: &[ModelCpu],
         chains: &HashMap<ModelId, Vec<ModelId>>,
+        live: impl Fn(ModelId) -> bool,
     ) -> Work {
         if let Some(work) = self.work {
             return work;
         }
         let mut work = Work::default();
-        for (&model, c) in &self.copies {
+        for (&model, c) in self.copies.iter().filter(|c| live(ModelId(*c.0))) {
             let own = models[model as usize].work;
             let mut steps = [own; 1 + crate::scenes::MAX_CHAIN];
             let mut n = 1;
@@ -895,8 +897,9 @@ impl SceneCpu {
         work
     }
 
-    /// A chain has changed, so what the copies ask is summed anew.
-    pub(crate) fn chains_changed(&mut self) {
+    /// A chain or the models that are live have changed, so what the copies ask is summed
+    /// anew.
+    pub(crate) fn models_changed(&mut self) {
         self.work = None;
     }
 

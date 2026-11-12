@@ -780,7 +780,7 @@ impl Scenes {
             .map(|(&model, _)| model)
             .collect();
         for scene in core.scenes.iter().flatten() {
-            scene.cpu.lock().unwrap().chains_changed();
+            scene.cpu.lock().unwrap().models_changed();
         }
         for model in ended {
             core.chains.remove(&model);
@@ -826,6 +826,9 @@ impl Scenes {
             }
         }
         core.mounts.destroy_edit(id, frame, &mut core.cages);
+        for scene in core.scenes.iter().flatten() {
+            scene.cpu.lock().unwrap().models_changed();
+        }
     }
 
     /// Gives every copy of `model` up to 3 farther models, each with the distance from the
@@ -933,7 +936,7 @@ impl Scenes {
             core.chained = true;
         }
         for scene in core.scenes.iter().flatten() {
-            scene.cpu.lock().unwrap().chains_changed();
+            scene.cpu.lock().unwrap().models_changed();
         }
         if gains_far {
             for scene in core.scenes.iter().flatten() {
@@ -1906,7 +1909,7 @@ impl<'a> Frame<'a> {
             let producers = cpu.producers.iter().any(Option::is_some);
             let tlas = cpu.ptlas.tlas(device, core.fif, producers)?;
             let layout = cpu.ptlas.layout();
-            let work = cpu.work(&core.model_cpu, &core.chains);
+            let work = cpu.work(&core.model_cpu, &core.chains, |m| core.mounts.is_live(m));
             let detail = DetailTarget {
                 pixels_per_radian: cpu.pixels_per_radian,
                 raster_pixels: core.raster_error_pixels,
