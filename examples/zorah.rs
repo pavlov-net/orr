@@ -398,6 +398,9 @@ fn budgets() -> Budgets {
         });
     Budgets {
         mesh_page_pool,
+        rt_cut_pixels: std::env::var("ZORAH_RT_CUT_PIXELS").map_or(defaults.rt_cut_pixels, |p| {
+            p.parse().expect("ZORAH_RT_CUT_PIXELS is a count of pixels")
+        }),
         rt_cut_memory: std::env::var("ZORAH_RT_CUT_MIB").map_or(defaults.rt_cut_memory, |m| {
             orr::PoolSize::Bytes(
                 m.parse::<u64>()
