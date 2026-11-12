@@ -207,7 +207,7 @@ fn view(scene: orr::SceneId, history: orr::ViewHistoryId) -> ViewDesc {
 /// nothing in device memory but what [`STATED`] names and, for every table and list the scene
 /// has nothing to put in, one allocation of the device's smallest size. A table or a list
 /// sized before the scene holds anything for it fails here by its label, and so does a label
-/// stated that holds no more than a table of nothing.
+/// stated as reserved that holds no more than a table of nothing.
 #[test]
 fn an_empty_scene_holds_no_memory_for_content() {
     let kinds = MemoryKind::ALL;
@@ -286,7 +286,9 @@ fn an_empty_scene_holds_no_memory_for_content() {
                 "{:?} {:?}: {} B in {} allocations, with no content and nothing stated",
                 l.kind, l.label, l.bytes, l.allocations
             )),
-            (Some((_, follows)), true) => wrong.push(format!(
+            // Only what was reserved shrinks to nothing: a small record can be as small as
+            // the device's smallest allocation.
+            (Some((_, follows @ Reserved)), true) => wrong.push(format!(
                 "{:?} {:?}: stated to follow {follows}, but it holds nothing",
                 l.kind, l.label
             )),
