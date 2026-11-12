@@ -5,8 +5,8 @@
 //! global partition until their transform has rested for 30 frames. The `ptlas` kernels
 //! decide each frame's writes, null writes, BLAS updates and part runs on the GPU and spend
 //! the frame's budget of rebuilt instances from the focus outward, mandatory work first.
-//! Producer entries and medium proxies (from `proxy_base`) sit in the global partition and
-//! their writes are mandatory.
+//! Producer entries, medium proxies (from `proxy_base`) and light proxies (from `light_base`)
+//! sit in the global partition and their writes are mandatory.
 //!
 //! The PTLAS holds what the copies placed take: a slot for each handed out, the part
 //! instances their runs may hold at once, and the cell partitions they fill. When a placement
@@ -327,11 +327,13 @@ struct Share {
 }
 
 /// The takers of [`Budget::take`]: a cell partition takes one of the device's partitions, a
-/// medium proxy one as an instance of the global partition, and a skinned copy two, its
-/// instance there and the far instance it may hold while it fades.
+/// medium proxy and a light proxy one each as an instance of the global partition, and a
+/// skinned copy two, its instance there and the far instance it may hold while it fades.
 const PARTITIONS: usize = 0;
 const SKINNED: usize = 1;
 const PROXIES: usize = 2;
+const LIGHTS: usize = 3;
+const TAKERS: usize = 4;
 
 /// The partitions a device's PTLAS holds, cell partitions and instances of the global
 /// partition together, and what a scene's PTLAS takes of them beside its shares: the copies
@@ -347,10 +349,11 @@ struct Budget {
 impl Budget {
     /// The device's partitions a PTLAS of `counts` takes, as [`Ptlas::limits`] counts its
     /// global partition with every part instance the pool can hold.
-    fn total(&self, [partitions, skinned, proxies]: [u32; 3]) -> u64 {
+    fn total(&self, [partitions, skinned, proxies, lights]: [u32; TAKERS]) -> u64 {
         let copies = u64::from(self.copies) + u64::from(skinned);
         let fading = copies.min(u64::from(MAX_PARTS));
-        u64::from(partitions) + copies + fading + u64::from(self.entries) + u64::from(proxies)
+        let entries = u64::from(self.entries) + u64::from(proxies) + u64::from(lights);
+        u64::from(partitions) + copies + fading + entries
     }
 
     /// `shares` with `used` entries of taker `which` in use. One that needs more than is
@@ -358,7 +361,7 @@ impl Budget {
     /// leaves beside the other reservations; when it needs more than they leave, the others
     /// give back what they hold beyond their use. Fails when the device cannot hold what is
     /// in use.
-    fn take(&self, shares: [Share; 3], which: usize, used: u32) -> Result<[Share; 3]> {
+    fn take(&self, shares: [Share; TAKERS], which: usize, used: u32) -> Result<[Share; TAKERS]> {
         let mut out = shares;
         let held = shares[which].reserved;
         out[which].used = used;
@@ -392,8 +395,42 @@ impl Budget {
     }
 }
 
+/// The entries of a table that hold an instance in the global partition.
+#[derive(Default)]
+struct Live {
+    /// Per entry up to the highest that holds one, whether it does.
+    set: Vec<bool>,
+    count: u32,
+}
+
+impl Live {
+    /// Marks entry `id` as holding an instance or not; returns whether it held one, or None
+    /// for an entry past the highest that does, which is left without one.
+    fn set(&mut self, id: u32, live: bool) -> Option<bool> {
+        let at = id as usize;
+        if live && at >= self.set.len() {
+            self.set.resize(at + 1, false);
+        }
+        let was = std::mem::replace(self.set.get_mut(at)?, live);
+        self.count = self.count + u32::from(live) - u32::from(was);
+        let last = self.set.iter().rposition(|&l| l);
+        self.set.truncate(last.map_or(0, |i| i + 1));
+        Some(was)
+    }
+
+    /// One past the highest entry that holds an instance.
+    fn end(&self) -> u32 {
+        self.set.len() as u32
+    }
+
+    /// The entries that hold an instance.
+    fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.end()).filter(|&i| self.set[i as usize])
+    }
+}
+
 /// How the instance indices of the scene's PTLAS lie: its slots, then its part instances, then
-/// its producer entries, medium proxies and light proxies.
+/// its producer entries, the medium proxies it reserves and the light proxies it reserves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
     pub(crate) slots: u32,
@@ -408,19 +445,18 @@ pub(crate) struct Ptlas {
     producer_capacity: u32,
     /// Medium proxies up to the highest set, which the global partition holds.
     proxies: Share,
-    light_capacity: u32,
+    /// Lights up to the highest that has a proxy, which the global partition holds.
+    lights: Share,
     /// Copies the global partition takes; producer entries and medium proxies come on top.
     global_copies: u32,
     /// Copies of skinned meshes, which sit in the global partition.
     skinned: Share,
-    /// Per medium proxy, whether it is set.
-    proxy_live: Vec<bool>,
-    proxies_live: u32,
+    /// The medium proxies set.
+    proxy_live: Live,
     /// Medium proxies set or cleared since the last build, and lights as `LIGHT_JOB` | LightId.
     proxy_dirty: BTreeSet<u32>,
-    /// Per light, whether it has a proxy: a sphere of non-zero radius or a rect.
-    light_live: Vec<bool>,
-    lights_live: u32,
+    /// The lights that have a proxy: a sphere of non-zero radius or a rect.
+    light_live: Live,
     partitions: Vec<PartitionCpu>,
     free: Vec<u32>,
     /// The partition of each cell that takes its next copies.
@@ -463,14 +499,12 @@ impl Ptlas {
             max_per_partition: desc.partition_instances,
             producer_capacity: desc.producer_capacity,
             proxies: Share::default(),
-            light_capacity: desc.light_capacity,
+            lights: Share::default(),
             global_copies: desc.global_instances,
             skinned: Share::default(),
-            proxy_live: Vec::new(),
-            proxies_live: 0,
+            proxy_live: Live::default(),
             proxy_dirty: BTreeSet::new(),
-            light_live: vec![false; desc.light_capacity as usize],
-            lights_live: 0,
+            light_live: Live::default(),
             partitions: Vec::new(),
             free: Vec::new(),
             open: FxHashMap::default(),
@@ -500,7 +534,7 @@ impl Ptlas {
         // global one, hold up to one instance more for every copy in them that the pool has.
         let fading = |copies: u32| copies.min(layout.parts);
         let global_copies = self.global_copies + self.skinned.reserved;
-        let entries = self.producer_capacity + self.proxies.reserved + self.light_capacity;
+        let entries = self.producer_capacity + self.proxies.reserved + self.lights.reserved;
         PtlasLimits {
             instances: layout.slots + layout.parts + entries,
             partitions,
@@ -566,8 +600,9 @@ impl Ptlas {
     }
 
     /// What the PTLAS takes of the device's partitions: its cell partitions, of which those up
-    /// to the last that is not free are in use, its skinned copies and its medium proxies.
-    fn shares(&self) -> [Share; 3] {
+    /// to the last that is not free are in use, its skinned copies, its medium proxies and its
+    /// light proxies.
+    fn shares(&self) -> [Share; TAKERS] {
         let mut free = vec![false; self.partitions.len()];
         for &p in &self.free {
             free[p as usize] = true;
@@ -577,7 +612,7 @@ impl Ptlas {
             used: (self.partitions.len() - unused) as u32,
             reserved: self.partitions.len() as u32,
         };
-        [partitions, self.skinned, self.proxies]
+        [partitions, self.skinned, self.proxies, self.lights]
     }
 
     /// The device's limit and what the PTLAS takes of it whatever the scene holds.
@@ -585,16 +620,17 @@ impl Ptlas {
         Budget {
             max: device.caps().cluster.max_partitions,
             copies: self.global_copies,
-            entries: self.producer_capacity + self.light_capacity,
+            entries: self.producer_capacity,
         }
     }
 
-    /// Takes the skinned copies' and medium proxies' shares of `shares`, and gives back the
-    /// cell partitions past the ones `shares` keeps, which are free.
-    fn keep(&mut self, shares: [Share; 3]) {
-        let [partitions, skinned, proxies] = shares;
+    /// Takes the skinned copies', medium proxies' and light proxies' shares of `shares`, and
+    /// gives back the cell partitions past the ones `shares` keeps, which are free.
+    fn keep(&mut self, shares: [Share; TAKERS]) {
+        let [partitions, skinned, proxies, lights] = shares;
         self.skinned = skinned;
         self.proxies = proxies;
+        self.lights = lights;
         let kept = partitions.reserved;
         if (kept as usize) < self.partitions.len() {
             self.partitions.truncate(kept as usize);
@@ -634,12 +670,26 @@ impl Ptlas {
     /// proxy table: the global partition counts the proxies up to the highest set. Fails,
     /// changing nothing, when the device's PTLAS cannot take them beside what else is in use.
     pub(crate) fn reserve_proxy(&mut self, device: &Device, id: u32) -> Result<()> {
-        if id < self.proxies.reserved {
+        self.reserve_entry(device, PROXIES, id)
+    }
+
+    /// Makes room for [`Self::set_light`] to give light `id`, an entry of the scene's light
+    /// table, a proxy: the global partition counts the lights up to the highest that has one.
+    /// Fails, changing nothing, when the device's PTLAS cannot take them beside what else is
+    /// in use.
+    pub(crate) fn reserve_light(&mut self, device: &Device, id: u32) -> Result<()> {
+        self.reserve_entry(device, LIGHTS, id)
+    }
+
+    /// Reserves the entries of taker `which` up to `id`.
+    fn reserve_entry(&mut self, device: &Device, which: usize, id: u32) -> Result<()> {
+        let held = self.shares()[which];
+        if id < held.reserved {
             return Ok(());
         }
-        let mut shares = self.budget(device).take(self.shares(), PROXIES, id + 1)?;
-        // The proxy is in use once it is set.
-        shares[PROXIES].used = self.proxies.used;
+        let mut shares = self.budget(device).take(self.shares(), which, id + 1)?;
+        // The entry is in use once it is set.
+        shares[which].used = held.used;
         self.keep(shares);
         Ok(())
     }
@@ -647,20 +697,11 @@ impl Ptlas {
     /// Marks medium proxy `id` set or cleared; its instance is written at the next build. A
     /// set has its room from [`Self::reserve_proxy`].
     pub(crate) fn set_proxy(&mut self, id: u32, live: bool) {
-        let at = id as usize;
-        if live && at >= self.proxy_live.len() {
-            self.proxy_live.resize(at + 1, false);
-        }
         // An id past the highest set holds no proxy to clear.
-        let Some(set) = self.proxy_live.get_mut(at) else {
-            return;
-        };
-        let was = std::mem::replace(set, live);
-        self.proxies_live = self.proxies_live + u32::from(live) - u32::from(was);
-        self.proxy_dirty.insert(id);
-        let last = self.proxy_live.iter().rposition(|&l| l);
-        self.proxy_live.truncate(last.map_or(0, |i| i + 1));
-        self.proxies.used = self.proxy_live.len() as u32;
+        if self.proxy_live.set(id, live).is_some() {
+            self.proxy_dirty.insert(id);
+        }
+        self.proxies.used = self.proxy_live.end();
     }
 
     /// The medium proxies the layout of the next build holds: light proxies come after them.
@@ -837,22 +878,23 @@ impl Ptlas {
     }
 
     /// Marks light `id` as having a proxy or not; its instance is written at the next build.
+    /// A light given one has its room from [`Self::reserve_light`].
     pub(crate) fn set_light(&mut self, id: u32, live: bool) {
-        let was = std::mem::replace(&mut self.light_live[id as usize], live);
-        self.lights_live = self.lights_live + u32::from(live) - u32::from(was);
-        if live || was {
+        let was = self.light_live.set(id, live);
+        if live || was == Some(true) {
             self.proxy_dirty.insert(LIGHT_JOB | id);
         }
+        self.lights.used = self.light_live.end();
     }
 
     /// Whether a medium proxy is set.
     pub(crate) fn has_medium_proxies(&self) -> bool {
-        self.proxies_live > 0
+        self.proxy_live.count > 0
     }
 
     /// Whether a medium or light proxy is set or awaits its null write.
     pub(crate) fn has_proxy_work(&self) -> bool {
-        self.proxies_live > 0 || self.lights_live > 0 || !self.proxy_dirty.is_empty()
+        self.proxy_live.count > 0 || self.light_live.count > 0 || !self.proxy_dirty.is_empty()
     }
 
     /// Frees the partitions emptied in frames at or before `completed`, and the part pools
@@ -903,8 +945,8 @@ impl Ptlas {
         if caps.cluster.max_partitions == 0
             || (self.high_water == 0
                 && !producers
-                && self.proxies_live == 0
-                && self.lights_live == 0)
+                && self.proxy_live.count == 0
+                && self.light_live.count == 0)
         {
             return Ok(None);
         }
@@ -1116,16 +1158,11 @@ impl Ptlas {
         };
         let mut proxies = std::mem::take(&mut self.proxy_dirty);
         // A proxy cleared past the ones the layout holds has no instance there to disable.
-        let held = self.proxies.reserved;
-        proxies.retain(|&job| job & LIGHT_JOB != 0 || job < held);
+        let held = [self.proxies.reserved, self.lights.reserved];
+        proxies.retain(|&job| job & !LIGHT_JOB < held[usize::from(job & LIGHT_JOB != 0)]);
         if anew {
-            proxies
-                .extend((0..self.proxy_live.len() as u32).filter(|&i| self.proxy_live[i as usize]));
-            proxies.extend(
-                (0..self.light_live.len() as u32)
-                    .filter(|&i| self.light_live[i as usize])
-                    .map(|i| LIGHT_JOB | i),
-            );
+            proxies.extend(self.proxy_live.ids());
+            proxies.extend(self.light_live.ids().map(|i| LIGHT_JOB | i));
         }
         let proxies: Vec<u32> = proxies.into_iter().collect();
         let proxy_jobs = if proxies.is_empty() {
@@ -1149,7 +1186,7 @@ impl Ptlas {
             slots: self.high_water,
             budget: f.budget,
             flags,
-            proxies: self.proxies_live + self.lights_live,
+            proxies: self.proxy_live.count + self.light_live.count,
             translate_jobs,
             translate_count: jobs.len() as u32,
             proxy_job_count: proxies.len() as u32,
@@ -1275,7 +1312,7 @@ mod tests {
             copies: 4096,
             entries: 512,
         };
-        let grow = |mut shares: [Share; 3], which: usize, to: u32| {
+        let grow = |mut shares: [Share; TAKERS], which: usize, to: u32| {
             let mut used = shares[which].used;
             while used < to {
                 used = to.min(used.max(1) * 2);
@@ -1283,7 +1320,7 @@ mod tests {
             }
             shares
         };
-        let none = [Share::default(); 3];
+        let none = [Share::default(); TAKERS];
         let skinned = grow(none, SKINNED, 12_001);
         assert_eq!(skinned[SKINNED].reserved, 16_384);
         // The partitions fit beside the skinned copies in use, not beside those reserved.
@@ -1292,17 +1329,19 @@ mod tests {
             used,
             reserved: used,
         };
-        assert_eq!(both, [exact(25_000), exact(12_001), exact(0)]);
+        assert_eq!(both, [exact(25_000), exact(12_001), exact(0), exact(0)]);
         let other = grow(grow(none, PARTITIONS, 25_000), SKINNED, 12_001);
         for shares in [both, other] {
-            assert_eq!(shares.map(|s| s.used), [25_000, 12_001, 0]);
+            assert_eq!(shares.map(|s| s.used), [25_000, 12_001, 0, 0]);
             assert!(budget.total(shares.map(|s| s.reserved)) <= 65_536);
         }
-        // One skinned copy or one proxy more than the device leaves beside what is in use.
+        // One skinned copy, medium proxy or light proxy more than the device leaves beside what
+        // is in use.
         let left = 65_536 - budget.total(both.map(|s| s.used));
         let most = 12_001 + (left / 2) as u32;
         assert!(budget.take(both, SKINNED, most).is_ok());
         assert!(budget.take(both, SKINNED, most + 1).is_err());
         assert!(budget.take(both, PROXIES, left as u32 + 1).is_err());
+        assert!(budget.take(both, LIGHTS, left as u32 + 1).is_err());
     }
 }

@@ -66,10 +66,7 @@ struct Cache {
 
 impl Cache {
     fn new(world_cache: WorldCacheSettings) -> Self {
-        let mut scene = TestScene::new(SceneDesc {
-            light_capacity: 4,
-            ..SceneDesc::default()
-        });
+        let mut scene = TestScene::new(SceneDesc::default());
         scene.write(|_, _| {});
         let mut lighting = scene.lighting();
         lighting
@@ -161,7 +158,9 @@ impl Cache {
         );
         let mut list = render().command_list().unwrap();
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        self.lighting.record(&mut list, &self.scene.pass([0.0; 3]));
+        self.lighting
+            .record(&mut list, &self.scene.pass([0.0; 3]))
+            .unwrap();
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         list.dispatch(&self.cells, root.gpu(), [self.capacity.div_ceil(64), 1, 1]);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());

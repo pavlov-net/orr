@@ -476,13 +476,7 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
     let mount = mount_pack(&mut r, pack, &mut frame);
     let models = ["floor", "box"].map(|name| r.model(mount, AssetId::from_name(name)).unwrap());
     let scene = r
-        .create_scene(
-            &SceneDesc {
-                light_capacity: 1,
-                ..SceneDesc::default()
-            },
-            &Default::default(),
-        )
+        .create_scene(&SceneDesc::default(), &Default::default())
         .unwrap();
     let history = r.create_view_history().unwrap();
     r.wait_paths().unwrap();
@@ -577,13 +571,7 @@ fn frames_around_the_compile(
     loading.stop_workers();
     worker.join().unwrap();
     let scene = r
-        .create_scene(
-            &SceneDesc {
-                light_capacity: 1,
-                ..SceneDesc::default()
-            },
-            &Default::default(),
-        )
+        .create_scene(&SceneDesc::default(), &Default::default())
         .unwrap();
     assert!(!r.kernels_ready());
     let history = r.create_view_history().unwrap();
@@ -725,13 +713,7 @@ fn a_chain_marks_its_scenes_for_ray_candidates() {
     loading.stop_workers();
     worker.join().unwrap();
     let scene = r
-        .create_scene(
-            &SceneDesc {
-                light_capacity: 1,
-                ..SceneDesc::default()
-            },
-            &Default::default(),
-        )
+        .create_scene(&SceneDesc::default(), &Default::default())
         .unwrap();
     let listed = [scene];
     let coverage = orr_scene::SceneFeatures::COVERAGE;
@@ -785,13 +767,7 @@ fn a_fading_copy_stops_rays_under_the_pipelines_made_for_its_scene() {
     // start and is seen near before the focus moves away.
     r.set_chain(models[1], &[(models[0], 10.0)]).unwrap();
     let scene = r
-        .create_scene(
-            &SceneDesc {
-                light_capacity: 1,
-                ..SceneDesc::default()
-            },
-            &Default::default(),
-        )
+        .create_scene(&SceneDesc::default(), &Default::default())
         .unwrap();
     // One view on the pipelines that hold everything and one on those made for the scene.
     let views = [false, true].map(|specialize| {
@@ -1307,13 +1283,7 @@ fn ray_reconstruction_resets_on_the_frame_pre_exposure_steps() {
     let mount = mount_pack(&mut r, &floor_and_box(), &mut frame);
     let models = ["floor", "box"].map(|name| r.model(mount, AssetId::from_name(name)).unwrap());
     let scene = r
-        .create_scene(
-            &SceneDesc {
-                light_capacity: 1,
-                ..SceneDesc::default()
-            },
-            &Default::default(),
-        )
+        .create_scene(&SceneDesc::default(), &Default::default())
         .unwrap();
     let history = r.create_view_history().unwrap();
     r.wait_paths().unwrap();

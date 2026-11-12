@@ -370,6 +370,9 @@ struct Target {
 struct Feedback {
     target: Target,
     sampled: TextureIndex,
+    /// Entries of the scene's light table when the feedback was written, which its ids of
+    /// emissive entries and of the environment follow.
+    lights: u32,
 }
 
 /// A target the view holds only while a feature is on, with its own image slots.
@@ -628,10 +631,12 @@ impl LightingView {
             Feedback {
                 sampled: sampled_view(&a.texture)?,
                 target: a,
+                lights: 0,
             },
             Feedback {
                 sampled: sampled_view(&b.texture)?,
                 target: b,
+                lights: 0,
             },
         ];
         // The tile grid moves by up to a tile each frame, so it spans one tile more each way.
@@ -1860,6 +1865,7 @@ impl LightingKernels {
         let local = local_share > 0.0;
         let written = view.feedback_index;
         view.feedback_index = 1 - written;
+        view.feedback[written].lights = scene.light_tables().lights;
         if local {
             let root = view.local_roots.write(
                 slot,
@@ -1873,7 +1879,7 @@ impl LightingKernels {
                     share: local_share,
                     reset: u32::from(view.history_reset),
                     frame: pass.sample_index,
-                    _pad0: 0,
+                    fed_lights: view.feedback[1 - written].lights,
                     _pad1: 0,
                 },
             );

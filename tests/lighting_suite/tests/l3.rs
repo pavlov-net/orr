@@ -42,13 +42,15 @@ fn y2020(c: [f32; 3]) -> f64 {
 /// Records the scene pass alone, as frame `frame`.
 fn scene_pass(scene: &TestScene, lighting: &mut SceneLighting, frame: u64) {
     let mut list = render().command_list().unwrap();
-    lighting.record(
-        &mut list,
-        &ScenePass {
-            frame,
-            ..scene.pass([0.0; 3])
-        },
-    );
+    lighting
+        .record(
+            &mut list,
+            &ScenePass {
+                frame,
+                ..scene.pass([0.0; 3])
+            },
+        )
+        .unwrap();
     finish(list);
 }
 
@@ -188,13 +190,15 @@ fn tiles(scene: &TestScene, lighting: &mut SceneLighting, bins: &Bins) -> Tiles 
             "tile probe root",
         );
         let mut list = render().command_list().unwrap();
-        lighting.record(
-            &mut list,
-            &ScenePass {
-                frame,
-                ..scene.pass([0.0; 3])
-            },
-        );
+        lighting
+            .record(
+                &mut list,
+                &ScenePass {
+                    frame,
+                    ..scene.pass([0.0; 3])
+                },
+            )
+            .unwrap();
         compute_barrier(&mut list);
         list.dispatch(&probe[0], root.gpu(), [SAMPLES / 64, 1, 1]);
         if f == 0 {
@@ -233,10 +237,7 @@ fn polygon_irradiance(v: &[DVec3], n: DVec3, luminance: f64) -> f64 {
 
 #[test]
 fn environment_tiles_match_the_density() {
-    let mut scene = TestScene::procedural(SceneDesc {
-        light_capacity: 4,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::procedural(SceneDesc::default());
     scene.write(|_, _| {});
     let mut lighting = scene.lighting();
     let t = tiles(&scene, &mut lighting, &Bins::around_y(PI, 16, 32));
@@ -251,11 +252,7 @@ fn a_half_degree_hot_spot_is_sampled_at_its_own_density() {
         DEFAULT_MEDIUM,
         &[(&hotspot_bake::MODULE, BAKE)],
     );
-    let desc = SceneDesc {
-        light_capacity: 4,
-        ..SceneDesc::default()
-    };
-    let mut scene = TestScene::linked(desc, linked, |w| {
+    let mut scene = TestScene::linked(SceneDesc::default(), linked, |w| {
         w.set_environment(GpuPtr::<HotSpotData>::NULL);
     });
     scene.write(|_, _| {});
@@ -279,10 +276,7 @@ fn a_half_degree_hot_spot_is_sampled_at_its_own_density() {
 
 #[test]
 fn sphere_tiles_match_the_density_and_irradiance() {
-    let mut scene = TestScene::new(SceneDesc {
-        light_capacity: 4,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::new(SceneDesc::default());
     let (a, b) = (DVec3::new(0.0, 3.0, 0.0), DVec3::new(5.0, 1.0, -4.0));
     scene.write(|w, _| {
         w.set_light(
@@ -333,10 +327,7 @@ fn sphere_tiles_match_the_density_and_irradiance() {
 
 #[test]
 fn rect_tiles_match_the_density_and_irradiance() {
-    let mut scene = TestScene::new(SceneDesc {
-        light_capacity: 4,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::new(SceneDesc::default());
     let center = DVec3::new(0.5, 2.0, 0.3);
     let (ex, ey) = (Vec3::new(1.2, 0.0, 0.1), Vec3::new(-0.8 / 12.0, 0.3, 0.8));
     scene.write(|w, _| {
@@ -505,7 +496,6 @@ fn set_producers_of(
 #[test]
 fn emissive_producer_tiles_match_the_density_and_irradiance() {
     let mut scene = TestScene::new(SceneDesc {
-        light_capacity: 4,
         producer_capacity: 4,
         emissive_capacity: 0,
         ..SceneDesc::default()
@@ -605,7 +595,6 @@ fn lit_through_a_texture(
     what: &str,
 ) {
     let mut scene = TestScene::new(SceneDesc {
-        light_capacity: 4,
         producer_capacity: 4,
         emissive_capacity: 0,
         ..SceneDesc::default()
@@ -705,13 +694,15 @@ fn local_candidates(
             "local probe root",
         );
         let mut list = render().command_list().unwrap();
-        lighting.record(
-            &mut list,
-            &ScenePass {
-                frame,
-                ..scene.pass([0.0; 3])
-            },
-        );
+        lighting
+            .record(
+                &mut list,
+                &ScenePass {
+                    frame,
+                    ..scene.pass([0.0; 3])
+                },
+            )
+            .unwrap();
         compute_barrier(&mut list);
         list.dispatch(&probe[0], root.gpu(), [SAMPLES / 64, 1, 1]);
         if f == 0 {
@@ -766,9 +757,7 @@ fn forced_local(
 /// included, and mixed with the tile samples they keep the density of the mixture.
 #[test]
 fn local_sampler_candidates_match_the_hit_side_density() {
-    let lights = 4;
     let mut scene = TestScene::new(SceneDesc {
-        light_capacity: lights,
         producer_capacity: 4,
         emissive_capacity: 0,
         ..SceneDesc::default()
@@ -806,6 +795,7 @@ fn local_sampler_candidates_match_the_hit_side_density() {
     );
     let mut lighting = scene.lighting();
     // Producer entry 0's feedback id follows the lights; its position 3 is in no slot.
+    let lights = scene.tables.lights;
     let entry = lights;
     let slots = [
         (1, 0, 1, 0.2),
@@ -839,7 +829,7 @@ fn run_nee_probe(
         pipeline(&nee_probe::MODULE, "totals"),
     ];
     let mut list = render().command_list().unwrap();
-    lighting.record(&mut list, &scene.pass([0.0; 3]));
+    lighting.record(&mut list, &scene.pass([0.0; 3])).unwrap();
     compute_barrier(&mut list);
     list.dispatch(&probe[0], root, [threads / 64, 1, 1]);
     list.dispatch(&probe[1], root, [1, 1, 1]);
@@ -848,10 +838,7 @@ fn run_nee_probe(
 
 #[test]
 fn directional_share_matches_the_lights_weights() {
-    let mut scene = TestScene::procedural(SceneDesc {
-        light_capacity: 8,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::procedural(SceneDesc::default());
     let sun = |d: Vec3, e: f32, r: f32| DirectionalLight {
         direction_to_light: d.normalize(),
         illuminance: Vec3::splat(e),
@@ -930,7 +917,10 @@ fn directional_share_matches_the_lights_weights() {
     run_nee_probe(&scene, &mut lighting, root.gpu(), threads);
 
     let table = scene.lights();
-    let states = read(lighting.directional_states(), 8);
+    let states = read(
+        lighting.directional_states(),
+        u64::from(scene.tables.lights),
+    );
     let weight = |id: u32, n: Vec3| {
         let w = f64::from(states[id as usize].weight);
         let l = Vec3::from_array(table[id as usize].direction);
@@ -1001,7 +991,6 @@ fn directional_share_matches_the_lights_weights() {
 #[test]
 fn selection_probabilities_follow_power_and_sum_to_one() {
     let mut scene = TestScene::procedural(SceneDesc {
-        light_capacity: 8,
         producer_capacity: 2,
         emissive_capacity: 4,
         ..SceneDesc::default()
@@ -1076,7 +1065,7 @@ fn selection_probabilities_follow_power_and_sum_to_one() {
     );
 
     let set: LightSetGpu = read(lighting.light_set(), 1)[0];
-    let light_p = read(set.light_probability, 8);
+    let light_p = read(set.light_probability, u64::from(scene.tables.lights));
     let emissive_p: Vec<EmissiveSelection> = read(set.emissive, 6);
     let power: Vec<EmissiveGpu> = read(scene.root_value().emissive, 6);
     let env = f64::from(set.environment_probability);
@@ -1096,8 +1085,9 @@ fn selection_probabilities_follow_power_and_sum_to_one() {
             "{what}: probability {got} against {expected}"
         );
     };
-    for id in 0..8 {
-        close(light_p[id], weights[id], &format!("light {id}"));
+    for (id, &p) in light_p.iter().enumerate() {
+        let w = weights.get(id).copied().unwrap_or(0.0);
+        close(p, w, &format!("light {id}"));
     }
     close(emissive_p[1].probability, emissive_w, "emissive entry");
     for (i, e) in emissive_p.iter().enumerate().filter(|&(i, _)| i != 1) {
@@ -1163,7 +1153,6 @@ fn check_power(
 #[test]
 fn producer_power_equals_area_times_luminance_after_it_moves() {
     let mut scene = TestScene::new(SceneDesc {
-        light_capacity: 2,
         producer_capacity: 1,
         emissive_capacity: 0,
         ..SceneDesc::default()
@@ -1226,7 +1215,6 @@ fn producer_power_equals_area_times_luminance_after_it_moves() {
 #[test]
 fn a_scene_without_lights_gives_empty_candidates_and_no_nan() {
     let mut scene = TestScene::new(SceneDesc {
-        light_capacity: 4,
         producer_capacity: 2,
         emissive_capacity: 4,
         ..SceneDesc::default()
@@ -1298,12 +1286,10 @@ fn feed_back(set: &LightSetGpu, counts: &[u32]) {
 
 #[test]
 fn light_feedback_blends_into_the_selection_and_clears_on_a_reset() {
-    let mut scene = TestScene::procedural(SceneDesc {
-        light_capacity: 4,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::procedural(SceneDesc::default());
     scene.write(|w, _| {
-        for (id, i) in [(0u32, 100.0f32), (1, 900.0)] {
+        // Light 3 is set and cleared, so the table holds an empty entry for it.
+        for (id, i) in [(0u32, 100.0f32), (1, 900.0), (3, 1.0)] {
             w.set_light(
                 LightId(id),
                 Some(&Light::Sphere {
@@ -1315,7 +1301,9 @@ fn light_feedback_blends_into_the_selection_and_clears_on_a_reset() {
             )
             .unwrap();
         }
+        w.set_light(LightId(3), None).unwrap();
     });
+    assert!(scene.tables.lights >= 4);
     let mut lighting = scene.lighting();
     let share = f64::from(SceneLightingSettings::default().feedback_share);
     let mut frame = scene.frame;
@@ -1436,7 +1424,6 @@ fn cooked_emitter_tiles_match_the_hit_side_density() {
         .memory
         .remove(0);
     let mut scene = TestScene::new(SceneDesc {
-        light_capacity: 1,
         producer_capacity: 0,
         emissive_capacity: 2,
         ..SceneDesc::default()

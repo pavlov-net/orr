@@ -25,6 +25,7 @@ use crate::decals::{self, build_bins};
 use crate::detail::{Detail, Sample};
 use crate::drawn::OpaqueHook;
 use crate::features::SceneFeatures;
+use crate::lights::LightTables;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
 use crate::medium_proxy::{ProxyBlas, VolumeRef};
@@ -396,6 +397,8 @@ pub struct SceneCompute<'a, 'q> {
     pub time: FrameTime,
     /// The scene focus and the render pixels per radian this update chooses geometry for.
     pub focus: Option<(DVec3, f32)>,
+    /// What `root` says the scene's light tables hold.
+    pub light_tables: LightTables,
     device: &'a Device,
     window: &'a UploadWindow,
     pipelines: &'a Pipelines,
@@ -1845,7 +1848,7 @@ impl<'a> Frame<'a> {
                 && needs_rebase(cpu.origin_cell, focus, core.cell_log2)
             {
                 cpu.origin_cell = origin_for(focus, core.cell_log2);
-                rebased.push((scene.tables.root.gpu(), scene.desc.light_capacity));
+                rebased.push((scene.tables.root.gpu(), scene.tables.lights.capacity()));
                 rebase = true;
             }
             let producers = cpu.producers.iter().any(Option::is_some);
@@ -1964,7 +1967,7 @@ impl<'a> Frame<'a> {
                 delta_time: self.time.delta,
                 frame_index: self.id as u32,
                 skinned_capacity: t.skinned.capacity(),
-                light_capacity: scene.desc.light_capacity,
+                light_capacity: t.lights.capacity(),
                 producer_capacity: scene.desc.producer_capacity,
                 emissive_capacity: scene.desc.emissive_capacity,
                 near_range: cpu.near_range,
@@ -2001,6 +2004,7 @@ impl<'a> Frame<'a> {
                 t.batches.gpu(),
                 cpu.focus_detail(),
                 scene.desc,
+                scene.light_tables(),
             ));
         }
         for e in &short {
@@ -2053,7 +2057,8 @@ impl<'a> Frame<'a> {
         );
         if !rebased.is_empty() {
             list.begin_pass("rebase", false);
-            for &(root, lights) in &rebased {
+            // A scene without lights has none to move.
+            for &(root, lights) in rebased.iter().filter(|r| r.1 > 0) {
                 let r = world_kernel::Root {
                     scene: root,
                     _pad0: 0,
@@ -2200,7 +2205,7 @@ impl<'a> Frame<'a> {
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
         core.mounts.record_edit_history(&mut list);
-        for &(scene, root, batches, focus, _) in &roots {
+        for &(scene, root, batches, focus, _, light_tables) in &roots {
             let mut sc = SceneCompute {
                 cmd: &mut list,
                 scene,
@@ -2208,6 +2213,7 @@ impl<'a> Frame<'a> {
                 batches,
                 time: self.time,
                 focus,
+                light_tables,
                 device,
                 window,
                 pipelines: self.pipelines,
@@ -2226,7 +2232,7 @@ impl<'a> Frame<'a> {
             self.id,
         )?;
         list.begin_pass("animate", false);
-        for &(id, root, _, focus, _) in &roots {
+        for &(id, root, _, focus, ..) in &roots {
             let slots = core.scene(id)?.cpu.lock().unwrap().ptlas.high_water;
             if slots == 0 {
                 continue;
@@ -2256,7 +2262,7 @@ impl<'a> Frame<'a> {
         }
         list.end_pass();
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
-        for &(id, root, _, focus, _) in &roots {
+        for &(id, root, _, focus, ..) in &roots {
             let cpu = core.scene(id)?.cpu.lock().unwrap();
             let Some(skin) = &cpu.skin_frame else {
                 continue;
@@ -2279,7 +2285,7 @@ impl<'a> Frame<'a> {
             )?;
         }
         let hierarchy = core.mounts.hierarchy();
-        for &(id, root, _, focus, _) in &roots {
+        for &(id, root, _, focus, ..) in &roots {
             let scene = core.scene(id)?;
             let cpu = &mut *scene.cpu.lock().unwrap();
             let focus = focus.map(|(f, ppr)| {
@@ -2386,7 +2392,7 @@ impl<'a> Frame<'a> {
             // The PTLAS kernels write the cuts this pass reads.
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
             list.begin_pass("emissive", false);
-            for &(_, scene, _, _, desc) in &roots {
+            for &(_, scene, _, _, desc, _) in &roots {
                 let r = emissive::Root {
                     scene,
                     jobs: GpuPtr::NULL,
@@ -2530,6 +2536,7 @@ impl<'a> Frame<'a> {
         };
         let root = scene.tables.root.gpu();
         let sky_stats = scene.tables.sky_stats.gpu();
+        let light_tables = scene.light_tables();
         let focus = WorldPos::new(focus, core.cell_log2)
             .relative_to(
                 WorldPos {
@@ -2669,6 +2676,7 @@ impl<'a> Frame<'a> {
             history: view.history,
             sky_stats,
             focus,
+            light_tables,
         };
         history.draws = draws;
         if let Some(e) = short {

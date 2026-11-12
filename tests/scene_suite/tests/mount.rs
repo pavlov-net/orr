@@ -719,8 +719,8 @@ fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it
         ..SceneDesc::default()
     };
     // What the global partition holds whatever is placed: its copies, a far instance for each,
-    // and the producer and light entries.
-    let fixed = 2 * desc.global_instances + desc.producer_capacity + desc.light_capacity;
+    // and the producer entries.
+    let fixed = 2 * desc.global_instances + desc.producer_capacity;
     let limited = limited_device(fixed + COPIES);
     if limited.caps().cluster.max_partitions != fixed + COPIES {
         return;

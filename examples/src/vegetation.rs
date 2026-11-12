@@ -1070,7 +1070,6 @@ impl DenseVegetation {
         let scene = renderer
             .create_scene(
                 &SceneDesc {
-                    light_capacity: (lights + textured).max(1),
                     producer_capacity: 8,
                     ..SceneDesc::default()
                 },

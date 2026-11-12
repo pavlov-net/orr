@@ -1459,8 +1459,9 @@ impl<'a> Frame<'a> {
                     frame: id,
                     scene: raster.scene,
                     focus: raster.focus,
+                    tables: raster.light_tables,
                 },
-            );
+            )?;
             self.lit.push(view.scene);
         }
         match &mut state.lighting {

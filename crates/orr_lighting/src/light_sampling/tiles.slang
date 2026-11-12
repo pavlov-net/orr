@@ -31,9 +31,14 @@ struct Root
     EmissiveSelection* emissive;
     uint* cluster_cdf;
     LightSample* tiles;
-    // Per feedback id: pixels the views of the frame before counted, and their decayed sums.
+    // Per feedback id: pixels the views of the frame before counted, and their decayed sums,
+    // as this frame leaves them.
     uint* feedback_counts;
     float* feedback_weights;
+    // The two as the frames before left them, for a light table of `lights_before` entries:
+    // other arrays than the two above once the table has grown.
+    uint* feedback_counts_before;
+    float* feedback_weights_before;
     // Shadow rays of the frame before past the candidate limit.
     uint* shadow_overflows;
     // `LightSetGpu.reference_counts` of the frame before.
@@ -47,8 +52,8 @@ struct Root
     float feedback_share;
     // 1: drop the feedback so far.
     uint clear_feedback;
+    uint lights_before;
     uint _pad0;
-    uint _pad1;
 }
 ORR_ROOT(Root);
 
@@ -243,13 +248,21 @@ void instance_list(SceneRoot* s, uint e, inout EmissiveSelection sel)
 }
 
 // Feedback weight of feedback id `i` this frame: the weight before, decayed, plus the pixels
-// counted for it in the frame before, whose count it clears. A clear drops both, and the
-// counts are not yet written after the light set is created.
-float feedback(uint i)
+// counted for it in the frame before, whose count it clears. The frames before named `i` by
+// their own light table: a light by the same id, and an emissive entry or the environment by
+// one as far past that table's lights as `i` is past this one's `lights`. A clear drops both,
+// and the counts are not yet written after the light set is created; a light the table before
+// did not hold has neither.
+float feedback(uint i, uint lights)
 {
-    bool clear = root.clear_feedback != 0;
-    uint pixels = clear ? 0 : root.feedback_counts[i];
-    float h = clear ? 0.0 : root.feedback_weights[i] * FEEDBACK_HISTORY + float(pixels);
+    uint pixels = 0;
+    float h = 0.0;
+    if (root.clear_feedback == 0 && (i >= lights || i < root.lights_before))
+    {
+        uint before = i < lights ? i : i - lights + root.lights_before;
+        pixels = root.feedback_counts_before[before];
+        h = root.feedback_weights_before[before] * FEEDBACK_HISTORY + float(pixels);
+    }
     root.feedback_weights[i] = h;
     root.feedback_counts[i] = 0;
     InterlockedAdd(counts[4], pixels);
@@ -274,7 +287,7 @@ void select(uint lane: SV_GroupIndex)
     bool environment = root.environment.mean.a > 0.0;
     if (lane == 0)
     {
-        float h = feedback(n);
+        float h = feedback(n, lights);
         environment_feedback = environment ? h : 0.0;
     }
     float carry_w = 0.0;
@@ -290,7 +303,7 @@ void select(uint lane: SV_GroupIndex)
         if (i < n)
         {
             candidate(s, i, w, c, pooled);
-            h = feedback(i);
+            h = feedback(i, lights);
             if (i >= lights && stack_entry(s, i - lights))
                 InterlockedAdd(counts[5], 1);
             if (i >= lights && i - lights < s.producer_capacity && particle_entry(s, i - lights))

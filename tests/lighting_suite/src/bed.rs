@@ -1994,7 +1994,6 @@ impl Bed {
         let feature_mount = features.map(|_| mounted(&mut scenes, feature_pack()));
 
         let desc = SceneDesc {
-            light_capacity: spec.lights.len().max(8) as u32,
             producer_capacity: PRODUCER_CAPACITY,
             ..SceneDesc::default()
         };
@@ -2623,14 +2622,17 @@ impl Bed {
         self.last_root = view.scene;
         let list = f.list().unwrap();
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        self.lighting.record(
-            list,
-            &ScenePass {
-                frame: id,
-                scene: view.scene,
-                focus: eye.to_array(),
-            },
-        );
+        self.lighting
+            .record(
+                list,
+                &ScenePass {
+                    frame: id,
+                    scene: view.scene,
+                    focus: eye.to_array(),
+                    tables: view.light_tables,
+                },
+            )
+            .unwrap();
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         kernel(
             list,

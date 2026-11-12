@@ -11,8 +11,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::decals::{Bins, Decal, DecalId, Listing, decal_gpu, listing};
 use crate::lights::{
-    EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, GATHERED_CLUSTERS, Light, LightId, NO_EMISSIVE, NO_SET,
-    light_gpu,
+    EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, GATHERED_CLUSTERS, Light, LightId, LightTables,
+    NO_EMISSIVE, NO_SET, light_gpu,
 };
 use crate::material::{MaterialId, MaterialTable};
 use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
@@ -65,10 +65,9 @@ const GROUP_QUANTIZED_PAGE: u32 = 1;
 pub struct SceneId(pub u32);
 
 /// Table sizes of a scene, fixed at creation. Its instance slots, transform groups, material
-/// sets, decals, skinned copies and medium proxies take what the scene's content needs.
+/// sets, decals, skinned copies, medium proxies and lights take what the scene's content needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SceneDesc {
-    pub light_capacity: u32,
     /// Producer entries: every `ProducerId` is below it.
     pub producer_capacity: u32,
     /// Emissive list entries for instances: one per copy per emissive and per caster section of
@@ -89,7 +88,6 @@ pub struct SceneDesc {
 impl Default for SceneDesc {
     fn default() -> Self {
         Self {
-            light_capacity: 256,
             producer_capacity: 256,
             emissive_capacity: 16_384,
             partition_instances: 1000,
@@ -334,7 +332,8 @@ pub(crate) struct Tables {
     pub(crate) material_sets: Column<MaterialId>,
     /// The material sets of placed pages' prototypes, below the 2^31 a base names.
     pub(crate) page_sets: Table<MaterialId>,
-    pub(crate) lights: Allocation<LightGpu>,
+    /// By `LightId`: an entry for every id set.
+    pub(crate) lights: Column<LightGpu>,
     /// Producer entries first, then instance entries.
     pub(crate) emissive: Allocation<EmissiveGpu>,
     /// Per instance entry, the list its copy's traversal gathers (`SceneRoot.emissive_lists`).
@@ -1048,6 +1047,7 @@ impl Scene {
         self.tables.skinned.land(frame, copies, records);
         self.tables.skin_state.land(frame, copies, records);
         self.tables.proxies.land(frame, copies, records);
+        self.tables.lights.land(frame, copies, records);
     }
 
     /// Frees the tables moved from in frames at or before `completed`.
@@ -1062,6 +1062,15 @@ impl Scene {
         self.tables.skinned.retire(completed);
         self.tables.skin_state.retire(completed);
         self.tables.proxies.retire(completed);
+        self.tables.lights.retire(completed);
+    }
+
+    /// What the root of the scene's next update says its light tables hold, and the root of
+    /// its last once the frame's writes are over.
+    pub(crate) fn light_tables(&self) -> LightTables {
+        LightTables {
+            lights: self.tables.lights.capacity(),
+        }
     }
 
     /// Instance entry `entry` of the emissive list.
@@ -1418,7 +1427,7 @@ impl Scene {
                 "page material sets",
                 PAGE_MATERIAL_SET,
             )?,
-            lights: device.gpu_malloc(dl, n(desc.light_capacity), "lights")?,
+            lights: Column::new(device, MemoryPriority::Normal, "lights", true)?,
             emissive: device.gpu_malloc(
                 dl,
                 n(desc.producer_capacity + desc.emissive_capacity),
@@ -1443,10 +1452,9 @@ impl Scene {
         };
         // The null group.
         tables.groups.reserve(device, 1)?;
-        // Tables start zeroed: no lights. These apply before any write (sequence 0).
+        // Tables start zeroed. These apply before any write (sequence 0).
         let zero = |a: GpuAddress, bytes: u64| Record::fill(0, a.0, words(bytes as usize), 0);
         let records = vec![
-            zero(tables.lights.gpu().address(), tables.lights.size()),
             zero(tables.emissive.gpu().address(), tables.emissive.size()),
             zero(tables.producers.gpu().address(), tables.producers.size()),
             zero(tables.batches.gpu().address(), tables.batches.size()),
@@ -2861,31 +2869,44 @@ impl<'f> SceneWriter<'f> {
         Ok(())
     }
 
-    /// Sets or clears light `id`. A sphere of non-zero radius and a rect also stand in the
-    /// scene's ray tracing as a proxy that only the BSDF rays of paths meet, weighed against
-    /// light sampling. Camera, lens, shadow and G-buffer rays do not see it, so a light casts
-    /// no shadow and has no body in the image; a lamp the camera sees is an emissive instance.
+    /// Sets or clears light `id`, from this frame on. An id is the light's entry in the
+    /// scene's light table, which grows to hold the highest id set. A sphere of non-zero radius
+    /// and a rect also stand in the scene's ray tracing as a proxy that only the BSDF rays of
+    /// paths meet, weighed against light sampling, and the device's PTLAS takes an instance in
+    /// its global partition for every id up to the highest with a proxy: a set past what it
+    /// takes beside what else is in use fails. Camera, lens, shadow and G-buffer rays do not
+    /// see a proxy, so a light casts no shadow and has no body in the image; a lamp the camera
+    /// sees is an emissive instance.
     pub fn set_light(&mut self, id: LightId, light: Option<&Light>) -> Result<()> {
-        assert!(
-            id.0 < self.scene.desc.light_capacity,
-            "{id:?} outside the light table"
-        );
         let proxied = matches!(
             light,
             Some(Light::Sphere { radius, .. }) if *radius > 0.0
         ) || matches!(light, Some(Light::Rect { .. }));
+        let table = &self.scene.tables.lights;
+        let held = table.capacity();
+        let entries = if id.0 < held {
+            held
+        } else if light.is_some() {
+            grown_to_hold("lights", held, id.0, table.limit())?
+        } else {
+            // An id past the table holds no light to clear.
+            return Ok(());
+        };
+        // Window room, then the table's, then the PTLAS's: a set that finds one missing leaves
+        // the scene as it was.
         let (src, out) = self.window.slice::<LightGpu>(self.device, 1)?;
+        let room = table.room(self.device, entries)?;
         let cpu = &mut *self.scene.cpu.lock().unwrap();
+        if proxied {
+            cpu.ptlas.reserve_light(self.device, id.0)?;
+        }
+        table.grow(room, entries);
         cpu.ptlas.set_light(id.0, proxied);
         cpu.lights.set(id.0, light);
         let origin = cpu.origin_cell;
         out[0] = light.map_or_else(LightGpu::zeroed, |l| light_gpu(l, origin, self.cell_log2));
-        cpu.records.push(Record::values(
-            self.next_seq(),
-            self.scene.tables.lights.gpu().offset(u64::from(id.0)),
-            src,
-            1,
-        ));
+        cpu.records
+            .push(Record::values(self.next_seq(), table.entry(id.0), src, 1));
         Ok(())
     }
 

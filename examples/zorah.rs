@@ -934,7 +934,6 @@ fn run(options: &Options) -> Option<Capture> {
     let scene = renderer
         .create_scene(
             &SceneDesc {
-                light_capacity: 1,
                 emissive_capacity: needs.emissive.max(defaults.emissive_capacity),
                 ..defaults
             },

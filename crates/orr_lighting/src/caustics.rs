@@ -177,6 +177,9 @@ fn resolve_grid(count: u64) -> [u32; 3] {
 pub(crate) struct Caustics {
     settings: CausticSettings,
     producers: u32,
+    /// Emissive list entries of the scene.
+    entries: u64,
+    /// Entries of the scene's light table at the last scene pass.
     lights: u32,
     pipelines: CausticPipelines,
     b: Buffers,
@@ -207,12 +210,21 @@ struct Buffers {
     interiors: Allocation<EyeInterior>,
 }
 
+/// Feedback ids of `lights` lights and `entries` emissive list entries: every light, every
+/// entry, then the environment.
+fn feedback_ids(lights: u32, entries: u64) -> u64 {
+    u64::from(lights) + entries + 1
+}
+
 impl Buffers {
-    fn new(device: &Device, scene: &SceneDesc, settings: &CausticSettings) -> Result<Self, Error> {
+    fn new(
+        device: &Device,
+        lights: u32,
+        entries: u64,
+        settings: &CausticSettings,
+    ) -> Result<Self, Error> {
         let capacity = 1u64 << settings.capacity_log2;
-        let entries = u64::from(scene.producer_capacity) + u64::from(scene.emissive_capacity);
-        // Every light, every entry, then the environment.
-        let ids = u64::from(scene.light_capacity) + entries + 1;
+        let ids = feedback_ids(lights, entries);
         Ok(Self {
             checks: device_local(device, capacity, "caustic grid checks")?,
             accumulated: device_local(device, 2 * capacity, "caustic grid deposits")?,
@@ -249,12 +261,14 @@ impl Caustics {
         settings: &CausticSettings,
     ) -> Result<Self, Error> {
         check_settings(settings)?;
+        let entries = u64::from(scene.producer_capacity) + u64::from(scene.emissive_capacity);
         Ok(Self {
             settings: *settings,
             producers: scene.producer_capacity,
-            lights: scene.light_capacity + scene.producer_capacity + scene.emissive_capacity + 1,
+            entries,
+            lights: 0,
             pipelines: CausticPipelines::new(device, kernels)?,
-            b: Buffers::new(device, scene, settings)?,
+            b: Buffers::new(device, 0, entries, settings)?,
             roots: Ring::new(device, "caustic roots")?,
             caster_roots: Ring::new(device, "caster roots")?,
             resolve_roots: Ring::new(device, "caustic resolve roots")?,
@@ -269,7 +283,6 @@ impl Caustics {
     pub(crate) fn set_settings(
         &mut self,
         device: &Device,
-        scene: &SceneDesc,
         settings: &CausticSettings,
     ) -> Result<(), Error> {
         check_settings(settings)?;
@@ -277,7 +290,7 @@ impl Caustics {
         if settings.capacity_log2 != old.capacity_log2
             || settings.producer_clusters != old.producer_clusters
         {
-            self.b = Buffers::new(device, scene, settings)?;
+            self.b = Buffers::new(device, self.lights, self.entries, settings)?;
             self.recorded = [false; FRAME_SLOTS];
             self.clear = true;
         }
@@ -294,6 +307,20 @@ impl Caustics {
     /// Empties every cell and forgets the casters' yields at the next scene pass.
     pub(crate) fn clear(&mut self) {
         self.clear = true;
+    }
+
+    /// Makes the lights' interiors, which every scene pass writes whole, anew for a light
+    /// table of `lights` entries; returns the ones before, which the frames in flight read.
+    /// Fails without device memory, changing nothing.
+    pub(crate) fn follow_lights(
+        &mut self,
+        device: &Device,
+        lights: u32,
+    ) -> Result<Allocation<EyeInterior>, Error> {
+        let ids = feedback_ids(lights, self.entries);
+        let interiors = device_local(device, ids, "light interiors")?;
+        self.lights = lights;
+        Ok(std::mem::replace(&mut self.b.interiors, interiors))
     }
 
     /// Records slot `slot`'s photon source after the light set's selection and starts the
@@ -383,7 +410,8 @@ impl Caustics {
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         }
         list.dispatch(&p.weigh, casters, [1, 1, 1]);
-        list.dispatch(&p.interiors, casters, [self.lights.div_ceil(64), 1, 1]);
+        let ids = feedback_ids(self.lights, self.entries);
+        list.dispatch(&p.interiors, casters, [ids.div_ceil(64) as u32, 1, 1]);
         if clear {
             list.dispatch(&p.clear, grid, resolve_grid(capacity));
         }

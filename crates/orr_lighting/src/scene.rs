@@ -7,14 +7,14 @@ use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, GpuAddress, GpuPtr, Hazards, MemoryKind,
     ROOT_ALIGN, Stages,
 };
-use orr_scene::{SceneDesc, SceneRoot, SkyStats};
+use orr_scene::{LightTables, SceneDesc, SceneRoot, SkyStats};
 
 use crate::caustics::{CausticSettings, CausticStats, Caustics};
 use crate::environment::EnvironmentBake;
 use crate::shaders::light_sampling::{directional, tiles};
 use crate::shaders::types::{
-    DirectionalState, EmissiveSelection, EnvironmentGpu, LightSample, LightSetGpu, LightSetStats,
-    WorldCacheGpu,
+    DirectionalState, EmissiveSelection, EnvironmentGpu, EyeInterior, LightSample, LightSetGpu,
+    LightSetStats, WorldCacheGpu,
 };
 use crate::world_cache::{ResolvePipelines, WorldCache, WorldCacheStats};
 use crate::{Error, KernelSet, pipeline};
@@ -99,6 +99,9 @@ pub struct ScenePass {
     pub scene: GpuPtr<SceneRoot>,
     /// The scene focus in render space.
     pub focus: [f32; 3],
+    /// What `scene` says the scene's light tables hold: `RasterView::light_tables` or
+    /// `SceneCompute::light_tables` of the frame.
+    pub tables: LightTables,
 }
 
 /// Statistics of one frame, read back after it completes.
@@ -182,6 +185,35 @@ pub(crate) fn device_local<T>(
     Ok(device.gpu_malloc(MemoryKind::DeviceLocal, count.max(1), name)?)
 }
 
+/// What the scene pass holds per light and per feedback id, for a light table of `lights`
+/// entries.
+struct PerLight {
+    lights: u32,
+    states: Allocation<DirectionalState>,
+    directional_ids: Allocation<u32>,
+    cdf: Allocation<f32>,
+    light_probability: Allocation<f32>,
+    feedback_counts: Allocation<u32>,
+    feedback_weights: Allocation<f32>,
+}
+
+impl PerLight {
+    /// For `lights` lights and `entries` emissive list entries.
+    fn new(device: &Device, lights: u32, entries: u64) -> Result<Self, Error> {
+        let n = u64::from(lights);
+        Ok(Self {
+            lights,
+            states: device_local(device, n, "directional states")?,
+            directional_ids: device_local(device, n, "directional ids")?,
+            cdf: device_local(device, n + entries, "light cdf")?,
+            light_probability: device_local(device, n, "light probabilities")?,
+            // Every candidate, then the environment.
+            feedback_counts: device_local(device, n + entries + 1, "light feedback counts")?,
+            feedback_weights: device_local(device, n + entries + 1, "light feedback weights")?,
+        })
+    }
+}
+
 /// Lighting state of one scene: the baked environment, the directional light states, the
 /// light selection, the presampled light tiles, the caustics' photon source and grid, and the
 /// world cache.
@@ -189,21 +221,23 @@ pub struct SceneLighting {
     device: Device,
     settings: SceneLightingSettings,
     producers: u32,
+    /// Emissive list entries of the scene.
+    entries: u64,
     environment: EnvironmentBake,
     directional: ComputePipeline,
     select: ComputePipeline,
     clusters: ComputePipeline,
     presample: ComputePipeline,
-    states: Allocation<DirectionalState>,
-    directional_ids: Allocation<u32>,
+    /// For the light table of the last scene pass recorded.
+    per_light: PerLight,
+    /// What a grown light table replaced, with the caustics' interiors, by the frame whose
+    /// scene pass replaced it: that pass reads its feedback, and the frames in flight before
+    /// it read all of it.
+    replaced: Vec<(u64, PerLight, Allocation<EyeInterior>)>,
     set: Allocation<LightSetGpu>,
-    cdf: Allocation<f32>,
-    light_probability: Allocation<f32>,
     emissive: Allocation<EmissiveSelection>,
     cluster_cdf: Allocation<u32>,
     tiles: Allocation<LightSample>,
-    feedback_counts: Allocation<u32>,
-    feedback_weights: Allocation<f32>,
     shadow_overflows: Allocation<u32>,
     reference_counts: Allocation<u32>,
     readback: Allocation<LightSetStats>,
@@ -213,7 +247,6 @@ pub struct SceneLighting {
     cache: WorldCache,
     cache_pipelines: ResolvePipelines,
     caustics: Caustics,
-    scene_desc: SceneDesc,
     /// One past the frame whose first view has recorded its update paths.
     first_view: AtomicU64,
     /// One past the frame whose first real-time view has traced its photons.
@@ -227,9 +260,10 @@ pub struct SceneLighting {
 }
 
 impl SceneLighting {
-    /// Lighting for a scene created with `scene`. `kernels` replaces the crate's kernels that
-    /// share a kernel name with one of its modules, as a build linking another environment or
-    /// medium produces them.
+    /// Lighting for a scene created with `scene`; what it holds per light follows the scene's
+    /// light table from pass to pass. `kernels` replaces the crate's kernels that share a
+    /// kernel name with one of its modules, as a build linking another environment or medium
+    /// produces them.
     pub fn new(
         device: &Device,
         kernels: &KernelSet,
@@ -237,24 +271,20 @@ impl SceneLighting {
         settings: &SceneLightingSettings,
     ) -> Result<Self, Error> {
         check_settings(settings)?;
-        let lights = u64::from(scene.light_capacity);
         let entries = u64::from(scene.producer_capacity) + u64::from(scene.emissive_capacity);
-        // Every candidate, then the environment.
-        let feedback_ids = lights + entries + 1;
         Ok(Self {
             device: device.clone(),
             settings: *settings,
             producers: scene.producer_capacity,
+            entries,
             environment: EnvironmentBake::new(device, kernels)?,
             directional: pipeline(device, kernels, &directional::MODULE, "main")?,
             select: pipeline(device, kernels, &tiles::MODULE, "select")?,
             clusters: pipeline(device, kernels, &tiles::MODULE, "clusters")?,
             presample: pipeline(device, kernels, &tiles::MODULE, "presample")?,
-            states: device_local(device, lights, "directional states")?,
-            directional_ids: device_local(device, lights, "directional ids")?,
+            per_light: PerLight::new(device, 0, entries)?,
+            replaced: Vec::new(),
             set: device_local(device, 1, "light set")?,
-            cdf: device_local(device, lights + entries, "light cdf")?,
-            light_probability: device_local(device, lights, "light probabilities")?,
             emissive: device_local(device, entries, "emissive selection")?,
             cluster_cdf: device_local(
                 device,
@@ -266,8 +296,6 @@ impl SceneLighting {
                 u64::from(LIGHT_TILES * LIGHT_TILE_SIZE),
                 "light tiles",
             )?,
-            feedback_counts: device_local(device, feedback_ids, "light feedback counts")?,
-            feedback_weights: device_local(device, feedback_ids, "light feedback weights")?,
             shadow_overflows: device_local(device, 1, "shadow overflows")?,
             reference_counts: device_local(device, 2, "reference counts")?,
             readback: device.gpu_malloc(
@@ -281,7 +309,6 @@ impl SceneLighting {
             cache: WorldCache::new(device, &settings.world_cache)?,
             cache_pipelines: ResolvePipelines::new(device, kernels)?,
             caustics: Caustics::new(device, kernels, scene, &settings.caustics)?,
-            scene_desc: *scene,
             first_view: AtomicU64::new(0),
             first_photons: AtomicU64::new(0),
             frames: [None; FRAME_SLOTS],
@@ -309,7 +336,7 @@ impl SceneLighting {
             self.cache = WorldCache::new(&self.device, &settings.world_cache)?;
         }
         self.caustics
-            .set_settings(&self.device, &self.scene_desc, &settings.caustics)?;
+            .set_settings(&self.device, &settings.caustics)?;
         if settings.emissive_clusters != self.settings.emissive_clusters {
             self.cluster_cdf = device_local(
                 &self.device,
@@ -326,9 +353,29 @@ impl SceneLighting {
     /// state, builds the light selection from emitted power and the light feedback of the
     /// views of earlier frames, builds the emissive cluster CDFs, presamples the light tiles,
     /// writes `SkyStats`, resolves the world cache at the focus, and writes the statistics
-    /// [`Self::stats`] reads. Its outputs are visible to every later stage of the list.
-    pub fn record(&mut self, list: &mut CommandList<'_>, pass: &ScenePass) {
+    /// [`Self::stats`] reads. Its outputs are visible to every later stage of the list. A pass
+    /// whose light table has grown since the last makes what the scene holds per light anew,
+    /// and its selection takes the light feedback so far by the ids the smaller table gave.
+    /// Fails without device memory for that, recording nothing.
+    pub fn record(&mut self, list: &mut CommandList<'_>, pass: &ScenePass) -> Result<(), Error> {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
+        // A frame's slot is written again `FRAME_SLOTS` frames on, when its work has completed.
+        self.replaced
+            .retain(|r| pass.frame < r.0 + FRAME_SLOTS as u64);
+        let lights = pass.tables.lights;
+        let grown = lights != self.per_light.lights;
+        if grown {
+            let next = PerLight::new(&self.device, lights, self.entries)?;
+            let interiors = self.caustics.follow_lights(&self.device, lights)?;
+            let before = std::mem::replace(&mut self.per_light, next);
+            self.replaced.push((pass.frame, before, interiors));
+        }
+        let now = &self.per_light;
+        // The frames before left their feedback in what this pass's table replaced.
+        let before = match self.replaced.last() {
+            Some((_, before, _)) if grown => before,
+            _ => now,
+        };
         self.frames[slot] = Some(pass.frame);
         let resets = self.resets();
         if self.resets_applied != resets {
@@ -345,8 +392,8 @@ impl SceneLighting {
             slot,
             directional::Root {
                 scene: pass.scene,
-                states: self.states.gpu(),
-                ids: self.directional_ids.gpu(),
+                states: now.states.gpu(),
+                ids: now.directional_ids.gpu(),
                 set: self.set.gpu(),
                 focus,
             },
@@ -357,15 +404,17 @@ impl SceneLighting {
                 scene: pass.scene,
                 set: self.set.gpu(),
                 environment: self.environment.environment(),
-                directional: self.states.gpu(),
-                directional_ids: self.directional_ids.gpu(),
-                cdf: self.cdf.gpu(),
-                light_probability: self.light_probability.gpu(),
+                directional: now.states.gpu(),
+                directional_ids: now.directional_ids.gpu(),
+                cdf: now.cdf.gpu(),
+                light_probability: now.light_probability.gpu(),
                 emissive: self.emissive.gpu(),
                 cluster_cdf: self.cluster_cdf.gpu(),
                 tiles: self.tiles.gpu(),
-                feedback_counts: self.feedback_counts.gpu(),
-                feedback_weights: self.feedback_weights.gpu(),
+                feedback_counts: now.feedback_counts.gpu(),
+                feedback_weights: now.feedback_weights.gpu(),
+                feedback_counts_before: before.feedback_counts.gpu(),
+                feedback_weights_before: before.feedback_weights.gpu(),
                 shadow_overflows: self.shadow_overflows.gpu(),
                 reference_counts: self.reference_counts.gpu(),
                 stats: self.readback.gpu().offset(slot as u64),
@@ -373,8 +422,8 @@ impl SceneLighting {
                 frame: pass.frame as u32,
                 feedback_share: self.settings.feedback_share,
                 clear_feedback: u32::from(std::mem::take(&mut self.clear_feedback)),
+                lights_before: before.lights,
                 _pad0: 0,
-                _pad1: 0,
             },
         );
 
@@ -407,6 +456,7 @@ impl SceneLighting {
             Hazards::empty(),
         );
         list.end_pass();
+        Ok(())
     }
 
     /// A lighting discontinuity, such as a time skip: the next [`Self::record`] clears the
@@ -486,6 +536,14 @@ impl SceneLighting {
 
     /// Per directional light, by LightId, its state for the last recorded frame.
     pub fn directional_states(&self) -> GpuPtr<DirectionalState> {
-        self.states.gpu()
+        self.per_light.states.gpu()
+    }
+
+    /// The light tables of the last recorded scene pass, which give the light set's feedback
+    /// ids.
+    pub(crate) fn light_tables(&self) -> LightTables {
+        LightTables {
+            lights: self.per_light.lights,
+        }
     }
 }

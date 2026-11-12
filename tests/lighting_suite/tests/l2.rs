@@ -43,11 +43,7 @@ fn scene_with(
     lights: &[DirectionalLight],
     data: impl FnOnce(&mut SceneWriter<'_>) + 'static,
 ) -> TestScene {
-    let desc = SceneDesc {
-        light_capacity: 8,
-        ..SceneDesc::default()
-    };
-    let mut scene = TestScene::linked(desc, kernels, data);
+    let mut scene = TestScene::linked(SceneDesc::default(), kernels, data);
     scene.write(|w, _| {
         for (i, l) in lights.iter().enumerate() {
             w.set_light(LightId(i as u32), Some(&Light::Directional(*l)))
@@ -199,7 +195,7 @@ fn sampling_matches_density(scene: &TestScene, lighting: &mut SceneLighting) {
         pipeline(&env_probe::MODULE, "integrate"),
     ];
     let mut list = render().command_list().unwrap();
-    lighting.record(&mut list, &scene.pass([0.0; 3]));
+    lighting.record(&mut list, &scene.pass([0.0; 3])).unwrap();
     compute_barrier(&mut list);
     list.dispatch(&probe[0], root.gpu(), [threads / 64, 1, 1]);
     list.dispatch(&probe[1], root.gpu(), [bins as u32, 1, 1]);
@@ -277,10 +273,7 @@ fn hdr_map_sampling_matches_its_density() {
 
 #[test]
 fn procedural_sky_sampling_matches_its_density() {
-    let mut scene = TestScene::procedural(SceneDesc {
-        light_capacity: 8,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::procedural(SceneDesc::default());
     scene.write(|_, _| {});
     let mut lighting = scene.lighting();
     sampling_matches_density(&scene, &mut lighting);
@@ -327,7 +320,7 @@ fn sky_stats_match_a_uniform_environment_and_a_slab() {
     let mut lighting = scene.lighting();
     let focus = [10.0, 100.0, -5.0];
     let mut list = render().command_list().unwrap();
-    lighting.record(&mut list, &scene.pass(focus));
+    lighting.record(&mut list, &scene.pass(focus)).unwrap();
     finish(list);
     let stats = lighting
         .stats(scene.frame)
@@ -386,10 +379,7 @@ struct Discs {
 
 fn discs(lights: &[DirectionalLight], focus: [f32; 3]) -> Discs {
     let count = lights.len() as u32;
-    let mut scene = TestScene::new(SceneDesc {
-        light_capacity: count,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::new(SceneDesc::default());
     let textured = readback::<[f32; 4]>(u64::from(count), "textured integrals");
     let probe = pipeline(&textured_probe::MODULE, "main");
     scene.frame(
@@ -404,6 +394,9 @@ fn discs(lights: &[DirectionalLight], focus: [f32; 3]) -> Discs {
                 .put_root(&textured_probe::Root {
                     scene: c.root,
                     integrals: textured.gpu(),
+                    count,
+                    _pad0: 0,
+                    _pad1: 0,
                 })
                 .unwrap();
             c.cmd.dispatch(&probe, root, [1, 1, 1]);
@@ -425,7 +418,7 @@ fn discs(lights: &[DirectionalLight], focus: [f32; 3]) -> Discs {
     );
     let p = pipeline(&disc_probe::MODULE, "integrate");
     let mut list = render().command_list().unwrap();
-    lighting.record(&mut list, &scene.pass(focus));
+    lighting.record(&mut list, &scene.pass(focus)).unwrap();
     compute_barrier(&mut list);
     list.dispatch(&p, root.gpu(), [count, 1, 1]);
     let states = copy_back(
@@ -436,7 +429,7 @@ fn discs(lights: &[DirectionalLight], focus: [f32; 3]) -> Discs {
     );
     finish(list);
     Discs {
-        table: scene.lights(),
+        table: scene.lights()[..lights.len()].to_vec(),
         states: states.as_slice().unwrap().to_vec(),
         integrals: integrals
             .as_slice()
@@ -570,7 +563,7 @@ fn glint_converges_to_the_same_value_from_nee_and_bsdf_sampling() {
         })
         .collect();
     let mut list = render().command_list().unwrap();
-    lighting.record(&mut list, &scene.pass([0.0; 3]));
+    lighting.record(&mut list, &scene.pass([0.0; 3])).unwrap();
     compute_barrier(&mut list);
     let p = pipeline(&glint::MODULE, "main");
     for root in &roots {

@@ -1,5 +1,5 @@
-// `textured_disc_integral` from a scene compute kernel: one value per light slot, 0 for
-// lights that are not textured discs.
+// `textured_disc_integral` from a scene compute kernel: one value for each of the scene's first
+// `count` lights, 0 for lights that are not textured discs.
 #include "orr_root.h"
 import orr_scene.lights;
 import orr_scene.tables;
@@ -9,6 +9,9 @@ struct Root
 {
     SceneRoot* scene;
     float4* integrals;
+    uint count;
+    uint _pad0;
+    uint64_t _pad1;
 }
 ORR_ROOT(Root);
 
@@ -17,7 +20,7 @@ ORR_ROOT(Root);
 void main(uint3 id: SV_DispatchThreadID)
 {
     SceneRoot* s = root.scene;
-    if (id.x >= s.light_capacity)
+    if (id.x >= root.count)
         return;
     LightGpu l = s.lights[id.x];
     bool textured = l.kind == LIGHT_DIRECTIONAL && l.disc == DISC_TEXTURED;

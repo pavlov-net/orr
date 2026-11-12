@@ -997,7 +997,8 @@ LightSample local_sample(LightSetGpu* set, uint id, float2 u, float probability)
 }
 
 // The environment's feedback id. Sphere and rect lights take their LightId, and emissive
-// entries the light capacity plus their entry.
+// entries the light capacity plus their entry, so an entry's id and the environment's are a
+// frame's: they move when the light table grows.
 public uint feedback_environment(LightSetGpu* set)
 {
     return set.candidate_count;

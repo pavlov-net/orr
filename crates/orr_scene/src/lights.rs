@@ -8,12 +8,21 @@ use crate::LightGpu;
 use crate::material::rec2020;
 use crate::world::{WorldPos, render_position};
 
-/// A slot in a scene's light table, below `SceneDesc::light_capacity`.
+/// A light of one scene: its entry in the scene's light table, which grows to hold the highest
+/// id set.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LightId(pub u32);
 
 impl LightId {
     pub const NONE: Self = Self(u32::MAX);
+}
+
+/// What a scene's light tables hold room for in a frame, as its root says: state kept per
+/// light by whoever reads the tables is sized from it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LightTables {
+    /// Entries of the light table: every `LightId` set is below it.
+    pub lights: u32,
 }
 
 /// A light. Colors are linear Rec.709 and convert to Rec.2020 when written.

@@ -51,7 +51,6 @@ impl Showcase {
         let scene = renderer
             .create_scene(
                 &SceneDesc {
-                    light_capacity: 2,
                     emissive_capacity: 16,
                     global_instances: 16,
                     ..SceneDesc::default()

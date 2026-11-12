@@ -182,8 +182,9 @@ impl Rig {
                     frame,
                     scene: cx.root,
                     focus: focus.as_vec3().to_array(),
+                    tables: cx.light_tables,
                 };
-                lighting.record(cx.cmd, &pass);
+                lighting.record(cx.cmd, &pass).unwrap();
             }
         })
         .unwrap();

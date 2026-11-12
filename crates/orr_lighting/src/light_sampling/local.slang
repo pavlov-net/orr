@@ -40,8 +40,8 @@ struct Root
     LightSetGpu* set;
     // Columns x rows of the view's tiles.
     LocalLights* local;
-    // RG32_UINT, sampled: the view's last frame's feedback, the light id and the camera
-    // distance of its first vertex.
+    // RG32_UINT, sampled: the view's last frame's feedback, the feedback id as that frame's
+    // light table of `fed_lights` entries named it and the camera distance of its first vertex.
     TextureIndex previous;
     uint columns;
     // `LocalLights.share` of a tile whose every surface found feedback.
@@ -50,7 +50,7 @@ struct Root
     uint reset;
     // The path kernels' frame, which moves the tile grid.
     uint frame;
-    uint _pad0;
+    uint fed_lights;
     uint64_t _pad1;
 }
 ORR_ROOT(Root);
@@ -93,8 +93,12 @@ bool reprojected(uint2 pixel, out uint id)
     float expected = length(q + v.eye_motion.xyz);
     if (abs(asfloat(fed.y) - expected) > DISTANCE_TOLERANCE * expected)
         return true;
-    if (fed.x != NO_LIGHT && global_selection(root.set, fed.x) > 0.0)
-        id = fed.x;
+    if (fed.x == NO_LIGHT)
+        return true;
+    // An emissive entry and the environment follow the lights, whose table may have grown since.
+    uint now = fed.x < root.fed_lights ? fed.x : fed.x - root.fed_lights + root.set.scene.light_capacity;
+    if (global_selection(root.set, now) > 0.0)
+        id = now;
     return true;
 }
 

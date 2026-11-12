@@ -255,6 +255,8 @@ pub struct RasterView {
     pub sky_stats: GpuPtr<crate::SkyStats>,
     /// The scene focus in render space; the view's camera while the scene has none.
     pub focus: [f32; 3],
+    /// What `scene` says the scene's light tables hold.
+    pub light_tables: crate::LightTables,
 }
 
 pub(crate) struct ViewHistory {
